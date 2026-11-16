@@ -177,6 +177,10 @@ fn emit_in(
         manifest.wasm_relaxed = Some(RELAXED_WASM.to_string());
         manifest.wasm_relaxed_abi = Some(abi);
     }
+    let egg_options = wrela_egraph::Options::from_env();
+    let egg_only: Option<Vec<usize>> = std::env::var("WRELA_EGG_ONLY")
+        .ok()
+        .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect());
     for (i, p) in l.pipelines.iter().enumerate() {
         let shader = format!("pipeline_{i}.{}", wrela_shader::extension(target));
         // The CPU host checks stages and bindings without looking up shader entry points: its
@@ -254,8 +258,37 @@ fn emit_in(
                 .map(|s| s.map(|s| sources.file(s.file).location(s.start)))
                 .collect(),
         };
+        // The e-graph spike (wrela-notes/next/backend.md): `WRELA_EGG` rewrites the pipelines
+        // `WRELA_EGG_ONLY` names (indices, comma-separated; all if unset) before they're written.
+        let rewritten = egg_options
+            .as_ref()
+            .filter(|_| egg_only.as_ref().is_none_or(|o| o.contains(&i)))
+            .map(|o| {
+                let mut m = p.module.clone();
+                let before: Vec<Option<u64>> = m
+                    .entry_points
+                    .iter()
+                    .map(|e| wrela_ir::work::entry_work(&m, e.function).work)
+                    .collect();
+                let stats = wrela_egraph::rewrite_module(&mut m, o);
+                if let Err(e) = wrela_ir::verify(&m) {
+                    panic!("the e-graph pass made `{}`'s IR malformed: {e}", p.name);
+                }
+                let after: Vec<Option<u64>> = m
+                    .entry_points
+                    .iter()
+                    .map(|e| wrela_ir::work::entry_work(&m, e.function).work)
+                    .collect();
+                eprintln!(
+                    "egg: pipeline {i} {}: work {before:?} -> {after:?}; {}",
+                    p.name,
+                    stats.summary()
+                );
+                m
+            });
+        let module = rewritten.as_ref().unwrap_or(&p.module);
         let shader = if let Some(s) = shaders {
-            match wrela_shader::emit_shader(&p.module, &mut pipeline, s.target, s.checks) {
+            match wrela_shader::emit_shader(module, &mut pipeline, s.target, s.checks) {
                 Ok(m) => Some(m),
                 Err(e) => {
                     diagnostics.push(Diagnostic::internal(format!(

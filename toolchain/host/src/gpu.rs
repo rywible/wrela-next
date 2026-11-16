@@ -2536,6 +2536,12 @@ impl Gpu {
                 PassItem::Draw(d) => d,
             };
             let (bind_group, offset) = prepared.next().expect("prepared for each draw");
+            if skipped_pipelines().contains(&d.pipeline) {
+                continue;
+            }
+            if std::env::var_os("WRELA_SAY_DRAWS").is_some() {
+                eprintln!("draw: pass {label} pipeline {}", d.pipeline);
+            }
             let Kind::Render { variants, .. } = &self.pipelines[d.pipeline as usize].kind else {
                 unreachable!("the checker checked the kind");
             };
@@ -3808,4 +3814,17 @@ mod target_tests {
         assert_eq!(as_rgba8(TextureFormat::Depth32Float, &grey), [64, 64, 64, 255]);
         assert_eq!(as_rgba8(TextureFormat::Rg16Float, &t[..4]), [128, 255, 0, 255]);
     }
+}
+
+/// For measuring one pipeline's share of a pass by subtraction (the e-graph spike): the render
+/// pipelines whose draws are skipped, `WRELA_SKIP_PIPELINES=52,53,54`. Pictures are wrong with it.
+fn skipped_pipelines() -> &'static HashSet<u32> {
+    static SKIP: std::sync::OnceLock<HashSet<u32>> = std::sync::OnceLock::new();
+    SKIP.get_or_init(|| {
+        std::env::var("WRELA_SKIP_PIPELINES")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect()
+    })
 }
