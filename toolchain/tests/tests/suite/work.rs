@@ -247,3 +247,53 @@ fn a_function_over_its_budget_is_e0710() {
     assert!(msgs.iter().any(|m| m.contains("`wide` weighs")), "{msgs:?}");
     assert!(msgs.iter().any(|m| m.contains("`open`'s work has no bound")), "{msgs:?}");
 }
+
+/// What the work count proves leaves its check out of the shader (language.md §11.3): a loop it
+/// sees end needs no bound, an index it knows is under its table's length no clamp, a division
+/// by a constant other than 0 no guard. What it can't prove keeps its check: a loop with no exit
+/// it's sure of, an index past what it knows, a divisor it doesn't know.
+#[test]
+fn checks_the_count_proves_unneeded_are_left_out() {
+    let items = "const TABLE: [f32; 16] = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0]\n";
+    let dir = kernels(
+        "work_proofs",
+        items,
+        &[
+            (
+                "proved",
+                "    var acc = 0.0\n    for i in 0..min(id.x, 16) {\n        acc += TABLE[i]\n    }\n    out[id] = acc + f32(id.x / 7) + f32(id.x % 5)",
+            ),
+            (
+                "unproved",
+                "    var i = id.x\n    var steps = 0.0\n    while i > 1 {\n        i = i / 2\n        steps += TABLE[i]\n    }\n    out[id] = steps + f32(id.x / (id.y + 1))",
+            ),
+        ],
+    );
+    let how = wrela_driver::BuildFor {
+        kind: wrela_driver::BuildKind { debug: false, testing: true },
+        set: Vec::new(),
+        target: wrela_abi::Target::Metal,
+        trusted_shaders: false,
+    };
+    let built = wrela_driver::build_for(&dir, &how);
+    assert!(!built.has_errors(), "{:?}", built.diagnostics);
+    let msl = |entry: &str| -> String {
+        built
+            .files
+            .iter()
+            .filter(|(n, _)| n.ends_with(".metal"))
+            .map(|(_, b)| String::from_utf8_lossy(b).into_owned())
+            .find(|t| t.contains(&format!("kernel void {entry}_e(")))
+            .unwrap_or_else(|| panic!("no shader of {entry}"))
+    };
+    let (proved, unproved) = (msl("proved"), msl("unproved"));
+    let count = |t: &str, what: &str| t.matches(what).count();
+    assert_eq!(count(&proved, "loop_bound"), 0, "the loop ends by 16:\n{proved}");
+    // (`out[id]` keeps its clamp: a buffer's length isn't known when it's compiled.)
+    assert_eq!(count(&proved, ", 15u)"), 0, "every index of the table is under 16:\n{proved}");
+    assert_eq!(count(&proved, "naga_div("), 0, "by 7:\n{proved}");
+    assert_eq!(count(&proved, "naga_mod("), 0, "by 5:\n{proved}");
+    assert!(count(&unproved, "loop_bound") > 0, "no exit is sure:\n{unproved}");
+    assert!(count(&unproved, ", 15u)") > 0, "`i` isn't known:\n{unproved}");
+    assert!(count(&unproved, "naga_div(") > 1, "by `id.y + 1`, which may wrap:\n{unproved}");
+}

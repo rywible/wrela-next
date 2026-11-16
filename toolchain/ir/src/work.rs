@@ -87,6 +87,7 @@ pub fn module_work(m: &Module) -> (Vec<EntryWork>, Vec<Breach>) {
         memo: HashMap::new(),
         breaches: Vec::new(),
         passes: HashMap::new(),
+        proof: None,
     };
     let mut out = Vec::new();
     for e in &m.entry_points {
@@ -108,6 +109,7 @@ pub fn entry_work(m: &Module, f: FuncId) -> EntryWork {
         memo: HashMap::new(),
         breaches: Vec::new(),
         passes: HashMap::new(),
+        proof: None,
     };
     let r = c.call(f, &[]);
     let work = if r.unbounded || c.gave_up { None } else { Some(r.work) };
@@ -132,6 +134,7 @@ impl<'a> ExprWork<'a> {
                 memo: HashMap::new(),
                 breaches: Vec::new(),
                 passes: HashMap::new(),
+                proof: None,
             },
         }
     }
@@ -171,10 +174,117 @@ pub fn loop_passes(m: &Module, f: FuncId) -> HashMap<usize, u32> {
         memo: HashMap::new(),
         breaches: Vec::new(),
         passes: HashMap::new(),
+        proof: None,
     };
     let args = vec![None; m.functions[f.0 as usize].params.len()];
     c.call(f, &args);
     if c.gave_up { HashMap::new() } else { c.passes }
+}
+
+/// What the work count proves of the run-time checks a shader is written with (language.md
+/// §11.3), so a writer can leave out the ones it makes unneeded. Each holds on every way the
+/// count follows, and the count follows every way the code can run (a bound may be loose, never
+/// low), with what it knows of the most an integer can be ([`entry_work`]'s count, which the
+/// host's step guard trusts). What a loop it can't bound computes is not proved, nor anything
+/// once the count gives up.
+#[derive(Clone, Debug, Default)]
+pub struct Proofs {
+    /// The loops, by their bodies' addresses, that end within [`MOST_PASSES`] passes every time
+    /// they run: a loop the GPU's compiler can see ends needs no counter to make it.
+    pub loops: std::collections::HashSet<usize>,
+    /// The most each `u32` value used as an index can be, by its function's address and the
+    /// value.
+    pub index_most: HashMap<(usize, ValueId), u64>,
+    /// The integer divisors, by their function's address and the value, that are a constant
+    /// every time they're used, never 0, nor -1 of a signed division.
+    pub divisors: std::collections::HashSet<(usize, ValueId)>,
+}
+
+impl Proofs {
+    /// Whether index `i` in function `f` is always less than `len`.
+    pub fn in_range(&self, f: &Function, i: ValueId, len: u32) -> bool {
+        let key = (f as *const Function as usize, i);
+        self.index_most.get(&key).is_some_and(|m| *m < u64::from(len))
+    }
+
+    /// Whether divisor `d` in function `f` is never 0 (nor -1 of a signed division).
+    pub fn safe_divisor(&self, f: &Function, d: ValueId) -> bool {
+        self.divisors.contains(&(f as *const Function as usize, d))
+    }
+
+    /// Whether the loop with body `body` always ends within [`MOST_PASSES`] passes.
+    pub fn ends(&self, body: &[Stmt]) -> bool {
+        self.loops.contains(&(body.as_ptr() as usize))
+    }
+}
+
+/// [`Proofs`] of module `m`, followed from each entry point knowing nothing of its inputs.
+pub fn proofs(m: &Module) -> Proofs {
+    let mut c = Counter {
+        m,
+        steps: 0,
+        gave_up: false,
+        bounds: true,
+        memo: HashMap::new(),
+        breaches: Vec::new(),
+        passes: HashMap::new(),
+        proof: Some(ProofLog::default()),
+    };
+    for e in &m.entry_points {
+        c.steps = 0;
+        c.call(e.function, &[]);
+        if c.gave_up {
+            return Proofs::default();
+        }
+    }
+    let log = c.proof.take().expect("the proof log");
+    Proofs {
+        loops: c.passes.keys().filter(|b| !log.endless.contains(b)).copied().collect(),
+        index_most: log.index.into_iter().filter_map(|(k, m)| Some((k, m?))).collect(),
+        divisors: log.div.into_iter().filter(|(_, ok)| *ok).map(|(k, _)| k).collect(),
+    }
+}
+
+/// What a [`proofs`] count has found so far, and the order it found it in, so what a loop it
+/// can't bound found can be taken back.
+#[derive(Default)]
+struct ProofLog {
+    /// The most of each index (`None`: not known on some way).
+    index: HashMap<(usize, ValueId), Option<u64>>,
+    /// Whether each divisor was safe every time.
+    div: HashMap<(usize, ValueId), bool>,
+    /// What was recorded, in order: an index (`true`) or a divisor.
+    log: Vec<(bool, (usize, ValueId))>,
+    /// The loops found unbounded, by their bodies' addresses.
+    endless: std::collections::HashSet<usize>,
+}
+
+impl ProofLog {
+    fn index(&mut self, key: (usize, ValueId), most: Option<u64>) {
+        let e = self.index.entry(key).or_insert(most);
+        *e = match (*e, most) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            _ => None,
+        };
+        self.log.push((true, key));
+    }
+
+    fn divisor(&mut self, key: (usize, ValueId), ok: bool) {
+        *self.div.entry(key).or_insert(ok) &= ok;
+        self.log.push((false, key));
+    }
+
+    /// Takes back what was found since `from`: a loop the count couldn't bound computed it.
+    fn unprove(&mut self, from: usize, body: usize) {
+        for (index, key) in self.log.split_off(from) {
+            if index {
+                self.index.insert(key, None);
+            } else {
+                self.div.insert(key, false);
+            }
+        }
+        self.endless.insert(body);
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -337,6 +447,7 @@ impl<'a> CallRuns<'a> {
                 memo: HashMap::new(),
                 breaches: Vec::new(),
                 passes: HashMap::new(),
+                proof: None,
             },
             steps: 0,
         }
@@ -405,6 +516,8 @@ struct Counter<'a> {
     breaches: Vec<Breach>,
     /// The most passes each loop that ended made, by its body's address.
     passes: HashMap<usize, u32>,
+    /// What the count proves of the run-time checks ([`proofs`]), when it's asked.
+    proof: Option<ProofLog>,
 }
 
 /// How a block ended: `Normal` when some way through it goes on past it (the state is what's
@@ -618,6 +731,7 @@ impl<'a> Counter<'a> {
                 self.expr(fr, st, e);
             }
             Stmt::Store(p, v) => {
+                self.prove_place(fr, p);
                 fr.work = fr.work.saturating_add(self.place_cost(p, true));
                 match (p.root.clone(), p.path.is_empty()) {
                     (PlaceRoot::Local(l), true) => {
@@ -725,6 +839,7 @@ impl<'a> Counter<'a> {
         let mark = fr.sites.as_ref().map(|s| s.log.len());
         let body_at = body.as_ptr() as usize;
         let endless = fr.sites.as_ref().is_some_and(|s| s.endless.contains(&body_at));
+        let proof_mark = self.proof.as_ref().map(|p| p.log.len());
         let mut ran = 0u64;
         // (Each pass is followed knowing what's sure on every way into it, so its work is the
         // most any of them does; the loop ends when no way goes on to another pass, and what's
@@ -742,6 +857,9 @@ impl<'a> Counter<'a> {
             };
             if done {
                 fr.unbounded = true;
+                if let (Some(p), Some(mark)) = (self.proof.as_mut(), proof_mark) {
+                    p.unprove(mark, body_at);
+                }
                 if fr.loop_at.is_none() {
                     fr.loop_at = at;
                 }
@@ -809,6 +927,7 @@ impl<'a> Counter<'a> {
             Expr::Const(c) => (0, Some(c.clone())),
             Expr::Extract(v, i) => (0, self.part(fr, *v, Some(u64::from(*i)))),
             Expr::ExtractDyn(v, i) => {
+                self.prove_index(fr, *i);
                 let at = known(i).and_then(|c| int_of(&c)).and_then(|i| u64::try_from(i).ok());
                 (OP, at.and_then(|at| self.part(fr, *v, Some(at))))
             }
@@ -826,6 +945,7 @@ impl<'a> Counter<'a> {
             | Expr::Mem(..) => (0, None),
             Expr::Param(i) => (0, fr.args.get(*i as usize).cloned().flatten()),
             Expr::Load(p) => {
+                self.prove_place(fr, p);
                 let v = match (&p.root, p.path.as_slice()) {
                     (PlaceRoot::Local(l), []) => st.locals.get(l).cloned(),
                     // An element of a table a local holds, at a known place.
@@ -847,6 +967,9 @@ impl<'a> Counter<'a> {
                 (OP * comps(x), v)
             }
             Expr::Binary(op, a, b) => {
+                if matches!(op, BinOp::Div | BinOp::Rem) {
+                    self.prove_divisor(fr, *b);
+                }
                 let n = binary_cost(&m.types, fr.f, *op, *a, *b);
                 let v = match (known(a), known(b)) {
                     (Some(x), Some(y)) => fold(*op, x, y),
@@ -871,7 +994,10 @@ impl<'a> Counter<'a> {
             }
             Expr::Texture(op, ..) => (texture_cost(*op), None),
             Expr::TextureStore(..) => (TEXEL, None),
-            Expr::Atomic(..) => (ATOMIC, None),
+            Expr::Atomic(_, p, _) => {
+                self.prove_place(fr, p);
+                (ATOMIC, None)
+            }
             Expr::Subgroup(..) => (2 * OP, None),
             Expr::Barrier => (4 * OP, None),
             Expr::Call(id, args) => {
@@ -882,6 +1008,11 @@ impl<'a> Counter<'a> {
                         Arg::Place(_) => None,
                     })
                     .collect();
+                for a in args {
+                    if let Arg::Place(p) = a {
+                        self.prove_place(fr, p);
+                    }
+                }
                 // A place lent to the call may be written there.
                 for a in args {
                     if let Arg::Place(p) = a
@@ -909,6 +1040,42 @@ impl<'a> Counter<'a> {
         };
         fr.work = fr.work.saturating_add(w);
         value
+    }
+
+    /// Records the most each index of place `p` can be here ([`proofs`]).
+    fn prove_place(&mut self, fr: &Frame, p: &Place) {
+        if self.proof.is_some() {
+            for x in &p.path {
+                if let Proj::Index(i) = x {
+                    self.prove_index(fr, *i);
+                }
+            }
+        }
+    }
+
+    /// Records the most index `i` can be here: its value, or of a `u32`, the most it can be.
+    fn prove_index(&mut self, fr: &Frame, i: ValueId) {
+        let Some(log) = self.proof.as_mut() else { return };
+        let most = match fr.vals.get(&i).and_then(int_of) {
+            Some(k) => u64::try_from(k).ok(),
+            None if matches!(self.m.types.get(fr.f.value_ty(i)), TypeDef::Scalar(Scalar::U32)) => {
+                fr.most.get(&i).and_then(|m| u64::try_from(*m).ok())
+            }
+            None => None,
+        };
+        log.index((fr.f as *const Function as usize, i), most);
+    }
+
+    /// Records whether integer divisor `d` is safe here: a constant, not 0, and not -1 of a
+    /// signed division.
+    fn prove_divisor(&mut self, fr: &Frame, d: ValueId) {
+        let Some(log) = self.proof.as_mut() else { return };
+        let ok = match fr.vals.get(&d) {
+            Some(Const::U32(k)) => *k != 0,
+            Some(Const::I32(k)) => *k != 0 && *k != -1,
+            _ => false,
+        };
+        log.divisor((fr.f as *const Function as usize, d), ok);
     }
 
     /// The known value of part `at` of value `v`, built of parts.

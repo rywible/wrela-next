@@ -4,6 +4,7 @@
 #pragma METAL fp math_mode(relaxed)
 #pragma METAL fp contract(fast)
 #pragma clang diagnostic ignored "-Wtautological-compare"
+#pragma clang diagnostic ignored "-Warray-bounds"
 using metal::uint;
 struct _mslBufferSizes {
 uint size0;

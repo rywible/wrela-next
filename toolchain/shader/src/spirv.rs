@@ -127,6 +127,8 @@ struct Writer<'m> {
     p: &'m Pipeline,
     promise: Option<ir::DepthPromise>,
     checks: Checks,
+    /// What the compiler proves of the checks: the ones it makes unneeded are left out.
+    proofs: wrela_ir::work::Proofs,
     layouts: WgslLayouts,
     next: Word,
     capabilities: BTreeSet<u32>,
@@ -164,6 +166,11 @@ impl<'m> Writer<'m> {
             p,
             promise,
             checks,
+            proofs: if checks == Checks::UNCHECKED {
+                wrela_ir::work::Proofs::default()
+            } else {
+                wrela_ir::work::proofs(m)
+            },
             layouts: WgslLayouts::default(),
             next: 1,
             capabilities: BTreeSet::new(),
@@ -915,8 +922,9 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
         if let Some(e) = entry {
             fw.entry_prologue(e)?;
         }
-        let body = f.body.clone();
-        fw.block(&body, None)?;
+        // (The IR's own body, not a copy: what the compiler proves of its loops is by address.)
+        let body = &f.body;
+        fw.block(body, None)?;
         if fw.open {
             if let Some(ir::Stmt::Trap) = body.last() {
                 fw.return_zero()?;
@@ -1060,7 +1068,7 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
                 self.branch(header);
                 self.label(header);
                 self.emit(Op::LoopMerge, &[merge, continue_id, 0]);
-                if self.w.checks.loops {
+                if self.w.checks.loops && !self.w.proofs.ends(body) {
                     let check = self.id();
                     self.branch(check);
                     self.label(check);
@@ -1590,6 +1598,11 @@ impl FunctionWriter<'_, '_> {
         {
             return Ok(self.w.const_u32(k as u32));
         }
+        if let Some(n) = len
+            && self.w.proofs.in_range(self.f, i, n)
+        {
+            return Ok(id);
+        }
         let max = match (len, runtime) {
             (Some(n), _) => self.w.const_u32(n - 1),
             (None, Some(var)) => {
@@ -2101,7 +2114,8 @@ impl FunctionWriter<'_, '_> {
         // dividend (and 0 for a remainder), the most negative by -1 gives itself (and 0).
         if !float && matches!(op, B::Div | B::Rem) {
             let n = self.width_of(a);
-            let divisor = if self.w.checks.int_div || (signed && op == B::Rem) {
+            let guarded = self.w.checks.int_div || (signed && op == B::Rem);
+            let divisor = if guarded && !self.w.proofs.safe_divisor(self.f, b) {
                 self.safe_divisor(l, r, signed, n)?
             } else {
                 r

@@ -243,9 +243,11 @@ pub struct BuildFor {
     /// clamped into range, no loop given a bound the GPU's compiler can see, no integer division
     /// guarded. A program whose GPU code then indexes out of range, loops forever or divides by
     /// zero is undefined on the GPU (it may read anything, hang or crash), where language.md
-    /// §11.3 promises it a value. Off unless asked for: on the atoms spike's 4K frame it saves 5
-    /// to 6.5% on Metal, which only a compiler that proves its indexes in range, its loops finite
-    /// and its divisors not zero could have for free (docs/dead-ends.md).
+    /// §11.3 promises it a value. Off unless asked for. A build without it already leaves out
+    /// the checks the work count proves unneeded (`wrela_ir::work::Proofs`): on the opening at
+    /// 4K, 99% of its loops' bounds, 83% of its divisions' guards and 40% of its index clamps
+    /// (3.9% of its frame on an M4, 1.1% on the Linux machine's Radeon; leaving every check out
+    /// saved 2.9% and 1.3%, measured apart).
     pub trusted_shaders: bool,
 }
 

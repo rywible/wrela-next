@@ -190,6 +190,8 @@ struct Writer<'m> {
     p: &'m Pipeline,
     depth: Option<ConservativeDepth>,
     checks: Checks,
+    /// What the compiler proves of the checks: the ones it makes unneeded are left out.
+    proofs: wrela_ir::work::Proofs,
     layouts: WgslLayouts,
     /// Each type's name in MSL, made once.
     type_names: HashMap<ir::TypeId, String>,
@@ -243,6 +245,11 @@ impl<'m> Writer<'m> {
             p,
             depth,
             checks,
+            proofs: if checks == Checks::UNCHECKED {
+                wrela_ir::work::Proofs::default()
+            } else {
+                wrela_ir::work::proofs(m)
+            },
             layouts: WgslLayouts::default(),
             type_names: HashMap::new(),
             structs: HashMap::new(),
@@ -309,6 +316,8 @@ impl<'m> Writer<'m> {
         out.push_str("#pragma METAL fp contract(fast)\n");
         // `x == x` is how GPU code asks whether a float is a number: meant, not a slip.
         out.push_str("#pragma clang diagnostic ignored \"-Wtautological-compare\"\n");
+        // A runtime-sized array is declared with one element; an index past it is meant.
+        out.push_str("#pragma clang diagnostic ignored \"-Warray-bounds\"\n");
         out.push_str("using metal::uint;\n");
         if !self.size_members.is_empty() {
             let mut members: Vec<(&usize, &String)> = self.size_members.iter().collect();
@@ -898,14 +907,15 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
             None => self.helper_signature(&mut header)?,
             Some(e) => self.entry_signature(e, &mut header)?,
         }
-        let body = self.f.body.clone();
+        // (The IR's own body, not a copy: what the compiler proves of its loops is by address.)
+        let body = &self.f.body;
         let mut text = String::new();
         // Locals, then the body.
         for (k, l) in self.f.locals.iter().enumerate() {
             let ty = self.w.ty(l.ty)?;
             let _ = writeln!(text, "{ty} {} = {{}};", self.locals[k]);
         }
-        self.block(&body, &mut text)?;
+        self.block(body, &mut text)?;
         if let Some(ir::Stmt::Trap) = body.last() {
             self.return_zero(&mut text)?;
         }
@@ -1281,7 +1291,8 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
                 out.push_str("}\n");
             }
             ir::Stmt::Loop { body, continuing } => {
-                let bound = self.w.checks.loops.then(|| self.fresh("loop_bound"));
+                let bound = (self.w.checks.loops && !self.w.proofs.ends(body))
+                    .then(|| self.fresh("loop_bound"));
                 let gate = (!continuing.is_empty()).then(|| self.fresh("loop_init"));
                 if let Some(b) = &bound {
                     let _ = writeln!(out, "uint2 {b} = uint2({}u);", u32::MAX);
@@ -1438,6 +1449,11 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
             if (0..i64::from(n)).contains(&k) {
                 return Ok(text);
             }
+        }
+        if let Some(n) = len
+            && self.w.proofs.in_range(self.f, i, n)
+        {
+            return Ok(text);
         }
         let limit = match (len, sized) {
             (Some(n), _) => format!("{}u", n - 1),
@@ -1876,7 +1892,11 @@ impl FunctionWriter<'_, '_> {
         let signed = scalar == Some(ir::Scalar::I32) && is_int;
         let (l, r) = (self.operand(a)?, self.operand(b)?);
         use ir::BinOp as B;
-        if is_int && matches!(op, B::Div | B::Rem) && self.w.checks.int_div {
+        if is_int
+            && matches!(op, B::Div | B::Rem)
+            && self.w.checks.int_div
+            && !self.w.proofs.safe_divisor(self.f, b)
+        {
             let tn = self.w.ty(t)?;
             let helper =
                 if op == B::Div { Helper::Div(tn, signed) } else { Helper::Mod(tn, signed) };
