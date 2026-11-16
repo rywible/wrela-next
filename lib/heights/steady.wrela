@@ -1,0 +1,218 @@
+// Steadiness as counts, frame by frame, under a moving eye: each frame's finished picture (the
+// last pass's, linear) against the frame before's, and its holes. Counted on the GPU into one
+// buffer, a row of `STEADY_COUNTS` a frame, read back once when the frames are done, and said
+// as a series: a pop when a ring changes level would stand out of it as one frame's spike,
+// where a steadily moving eye changes about as many pixels every frame.
+//
+//   0 pixels drawn (depth over 0)              1 pixels whose brightness steps more than 8/255
+//   2 more than 15/255                         3 holes: a pixel nothing drew, between two that
+//                                                something did, across or down (a crack)
+//   4 more than 2/255                          5 the steps summed (of 255)
+//   6 pixels in the counter's region (`region`) 7 of them, steps more than 15/255
+
+use frame::judge::shown
+use frame::last::cover
+use frame::picture::Frame
+use form::kinds::Paint
+use std::gpu::{
+    Atomics, DepthTexture, GlobalId, GpuBuffer, Rgba16Float, Texture, begin_screen_pass, buffer_of,
+    dispatch, draw, label, read, texture,
+}
+use std::io::{Pending, print}
+
+/// How many counts a frame has.
+pub const STEADY_COUNTS: u32 = 8
+
+/// A colour's brightness as the eye weighs it, as the screen shows it (0 to 1).
+fn luma(c: vec3) -> f32 {
+    dot(saturate(c), vec3(0.2126, 0.7152, 0.0722))
+}
+
+/// Frame `row`'s counts of pixel `id`, against the frame before (`was`; `moving` 0: there is
+/// none).
+@compute(8, 8)
+fn stepped(
+    now: Texture<Rgba16Float>,
+    was: Texture<Rgba16Float>,
+    depth: DepthTexture,
+    moving: u32,
+    row: u32,
+    region: vec4,
+    out: mut Atomics<u32>,
+    id: GlobalId,
+) {
+    let w = now.width()
+    let h = now.height()
+    if id.x >= w || id.y >= h {
+        return
+    }
+    let at = row * STEADY_COUNTS
+    let drawn = depth.load(id.x, id.y) > 0.0
+    if drawn {
+        let _ = out.add(i: at, value: 1)
+    }
+    if moving != 0 {
+        let step = abs(luma(now.load(id.x, id.y).xyz) - luma(was.load(id.x, id.y).xyz)) * 255.0
+        if step > 8.0 {
+            let _ = out.add(i: at + 1, value: 1)
+        }
+        if step > 15.0 {
+            let _ = out.add(i: at + 2, value: 1)
+        }
+        if step > 2.0 {
+            let _ = out.add(i: at + 4, value: 1)
+        }
+        let _ = out.add(i: at + 5, value: u32(step + 0.5))
+        let x = f32(id.x)
+        let y = f32(id.y)
+        if x >= region.x && y >= region.y && x < region.z && y < region.w {
+            let _ = out.add(i: at + 6, value: 1)
+            if step > 15.0 {
+                let _ = out.add(i: at + 7, value: 1)
+            }
+        }
+    }
+    if !drawn && id.x > 0 && id.y > 0 && id.x + 1 < w && id.y + 1 < h {
+        let across = depth.load(id.x - 1, id.y) > 0.0 && depth.load(id.x + 1, id.y) > 0.0
+        let down = depth.load(id.x, id.y - 1) > 0.0 && depth.load(id.x, id.y + 1) > 0.0
+        if across || down {
+            let _ = out.add(i: at + 3, value: 1)
+        }
+    }
+}
+
+/// The counter: how many frames it counts, the pictures (this frame's and the last, by turns),
+/// the counts, and the frames counted so far.
+pub struct Steady {
+    pub frames: u32,
+    /// A rectangle of the screen whose steps are counted apart (px: x0, y0, x1, y1).
+    pub region: vec4,
+    even: Texture<Rgba16Float>,
+    odd: Texture<Rgba16Float>,
+    counts: GpuBuffer<u32>,
+    heard: Option<Pending<u32>>,
+    done: u32,
+}
+
+/// A counter of `frames` frames.
+pub fn steady(frames: u32) -> Steady {
+    Steady {
+        frames,
+        region: vec4(0.0),
+        even: texture(width: 1, height: 1),
+        odd: texture(width: 1, height: 1),
+        counts: buffer_of(Vec::filled(frames * STEADY_COUNTS, 0)),
+        heard: None,
+        done: 0,
+    }
+}
+
+impl Steady {
+    /// `frame` ended into this frame's picture with `sky` where nothing is, counted against the
+    /// last, and shown; once the frames are done, the counts asked for, and said when they're
+    /// read back.
+    pub fn end<P: Paint>(mut self, frame: mut Frame, sky: P) {
+        let w = u32(frame.eye.size.x)
+        let h = u32(frame.eye.size.y)
+        if self.even.width() != w || self.even.height() != h {
+            self.even = texture(width: w, height: h)
+            self.odd = texture(width: w, height: h)
+        }
+        let even = self.done % 2 == 0
+        if even {
+            frame.end_into(sky, mut self.even)
+        } else {
+            frame.end_into(sky, mut self.odd)
+        }
+        if self.done < self.frames {
+            label("steady")
+            let moving: u32 = if self.done > 0 { 1 } else { 0 }
+            if even {
+                dispatch(
+                    stepped.bind(
+                        now: self.even,
+                        was: self.odd,
+                        depth: frame.depth,
+                        moving: moving,
+                        row: self.done,
+                        region: self.region,
+                        out: mut self.counts,
+                    ),
+                    over: (w, h),
+                )
+            } else {
+                dispatch(
+                    stepped.bind(
+                        now: self.odd,
+                        was: self.even,
+                        depth: frame.depth,
+                        moving: moving,
+                        row: self.done,
+                        region: self.region,
+                        out: mut self.counts,
+                    ),
+                    over: (w, h),
+                )
+            }
+            if self.done == self.frames - 1 {
+                self.heard = Some(read(self.counts.items()))
+            }
+        }
+        self.done += 1
+        self.said()
+        label("shown")
+        let screen = begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
+        if even {
+            draw(screen, cover, shown.bind(picture: self.even, style: frame.ink), vertices: 3)
+        } else {
+            draw(screen, cover, shown.bind(picture: self.odd, style: frame.ink), vertices: 3)
+        }
+        screen.present()
+    }
+
+    /// The counts said, once read back: each frame's, then their medians and most.
+    fn said(mut self) {
+        match mut self.heard {
+            Some(p) => match p.poll() {
+                Some(Ok(v)) => say(take v, self.frames),
+                _ => {},
+            },
+            None => {},
+        }
+    }
+}
+
+fn fewer(a: u32, b: u32) -> bool {
+    a < b
+}
+
+/// The counts `v` of `frames` frames, said.
+fn say(v: Vec<u32>, frames: u32) {
+    var steps: Vec<u32> = Vec::new()
+    var most8: u32 = 0
+    var most15: u32 = 0
+    var at8: u32 = 0
+    var holes: u32 = 0
+    var most_holes: u32 = 0
+    for f in 0..frames {
+        let r = f * STEADY_COUNTS
+        print(
+            f"steady: frame {f}: drawn {v[r]}, steps over 8/255 {v[r + 1]}, over 15/255 {v[r + 2]}, holes {v[r + 3]}, over 2/255 {v[r + 4]}, summed {v[r + 5]}, region {v[r + 6]} over 15/255 {v[r + 7]}",
+        )
+        if f > 0 {
+            steps.push(v[r + 1])
+            if v[r + 1] > most8 {
+                most8 = v[r + 1]
+                at8 = f
+            }
+            most15 = max(most15, v[r + 2])
+        }
+        holes += v[r + 3]
+        most_holes = max(most_holes, v[r + 3])
+    }
+    steps.sort_by(fewer)
+    let median = if steps.len() > 0 { steps[steps.len() / 2] } else { 0 }
+    print(
+        f"steady: over {frames} frames: pixels stepping over 8/255 frame to frame, median {median}, most {most8} (frame {at8}: {f32(most8) / max(f32(median), 1.0)} times the median); over 15/255 most {most15}; holes {holes} in all, {most_holes} in one frame at most",
+    )
+}

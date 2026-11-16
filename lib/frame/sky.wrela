@@ -1,0 +1,1209 @@
+// A plain sky: a paint of the whole sphere, brighter at the horizon, and a glow round the sun.
+// From the atoms spike's `sky` (draw.wrela:524).
+
+use clouds::{Clouds, CloudLight, Cloudscape, Volumes, jittered, march, sun_through}
+use sun::{SHADE_BLOCK, SHADE_SIDE, SHADE_SPAN, SunShade, on_air, shade_coarse}
+use eye::Eye
+use form::ink::InkStyle
+use form::kinds::Paint
+use judge::halton
+use last::displayed
+use std::gpu::{
+    Address, Atomics, DepthTexture, GlobalId, GpuBuffer, R32Float, Rgba16Float, Rgba32Float, Sampler,
+    Texels, Texels3d, Texture, Texture3d, buffer, buffer_of, copy_texture, dispatch, generate_mips,
+    label, limits, mip_levels, read, sampler, texture3d, writable_texture, write,
+}
+use form::shade::{NO_SKY_LIGHT, SkyLight, harmonics, sky_lit}
+use std::hash::{StateHash, state_hash}
+use std::io::Pending
+use std::math::{PI, TAU}
+
+/// Blue overhead, pale at the horizon, darkening to the ground below it, and a warm glow round
+/// `sun` (a unit vector toward it).
+pub struct Plain: Copy + GpuData + StateHash {
+    pub zenith: vec3,
+    pub glow: f32,
+    pub horizon: vec3,
+    pub spare0: f32,
+    pub ground: vec3,
+    pub spare1: f32,
+    pub sun: vec3,
+    pub spare2: f32,
+}
+
+impl Paint for Plain {
+    fn colour(self, d: vec3) -> vec4 {
+        let up = mix(self.horizon, self.zenith, saturate(d.y * 2.2))
+        let down = mix(self.horizon, self.ground, saturate(-d.y * 4.0))
+        let near_sun = pow(max(dot(d, self.sun), 0.0), 6.0)
+        vec4((if d.y >= 0.0 { up } else {
+            down
+        }) + vec3(0.35, 0.25, 0.12) * (self.glow * near_sun), 1.0)
+    }
+}
+
+/// The plain sky with the sun toward `sun` (a unit vector).
+pub fn plain(sun: vec3) -> Plain {
+    Plain {
+        zenith: vec3(0.3, 0.45, 0.72),
+        glow: 1.0,
+        horizon: vec3(0.72, 0.78, 0.84),
+        spare0: 0.0,
+        ground: vec3(0.3, 0.32, 0.3),
+        spare1: 0.0,
+        sun,
+        spare2: 0.0,
+    }
+}
+
+// ---- the sky as a table ---------------------------------------------------------------------
+//
+// For one sun and one moment a sky is a function of direction alone (docs/design.md, "Paint"),
+// so the frame cooks the scene's `Paint` into a table of directions and no pixel runs the paint
+// itself: the last pass reads the table where nothing is drawn, and a mirror (the sea) reads its
+// blurred layers (`mirror`). The table is the whole sphere by azimuth and elevation, its rows
+// finest at the horizon (where the sky changes fastest: its gradient's bands, clouds seen
+// edge on, the sea's mirror at a graze).
+//
+// The table is a held drawing, as anime holds a drawing on twos (docs/design.md, "Rates"): while
+// the paint changes it is redrawn whole every `DRAWN_OVER` frames, a band of its rows a frame into
+// a second table, which takes the first's place when it is whole; a paint that does not change
+// (its checksum the same) is drawn once. So a moving sky moves in drawings, `DRAWN_OVER` frames
+// apart, and its cost is a table's `1 / DRAWN_OVER` a frame, however many pixels read it. Its mips
+// are made when it takes its place, and the maps made from it (the mirror's, the glow, the sky's
+// light) over the next frames, a part a frame. (Nothing is smoothed across drawings: the last
+// pass reads one drawing.)
+
+/// The table's size: ways round the horizon, and from the nadir to the zenith.
+pub const AZIMUTHS: u32 = 1024
+pub const ELEVATIONS: u32 = 2048
+
+/// Over how many frames the table is redrawn: a band of `ELEVATIONS / DRAWN_OVER` rows a frame.
+/// (32 since the opening's gale sky weighs 170,086 a texel: a sixteenth of the table was 22
+/// billion work, past what one dispatch may do, docs/rates.md.)
+pub const DRAWN_OVER: u32 = 32
+
+/// The steps the maps made from the table are made again in, one a frame (`made_again`).
+const MAKING_STEPS: u32 = 5
+
+/// Where elevation `e` (rad, -π/2 to π/2) lies up the table (0 to 1): its rows finest at the
+/// horizon, as the square root of the elevation's share of a right angle either side.
+pub fn up_sphere(e: f32) -> f32 {
+    let a = sqrt(saturate(abs(e) / (0.5 * PI)))
+    0.5 + 0.5 * (if e < 0.0 { -a } else { a })
+}
+
+/// The elevation (rad) at `v` up the table: `up_sphere` undone.
+pub fn elevation_on(v: f32) -> f32 {
+    let a = 2.0 * (v - 0.5)
+    0.5 * PI * a * abs(a)
+}
+
+/// The way at azimuth `a` (rad, from +x toward +z) and elevation `e` (rad).
+pub fn way_at(a: f32, e: f32) -> vec3 {
+    vec3(cos(a) * cos(e), sin(e), sin(a) * cos(e))
+}
+
+/// Where the way `d` (a unit vector) is on the table, held half a row in from either end.
+pub fn on_table(d: vec3) -> vec2 {
+    let u = atan2(d.z, d.x) / TAU + 0.5
+    let v = clamp(
+        up_sphere(asin(clamp(d.y, -1.0, 1.0))),
+        0.5 / f32(ELEVATIONS),
+        1.0 - 0.5 / f32(
+            ELEVATIONS,
+        ),
+    )
+    vec2(u, v)
+}
+
+/// How finely the sky's light is summed from the table: ways round the horizon and rows up the
+/// upper half (each an equal share of it), and the table's mip it reads (64 by 128 ways).
+const LIGHT_ROUND: u32 = 64
+const LIGHT_UP: u32 = 32
+const LIGHT_LEVEL: f32 = 4.0
+
+/// Round the sun's way, the clouds' light held in the sky's light (`sky_harmonics`): wholly within
+/// `NEAR_SUN.x` rad of it, not at all past `NEAR_SUN.y`; to `NEAR_SUN_HELD` times the paint's.
+const NEAR_SUN = vec2(0.2, 0.4)
+const NEAR_SUN_HELD: f32 = 2.0
+
+/// How finely a whole number holds a share of the sky's light as it is summed (`sky_harmonics`).
+const LIGHT_FIXED: f32 = 1048576.0
+
+/// One way of the table's upper half, `id` (its way round in `x`, its row in `y`), its light
+/// against each harmonic added to the sums (`out`: harmonic `i`'s red, green and blue at `3 i` to
+/// `3 i + 2`, in parts of `LIGHT_FIXED`), the cosine taken (Ramamoorthi and Hanrahan's factors,
+/// over π) and its share of the half's solid angle. The lower half is the ground's, which a style
+/// takes as it throws back the sky's light (`Style::below`). Near the sun's way (`sun`, its `w` 1
+/// where the sky has clouds) the clouds' light is held to `NEAR_SUN_HELD` times the paint's behind
+/// them: what shines round the sun through a thin or torn cloud is the sun's own light, which a
+/// surface takes through `reach`; summed here as the sky's too, a break near the sun's bearing
+/// washed every face in the picture out.
+@compute(8, 8)
+fn sky_harmonics(
+    table: Texture<Rgba16Float>,
+    dome: Texture<Rgba16Float>,
+    s: Sampler,
+    sun: vec4,
+    out: mut Atomics<i32>,
+    id: GlobalId,
+) {
+    if id.x >= LIGHT_ROUND || id.y >= LIGHT_UP {
+        return
+    }
+    let e = asin((f32(id.y) + 0.5) / f32(LIGHT_UP))
+    let d = way_at((f32(id.x) + 0.5) / f32(LIGHT_ROUND) * TAU - PI, e)
+    let behind = table.sample_level(s, on_table(d), LIGHT_LEVEL)
+    let clouds = dome.sample_level(s, on_dome(d), log2(f32(dome.width()) / f32(LIGHT_ROUND)))
+    var c = composed(behind, clouds)
+    let near = smoothstep(cos(NEAR_SUN.y), cos(NEAR_SUN.x), dot(d, sun.xyz)) * sun.w
+    let luma = dot(c, vec3(0.2126, 0.7152, 0.0722))
+    let most = NEAR_SUN_HELD * max(dot(behind.xyz, vec3(0.2126, 0.7152, 0.0722)), 1.0e-3)
+    if near > 0.0 && luma > most {
+        c *= mix(1.0, most / luma, near)
+    }
+    c *= TAU / f32(LIGHT_ROUND * LIGHT_UP)
+    let y = harmonics(d)
+    for i in 0..9 {
+        let band = if i == 0 { 1.0 } else if i < 4 { 2.0 / 3.0 } else { 0.25 }
+        let v = c * (y[i] * band * LIGHT_FIXED)
+        let _ = out.add(3 * i, i32(round(v.x)))
+        let _ = out.add(3 * i + 1, i32(round(v.y)))
+        let _ = out.add(3 * i + 2, i32(round(v.z)))
+    }
+}
+
+/// Texel `id` of a band of the table's rows, from row `from`: the sky along its way, its
+/// middle's, seen by a texel's footprint round the horizon; and how much of the sky's clouds are
+/// seen in front of it (`Paint::veiled`).
+@compute(8, 8)
+fn cooked<P: Paint>(sky: P, from: u32, out: mut Texels<Rgba16Float>, id: GlobalId) {
+    if id.x >= AZIMUTHS || id.y >= ELEVATIONS / DRAWN_OVER {
+        return
+    }
+    let u = (f32(id.x) + 0.5) / f32(AZIMUTHS)
+    let v = (f32(from + id.y) + 0.5) / f32(ELEVATIONS)
+    let d = way_at((u - 0.5) * TAU, elevation_on(v))
+    out.store(id, vec4(sky.seen(d, TAU / f32(AZIMUTHS)).xyz, sky.veiled(d)))
+}
+
+// ---- the mirror's table ---------------------------------------------------------------------
+//
+// A rough mirror sees the sky spread: a normal tilted toward the eye by δ tilts the mirrored way
+// up by 2δ, and one tilted across turns it across by only 2δ n·v, little at a graze. So the
+// spread is up the sky, and the mirror's table holds the upper half of the sky blurred along its
+// elevation by a deviation doubling layer by layer (`SPREADS` of them, the first unblurred): one
+// trilinear read at the mirrored way and its spread is the mean over the slopes a pixel holds.
+// (Read through a footprint long up a plain table instead, with sixteenfold anisotropy, the read
+// was 0.9 ms of the sea's pass at 3840x2160.) Ways under the horizon read the horizon.
+
+/// The mirror's table's size: ways round the horizon, up from it to the zenith, and spreads.
+pub const MIRROR_AZIMUTHS: u32 = 256
+pub const MIRROR_ELEVATIONS: u32 = 64
+pub const SPREADS: u32 = 8
+
+/// The deviation of the mirrored way's elevation (rad) the mirror's second layer is blurred by;
+/// each layer after doubles it (the last, 1.28 rad).
+pub const FIRST_SPREAD: f32 = 0.02
+
+/// Where the elevation `e` (rad, 0 at the horizon) lies up the mirror's table (0 to 1).
+fn up_mirror(e: f32) -> f32 {
+    sqrt(saturate(e / (0.5 * PI)))
+}
+
+/// Where up the mirror's table `e` (rad) is read: held a half texel in from either end.
+fn held_up(e: f32) -> f32 {
+    clamp(up_mirror(max(e, 0.0)), 0.5 / f32(MIRROR_ELEVATIONS), 1.0 - 0.5 / f32(MIRROR_ELEVATIONS))
+}
+
+/// How many taps a layer's blur takes, either side of its middle.
+const TAPS: u32 = 8
+
+/// Texel `id` of the mirror's table where its layer is among the half from `first`: layer `id.z`'s,
+/// the sky (its table and its clouds' dome, each read at the mip as coarse as the mirror's texels)
+/// blurred up the sky by its layer's deviation, three deviations either way (under the horizon,
+/// the horizon's).
+@compute(8, 8, 1)
+fn spread(
+    sharp: Texture<Rgba16Float>,
+    dome: Texture<Rgba16Float>,
+    s: Sampler,
+    first: u32,
+    out: mut Texels3d<Rgba16Float>,
+    id: GlobalId,
+) {
+    if id.x >= MIRROR_AZIMUTHS || id.y >= MIRROR_ELEVATIONS || id.z < first || id.z >= min(first + SPREADS / 2, SPREADS) {
+        return
+    }
+    let a = ((f32(id.x) + 0.5) / f32(MIRROR_AZIMUTHS) - 0.5) * TAU
+    let v = (f32(id.y) + 0.5) / f32(MIRROR_ELEVATIONS)
+    let e = v * v * 0.5 * PI
+    let lod = log2(f32(AZIMUTHS) / f32(MIRROR_AZIMUTHS))
+    let dome_lod = log2(f32(dome.width()) / f32(MIRROR_AZIMUTHS))
+    let dev = if id.z == 0 { 0.0 } else { FIRST_SPREAD * f32(1 << (id.z - 1)) }
+    var sum = vec3(0.0)
+    var weights = 0.0
+    for i in 0..2 * TAPS + 1 {
+        let x = (f32(i) - f32(TAPS)) / f32(TAPS) * 3.0
+        let w = exp(-0.5 * x * x)
+        let d = way_at(a, max(e + x * dev, 0.0))
+        sum += composed(sharp.sample_level(s, on_table(d), lod), dome.sample_level(s, on_dome(d), dome_lod)) * w
+        weights += w
+    }
+    out.store(id, vec4(sum / weights, 1.0))
+}
+
+/// The sky along `d` (a unit vector, the mirrored way) as a surface sees it whose slope toward
+/// the eye deviates `toward_eye` (rad): the mirrored way's elevation deviates twice that.
+pub fn mirror(table: Texture3d<Rgba16Float>, s: Sampler, d: vec3, toward_eye: f32) -> vec3 {
+    let u = atan2(d.z, d.x) / TAU + 0.5
+    let v = held_up(asin(clamp(d.y, 0.0, 1.0)))
+    let layer = clamp(
+        log2(max(2.0 * toward_eye, 1.0e-6) / FIRST_SPREAD) + 1.0,
+        0.0,
+        f32(
+            SPREADS - 1,
+        ),
+    )
+    table.sample_level(s, vec3(u, v, (layer + 0.5) / f32(SPREADS)), 0.0).xyz
+}
+
+// ---- the mirror's sharp map and its facets ---------------------------------------------------
+//
+// A rough mirror (the sea) mirrors what the facets a pixel holds but can't draw mirror. The old
+// opening's sea took four of them, a quarter of the lost slopes each, each tilted by its
+// quarter's middle along the view and as much across, as many seen as their faces turn to the
+// eye, each by its own Fresnel (rywible/wrela 7ae6711e, scenes/opening/paint.wrela:971-1011,
+// after Bruneton, Neyret and Holzschuch 2010): so the deck's bright breaks are torn across the
+// waves where the blurred table smooths them into a wash. Each facet reads the sky's upper half
+// from one map composed of the table's paint and the dome's clouds when either changes
+// (`MAP_AZIMUTHS` by `MAP_ELEVATIONS`, rows finest at the horizon as the mirror's, with mips), at
+// the mip as coarse as the pixel's footprint of the mirrored way or the facet's own spread: one
+// read a facet, its way worked out as an azimuth and an elevation, no direction composed. (Each
+// facet reading the table and the dome at their finest, the ways composed, cost the sea's pass
+// 1.07 ms at 3840x2160: docs/dead-ends.md.)
+
+/// The sharp map's size: ways round the horizon (3 mrad a texel), and rows up to the zenith.
+pub const MAP_AZIMUTHS: u32 = 2048
+pub const MAP_ELEVATIONS: u32 = 512
+
+/// The middles of a normal spread's four quarters, in its deviations.
+const QUARTILES = [-1.15, -0.32, 0.32, 1.15]
+
+/// Texel `id` of the sharp map: the sky's table and its clouds' dome composed, each read at the
+/// mip as coarse as the map's texels.
+@compute(8, 8)
+fn mapped(
+    sharp: Texture<Rgba16Float>,
+    dome: Texture<Rgba16Float>,
+    s: Sampler,
+    out: mut Texels<Rgba16Float>,
+    id: GlobalId,
+) {
+    if id.x >= MAP_AZIMUTHS || id.y >= MAP_ELEVATIONS {
+        return
+    }
+    let a = ((f32(id.x) + 0.5) / f32(MAP_AZIMUTHS) - 0.5) * TAU
+    let v = (f32(id.y) + 0.5) / f32(MAP_ELEVATIONS)
+    let d = way_at(a, v * v * 0.5 * PI)
+    let lod = max(log2(f32(AZIMUTHS) / f32(MAP_AZIMUTHS)), 0.0)
+    let dome_lod = max(log2(f32(dome.width()) / f32(MAP_AZIMUTHS)), 0.0)
+    out.store(id, vec4(composed(sharp.sample_level(s, on_table(d), lod), dome.sample_level(s, on_dome(d), dome_lod)), 1.0))
+}
+
+/// The sky a rough surface mirrors toward the eye, from the sharp map (`map`): the mirrored way
+/// `r` (a unit vector), `nv` (the normal's cosine to the eye), the slopes the pixel lost
+/// (`slope`, their deviation, rad) and how wide the pixel's footprint of the mirrored way is
+/// (`foot`, rad): four facets, each read at the mip as coarse as its spread or the footprint.
+/// In `w`, how much of the sky they mirror: their Fresnel (water's) over those turned to the eye
+/// (a facet turned away is hidden behind the wave before it), so a rough sea seen low mirrors less
+/// than its mean normal would, and lies darker (Bruneton, Neyret and Holzschuch 2010; the old
+/// opening's `fresnel /= seen`, scenes/opening/paint.wrela:991-1011).
+pub fn mirrored(map: Texture<Rgba16Float>, s: Sampler, r: vec3, nv: f32, slope: f32, foot: f32) -> vec4 {
+    let rise = asin(clamp(r.y, 0.0, 1.0))
+    let round = atan2(r.z, r.x) / TAU + 0.5
+    let side = sqrt(max(1.0 - nv * nv, 0.0))
+    // (Each facet holds a quarter of the spread: about half a deviation each way.)
+    let wide = max(foot, slope * 0.5)
+    let lod = max(log2(wide * f32(MAP_AZIMUTHS) / TAU), 0.0)
+    var sum = vec3(0.0)
+    var weight = 0.0
+    var seen = 0.0
+    for k in 0..4 {
+        let tilt = slope * QUARTILES[k]
+        // (Its face's cosine to the eye: tilted toward it along the view.)
+        let c = nv + tilt * side
+        let e = max(rise + 2.0 * tilt, 0.002)
+        let u = round + slope * QUARTILES[(k + 2) % 4] * 1.2 / TAU
+        let v = clamp(sqrt(e / (0.5 * PI)), 0.5 / f32(MAP_ELEVATIONS), 1.0 - 0.5 / f32(MAP_ELEVATIONS))
+        let g = 1.0 - saturate(c)
+        let f = (0.02 + 0.98 * g * g * g * g * g) * (max(c, 0.0) + 1.0e-4)
+        sum += map.sample_level(s, vec2(u, v), lod).xyz * f
+        weight += f
+        seen += max(c, 0.0) + 1.0e-4
+    }
+    vec4(sum / max(weight, 1.0e-6), weight / seen)
+}
+
+// ---- the sky's glow -------------------------------------------------------------------------
+//
+// What's brightest in the sky glows round itself, as the old opening's picture did (its glow
+// gathered and spread at a quarter's size, scenes/opening/ink.wrela:261-362): the light past a
+// knee spread over its neighbours, so a cluster of bright texels near the sun (the dome's march
+// through thin deck) reads as one broad lightening. The sky alone, held in directions with the
+// map it is made from (`glow_bright`, then a Gaussian blur each way), and read with the sky where
+// the sky shows (`seen_sky`), its way the one the table and the dome are read at: one read more
+// a sky pixel. (Read at every pixel, over what stands in front of the sky too, its way worked out
+// there cost the last pass 0.38 ms at 3840x2160 on the M4; from a texture of it as the eye saw
+// it, a texel each 8 pixels, 0.12.)
+
+/// The glow's size: ways round, and rows from `GLOW_LOW` (rad, under the horizon) to the zenith,
+/// evenly (12 mrad by 10).
+pub const GLOW_WIDTH: u32 = 512
+pub const GLOW_HEIGHT: u32 = 160
+const GLOW_LOW: f32 = -0.1
+
+/// How wide the glow's blur is (its deviation, texels: about 0.05 rad, the old's sixteen rings
+/// out to 32 px at 720 lines).
+const GLOW_SPREAD: f32 = 4.0
+
+/// Where the way `d` is on the glow's map.
+pub fn on_glow(d: vec3) -> vec2 {
+    let e = asin(clamp(d.y, -1.0, 1.0))
+    vec2(atan2(d.z, d.x) / TAU + 0.5, clamp((0.5 * PI - e) / (0.5 * PI - GLOW_LOW), 0.0, 1.0))
+}
+
+/// Texel `id` of the glow's first map: the sharp map's light past `knee` (linear), its hue kept, to
+/// at most `GLOW_MOST` times the knee.
+@compute(8, 8)
+fn glow_bright(map: Texture<Rgba16Float>, s: Sampler, knee: f32, out: mut Texels<Rgba16Float>, id: GlobalId) {
+    if id.x >= GLOW_WIDTH || id.y >= GLOW_HEIGHT {
+        return
+    }
+    let u = (f32(id.x) + 0.5) / f32(GLOW_WIDTH)
+    let e = 0.5 * PI - (f32(id.y) + 0.5) / f32(GLOW_HEIGHT) * (0.5 * PI - GLOW_LOW)
+    let v = clamp(sqrt(max(e, 0.0) / (0.5 * PI)), 0.5 / f32(MAP_ELEVATIONS), 1.0 - 0.5 / f32(MAP_ELEVATIONS))
+    let c = map.sample_level(s, vec2(u, v), log2(f32(MAP_AZIMUTHS) / f32(GLOW_WIDTH))).xyz
+    let l = dot(c, vec3(0.2126, 0.7152, 0.0722))
+    out.store(id, vec4(c * (min(max(l - knee, 0.0), GLOW_MOST * knee) / max(l, 1.0e-6)), 1.0))
+}
+
+/// The most the glow takes of a way's light past the knee, times the knee: past it is the sun's own
+/// light seen through a break in a deck (hundreds of times the knee), and blurred it spread a disc of
+/// white 20 degrees round the sun.
+const GLOW_MOST: f32 = 8.0
+
+/// The light added to the sky where a ray meets nothing, as the last pass reads it in place of the
+/// glow where the air is lit (`added`): the glow's ways, finer, as fine as the air's map.
+pub const ADDED_WIDTH: u32 = 1024
+pub const ADDED_HEIGHT: u32 = 320
+
+/// Texel `id` of the light added to the sky (`ADDED_WIDTH` by `ADDED_HEIGHT`, the glow's ways):
+/// the glow (`glow`, `glow_k` of it) and the sun's light on the air all along the way (`air`, its
+/// far sum, `w`; `light` the sun's light on the air), so a ray that meets nothing reads both in
+/// the one read it made of the glow alone.
+@compute(8, 8)
+pub fn added(glow: Texture<Rgba16Float>, s: Sampler, glow_k: f32, air: Texture<Rgba16Float>, airs: Sampler, light: vec3, out: mut Texels<Rgba16Float>, id: GlobalId) {
+    if id.x >= ADDED_WIDTH || id.y >= ADDED_HEIGHT {
+        return
+    }
+    let uv = (vec2(f32(id.x), f32(id.y)) + vec2(0.5)) / vec2(f32(ADDED_WIDTH), f32(ADDED_HEIGHT))
+    let e = 0.5 * PI - uv.y * (0.5 * PI - GLOW_LOW)
+    let a = (uv.x - 0.5) * TAU
+    let d = vec3(cos(e) * cos(a), sin(e), cos(e) * sin(a))
+    let lit = light * max(air.sample_level(airs, on_air(d), 0.0).w, 0.0)
+    out.store(id, vec4(glow.sample_level(s, uv, 0.0).xyz * glow_k + lit, 1.0))
+}
+
+/// Texel `id` of the glow blurred along `across` (1: round the horizon, repeating; 0: up, held at
+/// its ends) from `from`.
+@compute(8, 8)
+fn glow_blurred(from: Texture<Rgba16Float>, across: u32, out: mut Texels<Rgba16Float>, id: GlobalId) {
+    if id.x >= GLOW_WIDTH || id.y >= GLOW_HEIGHT {
+        return
+    }
+    var sum = vec4(0.0)
+    var weights = 0.0
+    for k in 0..25 {
+        let o = i32(k) - 12
+        let w = exp(-0.5 * f32(o * o) / (GLOW_SPREAD * GLOW_SPREAD))
+        let x = if across == 1 { u32((i32(id.x) + o + i32(GLOW_WIDTH)) % i32(GLOW_WIDTH)) } else { id.x }
+        let y = if across == 1 { id.y } else { u32(clamp(i32(id.y) + o, 0, i32(GLOW_HEIGHT) - 1)) }
+        sum += from.load(x, y) * w
+        weights += w
+    }
+    out.store(id, sum / weights)
+}
+
+// ---- the clouds' dome ------------------------------------------------------------------------
+//
+// A sky's clouds (a medium: lib/frame's `clouds`) are marched once into a dome of directions
+// the frame keeps, as the old engine kept its storm's (rywible/wrela 7ae6711e, engine/sky.wrela:
+// 60-70, 1242-1364, with the opening's `HALF_SKY` and `MOVING_CLOUDS` false): every way round the
+// eye and from a little under the horizon to the zenith, each texel a ray marched through the
+// layer from where the eye stood. The clouds are kilometres off, so the eye moving metres moves
+// nothing in it and turning looks elsewhere in it; it is marched again only when its clouds are
+// changed or the eye has gone `MARCHED_AGAIN` from where it was marched. It is marched in blocks
+// over frames, the blocks nearest where the eye looks first, each block a dispatch within what
+// one may do; until a block is marched its ways show the paint alone. When every block is in,
+// it is finished as the old opening's weather pass finished its dome (scenes/opening/
+// weather.wrela:305-341): the march's dither smoothed, and a hole torn in a storm's deck that the
+// deck closes round shows a higher layer, the deck's own light round it a little brighter
+// (`Cloudscape::higher`), into a dome `DOME_FINE` times finer each way, read from the marched
+// one through a cubic B-spline (`smoothly`), so a texel far brighter than those round it (as the
+// march's are near the sun, through thin deck) is a soft round light and not a texel's square
+// when read between the finer texels; then its mips are made (the mirror's and the sky's light
+// read them). What it costs a frame once whole is one read where the sky shows. (The B-spline
+// read at every pixel instead cost the last pass 0.20 ms at 3840x2160 on the M4.) Until it is
+// whole, the marched dome is read.
+
+/// The dome's size: ways round (all round, from the same way as the table's) and rows from the
+/// zenith down to `DOME_LOW` (rad, under the horizon): the old's half dome.
+pub const DOME_WIDTH: u32 = 2048
+pub const DOME_HEIGHT: u32 = 640
+pub const DOME_LOW: f32 = -0.08
+
+/// How many times finer each way the finished dome is than the marched one.
+pub const DOME_FINE: u32 = 2
+
+/// A block of the dome a dispatch marches (texels), and how many blocks a frame.
+const BLOCK_WIDTH: u32 = 64
+const BLOCK_HEIGHT: u32 = 32
+pub const BLOCKS_A_FRAME: u32 = 3
+
+/// How far the eye goes from where the dome was marched before it's marched again (m).
+pub const MARCHED_AGAIN: f32 = 1000.0
+
+/// Where the way `d` (a unit vector) is in the dome: held half a row in from its ends.
+pub fn on_dome(d: vec3) -> vec2 {
+    let u = atan2(d.z, d.x) / TAU + 0.5
+    let e = asin(clamp(d.y, -1.0, 1.0))
+    let v = (0.5 * PI - e) / (0.5 * PI - DOME_LOW)
+    vec2(u, clamp(v, 0.5 / f32(DOME_HEIGHT), 1.0 - 0.5 / f32(DOME_HEIGHT)))
+}
+
+/// The way through the dome's texel `t` (its middle).
+fn dome_way(t: vec2u) -> vec3 {
+    dome_way_at(vec2((f32(t.x) + 0.5) / f32(DOME_WIDTH), (f32(t.y) + 0.5) / f32(DOME_HEIGHT)))
+}
+
+/// The way through the dome at `uv`.
+fn dome_way_at(uv: vec2) -> vec3 {
+    way_at((uv.x - 0.5) * TAU, 0.5 * PI - uv.y * (0.5 * PI - DOME_LOW))
+}
+
+/// The sky seen through its clouds: the paint (`behind`: its colour, and in `w` how much of the
+/// clouds are seen in front of it) and the clouds (`clouds`: their light premultiplied by their
+/// cover, and their cover).
+pub fn composed(behind: vec4, clouds: vec4) -> vec3 {
+    behind.xyz * (1.0 - clouds.w * behind.w) + clouds.xyz * behind.w
+}
+
+/// Texel `id` of the block of the dome at `at` (texels): the clouds (`scape` lit by `light`)
+/// marched from `eye` along its way.
+@compute(64, 1)
+fn domed(
+    scape: Cloudscape,
+    light: CloudLight,
+    eye: vec3,
+    at: vec2u,
+    v: Volumes,
+    out: mut Texels<Rgba16Float>,
+    id: GlobalId,
+) {
+    if id.x >= BLOCK_WIDTH || id.y >= BLOCK_HEIGHT {
+        return
+    }
+    let t = at + vec2u(id.x, id.y)
+    out.store(id, march(scape, light, eye, dome_way(t), jittered(t), v))
+}
+
+/// How many rows of the sun's map (`sun::SunShade`) a frame marches.
+const SHADE_ROWS: u32 = 64
+
+/// Texel `id` of the sun's map round `centre` (x, z, m), if it is in rows `from` to `to`: how much
+/// of the sun's beam the layer lets through to the sea's level there.
+@compute(8, 8)
+fn shaded(
+    scape: Cloudscape,
+    light: CloudLight,
+    centre: vec2,
+    from: u32,
+    to: u32,
+    v: Volumes,
+    out: mut Texels3d<R32Float>,
+    id: GlobalId,
+) {
+    if id.x >= SHADE_SIDE || id.y < from || id.y >= to {
+        return
+    }
+    let xz = centre + ((vec2(f32(id.x), f32(id.y)) + vec2(0.5)) / f32(SHADE_SIDE) - vec2(0.5)) * SHADE_SPAN
+    out.store(id, sun_through(scape, light, v, vec3(xz.x, 0.0, xz.y), jittered(vec2u(id.x, id.y))))
+}
+
+/// Texel `id` of the finished dome (`DOME_FINE` times finer each way), from the marched one
+/// (`raw`): its march's dither smoothed (`raw` read through a cubic B-spline), and a hole torn in a storm's deck that the
+/// deck closes round (its cover summed eight ways round it, seven texels off) given a higher
+/// layer's light, `scape.higher` times the deck's round it, as far as it is a hole and a storm
+/// (`gloom`); neither low on the horizon, under `scape.closes` (the sine of an elevation)
+/// (scenes/opening/weather.wrela:305-341).
+@compute(8, 8)
+fn finished(raw: Texture<Rgba16Float>, s: Sampler, scape: Cloudscape, out: mut Texels<Rgba16Float>, id: GlobalId) {
+    if id.x >= DOME_WIDTH * DOME_FINE || id.y >= DOME_HEIGHT * DOME_FINE {
+        return
+    }
+    let texel = vec2(1.0 / f32(DOME_WIDTH), 1.0 / f32(DOME_HEIGHT))
+    let uv = (vec2(f32(id.x), f32(id.y)) + vec2(0.5)) * texel / f32(DOME_FINE)
+    let d = dome_way_at(uv)
+    let one = raw.sample_level(s, uv)
+    let around = smoothly(raw, s, uv)
+    var c = mix(one, around, vec4(smoothstep(0.5 * scape.closes, scape.closes, d.y)))
+    let hole = 1.0 - saturate(c.w)
+    if hole > 0.01 && scape.gloom > 0.0 {
+        var round = vec4(0.0)
+        for k in 0..8 {
+            let a = f32(k) * 0.785398
+            round += raw.sample_level(s, uv + vec2(cos(a), sin(a)) * texel * 7.0)
+        }
+        let higher = round.xyz / max(round.w, 1.0e-3) * scape.higher
+        let f = hole * smoothstep(4.0, 7.0, round.w) * smoothstep(scape.closes, 2.0 * scape.closes, d.y) * scape.gloom
+        c = vec4(c.xyz * (1.0 - f) + higher * f, 1.0 - (1.0 - f) * (1.0 - c.w))
+    }
+    out.store(id, c)
+}
+
+/// The sky along `d` (a unit vector) as the frame holds it: the table's paint, its clouds in the
+/// dome in front of it.
+pub fn skyward(table: Texture<Rgba16Float>, dome: Texture<Rgba16Float>, s: Sampler, d: vec3) -> vec3 {
+    composed(table.sample_level(s, on_table(d), 0.0), dome.sample_level(s, on_dome(d), 0.0))
+}
+
+/// `t` at `uv` read through a cubic B-spline over its texels, in four reads between texels
+/// (Sigg and Hadwiger 2005, docs/citations.md): its light changes smoothly, with no texel's
+/// square in it where a texel is far brighter than those round it.
+pub fn smoothly(t: Texture<Rgba16Float>, s: Sampler, uv: vec2) -> vec4 {
+    let size = vec2(f32(t.width()), f32(t.height()))
+    let p = uv * size - vec2(0.5)
+    let i = floor(p)
+    let f = p - i
+    let g = vec2(1.0) - f
+    let w0 = g * g * g / 6.0
+    let w1 = (vec2(4.0) - 6.0 * f * f + 3.0 * f * f * f) / 6.0
+    let w3 = f * f * f / 6.0
+    let w2 = vec2(1.0) - w0 - w1 - w3
+    let lo = w0 + w1
+    let hi = w2 + w3
+    // (Held within its rows top and bottom; round its rows as the sampler takes them.)
+    let a = vec2((i.x - 0.5 + w1.x / lo.x) / size.x, clamp((i.y - 0.5 + w1.y / lo.y) / size.y, 0.5 / size.y, 1.0 - 0.5 / size.y))
+    let b = vec2((i.x + 1.5 + w3.x / hi.x) / size.x, clamp((i.y + 1.5 + w3.y / hi.y) / size.y, 0.5 / size.y, 1.0 - 0.5 / size.y))
+    (t.sample_level(s, vec2(a.x, a.y), 0.0) * lo.x + t.sample_level(s, vec2(b.x, a.y), 0.0) * hi.x) * lo.y +
+        (t.sample_level(s, vec2(a.x, b.y), 0.0) * lo.x + t.sample_level(s, vec2(b.x, b.y), 0.0) * hi.x) * hi.y
+}
+
+/// What the last pass reads of the sky: the table, the dome, how they're read.
+pub borrow struct SkySeen {
+    pub table: borrow Texture<Rgba16Float>,
+    pub dome: borrow Texture<Rgba16Float>,
+    pub s: borrow Sampler,
+    /// The sky's glow (`on_glow`), and how much of it shows (the style's `glow`).
+    pub glow: borrow Texture<Rgba16Float>,
+    pub glow_k: f32,
+}
+
+/// The sky along `d` (a unit vector), as the frame's tables hold it.
+pub fn seen_sky(k: SkySeen, d: vec3) -> vec3 {
+    let c = skyward(k.table, k.dome, k.s, d)
+    if k.glow_k > 0.0 {
+        return c + k.glow.sample_level(k.s, on_glow(d), 0.0).xyz * k.glow_k
+    }
+    c
+}
+
+// ---- the tables -----------------------------------------------------------------------------
+
+/// The sky's tables: the drawing the last pass reads (`table`, with mips), the one being drawn
+/// (`next`), the band of rows drawn this frame, the mirror's (`mirror`), how they're read
+/// (linear, round the horizon repeating), which band is next, and whether the first drawing is
+/// yet to be; and the clouds' dome (`dome`, finished, with mips; `raw`, as marched; the block
+/// marched now), the order its blocks are marched in, how many are, and where from.
+pub struct SkyTable {
+    pub table: Texture<Rgba16Float>,
+    next: Texture<Rgba16Float>,
+    band: Texture<Rgba16Float>,
+    pub mirror: Texture3d<Rgba16Float>,
+    /// The mirror's sharp map (`mirrored`).
+    pub map: Texture<Rgba16Float>,
+    /// The sky's glow (`glow_bright`), and the map it is blurred through; the knee it was made
+    /// for.
+    pub glow: Texture<Rgba16Float>,
+    glow_half: Texture<Rgba16Float>,
+    pub knee: f32,
+    /// How many times the glow has been made (what is made from it knows when to be made again).
+    pub glows: u32,
+    pub s: Sampler,
+    part: u32,
+    fresh: bool,
+    /// The checksum of the paint the table holds, and whether a drawing of it is under way into
+    /// `next` (of the paint whose checksum is `drawing`).
+    drawn: u64,
+    drawing: u64,
+    under_way: bool,
+    /// How many times what the maps are made from has changed (a drawing taking its place, the
+    /// dome marched or finished), and the count and knee they were last made for; the step of
+    /// their making under way (0: none).
+    changes: u32,
+    made_for: u32,
+    made_knee: f32,
+    making: u32,
+    /// The sky's light as a face turned each way takes it (`SkyLight`), from the last whole
+    /// drawing (read back a few frames after it takes its place; none before the first).
+    pub light: SkyLight,
+    harmonics: GpuBuffer<i32>,
+    asked: Option<Pending<i32>>,
+    /// The sky's clouds, a medium marched in front of the paint, if it has any (`set_clouds`).
+    clouds: Option<Clouds>,
+    pub dome: Texture<Rgba16Float>,
+    raw: Texture<Rgba16Float>,
+    block: Texture<Rgba16Float>,
+    order: Vec<u32>,
+    marched: u32,
+    whole: bool,
+    marched_from: vec3,
+    /// The sun's map past the clouds (`sun::SunShade`): how many of its rows are marched, and its
+    /// middle on the ground.
+    shade: Texture3d<R32Float>,
+    shade_coarse: Texture3d<R32Float>,
+    shaded_rows: u32,
+    shade_at: vec2,
+    /// Whether the frame's style has a sun's light: where it has none, the sun's map past the
+    /// clouds is never marched and every point reads the layer's `1 - gloom`.
+    pub sunlit: bool,
+}
+
+/// The tables, empty until drawn.
+pub fn sky_table() -> SkyTable {
+    let levels = mip_levels(AZIMUTHS, ELEVATIONS)
+    SkyTable {
+        table: writable_texture::<Rgba16Float>(width: AZIMUTHS, height: ELEVATIONS, levels: levels),
+        next: writable_texture::<Rgba16Float>(width: AZIMUTHS, height: ELEVATIONS, levels: levels),
+        band: writable_texture::<Rgba16Float>(width: AZIMUTHS, height: ELEVATIONS / DRAWN_OVER),
+        mirror: texture3d::<Rgba16Float>(
+            width: MIRROR_AZIMUTHS,
+            height: MIRROR_ELEVATIONS,
+            depth: SPREADS,
+        ),
+        map: writable_texture::<Rgba16Float>(width: MAP_AZIMUTHS, height: MAP_ELEVATIONS, levels: mip_levels(MAP_AZIMUTHS, MAP_ELEVATIONS)),
+        glow: writable_texture::<Rgba16Float>(width: GLOW_WIDTH, height: GLOW_HEIGHT),
+        glow_half: writable_texture::<Rgba16Float>(width: GLOW_WIDTH, height: GLOW_HEIGHT),
+        knee: 1.0e9,
+        glows: 0,
+        s: sampler(address: Address::Repeat),
+        part: 0,
+        fresh: true,
+        drawn: 0,
+        drawing: 0,
+        under_way: false,
+        changes: 0,
+        made_for: 0,
+        made_knee: 0.0,
+        making: 0,
+        light: NO_SKY_LIGHT,
+        harmonics: buffer(27),
+        asked: None,
+        clouds: None,
+        dome: writable_texture::<Rgba16Float>(width: 8, height: 8),
+        raw: writable_texture::<Rgba16Float>(width: 8, height: 8),
+        block: writable_texture::<Rgba16Float>(width: 8, height: 8),
+        order: Vec::new(),
+        marched: 0,
+        whole: false,
+        marched_from: vec3(0.0),
+        shade: texture3d::<R32Float>(width: 1, height: 1, depth: 1),
+        shade_coarse: texture3d::<R32Float>(width: 1, height: 1, depth: 1),
+        shaded_rows: 0,
+        shade_at: vec2(0.0),
+        sunlit: true,
+    }
+}
+
+impl SkyTable {
+    /// What the last pass reads of it.
+    pub fn seen(self, k: f32) -> SkySeen {
+        if self.whole {
+            return SkySeen { table: self.table, dome: self.dome, s: self.s, glow: self.glow, glow_k: k }
+        }
+        SkySeen { table: self.table, dome: self.raw, s: self.s, glow: self.glow, glow_k: k }
+    }
+
+    /// What the last pass reads of it where the light added to the sky is `added` (`added`'s
+    /// texels: the glow and the sun's light on the air), in place of the glow.
+    pub fn seen_added(self, added: Texture<Rgba16Float>) -> SkySeen {
+        if self.whole {
+            return SkySeen { table: self.table, dome: self.dome, s: self.s, glow: added, glow_k: 1.0 }
+        }
+        SkySeen { table: self.table, dome: self.raw, s: self.s, glow: added, glow_k: 1.0 }
+    }
+
+    /// The sky's glow made again from its sharp map, past `knee`.
+    fn glowed(mut self) {
+        self.glows += 1
+        dispatch(
+            glow_bright.bind(map: self.map, s: self.s, knee: self.knee, out: mut self.glow),
+            groups: (GLOW_WIDTH / 8, GLOW_HEIGHT / 8, 1),
+        )
+        dispatch(
+            glow_blurred.bind(from: self.glow, across: 1, out: mut self.glow_half),
+            groups: (GLOW_WIDTH / 8, GLOW_HEIGHT / 8, 1),
+        )
+        dispatch(
+            glow_blurred.bind(from: self.glow_half, across: 0, out: mut self.glow),
+            groups: (GLOW_WIDTH / 8, GLOW_HEIGHT / 8, 1),
+        )
+    }
+
+    /// The sky's clouds: `c` (a cloud layer, `clouds::clouds`), marched into the dome from the
+    /// next frame, nearest where the eye looks first.
+    pub fn set_clouds(mut self, c: take Clouds) {
+        self.clouds = Some(take c)
+        if self.raw.width() != DOME_WIDTH {
+            let w = DOME_WIDTH * DOME_FINE
+            let h = DOME_HEIGHT * DOME_FINE
+            self.dome = writable_texture::<Rgba16Float>(width: w, height: h, levels: mip_levels(w, h))
+            self.raw = writable_texture::<Rgba16Float>(width: DOME_WIDTH, height: DOME_HEIGHT)
+            self.block = writable_texture::<Rgba16Float>(width: BLOCK_WIDTH, height: BLOCK_HEIGHT)
+        }
+        self.order = Vec::new()
+        self.marched = 0
+        if self.shade.width() != SHADE_SIDE {
+            self.shade = texture3d::<R32Float>(width: SHADE_SIDE, height: SHADE_SIDE, depth: 1)
+            let n = SHADE_SIDE / SHADE_BLOCK
+            self.shade_coarse = texture3d::<R32Float>(width: n, height: n, depth: 1)
+        }
+        self.shaded_rows = 0
+    }
+
+    /// The sun's reach past the clouds as the frame's light carries it, the sun toward `sun`: none
+    /// held off where the sky has no clouds; until the map is whole, `unmapped` everywhere (what
+    /// it gives a point off the map too).
+    pub fn sun_shade(self, sun: vec3) -> SunShade {
+        let state = if self.clouds.is_none() { 0.0 } else if self.shaded_rows >= SHADE_SIDE { 1.0 } else { 2.0 }
+        let unmapped = match self.clouds {
+            Some(c) => 1.0 - c.scape.gloom,
+            None => 1.0,
+        }
+        SunShade {
+            map: self.shade.to_handle(),
+            coarse: self.shade_coarse.to_handle(),
+            at: vec4(self.shade_at.x, self.shade_at.y, SHADE_SPAN, state),
+            sun: vec4(sun, unmapped),
+        }
+    }
+
+    /// The way to the sun its clouds are lit from, `w` 1; none where it has no clouds.
+    fn sun_way(self) -> vec4 {
+        match self.clouds {
+            Some(c) => vec4(c.light.sun, 1.0),
+            None => vec4(0.0),
+        }
+    }
+
+    /// Whether the sky has clouds and their dome is whole.
+    pub fn clouded(self) -> bool {
+        self.whole
+    }
+
+    /// This frame's part of keeping the table a drawing of `sky` (a paint of the world's ways, not
+    /// the screen's) and of the maps made from it; and this frame's blocks of the clouds' dome
+    /// marched from where `eye` is.
+    ///
+    /// The work runs at the lowest rate that gives the same picture. Frames go in cycles of
+    /// `DRAWN_OVER`. At a cycle's start, a drawing finished in the last takes its place (its mips
+    /// made then), and a new one begins if the paint's checksum is not the table's: a band of rows
+    /// a frame. A held sky is drawn once. The maps made from the table and the dome (the mirror's
+    /// layers and sharp map, the sky's light, the glow) are made again only where what they are
+    /// made from changed since they were made, one part a frame over the cycle's next frames
+    /// (`made_again`), so no frame pays for them all. The first frame does it all at once.
+    pub fn refresh<P: Paint>(mut self, sky: P, eye: Eye) {
+        assert(!P::ON_SCREEN, "a sky table holds the world's ways")
+        label("sky table")
+        let rows = ELEVATIONS / DRAWN_OVER
+        let checksum = state_hash(sky)
+        if self.fresh {
+            for part in 0..DRAWN_OVER {
+                dispatch(
+                    cooked.bind(sky, from: part * rows, out: mut self.band),
+                    groups: (AZIMUTHS / 8, rows / 8, 1),
+                )
+                copy_texture(self.band.level(0), self.next.level_mut(0), to_y: part * rows)
+            }
+            swap(mut self.table, mut self.next)
+            generate_mips(mut self.table, self.s)
+            self.drawn = checksum
+            self.changes += 1
+            for step in 1..MAKING_STEPS + 1 {
+                self.made_again(step)
+            }
+            self.made_for = self.changes
+            self.made_knee = self.knee
+        } else {
+            if self.part == 0 {
+                if self.under_way {
+                    swap(mut self.table, mut self.next)
+                    generate_mips(mut self.table, self.s)
+                    self.drawn = self.drawing
+                    self.under_way = false
+                    self.changes += 1
+                }
+                if self.made_for != self.changes || self.made_knee != self.knee {
+                    self.made_for = self.changes
+                    self.made_knee = self.knee
+                    self.making = 1
+                }
+                if checksum != self.drawn {
+                    self.under_way = true
+                    self.drawing = checksum
+                }
+            } else if self.making > 0 {
+                self.made_again(self.making)
+                self.making = if self.making == MAKING_STEPS { 0 } else { self.making + 1 }
+            }
+            if self.under_way {
+                dispatch(
+                    cooked.bind(sky, from: self.part * rows, out: mut self.band),
+                    groups: (AZIMUTHS / 8, rows / 8, 1),
+                )
+                copy_texture(self.band.level(0), self.next.level_mut(0), to_y: self.part * rows)
+            }
+            self.part = (self.part + 1) % DRAWN_OVER
+            self.march_dome(eye)
+        }
+        match mut self.asked {
+            Some(a) => match a.poll() {
+                Some(Ok(v)) => {
+                    for i in 0..9 {
+                        self.light.c[i] = vec4(
+                            f32(v[3 * i]),
+                            f32(v[3 * i + 1]),
+                            f32(v[3 * i + 2]),
+                            0.0,
+                        ) / LIGHT_FIXED
+                    }
+                    self.light.up = vec4(sky_lit(self.light, vec3(0.0, 1.0, 0.0)), 0.0)
+                    self.asked = None
+                },
+                _ => {},
+            },
+            None => {},
+        }
+        self.fresh = false
+    }
+
+    /// Step `step` (1 to `MAKING_STEPS`) of making the maps again from the table and the dome
+    /// (until the dome is whole, the marched one): the mirror's layers, half a step; its sharp
+    /// map; the sharp map's mips and the sky's light; the glow. Each is at most about 0.4 ms at
+    /// any size on the M4, so a frame that makes one does not stand out.
+    fn made_again(mut self, step: u32) {
+        if step <= 2 {
+            // (The mirror's layers in two halves: read from the dome as marched, before it is
+            // whole and has mips, the whole of it was 7 ms on the Radeon.)
+            let first = (step - 1) * SPREADS / 2
+            if self.whole {
+                dispatch(
+                    spread.bind(sharp: self.table, dome: self.dome, s: self.s, first: first, out: mut self.mirror),
+                    groups: (MIRROR_AZIMUTHS / 8, MIRROR_ELEVATIONS / 8, SPREADS),
+                )
+            } else {
+                dispatch(
+                    spread.bind(sharp: self.table, dome: self.raw, s: self.s, first: first, out: mut self.mirror),
+                    groups: (MIRROR_AZIMUTHS / 8, MIRROR_ELEVATIONS / 8, SPREADS),
+                )
+            }
+        } else if step == 3 {
+            if self.whole {
+                dispatch(
+                    mapped.bind(sharp: self.table, dome: self.dome, s: self.s, out: mut self.map),
+                    groups: (MAP_AZIMUTHS / 8, MAP_ELEVATIONS / 8, 1),
+                )
+            } else {
+                dispatch(
+                    mapped.bind(sharp: self.table, dome: self.raw, s: self.s, out: mut self.map),
+                    groups: (MAP_AZIMUTHS / 8, MAP_ELEVATIONS / 8, 1),
+                )
+            }
+        } else if step == 4 {
+            generate_mips(mut self.map, self.s)
+            write(mut self.harmonics, 0, [0; 27])
+            if self.whole {
+                dispatch(
+                    sky_harmonics.bind(table: self.table, dome: self.dome, s: self.s, sun: self.sun_way(), out: mut self.harmonics),
+                    over: (LIGHT_ROUND, LIGHT_UP),
+                )
+            } else {
+                dispatch(
+                    sky_harmonics.bind(table: self.table, dome: self.raw, s: self.s, sun: self.sun_way(), out: mut self.harmonics),
+                    over: (LIGHT_ROUND, LIGHT_UP),
+                )
+            }
+            if self.asked.is_none() {
+                self.asked = Some(read(self.harmonics.items()))
+            }
+        } else if self.knee < 1.0e8 {
+            self.glowed()
+        }
+    }
+
+    /// This frame's blocks of the clouds' dome, if it has clouds: the blocks in order, nearest
+    /// where `eye` looks first (from the eye as it stood when the march began), into the marched
+    /// dome, and, until the dome is first whole, the finished one too; when the last is in, the
+    /// dome finished and its mips made. Begun again where the eye has gone `MARCHED_AGAIN`.
+    fn march_dome(mut self, eye: Eye) {
+        match self.clouds {
+            Some(c) => {
+                let across = DOME_WIDTH / BLOCK_WIDTH
+                let blocks = across * (DOME_HEIGHT / BLOCK_HEIGHT)
+                if self.whole && self.marched >= blocks && length(eye.at - self.marched_from) > MARCHED_AGAIN {
+                    self.order = Vec::new()
+                    self.marched = 0
+                }
+                if self.order.len() == 0 {
+                    self.order = nearest_first(eye.forward, across, blocks)
+                    self.marched_from = eye.at
+                }
+                if self.marched >= blocks {
+                    // The sun's map, a band of rows a frame once the dome is whole, round where
+                    // the dome was first marched from.
+                    if self.sunlit && self.shaded_rows < SHADE_SIDE {
+                        if self.shaded_rows == 0 {
+                            self.shade_at = vec2(self.marched_from.x, self.marched_from.z)
+                        }
+                        label("clouds' shade")
+                        let to = min(self.shaded_rows + SHADE_ROWS, SHADE_SIDE)
+                        dispatch(
+                            shaded.bind(scape: c.scape, light: c.light, centre: self.shade_at,
+                                from: self.shaded_rows, to: to, v: c.volumes(), out: mut self.shade),
+                            groups: (SHADE_SIDE / 8, SHADE_SIDE / 8, 1),
+                        )
+                        self.shaded_rows = to
+                        if to >= SHADE_SIDE {
+                            let n = SHADE_SIDE / SHADE_BLOCK
+                            dispatch(shade_coarse.bind(map: self.shade, out: mut self.shade_coarse), groups: (n / 8, n / 8, 1))
+                        }
+                    }
+                    return
+                }
+                label("clouds")
+                for _ in 0..BLOCKS_A_FRAME {
+                    if self.marched >= blocks {
+                        break
+                    }
+                    let b = self.order[self.marched]
+                    let at = vec2u(b % across * BLOCK_WIDTH, b / across * BLOCK_HEIGHT)
+                    dispatch(
+                        domed.bind(scape: c.scape, light: c.light, eye: self.marched_from,
+                            at: at, v: c.volumes(), out: mut self.block),
+                        groups: (BLOCK_WIDTH / 64, BLOCK_HEIGHT, 1),
+                    )
+                    copy_texture(self.block.level(0), self.raw.level_mut(0), to_x: at.x, to_y: at.y)
+                    self.marched += 1
+                    if !self.whole {
+                        self.changes += 1
+                    }
+                }
+                if self.marched >= blocks {
+                    dispatch(
+                        finished.bind(raw: self.raw, s: self.s, scape: c.scape, out: mut self.dome),
+                        groups: (DOME_WIDTH * DOME_FINE / 8, DOME_HEIGHT * DOME_FINE / 8, 1),
+                    )
+                    generate_mips(mut self.dome, self.s)
+                    self.whole = true
+                    self.changes += 1
+                }
+            },
+            None => {},
+        }
+    }
+}
+
+/// The dome's blocks (`across` a row, `blocks` in all), nearest `forward` first.
+fn nearest_first(forward: vec3, across: u32, blocks: u32) -> Vec<u32> {
+    var keyed: Vec<vec2> = Vec::new()
+    for b in 0..blocks {
+        let middle = vec2u(b % across * BLOCK_WIDTH + BLOCK_WIDTH / 2, b / across * BLOCK_HEIGHT + BLOCK_HEIGHT / 2)
+        keyed.push(vec2(-dot(dome_way(middle), forward), f32(b)))
+    }
+    keyed.sort_by(|a: vec2, b: vec2| a.x < b.x)
+    var out: Vec<u32> = Vec::new()
+    for k in keyed {
+        out.push(u32(k.y))
+    }
+    out
+}
+
+// ---- the table held to the paint ------------------------------------------------------------
+
+/// How many numbers `sky_apart` counts.
+pub const SKY_COUNTS: u32 = 10
+
+/// The looks a pixel the sky's reference is the mean of.
+const SKY_LOOKS: u32 = 16
+
+/// One look of the sky's reference at pixel `id` of a band of rows starting at row `from`, its
+/// rays moved `jitter` px in their pixels, as its `share` of the mean, added to the looks so far
+/// (`before`, the whole picture's; `first` 1: there are none), into the band (`out`).
+@compute(8, 8)
+fn sky_looked<P: Paint>(
+    eye: Eye,
+    sky: P,
+    jitter: vec2,
+    share: f32,
+    first: u32,
+    from: u32,
+    before: Texture<Rgba32Float>,
+    out: mut Texels<Rgba32Float>,
+    id: GlobalId,
+) {
+    let y = id.y + from
+    if id.x >= before.width() || y >= before.height() {
+        return
+    }
+    let px = vec2(f32(id.x) + 0.5, f32(y) + 0.5) + jitter
+    let look = vec4(sky.colour(eye.ray(px)).xyz * share, 0.0)
+    out.store(id, if first != 0 { look } else { before.load(id.x, y) + look })
+}
+
+/// The table's sky (as the last pass reads it), and the paint run once at each pixel's middle,
+/// each against the reference (`reference`: the paint's mean over `SKY_LOOKS` looks at Halton
+/// places in the pixel), at each pixel nothing drew, as the screen shows them (the tone curve),
+/// counted into `out`, leaving out pixels within `away` rad of `sun`: 0 pixels; the table's 1
+/// difference summed (/255, hundredths), 2 the most (hundredths), 3 pixels over 2/255, 4 over
+/// 1/255; 5 the pixels left out by the sun; the paint once a pixel's 6 summed, 7 most, 8 over
+/// 2/255, 9 over 1/255.
+@compute(8, 8)
+fn sky_apart<P: Paint>(
+    eye: Eye,
+    sky: P,
+    style: InkStyle,
+    seen: SkySeen,
+    depth: DepthTexture,
+    reference: Texture<Rgba32Float>,
+    sun: vec3,
+    away: f32,
+    from: u32,
+    out: mut Atomics<u32>,
+    id: GlobalId,
+) {
+    let y = id.y + from
+    if id.x >= depth.width() || y >= depth.height() || depth.load(id.x, y) > 0.0 {
+        return
+    }
+    let d = eye.ray(vec2(f32(id.x) + 0.5, f32(y) + 0.5))
+    if dot(d, sun) > cos(away) {
+        let _ = out.add(i: 5, value: 1)
+        return
+    }
+    let r = displayed(style, reference.load(id.x, y).xyz)
+    let _ = out.add(i: 0, value: 1)
+    for w in 0..2 {
+        let c = if w == 0 { displayed(style, seen_sky(seen, d)) } else {
+            displayed(style, sky.colour(d).xyz)
+        }
+        let dc = abs(c - r) * 255.0
+        let most = max(dc.x, max(dc.y, dc.z))
+        let at: u32 = if w == 0 { 1 } else { 6 }
+        let _ = out.add(i: at, value: u32(most * 100.0 + 0.5))
+        let _ = out.max(i: at + 1, value: u32(most * 100.0 + 0.5))
+        if most > 2.0 {
+            let _ = out.add(i: at + 2, value: 1)
+        }
+        if most > 1.0 {
+            let _ = out.add(i: at + 3, value: 1)
+        }
+    }
+}
+
+/// The most work the paint may do for one direction, as a judge sizes its dispatches by it
+/// (the host's units: the gale's storm deck states 171,233). A heavier paint's band is refused by
+/// the host's step guard, which says so.
+pub const SKY_WORK: u32 = 200000
+
+/// The table held to the paint, over many frames: each frame one look of the reference over every
+/// pixel, in bands of rows each within what one dispatch may do (`std::gpu::limits().step_work`
+/// over `SKY_WORK` a pixel); after the last look, the counts (`sky_apart`), banded the same way,
+/// and read back.
+pub struct SkyJudge {
+    looks: Texture<Rgba32Float>,
+    band: Texture<Rgba32Float>,
+    rows: u32,
+    look: u32,
+    out: GpuBuffer<u32>,
+}
+
+/// A judge of the sky for a picture `width` by `height` px.
+pub fn sky_judge(width: u32, height: u32) -> SkyJudge {
+    let rows = min(max(u32(f32(limits().step_work) * 1000.0 / (f32(width) * f32(SKY_WORK))), 1), height)
+    SkyJudge {
+        looks: writable_texture::<Rgba32Float>(width: width, height: height),
+        band: writable_texture::<Rgba32Float>(width: width, height: rows),
+        rows,
+        look: 0,
+        out: buffer_of(Vec::filled(SKY_COUNTS, value: 0)),
+    }
+}
+
+impl SkyJudge {
+    /// One frame's part: the next look of the reference, or, once all `SKY_LOOKS` are taken,
+    /// `sky_apart` over the picture `depth` seen by `eye`, the table and the paint against the
+    /// paint's mean, asked for: `Some` then, and `None` before.
+    pub fn step<P: Paint>(
+        mut self,
+        eye: Eye,
+        sky: P,
+        style: InkStyle,
+        t: SkyTable,
+        depth: DepthTexture,
+        sun: vec3,
+        away: f32,
+    ) -> Option<Pending<u32>> {
+        let (w, h) = (depth.width(), depth.height())
+        let rows = self.rows
+        let bands = (h + rows - 1) / rows
+        let k = self.look
+        if k < SKY_LOOKS {
+            let jitter = vec2(halton(k + 1, 2), halton(k + 1, 3)) - vec2(0.5)
+            let first: u32 = if k == 0 { 1 } else { 0 }
+            let share = 1.0 / f32(SKY_LOOKS)
+            for band in 0..bands {
+                let from = band * rows
+                let n = min(rows, h - from)
+                dispatch(
+                    sky_looked.bind(eye, sky: sky, jitter: jitter, share: share, first: first,
+                        from: from, before: self.looks, out: mut self.band),
+                    over: (w, n),
+                )
+                copy_texture(self.band.level(0), self.looks.level_mut(0), height: n, to_y: from)
+            }
+            self.look = k + 1
+            return None
+        }
+        for band in 0..bands {
+            let from = band * rows
+            dispatch(
+                sky_apart.bind(
+                    eye,
+                    sky: sky,
+                    style: style,
+                    seen: t.seen(0.0),
+                    depth: depth,
+                    reference: self.looks,
+                    sun: sun,
+                    away: away,
+                    from: from,
+                    out: mut self.out,
+                ),
+                over: (w, min(rows, h - from)),
+            )
+        }
+        Some(read(self.out.items()))
+    }
+}

@@ -1,0 +1,171 @@
+// One small form of each kind held to values worked out by hand (a limb's is lib/chart's), a ball's
+// jet to its closed form, the union rule on two balls, the question asked of a ball and a height.
+// On the CPU.
+
+use charts::{Height, Sheet}
+use jet::{Bend, Bends, FAR, ahead, behind, jet}
+use kinds::{Chart, Medium, Paint, Shape, Solid, Strand}
+use near::Near
+use std::derive::{Box2, Box3}
+use std::field::{Bound, Surface}
+use std::hash::StateHash
+use std::math::TAU
+
+fn same(a: f32, b: f32) -> bool {
+    abs(a - b) < 1.0e-5
+}
+
+fn same3(a: vec3, b: vec3) -> bool {
+    length(a - b) < 1.0e-5
+}
+
+/// A ball. Convex, so nothing curves under its tangent; at `d` from its centre it curves by
+/// 1 / d, so by at most 2 / d within d / 2 of there.
+struct Ball: Copy + GpuData {
+    c: vec3,
+    r: f32,
+}
+
+impl Surface for Ball {
+    fn distance(self, p: vec3) -> f32 {
+        length(p - self.c) - self.r
+    }
+
+    fn bound(self) -> Bound {
+        Bound { centre: self.c, radius: self.r, slope: 1.0 }
+    }
+}
+
+impl Bends for Ball {
+    fn bend(self, p: vec3) -> Bend {
+        let d = length(p - self.c)
+        Bend { below: 0.0, below_within: FAR, above: 2.0 / d, above_within: 0.5 * d }
+    }
+}
+
+/// From the origin straight up 1 m, 0.1 m thick at its root, tapering to nothing.
+struct Taper: Copy + GpuData {}
+
+impl Strand for Taper {
+    fn at(self, t: f32) -> vec4 {
+        vec4(0.0, t, 0.0, 0.1 * (1.0 - t))
+    }
+}
+
+/// Fog 2 m up, 1 m across, a density of 2 per metre at its middle and none past its edge.
+struct Fog: Copy + GpuData {}
+
+impl Medium for Fog {
+    fn density(self, p: vec3) -> f32 {
+        let q = p - vec3(y: 2.0)
+        2.0 * max(1.0 - dot(q, q), 0.0)
+    }
+
+    fn bound(self) -> Box3 {
+        Box3 { lo: vec3(-1.0, 1.0, -1.0), hi: vec3(1.0, 3.0, 1.0) }
+    }
+}
+
+/// Blue above the horizon, brown below it.
+struct Sky: Copy + GpuData + StateHash {}
+
+impl Paint for Sky {
+    fn colour(self, d: vec3) -> vec4 {
+        if d.y >= 0.0 { vec4(0.3, 0.5, 0.9, 1.0) } else { vec4(0.4, 0.3, 0.2, 1.0) }
+    }
+}
+
+/// A disc 1 across, about the plane's origin.
+struct Disc: Copy + GpuData {}
+
+impl Shape for Disc {
+    fn distance(self, p: vec2) -> f32 {
+        length(p) - 1.0
+    }
+
+    fn bound(self) -> Box2 {
+        Box2 { lo: vec2(-1.0), hi: vec2(1.0) }
+    }
+}
+
+/// A solid's distance, through the design's name for the trait.
+fn distance_of(s: Solid, p: vec3) -> f32 {
+    s.distance(p)
+}
+
+@test
+fn each_kind_gives_its_value() {
+    assert(same(distance_of(Ball { c: vec3(), r: 1.0 }, vec3(z: 3.0)), 2.0), "ball")
+    let flat = Sheet {
+        rest: |uv: vec2| vec3(uv.x, 0.0, uv.y),
+        places: Box2 { lo: vec2(), hi: vec2(2.0, 1.0) },
+    }
+    assert(same3(flat.at(vec2(1.0, 0.5)), vec3(1.0, 0.0, 0.5)), "sheet")
+    let fb = flat.bound()
+    assert(same3(fb.lo, vec3()) && same3(fb.hi, vec3(2.0, 0.0, 1.0)), "sheet's box")
+    assert(!flat.wraps() && flat.faces() == 1, "a sheet neither wraps nor shows two faces unsaid")
+    let wavy = Height {
+        h: |q: vec2| 0.2 * sin(q.x) * cos(q.y),
+        places: Box2 { lo: vec2(-3.0), hi: vec2(3.0) },
+    }
+    assert(same3(wavy.at(vec2(0.25 * TAU, 0.0)), vec3(0.25 * TAU, 0.2, 0.0)), "height")
+    let wb = wavy.bound()
+    assert(wb.lo.y <= -0.2 && wb.hi.y >= 0.2 && wb.hi.y - wb.lo.y <= 0.6, "height's box")
+    let mid = Taper {}.at(0.5)
+    assert(same3(mid.xyz, vec3(y: 0.5)) && same(mid.w, 0.05), "strand")
+    let hb = Taper {}.bound()
+    assert(same3(hb.lo, vec3(-0.1)) && same3(hb.hi, vec3(0.1, 1.1, 0.1)), "strand's box")
+    assert(same(Fog {}.density(vec3(y: 2.0)), 2.0), "fog at its middle")
+    assert(same(Fog {}.density(vec3(0.5, 2.0, 0.0)), 1.5), "fog halfway out")
+    assert(Fog {}.density(vec3(1.5, 2.0, 0.0)) == 0.0, "no fog past its edge")
+    assert(Sky {}.colour(vec3(y: 1.0)) == vec4(0.3, 0.5, 0.9, 1.0), "sky above")
+    assert(Sky {}.colour(vec3(y: -1.0)) == vec4(0.4, 0.3, 0.2, 1.0), "sky below")
+    assert(!Sky::ON_SCREEN, "a sky is in the world")
+    assert(same(Disc {}.distance(vec2(3.0, 0.0)), 2.0), "disc, outside")
+    assert(same(Disc {}.distance(vec2()), -1.0), "disc, at its middle")
+}
+
+@test
+fn a_balls_jet_clears_and_brackets_a_ray_where_the_closed_form_says() {
+    let ball = Ball { c: vec3(), r: 1.0 }
+    let d = vec3(z: 1.0)
+    // Clear: up to the tangent plane, (|p| - r) / -(n.d).
+    let p = vec3(0.5, 0.0, -3.0)
+    let t = ahead(jet(ball, p), d, 0.0)
+    assert(same(t, (length(p) - 1.0) / -dot(p / length(p), d)), f"clear {t}")
+    assert(t <= 3.0 - sqrt(0.75), "clear past the ball")
+    // Inside: the roots of 0.2 - t + (k / 2) t^2, k = 2 / 1.2, cut at 0.6 from the point.
+    let k = 2.0 / 1.2
+    let s = behind(jet(ball, vec3(z: -1.2)), d, 0.0)
+    assert(same(s.x, (1.0 - sqrt(1.0 - 2.0 * k * 0.2)) / k), f"inside from {s.x}")
+    assert(same(s.y, 0.6), f"inside to {s.y}")
+    assert(s.x >= 0.2 && s.y <= 2.2, "a stretch proved inside is outside the ball")
+}
+
+@test
+fn a_rays_advance_through_a_union_is_the_least_of_its_parts() {
+    let a = Ball { c: vec3(), r: 1.0 }
+    let b = Ball { c: vec3(x: 3.0), r: 1.0 }
+    let p = vec3(1.0, 0.0, -3.0)
+    let d = vec3(z: 1.0)
+    let t = a.union(b).clear(p, d, 0.0)
+    assert(same(t, min(a.clear(p, d, 0.0), b.clear(p, d, 0.0))) && t > 2.0, f"union cleared {t}")
+    assert(a.union(b).distance(p + d * t) >= -1.0e-5, "the advance passed into the union")
+    // Its own jet knows nothing below, across the crease: on its own it clears nothing.
+    assert(ahead(jet(a.union(b), p), d, 0.0) == 0.0, "the union's own jet cleared")
+}
+
+fn ask<K, F: Near<K>>(f: F, p: vec3) -> f32 {
+    f.near(p).distance
+}
+
+@test
+fn a_ball_and_a_height_say_how_far_and_which_way() {
+    let g = Ball { c: vec3(), r: 1.0 }.near(vec3(0.0, 3.0, 4.0))
+    assert(same(g.distance, 4.0) && same3(g.out, vec3(0.0, 0.6, 0.8)), "ball")
+    let slope = Height { h: |q: vec2| 0.5 * q.x, places: Box2 { lo: vec2(-1.0), hi: vec2(1.0) } }
+    let h = slope.near(vec3(y: 1.0))
+    assert(same(h.distance, 1.0 / sqrt(1.25)), "height, how far")
+    assert(same3(h.out, normalize(vec3(-0.5, 1.0, 0.0))), "height, which way")
+    assert(same(ask(slope, vec3(y: 2.0)), 2.0 / sqrt(1.25)), "a height asked by generic code")
+}

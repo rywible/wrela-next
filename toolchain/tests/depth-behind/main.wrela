@@ -1,0 +1,107 @@
+// A fragment depth never nearer than its triangle's (`WithDepthBehind`, language.md §18), under
+// both depth conventions (toolchain/tests/tests/suite/renderer.rs). The left half of the screen
+// keeps the smaller depth (cleared to 1, `Less`), the right half the larger (set to 0 first,
+// `Greater`: reversed depth). Each half has rows of quads drawn front to back, overlapping,
+// whose fragments push their depth back from their triangle's by a wave across the screen, so
+// which quad shows at a pixel depends on the pushed depths: the GPU's early test on the
+// triangle's depth rejects only what the pushed depth would reject too. A build with each
+// `WithDepthBehind` a `WithDepth` draws the same picture.
+use std::gpu::{
+    ClipPosition, Compare, Depth, DepthTexture, FragCoord, VertexIndex, WithDepthBehind,
+    begin_screen_pass_with_depth, depth_texture, draw,
+}
+
+/// A rectangle in clip space, its lower left corner and its size, at a depth.
+struct Rect: Copy + GpuData {
+    lo: vec2,
+    size: vec2,
+    z: f32,
+}
+
+@vertex
+fn quad(v: VertexIndex, rect: Rect) -> ClipPosition {
+    let corners = [
+        vec2(0.0, 0.0),
+        vec2(1.0, 0.0),
+        vec2(0.0, 1.0),
+        vec2(0.0, 1.0),
+        vec2(1.0, 0.0),
+        vec2(1.0, 1.0),
+    ]
+    let p = rect.lo + corners[v.index % 6] * rect.size
+    ClipPosition { position: vec4(p, rect.z, 1.0) }
+}
+
+@fragment
+fn flat(colour: vec4) -> vec4 {
+    colour
+}
+
+/// The colour, darkened by a wave across the screen, at the triangle's depth pushed back by
+/// `push` times the wave (a `push` toward the half's far side: up under `Less`, down under
+/// `Greater`).
+@fragment
+fn pushed(pixel: FragCoord, colour: vec4, push: f32) -> WithDepthBehind<vec4> {
+    let wave = 0.5 + 0.5 * sin(pixel.position.x * 0.37 + pixel.position.y * 0.23)
+    WithDepthBehind {
+        color: vec4(colour.xyz * (0.4 + 0.6 * wave), 1.0),
+        depth: pixel.position.z + push * wave,
+    }
+}
+
+pub struct Scene {
+    depth: DepthTexture,
+    width: u32,
+    height: u32,
+}
+
+pub fn init() -> Scene {
+    Scene { depth: depth_texture(width: 1, height: 1), width: 1, height: 1 }
+}
+
+/// Quad `k` of six in half `side` (0 left, 1 right): overlapping a third of the next, nearest
+/// first.
+fn piece(side: u32, k: u32, z: f32) -> Rect {
+    let x = -1.0 + f32(side) + 0.12 * f32(k)
+    let y = -0.9 + 0.25 * f32(k % 3)
+    Rect { lo: vec2(x, y), size: vec2(0.36, 1.2), z }
+}
+
+const COLOURS = [
+    vec4(1.0, 0.2, 0.2, 1.0),
+    vec4(0.2, 1.0, 0.2, 1.0),
+    vec4(0.2, 0.2, 1.0, 1.0),
+    vec4(1.0, 1.0, 0.2, 1.0),
+    vec4(1.0, 0.2, 1.0, 1.0),
+    vec4(0.2, 1.0, 1.0, 1.0),
+]
+
+pub fn frame(s: mut Scene, time: f32, width: u32, height: u32) {
+    if width != s.width || height != s.height {
+        s.depth = depth_texture(width, height)
+        s.width = width
+        s.height = height
+    }
+    let pass = begin_screen_pass_with_depth(mut s.depth, clear: vec4(0.0, 0.0, 0.0, 1.0))
+    // The right half's depth set to 0, the far side of reversed depth.
+    let half = Rect { lo: vec2(0.0, -1.0), size: vec2(1.0, 2.0), z: 0.0 }
+    draw(pass,
+        quad.bind(half),
+        flat.bind(vec4(0.0, 0.0, 0.0, 1.0)),
+        vertices: 6,
+        depth: Depth { compare: Compare::Always, write: true },
+    )
+    for k in 0..6 {
+        // Plain depth: nearest first at 0.2, each next 0.08 farther, pushed up to 0.3 back.
+        let near = 0.2 + 0.08 * f32(k)
+        draw(pass, quad.bind(piece(0, k, near)), pushed.bind(COLOURS[k], push: 0.3), vertices: 6)
+        // Reversed: nearest first at 0.8, each next 0.08 farther (smaller), pushed up to 0.3.
+        draw(pass,
+            quad.bind(piece(1, k, 1.0 - near)),
+            pushed.bind(COLOURS[k], push: -0.3),
+            vertices: 6,
+            depth: Depth { compare: Compare::Greater, write: true },
+        )
+    }
+    pass.present()
+}

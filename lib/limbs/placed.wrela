@@ -1,0 +1,266 @@
+// Each vertex of each posed piece's grid, worked out once a pose in compute: where it is, where
+// the same place is at rest, its side's own normal, how much of the light is that normal's, the
+// light's normal there (for a piece that carries it from vertex to vertex) and the section's
+// plane (for a pixel that reads its normal from the smoothed form). The draw then reads its
+// corners from this, so each vertex is worked out once however many triangles share it, and a
+// held drawing (anime's twos) isn't worked out again.
+//
+// A piece's place on its chart, its point and its light are lib/chart's (`vertex`,
+// `vertex_onto`, and the light's normal from the shading form, `normal_at`): this file only lays
+// them on grids. Every limb-sized piece's own side is read in one kernel (`placed_own`), which
+// finishes the vertices of those that grow from nothing; a piece grown from or lying on another
+// is moved onto it in a kernel of its own after: reading, moving and lighting it in one kernel
+// was 262 KiB of Metal text.
+
+use chart::grown::{COVERLESS, Grown}
+use chart::limb::{Band, Limb}
+use chart::lit::{Sided, Vertex, lit, onto_sides, sided, vertex, vertex_of}
+use chart::radial::Radial
+use grid::place_of
+use std::gpu::{GlobalId, Slots}
+
+/// No piece: what a piece that grows from nothing has for the piece it grows from.
+pub const ALONE: u32 = 4294967295
+
+/// How a piece is drawn this frame: its band of its chart; where its grid's vertices start (in
+/// its kernel's run of `Placed`) and its quads along and round; which limb it is in its size's
+/// buffer (posed, past the rests); the piece it grows from or lies on (in the other size's
+/// buffer where `onto_wide`, else in its own; `ALONE`) and how (`how`); its body and ink group
+/// (its identity); the cover its own edges are read from (`COVERLESS`); how many faces it shows;
+/// whether it's wide (1: its light read at every pixel; 2: a sheet); its path's length (m); its
+/// caps; which look it wears; and whether a limb-sized piece's light is read at every pixel
+/// too (`read` 1), or carried from its vertices; and how far it's drawn under what's over it
+/// (`Piece::under`).
+pub struct Part: Copy + GpuData {
+    pub band: Band,
+    pub base: u32,
+    pub along: u32,
+    pub round: u32,
+    pub limb: u32,
+    pub onto: u32,
+    pub onto_wide: u32,
+    pub body: u32,
+    pub group: u32,
+    pub cover: u32,
+    pub faces: u32,
+    pub wide: u32,
+    pub length: f32,
+    pub caps: vec2,
+    pub look: u32,
+    pub read: u32,
+    pub under: vec2,
+    pub how: Grown,
+}
+
+/// What a vertex passes on: where it is and its place along its chart (`at`, `f`); where the
+/// same place is at rest and its angle round (`rest`, `theta`); its side's own normal (unit:
+/// across its side's points, or leant to the form it grows from) and how much of the light is
+/// that normal's (`own`); the light's normal there, worked out at the vertex (`light`; unit);
+/// and the section's plane there (`up`, `left`).
+pub struct Placed: Copy + GpuData {
+    pub at: vec3,
+    pub f: f32,
+    pub rest: vec3,
+    pub theta: f32,
+    pub normal: vec3,
+    pub own: f32,
+    pub light: vec3,
+    pub spare0: f32,
+    pub up: vec3,
+    pub spare1: f32,
+    pub left: vec3,
+    pub spare2: f32,
+}
+
+/// Which of the `count` parts from `first` on holds vertex `i`: the last whose grid starts at or
+/// before it (their grids lie in order, in one kernel's run from `start`, whose vertex `id.x`
+/// is `start + id.x` of all of them).
+pub fn part_of(parts: [Part], first: u32, count: u32, i: u32) -> u32 {
+    var lo = 0
+    var hi = count
+    for _k in 0..8 {
+        if hi - lo > 1 {
+            let mid = (lo + hi) / 2
+            if parts[first + mid].base <= i {
+                lo = mid
+            } else {
+                hi = mid
+            }
+        }
+    }
+    first + lo
+}
+
+/// What vertex `v` of a piece passes on, with the light's normal at it.
+fn placed_of<const A: u32, const R: u32>(
+    form: Limb<A, R>,
+    v: Vertex,
+    light: vec3,
+    f: f32,
+    theta: f32,
+) -> Placed {
+    let section = form.path.frame(saturate(f) * form.path.length())
+    Placed {
+        at: v.at,
+        f,
+        rest: v.rest,
+        theta,
+        normal: v.normal,
+        own: v.own,
+        light,
+        spare0: 0.0,
+        up: section.up,
+        spare1: 0.0,
+        left: section.left,
+        spare2: 0.0,
+    }
+}
+
+/// Where vertex `i` (of all the parts' runs) is on its part's chart, and whether it's past the
+/// part's grid.
+fn place_in(p: Part, i: u32) -> vec3 {
+    let n = i - p.base
+    let q = vec2u(p.along, p.round)
+    let uv = place_of(n, q, vec2(p.band.f.x, p.band.theta.x), vec2(p.band.f.y, p.band.theta.y))
+    vec3(uv, if n >= (p.along + 1) * (p.round + 1) { 1.0 } else { 0.0 })
+}
+
+/// Every limb-sized piece's own side at each vertex (`count` parts from `first`, all three kinds
+/// of `Part`, in order): for a piece that grows from nothing, its vertex, its light worked out
+/// there from the piece's shading form (`shades`, by its limb), into `out`; for one grown from or
+/// lying on another, its side (`chart::lit::sided`) into `sides`, for `placed_onto` and
+/// `placed_on_wide` to move onto the other. `limbs` holds every limb at rest, then posed from
+/// `posed` on.
+@compute(64)
+pub fn placed_own<const A: u32, const R: u32>(
+    parts: [Part],
+    first: u32,
+    count: u32,
+    start: u32,
+    limbs: [Limb<A, R>],
+    posed: u32,
+    shades: [Radial<A, R>],
+    sides: mut Slots<Sided>,
+    out: mut Slots<Placed>,
+    id: GlobalId,
+) {
+    let i = start + id.x
+    let p = parts[part_of(parts, first, count, i)]
+    let uv = place_in(p, i)
+    if uv.z > 0.5 {
+        return
+    }
+    let form = limbs[posed + p.limb]
+    let s = sided(limbs[p.limb], form, f: uv.x, theta: uv.y)
+    if p.onto != ALONE {
+        sides[id] = s
+        return
+    }
+    let v = vertex_of(s)
+    let n = if p.read == 1 { v.normal } else {
+        lit(form, shades[p.limb], f: uv.x, theta: uv.y, v: v)
+    }
+    out[id] = placed_of(form, v, n, uv.x, uv.y)
+}
+
+/// The vertices of limb-sized pieces that grow from another limb-sized piece (`vertex_onto`, from
+/// their sides, `sides`, as `placed_own` read them, indexed as `out`'s whole buffer is), whose
+/// light leans to that piece's own (`shades`, by its limb).
+@compute(64)
+pub fn placed_onto<const A: u32, const R: u32>(
+    parts: [Part],
+    first: u32,
+    count: u32,
+    start: u32,
+    limbs: [Limb<A, R>],
+    posed: u32,
+    shades: [Radial<A, R>],
+    covers: [f32],
+    sides: [Sided],
+    out: mut Slots<Placed>,
+    id: GlobalId,
+) {
+    let i = start + id.x
+    let p = parts[part_of(parts, first, count, i)]
+    let uv = place_in(p, i)
+    if uv.z > 0.5 {
+        return
+    }
+    let form = limbs[posed + p.limb]
+    let v = onto_sides(
+        sides[i],
+        f: uv.x,
+        onto: limbs[posed + p.onto],
+        light: shades[p.onto],
+        how: p.how,
+        covers: covers,
+    )
+    let n = if p.read == 1 { v.normal } else {
+        lit(form, shades[p.limb], f: uv.x, theta: uv.y, v: v)
+    }
+    out[id] = placed_of(form, v, n, uv.x, uv.y)
+}
+
+/// The vertices of limb-sized pieces that lie on a wide piece (`wides`, at rest then posed from
+/// `wide_posed` on; its light `wide_shades`), from their sides (`placed_own`).
+@compute(64)
+pub fn placed_on_wide<const A: u32, const R: u32, const B: u32, const Q: u32, const T: u32>(
+    parts: [Part],
+    first: u32,
+    count: u32,
+    start: u32,
+    limbs: [Limb<A, R>],
+    posed: u32,
+    shades: [Radial<A, R>],
+    wides: [Limb<B, Q>],
+    wide_posed: u32,
+    wide_shades: [Radial<B, T>],
+    covers: [f32],
+    sides: [Sided],
+    out: mut Slots<Placed>,
+    id: GlobalId,
+) {
+    let i = start + id.x
+    let p = parts[part_of(parts, first, count, i)]
+    let uv = place_in(p, i)
+    if uv.z > 0.5 {
+        return
+    }
+    let form = limbs[posed + p.limb]
+    let v = onto_sides(
+        sides[i],
+        f: uv.x,
+        onto: wides[wide_posed + p.onto],
+        light: wide_shades[p.onto],
+        how: p.how,
+        covers: covers,
+    )
+    let n = if p.read == 1 { v.normal } else {
+        lit(form, shades[p.limb], f: uv.x, theta: uv.y, v: v)
+    }
+    out[id] = placed_of(form, v, n, uv.x, uv.y)
+}
+
+/// The vertices of wide pieces, which grow from nothing: their light is read at each pixel, so
+/// none is worked out here.
+@compute(64)
+pub fn placed_wide<const B: u32, const Q: u32>(
+    parts: [Part],
+    first: u32,
+    count: u32,
+    start: u32,
+    wides: [Limb<B, Q>],
+    posed: u32,
+    out: mut Slots<Placed>,
+    id: GlobalId,
+) {
+    let i = start + id.x
+    let p = parts[part_of(parts, first, count, i)]
+    let uv = place_in(p, i)
+    if uv.z > 0.5 {
+        return
+    }
+    let form = wides[posed + p.limb]
+    let v = vertex(wides[p.limb], form, f: uv.x, theta: uv.y)
+    out[id] = placed_of(form, v, v.normal, uv.x, uv.y)
+}

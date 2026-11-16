@@ -1,0 +1,393 @@
+// Charts: forms drawn along their own coordinates. A limb, a trunk, a finger, a sleeve: each is
+// a radius about a path. The path is the line through a chain of joints. A place on the form is
+// how far along the path (0 to 1) and at what angle round it. The radius there is a sum of
+// splines along the path times a Fourier series round it (`Radial`), so it is linear in its
+// numbers: fitting it to a target is one exact solve (`fit`), a second body is the first's
+// numbers plus a difference, and a change with the pose is a second set of numbers added in by
+// how far a joint is bent.
+//
+// A form with a chart needs no mesh and no skin weights. Each frame its path is laid where its
+// bones are (`Chain::posed`), and each vertex is worked out from its number alone: its place on
+// the chart, then the point of the form's side there (`Limb::side`). A bone's turn about its own
+// length is spread along it, from the joint before to the joint after, as a forearm's is.
+//
+// The path is cut into short straight pieces. A point's section is in the plane through it that
+// turns from the plane at one end of its piece (which halves the path's turn there) to the plane
+// at the other, so neighbouring pieces meet exactly. Angle 0 is the path's `up`, carried along
+// it without twisting; angles grow toward the left (`up × along`).
+//
+// A posed limb is a `form::kinds::Chart`: two numbers, its place (`f`, `theta`), to the point
+// of its side there.
+//
+// From rywible/wrela's engine/chart.wrela at 7ae6711e.
+
+use chain::{carried, wrapped}
+use form::kinds::Chart
+use path::{Path, Place, unit}
+use radial::Radial
+use std::derive::{Box2, Box3}
+use std::math::TAU
+
+/// The least a limb's side is from its path (m). A joint's change that follows a reference
+/// into the press of a limb against a body can take a radius to nothing or past it; a side on
+/// the wrong side of its path would be drawn inside out.
+pub const LEAST: f32 = 0.003
+
+/// The most hinges a limb folds at.
+pub const FOLDS: u32 = 2
+
+/// How far a limb's two sides of a folded hinge press into each other (m): flesh gives, so
+/// the crease lies this far in from the hinge's own line and the limb's sides aren't pinched
+/// beside it. (At half this, a runner's elbow bent past a right angle was a sharp notch on the
+/// inside of the bend, as a hose kinks, and read as pinched off.)
+pub const GIVE: f32 = 0.024
+
+/// A hinge a limb is folded at in a pose (an elbow, a knee): inside the bend, the limb's two
+/// lengths meet at the plane that halves it, and neither passes through the other. Where the
+/// hinge is on the chart (`at`, of the way along the path), the cotangent of half the bend's
+/// angle (`slope`: how fast the room to that plane grows along the path; below 0 for no fold),
+/// where the inside of the bend is on the chart (`toward`, `after`, `reached`: as `Bend`'s),
+/// and the path's length (m).
+pub struct Fold: Copy + GpuData {
+    pub at: f32,
+    pub slope: f32,
+    pub toward: f32,
+    pub after: f32,
+    pub reached: f32,
+    pub length: f32,
+}
+
+/// No fold.
+pub const NO_FOLD: Fold = Fold {
+    at: 0.0,
+    slope: -1.0,
+    toward: 0.0,
+    after: 0.0,
+    reached: 0.0,
+    length: 1.0,
+}
+
+impl Fold {
+    /// The most a limb's radius is at `f` of the way along and angle `theta`, so its side
+    /// stays its own side of the plane that halves the bend (and `GIVE` past it): within a
+    /// quarter turn of the bend's inside, the room to that plane along that angle; no limit
+    /// elsewhere.
+    pub fn most(self, f: f32, theta: f32) -> f32 {
+        let x = saturate((f - self.at) / max(self.reached - self.at, 0.000001))
+        let lean = self.toward + wrapped(self.after - self.toward) * x
+        let facing = cos(theta - lean)
+        let room = abs(f - self.at) * self.length * self.slope + GIVE
+        select(
+            if_false: room / max(facing, 0.05),
+            if_true: 1000.0,
+            cond: self.slope < 0.0 || facing <= 0.05,
+        )
+    }
+}
+
+/// What of a form's side stays with a bone that isn't its path's, and where that bone has it
+/// (`by`: the bone's matrix, from the body at rest to where the pose has it). A form goes
+/// where its path goes, whole; a garment's piece over a joint doesn't. A jacket's shoulder
+/// rides the arm along its top, and its panels in front of the armhole and behind it lie on
+/// the chest: carried round with the arm, they stood off the chest as a flap when the arm came
+/// across. So each place on the chart has a share that stays: by the angle round the path,
+/// none within `round.y` of angle `round.x` and all of it from `round.z` off that angle; and
+/// along the path, none before `along.x` of the way and all of it from `along.y`. A place's
+/// point is that share of the way from where its path has it to where the bone has the same
+/// place of the form at rest (`sides`): a skin weight, written over a chart.
+pub struct Stay: Copy + GpuData {
+    pub by: mat4,
+    pub round: vec3,
+    pub along: vec2,
+}
+
+/// None of the side stays anywhere: the whole form goes with its path.
+pub const NO_STAY: Stay = Stay {
+    by: mat4(
+        vec4(1.0, 0.0, 0.0, 0.0),
+        vec4(0.0, 1.0, 0.0, 0.0),
+        vec4(0.0, 0.0, 1.0, 0.0),
+        vec4(0.0, 0.0, 0.0, 1.0),
+    ),
+    round: vec3(0.0, 10.0, 11.0),
+    along: vec2(-2.0, -1.0),
+}
+
+impl Stay {
+    /// Whether any of the side stays anywhere.
+    pub fn any(self) -> bool {
+        self.round.y < 3.2
+    }
+
+    /// The share of the side that stays at a place: `f` of the way along, at angle `theta`.
+    pub fn share(self, f: f32, theta: f32) -> f32 {
+        let off = abs(wrapped(theta - self.round.x))
+        smoothstep(self.round.y, self.round.z, off) * smoothstep(self.along.x, self.along.y, f)
+    }
+}
+
+/// A form about a path: its radius at each place on the path's chart, less where a folded
+/// hinge leaves it no room (`folds`).
+pub struct Limb<const A: u32, const R: u32>: Copy + GpuData {
+    pub path: Path,
+    pub form: Radial<A, R>,
+    pub folds: [Fold; FOLDS] = [NO_FOLD; FOLDS],
+    /// Where it closes to a point: over this much of its path from its start, and over this
+    /// much before its end (of the path's length; 0: open, a tube's cut end). A form whose
+    /// end shows (a trunk's fork, a head's underside, a fingertip) closes there (`closed`).
+    pub caps: vec2 = vec2(0.0, 0.0),
+    /// The band of its chart that is drawn (`Part::band`): its places as a `Chart`.
+    pub band: Band = WHOLE,
+    /// How many faces it shows (`Part::faces`): 1, its outside; 2, an open sheet whose inside
+    /// is seen too (a jacket's piece).
+    pub faces: u32 = 1,
+    /// How many times as thick it's drawn (`side`): 1 as it is. A drawing that grows a part
+    /// or thins it sets this: a fist drawn big at a blow, a limb drawn thin where it's
+    /// stretched.
+    pub swell: f32 = 1.0,
+    /// What of its side stays with a bone that isn't its path's (`Stay`): none, unless said.
+    pub stay: Stay = NO_STAY,
+}
+
+/// How much of its radius a form with `caps` keeps `f` of the way along its path: all of it
+/// between its caps, and inside one a quarter circle's worth, from none at the path's end to
+/// all where the cap ends, so the end is round and meets the form's side without a crease.
+pub fn closed(caps: vec2, f: f32) -> f32 {
+    var keep = 1.0
+    if caps.x > 0.0 {
+        let a = saturate(f / caps.x)
+        keep *= sqrt(a * (2.0 - a))
+    }
+    if caps.y > 0.0 {
+        let b = saturate((1.0 - f) / caps.y)
+        keep *= sqrt(b * (2.0 - b))
+    }
+    keep
+}
+
+impl<const A: u32, const R: u32> Limb<A, R> {
+    /// The point of its side at a place on its chart: `f` of the way along its path, at angle
+    /// `theta` (from up, toward the left). Where the form doesn't fold over itself this is the
+    /// point `Path::place` puts at (`f` of its length, the radius there, `theta`): a point for
+    /// each place, with no grid searched for its surface.
+    pub fn side(self, f: f32, theta: f32) -> vec3 {
+        let x = saturate(f)
+        let fr = self.path.frame(x * self.path.length())
+        var r = max(self.form.radius(x, theta), LEAST)
+        for k in 0..FOLDS {
+            // (The lesser of the two, eased over 4 mm: a crease, not a tear.)
+            let most = self.folds[k].most(x, theta)
+            let h = saturate(0.5 + 0.5 * (most - r) / 0.004)
+            r = mix(most, r, h) - 0.004 * h * (1.0 - h)
+        }
+        r *= closed(self.caps, x) * self.swell
+        fr.at + (fr.up * cos(theta) + fr.left * sin(theta)) * r
+    }
+
+    /// Whether a folded hinge holds its side in at a place on its chart (1 where its radius is
+    /// the fold's, 0 where it is its form's own), or a cap closes it there: where either does,
+    /// the side's normal is its own across its points, not what the form's slopes say
+    /// (`normal_at`).
+    pub fn folded(self, f: f32, theta: f32) -> f32 {
+        let x = saturate(f)
+        let r = self.form.radius(x, theta)
+        var held = if closed(self.caps, x) < 0.999 { 1.0 } else { 0.0 }
+        for k in 0..FOLDS {
+            held = max(held, saturate(0.5 - 0.5 * (self.folds[k].most(x, theta) - r) / 0.004))
+        }
+        held
+    }
+
+    /// A point of its side (`side`) and the side's outward normal (unit) there: across the
+    /// side's points a little further along and a little further round. The three points are
+    /// worked out in one loop, so a shader holds the side's code once.
+    pub fn side_and_normal(self, f: f32, theta: f32) -> (vec3, vec3) {
+        let df = 0.002
+        let dt = 0.01
+        let f0 = min(f, 1.0 - df)
+        var p = [vec3(); 3]
+        for k in 0..3 {
+            let further = if k == 1 { df } else { 0.0 }
+            let round = if k == 2 { dt } else { 0.0 }
+            p[k] = self.side(f0 + further, theta + round)
+        }
+        (p[0], unit(cross(p[1] - p[0], p[2] - p[0])))
+    }
+
+    /// About how far `p` is from its side (m; negative inside), near it (`toward`).
+    pub fn near(self, p: vec3) -> f32 {
+        self.toward(p).w
+    }
+
+    /// The way out of its side where `p` is nearest it (`xyz`: the side's outward normal
+    /// there, unit) and about how far `p` is from the side (`w`, m; negative inside), near it:
+    /// how far `p` is past the radius at its place, over how steep the side is there
+    /// (√(1 + r_s² + (r_θ / ρ)²), ρ held at least half the radius). Its side as it's drawn:
+    /// closed where a cap closes it, as thick as it's swelled. Past an end of its path, how
+    /// far `p` is from the end's rim (its point, where a cap closes it).
+    pub fn toward(self, p: vec3) -> vec4 {
+        self.toward_at(p, self.path.place(p))
+    }
+
+    /// `toward`, for a point whose place about its path is already known (`pl`,
+    /// `Path::place`): finding the place is most of the work, and what needs both pays once.
+    pub fn toward_at(self, p: vec3, pl: Place) -> vec4 {
+        let len = self.path.length()
+        let x = saturate(pl.along / len)
+        let k = self.form.radius_and_slopes(x, pl.theta)
+        // (A cap's slope along the path, across a little either side; a quarter circle is
+        // upright at the path's end, so the slope is held to what the form's length allows.)
+        let e = 0.004
+        let x0 = max(x - e, 0.0)
+        let x1 = min(x + e, 1.0)
+        let shut = closed(self.caps, x)
+        let shuts = (closed(self.caps, x1) - closed(self.caps, x0)) / (x1 - x0)
+        let r = k.x * shut * self.swell
+        let along = (k.y * shut + k.x * shuts) * self.swell / len
+        let around = k.z * shut * self.swell / max(max(pl.rho, 0.5 * r), 0.001)
+        let fr = self.path.frame(x * len)
+        let out = fr.up * cos(pl.theta) + fr.left * sin(pl.theta)
+        let round = fr.left * cos(pl.theta) - fr.up * sin(pl.theta)
+        let gap = pl.rho - r
+        // (How far past an end of its path: none between them, to the last bit.)
+        let past = max(pl.along - len, 0.0) + min(pl.along, 0.0)
+        if past != 0.0 {
+            let off = max(gap, 0.0)
+            return vec4(unit(out * off + fr.along * past), sqrt(off * off + past * past))
+        }
+        vec4(
+            unit(out - round * around - fr.along * along),
+            gap / sqrt(1.0 + along * along + around * around),
+        )
+    }
+
+    /// The point of its side under `p`, and the side's way out there (unit): `p` moved to the
+    /// side by how far `toward` has it, twice. Once isn't enough off a flat form's edge, where
+    /// "about how far" is measured along a radius that runs nearly along the side.
+    pub fn foot(self, p: vec3) -> (vec3, vec3) {
+        let first = self.toward(p)
+        let nearer = p - first.xyz * first.w
+        let again = self.toward(nearer)
+        (nearer - again.xyz * again.w, again.xyz)
+    }
+}
+
+/// The outward normal (unit) of a form's side at a place on its chart, from its radius's slopes
+/// there: for a pixel, which knows its place (`f` of the way along, the angle `theta`) and the
+/// section's plane there (`up`, angle 0, and `left`, a quarter turn on, as its vertices passed
+/// them down), about a path `length` long. Exact at every pixel however coarse the grid the
+/// form was drawn on, where the path is straight; where it bends, off by the little the
+/// section's plane turns across the radius's change along it.
+pub fn normal_at<const A: u32, const R: u32>(
+    form: Radial<A, R>,
+    up: vec3,
+    left: vec3,
+    length: f32,
+    f: f32,
+    theta: f32,
+) -> vec3 {
+    let u = unit(up)
+    let l = unit(left - u * dot(left, u))
+    let along = cross(l, u)
+    let k = form.radius_and_slopes(saturate(f), theta)
+    let out = u * cos(theta) + l * sin(theta)
+    let round = l * cos(theta) - u * sin(theta)
+    unit(out - round * (k.z / max(k.x, 0.001)) - along * (k.y / max(length, 0.001)))
+}
+
+/// The band of a chart that is drawn: from `f.x` to `f.y` of the way along, and from angle
+/// `theta.x` to `theta.y` round (0 to τ for a closed form; less for an open sheet).
+pub struct Band: Copy + GpuData {
+    pub f: vec2,
+    pub theta: vec2,
+}
+
+/// The whole chart.
+pub const WHOLE: Band = Band { f: vec2(0.0, 1.0), theta: vec2(0.0, TAU) }
+
+/// A form's side at a place on its chart as a pose has it (`form`), and at two places beside
+/// it (a little further along, a little further round: the side's normal is across the three),
+/// with what of it stays with another bone put where that bone has it (`Stay`); where the same
+/// place is on the form at rest (`rest`); and the share that stays there. Worked out in one
+/// loop, so a shader holds a side's code once for the posed form and once for the form at rest.
+pub fn sides<const A: u32, const R: u32>(
+    rest: Limb<A, R>,
+    form: Limb<A, R>,
+    f: f32,
+    theta: f32,
+) -> ([vec3; 3], vec3, f32) {
+    let df = 0.002
+    let dt = 0.01
+    let f0 = min(f, 1.0 - df)
+    var stays = 0.0
+    if form.stay.any() {
+        stays = form.stay.share(f0, theta)
+    }
+    var p = [vec3(); 3]
+    var at_rest = vec3()
+    for k in 0..3 {
+        let ff = f0 + (if k == 1 { df } else { 0.0 })
+        let th = theta + (if k == 2 { dt } else { 0.0 })
+        p[k] = form.side(f: ff, theta: th)
+        if k == 0 || stays > 0.0 {
+            let r = rest.side(f: if k == 0 { f } else { ff }, theta: th)
+            if k == 0 {
+                at_rest = r
+            }
+            if stays > 0.0 {
+                p[k] = mix(p[k], carried(form.stay.by, r), vec3(form.stay.share(ff, th)))
+            }
+        }
+    }
+    (p, at_rest, stays)
+}
+
+/// A posed limb as a chart: place `uv` is `f` of the way along its path and the angle `theta`
+/// round it (from up, toward the left), and the point there is its side's (`side`). What of
+/// its side stays with another bone (`Stay`) needs the limb at rest too, so it isn't in this
+/// point: `sides` puts it there.
+impl<const A: u32, const R: u32> Chart for Limb<A, R> {
+    fn at(self, uv: vec2) -> vec3 {
+        self.side(f: uv.x, theta: uv.y)
+    }
+
+    /// The band of its chart that is drawn.
+    fn domain(self) -> Box2 {
+        Box2 {
+            lo: vec2(self.band.f.x, self.band.theta.x),
+            hi: vec2(self.band.f.y, self.band.theta.y),
+        }
+    }
+
+    /// Its angle wraps where its band goes the whole way round.
+    fn wraps(self) -> bool {
+        self.band.theta.y - self.band.theta.x >= TAU - 0.0001
+    }
+
+    fn faces(self) -> u32 {
+        self.faces
+    }
+
+    /// Its path's box, grown by the most its side can be from the path: a radius is a sum of
+    /// spline weights (none negative, together 1) times each control value's terms round the
+    /// path, so it is at most the largest sum of a control value's terms' sizes. A fold or a
+    /// cap only takes from it; `swell` scales it.
+    fn bound(self) -> Box3 {
+        var most = LEAST
+        for i in 0..A {
+            var sum = 0.0
+            for j in 0..R {
+                sum += abs(self.form.coef[i][j])
+            }
+            most = max(most, sum)
+        }
+        let r = vec3(most * self.swell)
+        var lo = self.path.at[0]
+        var hi = lo
+        for k in 1..self.path.vertices {
+            lo = min(lo, self.path.at[k])
+            hi = max(hi, self.path.at[k])
+        }
+        Box3 { lo: lo - r, hi: hi + r }
+    }
+}

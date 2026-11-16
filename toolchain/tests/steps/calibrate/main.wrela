@@ -1,0 +1,121 @@
+// The step guard's calibration (docs/rates.md, "The limit"): kernels that do all the work their
+// bound says, one of each kind of work the count weighs (language.md §18.11), dispatched over
+// `INVOCATIONS` invocations, `PASSES` passes each. A dispatch's time over its bound times its
+// invocations is what a unit of work costs on the machine at most (the host's `step::unit_ns`).
+//
+//     tools/wrela build toolchain/tests/steps/calibrate -o <out> --set INVOCATIONS=65536 --set PASSES=64
+//     tools/gpu <out> --frames 2 --timestamps --serial --steps
+//
+// Each kernel is labelled by its name. Start small: the reads that miss every cache are about
+// 300 times as slow a unit as arithmetic, so those kernels run over a 64th of the invocations.
+use std::gpu::{Atomics, GlobalId, GpuBuffer, R32Float, Slots, Texture, buffer, dispatch, label, texture}
+
+pub const INVOCATIONS: u32 = 65536
+pub const PASSES: u32 = 64
+/// The scattered reads' buffer, in numbers (64 MiB: past every cache).
+const SPREAD: u32 = 16777216
+
+/// A dependent chain of multiply-adds: one invocation's latency, hidden by the others.
+@compute(64)
+fn chain(out: mut Slots<f32>, id: GlobalId) {
+    var a = f32(id.x) * 0.001
+    for _i in 0..PASSES {
+        a = a * 1.0001 + 0.3
+    }
+    out[id] = a
+}
+
+/// Four independent chains in a vector.
+@compute(64)
+fn wide(out: mut Slots<f32>, id: GlobalId) {
+    var a = vec4(f32(id.x) * 0.001, 1.0, 2.0, 3.0)
+    for _i in 0..PASSES {
+        a = a * 1.0001 + vec4(0.3)
+    }
+    out[id] = a.x + a.y + a.z + a.w
+}
+
+/// Transcendentals in a chain.
+@compute(64)
+fn trig(out: mut Slots<f32>, id: GlobalId) {
+    var a = f32(id.x) * 0.001
+    for _i in 0..PASSES {
+        a = sin(a) + 0.5
+    }
+    out[id] = a
+}
+
+/// Reads of a storage buffer at places no cache holds.
+@compute(64)
+fn scattered(data: [f32], out: mut Slots<f32>, id: GlobalId) {
+    var h = id.x * 2654435761
+    var a = 0.0
+    for _i in 0..PASSES {
+        h = h * 1664525 + 1013904223
+        a += data[(h >> 8) & (SPREAD - 1)]
+    }
+    out[id] = a
+}
+
+/// Texel loads of a large texture at places no cache holds.
+@compute(64)
+fn texels(t: Texture<R32Float>, out: mut Slots<f32>, id: GlobalId) {
+    var h = id.x * 2654435761
+    var a = 0.0
+    for _i in 0..PASSES {
+        h = h * 1664525 + 1013904223
+        a += t.load((h >> 8) & 4095, (h >> 20) & 4095)
+    }
+    out[id] = a
+}
+
+/// Atomic adds every invocation makes to one place: the slowest kind of work there is.
+@compute(64)
+fn contended(counts: mut Atomics<u32>, id: GlobalId) {
+    for _i in 0..PASSES {
+        let _ = counts.add(i: 0, value: 1)
+    }
+}
+
+/// Atomic adds to places of their own.
+@compute(64)
+fn spread(counts: mut Atomics<u32>, id: GlobalId) {
+    var h = id.x * 2654435761
+    for _i in 0..PASSES {
+        h = h * 1664525 + 1013904223
+        let _ = counts.add(i: (h >> 8) & 65535, value: 1)
+    }
+}
+
+pub struct Scene {
+    data: GpuBuffer<f32>,
+    out: GpuBuffer<f32>,
+    counts: GpuBuffer<u32>,
+    t: Texture<R32Float>,
+}
+
+pub fn init() -> Scene {
+    Scene {
+        data: buffer(SPREAD),
+        out: buffer(INVOCATIONS),
+        counts: buffer(65536),
+        t: texture(width: 4096, height: 4096),
+    }
+}
+
+pub fn frame(s: mut Scene, time: f32, width: u32, height: u32) {
+    label("chain")
+    dispatch(chain.bind(mut s.out), over: INVOCATIONS)
+    label("wide")
+    dispatch(wide.bind(mut s.out), over: INVOCATIONS)
+    label("trig")
+    dispatch(trig.bind(mut s.out), over: INVOCATIONS)
+    label("scattered")
+    dispatch(scattered.bind(s.data, mut s.out), over: INVOCATIONS / 64)
+    label("texels")
+    dispatch(texels.bind(s.t, mut s.out), over: INVOCATIONS / 64)
+    label("spread")
+    dispatch(spread.bind(mut s.counts), over: INVOCATIONS / 64)
+    label("contended")
+    dispatch(contended.bind(mut s.counts), over: INVOCATIONS / 16)
+}

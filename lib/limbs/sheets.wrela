@@ -1,0 +1,370 @@
+// Sheets of stepped cloth (a coat's tails), as a scene uses them: a sheet's grid of nodes at
+// rest and what wears it, once; each frame each wearer's pose holds it and it's stepped
+// (`chart::cloth::Drape`, in compute); then drawn into the frame's picture, a quad between each
+// four nodes, from both faces.
+//
+//     var tails = limbs::sheets::sheets(Tails {}, NODES, LEG_RADII, places, views: 2)
+//     tails.add(view: 0, body: 0, group: 2, look)              // once a view
+//     tails.hold(view, held, palette)                          // each frame, each view
+//     tails.work(dt)                                           // each frame
+//     frame.draw(|d| { ...; tails.draw_into(d) })              // each frame, into the picture's pass
+//
+// The sheet's chart is its nodes: the point at a place between four is theirs between them, its
+// face `thick` out from the cloth's middle along the way its outside faces. Above its first row
+// it runs on one row more (`EXTRA`), carried on as its first two rows run and tucked in by
+// `tuck`: a sheet that hangs from under a garment starts out of sight. Its look cuts it where it
+// isn't cloth (`Worn::kept`).
+
+use chart::cloth::{Drape, Held, Node, Wearer, drape}
+use chart::grown::{COVERLESS, Grown}
+use chart::limb::Band
+use draw::{Seen, texels, unit}
+use frame::outline::fold_field
+use form::look::Look
+use frame::eye::{Eye, NEARER}
+use frame::light::{AllLit, Lighting, Lit, OneLit, Unlit, lit_by}
+use frame::picture::Drawing
+use placed::{ALONE, Part}
+use std::collections::Vec
+use std::derive::Box2
+use std::gpu::{
+    ClipPosition, Cull, Flat, GpuBuffer, RenderPass, Targets2, Targets3, VertexIndex, buffer,
+    buffer_of, draw, label, write,
+}
+use worn::Worn
+
+/// How many rows the sheet runs on above its first.
+pub const EXTRA: u32 = 1
+
+/// A quad's corners as two triangles (`grid`'s order).
+const CORNER_C: [u32; 6] = [0, 1, 1, 0, 1, 0]
+const CORNER_R: [u32; 6] = [0, 0, 1, 0, 1, 1]
+
+/// Corner `v` of view `part.limb`'s sheet: its grid's `cols` by `rows` nodes (`nodes`, view by
+/// view; `facing`, the way each faces; `rest`, each at rest) and `EXTRA` rows over them, its face
+/// `thick` out from the cloth's middle, its extra rows `tuck` in. Its place on the sheet's chart
+/// (`part.band`: from its first row to its last along, its first column to its last round).
+///
+/// Its light's normal is its shape's at rest (`normals`: each node's, its folds and its flare),
+/// carried as its wearer carries the cloth stiffly (`Wearer::skinned`, by `palettes` from
+/// `part.limb`'s): the cloth's step moves where it hangs, not the folds it's lit by.
+@vertex
+pub fn sheet_corner<W: Wearer>(
+    v: VertexIndex,
+    eye: Eye,
+    part: u32,
+    parts: [Part],
+    nodes: [vec4],
+    facing: [vec4],
+    rest: [Node],
+    cols: u32,
+    rows: u32,
+    thick: f32,
+    tuck: f32,
+    wearer: W,
+    palettes: [mat4],
+    normals: [vec4],
+) -> Seen {
+    let p = parts[part]
+    let quad = v.index / 6
+    let k = v.index % 6
+    let c = quad % (cols - 1) + CORNER_C[k]
+    let row = quad / (cols - 1) + CORNER_R[k]
+    let base = p.limb * cols * rows
+    // (Row `row` of the drawn grid is the sheet's row `row - EXTRA`: above its first, carried on.)
+    let r = if row >= EXTRA { row - EXTRA } else { 0 }
+    let n = unit(facing[base + r * cols + c].xyz)
+    var at = nodes[base + r * cols + c].xyz + n * thick
+    var at_rest = rest[r * cols + c].rest
+    if row < EXTRA {
+        let up = f32(EXTRA - row)
+        let n1 = unit(facing[base + cols + c].xyz)
+        let below = nodes[base + cols + c].xyz + n1 * thick
+        at = at + (at - below) * up - n * tuck
+        at_rest = at_rest + (at_rest - rest[cols + c].rest) * up
+    }
+    let along = (f32(row) - f32(EXTRA)) / f32(rows - 1)
+    let round = mix(p.band.theta.x, p.band.theta.y, f32(c) / f32(cols - 1))
+    let first = p.limb * 64
+    let held = wearer.skinned(at_rest, palettes, first)
+    let lit = unit(
+        wearer.skinned(at_rest + normals[r * cols + c].xyz * 0.01, palettes, first) - held,
+    )
+    Seen {
+        clip: ClipPosition { position: eye.clip(at) },
+        world: at,
+        rest: at_rest,
+        place: vec2(along, round),
+        normal: n,
+        own: 1.0,
+        light: lit,
+        up: vec3(0.0),
+        left: vec3(0.0),
+        field: fold_field(n, unit(eye.at - at)),
+        part: Flat { value: part },
+    }
+}
+
+/// A pixel of a sheet: its light's normal the way its cloth faces, between its nodes; lit by at
+/// most `lights` live lights (`form::shade::lit`'s `live`).
+@fragment
+pub fn sheet_shade<L: Worn>(
+    s: Seen,
+    eye: Eye,
+    light: Lighting,
+    parts: [Part],
+    looks: [L],
+    covers: [f32],
+    lights: const u32,
+) -> Targets3<vec4, vec4, u32> {
+    let p = parts[s.part.value]
+    let n = unit(s.light)
+    texels(s, p, n, n, eye, light, looks[p.look], covers, cuts: true, lights: lights)
+}
+
+/// A pixel of a sheet as a reference's look takes it: its colour and the way it faces.
+@fragment
+pub fn sheet_look<L: Worn>(
+    s: Seen,
+    eye: Eye,
+    light: Lighting,
+    parts: [Part],
+    looks: [L],
+    covers: [f32],
+) -> Targets2<vec4, vec4> {
+    let p = parts[s.part.value]
+    let n = unit(s.light)
+    let t = texels(
+        s,
+        p,
+        n,
+        n,
+        eye,
+        light,
+        looks[p.look],
+        covers,
+        cuts: true,
+    )
+    Targets2 { first: t.first, second: vec4(n, 0.0) }
+}
+
+/// The sheets of `views` wearers: their cloth (`Drape`), its nodes at rest, each wearer's
+/// palette this step, each view's part and look, the sheet's places, and how its face lies.
+pub struct Sheets<W: Wearer, L> {
+    drape: Drape<W>,
+    wearer: W,
+    normals: GpuBuffer<vec4>,
+    views: u32,
+    rest: GpuBuffer<Node>,
+    palettes: GpuBuffer<mat4>,
+    posed: Vec<mat4>,
+    drawn: Vec<Part>,
+    shown: Vec<bool>,
+    looks: Vec<L>,
+    parts: GpuBuffer<Part>,
+    worn: GpuBuffer<L>,
+    covers: GpuBuffer<f32>,
+    places: Box2,
+    /// How far out from the cloth's middle its face is drawn (m), and how far in its extra rows
+    /// are tucked (m).
+    pub thick: f32,
+    pub tuck: f32,
+}
+
+/// Bones a palette holds.
+const BONES: u32 = 64
+
+/// The sheets of `views` wearers of `wearer`'s cloth: its nodes at rest (`W::COLS` by
+/// `W::ROWS`, row by row) and its shape's normal at each at rest (`normals`), its wearer's table (`Wearer::off_legs`'), its places on its chart
+/// (`places`: the round, from its first column to its last, `x`; down, `y`).
+pub fn sheets<W: Wearer, L: Worn>(
+    wearer: W,
+    nodes: [Node],
+    normals: [vec4],
+    legs: [f32],
+    places: Box2,
+    views: u32,
+) -> Sheets<W, L> {
+    var parts: Vec<Part> = Vec::new()
+    var shown: Vec<bool> = Vec::new()
+    var posed: Vec<mat4> = Vec::new()
+    let still = mat4(
+        vec4(1.0, 0.0, 0.0, 0.0),
+        vec4(0.0, 1.0, 0.0, 0.0),
+        vec4(0.0, 0.0, 1.0, 0.0),
+        vec4(0.0, 0.0, 0.0, 1.0),
+    )
+    for view in 0..views {
+        shown.push(false)
+        parts.push(
+            Part {
+                band: Band {
+                    f: vec2(-f32(EXTRA) / f32(W::ROWS - 1), 1.0),
+                    theta: vec2(places.lo.x, places.hi.x),
+                },
+                base: 0,
+                along: W::ROWS - 1 + EXTRA,
+                round: W::COLS - 1,
+                limb: view,
+                onto: ALONE,
+                onto_wide: 0,
+                body: 0,
+                group: 0,
+                cover: COVERLESS,
+                faces: 2,
+                wide: 2,
+                length: 1.0,
+                // (Its top runs on out of sight: no edge drawn there.)
+                caps: vec2(1.0, 0.0),
+                look: view,
+                read: 0,
+                under: vec2(0.0),
+                how: Grown { fillet: 0.0, reach: 1.0 },
+            },
+        )
+        for _ in 0..BONES {
+            posed.push(still)
+        }
+    }
+    Sheets {
+        drape: drape(wearer, nodes, legs, views),
+        wearer,
+        normals: buffer_of(normals),
+        views,
+        rest: buffer_of(nodes),
+        palettes: buffer(views * BONES),
+        posed,
+        drawn: parts,
+        shown,
+        looks: Vec::new(),
+        parts: buffer(1),
+        worn: buffer(1),
+        covers: buffer(1),
+        places,
+        thick: 0.007,
+        tuck: 0.004,
+    }
+}
+
+impl<W: Wearer, L: Worn> Sheets<W, L> {
+    /// View `view`'s sheet drawn as body `body`'s, in ink group `group`, wearing `look`. Views
+    /// are added in order.
+    pub fn add(mut self, view: u32, body: u32, group: u32, look: L) {
+        assert(view == self.looks.len(), "views are added in order")
+        self.looks.push(look)
+        self.drawn[view].body = body
+        self.drawn[view].group = group
+        self.shown[view] = true
+        self.worn = buffer_of(self.looks)
+        self.parts = buffer_of(self.drawn)
+    }
+
+    /// What view `view`'s wearer's pose holds its cloth by this step (`Held`, from the same
+    /// `palette`: each of the wearer's bones' matrices).
+    pub fn hold(mut self, view: u32, held: Held, palette: [mat4; 64]) {
+        self.drape.hold(view, held)
+        for k in 0..BONES {
+            self.posed[view * BONES + k] = palette[k]
+        }
+    }
+
+    /// The cloth moved on `dt` seconds, held as `hold` was last told.
+    pub fn work(mut self, dt: f32) {
+        label("cloth")
+        write(mut self.palettes, 0, self.posed)
+        self.drape.work(self.palettes, BONES, dt)
+    }
+
+    /// Each view's sheet drawn into `pass`, an open pass into a reference's look (`frame::judge`).
+    pub fn looked_into<P: RenderPass>(self, pass: P, eye: Eye, light: Lighting) {
+        for view in 0..self.views {
+            if !self.shown[view] {
+                continue
+            }
+            draw(
+                pass,
+                sheet_corner.bind(
+                    eye,
+                    part: view,
+                    parts: self.parts,
+                    nodes: self.drape.nodes(),
+                    facing: self.drape.facing(),
+                    rest: self.rest,
+                    cols: W::COLS,
+                    rows: W::ROWS,
+                    thick: self.thick,
+                    tuck: self.tuck,
+                    wearer: self.wearer,
+                    palettes: self.palettes,
+                    normals: self.normals,
+                ),
+                sheet_look.bind(
+                    eye,
+                    light: light,
+                    parts: self.parts,
+                    looks: self.worn,
+                    covers: self.covers,
+                ),
+                vertices: (W::COLS - 1) * (W::ROWS - 1 + EXTRA) * 6,
+                cull: Cull::None,
+                depth: NEARER,
+            )
+        }
+    }
+
+    /// Each view's sheet drawn into the picture's pass (`Frame::draw`): after the opaque
+    /// triangles, since its look cuts it (its pixels may be dropped).
+    pub fn draw_into(self, d: Drawing) {
+        // (By its pixels' pipeline for as many live lights as are lit: its nodes are the GPU's,
+        // so no box of it is at hand to say which reach it.)
+        let lit = lit_by(d.light.lights, vec3(-1.0e30), vec3(1.0e30))
+        if lit == 0 {
+            self.drawn_with(d, Unlit {})
+        } else if lit == 1 {
+            self.drawn_with(d, OneLit {})
+        } else {
+            self.drawn_with(d, AllLit {})
+        }
+    }
+
+    /// Each view's sheet drawn into the picture's pass by its pixels' pipeline for `K`'s lights.
+    fn drawn_with<K: Lit>(self, d: Drawing, _lit: K) {
+        let pass = d.pass
+        let eye = d.eye
+        let light = d.light
+        for view in 0..self.views {
+            if !self.shown[view] {
+                continue
+            }
+            draw(
+                pass,
+                sheet_corner.bind(
+                    eye,
+                    part: view,
+                    parts: self.parts,
+                    nodes: self.drape.nodes(),
+                    facing: self.drape.facing(),
+                    rest: self.rest,
+                    cols: W::COLS,
+                    rows: W::ROWS,
+                    thick: self.thick,
+                    tuck: self.tuck,
+                    wearer: self.wearer,
+                    palettes: self.palettes,
+                    normals: self.normals,
+                ),
+                sheet_shade.bind(
+                    eye,
+                    light: light,
+                    parts: self.parts,
+                    looks: self.worn,
+                    covers: self.covers,
+                    lights: K::LIVE,
+                ),
+                vertices: (W::COLS - 1) * (W::ROWS - 1 + EXTRA) * 6,
+                cull: Cull::None,
+                depth: NEARER,
+            )
+        }
+    }
+}

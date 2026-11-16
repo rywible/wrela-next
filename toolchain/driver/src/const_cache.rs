@@ -1,0 +1,778 @@
+//! Constants cached by their inputs, between builds (language.md §13). A computed constant is
+//! lowered into a module of its own: the code it runs, the values of the constants it reads and
+//! the files it embeds, nothing else. Its key ([`key`]) is that module's WASM, with the fuel it
+//! may use, the build's options, the bytes of each file it embeds, the version of the WASM engine
+//! that runs it and the evaluator's meaning ([`MEANING`]), so a constant is computed again only
+//! when one of those changes: an edit to a function it doesn't call leaves its module, and its
+//! key, as they were, and so does a change to the toolchain that changes no value.
+//!
+//! The cache is a directory of files, one per key, each a constant's value and the fuel it used
+//! ([`encode`]): the one `WRELA_CONST_CACHE` names, which every package and checkout that set it
+//! share, or else the package's own `build/consts`; in either, the directory of the toolchain's
+//! version (`<version>`). A value is kept once on the machine: a build with the shared directory
+//! keeps none in the package. A compile's `Scope` may name other directories instead: the tool
+//! host's toolchain service keeps its cache in one of the host's own, never beside a package it
+//! was granted (§15.5). A file is written whole to a temporary name and renamed into place, so
+//! two builds at once never read half of one. Files no build has used for a week are removed.
+
+use sha2::{Digest, Sha256};
+use std::fmt::Write;
+use std::path::{Path, PathBuf};
+use wrela_ir as ir;
+use wrela_lower::Value;
+
+/// The format's first bytes and version: a file of another version is a miss.
+const MAGIC: &[u8; 8] = b"wrelac\x00\x04";
+
+/// The toolchain's version: the name of the directory its entries are in.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// What a constant's value means beyond its WASM, its fuel and its inputs: how the evaluator
+/// runs build-time code and reads a value back (lower/eval.rs's reading, the host calls
+/// build-time code may make, how its helpers share a parallel job), as a number in every key.
+/// Raise it in the change that could make a value differ for the same WASM: that cooks every
+/// constant again, and nothing else does. The test `the_evaluators_meaning_is_pinned`
+/// (toolchain/tests) fails when a corpus of constants' values change, or lower/eval.rs does,
+/// until it is raised or the change is shown to keep every value.
+pub const MEANING: u32 = 1;
+
+/// A key's encoded bytes, and the checksum at the end of an entry.
+const KEY_BYTES: usize = 64;
+const CHECKSUM_BYTES: usize = 32;
+
+/// How long an entry no build has used is kept.
+const KEEP_FOR: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
+
+/// The cache's directories for the package at `root`: the one `WRELA_CONST_CACHE` names, if
+/// it's set, else its `build/consts`. One directory can serve every package and checkout, as a
+/// key is all a value depends on: a fresh checkout reads the constants another one computed, and
+/// no package keeps a copy of its own.
+pub fn dirs_of(root: &Path) -> Vec<PathBuf> {
+    dirs_in(root, std::env::var_os("WRELA_CONST_CACHE"))
+}
+
+fn dirs_in(root: &Path, shared: Option<std::ffi::OsString>) -> Vec<PathBuf> {
+    let dir = match shared.filter(|d| !d.is_empty()) {
+        Some(d) => Some(PathBuf::from(d).join(VERSION)),
+        None => root.canonicalize().ok().map(|r| r.join("build").join("consts").join(VERSION)),
+    };
+    dir.into_iter().filter(|d| safe(d).is_some()).collect()
+}
+
+/// A cached constant: its value, and the fuel computing it used.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Entry {
+    pub value: Value,
+    pub fuel: u64,
+}
+
+/// The entry cached under `key` in the first of `dirs` that has it, kept in each before it,
+/// and its bytes in the cache.
+pub fn get_in(dirs: &[PathBuf], key: &str) -> Option<(Entry, u64)> {
+    for (i, dir) in dirs.iter().enumerate() {
+        if let Some((e, bytes)) = read(dir, key) {
+            for earlier in &dirs[..i] {
+                write(earlier, key, &bytes);
+            }
+            return Some((e, bytes.len() as u64));
+        }
+    }
+    None
+}
+
+/// Stores `entry` under `key` in each of `dirs`: its bytes in the cache.
+pub fn put_in(dirs: &[PathBuf], key: &str, entry: &Entry) -> u64 {
+    let Some(bytes) = encode(key, entry) else { return 0 };
+    for dir in dirs {
+        write(dir, key, &bytes);
+    }
+    bytes.len() as u64
+}
+
+/// Refuses a link in a cache path. For the package-owned `<package>/build/consts`, checks from
+/// the package; an explicitly configured shared directory is itself the ownership root. This
+/// is a preflight; [`crate::ensure_no_symlink_path`] documents its unavoidable replacement race.
+fn safe(dir: &Path) -> Option<()> {
+    let root = package_root(dir).unwrap_or(dir);
+    crate::ensure_no_symlink_path(root, dir).ok()
+}
+
+fn safe_file(dir: &Path, path: &Path) -> Option<()> {
+    safe(dir)?;
+    crate::ensure_no_symlink_path(dir, path).ok()
+}
+
+/// The package whose `build/consts` (or a version's directory in it) `dir` is.
+fn package_root(dir: &Path) -> Option<&Path> {
+    let consts = if dir.file_name()? == "consts" { dir } else { dir.parent()? };
+    let build = consts.parent()?;
+    (consts.file_name()? == "consts" && build.file_name()? == "build").then(|| build.parent())?
+}
+
+/// A constant's key: its module's WASM, the fuel it may use, and `inputs` (the build's options
+/// and the files it embeds, [`inputs`]), with the evaluator's [`MEANING`] and the version of the
+/// WASM engine that runs it (build.rs). Not the toolchain's sources: a change to them that
+/// changes no value computes nothing again. How many threads computed it isn't part of it:
+/// results don't depend on them (§16.1).
+pub fn key(wasm: &[u8], fuel: u64, inputs: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(MAGIC);
+    h.update(b"meaning");
+    h.update(MEANING.to_le_bytes());
+    h.update(env!("WRELA_CONST_ENGINE").as_bytes());
+    keyed(h, wasm, fuel, inputs)
+}
+
+/// The key's hash of the rest of a key: the fuel, the inputs and the WASM.
+fn keyed(mut h: Sha256, wasm: &[u8], fuel: u64, inputs: &[u8]) -> String {
+    h.update(fuel.to_le_bytes());
+    h.update((inputs.len() as u64).to_le_bytes());
+    h.update(inputs);
+    h.update((wasm.len() as u64).to_le_bytes());
+    h.update(wasm);
+    let mut key = String::with_capacity(KEY_BYTES);
+    for b in h.finalize() {
+        write!(key, "{b:02x}").expect("write a cache key");
+    }
+    key
+}
+
+/// The key the toolchain at main's b702378 gave the same constant: its version and the hash
+/// of the sources that computed it (WRELA_CONST_IDENTITY then), whose values are those of
+/// [`MEANING`] 1. Until 2026-11-23, when an entry no build has used for a week is gone, a build
+/// that misses takes such an entry for its own key ([`adopt`]), so the change of keys cooks
+/// nothing again. Remove it, and [`adopt`], then.
+pub fn legacy_key(wasm: &[u8], fuel: u64, inputs: &[u8]) -> Option<String> {
+    const IDENTITY: &str = "3072fb3b3f07b841a029182dd60e52045f57ca94779b16952238d18ef8f3dbb9";
+    if MEANING != 1 {
+        return None;
+    }
+    let mut h = Sha256::new();
+    h.update(MAGIC);
+    h.update(VERSION.as_bytes());
+    h.update(IDENTITY.as_bytes());
+    Some(keyed(h, wasm, fuel, inputs))
+}
+
+/// The entry cached under `legacy` ([`legacy_key`]) in the first of `dirs` that has it, kept
+/// under `key` in the first of `dirs`, and its bytes in the cache.
+pub fn adopt(dirs: &[PathBuf], key: &str, legacy: &str) -> Option<(Entry, u64)> {
+    let entry = dirs.iter().find_map(|d| get(d, legacy))?;
+    let bytes = encode(key, &entry)?;
+    write(dirs.first()?, key, &bytes);
+    Some((entry, bytes.len() as u64))
+}
+
+/// The inputs a constant's key holds beside its WASM: the build's `options` (each that changes
+/// what CPU code does, written out), and each file it embeds, by its path and its bytes'
+/// [`digest`] (which a build computes once a file).
+pub fn inputs<'a>(options: &str, embeds: impl IntoIterator<Item = (&'a str, [u8; 32])>) -> Vec<u8> {
+    let mut out = options.as_bytes().to_vec();
+    for (path, digest) in embeds {
+        out.push(0);
+        out.extend_from_slice(path.as_bytes());
+        out.push(0);
+        out.extend_from_slice(&digest);
+    }
+    out
+}
+
+/// A file's bytes' hash, as [`inputs`] takes it.
+pub fn digest(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
+}
+
+/// The entry cached under `key` in `dir`, if there's one that reads back whole.
+pub fn get(dir: &Path, key: &str) -> Option<Entry> {
+    read(dir, key).map(|(e, _)| e)
+}
+
+/// The entry under `key` in `dir` and its bytes, if they read back whole. A hit marks the file
+/// used now, so it's kept.
+fn read(dir: &Path, key: &str) -> Option<(Entry, Vec<u8>)> {
+    let path = dir.join(format!("{key}.wcv"));
+    safe_file(dir, &path)?;
+    let bytes = std::fs::read(&path).ok()?;
+    let entry = decode(key, &bytes)?;
+    // Touched, so cleaning keeps it.
+    let _ = std::fs::File::options()
+        .append(true)
+        .open(&path)
+        .and_then(|f| f.set_modified(std::time::SystemTime::now()));
+    Some((entry, bytes))
+}
+
+/// Stores `entry` under `key` in `dir`. Failing to is no error: the next build computes it again.
+pub fn put(dir: &Path, key: &str, entry: &Entry) {
+    if let Some(bytes) = encode(key, entry) {
+        write(dir, key, &bytes);
+    }
+}
+
+/// Writes an entry's `bytes` under `key` in `dir`, whole: to a temporary name, renamed into place.
+fn write(dir: &Path, key: &str, bytes: &[u8]) {
+    if safe(dir).is_none() {
+        return;
+    }
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    if safe(dir).is_none() {
+        return;
+    }
+    // Unique across machines too, which share a directory but not their process ids.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    let tmp = dir.join(format!("{key}.{}-{nanos}.tmp", std::process::id()));
+    if safe_file(dir, &tmp).is_none() {
+        return;
+    }
+    if std::fs::write(&tmp, bytes).is_ok()
+        && std::fs::rename(&tmp, dir.join(format!("{key}.wcv"))).is_err()
+    {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// Removes the entries in `dir` that no build has used for [`KEEP_FOR`], and temporary files
+/// left by a build that stopped; and, beside it, those of other versions' directories and of the
+/// layout before them (entries in `consts` itself), each emptied directory with them.
+pub fn clean(dir: &Path) {
+    clean_one(dir);
+    let Some(parent) = dir.parent() else { return };
+    if safe(parent).is_none() || !due(&parent.join(SWEPT)) {
+        return;
+    }
+    clean_one(parent);
+    let Ok(entries) = std::fs::read_dir(parent) else { return };
+    for e in entries.flatten() {
+        let other = e.path();
+        let versioned = e
+            .file_name()
+            .to_str()
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit() || b == b'.'));
+        if versioned && other != dir && e.file_type().is_ok_and(|t| t.is_dir()) {
+            clean_one(&other);
+            // Only once nothing is left in it.
+            let _ = std::fs::remove_dir(&other);
+        }
+    }
+}
+
+/// The file whose time says when [`clean`] last swept other versions' directories.
+const SWEPT: &str = ".swept";
+
+/// Whether a day has passed since the file at `marker` was touched (or there's none), touching
+/// it if so: the other versions' sweep runs at most once a day, not every build.
+fn due(marker: &Path) -> bool {
+    let day = std::time::Duration::from_secs(24 * 3600);
+    let fresh = std::fs::metadata(marker)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age < day);
+    if !fresh {
+        let _ = std::fs::write(marker, b"");
+    }
+    !fresh
+}
+
+/// [`clean`]'s work in one directory.
+fn clean_one(dir: &Path) {
+    if safe(dir).is_none() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let now = std::time::SystemTime::now();
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(temporary) = cache_name(&name) else { continue };
+        if !e.file_type().is_ok_and(|t| t.is_file()) {
+            continue;
+        }
+        let path = e.path();
+        let age = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .unwrap_or_default();
+        if (!temporary && age > KEEP_FOR) || (temporary && age.as_secs() > 3600) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Whether `name` belongs to this cache: a 64-hex-digit key and `.wcv` (false), or its
+/// `<key>.<pid>-<nanos>.tmp` temporary (true). The earlier `<key>.<pid>.tmp` form is owned too,
+/// so an old interrupted build's temporary can still be removed. Anything else is somebody
+/// else's.
+fn cache_name(name: &std::ffi::OsStr) -> Option<bool> {
+    let name = name.to_str()?;
+    if !is_key(name.get(..KEY_BYTES)?) {
+        return None;
+    }
+    let rest = &name[KEY_BYTES..];
+    if rest == ".wcv" {
+        return Some(false);
+    }
+    let unique = rest.strip_prefix('.')?.strip_suffix(".tmp")?;
+    let numeric = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let owned = match unique.split_once('-') {
+        Some((pid, nanos)) => numeric(pid) && numeric(nanos) && !nanos.contains('-'),
+        None => numeric(unique),
+    };
+    owned.then_some(true)
+}
+
+/// A value as bytes: [`MAGIC`], the key whose file may hold it, the value (each node a tag and
+/// its payload), and a checksum of all of those bytes. Binding the contents to the key makes a
+/// valid entry copied or renamed under another key a miss; the checksum makes a damaged entry
+/// one too.
+pub fn encode(key: &str, e: &Entry) -> Option<Vec<u8>> {
+    if !is_key(key) {
+        return None;
+    }
+    let mut out = MAGIC.to_vec();
+    out.extend_from_slice(key.as_bytes());
+    out.extend_from_slice(&e.fuel.to_le_bytes());
+    put_value(&mut out, &e.value);
+    let checksum = Sha256::digest(&out);
+    out.extend_from_slice(&checksum);
+    Some(out)
+}
+
+/// The entry `bytes` hold for `key`, or none if they aren't one whole, intact entry for it.
+pub fn decode(key: &str, bytes: &[u8]) -> Option<Entry> {
+    if !is_key(key) {
+        return None;
+    }
+    let checksum_at = bytes.len().checked_sub(CHECKSUM_BYTES)?;
+    let (body, stored_checksum) = bytes.split_at(checksum_at);
+    let checksum: [u8; CHECKSUM_BYTES] = Sha256::digest(body).into();
+    if checksum.as_slice() != stored_checksum {
+        return None;
+    }
+    let rest = body.strip_prefix(MAGIC.as_slice())?.strip_prefix(key.as_bytes())?;
+    let mut r = Reader { bytes: rest, at: 0 };
+    let fuel = r.u64()?;
+    let value = r.value(0)?;
+    (r.at == r.bytes.len()).then_some(Entry { value, fuel })
+}
+
+/// Whether `s` is a key as [`key`] writes it: [`KEY_BYTES`] hex digits.
+fn is_key(s: &str) -> bool {
+    s.len() == KEY_BYTES && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn put_u32(out: &mut Vec<u8>, x: u32) {
+    out.extend_from_slice(&x.to_le_bytes());
+}
+
+fn put_value(out: &mut Vec<u8>, v: &Value) {
+    match v {
+        Value::Scalar(c) => {
+            out.push(0);
+            put_const(out, c);
+        }
+        Value::Parts(parts) => {
+            out.push(1);
+            put_u32(out, parts.len() as u32);
+            for p in parts {
+                put_value(out, p);
+            }
+        }
+        Value::Variant(tag, payload) => {
+            out.push(2);
+            put_u32(out, *tag);
+            match payload {
+                Some(p) => {
+                    out.push(1);
+                    put_value(out, p);
+                }
+                None => out.push(0),
+            }
+        }
+        Value::Points(values) => {
+            out.push(3);
+            put_u32(out, values.len() as u32);
+            for p in values {
+                put_value(out, p);
+            }
+        }
+        Value::Bytes(b) => {
+            out.push(4);
+            put_u32(out, b.len() as u32);
+            out.extend_from_slice(b);
+        }
+    }
+}
+
+fn scalar_tag(s: ir::Scalar) -> u8 {
+    use ir::Scalar as S;
+    match s {
+        S::Bool => 0,
+        S::I8 => 1,
+        S::U8 => 2,
+        S::I16 => 3,
+        S::U16 => 4,
+        S::I32 => 5,
+        S::U32 => 6,
+        S::I64 => 7,
+        S::U64 => 8,
+        S::F32 => 9,
+        S::F64 => 10,
+        S::F16 => 11,
+    }
+}
+
+fn scalar_of(t: u8) -> Option<ir::Scalar> {
+    use ir::Scalar as S;
+    Some(match t {
+        0 => S::Bool,
+        1 => S::I8,
+        2 => S::U8,
+        3 => S::I16,
+        4 => S::U16,
+        5 => S::I32,
+        6 => S::U32,
+        7 => S::I64,
+        8 => S::U64,
+        9 => S::F32,
+        10 => S::F64,
+        11 => S::F16,
+        _ => return None,
+    })
+}
+
+fn put_const(out: &mut Vec<u8>, c: &ir::Const) {
+    match *c {
+        ir::Const::Bool(b) => out.extend_from_slice(&[0, u8::from(b)]),
+        ir::Const::I32(x) => {
+            out.push(1);
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        ir::Const::U32(x) => {
+            out.push(2);
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        ir::Const::I64(x) => {
+            out.push(3);
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        ir::Const::U64(x) => {
+            out.push(4);
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        ir::Const::Small(s, x) => {
+            out.push(5);
+            out.push(scalar_tag(s));
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        // Their bits, so a NaN's (canonical, §11) and a negative zero come back as they were.
+        ir::Const::F32(x) => {
+            out.push(6);
+            out.extend_from_slice(&x.to_bits().to_le_bytes());
+        }
+        ir::Const::F64(x) => {
+            out.push(7);
+            out.extend_from_slice(&x.to_bits().to_le_bytes());
+        }
+        ir::Const::F16(x) => {
+            out.push(8);
+            out.extend_from_slice(&x.to_bits().to_le_bytes());
+        }
+    }
+}
+
+struct Reader<'b> {
+    bytes: &'b [u8],
+    at: usize,
+}
+
+/// How deep a value nests at most: deeper is a corrupt file (types nest at most 128 deep, §2).
+const MAX_DEPTH: u32 = 4096;
+
+impl Reader<'_> {
+    fn take(&mut self, n: usize) -> Option<&[u8]> {
+        let end = self.at.checked_add(n)?;
+        let s = self.bytes.get(self.at..end)?;
+        self.at = end;
+        Some(s)
+    }
+
+    fn u8(&mut self) -> Option<u8> {
+        Some(self.take(1)?[0])
+    }
+
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+
+    fn u64(&mut self) -> Option<u64> {
+        Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
+    }
+
+    fn values(&mut self, depth: u32) -> Option<Vec<Value>> {
+        let n = self.u32()? as usize;
+        // Each value takes at least two bytes: a length past what's left is corrupt.
+        if n > self.bytes.len() - self.at {
+            return None;
+        }
+        (0..n).map(|_| self.value(depth + 1)).collect()
+    }
+
+    fn value(&mut self, depth: u32) -> Option<Value> {
+        if depth > MAX_DEPTH {
+            return None;
+        }
+        Some(match self.u8()? {
+            0 => Value::Scalar(self.constant()?),
+            1 => Value::Parts(self.values(depth)?),
+            2 => {
+                let tag = self.u32()?;
+                let payload = match self.u8()? {
+                    0 => None,
+                    1 => Some(Box::new(self.value(depth + 1)?)),
+                    _ => return None,
+                };
+                Value::Variant(tag, payload)
+            }
+            3 => Value::Points(self.values(depth)?),
+            4 => {
+                let n = self.u32()? as usize;
+                Value::Bytes(self.take(n)?.to_vec())
+            }
+            _ => return None,
+        })
+    }
+
+    fn constant(&mut self) -> Option<ir::Const> {
+        Some(match self.u8()? {
+            0 => ir::Const::Bool(self.u8()? != 0),
+            1 => ir::Const::I32(self.u32()? as i32),
+            2 => ir::Const::U32(self.u32()?),
+            3 => ir::Const::I64(self.u64()? as i64),
+            4 => ir::Const::U64(self.u64()?),
+            5 => {
+                let s = scalar_of(self.u8()?)?;
+                ir::Const::Small(s, self.u64()? as i64)
+            }
+            6 => ir::Const::F32(f32::from_bits(self.u32()?)),
+            7 => ir::Const::F64(f64::from_bits(self.u64()?)),
+            8 => ir::Const::F16(f32::from_bits(self.u32()?)),
+            _ => return None,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_value_reads_back_as_it_was_stored() {
+        let cache_key = key(b"\0asm codec", 7, b"");
+        let v = Value::Parts(vec![
+            Value::Scalar(ir::Const::F32(-0.0)),
+            Value::Scalar(ir::Const::F64(f64::from_bits(0x7ff8000000000000))),
+            Value::Scalar(ir::Const::Small(ir::Scalar::I8, -3)),
+            Value::Variant(2, Some(Box::new(Value::Bytes(b"tile".to_vec())))),
+            Value::Variant(0, None),
+            Value::Points(vec![Value::Scalar(ir::Const::U64(u64::MAX)); 3]),
+            Value::Scalar(ir::Const::Bool(true)),
+        ]);
+        let v = Entry { value: v, fuel: 12_345 };
+        let bytes = encode(&cache_key, &v).expect("a valid key");
+        let back = decode(&cache_key, &bytes).expect("it reads back");
+        // Compared by their bytes, as -0.0 == 0.0 and NaN != NaN.
+        assert_eq!(encode(&cache_key, &back).expect("a valid key"), bytes);
+        // Cut short, or with a byte more, it's no value.
+        assert!(decode(&cache_key, &bytes[..bytes.len() - 1]).is_none());
+        let mut longer = bytes.clone();
+        longer.push(0);
+        assert!(decode(&cache_key, &longer).is_none());
+        assert!(decode(&key(b"\0asm another", 7, b""), &bytes).is_none());
+    }
+
+    #[test]
+    fn the_cache_is_the_shared_directory_else_the_packages() {
+        let root = std::env::temp_dir();
+        let own =
+            root.canonicalize().expect("temporary directory").join("build/consts").join(VERSION);
+        assert_eq!(dirs_in(&root, None), std::slice::from_ref(&own));
+        assert_eq!(dirs_in(&root, Some("".into())), std::slice::from_ref(&own));
+        assert_eq!(dirs_in(&root, Some("/s/c".into())), [Path::new("/s/c").join(VERSION)]);
+        assert_eq!(dirs_in(Path::new("/no/such/package"), None), Vec::<PathBuf>::new());
+    }
+
+    /// An entry the toolchain before the meaning's version kept is found under its new key,
+    /// and kept there.
+    #[test]
+    fn an_entry_under_the_legacy_key_is_adopted() {
+        let dir = std::env::temp_dir().join(format!("wrela-consts-legacy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let dirs = [dir.clone()];
+        let (wasm, fuel, inputs) = (b"\0asm legacy".as_slice(), 7, b"debug=false".as_slice());
+        let (k, old) =
+            (key(wasm, fuel, inputs), legacy_key(wasm, fuel, inputs).expect("meaning 1"));
+        assert_ne!(k, old);
+        let v = Entry { value: Value::Bytes(vec![4, 5]), fuel: 3 };
+        put(&dir, &old, &v);
+        assert!(get_in(&dirs, &k).is_none());
+        assert_eq!(adopt(&dirs, &k, &old).map(|(e, _)| e), Some(v.clone()));
+        assert_eq!(get(&dir, &k), Some(v), "kept under the new key");
+        assert!(adopt(&dirs, &k, &key(b"\0asm other", 7, b"")).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_value_found_in_the_shared_directory_is_kept_in_the_packages() {
+        let base = std::env::temp_dir().join(format!("wrela-consts-two-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (own, shared) = (base.join("own"), base.join("shared"));
+        let dirs = [own.clone(), shared.clone()];
+        let (k, v) = (key(b"\0asm two", 1, b""), Entry { value: Value::Bytes(vec![7]), fuel: 1 });
+        put(&shared, &k, &v);
+        assert!(get(&own, &k).is_none());
+        assert_eq!(get_in(&dirs, &k).map(|(e, _)| e), Some(v.clone()));
+        assert_eq!(get(&own, &k), Some(v.clone()), "kept in the package's");
+        let k2 = key(b"\0asm three", 1, b"");
+        put_in(&dirs, &k2, &v);
+        assert!(get(&own, &k2).is_some() && get(&shared, &k2).is_some(), "written to both");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_stored_value_is_found_by_its_key_and_another_key_misses() {
+        let dir = std::env::temp_dir().join(format!("wrela-consts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let k = key(b"\0asm module", 1 << 34, b"");
+        // The same every time, for one build of the compiler (its code's hash is in it).
+        assert_eq!(k, key(b"\0asm module", 1 << 34, b""));
+        assert!(k.len() == 64 && k.bytes().all(|b| b.is_ascii_hexdigit()), "{k}");
+        assert_ne!(k, key(b"\0asm module", 1 << 35, b""), "the fuel is part of the key");
+        assert_ne!(k, key(b"\0asm modulf", 1 << 34, b""));
+        assert_ne!(k, key(b"\0asm module", 1 << 34, b"debug"), "the inputs are part of the key");
+        let v = Entry { value: Value::Bytes(vec![1, 2, 3]), fuel: 3 };
+        assert!(get(&dir, &k).is_none());
+        put(&dir, &k, &v);
+        assert_eq!(get(&dir, &k), Some(v));
+        clean(&dir);
+        assert!(get(&dir, &k).is_some(), "a value used today is kept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A valid entry belongs only to the key encoded in it, and any damaged byte makes it a
+    /// miss. A miss is recomputed by the caller, so cache files cannot change program meaning.
+    #[test]
+    fn an_entry_is_bound_to_its_key_and_checksum() {
+        let dir =
+            std::env::temp_dir().join(format!("wrela-consts-integrity-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (seven, nine) = (key(b"\0asm seven", 1, b""), key(b"\0asm nine", 1, b""));
+        let value = Entry { value: Value::Scalar(ir::Const::U32(9)), fuel: 9 };
+        put(&dir, &nine, &value);
+
+        let nine_file = dir.join(format!("{nine}.wcv"));
+        let seven_file = dir.join(format!("{seven}.wcv"));
+        std::fs::copy(&nine_file, &seven_file).expect("copy under another key");
+        assert!(get(&dir, &seven).is_none(), "an entry copied under another key misses");
+
+        let mut damaged = std::fs::read(&nine_file).expect("entry");
+        let payload = MAGIC.len() + KEY_BYTES + 8 + 2;
+        damaged[payload] ^= 1;
+        std::fs::write(&nine_file, damaged).expect("damage entry");
+        assert!(get(&dir, &nine).is_none(), "an entry whose payload changed misses");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn perf_cleanup_keeps_used_and_future_entries_and_discards_stale_files() {
+        use std::time::{Duration, SystemTime};
+        let dir =
+            std::env::temp_dir().join(format!("wrela-consts-perf-clean-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let now = SystemTime::now();
+        let hour = Duration::from_secs(3600);
+        let recent = format!("{}.wcv", "2".repeat(64));
+        let current = format!("{}.123.tmp", "4".repeat(64));
+        let future = format!("{}.123-456.tmp", "5".repeat(64));
+        for (name, modified) in [
+            (format!("{}.wcv", "1".repeat(64)), now - KEEP_FOR - hour),
+            (recent.clone(), now - hour * 2),
+            (format!("{}.123-456.tmp", "3".repeat(64)), now - hour * 2),
+            (current.clone(), now),
+            (future.clone(), now + hour),
+        ] {
+            std::fs::write(dir.join(&name), "cached").expect("write");
+            std::fs::File::options()
+                .write(true)
+                .open(dir.join(&name))
+                .expect("open")
+                .set_modified(modified)
+                .expect("set time");
+        }
+        clean(&dir);
+        let mut kept: Vec<_> = std::fs::read_dir(&dir)
+            .expect("read")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        kept.sort();
+        assert_eq!(kept, [recent, current, future]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cleaning_removes_only_old_cache_owned_files() {
+        let pkg = std::env::temp_dir().join(format!("wrela-consts-clean-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&pkg);
+        std::fs::create_dir_all(&pkg).expect("package");
+        let dir = dirs_in(&pkg, None).into_iter().next().expect("cache path");
+        std::fs::create_dir_all(&dir).expect("cache directory");
+        let key = "1".repeat(64);
+        let entry = dir.join(format!("{key}.wcv"));
+        let temporary = dir.join(format!("{key}.123-456.tmp"));
+        let old_temporary = dir.join(format!("{key}.123.tmp"));
+        let other = dir.join("important.txt");
+        let old = std::time::SystemTime::now()
+            .checked_sub(KEEP_FOR + std::time::Duration::from_secs(3600))
+            .expect("an old time");
+        for path in [&entry, &temporary, &old_temporary, &other] {
+            let file = std::fs::File::create(path).expect("file");
+            file.set_modified(old).expect("old");
+        }
+        clean(&dir);
+        assert!(!entry.exists(), "an old cache entry is removed");
+        assert!(!temporary.exists(), "an old cache temporary is removed");
+        assert!(!old_temporary.exists(), "an old-format cache temporary is removed");
+        assert!(other.exists(), "a file the cache doesn't own is left alone");
+        let _ = std::fs::remove_dir_all(pkg);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_cache_cannot_escape_through_a_symbolic_link() {
+        use std::os::unix::fs::symlink;
+
+        let base = std::env::temp_dir().join(format!("wrela-consts-link-{}", std::process::id()));
+        let pkg = base.join("package");
+        let outside = base.join("outside");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(pkg.join("build")).expect("package build");
+        std::fs::create_dir_all(&outside).expect("outside");
+        std::fs::write(outside.join("important.txt"), "keep").expect("outside file");
+        symlink(&outside, pkg.join("build/consts")).expect("symlink");
+
+        assert!(dirs_in(&pkg, None).is_empty());
+        assert!(dirs_in(&pkg, Some(pkg.join("build/consts").into_os_string())).is_empty());
+        clean(&pkg.join("build/consts"));
+        assert_eq!(
+            std::fs::read_to_string(outside.join("important.txt")).expect("outside file remains"),
+            "keep"
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+}

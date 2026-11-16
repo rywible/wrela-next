@@ -1,0 +1,238 @@
+// What a lister works out for a posed charted form, at a place on its chart: where the
+// point goes and what passes on to the light there (`Vertex`: the side's own normal, and how
+// much of the light is that normal's), and the normal the light uses (`lit`). The light reads
+// the form's slopes at the place, as smoothed for shading (`Radial::softened`, `kept`), so its
+// bands are as clean on a coarse grid as on a fine one; inside a cap, at a folded hinge, where
+// some of the side stays with another bone, and wherever a form grown from another is moved
+// (`vertex_onto`), it takes the side's own normal instead. From rywible/wrela's
+// engine/chart.wrela at 7ae6711e: its vertex programs `vertex` and `vertex_onto` and
+// `Vertex::normal_from`, as plain functions of a place.
+
+use cover::inside
+use grown::{COVERLESS, Grown, THERE}
+use limb::{Limb, normal_at, sides}
+use path::unit
+use radial::Radial
+
+/// What a place of a posed form passes on: where its point is (`at`) and where the same place
+/// is on the form at rest (`rest`); the side's own normal there (`normal`, unit: across the
+/// side's points, or leant to the form it grows from); and how much of the light at a pixel is
+/// that normal's rather than the form's slopes' (`own`, 0 to 1). A lister works it out at each
+/// vertex and passes it to its pixels between them (`lit`).
+pub struct Vertex: Copy + GpuData {
+    pub at: vec3,
+    pub rest: vec3,
+    pub normal: vec3,
+    pub own: f32,
+}
+
+/// Place (`f`, `theta`) of a form as a pose has it (`form`), with the form at rest (`rest`).
+/// Where a folded hinge holds its side in or a cap closes it, or some of it stays with another
+/// bone, the light is the side's own.
+pub fn vertex<const A: u32, const R: u32>(
+    rest: Limb<A, R>,
+    form: Limb<A, R>,
+    f: f32,
+    theta: f32,
+) -> Vertex {
+    vertex_of(sided(rest, form, f: f, theta: theta))
+}
+
+/// `vertex` from its place's side (`sided`).
+pub fn vertex_of(s: Sided) -> Vertex {
+    // (What of the side stays with another bone takes the side's own normal, across its points
+    // as they're put.)
+    let own = max(s.folded, saturate(s.stays * 1000.0))
+    Vertex { at: s.a, rest: s.rest, normal: unit(cross(s.b - s.a, s.c - s.a)), own }
+}
+
+/// `vertex`, for a form that grows from another or lies on it (`onto`, as the pose has it;
+/// `how`): its side rises from that form's at its root, is laid on it where they overlap and is
+/// filleted where it nears it (`Grown`), so the two meet as skin or as one cloth does and not at
+/// a crease or a step: a thumb's ball at a wrist, a jacket's shoulder on its body. Where it lies
+/// by the other form its normal leans to that form's own light (`light`: what the other form's
+/// pixels read their normals from), and wherever it's moved its light is its side's own.
+/// `covers` holds the other form's cover's edges (`Cover::edges`, one cover's after another;
+/// anything where `how.cover` is `COVERLESS`).
+pub fn vertex_onto<const A: u32, const R: u32, const B: u32, const Q: u32, const T: u32>(
+    rest: Limb<A, R>,
+    form: Limb<A, R>,
+    f: f32,
+    theta: f32,
+    onto: Limb<B, Q>,
+    light: Radial<B, T>,
+    how: Grown,
+    covers: [f32],
+) -> Vertex {
+    onto_sides(
+        sided(rest, form, f: f, theta: theta),
+        f: f,
+        onto: onto,
+        light: light,
+        how: how,
+        covers: covers,
+    )
+}
+
+/// A place's side as `vertex_onto` reads its own form there: the side's point (`a`), and two
+/// beside it (`b` a little along, `c` a little round), each moved by its own share of what
+/// stays with another bone (`stays`); the place at rest; and how folded the form is there. A
+/// lister that works these out in a pass of its own, and the rest of `vertex_onto` in another
+/// (`onto_sides`), keeps each kernel half the size.
+pub struct Sided: Copy + GpuData {
+    pub a: vec3,
+    pub stays: f32,
+    pub b: vec3,
+    pub folded: f32,
+    pub c: vec3,
+    pub spare0: f32,
+    pub rest: vec3,
+    pub spare1: f32,
+}
+
+/// Place (`f`, `theta`)'s side of a posed form (`form`, at rest `rest`), as `vertex_onto` reads it.
+pub fn sided<const A: u32, const R: u32>(
+    rest: Limb<A, R>,
+    form: Limb<A, R>,
+    f: f32,
+    theta: f32,
+) -> Sided {
+    let (p, at_rest, stays) = sides(rest, form, f: f, theta: theta)
+    Sided {
+        a: p[0],
+        stays,
+        b: p[1],
+        folded: form.folded(f: f, theta: theta),
+        c: p[2],
+        spare0: 0.0,
+        rest: at_rest,
+        spare1: 0.0,
+    }
+}
+
+/// `vertex_onto` from its place's side (`sided`), `f` of the way along.
+pub fn onto_sides<const B: u32, const Q: u32, const T: u32>(
+    s: Sided,
+    f: f32,
+    onto: Limb<B, Q>,
+    light: Radial<B, T>,
+    how: Grown,
+    covers: [f32],
+) -> Vertex {
+    // (The side there and at two places beside it, each moved by its own share: the normal
+    // is the moved side's. The other form's side is flat across the three: one reading of it
+    // serves them.)
+    let df = 0.002
+    let f0 = min(f, 1.0 - df)
+    let a = s.a
+    let b = s.b
+    let c = s.c
+    let at_rest = s.rest
+    let stays = s.stays
+    let out = unit(cross(b - a, c - a))
+    // Where the point is on the other form's chart, and whether that form is there.
+    let reach = onto.path.length()
+    let pl = onto.path.place(a)
+    let along = clamp(pl.along, 0.0, reach)
+    var there = 1.0
+    var past = 0.0
+    if how.cover != COVERLESS {
+        let within = inside(covers, along / reach, pl.theta, at: how.cover)
+        there = saturate(within / THERE)
+        past = how.lit_past(within)
+    }
+    // (Most of a form's points are nowhere near the form it grows from or lies on: one where
+    // that form isn't, or one out of reach of the hold, the laying and the fillet, is left
+    // as `vertex` has it, for one place found on the other form's chart. The rest pay for the
+    // other form's side under them, read twice, and its light.)
+    var by = vec3()
+    var a1 = a
+    var normal = out
+    var leant = 0.0
+    if there > 0.0 || past > 0.0 {
+        let first = onto.toward_at(a, pl)
+        if how.held(f0) > 0.0 || first.w < max(how.laid, 2.0 * how.fillet) || past > 0.0 {
+            let nearer = a - first.xyz * first.w
+            let again = onto.toward(nearer)
+            let foot = nearer - again.xyz * again.w
+            let other = again.xyz
+            by = how.moved(f: f0, d: dot(other, a - foot), other: other, out: out, there: there)
+            a1 = a + by
+            let b1 = b +
+                how.moved(f: f0 + df, d: dot(other, b - foot), other: other, out: out, there: there)
+            let c1 = c +
+                how.moved(f: f0, d: dot(other, c - foot), other: other, out: out, there: there)
+            leant = max(there * how.leant(f: f0, d: dot(other, a1 - foot)), past)
+            let fr = onto.path.frame(along)
+            let lit = normal_at(light, fr.up, fr.left, reach, along / reach, pl.theta)
+            normal = unit(mix(unit(cross(b1 - a1, c1 - a1)), lit, vec3(leant)))
+        }
+    }
+    // (Its own normal wherever it's held toward the other side or leans to it, however
+    // little it's moved there: just off that side it's moved a hair, and its form's
+    // slopes are still its own side's, a long way round from the side it lies along.)
+    let own = max(
+        max(s.folded, saturate(leant * 1000.0)),
+        max(
+            max(saturate(how.held(f0) * there * 1000.0), saturate(length(by) / 0.0003)),
+            saturate(stays * 1000.0),
+        ),
+    )
+    Vertex { at: a1, rest: at_rest, normal, own }
+}
+
+/// The unit normal the light uses at place (`f`, `theta`) of a posed form (`form`): read from
+/// its shading form's slopes there (`shade`: the posed form as softened for shading, the same
+/// number along), mixed toward the side's own normal by how much of the light is its own
+/// (`v`: what the place's vertices passed on, between them; the place's own `vertex` at one).
+/// Exact at every place however coarse the grid, where the path is straight; where it bends,
+/// off by the little the section's plane turns across the radius's change along it.
+pub fn lit<const A: u32, const R: u32, const S: u32>(
+    form: Limb<A, R>,
+    shade: Radial<A, S>,
+    f: f32,
+    theta: f32,
+    v: Vertex,
+) -> vec3 {
+    let length = form.path.length()
+    let section = form.path.frame(saturate(f) * length)
+    let read = normal_at(shade, section.up, section.left, length, f, theta)
+    unit(mix(read, unit(v.normal), vec3(saturate(v.own))))
+}
+
+/// The unit normal the light uses at place (`f`, `theta`) of a posed form, worked out there
+/// alone (`lit` of its own `vertex`).
+pub fn lit_at<const A: u32, const R: u32, const S: u32>(
+    rest: Limb<A, R>,
+    form: Limb<A, R>,
+    shade: Radial<A, S>,
+    f: f32,
+    theta: f32,
+) -> vec3 {
+    lit(form, shade, f: f, theta: theta, v: vertex(rest, form, f: f, theta: theta))
+}
+
+/// `lit_at`, for a form grown from another (`vertex_onto`'s).
+pub fn lit_onto_at<const A: u32, const R: u32, const S: u32, const B: u32, const Q: u32, const T: u32>(
+    rest: Limb<A, R>,
+    form: Limb<A, R>,
+    shade: Radial<A, S>,
+    f: f32,
+    theta: f32,
+    onto: Limb<B, Q>,
+    light: Radial<B, T>,
+    how: Grown,
+    covers: [f32],
+) -> vec3 {
+    let v = vertex_onto(
+        rest,
+        form,
+        f: f,
+        theta: theta,
+        onto: onto,
+        light: light,
+        how: how,
+        covers: covers,
+    )
+    lit(form, shade, f: f, theta: theta, v: v)
+}

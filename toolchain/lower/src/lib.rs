@@ -1,0 +1,1522 @@
+//! Lowering: checked wrela to IR, monomorphized (language.md §7: generics are always
+//! monomorphized).
+//!
+//! - **Instances.** A function is lowered once per [`InstanceKey`]: its generic arguments, the
+//!   closures or functions passed for its `fn(...)` parameters (each closure is its own
+//!   instance, so closures are inlined away), and on the GPU the resources bound to its run and
+//!   `Slots` parameters.
+//! - **Targets.** The CPU program is one IR module; each GPU pipeline (a `dispatch`ed kernel, or
+//!   a `draw`'s vertex and fragment shaders) is its own module, lowered from its entry points.
+//! - **Effects per instantiation** (§8): GPU code can't record GPU work (`host`), recurse, or use
+//!   CPU-only types; derivatives only exist in fragment shaders. These are found while lowering
+//!   each GPU pipeline and reported with the call chain.
+
+mod assoc;
+mod body;
+mod consts;
+mod derive;
+mod eval;
+mod glue;
+mod gpu;
+pub use gpu::blends_of;
+mod instance;
+mod job;
+mod lift;
+mod mem;
+mod par;
+mod task;
+mod ty;
+
+pub use eval::{
+    BuildData, ConstLowering, ConstModule, Embeds, MAX_CONST_VALUE_DEPTH, Memory, ReadError,
+    TestModule, Value, Values, is_computed, lower_consts, lower_tests, read_value,
+};
+pub use gpu::{PipelineKey, PipelineKind, PipelineOut};
+pub use instance::{Callable, InstanceKey};
+pub use lift::{LiftTable, LiftedFile, LiftedLiteral, candidates};
+
+use std::collections::{HashMap, VecDeque};
+use std::rc::Rc;
+use wrela_diag::{Diagnostic, Span};
+use wrela_ir as ir;
+use wrela_sema::Checked;
+use wrela_sema::builtins::BuiltinFn;
+use wrela_sema::defs::{Entry, Lang, TraitRef};
+use wrela_sema::program::Program;
+use wrela_sema::ty::{FnId, TyId, TyKind};
+
+/// The program, lowered: the CPU module and one module per GPU pipeline.
+#[derive(Debug)]
+pub struct Lowered {
+    pub cpu: ir::Module,
+    pub pipelines: Vec<PipelineOut>,
+    /// The functions the CPU module instantiates, each with its type arguments (its owner's,
+    /// then its own): for tools (`wrela query`). A pipeline's are its own.
+    pub instances: Vec<(FnId, Vec<TyId>)>,
+}
+
+/// What to lower.
+pub struct Roots {
+    /// Functions exported from the CPU module: the entry module's `pub fn`s.
+    pub exports: Vec<FnId>,
+    /// Functions to check on the GPU even if nothing dispatches them, so their effects are
+    /// checked where they're defined: non-generic entry points, and `@gpu` functions, each
+    /// with the type arguments to check it with (a generic one's are [`stand_ins`]).
+    pub gpu_checks: Vec<(FnId, Vec<TyId>)>,
+    /// Functions lowered for the CPU though nothing exports them: for tests, so code that
+    /// nothing calls still goes through lowering and the back ends.
+    pub also: Vec<FnId>,
+    /// Frame tests (§13), each exported as `test.<index>`, with the program's state when it
+    /// takes it: a name no wrela function has.
+    pub tests: Vec<FnId>,
+    /// Tool tests (§13.2): each exported as [`TOOL_TEST`] with `.<index>`, a tool's entry that
+    /// runs it. A tool build with them exports neither the program's own `tool` nor anything
+    /// else.
+    pub tool_tests: Vec<FnId>,
+}
+
+/// The export, `tool_test.<index>`, that runs tool test `index` (§13.2): as `tool`, it returns
+/// the exit status, 0 once the test has ended.
+pub const TOOL_TEST: &str = "tool_test";
+
+impl Roots {
+    /// The default roots: the entry module's public functions; every non-generic entry point
+    /// and every `@gpu` function in the package.
+    pub fn of(checked: &Checked) -> Roots {
+        let p = &checked.program;
+        let mut exports = Vec::new();
+        let mut gpu_checks = Vec::new();
+        for (i, f) in p.fns.iter().enumerate() {
+            let id = FnId(i as u32);
+            if p.is_std(f.module) || !checked.mir.contains_key(&id) {
+                continue;
+            }
+            let generic = !p.fn_all_generics(id).is_empty();
+            // A generic one too: it's reported (the host can't choose its types). Not a job,
+            // which the program starts and resumes (§16.3).
+            if Some(f.module) == p.main
+                && f.public
+                && f.owner == wrela_sema::defs::FnOwner::Free
+                && f.attrs.entry.is_none()
+                && f.attrs.job.is_none()
+            {
+                exports.push(id);
+            }
+            if f.attrs.entry.is_some() && !generic {
+                gpu_checks.push((id, Vec::new()));
+            } else if f.attrs.gpu.is_some()
+                && let Some(substs) = stand_ins(p, id)
+            {
+                gpu_checks.push((id, substs));
+            }
+        }
+        Roots { exports, gpu_checks, also: Vec::new(), tests: Vec::new(), tool_tests: Vec::new() }
+    }
+
+    /// [`Roots::of`], and every other function of the package that can be lowered on its own:
+    /// one that isn't generic, isn't GPU code, and takes no closure or function (lowered for
+    /// the one each call passes).
+    pub fn every_fn(checked: &Checked) -> Roots {
+        let p = &checked.program;
+        let mut roots = Roots::of(checked);
+        for (i, f) in p.fns.iter().enumerate() {
+            let id = FnId(i as u32);
+            if !p.is_std(f.module)
+                && checked.mir.contains_key(&id)
+                && !matches!(f.owner, wrela_sema::defs::FnOwner::Const(_))
+                && p.fn_all_generics(id).is_empty()
+                && f.attrs.entry.is_none()
+                && f.attrs.gpu.is_none()
+                && !f.attrs.intrinsic
+                && !f.params.iter().any(|ps| wrela_sema::mir::is_callable(&p.types, ps.ty))
+                && !roots.exports.contains(&id)
+            {
+                roots.also.push(id);
+            }
+        }
+        roots
+    }
+}
+
+/// Type arguments to check a `@gpu` function with: for each generic parameter, a type GPU code
+/// can hold that has the parameter's bounds. `f32` has every structural trait (`Copy`, `Clone`,
+/// `GpuData`); a parameter bounded by a declared trait (a trait method's `Self`, say) takes
+/// the first type the program implements it for. `None` when some parameter has none: then no
+/// GPU code can call the function either.
+fn stand_ins(p: &Program, f: FnId) -> Option<Vec<TyId>> {
+    let mut out = Vec::new();
+    for g in p.fn_all_generics(f) {
+        let bounds = wrela_sema::resolve::param_bounds_closure(p, g);
+        if bounds.iter().any(|b| b.args.iter().any(|&a| p.types.has_params(a))) {
+            return None;
+        }
+        let structural = |b: &&TraitRef| p.trait_(b.trait_).lang.is_some_and(Lang::is_structural);
+        let candidates: Vec<TyId> = match bounds.iter().find(|b| !structural(b)) {
+            None => vec![p.types.f32],
+            Some(b) => p
+                .impls_of(b.trait_)
+                .iter()
+                .map(|&i| p.impl_(i))
+                .filter(|imp| imp.generics.is_empty())
+                .map(|imp| imp.self_ty)
+                .collect(),
+        };
+        let fits = |t: TyId| {
+            on_gpu(p, t) && bounds.iter().all(|b| wrela_sema::traits::implements(p, t, b))
+        };
+        out.push(candidates.into_iter().find(|&t| fits(t))?);
+    }
+    Some(out)
+}
+
+/// Whether GPU code can hold a value of type `t`: no CPU-only scalars, runs or functions.
+fn on_gpu(p: &Program, t: TyId) -> bool {
+    on_gpu_in(p, t, &mut HashMap::new())
+}
+
+/// [`on_gpu`], each part a type shares decided once (`known`).
+fn on_gpu_in(p: &Program, t: TyId, known: &mut HashMap<TyId, bool>) -> bool {
+    if let Some(&k) = known.get(&t) {
+        return k;
+    }
+    let ok = match p.types.kind(t) {
+        TyKind::Bool | TyKind::Mat(..) => true,
+        TyKind::Vec(e, _) => e.on_gpu(),
+        TyKind::Int(i) => i.on_gpu(),
+        TyKind::Float(f) => *f == wrela_sema::ty::FloatTy::F32,
+        TyKind::Array(e, n) => *n > 0 && on_gpu_in(p, *e, known),
+        TyKind::Tuple(ts) => ts.iter().all(|&e| on_gpu_in(p, e, known)),
+        TyKind::Adt(a, args) => {
+            // A struct's fields, or each variant's; an enum without variants has no values.
+            let variants = p.field_lists(*a);
+            !variants.is_empty()
+                && variants
+                    .into_iter()
+                    .all(|v| p.fields_of(*a, args, v).into_iter().all(|ft| on_gpu_in(p, ft, known)))
+        }
+        _ => false,
+    };
+    known.insert(t, ok);
+    ok
+}
+
+/// std's thread entries (`@thread_entry`) the program uses: each one whose module the program
+/// uses, by any of the module's other functions (std's `std::par` for the helpers' `worker`,
+/// `std::audio` for `audio`, `std::tick` for `tick`). Each is lowered and exported as `__` and
+/// its name (wrela_abi `memory`'s threads). A `@tool` entry is a tool build's alone, and there
+/// takes the place of its module's others (`std::par`'s `tool_worker`, the tool's helpers').
+pub(crate) fn thread_entries(cx: &mut Cx, cpu: &mut ModuleBuilder) {
+    use wrela_sema::defs::Role;
+    let p = &cx.checked.program;
+    let tool_entry = |f: FnId| p.func(f).attrs.role.is_some_and(|(r, _)| r == Role::Tool);
+    let all: Vec<FnId> = (0..p.fns.len() as u32)
+        .map(FnId)
+        .filter(|f| p.func(*f).attrs.thread_entry.is_some() && cx.checked.mir.contains_key(f))
+        .collect();
+    let tool = cx.data.role == Role::Tool;
+    let entries: Vec<(FnId, String, wrela_sema::ty::ModuleId)> = all
+        .iter()
+        .copied()
+        .filter(|&f| {
+            if tool_entry(f) {
+                return tool;
+            }
+            let module = p.func(f).module;
+            !(tool && all.iter().any(|&g| tool_entry(g) && p.func(g).module == module))
+        })
+        .map(|f| (f, p.func(f).name.clone(), p.func(f).module))
+        .collect();
+    let mut done = Vec::new();
+    loop {
+        let mut added = false;
+        for (e, name, module) in &entries {
+            if done.contains(e) {
+                continue;
+            }
+            let p = &cx.checked.program;
+            let used = cpu
+                .instances
+                .keys()
+                .filter_map(InstanceKey::source_fn)
+                .any(|f| f != *e && p.func(f).module == *module);
+            if !used {
+                continue;
+            }
+            let def = p.func(*e);
+            let u32s = def.params.iter().all(|ps| ps.ty == p.types.u32);
+            if def.params.is_empty() || !u32s || !p.types.is_unit(def.ret) {
+                cx.err(Diagnostic::internal(format!(
+                    "the thread entry `{name}` must take `u32`s (the thread's number first) and return nothing"
+                )));
+            }
+            let id = cx.instance(cpu, InstanceKey::plain(*e, Vec::new()), None);
+            cpu.m.thread_entries.push((name.clone(), id));
+            done.push(*e);
+            added = true;
+        }
+        if !added {
+            break;
+        }
+        cx.drain(cpu);
+    }
+}
+
+/// What a debug build's NaN check panics with (§11).
+pub(crate) const NAN_MESSAGE: &str = "debug build: a float operation created a NaN";
+
+/// What a command too large for the host's command buffer panics with: std writes buffers and
+/// textures in pieces, and refuses a request over it by name, so this is the backstop.
+pub(crate) const COMMAND_MESSAGE: &str =
+    "a GPU or IO command larger than the host's command buffer (1 MiB): send its bytes in pieces";
+
+/// Shared state while lowering every module of one program.
+pub(crate) struct Cx<'a> {
+    pub checked: &'a Checked,
+    /// The values of the constants the build has computed, and the files `embed` reads.
+    pub data: &'a BuildData,
+    /// Whether a failure is explained: a failed `assert` shows its operands' values. In a
+    /// debug build, and in the modules that compute constants and run tests (§13).
+    pub explain: bool,
+    /// Computed constants whose values were needed but aren't in `values` yet.
+    pub missing: std::collections::BTreeSet<wrela_sema::ty::ConstId>,
+    /// The `GpuData` structs whose padding is checked (W0007), once each.
+    pub padded: std::collections::HashSet<wrela_sema::ty::AdtId>,
+    /// Whether GPU modules will be emitted; only then are they flattened and instrumented.
+    pub emit: bool,
+    pub diags: Vec<Diagnostic>,
+    /// Pipelines discovered by CPU code, deduplicated, in discovery order, with their
+    /// interfaces.
+    pub pipelines: Vec<(gpu::PipelineKey, Rc<gpu::Interface>)>,
+    /// Where CPU code dispatches or draws each of `pipelines`.
+    pub pipeline_sites: Vec<Vec<Span>>,
+    /// What each render pipeline of `pipelines` is drawn into, first drawn first (the
+    /// manifest's `targets`): from the draws left in the optimized CPU code, once it's emitted.
+    pub pipeline_targets: Vec<Vec<ir::RenderTarget>>,
+    /// A lifted build's literals (§23): only the program's own modules read them, never the
+    /// modules that compute constants or run tests.
+    pub lift: Option<&'a LiftTable>,
+}
+
+/// One target module being built: the CPU module by default.
+#[derive(Default)]
+pub(crate) struct ModuleBuilder {
+    pub m: ir::Module,
+    pub instances: HashMap<InstanceKey, ir::FuncId>,
+    pub queue: VecDeque<(InstanceKey, ir::FuncId)>,
+    pub type_cache: HashMap<TyId, Option<ir::TypeId>>,
+    /// A GPU module: what it's for, to check effects with context.
+    pub gpu: Option<gpu::GpuCx>,
+    /// The first caller of each instance, for call chains in diagnostics.
+    pub callers: HashMap<ir::FuncId, (ir::FuncId, Span)>,
+    /// Each instance's source name (`Sphere::distance`, `main`'s closure), for diagnostics.
+    pub source_names: HashMap<ir::FuncId, String>,
+    /// How many instantiations each instance is from a root (an export or entry point),
+    /// counting only those that specialize a function ([`InstanceKey::specializes`]).
+    pub depth: HashMap<ir::FuncId, u32>,
+    /// Whether the instantiation limit has been reported in this module.
+    pub too_deep: bool,
+    /// Every call between instances, for finding recursion on the GPU.
+    pub edges: Vec<(ir::FuncId, ir::FuncId, Span)>,
+    /// Derived functions built in this module.
+    pub derived: ir::derive::DeriveCache,
+    /// Where each derivative (`dpdx`, `dpdy`, `fwidth`) is in the source, by the value it
+    /// defines, for E0608.
+    pub derivatives: HashMap<(ir::FuncId, ir::ValueId), Span>,
+    /// The constant data holding each table (CPU only).
+    pub data: HashMap<wrela_sema::ty::ConstId, Option<ir::DataId>>,
+    /// Derived instances waiting for what they derive from to be lowered.
+    pub deriving: Vec<derive::Pending>,
+    /// The constant data holding each text (CPU only).
+    pub texts: HashMap<String, ir::DataId>,
+    /// A lifted build's table of literals, and what keeps its GPU copy (CPU only).
+    pub lift: Option<lift::CpuTable>,
+    /// Each job's value, as laid out (§16.3), by the job and its generics.
+    pub jobs: HashMap<(FnId, Vec<TyId>), job::JobLayout>,
+    /// The files `embed` read into this module's data, by path, in the order first read.
+    pub embeds: Vec<std::sync::Arc<str>>,
+}
+
+impl ModuleBuilder {
+    /// A GPU module, for `g`.
+    pub fn gpu(g: gpu::GpuCx) -> ModuleBuilder {
+        ModuleBuilder { gpu: Some(g), ..ModuleBuilder::default() }
+    }
+
+    pub fn target(&self) -> ir::Target {
+        if self.gpu.is_some() { ir::Target::Gpu } else { ir::Target::Cpu }
+    }
+
+    /// The functions this module instantiates, each with its type arguments, in order.
+    pub fn fn_instances(&self) -> Vec<(FnId, Vec<TyId>)> {
+        let mut out: Vec<(FnId, Vec<TyId>)> = self
+            .instances
+            .keys()
+            .filter_map(|k| match k {
+                InstanceKey::Fn { func, substs, .. } => Some((*func, substs.clone())),
+                _ => None,
+            })
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// How diagnostics name an instance: its source name, else its IR name.
+    pub fn display_name(&self, id: ir::FuncId) -> String {
+        match self.source_names.get(&id) {
+            Some(name) => name.clone(),
+            None => self.m.functions[id.index()].name.clone(),
+        }
+    }
+}
+
+/// Lowers a checked program (with no errors) to IR. With `emit`, its modules are ready for
+/// the back ends; without, lowering only checks (the GPU modules aren't flattened, which only
+/// the WGSL back end needs and which finds nothing wrong with a program).
+pub fn lower(
+    checked: &Checked,
+    roots: &Roots,
+    data: &BuildData,
+    emit: bool,
+) -> (Lowered, Vec<Diagnostic>) {
+    lower_in(checked, roots, data, emit, emit)
+}
+
+/// Lowers a program for the CPU host's frame and tick tests. GPU code is still checked, and
+/// its pipeline interfaces describe the commands the host checks, but its modules need no
+/// optimization or GPU memory layout: no shader runs on that host. CPU code is emitted as in
+/// a full build, including its debug checks.
+pub fn lower_for_cpu(
+    checked: &Checked,
+    roots: &Roots,
+    data: &BuildData,
+) -> (Lowered, Vec<Diagnostic>) {
+    lower_in(checked, roots, data, true, false)
+}
+
+fn lower_in(
+    checked: &Checked,
+    roots: &Roots,
+    data: &BuildData,
+    emit: bool,
+    emit_gpu: bool,
+) -> (Lowered, Vec<Diagnostic>) {
+    let mut cx = Cx::new(checked, data, emit_gpu);
+    cx.lift = data.lift.as_ref().filter(|t| !t.literals.is_empty());
+    let mut cpu = ModuleBuilder::default();
+    cx.make_table(&mut cpu);
+    let role = data.role;
+    let mut has_entry = false;
+    // What else the host runs (`mark_relaxable` keeps it strict).
+    let mut also = Vec::new();
+    for &f in &roots.also {
+        // A job's body is lowered as its `resume` (§16.3).
+        let key = if checked.program.func(f).attrs.job.is_some() {
+            InstanceKey::JobResume { func: f, substs: Vec::new() }
+        } else {
+            InstanceKey::plain(f, Vec::new())
+        };
+        also.push(cx.instance(&mut cpu, key, None));
+    }
+    // The program's state (§15): what `init` returns (a server's `serve_init`), which the
+    // other exports take first. A tool has none: `tool` runs the whole tool (§15.5).
+    let state = state_type(checked, data.role);
+    if let Some((init, s)) = state {
+        let span = checked.program.func(init).sig_span;
+        if let Some(t) = cx.lower_ty(&mut cpu, s, span) {
+            let value = eval::zero(&cpu.m.types, t);
+            cpu.m.state = Some(cpu.m.add_data(ir::Data { name: "state".into(), ty: t, value }));
+        }
+    }
+    // A tool build for tool tests has their entries alone (§13.2).
+    let exports: &[FnId] = if roots.tool_tests.is_empty() { &roots.exports } else { &[] };
+    tool_test_entries(&mut cx, &mut cpu, &roots.tool_tests);
+    for &f in exports {
+        // A `@testing` export is a test build's only (§9).
+        if checked.program.func(f).attrs.testing.is_some() && !data.testing {
+            continue;
+        }
+        // A server build exports `serve_init` and `serve` alone, a tool build `tool`; a client
+        // build every other export (§15.3).
+        let def = checked.program.func(f);
+        let name = &def.name;
+        if export_role(name) != role {
+            continue;
+        }
+        if let Some((only, _)) = def.attrs.role
+            && only != data.role
+        {
+            cx.err(
+                Diagnostic::new(
+                    wrela_diag::codes::E0708,
+                    def.name_span,
+                    format!(
+                        "`{name}` runs only in a {} build, and this is the {} build's code",
+                        only.name(),
+                        data.role.name()
+                    ),
+                )
+                .with_note("each build's exports are entry points for that role (§15.3)")
+                .with_help(format!(
+                    "remove the export from this build, or mark it for the {} build",
+                    data.role.name()
+                )),
+            );
+        }
+        if !checked.program.fn_all_generics(f).is_empty() {
+            // Reported; it has no types to be lowered with.
+            cx.check_export(f, state.map(|s| s.1));
+            continue;
+        }
+        let key = InstanceKey::plain(f, Vec::new());
+        let id = cx.instance(&mut cpu, key, None);
+        has_entry |= name == entry_export(role);
+        if cx.check_export(f, state.map(|s| s.1)) {
+            let id = enum_wrapper(&cx, &mut cpu, f, id);
+            let id = match (cpu.m.state, state) {
+                (Some(d), Some((init, _))) if f == init => state_wrapper(&mut cpu, id, d, true),
+                (Some(d), Some((_, s))) if def.params.first().is_some_and(|p| p.ty == s) => {
+                    state_wrapper(&mut cpu, id, d, false)
+                }
+                _ => id,
+            };
+            cpu.m.exports.push((name.clone(), id));
+        }
+    }
+    for (i, &f) in roots.tests.iter().enumerate() {
+        let id = cx.instance(&mut cpu, InstanceKey::plain(f, Vec::new()), None);
+        let id = match (cpu.m.state, checked.program.func(f).params.is_empty()) {
+            (Some(d), false) => state_wrapper(&mut cpu, id, d, false),
+            _ => id,
+        };
+        cpu.m.exports.push((format!("test.{i}"), id));
+    }
+    if !has_entry && role == wrela_sema::defs::Role::Client {
+        cx.no_frame();
+    }
+    cx.drain(&mut cpu);
+    rewrite_cpu_math(&mut cx, &mut cpu);
+    cx.drain(&mut cpu);
+    check_deterministic(&mut cx, &cpu);
+    if data.relaxed_simd {
+        mark_relaxable(&cx, &mut cpu, role, also);
+    }
+    thread_entries(&mut cx, &mut cpu);
+    mark_counted(&mut cx, &mut cpu);
+    if data.debug {
+        // Checked where floats are computed, by the back end.
+        cpu.m.nan_message = Some(cx.text_data(&mut cpu, NAN_MESSAGE));
+    }
+    cpu.m.command_message = Some(cx.text_data(&mut cpu, COMMAND_MESSAGE));
+    // Inlining finds no mistakes in the program, only makes its code faster, so a check (no
+    // code emitted) skips it.
+    if emit
+        && !wrela_diag::has_errors(&cx.diags)
+        && let Err(e) = ir::opt::inline_cpu(&mut cpu.m)
+    {
+        cx.err(Diagnostic::internal(format!("inlining the CPU module: {e}")));
+    }
+    // For the compiler's own debugging: `WRELA_DUMP_IR=cpu` prints the CPU module (`gpu`, each
+    // pipeline's: `gpu::verify`); set to anything else, it's printed when it's malformed.
+    let dump = std::env::var("WRELA_DUMP_IR").ok();
+    if dump.as_deref() == Some("cpu") {
+        eprintln!("{}", ir::print::print(&cpu.m));
+    }
+    if !wrela_diag::has_errors(&cx.diags)
+        && let Err(e) = ir::verify(&cpu.m)
+    {
+        if dump.is_some_and(|d| d != "cpu") {
+            eprintln!("{}", ir::print::print(&cpu.m));
+        }
+        cx.err(Diagnostic::internal(format!("the CPU module's IR is malformed: {e}")));
+    }
+    // A pipeline no command left in the CPU code records isn't built: behind a constant branch
+    // (`if test_build()`), it's out of the build with the code that recorded it.
+    if emit && !wrela_diag::has_errors(&cx.diags) {
+        recorded_pipelines_only(&mut cx, &mut cpu.m);
+    }
+    // Pipelines: those CPU code records and their stand-ins, then the standalone GPU checks.
+    let standins = gpu::add_standins(&mut cx);
+    let mut pipelines = Vec::new();
+    let mut i = 0;
+    while i < cx.pipelines.len() {
+        let (key, iface) = cx.pipelines[i].clone();
+        let sites = cx.pipeline_sites[i].clone();
+        let targets = cx.pipeline_targets[i].clone();
+        if let Some(mut out) = gpu::lower_pipeline(&mut cx, &key, iface, sites, targets) {
+            if data.debug && cx.emit {
+                gpu::debug_checks(&mut cx, &mut out, pipelines.len() as u32 + 1);
+            }
+            pipelines.push(out);
+        }
+        i += 1;
+    }
+    if pipelines.len() == cx.pipelines.len() {
+        for &(i, j) in &standins {
+            gpu::match_standin(&mut cx, &mut pipelines, i as usize, j as usize);
+        }
+    }
+    for (f, substs) in &roots.gpu_checks {
+        let already = cx.pipelines.iter().any(|(k, _)| k.mentions(*f));
+        if already {
+            continue;
+        }
+        let entry = cx.entry_of(*f);
+        let before = cx.diags.len();
+        gpu::check_standalone(&mut cx, *f, entry, substs);
+        if !substs.is_empty() {
+            // With stand-in types, only what the function's own code does is its error.
+            let own = checked.program.func(*f).span;
+            let found = cx.diags.split_off(before);
+            let inside = |s: Span| s.file == own.file && s.start >= own.start && s.end <= own.end;
+            cx.diags.extend(found.into_iter().filter(|d| d.span().is_some_and(inside)));
+        }
+    }
+    let instances = cpu.fn_instances();
+    let lowered = Lowered { cpu: cpu.m, pipelines, instances };
+    let mut diags = cx.diags;
+    wrela_diag::sort_and_dedup(&mut diags);
+    (lowered, diags)
+}
+
+/// Drops the pipelines no dispatch or draw in `cpu` records, and numbers the rest in order.
+fn recorded_pipelines_only(cx: &mut Cx, cpu: &mut ir::Module) {
+    let mut used = vec![false; cx.pipelines.len()];
+    // Each render pipeline's targets, from the draws left: one a draw that's gone drew into
+    // isn't made.
+    let mut targets: Vec<Vec<ir::RenderTarget>> = vec![Vec::new(); cx.pipelines.len()];
+    for f in &cpu.functions {
+        ir::visit::walk(&f.body, &mut |s| match s.expr() {
+            Some(ir::Expr::Host(ir::HostOp::Dispatch { pipeline, .. }, _)) => {
+                used[*pipeline as usize] = true;
+            }
+            Some(ir::Expr::Host(ir::HostOp::Draw { pipeline, target, .. }, _)) => {
+                used[*pipeline as usize] = true;
+                let ts = &mut targets[*pipeline as usize];
+                if !ts.contains(target) {
+                    ts.push(*target);
+                }
+            }
+            _ => {}
+        });
+    }
+    cx.pipeline_targets = targets;
+    if used.iter().all(|&u| u) {
+        return;
+    }
+    let mut renumber = vec![0u32; used.len()];
+    let mut next = 0;
+    for (i, &u) in used.iter().enumerate() {
+        renumber[i] = next;
+        next += u32::from(u);
+    }
+    for f in &mut cpu.functions {
+        ir::visit::walk_mut(&mut f.body, &mut |s| {
+            if let ir::Stmt::Let(_, e) | ir::Stmt::Eval(e) = s
+                && let ir::Expr::Host(
+                    ir::HostOp::Dispatch { pipeline, .. } | ir::HostOp::Draw { pipeline, .. },
+                    _,
+                ) = e
+            {
+                *pipeline = renumber[*pipeline as usize];
+            }
+        });
+    }
+    retain_used(&mut cx.pipelines, &used);
+    retain_used(&mut cx.pipeline_sites, &used);
+    retain_used(&mut cx.pipeline_targets, &used);
+}
+
+/// Keeps the items of `v` whose entry in `used` is true.
+fn retain_used<T>(v: &mut Vec<T>, used: &[bool]) {
+    let mut keep = used.iter();
+    v.retain(|_| *keep.next().unwrap_or(&false));
+}
+
+impl<'a> Cx<'a> {
+    pub fn new(checked: &'a Checked, data: &'a BuildData, emit: bool) -> Cx<'a> {
+        Cx {
+            checked,
+            data,
+            explain: data.debug,
+            missing: Default::default(),
+            padded: Default::default(),
+            emit,
+            diags: Vec::new(),
+            pipelines: Vec::new(),
+            pipeline_sites: Vec::new(),
+            pipeline_targets: Vec::new(),
+            lift: None,
+        }
+    }
+
+    pub fn err(&mut self, d: Diagnostic) {
+        self.diags.push(d);
+    }
+
+    /// The function for an instance, declaring it (and queueing its body) the first time.
+    pub fn instance(
+        &mut self,
+        mb: &mut ModuleBuilder,
+        key: InstanceKey,
+        caller: Option<(ir::FuncId, Span)>,
+    ) -> ir::FuncId {
+        if let Some(&id) = mb.instances.get(&key) {
+            if let Some((from, span)) = caller {
+                mb.edges.push((from, id, span));
+            }
+            return id;
+        }
+        // Only an instance that specializes its function is a level deeper than its caller: a
+        // chain of plain calls can't go on without end.
+        let step = u32::from(key.specializes());
+        let depth = caller.map_or(0, |(from, _)| mb.depth.get(&from).copied().unwrap_or(0) + step);
+        let types = &self.checked.program.types;
+        let huge = key.substs().iter().any(|&t| types.size(t) > wrela_sema::ty::MAX_TYPE_SIZE);
+        if huge {
+            // Its signature isn't made either: the types are too large to lower.
+            let id = mb.m.add_function(ir::Function::new("too_large", Vec::new(), None));
+            mb.m.functions[id.index()].body = vec![ir::Stmt::Trap];
+            mb.instances.insert(key.clone(), id);
+            if !mb.too_deep {
+                mb.too_deep = true;
+                self.report_too_deep(&key, caller.map(|c| c.1), true);
+            }
+            return id;
+        }
+        let mut f = self.signature(mb, &key);
+        if let InstanceKey::Fn { func, .. } = &key {
+            f.known = match self.checked.program.func(*func).lang {
+                Some(Lang::Smin) => Some(ir::Known::Smin),
+                Some(Lang::ValueNoise) => Some(ir::Known::ValueNoise),
+                Some(Lang::ValueNoiseBox) => Some(ir::Known::ValueNoiseBox),
+                Some(Lang::LatticeCoord) => Some(ir::Known::LatticeCoord),
+                Some(Lang::Pcg) => Some(ir::Known::Pcg),
+                _ => None,
+            };
+        }
+        let id = mb.m.add_function(f);
+        mb.instances.insert(key.clone(), id);
+        if let Some(name) = self.source_name(&key) {
+            mb.source_names.insert(id, name);
+        }
+        mb.depth.insert(id, depth);
+        if let Some(c) = caller {
+            mb.callers.insert(id, c);
+            mb.edges.push((c.0, id, c.1));
+        }
+        if depth > MAX_INSTANCE_DEPTH {
+            // Polymorphic recursion: each instance calls one with a bigger type. Its body is
+            // never lowered, so the queue ends; the build stops on the error.
+            if !mb.too_deep {
+                mb.too_deep = true;
+                self.report_too_deep(&key, caller.map(|c| c.1), false);
+            }
+            mb.m.functions[id.index()].body = vec![ir::Stmt::Trap];
+            return id;
+        }
+        mb.queue.push_back((key, id));
+        id
+    }
+
+    /// E0412, after [`MAX_INSTANCE_DEPTH`] levels or, if `huge`, at type arguments past
+    /// `MAX_TYPE_SIZE`.
+    fn report_too_deep(&mut self, key: &InstanceKey, at: Option<Span>, huge: bool) {
+        let Some(func) = key.source_fn() else { return };
+        let name = self.checked.program.fn_display_name(func);
+        let args: Vec<String> =
+            key.substs().iter().map(|&t| self.checked.program.display_ty(t)).collect();
+        let span = at.unwrap_or(self.checked.program.func(func).sig_span);
+        let when = if huge {
+            format!(
+                "its type arguments grew past {} parts: <{}>",
+                wrela_sema::ty::MAX_TYPE_SIZE,
+                args.join(", ")
+            )
+        } else {
+            format!(
+                "after {MAX_INSTANCE_DEPTH} levels it's instantiated with <{}>",
+                args.join(", ")
+            )
+        };
+        self.err(
+            Diagnostic::new(
+                wrela_diag::codes::E0412,
+                span,
+                format!("instantiating `{name}` never ends: each instance calls one with a larger type"),
+            )
+            .with_note(when)
+            .with_note("generics are monomorphized (§7), so a generic function can't call itself with an ever-growing type")
+            .with_help("give the recursion a fixed type: call it with the same type arguments, or keep the growing part in a `Vec`"),
+        );
+    }
+
+    /// Lowers queued instance bodies until none are left. Derived instances are built when
+    /// nothing else is, one at a time ([`derive::build_next`]).
+    pub fn drain(&mut self, mb: &mut ModuleBuilder) {
+        loop {
+            while let Some((key, id)) = mb.queue.pop_front() {
+                body::lower_body(self, mb, &key, id);
+            }
+            if mb.deriving.is_empty() {
+                return;
+            }
+            derive::build_next(self, mb);
+        }
+    }
+
+    /// Whether an exported function's signature can cross the WASM boundary: scalars and
+    /// vectors in, and out a scalar, a vector, a struct, tuple or array of those (each its
+    /// values, in order: [`export_values`]) or nothing. `frame` has the one signature the host
+    /// calls, and no export takes the name of the program's memory.
+    fn check_export(&mut self, f: FnId, state: Option<TyId>) -> bool {
+        let def = self.checked.program.func(f);
+        if def.name == wrela_abi::EXPORT_MEMORY {
+            self.err(
+                Diagnostic::new(
+                    wrela_diag::codes::E0703,
+                    def.name_span,
+                    format!(
+                        "`{}` can't be exported: the program exports its memory under that name",
+                        def.name
+                    ),
+                )
+                .with_help(
+                    "rename it, or make it private (drop `pub`) if the host doesn't call it",
+                ),
+            );
+            return false;
+        }
+        use wrela_sema::defs::{Mode, RetMode};
+        if def.name == wrela_abi::EXPORT_SERVE_INIT || def.name == wrela_abi::EXPORT_SERVE {
+            return self.check_server_export(f, state);
+        }
+        if def.name == wrela_abi::EXPORT_TOOL {
+            return self.check_tool_export(f);
+        }
+        if def.name == wrela_abi::EXPORT_INIT {
+            let t = &self.checked.program.types;
+            let ok = def.params.is_empty()
+                && !t.is_unit(def.ret)
+                && def.ret_mode == RetMode::Owned
+                && self.checked.program.fn_all_generics(f).is_empty();
+            if !ok {
+                self.err(
+                    Diagnostic::new(wrela_diag::codes::E0703, def.sig_span, "`init`'s signature is `init() -> State`: it makes the program's state, which the host keeps")
+                        .with_note("the host calls `init` once, then passes its result to `frame` and the other exports that take the state first (§15)")
+                    .with_help("declare it as `pub fn init() -> State`, with no parameters"),
+                );
+            }
+            return ok;
+        }
+        // An export may take the program's state first, as `mut` or borrowed.
+        let takes_state = state.is_some_and(|s| def.params.first().is_some_and(|p| p.ty == s));
+        if def.name == wrela_abi::EXPORT_FRAME {
+            let t = &self.checked.program.types;
+            let want = [t.f32, t.u32, t.u32];
+            let rest = if takes_state { &def.params[1..] } else { &def.params[..] };
+            let params_ok = rest.len() == want.len()
+                && rest.iter().zip(want).all(|(p, w)| p.ty == w && p.mode == Mode::Borrow)
+                && (takes_state || state.is_none())
+                && (!takes_state || def.params[0].mode == Mode::Mut);
+            if params_ok && def.ret == t.unit && def.ret_mode == RetMode::Owned {
+                return true;
+            }
+            let msg = match state {
+                Some(s) => format!(
+                    "`frame`'s signature is `frame(state: mut {}, time: f32, width: u32, height: u32)`, with no result: the host calls it each frame",
+                    self.checked.program.display_ty(s)
+                ),
+                None => "`frame`'s signature is `frame(time: f32, width: u32, height: u32)`, with no result: the host calls it each frame".into(),
+            };
+            self.err(
+                Diagnostic::new(wrela_diag::codes::E0703, def.sig_span, msg)
+                    .with_note("a host program exports `frame`: the time in seconds, and the screen's size in pixels; a program with `init` gets its state first (§15)")
+                    .with_help("declare it with exactly that signature, and keep what it computes in the state"),
+            );
+            return false;
+        }
+        if !self.checked.program.fn_all_generics(f).is_empty() {
+            self.err(
+                Diagnostic::new(wrela_diag::codes::E0703, def.sig_span, format!("`{}` is exported, so it can't be generic: the host calls it with numbers, and can't choose its types", def.name))
+                    .with_note("the entry module's `pub fn`s are the program's exports, called by the host")
+                    .with_help("make it private (drop `pub`), and export a function that calls it with the types the host needs"),
+            );
+            return false;
+        }
+        let mut ok = true;
+        if takes_state && def.params[0].mode == Mode::Take {
+            let p = &def.params[0];
+            ok = false;
+            self.err(
+                Diagnostic::new(
+                    wrela_diag::codes::E0703,
+                    p.span,
+                    format!(
+                        "`{}` takes the program's state, so `{}` must be borrowed or `mut`, not `take`",
+                        def.name, p.name
+                    ),
+                )
+                .with_note("the host keeps the state for later calls (§15)"),
+            );
+        }
+        let skip = usize::from(takes_state);
+        for p in &def.params[skip..] {
+            let k = self.checked.program.types.kind(p.ty);
+            let scalar =
+                matches!(k, TyKind::Bool | TyKind::Int(_) | TyKind::Float(_) | TyKind::Vec(..));
+            if !scalar && fieldless_enum(&self.checked.program, p.ty).is_none() {
+                ok = false;
+                let shown = self.checked.program.display_ty(p.ty);
+                self.err(
+                    Diagnostic::new(wrela_diag::codes::E0703, p.span, format!("`{}` is exported from the program, so its parameters are numbers, bools, vectors or enums whose variants hold nothing; `{}` is a `{shown}`", def.name, p.name))
+                        .with_note("the entry module's `pub fn`s are the program's exports, called by the host")
+                        .with_help("make it private (drop `pub`) if the host doesn't call it"),
+                );
+            } else if p.mode != wrela_sema::defs::Mode::Borrow {
+                ok = false;
+                let mode = p.mode.keyword();
+                self.err(
+                    Diagnostic::new(wrela_diag::codes::E0703, p.span, format!("`{}` is exported from the program, so its parameters are borrowed; `{}` is `{mode}`", def.name, p.name))
+                        .with_note("the host passes each argument as a value, which has no place to change or to move from")
+                        .with_help(format!("drop `{mode}`, or make the function private (drop `pub`) if the host doesn't call it")),
+                );
+            }
+        }
+        let values = export_values(&self.checked.program, def.ret);
+        if !(self.checked.program.types.is_unit(def.ret)
+            || values.is_some_and(|n| n <= MAX_EXPORT_VALUES))
+            || def.ret_mode != wrela_sema::defs::RetMode::Owned
+        {
+            ok = false;
+            let mode = match def.ret_mode {
+                wrela_sema::defs::RetMode::Owned => "",
+                wrela_sema::defs::RetMode::Borrow => "borrow ",
+                wrela_sema::defs::RetMode::Mut => "mut ",
+            };
+            let shown = format!("{mode}{}", self.checked.program.display_ty(def.ret));
+            let mut d = Diagnostic::new(
+                wrela_diag::codes::E0703,
+                def.sig_span,
+                format!(
+                    "`{}` is exported, so it returns a number, a `bool`, a vector, a struct, tuple or array of those, or nothing, not `{shown}`",
+                    def.name
+                ),
+            );
+            if values.is_some_and(|n| n > MAX_EXPORT_VALUES) {
+                d = d.with_note(format!(
+                    "it holds {} values, and an export returns at most {MAX_EXPORT_VALUES}",
+                    values.unwrap_or(0)
+                ));
+            }
+            if !mode.is_empty() {
+                d = d.with_note(
+                    "a projection points into the program's memory, which the host can't hold",
+                );
+            }
+            self.err(d.with_help("make it private (drop `pub`) if the host doesn't call it"));
+        }
+        ok
+    }
+
+    /// A server build's export (§15): `serve_init() -> State`, then `serve(state: mut State,
+    /// time: f32)` (`serve(time: f32)` without state). E0703 otherwise.
+    fn check_server_export(&mut self, f: FnId, state: Option<TyId>) -> bool {
+        use wrela_sema::defs::{Mode, RetMode};
+        let def = self.checked.program.func(f);
+        let t = &self.checked.program.types;
+        let generic = !self.checked.program.fn_all_generics(f).is_empty();
+        if def.name == wrela_abi::EXPORT_SERVE_INIT {
+            let ok = def.params.is_empty()
+                && !t.is_unit(def.ret)
+                && def.ret_mode == RetMode::Owned
+                && !generic;
+            if !ok {
+                self.err(
+                    Diagnostic::new(wrela_diag::codes::E0703, def.sig_span, "`serve_init`'s signature is `serve_init() -> State`: it makes the server's state, which the host keeps")
+                        .with_note("the server host calls `serve_init` once, then passes its result to `serve` (§15)"),
+                );
+            }
+            return ok;
+        }
+        let takes_state = state.is_some_and(|s| def.params.first().is_some_and(|p| p.ty == s));
+        let rest = if takes_state { &def.params[1..] } else { &def.params[..] };
+        let ok = rest.len() == 1
+            && rest[0].ty == t.f32
+            && rest[0].mode == Mode::Borrow
+            && (takes_state || state.is_none())
+            && (!takes_state || def.params[0].mode == Mode::Mut)
+            && def.ret == t.unit
+            && def.ret_mode == RetMode::Owned
+            && !generic;
+        if !ok {
+            let msg = match state {
+                Some(s) => format!(
+                    "`serve`'s signature is `serve(state: mut {}, time: f32)`, with no result: the server host calls it when something happens",
+                    self.checked.program.display_ty(s)
+                ),
+                None => "`serve`'s signature is `serve(time: f32)`, with no result: the server host calls it when something happens".into(),
+            };
+            self.err(
+                Diagnostic::new(wrela_diag::codes::E0703, def.sig_span, msg)
+                    .with_note("a server program exports `serve`, and `serve_init` for its state; it reads what happened as events (§15)"),
+            );
+        }
+        ok
+    }
+
+    /// A tool build's export (§15.5): `tool() -> u32`, which the tool host calls once. E0703
+    /// otherwise.
+    fn check_tool_export(&mut self, f: FnId) -> bool {
+        use wrela_sema::defs::RetMode;
+        let def = self.checked.program.func(f);
+        let t = &self.checked.program.types;
+        let generic = !self.checked.program.fn_all_generics(f).is_empty();
+        let ok =
+            def.params.is_empty() && def.ret == t.u32 && def.ret_mode == RetMode::Owned && !generic;
+        if !ok {
+            self.err(
+                Diagnostic::new(
+                    wrela_diag::codes::E0703,
+                    def.sig_span,
+                    "`tool`'s signature is `tool() -> u32`: the tool host calls it once, and its result is the exit status",
+                )
+                .with_note("a tool waits for its requests where it needs their answers (`call.wait()`), so it keeps its state in its own locals (§15.5)"),
+            );
+        }
+        ok
+    }
+
+    /// E0703 for a program that doesn't export `frame`, which every host calls: at a private
+    /// `frame`, else at the start of main.wrela.
+    fn no_frame(&mut self) {
+        let p = &self.checked.program;
+        let Some(main) = p.main else { return };
+        let private = p.fns.iter().find(|f| {
+            f.module == main
+                && f.owner == wrela_sema::defs::FnOwner::Free
+                && f.name == wrela_abi::EXPORT_FRAME
+        });
+        let main_file = p.main_file.map(|f| Span::new(f, 0, 0));
+        let (span, help) = match (private, main_file) {
+            (Some(f), _) if !f.public => (f.name_span, "make it public: `pub fn frame`"),
+            (Some(f), _) => (
+                f.name_span,
+                "the host calls it directly, so it can't be generic or a GPU entry point",
+            ),
+            (None, Some(s)) => {
+                (s, "add `pub fn frame(time: f32, width: u32, height: u32) {}` to main.wrela")
+            }
+            (None, None) => return,
+        };
+        self.err(
+            Diagnostic::new(
+                wrela_diag::codes::E0703,
+                span,
+                "the program doesn't export `frame`, which the host calls each frame",
+            )
+            .with_help(help),
+        );
+    }
+
+    /// An instance's function as the source names it: `Sphere::distance`, or `a closure in
+    /// main`. `None` for a derived interpretation, which has no source of its own.
+    pub fn source_name(&self, key: &InstanceKey) -> Option<String> {
+        let p = &self.checked.program;
+        match key {
+            InstanceKey::Fn { func, .. } => Some(p.fn_display_name(*func)),
+            InstanceKey::Closure { owner, .. } => {
+                owner.source_fn().map(|f| format!("a closure in {}", p.fn_display_name(f)))
+            }
+            InstanceKey::JobResume { func, .. } => Some(p.fn_display_name(*func)),
+            InstanceKey::Derived { .. } | InstanceKey::Glue { .. } => None,
+        }
+    }
+
+    pub fn entry_of(&self, f: FnId) -> Option<Entry> {
+        self.checked.program.func(f).attrs.entry.map(|e| e.0)
+    }
+}
+
+/// Marks the CPU functions only a client's `frame` reaches relaxable (`--relaxed-simd`, §11.2):
+/// presentation, whose results reach the simulation only as recorded input. What any other export
+/// reaches (`init`, whose world the simulation starts from, the tests), what the host runs
+/// besides (`also`: the jobs), an `@deterministic` function, an `@audio` entry point, a job's
+/// resume or a task must be bit for bit the same on every engine, and stays strict. The calls
+/// are the bodies' own, the math `rewrite_cpu_math` called in among them. A function inlined
+/// later keeps its caller's flag.
+fn mark_relaxable(
+    cx: &Cx,
+    mb: &mut ModuleBuilder,
+    role: wrela_sema::defs::Role,
+    mut strict: Vec<ir::FuncId>,
+) {
+    let p = &cx.checked.program;
+    let presents =
+        |name: &str| role == wrela_sema::defs::Role::Client && name == wrela_abi::EXPORT_FRAME;
+    strict.extend(mb.m.exports.iter().filter(|(name, _)| !presents(name)).map(|&(_, id)| id));
+    strict.extend(mb.instances.iter().filter_map(|(k, &id)| match k {
+        InstanceKey::Fn { func, .. } => {
+            let a = &p.func(*func).attrs;
+            (a.deterministic.is_some() || a.audio.is_some()).then_some(id)
+        }
+        InstanceKey::JobResume { .. } => Some(id),
+        _ => None,
+    }));
+    strict.extend(mb.m.tasks.iter().copied());
+    let mut reached: std::collections::HashSet<ir::FuncId> = strict.iter().copied().collect();
+    while let Some(at) = strict.pop() {
+        ir::visit::walk(&mb.m.functions[at.index()].body, &mut |s| {
+            if let Some(to) = s.expr().and_then(ir::Expr::callee)
+                && reached.insert(to)
+            {
+                strict.push(to);
+            }
+        });
+    }
+    for (i, f) in mb.m.functions.iter_mut().enumerate() {
+        f.relaxable = !reached.contains(&ir::FuncId(i as u32));
+    }
+}
+
+/// E0600 for what a `@deterministic` function reaches through a call whose target only its
+/// instantiation knows (a trait method of a generic parameter): sema checked every call it could
+/// resolve, and this checks, instance by instance, each body the function's instances reach for
+/// `io`, `nondet` or `host` (§12). Reported once for each place the effect happens.
+fn check_deterministic(cx: &mut Cx, mb: &ModuleBuilder) {
+    use wrela_sema::effects::{BodyId, DETERMINISTIC};
+    let p = &cx.checked.program;
+    let mut keys: HashMap<ir::FuncId, &InstanceKey> = HashMap::new();
+    for (k, &id) in &mb.instances {
+        keys.insert(id, k);
+    }
+    let body_of = |k: &InstanceKey| -> Option<BodyId> {
+        match k {
+            InstanceKey::Fn { func, .. } | InstanceKey::JobResume { func, .. } => {
+                Some(BodyId { func: *func, closure: None })
+            }
+            InstanceKey::Closure { owner, id } => {
+                owner.source_fn().map(|func| BodyId { func, closure: Some(*id) })
+            }
+            InstanceKey::Derived { .. } | InstanceKey::Glue { .. } => None,
+        }
+    };
+    let mut calls: HashMap<ir::FuncId, Vec<ir::FuncId>> = HashMap::new();
+    for &(from, to, _) in &mb.edges {
+        calls.entry(from).or_default().push(to);
+    }
+    let mut roots: Vec<(ir::FuncId, FnId)> = mb
+        .instances
+        .iter()
+        .filter_map(|(k, &id)| match k {
+            InstanceKey::Fn { func, .. } if p.func(*func).attrs.deterministic.is_some() => {
+                Some((id, *func))
+            }
+            _ => None,
+        })
+        .collect();
+    roots.sort();
+    let mut reported: std::collections::HashSet<Span> = std::collections::HashSet::new();
+    let mut diags = Vec::new();
+    for (root, root_fn) in roots {
+        // Breadth first, so each body's chain from the root is a shortest one.
+        let mut parent: HashMap<ir::FuncId, ir::FuncId> = HashMap::new();
+        let mut queue = std::collections::VecDeque::from([root]);
+        let mut seen = std::collections::HashSet::from([root]);
+        while let Some(at) = queue.pop_front() {
+            if let Some(body) = keys.get(&at).and_then(|k| body_of(k))
+                && let Some(direct) = cx.checked.direct.get(&body)
+            {
+                for (e, span, what) in direct {
+                    if !DETERMINISTIC.contains(e) || !reported.insert(*span) {
+                        continue;
+                    }
+                    // The instances from the root to here.
+                    let mut path = vec![at];
+                    while let Some(&up) = parent.get(path.last().expect("not empty")) {
+                        path.push(up);
+                    }
+                    path.reverse();
+                    // As sema reports: where it happens in the program's own code, the effect
+                    // or the call into std that does it; the chain stops at std.
+                    let in_std = |id: &ir::FuncId| {
+                        keys.get(id)
+                            .and_then(|k| k.source_fn())
+                            .is_some_and(|f| p.is_std(p.func(f).module))
+                    };
+                    let first_std = path.iter().position(in_std);
+                    let (primary, here, shown) = match first_std {
+                        Some(j) if j > 0 => {
+                            let call = mb
+                                .edges
+                                .iter()
+                                .find(|&&(from, to, _)| from == path[j - 1] && to == path[j])
+                                .map_or(*span, |&(_, _, s)| s);
+                            let name = mb.display_name(path[j]);
+                            (call, format!("`{name}` {}", e.verb()), j + 1)
+                        }
+                        _ => (*span, format!("this {what}"), path.len()),
+                    };
+                    let mut chain: Vec<String> = Vec::new();
+                    for &id in &path[..shown] {
+                        let name = mb.display_name(id);
+                        if chain.last() != Some(&name) {
+                            chain.push(name);
+                        }
+                    }
+                    let root_name = p.fn_display_name(root_fn);
+                    let mut d = Diagnostic::new(
+                        wrela_diag::codes::E0600,
+                        primary,
+                        format!(
+                            "{here}, and `{root_name}` is `@deterministic`, which can't `{}`",
+                            e.name()
+                        ),
+                    );
+                    if chain.len() > 1 {
+                        d = d.with_note(format!("the call chain: {}", chain.join(" → ")));
+                    }
+                    d = d.with_note("it's reached through a call that only the types it's instantiated with decide, such as a trait method of a generic parameter (§12)")
+                        .with_help(wrela_sema::effects::effect_help(*e));
+                    diags.push(d);
+                }
+            }
+            for &next in calls.get(&at).map_or(&[][..], Vec::as_slice) {
+                if seen.insert(next) {
+                    parent.insert(next, at);
+                    queue.push_back(next);
+                }
+            }
+        }
+    }
+    for d in diags {
+        cx.err(d);
+    }
+}
+
+/// How many instantiations deep a call chain may go from an export or entry point, counting
+/// those with type arguments or callables. Real programs are a few levels deep; only
+/// polymorphic recursion gets near.
+const MAX_INSTANCE_DEPTH: u32 = 256;
+
+/// The role whose build has the export `name` (§15.3): `serve_init` and `serve` are a
+/// server's, `tool` a tool's, and every other export a client's.
+fn export_role(name: &str) -> wrela_sema::defs::Role {
+    use wrela_sema::defs::Role;
+    match name {
+        wrela_abi::EXPORT_SERVE_INIT | wrela_abi::EXPORT_SERVE => Role::Server,
+        wrela_abi::EXPORT_TOOL => Role::Tool,
+        _ => Role::Client,
+    }
+}
+
+/// The export a role's host calls again and again: `frame`, `serve` or `tool` (§15.3).
+fn entry_export(role: wrela_sema::defs::Role) -> &'static str {
+    match role {
+        wrela_sema::defs::Role::Client => wrela_abi::EXPORT_FRAME,
+        wrela_sema::defs::Role::Server => wrela_abi::EXPORT_SERVE,
+        wrela_sema::defs::Role::Tool => wrela_abi::EXPORT_TOOL,
+    }
+}
+
+/// The program's `init` (§15): `pub fn init() -> S` in main.wrela, and its state type `S`; for
+/// a server build, its `serve_init`. A tool build has none.
+fn state_type(checked: &Checked, role: wrela_sema::defs::Role) -> Option<(FnId, TyId)> {
+    let p = &checked.program;
+    let main = p.main?;
+    let init = match role {
+        wrela_sema::defs::Role::Client => wrela_abi::EXPORT_INIT,
+        wrela_sema::defs::Role::Server => wrela_abi::EXPORT_SERVE_INIT,
+        wrela_sema::defs::Role::Tool => return None,
+    };
+    p.fns.iter().enumerate().find_map(|(i, f)| {
+        (f.module == main
+            && f.public
+            && f.owner == wrela_sema::defs::FnOwner::Free
+            && f.name == init
+            && f.params.is_empty()
+            && f.generics.is_empty()
+            && !p.types.is_unit(f.ret))
+        .then_some((FnId(i as u32), f.ret))
+    })
+}
+
+/// The enum `t` is, if its variants hold nothing: it crosses the WASM boundary as its `u32`
+/// discriminant (§3).
+fn fieldless_enum(p: &wrela_sema::program::Program, t: TyId) -> Option<wrela_sema::ty::AdtId> {
+    let &TyKind::Adt(a, _) = p.types.kind(t) else { return None };
+    p.adt(a).is_fieldless_enum().then_some(a)
+}
+
+/// An export whose enum parameters cross as their `u32` discriminants: it makes each enum from
+/// its discriminant (a trap, for a number no variant has) and runs `inner`, export `f`'s code.
+/// `inner` itself, if `f` takes no enum.
+fn enum_wrapper(cx: &Cx, mb: &mut ModuleBuilder, f: FnId, inner: ir::FuncId) -> ir::FuncId {
+    let p = &cx.checked.program;
+    let enums: Vec<Option<Vec<u32>>> = p
+        .func(f)
+        .params
+        .iter()
+        .map(|ps| {
+            let a = fieldless_enum(p, ps.ty)?;
+            Some(p.adt(a).variants().iter().map(|v| v.discriminant).collect())
+        })
+        .collect();
+    if enums.iter().all(Option::is_none) {
+        return inner;
+    }
+    let u32_ty = mb.m.types.u32();
+    let bool_ty = mb.m.types.bool();
+    let g = &mb.m.functions[inner.index()];
+    let name = format!("{}_enums", g.name);
+    let (inner_params, ret, ret_ref) = (g.params.clone(), g.ret, g.ret_ref);
+    let params: Vec<ir::Param> = inner_params
+        .iter()
+        .zip(&enums)
+        .map(|(q, e)| match e {
+            Some(_) => ir::Param::value(q.name.clone(), u32_ty),
+            None => q.clone(),
+        })
+        .collect();
+    let mut w = ir::Function::new(name, params, ret);
+    w.ret_ref = ret_ref;
+    let mut body = Vec::new();
+    let mut args = Vec::new();
+    for (i, (q, tags)) in inner_params.iter().zip(&enums).enumerate() {
+        let Some(tags) = tags else {
+            args.push(w.param_arg(i as u32, &mut body));
+            continue;
+        };
+        // The variant whose discriminant the number is, into a local: a chain of tests, the
+        // last a trap.
+        let n = w.let_(&mut body, u32_ty, ir::Expr::Param(i as u32));
+        let local = w.new_local(q.name.clone(), q.ty);
+        let mut chain = vec![ir::Stmt::Trap];
+        for (k, &tag) in tags.iter().enumerate().rev() {
+            let mut test = Vec::new();
+            let d = w.let_(&mut test, u32_ty, ir::Expr::Const(ir::Const::U32(tag)));
+            let eq = w.let_(&mut test, bool_ty, ir::Expr::Binary(ir::BinOp::Eq, n, d));
+            let mut then = Vec::new();
+            let v = w.let_(&mut then, q.ty, ir::Expr::Variant(q.ty, k as u32, None));
+            then.push(ir::Stmt::Store(ir::Place::local(local), v));
+            test.push(ir::Stmt::If { cond: eq, then, else_: chain });
+            chain = test;
+        }
+        body.extend(chain);
+        if q.by_ref {
+            args.push(ir::Arg::Place(ir::Place::local(local)));
+        } else {
+            let v = w.let_(&mut body, q.ty, ir::Expr::Load(ir::Place::local(local)));
+            args.push(ir::Arg::Value(v));
+        }
+    }
+    add_wrapper(mb, w, body, inner, args)
+}
+
+/// Adds wrapper `w` to the module, its body `body` and then a call of `inner` with `args`,
+/// returning what that returns: its id.
+fn add_wrapper(
+    mb: &mut ModuleBuilder,
+    mut w: ir::Function,
+    mut body: Vec<ir::Stmt>,
+    inner: ir::FuncId,
+    args: Vec<ir::Arg>,
+) -> ir::FuncId {
+    match w.ret {
+        Some(t) => {
+            let r = w.let_(&mut body, t, ir::Expr::Call(inner, args));
+            body.push(ir::Stmt::Return(Some(r)));
+        }
+        None => {
+            body.push(ir::Stmt::Eval(ir::Expr::Call(inner, args)));
+            body.push(ir::Stmt::Return(None));
+        }
+    }
+    w.body = body;
+    mb.m.add_function(w)
+}
+
+/// The tool tests' entries (§13.2), the functions `tests`: test `i`'s `tool_test.<i>` calls it,
+/// and returns 0 once it has ended.
+fn tool_test_entries(cx: &mut Cx, mb: &mut ModuleBuilder, tests: &[FnId]) {
+    let u32_ty = mb.m.types.u32();
+    for (i, &f) in tests.iter().enumerate() {
+        let test = cx.instance(mb, InstanceKey::plain(f, Vec::new()), None);
+        let mut tool = ir::Function::new(format!("{TOOL_TEST}_{i}"), Vec::new(), Some(u32_ty));
+        let mut body = vec![ir::Stmt::Eval(ir::Expr::Call(test, Vec::new()))];
+        let done = tool.let_(&mut body, u32_ty, ir::Expr::Const(ir::Const::U32(0)));
+        body.push(ir::Stmt::Return(Some(done)));
+        tool.body = body;
+        let tool = mb.m.add_function(tool);
+        mb.m.exports.push((format!("{TOOL_TEST}.{i}"), tool));
+    }
+}
+
+/// An export that runs `inner` on the program's state, in data `state`: with `init`, it stores
+/// what `inner` returns there; otherwise it passes the state for `inner`'s first parameter.
+fn state_wrapper(
+    mb: &mut ModuleBuilder,
+    inner: ir::FuncId,
+    state: ir::DataId,
+    init: bool,
+) -> ir::FuncId {
+    let f = &mb.m.functions[inner.index()];
+    let name = format!("{}_export", f.name);
+    let at = ir::Place::root(ir::PlaceRoot::Data(state));
+    if init {
+        let ret = f.ret;
+        let mut w = ir::Function::new(name, Vec::new(), None);
+        if let Some(t) = ret {
+            let v = w.new_value(t);
+            w.body = vec![
+                ir::Stmt::Let(v, ir::Expr::Call(inner, Vec::new())),
+                ir::Stmt::Store(at, v),
+                ir::Stmt::Return(None),
+            ];
+        }
+        return mb.m.add_function(w);
+    }
+    let (params, ret, first) = (f.params[1..].to_vec(), f.ret, f.params[0].clone());
+    let mut w = ir::Function::new(name, params.clone(), ret);
+    w.ret_ref = f.ret_ref;
+    let mut body = Vec::new();
+    let mut args = Vec::new();
+    if first.by_ref {
+        args.push(ir::Arg::Place(at));
+    } else {
+        let v = w.new_value(first.ty);
+        body.push(ir::Stmt::Let(v, ir::Expr::Load(at)));
+        args.push(ir::Arg::Value(v));
+    }
+    for i in 0..params.len() {
+        args.push(w.param_arg(i as u32, &mut body));
+    }
+    add_wrapper(mb, w, body, inner, args)
+}
+
+/// Marks the recursive functions `@deterministic` code reaches (language.md §8): their depth is
+/// counted, and a call past [`ir::RECURSION_LIMIT`] of them in progress panics, the same way on
+/// every engine, before engines' different stack limits could matter. A function in a cycle of
+/// calls is counted wherever it's called from. Drop and clone glue isn't: it follows the data.
+fn mark_counted(cx: &mut Cx, mb: &mut ModuleBuilder) {
+    let p = &cx.checked.program;
+    let n = mb.m.functions.len();
+    let mut adj = vec![Vec::new(); n];
+    for &(a, b, _) in &mb.edges {
+        adj[a.index()].push(b.index());
+    }
+    let mut glue = vec![false; n];
+    let mut work = Vec::new();
+    for (key, id) in &mb.instances {
+        match key {
+            InstanceKey::Fn { func, .. } if p.func(*func).attrs.deterministic.is_some() => {
+                work.push(id.index());
+            }
+            InstanceKey::Glue { .. } => glue[id.index()] = true,
+            _ => {}
+        }
+    }
+    let mut reached = vec![false; n];
+    while let Some(i) = work.pop() {
+        if !std::mem::replace(&mut reached[i], true) {
+            work.extend(&adj[i]);
+        }
+    }
+    let mut any = false;
+    for comp in wrela_sema::effects::sccs(&adj) {
+        let cyclic = comp.len() > 1 || adj[comp[0]].contains(&comp[0]);
+        for &f in comp.iter().filter(|&&f| cyclic && reached[f] && !glue[f]) {
+            mb.m.functions[f].counted = true;
+            any = true;
+        }
+    }
+    if any {
+        let msg = format!("recursion deeper than {} calls", ir::RECURSION_LIMIT);
+        let (d, len) = cx.text_data(mb, &msg);
+        mb.m.depth_message = Some((d, len));
+    }
+    let (d, len) = cx.text_data(
+        mb,
+        "the stack overflowed: calls too deep, or values too large for the thread's stack",
+    );
+    mb.m.stack_message = Some((d, len));
+}
+
+/// The std function implementing a transcendental builtin on the CPU (language.md §11): the
+/// one the built-in function that lowers to it names.
+pub(crate) fn cpu_math_lang(b: ir::Builtin) -> Option<Lang> {
+    BuiltinFn::ALL.iter().find_map(|&f| match body::builtin_ir(f) {
+        body::BuiltinIr::Math(m) if m == b => f.cpu_impl(),
+        _ => None,
+    })
+}
+
+/// Replaces the CPU module's transcendental builtins by calls to std's wrela implementations,
+/// per component for vectors; then makes the arithmetic of vectors of other components than
+/// f32s a component at a time (`ir::scalarize`). Runs after derived interpretations, which
+/// read the builtins.
+fn rewrite_cpu_math(cx: &mut Cx, mb: &mut ModuleBuilder) {
+    let mut i = 0;
+    while i < mb.m.functions.len() {
+        let mut f = std::mem::take(&mut mb.m.functions[i]);
+        let mut body = std::mem::take(&mut f.body);
+        ir::visit::expand(&mut body, &mut |s, out| rewrite_math(cx, mb, &mut f, s, out));
+        f.body = body;
+        mb.m.functions[i] = f;
+        i += 1;
+    }
+    // Vectors of other components than f32s compute a component at a time on the CPU.
+    ir::scalarize::scalarize_vectors(&mut mb.m);
+}
+
+/// `s` into `out`; a transcendental builtin it computes becomes a call to std's (a call per
+/// component, for a vector).
+fn rewrite_math(
+    cx: &mut Cx,
+    mb: &mut ModuleBuilder,
+    f: &mut ir::Function,
+    s: ir::Stmt,
+    out: &mut ir::Block,
+) {
+    if let ir::Stmt::Let(v, ir::Expr::Builtin(op, args)) = &s
+        && let Some(func) = cpu_math_lang(*op).and_then(|l| cx.checked.program.lang_fn(l))
+    {
+        let callee = cx.instance(mb, InstanceKey::plain(func, Vec::new()), None);
+        let ty = f.value_ty(*v);
+        let f32 = mb.m.types.f32();
+        let e = if let &ir::TypeDef::Vector(ir::Scalar::F32, n) = mb.m.types.get(ty) {
+            let comps = (0..u32::from(n))
+                .map(|c| {
+                    let parts = args
+                        .iter()
+                        .map(|&a| ir::Arg::Value(f.let_(out, f32, ir::Expr::Extract(a, c))))
+                        .collect();
+                    f.let_(out, f32, ir::Expr::Call(callee, parts))
+                })
+                .collect();
+            ir::Expr::Construct(ty, comps)
+        } else {
+            ir::Expr::Call(callee, args.iter().map(|&a| ir::Arg::Value(a)).collect())
+        };
+        out.push(ir::Stmt::Let(*v, e));
+    } else {
+        out.push(s);
+    }
+}
+
+/// The most values an export returns (WASM's multi-value results, each a number).
+const MAX_EXPORT_VALUES: usize = 64;
+
+/// How many values a value of type `t` crosses the WASM boundary as, if it can as an export's
+/// result: one for a number or a `bool`, a vector's or a matrix's components, and its parts'
+/// for a struct, a tuple or an array of those. Not an enum, nor a type the language or std
+/// gives a meaning (`Text`, `Vec`, ...): none crosses as its bytes.
+fn export_values(p: &wrela_sema::program::Program, t: TyId) -> Option<usize> {
+    match p.types.kind(t) {
+        TyKind::Bool | TyKind::Int(_) | TyKind::Float(_) => Some(1),
+        TyKind::Vec(_, n) => Some(usize::from(*n)),
+        TyKind::Mat(c, r) => Some(usize::from(*c) * usize::from(*r)),
+        TyKind::Array(e, n) if *n > 0 => Some(export_values(p, *e)? * *n as usize),
+        _ => p.plain_parts(t)?.into_iter().map(|e| export_values(p, e)).sum(),
+    }
+}

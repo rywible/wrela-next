@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+"""How far apart two pictures are. Usage:
+
+    tools/same a.png b.png [--noise c.png] [--edge-step S] [--json FILE]
+               [--over2 P] [--over8 P] [--mean X] [--max N] [--psnr DB]
+               [--edge-over2 P] [--edge-over8 P] [--edge-mean X] [--edge-max N] [--edge-psnr DB]
+
+Compares the red, green and blue of each pixel (alpha is not compared). A pixel's difference is
+the greatest of its three channels' differences, in 8-bit steps (of 255). Printed, over all
+pixels and over edge pixels alone:
+
+  over 2/255, over 8/255   the share of pixels whose difference is more than 2 (more than 8)
+  mean                     the mean of the pixels' differences
+  greatest                 the greatest difference
+  PSNR                     10 log10(255^2 / the mean squared channel difference), in dB; inf
+                           where the pictures are the same
+
+Edge pixels are where a.png changes sharply: a pixel whose difference from a neighbour (left,
+right, above, below) in a.png is more than --edge-step (default 24/255), both of the pair. A
+silhouette moved by a pixel changes only pixels along a.png's edges, which a mean over the whole
+picture hides (docs/dead-ends.md, "Measuring": a golden image by mean difference missed it).
+
+  --noise c.png   c.png is a second run of what made a.png: the same measures between a.png and
+                  c.png are the pictures' own noise, and b.png is ABOVE the noise when any
+                  measure, over all pixels or edge pixels, is worse between a and b than between
+                  a and c (a larger share, mean or greatest; a lower PSNR).
+  --over2 P ...   gates: fails when a share is more than P percent, the mean more than X, the
+                  greatest more than N, or the PSNR less than DB; --edge-* over edge pixels.
+
+Exit status: 0; 1 when a gate fails or, with --noise, b.png is above the noise; 2 for a usage
+error or pictures of different sizes. Needs Pillow (installed for this machine's python3).
+"""
+
+import json
+import math
+import sys
+
+try:
+    from PIL import Image, ImageChops
+except ImportError:  # pragma: no cover
+    print("same: needs Pillow for python3 (python3 -m pip install pillow)", file=sys.stderr)
+    sys.exit(2)
+
+MEASURES = ("over2", "over8", "mean", "max", "psnr")
+NAMES = {"over2": "over 2/255", "over8": "over 8/255", "mean": "mean", "max": "greatest",
+         "psnr": "PSNR"}
+
+
+def load(path):
+    """A picture as 8-bit RGB."""
+    with Image.open(path) as im:
+        im.load()
+        return im.convert("RGB")
+
+
+def greatest(diff):
+    """Each pixel's greatest channel of an RGB difference, as one channel."""
+    r, g, b = diff.split()
+    return ImageChops.lighter(ImageChops.lighter(r, g), b)
+
+
+def edges(a, step):
+    """The edge pixels of `a` as a mask (255 where an edge): each pixel whose greatest channel
+    difference from its right or lower neighbour is more than `step`, and that neighbour."""
+    w, h = a.size
+    mask = Image.new("L", (w, h), 0)
+    for dx, dy in ((1, 0), (0, 1)):
+        if w <= dx or h <= dy:
+            continue
+        near = a.crop((0, 0, w - dx, h - dy))
+        far = a.crop((dx, dy, w, h))
+        sharp = greatest(ImageChops.difference(near, far)).point(lambda v: 255 if v > step else 0)
+        for at in ((0, 0), (dx, dy)):
+            placed = Image.new("L", (w, h), 0)
+            placed.paste(sharp, at)
+            mask = ImageChops.lighter(mask, placed)
+    return mask
+
+
+def measure(diff, mask=None):
+    """The measures of an RGB difference, over the pixels `mask` holds (all without one)."""
+    hist = greatest(diff).histogram(mask)
+    n = sum(hist)
+    if n == 0:
+        return {"pixels": 0}
+    channels = diff.histogram(mask)
+    squares = sum((i % 256) ** 2 * c for i, c in enumerate(channels))
+    mse = squares / (3 * n)
+    return {
+        "pixels": n,
+        "over2": sum(hist[3:]) / n * 100.0,
+        "over2_n": sum(hist[3:]),
+        "over8": sum(hist[9:]) / n * 100.0,
+        "over8_n": sum(hist[9:]),
+        "mean": sum(i * c for i, c in enumerate(hist)) / n,
+        "max": max(i for i, c in enumerate(hist) if c),
+        "psnr": math.inf if mse == 0 else 10.0 * math.log10(255.0 ** 2 / mse),
+    }
+
+
+def compare(a, b, step):
+    """All pixels' and edge pixels' measures between two RGB pictures of one size."""
+    diff = ImageChops.difference(a, b)
+    mask = edges(a, step)
+    return {"all": measure(diff), "edge": measure(diff, mask)}
+
+
+def worse(name, x, y):
+    """Whether measure `name` reads x farther apart than y."""
+    return x < y if name == "psnr" else x > y
+
+
+def above_noise(d, noise):
+    """The measures on which `d` (a against b) is worse than `noise` (a against c)."""
+    out = []
+    for where in ("all", "edge"):
+        if not d[where]["pixels"]:
+            continue
+        for name in MEASURES:
+            if worse(name, d[where][name], noise[where][name]):
+                out.append((where, name, d[where][name], noise[where][name]))
+    return out
+
+
+def show(name, value):
+    if name in ("over2", "over8"):
+        return f"{value:.3f}%"
+    if name == "mean":
+        return f"{value:.3f}"
+    if name == "max":
+        return f"{value}"
+    return "inf" if value == math.inf else f"{value:.2f} dB"
+
+
+def table(d, pixels, step):
+    print(f"{'':<14}{'over 2/255':>18}{'over 8/255':>18}{'mean':>9}{'greatest':>10}{'PSNR':>11}")
+    for where, title in (("all", "all pixels"), ("edge", "edge pixels")):
+        m = d[where]
+        if not m["pixels"]:
+            print(f"{title:<14}none (no step over {step}/255 in a.png)")
+            continue
+        print(f"{title:<14}{show('over2', m['over2']):>9} {m['over2_n']:>8}"
+              f"{show('over8', m['over8']):>9} {m['over8_n']:>8}{show('mean', m['mean']):>9}"
+              f"{m['max']:>10}{show('psnr', m['psnr']):>11}")
+    e = d["edge"]["pixels"]
+    print(f"(edge pixels: {e} of {pixels}, {e / pixels * 100.0:.2f}%: a step over {step}/255 to "
+          "a neighbour in a.png)")
+
+
+def main(argv):
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
+    paths, noise, step, out = [], None, 24, None
+    gates = {}
+    i = 0
+    try:
+        while i < len(argv):
+            a = argv[i]
+            if a in ("-h", "--help"):
+                print(__doc__, file=sys.stderr)
+                return 2
+            if a.startswith("--"):
+                v = argv[i + 1]
+                i += 2
+                if a == "--noise":
+                    noise = v
+                elif a == "--json":
+                    out = v
+                elif a == "--edge-step":
+                    step = int(v)
+                    assert 0 <= step < 255
+                else:
+                    key = a[2:]
+                    where, name = ("edge", key[5:]) if key.startswith("edge-") else ("all", key)
+                    if name not in MEASURES:
+                        raise ValueError(f"unknown option {a}")
+                    gates[(where, name)] = float(v)
+            else:
+                paths.append(a)
+                i += 1
+        if len(paths) != 2:
+            raise ValueError("needs two pictures")
+    except (ValueError, AssertionError, IndexError) as e:
+        print(f"same: {e or 'a bad value'}\n{__doc__.splitlines()[2]}", file=sys.stderr)
+        return 2
+    try:
+        a, b = load(paths[0]), load(paths[1])
+        c = load(noise) if noise else None
+    except OSError as e:
+        print(f"same: {e}", file=sys.stderr)
+        return 2
+    for other, path in ((b, paths[1]), (c, noise)):
+        if other is not None and other.size != a.size:
+            print(f"same: {paths[0]} is {a.size[0]}x{a.size[1]} and {path} is "
+                  f"{other.size[0]}x{other.size[1]}", file=sys.stderr)
+            return 2
+    pixels = a.size[0] * a.size[1]
+    d = compare(a, b, step)
+    print(f"same: {paths[0]} against {paths[1]}, {a.size[0]}x{a.size[1]} ({pixels} pixels)")
+    table(d, pixels, step)
+    failed = []
+    result = {"a": paths[0], "b": paths[1], "size": list(a.size), "edge_step": step, "b_vs_a": d}
+    if noise:
+        n = compare(a, c, step)
+        print(f"noise: {paths[0]} against {noise} (a second run of A)")
+        table(n, pixels, step)
+        worse_on = above_noise(d, n)
+        result["noise"] = noise
+        result["c_vs_a"] = n
+        result["above_noise"] = [list(x) for x in worse_on]
+        if worse_on:
+            print("B is ABOVE the noise: " + "; ".join(
+                f"{NAMES[name]} over {'edge' if where == 'edge' else 'all'} pixels "
+                f"{show(name, x)} against {show(name, y)}" for where, name, x, y in worse_on))
+            failed.append("above the noise")
+        else:
+            print("B is not above the noise: no measure is worse than A's against itself")
+    for (where, name), limit in sorted(gates.items()):
+        m = d[where]
+        title = f"{NAMES[name]} over {'edge' if where == 'edge' else 'all'} pixels"
+        if not m["pixels"]:
+            print(f"gate: {title}: no such pixels, nothing to hold")
+            continue
+        bad = m[name] < limit if name == "psnr" else m[name] > limit
+        sign = ("<" if bad else ">=") if name == "psnr" else (">" if bad else "<=")
+        count = f" ({m[name + '_n']} pixels)" if name in ("over2", "over8") else ""
+        print(f"gate: {title} {show(name, m[name])}{count} {sign} {limit:g}: "
+              f"{'FAILS' if bad else 'holds'}")
+        if bad:
+            failed.append(title)
+    result["failed"] = failed
+    if out:
+        with open(out, "w") as f:
+            json.dump(result, f, indent=1, default=str)
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

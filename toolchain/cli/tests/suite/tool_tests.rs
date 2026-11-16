@@ -1,0 +1,378 @@
+//! Tool tests (`@test(tool, ...)`, language.md §13.2): `wrela test` runs each in a `wrela`
+//! process of its own, on the package's tool build. The fixture toolchain/tests/tool_tests
+//! passes (its scratch, fake clock, fake sites and fake program); here, the ways a tool test
+//! fails, each within its budget, and the attribute's rules.
+
+use crate::common::{exit_within, json, manifest, package, within, wrela};
+
+/// A package with a tool build, of `tests` (each a tool test or not).
+fn tool_package(name: &str, tests: &str) -> std::path::PathBuf {
+    let main = format!("pub fn tool() -> u32 {{\n    0\n}}\n{tests}");
+    package(name, &[("wrela.toml", &manifest(&name.replace('-', "_"))), ("main.wrela", &main)])
+}
+
+/// Each test `wrela test --json` ran: its name, whether it passed, and its failure's message.
+fn ran(dir: &std::path::Path) -> Vec<(String, bool, String)> {
+    let out = json(wrela().arg("test").arg(dir).arg("--json"));
+    let tests = out["tests"].as_array().unwrap_or_else(|| panic!("{out}"));
+    tests
+        .iter()
+        .map(|t| {
+            let message = t["failure"]["message"].as_str().unwrap_or("").to_string();
+            (t["name"].as_str().expect("a name").to_string(), t["passed"] == true, message)
+        })
+        .collect()
+}
+
+#[test]
+fn the_tool_tests_fixture_passes() {
+    let dir = wrela_root().join("toolchain/tests/tool_tests");
+    let tests = ran(&dir);
+    assert_eq!(tests.len(), 14, "{tests:?}");
+    for (name, passed, message) in &tests {
+        assert!(passed, "{name}: {message}");
+    }
+}
+
+/// The repository's root.
+fn wrela_root() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+#[test]
+fn a_tool_test_fails_on_a_panic_a_trap_or_its_budget_and_passes_otherwise() {
+    let tests = r#"
+use std::tool::files
+use std::tool::time
+
+@test(tool)
+fn waits_an_hour_of_fake_time() {
+    let _ = time::after(3600.0).wait()
+}
+
+@test(tool)
+fn panics() {
+    let _ = time::after(1.0).wait()
+    assert(1 + 1 == 3, "on purpose")
+}
+
+@test(tool)
+fn traps() {
+    let listed = files::list("scratch").wait()
+    // An overflow, with a count the build can't know.
+    var n: u32 = 4294967295
+    if listed.is_ok() {
+        n += 1
+    }
+}
+
+@test(tool, blobs: "1K")
+fn holds_its_blob_budget() {
+    // 2 KiB in a blob, past a budget of 1 KiB: the append fails, as a request past it does.
+    let Ok(b) = std::tool::blob::new().wait() else { panic("a blob") }
+    var bytes: Vec<u8> = Vec::new()
+    for _ in 0..2048 {
+        bytes.push(0)
+    }
+    assert(std::tool::blob::append(b, bytes).wait().is_ok(), "past the test's blob budget")
+}
+
+@test(tool, budget: 1)
+fn spins_past_its_budget() {
+    var n: u32 = 0
+    loop {
+        n = n.wrapping_add(1)
+    }
+}
+"#;
+    let dir = tool_package("tool-tests-ends", tests);
+    let started = std::time::Instant::now();
+    let tests = ran(&dir);
+    // The spinning one is stopped at its budget of 1 s, not its process's bound.
+    assert!(started.elapsed() < std::time::Duration::from_secs(20), "{:?}", started.elapsed());
+    let get = |name: &str| tests.iter().find(|t| t.0 == name).expect(name).clone();
+    assert!(get("waits_an_hour_of_fake_time").1, "{tests:?}");
+    let (_, passed, message) = get("panics");
+    assert!(!passed && message.contains("on purpose"), "{message}");
+    let (_, passed, message) = get("traps");
+    assert!(!passed && message.contains("trapped"), "{message}");
+    let (_, passed, message) = get("holds_its_blob_budget");
+    assert!(!passed && message.contains("past the test's blob budget"), "{message}");
+    let (_, passed, message) = get("spins_past_its_budget");
+    assert!(!passed && message.contains("past its budget of 1 s"), "{message}");
+}
+
+#[test]
+fn a_tool_test_is_a_function_of_no_parameters_in_a_package_with_a_tool_build() {
+    let check = |name: &str, main: &str| -> Vec<(String, String)> {
+        let dir = package(
+            name,
+            &[("wrela.toml", &manifest(&name.replace('-', "_"))), ("main.wrela", main)],
+        );
+        let out = json(wrela().arg("check").arg(&dir).arg("--json"));
+        out["diagnostics"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{out}"))
+            .iter()
+            .filter(|d| d["severity"] == "error")
+            .map(|d| {
+                (
+                    d["code"].as_str().unwrap_or("").to_string(),
+                    d["message"].as_str().unwrap_or("").to_string(),
+                )
+            })
+            .collect()
+    };
+    let tool = "pub fn tool() -> u32 {\n    0\n}\n";
+    let cases = [
+        ("@test(tool)\nfn takes(n: take u32) {}\n", "E0222", "takes parameters"),
+        ("@test(tool)\nfn gives() -> u32 {\n    0\n}\n", "E0222", "returns a value"),
+        ("@test(tool, budget: 0)\nfn none() {}\n", "E0222", "`budget` is seconds"),
+        ("@test(tool, net: [\"Game.Example\"])\nfn upper() {}\n", "E0222", "`net`"),
+        ("@test(tool, run: [(\"x\", \"../out\")])\nfn out() {}\n", "E0222", "`run`"),
+        ("@test(tool, frames: 3)\nfn frames() {}\n", "E0222", "takes `budget`"),
+        ("@test(tool, blobs: \"8X\")\nfn blobs() {}\n", "E0222", "`blobs` is a blob budget"),
+        ("@test(tool, workers: 9)\nfn many() {}\n", "E0222", "`workers` is how many"),
+        ("@test(tool)\n@fuel(100)\nfn fuel() {}\n", "E0108", "`@fuel`"),
+        // No test is a job: a tool test waits on its calls, and a test of code keeps a
+        // constant's effects.
+        ("@test(tool)\n@job\nfn a_job() {}\n", "E0336", "can't be a job"),
+        ("@test\n@job\nfn plain() {}\n", "E0336", "can't be a job"),
+        (
+            "@test\nfn reads() {\n    let p = std::tool::time::utc_now()\n}\n",
+            "E0600",
+            "a test, which the build runs",
+        ),
+    ];
+    for (i, (text, code, words)) in cases.iter().enumerate() {
+        let errors = check(&format!("tool-tests-rules-{i}"), &format!("{tool}{text}"));
+        assert!(errors.iter().any(|(c, m)| c == code && m.contains(words)), "{text}: {errors:?}");
+    }
+    // Without a tool build, there's nothing to run it on.
+    let errors = check(
+        "tool-tests-rules-no-tool",
+        "pub fn frame(time: f32, width: u32, height: u32) {}\n@test(tool)\nfn t() {}\n",
+    );
+    assert!(errors.iter().any(|(c, m)| c == "E0222" && m.contains("no tool build")), "{errors:?}");
+    // A good one checks clean.
+    let errors = check(
+        "tool-tests-rules-ok",
+        &format!("{tool}@test(tool, budget: 2.5, net: [\"a.example\"])\nfn t() {{}}\n"),
+    );
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+/// A fake program that waits a minute on the system's clock, then exits.
+const SLEEPER: &str = r#"
+use std::tool::time::after
+
+pub fn tool() -> u32 {
+    let _ = after(60.0).wait()
+    0
+}
+"#;
+
+/// A package whose one tool test, of budget `budget`, runs the fake program `sleeper` and waits
+/// for it: the package, and the sleeper's directory, which its process's command line names.
+fn sleeper_package(name: &str, budget: u32) -> (std::path::PathBuf, String) {
+    let main = format!(
+        r#"pub fn tool() -> u32 {{
+    0
+}}
+
+@test(tool, run: [("sleeper", "fakes/sleeper")], budget: {budget})
+fn waits_for_its_program() {{
+    let _ = std::tool::run::run(std::tool::run::command("sleeper", "scratch")).wait()
+}}
+"#
+    );
+    let dir = package(
+        name,
+        &[
+            ("wrela.toml", &manifest(&name.replace('-', "_"))),
+            ("main.wrela", &main),
+            ("fakes/sleeper/wrela.toml", &manifest("sleeper")),
+            ("fakes/sleeper/main.wrela", SLEEPER),
+        ],
+    );
+    let sleeper = dir.join("fakes/sleeper").canonicalize().expect("the sleeper");
+    (dir, sleeper.display().to_string())
+}
+
+/// The processes whose command lines have `marker`.
+fn running(marker: &str) -> Vec<String> {
+    let out = std::process::Command::new("pgrep").args(["-f", marker]).output().expect("pgrep");
+    String::from_utf8_lossy(&out.stdout).lines().map(str::to_string).collect()
+}
+
+#[test]
+fn ctrl_c_ends_wrela_tests_tool_tests_and_every_program_they_started() {
+    let (dir, sleeper) = sleeper_package("tool-tests-ctrl-c", 60);
+    let mut child = wrela()
+        .arg("test")
+        .arg(&dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("run wrela test");
+    let started = within(std::time::Duration::from_secs(60), || !running(&sleeper).is_empty());
+    assert!(started, "the fake program started");
+    let sent = std::process::Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .expect("kill");
+    assert!(sent.success());
+    assert_eq!(exit_within(&mut child, std::time::Duration::from_secs(10)), Some(130));
+    let gone = within(std::time::Duration::from_secs(3), || running(&sleeper).is_empty());
+    assert!(gone, "the fake program, in a process group of its own, ended too");
+}
+
+#[test]
+fn a_test_host_that_cant_end_its_programs_has_them_ended_by_wrela_test() {
+    let (dir, sleeper) = sleeper_package("tool-tests-stopped", 3);
+    let mut child = wrela()
+        .arg("test")
+        .arg(&dir)
+        .arg("--json")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("run wrela test");
+    let started = within(std::time::Duration::from_secs(60), || !running(&sleeper).is_empty());
+    assert!(started, "the fake program started");
+    // The test's host is stopped, so it can't end its program at its budget.
+    let host = running("tool --test").into_iter().find(|pid| {
+        let parent = std::process::Command::new("ps").args(["-o", "ppid=", "-p", pid]).output();
+        parent.is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == child.id().to_string())
+    });
+    let host = host.expect("the test's host");
+    let stopped = std::process::Command::new("kill").args(["-STOP", &host]).status().expect("kill");
+    assert!(stopped.success());
+    let bound = std::time::Duration::from_secs(3 + 10 + 20);
+    assert_eq!(exit_within(&mut child, bound), Some(1), "the test failed");
+    let mut out = String::new();
+    std::io::Read::read_to_string(child.stdout.as_mut().expect("its output"), &mut out)
+        .expect("read");
+    assert!(out.contains("was killed"), "{out}");
+    let gone = within(std::time::Duration::from_secs(3), || running(&sleeper).is_empty());
+    assert!(gone, "the fake program, in a process group of its own, ended too");
+}
+
+/// A package whose one tool test, of budget 3 s, loads the build in `built` (a subject that
+/// exports `spin`, which never ends) and calls `spin` with no end in sight.
+fn spinner_package(name: &str) -> std::path::PathBuf {
+    let main = r#"use std::tool::drive
+use std::tool::drive::{Scalar, Step}
+
+pub fn tool() -> u32 {
+    0
+}
+
+@test(tool, read: [("built", "built")], budget: 3)
+fn spins_a_driven_build() {
+    let Ok(loaded) = drive::load("built", drive::cpu()).wait() else { panic("loaded") }
+    let spin = Step::Call(String::from("spin"), Vec::from([Scalar::I32(0)]))
+    let _ = drive::steps(loaded.build, [Step::Init, take spin], timeout: 600.0).wait()
+}
+"#;
+    let subject = "pub fn frame(time: f32, width: u32, height: u32) {}\n\npub fn spin(n: i32) -> i32 {\n    var i = n\n    while i >= 0 {\n        i = (i + 1) % 1000\n    }\n    i\n}\n";
+    let dir = package(
+        name,
+        &[
+            ("wrela.toml", &manifest(&name.replace('-', "_"))),
+            ("main.wrela", main),
+            ("subject/wrela.toml", &manifest("subject")),
+            ("subject/main.wrela", subject),
+        ],
+    );
+    let built = wrela()
+        .arg("build")
+        .arg(dir.join("subject"))
+        .arg("-o")
+        .arg(dir.join("built"))
+        .output()
+        .expect("wrela build");
+    assert!(built.status.success(), "{}", String::from_utf8_lossy(&built.stderr));
+    dir
+}
+
+/// A test's host that is stopped, so it can't end the driven build's process it started, has
+/// that process ended by `wrela test` once the test runs out of budget: the process's group is
+/// in the test's file of groups before the build runs.
+#[test]
+fn a_driven_builds_process_left_by_a_test_past_its_budget_is_ended_by_wrela_test() {
+    let dir = spinner_package("tool-tests-driven");
+    let mut child = wrela()
+        .arg("test")
+        .arg(&dir)
+        .arg("--json")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("run wrela test");
+    let host = || {
+        running("tool --test").into_iter().find(|pid| {
+            let parent = std::process::Command::new("ps").args(["-o", "ppid=", "-p", pid]).output();
+            parent
+                .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == child.id().to_string())
+        })
+    };
+    let mut found = None;
+    let started = within(std::time::Duration::from_secs(60), || {
+        found = host().and_then(|h| {
+            let driven = running(&format!("tool --drive {h}$"));
+            (!driven.is_empty()).then_some((h, driven))
+        });
+        found.is_some()
+    });
+    assert!(started, "the driven build's process started");
+    let (host, driven) = found.expect("found");
+    // Its group is in the test's file of groups, which `wrela test` keeps in a directory of its
+    // own: the process leads it.
+    let prefix = format!("wrela-tool-tests-{}-", child.id());
+    let listed: Vec<String> = std::fs::read_dir(std::env::temp_dir())
+        .expect("the temporary directory")
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+        .filter_map(|e| std::fs::read_to_string(e.path().join("0/groups.txt")).ok())
+        .flat_map(|t| t.lines().map(str::to_string).collect::<Vec<_>>())
+        .collect();
+    assert!(listed.contains(&driven[0]), "{driven:?} in {listed:?}");
+    // The test's host is stopped, so it can't end its build's process at its budget.
+    let stopped = std::process::Command::new("kill").args(["-STOP", &host]).status().expect("kill");
+    assert!(stopped.success());
+    let bound = std::time::Duration::from_secs(3 + 10 + 20);
+    assert_eq!(exit_within(&mut child, bound), Some(1), "the test failed");
+    let mut out = String::new();
+    std::io::Read::read_to_string(child.stdout.as_mut().expect("its output"), &mut out)
+        .expect("read");
+    assert!(out.contains("was killed"), "{out}");
+    let gone = within(std::time::Duration::from_secs(3), || {
+        running(&format!("tool --drive {host}$")).is_empty()
+    });
+    assert!(gone, "the driven build's process {driven:?}, in a group of its own, ended too");
+}
+
+#[test]
+fn a_program_started_but_not_yet_recorded_ends_with_its_tests_host() {
+    let (dir, sleeper) = sleeper_package("tool-tests-unrecorded", 60);
+    // The host pauses between starting its program and recording the program's group.
+    let mut child = wrela()
+        .arg("test")
+        .arg(&dir)
+        .env("WRELA_TESTING_SPAWN_PAUSE", "60")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("run wrela test");
+    let started = within(std::time::Duration::from_secs(60), || !running(&sleeper).is_empty());
+    assert!(started, "the fake program started");
+    let sent = std::process::Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .expect("kill");
+    assert!(sent.success());
+    assert_eq!(exit_within(&mut child, std::time::Duration::from_secs(10)), Some(130));
+    let gone = within(std::time::Duration::from_secs(3), || running(&sleeper).is_empty());
+    assert!(gone, "the unrecorded program was still in its host's group, and ended with it");
+}

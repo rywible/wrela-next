@@ -1,0 +1,833 @@
+// The lister of posed charts, as a scene uses it: a body's pieces are added at rest with how each
+// is listed and what each wears, once; each frame each body is posed; then the bodies are listed
+// into the frame's picture, in its one pass (`Frame::draw`, docs/frame.md).
+//
+//     var limbs: Limbs<Dressed, 16, 13, 24, 21, 11> = limbs::limbs::limbs(covers: edges)
+//     let body = limbs.add(narrow_at_rest, wide_at_rest, pieces, looks)       // once
+//     limbs.pose(body, narrow, wide, shades, wide_shades)                       // each frame
+//     limbs.prepare(eye)                                                        // each frame
+//     frame.draw(|d| { limbs.draw_into(d); ...; limbs.cut_into(d) })            // each frame
+//
+// A body is limb-sized pieces (`Limb<A, R>`: arms, fingers, a collar) and wide ones (`Limb<B,
+// Q>`: a trunk, a jacket's body), numbered in that order: a piece that grows from or lies on
+// another names it by that number (`Piece::onto`). A frame of them is two steps (labels as
+// timed): `placed` (each vertex of each piece's grid, in compute, `prepare`) and the grids drawn
+// into the picture's pass (`draw_into`, then `cut_into`). A drawing held from the last frame (anime's twos:
+// `pose` not called since) on the same grids isn't placed again.
+
+use chart::grown::{COVERLESS, Grown}
+use chart::limb::Limb
+use chart::lit::Sided
+use chart::radial::Radial
+use draw::{corner, shade, shade_look, sky_look}
+use form::kinds::Paint
+use frame::judge::Judge
+use frame::last::cover
+use frame::eye::{Eye, NEARER, NOTHING_DEEP}
+use frame::light::{AllLit, Lighting, Lit, OneLit, Unlit, lit_by}
+use frame::picture::Drawing
+use grid::{SAG, corners_of, grid_for, vertices_of}
+use placed::{ALONE, Part, Placed, placed_on_wide, placed_onto, placed_own, placed_wide}
+use std::collections::{Vec, swap}
+use std::gpu::{
+    Compare, Cull, Depth, GpuBuffer, RenderPass, begin_pass2_with_depth, buffer, buffer_of,
+    dispatch, draw, label, write,
+}
+use chart::cloth::Wearer
+use sheets::Sheets
+use worn::Worn
+
+/// How a piece is listed, given once with it: its ink group (pieces that join smoothly share
+/// one: no line is drawn between them), the piece of its body it grows from or lies on (`ALONE`)
+/// and how (`chart::grown::Grown`), and which of the covers its own edges are read from
+/// (`COVERLESS`: it has none).
+pub struct Piece: Copy {
+    pub group: u32,
+    pub onto: u32 = ALONE,
+    pub how: Grown = Grown { fillet: 0.0, reach: 1.0 },
+    pub cover: u32 = COVERLESS,
+    /// Whether its look or its cover cuts it anywhere (`Worn::kept`): its pixels may be dropped.
+    pub cut: bool = false,
+    /// How far under what's over it its side is drawn, `chart::part::sunk_by`'s (`x` m at its
+    /// path's start, none from `y` of the way along): its point pushed that far from the eye
+    /// along its own line of sight, the same place on the screen, so whatever lies over it within
+    /// that wins there. Its depth in the picture is that much off where it's pushed, so this is
+    /// for millimetres (a palm's root in a wrist, a thumb's on a palm), not centimetres.
+    pub under: vec2 = vec2(0.0),
+}
+
+/// How many pixels a quad of a piece's grid may span along it: limb-sized (`QUAD_NARROW`) and
+/// wide (`QUAD_WIDE`). Round it, a grid has as many quads as hold its outline (`grid::SAG`).
+/// Each piece's light is read at every pixel from its smoothed form (`per_pixel`), so its grid
+/// needs only to hold its outline; carried from vertex to vertex instead, a limb-sized piece's
+/// band edges move under a pixel only on quads of about 4 px (docs/limbs.md).
+pub const QUAD_NARROW: f32 = 8.0
+pub const QUAD_WIDE: f32 = 8.0
+
+/// The fewest quads along and round a grid has.
+pub const LEAST = vec2u(4, 6)
+
+/// How many vertices the grids hold at first: room grows as they need it.
+const ROOM: u32 = 65536
+
+/// A body's pieces among all the lister's: its limb-sized ones from `narrow`, `narrows` of
+/// them, and its wide ones from `wide`, `wides` of them; its looks from `look`.
+struct Body: Copy {
+    narrow: u32,
+    narrows: u32,
+    wide: u32,
+    wides: u32,
+}
+
+/// The lister: every body's pieces (at rest, posed, their shading forms), how each is listed and
+/// what each wears, the covers their edges are read from, the parts as drawn this frame, every
+/// vertex placed, and whether a pose has come since the vertices were last placed.
+pub struct Limbs<L, const A: u32, const R: u32, const B: u32, const Q: u32, const T: u32> {
+    bodies: Vec<Body>,
+    pieces: Vec<Piece>,
+    looks: Vec<L>,
+    narrow: Vec<Limb<A, R>>,
+    narrow_posed: Vec<Limb<A, R>>,
+    shades: Vec<Radial<A, R>>,
+    wide: Vec<Limb<B, Q>>,
+    wide_posed: Vec<Limb<B, Q>>,
+    wide_shades: Vec<Radial<B, T>>,
+    worn: GpuBuffer<L>,
+    limbs: GpuBuffer<Limb<A, R>>,
+    wides: GpuBuffer<Limb<B, Q>>,
+    shaded: GpuBuffer<Radial<A, R>>,
+    wide_shaded: GpuBuffer<Radial<B, T>>,
+    covers: GpuBuffer<f32>,
+    parts: GpuBuffer<Part>,
+    placed: GpuBuffer<Placed>,
+    /// The sides of the pieces grown from or lying on another, before they're moved onto it
+    /// (`placed::placed_own`).
+    sided: GpuBuffer<Sided>,
+    drawn: Vec<Part>,
+    /// Each drawn part's box (its least corner, then its greatest), for the live lights.
+    boxes: Vec<vec3>,
+    moved: bool,
+    /// The most pixels a quad may span: limb-sized pieces' (`x`) and wide ones' (`y`).
+    pub quad: vec2,
+    /// Whether a limb-sized piece's light is read at every pixel, as a wide one's is, in place of
+    /// being carried from its vertices.
+    pub per_pixel: bool,
+    /// How far inside a form's outline its grid's chords round it may lie (px).
+    pub sag: f32,
+    /// A reference's grids (`reference`), as fine as a judge needs: its parts, its vertices, what
+    /// it drew and whether a pose has come since.
+    ref_parts: GpuBuffer<Part>,
+    ref_placed: GpuBuffer<Placed>,
+    ref_drawn: Vec<Part>,
+    ref_moved: bool,
+}
+
+/// A lister with no bodies, whose pieces' covers' edges are `covers` (`chart::cover::Cover::edges`,
+/// one cover's after another, as `Piece::cover` and `Grown::cover` number them).
+pub fn limbs<L: Worn, const A: u32, const R: u32, const B: u32, const Q: u32, const T: u32>(
+    covers: [f32],
+) -> Limbs<L, A, R, B, Q, T> {
+    Limbs {
+        bodies: Vec::new(),
+        pieces: Vec::new(),
+        looks: Vec::new(),
+        narrow: Vec::new(),
+        narrow_posed: Vec::new(),
+        shades: Vec::new(),
+        wide: Vec::new(),
+        wide_posed: Vec::new(),
+        wide_shades: Vec::new(),
+        worn: buffer(1),
+        limbs: buffer(1),
+        wides: buffer(1),
+        shaded: buffer(1),
+        wide_shaded: buffer(1),
+        covers: buffer_of(covers, at_least: 1),
+        parts: buffer(1),
+        placed: buffer(ROOM),
+        sided: buffer(ROOM),
+        drawn: Vec::new(),
+        boxes: Vec::new(),
+        moved: true,
+        quad: vec2(QUAD_NARROW, QUAD_WIDE),
+        per_pixel: true,
+        sag: SAG,
+        ref_parts: buffer(1),
+        ref_placed: buffer(64),
+        ref_drawn: Vec::new(),
+        ref_moved: true,
+    }
+}
+
+/// Where along `eye`'s view the nearest of `form` is (m): its path's points, less its largest
+/// radius.
+fn nearest<const C: u32, const D: u32>(eye: Eye, form: Limb<C, D>) -> f32 {
+    var near = 1.0e9
+    for k in 0..form.path.vertices {
+        near = min(near, dot(form.path.at[k] - eye.at, eye.forward))
+    }
+    near - widest(form)
+}
+
+/// A form's largest mean radius (m): of each control value along it, its term round it that
+/// doesn't turn.
+fn widest<const C: u32, const D: u32>(form: Limb<C, D>) -> f32 {
+    var most = 0.0
+    for i in 0..C {
+        most = max(most, form.form.coef[i][0])
+    }
+    most * form.swell
+}
+
+/// The box `form` lies in: its path's points, grown by its largest radius half again and a tenth
+/// of a metre (a grown piece is moved onto its host on the GPU: a little way).
+fn bounds<const C: u32, const D: u32>(form: Limb<C, D>) -> (vec3, vec3) {
+    let r = widest(form) * 1.5 + 0.1
+    var lo = vec3(1.0e9)
+    var hi = vec3(-1.0e9)
+    for k in 0..form.path.vertices {
+        lo = min(lo, form.path.at[k] - vec3(r))
+        hi = max(hi, form.path.at[k] + vec3(r))
+    }
+    (lo, hi)
+}
+
+/// Whether some of `form` may be in `eye`'s view: its path's points, grown by its largest
+/// radius, not all behind the eye or all past one side of its view.
+fn in_view<const C: u32, const D: u32>(eye: Eye, form: Limb<C, D>) -> bool {
+    let r = widest(form) * 1.5
+    var ahead = false
+    var lo = vec2(1.0e9)
+    var hi = vec2(-1.0e9)
+    for k in 0..form.path.vertices {
+        let v = form.path.at[k] - eye.at
+        let z = dot(v, eye.forward)
+        if z + r > eye.near {
+            ahead = true
+        }
+        // (Across and up, over how far along: where on the screen, from its middle.)
+        let zz = max(z, eye.near)
+        let s = vec2(
+            (dot(v, eye.right) + r) / zz * eye.focal / eye.aspect,
+            (dot(v, eye.up) + r) / zz * eye.focal,
+        )
+        let t = vec2(
+            (dot(v, eye.right) - r) / zz * eye.focal / eye.aspect,
+            (dot(v, eye.up) - r) / zz * eye.focal,
+        )
+        lo = min(lo, t)
+        hi = max(hi, s)
+    }
+    ahead && hi.x > -1.0 && lo.x < 1.0 && hi.y > -1.0 && lo.y < 1.0
+}
+
+/// The grid a form is drawn on as `eye` sees it, its quads at most `quad` px.
+fn grid_of<const C: u32, const D: u32>(eye: Eye, form: Limb<C, D>, quad: vec2) -> vec2u {
+    let length = form.path.length() * (form.band.f.y - form.band.f.x)
+    let round = (form.band.theta.y - form.band.theta.x) / 6.2831853
+    grid_for(
+        eye,
+        length: length,
+        radius: widest(form),
+        round: round,
+        z: nearest(eye, form),
+        quad: quad,
+        least: LEAST,
+    )
+}
+
+/// Vertices from `n` on, to a multiple of 64 (a run's start: a span of `Placed` bound to a
+/// kernel starts at a multiple of 256 bytes).
+fn aligned(n: u32) -> u32 {
+    (n + 63) / 64 * 64
+}
+
+impl<L: Worn, const A: u32, const R: u32, const B: u32, const Q: u32, const T: u32> Limbs<L, A, R, B, Q, T> {
+    /// A body added: its limb-sized pieces at rest (`narrow`) and its wide ones (`wide`), how
+    /// each is listed (`pieces`) and what each wears (`looks`), both in that order. Which body
+    /// it is: its number in the picture's identity.
+    pub fn add(
+        mut self,
+        narrow: [Limb<A, R>],
+        wide: [Limb<B, Q>],
+        pieces: [Piece],
+        looks: [L],
+    ) -> u32 {
+        assert(
+            pieces.len() == narrow.len() + wide.len() && looks.len() == pieces.len(),
+            "a body has a piece and a look for each of its forms",
+        )
+        let which = self.bodies.len()
+        self.bodies.push(
+            Body {
+                narrow: self.narrow.len(),
+                narrows: narrow.len(),
+                wide: self.wide.len(),
+                wides: wide.len(),
+            },
+        )
+        for k in 0..narrow.len() {
+            self.narrow.push(narrow[k])
+            self.narrow_posed.push(narrow[k])
+            self.shades.push(narrow[k].form)
+        }
+        for k in 0..wide.len() {
+            self.wide.push(wide[k])
+            self.wide_posed.push(wide[k])
+            self.wide_shades.push(wide[k].form.kept())
+        }
+        for k in 0..pieces.len() {
+            self.pieces.push(pieces[k])
+            self.looks.push(looks[k])
+        }
+        self.worn = buffer_of(self.looks)
+        // (Room for every piece at rest and posed, made once a body: each pose is written in.)
+        let n = self.narrow.len()
+        let w = self.wide.len()
+        self.limbs = buffer(2 * n)
+        write(mut self.limbs, 0, self.narrow)
+        self.wides = buffer(max(2 * w, 1))
+        write(mut self.wides, 0, self.wide)
+        self.shaded = buffer(max(n, 1))
+        self.wide_shaded = buffer(max(w, 1))
+        self.parts = buffer(self.pieces.len())
+        self.ref_parts = buffer(self.pieces.len())
+        self.moved = true
+        self.ref_moved = true
+        which
+    }
+
+    /// Body `body` as a pose has it: its limb-sized pieces (`narrow`) and wide ones (`wide`) in
+    /// the order they were added, and the smoothed forms their light is read from (`shades`,
+    /// `wide_shades`: each piece's posed form, as softened for shading; a limb-sized piece's
+    /// with as many terms round it as its form, its finer ones 0 where it keeps fewer).
+    pub fn pose(
+        mut self,
+        body: u32,
+        narrow: [Limb<A, R>],
+        wide: [Limb<B, Q>],
+        shades: [Radial<A, R>],
+        wide_shades: [Radial<B, T>],
+    ) {
+        let b = self.bodies[body]
+        assert(
+            narrow.len() == b.narrows &&
+                wide.len() == b.wides &&
+                shades.len() == b.narrows &&
+                wide_shades.len() == b.wides,
+            "a body is posed whole",
+        )
+        for k in 0..b.narrows {
+            self.narrow_posed[b.narrow + k] = narrow[k]
+            self.shades[b.narrow + k] = shades[k]
+        }
+        for k in 0..b.wides {
+            self.wide_posed[b.wide + k] = wide[k]
+            self.wide_shades[b.wide + k] = wide_shades[k]
+        }
+        self.moved = true
+        self.ref_moved = true
+    }
+
+    /// The parts as `eye` sees them: each piece in view on the grid its size on the screen asks
+    /// for, laid out kernel by kernel (pieces that grow from nothing; that grow from a limb-sized
+    /// piece; that lie on a wide one; the wide ones), each kernel's run from a multiple of 64.
+    /// The parts, each kernel's first part and how many it has, where each kernel's vertices
+    /// start, and how many vertices there are in all.
+    fn parts_for(self, eye: Eye) -> (Vec<Part>, [vec2u; 4], [u32; 4], u32, Vec<vec3>) {
+        var out: Vec<Part> = Vec::new()
+        var boxes: Vec<vec3> = Vec::new()
+        var runs = [vec2u(0, 0); 4]
+        var starts = [0; 4]
+        var next = 0
+        for kernel in 0..4 {
+            next = aligned(next)
+            starts[kernel] = next
+            let first = out.len()
+            for b in self.bodies {
+                let pieces = b.narrows + b.wides
+                for k in 0..pieces {
+                    let piece = self.pieces[b.narrow + b.wide + k]
+                    let is_wide = k >= b.narrows
+                    let onto_wide = piece.onto != ALONE && piece.onto >= b.narrows
+                    let which = if is_wide { 3 } else if piece.onto == ALONE {
+                        0
+                    } else if onto_wide {
+                        2
+                    } else { 1 }
+                    if which != kernel {
+                        continue
+                    }
+                    var part = Part {
+                        band: self.narrow_posed[0].band,
+                        base: next,
+                        along: 0,
+                        round: 0,
+                        limb: 0,
+                        onto: ALONE,
+                        onto_wide: if onto_wide { 1 } else { 0 },
+                        body: 0,
+                        group: piece.group,
+                        cover: piece.cover,
+                        faces: 1,
+                        wide: if is_wide { 1 } else { 0 },
+                        length: 1.0,
+                        caps: vec2(0.0),
+                        look: b.narrow + b.wide + k,
+                        read: if self.per_pixel { 1 } else { 0 },
+                        under: piece.under,
+                        how: piece.how,
+                    }
+                    var q = vec2u(0, 0)
+                    var shown = false
+                    var lo = vec3(0.0)
+                    var hi = vec3(0.0)
+                    if is_wide {
+                        let w = b.wide + k - b.narrows
+                        let form = self.wide_posed[w]
+                        shown = in_view(eye, form)
+                        let (box_lo, box_hi) = bounds(form)
+                        lo = box_lo
+                        hi = box_hi
+                        q = grid_of(eye, form, vec2(self.quad.y, self.sag))
+                        part.band = form.band
+                        part.limb = w
+                        part.faces = form.faces
+                        part.length = form.path.length()
+                        part.caps = form.caps
+                    } else {
+                        let n = b.narrow + k
+                        let form = self.narrow_posed[n]
+                        shown = in_view(eye, form)
+                        let (box_lo, box_hi) = bounds(form)
+                        lo = box_lo
+                        hi = box_hi
+                        q = grid_of(eye, form, vec2(self.quad.x, self.sag))
+                        part.band = form.band
+                        part.limb = n
+                        part.faces = form.faces
+                        part.length = form.path.length()
+                        part.caps = form.caps
+                        if piece.onto != ALONE {
+                            part.onto = if onto_wide { b.wide + piece.onto - b.narrows } else {
+                                b.narrow + piece.onto
+                            }
+                        }
+                    }
+                    if !shown {
+                        continue
+                    }
+                    part.along = q.x
+                    part.round = q.y
+                    part.body = self.body_of(b)
+                    next += vertices_of(q)
+                    out.push(part)
+                    boxes.push(lo)
+                    boxes.push(hi)
+                }
+            }
+            runs[kernel] = vec2u(first, out.len() - first)
+        }
+        (out, runs, starts, aligned(next), boxes)
+    }
+
+    /// The number of body `b` among the bodies.
+    fn body_of(self, b: Body) -> u32 {
+        var out = 0
+        for k in 0..self.bodies.len() {
+            if self.bodies[k].narrow == b.narrow && self.bodies[k].wide == b.wide {
+                out = k
+            }
+        }
+        out
+    }
+
+    /// Whether the parts drawn are on the same grids as `parts`.
+    fn same_grids(self, parts: [Part]) -> bool {
+        if parts.len() != self.drawn.len() {
+            return false
+        }
+        for k in 0..parts.len() {
+            let a = parts[k]
+            let b = self.drawn[k]
+            if a.base != b.base || a.along != b.along || a.round != b.round || a.limb != b.limb {
+                return false
+            }
+        }
+        true
+    }
+
+    /// What the last frame drew: its parts, their grids' vertices, and their triangles.
+    pub fn counts(self) -> vec3u {
+        var vertices = 0
+        var triangles = 0
+        for p in self.drawn {
+            vertices += vertices_of(vec2u(p.along, p.round))
+            triangles += 2 * p.along * p.round
+        }
+        vec3u(self.drawn.len(), vertices, triangles)
+    }
+
+    /// One look of a reference of every body (and `sheets`) for `judge` (`frame::judge`), as
+    /// `eye` (a look's, its rays moved in their pixels) sees them in `light` with `sky` behind:
+    /// each piece on a grid whose quads are at most `fine.x` px along and whose outline is within
+    /// `fine.y` px, its light read at every pixel; into the judge's look targets, its colour, the
+    /// way its surface faces, its depth.
+    pub fn reference<W: Wearer, P: Paint>(
+        mut self,
+        judge: mut Judge,
+        eye: Eye,
+        light: Lighting,
+        sky: P,
+        sheets: Sheets<W, L>,
+        fine: vec2,
+    ) {
+        // (The reference's grids in place of the picture's, and back after.)
+        let quad = self.quad
+        let sag = self.sag
+        let read = self.per_pixel
+        self.quad = vec2(fine.x)
+        self.sag = fine.y
+        self.per_pixel = true
+        self.swapped()
+        self.placed_for(eye)
+        label("reference")
+        let pass = begin_pass2_with_depth(
+            mut judge.look_colour,
+            mut judge.look_normal,
+            mut judge.look_depth,
+            clear: vec4(0.0),
+            clear_depth: NOTHING_DEEP,
+        )
+        draw(
+            pass,
+            cover,
+            sky_look.bind(eye, sky: sky),
+            vertices: 3,
+            depth: Depth { compare: Compare::Always, write: false },
+        )
+        for k in 0..self.drawn.len() {
+            let p = self.drawn[k]
+            // (Each face as the picture draws it: a closed form's inside isn't seen.)
+            if p.faces > 1 {
+                draw(
+                    pass,
+                    corner.bind(
+                        eye,
+                        part: k,
+                        parts: self.parts,
+                        placed: self.placed,
+                    ),
+                    shade_look.bind(
+                        eye,
+                        light: light,
+                        parts: self.parts,
+                        looks: self.worn,
+                        shades: self.shaded,
+                        wide_shades: self.wide_shaded,
+                        covers: self.covers,
+                    ),
+                    vertices: corners_of(vec2u(p.along, p.round)),
+                    cull: Cull::None,
+                    depth: NEARER,
+                )
+            } else {
+                draw(
+                    pass,
+                    corner.bind(
+                        eye,
+                        part: k,
+                        parts: self.parts,
+                        placed: self.placed,
+                    ),
+                    shade_look.bind(
+                        eye,
+                        light: light,
+                        parts: self.parts,
+                        looks: self.worn,
+                        shades: self.shaded,
+                        wide_shades: self.wide_shaded,
+                        covers: self.covers,
+                    ),
+                    vertices: corners_of(vec2u(p.along, p.round)),
+                    cull: Cull::Back,
+                    depth: NEARER,
+                )
+            }
+        }
+        sheets.looked_into(pass, eye, light)
+        pass.end()
+        self.swapped()
+        self.quad = quad
+        self.sag = sag
+        self.per_pixel = read
+    }
+
+    /// The picture's grids and the reference's swapped.
+    fn swapped(mut self) {
+        swap(mut self.parts, mut self.ref_parts)
+        swap(mut self.placed, mut self.ref_placed)
+        swap(mut self.drawn, mut self.ref_drawn)
+        swap(mut self.moved, mut self.ref_moved)
+    }
+
+    /// Each piece in view placed for `eye`, unless the drawing and the grids are as they were
+    /// (compute: before the picture's pass opens).
+    pub fn prepare(mut self, eye: Eye) {
+        self.placed_for(eye)
+    }
+
+    /// Every piece placed by `prepare` whose pixels are never dropped drawn into the picture's
+    /// pass: with the other listers' opaque triangles, before anything that may drop pixels.
+    pub fn draw_into(self, d: Drawing) {
+        self.drawn_into(d.pass, d.eye, d.light, cut: false)
+    }
+
+    /// Every piece placed by `prepare` that its look or cover cuts (its pixels may be dropped)
+    /// drawn into the picture's pass: after every opaque triangle, so the GPU's hidden-surface
+    /// removal has them all first.
+    pub fn cut_into(self, d: Drawing) {
+        self.drawn_into(d.pass, d.eye, d.light, cut: true)
+    }
+
+    /// Each piece in view as `eye` sees it placed on its grid, unless the drawing and the grids
+    /// are as they were.
+    fn placed_for(mut self, eye: Eye) {
+        let (parts, runs, starts, total, boxes) = self.parts_for(eye)
+        // (Each part's box, for the live lights: as this frame's, the parts the same as drawn
+        // when they aren't placed again.)
+        self.boxes = take boxes
+        let again = self.moved || !self.same_grids(parts)
+        if again {
+            if total > self.placed.len() {
+                self.placed = buffer(aligned(total + total / 2))
+            }
+            if total > self.sided.len() {
+                self.sided = buffer(aligned(total + total / 2))
+            }
+            write(mut self.parts, 0, parts)
+            self.place(runs, starts, total)
+            self.drawn = take parts
+            self.moved = false
+        }
+    }
+
+    /// The parts that can be cut (`cut`), or those that can't, drawn into `pass`.
+    fn drawn_into<P: RenderPass>(self, pass: P, eye: Eye, light: Lighting, cut: bool) {
+        for k in 0..self.drawn.len() {
+            let p = self.drawn[k]
+            if self.pieces[p.look].cut == cut {
+                // (By its pixels' pipeline for as many live lights as reach it:
+                // `frame::light::Lit`.)
+                let lit = lit_by(light.lights, self.boxes[2 * k], self.boxes[2 * k + 1])
+                if lit == 0 {
+                    self.drawn_one(pass, eye, light, k, p, Unlit {})
+                } else if lit == 1 {
+                    self.drawn_one(pass, eye, light, k, p, OneLit {})
+                } else {
+                    self.drawn_one(pass, eye, light, k, p, AllLit {})
+                }
+            }
+        }
+    }
+
+    /// Part `k` (`p`) drawn into `pass`: which faces are drawn, and whether its pixels may be
+    /// dropped, are its draw's pipeline's, so each way is written out.
+    fn drawn_one<P: RenderPass, K: Lit>(
+        self,
+        pass: P,
+        eye: Eye,
+        light: Lighting,
+        k: u32,
+        p: Part,
+        _lit: K,
+    ) {
+        let corners = corners_of(vec2u(p.along, p.round))
+        let cut = self.pieces[p.look].cut
+        if p.faces > 1 && cut {
+            draw(
+                pass,
+                corner.bind(eye, part: k, parts: self.parts, placed: self.placed),
+                shade.bind(
+                    eye,
+                    light: light,
+                    parts: self.parts,
+                    looks: self.worn,
+                    shades: self.shaded,
+                    wide_shades: self.wide_shaded,
+                    covers: self.covers,
+                    cuts: true,
+                    lights: K::LIVE,
+                ),
+                vertices: corners,
+                cull: Cull::None,
+                depth: NEARER,
+            )
+        } else if p.faces > 1 {
+            draw(
+                pass,
+                corner.bind(eye, part: k, parts: self.parts, placed: self.placed),
+                shade.bind(
+                    eye,
+                    light: light,
+                    parts: self.parts,
+                    looks: self.worn,
+                    shades: self.shaded,
+                    wide_shades: self.wide_shaded,
+                    covers: self.covers,
+                    cuts: false,
+                    lights: K::LIVE,
+                ),
+                vertices: corners,
+                cull: Cull::None,
+                depth: NEARER,
+            )
+        } else if cut {
+            draw(
+                pass,
+                corner.bind(eye, part: k, parts: self.parts, placed: self.placed),
+                shade.bind(
+                    eye,
+                    light: light,
+                    parts: self.parts,
+                    looks: self.worn,
+                    shades: self.shaded,
+                    wide_shades: self.wide_shaded,
+                    covers: self.covers,
+                    cuts: true,
+                    lights: K::LIVE,
+                ),
+                vertices: corners,
+                cull: Cull::Back,
+                depth: NEARER,
+            )
+        } else {
+            draw(
+                pass,
+                corner.bind(eye, part: k, parts: self.parts, placed: self.placed),
+                shade.bind(
+                    eye,
+                    light: light,
+                    parts: self.parts,
+                    looks: self.worn,
+                    shades: self.shaded,
+                    wide_shades: self.wide_shaded,
+                    covers: self.covers,
+                    cuts: false,
+                    lights: K::LIVE,
+                ),
+                vertices: corners,
+                cull: Cull::Back,
+                depth: NEARER,
+            )
+        }
+    }
+
+    /// Every vertex of `total` placed, each kernel over its run (`runs`: its first part and how
+    /// many; `starts`: where its vertices start), from the poses as they are.
+    fn place(mut self, runs: [vec2u; 4], starts: [u32; 4], total: u32) {
+        label("placed")
+        write(mut self.limbs, self.narrow.len(), self.narrow_posed)
+        if self.wide.len() > 0 {
+            write(mut self.wides, self.wide.len(), self.wide_posed)
+            write(mut self.wide_shaded, 0, self.wide_shades)
+        }
+        write(mut self.shaded, 0, self.shades)
+        let posed = self.narrow.len()
+        let wide_posed = self.wide.len()
+        let ends = [starts[1], starts[2], starts[3], total]
+        // Every limb-sized piece's own side, all three kinds at once (their parts and vertices lie
+        // in order, kernel by kernel, an empty run where the next begins): the free ones'
+        // vertices placed, the others' sides kept to be moved onto what they grow from.
+        let narrow = runs[2].x + runs[2].y - runs[0].x
+        if narrow > 256 {
+            // (`placed::part_of` finds a vertex's part in at most 256.)
+            panic("limbs: more than 256 limb-sized pieces in view")
+        }
+        if narrow > 0 {
+            let n = ends[2] - starts[0]
+            dispatch(
+                placed_own.bind(
+                    parts: self.parts,
+                    first: runs[0].x,
+                    count: narrow,
+                    start: starts[0],
+                    limbs: self.limbs,
+                    posed: posed,
+                    shades: self.shaded,
+                    sides: self.sided.span_mut(start: starts[0], count: n),
+                    out: self.placed.span_mut(start: starts[0], count: n),
+                ),
+                over: n,
+            )
+        }
+        for kernel in 1..4 {
+            let run = runs[kernel]
+            if run.y == 0 {
+                continue
+            }
+            let count = ends[kernel] - starts[kernel]
+            if kernel == 1 {
+                dispatch(
+                    placed_onto.bind(
+                        parts: self.parts,
+                        first: run.x,
+                        count: run.y,
+                        start: starts[kernel],
+                        limbs: self.limbs,
+                        posed: posed,
+                        shades: self.shaded,
+                        covers: self.covers,
+                        sides: self.sided,
+                        out: self.placed.span_mut(start: starts[kernel], count: count),
+                    ),
+                    over: count,
+                )
+            } else if kernel == 2 {
+                dispatch(
+                    placed_on_wide.bind(
+                        parts: self.parts,
+                        first: run.x,
+                        count: run.y,
+                        start: starts[kernel],
+                        limbs: self.limbs,
+                        posed: posed,
+                        shades: self.shaded,
+                        wides: self.wides,
+                        wide_posed: wide_posed,
+                        wide_shades: self.wide_shaded,
+                        covers: self.covers,
+                        sides: self.sided,
+                        out: self.placed.span_mut(start: starts[kernel], count: count),
+                    ),
+                    over: count,
+                )
+            } else {
+                dispatch(
+                    placed_wide.bind(
+                        parts: self.parts,
+                        first: run.x,
+                        count: run.y,
+                        start: starts[kernel],
+                        wides: self.wides,
+                        posed: wide_posed,
+                        out: self.placed.span_mut(start: starts[kernel], count: count),
+                    ),
+                    over: count,
+                )
+            }
+        }
+    }
+}
+
+/// `r` with `R` terms round it, those past its own `S` 0: a smoothed form kept to fewer terms (a
+/// limb's light's) as the lister takes a limb-sized piece's shading form, the same light.
+pub fn padded<const A: u32, const S: u32, const R: u32>(r: Radial<A, S>) -> Radial<A, R> {
+    var out: Radial<A, R> = Radial { from: r.from, to: r.to, coef: [[0.0; R]; A] }
+    for i in 0..A {
+        for k in 0..min(S, R) {
+            out.coef[i][k] = r.coef[i][k]
+        }
+    }
+    out
+}

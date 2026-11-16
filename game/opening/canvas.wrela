@@ -1,0 +1,237 @@
+// The skiff's sail: a sheet of cloth (docs/design.md, "Forms": a sheet chart, its stepped state
+// lib/chart's `Drape`), drawn by lib/limbs' sheets. Its luff runs up the mast from its foot to
+// its head, its clew at the boom's end, its foot loose between (a free rig's sail: the old
+// opening's, rywible/wrela 7ae6711e, scenes/opening/skiff.wrela:180-277, `cloth` and `cut`, its
+// head 4.1 m up the mast). Each step the rig holds its luff, its head and its clew where the
+// rules have the spars (`skiff::spars`), and the rest is free cloth, drawn toward the shape the
+// wind blows it to (`hung`: its belly out to leeward, as deep as the sail's pull, flogging when
+// it's let fly, sail.wrela:95-120's `Motion`) and stepped on the GPU: it lags, overshoots and
+// settles, and shivers in a gust.
+
+use chart::cloth::{Held, Node, Wearer}
+use form::look::{Look, Place, Skin}
+use gale::sail::Rig
+use limbs::worn::Worn
+use skiff::{FOOT, spars}
+use std::collections::Vec
+use std::derive::Box2
+use std::field::value_noise
+
+/// The sail's grid: columns from its luff (0) to its leech, rows from its head (0) down to its
+/// foot: six panels, three rows each, a batten at every third row.
+pub const COLS: u32 = 10
+pub const PANELS: u32 = 6
+pub const ROWS: u32 = PANELS * 3 + 1
+
+/// The boom's length (m: sail.wrela:523), which the sail's cut is measured by.
+pub const BOOM_LONG: f32 = 2.15
+
+/// How much of its shape the cloth keeps each step, how much of its swing, and how many times a
+/// step it's pulled back to its neighbours' distances.
+const SHAPE: f32 = 0.25
+const KEEP: f32 = 0.85
+const RELAXES: u32 = 12
+
+/// Node (`c`, `r`)'s place on the sail: across from luff to leech (`x`) and up from foot to head
+/// (`up`).
+fn uv(c: u32, r: u32) -> vec2 {
+    vec2(f32(c) / f32(COLS - 1), 1.0 - f32(r) / f32(ROWS - 1))
+}
+
+/// The junk's lug sail's cut (skiff.wrela:243-261, `cut` with `SAIL` 1), at `x` across it from
+/// luff to leech and `up` from its foot to its head: where that is along the boom from the
+/// mast's foot (`u`, m) and up the mast (`v`, m). Its foot (the boom batten) rises from half a
+/// metre up the mast to 0.8 m at the clew, its head (the yard) peaked from 2.9 m to 4.15 m; set a
+/// little forward of the mast, as a balanced lug is; its leech bowed out between them.
+fn cut(x: f32, up: f32) -> vec2 {
+    let lead = 0.16 - 0.06 * up
+    let reach = BOOM_LONG * (1.0 + 0.1 * sin(3.1415927 * up))
+    let u = -lead + x * (reach + lead)
+    let xu = clamp(u / BOOM_LONG, -0.2, 1.15)
+    let v0 = 0.5 + 0.3 * xu
+    let v1 = 2.9 + 1.25 * xu
+    vec2(u, v0 + up * (v1 - v0))
+}
+
+/// The sail at rest, flat: its mast straight up (+y), its boom straight aft (-z), from the
+/// mast's foot.
+fn rest_of(x: f32, up: f32) -> vec3 {
+    let c = cut(x, up)
+    vec3(0.0, c.y, -c.x)
+}
+
+/// (`x`, `up`) back from a point of the flat sail at rest.
+fn uv_of(p: vec3) -> vec2 {
+    let u = -p.z
+    let xu = clamp(u / BOOM_LONG, -0.2, 1.15)
+    let v0 = 0.5 + 0.3 * xu
+    let v1 = 2.9 + 1.25 * xu
+    let up = clamp((p.y - v0) / (v1 - v0), 0.0, 1.0)
+    let lead = 0.16 - 0.06 * up
+    let reach = BOOM_LONG * (1.0 + 0.1 * sin(3.1415927 * up))
+    vec2(clamp((u + lead) / (reach + lead), 0.0, 1.0), up)
+}
+
+/// The sail's nodes at rest.
+pub fn nodes() -> Vec<Node> {
+    var out: Vec<Node> = Vec::new()
+    for r in 0..ROWS {
+        for c in 0..COLS {
+            let p = uv(c, r)
+            out.push(Node { rest: rest_of(p.x, p.y), sewn: 0.0, out: vec3(1.0, 0.0, 0.0), woven: 1.0 })
+        }
+    }
+    out
+}
+
+/// Each node's shape's normal at rest (its outside, to starboard).
+pub fn normals() -> Vec<vec4> {
+    Vec::filled(COLS * ROWS, vec4(1.0, 0.0, 0.0, 0.0))
+}
+
+/// The sail as the rig stands it: the matrix whose columns are the mast's way up, the boom's way
+/// aft, the belly (the way and depth it blows out) and the mast's foot; all the world's, on the
+/// hull `h`. What the drape's pose holds it by (`hung`, `held`).
+pub fn rigged(r: Rig, h: mat4, t: f32) -> mat4 {
+    let (mast, boom) = spars(r)
+    let side = if r.boom >= 0.0 { 1.0 } else { -1.0 }
+    let out = -side * normalize(cross(mast, boom))
+    // (Its belly as deep as the sail's pull, a gust's puff filling it; let fly, its panels
+    // shiver between the battens, which hold it: sail.wrela:95-120, skiff.wrela:214-216.)
+    let full = 0.06 + 0.22 * smoothstep(0.0, 0.6, r.power) * r.gust
+    let flog = (1.0 - smoothstep(0.1, 0.5, r.power)) *
+        (sin(t * 7.3) * 0.6 + sin(t * 11.9 + 1.3) * 0.4)
+    let depth = mix(full, 0.12 * flog, 1.0 - smoothstep(0.1, 0.5, r.power))
+    let w = (h * vec4(mast, 0.0)).xyz
+    let b = (h * vec4(boom, 0.0)).xyz
+    let n = (h * vec4(out * depth, 0.0)).xyz
+    let o = (h * vec4(FOOT, 1.0)).xyz
+    mat4(vec4(w, 0.0), vec4(b, 0.0), vec4(n, 0.0), vec4(o, 1.0))
+}
+
+/// Where the sail's node at (`x`, `up`) is as rigged by `m` (`rigged`): its cut laid between the
+/// spars, each panel bellied out between its battens, deepest a third of the way back from the
+/// luff and half way up (skiff.wrela:206-208).
+fn shaped(x: f32, up: f32, m: mat4) -> vec3 {
+    let c = cut(x, up)
+    let panel = 0.2 + 0.8 * pow(max(sin(3.1415927 * fract(up * f32(PANELS))), 1.0e-4), 0.6)
+    let belly = panel * (0.55 + 1.6 * up * (1.0 - up)) / 0.95 * 4.0 * x * (1.0 - x) * (1.0 + 0.8 * x) / 1.43
+    m[3].xyz + m[0].xyz * c.y + m[1].xyz * c.x + m[2].xyz * belly
+}
+
+/// Where the sail's node at (`x`, `up`) is laid flat between its spars by `m`.
+fn laid(x: f32, up: f32, m: mat4) -> vec3 {
+    let c = cut(x, up)
+    m[3].xyz + m[0].xyz * c.y + m[1].xyz * c.x
+}
+
+/// What the rig holds each step: its luff and every batten firmly, the cloth between free; the
+/// sail hung from the mast's foot.
+pub fn held(m: mat4) -> Held {
+    var at: Vec<vec4> = Vec::new()
+    for r in 0..ROWS {
+        for c in 0..COLS {
+            let p = uv(c, r)
+            let firm = c == 0 || r % 3 == 0
+            at.push(vec4(shaped(p.x, p.y, m), if firm { 1.0 } else { 0.0 }))
+        }
+    }
+    Held { at, root: m[3].xyz, plumb: vec3(0.0, -1.0, 0.0) }
+}
+
+/// Where the junk's yard and its boom batten run (the hull's frame, from the mast and boom's
+/// ways `mast`, `boom`): each one's foot and its way along it, and the yard's length (m).
+pub fn yard_of(mast: vec3, boom: vec3) -> (vec3, vec3, vec3, vec3) {
+    let a = FOOT + mast * cut(0.0, 1.0).y + boom * cut(0.0, 1.0).x
+    let b = FOOT + mast * cut(1.0, 1.0).y + boom * cut(1.0, 1.0).x
+    let c = FOOT + mast * cut(0.0, 0.0).y + boom * cut(0.0, 0.0).x
+    let d = FOOT + mast * cut(1.0, 0.0).y + boom * cut(1.0, 0.0).x
+    (a, normalize(b - a), c, normalize(d - c))
+}
+
+/// The sail's wearer: the rig, its pose a palette whose first matrix is `rigged`'s.
+pub struct Sail: Copy + GpuData {
+    pub spare: vec4,
+}
+
+impl Wearer for Sail {
+    const COLS: u32 = COLS
+    const ROWS: u32 = ROWS
+    const HELD_ROWS: u32 = ROWS
+    const SHAPE: f32 = SHAPE
+    const KEEP: f32 = KEEP
+    const RELAXES: u32 = RELAXES
+
+    fn hung(self, rest: vec3, top: vec3, plumb: vec3, palette: [mat4], first: u32) -> vec3 {
+        let p = uv_of(rest)
+        shaped(p.x, p.y, palette[first])
+    }
+
+    /// The sail laid flat between its spars, a point off it at rest (`rest.x`, to starboard) as
+    /// far off it to the same side: so its light's normal is the sail's face.
+    fn skinned(self, rest: vec3, palette: [mat4], first: u32) -> vec3 {
+        let p = uv_of(rest)
+        let m = palette[first]
+        laid(p.x, p.y, m) + normalize(cross(m[1].xyz, m[0].xyz)) * rest.x
+    }
+
+    fn off_body(self, p: vec3, rest: vec3, palette: [mat4], first: u32) -> vec3 {
+        p
+    }
+
+    fn off_legs(self, p: vec3, held: bool, palette: [mat4], first: u32, legs: [f32]) -> vec3 {
+        p
+    }
+}
+
+/// The sail's places on its chart: across (x) and down (y), each 0 to 1.
+pub const PLACES = Box2 { lo: vec2(0.0), hi: vec2(1.0) }
+
+/// What the sail wears: the old's junk-rigged tanbark cloth (skiff.wrela:644-677, `sail_kind`
+/// with `SAIL` 1): six panels each its own shade of red-brown, sewn from narrow cloths running up
+/// it, pulled dark into a crease along each batten, bleached in broad streaks, grimed low; pale
+/// knotted bamboo battens across it.
+pub struct Canvas: Copy + GpuData {
+    pub spare: vec4,
+}
+
+/// Value noise in [0, 1].
+fn n01(p: vec2) -> f32 {
+    0.5 + 0.5 * value_noise(vec3(p.x, p.y, 23.0))
+}
+
+impl Look for Canvas {
+    fn skin(self, at: Place) -> Skin {
+        let p = uv_of(at.rest)
+        let up = p.y
+        let u = -at.rest.z
+        let stain = n01(vec2(u * 3.0, at.rest.y * 2.0)) * 0.6 + n01(vec2(u * 11.0, at.rest.y * 7.0)) * 0.4
+        let band = floor(up * f32(PANELS))
+        let tone = fract(sin(band * 12.9898 + 21.0) * 43758.547)
+        var c = mix(vec3(0.38, 0.14, 0.07), vec3(0.56, 0.25, 0.13), vec3(tone * 0.5 + stain * 0.5))
+        c *= 0.85 + 0.2 * smoothstep(0.0, 0.6, up)
+        c *= 0.8 + 0.2 * smoothstep(0.0, 0.35, up)
+        // (Narrow cloths running up it, their seams darker.)
+        let cloths = 1.0 - smoothstep(0.004, 0.012, abs(fract(u / 0.42) - 0.5) * 0.42 - 0.2)
+        c *= 1.0 - 0.18 * cloths
+        // (Pulled dark into a crease along each batten, and bleached in broad streaks.)
+        let span = cut(p.x, 1.0).y - cut(p.x, 0.0).y
+        let along_rib = abs(fract(up * f32(PANELS) + 0.5) - 0.5) / f32(PANELS) * span
+        c *= 0.42 + 0.58 * smoothstep(0.015, 0.2, along_rib)
+        let bleach = smoothstep(0.42, 0.7, n01(vec2(u * 0.6 + 4.0, at.rest.y * 1.4 + 1.0))) *
+            smoothstep(0.1, 0.7, up)
+        c = mix(c, c * 1.5 + vec3(0.07, 0.05, 0.03), vec3(bleach))
+        // (Bamboo battens, pale and knotted, across it.)
+        let rib = 1.0 - smoothstep(0.014, 0.03, along_rib)
+        let knot = smoothstep(0.85, 1.0, sin(u * 9.0) * 0.5 + 0.5)
+        c = mix(c, vec3(0.5, 0.42, 0.26) * (0.85 - 0.25 * knot), vec3(rib))
+        Skin { albedo: c, line: 1.0, metal: 0.0, rim: false, emits: vec3(0.0) }
+    }
+}
+
+impl Worn for Canvas {
+    /// Both its faces are the same cloth.
+    fn lined(self, at: Place) -> bool {
+        true
+    }
+}

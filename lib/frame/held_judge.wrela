@@ -1,0 +1,357 @@
+// The judge of what holds the light off a point (`held`, docs/light.md): at each pixel the
+// picture shows a judged surface on, how much of the sky that point sees, sampled many times
+// through the world's own forms (the reference), against what the frame's store gives
+// (`held::sky_seen`, as every lister asks it).
+//
+// The reference's sky at a point `p` facing `n` is the share of the sky's light it would take
+// with nothing round it that reaches it: rays toward the upper half of the world in front of the
+// face, spread as the cosine to `n` spreads light (so each counts alike), each 1 if it leaves the
+// world's forms. The scene hands its world as a `Seen` (its forms themselves, and whether a ray
+// meets them), and which surfaces are judged: solids of bodies `solids.x` to `solids.y` (their
+// normal the world's own gradient) and the chart of body `level` (a level surface: the sea, its
+// normal straight up). A pixel's point is where the picture's depth puts it.
+//
+// Heavy by design, so cut under the step guard (AGENTS.md rule 4): a band of `BAND` rows a
+// frame, `PER` rays a pixel a pass, `PASSES` passes; the eye is held while it runs. Then the
+// whole screen is judged in one dispatch and the numbers read back.
+
+use eye::Eye
+use held::{Held, sky_seen}
+use last::cover
+use picture::{CHART, Frame, NO_EDGE, NO_LINE, SOLID, body_of, edge_record, kind_of}
+use std::gpu::{
+    Atomics, Compare, Depth, DepthTexture, FragCoord, GlobalId, GpuBuffer, R32Uint, Rgba16Float,
+    Targets3, Texels, Texture, WithDepth, begin_pass3_with_depth, buffer, buffer_of, dispatch, draw,
+    label, read, writable_texture, write,
+}
+use std::io::{Pending, print}
+
+/// The world as the reference sees it: its own forms.
+pub trait Seen: Copy + GpuData {
+    /// The way out of its surface nearest `p` (`xyz`, a unit vector) and how far it is (`w`, m;
+    /// negative inside).
+    fn near(self, p: vec3) -> vec4
+
+    /// Whether the ray from `p` along `d` (a unit vector) meets it within `far` m.
+    fn meets(self, p: vec3, d: vec3, far: f32) -> bool
+}
+
+/// Every `STRIDE`th pixel each way is judged (the middle one of each block, its block drawn as
+/// it), `BAND` of their rows a band, `PER` rays a pixel a pass, `PASSES` passes: 256 rays a
+/// pixel, so the reference's own noise (its rays' share of a binary) is about 0.03 at a pixel. The
+/// judge's picture (`image`) is a texel a judged pixel.
+pub const STRIDE: u32 = 5
+pub const BAND: u32 = 16
+pub const PER: u32 = 2
+pub const PASSES: u32 = 128
+
+/// How many numbers the judge counts: for solids and the level surface each, pixels judged, the
+/// sum of the store's difference from the reference (in thousandths), pixels over 0.05 off,
+/// over 0.1, and the sum of the reference (thousandths) and of the store's.
+pub const COUNTS: u32 = 12
+
+/// The class of pixel `x`, `y` (0 none, 1 a judged solid, 2 the level surface), its point and its
+/// normal.
+fn point_of<W: Seen>(
+    eye: Eye,
+    world: W,
+    depth: DepthTexture,
+    identity: Texture<R32Uint>,
+    solids: vec2u,
+    level: u32,
+    x: u32,
+    y: u32,
+) -> (u32, vec3, vec3) {
+    let z = depth.load(x, y)
+    if z <= 0.0 {
+        return (0, vec3(0.0), vec3(0.0))
+    }
+    let id = identity.load(x, y)
+    let p = eye.place(vec2(f32(x) + 0.5, f32(y) + 0.5), z)
+    let kind = kind_of(id)
+    let body = body_of(id)
+    if kind == CHART && body == level {
+        return (2, p, vec3(0.0, 1.0, 0.0))
+    }
+    if kind == SOLID && body >= solids.x && body < solids.y {
+        let g = world.near(p)
+        if abs(g.w) < 0.5 {
+            return (1, p - g.xyz * g.w, g.xyz)
+        }
+    }
+    (0, vec3(0.0), vec3(0.0))
+}
+
+/// A number in [0, 1) from `i` (a pixel's own turn of the rays, so neighbours' rays differ).
+fn scrambled(i: u32) -> f32 {
+    var h = i * 747796405 + 2891336453
+    h = ((h >> ((h >> 28) + 4)) ^ h) * 277803737
+    f32((h >> 22) ^ h) / 4294967296.0
+}
+
+/// The radical inverse of `i` in base `b` (Halton's).
+fn radical(i: u32, b: u32) -> f32 {
+    var f = 1.0
+    var r = 0.0
+    var n = i
+    for _k in 0..16 {
+        if n > 0 {
+            f /= f32(b)
+            r += f * f32(n % b)
+            n /= b
+        }
+    }
+    r
+}
+
+/// One pass's rays of a band of rows from `from`: each judged pixel's rays toward the sky (the
+/// pass's two points of Halton's sequence, `points.xy` and `points.zw`, turned by the pixel's
+/// own), counted into `open` (pixel `i`'s rays that reach the sky at `2 i`, its rays toward the
+/// sky at `2 i + 1`).
+@compute(8, 8)
+fn looked<W: Seen>(
+    eye: Eye,
+    world: W,
+    depth: DepthTexture,
+    identity: Texture<R32Uint>,
+    solids: vec2u,
+    level: u32,
+    from: u32,
+    points: vec4,
+    open: mut Atomics<u32>,
+    id: GlobalId,
+) {
+    let w = u32(eye.size.x) / STRIDE
+    let gy = from + id.y
+    if id.x >= w || gy >= u32(eye.size.y) / STRIDE {
+        return
+    }
+    let x = id.x * STRIDE + STRIDE / 2
+    let y = gy * STRIDE + STRIDE / 2
+    let (class, p, n) = point_of(eye, world, depth, identity, solids, level, x, y)
+    if class == 0 {
+        return
+    }
+    let a = normalize(cross(n, if abs(n.y) < 0.9 { vec3(0.0, 1.0, 0.0) } else { vec3(1.0, 0.0, 0.0) }))
+    let b = cross(n, a)
+    let i = gy * w + id.x
+    let turn = vec2(scrambled(2 * i), scrambled(2 * i + 1))
+    var reached: u32 = 0
+    var toward: u32 = 0
+    for j in 0..PER {
+        let u = fract((if j == 0 { points.xy } else { points.zw }) + turn)
+        let r = sqrt(u.x)
+        let phi = 6.2831853 * u.y
+        let d = a * (r * cos(phi)) + b * (r * sin(phi)) + n * sqrt(max(1.0 - u.x, 0.0))
+        if d.y > 0.0 {
+            toward += 1
+            if !world.meets(p + n * 0.1, d, 400.0) {
+                reached += 1
+            }
+        }
+    }
+    let _ = open.add(2 * i, reached)
+    let _ = open.add(2 * i + 1, toward)
+}
+
+/// Each judged pixel (`id`, of the grid of every `STRIDE`th): the reference's sky (its rays that
+/// reached it over its rays toward it), the store's (`held::sky_seen`), their difference
+/// counted (`counts`) and drawn (`out`, a texel a judged pixel: as `shown` asks, 0 the
+/// reference, 1 the store, 2 the difference four times over, red where the store gives more).
+@compute(8, 8)
+fn judged<W: Seen>(
+    eye: Eye,
+    held: Held,
+    world: W,
+    depth: DepthTexture,
+    identity: Texture<R32Uint>,
+    solids: vec2u,
+    level: u32,
+    open: [u32],
+    shown: u32,
+    counts: mut Atomics<u32>,
+    out: mut Texels<Rgba16Float>,
+    id: GlobalId,
+) {
+    let w = u32(eye.size.x) / STRIDE
+    if id.x >= w || id.y >= u32(eye.size.y) / STRIDE {
+        return
+    }
+    let x = id.x * STRIDE + STRIDE / 2
+    let y = id.y * STRIDE + STRIDE / 2
+    let (class, p, n) = point_of(eye, world, depth, identity, solids, level, x, y)
+    let i = id.y * w + id.x
+    let toward = open[2 * i + 1]
+    if class == 0 || toward == 0 {
+        out.store(id, vec4(0.0, 0.0, 0.0, 1.0))
+        return
+    }
+    let truth = f32(open[2 * i]) / f32(toward)
+    let got = sky_seen(held, p, n)
+    let off = got - truth
+    let v = if shown == 0 { vec4(vec3(truth), 1.0) } else if shown == 1 { vec4(vec3(got), 1.0) } else {
+        vec4(max(off, 0.0) * 4.0, 0.0, max(-off, 0.0) * 4.0, 1.0)
+    }
+    out.store(id, v)
+    let c = 6 * (class - 1)
+    let _ = counts.add(c, 1)
+    let _ = counts.add(c + 1, u32(abs(off) * 1000.0))
+    if abs(off) > 0.05 {
+        let _ = counts.add(c + 2, 1)
+    }
+    if abs(off) > 0.1 {
+        let _ = counts.add(c + 3, 1)
+    }
+    let _ = counts.add(c + 4, u32(truth * 1000.0))
+    let _ = counts.add(c + 5, u32(got * 1000.0))
+}
+
+/// The judge: what it counts, how far it has got, and its picture.
+pub struct HeldJudge {
+    open: GpuBuffer<u32>,
+    counts: GpuBuffer<u32>,
+    pub image: Texture<Rgba16Float>,
+    band: u32,
+    pass: u32,
+    asked: Option<Pending<u32>>,
+    pub done: bool,
+}
+
+/// A judge for a screen `width` × `height`.
+pub fn held_judge(width: u32, height: u32) -> HeldJudge {
+    HeldJudge {
+        open: buffer_of(Vec::filled(2 * (width / STRIDE) * (height / STRIDE), 0)),
+        counts: buffer_of(Vec::filled(COUNTS, 0)),
+        image: writable_texture::<Rgba16Float>(width: width / STRIDE, height: height / STRIDE),
+        band: 0,
+        pass: 0,
+        asked: None,
+        done: false,
+    }
+}
+
+impl HeldJudge {
+    /// This frame's band, the eye held (`eye`), the world `world`, judging solids of bodies
+    /// `solids` and the chart of body `level`; the whole screen judged once every pass of every
+    /// band is in (`shown` as `judged` draws it), and the numbers said when they're read back.
+    pub fn step<W: Seen>(
+        mut self,
+        eye: Eye,
+        held: Held,
+        world: W,
+        depth: DepthTexture,
+        identity: Texture<R32Uint>,
+        solids: vec2u,
+        level: u32,
+        shown: u32,
+    ) {
+        let h = u32(eye.size.y)
+        let w = u32(eye.size.x)
+        let bands = (h / STRIDE + BAND - 1) / BAND
+        if self.pass < PASSES {
+            label("held judge")
+            dispatch(
+                looked.bind(
+                    eye,
+                    world: world,
+                    depth: depth,
+                    identity: identity,
+                    solids: solids,
+                    level: level,
+                    from: self.band * BAND,
+                    points: vec4(
+                        radical(2 * self.pass + 1, 2),
+                        radical(2 * self.pass + 1, 3),
+                        radical(2 * self.pass + 2, 2),
+                        radical(2 * self.pass + 2, 3),
+                    ),
+                    open: mut self.open,
+                ),
+                groups: ((w / STRIDE + 7) / 8, BAND / 8, 1),
+            )
+            self.band += 1
+            if self.band == bands {
+                self.band = 0
+                self.pass += 1
+            }
+            if self.pass == PASSES {
+                label("held judge")
+                dispatch(
+                    judged.bind(
+                        eye,
+                        held: held,
+                        world: world,
+                        depth: depth,
+                        identity: identity,
+                        solids: solids,
+                        level: level,
+                        open: self.open,
+                        shown: shown,
+                        counts: mut self.counts,
+                        out: mut self.image,
+                    ),
+                    groups: ((w / STRIDE + 7) / 8, (h / STRIDE + 7) / 8, 1),
+                )
+                self.asked = Some(read(self.counts.items()))
+            }
+        }
+        match mut self.asked {
+            Some(a) => match a.poll() {
+                Some(Ok(v)) => {
+                    for c in 0..2 {
+                        let k = 6 * c
+                        let n = max(f32(v[k]), 1.0)
+                        let name = if c == 0 { "solids" } else { "level" }
+                        print(
+                            f"held judge, {name}: {v[k]} pixels; the store's sky off the reference's by {f32(v[k + 1]) / 1000.0 / n} on average, over 0.05 at {f32(v[k + 2]) / n * 100.0}%, over 0.1 at {f32(v[k + 3]) / n * 100.0}%; the reference's mean {f32(v[k + 4]) / 1000.0 / n}, the store's {f32(v[k + 5]) / 1000.0 / n}",
+                        )
+                    }
+                    self.asked = None
+                    self.done = true
+                },
+                _ => {},
+            },
+            None => {},
+        }
+    }
+}
+
+/// The judge's picture over the screen, each judged pixel's texel over its block, as near as
+/// anything (so the last pass shows it as it is, with nothing else).
+@fragment
+fn judge_shown(pixel: FragCoord, image: Texture<Rgba16Float>) -> WithDepth<Targets3<vec4, vec4, u32>> {
+    let x = min(u32(pixel.position.x) / STRIDE, image.width() - 1)
+    let y = min(u32(pixel.position.y) / STRIDE, image.height() - 1)
+    WithDepth {
+        color: Targets3 {
+            first: image.load(x, y),
+            second: edge_record(NO_EDGE, 0.0, NO_LINE),
+            third: 0,
+        },
+        depth: 1.0,
+    }
+}
+
+impl HeldJudge {
+    /// The judge's picture drawn over `frame`'s, to be shown by its last pass (with no air).
+    pub fn shown(self, frame: mut Frame) {
+        let p = begin_pass3_with_depth(
+            mut frame.colour,
+            mut frame.edge,
+            mut frame.identity,
+            mut frame.depth,
+            clear: vec4(0.0),
+            keep: true,
+            clear_depth: 0.0,
+            keep_depth: true,
+        )
+        draw(
+            p,
+            cover,
+            judge_shown.bind(image: self.image),
+            vertices: 3,
+            depth: Depth { compare: Compare::Always, write: true },
+        )
+        p.end()
+    }
+}

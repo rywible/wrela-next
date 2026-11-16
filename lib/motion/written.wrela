@@ -1,0 +1,282 @@
+// A written move: a strike as a function of time, made of a few goal poses (`motion::keys`) and
+// of how long after the hips each part of the body plays them. Any moment gives a pose
+// (`Written::pose`), so the move is read at any rate, and its numbers are plain literals a
+// solve can move (`wrela solve --spec`, std::lift).
+//
+// A key holds the whole body at one moment, so a move keyed alone moves every part on one
+// curve: the hips, the chest and the fist set off together and stop together, which is what
+// `rywible/wrela's engine::timing` flags as "all at once". A struck or thrown blow goes from the middle of the
+// body outward, each part a little after the one before (Putnam 1993), and parts don't start
+// and stop together (overlapping action: Lasseter 1987). Here that's by construction: each part
+// of the chain plays the same keys on its own clock, later by its lag (`Chain`), so a lag
+// written is a lag drawn; and the body eases into a pose the fist is stopped dead by.
+//
+// - The hips, the legs and the feet keep the keys' own time: a planted foot stays where its key
+//   puts it.
+// - The trunk (the spine's bones, the neck and head, and the arm that doesn't strike) turns
+//   above the hips as the keys had it `Chain::trunk` earlier.
+// - The striking arm's collar, its upper arm, its forearm and its hand each turn in the bone
+//   they hang from as the keys had them their own lag earlier.
+//
+// How the parts follow the hips is the fighter's (`Taste`), not a move's: every move he makes is
+// written with his taste. And a fight plays a move at its own beats (`Beats`, `Written::played`):
+// the rules own a move's timing, and its keys are laid over the frames they give it.
+//
+// A part's turn is its turn in its parent, so a late arm is carried by the body that has
+// already gone: the fist rides the trunk's turn before the arm opens. What a late part does to
+// where the fist ends up is not written anywhere: it's read (`Written::thrown`) and solved for.
+//
+// Everything a solve reads is posed in arrays, not `Vec`s (`humanoid::Frames`): std::lift's
+// derivation follows an array alone.
+//
+// Carried from rywible/wrela's engine/written.wrela.wrela at 7ae6711e, cut to what a fight plays.
+
+use humanoid::{Clip, NONE, Pose, Rig, pose_world}
+use playback::{ACTIVE, CANCEL, Mark, Move, RECOVER, WINDUP}
+use keys::{Key, both_hands, hands_of, key_in, posed, shifted}
+use std::collections::Vec
+use stride::curled_hands
+use end::End
+
+/// How each part of the body follows the hips.
+///
+/// Its lag: how long after the hips it plays the keys (s), for the trunk, then the striking
+/// arm's collar, its shoulder (the upper arm), its elbow (the forearm) and its wrist (the
+/// hand).
+///
+/// Its snap: how much of a `keys::SNAP` key's snap the body (the hips and legs) and the trunk
+/// keep. 1 is all of it: the part gathers speed all the way to the key and is stopped dead by
+/// it. 0 is none: it eases into the key, fastest half way. The arm keeps all of it. A body
+/// that eases in while the fist snaps is fastest before the fist is, which is the chain's
+/// order again, and it doesn't check the fist by stopping under it.
+///
+/// Every lag 0 and every snap 1 is the keys alone, every part on one curve.
+pub struct Chain: Copy {
+    pub trunk: f32 = 0.0,
+    pub collar: f32 = 0.0,
+    pub shoulder: f32 = 0.0,
+    pub elbow: f32 = 0.0,
+    pub wrist: f32 = 0.0,
+    pub body_snap: f32 = 1.0,
+    pub trunk_snap: f32 = 1.0,
+}
+
+/// The clocks a body's bones are on: the keys' own time, then one for each of `Chain`'s parts.
+const BODY: u32 = 0
+const TRUNK: u32 = 1
+const COLLAR: u32 = 2
+const SHOULDER: u32 = 3
+const ELBOW: u32 = 4
+const WRIST: u32 = 5
+const CLOCKS: u32 = 6
+
+/// A fighter's taste: its habits, true of every move it makes, as a player's taste is true of
+/// any piece (`rywible/wrela's engine::perform::Taste`). How its body follows its hips (`Chain`) is a fighter's,
+/// not a move's: each of its moves is written with it.
+pub struct Taste: Copy {
+    pub chain: Chain,
+}
+
+/// A move's beats, as the fight's rules have them (s): its windup (to the frame the rules hit),
+/// its active frames and its recovery. The rules own a move's timing and the move bends to it
+/// (`Written::played`).
+pub struct Beats: Copy {
+    pub windup: f32,
+    pub active: f32,
+    pub recovery: f32,
+}
+
+impl Beats {
+    /// A move's beats from its frames at `hz` a second.
+    pub fn of_frames(windup: u32, active: u32, recovery: u32, hz: f32) -> Beats {
+        Beats { windup: f32(windup) / hz, active: f32(active) / hz, recovery: f32(recovery) / hz }
+    }
+
+    pub fn length(self) -> f32 {
+        self.windup + self.active + self.recovery
+    }
+}
+
+/// A written move: its keys in time order (`N` of them, their times the hips'), its fighter's
+/// taste (how the body follows the hips), and the end it strikes with (`motion::end::End`: a
+/// fist, or a point hung from a hand), whose arm is the striking one.
+pub struct Written<const N: u32>: Copy {
+    pub keys: [Key; N],
+    pub taste: Taste,
+    pub end: End,
+}
+
+/// The striking arm's bones: its collar, upper arm, forearm and hand.
+fn arm_of(rig: Rig, arm: u32) -> [u32; 4] {
+    let names = if arm == 0 {
+        ["leftShoulder", "leftUpperArm", "leftLowerArm", "leftHand"]
+    } else {
+        ["rightShoulder", "rightUpperArm", "rightLowerArm", "rightHand"]
+    }
+    [rig.find(names[0]), rig.find(names[1]), rig.find(names[2]), rig.find(names[3])]
+}
+
+/// The clock each of `rig`'s bones is on: its own where it's one of the chain's, else the one
+/// its parent is on (a finger its hand's, the head its trunk's, a leg the hips').
+fn clocks(rig: Rig, arm: u32) -> [u32; 64] {
+    let a = arm_of(rig, arm)
+    let spine = rig.find("spine")
+    var out = [BODY; 64]
+    for b in 0..rig.bones.len() {
+        let up = rig.bones[b].parent
+        var c = if up == NONE { BODY } else { out[up] }
+        if b == spine {
+            c = TRUNK
+        } else if b == a[0] {
+            c = COLLAR
+        } else if b == a[1] {
+            c = SHOULDER
+        } else if b == a[2] {
+            c = ELBOW
+        } else if b == a[3] {
+            c = WRIST
+        }
+        out[b] = c
+    }
+    out
+}
+
+impl<const N: u32> Written<N> {
+    /// The arm that strikes (0 the left, 1 the right): the one its end hangs from.
+    fn arm(self, rig: Rig) -> u32 {
+        if self.end.limb(rig) == 0 { 0 } else { 1 }
+    }
+
+    /// Each clock's lag (s), in the clocks' order.
+    fn lag(self) -> [f32; 6] {
+        let l = self.taste.chain
+        [0.0, l.trunk, l.collar, l.shoulder, l.elbow, l.wrist]
+    }
+
+    /// How much of a snap each clock keeps, in the clocks' order.
+    fn snap(self) -> [f32; 6] {
+        [self.taste.chain.body_snap, self.taste.chain.trunk_snap, 1.0, 1.0, 1.0, 1.0]
+    }
+
+    /// How long the move lasts (s): its last key, and the latest part's lag after it.
+    pub fn length(self) -> f32 {
+        var most = 0.0
+        for l in self.lag() {
+            most = max(most, l)
+        }
+        self.keys[N - 1].at + most
+    }
+
+    /// The body at `time` (s from the move's start), about its root (each key's travel taken
+    /// off: gameplay carries that): each bone's turn in its parent as the keys have it on the
+    /// bone's own clock.
+    pub fn pose(self, rig: Rig, time: f32) -> Pose {
+        let on = clocks(rig, self.arm(rig))
+        let lag = self.lag()
+        let snap = self.snap()
+        let nb = rig.bones.len()
+        var out = Pose { turns: [Quat::identity(); 64], hips: vec3(0.0) }
+        for c in 0..CLOCKS {
+            let k = key_in(self.keys, time - lag[c], snap[c])
+            let p = posed(rig, shifted(k, -k.travel))
+            for b in 0..nb {
+                if on[b] == c {
+                    out.turns[b] = p.turns[b]
+                }
+            }
+            if c == BODY {
+                out.hips = p.hips
+            }
+        }
+        // Both hands on what's held: the other hand follows the holding hand on the grip, on the
+        // holding hand's clock, not the trunk's.
+        both_hands(rig, out, self.keys[0].wield)
+    }
+
+    /// Where the move has carried its root along the floor by `time` (s from its start): its
+    /// keys' travel on the body's clock. A move that steps carries it; gameplay carries it as the
+    /// played move's root (`played`).
+    pub fn root(self, rig: Rig, time: f32) -> vec3 {
+        key_in(self.keys, time, self.snap()[BODY]).travel
+    }
+
+    /// The move as a clip at `fps`, its hands made fists (`fist`, as `stride::curled_hands`).
+    pub fn clip(self, rig: Rig, fps: f32, fist: f32) -> Clip {
+        let nb = rig.bones.len()
+        let n = u32(self.length() * fps + 0.5) + 1
+        var c = humanoid::rest_clip(rig)
+        c.frames = n
+        c.looped = false
+        c.fps = fps
+        c.turns = Vec::with_capacity(n * nb)
+        c.hips = Vec::with_capacity(n)
+        for f in 0..n {
+            let p = self.pose(rig, f32(f) / fps)
+            for b in 0..nb {
+                c.turns.push(p.turns[b])
+            }
+            c.hips.push(p.hips)
+        }
+        curled_hands(c, rig, fist)
+    }
+
+    /// The move with its keys at the fight's beats, its striking fist on its contact on the
+    /// frame the rules hit. The fist plays the keys a wrist's lag after the hips do (`Chain`), so
+    /// it reaches the key it lands on (the last before its contact, `contact` s into the move as
+    /// written) a lag after that key: the key goes to the windup less the lag, and what's before
+    /// it is squeezed or stretched over that. What's within the active frames after it plays at
+    /// its own pace, and the rest goes over the recovery, less the latest part's lag, so the move
+    /// ends with the rules'. The taste's lags are the fighter's, and stay as they are. A windup
+    /// shorter than the wrist's lag puts the key at the move's start, and the fist lands the
+    /// lag after it: late by what the windup's short of the lag.
+    pub fn at_beats(self, rig: Rig, contact: f32, beats: Beats) -> Written<N> {
+        var most = 0.0
+        for l in self.lag() {
+            most = max(most, l)
+        }
+        // (The end's lag: the clock its bone is on, a fist's the wrist's.)
+        let lag = self.lag()[clocks(rig, self.arm(rig))[self.end.bone_of(rig)]]
+        // The key the fist lands on, as written and as played.
+        let key = contact - lag
+        let key_at = max(beats.windup - lag, 0.0)
+        let last = self.keys[N - 1].at
+        let held = key + beats.active
+        let rest = max(beats.recovery - most + lag, 1.0e-3)
+        var out = self
+        for i in 0..N {
+            let t = self.keys[i].at
+            out.keys[i].at = if t <= key { t * key_at / max(key, 1.0e-4) } else if t <= held {
+                key_at + (t - key)
+            } else { key_at + beats.active + (t - held) * rest / max(last - held, 1.0e-4) }
+        }
+        out
+    }
+
+    /// The move as a fight plays it (`motion::playback`): at the fight's beats (`at_beats`), its
+    /// contact `contact` s into it as written, sampled at `fps` with its hands made fists, in
+    /// place, and marked with its windows (`WINDUP` to the hit, `ACTIVE`, `RECOVER`, and
+    /// `CANCEL` over the last third of the recovery).
+    pub fn played(self, rig: Rig, contact: f32, beats: Beats, fps: f32, fist: f32) -> Move {
+        let m = self.at_beats(rig, contact, beats)
+        let c = m.clip(rig, fps, fist)
+        let n = c.frames
+        var root: Vec<vec3> = Vec::with_capacity(n)
+        for f in 0..n {
+            root.push(m.root(rig, f32(f) / fps))
+        }
+        let (w, a, total) = (beats.windup, beats.active, beats.length())
+        var marks: Vec<Mark> = Vec::new()
+        marks.push(Mark { kind: WINDUP, from: 0.0, till: w })
+        marks.push(Mark { kind: ACTIVE, from: w, till: w + a })
+        marks.push(Mark { kind: RECOVER, from: w + a, till: total })
+        marks.push(Mark { kind: CANCEL, from: total - beats.recovery / 3.0, till: total })
+        Move {
+            clip: c,
+            root,
+            heading: Vec::filled(n, 0.0),
+            marks,
+            speed: 0.0,
+            stride: 0.0,
+        }
+    }
+}

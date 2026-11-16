@@ -1,0 +1,295 @@
+// The rings: where a height chart's vertices lie, round the eye. Level L is a square of 2n by 2n
+// quads (n = `HALF`), each `finest` × 2^L m across, its middle the eye's place snapped to twice its
+// spacing (so its even vertices are the next level's), with a hole where level L - 1 lies. Each
+// level is twice as coarse as the one inside it, so a vertex is about as far from its
+// neighbours, as a share of how far it is from the eye, near and far.
+//
+// No cracks and no popping, after Strugar's continuous distance-dependent levels of detail
+// (docs/citations.md): a vertex in the outer part of its level is moved toward the next level's
+// grid as it nears that level (its morph, 0 to 1, by its distance from the eye along the ground,
+// the larger of x's and z's), its odd coordinates sliding onto the even vertex below them. At
+// its level's outer edge every vertex is wholly moved, so the edge's vertices are the coarser
+// level's own, at the same places to the bit: the two levels' triangles meet edge to edge, never
+// at a T. And as the eye moves, every vertex slides; none jumps.
+//
+// Where a level's hole lies in it depends on which way each level's middle was rounded: one of
+// nine places (a quad either way along x and z). So the triangles are listed once for each, and
+// a frame draws each level's from the list that fits. Each list is cut into the eight parts
+// round its hole (and a ninth, the middle, for the finest level, which has none), and a part
+// wholly off the screen isn't drawn.
+
+use frame::eye::Eye
+use std::derive::Box2
+use std::gpu::{GpuBuffer, buffer_of}
+
+/// Half how many quads a level's square is across (n): a level is 2n by 2n quads, the level
+/// inside it n by n of its own.
+pub const HALF: u32 = 32
+
+/// The most levels there are.
+pub const MOST_LEVELS: u32 = 22
+
+/// How many vertices along a level's side.
+pub const SIDE: u32 = 2 * HALF + 1
+
+/// The rings as the vertex program reads them this frame: each level's middle (x, z: a multiple
+/// of twice its spacing) and spacing (m), in `xy` and `z`; the eye's place on the ground (x, z);
+/// how many levels; and the places the chart covers, past which no vertex goes (lo, then hi).
+pub struct Layout: Copy + GpuData {
+    pub levels: [vec4; MOST_LEVELS],
+    pub eye: vec2,
+    pub count: u32,
+    pub spare: f32,
+    pub domain: vec4,
+}
+
+/// A vertex placed: the place on the chart it stands at (x, z, after its morph), how far it has
+/// moved toward the next level's grid (0 to 1), and how far apart its level's vertices are, its
+/// morph counted (m: its spacing, rising to twice it as it morphs).
+pub struct Placed: Copy + GpuData {
+    pub rest: vec2,
+    pub morph: f32,
+    pub spacing: f32,
+}
+
+/// Where vertex `vertex` of level `level` stands (`vertex` is j·SIDE + i, i along x).
+pub fn placed(l: Layout, vertex: u32, level: u32) -> Placed {
+    let n = f32(HALF)
+    let i = vertex % SIDE
+    let j = vertex / SIDE
+    let g = vec2(f32(i), f32(j)) - vec2(n)
+    let lv = l.levels[level]
+    let s = lv.z
+    let at = lv.xy + g * s
+    // The morph: none within (n + 1)/2 spacings of the eye (the inner edge, where the finer
+    // level's edge may lie), all of it from n - 1 spacings (the outer edge, nearest the eye).
+    let far = max(abs(at.x - l.eye.x), abs(at.y - l.eye.y))
+    let from = 0.5 * (n + 1.0) * s
+    let to = (n - 1.0) * s
+    let m = saturate((far - from) / (to - from))
+    let odd = g - floor(g * 0.5) * 2.0
+    let moved = lv.xy + (g - odd * m) * s
+    Placed {
+        rest: clamp(moved, l.domain.xy, l.domain.zw),
+        morph: m,
+        spacing: s * (1.0 + m),
+    }
+}
+
+/// How many triangles' corners a level's square has, and its holed form.
+const FULL_CORNERS: u32 = 4 * HALF * HALF * 6
+const RING_CORNERS: u32 = 3 * HALF * HALF * 6
+
+/// The part of a level's square quad (`qi`, `qj`) lies in, round a hole from `h0` to below `h1`
+/// (quads, each way): 0 to 8, row by row, 4 the hole itself.
+pub(package) fn part_of(qi: u32, qj: u32, h0: vec2u, h1: vec2u) -> u32 {
+    let col: u32 = if qi < h0.x { 0 } else if qi >= h1.x { 2 } else { 1 }
+    let row: u32 = if qj < h0.y { 0 } else if qj >= h1.y { 2 } else { 1 }
+    row * 3 + col
+}
+
+/// Where hole form `v` (0 to 8) lies in a level's square: from, and to below (quads). Form `v`
+/// is the hole moved (v % 3 - 1, v / 3 - 1) quads from the square's middle.
+pub(package) fn hole(v: u32) -> (vec2u, vec2u) {
+    let h0 = vec2u(HALF / 2 + v % 3 - 1, HALF / 2 + v / 3 - 1)
+    (h0, h0 + vec2u(HALF))
+}
+
+/// The rings as listed: their finest spacing (m), and where each hole form's part starts in the
+/// list of triangles' corners and how many corners it has (ten forms: nine holed, and the
+/// finest level's, whole; nine parts each).
+pub struct Parts {
+    pub finest: f32,
+    first: Vec<u32>,
+    count: Vec<u32>,
+}
+
+/// The rings: as listed, and the list on the GPU.
+pub struct Rings {
+    pub parts: Parts,
+    pub indices: GpuBuffer<u32>,
+}
+
+/// One draw of a frame's rings: a level, the run of the list it draws, and the places (x, z) its
+/// part covers, within the domain (from `lo` to `hi`).
+pub struct Run: Copy {
+    pub level: u32,
+    pub first: u32,
+    pub count: u32,
+    pub lo: vec2,
+    pub hi: vec2,
+}
+
+/// Rings whose finest vertices are `finest` m apart.
+pub fn rings(finest: f32) -> Rings {
+    let (parts, all) = listed(finest)
+    Rings { parts, indices: buffer_of(all) }
+}
+
+/// Rings whose finest vertices are `finest` m apart, as listed, and their triangles' corners.
+pub fn listed(finest: f32) -> (Parts, Vec<u32>) {
+    var all: Vec<u32> = Vec::new()
+    var first: Vec<u32> = Vec::new()
+    var count: Vec<u32> = Vec::new()
+    for v in 0..10 {
+        let (h0, h1) = if v < 9 { hole(v) } else { (vec2u(2 * HALF), vec2u(2 * HALF)) }
+        for part in 0..9 {
+            first.push(all.len())
+            for qj in 0..2 * HALF {
+                for qi in 0..2 * HALF {
+                    // The whole square has no hole: its middle quads are part 4.
+                    let p = if v < 9 {
+                        part_of(qi, qj, h0, h1)
+                    } else {
+                        part_of(qi, qj, vec2u(HALF / 2), vec2u(3 * HALF / 2))
+                    }
+                    if p == part && !(v < 9 && p == 4) {
+                        let a = qj * SIDE + qi
+                        let b = a + 1
+                        let c = a + SIDE
+                        let d = c + 1
+                        all.push(a)
+                        all.push(c)
+                        all.push(b)
+                        all.push(b)
+                        all.push(c)
+                        all.push(d)
+                    }
+                }
+            }
+            count.push(all.len() - first[first.len() - 1])
+        }
+    }
+    assert(all.len() == 9 * RING_CORNERS + FULL_CORNERS, "every quad listed once a form")
+    (Parts { finest, first, count }, all)
+}
+
+/// Where `x` lies on a grid of `step`, rounded to the nearest point.
+fn snapped(x: vec2, step: f32) -> vec2 {
+    floor(x / step + vec2(0.5)) * step
+}
+
+/// Whether the box from `lo` to `hi` lies wholly off `eye`'s screen: every corner past one side
+/// of it (or behind its near plane).
+pub fn unseen(eye: Eye, lo: vec3, hi: vec3) -> bool {
+    var out = vec4u(0, 0, 0, 0)
+    var behind: u32 = 0
+    for k in 0..8 {
+        let p = vec3(
+            if (k & 1) == 0 { lo.x } else { hi.x },
+            if (k & 2) == 0 { lo.y } else { hi.y },
+            if (k & 4) == 0 { lo.z } else { hi.z },
+        )
+        let c = eye.clip(p)
+        if c.x > c.w {
+            out.x += 1
+        }
+        if c.x < -c.w {
+            out.y += 1
+        }
+        if c.y > c.w {
+            out.z += 1
+        }
+        if c.y < -c.w {
+            out.w += 1
+        }
+        if c.w < eye.near {
+            behind += 1
+        }
+    }
+    out.x == 8 || out.y == 8 || out.z == 8 || out.w == 8 || behind == 8
+}
+
+impl Rings {
+    /// This frame's rings for `eye` over `domain`: as `Parts::frame`.
+    pub fn frame(self, eye: Eye, domain: Box2, low: f32, high: f32) -> (Layout, Vec<Run>) {
+        self.parts.frame(eye, domain, low, high)
+    }
+}
+
+impl Parts {
+    /// This frame's rings for `eye` over `domain` (x, z), whose heights lie from `low` to
+    /// `high` (m): the layout the vertex program reads, and the runs to draw. Levels go out until
+    /// one holds the whole domain (or `MOST_LEVELS`); a part of a level wholly off the screen,
+    /// or wholly off the domain, isn't drawn.
+    pub fn frame(self, eye: Eye, domain: Box2, low: f32, high: f32) -> (Layout, Vec<Run>) {
+        let e = eye.at.xz
+        let n = f32(HALF)
+        var levels = [vec4(0.0); MOST_LEVELS]
+        // How far the domain reaches from the eye, along x or z.
+        let reach = max(
+            max(abs(domain.lo.x - e.x), abs(domain.hi.x - e.x)),
+            max(
+                abs(domain.lo.y - e.y),
+                abs(domain.hi.y - e.y),
+            ),
+        )
+        var count: u32 = 0
+        var s = self.finest
+        while count < MOST_LEVELS {
+            levels[count] = vec4(snapped(e, 2.0 * s), s, 0.0)
+            count += 1
+            if (n - 1.0) * s >= reach {
+                break
+            }
+            s *= 2.0
+        }
+        let layout = Layout {
+            levels,
+            eye: e,
+            count,
+            spare: 0.0,
+            domain: vec4(domain.lo, domain.hi),
+        }
+        var runs: Vec<Run> = Vec::new()
+        for l in 0..count {
+            let lv = levels[l]
+            let sp = lv.z
+            // Which form: the finest's, whole, or the hole where the level inside lies.
+            var v: u32 = 9
+            var h0 = vec2u(HALF / 2)
+            var h1 = vec2u(3 * HALF / 2)
+            if l > 0 {
+                let o = (levels[l - 1].xy - lv.xy) / sp
+                v = u32(o.y + 1.0) * 3 + u32(o.x + 1.0)
+                let (a, b) = hole(v)
+                h0 = a
+                h1 = b
+            }
+            for part in 0..9 {
+                let k = v * 9 + part
+                if self.count[k] > 0 {
+                    // The part's quads, each way: before the hole, the hole's span, or after.
+                    let col = part % 3
+                    let row = part / 3
+                    let x0 = if col == 0 { 0 } else if col == 1 { h0.x } else { h1.x }
+                    let x1 = if col == 0 { h0.x } else if col == 1 { h1.x } else { 2 * HALF }
+                    let z0 = if row == 0 { 0 } else if row == 1 { h0.y } else { h1.y }
+                    let z1 = if row == 0 { h0.y } else if row == 1 { h1.y } else { 2 * HALF }
+                    let lo = lv.xy + (vec2(f32(x0), f32(z0)) - vec2(n)) * sp
+                    let hi = lv.xy + (vec2(f32(x1), f32(z1)) - vec2(n)) * sp
+                    let off_domain = hi.x < domain.lo.x ||
+                        lo.x > domain.hi.x ||
+                        hi.y < domain.lo.y ||
+                        lo.y > domain.hi.y
+                    let clo = clamp(lo, domain.lo, domain.hi)
+                    let chi = clamp(hi, domain.lo, domain.hi)
+                    let shown = !off_domain &&
+                        !unseen(eye, vec3(clo.x, low, clo.y), vec3(chi.x, high, chi.y))
+                    if shown {
+                        runs.push(
+                            Run {
+                                level: l,
+                                first: self.first[k],
+                                count: self.count[k],
+                                lo: clo,
+                                hi: chi,
+                            },
+                        )
+                    }
+                }
+            }
+        }
+        (layout, runs)
+    }
+}

@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""The only way to launch the host. Usage:
+
+    tools/gpu [--timeout S] [--host PATH] <wrela-host arguments...>
+
+1. The guard: the build the arguments name is refused, before anything runs, if a pipeline's
+   shader keeps more than 8 KiB an invocation in variables of arrays, structs and enums (its
+   functions' locals, summed), as its manifest states it (`kept`, which the compiler counts on
+   every target), or if its manifest doesn't say. A build whose kernels kept
+   54 to 96 KiB an invocation ran its dispatches for tens of seconds on 2026-11-13, starved the
+   display, and WindowServer's watchdog killed every app on the machine
+   (wrela-notes/atoms/scratch/NOTES.md, "INCIDENT 2026-11-13"). Compiled kernels keep 6 KiB or
+   less.
+2. The lock: one GPU job on the machine at a time (tools/gpulock.py); a second waits its turn.
+3. The timeout: the host is killed, with its whole process group, when the wall clock passes
+   `--timeout S` seconds (else `WRELA_GPU_TIMEOUT`, else 120), counted from when it starts
+   (after the lock is taken). It then exits 124.
+4. Everything else goes to `wrela-host` as given: this repository's own (tools/wrela-host, built
+   first if stale), or `--host PATH`'s (a reference host, to compare against).
+
+Exit status: the host's; 3 if the guard refuses the build; 124 if the timeout killed it; 2 for a
+usage error.
+"""
+
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+
+TOOLS = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, TOOLS)
+import gpulock  # noqa: E402
+
+LIMIT = 8 * 1024
+DEFAULT_TIMEOUT = 120.0
+
+# wrela-host's options that take values, and how many: everything else that starts with `--`
+# takes none. The first other argument is the build directory.
+TAKES = {
+    "--frames": 1, "--fps": 1, "--size": 1, "--input": 1, "--png": 1, "--every": 1,
+    "--png-from": 1, "--rgba": 1, "--log": 1, "--capture": 2, "--workers": 1, "--until": 1,
+    "--ticks": 1, "--replay": 1, "--compare-ticks": 2,
+}
+
+
+def build_dir(args):
+    """The build directory `wrela-host args` would run, or None (`--version`, say)."""
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a.startswith("--"):
+            i += 1 + TAKES.get(a, 0)
+        else:
+            return a
+    return None
+
+
+# ---- the guard ---------------------------------------------------------------------------------
+
+
+def guard(build):
+    """Whether `build` may run: its manifest states each pipeline's `kept` (the bytes its shader
+    keeps an invocation, which the compiler counts: every function's locals of arrays, structs and
+    enums, summed), and none is over the limit. Prints each over it, and the largest."""
+    try:
+        with open(os.path.join(build, "manifest.json")) as f:
+            pipelines = json.load(f).get("pipelines", [])
+        kept = [(int(p["kept"]), p["shader"]) for p in pipelines]
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        print(f"gpu: guard: REFUSED {build}: its manifest doesn't say what each pipeline keeps "
+              f"an invocation ({e!r}): build it with this repository's toolchain", file=sys.stderr)
+        return False
+    bad = sorted((k for k in kept if k[0] > LIMIT), reverse=True)
+    for total, name in bad[:10]:
+        print(f"gpu: guard: {name} keeps {total} B an invocation, more than {LIMIT}",
+              file=sys.stderr)
+    if bad:
+        print(f"gpu: guard: REFUSED {build}: {len(bad)} shader(s) over {LIMIT} B", file=sys.stderr)
+    elif kept:
+        total, name = max(kept)
+        print(f"gpu: guard: largest {total} B ({name})", file=sys.stderr)
+    return not bad
+
+
+# ---- the run ------------------------------------------------------------------------------------
+
+
+def main(argv):
+    timeout = os.environ.get("WRELA_GPU_TIMEOUT")
+    host = None
+    while argv and argv[0] in ("--timeout", "--host") or argv and argv[0].startswith("--timeout="):
+        a = argv.pop(0)
+        if a.startswith("--timeout="):
+            timeout = a.split("=", 1)[1]
+        elif not argv:
+            print(f"gpu: {a} takes a value\n{__doc__}", file=sys.stderr)
+            return 2
+        elif a == "--timeout":
+            timeout = argv.pop(0)
+        else:
+            host = argv.pop(0)
+    try:
+        timeout = float(timeout) if timeout is not None else DEFAULT_TIMEOUT
+        assert timeout > 0
+    except (ValueError, AssertionError):
+        print(f"gpu: the timeout is a number of seconds over 0, not `{timeout}`", file=sys.stderr)
+        return 2
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__, file=sys.stderr)
+        return 2
+    build = build_dir(argv)
+    if build is not None:
+        if not os.path.isdir(build):
+            print(f"gpu: {build} isn't a directory", file=sys.stderr)
+            return 2
+        if not guard(build):
+            return 3
+    env = dict(os.environ)
+    if host is None:
+        # Built before the lock is taken, so a build never holds the GPU.
+        built = subprocess.run([os.path.join(TOOLS, "built"), "wrela-host"], stdout=subprocess.DEVNULL)
+        if built.returncode != 0:
+            return built.returncode
+        command = [os.path.join(TOOLS, "wrela-host")] + argv
+        env["WRELA_GPU_HELD"] = "1"
+    else:
+        command = [host] + argv
+    lock = gpulock.take(" ".join(command))
+    child = subprocess.Popen(command, env=env, start_new_session=True)
+
+    def kill(*_):
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(s, lambda n, _f: (kill(), sys.exit(128 + n)))
+    began = time.monotonic()
+    try:
+        status = child.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        kill()
+        child.wait()
+        print(f"gpu: killed the host after {time.monotonic() - began:.0f} s (timeout {timeout:g} s)",
+              file=sys.stderr)
+        return 124
+    finally:
+        lock.close()
+    return status if status >= 0 else 128 - status
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,245 @@
+// A copy of a strand drawn as a ribbon: at each of `segments` + 1 places along it, its centre
+// and two points either side of it, across the way it runs and the way to the eye, its radius
+// out (widened by the rule, `kept`). Opaque triangles, shaded once a pixel straight into the
+// frame's picture (docs/frame.md): colour by the one shading function, the edge record, the
+// identity, the triangles' own depth. No pixel is dropped.
+//
+// Where a copy's placed (`Laid`, worked out once a frame) is apart from its pixel program
+// (`shade`): another eye's depth (the sun's) can take the same corners.
+//
+// The light's normal: a strand's is a tube's, from the way to the eye round to the ribbon's
+// side, leant toward its host's normal (`lean`), so a field of grass reads as one mass with the
+// ground's band edges and not as noise. Its edge record: the way to the nearer of the ribbon's
+// two sides, which are lines on the screen (`side` runs -1 to 1 across it, evenly).
+
+use form::kinds::Strand
+use form::look::{Look, Place, Skin}
+use form::shade::Steps
+use frame::eye::Eye
+use frame::outline::way_to_outline
+use frame::light::{Lighting, worn}
+use frame::picture::{NO_EDGE, STRAND, edge_record, identity}
+use scatter::Wears
+use std::gpu::{ClipPosition, Flat, InstanceIndex, Targets2, Targets3, VertexIndex}
+
+/// A copy as drawn this frame: the strand, the normal its light leans to, how much wider than
+/// it is, the colour it's drawn toward as it's widened, how much of its length it keeps
+/// (`kept::Drawn`), and which copy it is.
+pub struct Laid<S>: Copy + GpuData {
+    pub strand: S,
+    pub host: vec3,
+    pub widen: f32,
+    /// The colour a widened copy is drawn toward (`Wears::mean`), and how much of its length it
+    /// keeps.
+    pub mean: vec3,
+    pub length: f32,
+    pub id: u32,
+}
+
+/// What a ribbon's corner passes to its pixels: where it is, how far across (-1 to 1) and along
+/// (0 to 1) it, what it wears there, the way across it and the way to the eye at right angles
+/// to it (a tube's normal is between them), and its host's normal.
+pub struct Strip: Copy {
+    pub clip: ClipPosition,
+    pub world: vec3,
+    pub side: f32,
+    pub across: vec3,
+    pub t: f32,
+    pub facing: vec3,
+    pub line: f32,
+    pub albedo: vec3,
+    pub host: Flat<vec3>,
+    /// How far its light leans to its host's normal, its own lean drawn further as it's widened.
+    pub lean: Flat<f32>,
+}
+
+/// How many copies one instance of a draw holds. This GPU runs a draw's vertices 32 at a time,
+/// an instance's own: a ribbon of a few vertices an instance left most of each 32 idle.
+pub const BATCH: u32 = 16
+
+/// The triangles of `BATCH` ribbons of `segments` segments each, as corners: ribbon r's vertices
+/// are 2(segments + 1) from r · 2(segments + 1), 2k on one side at place k, 2k + 1 on the other.
+pub fn ribbon_indices(segments: u32) -> Vec<u32> {
+    var out: Vec<u32> = Vec::new()
+    let each = 2 * (segments + 1)
+    for r in 0..BATCH {
+        for k in 0..segments {
+            let a = r * each + 2 * k
+            out.push(a)
+            out.push(a + 1)
+            out.push(a + 2)
+            out.push(a + 1)
+            out.push(a + 3)
+            out.push(a + 2)
+        }
+    }
+    out
+}
+
+/// No corner: all of a skipped copy's corners at one point, so its triangles have no area.
+const NOWHERE = vec4(2.0, 2.0, 2.0, 1.0)
+
+/// Corner `v` of copy `c` drawn as a ribbon of `segments` segments, seen by `eye`, wearing
+/// `look`. With `own` its sides lie across the plane of its root, its tip and up (a flat blade's
+/// own width, turned by the way it arches), not across the way to the eye: the other way,
+/// measured against it.
+pub fn corner_of<S: Strand, L: Wears<S>>(
+    eye: Eye,
+    c: Laid<S>,
+    look: L,
+    segments: u32,
+    v: u32,
+    own: bool,
+    thinnest: f32,
+    lean: f32,
+    contrast: f32,
+) -> Strip {
+    let k = v / 2
+    let side = if v % 2 == 0 { -1.0 } else { 1.0 }
+    let t = f32(k) / f32(segments)
+    let s = c.strand
+    let root = s.at(0.0).xyz
+    let here = s.at(t)
+    // (Its way along, from a little either side: the ends' own way, inward.)
+    let h = 0.25 / f32(segments)
+    let ahead = s.at(min(t + h, 1.0)).xyz
+    let behind = s.at(max(t - h, 0.0)).xyz
+    let centre = root + (here.xyz - root) * c.length
+    var along = ahead - behind
+    along = along / max(length(along), 1.0e-9)
+    let to_eye = eye.at - centre
+    var across = cross(along, to_eye)
+    if own {
+        across = cross(s.at(1.0).xyz - root, vec3(0.0, 1.0, 0.0))
+    }
+    across = across / max(length(across), 1.0e-9)
+    var facing = normalize(cross(across, along))
+    if dot(facing, to_eye) < 0.0 {
+        facing = -facing
+    }
+    // (Its half width, and at least half of `thinnest` px wherever along it.)
+    let half = max(
+        here.w * c.widen,
+        0.5 * thinnest * eye.pixel() * max(dot(centre - eye.at, eye.forward), 0.0),
+    )
+    let p = centre + across * (half * side)
+    let skin = look.skin(
+        s,
+        t,
+        Place { world: p, rest: p, chart: Some(vec2(t, side)), normal: facing },
+    )
+    // A copy widened `w` times stands for `w` copies a pixel's reference would average: its
+    // colour's and its light's difference from their mean drawn in by `w` to the -`contrast`
+    // (after Cook et al. 2007, who draw the kept elements' contrast in so the whole keeps its
+    // variance).
+    let k = pow(c.widen, -contrast)
+    let mean = c.mean
+    Strip {
+        clip: ClipPosition { position: if c.length > 0.0 { eye.clip(p) } else { NOWHERE } },
+        world: p,
+        side,
+        across,
+        t,
+        facing,
+        line: skin.line,
+        albedo: mean + (skin.albedo - mean) * k,
+        host: Flat { value: c.host },
+        lean: Flat { value: 1.0 - (1.0 - lean) * k },
+    }
+}
+
+/// A corner of a copy laid this frame: of the copies `laid` holds (`count[0]` of them), the
+/// instance's `BATCH`, and of them the one vertex `v` is of.
+@vertex
+pub fn corner<S: Strand, L: Wears<S>>(
+    v: VertexIndex,
+    i: InstanceIndex,
+    eye: Eye,
+    laid: [Laid<S>],
+    count: [u32],
+    look: L,
+    segments: u32,
+    own: u32,
+    thinnest: f32,
+    lean: f32,
+    contrast: f32,
+) -> Strip {
+    let each = 2 * (segments + 1)
+    let k = i.index * BATCH + v.index / each
+    let c = laid[min(k, laid.len() - 1)]
+    var s = corner_of(eye, c, look, segments, v.index % each, own == 1, thinnest, lean, contrast)
+    if k >= min(count[0], laid.len()) {
+        s.clip = ClipPosition { position: NOWHERE }
+    }
+    s
+}
+
+/// The nearer of two ways.
+pub fn nearer(a: vec2, b: vec2) -> vec2 {
+    if dot(a, a) <= dot(b, b) { a } else { b }
+}
+
+/// The way from a pixel at `side` across a ribbon (-1 to 1), changing by `g` a pixel across and
+/// down, to the nearer of its two sides (`frame::outline::way_to_outline`, the distance to each
+/// side taken as 0 past it: a pixel just over a side has it through its middle).
+pub fn to_sides(side: f32, g: vec2) -> vec2 {
+    nearer(way_to_outline(max(1.0 - side, 0.0), -g), way_to_outline(max(1.0 + side, 0.0), g))
+}
+
+/// A strand's normal at `side` across its ribbon: a tube's, from `facing` (toward the eye) round
+/// to `across`, leant `lean` of the way to `host`.
+pub fn tube(facing: vec3, across: vec3, side: f32, host: vec3, lean: f32) -> vec3 {
+    let s = clamp(side, -1.0, 1.0)
+    let own = facing * sqrt(max(1.0 - s * s, 0.0)) + across * s
+    normalize(mix(own, host, vec3(lean)))
+}
+
+/// A pixel of a ribbon: lit, its edge, its identity `id`, at its triangle's depth.
+@fragment
+pub fn shade(
+    f: Strip,
+    eye: Eye,
+    light: Lighting,
+    id: u32,
+    edged: f32,
+    ink: f32,
+    cover: u32,
+    lights: const u32,
+) -> Targets3<vec4, vec4, u32> {
+    let g = vec2(dpdx(f.side), dpdy(f.side))
+    // (A ribbon `2 / |g|` px wide writes its sides only where it's at least `edged` px wide:
+    // docs/strands.md, "The edge record".)
+    let wide = 2.0 / max(length(g), 1.0e-6)
+    let way = if wide >= edged { to_sides(f.side, g) } else { NO_EDGE }
+    let n = tube(f.facing, f.across, f.side, f.host.value, f.lean.value)
+    let toward = normalize(eye.at - f.world)
+    let steps = Steps {
+        across: dpdx(f.world),
+        down: dpdy(f.world),
+        normal_across: dpdx(n),
+        normal_down: dpdy(n),
+        relief: vec2(0.0),
+    }
+    let skin = Skin { albedo: f.albedo, line: f.line, metal: 0.0, rim: false }
+    let s = worn(light, skin, f.world, n, toward, steps, live: lights)
+    // (With `cover`, flat white and unlit: a judge's difference is then its cover's alone.)
+    Targets3 {
+        first: if cover == 1 { vec4(1.0, 1.0, 1.0, 0.0) } else { vec4(s.colour, 0.0) },
+        second: edge_record(way, ink, s.line),
+        third: id,
+    }
+}
+
+/// A pixel of a ribbon as a reference's look takes it (`frame::judge`): its colour and the way
+/// its surface faces, its band edges plain (the looks' mean softens them as a pixel would).
+@fragment
+pub fn shade_look(f: Strip, eye: Eye, light: Lighting, cover: u32) -> Targets2<vec4, vec4> {
+    let n = tube(f.facing, f.across, f.side, f.host.value, f.lean.value)
+    let toward = normalize(eye.at - f.world)
+    let skin = Skin { albedo: f.albedo, line: f.line, metal: 0.0, rim: false }
+    let s = worn(light, skin, f.world, n, toward, form::shade::STILL)
+    // (Its normal's `w` 1: a strand met, which the strand judge counts its pixels by.)
+    Targets2 { first: if cover == 1 { vec4(1.0) } else {
+        vec4(s.colour, 1.0)
+    }, second: vec4(n, 1.0) }
+}

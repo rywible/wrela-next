@@ -1,0 +1,697 @@
+// The cloth of his coat's tails: their shape at rest as a sheet chart (`sheet`), sampled once
+// by a grid of nodes (`NODES`); the rules that hold the cloth to him and keep it off him
+// (`Tails`, what wears it, for `chart::cloth`, which steps it); what a pose holds it by each
+// step (`held`); and the table of his trouser legs' radii it's kept off (`LEG_RADII`). From
+// rywible/wrela's content/hakuro/arms.wrela at 7ae6711e.
+
+use chart::cloth::{Held, Node, Wearer, place}
+use form::charts::Sheet
+use form::kinds::Chart
+use shapes::{TAILS_AXIS, TAILS_FROM, TAILS_TO, TAILS_TOP, front_edge, hem, tails}
+use skeleton::{CALF_LEFT, FOOT_LEFT, FOREARM_LEFT, HAND_LEFT, PELVIS, REST, THIGH_LEFT, THIGH_RIGHT}
+use std::collections::Vec
+use std::derive::Box2
+use std::math::TAU
+
+// ---- the sheet at rest ----------------------------------------------------------------------
+
+/// The drape's grid: columns round the tails from one front edge to the other, rows from their
+/// top down to the hem.
+pub const DRAPE_COLS: u32 = 72
+pub const DRAPE_ROWS: u32 = 40
+pub const DRAPE_NODES: u32 = DRAPE_COLS * DRAPE_ROWS
+
+/// How many rows from the top a pose holds (`held`): every node that's pinned at all
+/// (`pinned`) is in them.
+pub const HELD_ROWS: u32 = 10
+pub const HELD: u32 = DRAPE_COLS * HELD_ROWS
+
+/// The point at rest of the cloth's middle at a place: `uv.x` degrees round from straight
+/// ahead (`TAILS_FROM` to `TAILS_TO`), `uv.y` of the way from the tails' top down to the hem
+/// there.
+pub fn at_rest(uv: vec2) -> vec3 {
+    let deg = uv.x
+    let y = TAILS_TOP - (TAILS_TOP - hem(deg)) * uv.y
+    let a = deg * 0.0174532925
+    let out = vec3(sin(a), 0.0, cos(a))
+    let p = vec3(TAILS_AXIS.x, y, TAILS_AXIS.z) + out * 0.2
+    p - out * tails(p).1
+}
+
+/// The tails at rest as a sheet (`at_rest`): round from one front edge (`TAILS_FROM` degrees)
+/// to the other (`TAILS_TO`), down from their top (0) to the hem (1).
+pub fn sheet() -> Chart {
+    Sheet { rest: at_rest, places: Box2 { lo: vec2(TAILS_FROM, 0.0), hi: vec2(TAILS_TO, 1.0) } }
+}
+
+/// The point at rest of the cloth's middle at node (`c`, `r`).
+pub fn node(c: u32, r: u32) -> vec3 {
+    let s = sheet()
+    s.at(place(s.domain(), DRAPE_COLS, DRAPE_ROWS, c, r))
+}
+
+/// The grid's nodes at rest, row by row: each one's point, which way its outside faces (out
+/// from the tails' axis), how much of it is the seam (`sewn`) and how much is cloth (`woven`).
+pub const NODES: [Node; DRAPE_NODES] = nodes()
+
+fn nodes() -> [Node; DRAPE_NODES] {
+    var out = [Node { rest: vec3(0.0), sewn: 0.0, out: vec3(0.0), woven: 0.0 }; DRAPE_NODES]
+    for r in 0..DRAPE_ROWS {
+        for c in 0..DRAPE_COLS {
+            let rest = node(c, r)
+            let flat = vec3(rest.x - TAILS_AXIS.x, 0.0, rest.z - TAILS_AXIS.z)
+            out[r * DRAPE_COLS + c] = Node {
+                rest,
+                sewn: sewn(rest),
+                out: normalize(flat),
+                woven: woven(rest),
+            }
+        }
+    }
+    out
+}
+
+// ---- what holds it to him -------------------------------------------------------------------
+
+/// How much of a point of the tails at rest goes with each of his thighs (`x` his left, `y`
+/// his right), the rest with his hips: a coat's skirt hangs from the hips, but the side over
+/// each leg goes partly where that leg goes. Only a little: the cloth hangs from his hips and
+/// his legs push it; carried further by the thighs, its shape swung the hem out flat with a
+/// leg stepped back.
+fn shares(p: vec3) -> vec2 {
+    // How far down the tails (from their top under the jacket's hem to about the knee).
+    let t = clamp((0.98 - p.y) / 0.36, 0.0, 1.0)
+    let share = 0.2 * t * t * (3.0 - 2.0 * t)
+    // Over which leg: his left (+x) or right, eased across the middle of his back.
+    let lean = clamp(p.x / 0.15, -1.0, 1.0)
+    let left = share * (0.5 + 0.5 * lean)
+    vec2(left, share - left)
+}
+
+/// A point of the tails at rest carried by his hips and thighs as `palettes` (from `first`)
+/// pose them, as a skin is: their matrices blended by its `shares`.
+fn tails_skinned(rest: vec3, palettes: [mat4], first: u32) -> vec3 {
+    let w = shares(rest)
+    let m = palettes[first + PELVIS] * (1.0 - w.x - w.y) +
+        palettes[first + THIGH_LEFT] * w.x +
+        palettes[first + THIGH_RIGHT] * w.y
+    (m * vec4(rest, 1.0)).xyz
+}
+
+/// `rest` turned by `share` of what `thigh` (a thigh's matrix) turns from `hips` (his hips'),
+/// about that thigh's joint (`joint`, at rest), in his hips' own space.
+fn part_turned(rest: vec3, hips: mat4, thigh: mat4, joint: vec3, share: f32) -> vec3 {
+    if share <= 0.0 {
+        return rest
+    }
+    // The thigh's turn from his hips, as an axis and an angle.
+    // (His hips' turn undone: each of the thigh's axes along his hips' own.)
+    let (h0, h1, h2) = (hips[0].xyz, hips[1].xyz, hips[2].xyz)
+    let across = |c: vec3| vec3(dot(h0, c), dot(h1, c), dot(h2, c))
+    let r = mat3(across(thigh[0].xyz), across(thigh[1].xyz), across(thigh[2].xyz))
+    let lean = vec3(r[1][2] - r[2][1], r[2][0] - r[0][2], r[0][1] - r[1][0])
+    let s = 0.5 * length(lean)
+    if s < 1.0e-5 {
+        return rest
+    }
+    let angle = atan2(s, 0.5 * (r[0][0] + r[1][1] + r[2][2] - 1.0)) * share
+    let k = lean / (2.0 * s)
+    let d = rest - joint
+    joint + d * cos(angle) + cross(k, d) * sin(angle) + k * dot(k, d) * (1.0 - cos(angle))
+}
+
+/// Where the cloth's shape has a point of the tails (`rest`) as `palettes` (from `first`)
+/// pose him: carried by his hips, and turned about each thigh's joint by that thigh's share
+/// (`shares`) of its turn. (`tails_skinned` puts it a share of the way to where the thigh
+/// would carry it, which is nearer the joint: with a thigh lifted square to his hips a sixth
+/// nearer. The cloth, as long as ever, had to gather to lie on that shape, and its front edge
+/// ruffled at every high step.)
+fn tails_carried(rest: vec3, palettes: [mat4], first: u32) -> vec3 {
+    let w = shares(rest)
+    let hips = palettes[first + PELVIS]
+    let left = part_turned(rest, hips, palettes[first + THIGH_LEFT], HIP_L, w.x)
+    let right = part_turned(rest, hips, palettes[first + THIGH_RIGHT], HIP_R, w.y)
+    (hips * vec4(left + right - rest, 1.0)).xyz
+}
+
+/// The joints the cloth's step reads, each its own constant: read from `REST` by a number the
+/// GPU works out, the whole table of 57 joints was built in each invocation's own memory, twice a
+/// node a pass (the cloth's 18 passes took 6.6 ms at 4K; docs/limbs.md).
+const HIP_L: vec3 = REST[THIGH_LEFT]
+const HIP_R: vec3 = REST[THIGH_RIGHT]
+const KNEE_L: vec3 = REST[CALF_LEFT]
+const KNEE_R: vec3 = REST[CALF_LEFT + 1]
+const ANKLE_L: vec3 = REST[CALF_LEFT + 2]
+const ANKLE_R: vec3 = REST[CALF_LEFT + 3]
+const ELBOW_L: vec3 = REST[FOREARM_LEFT]
+const ELBOW_R: vec3 = REST[FOREARM_LEFT + 1]
+const WRIST_L: vec3 = REST[HAND_LEFT]
+const WRIST_R: vec3 = REST[HAND_LEFT + 1]
+
+/// `REST[THIGH_LEFT + 2 * seg + side]`, from the constants.
+fn upper_joint(side: u32, seg: u32) -> vec3 {
+    if seg == 0 {
+        return if side == 0 { HIP_L } else { HIP_R }
+    }
+    if side == 0 { KNEE_L } else { KNEE_R }
+}
+
+/// `REST[CALF_LEFT + 2 * seg + side]`, from the constants.
+fn lower_joint(side: u32, seg: u32) -> vec3 {
+    if seg == 0 {
+        return if side == 0 { KNEE_L } else { KNEE_R }
+    }
+    if side == 0 { ANKLE_L } else { ANKLE_R }
+}
+
+/// How much of the cloth's own shape it keeps each step: drawn this far toward where his hips
+/// carry it at rest (its A-line and pleats), the rest left to its weight, its swing and his
+/// legs.
+pub const SHAPE: f32 = 0.15
+/// How much of its swing it keeps from step to step (air and its own stiffness take the rest).
+pub const KEEP: f32 = 0.75
+/// How many times a step each node is pulled back to its neighbours' distances.
+pub const RELAXES: u32 = 16
+
+/// Where `rest` (a node of the cloth, its column's top at `top`) would hang: carried by his
+/// hips as the tails are, but swung back toward `plumb` below the jacket's hem the further
+/// down it is, as cloth hangs. (Carried stiffly, a tilt of his hips stood the tails' hem out
+/// like a shelf when he leaned out over the skiff's rail.)
+fn hung(rest: vec3, top: vec3, plumb: vec3, palettes: [mat4], first: u32) -> vec3 {
+    let at = tails_carried(rest, palettes, first)
+    let w = 0.85 * smoothstep(0.0, 0.45, top.y - rest.y)
+    if w <= 0.0 {
+        return at
+    }
+    let anchor = tails_carried(top, palettes, first)
+    let below = tails_carried(top - vec3(0.0, 0.3, 0.0), palettes, first)
+    let down = normalize(below - anchor)
+    let axis = cross(down, plumb)
+    let s = length(axis)
+    if s < 1.0e-4 {
+        return at
+    }
+    let k = axis / s
+    let angle = atan2(s, dot(down, plumb)) * w
+    let v = at - anchor
+    let c = cos(angle)
+    anchor + v * c + cross(k, v) * sin(angle) + k * dot(k, v) * (1.0 - c)
+}
+
+/// How far the cloth hangs back from straight down for his speed squared (the tangent of the
+/// angle, for each (m/s)²): 25° at a run's 4 m/s, 3° at a walk.
+pub const STREAM: f32 = 0.029
+
+/// Plumb in the air he's going through, as `palettes` (from `first`) pose him: going `going`
+/// m/s the way his hips face, the cloth hangs back from straight down by the air's push,
+/// which grows as his speed squared. (Hanging straight down at a run, his coat's tails only
+/// swung: they never streamed.)
+pub fn plumb(palettes: [mat4], first: u32, going: f32) -> vec3 {
+    let ahead = palettes[first + PELVIS][2].xyz
+    let back = -normalize(vec3(ahead.x, 0.0, ahead.z))
+    normalize(vec3(0.0, -1.0, 0.0) + back * (STREAM * going * going))
+}
+
+/// How firmly a node is held where his hips carry it: wholly along the seam where the tails
+/// carry on from his jacket (their top centimetre and a half), free from 8 cm below it. (Held
+/// a hand's width down, as they were when their top was tucked under a longer jacket, a thigh
+/// lifted in a stride came through the held cloth at his hip: it couldn't ride up over it.)
+pub fn pinned(rest: vec3) -> f32 {
+    let u = clamp((rest.y - 0.85) / 0.065, 0.0, 1.0)
+    u * u * (3.0 - 2.0 * u)
+}
+
+/// How much a node is the seam itself (1 along the tails' top edge, none from 2.5 cm under
+/// it): his jacket's hem carried on, which goes where the jacket does.
+pub fn sewn(rest: vec3) -> f32 {
+    smoothstep(0.9, 0.925, rest.y)
+}
+
+/// How much of a node is cloth (1 within the tails' front edges, none from 8° past one): the
+/// grid runs on in front of the edges where they're cut back (`shapes::front_edge`), and its
+/// nodes there are no cloth. Kept off a thigh that lifted through them, they stood away from
+/// the cloth beside them, column by column, and the edge between was drawn in steps.
+pub fn woven(rest: vec3) -> f32 {
+    let rel = rest - TAILS_AXIS
+    var deg = atan2(rel.x, rel.z) * 57.2957795
+    if deg < 0.0 {
+        deg += 360.0
+    }
+    let edge = front_edge(rest.y)
+    1.0 - smoothstep(0.0, 8.0, max(edge - deg, deg - (360.0 - edge)))
+}
+
+/// Where his hips are as `palettes` (from `first`) pose him: what the tails hang from.
+fn hips_of(palettes: [mat4], first: u32) -> vec3 {
+    (palettes[first + PELVIS] * vec4(REST[PELVIS], 1.0)).xyz
+}
+
+/// What `palette` (each of his bones' matrices, from him at rest to where the pose has him)
+/// holds his tails by, him going `going` m/s the way his hips face through still air (0: the
+/// air goes with him, or he's standing): each held node where his hips and thighs carry it
+/// and how firmly (`pinned`), where his hips are, and plumb in the air: what the cloth's step
+/// takes from his pose (`chart::cloth::Drape::hold`). It reads his nodes at rest from `NODES`,
+/// no form: about 0.05 ms a call.
+pub fn held(palette: [mat4; 64], going: f32) -> Held {
+    var at: Vec<vec4> = Vec::new()
+    for i in 0..HELD {
+        let rest = NODES[i].rest
+        at.push(vec4(tails_skinned(rest, palette, 0), pinned(rest)))
+    }
+    Held { at, root: hips_of(palette, 0), plumb: plumb(palette, 0, going) }
+}
+
+// ---- what it's kept off -----------------------------------------------------------------------
+
+/// How far off his trouser legs' sides the cloth is kept (m): where it hangs free, and where
+/// it's pinned up under his jacket's hem (only so a thigh swung out doesn't come through it:
+/// kept as clear there as below, its top stood out past the hem as a ledge).
+pub const CLEAR_OF_LEG: f32 = 0.012
+pub const CLEAR_PINNED: f32 = 0.003
+
+/// How far along a leg's path at rest his hip's joint is, and his knee's (m): the path starts
+/// 8 cm over his hip (`figure::chains::leg_left`).
+const HIP_ALONG: f32 = 0.08
+const KNEE_ALONG: f32 = 0.509
+
+/// His trouser legs' radii at rest, as a table the cloth's step reads (`LEG_RADII`): for each
+/// leg (his left, his right) and each of its two lengths (thigh, shin), `LEG_ROWS` places
+/// along it by `LEG_COLS` angles round it. A thigh's rows start `ABOVE_HIP` of its length over
+/// his hip's joint, where his trousers' seat is.
+pub const LEG_ROWS: u32 = 24
+pub const LEG_COLS: u32 = 32
+pub const ABOVE_HIP: f32 = 0.18
+pub const LEG_TABLE: u32 = 2 * 2 * LEG_ROWS * LEG_COLS
+
+/// The joints either end of length `seg` (0 his thigh, 1 his shin) of his leg on `side` (0
+/// his left), at rest.
+pub fn leg_ends(side: u32, seg: u32) -> (vec3, vec3) {
+    (upper_joint(side, seg), lower_joint(side, seg))
+}
+
+/// Where on length `seg` of a leg row `i` of the table is: how far along it from its upper
+/// joint, of its length (a thigh's rows start `ABOVE_HIP` over his hip).
+pub fn leg_row(seg: u32, i: u32) -> f32 {
+    let from = if seg == 0 { -ABOVE_HIP } else { 0.0 }
+    mix(from, 1.0, f32(i) / f32(LEG_ROWS - 1))
+}
+
+/// The way round a leg column `j` of the table is: from his front (`+z`), toward his left.
+pub fn leg_way(j: u32) -> vec3 {
+    let phi = TAU * f32(j) / f32(LEG_COLS)
+    vec3(sin(phi), 0.0, cos(phi))
+}
+
+/// His trouser legs' radii at rest about each of their straight lengths, read off his charted
+/// legs (`hakuro::charts`): how far the leg's side is from the length's line, at each row's
+/// place along it and each column's angle round it (from his front, toward his left). Leg by
+/// leg, length by length, row by row.
+pub fn leg_reads() -> [f32; LEG_TABLE] {
+    let parts = hakuro::charts()
+    var radii = [0.0; LEG_TABLE]
+    for side in 0..2 {
+        let leg = parts[4 + side].rest()
+        let whole = leg.path.length()
+        for seg in 0..2 {
+            let (a, b) = leg_ends(side, seg)
+            let e = b - a
+            for i in 0..LEG_ROWS {
+                let h = leg_row(seg, i)
+                let along = (if seg == 0 { HIP_ALONG } else { KNEE_ALONG }) + h * length(e)
+                let fr = leg.path.frame(along)
+                let on = a + e * h
+                for j in 0..LEG_COLS {
+                    let way = leg_way(j)
+                    let theta = atan2(dot(way, fr.left), dot(way, fr.up))
+                    let k = ((side * 2 + seg) * LEG_ROWS + i) * LEG_COLS + j
+                    radii[k] = length(leg.side(f: along / whole, theta: theta) - on)
+                }
+            }
+        }
+    }
+    radii
+}
+
+/// The table the cloth is kept off: `leg_reads`, each place the most of itself and the places
+/// round it (a row either way, held at the ends; a column either way, round). Read between
+/// places, a fold of his trousers finer than the table stood through the cloth as specks. A
+/// trouser leg is 8 cm deep one way and 15 the other: a capsule fat enough for the one let the
+/// cloth lie inside the other, and his thigh came through his coat's skirt wherever he stood
+/// with a leg out. The form's own side read at every node every pass (`Limb::toward`) kept the
+/// cloth off it as well and took 90 ms a frame; the table is that side, read once, when the
+/// game is built.
+pub const LEG_RADII: [f32; LEG_TABLE] = hull(leg_reads())
+
+/// Each place of a table of `LEG_ROWS` by `LEG_COLS` places a length, the most of itself and
+/// the places round it.
+pub fn hull(radii: [f32; LEG_TABLE]) -> [f32; LEG_TABLE] {
+    var out = [0.0; LEG_TABLE]
+    for k in 0..4 {
+        for i in 0..LEG_ROWS {
+            for j in 0..LEG_COLS {
+                var most = 0.0
+                for di in 0..3 {
+                    for dj in 0..3 {
+                        let ii = u32(clamp(i32(i) + i32(di) - 1, 0, i32(LEG_ROWS) - 1))
+                        let jj = (j + dj + LEG_COLS - 1) % LEG_COLS
+                        most = max(most, radii[(k * LEG_ROWS + ii) * LEG_COLS + jj])
+                    }
+                }
+                out[(k * LEG_ROWS + i) * LEG_COLS + j] = most
+            }
+        }
+    }
+    out
+}
+
+/// His middle between his hips as `palette` (from `first`) poses him: the cloth hangs outside
+/// his legs, out from it.
+fn middle(palette: [mat4], first: u32) -> vec3 {
+    ((palette[first + THIGH_LEFT] * vec4(HIP_L, 1.0)).xyz +
+        (palette[first + THIGH_RIGHT] * vec4(HIP_R, 1.0)).xyz) *
+        0.5
+}
+
+/// `p` (a node of the cloth) kept `clear` off his trouser legs as `palette` (from `first`)
+/// poses them (`legs`: `LEG_RADII`), where that moves it no more than about `most` (m). The
+/// cloth's point is taken back to him at rest by his thigh's bone and by his shin's in turn,
+/// and where it's by that bone's length of the leg it's kept clear of the leg's side there,
+/// out from the length's line.
+fn off_trousers(p: vec3, palette: [mat4], first: u32, legs: [f32], clear: f32, most: f32) -> vec3 {
+    var q = p
+    let mid = middle(palette, first)
+    for side in 0..2 {
+        for seg in 0..2 {
+            // (His thigh's bone, then his shin's.)
+            let m = palette[first + THIGH_LEFT + 2 * seg + side]
+            let off = q - m[3].xyz
+            let back = vec3(dot(m[0].xyz, off), dot(m[1].xyz, off), dot(m[2].xyz, off))
+            let (a, b) = leg_ends(side, seg)
+            let e = b - a
+            let h = dot(back - a, e) / dot(e, e)
+            let from = if seg == 0 { -ABOVE_HIP } else { 0.0 }
+            if h > from && h < 1.0 {
+                let d = back - (a + e * h)
+                let rho = length(d)
+                // The leg's radius there: between the table's rows and columns.
+                let row = (h - from) / (1.0 - from) * f32(LEG_ROWS - 1)
+                let col = fract(atan2(d.x, d.z) / TAU + 1.0) * f32(LEG_COLS)
+                let i0 = min(u32(floor(row)), LEG_ROWS - 2)
+                let j0 = u32(floor(col)) % LEG_COLS
+                let j1 = (j0 + 1) % LEG_COLS
+                let fi = clamp(row - f32(i0), 0.0, 1.0)
+                let fj = col - floor(col)
+                let base = ((side * 2 + seg) * LEG_ROWS + i0) * LEG_COLS
+                let r = mix(
+                    mix(legs[base + j0], legs[base + j1], fj),
+                    mix(legs[base + LEG_COLS + j0], legs[base + LEG_COLS + j1], fj),
+                    fi,
+                )
+                let need = r + clear - rho
+                if need > 0.0 && rho > 1.0e-5 {
+                    var n = (m * vec4(d / rho, 0.0)).xyz
+                    // (Off a leg always to its outer side, seen from his middle: pushed
+                    // straight off it, cloth just beside a leg kicked back slid round it and
+                    // the leg came out behind the coat.)
+                    let flat = vec3(q.x - mid.x, 0.0, q.z - mid.z)
+                    let fl = length(flat)
+                    if fl > 1.0e-4 {
+                        let o = flat / fl
+                        let outer = dot(n, o)
+                        if outer < 0.3 {
+                            n = normalize(n + o * (0.3 - outer) * 2.0)
+                        }
+                    }
+                    // (All the way clear if that's no more than `most`; less the deeper in
+                    // it is, and not at all from twice `most`.)
+                    q = q + n * need * (1.0 - smoothstep(most, 2.0 * most, need))
+                }
+            }
+        }
+    }
+    q
+}
+
+/// `p` (a node of the cloth, at rest `rest`) kept off his boots and arms as `palette` (from
+/// `first`) poses them: straight off each boot, forearm and hand, a capsule each, a couple of
+/// centimetres clear (less however far into a boot's the cloth already hangs at rest). His
+/// trouser legs are `off_trousers`'.
+fn off_legs_now(p: vec3, rest: vec3, palette: [mat4], first: u32) -> vec3 {
+    var q = p
+    let mid = middle(palette, first)
+    for side in 0..2 {
+        let sx = if side == 0 { 1.0 } else { -1.0 }
+        let foot = palette[first + FOOT_LEFT + side]
+        let hand = palette[first + HAND_LEFT + side]
+        let heel = (foot * vec4(0.124 * sx, 0.065, -0.13, 1.0)).xyz
+        let toe = (foot * vec4(0.124 * sx, 0.055, 0.14, 1.0)).xyz
+        let elbow = (palette[first + FOREARM_LEFT + side] *
+            vec4(if side == 0 { ELBOW_L } else { ELBOW_R }, 1.0)).xyz
+        let wrist = (hand * vec4(if side == 0 { WRIST_L } else { WRIST_R }, 1.0)).xyz
+        let knuckle = (hand * vec4(0.86 * sx, 1.45, -0.05, 1.0)).xyz
+        for k in 0..3 {
+            let a = if k == 0 { heel } else if k == 1 { elbow } else { wrist }
+            let b = if k == 0 { toe } else if k == 1 { wrist } else { knuckle }
+            let ra = if k == 0 { 0.085 } else if k == 1 { 0.055 } else { 0.042 }
+            let rb = if k == 0 { 0.075 } else if k == 1 { 0.042 } else { 0.045 }
+            // (How far in the capsule the cloth hangs at rest: his boot's only, his arms are
+            // clear.)
+            var inside = 0.0
+            if k == 0 {
+                let ar = vec3(0.124 * sx, 0.065, -0.13)
+                let er = vec3(0.124 * sx, 0.055, 0.14) - ar
+                let hr = clamp(dot(rest - ar, er) / dot(er, er), 0.0, 1.0)
+                inside = max(mix(ra, rb, hr) + 0.02 - length(rest - (ar + er * hr)), 0.0)
+            }
+            let e = b - a
+            let h = clamp(dot(q - a, e) / dot(e, e), 0.0, 1.0)
+            let off = q - (a + e * h)
+            let d = length(off)
+            let r = mix(ra, rb, h) + 0.02 - inside
+            if r - d > 0.0 && d > 1.0e-5 {
+                var n = off / d
+                // (Off a boot always to its outer side, seen from his middle: pushed straight
+                // off it, cloth just beside a heel kicked back slid round it and the boot came
+                // out behind the coat.)
+                if k == 0 {
+                    let flat = vec3(q.x - mid.x, 0.0, q.z - mid.z)
+                    let fl = length(flat)
+                    if fl > 1.0e-4 {
+                        let o = flat / fl
+                        let outer = dot(n, o)
+                        if outer < 0.3 {
+                            n = normalize(n + o * (0.3 - outer) * 2.0)
+                        }
+                    }
+                }
+                // Out along it until clear of the capsule.
+                let along = dot(off, n)
+                let across = length(off - n * along)
+                let need = sqrt(max(r * r - across * across, 0.0)) - along
+                if need > 0.0 {
+                    q = q + n * need
+                }
+            }
+        }
+    }
+    q
+}
+
+// ---- what wears it ----------------------------------------------------------------------------
+
+/// Hakuro as what wears his coat's tails (`chart::cloth::Wearer`): his rules above.
+pub struct Tails: Copy + GpuData {}
+
+impl Wearer for Tails {
+    const COLS: u32 = DRAPE_COLS
+    const ROWS: u32 = DRAPE_ROWS
+    const HELD_ROWS: u32 = HELD_ROWS
+    const SHAPE: f32 = SHAPE
+    const KEEP: f32 = KEEP
+    const RELAXES: u32 = RELAXES
+
+    fn hung(self, rest: vec3, top: vec3, plumb: vec3, palette: [mat4], first: u32) -> vec3 {
+        hung(rest, top, plumb, palette, first)
+    }
+
+    fn skinned(self, rest: vec3, palette: [mat4], first: u32) -> vec3 {
+        tails_skinned(rest, palette, first)
+    }
+
+    fn off_body(self, p: vec3, rest: vec3, palette: [mat4], first: u32) -> vec3 {
+        off_legs_now(p, rest, palette, first)
+    }
+
+    fn off_legs(self, p: vec3, held: bool, palette: [mat4], first: u32, legs: [f32]) -> vec3 {
+        let clear = if held { CLEAR_PINNED } else { CLEAR_OF_LEG }
+        off_trousers(p, palette, first, legs, clear, 10.0)
+    }
+}
+
+// ---- tests ------------------------------------------------------------------------------------
+
+const SAME: mat4 = mat4(
+    vec4(1.0, 0.0, 0.0, 0.0),
+    vec4(0.0, 1.0, 0.0, 0.0),
+    vec4(0.0, 0.0, 1.0, 0.0),
+    vec4(0.0, 0.0, 0.0, 1.0),
+)
+
+@test
+fn his_tails_at_rest_are_a_sheet_round_him_from_one_front_edge_to_the_other() {
+    // Its columns run from 42 degrees round from straight ahead to 318, its rows from the
+    // tails' top to the hem.
+    let d = sheet().domain()
+    assert(d.lo == vec2(42.0, 0.0) && d.hi == vec2(318.0, 1.0))
+    let deg = |p: vec3| {
+        let rel = p - TAILS_AXIS
+        var a = atan2(rel.x, rel.z) * 57.2957795
+        if a < 0.0 {
+            a += 360.0
+        }
+        a
+    }
+    for r in [0, DRAPE_ROWS / 2, DRAPE_ROWS - 1] {
+        assert(abs(deg(node(0, r)) - 42.0) < 0.001, f"{deg(node(0, r))} at row {r}")
+        assert(abs(deg(node(DRAPE_COLS - 1, r)) - 318.0) < 0.001)
+        assert(abs(node(0, DRAPE_ROWS - 1).y - hem(42.0)) < 1.0e-5)
+    }
+    // Its top row is the tails' top, and lies on their shape: on the middle of the cloth
+    // (within a tenth of a millimetre), so inside it and within half its thickness (9 mm) of
+    // its face.
+    for c in 0..DRAPE_COLS {
+        let p = node(c, 0)
+        let (d, through) = tails(p)
+        assert(abs(p.y - TAILS_TOP) < 1.0e-6)
+        assert(abs(through) < 0.0001, f"{through} m off the cloth's middle at column {c}")
+        assert(d <= 0.0001 && d >= -0.0091, f"{d} m from the tails' face at column {c}")
+        assert(NODES[c].rest == p)
+    }
+}
+
+@test
+fn the_held_nodes_are_where_his_hips_hold_them() {
+    // Every node that's pinned at all is in the rows a pose holds.
+    for c in 0..DRAPE_COLS {
+        assert(pinned(node(c, HELD_ROWS)) == 0.0, f"column {c} is pinned below the held rows")
+    }
+    // At rest each is where it is at rest, held as firmly as it's pinned.
+    let still = held([SAME; 64], 0.0)
+    assert(still.at.len() == HELD)
+    for i in 0..HELD {
+        let rest = NODES[i].rest
+        assert(length(still.at[i].xyz - rest) < 1.0e-6, f"node {i} is held off its rest")
+        assert(still.at[i].w == pinned(rest))
+    }
+    assert(length(still.root - TAILS_AXIS) < 1.0e-6 && still.plumb == vec3(0.0, -1.0, 0.0))
+    // Moved whole (turned 30 degrees about up, and carried 0.3 m left, 0.1 down, 0.5 ahead),
+    // each is held where that moves it, and so is his hips' point.
+    let (s, c) = (sin(TAU / 12.0), cos(TAU / 12.0))
+    let moved = mat4(
+        vec4(c, 0.0, -s, 0.0),
+        vec4(0.0, 1.0, 0.0, 0.0),
+        vec4(s, 0.0, c, 0.0),
+        vec4(0.3, -0.1, 0.5, 1.0),
+    )
+    let carried = held([moved; 64], 0.0)
+    for i in 0..HELD {
+        let want = (moved * vec4(NODES[i].rest, 1.0)).xyz
+        assert(
+            length(carried.at[i].xyz - want) < 1.0e-5,
+            f"node {i} is held off by {length(carried.at[i].xyz - want)}",
+        )
+    }
+    assert(length(carried.root - (moved * vec4(TAILS_AXIS, 1.0)).xyz) < 1.0e-6)
+}
+
+@test
+fn his_legs_table_is_his_legs_forms_read_once() {
+    // Each place of the table, out from its length's line its way round, is on the side of
+    // his charted leg there: within 1.5 mm.
+    let parts = hakuro::charts()
+    let reads = leg_reads()
+    var worst = 0.0
+    for side in 0..2 {
+        let leg = parts[4 + side].rest()
+        for seg in 0..2 {
+            let (a, b) = leg_ends(side, seg)
+            let e = b - a
+            for i in 0..LEG_ROWS {
+                let on = a + e * leg_row(seg, i)
+                for j in 0..LEG_COLS {
+                    let way = leg_way(j)
+                    let out = normalize(way - e * (dot(way, e) / dot(e, e)))
+                    let r = reads[((side * 2 + seg) * LEG_ROWS + i) * LEG_COLS + j]
+                    worst = max(worst, abs(leg.near(on + out * r)))
+                }
+            }
+        }
+    }
+    assert(worst < 0.0015, f"a place of the table is {worst} m off his leg")
+    // And the cloth's table is each place the most of the nine round it.
+    for k in 0..4 {
+        for i in 0..LEG_ROWS {
+            for j in 0..LEG_COLS {
+                var most = 0.0
+                for ii in [max(i, 1) - 1, i, min(i + 1, LEG_ROWS - 1)] {
+                    for jj in [(j + LEG_COLS - 1) % LEG_COLS, j, (j + 1) % LEG_COLS] {
+                        most = max(most, reads[(k * LEG_ROWS + ii) * LEG_COLS + jj])
+                    }
+                }
+                assert(LEG_RADII[(k * LEG_ROWS + i) * LEG_COLS + j] == most)
+            }
+        }
+    }
+}
+
+@test
+fn the_tails_hang_back_in_the_air_he_runs_through() {
+    // The middle of the tails' hem behind him, as he stands at rest: where his hips carry it
+    // in still air, and at a run's 4 m/s swung back and up about where it hangs from, by a
+    // fifth of a metre and more.
+    let palette = [SAME; 64]
+    let hem = node(DRAPE_COLS / 2, DRAPE_ROWS - 1)
+    let top = node(DRAPE_COLS / 2, 0)
+    let standing = hung(hem, top, plumb(palette, 0, 0.0), palette, 0)
+    assert(length(standing - hem) < 0.0001)
+    let running = hung(hem, top, plumb(palette, 0, 4.0), palette, 0)
+    assert(running.z < standing.z - 0.15 && running.y > standing.y, f"{running.z - standing.z}")
+    // At a walk it hardly stirs.
+    let walking = hung(hem, top, plumb(palette, 0, 1.4), palette, 0)
+    assert(length(walking - standing) < 0.04)
+}
+
+@test
+fn the_tails_shape_keeps_its_length_from_a_lifted_thighs_joint() {
+    // His right thigh lifted square to his hips (a quarter turn about its joint, his knee
+    // forward): a point of the tails over that thigh, a third of a metre under its joint.
+    let joint = REST[THIGH_RIGHT]
+    // (About +x through the joint, by -90°: down goes to ahead.)
+    let lifted = mat4(
+        vec4(1.0, 0.0, 0.0, 0.0),
+        vec4(0.0, 0.0, -1.0, 0.0),
+        vec4(0.0, 1.0, 0.0, 0.0),
+        vec4(0.0, joint.y - joint.z, joint.z + joint.y, 1.0),
+    )
+    assert(length((lifted * vec4(joint, 1.0)).xyz - joint) < 1.0e-5)
+    assert(
+        length(
+            (lifted * vec4(joint - vec3(0.0, 0.3, 0.0), 1.0)).xyz - (joint + vec3(0.0, 0.0, 0.3)),
+        ) <
+            1.0e-5,
+    )
+    var palette = [SAME; 64]
+    palette[THIGH_RIGHT] = lifted
+    let rest = vec3(-0.16, 0.64, 0.05)
+    let share = shares(rest).y
+    assert(share > 0.15, f"the thigh's share is {share}")
+    // Carried, it's as far from the joint as at rest, and turned that share of the quarter
+    // turn; a share of the way to where the thigh would take it is nearer the joint.
+    let far = length(rest - joint)
+    let carried = tails_carried(rest, palette, 0)
+    assert(abs(length(carried - joint) - far) < 1.0e-4, f"{length(carried - joint)} of {far}")
+    let turn = acos(dot(normalize(carried - joint), normalize(rest - joint)))
+    assert(abs(turn - share * 1.5707963) < 0.02, f"turned {turn}")
+    let skinned = tails_skinned(rest, palette, 0)
+    assert(length(skinned - joint) < far * 0.9, f"{length(skinned - joint)} of {far}")
+}

@@ -1,0 +1,5463 @@
+// GPU buffers, textures and passes, the builtins of GPU entry points, and the CPU calls that
+// record GPU work: dispatches, draws, copies and readbacks (language.md §18, §18.3). Every
+// function here that CPU code calls carries the `host` effect.
+
+use std::abi::{
+    COMPARE_ALWAYS, COMPARE_EQUAL, COMPARE_GREATER, COMPARE_GREATER_EQUAL, COMPARE_LESS,
+    COMPARE_LESS_EQUAL, COMPARE_NEVER, COMPARE_NOT_EQUAL, FORMAT_DEPTH32FLOAT, FORMAT_R16FLOAT,
+    FORMAT_R16FLOAT_BYTES, FORMAT_R32FLOAT, FORMAT_R32FLOAT_BYTES, FORMAT_R32UINT,
+    FORMAT_R32UINT_BYTES, FORMAT_RG16FLOAT, FORMAT_RG16FLOAT_BYTES, FORMAT_RGBA16FLOAT,
+    FORMAT_RGBA16FLOAT_BYTES, FORMAT_RGBA8UNORM, FORMAT_RGBA8UNORM_BYTES, FORMAT_R8UNORM,
+    FORMAT_R8UNORM_BYTES, FORMAT_RG8UNORM, FORMAT_RG8UNORM_BYTES, FORMAT_RGB10A2UNORM,
+    FORMAT_RGB10A2UNORM_BYTES, FORMAT_RG32FLOAT, FORMAT_RG32FLOAT_BYTES, FORMAT_RGBA32FLOAT,
+    FORMAT_RGBA32FLOAT_BYTES, FORMAT_RG32UINT, FORMAT_RG32UINT_BYTES, FORMAT_RG11B10UFLOAT,
+    FORMAT_RG11B10UFLOAT_BYTES, FORMAT_BC1_RGBA_UNORM, FORMAT_BC1_RGBA_UNORM_BYTES,
+    FORMAT_BC4_R_UNORM, FORMAT_BC4_R_UNORM_BYTES, FORMAT_BC5_RG_UNORM, FORMAT_BC5_RG_UNORM_BYTES,
+    FORMAT_BC7_RGBA_UNORM, FORMAT_BC7_RGBA_UNORM_BYTES, FORMAT_ETC2_RGB8UNORM,
+    FORMAT_ETC2_RGB8UNORM_BYTES, FORMAT_ASTC_4X4_UNORM, FORMAT_ASTC_4X4_UNORM_BYTES, KIND_2D,
+    KIND_3D, KIND_ARRAY, KIND_CUBE, MAX_LAYERS, MAX_TEXTURE_3D, TEXTURE_WRITABLE,
+    FORMAT_DEPTH32FLOAT_BYTES,
+}
+use std::io::{IoError, Pending, next_request}
+use std::mem::{Drop, gpu_count, own_gpu_count, set_gpu_count, size_of}
+
+/// A buffer of `T`s on the GPU: an owned value, which CPU code creates, writes into and passes
+/// to kernels and shaders, but can't read through. Dropping it releases it; the host
+/// waits for work already recorded with it. A buffer in the program's state lasts with it.
+pub struct GpuBuffer<T> {
+    // The compiler binds a buffer by these two fields, in this order.
+    handle: u32,
+    count: u32,
+}
+
+impl<T> Drop for GpuBuffer<T> {
+    fn drop(mut self) {
+        if self.handle != 0 {
+            destroy_buffer(self.handle)
+            count_memory(BUFFERS, buffer_bytes::<T>(self.count), add: false)
+        }
+    }
+}
+
+impl<T: GpuData> GpuBuffer<T> {
+    /// How many elements it holds.
+    pub fn len(self) -> u32 {
+        self.count
+    }
+
+    /// All its elements, read-only: a `GpuSpan<T>` of them. A bound entry point holds a buffer
+    /// given for a `[T]` parameter as this span (§18).
+    pub fn items(self) -> GpuSpan<T> {
+        GpuSpan { buffer: self, start: 0, count: self.count }
+    }
+
+    /// All its elements, to change: a `GpuSpanMut<T>` of them. A bound entry point holds a
+    /// buffer given `mut` for a `mut Slots<T>` parameter as this span (§18).
+    pub fn items_mut(mut self) -> GpuSpanMut<T> {
+        let count = self.count
+        GpuSpanMut { buffer: mut self, start: 0, count }
+    }
+
+    /// Element `i`, where it is (a `GpuField`): for a command that reads it there, or, through
+    /// its fields, a field of it (`buf.at(i).draw`). An element past the end panics.
+    pub fn at(self, i: u32) -> GpuField<T, T> {
+        if i >= self.count {
+            panic("at: the element is past the end of the buffer")
+        }
+        GpuField { buffer: self, offset: i * size_of::<T>() }
+    }
+
+    /// Elements `start` to `start + count`, read-only: to bind for a `[T]` parameter, or to
+    /// copy from. A range past the end panics.
+    pub fn span(self, start: u32, count: u32) -> GpuSpan<T> {
+        if start > self.count || count > self.count - start {
+            panic("span: the range is past the end of the buffer")
+        }
+        GpuSpan { buffer: self, start, count }
+    }
+
+    /// Elements `start` to `start + count`, to change: to bind for a `mut Slots<T>`
+    /// parameter, or to copy into. A range past the end panics.
+    pub fn span_mut(mut self, start: u32, count: u32) -> GpuSpanMut<T> {
+        if start > self.count || count > self.count - start {
+            panic("span_mut: the range is past the end of the buffer")
+        }
+        GpuSpanMut { buffer: mut self, start, count }
+    }
+}
+
+/// A run of a GPU buffer's elements, read-only: a projection of the buffer, as `[T]` is of an
+/// array (§18.3). Two spans of one buffer bound together count as overlapping, even if their
+/// ranges don't. Bound to a kernel, a span starts at a multiple of 256 bytes (WebGPU's rule),
+/// which the host checks.
+pub borrow struct GpuSpan<T> {
+    pub buffer: borrow GpuBuffer<T>,
+    pub start: u32,
+    pub count: u32,
+}
+
+impl<T: GpuData> GpuSpan<T> {
+    /// How many elements it holds: in GPU code too, where it's read as a `[T]` (§18).
+    pub fn len(self) -> u32 {
+        span_len(self)
+    }
+}
+
+@intrinsic
+fn span_len<T>(s: GpuSpan<T>) -> u32 {}
+
+/// One value in a `GpuBuffer<S>`, where it is: an element (`buf.at(i)`) or, through the
+/// element's fields, a field of it (`buf.at(i).draw`, a `GpuField<S, DrawIndexedArgs>`; §18).
+/// CPU code names it without reading it, for a command that reads it there (`indirect:`,
+/// `groups:`). It borrows its buffer, as a span does.
+pub borrow struct GpuField<S, T> {
+    buffer: borrow GpuBuffer<S>,
+    offset: u32,
+}
+
+/// Field `K` of the struct `f` names, where it is: what `f.name` is.
+@intrinsic
+fn field_at<S, T, U, const K: u32>(f: GpuField<S, T>) -> GpuField<S, U> {}
+
+/// A run of a GPU buffer's elements, to change.
+pub borrow struct GpuSpanMut<T> {
+    pub buffer: mut GpuBuffer<T>,
+    pub start: u32,
+    pub count: u32,
+}
+
+/// Copies `from`'s elements into `to`, in recorded order with dispatches and draws. The spans
+/// must be the same length, and in different buffers.
+pub fn copy<T: GpuData>(from: GpuSpan<T>, to: GpuSpanMut<T>) {
+    if from.count != to.count {
+        panic("copy: the spans' lengths differ")
+    }
+    let n = size_of::<T>()
+    copy_buffer(from.buffer.handle, from.start * n, to.buffer.handle, to.start * n, from.count * n)
+}
+
+@intrinsic
+fn destroy_buffer(handle: u32) {}
+
+@intrinsic
+fn copy_buffer(from: u32, from_offset: u32, to: u32, to_offset: u32, size: u32) {}
+
+/// A kernel parameter where each invocation writes only its own slot, indexed by its
+/// `GlobalId` (§18.4). The CPU passes a `GpuBuffer<T>` for it.
+pub struct Slots<T> {
+    handle: u32,
+}
+
+/// The invocation's position in the whole dispatch.
+pub struct GlobalId: Copy {
+    pub x: u32,
+    pub y: u32,
+    pub z: u32,
+}
+
+/// The invocation's position within its workgroup.
+pub struct LocalId: Copy {
+    pub x: u32,
+    pub y: u32,
+    pub z: u32,
+}
+
+/// The workgroup's position in the dispatch.
+pub struct WorkgroupId: Copy {
+    pub x: u32,
+    pub y: u32,
+    pub z: u32,
+}
+
+impl GlobalId {
+    /// As a vector.
+    pub fn xyz(self) -> vec3u {
+        vec3u(self.x, self.y, self.z)
+    }
+}
+
+impl LocalId {
+    /// As a vector.
+    pub fn xyz(self) -> vec3u {
+        vec3u(self.x, self.y, self.z)
+    }
+}
+
+impl WorkgroupId {
+    /// As a vector.
+    pub fn xyz(self) -> vec3u {
+        vec3u(self.x, self.y, self.z)
+    }
+}
+
+/// A vertex shader's vertex number.
+pub struct VertexIndex: Copy {
+    pub index: u32,
+}
+
+/// A vertex shader's instance number.
+pub struct InstanceIndex: Copy {
+    pub index: u32,
+}
+
+/// A kernel invocation's index in its subgroup, from 0 to `SubgroupSize`'s less one: a kernel's
+/// parameter, on a device with `features().subgroups` (§18.10), whose workgroup has one
+/// dimension (`@compute(n)`, or trailing sizes of 1); WebGPU numbers no other's (E0602).
+pub struct SubgroupInvocation: Copy {
+    pub index: u32,
+}
+
+/// How many invocations the kernel's subgroups have: between `features().subgroup_min` and
+/// `subgroup_max`, the same for every subgroup of a dispatch. A kernel's parameter.
+pub struct SubgroupSize: Copy {
+    pub size: u32,
+}
+
+/// A fragment's window position: pixel centres are at half-integers.
+pub struct FragCoord: Copy {
+    pub position: vec4,
+}
+
+/// A vertex shader's clip-space output position.
+pub struct ClipPosition: Copy {
+    pub position: vec4,
+}
+
+/// A fragment shader's colour, drawn over what's in its target: alpha blending, with straight
+/// (not premultiplied) alpha. A fragment shader that returns a `vec4` replaces what's there.
+///
+/// ```wrela
+/// use std::gpu::{FragCoord, Over}
+///
+/// @fragment
+/// fn glass(pixel: FragCoord) -> Over {
+///     Over { color: vec4(0.2, 0.4, 0.8, 0.5) }   // half covers what's under it
+/// }
+/// ```
+pub struct Over: Copy {
+    pub color: vec4,
+}
+
+/// A fragment shader's colour (`C`: a `vec4`, or a `u32` for an `R32Uint` target) and its own
+/// depth (from 0 to 1, as the clip position's z over its w), in place of the depth its triangle
+/// gives it: the depth test and the depth target take it. For a flat stand-in whose fragments
+/// show something at other depths (an impostor's leaves). The GPU's early depth test is off for
+/// a shader that returns one.
+pub struct WithDepth<C>: Copy {
+    pub color: C,
+    pub depth: f32,
+}
+
+/// A fragment shader's colour and its own depth, as a `WithDepth`'s, with a promise: the depth
+/// is never nearer than its triangle's (the depth the GPU gave the fragment), only behind it or
+/// on it. Nearer is as the draw's depth test reads it: smaller under a test that keeps the
+/// smaller (`Compare::Less` or `LessEqual`, the default: depth 0 near), larger under one that
+/// keeps the larger (`Greater` or `GreaterEqual`: reversed depth, 1 near). With the promise the
+/// GPU tests the triangle's depth before the shader runs and skips a fragment that is already
+/// hidden (Metal's conservative depth), as it does for a shader that gives no depth; a
+/// `WithDepth` turns that test off. For a surface drawn on the nearest face of a box or a card
+/// around it and pushed back to where it is (a quadric met by its pixel's ray).
+///
+/// A depth nearer than the triangle's breaks the promise: what the GPU does with it is
+/// undefined (it may keep or drop the fragment). Under any other test (`Equal`, `Always`, ...)
+/// nearer means nothing, and it draws as a `WithDepth`.
+pub struct WithDepthBehind<C>: Copy {
+    pub color: C,
+    pub depth: f32,
+}
+
+/// A vertex output that isn't interpolated.
+pub struct Flat<T>: Copy {
+    pub value: T,
+}
+
+/// Creates a GPU buffer of `count` elements, zeroed.
+pub fn buffer<T: GpuData>(count: u32) -> GpuBuffer<T> {
+    let b: GpuBuffer<T> = new_buffer(count)
+    count_memory(BUFFERS, buffer_bytes::<T>(count), add: true)
+    b
+}
+
+@intrinsic
+fn new_buffer<T: GpuData>(count: u32) -> GpuBuffer<T> {}
+
+/// A buffer's bytes, as its creation asks for: `count` elements, or one for an empty buffer
+/// (WebGPU binds no less), and at least 4.
+fn buffer_bytes<T>(count: u32) -> u64 {
+    let n = u64(size_of::<T>())
+    if count == 0 { u64(max(size_of::<T>(), 4)) } else { u64(count) * n }
+}
+
+/// What the program holds on the GPU (§18.10): the bytes of its buffers and textures now, and
+/// the most of each it has held at once. std counts them as it creates and drops each (a
+/// texture by its levels' blocks and its layers), the program's own arithmetic; test mode's
+/// `memory.json` is the host's count, the same numbers. A budget a game sets for itself is
+/// checked against it. It's `nondet`: a ticker reading it would see the frames' count at a time
+/// timing chooses, so `@deterministic` code takes it as data.
+pub struct Memory: Copy {
+    pub buffers: u64,
+    pub textures: u64,
+    pub peak_buffers: u64,
+    pub peak_textures: u64,
+}
+
+/// The buffers' count of the GPU's bytes (`gpu_count`'s word).
+const BUFFERS: u32 = 0
+/// The textures' count.
+const TEXTURES: u32 = 1
+/// How far past a count its peak is.
+const PEAK: u32 = 2
+
+/// What the program holds on the GPU.
+pub fn memory() -> Memory {
+    Memory {
+        buffers: gpu_count(BUFFERS),
+        textures: gpu_count(TEXTURES),
+        peak_buffers: gpu_count(BUFFERS + PEAK),
+        peak_textures: gpu_count(TEXTURES + PEAK),
+    }
+}
+
+/// Adds `bytes` to (`add`) or takes them from the buffers' count (`which` is `BUFFERS`) or the
+/// textures' (`TEXTURES`), and raises the peak.
+fn count_memory(which: u32, bytes: u64, add: bool) {
+    let now = own_gpu_count(which)
+    let next = if add { now + bytes } else if bytes > now { 0 } else { now - bytes }
+    set_gpu_count(which, next)
+    if next > own_gpu_count(which + PEAK) {
+        set_gpu_count(which + PEAK, next)
+    }
+}
+
+/// Creates a GPU buffer holding `values`, at least `at_least` elements long (the rest zeroed: a
+/// list that can be empty still makes a buffer that can be bound, with `at_least: 1`), and
+/// copies them in (`write`).
+pub fn buffer_of<T: GpuData>(values: [T], at_least: u32 = 0) -> GpuBuffer<T> {
+    var b: GpuBuffer<T> = buffer(max(values.len(), at_least))
+    write(mut b, 0, values)
+    b
+}
+
+/// Copies `values` into `buf`, starting at element `at`. The copy happens in recorded order
+/// with dispatches and draws. Writing past the end panics.
+pub fn write<T: GpuData>(buf: mut GpuBuffer<T>, at: u32, values: [T]) {
+    if at > buf.count || values.len() > buf.count - at {
+        panic("write: the values run past the end of the buffer")
+    }
+    write_buffer(buf.handle, at, values)
+}
+
+@intrinsic
+fn write_buffer<T: GpuData>(handle: u32, at: u32, values: [T]) {}
+
+/// A kernel bound to its arguments, as a value: `let k = fill.bind(0.5, mut out)` (§18). Each
+/// entry point has a borrow struct of its arguments, which the compiler makes and which has
+/// this trait; a function generic over `K: Kernel` takes any of them and passes it to
+/// `dispatch`, each kernel's instance its own pipeline.
+pub trait Kernel {}
+
+/// A vertex shader bound to its arguments, as a value, whose output is `V` (§18).
+pub trait VertexShader<V> {}
+
+/// A fragment shader bound to its arguments, as a value, whose input from the vertex shader is
+/// `V` (§18). One that takes no input from it has the trait for every `V`.
+pub trait FragmentShader<V> {}
+
+/// Records a dispatch of a `@compute` kernel bound to its arguments: `dispatch(kernel.bind(a,
+/// b), groups: n)`. The arguments are the kernel's, without its builtins, matched as a call's
+/// are; a kernel that takes nothing is named alone. `groups` is a `u32`, a `(u32, u32, u32)`, or
+/// a buffer holding them (indirect). Small `GpuData` arguments travel as uniforms. A
+/// `GpuBuffer<T>` or a `GpuSpan<T>` goes where the kernel takes `[T]`, and `mut buf` or a
+/// `GpuSpanMut<T>` where it takes `mut Slots<T>`.
+///
+/// ```wrela
+/// use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+///
+/// @compute(64)
+/// fn fill(value: f32, out: mut Slots<f32>, id: GlobalId) {
+///     out[id] = value
+/// }
+///
+/// var out: GpuBuffer<f32> = buffer(64)
+/// dispatch(fill.bind(0.5, mut out), groups: 1)
+/// ```
+@intrinsic
+pub fn dispatch() {}
+
+/// Records a draw into an open pass: `draw(pass, vs.bind(...), fs.bind(...), vertices: n)`,
+/// with `instances: m`, or `indirect: buf` for both counts. The pass is the value its `begin_`
+/// function gave (or a parameter bounded by `RenderPass`): its type says what the draw draws
+/// into, so the pipeline is made at load for each kind of pass it's drawn in, and a fragment
+/// shader's output the pass can't take is an error where it's drawn. Each shader is bound to
+/// its own arguments, as `dispatch`'s kernel is; one that takes nothing is named alone.
+///
+/// `indices: buf` (a `GpuBuffer<u32>` or a `GpuSpan<u32>`) draws indexed: with `indirect:`
+/// holding the index count, the instance count, the first index, the base vertex and the first
+/// instance, or directly, with `index_count:` (all of `indices` past `first_index:`, if not
+/// given), `instances:`, `first_index:`, `base_vertex:` (an `i32`) and `first_instance:` (each
+/// 0, or 1 instance, if not given): a static mesh needs no arguments buffer. `blend:` (a
+/// `Blend`, `Replace` if not given, or `Over` for a shader returning `Over`) says how its
+/// colour meets its target's; `blends:` (a `[Blend; N]`) sets each target's of a pass of
+/// several. `cull:` (a `Cull`, `Cull::None` if not given), `depth_bias:` (a `DepthBias`,
+/// none if not given) and `depth:` (a `Depth`: the nearest fragment kept, if not given) are
+/// part of the draw's pipeline, so they're build-time constants, written out where it draws.
+///
+/// ```wrela
+/// use std::gpu::{
+///     ClipPosition, Compare, Cull, Depth, DepthBias, DepthPass, GpuBuffer, Rgba8, VertexIndex,
+///     draw,
+/// }
+///
+/// @vertex
+/// fn corner(points: [vec2], i: VertexIndex) -> ClipPosition {
+///     ClipPosition { position: vec4(points[i.index].x, points[i.index].y, 0.5, 1.0) }
+/// }
+///
+/// @fragment
+/// fn white() -> vec4 {
+///     vec4(1.0, 1.0, 1.0, 1.0)
+/// }
+///
+/// fn quad(
+///     pass: DepthPass<Rgba8>,
+///     points: GpuBuffer<vec2>,
+///     indices: GpuBuffer<u32>,
+///     counts: GpuBuffer<u32>,
+/// ) {
+///     draw(
+///         pass,
+///         corner.bind(points),
+///         white,
+///         indices: indices,
+///         indirect: counts,
+///         cull: Cull::Back,
+///         depth_bias: DepthBias { constant: 4, slope: 2.0, clamp: 0.0 },
+///     )
+///     // Again where the first drew, with no depth written.
+///     draw(
+///         pass,
+///         corner.bind(points),
+///         white,
+///         indices: indices,
+///         indirect: counts,
+///         depth: Depth { compare: Compare::Equal, write: false },
+///     )
+/// }
+/// ```
+@intrinsic
+pub fn draw() {}
+
+/// Records `count` indirect draws in one command: `draw_multi(pass, vs, fs, indirect: buf,
+/// count: n)`, each with its own arguments, one after another in `buf` from where it starts
+/// (`DrawArgs`, or with `indices:` `DrawIndexedArgs`), as `draw` takes them. A host with
+/// `features().multi_draw_indirect` draws them in one call; another records them one by one,
+/// which draws the same: the program is the same either way. A culling kernel writes each
+/// draw's arguments (an instance count of 0 draws nothing), so one command draws what's
+/// visible of many kinds. The draw state and shaders are `draw`'s.
+@intrinsic
+pub fn draw_multi() {}
+
+/// Which triangles a draw drops by facing: a triangle whose corners run counter-clockwise on
+/// the target faces the front.
+pub enum Cull: Copy {
+    None,
+    Front,
+    Back,
+}
+
+/// How far a draw moves each fragment's depth, away from the eye for positive values:
+/// `constant` steps of the depth format's precision and `slope` times the triangle's depth
+/// slope, at most `clamp` in size (no limit when it's 0). A shadow map's pass uses it so a
+/// surface doesn't shadow itself.
+pub struct DepthBias: Copy {
+    pub constant: i32,
+    pub slope: f32,
+    pub clamp: f32,
+}
+
+/// How a draw tests and writes depth, in a pass with a depth target: a fragment is drawn where
+/// its depth `compare`s with the target's as it says, and it keeps its depth there if `write`.
+/// The default keeps the nearest fragment. A card's shading after its depth prepass draws where
+/// the depth is `Equal` and writes none.
+pub struct Depth: Copy {
+    pub compare: Compare = Compare::Less,
+    pub write: bool = true,
+}
+
+/// Drops the fragment a fragment shader is shading: it writes no colour and no depth (an alpha
+/// test, for leaves and grass cut from cards). Its invocation goes on as a helper, so
+/// derivatives stay defined (WGSL's demotion). In a fragment shader only (E0607).
+@intrinsic
+pub fn discard() {}
+
+/// Starts drawing to the screen, cleared to `clear`. A client's only: a server has no screen.
+@client
+pub fn begin_screen_pass(clear: vec4) -> ScreenPass {
+    begin_screen_pass_command(clear)
+    ScreenPass { open: true }
+}
+
+@intrinsic
+fn begin_screen_pass_command(clear: vec4) {}
+
+/// Ends the screen pass and shows it.
+@intrinsic
+@client
+pub fn present() {}
+
+/// An open pass: what a `draw` draws into (§18). Each kind of pass has it (`Pass<F>`,
+/// `DepthPass<F>`, `DepthOnlyPass`, `ScreenPass`, `ScreenDepthPass`, `LayerPass<F>`,
+/// `LayerDepthPass<F>`, `DepthLayerPass`, and `Pass2` to `Pass8` with their depth forms), and
+/// only they do (an `impl` elsewhere is E0415). A function that draws into whatever pass it's
+/// given takes one bounded by it: `fn shade<P: RenderPass>(pass: P, ...)`.
+pub trait RenderPass {
+    /// Clips the draws after it in the pass to the rectangle of `width` × `height` pixels at
+    /// (`x`, `y`), until the pass ends or the next scissor: a draw touches no pixel outside it.
+    /// Within the pass's targets (the host checks).
+    fn scissor(self, x: u32, y: u32, width: u32, height: u32) {
+        scissor_command(x, y, width, height)
+    }
+
+    /// Maps the clip space of the draws after it in the pass to the rectangle of `width` ×
+    /// `height` pixels at (`x`, `y`), and their depths to `min_depth` to `max_depth`, until the
+    /// pass ends or the next viewport: one pass draws several views (a probe's faces in one
+    /// atlas, a split screen).
+    fn viewport(
+        self,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        min_depth: f32 = 0.0,
+        max_depth: f32 = 1.0,
+    ) {
+        viewport_command(x, y, width, height, min_depth, max_depth)
+    }
+}
+
+/// An open pass on the screen.
+pub struct ScreenPass {
+    open: bool,
+}
+
+impl ScreenPass {
+    /// Ends the pass and shows it.
+    pub fn present(self) {
+        present()
+    }
+}
+
+impl RenderPass for ScreenPass {}
+
+// ---- textures, samplers and passes (§18) ------------------------------------------------------
+
+/// How a colour texture stores its texels (§18): each format is a type, which says what a texel
+/// is in GPU code (`Texel`). What else textures of it can do is a trait each format has or
+/// hasn't: GPU code filters between texels of a `Filtered` format, kernels write a `Storage`
+/// one, and passes draw into a `Target` one.
+pub trait Format {
+    /// A texel, as GPU code reads and writes it.
+    type Texel
+    /// The command stream's code for the format.
+    fn code() -> u32
+    /// Its bytes a texel, as CPU code writes texels.
+    fn bytes() -> u32
+    /// A texel as four channels, as WGSL reads it: those the format lacks 0, and alpha 1. For
+    /// code generic over formats: `F::rgba(t.sample(s, uv))` is a `vec4` whatever `F` is.
+    fn rgba(t: Self::Texel) -> vec4
+    /// A block's side in texels: 4 for a compressed format, whose `bytes` are a block's.
+    fn block() -> u32 {
+        1
+    }
+}
+
+/// Formats GPU code can filter between texels of (`sample`, `sample_level`).
+pub trait Filtered: Format {}
+
+/// Formats kernels can write (`Texels`; `writable_texture`, `texture3d`).
+pub trait Storage: Format {}
+
+/// Formats a pass can draw into (`begin_pass`).
+pub trait Target: Format {}
+
+/// Four 8-bit channels, read as floats in [0, 1]: 4 bytes a texel. The screen's format.
+pub struct Rgba8 {}
+
+/// Four 16-bit floats: 8 bytes a texel.
+pub struct Rgba16Float {}
+
+/// One 16-bit float: 2 bytes a texel. Kernels can't write it (WebGPU's core formats).
+pub struct R16Float {}
+
+/// Two 16-bit floats: 4 bytes a texel. Kernels can't write it.
+pub struct Rg16Float {}
+
+/// One 32-bit float: 4 bytes a texel. GPU code loads it (`load`) and doesn't filter it
+/// (WebGPU's core formats).
+pub struct R32Float {}
+
+/// One 32-bit unsigned integer: 4 bytes a texel, loaded whole (`load`), never filtered. Drawn
+/// into by a fragment shader that returns a `u32`.
+pub struct R32Uint {}
+
+impl Format for Rgba8 {
+    type Texel = vec4
+    fn code() -> u32 {
+        FORMAT_RGBA8UNORM
+    }
+    fn bytes() -> u32 {
+        FORMAT_RGBA8UNORM_BYTES
+    }
+    fn rgba(t: vec4) -> vec4 {
+        t
+    }
+}
+
+impl Filtered for Rgba8 {}
+
+impl Storage for Rgba8 {}
+
+impl Target for Rgba8 {}
+
+impl Format for Rgba16Float {
+    type Texel = vec4
+    fn code() -> u32 {
+        FORMAT_RGBA16FLOAT
+    }
+    fn bytes() -> u32 {
+        FORMAT_RGBA16FLOAT_BYTES
+    }
+    fn rgba(t: vec4) -> vec4 {
+        t
+    }
+}
+
+impl Filtered for Rgba16Float {}
+
+impl Storage for Rgba16Float {}
+
+impl Target for Rgba16Float {}
+
+impl Format for R16Float {
+    type Texel = f32
+    fn code() -> u32 {
+        FORMAT_R16FLOAT
+    }
+    fn bytes() -> u32 {
+        FORMAT_R16FLOAT_BYTES
+    }
+    fn rgba(t: f32) -> vec4 {
+        vec4(t, 0.0, 0.0, 1.0)
+    }
+}
+
+impl Filtered for R16Float {}
+
+impl Target for R16Float {}
+
+impl Format for Rg16Float {
+    type Texel = vec2
+    fn code() -> u32 {
+        FORMAT_RG16FLOAT
+    }
+    fn bytes() -> u32 {
+        FORMAT_RG16FLOAT_BYTES
+    }
+    fn rgba(t: vec2) -> vec4 {
+        vec4(t, 0.0, 1.0)
+    }
+}
+
+impl Filtered for Rg16Float {}
+
+impl Target for Rg16Float {}
+
+impl Format for R32Float {
+    type Texel = f32
+    fn code() -> u32 {
+        FORMAT_R32FLOAT
+    }
+    fn bytes() -> u32 {
+        FORMAT_R32FLOAT_BYTES
+    }
+    fn rgba(t: f32) -> vec4 {
+        vec4(t, 0.0, 0.0, 1.0)
+    }
+}
+
+impl Storage for R32Float {}
+
+impl Target for R32Float {}
+
+impl Format for R32Uint {
+    type Texel = u32
+    fn code() -> u32 {
+        FORMAT_R32UINT
+    }
+    fn bytes() -> u32 {
+        FORMAT_R32UINT_BYTES
+    }
+    fn rgba(t: u32) -> vec4 {
+        vec4(f32(t), 0.0, 0.0, 1.0)
+    }
+}
+
+impl Storage for R32Uint {}
+
+impl Target for R32Uint {}
+
+/// One 8-bit channel, read as a float in [0, 1]: 1 byte a texel. Masks, coverage, ambient
+/// occlusion. Kernels can't write it (WebGPU's core formats).
+pub struct R8 {}
+
+/// Two 8-bit channels, read as floats in [0, 1]: 2 bytes a texel. Kernels can't write it.
+pub struct Rg8 {}
+
+/// Red, green and blue of 10 bits and alpha of 2, read as floats in [0, 1]: 4 bytes a texel.
+/// Kernels can't write it.
+pub struct Rgb10a2 {}
+
+/// Two 32-bit floats: 8 bytes a texel. Filtered and blended only on a device with
+/// `float32-filterable` and `float32-blendable` (`features()`).
+pub struct Rg32Float {}
+
+/// Four 32-bit floats: 16 bytes a texel. Filtered and blended only as `Rg32Float` is.
+pub struct Rgba32Float {}
+
+/// Two 32-bit unsigned integers: 8 bytes a texel, loaded whole (`load`), never filtered. Drawn
+/// into by a fragment shader that returns a `vec2u`.
+pub struct Rg32Uint {}
+
+/// Red and green of 11 bits and blue of 10, unsigned floats: HDR colour in 4 bytes a texel.
+/// Filtered; drawn into only on a device with `rg11b10ufloat-renderable` (`features()`);
+/// kernels can't write it.
+pub struct Rg11b10Float {}
+
+impl Format for R8 {
+    type Texel = f32
+    fn code() -> u32 {
+        FORMAT_R8UNORM
+    }
+    fn bytes() -> u32 {
+        FORMAT_R8UNORM_BYTES
+    }
+    fn rgba(t: f32) -> vec4 {
+        vec4(t, 0.0, 0.0, 1.0)
+    }
+}
+
+impl Filtered for R8 {}
+
+impl Target for R8 {}
+
+impl Format for Rg8 {
+    type Texel = vec2
+    fn code() -> u32 {
+        FORMAT_RG8UNORM
+    }
+    fn bytes() -> u32 {
+        FORMAT_RG8UNORM_BYTES
+    }
+    fn rgba(t: vec2) -> vec4 {
+        vec4(t, 0.0, 1.0)
+    }
+}
+
+impl Filtered for Rg8 {}
+
+impl Target for Rg8 {}
+
+impl Format for Rgb10a2 {
+    type Texel = vec4
+    fn code() -> u32 {
+        FORMAT_RGB10A2UNORM
+    }
+    fn bytes() -> u32 {
+        FORMAT_RGB10A2UNORM_BYTES
+    }
+    fn rgba(t: vec4) -> vec4 {
+        t
+    }
+}
+
+impl Filtered for Rgb10a2 {}
+
+impl Target for Rgb10a2 {}
+
+impl Format for Rg32Float {
+    type Texel = vec2
+    fn code() -> u32 {
+        FORMAT_RG32FLOAT
+    }
+    fn bytes() -> u32 {
+        FORMAT_RG32FLOAT_BYTES
+    }
+    fn rgba(t: vec2) -> vec4 {
+        vec4(t, 0.0, 1.0)
+    }
+}
+
+impl Storage for Rg32Float {}
+
+impl Target for Rg32Float {}
+
+impl Format for Rgba32Float {
+    type Texel = vec4
+    fn code() -> u32 {
+        FORMAT_RGBA32FLOAT
+    }
+    fn bytes() -> u32 {
+        FORMAT_RGBA32FLOAT_BYTES
+    }
+    fn rgba(t: vec4) -> vec4 {
+        t
+    }
+}
+
+impl Storage for Rgba32Float {}
+
+impl Target for Rgba32Float {}
+
+impl Format for Rg32Uint {
+    type Texel = vec2u
+    fn code() -> u32 {
+        FORMAT_RG32UINT
+    }
+    fn bytes() -> u32 {
+        FORMAT_RG32UINT_BYTES
+    }
+    fn rgba(t: vec2u) -> vec4 {
+        vec4(f32(t.x), f32(t.y), 0.0, 1.0)
+    }
+}
+
+impl Storage for Rg32Uint {}
+
+impl Target for Rg32Uint {}
+
+impl Format for Rg11b10Float {
+    type Texel = vec3
+    fn code() -> u32 {
+        FORMAT_RG11B10UFLOAT
+    }
+    fn bytes() -> u32 {
+        FORMAT_RG11B10UFLOAT_BYTES
+    }
+    fn rgba(t: vec3) -> vec4 {
+        vec4(t, 1.0)
+    }
+}
+
+impl Filtered for Rg11b10Float {}
+
+impl Target for Rg11b10Float {}
+
+/// BC1: 4 × 4 texels of RGB (and 1-bit alpha) in 8 bytes. A texture of it exists only on a device
+/// with `features().bc`; its texels are written as blocks (a kernel encodes them into a buffer,
+/// `copy_buffer_to_texture` moves them, or `write` takes rows of blocks), and shaders sample it.
+pub struct Bc1 {}
+
+/// BC4: 4 × 4 texels of one channel in 8 bytes (`features().bc`).
+pub struct Bc4 {}
+
+/// BC5: 4 × 4 texels of two channels in 16 bytes: normals (`features().bc`).
+pub struct Bc5 {}
+
+/// BC7: 4 × 4 texels of RGBA in 16 bytes (`features().bc`).
+pub struct Bc7 {}
+
+/// ETC2: 4 × 4 texels of RGB in 8 bytes (`features().etc2`).
+pub struct Etc2Rgb8 {}
+
+/// ASTC: 4 × 4 texels of RGBA in 16 bytes (`features().astc`).
+pub struct Astc4x4 {}
+
+impl Format for Bc1 {
+    type Texel = vec4
+    fn code() -> u32 {
+        FORMAT_BC1_RGBA_UNORM
+    }
+    fn bytes() -> u32 {
+        FORMAT_BC1_RGBA_UNORM_BYTES
+    }
+    fn rgba(t: vec4) -> vec4 {
+        t
+    }
+    fn block() -> u32 {
+        4
+    }
+}
+
+impl Filtered for Bc1 {}
+
+impl Format for Bc4 {
+    type Texel = f32
+    fn code() -> u32 {
+        FORMAT_BC4_R_UNORM
+    }
+    fn bytes() -> u32 {
+        FORMAT_BC4_R_UNORM_BYTES
+    }
+    fn rgba(t: f32) -> vec4 {
+        vec4(t, 0.0, 0.0, 1.0)
+    }
+    fn block() -> u32 {
+        4
+    }
+}
+
+impl Filtered for Bc4 {}
+
+impl Format for Bc5 {
+    type Texel = vec2
+    fn code() -> u32 {
+        FORMAT_BC5_RG_UNORM
+    }
+    fn bytes() -> u32 {
+        FORMAT_BC5_RG_UNORM_BYTES
+    }
+    fn rgba(t: vec2) -> vec4 {
+        vec4(t, 0.0, 1.0)
+    }
+    fn block() -> u32 {
+        4
+    }
+}
+
+impl Filtered for Bc5 {}
+
+impl Format for Bc7 {
+    type Texel = vec4
+    fn code() -> u32 {
+        FORMAT_BC7_RGBA_UNORM
+    }
+    fn bytes() -> u32 {
+        FORMAT_BC7_RGBA_UNORM_BYTES
+    }
+    fn rgba(t: vec4) -> vec4 {
+        t
+    }
+    fn block() -> u32 {
+        4
+    }
+}
+
+impl Filtered for Bc7 {}
+
+impl Format for Etc2Rgb8 {
+    type Texel = vec3
+    fn code() -> u32 {
+        FORMAT_ETC2_RGB8UNORM
+    }
+    fn bytes() -> u32 {
+        FORMAT_ETC2_RGB8UNORM_BYTES
+    }
+    fn rgba(t: vec3) -> vec4 {
+        vec4(t, 1.0)
+    }
+    fn block() -> u32 {
+        4
+    }
+}
+
+impl Filtered for Etc2Rgb8 {}
+
+impl Format for Astc4x4 {
+    type Texel = vec4
+    fn code() -> u32 {
+        FORMAT_ASTC_4X4_UNORM
+    }
+    fn bytes() -> u32 {
+        FORMAT_ASTC_4X4_UNORM_BYTES
+    }
+    fn rgba(t: vec4) -> vec4 {
+        t
+    }
+    fn block() -> u32 {
+        4
+    }
+}
+
+impl Filtered for Astc4x4 {}
+
+/// A 2D colour texture on the GPU, its texels of format `F`: an owned value, like a
+/// `GpuBuffer`. CPU code makes one, writes texels into it, draws into it in a pass and passes
+/// it to shaders, which read it. Dropping it releases it. It has `levels` mip levels, each half
+/// the size of the one before (at least 1 texel): level 0 is the whole texture.
+pub struct Texture<F: Format> {
+    // The compiler binds a texture by its handle, the first field.
+    handle: u32,
+    width: u32,
+    height: u32,
+    levels: u32,
+}
+
+impl<F: Format> Drop for Texture<F> {
+    fn drop(mut self) {
+        if self.handle != 0 {
+            drop_texture(self.handle, colour_bytes::<F>(self.width, self.height, 1, self.levels))
+        }
+    }
+}
+
+/// A 2D texture of depths (32-bit floats): a pass's depth target, which shaders read with a
+/// `ComparisonSampler` or `load`.
+pub struct DepthTexture {
+    handle: u32,
+    width: u32,
+    height: u32,
+}
+
+impl Drop for DepthTexture {
+    fn drop(mut self) {
+        if self.handle != 0 {
+            drop_texture(
+                self.handle,
+                texture_bytes(
+                    width: self.width,
+                    height: self.height,
+                    layers: 1,
+                    levels: 1,
+                    bytes: FORMAT_DEPTH32FLOAT_BYTES,
+                    block: 1,
+                ),
+            )
+        }
+    }
+}
+
+/// A 3D colour texture on the GPU, its texels of format `F` (a `Storage` one): an owned value,
+/// like a `Texture`. CPU code makes one and passes it to kernels, which write its texels
+/// (`Texels3d`), and to shaders, which read it. Dropping it releases it.
+pub struct Texture3d<F: Storage> {
+    handle: u32,
+    width: u32,
+    height: u32,
+    depth: u32,
+}
+
+impl<F: Storage> Drop for Texture3d<F> {
+    fn drop(mut self) {
+        if self.handle != 0 {
+            drop_texture(self.handle, colour_bytes::<F>(self.width, self.height, self.depth, 1))
+        }
+    }
+}
+
+/// `layers` 2D colour textures of one size and format, each with `levels` mip levels: shaders
+/// sample one by its layer (`sample(s, uv, layer)`), so one binding holds many (a forest's
+/// kinds of leaf, a light's shadow cascades). A layer is a 2D texture of its own to a pass
+/// (`begin_layer_pass`), a kernel (`layer_mut(i)` for a `Texels<F>`) or a shader
+/// (`layer(i)` for a `Texture<F>`). Dropping it releases it.
+pub struct TextureArray<F: Format> {
+    handle: u32,
+    width: u32,
+    height: u32,
+    layers: u32,
+    levels: u32,
+}
+
+impl<F: Format> Drop for TextureArray<F> {
+    fn drop(mut self) {
+        if self.handle != 0 {
+            drop_texture(
+                self.handle,
+                colour_bytes::<F>(self.width, self.height, self.layers, self.levels),
+            )
+        }
+    }
+}
+
+/// Six square colour textures, the faces of a cube (+x, -x, +y, -y, +z, -z, WebGPU's order),
+/// sampled by direction (`sample(s, dir)`): an environment, a reflection probe. Each face is a
+/// layer of its array: drawn into with `begin_face_pass`, written by a kernel through
+/// `face_mut(i)`. Dropping it releases it.
+pub struct Cubemap<F: Format> {
+    // The compiler binds a cube by its array's handle.
+    array: TextureArray<F>,
+}
+
+/// `layers` depth textures of one size: shadow cascades in one binding, each a layer a depth
+/// pass draws into (`begin_depth_layer_pass`) and a shader compares against by its layer.
+pub struct DepthTextureArray {
+    handle: u32,
+    width: u32,
+    height: u32,
+    layers: u32,
+}
+
+impl Drop for DepthTextureArray {
+    fn drop(mut self) {
+        if self.handle != 0 {
+            drop_texture(
+                self.handle,
+                texture_bytes(
+                    width: self.width,
+                    height: self.height,
+                    layers: self.layers,
+                    levels: 1,
+                    bytes: FORMAT_DEPTH32FLOAT_BYTES,
+                    block: 1,
+                ),
+            )
+        }
+    }
+}
+
+/// One mip level of a texture, to read: what a shader taking a `Texture<F>` sees as a texture
+/// of one level (its level 0 is this one). It borrows its texture.
+pub borrow struct TextureLevel<F: Format> {
+    pub texture: borrow Texture<F>,
+    pub level: u32,
+}
+
+/// One mip level of a texture, to write: a kernel's `Texels<F>` (`writable_texture`'s), or a
+/// copy's destination. It borrows its texture mutably.
+pub borrow struct TextureLevelMut<F: Format> {
+    pub texture: mut Texture<F>,
+    pub level: u32,
+}
+
+/// One layer of an array (or a cube's face), to read, all its levels: what a shader taking a
+/// `Texture<F>` sees as a 2D texture.
+pub borrow struct TextureLayer<F: Format> {
+    pub array: borrow TextureArray<F>,
+    pub layer: u32,
+}
+
+/// One level of one layer of an array (or a cube's face), to write: a kernel's `Texels<F>`.
+pub borrow struct TextureLayerMut<F: Format> {
+    pub array: mut TextureArray<F>,
+    pub layer: u32,
+    pub level: u32,
+}
+
+/// Level `level` of a texture to write, and the level before it to read: a kernel's
+/// `MipStep<F>`, which makes a mip chain one level at a time (`generate_mips`, a depth
+/// pyramid, a bloom chain). Two levels of one texture bound together don't overlap (WebGPU
+/// tracks each level apart), so one dispatch reads one and writes the other.
+pub borrow struct TextureStep<F: Storage> {
+    pub texture: mut Texture<F>,
+    pub level: u32,
+}
+
+/// The most mip levels a `width` × `height` texture has: its whole chain, down to 1 × 1.
+pub fn mip_levels(width: u32, height: u32) -> u32 {
+    // The longer side's bit length: 1 for a side of 0 or 1.
+    32 - max(max(width, height), 1).leading_zeros()
+}
+
+/// How a `Sampler` filters.
+pub enum Filter: Copy {
+    /// The nearest texel.
+    Nearest,
+    /// A blend of the four nearest texels.
+    Linear,
+}
+
+/// What a `Sampler` does with coordinates outside [0, 1].
+pub enum Address: Copy {
+    /// The edge texels continue.
+    Clamp,
+    /// The texture tiles.
+    Repeat,
+}
+
+/// How two depths compare: a comparison sampler's test (a texel passes when the reference depth
+/// is less than it, and so on), and a draw's depth test (a fragment passes when its depth is
+/// less than the target's, and so on). `Always` passes every one, and `Never` none.
+pub enum Compare: Copy {
+    Less,
+    LessEqual,
+    Greater,
+    GreaterEqual,
+    Equal,
+    NotEqual,
+    Always,
+    Never,
+}
+
+/// How shaders read a `Texture` between its texels.
+pub struct Sampler {
+    handle: u32,
+}
+
+impl Drop for Sampler {
+    fn drop(mut self) {
+        if self.handle != 0 {
+            destroy_sampler(self.handle)
+        }
+    }
+}
+
+/// How shaders compare a reference depth with a `DepthTexture`'s texels (shadow maps).
+pub struct ComparisonSampler {
+    handle: u32,
+}
+
+impl Drop for ComparisonSampler {
+    fn drop(mut self) {
+        if self.handle != 0 {
+            destroy_sampler(self.handle)
+        }
+    }
+}
+
+/// A side is 1 texel to the GPU's limit (`limits().max_texture_size`, at least 8192), and a
+/// texture has 1 to its chain's levels.
+fn check_texture_size(width: u32, height: u32, levels: u32) {
+    let max = limit(0)
+    if width == 0 || height == 0 || width > max || height > max {
+        panic(f"texture: a side is 1 to {max} texels")
+    }
+    let most = mip_levels(width, height)
+    if levels == 0 || levels > most {
+        panic(f"texture: a {width}x{height} texture has 1 to {most} mip levels")
+    }
+}
+
+/// A new colour texture of format `F`, zeroed: `texture::<Rgba8>(width: 4, height: 4)`, or
+/// with `F` from where it goes; with `levels` mip levels (`mip_levels(w, h)` for the whole
+/// chain), which `generate_mips` fills, or a kernel or a pass each.
+pub fn texture<F: Format>(width: u32, height: u32, levels: u32 = 1) -> Texture<F> {
+    texture_of(width, height, levels, flags: 0)
+}
+
+/// A new colour texture of format `F`, zeroed, that kernels can also write (a `Texels`): a
+/// `Storage` format. Storage can cost a drawn texture its compression, so only textures kernels
+/// write are made this way.
+pub fn writable_texture<F: Storage>(width: u32, height: u32, levels: u32 = 1) -> Texture<F> {
+    texture_of(width, height, levels, flags: TEXTURE_WRITABLE)
+}
+
+/// A new 2D colour texture of format `F`, its size checked, with `flags` added to its format's
+/// code (`TEXTURE_WRITABLE`, or 0).
+fn texture_of<F: Format>(width: u32, height: u32, levels: u32, flags: u32) -> Texture<F> {
+    check_texture_size(width, height, levels)
+    let code = F::code() | flags
+    Texture {
+        handle: create_texture_of(width, height, code, KIND_2D, 1, levels, F::bytes(), F::block()),
+        width,
+        height,
+        levels,
+    }
+}
+
+/// A new 3D texture of format `F`, `width` × `height` × `depth` texels (each 1 to 2048),
+/// zeroed. Kernels write its texels (`Texels3d`): CPU code can't.
+pub fn texture3d<F: Storage>(width: u32, height: u32, depth: u32) -> Texture3d<F> {
+    let max = MAX_TEXTURE_3D
+    if width == 0 || height == 0 || depth == 0 || width > max || height > max || depth > max {
+        panic(f"texture3d: a side is 1 to {max} texels")
+    }
+    let code = F::code() | TEXTURE_WRITABLE
+    Texture3d {
+        handle: create_texture_of(width, height, code, KIND_3D, depth, 1, F::bytes(), F::block()),
+        width,
+        height,
+        depth,
+    }
+}
+
+/// A new array of `layers` colour textures (1 to 256) of format `F`, zeroed, each with `levels`
+/// mip levels.
+pub fn texture_array<F: Format>(
+    width: u32,
+    height: u32,
+    layers: u32,
+    levels: u32 = 1,
+) -> TextureArray<F> {
+    layered_of(width, height, layers, levels, KIND_ARRAY, flags: 0)
+}
+
+/// A new array of colour textures, zeroed, whose layers kernels can also write.
+pub fn writable_texture_array<F: Storage>(
+    width: u32,
+    height: u32,
+    layers: u32,
+    levels: u32 = 1,
+) -> TextureArray<F> {
+    layered_of(width, height, layers, levels, KIND_ARRAY, flags: TEXTURE_WRITABLE)
+}
+
+fn check_layers(layers: u32) {
+    if layers == 0 || layers > MAX_LAYERS {
+        panic(f"texture_array: an array has 1 to {MAX_LAYERS} layers")
+    }
+}
+
+/// A new cube of six `side` × `side` faces of format `F`, zeroed, each with `levels` levels.
+pub fn cubemap<F: Format>(side: u32, levels: u32 = 1) -> Cubemap<F> {
+    Cubemap { array: layered_of(side, side, 6, levels, KIND_CUBE, flags: 0) }
+}
+
+/// A new cube whose faces kernels can also write.
+pub fn writable_cubemap<F: Storage>(side: u32, levels: u32 = 1) -> Cubemap<F> {
+    Cubemap { array: layered_of(side, side, 6, levels, KIND_CUBE, flags: TEXTURE_WRITABLE) }
+}
+
+/// A new array (`kind` `KIND_ARRAY`) or cube (`KIND_CUBE`) of colour textures of format `F`, its
+/// size and layers checked, with `flags` added to its format's code (`TEXTURE_WRITABLE`, or 0).
+fn layered_of<F: Format>(
+    width: u32,
+    height: u32,
+    layers: u32,
+    levels: u32,
+    kind: u32,
+    flags: u32,
+) -> TextureArray<F> {
+    check_texture_size(width, height, levels)
+    check_layers(layers)
+    let (code, bytes, block) = (F::code() | flags, F::bytes(), F::block())
+    let handle = create_texture_of(width, height, code, kind, layers, levels, bytes, block)
+    TextureArray { handle, width, height, layers, levels }
+}
+
+/// A new depth texture, zeroed.
+pub fn depth_texture(width: u32, height: u32) -> DepthTexture {
+    check_texture_size(width, height, 1)
+    let handle = create_texture_of(
+        width,
+        height,
+        format: FORMAT_DEPTH32FLOAT,
+        kind: KIND_2D,
+        layers: 1,
+        levels: 1,
+        bytes: FORMAT_DEPTH32FLOAT_BYTES,
+        block: 1,
+    )
+    DepthTexture { handle, width, height }
+}
+
+/// A new array of `layers` depth textures, zeroed.
+pub fn depth_texture_array(width: u32, height: u32, layers: u32) -> DepthTextureArray {
+    check_texture_size(width, height, 1)
+    check_layers(layers)
+    let handle = create_texture_of(
+        width,
+        height,
+        format: FORMAT_DEPTH32FLOAT,
+        kind: KIND_ARRAY,
+        layers: layers,
+        levels: 1,
+        bytes: FORMAT_DEPTH32FLOAT_BYTES,
+        block: 1,
+    )
+    DepthTextureArray { handle, width, height, layers }
+}
+
+/// A new sampler: `filter` within a level, `mip` between levels, and with `anisotropy` above 1
+/// (to 16) more texels along a surface seen at a slant, which needs both linear (WebGPU's rule).
+pub fn sampler(
+    filter: Filter = Filter::Linear,
+    address: Address = Address::Clamp,
+    mip: Filter = Filter::Linear,
+    anisotropy: u32 = 1,
+) -> Sampler {
+    let linear = u32(filter == Filter::Linear)
+    let repeat = u32(address == Address::Repeat)
+    let mip_linear = u32(mip == Filter::Linear)
+    if anisotropy == 0 || anisotropy > 16 {
+        panic("sampler: anisotropy is 1 to 16")
+    }
+    if anisotropy > 1 && (linear == 0 || mip_linear == 0) {
+        panic("sampler: an anisotropic sampler filters linearly, within and between levels")
+    }
+    Sampler {
+        handle: create_sampler(
+            linear,
+            repeat,
+            compare: 0,
+            mip_linear: mip_linear,
+            anisotropy: anisotropy,
+        ),
+    }
+}
+
+/// A new comparison sampler: linear, so each comparison blends four texels' results.
+pub fn comparison_sampler(compare: Compare = Compare::LessEqual) -> ComparisonSampler {
+    let code: u32 = match compare {
+        Compare::Less => COMPARE_LESS,
+        Compare::LessEqual => COMPARE_LESS_EQUAL,
+        Compare::Greater => COMPARE_GREATER,
+        Compare::GreaterEqual => COMPARE_GREATER_EQUAL,
+        Compare::Equal => COMPARE_EQUAL,
+        Compare::NotEqual => COMPARE_NOT_EQUAL,
+        Compare::Always => COMPARE_ALWAYS,
+        Compare::Never => COMPARE_NEVER,
+    }
+    ComparisonSampler {
+        handle: create_sampler(linear: 1, repeat: 0, compare: code, mip_linear: 0, anisotropy: 1),
+    }
+}
+
+/// The most bytes one texture write command carries: writes are split into rows that fit.
+const TEXTURE_WRITE_BYTES: u32 = 512 * 1024
+
+/// The side of a level: `side` halved `level` times, at least 1.
+fn level_side(side: u32, level: u32) -> u32 {
+    max(1, side >> level)
+}
+
+/// Writes `bytes` (rows top to bottom: a row of texels of format `F`, or of a compressed
+/// format's blocks) into the rectangle of level `level`, layer `layer` of texture `handle`,
+/// whose level 0 is `base_w` × `base_h`.
+fn write_rows<F: Format>(
+    handle: u32,
+    base_w: u32,
+    base_h: u32,
+    level: u32,
+    layer: u32,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    bytes: [u8],
+) {
+    let (w, h) = (level_side(base_w, level), level_side(base_h, level))
+    if x > w || width > w - x || y > h || height > h - y {
+        panic("write: the rectangle runs past the texture's edge")
+    }
+    let (row, block) = (row_bytes::<F>(width), F::block())
+    let rows = blocks(height, block)
+    if u64(bytes.len()) != u64(row) * u64(rows) {
+        panic(
+            "write: the bytes aren't the rectangle's texels (rows of blocks, for a compressed format)",
+        )
+    }
+    if row == 0 || height == 0 {
+        return
+    }
+    let fit = max(1, TEXTURE_WRITE_BYTES / row)
+    var done = 0
+    while done < rows {
+        let n = min(fit, rows - done)
+        // In texels: a block's rows, but at the rectangle's last, which may be short.
+        let texel_rows = min(n * block, height - done * block)
+        write_texture_rows(
+            handle,
+            level,
+            layer,
+            x,
+            y + done * block,
+            width,
+            texel_rows,
+            bytes,
+            done * row,
+            n * row,
+        )
+        done += n
+    }
+}
+
+impl<F: Format> Texture<F> {
+    /// Its width in texels: in GPU code, its level 0's (a level's binding is a texture of its
+    /// own size).
+    pub fn width(self) -> u32 {
+        texture_width(self)
+    }
+
+    /// Its height in texels.
+    pub fn height(self) -> u32 {
+        texture_height(self)
+    }
+
+    /// How many mip levels it has: in GPU code too (a level's binding has 1).
+    pub fn levels(self) -> u32 {
+        texture_levels(self)
+    }
+
+    /// Copies texels into the rectangle at (`x`, `y`) of `width` by `height` texels of level
+    /// `level`: `bytes` holds its rows, top to bottom, `F::bytes()` a texel. It happens in
+    /// recorded order with dispatches and draws. A rectangle past the level's edge, or the wrong
+    /// number of bytes, panics.
+    pub fn write(mut self, x: u32, y: u32, width: u32, height: u32, bytes: [u8], level: u32 = 0) {
+        if level >= self.levels {
+            panic("write: the texture has no such level")
+        }
+        write_rows::<F>(self.handle, self.width, self.height, level, 0, x, y, width, height, bytes)
+    }
+
+    /// The texel at (`x`, `y`) of level `level`, unfiltered: any GPU code.
+    pub fn load(self, x: u32, y: u32, level: u32 = 0) -> F::Texel {
+        texture_load(self, x, y, level)
+    }
+
+    /// Level `i` alone, to read: a `Texture<F>` of one level to a shader. It borrows the texture.
+    pub fn level(self, i: u32) -> TextureLevel<F> {
+        if i >= self.levels {
+            panic("level: the texture has no such level")
+        }
+        TextureLevel { texture: self, level: i }
+    }
+
+    /// Level `i` alone, to write: a kernel's `Texels<F>`, or a copy's destination.
+    pub fn level_mut(mut self, i: u32) -> TextureLevelMut<F> {
+        if i >= self.levels {
+            panic("level_mut: the texture has no such level")
+        }
+        TextureLevelMut { texture: mut self, level: i }
+    }
+}
+
+impl<F: Storage> Texture<F> {
+    /// Level `i` to write and level `i - 1` to read, for a kernel's `MipStep<F>`: from level 1.
+    pub fn mip_step(mut self, i: u32) -> TextureStep<F> {
+        if i == 0 || i >= self.levels {
+            panic("mip_step: a step writes a level from 1 to the last")
+        }
+        TextureStep { texture: mut self, level: i }
+    }
+}
+
+impl<F: Filtered> Texture<F> {
+    /// The texel at (`u`, `v`) in [0, 1], filtered by `s` and at the level its footprint picks
+    /// (trilinear between levels with a sampler whose `mip` is linear): fragment shaders only,
+    /// since it reads the footprint from neighbouring pixels (as `dpdx` does).
+    pub fn sample(self, s: Sampler, uv: vec2) -> F::Texel {
+        texture_sample(self, s, uv)
+    }
+
+    /// The texel at (`u`, `v`) in [0, 1] of mip level `level` (between levels, by `s`'s `mip`
+    /// filter, at a fraction), filtered by `s`: any GPU code.
+    pub fn sample_level(self, s: Sampler, uv: vec2, level: f32 = 0.0) -> F::Texel {
+        texture_sample_level(self, s, uv, level)
+    }
+
+    /// The four texels a bilinear sample at `uv` reads, component `component` of each (0 to 3,
+    /// red to alpha), in WGSL's order: (min u, max v), (max u, max v), (max u, min v), (min u,
+    /// min v), at level 0. One fetch for what four loads read: any GPU code. Each component is
+    /// a fetch of its own, so a `component` that isn't a constant picks one with a branch.
+    pub fn gather(self, s: Sampler, uv: vec2, component: u32 = 0) -> vec4 {
+        if component == 0 {
+            texture_gather::<0, F>(self, s, uv)
+        } else if component == 1 {
+            texture_gather::<1, F>(self, s, uv)
+        } else if component == 2 {
+            texture_gather::<2, F>(self, s, uv)
+        } else {
+            texture_gather::<3, F>(self, s, uv)
+        }
+    }
+
+    /// The texel at (`u`, `v`), at the level the footprint `ddx` and `ddy` (how `uv` changes
+    /// from one pixel to the next, across and down) picks: any GPU code, so a kernel or a
+    /// vertex shader filters as a fragment shader does.
+    pub fn sample_grad(self, s: Sampler, uv: vec2, ddx: vec2, ddy: vec2) -> F::Texel {
+        texture_sample_grad(self, s, uv, ddx, ddy)
+    }
+
+    /// The texel at (`u`, `v`), at the level the footprint picks moved by `bias`: fragment
+    /// shaders only.
+    pub fn sample_bias(self, s: Sampler, uv: vec2, bias: f32) -> F::Texel {
+        texture_sample_bias(self, s, uv, bias)
+    }
+}
+
+impl<F: Format> TextureLevel<F> {
+    /// Its width in texels.
+    pub fn width(self) -> u32 {
+        level_side(self.texture.width, self.level)
+    }
+
+    /// Its height in texels.
+    pub fn height(self) -> u32 {
+        level_side(self.texture.height, self.level)
+    }
+}
+
+impl<F: Format> TextureLevelMut<F> {
+    /// Its width in texels.
+    pub fn width(self) -> u32 {
+        level_side(self.texture.width, self.level)
+    }
+
+    /// Its height in texels.
+    pub fn height(self) -> u32 {
+        level_side(self.texture.height, self.level)
+    }
+}
+
+impl<F: Format> TextureArray<F> {
+    /// Its width in texels. In GPU code too.
+    pub fn width(self) -> u32 {
+        texture_width(self)
+    }
+
+    /// Its height in texels. In GPU code too.
+    pub fn height(self) -> u32 {
+        texture_height(self)
+    }
+
+    /// How many layers it has. In GPU code too.
+    pub fn layers(self) -> u32 {
+        texture_layers(self)
+    }
+
+    /// How many mip levels each layer has. In GPU code too.
+    pub fn levels(self) -> u32 {
+        texture_levels(self)
+    }
+
+    /// Copies texels into a rectangle of layer `layer`'s level `level`, as `Texture::write`.
+    pub fn write(
+        mut self,
+        layer: u32,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        bytes: [u8],
+        level: u32 = 0,
+    ) {
+        if layer >= self.layers || level >= self.levels {
+            panic("write: the array has no such layer or level")
+        }
+        write_rows::<F>(
+            self.handle,
+            self.width,
+            self.height,
+            level,
+            layer,
+            x,
+            y,
+            width,
+            height,
+            bytes,
+        )
+    }
+
+    /// The texel at (`x`, `y`) of layer `layer`'s level `level`, unfiltered: any GPU code.
+    pub fn load(self, x: u32, y: u32, layer: u32, level: u32 = 0) -> F::Texel {
+        array_load(self, x, y, layer, level)
+    }
+
+    /// Layer `i`, all its levels, to read: a `Texture<F>` to a shader.
+    pub fn layer(self, i: u32) -> TextureLayer<F> {
+        if i >= self.layers {
+            panic("layer: the array has no such layer")
+        }
+        TextureLayer { array: self, layer: i }
+    }
+
+    /// Layer `i`'s level `level`, to write: a kernel's `Texels<F>`.
+    pub fn layer_mut(mut self, i: u32, level: u32 = 0) -> TextureLayerMut<F> {
+        if i >= self.layers || level >= self.levels {
+            panic("layer_mut: the array has no such layer or level")
+        }
+        TextureLayerMut { array: mut self, layer: i, level }
+    }
+}
+
+impl<F: Filtered> TextureArray<F> {
+    /// Layer `layer`'s texel at (`u`, `v`), filtered: fragment shaders only.
+    pub fn sample(self, s: Sampler, uv: vec2, layer: u32) -> F::Texel {
+        array_sample(self, s, uv, layer)
+    }
+
+    /// Layer `layer`'s texel at (`u`, `v`) of mip level `level`: any GPU code.
+    pub fn sample_level(self, s: Sampler, uv: vec2, layer: u32, level: f32 = 0.0) -> F::Texel {
+        array_sample_level(self, s, uv, layer, level)
+    }
+
+    /// As `Texture::gather`, of layer `layer`.
+    pub fn gather(self, s: Sampler, uv: vec2, layer: u32, component: u32 = 0) -> vec4 {
+        if component == 0 {
+            array_gather::<0, F>(self, s, uv, layer)
+        } else if component == 1 {
+            array_gather::<1, F>(self, s, uv, layer)
+        } else if component == 2 {
+            array_gather::<2, F>(self, s, uv, layer)
+        } else {
+            array_gather::<3, F>(self, s, uv, layer)
+        }
+    }
+
+    /// Layer `layer`'s texel at (`u`, `v`), at the level the footprint picks: any GPU code.
+    pub fn sample_grad(self, s: Sampler, uv: vec2, layer: u32, ddx: vec2, ddy: vec2) -> F::Texel {
+        array_sample_grad(self, s, uv, layer, ddx, ddy)
+    }
+}
+
+impl<F: Format> Cubemap<F> {
+    /// A face's side in texels.
+    pub fn side(self) -> u32 {
+        self.array.width
+    }
+
+    /// How many mip levels each face has.
+    pub fn levels(self) -> u32 {
+        self.array.levels
+    }
+
+    /// Face `i` (+x, -x, +y, -y, +z, -z), all its levels, to read.
+    pub fn face(self, i: u32) -> TextureLayer<F> {
+        self.array.layer(i)
+    }
+
+    /// Face `i`'s level `level`, to write: a kernel's `Texels<F>`.
+    pub fn face_mut(mut self, i: u32, level: u32 = 0) -> TextureLayerMut<F> {
+        self.array.layer_mut(i, level)
+    }
+
+    /// Copies texels into a rectangle of face `face`'s level `level`.
+    pub fn write(
+        mut self,
+        face: u32,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        bytes: [u8],
+        level: u32 = 0,
+    ) {
+        self.array.write(face, x, y, width, height, bytes, level)
+    }
+}
+
+impl<F: Filtered> Cubemap<F> {
+    /// The texel the direction `dir` from the cube's centre meets, filtered: fragment shaders
+    /// only.
+    pub fn sample(self, s: Sampler, dir: vec3) -> F::Texel {
+        cube_sample(self, s, dir)
+    }
+
+    /// As `sample`, at mip level `level`: any GPU code (a probe's roughness picks its level).
+    pub fn sample_level(self, s: Sampler, dir: vec3, level: f32 = 0.0) -> F::Texel {
+        cube_sample_level(self, s, dir, level)
+    }
+}
+
+impl DepthTexture {
+    /// Its width in texels. In GPU code too.
+    pub fn width(self) -> u32 {
+        texture_width(self)
+    }
+
+    /// Its height in texels. In GPU code too.
+    pub fn height(self) -> u32 {
+        texture_height(self)
+    }
+
+    /// The fraction of the texels around (`u`, `v`) in [0, 1] that pass `s`'s test against
+    /// `reference`: fragment shaders only.
+    pub fn sample_compare(self, s: ComparisonSampler, uv: vec2, reference: f32) -> f32 {
+        texture_sample_compare(self, s, uv, reference)
+    }
+
+    /// As `sample_compare`, at level 0: any GPU code.
+    pub fn sample_compare_level(self, s: ComparisonSampler, uv: vec2, reference: f32) -> f32 {
+        texture_sample_compare_level(self, s, uv, reference)
+    }
+
+    /// The four depths a bilinear sample at `uv` reads, in `Texture::gather`'s order, at level
+    /// 0: any GPU code.
+    pub fn gather(self, s: Sampler, uv: vec2) -> vec4 {
+        depth_gather(self, s, uv)
+    }
+
+    /// Each of `gather`'s four depths against `reference` by `s`'s test, 1 or 0: four shadow
+    /// taps in one fetch. Any GPU code.
+    pub fn gather_compare(self, s: ComparisonSampler, uv: vec2, reference: f32) -> vec4 {
+        depth_gather_compare(self, s, uv, reference)
+    }
+
+    /// The depth at (`x`, `y`): any GPU code.
+    pub fn load(self, x: u32, y: u32) -> f32 {
+        depth_load(self, x, y, 0)
+    }
+}
+
+impl DepthTextureArray {
+    /// Its width in texels. In GPU code too.
+    pub fn width(self) -> u32 {
+        texture_width(self)
+    }
+
+    /// Its height in texels. In GPU code too.
+    pub fn height(self) -> u32 {
+        texture_height(self)
+    }
+
+    /// How many layers it has. In GPU code too.
+    pub fn layers(self) -> u32 {
+        texture_layers(self)
+    }
+
+    /// The fraction of layer `layer`'s texels around (`u`, `v`) that pass `s`'s test against
+    /// `reference`: fragment shaders only.
+    pub fn sample_compare(self, s: ComparisonSampler, uv: vec2, layer: u32, reference: f32) -> f32 {
+        depth_array_compare(self, s, uv, layer, reference)
+    }
+
+    /// As `sample_compare`, at level 0: any GPU code.
+    pub fn sample_compare_level(
+        self,
+        s: ComparisonSampler,
+        uv: vec2,
+        layer: u32,
+        reference: f32,
+    ) -> f32 {
+        depth_array_compare_level(self, s, uv, layer, reference)
+    }
+
+    /// As `DepthTexture::gather`, of layer `layer`.
+    pub fn gather(self, s: Sampler, uv: vec2, layer: u32) -> vec4 {
+        depth_array_gather(self, s, uv, layer)
+    }
+
+    /// As `DepthTexture::gather_compare`, of layer `layer`.
+    pub fn gather_compare(
+        self,
+        s: ComparisonSampler,
+        uv: vec2,
+        layer: u32,
+        reference: f32,
+    ) -> vec4 {
+        depth_array_gather_compare(self, s, uv, layer, reference)
+    }
+
+    /// Layer `layer`'s depth at (`x`, `y`): any GPU code.
+    pub fn load(self, x: u32, y: u32, layer: u32) -> f32 {
+        depth_array_load(self, x, y, layer, 0)
+    }
+}
+
+impl<F: Storage> Texture3d<F> {
+    /// Its width in texels. In GPU code too.
+    pub fn width(self) -> u32 {
+        texture_width(self)
+    }
+
+    /// Its height in texels. In GPU code too.
+    pub fn height(self) -> u32 {
+        texture_height(self)
+    }
+
+    /// Its depth in texels. In GPU code too.
+    pub fn depth(self) -> u32 {
+        texture_depth(self)
+    }
+
+    /// The texel at (`x`, `y`, `z`), unfiltered: any GPU code.
+    pub fn load(self, x: u32, y: u32, z: u32) -> F::Texel {
+        texture3d_load(self, x, y, z, 0)
+    }
+}
+
+impl<F: Storage + Filtered> Texture3d<F> {
+    /// The texel at (`u`, `v`, `w`) in [0, 1], filtered by `s`: any GPU code. 3D textures have
+    /// one mip level, 0.
+    pub fn sample_level(self, s: Sampler, uvw: vec3, level: f32 = 0.0) -> F::Texel {
+        texture3d_sample_level(self, s, uvw, level)
+    }
+}
+
+impl<F: Storage> Texture3d<F> {
+    /// Its handle, as data a field may hold: a `Texture3dHandle`, which names this texture while
+    /// it lives.
+    pub fn to_handle(self) -> Texture3dHandle<F> {
+        Texture3dHandle {
+            handle: self.handle,
+            width: self.width,
+            height: self.height,
+            depth: self.depth,
+        }
+    }
+}
+
+/// A 3D texture's handle as data (language.md §20.3): `Copy` and `GpuData`, so a value, a
+/// field's among them, can hold the texture whose texels are its data. Where a value that holds
+/// one, at any depth of its fields, is an entry point's argument, the compiler binds the texture
+/// beside it as it binds a group's (§18): its other fields are the entry point's uniforms, and
+/// GPU code reads its texels (`load`). CPU code knows its size. It names its texture while the
+/// texture lives; the texture's owner keeps it.
+pub struct Texture3dHandle<F: Storage>: Copy + GpuData {
+    handle: u32,
+    width: u32,
+    height: u32,
+    depth: u32,
+}
+
+impl<F: Storage> Texture3dHandle<F> {
+    /// Its width in texels. In GPU code too.
+    pub fn width(self) -> u32 {
+        texture_width(self)
+    }
+
+    /// Its height in texels. In GPU code too.
+    pub fn height(self) -> u32 {
+        texture_height(self)
+    }
+
+    /// Its depth in texels. In GPU code too.
+    pub fn depth(self) -> u32 {
+        texture_depth(self)
+    }
+
+    /// The texel at (`x`, `y`, `z`), unfiltered: any GPU code.
+    pub fn load(self, x: u32, y: u32, z: u32) -> F::Texel {
+        texture3d_handle_load(self, x, y, z, 0)
+    }
+}
+
+// ---- copies and readback (§18.8) ---------------------------------------------------------------
+
+/// Copies a `width` × `height` rectangle at (`x`, `y`) of `from` into `to` at (`to_x`, `to_y`),
+/// in recorded order with dispatches and draws: two textures of one format, each at the level
+/// it names (`tex.level(i)`, `other.level_mut(j)`), or whole (level 0). A `width` or `height` of
+/// 0 (the default) reaches the source's edge from `x` or `y`. A rectangle past either level's
+/// edge panics.
+pub fn copy_texture<F: Format, S: TexelSource<F>, T: TexelTarget<F>>(
+    from: S,
+    to: T,
+    x: u32 = 0,
+    y: u32 = 0,
+    width: u32 = 0,
+    height: u32 = 0,
+    to_x: u32 = 0,
+    to_y: u32 = 0,
+) {
+    let (a, b) = (from.source(), to.target())
+    if x > a.width || y > a.height {
+        panic("copy_texture: the rectangle runs past the source's edge")
+    }
+    let w = if width == 0 { a.width - x } else { width }
+    let h = if height == 0 { a.height - y } else { height }
+    if w > a.width - x || h > a.height - y {
+        panic("copy_texture: the rectangle runs past the source's edge")
+    }
+    if to_x > b.width || w > b.width - to_x || to_y > b.height || h > b.height - to_y {
+        panic("copy_texture: the rectangle runs past the destination's edge")
+    }
+    copy_texture_command(
+        from: a.handle,
+        from_level: a.level,
+        from_layer: a.layer,
+        x: x,
+        y: y,
+        to: b.handle,
+        to_level: b.level,
+        to_layer: b.layer,
+        to_x: to_x,
+        to_y: to_y,
+        width: w,
+        height: h,
+    )
+}
+
+/// Copies a level of a texture into a buffer of its texels, row by row, each row padded to 256
+/// bytes (WebGPU's rule): `to` must hold a padded row's bytes / 4 `u32`s for each row of texels
+/// (of blocks, for a compressed format). `read_texture` unpads them. In recorded order.
+pub fn copy_texture_to_buffer<F: Format, S: TexelSource<F>>(from: S, to: mut GpuBuffer<u32>) {
+    let a = from.source()
+    let (row, bh) = padded_rows::<F>(a)
+    if u64(to.len()) * 4 < u64(row) * u64(bh) {
+        panic("copy_texture_to_buffer: the buffer is smaller than the texture's padded rows")
+    }
+    record_to_buffer(a, to.handle, row)
+}
+
+/// Copies a buffer of texels into a level of a texture, row by row (rows padded to 256 bytes,
+/// as `copy_texture_to_buffer` writes them): what a kernel encoded (compressed blocks too, a
+/// row of blocks a row) becomes a texture. In recorded order.
+pub fn copy_buffer_to_texture<F: Format, T: TexelTarget<F>>(from: GpuSpan<u32>, to: T) {
+    let b = to.target()
+    let (row, bh) = padded_rows::<F>(b)
+    if u64(from.count) * 4 < u64(row) * u64(bh) {
+        panic("copy_buffer_to_texture: the span is smaller than the texture's padded rows")
+    }
+    let offset = u64(from.start) * 4
+    if offset > 4294967295 {
+        panic("copy_buffer_to_texture: the span starts 4 GiB or more into its buffer")
+    }
+    if offset % u64(F::bytes()) != 0 {
+        panic(
+            "copy_buffer_to_texture: the span starts inside a texel block (WebGPU copies whole blocks)",
+        )
+    }
+    copy_buffer_to_texture_command(
+        buffer: from.buffer.handle,
+        offset: u32(offset),
+        bytes_per_row: row,
+        texture: b.handle,
+        level: b.level,
+        layer: b.layer,
+        x: 0,
+        y: 0,
+        width: b.width,
+        height: b.height,
+    )
+}
+
+/// Where a copy reads texels (`copy_texture`, `copy_texture_to_buffer`, `read_texture`): a level
+/// of a texture (`tex.level(i)`), or level 0 of an array's layer or a cube's face
+/// (`arr.layer(i)`).
+pub trait TexelSource<F: Format> {
+    /// The level, the layer and their size.
+    fn source(self) -> TexelPlace
+}
+
+/// Where a copy writes texels (`copy_texture`, `copy_buffer_to_texture`): a level of a texture
+/// (`tex.level_mut(i)`), or a level of an array's layer (`arr.layer_mut(i, level)`).
+pub trait TexelTarget<F: Format> {
+    /// The level, the layer and their size.
+    fn target(self) -> TexelPlace
+}
+
+/// One level of one layer of a texture, and its size: what a copy reads or writes.
+pub struct TexelPlace: Copy {
+    handle: u32,
+    level: u32,
+    layer: u32,
+    width: u32,
+    height: u32,
+}
+
+impl<F: Format> TexelSource<F> for TextureLevel<F> {
+    fn source(self) -> TexelPlace {
+        TexelPlace {
+            handle: self.texture.handle,
+            level: self.level,
+            layer: 0,
+            width: self.width(),
+            height: self.height(),
+        }
+    }
+}
+
+impl<F: Format> TexelSource<F> for TextureLayer<F> {
+    fn source(self) -> TexelPlace {
+        TexelPlace {
+            handle: self.array.handle,
+            level: 0,
+            layer: self.layer,
+            width: self.array.width,
+            height: self.array.height,
+        }
+    }
+}
+
+impl<F: Format> TexelTarget<F> for TextureLevelMut<F> {
+    fn target(self) -> TexelPlace {
+        TexelPlace {
+            handle: self.texture.handle,
+            level: self.level,
+            layer: 0,
+            width: self.width(),
+            height: self.height(),
+        }
+    }
+}
+
+impl<F: Format> TexelTarget<F> for TextureLayerMut<F> {
+    fn target(self) -> TexelPlace {
+        TexelPlace {
+            handle: self.array.handle,
+            level: self.level,
+            layer: self.layer,
+            width: level_side(self.array.width, self.level),
+            height: level_side(self.array.height, self.level),
+        }
+    }
+}
+
+/// `n` texels in blocks of `b`.
+fn blocks(n: u32, b: u32) -> u32 {
+    (n + b - 1) / b
+}
+
+/// The bytes of a row `width` texels wide of format `F`: its texels, or its blocks.
+fn row_bytes<F: Format>(width: u32) -> u32 {
+    blocks(width, F::block()) * F::bytes()
+}
+
+/// A row of `bytes` padded to 256, as a copy between a texture and a buffer lays it out.
+fn padded_row(bytes: u32) -> u32 {
+    blocks(bytes, 256) * 256
+}
+
+/// How a copy between `p` and a buffer lays out its texels of format `F`: the bytes of each
+/// row, padded (`padded_row`), and the rows (of blocks, for a compressed format).
+fn padded_rows<F: Format>(p: TexelPlace) -> (u32, u32) {
+    (padded_row(row_bytes::<F>(p.width)), blocks(p.height, F::block()))
+}
+
+/// Records a copy of `p`'s texels into buffer `buffer` from its start, `row` bytes a row.
+fn record_to_buffer(p: TexelPlace, buffer: u32, row: u32) {
+    copy_texture_to_buffer_command(
+        texture: p.handle,
+        level: p.level,
+        layer: p.layer,
+        x: 0,
+        y: 0,
+        width: p.width,
+        height: p.height,
+        buffer: buffer,
+        offset: 0,
+        bytes_per_row: row,
+    )
+}
+
+/// Reads a level of a texture back to the CPU, once the GPU work recorded before is done: its
+/// texels' bytes, rows top to bottom, `F::bytes()` a texel, unpadded. A request, answered on a
+/// later call (§17.1), and `nondet` as `read` is. It records a copy into a buffer it makes,
+/// which the `TextureRead` holds until it's dropped: a program drops a read once it has its
+/// bytes. A level of 4 GiB or more of padded rows panics.
+pub fn read_texture<F: Format, S: TexelSource<F>>(from: S) -> TextureRead {
+    let a = from.source()
+    let (row, bh) = padded_rows::<F>(a)
+    let total = u64(row) * u64(bh)
+    if total > 4294967295 {
+        panic("read_texture: the level's padded rows are 4 GiB or more, more than one read carries")
+    }
+    let bytes = u32(total)
+    var staging: GpuBuffer<u32> = buffer(bytes / 4)
+    record_to_buffer(a, staging.handle, row)
+    // The staging buffer's bytes, as `read` would ask for its elements.
+    let request = next_request()
+    read_buffer_command(request, staging.handle, 0, bytes)
+    TextureRead {
+        staging,
+        pending: Pending::new(request),
+        row,
+        packed: row_bytes::<F>(a.width),
+        height: bh,
+    }
+}
+
+/// A texture's texels on their way back to the CPU (`read_texture`). It holds the buffer the
+/// texels are copied into until it's dropped, after its answer as before it.
+pub struct TextureRead {
+    staging: GpuBuffer<u32>,
+    pending: Pending<u8>,
+    row: u32,
+    packed: u32,
+    height: u32,
+}
+
+impl TextureRead {
+    /// Its texels' bytes, once they've come back: `None` until then, and `Some(Err)` if the read
+    /// failed. Its buffer stays until the read is dropped.
+    pub fn poll(mut self) -> Option<Result<Vec<u8>, IoError>> {
+        match self.pending.poll() {
+            None => None,
+            Some(Err(e)) => Some(Err(e)),
+            Some(Ok(bytes)) => {
+                var out = take bytes
+                if self.row != self.packed {
+                    // Each row moves down over the padding of the rows above it.
+                    for y in 1..self.height {
+                        for b in 0..self.packed {
+                            out[y * self.packed + b] = out[y * self.row + b]
+                        }
+                    }
+                    out.truncate(self.packed * self.height)
+                }
+                Some(Ok(out))
+            },
+        }
+    }
+}
+
+/// An open pass that draws into a texture: what `begin_pass` gives. It borrows its target until
+/// `end()`, so the pass's draws can't bind it.
+pub borrow struct Pass<F: Target> {
+    pub target: mut Texture<F>,
+}
+
+impl<F: Target> Pass<F> {
+    /// Ends the pass.
+    pub fn end(self) {
+        end_pass_command()
+    }
+}
+
+impl<F: Target> RenderPass for Pass<F> {}
+
+/// An open pass with a colour target and a depth target.
+pub borrow struct DepthPass<F: Target> {
+    pub target: mut Texture<F>,
+    pub depth: mut DepthTexture,
+}
+
+impl<F: Target> DepthPass<F> {
+    /// Ends the pass.
+    pub fn end(self) {
+        end_pass_command()
+    }
+}
+
+impl<F: Target> RenderPass for DepthPass<F> {}
+
+/// An open pass that draws only depths, into its depth target (a shadow map).
+pub borrow struct DepthOnlyPass {
+    pub depth: mut DepthTexture,
+}
+
+impl DepthOnlyPass {
+    /// Ends the pass.
+    pub fn end(self) {
+        end_pass_command()
+    }
+}
+
+impl RenderPass for DepthOnlyPass {}
+
+/// An open pass on the screen with a depth target.
+pub borrow struct ScreenDepthPass {
+    pub depth: mut DepthTexture,
+}
+
+impl ScreenDepthPass {
+    /// Ends the pass and shows it.
+    pub fn present(self) {
+        present()
+    }
+}
+
+impl RenderPass for ScreenDepthPass {}
+
+/// An open pass that draws into one layer of an array (or a cube's face): `begin_layer_pass`,
+/// `begin_face_pass`.
+pub borrow struct LayerPass<F: Target> {
+    pub target: mut TextureArray<F>,
+}
+
+impl<F: Target> LayerPass<F> {
+    /// Ends the pass.
+    pub fn end(self) {
+        end_pass_command()
+    }
+}
+
+impl<F: Target> RenderPass for LayerPass<F> {}
+
+/// An open pass into one layer of an array (or a cube's face), with a depth target.
+pub borrow struct LayerDepthPass<F: Target> {
+    pub target: mut TextureArray<F>,
+    pub depth: mut DepthTexture,
+}
+
+impl<F: Target> LayerDepthPass<F> {
+    /// Ends the pass.
+    pub fn end(self) {
+        end_pass_command()
+    }
+}
+
+impl<F: Target> RenderPass for LayerDepthPass<F> {}
+
+/// An open pass that draws only depths, into one layer of a depth array (a shadow cascade).
+pub borrow struct DepthLayerPass {
+    pub depth: mut DepthTextureArray,
+}
+
+impl DepthLayerPass {
+    /// Ends the pass.
+    pub fn end(self) {
+        end_pass_command()
+    }
+}
+
+impl RenderPass for DepthLayerPass {}
+
+/// An open pass that draws into two textures at once: its fragment shader returns a
+/// `Targets2` of their colours (a G-buffer's, a colour and its motion).
+pub borrow struct Pass2<A: Target, B: Target> {
+    pub first: mut Texture<A>,
+    pub second: mut Texture<B>,
+}
+
+/// An open pass into two textures and a depth target.
+pub borrow struct DepthPass2<A: Target, B: Target> {
+    pub first: mut Texture<A>,
+    pub second: mut Texture<B>,
+    pub depth: mut DepthTexture,
+}
+
+/// An open pass into three textures.
+pub borrow struct Pass3<A: Target, B: Target, C: Target> {
+    pub first: mut Texture<A>,
+    pub second: mut Texture<B>,
+    pub third: mut Texture<C>,
+}
+
+/// An open pass into three textures and a depth target.
+pub borrow struct DepthPass3<A: Target, B: Target, C: Target> {
+    pub first: mut Texture<A>,
+    pub second: mut Texture<B>,
+    pub third: mut Texture<C>,
+    pub depth: mut DepthTexture,
+}
+
+/// An open pass into four textures.
+pub borrow struct Pass4<A: Target, B: Target, C: Target, D: Target> {
+    pub first: mut Texture<A>,
+    pub second: mut Texture<B>,
+    pub third: mut Texture<C>,
+    pub fourth: mut Texture<D>,
+}
+
+/// An open pass into four textures and a depth target.
+pub borrow struct DepthPass4<A: Target, B: Target, C: Target, D: Target> {
+    pub first: mut Texture<A>,
+    pub second: mut Texture<B>,
+    pub third: mut Texture<C>,
+    pub fourth: mut Texture<D>,
+    pub depth: mut DepthTexture,
+}
+
+/// An open pass into five textures.
+pub borrow struct Pass5<A: Target, B: Target, C: Target, D: Target, E: Target> {
+    pub first: mut Texture<A>,
+    pub second: mut Texture<B>,
+    pub third: mut Texture<C>,
+    pub fourth: mut Texture<D>,
+    pub fifth: mut Texture<E>,
+}
+
+/// An open pass into five textures and a depth target.
+pub borrow struct DepthPass5<A: Target, B: Target, C: Target, D: Target, E: Target> {
+    pub first: mut Texture<A>,
+    pub second: mut Texture<B>,
+    pub third: mut Texture<C>,
+    pub fourth: mut Texture<D>,
+    pub fifth: mut Texture<E>,
+    pub depth: mut DepthTexture,
+}
+
+/// An open pass into six textures.
+pub borrow struct Pass6<A: Target, B: Target, C: Target, D: Target, E: Target, F: Target> {
+    pub first: mut Texture<A>,
+    pub second: mut Texture<B>,
+    pub third: mut Texture<C>,
+    pub fourth: mut Texture<D>,
+    pub fifth: mut Texture<E>,
+    pub sixth: mut Texture<F>,
+}
+
+/// An open pass into six textures and a depth target.
+pub borrow struct DepthPass6<A: Target, B: Target, C: Target, D: Target, E: Target, F: Target> {
+    pub first: mut Texture<A>,
+    pub second: mut Texture<B>,
+    pub third: mut Texture<C>,
+    pub fourth: mut Texture<D>,
+    pub fifth: mut Texture<E>,
+    pub sixth: mut Texture<F>,
+    pub depth: mut DepthTexture,
+}
+
+/// An open pass into seven textures.
+pub borrow struct Pass7<A: Target, B: Target, C: Target, D: Target, E: Target, F: Target, G: Target> {
+    pub first: mut Texture<A>,
+    pub second: mut Texture<B>,
+    pub third: mut Texture<C>,
+    pub fourth: mut Texture<D>,
+    pub fifth: mut Texture<E>,
+    pub sixth: mut Texture<F>,
+    pub seventh: mut Texture<G>,
+}
+
+/// An open pass into seven textures and a depth target.
+pub borrow struct DepthPass7<A: Target, B: Target, C: Target, D: Target, E: Target, F: Target, G: Target> {
+    pub first: mut Texture<A>,
+    pub second: mut Texture<B>,
+    pub third: mut Texture<C>,
+    pub fourth: mut Texture<D>,
+    pub fifth: mut Texture<E>,
+    pub sixth: mut Texture<F>,
+    pub seventh: mut Texture<G>,
+    pub depth: mut DepthTexture,
+}
+
+/// An open pass into eight textures.
+pub borrow struct Pass8<A: Target, B: Target, C: Target, D: Target, E: Target, F: Target, G: Target, H: Target> {
+    pub first: mut Texture<A>,
+    pub second: mut Texture<B>,
+    pub third: mut Texture<C>,
+    pub fourth: mut Texture<D>,
+    pub fifth: mut Texture<E>,
+    pub sixth: mut Texture<F>,
+    pub seventh: mut Texture<G>,
+    pub eighth: mut Texture<H>,
+}
+
+/// An open pass into eight textures and a depth target.
+pub borrow struct DepthPass8<A: Target, B: Target, C: Target, D: Target, E: Target, F: Target, G: Target, H: Target> {
+    pub first: mut Texture<A>,
+    pub second: mut Texture<B>,
+    pub third: mut Texture<C>,
+    pub fourth: mut Texture<D>,
+    pub fifth: mut Texture<E>,
+    pub sixth: mut Texture<F>,
+    pub seventh: mut Texture<G>,
+    pub eighth: mut Texture<H>,
+    pub depth: mut DepthTexture,
+}
+
+impl<A: Target, B: Target> Pass2<A, B> {
+    /// Ends the pass.
+    pub fn end(self) {
+        end_pass_command()
+    }
+}
+
+impl<A: Target, B: Target> DepthPass2<A, B> {
+    /// Ends the pass.
+    pub fn end(self) {
+        end_pass_command()
+    }
+}
+
+impl<A: Target, B: Target, C: Target> Pass3<A, B, C> {
+    /// Ends the pass.
+    pub fn end(self) {
+        end_pass_command()
+    }
+}
+
+impl<A: Target, B: Target, C: Target> DepthPass3<A, B, C> {
+    /// Ends the pass.
+    pub fn end(self) {
+        end_pass_command()
+    }
+}
+
+impl<A: Target, B: Target, C: Target, D: Target> Pass4<A, B, C, D> {
+    /// Ends the pass.
+    pub fn end(self) {
+        end_pass_command()
+    }
+}
+
+impl<A: Target, B: Target, C: Target, D: Target> DepthPass4<A, B, C, D> {
+    /// Ends the pass.
+    pub fn end(self) {
+        end_pass_command()
+    }
+}
+
+impl<A: Target, B: Target, C: Target, D: Target, E: Target> Pass5<A, B, C, D, E> {
+    /// Ends the pass.
+    pub fn end(self) {
+        end_pass_command()
+    }
+}
+
+impl<A: Target, B: Target, C: Target, D: Target, E: Target> DepthPass5<A, B, C, D, E> {
+    /// Ends the pass.
+    pub fn end(self) {
+        end_pass_command()
+    }
+}
+
+impl<A: Target, B: Target, C: Target, D: Target, E: Target, F: Target> Pass6<A, B, C, D, E, F> {
+    /// Ends the pass.
+    pub fn end(self) {
+        end_pass_command()
+    }
+}
+
+impl<A: Target, B: Target, C: Target, D: Target, E: Target, F: Target> DepthPass6<A, B, C, D, E, F> {
+    /// Ends the pass.
+    pub fn end(self) {
+        end_pass_command()
+    }
+}
+
+impl<A: Target, B: Target, C: Target, D: Target, E: Target, F: Target, G: Target> Pass7<A, B, C, D, E, F, G> {
+    /// Ends the pass.
+    pub fn end(self) {
+        end_pass_command()
+    }
+}
+
+impl<A: Target, B: Target, C: Target, D: Target, E: Target, F: Target, G: Target> DepthPass7<A, B, C, D, E, F, G> {
+    /// Ends the pass.
+    pub fn end(self) {
+        end_pass_command()
+    }
+}
+
+impl<A: Target, B: Target, C: Target, D: Target, E: Target, F: Target, G: Target, H: Target> Pass8<A, B, C, D, E, F, G, H> {
+    /// Ends the pass.
+    pub fn end(self) {
+        end_pass_command()
+    }
+}
+
+impl<A: Target, B: Target, C: Target, D: Target, E: Target, F: Target, G: Target, H: Target> DepthPass8<A, B, C, D, E, F, G, H> {
+    /// Ends the pass.
+    pub fn end(self) {
+        end_pass_command()
+    }
+}
+
+impl<A: Target, B: Target> RenderPass for Pass2<A, B> {}
+
+impl<A: Target, B: Target> RenderPass for DepthPass2<A, B> {}
+
+impl<A: Target, B: Target, C: Target> RenderPass for Pass3<A, B, C> {}
+
+impl<A: Target, B: Target, C: Target> RenderPass for DepthPass3<A, B, C> {}
+
+impl<A: Target, B: Target, C: Target, D: Target> RenderPass for Pass4<A, B, C, D> {}
+
+impl<A: Target, B: Target, C: Target, D: Target> RenderPass for DepthPass4<A, B, C, D> {}
+
+impl<A: Target, B: Target, C: Target, D: Target, E: Target> RenderPass for Pass5<A, B, C, D, E> {}
+
+impl<A: Target, B: Target, C: Target, D: Target, E: Target> RenderPass for DepthPass5<A, B, C, D, E> {}
+
+impl<A: Target, B: Target, C: Target, D: Target, E: Target, F: Target> RenderPass for Pass6<A, B, C, D, E, F> {}
+
+impl<A: Target, B: Target, C: Target, D: Target, E: Target, F: Target> RenderPass for DepthPass6<A, B, C, D, E, F> {}
+
+impl<A: Target, B: Target, C: Target, D: Target, E: Target, F: Target, G: Target> RenderPass for Pass7<A, B, C, D, E, F, G> {}
+
+impl<A: Target, B: Target, C: Target, D: Target, E: Target, F: Target, G: Target> RenderPass for DepthPass7<A, B, C, D, E, F, G> {}
+
+impl<A: Target, B: Target, C: Target, D: Target, E: Target, F: Target, G: Target, H: Target> RenderPass for Pass8<A, B, C, D, E, F, G, H> {}
+
+impl<A: Target, B: Target, C: Target, D: Target, E: Target, F: Target, G: Target, H: Target> RenderPass for DepthPass8<A, B, C, D, E, F, G, H> {}
+
+/// A fragment shader's colours for a pass of two targets (`begin_pass2`), in target order: each
+/// a `vec4`, a `vec3`, a `vec2` or an `f32` for a float target, a `u32` or `vec2u` for an
+/// integer one, as the target's format takes.
+pub struct Targets2<A, B>: Copy {
+    pub first: A,
+    pub second: B,
+}
+
+/// A fragment shader's colours for a pass of three targets.
+pub struct Targets3<A, B, C>: Copy {
+    pub first: A,
+    pub second: B,
+    pub third: C,
+}
+
+/// A fragment shader's colours for a pass of four targets.
+pub struct Targets4<A, B, C, D>: Copy {
+    pub first: A,
+    pub second: B,
+    pub third: C,
+    pub fourth: D,
+}
+
+/// A fragment shader's colours for a pass of five targets.
+pub struct Targets5<A, B, C, D, E>: Copy {
+    pub first: A,
+    pub second: B,
+    pub third: C,
+    pub fourth: D,
+    pub fifth: E,
+}
+
+/// A fragment shader's colours for a pass of six targets.
+pub struct Targets6<A, B, C, D, E, F>: Copy {
+    pub first: A,
+    pub second: B,
+    pub third: C,
+    pub fourth: D,
+    pub fifth: E,
+    pub sixth: F,
+}
+
+/// A fragment shader's colours for a pass of seven targets.
+pub struct Targets7<A, B, C, D, E, F, G>: Copy {
+    pub first: A,
+    pub second: B,
+    pub third: C,
+    pub fourth: D,
+    pub fifth: E,
+    pub sixth: F,
+    pub seventh: G,
+}
+
+/// A fragment shader's colours for a pass of eight targets.
+pub struct Targets8<A, B, C, D, E, F, G, H>: Copy {
+    pub first: A,
+    pub second: B,
+    pub third: C,
+    pub fourth: D,
+    pub fifth: E,
+    pub sixth: F,
+    pub seventh: G,
+    pub eighth: H,
+}
+
+/// How a draw's colour meets what's in its target, as WebGPU's blend states define them: part
+/// of the draw's pipeline, so a build-time constant (`draw(..., blend: Blend::Add)`).
+pub enum Blend: Copy {
+    /// It replaces what's there (the default).
+    Replace,
+    /// Straight alpha over what's there: colour `src × src.a + dst × (1 − src.a)`, alpha
+    /// `src.a + dst.a × (1 − src.a)`. What a fragment shader returning `Over` gets.
+    Over,
+    /// Premultiplied alpha: colour `src + dst × (1 − src.a)`, alpha likewise.
+    Premultiplied,
+    /// `src + dst`, each channel: light that adds, accumulation.
+    Add,
+    /// `src × dst`, each channel: what's there darkened, transmittance.
+    Multiply,
+    /// The least of each channel.
+    Min,
+    /// The greatest of each channel.
+    Max,
+}
+
+/// The pass attachment that isn't there.
+const NO_TARGET: u32 = 4294967295
+/// The pass attachment that is the screen.
+const SCREEN_TARGET: u32 = 4294967294
+
+/// Starts a pass that draws into level `level` of `target`: cleared to `clear` (its first
+/// channels, for a format of fewer), or keeping what's there.
+pub fn begin_pass<F: Target>(
+    target: mut Texture<F>,
+    clear: vec4 = vec4(0.0, 0.0, 0.0, 1.0),
+    keep: bool = false,
+    level: u32 = 0,
+) -> Pass<F> {
+    if level >= target.levels {
+        panic("begin_pass: the target has no such level")
+    }
+    begin1(target.handle, level, 0, clear, keep)
+    Pass { target: mut target }
+}
+
+/// Starts a pass that draws into level `level` of `target`, keeping each fragment nearer than
+/// what `depth` holds. The two must be the same size. Depths are cleared to `clear_depth`, or
+/// kept. A pass that keeps both may `join` the pass before it, if that one ended right before it
+/// on the same targets: the host may run the two as one (on a tile-based GPU, the targets aren't
+/// stored and loaded again between them), which pays when this one is light; its timing alone
+/// (the serial mode) is its own.
+pub fn begin_pass_with_depth<F: Target>(
+    target: mut Texture<F>,
+    depth: mut DepthTexture,
+    clear: vec4 = vec4(0.0, 0.0, 0.0, 1.0),
+    keep: bool = false,
+    clear_depth: f32 = 1.0,
+    keep_depth: bool = false,
+    join: bool = false,
+    level: u32 = 0,
+) -> DepthPass<F> {
+    if level >= target.levels {
+        panic("begin_pass_with_depth: the target has no such level")
+    }
+    begin1(target.handle, level, 0, clear, keep, depth.handle, clear_depth, keep_depth, join)
+    DepthPass { target: mut target, depth: mut depth }
+}
+
+/// Starts a pass that draws only depths into `depth` (its draws' fragment colours go nowhere).
+pub fn begin_depth_pass(
+    depth: mut DepthTexture,
+    clear_depth: f32 = 1.0,
+    keep_depth: bool = false,
+) -> DepthOnlyPass {
+    begin_pass0_command(
+        count: 0,
+        join: 0,
+        depth: depth.handle,
+        depth_layer: 0,
+        keep_depth: u32(keep_depth),
+        clear_depth: clear_depth,
+    )
+    DepthOnlyPass { depth: mut depth }
+}
+
+/// Starts a pass that draws only depths into layer `layer` of `depth` (a shadow cascade).
+pub fn begin_depth_layer_pass(
+    depth: mut DepthTextureArray,
+    layer: u32,
+    clear_depth: f32 = 1.0,
+    keep_depth: bool = false,
+) -> DepthLayerPass {
+    if layer >= depth.layers {
+        panic("begin_depth_layer_pass: the array has no such layer")
+    }
+    begin_pass0_command(
+        count: 0,
+        join: 0,
+        depth: depth.handle,
+        depth_layer: layer,
+        keep_depth: u32(keep_depth),
+        clear_depth: clear_depth,
+    )
+    DepthLayerPass { depth: mut depth }
+}
+
+/// Starts a pass that draws into level `level` of layer `layer` of `target`.
+pub fn begin_layer_pass<F: Target>(
+    target: mut TextureArray<F>,
+    layer: u32,
+    level: u32 = 0,
+    clear: vec4 = vec4(0.0, 0.0, 0.0, 1.0),
+    keep: bool = false,
+) -> LayerPass<F> {
+    if layer >= target.layers || level >= target.levels {
+        panic("begin_layer_pass: the array has no such layer or level")
+    }
+    begin1(target.handle, level, layer, clear, keep)
+    LayerPass { target: mut target }
+}
+
+/// Starts a pass into level `level` of layer `layer` of `target`, with `depth` (its size).
+pub fn begin_layer_pass_with_depth<F: Target>(
+    target: mut TextureArray<F>,
+    layer: u32,
+    depth: mut DepthTexture,
+    level: u32 = 0,
+    clear: vec4 = vec4(0.0, 0.0, 0.0, 1.0),
+    keep: bool = false,
+    clear_depth: f32 = 1.0,
+    keep_depth: bool = false,
+) -> LayerDepthPass<F> {
+    if layer >= target.layers || level >= target.levels {
+        panic("begin_layer_pass_with_depth: the array has no such layer or level")
+    }
+    begin1(target.handle, level, layer, clear, keep, depth.handle, clear_depth, keep_depth)
+    LayerDepthPass { target: mut target, depth: mut depth }
+}
+
+/// Starts a pass that draws into level `level` of face `face` of `target` (+x, -x, +y, -y, +z,
+/// -z): a reflection probe's face.
+pub fn begin_face_pass<F: Target>(
+    target: mut Cubemap<F>,
+    face: u32,
+    level: u32 = 0,
+    clear: vec4 = vec4(0.0, 0.0, 0.0, 1.0),
+    keep: bool = false,
+) -> LayerPass<F> {
+    begin_layer_pass(mut target.array, face, level, clear, keep)
+}
+
+/// Starts a pass into level `level` of face `face` of `target`, with `depth` (its size).
+pub fn begin_face_pass_with_depth<F: Target>(
+    target: mut Cubemap<F>,
+    face: u32,
+    depth: mut DepthTexture,
+    level: u32 = 0,
+    clear: vec4 = vec4(0.0, 0.0, 0.0, 1.0),
+    keep: bool = false,
+    clear_depth: f32 = 1.0,
+) -> LayerDepthPass<F> {
+    begin_layer_pass_with_depth(mut target.array, face, mut depth, level, clear, keep, clear_depth)
+}
+
+/// Starts a pass that draws into two textures at once, each cleared to `clear` or kept. The
+/// targets are the same size, and their bytes a texel as attachments are within WebGPU's 32
+/// (the compiler counts them, E0602: `rgba16float` costs 8, `rgba32float` 16, `r32uint` 4).
+pub fn begin_pass2<A: Target, B: Target>(
+    first: mut Texture<A>,
+    second: mut Texture<B>,
+    clear: vec4 = vec4(0.0, 0.0, 0.0, 1.0),
+    keep: bool = false,
+) -> Pass2<A, B> {
+    begin2(first.handle, second.handle, clear, keep)
+    Pass2 { first: mut first, second: mut second }
+}
+
+/// Starts a pass into two textures with a depth target.
+pub fn begin_pass2_with_depth<A: Target, B: Target>(
+    first: mut Texture<A>,
+    second: mut Texture<B>,
+    depth: mut DepthTexture,
+    clear: vec4 = vec4(0.0, 0.0, 0.0, 1.0),
+    keep: bool = false,
+    clear_depth: f32 = 1.0,
+    keep_depth: bool = false,
+    join: bool = false,
+) -> DepthPass2<A, B> {
+    begin2(first.handle, second.handle, clear, keep, depth.handle, clear_depth, keep_depth, join)
+    DepthPass2 { first: mut first, second: mut second, depth: mut depth }
+}
+
+/// Starts a pass that draws into three textures at once.
+pub fn begin_pass3<A: Target, B: Target, C: Target>(
+    first: mut Texture<A>,
+    second: mut Texture<B>,
+    third: mut Texture<C>,
+    clear: vec4 = vec4(0.0, 0.0, 0.0, 1.0),
+    keep: bool = false,
+) -> Pass3<A, B, C> {
+    begin3(first.handle, second.handle, third.handle, clear, keep)
+    Pass3 { first: mut first, second: mut second, third: mut third }
+}
+
+/// Starts a pass into three textures with a depth target.
+pub fn begin_pass3_with_depth<A: Target, B: Target, C: Target>(
+    first: mut Texture<A>,
+    second: mut Texture<B>,
+    third: mut Texture<C>,
+    depth: mut DepthTexture,
+    clear: vec4 = vec4(0.0, 0.0, 0.0, 1.0),
+    keep: bool = false,
+    clear_depth: f32 = 1.0,
+    keep_depth: bool = false,
+    join: bool = false,
+) -> DepthPass3<A, B, C> {
+    let (a, b, c) = (first.handle, second.handle, third.handle)
+    begin3(a, b, c, clear, keep, depth.handle, clear_depth, keep_depth, join)
+    DepthPass3 { first: mut first, second: mut second, third: mut third, depth: mut depth }
+}
+
+/// Starts a pass that draws into four textures at once.
+pub fn begin_pass4<A: Target, B: Target, C: Target, D: Target>(
+    first: mut Texture<A>,
+    second: mut Texture<B>,
+    third: mut Texture<C>,
+    fourth: mut Texture<D>,
+    clear: vec4 = vec4(0.0, 0.0, 0.0, 1.0),
+    keep: bool = false,
+) -> Pass4<A, B, C, D> {
+    begin4(first.handle, second.handle, third.handle, fourth.handle, clear, keep)
+    Pass4 { first: mut first, second: mut second, third: mut third, fourth: mut fourth }
+}
+
+/// Starts a pass into four textures with a depth target.
+pub fn begin_pass4_with_depth<A: Target, B: Target, C: Target, D: Target>(
+    first: mut Texture<A>,
+    second: mut Texture<B>,
+    third: mut Texture<C>,
+    fourth: mut Texture<D>,
+    depth: mut DepthTexture,
+    clear: vec4 = vec4(0.0, 0.0, 0.0, 1.0),
+    keep: bool = false,
+    clear_depth: f32 = 1.0,
+    keep_depth: bool = false,
+    join: bool = false,
+) -> DepthPass4<A, B, C, D> {
+    let (a, b, c, d) = (first.handle, second.handle, third.handle, fourth.handle)
+    begin4(a, b, c, d, clear, keep, depth.handle, clear_depth, keep_depth, join)
+    DepthPass4 {
+        first: mut first,
+        second: mut second,
+        third: mut third,
+        fourth: mut fourth,
+        depth: mut depth,
+    }
+}
+
+/// Starts a pass that draws into five textures at once.
+pub fn begin_pass5<A: Target, B: Target, C: Target, D: Target, E: Target>(
+    first: mut Texture<A>,
+    second: mut Texture<B>,
+    third: mut Texture<C>,
+    fourth: mut Texture<D>,
+    fifth: mut Texture<E>,
+    clear: vec4 = vec4(0.0, 0.0, 0.0, 1.0),
+    keep: bool = false,
+) -> Pass5<A, B, C, D, E> {
+    let (t0, t1, t2, t3, t4) = (
+        first.handle,
+        second.handle,
+        third.handle,
+        fourth.handle,
+        fifth.handle,
+    )
+    begin5(t0, t1, t2, t3, t4, clear, keep)
+    Pass5 {
+        first: mut first,
+        second: mut second,
+        third: mut third,
+        fourth: mut fourth,
+        fifth: mut fifth,
+    }
+}
+
+/// Starts a pass into five textures with a depth target.
+pub fn begin_pass5_with_depth<A: Target, B: Target, C: Target, D: Target, E: Target>(
+    first: mut Texture<A>,
+    second: mut Texture<B>,
+    third: mut Texture<C>,
+    fourth: mut Texture<D>,
+    fifth: mut Texture<E>,
+    depth: mut DepthTexture,
+    clear: vec4 = vec4(0.0, 0.0, 0.0, 1.0),
+    keep: bool = false,
+    clear_depth: f32 = 1.0,
+    keep_depth: bool = false,
+    join: bool = false,
+) -> DepthPass5<A, B, C, D, E> {
+    let (t0, t1, t2, t3, t4) = (
+        first.handle,
+        second.handle,
+        third.handle,
+        fourth.handle,
+        fifth.handle,
+    )
+    begin5(t0, t1, t2, t3, t4, clear, keep, depth.handle, clear_depth, keep_depth, join)
+    DepthPass5 {
+        first: mut first,
+        second: mut second,
+        third: mut third,
+        fourth: mut fourth,
+        fifth: mut fifth,
+        depth: mut depth,
+    }
+}
+
+/// Starts a pass that draws into six textures at once.
+pub fn begin_pass6<A: Target, B: Target, C: Target, D: Target, E: Target, F: Target>(
+    first: mut Texture<A>,
+    second: mut Texture<B>,
+    third: mut Texture<C>,
+    fourth: mut Texture<D>,
+    fifth: mut Texture<E>,
+    sixth: mut Texture<F>,
+    clear: vec4 = vec4(0.0, 0.0, 0.0, 1.0),
+    keep: bool = false,
+) -> Pass6<A, B, C, D, E, F> {
+    let (t0, t1, t2, t3, t4, t5) = (
+        first.handle,
+        second.handle,
+        third.handle,
+        fourth.handle,
+        fifth.handle,
+        sixth.handle,
+    )
+    begin6(t0, t1, t2, t3, t4, t5, clear, keep)
+    Pass6 {
+        first: mut first,
+        second: mut second,
+        third: mut third,
+        fourth: mut fourth,
+        fifth: mut fifth,
+        sixth: mut sixth,
+    }
+}
+
+/// Starts a pass into six textures with a depth target.
+pub fn begin_pass6_with_depth<A: Target, B: Target, C: Target, D: Target, E: Target, F: Target>(
+    first: mut Texture<A>,
+    second: mut Texture<B>,
+    third: mut Texture<C>,
+    fourth: mut Texture<D>,
+    fifth: mut Texture<E>,
+    sixth: mut Texture<F>,
+    depth: mut DepthTexture,
+    clear: vec4 = vec4(0.0, 0.0, 0.0, 1.0),
+    keep: bool = false,
+    clear_depth: f32 = 1.0,
+    keep_depth: bool = false,
+    join: bool = false,
+) -> DepthPass6<A, B, C, D, E, F> {
+    let (t0, t1, t2, t3, t4, t5) = (
+        first.handle,
+        second.handle,
+        third.handle,
+        fourth.handle,
+        fifth.handle,
+        sixth.handle,
+    )
+    begin6(t0, t1, t2, t3, t4, t5, clear, keep, depth.handle, clear_depth, keep_depth, join)
+    DepthPass6 {
+        first: mut first,
+        second: mut second,
+        third: mut third,
+        fourth: mut fourth,
+        fifth: mut fifth,
+        sixth: mut sixth,
+        depth: mut depth,
+    }
+}
+
+/// Starts a pass that draws into seven textures at once.
+pub fn begin_pass7<A: Target, B: Target, C: Target, D: Target, E: Target, F: Target, G: Target>(
+    first: mut Texture<A>,
+    second: mut Texture<B>,
+    third: mut Texture<C>,
+    fourth: mut Texture<D>,
+    fifth: mut Texture<E>,
+    sixth: mut Texture<F>,
+    seventh: mut Texture<G>,
+    clear: vec4 = vec4(0.0, 0.0, 0.0, 1.0),
+    keep: bool = false,
+) -> Pass7<A, B, C, D, E, F, G> {
+    let (t0, t1, t2, t3, t4, t5, t6) = (
+        first.handle,
+        second.handle,
+        third.handle,
+        fourth.handle,
+        fifth.handle,
+        sixth.handle,
+        seventh.handle,
+    )
+    begin7(t0, t1, t2, t3, t4, t5, t6, clear, keep)
+    Pass7 {
+        first: mut first,
+        second: mut second,
+        third: mut third,
+        fourth: mut fourth,
+        fifth: mut fifth,
+        sixth: mut sixth,
+        seventh: mut seventh,
+    }
+}
+
+/// Starts a pass into seven textures with a depth target.
+pub fn begin_pass7_with_depth<A: Target, B: Target, C: Target, D: Target, E: Target, F: Target, G: Target>(
+    first: mut Texture<A>,
+    second: mut Texture<B>,
+    third: mut Texture<C>,
+    fourth: mut Texture<D>,
+    fifth: mut Texture<E>,
+    sixth: mut Texture<F>,
+    seventh: mut Texture<G>,
+    depth: mut DepthTexture,
+    clear: vec4 = vec4(0.0, 0.0, 0.0, 1.0),
+    keep: bool = false,
+    clear_depth: f32 = 1.0,
+    keep_depth: bool = false,
+    join: bool = false,
+) -> DepthPass7<A, B, C, D, E, F, G> {
+    let (t0, t1, t2, t3, t4, t5, t6) = (
+        first.handle,
+        second.handle,
+        third.handle,
+        fourth.handle,
+        fifth.handle,
+        sixth.handle,
+        seventh.handle,
+    )
+    begin7(t0, t1, t2, t3, t4, t5, t6, clear, keep, depth.handle, clear_depth, keep_depth, join)
+    DepthPass7 {
+        first: mut first,
+        second: mut second,
+        third: mut third,
+        fourth: mut fourth,
+        fifth: mut fifth,
+        sixth: mut sixth,
+        seventh: mut seventh,
+        depth: mut depth,
+    }
+}
+
+/// Starts a pass that draws into eight textures at once.
+pub fn begin_pass8<A: Target, B: Target, C: Target, D: Target, E: Target, F: Target, G: Target, H: Target>(
+    first: mut Texture<A>,
+    second: mut Texture<B>,
+    third: mut Texture<C>,
+    fourth: mut Texture<D>,
+    fifth: mut Texture<E>,
+    sixth: mut Texture<F>,
+    seventh: mut Texture<G>,
+    eighth: mut Texture<H>,
+    clear: vec4 = vec4(0.0, 0.0, 0.0, 1.0),
+    keep: bool = false,
+) -> Pass8<A, B, C, D, E, F, G, H> {
+    let (t0, t1, t2, t3, t4, t5, t6, t7) = (
+        first.handle,
+        second.handle,
+        third.handle,
+        fourth.handle,
+        fifth.handle,
+        sixth.handle,
+        seventh.handle,
+        eighth.handle,
+    )
+    begin8(t0, t1, t2, t3, t4, t5, t6, t7, clear, keep)
+    Pass8 {
+        first: mut first,
+        second: mut second,
+        third: mut third,
+        fourth: mut fourth,
+        fifth: mut fifth,
+        sixth: mut sixth,
+        seventh: mut seventh,
+        eighth: mut eighth,
+    }
+}
+
+/// Starts a pass into eight textures with a depth target.
+pub fn begin_pass8_with_depth<A: Target, B: Target, C: Target, D: Target, E: Target, F: Target, G: Target, H: Target>(
+    first: mut Texture<A>,
+    second: mut Texture<B>,
+    third: mut Texture<C>,
+    fourth: mut Texture<D>,
+    fifth: mut Texture<E>,
+    sixth: mut Texture<F>,
+    seventh: mut Texture<G>,
+    eighth: mut Texture<H>,
+    depth: mut DepthTexture,
+    clear: vec4 = vec4(0.0, 0.0, 0.0, 1.0),
+    keep: bool = false,
+    clear_depth: f32 = 1.0,
+    keep_depth: bool = false,
+    join: bool = false,
+) -> DepthPass8<A, B, C, D, E, F, G, H> {
+    let (t0, t1, t2, t3, t4, t5, t6, t7) = (
+        first.handle,
+        second.handle,
+        third.handle,
+        fourth.handle,
+        fifth.handle,
+        sixth.handle,
+        seventh.handle,
+        eighth.handle,
+    )
+    begin8(t0, t1, t2, t3, t4, t5, t6, t7, clear, keep, depth.handle, clear_depth, keep_depth, join)
+    DepthPass8 {
+        first: mut first,
+        second: mut second,
+        third: mut third,
+        fourth: mut fourth,
+        fifth: mut fifth,
+        sixth: mut sixth,
+        seventh: mut seventh,
+        eighth: mut eighth,
+        depth: mut depth,
+    }
+}
+
+/// Starts drawing to the screen, cleared to `clear`, with `depth` as its depth target (the
+/// screen's size). A client's only.
+@client
+pub fn begin_screen_pass_with_depth(
+    depth: mut DepthTexture,
+    clear: vec4 = vec4(0.0, 0.0, 0.0, 1.0),
+    clear_depth: f32 = 1.0,
+) -> ScreenDepthPass {
+    begin1(
+        SCREEN_TARGET,
+        level: 0,
+        layer: 0,
+        clear: clear,
+        keep: false,
+        depth: depth.handle,
+        clear_depth: clear_depth,
+    )
+    ScreenDepthPass { depth: mut depth }
+}
+
+/// Records the start of a pass into one colour target: level `level` of layer `layer` of texture
+/// `t` (or the screen), cleared to `clear` or kept; and depth target `depth` (`NO_TARGET` for
+/// none), cleared to `clear_depth` or kept, which may `join` the pass before it.
+fn begin1(
+    t: u32,
+    level: u32,
+    layer: u32,
+    clear: vec4,
+    keep: bool,
+    depth: u32 = NO_TARGET,
+    clear_depth: f32 = 1.0,
+    keep_depth: bool = false,
+    join: bool = false,
+) {
+    begin_pass1_command(
+        count: 1,
+        join: u32(join),
+        t0: t,
+        level0: level,
+        layer0: layer,
+        keep0: u32(keep),
+        r0: clear.x,
+        g0: clear.y,
+        b0: clear.z,
+        a0: clear.w,
+        depth: depth,
+        depth_layer: 0,
+        keep_depth: u32(keep_depth),
+        clear_depth: clear_depth,
+    )
+}
+
+/// Records the start of a pass into two colour targets, the level 0 of textures `t0` and `t1`,
+/// each cleared to `clear` or kept, and a depth target as `begin1`'s.
+fn begin2(
+    t0: u32,
+    t1: u32,
+    clear: vec4,
+    keep: bool,
+    depth: u32 = NO_TARGET,
+    clear_depth: f32 = 1.0,
+    keep_depth: bool = false,
+    join: bool = false,
+) {
+    let k = u32(keep)
+    let (x, y, z, w) = (clear.x, clear.y, clear.z, clear.w)
+    begin_pass2_command(
+        count: 2,
+        join: u32(join),
+        t0: t0,
+        level0: 0,
+        layer0: 0,
+        keep0: k,
+        r0: x,
+        g0: y,
+        b0: z,
+        a0: w,
+        t1: t1,
+        level1: 0,
+        layer1: 0,
+        keep1: k,
+        r1: x,
+        g1: y,
+        b1: z,
+        a1: w,
+        depth: depth,
+        depth_layer: 0,
+        keep_depth: u32(keep_depth),
+        clear_depth: clear_depth,
+    )
+}
+
+/// Records the start of a pass into three colour targets, as `begin2`.
+fn begin3(
+    t0: u32,
+    t1: u32,
+    t2: u32,
+    clear: vec4,
+    keep: bool,
+    depth: u32 = NO_TARGET,
+    clear_depth: f32 = 1.0,
+    keep_depth: bool = false,
+    join: bool = false,
+) {
+    let k = u32(keep)
+    let (x, y, z, w) = (clear.x, clear.y, clear.z, clear.w)
+    begin_pass3_command(
+        count: 3,
+        join: u32(join),
+        t0: t0,
+        level0: 0,
+        layer0: 0,
+        keep0: k,
+        r0: x,
+        g0: y,
+        b0: z,
+        a0: w,
+        t1: t1,
+        level1: 0,
+        layer1: 0,
+        keep1: k,
+        r1: x,
+        g1: y,
+        b1: z,
+        a1: w,
+        t2: t2,
+        level2: 0,
+        layer2: 0,
+        keep2: k,
+        r2: x,
+        g2: y,
+        b2: z,
+        a2: w,
+        depth: depth,
+        depth_layer: 0,
+        keep_depth: u32(keep_depth),
+        clear_depth: clear_depth,
+    )
+}
+
+/// Records the start of a pass into four colour targets, as `begin2`.
+fn begin4(
+    t0: u32,
+    t1: u32,
+    t2: u32,
+    t3: u32,
+    clear: vec4,
+    keep: bool,
+    depth: u32 = NO_TARGET,
+    clear_depth: f32 = 1.0,
+    keep_depth: bool = false,
+    join: bool = false,
+) {
+    let k = u32(keep)
+    let (x, y, z, w) = (clear.x, clear.y, clear.z, clear.w)
+    begin_pass4_command(
+        count: 4,
+        join: u32(join),
+        t0: t0,
+        level0: 0,
+        layer0: 0,
+        keep0: k,
+        r0: x,
+        g0: y,
+        b0: z,
+        a0: w,
+        t1: t1,
+        level1: 0,
+        layer1: 0,
+        keep1: k,
+        r1: x,
+        g1: y,
+        b1: z,
+        a1: w,
+        t2: t2,
+        level2: 0,
+        layer2: 0,
+        keep2: k,
+        r2: x,
+        g2: y,
+        b2: z,
+        a2: w,
+        t3: t3,
+        level3: 0,
+        layer3: 0,
+        keep3: k,
+        r3: x,
+        g3: y,
+        b3: z,
+        a3: w,
+        depth: depth,
+        depth_layer: 0,
+        keep_depth: u32(keep_depth),
+        clear_depth: clear_depth,
+    )
+}
+
+/// Records the start of a pass into five colour targets, as `begin2`.
+fn begin5(
+    t0: u32,
+    t1: u32,
+    t2: u32,
+    t3: u32,
+    t4: u32,
+    clear: vec4,
+    keep: bool,
+    depth: u32 = NO_TARGET,
+    clear_depth: f32 = 1.0,
+    keep_depth: bool = false,
+    join: bool = false,
+) {
+    let k = u32(keep)
+    let (x, y, z, w) = (clear.x, clear.y, clear.z, clear.w)
+    begin_pass5_command(
+        count: 5,
+        join: u32(join),
+        t0: t0,
+        level0: 0,
+        layer0: 0,
+        keep0: k,
+        r0: x,
+        g0: y,
+        b0: z,
+        a0: w,
+        t1: t1,
+        level1: 0,
+        layer1: 0,
+        keep1: k,
+        r1: x,
+        g1: y,
+        b1: z,
+        a1: w,
+        t2: t2,
+        level2: 0,
+        layer2: 0,
+        keep2: k,
+        r2: x,
+        g2: y,
+        b2: z,
+        a2: w,
+        t3: t3,
+        level3: 0,
+        layer3: 0,
+        keep3: k,
+        r3: x,
+        g3: y,
+        b3: z,
+        a3: w,
+        t4: t4,
+        level4: 0,
+        layer4: 0,
+        keep4: k,
+        r4: x,
+        g4: y,
+        b4: z,
+        a4: w,
+        depth: depth,
+        depth_layer: 0,
+        keep_depth: u32(keep_depth),
+        clear_depth: clear_depth,
+    )
+}
+
+/// Records the start of a pass into six colour targets, as `begin2`.
+fn begin6(
+    t0: u32,
+    t1: u32,
+    t2: u32,
+    t3: u32,
+    t4: u32,
+    t5: u32,
+    clear: vec4,
+    keep: bool,
+    depth: u32 = NO_TARGET,
+    clear_depth: f32 = 1.0,
+    keep_depth: bool = false,
+    join: bool = false,
+) {
+    let k = u32(keep)
+    let (x, y, z, w) = (clear.x, clear.y, clear.z, clear.w)
+    begin_pass6_command(
+        count: 6,
+        join: u32(join),
+        t0: t0,
+        level0: 0,
+        layer0: 0,
+        keep0: k,
+        r0: x,
+        g0: y,
+        b0: z,
+        a0: w,
+        t1: t1,
+        level1: 0,
+        layer1: 0,
+        keep1: k,
+        r1: x,
+        g1: y,
+        b1: z,
+        a1: w,
+        t2: t2,
+        level2: 0,
+        layer2: 0,
+        keep2: k,
+        r2: x,
+        g2: y,
+        b2: z,
+        a2: w,
+        t3: t3,
+        level3: 0,
+        layer3: 0,
+        keep3: k,
+        r3: x,
+        g3: y,
+        b3: z,
+        a3: w,
+        t4: t4,
+        level4: 0,
+        layer4: 0,
+        keep4: k,
+        r4: x,
+        g4: y,
+        b4: z,
+        a4: w,
+        t5: t5,
+        level5: 0,
+        layer5: 0,
+        keep5: k,
+        r5: x,
+        g5: y,
+        b5: z,
+        a5: w,
+        depth: depth,
+        depth_layer: 0,
+        keep_depth: u32(keep_depth),
+        clear_depth: clear_depth,
+    )
+}
+
+/// Records the start of a pass into seven colour targets, as `begin2`.
+fn begin7(
+    t0: u32,
+    t1: u32,
+    t2: u32,
+    t3: u32,
+    t4: u32,
+    t5: u32,
+    t6: u32,
+    clear: vec4,
+    keep: bool,
+    depth: u32 = NO_TARGET,
+    clear_depth: f32 = 1.0,
+    keep_depth: bool = false,
+    join: bool = false,
+) {
+    let k = u32(keep)
+    let (x, y, z, w) = (clear.x, clear.y, clear.z, clear.w)
+    begin_pass7_command(
+        count: 7,
+        join: u32(join),
+        t0: t0,
+        level0: 0,
+        layer0: 0,
+        keep0: k,
+        r0: x,
+        g0: y,
+        b0: z,
+        a0: w,
+        t1: t1,
+        level1: 0,
+        layer1: 0,
+        keep1: k,
+        r1: x,
+        g1: y,
+        b1: z,
+        a1: w,
+        t2: t2,
+        level2: 0,
+        layer2: 0,
+        keep2: k,
+        r2: x,
+        g2: y,
+        b2: z,
+        a2: w,
+        t3: t3,
+        level3: 0,
+        layer3: 0,
+        keep3: k,
+        r3: x,
+        g3: y,
+        b3: z,
+        a3: w,
+        t4: t4,
+        level4: 0,
+        layer4: 0,
+        keep4: k,
+        r4: x,
+        g4: y,
+        b4: z,
+        a4: w,
+        t5: t5,
+        level5: 0,
+        layer5: 0,
+        keep5: k,
+        r5: x,
+        g5: y,
+        b5: z,
+        a5: w,
+        t6: t6,
+        level6: 0,
+        layer6: 0,
+        keep6: k,
+        r6: x,
+        g6: y,
+        b6: z,
+        a6: w,
+        depth: depth,
+        depth_layer: 0,
+        keep_depth: u32(keep_depth),
+        clear_depth: clear_depth,
+    )
+}
+
+/// Records the start of a pass into eight colour targets, as `begin2`.
+fn begin8(
+    t0: u32,
+    t1: u32,
+    t2: u32,
+    t3: u32,
+    t4: u32,
+    t5: u32,
+    t6: u32,
+    t7: u32,
+    clear: vec4,
+    keep: bool,
+    depth: u32 = NO_TARGET,
+    clear_depth: f32 = 1.0,
+    keep_depth: bool = false,
+    join: bool = false,
+) {
+    let k = u32(keep)
+    let (x, y, z, w) = (clear.x, clear.y, clear.z, clear.w)
+    begin_pass8_command(
+        count: 8,
+        join: u32(join),
+        t0: t0,
+        level0: 0,
+        layer0: 0,
+        keep0: k,
+        r0: x,
+        g0: y,
+        b0: z,
+        a0: w,
+        t1: t1,
+        level1: 0,
+        layer1: 0,
+        keep1: k,
+        r1: x,
+        g1: y,
+        b1: z,
+        a1: w,
+        t2: t2,
+        level2: 0,
+        layer2: 0,
+        keep2: k,
+        r2: x,
+        g2: y,
+        b2: z,
+        a2: w,
+        t3: t3,
+        level3: 0,
+        layer3: 0,
+        keep3: k,
+        r3: x,
+        g3: y,
+        b3: z,
+        a3: w,
+        t4: t4,
+        level4: 0,
+        layer4: 0,
+        keep4: k,
+        r4: x,
+        g4: y,
+        b4: z,
+        a4: w,
+        t5: t5,
+        level5: 0,
+        layer5: 0,
+        keep5: k,
+        r5: x,
+        g5: y,
+        b5: z,
+        a5: w,
+        t6: t6,
+        level6: 0,
+        layer6: 0,
+        keep6: k,
+        r6: x,
+        g6: y,
+        b6: z,
+        a6: w,
+        t7: t7,
+        level7: 0,
+        layer7: 0,
+        keep7: k,
+        r7: x,
+        g7: y,
+        b7: z,
+        a7: w,
+        depth: depth,
+        depth_layer: 0,
+        keep_depth: u32(keep_depth),
+        clear_depth: clear_depth,
+    )
+}
+
+/// A texture array of format `F` that a kernel writes, each invocation only its own texel:
+/// (`id.x`, `id.y`) of layer `id.z` of its `GlobalId`. A kernel's `mut TexelsArray<F>`
+/// parameter, for which CPU code passes `mut arr` of a `TextureArray<F>` made by
+/// `writable_texture_array` (its first level of every layer).
+pub struct TexelsArray<F: Storage> {
+    unused: u32,
+}
+
+impl<F: Storage> TexelsArray<F> {
+    /// Writes `value` to the invocation's own texel, (`id.x`, `id.y`) of layer `id.z`.
+    pub fn store(mut self, id: GlobalId, value: F::Texel) {
+        texels_array_store(mut self, id.x, id.y, id.z, value)
+    }
+}
+
+/// One step of a mip chain, as a kernel sees it: the level it writes, each invocation its own
+/// texel (`id.x`, `id.y`), and the level before it, which it reads. A kernel's `mut MipStep<F>`
+/// parameter, for which CPU code passes `tex.mip_step(i)`. What it computes from the level
+/// before is the kernel's: a filtered average (`generate_mips`), the farthest of a depth
+/// pyramid's texels, a bloom's blur.
+pub struct MipStep<F: Storage> {
+    unused: u32,
+}
+
+impl<F: Storage> MipStep<F> {
+    /// The level it reads's texel at (`x`, `y`), unfiltered.
+    pub fn load(self, x: u32, y: u32) -> F::Texel {
+        mip_step_load(self, x, y)
+    }
+
+    /// The level it reads's width and height.
+    pub fn source_size(self) -> vec2u {
+        vec2u(mip_step_width(self), mip_step_height(self))
+    }
+
+    /// Writes `value` to the invocation's own texel of the level it writes.
+    pub fn store(mut self, id: GlobalId, value: F::Texel) {
+        mip_step_store(mut self, id.x, id.y, value)
+    }
+}
+
+impl<F: Storage + Filtered> MipStep<F> {
+    /// The level it reads, filtered by `s` at (`u`, `v`) in [0, 1]: any GPU code.
+    pub fn sample(self, s: Sampler, uv: vec2) -> F::Texel {
+        mip_step_sample(self, s, uv)
+    }
+}
+
+@compute(8, 8)
+fn downsample<F: Storage + Filtered>(step: mut MipStep<F>, s: Sampler, size: vec2u, id: GlobalId) {
+    if id.x < size.x && id.y < size.y {
+        let uv = (vec2(f32(id.x), f32(id.y)) + vec2(0.5)) / vec2(f32(size.x), f32(size.y))
+        step.store(id, step.sample(s, uv))
+    }
+}
+
+/// Fills levels 1 to the last of `tex` from level 0, each the average of the level before it
+/// (`s`, a linear sampler, filters each texel from the four under it): `levels - 1` dispatches,
+/// each binding level `i - 1` to read and level `i` to write, never the whole chain (WebGPU
+/// refuses a binding that both reads and writes a level). A `Storage` and `Filtered` format,
+/// made by `writable_texture`.
+pub fn generate_mips<F: Storage + Filtered>(tex: mut Texture<F>, s: Sampler) {
+    let levels = tex.levels
+    for i in 1..levels {
+        let size = vec2u(level_side(tex.width, i), level_side(tex.height, i))
+        let groups = (blocks(size.x, 8), blocks(size.y, 8), 1)
+        dispatch(downsample.bind(tex.mip_step(i), s, size), groups: groups)
+    }
+}
+
+@intrinsic
+fn new_texture(width: u32, height: u32, format: u32, kind: u32, layers: u32, levels: u32) -> u32 {}
+
+/// A texture of `format` (whose blocks are `block` texels square, `bytes` each), counted in
+/// `memory()`.
+fn create_texture_of(
+    width: u32,
+    height: u32,
+    format: u32,
+    kind: u32,
+    layers: u32,
+    levels: u32,
+    bytes: u32,
+    block: u32,
+) -> u32 {
+    let handle = new_texture(width, height, format, kind, layers, levels)
+    count_memory(TEXTURES, texture_bytes(width, height, layers, levels, bytes, block), add: true)
+    handle
+}
+
+/// A texture's bytes as the hosts count them: each level's blocks, for each layer (a 3D
+/// texture's depth counts as its layers).
+fn texture_bytes(width: u32, height: u32, layers: u32, levels: u32, bytes: u32, block: u32) -> u64 {
+    var total: u64 = 0
+    for l in 0..levels {
+        let w = blocks(level_side(width, l), block)
+        let h = blocks(level_side(height, l), block)
+        total += u64(w) * u64(h) * u64(bytes)
+    }
+    total * u64(layers)
+}
+
+/// A colour texture's bytes, its texels of format `F`, as `texture_bytes` counts them.
+fn colour_bytes<F: Format>(width: u32, height: u32, layers: u32, levels: u32) -> u64 {
+    texture_bytes(width, height, layers, levels, F::bytes(), F::block())
+}
+
+/// Destroys texture `handle`, its bytes uncounted from `memory()`.
+fn drop_texture(handle: u32, bytes: u64) {
+    destroy_texture(handle)
+    count_memory(TEXTURES, bytes, add: false)
+}
+
+@intrinsic
+fn write_texture_rows(
+    handle: u32,
+    level: u32,
+    layer: u32,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    bytes: [u8],
+    from: u32,
+    count: u32,
+) {}
+
+@intrinsic
+fn destroy_texture(handle: u32) {}
+
+@intrinsic
+fn create_sampler(
+    linear: u32,
+    repeat: u32,
+    compare: u32,
+    mip_linear: u32,
+    anisotropy: u32,
+) -> u32 {}
+
+@intrinsic
+fn destroy_sampler(handle: u32) {}
+
+@intrinsic
+fn copy_texture_command(
+    from: u32,
+    from_level: u32,
+    from_layer: u32,
+    x: u32,
+    y: u32,
+    to: u32,
+    to_level: u32,
+    to_layer: u32,
+    to_x: u32,
+    to_y: u32,
+    width: u32,
+    height: u32,
+) {}
+
+@intrinsic
+fn copy_texture_to_buffer_command(
+    texture: u32,
+    level: u32,
+    layer: u32,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    buffer: u32,
+    offset: u32,
+    bytes_per_row: u32,
+) {}
+
+@intrinsic
+fn copy_buffer_to_texture_command(
+    buffer: u32,
+    offset: u32,
+    bytes_per_row: u32,
+    texture: u32,
+    level: u32,
+    layer: u32,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+) {}
+
+@intrinsic
+fn begin_pass0_command(
+    count: u32,
+    join: u32,
+    depth: u32,
+    depth_layer: u32,
+    keep_depth: u32,
+    clear_depth: f32,
+) {}
+
+@intrinsic
+fn begin_pass1_command(
+    count: u32,
+    join: u32,
+    t0: u32,
+    level0: u32,
+    layer0: u32,
+    keep0: u32,
+    r0: f32,
+    g0: f32,
+    b0: f32,
+    a0: f32,
+    depth: u32,
+    depth_layer: u32,
+    keep_depth: u32,
+    clear_depth: f32,
+) {}
+
+@intrinsic
+fn begin_pass2_command(
+    count: u32,
+    join: u32,
+    t0: u32,
+    level0: u32,
+    layer0: u32,
+    keep0: u32,
+    r0: f32,
+    g0: f32,
+    b0: f32,
+    a0: f32,
+    t1: u32,
+    level1: u32,
+    layer1: u32,
+    keep1: u32,
+    r1: f32,
+    g1: f32,
+    b1: f32,
+    a1: f32,
+    depth: u32,
+    depth_layer: u32,
+    keep_depth: u32,
+    clear_depth: f32,
+) {}
+
+@intrinsic
+fn begin_pass3_command(
+    count: u32,
+    join: u32,
+    t0: u32,
+    level0: u32,
+    layer0: u32,
+    keep0: u32,
+    r0: f32,
+    g0: f32,
+    b0: f32,
+    a0: f32,
+    t1: u32,
+    level1: u32,
+    layer1: u32,
+    keep1: u32,
+    r1: f32,
+    g1: f32,
+    b1: f32,
+    a1: f32,
+    t2: u32,
+    level2: u32,
+    layer2: u32,
+    keep2: u32,
+    r2: f32,
+    g2: f32,
+    b2: f32,
+    a2: f32,
+    depth: u32,
+    depth_layer: u32,
+    keep_depth: u32,
+    clear_depth: f32,
+) {}
+
+@intrinsic
+fn begin_pass4_command(
+    count: u32,
+    join: u32,
+    t0: u32,
+    level0: u32,
+    layer0: u32,
+    keep0: u32,
+    r0: f32,
+    g0: f32,
+    b0: f32,
+    a0: f32,
+    t1: u32,
+    level1: u32,
+    layer1: u32,
+    keep1: u32,
+    r1: f32,
+    g1: f32,
+    b1: f32,
+    a1: f32,
+    t2: u32,
+    level2: u32,
+    layer2: u32,
+    keep2: u32,
+    r2: f32,
+    g2: f32,
+    b2: f32,
+    a2: f32,
+    t3: u32,
+    level3: u32,
+    layer3: u32,
+    keep3: u32,
+    r3: f32,
+    g3: f32,
+    b3: f32,
+    a3: f32,
+    depth: u32,
+    depth_layer: u32,
+    keep_depth: u32,
+    clear_depth: f32,
+) {}
+
+@intrinsic
+fn begin_pass5_command(
+    count: u32,
+    join: u32,
+    t0: u32,
+    level0: u32,
+    layer0: u32,
+    keep0: u32,
+    r0: f32,
+    g0: f32,
+    b0: f32,
+    a0: f32,
+    t1: u32,
+    level1: u32,
+    layer1: u32,
+    keep1: u32,
+    r1: f32,
+    g1: f32,
+    b1: f32,
+    a1: f32,
+    t2: u32,
+    level2: u32,
+    layer2: u32,
+    keep2: u32,
+    r2: f32,
+    g2: f32,
+    b2: f32,
+    a2: f32,
+    t3: u32,
+    level3: u32,
+    layer3: u32,
+    keep3: u32,
+    r3: f32,
+    g3: f32,
+    b3: f32,
+    a3: f32,
+    t4: u32,
+    level4: u32,
+    layer4: u32,
+    keep4: u32,
+    r4: f32,
+    g4: f32,
+    b4: f32,
+    a4: f32,
+    depth: u32,
+    depth_layer: u32,
+    keep_depth: u32,
+    clear_depth: f32,
+) {}
+
+@intrinsic
+fn begin_pass6_command(
+    count: u32,
+    join: u32,
+    t0: u32,
+    level0: u32,
+    layer0: u32,
+    keep0: u32,
+    r0: f32,
+    g0: f32,
+    b0: f32,
+    a0: f32,
+    t1: u32,
+    level1: u32,
+    layer1: u32,
+    keep1: u32,
+    r1: f32,
+    g1: f32,
+    b1: f32,
+    a1: f32,
+    t2: u32,
+    level2: u32,
+    layer2: u32,
+    keep2: u32,
+    r2: f32,
+    g2: f32,
+    b2: f32,
+    a2: f32,
+    t3: u32,
+    level3: u32,
+    layer3: u32,
+    keep3: u32,
+    r3: f32,
+    g3: f32,
+    b3: f32,
+    a3: f32,
+    t4: u32,
+    level4: u32,
+    layer4: u32,
+    keep4: u32,
+    r4: f32,
+    g4: f32,
+    b4: f32,
+    a4: f32,
+    t5: u32,
+    level5: u32,
+    layer5: u32,
+    keep5: u32,
+    r5: f32,
+    g5: f32,
+    b5: f32,
+    a5: f32,
+    depth: u32,
+    depth_layer: u32,
+    keep_depth: u32,
+    clear_depth: f32,
+) {}
+
+@intrinsic
+fn begin_pass7_command(
+    count: u32,
+    join: u32,
+    t0: u32,
+    level0: u32,
+    layer0: u32,
+    keep0: u32,
+    r0: f32,
+    g0: f32,
+    b0: f32,
+    a0: f32,
+    t1: u32,
+    level1: u32,
+    layer1: u32,
+    keep1: u32,
+    r1: f32,
+    g1: f32,
+    b1: f32,
+    a1: f32,
+    t2: u32,
+    level2: u32,
+    layer2: u32,
+    keep2: u32,
+    r2: f32,
+    g2: f32,
+    b2: f32,
+    a2: f32,
+    t3: u32,
+    level3: u32,
+    layer3: u32,
+    keep3: u32,
+    r3: f32,
+    g3: f32,
+    b3: f32,
+    a3: f32,
+    t4: u32,
+    level4: u32,
+    layer4: u32,
+    keep4: u32,
+    r4: f32,
+    g4: f32,
+    b4: f32,
+    a4: f32,
+    t5: u32,
+    level5: u32,
+    layer5: u32,
+    keep5: u32,
+    r5: f32,
+    g5: f32,
+    b5: f32,
+    a5: f32,
+    t6: u32,
+    level6: u32,
+    layer6: u32,
+    keep6: u32,
+    r6: f32,
+    g6: f32,
+    b6: f32,
+    a6: f32,
+    depth: u32,
+    depth_layer: u32,
+    keep_depth: u32,
+    clear_depth: f32,
+) {}
+
+@intrinsic
+fn begin_pass8_command(
+    count: u32,
+    join: u32,
+    t0: u32,
+    level0: u32,
+    layer0: u32,
+    keep0: u32,
+    r0: f32,
+    g0: f32,
+    b0: f32,
+    a0: f32,
+    t1: u32,
+    level1: u32,
+    layer1: u32,
+    keep1: u32,
+    r1: f32,
+    g1: f32,
+    b1: f32,
+    a1: f32,
+    t2: u32,
+    level2: u32,
+    layer2: u32,
+    keep2: u32,
+    r2: f32,
+    g2: f32,
+    b2: f32,
+    a2: f32,
+    t3: u32,
+    level3: u32,
+    layer3: u32,
+    keep3: u32,
+    r3: f32,
+    g3: f32,
+    b3: f32,
+    a3: f32,
+    t4: u32,
+    level4: u32,
+    layer4: u32,
+    keep4: u32,
+    r4: f32,
+    g4: f32,
+    b4: f32,
+    a4: f32,
+    t5: u32,
+    level5: u32,
+    layer5: u32,
+    keep5: u32,
+    r5: f32,
+    g5: f32,
+    b5: f32,
+    a5: f32,
+    t6: u32,
+    level6: u32,
+    layer6: u32,
+    keep6: u32,
+    r6: f32,
+    g6: f32,
+    b6: f32,
+    a6: f32,
+    t7: u32,
+    level7: u32,
+    layer7: u32,
+    keep7: u32,
+    r7: f32,
+    g7: f32,
+    b7: f32,
+    a7: f32,
+    depth: u32,
+    depth_layer: u32,
+    keep_depth: u32,
+    clear_depth: f32,
+) {}
+
+@intrinsic
+fn end_pass_command() {}
+
+@intrinsic
+fn scissor_command(x: u32, y: u32, width: u32, height: u32) {}
+
+@intrinsic
+fn viewport_command(x: f32, y: f32, width: f32, height: f32, min_depth: f32, max_depth: f32) {}
+
+/// Names the passes and dispatches after it in the hosts' timings, up to the next label or the
+/// frame's end (language.md §18): `label("terrain")` before `begin_pass_with_depth(...)`. Before
+/// a frame's first label, a pass is `pass` (`screen pass` on the screen), and a dispatch its
+/// kernel's pipeline.
+pub fn label(name: str) {
+    label_command(name)
+}
+
+@intrinsic
+fn label_command(name: str) {}
+
+@intrinsic
+fn texture_sample<F: Filtered>(t: Texture<F>, s: Sampler, uv: vec2) -> F::Texel {}
+
+@intrinsic
+fn texture_sample_level<F: Filtered>(t: Texture<F>, s: Sampler, uv: vec2, level: f32) -> F::Texel {}
+
+@intrinsic
+fn texture_gather<const C: u32, F: Filtered>(t: Texture<F>, s: Sampler, uv: vec2) -> vec4 {}
+
+@intrinsic
+fn array_gather<const C: u32, F: Filtered>(
+    t: TextureArray<F>,
+    s: Sampler,
+    uv: vec2,
+    layer: u32,
+) -> vec4 {}
+
+@intrinsic
+fn depth_gather(t: DepthTexture, s: Sampler, uv: vec2) -> vec4 {}
+
+@intrinsic
+fn depth_gather_compare(t: DepthTexture, s: ComparisonSampler, uv: vec2, reference: f32) -> vec4 {}
+
+@intrinsic
+fn depth_array_gather(t: DepthTextureArray, s: Sampler, uv: vec2, layer: u32) -> vec4 {}
+
+@intrinsic
+fn depth_array_gather_compare(
+    t: DepthTextureArray,
+    s: ComparisonSampler,
+    uv: vec2,
+    layer: u32,
+    reference: f32,
+) -> vec4 {}
+
+@intrinsic
+fn texture_sample_grad<F: Filtered>(
+    t: Texture<F>,
+    s: Sampler,
+    uv: vec2,
+    ddx: vec2,
+    ddy: vec2,
+) -> F::Texel {}
+
+@intrinsic
+fn texture_sample_bias<F: Filtered>(t: Texture<F>, s: Sampler, uv: vec2, bias: f32) -> F::Texel {}
+
+@intrinsic
+fn texture_sample_compare(t: DepthTexture, s: ComparisonSampler, uv: vec2, reference: f32) -> f32 {}
+
+@intrinsic
+fn texture_sample_compare_level(
+    t: DepthTexture,
+    s: ComparisonSampler,
+    uv: vec2,
+    reference: f32,
+) -> f32 {}
+
+@intrinsic
+fn texture_load<F: Format>(t: Texture<F>, x: u32, y: u32, level: u32) -> F::Texel {}
+
+@intrinsic
+fn depth_load(t: DepthTexture, x: u32, y: u32, level: u32) -> f32 {}
+
+@intrinsic
+fn array_sample<F: Filtered>(t: TextureArray<F>, s: Sampler, uv: vec2, layer: u32) -> F::Texel {}
+
+@intrinsic
+fn array_sample_level<F: Filtered>(
+    t: TextureArray<F>,
+    s: Sampler,
+    uv: vec2,
+    layer: u32,
+    level: f32,
+) -> F::Texel {}
+
+@intrinsic
+fn array_sample_grad<F: Filtered>(
+    t: TextureArray<F>,
+    s: Sampler,
+    uv: vec2,
+    layer: u32,
+    ddx: vec2,
+    ddy: vec2,
+) -> F::Texel {}
+
+@intrinsic
+fn array_load<F: Format>(t: TextureArray<F>, x: u32, y: u32, layer: u32, level: u32) -> F::Texel {}
+
+@intrinsic
+fn cube_sample<F: Filtered>(t: Cubemap<F>, s: Sampler, dir: vec3) -> F::Texel {}
+
+@intrinsic
+fn cube_sample_level<F: Filtered>(t: Cubemap<F>, s: Sampler, dir: vec3, level: f32) -> F::Texel {}
+
+@intrinsic
+fn depth_array_compare(
+    t: DepthTextureArray,
+    s: ComparisonSampler,
+    uv: vec2,
+    layer: u32,
+    reference: f32,
+) -> f32 {}
+
+@intrinsic
+fn depth_array_compare_level(
+    t: DepthTextureArray,
+    s: ComparisonSampler,
+    uv: vec2,
+    layer: u32,
+    reference: f32,
+) -> f32 {}
+
+@intrinsic
+fn depth_array_load(t: DepthTextureArray, x: u32, y: u32, layer: u32, level: u32) -> f32 {}
+
+@intrinsic
+fn texture3d_sample_level<F: Storage + Filtered>(
+    t: Texture3d<F>,
+    s: Sampler,
+    uvw: vec3,
+    level: f32,
+) -> F::Texel {}
+
+@intrinsic
+fn texture3d_load<F: Storage>(t: Texture3d<F>, x: u32, y: u32, z: u32, level: u32) -> F::Texel {}
+
+@intrinsic
+fn texture3d_handle_load<F: Storage>(
+    t: Texture3dHandle<F>,
+    x: u32,
+    y: u32,
+    z: u32,
+    level: u32,
+) -> F::Texel {}
+
+@intrinsic
+fn mip_step_load<F: Storage>(m: MipStep<F>, x: u32, y: u32) -> F::Texel {}
+
+@intrinsic
+fn mip_step_sample<F: Storage + Filtered>(m: MipStep<F>, s: Sampler, uv: vec2) -> F::Texel {}
+
+@intrinsic
+fn mip_step_width<F: Storage>(m: MipStep<F>) -> u32 {}
+
+@intrinsic
+fn mip_step_height<F: Storage>(m: MipStep<F>) -> u32 {}
+
+@intrinsic
+fn texture_width<T>(t: T) -> u32 {}
+
+@intrinsic
+fn texture_height<T>(t: T) -> u32 {}
+
+@intrinsic
+fn texture_depth<T>(t: T) -> u32 {}
+
+@intrinsic
+fn texture_levels<T>(t: T) -> u32 {}
+
+@intrinsic
+fn texture_layers<T>(t: T) -> u32 {}
+
+// ---- readback, indirect work and limits -------------------------------------------------------
+
+/// Reads a span of a buffer back to the CPU, once the GPU work recorded before it is done: a
+/// request, answered on a later call (§17.1). It's `nondet`: when the answer arrives depends on
+/// the GPU.
+pub fn read<T: GpuData + Plain>(span: GpuSpan<T>) -> Pending<T> {
+    let n = size_of::<T>()
+    let request = next_request()
+    read_buffer_command(request, span.buffer.handle, span.start * n, span.count * n)
+    Pending::new(request)
+}
+
+@intrinsic
+fn read_buffer_command(request: u32, handle: u32, offset: u32, size: u32) {}
+
+/// The GPU time of the passes and dispatches labelled `name` (`label`), in microseconds: a
+/// request, answered with their time in the first frame from this one on that runs one, summed,
+/// once the host has read it. It fails on a host that can't time GPU work (the CPU host, or a
+/// GPU without timestamp queries). A host times only the work of a label asked for and not yet
+/// answered, from the ask on in the order it was recorded, and none of the rest (whose passes
+/// and dispatches then cost nothing more): to time a frame's work, ask before recording it. It's
+/// `nondet`: the time is the device's. A program measures its own costs with it (a planner's,
+/// say); a test can check that a cost was measured, but no test asserts how small it is.
+pub fn timed(name: str) -> Pending<f32> {
+    let request = next_request()
+    timed_command(request, name)
+    Pending::new(request)
+}
+
+@intrinsic
+fn timed_command(request: u32, name: str) {}
+
+/// The GPU's limits: the host opens the device with the adapter's own, which are at least the
+/// machine's (an Apple M4's: 16384-texel textures, 4 GiB buffers, 29 storage buffers a stage,
+/// 32 KiB of workgroup memory, 1024 invocations a workgroup). It's `nondet`: another GPU gives
+/// other numbers. (Pipelines are compiled for the machine's: a kernel's bindings and workgroup
+/// stay within them.)
+pub struct Limits: Copy {
+    /// The widest and tallest texture.
+    pub max_texture_size: u32,
+    /// The largest buffer, in bytes: every buffer can be bound as storage.
+    pub max_buffer_size: u32,
+    pub max_storage_buffers_per_stage: u32,
+    pub max_uniform_buffer_binding_size: u32,
+    /// Workgroup-shared memory, in bytes.
+    pub max_workgroup_storage_size: u32,
+    pub max_workgroup_invocations: u32,
+    pub max_workgroup_size: (u32, u32, u32),
+    pub max_workgroups_per_dimension: u32,
+    /// The most work one compute dispatch may do, in thousands of units of the compiler's count
+    /// (§18.11): its kernel's bound times its invocations, never fewer invocations than about
+    /// 4,096 (what the GPU runs side by side). The host refuses a dispatch past it before it
+    /// runs (no dispatch may hold the GPU past about 50 ms); heavy work is dispatched in parts
+    /// this size.
+    pub step_work: u32,
+}
+
+/// The GPU's limits.
+pub fn limits() -> Limits {
+    Limits {
+        max_texture_size: limit(0),
+        max_buffer_size: limit(1),
+        max_storage_buffers_per_stage: limit(2),
+        max_uniform_buffer_binding_size: limit(3),
+        max_workgroup_storage_size: limit(4),
+        max_workgroup_invocations: limit(5),
+        max_workgroup_size: (limit(6), limit(7), limit(8)),
+        max_workgroups_per_dimension: limit(9),
+        step_work: limit(13),
+    }
+}
+
+@intrinsic
+fn limit(index: u32) -> u32 {}
+
+// ---- the screen ---------------------------------------------------------------------------------
+
+/// The colours a screen shows: sRGB's, or Display P3's wider ones.
+pub enum Gamut: Copy + Eq {
+    Srgb,
+    DisplayP3,
+}
+
+/// How the screen is shown (§18.8): HDR (a canvas of half floats, tone mapped `extended`, where
+/// 1.0 is SDR white and brighter is brighter where the display can), and its gamut.
+pub struct Screen: Copy + Eq {
+    pub hdr: bool,
+    pub gamut: Gamut,
+}
+
+/// Shows the screen `hdr` or not, in `gamut`, from a later frame on: once every pipeline that
+/// draws the screen is built for its new format, the host swaps it in between frames (until
+/// then, the frames go on as they were). A host that can't (the native host, which draws
+/// offscreen; a display that refuses) keeps the screen as it was, which `screen_is` says. In
+/// HDR a screen pass's fragments are linear values with headroom: a program's tone map gives
+/// them its own roll-off, not an SDR curve. Test mode keeps its screen as it was unless the
+/// test asks (`hdr=1`).
+pub fn screen(hdr: bool = false, gamut: Gamut = Gamut::Srgb) {
+    let p3 = match gamut {
+        Gamut::Srgb => 0,
+        Gamut::DisplayP3 => 1,
+    }
+    screen_command(u32(hdr), p3)
+}
+
+/// How the host shows the screen: what it did of the last `screen` it could. Nondeterministic:
+/// the display decides.
+pub fn screen_is() -> Screen {
+    let bits = limit(13)
+    Screen { hdr: (bits & 1) != 0, gamut: if (bits & 2) != 0 { Gamut::DisplayP3 } else {
+        Gamut::Srgb
+    } }
+}
+
+@intrinsic
+fn screen_command(hdr: u32, gamut: u32) {}
+
+/// The GPU's optional features (§18.10): the hosts open the device with every one the adapter
+/// has, and a program checks before it records what needs one (a format's capability, a kernel
+/// that uses subgroups), keeping a path for a device without it. None is required. It's
+/// `nondet`: another GPU gives other answers. (Test mode's `features=none` shows a program a
+/// device without them, so its fallback paths run on a device that has them.)
+pub struct Features: Copy {
+    /// Half floats in GPU code (`shader-f16`).
+    pub f16: bool,
+    /// Subgroup operations (`subgroups`): `subgroup_add` and the rest, and `SubgroupInvocation`.
+    pub subgroups: bool,
+    /// The least and the most invocations a subgroup has (0 without `subgroups`).
+    pub subgroup_min: u32,
+    pub subgroup_max: u32,
+    /// BC compressed textures (`texture-compression-bc`): `Bc1`, `Bc4`, `Bc5`, `Bc7`.
+    pub bc: bool,
+    /// ETC2 compressed textures: `Etc2Rgb8`.
+    pub etc2: bool,
+    /// ASTC compressed textures: `Astc4x4`.
+    pub astc: bool,
+    /// Whether the device could filter `R32Float`, `Rg32Float` and `Rgba32Float`
+    /// (`float32-filterable`). Toolchain 0.6 doesn't sample them yet: they aren't `Filtered`.
+    pub float32_filterable: bool,
+    /// Draws blending into `R32Float`, `Rg32Float` and `Rgba32Float` (`float32-blendable`).
+    pub float32_blendable: bool,
+    /// Passes drawing into `Rg11b10Float` (`rg11b10ufloat-renderable`).
+    pub rg11b10_renderable: bool,
+    pub bgra8_storage: bool,
+    /// GPU timing (`timestamp-query`): `timed`.
+    pub timestamps: bool,
+    /// Several indirect draws in one call (`draw_multi` draws them one by one without it).
+    pub multi_draw_indirect: bool,
+    /// Always true: every host requires it.
+    pub indirect_first_instance: bool,
+    /// 64-bit atomic minimum and maximum: false on every host, since neither WebGPU's core nor
+    /// a shipped browser has them yet (docs/toolchain-gaps.md in rywible/wrela).
+    pub atomic64_min_max: bool,
+}
+
+/// The GPU's optional features.
+pub fn features() -> Features {
+    let bits = limit(10)
+    let has = |i: u32| (bits & (1 << i)) != 0
+    Features {
+        f16: has(0),
+        subgroups: has(1),
+        subgroup_min: limit(11),
+        subgroup_max: limit(12),
+        bc: has(2),
+        etc2: has(3),
+        astc: has(4),
+        float32_filterable: has(5),
+        float32_blendable: has(6),
+        rg11b10_renderable: has(7),
+        bgra8_storage: has(8),
+        timestamps: has(9),
+        multi_draw_indirect: has(10),
+        indirect_first_instance: has(11),
+        atomic64_min_max: false,
+    }
+}
+
+// ---- workgroup memory, atomics, appending and maps (§18.4, §18.5) -------------------------------
+
+/// Workgroup memory: `N` `T`s that all of a workgroup's invocations share, as a kernel's
+/// `mut` parameter (CPU code doesn't pass it). Between barriers, each invocation writes only
+/// its own chunk: `shared.write(shared.chunk(lid), k, value)`. Any invocation reads any element
+/// with `shared.get(i)`. `barrier(mut shared)` separates a phase of writes from a phase of
+/// reads; the compiler rejects a read of what another invocation may still be writing, or a
+/// write of what another may still be reading, with no barrier between (E0609). Its elements
+/// start zeroed.
+pub struct Shared<T, const N: u32> {
+    unused: u32,
+}
+
+/// The elements an invocation writes: element `first + k * stride`, for `k` below `len()`. Each
+/// invocation's are its own, as its `LocalId` is.
+pub struct Chunk: Copy {
+    first: u32,
+    stride: u32,
+    count: u32,
+}
+
+impl Chunk {
+    /// How many elements it has.
+    pub fn len(self) -> u32 {
+        self.count
+    }
+
+    /// Which element its `k`th is.
+    pub fn index(self, k: u32) -> u32 {
+        self.first + k * self.stride
+    }
+}
+
+impl<T, const N: u32> Shared<T, N> {
+    /// The chunk invocation `lid` writes: every `W`th element from its index in the workgroup,
+    /// where `W` is the workgroup's size.
+    pub fn chunk(self, lid: LocalId) -> Chunk {
+        let first = local_index(lid)
+        let stride = workgroup_invocations()
+        let count = if first < N { (N - first + stride - 1) / stride } else { 0 }
+        Chunk { first, stride, count }
+    }
+
+    /// Writes `value` to the `k`th element of `chunk`, this invocation's. A `k` past the chunk's
+    /// end writes nothing.
+    pub fn write(mut self, chunk: Chunk, k: u32, value: T) {
+        if k < chunk.count {
+            shared_set(mut self, chunk.first + k * chunk.stride, value)
+        }
+    }
+
+    /// Element `i`, which any invocation may have written before the last barrier.
+    pub fn get(self, i: u32) -> T {
+        shared_get(self, i)
+    }
+
+    /// `N`.
+    pub fn len(self) -> u32 {
+        N
+    }
+}
+
+/// Waits until every invocation of the workgroup has reached it: their writes to workgroup
+/// memory before it are visible to every read after it. It must be reached by all of the
+/// workgroup's invocations together, so it's in uniform control flow (E0608).
+pub fn barrier<T, const N: u32>(shared: mut Shared<T, N>) {
+    workgroup_barrier(mut shared)
+}
+
+/// Workgroup memory of `N` `u32`s that any of a workgroup's invocations may change at once,
+/// each operation whole (a kernel's `mut SharedAtomics<N>` parameter; CPU code doesn't pass
+/// it): a histogram's bins, a compaction's counters, a scatter to any index. Its elements start
+/// zeroed. Its own operations need no barrier between them; a barrier (`atomics.barrier()`)
+/// before reading what every invocation added sees all of it.
+pub struct SharedAtomics<const N: u32> {
+    unused: u32,
+}
+
+impl<const N: u32> SharedAtomics<N> {
+    /// `N`.
+    pub fn len(self) -> u32 {
+        N
+    }
+
+    /// Element `i`.
+    pub fn load(self, i: u32) -> u32 {
+        atomic_load(self, i)
+    }
+
+    /// Sets element `i` to `value`: a scatter that can't race.
+    pub fn store(mut self, i: u32, value: u32) {
+        atomic_store(mut self, i, value)
+    }
+
+    /// Adds `value` to element `i`; the element's old value.
+    pub fn add(mut self, i: u32, value: u32) -> u32 {
+        atomic_add(mut self, i, value)
+    }
+
+    /// Sets element `i` to the smaller of it and `value`; the element's old value.
+    pub fn min(mut self, i: u32, value: u32) -> u32 {
+        atomic_min(mut self, i, value)
+    }
+
+    /// Sets element `i` to the larger of it and `value`; the element's old value.
+    pub fn max(mut self, i: u32, value: u32) -> u32 {
+        atomic_max(mut self, i, value)
+    }
+
+    /// Sets element `i` to its bitwise and with `value`; the element's old value.
+    pub fn and(mut self, i: u32, value: u32) -> u32 {
+        atomic_and(mut self, i, value)
+    }
+
+    /// Sets element `i` to its bitwise or with `value`; the element's old value.
+    pub fn or(mut self, i: u32, value: u32) -> u32 {
+        atomic_or(mut self, i, value)
+    }
+
+    /// Sets element `i` to its bitwise exclusive or with `value`; the element's old value.
+    pub fn xor(mut self, i: u32, value: u32) -> u32 {
+        atomic_xor(mut self, i, value)
+    }
+
+    /// Sets element `i` to `value`; the element's old value.
+    pub fn exchange(mut self, i: u32, value: u32) -> u32 {
+        atomic_exchange(mut self, i, value)
+    }
+
+    /// Stores `new` if element `i` is `expected`: the old value, which is `expected` exactly
+    /// when it stored.
+    pub fn compare_exchange(mut self, i: u32, expected: u32, new: u32) -> u32 {
+        strong_compare_exchange(mut self, i, expected, new)
+    }
+
+    /// Waits until every invocation of the workgroup has reached it: what each added before it
+    /// is in every element read after it. In uniform control flow (E0608).
+    pub fn barrier(mut self) {
+        atomics_barrier(mut self)
+    }
+}
+
+/// `SharedAtomics<N>` of `i32`s: workgroup memory any invocation changes at once, each operation
+/// whole, for signed counts and a signed minimum or maximum.
+pub struct SharedAtomicsI<const N: u32> {
+    unused: u32,
+}
+
+impl<const N: u32> SharedAtomicsI<N> {
+    /// `N`.
+    pub fn len(self) -> u32 {
+        N
+    }
+
+    /// Element `i`.
+    pub fn load(self, i: u32) -> i32 {
+        atomic_load(self, i)
+    }
+
+    /// Sets element `i` to `value`: a scatter that can't race.
+    pub fn store(mut self, i: u32, value: i32) {
+        atomic_store(mut self, i, value)
+    }
+
+    /// Adds `value` to element `i`; the element's old value.
+    pub fn add(mut self, i: u32, value: i32) -> i32 {
+        atomic_add(mut self, i, value)
+    }
+
+    /// Sets element `i` to the smaller of it and `value`; the element's old value.
+    pub fn min(mut self, i: u32, value: i32) -> i32 {
+        atomic_min(mut self, i, value)
+    }
+
+    /// Sets element `i` to the larger of it and `value`; the element's old value.
+    pub fn max(mut self, i: u32, value: i32) -> i32 {
+        atomic_max(mut self, i, value)
+    }
+
+    /// Sets element `i` to its bitwise and with `value`; the element's old value.
+    pub fn and(mut self, i: u32, value: i32) -> i32 {
+        atomic_and(mut self, i, value)
+    }
+
+    /// Sets element `i` to its bitwise or with `value`; the element's old value.
+    pub fn or(mut self, i: u32, value: i32) -> i32 {
+        atomic_or(mut self, i, value)
+    }
+
+    /// Sets element `i` to its bitwise exclusive or with `value`; the element's old value.
+    pub fn xor(mut self, i: u32, value: i32) -> i32 {
+        atomic_xor(mut self, i, value)
+    }
+
+    /// Sets element `i` to `value`; the element's old value.
+    pub fn exchange(mut self, i: u32, value: i32) -> i32 {
+        atomic_exchange(mut self, i, value)
+    }
+
+    /// Stores `new` if element `i` is `expected`: the old value, which is `expected` exactly
+    /// when it stored.
+    pub fn compare_exchange(mut self, i: u32, expected: i32, new: i32) -> i32 {
+        strong_compare_exchange(mut self, i, expected, new)
+    }
+
+    /// Waits until every invocation of the workgroup has reached it: what each added before it
+    /// is in every element read after it. In uniform control flow (E0608).
+    pub fn barrier(mut self) {
+        atomics_barrier(mut self)
+    }
+}
+
+/// A barrier on workgroup atomics (`SharedAtomics<N>`, `SharedAtomicsI<N>`).
+@intrinsic
+fn atomics_barrier<A>(shared: mut A) {}
+
+/// The sum of `value` over the invocations of the workgroup before this one (by `LocalId`'s
+/// index: an exclusive prefix sum), the building block of a compaction: each invocation's place
+/// in a list of what's kept. `shared` holds one element for each of the workgroup's
+/// invocations (`N` its size); after the call, each element holds its invocation's inclusive
+/// sum, so element `N - 1` is the workgroup's total. A Hillis–Steele scan: log2(N) steps, each a
+/// barrier apart, so every invocation reaches it (uniform control flow). `subgroup_prefix_sum`
+/// gives the same results on a device with `subgroups`.
+pub fn workgroup_prefix_sum<const N: u32>(
+    shared: mut Shared<u32, N>,
+    lid: LocalId,
+    value: u32,
+) -> u32 {
+    let c = shared.chunk(lid)
+    let i = c.index(0)
+    shared.write(c, 0, value)
+    barrier(mut shared)
+    var sum = value
+    var offset = 1
+    while offset < N {
+        let add = if i >= offset { shared.get(i - offset) } else { 0 }
+        barrier(mut shared)
+        sum += add
+        shared.write(c, 0, sum)
+        barrier(mut shared)
+        offset = offset * 2
+    }
+    sum - value
+}
+
+// ---- subgroups (§18.10) --------------------------------------------------------------------------
+//
+// A subgroup is a set of a kernel's invocations that run in lockstep (a SIMD group: 32 on
+// most GPUs, 4 to 128 on others): its operations combine their values without workgroup
+// memory or barriers. Kernels only, on a device with `features().subgroups`; a pipeline that
+// uses one needs the feature, and its program keeps a path without (`workgroup_prefix_sum`
+// for `subgroup_prefix_sum`). Each is called by all of its subgroup's invocations together
+// (E0610): in flow that's uniform, or that branched only on what's the same across the subgroup,
+// such as a reduction's result (language.md §18.11). They take an `i32`, `u32`, `f32` or `f16`,
+// or a vector of them, unless they say otherwise.
+
+/// The sum of `x` over the subgroup.
+@intrinsic
+pub fn subgroup_add<T>(x: T) -> T {}
+
+/// The sum of `x` over the invocations of the subgroup before this one (0 for the first).
+@intrinsic
+pub fn subgroup_exclusive_add<T>(x: T) -> T {}
+
+/// The sum of `x` over the invocations of the subgroup up to this one.
+@intrinsic
+pub fn subgroup_inclusive_add<T>(x: T) -> T {}
+
+/// The least `x` of the subgroup.
+@intrinsic
+pub fn subgroup_min<T>(x: T) -> T {}
+
+/// The greatest `x` of the subgroup.
+@intrinsic
+pub fn subgroup_max<T>(x: T) -> T {}
+
+/// The bitwise and of `x` (an `i32` or `u32`) over the subgroup.
+@intrinsic
+pub fn subgroup_and<T>(x: T) -> T {}
+
+/// The bitwise or of `x` (an `i32` or `u32`) over the subgroup.
+@intrinsic
+pub fn subgroup_or<T>(x: T) -> T {}
+
+/// The bitwise exclusive or of `x` (an `i32` or `u32`) over the subgroup.
+@intrinsic
+pub fn subgroup_xor<T>(x: T) -> T {}
+
+/// Whether `b` is true for any invocation of the subgroup.
+@intrinsic
+pub fn subgroup_any(b: bool) -> bool {}
+
+/// Whether `b` is true for every invocation of the subgroup.
+@intrinsic
+pub fn subgroup_all(b: bool) -> bool {}
+
+/// A bit for each invocation of the subgroup, set where `b` is true: invocation `i`'s is bit
+/// `i % 32` of component `i / 32`.
+@intrinsic
+pub fn subgroup_ballot(b: bool) -> vec4u {}
+
+/// `x` of the subgroup's first active invocation.
+@intrinsic
+pub fn subgroup_broadcast_first<T>(x: T) -> T {}
+
+/// `x` of invocation `from` of the subgroup.
+@intrinsic
+pub fn subgroup_shuffle<T>(x: T, from: u32) -> T {}
+
+/// A compaction's places with subgroup operations: each invocation gets the sum of `value` over
+/// the invocations before it in the workgroup's subgroup order, an exclusive scan, so the places
+/// are distinct and dense (0 to the workgroup's total) on any GPU. The order is the subgroups'
+/// by their first invocation's `LocalId` index, then each subgroup's own: WGSL leaves which
+/// invocations share a subgroup to the GPU, so the order may not be `LocalId`'s. Where subgroups
+/// are runs of consecutive indices (every GPU this toolchain has run on forms them so for a
+/// one-dimensional workgroup), the results are `workgroup_prefix_sum`'s exactly; a compaction
+/// that must keep `LocalId` order uses that one. One barrier, not `workgroup_prefix_sum`'s
+/// 2 log2(N) + 1.
+/// `shared` holds one element for each of the workgroup's invocations (`N` its size); after the
+/// call, each subgroup's first invocation's element holds its subgroup's total and the others
+/// 0. Uniform control flow. Its subgroups may be partial (a workgroup size that isn't a multiple
+/// of theirs): each reads `N` divided by its own invocations' count.
+pub fn subgroup_prefix_sum<const N: u32>(
+    shared: mut Shared<u32, N>,
+    lid: LocalId,
+    value: u32,
+) -> u32 {
+    let c = shared.chunk(lid)
+    let i = c.index(0)
+    let mine = subgroup_exclusive_add(value)
+    let total = subgroup_add(value)
+    // The subgroup's invocations, ranked among those it has: a subgroup may have fewer than its
+    // width (the workgroup's last), and WGSL doesn't say which lanes they are. Rank 0 is the
+    // lowest lane, whose index `subgroup_broadcast_first` gives, and it writes the total there.
+    let rank = subgroup_exclusive_add(1)
+    let count = subgroup_add(1)
+    let first = subgroup_broadcast_first(i)
+    shared.write(c, 0, if rank == 0 { total } else { 0 })
+    barrier(mut shared)
+    // The totals of the subgroups whose first invocation comes before this one's: every element
+    // below `first`, each rank taking every `count`th, then summed across the subgroup.
+    var partial = 0
+    var k = rank
+    while k < first {
+        partial += shared.get(k)
+        k += count
+    }
+    subgroup_add(partial) + mine
+}
+
+/// An indirect draw's arguments (`draw(pass, vs, fs, indirect: buf)`, of a `GpuBuffer` or span of
+/// these): its vertices and instances, its first vertex and first instance. GPU code writes
+/// them; the draw reads them.
+pub struct DrawArgs: Copy + GpuData {
+    pub vertices: u32,
+    pub instances: u32,
+    pub first_vertex: u32,
+    pub first_instance: u32,
+}
+
+/// An indexed indirect draw's arguments (`draw(pass, vs, fs, indices: idx, indirect: buf)`): its
+/// indices and instances, its first index, the vertex its indices count from, and its first
+/// instance.
+pub struct DrawIndexedArgs: Copy + GpuData {
+    pub indices: u32,
+    pub instances: u32,
+    pub first_index: u32,
+    pub base_vertex: i32,
+    pub first_instance: u32,
+}
+
+/// An indirect dispatch's workgroup counts (`dispatch(k.bind(...), groups: buf)`).
+pub struct DispatchArgs: Copy + GpuData {
+    pub x: u32,
+    pub y: u32,
+    pub z: u32,
+}
+
+/// One value a kernel writes, from one invocation: the dispatch's first, (0, 0, 0) of its
+/// `GlobalId`. A kernel's `mut One<T>` parameter, for which CPU code passes `mut buf` of a
+/// `GpuBuffer<T>` (its first element) or a `GpuSpanMut<T>` (its first). Any invocation may
+/// call `set` and `update`; only the first's does anything, so invocations never race for it.
+pub struct One<T> {
+    unused: u32,
+}
+
+impl<T: GpuData> One<T> {
+    /// Writes `value`, in the dispatch's first invocation.
+    pub fn set(mut self, id: GlobalId, value: T) {
+        if first(id) {
+            one_set(mut self, value)
+        }
+    }
+
+    /// Writes `f` of the value before, in the dispatch's first invocation: a value kept from
+    /// dispatch to dispatch (a running mean).
+    pub fn update(mut self, id: GlobalId, f: fn(T) -> T) {
+        if first(id) {
+            one_set(mut self, f(one_get(self)))
+        }
+    }
+}
+
+/// Whether `id` is the dispatch's first invocation's.
+fn first(id: GlobalId) -> bool {
+    id.x == 0 && id.y == 0 && id.z == 0
+}
+
+@intrinsic
+fn one_get<T>(o: One<T>) -> T {}
+
+@intrinsic
+fn one_set<T>(o: mut One<T>, value: T) {}
+
+/// A texture of format `F` that a kernel writes, each invocation only its own texel: (`id.x`,
+/// `id.y`) of its `GlobalId` (§18.4). A kernel's `mut Texels<F>` parameter, for which CPU code
+/// passes `mut tex` of a `Texture<F>` made by `writable_texture`. A kernel reads what it writes
+/// only through another pass's binding of the texture, never in the same dispatch.
+pub struct Texels<F: Storage> {
+    unused: u32,
+}
+
+impl<F: Storage> Texels<F> {
+    /// Writes `value` to the invocation's own texel, (`id.x`, `id.y`).
+    pub fn store(mut self, id: GlobalId, value: F::Texel) {
+        texels_store(mut self, id.x, id.y, value)
+    }
+}
+
+/// A 3D texture of format `F` that a kernel writes, each invocation only its own texel:
+/// (`id.x`, `id.y`, `id.z`) of its `GlobalId`. A kernel's `mut Texels3d<F>` parameter, for which
+/// CPU code passes `mut tex` of a `Texture3d<F>`. As with `Texels`, a kernel reads what it
+/// writes only through another pass's binding of the texture.
+pub struct Texels3d<F: Storage> {
+    unused: u32,
+}
+
+impl<F: Storage> Texels3d<F> {
+    /// Writes `value` to the invocation's own texel, (`id.x`, `id.y`, `id.z`).
+    pub fn store(mut self, id: GlobalId, value: F::Texel) {
+        texels3d_store(mut self, id.x, id.y, id.z, value)
+    }
+}
+
+/// Integers that every invocation of a dispatch may change at once: a kernel's `mut
+/// Atomics<u32>` or `mut Atomics<i32>` parameter, for which CPU code passes `mut buf` of a
+/// `GpuBuffer<u32>` (or `<i32>`). Each operation on an element happens whole, before or after
+/// every other invocation's on it, and gives the element's old value.
+pub struct Atomics<T> {
+    unused: u32,
+}
+
+impl<T> Atomics<T> {
+    /// How many elements it holds.
+    pub fn len(self) -> u32 {
+        atomic_len(self)
+    }
+
+    /// Element `i`.
+    pub fn load(self, i: u32) -> T {
+        atomic_load(self, i)
+    }
+
+    /// Sets element `i` to `value`.
+    pub fn store(mut self, i: u32, value: T) {
+        atomic_store(mut self, i, value)
+    }
+
+    /// Adds `value` to element `i`; the element's old value.
+    pub fn add(mut self, i: u32, value: T) -> T {
+        atomic_add(mut self, i, value)
+    }
+
+    /// Subtracts `value` from element `i`; the element's old value.
+    pub fn sub(mut self, i: u32, value: T) -> T {
+        atomic_sub(mut self, i, value)
+    }
+
+    /// Sets element `i` to the smaller of it and `value`; the element's old value.
+    pub fn min(mut self, i: u32, value: T) -> T {
+        atomic_min(mut self, i, value)
+    }
+
+    /// Sets element `i` to the larger of it and `value`; the element's old value.
+    pub fn max(mut self, i: u32, value: T) -> T {
+        atomic_max(mut self, i, value)
+    }
+
+    /// Sets element `i` to its bitwise and with `value`; the element's old value.
+    pub fn and(mut self, i: u32, value: T) -> T {
+        atomic_and(mut self, i, value)
+    }
+
+    /// Sets element `i` to its bitwise or with `value`; the element's old value.
+    pub fn or(mut self, i: u32, value: T) -> T {
+        atomic_or(mut self, i, value)
+    }
+
+    /// Sets element `i` to its bitwise exclusive or with `value`; the element's old value.
+    pub fn xor(mut self, i: u32, value: T) -> T {
+        atomic_xor(mut self, i, value)
+    }
+
+    /// Sets element `i` to `value`; the element's old value.
+    pub fn exchange(mut self, i: u32, value: T) -> T {
+        atomic_exchange(mut self, i, value)
+    }
+}
+
+impl<T: Eq + Copy> Atomics<T> {
+    /// Stores `new` if element `i` is `expected`: the old value, which is `expected` exactly
+    /// when it stored.
+    pub fn compare_exchange(mut self, i: u32, expected: T, new: T) -> T {
+        strong_compare_exchange(mut self, i, expected, new)
+    }
+}
+
+/// A kernel's output of any number of `T`s, in no particular order: its `mut Append<T>`
+/// parameter, for which CPU code passes `mut` an `AppendBuffer<T>`. `out.push(value)` takes
+/// the next free place; a push past the buffer's capacity is counted but kept nowhere.
+pub struct Append<T> {
+    unused: u32,
+}
+
+impl<T> Append<T> {
+    /// Takes the next free place for `value`, and returns its index. An index at or past the
+    /// buffer's capacity was counted but kept nowhere.
+    pub fn push(mut self, value: T) -> u32 {
+        append_push(mut self, value)
+    }
+}
+
+/// What a kernel appends to (`Append<T>`): room for `capacity` `T`s, and how many were pushed.
+pub struct AppendBuffer<T> {
+    items: GpuBuffer<T>,
+    // The count: one `u32`, then 1 and 1, so it's an indirect dispatch's group counts too.
+    count: GpuBuffer<u32>,
+}
+
+/// An `AppendBuffer` with room for `capacity` `T`s, empty.
+pub fn append_buffer<T: GpuData>(capacity: u32) -> AppendBuffer<T> {
+    let count: GpuBuffer<u32> = buffer_of([0, 1, 1])
+    AppendBuffer { items: buffer(capacity), count }
+}
+
+impl<T: GpuData> AppendBuffer<T> {
+    /// Empties it: what's pushed after starts at the start again.
+    pub fn clear(mut self) {
+        write(mut self.count, 0, [0])
+    }
+
+    /// Room for how many.
+    pub fn capacity(self) -> u32 {
+        self.items.len()
+    }
+
+    /// The items: the first `count` of them were pushed (to read back, or pass on).
+    pub fn items(self) -> GpuSpan<T> {
+        self.items.items()
+    }
+
+    /// The items, for a kernel to change in place (where it takes `mut Slots<T>`).
+    pub fn items_mut(mut self) -> GpuSpanMut<T> {
+        self.items.items_mut()
+    }
+
+    /// How many were pushed, the first of three `u32`s (then 1 and 1): to read back, or as an
+    /// indirect dispatch's group counts.
+    pub fn count(self) -> GpuSpan<u32> {
+        self.count.span(start: 0, count: 3)
+    }
+}
+
+/// A map from `u32` keys to `u32` values that every invocation of a dispatch may change at once:
+/// a kernel's `mut AtomicMap` parameter, for which CPU code passes `mut` an `AtomicMapBuffer`.
+/// It holds at most its capacity of keys; the key `EMPTY` can't be stored.
+pub struct AtomicMap {
+    unused: u32,
+}
+
+/// The key no entry has.
+pub const EMPTY: u32 = 4294967295
+
+impl AtomicMap {
+    /// Where key `key` is, or would go: its slot, and whether this call claimed it; `EMPTY`
+    /// if the map is full of other keys.
+    fn slot(mut self, key: u32, claim: bool) -> (u32, bool) {
+        let cap = atomic_len(self) / 2
+        var at = hash_key(key) % cap
+        for _ in 0..cap {
+            let there = atomic_load(self, 2 * at)
+            if there == key {
+                return (at, false)
+            }
+            if there == EMPTY {
+                if !claim {
+                    return (EMPTY, false)
+                }
+                let old = strong_compare_exchange(mut self, 2 * at, EMPTY, key)
+                if old == EMPTY {
+                    return (at, true)
+                }
+                if old == key {
+                    return (at, false)
+                }
+            }
+            at = (at + 1) % cap
+        }
+        (EMPTY, false)
+    }
+
+    /// Sets `key`'s value if it has none yet: whether it had none (and the map had room).
+    pub fn insert(mut self, key: u32, value: u32) -> bool {
+        if key == EMPTY {
+            return false
+        }
+        let (at, claimed) = self.slot(key, claim: true)
+        if at == EMPTY || !claimed {
+            return false
+        }
+        // A claimed slot starts at 0. Addition keeps increments from other invocations that
+        // reach the same key while its initial value is being added.
+        atomic_add(mut self, 2 * at + 1, value)
+        true
+    }
+
+    /// Adds `delta` to `key`'s value (from 0 if it had none): whether the map had room.
+    pub fn add(mut self, key: u32, delta: u32) -> bool {
+        if key == EMPTY {
+            return false
+        }
+        let (at, _) = self.slot(key, claim: true)
+        if at == EMPTY {
+            return false
+        }
+        atomic_add(mut self, 2 * at + 1, delta)
+        true
+    }
+
+    /// `key`'s value, if it has one. A new key starts at 0 while an `insert` in another
+    /// invocation adds its initial value; read in a later dispatch to see completed inserts.
+    pub fn get(mut self, key: u32) -> Option<u32> {
+        if key == EMPTY {
+            return None
+        }
+        let (at, _) = self.slot(key, claim: false)
+        if at == EMPTY {
+            return None
+        }
+        Some(atomic_load(self, 2 * at + 1))
+    }
+}
+
+/// A key's first slot: its bits mixed, so near keys spread out.
+fn hash_key(key: u32) -> u32 {
+    let h = key.wrapping_mul(2654435761)
+    h ^ (h >> 16)
+}
+
+/// What a kernel's `AtomicMap` lives in: room for `capacity` keys, each with its value.
+pub struct AtomicMapBuffer {
+    entries: GpuBuffer<u32>,
+}
+
+/// An empty `AtomicMapBuffer` with room for `capacity` keys.
+pub fn atomic_map_buffer(capacity: u32) -> AtomicMapBuffer {
+    let initial = Vec::from_fn(2 * capacity, |i| if i % 2 == 0 { EMPTY } else { 0 })
+    AtomicMapBuffer { entries: buffer_of(initial) }
+}
+
+impl AtomicMapBuffer {
+    /// Its entries, key then value: an unused slot's key is `EMPTY`, its value 0. To read back.
+    pub fn entries(self) -> GpuSpan<u32> {
+        self.entries.items()
+    }
+}
+
+/// The invocation's index in its workgroup: `x`, then `y` rows, then `z` layers.
+@intrinsic
+fn local_index(lid: LocalId) -> u32 {}
+
+/// The workgroup's size: how many invocations it has.
+@intrinsic
+fn workgroup_invocations() -> u32 {}
+
+@intrinsic
+fn shared_get<T, const N: u32>(shared: Shared<T, N>, i: u32) -> T {}
+
+@intrinsic
+fn shared_set<T, const N: u32>(shared: mut Shared<T, N>, i: u32, value: T) {}
+
+@intrinsic
+fn workgroup_barrier<T, const N: u32>(shared: mut Shared<T, N>) {}
+
+@intrinsic
+fn texels_store<F: Storage>(t: mut Texels<F>, x: u32, y: u32, value: F::Texel) {}
+
+@intrinsic
+fn texels3d_store<F: Storage>(t: mut Texels3d<F>, x: u32, y: u32, z: u32, value: F::Texel) {}
+
+@intrinsic
+fn texels_array_store<F: Storage>(
+    t: mut TexelsArray<F>,
+    x: u32,
+    y: u32,
+    layer: u32,
+    value: F::Texel,
+) {}
+
+@intrinsic
+fn mip_step_store<F: Storage>(m: mut MipStep<F>, x: u32, y: u32, value: F::Texel) {}
+
+@intrinsic
+fn atomic_len<A>(a: A) -> u32 {}
+
+@intrinsic
+fn atomic_load<A, T>(a: A, i: u32) -> T {}
+
+@intrinsic
+fn atomic_store<A, T>(a: mut A, i: u32, value: T) {}
+
+@intrinsic
+fn atomic_add<A, T>(a: mut A, i: u32, value: T) -> T {}
+
+@intrinsic
+fn atomic_sub<A, T>(a: mut A, i: u32, value: T) -> T {}
+
+@intrinsic
+fn atomic_min<A, T>(a: mut A, i: u32, value: T) -> T {}
+
+@intrinsic
+fn atomic_max<A, T>(a: mut A, i: u32, value: T) -> T {}
+
+@intrinsic
+fn atomic_and<A, T>(a: mut A, i: u32, value: T) -> T {}
+
+@intrinsic
+fn atomic_or<A, T>(a: mut A, i: u32, value: T) -> T {}
+
+@intrinsic
+fn atomic_xor<A, T>(a: mut A, i: u32, value: T) -> T {}
+
+@intrinsic
+fn atomic_exchange<A, T>(a: mut A, i: u32, value: T) -> T {}
+
+/// Stores `new` at element `i` if it's `expected`: the old value, and whether it stored. It may
+/// not store though they're equal (WGSL's `atomicCompareExchangeWeak`).
+@intrinsic
+fn atomic_compare_exchange<A, T>(a: mut A, i: u32, expected: T, new: T) -> (T, bool) {}
+
+/// As `atomic_compare_exchange`, but trying again when it didn't store though it could have:
+/// the old value, `expected` exactly when it stored.
+fn strong_compare_exchange<A, T: Eq + Copy>(a: mut A, i: u32, expected: T, new: T) -> T {
+    loop {
+        let (old, stored) = atomic_compare_exchange(mut a, i, expected, new)
+        if stored || old != expected {
+            return old
+        }
+    }
+}
+
+@intrinsic
+fn append_push<T>(a: mut Append<T>, value: T) -> u32 {}
+
+// ---- lossy encodings ----------------------------------------------------------------------------
+// A layout never loses precision on its own: a type that does says so in its name. Each packs
+// into one `u32`, which every GPU buffer can hold, and decodes with the same code on both
+// targets.
+
+/// Four values in [0, 1], 8 bits each: colours. Each decodes to the nearest of 256 steps, so
+/// within 0.5/255 of what was encoded, once that's clamped to [0, 1].
+pub struct Unorm8x4: Copy + GpuData + Eq {
+    pub bits: u32,
+}
+
+impl Unorm8x4 {
+    /// `v`, clamped to [0, 1] and rounded to the nearest of 256 steps.
+    pub fn encode(v: vec4) -> Unorm8x4 {
+        let q = clamp(v, vec4(0.0), vec4(1.0)) * 255.0 + vec4(0.5)
+        Unorm8x4 { bits: u32(q.x) | (u32(q.y) << 8) | (u32(q.z) << 16) | (u32(q.w) << 24) }
+    }
+
+    /// The four values, each in [0, 1].
+    pub fn decode(self) -> vec4 {
+        let b = self.bits
+        vec4(f32(b & 255), f32((b >> 8) & 255), f32((b >> 16) & 255), f32(b >> 24)) / 255.0
+    }
+}
+
+/// Two `f32`s as IEEE half floats, rounded to nearest, ties to even: within 2⁻¹¹ of the value
+/// relatively where |x| is in [2⁻¹⁴, 65504], and within 2⁻²⁵ absolutely below that. Larger
+/// values become infinite; a NaN stays a NaN.
+pub struct Half2: Copy + GpuData + Eq {
+    pub bits: u32,
+}
+
+/// `x` as a half float's 16 bits, rounded to nearest, ties to even.
+fn to_half(x: f32) -> u32 {
+    let b = bitcast_u32(x)
+    let sign = (b >> 16) & 32768
+    let e = i32((b >> 23) & 255)
+    let m = b & 8388607
+    if e == 255 {
+        // Infinity, or a NaN (kept a NaN: a mantissa bit set).
+        return sign | 31744 | (if m != 0 { 512 } else { 0 })
+    }
+    let he = e - 112
+    if he >= 31 {
+        return sign | 31744
+    }
+    if he <= 0 {
+        // A subnormal half, or zero: the mantissa with its implicit bit, shifted into place.
+        if he < -10 {
+            return sign
+        }
+        let full = m | 8388608
+        let shift = u32(14 - he)
+        var h = full >> shift
+        let rest = full & ((1 << shift) - 1)
+        let halfway = 1 << (shift - 1)
+        if rest > halfway || (rest == halfway && (h & 1) == 1) {
+            h += 1
+        }
+        return sign | h
+    }
+    var h = (u32(he) << 10) | (m >> 13)
+    let rest = m & 8191
+    if rest > 4096 || (rest == 4096 && (h & 1) == 1) {
+        // A carry into the exponent is right: the next binade, or infinity.
+        h += 1
+    }
+    sign | h
+}
+
+/// A half float's 16 bits as an `f32`, exactly.
+fn from_half(h: u32) -> f32 {
+    let sign = (h & 32768) << 16
+    let e = (h >> 10) & 31
+    let m = h & 1023
+    if e == 0 {
+        // Zero or subnormal: m × 2⁻²⁴, exact in an f32.
+        let v = f32(m) * 5.9604645e-8
+        return if sign != 0 { -v } else { v }
+    }
+    if e == 31 {
+        return bitcast_f32(sign | 2139095040 | (m << 13))
+    }
+    bitcast_f32(sign | ((e + 112) << 23) | (m << 13))
+}
+
+impl Half2 {
+    /// `v`, each value rounded to the nearest half float.
+    pub fn encode(v: vec2) -> Half2 {
+        Half2 { bits: to_half(v.x) | (to_half(v.y) << 16) }
+    }
+
+    /// The two values, as `f32`s.
+    pub fn decode(self) -> vec2 {
+        vec2(from_half(self.bits & 65535), from_half(self.bits >> 16))
+    }
+}
+
+/// A unit vector, octahedral, 16 bits a coordinate: normals. It decodes within 1.5 × 10⁻⁴
+/// radians of the direction encoded, in the worst case.
+pub struct Oct32: Copy + GpuData + Eq {
+    pub bits: u32,
+}
+
+impl Oct32 {
+    /// `n`'s direction; `n` needn't be unit length, but mustn't be zero.
+    pub fn encode(n: vec3) -> Oct32 {
+        let s = abs(n.x) + abs(n.y) + abs(n.z)
+        var p = vec2(n.x, n.y) / s
+        if n.z < 0.0 {
+            p = vec2((1.0 - abs(p.y)) * sign_of(p.x), (1.0 - abs(p.x)) * sign_of(p.y))
+        }
+        let q = clamp(p, vec2(-1.0), vec2(1.0)) * 32767.0
+        let x = u32(i32(round(q.x)) + 32768)
+        let y = u32(i32(round(q.y)) + 32768)
+        Oct32 { bits: x | (y << 16) }
+    }
+
+    /// The unit vector it holds.
+    pub fn decode(self) -> vec3 {
+        let p = vec2(f32(i32(self.bits & 65535) - 32768), f32(i32(self.bits >> 16) - 32768)) /
+            32767.0
+        var n = vec3(p.x, p.y, 1.0 - abs(p.x) - abs(p.y))
+        if n.z < 0.0 {
+            n = vec3((1.0 - abs(n.y)) * sign_of(n.x), (1.0 - abs(n.x)) * sign_of(n.y), n.z)
+        }
+        normalize(n)
+    }
+}
+
+/// 1 for x ≥ 0, else -1: the octahedral fold's sign, which `sign` would make 0 at 0.
+fn sign_of(x: f32) -> f32 {
+    if x >= 0.0 { 1.0 } else { -1.0 }
+}
+
+@test
+fn a_chain_halves_the_longer_side_down_to_one_texel() {
+    assert(mip_levels(width: 0, height: 0) == 1)
+    assert(mip_levels(width: 1, height: 1) == 1)
+    assert(mip_levels(width: 2, height: 1) == 2)
+    assert(mip_levels(width: 5, height: 3) == 3)
+    assert(mip_levels(width: 3, height: 8) == 4)
+    assert(mip_levels(width: 8192, height: 9) == 14)
+    assert(mip_levels(width: 4294967295, height: 1) == 32)
+}

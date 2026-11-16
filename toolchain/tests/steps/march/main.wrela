@@ -1,0 +1,60 @@
+// The kernel that took the M4 down on 2026-11-15 (docs/dead-ends.md, "The toolchain and the GPU"),
+// in its shape: a medium marched at every pixel with fine steps, in one compute dispatch. The
+// host must refuse it before it runs (host/src/step.rs; docs/rates.md, "Bounded compute steps").
+//
+// As first written (`STEPS` 8192) its loop may run past what the compiler follows, so it states
+// no bound and is refused at any size. With `--set STEPS=2048` it has a bound, and is refused by
+// its size: at 1920x1080 by far; at 64x64 it runs, unless the limit is lowered (`WRELA_GPU_STEP`).
+//
+//     tools/wrela build toolchain/tests/steps/march -o <out> [--set STEPS=2048]
+//     tools/gpu <out> --frames 2 --size 64x64 --timestamps --serial
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch, label}
+
+/// The march's steps a pixel.
+pub const STEPS: u32 = 8192
+
+/// A medium's density at `p`: a cloud of sines.
+fn density(p: vec3) -> f32 {
+    let a = sin(p.x * 3.1 + sin(p.y * 1.7)) * cos(p.z * 2.3 + sin(p.x * 0.9))
+    let b = sin(p.y * 5.3 + cos(p.z * 4.1)) * 0.5
+    max(a + b - 0.2, 0.0)
+}
+
+/// The reference: each pixel's ray marched through the medium with fine steps.
+@compute(8, 8)
+fn refer(width: u32, height: u32, out: mut Slots<vec4>, id: GlobalId) {
+    if id.x >= width || id.y >= height {
+        return
+    }
+    let uv = vec2(f32(id.x) / f32(width), f32(id.y) / f32(height)) * 2.0 - vec2(1.0)
+    let d = normalize(vec3(uv, 1.5))
+    var through = 1.0
+    var light = vec3(0.0)
+    let h = 8.0 / f32(STEPS)
+    for i in 0..STEPS {
+        let p = d * (f32(i) * h)
+        let rho = density(p)
+        let a = 1.0 - exp(-rho * h)
+        light += through * a * vec3(0.9, 0.8, 0.7)
+        through *= 1.0 - a
+    }
+    out[id] = vec4(light, through)
+}
+
+pub struct Scene {
+    out: GpuBuffer<vec4>,
+    size: (u32, u32),
+}
+
+pub fn init() -> Scene {
+    Scene { out: buffer(1), size: (0, 0) }
+}
+
+pub fn frame(s: mut Scene, time: f32, width: u32, height: u32) {
+    if s.size != (width, height) {
+        s.out = buffer(width * height)
+        s.size = (width, height)
+    }
+    label("reference")
+    dispatch(refer.bind(width, height, mut s.out), groups: ((width + 7) / 8, (height + 7) / 8, 1))
+}

@@ -1,0 +1,220 @@
+// The sea's model held to what it promises: its bands meet, its waves hold the sea's height, its
+// crests break as the wind whitens a sea, its CPU sum by tables is the sum a wave at a time, and
+// its derivatives and bounds are what finite differences and samples find. The first five are
+// carried from rywible/wrela at 7ae6711e, engine/ocean.wrela:1077-1234.
+
+use spectrum::{
+    G, SIDE, SeaState, TILES, band, breaking, density, foam_fade, kept_over, standing, wavenumber,
+    whitecaps,
+}
+use std::io::print
+use std::math::{PI, TAU}
+use swell::{Moment, Part, Swell, loudest}
+
+/// A gentle sea: Beaufort 3 to 4 over a long swell.
+fn gentle() -> SeaState {
+    SeaState {
+        wind: normalize(vec2(-0.55, 0.835)),
+        speed: 5.5,
+        fetch: 60000.0,
+        swell: normalize(vec2(0.17, 0.985)),
+        swell_height: 0.8,
+        swell_period: 11.0,
+        chop: 0.9,
+        seed: 7,
+    }
+}
+
+/// The opening's gale (rywible/wrela scenes/opening/sea.wrela:22-31).
+fn gale() -> SeaState {
+    SeaState {
+        wind: vec2(-0.96858, 0.24869),
+        speed: 19.0,
+        fetch: 300000.0,
+        swell: vec2(0.17007, 0.98543),
+        swell_height: 5.5,
+        swell_period: 10.5,
+        chop: 2.5,
+        seed: 7,
+    }
+}
+
+/// The bands meet end to end, so no wave is summed twice or missed.
+@test
+fn the_bands_meet_end_to_end() {
+    assert(band(0).lo == 0.0)
+    for i in 1..TILES {
+        assert(band(i - 1).hi == band(i).lo, f"a gap or an overlap before band {i}")
+    }
+    // Each band lies within what its texels hold (under half its Nyquist), and its longest wave
+    // spans six of its own lattice's.
+    for i in 0..TILES {
+        let b = band(i)
+        assert(b.hi <= PI * f32(SIDE) / b.side * 1.0001, f"band {i} past its Nyquist")
+        assert(i == 0 || b.lo >= 5.99 * TAU / b.side, f"band {i}'s longest too coarse")
+    }
+}
+
+/// The spectrum's waves, summed as the tiles hold them, give the sea its significant height, the
+/// wind's sea's and the swell's, their variances adding, within 10 % (the short waves raised to
+/// the tail's level add a few %; the tiles hold no wave longer than the big one's side).
+@test
+fn the_waves_hold_the_seas_height() {
+    let sea = gentle()
+    var variance = 0.0
+    for i in 0..TILES {
+        let b = band(i)
+        let dk = TAU / b.side
+        let reach = min(i32(ceil(b.hi / dk)), i32(SIDE / 2) - 1)
+        for y in -reach..reach + 1 {
+            for x in -reach..reach + 1 {
+                let k = wavenumber(b, vec2i(x, y))
+                let kk = length(k)
+                if kk > 0.0 && kk >= b.lo && kk < b.hi {
+                    variance += density(sea, k) * dk * dk
+                }
+            }
+        }
+    }
+    let wind_h = 0.0016 * sqrt(G * sea.fetch / (sea.speed * sea.speed)) * sea.speed * sea.speed / G
+    let expected = sqrt(wind_h * wind_h + sea.swell_height * sea.swell_height)
+    let h = 4.0 * sqrt(variance)
+    print(f"significant height {h} m, expected {expected} m")
+    assert(abs(h - expected) < 0.1 * expected, f"{h} m, not {expected} m")
+}
+
+/// The CPU's loudest waves hold most of the long bands' height.
+@test
+fn the_loudest_waves_hold_most_of_the_height() {
+    let sw: Swell<512> = loudest(gentle(), 1.0)
+    print(f"512 waves hold {sw.held * 100.0} % of the long bands' variance")
+    assert(sw.held > 0.6, f"{sw.held}")
+}
+
+/// `sw`'s shape summed a wave at a time, a cosine and a sine each: what `Swell::parts` gives by
+/// its tables, to check it by.
+fn shape_plainly<const N: u32>(sw: Swell<N>, p: vec2, t: f32) -> vec3 {
+    var d = vec3(0.0)
+    var tiles = vec2(0.0)
+    for m in sw.modes {
+        let phase = dot(m.k, p) - m.w * t
+        let c = cos(phase)
+        let s = sin(phase)
+        let re = m.a.x * c - m.a.y * s
+        let im = m.a.x * s + m.a.y * c
+        d += vec3(-m.u.x * im, re, -m.u.y * im) * 2.0
+        if m.tile == 0 { tiles.x += re * 2.0 } else { tiles.y += re * 2.0 }
+    }
+    let carried = sw.lean * (standing(tiles.x) + standing(tiles.y))
+    vec3(d.x * sw.chop + carried.x, d.y, d.z * sw.chop + carried.y)
+}
+
+/// The CPU's sea summed from its lattice's tables is the sea summed a wave at a time, to well
+/// under a millimetre, near and far, early and late, in a gentle sea and in a gale with its mid
+/// band weighted down.
+@test
+fn the_swell_summed_by_tables_is_the_swell_summed_plainly() {
+    for (sea, mid) in [(gentle(), 1.0), (gale(), 0.6)] {
+        let sw: Swell<4096> = loudest(sea, mid)
+        var worst = 0.0
+        for (p, t) in [
+            (vec2(0.0, 0.0), 0.0),
+            (vec2(3.7, -12.9), 4.25),
+            (vec2(-1811.3, 2404.6), 61.5),
+            (vec2(-1811.3, -2404.6), 61.5),
+            (vec2(997.0, -131.0), 600.0),
+            (vec2(5210.4, 77.7), 1234.5),
+        ] {
+            worst = max(worst, length(sw.shape(p, t) - shape_plainly(sw, p, t)))
+        }
+        print(f"4096 waves: the tables' sum within {worst * 1000.0} mm of the plain one")
+        assert(worst < 5.0e-4, f"{worst} m apart")
+    }
+}
+
+/// The crests break as often as the wind whitens a sea: rarely in a moderate breeze, a tenth of
+/// the sea white in a gale, its breaking crests some deviations under the Jacobian's mean
+/// (the normal tail's share inverted to within a hundredth of a deviation).
+@test
+fn the_crests_break_as_the_wind_whitens_the_sea() {
+    print(f"whitecaps: breeze {whitecaps(gentle()) * 100.0} %, gale {whitecaps(gale()) * 100.0} %")
+    assert(whitecaps(gentle()) < 0.003 && whitecaps(gale()) > 0.07, "coverage")
+    // (Half a gale's 8.8 %: 4.4 % past 1.71 deviations.)
+    assert(abs(breaking(gale()) - 1.71) < 0.02, f"{breaking(gale())}")
+    assert(breaking(gentle()) > 3.0, f"{breaking(gentle())}")
+}
+
+/// Old foam fades over the whole time between drawings, however long, and alike however often
+/// it's drawn.
+@test
+fn foam_fades_over_the_actual_gap_between_drawings() {
+    assert(kept_over(gale(), foam_fade(gale()) * 5.0) < 0.01, "a long gap leaves no fresh foam")
+    let one = kept_over(gale(), 1.0)
+    let two = kept_over(gale(), 0.5) * kept_over(gale(), 0.5)
+    assert(abs(one - two) < 1.0e-6, "the same elapsed time fades equally at different draw rates")
+    assert(kept_over(gale(), 0.0) == 1.0, "no time, no fade")
+}
+
+/// A band's derivatives, from its waves' own, are its central differences (2 cm apart) within a
+/// thousandth of the band's largest slope, at places near and far, for both bands, in a gale.
+@test
+fn a_bands_derivatives_are_its_finite_differences() {
+    let sw: Swell<1024> = loudest(gale(), 1.0)
+    let now = sw.moment(37.25)
+    let e = 0.02
+    var worst = 0.0
+    for p in [vec2(0.0, 0.0), vec2(13.1, -41.7), vec2(-388.0, 902.5), vec2(2047.3, -77.0)] {
+        let (b0, m0) = sw.parts(now, p)
+        let (bx1, mx1) = sw.parts(now, p + vec2(e, 0.0))
+        let (bx0, mx0) = sw.parts(now, p - vec2(e, 0.0))
+        let (bz1, mz1) = sw.parts(now, p + vec2(0.0, e))
+        let (bz0, mz0) = sw.parts(now, p - vec2(0.0, e))
+        for (o, x1, x0, z1, z0, i) in [(b0, bx1, bx0, bz1, bz0, 0), (m0, mx1, mx0, mz1, mz0, 1)] {
+            let scale = if i == 0 { sw.bend.slope.x } else { sw.bend.slope.y }
+            let fx = (x1.h - x0.h) / (2.0 * e)
+            let fz = (z1.h - z0.h) / (2.0 * e)
+            let dxx = (x1.d.x - x0.d.x) / (2.0 * e)
+            let dxz = (z1.d.x - z0.d.x) / (2.0 * e)
+            let dzz = (z1.d.y - z0.d.y) / (2.0 * e)
+            let off = max(
+                max(abs(fx - o.slope.x), abs(fz - o.slope.y)),
+                max(abs(dxx - o.stretch.x), max(abs(dxz - o.stretch.y), abs(dzz - o.stretch.z))),
+            )
+            worst = max(worst, off / scale)
+            // The chopped and leaned shape's derivatives too.
+            let s = sw.shaped(o)
+            let su = (sw.shaped(x1).at - sw.shaped(x0).at) / (2.0 * e)
+            let sv = (sw.shaped(z1).at - sw.shaped(z0).at) / (2.0 * e)
+            worst = max(worst, max(length(su - s.du), length(sv - s.dv)) / (scale * 4.0))
+        }
+    }
+    print(f"derivatives within {worst * 1000.0} thousandths of the largest slope")
+    assert(worst < 1.0e-3, f"{worst}")
+}
+
+/// No band's height, slope or curve passes its stated `Bend` at any place or time sampled.
+@test
+fn no_band_passes_its_bend() {
+    let sw: Swell<1024> = loudest(gale(), 1.0)
+    var most = vec3(0.0)
+    for k in 0..8 {
+        let now = sw.moment(f32(k) * 7.3)
+        for i in 0..16 {
+            let p = vec2(f32(i) * 61.7 - 400.0, f32(k * 16 + i) * 13.9 - 900.0)
+            let (b, m) = sw.parts(now, p)
+            for (o, j) in [(b, 0), (m, 1)] {
+                let h = if j == 0 { sw.bend.height.x } else { sw.bend.height.y }
+                let s = if j == 0 { sw.bend.slope.x } else { sw.bend.slope.y }
+                most = max(most, vec3(abs(o.h) / h, length(o.slope) / s, 0.0))
+            }
+            // The height's second derivative along x, by differences of the derived slope.
+            let e = 0.01
+            let (b1, m1) = sw.parts(now, p + vec2(e, 0.0))
+            let cb = abs(b1.slope.x - b.slope.x) / e / sw.bend.curve.x
+            let cm = abs(m1.slope.x - m.slope.x) / e / sw.bend.curve.y
+            most.z = max(most.z, max(cb, cm))
+        }
+    }
+    print(f"most of the bend reached: height {most.x}, slope {most.y}, curve {most.z}")
+    assert(most.x <= 1.0 && most.y <= 1.0 && most.z <= 1.0, f"{most}")
+}

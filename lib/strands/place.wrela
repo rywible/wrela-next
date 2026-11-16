@@ -1,0 +1,174 @@
+// Copies placed on the GPU each frame, in compute, in two steps: each cell of each block listed
+// round the eye (`blocks`) asked, in one invocation, whether its copy may be drawn (by its rank
+// and distance, before the copy is worked out: most far cells stop there), and listed if so;
+// then each listed cell's copy worked out once (the scatter's function), kept by the rule
+// (`kept`) and the eye's view, and appended to the list of its ribbon's segments. The draws'
+// arguments follow from the counts.
+
+use blocks::{Block, CELLS, GROUND_SPREAD, SIDE}
+use form::kinds::Strand
+use frame::eye::Eye
+use kept::{Rule, drawn, most_kept, rank_of, widened}
+use ribbon::{BATCH, Laid}
+use scatter::{Scatter, Wears}
+use std::gpu::{Append, DispatchArgs, DrawIndexedArgs, GlobalId, One}
+
+/// Whether a sphere round `c`, `r` m across, is in `eye`'s view (none of it past a side).
+pub fn sphere_in_view(eye: Eye, c: vec3, r: f32) -> bool {
+    let v = c - eye.at
+    let z = dot(v, eye.forward)
+    let x = dot(v, eye.right)
+    let y = dot(v, eye.up)
+    // The side planes' normals, unit: (focal, ±aspect) and (focal, ±1) over their lengths.
+    let ka = 1.0 / sqrt(eye.focal * eye.focal + eye.aspect * eye.aspect)
+    let ku = 1.0 / sqrt(eye.focal * eye.focal + 1.0)
+    z > eye.near - r &&
+        (eye.focal * x - eye.aspect * z) * ka < r &&
+        (-eye.focal * x - eye.aspect * z) * ka < r &&
+        (eye.focal * y - z) * ku < r &&
+        (-eye.focal * y - z) * ku < r
+}
+
+/// A cell that may hold a copy that's drawn: the cell, and its block's ground's height.
+pub struct Candidate: Copy + GpuData {
+    pub cell: vec2i,
+    pub ground: f32,
+    pub spare: f32,
+}
+
+/// Cell `id.x` of block `id.y`, appended to `out` if its copy may be drawn: by its rank and its
+/// distance from `from` (the eye's place, but for the pop count, which holds it still), before
+/// its copy is worked out; and if it is in view wherever in its cell and however high its ground
+/// in the block stands. Most far cells stop here: the copies are worked out after (`placed`),
+/// each invocation one that may be drawn, so no lane of the GPU's 32 idles while another works
+/// one out.
+@compute(64)
+pub fn listed_cells<S: Strand, C: Scatter<S>>(
+    scatter: C,
+    eye: Eye,
+    rule: Rule,
+    from: vec3,
+    blocks: [Block],
+    out: mut Append<Candidate>,
+    id: GlobalId,
+) {
+    if id.y >= blocks.len() || id.x >= CELLS {
+        return
+    }
+    let b = blocks[id.y]
+    let cell = b.cell + vec2i(i32(id.x % SIDE), i32(id.x / SIDE))
+    let rank = rank_of(cell)
+    let size = scatter.cell()
+    let middle = (vec2(f32(cell.x), f32(cell.y)) + vec2(0.5)) * size
+    let near = max(length(vec3(middle.x, b.ground, middle.y) - from) - 1.5, 0.0)
+    if rank >= most_kept(rule, near, scatter.widest(), eye.pixel()) {
+        return
+    }
+    let reach = scatter.longest() * 0.5
+    let middle_up = vec3(middle.x, b.ground + reach, middle.y)
+    if !sphere_in_view(eye, middle_up, reach + GROUND_SPREAD + size) {
+        return
+    }
+    let _ = out.push(Candidate { cell, ground: b.ground, spare: 0.0 })
+}
+
+/// The groups of 64 a dispatch over `count[0]` (at most `room`) invocations needs.
+@compute(1)
+pub fn grouped(count: [u32], room: u32, out: mut One<DispatchArgs>, id: GlobalId) {
+    out.set(id, DispatchArgs { x: (min(count[0], room) + 63) / 64, y: 1, z: 1 })
+}
+
+/// Candidate `id.x` of `cells` (`count[0]` of them): its copy worked out, kept by the rule and
+/// the eye's view, and appended to the list of its ribbon's segments: the fewest of `LEVELS`
+/// whose chords lie within `sag` px of its curve.
+@compute(64)
+pub fn placed<S: Strand, C: Scatter<S>, L: Wears<S>>(
+    scatter: C,
+    look: L,
+    eye: Eye,
+    rule: Rule,
+    from: vec3,
+    cells: [Candidate],
+    count: [u32],
+    sag: f32,
+    coarse: mut Append<Laid<S>>,
+    middling: mut Append<Laid<S>>,
+    fine: mut Append<Laid<S>>,
+    id: GlobalId,
+) {
+    if id.x >= min(count[0], cells.len()) {
+        return
+    }
+    let cell = cells[id.x].cell
+    match scatter.copy(cell) {
+        Some(s) => {
+            let root = s.at(0.0)
+            let far = length(root.xyz - from)
+            let d = drawn(rule, rank_of(cell), far, 2.0 * root.w, eye.pixel())
+            // (Its width by the eye's own distance: held still for the pop count, only which
+            // copies are drawn, and how much of each, are.)
+            let widen = widened(rule, length(root.xyz - eye.at), 2.0 * root.w, eye.pixel())
+            if d.length <= 0.0 {
+                return
+            }
+            let reach = scatter.longest() * 0.5
+            if !sphere_in_view(eye, root.xyz + vec3(0.0, reach, 0.0), reach + 0.05) {
+                return
+            }
+            let laid = Laid {
+                strand: s,
+                host: scatter.host(s),
+                widen: widen,
+                mean: look.mean(s),
+                length: d.length,
+                id: u32(cell.x) * 73856093 ^ u32(cell.y) * 19349663,
+            }
+            // Chords sag about as the square of their length: from the coarsest's sag, the
+            // others'.
+            let px = eye.pixel() * length(root.xyz - eye.at)
+            let coarsest = sagging(s, d.length, LEVELS[0])
+            let f = f32(LEVELS[0]) / f32(LEVELS[1])
+            if coarsest <= sag * px {
+                let _ = coarse.push(laid)
+            } else if coarsest * f * f <= sag * px {
+                let _ = middling.push(laid)
+            } else {
+                let _ = fine.push(laid)
+            }
+        },
+        None => {},
+    }
+}
+
+/// How many segments a ribbon has in each of the three lists: coarse, middling, fine.
+pub const LEVELS: [u32; 3] = [2, 4, 8]
+
+/// The farthest (m) the chords of `s` cut in `segments` lie from its curve, kept `kept` of its
+/// length: at each chord's middle.
+pub fn sagging<S: Strand>(s: S, kept: f32, segments: u32) -> f32 {
+    var most = 0.0
+    var a = s.at(0.0).xyz
+    for k in 0..min(segments, LEVELS[2]) {
+        let b = s.at(f32(k + 1) / f32(segments)).xyz
+        let m = s.at((f32(k) + 0.5) / f32(segments)).xyz
+        most = max(most, length(m - 0.5 * (a + b)))
+        a = b
+    }
+    most * kept
+}
+
+/// The draw's arguments for the copies appended (`count`, at most `room`): `BATCH` an
+/// instance, `indices` corners an instance.
+@compute(1)
+pub fn counted(count: [u32], room: u32, indices: u32, out: mut One<DrawIndexedArgs>, id: GlobalId) {
+    out.set(
+        id,
+        DrawIndexedArgs {
+            indices,
+            instances: (min(count[0], room) + BATCH - 1) / BATCH,
+            first_index: 0,
+            base_vertex: 0,
+            first_instance: 0,
+        },
+    )
+}

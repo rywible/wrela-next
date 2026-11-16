@@ -1,0 +1,470 @@
+// A sheet chart's stepped state (docs/design.md, "Forms": stepped state is fenced off): cloth
+// that hangs from a body as a grid of nodes, stepped each frame on the GPU. The sheet's rest
+// shape is a chart (`form::charts::Sheet`); the grid's nodes sample it at rest, once (`Node`).
+// What the body is, how it holds the cloth and what the cloth is kept off are its wearer's
+// (`Wearer`); what a pose holds it by each step is worked out on the CPU (`Held`). Each step
+// swings each node on by its momentum and its weight (Verlet), draws it toward its shape on the
+// body (`cloth_step`), pulls it back to its neighbours' distances at rest and off the body a
+// number of times (`cloth_relax`), and finds which way its outside faces (`cloth_drape`).
+// From rywible/wrela's content/hakuro/arms.wrela at 7ae6711e.
+
+use std::collections::Vec
+use std::derive::Box2
+use std::gpu::{GlobalId, GpuBuffer, GpuSpan, Slots, buffer, dispatch, write}
+
+/// A node of the grid at rest, as its wearer gives it once: the point of the sheet's middle
+/// there (`rest`); which way its outside faces (`out`, unit); how much of it is the seam
+/// itself (`sewn`: 1 along the top edge, its garment's hem carried on, which goes where the
+/// garment goes); and how much of it is cloth (`woven`: the grid may run on past the cloth's
+/// cut edge, and its nodes there are no cloth; they go where their neighbours take them).
+pub struct Node: Copy + GpuData {
+    pub rest: vec3,
+    pub sewn: f32,
+    pub out: vec3,
+    pub woven: f32,
+}
+
+/// What a sheet's stepper takes from its wearer's pose each step, worked out on the CPU: where
+/// each of its held nodes is held (`xyz`) and how firmly (`w`, 0 to 1), for the top
+/// `Wearer::HELD_ROWS` rows, row by row, each row's columns in order; where the point it hangs
+/// from is (`root`), whose travel since the last step the cloth keeps; and straight down in
+/// the air it's going through (`plumb`, unit).
+pub struct Held {
+    pub at: Vec<vec4>,
+    pub root: vec3,
+    pub plumb: vec3,
+}
+
+/// What a step takes of one view's pose on the GPU: how far its root moved since the last step
+/// (m), and its plumb (`Held`).
+pub struct Step: Copy + GpuData {
+    pub travel: vec3,
+    pub plumb: vec3,
+}
+
+/// What wears a sheet: its grid's size and how the cloth moves, where its shape on the body
+/// is, and what of the body it's kept off. A pose is a palette of the wearer's bones' matrices
+/// (`palette`, from `first` on), each carrying a point of the body at rest to where the pose
+/// puts it. `legs` is the wearer's own table of what it's kept off, given once (`drape`).
+pub trait Wearer: Copy + GpuData {
+    /// The grid: columns across the sheet, rows down it.
+    const COLS: u32
+    const ROWS: u32
+    /// How many rows from the top a pose holds (`Held`); none below.
+    const HELD_ROWS: u32
+    /// How much of the cloth's own shape it keeps each step: drawn this far toward where the
+    /// body carries it.
+    const SHAPE: f32
+    /// How much of its swing it keeps from step to step (air and its own stiffness take the
+    /// rest).
+    const KEEP: f32
+    /// How many times a step each node is pulled back to its neighbours' distances (even).
+    const RELAXES: u32
+
+    /// Where a node (at rest `rest`, its column's top at rest `top`) would hang as the pose
+    /// has the body, straight down being `plumb`: its shape on the body.
+    fn hung(self, rest: vec3, top: vec3, plumb: vec3, palette: [mat4], first: u32) -> vec3
+
+    /// Where the body carries a point of the cloth at rest, stiffly: what its outside is told
+    /// by (`cloth_drape`).
+    fn skinned(self, rest: vec3, palette: [mat4], first: u32) -> vec3
+
+    /// `p` (a node, at rest `rest`) kept off what of the body swings past the cloth.
+    fn off_body(self, p: vec3, rest: vec3, palette: [mat4], first: u32) -> vec3
+
+    /// `p` kept off what the cloth hangs over, by `legs`: just clear where the node is held
+    /// (`held`), further where it hangs free.
+    fn off_legs(self, p: vec3, held: bool, palette: [mat4], first: u32, legs: [f32]) -> vec3
+}
+
+/// Where node (`c`, `r`) is on a sheet's places (`domain`) for a grid of `cols` by `rows`:
+/// its first column at the domain's least `x` and its last at the most, its first row at the
+/// least `y` and its last at the most.
+pub fn place(domain: Box2, cols: u32, rows: u32, c: u32, r: u32) -> vec2 {
+    let u = vec2(f32(c) / f32(cols - 1), f32(r) / f32(rows - 1))
+    domain.lo + (domain.hi - domain.lo) * u
+}
+
+/// A node's place in `views` views' grids: its view, its column and row, its first bone.
+fn node_of<W: Wearer>(i: u32, stride: u32) -> (u32, u32, u32, u32) {
+    let nodes = W::COLS * W::ROWS
+    let view = i / nodes
+    let n = i % nodes
+    (view, n % W::COLS, n / W::COLS, view * stride)
+}
+
+/// The cloth's step: each node swung on from where it was (`pos`, a step ago `prev`) by its
+/// own momentum and its weight, and drawn a little toward its shape on the body. The first step
+/// (`fresh`) it starts where the body carries it.
+@compute(64)
+pub fn cloth_step<W: Wearer>(
+    wearer: W,
+    palettes: [mat4],
+    views: u32,
+    stride: u32,
+    dt: f32,
+    fresh: u32,
+    nodes: [Node],
+    held: [vec4],
+    steps: [Step],
+    pos: [vec4],
+    prev: [vec4],
+    out_pos: mut Slots<vec4>,
+    out_prev: mut Slots<vec4>,
+    id: GlobalId,
+) {
+    if id.x >= views * W::COLS * W::ROWS {
+        return
+    }
+    let (view, c, r, first) = node_of::<W>(id.x, stride)
+    let rest = nodes[r * W::COLS + c].rest
+    let step = steps[view]
+    let target = wearer.hung(rest, nodes[c].rest, step.plumb, palettes, first)
+    if fresh == 1 {
+        out_pos[id] = vec4(target, 0.0)
+        out_prev[id] = vec4(target, 0.0)
+        return
+    }
+    var pin = 0.0
+    if r < W::HELD_ROWS {
+        pin = held[view * W::COLS * W::HELD_ROWS + r * W::COLS + c].w
+    }
+    let p = pos[id.x].xyz
+    let swing = (p - prev[id.x].xyz) * W::KEEP
+    // (Its swing damped as it moves against the body, not as the body's carried: the way its
+    // root moved since the last step is kept whole. Damped with the rest, the coat of a man
+    // carried along at a skiff's ten metres a second streamed out behind him as if in a gale.)
+    var q = p + swing + step.travel * (1.0 - W::KEEP) + vec3(0.0, -9.8, 0.0) * dt * dt
+    q = mix(q, target, mix(W::SHAPE, 1.0, pin))
+    out_pos[id] = vec4(q, 0.0)
+    out_prev[id] = vec4(p, 0.0)
+}
+
+/// The cloth relaxed once: each node pulled toward its neighbours' distances at rest (beside it
+/// and above and below, and two along for its stiffness), then kept off the body, held where
+/// the pose holds it.
+@compute(64)
+pub fn cloth_relax<W: Wearer>(
+    wearer: W,
+    palettes: [mat4],
+    views: u32,
+    stride: u32,
+    legs: [f32],
+    nodes: [Node],
+    held: [vec4],
+    pos: [vec4],
+    out: mut Slots<vec4>,
+    id: GlobalId,
+) {
+    if id.x >= views * W::COLS * W::ROWS {
+        return
+    }
+    let (view, c, r, first) = node_of::<W>(id.x, stride)
+    let node = nodes[r * W::COLS + c]
+    let rest = node.rest
+    let p = pos[id.x].xyz
+    let base = view * W::COLS * W::ROWS
+    var pull = vec3(0.0)
+    var weight = 0.0
+    let steps = [
+        vec2(-1.0, 0.0),
+        vec2(1.0, 0.0),
+        vec2(0.0, -1.0),
+        vec2(0.0, 1.0),
+        vec2(-2.0, 0.0),
+        vec2(2.0, 0.0),
+        vec2(0.0, -2.0),
+        vec2(0.0, 2.0),
+    ]
+    for k in 0..8 {
+        let cc = i32(c) + i32(steps[k].x)
+        let rr = i32(r) + i32(steps[k].y)
+        if cc >= 0 && cc < i32(W::COLS) && rr >= 0 && rr < i32(W::ROWS) {
+            let n = u32(rr) * W::COLS + u32(cc)
+            let o = pos[base + n].xyz
+            let want = length(nodes[n].rest - rest)
+            let d = o - p
+            let l = length(d)
+            let w = if k < 4 { 1.0 } else { 0.25 }
+            if l > 1.0e-6 {
+                pull += d * ((l - want) / l) * 0.5 * w
+            }
+            weight += w
+        }
+    }
+    var q = p + pull / max(weight, 1.0) * 1.6
+    // (Only what's cloth is kept off the body: a node past the cloth's cut edge goes where its
+    // neighbours take it.)
+    let cloth = node.woven
+    q = mix(q, wearer.off_body(q, rest, palettes, first), cloth)
+    q = mix(q, wearer.off_legs(q, held: false, palette: palettes, first: first, legs: legs), cloth)
+    if r < W::HELD_ROWS {
+        let h = held[view * W::COLS * W::HELD_ROWS + r * W::COLS + c]
+        q = mix(q, h.xyz, h.w)
+    }
+    // (Where it's held it can't hang off what it's over, only be put out of it: a thigh swung
+    // out as he stood, or lifted in a stride, came through the cloth his hips held. But not
+    // its seam, which is the garment's hem carried on: put out of a lifted thigh while the hem
+    // over it stayed, its front corner stood off the hem as a wing at his belt.)
+    q = mix(
+        q,
+        wearer.off_legs(q, held: true, palette: palettes, first: first, legs: legs),
+        (1.0 - node.sewn) * cloth,
+    )
+    out[id] = vec4(q, 0.0)
+}
+
+/// Which way each node's outside faces now (`facing`, unit): across the cloth, turned the way
+/// its outside faced at rest, as the body carries it stiffly. A face and a lining laid along it
+/// turn over with the cloth when it swings over, and never pass through each other.
+@compute(64)
+pub fn cloth_drape<W: Wearer>(
+    wearer: W,
+    palettes: [mat4],
+    views: u32,
+    stride: u32,
+    nodes: [Node],
+    pos: [vec4],
+    facing: mut Slots<vec4>,
+    id: GlobalId,
+) {
+    if id.x >= views * W::COLS * W::ROWS {
+        return
+    }
+    let (view, c, r, first) = node_of::<W>(id.x, stride)
+    let base = view * W::COLS * W::ROWS
+    let at = |cc: u32, rr: u32| pos[base + rr * W::COLS + cc].xyz
+    let rest_at = |cc: u32, rr: u32| nodes[rr * W::COLS + cc].rest
+    let c0 = if c > 0 { c - 1 } else { c }
+    let c1 = min(c + 1, W::COLS - 1)
+    let r0 = if r > 0 { r - 1 } else { r }
+    let r1 = min(r + 1, W::ROWS - 1)
+    let node = nodes[r * W::COLS + c]
+    let here = wearer.skinned(node.rest, palettes, first)
+    // Its outside at rest, carried by the body.
+    let ow = normalize(wearer.skinned(node.rest + node.out * 0.01, palettes, first) - here)
+    // Its outside now: across the cloth, turned the way its outside was at rest.
+    let round = at(c1, r) - at(c0, r)
+    let down = at(c, r1) - at(c, r0)
+    let rround = wearer.skinned(rest_at(c1, r), palettes, first) -
+        wearer.skinned(rest_at(c0, r), palettes, first)
+    let rdown = wearer.skinned(rest_at(c, r1), palettes, first) -
+        wearer.skinned(rest_at(c, r0), palettes, first)
+    let rn = cross(rround, rdown)
+    let sign = if dot(rn, ow) >= 0.0 { 1.0 } else { -1.0 }
+    let n = cross(round, down) * sign
+    let nl = length(n)
+    facing[id] = vec4(if nl > 1.0e-8 { n / nl } else { ow }, 0.0)
+}
+
+/// A sheet's cloth for `views` views of its wearer (each view's palette `stride` bones on from
+/// the last): each node where it is (two buffers, stepped one into the other in turn) and
+/// where it was a step before, which way it faces, its nodes at rest and the wearer's table,
+/// and what this step's poses hold it by.
+pub struct Drape<W: Wearer> {
+    wearer: W,
+    views: u32,
+    nodes: GpuBuffer<Node>,
+    legs: GpuBuffer<f32>,
+    held: GpuBuffer<vec4>,
+    steps: GpuBuffer<Step>,
+    pos_a: GpuBuffer<vec4>,
+    pos_b: GpuBuffer<vec4>,
+    prev_a: GpuBuffer<vec4>,
+    prev_b: GpuBuffer<vec4>,
+    facing: GpuBuffer<vec4>,
+    // (Each view's root at the last step, and this step's travel and plumb, as `hold` gave them.)
+    roots: Vec<vec3>,
+    step: Vec<Step>,
+    flip: u32,
+    fresh: bool,
+}
+
+/// Room for the cloth of `views` views of `wearer`: its nodes at rest (`W::COLS` by
+/// `W::ROWS`, row by row) and its table (`Wearer::off_legs`'), written once.
+pub fn drape<W: Wearer>(wearer: W, nodes: [Node], legs: [f32], views: u32) -> Drape<W> {
+    let n = views * W::COLS * W::ROWS
+    var rest: GpuBuffer<Node> = buffer(W::COLS * W::ROWS)
+    write(mut rest, 0, nodes)
+    var table: GpuBuffer<f32> = buffer(legs.len())
+    write(mut table, 0, legs)
+    var roots: Vec<vec3> = Vec::new()
+    var step: Vec<Step> = Vec::new()
+    for _ in 0..views {
+        roots.push(vec3(0.0))
+        step.push(Step { travel: vec3(0.0), plumb: vec3(0.0, -1.0, 0.0) })
+    }
+    Drape {
+        wearer,
+        views,
+        nodes: rest,
+        legs: table,
+        held: buffer(views * W::COLS * W::HELD_ROWS),
+        steps: buffer(views),
+        pos_a: buffer(n),
+        pos_b: buffer(n),
+        prev_a: buffer(n),
+        prev_b: buffer(n),
+        facing: buffer(n),
+        roots,
+        step,
+        flip: 0,
+        fresh: true,
+    }
+}
+
+/// One step of the cloth: stepped from `pos` and `prev` into `next` and `next_prev`, relaxed
+/// back and forth between `next` and `pos` (ending in `next`), which way it faces into
+/// `facing`.
+fn cloth_frame<W: Wearer>(
+    wearer: W,
+    palettes: GpuBuffer<mat4>,
+    views: u32,
+    stride: u32,
+    nodes: GpuBuffer<Node>,
+    legs: GpuBuffer<f32>,
+    held: GpuBuffer<vec4>,
+    steps: GpuBuffer<Step>,
+    dt: f32,
+    fresh: u32,
+    pos: mut GpuBuffer<vec4>,
+    prev: GpuBuffer<vec4>,
+    next: mut GpuBuffer<vec4>,
+    next_prev: mut GpuBuffer<vec4>,
+    facing: mut GpuBuffer<vec4>,
+) {
+    let groups = (views * W::COLS * W::ROWS + 63) / 64
+    dispatch(
+        cloth_step.bind(
+            wearer: wearer,
+            palettes: palettes.items(),
+            views: views,
+            stride: stride,
+            dt: dt,
+            fresh: fresh,
+            nodes: nodes.items(),
+            held: held.items(),
+            steps: steps.items(),
+            pos: pos.items(),
+            prev: prev.items(),
+            out_pos: mut next,
+            out_prev: mut next_prev,
+        ),
+        groups: groups,
+    )
+    for _ in 0..W::RELAXES / 2 {
+        dispatch(
+            cloth_relax.bind(
+                wearer: wearer,
+                palettes: palettes.items(),
+                views: views,
+                stride: stride,
+                legs: legs.items(),
+                nodes: nodes.items(),
+                held: held.items(),
+                pos: next.items(),
+                out: mut pos,
+            ),
+            groups: groups,
+        )
+        dispatch(
+            cloth_relax.bind(
+                wearer: wearer,
+                palettes: palettes.items(),
+                views: views,
+                stride: stride,
+                legs: legs.items(),
+                nodes: nodes.items(),
+                held: held.items(),
+                pos: pos.items(),
+                out: mut next,
+            ),
+            groups: groups,
+        )
+    }
+    dispatch(
+        cloth_drape.bind(
+            wearer: wearer,
+            palettes: palettes.items(),
+            views: views,
+            stride: stride,
+            nodes: nodes.items(),
+            pos: next.items(),
+            facing: mut facing,
+        ),
+        groups: groups,
+    )
+}
+
+impl<W: Wearer> Drape<W> {
+    /// What view `view`'s pose holds the cloth by this step (`Held`, worked out on the CPU from
+    /// the same palette `work` is given): once a step for each view, before `work`.
+    pub fn hold(mut self, view: u32, held: Held) {
+        if held.at.len() != W::COLS * W::HELD_ROWS {
+            panic("hold: a pose holds every node of the held rows")
+        }
+        let travel = if self.fresh { vec3(0.0) } else { held.root - self.roots[view] }
+        self.roots[view] = held.root
+        self.step[view] = Step { travel, plumb: held.plumb }
+        write(mut self.held, view * W::COLS * W::HELD_ROWS, held.at)
+    }
+
+    /// The cloth moved on `dt` seconds (at most a twentieth: a longer step is taken as that),
+    /// its views posed as `palettes` has them (each view's palette `stride` bones on from the
+    /// last), held as `hold` was last told.
+    pub fn work(mut self, palettes: GpuBuffer<mat4>, stride: u32, dt: f32) {
+        let fresh: u32 = if self.fresh { 1 } else { 0 }
+        self.fresh = false
+        let step = clamp(dt, 0.0, 1.0 / 20.0)
+        write(mut self.steps, 0, self.step)
+        if self.flip == 0 {
+            cloth_frame(
+                self.wearer,
+                palettes,
+                self.views,
+                stride,
+                self.nodes,
+                self.legs,
+                self.held,
+                self.steps,
+                step,
+                fresh,
+                mut self.pos_a,
+                self.prev_a,
+                mut self.pos_b,
+                mut self.prev_b,
+                mut self.facing,
+            )
+        } else {
+            cloth_frame(
+                self.wearer,
+                palettes,
+                self.views,
+                stride,
+                self.nodes,
+                self.legs,
+                self.held,
+                self.steps,
+                step,
+                fresh,
+                mut self.pos_b,
+                self.prev_b,
+                mut self.pos_a,
+                mut self.prev_a,
+                mut self.facing,
+            )
+        }
+        self.flip = 1 - self.flip
+    }
+
+    /// Where each node of each view is after the last step (`xyz`), view by view, each row by
+    /// row: the sheet's middle as it hangs.
+    pub fn nodes(self) -> GpuSpan<vec4> {
+        if self.flip == 1 { self.pos_b.items() } else { self.pos_a.items() }
+    }
+
+    /// Which way each node's outside faces after the last step (`xyz`, unit), as `nodes`.
+    pub fn facing(self) -> GpuSpan<vec4> {
+        self.facing.items()
+    }
+}

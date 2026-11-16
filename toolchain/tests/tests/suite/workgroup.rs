@@ -1,0 +1,64 @@
+//! Kernels that share (AC4): toolchain/tests/workgroup's kernels use workgroup memory with one
+//! barrier (spike 01's `place_vertices` pattern), atomics, an append and an atomic map. The
+//! native host's results are what each must give, and headless Chrome gives the same (same
+//! state hash, which covers a buffer write of every summary).
+//! `cargo test -p wrela-tests --test suite workgroup:: -- --ignored`.
+
+use std::path::Path;
+use wrela_host::Host;
+use wrela_tests::{one_u32, page};
+
+const FRAMES: u32 = 31;
+
+fn native(dir: &Path) -> (String, Host) {
+    let mut host = Host::load(dir).expect("load");
+    let times = crate::frame_times(FRAMES);
+    let run = host.run_frames(&times, 16, 16).expect("run");
+    (run.hash_hex(), host)
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn atomic_map_keeps_all_u32_payloads_and_wrapping_sums() {
+    let buffers = crate::first_frame_buffers("workgroup", 2);
+    assert_eq!(
+        wrela_tests::u32s(&buffers[0]),
+        [1, u32::MAX, 0, u32::MAX, 1, u32::MAX, 1, 0, 1, 1, u32::MAX, 0],
+        "insert/get and add must preserve a value equal to the empty-key sentinel",
+    );
+    assert_eq!(
+        wrela_tests::u32s(&buffers[1]),
+        [0, 63, 1],
+        "64 adds wrap once; one winning insert of MAX and 64 adds commute to 63",
+    );
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn shared_memory_atomics_appends_and_maps_give_what_they_should() {
+    let (dir, _) = page("toolchain/tests/workgroup", "workgroup-native");
+    let (_, mut host) = native(&dir);
+    // Each of 2 × 64 cells sums its 8 corners, corner (x, y, z) of block b being
+    // x + 10y + 100z + 1000b.
+    let mut cells = 0.0f64;
+    for b in 0..2 {
+        for (x, y, z) in (0..64).map(|i| (i % 4, (i / 4) % 4, i / 16)) {
+            for j in 0..8 {
+                let (cx, cy, cz) = (x + (j & 1), y + ((j >> 1) & 1), z + ((j >> 2) & 1));
+                cells += f64::from(cx + 10 * cy + 100 * cz + 1000 * b);
+            }
+        }
+    }
+    assert_eq!(one_u32(&mut host, "cells_sum", &[]), cells as u32, "the shared corners");
+    let values: Vec<u32> = (0..1000u32).map(|i| i * 7919 % 1009).collect();
+    assert_eq!(one_u32(&mut host, "bins_sum", &[]), 1000, "every value in one bin");
+    let evens: Vec<u32> = values.iter().copied().filter(|v| v % 2 == 0).collect();
+    assert_eq!(one_u32(&mut host, "evens_count", &[]), evens.len() as u32, "the appended count");
+    assert_eq!(
+        one_u32(&mut host, "evens_sum", &[]),
+        evens.iter().sum::<u32>(),
+        "the appended values"
+    );
+    assert_eq!(one_u32(&mut host, "map_sum", &[]), 1000, "every value counted under its key");
+    assert_eq!(one_u32(&mut host, "map_keys", &[]), 7, "the keys 0 to 6");
+}

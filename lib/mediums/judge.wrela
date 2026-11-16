@@ -1,0 +1,532 @@
+// The judges of the mediums: what the lister lays over each pixel, against the same medium
+// marched at every pixel of the picture with fine steps to that pixel's own surface (the
+// reference), and against itself from frame to frame. `frame::judge` holds a surface's
+// coverage and outline; a soft thing has neither, so these are its own.
+//
+// Both are laid over a plain grey (0.18, linear, through the screen's tone curve) as the frame
+// lays a soft layer over the screen (as paint: `frame::soft::as_paint`), so a difference is in
+// the screen's 255ths and the same for every medium wherever it is:
+//
+// - against the reference, over the pixels either shows (over grey by more than half a 255th),
+//   their mean and worst difference, the share over 2 and over 8; the same over the pixels
+//   within 2 px of a step in the picture's depth (`edged`: a tall thing's outline in front of
+//   a medium, where a smaller target bleeds);
+// - from frame to frame, as the eye moves: each pixel's step in brightness, the lister's and the
+//   reference's, their means and the shares over 2 and over 4: crawl is the lister's steps past
+//   the reference's own.
+//
+// The reference is heavy by design (fine steps at every pixel), so it is drawn as a render pass
+// in bands of rows, a band a frame (AGENTS.md, rule 4): a moment of the judge, its eye held,
+// takes `bands` frames, and is compared once its last band is drawn.
+//
+// And a pillar (`Pillar`), written into the picture as a lister writes a solid, to stand in
+// front of a medium.
+
+use form::kinds::Medium
+use form::look::Haze
+use form::shade::{STILL, lit}
+use form::look::Skin
+use frame::eye::{Eye, NEARER}
+use frame::last::{cover, displayed}
+use frame::light::Lighting
+use frame::picture::{Drawing, Frame, NO_EDGE, SOLID, edge_record, identity}
+use frame::soft::{SoftSeen, as_paint, far_along, soft_over}
+use lister::Mediums
+use march::{Stepping, crossing, laid, march}
+use std::derive::Box3
+use std::gpu::{
+    Atomics, Blend, ClipPosition, DepthTexture, FragCoord, GlobalId, GpuBuffer, Rg32Float,
+    Rgba16Float, Sampler, Targets3, Texture, TextureArray, VertexIndex, begin_pass,
+    begin_screen_pass, buffer_of, dispatch, draw, label, read, texture, writable_texture,
+}
+use std::io::{Pending, print}
+use form::ink::InkStyle
+
+/// How the reference is marched: a quarter of a pixel's cone a step and never under 5 mm, the
+/// density read as wide as a pixel there, to 4,096 steps and proofs.
+pub const FINE = Stepping { share: 0.25, least: 0.005, limit: 4096, limited: 1, skip: 1, stops: 0 }
+
+/// The grey both are laid over (linear).
+pub const GREY: f32 = 0.18
+
+/// How many numbers the judge counts.
+pub const COUNTED: u32 = 20
+
+/// One medium's reference at a pixel: its ray through the pixel's middle marched with `steps`
+/// from its bound to the picture's surface there, laid over what is there already (the farther
+/// mediums', by the draw's premultiplied blend).
+@fragment
+pub fn truth<M: Medium, H: Haze>(
+    pixel: FragCoord,
+    eye: Eye,
+    light: Lighting,
+    medium: M,
+    haze: H,
+    bound: Box3,
+    steps: Stepping,
+    depth: DepthTexture,
+    live: [vec4],
+) -> vec4 {
+    let medium = medium.lived(live[0])
+    let px = pixel.position.xy
+    let d = eye.ray(px)
+    let span = crossing(bound, eye.at, d)
+    let to = min(span.y, far_along(eye, px, depth.load(u32(px.x), u32(px.y))))
+    if span.x >= to {
+        return vec4(0.0)
+    }
+    let cone = eye.pixel()
+    let m = march(medium, haze, eye.at, d, span.x, to, cone, steps)
+    let (c, _r) = laid(medium, m, light, eye.at, d, cone)
+    c
+}
+
+/// What the lister's soft target lays over a pixel, at full size, as the last pass reads it.
+@fragment
+pub fn mine(
+    pixel: FragCoord,
+    eye: Eye,
+    soft: SoftSeen,
+    colour: TextureArray<Rgba16Float>,
+    ramp: TextureArray<Rgba16Float>,
+    s: Sampler,
+    depth: DepthTexture,
+) -> vec4 {
+    let px = pixel.position.xy
+    soft_over(soft, colour, ramp, s, px, far_along(eye, px, depth.load(u32(px.x), u32(px.y))))
+}
+
+/// A premultiplied colour laid over the grey as the frame lays a soft layer over the screen (as
+/// paint, `frame::soft::as_paint`), as the screen shows it (0 to 1).
+fn over_grey(style: InkStyle, c: vec4) -> vec3 {
+    as_paint(style, c, 1.0).xyz + displayed(style, vec3(GREY)) * (1.0 - c.w)
+}
+
+/// The brightness of a colour on the screen.
+fn luma(c: vec3) -> f32 {
+    dot(saturate(c), vec3(0.2126, 0.7152, 0.0722))
+}
+
+/// Whether the picture's depth steps within 2 px of (x, y): what is met there and what is met
+/// beside it more than a quarter apart in distance, or one met and the other not.
+fn edged(depth: DepthTexture, x: i32, y: i32) -> bool {
+    let w = i32(depth.width())
+    let h = i32(depth.height())
+    let z = depth.load(u32(x), u32(y))
+    for k in 0..8 {
+        let r = 1 + (k >> 2)
+        let dx = if (k & 3) == 0 { r } else if (k & 3) == 1 { -r } else { 0 }
+        let dy = if (k & 3) == 2 { r } else if (k & 3) == 3 { -r } else { 0 }
+        let n = depth.load(u32(clamp(x + dx, 0, w - 1)), u32(clamp(y + dy, 0, h - 1)))
+        if (n > 0.0) != (z > 0.0) {
+            return true
+        }
+        if z > 0.0 && max(n, z) > 1.25 * min(n, z) {
+            return true
+        }
+    }
+    false
+}
+
+/// One of the judge's pictures, to look at: `which` 1 the lister's over grey, 2 the
+/// reference's, 3 their difference eight times (white is 32/255 or more).
+@fragment
+pub fn viewed(
+    pixel: FragCoord,
+    style: InkStyle,
+    mine: Texture<Rgba16Float>,
+    truth: Texture<Rgba16Float>,
+    which: u32,
+) -> vec4 {
+    let x = u32(pixel.position.x)
+    let y = u32(pixel.position.y)
+    let a = over_grey(style, mine.load(x, y))
+    let b = over_grey(style, truth.load(x, y))
+    if which == 1 {
+        return vec4(a, 1.0)
+    }
+    if which == 2 {
+        return vec4(b, 1.0)
+    }
+    vec4(saturate(abs(a - b) * 8.0), 1.0)
+}
+
+/// The counts, a pixel an invocation (in 100ths of a 255th where a difference is summed):
+///
+///   0 pixels either shows      1 their difference summed     2 the worst     3 over 2   4 over 8
+///   5..9 the same, of those within 2 px of a step in depth
+///   10 pixels judged for steps (shown this frame or the last)
+///   11 the lister's steps summed   12 the reference's   13 the lister's over 2   14 the
+///   reference's over 2   15 the lister's over 4   16 the reference's over 4   17 the lister's
+///   worst   18 the reference's worst   19 frames judged (by the first invocation)
+@compute(8, 8)
+pub fn counted(
+    style: InkStyle,
+    mine: Texture<Rgba16Float>,
+    truth: Texture<Rgba16Float>,
+    depth: DepthTexture,
+    last: Texture<Rg32Float>,
+    moving: u32,
+    out: mut Atomics<u32>,
+    now: mut std::gpu::Texels<Rg32Float>,
+    id: GlobalId,
+) {
+    if id.x >= mine.width() || id.y >= mine.height() {
+        return
+    }
+    if id.x == 0 && id.y == 0 {
+        let _ = out.add(i: 19, value: 1)
+    }
+    let grey = displayed(style, vec3(GREY))
+    let a = over_grey(style, mine.load(id.x, id.y))
+    let b = over_grey(style, truth.load(id.x, id.y))
+    let la = luma(a)
+    let lb = luma(b)
+    now.store(id, vec2(la, lb))
+    let shows = max(length(a - grey), length(b - grey)) * 255.0 > 0.5
+    let was = last.load(id.x, id.y)
+    let lg = luma(grey)
+    let showed = moving != 0 && max(abs(was.x - lg), abs(was.y - lg)) * 255.0 > 0.5
+    if shows {
+        let dc = abs(a - b) * 255.0
+        let most = max(dc.x, max(dc.y, dc.z))
+        let v = u32(most * 100.0 + 0.5)
+        let edge = edged(depth, i32(id.x), i32(id.y))
+        for k in 0..2 {
+            if k == 0 || edge {
+                let at = k * 5
+                let _ = out.add(i: at, value: 1)
+                let _ = out.add(i: at + 1, value: v)
+                let _ = out.max(i: at + 2, value: v)
+                if most > 2.0 {
+                    let _ = out.add(i: at + 3, value: 1)
+                }
+                if most > 8.0 {
+                    let _ = out.add(i: at + 4, value: 1)
+                }
+            }
+        }
+    }
+    if moving != 0 && (shows || showed) {
+        let sa = abs(la - was.x) * 255.0
+        let sb = abs(lb - was.y) * 255.0
+        let _ = out.add(i: 10, value: 1)
+        let _ = out.add(i: 11, value: u32(sa * 100.0 + 0.5))
+        let _ = out.add(i: 12, value: u32(sb * 100.0 + 0.5))
+        if sa > 2.0 {
+            let _ = out.add(i: 13, value: 1)
+        }
+        if sb > 2.0 {
+            let _ = out.add(i: 14, value: 1)
+        }
+        if sa > 4.0 {
+            let _ = out.add(i: 15, value: 1)
+        }
+        if sb > 4.0 {
+            let _ = out.add(i: 16, value: 1)
+        }
+        let _ = out.max(i: 17, value: u32(sa * 100.0 + 0.5))
+        let _ = out.max(i: 18, value: u32(sb * 100.0 + 0.5))
+    }
+}
+
+/// A judge of `frames` moments, each `bands` frames (a band of the reference's rows a frame):
+/// the reference and the lister's lay-over at full size, the last moment's brightness of each
+/// (by turns), and the counts.
+pub struct Judging {
+    pub frames: u32,
+    pub bands: u32,
+    drawn: u32,
+    pub truth: Texture<Rgba16Float>,
+    pub mine: Texture<Rgba16Float>,
+    even: Texture<Rg32Float>,
+    odd: Texture<Rg32Float>,
+    counts: GpuBuffer<u32>,
+    heard: Option<Pending<u32>>,
+    judged: u32,
+    fresh: bool,
+}
+
+/// A judge of `frames` moments, each drawn over `bands` frames.
+pub fn judging(frames: u32, bands: u32) -> Judging {
+    Judging {
+        frames,
+        bands: max(bands, 1),
+        drawn: 0,
+        truth: texture(width: 1, height: 1),
+        mine: texture(width: 1, height: 1),
+        even: writable_texture(width: 1, height: 1),
+        odd: writable_texture(width: 1, height: 1),
+        counts: buffer_of(Vec::filled(COUNTED, 0)),
+        heard: None,
+        judged: 0,
+        fresh: true,
+    }
+}
+
+/// `n` hundredths of a 255th over `of`, as 255ths.
+fn per(n: u32, of: u32) -> f32 {
+    f32(n) / 100.0 / max(f32(of), 1.0)
+}
+
+/// What `n` is of `of`, in parts of a hundred.
+fn share(n: u32, of: u32) -> f32 {
+    100.0 * f32(n) / max(f32(of), 1.0)
+}
+
+/// The counts, said.
+fn said(v: Vec<u32>) {
+    print(
+        f"mediums: judged {v[19]} moments: against the reference, over {v[0]} pixels shown: {per(v[1], v[0])} of 255 on average, {f32(v[2]) / 100.0} at worst; over 2: {share(v[3], v[0])}%, over 8: {share(v[4], v[0])}%",
+    )
+    print(
+        f"mediums: within 2 px of a step in depth, over {v[5]} pixels: {per(v[6], v[5])} of 255 on average, {f32(v[7]) / 100.0} at worst; over 2: {share(v[8], v[5])}%, over 8: {share(v[9], v[5])}%",
+    )
+    print(
+        f"mediums: steps from frame to frame over {v[10]} pixels: the lister's {per(v[11], v[10])} of 255 on average, {f32(v[17]) / 100.0} at worst, over 2 at {share(v[13], v[10])}%, over 4 at {share(v[15], v[10])}%; the reference's {per(v[12], v[10])}, {f32(v[18]) / 100.0}, {share(v[14], v[10])}%, {share(v[16], v[10])}%",
+    )
+}
+
+impl Judging {
+    /// Its textures the size of `eye`'s screen.
+    fn sized(mut self, eye: Eye) {
+        let w = u32(eye.size.x)
+        let h = u32(eye.size.y)
+        if self.truth.width() == w && self.truth.height() == h {
+            return
+        }
+        self.truth = texture(width: w, height: h)
+        self.mine = texture(width: w, height: h)
+        self.even = writable_texture(width: w, height: h)
+        self.odd = writable_texture(width: w, height: h)
+    }
+
+    /// The moment this frame is of: its eye is to be held for `bands` frames.
+    pub fn moment(self) -> u32 {
+        self.drawn / self.bands
+    }
+
+    /// Whether every moment is judged.
+    pub fn done(self) -> bool {
+        self.judged >= self.frames
+    }
+
+    /// The rows of this frame's band (first, count) of a screen `h` rows high.
+    fn rows(self, h: u32) -> (u32, u32) {
+        let band = self.drawn % self.bands
+        let from = band * h / self.bands
+        let to = (band + 1) * h / self.bands
+        (from, to - from)
+    }
+
+    /// A medium's reference drawn over this frame's band of rows of the picture, over those
+    /// drawn before it this frame (draw the farthest first; the first replaces what the band
+    /// held), marched as `steps` says.
+    pub fn refer<M: Medium, H: Haze>(mut self, frame: Frame, m: Mediums<M, H>, steps: Stepping) {
+        if self.done() {
+            return
+        }
+        self.sized(frame.eye)
+        let (from, count) = self.rows(u32(frame.eye.size.y))
+        label("reference")
+        let p = begin_pass(mut self.truth, clear: vec4(0.0), keep: true)
+        p.scissor(0, from, u32(frame.eye.size.x), count)
+        let shader = truth.bind(
+            eye: frame.eye,
+            light: frame.light,
+            medium: m.form,
+            haze: m.haze,
+            bound: m.form.bound(),
+            steps: steps,
+            depth: frame.depth,
+            live: m.live.items(),
+        )
+        if self.fresh {
+            draw(p, cover, shader, vertices: 3)
+        } else {
+            draw(p, cover, shader, vertices: 3, blend: Blend::Premultiplied)
+        }
+        self.fresh = false
+        p.end()
+    }
+
+    /// After every medium's reference this frame: at a moment's last band, the lister's lay-over
+    /// at full size and the counts added; said after the last moment.
+    pub fn judge(mut self, frame: Frame) {
+        if self.done() {
+            self.said()
+            return
+        }
+        self.fresh = true
+        let last_band = self.drawn % self.bands == self.bands - 1
+        self.drawn += 1
+        if !last_band {
+            return
+        }
+        label("judged")
+        let p = begin_pass(mut self.mine, clear: vec4(0.0))
+        draw(
+            p,
+            cover,
+            mine.bind(
+                eye: frame.eye,
+                soft: frame.soft.seen(),
+                colour: frame.soft.colour,
+                ramp: frame.soft.ramp,
+                s: frame.soft.s,
+                depth: frame.depth,
+            ),
+            vertices: 3,
+        )
+        p.end()
+        let w = u32(frame.eye.size.x)
+        let h = u32(frame.eye.size.y)
+        let moving: u32 = if self.judged > 0 { 1 } else { 0 }
+        if self.judged % 2 == 0 {
+            dispatch(
+                counted.bind(
+                    style: frame.ink,
+                    mine: self.mine,
+                    truth: self.truth,
+                    depth: frame.depth,
+                    last: self.odd,
+                    moving: moving,
+                    out: mut self.counts,
+                    now: mut self.even,
+                ),
+                groups: ((w + 7) / 8, (h + 7) / 8, 1),
+            )
+        } else {
+            dispatch(
+                counted.bind(
+                    style: frame.ink,
+                    mine: self.mine,
+                    truth: self.truth,
+                    depth: frame.depth,
+                    last: self.even,
+                    moving: moving,
+                    out: mut self.counts,
+                    now: mut self.odd,
+                ),
+                groups: ((w + 7) / 8, (h + 7) / 8, 1),
+            )
+        }
+        self.judged += 1
+        if self.judged == self.frames {
+            self.heard = Some(read(self.counts.items()))
+        }
+    }
+
+    /// One of its pictures shown in place of the frame's (`viewed`'s `which`).
+    pub fn show(self, frame: Frame, which: u32) {
+        label("shown")
+        let screen = begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
+        draw(
+            screen,
+            cover,
+            viewed.bind(style: frame.ink, mine: self.mine, truth: self.truth, which: which),
+            vertices: 3,
+        )
+        screen.present()
+    }
+
+    /// The counts said, once read back.
+    pub fn said(mut self) {
+        match mut self.heard {
+            Some(p) => match p.poll() {
+                Some(Ok(v)) => {
+                    said(take v)
+                    self.heard = None
+                },
+                _ => {},
+            },
+            None => {},
+        }
+    }
+}
+
+// ---- a pillar ---------------------------------------------------------------------------------
+
+/// A pillar: an upright cylinder standing on `foot` (its axis's lowest point), `radius` m round
+/// and `tall` m high, written into the picture as a solid (body `body`), drawn as 64 faces round
+/// (its chords within a millimetre of it at 0.3 m) and lit as stone.
+pub struct Pillar: Copy + GpuData {
+    pub foot: vec3,
+    pub radius: f32,
+    pub tall: f32,
+    pub body: u32,
+}
+
+/// How many faces round a pillar is drawn.
+const ROUND: u32 = 64
+
+/// What a pillar's corner passes on: where it is, and its normal.
+pub struct Side: Copy {
+    pub clip: ClipPosition,
+    pub world: vec3,
+    pub normal: vec3,
+}
+
+/// Corner `v` of a pillar's sides and top: six a face round, then six a slice of its top.
+@vertex
+pub fn pillar_corner(v: VertexIndex, eye: Eye, pillar: Pillar) -> Side {
+    let face = v.index / 6
+    let k = v.index % 6
+    let top = face >= ROUND
+    let f = if top { face - ROUND } else { face }
+    let step = 6.2831853 / f32(ROUND)
+    // Two triangles a face: (0, 1, 2) and (2, 1, 3) of its four corners.
+    let c = if k == 0 { 0 } else if k == 1 || k == 4 { 1 } else if k == 2 || k == 3 { 2 } else { 3 }
+    let a = f32(f + (c & 1)) * step
+    let round = vec3(cos(a), 0.0, sin(a))
+    var p = pillar.foot + round * pillar.radius + vec3(0.0, if (c & 2) != 0 { pillar.tall } else {
+        0.0
+    }, 0.0)
+    var n = round
+    if top {
+        p = pillar.foot + vec3(0.0, pillar.tall, 0.0) + (if (c & 2) != 0 { vec3(0.0) } else {
+            round * pillar.radius
+        })
+        n = vec3(0.0, 1.0, 0.0)
+    }
+    Side { clip: ClipPosition { position: eye.clip(p) }, world: p, normal: n }
+}
+
+/// A pillar's pixel: stone, lit by the frame's light, a solid's identity, no edge record of its
+/// own (the change of identity draws its outline).
+@fragment
+pub fn pillar_pixel(f: Side, eye: Eye, light: Lighting, body: u32) -> Targets3<vec4, vec4, u32> {
+    let n = normalize(f.normal)
+    let toward = normalize(eye.at - f.world)
+    let skin = Skin { albedo: vec3(0.32, 0.27, 0.23), line: 1.0, metal: 0.0 }
+    let c = lit(
+        light.style,
+        skin,
+        n,
+        light.sun,
+        toward,
+        reach: 1.0,
+        sky: 1.0,
+        height: 1.0,
+        steps: STILL,
+        around: light.lights.from(f.world),
+    )
+    Targets3 {
+        first: vec4(c, 0.0),
+        second: edge_record(NO_EDGE, weight: 0.0, line: 1.0),
+        third: identity(SOLID, body, 0),
+    }
+}
+
+impl Pillar {
+    /// Drawn into the picture's one pass (`Frame::draw`), meeting what else is there by depth.
+    pub fn draw_into(self, d: Drawing) {
+        draw(
+            d.pass,
+            pillar_corner.bind(eye: d.eye, pillar: self),
+            pillar_pixel.bind(eye: d.eye, light: d.light, body: self.body),
+            vertices: ROUND * 12,
+            depth: NEARER,
+        )
+    }
+}

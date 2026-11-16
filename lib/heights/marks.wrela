@@ -1,0 +1,238 @@
+// Marks (docs/design.md, "Forms": state written at run time onto a form's own domain, which
+// looks read): what a scene writes onto a height chart's places as it plays (a boat's wake on
+// the sea, a foot's print in the sand), kept from frame to frame, read by the chart's look.
+//
+// A window of texels over the chart's places (x, z), `side` m across, that follows a point the
+// scene names each frame (snapped to whole texels, so what is written stays where it was
+// written); each texel four numbers the look gives meaning to. Each frame, on the GPU, every
+// texel takes what was at its place the frame before, carried `drift` m/s (the wind's carrying
+// a foam down it; nothing for a print) and kept `kept` of a second (a foam fading, a print
+// smoothing), and the strokes the scene pressed this frame (`press`: a capsule from a place to a
+// place, `wide` m round, the most of its amount and what was there). Outside the window a look
+// reads nothing. A lister binds the window (`Marks::seen`) and fills `Wet::marks` at each pixel
+// (`marked`), through the pixel's footprint.
+//
+// A mark's last two numbers may hold the water down: a body afloat presses the water it displaces
+// under it, so the sea never stands through its sides. `z` is how much of the water at a place
+// is held (0 to 1) and `w` the level it is held to, as `z · (level + HELD_FROM)` (so a level kept
+// and fading keeps its height: `w / z`); `held` presses that, and a sea lister's vertices lower
+// the water there to it (`held_down`). The first two are the look's.
+//
+// What is not done here: a wake's ridges (the water thrown up beside a hull); marks that spread
+// (diffusion) or flow.
+
+use std::collections::Vec
+use std::gpu::{
+    Address, Filter, GlobalId, GpuBuffer, Rgba16Float, Sampler, Texels, Texture, buffer, dispatch,
+    label, sampler, writable_texture, write,
+}
+
+/// A stroke pressed into the marks: a capsule from `from` to `to` (the chart's places, m), `wide`
+/// m round, its amount.
+pub struct Stroke: Copy + GpuData {
+    pub amount: vec4,
+    pub spare: vec3,
+    pub wide: f32,
+    pub from: vec2,
+    pub to: vec2,
+}
+
+/// The most strokes a frame presses.
+pub const MOST_STROKES: u32 = 16
+
+/// The marks: their window's size (texels, m), how they fade and drift, the two textures they
+/// step between, the window's corner now and the frame before, this frame's strokes.
+pub struct Marks {
+    texels: u32,
+    pub side: f32,
+    /// What of a mark is left after a second (0 to 1), and how fast the marks are carried (m/s).
+    pub kept: f32,
+    pub drift: vec2,
+    a: Texture<Rgba16Float>,
+    b: Texture<Rgba16Float>,
+    flip: bool,
+    corner: vec2,
+    on: bool,
+    strokes: Vec<Stroke>,
+    pressed: GpuBuffer<Stroke>,
+    s: Sampler,
+}
+
+/// No marks: a window of one texel, never stepped, which a look reads as nothing.
+pub fn no_marks() -> Marks {
+    marks(texels: 1, side: 1.0, kept: 0.0, drift: vec2(0.0))
+}
+
+/// Marks over a window `texels` texels and `side` m across, `kept` of each left after a second,
+/// carried `drift` m/s.
+pub fn marks(texels: u32, side: f32, kept: f32, drift: vec2) -> Marks {
+    Marks {
+        texels,
+        side,
+        kept,
+        drift,
+        a: writable_texture::<Rgba16Float>(width: texels, height: texels),
+        b: writable_texture::<Rgba16Float>(width: texels, height: texels),
+        flip: false,
+        corner: vec2(0.0),
+        on: false,
+        strokes: Vec::new(),
+        pressed: buffer(MOST_STROKES),
+        s: sampler(address: Address::Clamp, filter: Filter::Linear),
+    }
+}
+
+/// What a lister reads the marks by: the texture they're in now, how it's read, and the window
+/// (its corner, its side; `w` 1 where there are marks at all).
+pub borrow struct MarksSeen {
+    pub now: borrow Texture<Rgba16Float>,
+    pub s: borrow Sampler,
+    pub window: vec4,
+}
+
+/// The marks at `p` (the chart's places), as a footprint `fu`, `fv` (m) sees them: nothing
+/// outside the window, or where there are no marks.
+pub fn marked(m: MarksSeen, p: vec2, fu: vec2, fv: vec2) -> vec4 {
+    let uv = (p - m.window.xy) / m.window.z
+    if m.window.w < 0.5 || uv.x <= 0.0 || uv.y <= 0.0 || uv.x >= 1.0 || uv.y >= 1.0 {
+        return vec4(0.0)
+    }
+    // (Faded to nothing over the window's outer tenth, so its edge is no line.)
+    let edge = min(min(uv.x, uv.y), min(1.0 - uv.x, 1.0 - uv.y))
+    m.now.sample_grad(m.s, uv, fu / m.window.z, fv / m.window.z) * smoothstep(0.0, 0.1, edge)
+}
+
+/// Texel `id` of the marks now: what was at its place the frame before (`before`, its window's
+/// corner `was`), carried and kept, and the strokes pressed over it.
+@compute(8, 8)
+fn stepped(
+    before: Texture<Rgba16Float>,
+    s: Sampler,
+    was: vec2,
+    corner: vec2,
+    side: f32,
+    texels: u32,
+    carried: vec2,
+    kept: f32,
+    strokes: [Stroke],
+    count: u32,
+    out: mut Texels<Rgba16Float>,
+    id: GlobalId,
+) {
+    if id.x >= texels || id.y >= texels {
+        return
+    }
+    let p = corner + (vec2(f32(id.x), f32(id.y)) + vec2(0.5)) * (side / f32(texels))
+    let uv = (p - carried - was) / side
+    var m = vec4(0.0)
+    if uv.x > 0.0 && uv.y > 0.0 && uv.x < 1.0 && uv.y < 1.0 {
+        m = before.sample_level(s, uv, 0.0) * kept
+    }
+    for i in 0..MOST_STROKES {
+        if i < count {
+            let k = strokes[i]
+            let ab = k.to - k.from
+            let f = clamp(dot(p - k.from, ab) / max(dot(ab, ab), 1.0e-6), 0.0, 1.0)
+            let d = length(p - k.from - ab * f)
+            m = max(m, k.amount * smoothstep(k.wide, k.wide * 0.5, d))
+        }
+    }
+    out.store(id, m)
+}
+
+/// How far under the sea's level a level held down may be (m): `w` holds the level over this.
+pub const HELD_FROM: f32 = 20.0
+
+/// The marks' amount for water held down to `level` (m), all of it.
+pub fn held(level: f32) -> vec4 {
+    vec4(0.0, 0.0, 1.0, max(level + HELD_FROM, 0.0))
+}
+
+/// The height `y` (m) of the water resting at `p` (the chart's places), held down by the marks
+/// `m` (read at their finest: a vertex has no footprint).
+pub fn held_down(m: MarksSeen, p: vec2, y: f32) -> f32 {
+    let uv = (p - m.window.xy) / m.window.z
+    if m.window.w < 0.5 || uv.x <= 0.0 || uv.y <= 0.0 || uv.x >= 1.0 || uv.y >= 1.0 {
+        return y
+    }
+    let k = m.now.sample_level(m.s, uv, 0.0)
+    if k.z <= 1.0e-3 {
+        return y
+    }
+    let level = k.w / k.z - HELD_FROM
+    mix(y, min(y, level), saturate(k.z))
+}
+
+impl Marks {
+    /// A stroke pressed this frame: from `from` to `to` (m), `wide` m round, `amount`.
+    pub fn press(mut self, from: vec2, to: vec2, wide: f32, amount: vec4) {
+        if self.strokes.len() < MOST_STROKES {
+            self.strokes.push(Stroke { from, to, amount, wide, spare: vec3(0.0) })
+        }
+    }
+
+    /// The marks stepped `dt` s on, their window round `centre` (m), with this frame's strokes.
+    pub fn step(mut self, centre: vec2, dt: f32) {
+        label("marks")
+        let texel = self.side / f32(self.texels)
+        let was = self.corner
+        let corner = floor((centre - vec2(0.5 * self.side)) / texel) * texel
+        let n = self.strokes.len()
+        var all = self.strokes.clone()
+        while all.len() < MOST_STROKES {
+            all.push(Stroke { from: vec2(0.0), to: vec2(0.0), amount: vec4(0.0), wide: 0.0, spare: vec3(0.0) })
+        }
+        write(mut self.pressed, 0, all)
+        let groups = (self.texels + 7) / 8
+        let kept = pow(max(self.kept, 1.0e-6), dt)
+        let carried = self.drift * dt
+        if self.flip {
+            dispatch(
+                stepped.bind(
+                    before: self.b,
+                    s: self.s,
+                    was: if self.on { was } else { vec2(-1.0e9) },
+                    corner: corner,
+                    side: self.side,
+                    texels: self.texels,
+                    carried: carried,
+                    kept: kept,
+                    strokes: self.pressed.items(),
+                    count: n,
+                    out: mut self.a,
+                ),
+                groups: (groups, groups, 1),
+            )
+        } else {
+            dispatch(
+                stepped.bind(
+                    before: self.a,
+                    s: self.s,
+                    was: if self.on { was } else { vec2(-1.0e9) },
+                    corner: corner,
+                    side: self.side,
+                    texels: self.texels,
+                    carried: carried,
+                    kept: kept,
+                    strokes: self.pressed.items(),
+                    count: n,
+                    out: mut self.b,
+                ),
+                groups: (groups, groups, 1),
+            )
+        }
+        self.flip = !self.flip
+        self.corner = corner
+        self.on = true
+        self.strokes.clear()
+    }
+
+    /// What a lister reads them by.
+    pub fn seen(self) -> MarksSeen {
+        let window = vec4(self.corner, self.side, if self.on { 1.0 } else { 0.0 })
+        if self.flip {
+            return MarksSeen { now: self.b, s: self.s, window }
+        }
+        MarksSeen { now: self.a, s: self.s, window }
+    }
+}

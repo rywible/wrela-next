@@ -1,0 +1,279 @@
+// The sea's waves as a spectrum: many thousand waves at once, each its own length, heading and
+// speed, their heights drawn from what the wind and a far storm's swell give a sea. Four bands of
+// wavelength, each one tile of the GPU's sum (`tiles`): the swell and the long waves (`big`), the
+// waves a boat rides (`mid`), the short waves (`fine`) and the ripples on them (`ripple`).
+//
+// The spectrum is JONSWAP's (Hasselmann et al. 1973): the wind's sea from the wind's speed and
+// its fetch, the swell from its height and period (scaled as Goda's normalization has it), each
+// spread round its heading as cos²ˢ (Longuet-Higgins et al. 1963), the wind's narrowest at its
+// peak (Mitsuyasu et al. 1975). The heights, the leaning crests (choppy displacement), the slopes
+// and the Jacobian a crest breaks where it folds follow J. Tessendorf, "Simulating Ocean Water"
+// (SIGGRAPH course notes, 2001). Whitecaps by Monahan and O'Muircheartaigh (1980), the slopes'
+// variance by Cox and Munk (1954).
+//
+// Carried from rywible/wrela at 7ae6711e, engine/ocean.wrela:32-286 and 549-566, as it was.
+
+use std::field::hash_u32
+use std::math::{PI, TAU}
+
+/// A tile's side in texels, each way.
+pub const SIDE: u32 = 256
+
+/// Gravity (m/s²).
+pub const G: f32 = 9.81
+
+/// How far a wind's crests lean down it, per metre they stand over the level (times the
+/// sea's chop).
+const LEAN: f32 = 0.65
+
+/// How long a broken crest's foam takes to fade to a third (s), in a sea with no whitecaps to
+/// speak of; a rougher sea's lasts longer (`foam_fade`).
+const FOAM_FADE: f32 = 12.0
+
+/// What sea it is: the wind that raises it and the swell come from far off.
+pub struct SeaState: Copy + GpuData {
+    /// The way the wind blows (x, z: a unit vector), its speed 10 m up (m/s), and how much open
+    /// water it has blown over (m). A sea is fully grown by about 2.2 × 10⁴ U²/g of fetch, and
+    /// JONSWAP's fits hold short of it.
+    pub wind: vec2,
+    pub speed: f32,
+    pub fetch: f32,
+    /// The way the swell runs (a unit vector), its significant height (m: the mean of its highest
+    /// third) and its peak period (s). No swell at height 0.
+    pub swell: vec2,
+    pub swell_height: f32,
+    pub swell_period: f32,
+    /// How far the crests lean and sharpen toward each other: 0 round, 1 about where the steepest
+    /// fold.
+    pub chop: f32,
+    pub seed: u32,
+}
+
+/// One band of the waves: its tile's side (m), and the wavenumbers it holds (rad/m), from `lo` to
+/// below `hi`.
+pub struct Band: Copy + GpuData {
+    pub side: f32,
+    pub lo: f32,
+    pub hi: f32,
+    pub seed: u32,
+}
+
+/// The tiles' sides (m): the longest swell's, the waves a boat rides, the short waves, the
+/// ripples (down to 3.4 cm). None a multiple of another, so their repeats never line up.
+pub const SIDES = vec4(997.0, 131.0, 19.7, 4.3)
+
+/// How many bands.
+pub const TILES: u32 = 4
+
+/// Band `i`: from where the band before leaves off up to six of the next tile's longest waves
+/// (shorter than those, the next holds them: its own longest span too few texels of the one
+/// before's), the last up to the shortest its texels hold.
+pub fn band(i: u32) -> Band {
+    let lo = if i == 0 { 0.0 } else { 6.0 * TAU / SIDES[i] }
+    let hi = if i == TILES - 1 { PI * f32(SIDE) / SIDES[i] } else { 6.0 * TAU / SIDES[i + 1] }
+    Band { side: SIDES[i], lo, hi, seed: (i + 1).wrapping_mul(0x9e3779b9) }
+}
+
+// ---- the spectrum -------------------------------------------------------------------------------
+
+/// JONSWAP's density at angular frequency `w` (rad/s), in m²s: `alpha` its scale, `peak` its
+/// peak's frequency, `gamma` how far its peak is raised over Pierson and Moskowitz's.
+fn jonswap(w: f32, alpha: f32, peak: f32, gamma: f32) -> f32 {
+    let sigma = if w <= peak { 0.07 } else { 0.09 }
+    let r = exp(-(w - peak) * (w - peak) / (2.0 * sigma * sigma * peak * peak))
+    let q = peak / w
+    let q2 = q * q
+    alpha * G * G / pow(w, 5.0) * exp(-1.25 * q2 * q2) * pow(gamma, r)
+}
+
+/// The share of a sea's waves heading `a` (rad) off its own heading: cos²ˢ(a/2), its integral
+/// round the circle 1 (Γ(s+1) / (2√π Γ(s+½)), its Gammas' ratio taken as √(s+¼)).
+fn spread(a: f32, s: f32) -> f32 {
+    0.2821 * sqrt(s + 0.25) * pow(abs(cos(a * 0.5)), 2.0 * s)
+}
+
+/// The wind's sea's peak frequency (rad/s), from its fetch (JONSWAP's fit).
+fn wind_peak(sea: SeaState) -> f32 {
+    22.0 * pow(G * G / (sea.speed * sea.fetch), 1.0 / 3.0)
+}
+
+/// The wind's sea's significant height (m), from its fetch: H = 0.0016 √(gF/U²) U²/g
+/// (JONSWAP's fit).
+pub fn wind_height(sea: SeaState) -> f32 {
+    0.0016 * sqrt(G * sea.fetch / (sea.speed * sea.speed)) * sea.speed * sea.speed / G
+}
+
+/// JONSWAP's scale (α) for a sea of significant height `h` (m) peaking at `peak` (rad/s): its
+/// variance m₀ = h²/16 is Pierson and Moskowitz's αg²/5ω⁴ raised by its peak, 1/(1 - 0.287 ln
+/// γ) (Goda's normalization). (JONSWAP's own fit for α with its peak's gives a sea about 1.4 times
+/// as high as its fit for the height: the height is the one kept.)
+fn alpha_for(h: f32, peak: f32) -> f32 {
+    5.0 * pow(peak, 4.0) * h * h / 16.0 * (1.0 - 0.287 * log(3.3)) / (G * G)
+}
+
+/// The wind's sea's JONSWAP scale (α).
+fn wind_alpha(sea: SeaState) -> f32 {
+    alpha_for(wind_height(sea), wind_peak(sea))
+}
+
+/// The wind's sea's scale over its short waves, past twice its peak: JONSWAP's fit for α, from
+/// its fetch (0.076 (gF/U²)^-0.22), which was fitted to them. The short waves' level is what
+/// the eye reads as how rough the sea is, and it's the fit's, not the height's.
+pub fn tail_alpha(sea: SeaState) -> f32 {
+    0.076 * pow(G * sea.fetch / (sea.speed * sea.speed), -0.22)
+}
+
+/// How far the sea's crests are carried down its wind (m along x and z) per metre they stand
+/// over the level (`LEAN` times its chop).
+pub fn leaning(sea: SeaState) -> vec2 {
+    sea.wind * (LEAN * sea.chop)
+}
+
+/// How high water `h` m over the level stands, for its crest's lean: `h` over it, none under,
+/// rounded through the level over `KNEE` m so the lean (and the stretches it brings) has no
+/// crease along the level's line.
+pub fn standing(h: f32) -> f32 {
+    0.5 * (h + sqrt(h * h + KNEE * KNEE))
+}
+
+/// How fast `standing` rises with `h` (0 well under the level, 1 well over it).
+pub fn standing_slope(h: f32) -> f32 {
+    0.5 * (1.0 + h / sqrt(h * h + KNEE * KNEE))
+}
+
+/// How far through the level a crest's lean is rounded (m).
+const KNEE: f32 = 0.3
+
+/// The share of the sea's face white with breaking crests and their foam, from its wind (Monahan
+/// and O'Muircheartaigh 1980: W = 3.84 × 10⁻⁶ U¹⁰^3.41): a few thousandths in a moderate
+/// breeze, near a tenth in a gale, a quarter in a storm.
+pub fn whitecaps(sea: SeaState) -> f32 {
+    min(3.84e-6 * pow(sea.speed, 3.41), 0.3)
+}
+
+/// How many of its Jacobian's deviations under 1 the crests of the waves a boat rides break
+/// at: as many as leave half the whitecaps' share (`whitecaps`) breaking afresh (the rest is
+/// the foam they leave, fading), the Jacobian taken as normal (its tail's share past d
+/// deviations, ½ erfc(d/√2), inverted by Abramowitz and Stegun's 26.2.23).
+pub fn breaking(sea: SeaState) -> f32 {
+    let p = clamp(whitecaps(sea) / 2.0, 1.0e-5, 0.4)
+    let t = sqrt(-2.0 * log(p))
+    t -
+        (2.515517 + 0.802853 * t + 0.010328 * t * t) /
+            (1.0 + 1.432788 * t + 0.189269 * t * t + 0.001308 * t * t * t)
+}
+
+/// The mean square slope of the sea's face, both slopes summed, from its wind (Cox and Munk 1954,
+/// clean water: 0.003 + 5.12 × 10⁻³ U): what the sun's glitter spreads by, the capillaries
+/// shorter than a tile holds included.
+pub fn capillary(sea: SeaState) -> f32 {
+    0.003 + 5.12e-3 * sea.speed
+}
+
+/// The slope variance the four bands hold, summed.
+pub fn held_slopes(sea: SeaState) -> f32 {
+    var sum = 0.0
+    for i in 0..TILES {
+        sum += slope_variance(sea, band(i))
+    }
+    sum
+}
+
+/// How long a broken crest's foam takes to fade to a third (s): longer as the sea's rougher (a
+/// gale's lies in streaks long after its crest broke).
+pub fn foam_fade(sea: SeaState) -> f32 {
+    FOAM_FADE * (1.0 + 15.0 * whitecaps(sea))
+}
+
+/// How much of a sea's foam is left after `gap` s (`foam_fade`): all of it after none.
+pub fn kept_over(sea: SeaState, gap: f32) -> f32 {
+    exp(-max(gap, 0.0) / foam_fade(sea))
+}
+
+/// The sea's directional spectrum at wavenumber `k` (rad/m, on x and z): its height's variance
+/// per (rad/m)², the wind's sea and the swell.
+pub fn density(sea: SeaState, k: vec2) -> f32 {
+    let kk = length(k)
+    if kk < 1.0e-6 {
+        return 0.0
+    }
+    // Deep water's waves: ω = √(gk). From ω to k, the density gains dω/dk over k.
+    let w = sqrt(G * kk)
+    let jacobian = G / (2.0 * w) / kk
+    let dir = k / kk
+    // The wind's sea: its peak from the fetch (JONSWAP's fits), its spread narrowest there.
+    let peak = wind_peak(sea)
+    let narrowest = 11.5 * pow(sea.speed * peak / G, -2.5)
+    let s = if w <= peak {
+        narrowest * pow(w / peak, 5.0)
+    } else {
+        narrowest * pow(w / peak, -2.5)
+    }
+    let off = acos(clamp(dot(dir, sea.wind), -1.0, 1.0))
+    let alpha = wind_alpha(sea)
+    let tail = mix(1.0, tail_alpha(sea) / alpha, smoothstep(1.3 * peak, 2.6 * peak, w))
+    let wind = jonswap(w, alpha, peak, 3.3) * tail * spread(off, max(s, 0.5))
+    // The swell, narrow round its heading.
+    var swell = 0.0
+    if sea.swell_height > 0.0 {
+        let sp = TAU / sea.swell_period
+        let sa = alpha_for(sea.swell_height, sp)
+        let soff = acos(clamp(dot(dir, sea.swell), -1.0, 1.0))
+        swell = jonswap(w, sa, sp, 3.3) * spread(soff, 24.0)
+    }
+    (wind + swell) * jacobian
+}
+
+/// A hash's top 24 bits as a value in [0, 1).
+fn unit(h: u32) -> f32 {
+    f32(h >> 8) * (1.0 / 16777216.0)
+}
+
+/// A lattice point's hash, of a seed's lattice (rywible/wrela engine/noise.wrela:19).
+fn hash2u(x: i32, y: i32, seed: u32) -> u32 {
+    hash_u32(u32(x).wrapping_mul(1597334677) ^ u32(y).wrapping_mul(3812015801) ^ seed)
+}
+
+/// Two standard normal draws for lattice point `n` of seed `seed` (Box and Muller's).
+fn gauss(n: vec2i, seed: u32) -> vec2 {
+    let u = max(unit(hash2u(n.x, n.y, seed)), 1.0e-7)
+    let v = unit(hash2u(n.x, n.y, seed ^ 0x68e31da4))
+    vec2(cos(TAU * v), sin(TAU * v)) * sqrt(-2.0 * log(u))
+}
+
+/// Band `b`'s wave `n` (its lattice point: -SIDE/2 to below SIDE/2 each way) as its wavenumber
+/// (rad/m).
+pub fn wavenumber(b: Band, n: vec2i) -> vec2 {
+    vec2(f32(n.x), f32(n.y)) * (TAU / b.side)
+}
+
+/// The complex amplitude of band `b`'s wave `n` at time 0 (m): a normal draw scaled to the
+/// spectrum's variance there (its wave's crest is 2|h₀| over its mean, so its mean square is
+/// 2|h₀|², which sums to the spectrum's); none outside the band.
+pub fn amplitude(sea: SeaState, b: Band, n: vec2i) -> vec2 {
+    let k = wavenumber(b, n)
+    let kk = length(k)
+    if kk <= 0.0 || kk < b.lo || kk >= b.hi {
+        return vec2(0.0)
+    }
+    gauss(n, sea.seed ^ b.seed) * (0.5 * sqrt(density(sea, k)) * (TAU / b.side))
+}
+
+/// The mean square slope of `sea`'s waves in band `b` (each wave's k² 2|a|², summed as the
+/// spectrum's variance at k times k²): how far its Jacobian strays from 1, its deviation
+/// about the chop times the root of it (the stretches' sum is -k h).
+pub fn slope_variance(sea: SeaState, b: Band) -> f32 {
+    let dk = TAU / b.side
+    let reach = min(i32(ceil(b.hi / dk)), i32(SIDE / 2) - 1)
+    var sum = 0.0
+    for y in -reach..reach + 1 {
+        for x in -reach..reach + 1 {
+            let k = wavenumber(b, vec2i(x, y))
+            let kk = length(k)
+            if kk > 0.0 && kk >= b.lo && kk < b.hi {
+                sum += density(sea, k) * dk * dk * kk * kk
+            }
+        }
+    }
+    sum
+}

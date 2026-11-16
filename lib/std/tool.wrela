@@ -1,0 +1,485 @@
+// A tool: a program the native host's tool profile runs (`wrela tool`, language.md §15.5), for
+// the work around a game: builds, captures, releases. A tool exports `tool() -> u32`, which the
+// host calls once; its result is the tool's exit status.
+//
+// A tool waits for what it asks: each service's function makes its request at once and gives a
+// `Call`, and `wait` blocks the tool's thread until the answer comes, and reads it. Requests made
+// before a `wait` are already being carried out, so several run at once:
+//
+// ```wrela
+// use std::tool::files
+// use std::tool::time::after
+//
+// pub fn tool() -> u32 {
+//     let a = files::read("src/a.txt")
+//     let b = files::read("src/b.txt")
+//     let _ = after(0.1).wait()
+//     let Ok(first) = take a.wait() else { return 1 }
+//     let Ok(second) = take b.wait() else { return 1 }
+//     (first.len() + second.len()) % 256
+// }
+// ```
+//
+// `any` waits for the first of several requests, for a tool that answers events (a served post,
+// a timer, a rebuild) as they come. `spawn` and `all` run sequences of calls at once, as tasks on
+// the tool's helpers (§16.2): a task's waits block only its own thread.
+//
+// The services are `std::tool`'s modules: `files`, `blob`, `time`, `http`, `run`, `toolchain`
+// (builds, tests, checks, formatting and docs), `drive` (builds run on the native host), `image`
+// (decoding, resizing and encoding), `serve` (a local server) and `browser` (Chrome, driven).
+// Each is `@tool`, and only what the `wrela tool` command line grants it reaches outside the
+// tool: roots of files by name, and secrets by name. Every answer of a tool service says
+// whether it succeeded: its first byte is 0, then what it gives, or 1, then why it failed in
+// UTF-8. Each type a service gives reads the rest (`Answer`).
+
+use std::abi::{REQUEST_FAILED, SLOT_FAILED, SLOT_FREE, SLOT_QUEUED, SLOT_STARTED, SLOT_THREAD}
+use std::alloc::{free, place, reach_heap}
+use std::collections::replace
+use std::mem::{
+    abort_from, atomic_load, atomic_store, compare_swap, read, size_of, task, tool_any, tool_join,
+    tool_request, tool_take, tool_wait, write,
+}
+use std::mem::Drop
+use std::par::{queue_task, run_started}
+use std::serialize::Reader
+
+/// The arguments the tool was run with: what follows `--` on the `wrela tool` command line. The
+/// host gives them when it starts the tool, so this makes no request.
+@tool
+pub fn args() -> Vec<String> {
+    var r = Reader::new(Vec::from_kept())
+    var out: Vec<String> = Vec::new()
+    let Ok(n) = r.read_u32() else { return out }
+    for _ in 0..n {
+        let Ok(a) = r.read_string() else { return out }
+        out.push(take a)
+    }
+    out
+}
+
+/// The secret granted as `name` (`--secret NAME`: the environment variable's value when the
+/// tool started), or `None` if `name` isn't granted. The host never shows a secret.
+@tool
+pub fn secret(name: str) -> Option<String> {
+    var r = Reader::new(Vec::from_kept())
+    let Ok(n) = r.read_u32() else { return None }
+    for _ in 0..n {
+        let Ok(_) = r.read_string() else { return None }
+    }
+    let Ok(count) = r.read_u32() else { return None }
+    for _ in 0..count {
+        let Ok(key) = r.read_string() else { return None }
+        let Ok(value) = r.read_string() else { return None }
+        if key.as_str() == name {
+            return Some(value)
+        }
+    }
+    None
+}
+
+/// Why a tool's request failed, in the host's words: a path outside the roots, a file that
+/// isn't there, a budget spent. A tool's own failures can be `ToolError`s too (`new`), so its
+/// work fails with one type, and `?` passes the host's reasons and its own up alike.
+pub struct ToolError: Clone {
+    message: String,
+}
+
+impl ToolError {
+    /// A failure of the tool's own, said as `message`.
+    pub fn new(message: str) -> ToolError {
+        ToolError { message: String::from(message) }
+    }
+
+    /// What the host said.
+    pub fn message(self) -> borrow str {
+        self.message
+    }
+}
+
+/// What a tool service gives: each type a service's `Call` gives reads itself from the bytes of
+/// a successful answer (those after its first byte), or says they don't read as one.
+pub trait Answer {
+    /// The value in `bytes`, a successful answer's, or why they aren't one.
+    fn read(bytes: take Vec<u8>) -> Result<Self, ToolError>
+}
+
+/// A request a tool service is carrying out, whose answer is a `T`. The service's function made
+/// it at once; `wait` blocks this thread until it's answered. A `Call` dropped without `wait`
+/// leaves its request to finish, and its answer, and anything made for it, is released when the
+/// tool ends.
+pub struct Call<T: Answer> {
+    request: u32,
+}
+
+/// A call's request, by its number (`Call::request`): what `any` waits on.
+pub struct Request: Copy + Eq {
+    number: u32,
+}
+
+impl<T: Answer> Call<T> {
+    /// Blocks this thread until the answer comes, and reads it: what the service gives, or why
+    /// it failed. If the run stops meanwhile (its `--timeout`, Ctrl-C, a helper's trap), the
+    /// tool ends there, and the host says why.
+    @tool
+    pub fn wait(take self) -> Result<T, ToolError> {
+        let n = unsafe { tool_wait(self.request) }
+        if n == REQUEST_FAILED {
+            // Forgets the request.
+            let _gone = Vec::from_tool_answer(self.request, 0)
+            return Err(ToolError { message: String::from("the tool host has no such service") })
+        }
+        let bytes = answer(Vec::from_tool_answer(self.request, u32(n)))?
+        T::read(take bytes)
+    }
+
+    /// Its request, which `any` waits on with others. The call itself is unchanged.
+    pub fn request(self) -> Request {
+        Request { number: self.request }
+    }
+}
+
+/// Blocks this thread until one of `requests` is answered: its index in `requests`, the one
+/// answered first. Nothing is read: each `Call` still waits for its own answer, and the others'
+/// requests go on. An empty list, or a request whose `Call` has had its answer, ends the tool:
+/// it waits on nothing.
+///
+/// ```wrela
+/// use std::tool::any
+/// use std::tool::time::after
+///
+/// @tool
+/// fn sooner() -> u32 {
+///     let slow = after(60.0)
+///     let fast = after(0.01)
+///     let first = any([slow.request(), fast.request()])
+///     assert(first == 1)
+///     first
+/// }
+/// ```
+@tool
+pub fn any(requests: [Request]) -> u32 {
+    var numbers: Vec<u32> = Vec::with_capacity(max(requests.len(), 1))
+    for r in requests {
+        numbers.push(r.number)
+    }
+    unsafe { tool_any(numbers) }
+}
+
+/// What a service gives that has nothing to give: it did what it was asked.
+pub struct Done: Copy + Eq {}
+
+impl Answer for Done {
+    fn read(bytes: take Vec<u8>) -> Result<Done, ToolError> {
+        if bytes.len() != 0 {
+            return Err(malformed("nothing"))
+        }
+        Ok(Done {})
+    }
+}
+
+/// The bytes themselves: a whole file's, or a blob's chunk.
+impl Answer for Vec<u8> {
+    fn read(bytes: take Vec<u8>) -> Result<Vec<u8>, ToolError> {
+        Ok(take bytes)
+    }
+}
+
+/// A text: a `u32` byte count, then UTF-8.
+impl Answer for String {
+    fn read(bytes: take Vec<u8>) -> Result<String, ToolError> {
+        var r = Reader::new(take bytes)
+        let Ok(text) = r.read_string() else { return Err(malformed("a text")) }
+        if !r.at_end() {
+            return Err(malformed("a text"))
+        }
+        Ok(text)
+    }
+}
+
+/// Texts: a count, then each.
+impl Answer for Vec<String> {
+    fn read(bytes: take Vec<u8>) -> Result<Vec<String>, ToolError> {
+        var r = Reader::new(take bytes)
+        let Some(out) = read_strings(mut r) else { return Err(malformed("texts")) }
+        if !r.at_end() {
+            return Err(malformed("texts"))
+        }
+        Ok(out)
+    }
+}
+
+/// A text that may not be there: 0, or 1 and the text.
+impl Answer for Option<String> {
+    fn read(bytes: take Vec<u8>) -> Result<Option<String>, ToolError> {
+        var r = Reader::new(take bytes)
+        let Ok(there) = r.read_u8() else { return Err(malformed("a text or none")) }
+        var out: Option<String> = None
+        if there == 1 {
+            let Ok(t) = r.read_string() else { return Err(malformed("a text or none")) }
+            out = Some(take t)
+        }
+        if !r.at_end() || there > 1 {
+            return Err(malformed("a text or none"))
+        }
+        Ok(out)
+    }
+}
+
+/// A count or a number: a `u32`.
+impl Answer for u32 {
+    fn read(bytes: take Vec<u8>) -> Result<u32, ToolError> {
+        var r = Reader::new(take bytes)
+        let Ok(n) = r.read_u32() else { return Err(malformed("a u32")) }
+        if !r.at_end() {
+            return Err(malformed("a u32"))
+        }
+        Ok(n)
+    }
+}
+
+/// A size or a hash: a `u64`.
+impl Answer for u64 {
+    fn read(bytes: take Vec<u8>) -> Result<u64, ToolError> {
+        var r = Reader::new(take bytes)
+        let Ok(n) = r.read_u64() else { return Err(malformed("a u64")) }
+        if !r.at_end() {
+            return Err(malformed("a u64"))
+        }
+        Ok(n)
+    }
+}
+
+/// A count, then as many items, each read by `item`: `None` if one doesn't read, or the count
+/// is past the bytes left (each item takes at least a byte).
+pub(package) fn read_list<T>(r: mut Reader, item: fn(mut Reader) -> Option<T>) -> Option<Vec<T>> {
+    let n = r.read_u32().ok()?
+    if n > r.left() {
+        return None
+    }
+    var out: Vec<T> = Vec::with_capacity(n)
+    for _ in 0..n {
+        out.push(item(mut r)?)
+    }
+    Some(out)
+}
+
+/// A count of texts, then each (`read_list`).
+pub(package) fn read_strings(r: mut Reader) -> Option<Vec<String>> {
+    read_list(mut r, |r| r.read_string().ok())
+}
+
+/// A tool service's answer, read: the bytes after its first, or the reason it gives for its
+/// failure.
+pub(package) fn answer(bytes: take Vec<u8>) -> Result<Vec<u8>, ToolError> {
+    var rest = take bytes
+    if rest.is_empty() {
+        return Err(ToolError { message: String::from("the host's answer is empty") })
+    }
+    if rest.remove(0) == 0 {
+        return Ok(rest)
+    }
+    match String::from_utf8(take rest) {
+        Some(message) => Err(ToolError { message }),
+        None => Err(ToolError { message: String::from("the host's reason isn't UTF-8") }),
+    }
+}
+
+/// A `ToolError` for an answer that doesn't read as `what`, the value a service gives.
+pub(package) fn malformed(what: str) -> ToolError {
+    ToolError { message: f"the host's answer doesn't read as {what}" }
+}
+
+/// The most bytes of data one tool request carries or one answer gives: whole files, and a
+/// blob's chunks, are at most this (512 KiB).
+pub const MOST_BYTES: u32 = 524288
+
+/// Makes a request of the tool service `service` (`tool/<service>`), at once. Each service's
+/// function that calls it is `@tool`.
+pub(package) fn ask<T: Answer>(service: str, body: [u8]) -> Call<T> {
+    Call { request: unsafe { tool_request(f"tool/{service}", body) } }
+}
+
+/// A tool task: `f(input)` on one of the tool's helpers (`spawn`). `join` gives its result.
+/// Dropping it waits for it as `join` does, then drops its result and releases its slot and
+/// memory.
+pub struct Task<O> {
+    /// Its slot's address, or 0 if it ran when it was made (every slot was taken).
+    slot: u32,
+    context: u32,
+    context_size: u32,
+    /// Where its result goes: an `Option<O>`.
+    out: u32,
+}
+
+/// A tool task's input, its function and where its result goes, on the heap.
+struct TaskContext<I, O, F> {
+    input: Option<I>,
+    f: Option<F>,
+    out: u32,
+}
+
+/// Runs `f(input)` on one of the tool's helpers, as a task (§16.2): `f` may make calls and wait
+/// on them, which blocks only its own thread, so several sequences of calls go on at once. A
+/// task that no helper has started runs inside `join`, so with no helpers each runs there, in
+/// turn. A trap in the task ends the tool, with its message.
+///
+/// ```wrela
+/// use std::tool::spawn
+/// use std::tool::time::after
+///
+/// fn later(seconds: take f64) -> bool {
+///     after(seconds).wait().is_ok()
+/// }
+///
+/// @tool
+/// fn both() -> bool {
+///     let a = spawn(0.01, later)
+///     let b = spawn(0.01, later)
+///     take a.join() && take b.join()
+/// }
+/// ```
+@tool
+pub fn spawn<I, O, F: fn(take I) -> O>(input: take I, f: F) -> Task<O> {
+    unsafe {
+        let none: Option<O> = None
+        let out = place(take none)
+        let c: TaskContext<I, O, F> = TaskContext { input: Some(take input), f: Some(f), out }
+        let context = place(take c)
+        let size = size_of::<TaskContext<I, O, F>>()
+        let slot = queue_task(task(run_task::<I, O, F>), context)
+        Task { slot, context, context_size: size, out }
+    }
+}
+
+/// `f` on each of `inputs`, each as a task (`spawn`), as many at once as the tool's helpers
+/// run: the results in the inputs' order, whichever finishes first.
+@tool
+pub fn all<I, O, F: Copy + fn(take I) -> O>(inputs: take Vec<I>, f: F) -> Vec<O> {
+    var rest = take inputs
+    let n = rest.len()
+    // Spawned in the inputs' order, so the helpers start from the first: reversed, then popped.
+    for i in 0..n / 2 {
+        rest.swap(i, n - 1 - i)
+    }
+    var tasks: Vec<Task<O>> = Vec::with_capacity(max(n, 1))
+    loop {
+        let Some(x) = rest.pop() else { break }
+        tasks.push(spawn(take x, f))
+    }
+    // Joined in the inputs' order too: with no helpers, each runs in turn, from the first.
+    var out: Vec<O> = Vec::with_capacity(max(n, 1))
+    for mut t in tasks {
+        out.push(t.finish())
+    }
+    out
+}
+
+/// A tool task's work: its function on its input, the result where it goes. Its input and
+/// function are dropped here, so its context owns nothing after.
+fn run_task<I, O, F: fn(take I) -> O>(chunk: u32, c: mut TaskContext<I, O, F>) {
+    let Some(input) = replace(mut c.input, None) else {
+        panic("a task ran twice")
+    }
+    let Some(f) = replace(mut c.f, None) else {
+        panic("a task ran twice")
+    }
+    let result: Option<O> = Some(f(take input))
+    unsafe {
+        write(c.out, take result)
+    }
+}
+
+impl<O> Task<O> {
+    /// The task's result, once it has finished: this thread waits for it in the host, and runs
+    /// it here if no helper has started it.
+    @tool
+    pub fn join(take self) -> O {
+        var pending = take self
+        pending.finish()
+    }
+
+    /// Completes the work, takes its result, and leaves this task with nothing owned.
+    fn finish(mut self) -> O {
+        unsafe {
+            if self.slot != 0 {
+                loop {
+                    let state = atomic_load(self.slot)
+                    if state == SLOT_QUEUED {
+                        if compare_swap(self.slot, SLOT_QUEUED, SLOT_STARTED) == SLOT_QUEUED {
+                            run_started(self.slot)
+                        }
+                    } else if state == SLOT_STARTED {
+                        // A helper runs it: the host wakes this thread when it's done, or the
+                        // run stops.
+                        tool_join(self.slot)
+                    } else if state == SLOT_FAILED {
+                        // Its host wrote the helper's number, and the helper's panic message is
+                        // still in its block.
+                        abort_from(atomic_load(self.slot + SLOT_THREAD))
+                    } else {
+                        break
+                    }
+                }
+                atomic_store(self.slot, SLOT_FREE)
+                self.slot = 0
+            }
+            // Its result may hold blocks in memory a helper grew.
+            reach_heap()
+            let result = read::<Option<O>>(self.out)
+            free(self.out, size_of::<Option<O>>())
+            free(self.context, self.context_size)
+            self.out = 0
+            self.context = 0
+            match take result {
+                Some(x) => x,
+                None => panic("a task finished with no result"),
+            }
+        }
+    }
+}
+
+impl<O> Drop for Task<O> {
+    /// Waits for the task as `join` does, in the tool host: what it gives depends on when the
+    /// task ends.
+    @effects(nondet)
+    fn drop(mut self) {
+        if self.context != 0 {
+            let _ = self.finish()
+        }
+    }
+}
+
+@test
+fn an_answer_reads_as_its_bytes_or_its_reason() {
+    let Ok(ok) = answer(Vec::from([u8(0), 7, 8])) else { panic("a success") }
+    assert(ok.len() == 2 && ok[0] == 7 && ok[1] == 8)
+    let Err(e) = answer(Vec::from([u8(1), 110, 111])) else { panic("a failure") }
+    assert(e.message() == "no")
+    assert(answer(Vec::new()).is_err(), "an empty answer")
+    assert(ToolError::new("the tool's own").message() == "the tool's own")
+}
+
+/// `bytes` read as a `T`, as a call reads its answer.
+fn read_as<T: Answer>(bytes: take Vec<u8>) -> Result<T, ToolError> {
+    T::read(take bytes)
+}
+
+@test
+fn the_shared_answers_read_back() {
+    let done: Result<Done, ToolError> = read_as(Vec::new())
+    let more: Result<Done, ToolError> = read_as(Vec::from([u8(1)]))
+    assert(done.is_ok() && more.is_err())
+    let big: Result<u64, ToolError> = read_as(Vec::from([u8(0), 0, 0, 0, 1, 0, 0, 0]))
+    let Ok(n) = big else { panic("a u64") }
+    assert(n == u64(4294967296))
+    let short: Result<u32, ToolError> = read_as(Vec::from([u8(5)]))
+    assert(short.is_err(), "a short count")
+    let absent: Result<Option<String>, ToolError> = read_as(Vec::from([u8(0)]))
+    let Ok(none) = absent else { panic("no text") }
+    assert(none.is_none())
+    let listed: Result<Vec<String>, ToolError> = read_as(
+        Vec::from([u8(2), 0, 0, 0, 1, 0, 0, 0, 97, 0, 0, 0, 0]),
+    )
+    let Ok(texts) = listed else { panic("texts") }
+    assert(texts.len() == 2 && texts[0].as_str() == "a" && texts[1].as_str() == "")
+}

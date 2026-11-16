@@ -1,0 +1,153 @@
+// The air: what lies between the eye and anything it sees, fading it with distance toward the
+// sky's own colour at the horizon. Two hazes over the whole scene, each its density falling by e
+// over its own height up from the sea's level (a low one, spray or mist, tens of metres; a high
+// one, the air's own, a kilometre or more), taken in the last pass by each pixel's depth (`last`), so
+// every lister is seen through it alike and none of them knows of it; the sky's paint, which has
+// no depth, carries its own (a paint may call `through` with the frame's air for the same haze).
+//
+// A pixel at `p` seen from the eye at `e` shows its colour `c` times what of it reaches the eye,
+// `T = exp(-τ)`, `τ` the haze's optical depth along the straight line between them, and the air's
+// light for the rest: `c T + L (1 - T)`. `L` is the sky at the horizon the way the pixel lies
+// (round the horizon, a coarse level of the frame's sky table): so the far sea and the far
+// stacks go into the sky at the horizon behind them, with no seam, under any sky. (The light the
+// haze scatters toward the eye, taken as the horizon's: a deep haze's own colour is the horizon
+// it hides, which is what an overcast shows; under an open sun it is a little dark toward the sun
+// and light away from it. The single-scattering integral with a phase function is not taken.)
+//
+// The ink's lines fade with it (`ink::weigh`): a line's weight is times `T` at the form it
+// outlines, so what the air has nearly hidden carries no line (the old opening drew none on its
+// world, its far stacks dark masses in the haze; rywible/wrela 7ae6711e,
+// scenes/opening/yonder.wrela:363-388 pushed them toward the sky by distance).
+//
+// The optical depth of an exponential haze along a straight line is closed-form (after
+// Wenzel, "Real-time atmospheric effects in games", 2006: the height fog's integral; and
+// Quílez, "Better fog", 2010): docs/citations.md.
+
+use eye::Eye
+use std::gpu::{Rgba16Float, Sampler, Texture}
+
+/// The scene's air, two hazes each falling by e over its own height: a low one (how much it takes
+/// away a metre at the sea's level, 1/m, and the height over which that falls by e, m: spray,
+/// mist, ground fog) and a high one (the same, for the air's own haze kilometres deep). 0 for
+/// either: none of it; both 0, nothing is worked out.
+pub struct Air: Copy + GpuData {
+    pub thick: f32,
+    pub scale: f32,
+    pub high: f32,
+    pub high_scale: f32,
+}
+
+/// No air: what is drawn shows as it is (the frame's default).
+pub const NO_AIR = Air { thick: 0.0, scale: 1.0, high: 0.0, high_scale: 1.0 }
+
+/// The optical depth of `air` between `a` and `b` (m, the world's): each haze's density `thick
+/// e^(-y/scale)` over the sea's level and `thick` under it (a trough's water stands under the
+/// level), along the straight line between them, exactly.
+pub fn depth_between(air: Air, a: vec3, b: vec3) -> f32 {
+    haze_between(air.thick, air.scale, a, b) + haze_between(air.high, air.high_scale, a, b)
+}
+
+/// The optical depth between `a` and `b` of one haze, `thick` at the sea's level falling by e
+/// every `scale` m up.
+fn haze_between(thick: f32, scale: f32, a: vec3, b: vec3) -> f32 {
+    if thick <= 0.0 {
+        return 0.0
+    }
+    let along = length(b - a)
+    if a.y <= 0.0 && b.y <= 0.0 {
+        return thick * along
+    }
+    // (The part under the level, if the line crosses it, at its own density; the rest rises
+    // from the level.)
+    var lo = a
+    var hi = b
+    if lo.y > hi.y {
+        lo = b
+        hi = a
+    }
+    var under = 0.0
+    if lo.y < 0.0 {
+        let f = -lo.y / (hi.y - lo.y)
+        under = thick * along * f
+        lo = mix(lo, hi, vec3(f))
+    }
+    let over = length(hi - lo)
+    let rise = hi.y - lo.y
+    let elo = exp(-lo.y / scale)
+    if rise < 0.01 * scale {
+        return under + thick * over * elo
+    }
+    let ehi = exp(-hi.y / scale)
+    under + thick * over * scale * (elo - ehi) / rise
+}
+
+/// How much of what is at `b` reaches an eye at `a` through `air` (0 to 1).
+pub fn through(air: Air, a: vec3, b: vec3) -> f32 {
+    if air.thick <= 0.0 && air.high <= 0.0 {
+        return 1.0
+    }
+    exp(-depth_between(air, a, b))
+}
+
+/// The air's light along the way `d` (a unit vector): the sky at the horizon round from it, from
+/// a coarse level of the frame's sky table (`table`, its rows finest at the horizon:
+/// `sky::up_sphere`), just over the horizon's row.
+pub fn air_light(table: Texture<Rgba16Float>, s: Sampler, d: vec3) -> vec3 {
+    let u = atan2(d.z, d.x) / 6.2831853 + 0.5
+    table.sample_level(s, vec2(u, 0.5 + 0.5 / 64.0), 5.0).xyz
+}
+
+/// `colour` met at depth `z` (the picture's, reversed) by the eye's ray through pixel `px`, as
+/// the eye sees it through `air`.
+pub fn aired(
+    air: Air,
+    eye: Eye,
+    table: Texture<Rgba16Float>,
+    s: Sampler,
+    px: vec2,
+    z: f32,
+    colour: vec3,
+) -> vec3 {
+    if (air.thick <= 0.0 && air.high <= 0.0) || z <= 0.0 {
+        return colour
+    }
+    let d = eye.ray(px)
+    let p = eye.place(px, z)
+    let k = exp(-depth_between(air, eye.at, p))
+    colour * k + air_light(table, s, d) * (1.0 - k)
+}
+
+/// How much of what pixel `px` meets at depth `z` reaches the eye through `air` (1 where
+/// nothing is met).
+pub fn reaching(air: Air, eye: Eye, px: vec2, z: f32) -> f32 {
+    if (air.thick <= 0.0 && air.high <= 0.0) || z <= 0.0 {
+        return 1.0
+    }
+    through(air, eye.at, eye.place(px, z))
+}
+
+/// The closed form against both hazes summed along the line in 20,000 steps, rising, level and
+/// falling, from under the sea's level to far over it; nothing at all where there is no air.
+@test
+fn the_air_is_its_integral() {
+    let air = Air { thick: 2.0e-3, scale: 80.0, high: 3.0e-4, high_scale: 1200.0 }
+    let pairs = [
+        (vec3(0.0, 2.0, 0.0), vec3(900.0, 40.0, 300.0)),
+        (vec3(0.0, 30.0, 0.0), vec3(500.0, 30.0, 0.0)),
+        (vec3(0.0, 300.0, 0.0), vec3(0.0, -5.0, 2000.0)),
+        (vec3(0.0, 1.5, 0.0), vec3(100.0, 1.6, 0.0)),
+    ]
+    for i in 0..4 {
+        let (a, b) = pairs[i]
+        var sum = 0.0
+        let n = 20000
+        for k in 0..n {
+            let p = mix(a, b, vec3((f32(k) + 0.5) / f32(n)))
+            sum += air.thick * exp(-max(p.y, 0.0) / air.scale) + air.high * exp(-max(p.y, 0.0) / air.high_scale)
+        }
+        sum *= length(b - a) / f32(n)
+        let closed = depth_between(air, a, b)
+        assert(abs(closed - sum) < 1.0e-3 * sum + 1.0e-6, f"pair {i}: closed {closed}, summed {sum}")
+    }
+    assert(through(NO_AIR, vec3(0.0), vec3(1.0e5)) == 1.0, "no air takes something away")
+}

@@ -1,0 +1,611 @@
+#!/usr/bin/env python3
+"""Tests of the measuring tools (tools/bench, tools/shot, tools/same), with no GPU: synthetic
+timestamp output from a fake tools/gpu, and synthetic pictures. Each gate is shown to hold where
+it should and to fail where it should, and each test is shown to catch a broken tool (the
+mutants at the end: a test that can't fail proves nothing).
+
+    tools/test-measure
+
+Exit status 0 when every test passes and every mutant is caught.
+"""
+
+import contextlib
+import importlib.util
+import io
+import json
+import os
+import shutil
+import statistics
+import sys
+import tempfile
+from importlib.machinery import SourceFileLoader
+
+# The bench waits for a quiet machine before a run; its own tests must not (they would wait
+# ten minutes a run while builders work).
+os.environ["WRELA_BENCH_QUIET_WAIT"] = "0"
+
+TOOLS = os.path.dirname(os.path.abspath(__file__))
+
+
+def tool(name):
+    loader = SourceFileLoader(name.replace("-", "_"), os.path.join(TOOLS, name))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+bench = tool("bench")
+same = tool("same")
+shot = tool("shot")
+from PIL import Image, ImageDraw  # noqa: E402  (tools/same needs Pillow too)
+
+WORK = tempfile.mkdtemp(prefix="test-measure-")
+
+# A stand-in for tools/gpu: reads the build's fake.json, `{"runs": [{"span": V, "passes": {label:
+# V}}, ...], "last": frame}` (V in ms: a number, a list a frame in turn, or {"from", "to", "over"}
+# frames, a line then level), and prints what wrela-host --timestamps prints: each label's pieces,
+# then each frame's span; with --serial, the pieces and spans of 99 ms (a serial span is the CPU's
+# waits). The span runs and the serial runs are counted apart, and each's arguments kept.
+FAKE = r"""#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[1:]
+while args[0] in ("--host", "--timeout"):
+    args = args[2:]
+build, n = args[0], int(args[args.index("--frames") + 1])
+mode = "serial" if "--serial" in args else "span" if "--timestamps" in args else "shot"
+open(os.path.join(build, ".args-" + mode), "w").write(" ".join(args))
+if "--png" in args:
+    open(args[args.index("--png") + 1], "wb").write(b"png")
+spec = json.load(open(os.path.join(build, "fake.json")))
+count = os.path.join(build, ".count-" + mode)
+k = int(open(count).read()) if os.path.exists(count) else 0
+open(count, "w").write(str(k + 1))
+run = spec["runs"][k % len(spec["runs"])]
+def at(v, f):
+    if isinstance(v, list):
+        return v[f % len(v)]
+    if isinstance(v, dict):
+        return v["from"] + (v["to"] - v["from"]) * min(f, v["over"]) / v["over"]
+    return v
+print("gpu: guard: largest 0 B (fake.wgsl)", file=sys.stderr)
+shown = range(min(n, spec.get("last", n - 1) + 1))
+for f in shown:
+    for label, v in run.get("passes", {}).items():
+        us = at(v, f) * 1000
+        # Two pieces a label, as a pass and its dispatch: the bench sums them.
+        print(f"frame {f:>4}  {label:<24} {us / 2:>10.3f} us", file=sys.stderr)
+        print(f"frame {f:>4}  {label:<24} {us - us / 2:>10.3f} us", file=sys.stderr)
+for f in shown:
+    span = 99.0 if mode == "serial" else at(run.get("span", 1.0), f)
+    print(f"frame {f:>4}  span {span:.3f} ms", file=sys.stderr)
+print("%016x" % (0xabc + k))
+"""
+FAKE_PATH = os.path.join(WORK, "fake-gpu")
+with open(FAKE_PATH, "w") as f:
+    f.write(FAKE)
+os.chmod(FAKE_PATH, 0o755)
+bench.GPU = FAKE_PATH
+shot.GPU = FAKE_PATH
+
+
+def build(name, runs, last=None):
+    """A fake build whose runs, in turn, time as `runs` says."""
+    path = os.path.join(WORK, name)
+    if os.path.exists(path):
+        shutil.rmtree(path)
+    os.makedirs(path)
+    spec = {"runs": runs}
+    if last is not None:
+        spec["last"] = last
+    with open(os.path.join(path, "fake.json"), "w") as f:
+        json.dump(spec, f)
+    return path
+
+
+def args_of(build_dir, mode):
+    path = os.path.join(build_dir, ".args-" + mode)
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        return f.read()
+
+
+def run(module, argv):
+    """A tool's main in this process: (status, stdout, stderr)."""
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        status = module.main(argv)
+    return status, out.getvalue(), err.getvalue()
+
+
+def near(x, y, eps=1e-9):
+    return abs(x - y) <= eps
+
+
+def bench_json(argv, frames="2-11"):
+    path = os.path.join(WORK, "out.json")
+    status, out, err = run(bench, ["--rest", "0", "--frames", frames, "--json", path] + argv)
+    assert status == 0, f"bench exited {status}: {err}"
+    with open(path) as f:
+        return json.load(f), out, err
+
+
+LOADED = {"work": 15.0, "sky": 10.0, "load": 20.0}
+
+
+# ---- tools/bench --------------------------------------------------------------------------------
+
+
+def test_timestamps_are_read():
+    """The host's lines: pieces summed by label and frame, other lines ignored, labels with
+    spaces kept whole, frames outside the range left out, medians and sums right, `load` out of
+    the sum; spans read by frame."""
+    lines = [
+        "gpu: guard: largest 0 B (x.wgsl)",
+        "frame    0  warm                        5000.000 us",
+        "frame    1  sky                          100.000 us",
+        "frame    1  ocean warming                200.000 us",
+        "frame    1  ocean warming                300.000 us",
+        "frame    1  load                       20000.000 us",
+        "frame    2  sky                          300.000 us",
+        "frame    2  ocean warming                700.000 us",
+        "frame    2  load                       20000.000 us",
+        "frame    3  sky                          200.000 us",
+        "frame    3  ocean warming                600.000 us",
+        "frame    3  load                       21000.000 us",
+        "frame    1  span 9.500 ms",
+        "frame    3  span 11.250 ms",
+        "frame    0  span 99.000 ms",
+        "c26ef2b0f0c54eb1",
+    ]
+    frames, order = bench.read_timings(lines)
+    assert order == ["warm", "sky", "ocean warming", "load"], order
+    m = bench.measure(frames, order, 1, 3)
+    assert m["frames"] == [1, 2, 3]
+    assert "warm" not in m["labels"], "a frame outside the range was read"
+    assert near(statistics.median(m["labels"]["sky"]["values"]), 0.2)
+    assert near(statistics.median(m["labels"]["ocean warming"]["values"]), 0.6)
+    assert all(near(x, y) for x, y in zip(m["sums"], [0.6, 1.0, 0.8])), m["sums"]
+    assert m["load"]
+    assert bench.window(bench.read_spans(lines), 1, 3) == [9.5, 11.25]
+
+
+def test_the_frame_is_the_span():
+    """The frame's cost is the span runs' spans (17 ms, past one 60 ms frame in ten), not the
+    passes alone, which sum to 25 here; the pass table says it doesn't add up to the frame."""
+    a = build("steady", [{"span": [17.0] * 9 + [60.0], "passes": LOADED}])
+    result, out, err = bench_json([a])
+    r = result["span_runs"][0]
+    assert r["frames_read"] == 10, r["frames_read"]
+    assert near(result["summary"]["median"], 17.0), result["summary"]
+    assert near(r["span"]["max"], 60.0), r["span"]
+    t = result["passes_runs"][0]["table"]
+    assert near(t["sum of passes alone"]["median"], 25.0), t
+    assert "frame span: 17.000 ms" in out, out
+    assert "these do not add up to the frame" in out
+    assert "sum of passes alone (not the frame)" in out
+
+
+def test_span_runs_overlap_and_passes_runs_are_serial():
+    a = build("asks", [{"span": 9.0, "passes": LOADED}])
+    bench_json([a, "--size", "1280x720", "--", "--input", "x.json"])
+    span, serial = args_of(a, "span"), args_of(a, "serial")
+    assert span == f"{a} --frames 12 --size 1280x720 --timestamps --input x.json", span
+    assert serial == f"{a} --frames 12 --size 1280x720 --timestamps --serial --input x.json", serial
+
+
+def test_no_passes():
+    a = build("nopasses", [{"span": 9.0, "passes": LOADED}])
+    result, out, err = bench_json([a, "--no-passes"])
+    assert args_of(a, "serial") is None and not result["passes_runs"]
+    assert "do not add up" not in out
+
+
+def test_load_in_the_span_is_warned():
+    a = build("loadspan", [{"span": 30.0, "passes": LOADED}])
+    result, out, err = bench_json([a])
+    assert "the frame's span INCLUDES it" in err, err
+    assert "LOAD INCLUDED" in out
+    b = build("noload", [{"span": 10.0, "passes": {"work": 4.0}}])
+    loaded = build("loaded", [{"span": 30.0, "passes": LOADED}])
+    result, out, err = bench_json([b, "--passes-build", loaded])
+    assert "INCLUDES" not in err and "LOAD INCLUDED" not in out
+    assert "no `load` pass beside them" not in err
+    assert args_of(loaded, "serial") is not None and args_of(b, "serial") is None
+
+
+def test_passes_with_no_load_are_warned():
+    a = build("light", [{"span": 4.0, "passes": {"work": 4.0}}])
+    result, out, err = bench_json([a])
+    assert "no `load` pass beside them" in err, err
+    assert "NO load beside them" in out
+
+
+def test_a_busy_cpu_is_warned():
+    a = build("busy", [{"span": 9.0, "passes": LOADED}])
+    result, out, err = bench_json([a, "--no-passes"])
+    others = result["span_runs"][0]["others_cpu_pct"]
+    assert others is None or ("the CPU was busy" in err) == (others > bench.BUSY), (others, err)
+    with patched(bench, "BUSY", -1.0), patched(bench, "SAMPLE_S", 0.01):
+        result, out, err = bench_json([a, "--no-passes"])
+    assert "the CPU was busy" in err, err
+
+
+def test_short_run_is_warned():
+    a = build("short", [{"span": 9.0, "passes": LOADED}], last=8)
+    result, out, err = bench_json([a])
+    assert result["span_runs"][0]["frames_read"] == 7
+    assert "read 7 frames of the 10 asked" in err, err
+
+
+def test_settled():
+    """Spans that jitter about 17 ms, the same in each third: settled, no warning."""
+    a = build("settled", [{"span": [17.0, 17.4, 16.8, 17.2, 16.6], "passes": LOADED}])
+    result, out, err = bench_json([a], frames="2-31")
+    assert result["span_runs"][0]["settling"]["settled"], result["span_runs"][0]["settling"]
+    assert "still settling" not in err and "1 of 1 span run settled" in out
+
+
+def test_a_drift_is_not_settling():
+    """Spans drifting from 16.0 to 17.6 ms over the window, as a settled scene's cost moves with
+    its camera: under 15% apart, not warned, though far past the frames' own standard error."""
+    a = build("drift", [{"span": {"from": 16.0, "to": 17.6, "over": 31}, "passes": LOADED}])
+    result, out, err = bench_json([a], frames="2-31")
+    assert result["span_runs"][0]["settling"]["settled"], result["span_runs"][0]["settling"]
+    assert "still settling" not in err
+
+
+def test_still_settling_is_warned():
+    """Spans falling from 30 to 17 ms over the window's first 12 frames: still settling."""
+    a = build("settling", [{"span": {"from": 30.0, "to": 17.0, "over": 12}, "passes": LOADED}])
+    result, out, err = bench_json([a], frames="2-31")
+    assert not result["span_runs"][0]["settling"]["settled"]
+    assert "still settling: take later frames" in err, err
+    assert "STILL SETTLING" in out
+
+
+def ab(a_spans, b_spans, canary=None, runs=3):
+    a = build("A", [{"span": t, "passes": {"work": 5.0, "clouds": 2.5, "load": 20.0}}
+                    for t in a_spans])
+    b = build("B", [{"span": t, "passes": {"work": 5.0, "clouds": canary or 2.5, "load": 20.0}}
+                    for t in b_spans])
+    return bench_json([a, "--against", b, "--runs", str(runs), "--canary", "clouds"])
+
+
+def test_inside_the_noise():
+    """B 0.3 ms (3%) over A where A reads 10.0 to 10.4 against itself: noise, not slower."""
+    result, out, err = ab([10.0, 10.4, 10.2], [10.5, 10.5, 10.5])
+    v = result["verdict"]
+    assert near(v["diff"], 0.3, 1e-6) and near(v["noise"], 0.4, 1e-6), v
+    assert v["verdict"] == "inside the noise", v
+    assert "INSIDE THE NOISE" in out
+
+
+def test_an_a_a_pair_is_noise():
+    """The same spans both sides, alternating: inside the noise."""
+    result, out, err = ab([10.0, 10.4, 10.2], [10.2, 10.0, 10.4])
+    assert result["verdict"]["verdict"] == "inside the noise"
+
+
+def test_faster():
+    result, out, err = ab([10.0, 10.4, 10.2], [9.0, 9.1, 9.0])
+    assert result["verdict"]["verdict"] == "faster", result["verdict"]
+    assert "FASTER" in out
+    order = [(r["side"], r["run"]) for r in result["span_runs"]]
+    assert order == [("A", 1), ("B", 1), ("A", 2), ("B", 2), ("A", 3), ("B", 3)], order
+    assert [r["side"] for r in result["passes_runs"]] == ["A", "B"]
+
+
+def test_slower():
+    result, out, err = ab([10.0, 10.4, 10.2], [11.0, 11.0, 11.1])
+    assert result["verdict"]["verdict"] == "slower"
+
+
+def test_the_verdict_is_on_the_span():
+    """Spans 10 against 9 (faster) while the passes alone sum the same both sides."""
+    result, out, err = ab([10.0, 10.1, 10.0], [9.0, 9.1, 9.0])
+    assert result["verdict"]["verdict"] == "faster"
+    assert near(result["A"]["median"], 10.0) and near(result["B"]["median"], 9.0)
+
+
+def test_unsteady_b_widens_the_noise():
+    """B's runs spread 9.0 to 11.0 while A's 10.0 to 10.1: B's 0.5 lower median is noise."""
+    result, out, err = ab([10.0, 10.1, 10.05], [9.0, 11.0, 9.55])
+    assert result["verdict"]["verdict"] == "inside the noise"
+
+
+def test_one_run_has_no_verdict():
+    result, out, err = ab([10.0], [9.0], runs=1)
+    assert result["verdict"]["verdict"].startswith("no verdict")
+
+
+def test_canary_holds():
+    result, out, err = ab([10.0, 10.4, 10.2], [9.0, 9.1, 9.0])
+    assert result["canary"]["warning"] is None, result["canary"]
+    assert "canary `clouds`" in out and "within 5%" in out
+
+
+def test_canary_moved_warns():
+    """The canary 2.5 ms in A's runs and 2.7 in B's (8%): heat, warned."""
+    result, out, err = ab([10.0, 10.4, 10.2], [9.0, 9.1, 9.0], canary=2.7)
+    assert result["canary"]["warning"] and "moved 8.0%" in result["canary"]["warning"]
+    assert "the canary `clouds` moved" in err
+
+
+def test_bench_refuses_its_own_flags():
+    a = build("flags", [{"span": 1.0}])
+    for extra in (["--", "--frames", "5"], ["--", "--size", "8x8"], ["--", "--serial"],
+                  ["--frames", "9"]):
+        status, out, err = run(bench, [a] + extra)
+        assert status == 2, (extra, status)
+
+
+# ---- tools/shot ---------------------------------------------------------------------------------
+
+
+def test_shot_runs_frames_through_n():
+    a = build("shot", [{"span": 1.0}])
+    png = os.path.join(WORK, "shot.png")
+    saved = os.dup(1), os.dup(2)
+    null = os.open(os.devnull, os.O_WRONLY)
+    try:  # the launcher's own output, which shot passes through
+        os.dup2(null, 1)
+        os.dup2(null, 2)
+        status, out, err = run(shot, [a, "--frame", "1", "--size", "64x32", "-o", png])
+    finally:
+        os.dup2(saved[0], 1)
+        os.dup2(saved[1], 2)
+        os.close(null)
+    assert status == 0, err
+    assert os.path.isfile(png)
+    args = args_of(a, "shot")
+    assert f"--frames 2 --size 64x32 --png {png}" in args, args
+    status, out, err = run(shot, [a, "--frame", "1"])
+    assert status == 2, "a shot with no -o ran"
+
+
+# ---- tools/same ---------------------------------------------------------------------------------
+
+
+def picture(name, draw=None, size=(256, 256), base=(40, 60, 90)):
+    im = Image.new("RGB", size, base)
+    if draw:
+        draw(ImageDraw.Draw(im), im)
+    path = os.path.join(WORK, name)
+    im.save(path)
+    return path
+
+
+def disc(dx=0):
+    return lambda d, im: d.ellipse((60 + dx, 70, 190 + dx, 200), fill=(220, 200, 160))
+
+
+def test_identical_pictures_are_the_same():
+    a = picture("a.png", disc())
+    b = picture("a2.png", disc())
+    d = same.compare(same.load(a), same.load(b), 24)
+    for where in ("all", "edge"):
+        m = d[where]
+        assert m["over2"] == 0 and m["over8"] == 0 and m["mean"] == 0 and m["max"] == 0
+        assert m["psnr"] == float("inf")
+    assert d["edge"]["pixels"] > 0
+    status, out, err = run(same, [a, b, "--over2", "0", "--max", "0", "--edge-over2", "0",
+                                  "--psnr", "1000", "--edge-psnr", "1000"])
+    assert status == 0, out
+
+
+def test_measures_are_exact():
+    """Two pixels of 100 differ: one by 4 in red, one by 10 in green."""
+    a = picture("flat-a.png", size=(10, 10), base=(50, 50, 50))
+
+    def nudge(d, im):
+        im.putpixel((2, 3), (54, 50, 50))
+        im.putpixel((7, 7), (50, 60, 50))
+    b = picture("flat-b.png", nudge, size=(10, 10), base=(50, 50, 50))
+    m = same.compare(same.load(a), same.load(b), 24)["all"]
+    assert m["pixels"] == 100
+    assert near(m["over2"], 2.0) and near(m["over8"], 1.0), m
+    assert near(m["mean"], 0.14) and m["max"] == 10, m
+    import math
+    assert near(m["psnr"], 10 * math.log10(255 ** 2 / ((16 + 100) / 300))), m
+
+
+def test_threshold_is_more_than():
+    """A difference of exactly 2 is not over 2/255; exactly 8 is not over 8/255."""
+    a = picture("t-a.png", size=(2, 1), base=(50, 50, 50))
+
+    def nudge(d, im):
+        im.putpixel((0, 0), (52, 50, 50))
+        im.putpixel((1, 0), (50, 50, 58))
+    b = picture("t-b.png", nudge, size=(2, 1), base=(50, 50, 50))
+    m = same.compare(same.load(a), same.load(b), 24)["all"]
+    assert near(m["over2"], 50.0) and m["over8"] == 0, m
+
+
+def test_a_silhouette_moved_a_pixel_is_caught_at_the_edges():
+    """The disc moved one pixel right: the whole picture's mean and share pass their gates, the
+    edge pixels' share fails its gate."""
+    a = picture("a.png", disc())
+    b = picture("moved.png", disc(1))
+    d = same.compare(same.load(a), same.load(b), 24)
+    assert d["all"]["mean"] < 1.0 and d["all"]["over8"] < 1.0, d["all"]
+    assert d["edge"]["over8"] > 30.0, d["edge"]
+    status, out, err = run(same, [a, b, "--mean", "1", "--over8", "1"])
+    assert status == 0 and "FAILS" not in out, out
+    status, out, err = run(same, [a, b, "--mean", "1", "--over8", "1", "--edge-over8", "10"])
+    assert status == 1, out
+    assert "gate: over 8/255 over edge pixels" in out and "FAILS" in out
+
+
+def test_each_gate_can_fail():
+    """Every gate, all pixels and edge pixels, fails on the moved disc and holds on itself."""
+    a = picture("a.png", disc())
+    b = picture("moved.png", disc(1))
+    for where in ("", "edge-"):
+        for flag, limit in (("over2", "0"), ("over8", "0"), ("mean", "0"), ("max", "0"),
+                            ("psnr", "60")):
+            gate = [f"--{where}{flag}", limit]
+            status, out, err = run(same, [a, b] + gate)
+            assert status == 1 and "FAILS" in out, (gate, out)
+            status, out, err = run(same, [a, a] + gate)
+            assert status == 0 and "holds" in out, (gate, out)
+
+
+def test_noise():
+    """c.png: A's second run, 20 interior pixels off by 3. B equal to c is not above the noise;
+    the moved disc is, as is one pixel off by 30."""
+    a = picture("a.png", disc())
+
+    def jitter(d, im):
+        disc()(d, im)
+        for i in range(20):
+            im.putpixel((100 + i, 130), (223, 200, 160))
+    c = picture("c.png", jitter)
+    b_same = picture("b-same.png", jitter)
+    moved = picture("moved.png", disc(1))
+
+    def one(d, im):
+        disc()(d, im)
+        im.putpixel((120, 130), (250, 200, 160))
+    spot = picture("spot.png", one)
+    status, out, err = run(same, [a, b_same, "--noise", c])
+    assert status == 0 and "not above the noise" in out, out
+    status, out, err = run(same, [a, moved, "--noise", c])
+    assert status == 1 and "ABOVE the noise" in out, out
+    status, out, err = run(same, [a, spot, "--noise", c])
+    assert status == 1 and "greatest over all pixels 30 against 3" in out, out
+
+
+def test_sizes_must_match():
+    a = picture("a.png", disc())
+    small = picture("small.png", size=(128, 128))
+    status, out, err = run(same, [a, small])
+    assert status == 2
+
+
+TESTS = [v for k, v in list(globals().items()) if k.startswith("test_")]
+
+
+# ---- the mutants: each breaks a tool, and a test must fail -------------------------------------
+
+
+@contextlib.contextmanager
+def patched(module, name, value):
+    old = getattr(module, name)
+    setattr(module, name, value)
+    try:
+        yield
+    finally:
+        setattr(module, name, old)
+
+
+class MeanNotMedian:
+    median = staticmethod(statistics.fmean)
+
+
+def no_edges(a, step):
+    return Image.new("L", a.size, 0)
+
+
+def a_noise_only(a_runs, b_runs):
+    a, b = statistics.median(a_runs), statistics.median(b_runs)
+    noise = max(a_runs) - min(a_runs)
+    word = "inside the noise" if abs(b - a) <= noise else ("faster" if b < a else "slower")
+    return b - a, noise, word
+
+
+def no_noise(a_runs, b_runs):
+    a, b = statistics.median(a_runs), statistics.median(b_runs)
+    return b - a, 0.0, "faster" if b < a else "slower"
+
+
+def settling_by_standard_error(values):
+    n = len(values) // 3
+    early, late = values[:n], values[-n:]
+    a, b = statistics.median(early), statistics.median(late)
+    mad = statistics.median(abs(x - b) for x in late)
+    noise = 5.0 * 2 ** 0.5 * 1.2533 * 1.4826 * mad / n ** 0.5
+    return {"first": a, "last": b, "noise": noise, "settled": abs(a - b) <= noise}
+
+
+def serial_sum_as_frame(lines):
+    """The frame read as the sum of its passes (what the bench once called the frame)."""
+    frames, order = bench.read_timings(lines)
+    return {f: sum(us for label, us in per.items() if label != bench.LOAD) / 1000.0
+            for f, per in frames.items()}
+
+
+def always_serial(run_once):
+    return lambda build, size, last, extra, host, timeout, serial: run_once(
+        build, size, last, extra, host, timeout, True)
+
+
+MUTANTS = [
+    ("the frame is the passes' sum", lambda: patched(bench, "read_spans", serial_sum_as_frame),
+     [test_the_frame_is_the_span]),
+    ("the span runs are serial", lambda: patched(bench, "run_once",
+                                                  always_serial(bench.run_once)),
+     [test_the_frame_is_the_span, test_span_runs_overlap_and_passes_runs_are_serial]),
+    ("the sum includes `load`", lambda: patched(bench, "LOAD", "nothing"),
+     [test_timestamps_are_read, test_the_frame_is_the_span]),
+    ("a mean in place of the median", lambda: patched(bench, "statistics", MeanNotMedian),
+     [test_the_frame_is_the_span]),
+    ("settling never warns", lambda: patched(bench, "settling", lambda v: None),
+     [test_still_settling_is_warned]),
+    ("settling by the standard error alone", lambda: patched(bench, "settling",
+                                                             settling_by_standard_error),
+     [test_a_drift_is_not_settling]),
+    ("no noise: every difference a verdict", lambda: patched(bench, "verdict", no_noise),
+     [test_inside_the_noise, test_an_a_a_pair_is_noise]),
+    ("the noise is A's alone", lambda: patched(bench, "verdict", a_noise_only),
+     [test_unsteady_b_widens_the_noise]),
+    ("the canary never warns", lambda: patched(bench, "canary_check",
+                                               lambda runs, label, share: ([], 0.0, None)),
+     [test_canary_moved_warns]),
+    ("no load warning on the passes", lambda: patched(bench, "no_load_warning",
+                                                      lambda b, w: None),
+     [test_passes_with_no_load_are_warned]),
+    ("no warning of a load in the span", lambda: patched(bench, "load_in_span_warning",
+                                                         lambda b, w: None),
+     [test_load_in_the_span_is_warned]),
+    ("the CPU never sampled", lambda: patched(bench, "others_cpu", lambda ours: None),
+     [test_a_busy_cpu_is_warned]),
+    ("no edge pixels", lambda: patched(same, "edges", no_edges),
+     [test_a_silhouette_moved_a_pixel_is_caught_at_the_edges]),
+    ("the noise compared by PSNR alone", lambda: patched(same, "MEASURES", ("psnr",)),
+     [test_noise]),
+]
+
+
+def main():
+    failed = 0
+    for t in TESTS:
+        try:
+            t()
+            print(f"ok      {t.__name__}")
+        except Exception as e:  # noqa: BLE001
+            failed += 1
+            print(f"FAILED  {t.__name__}: {type(e).__name__}: {e}")
+    for name, patch, tests in MUTANTS:
+        caught = []
+        with patch():
+            for t in tests:
+                try:
+                    t()
+                except Exception:  # noqa: BLE001
+                    caught.append(t.__name__)
+        if len(caught) == len(tests):
+            print(f"caught  mutant: {name} ({', '.join(caught)})")
+        else:
+            failed += 1
+            missed = [t.__name__ for t in tests if t.__name__ not in caught]
+            print(f"MISSED  mutant: {name}: {', '.join(missed)} still passed")
+    shutil.rmtree(WORK, ignore_errors=True)
+    print(f"test-measure: {len(TESTS)} tests, {len(MUTANTS)} mutants: "
+          f"{'all passed' if not failed else str(failed) + ' failed'}")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

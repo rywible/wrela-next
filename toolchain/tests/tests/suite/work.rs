@@ -1,0 +1,249 @@
+//! Work and weight (language.md §18.11, compiler/ir/src/work.rs): `wrela pipelines` counts each
+//! entry point's most work in one call and each pipeline's weight, the same on every machine;
+//! `@budget(work: n)` and `@budget(weight: n)` hold a GPU function to them (E0710).
+
+use crate::{scratch, write_package};
+
+/// A program of one kernel per body, each dispatched: `kernels` are `(name, body)`, the body
+/// computing `out[id]` from `x`, an `f32` the invocation has.
+fn kernels(name: &str, items: &str, kernels: &[(&str, &str)]) -> std::path::PathBuf {
+    let dir = scratch(name);
+    let mut src = String::from("use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}\n\n");
+    src.push_str(items);
+    for (k, body) in kernels {
+        src.push_str(&format!(
+            "\n@compute(64)\nfn {k}(out: mut Slots<f32>, id: GlobalId) {{\n    let x = f32(id.x)\n{body}\n}}\n"
+        ));
+    }
+    src.push_str("\npub fn frame(time: f32, width: u32, height: u32) {\n    var out: GpuBuffer<f32> = buffer(64)\n");
+    for (k, _) in kernels {
+        src.push_str(&format!("    dispatch({k}.bind(mut out), over: 64)\n"));
+    }
+    src.push_str("}\n");
+    write_package(&dir, name, &src);
+    dir
+}
+
+/// Each kernel's work, by name.
+fn work(dir: &std::path::Path) -> Vec<(String, Option<u64>, u64)> {
+    let out = wrela_driver::check_pipelines(dir);
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    out.pipelines
+        .iter()
+        .map(|p| (p.names[0].clone(), p.work.first().copied().flatten(), p.weight))
+        .collect()
+}
+
+fn of(all: &[(String, Option<u64>, u64)], k: &str) -> (Option<u64>, u64) {
+    let (_, w, g) = all.iter().find(|(n, ..)| n == k).unwrap_or_else(|| panic!("{k}: {all:?}"));
+    (*w, *g)
+}
+
+#[test]
+fn loops_count_each_pass_and_unbounded_ones_have_no_work() {
+    let dir = kernels(
+        "work_loops",
+        "",
+        &[
+            (
+                "eight",
+                "    var a = 0.0\n    for _i in 0..8 {\n        a = a + sin(x + f32(_i))\n    }\n    out[id] = a",
+            ),
+            (
+                "sixteen",
+                "    var a = 0.0\n    for _i in 0..16 {\n        a = a + sin(x + f32(_i))\n    }\n    out[id] = a",
+            ),
+            // Left early on the invocation's own value, but never past 32 passes.
+            (
+                "capped",
+                "    var a = 0.0\n    var i = 0\n    var done = false\n    while i < 32 && !done {\n        a = a + sin(x + a)\n        done = a > 10.0\n        i = i + 1\n    }\n    out[id] = a",
+            ),
+            // A bound the loop itself moves by the invocation's value: what the first pass knew
+            // of it isn't known on the next.
+            (
+                "moved",
+                "    var i: u32 = 0\n    var n: u32 = 4\n    while i < n {\n        i = i + 1\n        n = n + id.x\n    }\n    out[id] = f32(i)",
+            ),
+            // Left only on the invocation's own value: no sure exit.
+            (
+                "open",
+                "    var a = 0.0\n    while a < 10.0 {\n        a = a + sin(x + a) + 0.5\n    }\n    out[id] = a",
+            ),
+        ],
+    );
+    let all = work(&dir);
+    let (eight, sixteen) =
+        (of(&all, "eight").0.expect("bounded"), of(&all, "sixteen").0.expect("bounded"));
+    let per_pass = sixteen - eight;
+    assert!(per_pass >= 8 * 4, "eight more passes, each a sine (4) and more: {all:?}");
+    assert!(eight < sixteen && sixteen < 2 * eight + 16, "{all:?}");
+    let capped = of(&all, "capped").0.expect("a counter that reaches 32 bounds it");
+    assert!(capped >= 32 * 4, "{all:?}");
+    assert_eq!(of(&all, "open").0, None, "{all:?}");
+    assert_eq!(of(&all, "moved").0, None, "{all:?}");
+}
+
+#[test]
+fn a_loop_over_a_count_known_at_run_time_is_bounded_by_its_clamp() {
+    let items = "struct Steps: Copy + GpuData {\n    limit: u32,\n    signed: i32,\n}\n";
+    let dir = scratch("work_clamped");
+    let src = format!(
+        "use std::gpu::{{GlobalId, GpuBuffer, Slots, buffer, dispatch}}\n\n{items}\n\
+@compute(64)\nfn open(s: Steps, out: mut Slots<f32>, id: GlobalId) {{\n    var a = 0.0\n    for _i in 0..s.limit {{\n        a = a + sin(a)\n    }}\n    out[id] = a\n}}\n\n\
+@compute(64)\nfn clamped(s: Steps, out: mut Slots<f32>, id: GlobalId) {{\n    var a = 0.0\n    for _i in 0..min(s.limit, 64) {{\n        a = a + sin(a)\n    }}\n    out[id] = a\n}}\n\n\
+@compute(64)\nfn masked(s: Steps, out: mut Slots<f32>, id: GlobalId) {{\n    var a = 0.0\n    var i: u32 = 0\n    while i < (s.limit & 31) + 1 {{\n        a = a + sin(a)\n        i += 1\n    }}\n    out[id] = a\n}}\n\n\
+@compute(64)\nfn signed(s: Steps, out: mut Slots<f32>, id: GlobalId) {{\n    var a = 0.0\n    for _i in 0..clamp(s.signed, 0, 16) {{\n        a = a + sin(a)\n    }}\n    out[id] = a\n}}\n\n\
+@compute(64)\nfn wraps(s: Steps, out: mut Slots<f32>, id: GlobalId) {{\n    var a = 0.0\n    for _i in 0..min(s.limit, 64) - 1 {{\n        a = a + sin(a)\n    }}\n    out[id] = a\n}}\n\n\
+pub fn frame(time: f32, width: u32, height: u32) {{\n    var out: GpuBuffer<f32> = buffer(64)\n    let s = Steps {{ limit: width, signed: i32(height) }}\n\
+    dispatch(open.bind(s, mut out), over: 64)\n    dispatch(clamped.bind(s, mut out), over: 64)\n    dispatch(masked.bind(s, mut out), over: 64)\n\
+    dispatch(signed.bind(s, mut out), over: 64)\n    dispatch(wraps.bind(s, mut out), over: 64)\n}}\n"
+    );
+    write_package(&dir, "work_clamped", &src);
+    let all = work(&dir);
+    assert_eq!(of(&all, "open").0, None, "a count read at run time: {all:?}");
+    let clamped = of(&all, "clamped").0.expect("min(n, 64) bounds it");
+    assert!((64 * 4..64 * 40).contains(&clamped), "64 passes of a sine and a sum: {all:?}");
+    let masked = of(&all, "masked").0.expect("(n & 31) + 1 bounds it");
+    assert!((32 * 4..33 * 40).contains(&masked), "at most 32 passes: {all:?}");
+    let signed = of(&all, "signed").0.expect("clamp(n, 0, 16) bounds it");
+    assert!((16 * 4..16 * 40).contains(&signed), "{all:?}");
+    // A subtraction may wrap below zero: its count isn't bounded.
+    assert_eq!(of(&all, "wraps").0, None, "{all:?}");
+}
+
+/// A bound may be loose, never low: the host's step guard trusts it. A `break` or `continue` on
+/// a value the count doesn't know leaves what it knew with its loop, so what follows the loop
+/// (or its next pass) is counted for every way out, not only the last pass's.
+#[test]
+fn a_loop_left_early_counts_what_follows_for_every_way_out() {
+    // The heavy step: 16 sines.
+    let items = "fn heavy(x: f32) -> f32 {\n    var a = x\n    for _h in 0..16 {\n        a = a + sin(a)\n    }\n    a\n}\n";
+    let dir = kernels(
+        "work_left_early",
+        items,
+        &[
+            // The opening's cloud march as first written (2026-11-16, stated at 2,498 work for
+            // about 1.3 million): on to the next marked cell, then a heavy step. At most 8 cells
+            // of 4 steps run the heavy step: 32 times.
+            (
+                "cells",
+                "    var i: u32 = 0\n    var j: u32 = 0\n    var a = x\n    for _s in 0..64 {\n        for _k in 0..8 {\n            if i >= 8 || ((id.x >> i) & u32(1)) != u32(0) {\n                break\n            }\n            i += 1\n        }\n        if i >= 8 {\n            break\n        }\n        a = heavy(a + f32(j))\n        j += 1\n        if j >= 4 {\n            j = 0\n            i += 1\n        }\n    }\n    out[id] = a",
+            ),
+            // The same loop with one counter: the bound it was meant to have.
+            (
+                "counted",
+                "    var a = x\n    for k in 0..32 {\n        if ((id.x >> (k / 4)) & u32(1)) != u32(0) {\n            a = heavy(a + f32(k % 4))\n        }\n    }\n    out[id] = a",
+            ),
+            // A count a `break` may leave anywhere from 0 to 32, then a branch on it.
+            (
+                "after",
+                "    var n: u32 = 0\n    for k in 0..32 {\n        if f32(k) > x {\n            break\n        }\n        n += 1\n    }\n    var a = x\n    if n < 32 {\n        a = heavy(a)\n    }\n    out[id] = a",
+            ),
+            // The same loop without the branch, and the heavy step alone.
+            (
+                "before",
+                "    var n: u32 = 0\n    for k in 0..32 {\n        if f32(k) > x {\n            break\n        }\n        n += 1\n    }\n    out[id] = x + f32(n)",
+            ),
+            ("plain", "    out[id] = heavy(x)"),
+            ("none", "    out[id] = x"),
+            // A `continue` that sets the counter back: no sure exit.
+            (
+                "again",
+                "    var i: u32 = 0\n    var a = x\n    while i < 8 {\n        a = a + sin(a)\n        if a > 0.5 {\n            i = 0\n            continue\n        }\n        i += 1\n    }\n    out[id] = a",
+            ),
+            // A clamp whose least is past its value's most: at least 16 passes.
+            (
+                "floored",
+                "    var a = x\n    for _i in 0..clamp(id.x & 3, 16, 32) {\n        a = a + sin(a)\n    }\n    out[id] = a",
+            ),
+        ],
+    );
+    let all = work(&dir);
+    let step = of(&all, "counted").0.expect("bounded") / 32;
+    assert!(step >= 16 * 4, "a heavy step is 16 sines: {all:?}");
+    let cells = of(&all, "cells").0.expect("bounded by its 64 passes");
+    assert!(cells >= 32 * step, "32 heavy steps at least: {all:?}");
+    let after = of(&all, "after").0.expect("bounded");
+    let (before, plain) = (of(&all, "before").0.unwrap(), of(&all, "plain").0.unwrap());
+    let none = of(&all, "none").0.unwrap();
+    assert!(after + none >= before + plain, "the branch after the loop may run: {all:?}");
+    assert_eq!(of(&all, "again").0, None, "{all:?}");
+    let floored = of(&all, "floored").0.expect("bounded by its clamp");
+    assert!(floored >= 16 * 4, "{all:?}");
+}
+
+#[test]
+fn a_branch_counts_its_costlier_side_unless_its_condition_is_known() {
+    let items = "fn heavy(x: f32) -> f32 {\n    var a = x\n    for _i in 0..32 {\n        a = sin(a) + cos(a)\n    }\n    a\n}\n";
+    let dir = kernels(
+        "work_branches",
+        items,
+        &[
+            ("either", "    out[id] = if x > 3.0 { heavy(x) } else { x + 1.0 }"),
+            ("never", "    out[id] = if false { heavy(x) } else { x + 1.0 }"),
+            ("plain", "    out[id] = heavy(x)"),
+        ],
+    );
+    let all = work(&dir);
+    let (either, plain, never) =
+        (of(&all, "either").0.unwrap(), of(&all, "plain").0.unwrap(), of(&all, "never").0.unwrap());
+    assert!(either >= plain, "the costlier side counts: {all:?}");
+    assert!(never * 10 < plain, "a known branch counts the side it takes: {all:?}");
+}
+
+/// A function of about `n` hundred statements, called from many places: big enough that the
+/// shader is written with it as a function of its own (`opt::outlined`).
+fn big(n: usize) -> String {
+    let mut s = String::from("fn big(x: f32) -> f32 {\n    var a = x\n");
+    for k in 0..n * 25 {
+        s.push_str(&format!("    a = sin(a * {}.5) * cos(a) + sqrt(abs(a))\n", k % 7 + 1));
+    }
+    s.push_str("    a\n}\n");
+    s
+}
+
+#[test]
+fn a_function_called_from_more_places_weighs_more_unless_its_calls_merge() {
+    let dir = kernels(
+        "work_weight",
+        &big(12),
+        &[
+            // Each call needs the last's result: four copies.
+            ("chain", "    out[id] = big(big(big(big(x))))"),
+            // Four taps of it, none needing another's: one call in a loop (`merge_calls`).
+            ("taps", "    out[id] = big(x + 1.0) + big(x + 2.0) + big(x + 3.0) + big(x + 4.0)"),
+            // A loop that calls it stays a loop.
+            (
+                "looped",
+                "    var a = x\n    for _i in 0..4 {\n        a = a + big(x + f32(_i))\n    }\n    out[id] = a",
+            ),
+        ],
+    );
+    let all = work(&dir);
+    let (chain, taps, looped) = (of(&all, "chain").1, of(&all, "taps").1, of(&all, "looped").1);
+    assert!(chain > 3 * taps, "four copies against one: {all:?}");
+    assert!(chain > 3 * looped, "a loop of one call is one copy: {all:?}");
+    // About the same work either way: merging changes what's compiled, not what runs.
+    let (a, b) = (of(&all, "chain").0.unwrap(), of(&all, "taps").0.unwrap());
+    assert!(a.abs_diff(b) * 10 < a, "{all:?}");
+}
+
+#[test]
+fn a_function_over_its_budget_is_e0710() {
+    let items = "@budget(work: 50)\nfn heavy(x: f32) -> f32 {\n    var a = x\n    for _i in 0..32 {\n        a = sin(a) + cos(a)\n    }\n    a\n}\n\n@budget(weight: 10)\nfn wide(x: f32) -> f32 {\n    heavy(heavy(x))\n}\n\n@budget(work: 1000)\nfn open(x: f32) -> f32 {\n    var a = x\n    while a < 10.0 {\n        a = a + 1.0\n    }\n    a\n}\n";
+    let dir = kernels("work_budget", items, &[("k", "    out[id] = wide(x) + open(x)")]);
+    let out = wrela_driver::check_pipelines(&dir);
+    let msgs: Vec<String> = out
+        .diagnostics
+        .iter()
+        .filter(|d| d.code == wrela_diag::codes::E0710)
+        .map(|d| d.message.clone())
+        .collect();
+    assert_eq!(msgs.len(), 3, "{:?}", out.diagnostics);
+    assert!(
+        msgs.iter().any(|m| m.contains("`heavy` can do") && m.contains("over its budget of 50")),
+        "{msgs:?}"
+    );
+    assert!(msgs.iter().any(|m| m.contains("`wide` weighs")), "{msgs:?}");
+    assert!(msgs.iter().any(|m| m.contains("`open`'s work has no bound")), "{msgs:?}");
+}

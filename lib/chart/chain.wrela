@@ -1,0 +1,350 @@
+// A chain of joints a path runs along, how its bones pose it, how its joints bend, and how a
+// form changes where they do. From rywible/wrela's engine/chart.wrela at 7ae6711e.
+
+use path::{Path, angle_between, carry, laid, unit, VERTICES}
+use radial::Radial
+use std::math::TAU
+
+/// The most joints a chain has.
+pub const JOINTS: u32 = 8
+
+/// A chain of joints a path runs along, at rest: its joints from its root's end to its tip
+/// (`count` of them), how far the path runs on before the first and after the last (straight
+/// on), how far either side of a joint between them its bend is rounded (0 for a path that is
+/// a smooth curve through its joints, as a spine is), angle 0 at its start,
+/// and for each bone (bone `i` runs from joint `i` to joint `i + 1`) how far along it its own
+/// turn about its length is reached (`spread`: 1 for a forearm, whose two bones cross all the
+/// way from elbow to wrist; a third for an upper arm or a thigh, whose skin turns with the bone
+/// past the muscle that caps the joint). And how far its path cuts the corner at a bent joint
+/// (`cut`, 0 to 1): at 0 the path goes through the joint itself however far it's bent; at 1 it
+/// follows the arc that leaves one bone's line where the rounding starts and meets the other's
+/// where it ends, so a deep bend is one smooth curve and the limb's two lengths don't cross
+/// inside it.
+pub struct Chain: Copy {
+    pub joints: [vec3; JOINTS],
+    pub count: u32,
+    pub before: f32,
+    pub after: f32,
+    pub round: f32,
+    pub up: vec3,
+    pub spread: [f32; JOINTS],
+    pub cut: f32,
+}
+
+/// A chain through `joints`.
+pub fn chain<const J: u32>(
+    joints: [vec3; J],
+    up: vec3,
+    before: f32 = 0.0,
+    after: f32 = 0.0,
+    round: f32 = 0.05,
+    spread: [f32; JOINTS] = [1.0; JOINTS],
+    cut: f32 = 0.0,
+) -> Chain {
+    assert(J >= 2 && J <= JOINTS, "a chain has 2 to 8 joints")
+    var all = [vec3(); JOINTS]
+    for i in 0..J {
+        all[i] = joints[i]
+    }
+    Chain { joints: all, count: J, before, after, round, up, spread, cut }
+}
+
+/// `p` as matrix `m` carries it.
+pub(package) fn carried(m: mat4, p: vec3) -> vec3 {
+    (m * vec4(p, 1.0)).xyz
+}
+
+/// Direction `d` as matrix `m` turns it.
+fn turned_by(m: mat4, d: vec3) -> vec3 {
+    unit((m * vec4(d, 0.0)).xyz)
+}
+
+/// A chain's path's points: where each is at rest, which bone of the chain carries it and the
+/// bone that shares it (a joint's own point is halfway between where each of its two bones has
+/// it), how much of its bone's own turn about its length it has (`reach`: 0 where the bone
+/// starts, 1 from where its turn is reached on), and how many there are.
+struct Points: Copy {
+    at: [vec3; VERTICES],
+    bone: [u32; VERTICES],
+    other: [u32; VERTICES],
+    reach: [f32; VERTICES],
+    count: u32,
+}
+
+impl Chain {
+    /// How far either side of joint `i` (one between two bones) the bend is rounded: `round`,
+    /// or two fifths of the shorter bone there.
+    fn rounded(self, i: u32) -> f32 {
+        let a = length(self.joints[i] - self.joints[i - 1])
+        let b = length(self.joints[i + 1] - self.joints[i])
+        min(self.round, 0.4 * min(a, b))
+    }
+
+    /// Its path's points: its start; for each bone, where its turn is reached (if before its
+    /// end); three about each joint between two bones (before it, on it, after it); and its end.
+    fn points(self) -> Points {
+        var at = [vec3(); VERTICES]
+        var bone = [0; VERTICES]
+        var other = [0; VERTICES]
+        var reach = [0.0; VERTICES]
+        let j = self.joints
+        let last = self.count - 1
+        var n = 0
+        at[n] = j[0] - unit(j[1] - j[0]) * self.before
+        n += 1
+        for i in 0..last {
+            // Where bone `i` starts and ends on the path: past the rounding of the joints at
+            // its ends.
+            let from = if i == 0 { j[0] } else { j[i] + unit(j[i + 1] - j[i]) * self.rounded(i) }
+            let to = if i + 1 == last { j[last] } else {
+                j[i + 1] - unit(j[i + 1] - j[i]) * self.rounded(i + 1)
+            }
+            if self.spread[i] < 0.999 {
+                at[n] = mix(from, to, max(self.spread[i], 0.05))
+                bone[n] = i
+                other[n] = i
+                reach[n] = 1.0
+                n += 1
+            }
+            if i + 1 == last {
+                at[n] = j[last] + unit(j[last] - j[last - 1]) * self.after
+                bone[n] = i
+                other[n] = i
+                reach[n] = 1.0
+                n += 1
+            } else if self.rounded(i + 1) <= 0.0 {
+                // (No rounding: the joint's own point alone, and the path a smooth curve
+                // through the joints, its bends spread along it. A spine's.)
+                at[n] = j[i + 1]
+                bone[n] = i
+                other[n] = i + 1
+                reach[n] = 1.0
+                n += 1
+            } else {
+                at[n] = to
+                bone[n] = i
+                other[n] = i
+                reach[n] = 1.0
+                at[n + 1] = j[i + 1]
+                bone[n + 1] = i
+                other[n + 1] = i + 1
+                reach[n + 1] = 1.0
+                at[n + 2] = j[i + 1] + unit(j[i + 2] - j[i + 1]) * self.rounded(i + 1)
+                bone[n + 2] = i + 1
+                other[n + 2] = i + 1
+                n += 3
+            }
+        }
+        Points { at, bone, other, reach, count: n }
+    }
+
+    /// Its path's points with each bent joint's own point moved in across its corner (`cut`):
+    /// toward the middle of the arc from the point before it, where the bend's rounding starts,
+    /// to the point after it, where it ends. Where the joint is straight it stays.
+    fn corners_cut(self, p: Points, at: [vec3; VERTICES]) -> [vec3; VERTICES] {
+        var out = at
+        if self.cut <= 0.0 {
+            return out
+        }
+        for i in 1..p.count - 1 {
+            // (A joint's own point is the one two bones share, with a rounding point of each
+            // either side of it.)
+            let shared = p.other[i] != p.bone[i]
+            if !shared || p.other[i - 1] != p.bone[i - 1] || p.other[i + 1] != p.bone[i + 1] {
+                continue
+            }
+            let before = at[i] - at[i - 1]
+            let after = at[i + 1] - at[i]
+            let lean = unit(after) - unit(before)
+            let bent = acos(clamp(dot(unit(before), unit(after)), -1.0, 1.0))
+            if length(lean) < 0.000001 {
+                continue
+            }
+            // The arc's middle is the rounding's length times tan(a quarter of the bend) in
+            // from the corner.
+            let t = 0.5 * (length(before) + length(after))
+            out[i] = at[i] + unit(lean) * (self.cut * t * tan(0.25 * min(bent, 3.0)))
+        }
+        out
+    }
+
+    /// Its mirror image in the plane x = 0: a right limb's chain from its left's. Angles on
+    /// its chart then run the other way round the body, so a form about it is the left's
+    /// mirrored (`Radial::mirrored`).
+    pub fn mirrored(self) -> Chain {
+        var joints = self.joints
+        for i in 0..JOINTS {
+            joints[i] = vec3(-joints[i].x, joints[i].y, joints[i].z)
+        }
+        Chain { joints, up: vec3(-self.up.x, self.up.y, self.up.z), ..self }
+    }
+
+    /// Its path at rest.
+    pub fn rest(self) -> Path {
+        let p = self.points()
+        laid(self.corners_cut(p, p.at), [0.0; VERTICES], p.count, self.up)
+    }
+
+    /// Its path as its bones pose it. `root` is the matrix of what the chain hangs from (a
+    /// chest for an arm), and `bones[i]` the matrix of the bone from joint `i` to joint `i + 1`;
+    /// each carries a point of the body at rest to where the pose has it. Each of the path's
+    /// points goes with its bone. Angle 0 at the start is the root's, swung to the way the first
+    /// bone points. Each bone's own turn about its length starts from the bone before's at the
+    /// joint between them and is reached `spread` of the way along it: a forearm's turn from the
+    /// elbow to the wrist, an upper arm's within its first third.
+    pub fn posed(self, root: mat4, bones: [mat4; JOINTS]) -> Path {
+        let p = self.points()
+        let rest = laid(self.corners_cut(p, p.at), [0.0; VERTICES], p.count, self.up)
+        var carried_to = [vec3(); VERTICES]
+        for i in 0..p.count {
+            carried_to[i] = 0.5 *
+                (carried(bones[p.bone[i]], p.at[i]) + carried(bones[p.other[i]], p.at[i]))
+        }
+        let at = self.corners_cut(p, carried_to)
+        // Angle 0 at the start: the root's, swung from where the root has the path's start
+        // pointing to where the first bone has it.
+        let ahead = unit(at[1] - at[0])
+        let up0 = carry(turned_by(root, rest.up[0]), turned_by(root, rest.normal[0]), ahead)
+        let flat = laid(at, [0.0; VERTICES], p.count, up0)
+        // Each bone's turn about its length, read at the last point it alone carries: from the
+        // untwisted frame there to where the bone has the rest frame's angle 0. The nearest
+        // turn to the bone before's: never the long way round.
+        let per = (flat.vertices - 1) / (p.count - 1)
+        var turn = [0.0; JOINTS]
+        var so_far = 0.0
+        for i in 1..p.count {
+            let ends_bone = i + 1 == p.count ||
+                p.other[i + 1] != p.bone[i] ||
+                p.bone[i + 1] != p.bone[i]
+            if ends_bone && p.other[i] == p.bone[i] {
+                let v = i * per
+                let want = turned_by(bones[p.bone[i]], rest.up[v])
+                so_far += wrapped(angle_between(flat.up[v], want, flat.normal[v]) - so_far)
+                turn[p.bone[i]] = so_far
+            }
+        }
+        var twist = [0.0; VERTICES]
+        for i in 0..p.count {
+            let b = p.bone[i]
+            let before = if b == 0 { 0.0 } else { turn[b - 1] }
+            twist[i] = mix(before, turn[b], p.reach[i])
+        }
+        laid(at, twist, p.count, up0)
+    }
+
+    /// How each joint between two of its bones is bent in a pose (`Bend`; `bones` as `posed`
+    /// takes them): joint `i`'s is `[i]`, and the first and last joints' are no bend.
+    pub fn bends(self, bones: [mat4; JOINTS]) -> [Bend; JOINTS] {
+        let rest = self.rest()
+        let len = rest.length()
+        var out = [Bend { at: 0.0, angle: 0.0, toward: 0.0, after: 0.0, reached: 0.0 }; JOINTS]
+        for i in 1..self.count - 1 {
+            let j = self.joints[i]
+            let ahead = unit(self.joints[i + 1] - j)
+            let at = rest.place(j).along
+            let fr = rest.frame(at)
+            // The way the bone after points, as the bone before sees it: both bones' turns
+            // taken off, so it's a way in the body at rest. It leans toward the bend's inside.
+            let seen = seen_from(bones[i - 1], turned_by(bones[i], ahead))
+            let angle = acos(clamp(dot(seen, ahead), -1.0, 1.0))
+            let lean = seen - ahead * dot(seen, ahead)
+            // And the way the bone before points, as the bone after sees it: it leans away
+            // from the bend's inside, as the bone after has it (which has turned about its own
+            // length too).
+            let back = seen_from(bones[i], turned_by(bones[i - 1], ahead))
+            let away = back - ahead * dot(back, ahead)
+            let bent = length(lean) > 0.000001 && length(away) > 0.000001
+            let toward = if bent { atan2(dot(lean, fr.left), dot(lean, fr.up)) } else { 0.0 }
+            let after = if bent { atan2(-dot(away, fr.left), -dot(away, fr.up)) } else { 0.0 }
+            // Where the bone after's own turn is reached: `spread` of the way along it, from
+            // past the joint's rounding.
+            let last = self.count - 1
+            let from = j + ahead * self.rounded(i)
+            let to = if i + 1 == last { self.joints[last] } else {
+                self.joints[i + 1] - ahead * self.rounded(i + 1)
+            }
+            let reached = rest.place(mix(from, to, clamp(self.spread[i], 0.05, 1.0))).along
+            out[i] = Bend { at: at / len, angle, toward, after, reached: reached / len }
+        }
+        out
+    }
+
+    /// `posed`, with the chain's bones given as they are (`B` of them, one fewer than its
+    /// joints).
+    pub fn posed_by<const B: u32>(self, root: mat4, bones: [mat4; B]) -> Path {
+        assert(B + 1 == self.count, "a chain has a bone fewer than its joints")
+        var all = [root; JOINTS]
+        for i in 0..B {
+            all[i] = bones[i]
+        }
+        self.posed(root, all)
+    }
+}
+
+/// Direction `d` (in the world) as the body at rest has it, by the bone whose matrix is `m`:
+/// the bone's turn taken off.
+fn seen_from(m: mat4, d: vec3) -> vec3 {
+    unit(vec3(dot(d, m[0].xyz), dot(d, m[1].xyz), dot(d, m[2].xyz)))
+}
+
+/// How a joint between two bones of a chain is bent in a pose: where the joint is on the
+/// chain's chart (`at`, of the way along its path); by how much the bone after it leans from
+/// the bone before's line (`angle`, radians; 0 straight); and toward which angle of the chart
+/// the inside of the bend is (its outside is half a turn on): `toward` as the bone before has
+/// it, up to the joint, and `after` as the bone after has it, from where that bone's own turn
+/// about its length is reached (`reached`, of the way along the path) on. Between, the chart
+/// turns from one to the other (`lean_at`).
+pub struct Bend: Copy {
+    pub at: f32,
+    pub angle: f32,
+    pub toward: f32,
+    pub after: f32,
+    pub reached: f32,
+}
+
+impl Bend {
+    /// The angle of the chart the inside of the bend is at, `f` of the way along the path.
+    pub fn lean_at(self, f: f32) -> f32 {
+        let x = saturate((f - self.at) / max(self.reached - self.at, 0.000001))
+        self.toward + wrapped(self.after - self.toward) * x
+    }
+}
+
+/// How a form changes where a joint of its chain bends: what flesh does there, which a form
+/// made again along its posed path lacks (the outside of an elbow comes to a point, the cap of
+/// a shoulder thins as the arm comes down). Two forms written for a bend toward angle 0:
+/// `by_angle` is added times the bend's angle (radians), `by_square` times its square, each
+/// turned to where the bend leans (`Radial::bent`). A bend past `upto` (radians) changes the
+/// form as one of `upto` does: a change solved over poses holds at the deepest bend among them,
+/// since its square would carry it on past anything it was solved against.
+pub struct Change<const A: u32, const R: u32>: Copy {
+    pub by_angle: Radial<A, R>,
+    pub by_square: Radial<A, R>,
+    pub upto: f32 = 3.2,
+}
+
+impl<const A: u32, const R: u32> Change<A, R> {
+    /// Its mirror image: a right limb's joint's change from its left's.
+    pub fn mirrored(self) -> Change<A, R> {
+        Change {
+            by_angle: self.by_angle.mirrored(),
+            by_square: self.by_square.mirrored(),
+            upto: self.upto,
+        }
+    }
+
+    /// It with `other` added: a named change (a muscle's) over a solved one. The two hold at
+    /// the lesser of their deepest bends.
+    pub fn plus(self, other: Change<A, R>) -> Change<A, R> {
+        Change {
+            by_angle: self.by_angle.plus(other.by_angle),
+            by_square: self.by_square.plus(other.by_square),
+            upto: min(self.upto, other.upto),
+        }
+    }
+}
+
+/// An angle brought into −π to π.
+pub fn wrapped(a: f32) -> f32 {
+    a - TAU * floor(a / TAU + 0.5)
+}

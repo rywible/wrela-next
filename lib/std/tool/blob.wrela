@@ -1,0 +1,165 @@
+// Blobs: bytes the tool host holds for a tool, for data larger than one request carries
+// (language.md §15.5). A `Blob` is a handle; the tool moves bytes in and out in chunks of at most
+// 512 KiB (`append`, `read`), and files are read into blobs and written from them
+// (`files::read_blob`, `files::write_blob`). A tool holds at most 2 GiB of blobs in at most 4096
+// handles unless `wrela tool --blob-budget` says otherwise: past that, a request fails, as any
+// failed request does. `release` gives a blob back, and every blob is released when the tool ends.
+
+use std::serialize::{Reader, Writer}
+use std::tool::{Answer, Call, Done, MOST_BYTES, ToolError, ask, malformed}
+
+/// A blob the host holds: its handle, from a `new` or `files::read_blob` answer.
+pub struct Blob: Copy + Eq {
+    id: u32,
+}
+
+impl Blob {
+    /// Its handle's number, as the host names it.
+    pub fn id(self) -> u32 {
+        self.id
+    }
+}
+
+fn blob_body(blob: Blob) -> Writer {
+    var w = Writer::new()
+    w.write_u32(blob.id)
+    w
+}
+
+/// Bytes a request carries or an answer gives: in the request or the answer itself, if at most
+/// 512 KiB, or as a blob the host holds (an HTTP body, a program's input or output).
+pub enum Data: Clone {
+    Bytes(Vec<u8>),
+    Blob(Blob),
+}
+
+impl Data {
+    /// No bytes.
+    pub fn empty() -> Data {
+        Data::Bytes(Vec::new())
+    }
+}
+
+/// Writes `data` as the host reads it: 0, a count and the bytes; or 1 and the blob's handle.
+/// More than 512 KiB of bytes panics: put them in a blob.
+pub(package) fn write_data(w: mut Writer, data: Data) {
+    match data {
+        Data::Bytes(b) => {
+            if b.len() > MOST_BYTES {
+                panic("more than 512 KiB of bytes in one request: put them in a blob")
+            }
+            w.write_u8(0)
+            w.write_counted(b)
+        },
+        Data::Blob(blob) => {
+            w.write_u8(1)
+            w.write_u32(blob.id)
+        },
+    }
+}
+
+/// Reads data as the host writes it (`write_data`'s layout), or `None` if it doesn't read as
+/// that.
+pub(package) fn read_data(r: mut Reader) -> Option<Data> {
+    match r.read_u8() {
+        Ok(0) => {
+            let Ok(bytes) = r.read_counted() else { return None }
+            Some(Data::Bytes(bytes))
+        },
+        Ok(1) => {
+            let Ok(id) = r.read_u32() else { return None }
+            Some(Data::Blob(Blob { id }))
+        },
+        _ => None,
+    }
+}
+
+/// A new, empty blob.
+@tool
+pub fn new() -> Call<Blob> {
+    ask("blob/new", [u8(0); 0])
+}
+
+/// Adds `bytes` to the end of `blob`. At most 512 KiB at once; more panics.
+@tool
+pub fn append(blob: Blob, bytes: [u8]) -> Call<Done> {
+    if bytes.len() > MOST_BYTES {
+        panic("blob::append: more than 512 KiB at once")
+    }
+    var w = blob_body(blob)
+    w.write_bytes(bytes)
+    ask("blob/append", take w.into_bytes())
+}
+
+/// Up to `len` of `blob`'s bytes from byte `offset`: fewer at its end. `len` is at most 512 KiB;
+/// more panics. An offset past the end fails the request.
+@tool
+pub fn read(blob: Blob, offset: u64, len: u32) -> Call<Vec<u8>> {
+    if len > MOST_BYTES {
+        panic("blob::read: more than 512 KiB at once")
+    }
+    var w = blob_body(blob)
+    w.write_u64(offset)
+    w.write_u32(len)
+    ask("blob/read", take w.into_bytes())
+}
+
+/// How many bytes `blob` holds.
+@tool
+pub fn len(blob: Blob) -> Call<u64> {
+    ask("blob/len", blob_body(blob).into_bytes())
+}
+
+/// Gives `blob` back to the host, which frees its bytes: the handle names nothing after this.
+@tool
+pub fn release(blob: Blob) -> Call<Done> {
+    ask("blob/release", blob_body(blob).into_bytes())
+}
+
+/// A `new` or `files::read_blob` answer: the blob's handle, a `u32`.
+impl Answer for Blob {
+    fn read(bytes: take Vec<u8>) -> Result<Blob, ToolError> {
+        var r = Reader::new(take bytes)
+        let Ok(id) = r.read_u32() else { return Err(malformed("a blob")) }
+        if !r.at_end() {
+            return Err(malformed("a blob"))
+        }
+        Ok(Blob { id })
+    }
+}
+
+/// Bytes or a blob, alone in an answer (`write_data`'s layout): an encoded image's, a buffer's.
+impl Answer for Data {
+    fn read(bytes: take Vec<u8>) -> Result<Data, ToolError> {
+        var r = Reader::new(take bytes)
+        let Some(data) = read_data(mut r) else { return Err(malformed("bytes or a blob")) }
+        if !r.at_end() {
+            return Err(malformed("bytes or a blob"))
+        }
+        Ok(data)
+    }
+}
+
+@test
+fn data_reads_back_as_written() {
+    var w = Writer::new()
+    write_data(mut w, Data::Bytes(Vec::from([u8(7), 8])))
+    write_data(mut w, Data::Blob(Blob { id: 5 }))
+    var r = Reader::new(take w.into_bytes())
+    let Some(Data::Bytes(b)) = read_data(mut r) else { panic("bytes") }
+    assert(b.len() == 2 && b[1] == 8)
+    let Some(Data::Blob(blob)) = read_data(mut r) else { panic("a blob") }
+    assert(blob.id() == 5 && r.at_end())
+    var short = Reader::new(Vec::from([u8(0), 9, 0, 0, 0, 1]))
+    assert(read_data(mut short).is_none(), "fewer bytes than its count")
+}
+
+@test
+fn a_handle_and_data_read_back() {
+    let Ok(b) = Blob::read(Vec::from([u8(3), 0, 0, 0])) else { panic("a handle") }
+    assert(b.id() == 3)
+    assert(Blob::read(Vec::from([u8(3), 0])).is_err(), "a short handle")
+    let Ok(Data::Blob(d)) = Data::read(Vec::from([u8(1), 4, 0, 0, 0])) else { panic("data") }
+    assert(d.id() == 4)
+    assert(Data::read(Vec::from([u8(1), 4, 0, 0, 0, 9])).is_err(), "bytes left over")
+}

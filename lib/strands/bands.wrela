@@ -1,0 +1,193 @@
+// The far hand-over held to a number: a picture's mean colour by distance from the eye, over
+// the ground the copies stand thick on. Where copies give way to their host's look a line on the
+// ground would show as a step in it. A picture (the last pass's, linear) and its depth are read a
+// pixel an invocation; each pixel the eye sees ground under thick cover (the scatter's `cover`
+// in `thick`, from x to below y) at its place adds its colour to its band of `BAND` m. Summed over frames, read
+// back once, and said beside the same of a reference.
+
+use form::kinds::Strand
+use form::kinds::Paint
+use frame::eye::Eye
+use frame::judge::Judge
+use frame::picture::Frame
+use scatter::Scatter
+use std::gpu::{
+    Atomics, DepthTexture, GlobalId, GpuBuffer, Rgba16Float, Texture, buffer_of, dispatch, read,
+}
+use std::io::{Pending, print}
+
+/// How many bands, and how deep each is (m).
+pub const BANDS: u32 = 120
+pub const BAND: f32 = 1.0
+
+/// Pixel `id`'s colour added to its band (counts: pixels, then red, green, blue in 1/1024s).
+@compute(8, 8)
+pub fn banded<S: Strand, C: Scatter<S>>(
+    eye: Eye,
+    scatter: C,
+    thick: vec2,
+    picture: Texture<Rgba16Float>,
+    depth: DepthTexture,
+    out: mut Atomics<u32>,
+    id: GlobalId,
+) {
+    if id.x >= picture.width() || id.y >= picture.height() {
+        return
+    }
+    let z = depth.load(id.x, id.y)
+    if z <= 0.0 {
+        return
+    }
+    let p = eye.place(vec2(f32(id.x) + 0.5, f32(id.y) + 0.5), z)
+    let c0 = scatter.cover(p.xz)
+    if c0 < thick.x || c0 >= thick.y {
+        return
+    }
+    let far = length(p - eye.at)
+    let band = u32(far / BAND)
+    if band >= BANDS {
+        return
+    }
+    let c = saturate(picture.load(id.x, id.y).xyz)
+    let at = band * 4
+    let _ = out.add(i: at, value: 1)
+    let _ = out.add(i: at + 1, value: u32(c.x * 1024.0 + 0.5))
+    let _ = out.add(i: at + 2, value: u32(c.y * 1024.0 + 0.5))
+    let _ = out.add(i: at + 3, value: u32(c.z * 1024.0 + 0.5))
+}
+
+/// Bands summed over frames, under a name, and their read back.
+pub struct Bands {
+    sums: GpuBuffer<u32>,
+    heard: Option<Pending<u32>>,
+    name: String,
+}
+
+pub fn bands(name: str) -> Bands {
+    Bands { sums: buffer_of(Vec::filled(BANDS * 4, 0)), heard: None, name: f"{name}" }
+}
+
+impl Bands {
+    /// `picture` (with `depth`, seen by `eye`) added to the bands.
+    pub fn add<S: Strand, C: Scatter<S>>(
+        mut self,
+        eye: Eye,
+        scatter: C,
+        thick: vec2,
+        picture: Texture<Rgba16Float>,
+        depth: DepthTexture,
+    ) {
+        let w = picture.width()
+        let h = picture.height()
+        dispatch(
+            banded.bind(
+                eye,
+                scatter: scatter,
+                thick: thick,
+                picture: picture,
+                depth: depth,
+                out: mut self.sums,
+            ),
+            groups: ((w + 7) / 8, (h + 7) / 8, 1),
+        )
+    }
+
+    /// The sums asked for.
+    pub fn ask(mut self) {
+        self.heard = Some(read(self.sums.items()))
+    }
+
+    /// The bands said, once read back: each band's pixels and mean colour (linear, of 255).
+    pub fn said(mut self) {
+        match mut self.heard {
+            Some(p) => match p.poll() {
+                Some(Ok(v)) => {
+                    for b in 0..BANDS {
+                        let n = max(f32(v[b * 4]), 1.0)
+                        let k = 255.0 / 1024.0 / n
+                        print(
+                            f"bands: {self.name} {f32(b) * BAND} m: {v[b * 4]} px, mean {f32(v[b * 4 + 1]) * k} {f32(v[b * 4 + 2]) * k} {f32(v[b * 4 + 3]) * k}",
+                        )
+                    }
+                    self.heard = None
+                },
+                _ => {},
+            },
+            None => {},
+        }
+    }
+}
+
+/// The hand-over measured over `frames` frames: the picture's bands (`near`) and its
+/// reference's (`far`), and the picture each frame ends into.
+pub struct Fold {
+    pub frames: u32,
+    near: Bands,
+    far: Bands,
+    shown: Texture<Rgba16Float>,
+    done: u32,
+}
+
+pub fn fold(frames: u32) -> Fold {
+    Fold {
+        frames,
+        near: bands("picture"),
+        far: bands("reference"),
+        shown: std::gpu::texture(width: 1, height: 1),
+        done: 0,
+    }
+}
+
+impl Fold {
+    /// Whether frames are still to be measured.
+    pub fn measuring(self) -> bool {
+        self.done < self.frames
+    }
+
+    /// A reference's look (`judge`'s look targets, drawn with `eye`) added to its bands.
+    pub fn looked<S: Strand, C: Scatter<S>>(
+        mut self,
+        judge: Judge,
+        eye: Eye,
+        scatter: C,
+        thick: vec2,
+    ) {
+        self.far.add(eye, scatter, thick, judge.look_colour, judge.look_depth)
+    }
+
+    /// `frame` ended into the picture with `sky` where nothing is, added to its bands, and
+    /// shown; after the last frame, the bands asked for, and said when read back.
+    pub fn end<S: Strand, C: Scatter<S>, P: Paint>(
+        mut self,
+        frame: mut Frame,
+        sky: P,
+        scatter: C,
+        thick: vec2,
+    ) {
+        let w = u32(frame.eye.size.x)
+        let h = u32(frame.eye.size.y)
+        if self.shown.width() != w || self.shown.height() != h {
+            self.shown = std::gpu::texture(width: w, height: h)
+        }
+        frame.end_into(sky, mut self.shown)
+        if self.done < self.frames {
+            self.near.add(frame.eye, scatter, thick, self.shown, frame.depth)
+            self.done += 1
+            if self.done == self.frames {
+                self.near.ask()
+                self.far.ask()
+            }
+        }
+        self.near.said()
+        self.far.said()
+        std::gpu::label("shown")
+        let screen = std::gpu::begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
+        std::gpu::draw(
+            screen,
+            frame::last::cover,
+            frame::judge::shown.bind(picture: self.shown, style: frame.ink),
+            vertices: 3,
+        )
+        screen.present()
+    }
+}

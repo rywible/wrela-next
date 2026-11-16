@@ -1,0 +1,463 @@
+// The mesh cook held to the solid itself, on the CPU.
+
+use cook::KEPT_PIXELS
+use form::kinds::Solid
+use std::derive::{gradient, value_and_gradient}
+use std::field::{Bound, Surface, ellipsoid, fbm, half_space, round_cone, sphere}
+use std::io::print
+use solids::SEEN_PIXEL
+use mesh::{MESH_PIXELS, MeshSet, MeshVertex, meshed, meshed_in}
+use std::collections::sort_by
+use std::field::cuboid
+
+/// The probe's blob: a body, a neck and a head, smoothly joined.
+fn blob() -> Surface {
+    let body = ellipsoid(vec3(0.62, 0.42, 0.42))
+    let neck = round_cone(vec3(0.35, 0.15, 0.0), vec3(0.75, 0.62, 0.0), r_top: 0.16, r_bottom: 0.1)
+    let head = sphere(radius: 0.2).translate(vec3(0.82, 0.72, 0.0))
+    body.smooth_union(neck, k: 0.12).smooth_union(head, k: 0.08)
+}
+
+/// The probe's rock: an oval cut by five planes, weathered by a noise.
+fn rock() -> Surface {
+    ellipsoid(vec3(0.55, 0.4, 0.45))
+        .intersect(half_space(vec3(0.3, 1.0, 0.1), 0.3))
+        .intersect(half_space(vec3(1.0, 0.2, -0.3), 0.42))
+        .intersect(half_space(vec3(-0.8, 0.3, 0.6), 0.36))
+        .intersect(half_space(vec3(0.1, -0.2, -1.0), 0.33))
+        .intersect(half_space(vec3(-0.2, 0.5, 1.0), 0.38))
+        .displace(fbm(freq: 5.0, octaves: 3, offset: vec3(1.0, 4.0, 2.0)), amp: 0.012)
+}
+
+// ---- the mesh cook (mesh.wrela) ---------------------------------------------------------------
+
+/// Whether `m` is closed: every edge two triangles', counted by their vertices' places. Says
+/// the first edge that isn't, and how many triangles it has.
+fn closed(m: MeshSet) -> bool {
+    var edges: Vec<u64> = Vec::with_capacity(m.triangles.len())
+    for t in 0..m.triangles.len() / 3 {
+        for k in 0..3 {
+            let a = m.vertices[m.triangles[3 * t + k]].place
+            let b = m.vertices[m.triangles[3 * t + (k + 1) % 3]].place
+            edges.push((u64(min(a, b)) << 32) | u64(max(a, b)))
+        }
+    }
+    sort_by(mut edges, |x: u64, y: u64| x < y)
+    var i: u32 = 0
+    while i < edges.len() {
+        var j = i + 1
+        while j < edges.len() && edges[j] == edges[i] {
+            j += 1
+        }
+        if j - i != 2 {
+            print(f"edge {edges[i] >> 32}-{edges[i] & 4294967295}: {j - i} triangles")
+            return false
+        }
+        i = j
+    }
+    true
+}
+
+/// Every vertex of `m` within `tol` of `s`'s surface as the cook reads it (filtered as wide as
+/// its set's pixels see it, `KEPT_PIXELS` of them), its normal within `cos` of the gradient's
+/// direction there unless it's a crease's (one of two at its place), and every number a number:
+/// how many of its vertices are a crease's.
+fn checked_mesh<S: Solid>(s: S, m: MeshSet, tol: f32, cos: f32) -> u32 {
+    let foot = KEPT_PIXELS * SEEN_PIXEL * m.at
+    var creased: u32 = 0
+    for i in 0..m.vertices.len() {
+        let v = m.vertices[i]
+        assert(v.at == v.at && v.normal == v.normal, f"vertex {i} isn't numbers")
+        let (d, g) = value_and_gradient(|q: vec3| s.filtered(q, foot), v.at)
+        assert(abs(d) <= tol * max(length(g), 1.0e-6), f"vertex {i} at {v.at} is {d} off the surface")
+        let twin = (i + 1 < m.vertices.len() && m.vertices[i + 1].place == v.place) || v.place != i
+        if twin {
+            creased += 1
+        } else {
+            assert(dot(v.normal, normalize(g)) >= cos, f"vertex {i}'s normal {v.normal} isn't the gradient's {normalize(g)}")
+        }
+    }
+    creased
+}
+
+@test
+@fuel(2 ** 40)
+fn a_spheres_mesh_is_closed_on_its_surface_and_has_no_crease() {
+    let s = sphere(radius: 0.5)
+    let m = meshed(s, 10.0, MESH_PIXELS * SEEN_PIXEL * 10.0)
+    print(f"sphere: {m.vertices.len()} vertices, {m.triangles.len() / 3} triangles, cell {m.cell} m")
+    assert(m.triangles.len() > 300, "a sphere's mesh has triangles")
+    assert(closed(m), "the sphere's mesh is closed")
+    let tol = 0.25 * SEEN_PIXEL * 10.0
+    assert(checked_mesh(s, m, tol, 0.999) == 0, "a sphere has no crease")
+}
+
+@test
+@fuel(2 ** 40)
+fn a_cubes_mesh_keeps_its_edges_as_creases() {
+    // Off the lattice's planes, so its faces cross the cells.
+    let s = cuboid(half: vec3(0.4, 0.3, 0.35)).translate(vec3(0.013, 0.021, 0.007))
+    let m = meshed(s, 10.0, MESH_PIXELS * SEEN_PIXEL * 10.0)
+    print(f"cube: {m.vertices.len()} vertices, {m.triangles.len() / 3} triangles")
+    assert(closed(m), "the cube's mesh is closed")
+    let tol = 0.25 * SEEN_PIXEL * 10.0
+    let creased = checked_mesh(s, m, tol, 0.999)
+    print(f"cube: {creased} crease vertices")
+    // Its 12 edges, 0.6 to 0.8 m long, a crease vertex (two copies) every cell along each.
+    assert(creased > 200, "a cube's edges are creases")
+    // Each crease vertex on an edge of the cube: two of its coordinates at a face.
+    let c = vec3(0.013, 0.021, 0.007)
+    for i in 0..m.vertices.len() {
+        let v = m.vertices[i]
+        if v.place == i && !(i + 1 < m.vertices.len() && m.vertices[i + 1].place == i) {
+            continue
+        }
+        let q = abs(v.at - c) - vec3(0.4, 0.3, 0.35)
+        let on = (if abs(q.x) < tol { 1 } else { 0 }) + (if abs(q.y) < tol { 1 } else { 0 }) + (if abs(q.z) < tol { 1 } else { 0 })
+        assert(on >= 2, f"crease vertex {v.at} isn't on an edge of the cube")
+    }
+}
+
+@test
+@fuel(2 ** 44)
+fn the_rocks_mesh_is_closed() {
+    let s = rock()
+    for at in [3.0, 12.0] {
+        let m = meshed(s, at, MESH_PIXELS * SEEN_PIXEL * at)
+        print(f"rock at {at} m: {m.vertices.len()} vertices, {m.triangles.len() / 3} triangles")
+        assert(closed(m), "the rock's mesh is closed")
+        let _ = checked_mesh(s, m, 0.25 * SEEN_PIXEL * at, 0.9)
+    }
+}
+
+@test
+@fuel(2 ** 44)
+fn a_mesh_is_the_same_cooked_in_bricks() {
+    // The rock 3 m off is 2^7 cells across: in bricks of 2^5 (64 of them) and of 2^7 (one).
+    let s = rock()
+    let at = 3.0
+    let whole = meshed_in(s, at, MESH_PIXELS * SEEN_PIXEL * at, 7)
+    let bricked = meshed_in(s, at, MESH_PIXELS * SEEN_PIXEL * at, 5)
+    print(f"rock at {at} m: {whole.vertices.len()} vertices, {whole.triangles.len() / 3} triangles whole; {bricked.vertices.len()}, {bricked.triangles.len() / 3} in bricks")
+    assert(closed(bricked), "the rock's mesh cooked in bricks is closed")
+    assert(bricked.vertices.len() == whole.vertices.len(), "the bricks make the same vertices")
+    assert(bricked.triangles.len() == whole.triangles.len(), "the bricks make the same triangles")
+    for i in 0..whole.vertices.len() {
+        assert(bricked.vertices[i].at == whole.vertices[i].at, f"vertex {i} is the same in bricks")
+    }
+}
+
+/// `K d` for a vertex's turn (`K`'s diagonal `turn`, the rest `twist`: xy, xz, yz).
+fn turned(v: MeshVertex, d: vec3) -> vec3 {
+    let a = v.turn
+    let b = v.twist
+    vec3(a.x * d.x + b.x * d.y + b.y * d.z, b.x * d.x + a.y * d.y + b.z * d.z, b.y * d.x + b.z * d.y + a.z * d.z)
+}
+
+/// Whether vertex `i` of `m` is a crease's (one of two at its place).
+fn creased_at(m: MeshSet, i: u32) -> bool {
+    m.vertices[i].place != i || (i + 1 < m.vertices.len() && m.vertices[i + 1].place == i)
+}
+
+/// Over `m`'s edges between vertices off a crease: the root mean square of the cooked normals'
+/// change along an edge, and of what's left of it once each end's turn (`K`, halved each) is
+/// taken off.
+fn turn_residual(m: MeshSet) -> vec2 {
+    var change = 0.0
+    var left = 0.0
+    for t in 0..m.triangles.len() / 3 {
+        for k in 0..3 {
+            let i = m.triangles[3 * t + k]
+            let j = m.triangles[3 * t + (k + 1) % 3]
+            if creased_at(m, i) || creased_at(m, j) {
+                continue
+            }
+            let a = m.vertices[i]
+            let b = m.vertices[j]
+            let dn = b.normal - a.normal
+            let d = b.at - a.at
+            let e = dn - 0.5 * (turned(a, d) + turned(b, d))
+            change += dot(dn, dn)
+            left += dot(e, e)
+        }
+    }
+    vec2(sqrt(change), sqrt(left))
+}
+
+@test
+@fuel(2 ** 42)
+fn a_spheres_vertices_turn_as_one_over_its_radius() {
+    let r = 0.5
+    let s = sphere(radius: r)
+    let m = meshed(s, 10.0, MESH_PIXELS * SEEN_PIXEL * 10.0)
+    var worst = 0.0
+    for i in 0..m.vertices.len() {
+        let v = m.vertices[i]
+        let n = v.normal
+        // (I - n n^T) / r, entry by entry.
+        let want_d = (vec3(1.0) - n * n) / r
+        let want_o = -vec3(n.x * n.y, n.x * n.z, n.y * n.z) / r
+        let off = max(length(v.turn - want_d), length(v.twist - want_o)) * r
+        worst = max(worst, off)
+    }
+    let res = turn_residual(m)
+    print(f"sphere: K off I/r by {worst} (times r) at worst; normals' change along edges {res.x}, left once K is taken off {res.y}")
+    assert(worst < 0.05, "a sphere's K is (I - n n^T) / r")
+    assert(res.y < 0.1 * res.x, "K carries a sphere's normals from vertex to vertex")
+}
+
+@test
+@fuel(2 ** 42)
+fn a_boxs_faces_do_not_turn() {
+    let c = vec3(0.013, 0.021, 0.007)
+    let half = vec3(0.4, 0.3, 0.35)
+    let s = cuboid(half).translate(c)
+    let m = meshed(s, 10.0, MESH_PIXELS * SEEN_PIXEL * 10.0)
+    let foot = KEPT_PIXELS * SEEN_PIXEL * 10.0
+    var worst = 0.0
+    var seen: u32 = 0
+    for i in 0..m.vertices.len() {
+        let v = m.vertices[i]
+        // Off the edges by more than twice the cook's footprint: on one face alone.
+        let q = abs(v.at - c) - half
+        let near = (if abs(q.x) < 2.0 * foot { 1 } else { 0 }) + (if abs(q.y) < 2.0 * foot { 1 } else { 0 }) + (if abs(q.z) < 2.0 * foot { 1 } else { 0 })
+        if near >= 2 || creased_at(m, i) {
+            continue
+        }
+        seen += 1
+        worst = max(worst, max(length(v.turn), length(v.twist)))
+    }
+    print(f"box: {seen} vertices on its faces, K at most {worst}")
+    assert(seen > 100, "the box has vertices on its faces")
+    assert(worst < 1.0e-3, "a box's faces don't turn")
+}
+
+@test
+@fuel(2 ** 44)
+fn the_blobs_vertices_turn_as_its_normals_do() {
+    let s = blob()
+    let at = 3.0
+    let m = meshed(s, at, MESH_PIXELS * SEEN_PIXEL * at)
+    let res = turn_residual(m)
+    print(f"blob at {at} m: {m.vertices.len()} vertices; normals' change along edges {res.x}, left once K is taken off {res.y}")
+    assert(res.y < 0.2 * res.x, "K carries the blob's normals from vertex to vertex")
+}
+
+@test
+@fuel(2 ** 44)
+fn a_mesh_seen_only_from_far_off_is_coarser_and_closed() {
+    // The rock's set for 3 m, but the eye stays 40 m off: its blocks are cooked for there.
+    let s = rock()
+    let at = 3.0
+    let near = meshed(s, at, MESH_PIXELS * SEEN_PIXEL * at)
+    let far = meshed(s, at, MESH_PIXELS * SEEN_PIXEL * at, seen_from: vec4(0.0, 0.0, -40.0, 1.0))
+    print(f"rock at {at} m: {near.vertices.len()} vertices, {near.triangles.len() / 3} triangles; seen only from 40 m off, {far.vertices.len()}, {far.triangles.len() / 3}")
+    assert(closed(far), "the rock's mesh cooked for far off is closed")
+    assert(2 * far.vertices.len() < near.vertices.len(), "seen only from far off, it's coarser")
+}
+
+/// Over `m`'s edges whose two triangles turn from each other past the lister's crease line
+/// (`1 - na . nb` over 0.30, `meshes::TURNED`): the farthest either end is from the curve
+/// `off` measures (m), and how many such edges.
+fn creased_ends_off(m: MeshSet, off: fn(vec3) -> f32) -> vec2 {
+    var edges: Vec<vec3u> = Vec::with_capacity(m.triangles.len())
+    let nt = m.triangles.len() / 3
+    for t in 0..nt {
+        for k in 0..3 {
+            let a = m.vertices[m.triangles[3 * t + k]].place
+            let b = m.vertices[m.triangles[3 * t + (k + 1) % 3]].place
+            edges.push(vec3u(min(a, b), max(a, b), t))
+        }
+    }
+    sort_by(mut edges, |x: vec3u, y: vec3u| x.x < y.x || x.x == y.x && x.y < y.y)
+    var worst = 0.0
+    var count = 0.0
+    var i: u32 = 0
+    while i + 1 < edges.len() {
+        let e = edges[i]
+        let f = edges[i + 1]
+        if e.x == f.x && e.y == f.y {
+            let na = facing_of(m, e.z)
+            let nb = facing_of(m, f.z)
+            if 1.0 - dot(na, nb) > 0.30 {
+                count += 1.0
+                worst = max(worst, max(off(m.vertices[e.x].at), off(m.vertices[e.y].at)))
+            }
+            i += 2
+        } else {
+            i += 1
+        }
+    }
+    vec2(worst, count)
+}
+
+/// Triangle `t`'s own facing.
+fn facing_of(m: MeshSet, t: u32) -> vec3 {
+    let a = m.vertices[m.triangles[3 * t]].at
+    let b = m.vertices[m.triangles[3 * t + 1]].at
+    let c = m.vertices[m.triangles[3 * t + 2]].at
+    normalize(cross(b - a, c - a))
+}
+
+@test
+@fuel(2 ** 42)
+fn a_lens_crease_vertices_sit_on_its_cut() {
+    // Two balls' common part, 0.5 m each: its crease is the circle x = 0 round the x axis, where
+    // the faces meet at twice `asin(c / 0.5)`: 74 degrees with their middles 0.3 m off it, 40
+    // with 0.171 m (more crossings on one face than the other, where a fit once dropped one).
+    for c in [0.3, 0.171] {
+        let s = sphere(radius: 0.5).translate(vec3(-c, 0.0, 0.0)).intersect(sphere(radius: 0.5).translate(vec3(c, 0.0, 0.0)))
+        let ring = sqrt(0.25 - c * c)
+        let at = 10.0
+        let m = meshed(s, at, MESH_PIXELS * SEEN_PIXEL * at)
+        let pixel = SEEN_PIXEL * at
+        let r = creased_ends_off(m, |p: vec3| length(vec2(p.x, length(vec2(p.y, p.z)) - ring)))
+        var copies: u32 = 0
+        var worst = 0.0
+        for i in 0..m.vertices.len() {
+            let v = m.vertices[i]
+            if v.place != i {
+                copies += 1
+                worst = max(worst, length(vec2(v.at.x, length(vec2(v.at.y, v.at.z)) - ring)))
+            }
+        }
+        print(f"lens {c}: {m.vertices.len()} vertices; {r.y} edges turned past the crease line, their ends at most {r.x / pixel} px off the cut; {copies} crease copies, at most {worst / pixel} px off it (a cell {m.cell / pixel} px)")
+        assert(closed(m), "the lens's mesh is closed")
+        assert(r.x < 0.5 * pixel && worst < 0.5 * pixel, "every crease's vertices are within half a pixel of the cut")
+    }
+}
+
+/// The probe's rock's six cuts at `p` (its oval and its five planes): the rock is their largest,
+/// plus its weathering.
+fn rock_cut(p: vec3, k: u32) -> f32 {
+    if k == 0 {
+        ellipsoid(vec3(0.55, 0.4, 0.45)).distance(p)
+    } else if k == 1 {
+        half_space(vec3(0.3, 1.0, 0.1), 0.3).distance(p)
+    } else if k == 2 {
+        half_space(vec3(1.0, 0.2, -0.3), 0.42).distance(p)
+    } else if k == 3 {
+        half_space(vec3(-0.8, 0.3, 0.6), 0.36).distance(p)
+    } else if k == 4 {
+        half_space(vec3(0.1, -0.2, -1.0), 0.33).distance(p)
+    } else {
+        half_space(vec3(-0.2, 0.5, 1.0), 0.38).distance(p)
+    }
+}
+
+/// How far `p` is from the rock's nearest crease (where its two largest cuts are equal), by
+/// their difference over their gradients' difference.
+fn off_rock_crease(p: vec3) -> f32 {
+    var a: u32 = 0
+    var b: u32 = 1
+    if rock_cut(p, 1) > rock_cut(p, 0) {
+        a = 1
+        b = 0
+    }
+    for k in 2..6 {
+        let v = rock_cut(p, k)
+        if v > rock_cut(p, a) {
+            b = a
+            a = k
+        } else if v > rock_cut(p, b) {
+            b = k
+        }
+    }
+    let ga = gradient(|q: vec3| rock_cut(q, a), p)
+    let gb = gradient(|q: vec3| rock_cut(q, b), p)
+    (rock_cut(p, a) - rock_cut(p, b)) / max(length(ga - gb), 1.0e-6)
+}
+
+@test
+@fuel(2 ** 44)
+fn the_rocks_crease_vertices_sit_on_its_creases() {
+    let s = rock()
+    let at = 1.1
+    let m = meshed(s, at, MESH_PIXELS * SEEN_PIXEL * at)
+    let pixel = SEEN_PIXEL * at
+    var n: u32 = 0
+    var worst = 0.0
+    var over_half: u32 = 0
+    var sum = 0.0
+    for i in 0..m.vertices.len() {
+        let v = m.vertices[i]
+        let twin = (i + 1 < m.vertices.len() && m.vertices[i + 1].place == i)
+        if !twin {
+            continue
+        }
+        let d = off_rock_crease(v.at) / pixel
+        n += 1
+        sum += d
+        worst = max(worst, d)
+        if d > 0.5 {
+            over_half += 1
+        }
+    }
+    var hist: [u32; 5] = [0; 5]
+    for i in 0..m.vertices.len() {
+        if i + 1 < m.vertices.len() && m.vertices[i + 1].place == i {
+            let d = off_rock_crease(m.vertices[i].at) / pixel
+            let k = if d < 0.25 { 0 } else if d < 0.5 { 1 } else if d < 1.0 { 2 } else if d < 2.0 { 3 } else { 4 }
+            hist[k] += 1
+        }
+    }
+    print(f"  off by under 0.25, 0.5, 1, 2 px and more: {hist[0]}, {hist[1]}, {hist[2]}, {hist[3]}, {hist[4]}")
+    print(f"rock at {at} m: {n} crease vertices, off its crease {sum / f32(max(n, 1))} px on average, {worst} at most, {over_half} over half a pixel (a cell {m.cell / pixel} px)")
+    // (The few left over half a pixel, at most 1.5, are by its corners, where a third face
+    // meets the two and the distance to the crease measured here is itself rough.)
+    assert(worst < 2.0, "none of the rock's crease vertices is 2 pixels off its creases")
+    assert(f32(hist[0]) >= 0.995 * f32(n), "the rock's crease vertices are within a quarter pixel of its creases")
+}
+
+/// How many of `m`'s triangles face into `s` (their normal against its gradient at their middle,
+/// read as the cook reads it), and how many of its vertices off a crease have normals more than
+/// `turn` (a cosine) from their triangles' (the mean of their normals, each by its area).
+fn faced(s: Solid, m: MeshSet, turn: f32) -> vec2u {
+    let foot = KEPT_PIXELS * SEEN_PIXEL * m.at
+    var around: Vec<vec3> = Vec::with_capacity(m.vertices.len())
+    for _i in 0..m.vertices.len() {
+        around.push(vec3(0.0))
+    }
+    var into: u32 = 0
+    for t in 0..m.triangles.len() / 3 {
+        let (i, j, k) = (m.triangles[3 * t], m.triangles[3 * t + 1], m.triangles[3 * t + 2])
+        let (a, b, c) = (m.vertices[i].at, m.vertices[j].at, m.vertices[k].at)
+        let n = cross(b - a, c - a)
+        around[i] += n
+        around[j] += n
+        around[k] += n
+        let g = gradient(|q: vec3| s.filtered(q, foot), (a + b + c) / 3.0)
+        if dot(n, g) < 0.0 {
+            into += 1
+        }
+    }
+    var far: u32 = 0
+    for i in 0..m.vertices.len() {
+        if !creased_at(m, i) && dot(around[i], around[i]) > 0.0 && dot(normalize(around[i]), m.vertices[i].normal) < turn {
+            far += 1
+        }
+    }
+    vec2u(into, far)
+}
+
+@test
+@fuel(2 ** 44)
+fn no_triangle_faces_into_its_solid() {
+    // Each set's triangles face out of the solid, and each vertex off a crease faces within 45
+    // degrees of its triangles: the rock, its sets for 1.1, 3 and 12 m, and the blob's for 3 m.
+    let rock = rock()
+    for at in [1.1, 3.0, 12.0] {
+        let m = meshed(rock, at, MESH_PIXELS * SEEN_PIXEL * at)
+        let f = faced(rock, m, 0.7071)
+        print(f"rock at {at} m: {m.triangles.len() / 3} triangles, {f.x} facing into it; {f.y} vertices off a crease over 45 degrees from their triangles")
+        // (What's left: triangles of merged blocks, and slivers at creases; see docs/rates.md.)
+        assert(f.x * 1000 < m.triangles.len() / 3, "under one in 1,000 of the rock's triangles faces into it")
+        assert(f.y * 250 < m.vertices.len(), "under one in 250 of its vertices turns past 45 degrees from its triangles")
+    }
+    let blob = blob()
+    let m = meshed(blob, 3.0, MESH_PIXELS * SEEN_PIXEL * 3.0)
+    let f = faced(blob, m, 0.7071)
+    print(f"blob at 3 m: {m.triangles.len() / 3} triangles, {f.x} facing into it; {f.y} vertices off a crease over 45 degrees")
+    assert(f.x == 0 && f.y == 0, "no triangle of the blob faces into it, and no vertex off a crease turns past 45 degrees")
+}
+

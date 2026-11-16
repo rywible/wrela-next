@@ -1,0 +1,112 @@
+// The certified jet (docs/design.md, "The mechanism"). One evaluation of a function at a point
+// gives its value v, its gradient g, and a proven limit on how far it can curve away from them,
+// each way, within a radius:
+//
+//     v + g.(q-p) - below/2 |q-p|^2  <=  f(q)  <=  v + g.(q-p) + above/2 |q-p|^2
+//
+// Along a ray that answers how far it is certainly clear of the solid (`ahead`) and where it is
+// certainly inside (`behind`). From wrela-notes/certificates/certs/cert.wrela.
+
+use kinds::Solid
+use std::field::Union
+
+/// No bound on that side.
+pub const NONE: f32 = 1.0e30
+/// Farther than any ray goes.
+pub const FAR: f32 = 1.0e9
+
+/// How far a solid can curve away from its tangent near a point: under it by at most `below`
+/// within `below_within` of the point, and over it by at most `above` within `above_within`.
+pub struct Bend: Copy + GpuData {
+    pub below: f32,
+    pub below_within: f32,
+    pub above: f32,
+    pub above_within: f32,
+}
+
+/// Nothing known on either side.
+pub const UNKNOWN: Bend = Bend { below: NONE, below_within: 0.0, above: NONE, above_within: 0.0 }
+
+/// A solid's value `v` and gradient `g` at a point, and how it bends there.
+pub struct Jet: Copy + GpuData {
+    pub g: vec3,
+    pub v: f32,
+    pub bend: Bend,
+}
+
+/// A solid that states how it bends. The value and gradient of its jet are derived from its
+/// distance; the bend is the form's own statement, and by default nothing is known.
+pub trait Bends: Solid {
+    /// How it bends near `p`.
+    fn bend(self, p: vec3) -> Bend {
+        UNKNOWN
+    }
+
+    /// How far the ray from `p` along `d` (a unit vector) certainly stays where it is over `off`.
+    fn clear(self, p: vec3, d: vec3, off: f32) -> f32 {
+        ahead(jet(self, p), d, off)
+    }
+}
+
+/// The jet of `s` at `p`: value and gradient by the language's derivation, and its stated bend.
+pub fn jet(s: Bends, p: vec3) -> Jet {
+    let (v, g) = s.sample(p)
+    Jet { g, v, bend: s.bend(p) }
+}
+
+/// How far the ray from a jet's own point along `d` (a unit vector) certainly stays where the
+/// value is more than `off`: to the edge of the ball its lower bound clears, or of the radius
+/// the bound holds within. 0 where the bound proves nothing.
+pub fn ahead(j: Jet, d: vec3, off: f32) -> f32 {
+    let f0 = j.v - off
+    let k = j.bend.below
+    if f0 <= 0.0 || k >= NONE {
+        return 0.0
+    }
+    let b = dot(j.g, d)
+    let t = if k == 0.0 {
+        if b >= 0.0 { FAR } else { f0 / -b }
+    } else {
+        (b + sqrt(b * b + 2.0 * k * f0)) / k
+    }
+    min(t, j.bend.below_within)
+}
+
+/// The stretch of the ray from a jet's own point along `d` where the value is certainly less
+/// than `off`: from x to y, with y less than x where the bound proves none.
+pub fn behind(j: Jet, d: vec3, off: f32) -> vec2 {
+    let f0 = j.v - off
+    let k = j.bend.above
+    if k >= NONE {
+        return vec2(FAR, 0.0)
+    }
+    let b = dot(j.g, d)
+    var from = 0.0
+    var to = FAR
+    if k == 0.0 {
+        if b < 0.0 {
+            from = max(f0 / -b, 0.0)
+        } else if f0 < 0.0 {
+            to = if b > 0.0 { -f0 / b } else { FAR }
+        } else {
+            return vec2(FAR, 0.0)
+        }
+    } else {
+        let disc = b * b - 2.0 * k * f0
+        if disc <= 0.0 {
+            return vec2(FAR, 0.0)
+        }
+        let s = sqrt(disc)
+        from = max((-b - s) / k, 0.0)
+        to = (-b + s) / k
+    }
+    vec2(from, min(to, j.bend.above_within))
+}
+
+/// The union rule: what is clear of a union is what is clear of both parts, so a ray's advance
+/// through it is the least of its parts', with no bound across the crease (its own `bend` is unknown).
+impl<A: Bends, B: Bends> Bends for Union<A, B> {
+    fn clear(self, p: vec3, d: vec3, off: f32) -> f32 {
+        min(self.a.clear(p, d, off), self.b.clear(p, d, off))
+    }
+}

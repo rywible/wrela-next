@@ -1,0 +1,865 @@
+// The solid lister, as a scene uses it: each solid is cooked when the game is built as a closed
+// mesh a set by distance (a constant, `mesh::bake_mesh`) and loaded once, and placed as many
+// times as it's drawn, each copy by its own matrix, which may change every frame; then each
+// frame every copy is laid out and drawn into the picture's one pass as ordinary triangles.
+//
+//     @fuel(2 ** 46)
+//     pub const ROCK: Baked = atoms::mesh::bake_mesh("rock", rock(), nearest: 3.0)  // at build
+//
+//     var solids = atoms::solids::solids()
+//     let rock = solids.load(ROCK)                                              // once
+//     let copy = solids.place(rock, Stone {}, at: translate(p), body: 3, group: 0)
+//     solids.move_to(copy, at: m)                                               // when it moves
+//     frame.begin(eye, light)
+//     solids.cast(mut frame)                                                    // each frame
+//     frame.draw(|d| { solids.draw_into(d) })
+
+use copies::{COPIES, Placing}
+use form::look::Look
+use frame::eye::{Eye, NEARER}
+use frame::picture::Frame
+use std::field::Bound
+use std::gpu::{GpuBuffer, buffer, buffer_of, dispatch, draw, label}
+use std::io::{Pending, print}
+use std::time::{now, since}
+use bake::{Baked, words_of}
+use frame::held::{GRID, IN_CELL, MOST_COPIES, MOST_HELD, MOST_MOVERS, ROWS, ROWS_HIGH, SIDE, ball_of}
+use held::{
+    Hold, SLICES, cells_of, fielded, gridded, hold_of_corners, rowed, rows_of, shared, shelved,
+    wedged,
+}
+use meshes::{AT_CORNERS, AT_PIXELS, BAKED, Corner, creased_vertex, is_mesh, mesh_pixel, plain_vertex, read_mesh}
+use mesh::WORN_BIT
+use frame::light::{AllLit, Lit, OneLit, Unlit, lit_by}
+use frame::picture::Drawing
+use std::gpu::Cull
+use std::gpu::{R32Float, Texture3d, texture3d}
+use std::transform::{determinant, inverse}
+
+/// The pixel every solid is cooked for: its width a metre off (m), on the finest screen this
+/// game is drawn on (3840 × 2160, 0.9 rad high). An eye with wider pixels draws each copy from
+/// sets as much farther as its pixels are wider.
+pub const SEEN_PIXEL: f32 = 2.0 * 0.48305507 / 2160.0
+
+/// The most sets a solid is cooked as, and how few pixels across its last is when it's far off:
+/// past that the last set is drawn at any distance.
+pub const MOST_SETS: u32 = 12
+pub const LAST_PIXELS: f32 = 16.0
+
+/// One set of a solid's meshes in the pool: its first triangle, how many have no crease and no
+/// corner its baked look marked fine (they come first), how many have no crease but such a corner
+/// (next), and how many have a crease, and the distance it was cooked for (m).
+pub struct Run: Copy {
+    pub first: u32,
+    pub plain: u32,
+    pub fine: u32,
+    pub creased: u32,
+    pub at: f32,
+}
+
+/// A solid in the pool: its sets of meshes (`runs`), the sphere it lies in (its own frame's), and
+/// whether its look was baked at the cook (`mesh::bake_mesh_worn`: every vertex wears it).
+pub struct Cooked: Clone {
+    pub runs: Vec<Run>,
+    pub bound: Bound,
+    pub baked: bool,
+}
+
+/// A copy drawn this frame: its set (`run`), which copy, and how its draw wears its look and
+/// faces (`way`: `meshes::BAKED`, `AT_CORNERS` or `AT_PIXELS`, times two, plus one where its
+/// outside reaches the target clockwise).
+struct Drawn: Copy {
+    run: Run,
+    copy: u32,
+    way: u32,
+}
+
+/// A copy: which solid, its matrix, and how it stands in the picture.
+pub struct Placed<L>: Copy {
+    pub solid: u32,
+    pub look: L,
+    pub at: mat4,
+    pub body: u32,
+    pub group: u32,
+}
+
+/// Whether a sphere (`centre`, `radius`) can show on `eye`'s screen: not wholly behind the eye
+/// nor wholly past any of the screen's four sides.
+fn in_view(eye: Eye, centre: vec3, radius: f32) -> bool {
+    let v = centre - eye.at
+    let wide = eye.size.x / eye.size.y
+    let f = eye.focal
+    dot(v, eye.forward) > -radius &&
+        dot(v, normalize(eye.right * f - eye.forward * wide)) < radius &&
+        dot(v, normalize(eye.right * (-f) - eye.forward * wide)) < radius &&
+        dot(v, normalize(eye.up * f - eye.forward)) < radius &&
+        dot(v, normalize(eye.up * (-f) - eye.forward)) < radius
+}
+
+/// The solid lister: the meshes' pool, the solids and their copies, and what they hold off the
+/// sky.
+pub struct Solids<L> {
+    solids: Vec<Cooked>,
+    fetching: Vec<Option<Pending<u8>>>,
+    placed: Vec<Placed<L>>,
+    worn: GpuBuffer<L>,
+    /// How many frames have been laid out (what's drawn is said at the third and every 600th).
+    frames: u32,
+    /// What holds the light off a point (`held`; lib/frame's `held`): the solids' volumes worked
+    /// out on the CPU and waiting (the first on its way to the GPU, a band a frame: `band`), the
+    /// scratch they're worked out in, which solids hold one, which copies have moved (the rest
+    /// are the fixed world, in the grid), and whether the grid is to be laid again.
+    holds: Vec<Hold>,
+    band: u32,
+    values: GpuBuffer<f32>,
+    field: Texture3d<R32Float>,
+    wedges: GpuBuffer<u32>,
+    held: Vec<bool>,
+    moved: Vec<bool>,
+    regrid: bool,
+    grid_words: GpuBuffer<u32>,
+    grid_rows: GpuBuffer<vec4>,
+    /// The meshes' pool (`meshes`): every set's corners, triangles (corners of the pool) and
+    /// creases, on the CPU as they arrive and on the GPU; and this frame's copies and the copies
+    /// each draw lists.
+    corners: Vec<Corner>,
+    triangles: Vec<u32>,
+    creases: Vec<u32>,
+    corners_gpu: GpuBuffer<Corner>,
+    triangles_gpu: GpuBuffer<u32>,
+    creases_gpu: GpuBuffer<u32>,
+    mesh_copies: GpuBuffer<Placing>,
+    mesh_listed: GpuBuffer<u32>,
+    /// This frame's draws: a run's first triangle and count, its first copy listed and how many;
+    /// how many of its triangles are creased; how its copies wear their look and face (`Drawn`).
+    mesh_runs: Vec<vec4u>,
+    mesh_creased: Vec<u32>,
+    mesh_ways: Vec<u32>,
+    /// Each run's first triangle and how many of its plain triangles are fine.
+    fines: Vec<vec2u>,
+    /// Each copy's share of the sky from the fixed world's other copies (the world's four wedges,
+    /// `held::shared`): worked out once when the grid is laid for the copies that never moved,
+    /// each frame for those that move; a vertex's sky is its own baked share times its copy's.
+    shares: GpuBuffer<vec4>,
+    /// Whether the solids hold the sky off what is round them (`cast`; on unless a scene
+    /// measures it off).
+    pub hold: bool,
+    /// Whether a solid's corner takes the sun's beam only as far as its own solid leaves its way
+    /// to the sun open (its cook's wedges toward the sun: `meshes::sun_past_own`, a crude shadow
+    /// of itself). Off unless a scene turns it on, for a solid seen from kilometres off: near
+    /// the eye it is wrong on far more pixels than no shadow of itself at all (docs/atoms.md).
+    pub sun_past_own: bool,
+}
+
+/// A lister with no solids.
+pub fn solids<L: Look>() -> Solids<L> {
+    Solids {
+        solids: Vec::new(),
+        fetching: Vec::new(),
+        placed: Vec::new(),
+        worn: buffer(1),
+        frames: 0,
+        holds: Vec::new(),
+        band: 0,
+        values: buffer(1),
+        field: texture3d::<R32Float>(width: SIDE, height: SIDE, depth: SIDE),
+        wedges: buffer(SIDE * SIDE * SIDE),
+        held: Vec::new(),
+        moved: Vec::new(),
+        regrid: false,
+        grid_words: buffer(1),
+        grid_rows: buffer(1),
+        corners: Vec::new(),
+        triangles: Vec::new(),
+        creases: Vec::new(),
+        corners_gpu: buffer(1),
+        triangles_gpu: buffer(3),
+        creases_gpu: buffer(1),
+        mesh_copies: buffer(1),
+        mesh_listed: buffer(1),
+        mesh_runs: Vec::new(),
+        mesh_creased: Vec::new(),
+        mesh_ways: Vec::new(),
+        fines: Vec::new(),
+        shares: buffer_of(Vec::filled(COPIES, vec4(1.0))),
+        hold: true,
+        sun_past_own: false,
+    }
+}
+
+/// Whether `m` keeps lengths and angles (a rotation and a move, or a mirror image of one): its
+/// columns unit length and square to each other.
+fn rigid(m: mat4) -> bool {
+    let a = m[0].xyz
+    let b = m[1].xyz
+    let c = m[2].xyz
+    let ok = |x: f32, want: f32| abs(x - want) < 1.0e-3
+    ok(dot(a, a), 1.0) &&
+        ok(dot(b, b), 1.0) &&
+        ok(dot(c, c), 1.0) &&
+        ok(dot(a, b), 0.0) &&
+        ok(dot(a, c), 0.0) &&
+        ok(dot(b, c), 0.0)
+}
+
+impl<L: Look> Solids<L> {
+    /// A solid cooked when the game was built (`mesh::bake_mesh`) loaded: its file fetched, and
+    /// its sets put in the pool once it arrives (`ready`). Which solid it is. A copy of it may be
+    /// placed at once, and is drawn once it's loaded.
+    pub fn load(mut self, baked: Baked) -> u32 {
+        let which = self.solids.len()
+        self.solids.push(
+            Cooked { runs: Vec::new(), bound: Bound { centre: vec3(0.0), radius: 0.0, slope: 0.5 }, baked: false },
+        )
+        self.fetching.push(Some(baked.fetch(0)))
+        self.held.push(false)
+        which
+    }
+
+    /// Each fetched file that's arrived read into the pool.
+    fn heard(mut self) {
+        for i in 0..self.fetching.len() {
+            var arrived: Option<Vec<u8>> = None
+            match mut self.fetching[i] {
+                Some(p) => match p.poll() {
+                    Some(Ok(bytes)) => {
+                        arrived = Some(take bytes)
+                    },
+                    Some(Err(_)) => {
+                        panic(f"atoms: solid {i}'s file didn't load")
+                    },
+                    None => {},
+                },
+                None => {},
+            }
+            match arrived {
+                Some(bytes) => {
+                    self.fetching[i] = None
+                    let t = now()
+                    let size = bytes.len()
+                    let words = words_of(bytes)
+                    assert(is_mesh(words), f"atoms: solid {i}'s file isn't a cooked mesh")
+                    self.meshes_in(i, words, size, t)
+                },
+                None => {},
+            }
+        }
+    }
+
+    /// Solid `i`'s meshes (its file's `words`, `size` bytes, arrived at `t`) read into the
+    /// meshes' pool, its volume of held sky worked out from its finest.
+    fn meshes_in(mut self, i: u32, words: [u32], size: u32, t: f64) {
+        let (bound, sets) = read_mesh(words)
+        if i < MOST_HELD && sets.len() > 0 {
+            let th = now()
+            self.holds.push(hold_of_corners(i, bound, sets[0].corners))
+            print(f"atoms: solid {i}'s volume of what it holds off the sky worked out in {since(th) * 1000.0} ms")
+        }
+        var runs: Vec<Run> = Vec::new()
+        var all: u32 = 0
+        var creased: u32 = 0
+        for r in sets {
+            let base = self.corners.len()
+            let n = r.triangles.len() / 3
+            runs.push(Run { first: self.triangles.len() / 3, plain: r.plain, fine: r.fine, creased: n - r.plain - r.fine, at: r.at })
+            self.fines.push(vec2u(self.triangles.len() / 3, r.fine))
+            creased += n - r.plain - r.fine
+            for c in r.corners {
+                self.corners.push(c)
+            }
+            for k in r.triangles {
+                self.triangles.push(k + base)
+            }
+            for c in r.creases {
+                self.creases.push(c)
+            }
+            all += r.triangles.len() / 3
+        }
+        self.corners_gpu = buffer_of(self.corners)
+        self.triangles_gpu = buffer_of(self.triangles)
+        self.creases_gpu = buffer_of(self.creases)
+        print(f"atoms: solid {i} loaded as meshes, {all} triangles ({creased} at a crease) in {runs.len()} sets, {size} bytes, read in {since(t) * 1000.0} ms")
+        let baked = sets.len() > 0 && sets[0].corners.len() > 0 && (sets[0].corners[0].wear >> WORN_BIT) != 0
+        self.solids[i] = Cooked { runs, bound, baked }
+    }
+
+    /// This frame's copies laid out for `eye`, before the picture's pass (buffers are made
+    /// outside a pass): each copy's set the finest whose band its nearest point is in (by how
+    /// much wider this eye's pixels are than the cook's), the copies of each set that wear their
+    /// look and face alike listed together.
+    ///
+    /// Only a set's outside is drawn: a set is closed, so its inside is never seen past its
+    /// outside, and a triangle facing away from the eye is dropped before any of its pixels is
+    /// shaded. Which way an outside face's corners run on the target depends on the copy (a
+    /// mirror image turns them over) and the eye (an eye whose right, up and forward are
+    /// left-handed, as the opening's, `gale::camera::as_the_old_saw`, turns them over again).
+    fn meshes_laid(mut self, eye: Eye) {
+        self.mesh_runs.clear()
+        self.mesh_creased.clear()
+        self.mesh_ways.clear()
+        if self.triangles.len() == 0 {
+            return
+        }
+        let wider = SEEN_PIXEL / eye.pixel()
+        let eye_turns = dot(cross(eye.right, eye.up), eye.forward) > 0.0
+        var records: Vec<Placing> = Vec::with_capacity(self.placed.len())
+        var drawn: Vec<Drawn> = Vec::new()
+        for i in 0..self.placed.len() {
+            let c = self.placed[i]
+            let back = inverse(c.at)
+            let stretch = max(length(c.at[0].xyz), max(length(c.at[1].xyz), length(c.at[2].xyz)))
+            records.push(
+                Placing {
+                    to_world: c.at,
+                    to_body: back,
+                    eye: (back * vec4(eye.at, 1.0)).xyz,
+                    rigid: if rigid(c.at) { 1.0 } else { 0.0 },
+                    body: c.body,
+                    group: c.group,
+                    look: u32(i),
+                    stretch,
+                },
+            )
+            let k = self.solids[c.solid].clone()
+            if k.runs.len() > 0 {
+                let centre = (c.at * vec4(k.bound.centre, 1.0)).xyz
+                let r = k.bound.radius * stretch
+                if in_view(eye, centre, r) {
+                    let near = max(length(centre - eye.at) - r, 0.0)
+                    var j: u32 = 0
+                    for s in 1..k.runs.len() {
+                        if k.runs[s].at * stretch * wider <= near {
+                            j = s
+                        }
+                    }
+                    let wears = if k.baked { BAKED } else if c.look.coarse() { AT_CORNERS } else { AT_PIXELS }
+                    let turned = (determinant(c.at) < 0.0) != eye_turns
+                    drawn.push(Drawn { run: k.runs[j], copy: i, way: 2 * wears + if turned { 1 } else { 0 } })
+                }
+            }
+        }
+        // (Copies of one run that wear and face alike together: one draw each, a copy an
+        // instance.)
+        std::collections::sort_by(
+            mut drawn,
+            |a: Drawn, b: Drawn| a.run.first < b.run.first ||
+                (a.run.first == b.run.first && (a.way < b.way || (a.way == b.way && a.copy < b.copy))),
+        )
+        var listed: Vec<u32> = Vec::with_capacity(drawn.len())
+        for x in drawn {
+            listed.push(x.copy)
+        }
+        if drawn.len() == 0 {
+            return
+        }
+        self.mesh_copies = buffer_of(records)
+        self.mesh_listed = buffer_of(listed)
+        var at: u32 = 0
+        while at < drawn.len() {
+            var end = at + 1
+            while end < drawn.len() && drawn[end].run.first == drawn[at].run.first && drawn[end].way == drawn[at].way {
+                end += 1
+            }
+            let r = drawn[at].run
+            self.mesh_runs.push(vec4u(r.first, r.plain, at, end - at))
+            self.mesh_creased.push(r.creased)
+            self.mesh_ways.push(drawn[at].way)
+            at = end
+        }
+        self.frames += 1
+        if self.frames == 3 || self.frames % 600 == 0 {
+            var tris: u32 = 0
+            for k in 0..self.mesh_runs.len() {
+                let r = self.mesh_runs[k]
+                tris += (r.y + self.fine_of(r.x) + self.mesh_creased[k]) * r.w
+            }
+            print(f"meshes: {drawn.len()} copies drawn in {self.mesh_runs.len()} draws, {tris} triangles")
+        }
+    }
+
+    /// Every copy drawn into the frame's one pass (docs/frame.md), as `cast` laid them out: one
+    /// draw a set and way (`Drawn`), a copy an instance.
+    pub fn draw_into(self, d: Drawing) {
+        let k = lit_by(d.light.lights, vec3(-1.0e30), vec3(1.0e30))
+        for j in 0..self.mesh_runs.len() {
+            let r = self.mesh_runs[j]
+            let run = vec4u(r.x, r.y, self.fine_of(r.x), self.mesh_creased[j])
+            let way = self.mesh_ways[j]
+            if k == 0 {
+                self.drawn_way(d, run, r.z, r.w, way, Unlit {})
+            } else if k == 1 {
+                self.drawn_way(d, run, r.z, r.w, way, OneLit {})
+            } else {
+                self.drawn_way(d, run, r.z, r.w, way, AllLit {})
+            }
+        }
+    }
+
+    /// One run's draws for copies that wear and face as `way` says (`Drawn`), each way its own
+    /// pipelines.
+    fn drawn_way<K: Lit>(self, d: Drawing, run: vec4u, first: u32, count: u32, way: u32, lit: K) {
+        let turned = way % 2 == 1
+        let wears = way / 2
+        if wears == BAKED {
+            self.drawn_run(d, run, first, count, turned, lit, WornBaked {})
+        } else if wears == AT_CORNERS {
+            self.drawn_run(d, run, first, count, turned, lit, WornAtCorners {})
+        } else {
+            self.drawn_run(d, run, first, count, turned, lit, WornAtPixels {})
+        }
+    }
+
+    /// The first triangle `first`'s run's count of fine plain triangles.
+    fn fine_of(self, first: u32) -> u32 {
+        for f in self.fines {
+            if f.x == first {
+                return f.y
+            }
+        }
+        0
+    }
+
+    /// One run's triangles (`run`: its first, how many plain, how many plain and fine, how many
+    /// creased) drawn for `count` copies listed from `first`, wearing their look as `W` says,
+    /// their outside faces clockwise on the target where `turned` (`meshes_laid`): the plain
+    /// indexed (the fine ones with their look's pixel part, a pipeline of their own), the creased
+    /// three corners each. (A draw's cull is written where it draws: so each draw twice.)
+    fn drawn_run<K: Lit, W: Wearing>(self, d: Drawing, run: vec4u, first: u32, count: u32, turned: bool, _lit: K, _w: W) {
+        if run.y > 0 {
+            if turned {
+                draw(
+                    d.pass,
+                    plain_vertex.bind(
+                        d.eye,
+                        light: d.light,
+                        looks: self.worn,
+                        corners: self.corners_gpu,
+                        copies: self.mesh_copies,
+                        listed: self.mesh_listed,
+                        first: first,
+                        shares: self.shares,
+                        own_sun: if self.sun_past_own { 1 } else { 0 },
+                        wears: W::WEARS,
+                    ),
+                    mesh_pixel.bind(
+                        d.eye,
+                        light: d.light,
+                        looks: self.worn,
+                        copies: self.mesh_copies,
+                        lights: K::LIVE,
+                        creased: false,
+                        fine: false,
+                        wears: W::WEARS,
+                    ),
+                    indices: self.triangles_gpu.span(start: 3 * run.x, count: 3 * run.y),
+                    index_count: 3 * run.y,
+                    instances: count,
+                    cull: Cull::Front,
+                    depth: NEARER,
+                )
+            } else {
+                draw(
+                    d.pass,
+                    plain_vertex.bind(
+                        d.eye,
+                        light: d.light,
+                        looks: self.worn,
+                        corners: self.corners_gpu,
+                        copies: self.mesh_copies,
+                        listed: self.mesh_listed,
+                        first: first,
+                        shares: self.shares,
+                        own_sun: if self.sun_past_own { 1 } else { 0 },
+                        wears: W::WEARS,
+                    ),
+                    mesh_pixel.bind(
+                        d.eye,
+                        light: d.light,
+                        looks: self.worn,
+                        copies: self.mesh_copies,
+                        lights: K::LIVE,
+                        creased: false,
+                        fine: false,
+                        wears: W::WEARS,
+                    ),
+                    indices: self.triangles_gpu.span(start: 3 * run.x, count: 3 * run.y),
+                    index_count: 3 * run.y,
+                    instances: count,
+                    cull: Cull::Back,
+                    depth: NEARER,
+                )
+            }
+        }
+        if W::WEARS == BAKED && run.z > 0 {
+            if turned {
+                draw(
+                    d.pass,
+                    plain_vertex.bind(
+                        d.eye,
+                        light: d.light,
+                        looks: self.worn,
+                        corners: self.corners_gpu,
+                        copies: self.mesh_copies,
+                        listed: self.mesh_listed,
+                        first: first,
+                        shares: self.shares,
+                        own_sun: if self.sun_past_own { 1 } else { 0 },
+                        wears: W::WEARS,
+                    ),
+                    mesh_pixel.bind(
+                        d.eye,
+                        light: d.light,
+                        looks: self.worn,
+                        copies: self.mesh_copies,
+                        lights: K::LIVE,
+                        creased: false,
+                        fine: true,
+                        wears: W::WEARS,
+                    ),
+                    indices: self.triangles_gpu.span(start: 3 * (run.x + run.y), count: 3 * run.z),
+                    index_count: 3 * run.z,
+                    instances: count,
+                    cull: Cull::Front,
+                    depth: NEARER,
+                )
+            } else {
+                draw(
+                    d.pass,
+                    plain_vertex.bind(
+                        d.eye,
+                        light: d.light,
+                        looks: self.worn,
+                        corners: self.corners_gpu,
+                        copies: self.mesh_copies,
+                        listed: self.mesh_listed,
+                        first: first,
+                        shares: self.shares,
+                        own_sun: if self.sun_past_own { 1 } else { 0 },
+                        wears: W::WEARS,
+                    ),
+                    mesh_pixel.bind(
+                        d.eye,
+                        light: d.light,
+                        looks: self.worn,
+                        copies: self.mesh_copies,
+                        lights: K::LIVE,
+                        creased: false,
+                        fine: true,
+                        wears: W::WEARS,
+                    ),
+                    indices: self.triangles_gpu.span(start: 3 * (run.x + run.y), count: 3 * run.z),
+                    index_count: 3 * run.z,
+                    instances: count,
+                    cull: Cull::Back,
+                    depth: NEARER,
+                )
+            }
+        }
+        if run.w > 0 {
+            if turned {
+                draw(
+                    d.pass,
+                    creased_vertex.bind(
+                        d.eye,
+                        light: d.light,
+                        looks: self.worn,
+                        corners: self.corners_gpu,
+                        triangles: self.triangles_gpu,
+                        creases: self.creases_gpu,
+                        copies: self.mesh_copies,
+                        listed: self.mesh_listed,
+                        from: vec2u(run.x + run.y + run.z, first),
+                        shares: self.shares,
+                        own_sun: if self.sun_past_own { 1 } else { 0 },
+                        wears: W::WEARS,
+                    ),
+                    mesh_pixel.bind(
+                        d.eye,
+                        light: d.light,
+                        looks: self.worn,
+                        copies: self.mesh_copies,
+                        lights: K::LIVE,
+                        creased: true,
+                        fine: false,
+                        wears: W::WEARS,
+                    ),
+                    vertices: 3 * run.w,
+                    instances: count,
+                    cull: Cull::Front,
+                    depth: NEARER,
+                )
+            } else {
+                draw(
+                    d.pass,
+                    creased_vertex.bind(
+                        d.eye,
+                        light: d.light,
+                        looks: self.worn,
+                        corners: self.corners_gpu,
+                        triangles: self.triangles_gpu,
+                        creases: self.creases_gpu,
+                        copies: self.mesh_copies,
+                        listed: self.mesh_listed,
+                        from: vec2u(run.x + run.y + run.z, first),
+                        shares: self.shares,
+                        own_sun: if self.sun_past_own { 1 } else { 0 },
+                        wears: W::WEARS,
+                    ),
+                    mesh_pixel.bind(
+                        d.eye,
+                        light: d.light,
+                        looks: self.worn,
+                        copies: self.mesh_copies,
+                        lights: K::LIVE,
+                        creased: true,
+                        fine: false,
+                        wears: W::WEARS,
+                    ),
+                    vertices: 3 * run.w,
+                    instances: count,
+                    cull: Cull::Back,
+                    depth: NEARER,
+                )
+            }
+        }
+    }
+
+    /// Whether every solid is loaded: what's listed before then lacks those not yet.
+    pub fn ready(mut self) -> bool {
+        self.heard()
+        var all = true
+        for f in self.fetching {
+            all = all && f.is_none()
+        }
+        all
+    }
+
+    /// A copy of `solid`, wearing `look`, carried to the world by `at` (any affine map the solid
+    /// can be drawn through: rigid, mirrored, sheared), standing in the picture as body `body` and
+    /// ink group `group`: which copy it is.
+    pub fn place(mut self, solid: u32, look: L, at: mat4, body: u32, group: u32) -> u32 {
+        assert(self.placed.len() < COPIES, "too many copies")
+        self.placed.push(Placed { solid, look, at, body, group })
+        self.moved.push(false)
+        self.regrid = true
+        let looks = Vec::from_fn(self.placed.len(), |i| self.placed[i].look)
+        self.worn = buffer_of(looks)
+        self.placed.len() - 1
+    }
+
+    /// Copy `copy` carried to the world by `at` from now on.
+    pub fn move_to(mut self, copy: u32, at: mat4) {
+        self.placed[copy].at = at
+        if !self.moved[copy] {
+            self.moved[copy] = true
+            self.regrid = true
+        }
+    }
+
+    /// The solids' copies put in `frame`'s light, before anything is drawn into its picture
+    /// (docs/light.md): what each holds off the sky round it. A solid's volume is worked out on
+    /// the GPU a band a frame once it has loaded (`held::wedged`); the copies that never moved
+    /// are laid in the grid of the fixed world once every solid's volume is in (and again if one
+    /// moves); the copies that move are listed each frame.
+    pub fn cast(mut self, frame: mut Frame) {
+        self.heard()
+        self.meshes_laid(frame.eye)
+        if !self.hold {
+            return
+        }
+        if self.holds.len() > 0 {
+            label("held")
+            let solid = self.holds[0].solid
+            if self.band == 0 {
+                self.values = buffer_of(self.holds[0].field)
+                dispatch(
+                    fielded.bind(values: self.values, per: 1.0 / self.holds[0].box_.w, out: mut self.field),
+                    groups: (SIDE / 4, SIDE / 4, SIDE / 4),
+                )
+            }
+            // (All its bands in one frame: each is under 2 ms on the M4.)
+            while self.band * SLICES < SIDE {
+                dispatch(
+                    wedged.bind(field: self.field, from: self.band * SLICES, out: mut self.wedges),
+                    groups: (SIDE / 4, SIDE / 4, SLICES / 4),
+                )
+                self.band += 1
+            }
+            if self.band * SLICES >= SIDE {
+                dispatch(
+                    shelved.bind(words: self.wedges, slot: solid, out: mut frame.held.shade),
+                    groups: (SIDE / 4, SIDE / 4, (solid + 1) * SIDE / 4),
+                )
+                frame.held.held.boxes[solid] = self.holds[0].box_
+                self.held[solid] = true
+                let _ = self.holds.remove(0)
+                self.band = 0
+                self.regrid = true
+            }
+        }
+        var waiting = self.holds.len() > 0
+        for f in self.fetching {
+            waiting = waiting || f.is_some()
+        }
+        var fixed_again = false
+        if self.regrid && !waiting {
+            self.laid(mut frame)
+            self.regrid = false
+            fixed_again = true
+        }
+        // The copies that move, this frame.
+        var m: u32 = 0
+        var lo = vec3(1.0e30)
+        var hi = vec3(-1.0e30)
+        for i in 0..self.placed.len() {
+            let c = self.placed[i]
+            if self.moved[i] && c.solid < MOST_HELD && self.held[c.solid] && m < MOST_MOVERS {
+                let (r0, r1, r2) = rows_of(inverse(c.at))
+                let ball = ball_of(c.at, frame.held.held.boxes[c.solid])
+                frame.held.held.movers[ROWS * m] = r0
+                frame.held.held.movers[ROWS * m + 1] = r1
+                frame.held.held.movers[ROWS * m + 2] = r2
+                frame.held.held.movers[ROWS * m + 3] = ball
+                frame.held.held.movers[ROWS * m + 4] = vec4(f32(c.solid), f32(i), 0.0, 0.0)
+                lo = min(lo, ball.xyz - vec3(ball.w))
+                hi = max(hi, ball.xyz + vec3(ball.w))
+                m += 1
+            }
+        }
+        frame.held.held.moving = vec4(f32(m), 0.0, 0.0, 0.0)
+        frame.held.held.around = if m > 0 { vec4(0.5 * (lo + hi), 0.5 * length(hi - lo)) } else {
+            vec4(0.0)
+        }
+        frame.light.held = frame.held.held
+        self.shared_out(mut frame, fixed: fixed_again)
+    }
+
+    /// Each copy's share of the sky from the fixed world's other copies worked out at its middle
+    /// (`held::shared`): every fixed copy's when the grid has just been laid (`fixed`), and the
+    /// moving copies' every frame.
+    fn shared_out(mut self, frame: mut Frame, fixed: bool) {
+        if frame.held.held.grid_at.w < 0.5 {
+            return
+        }
+        var middles: Vec<vec4> = Vec::with_capacity(self.placed.len())
+        var any = false
+        for i in 0..self.placed.len() {
+            let c = self.placed[i]
+            let b = self.solids[c.solid].bound
+            let which = if self.solids[c.solid].runs.len() == 0 { 0.0 } else if self.moved[i] { 2.0 } else { 1.0 }
+            any = any || which == 2.0
+            middles.push(vec4((c.at * vec4(b.centre, 1.0)).xyz, which))
+        }
+        let n = min(self.placed.len(), COPIES)
+        if n == 0 {
+            return
+        }
+        let ins = buffer_of(middles)
+        label("held")
+        if fixed {
+            dispatch(
+                shared.bind(held: frame.held.held, middles: ins, count: n, which: 1.0, out: mut self.shares),
+                groups: (n + 63) / 64,
+            )
+        }
+        if any {
+            dispatch(
+                shared.bind(held: frame.held.held, middles: ins, count: n, which: 2.0, out: mut self.shares),
+                groups: (n + 63) / 64,
+            )
+        }
+    }
+
+    /// The grid of the fixed world laid: each copy that never moved (of a solid that holds a
+    /// volume) listed in every cell its volume reaches, up to `IN_CELL` a cell, and its rows.
+    fn laid(mut self, frame: mut Frame) {
+        let boxes = frame.held.held.boxes
+        var lo = vec2(1.0e30)
+        var hi = vec2(-1.0e30)
+        var any = false
+        for i in 0..min(self.placed.len(), MOST_COPIES) {
+            let c = self.placed[i]
+            if !self.moved[i] && c.solid < MOST_HELD && self.held[c.solid] {
+                let b = boxes[c.solid]
+                let r = cells_of(c.at, b.xyz, b.w * f32(SIDE), vec2(0.0), 1.0)
+                lo = min(lo, r.xy)
+                hi = max(hi, r.zw)
+                any = true
+            }
+        }
+        if !any {
+            return
+        }
+        let cell = max(max(hi.x - lo.x, hi.y - lo.y) / f32(GRID - 1), 1.0)
+        var words: Vec<u32> = Vec::filled(GRID * GRID * IN_CELL / 2, 4294967295)
+        var count: Vec<u32> = Vec::filled(GRID * GRID, 0)
+        var rows: Vec<vec4> = Vec::filled(MOST_COPIES * ROWS, vec4(0.0))
+        var full: u32 = 0
+        for i in 0..min(self.placed.len(), MOST_COPIES) {
+            let c = self.placed[i]
+            if !self.moved[i] && c.solid < MOST_HELD && self.held[c.solid] {
+                let (r0, r1, r2) = rows_of(inverse(c.at))
+                let b = boxes[c.solid]
+                rows[ROWS * i] = r0
+                rows[ROWS * i + 1] = r1
+                rows[ROWS * i + 2] = r2
+                rows[ROWS * i + 3] = ball_of(c.at, b)
+                rows[ROWS * i + 4] = vec4(f32(c.solid), f32(i), 0.0, 0.0)
+                let r = cells_of(c.at, b.xyz, b.w * f32(SIDE), lo, cell)
+                for cz in u32(max(r.y, 0.0))..min(u32(max(r.w, 0.0)) + 1, GRID) {
+                    for cx in u32(max(r.x, 0.0))..min(u32(max(r.z, 0.0)) + 1, GRID) {
+                        let k = cz * GRID + cx
+                        let slot = count[k]
+                        if slot < IN_CELL {
+                            let w = 2 * (((slot / 4) * GRID + cz) * GRID + cx) + (slot % 4) / 2
+                            let shift = 16 * (slot % 2)
+                            words[w] = (words[w] & !(65535 << shift)) | (i << shift)
+                            count[k] = slot + 1
+                        } else {
+                            full += 1
+                        }
+                    }
+                }
+            }
+        }
+        if full > 0 {
+            print(f"atoms: WARNING: {full} cells of the fixed world's grid were full: a copy's sky is left out there")
+        }
+        label("held")
+        self.grid_words = buffer_of(words)
+        self.grid_rows = buffer_of(rows)
+        dispatch(
+            gridded.bind(words: self.grid_words, out: mut frame.held.grid),
+            groups: (GRID / 8, GRID / 8, IN_CELL / 4),
+        )
+        dispatch(
+            rowed.bind(rows: self.grid_rows, out: mut frame.held.copies),
+            groups: (1, ROWS_HIGH / 32, MOST_COPIES / ROWS_HIGH),
+        )
+        frame.held.held.grid_at = vec4(lo, cell, 1.0)
+    }
+}
+
+/// How a draw's copies wear their look (`meshes::BAKED`, `AT_CORNERS`, `AT_PIXELS`), as a type:
+/// the draw's programs are built for that way alone.
+trait Wearing {
+    const WEARS: u32
+}
+
+struct WornBaked {}
+
+struct WornAtCorners {}
+
+struct WornAtPixels {}
+
+impl Wearing for WornBaked {
+    const WEARS: u32 = BAKED
+}
+
+impl Wearing for WornAtCorners {
+    const WEARS: u32 = AT_CORNERS
+}
+
+impl Wearing for WornAtPixels {
+    const WEARS: u32 = AT_PIXELS
+}

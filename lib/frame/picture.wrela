@@ -1,0 +1,767 @@
+// The picture: what every lister ends by writing, and what the last pass makes the screen from
+// (docs/frame.md). Four targets, a texel each a pixel:
+//
+//   colour    Rgba16Float  linear light, unclipped (HDR); alpha unused (0)
+//   edge      Rgba16Float  the way from the pixel's middle to the nearest edge of what it shows
+//                          (px, x across and y down) where one is within `EDGE_REACH`; 1 plus how
+//                          strong a line drawn there is (0 none to 1 full; the ink's style weighs
+//                          it again by what made it), or 0 where no edge is near; and the look's
+//                          line field's value there (`NO_LINE` for none). The last pass smooths
+//                          every edge a record holds; the ink draws a line only where it's over 0
+//                          strong (`edge_record`)
+//   identity  R32Uint      which kind drew the pixel, which body or instance, and its ink group
+//   depth     Depth32Float reversed, with no far plane (`eye`): 0 where nothing is
+//
+// A lister draws into them with the depth test `eye::NEARER`, so listers meet by depth alone,
+// in any order, and none needs to know another drew. Where nothing drew, depth is 0, the edge
+// record 0 (no edge: every pass into the picture clears its targets to 0), and the colour and
+// identity whatever the clear left: nothing reads them there.
+
+use air::{Air, NO_AIR}
+use sun::{AIR_ROWS, AIR_SIDE, AirSeen, NO_SUN_AIR, SunAir, air_lit}
+use eye::{Eye, NOTHING_DEEP}
+use form::ink::{InkStyle, KINETIC_INK_LINES}
+use form::kinds::Paint
+use ink::{
+    MOST_STROKES, Stroke, edges, lines_drawn, mark_words, stroke_corner, stroke_cover,
+    strokes_drawn, strokes_grouped, unmarked, weighed,
+}
+use last::{FINISH, cover, finish_alike, finish_table, last, paper}
+use form::shade::NO_SKY_LIGHT
+use held::{HeldStore, held_store}
+use light::{Lighting, Shine, lighting, sunlit}
+use load::burn
+use moment::{Blow, Moment, STILL_MOMENT}
+use sky::{ADDED_HEIGHT, ADDED_WIDTH, SkySeen, SkyTable, added, sky_table}
+use soft::{Soft, soft}
+use std::gpu::{
+    AppendBuffer, Filter, Sampler, sampler, Blend, DepthPass3, DepthTexture, DrawArgs, GpuBuffer, R16Float,
+    R32Uint, R8, RenderPass, Rg8, Rgba16Float, Texture, append_buffer, begin_pass,
+    begin_pass3_with_depth, begin_screen_pass, buffer, depth_texture, dispatch, draw, label, read,
+    Texture3d, copy_texture, texture, texture3d, writable_texture, write, Address,
+}
+use std::io::{Pending, print}
+use text::{MOST_GLYPHS, Placed, glyph_corner, glyph_cover, set}
+
+/// The edge record's way where no edge is within a pixel and a half: past any edge's reach.
+pub const NO_EDGE = vec2(8.0)
+
+/// How far from a pixel's middle an edge is still the pixel's (px): a pixel and a half, so a
+/// pixel that an edge crosses, or only nears, knows it.
+pub const EDGE_REACH: f32 = 1.5
+
+/// A line field's value where there is no line: far on its positive side.
+pub const NO_LINE: f32 = 1.0e4
+
+/// An edge record: the way to the nearest edge (`NO_EDGE` for none: past `EDGE_REACH`), how
+/// strong a line there is (0 none to 1 full: the ink's style weighs it again, as an outline, a
+/// fold or a crease), and the line field's value. Every edge a record holds is smoothed by the
+/// last pass, whatever its strength; a line is drawn along it only where its strength is over 0.
+/// So a lister that wants an edge smoothed with no line writes its way at strength 0.
+///
+/// (The record's `z` is 1 plus the strength where an edge is near and 0 where none is, so a
+/// texel nothing drew, cleared to 0, holds no edge, and the last pass finds the pixels to smooth
+/// from the records round each pixel alone.)
+pub fn edge_record(way: vec2, weight: f32, line: f32) -> vec4 {
+    if dot(way, way) > EDGE_REACH * EDGE_REACH {
+        return vec4(NO_EDGE, 0.0, line)
+    }
+    vec4(way, 1.0 + clamp(weight, 0.0, 1.0), line)
+}
+
+/// Whether an edge record holds an edge (one within `EDGE_REACH` of its pixel's middle).
+pub fn edge_near(r: vec4) -> bool {
+    r.z >= 0.5
+}
+
+/// The way to the edge an edge record holds: `NO_EDGE`, or within `EDGE_REACH`.
+pub fn edge_way(r: vec4) -> vec2 {
+    if r.z >= 0.5 { r.xy } else { NO_EDGE }
+}
+
+/// An edge record's strength (0 to 1; 0 where it holds no edge).
+pub fn edge_strength(r: vec4) -> f32 {
+    max(r.z - 1.0, 0.0)
+}
+
+/// What drew a pixel: nothing (0), or a lister of each kind.
+pub const NONE: u32 = 0
+pub const SOLID: u32 = 1
+pub const CHART: u32 = 2
+pub const STRAND: u32 = 3
+pub const MEDIUM: u32 = 4
+pub const SHAPE: u32 = 5
+
+/// An identity: its kind in the top 3 bits, its body or instance in the next 21 (up to
+/// 2,097,151), and its ink group in the low 8. Parts that join smoothly share a group, and no
+/// line is drawn between two pixels of one body and one group.
+pub fn identity(kind: u32, body: u32, group: u32) -> u32 {
+    (kind << 29) | ((body & 0x1fffff) << 8) | (group & 0xff)
+}
+
+/// An identity's kind.
+pub fn kind_of(id: u32) -> u32 {
+    id >> 29
+}
+
+/// An identity's body or instance.
+pub fn body_of(id: u32) -> u32 {
+    (id >> 8) & 0x1fffff
+}
+
+/// An identity's ink group.
+pub fn group_of(id: u32) -> u32 {
+    id & 0xff
+}
+
+/// The width and height the load burns at, whatever the screen's: so its work is the same at
+/// every size.
+pub const LOAD_WIDTH: u32 = 1920
+pub const LOAD_HEIGHT: u32 = 1080
+
+/// The frame: this frame's eye and light, the ink's style, the picture's targets (sized to the
+/// eye's screen), whether the picture is yet to be cleared this frame, the load; and what the
+/// last pass draws from besides: the moment (the time, the bodies' blows), the strokes of ink
+/// listed from the picture and drawn into their target, the paper, and the text.
+pub struct Frame {
+    pub eye: Eye,
+    pub light: Lighting,
+    pub ink: InkStyle,
+    /// The scene's air (`air::Air`; `NO_AIR` unless the scene sets it): every pixel met is seen
+    /// through it by its depth in the last pass, and the ink's lines fade with it.
+    pub air: Air,
+    /// The sun's light on the air where the clouds let it in (`sun::SunAir`: none by default);
+    /// the frame holds it in a map of directions.
+    pub sun_air: SunAir,
+    pub colour: Texture<Rgba16Float>,
+    pub edge: Texture<Rgba16Float>,
+    pub identity: Texture<R32Uint>,
+    pub depth: DepthTexture,
+    fresh: bool,
+    /// Sines a pixel the load pass burns over `LOAD_WIDTH` × `LOAD_HEIGHT` pixels, beside the
+    /// frame, so the GPU keeps its full clock while a light frame is timed (0: no load). It's
+    /// labelled `load`, and no total counts it.
+    load: u32,
+    burned: Texture<R8>,
+    time: f32,
+    moment: Moment,
+    pub strokes: Texture<Rg8>,
+    /// A bit a pixel, set where an edge record or a neighbour's across or down holds an edge:
+    /// the pixels the last pass smooths (`ink::edges` sets them, `ink::mark_words` long).
+    marked: GpuBuffer<u32>,
+    listed: AppendBuffer<Stroke>,
+    weighed: GpuBuffer<Stroke>,
+    draws: GpuBuffer<DrawArgs>,
+    groups: GpuBuffer<u32>,
+    paper: Texture<R16Float>,
+    papered: bool,
+    glyphs: Vec<Placed>,
+    placed: GpuBuffer<Placed>,
+    /// How many frames have ended, and the strokes the third listed, said once read back.
+    ended: u32,
+    /// Whether this frame can draw a line (`ink::lines_drawn`: the style weighs some line over 0,
+    /// or the moment is an impact frame's). Where none can, the ink's passes don't run and the
+    /// last pass finds the edges it smooths from the records itself.
+    lined: bool,
+    listed_count: Option<Pending<u32>>,
+    /// A sampler of the nearest texel, for gathers.
+    near: Sampler,
+    /// The sky as a table, drawn from the scene's paint (`sky::SkyTable`): what the last pass
+    /// shows where nothing is, and what a mirror reads.
+    pub sky: SkyTable,
+    /// The soft things' targets (`soft::Soft`): what a medium's lister marches into, a layer
+    /// each, smaller than the picture, and the last pass lays over the ink.
+    pub soft: Soft,
+    /// What holds the light off a point (`held`): the solids' volumes, the grid of the fixed
+    /// world's copies and the copies that move, which the frame's light carries to every pixel.
+    pub held: HeldStore,
+    /// The style's finish as a table (`last::finish_table`), the style it was made for, and a
+    /// sampler that reads between texels.
+    finish: Texture3d<Rgba16Float>,
+    finished_for: Option<InkStyle>,
+    smooth: Sampler,
+    /// The sun's light on the air held in a map of directions (`sun::air_lit`): the one read, the
+    /// one being marched (`AIR_ROWS` rows a frame), the next row, where it is marched from, and
+    /// whether one is whole; read round the horizon repeating.
+    air_map: Texture<Rgba16Float>,
+    air_next: Texture<Rgba16Float>,
+    air_band: Texture<Rgba16Float>,
+    air_row: u32,
+    air_from: vec3,
+    air_whole: bool,
+    /// The light added to the sky where a ray meets nothing (`sky::added`): the glow and the sun's
+    /// light on the air, made again when either is (`added_for`: the air's maps and the glows made
+    /// when it was, and the style's glow).
+    sky_added: Texture<Rgba16Float>,
+    added_for: vec3,
+    air_maps: u32,
+    round: Sampler,
+}
+
+/// What a lister draws its share of the picture with (`Frame::draw`): the picture's one pass,
+/// open; the frame's eye and light; and the sky's mirror table (`sky::mirror`), for what
+/// mirrors it.
+pub borrow struct Drawing {
+    pub pass: DepthPass3<Rgba16Float, Rgba16Float, R32Uint>,
+    pub eye: Eye,
+    pub light: Lighting,
+    pub mirror: borrow Texture3d<Rgba16Float>,
+    pub mirror_s: borrow Sampler,
+    /// The mirror's sharp map (`sky::mirrored`).
+    pub sky_map: borrow Texture<Rgba16Float>,
+}
+
+/// A frame and its picture, with a load of `load` sines a pixel (0 for none).
+pub fn picture(load: u32) -> Frame {
+    let held = held_store()
+    let sky = sky_table()
+    Frame {
+        eye: eye::eye_at(vec3(0.0, 0.0, 1.0), vec3(0.0), 1.0, width: 1, height: 1),
+        light: lighting(sunlit(vec3(0.0, 1.0, 0.0), ground: 0.0), NO_SKY_LIGHT, held.held, sky.sun_shade(vec3(0.0, 1.0, 0.0))),
+        colour: texture(width: 1, height: 1),
+        edge: texture(width: 1, height: 1),
+        identity: texture(width: 1, height: 1),
+        depth: depth_texture(width: 1, height: 1),
+        fresh: true,
+        load,
+        burned: texture(width: if load > 0 { LOAD_WIDTH } else { 1 }, height: if load > 0 {
+            LOAD_HEIGHT
+        } else { 1 }),
+        ink: KINETIC_INK_LINES,
+        air: NO_AIR,
+        sun_air: NO_SUN_AIR,
+        time: 0.0,
+        moment: STILL_MOMENT,
+        strokes: texture(width: 1, height: 1),
+        marked: buffer(1),
+        listed: append_buffer(MOST_STROKES),
+        weighed: buffer(MOST_STROKES),
+        draws: buffer(1),
+        groups: buffer(3),
+        paper: texture(width: 1, height: 1),
+        papered: false,
+        glyphs: Vec::new(),
+        placed: buffer(MOST_GLYPHS),
+        ended: 0,
+        lined: true,
+        listed_count: None,
+        near: sampler(filter: Filter::Nearest, mip: Filter::Nearest),
+        sky,
+        soft: soft(scale: 4),
+        held,
+        finish: texture3d::<Rgba16Float>(width: FINISH, height: FINISH, depth: FINISH),
+        finished_for: None,
+        smooth: sampler(),
+        air_map: writable_texture::<Rgba16Float>(width: 1, height: 1),
+        air_next: writable_texture::<Rgba16Float>(width: 1, height: 1),
+        air_band: writable_texture::<Rgba16Float>(width: 1, height: 1),
+        air_row: 0,
+        air_from: vec3(0.0),
+        air_whole: false,
+        sky_added: writable_texture::<Rgba16Float>(width: 1, height: 1),
+        added_for: vec3(-1.0),
+        air_maps: 0,
+        round: sampler(address: Address::Repeat),
+    }
+}
+
+impl Frame {
+    /// A frame begun: seen by `eye` in the scene's light `light` (lit as well by the sky's light
+    /// as the frame's sky last gave it, and held off by what the frame holds), its targets the
+    /// size of the eye's screen, to be cleared by the first pass into them.
+    pub fn begin(mut self, eye: Eye, light: Shine) {
+        let w = u32(eye.size.x)
+        let h = u32(eye.size.y)
+        if self.colour.width() != w || self.colour.height() != h {
+            self.colour = texture(width: w, height: h)
+            self.edge = texture(width: w, height: h)
+            self.identity = texture(width: w, height: h)
+            self.depth = depth_texture(width: w, height: h)
+            self.strokes = texture(width: w, height: h)
+            self.marked = buffer(mark_words(w, h))
+            self.paper = texture(width: w, height: h)
+            self.papered = false
+        }
+        self.soft.begin(w, h)
+        self.eye = eye
+        // (A scene whose sun has no light pays nothing for the clouds' map of it.)
+        self.sky.sunlit = dot(light.style.sun, light.style.sun) > 0.0
+        self.light = lighting(light, self.sky.light, self.held.held, self.sky.sun_shade(light.sun))
+        self.fresh = true
+        self.moment = STILL_MOMENT
+        self.glyphs.clear()
+    }
+
+    /// The time this frame shows (s): the ink boils once a drawing, `ink.drawings` a second, and
+    /// holds between. A frame not told keeps the last it was told (at first 0: no boil).
+    pub fn at(mut self, time: f32) {
+        self.time = time
+    }
+
+    /// A body's blow this frame: `body` the identity its lister writes (its kind and body; its ink
+    /// group's bits aren't read), `blow` what the scene's bodies give of it. Each body the scene
+    /// draws, each frame: the impact frame outlines the bodies it was told of.
+    pub fn blow(mut self, body: u32, blow: Blow) {
+        self.moment.took(body, blow)
+    }
+
+    /// A line of text over the picture: its top left at `at` (px), capitals `height` px tall, in
+    /// `colour` (linear).
+    pub fn text(mut self, line: str, at: vec2, height: f32, colour: vec3) {
+        set(mut self.glyphs, line, at, height, colour)
+    }
+
+    /// The picture drawn: the one pass into it each frame, opened (clearing it, unless a pass
+    /// drew into it already), handed to `listers` (the scene's: each lister draws its share,
+    /// `Drawing`), and closed. Every lister's work outside the picture (placing, stepping,
+    /// listing in compute, its own targets) is done before; a lister that reads the picture (a
+    /// medium marching to its depth) after. One pass, so the GPU
+    /// shades each pixel once whichever lister wins it, and loads and stores the picture's
+    /// targets once (docs/frame.md, "One pass into the picture").
+    pub fn draw(mut self, listers: fn(Drawing)) {
+        label("picture")
+        let first = self.first()
+        let pass = begin_pass3_with_depth(
+            mut self.colour,
+            mut self.edge,
+            mut self.identity,
+            mut self.depth,
+            clear: vec4(0.0),
+            keep: !first,
+            clear_depth: NOTHING_DEEP,
+            keep_depth: !first,
+        )
+        let d = Drawing {
+            pass,
+            eye: self.eye,
+            light: self.light,
+            mirror: self.sky.mirror,
+            mirror_s: self.sky.s,
+            sky_map: self.sky.map,
+        }
+        listers(d)
+        d.pass.end()
+    }
+
+    /// Whether a pass into the picture is the frame's first, which clears it (cleared, its
+    /// targets aren't read in first: cheaper than a pass of its own); taken as done.
+    pub fn first(mut self) -> bool {
+        let was = self.fresh
+        self.fresh = false
+        was
+    }
+
+    /// The picture cleared, if no lister drew into it this frame.
+    fn cleared(mut self) {
+        if self.fresh {
+            let p = begin_pass3_with_depth(
+                mut self.colour,
+                mut self.edge,
+                mut self.identity,
+                mut self.depth,
+                clear: vec4(0.0),
+                clear_depth: NOTHING_DEEP,
+            )
+            p.end()
+            self.fresh = false
+        }
+    }
+
+    /// The load, beside the frame.
+    fn loaded(mut self) {
+        if self.load > 0 {
+            label("load")
+            let p = begin_pass(mut self.burned, clear: vec4(0.0))
+            draw(p, cover, burn.bind(rounds: self.load), vertices: 3)
+            p.end()
+        }
+    }
+
+    /// The ink: the strokes listed from the picture, then drawn into their target.
+    fn inked(mut self) {
+        self.moment.ready(self.eye, self.ink, self.time)
+        let w = u32(self.eye.size.x)
+        let h = u32(self.eye.size.y)
+        if !self.papered {
+            label("paper")
+            let p = begin_pass(mut self.paper, clear: vec4(1.0))
+            draw(
+                p,
+                cover,
+                paper.bind(style: self.ink, size: self.eye.size),
+                vertices: 3,
+            )
+            p.end()
+            self.papered = true
+        }
+        // A style pays only for what it uses: where no line can be drawn this frame (the style
+        // weighs every line at nothing and it isn't an impact frame), nothing is listed or drawn
+        // and nothing marked: the last pass finds the edges it smooths from the records itself
+        // (`last::edged`). (At 3840x2160 on the M4 the marking alone was 0.39 ms.)
+        self.lined = lines_drawn(self.ink, self.moment)
+        self.ended += 1
+        if !self.lined {
+            if self.ended == 3 {
+                print("ink: no line drawn (the style draws none): the ink's passes don't run")
+            }
+            self.glyphs_placed()
+            return
+        }
+        label("edges")
+        self.listed.clear()
+        let words = mark_words(w, h)
+        dispatch(unmarked.bind(out: mut self.marked, words: words), groups: (words + 63) / 64)
+        dispatch(
+            edges.bind(
+                self.eye,
+                style: self.ink,
+                moment: self.moment,
+                edge: self.edge,
+                identity: self.identity,
+                depth: self.depth,
+                near: self.near,
+                out: mut self.listed,
+                marks: mut self.marked,
+            ),
+            groups: ((w + 15) / 16, (h + 7) / 8, 1),
+        )
+        dispatch(
+            strokes_drawn.bind(count: self.listed.count(), most: MOST_STROKES, out: mut self.draws),
+            groups: 1,
+        )
+        dispatch(
+            strokes_grouped.bind(
+                count: self.listed.count(),
+                most: MOST_STROKES,
+                out: mut self.groups,
+            ),
+            groups: 1,
+        )
+        label("weighed")
+        dispatch(
+            weighed.bind(
+                self.eye,
+                air: self.air,
+                style: self.ink,
+                moment: self.moment,
+                edge: self.edge,
+                identity: self.identity,
+                depth: self.depth,
+                count: self.listed.count(),
+                most: MOST_STROKES,
+                raw: self.listed.items(),
+                out: mut self.weighed,
+            ),
+            groups: self.groups.span(start: 0, count: 3),
+        )
+        label("ink")
+        let p = begin_pass(mut self.strokes, clear: vec4(0.0))
+        draw(
+            p,
+            stroke_corner.bind(
+                strokes: self.weighed.items(),
+                style: self.ink,
+                moment: self.moment,
+                size: self.eye.size,
+            ),
+            stroke_cover.bind(
+                strokes: self.weighed.items(),
+                style: self.ink,
+                moment: self.moment,
+                colour: self.colour,
+                depth: self.depth,
+            ),
+            indirect: self.draws.span(start: 0, count: 1),
+            blend: Blend::Max,
+        )
+        p.end()
+        self.glyphs_placed()
+        if self.ended == 3 {
+            self.listed_count = Some(read(self.listed.count()))
+        }
+        match mut self.listed_count {
+            Some(c) => match c.poll() {
+                Some(Ok(v)) => {
+                    print(
+                        f"ink: {v[0]} strokes listed (of {MOST_STROKES} at most)",
+                    )
+                    self.listed_count = None
+                },
+                _ => {},
+            },
+            None => {},
+        }
+    }
+
+    /// The style's finish made into its table, if the style finishes otherwise than the table's.
+    fn finished(mut self) {
+        let made = match self.finished_for {
+            Some(f) => finish_alike(f, self.ink),
+            None => false,
+        }
+        if !made {
+            label("finish")
+            dispatch(
+                finish_table.bind(style: self.ink, out: mut self.finish),
+                groups: (FINISH / 4, FINISH / 4, FINISH / 4),
+            )
+            self.finished_for = Some(self.ink)
+        }
+    }
+
+    /// This frame's rows of the sun's light on the air (`sun::air_lit`), where the scene lights the
+    /// air (`sun_air.light`) and the clouds' map of the sun is whole: from where the eye is when a
+    /// map begins, into the next, which takes the read one's place when whole.
+    fn air_marched(mut self) {
+        if self.sun_air.light.w <= 0.0 || self.light.shade.at.w != 1.0 {
+            return
+        }
+        if self.air_map.width() != AIR_SIDE {
+            self.air_map = writable_texture::<Rgba16Float>(width: AIR_SIDE, height: AIR_SIDE)
+            self.air_next = writable_texture::<Rgba16Float>(width: AIR_SIDE, height: AIR_SIDE)
+            self.air_band = writable_texture::<Rgba16Float>(width: AIR_SIDE, height: AIR_ROWS)
+        }
+        if self.air_row == 0 {
+            self.air_from = self.eye.at
+        }
+        label("sun on the air")
+        let to = min(self.air_row + AIR_ROWS, AIR_SIDE)
+        dispatch(
+            air_lit.bind(s: self.sun_air, shade: self.light.shade, air: self.air,
+                eye: self.air_from, from: self.air_row, to: to, out: mut self.air_band),
+            groups: (AIR_SIDE / 8, AIR_ROWS / 8, 1),
+        )
+        copy_texture(self.air_band.level(0), self.air_next.level_mut(0), height: to - self.air_row, to_y: self.air_row)
+        self.air_row = to
+        if to >= AIR_SIDE {
+            swap(mut self.air_map, mut self.air_next)
+            self.air_row = 0
+            self.air_whole = true
+            self.air_maps += 1
+        }
+    }
+
+    /// The sky as the last pass reads it: where the air is lit, its glow and the sun's light on
+    /// the air along a ray that meets nothing in one read (`sky::added`), made again when the
+    /// air's map or the glow is.
+    fn sky_seen(mut self) -> SkySeen {
+        if !self.air_whole || self.sun_air.light.w <= 0.0 {
+            return self.sky.seen(self.ink.glow)
+        }
+        if self.sky_added.width() != ADDED_WIDTH {
+            self.sky_added = writable_texture::<Rgba16Float>(width: ADDED_WIDTH, height: ADDED_HEIGHT)
+            self.added_for = vec3(-1.0)
+        }
+        let made = vec3(f32(self.air_maps), f32(self.sky.glows), self.ink.glow)
+        if made == self.added_for {
+            return self.sky.seen_added(self.sky_added)
+        }
+        self.added_for = made
+        label("sky added")
+        dispatch(
+            added.bind(glow: self.sky.glow, s: self.sky.s, glow_k: self.ink.glow, air: self.air_map,
+                airs: self.smooth, light: self.sun_air.light.xyz, out: mut self.sky_added),
+            groups: (ADDED_WIDTH / 8, ADDED_HEIGHT / 8, 1),
+        )
+        self.sky.seen_added(self.sky_added)
+    }
+
+    /// The sun's light on the air as the last pass reads it.
+    fn air_read(self) -> AirSeen {
+        let on = self.air_whole && self.sun_air.light.w > 0.0
+        AirSeen {
+            light: vec4(self.sun_air.light.xyz, if on { 1.0 } else { 0.0 }),
+            reach: self.sun_air.reach,
+            ceiling: self.sun_air.ceiling,
+            spare0: 0.0,
+            spare1: 0.0,
+        }
+    }
+
+    /// The text's glyphs written for the last pass.
+    fn glyphs_placed(mut self) {
+        let n = self.glyphs.len()
+        if n > 0 {
+            write(mut self.placed, 0, self.glyphs)
+        }
+    }
+
+    /// The frame ended: the last pass makes the screen from the picture, with `sky` where
+    /// nothing is, the text over it, and shows it.
+    pub fn end<P: Paint>(mut self, sky: P) {
+        self.sky.knee = if self.ink.glow > 0.0 { self.ink.glow_knee / self.ink.exposure } else { 1.0e9 }
+        self.sky.refresh(sky, self.eye)
+        self.air_marched()
+        self.cleared()
+        self.loaded()
+        self.inked()
+        self.finished()
+        let sky_seen = self.sky_seen()
+        label("last")
+        let screen = begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
+        draw(
+            screen,
+            cover,
+            last.bind(
+                self.eye,
+                air: self.air,
+                sun_air: self.air_read(),
+                air_map: self.air_map,
+                air_s: self.smooth,
+                sky: sky_seen,
+                style: self.ink,
+                moment: self.moment,
+                colour: self.colour,
+                edge: self.edge,
+                identity: self.identity,
+                depth: self.depth,
+                strokes: self.strokes,
+                paper: self.paper,
+                smoothed: self.marked.items(),
+                near: self.near,
+                lines: if self.lined { 1 } else { 0 },
+                finish: self.finish,
+                finish_s: self.smooth,
+                cover: false,
+                display: true,
+            ),
+            vertices: 3,
+        )
+        self.soft.lay(
+            screen,
+            self.eye,
+            self.ink,
+            self.moment,
+            self.depth,
+            self.paper,
+            display: true,
+        )
+        let n = self.glyphs.len()
+        if n > 0 {
+            draw(
+                screen,
+                glyph_corner.bind(glyphs: self.placed.items(), size: self.eye.size),
+                glyph_cover.bind(glyphs: self.placed.items(), style: self.ink, display: true),
+                vertices: 6,
+                instances: n,
+            )
+        }
+        screen.present()
+    }
+
+    /// The frame ended into `into` in place of the screen: linear light, with no paper, as the
+    /// judges read it (shown after by `show`); or (`alone`) its cover alone: what anything drew
+    /// white, nothing black, with no ink, soft things or text.
+    pub fn end_into<P: Paint>(
+        mut self,
+        sky: P,
+        into: mut Texture<Rgba16Float>,
+        alone: bool = false,
+    ) {
+        self.sky.knee = if self.ink.glow > 0.0 { self.ink.glow_knee / self.ink.exposure } else { 1.0e9 }
+        self.sky.refresh(sky, self.eye)
+        self.cleared()
+        self.loaded()
+        self.inked()
+        self.finished()
+        let sky_seen = self.sky_seen()
+        label("last")
+        let p = begin_pass(mut into, clear: vec4(0.0))
+        // (Cover alone is a pipeline of its own: the screen's carries none of it.)
+        if alone {
+            draw(
+                p,
+                cover,
+                last.bind(
+                    self.eye,
+                    air: self.air,
+                    sun_air: self.air_read(),
+                air_map: self.air_map,
+                air_s: self.smooth,
+                    sky: sky_seen,
+                    style: self.ink,
+                    moment: self.moment,
+                    colour: self.colour,
+                    edge: self.edge,
+                    identity: self.identity,
+                    depth: self.depth,
+                    strokes: self.strokes,
+                    paper: self.paper,
+                    smoothed: self.marked.items(),
+                    near: self.near,
+                    lines: if self.lined { 1 } else { 0 },
+                    finish: self.finish,
+                    finish_s: self.smooth,
+                        cover: true,
+                    display: false,
+                ),
+                vertices: 3,
+            )
+        } else {
+            draw(
+                p,
+                cover,
+                last.bind(
+                    self.eye,
+                    air: self.air,
+                    sun_air: self.air_read(),
+                air_map: self.air_map,
+                air_s: self.smooth,
+                    sky: sky_seen,
+                    style: self.ink,
+                    moment: self.moment,
+                    colour: self.colour,
+                    edge: self.edge,
+                    identity: self.identity,
+                    depth: self.depth,
+                    strokes: self.strokes,
+                    paper: self.paper,
+                    smoothed: self.marked.items(),
+                    near: self.near,
+                    lines: if self.lined { 1 } else { 0 },
+                    finish: self.finish,
+                    finish_s: self.smooth,
+                        cover: false,
+                    display: false,
+                ),
+                vertices: 3,
+            )
+        }
+        if !alone {
+            self.soft.lay(
+                p,
+                self.eye,
+                self.ink,
+                self.moment,
+                self.depth,
+                self.paper,
+                display: false,
+            )
+        }
+        let n = if alone { 0 } else { self.glyphs.len() }
+        if n > 0 {
+            draw(
+                p,
+                glyph_corner.bind(glyphs: self.placed.items(), size: self.eye.size),
+                glyph_cover.bind(glyphs: self.placed.items(), style: self.ink, display: false),
+                vertices: 6,
+                instances: n,
+            )
+        }
+        p.end()
+    }
+}
+
+@test
+fn a_record_of_strength_0_holds_its_edge_and_a_cleared_texel_none() {
+    // Smoothed with no line: the edge is held, its strength 0.
+    let r = edge_record(vec2(0.3, -0.4), 0.0, NO_LINE)
+    assert(edge_near(r) && edge_way(r) == vec2(0.3, -0.4) && edge_strength(r) == 0.0, f"{r}")
+    // A line at 0.75.
+    let s = edge_record(vec2(-1.0, 0.0), 0.75, NO_LINE)
+    assert(edge_near(s) && abs(edge_strength(s) - 0.75) < 1.0e-6, f"{s}")
+    // Past the reach, and a texel nothing drew (cleared to 0): no edge.
+    let far = edge_record(vec2(1.2, 1.2), 1.0, NO_LINE)
+    assert(!edge_near(far) && edge_way(far) == NO_EDGE && edge_strength(far) == 0.0, f"{far}")
+    assert(!edge_near(vec4(0.0)) && edge_way(vec4(0.0)) == NO_EDGE, "a cleared texel")
+}

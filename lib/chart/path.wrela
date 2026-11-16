@@ -1,0 +1,274 @@
+// The path a charted form is about: the line through a chain of joints, cut into short
+// straight pieces. A point's section is in the plane through it that turns from the plane at
+// one end of its piece (which halves the path's turn there) to the plane at the other, so
+// neighbouring pieces meet exactly. Angle 0 is the path's `up`, carried along it without
+// twisting; angles grow toward the left (`up × along`). From rywible/wrela's
+// engine/chart.wrela at 7ae6711e.
+
+/// The most vertices a path has, once cut into straight pieces.
+pub const VERTICES: u32 = 33
+
+/// A path cut into straight pieces: its vertices (`at`), the plane at each (`normal`, along the
+/// path), angle 0 there (`up`, in the plane), and the path's length to each (`along`).
+pub struct Path: Copy + GpuData {
+    pub at: [vec3; VERTICES],
+    pub normal: [vec3; VERTICES],
+    pub up: [vec3; VERTICES],
+    pub along: [f32; VERTICES],
+    pub vertices: u32,
+}
+
+/// The point at `t` (from `k.y` to `k.z`) on a centripetal Catmull–Rom curve through `p0` to
+/// `p3`, whose knots are `k` (Barry and Goldman's form).
+fn on_curve(p0: vec3, p1: vec3, p2: vec3, p3: vec3, k: vec4, t: f32) -> vec3 {
+    let a1 = mix(p0, p1, (t - k.x) / (k.y - k.x))
+    let a2 = mix(p1, p2, (t - k.y) / (k.z - k.y))
+    let a3 = mix(p2, p3, (t - k.z) / (k.w - k.z))
+    let b1 = mix(a1, a2, (t - k.x) / (k.z - k.x))
+    let b2 = mix(a2, a3, (t - k.y) / (k.w - k.y))
+    mix(b1, b2, (t - k.y) / (k.z - k.y))
+}
+
+/// `v` scaled to length 1, or held at length 10⁻⁹ or more before.
+pub(package) fn unit(v: vec3) -> vec3 {
+    v / max(length(v), 0.000000001)
+}
+
+/// `u` turned as the turn from unit `from` to unit `to` turns it.
+pub(package) fn carry(u: vec3, from: vec3, to: vec3) -> vec3 {
+    let axis = cross(from, to)
+    let s = length(axis)
+    let c = dot(from, to)
+    if s < 0.000001 {
+        return u
+    }
+    let k = axis / s
+    u * c + cross(k, u) * s + k * (dot(k, u) * (1.0 - c))
+}
+
+/// `u` (in the plane square to unit `n`) turned by `angle` about `n`, toward the left.
+fn turned(u: vec3, n: vec3, angle: f32) -> vec3 {
+    u * cos(angle) + cross(u, n) * sin(angle)
+}
+
+/// The angle from `u` to `to` about unit `n` (both in its plane, or brought into it), toward
+/// the left.
+pub(package) fn angle_between(u: vec3, to: vec3, n: vec3) -> f32 {
+    let uu = unit(u - n * dot(u, n))
+    atan2(dot(to, cross(uu, n)), dot(to, uu))
+}
+
+/// A path along a smooth curve through the first `count` of `points` (a straight line for two),
+/// angle 0 toward `up` at its start, and turned about itself by `twist` at each point (radians,
+/// toward the left; changing evenly between points).
+pub(package) fn laid(
+    points: [vec3; VERTICES],
+    twist: [f32; VERTICES],
+    count: u32,
+    up: vec3,
+) -> Path {
+    assert(count >= 2 && count <= VERTICES, "a path has 2 to 33 points")
+    for i in 1..count {
+        assert(length(points[i] - points[i - 1]) > 0.00001, "a path's points are apart")
+    }
+    // Each span between points in pieces: one for a straight path, else as many as fit.
+    let per = if count == 2 { 1 } else { min(8, (VERTICES - 1) / (count - 1)) }
+    var at = [vec3(); VERTICES]
+    var turn = [0.0; VERTICES]
+    var n = 0
+    for i in 0..count - 1 {
+        let p1 = points[i]
+        let p2 = points[i + 1]
+        let p0 = if i == 0 { 2.0 * p1 - p2 } else { points[i - 1] }
+        let p3 = if i + 2 == count { 2.0 * p2 - p1 } else { points[i + 2] }
+        // Centripetal knots: no loops or cusps where the points' spacing changes.
+        let k0 = 0.0
+        let k1 = k0 + max(sqrt(length(p1 - p0)), 0.0001)
+        let k2 = k1 + max(sqrt(length(p2 - p1)), 0.0001)
+        let k3 = k2 + max(sqrt(length(p3 - p2)), 0.0001)
+        for j in 0..per {
+            let x = f32(j) / f32(per)
+            at[n] = on_curve(p0, p1, p2, p3, vec4(k0, k1, k2, k3), k1 + (k2 - k1) * x)
+            turn[n] = mix(twist[i], twist[i + 1], x)
+            n += 1
+        }
+    }
+    at[n] = points[count - 1]
+    turn[n] = twist[count - 1]
+    n += 1
+    // The planes: square to the path at its ends, halving its turn at each vertex between.
+    var normal = [vec3(); VERTICES]
+    for i in 0..n {
+        let back = if i == 0 { at[1] - at[0] } else { at[i] - at[i - 1] }
+        let ahead = if i + 1 == n { at[i] - at[i - 1] } else { at[i + 1] - at[i] }
+        normal[i] = normalize(normalize(back) + normalize(ahead))
+    }
+    var frame = [vec3(); VERTICES]
+    var along = [0.0; VERTICES]
+    let u0 = up - normal[0] * dot(up, normal[0])
+    assert(length(u0) > 0.000001, "a path's up is along its start")
+    frame[0] = normalize(u0)
+    for i in 1..n {
+        let u = carry(frame[i - 1], normal[i - 1], normal[i])
+        frame[i] = normalize(u - normal[i] * dot(u, normal[i]))
+        along[i] = along[i - 1] + length(at[i] - at[i - 1])
+    }
+    for i in 0..n {
+        frame[i] = turned(frame[i], normal[i], turn[i])
+    }
+    Path { at, normal, up: frame, along, vertices: n }
+}
+
+/// A path along a smooth curve through `points` (a straight line for two), angle 0 toward `up`
+/// at its start and carried along it without twisting.
+pub fn path<const P: u32>(points: [vec3; P], up: vec3) -> Path {
+    assert(P >= 2 && P <= VERTICES, "a path has 2 to 33 points")
+    var all = [vec3(); VERTICES]
+    for i in 0..P {
+        all[i] = points[i]
+    }
+    laid(all, [0.0; VERTICES], P, up)
+}
+
+/// Where a point is about a path: how far along it (less than 0 before its start, more than its
+/// length past its end, by the distance past), how far from it, and at what angle (from up,
+/// toward the left).
+pub struct Place: Copy {
+    pub along: f32,
+    pub rho: f32,
+    pub theta: f32,
+}
+
+/// Where a point is about a piece of a path, but its angle (`Path::about`): its place (its
+/// `theta` 0), how far it's outside the piece's span, and what its angle needs: where it is in
+/// the piece's plane from the path (`q`), the plane (`n`, its normal), and how far the plane is
+/// from the piece's start to its end (`lam`).
+struct About: Copy {
+    place: Place,
+    outside: f32,
+    q: vec3,
+    n: vec3,
+    lam: f32,
+}
+
+/// How `nearest` ranks a piece: one whose span holds the point (`outside` 0) by its distance
+/// from the path in its plane, before any that doesn't; those by that and how far outside.
+fn rank(pl: Place, outside: f32) -> f32 {
+    select(
+        if_false: pl.rho,
+        if_true: 10000.0 + sqrt(pl.rho * pl.rho + outside * outside),
+        cond: outside > 0.0,
+    )
+}
+
+/// The section's plane at a place on a path: where the path is there, the way it runs, angle 0
+/// and a quarter turn to the left.
+pub struct Frame: Copy {
+    pub at: vec3,
+    pub along: vec3,
+    pub up: vec3,
+    pub left: vec3,
+}
+
+impl Path {
+    /// The path's length.
+    pub fn length(self) -> f32 {
+        self.along[self.vertices - 1]
+    }
+
+    /// How far `p` is past the plane at piece `i`'s start (toward its end) and before the plane
+    /// at its end, and how far outside the piece's span that puts it (but before the path's
+    /// start or past its end, which are the ends' regions).
+    fn span(self, i: u32, p: vec3) -> (f32, f32, f32) {
+        let g0 = dot(self.normal[i], p - self.at[i])
+        let g1 = dot(self.normal[i + 1], self.at[i + 1] - p)
+        let outside = select(if_false: max(-g0, 0.0), if_true: 0.0, cond: i == 0) +
+            select(if_false: max(-g1, 0.0), if_true: 0.0, cond: i + 2 == self.vertices)
+        (g0, g1, outside)
+    }
+
+    /// Where `p` is about piece `i` of the path, but its angle (`angled`): in the plane through
+    /// it of those that turn from the plane at the piece's start to the plane at its end, held
+    /// at the piece's ends; and how far `p` is outside the piece's span (`span`).
+    fn about(self, i: u32, p: vec3) -> About {
+        let a = self.at[i]
+        let b = self.at[i + 1]
+        let n0 = self.normal[i]
+        let n1 = self.normal[i + 1]
+        let (g0, g1, outside) = self.span(i, p)
+        let lam = saturate(g0 / max(g0 + g1, 0.000000001))
+        let w = unit(b - a)
+        let c0 = dot(n0, w)
+        let c1 = dot(n1, w)
+        let len = length(b - a)
+        let t = clamp(lam * len * c1 / max((1.0 - lam) * c0 + lam * c1, 0.000001), 0.0, len)
+        let n = unit(mix(n0, n1, lam))
+        let q = p - (a + w * t)
+        let q_in = q - n * dot(q, n)
+        // Before the path's start, or past its end: by how far.
+        let before = select(if_false: 0.0, if_true: min(g0, 0.0), cond: i == 0)
+        let past = select(if_false: 0.0, if_true: max(-g1, 0.0), cond: i + 2 == self.vertices)
+        let along = self.along[i] + t + before + past
+        About { place: Place { along, rho: length(q_in), theta: 0.0 }, outside, q: q_in, n, lam }
+    }
+
+    /// `a`'s place about piece `i`, with its angle: from up there, toward the left.
+    fn angled(self, i: u32, a: About) -> Place {
+        let u = mix(self.up[i], self.up[i + 1], a.lam)
+        let uu = unit(u - a.n * dot(u, a.n))
+        let v = cross(uu, a.n)
+        // On the path the angle is any: 0.
+        let theta = select(
+            if_false: atan2(dot(a.q, v), dot(a.q, uu)),
+            if_true: 0.0,
+            cond: a.place.rho < 0.000001,
+        )
+        Place { theta, ..a.place }
+    }
+
+    /// Where `p` is about the path (`Place`): about the piece whose span holds it. That piece is
+    /// the nearest by its distance from the path in its plane and how far it is outside the
+    /// piece's span (0 for that one); where two hold it, inside a sharp turn, the nearer.
+    pub fn place(self, p: vec3) -> Place {
+        var best = self.about(0, p)
+        var which = 0
+        var key = rank(best.place, best.outside)
+        for i in 1..min(self.vertices - 1, VERTICES - 1) {
+            let a = self.about(i, p)
+            let k = rank(a.place, a.outside)
+            if k < key {
+                best = a
+                which = i
+                key = k
+            }
+        }
+        self.angled(which, best)
+    }
+
+    /// The section's plane `s` metres along the path (held at its ends).
+    pub fn frame(self, s: f32) -> Frame {
+        // The piece of path that holds `s`.
+        var i = 0
+        for k in 1..min(self.vertices - 1, VERTICES - 1) {
+            if self.along[k] <= s {
+                i = k
+            }
+        }
+        let a = self.at[i]
+        let b = self.at[i + 1]
+        let seg = length(b - a)
+        let w = (b - a) / max(seg, 0.000000001)
+        let t = clamp(s - self.along[i], 0.0, seg)
+        let n0 = self.normal[i]
+        let n1 = self.normal[i + 1]
+        let c0 = dot(n0, w)
+        let c1 = dot(n1, w)
+        // How far the section's plane has turned from the piece's first to its last (`about`
+        // finds `t` from it; this is that, the other way).
+        let lam = saturate(t * c0 / max(seg * c1 + t * (c0 - c1), 0.000001))
+        let n = unit(mix(n0, n1, lam))
+        let u = mix(self.up[i], self.up[i + 1], lam)
+        let uu = unit(u - n * dot(u, n))
+        Frame { at: a + w * t, along: n, up: uu, left: cross(uu, n) }
+    }
+}

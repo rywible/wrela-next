@@ -1,0 +1,127 @@
+// A server's cryptography (language.md §19.4): randomness from the operating system, and signature
+// checks by the algorithms passkeys use, done by the server host with vetted libraries. Nothing
+// here is cryptography of std's own: each function is a request, answered on a later call.
+//
+// - `random(n)`: `n` bytes no one can guess, for a challenge, a session's token or a recovery code.
+// - `verify(algorithm, key, message, signature)`: whether `signature` is `key`'s over `message`.
+//   `verified` reads the answer. A key that isn't one of the algorithm's fails the request; a
+//   signature that's malformed is simply not the key's.
+// - `hmac(key, message)`: HMAC-SHA256 of `message` under `key` (RFC 2104, FIPS 180-4), 32
+//   bytes: a tag only the key's holder makes, such as a challenge the server checks later
+//   without keeping it. `same` compares two tags in time that doesn't depend on where they
+//   differ.
+
+use std::host::request
+use std::io::Pending
+use std::serialize::Writer
+
+/// The most bytes `random` gives at once.
+pub const MAX_RANDOM: u32 = 1024
+
+/// A signature algorithm, and the form of its keys and signatures.
+pub enum Signature: Copy + Eq {
+    /// ECDSA on P-256 with SHA-256 (COSE -7): a key is a SEC1 point, 65 bytes uncompressed
+    /// (`p256_key` makes one), and a signature is DER-encoded, as WebAuthn gives it.
+    Es256,
+    /// Ed25519 (COSE -8): a key is 32 bytes, and a signature 64.
+    Ed25519,
+    /// RSA PKCS #1 v1.5 with SHA-256 (COSE -257): a key is its modulus and exponent (`rsa_key`
+    /// makes one).
+    Rs256,
+}
+
+/// Asks for `n` random bytes (at most `MAX_RANDOM`).
+@server
+pub fn random(n: u32) -> Pending<u8> {
+    assert(n <= MAX_RANDOM, "at most 1024 random bytes at once")
+    var w = Writer::new()
+    w.write_u32(n)
+    request("crypto/random", take w.into_bytes())
+}
+
+/// Asks whether `signature` is `key`'s over `message`, by `algorithm`: `verified` reads the
+/// answer.
+@server
+pub fn verify(algorithm: Signature, key: [u8], message: [u8], signature: [u8]) -> Pending<u8> {
+    var w = Writer::new()
+    w.write_u8(match algorithm {
+        Signature::Es256 => 1,
+        Signature::Ed25519 => 2,
+        Signature::Rs256 => 3,
+    })
+    w.write_counted(key)
+    w.write_counted(message)
+    w.write_counted(signature)
+    request("crypto/verify", take w.into_bytes())
+}
+
+/// Whether a `verify`'s answer says the signature is the key's.
+pub fn verified(answer: [u8]) -> bool {
+    answer.len() == 1 && answer[0] == 1
+}
+
+/// The bytes an `hmac` answers with.
+pub const HMAC_BYTES: u32 = 32
+
+/// Asks for HMAC-SHA256 of `message` under `key` (any length; RFC 2104 hashes a key longer than
+/// 64 bytes first): the answer is the 32-byte tag.
+@server
+pub fn hmac(key: [u8], message: [u8]) -> Pending<u8> {
+    var w = Writer::new()
+    w.write_counted(key)
+    w.write_counted(message)
+    request("crypto/hmac", take w.into_bytes())
+}
+
+/// Whether `a` and `b` are the same bytes, in time that depends on their lengths alone, not on
+/// where they differ: for comparing a tag the client sent with the one `hmac` made.
+pub fn same(a: [u8], b: [u8]) -> bool {
+    if a.len() != b.len() {
+        return false
+    }
+    var differ: u8 = 0
+    for i in 0..a.len() {
+        differ = differ | (a[i] ^ b[i])
+    }
+    differ == 0
+}
+
+/// A P-256 key as `verify` takes it, from its coordinates (32 bytes each, big-endian, as COSE
+/// gives them): the uncompressed SEC1 point.
+pub fn p256_key(x: [u8], y: [u8]) -> Vec<u8> {
+    var out: Vec<u8> = Vec::with_capacity(65)
+    out.push(4)
+    for b in x {
+        out.push(b)
+    }
+    for b in y {
+        out.push(b)
+    }
+    out
+}
+
+/// An RSA key as `verify` takes it, from its modulus and exponent (big-endian, as COSE gives
+/// them).
+pub fn rsa_key(modulus: [u8], exponent: [u8]) -> Vec<u8> {
+    var w = Writer::new()
+    w.write_counted(modulus)
+    w.write_counted(exponent)
+    take w.into_bytes()
+}
+
+// ---- tests -------------------------------------------------------------------------------------
+
+@test
+fn keys_take_the_forms_the_host_reads() {
+    let p = p256_key([1; 32], [2; 32])
+    assert(p.len() == 65 && p[0] == 4 && p[1] == 1 && p[64] == 2)
+    let r = rsa_key([9, 9, 9], [1, 0, 1])
+    assert(r.len() == 14 && r[0] == 3 && r[7] == 3 && r[13] == 1)
+    assert(verified([1]) && !verified([0]) && !verified([]))
+}
+
+@test
+fn same_compares_every_byte() {
+    assert(same([1, 2, 3], [1, 2, 3]) && same([], []))
+    assert(!same([1, 2, 3], [1, 2, 4]) && !same([1, 2], [1, 2, 3]) && !same([9, 2, 3], [1, 2, 3]))
+}

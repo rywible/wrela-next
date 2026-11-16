@@ -1,0 +1,214 @@
+// The compiler's bar, row 2 (docs/design.md; docs/rates.md): a kernel that reads a constant table
+// by an index it works out, as the cloth's step read its legs' joints, `REST[THIGH_LEFT + 2 * seg
+// + side]` (game/hakuro/tails.wrela before e588442: the table of 57 joints was built in each
+// invocation's own memory, twice a node a pass; its 18 passes took 6.6 ms at 3840x2160 on the M4,
+// 0.22 ms with each joint read as its own constant). As first written (`MOVED` false) the kernel
+// indexes the table; as the hand moved it (`--set MOVED=true`) each joint it reads is a constant of
+// its own, picked by branches.
+//
+//     tools/wrela build toolchain/tests/rates/table -o <out> [--set MOVED=true] [--set LOAD=400]
+//
+// The 18 passes are labelled `cloth`; `load` holds the GPU's clock up beside them.
+use std::gpu::{
+    ClipPosition, FragCoord, GlobalId, GpuBuffer, R8, Slots, Texture, VertexIndex, begin_pass,
+    begin_screen_pass, buffer, dispatch, draw, label, texture,
+}
+
+/// Whether the joints are the hand's constants (true) or read from the table (false).
+pub const MOVED: bool = false
+
+/// Sines a pixel the load pass burns beside the frame (0: none).
+pub const LOAD: u32 = 0
+
+/// The cloth's nodes, and the passes of its step a frame.
+const NODES: u32 = 65536
+const PASSES: u32 = 18
+
+/// A body's joints at rest (m): 57 of them, as a rig's table holds them.
+const REST: [vec3; 57] = [
+    vec3(0.000, 1.500, 0.101),
+    vec3(0.307, 1.459, -0.083),
+    vec3(-0.079, 1.343, 0.059),
+    vec3(-0.287, 1.167, -0.033),
+    vec3(0.153, 0.954, 0.004),
+    vec3(0.248, 0.735, 0.025),
+    vec3(-0.217, 0.537, -0.052),
+    vec3(-0.192, 0.389, 0.076),
+    vec3(0.266, 0.310, -0.096),
+    vec3(0.123, 0.311, 0.111),
+    vec3(-0.298, 0.391, -0.119),
+    vec3(-0.046, 0.541, 0.120),
+    vec3(0.310, 0.739, -0.114),
+    vec3(-0.034, 0.958, 0.101),
+    vec3(-0.301, 1.170, -0.083),
+    vec3(0.111, 1.346, 0.059),
+    vec3(0.273, 1.461, -0.033),
+    vec3(-0.182, 1.500, 0.004),
+    vec3(-0.226, 1.458, 0.025),
+    vec3(0.240, 1.340, -0.052),
+    vec3(0.164, 1.163, 0.076),
+    vec3(-0.282, 0.950, -0.096),
+    vec3(-0.091, 0.731, 0.111),
+    vec3(0.306, 0.534, -0.119),
+    vec3(0.013, 0.387, 0.120),
+    vec3(-0.309, 0.309, -0.114),
+    vec3(0.067, 0.311, 0.101),
+    vec3(0.292, 0.393, -0.083),
+    vec3(-0.142, 0.544, 0.059),
+    vec3(-0.255, 0.743, -0.033),
+    vec3(0.208, 0.963, 0.004),
+    vec3(0.201, 1.174, 0.025),
+    vec3(-0.260, 1.349, -0.052),
+    vec3(-0.134, 1.462, 0.076),
+    vec3(0.294, 1.500, -0.096),
+    vec3(0.059, 1.456, 0.111),
+    vec3(-0.309, 1.338, -0.119),
+    vec3(0.021, 1.159, 0.120),
+    vec3(0.304, 0.946, -0.114),
+    vec3(-0.099, 0.727, 0.101),
+    vec3(-0.278, 0.531, -0.083),
+    vec3(0.171, 0.385, 0.060),
+    vec3(0.234, 0.308, -0.033),
+    vec3(-0.232, 0.312, 0.004),
+    vec3(-0.175, 0.396, 0.024),
+    vec3(0.277, 0.547, -0.052),
+    vec3(0.103, 0.746, 0.076),
+    vec3(-0.303, 0.967, -0.096),
+    vec3(-0.025, 1.178, 0.111),
+    vec3(0.310, 1.351, -0.119),
+    vec3(-0.055, 1.464, 0.120),
+    vec3(-0.296, 1.500, -0.114),
+    vec3(0.131, 1.455, 0.101),
+    vec3(0.262, 1.335, -0.083),
+    vec3(-0.198, 1.156, 0.060),
+    vec3(-0.211, 0.942, -0.033),
+    vec3(0.253, 0.723, 0.004),
+]
+
+const THIGH_LEFT: u32 = 13
+const CALF_LEFT: u32 = 15
+
+const HIP_L: vec3 = REST[THIGH_LEFT]
+const HIP_R: vec3 = REST[THIGH_LEFT + 1]
+const KNEE_L: vec3 = REST[CALF_LEFT]
+const KNEE_R: vec3 = REST[CALF_LEFT + 1]
+const ANKLE_L: vec3 = REST[CALF_LEFT + 2]
+const ANKLE_R: vec3 = REST[CALF_LEFT + 3]
+
+/// The joint at the upper end of length `seg` (0 the thigh, 1 the shin) of leg `side`.
+fn upper(side: u32, seg: u32) -> vec3 {
+    if MOVED {
+        if seg == 0 {
+            return if side == 0 { HIP_L } else { HIP_R }
+        }
+        return if side == 0 { KNEE_L } else { KNEE_R }
+    }
+    REST[THIGH_LEFT + 2 * seg + side]
+}
+
+/// The joint at its lower end.
+fn lower(side: u32, seg: u32) -> vec3 {
+    if MOVED {
+        if seg == 0 {
+            return if side == 0 { KNEE_L } else { KNEE_R }
+        }
+        return if side == 0 { ANKLE_L } else { ANKLE_R }
+    }
+    REST[CALF_LEFT + 2 * seg + side]
+}
+
+/// Node `id` pushed out of the leg's length nearest it, a capsule of radius 0.09 m: a pass of
+/// the cloth's step. Each node reads both lengths of its side's leg.
+@compute(64)
+fn step(nodes: mut Slots<vec4>, pass: u32, id: GlobalId) {
+    if id.x >= NODES {
+        return
+    }
+    var p = nodes[id].xyz
+    let side = (id.x >> 7) & 1
+    for seg in 0..2 {
+        let a = upper(side, (seg + pass) & 1)
+        let b = lower(side, (seg + pass) & 1)
+        let ab = b - a
+        let t = saturate(dot(p - a, ab) / max(dot(ab, ab), 1.0e-6))
+        let c = a + ab * t
+        let d = p - c
+        let l = length(d)
+        if l < 0.09 && l > 1.0e-6 {
+            p = c + d * (0.09 / l)
+        }
+    }
+    nodes[id] = vec4(p, 1.0)
+}
+
+/// The nodes' first places: a sheet about the legs.
+@compute(64)
+fn hang(nodes: mut Slots<vec4>, id: GlobalId) {
+    if id.x >= NODES {
+        return
+    }
+    let u = f32(id.x & 127) / 127.0
+    let v = f32(id.x >> 8) / 255.0
+    let side = f32((id.x >> 7) & 1)
+    nodes[id] = vec4(0.25 * side - 0.12 + 0.1 * u, 1.0 - 0.9 * v, 0.05 * sin(u * 6.0), 1.0)
+}
+
+@vertex
+fn cover(v: VertexIndex) -> ClipPosition {
+    let x = f32((v.index & 1) * 4) - 1.0
+    let y = f32((v.index & 2) * 2) - 1.0
+    ClipPosition { position: vec4(x, y, 0.0, 1.0) }
+}
+
+@fragment
+fn burn(pixel: FragCoord, rounds: u32) -> vec4 {
+    var x = pixel.position.x * 0.001 + pixel.position.y * 0.002
+    for _i in 0..rounds {
+        x = sin(x * 1.7 + 0.3) + cos(x * 0.9)
+    }
+    vec4(x, 0.0, 0.0, 1.0)
+}
+
+/// The nodes seen: a pixel's node, its depth as a grey.
+@fragment
+fn seen(pixel: FragCoord, nodes: [vec4]) -> vec4 {
+    let i = (u32(pixel.position.y) * 256 + u32(pixel.position.x)) % NODES
+    vec4(vec3(saturate(nodes[i].y)), 1.0)
+}
+
+pub struct Scene {
+    nodes: GpuBuffer<vec4>,
+    hung: bool,
+    burned: Texture<R8>,
+}
+
+pub fn init() -> Scene {
+    Scene {
+        nodes: buffer(NODES),
+        hung: false,
+        burned: texture(width: if LOAD > 0 { 1920 } else { 1 }, height: if LOAD > 0 {
+            1080
+        } else { 1 }),
+    }
+}
+
+pub fn frame(s: mut Scene, time: f32, width: u32, height: u32) {
+    if !s.hung {
+        dispatch(hang.bind(mut s.nodes), over: NODES)
+        s.hung = true
+    }
+    if LOAD > 0 {
+        label("load")
+        let p = begin_pass(mut s.burned, clear: vec4(0.0))
+        draw(p, cover, burn.bind(rounds: LOAD), vertices: 3)
+        p.end()
+    }
+    label("cloth")
+    for i in 0..PASSES {
+        dispatch(step.bind(mut s.nodes, pass: i), over: NODES)
+    }
+    label("seen")
+    let screen = begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
+    draw(screen, cover, seen.bind(nodes: s.nodes), vertices: 3)
+    screen.present()
+}

@@ -1,0 +1,273 @@
+// Sailing the skiff: the rules of play (docs/design.md, "The rules of play"): a pure function of
+// the helm's keys and the time, the same bits on every machine, reading no clock and no GPU. The
+// old opening's sailing (rywible/wrela 7ae6711e, scenes/opening/sail.wrela: `Rig`, `rest`,
+// `step`, `floats`, `polar`, `wind_off`, `flagged`; scenes/opening/wind.wrela: `air_over`;
+// scenes/opening/sea.wrela: `bearing`), its numbers unchanged:
+//
+// A small sail skiff with a free rig. Sheeted in (W or Up), it gathers way, slowly at first, then
+// lifts onto the plane and runs; it's quickest with the wind on its quarter, slow straight
+// downwind, and stalls heading into it. Let go, the sheet eases to a cruising trim; S or Down
+// lets the sail fly. A and D (or Left and Right) steer, a little even at rest, more under way.
+// It surfs down the swell's faces and is checked up their backs, heels to the sail's pull and
+// banks into its turns, and its boom keeps to its own side (it never swings right across). It is
+// held off the sea stacks' feet.
+//
+// What is not carried: the sail's cloth shapes and the traveller's body (`Motion`, `pose`: the
+// drawing's, not the rules'), the gamepad, and the climates (the old's clear weather 26 km behind
+// the skiff: everywhere the opening goes, the gale).
+
+use clusters::{CELL, cluster}
+use noise::noise
+use sea::{RIDING, SEA, height_at}
+
+/// The helm: which ways the keys hold this step.
+pub struct Helm: Copy {
+    pub sheet_in: bool,
+    pub let_fly: bool,
+    pub port: bool,
+    pub starboard: bool,
+}
+
+/// No key held.
+pub const IDLE = Helm { sheet_in: false, let_fly: false, port: false, starboard: false }
+
+/// The skiff under the helm.
+pub struct Rig: Copy {
+    /// Where it is (x, z, m) and how far it's been steered from its first heading (rad).
+    pub at: vec2,
+    pub steer: f32,
+    /// Its way through the water (m/s, forward positive) and its turning (rad/s).
+    pub speed: f32,
+    pub turn: f32,
+    /// How hard the sail is sheeted in, 0 (let fly) to 1 (sheeted hard): what the keys ask for,
+    /// and that eased.
+    pub trim: f32,
+    pub power: f32,
+    /// The boom's angle off the centreline aft (rad, positive to starboard), and the side the
+    /// sail sits (1 starboard, -1 port), which it keeps.
+    pub boom: f32,
+    pub tack: f32,
+    /// How far it heels (rad, positive starboard side down), and how fast.
+    pub heel: f32,
+    pub heel_rate: f32,
+    /// How it floats: its height, pitch and roll (`bearing`), the roll on a spring after the
+    /// sea's; and its roll's rate.
+    pub float: vec3,
+    pub roll_rate: f32,
+    /// How far onto the plane it is, 0 (pushing its bow wave) to 1 (skimming).
+    pub plane: f32,
+    /// The wind where it is: its gust (1 the mean) and how far it's veered (rad).
+    pub gust: f32,
+    pub veer: f32,
+    /// The camera's: how far it has swung after the steer (rad), the speed it has caught up with
+    /// (m/s), and which side of the wake it rides (-1 port to 1 starboard).
+    pub look: f32,
+    pub rush: f32,
+    pub perch: f32,
+    /// The time it was last stepped to (s).
+    pub time: f32,
+}
+
+/// Its best speed through the water, the wind on its quarter and the sail sheeted hard (m/s,
+/// before the gusts); the trim it keeps once W is let go; how fast it turns under way (rad/s).
+pub const RUN: f32 = 10.5
+pub const CRUISE: f32 = 0.6
+pub const TURN_RATE: f32 = 0.62
+
+/// The skiff's heading with no steer (rad from +z toward +x: sail.wrela:373).
+pub const YAW: f32 = -0.22
+
+/// The wind's heading (where it blows to) in the skiff's frame at heading `yaw`: (across, along).
+fn wind_in(yaw: f32) -> vec2 {
+    let w = SEA.wind
+    vec2(w.x * cos(yaw) - w.y * sin(yaw), w.x * sin(yaw) + w.y * cos(yaw))
+}
+
+/// Where the wind comes from, off the bow (rad, -π to π, positive from starboard), at heading
+/// `yaw`.
+pub fn wind_off(yaw: f32) -> f32 {
+    let w = wind_in(yaw)
+    atan2(-w.x, -w.y)
+}
+
+/// The boom let fly at heading `steer`: streaming with the wind, as a flag does.
+fn flagged(steer: f32, veer: f32) -> f32 {
+    -wind_off(YAW + steer + veer)
+}
+
+/// How fast it sails (of `RUN`) with the wind `off` the bow (rad): nothing heading into it, more
+/// as it bears away, best on a broad reach, a little less straight downwind.
+pub fn polar(off: f32) -> f32 {
+    let a = abs(off)
+    smoothstep(0.55, 1.25, a) * (0.72 + 0.3 * exp(-(a - 2.05) * (a - 2.05) / 0.45))
+}
+
+/// The gust cells' sizes (m): broad gusts, and the puffs inside them (wind.wrela:37-38).
+const BROAD: f32 = 85.0
+const PUFF: f32 = 25.0
+
+/// The wind's gust (1 the mean) and veer (rad) at `xz` at time `t`: cells of gusts and lulls
+/// carried down the gale (wind.wrela:41-55, `air_over`, over the storm's mean).
+pub fn air_at(xz: vec2, t: f32) -> vec2 {
+    let at = xz - SEA.wind * (SEA.speed * t)
+    let g = noise(at / BROAD) * 0.65 + noise(at / PUFF) * 0.35
+    let veer = (noise(at / (BROAD * 1.7) + vec2(31.0, 7.0)) - 0.5) * 0.3
+    vec2(0.78 + 0.5 * g, veer)
+}
+
+/// How the sea under the skiff at `at` (x, z), steered `steer`, would hold it at `t` were it
+/// weightless: its height, and how far it'd pitch (bow up, rise a metre along) and roll
+/// (starboard up, a metre across), read at its bow, stern, either side and twice its middle
+/// (sea.wrela:134-160): the swell it rides (`RIDING`).
+pub fn bearing(t: f32, at: vec2, steer: f32) -> vec3 {
+    let yaw = YAW + 0.05 * sin(t * 0.23) + steer
+    let along = vec2(sin(yaw), cos(yaw))
+    let across = vec2(cos(yaw), -sin(yaw))
+    // (Its five places summed at once, as a body's: lib/sea's `Swell::under`.)
+    let u = RIDING.under(RIDING.moment(t), at, along * 1.5, across * 0.5)
+    let y = (u.bow + u.stern + u.port + u.star + u.mid * 2.0) / 6.0 - 0.11
+    vec3(y, (u.bow - u.stern) / 3.0 * 0.8, (u.star - u.port) / 1.0 * 0.6)
+}
+
+/// The skiff at rest at the origin, at time `time`, its sail let fly, flagging downwind.
+pub fn rest(time: f32) -> Rig {
+    let boom = flagged(steer: 0.0, veer: 0.0)
+    Rig {
+        at: vec2(0.0),
+        steer: 0.0,
+        speed: 0.0,
+        turn: 0.0,
+        trim: 0.0,
+        power: 0.0,
+        boom,
+        tack: if boom >= 0.0 { 1.0 } else { -1.0 },
+        heel: 0.0,
+        heel_rate: 0.0,
+        float: bearing(time, vec2(0.0), 0.0),
+        roll_rate: 0.0,
+        plane: 0.0,
+        gust: 1.0,
+        veer: 0.0,
+        look: 0.0,
+        rush: 0.0,
+        perch: 1.0,
+        time,
+    }
+}
+
+/// How stiffly the skiff rolls back to where the sea would hold it, and how hard the water damps
+/// it (per s², per s: sail.wrela:466-467): a narrow hull under a standing traveller is tender.
+const ROLL_STIFF: f32 = 13.0
+const ROLL_DAMP: f32 = 1.0
+
+/// How far off a sea stack's foot the skiff is held (m), past the stack's girth there.
+const KEEP_OFF: f32 = 4.0
+
+/// The skiff stepped on to `time` (s) by the keys `helm` holds (sail.wrela:358-453).
+pub fn step(r0: Rig, helm: Helm, time: f32) -> Rig {
+    var r = r0
+    let dt = clamp(time - r.time, 0.0, 0.1)
+    r.time = time
+    if dt <= 0.0 {
+        return r
+    }
+    // The sheet: W draws it in (held, harder), let go it eases to a cruising trim, S lets it fly.
+    if helm.sheet_in {
+        r.trim = min(r.trim + dt * 1.6, 1.0)
+    } else if helm.let_fly {
+        r.trim = max(r.trim - dt * 1.4, 0.0)
+    } else if r.trim > CRUISE {
+        r.trim = max(r.trim - dt * 0.35, CRUISE)
+    }
+    r.power += (r.trim - r.power) * (1.0 - exp(-dt * (if r.trim < r.power { 5.0 } else { 3.0 })))
+    let air = air_at(r.at, time)
+    r.gust = air.x
+    r.veer = air.y
+    let yaw = YAW + r.steer
+    let off = wind_off(yaw + r.veer)
+    let heading = vec2(sin(yaw), cos(yaw))
+    // Its way: toward what the wind and the sheet give it; slow from rest, then a surge as it
+    // lifts onto the plane; braked when the sail's let fly. Down a swell's face it surfs, up the
+    // back it slows.
+    let want = RUN * polar(off) * r.power * r.gust
+    let rate = if want > r.speed { mix(0.3, 0.9, r.plane) } else { mix(0.3, 1.2, 1.0 - r.power) }
+    r.speed += (want - r.speed) * rate * dt
+    let now = RIDING.moment(time)
+    let bow = height_at(RIDING, now, r.at + heading * 1.6)
+    let stern = height_at(RIDING, now, r.at - heading * 1.6)
+    r.speed -= 9.81 * (bow - stern) / 3.2 * 0.5 * dt
+    // (A hard turn bleeds its way.)
+    r.speed -= abs(r.turn) * max(r.speed, 0.0) * 0.18 * dt
+    r.speed = max(r.speed, -0.5)
+    let planing = smoothstep(3.6, 6.0, r.speed)
+    r.plane += (planing - r.plane) * (1.0 - exp(-dt * (if planing > r.plane { 1.6 } else { 3.0 })))
+    // Steering: a little even at rest, more as it carves under way.
+    let wheel = (if helm.starboard { 1.0 } else { 0.0 }) - (if helm.port { 1.0 } else { 0.0 })
+    let grip = 0.4 + 0.6 * smoothstep(0.0, 5.0, r.speed)
+    r.turn += (wheel * TURN_RATE * grip - r.turn) * (1.0 - exp(-dt * 2.6))
+    r.steer += r.turn * dt
+    r.at += heading * r.speed * dt
+    // Never into a rock: held off a sea stack's foot, its way lost against it.
+    // (A cluster's main stack, its girth at its widest; only the cells round the skiff can hold
+    // one near it.)
+    let home = floor(r.at / CELL)
+    for j in 0..9 {
+        let cl = cluster(home + vec2(f32(j % 3) - 1.0, f32(j / 3) - 1.0))
+        if cl.z > 0.0 {
+            let girth = (4.5 + cl.z * 0.16) * 1.7 * 1.3
+            let away = r.at - cl.xy
+            let d = length(away)
+            if d < girth + KEEP_OFF {
+                r.at = cl.xy + away / max(d, 1.0e-3) * (girth + KEEP_OFF)
+                r.speed *= exp(-dt * 3.0)
+            }
+        }
+    }
+    // The boom: on its own side always; sheeted, held where the wind wants it; let fly, streaming
+    // out with the wind as far as its side lets it.
+    let side = r.tack
+    let trimmed = side * clamp((abs(off) - 0.45) * 0.62, 0.12, 1.42)
+    let free = side * clamp(-off * side, 0.15, 1.5)
+    let k = smoothstep(0.0, 0.55, r.power)
+    r.boom += (mix(free, trimmed, k) - r.boom) * (1.0 - exp(-dt * (1.6 + 1.2 * k)))
+    // Heeling: the sail's pull to leeward, and banked into its turns; on a spring.
+    let pull = r.power * sin(abs(off)) * polar(off) * r.gust
+    let lean = side * (0.3 * pull + 0.1 * r.power * r.gust) * (1.0 - 0.3 * r.plane) +
+        r.turn * clamp(r.speed, 0.0, 9.0) * 0.12
+    r.heel_rate += ((lean - r.heel) * 22.0 - r.heel_rate * 5.0) * dt
+    r.heel += r.heel_rate * dt
+    // Its float: its height and pitch the sea's own, its roll sprung after the sea's, in steps
+    // short enough for the spring.
+    let want_f = bearing(time, r.at, r.steer)
+    let steps = ceil(dt / 0.02)
+    let h = dt / max(steps, 1.0)
+    var roll = r.float.z
+    var rr = r.roll_rate
+    var n = 0.0
+    while n < steps {
+        rr += ((want_f.z - roll) * ROLL_STIFF - rr * ROLL_DAMP) * h
+        roll += rr * h
+        n += 1.0
+    }
+    r.float = vec3(want_f.x, want_f.y, roll)
+    r.roll_rate = rr
+    // The camera: swung round after the bow, lagging it; falling back as it surges.
+    r.look += (r.steer - r.look) * (1.0 - exp(-dt * 0.9))
+    r.rush += (r.speed - r.rush) * (1.0 - exp(-dt * 0.9))
+    let windward = if r.boom > 0.0 { -1.0 } else { 1.0 }
+    r.perch += (windward - r.perch) * (1.0 - exp(-dt * 0.35))
+    r
+}
+
+/// The helm a fixed run is sailed by, at `t` s into it: the bench's and the tests' (a run must
+/// be the same every time). At rest for 3 s, as the opening finds the skiff; then sheeted in and
+/// bearing away onto a broad reach; a turn to port at 14 s held for 3 s; the sheet eased at 24
+/// s; a turn to starboard at 30 s; let fly at 50 s.
+pub fn scripted(t: f32) -> Helm {
+    Helm {
+        sheet_in: (t >= 3.0 && t < 24.0) || (t >= 32.0 && t < 50.0),
+        let_fly: t >= 50.0,
+        port: t >= 14.0 && t < 17.0,
+        starboard: (t >= 4.0 && t < 6.0) || (t >= 30.0 && t < 33.0),
+    }
+}

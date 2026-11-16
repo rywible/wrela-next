@@ -1,0 +1,182 @@
+// The frame's light, as every lister shades by it: one call from a place, a normal and what the
+// surface wears to a colour, through lib/form's one shading function (`lit`): `shaded` from a
+// look, `worn` from the skin a lister worked out itself.
+
+use form::look::{Look, Place, Skin}
+use form::shade::{KINETIC_INK, Lights, MOST_LIGHTS, NO_LIGHTS, NO_SKY_LIGHT, SkyLight, Steps, Style, lit}
+use held::{Held, sky_seen}
+use sun::{SunShade, through_clouds}
+
+/// The light a scene hands its frame (`Frame::begin`): the game's style, the way toward the sun
+/// (a unit vector), the ground's height (m: `lit` darkens what's near it), and the live lights.
+pub struct Shine: Copy {
+    pub style: Style,
+    pub sun: vec3,
+    pub ground: f32,
+    pub lights: Lights,
+}
+
+/// The light a frame is drawn in, as every pixel program reads it: the scene's (`Shine`), the
+/// sky's light (`SkyLight`, the frame's sky as it falls on a face), what holds the light
+/// off a point (`held::Held`), and how much of the sun's beam its clouds let through
+/// (`sun::SunShade`).
+pub struct Lighting: Copy + GpuData {
+    pub style: Style,
+    pub sun: vec3,
+    pub ground: f32,
+    pub lights: Lights,
+    pub sky: SkyLight,
+    pub held: Held,
+    pub shade: SunShade,
+}
+
+/// Kinetic Ink's style, the sun toward `sun` (a unit vector), the ground at `ground` m, no live
+/// lights.
+pub fn sunlit(sun: vec3, ground: f32) -> Shine {
+    Shine { style: KINETIC_INK, sun, ground, lights: NO_LIGHTS }
+}
+
+/// The frame's light: `shine`, lit by the sky's light `sky`, held off by `held` and its sun by
+/// its clouds (`shade`).
+pub fn lighting(shine: Shine, sky: SkyLight, held: Held, shade: SunShade) -> Lighting {
+    Lighting { style: shine.style, sun: shine.sun, ground: shine.ground, lights: shine.lights, sky, held, shade }
+}
+
+/// How much of the sun's beam reaches `p`: what the clouds let through.
+pub fn sun_reach(light: Lighting, p: vec3) -> f32 {
+    through_clouds(light.shade, p)
+}
+
+/// The sun's glitter on water facing `n` (its mean normal over the pixel), `reach` of the sun's
+/// beam reaching it (`sun_reach`), seen from
+/// `toward`, its facets' slopes spread `spread` (their variance, the slopes the pixel holds):
+/// the sun's light reflected by the facets turned to mirror it (Beckmann's distribution, Schlick's
+/// Fresnel with water's 0.02), as much of it as reaches the point; nothing where the style takes
+/// no sun. (The old opening's `glitter`, scenes/opening/paint.wrela:724-757, isotropic.)
+pub fn sun_glint(light: Lighting, reach: f32, n: vec3, toward: vec3, spread: f32) -> vec3 {
+    let sun = light.style.sun
+    if reach <= 0.0 || dot(sun, sun) <= 0.0 || dot(n, light.sun) <= 0.0 {
+        return vec3(0.0)
+    }
+    let h = normalize(light.sun + toward)
+    let c = max(dot(n, h), 1.0e-3)
+    let c2 = c * c
+    let m2 = max(spread, 1.0e-3)
+    let d = exp(-(1.0 - c2) / (c2 * m2)) / (3.14159265 * m2 * c2 * c2)
+    let f = 0.02 + 0.98 * pow(1.0 - saturate(dot(h, toward)), 5.0)
+    // (The sun's light on a face square to it is π `style.sun`: `lit` takes `sun` as it falls on
+    // a matte face, over π.)
+    sun * (3.14159265 * reach * f * d / (4.0 * max(dot(n, toward), 0.05)))
+}
+
+/// How many live lights a pixel program is built to light by (`form::shade::lit`'s `live`), as a
+/// type: a lister's one draw site, generic over it, binds `lights: K::LIVE`, a pipeline for each
+/// (`Unlit`, none: no loop over them; `OneLit`; `AllLit`, `MOST_LIGHTS`), and `lit_by` picks.
+pub trait Lit {
+    const LIVE: u32
+}
+
+pub struct Unlit {}
+
+pub struct OneLit {}
+
+pub struct AllLit {}
+
+impl Lit for Unlit {
+    const LIVE: u32 = 0
+}
+
+impl Lit for OneLit {
+    const LIVE: u32 = 1
+}
+
+impl Lit for AllLit {
+    const LIVE: u32 = MOST_LIGHTS
+}
+
+/// Which pipeline a lister draws a part from `lo` to `hi` with, as `lights` are lit: 0 for
+/// `Unlit` (no light reaches it), 1 for `OneLit` (one is lit), 2 for `AllLit`.
+pub fn lit_by(lights: Lights, lo: vec3, hi: vec3) -> u32 {
+    if !reaches(lights, lo, hi) { 0 } else if lights.count == 1 { 1 } else { 2 }
+}
+
+/// Whether a live light of `lights` reaches into the box from `lo` to `hi`: a point of it within
+/// the light's reach. A lister whose part of a surface none reaches draws it as if none were lit:
+/// past its reach a light lights nothing (`form::shade::lit`).
+pub fn reaches(lights: Lights, lo: vec3, hi: vec3) -> bool {
+    for i in 0..min(lights.count, MOST_LIGHTS) {
+        let l = lights.each[i]
+        if length(clamp(l.at, lo, hi) - l.at) < l.reach {
+            return true
+        }
+    }
+    false
+}
+
+/// A surface shaded: its colour (linear), and its look's line field there (ink is drawn where it
+/// changes sign).
+pub struct Shaded: Copy {
+    pub colour: vec3,
+    pub line: f32,
+}
+
+/// What `look` wears at `p` (the world's, at rest: nothing here moves) facing `n`, lit as `light`
+/// says, seen from `toward` (a unit vector toward the eye); `steps` how the point and normal
+/// change a pixel across and down (to hold band edges to a pixel); as much of the sky as the
+/// solids round it leave it (`held::sky_seen`). `live`: the most live lights it's lit by
+/// (`lit`'s).
+pub fn shaded<L: Look>(
+    light: Lighting,
+    look: L,
+    p: vec3,
+    n: vec3,
+    toward: vec3,
+    steps: Steps,
+    live: u32 = MOST_LIGHTS,
+) -> Shaded {
+    worn(
+        light,
+        look.skin(Place { world: p, rest: p, chart: None, normal: n }),
+        p,
+        n,
+        toward,
+        steps,
+        live,
+    )
+}
+
+/// What `sky` is where the store is to be asked at the pixel (`worn`'s default).
+pub const ASKED: f32 = -1.0
+
+/// `skin` at `p` facing `n`, lit as `shaded` lights a look's: for a lister that works out what
+/// its surface wears itself (from its vertices, or a chart's place a `Look` isn't handed).
+/// `sky`: how much of the sky reaches the point, where the lister has asked the store at a
+/// lower rate (a vertex's, between its pixels); else the store is asked here. `reach`, the same
+/// for the sun's beam past the clouds (`sun_reach`).
+pub fn worn(
+    light: Lighting,
+    skin: Skin,
+    p: vec3,
+    n: vec3,
+    toward: vec3,
+    steps: Steps,
+    live: u32 = MOST_LIGHTS,
+    sky: f32 = ASKED,
+    reach: f32 = ASKED,
+) -> Shaded {
+    let colour = lit(
+        light.style,
+        skin,
+        n,
+        light.sun,
+        toward,
+        reach: if reach >= 0.0 { reach } else { sun_reach(light, p) },
+        sky: if sky >= 0.0 { sky } else { sky_seen(light.held, p, n) },
+        height: p.y - light.ground,
+        steps: steps,
+        around: light.lights.from(p),
+        live: live,
+        skylight: light.sky,
+    )
+    Shaded { colour, line: skin.line }
+}

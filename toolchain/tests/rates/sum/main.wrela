@@ -1,0 +1,122 @@
+// The compiler's bar, row 1 (docs/design.md; docs/rates.md): a pixel program that asks for a sum
+// over 6,561 constant terms where it uses it, as the sea's look asked `breaks()` (game/shore/
+// sea.wrela, before 7d4c2d5: a band's slope variance over its waves, `ocean::slope_variance`).
+// Every input of the sum is a constant, so its value is the same at every pixel and in every
+// build. As first written (`MOVED` false) the pixel program asks for it; as the hand moved it
+// (`--set MOVED=true`) it is a `const`, which the build computes once.
+//
+//     tools/wrela build toolchain/tests/rates/sum -o <out> [--set MOVED=true] [--set LOAD=400]
+//
+// The pass under test is labelled `sum`; `load` (sines a pixel) holds the GPU's clock up beside
+// it while it's timed (docs/vulkan.md).
+use std::gpu::{
+    ClipPosition, FragCoord, R8, Texture, VertexIndex, begin_pass, begin_screen_pass, draw,
+    label, texture,
+}
+
+/// Whether the sum is the hand's `const` (true) or asked for where it's used (false).
+pub const MOVED: bool = false
+
+/// Sines a pixel the load pass burns beside the frame (0: none).
+pub const LOAD: u32 = 0
+
+/// The waves' grid: a side of 64 m, 81 by 81 wavenumbers about none.
+const SIDE: f32 = 64.0
+const REACH: i32 = 40
+/// The spectrum's peak (rad/s), its scale and how far its peak is raised (JONSWAP's).
+const PEAK: f32 = 0.9
+const ALPHA: f32 = 0.0081
+const GAMMA: f32 = 3.3
+/// The band the sum keeps: wavenumbers from `LO` to `HI` (rad/m).
+const LO: f32 = 0.3
+const HI: f32 = 1.2
+
+/// JONSWAP's density at wavenumber `k`, spread about the wind's heading (as lib/sea's
+/// `density`): what wave `k` holds of the sea's height, squared.
+fn density(k: vec2) -> f32 {
+    let kk = length(k)
+    let w = sqrt(9.81 * kk)
+    let sigma = if w <= PEAK { 0.07 } else { 0.09 }
+    let r = exp(-(w - PEAK) * (w - PEAK) / (2.0 * sigma * sigma * PEAK * PEAK))
+    let q = PEAK / w
+    let q2 = q * q
+    let s = ALPHA * 9.81 * 9.81 / pow(w, 5.0) * exp(-1.25 * q2 * q2) * pow(GAMMA, r)
+    let spread = 0.2821 * sqrt(4.25) * pow(abs(cos(atan2(k.y, k.x) * 0.5)), 8.0)
+    s * spread * 0.5 * sqrt(9.81 / kk) / kk
+}
+
+/// The band's slope variance: a sum over its 6,561 waves, most of them outside the band.
+fn slopes() -> f32 {
+    let dk = 6.2831853 / SIDE
+    var sum = 0.0
+    for y in -REACH..REACH + 1 {
+        for x in -REACH..REACH + 1 {
+            let k = vec2(f32(x), f32(y)) * dk
+            let kk = length(k)
+            if kk > 0.0 && kk >= LO && kk < HI {
+                sum += density(k) * dk * dk * kk * kk
+            }
+        }
+    }
+    sum
+}
+
+/// The hand's move: the sum worked out once when the game is built.
+const SLOPES: f32 = slopes()
+
+/// How far under 1 a crest's squeeze must go for it to break, and over how much it whitens
+/// (the sea's `breaks()`).
+fn breaks() -> vec2 {
+    let spread = sqrt(if MOVED { SLOPES } else { slopes() })
+    vec2(1.0 - 2.1 * spread, 0.45 * spread)
+}
+
+@vertex
+fn cover(v: VertexIndex) -> ClipPosition {
+    let x = f32((v.index & 1) * 4) - 1.0
+    let y = f32((v.index & 2) * 2) - 1.0
+    ClipPosition { position: vec4(x, y, 0.0, 1.0) }
+}
+
+/// A sea's foam by its squeeze: the squeeze a pattern across the screen, the foam where it
+/// passes the breaking threshold.
+@fragment
+fn foam(pixel: FragCoord, time: f32) -> vec4 {
+    let b = breaks()
+    let p = pixel.position.xy
+    let fold = 0.5 + 0.5 * sin(p.x * 0.013 + time) * cos(p.y * 0.011 - 0.7 * time)
+    let white = saturate((b.x - fold) / b.y)
+    vec4(vec3(0.05, 0.2, 0.25) + vec3(white), 1.0)
+}
+
+@fragment
+fn burn(pixel: FragCoord, rounds: u32) -> vec4 {
+    var x = pixel.position.x * 0.001 + pixel.position.y * 0.002
+    for _i in 0..rounds {
+        x = sin(x * 1.7 + 0.3) + cos(x * 0.9)
+    }
+    vec4(x, 0.0, 0.0, 1.0)
+}
+
+pub struct Scene {
+    burned: Texture<R8>,
+}
+
+pub fn init() -> Scene {
+    Scene { burned: texture(width: if LOAD > 0 { 1920 } else { 1 }, height: if LOAD > 0 {
+        1080
+    } else { 1 }) }
+}
+
+pub fn frame(s: mut Scene, time: f32, width: u32, height: u32) {
+    if LOAD > 0 {
+        label("load")
+        let p = begin_pass(mut s.burned, clear: vec4(0.0))
+        draw(p, cover, burn.bind(rounds: LOAD), vertices: 3)
+        p.end()
+    }
+    label("sum")
+    let screen = begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
+    draw(screen, cover, foam.bind(time: time), vertices: 3)
+    screen.present()
+}

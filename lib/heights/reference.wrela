@@ -1,0 +1,266 @@
+// The reference height charts are held to (`frame::judge`): one look of it a frame, drawn into
+// a judge's look targets with the judge's eye (its rays moved within their pixels), so the mean
+// of many looks is what each pixel would show if it saw all of itself. The sky where nothing is;
+// then each chart from rings four times as fine as the lister's, every pixel worked out at its
+// own place with nothing filtered: for the land, its normal from the chart's derived tangents
+// and its look asked there; for the sea, the short bands' slopes read at their finest, the long
+// bands' as the finer vertices hold them, and the mirror through the capillaries' roughness
+// alone. The band edges are plain (`STILL`): the mean of the looks softens them as a pixel would.
+
+use form::kinds::{Chart, Paint}
+use form::look::{Look, Place}
+use form::shade::STILL
+use frame::eye::{Eye, NEARER}
+use frame::judge::Judge
+use frame::last::{cover, painted}
+use frame::light::{Lighting, shaded, worn}
+use lister::{FINEST, Grounds}
+use ocean::spectrum::SIDES
+use ocean::swell::Shape
+use ocean::tiles::{band_at, level_for, slopes_at}
+use ocean::waters::{UNSTEPPED, Waters, Wet}
+use rings::{Layout, Rings, placed, rings}
+use frame::sky::{SkyTable, mirror}
+use std::derive::gradient
+use std::gpu::{
+    ClipPosition, Compare, Depth, FragCoord, InstanceIndex, Rgba16Float, Sampler, Targets2, Texture,
+    Texture3d, VertexIndex, begin_pass2_with_depth, draw, label,
+}
+use tiled::{Long, Seas}
+
+/// A vertex of the reference: where it is, and its rest place.
+pub struct Fine: Copy {
+    pub clip: ClipPosition,
+    pub world: vec3,
+    pub rest: vec2,
+}
+
+/// The sky where nothing is: a look's colour, no normal, no depth.
+@fragment
+fn sky_look<P: Paint>(pixel: FragCoord, eye: Eye, sky: P) -> Targets2<vec4, vec4> {
+    Targets2 { first: vec4(painted(eye, sky, eye.ray(pixel.position.xy)), 1.0), second: vec4(0.0) }
+}
+
+/// A vertex of a chart drawn by its function, at the reference's rings.
+@vertex
+fn ground_fine<C: Chart>(
+    v: VertexIndex,
+    i: InstanceIndex,
+    eye: Eye,
+    layout: Layout,
+    chart: C,
+) -> Fine {
+    let at = placed(layout, v.index, i.index)
+    let p = chart.at(at.rest)
+    Fine { clip: ClipPosition { position: eye.clip(p) }, world: p, rest: at.rest }
+}
+
+/// A pixel of a chart drawn by its function: at its own place, its normal from the chart's
+/// derived tangents, its look asked there.
+@fragment
+fn ground_look<C: Chart, L: Look>(
+    f: Fine,
+    eye: Eye,
+    light: Lighting,
+    chart: C,
+    look: L,
+) -> Targets2<vec4, vec4> {
+    let uv = f.rest
+    let gx = gradient(|q: vec2| chart.at(q).x, uv)
+    let gy = gradient(|q: vec2| chart.at(q).y, uv)
+    let gz = gradient(|q: vec2| chart.at(q).z, uv)
+    let du = vec3(gx.x, gy.x, gz.x)
+    let dv = vec3(gx.y, gy.y, gz.y)
+    var n = normalize(cross(dv, du))
+    if n.y < 0.0 {
+        n = -n
+    }
+    let p = chart.at(uv)
+    let toward = normalize(eye.at - p)
+    let s = shaded(light, look, p, n, toward, STILL)
+    Targets2 { first: vec4(s.colour, 1.0), second: vec4(n, 0.0) }
+}
+
+/// What the reference's sea pixel reads: the short bands' tilts (at their finest), the sky's
+/// table, and the capillaries' roughness.
+pub borrow struct Finest {
+    pub fine_tilt: borrow Texture<Rgba16Float>,
+    pub ripple_tilt: borrow Texture<Rgba16Float>,
+    pub s: borrow Sampler,
+    pub sky: borrow Texture3d<Rgba16Float>,
+    pub sky_s: borrow Sampler,
+    pub unseen: f32,
+}
+
+/// A vertex of the sea, at the reference's rings.
+pub struct Wave: Copy {
+    pub clip: ClipPosition,
+    pub world: vec3,
+    pub du: vec3,
+    pub dv: vec3,
+    pub kept: vec4,
+    pub more: vec4,
+    pub rest: vec2,
+}
+
+/// A vertex of the sea at the reference's rings: as the lister's, its long bands read at its
+/// own spacing.
+@vertex
+fn sea_fine<W: Waters>(
+    v: VertexIndex,
+    i: InstanceIndex,
+    eye: Eye,
+    layout: Layout,
+    sea: W,
+    long: Long,
+) -> Wave {
+    let at = placed(layout, v.index, i.index)
+    let big = band_at(
+        long.big_was,
+        long.big_tilt_was,
+        long.big_shape,
+        long.big_tilt,
+        long.between.x,
+        long.s,
+        SIDES.x,
+        long.lean,
+        at.rest,
+        level_for(SIDES.x, at.spacing),
+    )
+    let mid = band_at(
+        long.mid_was,
+        long.mid_tilt_was,
+        long.mid_shape,
+        long.mid_tilt,
+        long.between.y,
+        long.s,
+        SIDES.y,
+        long.lean,
+        at.rest,
+        level_for(SIDES.y, at.spacing),
+    )
+    let w = sea.wet(at.rest, big, mid)
+    Wave {
+        clip: ClipPosition { position: eye.clip(w.shape.at) },
+        world: w.shape.at,
+        du: w.shape.du,
+        dv: w.shape.dv,
+        kept: w.kept,
+        more: w.more,
+        rest: at.rest,
+    }
+}
+
+/// A pixel of the sea: its short bands' slopes at their finest, nothing filtered.
+@fragment
+fn sea_look<W: Waters>(
+    f: Wave,
+    eye: Eye,
+    light: Lighting,
+    sea: W,
+    finest: Finest,
+) -> Targets2<vec4, vec4> {
+    let none = vec2(0.0)
+    let (fine_u, fine_v) = slopes_at(finest.fine_tilt, finest.s, SIDES.z, f.rest, none, none)
+    let (rip_u, rip_v) = slopes_at(finest.ripple_tilt, finest.s, SIDES.w, f.rest, none, none)
+    let w = Wet {
+        shape: Shape { at: f.world, du: f.du, dv: f.dv },
+        kept: f.kept,
+        more: f.more,
+        foam: UNSTEPPED,
+        marks: UNSTEPPED,
+        trail: UNSTEPPED,
+        pattern: UNSTEPPED,
+    }
+    let k = sea.short(w)
+    let n = normalize(cross(f.dv + (fine_v + rip_v) * k, f.du + (fine_u + rip_u) * k))
+    let toward = normalize(eye.at - f.world)
+    let r = n * (2.0 * dot(n, toward)) - toward
+    let sky = mirror(finest.sky, finest.sky_s, r, sqrt(finest.unseen))
+    let s = worn(light, sea.skin(w, n), f.world, n, toward, STILL)
+    let behind = mirror(finest.sky, finest.sky_s, normalize(vec3(-toward.x, 0.006, -toward.z)), 0.0)
+    // (One facet a look: the normal's own Fresnel, water's.)
+    let g = 1.0 - saturate(dot(n, toward))
+    let f = 0.02 + 0.98 * g * g * g * g * g
+    Targets2 { first: vec4(sea.seen(w, n, toward, s.colour, vec4(sky, f), behind), 1.0), second: vec4(n, 0.0) }
+}
+
+/// The reference's rings: four times as fine as the lister's.
+pub struct Reference {
+    rings: Rings,
+}
+
+/// A reference.
+pub fn reference() -> Reference {
+    Reference { rings: rings(FINEST / 4.0) }
+}
+
+impl Reference {
+    /// One look of the reference into `judge`'s look targets, seen by `eye` (the judge's,
+    /// `Judge::looking`) in `light`: `sky` where nothing is (the paint itself), the land `land`,
+    /// and the sea `sea`, mirroring the frame's sky table `table`.
+    pub fn look<C: Chart, L: Look, W: Waters + Chart, P: Paint>(
+        self,
+        judge: mut Judge,
+        eye: Eye,
+        light: Lighting,
+        sky: P,
+        land: Grounds<C, L>,
+        sea: Seas<W>,
+        table: SkyTable,
+    ) {
+        label("reference")
+        let b = land.chart.bound()
+        let (ground, ground_runs) = self.rings.frame(eye, land.chart.domain(), b.lo.y, b.hi.y)
+        let reach = sea.reach()
+        let (water, water_runs) = self.rings.frame(eye, sea.waters.domain(), -reach, reach)
+        let long = sea.long()
+        let finest = Finest {
+            fine_tilt: sea.ocean.fine.tilt,
+            ripple_tilt: sea.ocean.ripple.tilt,
+            s: sea.ocean.mips,
+            sky: table.mirror,
+            sky_s: table.s,
+            unseen: sea.ocean.view().unseen,
+        }
+        let p = begin_pass2_with_depth(
+            mut judge.look_colour,
+            mut judge.look_normal,
+            mut judge.look_depth,
+            clear: vec4(0.0),
+            clear_depth: 0.0,
+        )
+        draw(
+            p,
+            cover,
+            sky_look.bind(eye, sky: sky),
+            vertices: 3,
+            depth: Depth { compare: Compare::Always, write: false },
+        )
+        for r in ground_runs {
+            draw(
+                p,
+                ground_fine.bind(eye, layout: ground, chart: land.chart),
+                ground_look.bind(eye, light: light, chart: land.chart, look: land.look),
+                indices: self.rings.indices,
+                index_count: r.count,
+                first_index: r.first,
+                first_instance: r.level,
+                depth: NEARER,
+            )
+        }
+        for r in water_runs {
+            draw(
+                p,
+                sea_fine.bind(eye, layout: water, sea: sea.waters, long: long),
+                sea_look.bind(eye, light: light, sea: sea.waters, finest: finest),
+                indices: self.rings.indices,
+                index_count: r.count,
+                first_index: r.first,
+                first_instance: r.level,
+                depth: NEARER,
+            )
+        }
+        p.end()
+    }
+}

@@ -1,0 +1,462 @@
+// The ink held to the exact answer: a lister that writes known edges into the picture's targets
+// (`drawn`), and a judge (`proved`) that holds the strokes the ink draws from them to the cover a
+// band of the pen's width round each true edge gives, worked out from 16 × 16 looks a pixel.
+//
+// The picture, in units of the screen's height H (x across, y down):
+//
+//   A  a disc against nothing: a body's outline, all the way round
+//   L  a body cut by a line at 17 degrees: an outline straight across the pixels
+//   O  a disc in front of another disc: the line between two bodies
+//   S  a body whose look's line field is the distance (px) to a line at 61 degrees: a seam
+//   G  a body in two ink groups, split down a pixel's edge: a line between them
+//   N  a body in one ink group, its two halves different colours: no line
+//
+// Every edge but G's, N's and S's is in the edge records, the way to it exact; G's and N's are
+// changes of identity no record holds; S's is the line field alone. The pen is held still for
+// the judge (`STILL_PEN`: no wobble, no shove), so its radius is `base` scaled, and each line's
+// cover is the exact share of a pixel within that radius of the true edge.
+
+use eye::NEARER
+use form::ink::{InkStyle, KINETIC_INK_LINES}
+use last::cover
+use picture::{EDGE_REACH, Frame, NO_EDGE, NO_LINE, SOLID, edge_record, identity}
+use std::gpu::{
+    Atomics, FragCoord, GlobalId, GpuBuffer, Rg8, Targets3, Texture, WithDepth,
+    begin_pass3_with_depth, buffer_of, dispatch, draw, label, read,
+}
+use std::io::{Pending, print}
+
+/// Today's pen held still: no wobble, no shove, so a line's width is the pen's alone.
+pub const STILL_PEN = InkStyle { wob: 0.0, wob_energy: 0.0, shove: 0.0, ..KINETIC_INK_LINES }
+
+/// The features, in px on the screen they're drawn on, and how far off (px, across each edge)
+/// their records are written: 0, or a break, to show the judge sees a line out of place.
+pub struct Proof: Copy + GpuData {
+    pub a_c: vec2,
+    pub a_r: f32,
+    pub off: f32,
+    pub l_lo: vec2,
+    pub l_hi: vec2,
+    pub l_at: vec2,
+    pub b_c: vec2,
+    pub b_r: f32,
+    pub c_r: f32,
+    pub c_c: vec2,
+    pub s_lo: vec2,
+    pub s_hi: vec2,
+    pub s_mid: vec2,
+    pub g_lo: vec2,
+    pub g_hi: vec2,
+    pub n_lo: vec2,
+    pub n_hi: vec2,
+    pub g_x: f32,
+    pub n_x: f32,
+}
+
+/// The features on a screen `h` px tall, their records `off` px off.
+pub fn proof_at(h: f32, off: f32) -> Proof {
+    Proof {
+        a_c: vec2(0.25, 0.3) * h,
+        a_r: 0.18 * h,
+        off,
+        l_lo: vec2(0.5, 0.08) * h,
+        l_hi: vec2(1.0, 0.52) * h,
+        l_at: vec2(0.75, 0.3) * h,
+        b_c: vec2(1.25, 0.3) * h,
+        b_r: 0.19 * h,
+        c_r: 0.11 * h,
+        c_c: vec2(1.33, 0.36) * h,
+        s_lo: vec2(0.1, 0.62) * h,
+        s_hi: vec2(0.6, 0.95) * h,
+        s_mid: vec2(0.35, 0.785) * h,
+        g_lo: vec2(0.75, 0.62) * h,
+        g_hi: vec2(1.05, 0.95) * h,
+        n_lo: vec2(1.2, 0.62) * h,
+        n_hi: vec2(1.5, 0.95) * h,
+        g_x: floor(0.9 * h),
+        n_x: floor(1.35 * h),
+    }
+}
+
+const T17 = vec2(0.956305, 0.292372)
+const N61 = vec2(0.484810, 0.874620)
+
+fn circle(p: vec2, c: vec2, r: f32) -> f32 {
+    length(p - c) - r
+}
+
+/// The way from `p` (inside the box `lo` to `hi`) to its nearest side, and how far.
+fn to_side(p: vec2, lo: vec2, hi: vec2) -> vec2 {
+    let l = p.x - lo.x
+    let r = hi.x - p.x
+    let t = p.y - lo.y
+    let b = hi.y - p.y
+    var way = vec2(-l, 0.0)
+    if r < length(way) {
+        way = vec2(r, 0.0)
+    }
+    if t < length(way) {
+        way = vec2(0.0, -t)
+    }
+    if b < length(way) {
+        way = vec2(0.0, b)
+    }
+    way
+}
+
+fn inside(p: vec2, lo: vec2, hi: vec2) -> bool {
+    p.x > lo.x && p.x < hi.x && p.y > lo.y && p.y < hi.y
+}
+
+/// The signed distance (px) from the line L to `p`, positive below it.
+fn l_side(sc: Proof, p: vec2) -> f32 {
+    dot(p - sc.l_at, vec2(-T17.y, T17.x))
+}
+
+/// The proof's pixel: the nearest feature it is inside, written as a lister writes it.
+@fragment
+pub fn drawn(pixel: FragCoord, proof: Proof) -> WithDepth<Targets3<vec4, vec4, u32>> {
+    let sc = proof
+    let p = pixel.position.xy
+    let grey = vec4(0.2, 0.2, 0.2, 0.0)
+    var depth = 0.0
+    var way = NO_EDGE
+    var id: u32 = 0
+    var line = NO_LINE
+    var colour = grey
+    // A
+    let da = circle(p, sc.a_c, sc.a_r)
+    if da < 0.0 {
+        depth = 0.5
+        way = normalize(p - sc.a_c) * (-da)
+        id = identity(SOLID, body: 1, group: 0)
+    }
+    // L: the box above the line
+    if inside(p, sc.l_lo, sc.l_hi) && l_side(sc, p) < 0.0 {
+        depth = 0.5
+        let side = to_side(p, sc.l_lo, sc.l_hi)
+        let ls = l_side(sc, p)
+        way = vec2(-T17.y, T17.x) * (-ls)
+        if length(side) < -ls {
+            way = side
+        }
+        id = identity(SOLID, body: 2, group: 0)
+    }
+    // O: B behind, C in front
+    let db = circle(p, sc.b_c, sc.b_r)
+    if db < 0.0 {
+        depth = 0.4
+        way = normalize(p - sc.b_c) * (-db)
+        id = identity(SOLID, body: 4, group: 0)
+    }
+    let dc = circle(p, sc.c_c, sc.c_r)
+    if dc < 0.0 {
+        depth = 0.6
+        way = normalize(p - sc.c_c) * (-dc)
+        id = identity(SOLID, body: 5, group: 0)
+    }
+    // S
+    if inside(p, sc.s_lo, sc.s_hi) {
+        depth = 0.5
+        way = to_side(p, sc.s_lo, sc.s_hi)
+        id = identity(SOLID, body: 6, group: 0)
+        line = dot(p - sc.s_mid, N61)
+    }
+    // G: two groups
+    if inside(p, sc.g_lo, sc.g_hi) {
+        depth = 0.5
+        way = to_side(p, sc.g_lo, sc.g_hi)
+        id = identity(SOLID, 7, if p.x < sc.g_x { 0 } else { 1 })
+    }
+    // N: one group, two colours
+    if inside(p, sc.n_lo, sc.n_hi) {
+        depth = 0.5
+        way = to_side(p, sc.n_lo, sc.n_hi)
+        id = identity(SOLID, body: 8, group: 0)
+        colour = if p.x < sc.n_x { grey } else { vec4(0.4, 0.4, 0.4, 0.0) }
+    }
+    let off = length(way)
+    if off > 0.0 && off < 2.0 * EDGE_REACH {
+        way = way * ((off + proof.off) / off)
+    }
+    WithDepth {
+        color: Targets3 { first: colour, second: edge_record(way, 1.0, line), third: id },
+        depth: if depth > 0.0 { depth } else { 0.0 },
+    }
+}
+
+/// How many numbers `proved` counts: `EACH` for each of the six features.
+pub const EACH: u32 = 8
+pub const FEATURES: u32 = 6
+
+/// The signed distance (px) from feature `k`'s true edge to `p`.
+fn signed(sc: Proof, k: u32, p: vec2) -> f32 {
+    if k == 0 {
+        return circle(p, sc.a_c, sc.a_r)
+    }
+    if k == 1 {
+        return l_side(sc, p)
+    }
+    if k == 2 {
+        return circle(p, sc.c_c, sc.c_r)
+    }
+    if k == 3 {
+        return dot(p - sc.s_mid, N61)
+    }
+    if k == 4 {
+        return p.x - sc.g_x
+    }
+    p.x - sc.n_x
+}
+
+/// Feature `k`'s true edge as a curve: a circle (`x` 1; its centre and radius in `y`), or a
+/// line (`x` 0; a point on it and its unit normal in `y`).
+struct Curve: Copy {
+    round: f32,
+    shape: vec4,
+}
+
+fn curve(sc: Proof, k: u32) -> Curve {
+    if k == 0 {
+        return Curve { round: 1.0, shape: vec4(sc.a_c, sc.a_r, 0.0) }
+    }
+    if k == 1 {
+        return Curve { round: 0.0, shape: vec4(sc.l_at, vec2(-T17.y, T17.x)) }
+    }
+    if k == 2 {
+        return Curve { round: 1.0, shape: vec4(sc.c_c, sc.c_r, 0.0) }
+    }
+    if k == 3 {
+        return Curve { round: 0.0, shape: vec4(sc.s_mid, N61) }
+    }
+    if k == 4 {
+        return Curve { round: 0.0, shape: vec4(sc.g_x, 0.0, 1.0, 0.0) }
+    }
+    Curve { round: 0.0, shape: vec4(sc.n_x, 0.0, 1.0, 0.0) }
+}
+
+/// The signed distance (px) from curve `c` to `p`.
+fn off_curve(c: Curve, p: vec2) -> f32 {
+    let d = p - c.shape.xy
+    mix(dot(d, c.shape.zw), length(d) - c.shape.z, c.round)
+}
+
+/// Whether pixel middle `p` is in feature `k`'s region, `m` px either side of its edge and
+/// `keep` px clear of the rest of the picture.
+fn in_region(sc: Proof, k: u32, p: vec2, m: f32, keep: f32) -> bool {
+    let d = signed(sc, k, p)
+    if abs(d) >= m {
+        return false
+    }
+    if k == 0 {
+        return true
+    }
+    if k == 1 {
+        return p.x > sc.l_lo.x + keep && p.x < sc.l_hi.x - keep
+    }
+    if k == 2 {
+        return circle(p, sc.b_c, sc.b_r) < -keep
+    }
+    if k == 3 {
+        return inside(p, sc.s_lo + vec2(keep), sc.s_hi - vec2(keep))
+    }
+    if k == 4 {
+        return inside(p, sc.g_lo + vec2(keep), sc.g_hi - vec2(keep))
+    }
+    inside(p, sc.n_lo + vec2(keep), sc.n_hi - vec2(keep))
+}
+
+/// How strong feature `k`'s line is to be (0: none).
+fn strength(s: InkStyle, k: u32) -> f32 {
+    if k == 3 { s.seam } else if k == 5 { 0.0 } else { s.outline }
+}
+
+/// The ink's cover against the exact answer, a pixel an invocation, for each feature (its
+/// `EACH` numbers from `k · EACH`):
+///
+///   0 pixels in its region            1 the exact cover, summed (of 1000)
+///   2 the ink's, summed (of 1000)     3 their difference, summed (of 1000)
+///   4 the most difference (of 1000)   5 pixels more than 0.1 apart
+///   6 the ink's cover times (the distance from the edge + 8 px), summed (of 1000)
+///   7 the exact cover's, likewise
+///
+/// A feature that is to have no line counts its cover against 0, as a share of the outline's.
+@compute(8, 8)
+pub fn proved(
+    strokes: Texture<Rg8>,
+    style: InkStyle,
+    proof: Proof,
+    scale: f32,
+    out: mut Atomics<u32>,
+    id: GlobalId,
+) {
+    if id.x >= strokes.width() || id.y >= strokes.height() {
+        return
+    }
+    let sc = proof
+    let p = vec2(f32(id.x) + 0.5, f32(id.y) + 0.5)
+    let r = scale * style.base
+    let ink = strokes.load(id.x, id.y).x
+    for k in 0..FEATURES {
+        if in_region(sc, k, p, m: r + 2.0, keep: r + 6.0) {
+            let d = signed(sc, k, p)
+            let want = strength(style, k)
+            var exact = 0.0
+            let c = curve(sc, k)
+            if want > 0.0 {
+                for j in 0..16 {
+                    for i in 0..16 {
+                        let q = p + (vec2(f32(i), f32(j)) + vec2(0.5)) / 16.0 - vec2(0.5)
+                        if abs(off_curve(c, q)) <= r {
+                            exact += 1.0 / 256.0
+                        }
+                    }
+                }
+            }
+            let strong = if want > 0.0 { want } else { style.outline }
+            let got = ink / strong
+            let apart = abs(got - exact)
+            let at = k * EACH
+            let _ = out.add(i: at, value: 1)
+            let _ = out.add(i: at + 1, value: u32(exact * 1000.0 + 0.5))
+            let _ = out.add(i: at + 2, value: u32(got * 1000.0 + 0.5))
+            let _ = out.add(i: at + 3, value: u32(apart * 1000.0 + 0.5))
+            let _ = out.max(i: at + 4, value: u32(apart * 1000.0 + 0.5))
+            if apart > 0.1 {
+                let _ = out.add(i: at + 5, value: 1)
+            }
+            let _ = out.add(i: at + 6, value: u32(got * (d + 8.0) * 1000.0 + 0.5))
+            let _ = out.add(i: at + 7, value: u32(exact * (d + 8.0) * 1000.0 + 0.5))
+        }
+    }
+}
+
+/// The proof: its features drawn into a frame's picture each frame, and once the judge's counts.
+pub struct Proving {
+    pub off: f32,
+    /// How far the features move a frame (px, across and down): the proof under motion, each
+    /// line judged at another place in its pixels.
+    pub drift: vec2,
+    /// How many frames to judge, and how many have been.
+    pub frames: u32,
+    judged: u32,
+    shown: u32,
+    pub proof: Proof,
+    counts: Option<Pending<u32>>,
+}
+
+pub fn proving(off: f32, drift: vec2 = vec2(0.0), frames: u32 = 1) -> Proving {
+    Proving {
+        off,
+        drift,
+        frames,
+        judged: 0,
+        shown: 0,
+        proof: proof_at(1.0, off),
+        counts: None,
+    }
+}
+
+const NAMES = [
+    "A disc's outline",
+    "L a line at 17 degrees",
+    "O a disc over a disc",
+    "S a seam",
+    "G two ink groups",
+    "N one ink group",
+]
+
+/// The proof `p` moved by `by` (px).
+fn moved(p: Proof, by: vec2) -> Proof {
+    var q = p
+    q.a_c += by
+    q.l_lo += by
+    q.l_hi += by
+    q.l_at += by
+    q.b_c += by
+    q.c_c += by
+    q.s_lo += by
+    q.s_hi += by
+    q.s_mid += by
+    q.g_lo += by
+    q.g_hi += by
+    q.n_lo += by
+    q.n_hi += by
+    q.g_x = floor(q.g_x + by.x)
+    q.n_x = floor(q.n_x + by.x)
+    q
+}
+
+impl Proving {
+    /// The features, as a lister draws them into `frame`'s picture.
+    pub fn draw(mut self, frame: mut Frame) {
+        self.proof = moved(proof_at(frame.eye.size.y, self.off), self.drift * f32(self.shown))
+        self.shown += 1
+        label("proof")
+        let first = frame.first()
+        let q = begin_pass3_with_depth(
+            mut frame.colour,
+            mut frame.edge,
+            mut frame.identity,
+            mut frame.depth,
+            clear: vec4(0.0),
+            keep: !first,
+            clear_depth: 0.0,
+            keep_depth: !first,
+        )
+        draw(q, cover, drawn.bind(proof: self.proof), vertices: 3, depth: NEARER)
+        q.end()
+    }
+
+    /// After `frame` has ended (its strokes drawn): the judge, on this frame if the last judged
+    /// has been heard, until `frames` have been; each one's counts said when read.
+    pub fn judge(mut self, frame: Frame) {
+        match mut self.counts {
+            Some(c) => match c.poll() {
+                Some(Ok(v)) => {
+                    self.said(frame, take v)
+                    self.counts = None
+                },
+                _ => {},
+            },
+            None => {},
+        }
+        if self.counts.is_none() && self.judged < self.frames {
+            let w = u32(frame.eye.size.x)
+            let h = u32(frame.eye.size.y)
+            var out: GpuBuffer<u32> = buffer_of(Vec::filled(EACH * FEATURES, 0))
+            label("proved")
+            dispatch(
+                proved.bind(
+                    strokes: frame.strokes,
+                    style: frame.ink,
+                    proof: self.proof,
+                    scale: frame.eye.size.y / frame.ink.lines,
+                    out: mut out,
+                ),
+                groups: ((w + 7) / 8, (h + 7) / 8, 1),
+            )
+            self.counts = Some(read(out.items()))
+            self.judged += 1
+        }
+    }
+
+    fn said(self, frame: Frame, v: Vec<u32>) {
+        let r = frame.eye.size.y / frame.ink.lines * frame.ink.base
+        print(
+            f"proof: pen radius {r} px, records off by {self.off} px, the features moved {self.proof.a_c - proof_at(frame.eye.size.y, self.off).a_c} px",
+        )
+        for k in 0..FEATURES {
+            let a = k * EACH
+            let n = max(f32(v[a]), 1.0)
+            let exact = f32(v[a + 1]) / 1000.0
+            let got = f32(v[a + 2]) / 1000.0
+            let width = if exact > 0.0 { 2.0 * r * got / exact } else { got }
+            let place = if got > 0.0 { f32(v[a + 6]) / 1000.0 / got - 8.0 } else { 0.0 }
+            let true_place = if exact > 0.0 { f32(v[a + 7]) / 1000.0 / exact - 8.0 } else { 0.0 }
+            print(
+                f"proof: {NAMES[k]}: {v[a]} px; cover {got} against exact {exact} ({if exact > 0.0 { 100.0 * got / exact } else { 0.0 }}%), width {width} px (pen {2.0 * r}); centre {place - true_place} px off; |ink - exact| mean {f32(v[a + 3]) / 1000.0 / n}, most {f32(v[a + 4]) / 1000.0}; {v[a + 5]} px over 0.1",
+            )
+        }
+    }
+}

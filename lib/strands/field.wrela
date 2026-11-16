@@ -1,0 +1,436 @@
+// The lister of scattered strands, as a scene uses it: a scatter (where copies stand, each a
+// function of its cell of ground) and the look its copies wear, handed over once; each frame
+// the copies the eye can see placed on the GPU and drawn into the frame's picture as ribbons.
+//
+//     var grass = strands::field::field(Meadow { wind }, GrassLook {}, body: 2, rule: RULE)  // once
+//     grass.scatter = Meadow { wind: wind_at(t) }                               // each frame
+//     grass.place(eye, "grass placed")                                            // each frame
+//     frame.draw(|d| { ...; grass.draw_into(d) })                                 // each frame
+//
+// A frame of it is two steps: `place` (compute, labelled as named: each cell of the blocks
+// listed round the eye, before the picture's pass opens) and `draw_into` (the ribbons drawn into
+// the picture's one pass, `Frame::draw`).
+
+use blocks::{Block, CELLS, listed}
+use form::kinds::Strand
+use frame::eye::{Eye, NEARER, NOTHING_DEEP}
+use frame::light::{AllLit, Lighting, Lit, OneLit, Unlit, lit_by}
+use frame::picture::{Drawing, STRAND, identity}
+use kept::Rule
+use place::{Candidate, LEVELS, counted, grouped, listed_cells, placed}
+use frame::judge::Judge
+use ribbon::{BATCH, Laid, Strip, corner, ribbon_indices, shade, shade_look}
+use scatter::{Scatter, Wears}
+use std::gpu::{
+    AppendBuffer, Cull, DispatchArgs, DrawIndexedArgs, FragmentShader, GpuBuffer, RenderPass,
+    append_buffer, begin_pass2_with_depth, buffer, buffer_of, dispatch, draw, label, read, write,
+}
+use std::collections::swap
+use std::io::{Pending, print}
+
+/// How many copies the lister holds room for at first; it grows when a frame asks for more.
+const ROOM: u32 = 131072
+
+/// How many cells the lister holds room for that may hold a copy drawn, at first.
+const CELL_ROOM: u32 = 262144
+
+/// How many blocks of the reference are placed and drawn at once: as many cells as `CELL_ROOM`.
+const REF_BLOCKS: u32 = 256
+
+/// How many frames apart the count of copies placed is read back.
+const COUNTED: u32 = 60
+
+/// The copies drawn on ribbons of one number of segments: room for them, the draw's arguments,
+/// its triangles' corners, and how many the last count read back said were placed.
+pub struct List<S> {
+    pub segments: u32,
+    laid: AppendBuffer<Laid<S>>,
+    args: GpuBuffer<DrawIndexedArgs>,
+    indices: GpuBuffer<u32>,
+    heard: Option<Pending<u32>>,
+    pub count: u32,
+}
+
+fn list<S: Strand>(segments: u32, room: u32) -> List<S> {
+    List {
+        segments,
+        laid: append_buffer(room),
+        args: no_draw(),
+        indices: buffer_of(ribbon_indices(segments)),
+        heard: None,
+        count: 0,
+    }
+}
+
+impl<S: Strand> List<S> {
+    /// The draw's arguments from the count (on the GPU).
+    fn counted(mut self) {
+        dispatch(
+            counted.bind(
+                count: self.laid.count(),
+                room: self.laid.capacity(),
+                indices: 6 * self.segments * BATCH,
+                out: mut self.args,
+            ),
+            groups: 1,
+        )
+    }
+
+    /// The count read back (asked when `ask`), and the room grown if it was short.
+    fn heard(mut self, ask: bool) {
+        match mut self.heard {
+            Some(p) => match p.poll() {
+                Some(Ok(v)) => {
+                    self.count = v[0]
+                    self.heard = None
+                    if v[0] > self.laid.capacity() {
+                        self.laid = append_buffer(v[0] + v[0] / 4)
+                    }
+                },
+                _ => {},
+            },
+            None => {
+                if ask {
+                    self.heard = Some(read(self.laid.count()))
+                }
+            },
+        }
+    }
+
+    /// Its copies drawn into `pass` as `eye` sees them, wearing `look`, shaded by `pixel`.
+    fn drawn_into<P: RenderPass, L: Wears<S>, F: FragmentShader<Strip>>(
+        self,
+        pass: P,
+        eye: Eye,
+        look: L,
+        pixel: F,
+        own: bool,
+        thinnest: f32,
+        lean: f32,
+        contrast: f32,
+    ) {
+        draw(
+            pass,
+            corner.bind(
+                eye,
+                laid: self.laid.items(),
+                count: self.laid.count(),
+                look: look,
+                segments: self.segments,
+                own: if own { 1 } else { 0 },
+                thinnest: thinnest,
+                lean: lean,
+                contrast: contrast,
+            ),
+            pixel,
+            indices: self.indices,
+            indirect: self.args,
+            cull: Cull::None,
+            depth: NEARER,
+        )
+    }
+
+    /// Its copies drawn into the picture's pass (`d`) as `drawn_into` draws them, shaded by
+    /// `ribbon::shade` with `field`'s identity and ink, by its pipeline for `K`'s live lights.
+    fn drawn_lit<C: Scatter<S>, L: Wears<S>, K: Lit>(
+        self,
+        d: Drawing,
+        field: Field<S, C, L>,
+        _lit: K,
+    ) {
+        draw(
+            d.pass,
+            corner.bind(
+                d.eye,
+                laid: self.laid.items(),
+                count: self.laid.count(),
+                look: field.look,
+                segments: self.segments,
+                own: if field.own { 1 } else { 0 },
+                thinnest: field.thinnest,
+                lean: field.lean,
+                contrast: field.contrast,
+            ),
+            shade.bind(
+                d.eye,
+                light: d.light,
+                id: field.identity,
+                edged: field.edged,
+                ink: field.ink,
+                cover: if field.cover { 1 } else { 0 },
+                lights: K::LIVE,
+            ),
+            indices: self.indices,
+            indirect: self.args,
+            cull: Cull::None,
+            depth: NEARER,
+        )
+    }
+}
+
+/// The lister: the scatter and the look, the copies' body (their identity's), the rule they're
+/// kept and widened by, how far their light leans to their host's normal, how many segments a
+/// ribbon has; this frame's blocks and copies, and the draw's arguments.
+pub struct Field<S, C, L> {
+    pub scatter: C,
+    pub look: L,
+    pub body: u32,
+    /// The identity its pixels write: `STRAND`, its body, group 0; or its host's, where it's
+    /// folded into its host for the ink (no line between it and its host: a meadow's blades).
+    pub identity: u32,
+    pub rule: Rule,
+    pub lean: f32,
+    /// The least width (px) a ribbon writes the way to its nearer side at (its edge record), and
+    /// how strong a line the ink draws there (0 to 1: 0, the record only antialiases).
+    pub edged: f32,
+    pub ink: f32,
+    /// How far (px) a ribbon's chords may lie from its curve: its segments are the fewest of
+    /// `place::LEVELS` that keep them so.
+    pub sag: f32,
+    /// Whether ribbons lie across their strands' own planes (a flat blade's width) in place of
+    /// facing the eye: the other way, kept to measure against.
+    pub own: bool,
+    /// The least width (px) a ribbon is drawn anywhere along it, its tip's taper held there.
+    pub thinnest: f32,
+    /// Whether its copies are drawn flat white and unlit (its reference too), so a judge's
+    /// difference is their cover's alone.
+    pub cover: bool,
+    /// How far a widened copy's colour and light are drawn toward their mean: by its widening to
+    /// the -`contrast` (0: not at all).
+    pub contrast: f32,
+    coarse: List<S>,
+    middling: List<S>,
+    fine: List<S>,
+    blocks: GpuBuffer<Block>,
+    cells: AppendBuffer<Candidate>,
+    groups: GpuBuffer<DispatchArgs>,
+    /// The blocks listed this frame.
+    pub listed: u32,
+    /// Where copies' distances are measured from, if not the eye's place: the pop count holds it
+    /// still while the eye walks, so no copy enters or leaves.
+    pub from: Option<vec3>,
+    placings: u32,
+    /// The reference's copies (`reference`): every one in reach as it is, none widened, each on
+    /// the finest ribbon (the other two lists stay empty).
+    ref_fine: List<S>,
+    ref_spare: List<S>,
+    ref_spare2: List<S>,
+}
+
+/// Copies scattered by `scatter`, wearing `look`, as body `body` of the strands, kept by `rule`.
+pub fn field<S: Strand, C: Scatter<S>, L: Wears<S>>(
+    scatter: C,
+    look: L,
+    body: u32,
+    rule: Rule,
+) -> Field<S, C, L> {
+    Field {
+        scatter,
+        look,
+        body,
+        identity: identity(STRAND, body, 0),
+        rule,
+        lean: 0.75,
+        edged: 0.0,
+        ink: 0.0,
+        sag: 0.25,
+        own: false,
+        thinnest: 0.0,
+        cover: false,
+        contrast: 0.5,
+        coarse: list(LEVELS[0], ROOM),
+        middling: list(LEVELS[1], ROOM),
+        fine: list(LEVELS[2], ROOM),
+        blocks: buffer(1024),
+        cells: append_buffer(CELL_ROOM),
+        groups: buffer_of([DispatchArgs { x: 0, y: 1, z: 1 }]),
+        listed: 0,
+        from: None,
+        placings: 0,
+        ref_fine: list(LEVELS[2], 1),
+        ref_spare: list(LEVELS[0], 1),
+        ref_spare2: list(LEVELS[1], 1),
+    }
+}
+
+/// A draw's arguments that draw nothing.
+fn no_draw() -> GpuBuffer<DrawIndexedArgs> {
+    buffer_of(
+        [
+            DrawIndexedArgs {
+                indices: 0,
+                instances: 0,
+                first_index: 0,
+                base_vertex: 0,
+                first_instance: 0,
+            },
+        ],
+    )
+}
+
+impl<S: Strand, C: Scatter<S>, L: Wears<S>> Field<S, C, L> {
+    /// How far from the eye a copy can be drawn (m): where the last folds into its host's look.
+    pub fn reach(self) -> f32 {
+        self.rule.fold_to + self.scatter.longest()
+    }
+
+    /// The copies `eye` can see placed, labelled `name` in the timings (compute).
+    pub fn place(mut self, eye: Eye, name: str) {
+        let sc = self.scatter
+        let bs = listed(eye, sc.cell(), self.reach(), sc.longest(), |p: vec2| sc.ground(p))
+        self.listed = bs.len()
+        if bs.len() > self.blocks.len() {
+            self.blocks = buffer(bs.len() + bs.len() / 2)
+        }
+        write(mut self.blocks, 0, bs)
+        self.coarse.laid.clear()
+        self.middling.laid.clear()
+        self.fine.laid.clear()
+        label(name)
+        let from = match self.from {
+            Some(f) => f,
+            None => eye.at,
+        }
+        self.placed_from(eye, self.rule, from, 0, bs.len(), self.sag)
+        self.coarse.counted()
+        self.middling.counted()
+        self.fine.counted()
+        // (How many were placed, read back now and then: to say, and to grow the room. Seldom: a
+        // read back parts the frame's work where the GPU then waits on the CPU.)
+        self.placings += 1
+        let ask = self.placings % COUNTED == 1
+        self.coarse.heard(ask)
+        self.middling.heard(ask)
+        self.fine.heard(ask)
+    }
+
+    /// The copies of the `blocks` first blocks placed into the three lists, kept by `rule` by their
+    /// distance from `from`, their segments by `sag` (in compute: the cells that may hold one
+    /// listed, then each listed cell's copy worked out).
+    fn placed_from(mut self, eye: Eye, rule: Rule, from: vec3, first: u32, blocks: u32, sag: f32) {
+        self.coarse.laid.clear()
+        self.middling.laid.clear()
+        self.fine.laid.clear()
+        // (Room for every cell of the blocks: none listed is ever lost.)
+        if self.cells.capacity() < blocks * CELLS {
+            self.cells = append_buffer(blocks * CELLS)
+        }
+        self.cells.clear()
+        if blocks == 0 {
+            return
+        }
+        dispatch(
+            listed_cells.bind(
+                scatter: self.scatter,
+                eye: eye,
+                rule: rule,
+                from: from,
+                blocks: self.blocks.span(start: first, count: blocks),
+                out: mut self.cells,
+            ),
+            groups: (CELLS / 64, blocks, 1),
+        )
+        dispatch(
+            grouped.bind(
+                count: self.cells.count(),
+                room: self.cells.capacity(),
+                out: mut self.groups,
+            ),
+            groups: 1,
+        )
+        dispatch(
+            placed.bind(
+                scatter: self.scatter,
+                look: self.look,
+                eye: eye,
+                rule: rule,
+                from: from,
+                cells: self.cells.items(),
+                count: self.cells.count(),
+                sag: sag,
+                coarse: mut self.coarse.laid,
+                middling: mut self.middling.laid,
+                fine: mut self.fine.laid,
+            ),
+            groups: self.groups,
+        )
+    }
+
+    /// The copies placed (the last count read back): on coarse, middling and fine ribbons.
+    pub fn counts(self) -> vec3u {
+        vec3u(self.coarse.count, self.middling.count, self.fine.count)
+    }
+
+    /// The vertices of the copies placed (the last count read back).
+    pub fn vertices(self) -> u32 {
+        let c = self.counts()
+        c.x * 2 * (LEVELS[0] + 1) + c.y * 2 * (LEVELS[1] + 1) + c.z * 2 * (LEVELS[2] + 1)
+    }
+
+    /// The copies placed this frame (`place`) drawn into the picture's pass (`Frame::draw`).
+    pub fn draw_into(self, d: Drawing) {
+        // (By its pixels' pipeline for as many live lights as are lit: its copies are placed on
+        // the GPU, so no box of them is at hand to say which a light reaches.)
+        let lit = lit_by(d.light.lights, vec3(-1.0e30), vec3(1.0e30))
+        if lit == 0 {
+            self.drawn_with(d, Unlit {})
+        } else if lit == 1 {
+            self.drawn_with(d, OneLit {})
+        } else {
+            self.drawn_with(d, AllLit {})
+        }
+    }
+
+    /// The copies placed drawn into the picture's pass by their pixels' pipeline for `K`'s
+    /// lights.
+    fn drawn_with<K: Lit>(self, d: Drawing, lit: K) {
+        self.coarse.drawn_lit(d, self, lit)
+        self.middling.drawn_lit(d, self, lit)
+        self.fine.drawn_lit(d, self, lit)
+    }
+
+    /// One look of a reference of the copies for `judge` (`frame::judge`), drawn into its look
+    /// targets over what is there (the host's reference), as `eye` (the look's) sees them in
+    /// `light`: every copy within `reach` m as it is, none widened, none folded, its light at
+    /// every pixel with plain band edges.
+    pub fn reference(mut self, judge: mut Judge, eye: Eye, light: Lighting, reach: f32) {
+        label("reference")
+        let sc = self.scatter
+        let bs = listed(eye, sc.cell(), reach, sc.longest(), |p: vec2| sc.ground(p))
+        if bs.len() > self.blocks.len() {
+            self.blocks = buffer(bs.len() + bs.len() / 2)
+        }
+        write(mut self.blocks, 0, bs)
+        // (In parts of `REF_BLOCKS` blocks, each placed then drawn: at most as many copies as the
+        // cells' room holds, a part's work a few milliseconds, docs/strands.md.)
+        if self.ref_fine.laid.capacity() < REF_BLOCKS * CELLS {
+            self.ref_fine.laid = append_buffer(REF_BLOCKS * CELLS)
+        }
+        let all = Rule { least: 0.0, fade: self.rule.fade, fold_from: reach, fold_to: reach + 1.0 }
+        var first: u32 = 0
+        while first < bs.len() {
+            let n = min(REF_BLOCKS, bs.len() - first)
+            swap(mut self.fine, mut self.ref_fine)
+            swap(mut self.coarse, mut self.ref_spare)
+            swap(mut self.middling, mut self.ref_spare2)
+            self.placed_from(eye, all, eye.at, first, n, 0.0)
+            swap(mut self.fine, mut self.ref_fine)
+            swap(mut self.coarse, mut self.ref_spare)
+            swap(mut self.middling, mut self.ref_spare2)
+            self.ref_fine.counted()
+            let pass = begin_pass2_with_depth(
+                mut judge.look_colour,
+                mut judge.look_normal,
+                mut judge.look_depth,
+                clear: vec4(0.0),
+                keep: true,
+                clear_depth: NOTHING_DEEP,
+                keep_depth: true,
+            )
+            let looked = shade_look.bind(eye, light: light, cover: if self.cover { 1 } else { 0 })
+            self.ref_fine.drawn_into(pass, eye, self.look, looked, self.own, 0.0, self.lean, 0.0)
+            pass.end()
+            first += n
+        }
+    }
+}
