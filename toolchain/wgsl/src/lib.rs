@@ -19,6 +19,7 @@
 pub mod metal;
 pub mod msl;
 pub mod offline;
+pub mod spirv;
 pub mod spv;
 
 use naga::{
@@ -116,6 +117,16 @@ pub fn emit_shader(
         });
         let out = metal::write(m, p, depth, checks)?;
         return Ok(Shader { bytes: out.text.into_bytes(), entry_points: out.entry_points });
+    }
+    if target == wrela_abi::Target::Vulkan && std::env::var("WRELA_SPV").is_ok_and(|v| v == "ours")
+    {
+        let promise = m.entry_points.iter().find_map(|e| match &e.stage {
+            ir::Stage::Fragment { depth: Some(_), promise: Some(d), .. } => Some(*d),
+            _ => None,
+        });
+        p.sizes = None;
+        let (bytes, entry_points) = spirv::write(m, p, promise, checks)?;
+        return Ok(Shader { bytes, entry_points });
     }
     let tables = match target {
         wrela_abi::Target::Metal => Tables::Constant,
