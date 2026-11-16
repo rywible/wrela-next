@@ -37,7 +37,7 @@ fn folded_constants_are_what_the_gpu_computes() {
         .files
         .iter()
         .map(|(_, bytes)| String::from_utf8_lossy(bytes).into_owned())
-        .find(|s| s.contains("void folded("))
+        .find(|s| s.contains("void folded"))
         .expect("the folded kernel's shader");
     for f in ["sin(", "normalize(", "pow(", "smoothstep(", "exp2("] {
         assert!(!shader.contains(f), "the folded shader still calls {f}");

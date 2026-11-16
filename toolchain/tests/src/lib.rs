@@ -77,7 +77,20 @@ pub fn build(pkg: &Path) -> Result<wrela_driver::Output, String> {
             return Err(format!("{name}: {} bytes, over the 288 KiB shader budget", bytes.len()));
         }
     }
+    offline_check(&built)?;
     Ok(built)
+}
+
+/// Every shader of a build through its platform's own offline tool, where this machine has it
+/// (`wrela_wgsl::offline`): Apple's `metal` compiler, with warnings as errors, or `spirv-val`.
+pub fn offline_check(built: &wrela_driver::Output) -> Result<(), String> {
+    // naga's shaders (the default until its cutover) aren't held to the tools: its MSL warns, and
+    // its SPIR-V gives a private struct explicit offsets, which spirv-val 2026 rejects.
+    let ours = |var: &str| std::env::var(var).is_ok_and(|v| v == "ours");
+    let files = built.files.iter().filter(|(n, _)| {
+        (ours("WRELA_MSL") || !n.ends_with(".metal")) && (ours("WRELA_SPV") || !n.ends_with(".spv"))
+    });
+    wrela_wgsl::offline::check_all(files.map(|(n, b)| (n.as_str(), b.as_slice())))
 }
 
 /// [`build`], for `target`'s shaders and limits (`wrela build --target`) rather than this
@@ -94,6 +107,7 @@ pub fn build_for(pkg: &Path, target: wrela_abi::Target) -> Result<wrela_driver::
     if built.has_errors() {
         return Err(wrela_diag::render::render_all(&built.sources, &built.diagnostics));
     }
+    offline_check(&built)?;
     Ok(built)
 }
 
@@ -467,6 +481,9 @@ fn built_once(pkg: &str, kind: &str, build: fn(&Path) -> wrela_driver::Output) -
                 "{pkg} doesn't build:\n{}",
                 wrela_diag::render::render_all(&built.sources, &built.diagnostics)
             );
+        }
+        if let Err(e) = offline_check(&built) {
+            panic!("{pkg}'s shaders: {e}");
         }
         built.write_to(&base).expect("write the build");
     });

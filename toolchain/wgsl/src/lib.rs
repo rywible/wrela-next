@@ -16,7 +16,9 @@
 //! - GPU modules arrive flattened (`wrela_ir::opt`): every call is inlined but those to the
 //!   big functions that take only values, which are written as WGSL functions, callees first.
 
+pub mod metal;
 pub mod msl;
+pub mod offline;
 pub mod spv;
 
 use naga::{
@@ -102,6 +104,19 @@ pub fn emit_shader(
     target: wrela_abi::Target,
     checks: Checks,
 ) -> R<Shader> {
+    if target == wrela_abi::Target::Metal && std::env::var("WRELA_MSL").is_ok_and(|v| v == "ours") {
+        let promise = m.entry_points.iter().find_map(|e| match &e.stage {
+            ir::Stage::Fragment { depth: Some(_), promise: Some(d), .. } => Some(*d),
+            _ => None,
+        });
+        p.sizes = metal::buffer_sizes(m, p);
+        let depth = promise.map(|d| match d {
+            ir::DepthPromise::Greater => metal::ConservativeDepth::Greater,
+            ir::DepthPromise::Less => metal::ConservativeDepth::Less,
+        });
+        let out = metal::write(m, p, depth, checks)?;
+        return Ok(Shader { bytes: out.text.into_bytes(), entry_points: out.entry_points });
+    }
     let tables = match target {
         wrela_abi::Target::Metal => Tables::Constant,
         wrela_abi::Target::Vulkan => Tables::Local,

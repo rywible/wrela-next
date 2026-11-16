@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+"""Every shader of a build through its platform's own offline tool. Usage:
+
+    tools/shaders <build> [--jobs N]
+
+Each `pipeline_N.metal` is compiled by Apple's `metal` (`xcrun metal -c -std=metal4.0 -Werror`),
+each `pipeline_N.spv` validated by `spirv-val --target-env vulkan1.3`, N at a time (default: the
+machine's cores). The compiler's shader writers are held to both (toolchain/wgsl/src/offline.rs
+runs the same tools on every shader the test suite builds).
+
+Exit status: 0 when every shader passes; 1 when one fails (each failure printed); 2 for a usage
+error or a build with a shader whose tool this machine hasn't.
+"""
+
+import concurrent.futures
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+
+def check(path, scratch):
+    if path.endswith(".metal"):
+        cmd = ["xcrun", "metal", "-c", "-std=metal4.0", "-Werror", "-o",
+               os.path.join(scratch, os.path.basename(path) + ".air"), path]
+    else:
+        cmd = ["spirv-val", "--target-env", "vulkan1.3", path]
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    return path, p.returncode, p.stdout
+
+
+def main(argv):
+    jobs = os.cpu_count() or 4
+    if "--jobs" in argv:
+        i = argv.index("--jobs")
+        jobs = int(argv[i + 1])
+        del argv[i:i + 2]
+    if len(argv) != 1 or argv[0] in ("-h", "--help") or not os.path.isdir(argv[0]):
+        print(__doc__, file=sys.stderr)
+        return 2
+    build = argv[0]
+    files = sorted(os.path.join(build, f) for f in os.listdir(build)
+                   if f.endswith(".metal") or f.endswith(".spv"))
+    if not files:
+        print(f"shaders: {build} has no shaders", file=sys.stderr)
+        return 2
+    need = {"xcrun" if f.endswith(".metal") else "spirv-val" for f in files}
+    missing = [t for t in need if shutil.which(t) is None]
+    if missing:
+        print(f"shaders: this machine hasn't {', '.join(missing)}", file=sys.stderr)
+        return 2
+    scratch = tempfile.mkdtemp(prefix="shaders-")
+    failed = 0
+    try:
+        with concurrent.futures.ThreadPoolExecutor(jobs) as pool:
+            for path, status, said in pool.map(lambda f: check(f, scratch), files):
+                if status != 0:
+                    failed += 1
+                    print(f"FAILED {os.path.basename(path)}\n{said}")
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    print(f"shaders: {len(files) - failed} of {len(files)} pass")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

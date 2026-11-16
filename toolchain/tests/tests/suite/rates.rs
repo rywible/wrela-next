@@ -64,8 +64,15 @@ fn a_constant_table_is_kept_once() {
         }
     }
     let text = shader(&fixture("table", false, Target::Metal), "step");
-    assert!(text.contains("constant type_"), "no table in constant memory:\n{text}");
-    assert!(text.contains("T0_.inner["), "the kernel doesn't read the table in place:\n{text}");
+    // A table at program scope in the `constant` address space, read in place by the kernel.
+    let table = text
+        .lines()
+        .find_map(|l| l.strip_prefix("constant ").and_then(|r| r.split_whitespace().nth(1)))
+        .unwrap_or_else(|| panic!("no table in constant memory:\n{text}"));
+    assert!(
+        text.contains(&format!("{table}.inner[")),
+        "the kernel doesn't read the table `{table}` in place:\n{text}"
+    );
 }
 
 /// A loop of constants longer than the build runs one for is left to the GPU, and a shipped
