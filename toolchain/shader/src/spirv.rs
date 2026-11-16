@@ -2154,7 +2154,8 @@ impl FunctionWriter<'_, '_> {
             B::Eq if float => Op::FOrdEqual,
             B::Eq => Op::IEqual,
             B::Ne if boolean => Op::LogicalNotEqual,
-            B::Ne if float => Op::FOrdNotEqual,
+            // Unordered: a NaN is unequal to everything, itself included (IEEE 754, WGSL).
+            B::Ne if float => Op::FUnordNotEqual,
             B::Ne => Op::INotEqual,
             B::Lt if float => Op::FOrdLessThan,
             B::Lt if signed => Op::SLessThan,

@@ -1,7 +1,7 @@
 // language: metal4.0
 #include <metal_stdlib>
 #include <simd/simd.h>
-#pragma METAL fp math_mode(fast)
+#pragma METAL fp math_mode(relaxed)
 #pragma METAL fp contract(fast)
 #pragma clang diagnostic ignored "-Wtautological-compare"
 using metal::uint;

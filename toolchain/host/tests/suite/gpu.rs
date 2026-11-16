@@ -1097,10 +1097,10 @@ fn indirect_draws_keep_their_first_instance() {
     }
 }
 
-/// The math Metal compiles a shader with: by default fast (a NaN made at run time may compare
-/// equal to itself, sums may be reassociated: docs/dead-ends.md, "Fast math, unseen"), which a
-/// run prints; and with `#pragma METAL fp math_mode(safe)` at the top of its MSL, a NaN that
-/// compares unequal to itself and `(1e8 + 1) - 1e8` that is 0, which it checks.
+/// The math Metal compiles a shader with: the MSL writer's relaxed math (fast, keeping
+/// infinities and NaNs: language.md §11.3), where a NaN made at run time compares unequal to
+/// itself and sums may be reassociated, which a run prints; and with `#pragma METAL fp
+/// math_mode(safe)` in its place, `(1e8 + 1) - 1e8` that is 0, which it checks.
 #[cfg(target_vendor = "apple")]
 #[test]
 #[ignore = "needs a GPU"]
@@ -1123,9 +1123,9 @@ fn safe_math_keeps_nans_and_the_order_of_sums() {
             // The math mode the writer states, made safe.
             let path = dir.join("probe.metal");
             let text = std::fs::read_to_string(&path).expect("the MSL");
-            assert!(text.contains("#pragma METAL fp math_mode(fast)"), "the mode is stated");
+            assert!(text.contains("#pragma METAL fp math_mode(relaxed)"), "the mode is stated");
             let text = text
-                .replace("math_mode(fast)", "math_mode(safe)")
+                .replace("math_mode(relaxed)", "math_mode(safe)")
                 .replace("contract(fast)", "contract(off)");
             std::fs::write(&path, text).expect("the MSL");
         }
@@ -1138,10 +1138,10 @@ fn safe_math_keeps_nans_and_the_order_of_sums() {
         let fused = input[3].mul_add(input[4], input[5]);
         eprintln!(
             "math mode {}: NaN != NaN {nan}, (1e8 + 1) - 1e8 = {sum}, a * b + c = {fma:e} (fused {fused:e})",
-            if safe { "safe" } else { "default" }
+            if safe { "safe" } else { "relaxed" }
         );
+        assert!(nan, "a NaN compares unequal to itself");
         if safe {
-            assert!(nan, "a NaN compares unequal to itself");
             assert_eq!(sum, 0.0, "the sum isn't reassociated");
         }
     }

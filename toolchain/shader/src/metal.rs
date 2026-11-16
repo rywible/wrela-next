@@ -15,8 +15,10 @@
 //! - **Workgroup memory** is declared in the kernel's body, so Metal sizes it from its type.
 //! - **Conservative depth.** A fragment shader's promised depth is Metal's
 //!   `[[depth(greater)]]` or `[[depth(less)]]`.
-//! - **The math mode is stated:** `#pragma METAL fp math_mode(fast)` and `fp contract(fast)`,
-//!   what a passthrough shader was compiled under (`MTLCompileOptions`' defaults), not inherited.
+//! - **The math mode is stated:** `#pragma METAL fp math_mode(relaxed)` and `fp contract(fast)`:
+//!   fast math that keeps infinities and NaNs (language.md §11.3), not the `fast` a passthrough
+//!   shader would inherit from `MTLCompileOptions`' defaults. A float compared with itself is
+//!   `isnan`, which even relaxed math can't fold away.
 //!
 //! The text is written for a compiler, not a reader: one statement a line, no indentation. Each IR
 //! value that reads memory, calls, has an effect, is used more than once or is a derivative is
@@ -301,7 +303,10 @@ impl<'m> Writer<'m> {
         let (major, minor) = LANGUAGE;
         let _ = writeln!(out, "// language: metal{major}.{minor}");
         out.push_str("#include <metal_stdlib>\n#include <simd/simd.h>\n");
-        out.push_str("#pragma METAL fp math_mode(fast)\n#pragma METAL fp contract(fast)\n");
+        // Relaxed: fast math that keeps infinities and NaNs (language.md §11.3); `fast` lets the
+        // compiler assume there are none, and `safe` costs the opening's frame 91% on an M4.
+        out.push_str("#pragma METAL fp math_mode(relaxed)\n");
+        out.push_str("#pragma METAL fp contract(fast)\n");
         // `x == x` is how GPU code asks whether a float is a number: meant, not a slip.
         out.push_str("#pragma clang diagnostic ignored \"-Wtautological-compare\"\n");
         out.push_str("using metal::uint;\n");
@@ -1905,6 +1910,28 @@ impl FunctionWriter<'_, '_> {
             B::Gt => ">",
             B::Ge => ">=",
         };
+        // Metal's compiler, even in relaxed math, may fold a float's equality as if neither side
+        // were a NaN (`x != x` false), but keeps `isnan` and `isunordered`, which say it: a float
+        // compared with itself is `isnan`, and any other equality says whether the sides are
+        // unordered too. (Ordered comparisons with a NaN are left as WGSL leaves them.)
+        if scalar.is_some_and(|s| s.is_float()) && matches!(op, B::Eq | B::Ne) {
+            let x = self.arg(a)?;
+            if a == b {
+                return Ok(if op == B::Ne {
+                    atom(format!("metal::isnan({x})"))
+                } else {
+                    compound(format!("!metal::isnan({x})"))
+                });
+            }
+            let y = self.arg(b)?;
+            let vector = matches!(m.types.get(ta), ir::TypeDef::Vector(..));
+            let (and, or) = if vector { ("&", "|") } else { ("&&", "||") };
+            return Ok(atom(if op == B::Ne {
+                format!("(({l} != {r}) {or} metal::isunordered({x}, {y}))")
+            } else {
+                format!("(({l} == {r}) {and} !metal::isunordered({x}, {y}))")
+            }));
+        }
         // Signed arithmetic that may overflow is done unsigned, as WGSL defines it (it wraps).
         if signed
             && matches!(

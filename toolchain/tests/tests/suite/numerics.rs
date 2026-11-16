@@ -283,6 +283,56 @@ fn the_gpu_counts_bits_as_the_cpu_does() {
     }
 }
 
+/// What language.md §11.3 promises GPU code of infinities and NaNs: toolchain/tests/infinities's
+/// first frame. Infinities are IEEE 754's, made at run time and carried through division,
+/// comparisons, `min`, `max`, `clamp` and `exp`. A NaN made from numbers is indeterminate
+/// (WGSL), but `x != x` says truly whether each value is one; an uploaded NaN is one, unequal to
+/// itself, and arrives as uploaded.
+#[test]
+#[ignore = "needs a GPU"]
+fn the_gpu_keeps_infinities_and_finds_nans() {
+    let w = wrela_tests::u32s(&crate::first_frame_buffers("infinities", 1)[0]);
+    assert_eq!(w.len(), 28);
+    let (inf, ninf, one, two) = (0x7f80_0000, 0xff80_0000, 1.0f32.to_bits(), 2.0f32.to_bits());
+    let exact = [
+        (0, inf, "1 / 0"),
+        (1, ninf, "-1 / 0"),
+        (2, 1, "1 / 0 is infinite"),
+        (3, 0, "1 / 0 isn't finite"),
+        (4, 1, "1 / 0 is past a far distance"),
+        (5, 0, "1 / inf"),
+        (6, inf, "near / 0"),
+        (7, 1, "near / 0 is past 1"),
+        (8, 0, "near / 0 isn't within 1"),
+        (9, inf, "a march's distance that hit nothing"),
+        (10, 0, "it isn't short of a far distance"),
+        (11, 0, "it isn't finite"),
+        (12, two, "min(inf, 2)"),
+        (13, two, "max(-inf, 2)"),
+        (14, one, "clamp(inf, 0, 1)"),
+        (15, 0, "exp(-inf)"),
+        (23, 1, "an uploaded NaN is one"),
+        (24, 0, "an uploaded NaN is unequal to itself"),
+        (25, 0x7fc0_0000, "an uploaded NaN's bits"),
+        (26, inf, "an overflow"),
+        (27, 1, "an overflow is infinite"),
+    ];
+    for (k, want, what) in exact {
+        assert_eq!(w[k], want, "{what}: word {k} is {:#010x}", w[k]);
+    }
+    let is_nan = |bits: u32| f32::from_bits(bits).is_nan();
+    for (asked, bits, what) in [(16, 20, "0 / 0"), (17, 21, "inf - inf"), (18, 22, "inf * 0")] {
+        assert_eq!(
+            w[asked] == 1,
+            is_nan(w[bits]),
+            "{what} is {:#010x}: is_nan says {}",
+            w[bits],
+            w[asked]
+        );
+    }
+    assert_eq!(w[19] == 1, !is_nan(w[20]), "0 / 0 == itself, as {:#010x}", w[20]);
+}
+
 /// Vectors of i32s and u32s compute the same on the CPU (a component at a time) and the GPU
 /// (WGSL's vectors): arithmetic, shifts and bits, built-ins, conversions to and from float
 /// vectors, and swizzles. toolchain/tests/vectors's first frame writes the CPU's values and the

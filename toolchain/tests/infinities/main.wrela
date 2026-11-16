@@ -1,0 +1,117 @@
+// What language.md §11.3 promises GPU code of infinities and NaNs, asked of values made at run
+// time from ones the CPU uploads, so no compiler can fold them (toolchain/tests/tests/suite/
+// numerics.rs checks the words). Infinities are IEEE 754's: a division by zero, reversed
+// depth's `near / z` at the eye (lib/frame/eye.wrela) and a march whose distance is infinite
+// (nothing hit), each asked what GPU code asks of them. An operation that would make a NaN from
+// numbers (0/0, inf - inf, inf * 0) gives a value WGSL leaves indeterminate, but whatever it
+// gives, `x != x` (`is_nan`) says truly whether it is a NaN; a NaN uploaded is one to it.
+
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch, write}
+
+const F32_MAX: f32 = 340282346638528859811704183484516925440.0
+
+/// What the kernel writes: each word a float's bits, or a question's answer (1 yes, 0 no).
+pub const WORDS: u32 = 28
+
+fn yes(b: bool) -> u32 {
+    if b { 1 } else { 0 }
+}
+
+fn is_nan(x: f32) -> bool {
+    x != x
+}
+
+fn is_inf(x: f32) -> bool {
+    abs(x) > F32_MAX
+}
+
+fn is_finite(x: f32) -> bool {
+    abs(x) <= F32_MAX
+}
+
+struct Words: Copy + GpuData {
+    w: [u32; 28],
+}
+
+/// The inputs: 0, 1, a near plane, 2, a far distance, -1, a NaN.
+@compute(1)
+fn probe(inputs: [f32], out: mut Slots<Words>, id: GlobalId) {
+    let zero = inputs[0]
+    let one = inputs[1]
+    let near = inputs[2]
+    let two = inputs[3]
+    let far = inputs[4]
+    let minus = inputs[5]
+    let nan_in = inputs[6]
+    var w: [u32; 28] = [0; 28]
+    // A division by zero.
+    let inf = one / zero
+    w[0] = bitcast_u32(inf)
+    w[1] = bitcast_u32(minus / zero)
+    w[2] = yes(is_inf(inf))
+    w[3] = yes(is_finite(inf))
+    w[4] = yes(inf > far)
+    w[5] = bitcast_u32(one / inf)
+    // Reversed depth at the eye: `near / z` at z = 0 is infinite, past 1, so clipped.
+    let depth = near / zero
+    w[6] = bitcast_u32(depth)
+    w[7] = yes(depth > 1.0)
+    w[8] = yes(depth <= 1.0)
+    // A march that hits nothing: its distance starts infinite and stays so.
+    var t = inf
+    var steps: u32 = 0
+    while steps < 4 {
+        t = min(t, far * f32(steps) + inf)
+        steps += 1
+    }
+    w[9] = bitcast_u32(t)
+    w[10] = yes(t < far)
+    w[11] = yes(is_finite(t))
+    w[12] = bitcast_u32(min(t, two))
+    w[13] = bitcast_u32(max(-t, two))
+    w[14] = bitcast_u32(clamp(t, 0.0, 1.0))
+    w[15] = bitcast_u32(exp(-t))
+    // NaNs made from numbers: whatever each is, `is_nan` says truly whether it's a NaN.
+    let nan = zero / zero
+    let gone = inf - inf
+    let none = inf * zero
+    w[16] = yes(is_nan(nan))
+    w[17] = yes(is_nan(gone))
+    w[18] = yes(is_nan(none))
+    w[19] = yes(nan == nan)
+    w[20] = bitcast_u32(nan)
+    w[21] = bitcast_u32(gone)
+    w[22] = bitcast_u32(none)
+    // A NaN uploaded: it is one, and unequal to itself.
+    w[23] = yes(is_nan(nan_in))
+    w[24] = yes(nan_in == nan_in)
+    w[25] = bitcast_u32(nan_in)
+    // An overflow to infinity.
+    w[26] = bitcast_u32(far * far * far)
+    w[27] = yes(is_inf(far * far * far))
+    out[id] = Words { w: w }
+}
+
+pub struct Game {
+    inputs: GpuBuffer<f32>,
+    out: GpuBuffer<Words>,
+    done: bool,
+}
+
+pub fn init() -> Game {
+    Game { inputs: buffer(7), out: buffer(1), done: false }
+}
+
+pub fn frame(game: mut Game, time: f32, width: u32, height: u32) {
+    if game.done {
+        return
+    }
+    var xs: Vec<f32> = Vec::new()
+    for x in [0.0, 1.0, 0.1, 2.0, 1.0e30, -1.0] {
+        xs.push(x)
+    }
+    xs.push(bitcast_f32(0x7fc00000))
+    write(mut game.inputs, 0, xs)
+    dispatch(probe.bind(inputs: game.inputs.span(start: 0, count: 7), out: mut game.out), groups: 1)
+    game.done = true
+}

@@ -145,7 +145,7 @@ fn a_kernel_is_written_for_both_targets() {
         msl.contains("[[max_total_threads_per_threadgroup(64)]] kernel void step_cells_e("),
         "{msl}"
     );
-    assert!(msl.contains("#pragma METAL fp math_mode(fast)"), "the math mode is stated:\n{msl}");
+    assert!(msl.contains("#pragma METAL fp math_mode(relaxed)"), "the math mode is stated:\n{msl}");
     // Every name the writer makes has a letter of its own: an entry point's is `_e` after it.
     assert_eq!(msl_names, ["step_cells_e"]);
     assert_eq!(spv_names, ["step_cells"]);
