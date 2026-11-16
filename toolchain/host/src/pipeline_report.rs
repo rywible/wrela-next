@@ -5,7 +5,7 @@
 //! (`maxTotalThreadsPerThreadgroup`) and its static threadgroup memory
 //! (`staticThreadgroupMemoryLength`) (Apple's `MTLComputePipelineState`, docs/citations.md).
 //!
-//! The most threads comes twice. naga declares each kernel's workgroup as its cap
+//! The most threads comes twice. The MSL writer declares each kernel's workgroup as its cap
 //! (`[[max_total_threads_per_threadgroup(N)]]`), so as built it's the workgroup's size, unless
 //! the kernel's registers hold it lower (then its dispatches fail). Compiled again without the
 //! cap, it's as many as the kernel's registers allow, up to the device's: on GPUs whose
@@ -32,7 +32,7 @@ pub(crate) struct Metal {
     /// `threadExecutionWidth`: the threads that run in lockstep (a SIMD group).
     pub simd: u64,
     /// `maxTotalThreadsPerThreadgroup`: the most threads one of its threadgroups may have, as
-    /// built: at most its workgroup's size, which naga declares as the kernel's cap.
+    /// built: at most its workgroup's size, which the MSL writer declares as the kernel's cap.
     pub max_threads: u64,
     /// `maxTotalThreadsPerThreadgroup` of the kernel compiled without that cap: as many as its
     /// registers allow, up to the device's. Below the device's, the kernel's registers are
@@ -131,7 +131,7 @@ mod apple {
             Some(hal) => hal.raw_device().clone(),
             None => return Err("only Metal reports more".into()),
         };
-        // naga caps the kernel at its workgroup (`[[max_total_threads_per_threadgroup(N)]]`), so
+        // The MSL writer caps the kernel at its workgroup (`[[max_total_threads_per_threadgroup(N)]]`), so
         // as built its max is the workgroup's size unless registers hold it below that. Without
         // the cap, Metal says how many threads its registers allow.
         let cap = msl

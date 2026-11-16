@@ -1,79 +1,73 @@
-// first-light's render pipeline: one full-screen triangle; each pixel is coloured by its distance
-// to a circle whose centre the CPU computes each frame. Colours come from the palette that the
-// `fill` compute pipeline derived on the first frame.
-// Metal shading language as the toolchain's MSL writer (naga 30's, `wrela_wgsl::msl`) wrote it
-// from the WGSL this fixture held until 2026-11-15, its bindings in `wrela_abi::metal`'s slots.
 // language: metal4.0
 #include <metal_stdlib>
 #include <simd/simd.h>
-
+#pragma METAL fp math_mode(fast)
+#pragma METAL fp contract(fast)
+#pragma clang diagnostic ignored "-Wtautological-compare"
 using metal::uint;
-
 struct _mslBufferSizes {
-uint size1;
+uint size0;
 };
-
-struct Frame {
-metal::float2 resolution;
-metal::float2 center;
-float time;
-float radius;
-metal::float2 _pad;
+typedef uint B0[1];
+struct vs_eOutput {
+metal::float4 v0 [[position]];
 };
-typedef uint type_3[1];
-
-metal::float3 colour(
-uint i_1,
-device type_3 const& palette,
-constant _mslBufferSizes& _buffer_sizes
+struct S9_VertexIndex {
+uint m0_index;
+};
+struct S8_ClipPosition {
+metal::float4 m0_position;
+};
+struct fs_eOutput {
+metal::float4 color0 [[color(0)]];
+};
+struct S6_Frame {
+metal::float2 m0_resolution;
+metal::float2 m1_center;
+float m2_time;
+float m3_radius;
+metal::float2 m4_pad;
+};
+struct S10_FragCoord {
+metal::float4 m0_position;
+};
+metal::float3 f1_colour(
+uint p0_p0
+, device B0 const& r1_palette
+, constant _mslBufferSizes& _buffer_sizes
 ) {
-uint _e3 = palette[metal::min(unsigned(i_1), (_buffer_sizes.size1 - 0 - 4) / 4)];
-return metal::unpack_unorm4x8_to_float(_e3).xyz;
+uint v0 = p0_p0;
+uint v1 = r1_palette[metal::min(unsigned(v0), (_buffer_sizes.size0 - 0 - 4) / 4)];
+return metal::float4(static_cast<float>((v1 >> 0u) & 255u) / 255.0, static_cast<float>((v1 >> 8u) & 255u) / 255.0, static_cast<float>((v1 >> 16u) & 255u) / 255.0, static_cast<float>((v1 >> 24u) & 255u) / 255.0).xyz;
 }
 
-struct vsInput {
-};
-struct vsOutput {
-metal::float4 member [[position]];
-};
-vertex vsOutput vs(
-uint i [[vertex_id]]
+vertex vs_eOutput vs_e(
+uint input0 [[vertex_id]]
 ) {
-float x = static_cast<float>(as_type<int>(as_type<uint>(as_type<int>(as_type<uint>(static_cast<int>(i & 1u)) * as_type<uint>(4))) - as_type<uint>(1)));
-float y = static_cast<float>(as_type<int>(as_type<uint>(as_type<int>(as_type<uint>(static_cast<int>(i >> 1u)) * as_type<uint>(4))) - as_type<uint>(1)));
-return vsOutput { metal::float4(x, y, 0.0, 1.0) };
+S9_VertexIndex v0 = S9_VertexIndex {input0};
+const S8_ClipPosition _tmp1 = S8_ClipPosition {metal::float4(static_cast<float>(as_type<int>(as_type<uint>(as_type<int>(as_type<uint>(static_cast<int>(v0.m0_index & 1u)) * as_type<uint>(4))) - as_type<uint>(1))), static_cast<float>(as_type<int>(as_type<uint>(as_type<int>(as_type<uint>(static_cast<int>(v0.m0_index >> 1u)) * as_type<uint>(4))) - as_type<uint>(1))), 0.0, 1.0)};
+return vs_eOutput { _tmp1.m0_position };
 }
 
-
-struct fsInput {
-};
-struct fsOutput {
-metal::float4 member_1 [[color(0)]];
-};
-fragment fsOutput fs(
-metal::float4 pos [[position]]
-, constant Frame& frame [[buffer(0)]]
-, device type_3 const& palette [[buffer(1)]]
+fragment fs_eOutput fs_e(
+metal::float4 input0 [[position]]
+, constant S6_Frame& r0_frame [[buffer(0)]]
+, device B0 const& r1_palette [[buffer(1)]]
 , constant _mslBufferSizes& _buffer_sizes [[buffer(2)]]
 ) {
-metal::float3 c = {};
-metal::float2 p = pos.xy;
-metal::float3 _e3 = colour(0u, palette, _buffer_sizes);
-metal::float3 _e5 = colour(2u, palette, _buffer_sizes);
-float _e10 = frame.resolution.y;
-c = metal::mix(_e3, _e5, p.y / _e10);
-metal::float2 _e16 = frame.center;
-float _e20 = frame.radius;
-float d = metal::distance(p, _e16) - _e20;
-metal::float3 _e22 = c;
-metal::float3 _e24 = colour(7u, palette, _buffer_sizes);
-float _e32 = frame.radius;
-c = _e22 + ((_e24 * 0.4) * metal::exp(-(metal::max(d, 0.0)) / (0.3 * _e32)));
-float _e41 = frame.time;
-float pulse = 0.85 + (0.15 * metal::cos(_e41 * 3.0));
-metal::float3 _e50 = colour(5u, palette, _buffer_sizes);
-metal::float3 _e52 = c;
-c = metal::mix(_e50 * pulse, _e52, metal::smoothstep(-1.0, 1.0, d));
-metal::float3 _e57 = c;
-return fsOutput { metal::float4(metal::min(_e57, metal::float3(1.0)), 1.0) };
+S10_FragCoord v0 = S10_FragCoord {input0};
+metal::float2 v2 = v0.m0_position.xy;
+metal::float3 v4 = f1_colour(0u, r1_palette, _buffer_sizes);
+metal::float3 v6 = f1_colour(2u, r1_palette, _buffer_sizes);
+metal::float2 v7 = r0_frame.m0_resolution;
+metal::float2 v13 = r0_frame.m1_center;
+float v14 = r0_frame.m3_radius;
+float v16 = metal::distance(v2, v13) - v14;
+metal::float3 v18 = f1_colour(7u, r1_palette, _buffer_sizes);
+float v32 = r0_frame.m2_time;
+metal::float3 v41 = f1_colour(5u, r1_palette, _buffer_sizes);
+metal::float3 v50 = metal::min(metal::mix(v41 * metal::float3(0.85 + (0.15 * metal::cos(v32 * 3.0))), metal::mix(v4, v6, metal::float3(v2.y / v7.y)) + ((v18 * metal::float3(0.4)) * metal::float3(metal::exp((-(metal::max(v16, 0.0))) / (0.3 * v14)))), metal::float3(metal::smoothstep(-1.0, 1.0, v16))), metal::float3(1.0));
+const metal::float4 _tmp1 = metal::float4(v50.x, v50.y, v50.z, 1.0);
+return fs_eOutput { _tmp1 };
 }
+

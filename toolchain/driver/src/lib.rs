@@ -239,7 +239,7 @@ pub struct BuildFor {
     /// SPIR-V, and that machine's limits. [`wrela_abi::Target::HERE`] unless asked.
     pub target: wrela_abi::Target,
     /// Each pipeline's shader written without the run-time checks wgpu wrote into the shaders it
-    /// translated (`wrela_wgsl::Checks::UNCHECKED`, `wrela build --trusted-shaders`): no index
+    /// translated (`wrela_shader::Checks::UNCHECKED`, `wrela build --trusted-shaders`): no index
     /// clamped into range, no loop given a bound the GPU's compiler can see, no integer division
     /// guarded. A program whose GPU code then indexes out of range, loops forever or divides by
     /// zero is undefined on the GPU (it may read anything, hang or crash), where language.md
@@ -1076,9 +1076,9 @@ fn compile_loaded_in(
             let tier1: Vec<bool> = pipelines.iter().map(|p| p.tier() == 1).collect();
             let relaxed = mode.relaxed_simd && !data.no_simd;
             let checks = if mode.trusted_shaders {
-                wrela_wgsl::Checks::UNCHECKED
+                wrela_shader::Checks::UNCHECKED
             } else {
-                wrela_wgsl::Checks::CHECKED
+                wrela_shader::Checks::CHECKED
             };
             let shaders = build::Shaders { target: mode.target, checks };
             let out = build::emit(

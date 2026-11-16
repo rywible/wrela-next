@@ -3,8 +3,8 @@
 //! A [`Module`] holds types, functions and (for GPU code) resources. A function body is
 //! structured control flow over **values** (each defined once, by a [`Stmt::Let`], usable where
 //! its definition dominates) and **locals** (addressable variables, read with [`Expr::Load`] and
-//! written with [`Stmt::Store`]). That's the shape both back ends want: naga's expressions and
-//! local variables, and WASM's structured blocks. Merges go through locals, so there are no
+//! written with [`Stmt::Store`]). That's the shape the back ends want: a GPU language's
+//! expressions and local variables, and WASM's structured blocks. Merges go through locals, so there are no
 //! phis.
 //!
 //! The IR knows nothing about the language's traits, generics or modes: lowering has
@@ -1216,8 +1216,8 @@ pub fn element_name(i: usize) -> String {
 
 /// A name as an identifier both back ends accept: letters, digits and single underscores, not
 /// starting with a digit or an underscore (WGSL reserves names starting with `__`). The WGSL
-/// writer may still rename one (a WGSL keyword, a name ending in a digit, a name used twice),
-/// so the manifest takes entry points' names from the written shader (`wrela_wgsl::emit`).
+/// shader writers may still rename one (Metal's writer adds `_e` to an entry point's), so the
+/// manifest takes entry points' names from the written shader (`wrela_shader::emit_shader`).
 pub fn ident(name: &str) -> String {
     let mut s = String::with_capacity(name.len());
     for c in name.chars() {

@@ -1522,7 +1522,7 @@ fn passthrough(
             desc.spirv = Some(Cow::Owned(words));
         }
     }
-    // SAFETY: the compiler wrote this shader for this pipeline (`wrela_wgsl`): its entry points
+    // SAFETY: the compiler wrote this shader for this pipeline (`wrela_shader`): its entry points
     // are the manifest's, and its bindings are where the bind group layout made here puts them
     // (Metal: the slots `wrela_abi::metal` gives; Vulkan: set 0, the manifest's binding numbers).
     // wgpu checks nothing of it; the driver compiles it, and a shader that doesn't compile is an
@@ -3498,12 +3498,22 @@ mod tests {
             work: vec![Some(24)],
             unbounded: Vec::new(),
         });
-        let wgsl = "@group(0) @binding(0) var<storage, read_write> count: array<u32>;\n\
-                    @compute @workgroup_size(1) fn increment() { count[0] += 1u; }";
-        let (target, checks) = (wrela_abi::Target::HERE, wrela_wgsl::Checks::CHECKED);
+        // `count[0] += 1u`, of a storage buffer of `u32`s at binding 0.
+        use wrela_shader::build::{BinOp, Builder, Scalar};
+        let mut b = Builder::new();
+        let u = b.scalar(Scalar::U32);
+        let count = b.storage("count", 0, u, true);
+        b.compute("increment", [1, 1, 1], &[], |f| {
+            let zero = f.u32(0);
+            let one = f.u32(1);
+            let old = f.load(u, Builder::element(count, zero));
+            let new = f.binary(BinOp::Add, old, one);
+            f.store(Builder::element(count, zero), new);
+        });
+        let target = wrela_abi::Target::HERE;
         let p = &mut manifest.pipelines[0];
-        p.shader = format!("increment.{}", wrela_wgsl::extension(target));
-        let shader = wrela_wgsl::shader_of_wgsl(wgsl, p, target, checks).unwrap();
+        p.shader = format!("increment.{}", wrela_shader::extension(target));
+        let shader = b.write(p, target).unwrap();
         (manifest, [shader.bytes])
     }
 

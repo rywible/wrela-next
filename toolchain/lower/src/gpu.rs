@@ -2830,18 +2830,13 @@ fn bind_uniform(cx: &mut Cx, mb: &mut ModuleBuilder, iface: &Interface) -> Optio
     // A uniform binding has stricter layout rules; otherwise the same bytes are a read-only
     // storage binding. Over 64 KiB is storage too: the machine allows a uniform binding of
     // 4 GiB, and 64 KiB is a choice kept from WebGPU's limit, not measured since.
-    // On Vulkan, a two-row matrix in a struct inside the block is storage too: naga 30's SPIR-V
-    // writer splits a uniform's two-row matrices into columns only one struct deep, and panics
-    // reading one deeper (`back/spv/block.rs`, `std140_compat_uniform_types`).
-    let deep_matrix = cx.data.target == wrela_abi::Target::Vulkan
-        && match mb.m.types.get(ty) {
-            ir::TypeDef::Struct { fields, .. } => fields.iter().any(|(_, f)| {
-                !matches!(mb.m.types.get(*f), ir::TypeDef::Matrix(..))
-                    && holds_two_row_matrix(&mb.m.types, *f)
-            }),
-            _ => false,
-        };
-    let storage = !ir::layout::uniform_compatible(&mb.m.types, ty) || size > 65_536 || deep_matrix;
+    // On Vulkan, a block holding a two-row matrix is storage too: its columns are 8 bytes apart
+    // (WGSL's layout, the CPU's), and Vulkan's standard layout for a uniform block puts a
+    // matrix's columns 16 apart (std140's extended alignment); a storage block takes 8.
+    let two_row_matrix =
+        cx.data.target == wrela_abi::Target::Vulkan && holds_two_row_matrix(&mb.m.types, ty);
+    let storage =
+        !ir::layout::uniform_compatible(&mb.m.types, ty) || size > 65_536 || two_row_matrix;
     // Named `u`: a creature's shader reads it a thousand times or more, each written out in the
     // WGSL with its whole path.
     let id = mb.m.add_resource(ir::Resource {

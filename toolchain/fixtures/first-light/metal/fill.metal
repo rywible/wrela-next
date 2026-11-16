@@ -1,55 +1,39 @@
-// first-light's compute pipeline: derives palette entries 4.. from the four seed colours, adding
-// `step` once per group of four (wrapping u32 arithmetic, so a host can check it exactly).
-// Metal shading language as the toolchain's MSL writer (naga 30's, `wrela_wgsl::msl`) wrote it
-// from the WGSL this fixture held until 2026-11-15, its bindings in `wrela_abi::metal`'s slots.
 // language: metal4.0
 #include <metal_stdlib>
 #include <simd/simd.h>
-
+#pragma METAL fp math_mode(fast)
+#pragma METAL fp contract(fast)
+#pragma clang diagnostic ignored "-Wtautological-compare"
 using metal::uint;
-
 struct _mslBufferSizes {
-uint size1;
+uint size0;
 };
-
-struct Params {
-uint step;
-uint count;
-metal::uint2 _pad;
+struct S3_Params {
+uint m0_step;
+uint m1_count;
+metal::uint2 m2_pad;
 };
-typedef uint type_2[1];
-uint naga_mod(uint lhs, uint rhs) {
-return lhs % metal::select(rhs, 1u, rhs == 0u);
-}
-
+typedef uint B0[1];
 uint naga_div(uint lhs, uint rhs) {
 return lhs / metal::select(rhs, 1u, rhs == 0u);
 }
 
+uint naga_mod(uint lhs, uint rhs) {
+return lhs % metal::select(rhs, 1u, rhs == 0u);
+}
 
-struct fillInput {
-};
-[[max_total_threads_per_threadgroup(64)]] kernel void fill(
-metal::uint3 id [[thread_position_in_grid]]
-, constant Params& params [[buffer(0)]]
-, device type_2& palette [[buffer(1)]]
+[[max_total_threads_per_threadgroup(64)]] kernel void fill_e(
+metal::uint3 input0 [[thread_position_in_grid]]
+, constant S3_Params& r0_params [[buffer(0)]]
+, device B0& r1_palette [[buffer(1)]]
 , constant _mslBufferSizes& _buffer_sizes [[buffer(2)]]
 ) {
-bool local = {};
-uint i = id.x;
-if (i >= 4u) {
-uint _e8 = params.count;
-local = i < _e8;
-} else {
-local = false;
-}
-bool _e11 = local;
-if (_e11) {
-uint _e18 = palette[metal::min(unsigned(naga_mod(i, 4u)), (_buffer_sizes.size1 - 0 - 4) / 4)];
-uint _e23 = params.step;
-palette[metal::min(unsigned(i), (_buffer_sizes.size1 - 0 - 4) / 4)] = _e18 + (naga_div(i, 4u) * _e23);
-return;
-} else {
-return;
+metal::uint3 v0 = metal::uint3 {input0};
+uint v4 = r0_params.m1_count;
+if ((v0.x >= 4u) && (v0.x < v4)) {
+uint v8 = r1_palette[metal::min(unsigned(naga_mod(v0.x, 4u)), (_buffer_sizes.size0 - 0 - 4) / 4)];
+uint v10 = r0_params.m0_step;
+r1_palette[metal::min(unsigned(v0.x), (_buffer_sizes.size0 - 0 - 4) / 4)] = v8 + (naga_div(v0.x, 4u) * v10);
 }
 }
+

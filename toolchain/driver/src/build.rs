@@ -29,13 +29,13 @@ pub const MAX_WEIGHT: u64 = 300_000;
 #[derive(Clone, Copy, Debug)]
 pub struct Shaders {
     pub target: wrela_abi::Target,
-    pub checks: wrela_wgsl::Checks,
+    pub checks: wrela_shader::Checks,
 }
 
 impl Shaders {
     /// For the machine the compiler runs on, checked.
     pub const HERE: Shaders =
-        Shaders { target: wrela_abi::Target::HERE, checks: wrela_wgsl::Checks::CHECKED };
+        Shaders { target: wrela_abi::Target::HERE, checks: wrela_shader::Checks::CHECKED };
 }
 
 /// Runs the back ends over a lowered program. `sources` names the locations a trap reports.
@@ -178,7 +178,7 @@ fn emit_in(
         manifest.wasm_relaxed_abi = Some(abi);
     }
     for (i, p) in l.pipelines.iter().enumerate() {
-        let shader = format!("pipeline_{i}.{}", wrela_wgsl::extension(target));
+        let shader = format!("pipeline_{i}.{}", wrela_shader::extension(target));
         // The CPU host checks stages and bindings without looking up shader entry points: its
         // build names them as the IR does, and a full build as the MSL writer does, which may
         // rename them.
@@ -255,7 +255,7 @@ fn emit_in(
                 .collect(),
         };
         let shader = if let Some(s) = shaders {
-            match wrela_wgsl::emit_shader(&p.module, &mut pipeline, s.target, s.checks) {
+            match wrela_shader::emit_shader(&p.module, &mut pipeline, s.target, s.checks) {
                 Ok(m) => Some(m),
                 Err(e) => {
                     diagnostics.push(Diagnostic::internal(format!(

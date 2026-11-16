@@ -17,8 +17,8 @@
 //!   its runtime-sized buffers, which it fills only for shaders it translated itself.
 //! - So a passthrough shader gets its buffers' sizes another way: a uniform buffer of `u32`s, the
 //!   pipeline's [`crate::manifest::BufferSizes`], bound at a binding of its own after the rest.
-//!   naga's MSL reads it as its `_mslBufferSizes` (one member for each global holding a
-//!   runtime-sized array, in the module's order); the host writes each listed binding's bound
+//!   The MSL reads it as its `_mslBufferSizes` (one member for each runtime-sized buffer, in the
+//!   module's order); the host writes each listed binding's bound
 //!   size there when it makes a bind group.
 
 use crate::manifest::{BindingKind, BindingStage, Pipeline, Stage, UniformSpace};
@@ -165,7 +165,7 @@ pub struct Slot {
     pub binding: u32,
     pub table: Table,
     pub index: u8,
-    /// Whether the shader may write it (naga's `BindTarget::mutable`).
+    /// Whether the shader may write it.
     pub mutable: bool,
 }
 

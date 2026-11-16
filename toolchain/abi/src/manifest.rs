@@ -239,7 +239,7 @@ fn none_given(at: &[Option<String>]) -> bool {
 }
 
 /// A uniform buffer of `u32`s at `binding`: the bound size in bytes of each binding in
-/// `buffers`, in that order (naga's `_mslBufferSizes`, one member for each global that holds a
+/// `buffers`, in that order (the MSL's `_mslBufferSizes`, one member for each global that holds a
 /// runtime-sized array, in the module's order).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct BufferSizes {

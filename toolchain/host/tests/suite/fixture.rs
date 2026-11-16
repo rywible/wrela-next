@@ -1,11 +1,23 @@
-//! The checked-in fixtures are current. A fixture is a directory of sources (`game.wat` and a
-//! WGSL file a shader) with a build of them for each target (`metal/`, `vulkan/`): its
-//! `game.wasm` the `game.wat` compiled, its shaders the WGSL written by the compiler's own writer
-//! for that target (`wrela_wgsl::shader_of_wgsl`), its manifest valid and in canonical form.
+//! The checked-in fixtures are current. A fixture is a directory of sources (`game.wat`, and each
+//! shader built as IR in `common::shaders`) with a build of them for each target (`metal/`,
+//! `vulkan/`): its `game.wasm` the `game.wat` compiled, its shaders written by the compiler's own
+//! writers for that target, its manifest valid and in canonical form.
 //! `WRELA_BLESS=1` rewrites the builds' files. A Metal shader may open with comment lines of its
 //! own; past its opening comments, its text is the writer's, byte for byte.
 
+use crate::common::shaders;
 use std::path::{Path, PathBuf};
+use wrela_shader::build::Builder;
+
+/// Fixture `dir`'s shader `stem`, built as IR.
+fn sources(dir: &Path, stem: &str) -> Builder {
+    let fixture = dir.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    match (fixture, stem) {
+        ("first-light", "first-light") => shaders::first_light_render(),
+        ("first-light", "fill") => shaders::first_light_fill(),
+        _ => panic!("no shader `{stem}` of fixture `{fixture}` in common::shaders"),
+    }
+}
 use wrela_abi::{Manifest, Target};
 
 fn fixtures() -> Vec<PathBuf> {
@@ -46,12 +58,11 @@ fn each_targets_build_is_its_sources() {
             let mut shaders = Vec::new();
             for p in &mut m.pipelines {
                 let stem = p.shader.rsplit_once('.').map_or(&*p.shader, |(s, _)| s).to_string();
-                let wgsl = std::fs::read_to_string(dir.join(format!("{stem}.wgsl")))
-                    .unwrap_or_else(|e| panic!("{stem}.wgsl: {e}"));
-                p.shader = format!("{stem}.{}", wrela_wgsl::extension(target));
-                let checks = wrela_wgsl::Checks::CHECKED;
-                let written = wrela_wgsl::shader_of_wgsl(&wgsl, p, target, checks)
-                    .unwrap_or_else(|e| panic!("{stem}.wgsl for {}: {e}", target.name()));
+                let source = sources(&dir, &stem);
+                p.shader = format!("{stem}.{}", wrela_shader::extension(target));
+                let written = source
+                    .write(p, target)
+                    .unwrap_or_else(|e| panic!("{stem} for {}: {e}", target.name()));
                 shaders.push((p.shader.clone(), written.bytes));
             }
             let json = m.to_json();

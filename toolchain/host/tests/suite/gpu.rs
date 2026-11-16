@@ -2,7 +2,8 @@
 //!
 //!     cargo test -p wrela-host --test suite gpu:: -- --ignored
 
-use crate::common::{self, TempDir};
+use crate::common::{self, TempDir, shaders};
+use wrela_shader::build::Builder;
 
 use wrela_abi::hash::StateHash;
 use wrela_abi::stream::{self, Binding, Encoder, Pass, TextureFormat};
@@ -189,27 +190,11 @@ fn shader_errors_name_the_pipeline_and_shader() {
 
 /// A compute pipeline that stores `value` at `index`, and a render pipeline that fills the
 /// pixel at `cell` with a colour; both take 16 uniform bytes.
-const STORE_WGSL: &str = r#"
-struct P { index: u32, value: u32, _pad: vec2u }
-@group(0) @binding(0) var<uniform> p: P;
-@group(0) @binding(1) var<storage, read_write> out: array<u32>;
-@compute @workgroup_size(1) fn store() { out[p.index] = p.value; }
-"#;
-const CELL_WGSL: &str = r#"
-struct C { cell: vec2u, size: vec2u, colour: u32, _pad: u32, _pad2: vec2u }
-@group(0) @binding(0) var<uniform> c: C;
-@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
-    let corner = array(vec2f(0, 0), vec2f(1, 0), vec2f(0, 1), vec2f(1, 0), vec2f(1, 1), vec2f(0, 1))[i];
-    let px = (vec2f(c.cell) + corner) / vec2f(c.size);
-    return vec4f(px.x * 2 - 1, 1 - px.y * 2, 0, 1);
-}
-@fragment fn fs() -> @location(0) vec4f { return unpack4x8unorm(c.colour); }
-"#;
 const STORE_PIPELINES: &str = r#"[
-    { "name": "store", "shader": "store.wgsl", "kind": "compute", "entry": "store", "workgroup_size": [1, 1, 1],
+    { "name": "store", "shader": "store.ir", "kind": "compute", "entry": "store", "workgroup_size": [1, 1, 1],
       "uniform": { "binding": 0, "size": 16, "space": "uniform" },
       "bindings": [{ "binding": 1, "kind": "read_write" }] },
-    { "name": "cell", "shader": "cell.wgsl", "kind": "render", "vertex_entry": "vs", "fragment_entry": "fs",
+    { "name": "cell", "shader": "cell.ir", "kind": "render", "vertex_entry": "vs", "fragment_entry": "fs",
       "targets": [{ "colors": ["rgba8unorm"], "depth": false, "screen": true }], "outputs": ["float"],
       "uniform": { "binding": 0, "size": 32, "space": "uniform" }, "bindings": [] }
   ]"#;
@@ -219,20 +204,27 @@ const STORE_PIPELINES: &str = r#"[
 fn program_build(
     name: &str,
     pipelines: &str,
-    shaders: &[(&str, &str)],
+    shaders: &[(&str, &Builder)],
     frames: &[Vec<Vec<u8>>],
 ) -> TempDir {
     let wasm = wat::parse_str(common::wat::program(frames)).expect("compiles");
     common::build(name, &common::manifest(pipelines), shaders, &wasm)
 }
 
-/// The store and cell pipelines' shaders.
-const STORE_SHADERS: [(&str, &str); 2] = [("store.wgsl", STORE_WGSL), ("cell.wgsl", CELL_WGSL)];
+/// The store and cell pipelines' shaders (`common::shaders::store`, `cell`).
+fn store_shaders() -> [(&'static str, Builder); 2] {
+    [("store.ir", shaders::store()), ("cell.ir", shaders::cell(None))]
+}
+
+/// Shaders as `program_build` takes them.
+fn named<'a>(shaders: &'a [(&'static str, Builder)]) -> Vec<(&'static str, &'a Builder)> {
+    shaders.iter().map(|(n, b)| (*n, b)).collect()
+}
 
 /// A program submitting `frames`, loaded with the store and cell pipelines. The build's
 /// directory comes first, so `let (_dir, host) = ...` drops the host before the directory.
 fn store_host(name: &str, frames: &[Vec<Vec<u8>>], options: &Options) -> (TempDir, Host) {
-    let dir = program_build(name, STORE_PIPELINES, &STORE_SHADERS, frames);
+    let dir = program_build(name, STORE_PIPELINES, &named(&store_shaders()), frames);
     let host = Host::load_with(&dir, options).expect("loads");
     (dir, host)
 }
@@ -280,8 +272,12 @@ fn restarting_in_another_build_reuses_pipelines_but_starts_fresh() {
         .finish();
     // The first frame submits nothing; the second exercises fresh WASM globals, resources
     // and request IDs (the previous program already used buffer 1 and request 4).
-    let next_dir =
-        program_build("restart-next", STORE_PIPELINES, &STORE_SHADERS, &[vec![], vec![next]]);
+    let next_dir = program_build(
+        "restart-next",
+        STORE_PIPELINES,
+        &named(&store_shaders()),
+        &[vec![], vec![next]],
+    );
     host.restart_in(&next_dir, &options).expect("restarts in the next directory");
     assert_eq!(host.pipelines_built(), pipelines, "unchanged pipelines are reused");
     assert!(host.take_batches().is_empty(), "old recorded commands are gone");
@@ -309,11 +305,7 @@ fn restarting_in_another_build_reuses_pipelines_but_starts_fresh() {
 
     // The same-directory wrapper now refers to the new package, and a changed shader is
     // rebuilt while its companion compute pipeline is kept.
-    common::write_shader(
-        &next_dir,
-        "cell.wgsl",
-        &CELL_WGSL.replace("unpack4x8unorm(c.colour)", "vec4f(0, 0, 1, 1)"),
-    );
+    common::write_shader(&next_dir, "cell.ir", &shaders::cell(Some([0.0, 0.0, 1.0, 1.0])));
     host.restart_with(&options).expect("restarts the new package");
     assert_eq!(host.pipelines_built(), pipelines + 1, "only the changed pipeline is built");
     let changed = host.run_frames(&[0.0, 1.0], w, h).expect("changed shader runs");
@@ -553,18 +545,12 @@ fn writes_apply_in_recorded_order() {
 #[test]
 #[ignore = "needs a GPU"]
 fn cached_bind_groups_follow_resource_lifetimes() {
-    let shader = r#"
-@group(0) @binding(0) var<storage, read> a: array<u32>;
-@group(0) @binding(1) var<storage, read> b: array<u32>;
-@group(0) @binding(2) var<storage, read_write> out: array<u32>;
-@compute @workgroup_size(1) fn sum() { out[0] += a[0] + b[0]; }
-"#;
     let pipelines: Vec<_> = ["sum_a", "sum_b"]
         .into_iter()
         .map(|name| {
             format!(
                 r#"{{
-            "name": "{name}", "shader": "sum.wgsl", "kind": "compute", "entry": "sum",
+            "name": "{name}", "shader": "sum.ir", "kind": "compute", "entry": "sum",
             "workgroup_size": [1, 1, 1], "uniform": null,
             "bindings": [
                 {{ "binding": 0, "kind": "read" }},
@@ -595,7 +581,7 @@ fn cached_bind_groups_follow_resource_lifetimes() {
     let dir = program_build(
         "bind-group-lifetimes",
         &format!("[{}]", pipelines.join(",")),
-        &[("sum.wgsl", shader)],
+        &[("sum.ir", &shaders::sum())],
         &[vec![encoder.finish()]],
     );
     let mut host = Host::load(&dir).expect("loads");
@@ -653,7 +639,7 @@ fn serial_draws_keep_pipeline_and_uniform_order() {
         .into_iter()
         .map(|name| {
             format!(
-                r#"{{ "name": "{name}", "shader": "cell.wgsl", "kind": "render",
+                r#"{{ "name": "{name}", "shader": "cell.ir", "kind": "render",
                     "vertex_entry": "vs", "fragment_entry": "fs",
                     "targets": [{{ "colors": ["rgba8unorm"], "depth": false, "screen": true }}], "outputs": ["float"],
                     "uniform": {{ "binding": 0, "size": 32, "space": "uniform" }},
@@ -672,7 +658,7 @@ fn serial_draws_keep_pipeline_and_uniform_order() {
     let dir = program_build(
         "serial-draw-order",
         &format!("[{}]", pipelines.join(",")),
-        &[("cell.wgsl", CELL_WGSL)],
+        &[("cell.ir", &shaders::cell(None))],
         &[vec![encoder.present().finish()]],
     );
     let options = Options { timing: Timing::Serial, ..Options::default() };
@@ -736,14 +722,7 @@ fn manual_frames_do_not_inherit_the_previous_frames_gpu_label() {
 #[test]
 #[ignore = "needs a GPU"]
 fn a_two_byte_texture_upload_reaches_the_shader() {
-    let shader = r#"
-        @group(0) @binding(0) var source: texture_2d<f32>;
-        @group(0) @binding(1) var<storage, read_write> out: array<f32>;
-        @compute @workgroup_size(1) fn read_texel() {
-            out[0] = textureLoad(source, vec2i(0, 0), 0).x;
-        }
-    "#;
-    let pipelines = r#"[{ "name": "read_texel", "shader": "read.wgsl", "kind": "compute",
+    let pipelines = r#"[{ "name": "read_texel", "shader": "read.ir", "kind": "compute",
         "entry": "read_texel", "workgroup_size": [1, 1, 1],
         "bindings": [{ "binding": 0, "kind": "texture", "format": "r16float" },
                      { "binding": 1, "kind": "read_write" }] }]"#;
@@ -753,8 +732,12 @@ fn a_two_byte_texture_upload_reaches_the_shader() {
         .write_texture(1, [0, 0], [1, 1], &[0x00, 0x3c])
         .dispatch(0, [1, 1, 1], &[Binding::of(1), Binding::range(2, 0, 4)], &[])
         .finish();
-    let dir =
-        program_build("two-byte-texture", pipelines, &[("read.wgsl", shader)], &[vec![batch]]);
+    let dir = program_build(
+        "two-byte-texture",
+        pipelines,
+        &[("read.ir", &shaders::read_texel())],
+        &[vec![batch]],
+    );
     let mut host = Host::load(&dir).unwrap();
     host.frame(0.0, 4, 4).expect("the two-byte half-float texel uploads");
     assert_eq!(host.read_buffer(2).unwrap(), 1.0f32.to_le_bytes());
@@ -763,15 +746,15 @@ fn a_two_byte_texture_upload_reaches_the_shader() {
 #[test]
 #[ignore = "needs a GPU"]
 fn hot_reload_clears_the_retired_builds_debug_flag() {
-    let pipelines = r#"[{ "name": "flag", "shader": "flag.wgsl", "kind": "compute",
+    let pipelines = r#"[{ "name": "flag", "shader": "flag.ir", "kind": "compute",
         "entry": "flag_error", "workgroup_size": [1, 1, 1], "bindings": [], "debug_flag": 0 }]"#;
-    let shader = r#"
-        @group(0) @binding(0) var<storage, read_write> flag: atomic<u32>;
-        @compute @workgroup_size(1) fn flag_error() { atomicStore(&flag, 1u); }
-    "#;
     let failing = Encoder::new().dispatch(0, [1, 1, 1], &[], &[]).finish();
-    let old =
-        program_build("reload-debug-old", pipelines, &[("flag.wgsl", shader)], &[vec![failing]]);
+    let old = program_build(
+        "reload-debug-old",
+        pipelines,
+        &[("flag.ir", &shaders::flag())],
+        &[vec![failing]],
+    );
     let clean = Encoder::new().begin_screen_pass([0.0, 1.0, 0.0, 1.0]).present().finish();
     let next = program_build("reload-debug-next", "[]", &[], &[vec![clean]]);
     let options = Options { reloadable: true, ..Options::default() };
@@ -785,31 +768,12 @@ fn hot_reload_clears_the_retired_builds_debug_flag() {
 #[test]
 #[ignore = "needs a GPU"]
 fn adjacent_passes_with_different_buffer_access_do_not_join() {
-    let vertex = r#"
-        @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
-            let corners = array(vec2f(-1, -1), vec2f(3, -1), vec2f(-1, 3));
-            return vec4f(corners[i], 0, 1);
-        }
-    "#;
-    let read = format!(
-        r#"{vertex}
-        @group(0) @binding(0) var<storage, read> data: array<u32>;
-        @fragment fn fs() -> @location(0) vec4f {{ return unpack4x8unorm(data[0]); }}"#
-    );
-    let write = format!(
-        r#"{vertex}
-        @group(0) @binding(0) var<storage, read_write> data: array<atomic<u32>>;
-        @fragment fn fs() -> @location(0) vec4f {{
-            atomicStore(&data[0], 42u);
-            return vec4f(0, 1, 0, 1);
-        }}"#
-    );
     let pipelines = r#"[
-        { "name": "read", "shader": "read.wgsl", "kind": "render",
+        { "name": "read", "shader": "read.ir", "kind": "render",
           "vertex_entry": "vs", "fragment_entry": "fs",
           "targets": [{ "colors": ["rgba8unorm"], "depth": false }], "outputs": ["float"],
           "bindings": [{ "binding": 0, "kind": "read", "stage": "fragment" }] },
-        { "name": "write", "shader": "write.wgsl", "kind": "render",
+        { "name": "write", "shader": "write.ir", "kind": "render",
           "vertex_entry": "vs", "fragment_entry": "fs",
           "targets": [{ "colors": ["rgba8unorm"], "depth": false }], "outputs": ["float"],
           "bindings": [{ "binding": 0, "kind": "read_write", "stage": "fragment" }] }
@@ -833,7 +797,7 @@ fn adjacent_passes_with_different_buffer_access_do_not_join() {
     let dir = program_build(
         "incompatible-pass-join",
         pipelines,
-        &[("read.wgsl", &read), ("write.wgsl", &write)],
+        &[("read.ir", &shaders::read_pass()), ("write.ir", &shaders::write_pass())],
         &[vec![batch]],
     );
     let mut host = Host::load_with(&dir, &Options { timing: Timing::Span, ..Options::default() })
@@ -845,23 +809,16 @@ fn adjacent_passes_with_different_buffer_access_do_not_join() {
 
 /// A render pipeline, `fill`, whose one triangle covers an rgba8unorm target with white.
 const FILL_PIPELINES: &str = r#"[
-    { "name": "fill", "shader": "fill.wgsl", "kind": "render",
+    { "name": "fill", "shader": "fill.ir", "kind": "render",
       "vertex_entry": "vs", "fragment_entry": "fs",
       "targets": [{ "colors": ["rgba8unorm"], "depth": false }], "outputs": ["float"],
       "bindings": [] }
 ]"#;
-const FILL_WGSL: &str = r#"
-    @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
-        let corners = array(vec2f(-1, -1), vec2f(3, -1), vec2f(-1, 3));
-        return vec4f(corners[i], 0, 1);
-    }
-    @fragment fn fs() -> @location(0) vec4f { return vec4f(1, 1, 1, 1); }
-"#;
 
 /// A program with the `fill` pipeline that submits `batch` in its one frame, run once with
 /// every pass timed. The build's directory comes first, as [`store_host`]'s.
 fn fill_host(name: &str, batch: Vec<u8>) -> (TempDir, Host) {
-    let dir = program_build(name, FILL_PIPELINES, &[("fill.wgsl", FILL_WGSL)], &[vec![batch]]);
+    let dir = program_build(name, FILL_PIPELINES, &[("fill.ir", &shaders::fill())], &[vec![batch]]);
     let mut host = Host::load_with(&dir, &Options { timing: Timing::Span, ..Options::default() })
         .expect("loads");
     host.frame(0.0, 4, 4).expect("runs");
@@ -1039,22 +996,15 @@ fn times_more_passes_than_one_query_set_holds() {
 /// A render pipeline that draws `pos[i]` at depth `m.z` in colour `m.colour`, three times over:
 /// with no culling and no bias, culling back faces with a depth bias of -1000 steps, and culling
 /// back faces with none.
-const MESH_WGSL: &str = r#"
-struct M { colour: u32, z: f32, _pad: vec2u }
-@group(0) @binding(0) var<uniform> m: M;
-@group(0) @binding(1) var<storage, read> pos: array<vec2f>;
-@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f { return vec4f(pos[i], m.z, 1); }
-@fragment fn fs() -> @location(0) vec4f { return unpack4x8unorm(m.colour); }
-"#;
 const MESH_PIPELINES: &str = r#"[
-    { "name": "plain", "shader": "mesh.wgsl", "kind": "render", "vertex_entry": "vs", "fragment_entry": "fs",
+    { "name": "plain", "shader": "mesh.ir", "kind": "render", "vertex_entry": "vs", "fragment_entry": "fs",
       "targets": [{ "colors": ["rgba8unorm"], "depth": true, "screen": true }], "outputs": ["float"],
       "uniform": { "binding": 0, "size": 16, "space": "uniform" }, "bindings": [{ "binding": 1, "kind": "read" }] },
-    { "name": "biased", "shader": "mesh.wgsl", "kind": "render", "vertex_entry": "vs", "fragment_entry": "fs",
+    { "name": "biased", "shader": "mesh.ir", "kind": "render", "vertex_entry": "vs", "fragment_entry": "fs",
       "cull": "back", "depth_bias": { "constant": -1000, "slope_scale": 0, "clamp": 0 },
       "targets": [{ "colors": ["rgba8unorm"], "depth": true, "screen": true }], "outputs": ["float"],
       "uniform": { "binding": 0, "size": 16, "space": "uniform" }, "bindings": [{ "binding": 1, "kind": "read" }] },
-    { "name": "culled", "shader": "mesh.wgsl", "kind": "render", "vertex_entry": "vs", "fragment_entry": "fs",
+    { "name": "culled", "shader": "mesh.ir", "kind": "render", "vertex_entry": "vs", "fragment_entry": "fs",
       "cull": "back",
       "targets": [{ "colors": ["rgba8unorm"], "depth": true, "screen": true }], "outputs": ["float"],
       "uniform": { "binding": 0, "size": 16, "space": "uniform" }, "bindings": [{ "binding": 1, "kind": "read" }] }
@@ -1100,8 +1050,12 @@ fn indexed_indirect_draws_cull_and_bias() {
         e.draw_indexed_indirect(pipeline, [2, 0, 48], 3, 0, &pos, &words(&[colour, f(0.5), 0, 0]));
     }
     e.present();
-    let dir =
-        program_build("indexed", MESH_PIPELINES, &[("mesh.wgsl", MESH_WGSL)], &[vec![e.finish()]]);
+    let dir = program_build(
+        "indexed",
+        MESH_PIPELINES,
+        &[("mesh.ir", &shaders::mesh())],
+        &[vec![e.finish()]],
+    );
     let mut host = Host::load(&dir).expect("loads");
     let run = host.run_frames(&[0.0], w, h).expect("runs");
     for y in 0..h {
@@ -1116,16 +1070,7 @@ fn indexed_indirect_draws_cull_and_bias() {
 #[test]
 #[ignore = "needs a GPU"]
 fn indirect_draws_keep_their_first_instance() {
-    let source = r#"
-@vertex fn vs(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instance: u32)
-    -> @builtin(position) vec4f {
-    let corners = array(vec2f(-1, -1), vec2f(3, -1), vec2f(-1, 3));
-    let position = corners[vertex] + vec2f(f32(instance) - 5.0, 0.0) * 10.0;
-    return vec4f(position, 0, 1);
-}
-@fragment fn fs() -> @location(0) vec4f { return vec4f(0, 1, 0, 1); }
-"#;
-    let pipelines = r#"[{ "name": "instance", "shader": "instance.wgsl", "kind": "render",
+    let pipelines = r#"[{ "name": "instance", "shader": "instance.ir", "kind": "render",
         "vertex_entry": "vs", "fragment_entry": "fs",
         "targets": [{ "colors": ["rgba8unorm"], "depth": false, "screen": true }], "outputs": ["float"], "bindings": [] }]"#;
     for indexed in [false, true] {
@@ -1143,7 +1088,7 @@ fn indirect_draws_keep_their_first_instance() {
         let dir = program_build(
             "indirect-first-instance",
             pipelines,
-            &[("instance.wgsl", source)],
+            &[("instance.ir", &shaders::instance())],
             &[vec![encoder.finish()]],
         );
         let mut host = Host::load(&dir).expect("loads");
@@ -1160,21 +1105,8 @@ fn indirect_draws_keep_their_first_instance() {
 #[test]
 #[ignore = "needs a GPU"]
 fn safe_math_keeps_nans_and_the_order_of_sums() {
-    let shader = r#"
-@group(0) @binding(0) var<storage, read> input: array<f32>;
-@group(0) @binding(1) var<storage, read_write> out: array<u32>;
-@compute @workgroup_size(1) fn probe() {
-    let zero = input[0];
-    let big = input[1];
-    let one = input[2];
-    let nan = zero / zero;
-    out[0] = select(0u, 1u, nan != nan);
-    out[1] = bitcast<u32>((big + one) - big);
-    out[2] = bitcast<u32>(input[3] * input[4] + input[5]);
-}
-"#;
     let pipelines = r#"[{
-        "name": "probe", "shader": "probe.wgsl", "kind": "compute", "entry": "probe",
+        "name": "probe", "shader": "probe.ir", "kind": "compute", "entry": "probe",
         "workgroup_size": [1, 1, 1], "uniform": null,
         "bindings": [{ "binding": 0, "kind": "read" }, { "binding": 1, "kind": "read_write" }]
     }]"#;
@@ -1186,11 +1118,15 @@ fn safe_math_keeps_nans_and_the_order_of_sums() {
     let frames = [vec![encoder.finish()]];
     for safe in [false, true] {
         let name = format!("math-mode-{safe}");
-        let dir = program_build(&name, pipelines, &[("probe.wgsl", shader)], &frames);
+        let dir = program_build(&name, pipelines, &[("probe.ir", &shaders::probe())], &frames);
         if safe {
+            // The math mode the writer states, made safe.
             let path = dir.join("probe.metal");
             let text = std::fs::read_to_string(&path).expect("the MSL");
-            let text = format!("#pragma METAL fp math_mode(safe)\n{text}");
+            assert!(text.contains("#pragma METAL fp math_mode(fast)"), "the mode is stated");
+            let text = text
+                .replace("math_mode(fast)", "math_mode(safe)")
+                .replace("contract(fast)", "contract(off)");
             std::fs::write(&path, text).expect("the MSL");
         }
         let mut host = Host::load(&dir).expect("loads");

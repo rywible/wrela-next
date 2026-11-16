@@ -7,8 +7,8 @@
 //! legs) indexes a private copy of the array. GPU compilers keep such copies in slow memory:
 //! the grazer ran 19× slower than spike 01's hand-written kernel, which reads `G.parts[i]`
 //! straight from the uniform. After flattening, the compiled kernel reads the uniform the same
-//! way. WGSL can't pass pointers into uniform memory to functions (naga doesn't implement
-//! `unrestricted_pointer_parameters`), which is why this inlines rather than passing places.
+//! way. The shader writers pass no pointers into uniform memory to functions (WGSL, which the
+//! compiler once wrote, couldn't), which is why this inlines rather than passing places.
 //!
 //! GPU code has no recursion (E0600), so inlining terminates. Only GPU modules are flattened;
 //! CPU code inlines small functions and those called from one place ([`inline_cpu`]).

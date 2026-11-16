@@ -32,8 +32,8 @@ fn lengths_of_runs_and_buffers() {
     assert_eq!(&counts[..4], &[10, 11, 12, 13]);
 }
 
-/// Without a GPU too: the WGSL back end takes every shader (naga validates it, and parses the
-/// WGSL it writes).
+/// Without a GPU too: the shader writers take every shader (and the platforms' offline tools
+/// what they write, `wrela_tests::offline_check`).
 #[test]
 fn shaders_build() {
     built("shaders");
@@ -217,7 +217,7 @@ pub fn frame(time: f32, width: u32, height: u32) {
         let how = wrela_driver::BuildFor { kind, set: Vec::new(), target, trusted_shaders };
         let out = wrela_driver::build_for(&pkg, &how);
         assert!(!out.has_errors(), "{:?}", out.diagnostics);
-        let ext = format!(".{}", wrela_wgsl::extension(target));
+        let ext = format!(".{}", wrela_shader::extension(target));
         out.files.iter().filter(|(n, _)| n.ends_with(&ext)).flat_map(|(_, b)| b.clone()).collect()
     };
     let (checked, trusted) =
