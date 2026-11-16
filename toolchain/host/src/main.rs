@@ -1,8 +1,8 @@
 //! `wrela-host`: runs a build headless.
 //!
 //! - `wrela-host <build-dir> [--frames N] [--fps F] [--size WxH] [--input script.json]
-//!   [--png out.png [--every K [--png-from N]]] [--rgba out.rgba] [--timestamps [--serial]] [--log out.ticks]
-//!   [--pipelines] [--capture F out.gputrace] [--workers N]`: frames on the GPU (in lockstep
+//!   [--png out.png [--every K [--png-from N]]] [--rgba out.rgba] [--timestamps [--serial]] [--cpu]
+//!   [--log out.ticks] [--pipelines] [--capture F out.gputrace] [--workers N]`: frames on the GPU (in lockstep
 //!   with the program's ticker, if it has one), then the state hash; the phases the program
 //!   timed (`std::time::phase`), if any, on stderr. `--pipelines` reports each pipeline on
 //!   stderr as it's built (`pipeline_report`); `--capture` writes frame F's GPU work as a Metal
@@ -34,7 +34,7 @@ use std::process::ExitCode;
 use wrela_host::{CpuBuild, TickLog};
 
 const USAGE: &str = "usage:
-  wrela-host <build-dir> [--frames N] [--fps F] [--size WxH] [--input script.json] [--png out.png [--every K [--png-from N]]] [--rgba out.rgba] [--timestamps [--serial]] [--log out.ticks] [--pipelines] [--steps] [--capture F out.gputrace] [--workers N]
+  wrela-host <build-dir> [--frames N] [--fps F] [--size WxH] [--input script.json] [--png out.png [--every K [--png-from N]]] [--rgba out.rgba] [--timestamps [--serial]] [--cpu] [--targets DIR] [--log out.ticks] [--pipelines] [--steps] [--capture F out.gputrace] [--workers N]
   wrela-host <build-dir> --until TEXT [--input script.json] [--frames N] [--fps F] [--size WxH] --png out.png [--pipelines] [--workers N]
   wrela-host --no-gpu <build-dir> --ticks N [--input script.json] [--log out.ticks] [--workers N]
   wrela-host --replay <log> [--no-gpu] <build-dir> [--workers N]
@@ -52,9 +52,16 @@ frames; the capture schedule and numbering stay the same.
 is the PNG; it fails if none does within --frames.
 --timestamps prints each dispatch's and pass's GPU time to stderr, and each frame's span (its
 first start to its last end); --serial runs each pass and dispatch alone, so each time is its own.
+--cpu prints each frame's CPU time on the host's thread to stderr (`frame N  cpu total T ms
+program P check C record R blocked B`): the program's WASM and ticks, checking what it
+submits, recording the GPU's work, and waiting for the GPU. Without --timestamps: with them,
+the host waits for each submission's timestamps, and that wait is blocked time.
 --steps prints a line to stderr for each dispatch and draw as it's recorded: its frame, label
 and pipeline, a dispatch's invocations and its kernel's most work an invocation (work.json), a
 draw's vertices and instances.
+--targets DIR writes, after the last frame, each labelled pass's target as its own texels and as a
+PNG, and every buffer's bytes, with targets.json saying which is which (`Host::dump_targets`):
+what tools/hosts compares two hosts by.
 --pipelines prints a line to stderr for each pipeline as it's built: its MSL file
 (pipeline_N.metal) and entry points; a compute pipeline's declared workgroup size and, on Metal,
 its SIMD width, the most threads a threadgroup of it may have and its threadgroup memory; a
@@ -87,10 +94,12 @@ struct Args {
     every: Option<u32>,
     png_from: Option<u32>,
     rgba: Option<PathBuf>,
+    targets: Option<PathBuf>,
     input: Option<PathBuf>,
     until: Option<String>,
     timestamps: bool,
     serial: bool,
+    cpu: bool,
     pipelines: bool,
     capture: Option<(u32, PathBuf)>,
     no_gpu: bool,
@@ -112,10 +121,12 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
         every: None,
         png_from: None,
         rgba: None,
+        targets: None,
         input: None,
         until: None,
         timestamps: false,
         serial: false,
+        cpu: false,
         pipelines: false,
         capture: None,
         no_gpu: false,
@@ -152,12 +163,14 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
             "--every" => args.every = Some(whole("--every", value("--every")?)?.max(1)),
             "--png-from" => args.png_from = Some(whole("--png-from", value("--png-from")?)?),
             "--rgba" => args.rgba = Some(value("--rgba")?.into()),
+            "--targets" => args.targets = Some(value("--targets")?.into()),
             "--input" => args.input = Some(value("--input")?.into()),
             "--until" => args.until = Some(value("--until")?),
             "--log" => args.log = Some(value("--log")?.into()),
             "--replay" => args.replay = Some(value("--replay")?.into()),
             "--timestamps" => args.timestamps = true,
             "--serial" => args.serial = true,
+            "--cpu" => args.cpu = true,
             "--pipelines" => args.pipelines = true,
             "--steps" => wrela_host::step::log_steps(),
             "--capture" => {
@@ -336,7 +349,9 @@ fn frames(args: &Args) -> Result<(), Failure> {
         relaxed_simd: args.relaxed,
         ..Options::default()
     };
+    let loading = std::time::Instant::now();
     let mut host = Host::load_with(&args.dir, &options)?;
+    let loaded_ms = loading.elapsed().as_secs_f64() * 1000.0;
     let logging = args.log.is_some();
     host.want_hashes(logging);
     host.init()?;
@@ -358,6 +373,10 @@ fn frames(args: &Args) -> Result<(), Failure> {
             wrela_host::image::write_png(&path, w, h, rgba)
         },
     )?;
+    if let Some(dir) = &args.targets {
+        host.dump_targets(dir)?;
+    }
+    let (pipelines_built, pipelines_ms) = (host.pipelines_built(), host.pipelines_build_ms());
     // The phases the program timed (`std::time::phase`), over every frame and tick.
     let traced = host.trace().take();
     drop(host); // release the GPU (and its lock) before writing files
@@ -378,6 +397,18 @@ fn frames(args: &Args) -> Result<(), Failure> {
     }
     for (frame, ms) in wrela_host::frame_spans(&run.timings) {
         eprintln!("frame {frame:>4}  span {ms:.3} ms");
+    }
+    if args.cpu {
+        eprintln!(
+            "load  {loaded_ms:.1} ms, of which pipelines {} built in {pipelines_ms:.1} ms",
+            pipelines_built
+        );
+        for c in &run.cpu {
+            eprintln!(
+                "frame {:>4}  cpu total {:.3} ms program {:.3} check {:.3} record {:.3} blocked {:.3}",
+                c.frame, c.total, c.program, c.check, c.record, c.blocked
+            );
+        }
     }
     println!("{}", run.hash_hex());
     Ok(())

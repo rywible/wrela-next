@@ -351,6 +351,7 @@ mod tests {
             prepared: PreparedBuilds::new(),
             cancelled_preparations: Vec::new(),
             beside: None,
+            cpu: Vec::new(),
         };
         let builder = host.p().executor().builder();
         let (entered, release, finished) = (mpsc::channel(), mpsc::channel(), mpsc::channel());

@@ -3,8 +3,8 @@
 
     tools/bench <build> [--size WxH] [--frames A-B] [--runs N] [--rest S] [--against <build2>]
                 [--passes-build P] [--against-passes-build P2] [--no-passes]
-                [--canary LABEL [--canary-share P]] [--json FILE] [--host PATH] [--timeout S]
-                [-- <more wrela-host flags>]
+                [--canary LABEL [--canary-share P]] [--no-cpu] [--json FILE] [--host PATH]
+                [--timeout S] [-- <more wrela-host flags>]
 
 Every launch goes through tools/gpu (the guard, the machine's one GPU lock, the timeout) at --size
 (default 3840x2160), frames 0 to B, and frames A to B are read (0-based, as the host numbers them).
@@ -79,6 +79,15 @@ A span run during heavy CPU work elsewhere reads high (the old opening at 1280x7
 processes' CPU is sampled while a run holds the GPU (`ps`, every 2 s), its median shown on the
 run's line, and a span run past 400% of a core (the M4's 4 performance cores) is warned about.
 
+WHAT THE CPU DOES: one more run of each build with `--cpu` and no timestamps (whose reads would
+be the host waiting on the GPU), the host's own time a frame on its thread, as the host prints it
+(toolchain/host/src/cpu_time.rs): `program` (the program's WASM, its ticks), `check` (checking each
+batch it submits), `record` (carrying out the commands: recording the GPU's work, submitting it)
+and `blocked` (waiting for the GPU: the guard's wait for the oldest of the frames in flight,
+read-backs), each's median over the frames read, and the frame's `total`. A frame the GPU can't
+keep up with shows as blocked time: the CPU's own cost is program + check + record. --no-cpu
+leaves the run out.
+
 What tools/gpu and the host say besides timings (the wait for the GPU lock, errors) is passed on
 to stderr behind `  | `; each run's line says how long it waited and how long it ran.
 
@@ -114,12 +123,15 @@ SPAN_NAME = "frame span"
 
 TIMING = re.compile(r"^frame\s+(\d+)\s+(.+?)\s+(-?\d+(?:\.\d+)?) us$")
 SPAN = re.compile(r"^frame\s+(\d+)\s+span\s+(-?\d+(?:\.\d+)?) ms$")
+CPU = re.compile(r"^frame\s+(\d+)\s+cpu total (\S+) ms program (\S+) check (\S+) "
+                 r"record (\S+) blocked (\S+)$")
+CPU_PARTS = ("program", "check", "record", "blocked", "total")
 WAITED = re.compile(r"^gpu: waited (\d+(?:\.\d+)?) s$")
 HASH = re.compile(r"^[0-9a-f]{16}$")
 
 # wrela-host flags the bench sets itself, or that don't time frames.
 OWN = {"--frames", "--size", "--until", "--no-gpu", "--replay", "--compare-ticks", "--capture",
-       "--timestamps", "--serial"}
+       "--timestamps", "--serial", "--cpu"}
 
 
 class Usage(Exception):
@@ -153,6 +165,26 @@ def read_spans(lines):
         if m:
             spans[int(m.group(1))] = float(m.group(2))
     return spans
+
+
+def read_cpu(lines):
+    """The host's `--cpu` lines: {frame: {part: ms}}."""
+    out = {}
+    for line in lines:
+        m = CPU.match(line.rstrip("\n"))
+        if m:
+            total, program, check, record, blocked = (float(m.group(i)) for i in range(2, 7))
+            out[int(m.group(1))] = {"total": total, "program": program, "check": check,
+                                    "record": record, "blocked": blocked}
+    return out
+
+
+def cpu_table(cpu, first, last):
+    """Each part's spread over frames `first`..`last`: {part: spread}, or None if none."""
+    read = [cpu[f] for f in sorted(cpu) if first <= f <= last]
+    if not read:
+        return None
+    return {p: dict(spread([c[p] for c in read]), frames=len(read)) for p in CPU_PARTS}
 
 
 def window(spans, first, last):
@@ -379,16 +411,18 @@ class Sampler:
 
 
 
-def run_once(build, size, last, extra, host, timeout, serial):
-    """One run of `build` through tools/gpu, frames 0..last, with --timestamps (and --serial).
+def run_once(build, size, last, extra, host, timeout, serial, cpu=False):
+    """One run of `build` through tools/gpu, frames 0..last, with --timestamps (and --serial),
+    or with `cpu`, --cpu and no timestamps.
     Returns (status, the timed lines, state hash, seconds waited for the lock, seconds in all,
     the median of the other processes' CPU while it ran, in percent of a core, or None, and the
     share of its GPU clock samples at the top level, in percent, or None)."""
     cmd = [GPU]
     if host:
         cmd += ["--host", host]
-    cmd += ["--timeout", str(timeout), build, "--frames", str(last + 1), "--size", size,
-            "--timestamps"] + (["--serial"] if serial else []) + extra
+    timing = ["--cpu"] if cpu else ["--timestamps"] + (["--serial"] if serial else [])
+    cmd += ["--timeout", str(timeout), build, "--frames", str(last + 1), "--size", size] \
+        + timing + extra
     began = time.monotonic()
     child = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     sampler = Sampler(child)
@@ -397,7 +431,7 @@ def run_once(build, size, last, extra, host, timeout, serial):
     reader.start()
     timed, waited = [], 0.0
     for line in child.stderr:
-        if TIMING.match(line.rstrip("\n")) or SPAN.match(line.rstrip("\n")):
+        if any(r.match(line.rstrip("\n")) for r in (TIMING, SPAN, CPU)):
             timed.append(line)
             continue
         m = WAITED.match(line.strip())
@@ -504,10 +538,27 @@ def print_passes_ab(ta, tb, la, lb):
 # ---- the command -------------------------------------------------------------------------------
 
 
+def print_cpu(tables, sides):
+    print("what the CPU does a frame, on the host's thread (--cpu, no timestamps): medians, ms")
+    head = f"{'':<10}" + "".join(f"{s:>12}" for s in sides)
+    if len(sides) == 2:
+        head += f"{'B - A':>18}"
+    print(head)
+    for p in CPU_PARTS:
+        if p == "total":
+            print("-" * len(head))
+        row = f"{p:<10}" + "".join(f"{tables[s][p]['median']:>12.3f}" for s in sides)
+        if len(sides) == 2:
+            a, b = tables["A"][p]["median"], tables["B"][p]["median"]
+            row += f"{b - a:>+9.3f} ({pct(b - a, a):>6})"
+        print(row)
+
+
 def parse_args(argv):
     o = {"build": None, "size": "3840x2160", "frames": (300, 419), "runs": None, "rest": 30.0,
          "against": None, "passes_build": None, "against_passes_build": None, "passes": True,
-         "canary": None, "share": 5.0, "json": None, "host": None, "timeout": 600.0, "extra": []}
+         "canary": None, "share": 5.0, "json": None, "host": None, "timeout": 600.0, "extra": [],
+         "cpu": True}
     if "--" in argv:
         i = argv.index("--")
         argv, o["extra"] = argv[:i], argv[i + 1:]
@@ -521,6 +572,10 @@ def parse_args(argv):
             raise Usage(__doc__)
         if a == "--no-passes":
             o["passes"] = False
+            i += 1
+            continue
+        if a == "--no-cpu":
+            o["cpu"] = False
             i += 1
             continue
         if a in takes:
@@ -598,15 +653,18 @@ def main(argv):
     plan = [("span", s) for _ in range(o["runs"]) for s in builds]
     if o["passes"]:
         plan += [("passes", s) for s in builds]
+    if o["cpu"]:
+        plan += [("cpu", s) for s in builds]
     what = f"{o['build']} against {o['against']}" if o["against"] else o["build"]
     print(f"bench: {what} at {o['size']}, frames {first}-{last}; "
           f"{o['runs']} span {'pair' if o['against'] else 'run'}{'s' if o['runs'] > 1 else ''}"
           f"{', then passes alone' if o['passes'] else ''}"
+          f"{', then the CPU' if o['cpu'] else ''}"
           f"{(', ' + format(o['rest'], 'g') + ' s rest between runs') if len(plan) > 1 else ''}")
     warnings, began = [], time.monotonic()
     spans = {"A": [], "B": []}      # each span run: {"values", "pieces" (measure), ...}
-    tables = {}
-    record = {"span_runs": [], "passes_runs": []}
+    tables, cpus = {}, {}
+    record = {"span_runs": [], "passes_runs": [], "cpu_runs": []}
     warned = set()
     for n, (kind, s) in enumerate(plan):
         if n and o["rest"]:
@@ -615,11 +673,15 @@ def main(argv):
         wait_quiet()
         build = builds[s] if kind == "span" else passes[s]
         k = len(spans[s]) + 1
-        label = ((f"{s} " if o["against"] else "") + (f"run {k}" if kind == "span" else "passes"))
+        label = ((f"{s} " if o["against"] else "") + (f"run {k}" if kind == "span" else kind))
         print(f"bench: {label}: {build}" + (" (passes alone)" if kind == "passes" else ""),
               file=sys.stderr, flush=True)
-        status, timed, state, waited, took, busy, top = run_once(
-            build, o["size"], last, o["extra"], o["host"], o["timeout"], kind == "passes")
+        if kind == "cpu":
+            status, timed, state, waited, took, busy, top = run_once(
+                build, o["size"], last, o["extra"], o["host"], o["timeout"], False, cpu=True)
+        else:
+            status, timed, state, waited, took, busy, top = run_once(
+                build, o["size"], last, o["extra"], o["host"], o["timeout"], kind == "passes")
         if status != 0:
             print(f"bench: {label} failed (exit {status})", file=sys.stderr)
             return status
@@ -634,7 +696,18 @@ def main(argv):
             tail += f"; GPU clock at its top {top:.0f}% of the run"
         if state:
             tail += f"; state hash {state}"
-        if kind == "span":
+        if kind == "cpu":
+            t = cpu_table(read_cpu(timed), first, last)
+            if t is None:
+                print(f"bench: {label} printed no CPU times for frames {first}-{last}",
+                      file=sys.stderr)
+                return 1
+            cpus[s] = t
+            print(f"{label}: record {t['record']['median']:.3f} ms, check "
+                  f"{t['check']['median']:.3f}, program {t['program']['median']:.3f}, blocked "
+                  f"{t['blocked']['median']:.3f} a frame{tail}", flush=True)
+            record["cpu_runs"].append({"side": s, "build": build, "hash": state, "table": t})
+        elif kind == "span":
             values = window(read_spans(timed), first, last)
             if not values:
                 print(f"bench: {label} printed no spans for frames {first}-{last}",
@@ -745,6 +818,9 @@ def main(argv):
             print_passes_ab(tables["A"], tables["B"], tables["A_load"], tables["B_load"])
         else:
             print_passes(tables["A"], tables["A_load"])
+    if cpus:
+        print()
+        print_cpu(cpus, [s for s in "AB" if s in cpus])
     print(f"bench: {len(plan)} run{'s' if len(plan) > 1 else ''} in "
           f"{time.monotonic() - began:.0f} s", file=sys.stderr)
     if warnings:

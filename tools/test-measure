@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests of the measuring tools (tools/bench, tools/shot, tools/same), with no GPU: synthetic
+"""Tests of the measuring tools (tools/bench, tools/shot, tools/same, tools/hosts), with no GPU: synthetic
 timestamp output from a fake tools/gpu, and synthetic pictures. Each gate is shown to hold where
 it should and to fail where it should, and each test is shown to catch a broken tool (the
 mutants at the end: a test that can't fail proves nothing).
@@ -37,6 +37,7 @@ def tool(name):
 
 bench = tool("bench")
 same = tool("same")
+hosts = tool("hosts")
 shot = tool("shot")
 from PIL import Image, ImageDraw  # noqa: E402  (tools/same needs Pillow too)
 
@@ -53,7 +54,8 @@ args = sys.argv[1:]
 while args[0] in ("--host", "--timeout"):
     args = args[2:]
 build, n = args[0], int(args[args.index("--frames") + 1])
-mode = "serial" if "--serial" in args else "span" if "--timestamps" in args else "shot"
+mode = ("serial" if "--serial" in args else "span" if "--timestamps" in args
+        else "cpu" if "--cpu" in args else "shot")
 open(os.path.join(build, ".args-" + mode), "w").write(" ".join(args))
 if "--png" in args:
     open(args[args.index("--png") + 1], "wb").write(b"png")
@@ -76,6 +78,13 @@ for f in shown:
         # Two pieces a label, as a pass and its dispatch: the bench sums them.
         print(f"frame {f:>4}  {label:<24} {us / 2:>10.3f} us", file=sys.stderr)
         print(f"frame {f:>4}  {label:<24} {us - us / 2:>10.3f} us", file=sys.stderr)
+if mode == "cpu":
+    for f in shown:
+        c = {p: at(run.get("cpu", {}).get(p, 0.5), f) for p in ("program", "check", "record", "blocked")}
+        total = sum(c.values())
+        print(f"frame {f:>4}  cpu total {total:.3f} ms program {c['program']:.3f} check "
+              f"{c['check']:.3f} record {c['record']:.3f} blocked {c['blocked']:.3f}", file=sys.stderr)
+    shown = []
 for f in shown:
     span = 99.0 if mode == "serial" else at(run.get("span", 1.0), f)
     print(f"frame {f:>4}  span {span:.3f} ms", file=sys.stderr)
@@ -333,6 +342,57 @@ def test_canary_moved_warns():
     assert "the canary `clouds` moved" in err
 
 
+def test_cpu_is_read_from_its_own_run_without_timestamps():
+    b = build("cpu", [{"span": 5.0, "cpu": {"record": [1.0, 3.0], "check": 0.25,
+                                           "program": 2.0, "blocked": 0.0}}])
+    out, text, _ = bench_json([b, "--no-passes"])
+    t = out["cpu_runs"][0]["table"]
+    assert near(t["record"]["median"], 2.0), t
+    assert near(t["check"]["median"], 0.25), t
+    assert near(t["total"]["median"], 4.25), t
+    args = args_of(b, "cpu")
+    assert "--cpu" in args and "--timestamps" not in args, args
+    assert "what the CPU does" in text
+    out, _, _ = bench_json([b, "--no-passes", "--no-cpu"])
+    assert not out["cpu_runs"]
+
+
+def fake_run(name, targets, screen, buffers):
+    """A run's directory as `wrela-host --targets` writes it: `targets` [(label, bytes)] in
+    order (4x1 rgba8 each), `buffers` {handle: bytes}."""
+    d = os.path.join(WORK, name)
+    t = os.path.join(d, "targets")
+    os.makedirs(t, exist_ok=True)
+    listed = []
+    for k, (label, raw) in enumerate(targets):
+        open(os.path.join(t, f"target-{k}.raw"), "wb").write(raw)
+        listed.append({"label": label, "file": f"target-{k}", "width": 4, "height": 1,
+                       "format": "Rgba8"})
+    for h, raw in buffers.items():
+        open(os.path.join(t, f"buffer-{h}.raw"), "wb").write(raw)
+    json.dump({"targets": listed, "buffers": [{"handle": h, "file": f"buffer-{h}",
+                                               "bytes": len(r)} for h, r in buffers.items()]},
+              open(os.path.join(t, "targets.json"), "w"))
+    open(os.path.join(d, "screen.rgba"), "wb").write(screen)
+    return d
+
+
+def test_hosts_name_the_first_differing_pass():
+    px = bytes(range(16))
+    other = px[:9] + b"\xff" + px[10:]
+    a = fake_run("ha", [("sky", px), ("solids", px), ("last", px)], px, {3: b"abcd"})
+    b = fake_run("hb", [("sky", px), ("solids", other), ("last", other)], other, {3: b"abce"})
+    diffs, targets, buffers = hosts.compare(a, b)
+    assert (targets, buffers) == (3, 1)
+    names = [d[0] for d in diffs]
+    assert names == ["target `solids`", "target `last`", "the screen", "buffer 3"], diffs
+    assert "texel (2, 0)" in diffs[0][1], diffs[0]
+    same_dir = fake_run("hc", [("sky", px), ("solids", px), ("last", px)], px, {3: b"abcd"})
+    assert hosts.compare(a, same_dir)[0] == []
+    assert hosts.first_byte(b"x" * 10000 + b"a", b"x" * 10000 + b"b") == 10000
+    assert hosts.first_byte(b"abc", b"abcd") == 3
+
+
 def test_bench_refuses_its_own_flags():
     a = build("flags", [{"span": 1.0}])
     for extra in (["--", "--frames", "5"], ["--", "--size", "8x8"], ["--", "--serial"],
@@ -537,8 +597,15 @@ def serial_sum_as_frame(lines):
 
 
 def always_serial(run_once):
-    return lambda build, size, last, extra, host, timeout, serial: run_once(
-        build, size, last, extra, host, timeout, True)
+    return lambda build, size, last, extra, host, timeout, serial, **kw: run_once(
+        build, size, last, extra, host, timeout, True, **kw)
+
+
+def cpu_with_timestamps(run_once):
+    def run(build, size, last, extra, host, timeout, serial, cpu=False):
+        return run_once(build, size, last, extra + (["--timestamps"] if cpu else []), host,
+                        timeout, serial, cpu)
+    return run
 
 
 MUTANTS = [
@@ -569,6 +636,11 @@ MUTANTS = [
     ("no warning of a load in the span", lambda: patched(bench, "load_in_span_warning",
                                                          lambda b, w: None),
      [test_load_in_the_span_is_warned]),
+    ("the CPU run timed with timestamps", lambda: patched(bench, "run_once",
+                                                         cpu_with_timestamps(bench.run_once)),
+     [test_cpu_is_read_from_its_own_run_without_timestamps]),
+    ("hosts: no difference found", lambda: patched(hosts, "first_byte", lambda a, b: None),
+     [test_hosts_name_the_first_differing_pass]),
     ("the CPU never sampled", lambda: patched(bench, "others_cpu", lambda ours: None),
      [test_a_busy_cpu_is_warned]),
     ("no edge pixels", lambda: patched(same, "edges", no_edges),

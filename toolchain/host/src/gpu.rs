@@ -715,7 +715,7 @@ impl Behind {
             if self.waiting.len() <= Self::MOST {
                 return Ok(());
             }
-            std::thread::sleep(std::time::Duration::from_micros(200));
+            crate::cpu_time::blocked(|| std::thread::sleep(std::time::Duration::from_micros(200)));
         }
     }
 }
@@ -737,6 +737,9 @@ pub(crate) struct Gpu {
     /// How many pipelines it has built, here or on a [`Builder`]'s thread: for a test or a
     /// timing of what a swap built.
     built: Arc<AtomicUsize>,
+    /// The wall time it has spent building the builds' pipelines it took (ms), all threads at
+    /// once: a load's pipeline creation, as `--cpu` reports it.
+    build_ms: f64,
     /// Whether each pipeline it builds is reported on stderr ([`crate::pipeline_report`]).
     report: bool,
     resources: HashMap<u32, Resource>,
@@ -763,6 +766,8 @@ pub(crate) struct Gpu {
     /// colour, else its depth, as (texture, level, layer) ([`Gpu::read_target`], a test's
     /// golden of a pass).
     labelled: HashMap<Arc<str>, (u32, u32, u32)>,
+    /// The labels in `labelled`, in the order their passes last drew: a comparison's order.
+    labelled_order: Vec<Arc<str>>,
     /// The program's asks for a label's time (`std::gpu::timed`) not yet answered.
     asked: Vec<Ask>,
     /// The calls ended so far: a timing's call, and an ask's.
@@ -813,6 +818,14 @@ pub(crate) fn limits_of(l: &wgpu::Limits) -> wrela_abi::Limits {
 
 fn gpu_err(e: impl std::fmt::Display) -> Error {
     Error::Gpu(e.to_string())
+}
+
+/// Waits for the device to finish its work, counted as time blocked on the GPU
+/// ([`crate::cpu_time`]).
+fn wait(device: &wgpu::Device) -> Result<()> {
+    crate::cpu_time::blocked(|| device.poll(wgpu::PollType::wait_indefinitely()))
+        .map(|_| ())
+        .map_err(gpu_err)
 }
 
 /// Opens the high-performance adapter's device with `features` and the adapter's limits, as the
@@ -1021,6 +1034,7 @@ impl Gpu {
             pipeline_keys: Vec::new(),
             spare: HashMap::new(),
             built: Arc::new(AtomicUsize::new(0)),
+            build_ms: 0.0,
             report,
             resources: HashMap::new(),
             bind_groups: vec![HashMap::new(); manifest.pipelines.len()],
@@ -1034,6 +1048,7 @@ impl Gpu {
             buffer_readback: None,
             image_readback: None,
             labelled: HashMap::new(),
+            labelled_order: Vec::new(),
             asked: Vec::new(),
             calls: 0,
             behind: Behind::new(),
@@ -1079,7 +1094,9 @@ impl Gpu {
             kept.push(have);
             self.pipeline_keys.push(key);
         }
+        let began = std::time::Instant::now();
         let mut built = self.builder().build_many(&missing)?.into_iter();
+        self.build_ms += began.elapsed().as_secs_f64() * 1000.0;
         for have in kept {
             self.pipelines
                 .push(have.unwrap_or_else(|| built.next().expect("one built for each missing")));
@@ -1122,6 +1139,7 @@ impl Gpu {
         // build's requests reuse its numbers, and its handles name other resources.
         self.asked.clear();
         self.labelled.clear();
+        self.labelled_order.clear();
         // Its largest read sized these; the next build makes its own as it reads.
         self.buffer_readback = None;
         self.image_readback = None;
@@ -1169,6 +1187,11 @@ impl Gpu {
     /// How many pipelines it has built since it was opened.
     pub(crate) fn pipelines_built(&self) -> usize {
         self.built.load(Ordering::Relaxed)
+    }
+
+    /// The wall time spent building the pipelines builds took, in milliseconds.
+    pub(crate) fn pipelines_build_ms(&self) -> f64 {
+        self.build_ms
     }
 }
 
@@ -2237,7 +2260,7 @@ impl Gpu {
     fn alone(&mut self) -> Result<()> {
         if self.timer.as_ref().is_some_and(|t| t.serial) {
             self.flush()?;
-            self.device.poll(wgpu::PollType::wait_indefinitely()).map_err(gpu_err)?;
+            wait(&self.device)?;
         }
         Ok(())
     }
@@ -2425,6 +2448,8 @@ impl Gpu {
         };
         if let (Some(name), Some(target)) = (&open.label, target) {
             self.labelled.insert(name.clone(), target);
+            self.labelled_order.retain(|l| l != name);
+            self.labelled_order.push(name.clone());
         }
         let timestamps =
             self.timer.as_mut().and_then(|t| t.next_if(&self.asked, self.frame, self.calls, label));
@@ -2699,6 +2724,29 @@ impl Gpu {
     /// channel grey, two red and green, its alpha opaque unless it has one; a depth texture's
     /// depth grey. That level's width and height too. Waits for the GPU.
     pub(crate) fn read_target(&mut self, label: &str) -> Result<(u32, u32, Vec<u8>)> {
+        let (width, height, format, raw) = self.read_target_raw(label)?;
+        if format.is_uint() {
+            return Err(Error::Gpu(format!(
+                "the target of the pass labelled `{label}` holds integers, not an image"
+            )));
+        }
+        let texel = format.bytes_per_texel() as usize;
+        let rgba = raw.chunks_exact(texel).flat_map(|t| as_rgba8(format, t)).collect();
+        Ok((width, height, rgba))
+    }
+
+    /// The labels of the passes that drew into a texture, in the order they last drew
+    /// ([`Gpu::read_target`]).
+    pub(crate) fn target_labels(&self) -> Vec<String> {
+        self.labelled_order.iter().map(|l| l.to_string()).collect()
+    }
+
+    /// [`Gpu::read_target`]'s target as its own texels, rows top to bottom with no padding, and
+    /// its format: what a comparison of two hosts compares to the bit.
+    pub(crate) fn read_target_raw(
+        &mut self,
+        label: &str,
+    ) -> Result<(u32, u32, TextureFormat, Vec<u8>)> {
         self.flush()?;
         let (handle, level, layer) = *self
             .labelled
@@ -2712,9 +2760,9 @@ impl Gpu {
         };
         let (width, height) = stream::level_size(texture.width(), texture.height(), level);
         let format = *format;
-        if format.is_uint() || format.is_compressed() {
+        if format.is_compressed() {
             return Err(Error::Gpu(format!(
-                "the target of the pass labelled `{label}` holds integers, not an image"
+                "the target of the pass labelled `{label}` is compressed, which no pass draws"
             )));
         }
         let texel = u64::from(format.bytes_per_texel());
@@ -2747,19 +2795,16 @@ impl Gpu {
             wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
         );
         self.queue.submit([encoder.finish()]);
-        let rgba = map_read_with(&self.device, &staging, size, |bytes| {
-            let mut out = Vec::with_capacity(width as usize * height as usize * 4);
+        let raw = map_read_with(&self.device, &staging, size, |bytes| {
+            let mut out = Vec::with_capacity((row * u64::from(height)) as usize);
             for y in 0..height as usize {
                 let at = y * padded as usize;
-                let texels = &bytes[at..at + row as usize];
-                for t in texels.chunks_exact(texel as usize) {
-                    out.extend_from_slice(&as_rgba8(format, t));
-                }
+                out.extend_from_slice(&bytes[at..at + row as usize]);
             }
             out
         })?;
         self.check_errors()?;
-        Ok((width, height, rgba))
+        Ok((width, height, format, raw))
     }
 
     /// A debug build's: an error if a pipeline indexed an array out of range (its number, from
@@ -3176,7 +3221,7 @@ fn map_read_with<T>(
     // A failed map or poll must also release the buffer for its next copy. Declare the guard
     // before the mapped view, so that view is dropped first on every exit.
     let _unmap = UnmapOnExit(buffer);
-    device.poll(wgpu::PollType::wait_indefinitely()).map_err(gpu_err)?;
+    wait(device)?;
     rx.recv().map_err(gpu_err)?.map_err(gpu_err)?;
     let mapped = slice.get_mapped_range().map_err(gpu_err)?;
     let out = read(&mapped);
@@ -3328,7 +3373,7 @@ fn resolve(
     if n == 0 {
         return Ok(Vec::new());
     }
-    device.poll(wgpu::PollType::wait_indefinitely()).map_err(gpu_err)?;
+    wait(device)?;
     let size = u64::from(n) * 8;
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
     encoder.resolve_query_set(queries, 0..n, resolved, 0);

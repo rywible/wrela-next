@@ -652,12 +652,14 @@ impl<E: Executor> State<E> {
         self.checker.end_call(true);
         self.before_call = None;
         self.requests.reserved.clear();
-        for batch in std::mem::take(&mut self.pending) {
-            for command in stream::decode(&batch)? {
-                self.execute(&command)?;
+        crate::cpu_time::recording(|| {
+            for batch in std::mem::take(&mut self.pending) {
+                for command in stream::decode(&batch)? {
+                    self.execute(&command)?;
+                }
             }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     fn submit(&mut self, batch: &[u8]) -> Result<()> {
@@ -1690,7 +1692,7 @@ impl<E: Executor> Program<E> {
     fn finish_call(&mut self, result: wasmtime::Result<()>) -> Result<()> {
         self.settle(result)?;
         let state = self.store.data_mut();
-        let result = state.executor.end_frame();
+        let result = crate::cpu_time::recording(|| state.executor.end_frame());
         if let Err(error) = &result {
             state.failed = Some(error.to_string());
         }
@@ -2379,7 +2381,7 @@ fn submit<E: Executor>(
     // A handle of its own, so the batch is read in place while `state` changes.
     let memory = state.memory.clone();
     let result = match shared::slice(&memory, ptr as usize, len as usize) {
-        Some(batch) => state.submit(batch),
+        Some(batch) => crate::cpu_time::checking(|| state.submit(batch)),
         None => Err(Error::Trap(format!(
             "submit({ptr}, {len}) reaches past the end of the program's memory ({} bytes)",
             state.memory.data().len()

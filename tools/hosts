@@ -1,0 +1,242 @@
+#!/usr/bin/env python3
+"""Two hosts on one build, compared to the bit. Usage:
+
+    tools/hosts A B <build> [<build-B>] [--frames N] [--size WxH] [--keep DIR] [--timeout S]
+                [-- <more wrela-host flags>]
+
+A and B are wrela-host binaries, or `ours` for this repository's own (tools/gpu's, built if
+stale): a reference host kept outside the repository (wrela-notes/next/ref-host/<machine>/
+wrela-host, the wgpu host before it left) against the one in the tree, say. Each runs the build
+through tools/gpu, one after the other (one GPU job at a time), on the same frames (--frames,
+default 2) at the same size (--size, default 640x360), with `--targets` and `--rgba`: after the
+last frame each writes every labelled pass's target as its own texels, every buffer's bytes and
+the screen (toolchain/host/src/main.rs, `Host::dump_targets`). With a second build, B runs that one:
+one host on two builds of the same program (`tools/hosts ours ours a b`: two shader writers'
+builds, say).
+
+Compared, in order, and the first that differs named:
+
+  the state hash   every byte the program submitted (the hosts ran the same program the same way)
+  each target      in the order their passes last drew, by label: format, size, then every byte
+  the screen       every byte
+  each buffer      by handle: size, then every byte
+
+Every difference is listed; the first is called out (the earliest pass to differ is where to look:
+the later ones may only have read it). For a target or the screen that differs, tools/same gives
+how far apart the pictures are; this tool doesn't measure picture distance itself.
+
+  --keep DIR      write the runs to DIR (A/ and B/) and keep them; else a temporary directory,
+                  removed after.
+  --timeout S     tools/gpu's wall-clock limit for each run (default 300).
+
+Exit status: 0 when everything is the same to the bit; 1 when something differs; 2 for a usage
+error; else a failed run's (3: the guard refused the build, 124: the timeout killed it).
+"""
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+TOOLS = os.path.dirname(os.path.abspath(__file__))
+GPU = os.path.join(TOOLS, "gpu")
+SAME = os.path.join(TOOLS, "same")
+
+
+class Usage(Exception):
+    pass
+
+
+def parse(argv):
+    o = {"frames": 2, "size": "640x360", "keep": None, "timeout": 300.0, "extra": []}
+    if "--" in argv:
+        i = argv.index("--")
+        argv, o["extra"] = argv[:i], argv[i + 1:]
+    rest = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-h", "--help"):
+            raise Usage(__doc__)
+        if a in ("--frames", "--size", "--keep", "--timeout"):
+            if i + 1 >= len(argv):
+                raise Usage(f"{a} takes a value")
+            v = argv[i + 1]
+            try:
+                if a == "--frames":
+                    o["frames"] = int(v)
+                    assert o["frames"] >= 1
+                elif a == "--size":
+                    w, h = v.split("x")
+                    assert int(w) > 0 and int(h) > 0
+                    o["size"] = v
+                elif a == "--timeout":
+                    o["timeout"] = float(v)
+                    assert o["timeout"] > 0
+                else:
+                    o["keep"] = v
+            except (ValueError, AssertionError):
+                raise Usage(f"{a} doesn't take `{v}`")
+            i += 2
+            continue
+        if a.startswith("--"):
+            raise Usage(f"unknown option {a} (wrela-host's own go after `--`)")
+        rest.append(a)
+        i += 1
+    if len(rest) not in (3, 4):
+        raise Usage("needs two hosts and a build (and maybe B's own build)")
+    o["a"], o["b"], o["build"] = rest[:3]
+    o["build_b"] = rest[3] if len(rest) == 4 else rest[2]
+    for h in (o["a"], o["b"]):
+        if h != "ours" and not os.access(h, os.X_OK):
+            raise Usage(f"{h} isn't an executable wrela-host (or `ours`)")
+    for b in (o["build"], o["build_b"]):
+        if not os.path.isdir(b):
+            raise Usage(f"{b} isn't a directory")
+    for flag in ("--targets", "--rgba", "--frames", "--size"):
+        if flag in o["extra"]:
+            raise Usage(f"tools/hosts sets {flag} itself")
+    return o
+
+
+def run(host, build, out, o):
+    """One host's run into `out`: (exit status, its state hash or None)."""
+    os.makedirs(out, exist_ok=True)
+    cmd = [GPU, "--timeout", str(o["timeout"])]
+    if host != "ours":
+        cmd += ["--host", os.path.abspath(host)]
+    cmd += [build, "--frames", str(o["frames"]), "--size", o["size"],
+            "--targets", os.path.join(out, "targets"), "--rgba", os.path.join(out, "screen.rgba"),
+            "--png", os.path.join(out, "screen.png")] + o["extra"]
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    for line in p.stderr.splitlines():
+        if not line.startswith("gpu: guard: largest"):
+            print(f"  | {line}", file=sys.stderr)
+    lines = [l.strip() for l in p.stdout.splitlines() if l.strip()]
+    return p.returncode, (lines[-1] if lines else None)
+
+
+def read(path):
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def first_byte(a, b):
+    """The first byte where `a` and `b` differ, or None."""
+    n = min(len(a), len(b))
+    if a[:n] == b[:n]:
+        return None if len(a) == len(b) else n
+    lo, hi = 0, n
+    while hi - lo > 4096:
+        mid = (lo + hi) // 2
+        if a[lo:mid] != b[lo:mid]:
+            hi = mid
+        else:
+            lo = mid
+    for k in range(lo, hi):
+        if a[k] != b[k]:
+            return k
+    return n
+
+
+def same_line(pa, pb):
+    """tools/same's measures between two PNGs, as one line, or None."""
+    if not (os.path.exists(pa) and os.path.exists(pb)):
+        return None
+    p = subprocess.run([SAME, pa, pb], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                       text=True)
+    return " / ".join(l.strip() for l in p.stdout.splitlines() if l.strip())
+
+
+def compare(da, db):
+    """Every difference between two runs' directories, in order: [(what, detail)]."""
+    diffs = []
+    ta = json.load(open(os.path.join(da, "targets", "targets.json")))
+    tb = json.load(open(os.path.join(db, "targets", "targets.json")))
+    targets_b = {t["label"]: t for t in tb["targets"]}
+    for t in ta["targets"]:
+        u = targets_b.pop(t["label"], None)
+        what = f"target `{t['label']}`"
+        if u is None:
+            diffs.append((what, "only A drew it"))
+            continue
+        shape = lambda x: (x["format"], x["width"], x["height"])  # noqa: E731
+        if shape(t) != shape(u):
+            diffs.append((what, f"A {shape(t)}, B {shape(u)}"))
+            continue
+        ra = read(os.path.join(da, "targets", t["file"] + ".raw"))
+        rb = read(os.path.join(db, "targets", u["file"] + ".raw"))
+        k = first_byte(ra, rb)
+        if k is not None:
+            texel = len(ra) // max(1, t["width"] * t["height"])
+            at = k // max(1, texel)
+            detail = (f"{t['format']} {t['width']}x{t['height']}: first at texel "
+                      f"({at % t['width']}, {at // t['width']})")
+            near = same_line(os.path.join(da, "targets", t["file"] + ".png"),
+                             os.path.join(db, "targets", u["file"] + ".png"))
+            if near:
+                detail += f"; tools/same: {near}"
+            diffs.append((what, detail))
+    for label in targets_b:
+        diffs.append((f"target `{label}`", "only B drew it"))
+    sa, sb = read(os.path.join(da, "screen.rgba")), read(os.path.join(db, "screen.rgba"))
+    k = first_byte(sa, sb)
+    if k is not None:
+        near = same_line(os.path.join(da, "screen.png"), os.path.join(db, "screen.png"))
+        diffs.append(("the screen", f"first at byte {k}" + (f"; tools/same: {near}" if near else "")))
+    buffers_b = {b["handle"]: b for b in tb["buffers"]}
+    for b in ta["buffers"]:
+        c = buffers_b.pop(b["handle"], None)
+        what = f"buffer {b['handle']}"
+        if c is None:
+            diffs.append((what, "only in A"))
+            continue
+        ra = read(os.path.join(da, "targets", b["file"] + ".raw"))
+        rb = read(os.path.join(db, "targets", c["file"] + ".raw"))
+        k = first_byte(ra, rb)
+        if k is not None:
+            diffs.append((what, f"{len(ra)} and {len(rb)} bytes, first difference at byte {k}"))
+    for h in buffers_b:
+        diffs.append((f"buffer {h}", "only in B"))
+    return diffs, len(ta["targets"]), len(ta["buffers"])
+
+
+def main(argv):
+    try:
+        o = parse(argv)
+    except Usage as e:
+        print(__doc__ if str(e) == __doc__ else f"hosts: {e}\n(tools/hosts --help)",
+              file=sys.stderr)
+        return 2
+    work = o["keep"] or tempfile.mkdtemp(prefix="hosts-")
+    try:
+        hashes = {}
+        for side, host, build in (("A", o["a"], o["build"]), ("B", o["b"], o["build_b"])):
+            print(f"hosts: {side}: {host} on {build}, {o['frames']} frames at {o['size']}",
+                  file=sys.stderr, flush=True)
+            status, state = run(host, build, os.path.join(work, side), o)
+            if status != 0:
+                print(f"hosts: {side} failed (exit {status})", file=sys.stderr)
+                return status
+            hashes[side] = state
+        diffs, targets, buffers = compare(os.path.join(work, "A"), os.path.join(work, "B"))
+        if hashes["A"] != hashes["B"]:
+            diffs.insert(0, ("the state hash", f"A {hashes['A']}, B {hashes['B']}"))
+        if not diffs:
+            print(f"hosts: the same to the bit: state hash {hashes['A']}, {targets} targets, "
+                  f"the screen, {buffers} buffers")
+            return 0
+        print(f"hosts: {len(diffs)} difference{'s' if len(diffs) > 1 else ''}; the first: "
+              f"{diffs[0][0]}")
+        for what, detail in diffs:
+            print(f"  {what}: {detail}")
+        return 1
+    finally:
+        if not o["keep"]:
+            shutil.rmtree(work, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

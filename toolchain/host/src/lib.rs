@@ -24,6 +24,7 @@
 pub mod capture;
 pub mod code;
 mod confined;
+pub mod cpu_time;
 mod error;
 #[cfg(feature = "gpu")]
 mod gpu;
@@ -213,6 +214,8 @@ pub struct RunResult {
     pub frame: Vec<u8>,
     /// GPU durations, with [`Options::timing`]; empty otherwise.
     pub timings: Vec<GpuTiming>,
+    /// Each frame's CPU time on the host's thread ([`cpu_time`]), for the runs that time it.
+    pub cpu: Vec<cpu_time::CpuFrame>,
 }
 
 #[cfg(feature = "gpu")]
@@ -455,6 +458,8 @@ pub struct Host {
     cancelled_preparations: Vec<handover::Preparation>,
     /// A driven host's way to the builds it hands over to.
     beside: Option<Beside>,
+    /// The CPU time of each frame run since the last result ([`cpu_time`]).
+    cpu: Vec<cpu_time::CpuFrame>,
 }
 
 #[cfg(feature = "gpu")]
@@ -760,6 +765,7 @@ impl Host {
             prepared: handover::PreparedBuilds::new(),
             cancelled_preparations: Vec::new(),
             beside: None,
+            cpu: Vec::new(),
         };
         if !options.defer_init {
             host.init()?;
@@ -840,10 +846,12 @@ impl Host {
             if let Some((_, path)) = captured {
                 self.p().executor().begin_capture(path)?;
             }
-            let ran = self
-                .p()
-                .lockstep_frame(i, fps, width, height, script, log.as_mut())
-                .and_then(|()| self.settle_handing());
+            let (ran, cpu) = cpu_time::frame(i as usize, || {
+                self.p()
+                    .lockstep_frame(i, fps, width, height, script, log.as_mut())
+                    .and_then(|()| self.settle_handing())
+            });
+            self.cpu.push(cpu);
             if captured.is_some() {
                 self.p().executor().end_capture()?;
             }
@@ -955,7 +963,8 @@ impl Host {
         let frame = gpu.read_screen()?;
         let timings = gpu.take_timings()?;
         let hash = self.p().hash().value();
-        Ok(RunResult { hash, width, height, frame, timings })
+        let cpu = std::mem::take(&mut self.cpu);
+        Ok(RunResult { hash, width, height, frame, timings, cpu })
     }
 
     /// Calls one of the program's other exports with numeric arguments: CPU evaluation for
@@ -1028,6 +1037,12 @@ impl Host {
         &self.dir
     }
 
+    /// The wall time the current device has spent building the pipelines of the builds it took
+    /// (all threads at once), in milliseconds.
+    pub fn pipelines_build_ms(&mut self) -> f64 {
+        self.p().executor().pipelines_build_ms()
+    }
+
     /// How many pipelines the current device has built: what a hand-over, reload or restart
     /// built, by the difference. Restarts that change GPU capabilities open a new device.
     pub fn pipelines_built(&mut self) -> usize {
@@ -1056,6 +1071,51 @@ impl Host {
     /// test's golden of a pass (§13.2).
     pub fn read_target(&mut self, label: &str) -> Result<(u32, u32, Vec<u8>)> {
         self.p().executor().read_target(label)
+    }
+
+    /// Writes what two hosts' runs are compared by (`tools/hosts`) to `dir`: each labelled pass's
+    /// target ([`Host::read_target`]) as its own texels (`target-K.raw`, rows top to bottom) and
+    /// as RGBA8 (`target-K.png`, as `read_target` gives it), and every live buffer's bytes
+    /// (`buffer-H.raw`); and `targets.json`, which says which file is which: the targets in
+    /// the order their passes last drew (label, width, height, format), then the buffers by
+    /// handle. Waits for the GPU.
+    pub fn dump_targets(&mut self, dir: &Path) -> Result<()> {
+        use std::fmt::Write as _;
+        std::fs::create_dir_all(dir).map_err(|e| Error::io(dir, e))?;
+        let write = |name: &str, bytes: &[u8]| {
+            let path = dir.join(name);
+            std::fs::write(&path, bytes).map_err(|e| Error::io(&path, e))
+        };
+        let gpu = self.p().executor();
+        let mut json = String::from("{\"targets\": [");
+        for (k, label) in gpu.target_labels().iter().enumerate() {
+            let (width, height, format, raw) = gpu.read_target_raw(label)?;
+            write(&format!("target-{k}.raw"), &raw)?;
+            if !format.is_uint() {
+                let (_, _, rgba) = gpu.read_target(label)?;
+                image::write_png(&dir.join(format!("target-{k}.png")), width, height, &rgba)?;
+            }
+            let quoted = json_string(label);
+            let _ = write!(
+                json,
+                "{}\n {{\"label\": {quoted}, \"file\": \"target-{k}\", \"width\": {width}, \
+                 \"height\": {height}, \"format\": \"{format:?}\"}}",
+                if k == 0 { "" } else { "," }
+            );
+        }
+        json.push_str("],\n\"buffers\": [");
+        for (k, handle) in gpu.buffers().into_iter().enumerate() {
+            let bytes = gpu.read_buffer(handle)?;
+            write(&format!("buffer-{handle}.raw"), &bytes)?;
+            let _ = write!(
+                json,
+                "{}\n {{\"handle\": {handle}, \"file\": \"buffer-{handle}\", \"bytes\": {}}}",
+                if k == 0 { "" } else { "," },
+                bytes.len()
+            );
+        }
+        json.push_str("]}\n");
+        write("targets.json", json.as_bytes())
     }
 
     /// The lines the program printed (`std::io::print`) since the last call.
@@ -1564,4 +1624,20 @@ impl CpuHost {
     ) -> Result<Vec<(Ticked, f64)>> {
         self.program.ticks_beside_frames(ticks, frames, fps, width, height)
     }
+}
+
+/// `s` as a JSON string literal.
+#[cfg(feature = "gpu")]
+fn json_string(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
