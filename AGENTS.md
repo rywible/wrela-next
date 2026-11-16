@@ -84,5 +84,3 @@ Because agents author the whole game, tooling and verification are product work,
    from here, never edited there; the same rules hold there. Touch nothing else on it.
 5. **Commit locally, never push.** A message is one sentence saying what is now true, with no
    trailing period.
-6. **Plans and working state live outside the repository**, in
-   `/Users/ryanwible/projects/wrela-notes/next/`.
