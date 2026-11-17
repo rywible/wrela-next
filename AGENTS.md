@@ -78,7 +78,10 @@ Because agents author the whole game, tooling and verification are product work,
    run. Don't raise `WRELA_GPU_BEHIND` to get a heavy kernel through.
    **Never take the display:** no full-screen or borderless-fullscreen window on either machine.
    A full-screen run with the GPU busy hung the Mac's GPU driver and WindowServer, and the
-   machine had to be restarted. Windows stay ordinary windows.
+   machine had to be restarted. Windows stay ordinary windows, and on the Mac a window's frames
+   always wait for the display (display sync on): a windowed run with it off was followed by
+   WindowServer hanging a second time. A window on the Mac opens only when the user has said yes to
+   that run; measure windows on the Linux machine's headless Weston first.
 3. **One Rust build at a time.** The machine has 16 GB. Every cargo command uses the one target
    directory, `toolchain/target`, and waits for any other cargo to finish.
 4. **Two machines, two targets.** Metal on this Mac (the M4) and Vulkan with SPIR-V on the Linux

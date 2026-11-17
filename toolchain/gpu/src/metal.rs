@@ -1730,12 +1730,12 @@ impl Surface {
             height: f64::from(c.height),
         });
         self.layer.setMaximumDrawableCount(c.frames.clamp(2, 3) as NSUInteger);
-        // Fifo waits for the display's refresh; the others don't (Metal has no mailbox: a frame
-        // presented before the refresh replaces the one waiting, which is Mailbox's).
-        self.layer.setDisplaySyncEnabled(matches!(
-            c.present,
-            PresentMode::Fifo | PresentMode::FifoRelaxed
-        ));
+        // Every mode waits for the display's refresh (Fifo): twice, a window run that turned
+        // display sync off (`immediate`, once in full screen, once in a window) was followed by
+        // WindowServer hanging and the Mac needing a restart (2026-11-16). Pacing, not tearing,
+        // is how a frame gets to the display sooner.
+        let _ = c.present;
+        self.layer.setDisplaySyncEnabled(true);
         Ok(())
     }
 

@@ -42,6 +42,8 @@ pub use backend::{
 
 /// How a surface's frames reach the display.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// On Metal every mode presents as `Fifo`: turning display sync off was followed twice by
+/// WindowServer hanging (see `metal.rs`).
 pub enum PresentMode {
     /// In order, one each refresh: no tearing, a frame may wait for a refresh (vsync).
     Fifo,
