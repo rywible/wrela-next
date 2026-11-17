@@ -1652,6 +1652,8 @@ impl Device {
 /// the screen's 8-bit values exactly.
 pub struct Surface {
     layer: objc2::rc::Retained<objc2_quartz_core::CAMetalLayer>,
+    /// The window's view: its window's screen says the display's headroom.
+    view: objc2::rc::Retained<objc2_app_kit::NSView>,
     /// The window, alive while its layer is drawn into.
     _window: Arc<dyn Window>,
 }
@@ -1688,7 +1690,10 @@ impl Device {
         layer.setFramebufferOnly(true);
         view.setWantsLayer(true);
         view.setLayer(Some(&layer));
-        Ok(Surface { layer, _window: window })
+        let view = objc2::Message::retain(view);
+        let mut surface = Surface { layer, view, _window: window };
+        surface.set_space(false, false);
+        Ok(surface)
     }
 
     /// Submits `buffers` for `frame`: on Metal, as any other submission.
@@ -1722,6 +1727,40 @@ impl Surface {
             PresentMode::Fifo | PresentMode::FifoRelaxed
         ));
         Ok(())
+    }
+
+    /// Shows its frames as `hdr` (linear values, 1.0 SDR white, brighter where the display has
+    /// headroom: EDR) or not (sRGB's or Display P3's encoded values), in Display P3 (`p3`) or
+    /// sRGB: what it does of that, as `(hdr, p3)` (Metal does all of it).
+    pub fn set_space(&mut self, hdr: bool, p3: bool) -> (bool, bool) {
+        use objc2_core_graphics::{
+            CGColorSpace, kCGColorSpaceDisplayP3, kCGColorSpaceExtendedLinearDisplayP3,
+            kCGColorSpaceExtendedLinearSRGB, kCGColorSpaceSRGB,
+        };
+        // SAFETY: the names are CoreGraphics' own constants.
+        let name = unsafe {
+            match (hdr, p3) {
+                (true, true) => kCGColorSpaceExtendedLinearDisplayP3,
+                (true, false) => kCGColorSpaceExtendedLinearSRGB,
+                (false, true) => kCGColorSpaceDisplayP3,
+                (false, false) => kCGColorSpaceSRGB,
+            }
+        };
+        let space = CGColorSpace::with_name(Some(name));
+        self.layer.setColorspace(space.as_deref());
+        self.layer.setWantsExtendedDynamicRangeContent(hdr);
+        (hdr, p3)
+    }
+
+    /// The display's headroom now: the most a value may be over SDR white and still be brighter
+    /// (its screen's `maximumExtendedDynamicRangeColorComponentValue`; 1 where it has none).
+    pub fn headroom(&self) -> f32 {
+        let Some(mtm) = objc2::MainThreadMarker::new() else { return 1.0 };
+        let _ = mtm;
+        self.view
+            .window()
+            .and_then(|w| w.screen())
+            .map_or(1.0, |s| s.maximumExtendedDynamicRangeColorComponentValue() as f32)
     }
 
     /// The next frame to draw into (waits for one the display is done with).

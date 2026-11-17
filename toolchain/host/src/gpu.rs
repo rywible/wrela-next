@@ -287,6 +287,9 @@ pub(crate) struct Pipeline {
     bound: crate::step::Bound,
     /// A compute pipeline's workgroup size (a render pipeline's is 1 by 1 by 1).
     workgroup: [u32; 3],
+    /// A render pipeline's screen targets: whether each has depth. An HDR screen draws them
+    /// with its own colour format.
+    screen_depths: Vec<bool>,
 }
 
 enum Kind {
@@ -376,6 +379,8 @@ struct OpenPass {
 struct Screen {
     texture: wrela_gpu::Texture,
     view: wrela_gpu::TextureView,
+    /// `rgba8unorm` (SDR), or `rgba16float` (HDR: linear, 1.0 SDR white).
+    format: TextureFormat,
     width: u32,
     height: u32,
 }
@@ -652,12 +657,18 @@ pub(crate) struct Gpu {
     program_limits: wrela_abi::Limits,
     /// The window the screen is shown in, when there is one ([`Gpu::attach_window`]).
     presenter: Option<Presenter>,
+    /// How the program last asked to show the screen (`ConfigureScreen`), done between frames.
+    screen_asked: Option<(bool, bool)>,
+    /// Whether an offscreen screen goes HDR when asked (a test's `hdr=1`): else it stays SDR.
+    offscreen_hdr: bool,
 }
 
 /// A window the screen is shown in: its surface, and the pass that draws the screen into each
 /// of its frames (a triangle over the frame, each pixel the screen's texel there).
 struct Presenter {
     surface: wrela_gpu::Surface,
+    /// The format its pipeline draws: the surface's.
+    format: TextureFormat,
     config: wrela_gpu::SurfaceConfig,
     pipeline: wrela_gpu::RenderPipeline,
     layout: wrela_gpu::BindGroupLayout,
@@ -1007,6 +1018,8 @@ impl Gpu {
             debug_flag: None,
             program_limits,
             presenter: None,
+            screen_asked: None,
+            offscreen_hdr: false,
         };
         gpu.take_pipelines(manifest, shaders)?;
         Ok(gpu)
@@ -1316,6 +1329,12 @@ impl Builder {
             debug_flag: p.debug_flag,
             sizes: p.sizes.clone(),
             bound: crate::step::Bound::of(p),
+            screen_depths: match &p.stage {
+                Stage::Render { targets, .. } => {
+                    targets.iter().filter(|t| t.screen).map(|t| t.depth).collect()
+                }
+                Stage::Compute { .. } => Vec::new(),
+            },
             workgroup: match &p.stage {
                 Stage::Compute { workgroup_size, .. } => *workgroup_size,
                 Stage::Render { .. } => [1, 1, 1],
@@ -1428,6 +1447,29 @@ impl Builder {
 }
 
 impl Gpu {
+    /// Makes the screen `width` x `height` in `format`, a new, cleared texture.
+    fn set_screen_format(&mut self, width: u32, height: u32, format: TextureFormat) -> Result<()> {
+        let texture = self.device.create_texture(&wrela_gpu::TextureDesc {
+            label: "screen",
+            width,
+            height,
+            depth_or_layers: 1,
+            levels: 1,
+            dimension: wrela_gpu::TextureDimension::D2,
+            format,
+            usage: wrela_gpu::TextureUsage { render: true, copy_src: true, ..Default::default() },
+        });
+        let view = texture.create_view(&wrela_gpu::ViewDesc {
+            dimension: wrela_gpu::ViewDimension::D2,
+            base_level: 0,
+            level_count: Some(1),
+            base_layer: 0,
+            layer_count: Some(1),
+        });
+        self.screen = Some(Screen { texture, view, width, height, format });
+        Ok(())
+    }
+
     /// Makes the screen `width` x `height` (a new, cleared texture if the size changed).
     pub(crate) fn set_screen(&mut self, width: u32, height: u32) -> Result<()> {
         let max = self.limits.max_texture_dimension_2d;
@@ -1439,6 +1481,7 @@ impl Gpu {
         if self.screen.as_ref().is_some_and(|s| (s.width, s.height) == (width, height)) {
             return Ok(());
         }
+        let format = self.screen.as_ref().map_or(SCREEN_FORMAT, |s| s.format);
         let texture = self.device.create_texture(&wrela_gpu::TextureDesc {
             label: "screen",
             width,
@@ -1446,7 +1489,7 @@ impl Gpu {
             depth_or_layers: 1,
             levels: 1,
             dimension: wrela_gpu::TextureDimension::D2,
-            format: SCREEN_FORMAT,
+            format,
             usage: wrela_gpu::TextureUsage { render: true, copy_src: true, ..Default::default() },
         });
         let view = texture.create_view(&wrela_gpu::ViewDesc {
@@ -1456,7 +1499,107 @@ impl Gpu {
             base_layer: 0,
             layer_count: Some(1),
         });
-        self.screen = Some(Screen { texture, view, width, height });
+        self.screen = Some(Screen { texture, view, width, height, format });
+        Ok(())
+    }
+
+    /// How the screen is shown now: `SCREEN_LIMIT`'s bits.
+    pub(crate) fn screen_bits(&self) -> u32 {
+        self.program_limits.screen
+    }
+
+    /// The screen as linear floats, RGBA rows top to bottom (waits for the GPU).
+    pub(crate) fn read_screen_floats(&mut self) -> Result<Vec<f32>> {
+        self.flush()?;
+        let screen =
+            self.screen.as_ref().ok_or_else(|| Error::Gpu("there's no screen yet".into()))?;
+        let (w, h, format) = (screen.width, screen.height, screen.format);
+        let texel = format.bytes_per_texel();
+        let padded =
+            align_to(u64::from(w * texel), u64::from(wrela_gpu::COPY_BYTES_PER_ROW_ALIGNMENT));
+        let staging = staging(&self.device, &mut self.image_readback, padded * u64::from(h));
+        let mut encoder = self.device.create_command_encoder("read the screen");
+        encoder.copy_texture_to_buffer(
+            wrela_gpu::TextureCopy {
+                texture: &screen.texture,
+                level: 0,
+                origin: [0, 0, 0],
+                depth_only: false,
+            },
+            wrela_gpu::BufferCopy {
+                buffer: &staging,
+                offset: 0,
+                bytes_per_row: padded as u32,
+                rows_per_image: h,
+            },
+            [w, h, 1],
+        );
+        self.device.submit(vec![encoder.finish()]);
+        map_read_with(&self.device, &staging, padded * u64::from(h), |bytes| {
+            let mut out = Vec::with_capacity((w * h * 4) as usize);
+            for row in bytes.chunks_exact(padded as usize) {
+                for t in row[..(w * texel) as usize].chunks_exact(texel as usize) {
+                    if format == TextureFormat::Rgba16Float {
+                        out.extend(
+                            (0..4)
+                                .map(|k| f16_to_f32(u16::from_le_bytes([t[2 * k], t[2 * k + 1]]))),
+                        );
+                    } else {
+                        out.extend(t.iter().map(|&b| f32::from(b) / 255.0));
+                    }
+                }
+            }
+            out
+        })
+    }
+
+    /// Lets an offscreen screen go HDR when the program asks (a test's `hdr=1`): else, with no
+    /// window, it stays SDR in sRGB and the program's goldens with it.
+    pub(crate) fn allow_offscreen_hdr(&mut self, on: bool) {
+        self.offscreen_hdr = on;
+    }
+
+    /// Between frames: the screen shown as the program last asked (`ConfigureScreen`), as far as
+    /// the window (or, offscreen, a test) allows. HDR, its screen is half floats, every render
+    /// pipeline that draws it built for them first; then `screen_is` says what's done.
+    fn show_screen(&mut self) -> Result<()> {
+        let Some((hdr, p3)) = self.screen_asked.take() else { return Ok(()) };
+        let device = self.device.clone();
+        let (hdr, p3) = match &mut self.presenter {
+            Some(p) => {
+                let done = p.surface.set_space(hdr, p3);
+                // The present pass draws the surface's frames: in their new format, if it moved.
+                if p.surface.format() != p.format {
+                    let (pipeline, layout) = present_pipeline(&device, p.surface.format())?;
+                    (p.pipeline, p.layout, p.format) = (pipeline, layout, p.surface.format());
+                }
+                done
+            }
+            None if self.offscreen_hdr => (hdr, p3),
+            None => (false, false),
+        };
+        let format = if hdr { TextureFormat::Rgba16Float } else { SCREEN_FORMAT };
+        let current = self.screen.as_ref().map_or(SCREEN_FORMAT, |s| s.format);
+        if format != current {
+            // Every pipeline that draws the screen, built for its new format first.
+            for p in &mut self.pipelines {
+                let depths = p.screen_depths.clone();
+                for depth in depths {
+                    let targets = (vec![format], depth.then_some(TextureFormat::Depth32Float));
+                    render_variant(&device, &p.name, &p.layout, &mut p.kind, targets)
+                        .map_err(|e| Error::Gpu(format!("`{}` for the HDR screen: {e}", p.name)))?;
+                }
+            }
+            if let Some(screen) = &self.screen {
+                let (w, h) = (screen.width, screen.height);
+                self.screen = None;
+                self.set_screen_format(w, h, format)?;
+            }
+        }
+        self.program_limits.screen = u32::from(hdr) | u32::from(p3) << 1;
+        if !hdr {
+            self.program_limits.headroom = 1000;
+        }
         Ok(())
     }
 
@@ -1474,7 +1617,8 @@ impl Gpu {
         let config = wrela_gpu::SurfaceConfig { width, height, present, frames: 3 };
         surface.configure(&self.device, &config).map_err(gpu_err)?;
         let (pipeline, layout) = present_pipeline(&self.device, surface.format())?;
-        self.presenter = Some(Presenter { surface, config, pipeline, layout });
+        let format = surface.format();
+        self.presenter = Some(Presenter { surface, format, config, pipeline, layout });
         Ok(())
     }
 
@@ -1505,6 +1649,9 @@ impl Gpu {
                 return p.surface.configure(&device, &p.config).map_err(gpu_err);
             }
         };
+        if self.program_limits.screen & 1 != 0 {
+            self.program_limits.headroom = (p.surface.headroom().max(1.0) * 1000.0) as u32;
+        }
         let cb = draw_presented(&device, &p.pipeline, &p.layout, &screen.view, &frame.view);
         device.submit_frame(vec![cb], &frame);
         p.surface.present(frame).map_err(gpu_err)
@@ -2307,7 +2454,7 @@ impl Gpu {
             .iter()
             .map(|c| {
                 if c.texture == stream::SCREEN {
-                    SCREEN_FORMAT
+                    self.screen.as_ref().map_or(SCREEN_FORMAT, |s| s.format)
                 } else {
                     self.texture(c.texture).format
                 }
@@ -2409,7 +2556,13 @@ impl Gpu {
             let Kind::Render { variants, .. } = &self.pipelines[d.pipeline as usize].kind else {
                 unreachable!("the checker checked the kind");
             };
-            rp.set_pipeline(&variants[&formats]);
+            let Some(variant) = variants.get(&formats) else {
+                return Err(Error::Gpu(format!(
+                    "`{}` has no pipeline for its targets {formats:?}",
+                    self.pipelines[d.pipeline as usize].name
+                )));
+            };
+            rp.set_pipeline(variant);
             rp.set_bind_group(bind_group, offset.as_slice());
             counters.pipelines += 1;
             counters.bind_groups += 1;
@@ -2548,7 +2701,9 @@ impl Gpu {
                 screen.width, screen.height
             )));
         }
-        let row = u64::from(width) * 4;
+        let format = screen.format;
+        let texel = u64::from(format.bytes_per_texel());
+        let row = u64::from(width) * texel;
         let padded = align_to(row, u64::from(wrela_gpu::COPY_BYTES_PER_ROW_ALIGNMENT));
         let size = padded * u64::from(height);
         let staging = staging(&self.device, &mut self.image_readback, size);
@@ -2570,12 +2725,20 @@ impl Gpu {
         );
         self.device.submit(vec![encoder.finish()]);
         let frame = map_read_with(&self.device, &staging, size, |bytes| {
-            if padded == row {
+            if padded == row && format == SCREEN_FORMAT {
                 return bytes.to_vec();
             }
-            let mut frame = Vec::with_capacity((row * u64::from(height)) as usize);
+            // An HDR screen's half floats as RGBA8, each channel clamped to 0 to 1.
+            let mut frame = Vec::with_capacity((u64::from(width) * 4 * u64::from(height)) as usize);
             for padded_row in bytes.chunks_exact(padded as usize) {
-                frame.extend_from_slice(&padded_row[..row as usize]);
+                let line = &padded_row[..row as usize];
+                if format == SCREEN_FORMAT {
+                    frame.extend_from_slice(line);
+                } else {
+                    for t in line.chunks_exact(texel as usize) {
+                        frame.extend_from_slice(&as_rgba8(format, t));
+                    }
+                }
             }
             frame
         })?;
@@ -2761,9 +2924,10 @@ impl Executor for Gpu {
             Command::SetScissor { x, y, width, height } => {
                 self.pass_item(PassItem::Scissor([*x, *y, *width, *height]))
             }
-            // The native host draws offscreen, to no surface it could show another way: the
-            // screen stays SDR in sRGB, which `SCREEN_LIMIT` says (`Limits::get`).
-            Command::ConfigureScreen { .. } => {}
+            // Done between frames ([`Gpu::show_screen`]).
+            Command::ConfigureScreen { hdr, gamut } => {
+                self.screen_asked = Some((*hdr, *gamut == 1));
+            }
             Command::SetViewport { rect: [x, y, w, h], min_depth, max_depth } => {
                 self.pass_item(PassItem::Viewport([*x, *y, *w, *h, *min_depth, *max_depth]))
             }
@@ -2920,7 +3084,8 @@ impl Executor for Gpu {
         self.check_errors()?;
         self.behind.check(&self.device)?;
         self.indirect.read(&self.device)?;
-        self.check_debug_flag()
+        self.check_debug_flag()?;
+        self.show_screen()
     }
 
     /// A program's ask for `label`'s time (`std::gpu::timed`): from it on, until it's answered,

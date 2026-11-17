@@ -375,6 +375,8 @@ impl TargetLimits {
             subgroup_min_size: 0,
             subgroup_max_size: 0,
             step_work: step_work(STEP_MS as u64, METAL_FS),
+            screen: 0,
+            headroom: 1000,
         },
         storage_buffers_per_stage: 29,
         sampled_textures_per_stage: 96,
@@ -404,6 +406,8 @@ impl TargetLimits {
             subgroup_min_size: 0,
             subgroup_max_size: 0,
             step_work: step_work(STEP_MS as u64, VULKAN_FS),
+            screen: 0,
+            headroom: 1000,
         },
         storage_buffers_per_stage: 2_097_150,
         sampled_textures_per_stage: 2_097_149,
@@ -462,6 +466,12 @@ pub struct Limits {
     /// GPU's [`TargetLimits::step_width`]). The host refuses a dispatch past it before it runs;
     /// a program that dispatches heavy work cuts it into parts this size.
     pub step_work: u32,
+    /// How the host shows the screen ([`SCREEN_LIMIT`]): bit 0 HDR, bit 1 Display P3. Not the
+    /// device's: what the host did of the last `ConfigureScreen` it could.
+    pub screen: u32,
+    /// The display's headroom now, in thousandths ([`HEADROOM_LIMIT`]): how many times SDR
+    /// white the brightest value the screen shows is (1000 on an SDR display, and offscreen).
+    pub headroom: u32,
 }
 
 impl Limits {
@@ -507,16 +517,16 @@ impl Limits {
     }
 
     /// How many there are: `wrela.limit` gives 0 for an index past the last.
-    pub const COUNT: u32 = 13;
+    pub const COUNT: u32 = 16;
 
     /// Whether the device has feature `name` (WebGPU's).
     pub fn has(&self, name: &str) -> bool {
         feature_bit(name).is_some_and(|b| self.features & b != 0)
     }
 
-    /// The limit at `index`, as `wrela.limit` gives it. [`SCREEN_LIMIT`] is no limit of the
-    /// device's but how the host shows the screen, which a host with nothing to configure (the
-    /// native host draws offscreen) gives as 0: SDR, sRGB.
+    /// The limit at `index`, as `wrela.limit` gives it. [`SCREEN_LIMIT`] and [`HEADROOM_LIMIT`]
+    /// are no limits of the device's but how the host shows the screen and the display's
+    /// headroom: offscreen, 0 (SDR, sRGB) and 1000.
     pub fn get(&self, index: u32) -> u32 {
         match index {
             0 => self.max_texture_size,
@@ -531,6 +541,8 @@ impl Limits {
             11 => self.subgroup_min_size,
             12 => self.subgroup_max_size,
             13 => self.step_work,
+            SCREEN_LIMIT => self.screen,
+            HEADROOM_LIMIT => self.headroom,
             _ => 0,
         }
     }
@@ -538,8 +550,12 @@ impl Limits {
 
 /// `wrela.limit`'s index of how the host shows the screen (`std::gpu::screen_is`): bit 0, HDR
 /// (an `rgba16float` canvas, tone mapped `extended`); bit 1, Display P3. It changes when the host
-/// has done what a `ConfigureScreen` asked.
-pub const SCREEN_LIMIT: u32 = 13;
+/// has done what a `ConfigureScreen` asked. (It was 13, which `step_work` took: `screen_is`
+/// read the step's work as the screen until toolchain 0.33.)
+pub const SCREEN_LIMIT: u32 = 14;
+
+/// `wrela.limit`'s index of the display's headroom (`std::gpu::headroom`), in thousandths.
+pub const HEADROOM_LIMIT: u32 = 15;
 
 /// The optional WebGPU features the hosts request when the adapter has them, and report to a
 /// program (`std::gpu::features`), in the order `wrela.features` sets their bits: WebGPU's names.

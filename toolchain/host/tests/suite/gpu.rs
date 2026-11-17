@@ -1146,3 +1146,46 @@ fn safe_math_keeps_nans_and_the_order_of_sums() {
         }
     }
 }
+
+/// `std::gpu::screen(hdr: true, gamut: DisplayP3)` (`ConfigureScreen`) offscreen: kept SDR in
+/// sRGB unless the host is let (`Options::screen_hdr`, a test's `hdr=1`), when the screen goes
+/// half floats between frames and keeps a colour past SDR white; `screen_is` says which.
+#[test]
+#[ignore = "needs a GPU"]
+fn an_hdr_screen_keeps_values_past_white_where_the_host_lets_it() {
+    let pipelines = r#"[{ "name": "bright", "shader": "bright.ir", "kind": "render",
+        "vertex_entry": "vs", "fragment_entry": "fs",
+        "targets": [{ "colors": ["rgba8unorm"], "depth": false, "screen": true }], "outputs": ["float"],
+        "uniform": { "binding": 0, "size": 32, "space": "uniform" }, "bindings": [] }]"#;
+    let colour = [0.25, 0.5, 2.0, 1.0];
+    let frame = |configure: bool| {
+        let mut e = Encoder::new();
+        if configure {
+            e.configure_screen(true, 1);
+        }
+        e.begin_screen_pass([0.0, 0.0, 0.0, 1.0]);
+        e.draw(0, 6, 1, &[], &words(&[0, 0, 1, 1, 0, 0, 0, 0]));
+        e.present();
+        vec![e.finish()]
+    };
+    let shader = shaders::cell(Some(colour));
+    for allowed in [false, true] {
+        let dir = program_build(
+            &format!("hdr-{allowed}"),
+            pipelines,
+            &[("bright.ir", &shader)],
+            &[frame(true), frame(false)],
+        );
+        let options = Options { screen_hdr: allowed, ..Options::default() };
+        let mut host = Host::load_with(&dir, &options).expect("loads");
+        host.run_frames(&[0.0, 1.0 / 60.0], 8, 8).expect("runs");
+        let texel = &host.read_screen_floats().expect("reads")[..4];
+        if allowed {
+            assert_eq!(host.screen_is(), 3, "HDR in Display P3");
+            assert_eq!(texel, colour, "half floats keep 2.0");
+        } else {
+            assert_eq!(host.screen_is(), 0, "SDR in sRGB");
+            assert_eq!(texel, [64.0 / 255.0, 128.0 / 255.0, 1.0, 1.0], "8 bits clamp it");
+        }
+    }
+}

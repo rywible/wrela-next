@@ -149,6 +149,10 @@ pub struct Options {
     /// Load a relaxed-SIMD build's relaxed module (`wrela build --relaxed-simd`), as a browser
     /// that runs relaxed SIMD does; wasmtime runs relaxed SIMD (`wrela-host --relaxed`).
     pub relaxed_simd: bool,
+    /// An offscreen screen goes HDR when the program asks (`std::gpu::screen`), as test mode's
+    /// `hdr=1` does in a browser: else, with no window, it stays SDR in sRGB, and so the
+    /// program's goldens.
+    pub screen_hdr: bool,
 }
 
 impl Options {
@@ -652,12 +656,13 @@ impl Host {
                 }
             }
         } else {
-            let executor = Gpu::new(
+            let mut executor = Gpu::new(
                 &build.manifest,
                 &build.shaders,
                 options.timing,
                 options.report_pipelines,
             )?;
+            executor.allow_offscreen_hdr(options.screen_hdr);
             let mut program = Program::instantiate_with(
                 &build.compiled,
                 &build.manifest,
@@ -745,8 +750,9 @@ impl Host {
     /// Starts `build`, in `dir`, on a new device; `hands_over` lets it hand over to other builds,
     /// and its fetches read through its directory's handle if it's driven.
     fn start(build: Build, dir: &Path, options: &Options, hands_over: bool) -> Result<Host> {
-        let gpu =
+        let mut gpu =
             Gpu::new(&build.manifest, &build.shaders, options.timing, options.report_pipelines)?;
+        gpu.allow_offscreen_hdr(options.screen_hdr);
         let mut program = Program::instantiate_with(
             &build.compiled,
             &build.manifest,
@@ -1074,6 +1080,19 @@ impl Host {
     /// built, by the difference. Restarts that change GPU capabilities open a new device.
     pub fn pipelines_built(&mut self) -> usize {
         self.p().executor().pipelines_built()
+    }
+
+    /// The screen after the last frame as linear floats, RGBA, rows top to bottom: an SDR
+    /// screen's values over 255, an HDR screen's half floats as they are (past 1 where it's
+    /// brighter than SDR white).
+    pub fn read_screen_floats(&mut self) -> Result<Vec<f32>> {
+        self.p().executor().read_screen_floats()
+    }
+
+    /// How the host shows the screen now (`std::gpu::screen_is`'s bits): bit 0 HDR, bit 1
+    /// Display P3.
+    pub fn screen_is(&mut self) -> u32 {
+        self.p().executor().screen_bits()
     }
 
     /// The screen after the last frame: RGBA8, rows top to bottom.

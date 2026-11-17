@@ -26,7 +26,7 @@ use ink::{
     MOST_STROKES, Stroke, edges, lines_drawn, mark_words, stroke_corner, stroke_cover,
     strokes_drawn, strokes_grouped, unmarked, weighed,
 }
-use last::{FINISH, cover, finish_alike, finish_table, last, paper}
+use last::{FINISH, cover, finish_alike, finish_table, last, output, paper}
 use form::shade::NO_SKY_LIGHT
 use held::{HeldStore, held_store}
 use light::{Lighting, Shine, lighting, sunlit}
@@ -38,8 +38,10 @@ use std::gpu::{
     AppendBuffer, Filter, Sampler, sampler, Blend, DepthPass3, DepthTexture, DrawArgs, GpuBuffer, R16Float,
     R32Uint, R8, RenderPass, Rg8, Rgba16Float, Texture, append_buffer, begin_pass,
     begin_pass3_with_depth, begin_screen_pass, buffer, depth_texture, dispatch, draw, label, read,
-    Texture3d, copy_texture, texture, texture3d, writable_texture, write, Address,
+    Texture3d, copy_texture, texture, texture3d, writable_texture, write, Address, headroom,
+    screen, screen_is,
 }
+use std::collections::replace
 use std::io::{Pending, print}
 use text::{MOST_GLYPHS, Placed, glyph_corner, glyph_cover, set}
 
@@ -196,6 +198,11 @@ pub struct Frame {
     added_for: vec3,
     air_maps: u32,
     round: Sampler,
+    /// On an HDR screen, the last pass's display values (with the soft things and the text),
+    /// which the output pass makes the screen's linear light (`last::output`).
+    shown: Option<Texture<Rgba16Float>>,
+    /// Whether the frame has asked for an HDR screen (once: the host shows one where it can).
+    asked_hdr: bool,
 }
 
 /// What a lister draws its share of the picture with (`Frame::draw`): the picture's one pass,
@@ -262,6 +269,8 @@ pub fn picture(load: u32) -> Frame {
         added_for: vec3(-1.0),
         air_maps: 0,
         round: sampler(address: Address::Repeat),
+        shown: None,
+        asked_hdr: false,
     }
 }
 
@@ -283,6 +292,11 @@ impl Frame {
             self.papered = false
         }
         self.soft.begin(w, h)
+        // The screen HDR wherever the host can show one (an SDR screen's frames are as before).
+        if !self.asked_hdr {
+            screen(hdr: true)
+            self.asked_hdr = true
+        }
         self.eye = eye
         // (A scene whose sun has no light pays nothing for the clouds' map of it.)
         self.sky.sunlit = dot(light.style.sun, light.style.sun) > 0.0
@@ -596,6 +610,27 @@ impl Frame {
         self.loaded()
         self.inked()
         self.finished()
+        // An HDR screen: the same values into a half-float target, then the output pass.
+        let hdr = screen_is().hdr
+        if hdr {
+            let (w, h) = (self.colour.width(), self.colour.height())
+            // (Out of the frame while the sky's reads borrow it; made at the screen's size.)
+            var shown = match replace(mut self.shown, None) {
+                Some(t) if t.width() == w && t.height() == h => take t,
+                _ => texture(width: w, height: h),
+            }
+            let sky_seen = self.sky_seen()
+            label("last")
+            let p = begin_pass(mut shown, clear: vec4(0.0, 0.0, 0.0, 1.0))
+            self.laid_last(p, sky_seen)
+            p.end()
+            label("output")
+            let screen = begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
+            draw(screen, cover, output.bind(shown: shown, headroom: headroom()), vertices: 3)
+            screen.present()
+            self.shown = Some(take shown)
+            return
+        }
         let sky_seen = self.sky_seen()
         label("last")
         let screen = begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
@@ -647,6 +682,57 @@ impl Frame {
             )
         }
         screen.present()
+    }
+
+    /// The last pass, the soft things and the text, drawn in `pass` as the screen takes them.
+    fn laid_last<R: RenderPass>(self, pass: R, sky_seen: SkySeen) {
+        draw(
+            pass,
+            cover,
+            last.bind(
+                self.eye,
+                air: self.air,
+                sun_air: self.air_read(),
+                air_map: self.air_map,
+                air_s: self.smooth,
+                sky: sky_seen,
+                style: self.ink,
+                moment: self.moment,
+                colour: self.colour,
+                edge: self.edge,
+                identity: self.identity,
+                depth: self.depth,
+                strokes: self.strokes,
+                paper: self.paper,
+                smoothed: self.marked.items(),
+                near: self.near,
+                lines: if self.lined { 1 } else { 0 },
+                finish: self.finish,
+                finish_s: self.smooth,
+                cover: false,
+                display: true,
+            ),
+            vertices: 3,
+        )
+        self.soft.lay(
+            pass,
+            self.eye,
+            self.ink,
+            self.moment,
+            self.depth,
+            self.paper,
+            display: true,
+        )
+        let n = self.glyphs.len()
+        if n > 0 {
+            draw(
+                pass,
+                glyph_corner.bind(glyphs: self.placed.items(), size: self.eye.size),
+                glyph_cover.bind(glyphs: self.placed.items(), style: self.ink, display: true),
+                vertices: 6,
+                instances: n,
+            )
+        }
     }
 
     /// The frame ended into `into` in place of the screen: linear light, with no paper, as the

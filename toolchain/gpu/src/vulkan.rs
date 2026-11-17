@@ -163,6 +163,7 @@ impl Device {
                 ash::khr::wayland_surface::NAME,
                 ash::khr::xlib_surface::NAME,
                 ash::khr::xcb_surface::NAME,
+                ash::ext::swapchain_colorspace::NAME,
             ];
             let windowed = has(ash::khr::surface::NAME);
             if windowed {
@@ -2657,6 +2658,11 @@ pub struct Surface {
     next: usize,
     /// One a submission signals for each image, which its presentation waits on.
     rendered: Vec<vk::Semaphore>,
+    /// How its frames are shown, asked (`set_space`) and done: `(hdr, p3)`.
+    asked: (bool, bool),
+    done: (bool, bool),
+    /// The last configuration, which a change of space configures again.
+    config: Option<SurfaceConfig>,
     /// The window, alive while its surface is.
     _window: Arc<dyn Window>,
 }
@@ -2716,6 +2722,9 @@ impl Device {
             acquired: Vec::new(),
             next: 0,
             rendered: Vec::new(),
+            asked: (false, false),
+            done: (false, false),
+            config: None,
             _window: window,
         })
     }
@@ -2732,12 +2741,32 @@ impl Device {
 }
 
 impl Surface {
-    /// Its frames' format.
+    /// Its frames' format: half floats when it shows them HDR.
     pub fn format(&self) -> TextureFormat {
-        TextureFormat::Rgba8
+        if self.done.0 { TextureFormat::Rgba16Float } else { TextureFormat::Rgba8 }
+    }
+
+    /// Shows its frames as `hdr` (linear half floats in extended sRGB) or not, in Display P3
+    /// (`p3`) or sRGB, where the surface offers the colour space: what it does, `(hdr, p3)`.
+    pub fn set_space(&mut self, hdr: bool, p3: bool) -> (bool, bool) {
+        self.asked = (hdr, p3);
+        if let Some(c) = self.config {
+            let device = self.device.clone();
+            if self.configure(&device, &c).is_err() {
+                self.asked = (false, false);
+                let _ = self.configure(&device, &c);
+            }
+        }
+        self.done
+    }
+
+    /// The display's headroom: Vulkan has no query of it, so 1.
+    pub fn headroom(&self) -> f32 {
+        1.0
     }
 
     pub fn configure(&mut self, device: &Device, c: &SurfaceConfig) -> Result<()> {
+        self.config = Some(*c);
         let d = &device.0;
         // SAFETY: queries of the surface, then a swapchain of it (the old one retired once the
         // device is idle), and semaphores.
@@ -2750,11 +2779,32 @@ impl Surface {
                 .surface_fns
                 .get_physical_device_surface_formats(d.physical, self.surface)
                 .map_err(|e| Error(format!("the surface: {e}")))?;
-            let format = formats
-                .iter()
-                .find(|f| f.format == vk::Format::R8G8B8A8_UNORM)
-                .copied()
-                .ok_or("the surface has no R8G8B8A8_UNORM format")?;
+            // The space asked for where the surface has it, else SDR in sRGB.
+            let pair = |f: vk::Format, s: vk::ColorSpaceKHR| {
+                formats.iter().find(|x| x.format == f && x.color_space == s).copied()
+            };
+            let hdr = self.asked.0.then(|| {
+                pair(vk::Format::R16G16B16A16_SFLOAT, vk::ColorSpaceKHR::EXTENDED_SRGB_LINEAR_EXT)
+            });
+            let p3 = (self.asked.1 && !self.asked.0).then(|| {
+                pair(vk::Format::R8G8B8A8_UNORM, vk::ColorSpaceKHR::DISPLAY_P3_NONLINEAR_EXT)
+            });
+            let (format, done) = match (hdr.flatten(), p3.flatten()) {
+                (Some(f), _) => (f, (true, false)),
+                (None, Some(f)) => (f, (false, true)),
+                _ => (
+                    formats
+                        .iter()
+                        .find(|f| {
+                            f.format == vk::Format::R8G8B8A8_UNORM
+                                && f.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR
+                        })
+                        .copied()
+                        .ok_or("the surface has no R8G8B8A8_UNORM format in sRGB")?,
+                    (false, false),
+                ),
+            };
+            self.done = done;
             let modes = self
                 .surface_fns
                 .get_physical_device_surface_present_modes(d.physical, self.surface)
@@ -2888,7 +2938,7 @@ impl Surface {
         let view = self.images[index as usize].clone();
         let texture = Texture {
             raw: view.image.clone(),
-            format: TextureFormat::Rgba8,
+            format: self.format(),
             width: view.width,
             height: view.height,
             depth_or_layers: 1,

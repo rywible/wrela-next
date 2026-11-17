@@ -18,6 +18,10 @@
 //! - `wrela-host --compare-ticks <a.ticks> <b.ticks>`: two tick logs, two builds' runs of one
 //!   input: "equal", or the first tick whose state hash differs (G-sim). Unlike `--replay` it
 //!   doesn't compare the logs' WASM hashes.
+//! - `wrela-host <build-dir> --window [--present fifo|fifo-relaxed|mailbox|immediate]
+//!   [--frames N] [--size WxH]`: the frames shown in a window (`window`), until it's closed.
+//!   `--hdr` with a headless run lets the screen go HDR when the program asks
+//!   (`std::gpu::screen`), as a test's `hdr=1` does; a window goes HDR where its display can.
 //! - `wrela-host --adapter`: the GPU as `wrela_gpu` opens it: its name, driver, features and
 //!   limits.
 //! - `wrela-host --version`: its release and source revision.
@@ -110,6 +114,8 @@ struct Args {
     relaxed: bool,
     /// `--window`: shown in a window, presenting as this says.
     window: Option<String>,
+    /// `--hdr`: the screen goes HDR offscreen when the program asks (as a test's `hdr=1`).
+    hdr: bool,
 }
 
 fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -138,6 +144,7 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
         workers: 0,
         relaxed: false,
         window: None,
+        hdr: false,
     };
     while let Some(arg) = argv.next() {
         let mut value = |flag: &str| argv.next().ok_or_else(|| format!("{flag} needs a value"));
@@ -146,6 +153,7 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
         };
         match arg.as_str() {
             "--frames" => args.frames = whole("--frames", value("--frames")?)?,
+            "--hdr" => args.hdr = true,
             "--window" => args.window = Some(args.window.take().unwrap_or_else(|| "fifo".into())),
             "--present" => args.window = Some(value("--present")?),
             "--ticks" => args.ticks = Some(whole("--ticks", value("--ticks")?)?),
@@ -352,6 +360,7 @@ fn frames(args: &Args) -> Result<(), Failure> {
         workers: args.workers,
         defer_init: true,
         relaxed_simd: args.relaxed,
+        screen_hdr: args.hdr,
         ..Options::default()
     };
     let loading = std::time::Instant::now();

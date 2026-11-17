@@ -527,6 +527,69 @@ pub fn last(
     vec4(undisplayed(s, out), 1.0)
 }
 
+// ---- the output transform: an HDR screen --------------------------------------------------------
+//
+// On an SDR screen the last pass's values go to the screen as they are: display values, sRGB's
+// curve, which the screen clips at 1. On an HDR screen (`std::gpu::screen_is().hdr`: half floats,
+// linear light, 1.0 SDR white) the frame draws the same values into a half-float target first,
+// and `output` makes them the screen's: sRGB's curve undone, so up to white each is the light an
+// SDR display shows for it; past white (the tone curve's highlights, which an SDR screen clips)
+// rolled off toward the display's headroom (`std::gpu::headroom()`), never past it.
+
+/// Linear light `y` past white rolled off toward `top` (the display's headroom, 1 for none): as
+/// it is up to `min(top, 1)`, then `knee + room (1 - e^(-(y - knee) / room))`, which leaves the
+/// knee with slope 1 and nears `top` without reaching it.
+pub fn rolled(y: f32, top: f32) -> f32 {
+    let knee = min(top, 1.0)
+    if y <= knee {
+        return y
+    }
+    let room = top - knee
+    if room <= 0.0 {
+        return knee
+    }
+    knee + room * (1.0 - exp(-(y - knee) / room))
+}
+
+/// A display value `v` (sRGB's curve) as an HDR screen's linear light, rolled off toward `top`.
+pub fn hdr_out(v: vec3, top: f32) -> vec3 {
+    vec3(rolled(unsrgb(v.x), top), rolled(unsrgb(v.y), top), rolled(unsrgb(v.z), top))
+}
+
+/// The output pass's pixel: the display values `shown` drawn (the last pass, the soft things,
+/// the text), as an HDR screen takes them (`hdr_out`).
+@fragment
+pub fn output(pixel: FragCoord, shown: Texture<Rgba16Float>, headroom: f32) -> vec4 {
+    let v = shown.load(u32(pixel.position.x), u32(pixel.position.y)).xyz
+    vec4(hdr_out(v, headroom), 1.0)
+}
+
+/// Up to white an HDR screen shows the light an SDR one shows (sRGB's curve undone, to f32's
+/// rounding); a display with no headroom clips at white as the SDR screen does; past white the
+/// roll-off rises, never past its top, and leaves white with slope 1.
+@test
+fn the_output_transform_matches_sdr_to_white_and_rolls_off_to_the_headroom() {
+    for k in 0..=64 {
+        let v = f32(k) / 64.0
+        let want = if v <= 0.04045 { v / 12.92 } else { pow((v + 0.055) / 1.055, 2.4) }
+        let got = hdr_out(vec3(v), 4.0).x
+        assert(abs(got - want) <= 1.0e-6 * max(want, 1.0), f"{v}: {got} against sRGB's {want}")
+        assert(hdr_out(vec3(v), 1.0).x == got, f"{v}: white is white with no headroom")
+    }
+    assert(hdr_out(vec3(1.7), 1.0).x == 1.0, "no headroom: clipped at white")
+    // Rising where f32 tells it from its top (to 10 for a top of 3); never past the top.
+    var last = 1.0
+    for k in 1..=36 {
+        let y = 1.0 + f32(k) * 0.25
+        let r = rolled(y, 3.0)
+        assert(r > last && r < 3.0, f"{y}: {r} after {last}")
+        last = r
+    }
+    assert(rolled(1.0e6, 3.0) <= 3.0 && rolled(1.0e6, 3.0) >= last, "far past: at most the top")
+    let slope = (rolled(1.0 + 1.0e-3, 3.0) - 1.0) / 1.0e-3
+    assert(abs(slope - 1.0) < 1.0e-3, f"the slope at white: {slope}")
+}
+
 /// Today's ink shows light as it did (the soft shoulder, no grade); the filmic curve with no
 /// grade is undone by `undisplayed` (under white); and the filmic curve deepens the darks.
 @test
