@@ -36,9 +36,55 @@ pub use vulkan as backend;
 
 pub use backend::{
     BindGroup, BindGroupLayout, Buffer, CommandBuffer, CommandEncoder, ComputePass,
-    ComputePipeline, Device, QuerySet, RenderPass, RenderPipeline, Sampler, ShaderModule, Texture,
-    TextureView,
+    ComputePipeline, Device, QuerySet, RenderPass, RenderPipeline, Sampler, ShaderModule, Surface,
+    SurfaceTexture, Texture, TextureView,
 };
+
+/// How a surface's frames reach the display.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PresentMode {
+    /// In order, one each refresh: no tearing, a frame may wait for a refresh (vsync).
+    Fifo,
+    /// As `Fifo`, but a late frame goes at once rather than waiting a refresh (it may tear).
+    FifoRelaxed,
+    /// The newest frame done at each refresh; the rest are dropped: no tearing, no waiting.
+    Mailbox,
+    /// At once (it may tear): the least latency.
+    Immediate,
+}
+
+impl PresentMode {
+    pub fn parse(s: &str) -> Option<PresentMode> {
+        Some(match s {
+            "fifo" => PresentMode::Fifo,
+            "fifo-relaxed" => PresentMode::FifoRelaxed,
+            "mailbox" => PresentMode::Mailbox,
+            "immediate" => PresentMode::Immediate,
+            _ => return None,
+        })
+    }
+}
+
+/// A surface's swapchain: its size, how it presents, and how many frames it holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SurfaceConfig {
+    pub width: u32,
+    pub height: u32,
+    pub present: PresentMode,
+    /// Frames in the chain: 2 or 3.
+    pub frames: u32,
+}
+
+/// A window a surface draws into: its handles, alive as long as the surface.
+pub trait Window:
+    raw_window_handle::HasWindowHandle + raw_window_handle::HasDisplayHandle + Send + Sync
+{
+}
+
+impl<T: raw_window_handle::HasWindowHandle + raw_window_handle::HasDisplayHandle + Send + Sync>
+    Window for T
+{
+}
 
 /// What went wrong: a message for the host's error.
 #[derive(Clone, Debug, PartialEq, Eq)]

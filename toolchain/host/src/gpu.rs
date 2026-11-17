@@ -650,6 +650,161 @@ pub(crate) struct Gpu {
     /// The limits the program sees (`wrela.limit`), with its optional features
     /// ([`feature_bits`]) and, with subgroups, their sizes.
     program_limits: wrela_abi::Limits,
+    /// The window the screen is shown in, when there is one ([`Gpu::attach_window`]).
+    presenter: Option<Presenter>,
+}
+
+/// A window the screen is shown in: its surface, and the pass that draws the screen into each
+/// of its frames (a triangle over the frame, each pixel the screen's texel there).
+struct Presenter {
+    surface: wrela_gpu::Surface,
+    config: wrela_gpu::SurfaceConfig,
+    pipeline: wrela_gpu::RenderPipeline,
+    layout: wrela_gpu::BindGroupLayout,
+}
+
+/// The present pass's pipeline for frames of `format`, and its layout (the screen at binding 0).
+fn present_pipeline(
+    device: &wrela_gpu::Device,
+    format: TextureFormat,
+) -> Result<(wrela_gpu::RenderPipeline, wrela_gpu::BindGroupLayout)> {
+    use wrela_abi::manifest::{BindingKind, BindingStage, Output, RenderTarget, ResourceBinding};
+    let gpu_err = |e: wrela_gpu::Error| Error::Gpu(e.0);
+    let mut entry = wrela_abi::manifest::Pipeline {
+        name: "present".into(),
+        shader: "present".into(),
+        stage: Stage::Render {
+            vertex_entry: "cover".into(),
+            fragment_entry: "show".into(),
+            blends: Vec::new(),
+            cull: Cull::None,
+            depth_bias: DepthBias::default(),
+            depth: DepthState::default(),
+            writes_depth: false,
+            outputs: vec![Output::Float],
+            targets: vec![RenderTarget::of(&[format], false)],
+        },
+        uniform: None,
+        bindings: vec![ResourceBinding {
+            binding: 0,
+            kind: BindingKind::Texture,
+            stage: BindingStage::Fragment,
+            format: Some(TextureFormat::Rgba8),
+        }],
+        debug_flag: None,
+        requires: Vec::new(),
+        conditional: false,
+        standin: None,
+        sizes: None,
+        kept: 0,
+        work: vec![Some(16), Some(16)],
+        unbounded: Vec::new(),
+    };
+    let shader = present_shader()
+        .write(&mut entry, wrela_abi::Target::HERE)
+        .map_err(|e| Error::Gpu(format!("the present pass's shader: {e}")))?;
+    let entries: Vec<wrela_gpu::LayoutEntry> = wrela_abi::metal::layout(&entry)
+        .iter()
+        .map(|e| wrela_gpu::LayoutEntry {
+            binding: e.binding,
+            visibility: e.visibility,
+            ty: binding_type(e, &entry),
+        })
+        .collect();
+    let layout = device.create_bind_group_layout(&entries);
+    let module = device.create_shader_module("present", &shader.bytes).map_err(gpu_err)?;
+    let Stage::Render { vertex_entry, fragment_entry, .. } = &entry.stage else {
+        unreachable!("a render pipeline");
+    };
+    let pipeline = device
+        .create_render_pipeline(&wrela_gpu::RenderPipelineDesc {
+            label: "present",
+            layout: &layout,
+            module: &module,
+            vertex_entry,
+            fragment_entry,
+            colors: &[wrela_gpu::ColorTarget { format, blend: Blend::Replace }],
+            depth: None,
+            cull: Cull::None,
+        })
+        .map_err(gpu_err)?;
+    Ok((pipeline, layout))
+}
+
+/// The present pass: `src` (the screen) drawn into `dst`, a frame of the pipeline's format.
+fn draw_presented(
+    device: &wrela_gpu::Device,
+    pipeline: &wrela_gpu::RenderPipeline,
+    layout: &wrela_gpu::BindGroupLayout,
+    src: &wrela_gpu::TextureView,
+    dst: &wrela_gpu::TextureView,
+) -> wrela_gpu::CommandBuffer {
+    let group = device.create_bind_group(
+        layout,
+        &[wrela_gpu::BindGroupEntry { binding: 0, resource: wrela_gpu::Resource::View(src) }],
+    );
+    let mut encoder = device.create_command_encoder("present");
+    {
+        let colors = [wrela_gpu::ColorAttachment {
+            view: dst,
+            load: wrela_gpu::LoadOp::Clear([0.0, 0.0, 0.0, 1.0]),
+        }];
+        let mut rp = encoder.begin_render_pass(&wrela_gpu::RenderPassDesc {
+            label: "present",
+            colors: &colors,
+            depth: None,
+            timestamps: None,
+        });
+        rp.set_pipeline(pipeline);
+        rp.set_bind_group(&group, &[]);
+        rp.draw(0..3, 0..1);
+    }
+    encoder.finish()
+}
+
+/// The present pass's shader, as IR:
+/// ```text
+/// @group(0) @binding(0) var screen: texture_2d<f32>;
+/// @vertex fn cover(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+///     return vec4f(f32(i & 1) * 4 - 1, f32(i >> 1) * 4 - 1, 0, 1);
+/// }
+/// @fragment fn show(@builtin(position) p: vec4f) -> @location(0) vec4f {
+///     return textureLoad(screen, vec2u(p.xy), 0);
+/// }
+/// ```
+fn present_shader() -> wrela_shader::build::Builder {
+    use wrela_shader::build::{
+        BinOp, Builder, BuiltinInput, Scalar, TexDim, TextureFormat as IrFormat,
+    };
+    let mut b = Builder::new();
+    let u = b.scalar(Scalar::U32);
+    let fl = b.scalar(Scalar::F32);
+    let v4 = b.vector(Scalar::F32, 4);
+    let screen = b.texture("screen", 0, TexDim::D2, IrFormat::Rgba8, false);
+    b.vertex("cover", &[BuiltinInput::VertexIndex], |f| {
+        let i = f.input(0, u);
+        let one = f.u32(1);
+        let xb = f.binary(BinOp::BitAnd, i, one);
+        let yb = f.binary(BinOp::Shr, i, one);
+        let (four, minus, zero, unit) = (f.f32(4.0), f.f32(1.0), f.f32(0.0), f.f32(1.0));
+        let corner = |f: &mut wrela_shader::build::Body<'_>, bit| {
+            let v = f.convert(fl, bit, Scalar::F32);
+            let v = f.binary(BinOp::Mul, v, four);
+            f.binary(BinOp::Sub, v, minus)
+        };
+        let (x, y) = (corner(f, xb), corner(f, yb));
+        let p = f.construct(v4, &[x, y, zero, unit]);
+        f.ret_clip(p);
+    });
+    b.fragment("show", &[BuiltinInput::Position], |f| {
+        let p = f.input(0, v4);
+        let (x, y) = (f.extract(fl, p, 0), f.extract(fl, p, 1));
+        let (x, y) = (f.convert(u, x, Scalar::U32), f.convert(u, y, Scalar::U32));
+        let level = f.u32(0);
+        let texel = f.texel(screen, x, y, level);
+        f.ret(Some(texel));
+    });
+    b
 }
 
 /// The flag a debug build's bounds checks set, and the buffer it's read back through, made
@@ -851,6 +1006,7 @@ impl Gpu {
             frame: 0,
             debug_flag: None,
             program_limits,
+            presenter: None,
         };
         gpu.take_pipelines(manifest, shaders)?;
         Ok(gpu)
@@ -1302,6 +1458,56 @@ impl Gpu {
         });
         self.screen = Some(Screen { texture, view, width, height });
         Ok(())
+    }
+
+    /// Shows the screen in `window` from now on, `width` × `height`, presenting as `present`
+    /// says: each frame, [`Gpu::present`] draws it into the window's next frame.
+    pub(crate) fn attach_window(
+        &mut self,
+        window: Arc<dyn wrela_gpu::Window>,
+        width: u32,
+        height: u32,
+        present: wrela_gpu::PresentMode,
+    ) -> Result<()> {
+        let gpu_err = |e: wrela_gpu::Error| Error::Gpu(e.0);
+        let mut surface = self.device.create_surface(window).map_err(gpu_err)?;
+        let config = wrela_gpu::SurfaceConfig { width, height, present, frames: 3 };
+        surface.configure(&self.device, &config).map_err(gpu_err)?;
+        let (pipeline, layout) = present_pipeline(&self.device, surface.format())?;
+        self.presenter = Some(Presenter { surface, config, pipeline, layout });
+        Ok(())
+    }
+
+    /// The window is now `width` × `height`.
+    pub(crate) fn resize_window(&mut self, width: u32, height: u32) -> Result<()> {
+        let device = self.device.clone();
+        let Some(p) = &mut self.presenter else { return Ok(()) };
+        if (p.config.width, p.config.height) == (width, height) || width == 0 || height == 0 {
+            return Ok(());
+        }
+        p.config.width = width;
+        p.config.height = height;
+        p.surface.configure(&device, &p.config).map_err(|e| Error::Gpu(e.0))
+    }
+
+    /// Draws the screen into the window's next frame and shows it.
+    pub(crate) fn present(&mut self) -> Result<()> {
+        self.flush()?;
+        let device = self.device.clone();
+        let (Some(p), Some(screen)) = (&mut self.presenter, &self.screen) else {
+            return Ok(());
+        };
+        let gpu_err = |e: wrela_gpu::Error| Error::Gpu(e.0);
+        let frame = match p.surface.acquire() {
+            Ok(f) => f,
+            // The window changed under it: configured again, the frame is skipped.
+            Err(_) => {
+                return p.surface.configure(&device, &p.config).map_err(gpu_err);
+            }
+        };
+        let cb = draw_presented(&device, &p.pipeline, &p.layout, &screen.view, &frame.view);
+        device.submit_frame(vec![cb], &frame);
+        p.surface.present(frame).map_err(gpu_err)
     }
 
     /// A frame begins: no label carries over from the last one.
@@ -3035,6 +3241,94 @@ mod tests {
             previous = Some(staging.clone());
         }
         gpu.check_errors().unwrap();
+    }
+
+    /// The present pass draws each pixel of the screen into a frame of each format a surface has
+    /// (`rgba8unorm` on Vulkan, `rgba16float` on Metal): a gradient's every texel, exactly
+    /// (to 8 bits, read back from the half floats).
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn the_present_pass_draws_the_screen_into_a_frame() {
+        let device = open_device("present test", None).unwrap();
+        let (w, h) = (37u32, 23u32);
+        let texels: Vec<u8> = (0..w * h)
+            .flat_map(|i| [(i * 7) as u8, (i * 13 + 5) as u8, (i % 251) as u8, 255 - i as u8])
+            .collect();
+        let src = device.create_texture(&wrela_gpu::TextureDesc {
+            label: "screen",
+            width: w,
+            height: h,
+            depth_or_layers: 1,
+            levels: 1,
+            dimension: wrela_gpu::TextureDimension::D2,
+            format: TextureFormat::Rgba8,
+            usage: wrela_gpu::TextureUsage { sampled: true, copy_dst: true, ..Default::default() },
+        });
+        let at = wrela_gpu::TextureCopy {
+            texture: &src,
+            level: 0,
+            origin: [0, 0, 0],
+            depth_only: false,
+        };
+        device.write_texture(at, &texels, w * 4, h, [w, h, 1]);
+        let view = |t: &wrela_gpu::Texture| {
+            t.create_view(&wrela_gpu::ViewDesc {
+                dimension: wrela_gpu::ViewDimension::D2,
+                base_level: 0,
+                level_count: Some(1),
+                base_layer: 0,
+                layer_count: Some(1),
+            })
+        };
+        for format in [TextureFormat::Rgba8, TextureFormat::Rgba16Float] {
+            let (pipeline, layout) = present_pipeline(&device, format).unwrap();
+            let dst = device.create_texture(&wrela_gpu::TextureDesc {
+                label: "frame",
+                width: w,
+                height: h,
+                depth_or_layers: 1,
+                levels: 1,
+                dimension: wrela_gpu::TextureDimension::D2,
+                format,
+                usage: wrela_gpu::TextureUsage {
+                    render: true,
+                    copy_src: true,
+                    ..Default::default()
+                },
+            });
+            let cb = draw_presented(&device, &pipeline, &layout, &view(&src), &view(&dst));
+            let texel = format.bytes_per_texel();
+            let row = align_to(u64::from(w * texel), 256) as u32;
+            let read = readback_buffer(&device, u64::from(row * h));
+            let mut enc = device.create_command_encoder("read");
+            enc.copy_texture_to_buffer(
+                wrela_gpu::TextureCopy {
+                    texture: &dst,
+                    level: 0,
+                    origin: [0, 0, 0],
+                    depth_only: false,
+                },
+                wrela_gpu::BufferCopy {
+                    buffer: &read,
+                    offset: 0,
+                    bytes_per_row: row,
+                    rows_per_image: h,
+                },
+                [w, h, 1],
+            );
+            device.submit(vec![cb, enc.finish()]);
+            let bytes = map_read(&device, &read).unwrap();
+            let got: Vec<u8> = (0..h as usize)
+                .flat_map(|y| {
+                    let line = &bytes[y * row as usize..][..(w * texel) as usize];
+                    line.chunks(texel as usize)
+                        .flat_map(|t| as_rgba8(format, t))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            assert_eq!(got, texels, "{format:?}");
+            assert!(device.take_errors().is_empty());
+        }
     }
 
     /// A build of one compute pipeline, `increment`, that adds one to its buffer's first word.

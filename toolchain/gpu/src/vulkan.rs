@@ -29,7 +29,9 @@ use std::sync::{Arc, Mutex};
 // ---- the device ---------------------------------------------------------------------------------
 
 struct Shared {
-    _entry: ash::Entry,
+    entry: ash::Entry,
+    /// Whether it can present to a window (the surface and swapchain extensions are on).
+    swapchain: bool,
     instance: ash::Instance,
     debug: Option<(ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)>,
     physical: vk::PhysicalDevice,
@@ -151,8 +153,21 @@ impl Device {
                 .api_version(vk::API_VERSION_1_3);
             let layer = CString::new("VK_LAYER_KHRONOS_validation").expect("a name");
             let layers: Vec<*const i8> = if validate { vec![layer.as_ptr()] } else { Vec::new() };
-            let extensions: Vec<*const i8> =
+            let mut extensions: Vec<*const i8> =
                 if validate { vec![ash::ext::debug_utils::NAME.as_ptr()] } else { Vec::new() };
+            // A window's surface, wherever the loader has its kind (a headless run uses none).
+            let have = entry.enumerate_instance_extension_properties(None).unwrap_or_default();
+            let has = |name: &CStr| have.iter().any(|e| e.extension_name_as_c_str() == Ok(name));
+            let surfaces = [
+                ash::khr::surface::NAME,
+                ash::khr::wayland_surface::NAME,
+                ash::khr::xlib_surface::NAME,
+                ash::khr::xcb_surface::NAME,
+            ];
+            let windowed = has(ash::khr::surface::NAME);
+            if windowed {
+                extensions.extend(surfaces.iter().filter(|n| has(n)).map(|n| n.as_ptr()));
+            }
             let instance = entry
                 .create_instance(
                     &vk::InstanceCreateInfo::default()
@@ -356,11 +371,20 @@ impl Device {
                 .independent_blend(base.independent_blend == vk::TRUE)
                 .depth_clamp(base.depth_clamp == vk::TRUE)
                 .depth_bias_clamp(base.depth_bias_clamp == vk::TRUE);
+            let device_has = instance
+                .enumerate_device_extension_properties(physical)
+                .unwrap_or_default()
+                .iter()
+                .any(|e| e.extension_name_as_c_str() == Ok(ash::khr::swapchain::NAME));
+            let swapchain = windowed && device_has;
+            let device_extensions: Vec<*const i8> =
+                if swapchain { vec![ash::khr::swapchain::NAME.as_ptr()] } else { Vec::new() };
             let raw = instance
                 .create_device(
                     physical,
                     &vk::DeviceCreateInfo::default()
                         .queue_create_infos(&queues)
+                        .enabled_extension_names(&device_extensions)
                         .enabled_features(&on)
                         .push_next(&mut on11)
                         .push_next(&mut on12)
@@ -427,7 +451,8 @@ impl Device {
                     .min(l.max_compute_work_group_count[2]),
             };
             Ok(Device(Arc::new(Shared {
-                _entry: entry,
+                entry,
+                swapchain,
                 instance,
                 debug,
                 physical,
@@ -640,6 +665,7 @@ impl Device {
                 } else {
                     vk::ImageAspectFlags::COLOR
                 },
+                swapchain: false,
                 home: if desc.usage.storage {
                     vk::ImageLayout::GENERAL
                 } else if depth {
@@ -1094,6 +1120,16 @@ impl Device {
     /// Records the staged writes, then submits them and `buffers`, in order: their submission's
     /// index.
     pub fn submit(&self, buffers: Vec<CommandBuffer>) -> SubmissionIndex {
+        self.submit_waiting(buffers, None)
+    }
+
+    /// [`Device::submit`], first waiting on a binary semaphore and signalling another as it ends
+    /// (a frame's image acquired, and rendered).
+    fn submit_waiting(
+        &self,
+        buffers: Vec<CommandBuffer>,
+        frame: Option<(vk::Semaphore, vk::Semaphore)>,
+    ) -> SubmissionIndex {
         let pending = std::mem::take(&mut *lock(&self.0.pending));
         let index = self.0.submitted.fetch_add(1, Ordering::AcqRel) + 1;
         self.turn_belt(index);
@@ -1123,9 +1159,24 @@ impl Device {
             .iter()
             .map(|&cb| vk::CommandBufferSubmitInfo::default().command_buffer(cb))
             .collect();
+        let mut signals = signal.to_vec();
+        let mut waits = Vec::new();
+        if let Some((acquired, rendered)) = frame {
+            waits.push(
+                vk::SemaphoreSubmitInfo::default()
+                    .semaphore(acquired)
+                    .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS),
+            );
+            signals.push(
+                vk::SemaphoreSubmitInfo::default()
+                    .semaphore(rendered)
+                    .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS),
+            );
+        }
         let submit = vk::SubmitInfo2::default()
+            .wait_semaphore_infos(&waits)
             .command_buffer_infos(&cb_infos)
-            .signal_semaphore_infos(&signal);
+            .signal_semaphore_infos(&signals);
         // SAFETY: recorded command buffers, submitted once, kept until the semaphore passes
         // `index`.
         let r = unsafe { self.raw().queue_submit2(self.0.queue, &[submit], vk::Fence::null()) };
@@ -1318,6 +1369,9 @@ struct RawImage {
     /// copy) moves what it uses out and back, so a compressed target stays compressed
     /// (RADV keeps no DCC or HTILE in `GENERAL`).
     home: vk::ImageLayout,
+    /// A swapchain's image: not ours to free, and drawn whole each frame, so a pass takes it
+    /// from `UNDEFINED`.
+    swapchain: bool,
 }
 
 impl RawImage {
@@ -1374,6 +1428,9 @@ fn transition(
 
 impl Drop for RawImage {
     fn drop(&mut self) {
+        if self.swapchain {
+            return;
+        }
         // SAFETY: nothing in flight holds it.
         unsafe {
             self.device.raw.destroy_image(self.image, None);
@@ -2078,7 +2135,8 @@ impl CommandEncoder {
             targets.push((d.view.raw.clone(), vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL));
         }
         for (v, to) in &targets {
-            transition(self.d(), self.raw, v.image.image, v.range, v.image.home, *to);
+            let from = if v.image.swapchain { vk::ImageLayout::UNDEFINED } else { v.image.home };
+            transition(self.d(), self.raw, v.image.image, v.range, from, *to);
         }
         let colors: Vec<vk::RenderingAttachmentInfo<'_>> = desc
             .colors
@@ -2579,5 +2637,300 @@ fn blend_op(name: &str) -> vk::BlendOp {
         "min" => vk::BlendOp::MIN,
         "max" => vk::BlendOp::MAX,
         other => unreachable!("Blend::components names no operation `{other}`"),
+    }
+}
+
+// ---- a window's surface -------------------------------------------------------------------------
+
+/// A window's surface and its swapchain. Its frames are `R8G8B8A8_UNORM`, the screen's format,
+/// so presenting a frame is drawing the screen into it.
+pub struct Surface {
+    device: Device,
+    surface: vk::SurfaceKHR,
+    surface_fns: ash::khr::surface::Instance,
+    swapchain_fns: ash::khr::swapchain::Device,
+    swapchain: vk::SwapchainKHR,
+    images: Vec<Arc<RawView>>,
+    /// Semaphores an acquisition signals, used in turn, each with the submission that last
+    /// waited on it (reused once that's done).
+    acquired: Vec<(vk::Semaphore, SubmissionIndex)>,
+    next: usize,
+    /// One a submission signals for each image, which its presentation waits on.
+    rendered: Vec<vk::Semaphore>,
+    /// The window, alive while its surface is.
+    _window: Arc<dyn Window>,
+}
+
+/// A frame of a surface to draw into, then [`Surface::present`].
+pub struct SurfaceTexture {
+    index: u32,
+    acquired: vk::Semaphore,
+    rendered: vk::Semaphore,
+    slot: usize,
+    pub texture: Texture,
+    pub view: TextureView,
+}
+
+impl Device {
+    /// A surface of `window` (Wayland, X11).
+    pub fn create_surface(&self, window: Arc<dyn Window>) -> Result<Surface> {
+        if !self.0.swapchain {
+            return Err("this Vulkan has no surface or swapchain extension".into());
+        }
+        let display = window.display_handle().map_err(|e| Error(format!("the window: {e}")))?;
+        let handle = window.window_handle().map_err(|e| Error(format!("the window: {e}")))?;
+        // SAFETY: the handles are the window's, alive while the surface is (it keeps the window).
+        let surface = unsafe {
+            ash_window::create_surface(
+                &self.0.entry,
+                &self.0.instance,
+                display.as_raw(),
+                handle.as_raw(),
+                None,
+            )
+        }
+        .map_err(|e| Error(format!("Vulkan made no surface: {e}")))?;
+        let surface_fns = ash::khr::surface::Instance::new(&self.0.entry, &self.0.instance);
+        // SAFETY: a query of the surface.
+        let ok = unsafe {
+            surface_fns.get_physical_device_surface_support(
+                self.0.physical,
+                self.0.queue_family,
+                surface,
+            )
+        }
+        .unwrap_or(false);
+        if !ok {
+            // SAFETY: the surface was made above and nothing uses it.
+            unsafe { surface_fns.destroy_surface(surface, None) };
+            return Err("the GPU's queue can't present to this window".into());
+        }
+        let swapchain_fns = ash::khr::swapchain::Device::new(&self.0.instance, &self.0.raw);
+        Ok(Surface {
+            device: self.clone(),
+            surface,
+            surface_fns,
+            swapchain_fns,
+            swapchain: vk::SwapchainKHR::null(),
+            images: Vec::new(),
+            acquired: Vec::new(),
+            next: 0,
+            rendered: Vec::new(),
+            _window: window,
+        })
+    }
+
+    /// Submits `buffers` for `frame`: after its image is acquired, signalling what its
+    /// presentation waits on.
+    pub fn submit_frame(
+        &self,
+        buffers: Vec<CommandBuffer>,
+        frame: &SurfaceTexture,
+    ) -> SubmissionIndex {
+        self.submit_waiting(buffers, Some((frame.acquired, frame.rendered)))
+    }
+}
+
+impl Surface {
+    /// Its frames' format.
+    pub fn format(&self) -> TextureFormat {
+        TextureFormat::Rgba8
+    }
+
+    pub fn configure(&mut self, device: &Device, c: &SurfaceConfig) -> Result<()> {
+        let d = &device.0;
+        // SAFETY: queries of the surface, then a swapchain of it (the old one retired once the
+        // device is idle), and semaphores.
+        unsafe {
+            let caps = self
+                .surface_fns
+                .get_physical_device_surface_capabilities(d.physical, self.surface)
+                .map_err(|e| Error(format!("the surface: {e}")))?;
+            let formats = self
+                .surface_fns
+                .get_physical_device_surface_formats(d.physical, self.surface)
+                .map_err(|e| Error(format!("the surface: {e}")))?;
+            let format = formats
+                .iter()
+                .find(|f| f.format == vk::Format::R8G8B8A8_UNORM)
+                .copied()
+                .ok_or("the surface has no R8G8B8A8_UNORM format")?;
+            let modes = self
+                .surface_fns
+                .get_physical_device_surface_present_modes(d.physical, self.surface)
+                .map_err(|e| Error(format!("the surface: {e}")))?;
+            let want = match c.present {
+                PresentMode::Fifo => vk::PresentModeKHR::FIFO,
+                PresentMode::FifoRelaxed => vk::PresentModeKHR::FIFO_RELAXED,
+                PresentMode::Mailbox => vk::PresentModeKHR::MAILBOX,
+                PresentMode::Immediate => vk::PresentModeKHR::IMMEDIATE,
+            };
+            // FIFO is every surface's.
+            let mode = if modes.contains(&want) { want } else { vk::PresentModeKHR::FIFO };
+            let extent = if caps.current_extent.width == u32::MAX {
+                vk::Extent2D { width: c.width, height: c.height }
+            } else {
+                caps.current_extent
+            };
+            let mut count = c.frames.clamp(2, 3).max(caps.min_image_count);
+            if caps.max_image_count > 0 {
+                count = count.min(caps.max_image_count);
+            }
+            let old = self.swapchain;
+            let _ = d.raw.device_wait_idle();
+            let swapchain = self
+                .swapchain_fns
+                .create_swapchain(
+                    &vk::SwapchainCreateInfoKHR::default()
+                        .surface(self.surface)
+                        .min_image_count(count)
+                        .image_format(format.format)
+                        .image_color_space(format.color_space)
+                        .image_extent(extent)
+                        .image_array_layers(1)
+                        .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+                        .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
+                        .pre_transform(caps.current_transform)
+                        .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
+                        .present_mode(mode)
+                        .clipped(true)
+                        .old_swapchain(old),
+                    None,
+                )
+                .map_err(|e| Error(format!("Vulkan made no swapchain: {e}")))?;
+            self.release();
+            if old != vk::SwapchainKHR::null() {
+                self.swapchain_fns.destroy_swapchain(old, None);
+            }
+            self.swapchain = swapchain;
+            let images = self
+                .swapchain_fns
+                .get_swapchain_images(swapchain)
+                .map_err(|e| Error(format!("the swapchain: {e}")))?;
+            for image in images {
+                let raw = Arc::new(RawImage {
+                    device: d.clone(),
+                    image,
+                    memory: vk::DeviceMemory::null(),
+                    format: format.format,
+                    aspect: vk::ImageAspectFlags::COLOR,
+                    levels: 1,
+                    layers: 1,
+                    home: vk::ImageLayout::PRESENT_SRC_KHR,
+                    swapchain: true,
+                });
+                let range = raw.part(0, 0, 1);
+                let view = d
+                    .raw
+                    .create_image_view(
+                        &vk::ImageViewCreateInfo::default()
+                            .image(image)
+                            .view_type(vk::ImageViewType::TYPE_2D)
+                            .format(format.format)
+                            .subresource_range(range),
+                        None,
+                    )
+                    .map_err(|e| Error(format!("Vulkan made no view: {e}")))?;
+                self.images.push(Arc::new(RawView {
+                    image: raw,
+                    view,
+                    range,
+                    width: extent.width,
+                    height: extent.height,
+                }));
+                self.rendered.push(
+                    d.raw
+                        .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+                        .map_err(|e| Error(format!("Vulkan made no semaphore: {e}")))?,
+                );
+            }
+            for _ in 0..self.images.len() + 1 {
+                let sem = d
+                    .raw
+                    .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+                    .map_err(|e| Error(format!("Vulkan made no semaphore: {e}")))?;
+                self.acquired.push((sem, 0));
+            }
+        }
+        Ok(())
+    }
+
+    /// The swapchain's images, views and semaphores let go (the device idle).
+    fn release(&mut self) {
+        let d = &self.device.0.raw;
+        // SAFETY: the device is idle; nothing uses them.
+        unsafe {
+            let _ = d.device_wait_idle();
+            for (s, _) in self.acquired.drain(..) {
+                d.destroy_semaphore(s, None);
+            }
+            for s in self.rendered.drain(..) {
+                d.destroy_semaphore(s, None);
+            }
+        }
+        self.images.clear();
+        self.next = 0;
+    }
+
+    /// The next frame to draw into (waits for an image the display is done with). An error
+    /// when the window changed and the surface wants configuring again.
+    pub fn acquire(&mut self) -> Result<SurfaceTexture> {
+        let slot = self.next % self.acquired.len();
+        self.next += 1;
+        let (sem, used) = self.acquired[slot];
+        // The semaphore's last wait must be done before it's signalled again.
+        self.device.wait(used);
+        // SAFETY: an acquisition signalling an unsignalled semaphore.
+        let (index, _) = unsafe {
+            self.swapchain_fns.acquire_next_image(self.swapchain, u64::MAX, sem, vk::Fence::null())
+        }
+        .map_err(|e| Error(format!("the swapchain: {e}")))?;
+        let view = self.images[index as usize].clone();
+        let texture = Texture {
+            raw: view.image.clone(),
+            format: TextureFormat::Rgba8,
+            width: view.width,
+            height: view.height,
+            depth_or_layers: 1,
+            levels: 1,
+            dimension: TextureDimension::D2,
+        };
+        Ok(SurfaceTexture {
+            index,
+            acquired: sem,
+            rendered: self.rendered[index as usize],
+            slot,
+            texture,
+            view: TextureView { raw: view },
+        })
+    }
+
+    /// Shows `frame` once the submission for it ([`Device::submit_frame`]) is done.
+    pub fn present(&mut self, frame: SurfaceTexture) -> Result<()> {
+        self.acquired[frame.slot].1 = self.device.submitted();
+        let waits = [frame.rendered];
+        let chains = [self.swapchain];
+        let indices = [frame.index];
+        let info = vk::PresentInfoKHR::default()
+            .wait_semaphores(&waits)
+            .swapchains(&chains)
+            .image_indices(&indices);
+        // SAFETY: the image was acquired and its rendering submitted, signalling `rendered`.
+        unsafe { self.swapchain_fns.queue_present(self.device.0.queue, &info) }
+            .map(|_| ())
+            .map_err(|e| Error(format!("the swapchain: {e}")))
+    }
+}
+
+impl Drop for Surface {
+    fn drop(&mut self) {
+        self.release();
+        // SAFETY: the device is idle; the swapchain and then its surface go.
+        unsafe {
+            if self.swapchain != vk::SwapchainKHR::null() {
+                self.swapchain_fns.destroy_swapchain(self.swapchain, None);
+            }
+            self.surface_fns.destroy_surface(self.surface, None);
+        }
     }
 }

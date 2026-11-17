@@ -1644,3 +1644,107 @@ impl Device {
         });
     }
 }
+
+// ---- a window's surface -------------------------------------------------------------------------
+
+/// A window's `CAMetalLayer`, which Metal draws a frame into and the window shows. Its frames are
+/// half floats (`RGBA16Float`), which an extended-range display shows past white, and which hold
+/// the screen's 8-bit values exactly.
+pub struct Surface {
+    layer: objc2::rc::Retained<objc2_quartz_core::CAMetalLayer>,
+    /// The window, alive while its layer is drawn into.
+    _window: Arc<dyn Window>,
+}
+
+// SAFETY: the layer is made and used on the thread that runs the window (macOS's main thread);
+// the host keeps its surface there.
+unsafe impl Send for Surface {}
+
+/// A frame of a surface to draw into, then [`Surface::present`].
+pub struct SurfaceTexture {
+    drawable: objc2::rc::Retained<ProtocolObject<dyn objc2_quartz_core::CAMetalDrawable>>,
+    pub texture: Texture,
+    pub view: TextureView,
+}
+
+impl Device {
+    /// A surface of `window`, which must be an AppKit window's, made on the main thread.
+    pub fn create_surface(&self, window: Arc<dyn Window>) -> Result<Surface> {
+        use objc2_quartz_core::CAMetalLayer;
+        use raw_window_handle::RawWindowHandle;
+        let mtm = objc2::MainThreadMarker::new()
+            .ok_or("a window's Metal layer is made on the main thread")?;
+        let _ = mtm;
+        let handle = window.window_handle().map_err(|e| Error(format!("the window: {e}")))?;
+        let RawWindowHandle::AppKit(h) = handle.as_raw() else {
+            return Err("Metal draws only into an AppKit window".into());
+        };
+        // SAFETY: the handle's view is the window's, alive while the window is (the surface keeps
+        // it).
+        let view: &objc2_app_kit::NSView = unsafe { h.ns_view.cast().as_ref() };
+        let layer = CAMetalLayer::new();
+        layer.setDevice(Some(&self.0.raw));
+        layer.setPixelFormat(MTLPixelFormat::RGBA16Float);
+        layer.setFramebufferOnly(true);
+        view.setWantsLayer(true);
+        view.setLayer(Some(&layer));
+        Ok(Surface { layer, _window: window })
+    }
+
+    /// Submits `buffers` for `frame`: on Metal, as any other submission.
+    pub fn submit_frame(
+        &self,
+        buffers: Vec<CommandBuffer>,
+        frame: &SurfaceTexture,
+    ) -> SubmissionIndex {
+        let _ = frame;
+        self.submit(buffers)
+    }
+}
+
+impl Surface {
+    /// Its frames' format.
+    pub fn format(&self) -> TextureFormat {
+        TextureFormat::Rgba16Float
+    }
+
+    pub fn configure(&mut self, device: &Device, c: &SurfaceConfig) -> Result<()> {
+        let _ = device;
+        self.layer.setDrawableSize(objc2_core_foundation::CGSize {
+            width: f64::from(c.width),
+            height: f64::from(c.height),
+        });
+        self.layer.setMaximumDrawableCount(c.frames.clamp(2, 3) as NSUInteger);
+        // Fifo waits for the display's refresh; the others don't (Metal has no mailbox: a frame
+        // presented before the refresh replaces the one waiting, which is Mailbox's).
+        self.layer.setDisplaySyncEnabled(matches!(
+            c.present,
+            PresentMode::Fifo | PresentMode::FifoRelaxed
+        ));
+        Ok(())
+    }
+
+    /// The next frame to draw into (waits for one the display is done with).
+    pub fn acquire(&mut self) -> Result<SurfaceTexture> {
+        use objc2_quartz_core::CAMetalDrawable;
+        let drawable = self.layer.nextDrawable().ok_or("the layer gave no drawable")?;
+        let raw = drawable.texture();
+        let (width, height) = (raw.width() as u32, raw.height() as u32);
+        let texture = Texture {
+            raw: raw.clone(),
+            format: TextureFormat::Rgba16Float,
+            width,
+            height,
+            depth_or_layers: 1,
+            levels: 1,
+            dimension: TextureDimension::D2,
+        };
+        Ok(SurfaceTexture { drawable, texture, view: TextureView { raw } })
+    }
+
+    /// Shows `frame` once the work submitted for it is done.
+    pub fn present(&mut self, frame: SurfaceTexture) -> Result<()> {
+        frame.drawable.present();
+        Ok(())
+    }
+}

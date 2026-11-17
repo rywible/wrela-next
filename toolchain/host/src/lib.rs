@@ -52,6 +52,10 @@ mod program;
 mod shared;
 #[cfg(feature = "gpu")]
 pub mod step;
+#[cfg(feature = "gpu")]
+pub mod window;
+#[cfg(feature = "gpu")]
+pub use wrela_gpu::PresentMode;
 pub mod tool;
 mod trace;
 
@@ -1030,6 +1034,28 @@ impl Host {
         self.p().executor().set_screen(width, height)?;
         self.p().frame(time, width, height)?;
         self.settle_handing()
+    }
+
+    /// Shows the screen in `window`, `width` × `height`, from now on: [`Host::present`] draws
+    /// each frame into it.
+    pub fn attach_window(
+        &mut self,
+        window: std::sync::Arc<dyn wrela_gpu::Window>,
+        width: u32,
+        height: u32,
+        present: wrela_gpu::PresentMode,
+    ) -> Result<()> {
+        self.p().executor().attach_window(window, width, height, present)
+    }
+
+    /// The window is now `width` × `height`.
+    pub fn resize_window(&mut self, width: u32, height: u32) -> Result<()> {
+        self.p().executor().resize_window(width, height)
+    }
+
+    /// Draws the screen into the window's next frame and shows it.
+    pub fn present(&mut self) -> Result<()> {
+        self.p().executor().present()
     }
 
     /// The directory of the build that's running: another after a hand-over

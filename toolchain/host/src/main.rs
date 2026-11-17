@@ -108,6 +108,8 @@ struct Args {
     replay: Option<PathBuf>,
     workers: u32,
     relaxed: bool,
+    /// `--window`: shown in a window, presenting as this says.
+    window: Option<String>,
 }
 
 fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -135,6 +137,7 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
         replay: None,
         workers: 0,
         relaxed: false,
+        window: None,
     };
     while let Some(arg) = argv.next() {
         let mut value = |flag: &str| argv.next().ok_or_else(|| format!("{flag} needs a value"));
@@ -143,6 +146,8 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
         };
         match arg.as_str() {
             "--frames" => args.frames = whole("--frames", value("--frames")?)?,
+            "--window" => args.window = Some(args.window.take().unwrap_or_else(|| "fifo".into())),
+            "--present" => args.window = Some(value("--present")?),
             "--ticks" => args.ticks = Some(whole("--ticks", value("--ticks")?)?),
             "--workers" => args.workers = whole("--workers", value("--workers")?)?,
             "--fps" => {
@@ -449,7 +454,37 @@ fn run(args: &Args) -> Result<(), Failure> {
     if args.no_gpu {
         return ticks_alone(args);
     }
+    if args.window.is_some() {
+        return windowed(args);
+    }
     frames(args)
+}
+
+/// `--window`: the frames shown in a window until it's closed (or `--frames` given, ran).
+#[cfg(feature = "gpu")]
+fn windowed(args: &Args) -> Result<(), Failure> {
+    use wrela_host::{Host, Options, PresentMode, window};
+    let mode = args.window.as_deref().unwrap_or("fifo");
+    let present = PresentMode::parse(mode).ok_or_else(|| {
+        Failure::Host(wrela_host::Error::Gpu(format!(
+            "--present is fifo, fifo-relaxed, mailbox or immediate, not {mode}"
+        )))
+    })?;
+    let options = Options { workers: args.workers, defer_init: true, ..Options::default() };
+    let mut host = Host::load_with(&args.dir, &options)?;
+    host.init()?;
+    let frames = (args.frames > 1).then_some(args.frames);
+    let run = window::WindowRun { frames, fps: args.fps, size: args.size, present };
+    let ran = window::run(&mut host, &run)?;
+    println!("{} frames shown; state hash {:016x}", ran, host.hash());
+    Ok(())
+}
+
+#[cfg(not(feature = "gpu"))]
+fn windowed(_: &Args) -> Result<(), Failure> {
+    Err(Failure::Host(wrela_host::Error::Gpu(
+        "this wrela-host was built without the `gpu` feature".into(),
+    )))
 }
 
 /// Lets Metal capture to a file (`--capture`): `MTL_CAPTURE_ENABLED=1`, which Metal reads when
