@@ -116,8 +116,6 @@ struct Args {
     window: Option<String>,
     /// `--hdr`: the screen goes HDR offscreen when the program asks (as a test's `hdr=1`).
     hdr: bool,
-    /// `--in-flight N`: in a window, the most frames between their input and their photons.
-    in_flight: u32,
 }
 
 fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -147,7 +145,6 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
         relaxed: false,
         window: None,
         hdr: false,
-        in_flight: 2,
     };
     while let Some(arg) = argv.next() {
         let mut value = |flag: &str| argv.next().ok_or_else(|| format!("{flag} needs a value"));
@@ -157,7 +154,6 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
         match arg.as_str() {
             "--frames" => args.frames = whole("--frames", value("--frames")?)?,
             "--hdr" => args.hdr = true,
-            "--in-flight" => args.in_flight = whole("--in-flight", value("--in-flight")?)?,
             "--window" => args.window = Some(args.window.take().unwrap_or_else(|| "fifo".into())),
             "--present" => args.window = Some(value("--present")?),
             "--ticks" => args.ticks = Some(whole("--ticks", value("--ticks")?)?),
@@ -487,22 +483,26 @@ fn windowed(args: &Args) -> Result<(), Failure> {
     let mut host = Host::load_with(&args.dir, &options)?;
     host.init()?;
     let frames = (args.frames > 1).then_some(args.frames);
-    let run = window::WindowRun {
-        frames,
-        fps: args.fps,
-        size: args.size,
-        present,
-        in_flight: args.in_flight,
-    };
+    let run = window::WindowRun { frames, fps: args.fps, size: args.size, present };
     let ran = window::run(&mut host, &run)?;
-    if let (Some((median, p90, worst)), Some((before, _, _)), Some(first), Some(rate)) =
-        (ran.latency(), ran.before_present(), ran.first(), ran.rate())
+    if let (
+        Some((median, p90, worst)),
+        Some((s50, s90, sworst)),
+        Some((before, _, _)),
+        Some(first),
+        Some(rate),
+    ) = (ran.latency(), ran.settled(), ran.before_present(), ran.first(), ran.rate())
     {
         println!(
-            "latency, input sampled to shown: median {median:.2} ms (to presented {before:.2} ms), 90th percentile {p90:.2} ms, worst {worst:.2} ms (the {}th shown) over {} frames after the first ({first:.0} ms); {rate:.1} frames a second",
+            "latency, input sampled to shown: median {median:.2} ms (to presented {before:.2} ms), 90th percentile {p90:.2} ms, worst {worst:.2} ms (the {}th shown) over {} frames after the first ({first:.0} ms)",
             ran.latencies.iter().position(|&l| l == worst).unwrap_or(0),
             ran.latencies.len() - 1
         );
+        println!(
+            "settled (the second half): median {s50:.2} ms, 90th percentile {s90:.2} ms, worst {sworst:.2} ms; {rate:.1} frames a second; refresh {:.2} ms; {} missed their refresh",
+            ran.period, ran.misses
+        );
+        println!("pacer at the end: {}", ran.pacer);
     }
     println!("{} frames shown; state hash {:016x}", ran.frames, host.hash());
     Ok(())

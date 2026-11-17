@@ -5,9 +5,16 @@
 //! (each refresh, no tearing), `fifo-relaxed`, `mailbox` (the newest at each refresh) or
 //! `immediate` (at once, may tear). The window's size is the screen's: resizing it resizes the
 //! frames the program draws.
+//!
+//! Frames are paced ([`crate::pace`]): each takes its input as late as it can and still make the
+//! refresh it aims at, one frame a refresh. The loop draws between events, never inside one, so
+//! the events that come while a frame waits for its time reach that frame.
 
+use crate::pace::{Pacer, Plan};
 use crate::{Error, Host, Result};
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -20,9 +27,6 @@ pub struct WindowRun {
     pub fps: f64,
     pub size: (u32, u32),
     pub present: wrela_gpu::PresentMode,
-    /// The most frames sampled and not yet shown: a frame waits for the one this many before it
-    /// to reach the display before it takes its input (the latency it adds, a frame each).
-    pub in_flight: u32,
 }
 
 struct App<'a> {
@@ -32,35 +36,78 @@ struct App<'a> {
     size: (u32, u32),
     frame: u32,
     failed: Option<Error>,
-    /// When each frame shown sampled its input (just before it ran) and was presented, by its
-    /// present's id.
-    sampled: std::collections::HashMap<u64, (std::time::Instant, std::time::Instant)>,
+    /// The run's clock: seconds since this.
+    start: Instant,
+    pacer: Pacer,
+    /// `WRELA_PACE_TRACE`: each plan and each frame shown, to stderr.
+    trace: bool,
+    /// When the last frame was drawn: a window that draws none for a second has stalled.
+    drawn_at: f64,
+    /// When each frame not yet shown took its input and was presented, by its present's id.
+    waiting: HashMap<u64, (f64, f64)>,
     /// Each shown frame's latency, input sampled to photons, and of it input to presented (the
-    /// frame run, recorded and submitted): milliseconds.
+    /// frame run, recorded and submitted): milliseconds; and when it was shown (seconds).
     latencies: Vec<f64>,
     before_present: Vec<f64>,
-    /// When each was shown.
-    shown: Vec<std::time::Instant>,
+    shown: Vec<f64>,
 }
 
 impl App<'_> {
-    /// The latencies of the frames shown since the last look.
+    fn now(&self) -> f64 {
+        self.start.elapsed().as_secs_f64()
+    }
+
+    fn secs(&self, at: Instant) -> f64 {
+        at.saturating_duration_since(self.start).as_secs_f64()
+    }
+
+    /// The frames shown since the last look: their latencies, and the pacer told.
     fn note_shown(&mut self) {
         for (id, at) in self.host.take_presented() {
-            // Frames are shown in order: one before this not shown yet was replaced, and never
-            // will be (Metal drops a frame a newer one overtakes before its refresh).
-            self.sampled.retain(|&k, _| k >= id);
-            if let Some((sampled, presented)) = self.sampled.remove(&id) {
-                self.latencies.push(at.saturating_duration_since(sampled).as_secs_f64() * 1e3);
-                self.before_present
-                    .push(presented.saturating_duration_since(sampled).as_secs_f64() * 1e3);
+            let at = self.secs(at);
+            if self.trace {
+                eprintln!(
+                    "pace: frame {id} shown at {:.1} ms (told at {:.1})",
+                    at * 1e3,
+                    self.now() * 1e3
+                );
+            }
+            self.pacer.shown(id, at);
+            // Frames are shown in order: one before this not shown yet was overtaken.
+            self.waiting.retain(|&k, _| k >= id);
+            if let Some((sampled, presented)) = self.waiting.remove(&id) {
+                self.latencies.push((at - sampled) * 1e3);
+                self.before_present.push((presented - sampled) * 1e3);
                 self.shown.push(at);
             }
         }
     }
-}
 
-impl App<'_> {
+    /// Runs the next frame and shows it, aiming at `plan`'s refresh.
+    fn draw(&mut self, plan: Plan, el: &ActiveEventLoop) {
+        let (w, h) = self.size;
+        // The frame's input is what's come by now: its latency runs from here.
+        let sampled = self.now();
+        let drawn = self
+            .host
+            .lockstep_frame(self.frame, self.run.fps, w, h, &[])
+            .and_then(|()| self.host.present());
+        match drawn {
+            Ok(Some(id)) => {
+                let presented = self.now();
+                self.pacer.presented(id, sampled, presented, plan.target);
+                self.waiting.insert(id, (sampled, presented));
+            }
+            Ok(None) => {}
+            Err(e) => return self.fail(e, el),
+        }
+        self.frame += 1;
+        self.drawn_at = self.now();
+        if self.run.frames.is_some_and(|n| self.frame >= n) {
+            el.exit();
+        }
+    }
+
     fn fail(&mut self, e: Error, el: &ActiveEventLoop) {
         self.failed = Some(e);
         el.exit();
@@ -87,7 +134,6 @@ impl ApplicationHandler for App<'_> {
         {
             return self.fail(e, el);
         }
-        window.request_redraw();
         self.window = Some(window);
     }
 
@@ -102,39 +148,51 @@ impl ApplicationHandler for App<'_> {
                     }
                 }
             }
-            WindowEvent::RedrawRequested => {
-                let (w, h) = self.size;
-                // No more than `in_flight` frames between their input and their photons.
-                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
-                while self.sampled.len() >= self.run.in_flight.max(1) as usize
-                    && std::time::Instant::now() < deadline
-                {
-                    std::thread::sleep(std::time::Duration::from_micros(250));
-                    self.note_shown();
-                }
-                // The frame's input is what's come by now: its latency runs from here.
-                let sampled = std::time::Instant::now();
-                let drawn = self
-                    .host
-                    .lockstep_frame(self.frame, self.run.fps, w, h, &[])
-                    .and_then(|()| self.host.present());
-                match drawn {
-                    Ok(Some(id)) => {
-                        self.sampled.insert(id, (sampled, std::time::Instant::now()));
-                    }
-                    Ok(None) => {}
-                    Err(e) => return self.fail(e, el),
-                }
-                self.note_shown();
-                self.frame += 1;
-                if self.run.frames.is_some_and(|n| self.frame >= n) {
-                    el.exit();
-                } else if let Some(window) = &self.window {
-                    window.request_redraw();
-                }
-            }
             _ => {}
         }
+    }
+
+    /// The events that have come are handled: the next frame goes now if it's time, or the loop
+    /// waits for its time (and for events meanwhile).
+    fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        if self.window.is_none() || self.failed.is_some() || el.exiting() {
+            return;
+        }
+        self.note_shown();
+        let now = self.now();
+        // The first frame builds the program's pipelines: it may take seconds.
+        if self.frame > 1 && now - self.drawn_at > 1.0 {
+            let e = format!(
+                "the window stalled: no frame drawn for {:.0} ms after frame {}; {}",
+                (now - self.drawn_at) * 1e3,
+                self.frame,
+                self.pacer.describe()
+            );
+            return self.fail(Error::Gpu(e), el);
+        }
+        let plan = self.pacer.plan(now);
+        if self.trace {
+            eprintln!(
+                "pace: at {:.1} ms, frame {} plans input at {:.1} aiming at {:?}; {}",
+                now * 1e3,
+                self.frame,
+                plan.at * 1e3,
+                plan.target.map(|t| (t * 1e4).round() / 10.0),
+                self.pacer.describe()
+            );
+        }
+        let early = plan.at - now;
+        if early > 0.002 {
+            // Woken a millisecond early (a wake can be late), to wait out the rest exactly.
+            let wake = self.start + Duration::from_secs_f64(plan.at - 0.001);
+            el.set_control_flow(ControlFlow::WaitUntil(wake));
+            return;
+        }
+        if early > 0.0 {
+            std::thread::sleep(Duration::from_secs_f64(early));
+        }
+        self.draw(plan, el);
+        el.set_control_flow(ControlFlow::Poll);
     }
 }
 
@@ -146,8 +204,14 @@ pub struct WindowRan {
     pub latencies: Vec<f64>,
     /// Of each, input sampled to presented: the frame run, recorded and submitted (ms).
     pub before_present: Vec<f64>,
-    /// When each was shown.
-    pub shown: Vec<std::time::Instant>,
+    /// When each was shown (seconds).
+    pub shown: Vec<f64>,
+    /// Frames shown after the refresh they aimed at, or never.
+    pub misses: u32,
+    /// The display's refresh period as the pacer learned it (ms).
+    pub period: f64,
+    /// The pacer's state at the end ([`Pacer::describe`]): why the latency is what it is.
+    pub pacer: String,
 }
 
 impl WindowRan {
@@ -162,6 +226,11 @@ impl WindowRan {
         stats(self.latencies.get(1..)?)
     }
 
+    /// The same, of the second half of the run: once the pacer has settled.
+    pub fn settled(&self) -> Option<(f64, f64, f64)> {
+        stats(self.latencies.get(self.latencies.len() / 2..)?)
+    }
+
     /// The same of input sampled to presented.
     pub fn before_present(&self) -> Option<(f64, f64, f64)> {
         stats(self.before_present.get(1..)?)
@@ -170,7 +239,7 @@ impl WindowRan {
     /// Frames shown a second after the first.
     pub fn rate(&self) -> Option<f64> {
         let (first, last) = (self.shown.get(1)?, self.shown.last()?);
-        let span = last.saturating_duration_since(*first).as_secs_f64();
+        let span = last - first;
         (span > 0.0).then(|| (self.shown.len() - 2) as f64 / span)
     }
 }
@@ -197,7 +266,11 @@ pub fn run(host: &mut Host, run: &WindowRun) -> Result<WindowRan> {
         size: run.size,
         frame: 0,
         failed: None,
-        sampled: std::collections::HashMap::new(),
+        start: Instant::now(),
+        pacer: Pacer::new(1.0 / 60.0),
+        trace: std::env::var_os("WRELA_PACE_TRACE").is_some(),
+        drawn_at: 0.0,
+        waiting: HashMap::new(),
         latencies: Vec::new(),
         before_present: Vec::new(),
         shown: Vec::new(),
@@ -207,9 +280,9 @@ pub fn run(host: &mut Host, run: &WindowRun) -> Result<WindowRan> {
         return Err(e);
     }
     // The last frames' photons come after the loop: what's shown within a moment counts.
-    let until = std::time::Instant::now() + std::time::Duration::from_millis(250);
-    while !app.sampled.is_empty() && std::time::Instant::now() < until {
-        std::thread::sleep(std::time::Duration::from_millis(5));
+    let until = Instant::now() + Duration::from_millis(250);
+    while !app.waiting.is_empty() && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(5));
         app.note_shown();
     }
     Ok(WindowRan {
@@ -217,5 +290,8 @@ pub fn run(host: &mut Host, run: &WindowRun) -> Result<WindowRan> {
         latencies: app.latencies,
         before_present: app.before_present,
         shown: app.shown,
+        misses: app.pacer.misses,
+        period: app.pacer.period() * 1e3,
+        pacer: app.pacer.describe(),
     })
 }

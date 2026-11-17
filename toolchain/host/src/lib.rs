@@ -47,6 +47,7 @@ pub mod image;
 pub mod interfaces;
 pub mod loopback;
 #[cfg(feature = "gpu")]
+pub mod pace;
 mod pipeline_report;
 mod program;
 mod shared;
