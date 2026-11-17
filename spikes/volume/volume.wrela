@@ -26,10 +26,11 @@ use form::shade::STILL
 use frame::eye::{Eye, NEARER}
 use frame::last::cover
 use frame::light::{Lighting, Shaded, sun_reach, worn}
+use frame::outline::{fold_field, way_to_outline}
 use frame::picture::{EDGE_REACH, Frame, NO_EDGE, NO_LINE, SOLID, edge_record, identity}
 use std::gpu::{
     ClipPosition, DrawArgs, InstanceIndex, R32Uint, Slots, Texels, VertexIndex, writable_texture,
-    Address, Append, AppendBuffer, Atomics, Filter, FragCoord, GlobalId, GpuBuffer, Rg32Float,
+    Address, Append, AppendBuffer, Atomics, Filter, FragCoord, GlobalId, GpuBuffer, Rgba32Float,
     Rg32Uint, Rgba16Float, Rgba8, Sampler, Targets3, Texels3d, Texture, Texture3d, WithDepth, append_buffer,
     begin_pass, begin_pass3_with_depth, buffer, dispatch, draw, label, read, sampler, texture,
     texture3d,
@@ -79,6 +80,19 @@ const MARGIN: f32 = 2.0
 /// the scouting rays' footprints, for it to be read once from there rather than walked.
 const AGREE: f32 = 0.5
 
+/// How near the surface (in the pixel's footprints) a solve must end to count as settled.
+const SETTLED: f32 = 0.5
+
+/// How many bricks that hold nothing a solve looks on through for its sheet.
+const PROBED: u32 = 6
+
+/// The most rounds a solve takes, a read each.
+const ROUNDS: u32 = 4
+
+/// How far past the farthest its scouts met or came near the form a pixel's walk goes, where
+/// its solve couldn't say (bricks).
+const PAST: f32 = 4.0
+
 /// The volume's frame as every kernel and pixel program reads it: its least corner (m), a fine
 /// cell's side (m), its coarse cells along x, y and z and how many bricks it kept (`size.w`), the
 /// form's steepness (its gradient's most, for the skip), and the atlas's texels a side.
@@ -97,6 +111,12 @@ pub struct Grid: Copy + GpuData {
     /// Whether a joined pixel whose scouts agree reads the volume once (1) or takes its facing
     /// and albedo from its four scouts alone (0).
     pub reads: u32,
+    /// Whether smooth blocks are drawn as quads between their scouts (1) or joined at each pixel
+    /// by a full-screen pass (0).
+    pub quads: u32,
+    /// Whether an edge block's pixels are solved (1) or walked (0).
+    pub solves: u32,
+    pub spare: vec2,
 }
 
 /// The most invocations of a filling kernel in one dispatch (its work bound times this stays
@@ -130,11 +150,13 @@ pub struct Volume<S> {
     total: u32,
     s: Sampler,
     /// The scouting march's texels: how far along each met the form and first came near it.
-    scout: Texture<Rg32Float>,
+    scout: Texture<Rgba32Float>,
     /// Each scouting block's class, the edge blocks listed, and the draw of them.
     classes: Texture<R32Uint>,
     edges: AppendBuffer<u32>,
     draws: GpuBuffer<DrawArgs>,
+    smooth: AppendBuffer<u32>,
+    smooth_draws: GpuBuffer<DrawArgs>,
 }
 
 /// `form`'s volume, its fine cells `cell` m a side, over a cube round its bound.
@@ -156,6 +178,9 @@ pub fn volume<S: Solid>(form: S, cell: f32) -> Volume<S> {
             debug: 0,
             stored: 0,
             reads: 1,
+            quads: 1,
+            solves: 1,
+            spare: vec2(0.0),
         },
         coarse: texture3d(width: n, height: n, depth: n),
         atlas: texture3d(width: 1, height: 1, depth: 1),
@@ -171,6 +196,8 @@ pub fn volume<S: Solid>(form: S, cell: f32) -> Volume<S> {
         classes: writable_texture(width: 1, height: 1),
         edges: append_buffer(1),
         draws: buffer(1),
+        smooth: append_buffer(1),
+        smooth_draws: buffer(1),
     }
 }
 
@@ -218,6 +245,46 @@ fn unpacked_way(w: u32) -> vec3 {
 
 fn unpacked_albedo(w: u32) -> vec3 {
     let r = vec3(f32((w >> 16) & 31) / 31.0, f32((w >> 21) & 63) / 63.0, f32(w >> 27) / 31.0)
+    r * r
+}
+
+/// A unit vector folded onto an octahedron, as two numbers from -1 to 1, and back.
+fn octa(n: vec3) -> vec2 {
+    let a = n / (abs(n.x) + abs(n.y) + abs(n.z))
+    if a.y >= 0.0 {
+        return a.xz
+    }
+    (vec2(1.0) - abs(vec2(a.z, a.x))) * vec2(if a.x >= 0.0 { 1.0 } else { -1.0 }, if a.z >= 0.0 { 1.0 } else { -1.0 })
+}
+
+fn unocta(e: vec2) -> vec3 {
+    var v = vec3(e.x, 1.0 - abs(e.x) - abs(e.y), e.y)
+    let t = max(-v.y, 0.0)
+    v.x += if v.x >= 0.0 { -t } else { t }
+    v.z += if v.z >= 0.0 { -t } else { t }
+    normalize(v)
+}
+
+/// A unit vector as one whole number a float holds exactly (folded, 12 bits each way), and back.
+fn faced(n: vec3) -> f32 {
+    let q = floor(clamp(octa(n) * 0.5 + vec2(0.5), vec2(0.0), vec2(1.0)) * 4095.0 + vec2(0.5))
+    q.x + q.y * 4096.0
+}
+
+fn unfaced(w: f32) -> vec3 {
+    let k = u32(w)
+    unocta(vec2(f32(k & 4095), f32(k >> 12)) / 4095.0 * 2.0 - vec2(1.0))
+}
+
+/// An albedo as one whole number a float holds exactly (its square roots, 8 bits each), and back.
+fn rooted(albedo: vec3) -> f32 {
+    let r = floor(sqrt(saturate(albedo)) * 255.0 + vec3(0.5))
+    r.x + r.y * 256.0 + r.z * 65536.0
+}
+
+fn unrooted(w: f32) -> vec3 {
+    let k = u32(w)
+    let r = vec3(f32(k & 255), f32((k >> 8) & 255), f32((k >> 16) & 255)) / 255.0
     r * r
 }
 
@@ -372,14 +439,15 @@ impl<S: Solid> Volume<S> {
         let w = u32(frame.eye.size.x)
         let h = u32(frame.eye.size.y)
         if rate > 1 {
-            let sw = (w + rate - 1) / rate
-            let sh = (h + rate - 1) / rate
+            let sw = (w + rate - 1) / rate + 1
+            let sh = (h + rate - 1) / rate + 1
             if self.scout.width() != sw || self.scout.height() != sh {
                 self.scout = texture(width: sw, height: sh)
             }
             if self.classes.width() != sw || self.classes.height() != sh {
                 self.classes = writable_texture(width: sw, height: sh)
                 self.edges = append_buffer(sw * sh)
+                self.smooth = append_buffer(sw * sh)
             }
             label("scouted")
             let p = begin_pass(mut self.scout, clear: vec4(0.0))
@@ -400,11 +468,20 @@ impl<S: Solid> Volume<S> {
             p.end()
             label("classed")
             self.edges.clear()
+            self.smooth.clear()
             dispatch(
-                classed.bind(eye: frame.eye, scout: self.scout, rate: f32(rate), out: mut self.classes, edges: mut self.edges),
+                classed.bind(
+                    eye: frame.eye,
+                    scout: self.scout,
+                    rate: f32(rate),
+                    out: mut self.classes,
+                    edges: mut self.edges,
+                    smooth: mut self.smooth,
+                ),
                 groups: ((sw + 7) / 8, (sh + 7) / 8, 1),
             )
             dispatch(edges_drawn.bind(count: self.edges.count(), most: sw * sh, out: mut self.draws), groups: 1)
+            dispatch(edges_drawn.bind(count: self.smooth.count(), most: sw * sh, out: mut self.smooth_draws), groups: 1)
         }
         label(if rate > 1 { "joined" } else { "marched" })
         let first = frame.first()
@@ -419,45 +496,68 @@ impl<S: Solid> Volume<S> {
             keep_depth: !first,
         )
         if rate > 1 {
-            draw(
-                q,
-                cover,
-                joined.bind(
-                    eye: frame.eye,
-                    light: frame.light,
-                    look: look,
-                    g: self.grid,
-                    coarse: self.coarse,
-                    atlas: self.atlas,
-                    albedo: self.albedo,
-                    s: self.s,
-                    body: body,
-                    scout: self.scout,
-                    classes: self.classes,
-                    rate: f32(rate),
-                ),
-                vertices: 3,
-                depth: NEARER,
-            )
-            draw(
-                q,
-                block_corner.bind(edges: self.edges.items(), size: frame.eye.size, rate: f32(rate)),
-                edged.bind(
-                    eye: frame.eye,
-                    light: frame.light,
-                    look: look,
-                    g: self.grid,
-                    coarse: self.coarse,
-                    atlas: self.atlas,
-                    albedo: self.albedo,
-                    s: self.s,
-                    body: body,
-                    scout: self.scout,
-                    rate: f32(rate),
-                ),
-                indirect: self.draws.span(start: 0, count: 1),
-                depth: NEARER,
-            )
+            if self.grid.quads == 1 && (self.grid.debug & 8192) != 0 {
+                // (The patches left out, to time the edge blocks alone.)
+            } else if self.grid.quads == 1 {
+                draw(
+                    q,
+                    patch_corner.bind(blocks: self.smooth.items(), eye: frame.eye, scout: self.scout, rate: f32(rate)),
+                    patched.bind(
+                        eye: frame.eye,
+                        light: frame.light,
+                        g: self.grid,
+                        coarse: self.coarse,
+                        atlas: self.atlas,
+                        albedo: self.albedo,
+                        s: self.s,
+                        body: body,
+                    ),
+                    indirect: self.smooth_draws.span(start: 0, count: 1),
+                    depth: NEARER,
+                )
+            } else {
+                draw(
+                    q,
+                    cover,
+                    joined.bind(
+                        eye: frame.eye,
+                        light: frame.light,
+                        look: look,
+                        g: self.grid,
+                        coarse: self.coarse,
+                        atlas: self.atlas,
+                        albedo: self.albedo,
+                        s: self.s,
+                        body: body,
+                        scout: self.scout,
+                        classes: self.classes,
+                        rate: f32(rate),
+                    ),
+                    vertices: 3,
+                    depth: NEARER,
+                )
+            }
+            if (self.grid.debug & 4096) == 0 {
+                draw(
+                    q,
+                    block_corner.bind(edges: self.edges.items(), size: frame.eye.size, rate: f32(rate)),
+                    edged.bind(
+                        eye: frame.eye,
+                        light: frame.light,
+                        look: look,
+                        g: self.grid,
+                        coarse: self.coarse,
+                        atlas: self.atlas,
+                        albedo: self.albedo,
+                        s: self.s,
+                        body: body,
+                        scout: self.scout,
+                        rate: f32(rate),
+                    ),
+                    indirect: self.draws.span(start: 0, count: 1),
+                    depth: NEARER,
+                )
+            }
         } else {
             draw(
                 q,
@@ -551,6 +651,8 @@ struct Walked: Copy {
     again: u32,
     /// The look's albedo stored where it was last read (`w` 1), or none yet (`w` 0).
     albedo: vec4,
+    /// How far along the ray was last within its `near` footprints of the surface (0: never).
+    last: f32,
 }
 
 /// A ray from `o` along `d` walked through the volume from `from` to `to` m along it: through a
@@ -581,6 +683,7 @@ fn walk(
     var met = false
     var v = vec4(0.0)
     var first_near = 0.0
+    var last_near = 0.0
     var steps: u32 = 0
     var empty: u32 = 0
     while steps < MOST_STEPS && steps < g.most && !met && t < to {
@@ -607,8 +710,11 @@ fn walk(
                 if v.x < touch * t {
                     met = true
                 } else {
-                    if first_near == 0.0 && v.x < close * t {
-                        first_near = t
+                    if v.x < close * t {
+                        if first_near == 0.0 {
+                            first_near = t
+                        }
+                        last_near = t
                     }
                     // To the surface's tangent plane where the stored facing is good (the
                     // distance over the cosine, at most four times it), else by the distance.
@@ -624,7 +730,7 @@ fn walk(
             }
         }
     }
-    Walked { met, t, v, near: first_near, steps, empty, again: 2, albedo: vec4(0.0) }
+    Walked { met, t, v, near: first_near, steps, empty, again: 2, albedo: vec4(0.0), last: last_near }
 }
 
 /// Nothing drawn at a pixel.
@@ -765,7 +871,9 @@ pub fn marched<L: Look>(
 }
 
 /// A texel of the scouting march, one each `rate` × `rate` pixels: how far along its ray it met
-/// the form (0: not), and how far along the ray first came within `rate` footprints of it.
+/// the form (not: under 0, less how far along it was last within two of its footprints of the
+/// form, or 0), its facing and albedo there, and how far along the ray first came within two of
+/// its footprints of the form (0: never), whether or not it went on to meet it.
 @fragment
 pub fn scouted(
     pixel: FragCoord,
@@ -777,21 +885,23 @@ pub fn scouted(
     s: Sampler,
     rate: f32,
 ) -> vec4 {
-    let d = eye.ray(pixel.position.xy * rate)
+    // (Scouts stand at the corners of blocks of `rate` × `rate` pixels: texel (i, j)'s ray is
+    // through the screen at (i, j) × `rate`.)
+    let d = eye.ray((pixel.position.xy - vec2(0.5)) * rate)
     let span = crossing(eye, g, d)
     if !(span.x < span.y) {
         return vec4(0.0)
     }
     let w = walk(g, coarse, atlas, s, eye.at, d, from: span.x, to: span.y, px: eye.pixel() * rate, near: 2.0)
     if !w.met {
-        return vec4(-w.near, 0.0, 0.0, 0.0)
+        return vec4(-w.last, 0.0, 0.0, w.near)
     }
     let n = normalize(w.v.yzw)
     let t = w.t + w.v.x / max(-dot(n, d), 0.25)
     let brick = g.cell * f32(B)
     let top = vec3(f32(g.size.x - 1), f32(g.size.y - 1), f32(g.size.z - 1))
     let (_, a) = cell_at(g, coarse, atlas, albedo, s, brick, top, eye.at + d * t)
-    vec4(t, bitcast_f32(packed(n, a.xyz)), 0.0, 0.0)
+    vec4(t, faced(n), rooted(a.xyz), w.near)
 }
 
 /// What a pixel reads from its four scouting rays: the nearest that any met the form or came near
@@ -806,25 +916,35 @@ struct Scouts: Copy {
     most: f32,
     way: vec3,
     albedo: vec3,
+    /// The farthest any of the four met the form or was last near it (m along its own ray; 0
+    /// where none did).
+    far: f32,
 }
 
-fn scouts_at(eye: Eye, scout: Texture<Rg32Float>, rate: f32, pixel: vec2, d: vec3) -> Scouts {
-    let c = pixel / rate - vec2(0.5)
+fn scouts_at(eye: Eye, scout: Texture<Rgba32Float>, rate: f32, pixel: vec2, d: vec3) -> Scouts {
+    let c = pixel / rate
     let top = vec2(f32(scout.width() - 1), f32(scout.height() - 1))
     let lo = clamp(floor(c), vec2(0.0), top)
     let hi = min(lo + vec2(1.0), top)
     let f = saturate(c - lo)
-    var out = Scouts { start: 1.0e30, met: 0, blend: 0.0, least: 1.0e30, most: 0.0, way: vec3(0.0), albedo: vec3(0.0) }
+    var out = Scouts { start: 1.0e30, met: 0, blend: 0.0, least: 1.0e30, most: 0.0, way: vec3(0.0), albedo: vec3(0.0), far: 0.0 }
     for k in 0..4 {
         let x = if k % 2 == 0 { lo.x } else { hi.x }
         let y = if k / 2 == 0 { lo.y } else { hi.y }
         let e = scout.load(u32(x), u32(y))
-        if e.x != 0.0 {
-            out.start = min(out.start, abs(e.x))
+        if e.x > 0.0 {
+            out.start = min(out.start, e.x)
+            out.far = max(out.far, e.x)
+        }
+        if e.w > 0.0 {
+            out.start = min(out.start, e.w)
+        }
+        if e.x < 0.0 {
+            out.far = max(out.far, -e.x)
         }
         if e.x > 0.0 {
-            let n = unpacked_way(bitcast_u32(e.y))
-            let at = eye.at + eye.ray(vec2(x + 0.5, y + 0.5) * rate) * e.x
+            let n = unfaced(e.y)
+            let at = eye.at + eye.ray(vec2(x, y) * rate) * e.x
             let facing = dot(n, d)
             if facing < -0.05 {
                 let tp = dot(n, at - eye.at) / facing
@@ -832,7 +952,7 @@ fn scouts_at(eye: Eye, scout: Texture<Rg32Float>, rate: f32, pixel: vec2, d: vec
                 let wy = if k / 2 == 0 { 1.0 - f.y } else { f.y }
                 out.blend += tp * wx * wy
                 out.way += n * (wx * wy)
-                out.albedo += unpacked_albedo(bitcast_u32(e.y)) * (wx * wy)
+                out.albedo += unrooted(e.z) * (wx * wy)
                 out.least = min(out.least, tp)
                 out.most = max(out.most, tp)
                 out.met += 1
@@ -852,8 +972,19 @@ const EDGE: u32 = 2
 
 /// Each block of the scouting march, classed, and an edge block listed (x | y << 16).
 @compute(8, 8)
-fn classed(eye: Eye, scout: Texture<Rg32Float>, rate: f32, out: mut Texels<R32Uint>, edges: mut Append<u32>, id: GlobalId) {
-    let mid = (vec2(f32(id.x), f32(id.y)) + vec2(1.0)) * rate
+fn classed(
+    eye: Eye,
+    scout: Texture<Rgba32Float>,
+    rate: f32,
+    out: mut Texels<R32Uint>,
+    edges: mut Append<u32>,
+    smooth: mut Append<u32>,
+    id: GlobalId,
+) {
+    if id.x + 1 >= scout.width() || id.y + 1 >= scout.height() {
+        return
+    }
+    let mid = (vec2(f32(id.x), f32(id.y)) + vec2(0.5)) * rate
     let d = eye.ray(mid)
     let k = scouts_at(eye, scout, rate, mid, d)
     var class = EMPTY
@@ -865,6 +996,9 @@ fn classed(eye: Eye, scout: Texture<Rg32Float>, rate: f32, out: mut Texels<R32Ui
     }
     if class == EDGE {
         let _ = edges.push(id.x | (id.y << 16))
+    }
+    if class == SMOOTH {
+        let _ = smooth.push(id.x | (id.y << 16))
     }
     out.store(id, class)
 }
@@ -886,10 +1020,81 @@ const QUAD: [u32; 6] = [0, 1, 2, 2, 1, 3]
 pub fn block_corner(v: VertexIndex, i: InstanceIndex, edges: [u32], size: vec2, rate: f32) -> BlockCorner {
     let b = edges[i.index]
     let j = QUAD[v.index % 6]
-    let x = f32(b & 65535) + 0.5 + f32(j & 1)
-    let y = f32(b >> 16) + 0.5 + f32((j >> 1) & 1)
+    let x = f32(b & 65535) + f32(j & 1)
+    let y = f32(b >> 16) + f32((j >> 1) & 1)
     let p = vec2(x, y) * rate
     BlockCorner { clip: ClipPosition { position: vec4(p.x / size.x * 2.0 - 1.0, 1.0 - p.y / size.y * 2.0, 0.0, 1.0) } }
+}
+
+/// A corner of a smooth block's quad, at one of its four scouts: where that scout met the form,
+/// its facing and albedo there, and its outline's field (`frame::outline`).
+pub struct Patch: Copy {
+    pub clip: ClipPosition,
+    pub world: vec3,
+    pub normal: vec3,
+    pub albedo: vec3,
+    pub field: f32,
+}
+
+@vertex
+pub fn patch_corner(v: VertexIndex, i: InstanceIndex, blocks: [u32], eye: Eye, scout: Texture<Rgba32Float>, rate: f32) -> Patch {
+    let b = blocks[i.index]
+    let j = QUAD[v.index % 6]
+    let x = (b & 65535) + (j & 1)
+    let y = (b >> 16) + ((j >> 1) & 1)
+    let e = scout.load(x, y)
+    let pixel = vec2(f32(x), f32(y)) * rate
+    let d = eye.ray(pixel)
+    let world = eye.at + d * e.x
+    let n = unfaced(e.y)
+    // On the screen exactly where the block's corner is (so quads and edge blocks share their
+    // sides to the bit), as deep as its point.
+    let z = dot(world - eye.at, eye.forward)
+    let on = vec2(pixel.x / eye.size.x * 2.0 - 1.0, 1.0 - pixel.y / eye.size.y * 2.0)
+    Patch {
+        clip: ClipPosition { position: vec4(on * z, eye.near, z) },
+        world,
+        normal: n,
+        albedo: unrooted(e.z),
+        field: fold_field(n, -d),
+    }
+}
+
+/// A pixel of a smooth block's quad: its place, facing and albedo laid across the quad from its
+/// scouts by the rasteriser (or, with `g.reads` 1, its facing and albedo read once from the
+/// volume at its place), lit, its outline from the field laid the same way.
+@fragment
+pub fn patched(
+    f: Patch,
+    eye: Eye,
+    light: Lighting,
+    g: Grid,
+    coarse: Texture3d<Rg32Uint>,
+    atlas: Texture3d<Rgba16Float>,
+    albedo: Texture3d<Rgba8>,
+    s: Sampler,
+    body: u32,
+) -> Targets3<vec4, vec4, u32> {
+    let way = way_to_outline(f.field, vec2(dpdx(f.field), dpdy(f.field)))
+    var n = normalize(f.normal)
+    var a = f.albedo
+    if g.reads == 1 {
+        let brick = g.cell * f32(B)
+        let cube = vec3(f32(g.size.x - 1), f32(g.size.y - 1), f32(g.size.z - 1))
+        let (rv, ra) = cell_at(g, coarse, atlas, albedo, s, brick, cube, f.world)
+        if rv.y != 0.0 || rv.z != 0.0 || rv.w != 0.0 {
+            n = normalize(rv.yzw)
+            a = ra.xyz
+        }
+    }
+    let toward = normalize(eye.at - f.world)
+    let skin = Skin { albedo: a, line: 1.0, metal: 0.0, rim: false, emits: vec3(0.0) }
+    let lit = worn(light, skin, f.world, n, toward, STILL, reach: sun_reach(light, f.world))
+    Targets3 {
+        first: vec4(lit.colour, 0.0),
+        second: edge_record(way, 1.0, NO_LINE),
+        third: identity(SOLID, body: body, group: 0),
+    }
 }
 
 /// A pixel of a smooth block, joined from its four scouts: where their tangent planes put it,
@@ -907,11 +1112,11 @@ pub fn joined<L: Look>(
     albedo: Texture3d<Rgba8>,
     s: Sampler,
     body: u32,
-    scout: Texture<Rg32Float>,
+    scout: Texture<Rgba32Float>,
     classes: Texture<R32Uint>,
     rate: f32,
 ) -> WithDepth<Targets3<vec4, vec4, u32>> {
-    let c = pixel.position.xy / rate - vec2(0.5)
+    let c = pixel.position.xy / rate
     let top = vec2(f32(scout.width() - 1), f32(scout.height() - 1))
     let lo = clamp(floor(c), vec2(0.0), top)
     if classes.load(u32(lo.x), u32(lo.y)) != SMOOTH {
@@ -934,12 +1139,119 @@ pub fn joined<L: Look>(
         }
     }
     let n = normalize(v.yzw)
-    let w = Walked { met: true, t: k.blend + v.x / max(-dot(n, d), 0.25), v: v, near: 0.0, steps: 1, empty: 0, again: 0, albedo: a }
+    let w = Walked { met: true, t: k.blend + v.x / max(-dot(n, d), 0.25), v: v, near: 0.0, steps: 1, empty: 0, again: 0, albedo: a, last: 0.0 }
     shown(pixel.position.xy, eye, light, look, g, coarse, atlas, albedo, s, body, eye.at, d, w)
 }
 
-/// A pixel of an edge block: walked at its own footprint from the nearest of what its four
-/// scouting rays met or came near, less a margin.
+/// What solving a ray against one sheet of the form found: `MET` it meets it (at `t` m along
+/// it, the stored field there `v`); `CLEAR` it passes it without meeting it; `UNSURE` the volume
+/// holds nothing where the solve looked, or it didn't settle.
+const MET: u32 = 1
+const CLEAR: u32 = 2
+const UNSURE: u32 = 0
+
+struct Solved: Copy {
+    state: u32,
+    t: f32,
+    v: vec4,
+    /// Why it is unsure: 1 nothing stored where it began, 2 nothing stored where a round went,
+    /// 3 it didn't settle.
+    why: u32,
+}
+
+/// The first place a quadratic of value `f`, slope `g` and bend `bend` reaches 0 (how far on;
+/// `x`), or where it comes nearest 0 if it never does (`y` 1). Where it hardly bends: by its
+/// slope, or by its value where it isn't falling.
+fn rooted_at(f: f32, g: f32, bend: f32) -> vec2 {
+    if bend > 1.0e-4 {
+        let disc = g * g - 2.0 * bend * f
+        if disc < 0.0 {
+            return vec2(-g / bend, 1.0)
+        }
+        return vec2((-g - sqrt(disc)) / bend, 0.0)
+    }
+    vec2(if g < -0.05 { -f / g } else { f }, 0.0)
+}
+
+/// A ray from `o` along `d` against the sheet of the form near `t0` m along it, in at most five
+/// reads of the volume and no walk. Along the ray the stored distance is taken as a quadratic
+/// about where it was last read: its value there, its slope (the stored facing along the ray)
+/// and its bend (how the slope changed since the read before; at first, a cell on). Each round
+/// goes to the quadratic's first root, or to where it comes nearest 0 if it has none, and reads
+/// there. Settled within a share of the pixel's footprint: met. At a nearest point (the slope
+/// about 0) still clear of the sheet: the ray clears it (a ray past an outline, the case a walk
+/// skims for a long way).
+fn solved(
+    g: Grid,
+    coarse: Texture3d<Rg32Uint>,
+    atlas: Texture3d<Rgba16Float>,
+    s: Sampler,
+    brick: f32,
+    top: vec3,
+    o: vec3,
+    d: vec3,
+    t0: f32,
+    px: f32,
+) -> Solved {
+    // From `t0`, on through bricks that hold nothing (a few: the sheet its scouts found is near)
+    // to the first that holds some of it; none, and the ray clears the sheet.
+    var t = t0
+    var held = false
+    for _b in 0..PROBED {
+        if !held {
+            let p = o + d * t
+            let c = clamp(floor((p - g.lo) / brick), vec3(0.0), top)
+            if coarse.load(u32(c.x), u32(c.y), u32(c.z)).x != NO_BRICK {
+                held = true
+            } else {
+                let lo = g.lo + c * brick
+                let ex = if d.x > 0.0 { (lo.x + brick - p.x) / d.x } else if d.x < 0.0 { (lo.x - p.x) / d.x } else { 1.0e30 }
+                let ey = if d.y > 0.0 { (lo.y + brick - p.y) / d.y } else if d.y < 0.0 { (lo.y - p.y) / d.y } else { 1.0e30 }
+                let ez = if d.z > 0.0 { (lo.z + brick - p.z) / d.z } else if d.z < 0.0 { (lo.z - p.z) / d.z } else { 1.0e30 }
+                t += min(ex, min(ey, ez)) + 0.02 * brick
+            }
+        }
+    }
+    if !held {
+        return Solved { state: CLEAR, t, v: vec4(0.0), why: 0 }
+    }
+    var v = field_at(g, coarse, atlas, s, brick, top, o + d * t)
+    let ahead = field_at(g, coarse, atlas, s, brick, top, o + d * (t + g.cell))
+    if (v.y == 0.0 && v.z == 0.0 && v.w == 0.0) || (ahead.y == 0.0 && ahead.z == 0.0 && ahead.w == 0.0) {
+        return Solved { state: UNSURE, t: 0.0, v: vec4(0.0), why: 1 }
+    }
+    var slope = dot(v.yzw, d)
+    var bend = (dot(ahead.yzw, d) - slope) / g.cell
+    for _round in 0..ROUNDS {
+        let r = rooted_at(v.x, slope, bend)
+        let on = t + clamp(r.x, -brick, brick)
+        let w = field_at(g, coarse, atlas, s, brick, top, o + d * on)
+        if w.y == 0.0 && w.z == 0.0 && w.w == 0.0 {
+            return Solved { state: UNSURE, t: 0.0, v: vec4(0.0), why: 2 }
+        }
+        let slope_on = dot(w.yzw, d)
+        if abs(on - t) > 1.0e-5 {
+            bend = (slope_on - slope) / (on - t)
+        }
+        if abs(w.x) < SETTLED * px * on {
+            // The last of the way by the quadratic there (to its nearest point where it only
+            // touches).
+            let last = rooted_at(w.x, slope_on, bend)
+            return Solved { state: MET, t: on + clamp(last.x, -g.cell, g.cell), v: w, why: 0 }
+        }
+        if r.y > 0.5 && w.x > 0.0 && abs(slope_on) < 0.1 {
+            return Solved { state: CLEAR, t: on, v: w, why: 0 }
+        }
+        t = on
+        v = w
+        slope = slope_on
+    }
+    Solved { state: UNSURE, t: 0.0, v: vec4(0.0), why: 3 }
+}
+
+/// A pixel of an edge block, solved: its ray against the sheet of the form its scouts found
+/// nearest (`solved`), then, where it clears that one, against the farthest; walked only where a
+/// solve can't say (`g.solves` 0: always walked, from the nearest less a margin).
 @fragment
 pub fn edged<L: Look>(
     corner: BlockCorner,
@@ -953,7 +1265,7 @@ pub fn edged<L: Look>(
     albedo: Texture3d<Rgba8>,
     s: Sampler,
     body: u32,
-    scout: Texture<Rg32Float>,
+    scout: Texture<Rgba32Float>,
     rate: f32,
 ) -> WithDepth<Targets3<vec4, vec4, u32>> {
     let d = eye.ray(pixel.position.xy)
@@ -969,8 +1281,42 @@ pub fn edged<L: Look>(
     }
     let span = crossing(eye, g, d)
     let px = eye.pixel()
-    let from = max(k.start - MARGIN * rate * px * k.start, span.x)
-    let w = walk(g, coarse, atlas, s, eye.at, d, from: from, to: span.y, px: px, near: 0.0)
+    var w = Walked { met: false, t: 0.0, v: vec4(0.0), near: 0.0, steps: 0, empty: 0, again: 0, albedo: vec4(0.0), last: 0.0 }
+    var walked = g.solves == 0
+    var why: u32 = 0
+    if g.solves == 1 {
+        let brick = g.cell * f32(B)
+        let top = vec3(f32(g.size.x - 1), f32(g.size.y - 1), f32(g.size.z - 1))
+        let first = solved(g, coarse, atlas, s, brick, top, eye.at, d, t0: k.start, px: px)
+        if first.state == MET {
+            w = Walked { met: true, t: first.t, v: first.v, near: 0.0, steps: 4, empty: 0, again: 0, albedo: vec4(0.0), last: 0.0 }
+        } else if first.state == UNSURE {
+            walked = true
+            why = first.why
+        } else if k.far > k.start + 2.0 * rate * px * k.start {
+            // It clears the nearest sheet: the farthest its scouts met.
+            let second = solved(g, coarse, atlas, s, brick, top, eye.at, d, t0: k.far, px: px)
+            if second.state == MET {
+                w = Walked { met: true, t: second.t, v: second.v, near: 0.0, steps: 8, empty: 0, again: 0, albedo: vec4(0.0), last: 0.0 }
+            } else if second.state == UNSURE {
+                walked = true
+                why = second.why + 3
+            }
+        }
+    }
+    if (g.debug & 32768) != 0 {
+        // Which way each pixel went: red walked, green solved and met, blue solved and clear.
+        let c = if walked { vec4(1.0, 0.0, 0.0, f32(why)) } else if w.met { vec4(0.0, 1.0, 0.0, 0.0) } else { vec4(0.0, 0.0, 1.0, 0.0) }
+        return WithDepth {
+            color: Targets3 { first: c, second: edge_record(NO_EDGE, 1.0, NO_LINE), third: identity(SOLID, body: body, group: 0) },
+            depth: 0.9,
+        }
+    }
+    if walked && (g.debug & 16384) == 0 {
+        let from = max(k.start - MARGIN * rate * px * k.start, span.x)
+        let to = if g.solves == 1 { min(span.y, max(k.far, k.start) + PAST * g.cell * f32(B)) } else { span.y }
+        w = walk(g, coarse, atlas, s, eye.at, d, from: from, to: to, px: px, near: 0.0)
+    }
     if !w.met {
         return nothing()
     }
