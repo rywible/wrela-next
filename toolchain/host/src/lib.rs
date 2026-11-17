@@ -415,6 +415,15 @@ fn read_build(
     } else {
         Vec::new()
     };
+    // The e-graph spike's hoisted uniform work, beside a shader that has it.
+    for (p, shader) in manifest.pipelines.iter().zip(&shaders) {
+        let path = dir.join(wrela_abi::hoist::file_for(&p.shader));
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            let tape = wrela_abi::hoist::parse(&text)
+                .map_err(|e| Error::Program(format!("{}: {e}", path.display())))?;
+            wrela_abi::hoist::register(shader, tape);
+        }
+    }
     Ok((manifest, wasm, shaders))
 }
 

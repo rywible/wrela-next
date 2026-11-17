@@ -178,6 +178,7 @@ fn emit_in(
         manifest.wasm_relaxed_abi = Some(abi);
     }
     let egg_options = wrela_egraph::Options::from_env();
+    let mut hoist_files: Vec<(String, Vec<u8>)> = Vec::new();
     let egg_only: Option<Vec<usize>> = std::env::var("WRELA_EGG_ONLY")
         .ok()
         .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect());
@@ -284,6 +285,17 @@ fn emit_in(
                     p.name,
                     stats.summary()
                 );
+                if let Some(tape) = &stats.tape {
+                    hoist_files.push((
+                        wrela_abi::hoist::file_for(&format!("pipeline_{i}.{}", wrela_shader::extension(target))),
+                        wrela_abi::hoist::write(tape).into_bytes(),
+                    ));
+                }
+                for (name, total, interp, uniform) in wrela_egraph::fragment_rates(&m) {
+                    eprintln!(
+                        "egg: pipeline {i} {name}: static work {total:.0}, from varyings alone {interp:.0}, uniform {uniform:.0}"
+                    );
+                }
                 m
             });
         let module = rewritten.as_ref().unwrap_or(&p.module);
@@ -373,6 +385,7 @@ fn emit_in(
     if let Err(e) = manifest.validate() {
         diagnostics.push(Diagnostic::internal(e.to_string()));
     }
+    files.extend(hoist_files);
     files.push(("manifest.json".to_string(), manifest.to_json().into_bytes()));
     BuildOutput { files, diagnostics, lines: code_lines }
 }

@@ -394,6 +394,8 @@ pub(crate) struct Pipeline {
     layout: wgpu::BindGroupLayout,
     /// The uniform block's binding and size, if it has one.
     uniform: Option<(u32, u32)>,
+    /// Its hoisted uniform work (the e-graph spike), which extends each command's uniforms.
+    hoist: Option<std::sync::Arc<wrela_abi::hoist::Tape>>,
     bindings: Vec<ResourceBinding>,
     /// A debug build's: where its bounds checks' flag is bound.
     debug_flag: Option<u32>,
@@ -1262,6 +1264,7 @@ impl Builder {
     fn build(&self, p: &wrela_abi::manifest::Pipeline, source: &[u8]) -> Result<Pipeline> {
         self.built.fetch_add(1, Ordering::Relaxed);
         let began = std::time::Instant::now();
+        let hoist = wrela_abi::hoist::lookup(source);
         let shader_err = |message: String| Error::Shader {
             pipeline: p.name.clone(),
             shader: p.shader.clone(),
@@ -1380,7 +1383,11 @@ impl Builder {
             name: p.name.clone(),
             kind,
             layout,
-            uniform: p.uniform.as_ref().map(|u| (u.binding, u.size)),
+            uniform: p
+                .uniform
+                .as_ref()
+                .map(|u| (u.binding, hoist.as_ref().map_or(u.size, |t| t.size))),
+            hoist,
             bindings: p.bindings.clone(),
             debug_flag: p.debug_flag,
             sizes: p.sizes.clone(),
@@ -2164,6 +2171,14 @@ impl Gpu {
         // Weighed before anything is recorded: a dispatch that could hold the GPU too long never
         // reaches it (`crate::step`).
         self.weigh(pipeline, groups)?;
+        let extended;
+        let uniforms = match &self.pipelines[pipeline as usize].hoist {
+            Some(t) => {
+                extended = t.run(uniforms);
+                &extended[..]
+            }
+            None => uniforms,
+        };
         // Everything that can flush happens before anything is recorded for this dispatch.
         self.reserve_uniforms(Opcode::Dispatch, self.aligned(uniforms.len()))?;
         self.reserve_timestamps()?;
@@ -2281,8 +2296,11 @@ impl Gpu {
             };
             eprintln!("step frame {} draw {label} | {} | vertices {n}", self.frame, p.name);
         }
-        let draw =
-            PendingDraw { pipeline, how, bindings: bindings.to_vec(), uniforms: uniforms.to_vec() };
+        let uniforms = match &self.pipelines[pipeline as usize].hoist {
+            Some(t) => t.run(uniforms),
+            None => uniforms.to_vec(),
+        };
+        let draw = PendingDraw { pipeline, how, bindings: bindings.to_vec(), uniforms };
         self.pass_item(PassItem::Draw(draw));
     }
 

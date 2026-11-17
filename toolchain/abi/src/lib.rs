@@ -50,6 +50,7 @@
 
 pub mod check;
 pub mod hash;
+pub mod hoist;
 pub mod input;
 pub mod lines;
 pub mod manifest;
