@@ -82,6 +82,7 @@ enum Keep {
     Pipeline(Arc<RawPipeline>),
     Held(Held),
     Queries(Arc<RawQueries>),
+    Image(Arc<RawImage>),
 }
 
 enum Pending {
@@ -1582,6 +1583,7 @@ pub struct BindGroupLayout(Arc<Layout>);
 #[allow(dead_code)]
 enum Held {
     Buffer(Arc<RawBuffer>),
+    Image(Arc<RawImage>),
     View(Arc<RawView>),
     Sampler(Arc<RawSampler>),
 }
@@ -1771,8 +1773,10 @@ impl CommandEncoder {
                     d.cmd_copy_buffer_to_image(cb, staging.buffer, dst.image, to, &region);
                     transition(d, cb, dst.image, part, to, dst.home);
                     keep.push(Keep::Buffer(staging.clone()));
+                    keep.push(Keep::Image(dst.clone()));
                 }
                 Pending::Clear { dst } => {
+                    keep.push(Keep::Image(dst.clone()));
                     // From nothing to a copy's target, zeroed, then home.
                     let range = dst.all();
                     let to = vk::ImageLayout::TRANSFER_DST_OPTIMAL;
@@ -1889,6 +1893,7 @@ impl CommandEncoder {
         };
         transition(self.d(), self.raw, image.image, part, to, image.home);
         self.held.push(Held::Buffer(src.buffer.raw.clone()));
+        self.held.push(Held::Image(image.clone()));
     }
 
     pub fn copy_texture_to_buffer(
@@ -1922,6 +1927,7 @@ impl CommandEncoder {
         };
         transition(self.d(), self.raw, image.image, part, from, image.home);
         self.held.push(Held::Buffer(dst.buffer.raw.clone()));
+        self.held.push(Held::Image(image.clone()));
     }
 
     pub fn copy_texture_to_texture(
@@ -1989,6 +1995,9 @@ impl CommandEncoder {
         unsafe { d.cmd_copy_image(cb, a.image, from, b.image, to, &region) };
         transition(d, cb, a.image, pa, from, a.home);
         transition(d, cb, b.image, pb, to, b.home);
+        let (a, b) = (a.clone(), b.clone());
+        self.held.push(Held::Image(a));
+        self.held.push(Held::Image(b));
     }
 
     /// Timestamps `first..first + count` as 64-bit ticks into `dst` at `offset`.
