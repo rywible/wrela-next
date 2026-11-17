@@ -1634,19 +1634,26 @@ impl Gpu {
         p.surface.configure(&device, &p.config).map_err(|e| Error::Gpu(e.0))
     }
 
-    /// Draws the screen into the window's next frame and shows it.
-    pub(crate) fn present(&mut self) -> Result<()> {
+    /// The frames the window showed since the last take: each one's id ([`Gpu::present`]) and
+    /// when it reached the display.
+    pub(crate) fn take_presented(&mut self) -> Vec<(u64, std::time::Instant)> {
+        self.presenter.as_mut().map(|p| p.surface.take_presented()).unwrap_or_default()
+    }
+
+    /// Draws the screen into the window's next frame and shows it: the frame's id (`None` when
+    /// the window changed and the frame was skipped).
+    pub(crate) fn present(&mut self) -> Result<Option<u64>> {
         self.flush()?;
         let device = self.device.clone();
         let (Some(p), Some(screen)) = (&mut self.presenter, &self.screen) else {
-            return Ok(());
+            return Ok(None);
         };
         let gpu_err = |e: wrela_gpu::Error| Error::Gpu(e.0);
         let frame = match p.surface.acquire() {
             Ok(f) => f,
             // The window changed under it: configured again, the frame is skipped.
             Err(_) => {
-                return p.surface.configure(&device, &p.config).map_err(gpu_err);
+                return p.surface.configure(&device, &p.config).map(|()| None).map_err(gpu_err);
             }
         };
         if self.program_limits.screen & 1 != 0 {
@@ -1654,7 +1661,7 @@ impl Gpu {
         }
         let cb = draw_presented(&device, &p.pipeline, &p.layout, &screen.view, &frame.view);
         device.submit_frame(vec![cb], &frame);
-        p.surface.present(frame).map_err(gpu_err)
+        p.surface.present(frame).map(Some).map_err(gpu_err)
     }
 
     /// A frame begins: no label carries over from the last one.

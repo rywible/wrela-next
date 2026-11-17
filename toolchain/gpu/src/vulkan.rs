@@ -32,6 +32,8 @@ struct Shared {
     entry: ash::Entry,
     /// Whether it can present to a window (the surface and swapchain extensions are on).
     swapchain: bool,
+    /// Whether a present can carry an id and be waited for (`VK_KHR_present_id`, `_wait`).
+    present_wait: bool,
     instance: ash::Instance,
     debug: Option<(ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)>,
     physical: vk::PhysicalDevice,
@@ -372,26 +374,36 @@ impl Device {
                 .independent_blend(base.independent_blend == vk::TRUE)
                 .depth_clamp(base.depth_clamp == vk::TRUE)
                 .depth_bias_clamp(base.depth_bias_clamp == vk::TRUE);
-            let device_has = instance
-                .enumerate_device_extension_properties(physical)
-                .unwrap_or_default()
-                .iter()
-                .any(|e| e.extension_name_as_c_str() == Ok(ash::khr::swapchain::NAME));
-            let swapchain = windowed && device_has;
-            let device_extensions: Vec<*const i8> =
+            let device_exts =
+                instance.enumerate_device_extension_properties(physical).unwrap_or_default();
+            let device_has =
+                |n: &CStr| device_exts.iter().any(|e| e.extension_name_as_c_str() == Ok(n));
+            let swapchain = windowed && device_has(ash::khr::swapchain::NAME);
+            // When a frame reached the display: a present's id, and a wait for it.
+            let present_wait = swapchain
+                && device_has(ash::khr::present_id::NAME)
+                && device_has(ash::khr::present_wait::NAME);
+            let mut device_extensions: Vec<*const i8> =
                 if swapchain { vec![ash::khr::swapchain::NAME.as_ptr()] } else { Vec::new() };
+            if present_wait {
+                device_extensions.push(ash::khr::present_id::NAME.as_ptr());
+                device_extensions.push(ash::khr::present_wait::NAME.as_ptr());
+            }
+            let mut on_id = vk::PhysicalDevicePresentIdFeaturesKHR::default().present_id(true);
+            let mut on_wait =
+                vk::PhysicalDevicePresentWaitFeaturesKHR::default().present_wait(true);
+            let mut info = vk::DeviceCreateInfo::default()
+                .queue_create_infos(&queues)
+                .enabled_extension_names(&device_extensions)
+                .enabled_features(&on)
+                .push_next(&mut on11)
+                .push_next(&mut on12)
+                .push_next(&mut on13);
+            if present_wait {
+                info = info.push_next(&mut on_id).push_next(&mut on_wait);
+            }
             let raw = instance
-                .create_device(
-                    physical,
-                    &vk::DeviceCreateInfo::default()
-                        .queue_create_infos(&queues)
-                        .enabled_extension_names(&device_extensions)
-                        .enabled_features(&on)
-                        .push_next(&mut on11)
-                        .push_next(&mut on12)
-                        .push_next(&mut on13),
-                    None,
-                )
+                .create_device(physical, &info, None)
                 .map_err(|e| Error(format!("Vulkan made no device: {e}")))?;
             let queue = raw.get_device_queue(queue_family, 0);
             let mut timeline_type = vk::SemaphoreTypeCreateInfo::default()
@@ -454,6 +466,7 @@ impl Device {
             Ok(Device(Arc::new(Shared {
                 entry,
                 swapchain,
+                present_wait,
                 instance,
                 debug,
                 physical,
@@ -2663,8 +2676,69 @@ pub struct Surface {
     done: (bool, bool),
     /// The last configuration, which a change of space configures again.
     config: Option<SurfaceConfig>,
+    /// When each frame presented reached the display, by its id, until taken; the next id; and
+    /// the thread that waits for each present (where the device has `present_wait`).
+    presented: Arc<Mutex<Vec<(u64, std::time::Instant)>>>,
+    next_id: u64,
+    waiter: Option<Waiter>,
     /// The window, alive while its surface is.
     _window: Arc<dyn Window>,
+}
+
+/// What a surface's waiter thread is asked: to wait for a present (by its swapchain and id), or
+/// to say it has waited for every one asked before.
+enum Wait {
+    Present(vk::SwapchainKHR, u64),
+    Drained(std::sync::mpsc::Sender<()>),
+}
+
+/// The thread that waits for each present to reach the display and notes when.
+struct Waiter {
+    asks: std::sync::mpsc::Sender<Wait>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Waiter {
+    fn new(device: &Device, presented: Arc<Mutex<Vec<(u64, std::time::Instant)>>>) -> Waiter {
+        let fns = ash::khr::present_wait::Device::new(&device.0.instance, &device.0.raw);
+        let (asks, waits) = std::sync::mpsc::channel::<Wait>();
+        let thread = std::thread::spawn(move || {
+            for w in waits {
+                match w {
+                    Wait::Present(chain, id) => {
+                        // SAFETY: the swapchain lives until this thread says it's drained.
+                        let r = unsafe { fns.wait_for_present(chain, id + 1, 1_000_000_000) };
+                        if r.is_ok() {
+                            lock(&presented).push((id, std::time::Instant::now()));
+                        }
+                    }
+                    Wait::Drained(done) => {
+                        let _ = done.send(());
+                    }
+                }
+            }
+        });
+        Waiter { asks, thread: Some(thread) }
+    }
+
+    /// Returns once every wait asked before is done.
+    fn drain(&self) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        if self.asks.send(Wait::Drained(tx)).is_ok() {
+            let _ = rx.recv();
+        }
+    }
+}
+
+impl Drop for Waiter {
+    fn drop(&mut self) {
+        let (tx, _) = std::sync::mpsc::channel();
+        // Closing the channel ends the thread.
+        self.asks = tx;
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
 }
 
 /// A frame of a surface to draw into, then [`Surface::present`].
@@ -2725,6 +2799,9 @@ impl Device {
             asked: (false, false),
             done: (false, false),
             config: None,
+            presented: Arc::new(Mutex::new(Vec::new())),
+            next_id: 0,
+            waiter: None,
             _window: window,
         })
     }
@@ -2849,6 +2926,9 @@ impl Surface {
                 )
                 .map_err(|e| Error(format!("Vulkan made no swapchain: {e}")))?;
             self.release();
+            if let Some(w) = &self.waiter {
+                w.drain();
+            }
             if old != vk::SwapchainKHR::null() {
                 self.swapchain_fns.destroy_swapchain(old, None);
             }
@@ -2955,25 +3035,48 @@ impl Surface {
         })
     }
 
-    /// Shows `frame` once the submission for it ([`Device::submit_frame`]) is done.
-    pub fn present(&mut self, frame: SurfaceTexture) -> Result<()> {
+    /// Shows `frame` once the submission for it ([`Device::submit_frame`]) is done: its id,
+    /// which [`Surface::take_presented`] gives with the time it reached the display (where the
+    /// device can say: `present_wait`).
+    pub fn present(&mut self, frame: SurfaceTexture) -> Result<u64> {
         self.acquired[frame.slot].1 = self.device.submitted();
+        let id = self.next_id;
+        self.next_id += 1;
         let waits = [frame.rendered];
         let chains = [self.swapchain];
         let indices = [frame.index];
-        let info = vk::PresentInfoKHR::default()
+        // Present ids count from 1, and only up.
+        let ids = [id + 1];
+        let mut present_id = vk::PresentIdKHR::default().present_ids(&ids);
+        let mut info = vk::PresentInfoKHR::default()
             .wait_semaphores(&waits)
             .swapchains(&chains)
             .image_indices(&indices);
+        if self.device.0.present_wait {
+            info = info.push_next(&mut present_id);
+        }
         // SAFETY: the image was acquired and its rendering submitted, signalling `rendered`.
         unsafe { self.swapchain_fns.queue_present(self.device.0.queue, &info) }
-            .map(|_| ())
-            .map_err(|e| Error(format!("the swapchain: {e}")))
+            .map_err(|e| Error(format!("the swapchain: {e}")))?;
+        if self.device.0.present_wait {
+            let presented = self.presented.clone();
+            let w = self.waiter.get_or_insert_with(|| Waiter::new(&self.device, presented));
+            let _ = w.asks.send(Wait::Present(self.swapchain, id));
+        }
+        Ok(id)
+    }
+
+    /// The frames shown since the last take: each id and when it reached the display.
+    pub fn take_presented(&mut self) -> Vec<(u64, std::time::Instant)> {
+        std::mem::take(&mut *lock(&self.presented))
     }
 }
 
 impl Drop for Surface {
     fn drop(&mut self) {
+        if let Some(w) = self.waiter.take() {
+            w.drain();
+        }
         self.release();
         // SAFETY: the device is idle; the swapchain and then its surface go.
         unsafe {

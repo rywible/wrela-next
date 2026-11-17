@@ -20,6 +20,9 @@ pub struct WindowRun {
     pub fps: f64,
     pub size: (u32, u32),
     pub present: wrela_gpu::PresentMode,
+    /// The most frames sampled and not yet shown: a frame waits for the one this many before it
+    /// to reach the display before it takes its input (the latency it adds, a frame each).
+    pub in_flight: u32,
 }
 
 struct App<'a> {
@@ -29,6 +32,32 @@ struct App<'a> {
     size: (u32, u32),
     frame: u32,
     failed: Option<Error>,
+    /// When each frame shown sampled its input (just before it ran) and was presented, by its
+    /// present's id.
+    sampled: std::collections::HashMap<u64, (std::time::Instant, std::time::Instant)>,
+    /// Each shown frame's latency, input sampled to photons, and of it input to presented (the
+    /// frame run, recorded and submitted): milliseconds.
+    latencies: Vec<f64>,
+    before_present: Vec<f64>,
+    /// When each was shown.
+    shown: Vec<std::time::Instant>,
+}
+
+impl App<'_> {
+    /// The latencies of the frames shown since the last look.
+    fn note_shown(&mut self) {
+        for (id, at) in self.host.take_presented() {
+            // Frames are shown in order: one before this not shown yet was replaced, and never
+            // will be (Metal drops a frame a newer one overtakes before its refresh).
+            self.sampled.retain(|&k, _| k >= id);
+            if let Some((sampled, presented)) = self.sampled.remove(&id) {
+                self.latencies.push(at.saturating_duration_since(sampled).as_secs_f64() * 1e3);
+                self.before_present
+                    .push(presented.saturating_duration_since(sampled).as_secs_f64() * 1e3);
+                self.shown.push(at);
+            }
+        }
+    }
 }
 
 impl App<'_> {
@@ -75,13 +104,28 @@ impl ApplicationHandler for App<'_> {
             }
             WindowEvent::RedrawRequested => {
                 let (w, h) = self.size;
+                // No more than `in_flight` frames between their input and their photons.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+                while self.sampled.len() >= self.run.in_flight.max(1) as usize
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::sleep(std::time::Duration::from_micros(250));
+                    self.note_shown();
+                }
+                // The frame's input is what's come by now: its latency runs from here.
+                let sampled = std::time::Instant::now();
                 let drawn = self
                     .host
                     .lockstep_frame(self.frame, self.run.fps, w, h, &[])
                     .and_then(|()| self.host.present());
-                if let Err(e) = drawn {
-                    return self.fail(e, el);
+                match drawn {
+                    Ok(Some(id)) => {
+                        self.sampled.insert(id, (sampled, std::time::Instant::now()));
+                    }
+                    Ok(None) => {}
+                    Err(e) => return self.fail(e, el),
                 }
+                self.note_shown();
                 self.frame += 1;
                 if self.run.frames.is_some_and(|n| self.frame >= n) {
                     el.exit();
@@ -94,14 +138,84 @@ impl ApplicationHandler for App<'_> {
     }
 }
 
-/// Runs `host`'s frames in a window as `run` says; the frames run.
-pub fn run(host: &mut Host, run: &WindowRun) -> Result<u32> {
+/// What a window run did: the frames it ran, and each shown frame's latency (ms, input
+/// sampled to photons: when the frame took its input, just before it ran, to when the display
+/// showed it, as Metal's `presentedTime` or Vulkan's `present_wait` says), in the order shown.
+pub struct WindowRan {
+    pub frames: u32,
+    pub latencies: Vec<f64>,
+    /// Of each, input sampled to presented: the frame run, recorded and submitted (ms).
+    pub before_present: Vec<f64>,
+    /// When each was shown.
+    pub shown: Vec<std::time::Instant>,
+}
+
+impl WindowRan {
+    /// The first frame shown's latency (ms): it waits for the program's pipelines to be built.
+    pub fn first(&self) -> Option<f64> {
+        self.latencies.first().copied()
+    }
+
+    /// The latencies' median, 90th percentile and worst (ms) after the first, or `None` with
+    /// none.
+    pub fn latency(&self) -> Option<(f64, f64, f64)> {
+        stats(self.latencies.get(1..)?)
+    }
+
+    /// The same of input sampled to presented.
+    pub fn before_present(&self) -> Option<(f64, f64, f64)> {
+        stats(self.before_present.get(1..)?)
+    }
+
+    /// Frames shown a second after the first.
+    pub fn rate(&self) -> Option<f64> {
+        let (first, last) = (self.shown.get(1)?, self.shown.last()?);
+        let span = last.saturating_duration_since(*first).as_secs_f64();
+        (span > 0.0).then(|| (self.shown.len() - 2) as f64 / span)
+    }
+}
+
+/// Median, 90th percentile and worst.
+fn stats(l: &[f64]) -> Option<(f64, f64, f64)> {
+    let mut l = l.to_vec();
+    if l.is_empty() {
+        return None;
+    }
+    l.sort_by(f64::total_cmp);
+    let at = |q: f64| l[((l.len() - 1) as f64 * q).round() as usize];
+    Some((at(0.5), at(0.9), l[l.len() - 1]))
+}
+
+/// Runs `host`'s frames in a window as `run` says.
+pub fn run(host: &mut Host, run: &WindowRun) -> Result<WindowRan> {
     let event_loop = EventLoop::new().map_err(|e| Error::Gpu(format!("no event loop: {e}")))?;
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = App { host, run, window: None, size: run.size, frame: 0, failed: None };
+    let mut app = App {
+        host,
+        run,
+        window: None,
+        size: run.size,
+        frame: 0,
+        failed: None,
+        sampled: std::collections::HashMap::new(),
+        latencies: Vec::new(),
+        before_present: Vec::new(),
+        shown: Vec::new(),
+    };
     event_loop.run_app(&mut app).map_err(|e| Error::Gpu(format!("the window: {e}")))?;
-    match app.failed {
-        Some(e) => Err(e),
-        None => Ok(app.frame),
+    if let Some(e) = app.failed {
+        return Err(e);
     }
+    // The last frames' photons come after the loop: what's shown within a moment counts.
+    let until = std::time::Instant::now() + std::time::Duration::from_millis(250);
+    while !app.sampled.is_empty() && std::time::Instant::now() < until {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        app.note_shown();
+    }
+    Ok(WindowRan {
+        frames: app.frame,
+        latencies: app.latencies,
+        before_present: app.before_present,
+        shown: app.shown,
+    })
 }

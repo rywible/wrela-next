@@ -1059,9 +1059,17 @@ impl Host {
         self.p().executor().resize_window(width, height)
     }
 
-    /// Draws the screen into the window's next frame and shows it.
-    pub fn present(&mut self) -> Result<()> {
+    /// Draws the screen into the window's next frame and shows it: the frame's id, which
+    /// [`Host::take_presented`] gives back with when it reached the display (`None`: the window
+    /// changed, and the frame was skipped).
+    pub fn present(&mut self) -> Result<Option<u64>> {
         self.p().executor().present()
+    }
+
+    /// The frames the window showed since the last take: each id and when it reached the
+    /// display.
+    pub fn take_presented(&mut self) -> Vec<(u64, std::time::Instant)> {
+        self.p().executor().take_presented()
     }
 
     /// The directory of the build that's running: another after a hand-over

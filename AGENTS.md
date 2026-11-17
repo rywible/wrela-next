@@ -76,6 +76,9 @@ Because agents author the whole game, tooling and verification are product work,
    into parts of at most about 50 ms each, or drawn as a render pass. Run anything new first with
    `--frames 2 --timestamps --serial` at a small size and read its times before a long or large
    run. Don't raise `WRELA_GPU_BEHIND` to get a heavy kernel through.
+   **Never take the display:** no full-screen or borderless-fullscreen window on either machine.
+   A full-screen run with the GPU busy hung the Mac's GPU driver and WindowServer, and the
+   machine had to be restarted. Windows stay ordinary windows.
 3. **One Rust build at a time.** The machine has 16 GB. Every cargo command uses the one target
    directory, `toolchain/target`, and waits for any other cargo to finish.
 4. **Two machines, two targets.** Metal on this Mac (the M4) and Vulkan with SPIR-V on the Linux

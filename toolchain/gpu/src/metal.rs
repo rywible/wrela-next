@@ -1656,6 +1656,10 @@ pub struct Surface {
     view: objc2::rc::Retained<objc2_app_kit::NSView>,
     /// The window, alive while its layer is drawn into.
     _window: Arc<dyn Window>,
+    /// When each frame presented reached the display, by its id ([`Surface::present`]), until
+    /// taken; and the next id.
+    presented: Arc<Mutex<Vec<(u64, std::time::Instant)>>>,
+    next_id: u64,
 }
 
 // SAFETY: the layer is made and used on the thread that runs the window (macOS's main thread);
@@ -1691,7 +1695,13 @@ impl Device {
         view.setWantsLayer(true);
         view.setLayer(Some(&layer));
         let view = objc2::Message::retain(view);
-        let mut surface = Surface { layer, view, _window: window };
+        let mut surface = Surface {
+            layer,
+            view,
+            _window: window,
+            presented: Arc::new(Mutex::new(Vec::new())),
+            next_id: 0,
+        };
         surface.set_space(false, false);
         Ok(surface)
     }
@@ -1781,9 +1791,31 @@ impl Surface {
         Ok(SurfaceTexture { drawable, texture, view: TextureView { raw } })
     }
 
-    /// Shows `frame` once the work submitted for it is done.
-    pub fn present(&mut self, frame: SurfaceTexture) -> Result<()> {
+    /// Shows `frame` once the work submitted for it is done: its id, which
+    /// [`Surface::take_presented`] gives with the time it reached the display.
+    pub fn present(&mut self, frame: SurfaceTexture) -> Result<u64> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let sink = self.presented.clone();
+        // Metal says when the frame was shown (`presentedTime`, Core Animation's clock), or 0 if
+        // it never was (a frame replaced before its refresh).
+        let block = RcBlock::new(move |d: NonNull<ProtocolObject<dyn MTLDrawable>>| {
+            // SAFETY: Metal passes the drawable that was presented.
+            let shown = unsafe { d.as_ref() }.presentedTime();
+            if shown > 0.0 {
+                let ago = (objc2_quartz_core::CACurrentMediaTime() - shown).max(0.0);
+                let at = std::time::Instant::now() - std::time::Duration::from_secs_f64(ago);
+                lock(&sink).push((id, at));
+            }
+        });
+        // SAFETY: a handler of the drawable's own, which Metal copies.
+        unsafe { frame.drawable.addPresentedHandler(RcBlock::as_ptr(&block)) };
         frame.drawable.present();
-        Ok(())
+        Ok(id)
+    }
+
+    /// The frames shown since the last take: each id and when it reached the display.
+    pub fn take_presented(&mut self) -> Vec<(u64, std::time::Instant)> {
+        std::mem::take(&mut *lock(&self.presented))
     }
 }
