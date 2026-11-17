@@ -5,13 +5,11 @@
 //! The one check runs every retained CPU and GPU regression. Samples have one bounded
 //! size; historical milestone benchmarks and full-scene tours are not part of verification.
 
-pub mod spike01;
-
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use wrela_diag::{Diagnostic, Edit, FileId};
-use wrela_host::{CpuHost, Host, Value, map_read};
+use wrela_host::{CpuHost, Host, Value};
 
 /// SplitMix64, for tests' random inputs.
 pub mod rng;
@@ -269,150 +267,6 @@ pub fn worse(a: f64, b: f64) -> f64 {
 pub fn manifest(dir: &Path) -> wrela_abi::Manifest {
     let text = std::fs::read_to_string(dir.join("manifest.json")).expect("manifest.json");
     wrela_abi::Manifest::parse(&text).expect("a valid manifest")
-}
-
-/// One binding of a hand-written kernel, at group 0 and the binding's index in the list.
-pub enum Bind<'a> {
-    Uniform(&'a [u8]),
-    Read(&'a [u8]),
-    /// A read-write storage buffer of this many bytes, read back after the runs.
-    Write(u64),
-}
-
-/// A GPU device for running WGSL directly, with timestamps.
-pub struct RawGpu {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-}
-
-impl RawGpu {
-    pub fn new() -> Result<RawGpu, String> {
-        let (device, queue) =
-            wrela_host::open_device("hand-written", wgpu::Features::TIMESTAMP_QUERY)
-                .map_err(|e| e.to_string())?;
-        Ok(RawGpu { device, queue })
-    }
-
-    pub fn device(&self) -> &wgpu::Device {
-        &self.device
-    }
-
-    pub fn queue(&self) -> &wgpu::Queue {
-        &self.queue
-    }
-
-    /// The first `size` bytes of `src` (a `COPY_SRC` buffer), after the work submitted so far.
-    pub fn read(&self, src: &wgpu::Buffer, size: u64) -> Vec<u8> {
-        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("readback"),
-            size,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let mut encoder = self.device.create_command_encoder(&Default::default());
-        encoder.copy_buffer_to_buffer(src, 0, &readback, 0, size);
-        self.queue.submit([encoder.finish()]);
-        map_read(&self.device, &readback).expect("read back")
-    }
-
-    /// Runs `entry` of `wgsl` over `groups` workgroups (in x), `reps` times, each in its own
-    /// timed compute pass. Returns each run's GPU nanoseconds and the `Write` buffers'
-    /// contents after the last. Panics if the WGSL isn't valid or the GPU fails.
-    pub fn run(
-        &self,
-        wgsl: &str,
-        entry: &str,
-        binds: &[Bind],
-        groups: u32,
-        reps: u32,
-    ) -> (Vec<f64>, Vec<Vec<u8>>) {
-        use wgpu::util::DeviceExt;
-        let (device, queue) = (&self.device, &self.queue);
-        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some(entry),
-            source: wgpu::ShaderSource::Wgsl(wgsl.into()),
-        });
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some(entry),
-            layout: None,
-            module: &module,
-            entry_point: Some(entry),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-        let storage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC;
-        let buffers: Vec<wgpu::Buffer> = binds
-            .iter()
-            .map(|b| match b {
-                Bind::Uniform(data) => {
-                    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: None,
-                        contents: data,
-                        usage: wgpu::BufferUsages::UNIFORM,
-                    })
-                }
-                Bind::Read(data) => device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: None,
-                    contents: data,
-                    usage: storage,
-                }),
-                Bind::Write(size) => device.create_buffer(&wgpu::BufferDescriptor {
-                    label: None,
-                    size: *size,
-                    usage: storage,
-                    mapped_at_creation: false,
-                }),
-            })
-            .collect();
-        let entries: Vec<wgpu::BindGroupEntry> = buffers
-            .iter()
-            .enumerate()
-            .map(|(i, b)| wgpu::BindGroupEntry {
-                binding: i as u32,
-                resource: b.as_entire_binding(),
-            })
-            .collect();
-        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &pipeline.get_bind_group_layout(0),
-            entries: &entries,
-        });
-        let queries = device.create_query_set(&wgpu::QuerySetDescriptor {
-            label: None,
-            ty: wgpu::QueryType::Timestamp,
-            count: 2 * reps,
-        });
-        let mut encoder = device.create_command_encoder(&Default::default());
-        for r in 0..reps {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: None,
-                timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
-                    query_set: &queries,
-                    beginning_of_pass_write_index: Some(2 * r),
-                    end_of_pass_write_index: Some(2 * r + 1),
-                }),
-            });
-            pass.set_pipeline(&pipeline);
-            pass.set_bind_group(0, &group, &[]);
-            pass.dispatch_workgroups(groups, 1, 1);
-        }
-        queue.submit([encoder.finish()]);
-        if let Some(e) = pollster::block_on(scope.pop()) {
-            panic!("`{entry}`: {e}");
-        }
-        let times = wrela_host::read_timestamps(device, queue, &queries, reps)
-            .unwrap_or_else(|e| panic!("`{entry}`'s timestamps: {e}"));
-        let outs = binds
-            .iter()
-            .zip(&buffers)
-            .filter_map(|(b, buf)| match b {
-                Bind::Write(n) => Some(self.read(buf, *n)),
-                _ => None,
-            })
-            .collect();
-        (times, outs)
-    }
 }
 
 /// Builds the package at `pkg` (a path from the repo root) into `toolchain/target/tmp/<name>`. Returns the

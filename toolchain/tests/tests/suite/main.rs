@@ -20,7 +20,6 @@ mod explain;
 mod format;
 mod fuzz;
 mod gpu_limits;
-mod grazer;
 mod handover;
 mod input;
 mod language;

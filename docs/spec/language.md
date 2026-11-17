@@ -1601,7 +1601,7 @@ Three hosts run builds, from the same ABI (`runtime/abi`), and the native host h
 | Host | What it is | What it runs |
 |---|---|---|
 | The browser host | A page in Chrome, on WebGPU (`runtime/browser`) | A client build |
-| The native host | `wrela-host`, on wgpu and wasmtime (`runtime/native`) | A client build, on the machine's GPU; or its CPU alone (`--no-gpu`, and the frame tests of §13.2), which checks commands but runs no shaders |
+| The native host | `wrela-host`, on Metal or Vulkan (`toolchain/gpu`) and wasmtime (`runtime/native`) | A client build, on the machine's GPU; or its CPU alone (`--no-gpu`, and the frame tests of §13.2), which checks commands but runs no shaders |
 | The server host | `wrela-serve` (`wrela_host::server`) | A server build's rooms (§15.3, §19) |
 | The Cloudflare host | Durable Objects and the site's Worker (`runtime/cloudflare`), which `wrela build` writes beside a server build | A server build's HTTP requests (§19.5) and its rooms over WebSockets (§19.6) |
 | The native host's tool profile | `wrela tool` (`wrela_host::tool`), on wasmtime | A tool build, with what its command line grants (§15.5) |
@@ -2549,7 +2549,7 @@ The hosts can time each pass and dispatch on the GPU, they open the GPU with its
 - A frame's passes run in order after the frame, while the host records the next frame.
 - A GPU sets its clocks by its load, so a light frame paced at 60 Hz times slower than the same frame run back to back.
 
-**The build's target:** a build is for one machine's GPU, its target: `metal` (an Apple M4's, through wgpu 30's Metal backend) or `vulkan` (RADV's, on a Ryzen 5 5500U's integrated Radeon, through wgpu 30's Vulkan backend). `wrela build --target metal|vulkan` chooses; without it, the target is the machine the compiler runs on (Metal on Apple's machines, Vulkan elsewhere), and `wrela check` and `wrela test` build for that. The target decides the shaders' language (§13) and the limits below, which E0602 and E0707 hold a pipeline to. The host runs a build of its own machine's target only, on a GPU it finds with that API: the most capable (discrete before integrated), never a CPU's (`llvmpipe`) unless `WRELA_ALLOW_SOFTWARE` is set; with none, it fails and names the adapters it found.
+**The build's target:** a build is for one machine's GPU, its target: `metal` (an Apple M4's, through Metal) or `vulkan` (RADV's, on a Ryzen 5 5500U's integrated Radeon, through Vulkan 1.3). `wrela build --target metal|vulkan` chooses; without it, the target is the machine the compiler runs on (Metal on Apple's machines, Vulkan elsewhere), and `wrela check` and `wrela test` build for that. The target decides the shaders' language (§13) and the limits below, which E0602 and E0707 hold a pipeline to. The host runs a build of its own machine's target only, on a GPU it finds with that API: the most capable (discrete before integrated), never a CPU's (`llvmpipe`) unless `WRELA_ALLOW_SOFTWARE` is set; with none, it fails and names the adapters it found.
 
 **The GPU's limits:** the host opens the device with the adapter's own limits, and refuses one with less than the target's, which the checker holds commands to.
 

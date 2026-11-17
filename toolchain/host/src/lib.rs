@@ -1,6 +1,7 @@
 //! # The native host
 //!
-//! Runs a built wrela program: the WASM under wasmtime, the command stream under wgpu, headless
+//! Runs a built wrela program: the WASM under wasmtime, the command stream on the machine's own GPU API
+//! (`wrela_gpu`: Metal or Vulkan), headless
 //! (the screen is an offscreen texture). It serves tests, agents and performance comparisons.
 //!
 //! The contract it implements is `wrela-abi` (toolchain/abi). This crate never re-implements

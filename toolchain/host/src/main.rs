@@ -18,7 +18,7 @@
 //! - `wrela-host --compare-ticks <a.ticks> <b.ticks>`: two tick logs, two builds' runs of one
 //!   input: "equal", or the first tick whose state hash differs (G-sim). Unlike `--replay` it
 //!   doesn't compare the logs' WASM hashes.
-//! - `wrela-host --adapter`: the GPU's adapter as wgpu reports it: its name, features and
+//! - `wrela-host --adapter`: the GPU as `wrela_gpu` opens it: its name, driver, features and
 //!   limits.
 //! - `wrela-host --version`: its release and source revision.
 //!
@@ -414,7 +414,7 @@ fn frames(args: &Args) -> Result<(), Failure> {
     Ok(())
 }
 
-/// `--adapter`: the GPU as wgpu reports it, its features and its limits.
+/// `--adapter`: the GPU as `wrela_gpu` opens it, its features and its limits.
 #[cfg(feature = "gpu")]
 fn adapter() -> ExitCode {
     match wrela_host::adapter_report() {

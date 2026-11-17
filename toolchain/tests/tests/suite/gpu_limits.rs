@@ -11,10 +11,9 @@ use wrela_tests::{one_u32, page};
 fn a_program_sees_the_adapters_limits() {
     let (dir, _) = page("toolchain/tests/gpu-limits", "gpu-limits-native");
     let mut host = Host::load(&dir).expect("load");
-    // What wgpu says of the adapter, through the same device request.
-    let (device, _) =
-        wrela_host::open_device("limits test", wgpu::Features::empty()).expect("device");
-    let l = device.limits();
+    // What the GPU says of itself, through the same device request.
+    let device = wrela_host::open_device("limits test", None).expect("device");
+    let l = device.limits().clone();
     let texture = one_u32(&mut host, "max_texture_size", &[]);
     assert_eq!(texture, l.max_texture_dimension_2d);
     let buffer = l.max_buffer_size.min(l.max_storage_buffer_binding_size).min(u64::from(u32::MAX));

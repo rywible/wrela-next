@@ -216,33 +216,34 @@ mod tests {
 /// dispatch stops the run with an error naming its kernel. A dispatch the check passes runs as
 /// the program asked; one it cuts never runs.
 pub(crate) struct Indirect {
-    pipeline: wgpu::ComputePipeline,
-    layout: wgpu::BindGroupLayout,
+    pipeline: wrela_gpu::ComputePipeline,
+    layout: wrela_gpu::BindGroupLayout,
+    /// The check's manifest entry: where its shader reads its buffers' sizes.
+    entry: wrela_abi::manifest::Pipeline,
     /// Checked arguments, 16 bytes a dispatch this frame (x, y, z, cut).
-    args: wgpu::Buffer,
+    args: wrela_gpu::Buffer,
     /// Each check's numbers, [`CHECK_STRIDE`] bytes a dispatch this frame.
-    checks: wgpu::Buffer,
+    checks: wrela_gpu::Buffer,
     /// How many dispatches `args` and `checks` hold.
     capacity: u32,
-    /// The kernels dispatched indirectly this frame, in their slots' order, with what the
-    /// program's buffer was bound as for the check.
+    /// The kernels dispatched indirectly this frame, in their slots' order.
     names: Vec<String>,
     /// Bind groups by the program's buffer they read (its handle), for the frame's `args`.
-    groups: std::collections::HashMap<u32, wgpu::BindGroup>,
-    /// Frames' marks being read back: the buffer, its kernels, and whether it has been mapped
-    /// (0 not yet asked, 3 asked, 1 mapped, 2 failed).
+    groups: std::collections::HashMap<u32, wrela_gpu::BindGroup>,
+    /// Frames' marks being read back: the buffer, its kernels, and the submission that wrote
+    /// them (once it's made).
     pending: std::collections::VecDeque<(
-        wgpu::Buffer,
+        wrela_gpu::Buffer,
         Vec<String>,
-        std::sync::Arc<std::sync::atomic::AtomicU8>,
+        Option<wrela_gpu::SubmissionIndex>,
     )>,
 }
 
 /// An indirect dispatch's check, got ready ([`Indirect::prepare`]).
 pub(crate) struct Checked {
-    group: wgpu::BindGroup,
+    group: wrela_gpu::BindGroup,
     offset: u32,
-    pub(crate) args: wgpu::Buffer,
+    pub(crate) args: wrela_gpu::Buffer,
     pub(crate) at: u64,
 }
 
@@ -252,119 +253,159 @@ const MOST_INDIRECT: u32 = 4096;
 /// The bytes between two dispatches' check numbers (a uniform's dynamic offset's alignment).
 const CHECK_STRIDE: u64 = 256;
 
-const CHECK_WGSL: &str = "
-struct Check { at: u32, slot: u32, most: u32, unused: u32 }
-@group(0) @binding(0) var<storage, read> src: array<u32>;
-@group(0) @binding(1) var<storage, read_write> args: array<u32>;
-@group(0) @binding(2) var<uniform> c: Check;
-@compute @workgroup_size(1) fn checked() {
-    let x = src[c.at];
-    let y = src[c.at + 1u];
-    let z = src[c.at + 2u];
-    var over = false;
-    if x != 0u && y != 0u && z != 0u {
-        if x > c.most {
-            over = true;
-        } else if y > c.most / x {
-            over = true;
-        } else if z > c.most / (x * y) {
-            over = true;
+/// The check's kernel, as IR, written by the compiler's own writers for this machine:
+/// ```text
+/// struct Check { at: u32, slot: u32, most: u32, unused: u32 }
+/// @group(0) @binding(0) var<storage, read> src: array<u32>;
+/// @group(0) @binding(1) var<storage, read_write> args: array<u32>;
+/// @group(0) @binding(2) var<uniform> c: Check;
+/// @compute @workgroup_size(1) fn checked() {
+///     let (x, y, z) = (src[c.at], src[c.at + 1], src[c.at + 2]);
+///     let over = x != 0 && y != 0 && z != 0
+///         && (x > c.most || y > c.most / x || z > c.most / (x * y));
+///     let o = c.slot * 4;
+///     args[o..o + 4] = if over { (0, 0, 0, 1) } else { (x, y, z, 0) };
+/// }
+/// ```
+/// (Where `x > c.most` the other two may divide by zero or wrap: the writers' guarded division
+/// gives a value, and `over` is already true.)
+fn check_kernel() -> wrela_shader::build::Builder {
+    use wrela_shader::build::{BinOp, Builder, Proj, Scalar};
+    let mut b = Builder::new();
+    let u = b.scalar(Scalar::U32);
+    let check = b.structure("Check", &[("at", u), ("slot", u), ("most", u), ("unused", u)]);
+    let src = b.storage("src", 0, u, false);
+    let args = b.storage("args", 1, u, true);
+    let c = b.uniform("c", 2, check);
+    b.compute("checked", [1, 1, 1], &[], |f| {
+        let field = |f: &mut wrela_shader::build::Body<'_>, k: u32| {
+            f.load(u, Builder::whole(c).with(Proj::Field(k)))
+        };
+        let (at, slot, most) = (field(f, 0), field(f, 1), field(f, 2));
+        let read = |f: &mut wrela_shader::build::Body<'_>, k: u32| {
+            let k = f.u32(k);
+            let i = f.binary(BinOp::Add, at, k);
+            f.load(u, Builder::element(src, i))
+        };
+        let (x, y, z) = (read(f, 0), read(f, 1), read(f, 2));
+        let zero = f.u32(0);
+        let nx = f.binary(BinOp::Ne, x, zero);
+        let ny = f.binary(BinOp::Ne, y, zero);
+        let nz = f.binary(BinOp::Ne, z, zero);
+        let nxy = f.binary(BinOp::And, nx, ny);
+        let nonzero = f.binary(BinOp::And, nxy, nz);
+        let over_x = f.binary(BinOp::Gt, x, most);
+        let per_x = f.binary(BinOp::Div, most, x);
+        let over_y = f.binary(BinOp::Gt, y, per_x);
+        let xy = f.binary(BinOp::Mul, x, y);
+        let per_xy = f.binary(BinOp::Div, most, xy);
+        let over_z = f.binary(BinOp::Gt, z, per_xy);
+        let over_xy = f.binary(BinOp::Or, over_x, over_y);
+        let any = f.binary(BinOp::Or, over_xy, over_z);
+        let over = f.binary(BinOp::And, nonzero, any);
+        let four = f.u32(4);
+        let o = f.binary(BinOp::Mul, slot, four);
+        let one = f.u32(1);
+        for (k, kept, cut) in [(0, x, zero), (1, y, zero), (2, z, zero), (3, zero, one)] {
+            let v = f.select(over, cut, kept);
+            let kk = f.u32(k);
+            let i = f.binary(BinOp::Add, o, kk);
+            f.store(Builder::element(args, i), v);
         }
-    }
-    let o = c.slot * 4u;
-    if over {
-        args[o] = 0u; args[o + 1u] = 0u; args[o + 2u] = 0u; args[o + 3u] = 1u;
-    } else {
-        args[o] = x; args[o + 1u] = y; args[o + 2u] = z; args[o + 3u] = 0u;
+    });
+    b
+}
+
+/// The check's manifest entry: its uniform block and its two buffers.
+fn check_entry() -> wrela_abi::manifest::Pipeline {
+    use wrela_abi::manifest::{
+        BindingKind, BindingStage, Pipeline, ResourceBinding, Stage, UniformBlock, UniformSpace,
+    };
+    let binding =
+        |binding, kind| ResourceBinding { binding, kind, stage: BindingStage::Both, format: None };
+    Pipeline {
+        name: "indirect check".into(),
+        shader: "indirect check".into(),
+        stage: Stage::Compute { entry: "checked".into(), workgroup_size: [1, 1, 1] },
+        uniform: Some(UniformBlock { binding: 2, size: 16, space: UniformSpace::Uniform }),
+        bindings: vec![binding(0, BindingKind::Read), binding(1, BindingKind::ReadWrite)],
+        debug_flag: None,
+        requires: Vec::new(),
+        conditional: false,
+        standin: None,
+        sizes: None,
+        kept: 0,
+        work: vec![Some(64)],
+        unbounded: Vec::new(),
     }
 }
-";
 
 impl Indirect {
-    pub(crate) fn new(device: &wgpu::Device) -> Indirect {
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("indirect check"),
-            source: wgpu::ShaderSource::Wgsl(CHECK_WGSL.into()),
-        });
-        let entry = |binding, ty| wgpu::BindGroupLayoutEntry {
-            binding,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty,
-            count: None,
+    pub(crate) fn new(device: &wrela_gpu::Device) -> Result<Indirect> {
+        let mut entry = check_entry();
+        let shader = check_kernel()
+            .write(&mut entry, wrela_abi::Target::HERE)
+            .map_err(|e| Error::Gpu(format!("the indirect check's shader: {e}")))?;
+        let entries: Vec<wrela_gpu::LayoutEntry> = wrela_abi::metal::layout(&entry)
+            .iter()
+            .map(|e| wrela_gpu::LayoutEntry {
+                binding: e.binding,
+                visibility: e.visibility,
+                ty: crate::gpu::binding_type(e, &entry),
+            })
+            .collect();
+        let layout = device.create_bind_group_layout(&entries);
+        let module = device
+            .create_shader_module("indirect check", &shader.bytes)
+            .map_err(|e| Error::Gpu(format!("the indirect check's shader: {}", e.0)))?;
+        let wrela_abi::manifest::Stage::Compute { entry: name, .. } = &entry.stage else {
+            unreachable!("a kernel");
         };
-        let storage = |read_only| wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Storage { read_only },
-            has_dynamic_offset: false,
-            min_binding_size: None,
-        };
-        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("indirect check"),
-            entries: &[
-                entry(0, storage(true)),
-                entry(1, storage(false)),
-                entry(
-                    2,
-                    wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: true,
-                        min_binding_size: wgpu::BufferSize::new(16),
-                    },
-                ),
-            ],
-        });
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("indirect check"),
-            bind_group_layouts: &[Some(&layout)],
-            immediate_size: 0,
-        });
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("indirect check"),
-            layout: Some(&pipeline_layout),
-            module: &module,
-            entry_point: Some("checked"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
+        let pipeline = device
+            .create_compute_pipeline(&wrela_gpu::ComputePipelineDesc {
+                label: "indirect check",
+                layout: &layout,
+                module: &module,
+                entry: name,
+                workgroup_size: [1, 1, 1],
+            })
+            .map_err(|e| Error::Gpu(format!("the indirect check's pipeline: {}", e.0)))?;
         let (args, checks) = Indirect::buffers(device, MOST_INDIRECT);
-        Indirect {
+        Ok(Indirect {
             pipeline,
             layout,
+            entry,
             args,
             checks,
             capacity: MOST_INDIRECT,
             names: Vec::new(),
             groups: std::collections::HashMap::new(),
             pending: std::collections::VecDeque::new(),
-        }
+        })
     }
 
-    fn buffers(device: &wgpu::Device, n: u32) -> (wgpu::Buffer, wgpu::Buffer) {
-        let args = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("indirect checked"),
+    fn buffers(device: &wrela_gpu::Device, n: u32) -> (wrela_gpu::Buffer, wrela_gpu::Buffer) {
+        let args = device.create_buffer(&wrela_gpu::BufferDesc {
+            label: "indirect checked",
             size: u64::from(n) * 16,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::INDIRECT
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
+            mappable: false,
         });
-        let checks = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("indirect checks"),
+        let checks = device.create_buffer(&wrela_gpu::BufferDesc {
+            label: "indirect checks",
             size: u64::from(n) * CHECK_STRIDE,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
+            mappable: false,
         });
         (args, checks)
     }
 
     /// Gets ready the check of an indirect dispatch of kernel `name` whose arguments are at byte
     /// `at` of `source` (the program's buffer `handle`), at most `most` groups: what
-    /// [`Indirect::record`] records, in the dispatch's own pass, before the dispatch.
+    /// [`Indirect::record`] records, in a pass of its own just before the dispatch's.
     pub(crate) fn prepare(
         &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
+        device: &wrela_gpu::Device,
         name: &str,
-        (handle, source, at): (u32, &wgpu::Buffer, u32),
+        (handle, source, at): (u32, &wrela_gpu::Buffer, u32),
         most: u64,
     ) -> Result<Checked> {
         let slot = self.names.len() as u32;
@@ -377,26 +418,56 @@ impl Indirect {
         }
         let numbers = [at / 4, slot, most.min(u64::from(u32::MAX)) as u32, 0];
         let bytes: Vec<u8> = numbers.iter().flat_map(|n| n.to_le_bytes()).collect();
-        queue.write_buffer(&self.checks, u64::from(slot) * CHECK_STRIDE, &bytes);
-        let layout = &self.layout;
+        device.write_buffer(&self.checks, u64::from(slot) * CHECK_STRIDE, &bytes);
+        let (layout, entry) = (&self.layout, &self.entry);
         let (args, checks) = (&self.args, &self.checks);
         let group = self.groups.entry(handle).or_insert_with(|| {
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("indirect check"),
-                layout,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: source.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: args.as_entire_binding() },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                            buffer: checks,
-                            offset: 0,
-                            size: wgpu::BufferSize::new(16),
-                        }),
+            let mut entries = vec![
+                wrela_gpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wrela_gpu::Resource::Buffer { buffer: source, offset: 0, size: None },
+                },
+                wrela_gpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wrela_gpu::Resource::Buffer { buffer: args, offset: 0, size: None },
+                },
+                wrela_gpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wrela_gpu::Resource::Buffer {
+                        buffer: checks,
+                        offset: 0,
+                        size: Some(16),
                     },
-                ],
-            })
+                },
+            ];
+            // Metal's shader reads its buffers' sizes from a uniform of their own.
+            let sizes = entry.sizes.as_ref().map(|s| {
+                let words: Vec<u32> = s
+                    .buffers
+                    .iter()
+                    .map(|&b| match b {
+                        0 => source.size() as u32,
+                        1 => args.size() as u32,
+                        _ => 0,
+                    })
+                    .collect();
+                let mut bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+                bytes.resize(bytes.len().next_multiple_of(16).max(16), 0);
+                let b = device.create_buffer(&wrela_gpu::BufferDesc {
+                    label: "indirect check sizes",
+                    size: bytes.len() as u64,
+                    mappable: false,
+                });
+                device.write_buffer(&b, 0, &bytes);
+                (s.binding, b)
+            });
+            if let Some((binding, b)) = &sizes {
+                entries.push(wrela_gpu::BindGroupEntry {
+                    binding: *binding,
+                    resource: wrela_gpu::Resource::Buffer { buffer: b, offset: 0, size: None },
+                });
+            }
+            device.create_bind_group(layout, &entries)
         });
         self.names.push(name.to_string());
         Ok(Checked {
@@ -409,67 +480,51 @@ impl Indirect {
 
     /// Records the check `c` in `pass`, before its dispatch: the dispatch then reads its groups
     /// from `c.args` at `c.at`.
-    pub(crate) fn record(&self, pass: &mut wgpu::ComputePass<'_>, c: &Checked) {
+    pub(crate) fn record(&self, pass: &mut wrela_gpu::ComputePass<'_>, c: &Checked) {
         pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &c.group, &[c.offset]);
-        pass.dispatch_workgroups(1, 1, 1);
+        pass.set_bind_group(&c.group, &[c.offset]);
+        pass.dispatch(1, 1, 1);
     }
 
     /// Ends a frame: its marks are copied out to be read once its work is done.
-    pub(crate) fn end_frame(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder) {
+    pub(crate) fn end_frame(
+        &mut self,
+        device: &wrela_gpu::Device,
+        encoder: &mut wrela_gpu::CommandEncoder,
+    ) {
         if self.names.is_empty() {
             return;
         }
         let names = std::mem::take(&mut self.names);
         let size = names.len() as u64 * 16;
-        let read = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("indirect marks"),
+        let read = device.create_buffer(&wrela_gpu::BufferDesc {
+            label: "indirect marks",
             size,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
+            mappable: true,
         });
         encoder.copy_buffer_to_buffer(&self.args, 0, &read, 0, size);
-        self.pending.push_back((
-            read,
-            names,
-            std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
-        ));
+        self.pending.push_back((read, names, None));
         self.groups.clear();
     }
 
-    /// After a frame was submitted: asks for its marks, and fails if a frame already read cut
-    /// a dispatch.
-    pub(crate) fn read(&mut self) -> Result<()> {
-        use std::sync::atomic::Ordering;
-        for (buffer, _, state) in &self.pending {
-            if state.load(Ordering::Acquire) == 0 {
-                state.store(3, Ordering::Release);
-                let s = state.clone();
-                buffer.slice(..).map_async(wgpu::MapMode::Read, move |r| {
-                    s.store(if r.is_ok() { 1 } else { 2 }, Ordering::Release);
-                });
-            }
+    /// After a frame was submitted: notes its submission, and fails if a frame whose work is
+    /// done cut a dispatch.
+    pub(crate) fn read(&mut self, device: &wrela_gpu::Device) -> Result<()> {
+        for (_, _, at) in &mut self.pending {
+            at.get_or_insert(device.submitted());
         }
-        while let Some((buffer, names, state)) = self.pending.front() {
-            match state.load(Ordering::Acquire) {
-                0 | 3 => break,
-                2 => {
-                    return Err(Error::Gpu(
-                        "reading back the indirect dispatches' checks failed".into(),
-                    ));
-                }
-                _ => {}
+        let done = device.completed();
+        while let Some((buffer, names, Some(at))) = self.pending.front() {
+            if *at > done {
+                break;
             }
-            let cut: Vec<&str> = {
-                let mapped =
-                    buffer.slice(..).get_mapped_range().map_err(|e| Error::Gpu(e.to_string()))?;
-                mapped
-                    .chunks_exact(16)
-                    .zip(names)
-                    .filter(|(a, _)| a[12..16] != [0, 0, 0, 0])
-                    .map(|(_, n)| n.as_str())
-                    .collect()
-            };
+            let bytes = buffer.read(0, buffer.size()).map_err(|e| Error::Gpu(e.0))?;
+            let cut: Vec<&str> = bytes
+                .chunks_exact(16)
+                .zip(names)
+                .filter(|(a, _)| a[12..16] != [0, 0, 0, 0])
+                .map(|(_, n)| n.as_str())
+                .collect();
             if let Some(name) = cut.first() {
                 return Err(Error::Gpu(format!(
                     "refused an indirect dispatch of `{name}` before it ran: the groups the GPU \
@@ -479,7 +534,6 @@ impl Indirect {
                     limit_ms()
                 )));
             }
-            buffer.unmap();
             self.pending.pop_front();
         }
         Ok(())

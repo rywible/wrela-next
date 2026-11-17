@@ -333,6 +333,7 @@ pub fn instance() -> Builder {
 ///     out[2] = bitcast<u32>(input[3] * input[4] + input[5]);
 /// }
 /// ```
+#[cfg(target_vendor = "apple")]
 pub fn probe() -> Builder {
     let mut b = Builder::new();
     let fl = b.scalar(Scalar::F32);

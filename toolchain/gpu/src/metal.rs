@@ -53,7 +53,22 @@ struct Shared {
     errors: Arc<Mutex<Vec<String>>>,
     /// A buffer of zeros, shared, as large as the largest texture level zeroed so far.
     zeros: Mutex<Option<Id<dyn MTLBuffer>>>,
+    /// Shared buffers staged writes are copied into, reused once their submission is done.
+    belt: Mutex<Belt>,
 }
+
+/// The staging belt: the buffer this submission's writes go into (and how much of it they
+/// fill), the full ones this submission also uses, and those earlier submissions use or used.
+#[derive(Default)]
+struct Belt {
+    current: Option<(Id<dyn MTLBuffer>, u64)>,
+    filled: Vec<Id<dyn MTLBuffer>>,
+    in_flight: Vec<(SubmissionIndex, Id<dyn MTLBuffer>)>,
+    free: Vec<Id<dyn MTLBuffer>>,
+}
+
+/// The least a staging buffer holds.
+const BELT_CHUNK: u64 = 4 << 20;
 
 // SAFETY: Metal's objects are thread-safe (MTLDevice, MTLCommandQueue and resources may be used
 // from any thread); the host records on one thread at a time.
@@ -63,6 +78,7 @@ unsafe impl Sync for Shared {}
 enum PendingWrite {
     Buffer {
         staging: Id<dyn MTLBuffer>,
+        staging_offset: u64,
         dst: Id<dyn MTLBuffer>,
         offset: u64,
         len: u64,
@@ -185,6 +201,7 @@ impl Device {
                 pending: Mutex::new(Vec::new()),
                 errors: Arc::new(Mutex::new(Vec::new())),
                 zeros: Mutex::new(None),
+                belt: Mutex::new(Belt::default()),
             })))
         })
     }
@@ -274,7 +291,9 @@ impl Device {
             d.setMipmapLevelCount(desc.levels.max(1) as NSUInteger);
         }
         d.setStorageMode(MTLStorageMode::Private);
-        let mut usage = MTLTextureUsage::ShaderRead | MTLTextureUsage::PixelFormatView;
+        // No `PixelFormatView`: every view keeps its texture's format, and the flag would give up
+        // the GPU's lossless compression of what's drawn into it.
+        let mut usage = MTLTextureUsage::ShaderRead;
         if desc.usage.storage {
             usage |= MTLTextureUsage::ShaderWrite;
         }
@@ -554,9 +573,10 @@ impl Device {
         if data.is_empty() {
             return;
         }
-        let staging = self.staging(data);
+        let (staging, staging_offset) = self.staging(data, 4);
         lock(&self.0.pending).push(PendingWrite::Buffer {
             staging,
+            staging_offset,
             dst: buffer.raw.clone(),
             offset,
             len: data.len() as u64,
@@ -576,14 +596,14 @@ impl Device {
         if data.is_empty() {
             return;
         }
-        let staging = self.staging(data);
+        let (staging, staging_offset) = self.staging(data, 256);
         let (slice, z) = match at.texture.dimension {
             TextureDimension::D3 => (0, at.origin[2]),
             TextureDimension::D2 => (at.origin[2], 0),
         };
         lock(&self.0.pending).push(PendingWrite::Texture {
             staging,
-            staging_offset: 0,
+            staging_offset,
             bytes_per_row: u64::from(bytes_per_row),
             bytes_per_image: u64::from(bytes_per_row) * u64::from(rows_per_image),
             dst: at.texture.raw.clone(),
@@ -594,17 +614,57 @@ impl Device {
         });
     }
 
-    fn staging(&self, data: &[u8]) -> Id<dyn MTLBuffer> {
+    /// `data` copied into the staging belt at an offset aligned to `align`: the buffer and the
+    /// offset, which the next submission copies from.
+    fn staging(&self, data: &[u8], align: u64) -> (Id<dyn MTLBuffer>, u64) {
+        let need = data.len() as u64;
+        let mut belt = lock(&self.0.belt);
+        let fits = |b: &Id<dyn MTLBuffer>, used: u64| {
+            used.next_multiple_of(align) + need <= b.length() as u64
+        };
+        let (buffer, at) = match belt.current.take() {
+            Some((b, used)) if fits(&b, used) => (b, used.next_multiple_of(align)),
+            other => {
+                if let Some((b, _)) = other {
+                    belt.filled.push(b);
+                }
+                let free = belt.free.iter().position(|b| b.length() as u64 >= need);
+                let b = match free {
+                    Some(k) => belt.free.swap_remove(k),
+                    None => self
+                        .0
+                        .raw
+                        .newBufferWithLength_options(
+                            need.max(BELT_CHUNK).next_power_of_two() as NSUInteger,
+                            MTLResourceOptions::StorageModeShared,
+                        )
+                        .expect("Metal made no buffer"),
+                };
+                (b, 0)
+            }
+        };
+        // SAFETY: the buffer is shared and holds `at + need` bytes; no submission uses it yet.
         unsafe {
-            self.0
-                .raw
-                .newBufferWithBytes_length_options(
-                    NonNull::new(data.as_ptr() as *mut _).expect("data"),
-                    data.len() as NSUInteger,
-                    MTLResourceOptions::StorageModeShared,
-                )
-                .expect("Metal made no buffer")
+            let p = buffer.contents().as_ptr() as *mut u8;
+            std::ptr::copy_nonoverlapping(data.as_ptr(), p.add(at as usize), data.len());
         }
+        belt.current = Some((buffer.clone(), at + need));
+        (buffer, at)
+    }
+
+    /// The staging belt's buffers this submission uses go in flight with it; those of
+    /// submissions done are free again.
+    fn turn_belt(&self, index: SubmissionIndex) {
+        let done = self.completed();
+        let mut belt = lock(&self.0.belt);
+        let current = belt.current.take().map(|c| c.0);
+        let used: Vec<_> = belt.filled.drain(..).chain(current).collect();
+        belt.in_flight.extend(used.into_iter().map(|b| (index, b)));
+        let (ready, busy): (Vec<_>, Vec<_>) =
+            belt.in_flight.drain(..).partition(|(i, _)| *i <= done);
+        belt.in_flight = busy;
+        belt.free.extend(ready.into_iter().map(|(_, b)| b));
+        belt.free.truncate(8);
     }
 
     /// Commits the staged writes, then `buffers`, in order: their submission's index.
@@ -612,6 +672,7 @@ impl Device {
         autoreleasepool(|_| {
             let index = self.0.submitted.fetch_add(1, Ordering::AcqRel) + 1;
             let pending = self.take_pending();
+            self.turn_belt(index);
             let mut cbs: Vec<Id<dyn MTLCommandBuffer>> = Vec::new();
             if !pending.is_empty() {
                 let cb = self.command_buffer();
@@ -726,10 +787,10 @@ fn command_buffer_error(cb: &ProtocolObject<dyn MTLCommandBuffer>) -> String {
 fn encode_write(blit: &ProtocolObject<dyn MTLBlitCommandEncoder>, w: &PendingWrite) {
     unsafe {
         match w {
-            PendingWrite::Buffer { staging, dst, offset, len } => {
+            PendingWrite::Buffer { staging, staging_offset, dst, offset, len } => {
                 blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
                     staging,
-                    0,
+                    *staging_offset as NSUInteger,
                     dst,
                     *offset as NSUInteger,
                     *len as NSUInteger,
@@ -788,6 +849,11 @@ impl Buffer {
         self.size
     }
 
+    /// Whether it and `other` are the same buffer (clones of one).
+    pub fn same(&self, other: &Buffer) -> bool {
+        std::ptr::eq(&*self.raw, &*other.raw)
+    }
+
     /// A mappable buffer's bytes `offset..offset + len`, read in place: its submission must be
     /// done.
     pub fn read(&self, offset: u64, len: u64) -> Result<Vec<u8>> {
@@ -808,6 +874,7 @@ impl Clone for Buffer {
     }
 }
 
+#[derive(Clone)]
 pub struct Texture {
     raw: Id<dyn MTLTexture>,
     format: TextureFormat,
@@ -880,6 +947,7 @@ pub struct Sampler {
     raw: Id<dyn MTLSamplerState>,
 }
 
+#[derive(Clone)]
 pub struct QuerySet {
     raw: Id<dyn MTLCounterSampleBuffer>,
     count: u32,
@@ -891,10 +959,12 @@ impl QuerySet {
     }
 }
 
+#[derive(Clone)]
 pub struct ShaderModule {
     library: Id<dyn MTLLibrary>,
 }
 
+#[derive(Clone)]
 pub struct ComputePipeline {
     raw: Id<dyn MTLComputePipelineState>,
     workgroup: MTLSize,
@@ -907,6 +977,7 @@ impl ComputePipeline {
     }
 }
 
+#[derive(Clone)]
 pub struct RenderPipeline {
     raw: Id<dyn MTLRenderPipelineState>,
     depth_state: Option<Id<dyn MTLDepthStencilState>>,
@@ -945,7 +1016,7 @@ impl Layout {
                 }
             }
             slots.push(s);
-            if matches!(e.ty, BindingType::Uniform { dynamic: true, .. }) {
+            if e.ty.dynamic() {
                 dynamic.push(k);
             }
         }
@@ -1043,6 +1114,10 @@ impl CommandEncoder {
         dst_offset: u64,
         size: u64,
     ) {
+        // An empty copy is nothing (WebGPU allows one; Vulkan doesn't).
+        if size == 0 {
+            return;
+        }
         let b = self.blit();
         unsafe {
             b.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
@@ -1061,6 +1136,9 @@ impl CommandEncoder {
         dst: TextureCopy<'_>,
         extent: [u32; 3],
     ) {
+        if extent.contains(&0) {
+            return;
+        }
         let (slice, z) = slice_of(&dst);
         let b = self.blit();
         unsafe {
@@ -1084,6 +1162,9 @@ impl CommandEncoder {
         dst: BufferCopy<'_>,
         extent: [u32; 3],
     ) {
+        if extent.contains(&0) {
+            return;
+        }
         let (slice, z) = slice_of(&src);
         let b = self.blit();
         unsafe {
@@ -1107,6 +1188,9 @@ impl CommandEncoder {
         dst: TextureCopy<'_>,
         extent: [u32; 3],
     ) {
+        if extent.contains(&0) {
+            return;
+        }
         let (ss, sz) = slice_of(&src);
         let (ds, dz) = slice_of(&dst);
         let b = self.blit();

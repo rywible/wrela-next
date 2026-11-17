@@ -15,14 +15,9 @@
 //! allotted as it runs (Dynamic Caching, docs/citations.md), so this number can't show their
 //! pressure there.
 //!
-//! wgpu 30 has no way to reach a pipeline's Metal object (`as_hal` reaches the device, not a
-//! pipeline, and wgpu-hal keeps its pipeline state private), so on Metal each compute pipeline's
-//! MSL, as the build ships it, is compiled again on the raw device (`Device::as_hal`) as wgpu-hal
-//! 30 compiles a passthrough shader (`metal/device.rs`: default compile options, no buffer marked
-//! immutable). Only a run with the flag pays for it.
-//!
-//! The one `unsafe` is `as_hal`, which only reads the device.
-#![allow(unsafe_code)]
+//! On Metal each compute pipeline's MSL, as the build ships it, is compiled again on the device
+//! (`wrela_gpu::Device::kernel_report`), with its cap and without. Only a run with the flag pays
+//! for it.
 
 use std::fmt::Write as _;
 
@@ -101,86 +96,36 @@ pub(crate) fn line(shader: &str, name: &str, report: &Report) -> String {
 
 /// Metal's account of the compute pipeline of the MSL `source`'s kernel `entry`; an error
 /// saying why there's none, on another backend among them.
-pub(crate) fn metal(device: &wgpu::Device, source: &str, entry: &str) -> Result<Metal, String> {
+pub(crate) fn metal(device: &wrela_gpu::Device, msl: &str, entry: &str) -> Result<Metal, String> {
     #[cfg(target_vendor = "apple")]
     {
-        apple::measure(device, source, entry)
-    }
-    #[cfg(not(target_vendor = "apple"))]
-    {
-        let _ = (device, source, entry);
-        Err("only Metal reports more".into())
-    }
-}
-
-#[cfg(target_vendor = "apple")]
-mod apple {
-    use super::Metal;
-    use objc2::rc::autoreleasepool;
-    use objc2::runtime::ProtocolObject;
-    use objc2_foundation::NSString;
-    use objc2_metal::{
-        MTLCompileOptions, MTLComputePipelineDescriptor, MTLComputePipelineState, MTLDevice,
-        MTLLibrary, MTLPipelineOption,
-    };
-
-    pub(super) fn measure(device: &wgpu::Device, msl: &str, entry: &str) -> Result<Metal, String> {
-        // SAFETY: the raw device is only asked to compile a library and a pipeline of its own;
-        // nothing wgpu made is touched or destroyed.
-        let raw = match unsafe { device.as_hal::<wgpu::hal::api::Metal>() } {
-            Some(hal) => hal.raw_device().clone(),
-            None => return Err("only Metal reports more".into()),
-        };
-        // The MSL writer caps the kernel at its workgroup (`[[max_total_threads_per_threadgroup(N)]]`), so
-        // as built its max is the workgroup's size unless registers hold it below that. Without
-        // the cap, Metal says how many threads its registers allow.
+        // The MSL writer caps the kernel at its workgroup
+        // (`[[max_total_threads_per_threadgroup(N)]]`), so as built its max is the workgroup's
+        // size unless registers hold it below that. Without the cap, Metal says how many
+        // threads its registers allow.
+        let built = device.kernel_report(msl, entry).map_err(|e| e.0)?;
         let cap = msl
             .find("[[max_total_threads_per_threadgroup(")
             .and_then(|at| Some(at..at + msl[at..].find(")]] ")? + ")]] ".len()));
-        let built = compile(&raw, msl, entry)?;
         let uncapped = match cap {
             Some(cap) => {
                 let mut text = msl.to_string();
                 text.replace_range(cap, "");
-                compile(&raw, &text, entry)?.max_threads
+                device.kernel_report(&text, entry).map_err(|e| e.0)?.max_threads
             }
             None => built.max_threads,
         };
-        Ok(Metal { uncapped, ..built })
-    }
-
-    /// `msl`'s kernel `name` compiled on `raw` as wgpu-hal compiles a passthrough shader: what
-    /// Metal says of it, its uncapped max not yet known.
-    fn compile(
-        raw: &ProtocolObject<dyn MTLDevice>,
-        msl: &str,
-        name: &str,
-    ) -> Result<Metal, String> {
-        autoreleasepool(|_| {
-            let options = MTLCompileOptions::new();
-            let library = raw
-                .newLibraryWithSource_options_error(&NSString::from_str(msl), Some(&options))
-                .map_err(|e| format!("Metal: {e}"))?;
-            let function = library
-                .newFunctionWithName(&NSString::from_str(name))
-                .ok_or_else(|| format!("Metal: no function {name}"))?;
-            let descriptor = MTLComputePipelineDescriptor::new();
-            descriptor.setComputeFunction(Some(&function));
-            let state = raw
-                .newComputePipelineStateWithDescriptor_options_reflection_error(
-                    &descriptor,
-                    MTLPipelineOption::empty(),
-                    None,
-                )
-                .map_err(|e| format!("Metal: {e}"))?;
-            let max_threads = state.maxTotalThreadsPerThreadgroup() as u64;
-            Ok(Metal {
-                simd: state.threadExecutionWidth() as u64,
-                max_threads,
-                uncapped: max_threads,
-                threadgroup_memory: state.staticThreadgroupMemoryLength() as u64,
-            })
+        Ok(Metal {
+            simd: built.simd,
+            max_threads: built.max_threads,
+            uncapped,
+            threadgroup_memory: built.threadgroup_memory,
         })
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        let _ = (device, msl, entry);
+        Err("only Metal reports more".into())
     }
 }
 

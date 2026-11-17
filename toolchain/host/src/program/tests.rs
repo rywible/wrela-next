@@ -362,13 +362,12 @@ fn host_controls_without_control_words_do_not_panic() {
     assert!(matches!(error, Error::Program(why) if why.contains("hasn't started a ticker")));
 }
 
-/// WebGPU's default limits, as wgpu has them, are less than the machine's that pipelines are
-/// compiled for (`wrela_abi` can't see wgpu).
+/// WebGPU's default limits are less than the machine's that pipelines are compiled for.
 #[cfg(feature = "gpu")]
 #[test]
 fn webgpus_default_limits_are_short_of_the_machines() {
     // WebGPU's defaults fall short of the machine's: the host refuses such a device.
-    let defaults = crate::gpu::limits_of(&wgpu::Limits::default());
+    let defaults = crate::gpu::limits_of(&wrela_gpu::Limits::webgpu_defaults());
     for target in wrela_abi::Target::ALL {
         let need = &target.limits().device;
         assert_eq!(defaults.short_of(need), Some("max_texture_size"));

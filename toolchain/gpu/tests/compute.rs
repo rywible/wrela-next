@@ -67,7 +67,7 @@ fn a_kernel_writes_a_buffer_the_cpu_reads_back() {
     let mut entries = vec![LayoutEntry {
         binding: 0,
         visibility: Stages::COMPUTE,
-        ty: BindingType::Storage { read_only: false },
+        ty: BindingType::Storage { read_only: false, dynamic: false, size: 0 },
     }];
     let sizes_buffer = p.sizes.as_ref().map(|s: &BufferSizes| {
         entries.push(LayoutEntry {

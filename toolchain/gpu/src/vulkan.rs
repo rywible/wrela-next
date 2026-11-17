@@ -7,11 +7,13 @@
 //! - **Memory**: one allocation a resource, from the first memory type that fits (device-local
 //!   for the GPU's own, host-visible and coherent for what the CPU maps). Every resource starts
 //!   zeroed, as WebGPU's do: a fill or a clear staged before the next submission's own work.
-//! - **Images** are always in `GENERAL`, which every use here takes (sampling, storage, copies,
-//!   attachments of dynamic rendering), so no layout is ever tracked.
-//! - **Hazards**: a full memory barrier between commands (dispatches, copies, passes): what any
-//!   one writes, the next sees. Correct before it's fast; a tracker of each resource's last use
-//!   replaces it where a measurement shows the cost.
+//!   Staged writes go through a belt of host-visible buffers reused once their submission is done.
+//! - **Images** rest in a home layout by their use (`GENERAL` where a kernel writes one, else
+//!   read-only optimal), and a pass or a copy moves what it uses out and back: in `GENERAL` (or
+//!   made `MUTABLE_FORMAT`) RADV keeps no compression of a target, which cost the opening 10%.
+//! - **Hazards**: a dispatch or a copy waits on a full memory barrier only when it reads or
+//!   writes what a command since the last barrier wrote, or writes what one read (each
+//!   encoder's sets of handles); a pass begins and ends with one.
 //! - **Bindings**: set 0, each layout entry numbered by its place among the layout's entries
 //!   (`wrela_abi::vulkan::descriptor`), a uniform at a dynamic offset as
 //!   `UNIFORM_BUFFER_DYNAMIC`.
@@ -50,7 +52,22 @@ struct Shared {
     errors: Arc<Mutex<Vec<String>>>,
     /// Pipelines and layouts made for each bind group layout, freed with the device.
     descriptor_pools: Mutex<Vec<vk::DescriptorPool>>,
+    /// Host-visible buffers staged writes are copied into, reused once their submission is done.
+    belt: Mutex<Belt>,
 }
+
+/// The staging belt: the buffer this submission's writes go into (and how much of it they
+/// fill), the full ones this submission also uses, and those earlier submissions use or used.
+#[derive(Default)]
+struct Belt {
+    current: Option<(Arc<RawBuffer>, u64)>,
+    filled: Vec<Arc<RawBuffer>>,
+    in_flight: Vec<(SubmissionIndex, Arc<RawBuffer>)>,
+    free: Vec<Arc<RawBuffer>>,
+}
+
+/// The least a staging buffer holds.
+const BELT_CHUNK: u64 = 4 << 20;
 
 // SAFETY: Vulkan's handles may be used from any thread when externally synchronized; the queue
 // and the pending list are behind mutexes, and the host records on one thread at a time.
@@ -68,13 +85,14 @@ enum Keep {
 }
 
 enum Pending {
-    /// Bytes from a staging buffer into a buffer.
-    Buffer { staging: Arc<RawBuffer>, dst: Arc<RawBuffer>, offset: u64, len: u64 },
+    /// Bytes from a staging buffer (at `at`) into a buffer.
+    Buffer { staging: Arc<RawBuffer>, at: u64, dst: Arc<RawBuffer>, offset: u64, len: u64 },
     /// Zeros over a whole buffer.
     Fill { dst: Arc<RawBuffer> },
     /// Texels from a staging buffer into a level and layer of an image.
     Texture {
         staging: Arc<RawBuffer>,
+        at: u64,
         bytes_per_row: u32,
         rows_per_image: u32,
         dst: Arc<RawImage>,
@@ -311,7 +329,6 @@ impl Device {
                 .timeline_semaphore(true)
                 .shader_float16(f16)
                 .host_query_reset(f12.host_query_reset == vk::TRUE)
-                .vulkan_memory_model(f12.vulkan_memory_model == vk::TRUE)
                 .shader_int8(f12.shader_int8 == vk::TRUE);
             let mut on13 = vk::PhysicalDeviceVulkan13Features::default()
                 .synchronization2(true)
@@ -427,6 +444,7 @@ impl Device {
                 in_flight: Mutex::new(Vec::new()),
                 errors,
                 descriptor_pools: Mutex::new(Vec::new()),
+                belt: Mutex::new(Belt::default()),
             })))
         }
     }
@@ -575,11 +593,12 @@ impl Device {
             let image = d
                 .create_image(
                     &vk::ImageCreateInfo::default()
+                        // Never MUTABLE_FORMAT: every view keeps its image's format, and the
+                        // flag would cost a target its compression (RADV drops DCC).
                         .flags(if cube {
                             vk::ImageCreateFlags::CUBE_COMPATIBLE
-                                | vk::ImageCreateFlags::MUTABLE_FORMAT
                         } else {
-                            vk::ImageCreateFlags::MUTABLE_FORMAT
+                            vk::ImageCreateFlags::empty()
                         })
                         .image_type(ty)
                         .format(format)
@@ -619,6 +638,13 @@ impl Device {
                     vk::ImageAspectFlags::DEPTH
                 } else {
                     vk::ImageAspectFlags::COLOR
+                },
+                home: if desc.usage.storage {
+                    vk::ImageLayout::GENERAL
+                } else if depth {
+                    vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL
+                } else {
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
                 },
                 levels,
                 layers: array,
@@ -764,6 +790,7 @@ impl Device {
             let mut images: Vec<[vk::DescriptorImageInfo; 1]> = Vec::new();
             let mut writes: Vec<(u32, vk::DescriptorType, bool, usize)> = Vec::new();
             let mut held = Vec::new();
+            let mut uses: Vec<(u64, bool)> = Vec::new();
             for e in entries {
                 let Some(k) = l.entries.iter().position(|x| x.binding == e.binding) else {
                     continue;
@@ -773,7 +800,8 @@ impl Device {
                     Resource::Buffer { buffer, offset, size } => {
                         let range = match (l.entries[k].ty, size) {
                             // A dynamic uniform's range is its block, at offsets the pass gives.
-                            (BindingType::Uniform { dynamic: true, size }, _) => size,
+                            (BindingType::Uniform { dynamic: true, size }, _)
+                            | (BindingType::Storage { dynamic: true, size, .. }, _) => size,
                             (_, Some(s)) => *s,
                             (_, None) => vk::WHOLE_SIZE,
                         };
@@ -784,15 +812,26 @@ impl Device {
                         }]);
                         writes.push((k as u32, ty, true, buffers.len() - 1));
                         held.push(Held::Buffer(buffer.raw.clone()));
+                        uses.push((
+                            vk::Handle::as_raw(buffer.raw.buffer),
+                            matches!(
+                                l.entries[k].ty,
+                                BindingType::Storage { read_only: false, .. }
+                            ),
+                        ));
                     }
                     Resource::View(v) => {
                         images.push([vk::DescriptorImageInfo {
                             sampler: vk::Sampler::null(),
                             image_view: v.raw.view,
-                            image_layout: vk::ImageLayout::GENERAL,
+                            image_layout: v.raw.image.home,
                         }]);
                         writes.push((k as u32, ty, false, images.len() - 1));
                         held.push(Held::View(v.raw.clone()));
+                        uses.push((
+                            vk::Handle::as_raw(v.raw.image.image),
+                            matches!(l.entries[k].ty, BindingType::StorageTexture { .. }),
+                        ));
                     }
                     Resource::Sampler(s) => {
                         images.push([vk::DescriptorImageInfo {
@@ -824,6 +863,7 @@ impl Device {
                 pool,
                 set,
                 _held: held,
+                uses,
             }))
         }
     }
@@ -960,9 +1000,10 @@ impl Device {
         if data.is_empty() {
             return;
         }
-        let staging = self.staging(data);
+        let (staging, at) = self.staging(data, 4);
         lock(&self.0.pending).push(Pending::Buffer {
             staging,
+            at,
             dst: buffer.raw.clone(),
             offset,
             len: data.len() as u64,
@@ -982,13 +1023,14 @@ impl Device {
         if data.is_empty() {
             return;
         }
-        let staging = self.staging(data);
+        let (staging, staged_at) = self.staging(data, 256);
         let (layer, z) = match at.texture.dimension {
             TextureDimension::D3 => (0, at.origin[2]),
             TextureDimension::D2 => (at.origin[2], 0),
         };
         lock(&self.0.pending).push(Pending::Texture {
             staging,
+            at: staged_at,
             bytes_per_row,
             rows_per_image,
             dst: at.texture.raw.clone(),
@@ -999,11 +1041,53 @@ impl Device {
         });
     }
 
-    fn staging(&self, data: &[u8]) -> Arc<RawBuffer> {
-        let b = self.raw_buffer(data.len() as u64, true, vk::BufferUsageFlags::TRANSFER_SRC);
-        // SAFETY: the mapping holds at least `data.len()` bytes.
-        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), b.mapped, data.len()) };
-        b
+    /// `data` copied into the staging belt at an offset aligned to `align`: the buffer and the
+    /// offset, which the next submission copies from.
+    fn staging(&self, data: &[u8], align: u64) -> (Arc<RawBuffer>, u64) {
+        let need = data.len() as u64;
+        let mut belt = lock(&self.0.belt);
+        let (buffer, at) = match belt.current.take() {
+            Some((b, used)) if used.next_multiple_of(align) + need <= b.size => {
+                let at = used.next_multiple_of(align);
+                (b, at)
+            }
+            other => {
+                if let Some((b, _)) = other {
+                    belt.filled.push(b);
+                }
+                let free = belt.free.iter().position(|b| b.size >= need);
+                let b = match free {
+                    Some(k) => belt.free.swap_remove(k),
+                    None => self.raw_buffer(
+                        need.max(BELT_CHUNK).next_power_of_two(),
+                        true,
+                        vk::BufferUsageFlags::TRANSFER_SRC,
+                    ),
+                };
+                (b, 0)
+            }
+        };
+        // SAFETY: the mapping holds `at + need` bytes; no submission uses this part of it yet.
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), buffer.mapped.add(at as usize), data.len())
+        };
+        belt.current = Some((buffer.clone(), at + need));
+        (buffer, at)
+    }
+
+    /// The staging belt's buffers this submission uses go in flight with it; those of
+    /// submissions done are free again.
+    fn turn_belt(&self, index: SubmissionIndex) {
+        let done = self.completed();
+        let mut belt = lock(&self.0.belt);
+        let current = belt.current.take().map(|c| c.0);
+        let used: Vec<_> = belt.filled.drain(..).chain(current).collect();
+        belt.in_flight.extend(used.into_iter().map(|b| (index, b)));
+        let (ready, busy): (Vec<_>, Vec<_>) =
+            belt.in_flight.drain(..).partition(|(i, _)| *i <= done);
+        belt.in_flight = busy;
+        belt.free.extend(ready.into_iter().map(|(_, b)| b));
+        belt.free.truncate(8);
     }
 
     /// Records the staged writes, then submits them and `buffers`, in order: their submission's
@@ -1011,6 +1095,7 @@ impl Device {
     pub fn submit(&self, buffers: Vec<CommandBuffer>) -> SubmissionIndex {
         let pending = std::mem::take(&mut *lock(&self.0.pending));
         let index = self.0.submitted.fetch_add(1, Ordering::AcqRel) + 1;
+        self.turn_belt(index);
         let mut keep: Vec<Keep> = Vec::new();
         let mut pools = Vec::new();
         let mut cbs = Vec::new();
@@ -1191,6 +1276,11 @@ impl Buffer {
         self.size
     }
 
+    /// Whether it and `other` are the same buffer (clones of one).
+    pub fn same(&self, other: &Buffer) -> bool {
+        Arc::ptr_eq(&self.raw, &other.raw)
+    }
+
     /// A mappable buffer's bytes `offset..offset + len`, read in place: its submission must be
     /// done.
     pub fn read(&self, offset: u64, len: u64) -> Result<Vec<u8>> {
@@ -1222,6 +1312,63 @@ struct RawImage {
     aspect: vk::ImageAspectFlags,
     levels: u32,
     layers: u32,
+    /// The layout it rests in between commands, by its use: `GENERAL` where a kernel writes it,
+    /// else read-only optimal. A command that uses it otherwise (a pass drawing into it, a
+    /// copy) moves what it uses out and back, so a compressed target stays compressed
+    /// (RADV keeps no DCC or HTILE in `GENERAL`).
+    home: vk::ImageLayout,
+}
+
+impl RawImage {
+    /// Every level and layer.
+    fn all(&self) -> vk::ImageSubresourceRange {
+        vk::ImageSubresourceRange {
+            aspect_mask: self.aspect,
+            base_mip_level: 0,
+            level_count: vk::REMAINING_MIP_LEVELS,
+            base_array_layer: 0,
+            layer_count: vk::REMAINING_ARRAY_LAYERS,
+        }
+    }
+
+    /// One level's layers `layer..layer + count`.
+    fn part(&self, level: u32, layer: u32, count: u32) -> vk::ImageSubresourceRange {
+        vk::ImageSubresourceRange {
+            aspect_mask: self.aspect,
+            base_mip_level: level,
+            level_count: 1,
+            base_array_layer: layer,
+            layer_count: count,
+        }
+    }
+}
+
+/// `range` of `image` moved from layout `from` to `to`, everything before done and visible to
+/// everything after.
+fn transition(
+    d: &ash::Device,
+    cb: vk::CommandBuffer,
+    image: vk::Image,
+    range: vk::ImageSubresourceRange,
+    from: vk::ImageLayout,
+    to: vk::ImageLayout,
+) {
+    if from == to {
+        return;
+    }
+    let barrier = [vk::ImageMemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+        .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
+        .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+        .dst_access_mask(vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE)
+        .old_layout(from)
+        .new_layout(to)
+        .image(image)
+        .subresource_range(range)];
+    // SAFETY: a layout transition in a recording command buffer.
+    unsafe {
+        d.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().image_memory_barriers(&barrier))
+    };
 }
 
 impl Drop for RawImage {
@@ -1234,6 +1381,7 @@ impl Drop for RawImage {
     }
 }
 
+#[derive(Clone)]
 pub struct Texture {
     raw: Arc<RawImage>,
     format: TextureFormat,
@@ -1299,6 +1447,7 @@ impl Texture {
             raw: Arc::new(RawView {
                 image: self.raw.clone(),
                 view,
+                range,
                 width: (self.width >> level).max(1),
                 height: (self.height >> level).max(1),
             }),
@@ -1309,6 +1458,8 @@ impl Texture {
 struct RawView {
     image: Arc<RawImage>,
     view: vk::ImageView,
+    /// Its levels and layers.
+    range: vk::ImageSubresourceRange,
     width: u32,
     height: u32,
 }
@@ -1320,6 +1471,7 @@ impl Drop for RawView {
     }
 }
 
+#[derive(Clone)]
 pub struct TextureView {
     raw: Arc<RawView>,
 }
@@ -1336,6 +1488,7 @@ impl Drop for RawSampler {
     }
 }
 
+#[derive(Clone)]
 pub struct Sampler {
     raw: Arc<RawSampler>,
 }
@@ -1353,6 +1506,7 @@ impl Drop for RawQueries {
     }
 }
 
+#[derive(Clone)]
 pub struct QuerySet {
     raw: Arc<RawQueries>,
 }
@@ -1375,6 +1529,7 @@ impl Drop for RawModule {
     }
 }
 
+#[derive(Clone)]
 pub struct ShaderModule {
     raw: Arc<RawModule>,
 }
@@ -1391,11 +1546,13 @@ impl Drop for RawPipeline {
     }
 }
 
+#[derive(Clone)]
 pub struct ComputePipeline {
     raw: Arc<RawPipeline>,
     layout: Arc<Layout>,
 }
 
+#[derive(Clone)]
 pub struct RenderPipeline {
     raw: Arc<RawPipeline>,
     layout: Arc<Layout>,
@@ -1418,6 +1575,7 @@ impl Drop for Layout {
     }
 }
 
+#[derive(Clone)]
 pub struct BindGroupLayout(Arc<Layout>);
 
 /// A resource a bind group or a command holds alive (never read but to keep it).
@@ -1435,6 +1593,9 @@ struct Group {
     set: vk::DescriptorSet,
     /// The resources it binds, alive while it is.
     _held: Vec<Held>,
+    /// What it binds by its handle (a buffer's or an image's), and whether a shader may write
+    /// it: what a command that sets it uses, for the encoder's hazards.
+    uses: Vec<(u64, bool)>,
 }
 
 impl Drop for Group {
@@ -1446,6 +1607,7 @@ impl Drop for Group {
     }
 }
 
+#[derive(Clone)]
 pub struct BindGroup(Arc<Group>);
 
 // ---- recording ------------------------------------------------------------------------------------
@@ -1459,6 +1621,9 @@ pub struct CommandEncoder {
     groups: Vec<Arc<Group>>,
     pipelines: Vec<Arc<RawPipeline>>,
     held: Vec<Held>,
+    /// The resources written, and read, since the last barrier, by handle.
+    written: std::collections::HashSet<u64>,
+    read: std::collections::HashSet<u64>,
 }
 
 pub struct CommandBuffer {
@@ -1518,12 +1683,34 @@ impl CommandEncoder {
                 groups: Vec::new(),
                 pipelines: Vec::new(),
                 held: Vec::new(),
+                written: std::collections::HashSet::new(),
+                read: std::collections::HashSet::new(),
             }
         }
     }
 
     fn d(&self) -> &ash::Device {
         &self.device.0.raw
+    }
+
+    /// Before a command that reads `reads` and writes `writes`: a barrier, if it reads or
+    /// writes what a command since the last one wrote, or writes what one read; then notes
+    /// its own.
+    fn hazard(&mut self, reads: &[u64], writes: &[u64]) {
+        let conflict = reads.iter().any(|r| self.written.contains(r))
+            || writes.iter().any(|w| self.written.contains(w) || self.read.contains(w));
+        if conflict {
+            self.barrier_all();
+        }
+        self.read.extend(reads);
+        self.written.extend(writes);
+    }
+
+    /// The full barrier, and nothing pending after it.
+    fn barrier_all(&mut self) {
+        full_barrier(self.d(), self.raw);
+        self.written.clear();
+        self.read.clear();
     }
 
     /// One staged write.
@@ -1534,9 +1721,9 @@ impl CommandEncoder {
         unsafe {
             let d = &self.device.0.raw;
             match w {
-                Pending::Buffer { staging, dst, offset, len } => {
+                Pending::Buffer { staging, at, dst, offset, len } => {
                     let region =
-                        [vk::BufferCopy { src_offset: 0, dst_offset: *offset, size: *len }];
+                        [vk::BufferCopy { src_offset: *at, dst_offset: *offset, size: *len }];
                     d.cmd_copy_buffer(cb, staging.buffer, dst.buffer, &region);
                     keep.push(Keep::Buffer(staging.clone()));
                     keep.push(Keep::Buffer(dst.clone()));
@@ -1547,6 +1734,7 @@ impl CommandEncoder {
                 }
                 Pending::Texture {
                     staging,
+                    at,
                     bytes_per_row,
                     rows_per_image,
                     dst,
@@ -1557,7 +1745,7 @@ impl CommandEncoder {
                 } => {
                     let texel = format_texel(dst.format);
                     let region = [vk::BufferImageCopy {
-                        buffer_offset: 0,
+                        buffer_offset: *at,
                         buffer_row_length: bytes_per_row / texel.0 * texel.1,
                         buffer_image_height: rows_per_image * texel.1,
                         image_subresource: vk::ImageSubresourceLayers {
@@ -1577,43 +1765,23 @@ impl CommandEncoder {
                             depth: extent[2],
                         },
                     }];
-                    d.cmd_copy_buffer_to_image(
-                        cb,
-                        staging.buffer,
-                        dst.image,
-                        vk::ImageLayout::GENERAL,
-                        &region,
-                    );
+                    let part = dst.part(*level, *layer, 1);
+                    let to = vk::ImageLayout::TRANSFER_DST_OPTIMAL;
+                    transition(d, cb, dst.image, part, dst.home, to);
+                    d.cmd_copy_buffer_to_image(cb, staging.buffer, dst.image, to, &region);
+                    transition(d, cb, dst.image, part, to, dst.home);
                     keep.push(Keep::Buffer(staging.clone()));
                 }
                 Pending::Clear { dst } => {
-                    // From nothing to GENERAL, where it stays, then zeroed.
-                    let range = vk::ImageSubresourceRange {
-                        aspect_mask: dst.aspect,
-                        base_mip_level: 0,
-                        level_count: vk::REMAINING_MIP_LEVELS,
-                        base_array_layer: 0,
-                        layer_count: vk::REMAINING_ARRAY_LAYERS,
-                    };
-                    let to_general = [vk::ImageMemoryBarrier2::default()
-                        .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-                        .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-                        .dst_access_mask(
-                            vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE,
-                        )
-                        .old_layout(vk::ImageLayout::UNDEFINED)
-                        .new_layout(vk::ImageLayout::GENERAL)
-                        .image(dst.image)
-                        .subresource_range(range)];
-                    d.cmd_pipeline_barrier2(
-                        cb,
-                        &vk::DependencyInfo::default().image_memory_barriers(&to_general),
-                    );
+                    // From nothing to a copy's target, zeroed, then home.
+                    let range = dst.all();
+                    let to = vk::ImageLayout::TRANSFER_DST_OPTIMAL;
+                    transition(d, cb, dst.image, range, vk::ImageLayout::UNDEFINED, to);
                     if dst.aspect == vk::ImageAspectFlags::DEPTH {
                         d.cmd_clear_depth_stencil_image(
                             cb,
                             dst.image,
-                            vk::ImageLayout::GENERAL,
+                            to,
                             &vk::ClearDepthStencilValue { depth: 0.0, stencil: 0 },
                             &[range],
                         );
@@ -1621,11 +1789,12 @@ impl CommandEncoder {
                         d.cmd_clear_color_image(
                             cb,
                             dst.image,
-                            vk::ImageLayout::GENERAL,
+                            to,
                             &vk::ClearColorValue { uint32: [0; 4] },
                             &[range],
                         );
                     }
+                    transition(d, cb, dst.image, range, to, dst.home);
                 }
             }
             full_barrier(d, cb);
@@ -1640,12 +1809,16 @@ impl CommandEncoder {
         dst_offset: u64,
         size: u64,
     ) {
+        // An empty copy is nothing (WebGPU allows one; Vulkan doesn't).
+        if size == 0 {
+            return;
+        }
         let region = [vk::BufferCopy { src_offset, dst_offset, size }];
+        self.hazard(&[vk::Handle::as_raw(src.raw.buffer)], &[vk::Handle::as_raw(dst.raw.buffer)]);
         // SAFETY: a copy between live buffers the encoder keeps.
         unsafe { self.d().cmd_copy_buffer(self.raw, src.raw.buffer, dst.raw.buffer, &region) };
         self.held.push(Held::Buffer(src.raw.clone()));
         self.held.push(Held::Buffer(dst.raw.clone()));
-        full_barrier(self.d(), self.raw);
     }
 
     fn buffer_image(
@@ -1691,19 +1864,31 @@ impl CommandEncoder {
         dst: TextureCopy<'_>,
         extent: [u32; 3],
     ) {
+        if extent.contains(&0) {
+            return;
+        }
         let region = [Self::buffer_image(&src, &dst, extent)];
+        self.hazard(
+            &[vk::Handle::as_raw(src.buffer.raw.buffer)],
+            &[vk::Handle::as_raw(dst.texture.raw.image)],
+        );
+        let image = &dst.texture.raw;
+        let sub = region[0].image_subresource;
+        let part = image.part(sub.mip_level, sub.base_array_layer, sub.layer_count);
+        let to = vk::ImageLayout::TRANSFER_DST_OPTIMAL;
+        transition(self.d(), self.raw, image.image, part, image.home, to);
         // SAFETY: a copy between live resources the encoder keeps.
         unsafe {
             self.d().cmd_copy_buffer_to_image(
                 self.raw,
                 src.buffer.raw.buffer,
-                dst.texture.raw.image,
-                vk::ImageLayout::GENERAL,
+                image.image,
+                to,
                 &region,
             )
         };
+        transition(self.d(), self.raw, image.image, part, to, image.home);
         self.held.push(Held::Buffer(src.buffer.raw.clone()));
-        full_barrier(self.d(), self.raw);
     }
 
     pub fn copy_texture_to_buffer(
@@ -1712,19 +1897,31 @@ impl CommandEncoder {
         dst: BufferCopy<'_>,
         extent: [u32; 3],
     ) {
+        if extent.contains(&0) {
+            return;
+        }
         let region = [Self::buffer_image(&dst, &src, extent)];
+        self.hazard(
+            &[vk::Handle::as_raw(src.texture.raw.image)],
+            &[vk::Handle::as_raw(dst.buffer.raw.buffer)],
+        );
+        let image = &src.texture.raw;
+        let sub = region[0].image_subresource;
+        let part = image.part(sub.mip_level, sub.base_array_layer, sub.layer_count);
+        let from = vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
+        transition(self.d(), self.raw, image.image, part, image.home, from);
         // SAFETY: a copy between live resources the encoder keeps.
         unsafe {
             self.d().cmd_copy_image_to_buffer(
                 self.raw,
-                src.texture.raw.image,
-                vk::ImageLayout::GENERAL,
+                image.image,
+                from,
                 dst.buffer.raw.buffer,
                 &region,
             )
         };
+        transition(self.d(), self.raw, image.image, part, from, image.home);
         self.held.push(Held::Buffer(dst.buffer.raw.clone()));
-        full_barrier(self.d(), self.raw);
     }
 
     pub fn copy_texture_to_texture(
@@ -1733,6 +1930,9 @@ impl CommandEncoder {
         dst: TextureCopy<'_>,
         extent: [u32; 3],
     ) {
+        if extent.contains(&0) {
+            return;
+        }
         let layers_of = |t: &TextureCopy<'_>| match t.texture.dimension {
             TextureDimension::D3 => (0, t.origin[2], 1),
             TextureDimension::D2 => (t.origin[2], 0, extent[2]),
@@ -1768,18 +1968,27 @@ impl CommandEncoder {
             },
             extent: vk::Extent3D { width: extent[0], height: extent[1], depth },
         }];
-        // SAFETY: a copy between live images.
-        unsafe {
-            self.d().cmd_copy_image(
-                self.raw,
-                src.texture.raw.image,
-                vk::ImageLayout::GENERAL,
-                dst.texture.raw.image,
-                vk::ImageLayout::GENERAL,
-                &region,
-            )
+        self.hazard(
+            &[vk::Handle::as_raw(src.texture.raw.image)],
+            &[vk::Handle::as_raw(dst.texture.raw.image)],
+        );
+        let (a, b) = (&src.texture.raw, &dst.texture.raw);
+        let pa = a.part(src.level, sl, n);
+        let pb = b.part(dst.level, dl, n);
+        // (One image to another place of itself: the general layout for both.)
+        let same = a.image == b.image;
+        let (from, to) = if same {
+            (vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL)
+        } else {
+            (vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::ImageLayout::TRANSFER_DST_OPTIMAL)
         };
-        full_barrier(self.d(), self.raw);
+        let (d, cb) = (self.d(), self.raw);
+        transition(d, cb, a.image, pa, a.home, from);
+        transition(d, cb, b.image, pb, b.home, to);
+        // SAFETY: a copy between live images.
+        unsafe { d.cmd_copy_image(cb, a.image, from, b.image, to, &region) };
+        transition(d, cb, a.image, pa, from, a.home);
+        transition(d, cb, b.image, pb, to, b.home);
     }
 
     /// Timestamps `first..first + count` as 64-bit ticks into `dst` at `offset`.
@@ -1791,6 +2000,7 @@ impl CommandEncoder {
         dst: &Buffer,
         offset: u64,
     ) {
+        self.barrier_all();
         // SAFETY: results of written queries, into a live buffer.
         unsafe {
             self.d().cmd_copy_query_pool_results(
@@ -1805,7 +2015,7 @@ impl CommandEncoder {
             )
         };
         self.held.push(Held::Buffer(dst.raw.clone()));
-        full_barrier(self.d(), self.raw);
+        self.barrier_all();
     }
 
     fn timestamp(&mut self, queries: &QuerySet, index: u32, end: bool) {
@@ -1843,18 +2053,31 @@ impl CommandEncoder {
         let _ = label;
         self.reset(timestamps);
         let end = timestamps.map(|t| (t.queries.raw.clone(), t.end));
-        ComputePass { encoder: self, layout: None, end }
+        ComputePass { encoder: self, layout: None, end, bound: None }
     }
 
     pub fn begin_render_pass(&mut self, desc: &RenderPassDesc<'_>) -> RenderPass<'_> {
+        self.barrier_all();
         self.reset(desc.timestamps);
+        // Its targets, out of their homes into the layouts drawing takes.
+        let mut targets: Vec<(Arc<RawView>, vk::ImageLayout)> = desc
+            .colors
+            .iter()
+            .map(|c| (c.view.raw.clone(), vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL))
+            .collect();
+        if let Some(d) = &desc.depth {
+            targets.push((d.view.raw.clone(), vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL));
+        }
+        for (v, to) in &targets {
+            transition(self.d(), self.raw, v.image.image, v.range, v.image.home, *to);
+        }
         let colors: Vec<vk::RenderingAttachmentInfo<'_>> = desc
             .colors
             .iter()
             .map(|c| {
                 let a = vk::RenderingAttachmentInfo::default()
                     .image_view(c.view.raw.view)
-                    .image_layout(vk::ImageLayout::GENERAL)
+                    .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
                     .store_op(vk::AttachmentStoreOp::STORE);
                 match c.load {
                     LoadOp::Load => a.load_op(vk::AttachmentLoadOp::LOAD),
@@ -1869,7 +2092,7 @@ impl CommandEncoder {
         let depth = desc.depth.as_ref().map(|d| {
             let a = vk::RenderingAttachmentInfo::default()
                 .image_view(d.view.raw.view)
-                .image_layout(vk::ImageLayout::GENERAL)
+                .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
                 .store_op(vk::AttachmentStoreOp::STORE);
             match d.load {
                 LoadOp::Load => a.load_op(vk::AttachmentLoadOp::LOAD),
@@ -1908,22 +2131,11 @@ impl CommandEncoder {
         unsafe {
             let d = self.d();
             d.cmd_begin_rendering(self.raw, &info);
-            d.cmd_set_viewport(
-                self.raw,
-                0,
-                &[vk::Viewport {
-                    x: 0.0,
-                    y: 0.0,
-                    width: w as f32,
-                    height: h as f32,
-                    min_depth: 0.0,
-                    max_depth: 1.0,
-                }],
-            );
+            d.cmd_set_viewport(self.raw, 0, &[viewport(0.0, 0.0, w as f32, h as f32, 0.0, 1.0)]);
             d.cmd_set_scissor(self.raw, 0, &[area]);
         }
         let end = desc.timestamps.map(|t| (t.queries.raw.clone(), t.end));
-        RenderPass { encoder: self, layout: None, index: None, end }
+        RenderPass { encoder: self, layout: None, index: None, end, targets }
     }
 
     pub fn finish(mut self) -> CommandBuffer {
@@ -1963,6 +2175,8 @@ pub struct ComputePass<'a> {
     encoder: &'a mut CommandEncoder,
     layout: Option<vk::PipelineLayout>,
     end: Option<(Arc<RawQueries>, u32)>,
+    /// The bind group set: what the next dispatch uses.
+    bound: Option<Arc<Group>>,
 }
 
 impl ComputePass<'_> {
@@ -1995,21 +2209,34 @@ impl ComputePass<'_> {
             };
         }
         self.encoder.groups.push(group.0.clone());
+        self.bound = Some(group.0.clone());
+    }
+
+    /// The bound group's resources a dispatch reads and writes, with `extra` read too.
+    fn uses(&self, extra: Option<u64>) -> (Vec<u64>, Vec<u64>) {
+        let mut reads: Vec<u64> = extra.into_iter().collect();
+        let mut writes = Vec::new();
+        for &(h, w) in self.bound.iter().flat_map(|g| g.uses.iter()) {
+            if w { writes.push(h) } else { reads.push(h) }
+        }
+        (reads, writes)
     }
 
     pub fn dispatch(&mut self, x: u32, y: u32, z: u32) {
-        // SAFETY: a dispatch of the bound pipeline; what it writes, the next command sees.
+        let (reads, writes) = self.uses(None);
+        self.encoder.hazard(&reads, &writes);
+        // SAFETY: a dispatch of the bound pipeline, after any barrier its uses need.
         unsafe { self.encoder.d().cmd_dispatch(self.encoder.raw, x, y, z) };
-        full_barrier(self.encoder.d(), self.encoder.raw);
     }
 
     pub fn dispatch_indirect(&mut self, buffer: &Buffer, offset: u64) {
+        let (reads, writes) = self.uses(Some(vk::Handle::as_raw(buffer.raw.buffer)));
+        self.encoder.hazard(&reads, &writes);
         // SAFETY: an indirect dispatch of the bound pipeline, from a live buffer.
         unsafe {
             self.encoder.d().cmd_dispatch_indirect(self.encoder.raw, buffer.raw.buffer, offset)
         };
         self.encoder.held.push(Held::Buffer(buffer.raw.clone()));
-        full_barrier(self.encoder.d(), self.encoder.raw);
     }
 }
 
@@ -2032,6 +2259,8 @@ impl Drop for ComputePass<'_> {
 
 pub struct RenderPass<'a> {
     encoder: &'a mut CommandEncoder,
+    /// Its targets, and the layouts they're in while it draws: home again as it ends.
+    targets: Vec<(Arc<RawView>, vk::ImageLayout)>,
     layout: Option<vk::PipelineLayout>,
     /// The index buffer and its offset, for the indexed draws after it.
     index: Option<(vk::Buffer, u64)>,
@@ -2076,7 +2305,7 @@ impl RenderPass<'_> {
             self.encoder.d().cmd_set_viewport(
                 self.encoder.raw,
                 0,
-                &[vk::Viewport { x, y, width: w, height: h, min_depth: min, max_depth: max }],
+                &[viewport(x, y, w, h, min, max)],
             )
         };
     }
@@ -2198,11 +2427,28 @@ impl Drop for RenderPass<'_> {
             };
             self.encoder.keep.push(Keep::Queries(q));
         }
-        full_barrier(self.encoder.d(), self.encoder.raw);
+        for (v, from) in std::mem::take(&mut self.targets) {
+            transition(
+                self.encoder.d(),
+                self.encoder.raw,
+                v.image.image,
+                v.range,
+                from,
+                v.image.home,
+            );
+        }
+        self.encoder.barrier_all();
     }
 }
 
 // ---- conversions ----------------------------------------------------------------------------------
+
+/// A WebGPU viewport as Vulkan's: flipped, a negative height from its bottom edge, as wgpu-hal
+/// does, since WebGPU's clip space has y up and Vulkan's down (and the compiler's SPIR-V writes
+/// WebGPU's positions).
+fn viewport(x: f32, y: f32, w: f32, h: f32, min: f32, max: f32) -> vk::Viewport {
+    vk::Viewport { x, y: y + h, width: w, height: -h, min_depth: min, max_depth: max }
+}
 
 pub fn vk_format(f: TextureFormat) -> vk::Format {
     match f {
@@ -2270,7 +2516,8 @@ fn descriptor_type(t: BindingType) -> vk::DescriptorType {
     match t {
         BindingType::Uniform { dynamic: true, .. } => vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC,
         BindingType::Uniform { dynamic: false, .. } => vk::DescriptorType::UNIFORM_BUFFER,
-        BindingType::Storage { .. } => vk::DescriptorType::STORAGE_BUFFER,
+        BindingType::Storage { dynamic: true, .. } => vk::DescriptorType::STORAGE_BUFFER_DYNAMIC,
+        BindingType::Storage { dynamic: false, .. } => vk::DescriptorType::STORAGE_BUFFER,
         BindingType::Texture { .. } => vk::DescriptorType::SAMPLED_IMAGE,
         BindingType::StorageTexture { .. } => vk::DescriptorType::STORAGE_IMAGE,
         BindingType::Sampler { .. } => vk::DescriptorType::SAMPLER,

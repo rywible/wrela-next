@@ -134,6 +134,33 @@ pub struct Limits {
     pub max_compute_workgroups_per_dimension: u32,
 }
 
+impl Limits {
+    /// WebGPU's default limits (the WebGPU specification's limits table): what a browser's
+    /// device has unless it asks for more.
+    pub fn webgpu_defaults() -> Limits {
+        Limits {
+            max_texture_dimension_2d: 8192,
+            max_texture_dimension_3d: 2048,
+            max_texture_array_layers: 256,
+            max_buffer_size: 256 << 20,
+            max_storage_buffer_binding_size: 128 << 20,
+            max_uniform_buffer_binding_size: 64 << 10,
+            max_storage_buffers_per_shader_stage: 8,
+            max_sampled_textures_per_shader_stage: 16,
+            max_samplers_per_shader_stage: 16,
+            max_storage_textures_per_shader_stage: 4,
+            max_color_attachments: 8,
+            max_color_attachment_bytes_per_sample: 32,
+            min_uniform_buffer_offset_alignment: 256,
+            min_storage_buffer_offset_alignment: 256,
+            max_compute_workgroup_storage_size: 16384,
+            max_compute_invocations_per_workgroup: 256,
+            max_compute_workgroup_size: [256, 256, 64],
+            max_compute_workgroups_per_dimension: 65535,
+        }
+    }
+}
+
 /// The optional features a device has, by WebGPU's names (`wrela_abi::FEATURES`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Features(pub Vec<&'static str>);
@@ -247,9 +274,12 @@ pub enum BindingType {
         dynamic: bool,
         size: u64,
     },
-    /// A storage buffer.
+    /// A storage buffer: at a dynamic offset, `size` bytes of it (a uniform block held in
+    /// storage), or not.
     Storage {
         read_only: bool,
+        dynamic: bool,
+        size: u64,
     },
     Texture {
         sample_type: SampleType,
@@ -267,6 +297,14 @@ pub enum BindingType {
 }
 
 impl BindingType {
+    /// Whether it's bound at a dynamic offset, given when its group is set.
+    pub fn dynamic(self) -> bool {
+        matches!(
+            self,
+            BindingType::Uniform { dynamic: true, .. } | BindingType::Storage { dynamic: true, .. }
+        )
+    }
+
     /// Which of a Metal stage's argument tables it takes a slot of: 0 buffers, 1 textures, 2
     /// samplers (`wrela_abi::metal::Table`'s order).
     pub fn table(self) -> u8 {
