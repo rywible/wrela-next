@@ -21,15 +21,16 @@
 // Static and filled once: the structure a volume filled on demand would hold, without the demand.
 
 use form::kinds::Solid
-use form::look::{Look, Place}
+use form::look::{Look, Place, Skin}
 use form::shade::STILL
 use frame::eye::{Eye, NEARER}
 use frame::last::cover
-use frame::light::{Lighting, sun_reach, worn}
+use frame::light::{Lighting, Shaded, sun_reach, worn}
 use frame::picture::{EDGE_REACH, Frame, NO_EDGE, NO_LINE, SOLID, edge_record, identity}
 use std::gpu::{
+    ClipPosition, DrawArgs, InstanceIndex, R32Uint, Slots, Texels, VertexIndex, writable_texture,
     Address, Append, AppendBuffer, Atomics, Filter, FragCoord, GlobalId, GpuBuffer, Rg32Float,
-    Rg32Uint, Rgba16Float, Sampler, Targets3, Texels3d, Texture, Texture3d, WithDepth, append_buffer,
+    Rg32Uint, Rgba16Float, Rgba8, Sampler, Targets3, Texels3d, Texture, Texture3d, WithDepth, append_buffer,
     begin_pass, begin_pass3_with_depth, buffer, dispatch, draw, label, read, sampler, texture,
     texture3d,
 }
@@ -60,8 +61,23 @@ const MOST_STEPS: u32 = 1024
 const TOUCH: f32 = 0.02
 const LEAST: f32 = 0.25
 
+/// How many steps through bricks a ray takes before its least step has doubled.
+const SKIM: f32 = 8.0
+
+/// Where a ray steps to the surface's tangent plane rather than by the distance: the stored
+/// distance under this share of a brick (where the facing stored with it is the surface's).
+const PLANE: f32 = 0.5
+
 /// Where the fold field is read for an outline: facing the eye less than this.
 const FOLD_NEAR: f32 = 0.45
+
+/// How far before the nearest of its scouting rays' meetings a joined pixel starts, in the
+/// scouting rays' footprints.
+const MARGIN: f32 = 2.0
+
+/// How near the four scouting rays' tangent planes must put a joined pixel's ray's meeting, in
+/// the scouting rays' footprints, for it to be read once from there rather than walked.
+const AGREE: f32 = 0.5
 
 /// The volume's frame as every kernel and pixel program reads it: its least corner (m), a fine
 /// cell's side (m), its coarse cells along x, y and z and how many bricks it kept (`size.w`), the
@@ -76,7 +92,11 @@ pub struct Grid: Copy + GpuData {
     /// took instead of its colour (1).
     pub most: u32,
     pub debug: u32,
-    pub spare: vec2,
+    /// Whether a pixel wears the albedo stored in the cells (1) or asks the look (0).
+    pub stored: u32,
+    /// Whether a joined pixel whose scouts agree reads the volume once (1) or takes its facing
+    /// and albedo from its four scouts alone (0).
+    pub reads: u32,
 }
 
 /// The most invocations of a filling kernel in one dispatch (its work bound times this stays
@@ -84,12 +104,19 @@ pub struct Grid: Copy + GpuData {
 const BAND: u32 = 2097152
 const BANDS_A_FRAME: u32 = 4
 
+/// The same for the deposit, which also asks the look at each texel (its bound is ten times the
+/// coarse grid's).
+const DEPOSIT_BAND: u32 = 262144
+const DEPOSITS_A_FRAME: u32 = 16
+
 /// A form's volume, and where its filling stands.
 pub struct Volume<S> {
     pub form: S,
     pub grid: Grid,
     coarse: Texture3d<Rg32Uint>,
     atlas: Texture3d<Rgba16Float>,
+    /// The look's albedo at each atlas texel (its square root, so the darks keep their steps).
+    albedo: Texture3d<Rgba8>,
     bricks: AppendBuffer<u32>,
     /// What the filling kernels write, two words a coarse cell or an atlas texel, before a copy
     /// puts it in its texture (a kernel stores only its own texel, so a texture can't be filled a
@@ -104,6 +131,10 @@ pub struct Volume<S> {
     s: Sampler,
     /// The scouting march's texels: how far along each met the form and first came near it.
     scout: Texture<Rg32Float>,
+    /// Each scouting block's class, the edge blocks listed, and the draw of them.
+    classes: Texture<R32Uint>,
+    edges: AppendBuffer<u32>,
+    draws: GpuBuffer<DrawArgs>,
 }
 
 /// `form`'s volume, its fine cells `cell` m a side, over a cube round its bound.
@@ -123,10 +154,12 @@ pub fn volume<S: Solid>(form: S, cell: f32) -> Volume<S> {
             steep: max(form.lipschitz(brick), 1.0),
             most: MOST_STEPS,
             debug: 0,
-            spare: vec2(0.0),
+            stored: 0,
+            reads: 1,
         },
         coarse: texture3d(width: n, height: n, depth: n),
         atlas: texture3d(width: 1, height: 1, depth: 1),
+        albedo: texture3d(width: 1, height: 1, depth: 1),
         bricks: append_buffer(MOST_BRICKS),
         raw: buffer(2 * n * n * n),
         counted: None,
@@ -135,6 +168,9 @@ pub fn volume<S: Solid>(form: S, cell: f32) -> Volume<S> {
         total: n * n * n,
         s: sampler(filter: Filter::Linear, address: Address::Clamp),
         scout: texture(width: 1, height: 1),
+        classes: writable_texture(width: 1, height: 1),
+        edges: append_buffer(1),
+        draws: buffer(1),
     }
 }
 
@@ -156,6 +192,33 @@ fn unfolded(w: u32) -> vec3 {
     v.x += if v.x >= 0.0 { -t } else { t }
     v.z += if v.z >= 0.0 { -t } else { t }
     normalize(v)
+}
+
+/// A unit vector and an albedo in one word: the vector folded onto an octahedron, 8 bits each
+/// way; the albedo's square root in 5, 6 and 5 bits. And back.
+fn packed(n: vec3, albedo: vec3) -> u32 {
+    let a = n / (abs(n.x) + abs(n.y) + abs(n.z))
+    var e = a.xz
+    if a.y < 0.0 {
+        e = (vec2(1.0) - abs(vec2(a.z, a.x))) * vec2(if a.x >= 0.0 { 1.0 } else { -1.0 }, if a.z >= 0.0 { 1.0 } else { -1.0 })
+    }
+    let q = clamp(e * 0.5 + vec2(0.5), vec2(0.0), vec2(1.0)) * 255.0 + vec2(0.5)
+    let r = sqrt(saturate(albedo)) * vec3(31.0, 63.0, 31.0) + vec3(0.5)
+    u32(q.x) | (u32(q.y) << 8) | (u32(r.x) << 16) | (u32(r.y) << 21) | (u32(r.z) << 27)
+}
+
+fn unpacked_way(w: u32) -> vec3 {
+    let e = vec2(f32(w & 255), f32((w >> 8) & 255)) / 255.0 * 2.0 - vec2(1.0)
+    var v = vec3(e.x, 1.0 - abs(e.x) - abs(e.y), e.y)
+    let t = max(-v.y, 0.0)
+    v.x += if v.x >= 0.0 { -t } else { t }
+    v.z += if v.z >= 0.0 { -t } else { t }
+    normalize(v)
+}
+
+fn unpacked_albedo(w: u32) -> vec3 {
+    let r = vec3(f32((w >> 16) & 31) / 31.0, f32((w >> 21) & 63) / 63.0, f32(w >> 27) / 31.0)
+    r * r
 }
 
 /// Coarse cells `first` on: whether the surface may pass through each one's brick (kept, given
@@ -190,7 +253,7 @@ fn coarse_copied(raw: [u32], g: Grid, out: mut Texels3d<Rg32Uint>, id: GlobalId)
 
 /// Atlas texels `first` on, brick by brick: the form's distance and facing at each one's place.
 @compute(64)
-fn deposited<S: Solid>(form: S, g: Grid, bricks: [u32], first: u32, out: mut Atomics<u32>, id: GlobalId) {
+fn deposited<S: Solid, L: Look>(form: S, look: L, g: Grid, bricks: [u32], first: u32, out: mut Atomics<u32>, id: GlobalId) {
     let i = first + id.x
     let slot = i / (BS * BS * BS)
     if slot >= g.size.w {
@@ -203,28 +266,35 @@ fn deposited<S: Solid>(form: S, g: Grid, bricks: [u32], first: u32, out: mut Ato
     let p = g.lo + (at * f32(B) + local) * g.cell
     let (f, grad) = form.sample(p)
     let len = max(length(grad), 1.0e-6)
-    let _ = out.exchange(i: 2 * i, value: bitcast_u32(f / len))
-    let _ = out.exchange(i: 2 * i + 1, value: folded(grad / len))
+    let n = grad / len
+    let skin = look.skin(Place { world: p, rest: p, chart: None, normal: n })
+    let a = sqrt(saturate(skin.albedo)) * 255.0 + vec3(0.5)
+    let _ = out.exchange(i: 3 * i, value: bitcast_u32(f / len))
+    let _ = out.exchange(i: 3 * i + 1, value: folded(n))
+    let _ = out.exchange(i: 3 * i + 2, value: u32(a.x) | (u32(a.y) << 8) | (u32(a.z) << 16))
 }
 
 /// The atlas put in its texture: each texel's brick and place in it, read from what `deposited`
 /// wrote.
 @compute(4, 4, 4)
-fn atlas_copied(raw: [u32], g: Grid, out: mut Texels3d<Rgba16Float>, id: GlobalId) {
+fn atlas_copied(raw: [u32], g: Grid, out: mut Texels3d<Rgba16Float>, albedo: mut Texels3d<Rgba8>, id: GlobalId) {
     let slot = id.x / BS + ROW * (id.y / BS + ROW * (id.z / BS))
     if slot >= g.size.w {
         out.store(id, vec4(1.0, 0.0, 0.0, 0.0))
+        albedo.store(id, vec4(0.0))
         return
     }
     let i = slot * BS * BS * BS + id.x % BS + BS * (id.y % BS + BS * (id.z % BS))
-    out.store(id, vec4(bitcast_f32(raw[2 * i]), unfolded(raw[2 * i + 1])))
+    out.store(id, vec4(bitcast_f32(raw[3 * i]), unfolded(raw[3 * i + 1])))
+    let a = raw[3 * i + 2]
+    albedo.store(id, vec4(f32(a & 255), f32((a >> 8) & 255), f32((a >> 16) & 255), 255.0) / 255.0)
 }
 
 impl<S: Solid> Volume<S> {
     /// Some of the filling, `BANDS_A_FRAME` dispatches of it a frame: the coarse grid in bands
     /// and its count asked for; then, once the count is read, the atlas made to hold the bricks
     /// kept and filled in bands; each copied into its texture when its last band is done.
-    pub fn fill(mut self) {
+    pub fn fill<L: Look>(mut self, look: L) {
         if self.stage == 0 {
             label("coarse")
             for _b in 0..BANDS_A_FRAME {
@@ -254,7 +324,8 @@ impl<S: Solid> Volume<S> {
                         self.grid.size.w = n
                         self.grid.atlas = vec3(f32(size.x), f32(size.y), f32(size.z))
                         self.total = n * BS * BS * BS
-                        self.raw = buffer(max(2 * self.total, 2))
+                        self.raw = buffer(max(3 * self.total, 3))
+                        self.albedo = texture3d(width: size.x, height: size.y, depth: size.z)
                         self.cursor = 0
                         let brick = self.grid.cell * f32(B)
                         let mb = f32(size.x * size.y * size.z) * 8.0 / 1048576.0
@@ -272,17 +343,17 @@ impl<S: Solid> Volume<S> {
         }
         if self.stage == 2 {
             label("deposited")
-            for _b in 0..BANDS_A_FRAME {
+            for _b in 0..DEPOSITS_A_FRAME {
                 if self.cursor < self.total {
                     dispatch(
-                        deposited.bind(self.form, g: self.grid, bricks: self.bricks.items(), first: self.cursor, out: mut self.raw),
-                        over: BAND,
+                        deposited.bind(self.form, look: look, g: self.grid, bricks: self.bricks.items(), first: self.cursor, out: mut self.raw),
+                        over: DEPOSIT_BAND,
                     )
-                    self.cursor += BAND
+                    self.cursor += DEPOSIT_BAND
                 }
             }
             if self.cursor >= self.total {
-                dispatch(atlas_copied.bind(raw: self.raw.items(), g: self.grid, out: mut self.atlas), over: self.atlas)
+                dispatch(atlas_copied.bind(raw: self.raw.items(), g: self.grid, out: mut self.atlas, albedo: mut self.albedo), over: self.atlas)
                 self.raw = buffer(2)
                 self.stage = 3
             }
@@ -306,6 +377,10 @@ impl<S: Solid> Volume<S> {
             if self.scout.width() != sw || self.scout.height() != sh {
                 self.scout = texture(width: sw, height: sh)
             }
+            if self.classes.width() != sw || self.classes.height() != sh {
+                self.classes = writable_texture(width: sw, height: sh)
+                self.edges = append_buffer(sw * sh)
+            }
             label("scouted")
             let p = begin_pass(mut self.scout, clear: vec4(0.0))
             draw(
@@ -316,12 +391,20 @@ impl<S: Solid> Volume<S> {
                     g: self.grid,
                     coarse: self.coarse,
                     atlas: self.atlas,
+                    albedo: self.albedo,
                     s: self.s,
                     rate: f32(rate),
                 ),
                 vertices: 3,
             )
             p.end()
+            label("classed")
+            self.edges.clear()
+            dispatch(
+                classed.bind(eye: frame.eye, scout: self.scout, rate: f32(rate), out: mut self.classes, edges: mut self.edges),
+                groups: ((sw + 7) / 8, (sh + 7) / 8, 1),
+            )
+            dispatch(edges_drawn.bind(count: self.edges.count(), most: sw * sh, out: mut self.draws), groups: 1)
         }
         label(if rate > 1 { "joined" } else { "marched" })
         let first = frame.first()
@@ -346,12 +429,33 @@ impl<S: Solid> Volume<S> {
                     g: self.grid,
                     coarse: self.coarse,
                     atlas: self.atlas,
+                    albedo: self.albedo,
+                    s: self.s,
+                    body: body,
+                    scout: self.scout,
+                    classes: self.classes,
+                    rate: f32(rate),
+                ),
+                vertices: 3,
+                depth: NEARER,
+            )
+            draw(
+                q,
+                block_corner.bind(edges: self.edges.items(), size: frame.eye.size, rate: f32(rate)),
+                edged.bind(
+                    eye: frame.eye,
+                    light: frame.light,
+                    look: look,
+                    g: self.grid,
+                    coarse: self.coarse,
+                    atlas: self.atlas,
+                    albedo: self.albedo,
                     s: self.s,
                     body: body,
                     scout: self.scout,
                     rate: f32(rate),
                 ),
-                vertices: 3,
+                indirect: self.draws.span(start: 0, count: 1),
                 depth: NEARER,
             )
         } else {
@@ -365,6 +469,7 @@ impl<S: Solid> Volume<S> {
                     g: self.grid,
                     coarse: self.coarse,
                     atlas: self.atlas,
+                    albedo: self.albedo,
                     s: self.s,
                     body: body,
                 ),
@@ -397,6 +502,31 @@ fn field_at(
     atlas.sample_level(s, (a + local + vec3(0.5)) / g.atlas, 0.0)
 }
 
+/// The stored distance and facing at `p` (as `field_at`) and the albedo stored there (`w` 1; all
+/// 0 where no brick is kept), from one look in the coarse grid.
+fn cell_at(
+    g: Grid,
+    coarse: Texture3d<Rg32Uint>,
+    atlas: Texture3d<Rgba16Float>,
+    albedo: Texture3d<Rgba8>,
+    s: Sampler,
+    brick: f32,
+    top: vec3,
+    p: vec3,
+) -> (vec4, vec4) {
+    let q = (p - g.lo) / brick
+    let c = clamp(floor(q), vec3(0.0), top)
+    let k = coarse.load(u32(c.x), u32(c.y), u32(c.z))
+    if k.x == NO_BRICK {
+        return (vec4(brick, 0.0, 0.0, 0.0), vec4(0.0))
+    }
+    let a = vec3(f32(k.x % ROW), f32((k.x / ROW) % ROW), f32(k.x / (ROW * ROW))) * f32(BS)
+    let local = clamp((q - c) * f32(B), vec3(0.0), vec3(f32(B)))
+    let uvw = (a + local + vec3(0.5)) / g.atlas
+    let r = albedo.sample_level(s, uvw, 0.0).xyz
+    (atlas.sample_level(s, uvw, 0.0), vec4(r * r, 1.0))
+}
+
 /// Where a ray from `o` along `d` (unit) enters and leaves the box from `lo` to `hi` (m along it).
 fn box_span(o: vec3, d: vec3, lo: vec3, hi: vec3) -> vec2 {
     let inv = vec3(1.0) / d
@@ -417,6 +547,10 @@ struct Walked: Copy {
     near: f32,
     steps: u32,
     empty: u32,
+    /// How many steps onto the surface it still wants (2 after a walk, 0 where already settled).
+    again: u32,
+    /// The look's albedo stored where it was last read (`w` 1), or none yet (`w` 0).
+    albedo: vec4,
 }
 
 /// A ray from `o` along `d` walked through the volume from `from` to `to` m along it: through a
@@ -439,6 +573,7 @@ fn walk(
     let touch = TOUCH * px
     let least = LEAST * px
     let close = near * px
+    let plane = PLANE * brick
     let top = vec3(f32(g.size.x - 1), f32(g.size.y - 1), f32(g.size.z - 1))
     let nudge = 0.02 * brick
     let half = vec3(0.5 * brick)
@@ -475,12 +610,21 @@ fn walk(
                     if first_near == 0.0 && v.x < close * t {
                         first_near = t
                     }
-                    t += max(v.x, least * t)
+                    // To the surface's tangent plane where the stored facing is good (the
+                    // distance over the cosine, at most four times it), else by the distance.
+                    var step = v.x
+                    let lean_in = -dot(v.yzw, d)
+                    if v.x < plane && lean_in > 0.2 {
+                        step = min(v.x / lean_in, 4.0 * v.x)
+                    }
+                    // The least step grows as a ray skims a surface without meeting it: a ray
+                    // that long near it passes an outline, whose cover the edge record carries.
+                    t += max(step, least * t * (1.0 + f32(steps - empty) / SKIM))
                 }
             }
         }
     }
-    Walked { met, t, v, near: first_near, steps, empty }
+    Walked { met, t, v, near: first_near, steps, empty, again: 2, albedo: vec4(0.0) }
 }
 
 /// Nothing drawn at a pixel.
@@ -498,6 +642,7 @@ fn shown<L: Look>(
     g: Grid,
     coarse: Texture3d<Rg32Uint>,
     atlas: Texture3d<Rgba16Float>,
+    albedo: Texture3d<Rgba8>,
     s: Sampler,
     body: u32,
     o: vec3,
@@ -510,17 +655,37 @@ fn shown<L: Look>(
     var t = met.t
     var v = met.v
     // Onto the surface: the stored distance taken along the ray, twice.
-    for _k in 0..2 {
-        t += v.x
-        let w = field_at(g, coarse, atlas, s, brick, top, o + d * t)
-        if w.y != 0.0 || w.z != 0.0 || w.w != 0.0 {
-            v = w
+    for k in 0..2 {
+        if k < met.again {
+            t += v.x / max(-dot(v.yzw, d), 0.25)
+            let w = field_at(g, coarse, atlas, s, brick, top, o + d * t)
+            if w.y != 0.0 || w.z != 0.0 || w.w != 0.0 {
+                v = w
+            }
         }
     }
     let p = o + d * t
     let n = normalize(v.yzw)
-    let skin = look.skin(Place { world: p, rest: p, chart: None, normal: n })
-    let lit = worn(light, skin, p, n, -d, STILL, reach: sun_reach(light, p))
+    var skin = Skin { albedo: vec3(0.0), line: 1.0, metal: 0.0, rim: false, emits: vec3(0.0) }
+    if g.stored == 1 && met.albedo.w > 0.5 {
+        skin.albedo = met.albedo.xyz
+    } else if g.stored == 1 {
+        let q = (p - g.lo) / brick
+        let c = clamp(floor(q), vec3(0.0), top)
+        let k = coarse.load(u32(c.x), u32(c.y), u32(c.z))
+        if k.x != NO_BRICK {
+            let a = vec3(f32(k.x % ROW), f32((k.x / ROW) % ROW), f32(k.x / (ROW * ROW))) * f32(BS)
+            let local = clamp((q - c) * f32(B), vec3(0.0), vec3(f32(B)))
+            let r = albedo.sample_level(s, (a + local + vec3(0.5)) / g.atlas, 0.0).xyz
+            skin.albedo = r * r
+        }
+    } else {
+        skin = look.skin(Place { world: p, rest: p, chart: None, normal: n })
+    }
+    var lit = Shaded { colour: skin.albedo, line: 1.0 }
+    if (g.debug & 8) == 0 {
+        lit = worn(light, skin, p, n, -d, STILL, reach: sun_reach(light, p))
+    }
     // The way to its outline. A ray a little inside a smooth outline dips into the form and out,
     // as deep at its deepest as it is inside, so that depth over the footprint a pixel moves the
     // ray (along the way the normal leans on the screen) is how many pixels inside it is. Its
@@ -528,7 +693,7 @@ fn shown<L: Look>(
     // cell on (the field's second derivative along the ray), deepest at (n·d)² over twice that.
     var way = NO_EDGE
     let nv = dot(n, -d)
-    if nv < FOLD_NEAR {
+    if nv < FOLD_NEAR && (g.debug & 4) == 0 {
         let lean = vec2(dot(n, eye.right), -dot(n, eye.up))
         if dot(lean, lean) > 1.0e-8 {
             let w = field_at(g, coarse, atlas, s, brick, top, p + d * g.cell)
@@ -542,10 +707,10 @@ fn shown<L: Look>(
         }
     }
     var colour = lit.colour
-    if g.debug == 2 {
+    if (g.debug & 3) == 2 {
         colour = vec3(f32(met.empty) / 48.0, f32(met.steps - met.empty) / 48.0, 0.0)
     }
-    if g.debug == 1 {
+    if (g.debug & 3) == 1 {
         let k = f32(met.steps) / 64.0
         colour = vec3(saturate(k), saturate(k - 1.0), saturate(k - 2.0))
     }
@@ -577,6 +742,7 @@ pub fn marched<L: Look>(
     g: Grid,
     coarse: Texture3d<Rg32Uint>,
     atlas: Texture3d<Rgba16Float>,
+    albedo: Texture3d<Rgba8>,
     s: Sampler,
     body: u32,
 ) -> WithDepth<Targets3<vec4, vec4, u32>> {
@@ -589,7 +755,13 @@ pub fn marched<L: Look>(
     if !w.met {
         return nothing()
     }
-    shown(pixel.position.xy, eye, light, look, g, coarse, atlas, s, body, eye.at, d, w)
+    if (g.debug & 128) != 0 {
+        return WithDepth {
+            color: Targets3 { first: vec4(w.v.yzw, 0.0), second: edge_record(NO_EDGE, 1.0, NO_LINE), third: identity(SOLID, body: body, group: 0) },
+            depth: eye.depth(eye.at + d * w.t),
+        }
+    }
+    shown(pixel.position.xy, eye, light, look, g, coarse, atlas, albedo, s, body, eye.at, d, w)
 }
 
 /// A texel of the scouting march, one each `rate` × `rate` pixels: how far along its ray it met
@@ -601,6 +773,7 @@ pub fn scouted(
     g: Grid,
     coarse: Texture3d<Rg32Uint>,
     atlas: Texture3d<Rgba16Float>,
+    albedo: Texture3d<Rgba8>,
     s: Sampler,
     rate: f32,
 ) -> vec4 {
@@ -610,12 +783,118 @@ pub fn scouted(
         return vec4(0.0)
     }
     let w = walk(g, coarse, atlas, s, eye.at, d, from: span.x, to: span.y, px: eye.pixel() * rate, near: 2.0)
-    vec4(if w.met { w.t } else { 0.0 }, w.near, 0.0, 0.0)
+    if !w.met {
+        return vec4(-w.near, 0.0, 0.0, 0.0)
+    }
+    let n = normalize(w.v.yzw)
+    let t = w.t + w.v.x / max(-dot(n, d), 0.25)
+    let brick = g.cell * f32(B)
+    let top = vec3(f32(g.size.x - 1), f32(g.size.y - 1), f32(g.size.z - 1))
+    let (_, a) = cell_at(g, coarse, atlas, albedo, s, brick, top, eye.at + d * t)
+    vec4(t, bitcast_f32(packed(n, a.xyz)), 0.0, 0.0)
 }
 
-/// A pixel of the form joined from the scouting march: from the nearest of what its four
-/// scouting rays met or came near, less a margin, walked at its own footprint; nothing where none
-/// of them met it or came near it.
+/// What a pixel reads from its four scouting rays: the nearest that any met the form or came near
+/// it (m along its ray; 1e30 for none); and, where all four met it, where their tangent planes
+/// meet this pixel's ray, blended by how near each scout is, how far those meetings are spread
+/// (`least`, `most`), and the facing and albedo blended the same way.
+struct Scouts: Copy {
+    start: f32,
+    met: u32,
+    blend: f32,
+    least: f32,
+    most: f32,
+    way: vec3,
+    albedo: vec3,
+}
+
+fn scouts_at(eye: Eye, scout: Texture<Rg32Float>, rate: f32, pixel: vec2, d: vec3) -> Scouts {
+    let c = pixel / rate - vec2(0.5)
+    let top = vec2(f32(scout.width() - 1), f32(scout.height() - 1))
+    let lo = clamp(floor(c), vec2(0.0), top)
+    let hi = min(lo + vec2(1.0), top)
+    let f = saturate(c - lo)
+    var out = Scouts { start: 1.0e30, met: 0, blend: 0.0, least: 1.0e30, most: 0.0, way: vec3(0.0), albedo: vec3(0.0) }
+    for k in 0..4 {
+        let x = if k % 2 == 0 { lo.x } else { hi.x }
+        let y = if k / 2 == 0 { lo.y } else { hi.y }
+        let e = scout.load(u32(x), u32(y))
+        if e.x != 0.0 {
+            out.start = min(out.start, abs(e.x))
+        }
+        if e.x > 0.0 {
+            let n = unpacked_way(bitcast_u32(e.y))
+            let at = eye.at + eye.ray(vec2(x + 0.5, y + 0.5) * rate) * e.x
+            let facing = dot(n, d)
+            if facing < -0.05 {
+                let tp = dot(n, at - eye.at) / facing
+                let wx = if k % 2 == 0 { 1.0 - f.x } else { f.x }
+                let wy = if k / 2 == 0 { 1.0 - f.y } else { f.y }
+                out.blend += tp * wx * wy
+                out.way += n * (wx * wy)
+                out.albedo += unpacked_albedo(bitcast_u32(e.y)) * (wx * wy)
+                out.least = min(out.least, tp)
+                out.most = max(out.most, tp)
+                out.met += 1
+            }
+        }
+    }
+    out
+}
+
+/// What a block of the scouting march is (the output pixels between four scouts, each block's
+/// pixels joined from the same four): `EMPTY` none of the four met the form or came near it;
+/// `SMOOTH` all four met it and their tangent planes agree where the block's middle ray meets
+/// them; `EDGE` anything else.
+const EMPTY: u32 = 0
+const SMOOTH: u32 = 1
+const EDGE: u32 = 2
+
+/// Each block of the scouting march, classed, and an edge block listed (x | y << 16).
+@compute(8, 8)
+fn classed(eye: Eye, scout: Texture<Rg32Float>, rate: f32, out: mut Texels<R32Uint>, edges: mut Append<u32>, id: GlobalId) {
+    let mid = (vec2(f32(id.x), f32(id.y)) + vec2(1.0)) * rate
+    let d = eye.ray(mid)
+    let k = scouts_at(eye, scout, rate, mid, d)
+    var class = EMPTY
+    if k.start < 1.0e29 {
+        class = EDGE
+        if k.met == 4 && k.most - k.least < AGREE * rate * eye.pixel() * k.least {
+            class = SMOOTH
+        }
+    }
+    if class == EDGE {
+        let _ = edges.push(id.x | (id.y << 16))
+    }
+    out.store(id, class)
+}
+
+/// The draw of the edge blocks: six corners an edge block.
+@compute(1)
+fn edges_drawn(count: [u32], most: u32, out: mut Slots<DrawArgs>, id: GlobalId) {
+    out[id] = DrawArgs { vertices: 6, instances: min(count[0], most), first_vertex: 0, first_instance: 0 }
+}
+
+/// A corner of an edge block's quad, over the output pixels it joins.
+pub struct BlockCorner: Copy {
+    pub clip: ClipPosition,
+}
+
+const QUAD: [u32; 6] = [0, 1, 2, 2, 1, 3]
+
+@vertex
+pub fn block_corner(v: VertexIndex, i: InstanceIndex, edges: [u32], size: vec2, rate: f32) -> BlockCorner {
+    let b = edges[i.index]
+    let j = QUAD[v.index % 6]
+    let x = f32(b & 65535) + 0.5 + f32(j & 1)
+    let y = f32(b >> 16) + 0.5 + f32((j >> 1) & 1)
+    let p = vec2(x, y) * rate
+    BlockCorner { clip: ClipPosition { position: vec4(p.x / size.x * 2.0 - 1.0, 1.0 - p.y / size.y * 2.0, 0.0, 1.0) } }
+}
+
+/// A pixel of a smooth block, joined from its four scouts: where their tangent planes put it,
+/// then read once from the volume there (or, with `g.reads` 0, its facing and albedo blended from
+/// the scouts too).
 @fragment
 pub fn joined<L: Look>(
     pixel: FragCoord,
@@ -625,37 +904,75 @@ pub fn joined<L: Look>(
     g: Grid,
     coarse: Texture3d<Rg32Uint>,
     atlas: Texture3d<Rgba16Float>,
+    albedo: Texture3d<Rgba8>,
+    s: Sampler,
+    body: u32,
+    scout: Texture<Rg32Float>,
+    classes: Texture<R32Uint>,
+    rate: f32,
+) -> WithDepth<Targets3<vec4, vec4, u32>> {
+    let c = pixel.position.xy / rate - vec2(0.5)
+    let top = vec2(f32(scout.width() - 1), f32(scout.height() - 1))
+    let lo = clamp(floor(c), vec2(0.0), top)
+    if classes.load(u32(lo.x), u32(lo.y)) != SMOOTH {
+        return nothing()
+    }
+    let d = eye.ray(pixel.position.xy)
+    let k = scouts_at(eye, scout, rate, pixel.position.xy, d)
+    if k.met == 0 {
+        return nothing()
+    }
+    let brick = g.cell * f32(B)
+    let cube = vec3(f32(g.size.x - 1), f32(g.size.y - 1), f32(g.size.z - 1))
+    var v = vec4(0.0, normalize(k.way))
+    var a = vec4(k.albedo, 1.0)
+    if g.reads == 1 {
+        let (rv, ra) = cell_at(g, coarse, atlas, albedo, s, brick, cube, eye.at + d * k.blend)
+        if rv.y != 0.0 || rv.z != 0.0 || rv.w != 0.0 {
+            v = rv
+            a = ra
+        }
+    }
+    let n = normalize(v.yzw)
+    let w = Walked { met: true, t: k.blend + v.x / max(-dot(n, d), 0.25), v: v, near: 0.0, steps: 1, empty: 0, again: 0, albedo: a }
+    shown(pixel.position.xy, eye, light, look, g, coarse, atlas, albedo, s, body, eye.at, d, w)
+}
+
+/// A pixel of an edge block: walked at its own footprint from the nearest of what its four
+/// scouting rays met or came near, less a margin.
+@fragment
+pub fn edged<L: Look>(
+    corner: BlockCorner,
+    pixel: FragCoord,
+    eye: Eye,
+    light: Lighting,
+    look: L,
+    g: Grid,
+    coarse: Texture3d<Rg32Uint>,
+    atlas: Texture3d<Rgba16Float>,
+    albedo: Texture3d<Rgba8>,
     s: Sampler,
     body: u32,
     scout: Texture<Rg32Float>,
     rate: f32,
 ) -> WithDepth<Targets3<vec4, vec4, u32>> {
-    let c = pixel.position.xy / rate - vec2(0.5)
-    let most = vec2(f32(scout.width() - 1), f32(scout.height() - 1))
-    let lo = clamp(floor(c), vec2(0.0), most)
-    let hi = min(lo + vec2(1.0), most)
-    var start = 1.0e30
-    for k in 0..4 {
-        let x = if k % 2 == 0 { lo.x } else { hi.x }
-        let y = if k / 2 == 0 { lo.y } else { hi.y }
-        let e = scout.load(u32(x), u32(y))
-        if e.x > 0.0 {
-            start = min(start, e.x)
-        }
-        if e.y > 0.0 {
-            start = min(start, e.y)
+    let d = eye.ray(pixel.position.xy)
+    let k = scouts_at(eye, scout, rate, pixel.position.xy, d)
+    if (g.debug & 2048) != 0 {
+        return WithDepth {
+            color: Targets3 { first: vec4(1.0, 0.0, 0.0, 0.0), second: edge_record(NO_EDGE, 1.0, NO_LINE), third: identity(SOLID, body: body, group: 0) },
+            depth: 0.9,
         }
     }
-    if start > 1.0e29 {
+    if k.start > 1.0e29 {
         return nothing()
     }
-    let d = eye.ray(pixel.position.xy)
     let span = crossing(eye, g, d)
     let px = eye.pixel()
-    let from = max(start - (2.0 * rate * px * start + g.cell * f32(B)), span.x)
+    let from = max(k.start - MARGIN * rate * px * k.start, span.x)
     let w = walk(g, coarse, atlas, s, eye.at, d, from: from, to: span.y, px: px, near: 0.0)
     if !w.met {
         return nothing()
     }
-    shown(pixel.position.xy, eye, light, look, g, coarse, atlas, s, body, eye.at, d, w)
+    shown(pixel.position.xy, eye, light, look, g, coarse, atlas, albedo, s, body, eye.at, d, w)
 }
