@@ -1,0 +1,683 @@
+// Matter's cells (docs/design.md, "The safe default"): the index and the cache the engine keeps of
+// each thing. A coarse grid over the thing's bound, each coarse cell a brick of `B`³ fine cells;
+// a brick is kept where the thing's surface may pass through it, sound by the steepness its field
+// states (its value over its steepness at the brick's middle is under the brick's half diagonal).
+// Every brick, kept or not, keeps that value: an empty brick tells a ray how far the surface is
+// at the least, and that it may go to the brick's far side. Where the engine asks a thing's cells
+// and not its field (its field is dear: `Kept::asks`), each kept brick also holds its fine cells
+// in an atlas, `B + 1` texels a side (a brick's texels reach its far faces, so a filtered read
+// inside it never reads its neighbour), each the field's distance there and the way it faces.
+//
+// One deposit, two schedules (the volume spike's `fill_parts` and `redeposit`, spike/volume,
+// spikes/volume/volume.wrela, rewritten): a thing that keeps still is deposited once, a few bands a
+// frame until it is whole; a thing that moves is deposited whole every frame, its grid following
+// its bound. Whether a thing moves is seen, not told: the engine asks its field at a few fixed
+// places in its bound each frame, and a thing whose answers changed moves from then on.
+//
+// What the cells are asked by (`asked`): the coarse grid and, for a thing asked by its cells, the
+// atlas, read between the eight texels round a point.
+//
+// The cells' size is a placeholder for "the engine sizes its cells from what the eye sees", which
+// is not built: `CELL_PX` pixels' footprint at the thing's middle, as the eye sees it when the
+// thing is first deposited, one size for the whole thing.
+//
+// How the engine chooses field or cells: it measures. Once per thing, it dispatches a kernel
+// asking the thing's field along short lines through its bound (as a ray steps) and one asking
+// cells the same way, each timed (`std::gpu::timed`), and asks the field where an ask of it costs
+// no more than `ASK_RATIO` asks of cells (`Choice`). The compiler counts each entry point's work
+// (the build manifest's `work`), but a program can't read its manifest; the timing is the
+// engine's own measure, said in the log.
+
+use matter::substance::Substance
+use picture::eye::View
+use std::collections::Vec
+use std::field::{Field, hash_u32}
+use std::gpu::{
+    Append, AppendBuffer, Atomics, GlobalId, GpuBuffer, Rg32Uint, Rgba16Float, Sampler, Slots, Texels3d, Texture3d,
+    append_buffer, buffer, dispatch, label, read, texture3d, timed,
+}
+use std::io::{Pending, print}
+
+/// A brick's fine cells a side, and its texels a side in the atlas.
+pub const B: u32 = 8
+pub const BS: u32 = 9
+
+/// An atlas's bricks along x and along y (its bricks along z as many as it needs).
+pub const ROW: u32 = 64
+
+/// No brick: a coarse cell the surface doesn't pass through.
+pub const NO_BRICK: u32 = 4294967295
+
+/// How a thing is asked: by its field, or by its cells.
+pub const ASKS_FIELD: u32 = 1
+pub const ASKS_CELLS: u32 = 2
+
+/// A fine cell's side, in pixels' footprints at the thing's middle as the eye first sees it, and
+/// the least and most a cell is (m).
+pub const CELL_PX: f32 = 3.0
+const LEAST_CELL: f32 = 0.002
+const MOST_CELL: f32 = 0.5
+
+/// A brick is kept where its middle's distance (its field's value over its steepness) is under
+/// this many brick sides: its half diagonal (0.866) and a margin.
+const KEEP: f32 = 0.9
+
+/// How far past a brick's side a ray that leaves an empty brick lands (of a brick).
+const NUDGE: f32 = 0.01
+
+/// An ask of the field is chosen where it costs no more than this many asks of cells; for a
+/// thing that moves, whose cells are deposited again every frame (an ask of the field a texel),
+/// this many (`ASK_RATIO_MOVING`).
+pub const ASK_RATIO: f32 = 4.0
+pub const ASK_RATIO_MOVING: f32 = 16.0
+
+/// The most bricks a thing that keeps still keeps, and one that moves. A moving thing's deposit is
+/// one dispatch over its whole atlas (a kernel stores only its own texel, so it can't be cut in
+/// parts), and the host refuses a dispatch whose work may hold the GPU past 50 ms: 2,560 bricks
+/// (40 rows of 64, 1.87 million texels) is what the plain creature's 8,850 work a texel allows on
+/// the M4 (a GAP: wrela-notes/engine/NOTES.md).
+const MOST_STILL: u32 = 1048576
+const MOST_MOVING: u32 = 2560
+
+/// The most invocations of a filling kernel in one dispatch, and the dispatches of a still
+/// thing's deposit a frame.
+const COARSE_BAND: u32 = 262144
+const FINE_BAND: u32 = 65536
+const BANDS_A_FRAME: u32 = 8
+
+/// How many places a thing is asked at each frame to see whether it moved.
+const PROBES: u32 = 27
+
+/// A thing's grid as GPU code reads it: its least and greatest corners (m), a fine cell's side
+/// and a brick's (m), its last brick along x, y and z (`top`, as numbers) and its bricks along
+/// each (`size`), how it is asked (`ASKS_FIELD`, `ASKS_CELLS`), its atlas's texels along x, y and
+/// z, the steepness its field states within `scope` of its surface (what its value is divided by),
+/// that scope (m), and how many bricks it may keep. Worked out on the CPU: what is the same for
+/// every invocation is computed once.
+pub struct Grid: Copy + GpuData {
+    pub lo: vec3,
+    pub cell: f32,
+    pub hi: vec3,
+    pub brick: f32,
+    pub top: vec3,
+    pub steep: f32,
+    pub atlas: vec3,
+    pub scope: f32,
+    pub size: vec3u,
+    pub asks: u32,
+    /// How far past a brick's side a ray that leaves an empty brick lands (m): into the next brick.
+    pub nudge: vec3,
+    pub kept: u32,
+}
+
+/// A unit vector in two 16-bit numbers, folded onto an octahedron, and back.
+pub fn folded(n: vec3) -> u32 {
+    let a = n / (abs(n.x) + abs(n.y) + abs(n.z))
+    var e = a.xz
+    if a.y < 0.0 {
+        e = (vec2(1.0) - abs(vec2(a.z, a.x))) * vec2(if a.x >= 0.0 { 1.0 } else { -1.0 }, if a.z >= 0.0 { 1.0 } else { -1.0 })
+    }
+    let q = clamp(e * 0.5 + vec2(0.5), vec2(0.0), vec2(1.0)) * 65535.0
+    u32(q.x + 0.5) | (u32(q.y + 0.5) << 16)
+}
+
+pub fn unfolded(w: u32) -> vec3 {
+    let e = vec2(f32(w & 65535), f32(w >> 16)) / 65535.0 * 2.0 - vec2(1.0)
+    var v = vec3(e.x, 1.0 - abs(e.x) - abs(e.y), e.y)
+    let t = max(-v.y, 0.0)
+    v.x += if v.x >= 0.0 { -t } else { t }
+    v.z += if v.z >= 0.0 { -t } else { t }
+    normalize(v)
+}
+
+/// Bricks `first` on of a thing's grid: whether its surface may pass through each (kept, given
+/// a slot in the atlas), and its value over its steepness at each one's middle.
+@compute(64)
+fn coarsed<M: Field<Substance>>(field: M, g: Grid, first: u32, out: mut Atomics<u32>, bricks: mut Append<u32>, id: GlobalId) {
+    let i = first + id.x
+    if i >= g.size.x * g.size.y * g.size.z {
+        return
+    }
+    let x = i % g.size.x
+    let y = (i / g.size.x) % g.size.y
+    let z = i / (g.size.x * g.size.y)
+    let brick = g.cell * f32(B)
+    let mid = g.lo + (vec3(f32(x), f32(y), f32(z)) + vec3(0.5)) * brick
+    // What an empty brick tells a ray: the value over the steepness the field states, never past
+    // the surface. Whether a brick is kept: the value over its own gradient's length there (held
+    // between 1 and the stated steepness), as near the surface as a first-order guess puts it: a
+    // field whose stated steepness is far over its usual one (the stack's 3.5) would otherwise
+    // keep a band of bricks that many times too thick (measured: 101,937 bricks, 570 MB, for the
+    // stack). Unsound where the gradient changes fast within a brick (KEEP's margin covers a
+    // little of it); the judges' holes say whether it held.
+    let (f, grad) = field.sample(mid)
+    let d = clamp(f, -g.scope, g.scope) / g.steep
+    let near = f / clamp(length(grad), 1.0, g.steep)
+    var slot = NO_BRICK
+    if abs(near) < KEEP * brick {
+        let s = bricks.push(x | (y << 10) | (z << 20))
+        if s < g.kept {
+            slot = s
+        }
+    }
+    let _ = out.exchange(i: 2 * i, value: slot)
+    let _ = out.exchange(i: 2 * i + 1, value: bitcast_u32(d))
+}
+
+/// The coarse grid put in its texture.
+@compute(4, 4, 4)
+fn coarse_copied(raw: [u32], g: Grid, out: mut Texels3d<Rg32Uint>, id: GlobalId) {
+    let i = id.x + g.size.x * (id.y + g.size.y * id.z)
+    out.store(id, vec2u(raw[2 * i], raw[2 * i + 1]))
+}
+
+/// The field's distance (over its gradient's length where that is over 1: near the surface, the
+/// distance) and facing at `p`; where its gradient vanishes, its slope to each side.
+fn sampled<M: Field<Substance>>(field: M, p: vec3, h: f32) -> vec4 {
+    let (f, grad) = field.sample(p)
+    var n = grad
+    if dot(n, n) < 1.0e-8 {
+        n = vec3(field.distance(p + vec3(h, 0.0, 0.0)) - f, field.distance(p + vec3(0.0, h, 0.0)) - f, field.distance(p + vec3(0.0, 0.0, h)) - f) / h
+    }
+    let len = length(n)
+    if len < 1.0e-6 {
+        return vec4(f, 0.0, 1.0, 0.0)
+    }
+    vec4(f / max(len, 1.0), n / len)
+}
+
+/// Fine cells `first` on of a thing that keeps still, brick by brick (texel `i` of the atlas is
+/// texel `i % BS³` of slot `i / BS³`): each one's distance and facing, two words.
+@compute(64)
+fn deposited<M: Field<Substance>>(field: M, g: Grid, bricks: [u32], count: u32, first: u32, out: mut Atomics<u32>, id: GlobalId) {
+    let i = first + id.x
+    let slot = i / (BS * BS * BS)
+    if slot >= count {
+        return
+    }
+    let k = i % (BS * BS * BS)
+    let c = bricks[slot]
+    let local = vec3(f32(k % BS), f32((k / BS) % BS), f32(k / (BS * BS)))
+    let p = g.lo + (vec3(f32(c & 1023), f32((c >> 10) & 1023), f32(c >> 20)) * f32(B) + local) * g.cell
+    let v = sampled(field, p, 0.25 * g.cell)
+    let _ = out.exchange(i: 2 * i, value: bitcast_u32(v.x))
+    let _ = out.exchange(i: 2 * i + 1, value: folded(v.yzw))
+}
+
+/// A still thing's fine cells put in its atlas.
+@compute(4, 4, 3)
+fn atlas_copied(raw: [u32], count: u32, out: mut Texels3d<Rgba16Float>, id: GlobalId) {
+    let slot = id.x / BS + ROW * (id.y / BS + ROW * (id.z / BS))
+    if slot >= count {
+        out.store(id, vec4(1.0, 0.0, 0.0, 0.0))
+        return
+    }
+    let i = slot * BS * BS * BS + id.x % BS + BS * (id.y % BS + BS * (id.z % BS))
+    out.store(id, vec4(bitcast_f32(raw[2 * i]), unfolded(raw[2 * i + 1])))
+}
+
+/// An atlas texel of a thing that moves, this frame: the brick listed at its slot, if the coarse
+/// grid (`coarse`, as `coarsed` wrote it this frame) still gives that brick that slot (a slot past
+/// this frame's count holds an older frame's brick: left, nothing reads it); then the field's
+/// distance and facing there. Each texel is written by its own invocation, so the deposit is one
+/// dispatch over the whole atlas.
+@compute(4, 4, 3)
+fn pulled<M: Field<Substance>>(field: M, g: Grid, bricks: [u32], coarse: [u32], out: mut Texels3d<Rgba16Float>, id: GlobalId) {
+    let slot = id.x / BS + ROW * (id.y / BS + ROW * (id.z / BS))
+    if slot >= g.kept {
+        return
+    }
+    let c = bricks[slot]
+    let x = c & 1023
+    let y = (c >> 10) & 1023
+    let z = c >> 20
+    if x >= g.size.x || y >= g.size.y || z >= g.size.z {
+        return
+    }
+    if coarse[2 * (x + g.size.x * (y + g.size.y * z))] != slot {
+        return
+    }
+    let local = vec3(f32(id.x % BS), f32(id.y % BS), f32(id.z % BS))
+    let p = g.lo + (vec3(f32(x), f32(y), f32(z)) * f32(B) + local) * g.cell
+    out.store(id, sampled(field, p, 0.25 * g.cell))
+}
+
+/// What an ask costs, measured: each invocation asks along a short line through the sphere
+/// `held` (16 asks, a 50th of its radius apart: as a ray steps), the field's distance each time.
+@compute(64)
+fn field_cost<M: Field<Substance>>(field: M, held: vec4, out: mut Slots<f32>, id: GlobalId) {
+    let h = hash_u32(id.x * 3 + 1)
+    let a = vec3(f32(h & 1023), f32((h >> 10) & 1023), f32((h >> 20) & 1023)) / 1023.0 * 2.0 - vec3(1.0)
+    let way = normalize(vec3(f32(hash_u32(h) & 255) - 127.5, f32(hash_u32(h + 7) & 255) - 127.5, f32(hash_u32(h + 13) & 255) - 127.5) + vec3(0.001))
+    let o = held.xyz + a * (0.6 * held.w)
+    var sum = 0.0
+    var k: u32 = 0
+    while k < 16 {
+        sum += field.distance(o + way * (f32(k) * 0.02 * held.w))
+        k += 1
+    }
+    out[id] = sum
+}
+
+/// The same asked of cells, as a ray steps through them: a coarse grid's texel and a filtered
+/// atlas read each, the 64 invocations of a group starting a texel apart (as neighbouring pixels'
+/// rays do) and each stepping half a texel.
+@compute(64)
+fn cells_cost(coarse: Texture3d<Rg32Uint>, atlas: Texture3d<Rgba16Float>, s: Sampler, out: mut Slots<f32>, id: GlobalId) {
+    let h = hash_u32(id.x / 64 + 1)
+    let size = vec3(f32(atlas.width()), f32(atlas.height()), f32(atlas.depth()))
+    let base = vec3(f32(h & 1023), f32((h >> 10) & 1023), f32((h >> 20) & 1023)) / 1023.0 * (size - vec3(40.0))
+    let lane = vec3(f32(id.x % 8), f32((id.x / 8) % 8), 0.0)
+    let way = normalize(vec3(f32(hash_u32(h) & 255) - 127.5, f32(hash_u32(h + 7) & 255) - 127.5, f32(hash_u32(h + 13) & 255) - 127.5) + vec3(0.001))
+    let csize = vec3(f32(coarse.width()), f32(coarse.height()), f32(coarse.depth()))
+    var sum = 0.0
+    var k: u32 = 0
+    while k < 16 {
+        let q = clamp(base + lane + way * (0.5 * f32(k)), vec3(0.0), size - vec3(1.0))
+        let c = coarse.load(u32(q.x / size.x * csize.x), u32(q.y / size.y * csize.y), u32(q.z / size.z * csize.z))
+        sum += atlas.sample_level(s, (q + vec3(0.5)) / size, 0.0).x + f32(c.x & 1)
+        k += 1
+    }
+    out[id] = sum
+}
+
+/// What asks a thing, said.
+fn by(asks: u32) -> Text {
+    if asks == ASKS_CELLS { "cells" } else { "field" }
+}
+
+fn held(asks: u32) -> Text {
+    if asks != 0 { " (held so, to measure)" } else { "" }
+}
+
+/// How many invocations a cost kernel runs, each asking 16 times.
+const COST_ASKS: u32 = 65536
+
+/// One thing's cells, and where its deposit stands.
+pub struct Kept {
+    pub grid: Grid,
+    pub coarse: Texture3d<Rg32Uint>,
+    pub atlas: Texture3d<Rgba16Float>,
+    raw: GpuBuffer<u32>,
+    fine: GpuBuffer<u32>,
+    bricks: AppendBuffer<u32>,
+    counted: Option<Pending<u32>>,
+    /// 0 waiting to be told how it is asked; 1 the coarse grid's bands; 2 its count asked for;
+    /// 3 the fine cells' bands; 4 deposited (still); 5 moving (deposited whole every frame).
+    stage: u32,
+    cursor: u32,
+    /// Its field's answers at its probes last frame (none yet: empty).
+    probes: Vec<f32>,
+    /// How it is asked (0: not yet chosen), and, measured, an ask of its field and of cells (ns).
+    pub asks: u32,
+    pub cost: f32,
+    pub cells_cost: f32,
+    /// Whether it has been seen to move.
+    pub moving: bool,
+    /// What the engine was told to use in place of its own choices, to measure them (0: none).
+    pub held_asks: u32,
+    pub held_cell: f32,
+}
+
+/// A thing's cells, as yet nothing.
+pub fn kept() -> Kept {
+    Kept {
+        grid: Grid { lo: vec3(0.0), cell: 1.0, hi: vec3(8.0), brick: 8.0, top: vec3(0.0), steep: 1.0, atlas: vec3(1.0), scope: 1.0, size: vec3u(1, 1, 1), asks: ASKS_FIELD, nudge: vec3(0.08), kept: 0 },
+        coarse: texture3d(width: 1, height: 1, depth: 1),
+        atlas: texture3d(width: 1, height: 1, depth: 1),
+        raw: buffer(2),
+        fine: buffer(2),
+        bricks: append_buffer(1),
+        counted: None,
+        stage: 0,
+        cursor: 0,
+        probes: Vec::new(),
+        asks: 0,
+        cost: 0.0,
+        cells_cost: 0.0,
+        moving: false,
+        held_asks: 0,
+        held_cell: 0.0,
+    }
+}
+
+/// `field`'s answers at the thing's probes: a 3 × 3 × 3 lattice through its bound.
+fn probed<M: Field<Substance>>(field: M) -> Vec<f32> {
+    let b = field.bound()
+    var out: Vec<f32> = Vec::with_capacity(PROBES + 4)
+    out.push(b.centre.x)
+    out.push(b.centre.y)
+    out.push(b.centre.z)
+    out.push(b.radius)
+    for k in 0..PROBES {
+        let o = vec3(f32(k % 3), f32((k / 3) % 3), f32(k / 9)) - vec3(1.0)
+        out.push(field.distance(b.centre + o * (0.5 * b.radius)))
+    }
+    out
+}
+
+impl Kept {
+    /// Whether its cells are ready to be asked.
+    pub fn ready(self) -> bool {
+        self.stage >= 4
+    }
+
+    /// Whether it waits to be told how it is asked.
+    pub fn undecided(self) -> bool {
+        self.asks == 0
+    }
+
+    /// Its grid laid over `field`'s bound, its cells sized as `v` sees it (or as held): how many
+    /// bricks each way, from where; the steepness its value is divided by.
+    fn laid<M: Field<Substance>>(mut self, field: M, v: View, fixed: bool) {
+        let b = field.bound()
+        if !fixed {
+            let far = max(length(b.centre - v.at), 0.1)
+            var cell = clamp(CELL_PX * v.pixel() * far, LEAST_CELL, MOST_CELL)
+            if self.held_cell > 0.0 {
+                cell = self.held_cell
+            }
+            let brick = cell * f32(B)
+            let n = u32(ceil(2.0 * b.radius / brick)) + 1
+            if n > 1023 {
+                panic(f"engine::matter: a grid of {n} bricks a side: the most is 1023")
+            }
+            self.grid.cell = cell
+            self.grid.size = vec3u(n, n, n)
+        }
+        let brick = self.grid.cell * f32(B)
+        self.grid.lo = floor((b.centre - vec3(b.radius)) / brick) * brick
+        self.grid.brick = brick
+        self.grid.nudge = vec3(NUDGE * brick)
+        let size = vec3(f32(self.grid.size.x), f32(self.grid.size.y), f32(self.grid.size.z))
+        self.grid.hi = self.grid.lo + size * brick
+        self.grid.top = size - vec3(1.0)
+        // (Steepness asked over the whole grid, so an empty brick far from the surface says how
+        // far: a ray then crosses empty space in strides, not a brick at a time.)
+        self.grid.scope = max(2.0 * brick, length(size) * brick)
+        let steep = field.lipschitz(self.grid.scope)
+        if !(steep < 1.0e30) {
+            panic("engine::matter: a field that states no steepness can't be kept in cells: build it from std::field's parts, which state theirs")
+        }
+        self.grid.steep = max(steep, 1.0)
+    }
+
+    /// Brought up to date for this frame: seen whether it moves, then deposited as it does, a
+    /// few bands of it if it keeps still, whole if it moves.
+    pub fn deposit<M: Field<Substance>>(mut self, field: M, v: View) {
+        let was_moving = self.moving
+        let now = probed(field)
+        if self.probes.len() == now.len() {
+            var i: u32 = 0
+            while i < now.len() {
+                if now[i] != self.probes[i] {
+                    self.moving = true
+                }
+                i += 1
+            }
+        }
+        self.probes = take now
+        if self.asks == 0 {
+            return
+        }
+        if self.moving && !was_moving && self.held_asks == 0 && self.asks == ASKS_CELLS && self.cost <= ASK_RATIO_MOVING * self.cells_cost {
+            // It moves: its cells would be deposited every frame, which its field's cost doesn't pay for.
+            self.asks = ASKS_FIELD
+            self.stage = 0
+            print(f"engine::matter: a thing that moves: an ask of its field costs {self.cost / self.cells_cost} asks of cells, under {ASK_RATIO_MOVING}: asked by its field from now")
+        }
+        self.grid.asks = self.asks
+        if self.asks == ASKS_FIELD {
+            // Asked by its field, it needs no cells: only its grid, which bounds it.
+            if self.stage != 4 {
+                self.laid(field, v, fixed: false)
+                self.stage = 4
+                print(f"engine::matter: a thing asked by its field: no cells kept (grid {self.grid.size.x}^3 bricks of {self.grid.brick} m; steepness {self.grid.steep} within {self.grid.scope} m)")
+            }
+            if self.moving {
+                self.laid(field, v, fixed: true)
+            }
+            return
+        }
+        if self.moving {
+            self.moved(field, v)
+            return
+        }
+        if self.stage == 0 {
+            self.laid(field, v, fixed: false)
+            let n = self.grid.size.x * self.grid.size.y * self.grid.size.z
+            self.raw = buffer(2 * n)
+            self.bricks = append_buffer(MOST_STILL)
+            self.grid.kept = MOST_STILL
+            self.coarse = texture3d(width: self.grid.size.x, height: self.grid.size.y, depth: self.grid.size.z)
+            self.cursor = 0
+            self.stage = 1
+        }
+        let n = self.grid.size.x * self.grid.size.y * self.grid.size.z
+        if self.stage == 1 {
+            label("deposit coarse")
+            var b: u32 = 0
+            while b < BANDS_A_FRAME && self.cursor < n {
+                dispatch(coarsed.bind(field: field, g: self.grid, first: self.cursor, out: mut self.raw, bricks: mut self.bricks), over: min(COARSE_BAND, n - self.cursor))
+                self.cursor += COARSE_BAND
+                b += 1
+            }
+            if self.cursor >= n {
+                dispatch(coarse_copied.bind(raw: self.raw.items(), g: self.grid, out: mut self.coarse), over: self.coarse)
+                self.counted = Some(read(self.bricks.count()))
+                self.stage = 2
+            }
+            return
+        }
+        if self.stage == 2 {
+            match mut self.counted {
+                Some(p) => match p.poll() {
+                    Some(Ok(c)) => {
+                        let count = min(c[0], MOST_STILL)
+                        if c[0] > MOST_STILL {
+                            print(f"engine::matter: a still thing wanted {c[0]} bricks; {MOST_STILL} kept: past them it is not drawn")
+                        }
+                        self.grid.kept = count
+                        self.counted = None
+                        print(f"engine::matter: a still thing: {count} bricks kept of {n} ({self.grid.cell * f32(B)} m each, cells {self.grid.cell} m; steepness {self.grid.steep} within {self.grid.scope} m), asked by its {by(self.asks)}")
+                        if self.asks == ASKS_CELLS {
+                            let layers = max((count + ROW * ROW - 1) / (ROW * ROW), 1)
+                            self.atlas = texture3d(width: ROW * BS, height: ROW * BS, depth: layers * BS)
+                            self.grid.atlas = vec3(f32(ROW * BS), f32(ROW * BS), f32(layers * BS))
+                            self.fine = buffer(max(2 * count * BS * BS * BS, 2))
+                            self.cursor = 0
+                            self.stage = 3
+                            let mb = f32(ROW * BS * ROW * BS * layers * BS) * 8.0 / 1048576.0
+                            print(f"engine::matter: its atlas {ROW * BS} x {ROW * BS} x {layers * BS}, {mb} MB")
+                        } else {
+                            self.stage = 4
+                        }
+                    },
+                    _ => {},
+                },
+                None => {},
+            }
+            return
+        }
+        if self.stage == 3 {
+            label("deposit fine")
+            let texels = self.grid.kept * BS * BS * BS
+            var b: u32 = 0
+            while b < BANDS_A_FRAME && self.cursor < texels {
+                dispatch(
+                    deposited.bind(field: field, g: self.grid, bricks: self.bricks.items(), count: self.grid.kept, first: self.cursor, out: mut self.fine),
+                    over: min(FINE_BAND, texels - self.cursor),
+                )
+                self.cursor += FINE_BAND
+                b += 1
+            }
+            if self.cursor >= texels {
+                dispatch(atlas_copied.bind(raw: self.fine.items(), count: self.grid.kept, out: mut self.atlas), over: self.atlas)
+                self.fine = buffer(2)
+                self.stage = 4
+            }
+        }
+    }
+
+    /// The whole deposit of a thing that moves, in this frame: its grid moved to its bound, its
+    /// coarse grid asked again, and (asked by its cells) every texel of its atlas pulled again.
+    fn moved<M: Field<Substance>>(mut self, field: M, v: View) {
+        if self.stage != 5 {
+            // (Its grid sized once, as the eye first sees it moving, a little larger than its
+            // bound so the bound may grow as it moves.)
+            let b = field.bound()
+            self.laid(field, v, fixed: false)
+            let n = self.grid.size.x + 2
+            self.grid.size = vec3u(n, n, n)
+            self.laid(field, v, fixed: true)
+            let all = n * n * n
+            self.raw = buffer(2 * all)
+            self.bricks = append_buffer(MOST_MOVING)
+            self.grid.kept = MOST_MOVING
+            self.coarse = texture3d(width: n, height: n, depth: n)
+            if self.asks == ASKS_CELLS {
+                let rows = (MOST_MOVING + ROW - 1) / ROW
+                self.atlas = texture3d(width: ROW * BS, height: rows * BS, depth: BS)
+                self.grid.atlas = vec3(f32(ROW * BS), f32(rows * BS), f32(BS))
+            }
+            self.stage = 5
+            print(f"engine::matter: a moving thing: grid {n}^3 bricks ({self.grid.cell * f32(B)} m each, cells {self.grid.cell} m, bound {b.radius} m; steepness {self.grid.steep} within {self.grid.scope} m), asked by its {by(self.asks)}")
+        }
+        self.laid(field, v, fixed: true)
+        let n = self.grid.size.x * self.grid.size.y * self.grid.size.z
+        label("deposit moving coarse")
+        self.bricks.clear()
+        dispatch(coarsed.bind(field: field, g: self.grid, first: 0, out: mut self.raw, bricks: mut self.bricks), over: n)
+        dispatch(coarse_copied.bind(raw: self.raw.items(), g: self.grid, out: mut self.coarse), over: self.coarse)
+        if self.asks == ASKS_CELLS {
+            label("deposit moving fine")
+            dispatch(pulled.bind(field: field, g: self.grid, bricks: self.bricks.items(), coarse: self.raw.items(), out: mut self.atlas), over: self.atlas)
+        }
+    }
+}
+
+/// The engine's measure of what asks cost: one ask of cells (once), then each thing's field in
+/// turn, each timed and read back.
+pub struct Choice {
+    coarse: Texture3d<Rg32Uint>,
+    atlas: Texture3d<Rgba16Float>,
+    out: GpuBuffer<f32>,
+    asked: Option<Pending<f32>>,
+    /// An ask of cells (ns; 0 until measured), and which thing is being measured (none: past
+    /// the last).
+    pub cells: f32,
+    measuring: u32,
+    waiting: bool,
+    /// The least of the times taken so far of what is being measured, and how many there are
+    /// (each is measured `TIMES` times and the least kept: the GPU's clock rises over the first).
+    least: f32,
+    times: u32,
+}
+
+/// How many times each cost is measured.
+const TIMES: u32 = 3
+
+pub fn choice() -> Choice {
+    Choice {
+        coarse: texture3d(width: 64, height: 64, depth: 64),
+        atlas: texture3d(width: ROW * BS, height: ROW * BS, depth: BS),
+        out: buffer(COST_ASKS),
+        asked: None,
+        cells: 0.0,
+        measuring: 0,
+        waiting: false,
+        least: 1.0e30,
+        times: 0,
+    }
+}
+
+impl Choice {
+    /// Whether an ask of cells is measured.
+    pub fn known(self) -> bool {
+        self.cells > 0.0
+    }
+
+    /// Cells' cost measured (once), as far as this frame goes.
+    pub fn cells_measured(mut self, s: Sampler) {
+        if self.known() {
+            return
+        }
+        if !self.waiting {
+            self.asked = Some(timed("asked cells"))
+            label("asked cells")
+            dispatch(cells_cost.bind(coarse: self.coarse, atlas: self.atlas, s: s, out: mut self.out), over: COST_ASKS)
+            self.waiting = true
+            return
+        }
+        match mut self.asked {
+            Some(p) => match p.poll() {
+                Some(Ok(us)) => {
+                    self.least = min(self.least, us[0] * 1000.0 / f32(COST_ASKS * 16))
+                    self.times += 1
+                    self.asked = None
+                    self.waiting = false
+                    if self.times == TIMES {
+                        self.cells = max(self.least, 1.0e-6)
+                        self.least = 1.0e30
+                        self.times = 0
+                        print(f"engine::matter: an ask of cells costs {self.cells} ns (the least of {TIMES} measures)")
+                    }
+                },
+                Some(Err(_)) => {
+                    panic("engine::matter: the host can't time GPU work, so the engine can't measure what an ask costs")
+                },
+                None => {},
+            },
+            None => {},
+        }
+    }
+
+    /// `kept`'s field's cost measured and its choice made, as far as this frame goes; true once
+    /// made.
+    pub fn chose<M: Field<Substance>>(mut self, field: M, k: mut Kept, which: u32) -> bool {
+        if !k.undecided() {
+            return true
+        }
+        if !self.known() || self.waiting && self.measuring != which {
+            return false
+        }
+        if !self.waiting {
+            let b = field.bound()
+            self.asked = Some(timed("asked field"))
+            label("asked field")
+            dispatch(field_cost.bind(field: field, held: vec4(b.centre, b.radius), out: mut self.out), over: COST_ASKS)
+            self.waiting = true
+            self.measuring = which
+            return false
+        }
+        match mut self.asked {
+            Some(p) => match p.poll() {
+                Some(Ok(us)) => {
+                    self.least = min(self.least, us[0] * 1000.0 / f32(COST_ASKS * 16))
+                    self.times += 1
+                    self.asked = None
+                    self.waiting = false
+                    if self.times < TIMES {
+                        return false
+                    }
+                    k.cost = self.least
+                    self.least = 1.0e30
+                    self.times = 0
+                    k.asks = if k.cost <= ASK_RATIO * self.cells { ASKS_FIELD } else { ASKS_CELLS }
+                    k.cells_cost = self.cells
+                    if k.held_asks != 0 {
+                        k.asks = k.held_asks
+                    }
+                    print(f"engine::matter: thing {which}: an ask of its field costs {k.cost} ns, {k.cost / self.cells} asks of cells: asked by its {by(k.asks)}{held(k.held_asks)}")
+                    return true
+                },
+                Some(Err(_)) => {
+                    panic("engine::matter: the host can't time GPU work, so the engine can't measure what an ask costs")
+                },
+                None => {},
+            },
+            None => {},
+        }
+        false
+    }
+}

@@ -20,14 +20,15 @@
 // draws at most `PASSES` of them. `work` draws the next ones; a world that changes is begun again
 // (`begin`). It prints "reference: done" when every look is in.
 
-use matter::matter::Matter
+use matter::matter::{Matter, matter}
+use matter::world::World
 use matter::sky::{Sky, seen}
 use matter::substance::Substance
 use picture::eye::{Eye, View, view}
 use picture::look::{Look, Seen}
 use picture::picture::Picture
 use picture::screen::{cover, luma}
-use reference::traced::{ends, entered, lit}
+use reference::traced::{SIMPLE, WHOLE, ends, entered, lit, thickness}
 use std::field::{Field, hash_u32}
 use std::gpu::{FragCoord, Rgba16Float, Rgba32Float, Targets2, Targets3, Texture, begin_pass, begin_pass2, begin_pass3, draw, label, texture}
 use std::io::print
@@ -86,6 +87,7 @@ pub fn looked<M: Field<Substance>, S: Sky, L: Look>(
     index: u32,
     rays: u32,
     bounces: u32,
+    light_kind: u32,
     first: u32,
     met_sofar: Texture<Rgba32Float>,
     matter_sofar: Texture<Rgba32Float>,
@@ -109,29 +111,35 @@ pub fn looked<M: Field<Substance>, S: Sky, L: Look>(
     let p = view.at + d * t
     let n = m.facing(p, -d)
     let s = m.made_of(p)
-    let light = lit(m, sky, p, n, s, -d, dice(x, y, index, salt), rays, bounces)
+    let light = lit(m, sky, p, n, s, -d, dice(x, y, index, salt), rays, bounces, light_kind)
     let c = look.tone(Seen { light })
     let l = luma(c)
     Targets3 { first: a + vec4(c, 1.0), second: b + vec4(c, l * l), third: f + vec4(t, t * t, 0.0, 0.0) }
 }
 
+/// How thick (m) matter is counted at the most: past it, thick.
+pub const THICK: f32 = 0.1
+
 /// The pixel's middle ray alone: into the first target, which way the matter it meets faces and
 /// how far along the ray (0, 0, 0, 0 where it meets none); into the second, the sky along it as
-/// the look shows it, and 1 (2 where the ray ran out of steps: the reference failed there).
+/// the look shows it, and 1 (2 where the ray ran out of steps: the reference failed there); into
+/// the third, how thick the matter it meets is there (`thickness`; `THICK` at the most).
 @fragment
-pub fn centred<M: Field<Substance>, S: Sky, L: Look>(pixel: FragCoord, view: View, m: Matter<M>, sky: S, look: L) -> Targets2<vec4, vec4> {
+pub fn centred<M: Field<Substance>, S: Sky, L: Look>(pixel: FragCoord, view: View, m: Matter<M>, sky: S, look: L) -> Targets3<vec4, vec4, vec4> {
     let d = view.ray(pixel.position.xy)
     let behind = vec4(look.tone(Seen { light: seen(sky, d) }), 1.0)
+    let none = vec4(THICK, 0.0, 0.0, 0.0)
     let span = m.span(view.at, d)
     if !(span.y > max(span.x, 0.0)) {
-        return Targets2 { first: vec4(0.0), second: behind }
+        return Targets3 { first: vec4(0.0), second: behind, third: none }
     }
     let t = entered(m, view.at, d, max(span.x, 0.0), ends(m, view.at, d))
     if t < 0.0 {
-        return Targets2 { first: vec4(0.0), second: vec4(behind.xyz, if t < -1.5 { 2.0 } else { 1.0 }) }
+        return Targets3 { first: vec4(0.0), second: vec4(behind.xyz, if t < -1.5 { 2.0 } else { 1.0 }), third: none }
     }
     let p = view.at + d * t
-    Targets2 { first: vec4(m.facing(p, -d), t), second: behind }
+    let n = m.facing(p, -d)
+    Targets3 { first: vec4(n, t), second: behind, third: vec4(thickness(m, p, n, THICK), 0.0, 0.0, 0.0) }
 }
 
 /// The looks summed, as means: which halves (`which`: 0 both, 1 the first, 2 the second), each of
@@ -227,6 +235,8 @@ pub struct Truth {
     pub centre: Texture<Rgba32Float>,
     /// The sky along its middle ray, as the look shows it.
     pub behind: Texture<Rgba32Float>,
+    /// How thick the matter its middle ray meets is there (`x`, m; `THICK` at the most).
+    pub thick: Texture<Rgba32Float>,
     /// How many looks it is the mean of.
     pub looks: u32,
 }
@@ -242,6 +252,9 @@ pub struct Reference {
     second: Half,
     centre: Texture<Rgba32Float>,
     behind: Texture<Rgba32Float>,
+    thick: Texture<Rgba32Float>,
+    /// Its light: `WHOLE` or `SIMPLE` (`traced`).
+    pub light: u32,
     /// Bands of the middle rays drawn, of looks' bands drawn (the current look's).
     centred: u32,
     band: u32,
@@ -251,7 +264,7 @@ pub struct Reference {
     said: bool,
 }
 
-pub fn reference(looks: u32, rays: u32, bounces: u32, salt: u32 = 0) -> Reference {
+pub fn reference(looks: u32, rays: u32, bounces: u32, salt: u32 = 0, light: u32 = WHOLE) -> Reference {
     if looks % 2 != 0 || looks == 0 {
         panic("engine::reference: a half's looks must be an even number, over 0")
     }
@@ -264,6 +277,8 @@ pub fn reference(looks: u32, rays: u32, bounces: u32, salt: u32 = 0) -> Referenc
         second: half(width: 1, height: 1),
         centre: texture(width: 1, height: 1),
         behind: texture(width: 1, height: 1),
+        thick: texture(width: 1, height: 1),
+        light,
         centred: 0,
         band: 0,
         passes: 0,
@@ -284,6 +299,7 @@ fn band_of<M: Field<Substance>, S: Sky, L: Look>(
     index: u32,
     rays: u32,
     bounces: u32,
+    light_kind: u32,
     y: u32,
     rows: u32,
     width: u32,
@@ -304,6 +320,7 @@ fn band_of<M: Field<Substance>, S: Sky, L: Look>(
                 index: index,
                 rays: rays,
                 bounces: bounces,
+                light_kind: light_kind,
                 first: first,
                 met_sofar: h.met_odd,
                 matter_sofar: h.matter_odd,
@@ -327,6 +344,7 @@ fn band_of<M: Field<Substance>, S: Sky, L: Look>(
                 index: index,
                 rays: rays,
                 bounces: bounces,
+                light_kind: light_kind,
                 first: first,
                 met_sofar: h.met_even,
                 matter_sofar: h.matter_even,
@@ -385,12 +403,14 @@ impl Reference {
         self.second = half(width: width, height: height)
         self.centre = texture(width: width, height: height)
         self.behind = texture(width: width, height: height)
+        self.thick = texture(width: width, height: height)
         self.begin()
     }
 
     /// Up to `PASSES` more bands of `m` under `sky`, seen in `look` through `eye` on a `width` ×
     /// `height` screen: the middle rays first, then the looks, the halves by turns.
-    pub fn work<M: Field<Substance>, S: Sky, L: Look>(mut self, m: Matter<M>, sky: S, look: L, eye: Eye, width: u32, height: u32) {
+    pub fn work<W: World, S: Sky, L: Look>(mut self, world: W, sky: S, look: L, eye: Eye, width: u32, height: u32) {
+        let m = matter(world.field())
         self.sized(width, height)
         let middle = view(eye, width, height)
         let bands = self.bands()
@@ -402,7 +422,7 @@ impl Reference {
             self.passes += 1
             if self.centred < bands {
                 let y = self.centred * rows_a_band
-                let p = begin_pass2(mut self.centre, mut self.behind, keep: true)
+                let p = begin_pass3(mut self.centre, mut self.behind, mut self.thick, keep: true)
                 p.scissor(0, y, width, min(rows_a_band, height - y))
                 draw(p, cover, centred.bind(view: middle, m: m, sky: sky, look: look), vertices: 3)
                 p.end()
@@ -415,10 +435,10 @@ impl Reference {
             let rows = min(rows_a_band, height - y)
             if which == 0 {
                 let v = middle.moved(jitter(0, self.first.looks))
-                band_of(mut self.first, v, m, sky, look, self.salt, index, self.rays, self.bounces, y, rows, width)
+                band_of(mut self.first, v, m, sky, look, self.salt, index, self.rays, self.bounces, self.light, y, rows, width)
             } else {
                 let v = middle.moved(jitter(1, self.second.looks))
-                band_of(mut self.second, v, m, sky, look, self.salt, index, self.rays, self.bounces, y, rows, width)
+                band_of(mut self.second, v, m, sky, look, self.salt, index, self.rays, self.bounces, self.light, y, rows, width)
             }
             self.band += 1
             if self.band == bands {
@@ -432,7 +452,7 @@ impl Reference {
         }
         if self.done() && !self.said {
             self.said = true
-            print(f"reference: done: {2 * self.looks} looks of {self.rays} rays and {self.bounces} bounces at {width}x{height}, in {self.passes} passes")
+            print(f"reference: done: {2 * self.looks} looks of {self.rays} rays and {self.bounces} bounces ({lit_by(self.light)}) at {width}x{height}, in {self.passes} passes")
         }
     }
 
@@ -448,6 +468,7 @@ impl Reference {
             truth.far = texture(width: self.width, height: self.height)
             truth.centre = texture(width: self.width, height: self.height)
             truth.behind = texture(width: self.width, height: self.height)
+            truth.thick = texture(width: self.width, height: self.height)
         }
         label("reference settled")
         // (Each half's looks are even, so the last of them wrote its odd pair.)
@@ -471,6 +492,9 @@ impl Reference {
         let q = begin_pass2(mut truth.centre, mut truth.behind)
         draw(q, cover, copied2.bind(a: self.centre, b: self.behind), vertices: 3)
         q.end()
+        let r = begin_pass(mut truth.thick)
+        draw(r, cover, copied.bind(a: self.thick), vertices: 3)
+        r.end()
         truth.looks = if which == 0 { 2 * self.looks } else { self.looks }
     }
 
@@ -493,6 +517,11 @@ impl Reference {
     }
 }
 
+/// Which light, said.
+fn lit_by(light: u32) -> Text {
+    if light == SIMPLE { "the simple light" } else { "all the light" }
+}
+
 /// A truth, as yet unknown.
 pub fn truth() -> Truth {
     Truth {
@@ -501,6 +530,7 @@ pub fn truth() -> Truth {
         far: texture(width: 1, height: 1),
         centre: texture(width: 1, height: 1),
         behind: texture(width: 1, height: 1),
+        thick: texture(width: 1, height: 1),
         looks: 0,
     }
 }
