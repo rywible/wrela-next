@@ -126,6 +126,7 @@ the spike differs it says so.
 | J. T. Kajiya, "The Rendering Equation" (SIGGRAPH 1986) | Published method | `lit_truly`, the light's reference: each sky ray that meets the form followed on, taking the sun's light where it stops, against the form itself |
 | M. Pharr, W. Jakob and G. Humphreys, *Physically Based Rendering* (4th ed., 2023), cosine-weighted hemisphere sampling (Malley's method) | Published book, free to read online | The sky's rays in `lit_cells` and `lit_truly`: more of them where they count for more, so each counts alike |
 | Z. H. Cigolle and others, "A Survey of Efficient Representations for Independent Unit Vectors" (*JCGT* 3(2), 2014), the octahedral fold (cited above for the frame) | Published method | `folded` and `unfolded`: a cell's facing in one word while the deposit holds it in a buffer |
+| Inigo Quilez's [distance functions](https://iquilezles.org/articles/distfunctions/) (the round cone between two points) and [smooth minimum](https://iquilezles.org/articles/smin/) (the quadratic polynomial one) | MIT | `body.wrela`: the moving-body test's stand-in creature is round cones between a skeleton's joints, joined by that smooth minimum. The cone's gradient and the join's are written out by hand here, and each part's constants worked out once on the CPU |
 
 ## Bodies and motion
 

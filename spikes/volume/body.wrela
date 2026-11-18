@@ -1,0 +1,265 @@
+// The moving-body test's stand-in: a small two-legged creature of rounded parts, each a round
+// cone between two joints of a skeleton as a move has posed them this frame. The parts share
+// their joints, so they cannot come apart; they are joined smoothly, as flesh is. Two kinds of
+// part are deliberately thin: the ears' tips (1.5 cm through) and a wand in the hand (1 cm),
+// which is joined almost sharply so it stays thin. It is not an authored character: it stands in
+// for one, to ask what any moving body costs to deposit and how its picture holds.
+
+use form::look::{Look, Place, Skin}
+use hakuro::posed::of_rig
+use hakuro::skeleton::{
+    BALL_LEFT, CALF_LEFT, FINGERS_LEFT, FOOT_LEFT, FOREARM_LEFT, HAND_LEFT, HAND_RIGHT, HEAD, NECK, PELVIS, REST, SPINE_3, THIGH_LEFT, UPPER_ARM_LEFT,
+}
+use motion::humanoid::{Rig, palette}
+use motion::playback::Move
+use std::field::{Bound, Surface}
+use std::transform::translate
+use volume::Parted
+
+/// The most parts a body has.
+pub const PARTS: u32 = 20
+
+/// How wide the smooth join between two of the body's parts is (m), and the join of a thin part
+/// (the wand) to the body.
+pub const JOIN: f32 = 0.03
+pub const THIN_JOIN: f32 = 0.004
+
+/// A body as posed this frame: each part's first end and its radius there (`from`), the way
+/// to its other end and the radius there (`along`), and what a part's distance needs that is
+/// the same wherever it is asked (`made`: its length squared, its radii's difference, the first
+/// less the second squared, and one over the first), worked out once here and not at every
+/// cell. The body's parts come first (`flesh` of them), then its thin parts, `count` in all.
+/// `held`: the middle and radius of a sphere that holds it.
+pub struct Body: Copy + GpuData {
+    pub from: [vec4; 20],
+    pub along: [vec4; 20],
+    pub made: [vec4; 20],
+    pub held: vec4,
+    pub flesh: u32,
+    pub count: u32,
+    /// All its parts, a bit each.
+    pub parts: u32,
+}
+
+/// The distance from `p` to a round cone (`from`, `along`, `made`: a part of a `Body`): exact
+/// outside it and inside.
+fn round_cone(p: vec3, from: vec4, along: vec4, made: vec4) -> f32 {
+    let ba = along.xyz
+    let l2 = made.x
+    let rr = made.y
+    let a2 = made.z
+    let il2 = made.w
+    let pa = p - from.xyz
+    let y = dot(pa, ba)
+    let z = y - l2
+    let across = pa * l2 - ba * y
+    let x2 = dot(across, across)
+    let y2 = y * y * l2
+    let z2 = z * z * l2
+    let k = sign(rr) * rr * rr * x2
+    if sign(z) * a2 * z2 > k {
+        return sqrt(x2 + z2) * il2 - along.w
+    }
+    if sign(y) * a2 * y2 < k {
+        return sqrt(x2 + y2) * il2 - from.w
+    }
+    (sqrt(x2 * a2 * il2) + y * rr) * il2 - from.w
+}
+
+/// The same round cone's facing (`xyz`, of unit length: the way its distance grows) and its
+/// distance (`w`) at `p`, written out: from the nearer end's middle past either end, and
+/// square off its slanted side between them.
+fn round_cone_faced(p: vec3, from: vec4, along: vec4, made: vec4) -> vec4 {
+    let ba = along.xyz
+    let l2 = made.x
+    let rr = made.y
+    let a2 = made.z
+    let il2 = made.w
+    let pa = p - from.xyz
+    let y = dot(pa, ba)
+    let z = y - l2
+    let across = pa * l2 - ba * y
+    let x2 = dot(across, across)
+    let y2 = y * y * l2
+    let z2 = z * z * l2
+    let k = sign(rr) * rr * rr * x2
+    if sign(z) * a2 * z2 > k {
+        let off = pa - ba
+        let far = max(length(off), 1.0e-9)
+        return vec4(off / far, far - along.w)
+    }
+    if sign(y) * a2 * y2 < k {
+        let far = max(length(pa), 1.0e-9)
+        return vec4(pa / far, far - from.w)
+    }
+    let out = across / max(sqrt(x2), 1.0e-12)
+    vec4(out * sqrt(a2 * il2) + ba * (rr * il2), (sqrt(x2 * a2 * il2) + y * rr) * il2 - from.w)
+}
+
+/// The lesser of two distances, rounded over `k` m where they are near each other.
+fn joined(a: f32, b: f32, k: f32) -> f32 {
+    let h = max(k - abs(a - b), 0.0) / k
+    min(a, b) - h * h * k * 0.25
+}
+
+impl Surface for Body {
+    fn distance(self, p: vec3) -> f32 {
+        self.distance_of(p, self.parts)
+    }
+
+    fn sample(self, p: vec3) -> (f32, vec3) {
+        self.sample_of(p, self.parts)
+    }
+
+    fn gradient(self, p: vec3) -> vec3 {
+        let (_, g) = self.sample_of(p, self.parts)
+        g
+    }
+
+    fn bound(self) -> Bound {
+        Bound { centre: self.held.xyz, radius: self.held.w, slope: 1.0 }
+    }
+
+    fn lipschitz(self, near: f32) -> f32 {
+        1.0
+    }
+}
+
+impl Parted for Body {
+    /// A part matters within `reach` of `p` if it can come within a join's width of the nearest
+    /// part there: each distance changes by `reach` at the most, so if it is no farther at `p`
+    /// than the nearest and twice `reach` and the join.
+    fn near(self, p: vec3, reach: f32) -> u32 {
+        var least = 1.0e9
+        for i in 0..PARTS {
+            if i < self.count {
+                least = min(least, round_cone(p, self.from[i], self.along[i], self.made[i]))
+            }
+        }
+        var bits: u32 = 0
+        for i in 0..PARTS {
+            if i < self.count && round_cone(p, self.from[i], self.along[i], self.made[i]) <= least + 2.0 * reach + JOIN {
+                bits = bits | (1 << i)
+            }
+        }
+        bits
+    }
+
+    /// (Only the parts named, the last first: a loop as long as there are parts to ask, so a
+    /// cell near two parts pays for two.)
+    fn distance_of(self, p: vec3, parts: u32) -> f32 {
+        var d = 1.0e9
+        var left = parts
+        var asked: u32 = 0
+        while asked < PARTS && left != 0 {
+            asked += 1
+            let i = 31 - left.leading_zeros()
+            left = left ^ (1 << i)
+            let part = round_cone(p, self.from[i], self.along[i], self.made[i])
+            d = joined(d, part, if i < self.flesh { JOIN } else { THIN_JOIN })
+        }
+        d
+    }
+
+    /// The distance and its gradient written out, not derived: each part's own facing, shared
+    /// between two parts across their join as the join shares their distances.
+    fn sample_of(self, p: vec3, parts: u32) -> (f32, vec3) {
+        var d = 1.0e9
+        var g = vec3(0.0, 1.0, 0.0)
+        var left = parts
+        var asked: u32 = 0
+        while asked < PARTS && left != 0 {
+            asked += 1
+            let i = 31 - left.leading_zeros()
+            left = left ^ (1 << i)
+            let part = round_cone_faced(p, self.from[i], self.along[i], self.made[i])
+            let k = if i < self.flesh { JOIN } else { THIN_JOIN }
+            let h = max(k - abs(d - part.w), 0.0) / k
+            g = if part.w < d { part.xyz * (1.0 - 0.5 * h) + g * (0.5 * h) } else { g * (1.0 - 0.5 * h) + part.xyz * (0.5 * h) }
+            d = min(d, part.w) - h * h * k * 0.25
+        }
+        (d, g)
+    }
+}
+
+/// What the body wears: one warm colour, its thin parts (above its head's middle, or far out
+/// from its middle line) a darker one.
+pub struct Fur: Copy + GpuData {
+    pub spare: vec4,
+}
+
+impl Look for Fur {
+    fn skin(self, at: Place) -> Skin {
+        Skin { albedo: vec3(0.62, 0.45, 0.28), line: 1.0, metal: 0.0, rim: false, emits: vec3(0.0) }
+    }
+}
+
+/// How large the body is against the skeleton it rides (Hakuro's, a grown man's): about a
+/// metre to its ears' tips.
+pub const SCALE: f32 = 0.6
+
+/// Where a point `off` m from `bone`'s joint at rest is now, in the body's scale.
+fn joint(pal: [mat4; 64], bone: u32, off: vec3) -> vec3 {
+    (pal[bone] * vec4(REST[bone] + off, 1.0)).xyz * SCALE
+}
+
+/// The body as `walk` poses the skeleton `time` s in: in place, facing +z, its feet near y = 0.
+/// Its parts' radii are the skeleton's scale's (m), scaled with it.
+pub fn body_at(walk: Move, rig: Rig, time: f32) -> Body {
+    let pal = of_rig(palette(rig, walk.pose(time), translate(vec3(0.0))))
+    var from = [vec4(0.0); 20]
+    var to = [vec4(0.0); 20]
+    var n: u32 = 0
+    // The trunk and the head (a big one).
+    from[n] = vec4(joint(pal, PELVIS, vec3(0.0)), 0.17 * SCALE)
+    to[n] = vec4(joint(pal, SPINE_3, vec3(0.0)), 0.16 * SCALE)
+    n += 1
+    from[n] = vec4(joint(pal, SPINE_3, vec3(0.0)), 0.16 * SCALE)
+    to[n] = vec4(joint(pal, NECK, vec3(0.0)), 0.1 * SCALE)
+    n += 1
+    from[n] = vec4(joint(pal, HEAD, vec3(0.0, 0.1, 0.02)), 0.25 * SCALE)
+    to[n] = vec4(joint(pal, HEAD, vec3(0.0, 0.16, 0.03)), 0.23 * SCALE)
+    n += 1
+    // The limbs: a left bone and its right (the next bone).
+    for side in 0..2 {
+        from[n] = vec4(joint(pal, UPPER_ARM_LEFT + side, vec3(0.0)), 0.065 * SCALE)
+        to[n] = vec4(joint(pal, FOREARM_LEFT + side, vec3(0.0)), 0.058 * SCALE)
+        n += 1
+        from[n] = vec4(joint(pal, FOREARM_LEFT + side, vec3(0.0)), 0.058 * SCALE)
+        to[n] = vec4(joint(pal, HAND_LEFT + side, vec3(0.0)), 0.05 * SCALE)
+        n += 1
+        from[n] = vec4(joint(pal, HAND_LEFT + side, vec3(0.0)), 0.05 * SCALE)
+        to[n] = vec4(joint(pal, FINGERS_LEFT + side, vec3(0.0)), 0.045 * SCALE)
+        n += 1
+        from[n] = vec4(joint(pal, THIGH_LEFT + side, vec3(0.0)), 0.09 * SCALE)
+        to[n] = vec4(joint(pal, CALF_LEFT + side, vec3(0.0)), 0.072 * SCALE)
+        n += 1
+        from[n] = vec4(joint(pal, CALF_LEFT + side, vec3(0.0)), 0.072 * SCALE)
+        to[n] = vec4(joint(pal, FOOT_LEFT + side, vec3(0.0)), 0.056 * SCALE)
+        n += 1
+        from[n] = vec4(joint(pal, FOOT_LEFT + side, vec3(0.0)), 0.056 * SCALE)
+        to[n] = vec4(joint(pal, BALL_LEFT + side, vec3(0.0)), 0.046 * SCALE)
+        n += 1
+        // An ear: from the head's side to a tip 1.5 cm through.
+        let out = if side == 0 { 1.0 } else { -1.0 }
+        from[n] = vec4(joint(pal, HEAD, vec3(0.13 * out, 0.3, 0.02)), 0.05 * SCALE)
+        to[n] = vec4(joint(pal, HEAD, vec3(0.2 * out, 0.52, 0.0)), 0.0125 * SCALE)
+        n += 1
+    }
+    let flesh = n
+    // A wand in the right hand, 1 cm through and 36 cm long.
+    from[n] = vec4(joint(pal, HAND_RIGHT, vec3(0.0, 0.0, 0.0)), 0.0084 * SCALE)
+    to[n] = vec4(joint(pal, HAND_RIGHT, vec3(-0.12, 0.3, 0.5)), 0.0084 * SCALE)
+    n += 1
+    let middle = joint(pal, PELVIS, vec3(0.0))
+    var along = [vec4(0.0); 20]
+    var made = [vec4(0.0); 20]
+    for i in 0..n {
+        let ba = to[i].xyz - from[i].xyz
+        let l2 = dot(ba, ba)
+        let rr = from[i].w - to[i].w
+        along[i] = vec4(ba, to[i].w)
+        made[i] = vec4(l2, rr, l2 - rr * rr, 1.0 / l2)
+    }
+    Body { from, along, made, held: vec4(middle.x, 0.6, middle.z, 0.8), flesh, count: n, parts: (1 << n) - 1 }
+}

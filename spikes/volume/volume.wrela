@@ -186,6 +186,8 @@ pub struct Volume<S> {
     /// puts it in its texture (a kernel stores only its own texel, so a texture can't be filled a
     /// band at a time).
     raw: GpuBuffer<u32>,
+    /// A moving form's parts that matter in each coarse cell's brick (`Parted`).
+    parts: GpuBuffer<u32>,
     counted: Option<Pending<u32>>,
     /// 0 the coarse grid's bands; 1 its count asked for; 2 the atlas's bands; 3 filled.
     pub stage: u32,
@@ -274,6 +276,7 @@ pub fn volume<S: Solid>(form: S, cell: f32) -> Volume<S> {
         albedo: texture3d(width: 1, height: 1, depth: 1),
         bricks: append_buffer(MOST_BRICKS),
         raw: buffer(2 * n * n * n),
+        parts: buffer(1),
         counted: None,
         stage: 0,
         cursor: 0,
@@ -557,6 +560,391 @@ fn atlas_copied(raw: [u32], g: Grid, out: mut Texels3d<Rgba16Float>, albedo: mut
     let open = (a & BURIED) == 0
     out.store(id, vec4(bitcast_f32(raw[3 * i]), if open { unfolded(raw[3 * i + 1]) } else { vec3(0.0) }))
     albedo.store(id, vec4(f32(a & 255), f32((a >> 8) & 255), f32((a >> 16) & 255), if open { 255.0 } else { 0.0 }) / 255.0)
+}
+
+// A form that moves is deposited again every frame, whole, inside the frame. Its volume is made
+// once to hold the most bricks it may keep; each frame its grid follows the form's bound by whole
+// bricks, the coarse grid is asked again (which bricks the surface passes through now, each
+// given a place in the atlas in whatever order they come), and every atlas texel then pulls its
+// own value: it looks up which brick its place holds this frame and asks the form there. Nothing
+// is scattered and nothing is copied: a texel is written once, by its own invocation.
+
+/// A solid made of parts (a body's limbs, each on its bones), which can say which of its parts
+/// matter near a place and be asked for those alone: so a cell asks only the parts near it,
+/// not every part of the body.
+pub trait Parted: Solid {
+    /// Which of its parts (a bit each) can change its distance anywhere within `reach` m of `p`.
+    fn near(self, p: vec3, reach: f32) -> u32
+
+    /// Its distance and gradient at `p` from only `parts` of its parts: the whole solid's
+    /// wherever those are all the parts that matter there (`near`). (The parts are named in the
+    /// asking, not by a copy of the solid that holds fewer: a copy of a body's parts for every
+    /// cell cost twenty times what asking them did.)
+    fn sample_of(self, p: vec3, parts: u32) -> (f32, vec3)
+
+    /// Its distance alone at `p` from only `parts` of its parts.
+    fn distance_of(self, p: vec3, parts: u32) -> f32
+}
+
+/// How many cells off the nearest kept brick are counted round a moving form (a pass of its
+/// small grid each, every frame).
+const MOVING_RINGS: u32 = 1
+
+/// A moving form's coarse grid put in its texture: a cell no ring reached is `rings` + 1 off
+/// the nearest kept brick at the least.
+@compute(4, 4, 4)
+fn coarse_moved(raw: [u32], g: Grid, rings: u32, out: mut Texels3d<Rg32Uint>, id: GlobalId) {
+    let i = id.x + g.size.x * (id.y + g.size.y * id.z)
+    let w = raw[2 * i]
+    out.store(id, vec2u(if w == NO_BRICK { FAR_FROM | (rings + 1) } else { w }, raw[2 * i + 1]))
+}
+
+/// Coarse cells of a moving form, as `coarsed` asks a still one's, and for each brick kept the
+/// parts of the form that matter anywhere in it (`parts`).
+@compute(64)
+fn coarsed_parts<S: Parted>(form: S, g: Grid, out: mut Atomics<u32>, parts: mut Atomics<u32>, bricks: mut Append<u32>, id: GlobalId) {
+    let i = id.x
+    if i >= g.size.x * g.size.y * g.size.z {
+        return
+    }
+    let x = i % g.size.x
+    let y = (i / g.size.x) % g.size.y
+    let z = i / (g.size.x * g.size.y)
+    let brick = g.cell * f32(B)
+    let mid = g.lo + (vec3(f32(x), f32(y), f32(z)) + vec3(0.5)) * brick
+    // (Its value over its gradient's length where that is over 1, and the value itself where it
+    // is under: between two parts that pass close, joined, the value runs level and its
+    // gradient is next to nothing, and the value over it would be a distance ten times too
+    // far, the brick between them dropped.)
+    let (f, grad) = form.sample(mid)
+    let d = f / max(length(grad), 1.0)
+    var slot = NO_BRICK
+    if abs(d) < brick * NEAR_BRICK {
+        slot = bricks.push(x | (y << 10) | (z << 20))
+        // (A brick's farthest texel from its middle is half its diagonal off.)
+        let _ = parts.exchange(i: i, value: form.near(mid, 0.867 * brick))
+    }
+    let _ = out.exchange(i: 2 * i, value: slot)
+    let _ = out.exchange(i: 2 * i + 1, value: bitcast_u32(f))
+}
+
+/// An atlas texel of a moving form, this frame: the brick listed at its place, if the coarse
+/// grid (`coarse`, as `coarsed_parts` wrote it this frame) still gives that brick this place (a
+/// place past this frame's count holds an older frame's brick, which is left as it was: nothing
+/// reads it); then the distance and facing at the texel of the form's parts that matter in
+/// that brick (`parts`). What it wears isn't stored: a pixel asks the look where the form itself
+/// puts it (`marched_true`). (Its groups are 3 deep: an atlas of one layer of
+/// bricks is 9 texels deep, and groups 4 deep would run a third more invocations than it has
+/// texels, past what one dispatch may be.)
+@compute(4, 4, 3)
+fn deposited_here<S: Parted>(form: S, g: Grid, bricks: [u32], coarse: [u32], parts: [u32], out: mut Texels3d<Rgba16Float>, id: GlobalId) {
+    let slot = id.x / BS + ROW * (id.y / BS + ROW * (id.z / BS))
+    if slot >= g.size.w {
+        return
+    }
+    let c = bricks[slot]
+    let x = c & 1023
+    let y = (c >> 10) & 1023
+    let z = c >> 20
+    if x >= g.size.x || y >= g.size.y || z >= g.size.z {
+        return
+    }
+    let at = x + g.size.x * (y + g.size.y * z)
+    if coarse[2 * at] != slot {
+        return
+    }
+    let local = vec3(f32(id.x % BS), f32(id.y % BS), f32(id.z % BS))
+    let p = g.lo + (vec3(f32(x), f32(y), f32(z)) * f32(B) + local) * g.cell
+    var f = 1.0
+    var grad = vec3(0.0, 1.0, 0.0)
+    if (g.debug & 256) == 0 {
+        let (f0, g0) = form.sample_of(p, parts[at])
+        f = f0
+        grad = g0
+    }
+    // (The distance as `coarsed_parts` takes it; the facing of unit length whatever the
+    // gradient's.)
+    let len = max(length(grad), 1.0e-6)
+    out.store(id, vec4(f / max(len, 1.0), grad / len))
+}
+
+/// How near the stored surface (cells) a ray asks the form itself, and the most times it asks
+/// along a pixel's ray.
+const TRUE_NEAR: f32 = 1.5
+const TRUE_STEPS: u32 = 256
+
+/// A moving form itself at `p`: its facing (`xyz`, its gradient) and its distance (`w`), from
+/// the parts that matter in the brick `p` is in; or, in a brick that holds nothing, no facing
+/// and how far every place in such a brick is from the surface at the least (`clear.x`; in a
+/// brick inside the form `clear.y`, the same under 0).
+fn asked_at<S: Parted>(form: S, g: Grid, coarse: Texture3d<Rg32Uint>, parts: [u32], brick: f32, top: vec3, clear: vec2, p: vec3) -> vec4 {
+    let c = clamp(floor((p - g.lo) / brick), vec3(0.0), top)
+    let k = coarse.load(u32(c.x), u32(c.y), u32(c.z))
+    if k.x >= FAR_FROM {
+        // (Inside the form, where the form is under nothing at the brick's middle.)
+        return vec4(0.0, 0.0, 0.0, if bitcast_f32(k.y) < 0.0 { clear.y } else { clear.x })
+    }
+    let (f, grad) = form.sample_of(p, parts[u32(c.x) + g.size.x * (u32(c.y) + g.size.y * u32(c.z))])
+    vec4(grad, f)
+}
+
+/// A moving form's distance alone at `p`, as `asked_at` gives it: what a ray steps by.
+fn far_at<S: Parted>(form: S, g: Grid, coarse: Texture3d<Rg32Uint>, parts: [u32], brick: f32, top: vec3, clear: vec2, p: vec3) -> f32 {
+    let c = clamp(floor((p - g.lo) / brick), vec3(0.0), top)
+    let k = coarse.load(u32(c.x), u32(c.y), u32(c.z))
+    if k.x >= FAR_FROM {
+        return if bitcast_f32(k.y) < 0.0 { clear.y } else { clear.x }
+    }
+    form.distance_of(p, parts[u32(c.x) + g.size.x * (u32(c.y) + g.size.y * u32(c.z))])
+}
+
+/// A pixel of a moving form: found through its volume, finished against the form itself. The
+/// stored cells say where along the ray the surface is near (within `TRUE_NEAR` cells); through
+/// there the ray steps by the form's own distance (of the parts near, by the brick it is in)
+/// until it crosses the surface, as the references do, and the place is put on it by halving.
+/// Its facing is the form's gradient there and it wears the look asked there. So what the
+/// picture shows is the form, not the cells: a thing thinner than a cell is drawn if the cells
+/// bring the ray near it, and a crease is as sharp as the form makes it.
+@fragment
+pub fn marched_true<S: Parted, L: Look>(
+    pixel: FragCoord,
+    eye: Eye,
+    light: Lighting,
+    form: S,
+    look: L,
+    g: Grid,
+    coarse: Texture3d<Rg32Uint>,
+    atlas: Texture3d<Rgba16Float>,
+    s: Sampler,
+    parts: [u32],
+    body: u32,
+) -> WithDepth<Targets3<vec4, vec4, u32>> {
+    let d = eye.ray(pixel.position.xy)
+    let span = crossing(eye, g, d)
+    if !(span.x < span.y) {
+        return nothing()
+    }
+    let px = eye.pixel()
+    let reach = TRUE_NEAR * g.cell
+    let brick = g.cell * f32(B)
+    let top = vec3(f32(g.size.x - 1), f32(g.size.y - 1), f32(g.size.z - 1))
+    let clear = vec2(CLEAR_OF * brick, -CLEAR_OF * brick)
+    let near = reach / (px * span.x)
+    // A stretch at a time: the cells are walked to where the surface is next near (or met), and
+    // through there the ray steps by the form's own distance until it is in the form. A ray
+    // that skims one part without entering it (the cells, a little fatter in a hollow, may say
+    // it did) goes on from the stretch's end to the next: the body behind it.
+    var from = span.x
+    var rounds: u32 = 0
+    var going = true
+    var crossed = false
+    var t = span.x
+    var lo = span.x
+    var flo = 0.0
+    var v = 0.0
+    var steps: u32 = 0
+    while rounds < 4 && going && !crossed {
+        rounds += 1
+        let w = walk(g, coarse, atlas, s, eye.at, d, from: from, to: span.y, px: px, near: near)
+        if !w.met && w.near == 0.0 {
+            going = false
+        } else {
+            t = max((if w.near > 0.0 { min(w.near, if w.met { w.t } else { w.near }) } else { w.t }) - reach, from)
+            let end = (if w.met { w.t } else { w.last }) + 2.0 * reach
+            // (The stretch must begin outside the form. Where two parts pass within a cell of
+            // each other, a place a cell and a half short of the one the cells found can be
+            // inside the other, which the cells were too coarse to show: then it begins
+            // farther back, by how deep it was.)
+            var back: u32 = 0
+            var inside = true
+            while back < 8 && inside {
+                back += 1
+                let u = far_at(form, g, coarse, parts, brick, top, clear, eye.at + d * t)
+                if u < 0.0 && t > from {
+                    t = max(t - max(-u, reach), from)
+                } else {
+                    inside = false
+                }
+            }
+            // `lo`: the last place outside the form and its distance there; `t`: the first
+            // inside, and `v` its distance.
+            lo = t
+            flo = 0.0
+            while steps < TRUE_STEPS && !crossed && t < end {
+                steps += 1
+                v = far_at(form, g, coarse, parts, brick, top, clear, eye.at + d * t)
+                if v < 0.0 {
+                    crossed = true
+                } else {
+                    lo = t
+                    flo = v
+                    t += max(v, 0.25 * px * t)
+                }
+            }
+            from = t
+            going = steps < TRUE_STEPS && t < span.y
+        }
+    }
+    if !crossed || (g.debug & 2048) != 0 {
+        if (g.debug & 512) != 0 && rounds > 1 {
+            // (Green: the cells brought the ray near, but it never entered the form itself;
+            // its red, the asks it took.)
+            return WithDepth {
+                color: Targets3 { first: vec4(f32(steps) / f32(TRUE_STEPS), 1.0, 0.0, 0.0), second: edge_record(NO_EDGE, 1.0, NO_LINE), third: identity(SOLID, body: body, group: 0) },
+                depth: eye.depth(eye.at + d * span.x),
+            }
+        }
+        return nothing()
+    }
+    // Onto the surface between them: where a straight line through the two distances is 0,
+    // twice (the distance runs near straight along a ray this close to the surface).
+    // (A `while`, not a `for` of two turns: the compiler unrolls so short a `for`, and in each
+    // copy it then copied the whole form, a kilobyte of parts, into a local of the pixel's:
+    // the pass ran five times slower. Measured: 16.0 ms against 2.9 ms.)
+    var hi = t
+    var fhi = min(v, -1.0e-9)
+    var turns: u32 = 0
+    while turns < 2 {
+        turns += 1
+        let m = lo + (hi - lo) * (flo / (flo - fhi))
+        let fm = far_at(form, g, coarse, parts, brick, top, clear, eye.at + d * m)
+        if fm < 0.0 {
+            hi = m
+            fhi = min(fm, -1.0e-9)
+        } else {
+            lo = m
+            flo = fm
+        }
+    }
+    let at = lo + (hi - lo) * (flo / (flo - fhi))
+    let p = eye.at + d * at
+    let here = asked_at(form, g, coarse, parts, brick, top, clear, p)
+    let n = normalize(here.xyz)
+    let skin = look.skin(Place { world: p, rest: p, chart: None, normal: n })
+    var lit = worn(light, skin, p, n, -d, STILL, reach: sun_reach(light, p))
+    if (g.debug & 512) != 0 {
+        // (To see what a pixel found: red, no facing where it stopped; else its facing, and in
+        // blue how many times it asked the form, of the most.)
+        lit.colour = if dot(here.xyz, here.xyz) == 0.0 { vec3(1.0, 0.0, 0.0) } else { vec3(0.5 + 0.5 * n.x, 0.5 + 0.5 * n.y, f32(steps) / f32(TRUE_STEPS)) }
+    }
+    // The way to its outline, as `shown` finds it, from the form's own facing a little on.
+    var way = NO_EDGE
+    let nv = dot(n, -d)
+    if nv < FOLD_NEAR {
+        let lean = vec2(dot(n, eye.right), -dot(n, eye.up))
+        if dot(lean, lean) > 1.0e-8 {
+            // (Two of the pixel's footprints on: the form's own facing needs no cell's width.)
+            let ahead = 2.0 * px * at
+            let on = asked_at(form, g, coarse, parts, brick, top, clear, p + d * ahead)
+            if dot(on.xyz, on.xyz) > 0.0 {
+                let bend = (dot(normalize(on.xyz), d) + nv) / ahead
+                if bend > 1.0e-6 {
+                    let deep = nv * nv / (2.0 * bend)
+                    way = normalize(lean) * (deep / (px * at * length(lean)))
+                }
+            }
+        }
+    }
+    WithDepth {
+        color: Targets3 { first: vec4(lit.colour, 0.0), second: edge_record(way, 1.0, NO_LINE), third: identity(SOLID, body: body, group: 0) },
+        depth: eye.depth(p),
+    }
+}
+
+/// The volume of a form that moves, its fine cells `cell` m a side, holding `most` bricks at the
+/// most: over a box reaching `half` m each way from the middle of the form's bound, which it
+/// follows (`redeposit`). What of the form leaves the box isn't drawn.
+pub fn moving<S: Solid>(form: S, cell: f32, most: u32, half: vec3) -> Volume<S> {
+    var v = volume(form, cell)
+    let brick = cell * f32(B)
+    let n = vec3u(u32(ceil(2.0 * half.x / brick)), u32(ceil(2.0 * half.y / brick)), u32(ceil(2.0 * half.z / brick)))
+    v.grid.size = vec4u(n.x, n.y, n.z, most)
+    v.coarse = texture3d(width: n.x, height: n.y, depth: n.z)
+    v.raw = buffer(2 * n.x * n.y * n.z)
+    v.parts = buffer(n.x * n.y * n.z)
+    let layers = (most + ROW * ROW - 1) / (ROW * ROW)
+    let size = vec3u(ROW * BS, ROW * BS, layers * BS)
+    v.grid.size.w = most
+    v.grid.atlas = vec3(f32(size.x), f32(size.y), f32(size.z))
+    v.bricks = append_buffer(most)
+    v.atlas = texture3d(width: size.x, height: size.y, depth: size.z)
+    v.stage = 3
+    v
+}
+
+impl<S: Parted> Volume<S> {
+    /// The volume of a form that moves (`moving`), deposited again as `form` is now: the whole
+    /// of it, in this frame.
+    pub fn redeposit(mut self, form: S) {
+        self.form = form
+        let b = form.bound()
+        let brick = self.grid.cell * f32(B)
+        let n = self.grid.size.x * self.grid.size.y * self.grid.size.z
+        let half = 0.5 * brick * vec3(f32(self.grid.size.x), f32(self.grid.size.y), f32(self.grid.size.z))
+        self.grid.lo = floor((b.centre - half) / brick) * brick
+        self.grid.steep = max(form.lipschitz(brick), 1.0)
+        label("mover coarse")
+        self.bricks.clear()
+        dispatch(coarsed_parts.bind(self.form, g: self.grid, out: mut self.raw, parts: mut self.parts, bricks: mut self.bricks), over: n)
+        for ring in 0..MOVING_RINGS {
+            dispatch(spread.bind(g: self.grid, ring: ring + 1, first: 0, out: mut self.raw), over: n)
+        }
+        dispatch(coarse_moved.bind(raw: self.raw.items(), g: self.grid, rings: MOVING_RINGS, out: mut self.coarse), over: self.coarse)
+        label("mover deposited")
+        dispatch(
+            deposited_here.bind(self.form, g: self.grid, bricks: self.bricks.items(), coarse: self.raw.items(), parts: self.parts.items(), out: mut self.atlas),
+            over: self.atlas,
+        )
+    }
+
+    /// The moving form drawn at every pixel into `frame`'s picture as `look` wears it, as body
+    /// `body`: found through its volume and finished against the form itself (`marched_true`).
+    pub fn draw_true_into<L: Look>(self, frame: mut Frame, look: L, body: u32) {
+        label("marched")
+        let first = frame.first()
+        let q = begin_pass3_with_depth(
+            mut frame.colour,
+            mut frame.edge,
+            mut frame.identity,
+            mut frame.depth,
+            clear: vec4(0.0),
+            keep: !first,
+            clear_depth: 0.0,
+            keep_depth: !first,
+        )
+        draw(
+            q,
+            cover,
+            marched_true.bind(
+                eye: frame.eye,
+                light: frame.light,
+                form: self.form,
+                look: look,
+                g: self.grid,
+                coarse: self.coarse,
+                atlas: self.atlas,
+                s: self.s,
+                parts: self.parts.items(),
+                body: body,
+            ),
+            vertices: 3,
+            depth: NEARER,
+        )
+        q.end()
+    }
+}
+
+impl<S: Solid> Volume<S> {
+
+    /// How many bricks the last deposit kept, asked for.
+    pub fn kept_asked(self) -> Pending<u32> {
+        read(self.bricks.count())
+    }
+
+    /// The most bricks the volume holds.
+    pub fn most(self) -> u32 {
+        self.grid.size.w
+    }
 }
 
 impl<S: Solid> Volume<S> {
@@ -919,8 +1307,12 @@ fn walk(
     var least_v = vec4(0.0)
     var steps: u32 = 0
     var empty: u32 = 0
-    // (How far the last step went, where it went farther than the distance read: a guess.)
+    // (How far the last step went, where it went farther than the distance read: a guess. And,
+    // where the guess was aimed at a face's tangent plane, that face's facing; and whether the
+    // next step is to be by the distance alone, an aimed one having failed from here.)
     var guessed = 0.0
+    var aimed = vec3(0.0)
+    var plain = false
     while steps < MOST_STEPS && steps < g.most && !met && t < to {
         {
             steps += 1
@@ -928,7 +1320,15 @@ fn walk(
             let q = (p - g.lo) / brick
             let c = clamp(floor(q), vec3(0.0), top)
             let k = coarse.load(u32(c.x), u32(c.y), u32(c.z))
-            if k.x >= FAR_FROM {
+            if k.x >= FAR_FROM && dot(aimed, aimed) > 0.0 {
+                // A step aimed at a face landed in a brick that holds nothing: the face wasn't
+                // where its plane said (it curves away, or is a thin thing the step went past).
+                // The step is taken back, and the next from there is by the distance alone.
+                t -= guessed
+                guessed = 0.0
+                aimed = vec3(0.0)
+                plain = true
+            } else if k.x >= FAR_FROM {
                 empty += 1
                 let cell_lo = g.lo + c * brick
                 let ex = if d.x > 0.0 { (cell_lo.x + brick - p.x) / d.x } else if d.x < 0.0 { (cell_lo.x - p.x) / d.x } else { 1.0e30 }
@@ -957,13 +1357,21 @@ fn walk(
                     least_t = t
                     least_v = v
                 }
-                if v.x + floor_step * t < 0.0 && guessed > floor_step * t {
+                if dot(aimed, aimed) > 0.0 && dot(v.yzw, aimed) < 0.0 && v.x >= touch * t {
+                    // A step aimed at a face landed where the facing is the other way round: it
+                    // went past a thin thing (a wand, an ear's tip) to its far side. Taken back.
+                    t -= guessed
+                    guessed = 0.0
+                    aimed = vec3(0.0)
+                    plain = true
+                } else if v.x + floor_step * t < 0.0 && guessed > floor_step * t {
                     // A guessed step (to a tangent plane, or its least) that went well into the
                     // form: the plane it aimed at was behind another face (a wall's, where it
                     // stands on the ground). Half of it is taken back, and half again, until
                     // the ray is out of the form or within its least step of where it went in.
                     guessed = 0.5 * guessed
                     t -= guessed
+                    aimed = vec3(0.0)
                 } else if v.x < touch * t {
                     met = true
                 } else {
@@ -977,9 +1385,12 @@ fn walk(
                     // distance over the cosine, at most four times it), else by the distance.
                     var step = v.x
                     let lean_in = -dot(v.yzw, d)
-                    if v.x < plane && lean_in > 0.2 {
+                    var aim = false
+                    if !plain && v.x < plane && lean_in > 0.2 {
                         step = min(v.x / lean_in, 4.0 * v.x)
+                        aim = true
                     }
+                    plain = false
                     // The least step: a share of the footprint; and, where the ray isn't closing
                     // on the surface, of a cell: half one where it runs level with it, a whole
                     // one where it is leaving it. (A ray level with a surface a metre round goes
@@ -989,6 +1400,7 @@ fn walk(
                     let by_cell = if along > LEVEL_OFF { whole } else if along > -LEVEL_OFF { half_cell } else { 0.0 }
                     let took = max(step, max(floor_step * t, by_cell))
                     guessed = if took > v.x { took } else { 0.0 }
+                    aimed = if aim && took <= step { v.yzw } else { vec3(0.0) }
                     t += took
                 }
             }
@@ -1035,7 +1447,21 @@ fn shown<L: Look>(
         }
     }
     let p = o + d * t
-    let n = normalize(v.yzw)
+    var n = normalize(v.yzw)
+    if dot(v.yzw, v.yzw) < CREASED {
+        // (On a crease, or between two faces closer than a cell: one face's facing, not the
+        // blend of two.)
+        let q = (p - g.lo) / brick
+        let c = clamp(floor(q), vec3(0.0), top)
+        let k = coarse.load(u32(c.x), u32(c.y), u32(c.z))
+        if k.x < FAR_FROM {
+            let a = vec3(f32(k.x % ROW), f32((k.x / ROW) % ROW), f32(k.x / (ROW * ROW))) * f32(BS)
+            let facing = crease_facing(atlas, a, clamp((q - c) * f32(B), vec3(0.0), vec3(f32(B))), g.cell)
+            if dot(facing, facing) > 0.0 {
+                n = normalize(facing)
+            }
+        }
+    }
     var skin = Skin { albedo: vec3(0.0), line: 1.0, metal: 0.0, rim: false, emits: vec3(0.0) }
     if g.stored == 1 && met.albedo.w > 0.5 {
         skin.albedo = met.albedo.xyz
@@ -3039,13 +3465,12 @@ fn leak_summed(
 /// length, squared, of their blend: unit facings 37 degrees apart blend to 0.9 midway).
 const CREASED: f32 = 0.9
 
-/// A read on a crease, at `local` (cells) in the brick whose texels start at `a` in the atlas.
-/// A cell holds a plane (its distance and its facing), and two faces that meet are two planes;
-/// blended, they are a rounded corner that faces neither way and wears both colours. So the
-/// read takes the face whose plane it lies nearest: that cell's facing, and the light and the
-/// albedo of only the cells round it that face the same way (in the open), by their shares.
-/// A facing of nothing: no cell round it has one.
-fn on_crease(atlas: Texture3d<Rgba16Float>, albedo: Texture3d<Rgba8>, glowing: Texture3d<Rgba8>, a: vec3, local: vec3, cell: f32) -> (vec3, vec4, vec4) {
+/// The facing of a read on a crease, at `local` (cells) in the brick whose texels start at `a`
+/// in the atlas: of the eight cells round it, the facing of the one whose plane (its distance
+/// and facing) the place lies nearest. Two faces that meet, or two that pass close with a gap
+/// thinner than a cell between them (a hand by a hip), are two planes; their blend faces
+/// neither way, or no way at all. A facing of nothing: no cell round it has one.
+fn crease_facing(atlas: Texture3d<Rgba16Float>, a: vec3, local: vec3, cell: f32) -> vec3 {
     let base = min(floor(local), vec3(f32(B) - 1.0))
     let frac = local - base
     var best = vec3(0.0)
@@ -3060,6 +3485,19 @@ fn on_crease(atlas: Texture3d<Rgba16Float>, albedo: Texture3d<Rgba8>, glowing: T
             best = t.yzw
         }
     }
+    best
+}
+
+/// A read on a crease, at `local` (cells) in the brick whose texels start at `a` in the atlas.
+/// A cell holds a plane (its distance and its facing), and two faces that meet are two planes;
+/// blended, they are a rounded corner that faces neither way and wears both colours. So the
+/// read takes the face whose plane it lies nearest: that cell's facing, and the light and the
+/// albedo of only the cells round it that face the same way (in the open), by their shares.
+/// A facing of nothing: no cell round it has one.
+fn on_crease(atlas: Texture3d<Rgba16Float>, albedo: Texture3d<Rgba8>, glowing: Texture3d<Rgba8>, a: vec3, local: vec3, cell: f32) -> (vec3, vec4, vec4) {
+    let base = min(floor(local), vec3(f32(B) - 1.0))
+    let frac = local - base
+    let best = crease_facing(atlas, a, local, cell)
     var glow = vec4(0.0)
     var wear = vec3(0.0)
     var sum = 0.0
@@ -3679,4 +4117,54 @@ impl LitTruth {
         }
         read(out.items())
     }
+}
+
+/// Where a picture and its form disagree, a pixel each: the form itself met along the pixel's
+/// ray (as the references meet it) against whether the picture's depth says it drew there. Red:
+/// the form is there and the picture has nothing (a miss; a hole where it is inside the form's
+/// outline). Green: the picture drew where the form isn't. Grey: both. To see where, not to
+/// count: the judge counts.
+@fragment
+pub fn missed_at<F: Solid>(pixel: FragCoord, eye: Eye, form: F, bound: vec4, depth: DepthTexture) -> vec4 {
+    let d = eye.ray(pixel.position.xy)
+    let oc = eye.at - bound.xyz
+    let half = dot(oc, d)
+    let h = half * half - (dot(oc, oc) - bound.w * bound.w)
+    var met = false
+    if h >= 0.0 {
+        var t = max(-half - sqrt(h), eye.near)
+        let end = -half + sqrt(h)
+        var steps: u32 = 0
+        // (Met where the ray crosses into the form, by steps short of its distance, as the
+        // judge's reference meets it: a ray that only passes near hasn't met it.)
+        while steps < 2000 && !met && t < end {
+            steps += 1
+            let v = form.distance(eye.at + d * t)
+            if v < 0.0 {
+                met = true
+            } else {
+                t += max(0.9 * v, 0.00005)
+            }
+        }
+    }
+    let drawn = depth.load(u32(pixel.position.x), u32(pixel.position.y)) > 0.0
+    if met && !drawn {
+        return vec4(1.0, 0.0, 0.0, 1.0)
+    }
+    if drawn && !met {
+        return vec4(0.0, 1.0, 0.0, 1.0)
+    }
+    if met {
+        return vec4(0.3, 0.3, 0.3, 1.0)
+    }
+    vec4(0.0)
+}
+
+/// `missed_at` over the whole of `frame`'s picture so far, into `into`.
+pub fn missed_into<F: Solid>(into: mut Texture<Rgba32Float>, frame: Frame, form: F) {
+    let b = form.bound()
+    label("missed")
+    let p = begin_pass(mut into, clear: vec4(0.0))
+    draw(p, cover, missed_at.bind(eye: frame.eye, form: form, bound: vec4(b.centre, b.radius), depth: frame.depth), vertices: 3)
+    p.end()
 }

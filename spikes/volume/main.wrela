@@ -7,6 +7,9 @@
 //     MODE 2  the same volume, its scouts' picture laid out and drawn straight to the screen in
 //             one pass, with no picture targets and no pass after (`volume`, "the picture laid
 //             out")
+//     MODE 3  the light test (`stage`): a stage lit on its cells
+//     MODE 4  the moving-body test (`body`): a stand-in creature playing the walk, its volume
+//             deposited whole every frame and marched at every pixel
 //
 // The form is the opening's tallest-but-one stack (`PILLARS[2]`: 44 m tall, 11 m round at its
 // foot, six noises a distance), seen from 100 m with a long lens so it covers about half the
@@ -23,7 +26,13 @@ use frame::sky::{Plain, plain}
 use opening::stacks::{PILLARS, PILLAR_2_MESH, Pillar, Wears}
 use std::transform::identity
 use form::look::{Look, Place, Skin}
-use volume::{LitTruth, Volume, lit_truth, volume}
+use body::{Body, Fur, body_at}
+use motion::humanoid::Rig
+use motion::playback::Move
+use moves::gaits::ARMED
+use moves::rig::rig
+use std::gpu::{Rgba32Float, Texture, texture}
+use volume::{LitTruth, Volume, lit_truth, missed_into, moving, volume}
 use stage::{GROUND, Stage, StageLook, WALL_HALF}
 use std::io::{Pending, print}
 
@@ -56,6 +65,32 @@ pub const REFERENCE: bool = true
 /// MODE 3: which side of the wall the eye stands (m along z: the sun is on +z).
 pub const EYE_Z: f32 = 11.0
 pub const SETTLED: u32 = 1000000
+
+/// MODE 4: a fine cell of the moving body's volume (m); the most bricks it may keep; how far the
+/// eye stands from it (m); and how far the walk moves on a frame, or a judged moment (s).
+pub const BODY_CELL: f32 = 0.004
+pub const BODY_MOST: u32 = 4096
+pub const EYE_FAR: f32 = 6.0
+pub const PACE: f32 = 0.016667
+
+/// MODE 4: how far the moving body's volume reaches each way from the body's middle (m): past
+/// its ears' tips, its feet, and its wand at arm's length.
+const BODY_HALF = vec3(0.5, 0.72, 0.6)
+
+/// MODE 4: whether each frame also marks where its picture and the form disagree (`missed_at`),
+/// to be read from the run's dumped targets; and the moment whose pose every frame holds (under
+/// 0: the walk plays).
+pub const MISSED: bool = false
+pub const HELD: i32 = -1
+
+/// MODE 4: whether a pixel is finished against the body itself (true), or shows the cells alone.
+pub const TRUE: bool = true
+
+/// MODE 4, to see inside it: 256, no texel asks the form (the deposit's own cost); 512, a pixel
+/// shows its facing and how many times it asked the form, or green where the cells brought its
+/// ray near and it never entered the form; 1024 and 2048, the march stops after the cells'
+/// walk, or after its steps by the form (to time each).
+pub const BODY_DEBUG: u32 = 0
 
 /// A fine cell of the volume (m).
 pub const CELL: f32 = 0.0625
@@ -136,6 +171,13 @@ pub struct Program {
     light_asked: Option<Pending<u32>>,
     leak_asked: Option<Pending<u32>>,
     asked: bool,
+    /// The moving body's volume, the move it plays and the rig the move is for; and how many
+    /// bricks a deposit kept, once asked for.
+    mover: Volume<Body>,
+    walk: Move,
+    rig: Rig,
+    kept: Option<Pending<u32>>,
+    marks: Texture<Rgba32Float>,
 }
 
 pub fn init() -> Program {
@@ -143,6 +185,9 @@ pub fn init() -> Program {
     if !INK {
         frame.ink = NO_LINES
     }
+    let walk = ARMED.walk.clone()
+    let bones = rig()
+    let first = body_at(walk, bones, 0.0)
     Program {
         frame,
         solids: solids(),
@@ -156,6 +201,11 @@ pub fn init() -> Program {
         light_asked: None,
         leak_asked: None,
         asked: false,
+        mover: moving(first, cell: BODY_CELL, most: if MODE == 4 { BODY_MOST } else { 1 }, half: BODY_HALF),
+        walk,
+        rig: bones,
+        kept: None,
+        marks: texture(width: 1, height: 1),
     }
 }
 
@@ -238,9 +288,74 @@ fn lit_frame(p: mut Program, width: u32, height: u32) {
     p.frame.end(sky)
 }
 
+/// A frame of the moving-body test: the body as the walk poses it now, deposited whole and
+/// marched at every pixel into the frame's picture; judged, where `JUDGE` asks, a pose a moment.
+fn mover_frame(p: mut Program, width: u32, height: u32) {
+    let moment = if HELD >= 0 { u32(HELD) } else if JUDGE { p.judge.moment() } else { p.frames }
+    let form = body_at(p.walk, p.rig, PACE * f32(moment))
+    let wears = Fur { spare: vec4(0.0) }
+    let eye = eye_at(vec3(0.45 * EYE_FAR, 0.6 + 0.12 * EYE_FAR, 0.88 * EYE_FAR), vec3(0.0, 0.6, 0.0), 0.6, width: width, height: height)
+    let sky: Plain = plain(normalize(SUN))
+    p.frame.begin(eye, sunlit(normalize(SUN), ground: -1000.0))
+    p.mover.grid.debug = BODY_DEBUG
+    p.mover.redeposit(form)
+    p.mover.grid.debug = BODY_DEBUG & 3584
+    if TRUE {
+        p.mover.draw_true_into(mut p.frame, wears, body: 1)
+    } else {
+        p.mover.draw_into(mut p.frame, wears, body: 1, rate: 1)
+    }
+    if MISSED {
+        if p.marks.width() != width || p.marks.height() != height {
+            p.marks = texture(width: width, height: height)
+        }
+        missed_into(mut p.marks, p.frame, form)
+    }
+    p.frames += 1
+    if p.frames == 20 {
+        p.kept = Some(p.mover.kept_asked())
+    }
+    match mut p.kept {
+        Some(q) => match q.poll() {
+            Some(Ok(v)) => {
+                print(f"body: a deposit kept {v[0]} bricks of {p.mover.most()} at the most (cells {BODY_CELL} m, {v[0] * 729} texels asked)")
+                p.kept = None
+            },
+            _ => {},
+        },
+        None => {},
+    }
+    if JUDGE && !p.judge.done() {
+        p.judge.sized(eye)
+        let last = p.part + 1 == SPLIT
+        if last {
+            p.judge.resolve(mut p.frame, sky)
+        } else {
+            p.frame.end(sky)
+        }
+        let look = p.judge.looking(eye)
+        for b in p.part * BANDS / SPLIT..(p.part + 1) * BANDS / SPLIT {
+            trace(mut p.judge, look, p.frame.light, form, wears, sky, band: b, bands: BANDS)
+        }
+        if last {
+            p.judge.after(p.frame, sky)
+            p.part = 0
+        } else {
+            p.part += 1
+        }
+        return
+    }
+    p.judge.heard()
+    p.frame.end(sky)
+}
+
 pub fn frame(p: mut Program, time: f32, width: u32, height: u32) {
     if MODE == 3 {
         lit_frame(mut p, width, height)
+        return
+    }
+    if MODE == 4 {
+        mover_frame(mut p, width, height)
         return
     }
     let turned = if JUDGE { TURN * f32(p.judge.moment()) } else { 0.0 }
