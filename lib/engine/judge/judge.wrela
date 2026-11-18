@@ -1,0 +1,524 @@
+// The judges (docs/design.md, "Order of work", 0): a picture held to the reference (`reference`)
+// in numbers, in place of looking. Carried from branch `backend`'s lib/frame/judge.wrela
+// (`compare`, `judge_pictures`) and the volume spike's `light_judged` and `missed_at`
+// (spike/volume, spikes/volume/volume.wrela), with one change the spike asked for: a judge needs
+// only what any picture can give, its colour. Where it drew matter and where it drew none is read
+// from that colour, so a picture drawn in one pass with no depth has its holes counted too.
+//
+// Coverage from colour. The reference says, at each pixel, the mean colour of its looks that met
+// matter (M), what the sky behind looks like along the pixel's middle ray (S), and the share of
+// its looks that met matter (its coverage). A pixel that shows matter over a share c of itself
+// and the sky over the rest shows c M + (1 - c) S (the looks' colours are linear and averaged), so
+// a picture's coverage at the pixel is the share of the way from S to M its colour lies. Where M
+// and S are too alike to tell apart (`UNDECIDED`), the pixel is counted as such and not judged for
+// coverage. Where the reference meets no matter, a picture whose colour is off the sky's there
+// drew something where nothing is.
+//
+// Every number is of the screen's values (the colours encoded as the screen shows them, in
+// 255ths), as the eye sees a difference:
+//
+// - outline: pixels where the picture and the reference disagree on whether matter covers most of
+//   the pixel (missed, extra), over the length of the reference's outline (px: how far off the
+//   outline is, as the old judge counted it); and the coverage itself, |c - c_ref| summed near the
+//   outline over its length (px, finer: a picture whose edges are smooth but a fifth of a pixel
+//   out shows here and not in the first);
+// - holes: missed pixels whose eight neighbours the reference covers too;
+// - surfaces apart (only for a picture that says where it put each surface, `Picture::placed`):
+//   how far the picture's surface is from the reference's along the middle ray, across the view
+//   in pixels;
+// - lit: pixels over 8/255 from the reference's mean, over all pixels and over pixels matter
+//   covers wholly (where only the light can be wrong);
+// - edge pixels (the reference covers them in part): their error against the many-look mean;
+// - crawl: pixels whose brightness steps over 15/255 from one moment to the next, the picture's
+//   and the reference's, on edge pixels and on all (the reference crawls a little itself).
+
+use picture::eye::{Eye, View, view}
+use picture::picture::Picture
+use picture::screen::{cover, encoded, luma}
+use reference::reference::Truth
+use std::collections::Vec
+use std::gpu::{
+    Atomics, FragCoord, GlobalId, GpuBuffer, Rgba16Float, Rgba32Float, Texture, begin_pass, buffer_of, dispatch, draw,
+    label, read, texture,
+}
+use std::io::{Pending, print}
+
+/// How alike (of 255, the greatest channel's difference as the screen shows them) matter's colour
+/// and the sky's behind it may be before a picture's coverage can't be read from its colour.
+pub const UNDECIDED: f32 = 16.0
+
+/// A pixel is an edge pixel where the reference covers it more than this and less than all but
+/// this.
+pub const EDGE: f32 = 0.02
+
+/// How many numbers `judged` counts.
+pub const COUNTS: u32 = 33
+
+/// The greatest of the three channels' difference between two linear colours, as the screen
+/// shows them (of 255).
+fn apart_on_screen(a: vec3, b: vec3) -> f32 {
+    let d = abs(encoded(a) - encoded(b)) * 255.0
+    max(d.x, max(d.y, d.z))
+}
+
+/// How much of a pixel showing `c` is matter that shows `m` against a sky that shows `s` (all
+/// linear), from 0 to 1.
+fn covered(c: vec3, m: vec3, s: vec3) -> f32 {
+    let ms = m - s
+    clamp(dot(c - s, ms) / max(dot(ms, ms), 1.0e-12), 0.0, 1.0)
+}
+
+/// The reference's coverage at (`x`, `y`), the screen's edge held.
+fn ref_cover(mean: Texture<Rgba32Float>, x: i32, y: i32) -> f32 {
+    let w = i32(mean.width())
+    let h = i32(mean.height())
+    mean.load(u32(clamp(x, 0, w - 1)), u32(clamp(y, 0, h - 1))).w
+}
+
+/// What the judges read of a pixel's coverage (`coverage_at`).
+struct Coverage: Copy {
+    /// Whether matter and the sky behind it differ enough to read coverage from colour.
+    decided: bool,
+    /// The reference covers most of the pixel; the picture does.
+    ref_met: bool,
+    pic_met: bool,
+    /// The picture's coverage, from 0 to 1 (as `covered` reads it, near the outline).
+    c_pic: f32,
+    /// How many of the eight pixels round it the reference covers most of, and whether one of
+    /// the four beside it it doesn't.
+    around: u32,
+    side_open: bool,
+    /// Whether it is near the reference's outline (covered in part, beside an uncovered pixel,
+    /// or uncovered beside a covered one).
+    near: bool,
+}
+
+/// How far (of 255, as the screen shows it) a picture's colour may be from the sky's behind it
+/// and be read as the sky, away from the outline (if it is nearer the sky's than matter's too).
+pub const SKY_LIKE: f32 = 8.0
+
+/// A picture's coverage at (`x`, `y`), where it shows `p` (linear), against the reference's
+/// (`mean`: its share of looks that met matter; `mm`: their mean colour and spread; `s`: the sky
+/// behind). Near the reference's outline, the share of the way from the sky's colour to matter's
+/// the picture's colour lies; away from it, whether the picture shows the sky or not (so a
+/// picture whose light is wrong on matter, or whose matter is moved, isn't read as a hole: only
+/// a pixel that shows the sky is).
+fn coverage_at(p: vec3, mean: Texture<Rgba32Float>, mm: vec4, s: vec3, x: u32, y: u32) -> Coverage {
+    let c_ref = mean.load(x, y).w
+    var around: u32 = 0
+    var touched: u32 = 0
+    var side_open = false
+    var k: u32 = 0
+    while k < 9 {
+        let dx = i32(k % 3) - 1
+        let dy = i32(k / 3) - 1
+        k += 1
+        if dx != 0 || dy != 0 {
+            let c = ref_cover(mean, i32(x) + dx, i32(y) + dy)
+            if c >= 0.5 {
+                around += 1
+            } else if dx == 0 || dy == 0 {
+                side_open = true
+            }
+            if c > 0.0 {
+                touched += 1
+            }
+        }
+    }
+    let ref_met = c_ref >= 0.5
+    let inside = c_ref >= 0.9999 && around == 8
+    let outside = c_ref <= 0.0 && touched == 0
+    let near = !inside && !outside
+    // Like the sky: near its colour, and nearer it than matter's.
+    let met_any = c_ref > 0.0
+    // (Not where the reference's own looks spread as far as the picture is from them: an edge
+    // between two surfaces, one as dark as the sky behind.)
+    let off = abs(luma(p) - luma(mm.xyz))
+    let sky_like = apart_on_screen(p, s) <= SKY_LIKE && (!met_any || (covered(p, mm.xyz, s) < 0.5 && off > 3.0 * mm.w))
+    var decided = true
+    var c_pic = 0.0
+    if met_any && apart_on_screen(mm.xyz, s) < UNDECIDED {
+        decided = false
+    } else if near && met_any {
+        c_pic = covered(p, mm.xyz, s)
+    } else {
+        c_pic = if sky_like { 0.0 } else { 1.0 }
+    }
+    Coverage { decided, ref_met, pic_met: c_pic >= 0.5, c_pic, around, side_open, near }
+}
+
+/// Where a picture and the reference disagree on coverage, a pixel each, to be seen (the judges
+/// count; this shows where): red a hole, orange another pixel missed, green an extra one, blue
+/// undecided; elsewhere the picture, dimmed to a quarter.
+@fragment
+pub fn marked(
+    pixel: FragCoord,
+    colour: Texture<Rgba16Float>,
+    mean: Texture<Rgba32Float>,
+    matter: Texture<Rgba32Float>,
+    behind: Texture<Rgba32Float>,
+) -> vec4 {
+    let x = u32(pixel.position.x)
+    let y = u32(pixel.position.y)
+    let p = colour.load(x, y).xyz
+    let cov = coverage_at(p, mean, matter.load(x, y), behind.load(x, y).xyz, x, y)
+    if !cov.decided {
+        return vec4(0.0, 0.0, 1.0, 1.0)
+    }
+    if cov.ref_met && !cov.pic_met {
+        return if cov.around == 8 { vec4(1.0, 0.0, 0.0, 1.0) } else { vec4(1.0, 0.35, 0.0, 1.0) }
+    }
+    if cov.pic_met && !cov.ref_met {
+        return vec4(0.0, 1.0, 0.0, 1.0)
+    }
+    vec4(p * 0.25, 1.0)
+}
+
+/// A picture with what `judged` reads in its coverage drawn over it (`marked`), into `out`.
+pub fn marks(picture: Picture, truth: Truth, out: mut Picture) {
+    let w = picture.width()
+    let h = picture.height()
+    if out.width() != w || out.height() != h {
+        out.colour = texture(width: w, height: h)
+        out.place = texture(width: w, height: h)
+    }
+    label("judge marks")
+    let p = begin_pass(mut out.colour)
+    draw(p, cover, marked.bind(colour: picture.colour, mean: truth.mean, matter: truth.matter, behind: truth.behind), vertices: 3)
+    p.end()
+    out.placed = false
+}
+
+/// A picture held to the reference, a pixel an invocation, rows `first` on, counted into `out`:
+///
+///    0 pixels                                 1 the reference covers most of
+///    2 the picture covers most of             3 missed (the reference covers most, it doesn't)
+///    4 extra (it covers most, the reference doesn't)
+///    5 holes (missed, and the reference covers most of the eight round it)
+///    6 the reference's outline (covered most, a pixel beside it not)
+///    7 undecided (matter and the sky behind too alike to read coverage from colour)
+///    8 coverage off, |c - c_ref| summed over decided pixels near the outline (thousandths)
+///    9 pixels matter covers wholly            10 of them, over 8/255
+///   11 of them, the difference summed (16ths of 255)
+///   12 all pixels over 8/255                 13 all, the difference summed (16ths of 255)
+///   14 edge pixels                            15 their difference summed (16ths of 255)
+///   16 edge pixels over 8/255
+///   17 pixels both place a surface at         18..23 apart under 0.05 px, 0.1, 0.25, 0.5, 1, over
+///   24 apart summed, each at most 4 px (256ths of a px)    25 apart at the most (thousandths)
+///   26 edge pixels judged for steps (now or before)        27 the picture's steps over 15/255 there
+///   28 the reference's there                  29 pixels judged for steps
+///   30 the picture's steps over 15/255        31 the reference's
+///   32 pixels whose middle ray the reference couldn't follow (it ran out of steps)
+@compute(8, 8)
+pub fn judged(
+    colour: Texture<Rgba16Float>,
+    place: Texture<Rgba32Float>,
+    placed: u32,
+    mean: Texture<Rgba32Float>,
+    matter: Texture<Rgba32Float>,
+    centre: Texture<Rgba32Float>,
+    behind: Texture<Rgba32Float>,
+    last_colour: Texture<Rgba16Float>,
+    last_mean: Texture<Rgba32Float>,
+    moving: u32,
+    v: View,
+    first: u32,
+    out: mut Atomics<u32>,
+    id: GlobalId,
+) {
+    let x = id.x
+    let y = first + id.y
+    if x >= colour.width() || y >= colour.height() {
+        return
+    }
+    let p = colour.load(x, y).xyz
+    let r = mean.load(x, y)
+    let mm = matter.load(x, y)
+    let bh = behind.load(x, y)
+    let s = bh.xyz
+    let c_ref = r.w
+    if bh.w > 1.5 {
+        let _ = out.add(i: 32, value: 1)
+    }
+    let _ = out.add(i: 0, value: 1)
+    let cov = coverage_at(p, mean, mm, s, x, y)
+    if cov.ref_met {
+        let _ = out.add(i: 1, value: 1)
+        if cov.side_open {
+            let _ = out.add(i: 6, value: 1)
+        }
+    }
+    if !cov.decided {
+        let _ = out.add(i: 7, value: 1)
+    } else {
+        if cov.pic_met {
+            let _ = out.add(i: 2, value: 1)
+        }
+        if cov.ref_met && !cov.pic_met {
+            let _ = out.add(i: 3, value: 1)
+            if cov.around == 8 {
+                let _ = out.add(i: 5, value: 1)
+            }
+        }
+        if cov.pic_met && !cov.ref_met {
+            let _ = out.add(i: 4, value: 1)
+        }
+        if cov.near {
+            let _ = out.add(i: 8, value: u32(abs(cov.c_pic - c_ref) * 1000.0 + 0.5))
+        }
+    }
+    // Light.
+    let most = apart_on_screen(p, r.xyz)
+    let whole = c_ref >= 0.9999
+    if whole {
+        let _ = out.add(i: 9, value: 1)
+        if most > 8.0 {
+            let _ = out.add(i: 10, value: 1)
+        }
+        let _ = out.add(i: 11, value: u32(most * 16.0 + 0.5))
+    }
+    if most > 8.0 {
+        let _ = out.add(i: 12, value: 1)
+    }
+    let _ = out.add(i: 13, value: u32(most * 16.0 + 0.5))
+    let edge = c_ref > EDGE && c_ref < 1.0 - EDGE
+    if edge {
+        let _ = out.add(i: 14, value: 1)
+        let _ = out.add(i: 15, value: u32(most * 16.0 + 0.5))
+        if most > 8.0 {
+            let _ = out.add(i: 16, value: 1)
+        }
+    }
+    // Surfaces apart, along the middle ray.
+    let cr = centre.load(x, y)
+    if placed != 0 {
+        let cp = place.load(x, y)
+        if cr.w > 0.0 && cp.w > 0.0 {
+            let d = v.ray(vec2(f32(x) + 0.5, f32(y) + 0.5))
+            let e = abs(cp.w - cr.w) * abs(dot(cr.xyz, d)) / (cr.w * v.pixel())
+            var bin: u32 = 23
+            if e < 0.05 {
+                bin = 18
+            } else if e < 0.1 {
+                bin = 19
+            } else if e < 0.25 {
+                bin = 20
+            } else if e < 0.5 {
+                bin = 21
+            } else if e < 1.0 {
+                bin = 22
+            }
+            let _ = out.add(i: 17, value: 1)
+            let _ = out.add(i: bin, value: 1)
+            let _ = out.add(i: 24, value: u32(min(e, 4.0) * 256.0))
+            let _ = out.max(i: 25, value: u32(min(e, 1000.0) * 1000.0))
+        }
+    }
+    // Crawl.
+    if moving != 0 {
+        let lm = last_mean.load(x, y)
+        let was_edge = edge || (lm.w > EDGE && lm.w < 1.0 - EDGE)
+        let stepped = abs(luma(encoded(p)) - luma(encoded(last_colour.load(x, y).xyz))) * 255.0 > 15.0
+        let ref_stepped = abs(luma(encoded(r.xyz)) - luma(encoded(lm.xyz))) * 255.0 > 15.0
+        let _ = out.add(i: 29, value: 1)
+        if stepped {
+            let _ = out.add(i: 30, value: 1)
+        }
+        if ref_stepped {
+            let _ = out.add(i: 31, value: 1)
+        }
+        if was_edge {
+            let _ = out.add(i: 26, value: 1)
+            if stepped {
+                let _ = out.add(i: 27, value: 1)
+            }
+            if ref_stepped {
+                let _ = out.add(i: 28, value: 1)
+            }
+        }
+    }
+}
+
+/// A picture copied (its colour), for the next moment's crawl.
+@fragment
+pub fn kept_colour(pixel: FragCoord, a: Texture<Rgba16Float>) -> vec4 {
+    a.load(u32(pixel.position.x), u32(pixel.position.y))
+}
+
+/// A reference's mean copied, for the next moment's crawl.
+@fragment
+pub fn kept_mean(pixel: FragCoord, a: Texture<Rgba32Float>) -> vec4 {
+    a.load(u32(pixel.position.x), u32(pixel.position.y))
+}
+
+/// A fault planted in a picture, to see that the judges find it: none; a square of `size` px at
+/// (`x`, `y`) where matter is taken away (the sky behind shown: a hole); every pixel shown as the
+/// one to its left (the outline a pixel out sideways); the light on matter a tenth darker (the
+/// sky as it was, a pixel matter covers in part darker by its share).
+pub const NO_FAULT: u32 = 0
+pub const HOLE: u32 = 1
+pub const SHIFTED: u32 = 2
+pub const DIMMED: u32 = 3
+
+@fragment
+pub fn faulted(pixel: FragCoord, colour: Texture<Rgba16Float>, behind: Texture<Rgba32Float>, mean: Texture<Rgba32Float>, fault: u32, square: vec4) -> vec4 {
+    let x = u32(pixel.position.x)
+    let y = u32(pixel.position.y)
+    let c = colour.load(x, y).xyz
+    if fault == HOLE {
+        if f32(x) >= square.x && f32(x) < square.x + square.z && f32(y) >= square.y && f32(y) < square.y + square.z {
+            return vec4(behind.load(x, y).xyz, 1.0)
+        }
+    } else if fault == SHIFTED {
+        return vec4(colour.load(if x > 0 { x - 1 } else { 0 }, y).xyz, 1.0)
+    } else if fault == DIMMED {
+        // Matter's light alone: the sky as it was.
+        let share = mean.load(x, y).w
+        return vec4(mix(c, c * 0.9, share), 1.0)
+    }
+    vec4(c, 1.0)
+}
+
+/// `picture` with `fault` planted (a hole's square `size` px a side about where `eye` sees the
+/// point `at`), into `out`, which says nothing of where it put its surfaces.
+pub fn planted(picture: Picture, truth: Truth, fault: u32, eye: Eye, at: vec3, size: f32, out: mut Picture) {
+    let w = picture.width()
+    let h = picture.height()
+    let corner = view(eye, w, h).pixel_of(at) - vec2(0.5 * size)
+    if out.width() != w || out.height() != h {
+        out.colour = texture(width: w, height: h)
+        out.place = texture(width: w, height: h)
+    }
+    label("judge planted")
+    let p = begin_pass(mut out.colour)
+    draw(p, cover, faulted.bind(colour: picture.colour, behind: truth.behind, mean: truth.mean, fault: fault, square: vec4(floor(corner), size, 0.0)), vertices: 3)
+    p.end()
+    out.placed = false
+}
+
+/// What was asked of the judges and is not yet heard.
+struct Asked {
+    number: u32,
+    crawl: bool,
+    counts: Pending<u32>,
+}
+
+/// The judges, and what each was last shown (for crawl).
+pub struct Judge {
+    last_colour: Texture<Rgba16Float>,
+    last_mean: Texture<Rgba32Float>,
+    /// Whether `last_colour` and `last_mean` hold a moment.
+    moving: bool,
+    asked: Vec<Asked>,
+    numbers: u32,
+}
+
+pub fn judge() -> Judge {
+    Judge { last_colour: texture(width: 1, height: 1), last_mean: texture(width: 1, height: 1), moving: false, asked: Vec::new(), numbers: 0 }
+}
+
+/// `n` of `of`, in parts of a hundred.
+fn share(n: u32, of: u32) -> f32 {
+    100.0 * f32(n) / max(f32(of), 1.0)
+}
+
+/// The judges' counts, said.
+fn say(n: u32, v: Vec<u32>, crawl: bool) {
+    let outline = max(f32(v[6]), 1.0)
+    print(
+        f"judge {n}: outline: the reference covers {v[1]} px, the picture {v[2]}; outline {v[6]} px; missed {v[3]} ({v[5]} holes), extra {v[4]}; undecided {v[7]} px; outline off {f32(v[3] + v[4]) / outline} px; coverage off {f32(v[8]) / 1000.0 / outline} px",
+    )
+    if v[32] > 0 {
+        print(f"judge {n}: THE REFERENCE FAILED: its middle ray ran out of steps at {v[32]} px")
+    }
+    print(
+        f"judge {n}: lit: over 8/255 {share(v[12], v[0])}% of all px (mean {f32(v[13]) / 16.0 / max(f32(v[0]), 1.0)}/255); where matter covers wholly ({v[9]} px) {share(v[10], v[9])}% (mean {f32(v[11]) / 16.0 / max(f32(v[9]), 1.0)}/255)",
+    )
+    print(
+        f"judge {n}: edges: {v[14]} edge px, against the many-look mean {f32(v[15]) / 16.0 / max(f32(v[14]), 1.0)}/255 a pixel, {share(v[16], v[14])}% over 8/255",
+    )
+    let both = v[17]
+    if both > 0 {
+        print(
+            f"judge {n}: apart, of {both} px: under 0.05 px {share(v[18], both)}%, 0.1 {share(v[19], both)}%, 0.25 {share(v[20], both)}%, 0.5 {share(v[21], both)}%, 1 {share(v[22], both)}%, over {share(v[23], both)}%; mean {f32(v[24]) / 256.0 / max(f32(both), 1.0)} px, most {f32(v[25]) / 1000.0} px",
+        )
+    } else {
+        print(f"judge {n}: apart: not judged (the picture doesn't say where it put its surfaces)")
+    }
+    if crawl {
+        print(
+            f"judge {n}: crawl: steps over 15/255 from the moment before, a thousand edge px: the picture {1000.0 * f32(v[27]) / max(f32(v[26]), 1.0)}, the reference {1000.0 * f32(v[28]) / max(f32(v[26]), 1.0)} ({v[26]} edge px); a thousand px: the picture {1000.0 * f32(v[30]) / max(f32(v[29]), 1.0)}, the reference {1000.0 * f32(v[31]) / max(f32(v[29]), 1.0)}",
+        )
+    }
+}
+
+impl Judge {
+    /// `picture` held to `truth` (as `eye` saw it on the picture's screen), counted and asked for;
+    /// said when read back (`heard`), as judge number this returns. With `crawl`, also against
+    /// the last picture and reference so held, and this one kept for the next.
+    pub fn held(mut self, picture: Picture, truth: Truth, eye: Eye, crawl: bool, what: str) -> u32 {
+        let w = picture.width()
+        let h = picture.height()
+        let v = view(eye, w, h)
+        let n = self.numbers
+        self.numbers += 1
+        print(f"judge {n}: {what}")
+        label("judge")
+        var out: GpuBuffer<u32> = buffer_of(Vec::filled(COUNTS, 0))
+        let moving: u32 = if crawl && self.moving && self.last_colour.width() == w && self.last_colour.height() == h { 1 } else { 0 }
+        var first: u32 = 0
+        while first < h {
+            dispatch(
+                judged.bind(
+                    colour: picture.colour,
+                    place: picture.place,
+                    placed: if picture.placed { 1 } else { 0 },
+                    mean: truth.mean,
+                    matter: truth.matter,
+                    centre: truth.centre,
+                    behind: truth.behind,
+                    last_colour: self.last_colour,
+                    last_mean: self.last_mean,
+                    moving: moving,
+                    v: v,
+                    first: first,
+                    out: mut out,
+                ),
+                groups: ((w + 7) / 8, 8, 1),
+            )
+            first += 64
+        }
+        self.asked.push(Asked { number: n, crawl: moving != 0, counts: read(out.items()) })
+        if crawl {
+            if self.last_colour.width() != w || self.last_colour.height() != h {
+                self.last_colour = texture(width: w, height: h)
+                self.last_mean = texture(width: w, height: h)
+            }
+            let p = begin_pass(mut self.last_colour)
+            draw(p, cover, kept_colour.bind(a: picture.colour), vertices: 3)
+            p.end()
+            let q = begin_pass(mut self.last_mean)
+            draw(q, cover, kept_mean.bind(a: truth.mean), vertices: 3)
+            q.end()
+            self.moving = true
+        }
+        n
+    }
+
+    /// The counts said, of each judging read back since; whether every one asked is heard.
+    pub fn heard(mut self) -> bool {
+        var i: u32 = 0
+        while i < self.asked.len() {
+            match self.asked[i].counts.poll() {
+                Some(Ok(v)) => {
+                    say(self.asked[i].number, take v, self.asked[i].crawl)
+                    let _ = self.asked.remove(i)
+                },
+                _ => {
+                    i += 1
+                },
+            }
+        }
+        self.asked.len() == 0
+    }
+}

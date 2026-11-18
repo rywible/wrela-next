@@ -1,0 +1,167 @@
+// Motion written as code: a body's movement as functions of time, not frames read from a file.
+// A capture (or anything else that made a `humanoid::Clip`) is a reference: the motion tool
+// (studio/moves) fits it once and writes what it fitted as Wrela source, and the game plays the
+// source. Nothing the game builds reads a motion file.
+//
+// A cycle (a walk, a run, a stance's bounce: motion that repeats) is a Fourier series in its
+// phase: each bone's turn is a mean turn, then a rotation vector that is a sum of a few cosines
+// and sines of the phase (its harmonics), and the hips' place the same, less their steady travel.
+// Every harmonic is a knob: the first is the stride's swing, the second the double bob of the
+// hips, the higher ones the snap of a heel strike. A mean turn can be set, a harmonic scaled.
+//
+// What's written doesn't depend on the rig it was fitted on: each bone's turn is the turn it
+// makes from a T-pose, in the body's frame (+y up, +z ahead, +x the body's left), its parent's
+// taken off; the hips' place is in the body's frame, over the rest hips' height. Any rig standing
+// in a T-pose at rest plays it (`Cycle::clip`): Quaternius's body, or one whose bones are
+// unturned at rest (`rywible/wrela's engine::creature`'s), where a written turn is the bone's own.
+//
+// Carried from rywible/wrela's engine/cycle.wrela.wrela at 7ae6711e, cut to what a fight plays;
+// then from branch `backend`'s lib/motion/cycle.wrela into the kit (2026-11-18), unchanged.
+
+use motion::humanoid::{BONES, Clip, NONE, Rig, bone}
+use std::quat::Quat
+
+/// One harmonic of a series: which multiple of the phase it is (1 once a cycle, 2 twice, ...),
+/// and how much of the cosine and how much of the sine of that multiple. For a turn, rotation vectors (rad, the body's frame); for the hips, places (over the
+/// rest hips' height).
+pub struct Harmonic: Copy {
+    pub k: u32,
+    pub cos: vec3,
+    pub sin: vec3,
+}
+
+/// A bone's turn through a cycle: the VRM bone, its mean turn from the T-pose (its parent's taken
+/// off), and its swing about that mean: a constant rotation vector, then its harmonics (only
+/// those it needs: a boxer's bounce, four to a cycle, is mostly its fourth).
+pub struct Swing: Clone {
+    pub bone: Text,
+    pub mean: Quat,
+    pub bias: vec3,
+    pub waves: Vec<Harmonic>,
+}
+
+impl Swing {
+    /// Its turn at phase `t` (0 to 1 a cycle).
+    pub fn at(self, t: f32) -> Quat {
+        self.mean.mul(exp(series(self.bias, self.waves, t)))
+    }
+}
+
+/// A cycle: how long one lasts (s); how far the body goes in one (the body's frame, over the rest
+/// hips' height: a walk's stride pair); the hips' place through it about their steady travel (over
+/// the rest hips' height, from the rest hips): a mean and its harmonics; and each bone's swing.
+pub struct Cycle: Clone {
+    pub period: f32,
+    pub travel: vec3,
+    pub hips: vec3,
+    pub sway: Vec<Harmonic>,
+    pub bones: Vec<Swing>,
+}
+
+/// A series' value at phase `t`: `bias`, then each harmonic as `cos` times cos(2πkt) and `sin`
+/// times sin(2πkt).
+pub fn series(bias: vec3, waves: [Harmonic], t: f32) -> vec3 {
+    var v = bias
+    let w = 6.28318531 * t
+    for h in waves {
+        let a = w * f32(h.k)
+        v = v + h.cos * cos(a) + h.sin * sin(a)
+    }
+    v
+}
+
+/// The turn a rotation vector `r` makes.
+pub fn exp(r: vec3) -> Quat {
+    let a = length(r)
+    if a < 1.0e-9 {
+        return Quat { v: normalize(vec4(r * 0.5, 1.0)) }
+    }
+    Quat { v: vec4(r * (sin(a * 0.5) / a), cos(a * 0.5)) }
+}
+
+/// Each rig bone's turn at rest in the body's frame, and its parent's (the rig's base for the
+/// hips).
+pub fn rest_turns(rig: Rig) -> (Vec<Quat>, Vec<Quat>) {
+    let rw = rig.rest_world()
+    var own: Vec<Quat> = Vec::with_capacity(rw.len())
+    var up: Vec<Quat> = Vec::with_capacity(rw.len())
+    for b in 0..rw.len() {
+        own.push(rw[b].q)
+        let p = rig.bones[b].parent
+        up.push(if p == NONE { rig.base.q } else { rw[p].q })
+    }
+    (own, up)
+}
+
+/// The rest hips' height over the body's floor (m), which a cycle's places are over.
+pub fn hips_height(rig: Rig) -> f32 {
+    rig.rest_world()[0].t.y
+}
+
+impl Cycle {
+    /// The swing of VRM bone `name`, or `None` where the cycle has none.
+    pub fn swing(self, name: str) -> Option<u32> {
+        for i in 0..self.bones.len() {
+            if self.bones[i].bone == name {
+                return Some(i)
+            }
+        }
+        None
+    }
+
+    /// The cycle played on `rig` as a looped clip at `fps` frames a second: each bone's written
+    /// turn moved into the rig's own frames (a bone the cycle doesn't write keeps its rest), the
+    /// hips' places and travel scaled by the rig's hips' height.
+    pub fn clip(self, rig: Rig, fps: f32) -> Clip {
+        let nb = rig.bones.len()
+        let (own, up) = rest_turns(rig.clone())
+        let h = hips_height(rig.clone())
+        let base = rig.base.q.inverse()
+        var swings: Vec<u32> = Vec::with_capacity(nb)
+        for b in 0..nb {
+            swings.push(self.swing(BONES[rig.bones[b].vrm]).unwrap_or(NONE))
+        }
+        let span = max(u32(round(self.period * fps)), 2)
+        let frames = span + 1
+        let travel_local = base.rotate(self.travel * h)
+        var turns: Vec<Quat> = Vec::with_capacity(frames * nb)
+        var hips: Vec<vec3> = Vec::with_capacity(frames)
+        for j in 0..frames {
+            let t = f32(j) / f32(span)
+            for b in 0..nb {
+                let s = swings[b]
+                if s == NONE {
+                    turns.push(rig.bones[b].rest.q)
+                } else {
+                    let l = self.bones[s].at(t)
+                    turns.push(up[b].inverse().mul(l).mul(own[b]))
+                }
+            }
+            let d = self.hips + series(vec3(0.0), self.sway, t)
+            hips.push(rig.bones[0].rest.t + base.rotate(d * h) + travel_local * t)
+        }
+        Clip {
+            fps: f32(span) / self.period,
+            frames,
+            bones: nb,
+            turns,
+            hips,
+            looped: true,
+            travel: self.travel * h,
+            travel_local,
+        }
+    }
+}
+
+// ---- fitting: the tool's half -------------------------------------------------------------
+
+// ---- writing: the cycle as source ---------------------------------------------------------
+
+/// Harmonic `k`: `cos` of its cosine, `sin` of its sine (the written form).
+pub fn wave(k: u32, cos: vec3, sin: vec3) -> Harmonic {
+    Harmonic { k, cos, sin }
+}
+
+/// The decimal places a cycle's numbers are written to: 0.0001 rad is 0.006°, and 0.0001 of a
+/// body's hips' height a tenth of a millimetre.
+pub const PLACES: u32 = 4

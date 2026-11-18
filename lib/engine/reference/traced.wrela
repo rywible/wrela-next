@@ -1,0 +1,196 @@
+// The reference's rays and light, by brute force and nothing clever: a ray steps by how far
+// matter is (`Matter::far`, never more than the true distance) until it is inside, and the span of
+// its last step is halved to the surface; light is the sun by a shadow ray toward a point of its
+// disc, the sky by rays over the hemisphere, and light that bounces by following those rays on,
+// the sun asked again wherever one stops (a path tracer, with the sun asked by name at each
+// stop). It asks the same matter the engine asks, by the same module, so it checks the engine and
+// not a copy of it. It is allowed to be slow; it is not allowed to be wrong.
+//
+// What it leaves out, said so a picture is never judged for it: light from a surface's own glow
+// that falls on another surface is followed (a path that stops on one adds what it gives off),
+// but nothing seeks a glow out, so a small bright glow lights things noisily; and a path stops
+// after `bounces` stops (light that has bounced more is dropped: with albedos under a half, three
+// bounces leave out under a sixteenth of the bounced light).
+//
+// The orthonormal basis about a normal is T. Duff, J. Burgess, P. Christensen, C. Hery, A.
+// Kensler, M. Liani and R. Villemin, "Building an Orthonormal Basis, Revisited" (JCGT 6(1), 2017);
+// cosine-weighted directions by Malley's method (projecting a disc's even points onto the
+// hemisphere: M. Pharr, W. Jakob and G. Humphreys, *Physically Based Rendering*, 3rd ed., 13.6.3).
+
+use matter::matter::Matter
+use matter::sky::{Sky, Sun}
+use matter::substance::Substance
+use std::field::{Field, hash_u32}
+
+/// The most rays over the hemisphere a look takes, and the most stops a ray is followed
+/// through.
+pub const MOST_RAYS: u32 = 8
+pub const MOST_BOUNCES: u32 = 4
+
+/// The most steps a ray takes.
+pub const MOST_STEPS: u32 = 4096
+
+/// How many times the span of a ray's last step is halved to put it on the surface.
+const HALVINGS: u32 = 24
+
+/// The least a step is (m), how much more a metre along the ray, and how many steps double it:
+/// so a ray that runs level with a surface, or along a narrow gap between two (a ball where it
+/// touches the ground), still goes on and gets out within its steps. A twentieth of a millimetre
+/// near the eye at first, a millimetre after 4000 steps; a thing thinner than this may be
+/// stepped over (the thinnest thing judged so far is a 1 cm wand).
+const LEAST: f32 = 0.00005
+const LEAST_FAR: f32 = 0.000005
+const LEAST_DOUBLES: f32 = 256.0
+
+/// How far off a surface (m) a ray that leaves it starts: past the float's error in the point,
+/// short of any detail the world has.
+pub const LEAVE: f32 = 0.0001
+
+/// The farthest a ray goes (m), where the world's bound reaches farther.
+pub const FAR: f32 = 10000.0
+
+/// How far along the ray from `o` along `d` (unit), between `from` and `to` m, it enters matter;
+/// under 0 if it doesn't: -1 if it got to `to`, -2 if it ran out of steps first (the reference
+/// failed there, and says so). A ray that starts inside enters at `from`.
+pub fn entered<M: Field<Substance>>(m: Matter<M>, o: vec3, d: vec3, from: f32, to: f32) -> f32 {
+    var t = from
+    var before = from
+    var crossed = false
+    var steps: u32 = 0
+    while steps < MOST_STEPS && !crossed && t < to {
+        steps += 1
+        let f = m.far(o + d * t)
+        if f < 0.0 {
+            crossed = true
+        } else {
+            before = t
+            t += max(f, (LEAST + LEAST_FAR * t) * (1.0 + f32(steps) / LEAST_DOUBLES))
+        }
+    }
+    if !crossed {
+        return if t < to { -2.0 } else { -1.0 }
+    }
+    var lo = before
+    var hi = t
+    var k: u32 = 0
+    while k < HALVINGS {
+        k += 1
+        let mid = 0.5 * (lo + hi)
+        if m.inside(o + d * mid) {
+            hi = mid
+        } else {
+            lo = mid
+        }
+    }
+    hi
+}
+
+/// Where a ray from `o` along `d` stops looking for matter (m along it): where it leaves the
+/// sphere that holds all matter.
+pub fn ends<M: Field<Substance>>(m: Matter<M>, o: vec3, d: vec3) -> f32 {
+    min(m.span(o, d).y, FAR)
+}
+
+/// A number from 0 to 1, the same for the same `at` and `k` on every machine: the `k`th of a
+/// pixel's look's dice (`at`, from the pixel and the look).
+pub fn die(at: u32, k: u32) -> f32 {
+    f32(hash_u32(at ^ hash_u32(k.wrapping_mul(2654435769).wrapping_add(1013904223))) >> 8) * (1.0 / 16777216.0)
+}
+
+/// Two unit vectors square to `n` (unit) and to each other.
+fn basis(n: vec3) -> (vec3, vec3) {
+    let s = if n.z >= 0.0 { 1.0 } else { -1.0 }
+    let a = -1.0 / (s + n.z)
+    let b = n.x * n.y * a
+    (vec3(1.0 + s * n.x * n.x * a, s * b, -s * n.x), vec3(b, s + n.y * n.y * a, -n.y))
+}
+
+/// A way about `n` (unit) whose cosine to it is `c`, turned `turn` of a whole turn about it.
+fn about(n: vec3, c: f32, turn: f32) -> vec3 {
+    let (u, v) = basis(n)
+    let s = sqrt(max(1.0 - c * c, 0.0))
+    let a = 6.2831853 * turn
+    normalize(u * (s * cos(a)) + v * (s * sin(a)) + n * c)
+}
+
+/// A way over the hemisphere about `n`, as likely as its cosine to `n` (from two dice).
+pub fn cosine_way(n: vec3, u: f32, v: f32) -> vec3 {
+    about(n, sqrt(1.0 - u), v)
+}
+
+/// A way toward an even point of the sun's disc (from two dice).
+pub fn sun_way(sun: Sun, u: f32, v: f32) -> vec3 {
+    about(sun.way, 1.0 - u * (1.0 - cos(sun.size)), v)
+}
+
+/// The sun's light on a face at `p` facing `n` (irradiance), where a ray toward a point of its
+/// disc (from two dice) gets out: what one look of the sun is.
+pub fn sunlit<M: Field<Substance>, S: Sky>(m: Matter<M>, sky: S, p: vec3, n: vec3, u: f32, v: f32) -> vec3 {
+    let sun = sky.sun()
+    let w = sun_way(sun, u, v)
+    let lean = dot(n, w)
+    if lean <= 0.0 {
+        return vec3(0.0)
+    }
+    let o = p + n * LEAVE
+    if entered(m, o, w, 0.0, ends(m, o, w)) >= 0.0 {
+        return vec3(0.0)
+    }
+    sun.light * lean
+}
+
+/// The light leaving a surface at `p`, facing `n`, made of `s`, toward the way `to` (unit, away
+/// from it): one look of it, from the dice of `at`. What it gives off; the sun on it; and the
+/// light of `rays` ways over its hemisphere, each followed on through up to `bounces` more stops.
+pub fn lit<M: Field<Substance>, S: Sky>(
+    m: Matter<M>,
+    sky: S,
+    p: vec3,
+    n: vec3,
+    s: Substance,
+    to: vec3,
+    at: u32,
+    rays: u32,
+    bounces: u32,
+) -> vec3 {
+    var e = s.emits
+    let sun = sky.sun()
+    e += s.scatters(n, sun.way, to) * sunlit(m, sky, p, n, die(at, 0), die(at, 1))
+    var r: u32 = 0
+    while r < MOST_RAYS && r < rays {
+        let k = 2 + 32 * r
+        // A way chosen as likely as its cosine: its light times what the surface scatters, over
+        // how likely the way was, is π times the scattering function times the light.
+        var way = cosine_way(n, die(at, k), die(at, k + 1))
+        var carried = s.scatters(n, way, to) * (3.14159265 / f32(rays))
+        var o = p + n * LEAVE
+        var depth: u32 = 0
+        var going = true
+        while depth <= MOST_BOUNCES && depth <= bounces && going {
+            let stop = depth
+            depth += 1
+            let t = entered(m, o, way, 0.0, ends(m, o, way))
+            if t < 0.0 {
+                e += carried * sky.light(way)
+                going = false
+            } else {
+                let q = o + way * t
+                let nq = m.facing(q, -way)
+                let sq = m.made_of(q)
+                e += carried * sq.emits
+                if stop == bounces {
+                    going = false
+                } else {
+                    let kq = k + 2 + 4 * stop
+                    e += carried * sq.scatters(nq, sun.way, -way) * sunlit(m, sky, q, nq, die(at, kq), die(at, kq + 1))
+                    let next = cosine_way(nq, die(at, kq + 2), die(at, kq + 3))
+                    carried = carried * sq.scatters(nq, next, -way) * 3.14159265
+                    way = next
+                    o = q + nq * LEAVE
+                }
+            }
+        }
+        r += 1
+    }
+    e
+}
