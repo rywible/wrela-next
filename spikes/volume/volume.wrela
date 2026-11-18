@@ -23,7 +23,7 @@
 use form::ink::InkStyle
 use form::kinds::{Paint, Solid}
 use form::look::{Look, Place, Skin}
-use form::shade::STILL
+use form::shade::{STILL, Steps}
 use frame::eye::{Eye, NEARER}
 use frame::last::{cover, covered, displayed, painted}
 use frame::load::burn
@@ -698,13 +698,166 @@ fn far_at<S: Parted>(form: S, g: Grid, coarse: Texture3d<Rg32Uint>, parts: [u32]
     form.distance_of(p, parts[u32(c.x) + g.size.x * (u32(c.y) + g.size.y * u32(c.z))])
 }
 
-/// A pixel of a moving form: found through its volume, finished against the form itself. The
-/// stored cells say where along the ray the surface is near (within `TRUE_NEAR` cells); through
-/// there the ray steps by the form's own distance (of the parts near, by the brick it is in)
-/// until it crosses the surface, as the references do, and the place is put on it by halving.
-/// Its facing is the form's gradient there and it wears the look asked there. So what the
-/// picture shows is the form, not the cells: a thing thinner than a cell is drawn if the cells
-/// bring the ray near it, and a crease is as sharp as the form makes it.
+/// What a ray finds of a moving form itself.
+struct Reached: Copy {
+    /// Whether the ray enters the form.
+    met: bool,
+    /// Where along the ray it enters it; or, not entering, where it grazed it (`band`) or came
+    /// nearest it.
+    t: f32,
+    /// The form's own distance at its nearest to the ray, short of entering (m; 1e9: the cells
+    /// never brought the ray near), and where along the ray that was.
+    least: f32,
+    least_t: f32,
+    /// Where along the ray the cells first said the form was near, and last (0: never).
+    near: f32,
+    last: f32,
+    /// How many times the form was asked.
+    steps: u32,
+}
+
+/// A ray from `o` along `d`, from `from` to `to` m along it, through a moving form's volume and
+/// then against the form itself, a stretch at a time. The cells are walked (`px`, `near`: the
+/// walk's footprint a metre off and how many of them count as near) to where the surface is
+/// next near or met; through there the ray steps by the form's own distance (of the parts
+/// near, by the brick it is in; never less than a quarter of `own`, the pixel's footprint a
+/// metre off) until it is in the form, and is put on the surface by two secant steps. A ray
+/// that skims a part without entering it (the cells, a little fatter in a hollow, may say it
+/// did) goes on from the stretch's end to the next. With `band` over 0 it also stops where it
+/// grazes the form: where the form's distance, having fallen to within `band` of the pixel's
+/// footprints, begins to grow again.
+fn reached<S: Parted>(
+    form: S,
+    g: Grid,
+    coarse: Texture3d<Rg32Uint>,
+    atlas: Texture3d<Rgba16Float>,
+    s: Sampler,
+    parts: [u32],
+    brick: f32,
+    top: vec3,
+    clear: vec2,
+    o: vec3,
+    d: vec3,
+    from: f32,
+    to: f32,
+    px: f32,
+    near: f32,
+    own: f32,
+    band: f32,
+) -> Reached {
+    let reach = TRUE_NEAR * g.cell
+    let graze = band * own
+    let least_step = 0.25 * own
+    var begin = from
+    var rounds: u32 = 0
+    var going = true
+    var crossed = false
+    var grazed = false
+    var t = from
+    var lo = from
+    var flo = 1.0e9
+    var v = 0.0
+    var steps: u32 = 0
+    var least = 1.0e9
+    var least_t = from
+    var first_near = 0.0
+    var last_near = 0.0
+    while rounds < 4 && going && !crossed && !grazed {
+        rounds += 1
+        let w = walk(g, coarse, atlas, s, o, d, from: begin, to: to, px: px, near: near)
+        if rounds == 1 {
+            first_near = w.near
+        }
+        last_near = max(last_near, w.last)
+        if !w.met && w.near == 0.0 {
+            going = false
+        } else {
+            t = max((if w.near > 0.0 { min(w.near, if w.met { w.t } else { w.near }) } else { w.t }) - reach, begin)
+            let end = (if w.met { w.t } else { w.last }) + 2.0 * reach
+            // `lo`: the last place outside the form and its distance there; `t`: the first
+            // inside, and `v` its distance. `fell`: the distance has fallen in this stretch.
+            // (The stretch must begin outside the form. Where two parts pass within a cell of
+            // each other, a place a cell and a half short of the one the cells found can be
+            // inside the other, which the cells were too coarse to show: where its first ask
+            // is inside, it begins again farther back, by how deep that was.)
+            lo = t
+            flo = 1.0e9
+            var fell = false
+            var back: u32 = 0
+            while steps < TRUE_STEPS && !crossed && !grazed && t < end {
+                steps += 1
+                v = far_at(form, g, coarse, parts, brick, top, clear, o + d * t)
+                if v < 0.0 && flo > 1.0e8 && back < 8 && t > begin {
+                    back += 1
+                    t = max(t - max(-v, reach), begin)
+                    lo = t
+                } else if v < 0.0 {
+                    crossed = true
+                } else {
+                    var graze_here = false
+                    if band > 0.0 && fell && v > flo && flo < graze * lo {
+                        // (A graze by the form's value. Between two parts that pass close,
+                        // joined, the value runs level and is far under the distance: so it is
+                        // a graze only if the value over its gradient's length, the distance
+                        // to the surface, is within the band too. If not, the ray goes on.)
+                        let turn = asked_at(form, g, coarse, parts, brick, top, clear, o + d * lo)
+                        graze_here = flo < graze * lo * length(turn.xyz)
+                        fell = false
+                    }
+                    if graze_here {
+                        grazed = true
+                    } else {
+                        if v < least {
+                            least = v
+                            least_t = t
+                        }
+                        fell = fell || v < flo
+                        lo = t
+                        flo = v
+                        t += max(v, least_step * t)
+                    }
+                }
+            }
+            begin = t
+            going = steps < TRUE_STEPS && t < to
+        }
+    }
+    if grazed {
+        return Reached { met: false, t: lo, least: flo, least_t: lo, near: first_near, last: last_near, steps }
+    }
+    if !crossed {
+        return Reached { met: false, t: least_t, least, least_t, near: first_near, last: last_near, steps }
+    }
+    // Onto the surface between them: where a straight line through the two distances is 0,
+    // twice (the distance runs near straight along a ray this close to the surface).
+    // (A `while`, not a `for` of two turns: the compiler unrolls so short a `for`, and in each
+    // copy it then copied the whole form, a kilobyte of parts, into a local of the pixel's:
+    // the pass ran five times slower. Measured: 16.0 ms against 2.9 ms.)
+    var hi = t
+    var fhi = min(v, -1.0e-9)
+    if flo > 1.0e8 {
+        flo = 0.0
+    }
+    var turns: u32 = 0
+    while turns < 2 {
+        turns += 1
+        let m = lo + (hi - lo) * (flo / (flo - fhi))
+        let fm = far_at(form, g, coarse, parts, brick, top, clear, o + d * m)
+        if fm < 0.0 {
+            hi = m
+            fhi = min(fm, -1.0e-9)
+        } else {
+            lo = m
+            flo = fm
+        }
+    }
+    Reached { met: true, t: lo + (hi - lo) * (flo / (flo - fhi)), least, least_t, near: first_near, last: last_near, steps }
+}
+
+/// A pixel of a moving form: found through its volume, finished against the form itself
+/// (`reached`). Its facing is the form's gradient there and it wears the look asked there. So
+/// what the picture shows is the form, not the cells: a thing thinner than a cell is drawn if
+/// the cells bring the ray near it, and a crease is as sharp as the form makes it.
 @fragment
 pub fn marched_true<S: Parted, L: Look>(
     pixel: FragCoord,
@@ -725,98 +878,14 @@ pub fn marched_true<S: Parted, L: Look>(
         return nothing()
     }
     let px = eye.pixel()
-    let reach = TRUE_NEAR * g.cell
     let brick = g.cell * f32(B)
     let top = vec3(f32(g.size.x - 1), f32(g.size.y - 1), f32(g.size.z - 1))
     let clear = vec2(CLEAR_OF * brick, -CLEAR_OF * brick)
-    let near = reach / (px * span.x)
-    // A stretch at a time: the cells are walked to where the surface is next near (or met), and
-    // through there the ray steps by the form's own distance until it is in the form. A ray
-    // that skims one part without entering it (the cells, a little fatter in a hollow, may say
-    // it did) goes on from the stretch's end to the next: the body behind it.
-    var from = span.x
-    var rounds: u32 = 0
-    var going = true
-    var crossed = false
-    var t = span.x
-    var lo = span.x
-    var flo = 0.0
-    var v = 0.0
-    var steps: u32 = 0
-    while rounds < 4 && going && !crossed {
-        rounds += 1
-        let w = walk(g, coarse, atlas, s, eye.at, d, from: from, to: span.y, px: px, near: near)
-        if !w.met && w.near == 0.0 {
-            going = false
-        } else {
-            t = max((if w.near > 0.0 { min(w.near, if w.met { w.t } else { w.near }) } else { w.t }) - reach, from)
-            let end = (if w.met { w.t } else { w.last }) + 2.0 * reach
-            // (The stretch must begin outside the form. Where two parts pass within a cell of
-            // each other, a place a cell and a half short of the one the cells found can be
-            // inside the other, which the cells were too coarse to show: then it begins
-            // farther back, by how deep it was.)
-            var back: u32 = 0
-            var inside = true
-            while back < 8 && inside {
-                back += 1
-                let u = far_at(form, g, coarse, parts, brick, top, clear, eye.at + d * t)
-                if u < 0.0 && t > from {
-                    t = max(t - max(-u, reach), from)
-                } else {
-                    inside = false
-                }
-            }
-            // `lo`: the last place outside the form and its distance there; `t`: the first
-            // inside, and `v` its distance.
-            lo = t
-            flo = 0.0
-            while steps < TRUE_STEPS && !crossed && t < end {
-                steps += 1
-                v = far_at(form, g, coarse, parts, brick, top, clear, eye.at + d * t)
-                if v < 0.0 {
-                    crossed = true
-                } else {
-                    lo = t
-                    flo = v
-                    t += max(v, 0.25 * px * t)
-                }
-            }
-            from = t
-            going = steps < TRUE_STEPS && t < span.y
-        }
-    }
-    if !crossed || (g.debug & 2048) != 0 {
-        if (g.debug & 512) != 0 && rounds > 1 {
-            // (Green: the cells brought the ray near, but it never entered the form itself;
-            // its red, the asks it took.)
-            return WithDepth {
-                color: Targets3 { first: vec4(f32(steps) / f32(TRUE_STEPS), 1.0, 0.0, 0.0), second: edge_record(NO_EDGE, 1.0, NO_LINE), third: identity(SOLID, body: body, group: 0) },
-                depth: eye.depth(eye.at + d * span.x),
-            }
-        }
+    let r = reached(form, g, coarse, atlas, s, parts, brick, top, clear, eye.at, d, from: span.x, to: span.y, px: px, near: TRUE_NEAR * g.cell / (px * span.x), own: px, band: 0.0)
+    if !r.met {
         return nothing()
     }
-    // Onto the surface between them: where a straight line through the two distances is 0,
-    // twice (the distance runs near straight along a ray this close to the surface).
-    // (A `while`, not a `for` of two turns: the compiler unrolls so short a `for`, and in each
-    // copy it then copied the whole form, a kilobyte of parts, into a local of the pixel's:
-    // the pass ran five times slower. Measured: 16.0 ms against 2.9 ms.)
-    var hi = t
-    var fhi = min(v, -1.0e-9)
-    var turns: u32 = 0
-    while turns < 2 {
-        turns += 1
-        let m = lo + (hi - lo) * (flo / (flo - fhi))
-        let fm = far_at(form, g, coarse, parts, brick, top, clear, eye.at + d * m)
-        if fm < 0.0 {
-            hi = m
-            fhi = min(fm, -1.0e-9)
-        } else {
-            lo = m
-            flo = fm
-        }
-    }
-    let at = lo + (hi - lo) * (flo / (flo - fhi))
+    let at = r.t
     let p = eye.at + d * at
     let here = asked_at(form, g, coarse, parts, brick, top, clear, p)
     let n = normalize(here.xyz)
@@ -825,7 +894,7 @@ pub fn marched_true<S: Parted, L: Look>(
     if (g.debug & 512) != 0 {
         // (To see what a pixel found: red, no facing where it stopped; else its facing, and in
         // blue how many times it asked the form, of the most.)
-        lit.colour = if dot(here.xyz, here.xyz) == 0.0 { vec3(1.0, 0.0, 0.0) } else { vec3(0.5 + 0.5 * n.x, 0.5 + 0.5 * n.y, f32(steps) / f32(TRUE_STEPS)) }
+        lit.colour = if dot(here.xyz, here.xyz) == 0.0 { vec3(1.0, 0.0, 0.0) } else { vec3(0.5 + 0.5 * n.x, 0.5 + 0.5 * n.y, f32(r.steps) / f32(TRUE_STEPS)) }
     }
     // The way to its outline, as `shown` finds it, from the form's own facing a little on.
     var way = NO_EDGE
@@ -849,6 +918,390 @@ pub fn marched_true<S: Parted, L: Look>(
         color: Targets3 { first: vec4(lit.colour, 0.0), second: edge_record(way, 1.0, NO_LINE), third: identity(SOLID, body: body, group: 0) },
         depth: eye.depth(p),
     }
+}
+
+// ---- a moving form in the picture laid out -------------------------------------------------------
+//
+// The picture laid out (below: scouts, each lit, blocks checked and sorted, one pass of a fill
+// and quads) with every read of the cells that decides what is SHOWN replaced by the form
+// itself: a scout is finished against the form; a block's check asks the form at its middles;
+// a shaded pixel asks the form once where its quad puts it; an edge pixel takes the first sheet
+// its ray comes on by the form's own distance (`reached`), with its share of the pixel, over
+// what is behind. The cells only say where the form is near.
+
+/// A scout of a moving form, as `scouted` gives a still one's: how far along its ray it enters
+/// the form itself (not: under 0, less how far along the cells last said it was near), its
+/// facing and what it wears there (or whether it came within `SCOUT_NEAR` of its footprints of
+/// the form itself), and how far along the cells first said it was near.
+@fragment
+pub fn scouted_true<S: Parted, L: Look>(
+    pixel: FragCoord,
+    eye: Eye,
+    form: S,
+    look: L,
+    g: Grid,
+    coarse: Texture3d<Rg32Uint>,
+    atlas: Texture3d<Rgba16Float>,
+    s: Sampler,
+    parts: [u32],
+    rate: f32,
+) -> vec4 {
+    let d = eye.ray((pixel.position.xy - vec2(0.5)) * rate)
+    let span = crossing(eye, g, d)
+    if !(span.x < span.y) {
+        return vec4(0.0)
+    }
+    let own = eye.pixel()
+    let foot = own * rate
+    let brick = g.cell * f32(B)
+    let top = vec3(f32(g.size.x - 1), f32(g.size.y - 1), f32(g.size.z - 1))
+    let clear = vec2(CLEAR_OF * brick, -CLEAR_OF * brick)
+    let r = reached(form, g, coarse, atlas, s, parts, brick, top, clear, eye.at, d, from: span.x, to: span.y, px: foot, near: max(2.0, TRUE_NEAR * g.cell / (foot * span.x)), own: own, band: 0.0)
+    if !r.met {
+        return vec4(-r.last, if r.least < SCOUT_NEAR * foot * r.least_t { 1.0 } else { 0.0 }, 0.0, r.near)
+    }
+    let p = eye.at + d * r.t
+    let here = asked_at(form, g, coarse, parts, brick, top, clear, p)
+    let n = normalize(here.xyz)
+    let a = look.skin(Place { world: p, rest: p, chart: None, normal: n }).albedo
+    vec4(r.t, faced(n), rooted(a), if r.near > 0.0 { min(r.near, r.t) } else { r.t })
+}
+
+/// `laid_holds` for a moving form: the form itself asked where the quad lays the place.
+fn laid_holds_true<S: Parted, L: Look>(
+    eye: Eye,
+    light: Lighting,
+    form: S,
+    look: L,
+    g: Grid,
+    coarse: Texture3d<Rg32Uint>,
+    parts: [u32],
+    brick: f32,
+    top: vec3,
+    clear: vec2,
+    at: vec2,
+    t: f32,
+    c: vec3,
+    tol: f32,
+) -> u32 {
+    let d = eye.ray(at)
+    let p = eye.at + d * t
+    let v = asked_at(form, g, coarse, parts, brick, top, clear, p)
+    if dot(v.xyz, v.xyz) == 0.0 || abs(v.w) > SHEET * eye.pixel() * t {
+        return 2
+    }
+    let n = normalize(v.xyz)
+    let on = p + d * (v.w / max(-dot(n, d), 0.25))
+    let a = look.skin(Place { world: on, rest: on, chart: None, normal: n }).albedo
+    if apart(lit_at(light, on, n, a, d), c, tol) { 1 } else { 0 }
+}
+
+/// `side_holds` for a moving form.
+fn side_holds_true<S: Parted, L: Look, P: Paint>(
+    eye: Eye,
+    light: Lighting,
+    sky: P,
+    form: S,
+    look: L,
+    g: Grid,
+    coarse: Texture3d<Rg32Uint>,
+    parts: [u32],
+    brick: f32,
+    top: vec3,
+    clear: vec2,
+    at: vec2,
+    ea: vec4,
+    eb: vec4,
+    ca: vec3,
+    cb: vec3,
+    tol: f32,
+) -> u32 {
+    if ea.x > 0.0 && eb.x > 0.0 {
+        return laid_holds_true(eye, light, form, look, g, coarse, parts, brick, top, clear, at, 0.5 * (ea.x + eb.x), 0.5 * (ca + cb), tol)
+    }
+    if ea.x > 0.0 || eb.x > 0.0 || close_by(ea) || close_by(eb) {
+        return 2
+    }
+    if apart(painted(eye, sky, eye.ray(at)), 0.5 * (ca + cb), tol) { 1 } else { 0 }
+}
+
+/// `checked` for a moving form.
+@compute(8, 8)
+fn checked_true<S: Parted, L: Look, P: Paint>(
+    eye: Eye,
+    light: Lighting,
+    sky: P,
+    form: S,
+    look: L,
+    g: Grid,
+    coarse: Texture3d<Rg32Uint>,
+    parts: [u32],
+    scout: Texture<Rgba32Float>,
+    glow: Texture<Rgba16Float>,
+    rate: f32,
+    tol: f32,
+    out: mut Texels<R32Uint>,
+    id: GlobalId,
+) {
+    if id.x >= scout.width() || id.y >= scout.height() {
+        return
+    }
+    let brick = g.cell * f32(B)
+    let top = vec3(f32(g.size.x - 1), f32(g.size.y - 1), f32(g.size.z - 1))
+    let clear = vec2(CLEAR_OF * brick, -CLEAR_OF * brick)
+    let x1 = min(id.x + 1, scout.width() - 1)
+    let y1 = min(id.y + 1, scout.height() - 1)
+    let e00 = scout.load(id.x, id.y)
+    let e10 = scout.load(x1, id.y)
+    let e01 = scout.load(id.x, y1)
+    let e11 = scout.load(x1, y1)
+    let c00 = glow.load(id.x, id.y).xyz
+    let c10 = glow.load(x1, id.y).xyz
+    let c01 = glow.load(id.x, y1).xyz
+    let c11 = glow.load(x1, y1).xyz
+    let o = vec2(f32(id.x), f32(id.y)) * rate
+    let across = side_holds_true(eye, light, sky, form, look, g, coarse, parts, brick, top, clear, o + vec2(0.5, 0.0) * rate, e00, e10, c00, c10, tol)
+    let down = side_holds_true(eye, light, sky, form, look, g, coarse, parts, brick, top, clear, o + vec2(0.0, 0.5) * rate, e00, e01, c00, c01, tol)
+    let mid = o + vec2(0.5, 0.5) * rate
+    let mean = 0.25 * (c00 + c10 + c01 + c11)
+    let met = (if e00.x > 0.0 { 1 } else { 0 }) + (if e10.x > 0.0 { 1 } else { 0 }) + (if e01.x > 0.0 { 1 } else { 0 }) + (if e11.x > 0.0 { 1 } else { 0 })
+    let near = close_by(e00) || close_by(e10) || close_by(e01) || close_by(e11)
+    var middle: u32 = 2
+    if met == 4 {
+        middle = laid_holds_true(eye, light, form, look, g, coarse, parts, brick, top, clear, mid, 0.25 * (e00.x + e10.x + e01.x + e11.x), mean, tol)
+    } else if met == 0 && !near {
+        middle = if apart(painted(eye, sky, eye.ray(mid)), mean, tol) { 1 } else { 0 }
+    }
+    out.store(id, across | (down << 2) | (middle << 4))
+}
+
+/// How a moving form's surface changes a pixel across and a pixel down the screen, where a ray
+/// along `d` meets it `t` m on at `p`, facing `n`: its place, along its tangent plane; and its
+/// facing, by the form itself asked a pixel across and a pixel down. What the frame's lighting
+/// needs to spread a tone's edge over the pixel it crosses (`form::shade::Steps`): without it
+/// every edge between two tones steps from one pixel to the next.
+fn steps_on<S: Parted>(eye: Eye, form: S, g: Grid, coarse: Texture3d<Rg32Uint>, parts: [u32], brick: f32, top: vec3, clear: vec2, p: vec3, n: vec3, d: vec3, t: f32) -> Steps {
+    let wide = eye.pixel() * t
+    let toward = min(dot(n, d), -0.05)
+    let across = (eye.right - d * (dot(n, eye.right) / toward)) * wide
+    let down = (d * (dot(n, eye.up) / toward) - eye.up) * wide
+    let a = asked_at(form, g, coarse, parts, brick, top, clear, p + across)
+    let b = asked_at(form, g, coarse, parts, brick, top, clear, p + down)
+    Steps {
+        across,
+        down,
+        normal_across: if dot(a.xyz, a.xyz) > 0.0 { normalize(a.xyz) - n } else { vec3(0.0) },
+        normal_down: if dot(b.xyz, b.xyz) > 0.0 { normalize(b.xyz) - n } else { vec3(0.0) },
+        relief: vec2(0.0),
+    }
+}
+
+/// A pixel of a shaded block of a moving form: the form itself asked once where its quad puts
+/// the pixel, the place put on the surface by that, and lit as the look wears it there.
+@fragment
+pub fn shaded_true<S: Parted, L: Look>(
+    f: Patch,
+    eye: Eye,
+    light: Lighting,
+    style: InkStyle,
+    form: S,
+    look: L,
+    g: Grid,
+    coarse: Texture3d<Rg32Uint>,
+    parts: [u32],
+    display: u32,
+) -> vec4 {
+    let brick = g.cell * f32(B)
+    let top = vec3(f32(g.size.x - 1), f32(g.size.y - 1), f32(g.size.z - 1))
+    let clear = vec2(CLEAR_OF * brick, -CLEAR_OF * brick)
+    var n = normalize(f.normal)
+    var a = f.albedo
+    var p = f.world
+    let d = normalize(f.world - eye.at)
+    let v = asked_at(form, g, coarse, parts, brick, top, clear, f.world)
+    if dot(v.xyz, v.xyz) > 0.0 {
+        n = normalize(v.xyz)
+        p = f.world + d * (v.w / max(-dot(n, d), 0.25))
+        a = look.skin(Place { world: p, rest: p, chart: None, normal: n }).albedo
+    }
+    let skin = Skin { albedo: a, line: 1.0, metal: 0.0, rim: false, emits: vec3(0.0) }
+    let steps = steps_on(eye, form, g, coarse, parts, brick, top, clear, p, n, d, length(p - eye.at))
+    out_as(style, worn(light, skin, p, n, -d, steps, reach: sun_reach(light, p)).colour, display)
+}
+
+/// How near its outline (px) a sheet shares a pixel with what is behind it.
+const SHARED: f32 = 0.75
+
+/// The sheet of a moving form a pixel's ray first comes on from `from` m along it, by the form
+/// itself (`reached`): where the ray enters it, or grazes it within `band` px (0: only where it
+/// enters it, as what is behind another sheet is looked for: a ray past that sheet's outline
+/// grazes that same sheet first). Its share of
+/// the pixel is from how far inside its outline the pixel's middle is (entered: how deep the
+/// ray goes at its deepest, from how the form's facing turns along the ray, as `marched_true`
+/// finds its outline) or how far clear of it (grazed: the form's own distance there).
+fn sheet_true<S: Parted, L: Look>(
+    eye: Eye,
+    light: Lighting,
+    form: S,
+    look: L,
+    g: Grid,
+    coarse: Texture3d<Rg32Uint>,
+    atlas: Texture3d<Rgba16Float>,
+    s: Sampler,
+    parts: [u32],
+    brick: f32,
+    top: vec3,
+    clear: vec2,
+    d: vec3,
+    from: f32,
+    to: f32,
+    band: f32,
+) -> Sheet {
+    let px = eye.pixel()
+    let none = Sheet { colour: vec3(0.0), cover: 0.0, t: to, met: false, out: vec2(0.0), at: vec3(0.0), facing: vec3(0.0) }
+    let r = reached(form, g, coarse, atlas, s, parts, brick, top, clear, eye.at, d, from: from, to: to, px: px, near: TRUE_NEAR * g.cell / (px * from), own: px, band: band)
+    if !r.met && (band <= 0.0 || r.least > band * px * r.least_t) {
+        return none
+    }
+    let t = r.t
+    let p0 = eye.at + d * t
+    let here = asked_at(form, g, coarse, parts, brick, top, clear, p0)
+    if dot(here.xyz, here.xyz) == 0.0 {
+        return none
+    }
+    let n = normalize(here.xyz)
+    let lean = vec2(dot(n, eye.right), -dot(n, eye.up))
+    // (How far clear of the sheet: the form's value there over its gradient's length, which is
+    // the distance to its surface; the value alone is under it wherever two parts are joined.)
+    let off = max(r.least, 0.0) / max(length(here.xyz), 1.0e-3)
+    var inside = -off / (px * t)
+    if r.met {
+        inside = 1.0e9
+        let nv = -dot(n, d)
+        if nv < FOLD_NEAR && dot(lean, lean) > 1.0e-8 {
+            let ahead = 2.0 * px * t
+            let on = asked_at(form, g, coarse, parts, brick, top, clear, p0 + d * ahead)
+            if dot(on.xyz, on.xyz) > 0.0 {
+                let bend = (dot(normalize(on.xyz), d) + nv) / ahead
+                if bend > 1.0e-6 {
+                    inside = nv * nv / (2.0 * bend) / (px * t * length(lean))
+                }
+            }
+        }
+    }
+    var cover = if r.met { 1.0 } else { 0.0 }
+    var out = vec2(0.0)
+    if dot(lean, lean) > 1.0e-6 {
+        out = normalize(lean)
+        if abs(inside) < SHARED {
+            cover = covered(inside, out)
+        }
+    }
+    // (Where the ray clears the sheet, the sheet's point nearest it.)
+    let p = p0 - n * (if r.met { 0.0 } else { off })
+    if cover <= 0.0 {
+        return Sheet { colour: vec3(0.0), cover: 0.0, t, met: r.met, out, at: p, facing: n }
+    }
+    let a = look.skin(Place { world: p, rest: p, chart: None, normal: n }).albedo
+    let skin = Skin { albedo: a, line: 1.0, metal: 0.0, rim: false, emits: vec3(0.0) }
+    var steps = STILL
+    if band > 0.0 {
+        steps = steps_on(eye, form, g, coarse, parts, brick, top, clear, p, n, d, t)
+    }
+    Sheet { colour: worn(light, skin, p, n, -d, steps, reach: sun_reach(light, p)).colour, cover, t, met: r.met, out, at: p, facing: n }
+}
+
+/// A corner of an edge block's quad, with what the block's four scouts say of all its pixels
+/// alike: the nearest any of them met the form or the cells first said it was near (m along
+/// its ray; 1e30: none did), and the farthest any met it or was last near it.
+pub struct EdgeCorner: Copy {
+    pub clip: ClipPosition,
+    pub start: f32,
+    pub far: f32,
+}
+
+@vertex
+pub fn edge_corner(v: VertexIndex, i: InstanceIndex, edges: [u32], scout: Texture<Rgba32Float>, size: vec2, rate: f32) -> EdgeCorner {
+    let b = edges[i.index]
+    let j = QUAD[v.index % 6]
+    let bx = b & 65535
+    let by = b >> 16
+    var start = 1.0e30
+    var far = 0.0
+    for k in 0..4 {
+        let e = scout.load(bx + (k & 1), by + (k >> 1))
+        if e.x > 0.0 {
+            start = min(start, e.x)
+            far = max(far, e.x)
+        }
+        if e.w > 0.0 {
+            start = min(start, e.w)
+        }
+        if e.x < 0.0 {
+            far = max(far, -e.x)
+        }
+    }
+    let p = vec2(f32(bx + (j & 1)), f32(by + ((j >> 1) & 1))) * rate
+    EdgeCorner { clip: ClipPosition { position: vec4(p.x / size.x * 2.0 - 1.0, 1.0 - p.y / size.y * 2.0, 0.0, 1.0) }, start, far }
+}
+
+/// A pixel of an edge block of a moving form: the sheet its ray first comes on (`sheet_true`),
+/// by its share of the pixel, over what the rest of the pixel shows: the form where a ray past
+/// that sheet's outline next enters it, else the sky.
+@fragment
+pub fn edged_true<S: Parted, L: Look, P: Paint>(
+    corner: EdgeCorner,
+    pixel: FragCoord,
+    eye: Eye,
+    light: Lighting,
+    sky: P,
+    style: InkStyle,
+    form: S,
+    look: L,
+    g: Grid,
+    coarse: Texture3d<Rg32Uint>,
+    atlas: Texture3d<Rgba16Float>,
+    s: Sampler,
+    parts: [u32],
+    rate: f32,
+    display: u32,
+) -> vec4 {
+    let d = eye.ray(pixel.position.xy)
+    var colour = painted(eye, sky, d)
+    let span = crossing(eye, g, d)
+    if corner.start < 1.0e29 && span.x < span.y {
+        let brick = g.cell * f32(B)
+        let top = vec3(f32(g.size.x - 1), f32(g.size.y - 1), f32(g.size.z - 1))
+        let clear = vec2(CLEAR_OF * brick, -CLEAR_OF * brick)
+        let px = eye.pixel()
+        let ahead = max(corner.start - rate * px * corner.start, span.x)
+        // (As far as the farthest its block's scouts found anything, and some bricks past.)
+        let to = min(span.y, max(corner.far, corner.start) + PAST * brick)
+        // (Tried and measured a loss, 1.91 ms to 2.49 ms: walking the cells first and giving a
+        // pixel plainly of sky or plainly of one sheet a short way. The pixels of a block run
+        // together and wait for the slowest, so a short way for some saves nothing unless they
+        // are drawn apart.)
+        let near = sheet_true(eye, light, form, look, g, coarse, atlas, s, parts, brick, top, clear, d, from: ahead, to: to, band: SHARED)
+        if near.cover < 1.0 && near.t < to && (g.debug & 32768) == 0 {
+            // The rest of the pixel: along this ray past the sheet, where it clears it; where it
+            // enters it, along the ray a pixel and a half out past its outline. (Tried: taking
+            // the sheet's share from how far that second ray clears it, by the form's own
+            // distance, in place of the share from how its facing turns. No better: crawl 322
+            // to 329 a thousand edge pixels.)
+            var past = d
+            var from = near.t + 2.0 * px * near.t
+            if near.met {
+                past = eye.ray(pixel.position.xy + near.out * 1.5)
+                from = max(near.t - 0.5 * brick, span.x)
+            }
+            let far = sheet_true(eye, light, form, look, g, coarse, atlas, s, parts, brick, top, clear, past, from: from, to: to, band: 0.0)
+            if far.met {
+                colour = far.colour
+            }
+        }
+        colour = mix(colour, near.colour, near.cover)
+    }
+    out_as(style, colour, display)
 }
 
 /// The volume of a form that moves, its fine cells `cell` m a side, holding `most` bricks at the
@@ -895,6 +1348,144 @@ impl<S: Parted> Volume<S> {
             deposited_here.bind(self.form, g: self.grid, bricks: self.bricks.items(), coarse: self.raw.items(), parts: self.parts.items(), out: mut self.atlas),
             over: self.atlas,
         )
+    }
+
+    /// The moving form's picture laid out for `eye` as `look` wears it (as `laid_out` lays a
+    /// still form's): scouts finished against the form, each lit, each block checked against
+    /// the form and sorted. Before the pass it is drawn into (`laid_true_into`).
+    pub fn laid_out_true<L: Look, P: Paint>(mut self, eye: Eye, light: Lighting, sky: P, look: L, style: InkStyle, rate: u32, tol: f32) {
+        let w = u32(eye.size.x)
+        let h = u32(eye.size.y)
+        let sw = (w + rate - 1) / rate + 1
+        let sh = (h + rate - 1) / rate + 1
+        if self.scout.width() != sw || self.scout.height() != sh {
+            self.scout = texture(width: sw, height: sh)
+        }
+        if self.glow.width() != sw || self.glow.height() != sh {
+            self.glow = writable_texture(width: sw, height: sh)
+            self.glow_shown = writable_texture(width: sw, height: sh)
+            self.checks = writable_texture(width: sw, height: sh)
+            self.fills = append_buffer(sw * sh)
+            self.shades = append_buffer(sw * sh)
+            self.skies = append_buffer(sw * sh)
+            self.edges = append_buffer(sw * sh)
+        }
+        if self.load > 0 {
+            label("load")
+            let b = begin_pass(mut self.burned, clear: vec4(0.0))
+            draw(b, cover, burn.bind(rounds: self.load), vertices: 3)
+            b.end()
+        }
+        label("scouted")
+        let p = begin_pass(mut self.scout, clear: vec4(0.0))
+        draw(
+            p,
+            cover,
+            scouted_true.bind(eye: eye, form: self.form, look: look, g: self.grid, coarse: self.coarse, atlas: self.atlas, s: self.s, parts: self.parts.items(), rate: f32(rate)),
+            vertices: 3,
+        )
+        p.end()
+        label("glowed")
+        dispatch(
+            glowed.bind(eye: eye, light: light, sky: sky, style: style, scout: self.scout, rate: f32(rate), out: mut self.glow, shown: mut self.glow_shown),
+            groups: ((sw + 7) / 8, (sh + 7) / 8, 1),
+        )
+        label("checked")
+        dispatch(
+            checked_true.bind(
+                eye: eye,
+                light: light,
+                sky: sky,
+                form: self.form,
+                look: look,
+                g: self.grid,
+                coarse: self.coarse,
+                parts: self.parts.items(),
+                scout: self.scout,
+                glow: self.glow,
+                rate: f32(rate),
+                tol: tol,
+                out: mut self.checks,
+            ),
+            groups: ((sw + 7) / 8, (sh + 7) / 8, 1),
+        )
+        label("sorted")
+        self.fills.clear()
+        self.shades.clear()
+        self.skies.clear()
+        self.edges.clear()
+        dispatch(
+            sorted.bind(eye: eye, scout: self.scout, checks: self.checks, rate: f32(rate), shades: mut self.shades, skies: mut self.skies, edges: mut self.edges),
+            groups: ((sw + 7) / 8, (sh + 7) / 8, 1),
+        )
+        dispatch(
+            kinds_counted.bind(fills: self.fills.count(), shades: self.shades.count(), skies: self.skies.count(), edges: self.edges.count(), most: sw * sh, out: mut self.kinds_drawn),
+            groups: 1,
+        )
+    }
+
+    /// The moving form's laid-out picture drawn into `pass`: as the screen shows it
+    /// (`display`) or in linear light. Four draws, each pixel by one of them.
+    pub fn laid_true_into<R: RenderPass, L: Look, P: Paint>(self, pass: R, eye: Eye, light: Lighting, sky: P, look: L, style: InkStyle, rate: u32, display: bool) {
+        let shows: u32 = if display { 1 } else { 0 }
+        if display {
+            draw(pass, cover, filled_over.bind(glow: self.glow_shown, s: self.s, rate: f32(rate)), vertices: 3)
+        } else {
+            draw(pass, cover, filled_over.bind(glow: self.glow, s: self.s, rate: f32(rate)), vertices: 3)
+        }
+        // (To time the kinds apart: 16384 leaves the shaded blocks undrawn, 8192 the edge blocks.)
+        if (self.grid.debug & 16384) == 0 {
+        draw(
+            pass,
+            patch_corner.bind(blocks: self.shades.items(), eye: eye, scout: self.scout, rate: f32(rate)),
+            shaded_true.bind(eye: eye, light: light, style: style, form: self.form, look: look, g: self.grid, coarse: self.coarse, parts: self.parts.items(), display: shows),
+            indirect: self.kinds_drawn.span(start: 1, count: 1),
+        )
+        }
+        draw(
+            pass,
+            block_corner.bind(edges: self.skies.items(), size: eye.size, rate: f32(rate)),
+            skied.bind(eye: eye, sky: sky, style: style, display: shows, tint: vec3(1.0)),
+            indirect: self.kinds_drawn.span(start: 2, count: 1),
+        )
+        if (self.grid.debug & 8192) == 0 {
+        draw(
+            pass,
+            edge_corner.bind(edges: self.edges.items(), scout: self.scout, size: eye.size, rate: f32(rate)),
+            edged_true.bind(
+                eye: eye,
+                light: light,
+                sky: sky,
+                style: style,
+                form: self.form,
+                look: look,
+                g: self.grid,
+                coarse: self.coarse,
+                atlas: self.atlas,
+                s: self.s,
+                parts: self.parts.items(),
+                rate: f32(rate),
+                display: shows,
+            ),
+            indirect: self.kinds_drawn.span(start: 3, count: 1),
+        )
+        }
+    }
+
+    /// The moving form's laid-out picture drawn to the screen and shown.
+    pub fn shown_laid_true<L: Look, P: Paint>(self, eye: Eye, light: Lighting, sky: P, look: L, style: InkStyle, rate: u32) {
+        label("laid")
+        let screen = begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
+        self.laid_true_into(screen, eye, light, sky, look, style, rate, display: true)
+        screen.present()
+    }
+
+    /// The moving form's laid-out picture drawn into `into`, in linear light (for the judges).
+    pub fn laid_true_linear<L: Look, P: Paint>(self, into: mut Texture<Rgba16Float>, eye: Eye, light: Lighting, sky: P, look: L, style: InkStyle, rate: u32) {
+        label("laid")
+        let p = begin_pass(mut into, clear: vec4(0.0, 0.0, 0.0, 1.0))
+        self.laid_true_into(p, eye, light, sky, look, style, rate, display: false)
+        p.end()
     }
 
     /// The moving form drawn at every pixel into `frame`'s picture as `look` wears it, as body
