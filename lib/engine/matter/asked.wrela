@@ -12,7 +12,7 @@
 // answers for whichever thing is nearer. A field's raw value is read only here and in `cells`,
 // always divided by the steepness its field states.
 
-use matter::cells::{B, CELL_PER_SIZE, EMPTY, Grid, LEVELS, NODE, NONE, NO_BRICK, read_cells}
+use matter::cells::{B, CELL_PER_SIZE, EMPTY, Grid, LEVELS, NODE, NONE, NO_BRICK, ROOT, read_cells}
 use matter::substance::Substance
 use std::field::Field
 use std::gpu::GpuSpan
@@ -75,6 +75,13 @@ pub fn box_crossed(o: vec3, inv: vec3, lo: vec3, hi: vec3) -> vec2 {
     vec2(max(max(near.x, near.y), near.z), min(min(far.x, far.y), far.z))
 }
 
+/// How far `p` is inside the box `side` m a side from `lo`: its nearest face (0 outside). A box
+/// that holds no surface holds no matter nearer `p` than that.
+fn inside_by(p: vec3, lo: vec3, side: f32) -> f32 {
+    let a = min(p - lo, lo + vec3(side) - p)
+    max(min(a.x, min(a.y, a.z)), 0.0)
+}
+
 impl<M: Field<Substance>> Seen<M> {
     /// The answer at `p`, going along `d` (`along` false: no way, so an empty brick says only how
     /// far its middle says the surface is), asked `size` m finely; `by_cells`, by its cells. Into
@@ -87,18 +94,38 @@ impl<M: Field<Substance>> Seen<M> {
             let clear = length(max(outside, vec3(0.0))) + g.nudge.x
             return vec2(clear, clear)
         }
-        if !by_cells {
-            // A thing asked by its field: its value over its steepness, never past its surface.
-            let f = clamp(self.field.distance(p), -g.scope, g.scope) / g.steep
-            return vec2(f, f)
-        }
         let c = clamp(floor((p - g.lo) / g.brick), vec3(0.0), g.top)
         let r = u32(c.x) + g.size.x * (u32(c.y) + g.size.y * u32(c.z))
-        var node = self.roots[2 * r]
+        if !by_cells {
+            // A thing asked by its field. A root its field's range says holds nothing (its
+            // clearance over 0): across it and the roots round it that hold nothing either,
+            // unasked; matter is at least as far as their nearest face. Else its value over the
+            // most its gradient can be long in this root (derived; where that is unbounded, what
+            // std's shapes state: gap 16), never past its surface; a step goes no farther than
+            // the root's far side, where that bound ends.
+            let lo = g.lo + c * g.brick
+            let clear = self.roots[ROOT * r + 3]
+            if along && clear > 0 {
+                let e = f32(clear - 1) * g.brick
+                let s = box_crossed(p, inv, lo - vec3(e), lo + vec3(g.brick + e))
+                return vec2(s.y + g.nudge.x, inside_by(p, lo - vec3(e), g.brick + 2.0 * e))
+            }
+            let derived = bitcast_f32(self.roots[ROOT * r + 2])
+            let steep = if derived > 0.0 { max(derived, 1.0) } else { g.stated }
+            let f = clamp(self.field.distance(p), -g.scope, g.scope) / steep
+            if !along || f <= inside_by(p, lo, g.brick) {
+                return vec2(f, f)
+            }
+            let s = box_crossed(p, inv, lo, lo + vec3(g.brick))
+            return vec2(min(f, s.y + g.nudge.x), f)
+        }
+        var node = self.roots[ROOT * r]
         var lo = g.lo + c * g.brick
         var side = g.brick
-        var least = bitcast_f32(self.roots[2 * r + 1])
+        var least = bitcast_f32(self.roots[ROOT * r + 1])
         var empty = node == NO_BRICK
+        // (An empty root reaches as far round it as its clearance says nothing is.)
+        let reach = if empty { f32(max(self.roots[ROOT * r + 3], 1) - 1) * g.brick } else { 0.0 }
         var level: u32 = 0
         var leaf = false
         while level < LEVELS && !empty && !leaf && side / f32(B) > size * CELL_PER_SIZE {
@@ -124,13 +151,18 @@ impl<M: Field<Substance>> Seen<M> {
             // A brick that holds no surface: its middle's least distance less how far `p` is from
             // it, and, going along the ray, its far side.
             let off = length(p - (lo + vec3(0.5 * side)))
+            lo = lo - vec3(reach)
+            side = side + 2.0 * reach
             if least < 0.0 {
                 let inside = min(least + off, -1.0e-6)
                 return vec2(inside, inside)
             }
-            let lower = max(least - off, 0.0)
+            let lower = max(least - off, inside_by(p, lo, side))
             if !along {
-                return vec2(lower, lower)
+                // (Asked where matter is, with no way: a brick that holds no surface is never the
+                // one whose surface is here, so it says at least its own side: the sign stays,
+                // and a world's nearer thing is the one whose surface is here.)
+                return vec2(lower + side, lower + side)
             }
             let s = box_crossed(p, inv, lo, lo + vec3(side))
             return vec2(max(s.y + 0.01 * side, lower), lower)
@@ -144,7 +176,7 @@ impl<M: Field<Substance>> Seen<M> {
         let g = self.grid
         let c = clamp(floor((p - g.lo) / g.brick), vec3(0.0), g.top)
         let r = u32(c.x) + g.size.x * (u32(c.y) + g.size.y * u32(c.z))
-        var node = self.roots[2 * r]
+        var node = self.roots[ROOT * r]
         if node == NO_BRICK {
             return vec3(0.0)
         }

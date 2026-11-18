@@ -1,0 +1,271 @@
+// An instrument: how tight the compiler's derived ranges (`std::derive::interval`) are for a
+// field's value and its gradient over boxes near its surface, against what a field takes at
+// many points of each box; how long one takes on the CPU; and whether a kernel's equal the CPU's.
+// What slice 1c builds on (NOTES.md, "What interval can do").
+
+use matter::substance::Substance
+use std::collections::Vec
+use std::derive::{Box3, Interval, gradient, interval}
+use std::field::Field
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer_of, dispatch, read}
+use std::io::{Pending, print}
+use std::time::now
+
+/// Points on `field`'s surface: `n` from round its bound's middle, each pulled onto the surface
+/// by Newton's steps along its gradient.
+pub fn surface_points<M: Field<Substance>>(field: M, n: u32) -> Vec<vec3> {
+    let b = field.bound()
+    var out: Vec<vec3> = Vec::new()
+    var i: u32 = 0
+    let all = Box3 { lo: b.centre - vec3(0.7 * b.radius), hi: b.centre + vec3(0.7 * b.radius) }
+    while out.len() < n && i < 40 * n {
+        var p = all.sample(7, i)
+        i += 1
+        var k: u32 = 0
+        while k < 32 {
+            let (f, g) = field.sample(p)
+            let gg = max(dot(g, g), 1.0e-12)
+            p = p - g * (f / gg)
+            k += 1
+        }
+        if abs(field.distance(p)) < 1.0e-4 {
+            out.push(p)
+        }
+    }
+    out
+}
+
+/// The box `side` m a side round `p`.
+pub fn box_round(p: vec3, side: f32) -> Box3 {
+    Box3 { lo: p - vec3(0.5 * side), hi: p + vec3(0.5 * side) }
+}
+
+/// The most a gradient in `g` (each component's range) can be long.
+pub fn longest(g: Box3) -> f32 {
+    length(max(abs(g.lo), abs(g.hi)))
+}
+
+/// The value's range and the gradient's components' ranges over `b`, derived.
+pub fn ranges<M: Field<Substance>>(field: M, b: Box3) -> (Interval, Box3) {
+    let v = interval(|q: vec3| field.distance(q), b)
+    let g = interval(|q: vec3| gradient(|r: vec3| field.distance(r), q), b)
+    (v, g)
+}
+
+/// Each box's derived value range and longest gradient, in a kernel: four floats a box.
+@compute(64)
+fn ranged<M: Field<Substance>>(field: M, boxes: [vec4], side: f32, out: mut Slots<vec4>, id: GlobalId) {
+    if id.x >= boxes.len() {
+        return
+    }
+    let b = box_round(boxes[id.x].xyz, side)
+    let v = interval(|q: vec3| field.distance(q), b)
+    let g = interval(|q: vec3| gradient(|r: vec3| field.distance(r), q), b)
+    out[id] = vec4(v.lo, v.hi, longest(g), 0.0)
+}
+
+/// Said: for boxes `sides` round `n` points of `field`'s surface, the derived value range's width
+/// over the sampled range's (`samples` points a box), the derived longest gradient over the
+/// sampled longest, the CPU's time a box, and the largest difference between a kernel's ranges
+/// and the CPU's. `what` names the field.
+pub fn probe<M: Field<Substance>>(field: M, what: Text, n: u32, samples: u32) -> Vec<Pending<vec4>> {
+    let points = surface_points(field, n)
+    print(f"ranges: {what}: {points.len()} points on its surface")
+    var pending: Vec<Pending<vec4>> = Vec::new()
+    for side in [2.0, 0.5, 0.125, 0.03, 0.008] {
+        var wide = 0.0
+        var widest = 0.0
+        var steep = 0.0
+        var steepest = 0.0
+        var empty_wrong: u32 = 0
+        var loose_value: u32 = 0
+        var loose_steep: u32 = 0
+        let t0 = now()
+        var cpu: Vec<vec4> = Vec::new()
+        for p in points {
+            let b = box_round(p, side)
+            let (v, g) = ranges(field, b)
+            cpu.push(vec4(v.lo, v.hi, longest(g), 0.0))
+        }
+        let t1 = now()
+        var i: u32 = 0
+        for p in points {
+            let b = box_round(p, side)
+            var lo = 1.0e30
+            var hi = -1.0e30
+            var most = 0.0
+            for s in 0..samples {
+                let q = b.sample(11, s)
+                let (f, g) = field.sample(q)
+                lo = min(lo, f)
+                hi = max(hi, f)
+                most = max(most, length(g))
+            }
+            let c = cpu[i]
+            let r = (c.y - c.x) / max(hi - lo, 1.0e-9)
+            if r < 1.0e6 {
+                wide += r
+                widest = max(widest, r)
+            } else {
+                loose_value += 1
+            }
+            let gr = c.z / max(most, 1.0e-9)
+            if gr < 1.0e6 {
+                steep += gr
+                steepest = max(steepest, gr)
+            } else {
+                loose_steep += 1
+            }
+            if c.x > lo || c.y < hi {
+                empty_wrong += 1
+            }
+            i += 1
+        }
+        let k = f32(max(points.len(), 1))
+        let kv = max(k - f32(loose_value), 1.0)
+        let ks = max(k - f32(loose_steep), 1.0)
+        print(f"ranges: {what}: boxes {side} m: value range {wide / kv} times the sampled (most {widest}; {loose_value} unbounded); longest gradient {steep / ks} times the sampled (most {steepest}; {loose_steep} unbounded); {empty_wrong} boxes whose range misses a sample; CPU {(t1 - t0) * 1.0e6 / f64(k)} us a box")
+        var at: Vec<vec4> = Vec::new()
+        for p in points {
+            at.push(vec4(p, 0.0))
+        }
+        let boxes: GpuBuffer<vec4> = buffer_of(at)
+        var out: GpuBuffer<vec4> = buffer_of(Vec::filled(points.len(), vec4(0.0)))
+        dispatch(ranged.bind(field: field, boxes: boxes.items(), side: side, out: mut out), over: points.len())
+        pending.push(read(out.items()))
+        pending.push(read(buffer_of(cpu).items()))
+    }
+    pending
+}
+
+/// The kernel's ranges against the CPU's, as they come back: said once all are in.
+pub struct Heard {
+    pending: Vec<Pending<vec4>>,
+    got: Vec<Vec<vec4>>,
+    said: bool,
+}
+
+pub fn heard(pending: take Vec<Pending<vec4>>) -> Heard {
+    Heard { pending, got: Vec::new(), said: false }
+}
+
+impl Heard {
+    /// Whether every read is in (and, the first time, the kernel's against the CPU's said).
+    pub fn done(mut self, what: Text) -> bool {
+        if self.said {
+            return true
+        }
+        while self.got.len() < self.pending.len() {
+            let i = self.got.len()
+            match mut self.pending[i] {
+                p => match p.poll() {
+                    Some(Ok(v)) => self.got.push(take v),
+                    _ => return false,
+                },
+            }
+        }
+        var k: u32 = 0
+        var most = 0.0
+        var widest = 0.0
+        while k + 1 < self.got.len() {
+            for i in 0..self.got[k].len() {
+                let g = self.got[k][i]
+                let c = self.got[k + 1][i]
+                most = max(most, max(abs(g.x - c.x), abs(g.y - c.y)))
+                widest = max(widest, abs(g.z - c.z) / max(c.z, 1.0e-9))
+            }
+            k += 2
+        }
+        print(f"ranges: {what}: a kernel's value ranges differ from the CPU's by at most {most} m, its longest gradients by {widest} of the CPU's")
+        self.said = true
+        true
+    }
+}
+
+/// Where `field`'s matter can be, derived (no bound an author states): a box, from boxes over
+/// all the space a world holds (`WORLD` m each way) halved where the derived range of the value
+/// holds 0, until a box is an eighth of what is found so far, every box whose range is 0 or
+/// below kept. As `vec4(centre, radius)`, the radius the box's widest half; the radius under 0
+/// where the search can't close: a box whose range is not a number, or ranges so loose over large
+/// boxes that what is found holds over a quarter of the space searched (the creature's: its round
+/// cones' ranges reach below 0 hundreds of metres away, gap 18).
+pub fn derived_bound<M: Field<Substance>>(field: M) -> vec4 {
+    var boxes: Vec<Box3> = Vec::new()
+    boxes.push(Box3 { lo: vec3(-WORLD), hi: vec3(WORLD) })
+    // Boxes left whole (done), and the extent of everything found at the last level.
+    var lo = vec3(1.0e30)
+    var hi = vec3(-1.0e30)
+    var found = 2.0 * WORLD
+    var level: u32 = 0
+    while boxes.len() > 0 && level < 24 {
+        var next: Vec<Box3> = Vec::new()
+        var all_lo = lo
+        var all_hi = hi
+        for b in boxes {
+            let v = interval(|q: vec3| field.distance(q), b)
+            if !(abs(v.lo) < 1.0e38 && abs(v.hi) < 1.0e38) {
+                // Not a number (or past every number): nothing sound can be said from it.
+                return vec4(0.0, 0.0, 0.0, -1.0)
+            }
+            if v.lo > 0.0 {
+                continue
+            }
+            all_lo = min(all_lo, b.lo)
+            all_hi = max(all_hi, b.hi)
+            if v.hi >= 0.0 && b.hi.x - b.lo.x > 0.125 * found && next.len() + 8 <= SPLIT_MOST {
+                for c in b.split() {
+                    next.push(c)
+                }
+            } else {
+                lo = min(lo, b.lo)
+                hi = max(hi, b.hi)
+            }
+        }
+        found = max(max(all_hi.x - all_lo.x, all_hi.y - all_lo.y), all_hi.z - all_lo.z)
+        boxes = take next
+        level += 1
+    }
+    for b in boxes {
+        lo = min(lo, b.lo)
+        hi = max(hi, b.hi)
+    }
+    if hi.x < lo.x {
+        return vec4(0.0, 0.0, 0.0, 0.0)
+    }
+    let r = 0.5 * max(max(hi.x - lo.x, hi.y - lo.y), hi.z - lo.z)
+    if r > 0.25 * WORLD {
+        return vec4(0.0, 0.0, 0.0, -1.0)
+    }
+    vec4(0.5 * (lo + hi), r)
+}
+
+/// How far each way from the origin a world's matter may be (m), and the most boxes halved a level.
+const WORLD: f32 = 1024.0
+const SPLIT_MOST: u32 = 4096
+
+// ---- STAND-IN, the one place: what std's own shapes state, where the toolchain's ranges can't
+// say yet. Gap 18 (a range over a huge box is not a number: a body's bound does not derive) and
+// gap 16 (a gradient's range is unbounded wherever a length meets 0: a body's steepness does not
+// derive over a box wider than its limbs). When both close, this block goes, and every bound and
+// steepness the engine uses is derived. Nothing else in the engine reads `Surface::bound` or
+// `Surface::lipschitz` (the reference's `Matter` aside: an instrument, which asks the author's
+// matter as it stands). An author's own surface that states a number by hand (the stack's 3.5,
+// "not proved") is read here only where its derived range is unbounded, which the stack's never
+// is (its roots' derived steepness is finite: wrela-notes/engine/NOTES.md, slice 1c A1).
+
+/// Where `field`'s matter can be: derived where the search closes (`derived_bound`), else the
+/// sphere std's shapes compose (`Surface::bound`); and whether it was derived.
+pub fn bound_of<M: Field<Substance>>(field: M) -> (vec4, bool) {
+    let d = derived_bound(field)
+    if d.w > 0.0 {
+        return (d, true)
+    }
+    let b = field.bound()
+    (vec4(b.centre, b.radius), false)
+}
+
+/// The steepness std's shapes compose for `field` within `near` of its surface
+/// (`Surface::lipschitz`): what a root whose derived gradient is unbounded is stepped by.
+pub fn stated_steepness<M: Field<Substance>>(field: M, near: f32) -> f32 {
+    max(field.lipschitz(near), 1.0)
+}
