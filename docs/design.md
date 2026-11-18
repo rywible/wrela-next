@@ -86,6 +86,38 @@ The author stops and files the gap: "I needed this, for that." They do not work 
 filed is the engine's next piece of work; a workaround is a special case nobody can see. This has
 to be the easy path, so the author's tools must make filing a gap one step.
 
+## What it must run on
+
+The game ships on Steam, so the bar is what most Steam players have. In October 2026 that was an
+RTX 3060 class card, 16 GB of memory and a 1080p screen (citations.md). The aim is to win on
+quality and at least match comparable games on speed.
+
+| Tier | Hardware | What it must hold |
+| --- | --- | --- |
+| **The bar** | RTX 3060 class | 1080p at 60 frames a second, full quality |
+| **Stretch** | the same card | 1440p at 60, upscaled from a lower rate |
+| **Must run** | Steam Deck or a laptop chip | 30 to 40 frames a second, upscaled from a lower rate |
+
+A tier is a budget the engine fits itself to (how finely it samples, how much light it asks for
+a frame, what rate it draws at before upscaling). It is never something an author tunes.
+
+**How it is measured, with the machines there are.** Nobody here owns the bar's card yet.
+
+- **The M4 Air is where absolute numbers are held.** It is weaker than the bar's card (by two to
+  three times, an estimate, not a measurement), so the working line is the bar's own target on
+  the weaker machine: **1080p at 60 frames a second on the M4 Air**. What holds there holds on
+  the bar's card with room, if the estimate is right. It has no fan: a number is taken after the
+  machine has warmed, with the load beside the frame that keeps its clock up, and a long run
+  that slows is reported as such.
+- **The Radeon laptop chip is for Vulkan, and for deltas.** It proves the Vulkan path draws the
+  same picture, and a change is held to its own number before the change there, not to a line.
+  Its absolute times are not a bar. (The two machines do not move together: one frame that cost
+  twice another on the M4 tied it on the Radeon. So a delta there is evidence about that change
+  on that machine, and no more.)
+- **Not measured by either:** the bar's card itself, and whether the must-run tier holds on a
+  Steam Deck. The M4 is stronger than a Deck, so it does not show that. A Windows machine with
+  the bar's card is wanted, and every number in this document is provisional until it exists.
+
 ## The layers
 
 Dependencies point down. Nothing below knows anything above.

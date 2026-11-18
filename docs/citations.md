@@ -183,3 +183,9 @@ made up; `table`'s 57 joints are made-up points.
 The image fixtures in `toolchain/tests/images` are four flat colours that Claude made. The PNG and
 zlib fixtures in `toolchain/tests/png` are generated patterns that Claude made with Python's
 `zlib` and Pillow (HPND), and Pillow's decoder checked the 8-bit ones.
+
+## What the game is aimed at
+
+| Source | Rights | How and why we use it |
+|---|---|---|
+| Valve's [Steam Hardware & Software Survey](https://store.steampowered.com/hwsurvey/), October 2026, as reported by [Windows Report](https://windowsreport.com/?p=1514336), [Guru3D](https://www.guru3d.com/story/steam-hardware-survey-october-2026-16-gb-ram-regains-lead-over-32-gb/) and [DLCompare](https://www.dlcompare.com/gaming-news/rtx-5070-loses-its-lead-as-rtx-3060-makes-a-stunning-steam-survey-comeback-87806): the RTX 3060 at or tied for the most common card (3.6 to 3.8% of systems), 16 GB the most common memory (41%), 1080p the most common screen (about half, by the August figure) | Published figures, read second-hand; Valve's own page was not read | `docs/design.md`, "What it must run on": the bar is the most common Steam hardware. The ratio of that card to the M4 Air there is our own estimate, not from these |
