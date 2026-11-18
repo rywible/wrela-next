@@ -29,7 +29,7 @@ use picture::picture::Picture
 use picture::screen::{cover, luma}
 use reference::traced::{ends, entered, lit}
 use std::field::{Field, hash_u32}
-use std::gpu::{FragCoord, Rgba16Float, Rgba32Float, Targets2, Texture, begin_pass, begin_pass2, draw, label, texture}
+use std::gpu::{FragCoord, Rgba16Float, Rgba32Float, Targets2, Targets3, Texture, begin_pass, begin_pass2, begin_pass3, draw, label, texture}
 use std::io::print
 
 /// About how many pixels a pass draws (whole rows of the screen: at least one). At 3 µs a
@@ -73,7 +73,8 @@ fn dice(x: u32, y: u32, look: u32, salt: u32) -> u32 {
 /// One look of the reference at a pixel, added to the looks before it (`met_sofar`,
 /// `matter_sofar`; none where `first`): into the first target, the look's colour (toned) and 1 if
 /// its ray met matter; into the second, its colour again only if it met matter (what matter alone
-/// shows, summed), and the square of its brightness (linear luma).
+/// shows, summed), and the square of its brightness (linear luma); into the third, how far along
+/// its ray it met matter, and that squared.
 @fragment
 pub fn looked<M: Field<Substance>, S: Sky, L: Look>(
     pixel: FragCoord,
@@ -88,11 +89,13 @@ pub fn looked<M: Field<Substance>, S: Sky, L: Look>(
     first: u32,
     met_sofar: Texture<Rgba32Float>,
     matter_sofar: Texture<Rgba32Float>,
-) -> Targets2<vec4, vec4> {
+    far_sofar: Texture<Rgba32Float>,
+) -> Targets3<vec4, vec4, vec4> {
     let x = u32(pixel.position.x)
     let y = u32(pixel.position.y)
     let a = if first != 0 { vec4(0.0) } else { met_sofar.load(x, y) }
     let b = if first != 0 { vec4(0.0) } else { matter_sofar.load(x, y) }
+    let f = if first != 0 { vec4(0.0) } else { far_sofar.load(x, y) }
     let d = view.ray(pixel.position.xy)
     let span = m.span(view.at, d)
     var t = -1.0
@@ -101,7 +104,7 @@ pub fn looked<M: Field<Substance>, S: Sky, L: Look>(
     }
     if t < 0.0 {
         let c = look.tone(Seen { light: seen(sky, d) })
-        return Targets2 { first: a + vec4(c, 0.0), second: b }
+        return Targets3 { first: a + vec4(c, 0.0), second: b, third: f }
     }
     let p = view.at + d * t
     let n = m.facing(p, -d)
@@ -109,7 +112,7 @@ pub fn looked<M: Field<Substance>, S: Sky, L: Look>(
     let light = lit(m, sky, p, n, s, -d, dice(x, y, index, salt), rays, bounces)
     let c = look.tone(Seen { light })
     let l = luma(c)
-    Targets2 { first: a + vec4(c, 1.0), second: b + vec4(c, l * l) }
+    Targets3 { first: a + vec4(c, 1.0), second: b + vec4(c, l * l), third: f + vec4(t, t * t, 0.0, 0.0) }
 }
 
 /// The pixel's middle ray alone: into the first target, which way the matter it meets faces and
@@ -134,30 +137,36 @@ pub fn centred<M: Field<Substance>, S: Sky, L: Look>(pixel: FragCoord, view: Vie
 /// The looks summed, as means: which halves (`which`: 0 both, 1 the first, 2 the second), each of
 /// `looks` looks. Into the first target, the mean colour and the share of looks that met matter
 /// (its coverage); into the second, the mean colour of the looks that met matter, and how far
-/// their brightness spreads.
+/// their brightness spreads; into the third, how far along their rays they met it (mean, m) and
+/// how far that spreads (its deviation over its mean).
 @fragment
 pub fn settled(
     pixel: FragCoord,
     met_a: Texture<Rgba32Float>,
     matter_a: Texture<Rgba32Float>,
+    far_a: Texture<Rgba32Float>,
     met_b: Texture<Rgba32Float>,
     matter_b: Texture<Rgba32Float>,
+    far_b: Texture<Rgba32Float>,
     which: u32,
     looks: f32,
-) -> Targets2<vec4, vec4> {
+) -> Targets3<vec4, vec4, vec4> {
     let x = u32(pixel.position.x)
     let y = u32(pixel.position.y)
     var met = vec4(0.0)
     var matter = vec4(0.0)
+    var far = vec4(0.0)
     var n = 0.0
     if which != 2 {
         met += met_a.load(x, y)
         matter += matter_a.load(x, y)
+        far += far_a.load(x, y)
         n += looks
     }
     if which != 1 {
         met += met_b.load(x, y)
         matter += matter_b.load(x, y)
+        far += far_b.load(x, y)
         n += looks
     }
     // How far the looks that met matter spread in brightness (their linear luma's deviation):
@@ -166,7 +175,11 @@ pub fn settled(
     let m = matter.xyz / count
     let l = luma(m)
     let spread = sqrt(max(matter.w / count - l * l, 0.0))
-    Targets2 { first: vec4(met.xyz / n, met.w / n), second: vec4(m, spread) }
+    // How far along the rays the looks that met matter met it, and how far that spreads over the
+    // mean: wide where a pixel holds matter in front of other matter (an inner edge).
+    let t = far.x / count
+    let t_spread = sqrt(max(far.y / count - t * t, 0.0)) / max(t, 1.0e-9)
+    Targets3 { first: vec4(met.xyz / n, met.w / n), second: vec4(m, spread), third: vec4(t, t_spread, 0.0, 0.0) }
 }
 
 /// A reference's means as a picture's colour (linear, in half floats, as a picture gives it).
@@ -182,6 +195,8 @@ pub struct Half {
     matter_even: Texture<Rgba32Float>,
     met_odd: Texture<Rgba32Float>,
     matter_odd: Texture<Rgba32Float>,
+    far_even: Texture<Rgba32Float>,
+    far_odd: Texture<Rgba32Float>,
     /// Looks whole.
     looks: u32,
 }
@@ -192,6 +207,8 @@ fn half(width: u32, height: u32) -> Half {
         matter_even: texture(width: width, height: height),
         met_odd: texture(width: width, height: height),
         matter_odd: texture(width: width, height: height),
+        far_even: texture(width: width, height: height),
+        far_odd: texture(width: width, height: height),
         looks: 0,
     }
 }
@@ -203,6 +220,9 @@ pub struct Truth {
     /// The mean colour of its looks that met matter, and how far their brightness (linear luma)
     /// spreads about its mean.
     pub matter: Texture<Rgba32Float>,
+    /// How far along their rays its looks that met matter met it (mean, m), and how far that
+    /// spreads (its deviation over its mean: wide at an inner edge, matter before matter).
+    pub far: Texture<Rgba32Float>,
     /// Its middle ray's: which way the matter it meets faces, and how far along it (0: none).
     pub centre: Texture<Rgba32Float>,
     /// The sky along its middle ray, as the look shows it.
@@ -270,7 +290,7 @@ fn band_of<M: Field<Substance>, S: Sky, L: Look>(
 ) {
     let first: u32 = if h.looks == 0 { 1 } else { 0 }
     if h.looks % 2 == 0 {
-        let p = begin_pass2(mut h.met_even, mut h.matter_even, keep: true)
+        let p = begin_pass3(mut h.met_even, mut h.matter_even, mut h.far_even, keep: true)
         p.scissor(0, y, width, rows)
         draw(
             p,
@@ -287,12 +307,13 @@ fn band_of<M: Field<Substance>, S: Sky, L: Look>(
                 first: first,
                 met_sofar: h.met_odd,
                 matter_sofar: h.matter_odd,
+                far_sofar: h.far_odd,
             ),
             vertices: 3,
         )
         p.end()
     } else {
-        let p = begin_pass2(mut h.met_odd, mut h.matter_odd, keep: true)
+        let p = begin_pass3(mut h.met_odd, mut h.matter_odd, mut h.far_odd, keep: true)
         p.scissor(0, y, width, rows)
         draw(
             p,
@@ -309,6 +330,7 @@ fn band_of<M: Field<Substance>, S: Sky, L: Look>(
                 first: first,
                 met_sofar: h.met_even,
                 matter_sofar: h.matter_even,
+                far_sofar: h.far_even,
             ),
             vertices: 3,
         )
@@ -423,20 +445,23 @@ impl Reference {
         if truth.mean.width() != self.width || truth.mean.height() != self.height {
             truth.mean = texture(width: self.width, height: self.height)
             truth.matter = texture(width: self.width, height: self.height)
+            truth.far = texture(width: self.width, height: self.height)
             truth.centre = texture(width: self.width, height: self.height)
             truth.behind = texture(width: self.width, height: self.height)
         }
         label("reference settled")
         // (Each half's looks are even, so the last of them wrote its odd pair.)
-        let p = begin_pass2(mut truth.mean, mut truth.matter)
+        let p = begin_pass3(mut truth.mean, mut truth.matter, mut truth.far)
         draw(
             p,
             cover,
             settled.bind(
                 met_a: self.first.met_odd,
                 matter_a: self.first.matter_odd,
+                far_a: self.first.far_odd,
                 met_b: self.second.met_odd,
                 matter_b: self.second.matter_odd,
+                far_b: self.second.far_odd,
                 which: which,
                 looks: f32(self.looks),
             ),
@@ -473,6 +498,7 @@ pub fn truth() -> Truth {
     Truth {
         mean: texture(width: 1, height: 1),
         matter: texture(width: 1, height: 1),
+        far: texture(width: 1, height: 1),
         centre: texture(width: 1, height: 1),
         behind: texture(width: 1, height: 1),
         looks: 0,

@@ -28,7 +28,9 @@
 //   in pixels;
 // - lit: pixels over 8/255 from the reference's mean, over all pixels and over pixels matter
 //   covers wholly (where only the light can be wrong);
-// - edge pixels (the reference covers them in part): their error against the many-look mean;
+// - edge pixels (the reference covers them in part, or covers them wholly with matter at
+//   different distances: an inner edge, a creature before the ground): their error against the
+//   many-look mean;
 // - crawl: pixels whose brightness steps over 15/255 from one moment to the next, the picture's
 //   and the reference's, on edge pixels and on all (the reference crawls a little itself).
 
@@ -48,11 +50,15 @@ use std::io::{Pending, print}
 pub const UNDECIDED: f32 = 16.0
 
 /// A pixel is an edge pixel where the reference covers it more than this and less than all but
-/// this.
+/// this (an outline's), or where it covers it wholly but how far its looks met matter spreads
+/// over this share of how far (an inner edge: matter before other matter, a creature against
+/// the ground behind it; a surface seen edge on spreads about a pixel's angle over its cosine,
+/// under a hundredth here).
 pub const EDGE: f32 = 0.02
+pub const INNER: f32 = 0.02
 
 /// How many numbers `judged` counts.
-pub const COUNTS: u32 = 33
+pub const COUNTS: u32 = 34
 
 /// The greatest of the three channels' difference between two linear colours, as the screen
 /// shows them (of 255).
@@ -201,7 +207,7 @@ pub fn marks(picture: Picture, truth: Truth, out: mut Picture) {
 ///    9 pixels matter covers wholly            10 of them, over 8/255
 ///   11 of them, the difference summed (16ths of 255)
 ///   12 all pixels over 8/255                 13 all, the difference summed (16ths of 255)
-///   14 edge pixels                            15 their difference summed (16ths of 255)
+///   14 edge pixels (an outline's or an inner one) 15 their difference summed (16ths of 255)
 ///   16 edge pixels over 8/255
 ///   17 pixels both place a surface at         18..23 apart under 0.05 px, 0.1, 0.25, 0.5, 1, over
 ///   24 apart summed, each at most 4 px (256ths of a px)    25 apart at the most (thousandths)
@@ -209,6 +215,7 @@ pub fn marks(picture: Picture, truth: Truth, out: mut Picture) {
 ///   28 the reference's there                  29 pixels judged for steps
 ///   30 the picture's steps over 15/255        31 the reference's
 ///   32 pixels whose middle ray the reference couldn't follow (it ran out of steps)
+///   33 of the edge pixels (14), those at an inner edge (matter before matter)
 @compute(8, 8)
 pub fn judged(
     colour: Texture<Rgba16Float>,
@@ -216,10 +223,12 @@ pub fn judged(
     placed: u32,
     mean: Texture<Rgba32Float>,
     matter: Texture<Rgba32Float>,
+    far: Texture<Rgba32Float>,
     centre: Texture<Rgba32Float>,
     behind: Texture<Rgba32Float>,
     last_colour: Texture<Rgba16Float>,
     last_mean: Texture<Rgba32Float>,
+    last_far: Texture<Rgba32Float>,
     moving: u32,
     v: View,
     first: u32,
@@ -281,7 +290,13 @@ pub fn judged(
         let _ = out.add(i: 12, value: 1)
     }
     let _ = out.add(i: 13, value: u32(most * 16.0 + 0.5))
-    let edge = c_ref > EDGE && c_ref < 1.0 - EDGE
+    let rf = far.load(x, y)
+    let outline_edge = c_ref > EDGE && c_ref < 1.0 - EDGE
+    let inner_edge = c_ref >= 1.0 - EDGE && rf.y > INNER
+    let edge = outline_edge || inner_edge
+    if inner_edge {
+        let _ = out.add(i: 33, value: 1)
+    }
     if edge {
         let _ = out.add(i: 14, value: 1)
         let _ = out.add(i: 15, value: u32(most * 16.0 + 0.5))
@@ -317,7 +332,8 @@ pub fn judged(
     // Crawl.
     if moving != 0 {
         let lm = last_mean.load(x, y)
-        let was_edge = edge || (lm.w > EDGE && lm.w < 1.0 - EDGE)
+        let lf = last_far.load(x, y)
+        let was_edge = edge || (lm.w > EDGE && lm.w < 1.0 - EDGE) || (lm.w >= 1.0 - EDGE && lf.y > INNER)
         let stepped = abs(luma(encoded(p)) - luma(encoded(last_colour.load(x, y).xyz))) * 255.0 > 15.0
         let ref_stepped = abs(luma(encoded(r.xyz)) - luma(encoded(lm.xyz))) * 255.0 > 15.0
         let _ = out.add(i: 29, value: 1)
@@ -407,6 +423,7 @@ struct Asked {
 pub struct Judge {
     last_colour: Texture<Rgba16Float>,
     last_mean: Texture<Rgba32Float>,
+    last_far: Texture<Rgba32Float>,
     /// Whether `last_colour` and `last_mean` hold a moment.
     moving: bool,
     asked: Vec<Asked>,
@@ -414,7 +431,7 @@ pub struct Judge {
 }
 
 pub fn judge() -> Judge {
-    Judge { last_colour: texture(width: 1, height: 1), last_mean: texture(width: 1, height: 1), moving: false, asked: Vec::new(), numbers: 0 }
+    Judge { last_colour: texture(width: 1, height: 1), last_mean: texture(width: 1, height: 1), last_far: texture(width: 1, height: 1), moving: false, asked: Vec::new(), numbers: 0 }
 }
 
 /// `n` of `of`, in parts of a hundred.
@@ -435,7 +452,7 @@ fn say(n: u32, v: Vec<u32>, crawl: bool) {
         f"judge {n}: lit: over 8/255 {share(v[12], v[0])}% of all px (mean {f32(v[13]) / 16.0 / max(f32(v[0]), 1.0)}/255); where matter covers wholly ({v[9]} px) {share(v[10], v[9])}% (mean {f32(v[11]) / 16.0 / max(f32(v[9]), 1.0)}/255)",
     )
     print(
-        f"judge {n}: edges: {v[14]} edge px, against the many-look mean {f32(v[15]) / 16.0 / max(f32(v[14]), 1.0)}/255 a pixel, {share(v[16], v[14])}% over 8/255",
+        f"judge {n}: edges: {v[14]} edge px ({v[33]} of them inner), against the many-look mean {f32(v[15]) / 16.0 / max(f32(v[14]), 1.0)}/255 a pixel, {share(v[16], v[14])}% over 8/255",
     )
     let both = v[17]
     if both > 0 {
@@ -475,10 +492,12 @@ impl Judge {
                     placed: if picture.placed { 1 } else { 0 },
                     mean: truth.mean,
                     matter: truth.matter,
+                    far: truth.far,
                     centre: truth.centre,
                     behind: truth.behind,
                     last_colour: self.last_colour,
                     last_mean: self.last_mean,
+                    last_far: self.last_far,
                     moving: moving,
                     v: v,
                     first: first,
@@ -493,6 +512,7 @@ impl Judge {
             if self.last_colour.width() != w || self.last_colour.height() != h {
                 self.last_colour = texture(width: w, height: h)
                 self.last_mean = texture(width: w, height: h)
+                self.last_far = texture(width: w, height: h)
             }
             let p = begin_pass(mut self.last_colour)
             draw(p, cover, kept_colour.bind(a: picture.colour), vertices: 3)
@@ -500,6 +520,9 @@ impl Judge {
             let q = begin_pass(mut self.last_mean)
             draw(q, cover, kept_mean.bind(a: truth.mean), vertices: 3)
             q.end()
+            let r = begin_pass(mut self.last_far)
+            draw(r, cover, kept_mean.bind(a: truth.far), vertices: 3)
+            r.end()
             self.moving = true
         }
         n
