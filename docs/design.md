@@ -40,6 +40,8 @@ made of. The engine decides how to see it.
   hiding it would obscure more than it would simplify.
 - **The look owns tone, alone.** A substance says how matter answers light, physically. Only the
   look says how light becomes a tone on the screen. Style enters nowhere else.
+- **The sky owns all light from where there is no matter**, below the horizon as above it. **The
+  eye's field of view is the author's.**
 - **Matter never sees how it is viewed.** It may depend on a point, on time and on the game's
   state, and on nothing else: not the eye, not the screen, not the frame. Only the look sees
   light, and nothing in the game sees a pixel. Almost every workaround needs to know how a thing
@@ -131,6 +133,8 @@ lib/
     ray/          what does this ray meet
     light/        what light arrives here
     picture/      this world, this eye, this look -> an image, within a budget
+    reference/    the same questions answered by brute force: what every fast answer is held to
+    judge/        holds a picture to the reference, in numbers
   kit/            the shared library. Fields only
     shapes/       ways to write where matter is: a height, a tube, parts on bones, a base and its detail
     substances/   what matter is made of: stone, water, glass, flesh, flame
@@ -142,6 +146,9 @@ game/
   rules/          its moves, and later its spells
   scenes/         what is put before an eye
 ```
+
+The game's packages depend in the order world, look, rules, scenes. A folder of the engine exists
+once it holds something (`ray/` and `light/` come with their slices).
 
 Three rules keep it honest, and each is to be checked by the build, not by eye (the third by a
 check that no name in the engine's interfaces is a noun of the game):
@@ -187,6 +194,11 @@ web of flesh, and put a halo beside outlines, each fixed separately because no m
 
 **ray is one function.** The eye, a shadow, the sky's light, light that bounces, and "what is
 behind this" are that one call from another place in another direction.
+
+**The reference and the judges are the engine's instruments**, beside the four modules and
+below nothing: they ask the author's matter directly, so they check the engine and not a copy of
+it. A pixel is the mean of what the look shows over the pixel (toned colour, not light): the
+reference averages that, and the picture is held to the same.
 
 **picture hands the look everything it needs.** A look written plainly must come out smooth. In
 the spike every tone's edge stepped from pixel to pixel until the pixel program was told how the
