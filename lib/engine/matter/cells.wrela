@@ -21,20 +21,17 @@
 // is not built: `CELL_PX` pixels' footprint at the thing's middle, as the eye sees it when the
 // thing is first deposited, one size for the whole thing.
 //
-// How the engine chooses field or cells: it measures. Once per thing, it dispatches a kernel
-// asking the thing's field along short lines through its bound (as a ray steps) and one asking
-// cells the same way, each timed (`std::gpu::timed`), and asks the field where an ask of it costs
-// no more than `ASK_RATIO` asks of cells (`Choice`). The compiler counts each entry point's work
-// (the build manifest's `work`), but a program can't read its manifest; the timing is the
-// engine's own measure, said in the log.
+// How the engine chooses field or cells is the picture's (`picture::pixels`): a thing is asked by
+// its field first, and the picture tries it by its cells and keeps whichever made the frame
+// cheaper. Here, a thing is asked as it is told (`Kept::ask_by`).
 
 use matter::substance::Substance
 use picture::eye::View
 use std::collections::Vec
-use std::field::{Field, hash_u32}
+use std::field::Field
 use std::gpu::{
-    Append, AppendBuffer, Atomics, GlobalId, GpuBuffer, Rg32Uint, Rgba16Float, Sampler, Slots, Texels3d, Texture3d,
-    append_buffer, buffer, dispatch, label, read, texture3d, timed,
+    Append, AppendBuffer, Atomics, GlobalId, GpuBuffer, Rg32Uint, Rgba16Float, Texels3d, Texture3d, append_buffer, buffer,
+    dispatch, label, read, texture3d,
 }
 use std::io::{Pending, print}
 
@@ -64,12 +61,6 @@ const KEEP: f32 = 0.9
 
 /// How far past a brick's side a ray that leaves an empty brick lands (of a brick).
 const NUDGE: f32 = 0.01
-
-/// An ask of the field is chosen where it costs no more than this many asks of cells. (One rule
-/// for still and moving things: a moving thing's deposit asks its field once a texel every
-/// frame, which for the creature in the first scene is about 70,000 asks against the million or
-/// so its pixels make; a second threshold for movers flipped the creature's choice between runs.)
-pub const ASK_RATIO: f32 = 4.0
 
 /// The most bricks a thing that keeps still keeps, and one that moves. A moving thing's deposit is
 /// one dispatch over its whole atlas (a kernel stores only its own texel, so it can't be cut in
@@ -242,46 +233,6 @@ fn pulled<M: Field<Substance>>(field: M, g: Grid, bricks: [u32], coarse: [u32], 
     out.store(id, sampled(field, p, 0.25 * g.cell))
 }
 
-/// What an ask costs, measured: each invocation asks along a short line through the sphere
-/// `held` (16 asks, a 50th of its radius apart: as a ray steps), the field's distance each time.
-@compute(64)
-fn field_cost<M: Field<Substance>>(field: M, held: vec4, out: mut Slots<f32>, id: GlobalId) {
-    let h = hash_u32(id.x * 3 + 1)
-    let a = vec3(f32(h & 1023), f32((h >> 10) & 1023), f32((h >> 20) & 1023)) / 1023.0 * 2.0 - vec3(1.0)
-    let way = normalize(vec3(f32(hash_u32(h) & 255) - 127.5, f32(hash_u32(h + 7) & 255) - 127.5, f32(hash_u32(h + 13) & 255) - 127.5) + vec3(0.001))
-    let o = held.xyz + a * (0.6 * held.w)
-    var sum = 0.0
-    var k: u32 = 0
-    while k < 16 {
-        sum += field.distance(o + way * (f32(k) * 0.02 * held.w))
-        k += 1
-    }
-    out[id] = sum
-}
-
-/// The same asked of cells, as a ray steps through them: a coarse grid's texel and a filtered
-/// atlas read each, the 64 invocations of a group starting a texel apart (as neighbouring pixels'
-/// rays do) and each stepping half a texel, `CELL_ASKS` times (an ask of cells is cheap: fewer
-/// would time the dispatch's start, not the asks, and the measure would swing eightfold).
-@compute(64)
-fn cells_cost(coarse: Texture3d<Rg32Uint>, atlas: Texture3d<Rgba16Float>, s: Sampler, out: mut Slots<f32>, id: GlobalId) {
-    let h = hash_u32(id.x / 64 + 1)
-    let size = vec3(f32(atlas.width()), f32(atlas.height()), f32(atlas.depth()))
-    let base = vec3(f32(h & 1023), f32((h >> 10) & 1023), f32((h >> 20) & 1023)) / 1023.0 * (size - vec3(40.0))
-    let lane = vec3(f32(id.x % 8), f32((id.x / 8) % 8), 0.0)
-    let way = normalize(vec3(f32(hash_u32(h) & 255) - 127.5, f32(hash_u32(h + 7) & 255) - 127.5, f32(hash_u32(h + 13) & 255) - 127.5) + vec3(0.001))
-    let csize = vec3(f32(coarse.width()), f32(coarse.height()), f32(coarse.depth()))
-    var sum = 0.0
-    var k: u32 = 0
-    while k < CELL_ASKS {
-        let q = clamp(base + lane + way * (0.5 * f32(k % 64)), vec3(0.0), size - vec3(1.0))
-        let c = coarse.load(u32(q.x / size.x * csize.x), u32(q.y / size.y * csize.y), u32(q.z / size.z * csize.z))
-        sum += atlas.sample_level(s, (q + vec3(0.5)) / size, 0.0).x + f32(c.x & 1)
-        k += 1
-    }
-    out[id] = sum
-}
-
 /// What asks a thing, said.
 fn by(asks: u32) -> Text {
     if asks == ASKS_CELLS { "cells" } else { "field" }
@@ -290,11 +241,6 @@ fn by(asks: u32) -> Text {
 fn held(asks: u32) -> Text {
     if asks != 0 { " (held so, to measure)" } else { "" }
 }
-
-/// How many invocations a cost kernel runs, each asking 16 times (the field) or `CELL_ASKS`
-/// times (cells).
-const COST_ASKS: u32 = 65536
-const CELL_ASKS: u32 = 256
 
 /// One thing's cells, and where its deposit stands.
 pub struct Kept {
@@ -311,10 +257,8 @@ pub struct Kept {
     cursor: u32,
     /// Its field's answers at its probes last frame (none yet: empty).
     probes: Vec<f32>,
-    /// How it is asked (0: not yet chosen), and, measured, an ask of its field and of cells (ns).
+    /// How it is asked (`ASKS_FIELD` until the picture has tried it by its cells).
     pub asks: u32,
-    pub cost: f32,
-    pub cells_cost: f32,
     /// Whether it has been seen to move.
     pub moving: bool,
     /// What the engine was told to use in place of its own choices, to measure them (0: none).
@@ -335,9 +279,7 @@ pub fn kept() -> Kept {
         stage: 0,
         cursor: 0,
         probes: Vec::new(),
-        asks: 0,
-        cost: 0.0,
-        cells_cost: 0.0,
+        asks: ASKS_FIELD,
         moving: false,
         held_asks: 0,
         held_cell: 0.0,
@@ -365,9 +307,20 @@ impl Kept {
         self.stage >= 4
     }
 
-    /// Whether it waits to be told how it is asked.
-    pub fn undecided(self) -> bool {
-        self.asks == 0
+    /// From now asked by its field (`ASKS_FIELD`) or by its cells (`ASKS_CELLS`), its cells
+    /// deposited again if that changes what they must hold.
+    pub fn ask_by(mut self, asks: u32) {
+        if asks != self.asks {
+            self.asks = asks
+            self.stage = 0
+            if asks == ASKS_FIELD {
+                // (Its cells let go.)
+                self.atlas = texture3d(width: 1, height: 1, depth: 1)
+                self.fine = buffer(2)
+                self.raw = buffer(2)
+                self.bricks = append_buffer(1)
+            }
+        }
     }
 
     /// Its grid laid over `field`'s bound, its cells sized as `v` sees it (or as held): how many
@@ -419,8 +372,8 @@ impl Kept {
             }
         }
         self.probes = take now
-        if self.asks == 0 {
-            return
+        if self.held_asks != 0 {
+            self.asks = self.held_asks
         }
         self.grid.asks = self.asks
         if self.asks == ASKS_FIELD {
@@ -434,6 +387,10 @@ impl Kept {
                 self.laid(field, v, fixed: true)
             }
             return
+        }
+        if self.moving && self.stage != 5 && self.stage != 0 && self.stage < 4 {
+            // (It started to move while its still deposit was under way: begun again whole.)
+            self.stage = 0
         }
         if self.moving {
             self.moved(field, v)
@@ -519,6 +476,7 @@ impl Kept {
     /// coarse grid asked again, and (asked by its cells) every texel of its atlas pulled again.
     fn moved<M: Field<Substance>>(mut self, field: M, v: View) {
         if self.stage != 5 {
+            self.cursor = 0
             // (Its grid sized once, as the eye first sees it moving, a little larger than its
             // bound so the bound may grow as it moves.)
             let b = field.bound()
@@ -570,154 +528,5 @@ impl Kept {
             label("deposit moving fine")
             dispatch(pulled.bind(field: field, g: self.grid, bricks: self.bricks.items(), coarse: self.raw.items(), out: mut self.atlas), over: self.atlas)
         }
-    }
-}
-
-/// The engine's measure of what asks cost: one ask of cells (once), then each thing's field in
-/// turn, each timed and read back.
-pub struct Choice {
-    coarse: Texture3d<Rg32Uint>,
-    atlas: Texture3d<Rgba16Float>,
-    out: GpuBuffer<f32>,
-    asked: Option<Pending<f32>>,
-    /// An ask of cells (ns; 0 until measured), and which thing is being measured (none: past
-    /// the last).
-    pub cells: f32,
-    measuring: u32,
-    waiting: bool,
-    /// The least of the times taken so far of what is being measured, and how many there are
-    /// (each is measured `TIMES` times and the least kept: the GPU's clock rises over the first).
-    least: f32,
-    times: u32,
-    /// How many dispatches the field's measure makes (one at first; then as many as make it about
-    /// `MEASURE_US` long, so it times the asks and not their start: the host refuses one dispatch
-    /// whose work could hold the GPU past 50 ms, so it is many, timed together).
-    field_asks: u32,
-    sized: bool,
-}
-
-/// About how long a cost measure's dispatch should run (µs).
-const MEASURE_US: f32 = 2000.0
-
-/// How many times each cost is measured.
-const TIMES: u32 = 3
-
-pub fn choice() -> Choice {
-    Choice {
-        coarse: texture3d(width: 64, height: 64, depth: 64),
-        atlas: texture3d(width: ROW * BS, height: ROW * BS, depth: BS),
-        out: buffer(COST_ASKS),
-        asked: None,
-        cells: 0.0,
-        measuring: 0,
-        waiting: false,
-        least: 1.0e30,
-        times: 0,
-        field_asks: 1,
-        sized: false,
-    }
-}
-
-impl Choice {
-    /// Whether an ask of cells is measured.
-    pub fn known(self) -> bool {
-        self.cells > 0.0
-    }
-
-    /// Cells' cost measured (once), as far as this frame goes.
-    pub fn cells_measured(mut self, s: Sampler) {
-        if self.known() {
-            return
-        }
-        if !self.waiting {
-            self.asked = Some(timed("asked cells"))
-            label("asked cells")
-            dispatch(cells_cost.bind(coarse: self.coarse, atlas: self.atlas, s: s, out: mut self.out), over: COST_ASKS)
-            self.waiting = true
-            return
-        }
-        match mut self.asked {
-            Some(p) => match p.poll() {
-                Some(Ok(us)) => {
-                    self.least = min(self.least, us[0] * 1000.0 / f32(COST_ASKS * CELL_ASKS))
-                    self.times += 1
-                    self.asked = None
-                    self.waiting = false
-                    if self.times == TIMES {
-                        self.cells = max(self.least, 1.0e-6)
-                        self.least = 1.0e30
-                        self.times = 0
-                        print(f"engine::matter: an ask of cells costs {self.cells} ns (the least of {TIMES} measures)")
-                    }
-                },
-                Some(Err(_)) => {
-                    panic("engine::matter: the host can't time GPU work, so the engine can't measure what an ask costs")
-                },
-                None => {},
-            },
-            None => {},
-        }
-    }
-
-    /// `kept`'s field's cost measured and its choice made, as far as this frame goes; true once
-    /// made.
-    pub fn chose<M: Field<Substance>>(mut self, field: M, k: mut Kept, which: u32) -> bool {
-        if !k.undecided() {
-            return true
-        }
-        if !self.known() || self.waiting && self.measuring != which {
-            return false
-        }
-        if !self.waiting {
-            let b = field.bound()
-            self.asked = Some(timed("asked field"))
-            label("asked field")
-            var r: u32 = 0
-            while r < self.field_asks {
-                dispatch(field_cost.bind(field: field, held: vec4(b.centre, b.radius), out: mut self.out), over: COST_ASKS)
-                r += 1
-            }
-            self.waiting = true
-            self.measuring = which
-            return false
-        }
-        match mut self.asked {
-            Some(p) => match p.poll() {
-                Some(Ok(us)) => {
-                    let per = us[0] * 1000.0 / f32(COST_ASKS * 16 * self.field_asks)
-                    self.asked = None
-                    self.waiting = false
-                    if !self.sized {
-                        // (The first, short, sizes the rest.)
-                        self.field_asks = u32(clamp(MEASURE_US / max(us[0], 1.0), 1.0, 16.0))
-                        self.sized = true
-                        return false
-                    }
-                    self.least = min(self.least, per)
-                    self.times += 1
-                    if self.times < TIMES {
-                        return false
-                    }
-                    self.field_asks = 1
-                    self.sized = false
-                    k.cost = self.least
-                    self.least = 1.0e30
-                    self.times = 0
-                    k.asks = if k.cost <= ASK_RATIO * self.cells { ASKS_FIELD } else { ASKS_CELLS }
-                    k.cells_cost = self.cells
-                    if k.held_asks != 0 {
-                        k.asks = k.held_asks
-                    }
-                    print(f"engine::matter: thing {which}: an ask of its field costs {k.cost} ns, {k.cost / self.cells} asks of cells: asked by its {by(k.asks)}{held(k.held_asks)}")
-                    return true
-                },
-                Some(Err(_)) => {
-                    panic("engine::matter: the host can't time GPU work, so the engine can't measure what an ask costs")
-                },
-                None => {},
-            },
-            None => {},
-        }
-        false
     }
 }

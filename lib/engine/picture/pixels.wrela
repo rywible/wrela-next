@@ -2,6 +2,14 @@
 // ray through its middle (`ray::met`), then light, then the look. No scouts, no blocks, no edges
 // smoothed: the next slice's, on a ray held to the reference first.
 //
+// Which of a thing's answers the engine asks, its field's or its cells', is chosen here, by the
+// frame's own cost (docs/design.md: "the engine chooses; no author does"): every thing is asked
+// by its field at first; then, a thing at a time, the picture times its frame (the picture's
+// passes, and the thing's deposit if it moves) asked by the field and asked by the cells, the
+// least of `TRIALS` frames each, and keeps the cheaper. (A kernel timing an ask of each alone,
+// tried first, swung fivefold from run to run and flipped the creature's choice; what it measured
+// was not the frame.) Said in the log.
+//
 // The light here is a stand-in, the simplest that can be held to the reference exactly (the
 // reference's `SIMPLE` light): the sun where a shadow ray (the same `ray::met`) says it reaches,
 // toward the middle of its disc; and the sky's light as if nothing were in its way, read from a
@@ -9,7 +17,7 @@
 // replaces it whole: nothing outside this file knows how a pixel is lit.
 
 use matter::asked::{Answers, Asked, Chosen}
-use matter::cells::{Choice, Kept, choice, kept}
+use matter::cells::{ASKS_CELLS, ASKS_FIELD, Kept, kept}
 use matter::sky::{Sky, seen}
 use matter::world::World
 use picture::eye::{Eye, View, view}
@@ -21,13 +29,18 @@ use reference::traced::LEAVE
 use std::collections::Vec
 use std::gpu::{
     Address, FragCoord, GlobalId, R8, Rgba16Float, Sampler, Targets2, Texels, Texture, begin_pass, begin_pass2, begin_screen_pass, dispatch, draw,
-    label, sampler, texture, writable_texture,
+    label, sampler, texture, timed, writable_texture,
 }
-use std::io::print
+use std::io::{Pending, print}
 
-/// How many passes the picture is drawn in, each a band of the screen's rows: the stack at 1080p
-/// took 115 ms in one pass on the Radeon, past the 50 ms a pass may hold the GPU (AGENTS.md).
-const PICTURE_BANDS: u32 = 4
+/// The picture is drawn in passes, each a band of the screen's rows, as many as keep a pass near
+/// `BAND_US` by the picture's last time (no pass may hold the GPU long: AGENTS.md): at first
+/// `FIRST_BANDS` (a field not yet timed may be dear: the stack asked by its field took 58 ms a
+/// quarter of the screen at 1080p on the M4), and between `LEAST_BANDS` and `MOST_BANDS`.
+const BAND_US: f32 = 10000.0
+const FIRST_BANDS: u32 = 32
+const LEAST_BANDS: u32 = 4
+const MOST_BANDS: u32 = 128
 
 /// The sky table's texels a side (an octahedron's fold of every way a face can turn), and how
 /// many ways each texel's light is gathered from (a side of a square of them, cosine-spread).
@@ -133,11 +146,38 @@ pub fn burn(pixel: FragCoord, rounds: u32) -> vec4 {
     vec4(x, 0.0, 0.0, 1.0)
 }
 
-/// What the engine keeps from frame to frame to draw a world: each thing's cells, its measure of
-/// what asks cost, the sky's table, the picture, and the load beside the frame.
+/// How many frames each way of asking a thing is timed, the least kept.
+const TRIALS: u32 = 3
+
+/// A thing is asked by its cells only where they make the frame at most this share of what its
+/// field does: cells cost memory and round what is finer than a cell, so they must pay.
+const CELLS_PAY: f32 = 0.8
+
+/// Where the choice of field or cells stands for the thing being tried.
+const TIMING_FIELD: u32 = 0
+const AWAITING_CELLS: u32 = 1
+const TIMING_CELLS: u32 = 2
+
+/// What the engine keeps from frame to frame to draw a world: each thing's cells, where its trial
+/// of field against cells stands, the sky's table, the picture, and the load beside the frame.
 pub struct Sight {
     kept: Vec<Kept>,
-    choice: Choice,
+    /// The thing being tried (past the last: all chosen), how far its trial is, the least frame
+    /// asked each way (µs), the samples taken, and the times asked for.
+    trying: u32,
+    phase: u32,
+    by_field: f32,
+    by_cells: f32,
+    samples: u32,
+    picture_time: Option<Pending<f32>>,
+    coarse_time: Option<Pending<f32>>,
+    fine_time: Option<Pending<f32>>,
+    sum: f32,
+    waiting: u32,
+    /// How many bands the picture is drawn in (`BAND_US`), and the time asked of it to size them
+    /// once every thing is chosen.
+    bands: u32,
+    sizing: Option<Pending<f32>>,
     s: Sampler,
     table: Texture<Rgba16Float>,
     pub drawn: Picture,
@@ -155,7 +195,18 @@ pub struct Sight {
 pub fn sight() -> Sight {
     Sight {
         kept: Vec::new(),
-        choice: choice(),
+        trying: 0,
+        phase: TIMING_FIELD,
+        by_field: 1.0e30,
+        by_cells: 1.0e30,
+        samples: 0,
+        picture_time: None,
+        coarse_time: None,
+        fine_time: None,
+        sum: 0.0,
+        waiting: 0,
+        bands: FIRST_BANDS,
+        sizing: None,
         s: sampler(address: Address::Clamp),
         table: writable_texture(width: TABLE, height: TABLE),
         drawn: picture(width: 1, height: 1),
@@ -179,6 +230,118 @@ pub fn sight_held(asks: u32, cell: f32) -> Sight {
 }
 
 impl Sight {
+    /// The picture's bands sized for a picture that took `us` in `self.bands` passes.
+    fn banded(mut self, us: f32) {
+        self.bands = u32(clamp(ceil(us / BAND_US), f32(LEAST_BANDS), f32(MOST_BANDS)))
+    }
+
+    /// The trial of field against cells, as far as this frame goes: what was timed read, and
+    /// (where nothing is outstanding) the next frame's passes asked to be timed.
+    fn tried(mut self, count: u32) {
+        if self.trying >= count {
+            // (Chosen: the picture's time asked now and then, to keep its bands sized.)
+            match mut self.sizing {
+                Some(p) => match p.poll() {
+                    Some(Ok(us)) => {
+                        self.banded(us[0])
+                        self.sizing = None
+                    },
+                    _ => {},
+                },
+                None => {
+                    self.sizing = Some(timed("picture"))
+                },
+            }
+            return
+        }
+        let t = self.trying
+        // Read what was asked for.
+        var heard = false
+        var all = true
+        match mut self.picture_time {
+            Some(p) => match p.poll() {
+                Some(Ok(us)) => {
+                    self.sum += us[0]
+                    self.picture_time = None
+                    self.banded(us[0])
+                },
+                Some(Err(_)) => {
+                    panic("engine::picture: the host can't time GPU work, so the engine can't choose field or cells")
+                },
+                None => {
+                    all = false
+                },
+            },
+            None => {},
+        }
+        match mut self.coarse_time {
+            Some(p) => match p.poll() {
+                Some(Ok(us)) => {
+                    self.sum += us[0]
+                    self.coarse_time = None
+                },
+                _ => {
+                    all = false
+                },
+            },
+            None => {},
+        }
+        match mut self.fine_time {
+            Some(p) => match p.poll() {
+                Some(Ok(us)) => {
+                    self.sum += us[0]
+                    self.fine_time = None
+                },
+                _ => {
+                    all = false
+                },
+            },
+            None => {},
+        }
+        if self.waiting > 0 && all {
+            heard = true
+            self.waiting = 0
+        }
+        if heard {
+            if self.phase == TIMING_FIELD {
+                self.by_field = min(self.by_field, self.sum)
+            } else {
+                self.by_cells = min(self.by_cells, self.sum)
+            }
+            self.samples += 1
+            self.sum = 0.0
+            if self.samples >= TRIALS {
+                self.samples = 0
+                if self.phase == TIMING_FIELD {
+                    self.kept[t].ask_by(ASKS_CELLS)
+                    self.phase = AWAITING_CELLS
+                    return
+                }
+                let cells = self.by_cells < CELLS_PAY * self.by_field
+                self.kept[t].ask_by(if cells { ASKS_CELLS } else { ASKS_FIELD })
+                let by: Text = if cells { "cells" } else { "field" }
+                print(f"engine::picture: thing {t}: a frame asking its field {self.by_field} us, its cells {self.by_cells} us (its deposit in it, as it moves): asked by its {by}")
+                self.trying += 1
+                self.phase = TIMING_FIELD
+                self.by_field = 1.0e30
+                self.by_cells = 1.0e30
+                return
+            }
+        }
+        if self.phase == AWAITING_CELLS {
+            // (Its cells are ready: this frame is drawn by them.)
+            self.phase = TIMING_CELLS
+        }
+        if self.waiting == 0 {
+            self.picture_time = Some(timed("picture"))
+            if self.phase == TIMING_CELLS && self.kept[t].moving {
+                self.coarse_time = Some(timed("deposit moving coarse"))
+                self.fine_time = Some(timed("deposit moving fine"))
+            }
+            self.waiting = 1
+        }
+    }
+
     /// `world` under `sky` in `look` through `eye`, on a `width` × `height` screen: its cells
     /// brought up to date, every pixel drawn into `drawn`, and shown. Until every thing's cells
     /// are ready, the screen is black.
@@ -211,11 +374,16 @@ impl Sight {
             k.held_cell = self.held_cell
             self.kept.push(take k)
         }
-        self.choice.cells_measured(self.s)
-        world.kept(mut self.kept, mut self.choice, 0, v)
+        world.kept(mut self.kept, 0, v)
         if !world.ready(self.kept, 0) {
             self.drawn.placed = false
+            if self.phase == AWAITING_CELLS {
+                return
+            }
             return
+        }
+        if self.held_asks == 0 {
+            self.tried(world.count())
         }
         if !self.said {
             self.said = true
@@ -228,10 +396,11 @@ impl Sight {
         dispatch(skylit.bind(sky: sky, out: mut self.table), groups: ((TABLE + 7) / 8, (TABLE + 7) / 8, 1))
         label("picture")
         let w = world.asked(self.kept, self.s, 0)
+        let bands = self.bands
         var band: u32 = 0
-        while band < PICTURE_BANDS {
-        let y0 = band * height / PICTURE_BANDS
-        let y1 = (band + 1) * height / PICTURE_BANDS
+        while band < bands {
+        let y0 = band * height / bands
+        let y1 = (band + 1) * height / bands
         band += 1
         let p = begin_pass2(mut self.drawn.colour, mut self.drawn.place, keep: band > 1)
         p.scissor(0, y0, width, y1 - y0)
