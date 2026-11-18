@@ -40,6 +40,10 @@ made of. The engine decides how to see it.
   hiding it would obscure more than it would simplify.
 - **The look owns tone, alone.** A substance says how matter answers light, physically. Only the
   look says how light becomes a tone on the screen. Style enters nowhere else.
+- **Matter never sees how it is viewed.** It may depend on a point, on time and on the game's
+  state, and on nothing else: not the eye, not the screen, not the frame. Only the look sees
+  light, and nothing in the game sees a pixel. Almost every workaround needs to know how a thing
+  is being looked at, so this is what makes workarounds hard to write.
 
 ### What an author never states
 
@@ -49,12 +53,38 @@ caches, how a surface turns from one pixel to the next. Each of these is derived
 or decided by the engine against its budget. An author who has to state one has found an engine
 bug.
 
-### The safe default
+### Cost is the engine's, not the author's
 
-Every field is realised from cells the engine keeps (a cache of it). An author cannot write a
-slow thing, only one whose finest detail is a cell's. Where the toolchain's cost for a field is
-low, the engine asks the field itself, and its edges are then as sharp as the field makes them.
-The engine chooses; the build tells the author which they got and what it cost.
+An author writes what they mean, in the plainest way, and it comes out right and fast, as code
+does from a good compiler. How a thing is phrased should not show in the picture or in the
+frame's time, except in the few cases no engine could hide.
+
+**The safe default.** Every field is realised from cells the engine keeps (a cache of it). An
+author cannot write a slow thing. Where the toolchain's cost for a field is low, the engine asks
+the field itself. The engine chooses; no author does.
+
+**Three things make the difference between the two invisible.** None is measured yet; each is a
+line in the author test below.
+
+- **The engine sizes its cells from what the eye sees.** Cells about a pixel wide near the eye
+  lose only detail that could not be seen. (The spike's rounded edges came from cells five pixels
+  wide, a size fixed by hand.)
+- **The compiler finds the structure.** Which of a thing's parts matter near a place is derived
+  from a plain union, by the interval arithmetic the toolchain already has; an author does not
+  write it. (By hand in the spike, it took a body's deposit from 4.5 ms to 0.73 ms.)
+- **The two answers are mixed by budget, not by how a thing was written.** Cells bring a ray
+  near; the field itself is asked for as many pixels as the frame can afford, nearest first.
+  Quality then varies with load, never with phrasing.
+
+**What stays visible is the egregious case**, as with any compiler: a thing that is dear, moving
+and close all at once; a thing thinner than a cell, as fur is. For those the build says so
+plainly, with the number and what would cure it.
+
+### When the engine cannot do what an author needs
+
+The author stops and files the gap: "I needed this, for that." They do not work round it. A gap
+filed is the engine's next piece of work; a workaround is a special case nobody can see. This has
+to be the easy path, so the author's tools must make filing a gap one step.
 
 ## The layers
 
@@ -81,18 +111,30 @@ game/
   scenes/         what is put before an eye
 ```
 
-Three rules keep it honest, and each is to be checked by the build, not by eye:
+Three rules keep it honest, and each is to be checked by the build, not by eye (the third by a
+check that no name in the engine's interfaces is a noun of the game):
 
 1. **Only `lib/engine` touches the GPU.** A file of `lib/kit` or `game/` that imports `std::gpu`
    is an engine bug.
 2. **The kit and the game are fields.** The kit holds what any game would agree is true of the
    world ("water bends light"). The game holds this game's taste and content ("our sea is slate
    grey with torn foam"). Recipes live there, built from the kit; the engine never hears of them.
-3. **Nothing is built in the engine for one user.** A property of the engine (matter that is a
-   height over a plane; a substance light passes through) is a system when two unrelated things
-   use it and a special case in disguise when one does. A piece starts in the game and moves down
-   when a second, unrelated thing needs it. The engine never knows "ocean": it knows a height,
-   and it knows water, and the sea is the game's recipe of the two.
+3. **The engine knows properties, never things.** An interface of the engine may not hold a noun
+   of the game. "Ocean reflections" is refused; "a substance that mirrors" is taken. The engine
+   never knows "ocean": it knows a height, and it knows water, and the sea is the game's recipe of
+   the two.
+
+How a property gets into the engine (this replaces "wait for a second user", which would push
+workarounds up into the game):
+
+- **It is built at its first real user, if a second can be named.** Before building, name one
+  unrelated thing that would use the same interface unchanged. If one can be named, build it now:
+  the interface general, the implementation only what today needs. If none can, the need is
+  usually stated as a thing and not as a property: state it again.
+- **It is proved by its second user.** When the second thing arrives, it must need no change to
+  the interface. If it does, the first was a special case, and the interface is cut again.
+- **A property with one user after that is named as an exception**, with its cost, in one list.
+  It is not hidden.
 
 ## The engine's four modules
 
@@ -136,6 +178,7 @@ references. Numbers are in the spike's log and commit messages.
 | Fog, fire, glow as the only light, reflections | Not built |
 | The sea; fur; a whole world round the eye | Not built. Fur is the likeliest to fail |
 | A body's own light and its shadow on other things | Not built |
+| Cells sized from what the eye sees; structure found by the compiler; answers mixed by budget | Not built. What "phrasing does not show" rests on |
 
 ## What the design must make impossible
 
@@ -168,9 +211,14 @@ at a time, into the place this document gives it.
    spike's own numbers for each.
 2. **Light on that path**: sun, sky, bounce; a body's light and its shadow on other things.
 3. **The author test.** A sealed author is given briefs for new things, in pairs that share a
-   property (a sea and a terrain on a height; water and a glass shard). The pass mark is no
-   renderer code touched. If the second of a pair needs an engine change, the first was a special
-   case.
+   property (a sea and a terrain on a height; water and a glass shard). It is held to four marks:
+   - no renderer code touched;
+   - the second of a pair needs no change to the engine's interface (else the first was a
+     special case);
+   - no workaround: every gap the author met is filed, and none is written round;
+   - **phrasing does not show.** Each thing is written twice, the plainest way and the way a
+     person who knew the engine would structure it. The plain one must cost within a factor set
+     before measuring, and look the same from the game's camera.
 4. **Matter light passes through** (fog first), then the ones most likely to fail: fur, and a
    whole world round the eye.
 
@@ -182,5 +230,9 @@ at a time, into the place this document gives it.
 - The two questions are not independent everywhere: a substance light passes through means a ray
   goes on, which touches the cost of finding matter. They meet at one narrow question ("does
   light go on?").
-- Authors will still learn which shapes come out sharp, because cost can be seen. The build's
-  report makes that plain; it does not make it go away.
+- Hiding cost rests on three things nobody has measured: cells sized from what the eye sees
+  (memory, and the deposit of things that move), structure found by the compiler, and the two
+  answers mixed by budget. If they fall short, authors will learn which phrasings come out sharp,
+  which is what this design is meant to prevent.
+- A filed gap is only better than a workaround if gaps get closed. An engine that is slow to
+  close them teaches authors to work round it.
