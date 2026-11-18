@@ -36,6 +36,10 @@ made of. The engine decides how to see it.
 - A solid is matter with a hard edge. Fog is matter with a density. A glow is matter that emits.
   Whether light stops at it or passes through it is a fact about what it is made of, said once,
   there.
+- **A world is things, and a thing is what moves as one.** The author hands the engine a world of
+  things (a stage, a body, a stack). What counts as one thing is a fact about the world, as a
+  substance is: it is not a way to tune cost, and splitting or joining things must not show in
+  the picture or the frame's time.
 - **The sky** is matter with a direction and no place. It is the one named exception, because
   hiding it would obscure more than it would simplify.
 - **The look owns tone, alone.** A substance says how matter answers light, physically. Only the
@@ -65,8 +69,20 @@ frame's time, except in the few cases no engine could hide.
 author cannot write a slow thing. Where the toolchain's cost for a field is low, the engine asks
 the field itself. The engine chooses; no author does.
 
-**Three things make the difference between the two invisible.** None is measured yet; each is a
-line in the author test below.
+**The choice may never show.** Two rules follow, both paid for in the first slice.
+
+- **Either answer draws the same picture**, to the judges' lines. Cells are a cache of the field,
+  not a second version of it: where cells answer, they are fine enough for the pixel that reads
+  them. (Measured: cells three pixels wide lost 72 to 79 of a creature's 85 thin pixels, a 1 cm
+  wand and the tips of its ears, and opened holes.) Until that holds, the choice changes what is
+  drawn, and nothing may choose it.
+- **The choice is the same on every run and every machine.** It is made from what the toolchain
+  counts an ask of the field to cost, fixed when the game is built, never from timing a run.
+  (Measured: an engine that chose by timing its own frames chose differently for the same build
+  with the GPU in a different state, and so drew a different picture.)
+
+**Three things make the difference between the two invisible.** The first is now a requirement
+(above); the other two are not measured yet. Each is a line in the author test below.
 
 - **The engine sizes its cells from what the eye sees.** Cells about a pixel wide near the eye
   lose only detail that could not be seen. (The spike's rounded edges came from cells five pixels
@@ -224,6 +240,21 @@ references. Numbers are in the spike's log and commit messages.
 | A body's own light and its shadow on other things | Not built |
 | Cells sized from what the eye sees; structure found by the compiler; answers mixed by budget | Not built. What "phrasing does not show" rests on |
 
+From the engine's first slice (one ray function, every pixel drawn by it, a stand-in light of a
+sun's shadow ray and an open sky), 1080p, judged against the reference. Numbers are in the
+engine's log and commit messages.
+
+| Claim | State |
+| --- | --- |
+| A stage and a walking body, every pixel by one ray, fit half a frame | Measured. 6.9 ms on the M4 (line 8.3); 14.4 ms on the Radeon |
+| A stack from cells through the same ray is right | Measured. No holes, outline within 0.021 px, both machines, the same to within a pixel. 6.9 ms on the M4, 205 MB |
+| Asked by their fields, a stage and a body are right | Measured. No holes, outline within 0.038 px, thin parts kept |
+| Asked by cells three pixels wide, the same are right | **False.** 6 to 7 holes, outline off 0.59 px, the wand and ears' tips lost |
+| The engine can choose field or cells by timing its frames | **False.** The choice flips with the GPU's state |
+| Edges without smoothing crawl no more than the reference's | **Not met.** 5 to 10% more where fields are asked |
+| A plain body costs what a structured one does | **Not met.** Deposit 3.2 times the spike's hand-chosen parts |
+| A shipped build takes a plain body and a new field | **Not met.** E0712 refuses std's own round cone and smooth union inside the ray's steps; builds are made with `--testing` until the toolchain does that work once a command itself |
+
 ## What the design must make impossible
 
 Faults the spike found, each with the module that now owns it.
@@ -253,6 +284,11 @@ at a time, into the place this document gives it.
 1. **Still and moving solids through the four modules**: a stack answered from cells, a stage of
    boxes and a walking body answered by their fields, in one scene, one path. The lines are the
    spike's own numbers for each.
+   - 1a, done: cells, one ray, every pixel by it, a stand-in light that lives in picture until
+     slice 2 replaces it.
+   - 1b: cells that are true (sized from what the eye sees, kept only where the eye needs them),
+     a choice that is the same on every run, and edges that crawl no more than the reference's.
+   - 1c: the time (looking coarsely first, filling in, so that pixels do not all pay for a ray).
 2. **Light on that path**: sun, sky, bounce; a body's light and its shadow on other things.
 3. **The author test.** A sealed author is given briefs for new things, in pairs that share a
    property (a sea and a terrain on a height; water and a glass shard). It is held to four marks:
