@@ -65,11 +65,11 @@ const KEEP: f32 = 0.9
 /// How far past a brick's side a ray that leaves an empty brick lands (of a brick).
 const NUDGE: f32 = 0.01
 
-/// An ask of the field is chosen where it costs no more than this many asks of cells; for a
-/// thing that moves, whose cells are deposited again every frame (an ask of the field a texel),
-/// this many (`ASK_RATIO_MOVING`).
+/// An ask of the field is chosen where it costs no more than this many asks of cells. (One rule
+/// for still and moving things: a moving thing's deposit asks its field once a texel every
+/// frame, which for the creature in the first scene is about 70,000 asks against the million or
+/// so its pixels make; a second threshold for movers flipped the creature's choice between runs.)
 pub const ASK_RATIO: f32 = 4.0
-pub const ASK_RATIO_MOVING: f32 = 16.0
 
 /// The most bricks a thing that keeps still keeps, and one that moves. A moving thing's deposit is
 /// one dispatch over its whole atlas (a kernel stores only its own texel, so it can't be cut in
@@ -261,7 +261,8 @@ fn field_cost<M: Field<Substance>>(field: M, held: vec4, out: mut Slots<f32>, id
 
 /// The same asked of cells, as a ray steps through them: a coarse grid's texel and a filtered
 /// atlas read each, the 64 invocations of a group starting a texel apart (as neighbouring pixels'
-/// rays do) and each stepping half a texel.
+/// rays do) and each stepping half a texel, `CELL_ASKS` times (an ask of cells is cheap: fewer
+/// would time the dispatch's start, not the asks, and the measure would swing eightfold).
 @compute(64)
 fn cells_cost(coarse: Texture3d<Rg32Uint>, atlas: Texture3d<Rgba16Float>, s: Sampler, out: mut Slots<f32>, id: GlobalId) {
     let h = hash_u32(id.x / 64 + 1)
@@ -272,8 +273,8 @@ fn cells_cost(coarse: Texture3d<Rg32Uint>, atlas: Texture3d<Rgba16Float>, s: Sam
     let csize = vec3(f32(coarse.width()), f32(coarse.height()), f32(coarse.depth()))
     var sum = 0.0
     var k: u32 = 0
-    while k < 16 {
-        let q = clamp(base + lane + way * (0.5 * f32(k)), vec3(0.0), size - vec3(1.0))
+    while k < CELL_ASKS {
+        let q = clamp(base + lane + way * (0.5 * f32(k % 64)), vec3(0.0), size - vec3(1.0))
         let c = coarse.load(u32(q.x / size.x * csize.x), u32(q.y / size.y * csize.y), u32(q.z / size.z * csize.z))
         sum += atlas.sample_level(s, (q + vec3(0.5)) / size, 0.0).x + f32(c.x & 1)
         k += 1
@@ -290,8 +291,10 @@ fn held(asks: u32) -> Text {
     if asks != 0 { " (held so, to measure)" } else { "" }
 }
 
-/// How many invocations a cost kernel runs, each asking 16 times.
+/// How many invocations a cost kernel runs, each asking 16 times (the field) or `CELL_ASKS`
+/// times (cells).
 const COST_ASKS: u32 = 65536
+const CELL_ASKS: u32 = 256
 
 /// One thing's cells, and where its deposit stands.
 pub struct Kept {
@@ -405,7 +408,6 @@ impl Kept {
     /// Brought up to date for this frame: seen whether it moves, then deposited as it does, a
     /// few bands of it if it keeps still, whole if it moves.
     pub fn deposit<M: Field<Substance>>(mut self, field: M, v: View) {
-        let was_moving = self.moving
         let now = probed(field)
         if self.probes.len() == now.len() {
             var i: u32 = 0
@@ -419,12 +421,6 @@ impl Kept {
         self.probes = take now
         if self.asks == 0 {
             return
-        }
-        if self.moving && !was_moving && self.held_asks == 0 && self.asks == ASKS_CELLS && self.cost <= ASK_RATIO_MOVING * self.cells_cost {
-            // It moves: its cells would be deposited every frame, which its field's cost doesn't pay for.
-            self.asks = ASKS_FIELD
-            self.stage = 0
-            print(f"engine::matter: a thing that moves: an ask of its field costs {self.cost / self.cells_cost} asks of cells, under {ASK_RATIO_MOVING}: asked by its field from now")
         }
         self.grid.asks = self.asks
         if self.asks == ASKS_FIELD {
@@ -541,6 +537,8 @@ impl Kept {
                 self.grid.atlas = vec3(f32(ROW * BS), f32(rows * BS), f32(BS))
             }
             self.stage = 5
+            self.cursor = 0
+            self.counted = None
             print(f"engine::matter: a moving thing: grid {n}^3 bricks ({self.grid.cell * f32(B)} m each, cells {self.grid.cell} m, bound {b.radius} m; steepness {self.grid.steep} within {self.grid.scope} m), asked by its {by(self.asks)}")
         }
         self.laid(field, v, fixed: true)
@@ -548,6 +546,25 @@ impl Kept {
         label("deposit moving coarse")
         self.bricks.clear()
         dispatch(coarsed.bind(field: field, g: self.grid, first: 0, out: mut self.raw, bricks: mut self.bricks), over: n)
+        // (How many bricks it wanted, read back now and then: past `MOST_MOVING` the rest of it
+        // isn't drawn, and the log says so.)
+        match mut self.counted {
+            Some(p) => match p.poll() {
+                Some(Ok(c)) => {
+                    if c[0] > self.grid.kept {
+                        print(f"engine::matter: a moving thing wanted {c[0]} bricks; it holds {self.grid.kept}: the rest of it isn't drawn")
+                    }
+                    self.counted = None
+                },
+                _ => {},
+            },
+            None => {
+                if self.cursor % 64 == 0 {
+                    self.counted = Some(read(self.bricks.count()))
+                }
+                self.cursor += 1
+            },
+        }
         dispatch(coarse_copied.bind(raw: self.raw.items(), g: self.grid, out: mut self.coarse), over: self.coarse)
         if self.asks == ASKS_CELLS {
             label("deposit moving fine")
@@ -572,7 +589,15 @@ pub struct Choice {
     /// (each is measured `TIMES` times and the least kept: the GPU's clock rises over the first).
     least: f32,
     times: u32,
+    /// How many dispatches the field's measure makes (one at first; then as many as make it about
+    /// `MEASURE_US` long, so it times the asks and not their start: the host refuses one dispatch
+    /// whose work could hold the GPU past 50 ms, so it is many, timed together).
+    field_asks: u32,
+    sized: bool,
 }
+
+/// About how long a cost measure's dispatch should run (µs).
+const MEASURE_US: f32 = 2000.0
 
 /// How many times each cost is measured.
 const TIMES: u32 = 3
@@ -588,6 +613,8 @@ pub fn choice() -> Choice {
         waiting: false,
         least: 1.0e30,
         times: 0,
+        field_asks: 1,
+        sized: false,
     }
 }
 
@@ -612,7 +639,7 @@ impl Choice {
         match mut self.asked {
             Some(p) => match p.poll() {
                 Some(Ok(us)) => {
-                    self.least = min(self.least, us[0] * 1000.0 / f32(COST_ASKS * 16))
+                    self.least = min(self.least, us[0] * 1000.0 / f32(COST_ASKS * CELL_ASKS))
                     self.times += 1
                     self.asked = None
                     self.waiting = false
@@ -645,7 +672,11 @@ impl Choice {
             let b = field.bound()
             self.asked = Some(timed("asked field"))
             label("asked field")
-            dispatch(field_cost.bind(field: field, held: vec4(b.centre, b.radius), out: mut self.out), over: COST_ASKS)
+            var r: u32 = 0
+            while r < self.field_asks {
+                dispatch(field_cost.bind(field: field, held: vec4(b.centre, b.radius), out: mut self.out), over: COST_ASKS)
+                r += 1
+            }
             self.waiting = true
             self.measuring = which
             return false
@@ -653,13 +684,22 @@ impl Choice {
         match mut self.asked {
             Some(p) => match p.poll() {
                 Some(Ok(us)) => {
-                    self.least = min(self.least, us[0] * 1000.0 / f32(COST_ASKS * 16))
-                    self.times += 1
+                    let per = us[0] * 1000.0 / f32(COST_ASKS * 16 * self.field_asks)
                     self.asked = None
                     self.waiting = false
+                    if !self.sized {
+                        // (The first, short, sizes the rest.)
+                        self.field_asks = u32(clamp(MEASURE_US / max(us[0], 1.0), 1.0, 16.0))
+                        self.sized = true
+                        return false
+                    }
+                    self.least = min(self.least, per)
+                    self.times += 1
                     if self.times < TIMES {
                         return false
                     }
+                    self.field_asks = 1
+                    self.sized = false
                     k.cost = self.least
                     self.least = 1.0e30
                     self.times = 0
