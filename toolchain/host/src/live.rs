@@ -319,6 +319,11 @@ impl Live {
             if event.is_dropped() {
                 continue;
             }
+            // gilrs keeps each pad's state from the events `next_event` returns, before this
+            // filter: the button press it makes of a hat must be kept too, or the hat's release
+            // finds no button pressed and is dropped (seen with a virtual pad's D-pad). Keeping
+            // an event it kept already changes nothing.
+            gilrs.update(&event);
             if let Some(change) = PadChange::of(event.event) {
                 self.pads.change(event.id, change, event.time, &mut self.pending);
             }
