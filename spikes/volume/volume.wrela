@@ -3035,6 +3035,52 @@ fn leak_summed(
     }
 }
 
+/// Where the facings of the cells round a read disagree this much, the read is on a crease (the
+/// length, squared, of their blend: unit facings 37 degrees apart blend to 0.9 midway).
+const CREASED: f32 = 0.9
+
+/// A read on a crease, at `local` (cells) in the brick whose texels start at `a` in the atlas.
+/// A cell holds a plane (its distance and its facing), and two faces that meet are two planes;
+/// blended, they are a rounded corner that faces neither way and wears both colours. So the
+/// read takes the face whose plane it lies nearest: that cell's facing, and the light and the
+/// albedo of only the cells round it that face the same way (in the open), by their shares.
+/// A facing of nothing: no cell round it has one.
+fn on_crease(atlas: Texture3d<Rgba16Float>, albedo: Texture3d<Rgba8>, glowing: Texture3d<Rgba8>, a: vec3, local: vec3, cell: f32) -> (vec3, vec4, vec4) {
+    let base = min(floor(local), vec3(f32(B) - 1.0))
+    let frac = local - base
+    var best = vec3(0.0)
+    var least = 1.0e9
+    for i in 0..8 {
+        let corner = vec3(f32(i & 1), f32((i >> 1) & 1), f32(i >> 2))
+        let x = a + base + corner
+        let t = atlas.load(u32(x.x), u32(x.y), u32(x.z))
+        let off = abs(t.x + dot(t.yzw, (frac - corner) * cell))
+        if dot(t.yzw, t.yzw) > 0.0 && off < least {
+            least = off
+            best = t.yzw
+        }
+    }
+    var glow = vec4(0.0)
+    var wear = vec3(0.0)
+    var sum = 0.0
+    for i in 0..8 {
+        let corner = vec3(f32(i & 1), f32((i >> 1) & 1), f32(i >> 2))
+        let x = a + base + corner
+        let t = atlas.load(u32(x.x), u32(x.y), u32(x.z))
+        if dot(t.yzw, best) > 0.7 {
+            let each = mix(vec3(1.0) - frac, frac, corner)
+            let w = each.x * each.y * each.z + 1.0e-4
+            sum += w
+            glow += glowing.load(u32(x.x), u32(x.y), u32(x.z)) * w
+            wear += albedo.load(u32(x.x), u32(x.y), u32(x.z)).xyz * w
+        }
+    }
+    if sum <= 0.0 {
+        return (vec3(0.0), vec4(0.0), vec4(0.0))
+    }
+    (best, glow / sum, vec4(wear / sum, 1.0))
+}
+
 /// A pixel of the form, marched through its volume and lit from its cells: what its surface gives
 /// back of the stored light, and of the sun's, by the pixel's own facing, where the sun reaches
 /// it. Whether it does is read from the cells round it; where they disagree (a shadow's edge
@@ -3077,7 +3123,7 @@ pub fn marched_lit(
         }
     }
     let p = eye.at + d * t
-    let n = normalize(v.yzw)
+    var n = normalize(v.yzw)
     let q = (p - g.lo) / brick
     let c = clamp(floor(q), vec3(0.0), top)
     let k = coarse.load(u32(c.x), u32(c.y), u32(c.z))
@@ -3087,9 +3133,18 @@ pub fn marched_lit(
         let local = clamp((q - c) * f32(B), vec3(0.0), vec3(f32(B)))
         let uvw = (a + local + vec3(0.5)) / g.atlas
         // (Shared among the texels round it that are in the open: a buried one holds nothing.)
-        let wear = albedo.sample_level(s, uvw, 0.0)
-        let open = max(wear.w, 0.02)
-        let glow = glowing.sample_level(s, uvw, 0.0) / open
+        var wear = albedo.sample_level(s, uvw, 0.0)
+        var glow = glowing.sample_level(s, uvw, 0.0) / max(wear.w, 0.02)
+        var creased = false
+        if dot(v.yzw, v.yzw) < CREASED && sharp != 4 {
+            let (facing, lit, worn) = on_crease(atlas, albedo, glowing, a, local, g.cell)
+            if dot(facing, facing) > 0.0 {
+                n = facing
+                glow = lit
+                wear = worn
+                creased = true
+            }
+        }
         colour = glow.xyz * glow.xyz
         let toward = dot(n, sun)
         if toward > 0.0 {
@@ -3107,6 +3162,10 @@ pub fn marched_lit(
             // (Why a pixel is dark: green, every texel round it buried; blue, facing off the sun
             // and no stored light; else its facing.)
             colour = if wear.w < 0.02 { vec3(0.0, 1.0, 0.0) } else if toward <= 0.0 && glow.x + glow.y + glow.z < 0.01 { vec3(0.0, 0.0, 1.0) } else { vec3(0.3) + 0.3 * n }
+        }
+        if sharp == 5 && creased {
+            // (Red: a pixel read as on a crease, to count them.)
+            colour = vec3(100.0, 0.0, 0.0)
         }
     } else if sharp == 3 {
         // (Red: where the walk stopped, no brick is kept.)
@@ -3241,7 +3300,9 @@ impl<S: Solid> Volume<S> {
     /// The form marched at every pixel into `frame`'s picture, each pixel showing what its
     /// surface gives back of the light stored there, and of the sun's by its own facing. `sharp`
     /// 1: where the cells round a pixel disagree on whether the sun reaches them, the pixel asks
-    /// by a ray of its own; 2: those pixels shown red, to count them.
+    /// by a ray of its own; 2: those pixels shown red, to count them; 3: why a pixel is dark; 4:
+    /// as 1, but a pixel on a crease reads its cells blended as any other does; 5: the pixels
+    /// read as on a crease shown red.
     pub fn draw_lit_into(self, frame: mut Frame, sun: vec3, sun_e: vec3, sharp: u32, body: u32) {
         let g = self.grid
         label("marched")
