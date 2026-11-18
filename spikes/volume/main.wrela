@@ -23,10 +23,21 @@ use frame::sky::{Plain, plain}
 use opening::stacks::{PILLARS, PILLAR_2_MESH, Pillar, Wears}
 use std::transform::identity
 use form::look::{Look, Place, Skin}
-use volume::{Volume, volume}
+use volume::{LitTruth, Volume, lit_truth, volume}
+use stage::{GROUND, Stage, StageLook, WALL_HALF}
+use std::io::{Pending, print}
 
 /// Which way the form is drawn (see the head of the file).
 pub const MODE: u32 = 0
+
+/// MODE 3, the light test (`stage`): whether the sky lights it and its own light bounces (off:
+/// the sun alone, for the leak test); the sky rays a texel takes a sweep; the dispatches of
+/// lighting a frame; and the sweep after which the judges are asked.
+pub const SKY_ON: bool = true
+pub const BOUNCE: bool = false
+pub const RAYS: u32 = 4
+pub const LIGHT_BANDS: u32 = 4
+pub const JUDGE_SWEEP: u32 = 60
 
 /// A fine cell of the volume (m).
 pub const CELL: f32 = 0.0625
@@ -101,6 +112,12 @@ pub struct Program {
     frames: u32,
     /// Which of a look's `SPLIT` frames this is.
     part: u32,
+    /// The light test's stage, its reference, and its judges' counts once asked for.
+    stage: Volume<Stage>,
+    truth: LitTruth,
+    light_asked: Option<Pending<u32>>,
+    leak_asked: Option<Pending<u32>>,
+    asked: bool,
 }
 
 pub fn init() -> Program {
@@ -116,6 +133,11 @@ pub fn init() -> Program {
         placed: false,
         frames: 0,
         part: 0,
+        stage: volume(Stage { spare: vec4(0.0) }, cell: CELL),
+        truth: lit_truth(),
+        light_asked: None,
+        leak_asked: None,
+        asked: false,
     }
 }
 
@@ -127,7 +149,76 @@ fn eye_for(width: u32, height: u32, turned: f32) -> Eye {
     eye_at(from, TO, FOV, width: width, height: height)
 }
 
+/// The light test's sun (toward it), what it lays on a face square to it, and what an open sky
+/// lays on a face.
+const STAGE_SUN = vec3(0.3, 0.6, 0.74)
+const SUN_E = vec3(3.0, 2.85, 2.6)
+const SKY_E = vec3(0.45, 0.55, 0.75)
+
+/// A frame of the light test: the stage deposited, lit on its cells, drawn from the stored
+/// light, and (from the first whole sweep) the reference's looks added; judged once.
+fn lit_frame(p: mut Program, width: u32, height: u32) {
+    let form = Stage { spare: vec4(0.0) }
+    let wears = StageLook { spare: vec4(0.0) }
+    let sun = normalize(STAGE_SUN)
+    let sky_e = if SKY_ON { SKY_E } else { vec3(0.0) }
+    let eye = eye_at(vec3(9.0, 6.0, 11.0), vec3(0.0, 1.0, 0.0), 0.6, width: width, height: height)
+    let sky: Plain = plain(sun)
+    p.frame.begin(eye, sunlit(sun, ground: -1000.0))
+    if !p.stage.filled() {
+        p.stage.fill(wears)
+    } else {
+        p.stage.relit(sun, SUN_E, sky_e, BOUNCE, RAYS, LIGHT_BANDS)
+    }
+    if p.stage.filled() && p.stage.sweeps > 0 {
+        p.stage.draw_lit_into(mut p.frame, wears, body: 1)
+        if !p.asked {
+            p.truth.look(eye, form, wears, sun, SUN_E, sky_e, RAYS)
+        }
+        if p.stage.sweeps >= JUDGE_SWEEP && !p.asked {
+            p.light_asked = Some(p.truth.judged(p.frame))
+            p.leak_asked = Some(p.stage.leak_asked(WALL_HALF, GROUND))
+            p.asked = true
+        }
+    } else {
+        p.frame.draw(|d| {})
+    }
+    match mut p.light_asked {
+        Some(q) => match q.poll() {
+            Some(Ok(v)) => {
+                let n = max(f32(v[0]), 1.0)
+                print(
+                    f"light: after {p.stage.sweeps} sweeps against {p.truth.looks} looks of the reference, of {v[0]} px both meet: over 8 of 255 {100.0 * f32(v[1]) / n}%, over 16 {100.0 * f32(v[2]) / n}%, mean {f32(v[3]) / 100.0 / n} of 255",
+                )
+                p.light_asked = None
+            },
+            _ => {},
+        },
+        None => {},
+    }
+    match mut p.leak_asked {
+        Some(q) => match q.poll() {
+            Some(Ok(v)) => {
+                let lit = f32(v[0]) / 1000.0 / max(f32(v[1]), 1.0)
+                let dark = f32(v[2]) / 1000.0 / max(f32(v[3]), 1.0)
+                let shade = f32(v[4]) / 1000.0 / max(f32(v[5]), 1.0)
+                print(
+                    f"light: leak: the wall's lit face holds {lit} ({v[1]} texels), its dark face {dark} ({v[3]}), the ground in its shadow {shade} ({v[5]}): dark over lit {100.0 * dark / max(lit, 1.0e-6)}%, shadow over lit {100.0 * shade / max(lit, 1.0e-6)}%",
+                )
+                p.leak_asked = None
+            },
+            _ => {},
+        },
+        None => {},
+    }
+    p.frame.end(sky)
+}
+
 pub fn frame(p: mut Program, time: f32, width: u32, height: u32) {
+    if MODE == 3 {
+        lit_frame(mut p, width, height)
+        return
+    }
     let turned = if JUDGE { TURN * f32(p.judge.moment()) } else { 0.0 }
     let eye = eye_for(width, height, turned)
     let sky: Plain = plain(normalize(SUN))
