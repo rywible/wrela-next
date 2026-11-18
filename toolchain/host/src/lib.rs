@@ -58,6 +58,8 @@ mod shared;
 #[cfg(feature = "gpu")]
 pub mod step;
 #[cfg(feature = "gpu")]
+pub mod voice;
+#[cfg(feature = "gpu")]
 pub mod window;
 #[cfg(feature = "gpu")]
 pub use wrela_gpu::PresentMode;
@@ -1055,6 +1057,23 @@ impl Host {
         self.p().render_audio(quanta)
     }
 
+    /// Whether the program has started its voice (`std::audio::play`).
+    pub fn has_voice(&mut self) -> bool {
+        self.p().has_voice()
+    }
+
+    /// Plays the program's voice on the machine's audio device ([`voice`]), keeping the first
+    /// `tap` samples it writes; [`Host::stop_voice`] stops it. Errors if the program has no
+    /// voice or the machine no device it can play on.
+    pub fn play_voice(&mut self, tap: usize) -> Result<voice::Playing> {
+        self.p().play_voice(tap)
+    }
+
+    /// Stops a voice [`Host::play_voice`] started: what it played, or its trap.
+    pub fn stop_voice(&mut self, playing: voice::Playing) -> Result<voice::Played> {
+        self.p().stop_voice(playing)
+    }
+
     /// Queues an input event, which the program reads from its next call on.
     pub fn push_input(&mut self, e: Event) {
         self.p().push_input(e);
@@ -1641,6 +1660,18 @@ impl CpuHost {
     /// right, left, ...). Each call goes on from the last.
     pub fn render_audio(&mut self, quanta: u32) -> Result<Vec<f32>> {
         self.program.render_audio(quanta)
+    }
+
+    /// [`Host::play_voice`], on the CPU host: the voice needs no GPU.
+    #[cfg(feature = "gpu")]
+    pub fn play_voice(&mut self, tap: usize) -> Result<voice::Playing> {
+        self.program.play_voice(tap)
+    }
+
+    /// [`Host::stop_voice`].
+    #[cfg(feature = "gpu")]
+    pub fn stop_voice(&mut self, playing: voice::Playing) -> Result<voice::Played> {
+        self.program.stop_voice(playing)
     }
 
     /// The names and WASM types of the module's exported functions: `(params, results)`.

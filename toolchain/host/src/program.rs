@@ -761,7 +761,8 @@ impl<E: Executor> State<E> {
 }
 
 /// The program's voice: the audio thread's instance of the program, its `__audio(thread, task,
-/// context)`, and what it renders into. It renders on whichever OS thread holds it.
+/// context)`, and what it renders into. It renders on whichever OS thread holds it: the
+/// program's, offline ([`Program::render_audio`]), or an audio device's ([`crate::voice`]).
 pub(crate) struct Voice {
     store: Store<bool>,
     render: TypedFunc<(u32, u32, u32), ()>,
@@ -1851,7 +1852,8 @@ impl<E: Executor> Program<E> {
         }
     }
 
-    /// The voice, made if it hasn't been. Errors if the program hasn't started one.
+    /// The voice, made if it hasn't been, to render here or on another thread ([`crate::voice`]);
+    /// give it back with [`Program::give_voice`]. Errors if the program hasn't started one.
     pub(crate) fn take_voice(&mut self) -> Result<Voice> {
         if let Some(voice) = self.audio.take() {
             return Ok(voice);
@@ -1872,6 +1874,48 @@ impl<E: Executor> Program<E> {
             .map_err(wrap)?;
         let memory = self.memory.clone();
         Ok(Voice { store, render, memory, task, context, trace: self.trace() })
+    }
+
+    /// The voice back from another thread: it goes on from where it stopped.
+    pub(crate) fn give_voice(&mut self, voice: Voice) {
+        self.audio = Some(voice);
+    }
+
+    /// Whether the program has started its voice.
+    pub(crate) fn has_voice(&self) -> bool {
+        self.store.data().voice.is_some()
+    }
+
+    /// Plays the voice on the machine's audio device ([`crate::voice`]), keeping the first `tap`
+    /// samples it writes. Errors if the program hasn't started one, or there's no device to
+    /// play it on (the voice stays the program's).
+    #[cfg(feature = "gpu")]
+    pub(crate) fn play_voice(&mut self, tap: usize) -> Result<crate::voice::Playing> {
+        let voice = self.take_voice()?;
+        crate::voice::play(voice, self.serial, tap).map_err(|failed| {
+            let (voice, e) = *failed;
+            self.give_voice(voice);
+            e
+        })
+    }
+
+    /// Stops a voice [`Program::play_voice`] started: what it played, or its trap (the
+    /// program's failure). The voice goes on from there, if it's this program's.
+    #[cfg(feature = "gpu")]
+    pub(crate) fn stop_voice(
+        &mut self,
+        playing: crate::voice::Playing,
+    ) -> Result<crate::voice::Played> {
+        let ours = playing.program == self.serial;
+        let (voice, trap, played) = playing.stop();
+        if let (Some(voice), true) = (voice, ours) {
+            self.give_voice(voice);
+        }
+        match trap {
+            Some(trap) if ours => Err(self.voice_trapped(&trap)),
+            Some(trap) => Err(Error::Trap(format!("the replaced build's voice trapped: {trap:#}"))),
+            None => Ok(played),
+        }
     }
 
     /// The voice trapped (here or on another thread): the program's failure, as a trap in it.

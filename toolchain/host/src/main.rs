@@ -589,6 +589,25 @@ fn windowed(args: &Args) -> Result<(), Failure> {
             println!("ticks: not checked (the script has ticks' records)");
         }
     }
+    if let Some(v) = &ran.voice {
+        println!(
+            "voice: on {} ({} channels, 48 kHz): {} quanta in {} callbacks of {} to {} frames; the slowest took {:.1}% of the time its buffer plays, {} took longer; {} found the voice busy and played silence{}",
+            v.device,
+            v.channels,
+            v.quanta,
+            v.callbacks,
+            v.frames.0,
+            v.frames.1,
+            v.worst * 100.0,
+            v.over,
+            v.busy,
+            if v.errors.is_empty() {
+                String::new()
+            } else {
+                format!("; the device said: {}", v.errors.join("; "))
+            }
+        );
+    }
     println!("{} frames shown; state hash {:016x}", ran.frames, host.hash());
     Ok(())
 }

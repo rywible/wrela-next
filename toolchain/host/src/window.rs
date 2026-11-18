@@ -14,6 +14,9 @@
 //! and a script's events at that frame, if the run has one. Each frame hands what it took to the
 //! ticker, whose next tick takes it as records.
 //!
+//! The program's voice, once it starts one, plays on the machine's audio device
+//! ([`crate::voice`]); a machine with none it can play on runs silent, and says why.
+//!
 //! What it checks (the parry-tick test): with a tick log ([`WindowRun::log`]), that each event the
 //! frames took reached the sim in order, on the first tick that started after its frame handed
 //! it over ([`check_ticks`]), and how long that took; and a script's events can arrive as a
@@ -25,6 +28,7 @@
 use crate::live::Live;
 use crate::pace::{Pacer, Plan};
 use crate::paced::{Ran, Ticker};
+use crate::voice::{Played, Playing};
 use crate::{Error, Host, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -80,6 +84,9 @@ struct App<'a> {
     pacer: Pacer,
     live: Live,
     ticker: Option<Ticker>,
+    /// The voice playing, once the program starts it; why it can't, if it can't.
+    voice: Option<Playing>,
+    silent: Option<String>,
     /// The events each frame took, in order, and when the ticker was handed them (seconds;
     /// before the ticker started, its start), if kept.
     taken: Vec<(Scripted, f64)>,
@@ -240,6 +247,19 @@ impl App<'_> {
         if let Some(t) = &self.ticker {
             let ran = t.take();
             self.note_ticks(ran)?;
+        }
+        if self.voice.is_none() && self.silent.is_none() && self.host.has_voice() {
+            match self.host.play_voice(0) {
+                Ok(p) => self.voice = Some(p),
+                Err(e) => {
+                    eprintln!("{e}");
+                    self.silent = Some(e.to_string());
+                }
+            }
+        }
+        if self.voice.as_ref().is_some_and(Playing::trapped) {
+            let playing = self.voice.take().expect("checked");
+            self.host.stop_voice(playing)?;
         }
         Ok(())
     }
@@ -404,6 +424,10 @@ pub struct WindowRan {
     pub took: Vec<f64>,
     /// Ticks the ticker dropped, behind its clock ([`crate::paced::BEHIND`]).
     pub dropped: u32,
+    /// How the voice played, if the program started one and the machine could play it; or why
+    /// it couldn't.
+    pub voice: Option<Played>,
+    pub silent: Option<String>,
     /// When each frame sampled its input (seconds), and of the events that arrived as a
     /// person's ([`WindowRun::arrive`]), when each was sent and which frame took it.
     pub sampled: Vec<f64>,
@@ -593,6 +617,8 @@ pub fn run(host: &mut Host, run: &WindowRun) -> Result<WindowRan> {
         pacer: Pacer::new(1.0 / 60.0),
         live: Live::new(),
         ticker: None,
+        voice: None,
+        silent: None,
         taken: Vec::new(),
         log,
         took: Vec::new(),
@@ -614,6 +640,15 @@ pub fn run(host: &mut Host, run: &WindowRun) -> Result<WindowRan> {
         let ticks = app.host.stop_ticker(t);
         if let Err(e) = app.note_ticks(ticks) {
             app.failed.get_or_insert(e);
+        }
+    }
+    let mut voice = None;
+    if let Some(p) = app.voice.take() {
+        match app.host.stop_voice(p) {
+            Ok(played) => voice = Some(played),
+            Err(e) => {
+                app.failed.get_or_insert(e);
+            }
         }
     }
     ran.map_err(|e| Error::Gpu(format!("the window: {e}")))?;
@@ -638,6 +673,8 @@ pub fn run(host: &mut Host, run: &WindowRun) -> Result<WindowRan> {
         log: app.log,
         took: app.took,
         dropped: app.dropped,
+        voice,
+        silent: app.silent,
         sampled: app.sampled,
         arrived: app.arrived,
     })
