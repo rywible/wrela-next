@@ -62,6 +62,21 @@ pub const LOAD: u32 = 0
 pub const ASKS: u32 = 0
 pub const CELL: f32 = 0.0
 
+/// The stack (SCENE 1): how far from its surface the eye stands (m, along the spike's line of
+/// sight; 0: the spike's own eye, 100 m from its axis); whether the eye walks toward it at
+/// `WALK_SPEED` m/s turning to and fro at up to `TURN_RATE` rad/s, for `WALK_FRAMES` frames, then
+/// stops. Judged: the picture of the last walking frame (cells still filling), then the picture
+/// `STILL_FRAMES` frames after it stopped. A still eye is judged after `STILL_FRAMES` frames too
+/// (the cells a still eye wants are filled by then, or the lines say not).
+pub const STACK_AT: f32 = 0.0
+pub const EDGE: bool = false
+pub const WALK: bool = false
+pub const WALK_FRAMES: u32 = 90
+pub const STILL_FRAMES: u32 = 30
+const WALK_SPEED: f32 = 1.4
+const TURN_RATE: f32 = 0.5236
+const TURN_SWING: f32 = 0.15
+
 /// What is shown: 0 the engine's picture; 1 the reference; 2 where the judges read the engine's
 /// coverage as off (`engine::judge::marks`); 3 each pixel's steps (the engine's instrument).
 pub const SHOW: u32 = 0
@@ -91,11 +106,14 @@ pub struct Program {
     walk: Move,
     rig: Rig,
     moment: u32,
-    /// Whether the engine has drawn this moment.
+    /// Whether the engine has drawn this moment, and how many frames it has drawn in it.
     drawn: bool,
+    draws: u32,
     frames: u32,
     finished: bool,
     said: bool,
+    /// The turn that puts the stack's outline mid-view (`EDGE`; -1 until found).
+    edge: f32,
 }
 
 pub fn init() -> Program {
@@ -116,10 +134,67 @@ pub fn init() -> Program {
         rig: rig(),
         moment: 0,
         drawn: false,
+        draws: 0,
         frames: 0,
         finished: false,
         said: false,
+        edge: -1.0,
     }
+}
+
+/// The eye on the stack, `k` frames into its walk: on the spike's line of sight, `STACK_AT` m from
+/// the surface (or the walk's start, 30 m), walked toward it and turned to and fro; or, still and
+/// `EDGE`, turned (about the upright) until the stack's outline is in the middle of the view.
+fn stack_eye(p: mut Program, field: world::stack::Stack, k: u32) -> Eye {
+    if STACK_AT <= 0.0 && !WALK {
+        return STACK_EYE
+    }
+    let d = normalize(STACK_EYE.toward - STACK_EYE.at)
+    // Where the line of sight meets the stack's surface (a march on the CPU, by its value over
+    // its stated steepness).
+    var t = 0.0
+    var i: u32 = 0
+    while i < 4000 && field.distance(STACK_EYE.at + d * t) > 0.001 {
+        t += max(field.distance(STACK_EYE.at + d * t) / 3.5, 0.0005)
+        i += 1
+    }
+    let away = if WALK { 30.0 - WALK_SPEED * f32(k) / 60.0 } else { STACK_AT }
+    let at = STACK_EYE.at + d * (t - away)
+    if EDGE && !WALK && p.edge < 0.0 {
+        // (The outline: the turn at which the line of sight just misses, halved to.)
+        var a = 0.0
+        var b = 1.4
+        var j: u32 = 0
+        while j < 24 {
+            let m = 0.5 * (a + b)
+            if meets(field, at, turned(d, m)) { a = m } else { b = m }
+            j += 1
+        }
+        p.edge = a
+    }
+    let swing = if WALK { TURN_SWING * sin(TURN_RATE / TURN_SWING * f32(k) / 60.0) } else if EDGE { p.edge } else { 0.0 }
+    let way = turned(d, swing)
+    Eye { at, toward: at + way, wide: STACK_EYE.wide }
+}
+
+/// `d` turned by `a` rad about the upright.
+fn turned(d: vec3, a: f32) -> vec3 {
+    vec3(d.x * cos(a) - d.z * sin(a), d.y, d.x * sin(a) + d.z * cos(a))
+}
+
+/// Whether a ray from `o` along `d` meets the stack within 200 m (a march on the CPU).
+fn meets(field: world::stack::Stack, o: vec3, d: vec3) -> bool {
+    var t = 0.0
+    var i: u32 = 0
+    while i < 4000 && t < 200.0 {
+        let f = field.distance(o + d * t)
+        if f < 0.001 {
+            return true
+        }
+        t += max(f / 3.5, 0.0005)
+        i += 1
+    }
+    false
 }
 
 /// The creature as the walk poses it `t` s in.
@@ -133,11 +208,20 @@ pub fn frame(p: mut Program, time: f32, width: u32, height: u32) {
     let sky = clear(SUN)
     let look = photo(EXPOSURE)
     if SCENE == 1 {
-        let world = one(stack(TALL_STACK))
+        let field = stack(TALL_STACK)
+        let world = one(field)
+        // (Judging, once the engine has drawn the moment, the eye it drew it from: the frame before.)
+        // (The walk's last frame is `WALK_FRAMES` - 1; it stops there.)
+        let k = if JUDGE && p.drawn { min(p.draws - 1, WALK_FRAMES - 1) } else if JUDGE { min(p.draws, WALK_FRAMES - 1) } else { min(p.frames, WALK_FRAMES - 1) }
+        let eye = stack_eye(mut p, field, if WALK { k } else { 0 })
         if JUDGE {
-            judged(mut p, world, sky, look, STACK_EYE, width, height, t)
+            judged(mut p, world, sky, look, eye, width, height, t)
         } else {
-            p.sight.draw(world, sky, look, STACK_EYE, width, height)
+            p.sight.draw(world, sky, look, eye, width, height)
+        }
+        if p.frames % 60 == 0 {
+            let (used, room) = p.sight.bytes()
+            print(f"cells: frame {p.frames}: {used / 1048576.0} MB of cells in use, {room / 1048576.0} MB of room; {used / f32(width * height)} bytes a screen pixel")
         }
         return
     }
@@ -177,15 +261,16 @@ fn judged<W: engine::matter::world::World, S: engine::matter::sky::Sky, L: engin
     }
     if !p.finished {
         if !p.drawn {
-            // (Until the engine has chosen how it asks each thing, it draws every frame: its
-            // choice is timed on its frames.)
+            // (The engine draws until its cells are filled for this eye: `STILL_FRAMES` frames,
+            // or the walk's.)
             p.sight.drawn_only(world, sky, look, eye, width, height)
-            p.drawn = p.sight.settled()
+            if p.sight.settled() {
+                p.draws += 1
+            }
+            let need = if WALK { WALK_FRAMES + STILL_FRAMES * p.moment } else { STILL_FRAMES }
+            p.drawn = p.draws >= need
         }
-        // (The reference waits until the engine has chosen: the engine times its own frames to
-        // choose, and the reference's passes in them made the stage's field look five times
-        // dearer than it is.)
-        if p.drawn {
+        if p.drawn && !p.reference.done() {
             p.reference.work(world, sky, look, eye, width, height)
         }
         if p.reference.done() && p.drawn {
@@ -203,10 +288,19 @@ fn judged<W: engine::matter::world::World, S: engine::matter::sky::Sky, L: engin
             print(f"moment {p.moment} done")
             p.moment += 1
             p.drawn = false
-            if p.moment >= MOMENTS {
-                p.finished = true
+            if WALK {
+                // (The eye stopped: the same reference, the engine drawing on.)
+                p.draws = WALK_FRAMES
+                if p.moment >= 2 {
+                    p.finished = true
+                }
             } else {
-                p.reference.begin()
+                p.draws = 0
+                if p.moment >= MOMENTS {
+                    p.finished = true
+                } else {
+                    p.reference.begin()
+                }
             }
         }
     }

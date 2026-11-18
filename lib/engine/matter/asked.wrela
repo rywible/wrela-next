@@ -1,27 +1,31 @@
 // Matter as GPU code asks it (docs/design.md, "The engine's four modules": matter). Four
 // questions, and nothing of how they are answered: how far along a ray it may go and not pass
 // matter (`step`), how far matter is (`far`, under 0 inside), which way it faces (`facing`), and
-// what it is made of (`made_of`). A thing (`Seen`) answers by its field or by its cells, as the
-// engine chose for it (`cells`): by its field, its value over its steepness everywhere in its
-// grid; by its cells, where a brick holds nothing the ray goes to the brick's far side (or as far
-// as the brick's middle says the surface is), and in a kept brick by the cells' distance. A world
-// of things (`Both`) answers for whichever thing is nearer. A field's raw value is read only here, and always divided by the
-// steepness its field states, so a distance never runs past the true one where the field answers.
+// what it is made of (`made_of`). Each ask says how finely it is asked (`size`, m: whoever asks
+// knows; matter never sees the eye).
+//
+// A thing (`Seen`) answers by its field or by its cells, as the engine chose for it (`cost`): by
+// its field, its value over its steepness; by its cells, where a root brick holds nothing the ray
+// goes to the brick's far side (or as far as the brick's middle says the surface is), and in a
+// kept brick by the finest brick of its tree there no coarser than `size` (or the finest there
+// is), its distance read between the eight texels round the point. A world of things (`Both`)
+// answers for whichever thing is nearer. A field's raw value is read only here and in `cells`,
+// always divided by the steepness its field states.
 
-use matter::cells::{ASKS_CELLS, B, Grid, NO_BRICK}
+use matter::cells::{B, CELL_PER_SIZE, EMPTY, Grid, LEVELS, NODE, NONE, NO_BRICK, read_cells}
 use matter::substance::Substance
 use std::field::Field
-use std::gpu::{Rg32Uint, Rgba16Float, Sampler, Texture3d}
+use std::gpu::GpuSpan
 
 /// Matter as the engine's own groups answer, told which of its things (a bit each, the first the
-/// lowest) are asked by their cells: a number the draw gives as a constant (a pipeline for each),
-/// so a thing asked by its cells carries no code of its field's into the ray's pipeline, nor one
-/// asked by its field any of its cells'. `Chosen` puts the number with the group.
+/// lowest) are asked by their cells: a constant of the pipeline (`Chosen`), so a thing asked by
+/// its cells carries no code of its field's into the ray, nor one asked by its field any of its
+/// cells'.
 pub trait Answers: Copy {
     fn count(self) -> u32
-    fn step_by(self, p: vec3, d: vec3, inv: vec3, cells: u32) -> vec2
-    fn far_by(self, p: vec3, cells: u32) -> f32
-    fn facing_by(self, p: vec3, came: vec3, cells: u32) -> vec3
+    fn step_by(self, p: vec3, d: vec3, inv: vec3, size: f32, cells: u32) -> vec2
+    fn far_by(self, p: vec3, size: f32, cells: u32) -> f32
+    fn facing_by(self, p: vec3, came: vec3, size: f32, cells: u32) -> vec3
     fn made_of(self, p: vec3) -> Substance
     fn span(self, o: vec3, d: vec3) -> vec2
 }
@@ -29,16 +33,16 @@ pub trait Answers: Copy {
 /// Matter as GPU code asks it.
 pub trait Asked: Copy {
     /// How far along `d` (unit; `inv` its reciprocal, each axis) from `p` a ray may go and not
-    /// pass matter (`x`), and how far matter is from `p` at the least (`y`: under 0 inside).
-    /// Where cells answer, both are the cells' (as near the surface as the cells hold it).
-    fn step(self, p: vec3, d: vec3, inv: vec3) -> vec2
+    /// pass matter (`x`), and how far matter is from `p` at the least (`y`: under 0 inside),
+    /// asked `size` m finely. Where cells answer, both are the cells'.
+    fn step(self, p: vec3, d: vec3, inv: vec3, size: f32) -> vec2
 
     /// How far matter is from `p` (under 0 inside), as `step`'s `y`.
-    fn far(self, p: vec3) -> f32
+    fn far(self, p: vec3, size: f32) -> f32
 
     /// Which way matter faces at `p` on its surface (unit, out of it); `came` (unit) where it
     /// can't say.
-    fn facing(self, p: vec3, came: vec3) -> vec3
+    fn facing(self, p: vec3, came: vec3, size: f32) -> vec3
 
     /// What matter is made of at `p`.
     fn made_of(self, p: vec3) -> Substance
@@ -48,13 +52,13 @@ pub trait Asked: Copy {
     fn span(self, o: vec3, d: vec3) -> vec2
 }
 
-/// One thing as GPU code asks it: its field, its grid, its cells.
+/// One thing as GPU code asks it: its field, its grid, its cells (roots, nodes, texels).
 pub borrow struct Seen<M: Field<Substance>> {
     pub(package) field: M,
     pub(package) grid: Grid,
-    pub(package) coarse: borrow Texture3d<Rg32Uint>,
-    pub(package) atlas: borrow Texture3d<Rgba16Float>,
-    pub(package) s: borrow Sampler,
+    pub(package) roots: GpuSpan<u32>,
+    pub(package) nodes: GpuSpan<u32>,
+    pub(package) cells: GpuSpan<u32>,
 }
 
 /// Where a ray from `o` along `d` enters and leaves the box from `lo` to `hi` (m along it).
@@ -73,12 +77,11 @@ pub fn box_crossed(o: vec3, inv: vec3, lo: vec3, hi: vec3) -> vec2 {
 
 impl<M: Field<Substance>> Seen<M> {
     /// The answer at `p`, going along `d` (`along` false: no way, so an empty brick says only how
-    /// far its middle says the surface is).
-    fn answer(self, p: vec3, d: vec3, inv: vec3, along: bool, by_cells: bool) -> vec2 {
+    /// far its middle says the surface is), asked `size` m finely; `by_cells`, by its cells. Into
+    /// `x` and `y` as `Asked::step`'s; `zw` unused but for `facing` (`cells_at` gives the facing).
+    fn answer(self, p: vec3, inv: vec3, size: f32, along: bool, by_cells: bool) -> vec2 {
         let g = self.grid
-        let brick = g.brick
-        let hi = g.hi
-        let outside = max(g.lo - p, p - hi)
+        let outside = max(g.lo - p, p - g.hi)
         if max(outside.x, max(outside.y, outside.z)) > 0.0 {
             // Outside its grid, which holds all of it: at least as far as the grid is.
             let clear = length(max(outside, vec3(0.0))) + g.nudge.x
@@ -86,41 +89,88 @@ impl<M: Field<Substance>> Seen<M> {
         }
         if !by_cells {
             // A thing asked by its field: its value over its steepness, never past its surface.
-            // (Its cells would only slow a ray: an empty brick says less than the field does.)
             let f = clamp(self.field.distance(p), -g.scope, g.scope) / g.steep
             return vec2(f, f)
         }
-        let q = (p - g.lo) / brick
-        let c = clamp(floor(q), vec3(0.0), g.top)
-        let k = self.coarse.load(u32(c.x), u32(c.y), u32(c.z))
-        if k.x == NO_BRICK {
-            // A brick that holds no surface: its middle's distance less how far `p` is from it,
-            // and, going along `d`, its far side.
-            let mid = g.lo + (c + vec3(0.5)) * brick
-            let at_mid = bitcast_f32(k.y)
-            let off = length(p - mid)
-            if at_mid < 0.0 {
-                let inside = min(at_mid + off, -1.0e-6)
+        let c = clamp(floor((p - g.lo) / g.brick), vec3(0.0), g.top)
+        let r = u32(c.x) + g.size.x * (u32(c.y) + g.size.y * u32(c.z))
+        var node = self.roots[2 * r]
+        var lo = g.lo + c * g.brick
+        var side = g.brick
+        var least = bitcast_f32(self.roots[2 * r + 1])
+        var empty = node == NO_BRICK
+        var level: u32 = 0
+        var leaf = false
+        while level < LEVELS && !empty && !leaf && side / f32(B) > size * CELL_PER_SIZE {
+            level += 1
+            let first = self.nodes[node * NODE + 1]
+            if first == NONE {
+                leaf = true
+            } else {
+                let half = 0.5 * side
+                let o = step(lo + vec3(half), p)
+                let child = first + u32(o.x) + 2 * u32(o.y) + 4 * u32(o.z)
+                lo = lo + o * half
+                side = half
+                if self.nodes[child * NODE] == EMPTY {
+                    empty = true
+                    least = bitcast_f32(self.nodes[child * NODE + 2])
+                } else {
+                    node = child
+                }
+            }
+        }
+        if empty {
+            // A brick that holds no surface: its middle's least distance less how far `p` is from
+            // it, and, going along the ray, its far side.
+            let off = length(p - (lo + vec3(0.5 * side)))
+            if least < 0.0 {
+                let inside = min(least + off, -1.0e-6)
                 return vec2(inside, inside)
             }
-            let lower = max(at_mid - off, 0.0)
+            let lower = max(least - off, 0.0)
             if !along {
                 return vec2(lower, lower)
             }
-            let cell_lo = g.lo + c * brick
-            let s = box_crossed(p, inv, cell_lo, cell_lo + vec3(brick))
-            return vec2(max(s.y + g.nudge.x, lower), lower)
+            let s = box_crossed(p, inv, lo, lo + vec3(side))
+            return vec2(max(s.y + 0.01 * side, lower), lower)
         }
-        let v = self.cell_at(k.x, q, c)
+        let v = read_cells(self.cells, self.nodes[node * NODE], lo, side, p)
         vec2(v.x, v.x)
     }
 
-    /// What the cells hold at `q` (in bricks) in the brick `c`, kept in slot `slot`: the
-    /// distance and the facing, read between the eight texels round it.
-    fn cell_at(self, slot: u32, q: vec3, c: vec3) -> vec4 {
-        let a = vec3(f32(slot % 64), f32((slot / 64) % 64), f32(slot / 4096)) * f32(B + 1)
-        let local = clamp((q - c) * f32(B), vec3(0.0), vec3(f32(B)))
-        self.atlas.sample_level(self.s, (a + local + vec3(0.5)) / self.grid.atlas, 0.0)
+    /// The facing the cells give at `p`, asked `size` m finely (the brick `answer` reads).
+    fn cells_facing(self, p: vec3, size: f32) -> vec3 {
+        let g = self.grid
+        let c = clamp(floor((p - g.lo) / g.brick), vec3(0.0), g.top)
+        let r = u32(c.x) + g.size.x * (u32(c.y) + g.size.y * u32(c.z))
+        var node = self.roots[2 * r]
+        if node == NO_BRICK {
+            return vec3(0.0)
+        }
+        var lo = g.lo + c * g.brick
+        var side = g.brick
+        var level: u32 = 0
+        var going = true
+        while level < LEVELS && going && side / f32(B) > size * CELL_PER_SIZE {
+            level += 1
+            let first = self.nodes[node * NODE + 1]
+            if first == NONE {
+                going = false
+            } else {
+                let half = 0.5 * side
+                let o = step(lo + vec3(half), p)
+                let child = first + u32(o.x) + 2 * u32(o.y) + 4 * u32(o.z)
+                if self.nodes[child * NODE] == EMPTY {
+                    going = false
+                } else {
+                    node = child
+                    lo = lo + o * half
+                    side = half
+                }
+            }
+        }
+        read_cells(self.cells, self.nodes[node * NODE], lo, side, p).yzw
     }
 }
 
@@ -129,25 +179,19 @@ impl<M: Field<Substance>> Answers for Seen<M> {
         1
     }
 
-    fn step_by(self, p: vec3, d: vec3, inv: vec3, cells: u32) -> vec2 {
-        self.answer(p, d, inv, along: true, by_cells: (cells & 1) != 0)
+    fn step_by(self, p: vec3, d: vec3, inv: vec3, size: f32, cells: u32) -> vec2 {
+        self.answer(p, inv, size, along: true, by_cells: (cells & 1) != 0)
     }
 
-    fn far_by(self, p: vec3, cells: u32) -> f32 {
-        self.answer(p, vec3(0.0, 1.0, 0.0), vec3(1.0e30, 1.0, 1.0e30), along: false, by_cells: (cells & 1) != 0).y
+    fn far_by(self, p: vec3, size: f32, cells: u32) -> f32 {
+        self.answer(p, vec3(1.0e30, 1.0, 1.0e30), size, along: false, by_cells: (cells & 1) != 0).y
     }
 
-    fn facing_by(self, p: vec3, came: vec3, cells: u32) -> vec3 {
-        let g = self.grid
+    fn facing_by(self, p: vec3, came: vec3, size: f32, cells: u32) -> vec3 {
         if (cells & 1) != 0 {
-            let q = (p - g.lo) / g.brick
-            let c = clamp(floor(q), vec3(0.0), g.top)
-            let k = self.coarse.load(u32(c.x), u32(c.y), u32(c.z))
-            if k.x != NO_BRICK {
-                let n = self.cell_at(k.x, q, c).yzw
-                if dot(n, n) > 1.0e-8 {
-                    return normalize(n)
-                }
+            let n = self.cells_facing(p, size)
+            if dot(n, n) > 1.0e-8 {
+                return normalize(n)
             }
             return came
         }
@@ -180,26 +224,26 @@ impl<A: Answers, B: Answers> Answers for Both<A, B> {
         self.a.count() + self.b.count()
     }
 
-    fn step_by(self, p: vec3, d: vec3, inv: vec3, cells: u32) -> vec2 {
-        let x = self.a.step_by(p, d, inv, cells)
-        let y = self.b.step_by(p, d, inv, cells >> self.a.count())
+    fn step_by(self, p: vec3, d: vec3, inv: vec3, size: f32, cells: u32) -> vec2 {
+        let x = self.a.step_by(p, d, inv, size, cells)
+        let y = self.b.step_by(p, d, inv, size, cells >> self.a.count())
         vec2(min(x.x, y.x), min(x.y, y.y))
     }
 
-    fn far_by(self, p: vec3, cells: u32) -> f32 {
-        min(self.a.far_by(p, cells), self.b.far_by(p, cells >> self.a.count()))
+    fn far_by(self, p: vec3, size: f32, cells: u32) -> f32 {
+        min(self.a.far_by(p, size, cells), self.b.far_by(p, size, cells >> self.a.count()))
     }
 
-    fn facing_by(self, p: vec3, came: vec3, cells: u32) -> vec3 {
-        if self.a.far_by(p, cells) <= self.b.far_by(p, cells >> self.a.count()) {
-            self.a.facing_by(p, came, cells)
+    fn facing_by(self, p: vec3, came: vec3, size: f32, cells: u32) -> vec3 {
+        if self.a.far_by(p, size, cells) <= self.b.far_by(p, size, cells >> self.a.count()) {
+            self.a.facing_by(p, came, size, cells)
         } else {
-            self.b.facing_by(p, came, cells >> self.a.count())
+            self.b.facing_by(p, came, size, cells >> self.a.count())
         }
     }
 
     fn made_of(self, p: vec3) -> Substance {
-        if self.a.far_by(p, 0) <= self.b.far_by(p, 0) { self.a.made_of(p) } else { self.b.made_of(p) }
+        if self.a.far_by(p, 1.0e9, 0) <= self.b.far_by(p, 1.0e9, 0) { self.a.made_of(p) } else { self.b.made_of(p) }
     }
 
     fn span(self, o: vec3, d: vec3) -> vec2 {
@@ -216,23 +260,23 @@ impl<A: Answers, B: Answers> Answers for Both<A, B> {
 }
 
 /// A world's group with which of its things are asked by their cells (`C`, a bit a thing, the
-/// first the lowest), as a constant of its type (`Answers`): what GPU code asks (`Asked`). A
-/// pipeline for each `C`: a thing asked by its cells carries no code of its field's into it.
+/// first the lowest), as a constant of its type: what GPU code asks (`Asked`). A pipeline for
+/// each `C`.
 pub borrow struct Chosen<W: Answers, const C: u32> {
     pub(package) w: W,
 }
 
 impl<W: Answers, const C: u32> Asked for Chosen<W, C> {
-    fn step(self, p: vec3, d: vec3, inv: vec3) -> vec2 {
-        self.w.step_by(p, d, inv, C)
+    fn step(self, p: vec3, d: vec3, inv: vec3, size: f32) -> vec2 {
+        self.w.step_by(p, d, inv, size, C)
     }
 
-    fn far(self, p: vec3) -> f32 {
-        self.w.far_by(p, C)
+    fn far(self, p: vec3, size: f32) -> f32 {
+        self.w.far_by(p, size, C)
     }
 
-    fn facing(self, p: vec3, came: vec3) -> vec3 {
-        self.w.facing_by(p, came, C)
+    fn facing(self, p: vec3, came: vec3, size: f32) -> vec3 {
+        self.w.facing_by(p, came, size, C)
     }
 
     fn made_of(self, p: vec3) -> Substance {
