@@ -47,6 +47,14 @@ pub const BS: u32 = 9
 /// No brick: a coarse cell the surface doesn't pass through.
 pub const NO_BRICK: u32 = 4294967295
 
+/// A coarse cell that holds no brick says, from this value up, how many cells off the nearest
+/// that holds one is (in its low byte: the greatest of the three ways' counts; `RINGS` + 1 or
+/// more: farther than was counted).
+const FAR_FROM: u32 = 4294967040
+
+/// How many cells off the nearest kept brick is counted.
+const RINGS: u32 = 15
+
 /// The atlas's bricks along x and along y (its bricks along z as many as it needs).
 const ROW: u32 = 64
 
@@ -55,7 +63,7 @@ const MOST_BRICKS: u32 = 1048576
 
 /// A brick is kept where the form's distance at its middle is within this many brick sides (its
 /// half diagonal is 0.87 of one).
-const NEAR_BRICK: f32 = 1.0
+const NEAR_BRICK: f32 = 1.2
 
 /// The most steps a ray takes; how near the surface (a share of the pixel's footprint) a ray has
 /// met it (a ray that only passes near it hasn't: its pixel is covered from its neighbour's edge
@@ -66,7 +74,21 @@ const TOUCH: f32 = 0.02
 const LEAST: f32 = 0.25
 
 /// How many steps through bricks a ray takes before its least step has doubled.
-const SKIM: f32 = 8.0
+const SKIM: f32 = 1.0e9
+
+/// How near the form (in its own footprints, `rate` pixels each) a scout says it came: a block
+/// none of whose four scouts met the form or came this near is sky to its last pixel (the
+/// farthest of its pixels is 0.71 footprints from a corner, and an edge's cover reaches 0.75 px
+/// more). The bricks kept (`NEAR_BRICK`) hold every place this near the surface at the sizes run.
+const SCOUT_NEAR: f32 = 0.9
+
+/// How far from the surface any point of a brick that holds nothing is, at the least (of a
+/// brick's side): its middle is `NEAR_BRICK` sides off or more, and its corners 0.87 from that.
+const CLEAR_OF: f32 = 0.33
+
+/// How fast a ray closes on a surface or leaves it (the stored facing along the ray) past
+/// which it isn't running level with it, for the walk's least step.
+const LEVEL_OFF: f32 = 0.1
 
 /// Where a ray steps to the surface's tangent plane rather than by the distance: the stored
 /// distance under this share of a brick (where the facing stored with it is the surface's).
@@ -129,7 +151,10 @@ pub struct Grid: Copy + GpuData {
     pub quads: u32,
     /// Whether an edge block's pixels are solved (1) or walked (0).
     pub solves: u32,
-    pub spare: vec2,
+    /// Whether edge blocks are narrowed to quarters before their pixels are solved (1). Measured
+    /// a loss on the pillar (0.15 ms of scouts and sorting for no cheaper pass), so 0.
+    pub narrow: u32,
+    pub spare: f32,
 }
 
 /// The most invocations of a filling kernel in one dispatch (its work bound times this stays
@@ -161,6 +186,8 @@ pub struct Volume<S> {
     /// The next invocation of the stage's kernel, and how many it has.
     cursor: u32,
     total: u32,
+    /// The ring being counted (0: the coarse grid's bands aren't done).
+    ring: u32,
     s: Sampler,
     /// The scouting march's texels: how far along each met the form and first came near it.
     scout: Texture<Rgba32Float>,
@@ -173,12 +200,22 @@ pub struct Volume<S> {
     /// The picture laid out (`laid_out`): each scout's colour (linear; and as the screen shows
     /// it), and the blocks of each kind listed with their draws: those filled from their
     /// corners' colours, those shaded at each pixel, sky painted at each pixel, edges solved.
+    scout_k: Texture<Rgba32Float>,
     glow: Texture<Rgba16Float>,
     glow_shown: Texture<Rgba16Float>,
+    checks: Texture<R32Uint>,
     fills: AppendBuffer<u32>,
     shades: AppendBuffer<u32>,
     skies: AppendBuffer<u32>,
     kinds_drawn: GpuBuffer<DrawArgs>,
+    /// The edge blocks narrowed: their five more scouts each, their quarters, the quarters
+    /// listed by kind, and their draws.
+    more: GpuBuffer<vec4>,
+    quarters: GpuBuffer<Quarter>,
+    sky_quarters: AppendBuffer<u32>,
+    sheet_quarters: AppendBuffer<u32>,
+    edge_quarters: AppendBuffer<u32>,
+    quarters_drawn: GpuBuffer<DrawArgs>,
     /// The load beside the frame while it's timed (sines a pixel; 0 none), and its target.
     pub load: u32,
     burned: Texture<R8>,
@@ -205,7 +242,8 @@ pub fn volume<S: Solid>(form: S, cell: f32) -> Volume<S> {
             reads: 1,
             quads: 1,
             solves: 1,
-            spare: vec2(0.0),
+            narrow: 0,
+            spare: 0.0,
         },
         coarse: texture3d(width: n, height: n, depth: n),
         atlas: texture3d(width: 1, height: 1, depth: 1),
@@ -216,6 +254,7 @@ pub fn volume<S: Solid>(form: S, cell: f32) -> Volume<S> {
         stage: 0,
         cursor: 0,
         total: n * n * n,
+        ring: 0,
         s: sampler(filter: Filter::Linear, address: Address::Clamp),
         scout: texture(width: 1, height: 1),
         classes: writable_texture(width: 1, height: 1),
@@ -223,12 +262,20 @@ pub fn volume<S: Solid>(form: S, cell: f32) -> Volume<S> {
         draws: buffer(1),
         smooth: append_buffer(1),
         smooth_draws: buffer(1),
+        scout_k: writable_texture(width: 1, height: 1),
         glow: writable_texture(width: 1, height: 1),
         glow_shown: writable_texture(width: 1, height: 1),
+        checks: writable_texture(width: 1, height: 1),
         fills: append_buffer(1),
         shades: append_buffer(1),
         skies: append_buffer(1),
         kinds_drawn: buffer(4),
+        more: buffer(5),
+        quarters: buffer(4),
+        sky_quarters: append_buffer(1),
+        sheet_quarters: append_buffer(1),
+        edge_quarters: append_buffer(1),
+        quarters_drawn: buffer(3),
         load: 0,
         burned: texture(width: 1920, height: 1080),
     }
@@ -344,6 +391,40 @@ fn coarsed<S: Solid>(form: S, g: Grid, first: u32, out: mut Atomics<u32>, bricks
     let _ = out.exchange(i: 2 * i + 1, value: bitcast_u32(f))
 }
 
+/// Coarse cells `first` on that hold no brick and aren't yet counted: `ring` cells off the
+/// nearest that holds one, where one of the 26 round it is `ring` - 1 off (or, `ring` 1, holds
+/// one). In place: a cell counted in this pass reads as `ring`, which no cell looks for.
+@compute(64)
+fn spread(g: Grid, ring: u32, first: u32, out: mut Atomics<u32>, id: GlobalId) {
+    let i = first + id.x
+    if i >= g.size.x * g.size.y * g.size.z {
+        return
+    }
+    if out.load(2 * i) != NO_BRICK {
+        return
+    }
+    let x = i % g.size.x
+    let y = (i / g.size.x) % g.size.y
+    let z = i / (g.size.x * g.size.y)
+    var found = false
+    for dz in 0..3 {
+        for dy in 0..3 {
+            for dx in 0..3 {
+                if x + dx >= 1 && y + dy >= 1 && z + dz >= 1 && x + dx <= g.size.x && y + dy <= g.size.y && z + dz <= g.size.z {
+                    let j = (x + dx - 1) + g.size.x * ((y + dy - 1) + g.size.y * (z + dz - 1))
+                    let w = out.load(2 * j)
+                    if (ring == 1 && w < FAR_FROM) || (ring > 1 && w == (FAR_FROM | (ring - 1))) {
+                        found = true
+                    }
+                }
+            }
+        }
+    }
+    if found {
+        let _ = out.exchange(i: 2 * i, value: FAR_FROM | ring)
+    }
+}
+
 /// The coarse grid put in its texture.
 @compute(4, 4, 4)
 fn coarse_copied(raw: [u32], g: Grid, out: mut Texels3d<Rg32Uint>, id: GlobalId) {
@@ -395,7 +476,7 @@ impl<S: Solid> Volume<S> {
     /// and its count asked for; then, once the count is read, the atlas made to hold the bricks
     /// kept and filled in bands; each copied into its texture when its last band is done.
     pub fn fill<L: Look>(mut self, look: L) {
-        if self.stage == 0 {
+        if self.stage == 0 && self.ring == 0 {
             label("coarse")
             for _b in 0..BANDS_A_FRAME {
                 if self.cursor < self.total {
@@ -406,7 +487,26 @@ impl<S: Solid> Volume<S> {
                     self.cursor += BAND
                 }
             }
+            if self.cursor >= self.total && self.ring == 0 {
+                self.ring = 1
+                self.cursor = 0
+            }
+            return
+        }
+        if self.stage == 0 {
+            // How far each cell that holds no brick is from the nearest that does, a ring a pass.
+            label("spread")
+            for _b in 0..BANDS_A_FRAME {
+                if self.cursor < self.total {
+                    dispatch(spread.bind(g: self.grid, ring: self.ring, first: self.cursor, out: mut self.raw), over: BAND)
+                    self.cursor += BAND
+                }
+            }
             if self.cursor >= self.total {
+                self.ring += 1
+                self.cursor = 0
+            }
+            if self.ring > RINGS {
                 dispatch(coarse_copied.bind(raw: self.raw.items(), g: self.grid, out: mut self.coarse), over: self.coarse)
                 self.counted = Some(read(self.bricks.count()))
                 self.stage = 1
@@ -627,7 +727,7 @@ fn field_at(
     let q = (p - g.lo) / brick
     let c = clamp(floor(q), vec3(0.0), top)
     let k = coarse.load(u32(c.x), u32(c.y), u32(c.z))
-    if k.x == NO_BRICK {
+    if k.x >= FAR_FROM {
         // (A brick that holds nothing is a brick's side from the surface at the least: outside
         // the form, or by its sign inside it.)
         return vec4(if bitcast_f32(k.y) < 0.0 { -brick } else { brick }, 0.0, 0.0, 0.0)
@@ -652,7 +752,7 @@ fn cell_at(
     let q = (p - g.lo) / brick
     let c = clamp(floor(q), vec3(0.0), top)
     let k = coarse.load(u32(c.x), u32(c.y), u32(c.z))
-    if k.x == NO_BRICK {
+    if k.x >= FAR_FROM {
         return (vec4(brick, 0.0, 0.0, 0.0), vec4(0.0))
     }
     let a = vec3(f32(k.x % ROW), f32((k.x / ROW) % ROW), f32(k.x / (ROW * ROW))) * f32(BS)
@@ -713,6 +813,9 @@ fn walk(
     let brick = g.cell * f32(B)
     let touch = TOUCH * px
     let floor_step = LEAST * px
+    let whole = g.cell
+    let clear_of = CLEAR_OF * brick
+    let half_cell = 0.5 * g.cell
     let close = near * px
     let plane = PLANE * brick
     let top = vec3(f32(g.size.x - 1), f32(g.size.y - 1), f32(g.size.z - 1))
@@ -735,7 +838,7 @@ fn walk(
             let q = (p - g.lo) / brick
             let c = clamp(floor(q), vec3(0.0), top)
             let k = coarse.load(u32(c.x), u32(c.y), u32(c.z))
-            if k.x == NO_BRICK {
+            if k.x >= FAR_FROM {
                 empty += 1
                 let cell_lo = g.lo + c * brick
                 let ex = if d.x > 0.0 { (cell_lo.x + brick - p.x) / d.x } else if d.x < 0.0 { (cell_lo.x - p.x) / d.x } else { 1.0e30 }
@@ -744,7 +847,16 @@ fn walk(
                 let exit = min(ex, min(ey, ez))
                 let mid = cell_lo + half
                 let far = abs(bitcast_f32(k.y)) / g.steep - length(p - mid)
-                t += max(exit, far) + nudge
+                // (Or as many bricks as lie between here and the nearest that holds any, less one.)
+                let rings = f32(min(k.x & 255, RINGS + 1) - 1) * brick
+                // (Here the surface is at least that far off, and what a brick that holds
+                // nothing is from it besides.)
+                if rings + clear_of < least {
+                    least = rings + clear_of
+                    least_t = t
+                    least_v = vec4(0.0)
+                }
+                t += max(max(exit, far), rings) + nudge
             } else {
                 let a = vec3(f32(k.x % ROW), f32((k.x / ROW) % ROW), f32(k.x / (ROW * ROW))) * f32(BS)
                 let local = clamp((q - c) * f32(B), vec3(0.0), vec3(f32(B)))
@@ -770,9 +882,14 @@ fn walk(
                     if v.x < plane && lean_in > 0.2 {
                         step = min(v.x / lean_in, 4.0 * v.x)
                     }
-                    // The least step grows as a ray skims a surface without meeting it: a ray
-                    // that long near it passes an outline, whose cover the edge record carries.
-                    t += max(step, floor_step * t * (1.0 + f32(steps - empty) / SKIM))
+                    // The least step: a share of the footprint; and, where the ray isn't closing
+                    // on the surface, of a cell: half one where it runs level with it, a whole
+                    // one where it is leaving it. (A ray level with a surface a metre round goes
+                    // a tenth of a millimetre into it over half a cell: what is stepped over is
+                    // far under a pixel, and finer than the cells hold.)
+                    let along = dot(v.yzw, d)
+                    let by_cell = if along > LEVEL_OFF { whole } else if along > -LEVEL_OFF { half_cell } else { 0.0 }
+                    t += max(step, max(floor_step * t, by_cell))
                 }
             }
         }
@@ -826,7 +943,7 @@ fn shown<L: Look>(
         let q = (p - g.lo) / brick
         let c = clamp(floor(q), vec3(0.0), top)
         let k = coarse.load(u32(c.x), u32(c.y), u32(c.z))
-        if k.x != NO_BRICK {
+        if k.x < FAR_FROM {
             let a = vec3(f32(k.x % ROW), f32((k.x / ROW) % ROW), f32(k.x / (ROW * ROW))) * f32(BS)
             let local = clamp((q - c) * f32(B), vec3(0.0), vec3(f32(B)))
             let r = albedo.sample_level(s, (a + local + vec3(0.5)) / g.atlas, 0.0).xyz
@@ -920,7 +1037,8 @@ pub fn marched<L: Look>(
 /// A texel of the scouting march, one each `rate` × `rate` pixels: how far along its ray it met
 /// the form (not: under 0, less how far along it was last within two of its footprints of the
 /// form, or 0), its facing and albedo there, and how far along the ray first came within two of
-/// its footprints of the form (0: never), whether or not it went on to meet it.
+/// its footprints of the form (0: never), whether or not it went on to meet it. One that didn't
+/// meet it holds, in place of a facing, whether it came near it (`SCOUT_NEAR`: 1 or 0).
 @fragment
 pub fn scouted(
     pixel: FragCoord,
@@ -941,7 +1059,7 @@ pub fn scouted(
     }
     let w = walk(g, coarse, atlas, s, eye.at, d, from: span.x, to: span.y, px: eye.pixel() * rate, near: 2.0)
     if !w.met {
-        return vec4(-w.last, 0.0, 0.0, w.near)
+        return vec4(-w.last, if w.least < SCOUT_NEAR * rate * eye.pixel() * w.least_t { 1.0 } else { 0.0 }, 0.0, w.near)
     }
     let n = normalize(w.v.yzw)
     let t = w.t + w.v.x / max(-dot(n, d), 0.25)
@@ -949,6 +1067,44 @@ pub fn scouted(
     let top = vec3(f32(g.size.x - 1), f32(g.size.y - 1), f32(g.size.z - 1))
     let (_, a) = cell_at(g, coarse, atlas, albedo, s, brick, top, eye.at + d * t)
     vec4(t, faced(n), rooted(a.xyz), w.near)
+}
+
+/// The same, a scout an invocation (a pass this small costs more to begin than its rays do).
+@compute(8, 8)
+fn scouted_each(
+    eye: Eye,
+    g: Grid,
+    coarse: Texture3d<Rg32Uint>,
+    atlas: Texture3d<Rgba16Float>,
+    albedo: Texture3d<Rgba8>,
+    s: Sampler,
+    out_size: vec2u,
+    rate: f32,
+    out: mut Texels<Rgba32Float>,
+    id: GlobalId,
+) {
+    if id.x >= out_size.x || id.y >= out_size.y {
+        return
+    }
+    // (Scouts stand at the corners of blocks of `rate` × `rate` pixels: texel (i, j)'s ray is
+    // through the screen at (i, j) × `rate`.)
+    let d = eye.ray(vec2(f32(id.x), f32(id.y)) * rate)
+    let span = crossing(eye, g, d)
+    if !(span.x < span.y) {
+        out.store(id, vec4(0.0))
+        return
+    }
+    let w = walk(g, coarse, atlas, s, eye.at, d, from: span.x, to: span.y, px: eye.pixel() * rate, near: 2.0)
+    if !w.met {
+        out.store(id, vec4(-w.last, if w.least < SCOUT_NEAR * rate * eye.pixel() * w.least_t { 1.0 } else { 0.0 }, 0.0, w.near))
+        return
+    }
+    let n = normalize(w.v.yzw)
+    let t = w.t + w.v.x / max(-dot(n, d), 0.25)
+    let brick = g.cell * f32(B)
+    let top = vec3(f32(g.size.x - 1), f32(g.size.y - 1), f32(g.size.z - 1))
+    let (_, a) = cell_at(g, coarse, atlas, albedo, s, brick, top, eye.at + d * t)
+    out.store(id, vec4(t, faced(n), rooted(a.xyz), w.near))
 }
 
 /// What a pixel reads from its four scouting rays: the nearest that any met the form or came near
@@ -969,6 +1125,11 @@ struct Scouts: Copy {
     /// How far along this pixel's ray each of the four puts the form where it met it (by its
     /// tangent plane, where that faces the ray; else as far as it met it itself; 0: it didn't).
     depths: vec4,
+    /// Where each of the four met the form (the world's; unset where it didn't: `depths` 0).
+    q0: vec3,
+    q1: vec3,
+    q2: vec3,
+    q3: vec3,
 }
 
 fn scouts_at(eye: Eye, scout: Texture<Rgba32Float>, rate: f32, pixel: vec2, d: vec3) -> Scouts {
@@ -977,7 +1138,7 @@ fn scouts_at(eye: Eye, scout: Texture<Rgba32Float>, rate: f32, pixel: vec2, d: v
     let lo = clamp(floor(c), vec2(0.0), top)
     let hi = min(lo + vec2(1.0), top)
     let f = saturate(c - lo)
-    var out = Scouts { start: 1.0e30, met: 0, blend: 0.0, least: 1.0e30, most: 0.0, way: vec3(0.0), albedo: vec3(0.0), far: 0.0, depths: vec4(0.0) }
+    var out = Scouts { start: 1.0e30, met: 0, blend: 0.0, least: 1.0e30, most: 0.0, way: vec3(0.0), albedo: vec3(0.0), far: 0.0, depths: vec4(0.0), q0: vec3(0.0), q1: vec3(0.0), q2: vec3(0.0), q3: vec3(0.0) }
     for k in 0..4 {
         let x = if k % 2 == 0 { lo.x } else { hi.x }
         let y = if k / 2 == 0 { lo.y } else { hi.y }
@@ -1002,12 +1163,16 @@ fn scouts_at(eye: Eye, scout: Texture<Rgba32Float>, rate: f32, pixel: vec2, d: v
             }
             if k == 0 {
                 out.depths.x = depth
+                out.q0 = at
             } else if k == 1 {
                 out.depths.y = depth
+                out.q1 = at
             } else if k == 2 {
                 out.depths.z = depth
+                out.q2 = at
             } else {
                 out.depths.w = depth
+                out.q3 = at
             }
             if facing < -0.05 {
                 let tp = dot(n, at - eye.at) / facing
@@ -1270,14 +1435,15 @@ fn solved(
         if !held {
             let p = o + d * t
             let c = clamp(floor((p - g.lo) / brick), vec3(0.0), top)
-            if coarse.load(u32(c.x), u32(c.y), u32(c.z)).x != NO_BRICK {
+            let kc = coarse.load(u32(c.x), u32(c.y), u32(c.z)).x
+            if kc < FAR_FROM {
                 held = true
             } else {
                 let lo = g.lo + c * brick
                 let ex = if d.x > 0.0 { (lo.x + brick - p.x) / d.x } else if d.x < 0.0 { (lo.x - p.x) / d.x } else { 1.0e30 }
                 let ey = if d.y > 0.0 { (lo.y + brick - p.y) / d.y } else if d.y < 0.0 { (lo.y - p.y) / d.y } else { 1.0e30 }
                 let ez = if d.z > 0.0 { (lo.z + brick - p.z) / d.z } else if d.z < 0.0 { (lo.z - p.z) / d.z } else { 1.0e30 }
-                t += min(ex, min(ey, ez)) + 0.02 * brick
+                t += max(min(ex, min(ey, ez)), f32(min(kc & 255, RINGS + 1) - 1) * brick) + 0.02 * brick
             }
         }
     }
@@ -1370,6 +1536,17 @@ fn beyond_of(k: Scouts, past: f32, brick: f32) -> vec2 {
     vec2(max(past, nearest - 2.0 * brick), farthest + 2.0 * brick)
 }
 
+/// Whether any of a pixel's scouts met the form on the far side of a plane (through `p`, facing
+/// `n`) by more than `by` m: past a sheet the pixel's ray cleared at `p`, that is somewhere the
+/// sheet itself isn't (its own points lie behind its tangent plane where it bulges toward the
+/// ray), so something else the ray may yet meet.
+fn met_past(k: Scouts, p: vec3, n: vec3, by: f32) -> bool {
+    (k.depths.x > 0.0 && dot(k.q0 - p, n) > by) ||
+        (k.depths.y > 0.0 && dot(k.q1 - p, n) > by) ||
+        (k.depths.z > 0.0 && dot(k.q2 - p, n) > by) ||
+        (k.depths.w > 0.0 && dot(k.q3 - p, n) > by)
+}
+
 /// Past `from` m along a ray, where it next comes on the form: is in it, or near it and falling
 /// toward it. Looked for at half-brick steps as far as `to` (a place within half a brick of any
 /// sheet is in a brick that holds it; a brick that holds nothing says by its sign whether it is
@@ -1396,9 +1573,11 @@ fn next_from(
             let q = (p - g.lo) / brick
             let c = clamp(floor(q), vec3(0.0), top)
             let k = coarse.load(u32(c.x), u32(c.y), u32(c.z))
-            if k.x == NO_BRICK {
+            if k.x >= FAR_FROM {
                 if bitcast_f32(k.y) < 0.0 {
                     found = was
+                } else {
+                    t += f32(min(k.x & 255, RINGS + 1) - 1) * brick
                 }
             } else {
                 let a = vec3(f32(k.x % ROW), f32((k.x / ROW) % ROW), f32(k.x / (ROW * ROW))) * f32(BS)
@@ -1607,9 +1786,46 @@ fn laid_holds(
     if apart(lit_at(light, on, n, a.xyz, d), c, tol) { 1 } else { 0 }
 }
 
-/// Each block of four scouts, sorted (see the head of this part) and listed by its kind.
+/// Whether a scout that didn't meet the form came near it (`SCOUT_NEAR`).
+fn close_by(e: vec4) -> bool {
+    e.x <= 0.0 && e.y > 0.5
+}
+
+/// How a quad's laying holds at the screen place `at`, the middle of a side between two scouts
+/// (`ea`, `eb`: their texels; `ca`, `cb`: their colours): 0 it holds; 1 its colour is off; 2
+/// it isn't laid at all there (one scout met the form and the other didn't, or came near it).
+fn side_holds<P: Paint>(
+    eye: Eye,
+    light: Lighting,
+    sky: P,
+    g: Grid,
+    coarse: Texture3d<Rg32Uint>,
+    atlas: Texture3d<Rgba16Float>,
+    albedo: Texture3d<Rgba8>,
+    s: Sampler,
+    at: vec2,
+    ea: vec4,
+    eb: vec4,
+    ca: vec3,
+    cb: vec3,
+    tol: f32,
+    reach: f32,
+) -> u32 {
+    if ea.x > 0.0 && eb.x > 0.0 {
+        return laid_holds(eye, light, g, coarse, atlas, albedo, s, at, 0.5 * (ea.x + eb.x), 0.5 * (ca + cb), tol)
+    }
+    if ea.x > 0.0 || eb.x > 0.0 || close_by(ea) || close_by(eb) {
+        return 2
+    }
+    if apart(painted(eye, sky, eye.ray(at)), 0.5 * (ca + cb), tol) { 1 } else { 0 }
+}
+
+/// For each scout: how what quads lay holds at the middle of the side to the scout on its right
+/// (bits 0 and 1), of the side to the scout below it (bits 2 and 3), and of the block they
+/// corner (bits 4 and 5); each as `side_holds` says. A side is checked once, for both the
+/// blocks it lies between.
 @compute(8, 8)
-fn sorted<P: Paint>(
+fn checked<P: Paint>(
     eye: Eye,
     light: Lighting,
     sky: P,
@@ -1622,7 +1838,47 @@ fn sorted<P: Paint>(
     glow: Texture<Rgba16Float>,
     rate: f32,
     tol: f32,
-    fills: mut Append<u32>,
+    out: mut Texels<R32Uint>,
+    id: GlobalId,
+) {
+    if id.x >= scout.width() || id.y >= scout.height() {
+        return
+    }
+    let x1 = min(id.x + 1, scout.width() - 1)
+    let y1 = min(id.y + 1, scout.height() - 1)
+    let e00 = scout.load(id.x, id.y)
+    let e10 = scout.load(x1, id.y)
+    let e01 = scout.load(id.x, y1)
+    let e11 = scout.load(x1, y1)
+    let c00 = glow.load(id.x, id.y).xyz
+    let c10 = glow.load(x1, id.y).xyz
+    let c01 = glow.load(id.x, y1).xyz
+    let c11 = glow.load(x1, y1).xyz
+    let o = vec2(f32(id.x), f32(id.y)) * rate
+    let across = side_holds(eye, light, sky, g, coarse, atlas, albedo, s, o + vec2(0.5, 0.0) * rate, e00, e10, c00, c10, tol, reach: rate)
+    let down = side_holds(eye, light, sky, g, coarse, atlas, albedo, s, o + vec2(0.0, 0.5) * rate, e00, e01, c00, c01, tol, reach: rate)
+    // The block's middle, laid from all four.
+    let mid = o + vec2(0.5, 0.5) * rate
+    let mean = 0.25 * (c00 + c10 + c01 + c11)
+    let met = (if e00.x > 0.0 { 1 } else { 0 }) + (if e10.x > 0.0 { 1 } else { 0 }) + (if e01.x > 0.0 { 1 } else { 0 }) + (if e11.x > 0.0 { 1 } else { 0 })
+    let near = close_by(e00) || close_by(e10) || close_by(e01) || close_by(e11)
+    var middle: u32 = 2
+    if met == 4 {
+        middle = laid_holds(eye, light, g, coarse, atlas, albedo, s, mid, 0.25 * (e00.x + e10.x + e01.x + e11.x), mean, tol)
+    } else if met == 0 && !near {
+        middle = if apart(painted(eye, sky, eye.ray(mid)), mean, tol) { 1 } else { 0 }
+    }
+    out.store(id, across | (down << 2) | (middle << 4))
+}
+
+/// Each block of four scouts, sorted (see the head of this part) by how its laying holds at its
+/// middle and its four sides' middles (`checked`), and listed by its kind.
+@compute(8, 8)
+fn sorted(
+    eye: Eye,
+    scout: Texture<Rgba32Float>,
+    checks: Texture<R32Uint>,
+    rate: f32,
     shades: mut Append<u32>,
     skies: mut Append<u32>,
     edges: mut Append<u32>,
@@ -1636,47 +1892,27 @@ fn sorted<P: Paint>(
     let e10 = scout.load(id.x + 1, id.y)
     let e01 = scout.load(id.x, id.y + 1)
     let e11 = scout.load(id.x + 1, id.y + 1)
-    let c00 = glow.load(id.x, id.y).xyz
-    let c10 = glow.load(id.x + 1, id.y).xyz
-    let c01 = glow.load(id.x, id.y + 1).xyz
-    let c11 = glow.load(id.x + 1, id.y + 1).xyz
     let met = (if e00.x > 0.0 { 1 } else { 0 }) + (if e10.x > 0.0 { 1 } else { 0 }) + (if e01.x > 0.0 { 1 } else { 0 }) + (if e11.x > 0.0 { 1 } else { 0 })
-    let near = e00.w > 0.0 || e10.w > 0.0 || e01.w > 0.0 || e11.w > 0.0
-    let o = vec2(f32(id.x), f32(id.y)) * rate
-    // The middles of its sides (top, bottom, left, right) and its own (on the quad's diagonal
-    // from its corner 10 to its corner 01).
-    let top = o + vec2(0.5, 0.0) * rate
-    let bottom = o + vec2(0.5, 1.0) * rate
-    let left = o + vec2(0.0, 0.5) * rate
-    let right = o + vec2(1.0, 0.5) * rate
-    let mid = o + vec2(0.5, 0.5) * rate
+    let near = close_by(e00) || close_by(e10) || close_by(e01) || close_by(e11)
+    let own = checks.load(id.x, id.y)
+    let right = (checks.load(id.x + 1, id.y) >> 2) & 3
+    let below = checks.load(id.x, id.y + 1) & 3
+    let worst = max(max(own & 3, (own >> 2) & 3), max((own >> 4) & 3, max(right, below)))
     if met == 0 && !near {
-        // Sky: its paint at the five places against what the quad lays there.
-        let off = apart(painted(eye, sky, eye.ray(top)), 0.5 * (c00 + c10), tol) ||
-            apart(painted(eye, sky, eye.ray(bottom)), 0.5 * (c01 + c11), tol) ||
-            apart(painted(eye, sky, eye.ray(left)), 0.5 * (c00 + c01), tol) ||
-            apart(painted(eye, sky, eye.ray(right)), 0.5 * (c10 + c11), tol) ||
-            apart(painted(eye, sky, eye.ray(mid)), 0.25 * (c00 + c10 + c01 + c11), tol)
-        if off {
+        if worst > 0 {
             let _ = skies.push(here)
         }
         return
     }
-    var worst: u32 = 2
+    var one_sheet = false
     if met == 4 {
+        let mid = (vec2(f32(id.x), f32(id.y)) + vec2(0.5)) * rate
         let k = scouts_at(eye, scout, rate, mid, eye.ray(mid))
-        if k.met == 4 && k.most - k.least < AGREE * rate * eye.pixel() * k.least {
-            let a = laid_holds(eye, light, g, coarse, atlas, albedo, s, top, 0.5 * (e00.x + e10.x), 0.5 * (c00 + c10), tol)
-            let b = laid_holds(eye, light, g, coarse, atlas, albedo, s, bottom, 0.5 * (e01.x + e11.x), 0.5 * (c01 + c11), tol)
-            let c = laid_holds(eye, light, g, coarse, atlas, albedo, s, left, 0.5 * (e00.x + e01.x), 0.5 * (c00 + c01), tol)
-            let dd = laid_holds(eye, light, g, coarse, atlas, albedo, s, right, 0.5 * (e10.x + e11.x), 0.5 * (c10 + c11), tol)
-            let m = laid_holds(eye, light, g, coarse, atlas, albedo, s, mid, 0.25 * (e00.x + e10.x + e01.x + e11.x), 0.25 * (c00 + c10 + c01 + c11), tol)
-            worst = max(max(a, b), max(max(c, dd), m))
-        }
+        one_sheet = k.met == 4 && k.most - k.least < AGREE * rate * eye.pixel() * k.least
     }
-    if worst == 0 {
+    if one_sheet && worst == 0 {
         // (Filled: the pass's first draw fills every pixel, so it is listed nowhere.)
-    } else if worst == 1 {
+    } else if one_sheet && worst == 1 {
         let _ = shades.push(here)
     } else {
         let _ = edges.push(here)
@@ -1761,8 +1997,8 @@ pub fn shaded_out(
 
 /// A pixel of sky painted itself.
 @fragment
-pub fn skied<P: Paint>(corner: BlockCorner, pixel: FragCoord, eye: Eye, sky: P, style: InkStyle, display: u32) -> vec4 {
-    out_as(style, painted(eye, sky, eye.ray(pixel.position.xy)), display)
+pub fn skied<P: Paint>(corner: BlockCorner, pixel: FragCoord, eye: Eye, sky: P, style: InkStyle, display: u32, tint: vec3) -> vec4 {
+    out_as(style, painted(eye, sky, eye.ray(pixel.position.xy)) * tint, display)
 }
 
 /// One sheet of the form as a pixel's ray sees it: its colour, how much of the pixel it covers
@@ -1775,6 +2011,9 @@ struct Sheet: Copy {
     t: f32,
     met: bool,
     out: vec2,
+    /// The sheet's point there (met, or nearest the ray) and its facing.
+    at: vec3,
+    facing: vec3,
 }
 
 /// The sheet of the form a pixel's ray first comes on from `t0` m along it (`solved`), walked
@@ -1802,6 +2041,9 @@ fn sheet_seen(
     var out = vec2(0.0)
     var off = 0.0
     var least = r.least
+    if r.state == UNSURE && (g.debug & 1048576) != 0 {
+        return Sheet { colour: vec3(1.0, 0.0, 0.0), cover: 1.0, t: t0, met: true, out, at: vec3(0.0), facing: vec3(0.0) }
+    }
     if r.state == UNSURE {
         // Walked: met where the walk met it, else clear of it by the least the walk read.
         let w = walk(g, coarse, atlas, s, eye.at, d, from: t0, to: to, px: px, near: 0.0)
@@ -1811,7 +2053,7 @@ fn sheet_seen(
             met = true
         } else {
             if w.least > 1.0e8 {
-                return Sheet { colour: vec3(0.0), cover: 0.0, t: t0, met: false, out }
+                return Sheet { colour: vec3(0.0), cover: 0.0, t: t0, met: false, out, at: vec3(0.0), facing: vec3(0.0) }
             }
             t = w.least_t
             v = w.least_v
@@ -1820,7 +2062,7 @@ fn sheet_seen(
         cover = if met { 1.0 } else { 0.0 }
     }
     if v.y == 0.0 && v.z == 0.0 && v.w == 0.0 {
-        return Sheet { colour: vec3(0.0), cover: 0.0, t, met: false, out }
+        return Sheet { colour: vec3(0.0), cover: 0.0, t, met: false, out, at: vec3(0.0), facing: vec3(0.0) }
     }
     // How many pixels inside the outline (over 0) or clear of it the pixel's middle is, and the
     // share of the pixel on the sheet's side of it. Clear of it: by the least distance read. In
@@ -1847,17 +2089,18 @@ fn sheet_seen(
             cover = covered(inside, out)
         }
     }
-    if cover <= 0.0 {
-        return Sheet { colour: vec3(0.0), cover: 0.0, t, met, out }
-    }
     if !met {
         off = max(least, 0.0)
+    }
+    if cover <= 0.0 {
+        let n0 = normalize(v.yzw)
+        return Sheet { colour: vec3(0.0), cover: 0.0, t, met, out, at: eye.at + d * t - n0 * off, facing: n0 }
     }
     let n = normalize(v.yzw)
     // (Where the ray clears the sheet, the sheet's point nearest it.)
     let p = eye.at + d * t - n * off
     let (_, a) = cell_at(g, coarse, atlas, albedo, s, brick, top, p)
-    Sheet { colour: lit_at(light, p, n, a.xyz, d), cover, t, met, out }
+    Sheet { colour: lit_at(light, p, n, a.xyz, d), cover, t, met, out, at: p, facing: n }
 }
 
 /// A pixel of an edge block: the sheet of the form its ray first comes on, by its share of the
@@ -1883,6 +2126,13 @@ pub fn edged_out<P: Paint>(
     let d = eye.ray(pixel.position.xy)
     let k = scouts_at(eye, scout, rate, pixel.position.xy, d)
     var colour = painted(eye, sky, d)
+    if (g.debug & 524288) != 0 {
+        return out_as(style, colour, display)
+    }
+    if (g.debug & 2097152) != 0 {
+        let n = (if k.depths.x > 0.0 { 1.0 } else { 0.0 }) + (if k.depths.y > 0.0 { 1.0 } else { 0.0 }) + (if k.depths.z > 0.0 { 1.0 } else { 0.0 }) + (if k.depths.w > 0.0 { 1.0 } else { 0.0 })
+        return vec4(8.0, n, 0.0, 1.0)
+    }
     if k.start < 1.0e29 {
         let brick = g.cell * f32(B)
         let top = vec3(f32(g.size.x - 1), f32(g.size.y - 1), f32(g.size.z - 1))
@@ -1892,7 +2142,7 @@ pub fn edged_out<P: Paint>(
         let to = min(span.y, max(k.far, k.start) + PAST * brick)
         let near = sheet_seen(eye, light, g, coarse, atlas, albedo, s, d, t0: ahead, to: to)
         var behind = false
-        if near.cover < 1.0 {
+        if near.cover < 1.0 && (g.debug & 4194304) == 0 {
             // The rest of the pixel: along this ray past the sheet, where it clears it; where it
             // enters it, along the ray a pixel and a half out past its outline.
             var past = d
@@ -1922,6 +2172,190 @@ pub fn edged_out<P: Paint>(
     out_as(style, colour, display)
 }
 
+// ---- edge blocks narrowed --------------------------------------------------------------------------
+//
+// An edge block is `rate` pixels a side, and only its pixels within one or two of an outline need
+// solving. So each edge block gets five more scouts (the middles of its sides and its own) and is
+// cut in four; each quarter is sorted again from its own four scouts: sky (painted), one sheet
+// (each pixel reads the volume once where a quad puts it), or still an edge (solved).
+
+/// A quarter of an edge block: how far along its ray each of its four scouts met the form, and
+/// where it is (`at.xy`: in half blocks).
+pub struct Quarter: Copy + GpuData {
+    pub t: vec4,
+    pub at: vec4,
+}
+
+/// The five more scouts of each edge block (an invocation a scout: the middle of its top side,
+/// of its left, its own, of its right, of its bottom), each a scout's texel (`scouted`), walked
+/// from a little in front of where the block's own scouts first found the form.
+@compute(5)
+fn scouted_more(
+    eye: Eye,
+    g: Grid,
+    coarse: Texture3d<Rg32Uint>,
+    atlas: Texture3d<Rgba16Float>,
+    albedo: Texture3d<Rgba8>,
+    s: Sampler,
+    scout: Texture<Rgba32Float>,
+    edges: [u32],
+    rate: f32,
+    out: mut Slots<vec4>,
+    id: GlobalId,
+) {
+    let b = edges[id.x / 5]
+    let j = id.x % 5
+    let off = if j == 0 { vec2(0.5, 0.0) } else if j == 1 { vec2(0.0, 0.5) } else if j == 2 { vec2(0.5, 0.5) } else if j == 3 { vec2(1.0, 0.5) } else { vec2(0.5, 1.0) }
+    let pixel = (vec2(f32(b & 65535), f32(b >> 16)) + off) * rate
+    let d = eye.ray(pixel)
+    let span = crossing(eye, g, d)
+    if !(span.x < span.y) {
+        out[id] = vec4(0.0)
+        return
+    }
+    let brick = g.cell * f32(B)
+    let k = scouts_at(eye, scout, rate, pixel, d)
+    let from = if k.start < 1.0e29 { max(span.x, k.start - 2.0 * rate * eye.pixel() * k.start - brick) } else { span.x }
+    let w = walk(g, coarse, atlas, s, eye.at, d, from: from, to: span.y, px: eye.pixel() * rate * 0.5, near: 2.0)
+    if !w.met {
+        out[id] = vec4(-w.last, if w.least < SCOUT_NEAR * 0.5 * rate * eye.pixel() * w.least_t { 1.0 } else { 0.0 }, 0.0, w.near)
+        return
+    }
+    let n = normalize(w.v.yzw)
+    let t = w.t + w.v.x / max(-dot(n, d), 0.25)
+    let top = vec3(f32(g.size.x - 1), f32(g.size.y - 1), f32(g.size.z - 1))
+    let (_, a) = cell_at(g, coarse, atlas, albedo, s, brick, top, eye.at + d * t)
+    out[id] = vec4(t, faced(n), rooted(a.xyz), w.near)
+}
+
+/// How far along the ray `d` a scout's tangent plane puts the form (the scout's texel `e`, its
+/// ray through the screen at `at` px); 0 where it didn't meet it or its plane doesn't face `d`.
+fn plane_along(eye: Eye, e: vec4, at: vec2, d: vec3) -> f32 {
+    if e.x <= 0.0 {
+        return 0.0
+    }
+    let n = unfaced(e.y)
+    let facing = dot(n, d)
+    if facing > -0.05 {
+        return 0.0
+    }
+    dot(n, eye.ray(at) * e.x) / facing
+}
+
+/// Each quarter of each edge block (an invocation a quarter), sorted from its four scouts and
+/// listed: sky (none met the form or came near it), one sheet (all four met it, their tangent
+/// planes agree at its middle, and the form is there), or an edge.
+@compute(4)
+fn quartered(
+    eye: Eye,
+    g: Grid,
+    coarse: Texture3d<Rg32Uint>,
+    atlas: Texture3d<Rgba16Float>,
+    s: Sampler,
+    scout: Texture<Rgba32Float>,
+    edges: [u32],
+    more: [vec4],
+    rate: f32,
+    quarters: mut Slots<Quarter>,
+    skies: mut Append<u32>,
+    sheets: mut Append<u32>,
+    solved_at: mut Append<u32>,
+    id: GlobalId,
+) {
+    let block = id.x / 4
+    let q = id.x % 4
+    let b = edges[block]
+    let i = b & 65535
+    let j = b >> 16
+    let qx = q & 1
+    let qy = q >> 1
+    let top = more[5 * block]
+    let left = more[5 * block + 1]
+    let mid = more[5 * block + 2]
+    let right = more[5 * block + 3]
+    let bottom = more[5 * block + 4]
+    // Its four scouts: across the top, then across the bottom.
+    var e0 = scout.load(i, j)
+    var e1 = top
+    var e2 = left
+    var e3 = mid
+    if q == 1 {
+        e0 = top
+        e1 = scout.load(i + 1, j)
+        e2 = mid
+        e3 = right
+    } else if q == 2 {
+        e0 = left
+        e1 = mid
+        e2 = scout.load(i, j + 1)
+        e3 = bottom
+    } else if q == 3 {
+        e0 = mid
+        e1 = right
+        e2 = bottom
+        e3 = scout.load(i + 1, j + 1)
+    }
+    let half = 0.5 * rate
+    let hx = 2 * i + qx
+    let hy = 2 * j + qy
+    let here = hx | (hy << 16)
+    quarters[id] = Quarter { t: vec4(e0.x, e1.x, e2.x, e3.x), at: vec4(f32(hx), f32(hy), 0.0, 0.0) }
+    let met = (if e0.x > 0.0 { 1 } else { 0 }) + (if e1.x > 0.0 { 1 } else { 0 }) + (if e2.x > 0.0 { 1 } else { 0 }) + (if e3.x > 0.0 { 1 } else { 0 })
+    let near = close_by(e0) || close_by(e1) || close_by(e2) || close_by(e3)
+    if met == 0 && !near {
+        let _ = skies.push(here)
+        return
+    }
+    if met == 4 {
+        let o = vec2(f32(hx), f32(hy)) * half
+        let c = o + vec2(0.5) * half
+        let d = eye.ray(c)
+        let p0 = plane_along(eye, e0, o, d)
+        let p1 = plane_along(eye, e1, o + vec2(half, 0.0), d)
+        let p2 = plane_along(eye, e2, o + vec2(0.0, half), d)
+        let p3 = plane_along(eye, e3, o + vec2(half, half), d)
+        let least = min(min(p0, p1), min(p2, p3))
+        let most = max(max(p0, p1), max(p2, p3))
+        if least > 0.0 && most - least < AGREE * half * eye.pixel() * least {
+            let brick = g.cell * f32(B)
+            let cube = vec3(f32(g.size.x - 1), f32(g.size.y - 1), f32(g.size.z - 1))
+            let v = field_at(g, coarse, atlas, s, brick, cube, eye.at + d * (0.25 * (p0 + p1 + p2 + p3)))
+            if (v.y != 0.0 || v.z != 0.0 || v.w != 0.0) && abs(v.x) < SHEET * eye.pixel() * least {
+                let _ = sheets.push(id.x)
+                return
+            }
+        }
+    }
+    let _ = solved_at.push(here)
+}
+
+/// The three kinds of quarters' draws: six corners a quarter of each.
+@compute(3)
+fn quarters_counted(skies: [u32], sheets: [u32], edges: [u32], most: u32, out: mut Slots<DrawArgs>, id: GlobalId) {
+    let n = if id.x == 0 { skies[0] } else if id.x == 1 { sheets[0] } else { edges[0] }
+    out[id] = DrawArgs { vertices: 6, instances: min(n, most), first_vertex: 0, first_instance: 0 }
+}
+
+/// A corner of a one-sheet quarter's quad: where its scout met the form.
+@vertex
+pub fn quarter_corner(v: VertexIndex, i: InstanceIndex, sheets: [u32], quarters: [Quarter], eye: Eye, half: f32) -> Patch {
+    let q = quarters[sheets[i.index]]
+    let j = QUAD[v.index % 6]
+    let t = if j == 0 { q.t.x } else if j == 1 { q.t.y } else if j == 2 { q.t.z } else { q.t.w }
+    let pixel = (q.at.xy + vec2(f32(j & 1), f32((j >> 1) & 1))) * half
+    let d = eye.ray(pixel)
+    let world = eye.at + d * t
+    let z = dot(world - eye.at, eye.forward)
+    let on = vec2(pixel.x / eye.size.x * 2.0 - 1.0, 1.0 - pixel.y / eye.size.y * 2.0)
+    Patch {
+        clip: ClipPosition { position: vec4(on * z, eye.near, z) },
+        world,
+        normal: -d,
+        albedo: vec3(0.0),
+        field: 1.0,
+    }
+}
+
 impl<S: Solid> Volume<S> {
     /// The picture laid out for `eye`: the scouting march (one ray each `rate` × `rate` pixels),
     /// each scout shaded, each block sorted and listed (`sorted`, to within `tol` of the
@@ -1937,6 +2371,12 @@ impl<S: Solid> Volume<S> {
         if self.glow.width() != sw || self.glow.height() != sh {
             self.glow = writable_texture(width: sw, height: sh)
             self.glow_shown = writable_texture(width: sw, height: sh)
+            self.checks = writable_texture(width: sw, height: sh)
+            self.more = buffer(5 * sw * sh)
+            self.quarters = buffer(4 * sw * sh)
+            self.sky_quarters = append_buffer(4 * sw * sh)
+            self.sheet_quarters = append_buffer(4 * sw * sh)
+            self.edge_quarters = append_buffer(4 * sw * sh)
             self.fills = append_buffer(sw * sh)
             self.shades = append_buffer(sw * sh)
             self.skies = append_buffer(sw * sh)
@@ -1979,13 +2419,9 @@ impl<S: Solid> Volume<S> {
             ),
             groups: ((sw + 7) / 8, (sh + 7) / 8, 1),
         )
-        label("sorted")
-        self.fills.clear()
-        self.shades.clear()
-        self.skies.clear()
-        self.edges.clear()
+        label("checked")
         dispatch(
-            sorted.bind(
+            checked.bind(
                 eye: eye,
                 light: light,
                 sky: sky,
@@ -1998,7 +2434,21 @@ impl<S: Solid> Volume<S> {
                 glow: self.glow,
                 rate: f32(rate),
                 tol: tol,
-                fills: mut self.fills,
+                out: mut self.checks,
+            ),
+            groups: ((sw + 7) / 8, (sh + 7) / 8, 1),
+        )
+        label("sorted")
+        self.fills.clear()
+        self.shades.clear()
+        self.skies.clear()
+        self.edges.clear()
+        dispatch(
+            sorted.bind(
+                eye: eye,
+                scout: self.scout,
+                checks: self.checks,
+                rate: f32(rate),
                 shades: mut self.shades,
                 skies: mut self.skies,
                 edges: mut self.edges,
@@ -2016,6 +2466,57 @@ impl<S: Solid> Volume<S> {
             ),
             groups: 1,
         )
+        if self.grid.narrow == 0 {
+            return
+        }
+        // The edge blocks narrowed: five more scouts each, then their quarters sorted.
+        label("narrowed")
+        dispatch(
+            scouted_more.bind(
+                eye: eye,
+                g: self.grid,
+                coarse: self.coarse,
+                atlas: self.atlas,
+                albedo: self.albedo,
+                s: self.s,
+                scout: self.scout,
+                edges: self.edges.items(),
+                rate: f32(rate),
+                out: mut self.more,
+            ),
+            groups: self.edges.count(),
+        )
+        self.sky_quarters.clear()
+        self.sheet_quarters.clear()
+        self.edge_quarters.clear()
+        dispatch(
+            quartered.bind(
+                eye: eye,
+                g: self.grid,
+                coarse: self.coarse,
+                atlas: self.atlas,
+                s: self.s,
+                scout: self.scout,
+                edges: self.edges.items(),
+                more: self.more.items(),
+                rate: f32(rate),
+                quarters: mut self.quarters,
+                skies: mut self.sky_quarters,
+                sheets: mut self.sheet_quarters,
+                solved_at: mut self.edge_quarters,
+            ),
+            groups: self.edges.count(),
+        )
+        dispatch(
+            quarters_counted.bind(
+                skies: self.sky_quarters.count(),
+                sheets: self.sheet_quarters.count(),
+                edges: self.edge_quarters.count(),
+                most: 4 * sw * sh,
+                out: mut self.quarters_drawn,
+            ),
+            groups: 1,
+        )
     }
 
     /// The laid-out picture drawn into `pass`: as the screen shows it (`display`) or in linear
@@ -2027,6 +2528,7 @@ impl<S: Solid> Volume<S> {
         } else {
             draw(pass, cover, filled_over.bind(glow: self.glow, s: self.s, rate: f32(rate)), vertices: 3)
         }
+        if (self.grid.debug & 262144) == 0 {
         draw(
             pass,
             patch_corner.bind(blocks: self.shades.items(), eye: eye, scout: self.scout, rate: f32(rate)),
@@ -2043,31 +2545,79 @@ impl<S: Solid> Volume<S> {
             ),
             indirect: self.kinds_drawn.span(start: 1, count: 1),
         )
+        }
         draw(
             pass,
             block_corner.bind(edges: self.skies.items(), size: eye.size, rate: f32(rate)),
-            skied.bind(eye: eye, sky: sky, style: style, display: shows),
+            skied.bind(eye: eye, sky: sky, style: style, display: shows, tint: vec3(1.0)),
             indirect: self.kinds_drawn.span(start: 2, count: 1),
+        )
+        if self.grid.narrow == 0 {
+            draw(
+                pass,
+                block_corner.bind(edges: self.edges.items(), size: eye.size, rate: f32(rate)),
+                edged_out.bind(
+                    eye: eye,
+                    light: light,
+                    sky: sky,
+                    style: style,
+                    g: self.grid,
+                    coarse: self.coarse,
+                    atlas: self.atlas,
+                    albedo: self.albedo,
+                    s: self.s,
+                    scout: self.scout,
+                    rate: f32(rate),
+                    display: shows,
+                ),
+                indirect: self.kinds_drawn.span(start: 3, count: 1),
+            )
+            return
+        }
+        // The edge blocks' quarters: sky painted, one sheet read at each pixel, edges solved.
+        draw(
+            pass,
+            block_corner.bind(edges: self.sky_quarters.items(), size: eye.size, rate: 0.5 * f32(rate)),
+            skied.bind(eye: eye, sky: sky, style: style, display: shows, tint: if (self.grid.debug & 8388608) != 0 { vec3(1.0, 0.3, 0.3) } else { vec3(1.0) }),
+            indirect: self.quarters_drawn.span(start: 0, count: 1),
         )
         draw(
             pass,
-            block_corner.bind(edges: self.edges.items(), size: eye.size, rate: f32(rate)),
-            edged_out.bind(
+            quarter_corner.bind(sheets: self.sheet_quarters.items(), quarters: self.quarters.items(), eye: eye, half: 0.5 * f32(rate)),
+            shaded_out.bind(
                 eye: eye,
                 light: light,
-                sky: sky,
                 style: style,
                 g: self.grid,
                 coarse: self.coarse,
                 atlas: self.atlas,
                 albedo: self.albedo,
                 s: self.s,
-                scout: self.scout,
-                rate: f32(rate),
                 display: shows,
             ),
-            indirect: self.kinds_drawn.span(start: 3, count: 1),
+            indirect: self.quarters_drawn.span(start: 1, count: 1),
         )
+        if (self.grid.debug & 4096) == 0 {
+            draw(
+                pass,
+                block_corner.bind(edges: self.edge_quarters.items(), size: eye.size, rate: 0.5 * f32(rate)),
+                edged_out.bind(
+                    eye: eye,
+                    light: light,
+                    sky: sky,
+                    style: style,
+                    g: self.grid,
+                    coarse: self.coarse,
+                    atlas: self.atlas,
+                    albedo: self.albedo,
+                    s: self.s,
+                    scout: self.scout,
+                    rate: f32(rate),
+                    display: shows,
+                ),
+                indirect: self.quarters_drawn.span(start: 2, count: 1),
+            )
+        }
     }
 
     /// The laid-out picture drawn to the screen and shown.
