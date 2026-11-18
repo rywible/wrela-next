@@ -302,6 +302,51 @@ at a time, into the place this document gives it.
 4. **Matter light passes through** (fog first), then the ones most likely to fail: fur, and a
    whole world round the eye.
 
+## Directions, not yet measured
+
+Four ideas that would each remove machinery. None is built. Each has the line that would kill it,
+written before it is measured, and its place in the order.
+
+**1. A field's range over a box is the one mechanism.** The toolchain can evaluate a field over a
+box of space and give the range of its value and of its gradient. From that one operation:
+
+- a thing's bound and its steepness, here and everywhere (no author and no engine states one);
+- where nothing is (a box whose range excludes zero): the coarse grid;
+- which of a thing's parts can matter in a box: each brick keeps which are live, and an ask there
+  asks only those;
+- who answers in a brick: count what is left after that. A short remainder is asked itself; a
+  long one (noise) is kept as cells. The choice is a count, made a brick at a time, the same on
+  every run;
+- thin parts: a wand's bricks are left with one round cone, asked exactly, never sampled.
+
+It would close, at once, the first slice's unstable choice, its lost thin parts, the plain body's
+cost against a structured one, and every bound and steepness stated by hand. After slice 1b,
+before the time. Cheapest decider: live parts kept a brick, by hand if the toolchain cannot give
+ranges to a program yet, on the stage and the body. **Dead if** asking only a brick's live parts
+is not faster on the M4 than asking the whole field (the body's frame, 8.9 ms by its field), or
+if the bricks' masks and the remainders' variants cost more memory or pipelines than the cells
+they replace.
+
+**2. Move the question, not the matter.** A body is rigid parts on bones, and a part never
+changes in its own bone's frame. Keep cells a part, filled once, and carry the asked point into
+each bone's frame, joining the answers when asked. A body with bones then deposits nothing a
+frame; only matter that truly deforms (a sea, cloth) is asked afresh. It is the cure for the
+thing that is dear, moving and close. With the first dear body. **Dead if** joining the parts'
+answers at each ask costs more than the deposit it saves, or the join of sampled parts is off
+the reference by more than the judges' lines at a joint.
+
+**3. One store for everything remembered about a place.** Matter's cells, light on cells, and
+later a medium's density are each a function of position remembered as finely as the eye needs.
+One sparse store round the eye, one rule for filling it when asked. To be settled in slice 2's
+design, before light gets a store of its own. **Dead if** the two need different fineness or
+lifetimes badly enough that one store serves neither.
+
+**4. Use the facing the cells already keep.** A cell keeps a distance and a facing; the surface
+is rebuilt from distances alone. Rebuilt from both, the same cells give a sharper surface, so
+cells can be coarser for the same picture: twice as coarse is an eighth of the memory. In slice
+1b, as a measure against its memory line. **Dead if** at a given picture error it does not allow
+cells at least 1.5 times as coarse, or an ask slows by more than the memory is worth.
+
 ## Open risks
 
 - Edges cost. A ray is about 10 ns on the M4, and close up 40% of a body's pixels are edge
