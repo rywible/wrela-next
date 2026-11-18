@@ -87,14 +87,15 @@ fn the_native_host_shows_an_hdr_screen_where_its_let() {
     assert_eq!(&floats[..4], [2.0, 2.0, 2.0, 1.0], "past white, kept");
 }
 
-/// The opening on an HDR screen shows, below white, the light its SDR screen shows: each
-/// channel of a pixel the SDR screen doesn't clip, sRGB's curve undone, within the 8-bit
-/// screen's rounding (lib/frame's output pass, `last::output`). An SDR screen, the picture is
-/// as before to the bit (`tools/hosts` against a build without the output transform).
+/// A program's own output transform (toolchain/tests/screen-light, as an engine's last pass
+/// does: SDR clipped and sRGB-encoded, HDR the light itself) shows, on an HDR screen below
+/// white, the light its SDR screen shows: each channel of a pixel the SDR screen doesn't clip,
+/// sRGB's curve undone, within the 8-bit screen's rounding. The host's two screens each keep
+/// what the program drew.
 #[test]
 #[ignore = "needs a GPU"]
-fn the_opening_shows_the_same_light_on_an_hdr_screen_below_white() {
-    let (dir, _) = wrela_tests::page("game/opening", "opening-hdr");
+fn an_hdr_screen_shows_the_light_an_sdr_screen_shows_below_white() {
+    let (dir, _) = wrela_tests::page("toolchain/tests/screen-light", "screen-light");
     let run = |hdr: bool| {
         let options = wrela_host::Options { screen_hdr: hdr, ..Default::default() };
         let mut host = Host::load_with(&dir, &options).expect("load");
