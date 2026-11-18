@@ -107,6 +107,10 @@ pub struct PipelineOut {
     /// The loops its invocations each run that flattening couldn't move and that cost
     /// (`ir::rates`, §18.13): a shipped build's W0014.
     pub costly: Vec<ir::rates::Costly>,
+    /// Whole structs and arrays of read-only data its entry points still copy into each
+    /// invocation's memory once flattened (`ir::opt::read_only_copies`): a shipped build's
+    /// E0713.
+    pub copies: Vec<ir::opt::Copied>,
     /// The pipeline of its entry point's `@standin` (§18.12): what the browser runs in its
     /// place until it's built.
     pub standin: Option<u32>,
@@ -3046,7 +3050,7 @@ fn lower_compute(cx: &mut Cx, iface: Rc<Interface>, consts: Vec<ir::Const>) -> O
         function: entry,
         inputs,
     });
-    let (work, unbounded, weight, same, few, costly) = verify(cx, &mut mb, name)?;
+    let (work, unbounded, weight, same, few, costly, copies) = verify(cx, &mut mb, name)?;
     non_filtering(&mb.m, &mut bindings);
     let instances = mb.fn_instances();
     Some(PipelineOut {
@@ -3071,6 +3075,7 @@ fn lower_compute(cx: &mut Cx, iface: Rc<Interface>, consts: Vec<ir::Const>) -> O
         same,
         few,
         costly,
+        copies,
         standin: None,
         stands_in: false,
     })
@@ -3155,7 +3160,7 @@ fn lower_render(
         inputs: finputs,
     });
     let name = format!("{}_{}", ir::ident(&vdef.name), ir::ident(&fdef.name));
-    let (work, unbounded, weight, same, few, costly) = verify(cx, &mut mb, &name)?;
+    let (work, unbounded, weight, same, few, costly, copies) = verify(cx, &mut mb, &name)?;
     non_filtering(&mb.m, &mut bindings);
     let instances = mb.fn_instances();
     Some(PipelineOut {
@@ -3180,6 +3185,7 @@ fn lower_render(
         same,
         few,
         costly,
+        copies,
         standin: None,
         stands_in: false,
     })
@@ -3540,6 +3546,7 @@ type Counts = (
     Vec<ir::same::SameWork>,
     Vec<Vec<ir::same::FewInputs>>,
     Vec<ir::rates::Costly>,
+    Vec<ir::opt::Copied>,
 );
 
 /// A function's IR name without the `_<n>` and `_d<n>` tags lowering gives each instance and
@@ -3569,6 +3576,7 @@ fn verify(cx: &mut Cx, mb: &mut ModuleBuilder, name: &str) -> Option<Counts> {
     let mut same = Vec::new();
     let mut few = Vec::new();
     let mut costly = Vec::new();
+    let mut copies = Vec::new();
     // What a `@budget(work: n)` holds, taken while each function is its own: a costly loop in
     // it isn't reported (§18.13).
     let quiet = ir::rates::budgeted(&mb.m);
@@ -3611,6 +3619,7 @@ fn verify(cx: &mut Cx, mb: &mut ModuleBuilder, name: &str) -> Option<Counts> {
         if checked.is_ok() {
             weight = written_weight(&mb.m);
             same = ir::same::same_work(&mb.m, MOST_SAME_WORK + 1);
+            copies = ir::opt::read_only_copies(&mb.m, ir::opt::MOST_COPIED_BYTES);
             costly = ir::rates::costly_loops(&mb.m, &quiet, &heavy);
         }
         // For the compiler's own debugging: `WRELA_DUMP_IR=gpu` prints each pipeline's module
@@ -3627,6 +3636,7 @@ fn verify(cx: &mut Cx, mb: &mut ModuleBuilder, name: &str) -> Option<Counts> {
         {
             weight = written_weight(&flat);
             same = ir::same::same_work(&flat, MOST_SAME_WORK + 1);
+            copies = ir::opt::read_only_copies(&flat, ir::opt::MOST_COPIED_BYTES);
             costly = ir::rates::costly_loops(&flat, &quiet, &heavy);
         }
     }
@@ -3637,7 +3647,7 @@ fn verify(cx: &mut Cx, mb: &mut ModuleBuilder, name: &str) -> Option<Counts> {
     if wrela_diag::has_errors(&cx.diags) {
         return None;
     }
-    Some((work, unbounded, weight, same, few, costly))
+    Some((work, unbounded, weight, same, few, costly, copies))
 }
 
 /// A flattened module's weight (§18.11): its entry points' statements with each call to a

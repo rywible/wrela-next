@@ -35,6 +35,13 @@ pub fn flatten_gpu(m: &mut Module) -> Result<()> {
     for i in 0..m.functions.len() {
         let mut f = std::mem::take(&mut m.functions[i]);
         crate::unroll::unroll(&mut f);
+        // A large struct local is a local per field, so a copy of a uniform with a field
+        // changed (`form.only(mask)`) reads the fields it didn't change where they lie.
+        split_locals(m, &mut f, Split::Gpu);
+        forward(m, &mut f);
+        // A struct rebuilt from its split fields and taken apart again is those fields; what
+        // they read, read where it lies too.
+        forward_extracts(m, &mut f);
         forward(m, &mut f);
         promote(m, &mut f);
         forward_stores(m, &mut f);
@@ -1591,7 +1598,7 @@ fn inline_by_size(m: &mut Module) -> Result<()> {
 /// A CPU function's clean-up after inlining: its struct locals split, parts read through, loads
 /// that read what's known reused, and what nothing uses dropped.
 fn tidy(m: &Module, f: &mut Function) {
-    split_locals(m, f);
+    split_locals(m, f, Split::Cpu);
     forward_extracts(m, f);
     reuse_loads(m, f);
     // Merging is safe where a merged expression could trap: the first, which is kept, runs
@@ -1602,11 +1609,25 @@ fn tidy(m: &Module, f: &mut Function) {
     compact_locals(f);
 }
 
-// ---- splitting struct locals (CPU) ----------------------------------------------------------
+// ---- splitting struct locals -----------------------------------------------------------------
 
-/// The most fields a struct local has for it to be split, and the most bytes.
+/// The most fields a struct local has for it to be split, and the most bytes (CPU).
 const SPLIT_FIELDS: usize = 12;
 const SPLIT_BYTES: u32 = 256;
+
+/// The fewest bytes a GPU struct local has for it to be split, and the most fields.
+const GPU_SPLIT_BYTES: u32 = 64;
+const GPU_SPLIT_FIELDS: usize = 64;
+
+/// Which locals [`split_locals`] splits.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Split {
+    /// Small structs and integer vectors, into WASM locals.
+    Cpu,
+    /// Large structs (from [`GPU_SPLIT_BYTES`]): a copy of uniform data with a field changed
+    /// keeps only that field (GPU flattening).
+    Gpu,
+}
 
 /// Splits each small local of a struct type (a tuple's too) whose address isn't taken into a
 /// local per field, the fields' own structs again, so that a tuple a function builds and takes apart
@@ -1615,7 +1636,11 @@ const SPLIT_BYTES: u32 = 256;
 /// components the same way, unless a value indexes it. A store of the whole is a store of each
 /// field; a load of the whole builds it again from its fields' loads (which `forward_extracts`
 /// then reads through).
-fn split_locals(m: &Module, f: &mut Function) {
+///
+/// On the GPU ([`Split::Gpu`]) it splits large structs alone, of any size: what matters there
+/// is that a copy of a uniform's struct with a field changed (`var b = self; b.mask = m`) is no
+/// copy of the rest, whose fields [`forward`] then reads where they lie.
+fn split_locals(m: &Module, f: &mut Function, how: Split) {
     // Nested structs split a level a round.
     for _ in 0..4 {
         // Only locals something mentions (a split one is mentioned no more).
@@ -1623,10 +1648,20 @@ fn split_locals(m: &Module, f: &mut Function) {
         visit::count_local_mentions(&f.body, &mut mentions);
         let mut split = vec![false; f.locals.len()];
         for (i, l) in f.locals.iter().enumerate() {
+            let size = || crate::layout::layout(&m.types, l.ty).size;
             split[i] = mentions[i] > 0
-                && split_parts(m, l.ty)
-                    .is_some_and(|ps| !ps.is_empty() && ps.len() <= SPLIT_FIELDS)
-                && crate::layout::layout(&m.types, l.ty).size <= SPLIT_BYTES;
+                && match how {
+                    Split::Cpu => {
+                        split_parts(m, l.ty)
+                            .is_some_and(|ps| !ps.is_empty() && ps.len() <= SPLIT_FIELDS)
+                            && size() <= SPLIT_BYTES
+                    }
+                    Split::Gpu => {
+                        matches!(m.types.get(l.ty), TypeDef::Struct { fields, .. }
+                            if !fields.is_empty() && fields.len() <= GPU_SPLIT_FIELDS)
+                            && size() >= GPU_SPLIT_BYTES
+                    }
+                };
         }
         // A local whose place goes anywhere but a load or a store stays whole, as does a vector
         // indexed by a value.
@@ -2436,10 +2471,11 @@ fn read_only(m: &Module, p: &Place) -> bool {
 }
 
 /// Rewrites reads of values that are (parts of) read-only resources into loads of the resource
-/// itself, through locals that are written once.
+/// itself, through locals that are written once, or written whole each time with what the same
+/// read-only place holds ([`forwardable_copies`]).
 fn forward(m: &Module, f: &mut Function) {
     loop {
-        let fwd = forwardable_locals(f);
+        let fwd = forwardable_copies(m, f);
         let mut src: HashMap<ValueId, Place> = HashMap::new();
         let mut local_src: HashMap<LocalId, Place> = HashMap::new();
         let mut changed = false;
@@ -2455,14 +2491,52 @@ fn forward(m: &Module, f: &mut Function) {
 /// Locals written exactly once, as a whole, by a store that comes before every read of them in
 /// the same block (so it dominates them), and never written through or pointed to.
 fn forwardable_locals(f: &Function) -> HashSet<LocalId> {
-    let n = f.locals.len();
-    // Whole stores, and writes or pointers that rule a local out. (No calls are left to write
-    // one through a by-reference argument.)
     let (whole_stores, excluded) = local_writes(f);
+    let candidate: Vec<bool> =
+        (0..f.locals.len()).map(|l| whole_stores[l] == 1 && !excluded[l]).collect();
+    dominated(f, &candidate)
+}
+
+/// [`forwardable_locals`], and the locals written whole more than once, each time with a value
+/// read from the same read-only place, whose first store comes before every other mention of
+/// them in its block: each read reads what that place holds, whichever store it follows. (A
+/// call inlined into each copy of a loop [`crate::unroll`] wrote out stores its by-value
+/// argument, a uniform's struct, into the same local once a copy.)
+fn forwardable_copies(m: &Module, f: &Function) -> HashSet<LocalId> {
+    let (whole_stores, excluded) = local_writes(f);
+    let mut read: HashMap<ValueId, &Place> = HashMap::new();
+    let mut stored: Vec<Vec<ValueId>> = vec![Vec::new(); f.locals.len()];
+    visit::walk(&f.body, &mut |s| match s {
+        Stmt::Let(v, Expr::Load(p)) if read_only(m, p) => {
+            read.insert(*v, p);
+        }
+        Stmt::Store(p, v) if p.path.is_empty() => {
+            if let Some(l) = p.root_local() {
+                stored[l.index()].push(*v);
+            }
+        }
+        _ => {}
+    });
+    let same_place = |vs: &[ValueId]| {
+        let first = vs.first().and_then(|v| read.get(v));
+        first.is_some() && vs.iter().all(|v| read.get(v) == first)
+    };
+    let candidate: Vec<bool> = (0..f.locals.len())
+        .map(|l| {
+            !excluded[l]
+                && (whole_stores[l] == 1 || (whole_stores[l] > 1 && same_place(&stored[l])))
+        })
+        .collect();
+    dominated(f, &candidate)
+}
+
+/// Of the `candidate` locals, those whose first whole store comes before every other mention of
+/// them in the same block (so it dominates them).
+fn dominated(f: &Function, candidate: &[bool]) -> HashSet<LocalId> {
+    let n = f.locals.len();
     // Every mention of each local, the stores included.
     let mut mentions = vec![0u32; n];
     visit::count_local_mentions(&f.body, &mut mentions);
-    let candidate: Vec<bool> = (0..n).map(|l| whole_stores[l] == 1 && !excluded[l]).collect();
     // Dominance: in the block holding the store, every other mention comes after it. Each
     // block's statements are counted from the end, so this is one pass over the code.
     let mut ok = HashSet::new();
@@ -2499,7 +2573,7 @@ fn forwardable_locals(f: &Function) -> HashSet<LocalId> {
         }
         after
     }
-    scan(&f.body, &candidate, &mentions, &mut ok);
+    scan(&f.body, candidate, &mentions, &mut ok);
     ok
 }
 
@@ -3572,4 +3646,81 @@ mod tests {
             "a tiny body: always inlined"
         );
     }
+}
+
+// ---- copies of read-only data left (E0713) ----------------------------------------------------
+
+/// The fewest bytes of a read-only place a flattened GPU function may copy whole into each
+/// invocation's own memory before a shipped build says so (E0713): sixteen `vec4`s. (The volume
+/// spike's body of 964 bytes, copied, cost a pass 11 to 20 times its time.)
+pub const MOST_COPIED_BYTES: u32 = 256;
+
+/// A copy of read-only data into each invocation's own memory that flattening couldn't take
+/// off ([`read_only_copies`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Copied {
+    /// The function it's in, by name.
+    pub function: String,
+    /// Where in the source, if the code says.
+    pub at: Option<wrela_diag::Span>,
+    pub bytes: u32,
+    /// The type copied, by name (a struct's or an array's, as the IR prints it).
+    pub what: String,
+    /// It's of the uniform block (else a read-only buffer).
+    pub uniform: bool,
+}
+
+/// Each place a flattened GPU module still reads a whole struct or array of `least` bytes or
+/// more from its uniform block or a read-only buffer as one value: a copy into each
+/// invocation's memory, which GPU compilers keep in slow memory. Flattening reads such data
+/// where it lies wherever the code only reads it ([`forward`], [`split_locals`]); what's left is
+/// a copy the code needs, as it stands (a part of it changed at a place only the invocation
+/// knows, say).
+pub fn read_only_copies(m: &Module, least: u32) -> Vec<Copied> {
+    let mut out = Vec::new();
+    for f in &m.functions {
+        let mut here = None;
+        fn walk(
+            m: &Module,
+            f: &Function,
+            b: &Block,
+            least: u32,
+            here: &mut Option<wrela_diag::Span>,
+            out: &mut Vec<Copied>,
+        ) {
+            for s in b {
+                match s {
+                    Stmt::At(span) => *here = Some(*span),
+                    Stmt::Let(v, Expr::Load(p)) if read_only(m, p) => {
+                        let t = f.value_ty(*v);
+                        let aggregate =
+                            matches!(m.types.get(t), TypeDef::Struct { .. } | TypeDef::Array(..));
+                        let bytes = crate::layout::layout(&m.types, t).size;
+                        if aggregate && bytes >= least {
+                            let uniform = matches!(&p.root, PlaceRoot::Resource(r)
+                                if matches!(m.resources[r.index()].kind, ResourceKind::Uniform { .. }));
+                            let what = match m.types.get(t) {
+                                TypeDef::Struct { name, .. } => format!("`{name}`"),
+                                _ => "an array".to_string(),
+                            };
+                            out.push(Copied {
+                                function: f.name.clone(),
+                                at: *here,
+                                bytes,
+                                what,
+                                uniform,
+                            });
+                        }
+                    }
+                    _ => {
+                        for inner in s.blocks() {
+                            walk(m, f, inner, least, here, out);
+                        }
+                    }
+                }
+            }
+        }
+        walk(m, f, &f.body, least, &mut here, &mut out);
+    }
+    out
 }

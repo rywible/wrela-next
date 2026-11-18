@@ -1,0 +1,160 @@
+// A large uniform struct read where it lies, not copied into each invocation (backend notes,
+// "Item 2"; the volume spike lost 5-8x a pass to such copies twice): a body of three arrays of
+// twenty `vec4` (964 bytes) handed to kernels that sample it, through a method returning a
+// copy of it with a field changed (`only`), a by-value call in a short `for` (which the
+// compiler writes out), the same in a `while`, and through a generic function. Each kernel's
+// samples are read back: tests/suite/copies.rs checks them against the CPU, and that no
+// pipeline keeps a body of its own.
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch, read}
+use std::io::Pending
+
+/// Parts: a sphere each (centre, radius) in `a`, a tint in `b`, a weight in `c`; `mask` says
+/// which are there.
+pub struct Body: Copy + GpuData {
+    a: [vec4; 20],
+    b: [vec4; 20],
+    c: [vec4; 20],
+    mask: u32,
+}
+
+pub trait Shape {
+    fn sample(self, p: vec3) -> f32
+}
+
+impl Body {
+    /// The same body with only `mask`'s parts.
+    fn only(self, mask: u32) -> Body {
+        var b = self
+        b.mask = self.mask & mask
+        b
+    }
+}
+
+impl Shape for Body {
+    /// The nearest part's distance, weighted.
+    fn sample(self, p: vec3) -> f32 {
+        var d = 1.0e9
+        for i in 0..20 {
+            if (self.mask >> u32(i)) & 1 == 1 {
+                let s = self.a[i]
+                d = min(d, (length(p - s.xyz) - s.w) * self.c[i].x + self.b[i].y)
+            }
+        }
+        d
+    }
+}
+
+/// Through a generic function.
+fn far<S: Shape>(s: S, p: vec3) -> f32 {
+    s.sample(p)
+}
+
+fn at(x: u32) -> vec3 {
+    vec3(f32(x % 64) * 0.1, f32(x / 64) * 0.1, 0.5)
+}
+
+/// What kernel `k` gives invocation `x`, on the CPU.
+fn expected(body: Body, k: u32, x: u32) -> f32 {
+    if k == 0 {
+        body.sample(at(x))
+    } else if k == 1 {
+        body.only(0x55555 | (x & 3)).sample(at(x))
+    } else {
+        far(body, at(x)) + far(body, at(x) + vec3(1.0))
+    }
+}
+
+@compute(64)
+fn plain(body: Body, out: mut Slots<f32>, id: GlobalId) {
+    out[id] = body.sample(at(id.x))
+}
+
+@compute(64)
+fn masked(body: Body, out: mut Slots<f32>, id: GlobalId) {
+    out[id] = body.only(0x55555 | (id.x & 3)).sample(at(id.x))
+}
+
+@compute(64)
+fn unrolled(body: Body, out: mut Slots<f32>, id: GlobalId) {
+    var s = 0.0
+    for k in 0..2 {
+        s += far(body, at(id.x) + vec3(f32(k)))
+    }
+    out[id] = s
+}
+
+@compute(64)
+fn looped(body: Body, out: mut Slots<f32>, id: GlobalId) {
+    var s = 0.0
+    var k: u32 = 0
+    while k < 2 {
+        s += far(body, at(id.x) + vec3(f32(k)))
+        k += 1
+    }
+    out[id] = s
+}
+
+/// Invocations a kernel runs (`COUNT / 64` groups).
+pub const COUNT: u32 = 64 * 1024
+
+fn body() -> Body {
+    var a: [vec4; 20] = [vec4(0.0); 20]
+    var b: [vec4; 20] = [vec4(0.0); 20]
+    var c: [vec4; 20] = [vec4(0.0); 20]
+    for i in 0..20 {
+        let f = f32(i)
+        a[i] = vec4(f * 0.3, f * 0.17, 0.25 * f, 0.1 + 0.01 * f)
+        b[i] = vec4(0.0, 0.001 * f, 0.0, 0.0)
+        c[i] = vec4(1.0 + 0.02 * f, 0.0, 0.0, 0.0)
+    }
+    Body { a, b, c, mask: 0xfffff }
+}
+
+pub struct Work {
+    backs: [Pending<f32>; 4],
+    /// Each kernel's samples, once they arrive.
+    got: [Vec<f32>; 4],
+}
+
+pub fn init() -> Work {
+    let body = body()
+    var outs: [GpuBuffer<f32>; 4] = [buffer(COUNT), buffer(COUNT), buffer(COUNT), buffer(COUNT)]
+    let groups = COUNT / 64
+    dispatch(plain.bind(body, out: mut outs[0]), groups: groups)
+    dispatch(masked.bind(body, out: mut outs[1]), groups: groups)
+    dispatch(unrolled.bind(body, out: mut outs[2]), groups: groups)
+    dispatch(looped.bind(body, out: mut outs[3]), groups: groups)
+    let backs = [
+        read(outs[0].span(start: 0, count: COUNT)),
+        read(outs[1].span(start: 0, count: COUNT)),
+        read(outs[2].span(start: 0, count: COUNT)),
+        read(outs[3].span(start: 0, count: COUNT)),
+    ]
+    Work { backs, got: [Vec::new(), Vec::new(), Vec::new(), Vec::new()] }
+}
+
+/// How many of kernel `k`'s samples arrived.
+pub fn arrived(state: Work, k: u32) -> u32 {
+    u32(state.got[k].len())
+}
+
+/// How many of kernel `k`'s samples are the CPU's, within 1e-4 relatively.
+pub fn matched(state: Work, k: u32) -> u32 {
+    let body = body()
+    var n: u32 = 0
+    for x in 0..u32(state.got[k].len()) {
+        let want = expected(body, k, x)
+        if abs(state.got[k][x] - want) <= 1.0e-4 * (1.0 + abs(want)) {
+            n += 1
+        }
+    }
+    n
+}
+
+pub fn frame(state: mut Work, time: f32, width: u32, height: u32) {
+    for k in 0..4 {
+        if let Some(Ok(xs)) = state.backs[k].poll() {
+            state.got[k] = take xs
+        }
+    }
+}

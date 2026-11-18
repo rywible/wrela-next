@@ -265,6 +265,7 @@ codes! {
     E0710 = "E0710", "a GPU function over its `@budget` of work";
     E0711 = "E0711", "a `@standin` that can't stand in for its entry point";
     E0712 = "E0712", "GPU code that computes a value the same for every invocation, each invocation again";
+    E0713 = "E0713", "GPU code that copies a large struct or array of read-only data into each invocation";
 
     // ---- E09xx: not in tier 0 --------------------------------------------------------------
 

@@ -12,6 +12,7 @@ mod closed_list;
 mod codes;
 mod conformance;
 mod consts;
+mod copies;
 mod derive;
 mod diagnostics;
 mod doc_examples;

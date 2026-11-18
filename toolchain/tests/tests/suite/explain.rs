@@ -19,7 +19,7 @@ const UNTESTED: &[&str] = &[
 const FROM_TESTS: &[&str] = &["E0706"];
 
 /// The codes only a shipped build reports: their programs are built, not only checked.
-const FROM_BUILDS: &[&str] = &["E0707", "E0712", "W0014"];
+const FROM_BUILDS: &[&str] = &["E0707", "E0712", "E0713", "W0014"];
 
 /// The codes only a build with `--set` reports (language.md §3.5), and the set their programs
 /// are checked with.

@@ -148,6 +148,7 @@ fn emit_in(
 ) -> BuildOutput {
     let mut diagnostics = Vec::new();
     let mut costly_said = std::collections::HashSet::new();
+    let mut copies_said = std::collections::HashSet::new();
     let mut files = Vec::new();
     let mut code_lines = Vec::new();
     let mut wasm_abi = None;
@@ -331,6 +332,14 @@ fn emit_in(
                     diagnostics.push(costly_loop(c));
                 }
             }
+            for c in &p.copies {
+                // Once a place, however many pipelines copy there.
+                if let Some(at) = c.at
+                    && copies_said.insert(at)
+                {
+                    diagnostics.push(copied(at, c));
+                }
+            }
         }
         if let Some(written) = shader {
             files.push((pipeline.shader.clone(), written.bytes));
@@ -375,6 +384,22 @@ pub fn restate_abi(files: &mut [(String, Vec<u8>)]) -> Result<(), String> {
     }
     manifest.1 = m.to_json().into_bytes();
     Ok(())
+}
+
+/// E0713: a shipped build's GPU code copying a large struct or array of read-only data into
+/// each invocation (`wrela_ir::opt::read_only_copies`), at the copy.
+fn copied(at: wrela_diag::Span, c: &wrela_ir::opt::Copied) -> Diagnostic {
+    let from = if c.uniform { "the uniform block" } else { "a read-only buffer" };
+    Diagnostic::new(
+        wrela_diag::codes::E0713,
+        at,
+        format!(
+            "every invocation copies {} ({} bytes) from {from} into its own memory here",
+            c.what, c.bytes
+        ),
+    )
+    .with_note("the compiler reads a struct passed by value where it lies, unless the code needs a copy: a part of it changed and the whole then read again (a change at an index only the invocation knows, say). GPU compilers keep such a copy in slow memory; a 964-byte one made a pass 11 to 20 times slower (§18.13)")
+    .with_help("change nothing in it: pass what would change as an argument of its own (`form.sample_of(p, mask)` rather than `form.only(mask).sample(p)`)")
 }
 
 /// E0712: a shipped build's GPU code computing, in every invocation, `work` of a value the same
