@@ -339,6 +339,20 @@ std already gives a program the first half: `std::derive::interval(f, over)` is 
 `f` over a box, derived by the compiler, and a field's tape can be read. What is missing is a
 union's members numbered so that a mask selects them.
 
+*Measured so far (slice 1c, first part; numbers in the engine's log).* Ranges work on the CPU and
+in a kernel and agree. How tight they are depends on what the field is made of: a stage of boxes
+1.02 times the sampled range; a body of joined round cones about twice; a stack of noises twice
+at a 2 m box and 31 times at 8 mm, because a noise's range does not shrink with its box. A
+gradient's range is unbounded wherever a length meets zero in the box, so a body's steepness
+cannot be derived over a box wider than its limbs, and a stack's derived steepness over a 2 m box
+is 400 times too large. So: emptiness and a still thing's bound derive well today (the stack
+holds its lines from 100 m to 3 m with nothing stated, in 1.25 times the memory); steepness
+derives only over small boxes; a body's bound does not derive at all yet. Each is a named gap
+with the toolchain (a power's range, a noise's range, a length's gradient, a range that is not a
+number over a huge box), and until they close, the steepness and bounds that std's own shapes
+compose stay in use. std's tapes can already drop a union's members that cannot matter in a box,
+on the CPU; the masked ask of compiled code is what is still missing.
+
 It would close, at once, the first slice's unstable choice, its lost thin parts, the plain body's
 cost against a structured one, and every bound and steepness stated by hand. After slice 1b,
 before the time. Cheapest decider: live parts kept a brick, by hand if the toolchain cannot give
