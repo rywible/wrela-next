@@ -29,7 +29,8 @@
 // One deposit, carried from the volume spike (spike/volume, spikes/volume/volume.wrela:
 // `coarsed_parts`, `fill_parts`, `redeposit`), rewritten.
 
-use matter::cost::by_cells
+use matter::cost::{AFFORD, PARTS_SHARE, weighed, weighed_by_parts}
+use matter::parts::{Joined, chained, joins, live, whole}
 use matter::ranges::{bound_of, longest, stated_steepness}
 use std::derive::{Box3, gradient, interval}
 use matter::substance::Substance
@@ -74,8 +75,9 @@ pub const OFF: f32 = 0.1
 /// (bits: 0, or below 0 where all of it is inside), the most its field's gradient can be long over
 /// it (bits; derived; asked by its field only), and how many roots away the nearest root is that
 /// may hold matter (`CLEAR`, `cleared`: so every root nearer than that holds none, and a ray
-/// crosses them in one stride).
-pub const ROOT: u32 = 4
+/// crosses them in one stride), and which of its parts can matter in it (a bit a part: `parts`;
+/// every bit where it is asked whole).
+pub const ROOT: u32 = 5
 
 /// The most roots a root's clearance counts.
 const CLEAR: u32 = 255
@@ -130,7 +132,9 @@ pub struct Grid: Copy + GpuData {
     pub scope: f32,
     pub kept: u32,
     pub frame: u32,
-    pub spare: vec2u,
+    /// How many parts it is asked by (`parts`: 0 whole), and a spare word.
+    pub parts: u32,
+    pub spare: u32,
 }
 
 /// A unit vector folded onto an octahedron, 8 bits each way, and back.
@@ -237,7 +241,7 @@ fn kept_at<M: Field<Substance>>(field: M, g: Grid, p: vec3, side: f32) -> vec4 {
 /// Root bricks `first` on: whether each is kept (given a node, its push order), and its middle's
 /// least distance.
 @compute(64)
-fn coarsed<M: Field<Substance>>(field: M, g: Grid, first: u32, roots: mut Atomics<u32>, bricks: mut Append<u32>, id: GlobalId) {
+fn coarsed<M: Field<Substance>>(field: M, g: Grid, joined: Joined, first: u32, roots: mut Atomics<u32>, bricks: mut Append<u32>, id: GlobalId) {
     let i = first + id.x
     if i >= g.size.x * g.size.y * g.size.z {
         return
@@ -246,7 +250,19 @@ fn coarsed<M: Field<Substance>>(field: M, g: Grid, first: u32, roots: mut Atomic
     let y = (i / g.size.x) % g.size.y
     let z = i / (g.size.x * g.size.y)
     let mid = g.lo + (vec3(f32(x), f32(y), f32(z)) + vec3(0.5)) * g.brick
-    let k = kept_at(field, g, mid, g.brick)
+    var k = vec4(0.0)
+    var mask: u32 = 4294967295
+    if g.parts > 0 {
+        // Asked by its parts: which can matter here, the joined range from theirs, and the
+        // steepness of the live parts joined (the same field as the whole, inside the root).
+        let b = Box3 { lo: mid - vec3(0.5 * g.brick), hi: mid + vec3(0.5 * g.brick) }
+        let (m, v) = live(field, joined, b)
+        mask = m
+        let steep = longest(interval(|q: vec3| gradient(|r: vec3| chained(field, joined, m, r), q), b))
+        k = vec4(if v.lo <= 0.0 && v.hi >= 0.0 { 1.0 } else { 0.0 }, if v.hi < 0.0 { -1.0e-6 } else { 0.0 }, if steep < 1.0e30 { steep } else { -1.0 }, 0.0)
+    } else {
+        k = kept_at(field, g, mid, g.brick)
+    }
     var node = NO_BRICK
     if k.x > 0.5 {
         if g.asks == ASKS_FIELD {
@@ -262,6 +278,7 @@ fn coarsed<M: Field<Substance>>(field: M, g: Grid, first: u32, roots: mut Atomic
     let _ = roots.exchange(i: ROOT * i, value: node)
     let _ = roots.exchange(i: ROOT * i + 1, value: bitcast_u32(k.y))
     let _ = roots.exchange(i: ROOT * i + 2, value: bitcast_u32(k.z))
+    let _ = roots.exchange(i: ROOT * i + 4, value: mask)
 }
 
 /// Whether root `i` may hold matter (its surface may pass through it, or all of it is inside).
@@ -631,6 +648,8 @@ pub struct Kept {
     pub nodes: GpuBuffer<u32>,
     pub cells: GpuBuffer<u32>,
     bricks: AppendBuffer<u32>,
+    /// How its parts are joined (`parts::joins`), where it is asked by its parts.
+    pub joined: Joined,
     clear_a: GpuBuffer<u32>,
     clear_b: GpuBuffer<u32>,
     requests: AppendBuffer<u32>,
@@ -662,6 +681,8 @@ pub struct Kept {
     pub moving: bool,
     pub held_asks: u32,
     pub held_cell: f32,
+    /// An instrument: 1 asks it whole, never by its parts.
+    pub held_whole: u32,
     frame: u32,
 }
 
@@ -681,12 +702,14 @@ pub fn kept() -> Kept {
             scope: 1.0,
             kept: 0,
             frame: 0,
-            spare: vec2u(0, 0),
+            parts: 0,
+            spare: 0,
         },
         roots: buffer(2),
         nodes: buffer(NODE),
         cells: buffer(TEXELS),
         bricks: append_buffer(1),
+        joined: whole(),
         clear_a: buffer(1),
         clear_b: buffer(1),
         requests: append_buffer(1),
@@ -710,6 +733,7 @@ pub fn kept() -> Kept {
         moving: false,
         held_asks: 0,
         held_cell: 0.0,
+        held_whole: 0,
         frame: 0,
         derived: vec4(0.0),
         bound_derived: false,
@@ -826,7 +850,21 @@ impl Kept {
         }
         self.probes = take now
         if self.asks == 0 {
-            self.asks = if self.held_asks != 0 { self.held_asks } else if by_cells(field) { ASKS_CELLS } else { ASKS_FIELD }
+            // How it is asked: by its field where an ask there weighs no more than `AFFORD`; by
+            // its parts where they are joined so (`parts::joins`), an ask weighing what the parts
+            // live in a box do (`cost::weighed_by_parts`).
+            let j = if self.held_whole == 1 { whole() } else { joins(field, self.derived, 512) }
+            let w = if j.n > 0 { weighed_by_parts(field, j, self.derived, 2.0 * self.derived.w / ROOTS) } else { weighed(field) }
+            // (By its parts only where that weighs under `PARTS_SHARE` of the whole: what the
+            // stand-in's ask of a part by number costs beyond its operations, `parts::chained`.)
+            let by_parts = j.n > 0 && w < PARTS_SHARE * weighed(field)
+            let w = if by_parts { w } else { weighed(field) }
+            self.asks = if self.held_asks != 0 { self.held_asks } else if w > AFFORD { ASKS_CELLS } else { ASKS_FIELD }
+            if self.asks == ASKS_FIELD && by_parts {
+                self.grid.parts = j.n
+                self.joined = j
+            }
+            print(f"engine::matter: an ask weighs {w} (whole {weighed(field)}; {j.n} parts joined, 0: whole): asked by its {by(self.asks)}{if self.grid.parts > 0 { " parts" } else { "" }}")
         }
         self.grid.asks = self.asks
         if self.asks == ASKS_FIELD {
@@ -850,7 +888,7 @@ impl Kept {
                 label("deposit roots")
                 var first: u32 = 0
                 while first < n {
-                    dispatch(coarsed.bind(field: field, g: self.grid, first: first, roots: mut self.roots, bricks: mut self.bricks), over: min(ROOT_BAND, n - first))
+                    dispatch(coarsed.bind(field: field, g: self.grid, joined: self.joined, first: first, roots: mut self.roots, bricks: mut self.bricks), over: min(ROOT_BAND, n - first))
                     first += ROOT_BAND
                 }
                 self.clear_roots()
@@ -878,7 +916,7 @@ impl Kept {
             label("deposit roots")
             var b: u32 = 0
             while b < 32 && self.cursor < n {
-                dispatch(coarsed.bind(field: field, g: self.grid, first: self.cursor, roots: mut self.roots, bricks: mut self.bricks), over: min(ROOT_BAND, n - self.cursor))
+                dispatch(coarsed.bind(field: field, g: self.grid, joined: self.joined, first: self.cursor, roots: mut self.roots, bricks: mut self.bricks), over: min(ROOT_BAND, n - self.cursor))
                 self.cursor += ROOT_BAND
                 b += 1
             }
@@ -979,7 +1017,7 @@ impl Kept {
         self.bricks.clear()
         var r: u32 = 0
         while r < n {
-            dispatch(coarsed.bind(field: field, g: self.grid, first: r, roots: mut self.roots, bricks: mut self.bricks), over: min(ROOT_BAND, n - r))
+            dispatch(coarsed.bind(field: field, g: self.grid, joined: self.joined, first: r, roots: mut self.roots, bricks: mut self.bricks), over: min(ROOT_BAND, n - r))
             r += ROOT_BAND
         }
         self.clear_roots()

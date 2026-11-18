@@ -1,0 +1,152 @@
+// Which of a thing's parts can matter in a box, and an ask of only those (docs/design.md,
+// "Directions", 1: "each brick keeps which are live, and an ask there asks only those").
+//
+// STAND-IN, in this one place, for gap 17 (wrela-notes/engine/NOTES.md): the toolchain is to
+// number a union's members so that a mask selects them, and to compile a masked ask. Until then
+// the engine builds it from what std already gives every field: its parts, numbered as written
+// (`Surface::parts`), each part's own distance (`Surface::part_distance`, compiled), each part's
+// derived range over a box (`std::derive::interval` of it), and how the parts are joined, read
+// from the field's tape (`Surface::to_tape`): a chain of minima and smooth minima, each joining
+// one more part to all before it, as `[a, b, c].union()`, `a.union(b).union(c)` and
+// `parts.smooth_union(k)` are built. A field joined otherwise (a part that is itself a union of
+// parts, an intersection above the union) is one part, asked whole; so is one whose chain does
+// not give the field's own distance at every point tried (`joins`).
+//
+// A part is dead in a box where it can't change the joined value there, by std's own pruning
+// rule (`Taped::prune`): a minimum (or a smooth minimum `k` wide) whose operand's range is above
+// the other's by more than `k` is the other, value and gradient, at every point of the box. Down
+// the chain, a part above all before it by more than its join's width is dead; one below all
+// before it by more than that leaves them all dead. Asked with only the live parts, the chain
+// gives the same value and gradient as the whole field at every point of the box (a smooth
+// minimum of nothing and a part is the part: `EMPTY` is farther than any width), and outside the
+// box it may not, so whoever asks keeps to the box.
+
+use matter::substance::Substance
+use std::derive::{Box3, Interval, interval}
+use std::field::{EMPTY, Field, smin}
+use std::stage::{COPY, MIN, SMIN}
+
+/// The most parts a thing is asked by (a mask is a word).
+pub const MOST_PARTS: u32 = 32
+
+/// A thing's parts as joined: how many (`n`; 0: asked whole, not by parts), and for each, how it
+/// joins all before it, two to a `vec4` (the first `xy`, the next `zw`): its join's kind (1 a
+/// minimum, 2 a smooth minimum) and the smooth minimum's width `k` (m). The first part's join is
+/// unused. A value, so GPU code holds it as a uniform and a closure can carry it.
+pub struct Joined: Copy + GpuData {
+    pub n: u32,
+    pub spare: vec3u,
+    pub at: [vec4; 16],
+}
+
+/// None: asked whole.
+pub fn whole() -> Joined {
+    Joined { n: 0, spare: vec3u(0, 0, 0), at: [vec4(0.0); 16] }
+}
+
+/// Part `i`'s join: its kind (1 min, 2 smooth) and width.
+fn join_of(j: Joined, i: u32) -> vec2 {
+    let v = j.at[min(i / 2, 15)]
+    if i % 2 == 0 { v.xy } else { v.zw }
+}
+
+/// How `field`'s parts are joined, read from its tape and checked against its distance at `tries`
+/// points round where it is (`at`: centre and radius); asked whole where it can't be read so.
+pub fn joins<M: Field<Substance>>(field: M, at: vec4, tries: u32) -> Joined {
+    let n = field.parts()
+    if n < 2 || n > MOST_PARTS {
+        return whole()
+    }
+    let t = field.to_tape()
+    if t.len() == 0 {
+        return whole()
+    }
+    // Down the chain's first operands from the value: each minimum or smooth minimum joins its
+    // second operand (one part) to its first (all before it).
+    var out = whole()
+    var r = t.len() - 1
+    var j = n
+    var going = true
+    while going {
+        let op = t.op_at(r)
+        let code = op.opcode()
+        if code == COPY {
+            // (The value copied to the tape's last register: read through.)
+            let (a, _, _) = op.operands()
+            r = a
+        } else if (code == MIN || code == SMIN) && j > 1 {
+            j -= 1
+            let (a, _, c) = op.operands()
+            let w = if code == MIN { vec2(1.0, 0.0) } else { vec2(2.0, c) }
+            var v = out.at[j / 2]
+            if j % 2 == 0 {
+                v.x = w.x
+                v.y = w.y
+            } else {
+                v.z = w.x
+                v.w = w.y
+            }
+            out.at[j / 2] = v
+            r = a
+        } else {
+            going = false
+        }
+    }
+    if j != 1 {
+        // (Not a chain of one join a part: asked whole.)
+        return whole()
+    }
+    out.n = n
+    // Checked: the chain over every part is the field's distance, at points round it.
+    let b = Box3 { lo: at.xyz - vec3(at.w), hi: at.xyz + vec3(at.w) }
+    for i in 0..tries {
+        let p = b.sample(5, i)
+        let d = field.distance(p)
+        let c = chained(field, out, 4294967295, p)
+        if !(abs(d - c) <= 1.0e-5 * max(1.0, abs(d))) {
+            return whole()
+        }
+    }
+    out
+}
+
+/// The joined distance at `p` of the parts `mask` holds (a bit a part, the first the lowest),
+/// joined as `j` says: the chain with the others left out.
+pub fn chained<M: Field<Substance>>(field: M, j: Joined, mask: u32, p: vec3) -> f32 {
+    var d = EMPTY
+    var i: u32 = 0
+    while i < min(j.n, MOST_PARTS) {
+        if ((mask >> i) & 1) != 0 {
+            let e = field.part_distance(p, i)
+            let w = join_of(j, i)
+            d = if w.x > 1.5 { smin(d, e, w.y) } else { min(d, e) }
+        }
+        i += 1
+    }
+    d
+}
+
+/// Which of the parts (joined as `j` says) can matter over `b` (a bit each), and the range of the
+/// joined value there: each part's derived range, down the chain by std's pruning rule.
+pub fn live<M: Field<Substance>>(field: M, j: Joined, b: Box3) -> (u32, Interval) {
+    var mask: u32 = 1
+    var all = interval(|q: vec3| field.part_distance(q, 0), b)
+    var i: u32 = 1
+    while i < min(j.n, MOST_PARTS) {
+        let e = interval(|q: vec3| field.part_distance(q, i), b)
+        let w = join_of(j, i)
+        let k = if w.x > 1.5 { max(w.y, 0.0) } else { 0.0 }
+        if all.hi + k < e.lo {
+            // Above all before it by more than the join: dead here.
+        } else if e.hi + k < all.lo {
+            // Below all before it by more than the join: they are dead here, it alone lives.
+            mask = 1 << i
+            all = e
+        } else {
+            mask = mask | (1 << i)
+            all = Interval { lo: min(all.lo, e.lo) - 0.25 * k, hi: min(all.hi, e.hi) }
+        }
+        i += 1
+    }
+    (mask, all)
+}

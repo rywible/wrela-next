@@ -13,7 +13,9 @@
 // always divided by the steepness its field states.
 
 use matter::cells::{B, CELL_PER_SIZE, EMPTY, Grid, LEVELS, NODE, NONE, NO_BRICK, ROOT, read_cells}
+use matter::parts::{Joined, chained}
 use matter::substance::Substance
+use std::derive::gradient
 use std::field::Field
 use std::gpu::GpuSpan
 
@@ -59,6 +61,7 @@ pub borrow struct Seen<M: Field<Substance>> {
     pub(package) roots: GpuSpan<u32>,
     pub(package) nodes: GpuSpan<u32>,
     pub(package) cells: GpuSpan<u32>,
+    pub(package) joined: Joined,
 }
 
 /// Where a ray from `o` along `d` enters and leaves the box from `lo` to `hi` (m along it).
@@ -83,6 +86,15 @@ fn inside_by(p: vec3, lo: vec3, side: f32) -> f32 {
 }
 
 impl<M: Field<Substance>> Seen<M> {
+    /// Its field's value at `p` in root `r`: of the parts live there, where it is asked by its
+    /// parts (`parts::chained`: inside the root, the same value and gradient as the whole).
+    fn value(self, p: vec3, r: u32) -> f32 {
+        if self.grid.parts > 0 {
+            return chained(self.field, self.joined, self.roots[ROOT * r + 4], p)
+        }
+        self.field.distance(p)
+    }
+
     /// The answer at `p`, going along `d` (`along` false: no way, so an empty brick says only how
     /// far its middle says the surface is), asked `size` m finely; `by_cells`, by its cells. Into
     /// `x` and `y` as `Asked::step`'s; `zw` unused but for `facing` (`cells_at` gives the facing).
@@ -111,8 +123,8 @@ impl<M: Field<Substance>> Seen<M> {
                 return vec2(s.y + g.nudge.x, inside_by(p, lo - vec3(e), g.brick + 2.0 * e))
             }
             let derived = bitcast_f32(self.roots[ROOT * r + 2])
-            let steep = if derived > 0.0 { max(derived, 1.0) } else { g.stated }
-            let f = clamp(self.field.distance(p), -g.scope, g.scope) / steep
+            let steep = if derived > 0.0 { max(min(derived, g.stated), 1.0) } else { g.stated }
+            let f = clamp(self.value(p, r), -g.scope, g.scope) / steep
             if !along || f <= inside_by(p, lo, g.brick) {
                 return vec2(f, f)
             }
@@ -229,7 +241,13 @@ impl<M: Field<Substance>> Answers for Seen<M> {
         }
         // (Where the field's own gradient vanishes, back along the ray: asking its value to each
         // side would put six more asks of a dear field into every pixel's code.)
-        let grad = self.field.gradient(p)
+        let g = self.grid
+        let c = clamp(floor((p - g.lo) / g.brick), vec3(0.0), g.top)
+        let r = u32(c.x) + g.size.x * (u32(c.y) + g.size.y * u32(c.z))
+        let field = self.field
+        let joined = self.joined
+        let mask = if g.parts > 0 { self.roots[ROOT * r + 4] } else { 4294967295 }
+        let grad = if g.parts > 0 { gradient(|q: vec3| chained(field, joined, mask, q), p) } else { field.gradient(p) }
         if dot(grad, grad) > 1.0e-8 {
             return normalize(grad)
         }
