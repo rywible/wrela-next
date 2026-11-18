@@ -6,6 +6,14 @@
 // each was asked at (`asks`), to refine its cells where they were coarser than that. Matter never
 // sees the eye: only places and sizes.
 //
+// Where a pixel holds an edge (its middle ray met matter and a neighbour's didn't, or the other
+// way; it passed matter within its width; its neighbour shows another surface, nearer or farther
+// or turned another way), one ray through its middle can't say what it shows: the edge pass
+// (`edges_found`, `edge_rays`, `edges_resolved`) draws it again as the mean of `EDGE_LOOKS`² rays
+// spread evenly over it, each the same `shown` (the same `ray::met`), as the reference's mean of
+// looks over the pixel is. The edge pixels are listed first and their rays drawn a ray a fragment,
+// so a few edge pixels don't hold up the many round them.
+//
 // The light here is a stand-in, the simplest that can be held to the reference exactly (the
 // reference's `SIMPLE` light): the sun where a shadow ray (the same `ray::met`) says it reaches,
 // toward the middle of its disc; and the sky's light as if nothing were in its way, read from a
@@ -24,8 +32,9 @@ use ray::ray::{Met, Ray, met}
 use reference::traced::LEAVE
 use std::collections::Vec
 use std::gpu::{
-    Address, FragCoord, GlobalId, R8, Rgba16Float, Rgba32Float, Sampler, Targets3, Texels, Texture, begin_pass, begin_pass3,
-    begin_screen_pass, dispatch, draw, label, sampler, texture, timed, writable_texture,
+    Address, Append, AppendBuffer, Atomics, FragCoord, GlobalId, GpuBuffer, GpuSpan, R8, Rgba16Float, Rgba32Float, Sampler, Targets3, Texels,
+    Texture, append_buffer, begin_pass, begin_pass3, begin_screen_pass, buffer, dispatch, draw, label, sampler, texture, timed,
+    writable_texture,
 }
 use std::io::{Pending, print}
 
@@ -38,6 +47,18 @@ const BAND_US: f32 = 10000.0
 const FIRST_BANDS: u32 = 32
 const LEAST_BANDS: u32 = 4
 const MOST_BANDS: u32 = 128
+
+/// An edge pixel's rays a side; how far apart two neighbours' surfaces are, as a share of the
+/// nearer's distance, to be two surfaces; and the least cosine between two neighbours' facings for
+/// them to be one surface.
+const EDGE_LOOKS: u32 = 3
+const JUMP: f32 = 0.05
+const CREASE: f32 = 0.8
+
+/// No edge at a pixel; one in how many of a picture's pixels may be an edge (the rest drawn by
+/// their middle ray alone): the edge rays fill a picture the screen's size.
+const NO_EDGE: u32 = 4294967295
+const EDGE_SHARE: u32 = 16
 
 /// The sky table's texels a side (an octahedron's fold of every way a face can turn), and how
 /// many ways each texel's light is gathered from (a side of a square of them, cosine-spread).
@@ -110,9 +131,10 @@ pub fn shown<W: Asked, S: Sky, L: Look>(v: View, w: W, sky: S, look: L, table: T
     let px = v.pixel()
     let m = met(w, Ray { o: v.at, d, from: 0.0, to: 1.0e9, wide: 0.0, spread: px })
     if !m.met {
-        // (A ray that passed matter within its width asks there too: an outline needs it.)
+        // (A ray that passed matter within half its width, so that matter is within its pixel,
+        // asks there too: an outline needs it, and the edge pass reads it as an edge.)
         var ask = vec4(0.0)
-        if m.nearest < 1.0 {
+        if m.nearest < 0.5 {
             ask = vec4(v.at + d * m.nearest_t, px * m.nearest_t)
         }
         return Shown { colour: look.tone(Seen { light: seen(sky, d) }), place: vec4(0.0), ask, steps: m.steps }
@@ -144,10 +166,112 @@ pub fn shown<W: Asked, S: Sky, L: Look>(v: View, w: W, sky: S, look: L, table: T
 @fragment
 pub fn pixel<W: Asked, S: Sky, L: Look>(pixel: FragCoord, v: View, w: W, sky: S, look: L, table: Texture<Rgba16Float>, s: Sampler, steps: u32) -> Targets3<vec4, vec4, vec4> {
     let r = shown(v, w, sky, look, table, s, pixel.position.xy)
-    if steps != 0 {
+    if steps == 1 {
         return Targets3 { first: vec4(f32(r.steps % 65536) / 64.0, f32(r.steps / 65536) / 64.0, 0.0, 1.0), second: r.place, third: r.ask }
     }
     Targets3 { first: vec4(r.colour, 1.0), second: r.place, third: r.ask }
+}
+
+/// Whether pixel (`x`, `y`) holds an edge (see the head of the file), by what the picture put there
+/// and round it (`place`, and `asks`: a ray that met nothing but asked passed matter within its
+/// width).
+fn on_edge(place: Texture<Rgba32Float>, asks: Texture<Rgba32Float>, x: u32, y: u32) -> bool {
+    let me = place.load(x, y)
+    let met = me.w > 0.0
+    if !met && asks.load(x, y).w > 0.0 {
+        return true
+    }
+    let w = place.width()
+    let h = place.height()
+    var k: u32 = 0
+    var edge = false
+    while k < 4 {
+        let nx = if k == 0 { min(x + 1, w - 1) } else if k == 1 { if x > 0 { x - 1 } else { 0 } } else { x }
+        let ny = if k == 2 { min(y + 1, h - 1) } else if k == 3 { if y > 0 { y - 1 } else { 0 } } else { y }
+        let o = place.load(nx, ny)
+        let o_met = o.w > 0.0
+        if met != o_met {
+            edge = true
+        } else if met && (abs(o.w - me.w) > JUMP * min(o.w, me.w) || dot(o.xyz, me.xyz) < CREASE) {
+            edge = true
+        }
+        k += 1
+    }
+    edge
+}
+
+/// The edge pixels found: each pixel that holds one (`on_edge`) pushed on `list` (the first `most`
+/// kept), its place on the list kept at the pixel (`at`, `NO_EDGE` for none).
+@compute(8, 8)
+fn edges_found(place: Texture<Rgba32Float>, asks: Texture<Rgba32Float>, most: u32, list: mut Append<u32>, at: mut Atomics<u32>, id: GlobalId) {
+    let w = place.width()
+    if id.x >= w || id.y >= place.height() {
+        return
+    }
+    let pix = id.x + w * id.y
+    var k = NO_EDGE
+    if on_edge(place, asks, id.x, id.y) {
+        let i = list.push(pix)
+        if i < most {
+            k = i
+        }
+    }
+    at.store(i: pix, value: k)
+}
+
+/// One of the edge pixels' rays (ray `j` of edge pixel `e` is `EDGE_LOOKS² e + j`, drawn at pixel
+/// `j % width`, `j / width` of `rays`): its colour, one of `EDGE_LOOKS`² rays spread evenly over its
+/// pixel (`shown`). Drawn as a picture of its own so that every ray is a fragment's whole work, a
+/// few edge pixels not holding up the many round them.
+@fragment
+pub fn edge_ray<W: Asked, S: Sky, L: Look>(
+    pixel: FragCoord,
+    v: View,
+    w: W,
+    sky: S,
+    look: L,
+    table: Texture<Rgba16Float>,
+    s: Sampler,
+    list: GpuSpan<u32>,
+    count: GpuSpan<u32>,
+    width: u32,
+) -> vec4 {
+    let i = u32(pixel.position.x) + width * u32(pixel.position.y)
+    let n = EDGE_LOOKS * EDGE_LOOKS
+    let e = i / n
+    if e >= count[0] {
+        return vec4(0.0)
+    }
+    let pix = list[e]
+    let j = i % n
+    let o = (vec2(f32(j % EDGE_LOOKS), f32(j / EDGE_LOOKS)) + vec2(0.5)) / f32(EDGE_LOOKS)
+    vec4(shown(v, w, sky, look, table, s, vec2(f32(pix % width), f32(pix / width)) + o).colour, 1.0)
+}
+
+/// The picture: an edge pixel the mean of its rays, any other what its middle ray drew (`raw`);
+/// drawing `steps` 1 (the instrument) every pixel as drawn, `steps` 2 its edge pixels red.
+@compute(8, 8)
+fn edges_resolved(raw: Texture<Rgba16Float>, at: [u32], rays: Texture<Rgba16Float>, steps: u32, out: mut Texels<Rgba16Float>, id: GlobalId) {
+    let w = raw.width()
+    if id.x >= w || id.y >= raw.height() {
+        return
+    }
+    let k = at[id.x + w * id.y]
+    if k == NO_EDGE || steps == 1 {
+        out.store(id, raw.load(id.x, id.y))
+    } else if steps == 2 {
+        out.store(id, vec4(1.0, 0.0, 0.0, 1.0))
+    } else {
+        let n = EDGE_LOOKS * EDGE_LOOKS
+        var sum = vec3(0.0)
+        var j: u32 = 0
+        while j < n {
+            let r = n * k + j
+            sum += rays.load(r % w, r / w).xyz
+            j += 1
+        }
+        out.store(id, vec4(sum / f32(n), 1.0))
+    }
 }
 
 /// A load beside the frame while it is timed, so the M4 keeps its clock up (branch `backend`'s
@@ -171,13 +295,20 @@ pub struct Sight {
     table: Texture<Rgba16Float>,
     pub drawn: Picture,
     asks: Texture<Rgba32Float>,
+    /// The picture before the edge pass (`drawn.colour` after it), and the edge pass's list, each
+    /// pixel's place on it, and the edge rays' colours.
+    raw: Texture<Rgba16Float>,
+    edge_list: AppendBuffer<u32>,
+    edge_at: GpuBuffer<u32>,
+    edge_rays: Texture<Rgba16Float>,
     burned: Texture<R8>,
     /// The load beside each frame (sines a pixel; 0: none).
     pub load: u32,
     held_asks: u32,
     held_cell: f32,
     said: bool,
-    /// An instrument: the picture shows each pixel's steps instead of its colour (1).
+    /// An instrument: the picture shows each pixel's steps instead of its colour (1), or its edge
+    /// pixels red (2).
     pub steps: u32,
     /// How many bands the picture is drawn in (`BAND_US`), and its time asked for.
     bands: u32,
@@ -192,6 +323,10 @@ pub fn sight() -> Sight {
         table: writable_texture(width: TABLE, height: TABLE),
         drawn: picture(width: 1, height: 1),
         asks: texture(width: 1, height: 1),
+        raw: texture(width: 1, height: 1),
+        edge_list: append_buffer(1),
+        edge_at: buffer(1),
+        edge_rays: texture(width: 1, height: 1),
         burned: texture(width: 1, height: 1),
         load: 0,
         held_asks: 0,
@@ -290,7 +425,13 @@ impl Sight {
         }
         if self.drawn.width() != width || self.drawn.height() != height {
             self.drawn = picture(width: width, height: height)
+            self.drawn.colour = writable_texture(width: width, height: height)
             self.asks = texture(width: width, height: height)
+            self.raw = texture(width: width, height: height)
+            let most = width * height / EDGE_SHARE
+            self.edge_list = append_buffer(most)
+            self.edge_at = buffer(width * height)
+            self.edge_rays = texture(width: width, height: height)
         }
         match mut self.sizing {
             Some(p) => match p.poll() {
@@ -314,7 +455,7 @@ impl Sight {
             let y0 = band * height / bands
             let y1 = (band + 1) * height / bands
             band += 1
-            let p = begin_pass3(mut self.drawn.colour, mut self.drawn.place, mut self.asks, keep: band > 1)
+            let p = begin_pass3(mut self.raw, mut self.drawn.place, mut self.asks, keep: band > 1)
             p.scissor(0, y0, width, y1 - y0)
             // (Which things are asked by their cells is a constant of the draw, so each pipeline
             // holds only the code its things are asked by: four, for worlds of up to two things.)
@@ -336,6 +477,43 @@ impl Sight {
             }
             p.end()
         }
+        label("edges")
+        self.edge_list.clear()
+        dispatch(
+            edges_found.bind(place: self.drawn.place, asks: self.asks, most: width * height / EDGE_SHARE, list: mut self.edge_list, at: mut self.edge_at),
+            groups: ((width + 7) / 8, (height + 7) / 8, 1),
+        )
+        // (The edge rays in bands of rows, as the picture is; a band past the last ray is
+        // fragments that only read the count.)
+        label("edge rays")
+        let c = world.cells(self.kept, 0)
+        band = 0
+        while band < bands && self.steps != 1 {
+            let y0 = band * height / bands
+            let y1 = (band + 1) * height / bands
+            band += 1
+            let p = begin_pass(mut self.edge_rays, keep: band > 1)
+            p.scissor(0, y0, width, y1 - y0)
+            if c == 0 {
+                let g: Chosen<W::Asked, 0> = Chosen { w: w }
+                draw(p, cover, edge_ray.bind(v: v, w: g, sky: sky, look: look, table: self.table, s: self.s, list: self.edge_list.items(), count: self.edge_list.count(), width: width), vertices: 3)
+            } else if c == 1 {
+                let g: Chosen<W::Asked, 1> = Chosen { w: w }
+                draw(p, cover, edge_ray.bind(v: v, w: g, sky: sky, look: look, table: self.table, s: self.s, list: self.edge_list.items(), count: self.edge_list.count(), width: width), vertices: 3)
+            } else if c == 2 {
+                let g: Chosen<W::Asked, 2> = Chosen { w: w }
+                draw(p, cover, edge_ray.bind(v: v, w: g, sky: sky, look: look, table: self.table, s: self.s, list: self.edge_list.items(), count: self.edge_list.count(), width: width), vertices: 3)
+            } else {
+                let g: Chosen<W::Asked, 3> = Chosen { w: w }
+                draw(p, cover, edge_ray.bind(v: v, w: g, sky: sky, look: look, table: self.table, s: self.s, list: self.edge_list.items(), count: self.edge_list.count(), width: width), vertices: 3)
+            }
+            p.end()
+        }
+        label("edges resolved")
+        dispatch(
+            edges_resolved.bind(raw: self.raw, at: self.edge_at.items(), rays: self.edge_rays, steps: self.steps, out: mut self.drawn.colour),
+            groups: ((width + 7) / 8, (height + 7) / 8, 1),
+        )
         self.drawn.placed = true
         // Matter refines its cells where this picture asked finer than they hold.
         world.refine(mut self.kept, 0, self.asks)
