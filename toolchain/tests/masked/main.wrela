@@ -1,0 +1,397 @@
+// A union asked only where its parts can matter (§20.4, `Surface::live`, `distance_live`): a
+// creature of seventeen round cones joined smoothly and a wand joined to them (the engine's,
+// branch engine c3465d5 game/world/creature.wrela, at rest), its box cut into bricks, each
+// brick's live parts found on the CPU, and the creature drawn twice a frame by a pixel program
+// that marches each ray up to 512 steps: once asking the whole union, once asking at each step
+// only the live parts of the brick it is in. The two pictures must be the same to the bit (each
+// pixel's distance along its ray and its count of steps); the hosts' timings say which is
+// faster (labels `whole` and `masked`). It also says what finding the parts costs, on the CPU
+// and in a kernel (whose masks must hold everything the CPU's do).
+//
+// `--set BRICK=0.08` and so on change the bricks' side (m).
+use std::collections::Vec
+use std::derive::{Box3, interval}
+use std::field::{ALL_LIVE, Live, RoundCone, SmoothUnion, SmoothUnionAll, Surface, With, round_cone}
+use std::gpu::{
+    ClipPosition, FragCoord, GlobalId, GpuBuffer, Rg32Float, Slots, Texture, VertexIndex, begin_pass,
+    begin_screen_pass, buffer, buffer_of, dispatch, draw, label, read, texture,
+}
+use std::io::{Pending, print}
+use std::time::now
+
+/// A brick's side (m).
+pub const BRICK: f32 = 0.04
+
+/// How a part looks: its albedo.
+pub struct Look: Copy + GpuData {
+    pub albedo: vec3,
+}
+
+pub type Body = SmoothUnion<With<SmoothUnionAll<RoundCone, 17>, Look>, With<RoundCone, Look>>
+
+/// The engine's creature at rest (its seventeen parts and its wand, posed by the rest pose).
+fn body() -> Body {
+    let parts = [
+        round_cone(vec3(0.0, 0.5694, -0.0258), vec3(0.0, 0.7866, 0.0042), r_top: 0.102, r_bottom: 0.096),
+        round_cone(vec3(0.0, 0.7866, 0.0042), vec3(0.0, 0.912, -0.0246), r_top: 0.096, r_bottom: 0.06),
+        round_cone(vec3(0.0, 1.02, 0.0018), vec3(0.0, 1.056, 0.0078), r_top: 0.15, r_bottom: 0.138),
+        round_cone(vec3(0.1272, 0.873, -0.039), vec3(0.2778, 0.873, -0.0438), r_top: 0.039, r_bottom: 0.0348),
+        round_cone(vec3(0.2778, 0.873, -0.0438), vec3(0.4236, 0.873, -0.039), r_top: 0.0348, r_bottom: 0.03),
+        round_cone(vec3(0.4236, 0.873, -0.039), vec3(0.4932, 0.8706, -0.03), r_top: 0.03, r_bottom: 0.027),
+        round_cone(vec3(0.0684, 0.5826, -0.0216), vec3(0.0684, 0.3252, -0.0216), r_top: 0.054, r_bottom: 0.0432),
+        round_cone(vec3(0.0684, 0.3252, -0.0216), vec3(0.0684, 0.0516, -0.0528), r_top: 0.0432, r_bottom: 0.0336),
+        round_cone(vec3(0.0684, 0.0516, -0.0528), vec3(0.0684, 0.009, 0.033), r_top: 0.0336, r_bottom: 0.0276),
+        round_cone(vec3(0.078, 1.14, 0.0018), vec3(0.12, 1.272, -0.0102), r_top: 0.03, r_bottom: 0.0075),
+        round_cone(vec3(-0.1272, 0.873, -0.039), vec3(-0.2778, 0.873, -0.0438), r_top: 0.039, r_bottom: 0.0348),
+        round_cone(vec3(-0.2778, 0.873, -0.0438), vec3(-0.4236, 0.873, -0.039), r_top: 0.0348, r_bottom: 0.03),
+        round_cone(vec3(-0.4236, 0.873, -0.039), vec3(-0.4932, 0.8706, -0.03), r_top: 0.03, r_bottom: 0.027),
+        round_cone(vec3(-0.0684, 0.5826, -0.0216), vec3(-0.0684, 0.3252, -0.0216), r_top: 0.054, r_bottom: 0.0432),
+        round_cone(vec3(-0.0684, 0.3252, -0.0216), vec3(-0.0684, 0.0516, -0.0528), r_top: 0.0432, r_bottom: 0.0336),
+        round_cone(vec3(-0.0684, 0.0516, -0.0528), vec3(-0.0684, 0.009, 0.033), r_top: 0.0336, r_bottom: 0.0276),
+        round_cone(vec3(-0.078, 1.14, 0.0018), vec3(-0.12, 1.272, -0.0102), r_top: 0.03, r_bottom: 0.0075),
+    ]
+    let wand = round_cone(vec3(-0.4236, 0.873, -0.039), vec3(-0.4956, 1.053, 0.261), r_top: 0.00504, r_bottom: 0.00504)
+    parts.smooth_union(k: 0.03).with(Look { albedo: vec3(0.42, 0.28, 0.16) })
+        .smooth_union(wand.with(Look { albedo: vec3(0.22, 0.13, 0.07) }), k: 0.004)
+}
+
+/// The bricks: a grid of `n` bricks of side `side` from `lo`.
+pub struct Grid: Copy + GpuData {
+    pub lo: vec3,
+    pub side: f32,
+    pub n: vec3u,
+    pub count: u32,
+}
+
+/// Bricks of side `BRICK` over the creature's parts' box, with a brick to spare each way.
+fn grid(b: Body) -> Grid {
+    var lo = vec3(1.0e30)
+    var hi = vec3(-1.0e30)
+    for i in 0..17 {
+        let c = b.a.inner.parts[i]
+        let r = max(c.r1, c.r2)
+        lo = min(lo, min(c.a, c.b) - vec3(r))
+        hi = max(hi, max(c.a, c.b) + vec3(r))
+    }
+    let w = b.b.inner
+    lo = min(lo, min(w.a, w.b) - vec3(w.r1))
+    hi = max(hi, max(w.a, w.b) + vec3(w.r1))
+    let s = BRICK
+    let start = lo - vec3(s)
+    let n = vec3u(u32(ceil((hi.x - lo.x) / s)) + 2, u32(ceil((hi.y - lo.y) / s)) + 2, u32(ceil((hi.z - lo.z) / s)) + 2)
+    Grid { lo: start, side: s, n, count: n.x * n.y * n.z }
+}
+
+impl Grid {
+    /// Brick `i`'s box, grown by a ten-thousandth of its side each way, so a point a rounding
+    /// past its face is still in it.
+    pub fn brick(self, i: u32) -> Box3 {
+        let x = i % self.n.x
+        let y = (i / self.n.x) % self.n.y
+        let z = i / (self.n.x * self.n.y)
+        let lo = self.lo + vec3(f32(x), f32(y), f32(z)) * self.side
+        let e = vec3(self.side * 0.0001)
+        Box3 { lo: lo - e, hi: lo + vec3(self.side) + e }
+    }
+
+    /// The brick `p` is in, held to the grid.
+    pub fn at(self, p: vec3) -> u32 {
+        let q = (p - self.lo) / self.side
+        let x = min(u32(max(q.x, 0.0)), self.n.x - 1)
+        let y = min(u32(max(q.y, 0.0)), self.n.y - 1)
+        let z = min(u32(max(q.z, 0.0)), self.n.z - 1)
+        x + self.n.x * (y + self.n.y * z)
+    }
+
+    pub fn hi(self) -> vec3 {
+        self.lo + vec3(f32(self.n.x), f32(self.n.y), f32(self.n.z)) * self.side
+    }
+}
+
+/// Where the picture is taken from.
+pub struct View: Copy + GpuData {
+    pub eye: vec3,
+    pub width: f32,
+    pub fwd: vec3,
+    pub height: f32,
+    pub right: vec3,
+    pub tan: f32,
+    pub up: vec3,
+    pub spare: f32,
+}
+
+fn view(width: u32, height: u32) -> View {
+    let eye = vec3(0.35, 0.95, 1.5)
+    let fwd = normalize(vec3(0.0, 0.66, 0.0) - eye)
+    let right = normalize(cross(fwd, vec3(0.0, 1.0, 0.0)))
+    let up = cross(right, fwd)
+    View { eye, fwd, right, up, width: f32(width), height: f32(height), tan: 0.45, spare: 0.0 }
+}
+
+/// The ray through a pixel, and where it is in the grid's box (`t0..t1`; `t1 < t0` where it
+/// misses the box).
+fn ray(v: View, g: Grid, px: vec2) -> (vec3, vec3, f32, f32) {
+    let a = v.width / v.height
+    let s = (2.0 * px.x / v.width - 1.0) * v.tan * a
+    let u = (1.0 - 2.0 * px.y / v.height) * v.tan
+    let d = normalize(v.fwd + v.right * s + v.up * u)
+    let inv = vec3(1.0) / d
+    let ta = (g.lo - v.eye) * inv
+    let tb = (g.hi() - v.eye) * inv
+    let tn = min(ta, tb)
+    let tf = max(ta, tb)
+    (v.eye, d, max(max(tn.x, tn.y), max(tn.z, 0.0)), min(tf.x, min(tf.y, tf.z)))
+}
+
+/// How near a march counts as a hit (m).
+const NEAR: f32 = 0.0002
+
+@vertex
+fn cover(v: VertexIndex) -> ClipPosition {
+    let x = f32((v.index << 1) & 2) * 2.0 - 1.0
+    let y = f32(v.index & 2) * 2.0 - 1.0
+    ClipPosition { position: vec4(x, y, 0.5, 1.0) }
+}
+
+/// The march asking the whole creature: its distance along the ray where it met it (-1 where it
+/// didn't), and its steps.
+@fragment
+fn whole(pixel: FragCoord, v: View, g: Grid, b: Body) -> vec2 {
+    let (o, d, t0, t1) = ray(v, g, pixel.position.xy)
+    var t = t0
+    var steps: u32 = 0
+    var hit = false
+    while steps < 512 && t <= t1 && !hit {
+        let f = b.distance(o + d * t)
+        if f < NEAR {
+            hit = true
+        } else {
+            t += f
+            steps += 1
+        }
+    }
+    vec2(if hit { t } else { -1.0 }, f32(steps))
+}
+
+/// The same march asking, at each step, only the live parts of the brick it is in.
+@fragment
+fn masked(pixel: FragCoord, v: View, g: Grid, b: Body, live: [Live]) -> vec2 {
+    let (o, d, t0, t1) = ray(v, g, pixel.position.xy)
+    var t = t0
+    var steps: u32 = 0
+    var hit = false
+    while steps < 512 && t <= t1 && !hit {
+        let p = o + d * t
+        let f = b.distance_live(p, live[g.at(p)])
+        if f < NEAR {
+            hit = true
+        } else {
+            t += f
+            steps += 1
+        }
+    }
+    vec2(if hit { t } else { -1.0 }, f32(steps))
+}
+
+/// The pictures shown: what each pixel met, shaded by its distance.
+@fragment
+fn shown(pixel: FragCoord, a: Texture<Rg32Float>) -> vec4 {
+    let r = a.load(u32(pixel.position.x), u32(pixel.position.y))
+    if r.x < 0.0 { vec4(0.1, 0.1, 0.12, 1.0) } else { vec4(vec3(clamp(2.2 - r.x, 0.0, 1.0)), 1.0) }
+}
+
+/// In each row, how many pixels of the two pictures differ in any bit.
+@compute(64)
+fn differ(a: Texture<Rg32Float>, b: Texture<Rg32Float>, width: u32, height: u32, out: mut Slots<u32>, id: GlobalId) {
+    if id.x >= height {
+        return
+    }
+    var n: u32 = 0
+    for x in 0..min(width, 4096) {
+        let p = a.load(x, id.x)
+        let q = b.load(x, id.x)
+        if bitcast_u32(p.x) != bitcast_u32(q.x) || bitcast_u32(p.y) != bitcast_u32(q.y) {
+            n += 1
+        }
+    }
+    out[id] = n
+}
+
+/// Each brick's live parts, found in a kernel.
+@compute(64)
+fn found(b: Body, g: Grid, out: mut Slots<Live>, id: GlobalId) {
+    if id.x >= g.count {
+        return
+    }
+    out[id] = b.live(g.brick(id.x))
+}
+
+pub struct Masked {
+    frames: u32,
+    grid: Grid,
+    live: GpuBuffer<Live>,
+    cpu: Vec<Live>,
+    a: Texture<Rg32Float>,
+    b: Texture<Rg32Float>,
+    size: vec2u,
+    rows: Vec<Pending<u32>>,
+    differ: u32,
+    kernel: Vec<Pending<Live>>,
+    misses: u32,
+}
+
+pub fn init() -> Masked {
+    let body = body()
+    let g = grid(body)
+    // Each brick's live parts on the CPU, five times over: the least time.
+    var cpu: Vec<Live> = Vec::new()
+    var best = 1.0e30
+    for _ in 0..5 {
+        var found: Vec<Live> = Vec::new()
+        let t = now()
+        for i in 0..g.count {
+            found.push(body.live(g.brick(i)))
+        }
+        best = min(best, now() - t)
+        cpu = take found
+    }
+    var ranged = 1.0e30
+    for _ in 0..3 {
+        var lo = 0.0
+        let t = now()
+        for i in 0..g.count {
+            lo += body.range(g.brick(i)).value.lo
+        }
+        ranged = min(ranged, now() - t)
+        if lo == 1.0e30 {
+            print("never")
+        }
+    }
+    var valued = 1.0e30
+    for _ in 0..3 {
+        var lo = 0.0
+        let t = now()
+        for i in 0..g.count {
+            lo += interval(|q: vec3| body.distance(q), g.brick(i)).lo
+        }
+        valued = min(valued, now() - t)
+        if lo == 1.0e30 {
+            print("never")
+        }
+    }
+    var counts: [u32; 19] = [0; 19]
+    var total: u32 = 0
+    for l in cpu {
+        let c = l.count(18)
+        counts[c] += 1
+        total += c
+    }
+    let parts = body.parts()
+    print(f"masked: {g.count} bricks of {BRICK} m ({g.n.x} x {g.n.y} x {g.n.z}), {parts} parts")
+    print(f"masked: live parts a brick: mean {f32(total) / f32(g.count)}")
+    for c in 0..19 {
+        if counts[c] > 0 {
+            print(f"masked:   {counts[c]} bricks with {c} live")
+        }
+    }
+    print(f"masked: finding them on the CPU: {best * 1.0e6 / f64(g.count)} us a brick, {best * 1.0e9 / f64(g.count) / f64(parts)} ns a brick a part ({best * 1000.0} ms for all)")
+    print(f"masked: the range of value and gradient on the CPU: {ranged * 1.0e6 / f64(g.count)} us a brick; of the value alone {valued * 1.0e6 / f64(g.count)} us")
+    let live = buffer_of(cpu)
+    Masked {
+        frames: 0,
+        grid: g,
+        live,
+        cpu,
+        a: texture(width: 1, height: 1),
+        b: texture(width: 1, height: 1),
+        size: vec2u(1, 1),
+        rows: Vec::new(),
+        differ: 4294967295,
+        kernel: Vec::new(),
+        misses: 4294967295,
+    }
+}
+
+pub fn frame(s: mut Masked, time: f32, width: u32, height: u32) {
+    if s.size.x != width || s.size.y != height {
+        s.a = texture(width, height)
+        s.b = texture(width, height)
+        s.size = vec2u(width, height)
+    }
+    let body = body()
+    let v = view(width, height)
+    let g = s.grid
+    // The two in turn, the first of them alternating by frame.
+    for k in 0..2 {
+        if (k + s.frames) % 2 == 0 {
+            label("whole")
+            let p = begin_pass(mut s.a, clear: vec4(0.0))
+            draw(p, cover, whole.bind(v: v, g: g, b: body), vertices: 3)
+            p.end()
+        } else {
+            label("masked")
+            let p = begin_pass(mut s.b, clear: vec4(0.0))
+            draw(p, cover, masked.bind(v: v, g: g, b: body, live: s.live.items()), vertices: 3)
+            p.end()
+        }
+    }
+    if s.frames == 1 {
+        label("differ")
+        var out: GpuBuffer<u32> = buffer(height)
+        dispatch(differ.bind(a: s.a, b: s.b, width: width, height: height, out: mut out), over: height)
+        s.rows.push(read(out.items()))
+        label("found")
+        var masks: GpuBuffer<Live> = buffer(g.count)
+        dispatch(found.bind(b: body, g: g, out: mut masks), over: g.count)
+        s.kernel.push(read(masks.items()))
+    }
+    label("shown")
+    let p = begin_screen_pass(clear: vec4(0.0))
+    draw(p, cover, shown.bind(a: s.b), vertices: 3)
+    p.present()
+    s.frames += 1
+    for i in 0..u32(s.rows.len()) {
+        if let Some(Ok(rows)) = s.rows[i].poll() {
+            var n: u32 = 0
+            for x in rows {
+                n += x
+            }
+            print(f"masked: the two pictures differ in {n} of {width * height} pixels")
+            s.differ = n
+        }
+    }
+    for i in 0..u32(s.kernel.len()) {
+        if let Some(Ok(masks)) = s.kernel[i].poll() {
+            // A kernel's mask must hold every part the CPU's does (both are sound; the kernel's
+            // ranges are wider by the GPU's rounding).
+            var missing: u32 = 0
+            var same: u32 = 0
+            var live: u32 = 0
+            for i in 0..g.count {
+                let c = s.cpu[i]
+                let m = masks[i]
+                for j in 0..18 {
+                    if c.has(j) && !m.has(j) {
+                        missing += 1
+                    }
+                }
+                if c.words == m.words {
+                    same += 1
+                }
+                live += m.count(18)
+            }
+            print(f"masked: a kernel's masks: {same} of {g.count} the CPU's, {missing} parts the CPU keeps it leaves out, live parts a brick {f32(live) / f32(g.count)}")
+            s.misses = missing
+        }
+    }
+}
+
+/// How many pixels the two pictures differ in (all ones until they're compared).
+pub fn differing(s: Masked) -> u32 {
+    s.differ
+}
+
+/// How many live parts of the CPU's masks a kernel's left out (all ones until read).
+pub fn kernel_misses(s: Masked) -> u32 {
+    s.misses
+}

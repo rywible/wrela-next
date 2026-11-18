@@ -226,6 +226,188 @@ pub trait Surface: Copy + GpuData {
     fn part_offset(self, p: vec3, i: u32, by: f32) -> f32 {
         self.distance(p) + by
     }
+
+    // ---- over a box: its range, and the parts that can matter there (§20.4) ----
+
+    /// The range of its distance over `over`, and of its gradient's components: both derived
+    /// by the compiler from the surface as written (`std::derive::interval`, nested with
+    /// `gradient` for the second), so nothing is stated by hand. Sound as the target rounds.
+    fn range(self, over: Box3) -> FieldRange {
+        FieldRange {
+            value: interval(|q: vec3| self.distance(q), over),
+            gradient: interval(|q: vec3| gradient(|r: vec3| self.distance(r), q), over),
+        }
+    }
+
+    /// The parts that can change its distance anywhere in `over` (§23's numbering): a part of
+    /// a union, smooth or not, that no point of the box would miss is left out, and where it
+    /// is, `distance_live` gives the distance as `distance` does, bit for bit. Every other part
+    /// is live. Found from the ranges of each union's operands over the box, derived.
+    fn live(self, over: Box3) -> Live {
+        self.pruned(over, |q: vec3| q, 1.0, ALL_LIVE, 0).live
+    }
+
+    /// Its distance at `p`, asking only the parts `live` names: what `distance` gives, bit for
+    /// bit, wherever `live` is what `live(over)` gave for a box holding `p`. A union asks no part
+    /// of an operand whose parts are all left out; a surface that is no union asks all of
+    /// itself.
+    fn distance_live(self, p: vec3, live: Live) -> f32 {
+        self.masked(p, live, 0)
+    }
+
+    /// `distance_live` of a surface whose first part is numbered `first` in the whole
+    /// surface's numbering: what the combinators implement. The default asks all of it.
+    fn masked(self, p: vec3, live: Live, first: u32) -> f32 {
+        self.distance(p)
+    }
+
+    /// `live`'s work, for a surface whose first part is numbered `first`, asked at `at(q)` for
+    /// each `q` of `over` (the maps of the combinators above it, which stretch lengths at most
+    /// `stretch` times): `live` with the parts it can leave out cleared, and the range its
+    /// distance takes over the box. The default leaves everything live and gives the derived
+    /// range, narrowed by the distance at the box's centre and the stated bound on its gradient,
+    /// as `interval_near` narrows.
+    fn pruned<F: Copy + fn(vec3) -> vec3>(self, over: Box3, at: F, stretch: f32, live: Live, first: u32) -> Pruned {
+        let x = interval(|q: vec3| self.distance(at(q)), over)
+        let l = self.lipschitz(max(abs(x.lo), abs(x.hi)) * 1.001 + 0.000001)
+        if !(l < 1.0e30) {
+            return Pruned { live, range: x }
+        }
+        // How far from the centre's distance the box's can be, and a margin for the rounding of
+        // the two distances.
+        let d = self.distance(at(over.center()))
+        let r = l * stretch * 0.5 * length(over.hi - over.lo)
+        let e = r * 1.0e-5 + abs(d) * 1.0e-6 + 1.0e-6
+        Pruned { live, range: Interval { lo: max(x.lo, d - r - e), hi: min(x.hi, d + r + e) } }
+    }
+}
+
+/// A surface's ranges over a box (`Surface::range`): its distance's, and each component of its
+/// gradient's.
+pub struct FieldRange: Copy + GpuData {
+    pub value: Interval,
+    pub gradient: Box3,
+}
+
+/// Which parts of a surface an ask evaluates (`Surface::live`, `distance_live`): bit `i % 32` of
+/// `words[i / 32]` for part `i`, in §23's numbering (the order a surface's leaves are written).
+/// A part past the 128th is always asked.
+pub struct Live: Copy + GpuData + Plain {
+    pub words: vec4u,
+}
+
+/// Every part asked.
+pub const ALL_LIVE: Live = Live { words: vec4u(4294967295) }
+
+impl Live {
+    /// The parts a word names: bit `i` for part `i` of the first 32, and every part past them.
+    pub fn from_word(w: u32) -> Live {
+        Live { words: vec4u(w, 4294967295, 4294967295, 4294967295) }
+    }
+
+    /// The first 32 parts' bits, as `from_word` takes them.
+    pub fn word(self) -> u32 {
+        self.words.x
+    }
+
+    /// Whether part `i` is asked.
+    pub fn has(self, i: u32) -> bool {
+        i >= 128 || ((self.words[i >> 5] >> (i & 31)) & 1) != 0
+    }
+
+    /// Whether any of the `count` parts from `first` on is asked.
+    pub fn any(self, first: u32, count: u32) -> bool {
+        if count == 1 {
+            return self.has(first)
+        }
+        if first + count > 128 {
+            return count > 0
+        }
+        var hit: u32 = 0
+        for w in 0..4 {
+            hit = hit | (self.words[w] & span_bits(first, count, w))
+        }
+        hit != 0
+    }
+
+    /// The same, with the `count` parts from `first` on left out.
+    pub fn without(self, first: u32, count: u32) -> Live {
+        var words = self.words
+        for w in 0..4 {
+            words[w] = words[w] & !span_bits(first, count, w)
+        }
+        Live { words }
+    }
+
+    /// How many of the first `parts` parts are asked.
+    pub fn count(self, parts: u32) -> u32 {
+        var n = max(parts, 128) - 128
+        for w in 0..4 {
+            n += (self.words[w] & span_bits(0, min(parts, 128), w)).count_ones()
+        }
+        n
+    }
+}
+
+/// The bits of word `w` (parts `32 w` to `32 w + 31`) that parts `first..first + count` take.
+fn span_bits(first: u32, count: u32, w: u32) -> u32 {
+    let lo = max(first, 32 * w)
+    let hi = min(first + count, 32 * w + 32)
+    if lo >= hi {
+        return 0
+    }
+    let n = hi - lo
+    let ones = if n >= 32 { 4294967295 } else { (u32(1) << n) - 1 }
+    ones << (lo - 32 * w)
+}
+
+/// What `Surface::pruned` gives: the parts still live, and the surface's range over the box.
+pub struct Pruned: Copy + GpuData {
+    pub live: Live,
+    pub range: Interval,
+}
+
+/// Whether `a - b >= k` for every computed `a >= lo` and `b <= hi`, as the target subtracts
+/// (rounding is monotone, so the real difference at least `k` is enough; the margin covers the
+/// rounding of the test itself). Then `smin(b, a, k)` is `b`, exactly.
+fn apart(lo: f32, hi: f32, k: f32) -> bool {
+    if k <= 0.0 {
+        return lo >= hi
+    }
+    lo - hi >= k * 1.000001 + 1.0e-30
+}
+
+/// A range's ends moved out by a few units in the last place: what a sum of two ranges' ends
+/// needs to hold the computed sum.
+fn outward(r: Interval) -> Interval {
+    Interval { lo: r.lo - abs(r.lo) * 4.0e-7 - 1.0e-37, hi: r.hi + abs(r.hi) * 4.0e-7 + 1.0e-37 }
+}
+
+/// A range holding `smin(a, b, k)` for `a` in `x` and `b` in `y`, as the target computes it:
+/// at most the smaller (it takes a non-negative amount from it), at least the smaller less
+/// `k / 4` (and that amount's rounding). With `k` 0, `min`'s, exactly.
+fn smin_range(x: Interval, y: Interval, k: f32) -> Interval {
+    let lo = min(x.lo, y.lo)
+    let hi = min(x.hi, y.hi)
+    if k <= 0.0 {
+        return Interval { lo, hi }
+    }
+    let l = lo - 0.25 * k * 1.000001
+    Interval { lo: l - abs(l) * 4.0e-7 - 1.0e-37, hi }
+}
+
+/// Two operands joined by `smin` of width `k` (`min` for 0), parts `first..first + na` the
+/// first's and the next `nb` the second's: `b.live` is both operands' pruning, `a` the first's
+/// range. An operand at least `k` above the other over the box is left out.
+fn joined(a: Interval, b: Pruned, first: u32, na: u32, nb: u32, k: f32) -> Pruned {
+    let kk = max(k, 0.0)
+    if apart(b.range.lo, a.hi, kk) {
+        return Pruned { live: b.live.without(first + na, nb), range: a }
+    }
+    if apart(a.lo, b.range.hi, kk) {
+        return Pruned { live: b.live.without(first, na), range: b.range }
+    }
+    Pruned { live: b.live, range: smin_range(a, b.range, kk) }
 }
 
 /// Where a surface is: a sphere, and how fast its distance grows outside it. Its distance at
@@ -1095,6 +1277,26 @@ impl<A: Surface, B: Surface> Surface for Union<A, B> {
         min(self.a.distance(p), self.b.distance(p))
     }
 
+    /// An operand none of whose parts is live isn't asked: the other's distance is the union's.
+    fn masked(self, p: vec3, live: Live, first: u32) -> f32 {
+        let n = self.a.parts()
+        if !live.any(first + n, self.b.parts()) {
+            return self.a.masked(p, live, first)
+        }
+        if !live.any(first, n) {
+            return self.b.masked(p, live, first + n)
+        }
+        min(self.a.masked(p, live, first), self.b.masked(p, live, first + n))
+    }
+
+    /// An operand never below the other over the box changes nothing there.
+    fn pruned<F: Copy + fn(vec3) -> vec3>(self, over: Box3, at: F, stretch: f32, live: Live, first: u32) -> Pruned {
+        let n = self.a.parts()
+        let a = self.a.pruned(over, at, stretch, live, first)
+        let b = self.b.pruned(over, at, stretch, a.live, first + n)
+        joined(a.range, b, first, n, self.b.parts(), 0.0)
+    }
+
     fn bound(self) -> Bound {
         self.a.bound().and(self.b.bound())
     }
@@ -1143,6 +1345,27 @@ pub struct SmoothUnion<A, B>: Copy + GpuData {
 impl<A: Surface, B: Surface> Surface for SmoothUnion<A, B> {
     fn distance(self, p: vec3) -> f32 {
         smin(self.a.distance(p), self.b.distance(p), self.k)
+    }
+
+    /// As `Union`'s: an operand none of whose parts is live isn't asked.
+    fn masked(self, p: vec3, live: Live, first: u32) -> f32 {
+        let n = self.a.parts()
+        if !live.any(first + n, self.b.parts()) {
+            return self.a.masked(p, live, first)
+        }
+        if !live.any(first, n) {
+            return self.b.masked(p, live, first + n)
+        }
+        smin(self.a.masked(p, live, first), self.b.masked(p, live, first + n), self.k)
+    }
+
+    /// An operand at least `k` above the other everywhere in the box changes nothing there:
+    /// `smin` is then exactly the other (its seam is narrower than `k`).
+    fn pruned<F: Copy + fn(vec3) -> vec3>(self, over: Box3, at: F, stretch: f32, live: Live, first: u32) -> Pruned {
+        let n = self.a.parts()
+        let a = self.a.pruned(over, at, stretch, live, first)
+        let b = self.b.pruned(over, at, stretch, a.live, first + n)
+        joined(a.range, b, first, n, self.b.parts(), self.k)
     }
 
     fn bound(self) -> Bound {
@@ -1214,6 +1437,49 @@ impl<S: Surface, const N: u32> Surface for UnionAll<S, N> {
             d = min(d, self.parts[i].distance(p))
         }
         d
+    }
+
+    /// The same `min`s, over the parts with a live part.
+    fn masked(self, p: vec3, live: Live, first: u32) -> f32 {
+        var d = EMPTY
+        var f = first
+        for i in 0..N {
+            let n = self.parts[i].parts()
+            if live.any(f, n) {
+                d = min(d, self.parts[i].masked(p, live, f))
+            }
+            f += n
+        }
+        d
+    }
+
+    /// A part that is nowhere in the box below the part whose range tops out lowest changes
+    /// nothing there.
+    fn pruned<F: Copy + fn(vec3) -> vec3>(self, over: Box3, at: F, stretch: f32, live: Live, first: u32) -> Pruned {
+        var out = live
+        var ranges = [Interval { lo: EMPTY, hi: EMPTY }; N]
+        var firsts = [first; N]
+        var f = first
+        var best: u32 = 0
+        for i in 0..N {
+            let r = self.parts[i].pruned(over, at, stretch, out, f)
+            out = r.live
+            ranges[i] = r.range
+            firsts[i] = f
+            f += self.parts[i].parts()
+            if ranges[i].hi < ranges[best].hi {
+                best = i
+            }
+        }
+        var range = Interval { lo: EMPTY, hi: EMPTY }
+        for i in 0..N {
+            if i != best && apart(ranges[i].lo, ranges[best].hi, 0.0) {
+                out = out.without(firsts[i], self.parts[i].parts())
+            } else {
+                range = Interval { lo: min(range.lo, ranges[i].lo), hi: min(range.hi, ranges[i].hi) }
+            }
+        }
+        Pruned { live: out, range }
     }
 
     /// Its parts' bounds, joined (with no parts, unbounded: nothing to say where it is).
@@ -1301,6 +1567,56 @@ impl<S: Surface, const N: u32> Surface for SmoothUnionAll<S, N> {
             d = smin(d, self.parts[i].distance(p), self.k)
         }
         d
+    }
+
+    /// The same fold over the parts with a live part, from `EMPTY` (`smin(EMPTY, d, k)` is `d`
+    /// exactly, for any distance short of `EMPTY`).
+    fn masked(self, p: vec3, live: Live, first: u32) -> f32 {
+        var d = EMPTY
+        var f = first
+        for i in 0..N {
+            let n = self.parts[i].parts()
+            if live.any(f, n) {
+                d = smin(d, self.parts[i].masked(p, live, f), self.k)
+            }
+            f += n
+        }
+        d
+    }
+
+    /// The fold's own rules, over the box: a part at least `k` above everything folded before
+    /// it changes nothing (`smin` gives what was folded), and a part at least `k` below
+    /// everything folded before it starts the fold afresh (`smin` gives the part), so every
+    /// part before it changes nothing. What's left folds as the whole does, bit for bit.
+    fn pruned<F: Copy + fn(vec3) -> vec3>(self, over: Box3, at: F, stretch: f32, live: Live, first: u32) -> Pruned {
+        if N == 0 {
+            return Pruned { live, range: Interval { lo: EMPTY, hi: EMPTY } }
+        }
+        let k = max(self.k, 0.0)
+        var out = live
+        var ranges = [Interval { lo: EMPTY, hi: EMPTY }; N]
+        var firsts = [first; N]
+        var f = first
+        for i in 0..N {
+            let r = self.parts[i].pruned(over, at, stretch, out, f)
+            out = r.live
+            ranges[i] = r.range
+            firsts[i] = f
+            f += self.parts[i].parts()
+        }
+        var acc = ranges[0]
+        for j in 1..N {
+            let r = ranges[j]
+            if apart(r.lo, acc.hi, k) {
+                out = out.without(firsts[j], self.parts[j].parts())
+            } else if apart(acc.lo, r.hi, k) {
+                out = out.without(first, firsts[j] - first)
+                acc = r
+            } else {
+                acc = smin_range(acc, r, k)
+            }
+        }
+        Pruned { live: out, range: acc }
     }
 
     /// Its parts' bounds, joined, and lowered by each seam's most (a quarter of `k`).
@@ -1474,6 +1790,18 @@ impl<S: Surface, M: PointMap> Surface for Warp<S, M> {
         self.map.distance_out(self.inner.distance(self.map.local(p)))
     }
 
+    fn masked(self, p: vec3, live: Live, first: u32) -> f32 {
+        self.map.distance_out(self.inner.masked(self.map.local(p), live, first))
+    }
+
+    /// The inner surface's, asked where the map takes each point; its range in this space
+    /// (`distance_out` rises with the distance, and so does its rounding).
+    fn pruned<F: Copy + fn(vec3) -> vec3>(self, over: Box3, at: F, stretch: f32, live: Live, first: u32) -> Pruned {
+        let map = self.map
+        let r = self.inner.pruned(over, |q: vec3| map.local(at(q)), map.length_in(stretch), live, first)
+        Pruned { live: r.live, range: Interval { lo: map.distance_out(r.range.lo), hi: map.distance_out(r.range.hi) } }
+    }
+
     fn bound(self) -> Bound {
         self.map.bound(self.inner.bound())
     }
@@ -1599,6 +1927,19 @@ pub struct Displace<S, N>: Copy + GpuData {
 impl<S: Surface, N: Noise> Surface for Displace<S, N> {
     fn distance(self, p: vec3) -> f32 {
         self.inner.distance(p) + self.amp * self.noise.value(p)
+    }
+
+    fn masked(self, p: vec3, live: Live, first: u32) -> f32 {
+        self.inner.masked(p, live, first) + self.amp * self.noise.value(p)
+    }
+
+    /// The inner surface's (a displacement moves every operand of a union inside it alike),
+    /// and its range plus the displacement's.
+    fn pruned<F: Copy + fn(vec3) -> vec3>(self, over: Box3, at: F, stretch: f32, live: Live, first: u32) -> Pruned {
+        let r = self.inner.pruned(over, at, stretch, live, first)
+        let (noise, amp) = (self.noise, self.amp)
+        let n = interval(|q: vec3| amp * noise.value(at(q)), over)
+        Pruned { live: r.live, range: outward(Interval { lo: r.range.lo + n.lo, hi: r.range.hi + n.hi }) }
     }
 
     fn bound(self) -> Bound {
@@ -2130,6 +2471,17 @@ impl<S: Surface> Surface for ToBound<S> {
         clamp(self.inner.distance(p), -self.near, self.near) * self.scale
     }
 
+    fn masked(self, p: vec3, live: Live, first: u32) -> f32 {
+        clamp(self.inner.masked(p, live, first), -self.near, self.near) * self.scale
+    }
+
+    fn pruned<F: Copy + fn(vec3) -> vec3>(self, over: Box3, at: F, stretch: f32, live: Live, first: u32) -> Pruned {
+        let r = self.inner.pruned(over, at, stretch, live, first)
+        let lo = clamp(r.range.lo, -self.near, self.near) * self.scale
+        let hi = clamp(r.range.hi, -self.near, self.near) * self.scale
+        Pruned { live: r.live, range: Interval { lo: min(lo, hi), hi: max(lo, hi) } }
+    }
+
     /// Unbounded: held within ±`near`, its distance stops growing, which no sphere's bound
     /// (growing without end) holds. Cull by the surface it bounds (`inner.bound()`).
     fn bound(self) -> Bound {
@@ -2403,6 +2755,14 @@ impl<S: Surface, C: Copy + GpuData> Surface for With<S, C> {
         self.inner.distance(p)
     }
 
+    fn masked(self, p: vec3, live: Live, first: u32) -> f32 {
+        self.inner.masked(p, live, first)
+    }
+
+    fn pruned<F: Copy + fn(vec3) -> vec3>(self, over: Box3, at: F, stretch: f32, live: Live, first: u32) -> Pruned {
+        self.inner.pruned(over, at, stretch, live, first)
+    }
+
     fn bound(self) -> Bound {
         self.inner.bound()
     }
@@ -2459,6 +2819,14 @@ pub struct WithAt<S, F>: Copy + GpuData {
 impl<S: Surface, F: Copy + GpuData> Surface for WithAt<S, F> {
     fn distance(self, p: vec3) -> f32 {
         self.inner.distance(p)
+    }
+
+    fn masked(self, p: vec3, live: Live, first: u32) -> f32 {
+        self.inner.masked(p, live, first)
+    }
+
+    fn pruned<G: Copy + fn(vec3) -> vec3>(self, over: Box3, at: G, stretch: f32, live: Live, first: u32) -> Pruned {
+        self.inner.pruned(over, at, stretch, live, first)
     }
 
     fn bound(self) -> Bound {

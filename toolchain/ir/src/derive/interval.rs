@@ -332,7 +332,7 @@ enum Saved {
 
 /// By local: the one value stored in it, when it's stored exactly once, whole, and nothing
 /// else writes it (no projection's store, no `mut` argument): a `let` binding.
-fn single_stores(m: &Module, f: &Function) -> Vec<Option<ValueId>> {
+pub(super) fn single_stores(m: &Module, f: &Function) -> Vec<Option<ValueId>> {
     let mut src: Vec<Option<ValueId>> = vec![None; f.locals.len()];
     let mut writes = vec![0u32; f.locals.len()];
     visit::walk(&f.body, &mut |s| match s {
@@ -1348,6 +1348,16 @@ impl<'a> Ivx<'a> {
     }
 
     fn call_fn(&mut self, v: Option<ValueId>, g: FuncId, args: &[Arg], out: &mut Block) -> R<()> {
+        // A derivative's interval is its twin's whose code is written for its interval
+        // (`ad::BOUNDED`): the same function, tighter where a length is written out.
+        let g = match self.cache.ad_of.get(&g).cloned() {
+            Some((f, mask, key)) if key & (ad::FILTERED | ad::BOUNDED) == 0 => {
+                let at = self.track.at;
+                ad::derive(self.m, self.cache, f, mask, key, self.target, false, true)
+                    .map_err(|e| e.through(at))?
+            }
+            _ => g,
+        };
         let mask: Vec<Bits> = args.iter().map(|a| arg_bits(self.m, self.f, &self.act, a)).collect();
         // A `mut` place that's an inactive part of a range: the call writes its `lo`, and the
         // `hi` copies it after.
@@ -2719,7 +2729,32 @@ impl<'a> Ivx<'a> {
             self.widen(out, e, ty, CPU_STD_ULPS, 0.0)
         };
         let (fl, fh) = self.full(out, ty);
-        Ok((self.select(out, pos, r.0, fl), self.select(out, pos, r.1, fh)))
+        let r = (self.select(out, pos, r.0, fl), self.select(out, pos, r.1, fh));
+        if self.gpu() {
+            // A GPU's `pow` of a negative base is undefined (WGSL, MSL): its range stays every
+            // number there.
+            return Ok(r);
+        }
+        // On the CPU, std's `pow` of a negative base and a whole exponent is the power, signed
+        // by the exponent's oddness (IEEE 754's `pown`). For one whole exponent `y`, `x^y` is
+        // monotone on each side of 0, and for `y >= 0` its least magnitude is at the base
+        // nearest 0: its extremes are at the base's ends and the point of the range nearest 0.
+        // A negative `y` over a range holding 0 has a pole there: every number.
+        let one_y = self.cmp(out, BinOp::Eq, b.0, b.1);
+        let fy = self.builtin(out, Builtin::Floor, vec![b.0], ty);
+        let whole = self.cmp(out, BinOp::Eq, fy, b.0);
+        let bt = self.bool_ty();
+        let ok = self.bin(out, BinOp::And, one_y, whole, bt);
+        let y_up = self.cmp(out, BinOp::Ge, b.0, z);
+        let below = self.cmp(out, BinOp::Lt, a.1, z);
+        let no_zero = self.bin(out, BinOp::Or, above, below, bt);
+        let defined = self.bin(out, BinOp::Or, y_up, no_zero, bt);
+        let ok = self.bin(out, BinOp::And, ok, defined, bt);
+        let near0 = self.builtin(out, Builtin::Clamp, vec![z, a.0, a.1], ty);
+        let p = [a.0, a.1, near0].map(|x| self.builtin(out, Builtin::Pow, vec![x, b.0], ty));
+        let e = self.extremes(out, &p, ty);
+        let e = self.widen(out, e, ty, CPU_STD_ULPS, 0.0);
+        Ok((self.select(out, ok, e.0, r.0), self.select(out, ok, e.1, r.1)))
     }
 
     /// `log`/`log2` at both ends, widened: `-∞` at or below zero.

@@ -38,6 +38,7 @@ mod numerics;
 mod optimize;
 mod origin;
 mod parallel;
+mod ranges;
 mod rates;
 mod reload;
 mod render;

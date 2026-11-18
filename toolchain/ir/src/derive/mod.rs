@@ -25,6 +25,8 @@ use wrela_diag::Span;
 #[derive(Debug, Default)]
 pub struct DeriveCache {
     ad: HashMap<(FuncId, Vec<Bits>, u8), FuncId>,
+    /// Each derivative's key in `ad`: what it was derived from.
+    ad_of: HashMap<FuncId, (FuncId, Vec<Bits>, u8)>,
     interval: HashMap<(FuncId, Vec<Bits>), FuncId>,
     /// A precision report's walks' ([`Report`]): the `f32` walk's, then the half walk's.
     report: [HashMap<(FuncId, Vec<Bits>), FuncId>; 2],

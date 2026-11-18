@@ -79,14 +79,16 @@ fn creature_cube() -> Aabb {
 /// own `smin_if` certified at 3.9 mm.) No box is left open: std's ellipsoid has no zero inside
 /// the body (#28 §10.4). Its bound divided k0 (k0 − 1) by a length that's 0 at the centre, so
 /// its interval reached 0 there, the spurious zero the spike's topology test found, and the two
-/// boxes around the body's centre stayed open.
+/// boxes around the body's centre stayed open. Since a derivative's interval is its twin's
+/// (§14.2: a length written out, and `smin`'s derivative as a mix), boxes certify whole sooner:
+/// 4,534 boxes certified, from 8,696 at smaller sizes before.
 #[test]
 fn smins_seams_certify() {
     let mut host = host();
     let depth = 8;
     let leaf = 2.0 / (1 << depth) as f32;
     let (certified, open) = certify(&mut host, 5, creature_cube(), depth);
-    assert!(certified > 5000, "only {certified} boxes certified");
+    assert!(certified > 2000, "only {certified} boxes certified");
     for b in &open {
         let c = b.centre();
         let args = [Value::I32(5), Value::F32(c[0]), Value::F32(c[1]), Value::F32(c[2])];

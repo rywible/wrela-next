@@ -55,7 +55,7 @@ pub(super) fn value_and_gradient(
     };
     let mut mask = vec![0; func.params.len()];
     mask[xi] = all_bits(&m.types, x_ty);
-    let d = derive(m, cache, f, mask.clone(), n, target, false)?;
+    let d = derive(m, cache, f, mask.clone(), n, target, false, false)?;
     let returns = returns_active(m, cache, f, mask, Mode::Ad) != 0;
     let tuple = value_gradient_ty(&mut m.types, x_ty, payload);
     let mut g = Function::new(
@@ -138,7 +138,10 @@ fn call_seeded(
 }
 
 /// The top bit of a derivation's directions in the cache's key: a filtering one.
-const FILTERED: u8 = 0x80;
+pub(super) const FILTERED: u8 = 0x80;
+
+/// The next bit: a derivation whose code only an interval reads ([`Ad::bounds`]).
+pub(super) const BOUNDED: u8 = 0x40;
 
 /// A footprint narrower than this is a point: the builtin's own value is kept.
 const NARROWEST: f64 = 1.0e-6;
@@ -186,7 +189,7 @@ pub(super) fn filtered_value(
     }
     let mut mask = vec![0; func.params.len()];
     mask[xi] = all_bits(&m.types, x_ty);
-    let d = derive(m, cache, f, mask.clone(), n, target, true)?;
+    let d = derive(m, cache, f, mask.clone(), n, target, true, false)?;
     let returns = returns_active(m, cache, f, mask, Mode::Ad) != 0;
     let mut params = func.params.clone();
     let width_param = params.len() as u32;
@@ -212,7 +215,9 @@ pub(super) fn filtered_value(
 }
 
 /// The derivative of `f` with active parameters `mask` and `n` directions; with `filter`, a
-/// filtering one (see [`Ad::filter`]).
+/// filtering one (see [`Ad::filter`]); with `bounds`, one written for its interval to be tight
+/// (see [`Ad::bounds`]).
+#[allow(clippy::too_many_arguments)]
 pub(super) fn derive(
     m: &mut Module,
     cache: &mut DeriveCache,
@@ -221,9 +226,10 @@ pub(super) fn derive(
     n: u8,
     target: Target,
     filter: bool,
+    bounds: bool,
 ) -> Result<FuncId> {
-    // The cache's key: the directions, and the filtering mode in the top bit.
-    let key_n = n | if filter { FILTERED } else { 0 };
+    // The cache's key: the directions, and the modes in the top bits.
+    let key_n = n | if filter { FILTERED } else { 0 } | if bounds { BOUNDED } else { 0 };
     if let Some(&d) = cache.ad.get(&(f, mask.clone(), key_n)) {
         return Ok(d);
     }
@@ -234,7 +240,18 @@ pub(super) fn derive(
     no_heap_store(&act)?;
     no_write_through_mut(&func, &act, &mask, "a derivative")?;
     let mut nf = func.clone_signature();
-    nf.name = format!("{}_{}{}", func.name, if filter { "f" } else { "d" }, n);
+    nf.name = format!(
+        "{}_{}{}",
+        func.name,
+        if filter {
+            "f"
+        } else if bounds {
+            "b"
+        } else {
+            "d"
+        },
+        n
+    );
     // Tangent parameters, appended: n per active parameter.
     let mut tparam: Vec<Vec<u32>> = vec![Vec::new(); func.params.len()];
     for (i, p) in func.params.iter().enumerate() {
@@ -279,6 +296,14 @@ pub(super) fn derive(
     // fails, so a later request doesn't find the bodiless placeholder.
     let key = (f, mask, key_n);
     cache.ad.insert(key.clone(), id);
+    cache.ad_of.insert(id, key.clone());
+    let single = super::interval::single_stores(m, &func);
+    let mut defs = HashMap::new();
+    crate::visit::walk(&func.body, &mut |s| {
+        if let Stmt::Let(v, e) = s {
+            defs.insert(*v, e.clone());
+        }
+    });
     let mut b = Ad {
         m,
         cache,
@@ -288,6 +313,10 @@ pub(super) fn derive(
         n,
         target,
         filter,
+        bounds,
+        defs,
+        single,
+        scope: Vec::new(),
         tparam,
         tlocal,
         tv: HashMap::new(),
@@ -301,6 +330,7 @@ pub(super) fn derive(
         Ok(body) => body,
         Err(e) => {
             b.cache.ad.remove(&key);
+            b.cache.ad_of.remove(&id);
             return Err(e);
         }
     };
@@ -322,6 +352,18 @@ struct Ad<'a> {
     /// footprint's width along it, and the discontinuous builtins are box-filtered over the
     /// footprint they give (see `filtered_let`).
     filter: bool,
+    /// Code only an interval reads (`interval` of a `gradient`), so written for its interval to
+    /// be tight, not for its point's rounding: the square root of a sum of squares, `sqrt(c Σ
+    /// tᵢ²)` (a length written out, as a round cone's is), is differentiated as `length` is,
+    /// `√c dot(t / |t|, dt)`, whose interval is bounded where `t` can be 0, where the quotient
+    /// `d(Σ tᵢ²) / 2√(Σ tᵢ²)` is every number. The point code is not changed.
+    bounds: bool,
+    /// The primal's values, by the expression each is.
+    defs: HashMap<ValueId, Expr>,
+    /// By local: the one value stored in it, if a `let`'s.
+    single: Vec<Option<ValueId>>,
+    /// The values defined in the blocks being derived, innermost last: what's in scope.
+    scope: Vec<ValueId>,
     tparam: Vec<Vec<u32>>,
     tlocal: Vec<Vec<LocalId>>,
     /// Each active value's tangents (`None`: structurally zero).
@@ -509,10 +551,131 @@ impl Ad<'_> {
 
     fn block(&mut self, b: &Block) -> Result<Block> {
         let mut out = Vec::new();
+        let mark = self.scope.len();
         for s in b {
             self.stmt(s, &mut out)?;
+            if let Stmt::Let(v, _) = s {
+                self.scope.push(*v);
+            }
         }
+        self.scope.truncate(mark);
         Ok(out)
+    }
+
+    /// `v` as `c Σ tᵢ²` (`c` absent for 1): the terms (scalars and vectors, each a value in
+    /// scope) and the factor, which depends on nothing derived. Through `+`, `x * x`, `dot(x,
+    /// x)` and `let` bindings.
+    fn sum_of_squares(&self, v: ValueId) -> Option<(Vec<ValueId>, Option<ValueId>)> {
+        let e = self.def(v)?;
+        if let Expr::Binary(BinOp::Mul, a, b) = e {
+            for (x, c) in [(a, b), (b, a)] {
+                if !self.act.value(c) && self.m.types.as_scalar(self.ty(c)).is_some() {
+                    if let Some(t) = self.squares(x) {
+                        return Some((t, Some(c)));
+                    }
+                }
+            }
+        }
+        self.squares(v).map(|t| (t, None))
+    }
+
+    fn squares(&self, v: ValueId) -> Option<Vec<ValueId>> {
+        match self.def(v)? {
+            Expr::Binary(BinOp::Add, a, b) => {
+                let mut t = self.squares(a)?;
+                t.extend(self.squares(b)?);
+                Some(t)
+            }
+            Expr::Binary(BinOp::Mul, a, b) if self.track.same_value(a, b) || a == b => {
+                self.in_scope(a).then(|| vec![a])
+            }
+            Expr::Builtin(Builtin::Dot, args)
+                if args.len() == 2
+                    && (args[0] == args[1] || self.track.same_value(args[0], args[1])) =>
+            {
+                self.in_scope(args[0]).then(|| vec![args[0]])
+            }
+            _ => None,
+        }
+    }
+
+    /// What `v` is, through a load of a `let`'s local.
+    fn def(&self, v: ValueId) -> Option<Expr> {
+        match self.defs.get(&v)? {
+            Expr::Load(Place { root: PlaceRoot::Local(l), path }) if path.is_empty() => {
+                let src = self.single.get(l.index()).copied().flatten()?;
+                if self.in_scope(src) { self.def(src) } else { None }
+            }
+            e => Some(e.clone()),
+        }
+    }
+
+    fn in_scope(&self, v: ValueId) -> bool {
+        self.scope.contains(&v)
+    }
+
+    /// The tangent along direction `k` of `sqrt(c Σ tᵢ²)` as `length`'s rule gives it (see
+    /// [`Ad::bounds`]): `None` where the terms aren't 2 to 4 floats in all.
+    fn root_of_squares(
+        &mut self,
+        terms: &[ValueId],
+        factor: Option<ValueId>,
+        k: usize,
+        ty: TypeId,
+        out: &mut Block,
+    ) -> Option<ValueId> {
+        let mut comps = Vec::new();
+        let mut dcomps = Vec::new();
+        let zero = self.fc(out, ty, 0.0);
+        for &t in terms {
+            let tt = self.ty(t);
+            let n = match *self.m.types.get(tt) {
+                TypeDef::Scalar(Scalar::F32) => 1,
+                TypeDef::Vector(Scalar::F32, n) => n,
+                _ => return None,
+            };
+            let dt = self.t(t, k);
+            for c in 0..n as u32 {
+                let (x, dx) = if n == 1 {
+                    (t, dt.unwrap_or(zero))
+                } else {
+                    let x = self.emit(out, ty, Expr::Extract(t, c));
+                    let dx = match dt {
+                        Some(d) => self.emit(out, ty, Expr::Extract(d, c)),
+                        None => zero,
+                    };
+                    (x, dx)
+                };
+                comps.push(x);
+                dcomps.push(dx);
+            }
+        }
+        if !(2..=4).contains(&comps.len()) {
+            return None;
+        }
+        let vt = self.m.types.vector_of(Scalar::F32, comps.len() as u8);
+        let w = self.emit(out, vt, Expr::Construct(vt, comps.clone()));
+        let dw = self.emit(out, vt, Expr::Construct(vt, dcomps));
+        // As `length`'s: `normalize` where `w` isn't 0, 0 where it is.
+        let len = self.builtin(out, Builtin::Length, vec![w], ty);
+        let b = self.m.types.bool();
+        let pos = self.emit(out, b, Expr::Binary(BinOp::Gt, len, zero));
+        let one = self.fc(out, ty, 1.0);
+        let mut axis = vec![one];
+        axis.extend((1..comps.len()).map(|_| zero));
+        let axis = self.emit(out, vt, Expr::Construct(vt, axis));
+        let safe = self.emit(out, vt, Expr::Select { cond: pos, if_true: w, if_false: axis });
+        let unit = self.builtin(out, Builtin::Normalize, vec![safe], vt);
+        let none = self.emit(out, vt, Expr::Zero(vt));
+        let dir = self.emit(out, vt, Expr::Select { cond: pos, if_true: unit, if_false: none });
+        let d = self.builtin(out, Builtin::Dot, vec![dir, dw], ty);
+        Some(match factor {
+            Some(c) => {
+                let r = self.builtin(out, Builtin::Sqrt, vec![c], ty);
+                self.bin(out, BinOp::Mul, d, r, ty)
+            }
+            None => d,
+        })
     }
 
     fn stmt(&mut self, s: &Stmt, out: &mut Block) -> Result<()> {
@@ -589,9 +752,60 @@ impl Ad<'_> {
             out.push(let_or_eval(v, Expr::Call(g, args.to_vec())));
             return Ok(());
         }
+        if self.bounds
+            && let (Some(v), true) = (v, returns)
+            && self.m.functions[g.index()].known == Some(Known::Smin)
+            && let [Arg::Value(a), Arg::Value(b), Arg::Value(k)] = args
+            && mask[2] == 0
+        {
+            // `smin`'s derivative as the mix it is, `mix(da, db, w)` with `w` the weight on `b`
+            // (`smin_weight`, in [0, 1]), whose interval is the hull of the two: written out,
+            // `da + 2 m s (db - da)` counts `da` twice, and a fold of n smooth unions grows the
+            // interval by about 1.5 each step.
+            out.push(Stmt::Let(v, Expr::Call(g, args.to_vec())));
+            let ty = self.ty(v);
+            let d = self.bin(out, BinOp::Sub, *a, *b, ty);
+            let ad = self.builtin(out, Builtin::Abs, vec![d], ty);
+            let km = self.bin(out, BinOp::Sub, *k, ad, ty);
+            let zero = self.fc(out, ty, 0.0);
+            let m = self.builtin(out, Builtin::Max, vec![km, zero], ty);
+            let tiny = self.fc(out, ty, 1.1754944e-38);
+            let kk = self.builtin(out, Builtin::Max, vec![*k, tiny], ty);
+            let half = self.fc(out, ty, 0.5);
+            let s = self.bin(out, BinOp::Div, half, kk, ty);
+            let w = self.bin(out, BinOp::Mul, m, s, ty);
+            let w = self.builtin(out, Builtin::Min, vec![w, half], ty);
+            let one = self.fc(out, ty, 1.0);
+            let omw = self.bin(out, BinOp::Sub, one, w, ty);
+            let bt = self.m.types.bool();
+            let below = self.emit(out, bt, Expr::Binary(BinOp::Lt, *a, *b));
+            let wb = self.emit(out, ty, Expr::Select { cond: below, if_true: w, if_false: omw });
+            // Held to [0, 1] (it is, but an interval of it widens past its ends by its
+            // rounding, and `mix`'s interval is the hull only for a weight inside them).
+            let wb = self.builtin(out, Builtin::Max, vec![wb, zero], ty);
+            let wb = self.builtin(out, Builtin::Min, vec![wb, one], ty);
+            let mut ts = Vec::new();
+            for dir in 0..self.n as usize {
+                let (da, db) = (self.t(*a, dir), self.t(*b, dir));
+                let da = self.tangent_or_zero(out, da, ty);
+                let db = self.tangent_or_zero(out, db, ty);
+                ts.push(Some(self.builtin(out, Builtin::Mix, vec![da, db, wb], ty)));
+            }
+            self.tv.insert(v, ts);
+            return Ok(());
+        }
         let at = self.track.at;
-        let dg = derive(self.m, self.cache, g, mask.clone(), self.n, self.target, self.filter)
-            .map_err(|e| e.through(at))?;
+        let dg = derive(
+            self.m,
+            self.cache,
+            g,
+            mask.clone(),
+            self.n,
+            self.target,
+            self.filter,
+            self.bounds,
+        )
+        .map_err(|e| e.through(at))?;
         let mut new_args = args.to_vec();
         for (i, a) in args.iter().enumerate() {
             if mask[i] == 0 {
@@ -1021,6 +1235,17 @@ impl Ad<'_> {
                 ));
             }
             B::Fract => d[0],
+            B::Sqrt if self.bounds && d[0].is_some() && self.sum_of_squares(a0).is_some() => {
+                let (terms, factor) = self.sum_of_squares(a0).unwrap();
+                match self.root_of_squares(&terms, factor, k, ty, out) {
+                    Some(t) => Some(t),
+                    None => d[0].map(|da| {
+                        let two = self.fc(out, ty, 2.0);
+                        let den = self.bin(out, BinOp::Mul, v, two, ty);
+                        self.div_from_zero(out, da, den, ty)
+                    }),
+                }
+            }
             B::Sqrt => d[0].map(|da| {
                 let two = self.fc(out, ty, 2.0);
                 let den = self.bin(out, BinOp::Mul, v, two, ty);
@@ -1351,7 +1576,7 @@ mod tests {
         f.body = body;
         let id = m.add_function(f);
         verify(&m).expect("the source is valid IR");
-        derive(&mut m, &mut DeriveCache::default(), id, vec![1], 1, Target::Cpu, false)
+        derive(&mut m, &mut DeriveCache::default(), id, vec![1], 1, Target::Cpu, false, false)
             .expect("normalization is differentiable");
         verify(&m).expect("the derivative keeps the vector's component type");
     }
