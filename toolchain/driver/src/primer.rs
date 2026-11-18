@@ -324,6 +324,10 @@ pub const RULES: &[(&str, &str)] = &[
         "`over:` dispatches a kernel over a count, a size or a texture, its groups and bounds the compiler's",
     ),
     (
+        "gpu.origin",
+        "`origin:` starts a dispatch's invocations there, each `GlobalId` the origin added to its place, so a part is filled alone",
+    ),
+    (
         "gpu.draw-state",
         "a draw's cull mode, depth bias, depth test and blends are build-time constants",
     ),

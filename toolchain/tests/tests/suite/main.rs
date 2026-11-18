@@ -36,6 +36,7 @@ mod messages;
 mod noise;
 mod numerics;
 mod optimize;
+mod origin;
 mod parallel;
 mod rates;
 mod reload;

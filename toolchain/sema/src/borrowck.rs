@@ -1147,7 +1147,11 @@ impl<'a> FnCheck<'a> {
                     }
                 }
             }
-            Rvalue::Dispatch(d) => d.groups.iter().for_each(|g| self.operand(st, at, g)),
+            Rvalue::Dispatch(d) => d
+                .groups
+                .iter()
+                .chain(d.origin.iter().flatten())
+                .for_each(|g| self.operand(st, at, g)),
             Rvalue::Draw(d) => {
                 self.operand(st, at, &d.vertices);
                 self.operand(st, at, &d.instances);
@@ -2250,7 +2254,7 @@ fn rvalue_places(body: &Body, r: &Rvalue, add: &mut dyn FnMut(&Place, bool)) {
             if let Some(p) = d.kernel.value() {
                 add(p, false);
             }
-            for o in &d.groups {
+            for o in d.groups.iter().chain(d.origin.iter().flatten()) {
                 operand(o, add);
             }
             for (_, p, _) in &d.args {

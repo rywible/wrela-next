@@ -3475,19 +3475,22 @@ impl<'p> Checker<'p> {
     }
 
     /// `dispatch(kernel.bind(...), groups: n)`: `groups` is the workgroup count, a `u32`, a
-    /// `(u32, u32, u32)`, or a buffer holding them (indirect).
+    /// `(u32, u32, u32)`, or a buffer holding them (indirect). `origin:` (a `u32`, a
+    /// `(u32, u32)` or a `(u32, u32, u32)`) is where its invocations start: added to each one's
+    /// `GlobalId`, so a part of a volume is filled alone.
     fn check_dispatch(&mut self, args: &[ast::Arg], span: Span) -> Expr {
         let unit = self.p.types.unit;
         let u32_ty = self.p.types.u32;
         let is_groups = |i: usize, a: &ast::Arg| {
             a.name.as_ref().map_or(i == 1, |n| n.name == "groups" || n.name == "over")
         };
+        let is_origin = |a: &ast::Arg| a.name.as_ref().is_some_and(|n| n.name == "origin");
         // The form before binding: the kernel's arguments among `dispatch`'s own.
         let extra: Vec<&ast::Arg> = args
             .iter()
             .enumerate()
             .skip(1)
-            .filter(|(i, a)| !is_groups(*i, a))
+            .filter(|(i, a)| !is_groups(*i, a) && !is_origin(a))
             .map(|(_, a)| a)
             .collect();
         if !extra.is_empty()
@@ -3530,7 +3533,30 @@ impl<'p> Checker<'p> {
         let mut groups: Option<Expr> = None;
         let mut indirect = false;
         let mut over = false;
+        let mut origin: Option<Expr> = None;
         for (i, a) in args.iter().enumerate().skip(1) {
+            if is_origin(a) {
+                let e = self.check_expr(&a.value, None);
+                if origin.is_some() {
+                    self.err(
+                        Diagnostic::new(codes::E0304, a.span, "`dispatch` takes `origin:` once")
+                            .with_help("give one origin: where the part's invocations start"),
+                    );
+                    continue;
+                }
+                match self.kind(e.ty).clone() {
+                    TyKind::Tuple(ts) if ts.len() == 2 || ts.len() == 3 => {
+                        for t in ts {
+                            self.expect(t, u32_ty, e.span);
+                        }
+                    }
+                    _ => {
+                        self.expect(e.ty, u32_ty, e.span);
+                    }
+                }
+                origin = Some(e);
+                continue;
+            }
             if !is_groups(i, a) {
                 continue;
             }
@@ -3581,6 +3607,17 @@ impl<'p> Checker<'p> {
             );
             return self.error_expr(span);
         };
+        // A kernel that writes `Slots` numbers them row by row across its dispatch, which a part
+        // doesn't know: it's given an origin only along one row (E0603).
+        if let Some(o) = &origin
+            && let Some(f) = kernel_fn
+            && crate::gpu::writes_slots(self.p, f)
+        {
+            let row = |t: TyId, s: &Self| !matches!(s.kind(t), TyKind::Tuple(_) | TyKind::Adt(..));
+            if indirect || !row(groups.ty, self) || !row(o.ty, self) {
+                self.err(crate::gpu::slots_in_parts(self.p, f, o.span));
+            }
+        }
         let groups_at = kernel_args.len();
         let d = Dispatch {
             kernel,
@@ -3589,6 +3626,7 @@ impl<'p> Checker<'p> {
             over,
             args: kernel_args,
             groups_at,
+            origin: origin.map(Box::new),
         };
         Expr { ty: unit, span, kind: ExprKind::Dispatch(Box::new(d)) }
     }

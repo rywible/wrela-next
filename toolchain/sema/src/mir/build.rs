@@ -1357,11 +1357,40 @@ impl<'a> Builder<'a> {
             let g = self.value(&d.groups, Want::Read)?;
             [g, one.clone(), one]
         };
+        // Where its invocations start: a `u32` in x, or a tuple's each (0 past its length).
+        let origin = match &d.origin {
+            None => None,
+            Some(o) => {
+                let zero = constant(Lit::Int(0), u32_ty, o.span);
+                if let TyKind::Tuple(ts) = self.p.types.kind(o.ty) {
+                    let n = ts.len() as u32;
+                    let g = self.value(o, Want::Read)?;
+                    let gp = self.operand_place(g);
+                    let f = |k: u32, b: &mut Self| {
+                        if k >= n {
+                            return zero.clone();
+                        }
+                        b.materialize(OperandKind::Copy(gp.with(Proj::Field(k))), u32_ty, o.span)
+                    };
+                    Some([f(0, self), f(1, self), f(2, self)])
+                } else {
+                    let g = self.value(o, Want::Read)?;
+                    Some([g, zero.clone(), zero])
+                }
+            }
+        };
         for (i, a) in &d.args[d.groups_at..] {
             let p = self.gpu_arg(a)?;
             args.push((*i, p, a.span));
         }
-        Some(Rvalue::Dispatch(Box::new(Dispatch { kernel, groups, over: d.over, args, indirect })))
+        Some(Rvalue::Dispatch(Box::new(Dispatch {
+            kernel,
+            groups,
+            over: d.over,
+            origin,
+            args,
+            indirect,
+        })))
     }
 
     fn draw(&mut self, d: &thir::Draw) -> Option<Rvalue> {

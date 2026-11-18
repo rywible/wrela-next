@@ -2401,6 +2401,12 @@ The compiler sizes the workgroup counts from the kernel's `@compute` size. An in
 - A dispatch takes `over:` or `groups:`. Both is E0304; neither is E0603.
 - A kernel that shares workgroup memory is not dispatched over a domain (E0603). Its invocations past the domain must still reach its barriers, and the kernel decides what they add to the memory. So it is dispatched by `groups:` and checks its `GlobalId` itself.
 
+**Dispatch with an origin:** `dispatch(k.bind(...), over: (w, h, d), origin: (x, y, z))` runs the kernel's invocations from there: each invocation's `GlobalId` is the origin added to its place in the dispatch. So a part of a volume is filled alone (the bricks a ray wanted, a moving thing's atlas), and a fill too large for one step is cut into parts, each weighed by the step guard as its own invocations. The parts of a fill, in any order, write what the whole fill writes, to the bit, in both hosts.
+
+- `origin:` is a `u32` (in x; y and z 0), a `(u32, u32)` or a `(u32, u32, u32)`. It goes with `over:` (the part's size: invocations past it return at once) or `groups:`, direct or indirect. Twice is E0304.
+- The origin travels in the uniform block, so a kernel dispatched with an origin is a pipeline of its own. `LocalId` and `WorkgroupId` are the invocation's in the part, not the whole.
+- A kernel that writes `Slots` is given an origin only along one row: its count and its origin each a `u32` (E0603). A `Slots` is numbered row by row across the dispatch, so a part of more than one row would number its slots by its own rows. A texture's texels are where `GlobalId` says, so a kernel that writes `Texels` or `Texels3d` is filled in parts of any shape.
+
 **Indirect work:** a command can take its counts from a buffer, so GPU work can size later GPU work.
 
 - `dispatch(k.bind(...), groups: buf)` takes its three group counts from a buffer.
@@ -3481,6 +3487,7 @@ Each rule of the conformance suite (`compiler/tests/conformance`), with what it 
 | `gpu.dispatch` | `dispatch` and `draw` bind their entry points' arguments; an entry point isn't called | §18.7 |
 | `gpu.bound` | `k.bind(...)` is a value that a command takes, and code is generic over `Kernel`, `VertexShader<V>` and `FragmentShader<V>` | §18.7 |
 | `gpu.domains` | `over:` dispatches a kernel over a count, a size or a texture, its groups and bounds the compiler's | §18.7 |
+| `gpu.origin` | `origin:` starts a dispatch's invocations there, each `GlobalId` the origin added to its place, so a part is filled alone | §18.7 |
 | `gpu.draw-state` | A draw's cull mode, depth bias, depth test and blends are build-time constants | §18.7 |
 | `gpu.textures` | Textures are sampled in fragment shaders, read anywhere on the GPU, and drawn into in passes, by their mip levels and layers | §18.8 |
 | `gpu.formats` | A texture's format is a type: its texel, and whether it's filtered, written by kernels and drawn into | §18.8 |

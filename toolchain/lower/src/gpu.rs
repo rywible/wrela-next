@@ -26,6 +26,9 @@ pub enum PipelineKey {
         /// Dispatched over a domain (`over:`): its uniform block holds the domain, and
         /// invocations past it return at once.
         over: bool,
+        /// Dispatched with an origin (`origin:`): its uniform block holds it, and each
+        /// invocation's `GlobalId` is it added to the invocation's place in the dispatch.
+        origin: bool,
         /// Its `const` parameters' values (§18.1), as `(entry, parameter, value)`: one pipeline
         /// each set.
         consts: Vec<(usize, usize, ConstArg)>,
@@ -135,6 +138,8 @@ pub(crate) struct GpuCx {
     pub uniform_fields: Vec<Option<u32>>,
     /// Over a domain: the block's field holding the domain's size.
     pub domain_field: Option<u32>,
+    /// With an origin: the block's field holding it, which each `GlobalId` adds.
+    pub origin_field: Option<u32>,
     /// A lifted build's literal table (§23): the storage buffer every pipeline binds last.
     pub literals: Option<ir::ResourceId>,
     /// A pipeline's `const` parameters' values, in the interface's order (§18.1): each folded
@@ -160,6 +165,7 @@ impl GpuCx {
             uniform: None,
             uniform_fields: Vec::new(),
             domain_field: None,
+            origin_field: None,
             literals: None,
             consts: None,
         }
@@ -461,6 +467,9 @@ pub(crate) struct Interface {
     /// A kernel dispatched over a domain (`over:`): its uniform block ends with the domain's
     /// size (`DOMAIN`), and invocations past it return at once.
     pub over: bool,
+    /// A kernel dispatched with an origin (`origin:`): its uniform block ends with the origin
+    /// (`ORIGIN`), which its `GlobalId` adds.
+    pub origin: bool,
 }
 
 impl Interface {
@@ -533,8 +542,9 @@ impl Interface {
 /// A pipeline's interface.
 fn interface(cx: &mut Cx, key: &PipelineKey) -> Interface {
     match key {
-        PipelineKey::Compute { kernel, substs, over, .. } => Interface {
+        PipelineKey::Compute { kernel, substs, over, origin, .. } => Interface {
             over: *over,
+            origin: *origin,
             ..Interface::of(cx, &[(*kernel, substs.as_slice())], None, None)
         },
         PipelineKey::Render { vertex, fragment, .. } => {
@@ -713,12 +723,15 @@ pub(crate) fn add_standins(cx: &mut Cx) -> Vec<(u32, u32)> {
             continue;
         }
         let swapped = match &key {
-            PipelineKey::Compute { kernel: _, substs, over, consts } => PipelineKey::Compute {
-                kernel: cheap,
-                substs: substs.clone(),
-                over: *over,
-                consts: consts.clone(),
-            },
+            PipelineKey::Compute { kernel: _, substs, over, origin, consts } => {
+                PipelineKey::Compute {
+                    kernel: cheap,
+                    substs: substs.clone(),
+                    over: *over,
+                    origin: *origin,
+                    consts: consts.clone(),
+                }
+            }
             PipelineKey::Render { vertex, fragment, state, consts } => PipelineKey::Render {
                 vertex: vertex.clone(),
                 fragment: (cheap, fragment.1.clone()),
@@ -988,11 +1001,21 @@ fn record_dispatch(fl: &mut Fl, d: &mir::Dispatch, span: Span) -> Option<()> {
         fl.cx.err(wrela_sema::gpu::shared_over_domain(&fl.cx.checked.program, kernel.func, span));
         return None;
     }
+    // A kernel a generic function dispatches with an origin is known here (E0603).
+    if let Some(o) = &d.origin
+        && kernel.value.is_some()
+        && wrela_sema::gpu::writes_slots(&fl.cx.checked.program, kernel.func)
+        && (d.indirect.is_some() || !one_row(&d.groups) || !one_row(o))
+    {
+        fl.cx.err(wrela_sema::gpu::slots_in_parts(&fl.cx.checked.program, kernel.func, span));
+        return None;
+    }
     let consts = kernel.consts.iter().map(|&(i, c)| (0, i, c)).collect();
     let key = PipelineKey::Compute {
         kernel: kernel.func,
         substs: kernel.substs.clone(),
         over: d.over,
+        origin: d.origin.is_some(),
         consts,
     };
     let (pindex, iface) = pipeline(fl.cx, key, span);
@@ -1035,6 +1058,15 @@ fn record_dispatch(fl: &mut Fl, d: &mir::Dispatch, span: Span) -> Option<()> {
         uniform_fields.push((DOMAIN.to_string(), v3));
         uniform_vals.push(fl.value(v3, ir::Expr::Construct(v3, size)));
     }
+    if let Some(o) = &d.origin {
+        let v3 = fl.mb.m.types.vector_of(ir::Scalar::U32, 3);
+        let mut at = Vec::new();
+        for x in o {
+            at.push(fl.operand(x)?);
+        }
+        uniform_fields.push((ORIGIN.to_string(), v3));
+        uniform_vals.push(fl.value(v3, ir::Expr::Construct(v3, at)));
+    }
     let mut handles = bound(fl, &iface, |_, i| arg(i))?;
     // A lifted build's literal table (only a build with literals has one).
     handles.extend(fl.literal_binding(true).into_iter().flatten());
@@ -1057,6 +1089,16 @@ type UniformFields = Vec<(String, ir::TypeId)>;
 
 /// The uniform block's last field, of a kernel dispatched over a domain: the domain's size.
 const DOMAIN: &str = "domain";
+
+/// The uniform block's last field, of a kernel dispatched with an origin (after the domain's):
+/// where its invocations start.
+const ORIGIN: &str = "origin";
+
+/// Whether a dispatch's `groups` or `origin` operands are one row: y and z constants, as MIR
+/// makes them of a `u32` (1 for a count, 0 for an origin).
+fn one_row(xs: &[mir::Operand; 3]) -> bool {
+    xs[1..].iter().all(|x| matches!(&x.kind, mir::OperandKind::Const(_)))
+}
 
 /// The uniform block's fields and their values: each uniform leaf whose argument (`arg` of an
 /// entry point's parameter) has a runtime value, as `bind_uniform` makes the block. `None` if
@@ -2818,9 +2860,16 @@ fn bind_uniform(cx: &mut Cx, mb: &mut ModuleBuilder, iface: &Interface) -> Optio
         fields.push((DOMAIN.to_string(), v3));
         fields.len() as u32 - 1
     });
+    // With an origin, it last.
+    let origin = iface.origin.then(|| {
+        let v3 = mb.m.types.vector_of(ir::Scalar::U32, 3);
+        fields.push((ORIGIN.to_string(), v3));
+        fields.len() as u32 - 1
+    });
     if let Some(g) = mb.gpu.as_mut() {
         g.uniform_fields = map;
         g.domain_field = domain;
+        g.origin_field = origin;
     }
     if fields.is_empty() {
         return None;
@@ -3063,6 +3112,7 @@ fn lower_compute(cx: &mut Cx, iface: Rc<Interface>, consts: Vec<ir::Const>) -> O
             kernel: FnId(0),
             substs: Vec::new(),
             over: false,
+            origin: false,
             consts: Vec::new(),
         },
         sites: Vec::new(),
@@ -3173,6 +3223,7 @@ fn lower_render(
             kernel: FnId(0),
             substs: Vec::new(),
             over: false,
+            origin: false,
             consts: Vec::new(),
         },
         sites: Vec::new(),
@@ -3347,7 +3398,31 @@ pub(crate) fn bind_entry_params(fl: &mut Fl, func: FnId, entry: Entry) {
         fl.locals[local.index()] = match class {
             ParamClass::Builtin(b) => {
                 let Some(it) = fl.cx.lower_ty(fl.mb, *t, p.span) else { continue };
-                Repr::Var(fl.bind_local(&p.name, it, ir::Expr::EntryInput(input(*b))))
+                let at = ir::Expr::EntryInput(input(*b));
+                // With an origin, the invocation's `GlobalId` is its place in the dispatch
+                // past the origin.
+                let at = match fl.mb.gpu.as_ref().map(|g| (g.uniform, g.origin_field)) {
+                    Some((Some(u), Some(field))) if *b == ir::BuiltinInput::GlobalInvocationId => {
+                        let v3 = fl.mb.m.types.vector_of(ir::Scalar::U32, 3);
+                        let u32_ty = fl.mb.m.types.u32();
+                        let raw = fl.value(it, at);
+                        let place = ir::Place {
+                            root: ir::PlaceRoot::Resource(u),
+                            path: vec![ir::Proj::Field(field)],
+                        };
+                        let o = fl.load(place, v3);
+                        let parts = (0..3)
+                            .map(|k| {
+                                let r = fl.value(u32_ty, ir::Expr::Extract(raw, k));
+                                let d = fl.value(u32_ty, ir::Expr::Extract(o, k));
+                                fl.value(u32_ty, ir::Expr::Binary(ir::BinOp::Add, r, d))
+                            })
+                            .collect();
+                        ir::Expr::Construct(it, parts)
+                    }
+                    _ => at,
+                };
+                Repr::Var(fl.bind_local(&p.name, it, at))
             }
             ParamClass::Buffer { .. }
             | ParamClass::Append { .. }

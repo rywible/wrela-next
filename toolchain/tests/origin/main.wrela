@@ -1,0 +1,115 @@
+// A dispatch with an origin (§18.7, `gpu.origin`): a volume filled in parts, each part's
+// invocations starting at its origin, is the volume filled whole, to the bit; and a row of
+// `Slots` likewise. The parts are of uneven sizes, their origins not on the kernel's workgroups,
+// so each invocation's place is the origin added to its own. Both are read back:
+// tests/suite/origin.rs checks them against each other and against the CPU.
+use std::gpu::{GlobalId, GpuBuffer, R32Uint, Slots, Texels3d, Texture3d, buffer, dispatch, read, texture3d}
+use std::io::Pending
+
+/// The volume's size: no side a multiple of the kernel's workgroup (4).
+pub const W: u32 = 20
+pub const H: u32 = 13
+pub const D: u32 = 9
+/// The row's length.
+pub const N: u32 = 1000
+
+/// What texel (x, y, z) holds: never 0, which a texture starts as.
+fn mark(x: u32, y: u32, z: u32) -> u32 {
+    1 + x + 100 * y + 10000 * z
+}
+
+@compute(4, 4, 4)
+fn fill(out: mut Texels3d<R32Uint>, id: GlobalId) {
+    out.store(id, mark(id.x, id.y, id.z))
+}
+
+@compute(64)
+fn line(out: mut Slots<u32>, id: GlobalId) {
+    out[id] = 7 + 3 * id.x
+}
+
+/// Each texel of both volumes, in a row: x fastest, then y, then z.
+@compute(64)
+fn gather(a: Texture3d<R32Uint>, b: Texture3d<R32Uint>, wa: mut Slots<u32>, wb: mut Slots<u32>, id: GlobalId) {
+    let i = id.x
+    let x = i % W
+    let y = (i / W) % H
+    let z = i / (W * H)
+    wa[id] = a.load(x, y, z)
+    wb[id] = b.load(x, y, z)
+}
+
+pub struct Work {
+    backs: [Pending<u32>; 4],
+    /// The whole volume's texels, the parts', the whole row and the parts'.
+    got: [Vec<u32>; 4],
+}
+
+pub fn init() -> Work {
+    var whole = texture3d::<R32Uint>(width: W, height: H, depth: D)
+    var parts = texture3d::<R32Uint>(width: W, height: H, depth: D)
+    dispatch(fill.bind(mut whole), over: (W, H, D))
+    // Twelve parts, cut at x 7 and 15, y 5, z 3, filled last to first.
+    let xs = [0, 7, 15, W]
+    let ys = [0, 5, H]
+    let zs = [0, 3, D]
+    for k in 0..12 {
+        let n = 11 - k
+        let (i, j, l) = (n % 3, (n / 3) % 2, n / 6)
+        dispatch(
+            fill.bind(mut parts),
+            over: (xs[i + 1] - xs[i], ys[j + 1] - ys[j], zs[l + 1] - zs[l]),
+            origin: (xs[i], ys[j], zs[l]),
+        )
+    }
+    let count = W * H * D
+    var wa: GpuBuffer<u32> = buffer(count)
+    var wb: GpuBuffer<u32> = buffer(count)
+    dispatch(gather.bind(whole, parts, mut wa, mut wb), over: count)
+    var row: GpuBuffer<u32> = buffer(N)
+    var cut: GpuBuffer<u32> = buffer(N)
+    dispatch(line.bind(mut row), over: N)
+    dispatch(line.bind(mut cut), over: 650 - 300, origin: 300)
+    dispatch(line.bind(mut cut), over: N - 650, origin: 650)
+    dispatch(line.bind(mut cut), over: 300, origin: 0)
+    let backs = [
+        read(wa.span(start: 0, count: count)),
+        read(wb.span(start: 0, count: count)),
+        read(row.span(start: 0, count: N)),
+        read(cut.span(start: 0, count: N)),
+    ]
+    Work { backs, got: [Vec::new(), Vec::new(), Vec::new(), Vec::new()] }
+}
+
+/// How many of read-back `k`'s values arrived (0: the whole volume, 1: its parts, 2: the whole
+/// row, 3: its parts).
+pub fn arrived(state: Work, k: u32) -> u32 {
+    u32(state.got[k].len())
+}
+
+/// How many of the parts' values (`k` 1: the volume's, 3: the row's) are the whole's, to the bit,
+/// and the CPU's.
+pub fn matched(state: Work, k: u32) -> u32 {
+    var n: u32 = 0
+    borrow whole = state.got[k - 1]
+    borrow parts = state.got[k]
+    for i in 0..u32(parts.len()) {
+        let want = if k == 1 {
+            mark(i % W, (i / W) % H, i / (W * H))
+        } else {
+            7 + 3 * i
+        }
+        if parts[i] == whole[i] && parts[i] == want {
+            n += 1
+        }
+    }
+    n
+}
+
+pub fn frame(state: mut Work, time: f32, width: u32, height: u32) {
+    for k in 0..4 {
+        if let Some(Ok(xs)) = state.backs[k].poll() {
+            state.got[k] = take xs
+        }
+    }
+}
