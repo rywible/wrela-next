@@ -6,13 +6,16 @@
 // each was asked at (`asks`), to refine its cells where they were coarser than that. Matter never
 // sees the eye: only places and sizes.
 //
-// Where a pixel holds an edge (its middle ray met matter and a neighbour's didn't, or the other
-// way; it passed matter within its width; its neighbour shows another surface, nearer or farther
-// or turned another way), one ray through its middle can't say what it shows: the edge pass
-// (`edges_found`, `edge_rays`, `edges_resolved`) draws it again as the mean of `EDGE_LOOKS`² rays
-// spread evenly over it, each the same `shown` (the same `ray::met`), as the reference's mean of
-// looks over the pixel is. The edge pixels are listed first and their rays drawn a ray a fragment,
-// so a few edge pixels don't hold up the many round them.
+// A pixel is the mean of what the look shows over it, so where an edge crosses a pixel its colour
+// is shared between the two sides by how much of it each covers, and that share must change
+// smoothly as the edge moves across. One ray a pixel says where each side is, from distances it
+// already has (`covered`): how far its neighbour's ray passed the surface that ends there (the
+// ray's own `Met::nearest`, kept in the colour's alpha, px), turned onto the screen by which way
+// the surface faces; or, at a crease, where the two faces' planes meet between the two pixels.
+// Each side's colour is its own pixel's. Only where two edges cross one pixel (a part thinner than
+// a pixel, a gap narrower than one) does that not hold: those pixels alone (`edges_found`) are drawn
+// again as the mean of `EDGE_LOOKS`² rays spread evenly over each, the same `shown`, a ray a
+// fragment, so a few of them don't hold up the many round them.
 //
 // The light here is a stand-in, the simplest that can be held to the reference exactly (the
 // reference's `SIMPLE` light): the sun where a shadow ray (the same `ray::met`) says it reaches,
@@ -48,12 +51,8 @@ const FIRST_BANDS: u32 = 32
 const LEAST_BANDS: u32 = 4
 const MOST_BANDS: u32 = 128
 
-/// An edge pixel's rays a side; how far apart two neighbours' surfaces are, as a share of the
-/// nearer's distance, to be two surfaces; and the least cosine between two neighbours' facings for
-/// them to be one surface.
+/// A pixel's rays a side where two edges cross it.
 const EDGE_LOOKS: u32 = 3
-const JUMP: f32 = 0.05
-const CREASE: f32 = 0.8
 
 /// No edge at a pixel; one in how many of a picture's pixels may be an edge (the rest drawn by
 /// their middle ray alone): the edge rays fill a picture the screen's size.
@@ -122,6 +121,7 @@ pub struct Shown: Copy {
     pub colour: vec3,
     pub place: vec4,
     pub ask: vec4,
+    pub pass: f32,
     pub steps: u32,
 }
 
@@ -137,7 +137,7 @@ pub fn shown<W: Asked, S: Sky, L: Look>(v: View, w: W, sky: S, look: L, table: T
         if m.nearest < 0.5 {
             ask = vec4(v.at + d * m.nearest_t, px * m.nearest_t)
         }
-        return Shown { colour: look.tone(Seen { light: seen(sky, d) }), place: vec4(0.0), ask, steps: m.steps }
+        return Shown { colour: look.tone(Seen { light: seen(sky, d) }), place: vec4(0.0), ask, pass: min(m.nearest, 64.0), steps: m.steps }
     }
     let p = v.at + d * m.t
     let size = px * m.t
@@ -156,11 +156,12 @@ pub fn shown<W: Asked, S: Sky, L: Look>(v: View, w: W, sky: S, look: L, table: T
         }
     }
     light += stuff.scatters(n, n, -d) * sky_on(table, s, n)
-    Shown { colour: look.tone(Seen { light }), place: vec4(n, m.t), ask: vec4(p, size), steps }
+    Shown { colour: look.tone(Seen { light }), place: vec4(n, m.t), ask: vec4(p, size), pass: min(m.nearest, 64.0), steps }
 }
 
-/// A pixel: its middle ray (`shown`). Into the first target, the look's colour (or, as an
-/// instrument, `steps` 1: the eye's ray's steps in red and its shadow ray's in green, 64 to full);
+/// A pixel: its middle ray (`shown`). Into the first target, the look's colour and how nearly the
+/// ray passed matter it didn't meet (alpha, px) (or, as an instrument, `steps` 1: the eye's ray's
+/// steps in red and its shadow ray's in green, 64 to full);
 /// into the second, which way the surface it shows faces and how far along the ray (0: the sky);
 /// into the third, the place it shows and the size it was asked at (for matter's refining).
 @fragment
@@ -169,54 +170,193 @@ pub fn pixel<W: Asked, S: Sky, L: Look>(pixel: FragCoord, v: View, w: W, sky: S,
     if steps == 1 {
         return Targets3 { first: vec4(f32(r.steps % 65536) / 64.0, f32(r.steps / 65536) / 64.0, 0.0, 1.0), second: r.place, third: r.ask }
     }
-    Targets3 { first: vec4(r.colour, 1.0), second: r.place, third: r.ask }
+    Targets3 { first: vec4(r.colour, r.pass), second: r.place, third: r.ask }
 }
 
-/// Whether pixel (`x`, `y`) holds an edge (see the head of the file), by what the picture put there
-/// and round it (`place`, and `asks`: a ray that met nothing but asked passed matter within its
-/// width).
-fn on_edge(place: Texture<Rgba32Float>, asks: Texture<Rgba32Float>, x: u32, y: u32) -> bool {
-    let me = place.load(x, y)
-    let met = me.w > 0.0
-    if !met && asks.load(x, y).w > 0.0 {
-        return true
-    }
+/// What the first pass saw at pixel (`x`, `y`): whether its ray met matter, its colour and how
+/// nearly it passed matter it didn't meet (px), and the facing and distance of what it met.
+struct Saw: Copy {
+    met: bool,
+    colour: vec3,
+    pass: f32,
+    n: vec3,
+    t: f32,
+}
+
+fn saw(raw: Texture<Rgba16Float>, place: Texture<Rgba32Float>, x: u32, y: u32) -> Saw {
+    let c = raw.load(x, y)
+    let q = place.load(x, y)
+    Saw { met: q.w > 0.0, colour: c.xyz, pass: c.w, n: q.xyz, t: q.w }
+}
+
+/// Pixel (`x`, `y`)'s neighbour `k` (0 right, 1 left, 2 down, 3 up) and its offset (px); the pixel
+/// itself where the screen ends.
+fn neighbour(x: u32, y: u32, w: u32, h: u32, k: u32) -> vec4 {
+    let nx = if k == 0 { min(x + 1, w - 1) } else if k == 1 { if x > 0 { x - 1 } else { 0 } } else { x }
+    let ny = if k == 2 { min(y + 1, h - 1) } else if k == 3 { if y > 0 { y - 1 } else { 0 } } else { y }
+    vec4(f32(nx), f32(ny), f32(nx) - f32(x), f32(ny) - f32(y))
+}
+
+/// Which way the outline of the surface a pixel met faces on the screen (unit; 0 where its facing
+/// is straight at the eye): its facing at `p`, seen through `v`, `t` m along its ray.
+fn outward(v: View, p: vec3, n: vec3, t: f32) -> vec2 {
+    let e = v.pixel_of(p + n * (v.pixel() * t)) - v.pixel_of(p)
+    if dot(e, e) > 1.0e-12 { normalize(e) } else { vec2(0.0) }
+}
+
+/// Whether two edges cross pixel (`x`, `y`), so its neighbours can't say how it is shared: its
+/// own surface ends both before and behind it across its outline (a part thinner than a pixel),
+/// or beside it where no outline faces; it met nothing, passed matter under half a pixel, and no
+/// neighbour met that matter, or neighbours each side did (a gap); or a neighbour across an
+/// outline from it passed nothing to say where the outline is.
+fn crossed_twice(raw: Texture<Rgba16Float>, place: Texture<Rgba32Float>, v: View, x: u32, y: u32) -> bool {
     let w = place.width()
     let h = place.height()
+    let me = saw(raw, place, x, y)
+    let out = if me.met { outward(v, v.at + v.ray(vec2(f32(x), f32(y)) + vec2(0.5)) * me.t, me.n, me.t) } else { vec2(0.0) }
+    var met = [false; 4]
+    var any = false
+    var before = false
+    var behind = false
+    var unsaid = false
     var k: u32 = 0
-    var edge = false
     while k < 4 {
-        let nx = if k == 0 { min(x + 1, w - 1) } else if k == 1 { if x > 0 { x - 1 } else { 0 } } else { x }
-        let ny = if k == 2 { min(y + 1, h - 1) } else if k == 3 { if y > 0 { y - 1 } else { 0 } } else { y }
-        let o = place.load(nx, ny)
-        let o_met = o.w > 0.0
-        if met != o_met {
-            edge = true
-        } else if met && (abs(o.w - me.w) > JUMP * min(o.w, me.w) || dot(o.xyz, me.xyz) < CREASE) {
-            edge = true
+        let o = neighbour(x, y, w, h, k)
+        let q = saw(raw, place, u32(o.x), u32(o.y))
+        met[k] = q.met
+        any = any || q.met
+        if me.met && (!q.met || (q.t > me.t && q.pass < 1.5)) {
+            // Its own surface ends toward this neighbour.
+            let along = dot(o.zw, out)
+            if along > 0.25 {
+                before = true
+                unsaid = unsaid || q.pass >= 1.5
+            } else {
+                behind = true
+            }
         }
         k += 1
     }
-    edge
+    if me.met {
+        return (before && behind) || unsaid
+    }
+    if me.pass < 0.5 && !any {
+        return true
+    }
+    me.pass < 0.5 && ((met[0] && met[1]) || (met[2] && met[3]))
 }
 
-/// The edge pixels found: each pixel that holds one (`on_edge`) pushed on `list` (the first `most`
+/// The pixels where two edges cross (`crossed_twice`), each pushed on `list` (the first `most`
 /// kept), its place on the list kept at the pixel (`at`, `NO_EDGE` for none).
 @compute(8, 8)
-fn edges_found(place: Texture<Rgba32Float>, asks: Texture<Rgba32Float>, most: u32, list: mut Append<u32>, at: mut Atomics<u32>, id: GlobalId) {
+fn edges_found(raw: Texture<Rgba16Float>, place: Texture<Rgba32Float>, v: View, most: u32, list: mut Append<u32>, at: mut Atomics<u32>, id: GlobalId) {
     let w = place.width()
     if id.x >= w || id.y >= place.height() {
         return
     }
     let pix = id.x + w * id.y
     var k = NO_EDGE
-    if on_edge(place, asks, id.x, id.y) {
+    if crossed_twice(raw, place, v, id.x, id.y) {
         let i = list.push(pix)
         if i < most {
             k = i
         }
     }
     at.store(i: pix, value: k)
+}
+
+/// Where between pixel `a` and its neighbour `a + o` (px) the plane through `pa` facing `na` and
+/// the one through `pb` facing `nb` are met at the same distance along the ray (as a share of the
+/// way, 0 at `a`), seen through `v`; -1 where they aren't between the two.
+fn crease(v: View, a: vec2, o: vec2, pa: vec3, na: vec3, pb: vec3, nb: vec3) -> f32 {
+    let ha = dot(pa - v.at, na)
+    let hb = dot(pb - v.at, nb)
+    var lo = 0.0
+    var hi = 1.0
+    let d0 = v.ray(a)
+    let d1 = v.ray(a + o)
+    let g0 = ha / dot(d0, na) - hb / dot(d0, nb)
+    let g1 = ha / dot(d1, na) - hb / dot(d1, nb)
+    if !(g0 * g1 < 0.0) {
+        return -1.0
+    }
+    // (Nearly a line across one pixel: where the line through the two ends crosses 0, and once
+    // more from there.)
+    var glo = g0
+    var ghi = g1
+    var k: u32 = 0
+    while k < 3 {
+        let m = clamp(lo + (hi - lo) * glo / (glo - ghi), lo, hi)
+        let d = v.ray(a + o * m)
+        let g = ha / dot(d, na) - hb / dot(d, nb)
+        if (g < 0.0) == (glo < 0.0) {
+            lo = m
+            glo = g
+        } else {
+            hi = m
+            ghi = g
+        }
+        k += 1
+    }
+    lo + (hi - lo) * glo / (glo - ghi)
+}
+
+/// Pixel (`x`, `y`)'s colour where one edge crosses it: its own colour over the share of it its
+/// own side covers, its neighbour's over the rest, the share from distances alone (see the head of
+/// the file): of the four neighbours, the one that leaves it the least.
+fn covered(raw: Texture<Rgba16Float>, place: Texture<Rgba32Float>, v: View, x: u32, y: u32) -> vec3 {
+    let w = place.width()
+    let h = place.height()
+    let me = saw(raw, place, x, y)
+    // (Where no neighbour's colour differs from its own by a level of 255, sharing it changes
+    // nothing that shows.)
+    var differs = false
+    var j: u32 = 0
+    while j < 4 {
+        let o = neighbour(x, y, w, h, j)
+        let c = raw.load(u32(o.x), u32(o.y)).xyz - me.colour
+        differs = differs || max(abs(c.x), max(abs(c.y), abs(c.z))) > 1.0 / 255.0
+        j += 1
+    }
+    if !differs {
+        return me.colour
+    }
+    let at = vec2(f32(x), f32(y)) + vec2(0.5)
+    let d = v.ray(at)
+    let p = v.at + d * me.t
+    // Which way the edge of its own surface faces on the screen: its facing, seen.
+    let out = if me.met { outward(v, p, me.n, me.t) } else { vec2(0.0) }
+    var keep = 1.0
+    var other = me.colour
+    var k: u32 = 0
+    while k < 4 {
+        let o = neighbour(x, y, w, h, k)
+        let q = saw(raw, place, u32(o.x), u32(o.y))
+        var c = 1.0
+        if me.met && (!q.met || (q.t > me.t && q.pass < 1.5)) {
+            // Its own surface ends between them: the outline is the neighbour's pass from the
+            // neighbour, and this pixel that less the neighbour's way along the outline's normal.
+            let along = dot(o.zw, out)
+            if along > 0.25 && q.pass < 1.5 {
+                c = clamp(0.5 - (q.pass - along), 0.0, 1.0)
+            }
+        } else if q.met && (!me.met || (me.t > q.t && me.pass < 1.5)) {
+            // A nearer surface ends here, passed this near by this pixel's ray.
+            c = clamp(0.5 + me.pass, 0.0, 1.0)
+        } else if me.met && q.met && dot(me.n, q.n) < 0.99999 {
+            // A crease: where the two faces' planes meet.
+            let u = crease(v, at, o.zw, p, me.n, v.at + v.ray(at + o.zw) * q.t, q.n)
+            if u >= 0.0 {
+                c = clamp(u + 0.5, 0.0, 1.0)
+            }
+        }
+        if c < keep {
+            keep = c
+            other = q.colour
+        }
+        k += 1
+    }
+    me.colour * keep + other * (1.0 - keep)
 }
 
 /// One of the edge pixels' rays (ray `j` of edge pixel `e` is `EDGE_LOOKS² e + j`, drawn at pixel
@@ -248,17 +388,28 @@ pub fn edge_ray<W: Asked, S: Sky, L: Look>(
     vec4(shown(v, w, sky, look, table, s, vec2(f32(pix % width), f32(pix / width)) + o).colour, 1.0)
 }
 
-/// The picture: an edge pixel the mean of its rays, any other what its middle ray drew (`raw`);
-/// drawing `steps` 1 (the instrument) every pixel as drawn, `steps` 2 its edge pixels red.
+/// The picture: a pixel two edges cross the mean of its rays, any other its colour as one edge
+/// shares it (`covered`); drawing `steps` 1 (the instrument) every pixel as drawn, `steps` 2 the
+/// pixels drawn by rays red and those an edge shares blue.
 @compute(8, 8)
-fn edges_resolved(raw: Texture<Rgba16Float>, at: [u32], rays: Texture<Rgba16Float>, steps: u32, out: mut Texels<Rgba16Float>, id: GlobalId) {
+fn edges_resolved(raw: Texture<Rgba16Float>, place: Texture<Rgba32Float>, v: View, at: [u32], rays: Texture<Rgba16Float>, steps: u32, out: mut Texels<Rgba16Float>, id: GlobalId) {
     let w = raw.width()
     if id.x >= w || id.y >= raw.height() {
         return
     }
     let k = at[id.x + w * id.y]
-    if k == NO_EDGE || steps == 1 {
-        out.store(id, raw.load(id.x, id.y))
+    if steps == 1 {
+        out.store(id, vec4(raw.load(id.x, id.y).xyz, 1.0))
+    } else if steps == 3 {
+        let q = place.load(id.x, id.y)
+        out.store(id, vec4(vec3(clamp(raw.load(id.x, id.y).w / 2.0, 0.0, 1.0)), 1.0) * (if q.w > 0.0 { vec4(1.0, 0.6, 0.6, 1.0) } else { vec4(0.6, 0.6, 1.0, 1.0) }))
+    } else if k == NO_EDGE {
+        let c = covered(raw, place, v, id.x, id.y)
+        if steps == 2 && length(c - raw.load(id.x, id.y).xyz) > 0.001 {
+            out.store(id, vec4(0.0, 0.0, 1.0, 1.0))
+        } else {
+            out.store(id, vec4(c, 1.0))
+        }
     } else if steps == 2 {
         out.store(id, vec4(1.0, 0.0, 0.0, 1.0))
     } else {
@@ -479,7 +630,7 @@ impl Sight {
         label("edges")
         self.edge_list.clear()
         dispatch(
-            edges_found.bind(place: self.drawn.place, asks: self.asks, most: width * height / EDGE_SHARE, list: mut self.edge_list, at: mut self.edge_at),
+            edges_found.bind(raw: self.raw, place: self.drawn.place, v: v, most: width * height / EDGE_SHARE, list: mut self.edge_list, at: mut self.edge_at),
             groups: ((width + 7) / 8, (height + 7) / 8, 1),
         )
         // (The edge rays in bands of rows, as the picture is; a band past the last ray is
@@ -510,7 +661,7 @@ impl Sight {
         }
         label("edges resolved")
         dispatch(
-            edges_resolved.bind(raw: self.raw, at: self.edge_at.items(), rays: self.edge_rays, steps: self.steps, out: mut self.drawn.colour),
+            edges_resolved.bind(raw: self.raw, place: self.drawn.place, v: v, at: self.edge_at.items(), rays: self.edge_rays, steps: self.steps, out: mut self.drawn.colour),
             groups: ((width + 7) / 8, (height + 7) / 8, 1),
         )
         self.drawn.placed = true

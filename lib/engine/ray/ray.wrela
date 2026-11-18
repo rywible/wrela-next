@@ -25,8 +25,11 @@ pub struct Ray: Copy {
 }
 
 /// What a ray met: whether it entered matter and where along it (m: the last place it was outside,
-/// within a hundredth of a millimetre or a ten-thousandth of its last step); else, where it came nearest
-/// matter, as a share of its own width there (`nearest`: how nearly it passed), and where.
+/// within a hundredth of a millimetre or a ten-thousandth of its last step); and how nearly it
+/// passed matter it didn't meet, as a share of its own width there (`nearest`), and where: the
+/// least distance at a place it came near and then left (the distance rose again by its width
+/// after), or, a ray that met nothing, the least at all. (A convex thing's distance along a line
+/// has one least: a ray that meets a face never passes it, and one past an outline does.)
 pub struct Met: Copy {
     pub met: bool,
     pub t: f32,
@@ -48,6 +51,33 @@ const RELAX: f32 = 1.6
 const LEAST: f32 = 0.25
 const LEAST_M: f32 = 0.00001
 
+/// Where between three places a ray read the distance (`t`, distance: the least in the middle)
+/// the distance is least, and that as a share of the ray's width there: the parabola through the
+/// three squared distances (exact for a ray passing a sphere, a line or a plane: its squared
+/// distance is a parabola along it), so how nearly it passed doesn't hang on where its steps fell.
+/// Where there aren't three, the middle's.
+fn passed(a: vec2, b: vec2, c: vec2, r: Ray) -> vec2 {
+    let at_b = vec2(b.x, b.y / max(r.wide + r.spread * b.x, 1.0e-9))
+    if a.x < 0.0 || c.x < 0.0 || !(a.x < b.x && b.x < c.x) {
+        return at_b
+    }
+    let ya = a.y * a.y
+    let yb = b.y * b.y
+    let yc = c.y * c.y
+    let p = (b.x - a.x) * (yb - yc)
+    let q = (b.x - c.x) * (yb - ya)
+    let den = p - q
+    if !(abs(den) > 1.0e-20) {
+        return at_b
+    }
+    let x = clamp(b.x - 0.5 * ((b.x - a.x) * p - (b.x - c.x) * q) / den, a.x, c.x)
+    let la = (x - b.x) * (x - c.x) / ((a.x - b.x) * (a.x - c.x))
+    let lb = (x - a.x) * (x - c.x) / ((b.x - a.x) * (b.x - c.x))
+    let lc = (x - a.x) * (x - b.x) / ((c.x - a.x) * (c.x - b.x))
+    let y = clamp(ya * la + yb * lb + yc * lc, 0.0, yb)
+    vec2(x, sqrt(y) / max(r.wide + r.spread * x, 1.0e-9))
+}
+
 /// What `r` meets of `w`.
 pub fn met<W: Asked>(w: W, r: Ray) -> Met {
     let span = w.span(r.o, r.d)
@@ -60,6 +90,14 @@ pub fn met<W: Asked>(w: W, r: Ray) -> Met {
     var crossed = false
     var nearest = 1.0e9
     var nearest_t = t
+    // (The least share since the distance last rose by the ray's width: a pass not yet left; and
+    // the places either side of it, where the distance was read, to find its least between them.)
+    var run = 1.0e9
+    var run_t = t
+    var at0 = vec2(-1.0)
+    var at1 = vec2(-1.0)
+    var at2 = vec2(-1.0)
+    var seen = vec2(-1.0)
     var steps: u32 = 0
     let inv = vec3(1.0) / r.d
     // (Over-relaxed: a step of `RELAX` times what matter allows, kept only where the sphere it
@@ -90,9 +128,32 @@ pub fn met<W: Asked>(w: W, r: Ray) -> Met {
             // (How nearly it passes, only where matter answered with a distance: an empty brick's
             // bound says only that nothing is nearer, and is no near miss.)
             let share = a.y / max(width, 1.0e-9)
-            if share < nearest && a.x <= a.y * 1.0001 {
-                nearest = share
-                nearest_t = t
+            if a.x <= a.y * 1.0001 {
+                if share < run {
+                    run = share
+                    run_t = t
+                    at0 = seen
+                    at1 = vec2(t, a.y)
+                    at2 = vec2(-1.0)
+                } else {
+                    if at2.x < 0.0 {
+                        at2 = vec2(t, a.y)
+                    }
+                    if share > run + 1.0 {
+                        // Left a place it came near: a pass.
+                        let least = passed(at0, at1, at2, r)
+                        if least.y < nearest {
+                            nearest = least.y
+                            nearest_t = least.x
+                        }
+                        run = share
+                        run_t = t
+                        at0 = seen
+                        at1 = vec2(t, a.y)
+                        at2 = vec2(-1.0)
+                    }
+                }
+                seen = vec2(t, a.y)
             }
             before = t
             f_before = a.y
@@ -103,15 +164,22 @@ pub fn met<W: Asked>(w: W, r: Ray) -> Met {
         }
     }
     if !crossed {
+        if run < 1.0e9 {
+            let least = passed(at0, at1, at2, r)
+            if least.y < nearest {
+                nearest = least.y
+                nearest_t = least.x
+            }
+        }
         if steps >= MOST_STEPS && t < to && nearest < LEAST {
             // (Out of steps skimming matter within a quarter of its width: it lies along the
             // surface, and has met it where it came nearest.)
-            return Met { met: true, t: nearest_t, nearest: 0.0, nearest_t, steps }
+            return Met { met: true, t: nearest_t, nearest: 1.0e9, nearest_t, steps }
         }
         return Met { met: false, t: min(t, r.to), nearest, nearest_t, steps }
     }
     if t <= max(r.from, span.x) {
-        return Met { met: true, t, nearest: 0.0, nearest_t: t, steps }
+        return Met { met: true, t, nearest, nearest_t, steps }
     }
     // Onto the surface: where a line through the distances either side is 0, then halved.
     var lo = before
@@ -132,5 +200,5 @@ pub fn met<W: Asked>(w: W, r: Ray) -> Met {
         }
     }
     // (The last place outside: a ray that leaves the surface from there starts outside it.)
-    Met { met: true, t: lo, nearest: 0.0, nearest_t: lo, steps }
+    Met { met: true, t: lo, nearest, nearest_t, steps }
 }
