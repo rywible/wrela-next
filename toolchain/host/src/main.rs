@@ -19,7 +19,15 @@
 //!   input: "equal", or the first tick whose state hash differs (G-sim). Unlike `--replay` it
 //!   doesn't compare the logs' WASM hashes.
 //! - `wrela-host <build-dir> --window [--present fifo|fifo-relaxed|mailbox|immediate]
-//!   [--frames N] [--size WxH]`: the frames shown in a window (`window`), until it's closed.
+//!   [--frames N] [--size WxH] [--input FILE] [--arrive FILE] [--record FILE] [--log FILE]`:
+//!   the frames shown in a window (`window`), until it's closed, on play's schedule (the ticker on
+//!   its own clock: `paced`), each frame taking a person's keys, pointer, wheel and gamepads
+//!   (`live`) and `--input`'s events at it; `--arrive`'s events come as a person's do, at times
+//!   on the clock, and it prints how late the frames took them; `--log` writes the tick log,
+//!   which `--replay` replays, and checks that each event the frames took reached the sim on the
+//!   first tick after its frame handed it over (the parry-tick test); `--record` writes the
+//!   records each tick took as a script, which `--no-gpu --ticks N --input` runs to the same
+//!   ticks (without a ticker, the frames' events at their frames).
 //!   `--hdr` with a headless run lets the screen go HDR when the program asks
 //!   (`std::gpu::screen`), as a test's `hdr=1` does; a window goes HDR where its display can.
 //! - `wrela-host --adapter`: the GPU as `wrela_gpu` opens it: its name, driver, features and
@@ -43,6 +51,7 @@ const USAGE: &str = "usage:
   wrela-host --no-gpu <build-dir> --ticks N [--input script.json] [--log out.ticks] [--workers N]
   wrela-host --replay <log> [--no-gpu] <build-dir> [--workers N]
   wrela-host --compare-ticks <a.ticks> <b.ticks>
+  wrela-host <build-dir> --window [--present fifo|fifo-relaxed|mailbox|immediate] [--frames N] [--fps F] [--size WxH] [--input script.json] [--arrive script.json] [--record out.json] [--log out.ticks] [--workers N]
   wrela-host --adapter
 
 With a GPU: runs the build's frame(i / fps, width, height) for i in 0..N (default 1 frame at 60
@@ -100,6 +109,10 @@ struct Args {
     rgba: Option<PathBuf>,
     targets: Option<PathBuf>,
     input: Option<PathBuf>,
+    /// `--record FILE`: in a window, what the frames took, written as a script.
+    record: Option<PathBuf>,
+    /// `--arrive FILE`: in a window, a script's events arriving as a person's do.
+    arrive: Option<PathBuf>,
     until: Option<String>,
     timestamps: bool,
     serial: bool,
@@ -131,6 +144,8 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
         rgba: None,
         targets: None,
         input: None,
+        record: None,
+        arrive: None,
         until: None,
         timestamps: false,
         serial: false,
@@ -178,6 +193,8 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
             "--rgba" => args.rgba = Some(value("--rgba")?.into()),
             "--targets" => args.targets = Some(value("--targets")?.into()),
             "--input" => args.input = Some(value("--input")?.into()),
+            "--record" => args.record = Some(value("--record")?.into()),
+            "--arrive" => args.arrive = Some(value("--arrive")?.into()),
             "--until" => args.until = Some(value("--until")?),
             "--log" => args.log = Some(value("--log")?.into()),
             "--replay" => args.replay = Some(value("--replay")?.into()),
@@ -249,7 +266,11 @@ impl From<wrela_host::Error> for Failure {
 }
 
 fn read_script(args: &Args) -> Result<Vec<wrela_host::Scripted>, wrela_host::Error> {
-    match &args.input {
+    read_script_at(args.input.as_ref())
+}
+
+fn read_script_at(path: Option<&PathBuf>) -> Result<Vec<wrela_host::Scripted>, wrela_host::Error> {
+    match path {
         Some(path) => {
             let text = std::fs::read_to_string(path).map_err(|e| wrela_host::Error::io(path, e))?;
             wrela_host::parse_script(&text)
@@ -481,9 +502,29 @@ fn windowed(args: &Args) -> Result<(), Failure> {
     })?;
     let options = Options { workers: args.workers, defer_init: true, ..Options::default() };
     let mut host = Host::load_with(&args.dir, &options)?;
+    let logging = args.log.is_some();
+    host.want_hashes(logging || args.record.is_some());
     host.init()?;
     let frames = (args.frames > 1).then_some(args.frames);
-    let run = window::WindowRun { frames, fps: args.fps, size: args.size, present };
+    let script = read_script(args)?;
+    let arrive = read_script_at(args.arrive.as_ref())?;
+    if arrive.iter().any(|s| !matches!(s.at, wrela_host::At::Frame(_))) {
+        let e = "--arrive's events arrive at frames' times: a tick's record can't arrive";
+        return Err(Failure::Host(wrela_host::Error::Program(e.into())));
+    }
+    let checked = logging && script.iter().all(|s| matches!(s.at, wrela_host::At::Frame(_)));
+    // `--record` writes the ticks' records from the log, if the program has a ticker.
+    let logging = logging || args.record.is_some();
+    let run = window::WindowRun {
+        frames,
+        fps: args.fps,
+        size: args.size,
+        present,
+        script,
+        arrive,
+        keep: args.record.is_some() || checked,
+        log: logging && host.ticker_hz().is_some(),
+    };
     let ran = window::run(&mut host, &run)?;
     if let (
         Some((median, p90, worst)),
@@ -503,6 +544,50 @@ fn windowed(args: &Args) -> Result<(), Failure> {
             ran.period, ran.misses
         );
         println!("pacer at the end: {}", ran.pacer);
+    }
+    if let Some(a) = ran.arrivals() {
+        println!(
+            "arrived as a person's: {} events, taken {:.2} ms after (median), {:.2} ms (worst); {} taken by a later frame than the first that sampled after them{}",
+            a.count,
+            a.median,
+            a.worst,
+            a.late,
+            if a.late > 0 { format!(" (by up to {:.2} ms)", a.late_by) } else { String::new() }
+        );
+    }
+    if let Some(path) = &args.record {
+        // With a ticker, the records each tick took, at their ticks: `--no-gpu --ticks N
+        // --input` runs the same ticks. Without, the frames' events at their frames.
+        let recorded = match &ran.log {
+            Some(log) => log.script(),
+            None => ran.taken.iter().map(|(s, _)| s.clone()).collect(),
+        };
+        let text = wrela_host::write_script(&recorded).map_err(wrela_host::Error::Program)?;
+        std::fs::write(path, text).map_err(|e| wrela_host::Error::io(path, e))?;
+        println!("{} events written to {}", recorded.len(), path.display());
+    }
+    if let (Some(path), Some(log)) = (&args.log, &ran.log) {
+        write_log(path, log)?;
+        if ran.dropped > 0 {
+            println!("ticks: {} dropped, behind the clock", ran.dropped);
+        }
+        if checked {
+            match window::check_ticks(log, &ran.took, &ran.taken) {
+                Ok(r) => println!(
+                    "ticks: {} events the frames took each reached the sim on the first tick after their frame handed them over, {:.2} ms after (median), {:.2} ms (worst); {} ticks",
+                    r.count,
+                    r.median,
+                    r.worst,
+                    log.ticks.len()
+                ),
+                Err(why) => {
+                    let e = format!("an event didn't reach the sim on its tick: {why}");
+                    return Err(Failure::Host(wrela_host::Error::Program(e)));
+                }
+            }
+        } else {
+            println!("ticks: not checked (the script has ticks' records)");
+        }
     }
     println!("{} frames shown; state hash {:016x}", ran.frames, host.hash());
     Ok(())

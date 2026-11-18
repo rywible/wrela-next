@@ -143,6 +143,25 @@ impl TickLog {
         TickLog { wasm_hash, hz, first, ticks: Vec::new() }
     }
 
+    /// Each tick's records as a script's events of that tick (`"tick": k`): a script that gives
+    /// the same ticks the same records. The program's own posts are left out (a run of it posts
+    /// its own).
+    pub fn script(&self) -> Vec<crate::input::Scripted> {
+        use crate::input::{At, Event, EventKind, Scripted};
+        let mut out = Vec::new();
+        for (k, tick) in self.ticks.iter().enumerate() {
+            for r in &tick.records {
+                match Event::from_bytes(r) {
+                    Some(event) if event.kind != EventKind::Posted => {
+                        out.push(Scripted { at: At::Tick(k as u32), event, payload: Vec::new() })
+                    }
+                    _ => {}
+                }
+            }
+        }
+        out
+    }
+
     /// Its bytes.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(HEADER_LEN + self.ticks.len() * 16);

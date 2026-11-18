@@ -475,6 +475,13 @@ impl Event {
         }
         out
     }
+
+    /// The event whose bytes these are ([`Event::bytes`]), or `None` if word 0 is no kind.
+    pub fn from_bytes(bytes: &[u8; EVENT_SIZE as usize]) -> Option<Event> {
+        let word = |i: usize| u32::from_le_bytes(bytes[4 * i..4 * i + 4].try_into().unwrap());
+        let kind = *EventKind::ALL.iter().find(|k| **k as u32 == word(0))?;
+        Some(Event { kind, modifiers: word(1), words: [word(2), word(3), word(4), word(5)] })
+    }
 }
 
 /// When a script's event arrives: before a frame, or as a tick's record.
@@ -747,6 +754,74 @@ pub fn parse_script(text: &str) -> Result<Vec<Scripted>, String> {
     Ok(out)
 }
 
+/// Writes `events` as a script ([the format](self#scripted-input)) that [`parse_script`] reads
+/// back as the same events, bit for bit: what a live window took, kept so a headless run can
+/// replay it. Keys, buttons and axes are written by number; values as the shortest decimal
+/// that reads back as the same `f32`. Only the kinds a person's devices make can be written
+/// (pointer, wheel, keys, text, a pad's buttons and axes), at frames or ticks; any other is an
+/// error. The events are written in the order given, which a script's rule holds them to: each
+/// kind's numbers don't decrease.
+pub fn write_script(events: &[Scripted]) -> Result<String, String> {
+    let mut out = String::from("[\n");
+    for (i, s) in events.iter().enumerate() {
+        let at = match s.at {
+            At::Frame(frame) => format!("\"frame\": {frame}"),
+            At::Tick(tick) => format!("\"tick\": {tick}"),
+        };
+        let e = &s.event;
+        let f = |w: u32| f64::from(f32::from_bits(w));
+        let mods = [(SHIFT, "shift"), (CONTROL, "ctrl"), (ALT, "alt"), (META, "meta")]
+            .iter()
+            .filter(|(bit, _)| e.modifiers & bit != 0)
+            .map(|(_, k)| format!(", \"{k}\": true"))
+            .collect::<String>();
+        let [a, b, c, d] = e.words;
+        let body = match e.kind {
+            EventKind::PointerMove => {
+                format!("\"type\": \"move\", \"x\": {}, \"y\": {}{mods}", f(a), f(b))
+            }
+            EventKind::PointerDown | EventKind::PointerUp => {
+                let ty = if e.kind == EventKind::PointerDown { "down" } else { "up" };
+                format!(
+                    "\"type\": \"{ty}\", \"x\": {}, \"y\": {}, \"button\": {c}{mods}",
+                    f(a),
+                    f(b)
+                )
+            }
+            EventKind::Wheel => format!(
+                "\"type\": \"wheel\", \"x\": {}, \"y\": {}, \"dx\": {}, \"dy\": {}{mods}",
+                f(a),
+                f(b),
+                f(c),
+                f(d)
+            ),
+            EventKind::KeyDown | EventKind::KeyUp if a != 0 => {
+                let ty = if e.kind == EventKind::KeyDown { "keydown" } else { "keyup" };
+                let repeat = if b != 0 { ", \"repeat\": true" } else { "" };
+                format!("\"type\": \"{ty}\", \"code\": {a}{repeat}{mods}")
+            }
+            EventKind::Text if e.modifiers == 0 => {
+                let c = char::from_u32(a).ok_or_else(|| format!("event {i}: not a character"))?;
+                let text = serde_json::to_string(&c.to_string()).expect("a string is JSON");
+                format!("\"type\": \"text\", \"text\": {text}")
+            }
+            EventKind::PadButton if e.modifiers == 0 => format!(
+                "\"type\": \"padbutton\", \"pad\": {a}, \"button\": {b}, \"value\": {}, \"pressed\": {}",
+                f(c),
+                d != 0
+            ),
+            EventKind::PadAxis if e.modifiers == 0 => {
+                format!("\"type\": \"padaxis\", \"pad\": {a}, \"axis\": {b}, \"value\": {}", f(c))
+            }
+            kind => return Err(format!("event {i}: a {} isn't written", kind.name())),
+        };
+        let comma = if i + 1 < events.len() { "," } else { "" };
+        out.push_str(&format!("  {{ {at}, {body} }}{comma}\n"));
+    }
+    out.push(']');
+    Ok(out)
+}
+
 /// A host's queue of events not yet read: [`Queue::take`] gives `wrela.input` its events, and
 /// [`Queue::payload`] gives `wrela.payload` the bytes of the messages the current call was
 /// given ([Messages](self#messages)).
@@ -851,6 +926,47 @@ impl Queue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a live window takes, written as a script and read back: the same events, bit for
+    /// bit, values that aren't short decimals and every modifier included.
+    #[test]
+    fn a_written_script_reads_back_as_the_same_events() {
+        let third = 1.0f32 / 3.0;
+        let tiny = f32::from_bits(1);
+        let at = |frame, event| Scripted { at: At::Frame(frame), event, payload: Vec::new() };
+        let events = vec![
+            at(0, Event::pointer(EventKind::PointerMove, third, 719.999, 0, 0)),
+            at(0, Event::pointer(EventKind::PointerDown, 1.5, 2.25, 2, SHIFT | META)),
+            at(1, Event::pointer(EventKind::PointerUp, 1.5, 2.25, 2, 0)),
+            at(1, Event::wheel(3.0, 4.0, -0.1, 120.0, CONTROL | ALT)),
+            at(2, Event::key(true, key_code("KeyW"), false, 0)),
+            at(2, Event::key(true, key_code("KeyW"), true, SHIFT)),
+            at(5, Event::key(false, key_code("KeyW"), false, 0)),
+            at(5, Event::text('"')),
+            at(5, Event::text('é')),
+            at(5, Event::text('\n')),
+            at(6, Event::pad_button(3, 7, third, true)),
+            at(6, Event::pad_button(0, 0, 0.0, false)),
+            at(7, Event::pad_axis(1, 3, -tiny)),
+            at(7, Event::pad_axis(1, 0, -1.0)),
+        ];
+        let text = write_script(&events).unwrap();
+        assert_eq!(parse_script(&text).unwrap(), events, "{text}");
+        assert!(write_script(&[at(0, Event::paste(1))]).is_err());
+        // A tick's records too, beside the frames' events.
+        let tick = |t, event| Scripted { at: At::Tick(t), event, payload: Vec::new() };
+        let mixed = vec![
+            tick(0, Event::text('a')),
+            at(0, Event::key(true, key_code("Space"), false, 0)),
+            tick(3, Event::pad_axis(0, 1, 0.5)),
+        ];
+        let text = write_script(&mixed).unwrap();
+        assert_eq!(parse_script(&text).unwrap(), mixed, "{text}");
+        for s in events.iter().chain(&mixed) {
+            assert_eq!(Event::from_bytes(&s.event.bytes()), Some(s.event));
+        }
+        assert_eq!(Event::from_bytes(&[0; EVENT_SIZE as usize]), None);
+    }
 
     /// Every kind of event a script can hold, read back as the program would read it.
     #[test]

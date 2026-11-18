@@ -760,12 +760,44 @@ impl<E: Executor> State<E> {
     }
 }
 
-/// The audio thread's instance of the program, and its `__audio(thread, task, context)`.
-type AudioThread = (Store<bool>, TypedFunc<(u32, u32, u32), ()>);
+/// The program's voice: the audio thread's instance of the program, its `__audio(thread, task,
+/// context)`, and what it renders into. It renders on whichever OS thread holds it.
+pub(crate) struct Voice {
+    store: Store<bool>,
+    render: TypedFunc<(u32, u32, u32), ()>,
+    memory: SharedMemory,
+    task: u32,
+    context: u32,
+    trace: Trace,
+}
+
+impl Voice {
+    /// Samples a quantum: [`AUDIO_QUANTUM`] in each of the two channels.
+    pub(crate) const SAMPLES: usize = AUDIO_QUANTUM as usize * wrela_abi::AUDIO_CHANNELS as usize;
+
+    /// The next quantum, its two channels interleaved (left, right, left, ...) into `out`
+    /// ([`Voice::SAMPLES`] of them), or the voice's trap.
+    pub(crate) fn quantum(&mut self, out: &mut [f32]) -> std::result::Result<(), wasmtime::Error> {
+        let n = AUDIO_QUANTUM as usize;
+        let (render, store) = (&self.render, &mut self.store);
+        let args = (memory::THREAD_AUDIO, self.task, self.context);
+        self.trace.end_phase_after(|| render.call(store, args))?;
+        // The quantum finished writing these samples before returning. Convert them straight
+        // from shared memory, before the next quantum can overwrite them.
+        let bytes = shared::slice(&self.memory, memory::AUDIO_OUT as usize, Voice::SAMPLES * 4)
+            .expect("checked when the voice was made");
+        let sample = |i: usize| f32::from_le_bytes(bytes[4 * i..4 * i + 4].try_into().unwrap());
+        for (i, pair) in out[..Voice::SAMPLES].chunks_exact_mut(2).enumerate() {
+            pair[0] = sample(i);
+            pair[1] = sample(n + i);
+        }
+        Ok(())
+    }
+}
 
 /// The ticker's thread's instance of the program, its `__tick(thread, task, context, tick)`,
 /// and the next tick's number.
-struct TickThread {
+pub(crate) struct TickThread {
     store: Store<bool>,
     tick: TypedFunc<(u32, u32, u32, u32), ()>,
     next: u32,
@@ -777,10 +809,20 @@ struct TickThread {
 }
 
 impl TickThread {
+    /// The next tick's number.
+    pub(crate) fn next(&self) -> u32 {
+        self.next
+    }
+
+    /// Sets `std::tick::origin()`: the frame time (s) at which tick 0 was due.
+    pub(crate) fn set_origin(&self, origin: f64) {
+        shared::write(&self.memory, memory::TICK_ORIGIN as usize, &origin.to_le_bytes());
+    }
+
     /// Runs the next tick with `records`, on whichever OS thread holds this (a tick can run
     /// beside the program's frames): its state's hash too, if the host asked for it
     /// ([`Program::want_hashes`]).
-    fn run(
+    pub(crate) fn run(
         &mut self,
         records: Vec<[u8; EVENT_SIZE as usize]>,
     ) -> std::result::Result<Ticked, (u32, wasmtime::Error)> {
@@ -839,12 +881,15 @@ pub struct Ticked {
 
 pub(crate) struct Program<E: 'static> {
     store: Store<State<E>>,
+    /// This program's number, the host's alone: a program another replaced has another.
+    serial: u64,
     /// The worker threads, which return when the program is dropped (or retired).
     _helpers: Helpers,
     memory: SharedMemory,
     module: Module,
-    /// The audio thread's instance, once [`Program::render_audio`] has made it.
-    audio: Option<AudioThread>,
+    /// The voice, once [`Program::render_audio`] or [`Program::take_voice`] has made it (and
+    /// not while a device plays it).
+    audio: Option<Voice>,
     /// The ticker's thread's instance, once [`Program::tick`] has made it.
     ticker: Option<TickThread>,
     /// The ticker's records not yet stamped into a tick, as bytes: a tick takes at most
@@ -1448,8 +1493,10 @@ impl<E: Executor> Program<E> {
             Ok(h) => h,
             Err(why) => fail_after_store!(Error::Program(why)),
         };
+        static SERIAL: AtomicU64 = AtomicU64::new(0);
         let program = Program {
             store,
+            serial: SERIAL.fetch_add(1, Ordering::Relaxed),
             instance,
             frame,
             lines: compiled.lines.clone(),
@@ -1790,55 +1837,49 @@ impl<E: Executor> Program<E> {
     /// each, at [`wrela_abi::AUDIO_SAMPLE_RATE`]) on an instance of its own, as the audio
     /// thread does, here and now: an offline run. The samples are the two channels
     /// interleaved: left, right, left, and so on. The voice goes on where the last call
-    /// stopped. Errors if the program hasn't started one.
+    /// stopped (or where a device that played it stopped). Errors if the program hasn't started
+    /// one.
     pub(crate) fn render_audio(&mut self, quanta: u32) -> Result<Vec<f32>> {
+        let mut voice = self.take_voice()?;
+        let mut out = vec![0.0; Voice::SAMPLES * quanta as usize];
+        self.last_failure = None;
+        let rendered = out.chunks_exact_mut(Voice::SAMPLES).try_for_each(|q| voice.quantum(q));
+        self.audio = Some(voice);
+        match rendered {
+            Ok(()) => Ok(out),
+            Err(trap) => Err(self.voice_trapped(&trap)),
+        }
+    }
+
+    /// The voice, made if it hasn't been. Errors if the program hasn't started one.
+    pub(crate) fn take_voice(&mut self) -> Result<Voice> {
+        if let Some(voice) = self.audio.take() {
+            return Ok(voice);
+        }
         let Some((task, context)) = self.store.data().voice else {
             return Err(Error::Program("it hasn't started a voice (`std::audio::play`)".into()));
         };
+        let need = memory::AUDIO_OUT as usize + Voice::SAMPLES * 4;
+        if self.memory.data().len() < need {
+            return Err(Error::Program("the samples are past the memory's end".into()));
+        }
         let wrap = |e: wasmtime::Error| Error::Program(format!("{e:#}"));
-        if self.audio.is_none() {
-            let (mut store, instance) =
-                other_instance(&self.module, &self.memory, "the audio thread", &self.trace(), None)
-                    .map_err(wrap)?;
-            let render = instance
-                .get_typed_func::<(u32, u32, u32), ()>(&mut store, EXPORT_AUDIO)
+        let (mut store, instance) =
+            other_instance(&self.module, &self.memory, "the audio thread", &self.trace(), None)
                 .map_err(wrap)?;
-            self.audio = Some((store, render));
+        let render = instance
+            .get_typed_func::<(u32, u32, u32), ()>(&mut store, EXPORT_AUDIO)
+            .map_err(wrap)?;
+        let memory = self.memory.clone();
+        Ok(Voice { store, render, memory, task, context, trace: self.trace() })
+    }
+
+    /// The voice trapped (here or on another thread): the program's failure, as a trap in it.
+    pub(crate) fn voice_trapped(&mut self, trap: &wasmtime::Error) -> Error {
+        match self.trapped(trap, memory::THREAD_AUDIO) {
+            Error::Trap(why) => Error::Trap(format!("the voice trapped: {why}")),
+            error => error,
         }
-        let trace = self.trace();
-        let n = AUDIO_QUANTUM as usize;
-        let channels = wrela_abi::AUDIO_CHANNELS as usize;
-        let mut out = Vec::with_capacity(channels * n * quanta as usize);
-        self.last_failure = None;
-        for _ in 0..quanta {
-            let result = {
-                let (store, render) = self.audio.as_mut().expect("made above");
-                trace.end_phase_after(|| {
-                    render.call(&mut *store, (memory::THREAD_AUDIO, task, context))
-                })
-            };
-            if let Err(trap) = result {
-                return Err(match self.trapped(&trap, memory::THREAD_AUDIO) {
-                    Error::Trap(why) => Error::Trap(format!("the voice trapped: {why}")),
-                    error => error,
-                });
-            }
-            // The quantum finished writing these samples before returning. Convert them
-            // straight from shared memory, before the next quantum can overwrite them.
-            let bytes = shared::slice(&self.memory, memory::AUDIO_OUT as usize, channels * n * 4)
-                .ok_or_else(|| {
-                Error::Program("the samples are past the memory's end".into())
-            })?;
-            let sample = |i: usize| {
-                let b = &bytes[4 * i..4 * i + 4];
-                f32::from_le_bytes([b[0], b[1], b[2], b[3]])
-            };
-            for i in 0..n {
-                out.push(sample(i));
-                out.push(sample(n + i));
-            }
-        }
-        Ok(out)
     }
 
     /// How many chunks of parallel jobs the helpers have run (`wrela_abi::memory::PAR_HELPED`).
@@ -1994,6 +2035,34 @@ impl<E: Executor> Program<E> {
             }
         }
         self.frame(frame_time(i, fps), width, height)
+    }
+
+    /// This program's number, the host's alone ([`Program::serial`]'s field).
+    pub(crate) fn serial(&self) -> u64 {
+        self.serial
+    }
+
+    /// The ticker's instance, to run ticks on another thread (play's schedule,
+    /// [`crate::paced`]), and its rate; give it back with [`Program::give_tick_thread`].
+    pub(crate) fn take_ticker(&mut self) -> Result<(TickThread, u32)> {
+        let hz = self.ticker_hz().unwrap_or(0);
+        Ok((self.take_tick_thread()?, hz))
+    }
+
+    /// The ticker's instance back from another thread.
+    pub(crate) fn give_tick_thread(&mut self, thread: TickThread) {
+        self.ticker = Some(thread);
+    }
+
+    /// The records queued for the ticker (what the program posted, input pushed as records),
+    /// taken: for a ticker that runs on another thread.
+    pub(crate) fn take_records(&mut self) -> Vec<[u8; EVENT_SIZE as usize]> {
+        self.records.drain(..).collect()
+    }
+
+    /// Tick `k` trapped on another thread: the program's failure, as a trap in that tick.
+    pub(crate) fn tick_failed(&mut self, k: u32, trap: &wasmtime::Error) -> Error {
+        self.tick_trapped(k, trap)
     }
 
     /// The ticker's thread's instance, made the first time, to run ticks on any OS thread

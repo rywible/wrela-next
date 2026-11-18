@@ -45,9 +45,13 @@ mod handover;
 #[cfg(feature = "gpu")]
 pub mod image;
 pub mod interfaces;
+#[cfg(feature = "gpu")]
+pub mod live;
 pub mod loopback;
 #[cfg(feature = "gpu")]
 pub mod pace;
+#[cfg(feature = "gpu")]
+pub mod paced;
 mod pipeline_report;
 mod program;
 mod shared;
@@ -75,7 +79,7 @@ pub use program::{
     BuildHelpers, Failure, HelperRun, HostHandler, PostHandler, QueuedPost, Stop, Ticked, Value,
     metered_engine, refuse_host_functions, stoppable_metered_engine,
 };
-pub use wrela_abi::input::{Event, Scripted, parse_script};
+pub use wrela_abi::input::{At, Event, Scripted, parse_script, write_script};
 pub use wrela_abi::ticks::{TickLog, frame_time, lockstep_ticks};
 
 /// `m`, locked: a thread that panicked while it held it leaves it as it was.
@@ -844,13 +848,7 @@ impl Host {
     ) -> Result<(RunResult, Option<TickLog>)> {
         program::valid_fps(fps)?;
         self.p().executor().set_screen(width, height)?;
-        let mut log = if log {
-            self.p().want_hashes(true);
-            let hash = self.build.wasm_hash;
-            Some(self.p().tick_log(hash)?)
-        } else {
-            None
-        };
+        let mut log = if log { Some(self.tick_log()?) } else { None };
         let capture = self.options.capture.clone();
         for i in 0..frames {
             self.p().executor().set_frame(i as usize);
@@ -915,6 +913,71 @@ impl Host {
         self.p().executor().set_frame(i as usize);
         self.p().lockstep_frame(i, fps, width, height, script, None)?;
         self.settle_handing()
+    }
+
+    /// A tick log for the ticks run from here, starting at the ticker's state now; hashes are
+    /// asked for. An error if the program started no ticker.
+    pub fn tick_log(&mut self) -> Result<TickLog> {
+        self.p().want_hashes(true);
+        let hash = self.build.wasm_hash;
+        self.p().tick_log(hash)
+    }
+
+    /// Queues events for the ticker: the next ticks take them as records, after what's queued.
+    pub fn push_records(&mut self, events: impl IntoIterator<Item = Event>) {
+        self.p().push_records(events);
+    }
+
+    /// The ticker's rate, if the program started one.
+    pub fn ticker_hz(&mut self) -> Option<u32> {
+        self.p().ticker_hz()
+    }
+
+    /// Starts the program's ticker on play's schedule ([`paced`]): its own thread, its next
+    /// tick due at `start` (frame time 0), the records queued so far its first's, and
+    /// `script`'s records of ticks at their ticks. `None` if the program started no ticker.
+    /// Stop it with [`Host::stop_ticker`].
+    pub fn start_ticker(
+        &mut self,
+        start: std::time::Instant,
+        script: Vec<Scripted>,
+    ) -> Result<Option<paced::Ticker>> {
+        if self.p().ticker_hz().is_none() {
+            return Ok(None);
+        }
+        let queued = self.p().take_records();
+        let (thread, hz) = self.p().take_ticker()?;
+        let program = self.p().serial();
+        Ok(Some(paced::Ticker::start(thread, hz, program, start, script, queued)))
+    }
+
+    /// What the program queued for its ticker since the last take (what it posted, and events
+    /// pushed as records), for a ticker on play's schedule ([`paced::Ticker::queue`]).
+    pub fn take_records(&mut self) -> Vec<[u8; wrela_abi::input::EVENT_SIZE as usize]> {
+        self.p().take_records()
+    }
+
+    /// Stops a ticker [`Host::start_ticker`] started, after the tick it's running: what it did
+    /// since the last look. Its instance goes back to the program, which ticks on from there
+    /// (if it's still the program that runs).
+    pub fn stop_ticker(&mut self, ticker: paced::Ticker) -> Vec<paced::Ran> {
+        let program = ticker.program;
+        let (thread, ran) = ticker.stop();
+        if self.p().serial() == program {
+            self.p().give_tick_thread(thread);
+        }
+        ran
+    }
+
+    /// Tick `tick` trapped on a ticker on play's schedule: the program's failure.
+    pub fn tick_failed(&mut self, tick: u32, trap: &wasmtime::Error) -> Error {
+        self.p().tick_failed(tick, trap)
+    }
+
+    /// The running program's number, the host's alone: it changes when another build takes
+    /// the program's place.
+    pub fn program_serial(&mut self) -> u64 {
+        self.p().serial()
     }
 
     /// [`CpuHost::ticks_beside_frames`], with the GPU: the frames draw.

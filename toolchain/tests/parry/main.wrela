@@ -1,0 +1,89 @@
+// A parry on a 60 Hz ticker, the shape the game's sim takes (game/rules), for the window's
+// parry-tick test (`wrela-host --window --log`, backend Phase 3): each tick takes its records
+// and counts a parry (Space down, or a pad's South pressed), keeping the tick each landed on;
+// the state hash is over them, so a parry on another tick is another hash. Each frame shows
+// the newest snapshot (the screen's red is the parries so far, mod 8) and reads its own events.
+
+use std::gpu::begin_screen_pass
+use std::handoff::{Latest, Publisher, handoff}
+use std::hash::{StateHash, state_hash}
+use std::input::{Event, Key, PadButton, events}
+use std::tick::{Ticked, start}
+
+struct Sim {
+    world: World,
+    out: Publisher<Snap>,
+}
+
+/// The ticker's world: what's hashed.
+struct World: Clone + StateHash {
+    parries: u32,
+    /// The tick each parry landed on, the newest 64.
+    landed: Vec<u32>,
+}
+
+struct Snap: Copy + Plain {
+    tick: u32,
+    parries: u32,
+}
+
+@deterministic
+fn step(sim: mut Sim, t: Ticked) {
+    for e in t.records {
+        let parry = match e {
+            Event::KeyDown { key, repeat, .. } => key == Key::Space && !repeat,
+            Event::PadButton { button, pressed, .. } => button == PadButton::South && pressed,
+            _ => false,
+        }
+        if parry {
+            sim.world.parries += 1
+            if sim.world.landed.len() == 64 {
+                sim.world.landed.remove(0)
+            }
+            sim.world.landed.push(t.tick)
+        }
+    }
+    sim.out.publish(Snap { tick: t.tick, parries: sim.world.parries })
+}
+
+@deterministic
+fn hash(sim: Sim) -> u64 {
+    state_hash(sim.world)
+}
+
+pub struct Game {
+    latest: Latest<Snap>,
+    newest: Snap,
+    events: u32,
+}
+
+pub fn init() -> Game {
+    let first = Snap { tick: 0, parries: 0 }
+    let (out, latest) = handoff(first)
+    start(
+        Sim { world: World { parries: 0, landed: Vec::new() }, out: out },
+        hz: 60,
+        step: step,
+        hash: hash,
+    )
+    Game { latest: latest, newest: first, events: 0 }
+}
+
+pub fn frame(game: mut Game, time: f32, width: u32, height: u32) {
+    game.newest = game.latest.read()
+    game.events += u32(events().len())
+    let red = f32(game.newest.parries % 8) / 7.0
+    let screen = begin_screen_pass(clear: vec4(red, 0.1, 0.2, 1.0))
+    screen.present()
+}
+
+/// The newest snapshot the frames read: its tick and the parries so far.
+pub fn newest(game: Game) -> vec2 {
+    vec2(f32(game.newest.tick), f32(game.newest.parries))
+}
+
+/// Frame 3's parry and frame 4's reach the ticks (on which tick, the window's `--log` checks).
+@test(frames: 6, input: "parry.json")
+fn a_parry_lands_on_its_frames_tick(game: Game) {
+    assert(game.newest.parries == 2, f"{game.newest.parries} parries")
+}
