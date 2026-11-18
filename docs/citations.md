@@ -111,6 +111,22 @@ Each is used as facts or as a method; no code was copied.
 | P. Beckmann and A. Spizzichino, *The Scattering of Electromagnetic Waves from Rough Surfaces* (1963), the facets' distribution; C. Schlick, "An Inexpensive BRDF Model for Physically-based Rendering" (*Computer Graphics Forum* 13(3), 1994), the Fresnel approximation; as the old opening's glitter used them (`rywible/wrela` 7ae6711e, `scenes/opening/paint.wrela:724-757`) | Published methods; our own earlier code | `lib/frame/light.wrela`'s `sun_glint`: the sun's glitter on water where it reaches |
 | The cloud shadow map of `rywible/wrela` at 7ae6711e (`engine/sky.wrela:1003-1049`: the field marched toward the sun from each texel of a map over the ground, held) | Our own earlier code | `lib/frame/sun.wrela` and `lib/frame/sky.wrela`: a cloud layer's shadow on the world, the sun's reach every lister reads |
 
+### The volume spike (`spikes/volume`, branch `spike/volume`; not in the engine)
+
+Known methods the spike follows. None was copied from; each was worked from the idea, and where
+the spike differs it says so.
+
+| Work | Rights | How and why we use it |
+|---|---|---|
+| J. C. Hart, "Sphere Tracing: A Geometric Method for the Antialiased Ray Tracing of Implicit Surfaces" (*The Visual Computer* 12, 1996) | Published method | `volume.wrela` `walk` and `reaches`: a ray stepped by the distance read where it stands. The spike reads the distance from stored cells instead of the form, and guesses longer steps (to the surface's tangent plane) that it takes back when they go through another face |
+| C. Crassin, F. Neyret, S. Lefebvre and E. Eisemann, "GigaVoxels: Ray-Guided Streaming for Efficient and Detailed Voxel Rendering" (I3D 2009) | Published method | The volume's layout: a coarse grid whose cells point at bricks of fine cells in an atlas, each brick holding its far faces' texels so a filtered read never crosses into a neighbour. The spike's bricks hold a distance and a facing, not a density, and nothing is streamed |
+| C. Crassin, F. Neyret, M. Sainz, S. Green and E. Eisemann, "Interactive Indirect Illumination Using Voxel Cone Tracing" (*Computer Graphics Forum* 30(7), 2011) | Published method | The spike's premise that one march through stored matter can carry the eye's rays and the light's alike. The spike's light rays are thin and stop at the stored surface, where that paper's cones gather filtered density on the way (the source of its leaks through thin walls) |
+| D. Wright, "Dynamic Occlusion with Signed Distance Fields" (SIGGRAPH 2015 course, Advances in Real-Time Rendering) | Published talk | Shadows and sky occlusion by rays through stored distances, as the spike's `lit_cells` asks whether the sun and the sky reach a cell |
+| Z. Majercik, J.-P. Guertin, D. Nowrouzezahrai and M. McGuire, "Dynamic Diffuse Global Illumination with Ray-Traced Irradiance Fields" (*JCGT* 8(2), 2019) | Published method | Light stored in the world and kept current by a few rays a place a frame, added into a running mean, with bounce read back from what is stored; and a read that gives no weight to stores that cannot see the point (there by a stored depth, here by marking cells whose place on the surface is buried). The spike stores light on the surface's own cells, not on probes in the open |
+| J. T. Kajiya, "The Rendering Equation" (SIGGRAPH 1986) | Published method | `lit_truly`, the light's reference: each sky ray that meets the form followed on, taking the sun's light where it stops, against the form itself |
+| M. Pharr, W. Jakob and G. Humphreys, *Physically Based Rendering* (4th ed., 2023), cosine-weighted hemisphere sampling (Malley's method) | Published book, free to read online | The sky's rays in `lit_cells` and `lit_truly`: more of them where they count for more, so each counts alike |
+| Z. H. Cigolle and others, "A Survey of Efficient Representations for Independent Unit Vectors" (*JCGT* 3(2), 2014), the octahedral fold (cited above for the frame) | Published method | `folded` and `unfolded`: a cell's facing in one word while the deposit holds it in a buffer |
+
 ## Bodies and motion
 
 The fighters' bodies and moves, carried from `rywible/wrela` at `7ae6711e`. No file of any of them

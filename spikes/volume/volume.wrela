@@ -164,9 +164,13 @@ pub struct Grid: Copy + GpuData {
 const BAND: u32 = 2097152
 const BANDS_A_FRAME: u32 = 4
 
-/// The same for the deposit, which also asks the look at each texel (its bound is ten times the
-/// coarse grid's).
-const DEPOSIT_BAND: u32 = 262144
+/// The same for the coarse grid, which asks the form at each brick's middle (four times over,
+/// where its gradient vanishes there: `sloped`).
+const COARSE_BAND: u32 = 524288
+
+/// The same for the deposit, which asks the form up to nine times a texel (its place on the
+/// surface, and whether that is buried) and the look once.
+const DEPOSIT_BAND: u32 = 65536
 const DEPOSITS_A_FRAME: u32 = 16
 
 /// A form's volume, and where its filling stands.
@@ -224,7 +228,7 @@ pub struct Volume<S> {
     /// Light stored on the cells (see "light on the cells"): the light falling on each atlas
     /// texel's surface point; what its surface gives back toward anything (its albedo's share
     /// of that, over π), as an eye's pixel reads it; what the lighting kernels write before a
-    /// copy puts it in the textures (three words a texel); the texels near enough the surface
+    /// copy puts it in the textures (four words a texel); the texels near enough the surface
     /// to hold light, listed; and where the lighting stands.
     irr: Texture3d<Rgba16Float>,
     glowing: Texture3d<Rgba8>,
@@ -237,6 +241,8 @@ pub struct Volume<S> {
     light_cursor: u32,
     /// How many whole sweeps of the shell are in the stored light.
     pub sweeps: u32,
+    /// The sun the cells last asked about (toward it).
+    lit_sun: vec3,
 }
 
 /// `form`'s volume, its fine cells `cell` m a side, over a cube round its bound.
@@ -305,6 +311,7 @@ pub fn volume<S: Solid>(form: S, cell: f32) -> Volume<S> {
         light_stage: 0,
         light_cursor: 0,
         sweeps: 0,
+        lit_sun: vec3(0.0),
     }
 }
 
@@ -408,7 +415,7 @@ fn coarsed<S: Solid>(form: S, g: Grid, first: u32, out: mut Atomics<u32>, bricks
     let z = i / (g.size.x * g.size.y)
     let brick = g.cell * f32(B)
     let mid = g.lo + (vec3(f32(x), f32(y), f32(z)) + vec3(0.5)) * brick
-    let (f, grad) = form.sample(mid)
+    let (f, grad) = sloped(form, mid, 0.25 * g.cell)
     let d = f / max(length(grad), 1.0e-6)
     var slot = NO_BRICK
     if abs(d) < brick * NEAR_BRICK {
@@ -459,6 +466,26 @@ fn coarse_copied(raw: [u32], g: Grid, out: mut Texels3d<Rg32Uint>, id: GlobalId)
     out.store(id, vec2u(raw[2 * i], raw[2 * i + 1]))
 }
 
+/// The mark, in a texel's albedo word, of one whose place on the surface is buried (`deposited`).
+const BURIED: u32 = 16777216
+
+/// The form's value and gradient at `p`. Where its gradient vanishes (on a flat face, or midway
+/// through a slab, where its nearest face is either: the lattice's places fall on both whenever
+/// a form is laid on whole metres), its slope to one side over `h` m is a gradient there, and
+/// where that vanishes too, one of unit length straight up: a value over a vanished gradient
+/// would be a distance of millions, and a brick or a cell holding the surface dropped.
+fn sloped<S: Solid>(form: S, p: vec3, h: f32) -> (f32, vec3) {
+    let (f, grad) = form.sample(p)
+    if length(grad) >= 1.0e-3 {
+        return (f, grad)
+    }
+    let side = vec3(form.distance(p + vec3(h, 0.0, 0.0)) - f, form.distance(p + vec3(0.0, h, 0.0)) - f, form.distance(p + vec3(0.0, 0.0, h)) - f) / h
+    if length(side) >= 1.0e-3 {
+        return (f, side)
+    }
+    (f, vec3(0.0, 1.0, 0.0))
+}
+
 /// Atlas texels `first` on, brick by brick: the form's distance and facing at each one's place.
 @compute(64)
 fn deposited<S: Solid, L: Look>(form: S, look: L, g: Grid, bricks: [u32], first: u32, out: mut Atomics<u32>, id: GlobalId) {
@@ -472,17 +499,45 @@ fn deposited<S: Solid, L: Look>(form: S, look: L, g: Grid, bricks: [u32], first:
     let at = vec3(f32(c & 1023), f32((c >> 10) & 1023), f32(c >> 20))
     let local = vec3(f32(k % BS), f32((k / BS) % BS), f32(k / (BS * BS)))
     let p = g.lo + (at * f32(B) + local) * g.cell
-    let (f, grad) = form.sample(p)
-    let len = max(length(grad), 1.0e-6)
+    let (f, grad) = sloped(form, p, 0.25 * g.cell)
+    let len = length(grad)
     let n = grad / len
     // (What the surface wears where this texel's place falls on it, not at the place itself: a
     // look that changes sharply across a corner must not colour the other face's cells.)
-    let on = p - n * (f / len)
+    var on = p - n * (f / len)
+    var k: u32 = 0
+    var off = true
+    while k < 2 && off {
+        k += 1
+        let (f2, g2) = sloped(form, on, 0.25 * g.cell)
+        if abs(f2) > 0.05 * g.cell * length(g2) {
+            on = on - g2 * (f2 / dot(g2, g2))
+        } else {
+            off = false
+        }
+    }
     let skin = look.skin(Place { world: on, rest: on, chart: None, normal: n })
     let a = sqrt(saturate(skin.albedo)) * 255.0 + vec3(0.5)
-    let _ = out.exchange(i: 3 * i, value: bitcast_u32(f / len))
+    // Whether the texel's place on the surface is buried: no open space a quarter of a cell off
+    // it along its facing. Where two forms are joined, the distance inside is to the nearer face
+    // of either, and the face of one that lies inside the other (a wall's foot on the ground) is
+    // a sheet of zero inside the solid: a surface that isn't there, which a ray could stop on.
+    // A texel whose place is on such a sheet is stored as inside (half a cell at the least) with
+    // no facing, and holds no light (`BURIED`).
+    var d = f / len
+    var mark: u32 = 0
+    if d < 0.01 * g.cell {
+        let eps = 0.25 * g.cell
+        let (_, go) = sloped(form, on, eps)
+        let (fp, gp) = sloped(form, on + go * (eps / length(go)), eps)
+        if fp < -0.5 * eps * length(gp) {
+            d = min(d, -0.5 * g.cell)
+            mark = BURIED
+        }
+    }
+    let _ = out.exchange(i: 3 * i, value: bitcast_u32(d))
     let _ = out.exchange(i: 3 * i + 1, value: folded(n))
-    let _ = out.exchange(i: 3 * i + 2, value: u32(a.x) | (u32(a.y) << 8) | (u32(a.z) << 16))
+    let _ = out.exchange(i: 3 * i + 2, value: u32(a.x) | (u32(a.y) << 8) | (u32(a.z) << 16) | mark)
 }
 
 /// The atlas put in its texture: each texel's brick and place in it, read from what `deposited`
@@ -496,9 +551,12 @@ fn atlas_copied(raw: [u32], g: Grid, out: mut Texels3d<Rgba16Float>, albedo: mut
         return
     }
     let i = slot * BS * BS * BS + id.x % BS + BS * (id.y % BS + BS * (id.z % BS))
-    out.store(id, vec4(bitcast_f32(raw[3 * i]), unfolded(raw[3 * i + 1])))
+    // (A buried texel has no facing, so it leans no read of the facing round it; and its
+    // albedo's alpha is 0, an open one's 1: light read there is shared among the open.)
     let a = raw[3 * i + 2]
-    albedo.store(id, vec4(f32(a & 255), f32((a >> 8) & 255), f32((a >> 16) & 255), 255.0) / 255.0)
+    let open = (a & BURIED) == 0
+    out.store(id, vec4(bitcast_f32(raw[3 * i]), if open { unfolded(raw[3 * i + 1]) } else { vec3(0.0) }))
+    albedo.store(id, vec4(f32(a & 255), f32((a >> 8) & 255), f32((a >> 16) & 255), if open { 255.0 } else { 0.0 }) / 255.0)
 }
 
 impl<S: Solid> Volume<S> {
@@ -512,9 +570,9 @@ impl<S: Solid> Volume<S> {
                 if self.cursor < self.total {
                     dispatch(
                         coarsed.bind(self.form, g: self.grid, first: self.cursor, out: mut self.raw, bricks: mut self.bricks),
-                        over: BAND,
+                        over: COARSE_BAND,
                     )
-                    self.cursor += BAND
+                    self.cursor += COARSE_BAND
                 }
             }
             if self.cursor >= self.total && self.ring == 0 {
@@ -861,6 +919,8 @@ fn walk(
     var least_v = vec4(0.0)
     var steps: u32 = 0
     var empty: u32 = 0
+    // (How far the last step went, where it went farther than the distance read: a guess.)
+    var guessed = 0.0
     while steps < MOST_STEPS && steps < g.most && !met && t < to {
         {
             steps += 1
@@ -887,6 +947,7 @@ fn walk(
                     least_v = vec4(0.0)
                 }
                 t += max(max(exit, far), rings) + nudge
+                guessed = 0.0
             } else {
                 let a = vec3(f32(k.x % ROW), f32((k.x / ROW) % ROW), f32(k.x / (ROW * ROW))) * f32(BS)
                 let local = clamp((q - c) * f32(B), vec3(0.0), vec3(f32(B)))
@@ -896,7 +957,14 @@ fn walk(
                     least_t = t
                     least_v = v
                 }
-                if v.x < touch * t {
+                if v.x + floor_step * t < 0.0 && guessed > floor_step * t {
+                    // A guessed step (to a tangent plane, or its least) that went well into the
+                    // form: the plane it aimed at was behind another face (a wall's, where it
+                    // stands on the ground). Half of it is taken back, and half again, until
+                    // the ray is out of the form or within its least step of where it went in.
+                    guessed = 0.5 * guessed
+                    t -= guessed
+                } else if v.x < touch * t {
                     met = true
                 } else {
                     if v.x < close * t {
@@ -919,7 +987,9 @@ fn walk(
                     // far under a pixel, and finer than the cells hold.)
                     let along = dot(v.yzw, d)
                     let by_cell = if along > LEVEL_OFF { whole } else if along > -LEVEL_OFF { half_cell } else { 0.0 }
-                    t += max(step, max(floor_step * t, by_cell))
+                    let took = max(step, max(floor_step * t, by_cell))
+                    guessed = if took > v.x { took } else { 0.0 }
+                    t += took
                 }
             }
         }
@@ -2692,6 +2762,10 @@ const LIGHT_STEPS: u32 = 96
 const MOST_RAYS: u32 = 8
 const LIGHT_BAND: u32 = 65536
 
+/// How many sweeps' worth the stored light still counts for once the sun has moved, where the
+/// form's own light is in it.
+const FORGET: u32 = 4
+
 /// Where atlas texel `i` (as the deposit numbers them: a brick's 729 in turn) is in the atlas.
 fn texel_of(i: u32) -> vec3u {
     let slot = i / (BS * BS * BS)
@@ -2712,7 +2786,8 @@ fn place_of(g: Grid, bricks: [u32], i: u32) -> vec3 {
     g.lo + (at * f32(B) + local) * g.cell
 }
 
-/// Atlas texels `first` on that hold light (within `SHELL` cells of the surface), listed.
+/// Atlas texels `first` on that hold light (within `SHELL` cells of the surface, their place on
+/// it in the open), listed.
 @compute(64)
 fn shelled(g: Grid, atlas: Texture3d<Rgba16Float>, first: u32, out: mut Append<u32>, id: GlobalId) {
     let i = first + id.x
@@ -2720,7 +2795,8 @@ fn shelled(g: Grid, atlas: Texture3d<Rgba16Float>, first: u32, out: mut Append<u
         return
     }
     let x = texel_of(i)
-    if abs(atlas.load(x.x, x.y, x.z).x) < SHELL * g.cell {
+    let v = atlas.load(x.x, x.y, x.z)
+    if abs(v.x) < SHELL * g.cell && dot(v.yzw, v.yzw) > 0.0 {
         let _ = out.push(i)
     }
 }
@@ -2768,7 +2844,8 @@ fn reaches(g: Grid, coarse: Texture3d<Rg32Uint>, atlas: Texture3d<Rgba16Float>, 
 }
 
 /// What the form gives back at `p` (on its surface): the light stored there by its albedo (its
-/// radiance times π), or nothing where no brick holds it.
+/// radiance times π), or nothing where no brick holds it; shared among the texels round it
+/// that are in the open (the albedo's alpha).
 fn given_at(
     g: Grid,
     coarse: Texture3d<Rg32Uint>,
@@ -2788,8 +2865,11 @@ fn given_at(
     let a = vec3(f32(k.x % ROW), f32((k.x / ROW) % ROW), f32(k.x / (ROW * ROW))) * f32(BS)
     let local = clamp((q - c) * f32(B), vec3(0.0), vec3(f32(B)))
     let uvw = (a + local + vec3(0.5)) / g.atlas
-    let r = albedo.sample_level(s, uvw, 0.0).xyz
-    irr.sample_level(s, uvw, 0.0).xyz * r * r
+    let r = albedo.sample_level(s, uvw, 0.0)
+    if r.w < 0.02 {
+        return vec3(0.0)
+    }
+    irr.sample_level(s, uvw, 0.0).xyz * r.xyz * r.xyz / r.w
 }
 
 /// Two numbers in [0, 1) from three whole ones.
@@ -2799,10 +2879,12 @@ fn hashed2(a: u32, b: u32, c: u32) -> vec2 {
     vec2(f32(h >> 8), f32(k >> 8)) / 16777216.0
 }
 
-/// The light falling on the listed texels `first` on, this sweep: the sun's (`sun_e`: what it
-/// lays on a face square to it) where a ray toward `sun` gets through; the sky's (`sky_e`: what
-/// an open sky lays on a face) over `rays` rays; and, with `bounce`, what the form gives back
-/// where a sky ray stops. Added into the running mean of the sweeps so far (`sweep` of them).
+/// The light on the listed texels `first` on, this sweep, four words a texel. With `part`'s
+/// first bit, whether the sun reaches it (a ray toward `sun` gets through): its fourth word, 1
+/// or 0, replaced. With its second bit, the light that isn't straight from the sun: the sky's
+/// (`sky_e`: what an open sky lays on a face) over `rays` rays, and, with `bounce`, what the
+/// form gives back where a sky ray stops; added into the running mean of the sweeps so far
+/// (`sweep` of them), its first three words.
 @compute(64)
 fn lit_cells(
     g: Grid,
@@ -2819,6 +2901,7 @@ fn lit_cells(
     bounce: u32,
     rays: u32,
     sweep: u32,
+    part: u32,
     first: u32,
     count: u32,
     out: mut Atomics<u32>,
@@ -2834,11 +2917,14 @@ fn lit_cells(
     let o = place_of(g, bricks, i) - n * v.x + n * (LIFT * g.cell)
     let side = g.cell * f32(B) * f32(g.size.x)
     let far = 2.0 * side
-    var e = vec3(0.0)
-    let toward = dot(n, sun)
-    if toward > 0.0 && reaches(g, coarse, atlas, s, o, sun, far).x < 0.5 {
-        e += sun_e * toward
+    if (part & 1) != 0 {
+        let seen = dot(n, sun) > 0.0 && reaches(g, coarse, atlas, s, o, sun, far).x < 0.5
+        let _ = out.exchange(i: 4 * i + 3, value: bitcast_u32(if seen { 1.0 } else { 0.0 }))
     }
+    if (part & 2) == 0 {
+        return
+    }
+    var e = vec3(0.0)
     // The sky's rays: over the hemisphere round the facing, more of them where they count for
     // more (by the cosine), so each counts alike.
     let up = if abs(n.y) < 0.99 { vec3(0.0, 1.0, 0.0) } else { vec3(1.0, 0.0, 0.0) }
@@ -2859,18 +2945,31 @@ fn lit_cells(
         }
     }
     if sweep > 0 {
-        let was = vec3(bitcast_f32(out.load(3 * i)), bitcast_f32(out.load(3 * i + 1)), bitcast_f32(out.load(3 * i + 2)))
+        let was = vec3(bitcast_f32(out.load(4 * i)), bitcast_f32(out.load(4 * i + 1)), bitcast_f32(out.load(4 * i + 2)))
         e = was + (e - was) / f32(sweep + 1)
     }
-    let _ = out.exchange(i: 3 * i, value: bitcast_u32(e.x))
-    let _ = out.exchange(i: 3 * i + 1, value: bitcast_u32(e.y))
-    let _ = out.exchange(i: 3 * i + 2, value: bitcast_u32(e.z))
+    let _ = out.exchange(i: 4 * i, value: bitcast_u32(e.x))
+    let _ = out.exchange(i: 4 * i + 1, value: bitcast_u32(e.y))
+    let _ = out.exchange(i: 4 * i + 2, value: bitcast_u32(e.z))
 }
 
-/// The stored light put in its textures: the light on each texel, and what its surface gives
-/// back toward an eye (its albedo's share over π, its square root in 8 bits as the albedo is).
+/// The stored light put in its textures. `out`: all the light on each texel (the sun's by the
+/// texel's own facing, where it reaches it), which a bounce reads, and whether the sun reaches
+/// it. `glowing`: what its surface gives back toward an eye of the light that isn't straight
+/// from the sun (its albedo's share over π, its square root in 8 bits as the albedo is), and
+/// whether the sun reaches it: an eye adds the sun's by its own pixel's facing.
 @compute(4, 4, 4)
-fn light_copied(raw: [u32], g: Grid, albedo: Texture3d<Rgba8>, out: mut Texels3d<Rgba16Float>, glowing: mut Texels3d<Rgba8>, id: GlobalId) {
+fn light_copied(
+    raw: [u32],
+    g: Grid,
+    atlas: Texture3d<Rgba16Float>,
+    albedo: Texture3d<Rgba8>,
+    sun: vec3,
+    sun_e: vec3,
+    out: mut Texels3d<Rgba16Float>,
+    glowing: mut Texels3d<Rgba8>,
+    id: GlobalId,
+) {
     let slot = id.x / BS + ROW * (id.y / BS + ROW * (id.z / BS))
     if slot >= g.size.w {
         out.store(id, vec4(0.0))
@@ -2878,10 +2977,13 @@ fn light_copied(raw: [u32], g: Grid, albedo: Texture3d<Rgba8>, out: mut Texels3d
         return
     }
     let i = slot * BS * BS * BS + id.x % BS + BS * (id.y % BS + BS * (id.z % BS))
-    let e = vec3(bitcast_f32(raw[3 * i]), bitcast_f32(raw[3 * i + 1]), bitcast_f32(raw[3 * i + 2]))
-    out.store(id, vec4(e, 1.0))
+    let e = vec3(bitcast_f32(raw[4 * i]), bitcast_f32(raw[4 * i + 1]), bitcast_f32(raw[4 * i + 2]))
+    let seen = bitcast_f32(raw[4 * i + 3])
     let r = albedo.load(id.x, id.y, id.z).xyz
-    glowing.store(id, vec4(sqrt(saturate(r * r * e / 3.14159265)), 1.0))
+    let v = atlas.load(id.x, id.y, id.z)
+    let toward = if dot(v.yzw, v.yzw) > 0.0 { max(dot(normalize(v.yzw), sun), 0.0) } else { 0.0 }
+    out.store(id, vec4(e + sun_e * (toward * seen), seen))
+    glowing.store(id, vec4(sqrt(saturate(r * r * e / 3.14159265)), seen))
 }
 
 /// The leak test's sums over the listed texels `first` on, for a wall across z = 0 whose faces
@@ -2889,7 +2991,20 @@ fn light_copied(raw: [u32], g: Grid, albedo: Texture3d<Rgba8>, out: mut Texels3d
 /// its dark face, and on the ground (its top `ground` m up) in its shadow, and how many texels
 /// each is of.
 @compute(64)
-fn leak_summed(g: Grid, bricks: [u32], shell: [u32], atlas: Texture3d<Rgba16Float>, raw: [u32], half: f32, ground: f32, count: u32, out: mut Atomics<u32>, id: GlobalId) {
+fn leak_summed(
+    g: Grid,
+    bricks: [u32],
+    shell: [u32],
+    atlas: Texture3d<Rgba16Float>,
+    raw: [u32],
+    sun: vec3,
+    sun_e: vec3,
+    half: f32,
+    ground: f32,
+    count: u32,
+    out: mut Atomics<u32>,
+    id: GlobalId,
+) {
     if id.x >= count {
         return
     }
@@ -2901,7 +3016,8 @@ fn leak_summed(g: Grid, bricks: [u32], shell: [u32], atlas: Texture3d<Rgba16Floa
     }
     let n = normalize(v.yzw)
     let q = place_of(g, bricks, i) - n * v.x
-    let e = (bitcast_f32(raw[3 * i]) + bitcast_f32(raw[3 * i + 1]) + bitcast_f32(raw[3 * i + 2])) / 3.0
+    let direct = sun_e * (max(dot(n, sun), 0.0) * bitcast_f32(raw[4 * i + 3]))
+    let e = (bitcast_f32(raw[4 * i]) + bitcast_f32(raw[4 * i + 1]) + bitcast_f32(raw[4 * i + 2]) + direct.x + direct.y + direct.z) / 3.0
     let k = u32(max(e, 0.0) * 1000.0)
     if abs(q.x) < 2.5 && q.y > 0.3 && q.y < 2.7 {
         if n.z > 0.7 && abs(q.z - half) < 0.03 {
@@ -2919,15 +3035,101 @@ fn leak_summed(g: Grid, bricks: [u32], shell: [u32], atlas: Texture3d<Rgba16Floa
     }
 }
 
+/// A pixel of the form, marched through its volume and lit from its cells: what its surface gives
+/// back of the stored light, and of the sun's, by the pixel's own facing, where the sun reaches
+/// it. Whether it does is read from the cells round it; where they disagree (a shadow's edge
+/// crosses them) and `sharp` is set, a ray of the pixel's own through the same volume says.
+@fragment
+pub fn marched_lit(
+    pixel: FragCoord,
+    eye: Eye,
+    g: Grid,
+    coarse: Texture3d<Rg32Uint>,
+    atlas: Texture3d<Rgba16Float>,
+    albedo: Texture3d<Rgba8>,
+    glowing: Texture3d<Rgba8>,
+    s: Sampler,
+    sun: vec3,
+    sun_e: vec3,
+    sharp: u32,
+    body: u32,
+) -> WithDepth<Targets3<vec4, vec4, u32>> {
+    let d = eye.ray(pixel.position.xy)
+    let span = crossing(eye, g, d)
+    if !(span.x < span.y) {
+        return nothing()
+    }
+    let met = walk(g, coarse, atlas, s, eye.at, d, from: span.x, to: span.y, px: eye.pixel(), near: 0.0)
+    if !met.met {
+        return nothing()
+    }
+    let brick = g.cell * f32(B)
+    let top = vec3(f32(g.size.x - 1), f32(g.size.y - 1), f32(g.size.z - 1))
+    var t = met.t
+    var v = met.v
+    for k in 0..2 {
+        if k < met.again {
+            t += v.x / max(-dot(v.yzw, d), 0.25)
+            let w = field_at(g, coarse, atlas, s, brick, top, eye.at + d * t)
+            if w.y != 0.0 || w.z != 0.0 || w.w != 0.0 {
+                v = w
+            }
+        }
+    }
+    let p = eye.at + d * t
+    let n = normalize(v.yzw)
+    let q = (p - g.lo) / brick
+    let c = clamp(floor(q), vec3(0.0), top)
+    let k = coarse.load(u32(c.x), u32(c.y), u32(c.z))
+    var colour = vec3(0.0)
+    if k.x < FAR_FROM {
+        let a = vec3(f32(k.x % ROW), f32((k.x / ROW) % ROW), f32(k.x / (ROW * ROW))) * f32(BS)
+        let local = clamp((q - c) * f32(B), vec3(0.0), vec3(f32(B)))
+        let uvw = (a + local + vec3(0.5)) / g.atlas
+        // (Shared among the texels round it that are in the open: a buried one holds nothing.)
+        let wear = albedo.sample_level(s, uvw, 0.0)
+        let open = max(wear.w, 0.02)
+        let glow = glowing.sample_level(s, uvw, 0.0) / open
+        colour = glow.xyz * glow.xyz
+        let toward = dot(n, sun)
+        if toward > 0.0 {
+            var seen = glow.w
+            if sharp != 0 && seen > 0.02 && seen < 0.98 {
+                let side = brick * f32(g.size.x)
+                seen = if reaches(g, coarse, atlas, s, p + n * (LIFT * g.cell), sun, 2.0 * side).x < 0.5 { 1.0 } else { 0.0 }
+                if sharp == 2 {
+                    colour = vec3(100.0, 0.0, 0.0)
+                }
+            }
+            colour += wear.xyz * wear.xyz * sun_e * (toward * seen / 3.14159265)
+        }
+        if sharp == 3 {
+            // (Why a pixel is dark: green, every texel round it buried; blue, facing off the sun
+            // and no stored light; else its facing.)
+            colour = if wear.w < 0.02 { vec3(0.0, 1.0, 0.0) } else if toward <= 0.0 && glow.x + glow.y + glow.z < 0.01 { vec3(0.0, 0.0, 1.0) } else { vec3(0.3) + 0.3 * n }
+        }
+    } else if sharp == 3 {
+        // (Red: where the walk stopped, no brick is kept.)
+        colour = vec3(1.0, 0.0, 0.0)
+    }
+    WithDepth {
+        color: Targets3 { first: vec4(colour, 0.0), second: edge_record(NO_EDGE, 1.0, NO_LINE), third: identity(SOLID, body: body, group: 0) },
+        depth: eye.depth(p),
+    }
+}
+
 impl<S: Solid> Volume<S> {
-    /// Some of the lighting, `bands` dispatches of it a frame: the shell listed once; then
-    /// sweeps of it, each copied into the light's textures when its last band is done.
-    pub fn relit(mut self, sun: vec3, sun_e: vec3, sky_e: vec3, bounce: bool, rays: u32, bands: u32) {
+    /// A frame's lighting. The shell is listed once. Then, whenever the sun has moved, every
+    /// cell asks again whether it reaches it, within the frame; and the rest of the light (the
+    /// sky's, the form's own) is swept `bands` dispatches a frame until `settled` sweeps are in
+    /// it, after which a frame in which nothing changed costs nothing. The light's textures
+    /// are written again whenever either changed them.
+    pub fn relit(mut self, sun: vec3, sun_e: vec3, sky_e: vec3, bounce: bool, rays: u32, bands: u32, settled: u32) {
         let texels = self.grid.size.w * BS * BS * BS
         if self.light_stage == 0 {
             label("shelled")
             self.shell = append_buffer(texels)
-            self.light_raw = buffer(max(3 * texels, 3))
+            self.light_raw = buffer(max(4 * texels, 4))
             let size = vec3u(u32(self.grid.atlas.x), u32(self.grid.atlas.y), u32(self.grid.atlas.z))
             self.irr = texture3d(width: size.x, height: size.y, depth: size.z)
             self.glowing = texture3d(width: size.x, height: size.y, depth: size.z)
@@ -2957,51 +3159,91 @@ impl<S: Solid> Volume<S> {
             }
             return
         }
-        label("relit")
-        for _b in 0..bands {
-            if self.light_cursor < self.shell_count {
-                dispatch(
-                    lit_cells.bind(
-                        g: self.grid,
-                        bricks: self.bricks.items(),
-                        shell: self.shell.items(),
-                        coarse: self.coarse,
-                        atlas: self.atlas,
-                        albedo: self.albedo,
-                        irr: self.irr,
-                        s: self.s,
-                        sun: sun,
-                        sun_e: sun_e,
-                        sky_e: sky_e,
-                        bounce: if bounce { 1 } else { 0 },
-                        rays: rays,
-                        sweep: self.sweeps,
-                        first: self.light_cursor,
-                        count: self.shell_count,
-                        out: mut self.light_raw,
-                    ),
-                    over: LIGHT_BAND,
-                )
-                self.light_cursor += LIGHT_BAND
+        // The sun moved (or was never asked about): every cell asks again whether it reaches it,
+        // now; and where the form's own light is counted, the light stored forgets most of what
+        // it held (it was the old sun's).
+        var copy = false
+        if sun.x != self.lit_sun.x || sun.y != self.lit_sun.y || sun.z != self.lit_sun.z {
+            label("sun asked")
+            var first: u32 = 0
+            for _b in 0..1024 {
+                if first < self.shell_count {
+                    self.lit_band(sun, sun_e, sky_e, bounce, rays, part: 1, first: first)
+                    first += LIGHT_BAND
+                }
+            }
+            self.lit_sun = sun
+            if bounce {
+                self.sweeps = min(self.sweeps, FORGET)
+            }
+            copy = true
+        }
+        // The rest of the light, `bands` dispatches of it a frame, until it has settled.
+        if self.sweeps < settled {
+            label("relit")
+            for _b in 0..bands {
+                if self.light_cursor < self.shell_count {
+                    self.lit_band(sun, sun_e, sky_e, bounce, rays, part: 2, first: self.light_cursor)
+                    self.light_cursor += LIGHT_BAND
+                }
+            }
+            if self.light_cursor >= self.shell_count {
+                self.light_cursor = 0
+                self.sweeps += 1
+                copy = true
             }
         }
-        if self.light_cursor >= self.shell_count {
+        if copy {
             label("light copied")
             dispatch(
-                light_copied.bind(raw: self.light_raw.items(), g: self.grid, albedo: self.albedo, out: mut self.irr, glowing: mut self.glowing),
+                light_copied.bind(
+                    raw: self.light_raw.items(),
+                    g: self.grid,
+                    atlas: self.atlas,
+                    albedo: self.albedo,
+                    sun: sun,
+                    sun_e: sun_e,
+                    out: mut self.irr,
+                    glowing: mut self.glowing,
+                ),
                 over: self.irr,
             )
-            self.light_cursor = 0
-            self.sweeps += 1
         }
     }
 
+    /// One dispatch of the lighting (`lit_cells`): `LIGHT_BAND` of the listed texels, `first` on.
+    fn lit_band(mut self, sun: vec3, sun_e: vec3, sky_e: vec3, bounce: bool, rays: u32, part: u32, first: u32) {
+        dispatch(
+            lit_cells.bind(
+                g: self.grid,
+                bricks: self.bricks.items(),
+                shell: self.shell.items(),
+                coarse: self.coarse,
+                atlas: self.atlas,
+                albedo: self.albedo,
+                irr: self.irr,
+                s: self.s,
+                sun: sun,
+                sun_e: sun_e,
+                sky_e: sky_e,
+                bounce: if bounce { 1 } else { 0 },
+                rays: rays,
+                sweep: self.sweeps,
+                part: part,
+                first: first,
+                count: self.shell_count,
+                out: mut self.light_raw,
+            ),
+            over: LIGHT_BAND,
+        )
+    }
+
     /// The form marched at every pixel into `frame`'s picture, each pixel showing what its
-    /// surface gives back of the light stored there.
-    pub fn draw_lit_into<L: Look>(self, frame: mut Frame, look: L, body: u32) {
-        var g = self.grid
-        g.stored = 1
-        g.debug = 12
+    /// surface gives back of the light stored there, and of the sun's by its own facing. `sharp`
+    /// 1: where the cells round a pixel disagree on whether the sun reaches them, the pixel asks
+    /// by a ray of its own; 2: those pixels shown red, to count them.
+    pub fn draw_lit_into(self, frame: mut Frame, sun: vec3, sun_e: vec3, sharp: u32, body: u32) {
+        let g = self.grid
         label("marched")
         let first = frame.first()
         let q = begin_pass3_with_depth(
@@ -3017,15 +3259,17 @@ impl<S: Solid> Volume<S> {
         draw(
             q,
             cover,
-            marched.bind(
+            marched_lit.bind(
                 eye: frame.eye,
-                light: frame.light,
-                look: look,
                 g: g,
                 coarse: self.coarse,
                 atlas: self.atlas,
-                albedo: self.glowing,
+                albedo: self.albedo,
+                glowing: self.glowing,
                 s: self.s,
+                sun: sun,
+                sun_e: sun_e,
+                sharp: sharp,
                 body: body,
             ),
             vertices: 3,
@@ -3035,7 +3279,7 @@ impl<S: Solid> Volume<S> {
     }
 
     /// The leak test's sums, asked for (`leak_summed`).
-    pub fn leak_asked(self, half: f32, ground: f32) -> Pending<u32> {
+    pub fn leak_asked(self, sun: vec3, sun_e: vec3, half: f32, ground: f32) -> Pending<u32> {
         label("judge")
         var out: GpuBuffer<u32> = buffer_of(Vec::filled(6, 0))
         dispatch(
@@ -3045,6 +3289,8 @@ impl<S: Solid> Volume<S> {
                 shell: self.shell.items(),
                 atlas: self.atlas,
                 raw: self.light_raw.items(),
+                sun: sun,
+                sun_e: sun_e,
                 half: half,
                 ground: ground,
                 count: self.shell_count,
@@ -3056,8 +3302,9 @@ impl<S: Solid> Volume<S> {
     }
 }
 
-/// Whether a ray from `o` along `d` meets `form` within `far` m: by its distance, which is exact.
-fn blocked<F: Solid>(form: F, o: vec3, d: vec3, far: f32) -> bool {
+/// How far along a ray from `o` along `d` it meets `form` (under 0: not within `far` m): by its
+/// distance, which is exact.
+fn met_at<F: Solid>(form: F, o: vec3, d: vec3, far: f32) -> f32 {
     var t = 0.0
     var met = false
     var steps: u32 = 0
@@ -3070,12 +3317,19 @@ fn blocked<F: Solid>(form: F, o: vec3, d: vec3, far: f32) -> bool {
             t += v
         }
     }
-    met
+    if met { t } else { -1.0 }
+}
+
+/// Whether a ray from `o` along `d` meets `form` within `far` m.
+fn blocked<F: Solid>(form: F, o: vec3, d: vec3, far: f32) -> bool {
+    met_at(form, o, d, far) >= 0.0
 }
 
 /// One more look of the light's reference at a pixel, added to the looks so far: the form
 /// itself met along the pixel's ray, and what it gives back there under the same sun and sky by
-/// rays against the form itself (no bounce). Its alpha counts the looks that met the form.
+/// rays against the form itself: each sky ray that meets the form followed on, `bounces` times,
+/// taking the sun's light where it stops and going on by one ray more. Its alpha counts the
+/// looks that met the form.
 @fragment
 pub fn lit_truly<F: Solid, L: Look>(
     pixel: FragCoord,
@@ -3087,6 +3341,7 @@ pub fn lit_truly<F: Solid, L: Look>(
     sun_e: vec3,
     sky_e: vec3,
     rays: u32,
+    bounces: u32,
     looks: u32,
     sofar: Texture<Rgba32Float>,
 ) -> vec4 {
@@ -3131,9 +3386,39 @@ pub fn lit_truly<F: Solid, L: Look>(
             let u = hashed2(at, looks, r)
             let ring = sqrt(u.x)
             let turn = 6.2831853 * u.y
-            let way = normalize(across * (ring * cos(turn)) + along * (ring * sin(turn)) + n * sqrt(1.0 - u.x))
-            if !blocked(form, o, way, 40.0) {
-                e += sky_e / f32(rays)
+            var way = normalize(across * (ring * cos(turn)) + along * (ring * sin(turn)) + n * sqrt(1.0 - u.x))
+            var from = o
+            var share = vec3(1.0 / f32(rays))
+            var depth: u32 = 0
+            var going = true
+            while going {
+                let far = met_at(form, from, way, 40.0)
+                if far < 0.0 {
+                    e += share * sky_e
+                    going = false
+                } else if depth >= bounces {
+                    going = false
+                } else {
+                    // What the form gives back where the ray stopped: the sun's light there, and
+                    // (by the next turn of the loop) one ray's worth of everything else's.
+                    let at_q = from + way * far
+                    let nq = normalize(form.gradient(at_q))
+                    let oq = at_q + nq * 0.01
+                    share = share * look.skin(Place { world: at_q, rest: at_q, chart: None, normal: nq }).albedo
+                    let lean = dot(nq, sun)
+                    if lean > 0.0 && !blocked(form, oq, sun, 40.0) {
+                        e += share * sun_e * lean
+                    }
+                    depth += 1
+                    let uq = hashed2(at, looks, r + 8 * depth)
+                    let upq = if abs(nq.y) < 0.99 { vec3(0.0, 1.0, 0.0) } else { vec3(1.0, 0.0, 0.0) }
+                    let acq = normalize(cross(upq, nq))
+                    let alq = cross(nq, acq)
+                    let rq = sqrt(uq.x)
+                    let tq = 6.2831853 * uq.y
+                    way = normalize(acq * (rq * cos(tq)) + alq * (rq * sin(tq)) + nq * sqrt(1.0 - uq.x))
+                    from = oq
+                }
             }
         }
     }
@@ -3141,19 +3426,45 @@ pub fn lit_truly<F: Solid, L: Look>(
     before + vec4(skin.albedo * e / 3.14159265, 1.0)
 }
 
-/// The picture's stored light against the reference's, counted: pixels both meet the form at;
-/// of them, those over 8 and over 16 of 255 apart (as a plain screen shows them); and the sum
-/// of how far apart (in hundredths of 255).
+/// How far the picture's surface may be from the form's (cells), and the least its facing may
+/// agree with the form's (their dot: 15 degrees apart), for a pixel's surface to count as the
+/// form's own: past either, what is wrong at the pixel is where the volume holds the surface (a
+/// sharp edge it rounds, an outline a part of a pixel off), not the light on it.
+const SAME_PLACE: f32 = 0.5
+const SAME_FACING: f32 = 0.966
+
+/// The picture's stored light against the reference's, counted over rows `first` on: pixels
+/// both meet the form at; of them, those over 8 and over 16 of 255 apart (as a plain screen
+/// shows them); the sum of how far apart (in hundredths of 255); and the same three again over
+/// only the pixels whose surface is the form's own (`SAME_PLACE`, `SAME_FACING`), after their
+/// count.
 @compute(8, 8)
-fn light_judged(colour: Texture<Rgba16Float>, depth: DepthTexture, truth: Texture<Rgba32Float>, looks: f32, out: mut Atomics<u32>, id: GlobalId) {
-    if id.x >= colour.width() || id.y >= colour.height() {
+fn light_judged<F: Solid>(
+    colour: Texture<Rgba16Float>,
+    depth: DepthTexture,
+    truth: Texture<Rgba32Float>,
+    looks: f32,
+    eye: Eye,
+    form: F,
+    bound: vec4,
+    g: Grid,
+    coarse: Texture3d<Rg32Uint>,
+    atlas: Texture3d<Rgba16Float>,
+    s: Sampler,
+    first: u32,
+    out: mut Atomics<u32>,
+    id: GlobalId,
+) {
+    let y = first + id.y
+    if id.x >= colour.width() || y >= colour.height() {
         return
     }
-    let b = truth.load(id.x, id.y)
-    if depth.load(id.x, id.y) <= 0.0 || b.w < 0.99 * looks {
+    let b = truth.load(id.x, y)
+    let z = depth.load(id.x, y)
+    if z <= 0.0 || b.w < 0.99 * looks {
         return
     }
-    let apart = abs(as_seen(colour.load(id.x, id.y).xyz) - as_seen(b.xyz / b.w)) * 255.0
+    let apart = abs(as_seen(colour.load(id.x, y).xyz) - as_seen(b.xyz / b.w)) * 255.0
     let most = max(apart.x, max(apart.y, apart.z))
     let _ = out.add(i: 0, value: 1)
     if most > 8.0 {
@@ -3163,6 +3474,48 @@ fn light_judged(colour: Texture<Rgba16Float>, depth: DepthTexture, truth: Textur
         let _ = out.add(i: 2, value: 1)
     }
     let _ = out.add(i: 3, value: u32(most * 100.0))
+    // The form itself along the pixel's ray, as the reference meets it.
+    let at = vec2(f32(id.x) + 0.5, f32(y) + 0.5)
+    let d = eye.ray(at)
+    let oc = eye.at - bound.xyz
+    let half = dot(oc, d)
+    let h = half * half - (dot(oc, oc) - bound.w * bound.w)
+    if !(h >= 0.0) {
+        return
+    }
+    var t = max(-half - sqrt(h), eye.near)
+    let end = -half + sqrt(h)
+    var met = false
+    var steps: u32 = 0
+    while steps < 256 && !met && t < end {
+        steps += 1
+        let v = form.distance(eye.at + d * t)
+        if v < 0.0002 * t {
+            met = true
+        } else {
+            t += v
+        }
+    }
+    if !met {
+        return
+    }
+    let p = eye.at + d * t
+    let n = normalize(form.gradient(p))
+    let shown = eye.place(at, z)
+    let brick = g.cell * f32(B)
+    let top = vec3(f32(g.size.x - 1), f32(g.size.y - 1), f32(g.size.z - 1))
+    let w = field_at(g, coarse, atlas, s, brick, top, shown)
+    if length(shown - p) > SAME_PLACE * g.cell || dot(w.yzw, w.yzw) == 0.0 || dot(normalize(w.yzw), n) < SAME_FACING {
+        return
+    }
+    let _ = out.add(i: 4, value: 1)
+    if most > 8.0 {
+        let _ = out.add(i: 5, value: 1)
+    }
+    if most > 16.0 {
+        let _ = out.add(i: 6, value: 1)
+    }
+    let _ = out.add(i: 7, value: u32(most * 100.0))
 }
 
 /// The light's reference: the looks added up so far (by turns, into one of two), and how many.
@@ -3178,7 +3531,7 @@ pub fn lit_truth() -> LitTruth {
 
 impl LitTruth {
     /// One more look of the reference (`lit_truly`), as `eye` sees `form`.
-    pub fn look<F: Solid, L: Look>(mut self, eye: Eye, form: F, look: L, sun: vec3, sun_e: vec3, sky_e: vec3, rays: u32) {
+    pub fn look<F: Solid, L: Look>(mut self, eye: Eye, form: F, look: L, sun: vec3, sun_e: vec3, sky_e: vec3, rays: u32, bounces: u32) {
         let w = u32(eye.size.x)
         let h = u32(eye.size.y)
         if self.even.width() != w || self.even.height() != h {
@@ -3193,7 +3546,7 @@ impl LitTruth {
             draw(
                 p,
                 cover,
-                lit_truly.bind(eye: eye, form: form, look: look, bound: vec4(b.centre, b.radius), sun: sun, sun_e: sun_e, sky_e: sky_e, rays: rays, looks: self.looks, sofar: self.odd),
+                lit_truly.bind(eye: eye, form: form, look: look, bound: vec4(b.centre, b.radius), sun: sun, sun_e: sun_e, sky_e: sky_e, rays: rays, bounces: bounces, looks: self.looks, sofar: self.odd),
                 vertices: 3,
             )
             p.end()
@@ -3202,7 +3555,7 @@ impl LitTruth {
             draw(
                 p,
                 cover,
-                lit_truly.bind(eye: eye, form: form, look: look, bound: vec4(b.centre, b.radius), sun: sun, sun_e: sun_e, sky_e: sky_e, rays: rays, looks: self.looks, sofar: self.even),
+                lit_truly.bind(eye: eye, form: form, look: look, bound: vec4(b.centre, b.radius), sun: sun, sun_e: sun_e, sky_e: sky_e, rays: rays, bounces: bounces, looks: self.looks, sofar: self.even),
                 vertices: 3,
             )
             p.end()
@@ -3210,22 +3563,58 @@ impl LitTruth {
         self.looks += 1
     }
 
-    /// `frame`'s picture (before its last pass) against the reference, counted and asked for.
-    pub fn judged(self, frame: Frame) -> Pending<u32> {
+    /// `frame`'s picture (before its last pass) of `vol` against the reference, counted and
+    /// asked for (`light_judged`), 64 rows a dispatch.
+    pub fn judged<F: Solid>(self, frame: Frame, form: F, vol: Volume<F>) -> Pending<u32> {
         let w = u32(frame.eye.size.x)
         let h = u32(frame.eye.size.y)
+        let b = form.bound()
         label("judge")
-        var out: GpuBuffer<u32> = buffer_of(Vec::filled(4, 0))
-        if self.looks % 2 == 1 {
-            dispatch(
-                light_judged.bind(colour: frame.colour, depth: frame.depth, truth: self.even, looks: f32(self.looks), out: mut out),
-                groups: ((w + 7) / 8, (h + 7) / 8, 1),
-            )
-        } else {
-            dispatch(
-                light_judged.bind(colour: frame.colour, depth: frame.depth, truth: self.odd, looks: f32(self.looks), out: mut out),
-                groups: ((w + 7) / 8, (h + 7) / 8, 1),
-            )
+        var out: GpuBuffer<u32> = buffer_of(Vec::filled(8, 0))
+        var first: u32 = 0
+        for _b in 0..64 {
+            if first < h {
+                if self.looks % 2 == 1 {
+                    dispatch(
+                        light_judged.bind(
+                            colour: frame.colour,
+                            depth: frame.depth,
+                            truth: self.even,
+                            looks: f32(self.looks),
+                            eye: frame.eye,
+                            form: form,
+                            bound: vec4(b.centre, b.radius),
+                            g: vol.grid,
+                            coarse: vol.coarse,
+                            atlas: vol.atlas,
+                            s: vol.s,
+                            first: first,
+                            out: mut out,
+                        ),
+                        groups: ((w + 7) / 8, 8, 1),
+                    )
+                } else {
+                    dispatch(
+                        light_judged.bind(
+                            colour: frame.colour,
+                            depth: frame.depth,
+                            truth: self.odd,
+                            looks: f32(self.looks),
+                            eye: frame.eye,
+                            form: form,
+                            bound: vec4(b.centre, b.radius),
+                            g: vol.grid,
+                            coarse: vol.coarse,
+                            atlas: vol.atlas,
+                            s: vol.s,
+                            first: first,
+                            out: mut out,
+                        ),
+                        groups: ((w + 7) / 8, 8, 1),
+                    )
+                }
+                first += 64
+            }
         }
         read(out.items())
     }
