@@ -72,8 +72,11 @@ the field itself. The engine chooses; no author does.
 **The choice may never show.** Two rules follow, both paid for in the first slice.
 
 - **Either answer draws the same picture**, to the judges' lines. Cells are a cache of the field,
-  not a second version of it: where cells answer, they are fine enough for the pixel that reads
-  them. (Measured: cells three pixels wide lost 72 to 79 of a creature's 85 thin pixels, a 1 cm
+  not a second version of it: where cells answer, they are as fine as the eye asks or as the
+  field needs, whichever is coarser. A brick is split only where a pixel reads it finer and its
+  cells are off their field by more than a tenth of that pixel. (Measured: that holds a stone
+  stack from 100 m to 3 m in 10 to 16 bytes a screen pixel; cells a pixel wide everywhere draw
+  the same picture in 250 to 310.) (Measured: cells three pixels wide lost 72 to 79 of a creature's 85 thin pixels, a 1 cm
   wand and the tips of its ears, and opened holes.) Until that holds, the choice changes what is
   drawn, and nothing may choose it.
 - **The choice is the same on every run and every machine.** It is made from what the toolchain
@@ -253,6 +256,13 @@ engine's log and commit messages.
 | The engine can choose field or cells by timing its frames | **False.** The choice flips with the GPU's state |
 | Edges without smoothing crawl no more than the reference's | **Not met.** 5 to 10% more where fields are asked |
 | A plain body costs what a structured one does | **Not met.** Deposit 3.2 times the spike's hand-chosen parts |
+| Cells sized from what the eye sees hold a still thing at any distance, in memory that follows the screen | Measured (slice 1b, judged at 960x540, both machines alike). A stack at 100, 30, 10 and 3 m: no holes, outline within 0.069 px, 5 to 8 MB. Sharp boxes cost more: 79 bytes a pixel against the stack's 12 |
+| New cells while the eye walks fit the frame | Measured. 1.46 ms a frame on the mean, 1.94 at most (M4, 1080p); no hole mid-walk |
+| A choice made from a count is the same on every run | Measured. Five runs on each machine, load or none; by fields against by cells differs on 0.13% of pixels |
+| A thing in cells keeps its thin parts | **Not met.** It needs about 8 cells across its thinnest part; a moving body in pixel-wide cells loses 15 of 22 thin pixels |
+| Edge pixels drawn again as nine rays each are right and still | **Half.** Edge error 24.7 to 5.6 of 255 (line 8) for 2.4 ms, but crawl is up to 3.5 times the reference's: the nine rays sit at fixed places |
+| The frame with edges fits half a frame | **Not met.** 10.7 ms (line 8.3): picture 7.0, of which about half is the stand-in sun's shadow rays; edges 2.4; a body's deposit 1.05 |
+| Rebuilding the surface from the facing cells keep (direction 4) | Measured, and dead as built. Cells twice as coarse for the same outline, but an ask 71% dearer, and memory is no longer short |
 | A shipped build takes a plain body and a new field | **Not met.** E0712 refuses std's own round cone and smooth union inside the ray's steps; builds are made with `--testing` until the toolchain does that work once a command itself |
 
 ## What the design must make impossible
@@ -286,9 +296,15 @@ at a time, into the place this document gives it.
    spike's own numbers for each.
    - 1a, done: cells, one ray, every pixel by it, a stand-in light that lives in picture until
      slice 2 replaces it.
-   - 1b: cells that are true (sized from what the eye sees, kept only where the eye needs them),
-     a choice that is the same on every run, and edges that crawl no more than the reference's.
-   - 1c: the time (looking coarsely first, filling in, so that pixels do not all pay for a ray).
+   - 1b, done: cells that are true for still things (sized from what the eye sees, split only
+     where they are off their field), and a choice that is the same on every run. Edges are
+     right but crawl; thin parts are lost in cells; the frame is over its line.
+   - 1c: a field's range over a box (direction 1 below), which is meant to keep thin and moving
+     things exactly and to derive what is still stated by hand; and edges whose cover changes
+     smoothly as an edge crosses a pixel.
+   - 1d: the time (looking coarsely first, filling in, so that pixels do not all pay for a ray).
+     The half-frame line is held at the end of slice 2, when stored light replaces the stand-in's
+     shadow ray a pixel.
 2. **Light on that path**: sun, sky, bounce; a body's light and its shadow on other things.
 3. **The author test.** A sealed author is given briefs for new things, in pairs that share a
    property (a sea and a terrain on a height; water and a glass shard). It is held to four marks:
@@ -319,6 +335,10 @@ box of space and give the range of its value and of its gradient. From that one 
   every run;
 - thin parts: a wand's bricks are left with one round cone, asked exactly, never sampled.
 
+std already gives a program the first half: `std::derive::interval(f, over)` is a range holding
+`f` over a box, derived by the compiler, and a field's tape can be read. What is missing is a
+union's members numbered so that a mask selects them.
+
 It would close, at once, the first slice's unstable choice, its lost thin parts, the plain body's
 cost against a structured one, and every bound and steepness stated by hand. After slice 1b,
 before the time. Cheapest decider: live parts kept a brick, by hand if the toolchain cannot give
@@ -341,7 +361,10 @@ One sparse store round the eye, one rule for filling it when asked. To be settle
 design, before light gets a store of its own. **Dead if** the two need different fineness or
 lifetimes badly enough that one store serves neither.
 
-**4. Use the facing the cells already keep.** A cell keeps a distance and a facing; the surface
+**4. Use the facing the cells already keep.** *Measured in slice 1b and dead as built: cells
+twice as coarse gave the same outline, but an ask cost 71% more (the shader's size, it seems,
+not its arithmetic), and error-bounded cells had already made memory small. It may live again
+if that cost can be cut.* A cell keeps a distance and a facing; the surface
 is rebuilt from distances alone. Rebuilt from both, the same cells give a sharper surface, so
 cells can be coarser for the same picture: twice as coarse is an eighth of the memory. In slice
 1b, as a measure against its memory line. **Dead if** at a given picture error it does not allow
