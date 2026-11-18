@@ -29,7 +29,7 @@
 // One deposit, carried from the volume spike (spike/volume, spikes/volume/volume.wrela:
 // `coarsed_parts`, `fill_parts`, `redeposit`), rewritten.
 
-use matter::cost::by_cells
+use matter::cost::{AFFORD, weighed, weighed_by_parts}
 use matter::ranges::{bound_of, longest, stated_steepness}
 use std::derive::{Box3, gradient, interval}
 use matter::substance::Substance
@@ -74,8 +74,9 @@ pub const OFF: f32 = 0.1
 /// (bits: 0, or below 0 where all of it is inside), the most its field's gradient can be long over
 /// it (bits; derived; asked by its field only), and how many roots away the nearest root is that
 /// may hold matter (`CLEAR`, `cleared`: so every root nearer than that holds none, and a ray
-/// crosses them in one stride).
-pub const ROOT: u32 = 4
+/// crosses them in one stride), and, for a thing asked by its parts, which of them can change its
+/// distance in the root (`Surface::live`'s word).
+pub const ROOT: u32 = 5
 
 /// The most roots a root's clearance counts.
 const CLEAR: u32 = 255
@@ -130,7 +131,9 @@ pub struct Grid: Copy + GpuData {
     pub scope: f32,
     pub kept: u32,
     pub frame: u32,
-    pub spare: vec2u,
+    /// Whether it is asked by the parts live in each root (1), or whole (0).
+    pub parts: u32,
+    pub spare: u32,
 }
 
 /// A unit vector folded onto an octahedron, 8 bits each way, and back.
@@ -246,7 +249,19 @@ fn coarsed<M: Field<Substance>>(field: M, g: Grid, first: u32, roots: mut Atomic
     let y = (i / g.size.x) % g.size.y
     let z = i / (g.size.x * g.size.y)
     let mid = g.lo + (vec3(f32(x), f32(y), f32(z)) + vec3(0.5)) * g.brick
-    let k = kept_at(field, g, mid, g.brick)
+    var k = vec4(0.0)
+    var mask: u32 = 4294967295
+    if g.parts > 0 {
+        // Asked by its parts: the range of its distance and gradient over the root, and the parts
+        // that can change its distance there (std's `range` and `live`, derived).
+        let b = Box3 { lo: mid - vec3(0.5 * g.brick), hi: mid + vec3(0.5 * g.brick) }
+        let r = field.range(b)
+        mask = field.live(b).word()
+        let steep = longest(r.gradient)
+        k = vec4(if r.value.lo <= 0.0 && r.value.hi >= 0.0 { 1.0 } else { 0.0 }, if r.value.hi < 0.0 { -1.0e-6 } else { 0.0 }, if steep < 1.0e30 { steep } else { -1.0 }, 0.0)
+    } else {
+        k = kept_at(field, g, mid, g.brick)
+    }
     var node = NO_BRICK
     if k.x > 0.5 {
         if g.asks == ASKS_FIELD {
@@ -262,6 +277,7 @@ fn coarsed<M: Field<Substance>>(field: M, g: Grid, first: u32, roots: mut Atomic
     let _ = roots.exchange(i: ROOT * i, value: node)
     let _ = roots.exchange(i: ROOT * i + 1, value: bitcast_u32(k.y))
     let _ = roots.exchange(i: ROOT * i + 2, value: bitcast_u32(k.z))
+    let _ = roots.exchange(i: ROOT * i + 4, value: mask)
 }
 
 /// Whether root `i` may hold matter (its surface may pass through it, or all of it is inside).
@@ -662,6 +678,8 @@ pub struct Kept {
     pub moving: bool,
     pub held_asks: u32,
     pub held_cell: f32,
+    /// An instrument: 1 asks it whole, never by its parts.
+    pub held_whole: u32,
     frame: u32,
 }
 
@@ -681,7 +699,8 @@ pub fn kept() -> Kept {
             scope: 1.0,
             kept: 0,
             frame: 0,
-            spare: vec2u(0, 0),
+            parts: 0,
+            spare: 0,
         },
         roots: buffer(2),
         nodes: buffer(NODE),
@@ -710,6 +729,7 @@ pub fn kept() -> Kept {
         moving: false,
         held_asks: 0,
         held_cell: 0.0,
+        held_whole: 0,
         frame: 0,
         derived: vec4(0.0),
         bound_derived: false,
@@ -811,7 +831,7 @@ impl Kept {
             // steepness std's shapes state, for roots whose derived steepness is unbounded.
             self.bounded(field)
             let d = self.derived
-            let how = if self.bound_derived { "derived" } else { "as std's shapes state it (its ranges are not numbers over large boxes: gap 18)" }
+            let how = if self.bound_derived { "derived" } else { "NOT derived: its search did not close, so it is laid over the space searched" }
             print(f"engine::matter: where it can be, {how}: within {d.w} m of ({d.x}, {d.y}, {d.z})")
         }
         let now = probed(field, self.derived)
@@ -826,12 +846,37 @@ impl Kept {
         }
         self.probes = take now
         if self.asks == 0 {
-            self.asks = if self.held_asks != 0 { self.held_asks } else if by_cells(field) { ASKS_CELLS } else { ASKS_FIELD }
+            // How it is asked: by its parts where the parts live where it is asked weigh less than
+            // the whole (`cost::weighed_by_parts`, with what keeping them a root costs a step); by
+            // its field where that ask weighs no more than `AFFORD`; else by its cells.
+            let whole = weighed(field)
+            let parted = if field.parts() > 1 && self.held_whole == 0 { weighed_by_parts(field, self.derived, 2.0 * self.derived.w / ROOTS) } else { 1.0e30 }
+            let by_parts = parted < whole
+            let w = min(whole, parted)
+            self.asks = if self.held_asks != 0 { self.held_asks } else if w > AFFORD { ASKS_CELLS } else { ASKS_FIELD }
+            if self.asks == ASKS_FIELD && by_parts {
+                self.grid.parts = 1
+            }
+            print(f"engine::matter: an ask weighs {whole} whole, {parted} by its parts: asked by its {by(self.asks)}{if self.grid.parts > 0 { ", by the parts live a root" } else { "" }}")
         }
         self.grid.asks = self.asks
         if self.asks == ASKS_FIELD {
             // Asked by its field, it needs no cells: only its grid, which bounds it.
             // Asked by its field, it keeps its roots: where nothing is, and how steep it is in each.
+            if self.grid.parts == 0 {
+                // Asked whole, it keeps nothing: its grid bounds it, and a ray steps by its value
+                // over its steepness (looking a root up at every step costs more than it saves for
+                // a field asked whole: wrela-notes/engine/NOTES.md, "A1's time").
+                if self.stage == 0 {
+                    self.laid(2.0 * self.derived.w / ROOTS / f32(B), fixed: false)
+                    print(f"engine::matter: a thing asked whole by its field{held(self.held_asks)}: no cells kept")
+                } else if self.moving {
+                    self.bounded(field)
+                    self.laid(self.grid.cell, fixed: true)
+                }
+                self.stage = 4
+                return
+            }
             if self.stage == 0 || self.moving {
                 if self.stage == 0 {
                     self.laid(2.0 * self.derived.w / ROOTS / f32(B), fixed: false)
@@ -971,7 +1016,7 @@ impl Kept {
             self.stage = 5
             self.cursor = 0
             self.counted = None
-            print(f"engine::matter: a moving thing{held(self.held_asks)}: {n}^3 root bricks ({self.grid.brick} m each, cells {self.grid.cell} m, bound {self.derived.w} m, {if self.bound_derived { "derived" } else { "stated: gap 18" }}), asked by its {by(self.asks)}")
+            print(f"engine::matter: a moving thing{held(self.held_asks)}: {n}^3 root bricks ({self.grid.brick} m each, cells {self.grid.cell} m, bound {self.derived.w} m, {if self.bound_derived { "derived" } else { "not derived" }}), asked by its {by(self.asks)}")
         }
         self.laid(self.grid.cell, fixed: true)
         let n = self.grid.size.x * self.grid.size.y * self.grid.size.z

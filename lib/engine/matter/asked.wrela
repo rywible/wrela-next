@@ -14,13 +14,14 @@
 
 use matter::cells::{B, CELL_PER_SIZE, EMPTY, Grid, LEVELS, NODE, NONE, NO_BRICK, ROOT, read_cells}
 use matter::substance::Substance
-use std::field::Field
+use std::derive::gradient
+use std::field::{Field, Live}
 use std::gpu::GpuSpan
 
-/// Matter as the engine's own groups answer, told which of its things (a bit each, the first the
-/// lowest) are asked by their cells: a constant of the pipeline (`Chosen`), so a thing asked by
-/// its cells carries no code of its field's into the ray, nor one asked by its field any of its
-/// cells'.
+/// Matter as the engine's own groups answer, told how each of its things is asked (two bits each,
+/// the first the lowest: 0 by its field whole, 1 by its cells, 2 by the parts live a root): a
+/// constant of the pipeline (`Chosen`), so a thing asked by its cells carries no code of its
+/// field's into the ray, one asked whole no root's, nor one asked by its field any of its cells'.
 pub trait Answers: Copy {
     fn count(self) -> u32
     fn step_by(self, p: vec3, d: vec3, inv: vec3, size: f32, cells: u32) -> vec2
@@ -86,7 +87,7 @@ impl<M: Field<Substance>> Seen<M> {
     /// The answer at `p`, going along `d` (`along` false: no way, so an empty brick says only how
     /// far its middle says the surface is), asked `size` m finely; `by_cells`, by its cells. Into
     /// `x` and `y` as `Asked::step`'s; `zw` unused but for `facing` (`cells_at` gives the facing).
-    fn answer(self, p: vec3, inv: vec3, size: f32, along: bool, by_cells: bool) -> vec2 {
+    fn answer(self, p: vec3, inv: vec3, size: f32, along: bool, by_cells: bool, by_parts: bool) -> vec2 {
         let g = self.grid
         let outside = max(g.lo - p, p - g.hi)
         if max(outside.x, max(outside.y, outside.z)) > 0.0 {
@@ -96,6 +97,12 @@ impl<M: Field<Substance>> Seen<M> {
         }
         let c = clamp(floor((p - g.lo) / g.brick), vec3(0.0), g.top)
         let r = u32(c.x) + g.size.x * (u32(c.y) + g.size.y * u32(c.z))
+        if !by_cells && !by_parts {
+            // A thing asked whole by its field: its value over its steepness, never past its
+            // surface (1b's path: nothing looked up).
+            let f = clamp(self.field.distance(p), -g.scope, g.scope) / g.stated
+            return vec2(f, f)
+        }
         if !by_cells {
             // A thing asked by its field. A root its field's range says holds nothing (its
             // clearance over 0): across it and the roots round it that hold nothing either,
@@ -113,7 +120,7 @@ impl<M: Field<Substance>> Seen<M> {
             }
             let derived = bitcast_f32(self.roots[ROOT * r + 2])
             let steep = if derived > 0.0 { max(min(derived, g.stated), 1.0) } else { g.stated }
-            let f = clamp(self.field.distance(p), -g.scope, g.scope) / steep
+            let f = clamp(self.field.distance_live(p, Live::from_word(self.roots[ROOT * r + 4])), -g.scope, g.scope) / steep
             if !along || f <= inside_by(p, lo, g.brick) {
                 return vec2(f, f)
             }
@@ -213,15 +220,15 @@ impl<M: Field<Substance>> Answers for Seen<M> {
     }
 
     fn step_by(self, p: vec3, d: vec3, inv: vec3, size: f32, cells: u32) -> vec2 {
-        self.answer(p, inv, size, along: true, by_cells: (cells & 1) != 0)
+        self.answer(p, inv, size, along: true, by_cells: (cells & 3) == 1, by_parts: (cells & 3) == 2)
     }
 
     fn far_by(self, p: vec3, size: f32, cells: u32) -> f32 {
-        self.answer(p, vec3(1.0e30, 1.0, 1.0e30), size, along: false, by_cells: (cells & 1) != 0).y
+        self.answer(p, vec3(1.0e30, 1.0, 1.0e30), size, along: false, by_cells: (cells & 3) == 1, by_parts: (cells & 3) == 2).y
     }
 
     fn facing_by(self, p: vec3, came: vec3, size: f32, cells: u32) -> vec3 {
-        if (cells & 1) != 0 {
+        if (cells & 3) == 1 {
             let n = self.cells_facing(p, size)
             if dot(n, n) > 1.0e-8 {
                 return normalize(n)
@@ -230,7 +237,17 @@ impl<M: Field<Substance>> Answers for Seen<M> {
         }
         // (Where the field's own gradient vanishes, back along the ray: asking its value to each
         // side would put six more asks of a dear field into every pixel's code.)
-        let grad = self.field.gradient(p)
+        let g = self.grid
+        var grad = vec3(0.0)
+        if (cells & 3) == 2 {
+            let c = clamp(floor((p - g.lo) / g.brick), vec3(0.0), g.top)
+            let r = u32(c.x) + g.size.x * (u32(c.y) + g.size.y * u32(c.z))
+            let field = self.field
+            let live = Live::from_word(self.roots[ROOT * r + 4])
+            grad = gradient(|q: vec3| field.distance_live(q, live), p)
+        } else {
+            grad = self.field.gradient(p)
+        }
         if dot(grad, grad) > 1.0e-8 {
             return normalize(grad)
         }
@@ -259,19 +276,19 @@ impl<A: Answers, B: Answers> Answers for Both<A, B> {
 
     fn step_by(self, p: vec3, d: vec3, inv: vec3, size: f32, cells: u32) -> vec2 {
         let x = self.a.step_by(p, d, inv, size, cells)
-        let y = self.b.step_by(p, d, inv, size, cells >> self.a.count())
+        let y = self.b.step_by(p, d, inv, size, cells >> (2 * self.a.count()))
         vec2(min(x.x, y.x), min(x.y, y.y))
     }
 
     fn far_by(self, p: vec3, size: f32, cells: u32) -> f32 {
-        min(self.a.far_by(p, size, cells), self.b.far_by(p, size, cells >> self.a.count()))
+        min(self.a.far_by(p, size, cells), self.b.far_by(p, size, cells >> (2 * self.a.count())))
     }
 
     fn facing_by(self, p: vec3, came: vec3, size: f32, cells: u32) -> vec3 {
-        if self.a.far_by(p, size, cells) <= self.b.far_by(p, size, cells >> self.a.count()) {
+        if self.a.far_by(p, size, cells) <= self.b.far_by(p, size, cells >> (2 * self.a.count())) {
             self.a.facing_by(p, came, size, cells)
         } else {
-            self.b.facing_by(p, came, size, cells >> self.a.count())
+            self.b.facing_by(p, came, size, cells >> (2 * self.a.count()))
         }
     }
 
