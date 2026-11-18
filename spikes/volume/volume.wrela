@@ -156,7 +156,10 @@ pub struct Grid: Copy + GpuData {
     /// Whether edge blocks are narrowed to quarters before their pixels are solved (1). Measured
     /// a loss on the pillar (0.15 ms of scouts and sorting for no cheaper pass), so 0.
     pub narrow: u32,
-    pub spare: f32,
+    /// Whether an ask of the form is answered from its cells (1: a form too dear to ask at every
+    /// pixel, its distance and facing kept in the cells as its deposit took them) or by the
+    /// form's own function (0).
+    pub cached: u32,
 }
 
 /// The most invocations of a filling kernel in one dispatch (its work bound times this stays
@@ -186,8 +189,11 @@ pub struct Volume<S> {
     /// puts it in its texture (a kernel stores only its own texel, so a texture can't be filled a
     /// band at a time).
     raw: GpuBuffer<u32>,
-    /// A moving form's parts that matter in each coarse cell's brick (`Parted`).
+    /// A form's parts that matter in each coarse cell's brick (`Parted`).
     parts: GpuBuffer<u32>,
+    /// What a still form's deposit writes, three words an atlas texel, before a copy puts it in
+    /// its textures.
+    fine: GpuBuffer<u32>,
     counted: Option<Pending<u32>>,
     /// 0 the coarse grid's bands; 1 its count asked for; 2 the atlas's bands; 3 filled.
     pub stage: u32,
@@ -269,7 +275,7 @@ pub fn volume<S: Solid>(form: S, cell: f32) -> Volume<S> {
             quads: 1,
             solves: 1,
             narrow: 0,
-            spare: 0.0,
+            cached: 0,
         },
         coarse: texture3d(width: n, height: n, depth: n),
         atlas: texture3d(width: 1, height: 1, depth: 1),
@@ -277,6 +283,7 @@ pub fn volume<S: Solid>(form: S, cell: f32) -> Volume<S> {
         bricks: append_buffer(MOST_BRICKS),
         raw: buffer(2 * n * n * n),
         parts: buffer(1),
+        fine: buffer(3),
         counted: None,
         stage: 0,
         cursor: 0,
@@ -602,8 +609,8 @@ fn coarse_moved(raw: [u32], g: Grid, rings: u32, out: mut Texels3d<Rg32Uint>, id
 /// Coarse cells of a moving form, as `coarsed` asks a still one's, and for each brick kept the
 /// parts of the form that matter anywhere in it (`parts`).
 @compute(64)
-fn coarsed_parts<S: Parted>(form: S, g: Grid, out: mut Atomics<u32>, parts: mut Atomics<u32>, bricks: mut Append<u32>, id: GlobalId) {
-    let i = id.x
+fn coarsed_parts<S: Parted>(form: S, g: Grid, first: u32, out: mut Atomics<u32>, parts: mut Atomics<u32>, bricks: mut Append<u32>, id: GlobalId) {
+    let i = first + id.x
     if i >= g.size.x * g.size.y * g.size.z {
         return
     }
@@ -668,6 +675,56 @@ fn deposited_here<S: Parted>(form: S, g: Grid, bricks: [u32], coarse: [u32], par
     out.store(id, vec4(f / max(len, 1.0), grad / len))
 }
 
+/// Atlas texels `first` on of a form that keeps still, brick by brick (a band of them a
+/// dispatch, over as many frames as it takes: `fill_parts`): each texel's distance and facing
+/// as `deposited_here` takes a moving form's, from the parts that matter in its brick; and what
+/// the look wears where the texel's place falls on the surface.
+@compute(64)
+fn deposited_parts<S: Parted, L: Look>(form: S, look: L, g: Grid, bricks: [u32], parts: [u32], first: u32, out: mut Atomics<u32>, id: GlobalId) {
+    let i = first + id.x
+    let slot = i / (BS * BS * BS)
+    if slot >= g.size.w {
+        return
+    }
+    let k = i % (BS * BS * BS)
+    let c = bricks[slot]
+    let x = c & 1023
+    let y = (c >> 10) & 1023
+    let z = c >> 20
+    let local = vec3(f32(k % BS), f32((k / BS) % BS), f32(k / (BS * BS)))
+    let p = g.lo + (vec3(f32(x), f32(y), f32(z)) * f32(B) + local) * g.cell
+    let (f, grad) = form.sample_of(p, parts[x + g.size.x * (y + g.size.y * z)])
+    let len = max(length(grad), 1.0e-6)
+    let n = grad / len
+    let dist = f / max(len, 1.0)
+    var worn = vec3(0.0)
+    if abs(dist) < 2.0 * g.cell {
+        let on = p - n * (f / len)
+        worn = sqrt(saturate(look.skin(Place { world: on, rest: on, chart: None, normal: n }).albedo)) * 255.0 + vec3(0.5)
+    }
+    let _ = out.exchange(i: 3 * i, value: bitcast_u32(dist))
+    let _ = out.exchange(i: 3 * i + 1, value: folded(n))
+    let _ = out.exchange(i: 3 * i + 2, value: u32(worn.x) | (u32(worn.y) << 8) | (u32(worn.z) << 16))
+}
+
+/// What a form wears at `p` on its surface, facing `n`: read from its cells where they hold it
+/// (`g.stored`: a look coarser than a cell, asked once at the deposit, as a still form's is), else
+/// the look asked here.
+fn worn_at<L: Look>(look: L, g: Grid, coarse: Texture3d<Rg32Uint>, albedo: Texture3d<Rgba8>, s: Sampler, brick: f32, top: vec3, p: vec3, n: vec3) -> vec3 {
+    if g.stored == 0 {
+        return look.skin(Place { world: p, rest: p, chart: None, normal: n }).albedo
+    }
+    let q = (p - g.lo) / brick
+    let c = clamp(floor(q), vec3(0.0), top)
+    let k = coarse.load(u32(c.x), u32(c.y), u32(c.z))
+    if k.x >= FAR_FROM {
+        return vec3(0.0)
+    }
+    let a = vec3(f32(k.x % ROW), f32((k.x / ROW) % ROW), f32(k.x / (ROW * ROW))) * f32(BS)
+    let r = albedo.sample_level(s, (a + clamp((q - c) * f32(B), vec3(0.0), vec3(f32(B))) + vec3(0.5)) / g.atlas, 0.0).xyz
+    r * r
+}
+
 /// How near the stored surface (cells) a ray asks the form itself, and the most times it asks
 /// along a pixel's ray.
 const TRUE_NEAR: f32 = 1.5
@@ -677,23 +734,35 @@ const TRUE_STEPS: u32 = 256
 /// the parts that matter in the brick `p` is in; or, in a brick that holds nothing, no facing
 /// and how far every place in such a brick is from the surface at the least (`clear.x`; in a
 /// brick inside the form `clear.y`, the same under 0).
-fn asked_at<S: Parted>(form: S, g: Grid, coarse: Texture3d<Rg32Uint>, parts: [u32], brick: f32, top: vec3, clear: vec2, p: vec3) -> vec4 {
-    let c = clamp(floor((p - g.lo) / brick), vec3(0.0), top)
+fn asked_at<S: Parted>(form: S, g: Grid, coarse: Texture3d<Rg32Uint>, atlas: Texture3d<Rgba16Float>, s: Sampler, parts: [u32], brick: f32, top: vec3, clear: vec2, p: vec3) -> vec4 {
+    let q = (p - g.lo) / brick
+    let c = clamp(floor(q), vec3(0.0), top)
     let k = coarse.load(u32(c.x), u32(c.y), u32(c.z))
     if k.x >= FAR_FROM {
         // (Inside the form, where the form is under nothing at the brick's middle.)
         return vec4(0.0, 0.0, 0.0, if bitcast_f32(k.y) < 0.0 { clear.y } else { clear.x })
+    }
+    if g.cached == 1 {
+        // (A form answered from its cells: the distance and facing its deposit kept.)
+        let a = vec3(f32(k.x % ROW), f32((k.x / ROW) % ROW), f32(k.x / (ROW * ROW))) * f32(BS)
+        let v = atlas.sample_level(s, (a + clamp((q - c) * f32(B), vec3(0.0), vec3(f32(B))) + vec3(0.5)) / g.atlas, 0.0)
+        return vec4(v.yzw, v.x)
     }
     let (f, grad) = form.sample_of(p, parts[u32(c.x) + g.size.x * (u32(c.y) + g.size.y * u32(c.z))])
     vec4(grad, f)
 }
 
 /// A moving form's distance alone at `p`, as `asked_at` gives it: what a ray steps by.
-fn far_at<S: Parted>(form: S, g: Grid, coarse: Texture3d<Rg32Uint>, parts: [u32], brick: f32, top: vec3, clear: vec2, p: vec3) -> f32 {
-    let c = clamp(floor((p - g.lo) / brick), vec3(0.0), top)
+fn far_at<S: Parted>(form: S, g: Grid, coarse: Texture3d<Rg32Uint>, atlas: Texture3d<Rgba16Float>, s: Sampler, parts: [u32], brick: f32, top: vec3, clear: vec2, p: vec3) -> f32 {
+    let q = (p - g.lo) / brick
+    let c = clamp(floor(q), vec3(0.0), top)
     let k = coarse.load(u32(c.x), u32(c.y), u32(c.z))
     if k.x >= FAR_FROM {
         return if bitcast_f32(k.y) < 0.0 { clear.y } else { clear.x }
+    }
+    if g.cached == 1 {
+        let a = vec3(f32(k.x % ROW), f32((k.x / ROW) % ROW), f32(k.x / (ROW * ROW))) * f32(BS)
+        return atlas.sample_level(s, (a + clamp((q - c) * f32(B), vec3(0.0), vec3(f32(B))) + vec3(0.5)) / g.atlas, 0.0).x
     }
     form.distance_of(p, parts[u32(c.x) + g.size.x * (u32(c.y) + g.size.y * u32(c.z))])
 }
@@ -748,6 +817,8 @@ fn reached<S: Parted>(
     let reach = TRUE_NEAR * g.cell
     let graze = band * own
     let least_step = 0.25 * own
+    // (A form's value over its steepness is no farther than its surface: what a step may be.)
+    let rate = if g.cached == 1 { 1.0 } else { 1.0 / g.steep }
     var begin = from
     var rounds: u32 = 0
     var going = true
@@ -786,10 +857,10 @@ fn reached<S: Parted>(
             var back: u32 = 0
             while steps < TRUE_STEPS && !crossed && !grazed && t < end {
                 steps += 1
-                v = far_at(form, g, coarse, parts, brick, top, clear, o + d * t)
+                v = far_at(form, g, coarse, atlas, s, parts, brick, top, clear, o + d * t)
                 if v < 0.0 && flo > 1.0e8 && back < 8 && t > begin {
                     back += 1
-                    t = max(t - max(-v, reach), begin)
+                    t = max(t - max(-v * rate, reach), begin)
                     lo = t
                 } else if v < 0.0 {
                     crossed = true
@@ -800,7 +871,7 @@ fn reached<S: Parted>(
                         // joined, the value runs level and is far under the distance: so it is
                         // a graze only if the value over its gradient's length, the distance
                         // to the surface, is within the band too. If not, the ray goes on.)
-                        let turn = asked_at(form, g, coarse, parts, brick, top, clear, o + d * lo)
+                        let turn = asked_at(form, g, coarse, atlas, s, parts, brick, top, clear, o + d * lo)
                         graze_here = flo < graze * lo * length(turn.xyz)
                         fell = false
                     }
@@ -814,7 +885,7 @@ fn reached<S: Parted>(
                         fell = fell || v < flo
                         lo = t
                         flo = v
-                        t += max(v, least_step * t)
+                        t += max(v * rate, least_step * t)
                     }
                 }
             }
@@ -842,7 +913,7 @@ fn reached<S: Parted>(
     while turns < 2 {
         turns += 1
         let m = lo + (hi - lo) * (flo / (flo - fhi))
-        let fm = far_at(form, g, coarse, parts, brick, top, clear, o + d * m)
+        let fm = far_at(form, g, coarse, atlas, s, parts, brick, top, clear, o + d * m)
         if fm < 0.0 {
             hi = m
             fhi = min(fm, -1.0e-9)
@@ -868,6 +939,7 @@ pub fn marched_true<S: Parted, L: Look>(
     g: Grid,
     coarse: Texture3d<Rg32Uint>,
     atlas: Texture3d<Rgba16Float>,
+    albedo: Texture3d<Rgba8>,
     s: Sampler,
     parts: [u32],
     body: u32,
@@ -887,9 +959,9 @@ pub fn marched_true<S: Parted, L: Look>(
     }
     let at = r.t
     let p = eye.at + d * at
-    let here = asked_at(form, g, coarse, parts, brick, top, clear, p)
+    let here = asked_at(form, g, coarse, atlas, s, parts, brick, top, clear, p)
     let n = normalize(here.xyz)
-    let skin = look.skin(Place { world: p, rest: p, chart: None, normal: n })
+    let skin = Skin { albedo: worn_at(look, g, coarse, albedo, s, brick, top, p, n), line: 1.0, metal: 0.0, rim: false, emits: vec3(0.0) }
     var lit = worn(light, skin, p, n, -d, STILL, reach: sun_reach(light, p))
     if (g.debug & 512) != 0 {
         // (To see what a pixel found: red, no facing where it stopped; else its facing, and in
@@ -904,7 +976,7 @@ pub fn marched_true<S: Parted, L: Look>(
         if dot(lean, lean) > 1.0e-8 {
             // (Two of the pixel's footprints on: the form's own facing needs no cell's width.)
             let ahead = 2.0 * px * at
-            let on = asked_at(form, g, coarse, parts, brick, top, clear, p + d * ahead)
+            let on = asked_at(form, g, coarse, atlas, s, parts, brick, top, clear, p + d * ahead)
             if dot(on.xyz, on.xyz) > 0.0 {
                 let bend = (dot(normalize(on.xyz), d) + nv) / ahead
                 if bend > 1.0e-6 {
@@ -942,6 +1014,7 @@ pub fn scouted_true<S: Parted, L: Look>(
     g: Grid,
     coarse: Texture3d<Rg32Uint>,
     atlas: Texture3d<Rgba16Float>,
+    albedo: Texture3d<Rgba8>,
     s: Sampler,
     parts: [u32],
     rate: f32,
@@ -958,12 +1031,13 @@ pub fn scouted_true<S: Parted, L: Look>(
     let clear = vec2(CLEAR_OF * brick, -CLEAR_OF * brick)
     let r = reached(form, g, coarse, atlas, s, parts, brick, top, clear, eye.at, d, from: span.x, to: span.y, px: foot, near: max(2.0, TRUE_NEAR * g.cell / (foot * span.x)), own: own, band: 0.0)
     if !r.met {
-        return vec4(-r.last, if r.least < SCOUT_NEAR * foot * r.least_t { 1.0 } else { 0.0 }, 0.0, r.near)
+        // (Near by the form's value over its steepness, which is no farther than its surface.)
+        return vec4(-r.last, if r.least < SCOUT_NEAR * foot * r.least_t * (if g.cached == 1 { 1.0 } else { g.steep }) { 1.0 } else { 0.0 }, 0.0, r.near)
     }
     let p = eye.at + d * r.t
-    let here = asked_at(form, g, coarse, parts, brick, top, clear, p)
+    let here = asked_at(form, g, coarse, atlas, s, parts, brick, top, clear, p)
     let n = normalize(here.xyz)
-    let a = look.skin(Place { world: p, rest: p, chart: None, normal: n }).albedo
+    let a = worn_at(look, g, coarse, albedo, s, brick, top, p, n)
     vec4(r.t, faced(n), rooted(a), if r.near > 0.0 { min(r.near, r.t) } else { r.t })
 }
 
@@ -975,6 +1049,9 @@ fn laid_holds_true<S: Parted, L: Look>(
     look: L,
     g: Grid,
     coarse: Texture3d<Rg32Uint>,
+    atlas: Texture3d<Rgba16Float>,
+    albedo: Texture3d<Rgba8>,
+    s: Sampler,
     parts: [u32],
     brick: f32,
     top: vec3,
@@ -986,13 +1063,15 @@ fn laid_holds_true<S: Parted, L: Look>(
 ) -> u32 {
     let d = eye.ray(at)
     let p = eye.at + d * t
-    let v = asked_at(form, g, coarse, parts, brick, top, clear, p)
-    if dot(v.xyz, v.xyz) == 0.0 || abs(v.w) > SHEET * eye.pixel() * t {
+    let v = asked_at(form, g, coarse, atlas, s, parts, brick, top, clear, p)
+    // (How far off the surface the place is: the form's value over its gradient's length.)
+    let steep = length(v.xyz)
+    if steep == 0.0 || abs(v.w) > SHEET * eye.pixel() * t * steep {
         return 2
     }
-    let n = normalize(v.xyz)
-    let on = p + d * (v.w / max(-dot(n, d), 0.25))
-    let a = look.skin(Place { world: on, rest: on, chart: None, normal: n }).albedo
+    let n = v.xyz / steep
+    let on = p + d * (v.w / steep / max(-dot(n, d), 0.25))
+    let a = worn_at(look, g, coarse, albedo, s, brick, top, on, n)
     if apart(lit_at(light, on, n, a, d), c, tol) { 1 } else { 0 }
 }
 
@@ -1005,6 +1084,9 @@ fn side_holds_true<S: Parted, L: Look, P: Paint>(
     look: L,
     g: Grid,
     coarse: Texture3d<Rg32Uint>,
+    atlas: Texture3d<Rgba16Float>,
+    albedo: Texture3d<Rgba8>,
+    s: Sampler,
     parts: [u32],
     brick: f32,
     top: vec3,
@@ -1017,7 +1099,7 @@ fn side_holds_true<S: Parted, L: Look, P: Paint>(
     tol: f32,
 ) -> u32 {
     if ea.x > 0.0 && eb.x > 0.0 {
-        return laid_holds_true(eye, light, form, look, g, coarse, parts, brick, top, clear, at, 0.5 * (ea.x + eb.x), 0.5 * (ca + cb), tol)
+        return laid_holds_true(eye, light, form, look, g, coarse, atlas, albedo, s, parts, brick, top, clear, at, 0.5 * (ea.x + eb.x), 0.5 * (ca + cb), tol)
     }
     if ea.x > 0.0 || eb.x > 0.0 || close_by(ea) || close_by(eb) {
         return 2
@@ -1035,6 +1117,9 @@ fn checked_true<S: Parted, L: Look, P: Paint>(
     look: L,
     g: Grid,
     coarse: Texture3d<Rg32Uint>,
+    atlas: Texture3d<Rgba16Float>,
+    albedo: Texture3d<Rgba8>,
+    s: Sampler,
     parts: [u32],
     scout: Texture<Rgba32Float>,
     glow: Texture<Rgba16Float>,
@@ -1060,15 +1145,15 @@ fn checked_true<S: Parted, L: Look, P: Paint>(
     let c01 = glow.load(id.x, y1).xyz
     let c11 = glow.load(x1, y1).xyz
     let o = vec2(f32(id.x), f32(id.y)) * rate
-    let across = side_holds_true(eye, light, sky, form, look, g, coarse, parts, brick, top, clear, o + vec2(0.5, 0.0) * rate, e00, e10, c00, c10, tol)
-    let down = side_holds_true(eye, light, sky, form, look, g, coarse, parts, brick, top, clear, o + vec2(0.0, 0.5) * rate, e00, e01, c00, c01, tol)
+    let across = side_holds_true(eye, light, sky, form, look, g, coarse, atlas, albedo, s, parts, brick, top, clear, o + vec2(0.5, 0.0) * rate, e00, e10, c00, c10, tol)
+    let down = side_holds_true(eye, light, sky, form, look, g, coarse, atlas, albedo, s, parts, brick, top, clear, o + vec2(0.0, 0.5) * rate, e00, e01, c00, c01, tol)
     let mid = o + vec2(0.5, 0.5) * rate
     let mean = 0.25 * (c00 + c10 + c01 + c11)
     let met = (if e00.x > 0.0 { 1 } else { 0 }) + (if e10.x > 0.0 { 1 } else { 0 }) + (if e01.x > 0.0 { 1 } else { 0 }) + (if e11.x > 0.0 { 1 } else { 0 })
     let near = close_by(e00) || close_by(e10) || close_by(e01) || close_by(e11)
     var middle: u32 = 2
     if met == 4 {
-        middle = laid_holds_true(eye, light, form, look, g, coarse, parts, brick, top, clear, mid, 0.25 * (e00.x + e10.x + e01.x + e11.x), mean, tol)
+        middle = laid_holds_true(eye, light, form, look, g, coarse, atlas, albedo, s, parts, brick, top, clear, mid, 0.25 * (e00.x + e10.x + e01.x + e11.x), mean, tol)
     } else if met == 0 && !near {
         middle = if apart(painted(eye, sky, eye.ray(mid)), mean, tol) { 1 } else { 0 }
     }
@@ -1080,13 +1165,13 @@ fn checked_true<S: Parted, L: Look, P: Paint>(
 /// facing, by the form itself asked a pixel across and a pixel down. What the frame's lighting
 /// needs to spread a tone's edge over the pixel it crosses (`form::shade::Steps`): without it
 /// every edge between two tones steps from one pixel to the next.
-fn steps_on<S: Parted>(eye: Eye, form: S, g: Grid, coarse: Texture3d<Rg32Uint>, parts: [u32], brick: f32, top: vec3, clear: vec2, p: vec3, n: vec3, d: vec3, t: f32) -> Steps {
+fn steps_on<S: Parted>(eye: Eye, form: S, g: Grid, coarse: Texture3d<Rg32Uint>, atlas: Texture3d<Rgba16Float>, s: Sampler, parts: [u32], brick: f32, top: vec3, clear: vec2, p: vec3, n: vec3, d: vec3, t: f32) -> Steps {
     let wide = eye.pixel() * t
     let toward = min(dot(n, d), -0.05)
     let across = (eye.right - d * (dot(n, eye.right) / toward)) * wide
     let down = (d * (dot(n, eye.up) / toward) - eye.up) * wide
-    let a = asked_at(form, g, coarse, parts, brick, top, clear, p + across)
-    let b = asked_at(form, g, coarse, parts, brick, top, clear, p + down)
+    let a = asked_at(form, g, coarse, atlas, s, parts, brick, top, clear, p + across)
+    let b = asked_at(form, g, coarse, atlas, s, parts, brick, top, clear, p + down)
     Steps {
         across,
         down,
@@ -1108,6 +1193,9 @@ pub fn shaded_true<S: Parted, L: Look>(
     look: L,
     g: Grid,
     coarse: Texture3d<Rg32Uint>,
+    atlas: Texture3d<Rgba16Float>,
+    albedo: Texture3d<Rgba8>,
+    s: Sampler,
     parts: [u32],
     display: u32,
 ) -> vec4 {
@@ -1118,14 +1206,15 @@ pub fn shaded_true<S: Parted, L: Look>(
     var a = f.albedo
     var p = f.world
     let d = normalize(f.world - eye.at)
-    let v = asked_at(form, g, coarse, parts, brick, top, clear, f.world)
-    if dot(v.xyz, v.xyz) > 0.0 {
-        n = normalize(v.xyz)
-        p = f.world + d * (v.w / max(-dot(n, d), 0.25))
-        a = look.skin(Place { world: p, rest: p, chart: None, normal: n }).albedo
+    let v = asked_at(form, g, coarse, atlas, s, parts, brick, top, clear, f.world)
+    let steep = length(v.xyz)
+    if steep > 0.0 {
+        n = v.xyz / steep
+        p = f.world + d * (v.w / steep / max(-dot(n, d), 0.25))
+        a = worn_at(look, g, coarse, albedo, s, brick, top, p, n)
     }
     let skin = Skin { albedo: a, line: 1.0, metal: 0.0, rim: false, emits: vec3(0.0) }
-    let steps = steps_on(eye, form, g, coarse, parts, brick, top, clear, p, n, d, length(p - eye.at))
+    let steps = steps_on(eye, form, g, coarse, atlas, s, parts, brick, top, clear, p, n, d, length(p - eye.at))
     out_as(style, worn(light, skin, p, n, -d, steps, reach: sun_reach(light, p)).colour, display)
 }
 
@@ -1147,6 +1236,7 @@ fn sheet_true<S: Parted, L: Look>(
     g: Grid,
     coarse: Texture3d<Rg32Uint>,
     atlas: Texture3d<Rgba16Float>,
+    albedo: Texture3d<Rgba8>,
     s: Sampler,
     parts: [u32],
     brick: f32,
@@ -1165,7 +1255,7 @@ fn sheet_true<S: Parted, L: Look>(
     }
     let t = r.t
     let p0 = eye.at + d * t
-    let here = asked_at(form, g, coarse, parts, brick, top, clear, p0)
+    let here = asked_at(form, g, coarse, atlas, s, parts, brick, top, clear, p0)
     if dot(here.xyz, here.xyz) == 0.0 {
         return none
     }
@@ -1180,7 +1270,7 @@ fn sheet_true<S: Parted, L: Look>(
         let nv = -dot(n, d)
         if nv < FOLD_NEAR && dot(lean, lean) > 1.0e-8 {
             let ahead = 2.0 * px * t
-            let on = asked_at(form, g, coarse, parts, brick, top, clear, p0 + d * ahead)
+            let on = asked_at(form, g, coarse, atlas, s, parts, brick, top, clear, p0 + d * ahead)
             if dot(on.xyz, on.xyz) > 0.0 {
                 let bend = (dot(normalize(on.xyz), d) + nv) / ahead
                 if bend > 1.0e-6 {
@@ -1202,11 +1292,11 @@ fn sheet_true<S: Parted, L: Look>(
     if cover <= 0.0 {
         return Sheet { colour: vec3(0.0), cover: 0.0, t, met: r.met, out, at: p, facing: n }
     }
-    let a = look.skin(Place { world: p, rest: p, chart: None, normal: n }).albedo
+    let a = worn_at(look, g, coarse, albedo, s, brick, top, p, n)
     let skin = Skin { albedo: a, line: 1.0, metal: 0.0, rim: false, emits: vec3(0.0) }
     var steps = STILL
     if band > 0.0 {
-        steps = steps_on(eye, form, g, coarse, parts, brick, top, clear, p, n, d, t)
+        steps = steps_on(eye, form, g, coarse, atlas, s, parts, brick, top, clear, p, n, d, t)
     }
     Sheet { colour: worn(light, skin, p, n, -d, steps, reach: sun_reach(light, p)).colour, cover, t, met: r.met, out, at: p, facing: n }
 }
@@ -1261,6 +1351,7 @@ pub fn edged_true<S: Parted, L: Look, P: Paint>(
     g: Grid,
     coarse: Texture3d<Rg32Uint>,
     atlas: Texture3d<Rgba16Float>,
+    albedo: Texture3d<Rgba8>,
     s: Sampler,
     parts: [u32],
     rate: f32,
@@ -1281,7 +1372,7 @@ pub fn edged_true<S: Parted, L: Look, P: Paint>(
         // pixel plainly of sky or plainly of one sheet a short way. The pixels of a block run
         // together and wait for the slowest, so a short way for some saves nothing unless they
         // are drawn apart.)
-        let near = sheet_true(eye, light, form, look, g, coarse, atlas, s, parts, brick, top, clear, d, from: ahead, to: to, band: SHARED)
+        let near = sheet_true(eye, light, form, look, g, coarse, atlas, albedo, s, parts, brick, top, clear, d, from: ahead, to: to, band: SHARED)
         if near.cover < 1.0 && near.t < to && (g.debug & 32768) == 0 {
             // The rest of the pixel: along this ray past the sheet, where it clears it; where it
             // enters it, along the ray a pixel and a half out past its outline. (Tried: taking
@@ -1294,7 +1385,7 @@ pub fn edged_true<S: Parted, L: Look, P: Paint>(
                 past = eye.ray(pixel.position.xy + near.out * 1.5)
                 from = max(near.t - 0.5 * brick, span.x)
             }
-            let far = sheet_true(eye, light, form, look, g, coarse, atlas, s, parts, brick, top, clear, past, from: from, to: to, band: 0.0)
+            let far = sheet_true(eye, light, form, look, g, coarse, atlas, albedo, s, parts, brick, top, clear, past, from: from, to: to, band: 0.0)
             if far.met {
                 colour = far.colour
             }
@@ -1326,6 +1417,100 @@ pub fn moving<S: Solid>(form: S, cell: f32, most: u32, half: vec3) -> Volume<S> 
 }
 
 impl<S: Parted> Volume<S> {
+    /// Some of the deposit of a form that keeps still, a few dispatches a frame until it is
+    /// whole (`filled`): the coarse grid and each kept brick's parts in bands, the rings, the
+    /// count of bricks read back and the atlas made to hold them, then every texel in bands
+    /// (`deposited_parts`) and the atlas put in its textures. The same deposit a moving form
+    /// takes every frame (`redeposit`), spread over frames because a still form may be large:
+    /// nothing reads it until it is whole. It wears `look`, asked once here (`g.stored`). With
+    /// `cached`, an ask of the form is answered from these cells from then on, not by its
+    /// function (`g.cached`): for a form too dear to ask at every pixel.
+    pub fn fill_parts<L: Look>(mut self, look: L, cached: bool) {
+        self.grid.stored = 1
+        self.grid.cached = if cached { 1 } else { 0 }
+        if self.stage == 0 && self.ring == 0 {
+            label("coarse")
+            if self.parts.len() != self.total {
+                self.parts = buffer(self.total)
+            }
+            for _b in 0..BANDS_A_FRAME {
+                if self.cursor < self.total {
+                    dispatch(
+                        coarsed_parts.bind(self.form, g: self.grid, first: self.cursor, out: mut self.raw, parts: mut self.parts, bricks: mut self.bricks),
+                        over: COARSE_BAND,
+                    )
+                    self.cursor += COARSE_BAND
+                }
+            }
+            if self.cursor >= self.total && self.ring == 0 {
+                self.ring = 1
+                self.cursor = 0
+            }
+            return
+        }
+        if self.stage == 0 {
+            label("spread")
+            for _b in 0..BANDS_A_FRAME {
+                if self.cursor < self.total {
+                    dispatch(spread.bind(g: self.grid, ring: self.ring, first: self.cursor, out: mut self.raw), over: BAND)
+                    self.cursor += BAND
+                }
+            }
+            if self.cursor >= self.total {
+                self.ring += 1
+                self.cursor = 0
+            }
+            if self.ring > RINGS {
+                dispatch(coarse_copied.bind(raw: self.raw.items(), g: self.grid, out: mut self.coarse), over: self.coarse)
+                self.counted = Some(read(self.bricks.count()))
+                self.stage = 1
+            }
+            return
+        }
+        if self.stage == 1 {
+            match mut self.counted {
+                Some(p) => match p.poll() {
+                    Some(Ok(v)) => {
+                        let n = min(v[0], MOST_BRICKS)
+                        let layers = (n + ROW * ROW - 1) / (ROW * ROW)
+                        let size = vec3u(ROW * BS, ROW * BS, max(layers, 1) * BS)
+                        self.atlas = texture3d(width: size.x, height: size.y, depth: size.z)
+                        self.albedo = texture3d(width: size.x, height: size.y, depth: size.z)
+                        self.grid.size.w = n
+                        self.grid.atlas = vec3(f32(size.x), f32(size.y), f32(size.z))
+                        self.fine = buffer(max(3 * n * BS * BS * BS, 3))
+                        self.cursor = 0
+                        let mb = f32(size.x * size.y * size.z) * 12.0 / 1048576.0
+                        print(f"volume: {n} bricks kept of {self.total} ({self.grid.cell * f32(B)} m each, cells {self.grid.cell} m); atlas {size.x} x {size.y} x {size.z}, {mb} MB")
+                        self.counted = None
+                        self.stage = 2
+                    },
+                    _ => {},
+                },
+                None => {},
+            }
+            return
+        }
+        if self.stage == 2 {
+            label("deposited")
+            let texels = self.grid.size.w * BS * BS * BS
+            for _b in 0..DEPOSITS_A_FRAME {
+                if self.cursor < texels {
+                    dispatch(
+                        deposited_parts.bind(self.form, look: look, g: self.grid, bricks: self.bricks.items(), parts: self.parts.items(), first: self.cursor, out: mut self.fine),
+                        over: DEPOSIT_BAND,
+                    )
+                    self.cursor += DEPOSIT_BAND
+                }
+            }
+            if self.cursor >= texels {
+                dispatch(atlas_copied.bind(raw: self.fine.items(), g: self.grid, out: mut self.atlas, albedo: mut self.albedo), over: self.atlas)
+                self.fine = buffer(3)
+                self.stage = 3
+            }
+        }
+    }
+
     /// The volume of a form that moves (`moving`), deposited again as `form` is now: the whole
     /// of it, in this frame.
     pub fn redeposit(mut self, form: S) {
@@ -1338,7 +1523,7 @@ impl<S: Parted> Volume<S> {
         self.grid.steep = max(form.lipschitz(brick), 1.0)
         label("mover coarse")
         self.bricks.clear()
-        dispatch(coarsed_parts.bind(self.form, g: self.grid, out: mut self.raw, parts: mut self.parts, bricks: mut self.bricks), over: n)
+        dispatch(coarsed_parts.bind(self.form, g: self.grid, first: 0, out: mut self.raw, parts: mut self.parts, bricks: mut self.bricks), over: n)
         for ring in 0..MOVING_RINGS {
             dispatch(spread.bind(g: self.grid, ring: ring + 1, first: 0, out: mut self.raw), over: n)
         }
@@ -1381,7 +1566,7 @@ impl<S: Parted> Volume<S> {
         draw(
             p,
             cover,
-            scouted_true.bind(eye: eye, form: self.form, look: look, g: self.grid, coarse: self.coarse, atlas: self.atlas, s: self.s, parts: self.parts.items(), rate: f32(rate)),
+            scouted_true.bind(eye: eye, form: self.form, look: look, g: self.grid, coarse: self.coarse, atlas: self.atlas, albedo: self.albedo, s: self.s, parts: self.parts.items(), rate: f32(rate)),
             vertices: 3,
         )
         p.end()
@@ -1400,6 +1585,9 @@ impl<S: Parted> Volume<S> {
                 look: look,
                 g: self.grid,
                 coarse: self.coarse,
+                atlas: self.atlas,
+                albedo: self.albedo,
+                s: self.s,
                 parts: self.parts.items(),
                 scout: self.scout,
                 glow: self.glow,
@@ -1438,7 +1626,7 @@ impl<S: Parted> Volume<S> {
         draw(
             pass,
             patch_corner.bind(blocks: self.shades.items(), eye: eye, scout: self.scout, rate: f32(rate)),
-            shaded_true.bind(eye: eye, light: light, style: style, form: self.form, look: look, g: self.grid, coarse: self.coarse, parts: self.parts.items(), display: shows),
+            shaded_true.bind(eye: eye, light: light, style: style, form: self.form, look: look, g: self.grid, coarse: self.coarse, atlas: self.atlas, albedo: self.albedo, s: self.s, parts: self.parts.items(), display: shows),
             indirect: self.kinds_drawn.span(start: 1, count: 1),
         )
         }
@@ -1462,6 +1650,7 @@ impl<S: Parted> Volume<S> {
                 g: self.grid,
                 coarse: self.coarse,
                 atlas: self.atlas,
+                albedo: self.albedo,
                 s: self.s,
                 parts: self.parts.items(),
                 rate: f32(rate),
@@ -1514,6 +1703,7 @@ impl<S: Parted> Volume<S> {
                 g: self.grid,
                 coarse: self.coarse,
                 atlas: self.atlas,
+                albedo: self.albedo,
                 s: self.s,
                 parts: self.parts.items(),
                 body: body,
