@@ -1304,6 +1304,15 @@ impl CommandEncoder {
     }
 }
 
+/// An encoder dropped unfinished (its recording failed part way) ends its open blit encoder:
+/// Metal asserts on an encoder released without `endEncoding`, which ended the whole process
+/// (the GPU tests' run stopped at the first test whose recording failed after a copy).
+impl Drop for CommandEncoder {
+    fn drop(&mut self) {
+        self.end_blit();
+    }
+}
+
 fn size(e: [u32; 3]) -> MTLSize {
     MTLSize {
         width: e[0] as NSUInteger,
