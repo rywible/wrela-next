@@ -1663,6 +1663,35 @@ fn split_locals(m: &Module, f: &mut Function, how: Split) {
                     }
                 };
         }
+        // On the GPU, a local read whole whose value goes anywhere but to have its fields read
+        // stays whole: a split local read whole is built again from its fields at each read, and
+        // a struct passed on whole (to a function that stays a call: a ray's march's distance,
+        // each step) was built a field at a time inside the loop (the engine's picture, 45% slower
+        // on the M4 with 630217c's split). Read whole only to read its fields, it splits, and
+        // `forward_extracts` reads each where it lies.
+        if how == Split::Gpu {
+            let mut whole: HashMap<ValueId, LocalId> = HashMap::new();
+            visit::walk(&f.body, &mut |s| {
+                if let Stmt::Let(v, Expr::Load(p)) = s
+                    && let Some(l) = p.root_local()
+                    && p.path.is_empty()
+                {
+                    whole.insert(*v, l);
+                }
+            });
+            if !whole.is_empty() {
+                visit::walk(&f.body, &mut |s| {
+                    if let Stmt::Let(_, Expr::Extract(..)) = s {
+                        return;
+                    }
+                    s.for_each_value(&mut |v| {
+                        if let Some(l) = whole.get(&v) {
+                            split[l.index()] = false;
+                        }
+                    });
+                });
+            }
+        }
         // A local whose place goes anywhere but a load or a store stays whole, as does a vector
         // indexed by a value.
         visit::walk(&f.body, &mut |s| match s {
@@ -3399,6 +3428,45 @@ mod tests {
             f.body
         );
         let _ = img;
+    }
+
+    /// On the GPU, a large struct local read whole and passed on whole (to a function that
+    /// stays a call) stays one local: split, it was built again from its fields at each read
+    /// (the engine's picture, 2026-11-18). Read whole only to read its fields, it splits.
+    #[test]
+    fn a_gpu_struct_passed_on_whole_stays_whole() {
+        let mut m = Module::default();
+        let v4 = m.types.vector(4);
+        let body = m.types.intern(TypeDef::Struct {
+            name: "Body".into(),
+            fields: (0..5).map(|k| (format!("f{k}"), v4)).collect(),
+        });
+        let locals_after = |m: &Module, passed: bool| {
+            let mut f = Function::new("f", Vec::new(), Some(v4));
+            let l = f.new_local("b", body);
+            let (z, s, back, out) =
+                (f.new_value(v4), f.new_value(body), f.new_value(body), f.new_value(v4));
+            let read = if passed {
+                Expr::Call(FuncId(0), vec![Arg::Value(back)])
+            } else {
+                Expr::Extract(back, 2)
+            };
+            f.body = vec![
+                Stmt::Let(z, Expr::Zero(v4)),
+                Stmt::Let(s, Expr::Construct(body, vec![z, z, z, z, z])),
+                Stmt::Store(Place::local(l), s),
+                Stmt::Store(Place::local(l).with(Proj::Field(1)), z),
+                Stmt::Let(back, Expr::Load(Place::local(l))),
+                Stmt::Let(out, read),
+                Stmt::Return(Some(out)),
+            ];
+            split_locals(m, &mut f, Split::Gpu);
+            let mut mentions = vec![0u32; f.locals.len()];
+            visit::count_local_mentions(&f.body, &mut mentions);
+            mentions.iter().filter(|&&n| n > 0).count()
+        };
+        assert_eq!(locals_after(&m, true), 1, "passed on whole: one local");
+        assert!(locals_after(&m, false) > 1, "read for a field: split");
     }
 
     /// A value only one branch of a later `if` uses is computed in that branch; one both use,
