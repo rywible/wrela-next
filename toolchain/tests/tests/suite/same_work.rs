@@ -1,8 +1,12 @@
-//! How often GPU code runs (language.md §18.13, compiler/ir/src/const_fold.rs and same.rs): a
-//! value computed only from constants is computed as the shader is built, and a shipped build's
-//! GPU code that computes a value the same for every invocation, at more than 256 work, is E0712.
+//! How often GPU code runs (language.md §18.13, compiler/ir/src/const_fold.rs, same.rs and
+//! hoist.rs): a value computed only from constants is computed as the shader is built; a value
+//! the same for every invocation, at more than 256 work, computed from the uniform block (and a
+//! counted loop's counter) is computed once a command on the CPU; and a shipped build's GPU code
+//! that computes one it can't move, from a buffer read at a same place, is E0712.
 
 use crate::{first_frame_buffers, scratch, write_package};
+use wrela_host::{Host, Value};
+use wrela_tests::{one_u32, page};
 
 /// The folded cases (toolchain/tests/folded) agree with the same math the GPU does, within its
 /// error, and the folded kernel's shader computes none of it.
@@ -100,14 +104,53 @@ fn e0712(dir: &std::path::Path) -> Vec<String> {
 }
 
 #[test]
-fn work_every_invocation_redoes_alike_is_e0712() {
-    let dir = kernel("same_uniform", 64, &chain("g.u"));
+fn alike_work_the_cpu_can_do_moves_there_and_the_rest_is_e0712() {
+    // From the uniform block: the CPU computes it once a command, and the shader reads it.
+    assert_eq!(e0712(&kernel("same_uniform", 64, &chain("g.u"))), Vec::<String>::new());
+    // From a buffer read at a same place: it can't move, and every invocation redoes it.
+    let dir = table_kernel("same_buffer", &chain("w[3]"));
     let msgs = e0712(&dir);
     assert_eq!(msgs.len(), 1, "{msgs:?}");
     assert!(msgs[0].contains("every invocation computes this again"), "{msgs:?}");
     // A check reports it as no error: only a shipped build is held to it.
     let checked = wrela_driver::check_pipelines(&dir);
     assert!(!checked.has_errors(), "{:?}", checked.diagnostics);
+}
+
+/// The hoisted fixture (toolchain/tests/hoisted): its shipped build moves its alike work onto
+/// the CPU, so it builds with no E0712; `chained`'s shader computes no `sin` (40 rounds of it
+/// moved), and `parted`'s reads its cones' axes from arrays in its uniform block, a pass each.
+#[test]
+fn the_hoisted_fixture_ships_with_its_alike_work_on_the_cpu() {
+    let pkg = wrela_tests::repo_root().join("toolchain/tests/hoisted");
+    assert_eq!(e0712(&pkg), Vec::<String>::new());
+    let built = wrela_tests::build_for(&pkg, wrela_abi::Target::Metal).expect("builds");
+    let file =
+        |name: &str| built.files.iter().find(|(n, _)| n == name).map(|(_, b)| b).expect(name);
+    let manifest =
+        wrela_abi::Manifest::parse(&String::from_utf8_lossy(file("manifest.json"))).expect("valid");
+    let msl = |k: &str| {
+        let p = manifest.pipelines.iter().find(|p| p.name == k).expect(k);
+        String::from_utf8_lossy(file(&p.shader)).into_owned()
+    };
+    assert!(!msl("chained").contains("sin("), "{}", msl("chained"));
+    assert!(msl("parted").contains("hoisted0.inner["), "{}", msl("parted"));
+}
+
+/// On the GPU, what the hoisted fixture's kernels compute with their alike work done on the CPU
+/// is what the CPU computes, within 1e-4 relatively.
+#[test]
+#[ignore = "needs a GPU"]
+fn hoisted_work_gives_what_the_cpu_does() {
+    let (dir, _) = page("toolchain/tests/hoisted", "hoisted-native");
+    let mut host = Host::load(&dir).expect("load");
+    let times = crate::frame_times(4);
+    host.run_frames(&times, 16, 16).expect("run");
+    for (k, name) in ["chained", "parted"].iter().enumerate() {
+        let arg = [Value::I32(k as i32)];
+        assert_eq!(one_u32(&mut host, "arrived", &arg), 256, "{name}'s results arrived");
+        assert_eq!(one_u32(&mut host, "matched", &arg), 256, "{name}'s are the CPU's");
+    }
 }
 
 #[test]

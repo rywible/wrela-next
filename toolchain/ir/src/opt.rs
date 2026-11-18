@@ -480,7 +480,7 @@ fn collapse_rebuilds(f: &mut Function) {
 /// Gives a pure expression computed twice, where the first is visible, the first's value: the
 /// same constant made again, or the same product of an interval's corners. Loads and calls
 /// aren't merged, nor is anything with an effect.
-fn cse(f: &mut Function) {
+pub(crate) fn cse(f: &mut Function) {
     let mut rename: Vec<Option<ValueId>> = vec![None; f.values.len()];
     let mut body = std::mem::take(&mut f.body);
     cse_block(&mut body, &mut rename, &mut HashMap::new());
@@ -2672,7 +2672,7 @@ fn forward_block(
 /// needs its operands and the locals it loads, and a local needs what's stored to it. One walk
 /// collects that, a worklist follows it, and one sweep removes the rest, however long a dead
 /// chain is (through locals, too).
-fn dce(f: &mut Function) {
+pub(crate) fn dce(f: &mut Function) {
     #[derive(Clone, Copy)]
     enum Need {
         Value(ValueId),

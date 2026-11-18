@@ -295,6 +295,9 @@ pub(crate) struct Cx<'a> {
     /// A lifted build's literals (§23): only the program's own modules read them, never the
     /// modules that compute constants or run tests.
     pub lift: Option<&'a LiftTable>,
+    /// Whether the pipeline being lowered moves its same work onto the CPU (`ir::hoist`): not a
+    /// stand-in's pair, whose commands both must bind alike.
+    pub hoist: bool,
 }
 
 /// One target module being built: the CPU module by default.
@@ -543,7 +546,10 @@ fn lower_in(
         let (key, iface) = cx.pipelines[i].clone();
         let sites = cx.pipeline_sites[i].clone();
         let targets = cx.pipeline_targets[i].clone();
-        if let Some(mut out) = gpu::lower_pipeline(&mut cx, &key, iface, sites, targets) {
+        cx.hoist = !standins.iter().any(|&(a, b)| a as usize == i || b as usize == i);
+        let out = gpu::lower_pipeline(&mut cx, &key, iface, sites, targets);
+        cx.hoist = false;
+        if let Some(mut out) = out {
             if data.debug && cx.emit {
                 gpu::debug_checks(&mut cx, &mut out, pipelines.len() as u32 + 1);
             }
@@ -554,6 +560,25 @@ fn lower_in(
     if pipelines.len() == cx.pipelines.len() {
         for &(i, j) in &standins {
             gpu::match_standin(&mut cx, &mut pipelines, i as usize, j as usize);
+        }
+    }
+    // What a pipeline moved onto the CPU (`ir::hoist`), computed where its commands are
+    // recorded; then std's math for it, as for the rest of the CPU code.
+    if emit && !wrela_diag::has_errors(&cx.diags) && pipelines.iter().any(|p| !p.hoisted.is_empty())
+    {
+        for (i, p) in pipelines.iter().enumerate() {
+            if !p.hoisted.is_empty() {
+                gpu::record_hoisted(&mut cx, &mut cpu.m, i as u32, &p.module.types, &p.hoisted);
+            }
+        }
+        // Inlining renumbered the module's functions, so the instances it knew are stale: std's
+        // math for this code is instantiated afresh, and the map put back for what reads it.
+        let known = std::mem::take(&mut cpu.instances);
+        rewrite_cpu_math(&mut cx, &mut cpu);
+        cx.drain(&mut cpu);
+        cpu.instances = known;
+        if let Err(e) = ir::verify(&cpu.m) {
+            cx.err(Diagnostic::internal(format!("the CPU module's IR is malformed: {e}")));
         }
     }
     for (f, substs) in &roots.gpu_checks {
@@ -647,6 +672,7 @@ impl<'a> Cx<'a> {
             pipeline_sites: Vec::new(),
             pipeline_targets: Vec::new(),
             lift: None,
+            hoist: false,
         }
     }
 

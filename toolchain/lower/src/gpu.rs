@@ -119,6 +119,9 @@ pub struct PipelineOut {
     pub standin: Option<u32>,
     /// It's another pipeline's stand-in.
     pub stands_in: bool,
+    /// The values its same work moved onto the CPU (`ir::hoist`, §18.13): its uniform block's
+    /// last fields, which the CPU computes where it records each command.
+    pub hoisted: Vec<ir::hoist::Hoisted>,
 }
 
 /// What a GPU module is for, while it's lowered.
@@ -140,6 +143,8 @@ pub(crate) struct GpuCx {
     pub domain_field: Option<u32>,
     /// With an origin: the block's field holding it, which each `GlobalId` adds.
     pub origin_field: Option<u32>,
+    /// The values its same work moved onto the CPU (`ir::hoist`): its block's last fields.
+    pub hoisted: Vec<ir::hoist::Hoisted>,
     /// A lifted build's literal table (§23): the storage buffer every pipeline binds last.
     pub literals: Option<ir::ResourceId>,
     /// A pipeline's `const` parameters' values, in the interface's order (§18.1): each folded
@@ -166,6 +171,7 @@ impl GpuCx {
             uniform_fields: Vec::new(),
             domain_field: None,
             origin_field: None,
+            hoisted: Vec::new(),
             literals: None,
             consts: None,
         }
@@ -3100,6 +3106,8 @@ fn lower_compute(cx: &mut Cx, iface: Rc<Interface>, consts: Vec<ir::Const>) -> O
         inputs,
     });
     let (work, unbounded, weight, same, few, costly, copies) = verify(cx, &mut mb, name)?;
+    let uniform = hoisted_block(cx, &mut mb, uniform);
+    let hoisted = mb.gpu.as_mut().map(|g| std::mem::take(&mut g.hoisted)).unwrap_or_default();
     non_filtering(&mb.m, &mut bindings);
     let instances = mb.fn_instances();
     Some(PipelineOut {
@@ -3128,6 +3136,7 @@ fn lower_compute(cx: &mut Cx, iface: Rc<Interface>, consts: Vec<ir::Const>) -> O
         copies,
         standin: None,
         stands_in: false,
+        hoisted,
     })
 }
 
@@ -3211,6 +3220,8 @@ fn lower_render(
     });
     let name = format!("{}_{}", ir::ident(&vdef.name), ir::ident(&fdef.name));
     let (work, unbounded, weight, same, few, costly, copies) = verify(cx, &mut mb, &name)?;
+    let uniform = hoisted_block(cx, &mut mb, uniform);
+    let hoisted = mb.gpu.as_mut().map(|g| std::mem::take(&mut g.hoisted)).unwrap_or_default();
     non_filtering(&mb.m, &mut bindings);
     let instances = mb.fn_instances();
     Some(PipelineOut {
@@ -3239,6 +3250,7 @@ fn lower_render(
         copies,
         standin: None,
         stands_in: false,
+        hoisted,
     })
 }
 
@@ -3689,6 +3701,7 @@ fn verify(cx: &mut Cx, mb: &mut ModuleBuilder, name: &str) -> Option<Counts> {
     if cx.emit {
         checked = checked
             .and_then(|()| ir::opt::flatten_gpu(&mut mb.m))
+            .map(|()| hoist_same(cx, mb))
             .and_then(|()| ir::gpu_memory::lay_out_gpu_memory(&mut mb.m))
             .and_then(|()| ir::verify(&mb.m));
         if checked.is_ok() {
@@ -3706,6 +3719,13 @@ fn verify(cx: &mut Cx, mb: &mut ModuleBuilder, name: &str) -> Option<Counts> {
         // The pipeline's weight is its WGSL's, as flattening writes it (§18.11).
         let mut flat = mb.m.clone();
         if ir::opt::flatten_gpu(&mut flat)
+            .map(|()| {
+                if cx.hoist
+                    && let Some(u) = mb.gpu.as_ref().and_then(|g| g.uniform)
+                {
+                    ir::hoist::hoist(&mut flat, u, MOST_SAME_WORK + 1);
+                }
+            })
             .and_then(|()| ir::gpu_memory::lay_out_gpu_memory(&mut flat))
             .is_ok()
         {
@@ -3732,8 +3752,260 @@ fn written_weight(m: &ir::Module) -> u64 {
 }
 
 /// The most work a shipped build's GPU code may do, each invocation again, to compute one value
-/// the same for every invocation (§18.13): E0712 past it.
+/// the same for every invocation (§18.13): E0712 past it. Work past it that the CPU can do as
+/// the GPU does moves there (`ir::hoist`); E0712 names what's left.
 pub const MOST_SAME_WORK: u64 = 256;
+
+/// Moves a flattened module's same work out of its invocations (`ir::hoist`), past
+/// [`MOST_SAME_WORK`]: the values it moves onto the CPU wait in `mb.gpu` for the pipeline.
+fn hoist_same(cx: &Cx, mb: &mut ModuleBuilder) {
+    if !cx.hoist {
+        return;
+    }
+    let Some(u) = mb.gpu.as_ref().and_then(|g| g.uniform) else { return };
+    let hoisted = ir::hoist::hoist(&mut mb.m, u, MOST_SAME_WORK + 1);
+    if let Some(g) = mb.gpu.as_mut() {
+        g.hoisted = hoisted;
+    }
+}
+
+/// A pipeline's uniform block once its module is laid out, with what `hoist_same` added: its
+/// size and space as `entry_module` says, from the block's type as the module holds it now.
+fn hoisted_block(
+    cx: &Cx,
+    mb: &mut ModuleBuilder,
+    uniform: Option<UniformOut>,
+) -> Option<UniformOut> {
+    let Some(mut out) = uniform else { return None };
+    let Some(g) = mb.gpu.as_ref() else { return Some(out) };
+    let Some(u) = g.uniform.filter(|_| !g.hoisted.is_empty()) else { return Some(out) };
+    let ty = mb.m.resources[u.index()].ty;
+    out.size = ir::layout::round_up(16, ir::layout::layout(&mb.m.types, ty).size);
+    let two_row_matrix =
+        cx.data.target == wrela_abi::Target::Vulkan && holds_two_row_matrix(&mb.m.types, ty);
+    out.storage =
+        !ir::layout::uniform_compatible(&mb.m.types, ty) || out.size > 65_536 || two_row_matrix;
+    mb.m.resources[u.index()].kind = ir::ResourceKind::Uniform { storage: out.storage };
+    Some(out)
+}
+
+/// Where CPU code records a command of pipeline `pipeline` (a dispatch or a draw), the values
+/// its same work moved onto the CPU (`hoisted`, in the GPU module's types `gpu`): each computed
+/// from the uniform block's values as the shader would, and the block made with them last.
+pub(crate) fn record_hoisted(
+    cx: &mut Cx,
+    cpu: &mut ir::Module,
+    pipeline: u32,
+    gpu: &ir::Types,
+    hoisted: &[ir::hoist::Hoisted],
+) {
+    for i in 0..cpu.functions.len() {
+        let mut f = std::mem::take(&mut cpu.functions[i]);
+        let mut body = std::mem::take(&mut f.body);
+        let mut failed = None;
+        ir::visit::expand(&mut body, &mut |s, out| {
+            let ir::Stmt::Eval(ir::Expr::Host(
+                ir::HostOp::Dispatch { pipeline: p, uniform: Some(t), .. }
+                | ir::HostOp::Draw { pipeline: p, uniform: Some(t), .. },
+                args,
+            )) = &s
+            else {
+                out.push(s);
+                return;
+            };
+            if *p != pipeline {
+                out.push(s);
+                return;
+            }
+            let (t, block) = (*t, *args.last().expect("a block"));
+            let ir::TypeDef::Struct { name, fields } = cpu.types.get(t).clone() else {
+                failed = Some("its uniform block isn't a struct");
+                out.push(s);
+                return;
+            };
+            if hoisted.first().is_some_and(|h| h.field as usize != fields.len()) {
+                failed = Some("its uniform block's fields aren't the shader's");
+                out.push(s);
+                return;
+            }
+            let mut vals: Vec<ir::ValueId> = (0..fields.len() as u32)
+                .map(|k| f.let_(out, fields[k as usize].1, ir::Expr::Extract(block, k)))
+                .collect();
+            let mut all = fields.clone();
+            for h in hoisted {
+                let v = match h.count {
+                    None => cpu_recipe(cpu, gpu, &mut f, out, block, t, &h.recipe, None),
+                    // An array over a loop's counter: each pass's value, as a vector of four.
+                    Some((start, end)) => (|| {
+                        let ir::TypeDef::Array(wide, _) = gpu.get(h.ty).clone() else {
+                            return None;
+                        };
+                        let wide = cpu_type(cpu, gpu, wide)?;
+                        let ir::TypeDef::Vector(s, _) = cpu.types.get(wide).clone() else {
+                            return None;
+                        };
+                        let scalar = cpu.types.intern(ir::TypeDef::Scalar(s));
+                        // The counter as the loop holds it: a `u32` or an `i32`.
+                        let counter = h.recipe.params.first()?.ty;
+                        let signed =
+                            matches!(gpu.get(counter), ir::TypeDef::Scalar(ir::Scalar::I32));
+                        let u = cpu_type(cpu, gpu, counter)?;
+                        let mut elems = Vec::new();
+                        for k in 0..end {
+                            if k < start {
+                                elems.push(f.let_(out, wide, ir::Expr::Zero(wide)));
+                                continue;
+                            }
+                            let k =
+                                if signed { ir::Const::I32(k as i32) } else { ir::Const::U32(k) };
+                            let c = f.let_(out, u, ir::Expr::Const(k));
+                            let x =
+                                cpu_recipe(cpu, gpu, &mut f, out, block, t, &h.recipe, Some(c))?;
+                            let n = match cpu.types.get(f.value_ty(x)) {
+                                ir::TypeDef::Vector(_, n) => u32::from(*n),
+                                _ => 1,
+                            };
+                            let zero = f.let_(out, scalar, ir::Expr::Zero(scalar));
+                            let parts = (0..4)
+                                .map(|j| match (j < n, n) {
+                                    (true, 1) => x,
+                                    (true, _) => f.let_(out, scalar, ir::Expr::Extract(x, j)),
+                                    (false, _) => zero,
+                                })
+                                .collect();
+                            elems.push(f.let_(out, wide, ir::Expr::Construct(wide, parts)));
+                        }
+                        let array = cpu.types.intern(ir::TypeDef::Array(wide, end));
+                        Some(f.let_(out, array, ir::Expr::Construct(array, elems)))
+                    })(),
+                };
+                let Some(v) = v else {
+                    failed = Some("a hoisted value's recipe doesn't read as CPU code");
+                    return;
+                };
+                all.push((format!("hoisted{}", all.len() - fields.len()), f.value_ty(v)));
+                vals.push(v);
+            }
+            let t2 = cpu.types.intern(ir::TypeDef::Struct { name, fields: all });
+            let made = f.let_(out, t2, ir::Expr::Construct(t2, vals));
+            let mut s = s;
+            if let ir::Stmt::Eval(ir::Expr::Host(
+                ir::HostOp::Dispatch { uniform, .. } | ir::HostOp::Draw { uniform, .. },
+                args,
+            )) = &mut s
+            {
+                *uniform = Some(t2);
+                *args.last_mut().expect("a block") = made;
+            }
+            out.push(s);
+        });
+        f.body = body;
+        cpu.functions[i] = f;
+        if let Some(why) = failed {
+            cx.err(Diagnostic::internal(format!("pipeline {pipeline}'s hoisted values: {why}")));
+            return;
+        }
+    }
+}
+
+/// `recipe` (a hoisted value's, in the GPU module's types `gpu`) as CPU code appended to `out`,
+/// its loads of the uniform block read from `block` (of the CPU's type `t`): its value.
+fn cpu_recipe(
+    cpu: &mut ir::Module,
+    gpu: &ir::Types,
+    f: &mut ir::Function,
+    out: &mut ir::Block,
+    block: ir::ValueId,
+    t: ir::TypeId,
+    recipe: &ir::Function,
+    counter: Option<ir::ValueId>,
+) -> Option<ir::ValueId> {
+    let mut map: std::collections::HashMap<ir::ValueId, ir::ValueId> = Default::default();
+    for s in &recipe.body {
+        match s {
+            ir::Stmt::Let(v, e) => {
+                let ty = cpu_type(cpu, gpu, recipe.value_ty(*v))?;
+                let e = match e {
+                    // A loop's counter, this pass's.
+                    ir::Expr::Param(0) => {
+                        map.insert(*v, counter?);
+                        continue;
+                    }
+                    ir::Expr::Load(p) => {
+                        let (mut at, mut at_ty) = (block, t);
+                        for x in &p.path {
+                            if let ir::Proj::Index(i) = x {
+                                let ir::TypeDef::Array(e, _) = cpu.types.get(at_ty).clone() else {
+                                    return None;
+                                };
+                                at = f.let_(out, e, ir::Expr::ExtractDyn(at, *map.get(i)?));
+                                at_ty = e;
+                                continue;
+                            }
+                            let k = match x {
+                                ir::Proj::Field(k) => *k,
+                                ir::Proj::Comp(k) => u32::from(*k),
+                                ir::Proj::Index(_) => unreachable!(),
+                            };
+                            let next = match cpu.types.get(at_ty).clone() {
+                                ir::TypeDef::Struct { fields, .. } => fields.get(k as usize)?.1,
+                                ir::TypeDef::Vector(s, _) => {
+                                    cpu.types.intern(ir::TypeDef::Scalar(s))
+                                }
+                                ir::TypeDef::Matrix(_, r) => {
+                                    cpu.types.intern(ir::TypeDef::Vector(ir::Scalar::F32, r))
+                                }
+                                _ => return None,
+                            };
+                            at = f.let_(out, next, ir::Expr::Extract(at, k));
+                            at_ty = next;
+                        }
+                        if at_ty != ty {
+                            return None;
+                        }
+                        map.insert(*v, at);
+                        continue;
+                    }
+                    ir::Expr::Construct(ct, xs) => {
+                        ir::Expr::Construct(cpu_type(cpu, gpu, *ct)?, xs.clone())
+                    }
+                    ir::Expr::Zero(zt) => ir::Expr::Zero(cpu_type(cpu, gpu, *zt)?),
+                    e => e.clone(),
+                };
+                let mut e = e;
+                let mut ok = true;
+                e.for_each_value_mut(&mut |y| match map.get(y) {
+                    Some(z) => *y = *z,
+                    None => ok = false,
+                });
+                if !ok {
+                    return None;
+                }
+                map.insert(*v, f.let_(out, ty, e));
+            }
+            ir::Stmt::Return(Some(v)) => return map.get(v).copied(),
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// GPU type `t` (of `gpu`) as the CPU module's: numbers, vectors, matrices and structs of them.
+fn cpu_type(cpu: &mut ir::Module, gpu: &ir::Types, t: ir::TypeId) -> Option<ir::TypeId> {
+    let d = match gpu.get(t).clone() {
+        d @ (ir::TypeDef::Scalar(_) | ir::TypeDef::Vector(..) | ir::TypeDef::Matrix(..)) => d,
+        ir::TypeDef::Array(e, n) => ir::TypeDef::Array(cpu_type(cpu, gpu, e)?, n),
+        ir::TypeDef::Struct { name, fields } => {
+            let mut out = Vec::new();
+            for (n, ft) in fields {
+                out.push((n, cpu_type(cpu, gpu, ft)?));
+            }
+            ir::TypeDef::Struct { name, fields: out }
+        }
+        _ => return None,
+    };
+    Some(cpu.types.intern(d))
+}
 
 /// The least work an invocation's calls to one function, with few numbers that vary, must do
 /// for `wrela pipelines` to show them (§18.13): a table read costs about 20.

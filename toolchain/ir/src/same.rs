@@ -27,7 +27,7 @@ pub fn same_values(m: &Module, f: &Function, args: &[bool]) -> HashSet<ValueId> 
 
 /// The same values, and the locals that vary. A call to a function in `unsteady` varies,
 /// whatever it's given (before flattening, a function that reads what an invocation writes).
-fn analyse(
+pub(crate) fn analyse(
     m: &Module,
     f: &Function,
     args: &[bool],
@@ -443,7 +443,11 @@ impl Sites<'_> {
 
 /// How many times each value of `f` (function `id` of `m`) is computed an invocation: the passes
 /// of the loops it's in, where the count bounds them (§18.11). A loop it can't bound counts once.
-fn times_computed(m: &Module, id: FuncId, f: &Function) -> std::collections::HashMap<ValueId, u64> {
+pub(crate) fn times_computed(
+    m: &Module,
+    id: FuncId,
+    f: &Function,
+) -> std::collections::HashMap<ValueId, u64> {
     fn times_in(
         b: &[Stmt],
         k: u64,
@@ -1104,7 +1108,7 @@ struct LocalStore {
 
 /// The values of `def` (a function's same values) computed only from constants and locals
 /// that only ever hold such values, whichever invocation, pass or path: see `Sites::function`.
-fn fixed_values(
+pub(crate) fn fixed_values(
     f: &Function,
     def: &std::collections::HashMap<ValueId, (&Expr, Option<wrela_diag::Span>)>,
 ) -> HashSet<ValueId> {

@@ -1,0 +1,165 @@
+// Work the same for every invocation, moved onto the CPU (§18.13, `ir::hoist`): kernels whose
+// shipped build would be E0712 without the move. `chained` computes 40 rounds of `sin(a) +
+// cos(a)` from its uniform; `parted` the distance to the nearest of 20 round cones of its
+// uniform, a loop over them (each cone's axis over its length, its radii's slope: what the CPU
+// computes once a command, a value for each pass). Each kernel's results are read back:
+// tests/suite/same_work.rs checks them against the CPU's.
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, buffer_of, dispatch, read}
+use std::io::Pending
+
+pub struct Cone: Copy + GpuData {
+    a: vec3,
+    b: vec3,
+    r1: f32,
+    r2: f32,
+}
+
+pub struct Given: Copy + GpuData {
+    u: f32,
+    parts: [Cone; 20],
+}
+
+/// 40 rounds of `sin(a) + cos(a)` from `u`.
+fn chain(u: f32) -> f32 {
+    var a = u
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a = sin(a) + cos(a)
+    a
+}
+
+/// How far `p` is from the cone's hull (the two spheres' and the cone's between, as std's
+/// `RoundCone` with its two ends apart).
+fn cone_distance(c: Cone, p: vec3) -> f32 {
+    let ba = c.b - c.a
+    let l = length(ba)
+    let u = ba / l
+    let q = (c.r1 - c.r2) / l
+    let a2 = 1.0 - q * q
+    let pa = p - c.a
+    let y = dot(pa, u)
+    let xv = pa - u * y
+    sqrt(dot(xv, xv) * a2) + y * q - c.r1
+}
+
+/// Where invocation `x` asks.
+fn at(x: u32) -> vec3 {
+    vec3(f32(x % 16) * 0.2, f32(x / 16) * 0.2, 0.5)
+}
+
+fn nearest(g: Given, p: vec3) -> f32 {
+    var d = 1.0e9
+    for i in 0..20 {
+        d = min(d, cone_distance(g.parts[i], p))
+    }
+    d
+}
+
+@compute(64)
+fn chained(g: Given, out: mut Slots<f32>, id: GlobalId) {
+    out[id] = chain(g.u) * f32(id.x)
+}
+
+@compute(64)
+fn parted(g: Given, out: mut Slots<f32>, id: GlobalId) {
+    out[id] = nearest(g, at(id.x))
+}
+
+/// Invocations a kernel runs.
+pub const COUNT: u32 = 256
+
+fn given() -> Given {
+    var parts: [Cone; 20] = [Cone { a: vec3(0.0), b: vec3(1.0), r1: 0.2, r2: 0.1 }; 20]
+    for i in 0..20 {
+        let f = f32(i)
+        parts[i] = Cone {
+            a: vec3(0.3 * f, 0.1 * f, 0.2),
+            b: vec3(0.3 * f + 0.5, 0.4 + 0.05 * f, 0.9),
+            r1: 0.2 + 0.01 * f,
+            r2: 0.1,
+        }
+    }
+    Given { u: 0.7, parts }
+}
+
+/// What kernel `k` gives invocation `x`, on the CPU.
+fn expected(k: u32, x: u32) -> f32 {
+    let g = given()
+    if k == 0 { chain(g.u) * f32(x) } else { nearest(g, at(x)) }
+}
+
+pub struct Work {
+    backs: [Pending<f32>; 2],
+    got: [Vec<f32>; 2],
+}
+
+pub fn init() -> Work {
+    let g = given()
+    var outs: [GpuBuffer<f32>; 2] = [buffer(COUNT), buffer(COUNT)]
+    dispatch(chained.bind(g, out: mut outs[0]), over: COUNT)
+    dispatch(parted.bind(g, out: mut outs[1]), over: COUNT)
+    let backs = [read(outs[0].span(start: 0, count: COUNT)), read(outs[1].span(start: 0, count: COUNT))]
+    Work { backs, got: [Vec::new(), Vec::new()] }
+}
+
+/// How many of kernel `k`'s results arrived.
+pub fn arrived(state: Work, k: u32) -> u32 {
+    u32(state.got[k].len())
+}
+
+/// How many of kernel `k`'s results are the CPU's, within 1e-4 relatively.
+pub fn matched(state: Work, k: u32) -> u32 {
+    var n: u32 = 0
+    for x in 0..u32(state.got[k].len()) {
+        let want = expected(k, x)
+        if abs(state.got[k][x] - want) <= 1.0e-4 * (1.0 + abs(want)) {
+            n += 1
+        }
+    }
+    n
+}
+
+pub fn frame(state: mut Work, time: f32, width: u32, height: u32) {
+    for k in 0..2 {
+        if let Some(Ok(xs)) = state.backs[k].poll() {
+            state.got[k] = take xs
+        }
+    }
+}
