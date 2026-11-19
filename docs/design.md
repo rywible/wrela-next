@@ -488,6 +488,54 @@ does not at least halve the eye's part of the picture against marching from the 
 same shape written two ways (std's shapes joined, against one function) then differs in cost by
 more than the author test allows, with no way for the compiler to see through the second.
 
+## Ways of spending less that are not tried yet
+
+Since slice 1d the work has gone into making a march cheaper. The larger savings in drawing are
+usually in not marching at all: letting the rasteriser, or the frame before, do the finding.
+Each of these is a way of realising a thing or a schedule in picture, behind the same ask, so
+none changes what an author writes; each has its kill line; the build that measures (direction
+5) is what finally keeps or drops one for a kind of thing.
+
+1. **Let the rasteriser find the brick.** The engine already knows which bricks may hold a
+   thing's surface. Draw those bricks' boxes, near to far, with depth: the hardware then hands
+   each pixel the brick its ray enters, having thrown away what is hidden, and the pixel marches
+   only inside that brick (a few reads of cells, or an ask of the parts live there). This
+   replaces the walk through roots and the descent of the tree at every step, which is where a
+   thing in cells spends its time, and it is how a world of many things is culled. Rays that
+   are not the eye's (a shadow from the sun) can be drawn the same way from where the light is.
+   **Dead if** the eye's part for the stack is not at least halved against the walk with its
+   leaf kept, or if boxes overdrawn at grazing views cost more than the walk they replace.
+2. **Use the frame before.** One ray a pixel, moved a little within the pixel each frame, and the
+   picture kept as a running mean where nothing has changed: a pixel becomes the mean over it
+   through time, which is what the edge pass buys with nine rays and still crawls. And a ray may
+   start from where the frame before met something, carried to this frame. **Dead if** the
+   judges' crawl is still over the reference's, if a walking body smears (edge error over 8/255
+   while it moves), or if what is saved in edge rays is spent keeping the history.
+3. **Do not march where the surface is plain.** March a pixel in four or in sixteen; where its
+   neighbours' hits lie on one plane, a pixel's hit is that plane's, checked by one read of the
+   distance there, and it marches for itself only where they disagree. (The spike's join, which
+   the engine never took: it took only the start.) **Dead if** fewer than half the pixels of the
+   stage and the stack are settled without a march, or the judged pictures move.
+4. **Do not let pixels wait for the slowest.** A pass gives every ray a few steps; rays not yet
+   done are listed and finished in a pass of their own, as edge pixels already are. The pixels
+   at a body's outline, which march longest, then hold nobody up. **Dead if** the list's own
+   cost exceeds what the waiting cost (measure the waiting first: steps a pixel, mean against
+   the worst in its group).
+5. **Draw fewer pixels than the screen has.** The picture at a lower rate and brought up to the
+   screen from the frame before and from what is known exactly at each pixel (depth, facing,
+   which thing). Ryan allowed this at the start; nothing uses it. It multiplies with 2. **Dead
+   if** the judged picture at the screen's size is off by more than the lines, or thin parts go.
+6. **Hardware that follows rays.** The bar's card and the M4 can walk a tree of boxes in
+   hardware and call our code for what is inside one; the Radeon cannot. For rays that go every
+   way (light, reflections) this may be the largest saving of all, and it is the largest piece
+   of work in the toolchain. Not before light is on cells and its rays are counted.
+7. **The code the compiler writes.** Single fixes to it have each been worth 15 to 20% (a struct
+   rebuilt at calls; a union's code written three times). How far the whole is from what a
+   person would write by hand for one march is not known. It is one afternoon to find out.
+
+Light kept on cells (slice 2) already removes the shadow ray a pixel, which is a fifth of the
+frame today.
+
 ## Open risks
 
 - Edges cost. A ray is about 10 ns on the M4, and close up 40% of a body's pixels are edge
