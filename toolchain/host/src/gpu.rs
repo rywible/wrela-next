@@ -745,6 +745,8 @@ pub(crate) struct Gpu {
 /// A window the screen is shown in: its surface, and the pass that draws the screen into each
 /// of its frames (a triangle over the frame, each pixel the screen's texel there).
 struct Presenter {
+    /// The window, kept to make its surface again on a new device (`Gpu::recover`).
+    window: Arc<dyn wrela_gpu::Window>,
     surface: wrela_gpu::Surface,
     /// The format its pipeline draws: the surface's.
     format: TextureFormat,
@@ -1707,12 +1709,12 @@ impl Gpu {
         present: wrela_gpu::PresentMode,
     ) -> Result<()> {
         let gpu_err = |e: wrela_gpu::Error| Error::Gpu(e.0);
-        let mut surface = self.device.create_surface(window).map_err(gpu_err)?;
+        let mut surface = self.device.create_surface(window.clone()).map_err(gpu_err)?;
         let config = wrela_gpu::SurfaceConfig { width, height, present, frames: 3 };
         surface.configure(&self.device, &config).map_err(gpu_err)?;
         let (pipeline, layout) = present_pipeline(&self.device, surface.format())?;
         let format = surface.format();
-        self.presenter = Some(Presenter { surface, format, config, pipeline, layout });
+        self.presenter = Some(Presenter { window, surface, format, config, pipeline, layout });
         Ok(())
     }
 
@@ -3029,14 +3031,16 @@ impl Gpu {
     /// texture and sampler made again at its handle and size (zeroed: what the GPU and the
     /// program wrote is gone), the screen again at its size, and the epoch one more
     /// (`std::gpu::device_epoch`): the program writes again what it holds and builds its
-    /// caches as on its first frame. A window's surface isn't made again yet.
+    /// caches as on its first frame. A window's surface is made again on the new device at its
+    /// size (the old one let go first: a window holds one swapchain), and the screen as the
+    /// program last asked (HDR, Display P3) is asked again.
     fn recover(&mut self, e: &Error) -> Result<()> {
-        if self.presenter.is_some() {
-            return Err(Error::Gpu(format!(
-                "{e}\n(the device was lost while drawing to a window: a window isn't made again yet)"
-            )));
-        }
         let mut fresh = Gpu::new(&self.manifest, &self.shaders, self.timing, self.report)?;
+        if let Some(p) = self.presenter.take() {
+            let (window, config) = (p.window.clone(), p.config);
+            drop(p);
+            fresh.attach_window(window, config.width, config.height, config.present)?;
+        }
         let mut made: Vec<(u32, Made)> = self.made.iter().map(|(&h, &m)| (h, m)).collect();
         made.sort_by_key(|&(h, _)| h);
         for (h, m) in made {
@@ -3050,15 +3054,21 @@ impl Gpu {
                 }
             }
         }
+        // In the plain format: a screen asked HDR becomes so again at the frame's end
+        // (`show_screen`), its pipelines' variants built on the new device.
         if let Some(s) = &self.screen {
-            fresh.set_screen_format(s.width, s.height, s.format)?;
+            fresh.set_screen_format(s.width, s.height, SCREEN_FORMAT)?;
+        }
+        let bits = self.program_limits.screen;
+        if bits != 0 {
+            fresh.screen_asked = Some((bits & 1 != 0, bits & 2 != 0));
         }
         fresh.frame = self.frame;
         fresh.calls = self.calls;
         fresh.labelled = std::mem::take(&mut self.labelled);
         fresh.labelled_order = std::mem::take(&mut self.labelled_order);
         fresh.asked = std::mem::take(&mut self.asked);
-        fresh.screen_asked = self.screen_asked;
+        fresh.screen_asked = self.screen_asked.or(fresh.screen_asked);
         fresh.offscreen_hdr = self.offscreen_hdr;
         fresh.program_limits.screen = self.program_limits.screen;
         fresh.program_limits.headroom = self.program_limits.headroom;

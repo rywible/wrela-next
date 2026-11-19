@@ -476,6 +476,8 @@ pub struct Host {
     beside: Option<Beside>,
     /// The CPU time of each frame run since the last result ([`cpu_time`]).
     cpu: Vec<cpu_time::CpuFrame>,
+    /// The frames `Host::frame` has run (a window's, a typed session's): each one's number.
+    frames: usize,
 }
 
 #[cfg(feature = "gpu")]
@@ -784,6 +786,7 @@ impl Host {
             cancelled_preparations: Vec::new(),
             beside: None,
             cpu: Vec::new(),
+            frames: 0,
         };
         if !options.defer_init {
             host.init()?;
@@ -1121,6 +1124,10 @@ impl Host {
     /// the program a frame at a time (a session a person types), and reads the screen when it wants.
     pub fn frame(&mut self, time: f32, width: u32, height: u32) -> Result<()> {
         self.p().executor().set_screen(width, height)?;
+        // Numbered as a run's frames are: its labels' and timings' frame, `WRELA_GPU_LOSE_AT`'s.
+        let i = self.frames;
+        self.frames += 1;
+        self.p().executor().set_frame(i);
         self.p().frame(time, width, height)?;
         self.settle_handing()
     }
