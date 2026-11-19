@@ -524,29 +524,38 @@ impl<S: Sky> Each for Shadows<S> {
 }
 
 /// An instrument: the eye's ray through `at` (px) of `v` against `w`, stepped as `ray::met` steps
-/// it (over-relaxed, its least step a quarter of its width), each step written to `out` (12 words:
-/// t, the step, the distance, then `Asked::told` at the point) until it meets matter or leaves.
+/// it, step for step (over-relaxed, its least step a quarter of its width, back after a stretched
+/// step lands inside, never stretched past its span's end: keep it so when `met` changes; a copy
+/// that had drifted traced a ray the picture never drew), each step written to `out` (12 words: t,
+/// the step, the distance, then `Asked::told` at the point) until it meets matter or leaves.
 @compute(1)
 fn ray_traced<A: Asked>(w: A, v: View, at: vec2, out: mut Atomics<u32>, id: GlobalId) {
     let d = v.ray(at)
     let px = v.pixel()
-    let b = w.begun(v.at, d, 0.0, px)
-    var t = max(0.0, b.near)
-    var walk = b.walk
-    let inv = vec3(1.0) / d
-    var steps: u32 = 0
+    let begun = w.begun(v.at, d, 0.0, px)
+    let to = begun.far
+    var t = max(0.0, begun.near)
+    var before = t
     var crossed = false
+    var steps: u32 = 0
+    let inv = vec3(1.0) / d
+    var walk = begun.walk
     var relax = 1.6
     var last = 0.0
+    var stretched = false
+    var plain_before = 0.0
+    var walk_before = walk
     var f_before = 1.0e9
-    var before = t
-    while steps < 120 && !crossed && t < b.far {
+    var rec: u32 = 0
+    while steps < 120 && !crossed && t < to {
+        steps += 1
         let width = px * t
         let p = v.at + d * t
         let a = w.step(walk, p, d, inv, t, width)
         walk = a.walk
         let told = w.told(walk, p, width)
-        let o = 12 * steps + 2
+        let o = 12 * rec + 2
+        rec += 1
         out.store(i: o, value: bitcast_u32(t))
         out.store(i: o + 1, value: bitcast_u32(a.x))
         out.store(i: o + 2, value: bitcast_u32(a.y))
@@ -559,23 +568,34 @@ fn ray_traced<A: Asked>(w: A, v: View, at: vec2, out: mut Atomics<u32>, id: Glob
         out.store(i: o + 9, value: bitcast_u32(told.exit))
         out.store(i: o + 10, value: told.brick)
         out.store(i: o + 11, value: bitcast_u32(width))
-        steps += 1
-        if a.y < 0.0 {
+        if a.y < 0.0 && stretched {
+            t = before + plain_before
+            relax = 1.0
+            last = 0.0
+            stretched = false
+            walk = walk_before
+        } else if a.y < 0.0 {
             crossed = true
         } else if relax > 1.0 && last > 0.0 && a.y + f_before < last {
             t = before
             relax = 1.0
             last = 0.0
-            walk = b.walk
+            walk = begun.walk
         } else {
             before = t
             f_before = a.y
             let plain = max(a.x, max(0.25 * width, 0.00001))
+            plain_before = plain
+            walk_before = walk
             last = if a.x <= a.y * 1.0001 { max(relax * a.x, plain) } else { plain }
+            if t + last >= to {
+                last = plain
+            }
+            stretched = last > plain * 1.0001
             t += last
         }
     }
-    out.store(i: 0, value: steps)
+    out.store(i: 0, value: rec)
     out.store(i: 1, value: if crossed { 1 } else { 0 })
 }
 
