@@ -880,6 +880,13 @@ impl Device {
     pub fn take_errors(&self) -> Vec<String> {
         std::mem::take(&mut *lock(&self.0.errors))
     }
+
+    /// Reports the device lost, as a failed command buffer is reported: what the host's
+    /// handling of a loss is tested by (`WRELA_GPU_LOSE_AT`).
+    pub fn lose(&self) {
+        lock(&self.0.errors)
+            .push("the GPU failed command buffer `frame`: the device was lost: simulated (WRELA_GPU_LOSE_AT)".into());
+    }
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {

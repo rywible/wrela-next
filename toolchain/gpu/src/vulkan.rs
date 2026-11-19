@@ -1519,6 +1519,12 @@ impl Device {
     pub fn take_errors(&self) -> Vec<String> {
         std::mem::take(&mut *lock(&self.0.errors))
     }
+
+    /// Reports the device lost, as a real loss is reported (`completed`, `wait`): what the
+    /// host's handling of a loss is tested by (`WRELA_GPU_LOSE_AT`).
+    pub fn lose(&self) {
+        lock(&self.0.errors).push("Vulkan lost the device: simulated (WRELA_GPU_LOSE_AT)".into());
+    }
 }
 
 impl Drop for Shared {

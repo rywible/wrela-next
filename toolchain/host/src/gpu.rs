@@ -593,6 +593,12 @@ impl Behind {
     }
 }
 
+/// The frame at whose end the device is reported lost (`WRELA_GPU_LOSE_AT`), if one is given:
+/// how a lost device's handling is tested on a machine whose GPU can't be made to lose it safely.
+fn lose_at() -> Option<usize> {
+    std::env::var("WRELA_GPU_LOSE_AT").ok().and_then(|v| v.trim().parse().ok())
+}
+
 /// The most work one submission may hold, by what bounds it: past either, what's recorded is
 /// submitted first (`Gpu::room`). A submission is one job to the GPU's driver, and a driver
 /// resets a GPU whose job runs too long (amdgpu: 10 s; a Metal command buffer of seconds hung
@@ -3194,6 +3200,11 @@ impl Executor for Gpu {
         self.behind.submitted(&self.device);
         self.collect()?;
         self.calls += 1;
+        // A loss on demand (`WRELA_GPU_LOSE_AT=<frame>`), reported as a real one is: the
+        // host's handling of it is tested so.
+        if lose_at().is_some_and(|f| self.frame >= f) {
+            self.device.lose();
+        }
         self.check_errors()?;
         self.behind.check(&self.device)?;
         self.indirect.read(&self.device)?;
@@ -3712,6 +3723,23 @@ mod tests {
         assert!(largest.bound_ms <= SUBMIT_BOUND_MS, "{largest:?}");
         assert_eq!(gpu.read_buffer(1).unwrap(), 30u32.to_le_bytes());
         gpu.check_errors().unwrap();
+    }
+
+    /// A lost device stops the run at the end of its frame with an error that says so, on
+    /// both backends (`lose`, what `WRELA_GPU_LOSE_AT` calls), and nothing waits on the device
+    /// it lost.
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn a_lost_device_stops_the_run_with_an_error_saying_so() {
+        let (manifest, shaders) = increment();
+        let mut gpu = Gpu::new(&manifest, &shaders, Timing::Off, false).unwrap();
+        gpu.create_buffer(1, 4);
+        gpu.dispatch(0, Ok([1, 1, 1]), &[Binding::range(1, 0, 4)], &[]).unwrap();
+        gpu.end_frame().unwrap();
+        gpu.device.lose();
+        gpu.dispatch(0, Ok([1, 1, 1]), &[Binding::range(1, 0, 4)], &[]).unwrap();
+        let e = gpu.end_frame().unwrap_err().to_string();
+        assert!(e.contains("lost"), "{e}");
     }
 
     #[test]
