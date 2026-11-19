@@ -43,8 +43,13 @@ pub trait Asked: Copy {
     /// Where a ray is in the world's roots: what `step` fetched and keeps, opaque to the ray.
     type Walk: Copy
 
-    /// A walk that has fetched nothing yet: a ray's start, or a ray that went back.
-    fn walk(self) -> Self::Walk
+    /// Where a ray from `o` along `d` (unit), `wide` m across at `o` and widening `spread` m a
+    /// metre, can meet matter (`near` to `far`, m along it; `far` under `near` where it never
+    /// can), and the walk it starts with (a ray that goes back starts it again). A ray meets
+    /// matter where it enters it, or, standing for the rays it holds (`touch` over 0), where
+    /// matter comes within `touch` of its width; and it is told how nearly it passes matter
+    /// within half its width.
+    fn begun(self, o: vec3, d: vec3, wide: f32, spread: f32, touch: f32) -> Begun<Self::Walk>
 
     /// How far along `d` (unit; `inv` its reciprocal, each axis) from `p`, `t` m along the ray,
     /// a ray may go and not pass matter (`x`), and how far matter is from `p` at the least (`y`:
@@ -63,11 +68,18 @@ pub trait Asked: Copy {
 
     /// What matter is made of at `p`, where the walk ended (as `far`).
     fn made_of(self, walk: Self::Walk, p: vec3, t: f32) -> Substance
-
-    /// Where a ray from `o` along `d` (unit) is within reach of matter at all (m along it: `x`
-    /// in, `y` out; `y` under `x` where it never is).
-    fn span(self, o: vec3, d: vec3) -> vec2
 }
+
+/// Where a ray can meet matter, and the walk it starts with (`Asked::begun`).
+pub struct Begun<K: Copy>: Copy {
+    pub near: f32,
+    pub far: f32,
+    pub walk: K,
+}
+
+/// A walk's node where the thing says in closed form where the ray first meets it (`exit`, m
+/// along the ray: `Surface::meets`, exact): no march, no root.
+const HIT: u32 = 4294967292
 
 /// One thing as GPU code asks it, answered only the ways `W` says: its field, its grid, its cells
 /// (roots, nodes, texels).
@@ -307,14 +319,41 @@ impl<M: Field<Substance>, const W: u32> Seen<M, W> {
 impl<M: Field<Substance>, const W: u32> Asked for Seen<M, W> {
     type Walk = Within
 
-    fn walk(self) -> Within {
-        Within { exit: -1.0, node: NO_BRICK, mask: 0, steep: 1.0 }
+    fn begun(self, o: vec3, d: vec3, wide: f32, spread: f32, touch: f32) -> Begun<Within> {
+        // Where the thing says the ray can meet it (`Surface::meets`, std's, in closed form
+        // through its combinators; its bound's sphere where it can't see in), within its grid.
+        // Exact, the ray meets it there and is never marched. Else the ray marches only where
+        // the thing grown by as much as the ray must be told of (half its widest width over the
+        // grid, or `touch` of it) can be.
+        let g = self.grid
+        let box = box_span(o, d, g.lo, g.hi)
+        var near = box.x
+        var far = box.y
+        var k = Within { exit: -1.0, node: NO_BRICK, mask: 0, steep: 1.0 }
+        if box.y >= box.x && box.y >= 0.0 {
+            let m = self.field.meets(o, d)
+            if touch <= 0.0 && m.exact() && m.near <= m.far {
+                near = m.near
+                far = m.far
+                k = Within { exit: m.near, node: HIT, mask: ALL, steep: 1.0 }
+            } else {
+                let grow = max(touch, 0.5) * (wide + spread * max(box.y, 0.0))
+                let n = self.field.meets_grown(o, d, grow)
+                near = max(near, n.near)
+                far = min(far, n.far)
+            }
+        }
+        Begun { near, far, walk: k }
     }
 
     fn step(self, walk: Within, p: vec3, d: vec3, inv: vec3, t: f32, size: f32) -> Stepped<Within> {
         var k = walk
         var a = vec2(0.0)
-        if W == WHOLE {
+        if k.node == HIT {
+            // (Met where the thing says, and inside from there.)
+            let f = if t >= k.exit { -1.0e-6 } else { k.exit - t }
+            a = vec2(f, f)
+        } else if W == WHOLE {
             let f = self.whole_at(p)
             a = vec2(f, f)
         } else {
@@ -327,7 +366,7 @@ impl<M: Field<Substance>, const W: u32> Asked for Seen<M, W> {
     }
 
     fn far(self, walk: Within, p: vec3, t: f32, size: f32) -> f32 {
-        if W == WHOLE {
+        if W == WHOLE || walk.node == HIT {
             return self.whole_at(p)
         }
         if walk.node == NO_BRICK && walk.mask != 1 {
@@ -343,7 +382,7 @@ impl<M: Field<Substance>, const W: u32> Asked for Seen<M, W> {
         if W != WHOLE && walk.node == NO_BRICK {
             return came
         }
-        var parts = W == WHOLE || walk.node == HOLDS
+        var parts = W == WHOLE || walk.node == HOLDS || walk.node == HIT
         var mask = if W == WHOLE { ALL } else { walk.mask }
         if W == CELLS && !parts {
             // (Cells not true at this size: its parts live in the root, as `answered`.)
@@ -371,9 +410,5 @@ impl<M: Field<Substance>, const W: u32> Asked for Seen<M, W> {
 
     fn made_of(self, walk: Within, p: vec3, t: f32) -> Substance {
         self.field.channels(p)
-    }
-
-    fn span(self, o: vec3, d: vec3) -> vec2 {
-        box_span(o, d, self.grid.lo, self.grid.hi)
     }
 }
