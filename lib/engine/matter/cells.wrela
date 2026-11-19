@@ -215,6 +215,148 @@ pub fn read_distance(cells: GpuSpan<u32>, slot: u32, lo: vec3, side: f32, p: vec
     (v / 65535.0 - 0.5) * 4.0 * side
 }
 
+/// A texel's distance (m, `side` its brick's side), as `read_distance` decodes it.
+fn texel_distance(w: u32, side: f32) -> f32 {
+    (f32(w & 65535) / 65535.0 - 0.5) * 4.0 * side
+}
+
+/// The mix of a cell's eight corners' values (`a`: x 0, `b`: x 1, each in the order y z: 00, 10,
+/// 01, 11) at `u` (from 0 to 1 each way in the cell).
+fn mixed(a: vec4, b: vec4, u: vec3) -> f32 {
+    let v = mix(a, b, vec4(clamp(u.x, 0.0, 1.0)))
+    let w = clamp(u.yz, vec2(0.0), vec2(1.0))
+    mix(mix(v.x, v.y, w.x), mix(v.z, v.w, w.x), w.y)
+}
+
+/// Where along a cell's segment (from 0 to 1) a cubic first reaches 0, given its values at 0, 1/3,
+/// 2/3 and 1 (which fix it); -1 where it doesn't. Its turning points cut the segment into pieces
+/// it is monotone on; the first whose ends change sign holds the zero, found by regula falsi
+/// (Illinois) on the cubic: no step can pass it.
+fn first_zero(f0: f32, f1: f32, f2: f32, f3: f32) -> f32 {
+    if f0 <= 0.0 {
+        return 0.0
+    }
+    let c1 = 0.5 * (-11.0 * f0 + 18.0 * f1 - 9.0 * f2 + 2.0 * f3)
+    let c2 = 0.5 * (18.0 * f0 - 45.0 * f1 + 36.0 * f2 - 9.0 * f3)
+    let c3 = 0.5 * (-9.0 * f0 + 27.0 * f1 - 27.0 * f2 + 9.0 * f3)
+    // (Its turning points, where 3 c3 s² + 2 c2 s + c1 is 0.)
+    var e1 = 1.0
+    var e2 = 1.0
+    if abs(c3) > 1.0e-12 * (abs(c1) + abs(c2) + 1.0e-30) {
+        let disc = c2 * c2 - 3.0 * c1 * c3
+        if disc >= 0.0 {
+            let r = sqrt(disc)
+            let x1 = (-c2 - r) / (3.0 * c3)
+            let x2 = (-c2 + r) / (3.0 * c3)
+            e1 = min(x1, x2)
+            e2 = max(x1, x2)
+        }
+    } else if abs(c2) > 1.0e-30 {
+        e1 = -c1 / (2.0 * c2)
+    }
+    let b1 = clamp(e1, 0.0, 1.0)
+    let b2 = clamp(e2, b1, 1.0)
+    var found = -1.0
+    for piece in 0..3 {
+        let a = if piece == 0 { 0.0 } else if piece == 1 { b1 } else { b2 }
+        let b = if piece == 0 { b1 } else if piece == 1 { b2 } else { 1.0 }
+        if found < 0.0 && b > a {
+            var lo = a
+            var hi = b
+            var flo = f0 + lo * (c1 + lo * (c2 + lo * c3))
+            var fhi = f0 + hi * (c1 + hi * (c2 + hi * c3))
+            if flo > 0.0 && fhi <= 0.0 {
+                var side = 0
+                for k in 0..ZERO_STEPS {
+                    let m = clamp(lo + (hi - lo) * flo / (flo - fhi), lo, hi)
+                    let fm = f0 + m * (c1 + m * (c2 + m * c3))
+                    if fm > 0.0 {
+                        lo = m
+                        flo = fm
+                        if side == 1 { fhi = 0.5 * fhi }
+                        side = 1
+                    } else {
+                        hi = m
+                        fhi = fm
+                        if side == -1 { flo = 0.5 * flo }
+                        side = -1
+                    }
+                }
+                found = hi
+            }
+        }
+    }
+    found
+}
+
+/// How many steps of regula falsi find a cubic's zero in a cell (`first_zero`).
+const ZERO_STEPS: u32 = 8
+
+/// Where the ray from `p` along `d` (unit) first meets the surface of a brick's cells (`slot`,
+/// least corner `lo`, side `side`; the zero of the mix `read_distance` reads, lowered by `off`), m
+/// along it, no farther than `reach` and in the brick (`x`; -1 where it doesn't), and where it
+/// stopped (`y`). The ray walks the brick
+/// cell by cell (a 3D DDA); a cell whose eight corners are all above 0 can't hold the zero (a
+/// trilinear mix lies between its corners) and is crossed; in any other, the mix along the ray is a
+/// cubic, fixed by its value at four points of the cell's segment, and its first zero is found
+/// outright (`first_zero`). (S. Parker et al. 1998; G. Marmitt et al. 2004: docs/citations.md.)
+pub fn brick_crossed(cells: GpuSpan<u32>, slot: u32, lo: vec3, side: f32, off: f32, p: vec3, d: vec3, reach: f32) -> vec2 {
+    let cell = side / f32(B)
+    let q = clamp((p - lo) / cell, vec3(0.0), vec3(f32(B) - 0.0001))
+    var i = floor(q)
+    let dq = d / cell
+    let up = vec3(if d.x >= 0.0 { 1.0 } else { -1.0 }, if d.y >= 0.0 { 1.0 } else { -1.0 }, if d.z >= 0.0 { 1.0 } else { -1.0 })
+    let far = 1.0e30
+    let gap = vec3(if abs(dq.x) > 1.0e-12 { 1.0 / abs(dq.x) } else { far }, if abs(dq.y) > 1.0e-12 { 1.0 / abs(dq.y) } else { far }, if abs(dq.z) > 1.0e-12 { 1.0 / abs(dq.z) } else { far })
+    var next = vec3(
+        if abs(dq.x) > 1.0e-12 { (i.x + max(up.x, 0.0) - q.x) / dq.x } else { far },
+        if abs(dq.y) > 1.0e-12 { (i.y + max(up.y, 0.0) - q.y) / dq.y } else { far },
+        if abs(dq.z) > 1.0e-12 { (i.z + max(up.z, 0.0) - q.z) / dq.z } else { far },
+    )
+    var t0 = 0.0
+    var hit = -1.0
+    var going = true
+    for k in 0..(3 * B) {
+        if going {
+            let t1 = min(min(next.x, min(next.y, next.z)), reach)
+            let base = slot * TEXELS + u32(i.x) + BS * (u32(i.y) + BS * u32(i.z))
+            let a = vec4(texel_distance(cells[base], side), texel_distance(cells[base + BS], side), texel_distance(cells[base + BS * BS], side), texel_distance(cells[base + BS * BS + BS], side)) - vec4(off)
+            let b = vec4(texel_distance(cells[base + 1], side), texel_distance(cells[base + BS + 1], side), texel_distance(cells[base + BS * BS + 1], side), texel_distance(cells[base + BS * BS + BS + 1], side)) - vec4(off)
+            let least = min(min(min(a.x, a.y), min(a.z, a.w)), min(min(b.x, b.y), min(b.z, b.w)))
+            if least <= 0.0 {
+                // (The cell's segment, from 0 to 1: `u0` where the ray is at its start, `du` how
+                // far it goes in the cell's own measure.)
+                let u0 = q + dq * t0 - i
+                let du = dq * (t1 - t0)
+                let s = first_zero(mixed(a, b, u0), mixed(a, b, u0 + du * (1.0 / 3.0)), mixed(a, b, u0 + du * (2.0 / 3.0)), mixed(a, b, u0 + du))
+                if s >= 0.0 {
+                    hit = t0 + s * (t1 - t0)
+                    going = false
+                }
+            }
+            if going && t1 >= reach {
+                going = false
+                t0 = t1
+            }
+            if going {
+                t0 = t1
+                if next.x <= next.y && next.x <= next.z {
+                    i.x += up.x
+                    next.x += gap.x
+                } else if next.y <= next.z {
+                    i.y += up.y
+                    next.y += gap.y
+                } else {
+                    i.z += up.z
+                    next.z += gap.z
+                }
+                going = i.x >= 0.0 && i.y >= 0.0 && i.z >= 0.0 && i.x < f32(B) && i.y < f32(B) && i.z < f32(B)
+            }
+        }
+    }
+    vec2(hit, t0)
+}
+
 /// How far a brick's cells are off its field at the middle of its cell `k` (m): where the surface
 /// is within two cells of it, the distance's error or the facing's times the cell's side,
 /// whichever is more; elsewhere, how much the cells overestimate the distance (what a step by them
