@@ -263,7 +263,13 @@ engine's log and commit messages.
 | Edge pixels drawn again as nine rays each are right and still | **Half.** Edge error 24.7 to 5.6 of 255 (line 8) for 2.4 ms, but crawl is up to 3.5 times the reference's: the nine rays sit at fixed places |
 | The frame with edges fits half a frame | **Not met.** 10.7 ms (line 8.3): picture 7.0, of which about half is the stand-in sun's shadow rays; edges 2.4; a body's deposit 1.05 |
 | Rebuilding the surface from the facing cells keep (direction 4) | Measured, and dead as built. Cells twice as coarse for the same outline, but an ask 71% dearer, and memory is no longer short |
-| A shipped build takes a plain body and a new field | **Not met.** E0712 refuses std's own round cone and smooth union inside the ray's steps; builds are made with `--testing` until the toolchain does that work once a command itself |
+| An ask of only the parts live in a brick is the whole ask, and cheaper | Measured (slice 1c; the toolchain's own march of an 18-part body). To the bit; 4 of 18 parts live a brick; 5.84 to 3.01 ms (M4), 18.3 to 8.0 (Radeon) |
+| A walking body asked by its live parts keeps its thin parts with no cells | Measured at 1080p. No holes, outline within 0.037 px, no thin pixel lost (15 of 22 lost in cells) |
+| That body, so asked, fits the frame | **Not met.** 12.9 ms; in cells 11.8; whole 14.8 (slice 1b: 10.7). A root is looked up at every step, and rays grazing its outline ask about six parts a step where cells take eight reads |
+| Bounds and emptiness derived from ranges, nothing stated | Measured. Every thing's bound is derived; the stack holds its lines in 1.25 times the memory |
+| Steepness derived from ranges | **Not met.** A gradient's range is a box a component, about 1.7 times too long at a corner; for std's shapes the stated steepness is always the tighter, and stays in one marked place until the toolchain bounds the gradient's length |
+| Edge cover from how nearly neighbouring rays passed | **Not met** (parked). Edge error 4.7 to 5.2 of 255, but crawl 20.6 to 28.3 against the reference's 11.8, and 2.1 ms |
+| A shipped build takes a plain body and a new field | Met for the scene (the compiler does once a command what every pixel would redo). **Not** for the judged builds of the stack, where the same refusal fires in std's value noise |
 
 ## What the design must make impossible
 
@@ -279,7 +285,9 @@ Faults the spike found, each with the module that now owns it.
 | Tones' edges stepping pixel to pixel | picture: it gives the look what it needs |
 | What is behind a sheet stopped by the sheet's own outline | picture |
 | A compiler construct that copies a whole form for every pixel (5 to 8 times slower, twice) | toolchain: the build's `kept` figure is the tell; it should be an error |
-| A dispatch that cannot be cut in parts, because a kernel stores only its own texel | toolchain: wanted from the backend's native features |
+| A dispatch that cannot be cut in parts, because a kernel stores only its own texel | toolchain: a dispatch now takes an origin |
+| A way of asking chosen a thing at a time, each way its own pipelines (nine draws for two things in slice 1c) | matter: who answers is decided a brick at a time, behind one ask; the picture has one pipeline for a world |
+| A constant fitted to one scene's timing deciding how a thing is asked | matter: the count is the toolchain's count of what an ask costs, against what a read of cells costs |
 
 ## Order of work
 
@@ -299,10 +307,13 @@ at a time, into the place this document gives it.
    - 1b, done: cells that are true for still things (sized from what the eye sees, split only
      where they are off their field), and a choice that is the same on every run. Edges are
      right but crawl; thin parts are lost in cells; the frame is over its line.
-   - 1c: a field's range over a box (direction 1 below), which is meant to keep thin and moving
-     things exactly and to derive what is still stated by hand; and edges whose cover changes
-     smoothly as an edge crosses a pixel.
-   - 1d: the time (looking coarsely first, filling in, so that pixels do not all pay for a ray).
+   - 1c, done in part: a field's range over a box. Bounds and emptiness are derived; a brick's
+     live parts keep a moving body's thin parts exactly. But the frame grew (10.7 to 12.9 ms),
+     the ways of asking multiplied, and edges still crawl.
+   - 1d: one way of asking and the time. A ray walks a thing's roots, fetching each once, and a
+     root says who answers in it (its live parts, or its cells): no way of asking a thing at a
+     time. Then looking coarsely first and filling in, so that pixels do not all pay for a ray.
+   - 1e: edges whose cover changes smoothly as an edge crosses a pixel.
      The half-frame line is held at the end of slice 2, when stored light replaces the stand-in's
      shadow ray a pixel.
 2. **Light on that path**: sun, sky, bounce; a body's light and its shadow on other things.
