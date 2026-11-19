@@ -326,7 +326,11 @@ at a time, into the place this document gives it.
      makes every pixel pay for all of them. So: one ask as written, specialised to each thing as
      it runs, each thing drawn over its own part of the screen. Then looking coarsely first and
      filling in, so that pixels do not all pay for a ray.
-   - 1e: edges whose cover changes smoothly as an edge crosses a pixel.
+   - 1e: the build measures and picks (direction 5). Closed-form meeting for things built of
+     std's shapes; each kind of thing tried each way when the game is built, and a table a thing
+     kept (which way, by how finely it is seen). The weights by hand and the count's comparison
+     leave. This is now the engine's main line: what follows is built on it.
+   - 1f: edges whose cover changes smoothly as an edge crosses a pixel.
      The half-frame line is held at the end of slice 2, when stored light replaces the stand-in's
      shadow ray a pixel.
 2. **Light on that path**: sun, sky, bounce; a body's light and its shadow on other things.
