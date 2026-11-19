@@ -887,6 +887,16 @@ fn a_sixth_target_keeps_the_least_each_fragment_offers() {
     assert_eq!(crate::tests_pass(&dir), 4);
 }
 
+/// A field written while the program runs (`std::field::Written`, toolchain/tests/written) asked
+/// in a kernel, every leaf kind, map and join and a displacement: within 1e-6 of the compiled tree
+/// of the same kinds at 4,096 points, on both hosts.
+#[test]
+#[ignore = "needs a GPU"]
+fn a_written_field_is_its_compiled_tree_on_the_gpu() {
+    let dir = wrela_tests::repo_root().join("toolchain/tests/written");
+    assert_eq!(crate::tests_pass(&dir), 1);
+}
+
 /// A kind's things in GPU code (toolchain/tests/kinds, gap 29): a group built in a kernel from a
 /// thing's field read in place and a run of a shared buffer (`GpuSpan::sub`), passed to generic
 /// functions and a run of the run passed on, reads what the direct reads do, to the bit, on both

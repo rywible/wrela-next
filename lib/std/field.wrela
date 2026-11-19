@@ -3187,6 +3187,444 @@ impl PointMap for Size {
     }
 }
 
+// ---- fields written while the program runs (language.md §14.4) ----
+
+/// The most nodes a `Written` holds, and the deepest its evaluation goes (its stack).
+pub const WRITTEN_NODES: u32 = 64
+/// The deepest a `Written`'s evaluation goes: its stack.
+pub const WRITTEN_DEPTH: u32 = 16
+
+// A `WrittenNode`'s kinds. Leaves, their numbers in `p` and `q`:
+/// A ball of radius `p.x` about the origin.
+pub const W_SPHERE: u32 = 1
+/// An ellipsoid of radii `p.xyz`.
+pub const W_ELLIPSOID: u32 = 2
+/// A round cone: top `p.xyz` of radius `p.w`, bottom `q.xyz` of radius `q.w`.
+pub const W_ROUND_CONE: u32 = 3
+/// A box of half-extents `p.xyz`.
+pub const W_CUBOID: u32 = 4
+/// A half-space: the unit normal `p.xyz`, its offset `p.w`.
+pub const W_HALF_SPACE: u32 = 5
+// Maps of node `a`:
+/// Moved by `p.xyz`.
+pub const W_TRANSLATE: u32 = 16
+/// Turned by the unit quaternion `p` (x, y, z, w).
+pub const W_ROTATE: u32 = 17
+/// Scaled by `p.x` (nonzero).
+pub const W_SCALE: u32 = 18
+// Joins of nodes `a` and `b`, `k` = `p.x`:
+/// The union of `a` and `b` (their least).
+pub const W_UNION: u32 = 32
+/// `a` and `b` joined smoothly over `k`.
+pub const W_SMOOTH_UNION: u32 = 33
+/// The intersection of `a` and `b` (their most).
+pub const W_INTERSECT: u32 = 34
+/// `a` with `b` cut out, smoothly over `k`.
+pub const W_SMOOTH_SUBTRACT: u32 = 35
+/// `a` and `b` intersected smoothly over `k`.
+pub const W_SMOOTH_INTERSECT: u32 = 36
+/// Node `a` displaced by fractal noise: amplitude `p.x`, frequency `p.y`, octaves `p.z` (1 to
+/// 6), its offset `q.xyz`.
+pub const W_DISPLACE: u32 = 48
+/// Reserved: the rates in time of the map node before it (not written yet; refused).
+pub const W_RATES: u32 = 64
+
+/// A node of a `Written`: its kind, its operands (earlier nodes), a leaf's matter (what the game's
+/// look reads), and its numbers.
+pub struct WrittenNode: Copy + GpuData + Eq + StateHash {
+    pub kind: u32,
+    pub a: u32,
+    pub b: u32,
+    pub matter: u32,
+    pub p: vec4,
+    pub q: vec4,
+}
+
+/// A field written while the program runs, as data: up to `WRITTEN_NODES` of std's own kinds in
+/// post-order (each node after its operands; the last the root), made by `Writing` and checked
+/// once (`Writing::done`). Every answer comes from each node's own kind's code: its distance is
+/// the compiled tree's of the same kinds, to the bit on the CPU. A `Written` is `GpuData`, so it
+/// passes to a shader as a uniform (about 6.5 KB).
+pub struct Written: Copy + GpuData {
+    nodes: [WrittenNode; 64],
+    len: u32,
+    /// Each node's nearest map above it (`WRITTEN_NODES` for none): the maps its point passes.
+    up: [u32; 64],
+    /// A rotation's matrix into its operand's space, made from its quaternion at the door.
+    turns: [mat3; 64],
+    /// The whole's bound, made once at the door.
+    whole: Bound,
+    leaves: u32,
+}
+
+/// Builds a `Written`: each method adds a node and gives its index; the last added is the root.
+pub struct Writing {
+    nodes: [WrittenNode; 64],
+    len: u32,
+    full: bool,
+}
+
+/// An empty `Writing`, to build a `Written` with.
+pub fn writing() -> Writing {
+    Writing { nodes: [WrittenNode { kind: 0, a: 0, b: 0, matter: 0, p: vec4(0.0), q: vec4(0.0) }; 64], len: 0, full: false }
+}
+
+impl Writing {
+    fn add(mut self, n: WrittenNode) -> u32 {
+        if self.len >= WRITTEN_NODES {
+            self.full = true
+            return self.len
+        }
+        self.nodes[self.len] = n
+        self.len += 1
+        self.len - 1
+    }
+
+    fn leaf(mut self, kind: u32, p: vec4, q: vec4, matter: u32) -> u32 {
+        self.add(WrittenNode { kind, a: 0, b: 0, matter, p, q })
+    }
+
+    /// A ball of `radius` about the origin.
+    pub fn sphere(mut self, radius: f32, matter: u32 = 0) -> u32 { self.leaf(W_SPHERE, vec4(radius, 0.0, 0.0, 0.0), vec4(0.0), matter) }
+    /// An ellipsoid of `radii` about the origin.
+    pub fn ellipsoid(mut self, radii: vec3, matter: u32 = 0) -> u32 { self.leaf(W_ELLIPSOID, vec4(radii, 0.0), vec4(0.0), matter) }
+    /// The hull of a ball of `r_top` at `a` and one of `r_bottom` at `b`.
+    pub fn round_cone(mut self, a: vec3, b: vec3, r_top: f32, r_bottom: f32, matter: u32 = 0) -> u32 { self.leaf(W_ROUND_CONE, vec4(a, r_top), vec4(b, r_bottom), matter) }
+    /// A box of half-extents `half` about the origin.
+    pub fn cuboid(mut self, half: vec3, matter: u32 = 0) -> u32 { self.leaf(W_CUBOID, vec4(half, 0.0), vec4(0.0), matter) }
+    /// The half-space below the plane of unit `normal` at `offset`.
+    pub fn half_space(mut self, normal: vec3, offset: f32, matter: u32 = 0) -> u32 { self.leaf(W_HALF_SPACE, vec4(normal, offset), vec4(0.0), matter) }
+
+    fn of(mut self, kind: u32, a: u32, b: u32, p: vec4, q: vec4) -> u32 {
+        self.add(WrittenNode { kind, a, b, matter: 0, p, q })
+    }
+
+    /// Node `a` moved by `by`.
+    pub fn translate(mut self, a: u32, by: vec3) -> u32 { self.of(W_TRANSLATE, a, 0, vec4(by, 0.0), vec4(0.0)) }
+    /// Node `a` turned by `by`.
+    pub fn rotate(mut self, a: u32, by: Quat) -> u32 { self.of(W_ROTATE, a, 0, by.v, vec4(0.0)) }
+    /// Node `a` scaled by `by` (nonzero) about the origin.
+    pub fn scale(mut self, a: u32, by: f32) -> u32 { self.of(W_SCALE, a, 0, vec4(by, 0.0, 0.0, 0.0), vec4(0.0)) }
+    /// The union of nodes `a` and `b`.
+    pub fn union(mut self, a: u32, b: u32) -> u32 { self.of(W_UNION, a, b, vec4(0.0), vec4(0.0)) }
+    /// Nodes `a` and `b` joined smoothly over `k`.
+    pub fn smooth_union(mut self, a: u32, b: u32, k: f32) -> u32 { self.of(W_SMOOTH_UNION, a, b, vec4(k, 0.0, 0.0, 0.0), vec4(0.0)) }
+    /// The intersection of nodes `a` and `b`.
+    pub fn intersect(mut self, a: u32, b: u32) -> u32 { self.of(W_INTERSECT, a, b, vec4(0.0), vec4(0.0)) }
+    /// Node `a` with node `b` cut out, smoothly over `k`.
+    pub fn smooth_subtract(mut self, a: u32, b: u32, k: f32) -> u32 { self.of(W_SMOOTH_SUBTRACT, a, b, vec4(k, 0.0, 0.0, 0.0), vec4(0.0)) }
+    /// Nodes `a` and `b` intersected smoothly over `k`.
+    pub fn smooth_intersect(mut self, a: u32, b: u32, k: f32) -> u32 { self.of(W_SMOOTH_INTERSECT, a, b, vec4(k, 0.0, 0.0, 0.0), vec4(0.0)) }
+    /// Node `a` displaced by fractal noise of `octaves` (1 to 6) at `freq`, `amp` high.
+    pub fn displace(mut self, a: u32, amp: f32, freq: f32, octaves: u32, offset: vec3 = vec3()) -> u32 {
+        self.of(W_DISPLACE, a, 0, vec4(amp, freq, f32(octaves), 0.0), vec4(offset, 0.0))
+    }
+
+    /// The field written, checked: at most `WRITTEN_NODES` nodes, its evaluation no deeper than
+    /// `WRITTEN_DEPTH`, each node's operands the ones just before it in post-order, every number
+    /// finite and in its kind's range; or why not.
+    pub fn done(self) -> Result<Written, String> {
+        written_of(self.nodes, self.len, self.full)
+    }
+}
+
+/// Whether `x` is finite and within `lo..hi`.
+fn within(x: f32, lo: f32, hi: f32) -> bool {
+    x >= lo && x <= hi
+}
+
+/// The door: `nodes[..len]` checked and made a `Written` (its maps' chains, its rotations'
+/// matrices, its bound), or why not. Bytes that came from anywhere pass through here.
+pub fn written_of(nodes: [WrittenNode; 64], len: u32, full: bool) -> Result<Written, String> {
+    if full || len == 0 || len > WRITTEN_NODES {
+        return Err(f"a written field holds 1 to {WRITTEN_NODES} nodes")
+    }
+    var stack = [0; 16]
+    var top: u32 = 0
+    var parent = [WRITTEN_NODES; 64]
+    var leaves: u32 = 0
+    var turns = [mat3(vec3(0.0), vec3(0.0), vec3(0.0)); 64]
+    for i in 0..len {
+        let n = nodes[i]
+        let k = n.kind
+        let fin = within(n.p.x, lo: -1.0e6, hi: 1.0e6) && within(n.p.y, lo: -1.0e6, hi: 1.0e6) && within(n.p.z, lo: -1.0e6, hi: 1.0e6) && within(n.p.w, lo: -1.0e6, hi: 1.0e6) && within(n.q.x, lo: -1.0e6, hi: 1.0e6) && within(n.q.y, lo: -1.0e6, hi: 1.0e6) && within(n.q.z, lo: -1.0e6, hi: 1.0e6) && within(n.q.w, lo: -1.0e6, hi: 1.0e6)
+        if !fin {
+            return Err(f"node {i}: a number not finite or past a million")
+        }
+        if k >= W_SPHERE && k <= W_HALF_SPACE {
+            let ok = if k == W_SPHERE { within(n.p.x, lo: 1.0e-3, hi: 50.0) } else if k == W_ELLIPSOID { within(n.p.x, lo: 1.0e-3, hi: 50.0) && within(n.p.y, lo: 1.0e-3, hi: 50.0) && within(n.p.z, lo: 1.0e-3, hi: 50.0) } else if k == W_ROUND_CONE { within(n.p.w, lo: 1.0e-3, hi: 50.0) && within(n.q.w, lo: 1.0e-3, hi: 50.0) && length(n.q.xyz - n.p.xyz) <= 100.0 } else if k == W_CUBOID { within(n.p.x, lo: 1.0e-3, hi: 50.0) && within(n.p.y, lo: 1.0e-3, hi: 50.0) && within(n.p.z, lo: 1.0e-3, hi: 50.0) } else { abs(length(n.p.xyz) - 1.0) <= 1.0e-3 && within(n.p.w, lo: -100.0, hi: 100.0) }
+            if !ok {
+                return Err(f"node {i}: a leaf's number out of its range")
+            }
+            if top >= WRITTEN_DEPTH {
+                return Err(f"node {i}: deeper than {WRITTEN_DEPTH}")
+            }
+            stack[top] = i
+            top += 1
+            leaves += 1
+        } else if k == W_TRANSLATE || k == W_ROTATE || k == W_SCALE || k == W_DISPLACE {
+            if top == 0 || stack[top - 1] != n.a {
+                return Err(f"node {i}: its operand isn't the node just before it")
+            }
+            let ok = if k == W_TRANSLATE { length(n.p.xyz) <= 1000.0 } else if k == W_ROTATE { abs(length(n.p) - 1.0) <= 1.0e-3 } else if k == W_SCALE { within(abs(n.p.x), lo: 1.0e-3, hi: 1000.0) } else { within(abs(n.p.x), lo: 0.0, hi: 1.0) && within(n.p.y, lo: 0.0, hi: 100.0) && n.p.z == floor(n.p.z) && within(n.p.z, lo: 1.0, hi: 6.0) }
+            if !ok {
+                return Err(f"node {i}: a number out of its range")
+            }
+            parent[n.a] = i
+            stack[top - 1] = i
+            if k == W_ROTATE {
+                turns[i] = Quat { v: n.p }.inverse().to_mat3()
+            }
+        } else if k >= W_UNION && k <= W_SMOOTH_INTERSECT {
+            if top < 2 || stack[top - 1] != n.b || stack[top - 2] != n.a {
+                return Err(f"node {i}: its operands aren't the two nodes before it")
+            }
+            if !within(n.p.x, lo: 0.0, hi: 2.0) {
+                return Err(f"node {i}: a join's width out of 0..2 m")
+            }
+            parent[n.a] = i
+            parent[n.b] = i
+            top -= 1
+            stack[top - 1] = i
+        } else {
+            return Err(f"node {i}: kind {k} isn't one a written field holds (W_RATES is reserved)")
+        }
+    }
+    if top != 1 {
+        return Err(f"more than one root: every node but the last must be an operand")
+    }
+    // Each node's nearest map above it, from the root down.
+    var up = [WRITTEN_NODES; 64]
+    var i = len
+    while i > 0 {
+        i -= 1
+        let pa = parent[i]
+        if pa < WRITTEN_NODES {
+            let pk = nodes[pa].kind
+            up[i] = if pk == W_TRANSLATE || pk == W_ROTATE || pk == W_SCALE { pa } else { up[pa] }
+        }
+    }
+    var w = Written { nodes, len, up, turns, whole: UNBOUNDED, leaves }
+    w.whole = w.bound_of()
+    Ok(w)
+}
+
+impl Written {
+    /// `p` taken through node `i`'s maps, the outermost first, as the compiled tree takes it.
+    fn local_at(self, i: u32, p: vec3) -> vec3 {
+        var chain = [0; 16]
+        var n: u32 = 0
+        var j = self.up[i]
+        for k in 0..WRITTEN_DEPTH {
+            if j >= WRITTEN_NODES {
+                break
+            }
+            chain[n] = j
+            n += 1
+            j = self.up[j]
+        }
+        var x = p
+        for k in 0..WRITTEN_DEPTH {
+            if k >= n {
+                break
+            }
+            let c = n - 1 - k
+            let m = self.nodes[chain[c]]
+            x = if m.kind == W_TRANSLATE { Shift { by: m.p.xyz }.local(x) } else if m.kind == W_ROTATE { Turn { to_local: self.turns[chain[c]] }.local(x) } else { Size { by: m.p.x }.local(x) }
+        }
+        x
+    }
+
+    /// Leaf `i`'s own distance at `x` (in its own space).
+    fn leaf_distance(self, i: u32, x: vec3) -> f32 {
+        let n = self.nodes[i]
+        let k = n.kind
+        // (Round cones first: a body is mostly them.)
+        if k == W_ROUND_CONE { round_cone(n.p.xyz, n.q.xyz, r_top: n.p.w, r_bottom: n.q.w).distance(x) } else if k == W_SPHERE { sphere(n.p.x).distance(x) } else if k == W_CUBOID { cuboid(n.p.xyz).distance(x) } else if k == W_ELLIPSOID { ellipsoid(n.p.xyz).distance(x) } else { half_space(n.p.xyz, n.p.w).distance(x) }
+    }
+
+    fn leaf_bound(self, i: u32) -> Bound {
+        let n = self.nodes[i]
+        let k = n.kind
+        if k == W_SPHERE { sphere(n.p.x).bound() } else if k == W_ELLIPSOID { ellipsoid(n.p.xyz).bound() } else if k == W_ROUND_CONE { round_cone(n.p.xyz, n.q.xyz, r_top: n.p.w, r_bottom: n.q.w).bound() } else if k == W_CUBOID { cuboid(n.p.xyz).bound() } else { half_space(n.p.xyz, n.p.w).bound() }
+    }
+
+    fn leaf_lipschitz(self, i: u32, near: f32) -> f32 {
+        let n = self.nodes[i]
+        let k = n.kind
+        if k == W_SPHERE { sphere(n.p.x).lipschitz(near) } else if k == W_ELLIPSOID { ellipsoid(n.p.xyz).lipschitz(near) } else if k == W_ROUND_CONE { round_cone(n.p.xyz, n.q.xyz, r_top: n.p.w, r_bottom: n.q.w).lipschitz(near) } else if k == W_CUBOID { cuboid(n.p.xyz).lipschitz(near) } else { half_space(n.p.xyz, n.p.w).lipschitz(near) }
+    }
+
+    fn noise_of(n: WrittenNode) -> Fbm {
+        fbm(n.p.y, u32(n.p.z), n.q.xyz)
+    }
+
+    /// The bound, node by node as each kind's own `bound` combines its operands' (made once).
+    fn bound_of(self) -> Bound {
+        var st = [UNBOUNDED; 16]
+        var top: u32 = 0
+        for i in 0..min(self.len, WRITTEN_NODES) {
+            let n = self.nodes[i]
+            let k = n.kind
+            if k <= W_HALF_SPACE {
+                st[top] = self.leaf_bound(i)
+                top += 1
+            } else if k == W_TRANSLATE {
+                st[top - 1] = Shift { by: n.p.xyz }.bound(st[top - 1])
+            } else if k == W_ROTATE {
+                st[top - 1] = Turn { to_local: self.turns[i] }.bound(st[top - 1])
+            } else if k == W_SCALE {
+                st[top - 1] = Size { by: n.p.x }.bound(st[top - 1])
+            } else if k == W_DISPLACE {
+                let r = Written::noise_of(n).range()
+                st[top - 1] = st[top - 1].lowered(abs(n.p.x) * max(abs(r.lo), abs(r.hi)))
+            } else {
+                let (a, b) = (st[top - 2], st[top - 1])
+                top -= 1
+                st[top - 1] = if k == W_UNION { a.and(b) } else if k == W_SMOOTH_UNION { a.and(b).lowered(0.25 * max(n.p.x, 0.0)) } else if k == W_SMOOTH_SUBTRACT { a } else if a.radius <= b.radius { a } else { b }
+            }
+        }
+        st[0]
+    }
+
+    /// How many nodes it holds.
+    pub fn len(self) -> u32 {
+        self.len
+    }
+
+    /// Its nodes' hash (`state_hash` of what it was written as: the key for its caches).
+    pub fn hash(self) -> u64 {
+        var h: u64 = state_hash(self.len)
+        for i in 0..min(self.len, WRITTEN_NODES) {
+            h = h ^ (state_hash(self.nodes[i]) + 0x9E3779B97F4A7C15 + (h << 6) + (h >> 2))
+        }
+        h
+    }
+
+    /// Which matter the leaf whose own surface is nearest `p` is (what a leaf was written with):
+    /// at a point of the surface, the leaf that made it there; where two leaves tie, the first.
+    pub fn matter_at(self, p: vec3) -> u32 {
+        var best = EMPTY
+        var m: u32 = 0
+        for i in 0..min(self.len, WRITTEN_NODES) {
+            let n = self.nodes[i]
+            if n.kind <= W_HALF_SPACE {
+                let d = abs(self.leaf_distance(i, self.local_at(i, p)))
+                if d < best {
+                    best = d
+                    m = n.matter
+                }
+            }
+        }
+        m
+    }
+}
+
+impl Surface for Written {
+    /// Node by node, each its own kind's code, in post-order on a stack (`WRITTEN_DEPTH` deep):
+    /// a leaf at its point taken through its maps; a map gives its operand's (scaled out by a
+    /// scale); a join, its kind's join of its operands; a displacement adds its noise at its own
+    /// point.
+    fn distance(self, p: vec3) -> f32 {
+        // The stack's top two in `x0` (the top) and `x1`, the rest in `st`: a tree no deeper
+        // than 2 (a fold of joins) never touches the array, which GPU code keeps in memory.
+        var st = [0.0; 16]
+        var top: u32 = 0
+        var x0 = 0.0
+        var x1 = 0.0
+        for i in 0..min(self.len, WRITTEN_NODES) {
+            let n = self.nodes[i]
+            let k = n.kind
+            if k == W_SMOOTH_UNION {
+                // (The commonest join first: a body is a fold of them.)
+                x0 = smin(x1, x0, n.p.x)
+                top -= 1
+                if top >= 2 {
+                    x1 = st[top - 2]
+                }
+            } else if k <= W_HALF_SPACE {
+                // (A leaf with no map above it is asked at `p` itself.)
+                let x = if self.up[i] >= WRITTEN_NODES { p } else { self.local_at(i, p) }
+                let v = self.leaf_distance(i, x)
+                if top >= 2 {
+                    st[top - 2] = x1
+                }
+                x1 = x0
+                x0 = v
+                top += 1
+            } else if k == W_SCALE {
+                x0 = Size { by: n.p.x }.distance_out(x0)
+            } else if k == W_DISPLACE {
+                x0 = x0 + n.p.x * Written::noise_of(n).value(self.local_at(i, p))
+            } else if k >= W_UNION {
+                let (a, b) = (x1, x0)
+                x0 = if k == W_UNION { min(a, b) } else if k == W_SMOOTH_UNION { smin(a, b, n.p.x) } else if k == W_INTERSECT { max(a, b) } else if k == W_SMOOTH_SUBTRACT { smax(a, -b, n.p.x) } else { smax(a, b, n.p.x) }
+                top -= 1
+                if top >= 2 {
+                    x1 = st[top - 2]
+                }
+            }
+        }
+        x0
+    }
+
+    /// Made once at the door, node by node as each kind combines its operands'.
+    fn bound(self) -> Bound {
+        self.whole
+    }
+
+    /// Node by node: the scope each node passes its operands (as each kind does), then each
+    /// leaf's own, combined as each kind combines its operands'.
+    fn lipschitz(self, near: f32) -> f32 {
+        var scope = [0.0; 64]
+        if self.len == 0 {
+            return 1.0
+        }
+        scope[self.len - 1] = near
+        var i = self.len
+        while i > 0 {
+            i -= 1
+            let n = self.nodes[i]
+            let k = n.kind
+            let sc = scope[i]
+            if k == W_TRANSLATE || k == W_ROTATE {
+                scope[n.a] = sc
+            } else if k == W_SCALE {
+                scope[n.a] = Size { by: n.p.x }.length_in(sc)
+            } else if k == W_DISPLACE {
+                let r = Written::noise_of(n).range()
+                scope[n.a] = sc + abs(n.p.x) * max(abs(r.lo), abs(r.hi))
+            } else if k >= W_UNION {
+                let s2 = if k == W_UNION || k == W_INTERSECT { sc } else { sc + 1.25 * max(n.p.x, 0.0) }
+                scope[n.a] = s2
+                scope[n.b] = s2
+            }
+        }
+        var st = [0.0; 16]
+        var top: u32 = 0
+        for j in 0..min(self.len, WRITTEN_NODES) {
+            let n = self.nodes[j]
+            let k = n.kind
+            if k <= W_HALF_SPACE {
+                st[top] = self.leaf_lipschitz(j, scope[j])
+                top += 1
+            } else if k == W_DISPLACE {
+                st[top - 1] = st[top - 1] + abs(n.p.x) * Written::noise_of(n).lipschitz()
+            } else if k >= W_UNION {
+                let (a, b) = (st[top - 2], st[top - 1])
+                top -= 1
+                st[top - 1] = max(a, b)
+            }
+        }
+        st[0]
+    }
+
+    /// Each leaf a part, in order.
+    fn parts(self) -> u32 {
+        self.leaves
+    }
+}
+
 /// A surface with noise added to its distance: `s.displace(noise, amp)`.
 pub struct Displace<S, N>: Copy + GpuData + Eq + StateHash {
     pub inner: S,
@@ -3706,8 +4144,12 @@ pub fn value_noise_box_near(p: vec3, half: vec3) -> f32 {
 /// The most lattice points `value_noise_box_near` reads on an axis.
 pub const MOST_BOX_SIDE: u32 = 8
 
-/// Fractal noise: `octaves` layers of value noise, each at twice the frequency and half the
-/// amplitude of the last, sampled at `p + offset`.
+/// The most octaves a fractal noise sums (16: 2^16 times its frequency, past what an f32 point
+/// resolves): its loop's bound, so GPU code that reads a noise's octaves from a value has one.
+pub const FBM_OCTAVES: u32 = 16
+
+/// Fractal noise: `octaves` layers of value noise (at most `FBM_OCTAVES`), each at twice the
+/// frequency and half the amplitude of the last, sampled at `p + offset`.
 pub struct Fbm: Copy + GpuData + Eq + StateHash {
     pub freq: f32,
     pub octaves: u32,
@@ -3725,7 +4167,7 @@ impl Noise for Fbm {
         var s = 0.0
         var a = 1.0
         var fr = self.freq
-        for o in 0..self.octaves {
+        for o in 0..min(self.octaves, FBM_OCTAVES) {
             s += a * value_noise(q * fr + f32(o) * 17.0)
             a *= 0.5
             fr *= 2.0
@@ -3760,7 +4202,7 @@ impl Noise for Fbm {
         var s = 0.0
         var a = 1.0
         var fr = self.freq
-        for o in 0..self.octaves {
+        for o in 0..min(self.octaves, FBM_OCTAVES) {
             let half = abs(footprint) * (0.5 * abs(fr))
             let r = 2.0 * max(half.x, max(half.y, half.z))
             let at = q * fr + f32(o) * 17.0
@@ -4932,6 +5374,85 @@ fn a_boxs_gradient_interval_holds_where_its_outside_part_can_be_zero() {
             }
         }
     }
+}
+
+/// A field written while the program runs (`Writing`) with every leaf kind, every map and join
+/// and a displacement, against the compiled tree of the same kinds: its distance the same to the
+/// bit at 2,000 points, its bound and steepness the same, its parts its leaves.
+@test
+fn a_written_field_is_its_compiled_tree_to_the_bit() {
+    let q = Quat::axis_angle(normalize(vec3(1.0, 2.0, 0.5)), 0.7)
+    var w = writing()
+    let a = w.sphere(0.6, matter: 1)
+    let a1 = w.translate(a, vec3(0.5, 0.0, 0.0))
+    let b = w.round_cone(vec3(-0.6, -0.3, 0.1), vec3(0.1, 0.4, -0.2), r_top: 0.15, r_bottom: 0.35, matter: 2)
+    let ab = w.smooth_union(a1, b, 0.3)
+    let c = w.cuboid(vec3(0.4, 0.3, 0.2), matter: 3)
+    let c1 = w.rotate(c, q)
+    let c2 = w.translate(c1, vec3(0.2, 0.5, 0.3))
+    let abc = w.smooth_subtract(ab, c2, 0.1)
+    let e = w.ellipsoid(vec3(0.3, 0.5, 0.4), matter: 4)
+    let e1 = w.scale(e, 1.5)
+    let all = w.union(abc, e1)
+    let h = w.half_space(normalize(vec3(0.1, 1.0, 0.05)), 0.7, matter: 5)
+    let cut = w.smooth_intersect(all, h, 0.05)
+    let d = w.displace(cut, amp: 0.02, freq: 4.0, octaves: 3)
+    let written = w.done().unwrap()
+    let compiled = sphere(0.6).translate(vec3(0.5, 0.0, 0.0))
+        .smooth_union(round_cone(vec3(-0.6, -0.3, 0.1), vec3(0.1, 0.4, -0.2), r_top: 0.15, r_bottom: 0.35), k: 0.3)
+        .smooth_subtract(cuboid(vec3(0.4, 0.3, 0.2)).rotate(q).translate(vec3(0.2, 0.5, 0.3)), k: 0.1)
+        .union(ellipsoid(vec3(0.3, 0.5, 0.4)).scale(1.5))
+        .smooth_intersect(half_space(normalize(vec3(0.1, 1.0, 0.05)), 0.7), k: 0.05)
+        .displace(fbm(4.0, 3), amp: 0.02)
+    for i in 0..2000 {
+        let p = Box3 { lo: vec3(-2.0), hi: vec3(2.0) }.sample(3, i)
+        let (x, y) = (written.distance(p), compiled.distance(p))
+        assert(x == y, f"at ({p.x}, {p.y}, {p.z}): written {x}, compiled {y}")
+    }
+    let (bw, bc) = (written.bound(), compiled.bound())
+    assert(bw.centre == bc.centre && bw.radius == bc.radius && bw.slope == bc.slope, "the bounds differ")
+    for near in [0.0, 0.1, 1.0] {
+        assert(written.lipschitz(near) == compiled.lipschitz(near), f"the steepness within {near} differs")
+    }
+    assert(written.parts() == 5)
+    // The matter of the nearest leaf.
+    assert(written.matter_at(vec3(1.1, 0.0, 0.0)) == 1)
+    assert(written.matter_at(vec3(-0.6, -0.45, 0.1)) == 2)
+}
+
+/// The door refuses what isn't a field: operands not the nodes before, a leaf out of range, a
+/// number not finite, the reserved rates node, more than one root, too many nodes.
+@test
+fn a_written_field_is_checked_at_the_door() {
+    var w = writing()
+    let a = w.sphere(1.0)
+    let b = w.sphere(2.0)
+    assert(w.done().is_err(), "two roots")
+    var x = writing()
+    let s = x.sphere(0.0)
+    assert(x.done().is_err(), "a radius of 0")
+    var y = writing()
+    let s1 = y.sphere(1.0)
+    let t = y.translate(s1, vec3(2.0e6, 0.0, 0.0))
+    assert(y.done().is_err(), "a number past a million")
+    var z = writing()
+    let s2 = z.sphere(1.0)
+    let s3 = z.sphere(1.0)
+    let u = z.union(s3, s2)
+    assert(z.done().is_err(), "operands out of order")
+    var r = writing()
+    let s4 = r.sphere(1.0)
+    let rr = r.of(W_RATES, s4, 0, vec4(0.0), vec4(0.0))
+    assert(r.done().is_err(), "the reserved rates")
+    var f = writing()
+    var last = f.sphere(1.0)
+    for i in 0..70 {
+        last = f.translate(last, vec3(0.1, 0.0, 0.0))
+    }
+    assert(f.done().is_err(), "too many nodes")
+    var ok = writing()
+    let o = ok.sphere(1.0)
+    assert(ok.done().is_ok())
 }
 
 /// A surface with no bounds of its own for its parts (a cut) gives each the whole surface's: a
