@@ -313,6 +313,12 @@ engine's log and commit messages.
 | Bounds and emptiness derived from ranges, nothing stated | Measured. Every thing's bound is derived; the stack holds its lines in 1.25 times the memory |
 | Steepness derived from ranges | **Not met.** A gradient's range is a box a component, about 1.7 times too long at a corner; for std's shapes the stated steepness is always the tighter, and stays in one marked place until the toolchain bounds the gradient's length |
 | Edge cover from how nearly neighbouring rays passed | **Not met** (parked). Edge error 4.7 to 5.2 of 255, but crawl 20.6 to 28.3 against the reference's 11.8, and 2.1 ms |
+| The frame after the corrections of slice 1d (a draw a thing, closed forms where exact, the compiler's counts, live parts walked by set bits) | Measured. Stage and body 5.7 ms on the M4 (15.4 at its worst); no holes, outline within 0.010 px, no hit off by a pixel on the body |
+| A dear thing's field is never asked by a pixel | Measured. Cells are a bound a ray steps by; the stack has no holes from any of 24 eyes or any judged view. Its eye part is 12.5 ms at 100 m and 14.7 at 3 m (share 2.5), and 0.2% of its hits are off by more than a pixel |
+| The rasteriser handing each pixel its brick halves a walk through cells | **Not met** at one view (12.5 to 6.2 ms at 100 m; 15.3 to 8.2 at 3 m, line 7.7), with five times the hits off by a pixel. Kept as a patch |
+| Cells read by the hardware's filter | **Not met** with four channels (2.07 times dearer than the words). A one-channel 16-bit texture a kernel can write now exists; retried once |
+| Writing less a pixel | **Dead** on the M4: 60 to 20 bytes a pixel moved nothing |
+| The compiler's code against a person's | Measured by the toolchain: 1.21 times on a masked march, 1.09 on a walk through cells, after a day's fixes (1.75 before). The IR as a whole is not where the time is; a counted loop as one node is |
 | A shipped build takes a plain body and a new field | Met for the scene (the compiler does once a command what every pixel would redo). **Not** for the judged builds of the stack, where the same refusal fires in std's value noise |
 
 ## What the design must make impossible
@@ -361,11 +367,25 @@ at a time, into the place this document gives it.
      makes every pixel pay for all of them. So: one ask as written, specialised to each thing as
      it runs, each thing drawn over its own part of the screen. Then looking coarsely first and
      filling in, so that pixels do not all pay for a ray.
-   - 1e: the build measures and picks (direction 5). Closed-form meeting for things built of
+   - 1e: a world of many things. Measured as a probe (slice 1d's last item): a stage, 256 small
+     boxes and 1, 8, 64 walking bodies cost 85, 99 and 256 ms a frame on the M4 where the stage
+     and one body cost 6. Pipelines follow kinds of thing (58 at any count), as designed; draws
+     do not. What breaks, in order: the stand-in's shadow and the edge pass draw every thing
+     over the whole screen; four draws a thing; every moving body lays out 25 cubed roots again
+     each frame; the CPU poses each skeleton in 1.1 ms. So: things of one kind are drawn together
+     from a buffer of their values; a ray that can cross many things (a shadow's) is drawn a kind
+     over only where that kind's things can matter to it, or walks one structure of the world's
+     things; roots are sized from what the eye sees of a thing, as cells are, and a thing that
+     answers exactly keeps none.
+   - 1f: the build measures and picks (direction 5). Closed-form meeting for things built of
      std's shapes; each kind of thing tried each way when the game is built, and a table a thing
      kept (which way, by how finely it is seen). The weights by hand and the count's comparison
      leave. This is now the engine's main line: what follows is built on it.
-   - 1f: edges whose cover changes smoothly as an edge crosses a pixel.
+   - 1g: edges. Kept through time alone (one ray a pixel, a running mean where nothing that went
+     into the pixel changed) took the frame from 6.05 to 3.73 ms and crawled less than nine rays
+     do, but a walking body's edges (one ray a frame) were off 8.0 to 9.3 of 255 and the first
+     frame after a cut 27 to 38: dead as the only way. So: kept through time where what was kept
+     is still true, and rays spent only on pixels where it is not.
      The half-frame line is held at the end of slice 2, when stored light replaces the stand-in's
      shadow ray a pixel.
 2. **Light on that path**: sun, sky, bounce; a body's light and its shadow on other things.
