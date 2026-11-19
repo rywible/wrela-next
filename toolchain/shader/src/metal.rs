@@ -731,6 +731,119 @@ fn expr_resources(e: &ir::Expr, used: &mut BTreeSet<usize>) {
 
 /// A scalar constant as MSL writes it: a float in its shortest decimal that reads back the same
 /// (with `.0` when whole), `INFINITY` and `NAN` by name; integers suffixed.
+/// A loop the MSL writer writes as `for`: it leaves first thing when local `local`, read at
+/// its top, reaches the constant `limit` (the body's statement `check`, an `if` of a `break`, after
+/// only pure `let`s), and its `continuing` only adds the constant `step` to `local`, which nothing
+/// else in the loop stores.
+struct Counted {
+    local: ir::LocalId,
+    check: usize,
+    /// The body's statements (the counter's read, the comparison) only the check used.
+    unused: Vec<usize>,
+    limit: ir::Const,
+    step: ir::Const,
+}
+
+/// [`Counted`] of a loop of `f`, if it is one.
+fn counted(f: &ir::Function, body: &[ir::Stmt], continuing: &[ir::Stmt]) -> Option<Counted> {
+    use ir::{BinOp, Expr, PlaceRoot, Stmt};
+    let konst = |v: ir::ValueId| -> Option<ir::Const> {
+        let mut found = None;
+        ir::visit::walk(&f.body, &mut |s| {
+            if let Stmt::Let(x, Expr::Const(c)) = s
+                && *x == v
+            {
+                found = Some(c.clone());
+            }
+        });
+        found.filter(|c| matches!(c, ir::Const::U32(_) | ir::Const::I32(_)))
+    };
+    let whole = |p: &ir::Place| match p.root {
+        PlaceRoot::Local(l) if p.path.is_empty() => Some(l),
+        _ => None,
+    };
+    // `continuing`: `a = local; b = a + step; local = b`.
+    let cont: Vec<&Stmt> = continuing.iter().filter(|s| !matches!(s, Stmt::At(_))).collect();
+    let [
+        Stmt::Let(a, Expr::Load(pa)),
+        Stmt::Let(b, Expr::Binary(BinOp::Add, a2, sv)),
+        Stmt::Store(pb, b2),
+    ] = cont.as_slice()
+    else {
+        return None;
+    };
+    let local = whole(pa)?;
+    if a2 != a || b2 != b || whole(pb)? != local {
+        return None;
+    }
+    let step = konst(*sv)?;
+    // The body: pure `let`s, then `if cmp { break }` with `cmp = c >= limit`, `c = local`.
+    let mut loads: Vec<(ir::ValueId, usize)> = Vec::new();
+    let mut cmps: Vec<(ir::ValueId, ir::ValueId, ir::ValueId, usize)> = Vec::new();
+    let mut check = None;
+    for (i, s) in body.iter().enumerate() {
+        match s {
+            Stmt::At(_) => {}
+            Stmt::Let(_, Expr::Call(..)) => return None,
+            Stmt::Let(v, Expr::Load(p)) if whole(p) == Some(local) => loads.push((*v, i)),
+            Stmt::Let(v, Expr::Binary(BinOp::Ge, x, n)) => cmps.push((*v, *x, *n, i)),
+            Stmt::Let(..) => {}
+            Stmt::If { cond, then, else_ }
+                if else_.iter().all(|s| matches!(s, Stmt::At(_)))
+                    && then.iter().filter(|s| !matches!(s, Stmt::At(_))).count() == 1
+                    && then.iter().any(|s| matches!(s, Stmt::Break)) =>
+            {
+                let &(cmp, x, n, at) = cmps.iter().find(|(v, ..)| v == cond)?;
+                let &(_, read) = loads.iter().find(|(v, _)| *v == x)?;
+                check = Some((i, n, cmp, at, x, read));
+                break;
+            }
+            _ => return None,
+        }
+    }
+    let (check, n, cmp, cmp_at, read_v, read_at) = check?;
+    let limit = konst(n)?;
+    // What the rest of the body reads: the comparison and the counter's read go where only the
+    // check read them.
+    let mut used = std::collections::HashSet::new();
+    for (i, s) in body.iter().enumerate() {
+        if i == check || i == cmp_at {
+            continue;
+        }
+        ir::visit::walk(std::slice::from_ref(s), &mut |x| {
+            x.for_each_value(&mut |v| {
+                used.insert(v);
+            })
+        });
+    }
+    let mut unused = Vec::new();
+    if !used.contains(&cmp) {
+        unused.push(cmp_at);
+        if !used.contains(&read_v) {
+            unused.push(read_at);
+        }
+    }
+    if std::mem::discriminant(&limit) != std::mem::discriminant(&step) {
+        return None;
+    }
+    // Nothing in the body stores the counter.
+    let mut stored = false;
+    ir::visit::walk(body, &mut |s| {
+        if let Stmt::Store(p, _) = s {
+            stored |= whole(p) == Some(local);
+        }
+    });
+    if stored {
+        return None;
+    }
+    // A step of 0 or a negative one never reaches the limit as `<` reads it: not this form.
+    match step {
+        ir::Const::U32(0) | ir::Const::I32(i32::MIN..=0) => return None,
+        _ => {}
+    }
+    Some(Counted { local, check, unused, limit, step })
+}
+
 fn literal(c: &ir::Const) -> R<String> {
     Ok(match c {
         ir::Const::Bool(b) => b.to_string(),
@@ -1362,6 +1475,37 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
                 let bound = (self.w.checks.loops && !self.w.proofs.ends(body))
                     .then(|| self.fresh("loop_bound"));
                 let gate = (!continuing.is_empty()).then(|| self.fresh("loop_init"));
+                // A counted loop is written as a `for`, not unrolled: a loop that leaves when a
+                // local counter reaches a constant, which its `continuing` steps by a constant.
+                // Metal's compiler does more with that shape than with a `while` whose
+                // `continuing` runs at its top behind a flag (the masked march: 2.52 -> 2.13 ms);
+                // let it unroll, and it gains more there (1.70) but copies a large body pass by
+                // pass elsewhere (the engine's edge rays: 1.54 -> 7.74 ms). backend.md, item 12.
+                if bound.is_none()
+                    && let Some(c) = counted(self.f, body, continuing)
+                {
+                    let it = self.fresh("it");
+                    let l = self.locals[c.local.index()].clone();
+                    let ty = self.w.ty(self.f.locals[c.local.index()].ty)?;
+                    let (limit, step) = (literal(&c.limit)?, literal(&c.step)?);
+                    let _ = writeln!(out, "{ty} {it} = {l};");
+                    let _ = writeln!(out, "#pragma clang loop unroll(disable)");
+                    let _ = writeln!(out, "for (; {it} < {limit}; {it} = {it} + {step}) {{");
+                    let _ = writeln!(out, "{l} = {it};");
+                    // The check goes, and the counter's read and the comparison where only the
+                    // check used them (a value nothing reads is an error under `-Werror`).
+                    let dropped = |i: usize| i == c.check || c.unused.contains(&i);
+                    let rest: Vec<ir::Stmt> = body
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| !dropped(*i))
+                        .map(|(_, s)| s.clone())
+                        .collect();
+                    self.block(&rest, out)?;
+                    out.push_str("}\n");
+                    let _ = writeln!(out, "{l} = {it};");
+                    return Ok(());
+                }
                 if let Some(b) = &bound {
                     let _ = writeln!(out, "uint2 {b} = uint2({}u);", u32::MAX);
                 }
