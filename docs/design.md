@@ -140,6 +140,41 @@ a frame, what rate it draws at before upscaling). It is never something an autho
   Steam Deck. The M4 is stronger than a Deck, so it does not show that. A Windows machine with
   the bar's card is wanted, and every number in this document is provisional until it exists.
 
+## The frame's budget, and two kinds of line
+
+A frame at the bar is 16.6 ms: 1080p at 60 frames a second on the M4 Air, for a whole scene of
+the game, not a test scene. It is shared out once, here, so that a slice's targets come from a
+share and not from a round number somebody liked.
+
+| Share | ms | What it pays for |
+| --- | --- | --- |
+| The eye's rays | 3.0 | what every pixel meets first, for the whole world |
+| Light | 3.0 | keeping stored light, and reading it where a pixel is shaded |
+| Matter light passes through | 2.0 | fog, fire, smoke |
+| Edges | 1.5 | a pixel as the mean of what the look shows over it |
+| Things that move | 1.5 | whatever is found or deposited again each frame |
+| Cells filled as the eye moves | 1.0 | |
+| The look | 1.0 | tone, bloom, the screen |
+| Held back | 3.6 | what is not built (the sea, fur, text), and a frame's own variation |
+
+The shares are a first proposal from what is measured and will move; they move here, said
+plainly, never inside a slice. A test scene of two or three things should take a small part of
+each share, and a slice says what part before it measures. Until many things are measured
+together, nobody knows how a share fills as a world grows: that probe sets the first real
+targets.
+
+**Two kinds of line, and they are not the same.**
+
+- **A kill line ends an idea.** It asks whether a way of doing something pays at all, it is
+  relative (halve this; save a third of that), it is written before measuring, and when it fires
+  the idea leaves in the same change. Nobody goes round one.
+- **A target is a share of the budget.** Missing it does not end anything and needs nobody's
+  decision: it stays open, it is reported again each time, and the report says how far over its
+  share the engine is and which spans hold the difference.
+
+A report keeps the two apart, and leads with correctness, which is neither: a picture that is
+wrong is a fault, whatever it costs.
+
 ## The layers
 
 Dependencies point down. Nothing below knows anything above.
