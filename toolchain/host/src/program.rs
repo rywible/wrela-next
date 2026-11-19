@@ -318,7 +318,7 @@ struct State<E> {
     memory: SharedMemory,
     checker: Checker,
     executor: E,
-    hash: StateHash,
+    hash: HashThread,
     sequencer: Sequencer,
     /// Checked batches wait until the export returns successfully. The program may reuse its
     /// command memory between submits, so each batch has its own bytes.
@@ -1408,7 +1408,7 @@ impl<E: Executor> Program<E> {
             memory: memory.clone(),
             checker: Checker::with_limits(manifest, executor.limits()),
             executor,
-            hash: StateHash::new(),
+            hash: HashThread::new(),
             sequencer: Sequencer::new(),
             pending: Vec::new(),
             before_call: None,
@@ -2184,7 +2184,7 @@ impl<E: Executor> Program<E> {
 
     /// FNV-1a 64 of every byte submitted since the program loaded.
     pub(crate) fn hash(&self) -> StateHash {
-        self.store.data().hash
+        self.store.data().hash.value()
     }
 
     /// Queues an input event: the program reads it (`wrela.input`) from its next call on.
@@ -2738,3 +2738,66 @@ fn request_take<E: Executor>(
 
 #[cfg(test)]
 mod tests;
+
+/// The state hash (FNV-1a 64 of every byte submitted, in order), computed on a thread of its own:
+/// each batch is sent to it as it's submitted, and reading the value asks through the same
+/// channel, so the answer covers every batch submitted before the read, as hashing in place would.
+/// FNV-1a is a chain a byte long, so it can't be computed faster; off the frame's thread it costs
+/// the frame a copy of its bytes (64 walking bodies: about 4 ms of its 9 ms of checking, before).
+pub(crate) struct HashThread {
+    tx: Option<std::sync::mpsc::Sender<HashMsg>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+enum HashMsg {
+    Bytes(Vec<u8>),
+    Ask(std::sync::mpsc::Sender<StateHash>),
+}
+
+impl HashThread {
+    pub(crate) fn new() -> HashThread {
+        let (tx, rx) = std::sync::mpsc::channel::<HashMsg>();
+        let worker = std::thread::Builder::new()
+            .name("wrela state hash".into())
+            .spawn(move || {
+                let mut hash = StateHash::new();
+                for m in rx {
+                    match m {
+                        HashMsg::Bytes(b) => hash.update(&b),
+                        HashMsg::Ask(reply) => {
+                            let _ = reply.send(hash);
+                        }
+                    }
+                }
+            })
+            .expect("a thread for the state hash");
+        HashThread { tx: Some(tx), worker: Some(worker) }
+    }
+
+    pub(crate) fn update(&self, bytes: &[u8]) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(HashMsg::Bytes(bytes.to_vec()));
+        }
+    }
+
+    /// The hash of every byte sent so far.
+    pub(crate) fn value(&self) -> StateHash {
+        let (reply, answer) = std::sync::mpsc::channel();
+        if let Some(tx) = &self.tx
+            && tx.send(HashMsg::Ask(reply)).is_ok()
+            && let Ok(h) = answer.recv()
+        {
+            return h;
+        }
+        StateHash::new()
+    }
+}
+
+impl Drop for HashThread {
+    fn drop(&mut self) {
+        self.tx = None;
+        if let Some(w) = self.worker.take() {
+            let _ = w.join();
+        }
+    }
+}
