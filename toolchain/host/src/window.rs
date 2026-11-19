@@ -107,8 +107,8 @@ struct App<'a> {
     sampled: Vec<f64>,
     /// `WRELA_PACE_TRACE`: each plan and each frame shown, to stderr.
     trace: bool,
-    /// When the last frame was drawn: a window that draws none for a second has stalled.
-    drawn_at: f64,
+    /// How long the loop has waited by its own plan since the last frame: a second is a stall.
+    awake: Awake,
     /// When each frame not yet shown took its input and was presented, by its present's id.
     waiting: HashMap<u64, (f64, f64)>,
     /// Each shown frame's latency, input sampled to photons, and of it input to presented (the
@@ -173,7 +173,8 @@ impl App<'_> {
             return self.fail(e, el);
         }
         self.frame += 1;
-        self.drawn_at = self.now();
+        let now = self.now();
+        self.awake.drew(now);
         if self.run.frames.is_some_and(|n| self.frame >= n) {
             el.exit();
         }
@@ -372,42 +373,119 @@ impl ApplicationHandler<Arrival> for App<'_> {
         }
         self.note_shown();
         let now = self.now();
-        // The first frame builds the program's pipelines: it may take seconds.
-        if self.frame > 1 && now - self.drawn_at > 1.0 {
-            let e = format!(
-                "the window stalled: no frame drawn for {:.0} ms after frame {}; {}",
-                (now - self.drawn_at) * 1e3,
-                self.frame,
-                self.pacer.describe()
-            );
-            return self.fail(Error::Gpu(e), el);
-        }
         let plan = self.pacer.plan(now);
+        let step = self.awake.step(now, self.frame, plan, self.pacer.period());
         if self.trace {
             eprintln!(
-                "pace: at {:.1} ms, frame {} plans input at {:.1} aiming at {:?}; {}",
+                "pace: at {:.1} ms, frame {} {step:?}; {}",
                 now * 1e3,
                 self.frame,
-                plan.at * 1e3,
-                plan.target.map(|t| (t * 1e4).round() / 10.0),
                 self.pacer.describe()
             );
+        }
+        match step {
+            Step::Stalled { waited } => {
+                let e = format!(
+                    "the window stalled: no frame drawn for {:.0} ms after frame {}, {:.0} ms of it waiting by its own plan (the rest held asleep by the system); {}",
+                    (now - self.awake.drawn_at) * 1e3,
+                    self.frame,
+                    waited * 1e3,
+                    self.pacer.describe()
+                );
+                self.fail(Error::Gpu(e), el);
+            }
+            Step::Wait(wake) => {
+                let wake = self.start + Duration::from_secs_f64(wake);
+                el.set_control_flow(ControlFlow::WaitUntil(wake));
+            }
+            Step::Poll => el.set_control_flow(ControlFlow::Poll),
+            Step::Draw(plan) => {
+                self.draw(plan, el);
+                el.set_control_flow(ControlFlow::Poll);
+            }
+        }
+    }
+}
+
+/// Time a window's loop waits by its own plan without drawing before the run is a stall (s).
+const STALL: f64 = 1.0;
+
+/// What a window's loop does when it wakes: draws a frame, waits for one's time, or fails.
+///
+/// It counts how long it has waited by its own plan since it last drew: a stall is [`STALL`] of
+/// that (a plan that never comes due). The time the system held it asleep past the wake it
+/// asked for isn't its own: a window hidden, on another Space, on a display asleep or dimmed,
+/// has its timers held back (macOS's App Nap, about a second at a time). Held past its wake by
+/// more than a refresh, the frame it waited for is overdue and goes at once, aimed at the next
+/// refresh it can still make: planned afresh, it would wait for that refresh, be held again, and
+/// never go. So a window the system runs slowly slows down with it, without failing.
+#[derive(Clone, Copy, Debug)]
+struct Awake {
+    drawn_at: f64,
+    /// When the loop asked to be woken by (the time it asked, polling).
+    asked: f64,
+    /// Since the last frame, the time the loop woke past its asked wake.
+    held: f64,
+    /// Over the run: the time held in holds past a refresh, and the longest.
+    held_total: f64,
+    longest_hold: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Step {
+    /// No frame drawn for [`STALL`] of the loop's own waiting.
+    Stalled {
+        waited: f64,
+    },
+    /// Sleep until this (seconds), a millisecond before the frame's time: a wake can be late,
+    /// and the rest is waited out exactly.
+    Wait(f64),
+    /// The rest waited out by the loop itself, not asleep: an event that comes in the last
+    /// moment before the frame samples is still this frame's.
+    Poll,
+    Draw(Plan),
+}
+
+impl Awake {
+    fn new() -> Awake {
+        Awake { drawn_at: 0.0, asked: 0.0, held: 0.0, held_total: 0.0, longest_hold: 0.0 }
+    }
+
+    /// The loop woke at `now`, `frames` drawn so far, with the pacer's `plan` for now and its
+    /// refresh `period`: what it does.
+    fn step(&mut self, now: f64, frames: u32, plan: Plan, period: f64) -> Step {
+        // Before the first frame, nothing was asked.
+        let late = if frames == 0 { 0.0 } else { (now - self.asked).max(0.0) };
+        self.held += late;
+        if late > period {
+            self.held_total += late;
+            self.longest_hold = self.longest_hold.max(late);
+        }
+        self.asked = now;
+        let waited = now - self.drawn_at - self.held;
+        // The first frame builds the program's pipelines: it may take seconds.
+        if frames > 1 && waited > STALL {
+            return Step::Stalled { waited };
+        }
+        if late > period {
+            return Step::Draw(Plan { at: now, target: plan.target });
         }
         let early = plan.at - now;
         if early > 0.002 {
-            // Woken a millisecond early (a wake can be late), to wait out the rest exactly.
-            let wake = self.start + Duration::from_secs_f64(plan.at - 0.001);
-            el.set_control_flow(ControlFlow::WaitUntil(wake));
-            return;
+            self.asked = plan.at - 0.001;
+            return Step::Wait(self.asked);
         }
         if early > 0.0 {
-            // The rest waited out by the loop itself, not asleep: an event that comes in the
-            // last moment before the frame samples is still this frame's.
-            el.set_control_flow(ControlFlow::Poll);
-            return;
+            return Step::Poll;
         }
-        self.draw(plan, el);
-        el.set_control_flow(ControlFlow::Poll);
+        Step::Draw(plan)
+    }
+
+    /// A frame was drawn, done at `now`.
+    fn drew(&mut self, now: f64) {
+        self.drawn_at = now;
+        self.asked = now;
+        self.held = 0.0;
     }
 }
 
@@ -444,6 +522,10 @@ pub struct WindowRan {
     /// person's ([`WindowRun::arrive`]), when each was sent and which frame took it.
     pub sampled: Vec<f64>,
     pub arrived: Vec<(f64, u32)>,
+    /// How long the system held the loop asleep past the wakes it asked for, each hold past a
+    /// refresh (s): in all, and the longest (a window hidden or its display asleep: App Nap).
+    pub held: f64,
+    pub longest_hold: f64,
 }
 
 /// How the events that arrived as a person's were taken ([`WindowRan::arrivals`]).
@@ -643,7 +725,7 @@ pub fn run(host: &mut Host, run: &WindowRun) -> Result<WindowRan> {
         arrived: Vec::new(),
         sampled: Vec::new(),
         trace: std::env::var_os("WRELA_PACE_TRACE").is_some(),
-        drawn_at: 0.0,
+        awake: Awake::new(),
         waiting: HashMap::new(),
         latencies: Vec::new(),
         before_present: Vec::new(),
@@ -692,6 +774,8 @@ pub fn run(host: &mut Host, run: &WindowRun) -> Result<WindowRan> {
         silent: app.silent,
         sampled: app.sampled,
         arrived: app.arrived,
+        held: app.awake.held_total,
+        longest_hold: app.awake.longest_hold,
     })
 }
 
@@ -699,6 +783,106 @@ pub fn run(host: &mut Host, run: &WindowRun) -> Result<WindowRan> {
 mod tests {
     use super::*;
     use wrela_abi::input::key_code;
+
+    /// The window's loop as `about_to_wait` drives it, against a 60 Hz display that shows a
+    /// frame at the first refresh 4 ms after its present, with 5 ms of work a frame. The
+    /// system wakes the loop when `wake(asked)` says (asked, on time). The times each frame was
+    /// drawn, or the stall, as the window says it.
+    fn drive(frames: u32, wake: impl Fn(f64) -> f64) -> std::result::Result<Vec<f64>, String> {
+        let t = 1.0 / 60.0;
+        let mut pacer = Pacer::new(t);
+        let mut awake = Awake::new();
+        let (mut now, mut drawn, mut id) = (0.0f64, Vec::new(), 0u64);
+        let mut coming: Vec<(u64, f64)> = Vec::new();
+        while drawn.len() < frames as usize {
+            for &(k, at) in coming.iter().filter(|c| c.1 <= now) {
+                pacer.shown(k, at);
+            }
+            coming.retain(|c| c.1 > now);
+            let plan = match awake.step(now, drawn.len() as u32, pacer.plan(now), t) {
+                Step::Stalled { waited } => {
+                    return Err(format!(
+                        "stalled at {now:.3} s after frame {}, {:.0} ms waited",
+                        drawn.len(),
+                        waited * 1e3
+                    ));
+                }
+                Step::Wait(at) => {
+                    now = wake(at);
+                    continue;
+                }
+                // Polled: the loop runs again a moment later.
+                Step::Poll => {
+                    now += 0.0001;
+                    continue;
+                }
+                Step::Draw(plan) => plan,
+            };
+            let presented = now + 0.005;
+            pacer.presented(id, now, presented, plan.target);
+            assert!(plan.target.is_none_or(|t| t > presented), "aimed behind its present");
+            coming.push((id, ((presented + 0.004) / t).ceil() * t));
+            id += 1;
+            now = presented;
+            awake.drew(now);
+            drawn.push(now);
+        }
+        Ok(drawn)
+    }
+
+    #[test]
+    fn a_window_the_system_holds_asleep_slows_down_and_does_not_stall() {
+        // Woken on time: a frame a refresh.
+        let on_time = drive(200, |asked| asked).unwrap();
+        let rate = 100.0 / (on_time[199] - on_time[99]);
+        assert!((rate - 60.0).abs() < 1.0, "{rate} f/s on time");
+        // From 0.5 s on (30 frames), timers held to the next whole second past their time (App
+        // Nap, a window hidden or its display asleep): a frame a second or so, every one drawn,
+        // no stall.
+        let napped = |asked: f64| if asked < 0.5 { asked } else { asked.floor() + 1.0 + 0.01 };
+        let slow = drive(50, napped).unwrap();
+        let rate = 10.0 / (slow[49] - slow[39]);
+        assert!(rate > 0.4 && rate < 1.1, "{rate} f/s held");
+        // One hold of 1.5 s (a process stopped and continued): no stall either.
+        let once = |asked: f64| if (2.0..2.02).contains(&asked) { asked + 1.5 } else { asked };
+        let held = drive(300, once).unwrap();
+        assert!(held.windows(2).any(|w| w[1] - w[0] > 1.4));
+    }
+
+    #[test]
+    fn a_plan_that_never_comes_due_is_a_stall() {
+        // Plans always 0.1 s ahead, and a loop woken on time: it stalls a second after its last
+        // frame.
+        let t = 1.0 / 60.0;
+        let ahead = |now: f64| Plan { at: now + 0.1, target: Some(now + 0.12) };
+        let mut awake = Awake::new();
+        awake.drew(0.5);
+        let mut now = 0.5;
+        let waited = loop {
+            match awake.step(now, 9, ahead(now), t) {
+                Step::Stalled { waited } => break waited,
+                Step::Wait(at) => now = at,
+                Step::Poll => now += 0.0001,
+                Step::Draw(p) => panic!("drew {p:?} at {now}"),
+            }
+            assert!(now < 3.0, "never stalled");
+        };
+        assert!((now - 1.5).abs() < 0.1 && waited > STALL, "stalled at {now}");
+        // One wake held 0.3 s past its time: the frame goes then, and a loop woken on time
+        // after it stalls a second after that frame.
+        let mut awake = Awake::new();
+        awake.drew(0.0);
+        let Step::Wait(at) = awake.step(0.0, 9, ahead(0.0), t) else { panic!() };
+        let Step::Draw(p) = awake.step(at + 0.3, 9, ahead(at + 0.3), t) else { panic!() };
+        assert_eq!(p.at, at + 0.3);
+        awake.drew(at + 0.31);
+        let mut now = at + 0.31;
+        while !matches!(awake.step(now, 10, ahead(now), t), Step::Stalled { .. }) {
+            now = awake.asked;
+        }
+        assert!((now - (at + 1.31)).abs() < 0.1, "stalled at {now}");
+        assert!((awake.longest_hold - 0.3).abs() < 1e-9);
+    }
 
     fn at(frame: u32, event: Event) -> Scripted {
         Scripted { at: At::Frame(frame), event, payload: Vec::new() }

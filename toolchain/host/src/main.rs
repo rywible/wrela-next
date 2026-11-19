@@ -545,6 +545,13 @@ fn windowed(args: &Args) -> Result<(), Failure> {
         );
         println!("pacer at the end: {}", ran.pacer);
     }
+    if ran.longest_hold > 0.0 {
+        println!(
+            "held asleep by the system past its wakes by more than a refresh: {:.0} ms in all, {:.0} ms at the longest (a window hidden or its display asleep: the frames went as it woke)",
+            ran.held * 1e3,
+            ran.longest_hold * 1e3
+        );
+    }
     if let Some(a) = ran.arrivals() {
         println!(
             "arrived as a person's: {} events, taken {:.2} ms after (median), {:.2} ms (worst); {} taken by a later frame than the first that sampled after them{}",
