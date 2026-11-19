@@ -47,6 +47,7 @@ use std::gpu::{
     label, read,
 }
 use std::derive::reads_only_input
+use std::hash::{StateHash, state_hash}
 use std::io::{Pending, print}
 
 /// A brick's cells a side, and its texels a side.
@@ -712,8 +713,9 @@ pub struct Kept {
     /// Free slots when last read, and whether folding is under way.
     free_slots: u32,
     folding: bool,
-    /// Its field's answers at its probes last frame (`same_as_before`).
-    probes: Vec<f32>,
+    /// Its field's `StateHash` last frame (`same_as_before`).
+    hash: u64,
+    hashed: bool,
     /// Where its matter can be (centre, radius), derived from its field's ranges (or, where they
     /// can't say yet, as std's shapes state it: `ranges::bound_of`), and whether derived.
     derived: vec4,
@@ -779,7 +781,8 @@ pub fn kept() -> Kept {
         nodes_most: 1,
         free_slots: 0,
         folding: false,
-        probes: Vec::new(),
+        hash: 0,
+        hashed: false,
         weights: buffer(1),
         weighed: false,
         weight: Vec::new(),
@@ -796,36 +799,6 @@ pub fn kept() -> Kept {
         bound_derived: false,
     }
 }
-
-/// Whether `field` says exactly where every ray meets it (`Surface::meets`). A STAND-IN, in this
-/// one place, until std says it as a constant of the field's code (gap 26): asked of `RAYS` rays
-/// through its bound `b` (from points round it toward points in it), true where every one that
-/// can meet it is told exactly.
-fn meets_exactly<M: Field<Substance>>(field: M, b: vec4) -> bool {
-    var exact = true
-    var met = false
-    for k in 0..RAYS {
-        let f = f32(k) + 0.5
-        let u = vec3(fract(f * 0.618034), fract(f * 0.754878), fract(f * 0.569840)) * 2.0 - vec3(1.0)
-        let v = vec3(fract(f * 0.381966), fract(f * 0.245122), fract(f * 0.430160)) * 2.0 - vec3(1.0)
-        let o = b.xyz + normalize(u + vec3(1.0e-3)) * (2.0 * b.w)
-        let d = normalize(b.xyz + v * (0.5 * b.w) - o)
-        let m = field.meets(o, d)
-        if m.near <= m.far {
-            met = true
-            if !m.exact() {
-                exact = false
-            }
-        }
-    }
-    exact && met
-}
-
-/// Rays `meets_exactly` asks.
-const RAYS: u32 = 64
-
-/// Places `same_as_before` asks a field at (a 3 x 3 x 3 lattice through its bound).
-const PROBES: u32 = 27
 
 impl Kept {
     /// Where its matter can be (centre, radius; radius 0 until known), derived.
@@ -904,30 +877,19 @@ impl Kept {
         self.grid.scope = max(2.0 * brick, length(size) * brick)
     }
 
-    /// Whether `field` is as it was last frame (false the first frame, and always where its
-    /// distance reads more than the field and the point: `std::derive::reads_only_input`, a
-    /// constant of the build). Where it reads only them it changed exactly when its value did;
-    /// that compare is a STAND-IN, in this one place, until a field's value can be compared
-    /// without std's unsafe core (gap 27): its answers at `PROBES` places through its bound.
-    fn same_as_before<M: Field<Substance>>(mut self, field: M) -> bool {
+    /// Whether `field` is as it was last frame: where its distance reads nothing but the field
+    /// and the point (`std::derive::reads_only_input`, a constant of the build), exactly when its
+    /// value is (its `StateHash`, kept from frame to frame); else never (it reads time or state).
+    /// True the first frame.
+    fn same_as_before<M: Field<Substance> + StateHash>(mut self, field: M) -> bool {
         if !reads_only_input(|a: (M, vec3)| a.0.distance(a.1)) {
             return false
         }
-        var out: Vec<f32> = Vec::with_capacity(PROBES)
-        let b = self.derived
-        for k in 0..PROBES {
-            let o = vec3(f32(k % 3), f32((k / 3) % 3), f32(k / 9)) - vec3(1.0)
-            out.push(field.distance(b.xyz + o * (0.5 * b.w)))
-        }
-        var same = self.probes.len() == out.len()
-        var i: u32 = 0
-        while i < out.len() && same {
-            same = out[i] == self.probes[i]
-            i += 1
-        }
-        let first = self.probes.len() == 0
-        self.probes = take out
-        same || first
+        let h = state_hash(field)
+        let same = !self.hashed || h == self.hash
+        self.hash = h
+        self.hashed = true
+        same
     }
 
     /// The ways it can be answered, from the count (`cost`): by its cells where it is still and its
@@ -953,7 +915,7 @@ impl Kept {
     /// Brought up to date for this frame: seen whether it moves, then its roots laid where it is
     /// (a moving thing's every frame), and a still thing's cells deposited where its roots chose
     /// them. `size` (m) is the finest it was asked at last frame.
-    pub fn deposit<M: Field<Substance>>(mut self, field: M, size: f32) {
+    pub fn deposit<M: Field<Substance> + StateHash>(mut self, field: M, size: f32) {
         self.frame += 1
         self.grid.frame = self.frame
         if self.derived.w <= 0.0 {
@@ -977,7 +939,7 @@ impl Kept {
                         self.weights = buffer_of(w)
                         self.weight = weights(field, v[0], v[1])
                         self.weighed = true
-                        self.exact = meets_exactly(field, self.derived)
+                        self.exact = M::EXACT_MEETS
                         self.counts = None
                     },
                     _ => {},
