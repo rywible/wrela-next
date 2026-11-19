@@ -1,0 +1,197 @@
+// Things whose fields say where each of their parts can be (`Parted`), and how GPU code asks such a
+// thing that moves (`Rayed`): no roots. A ray finds the parts it can come near from the parts' own
+// bounds along it, once as it begins, and marches by those parts alone (`distance_live`).
+//
+// THE MARKED PLACE (gap 31, NOTES): std's surfaces say neither where part `i` can be (its bound
+// by index) nor which parts are live along a ray (only over a box, `Surface::live`). Until they
+// do, the parts' bounds are written here by hand for std's round cones, the two smooth unions,
+// `With` and a `Shift` of them: the shapes a body is made of. When std has them, this file goes
+// and every thing that moves asks its parts so.
+//
+// Why a part left out of a ray changes nothing it meets: a smooth union of distance `k` changes
+// the distance only where its operands are within `k` of each other, and lowers it by at most a
+// quarter of `k`. If a part's own distance is at least twice `k` all along the ray, then wherever
+// the surface can be on the ray (the rest within a quarter of `k` of it) the part is farther than
+// `k` from the rest and blends nothing in: the distance without it is the distance, and elsewhere
+// on the ray it is a bound of a surface that is the same on the ray. Unions nested sum their `k`s.
+
+use matter::asked::{Asked, Begun, Stepped, Told, Within, box_span}
+use matter::cells::{Grid, HOLDS, NO_BRICK}
+use matter::substance::Substance
+use std::derive::gradient
+use std::field::{Field, Live, RoundCone, Shift, SmoothUnion, SmoothUnionAll, Surface, Warp, With}
+
+/// Where a part can be: within `r` of the segment from `a` to `b`; and how far the blends above it
+/// can reach past that (`reach`: a part farther than `r + reach` from a ray changes nothing it
+/// meets).
+pub struct Capsule: Copy + GpuData {
+    pub a: vec3,
+    pub r: f32,
+    pub b: vec3,
+    pub reach: f32,
+}
+
+/// A surface that says where each of its parts can be (§23's numbering).
+pub trait Parted: Surface {
+    fn capsule(self, i: u32) -> Capsule
+}
+
+impl Parted for RoundCone {
+    fn capsule(self, i: u32) -> Capsule {
+        Capsule { a: self.a, r: max(self.r1, self.r2), b: self.b, reach: 0.0 }
+    }
+}
+
+impl<S: Parted, C: Copy + GpuData> Parted for With<S, C> {
+    fn capsule(self, i: u32) -> Capsule {
+        self.inner.capsule(i)
+    }
+}
+
+impl<S: Parted> Parted for Warp<S, Shift> {
+    fn capsule(self, i: u32) -> Capsule {
+        var c = self.inner.capsule(i)
+        c.a += self.map.by
+        c.b += self.map.by
+        c
+    }
+}
+
+impl<A: Parted, B: Parted> Parted for SmoothUnion<A, B> {
+    fn capsule(self, i: u32) -> Capsule {
+        let n = self.a.parts()
+        var c = if i < n { self.a.capsule(i) } else { self.b.capsule(i - n) }
+        c.reach += 2.0 * self.k
+        c
+    }
+}
+
+impl<S: Parted, const N: u32> Parted for SmoothUnionAll<S, N> {
+    fn capsule(self, i: u32) -> Capsule {
+        let per = if N > 0 { self.parts[0].parts() } else { 1 }
+        var c = self.parts[min(i / per, N - 1)].capsule(i % per)
+        c.reach += 2.0 * self.k
+        c
+    }
+}
+
+/// The least distance between the segments from `p0` to `p1` and from `q0` to `q1`.
+fn segments_apart(p0: vec3, p1: vec3, q0: vec3, q1: vec3) -> f32 {
+    let d1 = p1 - p0
+    let d2 = q1 - q0
+    let r = p0 - q0
+    let a = dot(d1, d1)
+    let e = dot(d2, d2)
+    let f = dot(d2, r)
+    var s = 0.0
+    var t = 0.0
+    if a <= 1.0e-12 && e <= 1.0e-12 {
+        return length(r)
+    }
+    if a <= 1.0e-12 {
+        t = clamp(f / e, 0.0, 1.0)
+    } else {
+        let c = dot(d1, r)
+        if e <= 1.0e-12 {
+            s = clamp(-c / a, 0.0, 1.0)
+        } else {
+            let b = dot(d1, d2)
+            let den = a * e - b * b
+            s = if den > 1.0e-12 { clamp((b * f - c * e) / den, 0.0, 1.0) } else { 0.0 }
+            t = (b * s + f) / e
+            if t < 0.0 {
+                t = 0.0
+                s = clamp(-c / a, 0.0, 1.0)
+            } else if t > 1.0 {
+                t = 1.0
+                s = clamp((b - c) / a, 0.0, 1.0)
+            }
+        }
+    }
+    length(p0 + d1 * s - (q0 + d2 * t))
+}
+
+/// Every part live.
+const ALL: u32 = 4294967295
+
+/// A moving thing whose field says where its parts are, as GPU code asks it: its field and its
+/// grid (only a box round it: no roots). A ray's walk holds the parts it can come near (`mask`,
+/// found as it begins, `begun`); its steps ask only them.
+pub struct Rayed<M>: Copy + GpuData {
+    pub(package) field: M,
+    pub(package) grid: Grid,
+}
+
+impl<M: Field<Substance> + Parted> Rayed<M> {
+    fn live_at(self, p: vec3, mask: u32) -> f32 {
+        let g = self.grid
+        let v = if mask == ALL { self.field.distance(p) } else { self.field.distance_live(p, Live::from_word(mask)) }
+        clamp(v, -g.scope, g.scope) / g.stated
+    }
+
+    // (Plain functions the `Asked` impl calls: the associated type `Rayed<M>::Walk` is not seen
+    // to be `Within` in generic code, gap 30.)
+    fn rayed_begun(self, o: vec3, d: vec3, wide: f32, spread: f32) -> Begun<Within> {
+        let g = self.grid
+        let box = box_span(o, d, g.lo, g.hi)
+        let near = max(box.x, 0.0)
+        var mask: u32 = 0
+        if box.y >= near {
+            // (The parts whose capsule the ray's stretch through the grid passes within their
+            // reach and half the ray's widest width there; more than 32 parts: all.)
+            let a0 = o + d * near
+            let a1 = o + d * box.y
+            let half = 0.5 * (wide + spread * box.y)
+            let n = self.field.parts()
+            for i in 0..min(n, 32) {
+                let c = self.field.capsule(i)
+                if segments_apart(a0, a1, c.a, c.b) <= c.r + c.reach + half {
+                    mask = mask | (1 << i)
+                }
+            }
+            if n > 32 {
+                mask = ALL
+            }
+        }
+        let walk = Within { exit: box.y, node: HOLDS, mask, steep: self.grid.stated }
+        if mask == 0 {
+            return Begun { near: box.y, far: box.x - 1.0, walk: Within { exit: -1.0, node: NO_BRICK, mask: 0, steep: 1.0 } }
+        }
+        Begun { near: box.x, far: box.y, walk }
+    }
+}
+
+impl<M: Field<Substance> + Parted> Asked for Rayed<M> {
+    type Walk = Within
+
+    fn begun(self, o: vec3, d: vec3, wide: f32, spread: f32) -> Begun<Within> {
+        self.rayed_begun(o, d, wide, spread)
+    }
+
+    fn step(self, walk: Within, p: vec3, d: vec3, inv: vec3, t: f32, size: f32) -> Stepped<Within> {
+        let f = self.live_at(p, walk.mask)
+        Stepped { x: f, y: f, walk }
+    }
+
+    fn far(self, walk: Within, p: vec3, t: f32, size: f32) -> f32 {
+        self.live_at(p, walk.mask)
+    }
+
+    fn facing(self, walk: Within, p: vec3, t: f32, came: vec3, size: f32) -> vec3 {
+        let field = self.field
+        let live = Live::from_word(walk.mask)
+        let grad = if walk.mask == ALL { field.gradient(p) } else { gradient(|q: vec3| field.distance_live(q, live), p) }
+        if dot(grad, grad) > 1.0e-8 {
+            return normalize(grad)
+        }
+        came
+    }
+
+    fn made_of(self, walk: Within, p: vec3, t: f32) -> Substance {
+        self.field.channels(p)
+    }
+
+    fn told(self, walk: Within, p: vec3, size: f32) -> Told {
+        Told { node: walk.node, level: 0, side: 0.0, off: 0.0, cells: 0.0, field: self.live_at(p, ALL), exit: walk.exit, brick: walk.mask }
+    }
+}
