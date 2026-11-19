@@ -1372,6 +1372,60 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
         Ok(self.val(v)?.text)
     }
 
+    /// The loop body `b`'s leading exit test, where it has one a `for`'s condition can hold:
+    /// pure `let`s (none reading the counter `counter`, set only after the condition), each read
+    /// only by them and the test, then `if cond { break }`. Its condition as MSL, with the
+    /// index of the test's `if` in `b`.
+    fn leading_test(&mut self, b: &[ir::Stmt], counter: ir::LocalId) -> R<Option<(String, usize)>> {
+        let mut lets: Vec<(ir::ValueId, &ir::Expr)> = Vec::new();
+        for (i, s) in b.iter().enumerate() {
+            match s {
+                ir::Stmt::At(_) => {}
+                ir::Stmt::Let(v, e) => {
+                    let reads_counter =
+                        matches!(e, ir::Expr::Load(p) if p.root_local() == Some(counter));
+                    let simple =
+                        matches!(e, ir::Expr::Load(p) if p.root_local().is_some()) || pure(e);
+                    if reads_counter || !simple {
+                        return Ok(None);
+                    }
+                    lets.push((*v, e));
+                }
+                ir::Stmt::If { cond, then, else_ }
+                    if then.iter().filter(|s| !matches!(s, ir::Stmt::At(_))).count() == 1
+                        && then.iter().any(|s| matches!(s, ir::Stmt::Break))
+                        && else_.iter().all(|s| matches!(s, ir::Stmt::At(_))) =>
+                {
+                    // Every use of the lets' values is in the lets or the condition.
+                    let mut inside: HashMap<ir::ValueId, u32> = HashMap::new();
+                    for (_, e) in &lets {
+                        e.for_each_value(&mut |x| *inside.entry(x).or_default() += 1);
+                    }
+                    *inside.entry(*cond).or_default() += 1;
+                    if lets
+                        .iter()
+                        .any(|(v, _)| inside.get(v).copied().unwrap_or(0) != self.uses[v.index()])
+                        || !lets.iter().any(|(v, _)| v == cond)
+                    {
+                        return Ok(None);
+                    }
+                    // Written where used: the lets add no statements.
+                    let mut scratch = String::new();
+                    for (v, e) in &lets {
+                        let text = self.value(*v, e, &mut scratch)?;
+                        self.vals[v.index()] = Some(text);
+                    }
+                    if !scratch.is_empty() {
+                        return Ok(None);
+                    }
+                    return Ok(Some((self.arg(*cond)?, i)));
+                }
+                _ => return Ok(None),
+            }
+        }
+        Ok(None)
+    }
+
     fn ty_of(&self, v: ir::ValueId) -> ir::TypeId {
         self.f.value_ty(v)
     }
@@ -1486,17 +1540,27 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
                     let (limit, step) = (literal(&c.limit)?, literal(&c.step)?);
                     let _ = writeln!(out, "{ty} {it} = {l};");
                     let _ = writeln!(out, "#pragma clang loop unroll(disable)");
-                    let _ = writeln!(out, "for (; {it} < {limit}; {it} = {it} + {step}) {{");
-                    let _ = writeln!(out, "{l} = {it};");
                     // The check goes, and the counter's read and the comparison where only the
                     // check used them (a value nothing reads is an error under `-Werror`).
                     let dropped = |i: usize| i == c.check || c.unused.contains(&i);
-                    let rest: Vec<ir::Stmt> = body
+                    let mut rest: Vec<ir::Stmt> = body
                         .iter()
                         .enumerate()
                         .filter(|(i, _)| !dropped(*i))
                         .map(|(_, s)| s.clone())
                         .collect();
+                    // A second test right after, of pure reads nothing else uses (the set-bit
+                    // walk's `if bits == 0 { break }`), joins the condition: Metal's compiler
+                    // does more with one exit (the masked march: 0.062 of its 0.089 ms).
+                    let also = match self.leading_test(&rest, c.local)? {
+                        Some((cond, upto)) => {
+                            rest.drain(..=upto);
+                            format!(" && !({cond})")
+                        }
+                        None => String::new(),
+                    };
+                    let _ = writeln!(out, "for (; {it} < {limit}{also}; {it} = {it} + {step}) {{");
+                    let _ = writeln!(out, "{l} = {it};");
                     self.loop_depth += 1;
                     self.block(&rest, out)?;
                     self.loop_depth -= 1;
