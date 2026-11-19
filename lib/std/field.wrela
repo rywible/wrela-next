@@ -255,7 +255,7 @@ pub trait Surface: Copy + GpuData {
     /// nothing a ray can come near.
     fn part_bound(self, i: u32) -> PartBound {
         let b = self.bound()
-        PartBound { a: b.centre, r: b.radius, b: b.centre, reach: 0.0 }
+        PartBound { a: b.centre, r: b.radius, b: b.centre, reach: 0.0, lowers: 0.0 }
     }
 
     /// Its distance at `p`, asking only the parts `live` names: what `distance` gives, bit for
@@ -751,13 +751,18 @@ fn span_bits(first: u32, count: u32, w: u32) -> u32 {
 }
 
 /// Where a part of a surface can be (`Surface::part_bound`): within `r` of the segment from `a` to
-/// `b` (a sphere where they're one point), and how far the joins above it can carry its effect
-/// past that (`reach`).
+/// `b` (a sphere where they're one point), how far the joins above it can carry its effect past
+/// that (`reach`), and of that, how far they lower the distance (`lowers`): the whole surface lies
+/// within some part's `r + lowers` of its segment (where the whole is at most 0, a part's own
+/// distance is at most what the joins above it lower it by), so a march for the surface needs only
+/// `lowers`; a part's effect on the distance, `reach` (`live_along`). A smooth join of width `k`
+/// adds `k` and its lowering to `reach`, its lowering alone to `lowers`.
 pub struct PartBound: Copy + GpuData {
     pub a: vec3,
     pub r: f32,
     pub b: vec3,
     pub reach: f32,
+    pub lowers: f32,
 }
 
 /// The parts of `s` a segment from `a` to `b` can come near: those whose bound
@@ -1274,7 +1279,7 @@ pub fn sphere(radius: f32) -> Sphere {
 
 impl Surface for Sphere {
     fn part_bound(self, i: u32) -> PartBound {
-        PartBound { a: vec3(), r: abs(self.radius), b: vec3(), reach: 0.0 }
+        PartBound { a: vec3(), r: abs(self.radius), b: vec3(), reach: 0.0, lowers: 0.0 }
     }
 
     const EXACT_MEETS: bool = true
@@ -1558,7 +1563,7 @@ pub fn round_cone(a: vec3, b: vec3, r_top: f32, r_bottom: f32) -> RoundCone {
 impl Surface for RoundCone {
     /// Its segment, at its larger radius.
     fn part_bound(self, i: u32) -> PartBound {
-        PartBound { a: self.a, r: max(self.r1, self.r2), b: self.b, reach: 0.0 }
+        PartBound { a: self.a, r: max(self.r1, self.r2), b: self.b, reach: 0.0, lowers: 0.0 }
     }
 
     const EXACT_MEETS: bool = true
@@ -1628,7 +1633,7 @@ pub fn cuboid(half: vec3) -> Cuboid {
 
 impl Surface for Cuboid {
     fn part_bound(self, i: u32) -> PartBound {
-        PartBound { a: vec3(), r: length(self.half), b: vec3(), reach: 0.0 }
+        PartBound { a: vec3(), r: length(self.half), b: vec3(), reach: 0.0, lowers: 0.0 }
     }
 
     const EXACT_MEETS: bool = true
@@ -1894,12 +1899,14 @@ pub struct SmoothUnion<A, B>: Copy + GpuData + Eq + StateHash {
 
 impl<A: Surface, B: Surface> Surface for SmoothUnion<A, B> {
     /// Its operand's, reaching `k` farther (where its operands are within `k` of each other the
-    /// blend can move) and a quarter of `k` more (the most it lowers the other's distance).
+    /// blend can move) and a quarter of `k` more (the most it lowers the other's distance), which
+    /// it lowers by too.
     fn part_bound(self, i: u32) -> PartBound {
         let n = self.a.parts()
         var c = if i < n { self.a.part_bound(i) } else { self.b.part_bound(i - n) }
         let k = max(self.k, 0.0)
         c.reach += k + 0.25 * k
+        c.lowers += 0.25 * k
         c
     }
 
@@ -2012,7 +2019,7 @@ pub struct UnionAll<S, const N: u32>: Copy + GpuData + Eq + StateHash {
 impl<S: Surface, const N: u32> Surface for UnionAll<S, N> {
     fn part_bound(self, i: u32) -> PartBound {
         if N == 0 {
-            return PartBound { a: vec3(), r: EMPTY, b: vec3(), reach: 0.0 }
+            return PartBound { a: vec3(), r: EMPTY, b: vec3(), reach: 0.0, lowers: 0.0 }
         }
         let (k, j) = part_of(self.parts, i)
         self.parts[k].part_bound(j)
@@ -2190,15 +2197,17 @@ pub struct SmoothUnionAll<S, const N: u32>: Copy + GpuData + Eq + StateHash {
 
 impl<S: Surface, const N: u32> Surface for SmoothUnionAll<S, N> {
     /// Its element's, reaching `k` farther and the fold's whole lowering more
-    /// (`fold_lowering`, at most `k`: 0.817 k for 17 parts).
+    /// (`fold_lowering`, at most `k`: 0.817 k for 17 parts), which it lowers by too.
     fn part_bound(self, i: u32) -> PartBound {
         if N == 0 {
-            return PartBound { a: vec3(), r: EMPTY, b: vec3(), reach: 0.0 }
+            return PartBound { a: vec3(), r: EMPTY, b: vec3(), reach: 0.0, lowers: 0.0 }
         }
         let (e, j) = part_of(self.parts, i)
         var c = self.parts[e].part_bound(j)
         let k = max(self.k, 0.0)
-        c.reach += k + fold_lowering(N, k)
+        let l = fold_lowering(N, k)
+        c.reach += k + l
+        c.lowers += l
         c
     }
 
@@ -2494,16 +2503,16 @@ pub struct Warp<S, M>: Copy + GpuData + Eq + StateHash {
 
 impl<S: Surface, M: PointMap> Surface for Warp<S, M> {
     /// Its surface's, moved by a map that keeps shapes (`PointMap::SIMILAR`: a capsule's ends
-    /// map as points, its radius and reach as lengths); by any other, its whole bound.
+    /// map as points, its radius, reach and lowering as lengths); by any other, its whole bound.
     fn part_bound(self, i: u32) -> PartBound {
         if !M::SIMILAR {
             let b = self.bound()
-            return PartBound { a: b.centre, r: b.radius, b: b.centre, reach: 0.0 }
+            return PartBound { a: b.centre, r: b.radius, b: b.centre, reach: 0.0, lowers: 0.0 }
         }
         let c = self.inner.part_bound(i)
         let a = self.map.bound(Bound { centre: c.a, radius: c.r, slope: 1.0 })
         let b = self.map.bound(Bound { centre: c.b, radius: c.r, slope: 1.0 })
-        PartBound { a: a.centre, r: max(a.radius, b.radius), b: b.centre, reach: self.map.distance_out(c.reach) }
+        PartBound { a: a.centre, r: max(a.radius, b.radius), b: b.centre, reach: self.map.distance_out(c.reach), lowers: self.map.distance_out(c.lowers) }
     }
 
     const EXACT_MEETS: bool = S::EXACT_MEETS
@@ -4025,6 +4034,52 @@ fn a_segments_live_parts_give_its_distance_where_the_surface_can_be() {
     assert(kept < 300 * 18, "every segment kept every part")
     let far = live_along(s, b.centre + vec3(5.0 * b.radius, 0.0, 0.0), b.centre + vec3(5.0 * b.radius, 1.0, 0.0), 0.0)
     assert(far.count(18) == 0, "a far segment kept parts")
+}
+
+/// Each part's lowering is its joins' alone (here a fold of 17 at `k` 0.03, then a join at 0.004),
+/// less than its reach; and every point inside the surface is within some part's `r + lowers` of
+/// its segment, some only so (inside, but outside every part's own bound).
+@test
+fn the_surface_is_within_its_parts_lowering() {
+    let s = parted_body()
+    let cone = s.part_bound(3)
+    let wand = s.part_bound(17)
+    let fold = fold_lowering(17, 0.03) + 0.001
+    assert(abs(cone.lowers - fold) <= 1.0e-6, f"a cone lowers by {cone.lowers}, not {fold}")
+    assert(abs(wand.lowers - 0.001) <= 1.0e-6, f"the wand lowers by {wand.lowers}")
+    assert(abs(cone.reach - (0.034 + fold)) <= 1.0e-6, f"a cone reaches {cone.reach}")
+    // Points in the seams between neighbouring cones, where the fold lowers the distance most.
+    var inside = 0
+    var lowered = 0
+    for i in 0..17 {
+        let c = s.part_bound(i)
+        let n = s.part_bound((i + 1) % 17)
+        for u in 0..24 {
+            for v in 0..24 {
+                let t = f32(u) / 23.0
+                let q = c.a + (c.b - c.a) * t
+                let m = n.a + (n.b - n.a) * t
+                let p = q + (m - q) * (0.2 + 0.6 * f32(v) / 23.0)
+                if s.distance(p) > 0.0 {
+                    continue
+                }
+                inside += 1
+                var least = 1.0e9
+                var own = 1.0e9
+                for k in 0..18 {
+                    let e = s.part_bound(k)
+                    least = min(least, segments_apart(p, p, e.a, e.b) - e.r - e.lowers)
+                    own = min(own, segments_apart(p, p, e.a, e.b) - e.r)
+                }
+                assert(least <= 1.0e-5, f"({p.x}, {p.y}, {p.z}) inside, {least} past every part's lowering")
+                if own > 0.0 {
+                    lowered += 1
+                }
+            }
+        }
+    }
+    assert(inside > 200, f"only {inside} points inside")
+    assert(lowered > 0, "no point inside needed a part's lowering")
 }
 
 /// A surface with no bounds of its own for its parts (a cut) gives each the whole surface's: a
