@@ -36,7 +36,7 @@
 // (a shadow's edge, a thin thing's shadow), and from things that move, a shadow ray (the same
 // `ray::met`), a draw a thing over where its bound swept from the sun can shade.
 
-use light::moving::{Sunward, map_deep, map_near, map_quad, sun_from_movers, sunward}
+use light::moving::{SKY_ACROSS, SKY_MAP, SKY_MAPS, Sunward, map_deep, map_near, map_quad, sky_map_way, sun_from_movers, sunward, way_open}
 use light::store::{SAYS_DARK, SAYS_LIT, SKY_WAYS, Store, said, said_kept, sky_way, store}
 use matter::asked::{Asked, Cone, Kinded, box_span, cone_met}
 use matter::cells::{Kept, kept}
@@ -380,15 +380,19 @@ fn eyed<A: Asked, S: Sky>(pixel: FragCoord, v: View, w: A, sky: S, lay: Lay, lis
 }
 
 /// The most parts a moving thing gives as cones (`Asked::cones`), a run of them each in `cones`
-/// (and in `hulls`, the box round them and how far they hide the sky: `hull_made`).
+/// (and in `hulls`, the box round them and its joins' flesh: `hull_made`).
 const CONES: u32 = 32
 
 /// How many of the picture's pixels a side a texel of the moving things' share of the sky covers
-/// (`sky_shut`: what a body hides of the sky changes slowly across the screen).
+/// (`sky_movers`: what a body hides of the sky changes slowly across the screen).
 const SHUT: u32 = 4
 
 /// The sun's map of the moving things (`light::moving`), texels a side.
 const MAP: u32 = 2048
+
+/// The finest texel of the sky's maps of the moving things (m): what a body hides of the sky
+/// changes over its own size, and half a limb's width (~2 cm) is the least of it.
+const SKY_TEXEL: f32 = 0.02
 
 /// What the moving things hide of the sun at each pixel in the sun, from their map
 /// (`light::moving::sun_from_movers`): 0 hidden, 1 not (kept by the least with the other shadows).
@@ -424,23 +428,17 @@ fn sky_along(table: Texture<Rgba16Float>, s: Sampler, d: vec3) -> vec3 {
 }
 
 /// The box round moving thing `id.x`'s `n` cones (`cones[first..first + n]`), as a cone (`a` its
-/// least corner, `b` its greatest, `rb` the flesh its joins add, `Asked::flesh`) into `hulls`, and how far from the box's middle it can hide one in
-/// `SKY_WAYS` of the sky (`ra`: where its cones' outline, seen across, fills under that share of a
-/// hemisphere's cosine-spread sky; past it, a pixel's ways all pass it).
+/// least corner, `b` its greatest, `rb` the flesh its joins add, `Asked::flesh`) into `hulls`.
 @compute(1)
 fn hull_made(cones: [Cone], first: u32, n: u32, flesh: f32, hulls: mut Slots<Cone>, id: GlobalId) {
     var lo = vec3(1.0e30)
     var hi = vec3(-1.0e30)
-    var area = 0.0
     for k in 0..min(n, CONES - 1) {
         let c = cones[first + k]
         lo = min(lo, min(c.a - vec3(c.ra), c.b - vec3(c.rb)))
         hi = max(hi, max(c.a + vec3(c.ra), c.b + vec3(c.rb)))
-        let r = max(c.ra, c.rb)
-        area += 2.0 * r * length(c.b - c.a) + 3.14159265 * r * r
     }
-    let reach = sqrt(f32(SKY_WAYS) * area / 3.14159265) + 0.5 * length(hi - lo)
-    hulls[id] = Cone { a: lo, ra: reach, b: hi, rb: flesh }
+    hulls[id] = Cone { a: lo, ra: 0.0, b: hi, rb: flesh }
 }
 
 /// Thing `w`'s parts as round cones (`Asked::cone`), from `first` on.
@@ -449,15 +447,16 @@ fn cones_made<A: Asked>(w: A, first: u32, out: mut Slots<Cone>, id: GlobalId) {
     out[id] = w.cone(id.x - first)
 }
 
-/// The share of the open sky's light a moving thing (its parts as cones, `cones[first..first +
-/// n]`) leaves each pixel near it: the pixel's 32 ways over its hemisphere (`sky_way`, the store's)
-/// each tested against the box round the cones and then the cones, in closed form (multiplied into
-/// what the others leave: `Blend::Multiply`).
+/// The share of the open sky's light the moving things leave each pixel: of the sky's fixed ways
+/// (`light::moving::sky_map_way`, one map each, `ways`, `count` of them, tiles of `maps`), each
+/// way in the pixel's half weighed by its cosine to the pixel's facing and the sky's light that
+/// way (`radiance`), clear as far as its map says (`way_open`); the weighted clear over the
+/// weighed all.
 ///
 /// Drawn at a `SHUT`th of the picture's size a side: a texel takes the pixel at its middle; the
 /// shade reads it filtered at its ray's own point, the edge rays' too.
 @fragment
-pub fn sky_shut(pixel: FragCoord, radiance: Texture<Rgba16Float>, s: Sampler, cones: GpuSpan<Cone>, hulls: GpuSpan<Cone>, first: u32, n: u32, place: Texture<Rgba32Float>, asks: Texture<Rgba32Float>) -> vec4 {
+pub fn sky_movers(pixel: FragCoord, radiance: Texture<Rgba16Float>, s: Sampler, ways: GpuSpan<Sunward>, count: u32, maps: DepthTexture, place: Texture<Rgba32Float>, asks: Texture<Rgba32Float>) -> vec4 {
     let x = min(SHUT * u32(pixel.position.x) + SHUT / 2, place.width() - 1)
     let y = min(SHUT * u32(pixel.position.y) + SHUT / 2, place.height() - 1)
     let at = place.load(x, y)
@@ -465,30 +464,15 @@ pub fn sky_shut(pixel: FragCoord, radiance: Texture<Rgba16Float>, s: Sampler, co
         return vec4(1.0)
     }
     let o = asks.load(x, y).xyz + at.xyz * LEAVE
-    // (Its box and its reach, made once a frame: past the reach it hides nothing of the sky.)
-    let hull = hulls[first / CONES]
-    let lo = hull.a
-    let hi = hull.b
-    if length(o - 0.5 * (lo + hi)) > hull.ra {
-        return vec4(1.0)
-    }
     var open = 0.0
     var seen = 0.0
-    for j in 0..SKY_WAYS {
-        let d = sky_way(at.xyz, j)
-        let l = dot(sky_along(radiance, s, d), vec3(0.2126, 0.7152, 0.0722))
-        open += l
-        var clear = true
-        let b = box_span(o, d, lo, hi)
-        if b.y >= max(b.x, 0.0) {
-            for k in 0..min(n, CONES) {
-                if clear && cone_met(o, d, cones[first + k]) >= 0.0 {
-                    clear = false
-                }
-            }
-        }
-        if clear {
-            seen += l
+    for j in 0..min(count, SKY_MAPS) {
+        let m = ways[j]
+        let c = dot(at.xyz, m.sun)
+        if c > 0.0 {
+            let l = c * dot(sky_along(radiance, s, m.sun), vec3(0.2126, 0.7152, 0.0722))
+            open += l
+            seen += l * way_open(m, maps, o, c)
         }
     }
     vec4(if open > 0.0 { seen / open } else { 1.0 })
@@ -516,46 +500,6 @@ impl Each for Coning {
             self.list.push(n)
             self.boxes.push(vec4(bound.xyz - vec3(bound.w), 0.0))
             self.boxes.push(vec4(bound.xyz + vec3(bound.w), 0.0))
-        }
-    }
-}
-
-/// Each moving thing's darkening of the sky round it (`sky_shut`), into one pass at half the
-/// picture's size: over the pixels within four of its bound's half sides of it.
-borrow struct Shutting<S: Sky> {
-    pass: Pass<R8>,
-    sky: S,
-    radiance: borrow Texture<Rgba16Float>,
-    s: borrow Sampler,
-    hulls: GpuSpan<Cone>,
-    kept: borrow Vec<Kept>,
-    cones: GpuSpan<Cone>,
-    place: borrow Texture<Rgba32Float>,
-    asks: borrow Texture<Rgba32Float>,
-    v: View,
-    width: u32,
-    height: u32,
-}
-
-impl<S: Sky> Each for Shutting<S> {
-    fn kind<K: Kinded>(mut self, k: K, n: u32, first: u32) {}
-
-    fn thing<A: Asked>(mut self, a: A, k: u32, bound: vec4) {
-        let n = a.cones()
-        if !self.kept[k].moving || n == 0 {
-            return
-        }
-        // (At half size: its rectangle halved.)
-        let r = rect_of(self.v, vec4(bound.xyz, 4.0 * bound.w), self.width, self.height)
-        let hw = (self.width + SHUT - 1) / SHUT
-        let hh = (self.height + SHUT - 1) / SHUT
-        let x0 = u32(r.x) / SHUT
-        let y0 = u32(r.y) / SHUT
-        let x1 = min((u32(r.z) + SHUT - 1) / SHUT, hw)
-        let y1 = min((u32(r.w) + SHUT - 1) / SHUT, hh)
-        if x1 > x0 && y1 > y0 {
-            self.pass.scissor(x0, y0, x1 - x0, y1 - y0)
-            draw(self.pass, cover, sky_shut.bind(radiance: self.radiance, s: self.s, cones: self.cones, hulls: self.hulls, first: k * CONES, n: n, place: self.place, asks: self.asks), vertices: 3, blend: Blend::Multiply)
         }
     }
 }
@@ -1192,6 +1136,10 @@ pub struct Sight {
     sunward: Sunward,
     map_deep: DepthTexture,
     map_near: Texture<R8>,
+    /// The sky's maps of the moving things (`light::moving::sky_map_way`): each way's frame, and
+    /// their depths, tiles of one atlas.
+    sky_ways: GpuBuffer<Sunward>,
+    sky_maps: DepthTexture,
     radiance: Texture<Rgba16Float>,
     trace_out: GpuBuffer<u32>,
     trace_read: Option<Pending<u32>>,
@@ -1246,6 +1194,8 @@ pub fn sight() -> Sight {
         sunward: sunward(vec3(0.0, 1.0, 0.0), Vec::new(), MAP, 1.0),
         map_deep: depth_texture(width: MAP, height: MAP),
         map_near: texture(width: MAP, height: MAP),
+        sky_ways: buffer(SKY_MAPS),
+        sky_maps: depth_texture(width: SKY_ACROSS * SKY_MAP, height: SKY_ACROSS * SKY_MAP),
         shut: texture(width: 1, height: 1),
         radiance: writable_texture(width: RADIANCE, height: RADIANCE),
         trace_out: buffer(1),
@@ -1410,18 +1360,15 @@ impl Sight {
         if !edge && self.light.checking {
             self.light.checked(self.drawn.place, self.lit, self.drawn.sun, self.light_said)
         }
-        // What moving things hide of the sky round them (`sky_shut`: the picture's, at half size;
-        // the edge rays read it too).
+        // What moving things hide of the sky (`sky_movers`, from the sky's maps: the picture's, at
+        // a quarter of its size a side; the edge rays read it too).
         if !edge {
             label("sky shut")
             let q = begin_pass(mut self.shut, clear: vec4(1.0))
-            if !self.light.off {
-                var e = Shutting { pass: q, sky, radiance: self.radiance, s: self.s, hulls: self.hulls.items(), kept: self.kept, cones: self.cones.items(), place: self.drawn.place, asks: self.asks, v, width, height }
-                world.each(self.kept, kinds, 0, mut e)
-                e.pass.end()
-            } else {
-                q.end()
+            if !self.light.off && self.movers_count > 0 {
+                draw(q, cover, sky_movers.bind(radiance: self.radiance, s: self.s, ways: self.sky_ways.items(), count: SKY_MAPS, maps: self.sky_maps, place: self.drawn.place, asks: self.asks), vertices: 3)
             }
+            q.end()
         }
         label(if edge { "edge shade" } else { "shade" })
         if edge {
@@ -1578,11 +1525,29 @@ impl Sight {
             if self.movers_count > 0 {
                 label("sun map")
                 let d = begin_depth_pass(mut self.map_deep, clear_depth: 1.0)
-                draw(d, map_quad.bind(m: self.sunward, hulls: self.hulls.items(), movers: self.movers.items()), map_deep.bind(m: self.sunward, cones: self.cones.items(), movers: self.movers.items(), per: CONES), vertices: 6, instances: self.movers_count)
+                draw(d, map_quad.bind(m: self.sunward, hulls: self.hulls.items(), movers: self.movers.items()), map_deep.bind(m: self.sunward, cones: self.cones.items(), movers: self.movers.items(), per: CONES, shrink: 1.0), vertices: 6, instances: self.movers_count)
                 d.end()
                 let f = begin_pass(mut self.map_near, clear: vec4(0.0))
                 draw(f, map_quad.bind(m: self.sunward, hulls: self.hulls.items(), movers: self.movers.items()), map_near.bind(m: self.sunward, cones: self.cones.items(), hulls: self.hulls.items(), movers: self.movers.items(), per: CONES), vertices: 6, instances: self.movers_count, blend: Blend::Max)
                 f.end()
+                // The same from each of the sky's fixed ways, a tile of one atlas each, at a
+                // coarser texel (a body hides sky over its own size: `SKY_TEXEL` at the finest):
+                // each texel's middle's entry.
+                label("sky maps")
+                var ways: Vec<Sunward> = Vec::new()
+                for j in 0..SKY_MAPS {
+                    var m = sunward(sky_map_way(j), boxes, SKY_MAP, SKY_TEXEL)
+                    m.full = SKY_ACROSS * SKY_MAP
+                    m.ox = (j % SKY_ACROSS) * SKY_MAP
+                    m.oy = (j / SKY_ACROSS) * SKY_MAP
+                    ways.push(m)
+                }
+                let d2 = begin_depth_pass(mut self.sky_maps, clear_depth: 1.0)
+                for j in 0..SKY_MAPS {
+                    draw(d2, map_quad.bind(m: ways[j], hulls: self.hulls.items(), movers: self.movers.items()), map_deep.bind(m: ways[j], cones: self.cones.items(), movers: self.movers.items(), per: CONES, shrink: 0.0), vertices: 6, instances: self.movers_count)
+                }
+                d2.end()
+                self.sky_ways = buffer_of(ways)
             }
         }
         label("sky table")
