@@ -7,11 +7,8 @@
 //! Written out here, each pass's index is a constant the shader compiler folds.
 //!
 //! A loop is unrolled when:
-//! - its body starts with pure computations of its counter and constants, then
-//!   `if cond { break }`, and has no other `break` or `continue` of its own;
-//! - its counter is a local, stored a constant just before the loop, written in the loop only
-//!   by one store in its continuing block (a pure function of the counter and constants), and
-//!   never lent;
+//! - it is counted (`crate::counted`) from a constant start, and has no `break` or `continue` of
+//!   its own but its test;
 //! - it runs at most `MOST_PASSES` times, and its copies come to at most `MOST_STATEMENTS`;
 //! - it calls no function (those left are big ones, written out once per call by a browser's
 //!   shader compiler: language.md §18.11's weight).
@@ -91,102 +88,17 @@ fn plan(
     if calls(body) || calls(continuing) {
         return None;
     }
-    // The exit test: pure statements, then `if cond { break }`.
-    let test = body.iter().position(is_exit_test)?;
-    let Stmt::If { cond, .. } = &body[test] else { return None };
-    let prefix = &body[..test];
-    if !prefix.iter().all(|s| matches!(s, Stmt::At(_)) || matches!(s, Stmt::Let(_, e) if pure(e))) {
+    // Counted (`crate::counted`), from a known start, and leaving only at its test.
+    let c = crate::counted::counted(consts, before, body, continuing)?;
+    if exits(&body[c.check + 1..]) || exits(continuing) {
         return None;
     }
-    // The counter: the one local the test reads.
-    let mut counter = None;
-    for s in prefix {
-        if let Stmt::Let(_, Expr::Load(p)) = s {
-            let l = whole_local(p)?;
-            if counter.is_some_and(|c| c != l) {
-                return None;
-            }
-            counter = Some(l);
-        }
-    }
-    let counter = counter?;
-    // No other exit of its own, nothing else writes or lends the counter, and the continuing
-    // block's one store of it is the step.
-    let rest = &body[test + 1..];
-    if exits(rest) || exits(continuing) {
-        return None;
-    }
-    let mut step = None;
-    for s in continuing {
-        if let Stmt::Store(p, v) = s
-            && whole_local(p) == Some(counter)
-        {
-            if step.is_some() {
-                return None;
-            }
-            step = Some(*v);
-        }
-    }
-    let step = step?;
-    let others_write = |b: &[Stmt], allow_step: bool| {
-        let mut bad = false;
-        visit::walk(b, &mut |s| {
-            match s {
-                Stmt::Store(p, v) if p.root_local() == Some(counter) => {
-                    bad |= !(allow_step && *v == step && p.path.is_empty());
-                }
-                _ => {}
-            }
-            if let Some(e) = s.expr() {
-                e.for_each_place(&mut |p| {
-                    let lent = matches!(e, Expr::Addr(_) | Expr::Call(..) | Expr::Atomic(..));
-                    bad |= lent && p.root_local() == Some(counter);
-                });
-            }
-        });
-        bad
-    };
-    if others_write(rest, false) || others_write(continuing, true) {
-        return None;
-    }
-    // The counter's start: the last store of it before the loop, with nothing between that
-    // mentions it.
-    let mut start = None;
-    for s in before.iter().rev() {
-        if let Stmt::Store(p, v) = s
-            && whole_local(p) == Some(counter)
-        {
-            start = Some(consts.get(v)?.clone());
-            break;
-        }
-        if mentions(s, counter) {
-            return None;
-        }
-    }
-    let mut k = start?;
-    // Run the test and the step on the counter alone.
-    let defs: HashMap<ValueId, &Expr> = prefix
-        .iter()
-        .chain(continuing.iter())
-        .filter_map(|s| match s {
-            Stmt::Let(v, e) => Some((*v, e)),
-            _ => None,
-        })
-        .collect();
+    let passes = c.passes?;
     let size = crate::opt::size_of(body) + crate::opt::size_of(continuing);
-    let mut passes = 0;
-    loop {
-        match eval(*cond, &k, counter, &defs, consts)? {
-            Const::Bool(true) => return Some(passes),
-            Const::Bool(false) => {}
-            _ => return None,
-        }
-        passes += 1;
-        if passes > MOST_PASSES || passes as usize * size > MOST_STATEMENTS {
-            return None;
-        }
-        k = eval(step, &k, counter, &defs, consts)?;
+    if passes > u64::from(MOST_PASSES) || passes as usize * size > MOST_STATEMENTS {
+        return None;
     }
+    Some(passes as u32)
 }
 
 /// `if cond { break }`, with nothing else in either branch but source locations.
@@ -212,80 +124,6 @@ fn exits(b: &[Stmt]) -> bool {
         Stmt::Break | Stmt::Continue => true,
         Stmt::If { then, else_, .. } => exits(then) || exits(else_),
         _ => false,
-    })
-}
-
-fn whole_local(p: &Place) -> Option<LocalId> {
-    if p.path.is_empty() { p.root_local() } else { None }
-}
-
-fn mentions(s: &Stmt, l: LocalId) -> bool {
-    visit::any(std::slice::from_ref(s), &mut |s| {
-        let mut hit = false;
-        s.for_each_place(&mut |p| hit |= p.root_local() == Some(l));
-        hit
-    })
-}
-
-/// What the exit test and the step may compute: loads, constants, arithmetic, comparisons.
-fn pure(e: &Expr) -> bool {
-    matches!(e, Expr::Load(_) | Expr::Const(_) | Expr::Binary(..) | Expr::Unary(..))
-}
-
-/// Value `v` when the counter holds `k`.
-fn eval(
-    v: ValueId,
-    k: &Const,
-    counter: LocalId,
-    defs: &HashMap<ValueId, &Expr>,
-    consts: &HashMap<ValueId, Const>,
-) -> Option<Const> {
-    if let Some(c) = consts.get(&v) {
-        return Some(c.clone());
-    }
-    let go = |x: ValueId| eval(x, k, counter, defs, consts);
-    match defs.get(&v)? {
-        Expr::Load(p) if whole_local(p) == Some(counter) => Some(k.clone()),
-        Expr::Unary(UnOp::Not, x) => match go(*x)? {
-            Const::Bool(b) => Some(Const::Bool(!b)),
-            _ => None,
-        },
-        Expr::Binary(op, a, b) => binary(*op, go(*a)?, go(*b)?),
-        _ => None,
-    }
-}
-
-/// An integer step or test, on the counter's type (`i32` or `u32`), as the GPU computes it.
-fn binary(op: BinOp, a: Const, b: Const) -> Option<Const> {
-    use std::cmp::Ordering;
-    let (ord, sum, diff): (Ordering, Const, Const) = match (a, b) {
-        (Const::I32(x), Const::I32(y)) => {
-            (x.cmp(&y), Const::I32(x.wrapping_add(y)), Const::I32(x.wrapping_sub(y)))
-        }
-        (Const::U32(x), Const::U32(y)) => {
-            (x.cmp(&y), Const::U32(x.wrapping_add(y)), Const::U32(x.wrapping_sub(y)))
-        }
-        (Const::Bool(x), Const::Bool(y)) => {
-            return match op {
-                BinOp::And => Some(Const::Bool(x && y)),
-                BinOp::Or => Some(Const::Bool(x || y)),
-                BinOp::Eq => Some(Const::Bool(x == y)),
-                BinOp::Ne => Some(Const::Bool(x != y)),
-                _ => None,
-            };
-        }
-        _ => return None,
-    };
-    Some(match op {
-        BinOp::Add | BinOp::WrappingAdd => sum,
-        BinOp::Sub | BinOp::WrappingSub => diff,
-        BinOp::Eq => Const::Bool(ord == Ordering::Equal),
-        BinOp::Ne => Const::Bool(ord != Ordering::Equal),
-        BinOp::Lt => Const::Bool(ord == Ordering::Less),
-        BinOp::Le => Const::Bool(ord != Ordering::Greater),
-        BinOp::Gt => Const::Bool(ord == Ordering::Greater),
-        BinOp::Ge => Const::Bool(ord != Ordering::Less),
-        _ => return None,
     })
 }
 

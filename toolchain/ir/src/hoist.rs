@@ -187,36 +187,24 @@ struct Picked {
 }
 
 /// The values of `f` that read a counted loop's counter in its body, each with the counter's
-/// first value and the value it stops at: a loop `for i in a..b` writes, `a` and `b` constants
-/// (`b - a` at most [`MOST_PASSES`]), its local set before the loop and stepped by 1 in its
-/// `continuing` alone, and left at its first statements when it reaches `b`.
+/// first value and the value it stops at: a loop counted by 1 (`crate::counted`) from a known
+/// start below its limit, at most [`MOST_PASSES`] passes, its counter stored nowhere but before it
+/// and in its step.
 fn counters(f: &Function) -> HashMap<ValueId, (LocalId, u32, u32)> {
-    let mut consts: HashMap<ValueId, u32> = HashMap::new();
-    let mut defs: HashMap<ValueId, &Expr> = HashMap::new();
+    let consts = crate::counted::constants(f);
     let mut stores = vec![0u32; f.locals.len()];
-    visit::walk(&f.body, &mut |s| match s {
-        Stmt::Let(v, e) => {
-            match e {
-                Expr::Const(Const::U32(x)) => {
-                    consts.insert(*v, *x);
-                }
-                Expr::Const(Const::I32(x)) if *x >= 0 => {
-                    consts.insert(*v, *x as u32);
-                }
-                _ => {}
-            }
-            defs.insert(*v, e);
+    visit::walk(&f.body, &mut |s| {
+        if let Stmt::Store(p, _) = s
+            && let PlaceRoot::Local(l) = p.root
+        {
+            stores[l.index()] += 1;
         }
-        Stmt::Store(p, _) => {
-            if let PlaceRoot::Local(l) = p.root {
-                stores[l.index()] += 1;
-            }
-        }
-        _ => {}
     });
-    fn code(b: &[Stmt]) -> Vec<&Stmt> {
-        b.iter().filter(|s| !matches!(s, Stmt::At(_))).collect()
-    }
+    let as_u32 = |c: &Const| match *c {
+        Const::U32(x) => Some(x),
+        Const::I32(x) if x >= 0 => Some(x as u32),
+        _ => None,
+    };
     let mut out = HashMap::new();
     let mut blocks: Vec<&Block> = vec![&f.body];
     while let Some(b) = blocks.pop() {
@@ -225,56 +213,19 @@ fn counters(f: &Function) -> HashMap<ValueId, (LocalId, u32, u32)> {
                 blocks.push(inner);
             }
             let Stmt::Loop { body, continuing } = s else { continue };
-            // Set just before the loop, to a constant.
-            let Some(Stmt::Store(init, first)) =
-                b[..i].iter().rev().find(|s| !matches!(s, Stmt::At(_)))
+            let Some(c) = crate::counted::counted(&consts, &b[..i], body, continuing) else {
+                continue;
+            };
+            let (Some(start), Some(end)) = (c.start.as_ref().and_then(as_u32), as_u32(&c.limit))
             else {
                 continue;
             };
-            let (Some(l), true) = (init.root_local(), init.path.is_empty()) else { continue };
-            let Some(&start) = consts.get(first) else { continue };
-            // Left at its first branch when it reaches a constant: what comes before only reads
-            // the counter and names constants.
-            let head = code(body);
-            let Some(k) = head.iter().position(|s| !matches!(s, Stmt::Let(..))) else { continue };
-            let Stmt::If { cond, then, else_ } = head[k] else { continue };
-            let Some(Stmt::Let(c, Expr::Binary(BinOp::Ge, x, n))) =
-                head[..k].iter().rev().find(|s| matches!(s, Stmt::Let(v, _) if v == cond))
-            else {
-                continue;
-            };
-            let Some(Stmt::Let(a, Expr::Load(read))) =
-                head[..k].iter().find(|s| matches!(s, Stmt::Let(v, _) if v == x))
-            else {
-                continue;
-            };
-            let only_names = head[..k].iter().all(
-                |s| matches!(s, Stmt::Let(v, e) if v == a || v == c || matches!(e, Expr::Const(_))),
-            );
-            if !only_names {
-                continue;
-            }
-            let Some(&end) = consts.get(n) else { continue };
-            let leaves = code(then).last().is_some_and(|s| matches!(s, Stmt::Break))
-                && code(else_).is_empty();
-            if read.root_local() != Some(l)
-                || !read.path.is_empty()
-                || x != a
-                || cond != c
-                || !leaves
+            let l = c.local;
+            if as_u32(&c.step) != Some(1)
+                || stores[l.index()] != 2
+                || end <= start
+                || end - start > MOST_PASSES
             {
-                continue;
-            }
-            // Stepped by 1 in `continuing`, and set nowhere else.
-            let stepped = code(continuing).iter().any(|s| {
-                let Stmt::Store(p, y) = s else { return false };
-                p.root_local() == Some(l)
-                    && p.path.is_empty()
-                    && matches!(defs.get(y), Some(Expr::Binary(BinOp::Add, z, one))
-                        if consts.get(one) == Some(&1)
-                            && matches!(defs.get(z), Some(Expr::Load(q)) if q.root_local() == Some(l) && q.path.is_empty()))
-            });
-            if !stepped || stores[l.index()] != 2 || end <= start || end - start > MOST_PASSES {
                 continue;
             }
             visit::walk(body, &mut |s| {

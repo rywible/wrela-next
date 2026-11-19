@@ -228,6 +228,55 @@ struct Writer<'m> {
     /// by type; and whether the block of indices' struct is written.
     table_types: HashMap<String, String>,
     block_written: bool,
+    /// Each function's: whether some call to it, or to a function that calls it, is inside a
+    /// loop (`repeated`).
+    repeated: Vec<bool>,
+}
+
+/// For each function of `m`, whether it runs inside a loop: some call to it is in a loop, or in
+/// a function that does.
+fn repeated(m: &ir::Module) -> Vec<bool> {
+    fn scan(b: &[ir::Stmt], depth: u32, calls: &mut Vec<(usize, bool)>) {
+        for s in b {
+            if let Some(ir::Expr::Call(g, _)) = s.expr() {
+                calls.push((g.index(), depth > 0));
+            }
+            match s {
+                ir::Stmt::If { then, else_, .. } => {
+                    scan(then, depth, calls);
+                    scan(else_, depth, calls);
+                }
+                ir::Stmt::Loop { body, continuing } => {
+                    scan(body, depth + 1, calls);
+                    scan(continuing, depth + 1, calls);
+                }
+                _ => {}
+            }
+        }
+    }
+    let calls: Vec<Vec<(usize, bool)>> = m
+        .functions
+        .iter()
+        .map(|f| {
+            let mut c = Vec::new();
+            scan(&f.body, 0, &mut c);
+            c
+        })
+        .collect();
+    let mut out = vec![false; m.functions.len()];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (f, cs) in calls.iter().enumerate() {
+            for &(g, in_loop) in cs {
+                if g < out.len() && !out[g] && (in_loop || out[f]) {
+                    out[g] = true;
+                    changed = true;
+                }
+            }
+        }
+    }
+    out
 }
 
 impl<'m> Writer<'m> {
@@ -272,6 +321,7 @@ impl<'m> Writer<'m> {
             uses: Vec::new(),
             data_names: HashMap::new(),
             runtime_arrays: HashSet::new(),
+            repeated: repeated(m),
             size_members,
             entry_names: Vec::new(),
             table_types: HashMap::new(),
@@ -729,16 +779,12 @@ fn expr_resources(e: &ir::Expr, used: &mut BTreeSet<usize>) {
     }
 }
 
-/// A scalar constant as MSL writes it: a float in its shortest decimal that reads back the same
-/// (with `.0` when whole), `INFINITY` and `NAN` by name; integers suffixed.
-/// A loop the MSL writer writes as `for`: it leaves first thing when local `local`, read at
-/// its top, reaches the constant `limit` (the body's statement `check`, an `if` of a `break`, after
-/// only pure `let`s), and its `continuing` only adds the constant `step` to `local`, which nothing
-/// else in the loop stores.
+/// A loop the MSL writer writes as `for` (`ir::counted`): its counter, limit and step, its test's
+/// statement `check`, and the test's own statements nothing else reads (`unused`: a value nothing
+/// reads is an error under `-Werror`).
 struct Counted {
     local: ir::LocalId,
     check: usize,
-    /// The body's statements (the counter's read, the comparison) only the check used.
     unused: Vec<usize>,
     limit: ir::Const,
     step: ir::Const,
@@ -746,68 +792,14 @@ struct Counted {
 
 /// [`Counted`] of a loop of `f`, if it is one.
 fn counted(f: &ir::Function, body: &[ir::Stmt], continuing: &[ir::Stmt]) -> Option<Counted> {
-    use ir::{BinOp, Expr, PlaceRoot, Stmt};
-    let konst = |v: ir::ValueId| -> Option<ir::Const> {
-        let mut found = None;
-        ir::visit::walk(&f.body, &mut |s| {
-            if let Stmt::Let(x, Expr::Const(c)) = s
-                && *x == v
-            {
-                found = Some(c.clone());
-            }
-        });
-        found.filter(|c| matches!(c, ir::Const::U32(_) | ir::Const::I32(_)))
-    };
-    let whole = |p: &ir::Place| match p.root {
-        PlaceRoot::Local(l) if p.path.is_empty() => Some(l),
-        _ => None,
-    };
-    // `continuing`: `a = local; b = a + step; local = b`.
-    let cont: Vec<&Stmt> = continuing.iter().filter(|s| !matches!(s, Stmt::At(_))).collect();
-    let [
-        Stmt::Let(a, Expr::Load(pa)),
-        Stmt::Let(b, Expr::Binary(BinOp::Add, a2, sv)),
-        Stmt::Store(pb, b2),
-    ] = cont.as_slice()
-    else {
-        return None;
-    };
-    let local = whole(pa)?;
-    if a2 != a || b2 != b || whole(pb)? != local {
-        return None;
-    }
-    let step = konst(*sv)?;
-    // The body: pure `let`s, then `if cmp { break }` with `cmp = c >= limit`, `c = local`.
-    let mut loads: Vec<(ir::ValueId, usize)> = Vec::new();
-    let mut cmps: Vec<(ir::ValueId, ir::ValueId, ir::ValueId, usize)> = Vec::new();
-    let mut check = None;
-    for (i, s) in body.iter().enumerate() {
-        match s {
-            Stmt::At(_) => {}
-            Stmt::Let(_, Expr::Call(..)) => return None,
-            Stmt::Let(v, Expr::Load(p)) if whole(p) == Some(local) => loads.push((*v, i)),
-            Stmt::Let(v, Expr::Binary(BinOp::Ge, x, n)) => cmps.push((*v, *x, *n, i)),
-            Stmt::Let(..) => {}
-            Stmt::If { cond, then, else_ }
-                if else_.iter().all(|s| matches!(s, Stmt::At(_)))
-                    && then.iter().filter(|s| !matches!(s, Stmt::At(_))).count() == 1
-                    && then.iter().any(|s| matches!(s, Stmt::Break)) =>
-            {
-                let &(cmp, x, n, at) = cmps.iter().find(|(v, ..)| v == cond)?;
-                let &(_, read) = loads.iter().find(|(v, _)| *v == x)?;
-                check = Some((i, n, cmp, at, x, read));
-                break;
-            }
-            _ => return None,
-        }
-    }
-    let (check, n, cmp, cmp_at, read_v, read_at) = check?;
-    let limit = konst(n)?;
-    // What the rest of the body reads: the comparison and the counter's read go where only the
-    // check read them.
+    let c = ir::counted::counted(&ir::counted::constants(f), &[], body, continuing)?;
+    // What the rest of the body reads; then each of the test's statements whose value that
+    // reads stays, with what it reads.
+    let test: std::collections::HashMap<usize, ir::ValueId> =
+        c.test.iter().map(|&(v, at)| (at, v)).collect();
     let mut used = std::collections::HashSet::new();
     for (i, s) in body.iter().enumerate() {
-        if i == check || i == cmp_at {
+        if i == c.check || test.contains_key(&i) {
             continue;
         }
         ir::visit::walk(std::slice::from_ref(s), &mut |x| {
@@ -816,34 +808,30 @@ fn counted(f: &ir::Function, body: &[ir::Stmt], continuing: &[ir::Stmt]) -> Opti
             })
         });
     }
-    let mut unused = Vec::new();
-    if !used.contains(&cmp) {
-        unused.push(cmp_at);
-        if !used.contains(&read_v) {
-            unused.push(read_at);
+    let mut kept: Vec<usize> = Vec::new();
+    loop {
+        let more: Vec<usize> = test
+            .iter()
+            .filter(|(at, v)| !kept.contains(at) && used.contains(*v))
+            .map(|(at, _)| *at)
+            .collect();
+        if more.is_empty() {
+            break;
+        }
+        for at in more {
+            body[at].for_each_value(&mut |v| {
+                used.insert(v);
+            });
+            kept.push(at);
         }
     }
-    if std::mem::discriminant(&limit) != std::mem::discriminant(&step) {
-        return None;
-    }
-    // Nothing in the body stores the counter.
-    let mut stored = false;
-    ir::visit::walk(body, &mut |s| {
-        if let Stmt::Store(p, _) = s {
-            stored |= whole(p) == Some(local);
-        }
-    });
-    if stored {
-        return None;
-    }
-    // A step of 0 or a negative one never reaches the limit as `<` reads it: not this form.
-    match step {
-        ir::Const::U32(0) | ir::Const::I32(i32::MIN..=0) => return None,
-        _ => {}
-    }
-    Some(Counted { local, check, unused, limit, step })
+    let mut unused: Vec<usize> = test.keys().filter(|at| !kept.contains(at)).copied().collect();
+    unused.sort_unstable();
+    Some(Counted { local: c.local, check: c.check, unused, limit: c.limit, step: c.step })
 }
 
+/// A scalar constant as MSL writes it: a float in its shortest decimal that reads back the same
+/// (with `.0` when whole), `INFINITY` and `NAN` by name; integers suffixed.
 fn literal(c: &ir::Const) -> R<String> {
     Ok(match c {
         ir::Const::Bool(b) => b.to_string(),
@@ -990,6 +978,8 @@ struct FunctionWriter<'a, 'm> {
     takes_sizes: bool,
     /// The integer constants among its values: an index known to be in range isn't clamped.
     consts: HashMap<ir::ValueId, i64>,
+    /// How many loops the statement being written is in.
+    loop_depth: u32,
 }
 
 /// Whether `e` is written where it's used: it only computes from values, and isn't a derivative
@@ -1042,6 +1032,7 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
             fresh: 0,
             takes_sizes,
             consts: HashMap::new(),
+            loop_depth: 0,
         })
     }
 
@@ -1475,13 +1466,18 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
                 let bound = (self.w.checks.loops && !self.w.proofs.ends(body))
                     .then(|| self.fresh("loop_bound"));
                 let gate = (!continuing.is_empty()).then(|| self.fresh("loop_init"));
-                // A counted loop is written as a `for`, not unrolled: a loop that leaves when a
-                // local counter reaches a constant, which its `continuing` steps by a constant.
-                // Metal's compiler does more with that shape than with a `while` whose
-                // `continuing` runs at its top behind a flag (the masked march: 2.52 -> 2.13 ms);
-                // let it unroll, and it gains more there (1.70) but copies a large body pass by
-                // pass elsewhere (the engine's edge rays: 1.54 -> 7.74 ms). backend.md, item 12.
+                // A counted loop (`ir::counted`) that repeats (in a loop, or in a function some
+                // loop calls: a march's every step) is written as a `for` Metal doesn't unroll:
+                // its compiler does more with that shape than with a `while` whose `continuing`
+                // runs at its top behind a flag (the masked march: 2.52 -> 2.13 ms), and unrolled
+                // a large body is copied pass by pass (the engine's edge rays: 1.54 -> 7.74 ms).
+                // One that runs once an invocation stays a `while`, as Metal does best with
+                // there: as a `for` not unrolled, a ray's `meets` over a fold's 17 parts took
+                // the engine's picture 7% longer; as one it may unroll, the kernels' loops took
+                // its frame twice as long. backend.md, items 12 and 18.
+                let repeats = self.loop_depth > 0 || self.w.repeated[self.id.index()];
                 if bound.is_none()
+                    && repeats
                     && let Some(c) = counted(self.f, body, continuing)
                 {
                     let it = self.fresh("it");
@@ -1501,7 +1497,9 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
                         .filter(|(i, _)| !dropped(*i))
                         .map(|(_, s)| s.clone())
                         .collect();
+                    self.loop_depth += 1;
                     self.block(&rest, out)?;
+                    self.loop_depth -= 1;
                     out.push_str("}\n");
                     let _ = writeln!(out, "{l} = {it};");
                     return Ok(());
@@ -1519,6 +1517,7 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
                         "if (metal::all({b} == uint2(0u))) {{ break; }}\n{b} -= uint2({b}.y == 0u, 1u);"
                     );
                 }
+                self.loop_depth += 1;
                 if let Some(g) = &gate {
                     let _ = writeln!(out, "if (!{g}) {{");
                     self.block(continuing, out)?;
@@ -1526,6 +1525,7 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
                     let _ = writeln!(out, "{g} = false;");
                 }
                 self.block(body, out)?;
+                self.loop_depth -= 1;
                 out.push_str("}\n");
             }
             ir::Stmt::Break => out.push_str("break;\n"),

@@ -15,6 +15,7 @@
 
 pub mod bounds;
 mod const_fold;
+pub mod counted;
 pub use const_fold::FUEL as FOLD_FUEL;
 pub mod depends;
 pub mod derive;
