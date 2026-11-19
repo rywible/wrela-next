@@ -324,7 +324,7 @@ fn emit_in(
         if budgets {
             for w in &p.same {
                 let Some(at) = w.at else { continue };
-                diagnostics.push(same_work(at, w.work));
+                diagnostics.push(same_work(at, w));
             }
             for c in &p.costly {
                 // Once a loop, however many pipelines run it.
@@ -404,16 +404,21 @@ fn copied(at: wrela_diag::Span, c: &wrela_ir::opt::Copied) -> Diagnostic {
 
 /// E0712: a shipped build's GPU code computing, in every invocation, `work` of a value the same
 /// for all of them (§18.13), at the value.
-fn same_work(at: wrela_diag::Span, work: Option<u64>) -> Diagnostic {
-    let work = match work {
+fn same_work(at: wrela_diag::Span, w: &wrela_ir::same::SameWork) -> Diagnostic {
+    let work = match w.work {
         Some(w) => format!("{w} work"),
         None => "work with no bound".to_string(),
     };
+    let mut path = format!("`{}`", w.entry);
+    for f in &w.path {
+        path.push_str(&format!(" -> `{f}`"));
+    }
     Diagnostic::new(
         wrela_diag::codes::E0712,
         at,
         format!("every invocation computes this again, the same for all of them: {work}"),
     )
+    .with_note(format!("in the invocations of entry point {path}"))
     .with_note("it's computed only from what the command gives every invocation alike: its uniform block, the pipeline's constants, a buffer or a texture read at a same place (§18.13)")
     .with_help("compute it once, on the CPU or in a kernel of one invocation (`@compute(1)`), and pass the result in")
 }

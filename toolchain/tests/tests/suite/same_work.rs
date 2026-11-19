@@ -175,6 +175,63 @@ fn a_loop_s_alike_work_counts_each_pass() {
 }
 
 #[test]
+fn a_uniform_compared_in_a_loop_is_computed_once_an_invocation() {
+    // A ray's step loop of 512 passes choosing by a uniform flag (engine gap 21): the compare
+    // reads nothing the loop changes, so it is one compare an invocation, as every GPU compiler
+    // moves it out of the loop, not 512.
+    let steps = "    var acc = x\n    for _i in 0..512 {\n        acc = acc * 0.5 + (if g.u > 0.5 { x } else { 1.0 })\n    }\n    out[id] = acc";
+    assert_eq!(e0712(&kernel("same_flag_in_loop", 64, steps)), Vec::<String>::new());
+    // What the loop does change, it computes again each pass: still each pass's work.
+    let changing = "    var a = g.u\n    for _i in 0..512 {\n        a = a * 0.5 + 1.0\n    }\n    out[id] = a * x";
+    assert_eq!(e0712(&kernel("same_changing_in_loop", 64, changing)).len(), 1);
+}
+
+#[test]
+fn e0712_names_its_entry_point_and_the_calls_to_it() {
+    let dir = scratch("same_path");
+    let src = "use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+struct Given: Copy + GpuData {
+    u: f32,
+}
+
+fn deep(a: f32, x: f32) -> f32 {
+    var b = a
+    for _i in 0..200 {
+        b = sin(b) + cos(b)
+    }
+    b * x
+}
+
+fn middle(a: f32, x: f32) -> f32 {
+    deep(a, x) + 1.0
+}
+
+@compute(64)
+fn k(g: Given, seen: [f32], out: mut Slots<f32>, id: GlobalId) {
+    out[id] = middle(seen[0], f32(id.x))
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var out: GpuBuffer<f32> = buffer(64)
+    let seen: GpuBuffer<f32> = buffer(1)
+    dispatch(k.bind(g: Given { u: time }, seen: seen, out: mut out), over: 64)
+}
+";
+    write_package(&dir, "same_path", src);
+    let out = wrela_driver::build(&dir);
+    let d = out
+        .diagnostics
+        .iter()
+        .find(|d| d.code == wrela_diag::codes::E0712)
+        .unwrap_or_else(|| panic!("no E0712: {:?}", out.diagnostics));
+    // Flattening wrote `middle` and `deep` into `k`: the entry point alone is the path. (Calls
+    // that stay calls are named after it, `k` -> `f` -> `g`: the engine's judged stack's, a
+    // range's twins, read `coarsed` -> `range_closure1_iv` -> .. -> `value_noise_32_b3_iv`.)
+    assert!(d.notes.iter().any(|n| n == "in the invocations of entry point `k`"), "{:?}", d.notes);
+}
+
+#[test]
 fn small_alike_values_sharing_a_cheap_one_are_not_one_big_one() {
     // 60 terms of a few work each, all from one cheap same value: no term is much work, as
     // without the shared value.

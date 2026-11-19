@@ -236,6 +236,11 @@ impl Analysis<'_> {
 pub struct SameWork {
     /// The function it's in, by name.
     pub function: String,
+    /// The entry point whose invocations compute it, and the calls from there to `function`, by
+    /// the names of the functions called (the first path the compiler found it by; empty where
+    /// the entry point's own function computes it).
+    pub entry: String,
+    pub path: Vec<String>,
     pub at: Option<wrela_diag::Span>,
     pub work: Option<u64>,
 }
@@ -257,7 +262,7 @@ pub fn same_work(m: &Module, least: u64) -> Vec<SameWork> {
         if matches!(e.stage, Stage::Compute { workgroup_size: [1, 1, 1] }) {
             continue;
         }
-        s.function(e.function, Vec::new());
+        s.function(e.function, Vec::new(), &e.name, &[]);
     }
     let mut out = s.out;
     out.sort_by(|a, b| {
@@ -276,7 +281,7 @@ struct Sites<'a> {
 }
 
 impl Sites<'_> {
-    fn function(&mut self, id: FuncId, args: Vec<bool>) {
+    fn function(&mut self, id: FuncId, args: Vec<bool>, entry: &str, path: &[String]) {
         if !self.seen.insert((id.0, args.clone())) {
             return;
         }
@@ -432,51 +437,114 @@ impl Sites<'_> {
             let work = sum(&cones[top].1);
             if work.is_none_or(|w| w >= self.least) {
                 let at = def[&cones[top].0].1;
-                self.out.push(SameWork { function: f.name.clone(), at, work });
+                self.out.push(SameWork {
+                    function: f.name.clone(),
+                    entry: entry.to_string(),
+                    path: path.to_vec(),
+                    at,
+                    work,
+                });
             }
         }
         for (g, bits) in calls {
-            self.function(g, bits);
+            let mut deeper = path.to_vec();
+            deeper.push(m.functions[g.0 as usize].name.clone());
+            self.function(g, bits, entry, &deeper);
         }
     }
 }
 
 /// How many times each value of `f` (function `id` of `m`) is computed an invocation: the passes
-/// of the loops it's in, where the count bounds them (§18.11). A loop it can't bound counts once.
+/// of the loops it depends on, where the count bounds them (§18.11). A loop it can't bound counts
+/// once. A value written inside a loop but computed only from what the loop doesn't change (a
+/// uniform's field compared with a constant, in a ray's step loop) is computed once an
+/// invocation, as every GPU compiler moves it out of the loop: counted by the passes of the loops
+/// it does depend on, not of every loop it's written in (engine gap 21).
 pub(crate) fn times_computed(
     m: &Module,
     id: FuncId,
     f: &Function,
 ) -> std::collections::HashMap<ValueId, u64> {
-    fn times_in(
-        b: &[Stmt],
+    /// One loop it's inside: the passes of the loops around it and its own, and the locals its
+    /// body stores (what a load of them there can't count on).
+    struct Frame {
         k: u64,
-        passes: &std::collections::HashMap<usize, u32>,
-        out: &mut std::collections::HashMap<ValueId, u64>,
-    ) {
-        for s in b {
-            match s {
-                Stmt::Let(v, _) => {
-                    out.insert(*v, k);
+        stored: HashSet<LocalId>,
+    }
+    struct Walk<'a> {
+        m: &'a Module,
+        passes: std::collections::HashMap<usize, u32>,
+        /// Each value's depth: the innermost loop (1-based; 0 none) it depends on.
+        depth: std::collections::HashMap<ValueId, usize>,
+        out: std::collections::HashMap<ValueId, u64>,
+    }
+    fn stores(b: &[Stmt], out: &mut HashSet<LocalId>) {
+        visit::walk(b, &mut |s| {
+            if let Stmt::Store(p, _) = s
+                && let PlaceRoot::Local(l) = p.root
+            {
+                out.insert(l);
+            }
+        });
+    }
+    impl Walk<'_> {
+        /// The innermost loop of `frames` expression `e` depends on.
+        fn depth_of(&self, e: &Expr, frames: &[Frame]) -> usize {
+            let mut d = 0;
+            e.for_each_value(&mut |v| d = d.max(self.depth.get(&v).copied().unwrap_or(0)));
+            if let Expr::Load(p) = e {
+                let root = match p.root {
+                    PlaceRoot::Local(l) => {
+                        frames.iter().rposition(|fr| fr.stored.contains(&l)).map_or(0, |i| i + 1)
+                    }
+                    PlaceRoot::Resource(r) => match self.m.resources[r.index()].kind {
+                        ResourceKind::Uniform { .. } | ResourceKind::StorageRead => 0,
+                        _ => frames.len(),
+                    },
+                    PlaceRoot::Data(_) => 0,
+                    PlaceRoot::Param(_) | PlaceRoot::Ptr(_) => frames.len(),
+                };
+                d = d.max(root);
+            }
+            d
+        }
+
+        fn block(&mut self, b: &[Stmt], frames: &mut Vec<Frame>) {
+            for s in b {
+                match s {
+                    Stmt::Let(v, e) => {
+                        let d = self.depth_of(e, frames);
+                        self.depth.insert(*v, d);
+                        self.out.insert(*v, if d == 0 { 1 } else { frames[d - 1].k });
+                    }
+                    Stmt::If { then, else_, .. } => {
+                        self.block(then, frames);
+                        self.block(else_, frames);
+                    }
+                    Stmt::Loop { body, continuing } => {
+                        let p = self.passes.get(&(body.as_ptr() as usize)).copied().unwrap_or(1);
+                        let outer = frames.last().map_or(1, |f| f.k);
+                        let mut stored = HashSet::new();
+                        stores(body, &mut stored);
+                        stores(continuing, &mut stored);
+                        frames.push(Frame { k: outer.saturating_mul(u64::from(p.max(1))), stored });
+                        self.block(body, frames);
+                        self.block(continuing, frames);
+                        frames.pop();
+                    }
+                    _ => {}
                 }
-                Stmt::If { then, else_, .. } => {
-                    times_in(then, k, passes, out);
-                    times_in(else_, k, passes, out);
-                }
-                Stmt::Loop { body, continuing } => {
-                    let p = passes.get(&(body.as_ptr() as usize)).copied().unwrap_or(1);
-                    let k = k.saturating_mul(u64::from(p.max(1)));
-                    times_in(body, k, passes, out);
-                    times_in(continuing, k, passes, out);
-                }
-                _ => {}
             }
         }
     }
-    let passes = crate::work::loop_passes(m, id);
-    let mut times = std::collections::HashMap::new();
-    times_in(&f.body, 1, &passes, &mut times);
-    times
+    let mut w = Walk {
+        m,
+        passes: crate::work::loop_passes(m, id),
+        depth: std::collections::HashMap::new(),
+        out: std::collections::HashMap::new(),
+    };
+    w.block(&f.body, &mut Vec::new());
+    w.out
 }
 
 /// A function GPU code calls, each invocation, with few numbers that vary between invocations
