@@ -35,6 +35,7 @@
 // One deposit, carried from the volume spike (spike/volume, spikes/volume/volume.wrela:
 // `coarsed_parts`, `fill_parts`, `redeposit`), rewritten.
 
+use matter::asked::{CELLS, PARTS, WHOLE}
 use matter::cost::{CELL_READ, FETCH, part_weights}
 use matter::ranges::{bound_of, longest, stated_steepness}
 use std::derive::{Box3, gradient, interval}
@@ -715,6 +716,10 @@ pub struct Kept {
     /// What each of its parts weighs (`cost::part_weights`), for its roots' choice.
     weights: GpuBuffer<f32>,
     weighed: bool,
+    weight: Vec<f32>,
+    /// The ways it can be answered (`asked::WHOLE`, `PARTS`, `CELLS`): chosen from the count once
+    /// (again when it starts to move), a constant of the pipelines that draw it.
+    pub ways: u32,
     pub moving: bool,
     pub held_asks: u32,
     pub held_cell: f32,
@@ -767,6 +772,8 @@ pub fn kept() -> Kept {
         probes: Vec::new(),
         weights: buffer(1),
         weighed: false,
+        weight: Vec::new(),
+        ways: 99,
         moving: false,
         held_asks: 0,
         held_cell: 0.0,
@@ -864,6 +871,26 @@ impl Kept {
         self.grid.scope = max(2.0 * brick, length(size) * brick)
     }
 
+    /// The ways it can be answered, from the count (`cost`): by its cells where it is still and its
+    /// whole ask weighs more than a read of cells; by its whole field alone where every root would
+    /// be (its whole ask weighs no more than a fetch, and no mask's ask less than it); else by the
+    /// walk, its live parts or its whole field a root.
+    fn chosen_ways(self) -> u32 {
+        let n = self.weight.len() - 3
+        let whole = self.weight[n + 1]
+        var least = 1.0e30
+        for i in 0..n {
+            least = min(least, self.weight[i])
+        }
+        if !self.moving && self.held_asks != ASKS_FIELD && (self.held_asks == ASKS_CELLS || whole > CELL_READ) {
+            return CELLS
+        }
+        if whole <= FETCH && (n <= 1 || self.weight[n + 2] + least >= whole) {
+            return WHOLE
+        }
+        PARTS
+    }
+
     /// Brought up to date for this frame: seen whether it moves, then its roots laid where it is
     /// (a moving thing's every frame), and a still thing's cells deposited where its roots chose
     /// them. `size` (m) is the finest it was asked at last frame.
@@ -884,6 +911,7 @@ impl Kept {
             let n = w.len() - 3
             print(f"engine::matter: {field.parts()} parts; an ask weighs {w[n + 1]} whole, a mask {w[n + 2]} beyond the parts it asks; a read of cells {CELL_READ}{held(self.held_asks)}")
             self.weights = buffer_of(w)
+            self.weight = part_weights(field)
             self.weighed = true
         }
         let now = probed(field, self.derived)
@@ -899,6 +927,26 @@ impl Kept {
         self.probes = take now
         self.grid.asks = self.held_asks
         self.grid.whole = self.held_whole
+        let ways = self.chosen_ways()
+        if ways != self.ways {
+            self.ways = ways
+            print(f"engine::matter: answered {if ways == WHOLE { "by its whole field alone, no root looked up" } else if ways == PARTS { "by the walk: its live parts or its whole field a root" } else { "by the walk: its cells, its live parts or its whole field a root" }}{held(self.held_asks)}")
+        }
+        if self.ways == WHOLE {
+            // Its whole field everywhere: its grid only bounds it; no roots.
+            if self.stage == 0 {
+                self.laid(2.0 * self.derived.w / ROOTS / f32(B), fixed: false)
+            } else if self.moving {
+                self.bounded(field)
+                self.laid(self.grid.cell, fixed: true)
+            }
+            self.roots_kept = 0
+            self.slots_most = 0
+            self.nodes_most = 0
+            self.free_slots = 0
+            self.stage = 4
+            return
+        }
         if self.moving {
             // Its roots again where it now is, each answered by its parts: no cells.
             if self.stage != 5 {

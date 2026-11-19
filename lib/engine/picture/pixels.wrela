@@ -1,5 +1,19 @@
-// The picture, as slice 1 draws it (docs/design.md, "Order of work", 1): every pixel by one ray
-// through its middle (`ray::met`), then light, then the look. No scouts, no blocks yet.
+// The picture, as slice 1 draws it (docs/design.md, "Order of work", 1): each thing by itself,
+// then light, then the look. No scouts, no blocks yet.
+//
+// One where it is written, many where it runs (docs/design.md, under the four modules). Each thing
+// is drawn by code specialised to it: `world::World::each` hands the picture each thing as GPU
+// code asks it, answered only the ways that thing can be (`asked::Seen`'s `W`), and the picture
+// draws it over the part of the screen its bound covers. A pixel runs only its things' code.
+//
+// A frame: for each thing an EYE draw (`eye`: a triangle over the screen at the depth of the
+// bound's nearest point, scissored to the bound's rectangle) marches the pixel's ray against that
+// thing alone (`ray::met`) and writes its own depth, never nearer than its triangle's, so the
+// depth test keeps the nearest thing and skips pixels a nearer thing already covers; what it met,
+// its facing and its light, split into what the sun's shadow ray decides and the rest. Then for
+// each thing a SHADOW draw (`shadow`) over the screen: the sun's ray from each lit pixel against
+// that thing alone, into a visibility target by the least (`Blend::Min`). Then one SHADE pass
+// (`shade`): the look's tone of the light, or of the sky where nothing was met.
 //
 // The picture tells matter how finely it asks: every ask names the ray's width there (its
 // footprint, m), and after each frame matter is handed the places the picture showed and the size
@@ -9,31 +23,33 @@
 // Where a pixel holds an edge (its middle ray met matter and a neighbour's didn't, or the other
 // way; it passed matter within its width; its neighbour shows another surface, nearer or farther
 // or turned another way), one ray through its middle can't say what it shows: the edge pass
-// (`edges_found`, `edge_rays`, `edges_resolved`) draws it again as the mean of `EDGE_LOOKS`² rays
-// spread evenly over it, each the same `shown` (the same `ray::met`), as the reference's mean of
-// looks over the pixel is. The edge pixels are listed first and their rays drawn a ray a fragment,
-// so a few edge pixels don't hold up the many round them.
+// (`edges_found`, the same three draws laid out a ray a fragment, `edges_resolved`) draws it
+// again as the mean of `EDGE_LOOKS`² rays spread evenly over it, as the reference's mean of looks
+// over the pixel is. The edge pixels are listed first and their rays drawn a ray a fragment, so a
+// few edge pixels don't hold up the many round them.
 //
 // The light here is a stand-in, the simplest that can be held to the reference exactly (the
 // reference's `SIMPLE` light): the sun where a shadow ray (the same `ray::met`) says it reaches,
 // toward the middle of its disc; and the sky's light as if nothing were in its way, read from a
 // table of what the open sky lays on a face turned each way (`skylit`). The light module (slice 2)
-// replaces it whole: nothing outside this file knows how a pixel is lit.
+// replaces it whole: nothing outside this file knows how a pixel is lit. Its shadow ray is the
+// one ray that must cross every thing: a draw a thing over the whole screen.
 
 use matter::asked::Asked
 use matter::cells::{Kept, kept}
 use matter::sky::{Sky, seen}
-use matter::world::World
+use matter::world::{Each, World}
 use picture::eye::{Eye, View, view}
 use picture::look::{Look, Seen}
 use picture::picture::{Picture, picture}
 use picture::screen::{cover, show}
-use ray::ray::{Met, Ray, met}
+use ray::ray::{Ray, met}
 use reference::traced::LEAVE
 use std::collections::Vec
 use std::gpu::{
-    Address, Append, AppendBuffer, Atomics, FragCoord, GlobalId, GpuBuffer, GpuSpan, R8, Rgba16Float, Rgba32Float, Sampler, Targets3, Texels,
-    Texture, append_buffer, begin_pass, begin_pass3, begin_screen_pass, buffer, dispatch, draw, label, sampler, texture, timed,
+    Address, Append, AppendBuffer, Atomics, Blend, ClipPosition, DepthPass5, DepthTexture, FragCoord, GlobalId, GpuBuffer, GpuSpan, Pass, R8,
+    Rgba16Float, Rgba32Float, Sampler, Targets5, Texels, Texture, VertexIndex, WithDepthBehind, append_buffer, begin_pass,
+    begin_pass5_with_depth, begin_screen_pass, buffer, depth_texture, discard, dispatch, draw, label, sampler, texture, timed,
     writable_texture,
 }
 use std::io::{Pending, print}
@@ -45,7 +61,7 @@ use std::io::{Pending, print}
 /// `LEAST_BANDS` and `MOST_BANDS`.
 const BAND_US: f32 = 10000.0
 const FIRST_BANDS: u32 = 32
-const LEAST_BANDS: u32 = 4
+const LEAST_BANDS: u32 = 1
 const MOST_BANDS: u32 = 128
 
 /// An edge pixel's rays a side; how far apart two neighbours' surfaces are, as a share of the
@@ -114,62 +130,208 @@ fn sky_on(table: Texture<Rgba16Float>, s: Sampler, n: vec3) -> vec3 {
     table.sample_level(s, (e * (f32(TABLE) - 1.0) + vec2(0.5)) / f32(TABLE), 0.0).xyz
 }
 
-/// What one ray through a pixel shows (`at`: the point on the screen, px), lit by the stand-in
-/// light and toned: the look's colour (`colour`), the facing and distance of what it met
-/// (`place`: 0 where the sky), and the place it shows with the size it was asked at (`ask`: `w`
-/// 0 where nothing).
-pub struct Shown: Copy {
-    pub colour: vec3,
-    pub place: vec4,
-    pub ask: vec4,
-    pub steps: u32,
+/// Where a fragment's ray goes through the screen: the screen's own pixels (`edges` 0), or the
+/// edge pass's rays laid out a ray a fragment (`edges` 1: ray `j` of edge pixel `e` at fragment
+/// `EDGE_LOOKS² e + j` of a picture `width` wide).
+pub struct Lay: Copy + GpuData {
+    pub edges: u32,
+    pub width: u32,
+    pub spare: u32,
+    pub spare2: u32,
 }
 
-/// One ray through `at` (px) of `v`, as `pixel` shows it.
-pub fn shown<W: Asked, S: Sky, L: Look>(v: View, w: W, sky: S, look: L, table: Texture<Rgba16Float>, s: Sampler, at: vec2) -> Shown {
-    let d = v.ray(at)
+/// The point on the screen (px) a fragment at `at` draws the ray through (`xy`), and whether it
+/// draws one (`z` 1): an edge pixel's ray is one of `EDGE_LOOKS`² spread evenly over its pixel.
+fn spot(at: vec2, lay: Lay, list: GpuSpan<u32>, count: GpuSpan<u32>) -> vec3 {
+    if lay.edges == 0 {
+        return vec3(at, 1.0)
+    }
+    let i = u32(at.x) + lay.width * u32(at.y)
+    let n = EDGE_LOOKS * EDGE_LOOKS
+    let e = i / n
+    if e >= count[0] {
+        return vec3(0.0)
+    }
+    let pix = list[e]
+    let j = i % n
+    let o = (vec2(f32(j % EDGE_LOOKS), f32(j / EDGE_LOOKS)) + vec2(0.5)) / f32(EDGE_LOOKS)
+    vec3(vec2(f32(pix % lay.width), f32(pix / lay.width)) + o, 1.0)
+}
+
+/// The depth (0 to 1) of what is `t` m along a pixel's ray: the nearer, the less, on every ray.
+fn depth_of(t: f32) -> f32 {
+    t / (t + 1.0)
+}
+
+/// The depth a near miss is kept at: behind anything met.
+const MISSED: f32 = 0.9999999
+
+/// The three corners of a triangle that covers the screen, at depth `z`.
+@vertex
+pub fn cover_at(v: VertexIndex, z: f32) -> ClipPosition {
+    let x = f32(v.index % 2) * 4.0 - 1.0
+    let y = f32(v.index / 2) * 4.0 - 1.0
+    ClipPosition { position: vec4(x, y, z, 1.0) }
+}
+
+/// A thing's eye draw: the fragment's ray (`spot`) against that thing (`w`) alone. Where it meets
+/// it: its own depth, and into the targets which way the surface faces and how far along the ray
+/// (`first`), the place and the size it was asked at (`second`), the sun's light it would scatter
+/// toward the eye if the shadow ray finds the sun (`third`; `w` 1 where the sun is in front of
+/// it), what it scatters of the open sky's light, by the sky's light on a face turned so
+/// (`fourth`), and what it gives off itself (`fifth`). A ray that passes it within half its width,
+/// so that it is within the pixel: the place it passed, at the depth behind everything met (an
+/// outline needs it, and the edge pass reads it as an edge). Else nothing.
+@fragment
+pub fn eye<A: Asked, S: Sky>(pixel: FragCoord, v: View, w: A, sky: S, lay: Lay, list: GpuSpan<u32>, count: GpuSpan<u32>) -> WithDepthBehind<Targets5<vec4, vec4, vec4, vec4, vec4>> {
+    let at = spot(pixel.position.xy, lay, list, count)
+    let d = v.ray(at.xy)
     let px = v.pixel()
     let m = met(w, Ray { o: v.at, d, from: 0.0, to: 1.0e9, wide: 0.0, spread: px })
-    if !m.met {
-        // (A ray that passed matter within half its width, so that matter is within its pixel,
-        // asks there too: an outline needs it, and the edge pass reads it as an edge.)
-        var ask = vec4(0.0)
-        if m.nearest < 0.5 {
-            ask = vec4(v.at + d * m.nearest_t, px * m.nearest_t)
-        }
-        return Shown { colour: look.tone(Seen { light: seen(sky, d) }), place: vec4(0.0), ask, steps: m.steps }
+    var out = Targets5 { first: vec4(0.0), second: vec4(0.0), third: vec4(0.0), fourth: vec4(0.0), fifth: vec4(0.0) }
+    var depth = MISSED
+    if at.z < 0.5 || (!m.met && !(m.nearest < 0.5)) {
+        discard()
+    } else if !m.met {
+        out.second = vec4(v.at + d * m.nearest_t, px * m.nearest_t)
+    } else {
+        let p = v.at + d * m.t
+        let size = px * m.t
+        let n = w.facing(m.walk, p, m.t, -d, size)
+        let stuff = w.made_of(m.walk, p, m.t)
+        let sun = sky.sun()
+        let lean = dot(n, sun.way)
+        out.first = vec4(n, m.t)
+        out.second = vec4(p, size)
+        out.third = vec4(stuff.scatters(n, sun.way, -d) * sun.light * max(lean, 0.0), if lean > 0.0 { 1.0 } else { 0.0 })
+        out.fourth = vec4(stuff.scatters(n, n, -d), 0.0)
+        out.fifth = vec4(stuff.emits, 0.0)
+        depth = depth_of(m.t)
     }
-    let p = v.at + d * m.t
-    let size = px * m.t
-    let n = w.facing(m.walk, p, m.t, -d, size)
-    let stuff = w.made_of(m.walk, p, m.t)
-    let sun = sky.sun()
-    var light = stuff.emits
-    let lean = dot(n, sun.way)
-    var steps = m.steps
-    if lean > 0.0 {
-        let o = p + n * LEAVE
-        let shadow = met(w, Ray { o, d: sun.way, from: 0.0, to: 1.0e9, wide: size, spread: 0.0 })
-        steps += shadow.steps * 65536
-        if !shadow.met {
-            light += stuff.scatters(n, sun.way, -d) * sun.light * lean
-        }
-    }
-    light += stuff.scatters(n, n, -d) * sky_on(table, s, n)
-    Shown { colour: look.tone(Seen { light }), place: vec4(n, m.t), ask: vec4(p, size), steps }
+    WithDepthBehind { color: out, depth }
 }
 
-/// A pixel: its middle ray (`shown`). Into the first target, the look's colour (or, as an
-/// instrument, `steps` 1: the eye's ray's steps in red and its shadow ray's in green, 64 to full);
-/// into the second, which way the surface it shows faces and how far along the ray (0: the sky);
-/// into the third, the place it shows and the size it was asked at (for matter's refining).
+/// A thing's shadow draw: from each pixel that met matter with the sun in front of it, the sun's
+/// ray against that thing (`w`) alone: 0 where it meets it, else 1 (the least of the things'
+/// is kept).
 @fragment
-pub fn pixel<W: Asked, S: Sky, L: Look>(pixel: FragCoord, v: View, w: W, sky: S, look: L, table: Texture<Rgba16Float>, s: Sampler, steps: u32) -> Targets3<vec4, vec4, vec4> {
-    let r = shown(v, w, sky, look, table, s, pixel.position.xy)
-    if steps == 1 {
-        return Targets3 { first: vec4(f32(r.steps % 65536) / 64.0, f32(r.steps / 65536) / 64.0, 0.0, 1.0), second: r.place, third: r.ask }
+pub fn shadow<A: Asked, S: Sky>(pixel: FragCoord, w: A, sky: S, place: Texture<Rgba32Float>, asks: Texture<Rgba32Float>, lit: Texture<Rgba16Float>) -> vec4 {
+    let x = u32(pixel.position.x)
+    let y = u32(pixel.position.y)
+    let at = place.load(x, y)
+    var seen_sun = 1.0
+    if at.w > 0.0 && lit.load(x, y).w > 0.5 {
+        let a = asks.load(x, y)
+        let m = met(w, Ray { o: a.xyz + at.xyz * LEAVE, d: sky.sun().way, from: 0.0, to: 1.0e9, wide: a.w, spread: 0.0 })
+        if m.met {
+            seen_sun = 0.0
+        }
     }
-    Targets3 { first: vec4(r.colour, 1.0), second: r.place, third: r.ask }
+    vec4(seen_sun)
+}
+
+/// The picture's colour at each fragment: the look's tone of the light where matter was met (what
+/// it gives off, the sun where its shadow ray found it, the open sky's), else of the sky.
+@fragment
+pub fn shade<S: Sky, L: Look>(
+    pixel: FragCoord,
+    v: View,
+    sky: S,
+    look: L,
+    table: Texture<Rgba16Float>,
+    s: Sampler,
+    place: Texture<Rgba32Float>,
+    lit: Texture<Rgba16Float>,
+    open: Texture<Rgba16Float>,
+    emits: Texture<Rgba16Float>,
+    sunny: Texture<R8>,
+    lay: Lay,
+    list: GpuSpan<u32>,
+    count: GpuSpan<u32>,
+) -> vec4 {
+    let x = u32(pixel.position.x)
+    let y = u32(pixel.position.y)
+    let at = place.load(x, y)
+    let spotted = spot(pixel.position.xy, lay, list, count)
+    var colour = look.tone(Seen { light: seen(sky, v.ray(spotted.xy)) })
+    if at.w > 0.0 {
+        let found: f32 = sunny.load(x, y)
+        let light = emits.load(x, y).xyz + lit.load(x, y).xyz * found + open.load(x, y).xyz * sky_on(table, s, at.xyz)
+        colour = look.tone(Seen { light })
+    }
+    vec4(colour, 1.0)
+}
+
+/// Where on the screen (px: least x and y, greatest x and y, past the last) the sphere `b` can
+/// show through `v`, `width` × `height`: its bounding cube's corners' pixels, or the whole screen
+/// where a corner is behind the eye.
+fn rect_of(v: View, b: vec4, width: u32, height: u32) -> vec4 {
+    let all = vec4(0.0, 0.0, f32(width), f32(height))
+    var lo = vec2(1.0e9)
+    var hi = vec2(-1.0e9)
+    var behind = false
+    for k in 0..8 {
+        let c = b.xyz + (vec3(f32(k & 1), f32((k >> 1) & 1), f32((k >> 2) & 1)) * 2.0 - vec3(1.0)) * b.w
+        if dot(c - v.at, v.forward) <= 0.001 {
+            behind = true
+        } else {
+            let q = v.pixel_of(c)
+            lo = min(lo, q)
+            hi = max(hi, q)
+        }
+    }
+    if behind {
+        return all
+    }
+    clamp(vec4(floor(lo) - vec2(1.0), ceil(hi) + vec2(1.0)), vec4(0.0), vec4(f32(width), f32(height), f32(width), f32(height)))
+}
+
+/// The things' eye draws into one pass (`World::each`): each over its bound's rectangle within the
+/// band of rows from `y0` to `y1`.
+borrow struct Eyes<S: Sky> {
+    pass: DepthPass5<Rgba32Float, Rgba32Float, Rgba16Float, Rgba16Float, Rgba16Float>,
+    v: View,
+    sky: S,
+    lay: Lay,
+    list: GpuSpan<u32>,
+    count: GpuSpan<u32>,
+    y0: u32,
+    y1: u32,
+    width: u32,
+    height: u32,
+}
+
+impl<S: Sky> Each for Eyes<S> {
+    fn thing<A: Asked>(mut self, a: A, k: u32, bound: vec4) {
+        // (Laid out a ray a fragment, an edge pass's rays are anywhere: the whole of it.)
+        let r = if self.lay.edges == 0 { rect_of(self.v, bound, self.width, self.height) } else { vec4(0.0, 0.0, f32(self.width), f32(self.height)) }
+        let ya = max(u32(r.y), self.y0)
+        let yb = min(u32(r.w), self.y1)
+        if u32(r.z) > u32(r.x) && yb > ya {
+            self.pass.scissor(u32(r.x), ya, u32(r.z) - u32(r.x), yb - ya)
+            let near = max(length(bound.xyz - self.v.at) - bound.w, 0.0)
+            draw(self.pass, cover_at.bind(z: depth_of(near)), eye.bind(v: self.v, w: a, sky: self.sky, lay: self.lay, list: self.list, count: self.count), vertices: 3)
+        }
+    }
+}
+
+/// The things' shadow draws into one pass, each over the band of rows from `y0` to `y1`.
+borrow struct Shadows<S: Sky> {
+    pass: Pass<R8>,
+    sky: S,
+    place: borrow Texture<Rgba32Float>,
+    asks: borrow Texture<Rgba32Float>,
+    lit: borrow Texture<Rgba16Float>,
+    y0: u32,
+    y1: u32,
+    width: u32,
+}
+
+impl<S: Sky> Each for Shadows<S> {
+    fn thing<A: Asked>(mut self, a: A, k: u32, bound: vec4) {
+        self.pass.scissor(0, self.y0, self.width, self.y1 - self.y0)
+        draw(self.pass, cover, shadow.bind(w: a, sky: self.sky, place: self.place, asks: self.asks, lit: self.lit), vertices: 3, blend: Blend::Min)
+    }
 }
 
 /// Whether pixel (`x`, `y`) holds an edge (see the head of the file), by what the picture put there
@@ -217,35 +379,6 @@ fn edges_found(place: Texture<Rgba32Float>, asks: Texture<Rgba32Float>, most: u3
         }
     }
     at.store(i: pix, value: k)
-}
-
-/// One of the edge pixels' rays (ray `j` of edge pixel `e` is `EDGE_LOOKS² e + j`, drawn at pixel
-/// `j % width`, `j / width` of `rays`): its colour, one of `EDGE_LOOKS`² rays spread evenly over its
-/// pixel (`shown`). Drawn as a picture of its own so that every ray is a fragment's whole work, a
-/// few edge pixels not holding up the many round them.
-@fragment
-pub fn edge_ray<W: Asked, S: Sky, L: Look>(
-    pixel: FragCoord,
-    v: View,
-    w: W,
-    sky: S,
-    look: L,
-    table: Texture<Rgba16Float>,
-    s: Sampler,
-    list: GpuSpan<u32>,
-    count: GpuSpan<u32>,
-    width: u32,
-) -> vec4 {
-    let i = u32(pixel.position.x) + width * u32(pixel.position.y)
-    let n = EDGE_LOOKS * EDGE_LOOKS
-    let e = i / n
-    if e >= count[0] {
-        return vec4(0.0)
-    }
-    let pix = list[e]
-    let j = i % n
-    let o = (vec2(f32(j % EDGE_LOOKS), f32(j / EDGE_LOOKS)) + vec2(0.5)) / f32(EDGE_LOOKS)
-    vec4(shown(v, w, sky, look, table, s, vec2(f32(pix % width), f32(pix / width)) + o).colour, 1.0)
 }
 
 /// The picture: an edge pixel the mean of its rays, any other what its middle ray drew (`raw`);
@@ -301,6 +434,16 @@ pub struct Sight {
     edge_list: AppendBuffer<u32>,
     edge_at: GpuBuffer<u32>,
     edge_rays: Texture<Rgba16Float>,
+    /// What the eye draws hand the shade pass (the sun's light if its ray finds it, the open
+    /// sky's factor, what is given off), the depth that joins things, whether the sun's ray found
+    /// the sun; and the edge pass's own places and asks.
+    lit: Texture<Rgba16Float>,
+    open: Texture<Rgba16Float>,
+    emits: Texture<Rgba16Float>,
+    depth: DepthTexture,
+    sunny: Texture<R8>,
+    edge_place: Texture<Rgba32Float>,
+    edge_asks: Texture<Rgba32Float>,
     burned: Texture<R8>,
     /// The load beside each frame (sines a pixel; 0: none).
     pub load: u32,
@@ -328,6 +471,13 @@ pub fn sight() -> Sight {
         edge_list: append_buffer(1),
         edge_at: buffer(1),
         edge_rays: texture(width: 1, height: 1),
+        lit: texture(width: 1, height: 1),
+        open: texture(width: 1, height: 1),
+        emits: texture(width: 1, height: 1),
+        depth: depth_texture(width: 1, height: 1),
+        sunny: texture(width: 1, height: 1),
+        edge_place: texture(width: 1, height: 1),
+        edge_asks: texture(width: 1, height: 1),
         burned: texture(width: 1, height: 1),
         load: 0,
         held_asks: 0,
@@ -388,6 +538,57 @@ impl Sight {
         }
     }
 
+    /// The eye draws, the shadow draws and the shade pass, the fragments laid out as `lay` says,
+    /// into the picture's targets (`edge` false) or the edge pass's (`edge` true), in `bands`
+    /// bands of rows.
+    fn lit_by<W: World, S: Sky, L: Look>(mut self, world: W, sky: S, look: L, v: View, lay: Lay, bands: u32, width: u32, height: u32, edge: bool) {
+        label(if edge { "edge rays" } else { "picture" })
+        var band: u32 = 0
+        while band < bands {
+            let y0 = band * height / bands
+            let y1 = (band + 1) * height / bands
+            band += 1
+            if edge {
+                let p = begin_pass5_with_depth(mut self.edge_place, mut self.edge_asks, mut self.lit, mut self.open, mut self.emits, mut self.depth, clear: vec4(0.0), keep: band > 1, keep_depth: band > 1)
+                var e = Eyes { pass: p, v, sky, lay, list: self.edge_list.items(), count: self.edge_list.count(), y0, y1, width, height }
+                world.each(self.kept, 0, mut e)
+                e.pass.end()
+            } else {
+                let p = begin_pass5_with_depth(mut self.drawn.place, mut self.asks, mut self.lit, mut self.open, mut self.emits, mut self.depth, clear: vec4(0.0), keep: band > 1, keep_depth: band > 1)
+                var e = Eyes { pass: p, v, sky, lay, list: self.edge_list.items(), count: self.edge_list.count(), y0, y1, width, height }
+                world.each(self.kept, 0, mut e)
+                e.pass.end()
+            }
+        }
+        label(if edge { "edge shadows" } else { "shadows" })
+        band = 0
+        while band < bands {
+            let y0 = band * height / bands
+            let y1 = (band + 1) * height / bands
+            band += 1
+            let p = begin_pass(mut self.sunny, clear: vec4(1.0), keep: band > 1)
+            if edge {
+                var e = Shadows { pass: p, sky, place: self.edge_place, asks: self.edge_asks, lit: self.lit, y0, y1, width }
+                world.each(self.kept, 0, mut e)
+                e.pass.end()
+            } else {
+                var e = Shadows { pass: p, sky, place: self.drawn.place, asks: self.asks, lit: self.lit, y0, y1, width }
+                world.each(self.kept, 0, mut e)
+                e.pass.end()
+            }
+        }
+        label(if edge { "edge shade" } else { "shade" })
+        if edge {
+            let p = begin_pass(mut self.edge_rays)
+            draw(p, cover, shade.bind(v: v, sky: sky, look: look, table: self.table, s: self.s, place: self.edge_place, lit: self.lit, open: self.open, emits: self.emits, sunny: self.sunny, lay: lay, list: self.edge_list.items(), count: self.edge_list.count()), vertices: 3)
+            p.end()
+        } else {
+            let p = begin_pass(mut self.raw)
+            draw(p, cover, shade.bind(v: v, sky: sky, look: look, table: self.table, s: self.s, place: self.drawn.place, lit: self.lit, open: self.open, emits: self.emits, sunny: self.sunny, lay: lay, list: self.edge_list.items(), count: self.edge_list.count()), vertices: 3)
+            p.end()
+        }
+    }
+
     /// The same, into `drawn` only (nothing shown): `drawn.placed` once drawn.
     pub fn drawn_only<W: World, S: Sky, L: Look>(mut self, world: W, sky: S, look: L, eye: Eye, width: u32, height: u32) {
         let v = view(eye, width, height)
@@ -435,6 +636,13 @@ impl Sight {
             self.edge_list = append_buffer(most)
             self.edge_at = buffer(width * height)
             self.edge_rays = texture(width: width, height: height)
+            self.lit = texture(width: width, height: height)
+            self.open = texture(width: width, height: height)
+            self.emits = texture(width: width, height: height)
+            self.depth = depth_texture(width: width, height: height)
+            self.sunny = texture(width: width, height: height)
+            self.edge_place = texture(width: width, height: height)
+            self.edge_asks = texture(width: width, height: height)
         }
         match mut self.sizing {
             Some(p) => match p.poll() {
@@ -450,38 +658,20 @@ impl Sight {
         }
         label("sky table")
         dispatch(skylit.bind(sky: sky, out: mut self.table), groups: ((TABLE + 7) / 8, (TABLE + 7) / 8, 1))
-        label("picture")
-        let w = world.asked(self.kept, 0)
         let bands = self.bands
-        var band: u32 = 0
-        while band < bands {
-            let y0 = band * height / bands
-            let y1 = (band + 1) * height / bands
-            band += 1
-            let p = begin_pass3(mut self.raw, mut self.drawn.place, mut self.asks, keep: band > 1)
-            p.scissor(0, y0, width, y1 - y0)
-            draw(p, cover, pixel.bind(v: v, w: w, sky: sky, look: look, table: self.table, s: self.s, steps: self.steps), vertices: 3)
-            p.end()
-        }
+        // The picture: each thing's eye draw, each thing's shadow draw, the shade.
+        let screen = Lay { edges: 0, width, spare: 0, spare2: 0 }
+        self.lit_by(world, sky, look, v, screen, bands, width, height, edge: false)
         label("edges")
         self.edge_list.clear()
         dispatch(
             edges_found.bind(place: self.drawn.place, asks: self.asks, most: width * height / EDGE_SHARE, list: mut self.edge_list, at: mut self.edge_at),
             groups: ((width + 7) / 8, (height + 7) / 8, 1),
         )
-        // (The edge rays in bands of rows, as the picture is; a band past the last ray is
+        // (The edge rays the same three, laid out a ray a fragment; a band past the last ray is
         // fragments that only read the count.)
-        label("edge rays")
-        band = 0
-        while band < bands && self.steps != 1 {
-            let y0 = band * height / bands
-            let y1 = (band + 1) * height / bands
-            band += 1
-            let p = begin_pass(mut self.edge_rays, keep: band > 1)
-            p.scissor(0, y0, width, y1 - y0)
-            draw(p, cover, edge_ray.bind(v: v, w: w, sky: sky, look: look, table: self.table, s: self.s, list: self.edge_list.items(), count: self.edge_list.count(), width: width), vertices: 3)
-            p.end()
-        }
+        let rays = Lay { edges: 1, width, spare: 0, spare2: 0 }
+        self.lit_by(world, sky, look, v, rays, bands, width, height, edge: true)
         label("edges resolved")
         dispatch(
             edges_resolved.bind(raw: self.raw, at: self.edge_at.items(), rays: self.edge_rays, steps: self.steps, out: mut self.drawn.colour),
