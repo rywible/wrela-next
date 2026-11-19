@@ -3434,6 +3434,27 @@ pub fn written_of(nodes: [WrittenNode; 64], len: u32, full: bool) -> Result<Writ
     Ok(w)
 }
 
+/// One node's step in a written field's evaluators, its kind's own work aside: reading the node
+/// and choosing its kind's branch (what `Written::node_work` adds for every node).
+fn written_step(n: WrittenNode) -> f32 {
+    let k = n.kind
+    if k == W_SMOOTH_UNION { n.p.x } else if k <= W_HALF_SPACE { n.p.y } else if k == W_SCALE { n.p.z } else if k == W_DISPLACE { n.p.w } else if k >= W_UNION { n.q.x } else { 0.0 }
+}
+
+/// What one map a point passes costs the leaf or displacement under it (`Written::local_at`):
+/// the map's own `local`, and a step of the walk up to it.
+fn written_map_work(kind: u32) -> u32 {
+    let walk = work(|n: WrittenNode| written_step(n))
+    let own = if kind == W_TRANSLATE {
+        work(|n: WrittenNode| Shift { by: n.p.xyz }.local(n.q.xyz))
+    } else if kind == W_ROTATE {
+        work(|n: WrittenNode| Turn { to_local: mat3(n.p.xyz, n.q.xyz, n.p.zxy) }.local(n.q.xyz))
+    } else {
+        work(|n: WrittenNode| Size { by: n.p.x }.local(n.q.xyz))
+    }
+    plus_work(walk, own)
+}
+
 /// `Written::under`'s flag: an intersection or a cut is above the node.
 const W_UNDER_CUT: u32 = 1
 /// `Written::under`'s flag: a union or a smooth union is above the node.
@@ -3759,6 +3780,65 @@ impl Written {
         Interval { lo: max(x.lo, d - r - e), hi: min(x.hi, d + r + e) }
     }
 
+    /// What the maps above node `i` cost its point (`local_at`), one `written_map_work` each.
+    fn maps_work(self, i: u32) -> u32 {
+        var w: u32 = 0
+        var j = self.up[i]
+        for k in 0..WRITTEN_DEPTH {
+            if j >= WRITTEN_NODES {
+                break
+            }
+            w = plus_work(w, written_map_work(self.nodes[j].kind))
+            j = self.up[j]
+        }
+        w
+    }
+
+    /// Leaf `i`'s own work in an ask: its kind's distance (the compiler's count of the kind's
+    /// code, a build constant) and the maps its point passes. What a masked ask skips where its
+    /// part isn't live.
+    fn leaf_work(self, i: u32) -> u32 {
+        let k = self.nodes[i].kind
+        let own = if k == W_ROUND_CONE {
+            work(|n: WrittenNode| round_cone(n.p.xyz, n.q.xyz, r_top: n.p.w, r_bottom: n.q.w).distance(n.q.zxy))
+        } else if k == W_SPHERE {
+            work(|n: WrittenNode| sphere(n.p.x).distance(n.q.xyz))
+        } else if k == W_CUBOID {
+            work(|n: WrittenNode| cuboid(n.p.xyz).distance(n.q.xyz))
+        } else if k == W_ELLIPSOID {
+            work(|n: WrittenNode| ellipsoid(n.p.xyz).distance(n.q.xyz))
+        } else {
+            work(|n: WrittenNode| half_space(n.p.xyz, n.p.w).distance(n.q.xyz))
+        }
+        plus_work(own, self.maps_work(i))
+    }
+
+    /// Node `i`'s work in an ask beyond its leaf's (`leaf_work`): its step, and its kind's own
+    /// (a join's, a scale's lengths out, a displacement's noise at its octaves and its point
+    /// through its maps, a union's two tests of the mask in a masked ask). Each the compiler's
+    /// count of that code, a build constant.
+    fn node_work(self, i: u32) -> u32 {
+        let n = self.nodes[i]
+        let k = n.kind
+        let step = work(|m: WrittenNode| written_step(m))
+        let own = if k == W_SCALE {
+            work(|m: WrittenNode| Size { by: m.p.x }.distance_out(m.q.x))
+        } else if k == W_DISPLACE {
+            let octave = work(|m: WrittenNode| m.p.w * value_noise(m.q.xyz * m.p.y + vec3(m.p.z)))
+            plus_work(octave * min(u32(n.p.z), FBM_OCTAVES), self.maps_work(i))
+        } else if k == W_UNION || k == W_SMOOTH_UNION {
+            let join = if k == W_UNION { work(|m: WrittenNode| min(m.p.x, m.p.y)) } else { work(|m: WrittenNode| smin(m.p.x, m.p.y, m.p.z)) }
+            plus_work(join, 2 * work(|l: Live| l.any(l.words.x, l.words.y)))
+        } else if k == W_INTERSECT {
+            work(|m: WrittenNode| max(m.p.x, m.p.y))
+        } else if k == W_SMOOTH_SUBTRACT || k == W_SMOOTH_INTERSECT {
+            work(|m: WrittenNode| smax(m.p.x, -m.p.y, m.p.z))
+        } else {
+            0
+        }
+        plus_work(step, own)
+    }
+
     /// How many nodes it holds.
     pub fn len(self) -> u32 {
         self.len
@@ -3948,6 +4028,37 @@ impl Surface for Written {
             }
         }
         (ds[0], ps[0])
+    }
+
+    /// The run-time count of an ask (§20.4's `ask_work`, in §18.11's unit): each node's step and
+    /// its kind's own work, each leaf's distance and the maps its point passes, every one the
+    /// compiler's count of that code. What this value asks, not the 64 nodes the type can hold
+    /// (the compiler's count of `distance`, `work`, is that: hundreds of thousands).
+    fn ask_work(self) -> u32 {
+        var w: u32 = 0
+        for i in 0..min(self.len, WRITTEN_NODES) {
+            w = plus_work(w, self.node_work(i))
+            if self.nodes[i].kind <= W_HALF_SPACE {
+                w = plus_work(w, self.leaf_work(i))
+            }
+        }
+        w
+    }
+
+    /// Part `i`'s: its leaf's distance and the maps its point passes (what a masked ask skips
+    /// where it isn't live).
+    fn part_work(self, i: u32) -> u32 {
+        let leaf = self.leaf_of(i)
+        if leaf >= WRITTEN_NODES { 0 } else { self.leaf_work(leaf) }
+    }
+
+    /// Every node's step and its kind's own work: what a masked ask does beyond its parts.
+    fn base_work(self) -> u32 {
+        var w: u32 = 0
+        for i in 0..min(self.len, WRITTEN_NODES) {
+            w = plus_work(w, self.node_work(i))
+        }
+        w
     }
 
     /// Node by node as each kind's own `pruned` does, `live` passed from each operand to the
@@ -6034,6 +6145,15 @@ fn a_written_field_is_its_compiled_tree_to_the_bit() {
         assert(written.lipschitz(near) == compiled.lipschitz(near), f"the steepness within {near} differs")
     }
     assert(written.parts() == 5)
+    // Its ask's run-time count is its base's and its parts' together, each part's its leaf's
+    // own, and far under the compiler's count of the 64 nodes the type can hold.
+    var parts: u32 = 0
+    for i in 0..written.parts() {
+        assert(written.part_work(i) > 0, f"part {i} weighs nothing")
+        parts += written.part_work(i)
+    }
+    assert(written.ask_work() == written.base_work() + parts, "an ask isn't its base and its parts")
+    assert(written.ask_work() * 20 < work(|q: vec3| written.distance(q)), "the count is the type's, not the value's")
     // Its hash (each node's mixed in, the sums wrapping) is the same each time it's asked, and
     // another field's differs.
     assert(written.hash() == written.hash(), "the hash changed")
