@@ -316,6 +316,11 @@ fn masked_and_whole_draw_the_same_picture() {
         0,
         "a kernel's counts of what an ask costs differ from the CPU's"
     );
+    assert_eq!(
+        one_u32(&mut host, "facts_differing", &[]),
+        0,
+        "a kernel's facts of what a function reads differ from the CPU's"
+    );
 }
 
 /// Where a ray can meet a surface (`Surface::meets`, §20.5): no point inside a surface lies

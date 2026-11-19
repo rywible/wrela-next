@@ -1455,6 +1455,9 @@ pub(crate) fn intrinsic(
         Some(Lang::WorkOf) => {
             return work_call(fl, c);
         }
+        Some(Lang::ReadsOnlyInput) => {
+            return reads_call(fl, c);
+        }
         Some(
             l @ (Lang::LiftGradient
             | Lang::LiftJacobian
@@ -4275,16 +4278,31 @@ pub(crate) fn work_call(fl: &mut Fl, c: &mir::Call) -> Option<ir::ValueId> {
 
 /// [`work_call`]'s count of the callable `key`: `None` if it can't be GPU code (the errors say
 /// why, with a note that `work` asked).
-/// Asked in a GPU module (`beside`), the count's module starts with its types and resources.
 fn count_work(
     cx: &mut Cx,
     key: &InstanceKey,
     span: Span,
     beside: Option<&ModuleBuilder>,
 ) -> Option<u32> {
+    let (mb, id) = as_gpu_code(cx, key, span, beside, "work")?;
+    let w = ir::work::entry_work(&mb.m, id).work;
+    Some(w.map_or(u32::MAX, |w| u32::try_from(w).unwrap_or(u32::MAX)))
+}
+
+/// The callable `key` lowered as GPU code in a module of its own, for a derivation that reads its
+/// code (`what`, the intrinsic's name): `None` if it can't be GPU code (the errors say why, with a
+/// note that the intrinsic asked). Asked in a GPU module (`beside`), the module starts with its
+/// types and resources, so a closure over a buffer the kernel was given reads that buffer.
+fn as_gpu_code(
+    cx: &mut Cx,
+    key: &InstanceKey,
+    span: Span,
+    beside: Option<&ModuleBuilder>,
+    what: &str,
+) -> Option<(ModuleBuilder, ir::FuncId)> {
     let name = cx.source_name(key).unwrap_or_else(|| "the function".to_string());
-    let what = format!("`{name}`, as `std::derive::work` counts it");
-    let mut mb = ModuleBuilder::gpu(GpuCx::new(what, Rc::default(), None));
+    let label = format!("`{name}`, as `std::derive::{what}` reads it");
+    let mut mb = ModuleBuilder::gpu(GpuCx::new(label, Rc::default(), None));
     if let Some(b) = beside {
         mb.m.types = b.m.types.clone();
         mb.m.resources = b.m.resources.clone();
@@ -4298,14 +4316,37 @@ fn count_work(
         let note = Diagnostic::new(
             codes::E0700,
             span,
-            format!("`work` counts `{name}` as GPU code, which it can't be"),
+            format!("`{what}` reads `{name}` as GPU code, which it can't be"),
         )
-        .with_note("`std::derive::work` counts what one call does on the GPU (§18.11): the function must be one GPU code could call");
+        .with_note(format!("`std::derive::{what}` reads what one call does on the GPU: the function must be one GPU code could call"));
         cx.err(note);
         return None;
     }
-    let w = ir::work::entry_work(&mb.m, id).work;
-    Some(w.map_or(u32::MAX, |w| u32::try_from(w).unwrap_or(u32::MAX)))
+    Some((mb, id))
+}
+
+/// `std::derive::reads_only_input(f)` (language.md §14): whether `f`'s result depends on nothing
+/// but what it's given: none of the values it captures, nothing outside it (a resource, a builtin
+/// input). A constant of the build, as `work` is (`ir::depends`).
+pub(crate) fn reads_call(fl: &mut Fl, c: &mir::Call) -> Option<ir::ValueId> {
+    let Some(crate::body::Repr::Callable(callable, _)) = fl.callable_arg(&c.args[0]) else {
+        fl.cx.err(Diagnostic::new(
+            codes::E0700,
+            c.args[0].span(),
+            "`reads_only_input` reads a closure or a named function",
+        ));
+        return None;
+    };
+    let key = callable.instance_key();
+    let beside = if fl.mb.gpu.is_some() { Some(&*fl.mb) } else { None };
+    let (mb, id) = as_gpu_code(fl.cx, &key, c.span, beside, "reads_only_input")?;
+    let f = &mb.m.functions[id.index()];
+    // Its parameters: what it captures, then its input (the last).
+    let inputs = f.params.len().saturating_sub(1) as u32;
+    let d = ir::depends::depends(&mb.m, id);
+    let only = !d.outside() && (0..inputs).all(|i| !d.on_param(i));
+    let b = fl.mb.m.types.bool();
+    Some(fl.value(b, ir::Expr::Const(ir::Const::Bool(only))))
 }
 
 #[cfg(test)]

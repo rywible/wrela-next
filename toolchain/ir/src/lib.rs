@@ -16,6 +16,7 @@
 pub mod bounds;
 mod const_fold;
 pub use const_fold::FUEL as FOLD_FUEL;
+pub mod depends;
 pub mod derive;
 mod error;
 pub mod gpu_memory;

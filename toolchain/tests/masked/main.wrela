@@ -12,8 +12,8 @@
 //
 // `--set BRICK=0.08` and so on change the bricks' side (m).
 use std::collections::Vec
-use std::derive::{Box3, interval, work}
-use std::field::{ALL_LIVE, Live, RoundCone, SmoothUnion, SmoothUnionAll, Surface, With, round_cone}
+use std::derive::{Box3, interval, reads_only_input, work}
+use std::field::{ALL_LIVE, Live, RoundCone, SmoothUnion, SmoothUnionAll, Surface, With, round_cone, sphere}
 use std::gpu::{
     ClipPosition, FragCoord, GlobalId, GpuBuffer, Rg32Float, Slots, Texture, VertexIndex, begin_pass,
     begin_screen_pass, buffer, buffer_of, dispatch, draw, label, read, texture,
@@ -257,6 +257,26 @@ fn counted(b: Body, out: mut Slots<u32>, id: GlobalId) {
     }
 }
 
+/// What the compiler says of what a function reads (`std::derive::reads_only_input`), in a
+/// kernel: the creature held as a value (no: its numbers are an input), a ball built inside (yes),
+/// a read of the kernel's own buffer (no).
+@compute(1)
+fn facts(b: Body, live: [Live], out: mut Slots<u32>, id: GlobalId) {
+    let yes = if id.x == 0 {
+        b.reads_only_point()
+    } else if id.x == 1 {
+        reads_only_input(|p: vec3| sphere(1.0).distance(p))
+    } else {
+        reads_only_input(|i: u32| live[i].words.x)
+    }
+    out[id] = if yes { 1 } else { 0 }
+}
+
+/// What the CPU says of the same (a buffer it can't name: no, as the kernel must).
+fn facts_here(b: Body) -> [u32; 3] {
+    [if b.reads_only_point() { 1 } else { 0 }, if reads_only_input(|p: vec3| sphere(1.0).distance(p)) { 1 } else { 0 }, 0]
+}
+
 pub struct Masked {
     frames: u32,
     grid: Grid,
@@ -271,6 +291,8 @@ pub struct Masked {
     misses: u32,
     counted: Vec<Pending<u32>>,
     counts_differ: u32,
+    facts: Vec<Pending<u32>>,
+    facts_differ: u32,
 }
 
 pub fn init() -> Masked {
@@ -344,6 +366,8 @@ pub fn init() -> Masked {
         misses: 4294967295,
         counted: Vec::new(),
         counts_differ: 4294967295,
+        facts: Vec::new(),
+        facts_differ: 4294967295,
     }
 }
 
@@ -383,6 +407,10 @@ pub fn frame(s: mut Masked, time: f32, width: u32, height: u32) {
         var cs: GpuBuffer<u32> = buffer(COUNTS)
         dispatch(counted.bind(b: body, out: mut cs), over: COUNTS)
         s.counted.push(read(cs.items()))
+        label("facts")
+        var fs: GpuBuffer<u32> = buffer(3)
+        dispatch(facts.bind(b: body, live: s.live.items(), out: mut fs), over: 3)
+        s.facts.push(read(fs.items()))
     }
     label("shown")
     let p = begin_screen_pass(clear: vec4(0.0))
@@ -435,6 +463,19 @@ pub fn frame(s: mut Masked, time: f32, width: u32, height: u32) {
             s.counts_differ = differ
         }
     }
+    for i in 0..u32(s.facts.len()) {
+        if let Some(Ok(got)) = s.facts[i].poll() {
+            let want = facts_here(body)
+            var differ: u32 = 0
+            for k in 0..3 {
+                if got[k] != want[k] {
+                    differ += 1
+                }
+            }
+            print(f"masked: reads only its input (the creature held, a ball built inside, a buffer): {got[0]} {got[1]} {got[2]}; the CPU's differ in {differ} of 3")
+            s.facts_differ = differ
+        }
+    }
 }
 
 /// How many pixels the two pictures differ in (all ones until they're compared).
@@ -445,6 +486,11 @@ pub fn differing(s: Masked) -> u32 {
 /// How many live parts of the CPU's masks a kernel's left out (all ones until read).
 pub fn kernel_misses(s: Masked) -> u32 {
     s.misses
+}
+
+/// How many of a kernel's `facts` differ from the CPU's (all ones until read).
+pub fn facts_differing(s: Masked) -> u32 {
+    s.facts_differ
 }
 
 /// How many of a kernel's `counts` differ from the CPU's (all ones until read).

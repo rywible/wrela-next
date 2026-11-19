@@ -657,6 +657,7 @@ lang_items! {
     TapeWith = "std::derive::tape_with",
     TapeSized = "std::derive::tape_sized",
     WorkOf = "std::derive::work",
+    ReadsOnlyInput = "std::derive::reads_only_input",
     Building = "std::stage::Building",
     PushOne = "std::stage::push_one",
     PushTwo = "std::stage::push_two",
