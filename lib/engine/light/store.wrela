@@ -84,6 +84,11 @@ const LISTED: u32 = 2
 const FILLED: u32 = 4
 const TICKET: u32 = 16777216
 
+/// A slot's state: its point and facing written (`probes_pointed`). Until then its word 4 holds
+/// the complement of the least pixel that asked for it this frame (`probes_owned`): a probe's point
+/// is that pixel's whatever order the pixels ran in, so the picture is the same every run.
+const POINTED: u32 = 4194304
+
 /// What a pixel's probe says: nothing, the sun reaches it, it doesn't, there is no probe yet.
 pub const SAYS_LIT: u32 = 1
 pub const SAYS_DARK: u32 = 2
@@ -156,20 +161,20 @@ fn probed(table: mut Atomics<u32>, head: mut Atomics<u32>, list: mut Atomics<u32
         let at = s * WORDS
         let c = table.load(i: at + 2)
         if c == 0 {
-            let old = table.add(i: at + 3, value: TICKET)
-            if old < TICKET {
-                // (Made here: its point and facing, then its key, then made.)
-                table.store(i: at + 4, value: bitcast_u32(p.x))
-                table.store(i: at + 5, value: bitcast_u32(p.y))
-                table.store(i: at + 6, value: bitcast_u32(p.z))
-                table.store(i: at + 7, value: folded8(n))
-                table.store(i: at, value: k.x)
-                table.store(i: at + 1, value: k.y)
-                table.store(i: at + 2, value: k.z)
-                let _ = table.or(i: at + 3, value: MADE)
-                queued(mut table, mut head, mut list, s)
+            // (Made only where the list has room, so every probe made is listed, and pointed, in
+            // the frame it is made.)
+            if head.load(i: 0) < LIST {
+                let old = table.add(i: at + 3, value: TICKET)
+                if old < TICKET {
+                    // (Made here: its key, then made and listed; its point by `probes_pointed`.)
+                    table.store(i: at, value: k.x)
+                    table.store(i: at + 1, value: k.y)
+                    table.store(i: at + 2, value: k.z)
+                    let _ = table.or(i: at + 3, value: MADE)
+                    queued(mut table, mut head, mut list, s)
+                }
             }
-            // (Being made by another pixel, maybe of this key: asked again next frame.)
+            // (Being made by another pixel, maybe of this key: the next pass makes it, if not.)
             going = false
         } else if c == k.z && table.load(i: at) == k.x && table.load(i: at + 1) == k.y {
             state = table.load(i: at + 3)
@@ -239,6 +244,9 @@ pub fn said(table: GpuSpan<u32>, p: vec3, n: vec3, size: f32) -> vec2 {
     if f.x == NONE || (f.y & (MADE | LISTED | FILLED)) == MADE {
         return vec2(f32(SAYS_MISSING), 1.0)
     }
+    if (f.y & POINTED) == 0 {
+        return vec2(0.0, 1.0)
+    }
     if (f.y & FILLED) == 0 {
         return vec2(0.0, 1.0)
     }
@@ -282,6 +290,66 @@ fn probes_made(kept: Texture<Rg8>, place: Texture<Rgba32Float>, asks: Texture<Rg
     let at = place.load(id.x, id.y)
     let a = asks.load(id.x, id.y)
     let _ = probed(mut table, mut head, mut list, a.xyz, at.xyz, a.w)
+}
+
+/// Each pixel whose probe was missing (`kept`): offered as its probe's owner, where the probe has
+/// no point yet: the least pixel's number is kept (its complement, by the most).
+@compute(8, 8)
+fn probes_owned(kept: Texture<Rg8>, place: Texture<Rgba32Float>, asks: Texture<Rgba32Float>, table: mut Atomics<u32>, id: GlobalId) {
+    let w = kept.width()
+    if id.x >= w || id.y >= kept.height() {
+        return
+    }
+    if said_kept(kept.load(id.x, id.y).x) != SAYS_MISSING {
+        return
+    }
+    let at = place.load(id.x, id.y)
+    let a = asks.load(id.x, id.y)
+    let k = key_of(a.xyz, at.xyz, a.w)
+    var s = slot_of(k)
+    var going = true
+    for _ in 0..TRIES {
+        if !going {
+            continue
+        }
+        let o = s * WORDS
+        let c = table.load(i: o + 2)
+        if c == 0 {
+            going = false
+        } else if c == k.z && table.load(i: o) == k.x && table.load(i: o + 1) == k.y {
+            if (table.load(i: o + 3) & POINTED) == 0 {
+                let _ = table.max(i: o + 4, value: 4294967295 ^ (id.x + w * id.y))
+            }
+            going = false
+        }
+        s = (s + 1) & (SLOTS - 1)
+    }
+}
+
+/// Each probe listed and not yet pointed: its point and facing its owner pixel's (`probes_owned`),
+/// read from this frame's picture.
+@compute(64)
+fn probes_pointed(place: Texture<Rgba32Float>, asks: Texture<Rgba32Float>, list: [u32], head: [u32], table: mut Atomics<u32>, id: GlobalId) {
+    if id.x >= min(head[0], LIST) {
+        return
+    }
+    let o = list[id.x] * WORDS
+    if (table.load(i: o + 3) & POINTED) != 0 {
+        return
+    }
+    let owner = table.load(i: o + 4)
+    if owner == 0 {
+        return
+    }
+    let pix = 4294967295 ^ owner
+    let w = place.width()
+    let at = place.load(pix % w, pix / w)
+    let p = asks.load(pix % w, pix / w).xyz
+    table.store(i: o + 4, value: bitcast_u32(p.x))
+    table.store(i: o + 5, value: bitcast_u32(p.y))
+    table.store(i: o + 6, value: bitcast_u32(p.z))
+    table.store(i: o + 7, value: folded8(at.xyz))
+    let _ = table.or(i: o + 3, value: POINTED)
 }
 
 /// `n` zeroed words of `words`, `first` on.
@@ -584,9 +652,6 @@ pub struct Store {
     head: GpuBuffer<u32>,
     list: GpuBuffer<u32>,
     rays: Texture<Rgba8>,
-    /// The list's head as last read back (how many wait, from the last filled), and its read.
-    waiting: u32,
-    heard: Option<Pending<u32>>,
     sun: vec3,
     moving: Vec<bool>,
     /// An instrument: the main picture's decided pixels held to the rays (`checked`), its counts;
@@ -595,7 +660,6 @@ pub struct Store {
     pub off: bool,
     counts: GpuBuffer<u32>,
     counted: Option<Pending<u32>>,
-    frame: u32,
 }
 
 /// An empty store.
@@ -605,15 +669,12 @@ pub fn store() -> Store {
         head: buffer(2),
         list: buffer(LIST),
         rays: texture(width: FW, height: FILL * RAYS / FW),
-        waiting: 0,
-        heard: None,
         sun: vec3(0.0),
         moving: Vec::new(),
         checking: false,
         off: false,
         counts: buffer(11),
         counted: None,
-        frame: 0,
     }
 }
 
@@ -638,7 +699,6 @@ impl Store {
             first += 1048576
         }
         dispatch(zeroed.bind(words: mut self.head, n: 2, first: 0), over: 2)
-        self.waiting = 0
         self.sun = sun
         self.moving = Vec::new()
         for i in 0..kept.len() {
@@ -654,32 +714,20 @@ impl Store {
     /// The probes the picture found missing (`said`, kept in `kept`) made and listed.
     pub fn made(mut self, kept: Texture<Rg8>, place: Texture<Rgba32Float>, asks: Texture<Rgba32Float>) {
         label("light made")
-        dispatch(probes_made.bind(kept, place, asks, table: mut self.table, head: mut self.head, list: mut self.list), groups: ((kept.width() + 7) / 8, (kept.height() + 7) / 8, 1))
+        // (Three passes: a key that lost its slot to another in one makes it in the next.)
+        for _ in 0..3 {
+            dispatch(probes_made.bind(kept, place, asks, table: mut self.table, head: mut self.head, list: mut self.list), groups: ((kept.width() + 7) / 8, (kept.height() + 7) / 8, 1))
+        }
+        dispatch(probes_owned.bind(kept, place, asks, table: mut self.table), groups: ((kept.width() + 7) / 8, (kept.height() + 7) / 8, 1))
+        dispatch(probes_pointed.bind(place, asks, list: self.list.items(), head: self.head.items(), table: mut self.table), over: LIST)
     }
 
     /// The probes waiting filled, `FILL` a frame, by a draw a still thing of `world`; nothing
     /// drawn when the last read of the list said none wait.
     pub fn fill<W: World, S: Sky>(mut self, world: W, kinds: W::Kinds, kept: Vec<Kept>, sky: S) {
         let sun = sky.sun().way
-        match mut self.heard {
-            Some(p) => match p.poll() {
-                Some(Ok(h)) => {
-                    self.waiting = if min(h[0], LIST) > h[1] { min(h[0], LIST) - h[1] } else { 0 }
-                    self.heard = None
-                },
-                _ => {},
-            },
-            None => {},
-        }
-        if self.heard.is_none() {
-            self.heard = Some(read(self.head.items()))
-        }
-        self.frame += 1
-        // (Read back late: a frame whose list was emptied since draws nothing, at the cost of
-        // its draws' setting up.)
-        if self.waiting == 0 && self.frame > 2 {
-            return
-        }
+        // (Every frame, by count, never by time or a read back: what a frame holds is the same
+        // every run. With nothing waiting the draws cover nothing: `fill_quad`.)
         label("light filled")
         var f = Filling { pass: begin_pass(mut self.rays, clear: vec4(0.0)), kept, sun, table: self.table.items(), list: self.list.items(), head: self.head.items() }
         world.each(kept, kinds, 0, mut f)
