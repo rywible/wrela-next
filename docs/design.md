@@ -407,6 +407,30 @@ cells can be coarser for the same picture: twice as coarse is an eighth of the m
 1b, as a measure against its memory line. **Dead if** at a given picture error it does not allow
 cells at least 1.5 times as coarse, or an ask slows by more than the memory is worth.
 
+**5. The engine reads what a thing is when the game is built, and fuses the path for it.** A
+field's structure is known before anything runs: its type says how std's shapes were joined, and
+the compiler holds its expression. So the engine need not treat every thing as an opaque
+function to be marched. Three steps, each a property the toolchain derives, never a thing the
+engine knows by name, and each falling back to the general march, so that only cost depends on
+it and the judges hold it to the same picture:
+
+- **Where a ray can meet a thing, in closed form.** std's shapes each say exactly where a ray
+  enters and leaves them; joins compose it (a sharp union: the nearest of its members' hits,
+  exact, no marching at all; a smooth union: its members grown by what the blend can add, which
+  bounds where the surface can be, so a march starts at the surface and takes a few steps). A
+  field with no such form (an author's own function) answers with its bound, as now.
+- **Facts fixed when the game is built:** whether a thing can move (does its field read time or
+  state at all), whether its value is a true distance, what an ask of it and of each part costs.
+  Each becomes a constant of that thing's code instead of something found out while running.
+- **The engine's own code run at build time over the world,** to lay out a draw a kind of thing,
+  join things that share a structure, and fill a still thing's cells ahead.
+
+The first needs nothing new in the language and may replace most of "looking coarsely first"
+for things built of std's shapes. **Dead if**, on the stage and the body, meeting in closed form
+does not at least halve the eye's part of the picture against marching from the bound; or if the
+same shape written two ways (std's shapes joined, against one function) then differs in cost by
+more than the author test allows, with no way for the compiler to see through the second.
+
 ## Open risks
 
 - Edges cost. A ray is about 10 ns on the M4, and close up 40% of a body's pixels are edge
