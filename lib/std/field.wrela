@@ -582,55 +582,60 @@ impl Live {
         self.words.x
     }
 
-    /// Whether part `i` is asked.
+    /// Whether part `i` is asked: a shift and an and of one word. Of the first 32 parts, the
+    /// first word, read alone; past them, the word chosen by selects (no index into the four,
+    /// which keeps them in memory where `i` isn't a constant).
     pub fn has(self, i: u32) -> bool {
-        i >= 128 || ((self.words[i >> 5] >> (i & 31)) & 1) != 0
+        let w = if i < 32 { self.words.x } else { self.word_at(i >> 5) }
+        i >= 128 || ((w >> (i & 31)) & 1) != 0
     }
 
-    /// Whether any of the `count` parts from `first` on is asked.
+    /// Word `w` of the four (0 to 3), chosen by selects.
+    fn word_at(self, w: u32) -> u32 {
+        let v = self.words
+        select(
+            if_false: select(if_false: v.x, if_true: v.y, cond: w == 1),
+            if_true: select(if_false: v.z, if_true: v.w, cond: w == 3),
+            cond: w >= 2,
+        )
+    }
+
+    /// Whether any of the `count` parts from `first` on is asked: one part's bit, or each word
+    /// and'ed with the span's bits in it (constants, where the span is).
     pub fn any(self, first: u32, count: u32) -> bool {
         if count == 1 {
-            return self.has(first)
+            self.has(first)
+        } else if first + count > 128 {
+            count > 0
+        } else {
+            (self.words & spans(first, count)) != vec4u(0)
         }
-        if first + count > 128 {
-            return count > 0
-        }
-        var hit: u32 = 0
-        for w in 0..4 {
-            hit = hit | (self.words[w] & span_bits(first, count, w))
-        }
-        hit != 0
     }
 
     /// The same, with the `count` parts from `first` on left out.
     pub fn without(self, first: u32, count: u32) -> Live {
-        var words = self.words
-        for w in 0..4 {
-            words[w] = words[w] & !span_bits(first, count, w)
-        }
-        Live { words }
+        Live { words: self.words & (vec4u(4294967295) ^ spans(first, count)) }
     }
 
     /// How many of the first `parts` parts are asked.
     pub fn count(self, parts: u32) -> u32 {
-        var n = max(parts, 128) - 128
-        for w in 0..4 {
-            n += (self.words[w] & span_bits(0, min(parts, 128), w)).count_ones()
-        }
-        n
+        let w = self.words & spans(0, min(parts, 128))
+        max(parts, 128) - 128 + w.x.count_ones() + w.y.count_ones() + w.z.count_ones() + w.w.count_ones()
     }
+}
+
+/// The bits of each word that parts `first..first + count` take (of the first 128).
+fn spans(first: u32, count: u32) -> vec4u {
+    vec4u(span_bits(first, count, 0), span_bits(first, count, 1), span_bits(first, count, 2), span_bits(first, count, 3))
 }
 
 /// The bits of word `w` (parts `32 w` to `32 w + 31`) that parts `first..first + count` take.
 fn span_bits(first: u32, count: u32, w: u32) -> u32 {
     let lo = max(first, 32 * w)
     let hi = min(first + count, 32 * w + 32)
-    if lo >= hi {
-        return 0
-    }
-    let n = hi - lo
+    let n = if hi > lo { hi - lo } else { 0 }
     let ones = if n >= 32 { 4294967295 } else { (u32(1) << n) - 1 }
-    ones << (lo - 32 * w)
+    if n == 0 { 0 } else { ones << (lo - 32 * w) }
 }
 
 /// What `Surface::pruned` gives: the parts still live, and the surface's range over the box.
@@ -1582,16 +1587,13 @@ impl<A: Surface, B: Surface> Surface for Union<A, B> {
         self.a.meets_grown(o, d, grow).or(self.b.meets_grown(o, d, grow))
     }
 
-    /// An operand none of whose parts is live isn't asked: the other's distance is the union's.
+    /// An operand none of whose parts is live isn't asked: it counts as `EMPTY`, and `min` of
+    /// the other and `EMPTY` is the other. One exit, each operand written once.
     fn masked(self, p: vec3, live: Live, first: u32) -> f32 {
         let n = self.a.parts()
-        if !live.any(first + n, self.b.parts()) {
-            return self.a.masked(p, live, first)
-        }
-        if !live.any(first, n) {
-            return self.b.masked(p, live, first + n)
-        }
-        min(self.a.masked(p, live, first), self.b.masked(p, live, first + n))
+        let a = if live.any(first, n) { self.a.masked(p, live, first) } else { EMPTY }
+        let b = if live.any(first + n, self.b.parts()) { self.b.masked(p, live, first + n) } else { EMPTY }
+        min(a, b)
     }
 
     /// Its operands' parts'; a `b` of one part takes the join too, which a masked ask skips
@@ -1672,16 +1674,13 @@ impl<A: Surface, B: Surface> Surface for SmoothUnion<A, B> {
         self.a.meets_grown(o, d, g).or(self.b.meets_grown(o, d, g)).loose()
     }
 
-    /// As `Union`'s: an operand none of whose parts is live isn't asked.
+    /// As `Union`'s: an operand none of whose parts is live isn't asked, and counts as `EMPTY`
+    /// (`smin(d, EMPTY, k)` and `smin(EMPTY, d, k)` are `d`, bit for bit).
     fn masked(self, p: vec3, live: Live, first: u32) -> f32 {
         let n = self.a.parts()
-        if !live.any(first + n, self.b.parts()) {
-            return self.a.masked(p, live, first)
-        }
-        if !live.any(first, n) {
-            return self.b.masked(p, live, first + n)
-        }
-        smin(self.a.masked(p, live, first), self.b.masked(p, live, first + n), self.k)
+        let a = if live.any(first, n) { self.a.masked(p, live, first) } else { EMPTY }
+        let b = if live.any(first + n, self.b.parts()) { self.b.masked(p, live, first + n) } else { EMPTY }
+        smin(a, b, self.k)
     }
 
     /// Its operands' parts'; a `b` of one part takes the join too, which a masked ask skips
