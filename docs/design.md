@@ -214,6 +214,14 @@ web of flesh, and put a halo beside outlines, each fixed separately because no m
 **ray is one function.** The eye, a shadow, the sky's light, light that bounces, and "what is
 behind this" are that one call from another place in another direction.
 
+**One where it is written, many where it runs.** The engine is unified at what an author writes,
+at the light and at the picture, not in the inner loop. The one ask and the one ray are source:
+the compiler specialises them to each thing (its field, and only the ways of answering that
+thing can use), and the picture runs each thing's code over the pixels that thing can cover. A
+single shader that can answer for anything is the wrong way to keep one way of doing a job: on a
+GPU every pixel pays for the widest path in the code it runs, taken or not. Measured three times
+(the spike's fast paths in one draw; rebuilding from facings; slice 1d's one pipeline).
+
 **The reference and the judges are the engine's instruments**, beside the four modules and
 below nothing: they ask the author's matter directly, so they check the engine and not a copy of
 it. A pixel is the mean of what the look shows over the pixel (toned colour, not light): the
@@ -286,7 +294,8 @@ Faults the spike found, each with the module that now owns it.
 | What is behind a sheet stopped by the sheet's own outline | picture |
 | A compiler construct that copies a whole form for every pixel (5 to 8 times slower, twice) | toolchain: the build's `kept` figure is the tell; it should be an error |
 | A dispatch that cannot be cut in parts, because a kernel stores only its own texel | toolchain: a dispatch now takes an origin |
-| A way of asking chosen a thing at a time, each way its own pipelines (nine draws for two things in slice 1c) | matter: who answers is decided a brick at a time, behind one ask; the picture has one pipeline for a world |
+| Ways of asking multiplied together: one shader for the whole world, a variant for every combination of how each thing is asked (nine draws for two things in slice 1c) | picture: each thing is drawn by code specialised to it, over the part of the screen its bound covers, so variants grow with the kinds of thing, not their combinations |
+| One shader holding every way of answering, so every pixel pays for the widest (slice 1d: a stage that takes one answer cost 6.4 to 7.0 ms with every answer present, 4.4 with only its own; the spike found the same twice) | the engine is one function where it is written and many where it runs: the compiler specialises the one ask and the one ray to each thing, and a pixel runs only what its thing can use |
 | A constant fitted to one scene's timing deciding how a thing is asked | matter: the count is the toolchain's count of what an ask costs, against what a read of cells costs |
 
 ## Order of work
@@ -311,8 +320,11 @@ at a time, into the place this document gives it.
      live parts keep a moving body's thin parts exactly. But the frame grew (10.7 to 12.9 ms),
      the ways of asking multiplied, and edges still crawl.
    - 1d: one way of asking and the time. A ray walks a thing's roots, fetching each once, and a
-     root says who answers in it (its live parts, or its cells): no way of asking a thing at a
-     time. Then looking coarsely first and filling in, so that pixels do not all pay for a ray.
+     root says who answers in it (its live parts, or its cells). First built as one pipeline for
+     the whole world, which was slower (15.4 ms against 13.0): a shader that holds every answer
+     makes every pixel pay for all of them. So: one ask as written, specialised to each thing as
+     it runs, each thing drawn over its own part of the screen. Then looking coarsely first and
+     filling in, so that pixels do not all pay for a ray.
    - 1e: edges whose cover changes smoothly as an edge crosses a pixel.
      The half-frame line is held at the end of slice 2, when stored light replaces the stand-in's
      shadow ray a pixel.
