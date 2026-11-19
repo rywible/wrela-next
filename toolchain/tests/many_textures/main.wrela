@@ -1,0 +1,62 @@
+// Five thousand textures alive at once, each written and one read back (C3): past what Vulkan
+// lets a device hold as allocations of their own (as few as 4,096), so each must be a range of a
+// block the host's allocator shares. Frame 0 makes them and writes each a texel; the test reads
+// a kernel's sum of the last ones, on both hosts.
+use std::collections::Vec
+use std::gpu::{
+    GlobalId, GpuBuffer, R32Float, Slots, Texels, Texture, buffer, dispatch, read, writable_texture,
+}
+use std::io::Pending
+
+const COUNT: u32 = 5000
+
+pub struct State {
+    textures: Vec<Texture<R32Float>>,
+    pending: Vec<Pending<f32>>,
+    seen: Vec<Vec<f32>>,
+    frame: u32,
+}
+
+pub fn init() -> State {
+    var textures: Vec<Texture<R32Float>> = Vec::new()
+    for _ in 0..COUNT {
+        textures.push(writable_texture(width: 4, height: 4))
+    }
+    State { textures, pending: Vec::new(), seen: Vec::new(), frame: 0 }
+}
+
+@compute(4, 4)
+fn fill(out: mut Texels<R32Float>, value: f32, id: GlobalId) {
+    out.store(id, value)
+}
+
+@compute(1)
+fn sum(a: Texture<R32Float>, b: Texture<R32Float>, out: mut Slots<f32>, id: GlobalId) {
+    out[id] = a.load(x: 1, y: 2) + b.load(x: 3, y: 0)
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    if s.frame == 0 {
+        for i in 0..COUNT {
+            dispatch(fill.bind(mut s.textures[i], value: f32(i)), groups: (1, 1, 1))
+        }
+        var out: GpuBuffer<f32> = buffer(1)
+        dispatch(sum.bind(s.textures[COUNT - 1], s.textures[COUNT - 2], mut out), groups: 1)
+        s.pending.push(read(out.items()))
+    }
+    for i in 0..s.pending.len() {
+        if s.seen.len() == i {
+            if let Some(Ok(v)) = s.pending[i].poll() {
+                s.seen.push(take v)
+            }
+        }
+    }
+    s.frame += 1
+}
+
+/// Every texture made and written, the last two read: their values' sum.
+@test(frames: 4, gpu: true, hosts: both)
+fn five_thousand_textures_live_at_once(s: State) {
+    assert(s.seen.len() == 1)
+    assert(s.seen[0][0] == f32(COUNT - 1) + f32(COUNT - 2))
+}

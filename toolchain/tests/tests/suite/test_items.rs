@@ -876,6 +876,16 @@ fn a_kinds_thing_is_a_group_built_in_a_shader() {
     assert_eq!(crate::tests_pass(&dir), 2);
 }
 
+/// Five thousand textures alive at once, each written and two read back
+/// (toolchain/tests/many_textures, C3): on Vulkan each is a range of a block the host's allocator
+/// shares, not an allocation of its own (a device may allow as few as 4,096), on both hosts.
+#[test]
+#[ignore = "needs a GPU"]
+fn five_thousand_textures_live_at_once() {
+    let dir = wrela_tests::repo_root().join("toolchain/tests/many_textures");
+    assert_eq!(crate::tests_pass(&dir), 1);
+}
+
 /// Textures baked when a program is built (toolchain/tests/png, language.md §20.2): `std::png`
 /// decodes PNGs of every colour type and bit depth, plain and Adam7-interlaced, with `tRNS`,
 /// split image data and Pillow's own files, to the RGBA8 bytes made beside them; a constant holds

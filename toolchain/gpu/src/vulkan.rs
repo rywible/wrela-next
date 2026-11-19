@@ -63,6 +63,9 @@ struct Shared {
     table: Table,
     /// Host-visible buffers staged writes are copied into, reused once their submission is done.
     belt: Mutex<Belt>,
+    /// Device memory in blocks, by memory type and kind (buffers, images), each resource a range
+    /// of one (`Heap`).
+    heap: Mutex<Heap>,
 }
 
 /// The staging belt: the buffer this submission's writes go into (and how much of it they
@@ -619,6 +622,7 @@ impl Device {
                 descriptor_pools: Mutex::new(Vec::new()),
                 table,
                 belt: Mutex::new(Belt::default()),
+                heap: Mutex::new(Heap::default()),
             })))
         }
     }
@@ -663,6 +667,71 @@ impl Device {
         })
     }
 
+    /// A range of device memory of type `ty` for a resource with requirements `req` (an image's
+    /// pool apart from buffers', so the buffer-image granularity rule can't apply): from a block
+    /// of its pool, a new one twice the last (from [`FIRST_BLOCK`] to [`BLOCK`]) where none has
+    /// room, or one of its own if it's more than half of [`BLOCK`].
+    fn allocate(&self, req: vk::MemoryRequirements, ty: u32, image: bool) -> Allocation {
+        let d = self.raw();
+        let host = self.0.memory.memory_types[ty as usize]
+            .property_flags
+            .contains(vk::MemoryPropertyFlags::HOST_VISIBLE);
+        // SAFETY: memory allocated, and mapped whole where it's host-visible, here.
+        let fresh = |size: u64| unsafe {
+            let memory = d
+                .allocate_memory(
+                    &vk::MemoryAllocateInfo::default().allocation_size(size).memory_type_index(ty),
+                    None,
+                )
+                .expect("Vulkan allocated no memory");
+            let mapped = if host {
+                d.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+                    .expect("Vulkan mapped no memory") as *mut u8
+            } else {
+                std::ptr::null_mut()
+            };
+            (memory, mapped)
+        };
+        if req.size > BLOCK / 2 {
+            let (memory, mapped) = fresh(req.size);
+            return Allocation { memory, offset: 0, size: req.size, mapped, pool: None };
+        }
+        let key = (ty, image);
+        let mut heap = lock(&self.0.heap);
+        let blocks = heap.pools.entry(key).or_default();
+        for b in blocks.iter_mut() {
+            if let Some(at) = b.take(req.size, req.alignment.max(1)) {
+                let mapped = if b.mapped.is_null() {
+                    std::ptr::null_mut()
+                } else {
+                    // SAFETY: inside the block's mapping.
+                    unsafe { b.mapped.add(at as usize) }
+                };
+                return Allocation {
+                    memory: b.memory,
+                    offset: at,
+                    size: req.size,
+                    mapped,
+                    pool: Some(key),
+                };
+            }
+        }
+        // Small first, so a device that holds little reserves little (a test suite runs many).
+        let last = blocks.iter().map(|b| b.size).max().unwrap_or(FIRST_BLOCK / 2);
+        let size = (last * 2).clamp(FIRST_BLOCK, BLOCK).max(req.size.next_power_of_two());
+        let (memory, mapped) = fresh(size);
+        let mut b = Block { memory, size, mapped, free: vec![(0, size)] };
+        let at = b.take(req.size, req.alignment.max(1)).expect("a fresh block holds it");
+        let mapped_at = if mapped.is_null() {
+            std::ptr::null_mut()
+        } else {
+            // SAFETY: inside the block's mapping.
+            unsafe { mapped.add(at as usize) }
+        };
+        blocks.push(b);
+        Allocation { memory, offset: at, size: req.size, mapped: mapped_at, pool: Some(key) }
+    }
+
     fn raw_buffer(&self, size: u64, mappable: bool, usage: vk::BufferUsageFlags) -> Arc<RawBuffer> {
         let size = size.max(4).next_multiple_of(4);
         // SAFETY: a buffer, its memory and its mapping, made and bound here.
@@ -689,18 +758,12 @@ impl Device {
                     self.memory_type(req.memory_type_bits, vk::MemoryPropertyFlags::empty())
                 })
                 .expect("no memory type for a buffer");
-            let memory = d
-                .allocate_memory(
-                    &vk::MemoryAllocateInfo::default()
-                        .allocation_size(req.size)
-                        .memory_type_index(ty),
-                    None,
-                )
-                .expect("Vulkan allocated no memory");
-            d.bind_buffer_memory(buffer, memory, 0).expect("Vulkan bound no memory");
+            let memory = self.allocate(req, ty, false);
+            d.bind_buffer_memory(buffer, memory.memory, memory.offset)
+                .expect("Vulkan bound no memory");
             let mapped = if mappable {
-                d.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
-                    .expect("Vulkan mapped no memory") as *mut u8
+                assert!(!memory.mapped.is_null(), "a mappable buffer's memory isn't host-visible");
+                memory.mapped
             } else {
                 std::ptr::null_mut()
             };
@@ -794,15 +857,9 @@ impl Device {
                     self.memory_type(req.memory_type_bits, vk::MemoryPropertyFlags::empty())
                 })
                 .expect("no memory type for an image");
-            let memory = d
-                .allocate_memory(
-                    &vk::MemoryAllocateInfo::default()
-                        .allocation_size(req.size)
-                        .memory_type_index(ty),
-                    None,
-                )
-                .expect("Vulkan allocated no memory");
-            d.bind_image_memory(image, memory, 0).expect("Vulkan bound no memory");
+            let memory = self.allocate(req, ty, true);
+            d.bind_image_memory(image, memory.memory, memory.offset)
+                .expect("Vulkan bound no memory");
             Arc::new(RawImage {
                 device: self.0.clone(),
                 image,
@@ -1479,6 +1536,11 @@ impl Drop for Shared {
             for p in lock(&self.descriptor_pools).drain(..) {
                 self.raw.destroy_descriptor_pool(p, None);
             }
+            for blocks in lock(&self.heap).pools.values_mut() {
+                for b in blocks.drain(..) {
+                    self.raw.free_memory(b.memory, None);
+                }
+            }
             self.raw.destroy_descriptor_pool(self.table.pool, None);
             self.raw.destroy_descriptor_set_layout(self.table.set_layout, None);
             self.raw.destroy_semaphore(self.timeline, None);
@@ -1489,6 +1551,142 @@ impl Drop for Shared {
             self.instance.destroy_instance(None);
         }
         let _ = (self.physical, self.queue_family);
+    }
+}
+
+/// The bytes of device memory a block holds: resources take ranges of it, so a device makes few
+/// allocations however many resources a program has (Vulkan allows as few as 4,096 at once, and
+/// each costs the kernel a call and, host-visible, a mapping). 64 MiB: a 1080p RGBA32F target
+/// (33 MB) fits one.
+const BLOCK: u64 = 64 << 20;
+
+/// A pool's first block: each after it twice the last, to [`BLOCK`].
+const FIRST_BLOCK: u64 = 2 << 20;
+
+/// A resource's device memory: a range of a block (`pool` its pool), or an allocation of its own.
+struct Allocation {
+    memory: vk::DeviceMemory,
+    offset: u64,
+    size: u64,
+    /// Where the host sees it, if its memory is host-visible.
+    mapped: *mut u8,
+    pool: Option<(u32, bool)>,
+}
+
+impl Allocation {
+    const NONE: Allocation = Allocation {
+        memory: vk::DeviceMemory::null(),
+        offset: 0,
+        size: 0,
+        mapped: std::ptr::null_mut(),
+        pool: None,
+    };
+}
+
+/// The device's blocks, by memory type and kind (images apart from buffers).
+#[derive(Default)]
+struct Heap {
+    pools: std::collections::HashMap<(u32, bool), Vec<Block>>,
+}
+
+struct Block {
+    memory: vk::DeviceMemory,
+    size: u64,
+    mapped: *mut u8,
+    /// Its free ranges, by offset, none touching another.
+    free: Vec<(u64, u64)>,
+}
+
+// SAFETY: a block's mapping is written only through the ranges handed out, each by the one
+// resource that holds it.
+unsafe impl Send for Block {}
+
+impl Block {
+    /// The offset of `size` bytes aligned to `align`, taken from the first free range they fit.
+    fn take(&mut self, size: u64, align: u64) -> Option<u64> {
+        for k in 0..self.free.len() {
+            let (start, len) = self.free[k];
+            let at = start.next_multiple_of(align);
+            let end = start + len;
+            if at + size > end {
+                continue;
+            }
+            self.free.remove(k);
+            if at + size < end {
+                self.free.insert(k, (at + size, end - at - size));
+            }
+            if at > start {
+                self.free.insert(k, (start, at - start));
+            }
+            return Some(at);
+        }
+        None
+    }
+
+    /// Gives `size` bytes at `at` back, merged with free neighbours.
+    fn give(&mut self, at: u64, size: u64) {
+        let k = self.free.partition_point(|&(s, _)| s < at);
+        self.free.insert(k, (at, size));
+        if k + 1 < self.free.len() && self.free[k].0 + self.free[k].1 == self.free[k + 1].0 {
+            self.free[k].1 += self.free[k + 1].1;
+            self.free.remove(k + 1);
+        }
+        if k > 0 && self.free[k - 1].0 + self.free[k - 1].1 == self.free[k].0 {
+            self.free[k - 1].1 += self.free[k].1;
+            self.free.remove(k);
+        }
+    }
+
+    fn empty(&self) -> bool {
+        self.free.len() == 1 && self.free[0] == (0, self.size)
+    }
+}
+
+impl Shared {
+    /// Gives a resource's memory back: its range to its block (a block left empty, past one a
+    /// pool, freed), or its own allocation freed.
+    fn release(&self, a: &Allocation) {
+        if a.memory == vk::DeviceMemory::null() {
+            return;
+        }
+        let Some(key) = a.pool else {
+            // SAFETY: nothing in flight holds the resource whose memory this is.
+            unsafe { self.raw.free_memory(a.memory, None) };
+            return;
+        };
+        let mut heap = lock(&self.heap);
+        let Some(blocks) = heap.pools.get_mut(&key) else { return };
+        let Some(k) = blocks.iter().position(|b| b.memory == a.memory) else { return };
+        blocks[k].give(a.offset, a.size);
+        if blocks[k].empty() && blocks.len() > 1 {
+            let b = blocks.swap_remove(k);
+            // SAFETY: no range of it is held.
+            unsafe { self.raw.free_memory(b.memory, None) };
+        }
+    }
+}
+
+#[cfg(test)]
+mod heap_tests {
+    use super::*;
+
+    #[test]
+    fn a_block_gives_aligned_ranges_and_merges_what_comes_back() {
+        let mut b = Block {
+            memory: vk::DeviceMemory::null(),
+            size: BLOCK,
+            mapped: std::ptr::null_mut(),
+            free: vec![(0, BLOCK)],
+        };
+        let x = b.take(100, 1).unwrap();
+        let y = b.take(1000, 256).unwrap();
+        let z = b.take(10, 4).unwrap();
+        assert_eq!((x, y, z), (0, 256, 100));
+        b.give(y, 1000);
+        b.give(x, 100);
+        b.give(z, 10);
+        assert!(b.empty(), "{:?}", b.free);
+        assert!(b.take(BLOCK + 1, 1).is_none());
     }
 }
 
@@ -1506,7 +1704,7 @@ fn cstr(chars: &[std::ffi::c_char]) -> String {
 struct RawBuffer {
     device: Arc<Shared>,
     buffer: vk::Buffer,
-    memory: vk::DeviceMemory,
+    memory: Allocation,
     size: u64,
     /// The host's view of a mappable buffer's memory; null otherwise.
     mapped: *mut u8,
@@ -1521,7 +1719,7 @@ impl Drop for RawBuffer {
         // SAFETY: nothing in flight holds it (submissions keep their resources alive).
         unsafe {
             self.device.raw.destroy_buffer(self.buffer, None);
-            self.device.raw.free_memory(self.memory, None);
+            self.device.release(&self.memory);
         }
     }
 }
@@ -1568,7 +1766,8 @@ impl Clone for Buffer {
 struct RawImage {
     device: Arc<Shared>,
     image: vk::Image,
-    memory: vk::DeviceMemory,
+    /// Its memory; a swapchain's image has none of ours (`Allocation::NONE`).
+    memory: Allocation,
     format: vk::Format,
     aspect: vk::ImageAspectFlags,
     levels: u32,
@@ -1645,7 +1844,7 @@ impl Drop for RawImage {
         // SAFETY: nothing in flight holds it.
         unsafe {
             self.device.raw.destroy_image(self.image, None);
-            self.device.raw.free_memory(self.memory, None);
+            self.device.release(&self.memory);
         }
     }
 }
@@ -3211,7 +3410,7 @@ impl Surface {
                 let raw = Arc::new(RawImage {
                     device: d.clone(),
                     image,
-                    memory: vk::DeviceMemory::null(),
+                    memory: Allocation::NONE,
                     format: format.format,
                     aspect: vk::ImageAspectFlags::COLOR,
                     levels: 1,
