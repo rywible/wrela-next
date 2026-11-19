@@ -48,7 +48,7 @@ use reference::traced::LEAVE
 use std::collections::Vec
 use std::gpu::{
     Address, Append, AppendBuffer, Atomics, Blend, ClipPosition, DepthPass5, DepthTexture, FragCoord, GlobalId, GpuBuffer, GpuSpan, Pass, R8,
-    Rgba16Float, Rgba32Float, Sampler, Targets5, Texels, Texture, VertexIndex, WithDepthBehind, append_buffer, begin_pass,
+    Rgba16Float, Rgba32Float, Sampler, Targets5, Texels, Texture, VertexIndex, WithDepthBehind, append_buffer, buffer_of, read, begin_pass,
     begin_pass5_with_depth, begin_screen_pass, buffer, depth_texture, discard, dispatch, draw, label, sampler, texture, timed,
     writable_texture,
 }
@@ -342,6 +342,75 @@ impl<S: Sky> Each for Shadows<S> {
     }
 }
 
+/// An instrument: the eye's ray through `at` (px) of `v` against `w`, stepped as `ray::met` steps
+/// it (over-relaxed, its least step a quarter of its width), each step written to `out` (12 words:
+/// t, the step, the distance, then `Asked::told` at the point) until it meets matter or leaves.
+@compute(1)
+fn ray_traced<A: Asked>(w: A, v: View, at: vec2, out: mut Atomics<u32>, id: GlobalId) {
+    let d = v.ray(at)
+    let px = v.pixel()
+    let b = w.begun(v.at, d, 0.0, px)
+    var t = max(0.0, b.near)
+    var walk = b.walk
+    let inv = vec3(1.0) / d
+    var steps: u32 = 0
+    var crossed = false
+    var relax = 1.6
+    var last = 0.0
+    var f_before = 1.0e9
+    var before = t
+    while steps < 120 && !crossed && t < b.far {
+        let width = px * t
+        let p = v.at + d * t
+        let a = w.step(walk, p, d, inv, t, width)
+        walk = a.walk
+        let told = w.told(walk, p, width)
+        let o = 12 * steps + 2
+        out.store(i: o, value: bitcast_u32(t))
+        out.store(i: o + 1, value: bitcast_u32(a.x))
+        out.store(i: o + 2, value: bitcast_u32(a.y))
+        out.store(i: o + 3, value: told.node)
+        out.store(i: o + 4, value: told.level)
+        out.store(i: o + 5, value: bitcast_u32(told.side))
+        out.store(i: o + 6, value: bitcast_u32(told.off))
+        out.store(i: o + 7, value: bitcast_u32(told.cells))
+        out.store(i: o + 8, value: bitcast_u32(told.field))
+        out.store(i: o + 9, value: bitcast_u32(told.exit))
+        out.store(i: o + 10, value: told.brick)
+        out.store(i: o + 11, value: bitcast_u32(width))
+        steps += 1
+        if a.y < 0.0 {
+            crossed = true
+        } else if relax > 1.0 && last > 0.0 && a.y + f_before < last {
+            t = before
+            relax = 1.0
+            last = 0.0
+            walk = b.walk
+        } else {
+            before = t
+            f_before = a.y
+            let plain = max(a.x, max(0.25 * width, 0.00001))
+            last = if a.x <= a.y * 1.0001 { max(relax * a.x, plain) } else { plain }
+            t += last
+        }
+    }
+    out.store(i: 0, value: steps)
+    out.store(i: 1, value: if crossed { 1 } else { 0 })
+}
+
+/// The things' ray traces (`ray_traced`), each into `out` at its own offset.
+borrow struct Tracer {
+    v: View,
+    at: vec2,
+    out: mut GpuBuffer<u32>,
+}
+
+impl Each for Tracer {
+    fn thing<A: Asked>(mut self, a: A, k: u32, bound: vec4) {
+        dispatch(ray_traced.bind(w: a, v: self.v, at: self.at, out: mut self.out), over: 1)
+    }
+}
+
 /// Whether pixel (`x`, `y`) holds an edge (see the head of the file), by what the picture put there
 /// and round it (`place`, and `asks`: a ray that met nothing but asked passed matter within its
 /// width).
@@ -453,6 +522,8 @@ pub struct Sight {
     edge_place: Texture<Rgba32Float>,
     edge_asks: Texture<Rgba32Float>,
     burned: Texture<R8>,
+    trace_out: GpuBuffer<u32>,
+    trace_read: Option<Pending<u32>>,
     /// The load beside each frame (sines a pixel; 0: none).
     pub load: u32,
     held_asks: u32,
@@ -487,6 +558,8 @@ pub fn sight() -> Sight {
         edge_place: texture(width: 1, height: 1),
         edge_asks: texture(width: 1, height: 1),
         burned: texture(width: 1, height: 1),
+        trace_out: buffer(1),
+        trace_read: None,
         load: 0,
         held_asks: 0,
         held_cell: 0.0,
@@ -595,6 +668,38 @@ impl Sight {
             draw(p, cover, shade.bind(v: v, sky: sky, look: look, table: self.table, s: self.s, place: self.drawn.place, lit: self.lit, open: self.open, emits: self.emits, sunny: self.sunny, lay: lay, list: self.edge_list.items(), count: self.edge_list.count()), vertices: 3)
             p.end()
         }
+    }
+
+    /// An instrument: the eye's ray through pixel (`x`, `y`) traced through each thing
+    /// (`ray_traced`), asked for; `traced_said` prints it once it is back.
+    pub fn trace<W: World>(mut self, world: W, eye: Eye, width: u32, height: u32, x: u32, y: u32) {
+        let v = view(eye, width, height)
+        self.trace_out = buffer_of(Vec::filled(2 + 12 * 120, 0))
+        var e = Tracer { v, at: vec2(f32(x) + 0.5, f32(y) + 0.5), out: mut self.trace_out }
+        world.each(self.kept, 0, mut e)
+        self.trace_read = Some(read(self.trace_out.items()))
+    }
+
+    /// Prints the trace asked for (`trace`) once it is back: true then.
+    pub fn traced_said(mut self) -> bool {
+        match mut self.trace_read {
+            Some(r) => match r.poll() {
+                Some(Ok(w)) => {
+                    print(f"trace: {w[0]} steps, met {w[1]}")
+                    var i: u32 = 0
+                    while i < w[0] {
+                        let o = 12 * i + 2
+                        print(f"trace: t {bitcast_f32(w[o])} step {bitcast_f32(w[o + 1])} far {bitcast_f32(w[o + 2])} | node {w[o + 3]} brick {w[o + 10]} level {w[o + 4]} side {bitcast_f32(w[o + 5])} err {bitcast_f32(w[o + 6])} cells {bitcast_f32(w[o + 7])} field {bitcast_f32(w[o + 8])} | walk ends {bitcast_f32(w[o + 9])} width {bitcast_f32(w[o + 11])}")
+                        i += 1
+                    }
+                    self.trace_read = None
+                    return true
+                },
+                _ => {},
+            },
+            None => {},
+        }
+        false
     }
 
     /// The same, into `drawn` only (nothing shown): `drawn.placed` once drawn.
