@@ -339,27 +339,34 @@ pub trait Surface: Copy + GpuData {
     // ---- where a ray can meet it (§20.5) ----
 
     /// Where the ray `o + t d` (t >= 0; any nonzero `d`, `t` in its units) can be inside or on
-    /// the surface: a stretch of `t` outside which its distance is above 0 all along the ray.
-    /// std's shapes answer exactly, and their sharp unions too, so `near` is where the ray
-    /// first meets it (`Meets::exact`); a smooth union, a displacement and a surface std can't
-    /// see into answer a stretch that holds the surface, from which a march starts.
+    /// the surface: a stretch of `t` outside which its distance is above 0 all along the ray,
+    /// and a `t` by which it has surely met it (`first`). std's shapes answer exactly, and their
+    /// sharp unions too, so `near` is where the ray first meets it (`Meets::exact`); a smooth
+    /// union, a displacement and a surface std can't see into answer a stretch that holds the
+    /// surface, from which a march starts, and the hit is in `near..first`.
     fn meets(self, o: vec3, d: vec3) -> Meets {
-        self.meets_grown(o, d, 0.0)
+        let m = self.meets_grown(o, d, grow: 0.0, inner: 0.0)
+        if m.exact() && !m.is_empty() { Meets { first: min(m.first, m.near), ..m } } else { m }
     }
 
-    /// `meets` of the surface grown by `grow` (at least 0): where its distance can be at most
-    /// `grow`. What the combinators implement. The default is the bound's sphere, grown by
-    /// `grow` over the bound's slope: it holds wherever the bound holds, and is never exact.
-    fn meets_grown(self, o: vec3, d: vec3, grow: f32) -> Meets {
+    /// `meets` of the surface grown by `grow` (at least 0): `near` and `far` where its distance
+    /// can be at most `grow`, and `first` a `t` by which the ray has met it grown by `inner`
+    /// (at most `grow`, at most 0: a displacement above shrinks it), `EMPTY` where nothing says.
+    /// What the combinators implement. The default is the bound's sphere, grown by `grow` over
+    /// the bound's slope: it holds wherever the bound holds, never exact, and says no `first`.
+    fn meets_grown(self, o: vec3, d: vec3, grow: f32, inner: f32) -> Meets {
         bound_meets(self.bound(), o, d, grow)
     }
 }
 
 /// Where a ray can meet a surface (`Surface::meets`): the stretch `near..far` of the ray's
-/// `t` outside which it is nowhere inside or on the surface; empty where `near > far`.
+/// `t` outside which it is nowhere inside or on the surface (empty where `near > far`), and
+/// `first`, a `t` by which it has surely met it (`EMPTY` where nothing says): the hit is in
+/// `near..first`, so a march from `near` that reaches `first` has its answer there.
 pub struct Meets: Copy + GpuData {
     pub near: f32,
     pub far: f32,
+    pub first: f32,
     /// `MEETS_EXACT` and `MEETS_WHOLE`, as they hold.
     pub flags: u32,
 }
@@ -373,10 +380,10 @@ pub const MEETS_EXACT: u32 = 1
 pub const MEETS_WHOLE: u32 = 2
 
 /// A ray that meets nothing, exactly.
-pub const NEVER: Meets = Meets { near: EMPTY, far: -EMPTY, flags: 3 }
+pub const NEVER: Meets = Meets { near: EMPTY, far: -EMPTY, first: EMPTY, flags: 3 }
 
 /// A ray inside everywhere along it.
-const EVERYWHERE: Meets = Meets { near: -EMPTY, far: EMPTY, flags: 3 }
+const EVERYWHERE: Meets = Meets { near: -EMPTY, far: EMPTY, first: EMPTY, flags: 3 }
 
 impl Meets {
     /// Whether the ray can't meet it at all.
@@ -395,22 +402,22 @@ impl Meets {
     }
 
     /// Where a ray can meet either (a union): the nearer start and the farther end, exact if
-    /// both are.
+    /// both are; met by the earlier of their `first`s.
     pub fn or(self, b: Meets) -> Meets {
         if self.is_empty() {
-            return b
+            return Meets { first: min(self.first, b.first), ..b }
         }
         if b.is_empty() {
-            return self
+            return Meets { first: min(self.first, b.first), ..self }
         }
         let overlap = self.near <= b.far && b.near <= self.far
         let exact = self.flags & b.flags & MEETS_EXACT
         let whole = if overlap { self.flags & b.flags & MEETS_WHOLE } else { 0 }
-        Meets { near: min(self.near, b.near), far: max(self.far, b.far), flags: exact | whole }
+        Meets { near: min(self.near, b.near), far: max(self.far, b.far), first: min(self.first, b.first), flags: exact | whole }
     }
 
     /// Where a ray can meet both (an intersection): the farther start and the nearer end,
-    /// exact where both are whole.
+    /// exact where both are whole. No `first`: neither's says where both are.
     pub fn and(self, b: Meets) -> Meets {
         if self.is_empty() || b.is_empty() {
             return NEVER
@@ -421,25 +428,38 @@ impl Meets {
             return NEVER
         }
         let flags = if self.whole() && b.whole() { MEETS_EXACT | MEETS_WHOLE } else { 0 }
-        Meets { near, far, flags }
+        Meets { near, far, first: EMPTY, flags }
     }
 
-    /// The same, where it can still hold a surface: no longer exact or whole.
+    /// The same, where it can still hold a surface: no longer exact or whole (`first` still
+    /// holds).
     pub fn loose(self) -> Meets {
-        if self.is_empty() { NEVER } else { Meets { flags: 0, ..self } }
+        if self.is_empty() { Meets { first: self.first, ..NEVER } } else { Meets { flags: 0, ..self } }
+    }
+
+    /// The same, with no longer anything known of where it is met.
+    pub fn unsure(self) -> Meets {
+        if self.is_empty() { NEVER } else { Meets { flags: 0, first: EMPTY, ..self } }
     }
 
     /// Its part at `t >= 0`: where the ray starts inside a whole stretch, `near` is 0, still
     /// exact; inside one that isn't whole, the first point inside isn't known.
     pub fn ahead(self) -> Meets {
         if self.is_empty() || self.far < 0.0 {
-            return NEVER
+            return Meets { first: self.first, ..NEVER }
         }
         if self.near >= 0.0 {
             return self
         }
         let flags = if self.whole() { self.flags } else { self.flags & !MEETS_EXACT }
-        Meets { near: 0.0, far: self.far, flags }
+        Meets { near: 0.0, far: self.far, first: self.first, flags }
+    }
+
+    /// The same, met by the time `inner` (the surface grown by less) is first met, where `inner`
+    /// says so exactly.
+    fn met_by(self, inner: Meets) -> Meets {
+        let f = if !inner.is_empty() && inner.exact() { inner.near } else { EMPTY }
+        Meets { first: min(self.first, f), ..self }
     }
 }
 
@@ -461,11 +481,11 @@ fn ball_meets(o: vec3, d: vec3, c: vec3, r: f32) -> Meets {
     let s = sqrt(h)
     let k = if b >= 0.0 { -b - s } else { -b + s }
     if k == 0.0 {
-        return Meets { near: 0.0, far: 0.0, flags: 3 }
+        return Meets { near: 0.0, far: 0.0, first: EMPTY, flags: 3 }
     }
     let t0 = k / a
     let t1 = q / k
-    Meets { near: min(t0, t1), far: max(t0, t1), flags: 3 }
+    Meets { near: min(t0, t1), far: max(t0, t1), first: EMPTY, flags: 3 }
 }
 
 /// Where `o + t d` along one axis is within `h` of 0: every `t`, or none, where `d` is 0.
@@ -489,20 +509,26 @@ fn box_meets(o: vec3, d: vec3, h: vec3) -> Meets {
     let z = slab(o.z, d.z, h.z)
     let near = max(x.x, max(y.x, z.x))
     let far = min(x.y, min(y.y, z.y))
-    if near > far { NEVER } else { Meets { near, far, flags: 3 } }
+    if near > far { NEVER } else { Meets { near, far, first: EMPTY, flags: 3 } }
 }
 
-/// Where the ray meets the hull of the ball of radius `ra` about `pa` and that of `rb` about
-/// `pb` (a round cone; Inigo Quilez's intersection of a rounded cone, entry and exit). The hull
-/// is the two balls and the cone between the circles where it touches them, and it is convex: so
-/// the ray is inside from its first crossing of any of them to its last.
-fn round_cone_meets(o: vec3, d: vec3, pa: vec3, pb: vec3, ra: f32, rb: f32) -> Meets {
+/// Where the ray meets the hull of the ball of radius `ra + grow` about `pa` and that of
+/// `rb + grow` about `pb` (a round cone; Inigo Quilez's intersection of a rounded cone, entry and
+/// exit), met by the same hull of radii `+ inner` where those stay at least 0 (shrunk further, a
+/// round cone's erosion isn't a round cone, and nothing is said). The hull is the two balls and
+/// the cone between the circles where it touches them, and it is convex: so the ray is inside
+/// from its first crossing of any of them to its last. The two hulls share their setup, and
+/// both are found on every call with no branch between: what they compute from the ray's origin
+/// alone is the same for every invocation where the origin is, and moves onto the CPU (§18.13).
+fn round_cone_meets(o: vec3, d: vec3, pa: vec3, pb: vec3, ra: f32, rb: f32, grow: f32, inner: f32) -> Meets {
     let ba = pb - pa
     let m0 = dot(ba, ba)
     let rr = ra - rb
     if m0 <= rr * rr {
         // One ball holds the other.
-        return (if rr >= 0.0 { ball_meets(o, d, pa, ra) } else { ball_meets(o, d, pb, rb) }).ahead()
+        let (c, r) = if rr >= 0.0 { (pa, ra) } else { (pb, rb) }
+        let m = ball_meets(o, d, c, r + grow).ahead()
+        return if r + inner >= 0.0 { m.met_by(ball_meets(o, d, c, r + inner).ahead()) } else { m }
     }
     let len = length(d)
     if !(len > 0.0) {
@@ -513,12 +539,10 @@ fn round_cone_meets(o: vec3, d: vec3, pa: vec3, pb: vec3, ra: f32, rb: f32) -> M
     let mid = 0.5 * (pa + pb)
     let oc = o - mid
     let b = dot(oc, rd)
-    let around = 0.5 * sqrt(m0) + max(ra, rb)
+    let around = 0.5 * sqrt(m0) + max(ra, rb) + grow
     if b * b - (dot(oc, oc) - around * around) < 0.0 || (b > 0.0 && dot(oc, oc) > around * around) {
         return NEVER
     }
-    var m = ball_meets(o, rd, pa, ra).or(ball_meets(o, rd, pb, rb))
-    // The cone: its crossings whose place along the axis is between the two circles.
     let oa = o - pa
     let m1 = dot(ba, oa)
     let m2 = dot(ba, rd)
@@ -526,6 +550,23 @@ fn round_cone_meets(o: vec3, d: vec3, pa: vec3, pb: vec3, ra: f32, rb: f32) -> M
     let m5 = dot(oa, oa)
     let d2 = m0 - rr * rr
     let k2 = d2 - m2 * m2
+    let m = cone_crossings(o, rd, pa, pb, ra + grow, rb + grow, m0, m1, m2, m3, m5, d2, k2, rr)
+    if m.is_empty() {
+        return NEVER
+    }
+    let n = cone_crossings(o, rd, pa, pb, ra + inner, rb + inner, m0, m1, m2, m3, m5, d2, k2, rr)
+    let outer = Meets { near: m.near / len, far: m.far / len, first: EMPTY, flags: 3 }.ahead()
+    if min(ra, rb) + inner < 0.0 || n.is_empty() {
+        return outer
+    }
+    outer.met_by(Meets { near: n.near / len, far: n.far / len, first: EMPTY, flags: 3 }.ahead())
+}
+
+/// The ray's crossings (`t` along the unit `rd`) of the round cone of radii `ra`, `rb` (their
+/// difference `rr`) and the dot products its setup made: its two balls' and its cone's between
+/// the circles where it touches them.
+fn cone_crossings(o: vec3, rd: vec3, pa: vec3, pb: vec3, ra: f32, rb: f32, m0: f32, m1: f32, m2: f32, m3: f32, m5: f32, d2: f32, k2: f32, rr: f32) -> Meets {
+    var m = ball_meets(o, rd, pa, ra).or(ball_meets(o, rd, pb, rb))
     let k1 = d2 * m3 - m1 * m2 + m2 * rr * ra
     let k0 = d2 * m5 - m1 * m1 + m1 * rr * ra * 2.0 - m0 * ra * ra
     let h = k1 * k1 - k0 * k2
@@ -534,26 +575,49 @@ fn round_cone_meets(o: vec3, d: vec3, pa: vec3, pb: vec3, ra: f32, rb: f32) -> M
         let ta = (-k1 - s) / k2
         let ya = m1 - ra * rr + ta * m2
         if ya > 0.0 && ya < d2 {
-            m = m.or(Meets { near: ta, far: ta, flags: 3 })
+            m = m.or(Meets { near: ta, far: ta, first: EMPTY, flags: 3 })
         }
         let tb = (-k1 + s) / k2
         let yb = m1 - ra * rr + tb * m2
         if yb > 0.0 && yb < d2 {
-            m = m.or(Meets { near: tb, far: tb, flags: 3 })
+            m = m.or(Meets { near: tb, far: tb, first: EMPTY, flags: 3 })
         }
     }
-    if m.is_empty() {
-        return NEVER
+    m
+}
+
+/// Where the ray is on the side of a plane `dot(p, n) <= c`.
+fn side_meets(o: vec3, d: vec3, n: vec3, c: f32) -> Meets {
+    let dn = dot(d, n)
+    let e = c - dot(o, n)
+    if dn == 0.0 {
+        return if e >= 0.0 { EVERYWHERE.ahead() } else { NEVER }
     }
-    Meets { near: m.near / len, far: m.far / len, flags: 3 }.ahead()
+    let t = e / dn
+    if dn > 0.0 { Meets { near: -EMPTY, far: t, first: EMPTY, flags: 3 }.ahead() } else { Meets { near: t, far: EMPTY, first: EMPTY, flags: 3 }.ahead() }
 }
 
 /// A bound's sphere, grown by `grow` over its slope (`Surface::meets_grown`'s default).
 fn bound_meets(b: Bound, o: vec3, d: vec3, grow: f32) -> Meets {
     if b.radius >= 1.0e30 || !(b.slope > 0.0) {
-        return Meets { near: 0.0, far: EMPTY, flags: 0 }
+        return Meets { near: 0.0, far: EMPTY, first: EMPTY, flags: 0 }
     }
-    ball_meets(o, d, b.centre, b.radius + max(grow, 0.0) / b.slope).ahead().loose()
+    ball_meets(o, d, b.centre, b.radius + max(grow, 0.0) / b.slope).ahead().unsure()
+}
+
+/// The most a fold of `n` smooth unions of width `k` (`[..].smooth_union(k)`) lowers the least
+/// of its parts' distances: one `smin` lowers it by at most `k / 4`, and each part folded after
+/// lowers it again, the most where the distances are equal (found by search, 2 to 7 parts): L(1)
+/// = 0, L(i + 1) = L(i) + (k - L(i))^2 / 4k, which rises to `k` (L(17) = 0.817 k).
+/// It is `k` times the same of `k = 1` (the recursion scales with `k`), which depends on `n`
+/// alone: a constant of the fold's type, folded when the game is built, so `k` times it moves
+/// onto the CPU with the fold's other numbers (§18.13).
+fn fold_lowering(n: u32, k: f32) -> f32 {
+    var x = 0.0
+    for _ in 1..max(n, 1) {
+        x += 0.25 * (1.0 - x) * (1.0 - x)
+    }
+    k * x
 }
 
 /// `work` of `s`'s masked ask (`distance_live`), the mask unknown to the count: what it costs
@@ -1092,8 +1156,9 @@ impl Surface for Sphere {
     }
 
     /// Exact: the ball of radius `radius + grow`.
-    fn meets_grown(self, o: vec3, d: vec3, grow: f32) -> Meets {
-        ball_meets(o, d, vec3(), self.radius + grow).ahead()
+    fn meets_grown(self, o: vec3, d: vec3, grow: f32, inner: f32) -> Meets {
+        let m = ball_meets(o, d, vec3(), self.radius + grow).ahead()
+        if m.is_empty() || inner == grow { m.met_by(m) } else { m.met_by(ball_meets(o, d, vec3(), self.radius + inner).ahead()) }
     }
 
     fn bound(self) -> Bound {
@@ -1396,8 +1461,13 @@ impl Surface for RoundCone {
     }
 
     /// Exact: the hull of its two balls, each grown by `grow`.
-    fn meets_grown(self, o: vec3, d: vec3, grow: f32) -> Meets {
-        round_cone_meets(o, d, self.a, self.b, self.r1 + grow, self.r2 + grow)
+    /// Met by `inner`'s hull, where its radii stay at least 0 (shrunk further, a round cone's
+    /// erosion isn't a round cone, and nothing is said).
+    /// (Both hulls are asked on every call, with no branch between: what each computes from the
+    /// ray's origin alone is then the same for every invocation where the origin is, and moves
+    /// onto the CPU with the rest, §18.13.)
+    fn meets_grown(self, o: vec3, d: vec3, grow: f32, inner: f32) -> Meets {
+        round_cone_meets(o, d, self.a, self.b, self.r1, self.r2, grow, inner)
     }
 
     fn bound(self) -> Bound {
@@ -1433,9 +1503,11 @@ impl Surface for Cuboid {
 
     /// Exact: where the ray is between each pair of faces. Grown, the box grown by `grow` along
     /// each axis holds it (its edges and corners are rounded inside that box): not exact.
-    fn meets_grown(self, o: vec3, d: vec3, grow: f32) -> Meets {
+    fn meets_grown(self, o: vec3, d: vec3, grow: f32, inner: f32) -> Meets {
         let m = box_meets(o, d, self.half + vec3(grow)).ahead()
-        if grow > 0.0 { m.loose() } else { m }
+        let n = if grow > 0.0 { m.loose() } else { m }
+        // Shrunk (or as it is), the box moved in by `inner` is the surface grown by it exactly.
+        if n.is_empty() || inner > 0.0 { n } else if inner == grow { n.met_by(n) } else { n.met_by(box_meets(o, d, self.half + vec3(inner)).ahead()) }
     }
 
     fn bound(self) -> Bound {
@@ -1471,14 +1543,9 @@ impl Surface for HalfSpace {
     }
 
     /// Exact: one side of the plane moved by `grow`.
-    fn meets_grown(self, o: vec3, d: vec3, grow: f32) -> Meets {
-        let dn = dot(d, self.normal)
-        let c = self.offset + grow - dot(o, self.normal)
-        if dn == 0.0 {
-            return if c >= 0.0 { EVERYWHERE.ahead() } else { NEVER }
-        }
-        let t = c / dn
-        if dn > 0.0 { Meets { near: -EMPTY, far: t, flags: 3 }.ahead() } else { Meets { near: t, far: EMPTY, flags: 3 }.ahead() }
+    fn meets_grown(self, o: vec3, d: vec3, grow: f32, inner: f32) -> Meets {
+        let m = side_meets(o, d, self.normal, self.offset + grow)
+        if m.is_empty() { m } else { m.met_by(side_meets(o, d, self.normal, self.offset + inner)) }
     }
 
     /// Unbounded: it reaches to infinity.
@@ -1592,8 +1659,8 @@ impl<A: Surface, B: Surface> Surface for Union<A, B> {
     }
 
     /// The nearer of its operands': exact where both are.
-    fn meets_grown(self, o: vec3, d: vec3, grow: f32) -> Meets {
-        self.a.meets_grown(o, d, grow).or(self.b.meets_grown(o, d, grow))
+    fn meets_grown(self, o: vec3, d: vec3, grow: f32, inner: f32) -> Meets {
+        self.a.meets_grown(o, d, grow, inner).or(self.b.meets_grown(o, d, grow, inner))
     }
 
     /// An operand none of whose parts is live isn't asked: it counts as `EMPTY`, and `min` of
@@ -1678,9 +1745,11 @@ impl<A: Surface, B: Surface> Surface for SmoothUnion<A, B> {
 
     /// Its operands', each grown by `k / 4`, which is the most `smin` lowers the smaller
     /// distance: the blend is inside that, and the stretch holds it, not exactly.
-    fn meets_grown(self, o: vec3, d: vec3, grow: f32) -> Meets {
+    /// Met by the earlier of its operands' own hits: `smin` is at most the smaller distance, so
+    /// the blend holds each operand.
+    fn meets_grown(self, o: vec3, d: vec3, grow: f32, inner: f32) -> Meets {
         let g = grow + 0.25 * max(self.k, 0.0)
-        self.a.meets_grown(o, d, g).or(self.b.meets_grown(o, d, g)).loose()
+        self.a.meets_grown(o, d, g, inner).or(self.b.meets_grown(o, d, g, inner)).loose()
     }
 
     /// As `Union`'s: an operand none of whose parts is live isn't asked, and counts as `EMPTY`
@@ -1787,10 +1856,10 @@ impl<S: Surface, const N: u32> Surface for UnionAll<S, N> {
     }
 
     /// The nearest of its parts': exact where every part's is.
-    fn meets_grown(self, o: vec3, d: vec3, grow: f32) -> Meets {
+    fn meets_grown(self, o: vec3, d: vec3, grow: f32, inner: f32) -> Meets {
         var m = NEVER
         for i in 0..N {
-            m = m.or(self.parts[i].meets_grown(o, d, grow))
+            m = m.or(self.parts[i].meets_grown(o, d, grow, inner))
         }
         m
     }
@@ -1944,11 +2013,11 @@ impl<S: Surface, const N: u32> Surface for SmoothUnionAll<S, N> {
     }
 
     /// Its parts', each grown by `k / 4` (as `SmoothUnion`'s): not exact.
-    fn meets_grown(self, o: vec3, d: vec3, grow: f32) -> Meets {
-        let g = grow + 0.25 * max(self.k, 0.0)
+    fn meets_grown(self, o: vec3, d: vec3, grow: f32, inner: f32) -> Meets {
+        let g = grow + fold_lowering(N, max(self.k, 0.0))
         var m = NEVER
         for i in 0..N {
-            m = m.or(self.parts[i].meets_grown(o, d, g))
+            m = m.or(self.parts[i].meets_grown(o, d, g, inner))
         }
         m.loose()
     }
@@ -2116,8 +2185,9 @@ impl<A: Surface, B: Surface> Surface for Intersect<A, B> {
     }
 
     /// Where both can be met: exact where both are one piece along the ray.
-    fn meets_grown(self, o: vec3, d: vec3, grow: f32) -> Meets {
-        self.a.meets_grown(o, d, grow).and(self.b.meets_grown(o, d, grow))
+    fn meets_grown(self, o: vec3, d: vec3, grow: f32, inner: f32) -> Meets {
+        let m = self.a.meets_grown(o, d, grow, inner).and(self.b.meets_grown(o, d, grow, inner))
+        if m.exact() && grow == inner { Meets { first: m.near, ..m } } else { m }
     }
 
     fn bound(self) -> Bound {
@@ -2206,8 +2276,8 @@ impl<S: Surface, M: PointMap> Surface for Warp<S, M> {
 
     /// The inner surface's, the ray taken into its space (the map is affine, so `t` is kept)
     /// and `grow` with it.
-    fn meets_grown(self, o: vec3, d: vec3, grow: f32) -> Meets {
-        self.inner.meets_grown(self.map.local(o), self.map.local_direction(d), self.map.distance_in(grow))
+    fn meets_grown(self, o: vec3, d: vec3, grow: f32, inner: f32) -> Meets {
+        self.inner.meets_grown(self.map.local(o), self.map.local_direction(d), self.map.distance_in(grow), self.map.distance_in(inner))
     }
 
     fn masked(self, p: vec3, live: Live, first: u32) -> f32 {
@@ -2361,9 +2431,11 @@ impl<S: Surface, N: Noise> Surface for Displace<S, N> {
     }
 
     /// The inner surface's grown by the most the displacement can lower it: not exact.
-    fn meets_grown(self, o: vec3, d: vec3, grow: f32) -> Meets {
+    /// Met by its surface's shrunk by as much: there the displacement can't lift it above 0.
+    fn meets_grown(self, o: vec3, d: vec3, grow: f32, inner: f32) -> Meets {
         let r = self.noise.range()
-        self.inner.meets_grown(o, d, grow + abs(self.amp) * max(abs(r.lo), abs(r.hi))).loose()
+        let a = abs(self.amp) * max(abs(r.lo), abs(r.hi))
+        self.inner.meets_grown(o, d, grow + a, inner - a).loose()
     }
 
     fn masked(self, p: vec3, live: Live, first: u32) -> f32 {
@@ -2456,8 +2528,8 @@ impl<A: Surface, B: Surface> Surface for SmoothSubtract<A, B> {
     }
 
     /// Within `a`'s: its distance is at least `a`'s (`smax` is at least the larger). Not exact.
-    fn meets_grown(self, o: vec3, d: vec3, grow: f32) -> Meets {
-        self.a.meets_grown(o, d, grow).loose()
+    fn meets_grown(self, o: vec3, d: vec3, grow: f32, inner: f32) -> Meets {
+        self.a.meets_grown(o, d, grow, inner).unsure()
     }
 
     /// `a`'s: the smooth maximum is at least the larger, so at least `a`'s distance.
@@ -2516,8 +2588,8 @@ impl<A: Surface, B: Surface> Surface for SmoothIntersect<A, B> {
     }
 
     /// Within both's: its distance is at least each's. Not exact.
-    fn meets_grown(self, o: vec3, d: vec3, grow: f32) -> Meets {
-        self.a.meets_grown(o, d, grow).and(self.b.meets_grown(o, d, grow)).loose()
+    fn meets_grown(self, o: vec3, d: vec3, grow: f32, inner: f32) -> Meets {
+        self.a.meets_grown(o, d, grow, inner).and(self.b.meets_grown(o, d, grow, inner)).unsure()
     }
 
     /// The tighter operand's: the smooth maximum is at least each distance.
@@ -2581,10 +2653,10 @@ impl<S: Surface> Surface for Mirror<S> {
     }
 
     /// Within its surface's and that one's image in x = 0: not exact.
-    fn meets_grown(self, o: vec3, d: vec3, grow: f32) -> Meets {
-        let a = self.inner.meets_grown(o, d, grow)
-        let b = self.inner.meets_grown(mirrored_centre(o), mirrored_centre(d), grow)
-        a.or(b).loose()
+    fn meets_grown(self, o: vec3, d: vec3, grow: f32, inner: f32) -> Meets {
+        let a = self.inner.meets_grown(o, d, grow, inner)
+        let b = self.inner.meets_grown(mirrored_centre(o), mirrored_centre(d), grow, inner)
+        a.or(b).unsure()
     }
 
     /// The surface's bound and its image's, joined.
@@ -2654,8 +2726,8 @@ impl<S: Surface> Surface for Named<S> {
         self.inner.distance(p)
     }
 
-    fn meets_grown(self, o: vec3, d: vec3, grow: f32) -> Meets {
-        self.inner.meets_grown(o, d, grow)
+    fn meets_grown(self, o: vec3, d: vec3, grow: f32, inner: f32) -> Meets {
+        self.inner.meets_grown(o, d, grow, inner)
     }
 
     fn bound(self) -> Bound {
@@ -2936,9 +3008,9 @@ impl<S: Surface> Surface for ToBound<S> {
     }
 
     /// The inner surface's, where `grow` is within `near` in its units; past that, every point.
-    fn meets_grown(self, o: vec3, d: vec3, grow: f32) -> Meets {
+    fn meets_grown(self, o: vec3, d: vec3, grow: f32, inner: f32) -> Meets {
         let g = grow / self.scale
-        if g < self.near { self.inner.meets_grown(o, d, g) } else { EVERYWHERE.ahead() }
+        if g < self.near { self.inner.meets_grown(o, d, g, inner / self.scale) } else { EVERYWHERE.ahead() }
     }
 
     fn masked(self, p: vec3, live: Live, first: u32) -> f32 {
@@ -3231,8 +3303,8 @@ impl<S: Surface, C: Copy + GpuData> Surface for With<S, C> {
         self.inner.distance(p)
     }
 
-    fn meets_grown(self, o: vec3, d: vec3, grow: f32) -> Meets {
-        self.inner.meets_grown(o, d, grow)
+    fn meets_grown(self, o: vec3, d: vec3, grow: f32, inner: f32) -> Meets {
+        self.inner.meets_grown(o, d, grow, inner)
     }
 
     fn masked(self, p: vec3, live: Live, first: u32) -> f32 {
@@ -3307,8 +3379,8 @@ impl<S: Surface, F: Copy + GpuData> Surface for WithAt<S, F> {
         self.inner.distance(p)
     }
 
-    fn meets_grown(self, o: vec3, d: vec3, grow: f32) -> Meets {
-        self.inner.meets_grown(o, d, grow)
+    fn meets_grown(self, o: vec3, d: vec3, grow: f32, inner: f32) -> Meets {
+        self.inner.meets_grown(o, d, grow, inner)
     }
 
     fn masked(self, p: vec3, live: Live, first: u32) -> f32 {
@@ -4006,6 +4078,8 @@ fn a_field_reads_only_the_point_where_its_numbers_are_its_code() {
     assert(!reads_only_input(|p: vec3| if time > 0.0 { length(p) } else { length(p) - 1.0 }), "a branch on a capture")
     assert(reads_only_input(|p: vec3| length(p) - 1.0), "a closure of the point alone")
     assert(reads_only_input(check_bound_scope), "a named function")
+    assert(reads_only_input(|a: (Sphere, vec3)| a.0.distance(a.1)), "a field given with its point")
+    assert(!reads_only_input(|a: (Sphere, vec3)| sphere(a.0.radius + time).distance(a.1)), "the same that reads the time")
     assert(!s.reads_only_point() && !s.union(sphere(2.0)).reads_only_point(), "std's shapes and joins held as values")
     assert(BuiltBall {}.reads_only_point() && BuiltBall {}.union(BuiltBall {}).reads_only_point(), "a surface whose numbers are its code, and a join of two")
 }

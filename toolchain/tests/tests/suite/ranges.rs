@@ -120,7 +120,8 @@ pub fn masks(kind: u32, side: f32, n: u32) -> vec2 {
 /// Over `n` rays from all round the surface's room (some starting inside it), 512 points each
 /// along the first 8 m: how many points inside the surface fall outside its `meets` (by more
 /// than 0.1 mm); of the rays `meets` calls exact, how many have a point inside before `near`, or
-/// a distance at `near` off 0 by more than 0.1 mm (or, at 0, not inside); how many it calls
+/// a distance at `near` off 0 by more than 0.1 mm (or, at 0, not inside), and of those it says
+/// are met by `first`, how many are outside there or have it before `near`; how many it calls
 /// exact; and the worst distance at an exact `near`.
 fn meet_check<S: Surface>(s: S, n: u32) -> vec4 {
     var outside: u32 = 0
@@ -144,6 +145,13 @@ fn meet_check<S: Surface>(s: S, n: u32) -> vec4 {
                 }
             }
         }
+        // Met by `first`: the point there is inside or on it, and not before `near`.
+        if m.first < 1.0e29 {
+            let f = s.distance(o + d * m.first)
+            if f > 0.0001 || m.first < m.near - 0.0001 {
+                wrong += 1
+            }
+        }
         if m.exact() {
             exact += 1
             if m.is_empty() {
@@ -165,7 +173,8 @@ fn meet_check<S: Surface>(s: S, n: u32) -> vec4 {
 
 /// `meet_check` of: a ball (0), a box turned and scaled (1), a round cone (2), the engine's stage
 /// (two boxes and a ball, joined sharply: 3), the creature (4), the tree of every union (5), a
-/// ball cut by a plane (6), a displaced box (7), a mirrored cone (8).
+/// ball cut by a plane (6), a displaced box (7), a mirrored cone (8), five balls at one place folded
+/// smoothly (9).
 pub fn meet_checks(kind: u32, n: u32) -> vec4 {
     let c = cones()
     let turn = Quat::axis_angle(normalize(vec3(1.0, 2.0, 0.5)), 0.7)
@@ -193,8 +202,13 @@ pub fn meet_checks(kind: u32, n: u32) -> vec4 {
         meet_check(sphere(0.8).translate(vec3(0.0, 0.5, 0.0)).intersect(half_space(vec3(0.3, 1.0, 0.2), 0.6)), n)
     } else if kind == 7 {
         meet_check(cuboid(vec3(0.4, 0.3, 0.5)).translate(vec3(0.1, 0.4, 0.0)).displace(fbm(4.0, 3), amp: 0.05), n)
-    } else {
+    } else if kind == 8 {
         meet_check(round_cone(vec3(0.2, 0.2, 0.0), vec3(0.6, 0.9, 0.2), r_top: 0.2, r_bottom: 0.1).mirror_x(), n)
+    } else {
+        // Five balls at one place, folded smoothly: the fold lowers their distance by more than
+        // one `smin` can (by L(5) = 0.55 k, not k / 4).
+        let b = sphere(0.5).translate(vec3(0.0, 0.5, 0.0))
+        meet_check([b, b, b, b, b].smooth_union(k: 0.6), n)
     }
 }
 ";
@@ -331,7 +345,7 @@ fn masked_and_whole_draw_the_same_picture() {
 fn a_ray_meets_a_surface_only_where_meets_says() {
     let mut host = host();
     let mut exact = Vec::new();
-    for kind in 0..9u32 {
+    for kind in 0..10u32 {
         let r = host
             .call_export("meet_checks", &[Value::I32(kind as i32), Value::I32(2000)])
             .expect("meet_checks");
@@ -350,7 +364,7 @@ fn a_ray_meets_a_surface_only_where_meets_says() {
     for kind in [0, 1, 2, 3, 6] {
         assert_eq!(exact[kind], 2000.0, "kind {kind} is exact: {exact:?}");
     }
-    for kind in [4, 5, 7, 8] {
+    for kind in [4, 5, 7, 8, 9] {
         assert!(exact[kind] < 2000.0, "kind {kind} isn't exact everywhere: {exact:?}");
     }
 }
