@@ -376,16 +376,27 @@ pub trait Surface: Copy + GpuData {
         bound_meets(self.bound(), o, d, grow)
     }
 
-    /// Where the ray `o + t d` (t >= 0; any nonzero `d`, `t` in its units) passes nearest the
-    /// surface: the least its distance comes to along the ray, and a `t` where it does
-    /// (`Pass`). std's shapes answer exactly in closed form, and their sharp unions (the least
-    /// of their members'), moved and named: `exact`, the least to rounding, never farther. A
-    /// smooth union answers its members' least less its join's lowering: a bound (the true
-    /// least is at least that), its `t` the nearest member's, which `Pass::refined` makes
-    /// nearly the true least with a few asks. Anything else answers its bound's pass: a bound.
-    /// Where `distance` is at most 0 the ray meets the surface (`meets` says where first).
+    /// Whether `passes` is exact for every value of this type and every ray, a constant of the
+    /// build (as `EXACT_MEETS`): true for std's shapes, their sharp unions and what moves
+    /// (`PointMap::SIMILAR`), names or colours them; false through a smooth join, a
+    /// displacement, and any surface that doesn't say.
+    const EXACT_PASSES: bool = false
+
+    /// The least the surface's distance comes to along the ray `o + t d` (t >= 0; any nonzero
+    /// `d`, `t` in its units), on both sides of its outline: above 0 how near a ray that misses
+    /// passes, at or below 0 how deep one that goes in goes (the deepest value along its chord;
+    /// a half-space a ray goes into: `-EMPTY`); and a `t` where it is (`Pass`). The true least
+    /// is always within `low..high`. std's shapes answer exactly in closed form (`exact()`:
+    /// `low`, `distance` and `high` the least, to rounding), and their sharp unions (the least
+    /// of their parts': exact). A smooth join answers its parts' least less its lowering as
+    /// `low`, and as `high` and `distance` the less of its parts' least and its own distance
+    /// asked once where they pass: the true least within its lowering of `high` (a fold of `n`,
+    /// `fold_lowering`; two, `k / 4`), which `Pass::refined` tightens with four more asks. A
+    /// displacement answers its inner surface's within its reach either way, asked once so too
+    /// (`high` within twice its reach). Anything else: its bound's pass as `low`, its distance
+    /// asked there as `high`.
     fn passes(self, o: vec3, d: vec3) -> Pass {
-        bound_passes(self.bound(), o, d)
+        bound_pass_asked(self, o, d)
     }
 }
 
@@ -635,10 +646,12 @@ fn bound_meets(b: Bound, o: vec3, d: vec3, grow: f32) -> Meets {
     ball_meets(o, d, b.centre, b.radius + max(grow, 0.0) / b.slope).ahead().unsure()
 }
 
-/// Where a ray passes nearest a surface (`Surface::passes`): the least its distance comes to
-/// along the ray (`t >= 0`), and a `t` where it does. `PASS_EXACT`: `distance` is that least, to
-/// rounding, and never farther; else it is a bound below it and `t` a guess. At most 0: the ray
-/// meets the surface, and `t` is a point of the ray inside or on it. Through a union, the next
+/// Where a ray passes nearest a surface, or goes deepest into it (`Surface::passes`): the least
+/// its distance comes to along the ray (`t >= 0`), a `t` where it does, and `low..high`, which
+/// holds the true least. `PASS_EXACT`: `distance` is that least, to rounding (`low`, `high` the
+/// same), and the distance at `t`; else `distance` is `high`, the least known value at or above
+/// the true least, and the surface's distance at `t` is at most it (it was asked there, or a
+/// part's was, which a join only lowers). At most 0: the ray meets the surface. Through a union, the next
 /// nearest member's pass too (`other`, its `t`, and `other_distance`, lowered as `distance` is;
 /// `EMPTY` where there's none), and the widest smooth join that lowered it (`blend`, its `k`):
 /// where the two nearest are within `blend` of each other the true least can lie between them
@@ -646,17 +659,20 @@ fn bound_meets(b: Bound, o: vec3, d: vec3, grow: f32) -> Meets {
 pub struct Pass: Copy + GpuData {
     pub t: f32,
     pub distance: f32,
+    /// The true least is at least `low` and at most `high` (both `distance` where exact).
+    pub low: f32,
+    pub high: f32,
     pub flags: u32,
     pub other: f32,
     pub other_distance: f32,
     pub blend: f32,
 }
 
-/// `Pass`'s flag: `distance` is the least along the ray, not a bound of it.
+/// `Pass`'s flag: `distance` is the least along the ray, to rounding.
 pub const PASS_EXACT: u32 = 1
 
 impl Pass {
-    /// Whether `distance` is the least along the ray (not a bound below it).
+    /// Whether `distance` is the least along the ray, to rounding.
     pub fn exact(self) -> bool {
         (self.flags & PASS_EXACT) != 0
     }
@@ -671,20 +687,24 @@ impl Pass {
     pub fn or(self, b: Pass) -> Pass {
         let flags = self.flags & b.flags
         let blend = max(self.blend, b.blend)
+        let (low, high) = (min(self.low, b.low), min(self.high, b.high))
         let w = if b.distance < self.distance { b } else { self }
         let l = if b.distance < self.distance { self } else { b }
         if l.distance < w.other_distance {
-            Pass { t: w.t, distance: w.distance, flags, other: l.t, other_distance: l.distance, blend }
+            Pass { t: w.t, distance: w.distance, low, high, flags, other: l.t, other_distance: l.distance, blend }
         } else {
-            Pass { flags, blend, ..w }
+            Pass { flags, blend, low, high, ..w }
         }
     }
 
-    /// The same, lowered by `by` (a smooth join of width `k`, its lowering): a bound.
+    /// The same, lowered by up to `by` (a smooth join of width `k`, its lowering): `low` less
+    /// `by`, `high` as it was (a join only lowers), `distance` its low until asked.
     pub fn lowered(self, by: f32, k: f32) -> Pass {
         Pass {
             t: self.t,
-            distance: self.distance - by,
+            distance: self.low - by,
+            low: self.low - by,
+            high: self.high,
             flags: 0,
             other: self.other,
             other_distance: self.other_distance - by,
@@ -694,7 +714,7 @@ impl Pass {
 
     /// A bound made nearly the least: `f` (the surface's distance, or its live parts') asked
     /// four times along the ray: three evenly spaced, then one where the parabola through them
-    /// is least; the least asked, and where. Round `t`, `h` apart (a length, m); in a seam (the
+    /// is least; the least asked, and where (`distance`, `high`; `low` as it was). Round `t`, `h` apart (a length, m); in a seam (the
     /// next nearest within `blend` of the nearest), from `t` to `other`. Not a bound any more:
     /// at least the true least, by little where `f` is smooth there (std's tests and the
     /// toolchain's `passes` fixture measure how little). An exact pass is returned as it is.
@@ -714,23 +734,38 @@ impl Pass {
         let den = f0 - 2.0 * f1 + f2
         let tv = if den > 0.0 { max(t1 + 0.5 * k * (f0 - f2) / den, 0.0) } else { if f0 < f2 { t0 } else { t2 } }
         let fv = f(o + d * tv)
-        var best = pass_at(t1, f1, 0)
-        if f0 < best.distance {
-            best = pass_at(t0, f0, 0)
+        var at = t1
+        var least = f1
+        if f0 < least {
+            at = t0
+            least = f0
         }
-        if f2 < best.distance {
-            best = pass_at(t2, f2, 0)
+        if f2 < least {
+            at = t2
+            least = f2
         }
-        if fv < best.distance {
-            best = pass_at(tv, fv, 0)
+        if fv < least {
+            at = tv
+            least = fv
         }
-        best
+        self.asked(at, least)
+    }
+
+    /// The same, with the surface's distance asked at `t` and found `f`: where that is less than
+    /// `high`, it is `high` and `distance` and `t` is there (`low` no more than it).
+    pub fn asked(self, t: f32, f: f32) -> Pass {
+        if f < self.high {
+            Pass { t, distance: f, low: min(self.low, f), high: f, flags: 0, ..self }
+        } else {
+            Pass { distance: self.high, flags: 0, ..self }
+        }
     }
 }
 
 /// A pass at `t`, `distance` away, of one surface (no other member's, no blend).
 fn pass_at(t: f32, distance: f32, flags: u32) -> Pass {
-    Pass { t, distance, flags, other: t, other_distance: EMPTY, blend: 0.0 }
+    let high = if (flags & PASS_EXACT) != 0 { distance } else { EMPTY }
+    Pass { t, distance, low: distance, high, flags, other: t, other_distance: EMPTY, blend: 0.0 }
 }
 
 /// Where the ray passes nearest the ball of radius `r` about `c`: the nearest point of the ray
@@ -740,13 +775,21 @@ fn ball_passes(o: vec3, d: vec3, c: vec3, r: f32) -> Pass {
     pass_at(t, length(o + d * t - c) - r, PASS_EXACT)
 }
 
-/// A bound's pass: its ball's, times its slope; where it bounds nothing, it says nothing.
+/// A bound's pass, at most the least of the distance of what it bounds: its ball's, times its
+/// slope outside the ball; inside it, the ball's own (a distance exact or below the true one in
+/// size is no deeper than the ball is). Where it bounds nothing, it says nothing.
 fn bound_passes(b: Bound, o: vec3, d: vec3) -> Pass {
     if b.radius >= 1.0e30 || !(b.slope > 0.0) {
         return pass_at(0.0, -EMPTY, 0)
     }
     let p = ball_passes(o, d, b.centre, b.radius)
-    pass_at(p.t, b.slope * p.distance, 0)
+    pass_at(p.t, if p.distance < 0.0 { max(b.slope, 1.0) * p.distance } else { b.slope * p.distance }, 0)
+}
+
+/// A surface's bound's pass as `low`, and its distance asked there as `high` and `distance`.
+fn bound_pass_asked<S: Surface>(s: S, o: vec3, d: vec3) -> Pass {
+    let p = bound_passes(s.bound(), o, d)
+    p.asked(p.t, s.distance(o + d * p.t))
 }
 
 /// Where the ray passes nearest the box of half-extents `h` about the origin. The squared
@@ -771,8 +814,14 @@ fn box_passes(o: vec3, d: vec3, h: vec3) -> Pass {
     let s0 = box_slope(w, a, b, 0.0)
     var t = 0.0
     if enter <= exit && exit >= 0.0 {
-        t = max(enter, 0.0)
-    } else if s0 < 0.0 {
+        // In every slab at once: in the box, unless an axis the ray doesn't move along is
+        // outside its slab (that slab is everywhere, for this test), where the deepest is above 0.
+        let deep = box_deepest(o, d, h)
+        if deep.distance <= 0.0 {
+            return deep
+        }
+    }
+    if s0 < 0.0 {
         // (lo, its slope, hi, its slope): the last corner below 0 and the first at or above it.
         var k = vec4(0.0, s0, EMPTY, 0.0)
         k = box_bracket(k, max(a.x, 0.0), w, a, b)
@@ -792,6 +841,43 @@ fn box_passes(o: vec3, d: vec3, h: vec3) -> Pass {
     let q = abs(o + d * t) - h
     let m = max(q.x, max(q.y, q.z))
     pass_at(t, if m > 0.0 { length(max(q, vec3(0.0))) } else { m }, PASS_EXACT)
+}
+
+/// The deepest the box's distance goes along a ray that goes into it (`t >= 0`). Inside, it is
+/// `max(|x| - h)` over the axes: the most of six lines in `t`, on each axis the ray moves along
+/// one rising (`|d| t + a`) and one falling (`-|d| t + b`), and on an axis it doesn't, a constant
+/// `|o| - h`. The least of the most of lines is where the rising ones' upper envelope crosses the
+/// falling ones' (or at `t = 0`, where they cross behind the ray), which is the most over each
+/// rising and falling pair of where those two cross: nine pairs, three at a time. Exact.
+fn box_deepest(o: vec3, d: vec3, h: vec3) -> Pass {
+    let s = sign(d)
+    let w = abs(d)
+    let a = s * o - h
+    let b = -s * o - h
+    // 1 on an axis the ray moves along, 0 on one it doesn't.
+    let moving = sign(w)
+    let still = (abs(o) - h) * (vec3(1.0) - moving) - moving * EMPTY
+    let x = box_crossings(a.x, w.x, b, w, moving)
+    let y = box_crossings(a.y, w.y, b, w, moving)
+    let z = box_crossings(a.z, w.z, b, w, moving)
+    let xy = if y.x > x.x { y } else { x }
+    let m = if z.x > xy.x { z } else { xy }
+    let least = m.x
+    let t = m.y
+    pass_at(t, max(least, max(still.x, max(still.y, still.z))), PASS_EXACT)
+}
+
+/// `box_deepest`'s rising line `wi t + ai` against each falling one (`-w t + b`, on the axes
+/// `moving` says): the most where they cross (or at `t = 0`), and there `t`; `-EMPTY` where the
+/// rising line's axis doesn't move.
+fn box_crossings(ai: f32, wi: f32, b: vec3, w: vec3, moving: vec3) -> vec2 {
+    if !(wi > 0.0) {
+        return vec2(-EMPTY, 0.0)
+    }
+    let at = max((b - vec3(ai)) / (vec3(wi) + w), vec3(0.0))
+    let v = (vec3(ai) + at * wi) * moving - (vec3(1.0) - moving) * EMPTY
+    let xy = if v.y > v.x { vec2(v.y, at.y) } else { vec2(v.x, at.x) }
+    if v.z > xy.x { vec2(v.z, at.z) } else { xy }
 }
 
 /// Where a ray (`o` and `d` an axis's) enters and leaves the slab `-h..h` of that axis; along it,
@@ -1535,6 +1621,7 @@ impl Surface for Sphere {
     }
 
     const EXACT_MEETS: bool = true
+    const EXACT_PASSES: bool = true
 
     fn distance(self, p: vec3) -> f32 {
         length(p) - self.radius
@@ -1824,6 +1911,7 @@ impl Surface for RoundCone {
     }
 
     const EXACT_MEETS: bool = true
+    const EXACT_PASSES: bool = true
 
     fn distance(self, p: vec3) -> f32 {
         let ba = self.b - self.a
@@ -1899,6 +1987,7 @@ impl Surface for Cuboid {
     }
 
     const EXACT_MEETS: bool = true
+    const EXACT_PASSES: bool = true
 
     /// Outside, the distance to the nearest point of the box; inside, minus the distance to
     /// the nearest face. One branch on which, so what's derived from it knows the side: on a
@@ -1952,6 +2041,7 @@ pub fn half_space(normal: vec3, offset: f32) -> HalfSpace {
 
 impl Surface for HalfSpace {
     const EXACT_MEETS: bool = true
+    const EXACT_PASSES: bool = true
 
     fn distance(self, p: vec3) -> f32 {
         dot(p, self.normal) - self.offset
@@ -1962,7 +2052,8 @@ impl Surface for HalfSpace {
     fn passes(self, o: vec3, d: vec3) -> Pass {
         let f = self.distance(o)
         let dn = dot(d, self.normal)
-        if dn >= 0.0 || f <= 0.0 { pass_at(0.0, f, PASS_EXACT) } else { pass_at(f / -dn, 0.0, PASS_EXACT) }
+        // Going in, the ray goes deeper for ever.
+        if dn >= 0.0 { pass_at(0.0, f, PASS_EXACT) } else { pass_at(max(f / -dn, 0.0), -EMPTY, PASS_EXACT) }
     }
 
     /// Exact: one side of the plane moved by `grow`.
@@ -2087,6 +2178,7 @@ impl<A: Surface, B: Surface> Surface for Union<A, B> {
     }
 
     const EXACT_MEETS: bool = A::EXACT_MEETS && B::EXACT_MEETS
+    const EXACT_PASSES: bool = A::EXACT_PASSES && B::EXACT_PASSES
 
     fn distance(self, p: vec3) -> f32 {
         min(self.a.distance(p), self.b.distance(p))
@@ -2197,7 +2289,10 @@ impl<A: Surface, B: Surface> Surface for SmoothUnion<A, B> {
     /// The nearer of its operands' less the most the blend lowers it (a quarter of `k`): a
     /// bound, at the nearer's `t`.
     fn passes(self, o: vec3, d: vec3) -> Pass {
-        self.a.passes(o, d).or(self.b.passes(o, d)).lowered(0.25 * max(self.k, 0.0), max(self.k, 0.0))
+        // Asked once where its nearer operand passes.
+        let k = max(self.k, 0.0)
+        let p = self.a.passes(o, d).or(self.b.passes(o, d)).lowered(0.25 * k, k)
+        p.asked(p.t, self.distance(o + d * p.t))
     }
 
     /// Its operands', each grown by `k / 4`, which is the most `smin` lowers the smaller
@@ -2312,6 +2407,7 @@ impl<S: Surface, const N: u32> Surface for UnionAll<S, N> {
     }
 
     const EXACT_MEETS: bool = S::EXACT_MEETS
+    const EXACT_PASSES: bool = S::EXACT_PASSES
 
     /// The nearest part's distance; with no parts, nowhere near (`EMPTY`).
     fn distance(self, p: vec3) -> f32 {
@@ -2619,7 +2715,9 @@ impl<S: Surface, const N: u32> Surface for SmoothUnionAll<S, N> {
             let t = if min(f1, f2) >= min(f0, least) { if f0 <= least { ta } else { best } } else if f1 < f2 { x1 } else { x2 }
             p = Pass { t, other: t, other_distance: EMPTY, ..p }
         }
-        p.lowered(fold_lowering(N, k), k)
+        // Asked once where the search found the least.
+        let q = p.lowered(fold_lowering(N, k), k)
+        q.asked(q.t, self.distance(o + d * q.t))
     }
 
     /// Its parts', each grown by the fold's whole lowering (`fold_lowering`): not exact.
@@ -2916,6 +3014,7 @@ impl<S: Surface, M: PointMap> Surface for Warp<S, M> {
     }
 
     const EXACT_MEETS: bool = S::EXACT_MEETS
+    const EXACT_PASSES: bool = S::EXACT_PASSES && M::SIMILAR
 
     fn distance(self, p: vec3) -> f32 {
         self.map.distance_out(self.inner.distance(self.map.local(p)))
@@ -2925,11 +3024,13 @@ impl<S: Surface, M: PointMap> Surface for Warp<S, M> {
     /// (`PointMap::SIMILAR`: its distances scale as lengths do); by any other, its bound's.
     fn passes(self, o: vec3, d: vec3) -> Pass {
         if !M::SIMILAR {
-            return bound_passes(self.bound(), o, d)
+            return bound_pass_asked(self, o, d)
         }
         let p = self.inner.passes(self.map.local(o), self.map.local_direction(d))
         Pass {
             distance: self.map.distance_out(p.distance),
+            low: self.map.distance_out(p.low),
+            high: self.map.distance_out(p.high),
             other_distance: self.map.distance_out(p.other_distance),
             blend: self.map.distance_out(p.blend),
             ..p
@@ -3112,7 +3213,10 @@ impl<S: Surface, N: Noise> Surface for Displace<S, N> {
     fn passes(self, o: vec3, d: vec3) -> Pass {
         let r = self.noise.range()
         let a = abs(self.amp) * max(abs(r.lo), abs(r.hi))
-        self.inner.passes(o, d).lowered(a, 0.0)
+        // Within its reach of its inner surface's, either way; asked once where that passes.
+        let p = self.inner.passes(o, d)
+        let q = Pass { high: p.high + a, ..p.lowered(a, 0.0) }
+        q.asked(q.t, self.distance(o + d * q.t))
     }
 
     fn masked(self, p: vec3, live: Live, first: u32) -> f32 {
@@ -3400,6 +3504,7 @@ pub struct Named<S>: Copy + GpuData + Eq + StateHash {
 
 impl<S: Surface> Surface for Named<S> {
     const EXACT_MEETS: bool = S::EXACT_MEETS
+    const EXACT_PASSES: bool = S::EXACT_PASSES
 
     fn distance(self, p: vec3) -> f32 {
         self.inner.distance(p)
@@ -3687,6 +3792,7 @@ pub struct ToBound<S>: Copy + GpuData + Eq + StateHash {
 
 impl<S: Surface> Surface for ToBound<S> {
     const EXACT_MEETS: bool = S::EXACT_MEETS
+    const EXACT_PASSES: bool = S::EXACT_PASSES
 
     fn distance(self, p: vec3) -> f32 {
         clamp(self.inner.distance(p), -self.near, self.near) * self.scale
@@ -3695,7 +3801,8 @@ impl<S: Surface> Surface for ToBound<S> {
     /// The inner surface's, clamped and scaled as its distance is.
     fn passes(self, o: vec3, d: vec3) -> Pass {
         let p = self.inner.passes(o, d)
-        Pass { distance: clamp(p.distance, -self.near, self.near) * self.scale, ..p }
+        let f = |x: f32| clamp(x, -self.near, self.near) * self.scale
+        Pass { distance: f(p.distance), low: f(p.low), high: f(p.high), ..p }
     }
 
     /// The inner surface's, where `grow` is within `near` in its units; past that, every point.
@@ -3995,6 +4102,7 @@ impl<S: Surface, C: Copy + GpuData> Surface for With<S, C> {
     }
 
     const EXACT_MEETS: bool = S::EXACT_MEETS
+    const EXACT_PASSES: bool = S::EXACT_PASSES
 
     fn distance(self, p: vec3) -> f32 {
         self.inner.distance(p)
@@ -4077,6 +4185,7 @@ pub struct WithAt<S, F>: Copy + GpuData + Eq + StateHash {
 
 impl<S: Surface, F: Copy + GpuData> Surface for WithAt<S, F> {
     const EXACT_MEETS: bool = S::EXACT_MEETS
+    const EXACT_PASSES: bool = S::EXACT_PASSES
 
     fn distance(self, p: vec3) -> f32 {
         self.inner.distance(p)
@@ -4587,6 +4696,12 @@ fn passes_of_std_shapes_are_the_least_along_the_ray() {
             } else if m.distance <= 0.0 {
                 met += 1
                 assert(p.distance <= 1.0e-4, f"case {c} ray {i}: the march meets it, the pass is {p.distance} away")
+                // As deep as the ray goes (a half-space: for ever, where it goes in).
+                if c == 2 {
+                    assert(p.distance <= m.distance + 1.0e-5 * (1.0 + abs(m.distance)), f"ray {i}: the plane's pass {p.distance} above the march's {m.distance}")
+                } else {
+                    assert(abs(p.distance - m.distance) <= 1.0e-4, f"case {c} ray {i}: in as deep as {p.distance}, the march {m.distance}")
+                }
             } else {
                 near += if m.distance < 0.05 { 1 } else { 0 }
                 let off = p.distance - m.distance
@@ -4601,10 +4716,117 @@ fn passes_of_std_shapes_are_the_least_along_the_ray() {
     assert(near > 100 && met > 100, f"{near} near, {met} met")
 }
 
+/// `s`'s pass against a brute-force least (`marched_pass`: 2,000 even samples over `far` m and a
+/// refine) on 600 rays from round `c` (from up to `size` m off it, a third toward it and the rest
+/// anywhere, many from inside), both sides of its outline: within `low..high` (to `slack`), and
+/// within `gap` of it at `high`. Exact (`exact`): `low`, `distance` and `high` the same and within
+/// 1e-4 m of the least, never farther past rounding. (rays inside, rays outside, the most
+/// `high` was above the least in 1e-6 m.)
+fn passes_both_sides<S: Surface>(s: S, c: vec3, size: f32, far: f32, exact: bool, gap: f32) -> vec3u {
+    let slack = 1.0e-5
+    var inside: u32 = 0
+    var outside: u32 = 0
+    var worst = 0.0
+    for i in 0..600 {
+        let from = c + Box3 { lo: vec3(-size), hi: vec3(size) }.sample(13, i)
+        let toward = c + Box3 { lo: vec3(-0.3 * size), hi: vec3(0.3 * size) }.sample(17, i)
+        let any = Box3 { lo: vec3(-1.0), hi: vec3(1.0) }.sample(19, i) + vec3(0.0, 0.001, 0.0)
+        let d = normalize(if i % 3 == 0 { toward - from + vec3(0.0, 0.0, 1.0e-3) } else { any })
+        let p = s.passes(from, d)
+        let m = marched_pass(s, from, d, far, 2000)
+        assert(p.exact() == exact, f"ray {i}: exact {p.exact()}")
+        assert(p.low <= p.distance && p.distance <= p.high, f"ray {i}: {p.low} {p.distance} {p.high} out of order")
+        assert(p.low <= m.distance + slack * (1.0 + abs(m.distance)), f"ray {i}: low {p.low} above the least {m.distance}")
+        if exact {
+            assert(p.low == p.high, f"ray {i}: exact, low {p.low} and high {p.high}")
+            assert(abs(p.distance - m.distance) <= 1.0e-4, f"ray {i}: {p.distance} at {p.t}, the least {m.distance} at {m.t}")
+            assert(abs(s.distance(from + d * p.t) - p.distance) <= 1.0e-4, f"ray {i}: not {p.distance} at its t")
+        } else {
+            assert(p.high >= m.distance - slack * (1.0 + abs(m.distance)), f"ray {i}: high {p.high} below the least {m.distance}")
+            assert(p.high - m.distance <= gap + slack, f"ray {i}: high {p.high} above the least {m.distance} by more than {gap}")
+            assert(s.distance(from + d * p.t) <= p.distance + slack, f"ray {i}: above {p.distance} at its t")
+        }
+        worst = max(worst, p.high - m.distance)
+        inside += if m.distance < -1.0e-3 { 1 } else { 0 }
+        outside += if m.distance > 1.0e-3 { 1 } else { 0 }
+    }
+    vec3u(inside, outside, u32(max(worst, 0.0) * 1.0e6))
+}
+
+/// std's shapes (a ball, round cones thin, fat and one holding the other, a cylinder, a box
+/// turned), and a sharp union of them: exact on both sides, from inside and out.
+@test
+fn passes_of_std_shapes_are_the_least_along_the_ray_on_both_sides() {
+    let turn = Quat::axis_angle(normalize(vec3(1.0, 2.0, 0.5)), 0.7)
+    let ball = sphere(0.8).translate(vec3(0.3, -0.2, 0.1))
+    let cone = round_cone(vec3(-0.5, -0.4, 0.2), vec3(0.4, 0.6, -0.3), r_top: 0.15, r_bottom: 0.4)
+    let held = round_cone(vec3(0.1, 0.0, 0.0), vec3(0.12, 0.03, 0.0), r_top: 0.6, r_bottom: 0.1)
+    let rod = round_cone(vec3(0.0, -0.8, 0.0), vec3(0.0, 0.8, 0.0), r_top: 0.3, r_bottom: 0.3)
+    let block = cuboid(vec3(0.9, 0.4, 0.6)).rotate(turn).translate(vec3(0.2, 0.1, -0.1))
+    let all = ball.translate(vec3(1.2, 0.0, 0.0)).union(cone).union(block.translate(vec3(-1.0, 0.3, 0.4)))
+    let r0 = passes_both_sides(ball, vec3(0.3, -0.2, 0.1), size: 1.6, far: 8.0, exact: true, gap: 0.0)
+    let r1 = passes_both_sides(cone, vec3(), size: 1.2, far: 8.0, exact: true, gap: 0.0)
+    let r2 = passes_both_sides(held, vec3(0.1, 0.0, 0.0), size: 1.0, far: 8.0, exact: true, gap: 0.0)
+    let r3 = passes_both_sides(rod, vec3(), size: 1.2, far: 8.0, exact: true, gap: 0.0)
+    let r4 = passes_both_sides(block, vec3(0.2, 0.1, -0.1), size: 1.4, far: 8.0, exact: true, gap: 0.0)
+    let r5 = passes_both_sides(all, vec3(), size: 2.2, far: 12.0, exact: true, gap: 0.0)
+    for r in [r0, r1, r2, r3, r4, r5] {
+        assert(r.x > 60 && r.y > 60, f"{r.x} rays went in, {r.y} passed")
+    }
+    // Rays along a box's axes, from inside it and out: on the axes a ray doesn't move along, the
+    // box's distance is a constant.
+    let plain = cuboid(vec3(0.9, 0.4, 0.6))
+    for i in 0..120 {
+        let from = Box3 { lo: vec3(-1.3), hi: vec3(1.3) }.sample(23, i)
+        let e = i % 3
+        let along = if e == 0 { vec3(1.0, 0.0, 0.0) } else if e == 1 { vec3(0.0, 1.0, 0.0) } else { vec3(0.0, 0.0, 1.0) }
+        let d = if (i / 3) % 2 == 0 { along } else { -along }
+        let p = plain.passes(from, d)
+        let m = marched_pass(plain, from, d, 8.0, 2000)
+        assert(abs(p.distance - m.distance) <= 1.0e-4, f"axis ray {i}: {p.distance} at {p.t}, the least {m.distance} at {m.t}")
+        assert(abs(plain.distance(from + d * p.t) - p.distance) <= 1.0e-4, f"axis ray {i}: not {p.distance} at its t")
+    }
+    // A half-space: out as far as a ray going out is, in for ever.
+    let plane = half_space(normalize(vec3(0.1, 1.0, 0.05)), 0.2)
+    for i in 0..200 {
+        let from = Box3 { lo: vec3(-3.0), hi: vec3(3.0) }.sample(13, i)
+        let d = normalize(Box3 { lo: vec3(-1.0), hi: vec3(1.0) }.sample(19, i) + vec3(0.0, 0.001, 0.0))
+        let p = plane.passes(from, d)
+        let m = marched_pass(plane, from, d, 8.0, 2000)
+        assert(p.exact() && p.low == p.high, "a half-space's pass not exact")
+        if dot(d, plane.normal) < 0.0 {
+            assert(p.distance == -EMPTY, f"ray {i}: going in, {p.distance}")
+        } else {
+            assert(abs(p.distance - m.distance) <= 1.0e-4, f"ray {i}: {p.distance} against {m.distance}")
+        }
+    }
+}
+
+/// A smooth join (two shapes, and a fold of three balls) and a displaced ball, on both sides:
+/// the least along the ray within `low..high`, and `high` (four asks of its own distance) within
+/// the join's lowering of it (a displacement: twice its reach).
+@test
+fn passes_of_smooth_and_displaced_surfaces_hold_the_least_on_both_sides() {
+    let k = 0.3
+    let ball = sphere(0.6).translate(vec3(0.5, 0.0, 0.0))
+    let cone = round_cone(vec3(-0.6, -0.3, 0.1), vec3(0.1, 0.4, -0.2), r_top: 0.15, r_bottom: 0.35)
+    let pair = ball.smooth_union(cone, k: k)
+    let three = [sphere(0.4).translate(vec3(-0.5, 0.0, 0.0)), sphere(0.35).translate(vec3(0.2, 0.3, 0.0)), sphere(0.45).translate(vec3(0.3, -0.4, 0.2))].smooth_union(k)
+    let r = fbm(4.0, 3).range()
+    let reach = 0.02 * max(abs(r.lo), abs(r.hi))
+    let bumpy = sphere(1.0).displace(fbm(4.0, 3), amp: 0.02)
+    let a = passes_both_sides(pair, vec3(), size: 1.4, far: 8.0, exact: false, gap: 0.25 * k)
+    let b = passes_both_sides(three, vec3(), size: 1.2, far: 8.0, exact: false, gap: fold_lowering(3, k))
+    let c = passes_both_sides(bumpy, vec3(), size: 2.0, far: 8.0, exact: false, gap: 2.0 * reach)
+    for q in [a, b, c] {
+        assert(q.x > 60 && q.y > 60, f"{q.x} rays went in, {q.y} passed")
+    }
+}
+
 /// The rays of `a_smooth_unions_pass_refined_*` seen from `away` m: how many pass within a
 /// footprint of the body (a fine march's least in 0..one footprint), and how many of those its
-/// pass refined by four asks puts within a twentieth of one; the bound never farther than the
-/// march's least.
+/// pass refined by four asks a footprint's scale apart puts within a twentieth of one; the
+/// march's least within the pass's `low..high`.
 fn refined_passes(away: f32, rays: u32) -> vec2u {
     let s = parted_body()
     let pixel = 2.0 / (1080.0 * (1.0 / tan(0.3)))
@@ -4625,7 +4847,8 @@ fn refined_passes(away: f32, rays: u32) -> vec2u {
         let from = q + n * (foot * (1.2 * fract(f32(i) * 0.414214) - 0.1)) - d * away
         let p = s.passes(from, d)
         let m = marched_pass(s, from, d, away + 1.0, 2000)
-        assert(p.distance <= m.distance + 1.0e-6, f"ray {i}: the bound {p.distance} farther than the march's {m.distance}")
+        assert(p.low <= m.distance + 1.0e-6, f"ray {i}: low {p.low} farther than the march's {m.distance}")
+        assert(p.high >= m.distance - 1.0e-6, f"ray {i}: high {p.high} nearer than the march's {m.distance}")
         if m.distance > 0.0 && m.distance <= foot {
             within += 1
             let r = p.refined(from, d, |q: vec3| s.distance(q), 0.5 * foot)
@@ -4636,8 +4859,8 @@ fn refined_passes(away: f32, rays: u32) -> vec2u {
     vec2u(within, good)
 }
 
-/// A creature-like body (`parted_body`) seen from 1.5 m (the engine's near body eye): its pass is
-/// a bound, and refined by four asks it is within a twentieth of a pixel's footprint (the
+/// A creature-like body (`parted_body`) seen from 1.5 m (the engine's near body eye): its pass
+/// holds the least, and refined by four asks it is within a twentieth of a pixel's footprint (the
 /// engine's camera: 0.6 rad high at 1080 rows, 0.57 mm a metre) of the true least on 99% of the
 /// rays that pass within a footprint.
 @test
@@ -4655,8 +4878,8 @@ fn a_smooth_unions_pass_refined_is_within_a_twentieth_of_a_footprint_far() {
     assert(r.y * 100 >= r.x * 99, f"{r.y} of {r.x} within a twentieth")
 }
 
-/// A displaced ball: its pass is a bound (never farther than a fine march's least), within the
-/// displacement's reach of it; refined by four asks, nearer.
+/// A displaced ball: its pass's `low` is never farther than a fine march's least, and within twice
+/// the displacement's reach of it; refined by four asks, never nearer.
 @test
 fn a_displaced_surfaces_pass_is_its_inner_ones_less_its_reach() {
     let s = sphere(1.0).displace(fbm(4.0, 3), amp: 0.02)
@@ -4673,11 +4896,11 @@ fn a_displaced_surfaces_pass_is_its_inner_ones_less_its_reach() {
         let p = s.passes(from, d)
         assert(!p.exact(), "a displaced surface's pass claims exact")
         if m.distance > 0.0 {
-            assert(p.distance <= m.distance + 1.0e-5, f"ray {i}: the pass {p.distance} farther than the march's {m.distance}")
-            assert(m.distance - p.distance <= 2.0 * reach + 1.0e-4, f"ray {i}: {p.distance} against {m.distance}, reach {reach}")
+            assert(p.low <= m.distance + 1.0e-5, f"ray {i}: low {p.low} farther than the march's {m.distance}")
+            assert(m.distance - p.low <= 2.0 * reach + 1.0e-4, f"ray {i}: {p.low} against {m.distance}, reach {reach}")
             let q = p.refined(from, d, |x: vec3| s.distance(x), 0.005)
             assert(q.distance >= m.distance - 1.0e-5, f"ray {i}: refined {q.distance} nearer than the march's {m.distance}")
-            raw += m.distance - p.distance
+            raw += m.distance - p.low
             refined += q.distance - m.distance
             counted += 1
         }
