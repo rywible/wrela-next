@@ -79,16 +79,22 @@ pub const VERSION: u32 = 16;
 pub const SCREEN_TEXTURE: TextureFormat = TextureFormat::Rgba8;
 /// [`SCREEN_TEXTURE`] in WebGPU's spelling.
 pub const SCREEN_FORMAT: &str = SCREEN_TEXTURE.info().name;
-/// The most a workgroup may be along each axis, and in all, on every target (both are 1024).
-pub const MAX_WORKGROUP_SIZE: [u32; 3] = crate::TargetLimits::METAL.device.max_workgroup_size;
+/// The most a workgroup may be along each axis, and in all, on every target: 1024, and 64
+/// along z (the Vulkan floor's: NVIDIA's).
+pub const MAX_WORKGROUP_SIZE: [u32; 3] = {
+    let m = crate::TargetLimits::METAL.device.max_workgroup_size;
+    let v = crate::TargetLimits::VULKAN.device.max_workgroup_size;
+    [min(m[0], v[0]), min(m[1], v[1]), min(m[2], v[2])]
+};
 pub const MAX_WORKGROUP_INVOCATIONS: u32 =
     crate::TargetLimits::METAL.device.max_workgroup_invocations;
 const _: () = assert!(
     crate::TargetLimits::VULKAN.device.max_workgroup_invocations == MAX_WORKGROUP_INVOCATIONS
-        && crate::TargetLimits::VULKAN.device.max_workgroup_size[0] == MAX_WORKGROUP_SIZE[0]
-        && crate::TargetLimits::VULKAN.device.max_workgroup_size[1] == MAX_WORKGROUP_SIZE[1]
-        && crate::TargetLimits::VULKAN.device.max_workgroup_size[2] == MAX_WORKGROUP_SIZE[2]
 );
+
+const fn min(a: u32, b: u32) -> u32 {
+    if a < b { a } else { b }
+}
 /// WebGPU's default `maxBindingsPerBindGroup`: every binding number is below this.
 pub const MAX_BINDINGS_PER_GROUP: u32 = 1000;
 

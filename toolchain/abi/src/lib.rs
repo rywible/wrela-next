@@ -393,18 +393,28 @@ impl TargetLimits {
         step_width: 8192,
     };
 
-    /// A Ryzen 5 5500U's integrated Radeon (Mesa 26.1.6's RADV) as wgpu 30's Vulkan backend
-    /// reports it (`wrela-host --adapter` on the Linux machine, 2026-11-15).
+    /// The floor of the Vulkan devices wrela runs on (Phase 5's minimum spec, backend.md item
+    /// 35): what pipelines are compiled for, and less than which the host refuses an adapter.
+    /// Each is Vulkan Roadmap 2022's (every Vulkan 1.3 desktop device: NVIDIA, AMD, Intel, the
+    /// Steam Deck) or under it where content needs no more, and never more than the three
+    /// vendors' devices report: until 2026-11-19 it was the Radeon 5500U's own numbers, which
+    /// an NVIDIA GPU (48 KiB of workgroup memory, a 64 KiB uniform range) is short of.
+    /// What a device has above the floor a program reads at run time (`std::gpu::limits()`).
     pub const VULKAN: TargetLimits = TargetLimits {
         device: Limits {
+            // Roadmap 2022 is 8192; desktop devices 16384 or more.
             max_texture_size: 16_384,
-            // `maxStorageBufferBindingSize`, 2 GiB less 4: the lesser of it and `maxBufferSize`.
-            max_buffer_size: 2_147_483_644,
-            max_storage_buffers_per_stage: 2_097_150,
-            max_uniform_buffer_binding_size: 2_147_483_647,
-            max_workgroup_storage_size: 65_536,
+            // `maxStorageBufferRange`: Intel's integrated GPUs report 1 GiB.
+            max_buffer_size: 1_073_741_824,
+            // Roadmap 2022.
+            max_storage_buffers_per_stage: 30,
+            // Roadmap 2022 (`maxUniformBufferRange`), NVIDIA's.
+            max_uniform_buffer_binding_size: 65_536,
+            // Apple's 32 KiB, under NVIDIA's 48 and AMD's and Intel's 64 (the core floor is 16).
+            max_workgroup_storage_size: 32_768,
+            // Every desktop vendor's and Metal's (Roadmap 2022 is 256, and 64 along z: NVIDIA's).
             max_workgroup_invocations: 1024,
-            max_workgroup_size: [1024, 1024, 1024],
+            max_workgroup_size: [1024, 1024, 64],
             max_workgroups_per_dimension: 65_535,
             features: REQUIRED_FEATURES,
             subgroup_min_size: 0,
@@ -413,10 +423,11 @@ impl TargetLimits {
             screen: 0,
             headroom: 1000,
         },
-        storage_buffers_per_stage: 2_097_150,
-        sampled_textures_per_stage: 2_097_149,
-        samplers_per_stage: 2_796_212,
-        storage_textures_per_stage: 2_097_150,
+        // Roadmap 2022's per-stage descriptors.
+        storage_buffers_per_stage: 30,
+        sampled_textures_per_stage: 200,
+        samplers_per_stage: 64,
+        storage_textures_per_stage: 16,
         varyings: 31,
         color_attachment_bytes: 128,
         buffer_slots_per_stage: None,
