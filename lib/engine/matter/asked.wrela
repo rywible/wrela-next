@@ -85,6 +85,15 @@ pub trait Asked: Copy {
     fn flesh(self) -> f32
 }
 
+/// A leaf of a thing's tree of bricks (`Seen::leaf_at`): its node, least corner and side, and
+/// whether it is a child that holds no surface.
+pub struct Leaf: Copy {
+    pub node: u32,
+    pub lo: vec3,
+    pub side: f32,
+    pub empty: bool,
+}
+
 /// A round cone (the hull of a sphere of radius `ra` at `a` and one of `rb` at `b`).
 pub struct Cone: Copy + GpuData {
     pub a: vec3,
@@ -199,13 +208,13 @@ impl<M: Field<Substance>, const W: u32> Lone<M, W> {
         let box = box_span(o, d, g.lo, g.hi)
         var near = box.x
         var far = box.y
-        var k = Within { exit: -1.0, node: NO_BRICK, mask: 0, steep: 1.0 }
+        var k = Within { exit: -1.0, node: NO_BRICK, mask: 0, steep: 1.0, leaf: NONE }
         if W == MET && M::EXACT_MEETS && box.y >= box.x && box.y >= 0.0 {
             let m = self.field.meets(o, d)
             if m.exact() && m.near <= m.far {
                 near = m.near
                 far = m.far
-                k = Within { exit: m.near, node: HIT, mask: ALL, steep: 1.0 }
+                k = Within { exit: m.near, node: HIT, mask: ALL, steep: 1.0, leaf: NONE }
             } else {
                 let grow = 0.5 * (wide + spread * max(box.y, 0.0))
                 let n = self.field.meets_grown(o, d, grow, 0.0)
@@ -331,6 +340,10 @@ pub struct Within: Copy {
     pub node: u32,
     pub mask: u32,
     pub steep: f32,
+    /// The leaf brick of cells its last step's descent found (`NONE`: none): a halving or the
+    /// facing that a descent would bring to the same brick reads it with no descent
+    /// (`Seen::leaf_holds`).
+    pub leaf: u32,
 }
 
 /// Where a ray from `o` along `d` enters and leaves the box from `lo` to `hi` (m along it).
@@ -395,6 +408,7 @@ pub fn fetched(roots: GpuSpan<u32>, g: Grid, p: vec3, inv: vec3, t: f32) -> With
         node: if none { NO_BRICK } else { node },
         mask: if out { 0 } else if empty { if least < 0.0 { 1 } else { 0 } } else if node == HOLDS { mask } else { r },
         steep: if out { clear_out + t } else if empty { y_empty + t } else { steep },
+        leaf: NONE,
     }
 }
 
@@ -445,6 +459,13 @@ impl<M: Field<Substance>, const W: u32> Seen<M, W> {
     /// the error, toward the eye, and the place shown asks for the brick's split (`cells::
     /// refined`): never a hole, and the thing's field is never asked by a ray.
     fn cells_at(self, p: vec3, inv: vec3, node0: u32, lo0: vec3, size: f32) -> vec4 {
+        self.leaf_read(self.leaf_at(p, node0, lo0, size), p, inv)
+    }
+
+    /// The brick of its tree that answers at `p`, asked `size` m finely, in the root whose node is
+    /// `node0` (least corner `lo0`): the finest there no coarser than `size` (its node, least
+    /// corner and side), or a child that holds no surface (`empty`).
+    fn leaf_at(self, p: vec3, node0: u32, lo0: vec3, size: f32) -> Leaf {
         let g = self.grid
         var node = node0
         var lo = lo0
@@ -470,8 +491,48 @@ impl<M: Field<Substance>, const W: u32> Seen<M, W> {
                 node = child
             }
         }
-        if empty {
-            let least = bitcast_f32(self.nodes[node * NODE + 2])
+        Leaf { node, lo, side, empty }
+    }
+
+    /// Whether the leaf the walk `k` keeps is the brick a descent at `p`, asked `size` m finely,
+    /// would find (`leaf_at`'s own conditions): `p` in its box (as the descent's halvings place it:
+    /// an upper child holds its lower face), its parent's cells coarser than the size, and its own
+    /// no coarser, or it has no children. Then it is read with no descent, the same brick: the
+    /// same reads, the same picture.
+    fn leaf_holds(self, k: Within, p: vec3, size: f32) -> bool {
+        if k.leaf == NONE {
+            return false
+        }
+        let level = self.nodes[k.leaf * NODE + 3]
+        let side = self.grid.brick * exp2(-f32(level))
+        let lo = self.leaf_lo(k.leaf)
+        let hi = lo + vec3(side)
+        let inside = p.x >= lo.x && p.y >= lo.y && p.z >= lo.z && p.x < hi.x && p.y < hi.y && p.z < hi.z
+        let fine = side / f32(B) <= size * CELL_PER_SIZE || level >= LEVELS || self.nodes[k.leaf * NODE + 1] == NONE
+        let coarse = level == 0 || 2.0 * side / f32(B) > size * CELL_PER_SIZE
+        inside && fine && coarse
+    }
+
+    /// A node's least corner (its words 4-6).
+    fn leaf_lo(self, node: u32) -> vec3 {
+        vec3(bitcast_f32(self.nodes[node * NODE + 4]), bitcast_f32(self.nodes[node * NODE + 5]), bitcast_f32(self.nodes[node * NODE + 6]))
+    }
+
+    /// The leaf at `p` for the walk `k` (its root a brick of cells): the kept one where it holds
+    /// (`leaf_holds`), else a descent (`leaf_at`).
+    fn leaf_for(self, k: Within, p: vec3, size: f32) -> Leaf {
+        if self.leaf_holds(k, p, size) {
+            return Leaf { node: k.leaf, lo: self.leaf_lo(k.leaf), side: self.grid.brick * exp2(-f32(self.nodes[k.leaf * NODE + 3])), empty: false }
+        }
+        self.leaf_at(p, k.node, self.lo_of(k.mask), size)
+    }
+
+    /// `cells_at` from its leaf.
+    fn leaf_read(self, leaf: Leaf, p: vec3, inv: vec3) -> vec4 {
+        let lo = leaf.lo
+        let side = leaf.side
+        if leaf.empty {
+            let least = bitcast_f32(self.nodes[leaf.node * NODE + 2])
             if least < 0.0 {
                 // (A child all inside matter: the point is inside, at least as deep as it is inside
                 // the child. Read as holding nothing, a ray a step had carried past the surface
@@ -481,8 +542,8 @@ impl<M: Field<Substance>, const W: u32> Seen<M, W> {
             let off = length(p - (lo + vec3(0.5 * side)))
             return vec4(max(least - off, inside_by(p, lo, side)), side, box_crossed(p, inv, lo, lo + vec3(side)).y, 1.0)
         }
-        let off = bitcast_f32(self.nodes[node * NODE + 7])
-        vec4(read_distance(self.cells, self.nodes[node * NODE], lo, side, p) - off, side, 0.0, 0.0)
+        let off = bitcast_f32(self.nodes[leaf.node * NODE + 7])
+        vec4(read_distance(self.cells, self.nodes[leaf.node * NODE], lo, side, p) - off, side, 0.0, 0.0)
     }
 
     /// The roots at `p`, `t` m along a ray going `inv`, fetched: the walk in them (`fetched`).
@@ -520,6 +581,18 @@ impl<M: Field<Substance>, const W: u32> Seen<M, W> {
             // no farther than the root's far side.
             y = self.by_parts(p, k.mask) / k.steep
             x = if along && k.steep < g.stated && y > k.exit - t { k.exit - t + g.nudge.x } else { y }
+        }
+        vec2(x, y)
+    }
+
+    /// `answered` for a root of cells, from the leaf its descent found (`leaf_at`).
+    fn leaf_answered(self, k: Within, leaf: Leaf, p: vec3, inv: vec3, t: f32, along: bool) -> vec2 {
+        let c = self.leaf_read(leaf, p, inv)
+        var x = c.x
+        var y = c.x
+        if c.w > 0.5 {
+            x = if along { max(c.z + 0.01 * c.y, c.x) } else { c.x + c.y }
+            y = if along { c.x } else { c.x + c.y }
         }
         vec2(x, y)
     }
@@ -565,7 +638,7 @@ impl<M: Field<Substance>, const W: u32> Asked for Seen<M, W> {
         }
         let g = self.grid
         let box = box_span(o, d, g.lo, g.hi)
-        Begun { near: box.x, far: box.y, walk: Within { exit: -1.0, node: NO_BRICK, mask: 0, steep: 1.0 } }
+        Begun { near: box.x, far: box.y, walk: Within { exit: -1.0, node: NO_BRICK, mask: 0, steep: 1.0, leaf: NONE } }
     }
 
     fn step(self, walk: Within, p: vec3, d: vec3, inv: vec3, t: f32, size: f32) -> Stepped<Within> {
@@ -575,6 +648,14 @@ impl<M: Field<Substance>, const W: u32> Asked for Seen<M, W> {
         var k = walk
         if !(t < k.exit) {
             k = self.fetched(p, inv, t)
+        }
+        if W == CELLS && k.node != HOLDS && k.node != NO_BRICK {
+            // (A step descends as ever; the leaf it found is noted for the halvings and the facing
+            // that follow where it crosses the surface.)
+            let leaf = self.leaf_at(p, k.node, self.lo_of(k.mask), size)
+            k.leaf = if leaf.empty { NONE } else { leaf.node }
+            let a = self.leaf_answered(k, leaf, p, inv, t, along: true)
+            return Stepped { x: a.x, y: a.y, walk: k }
         }
         let a = self.answered(k, p, inv, t, along: true, size: size)
         Stepped { x: a.x, y: a.y, walk: k }
@@ -588,6 +669,10 @@ impl<M: Field<Substance>, const W: u32> Asked for Seen<M, W> {
             // (Roots that hold nothing, from where they were fetched to where the walk now is:
             // its surface is not here, so it is never the nearer thing.)
             return 1.0e9
+        }
+        if W == CELLS && self.leaf_holds(walk, p, size) {
+            // (In the leaf the walk keeps, the brick a descent would find: read with none.)
+            return self.leaf_read(self.leaf_for(walk, p, size), p, vec3(1.0)).x
         }
         // (The root at `p` itself: a point between the ray's last two steps may lie in another
         // root than the walk's, whose mask or brick doesn't hold there; asked through the walk's,
@@ -608,7 +693,7 @@ impl<M: Field<Substance>, const W: u32> Asked for Seen<M, W> {
         let parts = W == WHOLE || W == MET || walk.node == HOLDS
         let mask = if W == WHOLE || W == MET { ALL } else { walk.mask }
         if W == CELLS && !parts {
-            grad = self.cells_facing(p, walk.node, self.lo_of(walk.mask), size)
+            grad = if self.leaf_holds(walk, p, size) { read_cells(self.cells, self.nodes[walk.leaf * NODE], self.leaf_lo(walk.leaf), self.grid.brick * exp2(-f32(self.nodes[walk.leaf * NODE + 3])), p).yzw } else { self.cells_facing(p, walk.node, self.lo_of(walk.mask), size) }
         }
         if parts && mask == ALL {
             grad = self.field.gradient(p)
@@ -708,15 +793,15 @@ impl<M: Field<Substance>> Asked for Rayed<M> {
         let box = box_span(o, d, g.lo, g.hi)
         let near = max(box.x, 0.0)
         if box.y < near {
-            return Begun { near: box.y, far: box.x - 1.0, walk: Within { exit: -1.0, node: NO_BRICK, mask: 0, steep: 1.0 } }
+            return Begun { near: box.y, far: box.x - 1.0, walk: Within { exit: -1.0, node: NO_BRICK, mask: 0, steep: 1.0, leaf: NONE } }
         }
         // (The parts its stretch through the box passes within their reach and half the ray's
         // widest width there.)
         let live = live_along(self.field, o + d * near, o + d * box.y, 0.5 * (wide + spread * box.y))
         if !live.any(0, self.field.parts()) {
-            return Begun { near: box.y, far: box.x - 1.0, walk: Within { exit: -1.0, node: NO_BRICK, mask: 0, steep: 1.0 } }
+            return Begun { near: box.y, far: box.x - 1.0, walk: Within { exit: -1.0, node: NO_BRICK, mask: 0, steep: 1.0, leaf: NONE } }
         }
-        Begun { near: box.x, far: box.y, walk: Within { exit: box.y, node: HOLDS, mask: live.word(), steep: g.stated } }
+        Begun { near: box.x, far: box.y, walk: Within { exit: box.y, node: HOLDS, mask: live.word(), steep: g.stated, leaf: NONE } }
     }
 
     fn step(self, walk: Within, p: vec3, d: vec3, inv: vec3, t: f32, size: f32) -> Stepped<Within> {
