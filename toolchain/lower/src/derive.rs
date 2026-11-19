@@ -21,6 +21,7 @@ pub(crate) fn call(
 ) -> Option<ir::ValueId> {
     let kind = match lang {
         Lang::IntervalOf => DeriveKind::Interval,
+        Lang::AffineOf => DeriveKind::Affine,
         Lang::Precision => DeriveKind::Precision,
         Lang::Filtered => DeriveKind::Filtered,
         Lang::LiftGradient | Lang::LiftJacobian => DeriveKind::Literals,
@@ -37,7 +38,9 @@ pub(crate) fn call(
         return None;
     };
     let (input, output) = match kind {
-        DeriveKind::Interval | DeriveKind::Precision => (substs[0], substs.get(1).copied()),
+        DeriveKind::Interval | DeriveKind::Affine | DeriveKind::Precision => {
+            (substs[0], substs.get(1).copied())
+        }
         DeriveKind::Filtered => (substs[0], None),
         // `gradient<const N>`: the literals' type and the result's are the call's.
         DeriveKind::Literals => {
@@ -177,7 +180,7 @@ pub(crate) fn signature(cx: &mut Cx, mb: &mut ModuleBuilder, key: &InstanceKey) 
         }
         // `input` is the tape's type.
         DeriveKind::Tape => ir::Function::new("tape", params, x),
-        DeriveKind::Interval | DeriveKind::Precision => {
+        DeriveKind::Interval | DeriveKind::Affine | DeriveKind::Precision => {
             let (bt, it) = box_types(cx, mb, *input, *output, span);
             if let Some(bt) = bt {
                 params.push(ir::Param::value("over", bt));
@@ -279,6 +282,7 @@ pub(crate) fn build_next(cx: &mut Cx, mb: &mut ModuleBuilder) {
         let at = mb.callers.get(&p.id).map(|c| c.1);
         let what = match &p.key {
             InstanceKey::Derived { kind: DeriveKind::Interval, .. } => "its interval",
+            InstanceKey::Derived { kind: DeriveKind::Affine, .. } => "its affine form",
             InstanceKey::Derived { kind: DeriveKind::Filtered, .. } => "its filtered value",
             InstanceKey::Derived { kind: DeriveKind::Tape, .. } => "its tape",
             _ => "its gradient",
@@ -464,19 +468,17 @@ fn build(
                 )),
             }
         }
-        DeriveKind::Interval => {
+        DeriveKind::Interval | DeriveKind::Affine => {
             let sig = &mb.m.functions[id.index()];
             let ncap = (sig.params.len() as u32).saturating_sub(1);
+            let derive = match kind {
+                DeriveKind::Affine => ir::derive::affine,
+                _ => ir::derive::interval,
+            };
             match (sig.params.last().map(|p| p.ty), sig.ret) {
-                (Some(box_ty), Some(interval_ty)) => ir::derive::interval(
-                    &mut mb.m,
-                    &mut mb.derived,
-                    inner,
-                    ncap,
-                    target,
-                    box_ty,
-                    interval_ty,
-                ),
+                (Some(box_ty), Some(interval_ty)) => {
+                    derive(&mut mb.m, &mut mb.derived, inner, ncap, target, box_ty, interval_ty)
+                }
                 _ => Err(ir::Error::internal("an interval's signature has no box or no result")),
             }
         }

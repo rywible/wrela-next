@@ -36,6 +36,8 @@ pub enum DeriveKind {
     ValueAndGradient,
     /// The interval over a box.
     Interval,
+    /// The affine form's range over a box, intersected with the interval (`std::derive::affine`).
+    Affine,
     /// A precision report over a box (`std::derive::precision`, `wrela precision`): nothing.
     Precision,
     /// The value box-filtered over a footprint (`filtered`): `f32`.

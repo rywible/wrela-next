@@ -8,6 +8,7 @@
 //! counts) costs nothing extra; only the arithmetic on the input's path is transformed.
 
 pub mod ad;
+mod affine;
 mod exits;
 pub mod interval;
 pub mod literal;
@@ -41,6 +42,13 @@ pub struct DeriveCache {
     /// The intervals being built, outermost first, and whether the call that asked for each
     /// runs under a branch on the input.
     building: Vec<(FuncId, Vec<Bits>, bool)>,
+    /// Affine forms ([`affine`]) by the function, its active parameters and its axes.
+    affine: HashMap<(FuncId, Vec<Bits>, u8), FuncId>,
+    /// The affine forms being built, for a recursion to be refused.
+    affine_open: Vec<(FuncId, Vec<Bits>, u8)>,
+    /// A function of one operation, made for an affine form to take the plain interval's rule
+    /// for it, by the operation and its types.
+    affine_ops: HashMap<String, FuncId>,
 }
 
 /// A function of `f`'s captures and `x` (its last parameter) returning `(f32, X)`: `f(x)` and
@@ -107,6 +115,22 @@ pub fn interval(
     interval_ty: TypeId,
 ) -> Result<FuncId> {
     interval::interval(m, cache, f, ncap, target, (box_ty, interval_ty), None)
+}
+
+/// As [`interval`], for an `f` that returns an `f32`: the range of `f`'s affine form over the
+/// box (first order, one error term), intersected with the interval's. Tighter where `f` is
+/// smooth over the box, by as much as the box is small; never looser. Sound as the target rounds,
+/// as the interval is. A function the form can't follow gets the interval.
+pub fn affine(
+    m: &mut Module,
+    cache: &mut DeriveCache,
+    f: FuncId,
+    ncap: u32,
+    target: Target,
+    box_ty: TypeId,
+    interval_ty: TypeId,
+) -> Result<FuncId> {
+    affine::affine(m, cache, f, ncap, target, (box_ty, interval_ty))
 }
 
 /// A function of `f`'s captures and a box (as [`interval`]'s) that returns nothing: it runs the

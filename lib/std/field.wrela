@@ -15,7 +15,7 @@
 // name, so a tool can say what a point belongs to without knowing what made the surface.
 
 use std::collections::Vec
-use std::derive::{Box3, Interval, UNBOUNDED_WORK, gradient, interval, plus_work, reads_only_input, tape, value_and_gradient, work}
+use std::derive::{Box3, Interval, UNBOUNDED_WORK, affine, gradient, interval, plus_work, reads_only_input, tape, value_and_gradient, work}
 use std::stage::Tape
 use std::quat::Quat
 use std::hash::{StateHash, pcg, state_hash}
@@ -230,11 +230,13 @@ pub trait Surface: Copy + GpuData {
     // ---- over a box: its range, and the parts that can matter there (§20.4) ----
 
     /// The range of its distance over `over`, and of its gradient's components: both derived
-    /// by the compiler from the surface as written (`std::derive::interval`, nested with
-    /// `gradient` for the second), so nothing is stated by hand. Sound as the target rounds.
+    /// by the compiler from the surface as written, so nothing is stated by hand. The distance's
+    /// is its affine form's range intersected with its interval's (`std::derive::affine`), which
+    /// closes on the true range as the box shrinks; the gradient's is the interval of the
+    /// gradient (`std::derive::interval` nested with `gradient`). Sound as the target rounds.
     fn range(self, over: Box3) -> FieldRange {
         FieldRange {
-            value: interval(|q: vec3| self.distance(q), over),
+            value: affine(|q: vec3| self.distance(q), over),
             gradient: interval(|q: vec3| gradient(|r: vec3| self.distance(r), q), over),
         }
     }
@@ -4994,6 +4996,90 @@ fn parted_body() -> Warp<SmoothUnion<SmoothUnionAll<RoundCone, 17>, RoundCone>, 
     }
     let wand = round_cone(vec3(-0.42, 0.87, -0.04), vec3(-0.5, 1.05, 0.26), r_top: 0.005, r_bottom: 0.005)
     parts.smooth_union(k: 0.03).smooth_union(wand, k: 0.004).translate(vec3(1.0, 0.0, -2.0))
+}
+
+/// The box sides `range`'s soundness is checked at: a metre, the engine's middle level, and
+/// the two finest a march asks.
+const RANGE_SIDES: [f32; 4] = [1.0, 0.12, 0.008, 0.001]
+
+/// Checks `range`'s distance range on `s` over boxes of each of `RANGE_SIDES` centred on
+/// `s`'s surface (points of space walked onto it by two Newton steps): every box's corners and
+/// 56 more samples are inside it, and it is never wider than the plain interval. How many of the
+/// 48 boxes 8 mm and smaller it is within a quarter again of the samples' own spread on.
+fn affine_holds<S: Surface>(s: S, space: Box3, name: Text) -> u32 {
+    var narrower = 0
+    for side in RANGE_SIDES {
+        for i in 0..24 {
+            var c = space.sample(11, i)
+            for step in 0..2 {
+                let (d, g) = value_and_gradient(|q: vec3| s.distance(q), c)
+                c = c - g * (d / max(dot(g, g), 1.0e-6))
+            }
+            let b = Box3 { lo: c - vec3(0.5 * side), hi: c + vec3(0.5 * side) }
+            let r = s.range(b).value
+            let x = interval(|q: vec3| s.distance(q), b)
+            assert(x.lo <= r.lo && r.hi <= x.hi, f"{name}: wider than the interval, side {side}")
+            var least = 1.0e30
+            var most = -1.0e30
+            for j in 0..64 {
+                let p = if j < 8 {
+                    vec3(
+                        if (j & 1) == 0 { b.lo.x } else { b.hi.x },
+                        if (j & 2) == 0 { b.lo.y } else { b.hi.y },
+                        if (j & 4) == 0 { b.lo.z } else { b.hi.z },
+                    )
+                } else {
+                    b.sample(13, j + 64 * i)
+                }
+                let d = s.distance(p)
+                least = min(least, d)
+                most = max(most, d)
+                assert(
+                    r.lo <= d && d <= r.hi,
+                    f"{name}: {d} outside [{r.lo}, {r.hi}], side {side}, at ({p.x}, {p.y}, {p.z})",
+                )
+            }
+            if side < 0.01 && r.hi - r.lo <= 1.25 * (most - least) {
+                narrower += 1
+            }
+        }
+    }
+    narrower
+}
+
+/// `range`'s distance range, the affine form intersected with the interval, holds every sample
+/// of its box for each std kind alone and for the blob and the body, at every side; and on the
+/// smooth kinds, at 8 mm and 1 mm, it is within a quarter again of the samples' spread on most
+/// boxes (where the round cone's plain interval is not).
+@test
+fn affine_ranges_hold_every_sample_for_each_kind() {
+    let space = Box3 { lo: vec3(-1.0), hi: vec3(1.0) }
+    let q = Quat::axis_angle(normalize(vec3(1.0, 2.0, 0.5)), 0.7)
+    let cone = round_cone(vec3(-0.6, -0.3, 0.1), vec3(0.1, 0.4, -0.2), r_top: 0.15, r_bottom: 0.35)
+    let box = cuboid(vec3(0.4, 0.3, 0.2))
+    let egg = ellipsoid(vec3(0.3, 0.5, 0.4))
+    let n_sphere = affine_holds(sphere(0.6), space, "sphere")
+    let n_egg = affine_holds(egg, space, "ellipsoid")
+    let n_cone = affine_holds(cone, space, "round cone")
+    affine_holds(box, space, "cuboid")
+    affine_holds(half_space(normalize(vec3(0.1, 1.0, 0.05)), 0.7), space, "half space")
+    affine_holds(sphere(0.6).translate(vec3(0.5, 0.0, 0.0)), space, "translate")
+    affine_holds(box.rotate(q), space, "rotate")
+    affine_holds(egg.scale(1.5), space, "scale")
+    affine_holds(sphere(0.6).union(cone), space, "union")
+    affine_holds(box.intersect(sphere(0.45)), space, "intersect")
+    let n_smooth = affine_holds(sphere(0.6).smooth_union(cone, k: 0.3), space, "smooth union")
+    affine_holds(cone.smooth_subtract(box, k: 0.1), space, "smooth subtract")
+    affine_holds(egg.smooth_intersect(sphere(0.4), k: 0.05), space, "smooth intersect")
+    let n_noise = affine_holds(sphere(0.6).displace(fbm(4.0, 3), amp: 0.02), space, "displace")
+    affine_holds(test_blob(), space, "the blob")
+    let body = parted_body()
+    let bb = body.bound()
+    let near = Box3 { lo: bb.centre - vec3(bb.radius), hi: bb.centre + vec3(bb.radius) }
+    affine_holds(body, near, "the body")
+    for (n, name) in [(n_sphere, "sphere"), (n_egg, "ellipsoid"), (n_cone, "round cone"), (n_smooth, "smooth union"), (n_noise, "displace")] {
+        assert(n >= 36, f"{name}: only {n} of 48 small boxes as tight as their samples")
+    }
 }
 
 /// Along a segment, the parts it can come near (`live_along`) give a distance never below the

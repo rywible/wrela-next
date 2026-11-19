@@ -155,7 +155,7 @@ pub(super) fn interval(
 /// active ones as their `lo`, followed by a `hi` for each active one; it returns
 /// `range<T> { lo, hi }` when its result is active. `speculative`: the call runs under a branch
 /// on the input.
-fn derive(
+pub(super) fn derive(
     m: &mut Module,
     cache: &mut DeriveCache,
     f: FuncId,

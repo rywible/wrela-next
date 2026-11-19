@@ -1,0 +1,326 @@
+// A field's distance range over a box (`std::derive::affine`, the affine form intersected with
+// the plain interval: `Surface::range`'s value) holds every sample of the box: each std kind alone
+// and the engine's three fields (the stack, the creature, the stage, as backend item J measured
+// them), at boxes of 1 m, 12 cm, 8 mm and 1 mm centred on each surface, on the CPU (through
+// `range`) and in a kernel (through `affine` itself: `range`'s gradient half is the plain
+// interval's, unchanged, and would make the stack's invocation too long for the GPU guard), on both
+// hosts.
+use std::cmp::Eq
+use std::collections::Vec
+use std::derive::{Box3, affine, value_and_gradient}
+use std::field::{Bound, Cuboid, RoundCone, SmoothUnion, SmoothUnionAll, Sphere, Surface, Translate, Union, With, cuboid, ellipsoid, fbm, half_space, hash_u32, round_cone, sphere, value_noise}
+use std::gpu::{GlobalId, GpuBuffer, GpuSpan, Slots, buffer, buffer_of, dispatch, read}
+use std::hash::StateHash
+use std::io::Pending
+use std::quat::Quat
+
+/// Boxes per side and field.
+const BOXES: u32 = 96
+
+/// The box sides checked: a metre, the engine's middle level, the two finest a march asks.
+const SIDES: [f32; 4] = [1.0, 0.12, 0.008, 0.001]
+
+/// The fields checked, in the order their results sit in the buffer.
+const FIELDS: u32 = 19
+
+/// Value noise in [0, 1] (std's, the same bits on the CPU and the GPU).
+fn n01(p: vec3) -> f32 {
+    0.5 + 0.5 * value_noise(p)
+}
+
+/// A number from `seed` and `k` in [0, 1), the same on every machine. (The old code's
+/// `fract(sin(seed * 12.9898 + k * 78.233) * 43758.547)` drew a different stack on the Radeon from
+/// the M4's: `sin` of a large number is rounded differently by each GPU, and the hash multiplies
+/// the difference forty thousand times. Filed as a gap.)
+fn pick(seed: f32, k: f32) -> f32 {
+    f32(hash_u32(u32(seed * 1000.0) * 131 + u32(k)) >> 8) * (1.0 / 16777216.0)
+}
+
+/// How far under the sea a stack's foot reaches (m).
+const FOOT: f32 = 6.0
+
+/// The most its gradient reaches (its lobes, crown and crags, its rough faces), with a margin.
+/// Not proved: stated, as std's `Surface` asks of a field it can't derive.
+const STEEPEST: f32 = 3.5
+
+/// A stack `girth` m round at its foot and `tall` m high, from its seed.
+pub struct Pillar: Copy + GpuData + Eq + StateHash {
+    pub girth: f32,
+    pub tall: f32,
+    pub seed: f32,
+    pub spare: f32,
+}
+
+impl Surface for Pillar {
+    fn distance(self, q: vec3) -> f32 {
+        let r = self.girth
+        let tall = self.tall
+        let seed = self.seed
+        let lean = vec2(pick(seed, 1.0) - 0.5, pick(seed, 2.0) - 0.5) * 0.22
+        let v = q.xz - lean * max(q.y, 0.0)
+        let rv = length(v)
+        let dir = v / max(rv, 1.0e-3)
+        let up = clamp(q.y / tall, 0.0, 1.0)
+        let lobe = 1.0 + 0.36 * (n01(vec3(dir.x * 1.3 + seed, dir.y * 1.3, q.y * 0.012)) - 0.5) +
+            0.16 * (n01(vec3(dir.x * 2.9 + seed * 2.0, dir.y * 2.9, q.y * 0.035 + 7.0)) - 0.5)
+        let hard = smoothstep(0.55, 0.8, n01(vec3(q.y * 0.22, seed * 1.7, 0.5)))
+        let lip = 1.0 + 0.06 * hard
+        let nq = (q.y - 2.2) / 2.2
+        let notch = 1.0 - 0.26 * exp(-(nq * nq))
+        let girth = r * lobe * lip * (1.0 - 0.35 * up) * notch
+        let tilt = vec2(pick(seed, 3.0) - 0.5, pick(seed, 4.0) - 0.5) * 0.6
+        let crags = n01(vec3(dir.x * 2.4 + seed * 3.0, dir.y * 2.4, 3.0)) * tall * 0.16
+        let crown = tall - dot(v, tilt) - 0.15 * rv - crags
+        let rough = (n01(q * 0.16 + vec3(seed)) - 0.5) * 2.4 +
+            (n01(q * 0.4 + vec3(seed * 2.0)) - 0.5) * 0.9
+        let shell = max(rv - girth, max(q.y - crown, -q.y - FOOT))
+        shell + rough * smoothstep(8.0, 0.0, abs(shell))
+    }
+
+    /// A sphere round its widest (its lobes and ledges at most 1.26 × 1.06 its girth, leant as
+    /// far as any leans, 0.11 a metre up, roughened 1.2 m) and its foot.
+    fn bound(self) -> Bound {
+        let wide = self.girth * 1.34 + 0.11 * self.tall + 1.2
+        let lo = -FOOT - 1.2
+        let hi = self.tall * 1.05 + 1.2
+        let half = vec2(wide, 0.5 * (hi - lo))
+        Bound { centre: vec3(0.0, 0.5 * (hi + lo), 0.0), radius: length(half), slope: 0.5 }
+    }
+
+    fn lipschitz(self, near: f32) -> f32 {
+        STEEPEST
+    }
+}
+
+pub type Body = SmoothUnion<With<SmoothUnionAll<RoundCone, 17>, vec3>, With<RoundCone, vec3>>
+
+/// The engine's creature at rest (as toolchain/tests/masked).
+fn body() -> Body {
+    let parts = [
+        round_cone(vec3(0.0, 0.5694, -0.0258), vec3(0.0, 0.7866, 0.0042), r_top: 0.102, r_bottom: 0.096),
+        round_cone(vec3(0.0, 0.7866, 0.0042), vec3(0.0, 0.912, -0.0246), r_top: 0.096, r_bottom: 0.06),
+        round_cone(vec3(0.0, 1.02, 0.0018), vec3(0.0, 1.056, 0.0078), r_top: 0.15, r_bottom: 0.138),
+        round_cone(vec3(0.1272, 0.873, -0.039), vec3(0.2778, 0.873, -0.0438), r_top: 0.039, r_bottom: 0.0348),
+        round_cone(vec3(0.2778, 0.873, -0.0438), vec3(0.4236, 0.873, -0.039), r_top: 0.0348, r_bottom: 0.03),
+        round_cone(vec3(0.4236, 0.873, -0.039), vec3(0.4932, 0.8706, -0.03), r_top: 0.03, r_bottom: 0.027),
+        round_cone(vec3(0.0684, 0.5826, -0.0216), vec3(0.0684, 0.3252, -0.0216), r_top: 0.054, r_bottom: 0.0432),
+        round_cone(vec3(0.0684, 0.3252, -0.0216), vec3(0.0684, 0.0516, -0.0528), r_top: 0.0432, r_bottom: 0.0336),
+        round_cone(vec3(0.0684, 0.0516, -0.0528), vec3(0.0684, 0.009, 0.033), r_top: 0.0336, r_bottom: 0.0276),
+        round_cone(vec3(0.078, 1.14, 0.0018), vec3(0.12, 1.272, -0.0102), r_top: 0.03, r_bottom: 0.0075),
+        round_cone(vec3(-0.1272, 0.873, -0.039), vec3(-0.2778, 0.873, -0.0438), r_top: 0.039, r_bottom: 0.0348),
+        round_cone(vec3(-0.2778, 0.873, -0.0438), vec3(-0.4236, 0.873, -0.039), r_top: 0.0348, r_bottom: 0.03),
+        round_cone(vec3(-0.4236, 0.873, -0.039), vec3(-0.4932, 0.8706, -0.03), r_top: 0.03, r_bottom: 0.027),
+        round_cone(vec3(-0.0684, 0.5826, -0.0216), vec3(-0.0684, 0.3252, -0.0216), r_top: 0.054, r_bottom: 0.0432),
+        round_cone(vec3(-0.0684, 0.3252, -0.0216), vec3(-0.0684, 0.0516, -0.0528), r_top: 0.0432, r_bottom: 0.0336),
+        round_cone(vec3(-0.0684, 0.0516, -0.0528), vec3(-0.0684, 0.009, 0.033), r_top: 0.0336, r_bottom: 0.0276),
+        round_cone(vec3(-0.078, 1.14, 0.0018), vec3(-0.12, 1.272, -0.0102), r_top: 0.03, r_bottom: 0.0075),
+    ]
+    let wand = round_cone(vec3(-0.4236, 0.873, -0.039), vec3(-0.4956, 1.053, 0.261), r_top: 0.00504, r_bottom: 0.00504)
+    parts.smooth_union(k: 0.03).with(vec3(0.42, 0.28, 0.16)).smooth_union(wand.with(vec3(0.22, 0.13, 0.07)), k: 0.004)
+}
+
+
+pub const TALL_STACK = Pillar { girth: 11.0, tall: 44.0, seed: 12.7, spare: 0.0 }
+
+pub type Stage = Union<Union<Translate<Cuboid>, Translate<Cuboid>>, Translate<Sphere>>
+
+fn stage() -> Stage {
+    let ground = cuboid(vec3(8.0, 0.25, 8.0)).translate(vec3(0.0, -0.25, 0.0))
+    let wall = cuboid(vec3(3.0, 1.5, 0.1)).translate(vec3(0.0, 1.5, 0.0))
+    let ball = sphere(1.0).translate(vec3(-4.5, 1.0, 3.0))
+    ground.union(wall).union(ball)
+}
+
+
+fn turn() -> Quat {
+    Quat::axis_angle(normalize(vec3(1.0, 2.0, 0.5)), 0.7)
+}
+
+fn cone() -> RoundCone {
+    round_cone(vec3(-0.6, -0.3, 0.1), vec3(0.1, 0.4, -0.2), r_top: 0.15, r_bottom: 0.35)
+}
+
+/// `BOXES` points on or near `s`'s surface: points of `space` walked onto it by three Newton
+/// steps.
+fn centres<S: Surface>(s: S, space: Box3, into: mut Vec<vec3>) {
+    for i in 0..BOXES {
+        var c = space.sample(11, i)
+        for _step in 0..3 {
+            let (d, g) = value_and_gradient(|q: vec3| s.distance(q), c)
+            c = c - g * (d / max(dot(g, g), 1.0e-6))
+        }
+        into.push(c)
+    }
+}
+
+/// The region round a bound's sphere that centres are drawn from.
+fn around(b: Bound) -> Box3 {
+    Box3 { lo: b.centre - vec3(b.radius), hi: b.centre + vec3(b.radius) }
+}
+
+/// Box `i` of `SIDES[side]` about `c`, and its sample `j`: its 8 corners, then 56 more.
+fn sample(b: Box3, i: u32, j: u32) -> vec3 {
+    if j < 8 {
+        vec3(
+            if (j & 1) == 0 { b.lo.x } else { b.hi.x },
+            if (j & 2) == 0 { b.lo.y } else { b.hi.y },
+            if (j & 4) == 0 { b.lo.z } else { b.hi.z },
+        )
+    } else {
+        b.sample(13, j + 64 * i)
+    }
+}
+
+/// One box's check: its distance range's ends (`range`'s, or with `bare` the affine form's
+/// alone), how many of its 64 samples fall outside, and the samples' spread.
+fn check<S: Surface>(s: S, c: vec3, side: f32, i: u32, bare: bool) -> vec4 {
+    let b = Box3 { lo: c - vec3(0.5 * side), hi: c + vec3(0.5 * side) }
+    let r = if bare { affine(|q: vec3| s.distance(q), b) } else { s.range(b).value }
+    var outside = 0.0
+    var least = 1.0e30
+    var most = -1.0e30
+    for j in 0..64 {
+        let d = s.distance(sample(b, i, j))
+        if d < r.lo || d > r.hi {
+            outside += 1.0
+        }
+        least = min(least, d)
+        most = max(most, d)
+    }
+    vec4(r.lo, r.hi, outside, most - least)
+}
+
+/// Every box of every side for one field, its results from `base` on.
+@compute(64)
+fn ranges<S: Surface>(s: S, centres: GpuSpan<vec3>, out: mut Slots<vec4>, id: GlobalId) {
+    if id.x >= 4 * BOXES {
+        return
+    }
+    let side = SIDES[id.x / BOXES]
+    let i = id.x % BOXES
+    out[id] = check(s, centres[i], side, i, bare: true)
+}
+
+pub struct State {
+    frame: u32,
+    centres: Vec<GpuBuffer<vec3>>,
+    outs: Vec<GpuBuffer<vec4>>,
+    pending: Vec<Pending<vec4>>,
+    seen: Vec<Vec<vec4>>,
+}
+
+/// Every field's centres, in `FIELDS`' order.
+fn all_centres() -> Vec<vec3> {
+    let space = Box3 { lo: vec3(-1.0), hi: vec3(1.0) }
+    let q = turn()
+    let box = cuboid(vec3(0.4, 0.3, 0.2))
+    let egg = ellipsoid(vec3(0.3, 0.5, 0.4))
+    var c: Vec<vec3> = Vec::new()
+    centres(sphere(0.6), space, mut c)
+    centres(egg, space, mut c)
+    centres(cone(), space, mut c)
+    centres(box, space, mut c)
+    centres(half_space(normalize(vec3(0.1, 1.0, 0.05)), 0.7), space, mut c)
+    centres(sphere(0.6).translate(vec3(0.5, 0.0, 0.0)), space, mut c)
+    centres(box.rotate(q), space, mut c)
+    centres(egg.scale(1.5), space, mut c)
+    centres(sphere(0.6).union(cone()), space, mut c)
+    centres(box.intersect(sphere(0.45)), space, mut c)
+    centres(sphere(0.6).smooth_union(cone(), k: 0.3), space, mut c)
+    centres(cone().smooth_subtract(box, k: 0.1), space, mut c)
+    centres(egg.smooth_intersect(sphere(0.4), k: 0.05), space, mut c)
+    centres(sphere(0.6).displace(fbm(4.0, 3), amp: 0.02), space, mut c)
+    centres(TALL_STACK, around(TALL_STACK.bound()), mut c)
+    centres(body(), around(body().bound()), mut c)
+    centres(stage(), around(stage().bound()), mut c)
+    centres(sphere(0.6).displace(fbm(4.0, 3), amp: 0.02).smooth_union(cone(), k: 0.2), space, mut c)
+    centres(body().translate(vec3(0.3, 0.0, -0.2)).rotate(q), around(body().bound()), mut c)
+    c
+}
+
+pub fn init() -> State {
+    let all = all_centres()
+    var centres: Vec<GpuBuffer<vec3>> = Vec::new()
+    var outs: Vec<GpuBuffer<vec4>> = Vec::new()
+    for f in 0..FIELDS {
+        var c: Vec<vec3> = Vec::new()
+        for i in 0..BOXES {
+            c.push(all[f * BOXES + i])
+        }
+        centres.push(buffer_of(c))
+        outs.push(buffer(4 * BOXES))
+    }
+    State { frame: 0, centres: centres, outs: outs, pending: Vec::new(), seen: Vec::new() }
+}
+
+/// Dispatches `ranges` for one field, the `f`th.
+fn run<S: Surface>(s: S, f: u32, st: mut State) {
+    dispatch(ranges.bind(s: s, centres: st.centres[f].items(), out: mut st.outs[f]), over: 4 * BOXES)
+    st.pending.push(read(st.outs[f].items()))
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    if s.frame == 0 {
+        let q = turn()
+        let box = cuboid(vec3(0.4, 0.3, 0.2))
+        let egg = ellipsoid(vec3(0.3, 0.5, 0.4))
+        run(sphere(0.6), 0, mut s)
+        run(egg, 1, mut s)
+        run(cone(), 2, mut s)
+        run(box, 3, mut s)
+        run(half_space(normalize(vec3(0.1, 1.0, 0.05)), 0.7), 4, mut s)
+        run(sphere(0.6).translate(vec3(0.5, 0.0, 0.0)), 5, mut s)
+        run(box.rotate(q), 6, mut s)
+        run(egg.scale(1.5), 7, mut s)
+        run(sphere(0.6).union(cone()), 8, mut s)
+        run(box.intersect(sphere(0.45)), 9, mut s)
+        run(sphere(0.6).smooth_union(cone(), k: 0.3), 10, mut s)
+        run(cone().smooth_subtract(box, k: 0.1), 11, mut s)
+        run(egg.smooth_intersect(sphere(0.4), k: 0.05), 12, mut s)
+        run(sphere(0.6).displace(fbm(4.0, 3), amp: 0.02), 13, mut s)
+        run(TALL_STACK, 14, mut s)
+        run(body(), 15, mut s)
+        run(stage(), 16, mut s)
+        run(sphere(0.6).displace(fbm(4.0, 3), amp: 0.02).smooth_union(cone(), k: 0.2), 17, mut s)
+        run(body().translate(vec3(0.3, 0.0, -0.2)).rotate(q), 18, mut s)
+    }
+    for i in 0..s.pending.len() {
+        if s.seen.len() == i {
+            if let Some(Ok(v)) = s.pending[i].poll() {
+                s.seen.push(take v)
+            }
+        }
+    }
+    s.frame += 1
+}
+
+/// In GPU code, every field's range holds all 64 samples of every box, at every side.
+@test(frames: 8, gpu: true, hosts: both)
+fn a_range_holds_every_sample_in_gpu_code(s: State) {
+    // The fields, in order: sphere, ellipsoid, round cone, cuboid, half space, translate,
+    // rotate, scale, union, intersect, smooth union, smooth subtract, smooth intersect,
+    // displace, the stack, the creature, the stage, displaced and blended, the creature moved.
+    assert(s.seen.len() == FIELDS)
+    for f in 0..FIELDS {
+        for k in 0..4 * BOXES {
+            let v = s.seen[f][k]
+            assert(v.z == 0.0, f"field {f}: {v.z} samples outside [{v.x}, {v.y}], side {SIDES[k / BOXES]}, box {k % BOXES}")
+        }
+    }
+}
+
+/// On the CPU, the engine's three fields' ranges hold all 64 samples of every box, at every side.
+@test
+fn a_range_holds_every_sample_on_the_engines_fields() {
+    let c = all_centres()
+    for side in 0..4 {
+        for i in 0..BOXES {
+            let a = check(TALL_STACK, c[14 * BOXES + i], SIDES[side], i, bare: false)
+            assert(a.z == 0.0, f"the stack: {a.z} samples outside [{a.x}, {a.y}], side {SIDES[side]}")
+            let b = check(body(), c[15 * BOXES + i], SIDES[side], i, bare: false)
+            assert(b.z == 0.0, f"the creature: {b.z} samples outside [{b.x}, {b.y}], side {SIDES[side]}")
+            let d = check(stage(), c[16 * BOXES + i], SIDES[side], i, bare: false)
+            assert(d.z == 0.0, f"the stage: {d.z} samples outside [{d.x}, {d.y}], side {SIDES[side]}")
+        }
+    }
+}

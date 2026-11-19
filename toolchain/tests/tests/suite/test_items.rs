@@ -897,6 +897,17 @@ fn a_written_field_is_its_compiled_tree_on_the_gpu() {
     assert_eq!(crate::tests_pass(&dir), 1);
 }
 
+/// A field's distance range over a box (`std::derive::affine`, `Surface::range`'s value,
+/// toolchain/tests/affine) holds every sample of every box, each std kind alone and the engine's
+/// stack, creature and stage, at 1 m, 12 cm, 8 mm and 1 mm: in a kernel on both hosts, and through
+/// `range` on the CPU.
+#[test]
+#[ignore = "needs a GPU"]
+fn an_affine_range_holds_every_sample_in_gpu_code() {
+    let dir = wrela_tests::repo_root().join("toolchain/tests/affine");
+    assert_eq!(crate::tests_pass(&dir), 2);
+}
+
 /// A kind's things in GPU code (toolchain/tests/kinds, gap 29): a group built in a kernel from a
 /// thing's field read in place and a run of a shared buffer (`GpuSpan::sub`), passed to generic
 /// functions and a run of the run passed on, reads what the direct reads do, to the bit, on both
