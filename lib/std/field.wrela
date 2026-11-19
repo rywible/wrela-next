@@ -3261,6 +3261,11 @@ pub struct Written: Copy + GpuData {
     parent: [u32; 64],
     /// Each node's place in the tree (`W_UNDER_CUT`, `W_UNDER_UNION`), made at the door.
     under: [u32; 64],
+    /// Its folds (made at the door): a chain of two or more smooth unions of one width, each
+    /// the first operand of the next, is a fold of its operands, answered as std's n-ary fold
+    /// (`SmoothUnionAll`) answers: at its top, how many parts it has; at each other link,
+    /// `W_FOLD_LINK`; elsewhere 0.
+    fold: [u32; 64],
     /// A rotation's matrix into its operand's space, made from its quaternion at the door.
     turns: [mat3; 64],
     /// The whole's bound, made once at the door.
@@ -3429,7 +3434,33 @@ pub fn written_of(nodes: [WrittenNode; 64], len: u32, full: bool) -> Result<Writ
             under[i2] = under[pa] | cut | union
         }
     }
-    var w = Written { nodes, len, up, parent, under, turns, whole: UNBOUNDED, leaves }
+    // Folds: how many links of one width end at each smooth union, then each chain of two or
+    // more from its top down.
+    var links = [0; 64]
+    var fold = [0; 64]
+    for i in 0..len {
+        let n = nodes[i]
+        if n.kind == W_SMOOTH_UNION {
+            let a = nodes[n.a]
+            links[i] = if a.kind == W_SMOOTH_UNION && a.p.x == n.p.x { links[n.a] + 1 } else { 1 }
+        }
+    }
+    var i3 = len
+    while i3 > 0 {
+        i3 -= 1
+        if links[i3] >= 2 && fold[i3] == 0 {
+            fold[i3] = links[i3] + 1
+            var j = nodes[i3].a
+            for _k in 0..WRITTEN_NODES {
+                if links[j] == 0 || nodes[j].p.x != nodes[i3].p.x {
+                    break
+                }
+                fold[j] = W_FOLD_LINK
+                j = nodes[j].a
+            }
+        }
+    }
+    var w = Written { nodes, len, up, parent, under, fold, turns, whole: UNBOUNDED, leaves }
     w.whole = w.bound_of()
     Ok(w)
 }
@@ -3453,6 +3484,26 @@ fn written_map_work(kind: u32) -> u32 {
         work(|n: WrittenNode| Size { by: n.p.x }.local(n.q.xyz))
     }
     plus_work(walk, own)
+}
+
+/// `Written::fold`'s mark of a fold's link below its top.
+const W_FOLD_LINK: u32 = 1
+
+/// A written fold's `passes` while its links are walked (as `SmoothUnionAll::passes` walks its
+/// parts): the pass so far, the three nearest parts (their roots, passes' `t` and distances),
+/// how many parts, and the ray in the fold's space.
+struct WrittenFold: Copy {
+    p: Pass,
+    a: u32,
+    b: u32,
+    c: u32,
+    ta: f32,
+    tb: f32,
+    tc: f32,
+    db: f32,
+    dc: f32,
+    o: vec3,
+    d: vec3,
 }
 
 /// `Written::under`'s flag: an intersection or a cut is above the node.
@@ -3640,7 +3691,13 @@ impl Written {
                 let s = Size { by: m.p.x }
                 r = WrittenRay { o: s.local(r.o), d: s.local_direction(r.d), grow: s.distance_in(r.grow), inner: s.distance_in(r.inner) }
             } else if m.kind == W_SMOOTH_UNION {
-                r.grow = r.grow + 0.25 * max(m.p.x, 0.0)
+                // A fold grows its parts by its whole lowering, once, at its top.
+                let f = self.fold[a]
+                if f == 0 {
+                    r.grow = r.grow + 0.25 * max(m.p.x, 0.0)
+                } else if f != W_FOLD_LINK {
+                    r.grow = r.grow + fold_lowering(f, max(m.p.x, 0.0))
+                }
             } else if m.kind == W_DISPLACE {
                 let nr = Written::noise_of(m).range()
                 let reach = abs(m.p.x) * max(abs(nr.lo), abs(nr.hi))
@@ -3670,6 +3727,102 @@ impl Written {
             }
         }
         WRITTEN_NODES
+    }
+
+    /// A fold's walk taking its next part (rooted at node `root`, its pass `q`), as
+    /// `SmoothUnionAll::passes` takes each: a part whose bound's pass is no nearer than the third
+    /// nearest yet is passed over; else the three nearest are kept, and the pass joined.
+    fn fold_part(self, f: WrittenFold, root: u32, q: Pass) -> WrittenFold {
+        var g = f
+        if bound_passes(self.bound_within(root), f.o, f.d).distance >= f.dc {
+            return g
+        }
+        if q.distance < g.p.distance {
+            g.c = g.b
+            g.tc = g.tb
+            g.dc = g.db
+            g.b = g.a
+            g.tb = g.ta
+            g.db = g.p.distance
+            g.a = root
+            g.ta = q.t
+        } else if q.distance < g.db {
+            g.c = g.b
+            g.tc = g.tb
+            g.dc = g.db
+            g.b = root
+            g.tb = q.t
+            g.db = q.distance
+        } else if q.distance < g.dc {
+            g.c = root
+            g.tc = q.t
+            g.dc = q.distance
+        }
+        g.p = g.p.or(q)
+        g
+    }
+
+    /// The join of parts `a` and `b` (and `c`, with `three`) at `x` in the fold's space: `smin` of
+    /// their own distances, `k` wide (std's `seam_at`).
+    fn fold_seam(self, a: u32, b: u32, c: u32, three: bool, x: vec3, k: f32) -> f32 {
+        let ab = smin(self.distance_within(a, x), self.distance_within(b, x), k)
+        if three { smin(ab, self.distance_within(c, x), k) } else { ab }
+    }
+
+    /// A fold's pass once its `n` parts are walked (`top` its top link, `k` its width), as
+    /// `SmoothUnionAll::passes` finishes: in a seam near the surface, the least of the three
+    /// nearest parts' join along the ray (even samples and a golden-section search round the
+    /// least); then lowered by the fold's whole lowering and asked once there.
+    fn fold_done(self, f: WrittenFold, top: u32, n: u32, width: f32) -> Pass {
+        var p = f.p
+        let (o, d) = (f.o, f.d)
+        let k = max(width, 0.0)
+        if n > 1 && f.db - p.distance < k && p.distance < fold_lowering(n, k) + 0.25 * k {
+            let three = n > 2 && f.dc - p.distance < k
+            let pc = if three { f.c } else { f.b }
+            let first = min(f.ta, if three { min(f.tb, f.tc) } else { f.tb })
+            let last = max(f.ta, if three { max(f.tb, f.tc) } else { f.tb })
+            let w = last - first
+            let start = max(first - 0.25 * w, 0.0)
+            let step = (last + 0.25 * w - start) / f32(SEAM_SAMPLES - 1)
+            var best = start
+            var least = EMPTY
+            for i in 0..SEAM_SAMPLES {
+                let x = start + step * f32(i)
+                let v = self.fold_seam(f.a, f.b, pc, three, o + d * x, k)
+                if v < least {
+                    least = v
+                    best = x
+                }
+            }
+            var lo = max(best - step, 0.0)
+            var hi = best + step
+            let g = 0.618034
+            var x1 = hi - g * (hi - lo)
+            var x2 = lo + g * (hi - lo)
+            var f1 = self.fold_seam(f.a, f.b, pc, three, o + d * x1, k)
+            var f2 = self.fold_seam(f.a, f.b, pc, three, o + d * x2, k)
+            for i in 0..SEAM_STEPS {
+                if f1 < f2 {
+                    hi = x2
+                    x2 = x1
+                    f2 = f1
+                    x1 = hi - g * (hi - lo)
+                    f1 = self.fold_seam(f.a, f.b, pc, three, o + d * x1, k)
+                } else {
+                    lo = x1
+                    x1 = x2
+                    f1 = f2
+                    x2 = lo + g * (hi - lo)
+                    f2 = self.fold_seam(f.a, f.b, pc, three, o + d * x2, k)
+                }
+            }
+            let f0 = self.fold_seam(f.a, f.b, pc, three, o + d * f.ta, k)
+            let t = if min(f1, f2) >= min(f0, least) { if f0 <= least { f.ta } else { best } } else if f1 < f2 { x1 } else { x2 }
+            p = Pass { t, other: t, other_distance: EMPTY, ..p }
+        }
+        let q = p.lowered(fold_lowering(n, k), k)
+        q.asked(q.t, self.distance_within(top, o + d * q.t))
     }
 
     /// Leaf `i`'s own `meets_grown`, in its own space.
@@ -3948,8 +4101,15 @@ impl Surface for Written {
                 c = if kind == W_TRANSLATE { mapped_part_bound(Shift { by: m.p.xyz }, c) } else if kind == W_ROTATE { mapped_part_bound(Turn { to_local: self.turns[j] }, c) } else { mapped_part_bound(Size { by: m.p.x }, c) }
             } else if kind == W_SMOOTH_UNION {
                 let kk = max(m.p.x, 0.0)
-                c.reach += kk + 0.25 * kk
-                c.lowers += 0.25 * kk
+                let f = self.fold[j]
+                if f == 0 {
+                    c.reach += kk + 0.25 * kk
+                    c.lowers += 0.25 * kk
+                } else if f != W_FOLD_LINK {
+                    let l = fold_lowering(f, kk)
+                    c.reach += kk + l
+                    c.lowers += l
+                }
             } else if kind != W_UNION {
                 let b = self.bound_within(j)
                 c = PartBound { a: b.centre, r: b.radius, b: b.centre, reach: 0.0, lowers: 0.0 }
@@ -4186,7 +4346,7 @@ impl Surface for Written {
             } else if k >= W_UNION {
                 let (a, b) = (st[top - 2], st[top - 1])
                 top -= 1
-                st[top - 1] = if k == W_UNION {
+                st[top - 1] = if k == W_UNION || k == W_SMOOTH_UNION && self.fold[i] == W_FOLD_LINK {
                     a.or(b)
                 } else if k == W_SMOOTH_UNION {
                     a.or(b).loose()
@@ -4212,6 +4372,10 @@ impl Surface for Written {
     fn passes(self, o: vec3, d: vec3) -> Pass {
         var st = [bound_passes(UNBOUNDED, o, d); 16]
         var top: u32 = 0
+        // The folds being walked, innermost last (a fold's parts can hold folds of their own).
+        let none = WrittenFold { p: st[0], a: 0, b: 0, c: 0, ta: 0.0, tb: 0.0, tc: 0.0, db: EMPTY, dc: EMPTY, o, d }
+        var fs = [none; 16]
+        var ftop: u32 = 0
         for i in 0..min(self.len, WRITTEN_NODES) {
             let n = self.nodes[i]
             let k = n.kind
@@ -4239,6 +4403,24 @@ impl Surface for Written {
             } else if k >= W_UNION {
                 let (a, b) = (st[top - 2], st[top - 1])
                 top -= 1
+                let f = self.fold[i]
+                if k == W_SMOOTH_UNION && f != 0 {
+                    // A fold's link: its parts walked as std's fold walks them, the first two at
+                    // its first link; its top finishes it.
+                    if self.fold[n.a] != W_FOLD_LINK {
+                        let r = self.ray_at(i, o, d, grow: 0.0, inner: 0.0)
+                        fs[ftop] = WrittenFold { o: r.o, d: r.d, ..none }
+                        fs[ftop].p = pass_at(0.0, EMPTY, PASS_EXACT)
+                        ftop += 1
+                        fs[ftop - 1] = self.fold_part(fs[ftop - 1], n.a, a)
+                    }
+                    fs[ftop - 1] = self.fold_part(fs[ftop - 1], n.b, b)
+                    if f != W_FOLD_LINK {
+                        ftop -= 1
+                        st[top - 1] = self.fold_done(fs[ftop], i, f, n.p.x)
+                    }
+                    continue
+                }
                 st[top - 1] = if k == W_UNION {
                     a.or(b)
                 } else if k == W_SMOOTH_UNION {
@@ -6410,6 +6592,45 @@ fn a_reversed_smoothsteps_interval_holds_and_is_tight() {
     }
     let crossing = interval(|e: f32| smoothstep(e, 1.0, 0.5), Interval { lo: 0.0, hi: 2.0 })
     assert(crossing.lo <= 0.0 && crossing.hi >= 1.0, "edges whose ranges cross")
+}
+
+/// A written fold (a chain of smooth unions of one width, each the next's first operand) is
+/// answered as std's n-ary fold of the same parts: its `passes`, `meets` (grown too) and parts'
+/// bounds are `SmoothUnionAll`'s to the bit (a body's seven cones with a wand joined, moved).
+@test
+fn a_written_fold_is_std_s_fold() {
+    var w = writing()
+    var cones = [round_cone(vec3(), vec3(0.0, 1.0, 0.0), r_top: 0.05, r_bottom: 0.1); 7]
+    for i in 0..7 {
+        let a = f32(i) * 0.37
+        cones[i] = round_cone(vec3(0.12 * cos(a), 0.06 * f32(i), 0.12 * sin(a)), vec3(0.25 * cos(a), 0.06 * f32(i) + 0.12, 0.25 * sin(a)), r_top: 0.03, r_bottom: 0.045)
+        let n = w.round_cone(cones[i].a, cones[i].b, r_top: 0.03, r_bottom: 0.045, matter: 1)
+        if i > 0 {
+            let u = w.smooth_union(n - 1, n, 0.03)
+        }
+    }
+    let wand = round_cone(vec3(-0.12, 0.17, -0.04), vec3(-0.2, 0.35, 0.26), r_top: 0.005, r_bottom: 0.005)
+    let wn = w.round_cone(wand.a, wand.b, r_top: 0.005, r_bottom: 0.005, matter: 2)
+    let all = w.smooth_union(wn - 1, wn, 0.004)
+    let moved = w.translate(all, vec3(1.0, 0.0, -2.0))
+    let written = w.done().unwrap()
+    assert(cones[3].r1 == 0.045 || cones[3].r2 == 0.045, "the cones' radii")
+    let compiled = cones.smooth_union(k: 0.03).smooth_union(wand, k: 0.004).translate(vec3(1.0, 0.0, -2.0))
+    for i in 0..written.parts() {
+        let (x, y) = (written.part_bound(i), compiled.part_bound(i))
+        assert(x.a == y.a && x.b == y.b && x.r == y.r && x.reach == y.reach && x.lowers == y.lowers, f"part {i}'s bound differs: written reach {x.reach}, compiled {y.reach}")
+    }
+    let c = vec3(1.0, 0.3, -2.0)
+    for i in 0..600 {
+        let o = c + Box3 { lo: vec3(-1.5), hi: vec3(1.5) }.sample(7, i)
+        let dir = c + Box3 { lo: vec3(-0.3), hi: vec3(0.3) }.sample(9, i) - o
+        let (u, v) = (written.passes(o, dir), compiled.passes(o, dir))
+        assert(u.t == v.t && u.distance == v.distance && u.low == v.low && u.high == v.high && u.flags == v.flags && u.other == v.other && u.other_distance == v.other_distance && u.blend == v.blend, f"ray {i}: passes differ: written t {u.t} [{u.low}, {u.high}] {u.distance}, compiled t {v.t} [{v.low}, {v.high}] {v.distance}")
+        let (m, n) = (written.meets(o, dir), compiled.meets(o, dir))
+        assert(m.near == n.near && m.far == n.far && m.first == n.first && m.flags == n.flags, f"ray {i}: meets differ: written [{m.near}, {m.far}], compiled [{n.near}, {n.far}]")
+        let (g, h) = (written.meets_grown(o, dir, grow: 0.02, inner: 0.0), compiled.meets_grown(o, dir, grow: 0.02, inner: 0.0))
+        assert(g.near == h.near && g.far == h.far && g.first == h.first && g.flags == h.flags, f"ray {i}: grown meets differ")
+    }
 }
 
 /// The door refuses what isn't a field: operands not the nodes before, a leaf out of range, a
