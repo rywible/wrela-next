@@ -613,6 +613,35 @@ const SUBMIT_BOUND_MS: f64 = 2.0 * crate::step::STEP_MS;
 /// rule each holds the GPU at most about a step (50 ms), so 64 of them about 3 s at most.
 const SUBMIT_COMMANDS: u32 = 64;
 
+/// How a buffer, texture or sampler was made: what `Gpu::recover` makes again at its handle.
+#[derive(Clone, Copy, Debug)]
+enum Made {
+    Buffer {
+        size: u32,
+    },
+    Texture {
+        size: [u32; 3],
+        format: TextureFormat,
+        writable: bool,
+        kind: TextureKind,
+        levels: u32,
+    },
+    Sampler {
+        linear: bool,
+        repeat: bool,
+        compare: Option<Compare>,
+        mip_linear: bool,
+        anisotropy: u32,
+    },
+}
+
+/// Whether an error the GPU reported is the device lost (as either backend says it, or a
+/// hang that ended its work).
+fn says_lost(e: &Error) -> bool {
+    let s = e.to_string();
+    s.contains("lost the device") || s.contains("device was lost") || s.contains("Hang")
+}
+
 /// What the submission being recorded holds (`SUBMIT_BOUND_MS`, `SUBMIT_COMMANDS`).
 #[derive(Clone, Copy, Debug, Default)]
 struct Queued {
@@ -636,6 +665,12 @@ pub(crate) struct Gpu {
     submissions: u64,
     /// The most any submission has held: its commands, and (apart) its summed bound.
     largest: Queued,
+    /// What it was made with, kept to make it again on a new device when this one is lost
+    /// (`Gpu::recover`): the build, how it times, and each live resource's making.
+    manifest: Manifest,
+    shaders: Vec<Vec<u8>>,
+    timing: Timing,
+    made: HashMap<u32, Made>,
     device: wrela_gpu::Device,
     limits: wrela_gpu::Limits,
     align: u64,
@@ -1038,6 +1073,10 @@ impl Gpu {
             queued: Queued::default(),
             submissions: 0,
             largest: Queued::default(),
+            manifest: manifest.clone(),
+            shaders: shaders.to_vec(),
+            timing,
+            made: HashMap::new(),
             device,
             limits,
             align,
@@ -1124,6 +1163,8 @@ impl Gpu {
     /// survive. In particular, a program that doesn't draw mustn't see the last one's screen.
     pub(crate) fn restart_build(&mut self, manifest: &Manifest, shaders: &[Vec<u8>]) -> Result<()> {
         self.finish_build()?;
+        self.manifest = manifest.clone();
+        self.shaders = shaders.to_vec();
         self.screen = None;
         self.frame = 0;
         self.debug_flag = None;
@@ -1895,6 +1936,7 @@ impl Gpu {
     /// holds its own references until the GPU is done.
     fn destroy(&mut self, handle: u32) {
         self.resources.remove(&handle);
+        self.made.remove(&handle);
         for group in self.bound_in.remove(&handle).unwrap_or_default() {
             for other in group.1.iter().filter(|b| b.handle != handle) {
                 if let Some(groups) = self.bound_in.get_mut(&other.handle) {
@@ -2029,6 +2071,7 @@ impl Gpu {
     }
 
     fn create_buffer(&mut self, handle: u32, size: u32) {
+        self.made.insert(handle, Made::Buffer { size });
         let buffer = self.device.create_buffer(&wrela_gpu::BufferDesc {
             label: &format!("buffer {handle}"),
             size: u64::from(size),
@@ -2048,6 +2091,7 @@ impl Gpu {
         kind: TextureKind,
         levels: u32,
     ) {
+        self.made.insert(handle, Made::Texture { size, format, writable, kind, levels });
         let [width, height, depth] = size;
         let three = kind == TextureKind::D3;
         let features = self.device.features();
@@ -2087,6 +2131,7 @@ impl Gpu {
         mip_linear: bool,
         anisotropy: u32,
     ) {
+        self.made.insert(handle, Made::Sampler { linear, repeat, compare, mip_linear, anisotropy });
         let sampler = self.device.create_sampler(&wrela_gpu::SamplerDesc {
             linear,
             repeat,
@@ -2979,6 +3024,82 @@ fn staging(
     }
 }
 
+impl Gpu {
+    /// The device lost (`e` says how): a new one, every pipeline built again, every buffer,
+    /// texture and sampler made again at its handle and size (zeroed: what the GPU and the
+    /// program wrote is gone), the screen again at its size, and the epoch one more
+    /// (`std::gpu::device_epoch`): the program writes again what it holds and builds its
+    /// caches as on its first frame. A window's surface isn't made again yet.
+    fn recover(&mut self, e: &Error) -> Result<()> {
+        if self.presenter.is_some() {
+            return Err(Error::Gpu(format!(
+                "{e}\n(the device was lost while drawing to a window: a window isn't made again yet)"
+            )));
+        }
+        let mut fresh = Gpu::new(&self.manifest, &self.shaders, self.timing, self.report)?;
+        let mut made: Vec<(u32, Made)> = self.made.iter().map(|(&h, &m)| (h, m)).collect();
+        made.sort_by_key(|&(h, _)| h);
+        for (h, m) in made {
+            match m {
+                Made::Buffer { size } => fresh.create_buffer(h, size),
+                Made::Texture { size, format, writable, kind, levels } => {
+                    fresh.create_texture(h, size, format, writable, kind, levels)
+                }
+                Made::Sampler { linear, repeat, compare, mip_linear, anisotropy } => {
+                    fresh.create_sampler(h, linear, repeat, compare, mip_linear, anisotropy)
+                }
+            }
+        }
+        if let Some(s) = &self.screen {
+            fresh.set_screen_format(s.width, s.height, s.format)?;
+        }
+        fresh.frame = self.frame;
+        fresh.calls = self.calls;
+        fresh.labelled = std::mem::take(&mut self.labelled);
+        fresh.labelled_order = std::mem::take(&mut self.labelled_order);
+        fresh.asked = std::mem::take(&mut self.asked);
+        fresh.screen_asked = self.screen_asked;
+        fresh.offscreen_hdr = self.offscreen_hdr;
+        fresh.program_limits.screen = self.program_limits.screen;
+        fresh.program_limits.headroom = self.program_limits.headroom;
+        fresh.program_limits.epoch = self.program_limits.epoch + 1;
+        fresh.submissions = self.submissions;
+        if let (Some(old), Some(new)) = (&mut self.timer, &mut fresh.timer) {
+            new.results = std::mem::take(&mut old.results);
+        }
+        eprintln!(
+            "wrela-host: {e}\nwrela-host: the device was made again at frame {} (epoch {}): {} buffers, textures and samplers, zeroed",
+            self.frame,
+            fresh.program_limits.epoch,
+            fresh.made.len()
+        );
+        *self = fresh;
+        Ok(())
+    }
+
+    /// [`Gpu::end_frame`] on this device.
+    fn end_frame_on_device(&mut self) -> Result<()> {
+        self.record_ended()?;
+        let mut encoder = self.take_encoder();
+        self.indirect.end_frame(&self.device, &mut encoder);
+        self.encoder = Some(encoder);
+        self.flush()?;
+        self.behind.submitted(&self.device);
+        self.collect()?;
+        self.calls += 1;
+        // A loss on demand (`WRELA_GPU_LOSE_AT=<frame>`), reported as a real one is: the
+        // host's handling of it is tested so.
+        if lose_at() == Some(self.frame) && self.program_limits.epoch == 0 {
+            self.device.lose();
+        }
+        self.check_errors()?;
+        self.behind.check(&self.device)?;
+        self.indirect.read(&self.device)?;
+        self.check_debug_flag()?;
+        self.show_screen()
+    }
+}
+
 impl Executor for Gpu {
     fn begin_frame(&mut self) {
         self.label = None;
@@ -3192,24 +3313,10 @@ impl Executor for Gpu {
     }
 
     fn end_frame(&mut self) -> Result<()> {
-        self.record_ended()?;
-        let mut encoder = self.take_encoder();
-        self.indirect.end_frame(&self.device, &mut encoder);
-        self.encoder = Some(encoder);
-        self.flush()?;
-        self.behind.submitted(&self.device);
-        self.collect()?;
-        self.calls += 1;
-        // A loss on demand (`WRELA_GPU_LOSE_AT=<frame>`), reported as a real one is: the
-        // host's handling of it is tested so.
-        if lose_at().is_some_and(|f| self.frame >= f) {
-            self.device.lose();
+        match self.end_frame_on_device() {
+            Err(e) if says_lost(&e) => self.recover(&e),
+            done => done,
         }
-        self.check_errors()?;
-        self.behind.check(&self.device)?;
-        self.indirect.read(&self.device)?;
-        self.check_debug_flag()?;
-        self.show_screen()
     }
 
     /// A program's ask for `label`'s time (`std::gpu::timed`): from it on, until it's answered,
@@ -3259,6 +3366,8 @@ impl Executor for Gpu {
     /// pipelines. The device, the screen and the rings stay.
     fn reload(&mut self, manifest: &Manifest, shaders: &[Vec<u8>]) -> Result<()> {
         self.finish_build()?;
+        self.manifest = manifest.clone();
+        self.shaders = shaders.to_vec();
         self.take_pipelines(manifest, shaders)
     }
 }
@@ -3725,21 +3834,31 @@ mod tests {
         gpu.check_errors().unwrap();
     }
 
-    /// A lost device stops the run at the end of its frame with an error that says so, on
-    /// both backends (`lose`, what `WRELA_GPU_LOSE_AT` calls), and nothing waits on the device
-    /// it lost.
+    /// A lost device is made again at the end of its frame (both backends; `lose`, what
+    /// `WRELA_GPU_LOSE_AT` calls): the run carries on, every buffer is there at its handle and
+    /// size, zeroed, the epoch is one more (`std::gpu::device_epoch`), and work recorded after
+    /// runs on the new device.
     #[test]
     #[ignore = "needs a GPU"]
-    fn a_lost_device_stops_the_run_with_an_error_saying_so() {
+    fn a_lost_device_is_made_again_with_its_resources_zeroed() {
         let (manifest, shaders) = increment();
         let mut gpu = Gpu::new(&manifest, &shaders, Timing::Off, false).unwrap();
         gpu.create_buffer(1, 4);
-        gpu.dispatch(0, Ok([1, 1, 1]), &[Binding::range(1, 0, 4)], &[]).unwrap();
+        for _ in 0..3 {
+            gpu.dispatch(0, Ok([1, 1, 1]), &[Binding::range(1, 0, 4)], &[]).unwrap();
+        }
         gpu.end_frame().unwrap();
+        assert_eq!(gpu.read_buffer(1).unwrap(), 3u32.to_le_bytes());
+        assert_eq!(gpu.program_limits.epoch, 0);
         gpu.device.lose();
         gpu.dispatch(0, Ok([1, 1, 1]), &[Binding::range(1, 0, 4)], &[]).unwrap();
-        let e = gpu.end_frame().unwrap_err().to_string();
-        assert!(e.contains("lost"), "{e}");
+        gpu.end_frame().unwrap();
+        assert_eq!(gpu.program_limits.epoch, 1);
+        assert_eq!(gpu.read_buffer(1).unwrap(), 0u32.to_le_bytes(), "zeroed");
+        gpu.dispatch(0, Ok([1, 1, 1]), &[Binding::range(1, 0, 4)], &[]).unwrap();
+        gpu.end_frame().unwrap();
+        assert_eq!(gpu.read_buffer(1).unwrap(), 1u32.to_le_bytes());
+        gpu.check_errors().unwrap();
     }
 
     #[test]

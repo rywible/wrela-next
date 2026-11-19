@@ -379,6 +379,7 @@ impl TargetLimits {
             step_work: step_work(STEP_MS as u64, METAL_FS),
             screen: 0,
             headroom: 1000,
+            epoch: 0,
         },
         storage_buffers_per_stage: 29,
         sampled_textures_per_stage: 96,
@@ -422,6 +423,7 @@ impl TargetLimits {
             step_work: step_work(STEP_MS as u64, VULKAN_FS),
             screen: 0,
             headroom: 1000,
+            epoch: 0,
         },
         // Roadmap 2022's per-stage descriptors.
         storage_buffers_per_stage: 30,
@@ -487,6 +489,10 @@ pub struct Limits {
     /// The display's headroom now, in thousandths ([`HEADROOM_LIMIT`]): how many times SDR
     /// white the brightest value the screen shows is (1000 on an SDR display, and offscreen).
     pub headroom: u32,
+    /// How many times the device has been lost and made again ([`EPOCH_LIMIT`]): after a loss
+    /// every buffer and texture is there at its handle and size, zeroed. Not the device's: the
+    /// host's count.
+    pub epoch: u32,
 }
 
 impl Limits {
@@ -558,6 +564,7 @@ impl Limits {
             13 => self.step_work,
             SCREEN_LIMIT => self.screen,
             HEADROOM_LIMIT => self.headroom,
+            EPOCH_LIMIT => self.epoch,
             _ => 0,
         }
     }
@@ -568,6 +575,10 @@ impl Limits {
 /// has done what a `ConfigureScreen` asked. (It was 13, which `step_work` took: `screen_is`
 /// read the step's work as the screen until toolchain 0.33.)
 pub const SCREEN_LIMIT: u32 = 14;
+
+/// `wrela.limit`'s index of how many times the device has been lost and made again
+/// (`std::gpu::device_epoch`, [`Limits::epoch`]).
+pub const EPOCH_LIMIT: u32 = 16;
 
 /// `wrela.limit`'s index of the display's headroom (`std::gpu::headroom`), in thousandths.
 pub const HEADROOM_LIMIT: u32 = 15;
