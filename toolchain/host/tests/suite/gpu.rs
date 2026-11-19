@@ -968,6 +968,43 @@ fn times_dispatches_and_passes_with_timestamps() {
     }
 }
 
+/// A label ends at a screen pass: the screen pass after labelled work is named `screen pass`,
+/// never summed into that work's label (a reader that took a label's entries apart once halved
+/// the last labelled pass of a frame: backend item 45), unless a label is given right before it.
+#[test]
+#[ignore = "needs a GPU"]
+fn a_screen_pass_ends_the_label_before_it() {
+    for timing in [Timing::Span, Timing::Serial] {
+        let frame = |given: bool| {
+            let mut e = Encoder::new();
+            e.create_buffer(1, 64);
+            e.label("work").dispatch(
+                0,
+                [1, 1, 1],
+                &[Binding::range(1, 0, 64)],
+                &words(&[1, 1, 0, 0]),
+            );
+            if given {
+                e.label("shown");
+            }
+            e.begin_screen_pass([0.0; 4])
+                .draw(1, 6, 1, &[], &words(&[0, 0, 1, 1, u32::MAX, 0, 0, 0]))
+                .present();
+            vec![e.finish()]
+        };
+        for (given, screen) in [(false, "screen pass"), (true, "shown")] {
+            let (_dir, mut host) = store_host(
+                "screen-label",
+                &[frame(given)],
+                &Options { timing, ..Options::default() },
+            );
+            let run = host.run_frames(&[0.0], 64, 64).expect("runs");
+            let labels: Vec<&str> = run.timings.iter().map(|t| t.label.as_str()).collect();
+            assert_eq!(labels, ["work", screen], "{timing:?}");
+        }
+    }
+}
+
 /// More timed passes in one submission than the query set holds: the host flushes early and
 /// every pass still gets its own duration.
 #[test]

@@ -2555,7 +2555,7 @@ fn cull<F: Surface>(field: F, grid: Grid, live: mut Slots<u32>, id: GlobalId) {
 
 The hosts can time each pass and dispatch on the GPU, they open the GPU with its own limits and every optional feature it has, and std counts the GPU memory a program holds.
 
-**Labels:** `std::gpu::label(name)` names the passes and dispatches after it in the hosts' timings, up to the next label or the frame's end. So a system's helper dispatches are timed with it. Before a frame's first label, a pass is named `pass` (`screen pass` on the screen), and a dispatch is named by its kernel's pipeline.
+**Labels:** `std::gpu::label(name)` names the passes and dispatches after it in the hosts' timings, up to the next label, a screen pass or the frame's end. So a system's helper dispatches are timed with it. A screen pass takes a label given right before it (after the last pass or dispatch); otherwise it is named `screen pass` and the label before it ends there, so the screen's time is never counted in the work before it. Before a frame's first label, a pass is named `pass` (`screen pass` on the screen), and a dispatch is named by its kernel's pipeline.
 
 **Timestamps:** when asked, both hosts time each pass and dispatch with GPU timestamps: its name, its start and its end. Test mode's `timestamps` and the native host's `Options::timestamps` ask for them.
 

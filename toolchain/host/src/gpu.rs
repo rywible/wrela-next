@@ -913,6 +913,10 @@ pub(crate) struct Gpu {
     timer: Option<Timer>,
     /// The name the program gave the passes and dispatches after it in this frame (`Label`).
     label: Option<Arc<str>>,
+    /// Whether that name was given since the last pass or dispatch: a screen pass takes it then,
+    /// and else ends it (named `screen pass`), so its time is never summed into the label of
+    /// the work before it.
+    label_fresh: bool,
     frame: usize,
     /// A debug build's: the flag its pipelines' bounds checks set (the manifest's
     /// `debug_flag`), read after each frame.
@@ -1301,6 +1305,7 @@ impl Gpu {
             indirect,
             timer,
             label: None,
+            label_fresh: false,
             frame: 0,
             debug_flag: None,
             program_limits,
@@ -2542,6 +2547,7 @@ impl Gpu {
         bindings: &[Binding],
         uniforms: &[u8],
     ) -> Result<()> {
+        self.label_fresh = false;
         // Weighed before anything is recorded: a dispatch that could hold the GPU too long never
         // reaches it (`crate::step`).
         self.weigh(pipeline, groups)?;
@@ -2683,6 +2689,7 @@ impl Gpu {
 
     /// Opens `pass`, named by the label in force.
     fn begin_pass(&mut self, pass: Pass) {
+        self.label_fresh = false;
         let label = self.label.clone();
         self.pass = Some(OpenPass { pass, draws: Vec::new(), label, uses: None, rect_set: false });
     }
@@ -3485,6 +3492,9 @@ impl Executor for Gpu {
                 return self.dispatch(*pipeline, Err((*arguments, *offset)), bindings, uniforms);
             }
             Command::BeginScreenPass { clear } => {
+                if !self.label_fresh {
+                    self.label = None;
+                }
                 self.begin_pass(Pass::one(stream::SCREEN, false, *clear))
             }
             Command::BeginPass(pass) => {
@@ -3539,6 +3549,7 @@ impl Executor for Gpu {
                 if self.label.as_deref() != Some(*name) {
                     self.label = Some(Arc::from(*name));
                 }
+                self.label_fresh = true;
             }
         }
         Ok(())
