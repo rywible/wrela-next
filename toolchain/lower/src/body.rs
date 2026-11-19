@@ -2632,11 +2632,26 @@ impl<'c, 'a> Fl<'c, 'a> {
                     }
                 });
                 if r.is_none() {
-                    self.cx.err(Diagnostic::new(
-                        codes::E0702,
-                        a.span(),
-                        "GPU code can pass a buffer on only as the kernel received it",
-                    ));
+                    let handle =
+                        self.cx.checked.program.lang_of_ty(pt) == Some(Lang::Texture3dHandle);
+                    let d = if handle {
+                        Diagnostic::new(
+                            codes::E0702,
+                            a.span(),
+                            "GPU code reads a texture through a handle only as the shader received it",
+                        )
+                        .with_note("a `Texture3dHandle` read from a buffer or built in GPU code names no texture the shader binds")
+                        .with_help("pass the handle in the entry point's arguments, at any depth of a struct's fields")
+                    } else {
+                        Diagnostic::new(
+                            codes::E0702,
+                            a.span(),
+                            "GPU code can pass a buffer on only as the kernel received it",
+                        )
+                    };
+                    self.cx.err(d);
+                    // No call: one missing an argument would mislead what reads it after.
+                    return None;
                 }
                 resources.push(r.map(Bound::One));
                 continue;
