@@ -175,6 +175,31 @@ fn a_loop_s_alike_work_counts_each_pass() {
 }
 
 #[test]
+fn a_loop_counter_is_fixed_though_a_nested_loop_breaks_on_what_varies() {
+    // An interval's `floor` split runs its cases in a loop of 27 passes and works out each
+    // case's digits from the counter (the loop's own structure: nothing the command gives);
+    // inside, a branch on what varies holds a loop of its own that breaks. That `break` leaves
+    // the inner loop only, so the counter still holds the same values in every invocation
+    // whatever path it takes: not alike work to move, and no E0712.
+    let cases = "    var acc = x
+    var case: u32 = 0
+    while case < 27 {
+        let d = (case / 9) % 3 * 7 + (case / 3) % 3 * 5 + case % 3 * 3 + (case * 11) % 13 + (case * 17) % 19
+        if x > 3.0 {
+            for _j in 0..8 {
+                if acc > 100.0 {
+                    break
+                }
+                acc = acc + f32(d)
+            }
+        }
+        case += 1
+    }
+    out[id] = acc";
+    assert_eq!(e0712(&kernel("same_nested_break", 64, cases)), Vec::<String>::new());
+}
+
+#[test]
 fn a_uniform_compared_in_a_loop_is_computed_once_an_invocation() {
     // A ray's step loop of 512 passes choosing by a uniform flag (engine gap 21): the compare
     // reads nothing the loop changes, so it is one compare an invocation, as every GPU compiler

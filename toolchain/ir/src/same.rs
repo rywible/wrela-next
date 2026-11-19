@@ -1037,28 +1037,31 @@ fn pure_or(
 /// Each store to a local of `f`, with what it depends on beyond the value stored, and the locals
 /// reached other than by loads and stores (lent, their address taken).
 fn local_stores(f: &Function) -> (Vec<LocalStore>, HashSet<LocalId>) {
-    // The conditions of the branches in `b` that leave a loop (or the function) under them.
-    fn exits(b: &[Stmt], out: &mut Vec<ValueId>) {
-        fn leaves(b: &[Stmt]) -> bool {
+    // The conditions of the branches in `b` (a loop's body or continuing) that leave that loop
+    // (or the function) under them: a `break` or `continue` of a loop nested in it leaves only
+    // the nested loop, so there only a `return` counts (`nested`).
+    fn exits(b: &[Stmt], out: &mut Vec<ValueId>, nested: bool) {
+        fn leaves(b: &[Stmt], nested: bool) -> bool {
             b.iter().any(|s| match s {
-                Stmt::Break | Stmt::Continue | Stmt::Return(_) => true,
-                Stmt::If { then, else_, .. } => leaves(then) || leaves(else_),
-                Stmt::Loop { body, continuing } => leaves(body) || leaves(continuing),
+                Stmt::Return(_) => true,
+                Stmt::Break | Stmt::Continue => !nested,
+                Stmt::If { then, else_, .. } => leaves(then, nested) || leaves(else_, nested),
+                Stmt::Loop { body, continuing } => leaves(body, true) || leaves(continuing, true),
                 _ => false,
             })
         }
         for s in b {
             match s {
                 Stmt::If { cond, then, else_ } => {
-                    if leaves(then) || leaves(else_) {
+                    if leaves(then, nested) || leaves(else_, nested) {
                         out.push(*cond);
                     }
-                    exits(then, out);
-                    exits(else_, out);
+                    exits(then, out, nested);
+                    exits(else_, out, nested);
                 }
                 Stmt::Loop { body, continuing } => {
-                    exits(body, out);
-                    exits(continuing, out);
+                    exits(body, out, true);
+                    exits(continuing, out, true);
                 }
                 _ => {}
             }
@@ -1113,8 +1116,8 @@ fn local_stores(f: &Function) -> (Vec<LocalStore>, HashSet<LocalId>) {
                 }
                 Stmt::Loop { body, continuing } => {
                     let n = on.len();
-                    exits(body, on);
-                    exits(continuing, on);
+                    exits(body, on, false);
+                    exits(continuing, on, false);
                     walk(body, on, w);
                     walk(continuing, on, w);
                     on.truncate(n);
