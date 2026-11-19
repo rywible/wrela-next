@@ -465,9 +465,12 @@ struct Ask {
     /// The passes and dispatches timed before it ([`Timer::noted`]): it times only its label's
     /// after it, in the order the program recorded them.
     from: u64,
-    /// Its answer, once some of that work is read back: the first call that ran some, and its
-    /// nanoseconds in that call, summed.
-    time: Option<(usize, f64)>,
+    /// Its answer, once some of that work is read back: the first call that ran some, and the
+    /// first start and the last end of its work in that call (nanoseconds, the device's clock).
+    /// Passes and dispatches of one submission overlap on the GPU (on Apple GPUs a pass's start
+    /// is near its submission's), so their spans can't be summed: the work took from the first
+    /// one's start to the last one's end.
+    time: Option<(usize, f64, f64)>,
 }
 
 /// What the executor did below the recorded stream, since its counters were last taken: the
@@ -3126,7 +3129,8 @@ impl Executor for Gpu {
         // A call's work is all read back once it has ended.
         let ended = self.calls;
         self.asked.retain(|ask| match ask.time {
-            Some((call, nanos)) if call < ended => {
+            Some((call, start, end)) if call < ended => {
+                let nanos = (end - start).max(0.0);
                 answered.push((ask.request, Ok(((nanos / 1000.0) as f32).to_le_bytes().to_vec())));
                 false
             }
@@ -3260,8 +3264,11 @@ impl Timer {
             let nanos = end - start;
             for ask in asked.iter_mut().filter(|a| a.label == label && a.from <= at) {
                 match &mut ask.time {
-                    None => ask.time = Some((call, nanos)),
-                    Some((c, n)) if *c == call => *n += nanos,
+                    None => ask.time = Some((call, start, end)),
+                    Some((c, s, e)) if *c == call => {
+                        *s = s.min(start);
+                        *e = e.max(end);
+                    }
                     Some(_) => {}
                 }
             }

@@ -32,4 +32,7 @@ def take(what):
     f.truncate()
     f.write(f"pid {os.getpid()}: {what}\n")
     f.flush()
+    # What this process runs is under the lock: a tool it starts that drives a GPU build
+    # (`std::tool::drive`) goes on without taking it again (`wrela-host`'s drive).
+    os.environ["WRELA_GPU_LOCK_HELD"] = str(os.getpid())
     return f

@@ -1,0 +1,159 @@
+// The build measures: builds the subject (`pkg`, a kind of thing realised each of its ways), keys
+// what it built (a hash of every file of the build, and the machine's tier, the first argument),
+// and if `out/measured.bin` holds a table of that key, keeps it ("kept"). Else, with `gpu` (the
+// second argument), drives the build on the machine's GPU (which holds the machine's GPU lock
+// while it runs, as every GPU job does) until each way has kept `ROUNDS` times past its warm-up,
+// and writes their medians; without, it calls the build on the CPU alone for what the compiler
+// counts each way to cost (`work`), and writes those. The table: the key (8 bytes), whether its
+// numbers are times (1) or counts (0) (4 bytes), then each way's number, an `f32` (little-endian).
+use std::collections::Vec
+use std::hash::state_hash
+use std::input::Script
+use std::io::print
+use std::tool::{ToolError, args}
+use std::tool::drive
+use std::tool::drive::{Scalar, Step}
+use std::tool::files
+use std::tool::toolchain
+
+/// The subject's ways, and how many times each keeps before the table is written.
+const WAYS: u32 = 2
+const ROUNDS: u32 = 31
+
+fn failed(e: ToolError) -> u32 {
+    print(f"error: {e.message()}")
+    1
+}
+
+fn push_u32(out: mut Vec<u8>, x: u32) {
+    for i in 0..4 {
+        out.push(u8((x >> (8 * i)) & 255))
+    }
+}
+
+fn read_u32(b: [u8], at: u32) -> u32 {
+    u32(b[at]) | (u32(b[at + 1]) << 8) | (u32(b[at + 2]) << 16) | (u32(b[at + 3]) << 24)
+}
+
+/// The key of the build in `out/build` for `tier`: its files' bytes, in order of name, and the tier.
+fn key(tier: str) -> Result<u64, ToolError> {
+    var names: Vec<String> = Vec::new()
+    for e in files::list("out/build").wait()? {
+        names.push(e.name.clone())
+    }
+    // In order of name, so the key doesn't hang on how the files were listed.
+    let n = u32(names.len())
+    for i in 1..n {
+        var j = i
+        while j > 0 && names[j - 1].as_str() > names[j].as_str() {
+            let t = names[j].clone()
+            names[j] = names[j - 1].clone()
+            names[j - 1] = take t
+            j -= 1
+        }
+    }
+    var all: Vec<u64> = Vec::new()
+    for name in names {
+        let bytes = files::read(f"out/build/{name}").wait()?
+        all.push(state_hash(name.clone()))
+        all.push(state_hash(bytes))
+    }
+    all.push(state_hash(String::from(tier)))
+    Ok(state_hash(all))
+}
+
+/// A number an export returned, as an `f32`.
+fn number(s: Scalar) -> f32 {
+    match s {
+        Scalar::F32(x) => x,
+        Scalar::I32(x) => f32(x),
+        Scalar::I64(x) => f32(x),
+        Scalar::F64(x) => f32(x),
+    }
+}
+
+pub fn tool() -> u32 {
+    let a = args()
+    if a.len() < 1 {
+        print("usage: measure <tier> [gpu]")
+        return 2
+    }
+    borrow tier = a[0]
+    let gpu = a.len() > 1 && a[1].as_str() == "gpu"
+    let built = match toolchain::build("pkg", "out/build", toolchain::options()).wait() {
+        Ok(b) => take b,
+        Err(e) => return failed(e),
+    }
+    if !built.ok {
+        print("error: the subject didn't build")
+        return 1
+    }
+    let k = match key(tier.as_str()) {
+        Ok(k) => k,
+        Err(e) => return failed(e),
+    }
+    if let Ok(old) = files::read("out/measured.bin").wait() {
+        if old.len() >= 12 && (u64(read_u32(old, 0)) | (u64(read_u32(old, 4)) << 32)) == k {
+            print(f"kept {k}")
+            return 0
+        }
+    }
+    var values: Vec<f32> = Vec::new()
+    if gpu {
+        let loaded = match drive::load("out/build", drive::gpu()).wait() {
+            Ok(x) => x,
+            Err(e) => return failed(e),
+        }
+        let b = loaded.build
+        if let Err(e) = drive::steps(b, [Step::Init]).wait() {
+            return failed(e)
+        }
+        var frames: u32 = 0
+        var done = false
+        while !done && frames < 2000 {
+            let seen = match drive::steps(b, [Step::Frames(20, Script::frames()), Step::Call(String::from("kept"), Vec::from([Scalar::I32(0)])), Step::Call(String::from("kept"), Vec::from([Scalar::I32(1)]))]).wait() {
+                Ok(s) => take s,
+                Err(e) => return failed(e),
+            }
+            frames += 20
+            done = number(seen.ran[1].results[0]) >= f32(ROUNDS) && number(seen.ran[2].results[0]) >= f32(ROUNDS)
+        }
+        for way in 0..WAYS {
+            let seen = match drive::steps(b, [Step::Call(String::from("median"), Vec::from([Scalar::I32(i32(way))]))]).wait() {
+                Ok(s) => take s,
+                Err(e) => return failed(e),
+            }
+            values.push(number(seen.ran[0].results[0]))
+        }
+        print(f"timed {frames} frames")
+    } else {
+        let loaded = match drive::load("out/build", drive::cpu()).wait() {
+            Ok(x) => x,
+            Err(e) => return failed(e),
+        }
+        if let Err(e) = drive::steps(loaded.build, [Step::Init]).wait() {
+            return failed(e)
+        }
+        for way in 0..WAYS {
+            let seen = match drive::steps(loaded.build, [Step::Call(String::from("counted"), Vec::from([Scalar::I32(i32(way))]))]).wait() {
+                Ok(s) => take s,
+                Err(e) => return failed(e),
+            }
+            values.push(number(seen.ran[0].results[0]))
+        }
+        print("counted")
+    }
+    var out: Vec<u8> = Vec::new()
+    push_u32(mut out, u32(k & 4294967295))
+    push_u32(mut out, u32(k >> 32))
+    push_u32(mut out, if gpu { 1 } else { 0 })
+    for v in values {
+        push_u32(mut out, bitcast_u32(v))
+        print(f"way {v}")
+    }
+    if let Err(e) = files::write("out/measured.bin", out).wait() {
+        return failed(e)
+    }
+    print(f"wrote {k}")
+    0
+}

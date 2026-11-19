@@ -1,0 +1,217 @@
+// The build measures (language.md §15.5's drive, `std::gpu::timed`): a kind of thing (the engine's
+// creature) realised two ways, marched from its bound's sphere (`marched`) and met by `meets`
+// (`met`), each over the same 4,096 rays (a 64 x 64 picture, eight times a frame), timed on the
+// GPU, one way a frame, the two in turn, and the median of each kept past a warm-up. A measuring tool (`../tool`) drives it and keeps the table; with no GPU, the tool asks
+// it for what the compiler counts each way to cost (`work`) instead.
+use std::collections::Vec
+use std::derive::work
+use std::field::{Bound, RoundCone, SmoothUnion, SmoothUnionAll, Surface, With, round_cone}
+use std::gpu::{
+    ClipPosition, FragCoord, Rg32Float, Texture, VertexIndex, begin_pass, begin_screen_pass, draw, label,
+    texture, timed,
+}
+use std::io::Pending
+
+pub type Body = SmoothUnion<With<SmoothUnionAll<RoundCone, 17>, vec3>, With<RoundCone, vec3>>
+
+/// The engine's creature at rest (as toolchain/tests/masked).
+fn body() -> Body {
+    let parts = [
+        round_cone(vec3(0.0, 0.5694, -0.0258), vec3(0.0, 0.7866, 0.0042), r_top: 0.102, r_bottom: 0.096),
+        round_cone(vec3(0.0, 0.7866, 0.0042), vec3(0.0, 0.912, -0.0246), r_top: 0.096, r_bottom: 0.06),
+        round_cone(vec3(0.0, 1.02, 0.0018), vec3(0.0, 1.056, 0.0078), r_top: 0.15, r_bottom: 0.138),
+        round_cone(vec3(0.1272, 0.873, -0.039), vec3(0.2778, 0.873, -0.0438), r_top: 0.039, r_bottom: 0.0348),
+        round_cone(vec3(0.2778, 0.873, -0.0438), vec3(0.4236, 0.873, -0.039), r_top: 0.0348, r_bottom: 0.03),
+        round_cone(vec3(0.4236, 0.873, -0.039), vec3(0.4932, 0.8706, -0.03), r_top: 0.03, r_bottom: 0.027),
+        round_cone(vec3(0.0684, 0.5826, -0.0216), vec3(0.0684, 0.3252, -0.0216), r_top: 0.054, r_bottom: 0.0432),
+        round_cone(vec3(0.0684, 0.3252, -0.0216), vec3(0.0684, 0.0516, -0.0528), r_top: 0.0432, r_bottom: 0.0336),
+        round_cone(vec3(0.0684, 0.0516, -0.0528), vec3(0.0684, 0.009, 0.033), r_top: 0.0336, r_bottom: 0.0276),
+        round_cone(vec3(0.078, 1.14, 0.0018), vec3(0.12, 1.272, -0.0102), r_top: 0.03, r_bottom: 0.0075),
+        round_cone(vec3(-0.1272, 0.873, -0.039), vec3(-0.2778, 0.873, -0.0438), r_top: 0.039, r_bottom: 0.0348),
+        round_cone(vec3(-0.2778, 0.873, -0.0438), vec3(-0.4236, 0.873, -0.039), r_top: 0.0348, r_bottom: 0.03),
+        round_cone(vec3(-0.4236, 0.873, -0.039), vec3(-0.4932, 0.8706, -0.03), r_top: 0.03, r_bottom: 0.027),
+        round_cone(vec3(-0.0684, 0.5826, -0.0216), vec3(-0.0684, 0.3252, -0.0216), r_top: 0.054, r_bottom: 0.0432),
+        round_cone(vec3(-0.0684, 0.3252, -0.0216), vec3(-0.0684, 0.0516, -0.0528), r_top: 0.0432, r_bottom: 0.0336),
+        round_cone(vec3(-0.0684, 0.0516, -0.0528), vec3(-0.0684, 0.009, 0.033), r_top: 0.0336, r_bottom: 0.0276),
+        round_cone(vec3(-0.078, 1.14, 0.0018), vec3(-0.12, 1.272, -0.0102), r_top: 0.03, r_bottom: 0.0075),
+    ]
+    let wand = round_cone(vec3(-0.4236, 0.873, -0.039), vec3(-0.4956, 1.053, 0.261), r_top: 0.00504, r_bottom: 0.00504)
+    parts.smooth_union(k: 0.03).with(vec3(0.42, 0.28, 0.16)).smooth_union(wand.with(vec3(0.22, 0.13, 0.07)), k: 0.004)
+}
+
+/// The rays: from in front of the creature, a 64 x 64 picture of it.
+fn ray(px: vec2) -> (vec3, vec3) {
+    let eye = vec3(0.35, 0.95, 1.5)
+    let fwd = normalize(vec3(0.0, 0.66, 0.0) - eye)
+    let right = normalize(cross(fwd, vec3(0.0, 1.0, 0.0)))
+    let up = cross(right, fwd)
+    let s = (2.0 * px.x / 64.0 - 1.0) * 0.45
+    let u = (1.0 - 2.0 * px.y / 64.0) * 0.45
+    (eye, normalize(fwd + right * s + up * u))
+}
+
+const NEAR: f32 = 0.0002
+
+/// At most 512 steps, a counted loop, so the compiler can bound what it costs (`work`).
+fn march(s: Body, o: vec3, d: vec3, t0: f32, t1: f32) -> f32 {
+    var t = t0
+    var met = -1.0
+    for _ in 0..512 {
+        if t > t1 {
+            break
+        }
+        let f = s.distance(o + d * t)
+        if f < NEAR {
+            met = t
+            break
+        }
+        t += f
+    }
+    met
+}
+
+fn bounded(b: Bound, o: vec3, d: vec3) -> vec2 {
+    let oc = o - b.centre
+    let p = dot(oc, d)
+    let h = p * p - (dot(oc, oc) - b.radius * b.radius)
+    if h < 0.0 {
+        return vec2(1.0, 0.0)
+    }
+    let r = sqrt(h)
+    vec2(max(-p - r, 0.0), -p + r)
+}
+
+/// Way 0: marched from the bound's sphere.
+fn marched_at(s: Body, b: Bound, px: vec2) -> f32 {
+    let (o, d) = ray(px)
+    let r = bounded(b, o, d)
+    if r.x > r.y { -1.0 } else { march(s, o, d, r.x, r.y) }
+}
+
+/// Way 1: met by `meets`, marched over its stretch where it isn't exact.
+fn met_at(s: Body, b: Bound, px: vec2) -> f32 {
+    let (o, d) = ray(px)
+    let r = bounded(b, o, d)
+    if r.x > r.y {
+        return -1.0
+    }
+    let m = s.meets(o, d)
+    if m.is_empty() {
+        -1.0
+    } else if m.exact() {
+        m.near
+    } else {
+        let t = march(s, o, d, m.near, min(m.far, m.first))
+        if t < 0.0 && m.first <= m.far { m.first } else { t }
+    }
+}
+
+@vertex
+fn cover(v: VertexIndex) -> ClipPosition {
+    let x = f32((v.index << 1) & 2) * 2.0 - 1.0
+    let y = f32(v.index & 2) * 2.0 - 1.0
+    ClipPosition { position: vec4(x, y, 0.5, 1.0) }
+}
+
+@fragment
+fn marched(pixel: FragCoord, s: Body, b: Bound) -> vec2 {
+    vec2(marched_at(s, b, pixel.position.xy), 0.0)
+}
+
+@fragment
+fn met(pixel: FragCoord, s: Body, b: Bound) -> vec2 {
+    vec2(met_at(s, b, pixel.position.xy), 0.0)
+}
+
+/// The ways, in the table's order.
+pub const WAYS: u32 = 2
+
+/// Frames before any time is kept, and how many passes of each way a frame.
+const WARM: u32 = 30
+const PASSES: u32 = 8
+
+pub struct Measured {
+    frames: u32,
+    picture: Texture<Rg32Float>,
+    asked: Vec<Pending<f32>>,
+    asked_way: Vec<u32>,
+    times: [Vec<f32>; 2],
+}
+
+pub fn init() -> Measured {
+    Measured {
+        frames: 0,
+        picture: texture(width: 64, height: 64),
+        asked: Vec::new(),
+        asked_way: Vec::new(),
+        times: [Vec::new(), Vec::new()],
+    }
+}
+
+pub fn frame(m: mut Measured, time: f32, width: u32, height: u32) {
+    let s = body()
+    let b = s.bound()
+    // One way a frame, the two in turn: the passes of one submission overlap on the GPU, so two
+    // ways in one frame can't be told apart by their times.
+    let way = m.frames % 2
+    let name = if way == 0 { "way 0" } else { "way 1" }
+    if m.frames >= WARM {
+        m.asked.push(timed(name))
+        m.asked_way.push(way)
+    }
+    label(name)
+    for _ in 0..PASSES {
+        let p = begin_pass(mut m.picture, clear: vec4(0.0))
+        if way == 0 {
+            draw(p, cover, marched.bind(s: s, b: b), vertices: 3)
+        } else {
+            draw(p, cover, met.bind(s: s, b: b), vertices: 3)
+        }
+        p.end()
+    }
+    label("screen")
+    let q = begin_screen_pass(clear: vec4(0.0))
+    q.present()
+    m.frames += 1
+    var i: u32 = 0
+    while i < u32(m.asked.len()) {
+        if let Some(Ok(us)) = m.asked[i].poll() {
+            m.times[m.asked_way[i]].push(us[0])
+            let _ = m.asked.remove(i)
+            let _ = m.asked_way.remove(i)
+        } else {
+            i += 1
+        }
+    }
+}
+
+/// How many times way `way` has kept.
+pub fn kept(m: Measured, way: u32) -> u32 {
+    u32(m.times[way].len())
+}
+
+/// Way `way`'s median time of a frame's passes (us): its rays, `PASSES` times over.
+pub fn median(m: Measured, way: u32) -> f32 {
+    var xs = m.times[way].clone()
+    let n = u32(xs.len())
+    if n == 0 {
+        return -1.0
+    }
+    for i in 1..n {
+        var j = i
+        while j > 0 && xs[j - 1] > xs[j] {
+            let t = xs[j]
+            xs[j] = xs[j - 1]
+            xs[j - 1] = t
+            j -= 1
+        }
+    }
+    xs[n / 2]
+}
+
+/// What the compiler counts way `way` to cost a ray (`std::derive::work`): the answer with no GPU.
+pub fn counted(way: u32) -> u32 {
+    let s = body()
+    let b = s.bound()
+    if way == 0 { work(|px: vec2| marched_at(s, b, px)) } else { work(|px: vec2| met_at(s, b, px)) }
+}

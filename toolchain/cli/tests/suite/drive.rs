@@ -27,7 +27,8 @@ use std::time::{Duration, Instant};
 ///   request is made), then the hash; `out/stopped` says it's done, and it waits for `out/go`;
 /// - `hold <export>`: a call of the export, which never ends (`out/asked` says it's made);
 /// - `spin-forever`: a call of `spin` with no deadline of its own (the tool's `--timeout` ends
-///   it).
+///   it);
+/// - `gpu-soon`: `fx` loaded on the GPU with a deadline of 2 s.
 const TOOL: &str = r#"
 use std::input::{Key, Script}
 use std::io::print
@@ -147,6 +148,15 @@ pub fn tool() -> u32 {
                 let took = f64(u.seconds - t.seconds) + (f64(u.nanos) - f64(t.nanos)) * 0.000000001
                 print(f"load: {e.message()} after {took}")
             },
+        }
+        return 0
+    }
+    if what.as_str() == "gpu-soon" {
+        var soon = drive::gpu()
+        soon.timeout = 2.0
+        match drive::load("fx", soon).wait() {
+            Ok(_) => print("loaded"),
+            Err(e) => return failed(e),
         }
         return 0
     }
@@ -1503,4 +1513,116 @@ fn every_printed_line_comes_back_through_a_blob_when_the_answer_cant_hold_them()
     assert!(printed.contains("refused: the 30000 lines it printed, "), "{printed}");
     assert!(printed.contains("budget"), "{printed}");
     assert!(printed.contains("then 1 inline 1 log false"), "{printed}");
+}
+
+/// A GPU build a tool drives holds the machine's one GPU lock while it runs (AGENTS.md rule 2):
+/// while another job holds it, the load waits, and past its deadline fails, naming the holder.
+/// (Under `tools/check` the lock's holder marks what it starts, `WRELA_GPU_LOCK_HELD`, and a
+/// driven build goes on: here that mark is taken away, and the lock is a file of the test's.)
+#[test]
+fn a_driven_gpu_build_waits_for_the_machines_gpu_lock() {
+    use std::io::BufRead;
+    let (tool, src, out) = setup("drive-lock");
+    let lock = out.join("gpu.lock");
+    let mut holder = Command::new("python3")
+        .arg("-c")
+        .arg(
+            "import fcntl, sys, time\n\
+             f = open(sys.argv[1], 'a+')\n\
+             fcntl.flock(f, fcntl.LOCK_EX)\n\
+             f.seek(0); f.truncate(); f.write('pid 1: a test holding it\\n'); f.flush()\n\
+             print('held', flush=True)\n\
+             time.sleep(120)\n",
+        )
+        .arg(&lock)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("python3");
+    let mut line = String::new();
+    std::io::BufReader::new(holder.stdout.as_mut().expect("its output"))
+        .read_line(&mut line)
+        .expect("held");
+    assert_eq!(line.trim(), "held");
+    let mut c = drive(&tool, &src, &out, "30", &["gpu-soon"]);
+    c.env("WRELA_GPU_LOCK", &lock).env_remove("WRELA_GPU_LOCK_HELD");
+    let started = Instant::now();
+    let (code, printed) = run(&mut c);
+    let _ = holder.kill();
+    let _ = holder.wait();
+    assert_ne!(code, Some(0), "{printed}");
+    assert!(
+        printed.contains("waited for the GPU past its deadline")
+            && printed.contains("a test holding it"),
+        "{printed}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(30), "it waited for its deadline, no longer");
+}
+
+/// The build measures (language.md §15.5, toolchain/tests/measured): a tool builds a kind of
+/// thing's subject, drives it on the GPU (which holds the machine's GPU lock), and writes a table
+/// of each way's time, keyed by the subject's build and the machine's tier; run again on the same
+/// build, it keeps the table; a game's build embeds it and reads which way is the cheaper as a
+/// constant; and with no GPU the table holds the compiler's counts (`work`) instead.
+#[test]
+#[ignore = "needs a GPU"]
+fn a_tool_measures_a_kind_of_things_ways_keeps_the_table_and_a_game_reads_it() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/measured");
+    let dir = package("measured", &[("game/wrela.toml", &manifest("game"))]);
+    std::fs::copy(fixture.join("game/main.wrela"), dir.join("game/main.wrela")).expect("game");
+    let out = dir.join("out");
+    std::fs::create_dir_all(&out).expect("out");
+    let measure = |tier: &str, gpu: bool| {
+        let mut c = wrela();
+        c.arg("tool").arg(fixture.join("tool"));
+        c.arg("--read").arg(format!("pkg={}", fixture.join("subject").display()));
+        c.arg("--write").arg(format!("out={}", out.display()));
+        c.arg("--timeout").arg("300").arg("--").arg(tier);
+        if gpu {
+            c.arg("gpu");
+        }
+        run(&mut c)
+    };
+    let table = || std::fs::read(out.join("measured.bin")).expect("the table");
+    let (code, printed) = measure("here", true);
+    assert_eq!(code, Some(0), "{printed}");
+    assert!(printed.contains("timed") && printed.contains("wrote"), "{printed}");
+    let timed = table();
+    assert_eq!(timed.len(), 12 + 2 * 4, "the key, the kind, two ways");
+    assert_eq!(&timed[8..12], &1u32.to_le_bytes(), "times");
+    let times: Vec<f32> =
+        timed[12..].chunks(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+    assert!(times.iter().all(|t| t.is_finite() && *t > 0.0), "{times:?}");
+    // The same build and tier: kept, not measured again.
+    let (code, printed) = measure("here", true);
+    assert_eq!(code, Some(0), "{printed}");
+    assert!(printed.contains("kept"), "{printed}");
+    assert_eq!(table(), timed);
+    // The game reads it, a constant of its build.
+    let read = |table: &[u8]| {
+        std::fs::write(dir.join("game/measured.bin"), table).expect("the game's table");
+        let built = dir.join("game-build");
+        build(&dir.join("game"), &built);
+        let mut host = wrela_host::CpuBuild::load(&built).expect("load").start().expect("start");
+        let one = |host: &mut wrela_host::CpuHost, name: &str| match host
+            .call_export(name, &[])
+            .expect(name)[..]
+        {
+            [wrela_host::Value::I32(x)] => x,
+            ref other => panic!("{name}: {other:?}"),
+        };
+        (one(&mut host, "cheaper"), one(&mut host, "timed"))
+    };
+    let cheaper = if times[1] < times[0] { 1 } else { 0 };
+    assert_eq!(read(&timed), (cheaper, 1));
+    // Another tier is another key: with no GPU, the compiler's counts.
+    let (code, printed) = measure("no-gpu", false);
+    assert_eq!(code, Some(0), "{printed}");
+    assert!(printed.contains("counted"), "{printed}");
+    let counted = table();
+    assert_eq!(&counted[8..12], &0u32.to_le_bytes(), "counts");
+    assert_ne!(&counted[..8], &timed[..8], "another key");
+    let counts: Vec<f32> =
+        counted[12..].chunks(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+    assert!(counts.iter().all(|c| *c > 0.0 && *c < 4.0e9), "bounded counts: {counts:?}");
+    assert_eq!(read(&counted).1, 0);
 }

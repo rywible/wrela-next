@@ -91,6 +91,8 @@ struct Current {
 /// why it can't be observed (it was stopped, or its process ended), where its code came from,
 /// and the storage directory the host made for it (removed with it).
 pub(crate) struct Driven {
+    /// A GPU build's hold on the machine's one GPU lock, until the build is dropped.
+    _gpu: Option<File>,
     process: Lifecycle<Spawned>,
     to: Mutex<File>,
     answers: Mutex<mpsc::Receiver<Result<Vec<u8>, String>>>,
@@ -603,6 +605,58 @@ fn loaded(
     Ok(out.0)
 }
 
+/// The machine's one GPU lock (`tools/gpulock.py`: an advisory `flock` on `WRELA_GPU_LOCK`, else
+/// `~/.wrela/gpu.lock`), taken for `what` by `due`, the file that holds it naming this process;
+/// `None` where an ancestor holds it (`WRELA_GPU_LOCK_HELD`, which the lock's holders set for
+/// what they start). Past `due`, or when the tool ends, the load fails, naming who holds it.
+fn gpu_lock(s: &Services, what: &str, due: Instant) -> Result<Option<File>, String> {
+    if std::env::var_os("WRELA_GPU_LOCK_HELD").is_some() {
+        return Ok(None);
+    }
+    let path = match std::env::var_os("WRELA_GPU_LOCK") {
+        Some(p) => PathBuf::from(p),
+        None => {
+            let home = std::env::var_os("HOME").ok_or("the GPU lock: no HOME")?;
+            PathBuf::from(home).join(".wrela/gpu.lock")
+        }
+    };
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("the GPU lock: {e}"))?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .append(true)
+        .create(true)
+        .open(&path)
+        .map_err(|e| format!("the GPU lock `{}`: {e}", path.display()))?;
+    use std::io::{Read, Seek, Write};
+    loop {
+        // (`flock` on Unix, as `tools/gpulock.py` takes it: one lock, whichever takes it.)
+        match file.try_lock() {
+            Ok(()) => break,
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(std::fs::TryLockError::Error(e)) => return Err(format!("the GPU lock: {e}")),
+        }
+        let ended = s.closing.load(Ordering::Acquire);
+        if ended || Instant::now() >= due {
+            let mut holder = String::new();
+            let _ = file.seek(std::io::SeekFrom::Start(0));
+            let _ = file.read_to_string(&mut holder);
+            let holder = holder.trim();
+            let holder = if holder.is_empty() { "another job" } else { holder };
+            return Err(if ended {
+                format!("the tool ended while `{what}` waited for the GPU, held by {holder}")
+            } else {
+                format!("`{what}` waited for the GPU past its deadline: held by {holder}")
+            });
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = file.set_len(0);
+    let _ = writeln!(file, "pid {}: wrela tool, {what}", std::process::id());
+    Ok(Some(file))
+}
+
 /// Starts `load`'s process for `request`, registered under the request, and loads the build in
 /// it by `due`: its handle and the build.
 fn start(
@@ -620,6 +674,9 @@ fn start(
     let Some(runner) = s.caps.runner() else {
         return Err("a driven build runs in a process of its own, which `wrela tool` starts, and nothing here runs one".into());
     };
+    // One GPU job at a time on the machine (AGENTS.md rule 2): a GPU build holds the lock while
+    // it runs, unless what started this host holds it already.
+    let gpu = if load.gpu { gpu_lock(s, &what, due)? } else { None };
     // Opened through the grants, once, now: the process gets these directories alone.
     let (_, build) = s.caps.open_dir(&load.path)?;
     let root = s.caps.root_handle(&load.path)?;
@@ -688,6 +745,7 @@ fn start(
     }
     let (sent, answers) = mpsc::channel();
     let driven = Arc::new(Driven {
+        _gpu: gpu,
         process: Lifecycle::new(Spawned { child, group }),
         to: Mutex::new(File::from(std::os::fd::OwnedFd::from(to))),
         answers: Mutex::new(answers),
