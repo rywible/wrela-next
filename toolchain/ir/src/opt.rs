@@ -46,6 +46,12 @@ pub fn flatten_gpu(m: &mut Module) -> Result<()> {
         promote(m, &mut f);
         forward_stores(m, &mut f);
         dce(&mut f);
+        // A value built and passed through locals reaches its uses only now: a part taken of
+        // it is that part, and a read-only aggregate loaded whole and only taken apart is read
+        // part by part where used (E0713: a 976-byte field read from a buffer by index).
+        forward_extracts(m, &mut f);
+        narrow_loads(m, &mut f);
+        dce(&mut f);
         // What's computed from constants is computed now, once (§18.13).
         if crate::const_fold::fold_constants(m, &mut f) {
             dce(&mut f);
@@ -68,6 +74,13 @@ pub fn flatten_gpu(m: &mut Module) -> Result<()> {
         dce(&mut f);
         if_convert(m, &mut f);
         cse(&mut f);
+        dce(&mut f);
+        // Again, for what the passes since made of locals and copies (`narrow_loads`); a part
+        // read whole into a local (an array a method indexes) is read where it lies too.
+        forward_extracts(m, &mut f);
+        narrow_loads(m, &mut f);
+        forward(m, &mut f);
+        narrow_loads(m, &mut f);
         dce(&mut f);
         // Last: the calls left are the ones a browser's compiler writes out at each place.
         crate::merge_calls::merge_calls(m, &mut f);
@@ -1831,6 +1844,78 @@ fn forward_extracts(m: &Module, f: &mut Function) {
     let mut body = std::mem::take(&mut f.body);
     go(&mut body, &built, &mut rename);
     f.body = body;
+}
+
+/// A read-only struct or array loaded whole (`v = load p`), whose every use takes a part of it
+/// (`v.k`, `v[i]`), is read part by part where each is used (`load p.k`, `load p[i]`): no copy of
+/// the whole in each invocation's memory (language.md §18.13). The place is read-only for the
+/// whole dispatch, so a read moved later reads the same; its index values are defined before
+/// the whole load, so wherever its parts are used. Repeated until no such load is left, so a
+/// part that is itself only taken apart is read the same way.
+fn narrow_loads(m: &Module, f: &mut Function) {
+    for _ in 0..16 {
+        let mut whole: HashMap<ValueId, Place> = HashMap::new();
+        visit::walk(&f.body, &mut |s| {
+            if let Stmt::Let(v, Expr::Load(p)) = s
+                && read_only(m, p)
+                && matches!(
+                    m.types.get(f.value_ty(*v)),
+                    TypeDef::Struct { .. } | TypeDef::Array(..)
+                )
+            {
+                whole.insert(*v, p.clone());
+            }
+        });
+        // Only those whose every use takes a part.
+        visit::walk(&f.body, &mut |s| match s {
+            Stmt::Let(_, Expr::Extract(_, _) | Expr::ExtractDyn(_, _)) => {
+                if let Some(e) = s.expr() {
+                    let parted = match e {
+                        Expr::Extract(x, _) => Some(*x),
+                        Expr::ExtractDyn(x, _) => Some(*x),
+                        _ => None,
+                    };
+                    e.for_each_value(&mut |y| {
+                        if Some(y) != parted {
+                            whole.remove(&y);
+                        }
+                    });
+                }
+            }
+            _ => s.for_each_value(&mut |y| {
+                whole.remove(&y);
+            }),
+        });
+        if whole.is_empty() {
+            return;
+        }
+        let u = m.types.lookup(&TypeDef::Scalar(Scalar::U32));
+        let mut body = std::mem::take(&mut f.body);
+        visit::expand(&mut body, &mut |s, out| match s {
+            Stmt::Let(w, Expr::Extract(x, k)) if whole.contains_key(&x) => {
+                let p = &whole[&x];
+                let at = match m.types.get(f.value_ty(x)) {
+                    TypeDef::Struct { .. } => p.clone().with(Proj::Field(k)),
+                    _ => {
+                        let Some(u) = u else {
+                            out.push(Stmt::Let(w, Expr::Extract(x, k)));
+                            return;
+                        };
+                        let i = f.new_value(u);
+                        out.push(Stmt::Let(i, Expr::Const(Const::U32(k))));
+                        p.clone().with(Proj::Index(i))
+                    }
+                };
+                out.push(Stmt::Let(w, Expr::Load(at)));
+            }
+            Stmt::Let(w, Expr::ExtractDyn(x, i)) if whole.contains_key(&x) => {
+                out.push(Stmt::Let(w, Expr::Load(whole[&x].clone().with(Proj::Index(i)))));
+            }
+            s => out.push(s),
+        });
+        f.body = body;
+        dce(f);
+    }
 }
 
 /// The size from which an aggregate stays where it's made, used or not: a value larger than
