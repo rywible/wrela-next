@@ -508,6 +508,42 @@ does not at least halve the eye's part of the picture against marching from the 
 same shape written two ways (std's shapes joined, against one function) then differs in cost by
 more than the author test allows, with no way for the compiler to see through the second.
 
+## Two pieces of mathematics not tried yet (2026-11-19)
+
+Six ways of drawing an edge with fewer than nine rays have died, and a thing's cells still do
+not hold a bound a ray can step by. Both may be the wrong question asked of the wrong quantity.
+
+**A. The least value along a ray is a picture of the outline.** For a ray through screen place
+(x, y), let g(x, y) be the least value the field takes along it. g is above 0 where the ray
+misses, below 0 where it passes through the thing (how deep it goes in), and exactly 0 on the
+outline; and it is smooth across the outline, which a hit-or-miss is not. So the outline is the
+zero of a smooth function on the screen, known on BOTH sides: every cut that died knew it on the
+missing side only, and had to count a hit near the outline as whole. How g changes across the
+screen needs no second search: at the place along the ray where the field is least, its
+gradient turned onto the screen is g's (the envelope theorem), which the toolchain already
+derives. Then g over the length of that screen gradient is how many pixels the outline is from
+the pixel's middle, on either side, whatever the field's value is scaled by; a pixel's cover
+follows in closed form; g's second derivative gives the cover of a part thinner than a pixel
+(how wide the dip under 0 is); and g's range over a pixel's footprint says with certainty which
+pixels hold no edge at all. It costs a hitting ray a short search on past its hit for where the
+field is least, and the colour of what is behind. The same along a ray to the sun gives how
+much of the sun's disc an occluder's edge hides, in closed form: a soft shadow of the right
+width with no edge shadow rays, which are most of what edges cost at scale. **Dead if** judged
+against nine rays any measure is worse by more than its spread, or edge work at 64 bodies is not
+at least halved; said plainly either way.
+
+**B. Solve for the surface in a cell; do not step toward it.** Cells are read by mixing eight
+values, and a ray through that mix is a cubic in the distance along it: its zero is found
+outright, with a bracket that cannot miss. So inside cells nothing steps by a value, the value
+need not be a distance at all (the fault met four times), a hit lies in the cell that made it
+(so a request to split it needs no direction, and matter is still never told which way a ray
+went), and bricks whose least and greatest values have one sign are crossed whole. Where a ray
+must still step (between bricks, or by a field), the best lower bound that samples and a
+steepness allow is known (the largest, over the samples, of each sample's value less the
+steepness times the distance to it): stepping by that is sound by a theorem, not by a measured
+error. **Dead if** the stack's eye is dearer than today's walk at 100 m or at 3 m, or the
+audit's count of hits off by a pixel against the cells' own surface is not zero.
+
 ## Ways of spending less that are not tried yet
 
 Since slice 1d the work has gone into making a march cheaper. The larger savings in drawing are
