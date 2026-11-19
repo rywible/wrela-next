@@ -298,6 +298,9 @@ pub(crate) struct Cx<'a> {
     /// Whether the pipeline being lowered moves its same work onto the CPU (`ir::hoist`): not a
     /// stand-in's pair, whose commands both must bind alike.
     pub hoist: bool,
+    /// `std::derive::work`'s count of each callable it was asked of (`None`: it can't be GPU
+    /// code), once a build.
+    pub works: HashMap<InstanceKey, Option<u32>>,
 }
 
 /// One target module being built: the CPU module by default.
@@ -673,6 +676,7 @@ impl<'a> Cx<'a> {
             pipeline_targets: Vec::new(),
             lift: None,
             hoist: false,
+            works: HashMap::new(),
         }
     }
 

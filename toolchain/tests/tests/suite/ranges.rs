@@ -230,4 +230,9 @@ fn masked_and_whole_draw_the_same_picture() {
         0,
         "a kernel's masks leave out live parts"
     );
+    assert_eq!(
+        one_u32(&mut host, "counts_differing", &[]),
+        0,
+        "a kernel's counts of what an ask costs differ from the CPU's"
+    );
 }

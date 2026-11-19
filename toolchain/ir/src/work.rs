@@ -155,6 +155,7 @@ impl<'a> ExprWork<'a> {
             calls: HashMap::new(),
             sites: None,
             exits: Vec::new(),
+            left: 0,
         };
         (self.c.steps, self.c.gave_up) = (0, false);
         self.c.expr(&mut fr, &mut State::default(), e);
@@ -485,6 +486,7 @@ impl<'a> CallRuns<'a> {
             calls: HashMap::new(),
             sites: Some(SiteLog::default()),
             exits: Vec::new(),
+            left: 0,
         };
         (self.c.steps, self.c.gave_up) = (0, false);
         self.c.block(&mut fr, &mut State::default(), &func.body);
@@ -614,6 +616,10 @@ struct Frame<'f> {
     sites: Option<SiteLog>,
     /// The loops being followed, innermost last, and the ways out of each found so far.
     exits: Vec<Exits>,
+    /// The most work any way through the function that has already returned did: a side of an
+    /// `if` that returns ends its way there, so the code after the `if` is counted only on the
+    /// sides that go on, and the call's work is the most of every way.
+    left: u64,
 }
 
 impl<'a> Counter<'a> {
@@ -638,11 +644,12 @@ impl<'a> Counter<'a> {
             calls: HashMap::new(),
             sites: None,
             exits: Vec::new(),
+            left: 0,
         };
         let mut st = State::default();
         self.block(&mut fr, &mut st, &f.body);
         let called = Called {
-            work: fr.work,
+            work: fr.work.max(fr.left),
             unbounded: fr.unbounded,
             loop_at: fr.loop_at,
             ret: fr.ret.flatten(),
@@ -808,6 +815,19 @@ impl<'a> Counter<'a> {
         let wb = fr.work - start;
         fr.work = start.saturating_add(wa.max(wb));
         match (fa, fb) {
+            // One side returns: its way ends with its own work, and only the other's goes on.
+            (Flow::Normal, Flow::Return) => {
+                fr.left = fr.left.max(start.saturating_add(wb));
+                fr.work = start.saturating_add(wa);
+                *st = a;
+                Flow::Normal
+            }
+            (Flow::Return, Flow::Normal) => {
+                fr.left = fr.left.max(start.saturating_add(wa));
+                fr.work = start.saturating_add(wb);
+                *st = b;
+                Flow::Normal
+            }
             (x, y) if x == y => {
                 a.join(&b);
                 *st = a;

@@ -15,7 +15,7 @@
 // name, so a tool can say what a point belongs to without knowing what made the surface.
 
 use std::collections::Vec
-use std::derive::{Box3, Interval, gradient, interval, tape, value_and_gradient}
+use std::derive::{Box3, Interval, UNBOUNDED_WORK, gradient, interval, plus_work, tape, value_and_gradient, work}
 use std::stage::Tape
 use std::quat::Quat
 use std::hash::{StateHash, pcg}
@@ -280,6 +280,59 @@ pub trait Surface: Copy + GpuData {
         let e = r * 1.0e-5 + abs(d) * 1.0e-6 + 1.0e-6
         Pruned { live, range: Interval { lo: max(x.lo, d - r - e), hi: min(x.hi, d + r + e) } }
     }
+
+    // ---- what an ask costs (§20.4): the compiler's count, `std::derive::work` ----
+
+    /// The most work one ask of its distance does as GPU code (`work` of `distance`, §18.11): a
+    /// constant of the build, the same on every machine and run.
+    fn ask_work(self) -> u32 {
+        work(|q: vec3| self.distance(q))
+    }
+
+    /// Part `i`'s own ask, in §23's numbering: the code a masked ask leaves out where `i` isn't
+    /// live, which is the largest piece of the surface holding part `i` and no other (its leaf,
+    /// with what moves, turns or displaces it alone), asked as `distance_live` asks it. A union
+    /// gives its operands'; a surface of one part, its whole masked ask; a surface of several
+    /// that is no union (an intersection, a cut, a mirror) asks all of itself wherever any part
+    /// is live, so its parts' are 0 and it is all base.
+    fn part_work(self, i: u32) -> u32 {
+        if self.parts() == 1 { masked_work(self) } else { 0 }
+    }
+
+    /// What `distance_live` does beyond the parts it asks: each union's tests of the mask and
+    /// its joins, and the code of what moves, turns or displaces several parts at once. It is
+    /// the compiler's count of a masked ask with every part live (`work` of `distance_live`, the
+    /// mask unknown to it), less every part's `part_work`.
+    fn base_work(self) -> u32 {
+        let all = masked_work(self)
+        var parts: u32 = 0
+        for i in 0..min(self.parts(), 4096) {
+            parts = plus_work(parts, self.part_work(i))
+        }
+        if all == UNBOUNDED_WORK { UNBOUNDED_WORK } else if parts >= all { 0 } else { all - parts }
+    }
+
+    /// The most work `distance_live(p, live)` does: `base_work` and each live part's
+    /// `part_work`, an upper bound on the compiler's count of the ask with `live` known. Every
+    /// part live, it is that count exactly; a part left out takes off exactly the code skipped
+    /// for it, but not the tests and joins the skip saves (a few operations a union). The parts
+    /// past the 4096th are counted live.
+    fn live_work(self, live: Live) -> u32 {
+        var w = self.base_work()
+        for i in 0..min(self.parts(), 4096) {
+            if live.has(i) {
+                w = plus_work(w, self.part_work(i))
+            }
+        }
+        w
+    }
+}
+
+/// `work` of `s`'s masked ask (`distance_live`), the mask unknown to the count: what it costs
+/// with every part live.
+fn masked_work<S: Surface>(s: S) -> u32 {
+    let live = ALL_LIVE
+    work(|q: vec3| s.distance_live(q, live))
 }
 
 /// A surface's ranges over a box (`Surface::range`): its distance's, and each component of its
@@ -1289,6 +1342,19 @@ impl<A: Surface, B: Surface> Surface for Union<A, B> {
         min(self.a.masked(p, live, first), self.b.masked(p, live, first + n))
     }
 
+    /// Its operands' parts'; a `b` of one part takes the join too, which a masked ask skips
+    /// with it.
+    fn part_work(self, i: u32) -> u32 {
+        let n = self.a.parts()
+        if i < n {
+            self.a.part_work(i)
+        } else if self.b.parts() == 1 {
+            plus_work(self.b.part_work(0), work(|x: vec2| min(x.x, x.y)))
+        } else {
+            self.b.part_work(i - n)
+        }
+    }
+
     /// An operand never below the other over the box changes nothing there.
     fn pruned<F: Copy + fn(vec3) -> vec3>(self, over: Box3, at: F, stretch: f32, live: Live, first: u32) -> Pruned {
         let n = self.a.parts()
@@ -1357,6 +1423,20 @@ impl<A: Surface, B: Surface> Surface for SmoothUnion<A, B> {
             return self.b.masked(p, live, first + n)
         }
         smin(self.a.masked(p, live, first), self.b.masked(p, live, first + n), self.k)
+    }
+
+    /// Its operands' parts'; a `b` of one part takes the join too, which a masked ask skips
+    /// with it.
+    fn part_work(self, i: u32) -> u32 {
+        let n = self.a.parts()
+        if i < n {
+            self.a.part_work(i)
+        } else if self.b.parts() == 1 {
+            let k = self.k
+            plus_work(self.b.part_work(0), work(|x: vec2| smin(x.x, x.y, k)))
+        } else {
+            self.b.part_work(i - n)
+        }
     }
 
     /// An operand at least `k` above the other everywhere in the box changes nothing there:
@@ -1451,6 +1531,24 @@ impl<S: Surface, const N: u32> Surface for UnionAll<S, N> {
             f += n
         }
         d
+    }
+
+    /// Its parts' parts'; a part of one part takes its join too, which a masked ask skips
+    /// with it.
+    fn part_work(self, i: u32) -> u32 {
+        if N == 1 {
+            return masked_work(self)
+        }
+        let (k, j) = locate(self.parts, i)
+        if k >= N {
+            return 0
+        }
+        let w = self.parts[k].part_work(j)
+        if self.parts[k].parts() == 1 {
+            plus_work(w, work(|x: vec2| min(x.x, x.y)))
+        } else {
+            w
+        }
     }
 
     /// A part that is nowhere in the box below the part whose range tops out lowest changes
@@ -1582,6 +1680,25 @@ impl<S: Surface, const N: u32> Surface for SmoothUnionAll<S, N> {
             f += n
         }
         d
+    }
+
+    /// Its parts' parts'; a part of one part takes its join too, which a masked ask skips
+    /// with it.
+    fn part_work(self, i: u32) -> u32 {
+        if N == 1 {
+            return masked_work(self)
+        }
+        let (k, j) = locate(self.parts, i)
+        if k >= N {
+            return 0
+        }
+        let w = self.parts[k].part_work(j)
+        if self.parts[k].parts() == 1 {
+            let k = self.k
+            plus_work(w, work(|x: vec2| smin(x.x, x.y, k)))
+        } else {
+            w
+        }
     }
 
     /// The fold's own rules, over the box: a part at least `k` above everything folded before
@@ -1794,6 +1911,12 @@ impl<S: Surface, M: PointMap> Surface for Warp<S, M> {
         self.map.distance_out(self.inner.masked(self.map.local(p), live, first))
     }
 
+    /// Of one part, its whole masked ask, this surface's own code included; else its inner
+    /// surface's part's.
+    fn part_work(self, i: u32) -> u32 {
+        if self.parts() == 1 { masked_work(self) } else { self.inner.part_work(i) }
+    }
+
     /// The inner surface's, asked where the map takes each point; its range in this space
     /// (`distance_out` rises with the distance, and so does its rounding).
     fn pruned<F: Copy + fn(vec3) -> vec3>(self, over: Box3, at: F, stretch: f32, live: Live, first: u32) -> Pruned {
@@ -1931,6 +2054,12 @@ impl<S: Surface, N: Noise> Surface for Displace<S, N> {
 
     fn masked(self, p: vec3, live: Live, first: u32) -> f32 {
         self.inner.masked(p, live, first) + self.amp * self.noise.value(p)
+    }
+
+    /// Of one part, its whole masked ask, this surface's own code included; else its inner
+    /// surface's part's.
+    fn part_work(self, i: u32) -> u32 {
+        if self.parts() == 1 { masked_work(self) } else { self.inner.part_work(i) }
     }
 
     /// The inner surface's (a displacement moves every operand of a union inside it alike),
@@ -2475,6 +2604,12 @@ impl<S: Surface> Surface for ToBound<S> {
         clamp(self.inner.masked(p, live, first), -self.near, self.near) * self.scale
     }
 
+    /// Of one part, its whole masked ask, this surface's own code included; else its inner
+    /// surface's part's.
+    fn part_work(self, i: u32) -> u32 {
+        if self.parts() == 1 { masked_work(self) } else { self.inner.part_work(i) }
+    }
+
     fn pruned<F: Copy + fn(vec3) -> vec3>(self, over: Box3, at: F, stretch: f32, live: Live, first: u32) -> Pruned {
         let r = self.inner.pruned(over, at, stretch, live, first)
         let lo = clamp(r.range.lo, -self.near, self.near) * self.scale
@@ -2759,6 +2894,12 @@ impl<S: Surface, C: Copy + GpuData> Surface for With<S, C> {
         self.inner.masked(p, live, first)
     }
 
+    /// Of one part, its whole masked ask, this surface's own code included; else its inner
+    /// surface's part's.
+    fn part_work(self, i: u32) -> u32 {
+        if self.parts() == 1 { masked_work(self) } else { self.inner.part_work(i) }
+    }
+
     fn pruned<F: Copy + fn(vec3) -> vec3>(self, over: Box3, at: F, stretch: f32, live: Live, first: u32) -> Pruned {
         self.inner.pruned(over, at, stretch, live, first)
     }
@@ -2823,6 +2964,12 @@ impl<S: Surface, F: Copy + GpuData> Surface for WithAt<S, F> {
 
     fn masked(self, p: vec3, live: Live, first: u32) -> f32 {
         self.inner.masked(p, live, first)
+    }
+
+    /// Of one part, its whole masked ask, this surface's own code included; else its inner
+    /// surface's part's.
+    fn part_work(self, i: u32) -> u32 {
+        if self.parts() == 1 { masked_work(self) } else { self.inner.part_work(i) }
     }
 
     fn pruned<G: Copy + fn(vec3) -> vec3>(self, over: Box3, at: G, stretch: f32, live: Live, first: u32) -> Pruned {
@@ -3417,4 +3564,70 @@ fn certified_checks_prove_what_holds_and_find_what_fails() {
         ),
         _ => assert(false, "overlapping parts are found"),
     }
+}
+
+/// Whether `s.live_work(ALL_LIVE)`, its base and every part's, is the compiler's own count of
+/// its masked ask with the mask unknown to it.
+fn counted_exactly<S: Surface>(s: S) -> bool {
+    let live = ALL_LIVE
+    s.live_work(ALL_LIVE) == work(|q: vec3| s.distance_live(q, live))
+}
+
+/// Two masks for `a_masked_ask_costs_its_base_and_its_live_parts`: parts 0, 2 and 5; parts 1
+/// and 4. (Constants, which the count follows through a shift: a bare literal it doesn't yet.)
+const MASK_A: u32 = 37
+const MASK_B: u32 = 18
+
+/// What std counts a masked ask to cost (`live_work`): with every part live, the compiler's
+/// count exactly; with a mask, never less than the compiler's count of code asking only the
+/// live parts (here a mask written as a constant the count can follow, so the parts left out
+/// are counted as not run).
+@test
+fn a_masked_ask_costs_its_base_and_its_live_parts() {
+    let cones = [
+        round_cone(vec3(0.0, 0.57, -0.03), vec3(0.0, 0.79, 0.0), r_top: 0.1, r_bottom: 0.096),
+        round_cone(vec3(0.0, 0.79, 0.0), vec3(0.0, 0.91, -0.02), r_top: 0.096, r_bottom: 0.06),
+        round_cone(vec3(0.13, 0.87, -0.04), vec3(0.28, 0.87, -0.04), r_top: 0.039, r_bottom: 0.035),
+        round_cone(vec3(-0.13, 0.87, -0.04), vec3(-0.28, 0.87, -0.04), r_top: 0.039, r_bottom: 0.035),
+        round_cone(vec3(0.07, 0.58, -0.02), vec3(0.07, 0.33, -0.02), r_top: 0.054, r_bottom: 0.043),
+        round_cone(vec3(-0.07, 0.58, -0.02), vec3(-0.07, 0.33, -0.02), r_top: 0.054, r_bottom: 0.043),
+    ]
+    let smooth = cones.smooth_union(k: 0.03)
+    let sharp = cones.union()
+    let turn = Quat::axis_angle(normalize(vec3(1.0, 2.0, 0.5)), 0.7)
+    let head = sphere(0.15).translate(vec3(0.0, 1.05, 0.0)).smooth_union(cones[2], k: 0.05).union(cones[3])
+    let block = cuboid(vec3(0.2, 0.1, 0.1)).translate(vec3(0.3, 0.2, 0.0)).displace(fbm(4.0, 3), amp: 0.01)
+    let tree = [cones[4], cones[5]].smooth_union(k: 0.02).rotate(turn).scale(1.3)
+        .union(cones[0].smooth_union(cones[1], k: 0.04).with(vec3(1.0)).union(head))
+        .smooth_union(block, k: 0.03)
+    // (Made as `to_bound` makes it, without its debug build's check of a stated steepness.)
+    let bounded = ToBound { inner: tree, near: 0.5, scale: 1.0 }
+    assert(counted_exactly(smooth), "a smooth fold")
+    assert(counted_exactly(sharp), "a sharp fold")
+    assert(counted_exactly(tree), "a tree of every union under moves, channels and a displacement")
+    assert(counted_exactly(bounded), "the tree held to a bound")
+    assert(counted_exactly(sphere(1.0)), "one part")
+    let a = work(|q: vec3| {
+        var d = EMPTY
+        for i in 0..6 {
+            if ((MASK_A >> i) & 1) != 0 {
+                d = smin(d, cones[i].distance(q), 0.03)
+            }
+        }
+        d
+    })
+    assert(smooth.live_work(Live::from_word(MASK_A)) >= a, f"smooth, mask A: {smooth.live_work(Live::from_word(MASK_A))} under {a}")
+    let b = work(|q: vec3| {
+        var d = EMPTY
+        for i in 0..6 {
+            if ((MASK_B >> i) & 1) != 0 {
+                d = min(d, cones[i].distance(q))
+            }
+        }
+        d
+    })
+    assert(sharp.live_work(Live::from_word(MASK_B)) >= b, f"sharp, mask B: {sharp.live_work(Live::from_word(MASK_B))} under {b}")
+    // A part left out takes off what it alone costs.
+    assert(smooth.live_work(Live::from_word(MASK_A)) < smooth.live_work(ALL_LIVE))
+    assert(tree.part_work(0) > 0 && tree.base_work() > 0)
 }

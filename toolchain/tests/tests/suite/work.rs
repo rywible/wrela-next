@@ -111,6 +111,47 @@ pub fn frame(time: f32, width: u32, height: u32) {{\n    var out: GpuBuffer<f32>
     assert_eq!(of(&all, "wraps").0, None, "{all:?}");
 }
 
+/// A side of a branch that returns ends its way through the function there: what follows the
+/// branch is counted on the other side's way only, and the function's work is the most of every
+/// way, as for a branch with an `else` (once, the two were summed).
+#[test]
+fn a_branch_that_returns_ends_its_way_there() {
+    let items = "fn heavy(x: f32) -> f32 {\n    var a = x\n    for _h in 0..16 {\n        a = a + sin(a)\n    }\n    a\n}\n\nfn early(x: f32) -> f32 {\n    if x > 1.0 {\n        return heavy(x)\n    }\n    heavy(x + 1.0)\n}\n\nfn branched(x: f32) -> f32 {\n    if x > 1.0 { heavy(x) } else { heavy(x + 1.0) }\n}\n";
+    let dir = kernels(
+        "work_returned",
+        items,
+        &[("returns", "    out[id] = early(x)"), ("elsed", "    out[id] = branched(x)")],
+    );
+    let all = work(&dir);
+    let early = of(&all, "returns").0.expect("bounded");
+    let branched = of(&all, "elsed").0.expect("bounded");
+    assert_eq!(early, branched, "{all:?}");
+}
+
+/// `std::derive::work` in GPU code counts a closure over what the kernel was given (a buffer it
+/// reads) as the read it is; in CPU code, where a buffer is a handle, such a closure isn't GPU
+/// code, and `work` says so (E0700).
+#[test]
+fn work_counts_a_closure_over_a_kernels_buffer() {
+    let dir = scratch("work_of_a_read");
+    let src = "use std::derive::work\nuse std::gpu::{GlobalId, GpuBuffer, GpuSpan, Slots, buffer, dispatch}\n\n\
+fn twice(xs: GpuSpan<f32>, i: u32) -> f32 {\n    xs[i] * 2.0\n}\n\n\
+@compute(64)\nfn counted(xs: GpuSpan<f32>, out: mut Slots<f32>, id: GlobalId) {\n    out[id] = f32(work(|i: u32| twice(xs, i)))\n}\n\n\
+pub fn frame(time: f32, width: u32, height: u32) {\n    let xs: GpuBuffer<f32> = buffer(64)\n    var out: GpuBuffer<f32> = buffer(64)\n\
+    dispatch(counted.bind(xs.items(), mut out), over: 64)\n}\n";
+    write_package(&dir, "work_of_a_read", src);
+    let all = work(&dir);
+    assert!(of(&all, "counted").0.is_some(), "{all:?}");
+    let cpu = scratch("work_of_a_handle");
+    let src = "use std::derive::work\nuse std::gpu::{GpuBuffer, GpuSpan, buffer}\n\n\
+fn twice(xs: GpuSpan<f32>, i: u32) -> f32 {\n    xs[i] * 2.0\n}\n\n\
+pub fn frame(time: f32, width: u32, height: u32) {\n    let b: GpuBuffer<f32> = buffer(64)\n    let xs = b.items()\n\
+    let w = work(|i: u32| twice(xs, i))\n    if w == 0 {\n        let c: GpuBuffer<f32> = buffer(1)\n    }\n}\n";
+    write_package(&cpu, "work_of_a_handle", src);
+    let (codes, all) = crate::checked(&cpu);
+    assert!(codes.contains(&"E0700".to_string()), "{all}");
+}
+
 /// A bound may be loose, never low: the host's step guard trusts it. A `break` or `continue` on
 /// a value the count doesn't know leaves what it knew with its loop, so what follows the loop
 /// (or its next pass) is counted for every way out, not only the last pass's.

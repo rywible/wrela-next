@@ -1452,6 +1452,9 @@ pub(crate) fn intrinsic(
         ) => {
             return crate::derive::call(fl, l, substs, c, ty);
         }
+        Some(Lang::WorkOf) => {
+            return work_call(fl, c);
+        }
         Some(
             l @ (Lang::LiftGradient
             | Lang::LiftJacobian
@@ -4235,6 +4238,74 @@ pub(crate) fn check_standalone(cx: &mut Cx, f: FnId, entry: Option<Entry>, subst
     if let Some((id, inputs)) = fragment {
         check_uniformity(cx, &mb, id, &inputs);
     }
+}
+
+/// `std::derive::work(f)` (language.md §14, §18.11): the most work one call of `f` does as GPU
+/// code, a constant of the build. `f` is lowered in a GPU module of its own and counted as the
+/// manifest counts an entry point (`ir::work::entry_work`, before flattening), knowing nothing
+/// of what it captures or is given; unbounded is `u32::MAX`. The same number wherever it's
+/// asked, on the CPU or in GPU code: each callable is counted once a build ([`Cx::works`]).
+pub(crate) fn work_call(fl: &mut Fl, c: &mir::Call) -> Option<ir::ValueId> {
+    let Some(crate::body::Repr::Callable(callable, _)) = fl.callable_arg(&c.args[0]) else {
+        fl.cx.err(Diagnostic::new(
+            codes::E0700,
+            c.args[0].span(),
+            "`work` counts a closure or a named function",
+        ));
+        return None;
+    };
+    let key = callable.instance_key();
+    // In GPU code, what it reaches may be the module's own resources (a buffer it captures):
+    // it's counted beside them, once for each call.
+    let n = if fl.mb.gpu.is_some() {
+        count_work(fl.cx, &key, c.span, Some(&*fl.mb))
+    } else {
+        match fl.cx.works.get(&key) {
+            Some(n) => *n,
+            None => {
+                let n = count_work(fl.cx, &key, c.span, None);
+                fl.cx.works.insert(key, n);
+                n
+            }
+        }
+    }?;
+    let u = fl.mb.m.types.u32();
+    Some(fl.value(u, ir::Expr::Const(ir::Const::U32(n))))
+}
+
+/// [`work_call`]'s count of the callable `key`: `None` if it can't be GPU code (the errors say
+/// why, with a note that `work` asked).
+/// Asked in a GPU module (`beside`), the count's module starts with its types and resources.
+fn count_work(
+    cx: &mut Cx,
+    key: &InstanceKey,
+    span: Span,
+    beside: Option<&ModuleBuilder>,
+) -> Option<u32> {
+    let name = cx.source_name(key).unwrap_or_else(|| "the function".to_string());
+    let what = format!("`{name}`, as `std::derive::work` counts it");
+    let mut mb = ModuleBuilder::gpu(GpuCx::new(what, Rc::default(), None));
+    if let Some(b) = beside {
+        mb.m.types = b.m.types.clone();
+        mb.m.resources = b.m.resources.clone();
+        mb.type_cache = b.type_cache.clone();
+    }
+    let before = cx.diags.len();
+    let id = cx.instance(&mut mb, key.clone(), None);
+    cx.drain(&mut mb);
+    check_recursion(cx, &mb);
+    if wrela_diag::has_errors(&cx.diags[before..]) {
+        let note = Diagnostic::new(
+            codes::E0700,
+            span,
+            format!("`work` counts `{name}` as GPU code, which it can't be"),
+        )
+        .with_note("`std::derive::work` counts what one call does on the GPU (§18.11): the function must be one GPU code could call");
+        cx.err(note);
+        return None;
+    }
+    let w = ir::work::entry_work(&mb.m, id).work;
+    Some(w.map_or(u32::MAX, |w| u32::try_from(w).unwrap_or(u32::MAX)))
 }
 
 #[cfg(test)]
