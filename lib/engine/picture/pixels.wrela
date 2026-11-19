@@ -36,8 +36,8 @@
 // (a shadow's edge, a thin thing's shadow), and from things that move, a shadow ray (the same
 // `ray::met`), a draw a thing over where its bound swept from the sun can shade.
 
-use light::store::{SAYS_DARK, SAYS_LIT, Store, said, said_kept, store}
-use matter::asked::{Asked, Kinded, box_span}
+use light::store::{SAYS_DARK, SAYS_LIT, SKY_WAYS, Store, said, said_kept, sky_way, store}
+use matter::asked::{Asked, Cone, Kinded, box_span, cone_met}
 use matter::cells::{Kept, kept}
 use matter::sky::{Sky, seen}
 use matter::world::{Each, World}
@@ -50,7 +50,7 @@ use reference::traced::LEAVE
 use std::collections::Vec
 use std::gpu::{
     Address, Atomics, Blend, ClipPosition, Cull, DepthPass5, DepthTexture, FragCoord, GlobalId, GpuBuffer, GpuSpan, Pass, R8,
-    Rgba16Float, Rgba32Float, Sampler, Targets5, Texels, Texture, VertexIndex, InstanceIndex, Flat, WithDepthBehind, buffer_of, read, begin_pass,
+    Rg8, Rgba16Float, Rgba32Float, Sampler, Slots, Targets5, Texels, Texture, VertexIndex, InstanceIndex, Flat, WithDepthBehind, buffer_of, read, begin_pass,
     begin_pass5_with_depth, begin_screen_pass, buffer, depth_texture, discard, dispatch, draw, label, sampler, texture, timed,
     writable_texture,
 }
@@ -369,7 +369,8 @@ fn eyed<A: Asked, S: Sky>(pixel: FragCoord, v: View, w: A, sky: S, lay: Lay, lis
         out.first = vec4(n, m.t)
         out.second = vec4(p, size)
         // (Its alpha: the sun in front of it, 1; and the thing still, 2: light's store asked.)
-        out.third = vec4(stuff.scatters(n, sun.way, -d) * sun.light * max(lean, 0.0), if lean > 0.0 { if still != 0 { 2.0 } else { 1.0 } } else { 0.0 })
+        // (Its alpha: 1 the sun in front of it, and 2 more the thing still: light's store asked.)
+        out.third = vec4(stuff.scatters(n, sun.way, -d) * sun.light * max(lean, 0.0), f32((if lean > 0.0 { 1 } else { 0 }) + (if still != 0 { 2 } else { 0 })))
         out.fourth = vec4(stuff.scatters(n, n, -d), 0.0)
         out.fifth = vec4(stuff.emits, 0.0)
         depth = depth_of(m.t)
@@ -377,20 +378,141 @@ fn eyed<A: Asked, S: Sky>(pixel: FragCoord, v: View, w: A, sky: S, lay: Lay, lis
     WithDepthBehind { color: out, depth }
 }
 
-/// What light's store says (`light::store::said`) of the sun from still things at each pixel a
-/// still thing showed in the sun (`lit`'s alpha 2): the point and size again from its place and
-/// the view, so nothing more is kept for it; into an `R8` a third a step (`said_kept`).
+/// The most parts a moving thing gives as cones (`Asked::cones`), a run of them each in `cones`.
+const CONES: u32 = 32
+
+/// Thing `w`'s parts as round cones (`Asked::cone`), from `first` on.
+@compute(64)
+fn cones_made<A: Asked>(w: A, first: u32, out: mut Slots<Cone>, id: GlobalId) {
+    out[id] = w.cone(id.x - first)
+}
+
+/// The share of the open sky's light a moving thing (its parts as cones, `cones[first..first +
+/// n]`) leaves each pixel near it: the pixel's 32 ways over its hemisphere (`sky_way`, the store's)
+/// each tested against the box round the cones and then the cones, in closed form (multiplied into
+/// what the others leave: `Blend::Multiply`).
+///
+/// Drawn at half the picture's size (what a body hides of the sky changes slowly across the
+/// screen): a texel takes the pixel at twice its place; the shade reads it filtered at its ray's
+/// own point, the edge rays' too.
+@fragment
+pub fn sky_shut<S: Sky>(pixel: FragCoord, sky: S, cones: GpuSpan<Cone>, first: u32, n: u32, place: Texture<Rgba32Float>, asks: Texture<Rgba32Float>) -> vec4 {
+    let x = min(2 * u32(pixel.position.x), place.width() - 1)
+    let y = min(2 * u32(pixel.position.y), place.height() - 1)
+    let at = place.load(x, y)
+    if at.w <= 0.0 {
+        return vec4(1.0)
+    }
+    let o = asks.load(x, y).xyz + at.xyz * LEAVE
+    var lo = vec3(1.0e30)
+    var hi = vec3(-1.0e30)
+    for k in 0..min(n, CONES) {
+        let c = cones[first + k]
+        lo = min(lo, min(c.a - vec3(c.ra), c.b - vec3(c.rb)))
+        hi = max(hi, max(c.a + vec3(c.ra), c.b + vec3(c.rb)))
+    }
+    var open = 0.0
+    var seen = 0.0
+    for j in 0..SKY_WAYS {
+        let d = sky_way(at.xyz, j)
+        let l = dot(sky.light(d), vec3(0.2126, 0.7152, 0.0722))
+        open += l
+        var clear = true
+        let b = box_span(o, d, lo, hi)
+        if b.y >= max(b.x, 0.0) {
+            for k in 0..min(n, CONES) {
+                if clear && cone_met(o, d, cones[first + k]) >= 0.0 {
+                    clear = false
+                }
+            }
+        }
+        if clear {
+            seen += l
+        }
+    }
+    vec4(if open > 0.0 { seen / open } else { 1.0 })
+}
+
+/// Each moving thing's parts made as cones (`cones_made`), before the passes.
+borrow struct Coning {
+    kept: borrow Vec<Kept>,
+    out: mut GpuBuffer<Cone>,
+}
+
+impl Each for Coning {
+    fn kind<K: Kinded>(mut self, k: K, n: u32, first: u32) {}
+
+    fn thing<A: Asked>(mut self, a: A, k: u32, bound: vec4) {
+        let n = a.cones()
+        if self.kept[k].moving && n > 0 {
+            dispatch(cones_made.bind(w: a, first: k * CONES, out: mut self.out), over: n, origin: k * CONES)
+        }
+    }
+}
+
+/// Each moving thing's darkening of the sky round it (`sky_shut`), into one pass at half the
+/// picture's size: over the pixels within four of its bound's half sides of it.
+borrow struct Shutting<S: Sky> {
+    pass: Pass<R8>,
+    sky: S,
+    kept: borrow Vec<Kept>,
+    cones: GpuSpan<Cone>,
+    place: borrow Texture<Rgba32Float>,
+    asks: borrow Texture<Rgba32Float>,
+    v: View,
+    width: u32,
+    height: u32,
+}
+
+impl<S: Sky> Each for Shutting<S> {
+    fn kind<K: Kinded>(mut self, k: K, n: u32, first: u32) {}
+
+    fn thing<A: Asked>(mut self, a: A, k: u32, bound: vec4) {
+        let n = a.cones()
+        if !self.kept[k].moving || n == 0 {
+            return
+        }
+        // (At half size: its rectangle halved.)
+        let r = rect_of(self.v, vec4(bound.xyz, 4.0 * bound.w), self.width, self.height)
+        let hw = (self.width + 1) / 2
+        let hh = (self.height + 1) / 2
+        let x0 = u32(r.x) / 2
+        let y0 = u32(r.y) / 2
+        let x1 = min((u32(r.z) + 1) / 2, hw)
+        let y1 = min((u32(r.w) + 1) / 2, hh)
+        if x1 > x0 && y1 > y0 {
+            self.pass.scissor(x0, y0, x1 - x0, y1 - y0)
+            draw(self.pass, cover, sky_shut.bind(sky: self.sky, cones: self.cones, first: k * CONES, n: n, place: self.place, asks: self.asks), vertices: 3, blend: Blend::Multiply)
+        }
+    }
+}
+
+/// What light's store says (`light::store::said`) at each pixel a still thing showed (`lit`'s
+/// alpha has 2): of the sun from still things, into red a third a step (`said_kept`), and the
+/// share of the open sky's light they let through, into green (1 where it can't say). The point
+/// and size again from its place and the view, so nothing more is kept for it.
 @fragment
 pub fn said_drawn(pixel: FragCoord, v: View, sun: vec3, place: Texture<Rgba32Float>, lit: Texture<Rgba16Float>, table: GpuSpan<u32>, lay: Lay, list: GpuSpan<u32>, count: GpuSpan<u32>) -> vec4 {
     let x = u32(pixel.position.x)
     let y = u32(pixel.position.y)
     let at = place.load(x, y)
-    if at.w <= 0.0 || lit.load(x, y).w < 1.5 {
-        return vec4(0.0)
+    if at.w <= 0.0 || !still_at(lit.load(x, y).w) {
+        return vec4(0.0, 1.0, 0.0, 0.0)
     }
     let spotted = spot(pixel.position.xy, lay, list, count)
     let p = v.at + v.ray(spotted.xy) * at.w
-    vec4(f32(said(table, p, at.xyz, v.pixel() * at.w)) / 3.0)
+    let s = said(table, p, at.xyz, v.pixel() * at.w)
+    vec4(s.x / 3.0, s.y, 0.0, 0.0)
+}
+
+/// Whether `lit`'s alpha (an eye draw's) says the sun is in front of the surface; and the thing
+/// still.
+pub fn sun_at(w: f32) -> bool {
+    (u32(w + 0.5) & 1) != 0
+}
+
+fn still_at(w: f32) -> bool {
+    (u32(w + 0.5) & 2) != 0
 }
 
 /// A thing's shadow draw: from each pixel that met matter with the sun in front of it, the sun's
@@ -405,7 +527,7 @@ pub fn shadow<A: Asked, S: Sky>(
     place: Texture<Rgba32Float>,
     asks: Texture<Rgba32Float>,
     lit: Texture<Rgba16Float>,
-    kept: Texture<R8>,
+    kept: Texture<Rg8>,
     still: u32,
     checking: u32,
 ) -> vec4 {
@@ -423,7 +545,7 @@ pub fn shadow_kind<K: Kinded, S: Sky>(
     place: Texture<Rgba32Float>,
     asks: Texture<Rgba32Float>,
     lit: Texture<Rgba16Float>,
-    kept: Texture<R8>,
+    kept: Texture<Rg8>,
     still: u32,
     checking: u32,
 ) -> vec4 {
@@ -431,13 +553,12 @@ pub fn shadow_kind<K: Kinded, S: Sky>(
 }
 
 /// What a shadow draw writes (`shadow`).
-fn shadowed<A: Asked, S: Sky>(pixel: FragCoord, w: A, sky: S, place: Texture<Rgba32Float>, asks: Texture<Rgba32Float>, lit: Texture<Rgba16Float>, kept: Texture<R8>, still: u32, checking: u32) -> vec4 {
+fn shadowed<A: Asked, S: Sky>(pixel: FragCoord, w: A, sky: S, place: Texture<Rgba32Float>, asks: Texture<Rgba32Float>, lit: Texture<Rgba16Float>, kept: Texture<Rg8>, still: u32, checking: u32) -> vec4 {
     let x = u32(pixel.position.x)
     let y = u32(pixel.position.y)
     // (A still thing's shadow where the pixel's probe decided it (`said_drawn`): no ray.)
     if still != 0 {
-        let kv: f32 = kept.load(x, y)
-        let says = said_kept(kv)
+        let says = said_kept(kept.load(x, y).x)
         if says == SAYS_LIT {
             return vec4(1.0)
         }
@@ -447,7 +568,7 @@ fn shadowed<A: Asked, S: Sky>(pixel: FragCoord, w: A, sky: S, place: Texture<Rgb
     }
     let at = place.load(x, y)
     var seen_sun = 1.0
-    if at.w > 0.0 && lit.load(x, y).w > 0.5 {
+    if at.w > 0.0 && sun_at(lit.load(x, y).w) {
         let a = asks.load(x, y)
         let m = met(w, Ray { o: a.xyz + at.xyz * LEAVE, d: sky.sun().way, from: 0.0, to: 1.0e9, wide: a.w, spread: 0.0 })
         if m.met {
@@ -524,6 +645,9 @@ pub fn shade<S: Sky, L: Look>(
     open: Texture<Rgba16Float>,
     emits: Texture<Rgba16Float>,
     sunny: Texture<R8>,
+    said: Texture<Rg8>,
+    hidden: u32,
+    shut: Texture<R8>,
     lay: Lay,
     list: GpuSpan<u32>,
     count: GpuSpan<u32>,
@@ -535,7 +659,10 @@ pub fn shade<S: Sky, L: Look>(
     var colour = look.tone(Seen { light: seen(sky, v.ray(spotted.xy)) })
     if at.w > 0.0 {
         let found: f32 = sunny.load(x, y)
-        let light = emits.load(x, y).xyz + lit.load(x, y).xyz * found + open.load(x, y).xyz * sky_on(table, s, at.xyz)
+        // (The open sky's light, less what still things hide of it, as light's store says.)
+        let shut_by: f32 = shut.sample_level(s, spotted.xy / vec2(f32(place.width()), f32(place.height())), 0.0)
+        let seen_sky = if hidden != 0 { said.load(x, y).y * shut_by } else { 1.0 }
+        let light = emits.load(x, y).xyz + lit.load(x, y).xyz * found + open.load(x, y).xyz * sky_on(table, s, at.xyz) * seen_sky
         colour = look.tone(Seen { light })
     }
     vec4(colour, 1.0)
@@ -668,7 +795,7 @@ borrow struct Shadows<S: Sky> {
     /// whether the decisions are being checked (every still thing's ray asked, no moving thing's
     /// shadow).
     kept: borrow Vec<Kept>,
-    said: borrow Texture<R8>,
+    said: borrow Texture<Rg8>,
     checking: bool,
 }
 
@@ -976,7 +1103,11 @@ pub struct Sight {
     burned: Texture<R8>,
     /// Light's store (`light::store`), and what it says of each pixel's sun (`said_drawn`).
     light: Store,
-    light_said: Texture<R8>,
+    light_said: Texture<Rg8>,
+    /// Moving things' parts as cones (`CONES` a thing), and the share of the open sky's light
+    /// they leave each pixel (`sky_shut`).
+    cones: GpuBuffer<Cone>,
+    shut: Texture<R8>,
     trace_out: GpuBuffer<u32>,
     trace_read: Option<Pending<u32>>,
     /// The load beside each frame (sines a pixel; 0: none).
@@ -1023,6 +1154,8 @@ pub fn sight() -> Sight {
         burned: texture(width: 1, height: 1),
         light: store(),
         light_said: texture(width: 1, height: 1),
+        cones: buffer(CONES),
+        shut: texture(width: 1, height: 1),
         trace_out: buffer(1),
         trace_read: None,
         load: 0,
@@ -1139,7 +1272,7 @@ impl Sight {
         if !self.light.off {
             // What light's store says of each pixel's sun from still things (`said_drawn`).
             label(if edge { "edge light read" } else { "light read" })
-            let p = begin_pass(mut self.light_said, clear: vec4(0.0))
+            let p = begin_pass(mut self.light_said, clear: vec4(0.0, 1.0, 0.0, 0.0))
             let sun = sky.sun().way
             if edge {
                 let tt = tiles_of(width, height)
@@ -1174,15 +1307,28 @@ impl Sight {
         if !edge && self.light.checking {
             self.light.checked(self.drawn.place, self.lit, self.drawn.sun, self.light_said)
         }
+        // What moving things hide of the sky round them (`sky_shut`: the picture's, at half size;
+        // the edge rays read it too).
+        if !edge {
+            label("sky shut")
+            let q = begin_pass(mut self.shut, clear: vec4(1.0))
+            if !self.light.off {
+                var e = Shutting { pass: q, sky, kept: self.kept, cones: self.cones.items(), place: self.drawn.place, asks: self.asks, v, width, height }
+                world.each(self.kept, kinds, 0, mut e)
+                e.pass.end()
+            } else {
+                q.end()
+            }
+        }
         label(if edge { "edge shade" } else { "shade" })
         if edge {
             let p = begin_pass(mut self.edge_rays)
             let tt = tiles_of(width, height)
-            draw(p, rays_tiles.bind(tile_at: self.edge_tile_at.items(), tx0: 0, tx1: tt.x - 1, ty0: 0, tw: tt.x, most: width * height / EDGE_SHARE, width: width, height: height, z: 0.5), shade.bind(v: v, sky: sky, look: look, table: self.table, s: self.s, place: self.edge_place, lit: self.lit, open: self.open, emits: self.emits, sunny: self.sunny, lay: lay, list: self.edge_list.items(), count: self.edge_count.items()), vertices: 18, instances: tt.y)
+            draw(p, rays_tiles.bind(tile_at: self.edge_tile_at.items(), tx0: 0, tx1: tt.x - 1, ty0: 0, tw: tt.x, most: width * height / EDGE_SHARE, width: width, height: height, z: 0.5), shade.bind(v: v, sky: sky, look: look, table: self.table, s: self.s, place: self.edge_place, lit: self.lit, open: self.open, emits: self.emits, sunny: self.sunny, said: self.light_said, hidden: if self.light.off { 0 } else { 1 }, shut: self.shut, lay: lay, list: self.edge_list.items(), count: self.edge_count.items()), vertices: 18, instances: tt.y)
             p.end()
         } else {
             let p = begin_pass(mut self.raw)
-            draw(p, cover, shade.bind(v: v, sky: sky, look: look, table: self.table, s: self.s, place: self.drawn.place, lit: self.lit, open: self.open, emits: self.emits, sunny: self.drawn.sun, lay: lay, list: self.edge_list.items(), count: self.edge_count.items()), vertices: 3)
+            draw(p, cover, shade.bind(v: v, sky: sky, look: look, table: self.table, s: self.s, place: self.drawn.place, lit: self.lit, open: self.open, emits: self.emits, sunny: self.drawn.sun, said: self.light_said, hidden: if self.light.off { 0 } else { 1 }, shut: self.shut, lay: lay, list: self.edge_list.items(), count: self.edge_count.items()), vertices: 3)
             p.end()
         }
     }
@@ -1278,6 +1424,7 @@ impl Sight {
             self.depth = depth_texture(width: width, height: height)
             self.sunny = texture(width: width, height: height)
             self.light_said = texture(width: width, height: height)
+            self.shut = texture(width: (width + 1) / 2, height: (height + 1) / 2)
             self.edge_place = texture(width: width, height: height)
             self.edge_asks = texture(width: width, height: height)
         }
@@ -1303,8 +1450,16 @@ impl Sight {
             },
         }
         self.light.kept_for(self.kept, sky.sun().way)
-        // (Its kinds' values for the GPU, before any pass.)
+        // (Its kinds' values for the GPU, and moving things' parts as cones, before any pass.)
         let kinds = world.kinds(self.kept, 0)
+        if self.cones.len() < world.count() * CONES {
+            self.cones = buffer(world.count() * CONES)
+        }
+        if !self.light.off {
+            label("cones")
+            var c = Coning { kept: self.kept, out: mut self.cones }
+            world.each(self.kept, kinds, 0, mut c)
+        }
         label("sky table")
         dispatch(skylit.bind(sky: sky, out: mut self.table), groups: ((TABLE + 7) / 8, (TABLE + 7) / 8, 1))
         let bands = self.bands
@@ -1330,7 +1485,7 @@ impl Sight {
         self.drawn.placed = true
         // Light fills the probes this frame's pixels made.
         if !self.light.off {
-            self.light.fill(world, kinds, self.kept, sky.sun().way)
+            self.light.fill(world, kinds, self.kept, sky)
         }
         // Matter refines its cells where this picture asked finer than they hold.
         world.refine(mut self.kept, 0, self.asks, self.drawn.place)
