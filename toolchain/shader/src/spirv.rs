@@ -898,6 +898,8 @@ enum Outputs {
 struct FunctionWriter<'a, 'm> {
     w: &'a mut Writer<'m>,
     f: &'m ir::Function,
+    /// Its float values' bounds (`wrela_ir::ranges`): a conversion of a bounded one isn't clamped.
+    ranges: wrela_ir::ranges::Ranges<'m>,
     entry: Option<&'m ir::EntryPoint>,
     /// The function's variables, written in its first block.
     vars: Vec<Word>,
@@ -940,6 +942,7 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
         let mut fw = FunctionWriter {
             w,
             f,
+            ranges: wrela_ir::ranges::Ranges::new(f),
             entry,
             vars: Vec::new(),
             body: Vec::new(),
@@ -2131,6 +2134,18 @@ impl FunctionWriter<'_, '_> {
                 };
                 let zero = self.w.splat_const(xt, zero, n);
                 self.op(op, ty, &[id, zero])
+            }
+            // A value its own code bounds inside the integer's range (`wrela_ir::ranges`) converts
+            // as it is: the clamp would change nothing (above -1, truncation gives 0 too).
+            (S::F32 | S::F16, S::I32 | S::U32)
+                if self.ranges.within(
+                    x,
+                    if s == S::I32 { -2147483648.0 } else { -0.999 },
+                    if s == S::I32 { 2147483520.0 } else { 4294967040.0 },
+                ) =>
+            {
+                let op = if s == S::I32 { Op::ConvertFToS } else { Op::ConvertFToU };
+                self.op(op, ty, &[id])
             }
             (S::F32 | S::F16, S::I32 | S::U32) => {
                 let xt = self.w.ty(self.ty_of(x), false)?;

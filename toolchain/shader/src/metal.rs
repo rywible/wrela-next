@@ -954,6 +954,8 @@ struct Val {
 struct FunctionWriter<'a, 'm> {
     w: &'a mut Writer<'m>,
     f: &'m ir::Function,
+    /// Its float values' bounds (`wrela_ir::ranges`): a conversion of a bounded one isn't clamped.
+    ranges: wrela_ir::ranges::Ranges<'m>,
     id: ir::FuncId,
     entry: Option<&'m ir::EntryPoint>,
     out: String,
@@ -1017,6 +1019,7 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
         Ok(FunctionWriter {
             w,
             f,
+            ranges: wrela_ir::ranges::Ranges::new(f),
             id,
             entry,
             out: String::new(),
@@ -2064,7 +2067,18 @@ impl FunctionWriter<'_, '_> {
                 let from = self.scalar_of(*x).ok_or("internal: a conversion of a non-number")?;
                 let xt = self.ty_of(*x);
                 let to = self.numeric_like(xt, *s)?;
-                if from.is_float() && matches!(s, ir::Scalar::I32 | ir::Scalar::U32) {
+                let signed = *s == ir::Scalar::I32;
+                // A value its own code bounds inside the integer's range (`wrela_ir::ranges`)
+                // converts as it is: the clamp would change nothing (above -1, truncation gives 0
+                // too).
+                let bounded = from.is_float()
+                    && matches!(s, ir::Scalar::I32 | ir::Scalar::U32)
+                    && self.ranges.within(
+                        *x,
+                        if signed { -2147483648.0 } else { -0.999 },
+                        if signed { 2147483520.0 } else { 4294967040.0 },
+                    );
+                if from.is_float() && matches!(s, ir::Scalar::I32 | ir::Scalar::U32) && !bounded {
                     let from_name = self.numeric_like(xt, from)?;
                     let signed = *s == ir::Scalar::I32;
                     self.w.helpers.insert(Helper::F2I(from_name, to.clone(), signed));

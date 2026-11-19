@@ -26,6 +26,7 @@ pub mod layout;
 mod merge_calls;
 pub mod opt;
 pub mod print;
+pub mod ranges;
 pub mod rates;
 pub mod same;
 pub mod scalarize;
