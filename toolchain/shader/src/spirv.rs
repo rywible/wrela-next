@@ -1677,7 +1677,12 @@ fn static_len(types: &ir::Types, t: ir::TypeId) -> Option<u32> {
 impl FunctionWriter<'_, '_> {
     /// An index into something of `len` elements, or into a sized buffer's array (`runtime`: its
     /// variable): clamped into range by `UMin` unless it's a constant known to be inside, and a
-    /// `u32` either way.
+    /// `u32` either way. A buffer's index isn't clamped: the device's robust buffer access, which
+    /// the native host requires, keeps every read and write inside the buffer (a read gives a
+    /// value from inside it, or 0; a write lands inside it, or nowhere: WebGPU's robust access,
+    /// language.md §11.3). AMD's hardware checks a buffer load against its descriptor's size for
+    /// nothing, so a clamp a load was work twice over: the stack's eye on the Radeon, 8.32 ->
+    /// 7.46 ms (backend.md, item 19). A debug build still checks each index (`wrela_ir::bounds`).
     fn index(&mut self, i: ir::ValueId, len: Option<u32>, runtime: Option<Word>) -> R<Word> {
         let u = self.w.u32_ty();
         let mut id = self.val(i)?;
@@ -1699,11 +1704,7 @@ impl FunctionWriter<'_, '_> {
         }
         let max = match (len, runtime) {
             (Some(n), _) => self.w.const_u32(n - 1),
-            (None, Some(var)) => {
-                let length = self.op(Op::ArrayLength, u, &[var, 0]);
-                let one = self.w.const_u32(1);
-                self.op(Op::ISub, u, &[length, one])
-            }
+            (None, Some(_)) => return Ok(id),
             (None, None) => return Err("internal: an index with no length".into()),
         };
         Ok(self.ext(GLOp::UMin, u, &[id, max]))

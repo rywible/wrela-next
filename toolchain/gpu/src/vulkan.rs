@@ -368,6 +368,9 @@ impl Device {
                 ),
                 (base.shader_sampled_image_array_dynamic_indexing, "sampled images indexed"),
                 (base.shader_storage_image_array_dynamic_indexing, "storage images indexed"),
+                // What keeps a kernel's buffer indexes inside their buffers (the SPIR-V doesn't
+                // clamp them: `wrela_shader::spirv`, language.md §11.3).
+                (base.robust_buffer_access, "robust buffer access"),
             ] {
                 if have == vk::FALSE {
                     return Err(Error(format!("the GPU lacks {what}, which the host needs")));
@@ -475,6 +478,7 @@ impl Device {
                     f13.shader_demote_to_helper_invocation == vk::TRUE,
                 );
             let on = vk::PhysicalDeviceFeatures::default()
+                .robust_buffer_access(true)
                 .multi_draw_indirect(base.multi_draw_indirect == vk::TRUE)
                 .draw_indirect_first_instance(base.draw_indirect_first_instance == vk::TRUE)
                 .sampler_anisotropy(base.sampler_anisotropy == vk::TRUE)
