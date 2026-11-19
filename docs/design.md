@@ -80,7 +80,8 @@ the field itself. The engine chooses; no author does.
   wand and the tips of its ears, and opened holes.) Until that holds, the choice changes what is
   drawn, and nothing may choose it.
 - **The choice is the same on every run and every machine.** It is made from what the toolchain
-  counts an ask of the field to cost, fixed when the game is built, never from timing a run.
+  counts or measures an ask of the field to cost, fixed when the game is built (or once for a
+  machine, and kept), never from timing while playing.
   (Measured: an engine that chose by timing its own frames chose differently for the same build
   with the GPU in a different state, and so drew a different picture.)
 
@@ -424,6 +425,23 @@ it and the judges hold it to the same picture:
   Each becomes a constant of that thing's code instead of something found out while running.
 - **The engine's own code run at build time over the world,** to lay out a draw a kind of thing,
   join things that share a structure, and fill a still thing's cells ahead.
+
+**The build measures, and picks.** With more than one way to realise a thing (closed form, its
+whole field, its live parts, cells at a size), which to use is not guessed from a count: when
+the game is built, each kind of thing is tried each way, for how finely it is seen (a pixel's
+width on it, from close to far) and whether it moves. Two numbers come back for each: what it
+costs, timed, and how far it is from the field itself, by rays thrown at it (not whole pictures:
+thousands of rays a thing are quick). Ways that miss the picture's lines at a fineness are
+thrown out; of the rest the cheapest is kept, as a small table a thing: this way from here to
+there, that way beyond. That table is automatic level of detail, it is the same on every run,
+and under load the engine can move along it toward cheaper, so quality gives with load and never
+with phrasing. A count from the compiler stays as the first guess and for a build with no GPU.
+Costs differ between machines, so a table is kept a tier of hardware, or measured once on the
+player's machine and kept; never while playing. Every way kept draws the same picture to the
+judges' lines, so a table can only change cost. **Dead if** trying a kind of thing costs more
+than a few seconds of build (kept between builds by the field's hash), or if the cheapest way
+measured alone is not the cheapest in the frame (pixels drawn together wait for the slowest)
+often enough that the tables mislead.
 
 The first needs nothing new in the language and may replace most of "looking coarsely first"
 for things built of std's shapes. **Dead if**, on the stage and the body, meeting in closed form
