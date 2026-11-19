@@ -378,8 +378,53 @@ fn eyed<A: Asked, S: Sky>(pixel: FragCoord, v: View, w: A, sky: S, lay: Lay, lis
     WithDepthBehind { color: out, depth }
 }
 
-/// The most parts a moving thing gives as cones (`Asked::cones`), a run of them each in `cones`.
+/// The most parts a moving thing gives as cones (`Asked::cones`), a run of them each in `cones`
+/// (and in `hulls`, the box round them and how far they hide the sky: `hull_made`).
 const CONES: u32 = 32
+
+/// How many of the picture's pixels a side a texel of the moving things' share of the sky covers
+/// (`sky_shut`: what a body hides of the sky changes slowly across the screen).
+const SHUT: u32 = 4
+
+/// The sky's light along each way, a table a frame (`skyward`; an octahedron's fold, `RADIANCE`
+/// texels a side), as the moving things' share of the sky reads it.
+const RADIANCE: u32 = 64
+
+/// The sky's light (radiance) along the way texel `id` stands for.
+@compute(8, 8)
+pub fn skyward<S: Sky>(sky: S, out: mut Texels<Rgba16Float>, id: GlobalId) {
+    if id.x >= RADIANCE || id.y >= RADIANCE {
+        return
+    }
+    let d = unocta((vec2(f32(id.x), f32(id.y)) + vec2(0.5)) / f32(RADIANCE) * 2.0 - vec2(1.0))
+    out.store(id, vec4(sky.light(d), 1.0))
+}
+
+/// The sky's light along `d`, from the table (`skyward`).
+fn sky_along(table: Texture<Rgba16Float>, s: Sampler, d: vec3) -> vec3 {
+    let e = octa(d) * 0.5 + vec2(0.5)
+    table.sample_level(s, (e * (f32(RADIANCE) - 1.0) + vec2(0.5)) / f32(RADIANCE), 0.0).xyz
+}
+
+/// The box round moving thing `id.x`'s `n` cones (`cones[first..first + n]`), as a cone (`a` its
+/// least corner, `b` its greatest) into `hulls`, and how far from the box's middle it can hide one in
+/// `SKY_WAYS` of the sky (`ra`: where its cones' outline, seen across, fills under that share of a
+/// hemisphere's cosine-spread sky; past it, a pixel's ways all pass it).
+@compute(1)
+fn hull_made(cones: [Cone], first: u32, n: u32, hulls: mut Slots<Cone>, id: GlobalId) {
+    var lo = vec3(1.0e30)
+    var hi = vec3(-1.0e30)
+    var area = 0.0
+    for k in 0..min(n, CONES - 1) {
+        let c = cones[first + k]
+        lo = min(lo, min(c.a - vec3(c.ra), c.b - vec3(c.rb)))
+        hi = max(hi, max(c.a + vec3(c.ra), c.b + vec3(c.rb)))
+        let r = max(c.ra, c.rb)
+        area += 2.0 * r * length(c.b - c.a) + 3.14159265 * r * r
+    }
+    let reach = sqrt(f32(SKY_WAYS) * area / 3.14159265) + 0.5 * length(hi - lo)
+    hulls[id] = Cone { a: lo, ra: reach, b: hi, rb: 0.0 }
+}
 
 /// Thing `w`'s parts as round cones (`Asked::cone`), from `first` on.
 @compute(64)
@@ -392,30 +437,29 @@ fn cones_made<A: Asked>(w: A, first: u32, out: mut Slots<Cone>, id: GlobalId) {
 /// each tested against the box round the cones and then the cones, in closed form (multiplied into
 /// what the others leave: `Blend::Multiply`).
 ///
-/// Drawn at half the picture's size (what a body hides of the sky changes slowly across the
-/// screen): a texel takes the pixel at twice its place; the shade reads it filtered at its ray's
-/// own point, the edge rays' too.
+/// Drawn at a `SHUT`th of the picture's size a side: a texel takes the pixel at its middle; the
+/// shade reads it filtered at its ray's own point, the edge rays' too.
 @fragment
-pub fn sky_shut<S: Sky>(pixel: FragCoord, sky: S, cones: GpuSpan<Cone>, first: u32, n: u32, place: Texture<Rgba32Float>, asks: Texture<Rgba32Float>) -> vec4 {
-    let x = min(2 * u32(pixel.position.x), place.width() - 1)
-    let y = min(2 * u32(pixel.position.y), place.height() - 1)
+pub fn sky_shut(pixel: FragCoord, radiance: Texture<Rgba16Float>, s: Sampler, cones: GpuSpan<Cone>, hulls: GpuSpan<Cone>, first: u32, n: u32, place: Texture<Rgba32Float>, asks: Texture<Rgba32Float>) -> vec4 {
+    let x = min(SHUT * u32(pixel.position.x) + SHUT / 2, place.width() - 1)
+    let y = min(SHUT * u32(pixel.position.y) + SHUT / 2, place.height() - 1)
     let at = place.load(x, y)
     if at.w <= 0.0 {
         return vec4(1.0)
     }
     let o = asks.load(x, y).xyz + at.xyz * LEAVE
-    var lo = vec3(1.0e30)
-    var hi = vec3(-1.0e30)
-    for k in 0..min(n, CONES) {
-        let c = cones[first + k]
-        lo = min(lo, min(c.a - vec3(c.ra), c.b - vec3(c.rb)))
-        hi = max(hi, max(c.a + vec3(c.ra), c.b + vec3(c.rb)))
+    // (Its box and its reach, made once a frame: past the reach it hides nothing of the sky.)
+    let hull = hulls[first / CONES]
+    let lo = hull.a
+    let hi = hull.b
+    if length(o - 0.5 * (lo + hi)) > hull.ra {
+        return vec4(1.0)
     }
     var open = 0.0
     var seen = 0.0
     for j in 0..SKY_WAYS {
         let d = sky_way(at.xyz, j)
-        let l = dot(sky.light(d), vec3(0.2126, 0.7152, 0.0722))
+        let l = dot(sky_along(radiance, s, d), vec3(0.2126, 0.7152, 0.0722))
         open += l
         var clear = true
         let b = box_span(o, d, lo, hi)
@@ -437,6 +481,7 @@ pub fn sky_shut<S: Sky>(pixel: FragCoord, sky: S, cones: GpuSpan<Cone>, first: u
 borrow struct Coning {
     kept: borrow Vec<Kept>,
     out: mut GpuBuffer<Cone>,
+    hulls: mut GpuBuffer<Cone>,
 }
 
 impl Each for Coning {
@@ -446,6 +491,7 @@ impl Each for Coning {
         let n = a.cones()
         if self.kept[k].moving && n > 0 {
             dispatch(cones_made.bind(w: a, first: k * CONES, out: mut self.out), over: n, origin: k * CONES)
+            dispatch(hull_made.bind(cones: self.out.items(), first: k * CONES, n: n, hulls: mut self.hulls), over: 1, origin: k)
         }
     }
 }
@@ -455,6 +501,9 @@ impl Each for Coning {
 borrow struct Shutting<S: Sky> {
     pass: Pass<R8>,
     sky: S,
+    radiance: borrow Texture<Rgba16Float>,
+    s: borrow Sampler,
+    hulls: GpuSpan<Cone>,
     kept: borrow Vec<Kept>,
     cones: GpuSpan<Cone>,
     place: borrow Texture<Rgba32Float>,
@@ -474,15 +523,15 @@ impl<S: Sky> Each for Shutting<S> {
         }
         // (At half size: its rectangle halved.)
         let r = rect_of(self.v, vec4(bound.xyz, 4.0 * bound.w), self.width, self.height)
-        let hw = (self.width + 1) / 2
-        let hh = (self.height + 1) / 2
-        let x0 = u32(r.x) / 2
-        let y0 = u32(r.y) / 2
-        let x1 = min((u32(r.z) + 1) / 2, hw)
-        let y1 = min((u32(r.w) + 1) / 2, hh)
+        let hw = (self.width + SHUT - 1) / SHUT
+        let hh = (self.height + SHUT - 1) / SHUT
+        let x0 = u32(r.x) / SHUT
+        let y0 = u32(r.y) / SHUT
+        let x1 = min((u32(r.z) + SHUT - 1) / SHUT, hw)
+        let y1 = min((u32(r.w) + SHUT - 1) / SHUT, hh)
         if x1 > x0 && y1 > y0 {
             self.pass.scissor(x0, y0, x1 - x0, y1 - y0)
-            draw(self.pass, cover, sky_shut.bind(sky: self.sky, cones: self.cones, first: k * CONES, n: n, place: self.place, asks: self.asks), vertices: 3, blend: Blend::Multiply)
+            draw(self.pass, cover, sky_shut.bind(radiance: self.radiance, s: self.s, cones: self.cones, hulls: self.hulls, first: k * CONES, n: n, place: self.place, asks: self.asks), vertices: 3, blend: Blend::Multiply)
         }
     }
 }
@@ -1107,7 +1156,9 @@ pub struct Sight {
     /// Moving things' parts as cones (`CONES` a thing), and the share of the open sky's light
     /// they leave each pixel (`sky_shut`).
     cones: GpuBuffer<Cone>,
+    hulls: GpuBuffer<Cone>,
     shut: Texture<R8>,
+    radiance: Texture<Rgba16Float>,
     trace_out: GpuBuffer<u32>,
     trace_read: Option<Pending<u32>>,
     /// The load beside each frame (sines a pixel; 0: none).
@@ -1155,7 +1206,9 @@ pub fn sight() -> Sight {
         light: store(),
         light_said: texture(width: 1, height: 1),
         cones: buffer(CONES),
+        hulls: buffer(1),
         shut: texture(width: 1, height: 1),
+        radiance: writable_texture(width: RADIANCE, height: RADIANCE),
         trace_out: buffer(1),
         trace_read: None,
         load: 0,
@@ -1313,7 +1366,7 @@ impl Sight {
             label("sky shut")
             let q = begin_pass(mut self.shut, clear: vec4(1.0))
             if !self.light.off {
-                var e = Shutting { pass: q, sky, kept: self.kept, cones: self.cones.items(), place: self.drawn.place, asks: self.asks, v, width, height }
+                var e = Shutting { pass: q, sky, radiance: self.radiance, s: self.s, hulls: self.hulls.items(), kept: self.kept, cones: self.cones.items(), place: self.drawn.place, asks: self.asks, v, width, height }
                 world.each(self.kept, kinds, 0, mut e)
                 e.pass.end()
             } else {
@@ -1424,7 +1477,7 @@ impl Sight {
             self.depth = depth_texture(width: width, height: height)
             self.sunny = texture(width: width, height: height)
             self.light_said = texture(width: width, height: height)
-            self.shut = texture(width: (width + 1) / 2, height: (height + 1) / 2)
+            self.shut = texture(width: (width + SHUT - 1) / SHUT, height: (height + SHUT - 1) / SHUT)
             self.edge_place = texture(width: width, height: height)
             self.edge_asks = texture(width: width, height: height)
         }
@@ -1454,14 +1507,16 @@ impl Sight {
         let kinds = world.kinds(self.kept, 0)
         if self.cones.len() < world.count() * CONES {
             self.cones = buffer(world.count() * CONES)
+            self.hulls = buffer(world.count())
         }
         if !self.light.off {
             label("cones")
-            var c = Coning { kept: self.kept, out: mut self.cones }
+            var c = Coning { kept: self.kept, out: mut self.cones, hulls: mut self.hulls }
             world.each(self.kept, kinds, 0, mut c)
         }
         label("sky table")
         dispatch(skylit.bind(sky: sky, out: mut self.table), groups: ((TABLE + 7) / 8, (TABLE + 7) / 8, 1))
+        dispatch(skyward.bind(sky: sky, out: mut self.radiance), groups: ((RADIANCE + 7) / 8, (RADIANCE + 7) / 8, 1))
         let bands = self.bands
         // The picture: each thing's eye draw, each thing's shadow draw, the shade.
         let screen = Lay { edges: 0, width, spare: 0, spare2: 0 }
