@@ -1,29 +1,22 @@
-// What an ask of a field costs, as the engine weighs it to choose whether a thing is asked by its
-// field or by its cells. A STAND-IN, in this one place, until the toolchain hands the program the
-// work it already counts for each pipeline (the build manifest's `work`; asked for, gap 8): then
-// this file goes, and `asked_by` reads that.
+// What an ask costs, as a thing's roots weigh it to choose who answers in each: the parts of its
+// field live there, or its cells (`cells::coarsed`). A STAND-IN, in this one place, until the
+// toolchain hands the program the work it already counts (the build manifest's `work`; asked for,
+// gap 8): then this file goes, and the roots read that.
 //
-// Deterministic: the toolchain turns any field into a tape of operations (`Surface::to_tape`,
-// `std::derive::tape`: what doesn't depend on the point is folded to constants, both sides of a
-// branch kept), so the same field weighs the same on every run and machine. Each operation weighs
-// 1; a value noise or a lattice hash (one operation on the tape, a hundred or so when run)
-// `NOISE_WEIGHT`; an fBm `FBM_OCTAVES` of them. (Slice 1b multiplied the weight by the steepness
-// the field states; a stated steepness is no longer read here (slice 1c: only `ranges`' marked
-// stand-in reads one), and the choices it made are the same without it: the stage 50, the
-// creature 964, the stack 1,058.)
+// Deterministic: the toolchain turns any field into a tape of operations (`std::derive::tape`:
+// what doesn't depend on the point is folded to constants, both sides of a branch kept), so the
+// same field weighs the same on every run and machine. Each operation weighs 1; a value noise or
+// a lattice hash (one operation on the tape, a hundred or so when run) `NOISE_WEIGHT`; an fBm
+// `FBM_OCTAVES` of them. (Slice 1a measured an ask of the creature's field, 964 operations, at
+// 0.87 to 1.15 ns on the M4 and the stack's, 158 and 6 noises, at 0.9 to 1.6 ns: a noise is about
+// 130 operations.)
 //
-// The weights are fitted to slice 1a's measures (wrela-notes/engine/NOTES.md): an ask of the
-// creature's field (964 operations) took 0.87 to 1.15 ns on the M4, the stack's (158 and 6 noises)
-// 0.9 to 1.6 ns, so a noise is about 130 operations. `AFFORD` sits between the stage's 50, whose
-// frame by its cells was dearer (slice 1b: stage and creature both by cells 22.2 ms at 1080p on
-// the M4), and the creature's 964, whose frame by its field was dearer (9.26 ms; by its cells,
-// the stage by its field, 8.10 ms).
+// A read of cells is weighed the same way, by counting what its code does (`CELL_READ`).
 
-use matter::ranges::surface_points
 use matter::substance::Substance
 use std::collections::Vec
-use std::derive::{Box3, tape}
-use std::field::Field
+use std::derive::tape
+use std::field::{Field, Live}
 use std::stage::{FBM3, HASH, NOISE3, Tape}
 
 /// What one value noise (or lattice hash) on a tape weighs, in operations.
@@ -32,49 +25,42 @@ pub const NOISE_WEIGHT: f32 = 150.0
 /// The octaves an fBm on a tape is weighed as.
 const FBM_OCTAVES: f32 = 6.0
 
-/// The most an ask of a thing may weigh (operations) for the thing to be asked by its field.
-pub const AFFORD: f32 = 500.0
+/// What a step's read of cells weighs, in the toolchain's own units of work (toolchain/ir/src/
+/// work.rs: an operation on a component 1, a division 4, a read of a buffer 8), counted from its
+/// code: a level of its tree walked (a test 2, a read 8, the child's place and number 12, its
+/// record read 8: 30) and its distance read between eight texels (`cells::read_distance`: the
+/// place in the brick 24, the first texel's number 14, eight reads 64, their masks and
+/// conversions 16, seven blends 21, the scale 3: 142).
+pub const CELL_READ: f32 = 172.0
 
-/// What `field`'s ask weighs (operations).
-pub fn weighed<M: Field<Substance>>(field: M) -> f32 {
-    tape_weight(field.to_tape())
-}
+/// What a ray's fetch of a root weighs, counted the same way (`asked::Seen::fetched`): the root
+/// found (the place in the grid 24, its number 6), its six words read (48), and where the ray
+/// leaves the roots it holds (24): about 100. An empty root is crossed in a stride (a fetch) only
+/// where that weighs less than asking the thing's whole field there.
+pub const FETCH: f32 = 100.0
 
-/// What an ask of `field` by the parts live where it is asked weighs (operations), on the mean:
-/// at `POINTS` points on its surface (`ranges::surface_points`, round where it is: `at`), the parts
-/// `Surface::live` leaves in a box `side` m wide round each (the root it would be asked in), each
-/// part its own weight; and `ROOT_STEP` for keeping them a root.
-pub fn weighed_by_parts<M: Field<Substance>>(field: M, at: vec4, side: f32) -> f32 {
-    let n = min(field.parts(), 32)
-    var each: Vec<f32> = Vec::filled(n, 0.0)
+/// What an ask of `field` weighs, for its roots' choice (operations): each of its parts', in std's
+/// numbering, the first 32; then what every part past them weighs together (a mask names only the
+/// first 32: the rest are always asked); then its whole ask's; then what a masked ask weighs beyond
+/// the parts it asks (its masked ask's tape, with a mask the tape can't fold so every test of it is
+/// kept, less its whole ask's).
+pub fn part_weights<M: Field<Substance>>(field: M) -> Vec<f32> {
+    let n = field.parts()
+    var out: Vec<f32> = Vec::filled(min(n, 32) + 3, 0.0)
     for i in 0..n {
-        each[i] = tape_weight(tape(|q: vec3| field.part_distance(q, i)))
-    }
-    let points = surface_points(field, at, POINTS)
-    if points.len() == 0 {
-        return 1.0e30
-    }
-    var sum = 0.0
-    for p in points {
-        let w = field.live(Box3 { lo: p - vec3(0.5 * side), hi: p + vec3(0.5 * side) }).word()
-        for i in 0..n {
-            if ((w >> i) & 1) != 0 {
-                sum += each[i]
-            }
+        let w = tape_weight(tape(|q: vec3| field.part_distance(q, i)))
+        if i < 32 {
+            out[i] = w
+        } else {
+            out[min(n, 32)] += w
         }
     }
-    sum / f32(points.len()) + ROOT_STEP
+    let whole = tape_weight(tape(|q: vec3| field.distance(q)))
+    let masked = tape_weight(tape(|q: vec3| field.distance_live(q, Live::from_word(if q.x > 1.0e30 { 0 } else { 4294967295 }))))
+    out[min(n, 32) + 1] = whole
+    out[min(n, 32) + 2] = max(masked - whole, 0.0)
+    out
 }
-
-/// Points on a thing's surface `weighed_by_parts` weighs an ask at.
-const POINTS: u32 = 64
-
-/// What a step costs, in operations, for a thing asked by its parts beyond the parts themselves:
-/// looking its root up, and keeping the step inside the root (where the parts it asks are the
-/// whole). Fitted to the stage alone at 1080p on the M4, whose 50-operation ask drew in 5.13 ms
-/// with no root looked up and 8.52 ms with one looked up and the step kept to it: two thirds of
-/// an ask, 33 operations. A stand-in with the rest of this file (gap 8).
-const ROOT_STEP: f32 = 33.0
 
 /// What a tape's ask weighs (operations).
 fn tape_weight(t: Tape) -> f32 {

@@ -1,12 +1,18 @@
-// Matter's cells (docs/design.md, "Cost is the engine's"): the cache the engine keeps of a thing
-// asked by its cells, true where it answers: fine enough for whoever asks there.
+// A thing's roots, and its cells (docs/design.md, "Cost is the engine's"): who answers where, a
+// root at a time, and the cache the engine keeps of a thing where its cells answer, true where
+// they do: fine enough for whoever asks there.
 //
-// A thing's cells are a tree of bricks. Its roots are a coarse grid over its bound, `ROOTS`
-// bricks across its widest; each brick is `B`³ cells (`BS`³ = 729 texels: a brick's texels reach
-// its far faces, so a read inside it never reads a neighbour). A root brick is kept where the
-// thing's surface may pass through it; every root, kept or not, keeps how far the surface is from
-// its middle at the least (its value over its stated steepness), so a ray crosses an empty one in
-// a stride. A kept brick may be split into eight children half its size, each kept or marked
+// A thing's roots are a coarse grid over its bound, `ROOTS` bricks across its widest (a moving
+// thing's a size wide: `B` cells of the size it is asked at). Each root says, from its field's
+// derived range over it (`coarsed`), whether its surface may pass through it; how many roots
+// round it hold none (its clearance: a ray crosses them in one stride); and, where the surface
+// may pass, who answers there: the parts of its field that can matter there (`Surface::live`'s
+// mask) or its cells, whichever an ask weighs less in (`cost`: one comparison, the same on every
+// run). A thing that moves keeps no cells: they would be laid again every frame and never be
+// measured true, so its roots answer by their parts.
+//
+// Where cells answer, a root is a tree of bricks; each brick is `B`³ cells (`BS`³ = 729 texels: a
+// brick's texels reach its far faces, so a read inside it never reads a neighbour). A kept brick may be split into eight children half its size, each kept or marked
 // empty (with its own least distance), and so on down. An ask names a place and a size (m: how
 // finely it is asked there, whoever asks: matter never sees the eye or a pixel); it is answered
 // by the finest brick there no coarser than that size, or the finest there is yet.
@@ -29,7 +35,7 @@
 // One deposit, carried from the volume spike (spike/volume, spikes/volume/volume.wrela:
 // `coarsed_parts`, `fill_parts`, `redeposit`), rewritten.
 
-use matter::cost::{AFFORD, weighed, weighed_by_parts}
+use matter::cost::{CELL_READ, FETCH, part_weights}
 use matter::ranges::{bound_of, longest, stated_steepness}
 use std::derive::{Box3, gradient, interval}
 use matter::substance::Substance
@@ -51,10 +57,10 @@ pub const NO_BRICK: u32 = 4294967295
 pub const NONE: u32 = 4294967295
 pub const EMPTY: u32 = 4294967294
 
-/// A root of a thing asked by its field that its surface may pass through (it keeps no cells).
+/// A root its surface may pass through, answered by its parts (it keeps no cells).
 pub const HOLDS: u32 = 4294967293
 
-/// How a thing is asked: by its field, or by its cells.
+/// To measure, not an author's: every root held to its parts, or (a still thing's) to its cells.
 pub const ASKS_FIELD: u32 = 1
 pub const ASKS_CELLS: u32 = 2
 
@@ -70,13 +76,16 @@ pub const LEVELS: u32 = 14
 pub const CELL_PER_SIZE: f32 = 0.25
 pub const OFF: f32 = 0.1
 
-/// Words a root holds: its node (or `NO_BRICK`; `HOLDS` asked by its field), its least distance
-/// (bits: 0, or below 0 where all of it is inside), the most its field's gradient can be long over
-/// it (bits; derived; asked by its field only), and how many roots away the nearest root is that
-/// may hold matter (`CLEAR`, `cleared`: so every root nearer than that holds none, and a ray
-/// crosses them in one stride), and, for a thing asked by its parts, which of them can change its
-/// distance in the root (`Surface::live`'s word).
-pub const ROOT: u32 = 5
+/// Words a root holds: its node (`NO_BRICK` none; `HOLDS` answered by its parts; else its brick of
+/// cells), its least distance (bits: 0, or below 0 where all of it is inside), the most its
+/// field's gradient can be long over it (bits; derived, where its parts answer; else -1), how many
+/// roots away the nearest root is that may hold matter (`CLEAR`, `cleared`: so every root nearer
+/// than that holds none, and a ray crosses them in one stride), and which of its parts can change
+/// its distance in the root (`Surface::live`'s word, every bit past its parts set; all set where
+/// its whole field answers), and how many roots away the nearest root is that is answered other
+/// than by its whole field (`cleared` again: a ray among roots its whole field answers, or that
+/// hold nothing, asks its whole field and fetches no root until it leaves them).
+pub const ROOT: u32 = 6
 
 /// The most roots a root's clearance counts.
 const CLEAR: u32 = 255
@@ -89,12 +98,11 @@ const ROOT_BAND: u32 = 8192
 /// its field at the most (m, bits: `measured`).
 pub const NODE: u32 = 8
 
-/// Room: a still thing's slots (bricks of cells, 2,916 bytes each) and nodes (32 bytes each); a
-/// moving thing's slots; splits a frame; how many frames unasked before a brick may be folded,
+/// Room: a still thing's slots (bricks of cells, 2,916 bytes each) and nodes (32 bytes each);
+/// splits a frame; how many frames unasked before a brick may be folded,
 /// and how few free slots start folding.
 const STILL_SLOTS: u32 = 163840
 const STILL_NODES: u32 = 524288
-const MOVING_SLOTS: u32 = 8192
 pub const BUDGET: u32 = 192
 const AGE: u32 = 30
 const LOW: u32 = 8192
@@ -131,9 +139,10 @@ pub struct Grid: Copy + GpuData {
     pub scope: f32,
     pub kept: u32,
     pub frame: u32,
-    /// Whether it is asked by the parts live in each root (1), or whole (0).
-    pub parts: u32,
-    pub spare: u32,
+    /// To measure: every root asks all its parts (1), or only those live there (0, its own).
+    pub whole: u32,
+    /// Whether it is still (1), so its roots may keep cells.
+    pub still: u32,
 }
 
 /// A unit vector folded onto an octahedron, 8 bits each way, and back.
@@ -190,6 +199,20 @@ pub fn read_cells(cells: GpuSpan<u32>, slot: u32, lo: vec3, side: f32, p: vec3) 
     mix(mix(x00, x10, vec4(t.y)), mix(x01, x11, vec4(t.y)), vec4(t.z))
 }
 
+/// A brick's cells' distance at `p` (m), as `read_cells` reads it, without the facing.
+pub fn read_distance(cells: GpuSpan<u32>, slot: u32, lo: vec3, side: f32, p: vec3) -> f32 {
+    let q = clamp((p - lo) / side * f32(B), vec3(0.0), vec3(f32(B) - 0.0001))
+    let i = floor(q)
+    let t = q - i
+    let base = slot * TEXELS + u32(i.x) + BS * (u32(i.y) + BS * u32(i.z))
+    let x00 = mix(f32(cells[base] & 65535), f32(cells[base + 1] & 65535), t.x)
+    let x10 = mix(f32(cells[base + BS] & 65535), f32(cells[base + BS + 1] & 65535), t.x)
+    let x01 = mix(f32(cells[base + BS * BS] & 65535), f32(cells[base + BS * BS + 1] & 65535), t.x)
+    let x11 = mix(f32(cells[base + BS * BS + BS] & 65535), f32(cells[base + BS * BS + BS + 1] & 65535), t.x)
+    let v = mix(mix(x00, x10, t.y), mix(x01, x11, t.y), t.z)
+    (v / 65535.0 - 0.5) * 4.0 * side
+}
+
 /// How far a brick's cells are off its field at the middle of its cell `k` (m: the distance's
 /// error, or the facing's times the cell's side, whichever is more), where the surface is within
 /// two cells of it; -1 elsewhere. The brick: `slot`, least corner `lo`, side `side`.
@@ -220,27 +243,24 @@ pub fn sampled<M: Field<Substance>>(field: M, p: vec3, h: f32) -> vec4 {
     vec4(f / max(len, 1.0), n / len)
 }
 
-/// Whether a brick of side `side` whose middle is `p` may hold the surface (the derived range of
-/// its field's value over the brick holds 0: sound, no guess), its least distance (0, or below 0
-/// where all of it is inside), and the most its field's gradient can be long over it (derived;
-/// -1 where the range is unbounded: the asker then steps by `Grid::stated`, gap 16).
-fn kept_at<M: Field<Substance>>(field: M, g: Grid, p: vec3, side: f32) -> vec4 {
-    let b = Box3 { lo: p - vec3(0.5 * side), hi: p + vec3(0.5 * side) }
-    let v = interval(|q: vec3| field.distance(q), b)
-    // (Only a thing asked by its field steps by a steepness.)
-    var steep = 1.0e30
-    if g.asks == ASKS_FIELD {
-        steep = longest(interval(|q: vec3| gradient(|r: vec3| field.distance(r), q), b))
-    }
-    let kept = v.lo <= 0.0 && v.hi >= 0.0
-    let least = if v.hi < 0.0 { -1.0e-6 } else { 0.0 }
-    vec4(if kept { 1.0 } else { 0.0 }, least, if steep < 1.0e30 { steep } else { -1.0 }, 0.0)
+/// Whether a brick of side `side` whose middle is `p` may hold the surface (`x` 1: the derived
+/// range of its field's value over the brick holds 0: sound, no guess), and its least distance
+/// (`y`: 0, or below 0 where all of it is inside).
+fn kept_at<M: Field<Substance>>(field: M, p: vec3, side: f32) -> vec2 {
+    let v = interval(|q: vec3| field.distance(q), Box3 { lo: p - vec3(0.5 * side), hi: p + vec3(0.5 * side) })
+    vec2(if v.lo <= 0.0 && v.hi >= 0.0 { 1.0 } else { 0.0 }, if v.hi < 0.0 { -1.0e-6 } else { 0.0 })
 }
 
-/// Root bricks `first` on: whether each is kept (given a node, its push order), and its middle's
-/// least distance.
+/// Root bricks `first` on: whether each may hold its surface, its least distance, and who answers
+/// in it, whichever an ask there weighs least by (`weights`, `cost::part_weights`): its parts live
+/// there (`HOLDS` with their mask: what they weigh, and a mask's own work), its whole field (`HOLDS`
+/// with every bit set), or its cells (a brick pushed, its push order its node); where it holds
+/// nothing, no one (a ray crosses it in a stride, a fetch), or its whole field where that weighs
+/// less than the fetch (`cost::FETCH`). Where its parts
+/// answer, also how steep they can be there. Only a still thing with room keeps cells; held
+/// (`g.asks`), every root answers one way.
 @compute(64)
-fn coarsed<M: Field<Substance>>(field: M, g: Grid, first: u32, roots: mut Atomics<u32>, bricks: mut Append<u32>, id: GlobalId) {
+fn coarsed<M: Field<Substance>>(field: M, g: Grid, weights: [f32], first: u32, roots: mut Atomics<u32>, bricks: mut Append<u32>, id: GlobalId) {
     let i = first + id.x
     if i >= g.size.x * g.size.y * g.size.z {
         return
@@ -249,48 +269,71 @@ fn coarsed<M: Field<Substance>>(field: M, g: Grid, first: u32, roots: mut Atomic
     let y = (i / g.size.x) % g.size.y
     let z = i / (g.size.x * g.size.y)
     let mid = g.lo + (vec3(f32(x), f32(y), f32(z)) + vec3(0.5)) * g.brick
-    var k = vec4(0.0)
-    var mask: u32 = 4294967295
-    if g.parts > 0 {
-        // Asked by its parts: the range of its distance and gradient over the root, and the parts
-        // that can change its distance there (std's `range` and `live`, derived).
-        let b = Box3 { lo: mid - vec3(0.5 * g.brick), hi: mid + vec3(0.5 * g.brick) }
-        let r = field.range(b)
-        mask = field.live(b).word()
-        let steep = longest(r.gradient)
-        k = vec4(if r.value.lo <= 0.0 && r.value.hi >= 0.0 { 1.0 } else { 0.0 }, if r.value.hi < 0.0 { -1.0e-6 } else { 0.0 }, if steep < 1.0e30 { steep } else { -1.0 }, 0.0)
-    } else {
-        k = kept_at(field, g, mid, g.brick)
-    }
+    let b = Box3 { lo: mid - vec3(0.5 * g.brick), hi: mid + vec3(0.5 * g.brick) }
+    let k = kept_at(field, mid, g.brick)
     var node = NO_BRICK
+    var steep = -1.0
+    var mask: u32 = 4294967295
     if k.x > 0.5 {
-        if g.asks == ASKS_FIELD {
-            // (Asked by its field: no cells, only that its surface may pass through.)
-            node = HOLDS
-        } else {
+        let n = weights.len() - 3
+        var w = weights[n + 1]
+        if g.whole == 0 {
+            mask = field.live(b).word()
+            if n < 32 {
+                mask = mask | (4294967295 << n)
+            }
+            var masked = weights[n] + weights[n + 2]
+            for j in 0..min(n, 32) {
+                if ((mask >> j) & 1) != 0 {
+                    masked += weights[j]
+                }
+            }
+            if masked < w {
+                w = masked
+            } else {
+                mask = 4294967295
+            }
+        }
+        let cells = g.still > 0 && g.kept > 0 && g.asks != ASKS_FIELD && (g.asks == ASKS_CELLS || w > CELL_READ)
+        if cells {
             let s = bricks.push(x | (y << 10) | (z << 20))
             if s < g.kept {
                 node = s
             }
+        } else {
+            node = HOLDS
+            let s = longest(interval(|q: vec3| gradient(|r: vec3| field.distance(r), q), b))
+            steep = if s < 1.0e30 { s } else { -1.0 }
         }
+    }
+    if node == NO_BRICK && k.y >= 0.0 && weights[weights.len() - 2] <= FETCH && g.asks != ASKS_CELLS {
+        // Holds nothing, but its whole field weighs less than the fetch a stride across it
+        // would: its whole field answers here too.
+        node = HOLDS
     }
     let _ = roots.exchange(i: ROOT * i, value: node)
     let _ = roots.exchange(i: ROOT * i + 1, value: bitcast_u32(k.y))
-    let _ = roots.exchange(i: ROOT * i + 2, value: bitcast_u32(k.z))
+    let _ = roots.exchange(i: ROOT * i + 2, value: bitcast_u32(steep))
     let _ = roots.exchange(i: ROOT * i + 4, value: mask)
 }
 
-/// Whether root `i` may hold matter (its surface may pass through it, or all of it is inside).
-fn occupied(roots: [u32], i: u32) -> bool {
-    roots[ROOT * i] != NO_BRICK || bitcast_f32(roots[ROOT * i + 1]) < 0.0
+/// Whether root `i` may hold matter (its surface may pass through it, or all of it is inside:
+/// `kind` 0), or is answered other than by its whole field (by its cells, or a mask: `kind` 1).
+fn occupied(roots: [u32], i: u32, kind: u32) -> bool {
+    let node = roots[ROOT * i]
+    if kind == 0 {
+        return node != NO_BRICK || bitcast_f32(roots[ROOT * i + 1]) < 0.0
+    }
+    node != NO_BRICK && (node != HOLDS || roots[ROOT * i + 4] != 4294967295)
 }
 
 /// Each root's clearance, a pass an axis (a chessboard distance transform, separable: G. Borgefors,
-/// "Distance transformations in digital images", 1986): along x, how far the nearest occupied root
-/// is in its row (`axis` 0, from `roots`); along y or z (`axis` 1, 2), the most of that and the
-/// way along the axis, least over the line (from `from`). Into `out` at `stride` i + `at`.
+/// "Distance transformations in digital images", 1986): along x, how far the nearest root occupied
+/// as `kind` says (`occupied`) is in its row (`axis` 0, from `roots`); along y or z (`axis` 1, 2),
+/// the most of that and the way along the axis, least over the line (from `from`). Into `out` at
+/// `stride` i + `at`.
 @compute(64)
-fn cleared(g: Grid, roots: [u32], from: [u32], axis: u32, first: u32, stride: u32, at: u32, out: mut Atomics<u32>, id: GlobalId) {
+fn cleared(g: Grid, roots: [u32], from: [u32], axis: u32, kind: u32, first: u32, stride: u32, at: u32, out: mut Atomics<u32>, id: GlobalId) {
     let i = first + id.x
     if i >= g.size.x * g.size.y * g.size.z {
         return
@@ -306,7 +349,7 @@ fn cleared(g: Grid, roots: [u32], from: [u32], axis: u32, first: u32, stride: u3
         if axis == 0 { q.x = j } else if axis == 1 { q.y = j } else { q.z = j }
         let k = q.x + g.size.x * (q.y + g.size.y * q.z)
         if axis == 0 {
-            if occupied(roots, k) {
+            if occupied(roots, k, kind) {
                 d = min(d, away)
             }
         } else {
@@ -326,7 +369,7 @@ fn rooted<M: Field<Substance>>(field: M, g: Grid, bricks: [u32], count: [u32], f
     }
     let c = bricks[i]
     let lo = g.lo + vec3(f32(c & 1023), f32((c >> 10) & 1023), f32(c >> 20)) * g.brick
-    let least = kept_at(field, g, lo + vec3(0.5 * g.brick), g.brick).y
+    let least = kept_at(field, lo + vec3(0.5 * g.brick), g.brick).y
     let at = i * NODE
     nodes.store(i: at, value: i)
     nodes.store(i: at + 1, value: NONE)
@@ -410,7 +453,7 @@ fn refined(
     let c = clamp(floor((p - g.lo) / g.brick), vec3(0.0), g.top)
     let r = u32(c.x) + g.size.x * (u32(c.y) + g.size.y * u32(c.z))
     var node = roots[ROOT * r]
-    if node == NO_BRICK {
+    if node == NO_BRICK || node == HOLDS {
         return
     }
     var side = g.brick
@@ -503,7 +546,7 @@ fn split<M: Field<Substance>>(field: M, g: Grid, requests: [u32], count: [u32], 
     let side = g.brick * exp2(-f32(level))
     let o = vec3(f32(c & 1), f32((c >> 1) & 1), f32((c >> 2) & 1))
     let clo = lo + o * side
-    let k = kept_at(field, g, clo + vec3(0.5 * side), side)
+    let k = kept_at(field, clo + vec3(0.5 * side), side)
     var slot = pending[9 * r + 1 + c]
     if k.x < 0.5 {
         let at = state.add(i: FREE_TOP, value: 1)
@@ -631,11 +674,7 @@ fn folded(g: Grid, first: u32, most: u32, nodes: mut Atomics<u32>, stamps: [u32]
     node_free.store(i: b, value: block)
 }
 
-/// What asks a thing, said.
-fn by(asks: u32) -> Text {
-    if asks == ASKS_CELLS { "cells" } else { "field" }
-}
-
+/// Said of a thing held to a way of asking, to measure.
 fn held(asks: u32) -> Text {
     if asks != 0 { " (held so, to measure)" } else { "" }
 }
@@ -673,8 +712,9 @@ pub struct Kept {
     /// can't say yet, as std's shapes state it: `ranges::bound_of`), and whether derived.
     derived: vec4,
     bound_derived: bool,
-    /// How it is asked (chosen at its first frame: `cost`).
-    pub asks: u32,
+    /// What each of its parts weighs (`cost::part_weights`), for its roots' choice.
+    weights: GpuBuffer<f32>,
+    weighed: bool,
     pub moving: bool,
     pub held_asks: u32,
     pub held_cell: f32,
@@ -699,8 +739,8 @@ pub fn kept() -> Kept {
             scope: 1.0,
             kept: 0,
             frame: 0,
-            parts: 0,
-            spare: 0,
+            whole: 0,
+            still: 1,
         },
         roots: buffer(2),
         nodes: buffer(NODE),
@@ -725,7 +765,8 @@ pub fn kept() -> Kept {
         free_slots: 0,
         folding: false,
         probes: Vec::new(),
-        asks: 0,
+        weights: buffer(1),
+        weighed: false,
         moving: false,
         held_asks: 0,
         held_cell: 0.0,
@@ -761,7 +802,8 @@ impl Kept {
         self.grid.stated = stated_steepness(field, max(2.0 * b.w, 1.0))
     }
 
-    /// Each root's clearance (`cleared`), once its roots are laid.
+    /// Each root's clearances (`cleared`), once its roots are laid: from roots that may hold
+    /// matter (word 3), and from roots answered other than by its whole field (word 5).
     fn clear_roots(mut self) {
         let n = self.grid.size.x * self.grid.size.y * self.grid.size.z
         if self.clear_a.len() != n {
@@ -769,20 +811,22 @@ impl Kept {
             self.clear_b = buffer(n)
         }
         label("roots cleared")
-        var first: u32 = 0
-        while first < n {
-            dispatch(cleared.bind(g: self.grid, roots: self.roots.items(), from: self.clear_b.items(), axis: 0, first: first, stride: 1, at: 0, out: mut self.clear_a), over: min(BAND, n - first))
-            first += BAND
-        }
-        first = 0
-        while first < n {
-            dispatch(cleared.bind(g: self.grid, roots: self.roots.items(), from: self.clear_a.items(), axis: 1, first: first, stride: 1, at: 0, out: mut self.clear_b), over: min(BAND, n - first))
-            first += BAND
-        }
-        first = 0
-        while first < n {
-            dispatch(cleared.bind(g: self.grid, roots: self.clear_a.items(), from: self.clear_b.items(), axis: 2, first: first, stride: ROOT, at: 3, out: mut self.roots), over: min(BAND, n - first))
-            first += BAND
+        for kind in 0..2 {
+            var first: u32 = 0
+            while first < n {
+                dispatch(cleared.bind(g: self.grid, roots: self.roots.items(), from: self.clear_b.items(), axis: 0, kind: kind, first: first, stride: 1, at: 0, out: mut self.clear_a), over: min(BAND, n - first))
+                first += BAND
+            }
+            first = 0
+            while first < n {
+                dispatch(cleared.bind(g: self.grid, roots: self.roots.items(), from: self.clear_a.items(), axis: 1, kind: kind, first: first, stride: 1, at: 0, out: mut self.clear_b), over: min(BAND, n - first))
+                first += BAND
+            }
+            first = 0
+            while first < n {
+                dispatch(cleared.bind(g: self.grid, roots: self.clear_a.items(), from: self.clear_b.items(), axis: 2, kind: kind, first: first, stride: ROOT, at: 3 + 2 * kind, out: mut self.roots), over: min(BAND, n - first))
+                first += BAND
+            }
         }
     }
 
@@ -820,19 +864,27 @@ impl Kept {
         self.grid.scope = max(2.0 * brick, length(size) * brick)
     }
 
-    /// Brought up to date for this frame: how it is asked chosen (once: `cost`), seen whether it
-    /// moves, then deposited as it does. `size` (m) is the finest it was asked at last frame (a
-    /// moving thing's cells are that fine).
+    /// Brought up to date for this frame: seen whether it moves, then its roots laid where it is
+    /// (a moving thing's every frame), and a still thing's cells deposited where its roots chose
+    /// them. `size` (m) is the finest it was asked at last frame.
     pub fn deposit<M: Field<Substance>>(mut self, field: M, size: f32) {
         self.frame += 1
         self.grid.frame = self.frame
         if self.derived.w <= 0.0 {
-            // Where it can be, derived once (a moving thing's again each frame it moves); and the
+            // Where it can be, derived once (a moving thing's again each frame); and the
             // steepness std's shapes state, for roots whose derived steepness is unbounded.
             self.bounded(field)
             let d = self.derived
             let how = if self.bound_derived { "derived" } else { "NOT derived: its search did not close, so it is laid over the space searched" }
             print(f"engine::matter: where it can be, {how}: within {d.w} m of ({d.x}, {d.y}, {d.z})")
+        }
+        if !self.weighed {
+            // What each of its parts weighs, once: its roots choose by it.
+            let w = part_weights(field)
+            let n = w.len() - 3
+            print(f"engine::matter: {field.parts()} parts; an ask weighs {w[n + 1]} whole, a mask {w[n + 2]} beyond the parts it asks; a read of cells {CELL_READ}{held(self.held_asks)}")
+            self.weights = buffer_of(w)
+            self.weighed = true
         }
         let now = probed(field, self.derived)
         if self.probes.len() == now.len() {
@@ -845,66 +897,30 @@ impl Kept {
             }
         }
         self.probes = take now
-        if self.asks == 0 {
-            // How it is asked: by its parts where the parts live where it is asked weigh less than
-            // the whole (`cost::weighed_by_parts`, with what keeping them a root costs a step); by
-            // its field where that ask weighs no more than `AFFORD`; else by its cells.
-            let whole = weighed(field)
-            let parted = if field.parts() > 1 && self.held_whole == 0 { weighed_by_parts(field, self.derived, 2.0 * self.derived.w / ROOTS) } else { 1.0e30 }
-            let by_parts = parted < whole
-            let w = min(whole, parted)
-            self.asks = if self.held_asks != 0 { self.held_asks } else if w > AFFORD { ASKS_CELLS } else { ASKS_FIELD }
-            if self.asks == ASKS_FIELD && by_parts {
-                self.grid.parts = 1
-            }
-            print(f"engine::matter: an ask weighs {whole} whole, {parted} by its parts: asked by its {by(self.asks)}{if self.grid.parts > 0 { ", by the parts live a root" } else { "" }}")
-        }
-        self.grid.asks = self.asks
-        if self.asks == ASKS_FIELD {
-            // Asked by its field, it needs no cells: only its grid, which bounds it.
-            // Asked by its field, it keeps its roots: where nothing is, and how steep it is in each.
-            if self.grid.parts == 0 {
-                // Asked whole, it keeps nothing: its grid bounds it, and a ray steps by its value
-                // over its steepness (looking a root up at every step costs more than it saves for
-                // a field asked whole: wrela-notes/engine/NOTES.md, "A1's time").
-                if self.stage == 0 {
-                    self.laid(2.0 * self.derived.w / ROOTS / f32(B), fixed: false)
-                    print(f"engine::matter: a thing asked whole by its field{held(self.held_asks)}: no cells kept")
-                } else if self.moving {
-                    self.bounded(field)
-                    self.laid(self.grid.cell, fixed: true)
-                }
-                self.stage = 4
-                return
-            }
-            if self.stage == 0 || self.moving {
-                if self.stage == 0 {
-                    self.laid(2.0 * self.derived.w / ROOTS / f32(B), fixed: false)
-                    print(f"engine::matter: a thing asked by its field{held(self.held_asks)}: no cells kept")
-                } else {
-                    self.bounded(field)
-                    self.laid(self.grid.cell, fixed: true)
-                }
-                let n = self.grid.size.x * self.grid.size.y * self.grid.size.z
-                if self.roots.len() != ROOT * n {
-                    self.roots = buffer(ROOT * n)
-                    self.bricks = append_buffer(1)
-                }
-                self.grid.kept = 0
-                self.bricks.clear()
-                label("deposit roots")
-                var first: u32 = 0
-                while first < n {
-                    dispatch(coarsed.bind(field: field, g: self.grid, first: first, roots: mut self.roots, bricks: mut self.bricks), over: min(ROOT_BAND, n - first))
-                    first += ROOT_BAND
-                }
-                self.clear_roots()
-                self.stage = 4
-            }
-            return
-        }
+        self.grid.asks = self.held_asks
+        self.grid.whole = self.held_whole
         if self.moving {
-            self.moved(field, size)
+            // Its roots again where it now is, each answered by its parts: no cells.
+            if self.stage != 5 {
+                self.stage = 5
+                print(f"engine::matter: a moving thing{held(self.held_asks)}: {self.grid.size.x}^3 roots ({self.grid.brick} m each), each answered by its live parts; no cells")
+            }
+            self.bounded(field)
+            self.laid(self.grid.cell, fixed: true)
+            self.grid.still = 0
+            self.grid.kept = 0
+            self.roots_kept = 0
+            self.slots_most = 0
+            self.nodes_most = 0
+            self.free_slots = 0
+            let n = self.grid.size.x * self.grid.size.y * self.grid.size.z
+            label("deposit roots")
+            var r: u32 = 0
+            while r < n {
+                dispatch(coarsed.bind(field: field, g: self.grid, weights: self.weights.items(), first: r, roots: mut self.roots, bricks: mut self.bricks), over: min(ROOT_BAND, n - r))
+                r += ROOT_BAND
+            }
+            self.clear_roots()
             return
         }
         if self.stage == 0 {
@@ -915,6 +931,7 @@ impl Kept {
             self.roots = buffer(ROOT * n)
             self.bricks = append_buffer(self.slots_most)
             self.grid.kept = self.slots_most
+            self.grid.still = 1
             self.cursor = 0
             self.stage = 1
         }
@@ -923,7 +940,7 @@ impl Kept {
             label("deposit roots")
             var b: u32 = 0
             while b < 32 && self.cursor < n {
-                dispatch(coarsed.bind(field: field, g: self.grid, first: self.cursor, roots: mut self.roots, bricks: mut self.bricks), over: min(ROOT_BAND, n - self.cursor))
+                dispatch(coarsed.bind(field: field, g: self.grid, weights: self.weights.items(), first: self.cursor, roots: mut self.roots, bricks: mut self.bricks), over: min(ROOT_BAND, n - self.cursor))
                 self.cursor += ROOT_BAND
                 b += 1
             }
@@ -941,6 +958,15 @@ impl Kept {
                         let count = min(c[0], self.slots_most)
                         self.roots_kept = count
                         self.counted = None
+                        if count == 0 {
+                            // No root chose cells: none kept, no room.
+                            self.slots_most = 0
+                            self.nodes_most = 0
+                            self.free_slots = 0
+                            self.stage = 4
+                            print(f"engine::matter: a still thing: {n} roots ({self.grid.brick} m each; derived bound {self.derived.w} m), every one that holds its surface answered by its parts{held(self.held_asks)}")
+                            return
+                        }
                         self.nodes = buffer(self.nodes_most * NODE)
                         self.cells = buffer(self.slots_most * TEXELS)
                         self.flags = buffer_of(Vec::filled(self.nodes_most, 0))
@@ -958,7 +984,7 @@ impl Kept {
                         self.cursor = 0
                         self.stage = 3
                         let mb = f32(self.slots_most) * f32(TEXELS * 4) / 1048576.0 + f32(self.nodes_most) * f32(NODE * 4 + 8) / 1048576.0
-                        print(f"engine::matter: a still thing: {count} root bricks kept of {n} ({self.grid.brick} m each, cells {self.grid.cell} m; derived bound {self.derived.w} m), asked by its {by(self.asks)}; room for {self.slots_most} bricks and {self.nodes_most} nodes, {mb} MB")
+                        print(f"engine::matter: a still thing: {count} root bricks of {n} answered by cells ({self.grid.brick} m each, cells {self.grid.cell} m; derived bound {self.derived.w} m), the rest that hold its surface by its parts{held(self.held_asks)}; room for {self.slots_most} bricks and {self.nodes_most} nodes, {mb} MB")
                     },
                     _ => {},
                 },
@@ -993,74 +1019,11 @@ impl Kept {
         }
     }
 
-    /// The whole deposit of a thing that moves, in this frame: its roots laid to its bound, its
-    /// root cells `size` m (as it is asked: or as held), asked again.
-    fn moved<M: Field<Substance>>(mut self, field: M, size: f32) {
-        self.bounded(field)
-        if self.stage != 5 {
-            // (No test of error for a thing that moves: its cells a size wide.)
-            self.laid(max(size, 0.0005), fixed: false)
-            let n = self.grid.size.x + 2
-            self.grid.size = vec3u(n, n, n)
-            self.laid(self.grid.cell, fixed: true)
-            let all = n * n * n
-            self.slots_most = MOVING_SLOTS
-            // (A moving thing's room is all in use: it is deposited whole.)
-            self.free_slots = 0
-            self.nodes_most = MOVING_SLOTS
-            self.roots = buffer(ROOT * all)
-            self.bricks = append_buffer(self.slots_most)
-            self.grid.kept = self.slots_most
-            self.nodes = buffer(self.slots_most * NODE)
-            self.cells = buffer(self.slots_most * TEXELS)
-            self.stage = 5
-            self.cursor = 0
-            self.counted = None
-            print(f"engine::matter: a moving thing{held(self.held_asks)}: {n}^3 root bricks ({self.grid.brick} m each, cells {self.grid.cell} m, bound {self.derived.w} m, {if self.bound_derived { "derived" } else { "not derived" }}), asked by its {by(self.asks)}")
-        }
-        self.laid(self.grid.cell, fixed: true)
-        let n = self.grid.size.x * self.grid.size.y * self.grid.size.z
-        label("deposit moving roots")
-        self.bricks.clear()
-        var r: u32 = 0
-        while r < n {
-            dispatch(coarsed.bind(field: field, g: self.grid, first: r, roots: mut self.roots, bricks: mut self.bricks), over: min(ROOT_BAND, n - r))
-            r += ROOT_BAND
-        }
-        self.clear_roots()
-        dispatch(rooted.bind(field: field, g: self.grid, bricks: self.bricks.items(), count: self.bricks.count(), first: 0, nodes: mut self.nodes), over: self.slots_most)
-        label("deposit moving cells")
-        var first: u32 = 0
-        while first < self.slots_most * TEXELS {
-            dispatch(deposited.bind(field: field, g: self.grid, bricks: self.bricks.items(), count: self.bricks.count(), first: first, cells: mut self.cells), over: BAND)
-            first += BAND
-        }
-        // (How many bricks it wanted, read back now and then: past its room the rest of it
-        // isn't drawn, and the log says so.)
-        match mut self.counted {
-            Some(p) => match p.poll() {
-                Some(Ok(c)) => {
-                    if c[0] > self.grid.kept {
-                        print(f"engine::matter: a moving thing wanted {c[0]} bricks; it holds {self.grid.kept}: the rest of it isn't drawn")
-                    }
-                    self.counted = None
-                },
-                _ => {},
-            },
-            None => {
-                if self.cursor % 64 == 0 {
-                    self.counted = Some(read(self.bricks.count()))
-                }
-                self.cursor += 1
-            },
-        }
-    }
-
     /// After a frame: where the picture showed this thing finer than its cells hold
     /// (`asks`: places and the sizes they were asked at), splits asked for and made, at most
     /// `BUDGET`; and, room running low, bricks long unasked folded back.
     pub fn refine<M: Field<Substance>>(mut self, field: M, asks: Texture<Rgba32Float>) {
-        if self.asks != ASKS_CELLS || self.moving || self.stage != 4 || self.held_cell > 0.0 {
+        if self.roots_kept == 0 || self.moving || self.stage != 4 || self.held_cell > 0.0 {
             // (A cell held to a size, to measure, is not refined.)
             return
         }
