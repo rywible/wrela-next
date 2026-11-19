@@ -175,6 +175,15 @@ targets.
 A report keeps the two apart, and leads with correctness, which is neither: a picture that is
 wrong is a fault, whatever it costs.
 
+**When a kill line asked only for an amount.** A change is kept, its line recorded as missed and
+left as an open target, when all of these hold: every judged measure and the audit are the same
+as before within their run-to-run spread; it is cheaper on every scene and count measured, on
+both machines; and it repeats to the bit. (Three such on one night: shadows swept from the sun,
+the sun's map for moving things, the sky's maps: each several times cheaper with the same
+picture, each short of the figure its own line named.) In every other case the line stands as
+written: anything judged that got worse, anything dearer somewhere, or an idea whose machinery
+only its amount would justify, which is said when the line is written.
+
 ## The layers
 
 Dependencies point down. Nothing below knows anything above.
