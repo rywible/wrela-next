@@ -7,14 +7,14 @@
 // The whole world is also one field, the things' union (`World::field`): what the reference
 // asks, by brute force, so it checks the engine against the author's own matter.
 
-use matter::asked::{Asked, CELLS, MET, PARTS, Seen}
-use matter::cells::Kept
+use matter::asked::{Asked, CELLS, Kinded, MET, PARTS, Seen, Seens}
+use matter::cells::{Grid, Kept}
 use matter::parted::{Parted, Rayed}
 use matter::substance::Substance
 use std::collections::Vec
 use std::field::{Field, Surface, Union, UnionAll}
 use std::hash::StateHash
-use std::gpu::{Rgba32Float, Texture}
+use std::gpu::{GpuBuffer, Rgba32Float, Texture, buffer_of}
 
 /// What the engine is given of the world each frame.
 pub trait World: Copy {
@@ -42,11 +42,42 @@ pub trait World: Copy {
     /// Each of its things handed to `e` as GPU code asks it, by code that answers only the ways
     /// that thing can be answered (`Kept::ways`), the first being `kept[first]`: a variant a way,
     /// for each kind of thing, never one for each combination of them.
-    fn each<E: Each>(self, kept: Vec<Kept>, first: u32, e: mut E)
+    fn each<E: Each>(self, kept: Vec<Kept>, kinds: Self::Kinds, first: u32, e: mut E)
+
+    /// What its kinds drawn at once need on the GPU this frame (`Each::kind`: a kind's values in
+    /// buffers), made before any pass (a buffer can't be made inside one), the first being
+    /// `kept[first]`.
+    type Kinds
+
+    fn kinds(self, kept: Vec<Kept>, first: u32) -> Self::Kinds
+}
+
+/// No kind to draw at once.
+pub struct NoKinds {
+    none: u32,
+}
+
+/// Two worlds' kinds.
+pub struct Both<A, B> {
+    pub a: A,
+    pub b: B,
+}
+
+/// A kind's values for the GPU this frame (`Many`): its fields, grids and bounds; `on` where it
+/// is drawn at once.
+pub struct KindBuffers<M: GpuData> {
+    fields: GpuBuffer<M>,
+    grids: GpuBuffer<Grid>,
+    bounds: GpuBuffer<vec4>,
+    on: bool,
 }
 
 /// What is done with each thing of a world (`World::each`): the picture draws each by itself.
 pub trait Each {
+    /// Things `first` to `first + n` (less one), all of one kind and keeping no roots, as GPU code
+    /// asks them (`k`): drawn at once.
+    fn kind<K: Kinded>(mut self, k: K, n: u32, first: u32)
+
     /// Thing `k`, as GPU code asks it (`a`), where its matter can be (`bound`: centre, radius).
     fn thing<A: Asked>(mut self, a: A, k: u32, bound: vec4)
 }
@@ -68,11 +99,11 @@ pub struct Many<M, const N: u32>: Copy {
 }
 
 /// `fields`, each a thing.
-pub fn many<M: Field<Substance> + Surface + StateHash, const N: u32>(fields: [M; N]) -> Many<M, N> {
+pub fn many<M: Field<Substance> + Surface + StateHash + GpuData, const N: u32>(fields: [M; N]) -> Many<M, N> {
     Many { fields }
 }
 
-impl<M: Field<Substance> + Surface + StateHash, const N: u32> World for Many<M, N> {
+impl<M: Field<Substance> + Surface + StateHash + GpuData, const N: u32> World for Many<M, N> {
     type Field = UnionAll<M, N>
 
     fn field(self) -> UnionAll<M, N> {
@@ -103,9 +134,39 @@ impl<M: Field<Substance> + Surface + StateHash, const N: u32> World for Many<M, 
         all
     }
 
-    fn each<E: Each>(self, kept: Vec<Kept>, first: u32, e: mut E) {
+    type Kinds = KindBuffers<M>
+
+    fn kinds(self, kept: Vec<Kept>, first: u32) -> KindBuffers<M> {
+        // (Things that keep no roots, all answered one way, are drawn as a kind: their fields,
+        // grids and bounds in buffers made this frame. Only things a ray begins where they say
+        // it meets them (`MET`): a field that says so in closed form is small enough to read from
+        // a buffer an invocation; a body's isn't. Others, one by one.)
+        let w = kept[first].ways
+        var on = M::EXACT_MEETS && N > 1 && w == MET
         for i in 0..N {
-            one(self.fields[i]).each(kept, first + i, mut e)
+            on = on && kept[first + i].ways == w
+        }
+        var fs: Vec<M> = Vec::new()
+        var gs: Vec<Grid> = Vec::new()
+        var bs: Vec<vec4> = Vec::new()
+        for i in 0..(if on { N } else { 1 }) {
+            fs.push(self.fields[i])
+            gs.push(kept[first + i].grid)
+            bs.push(kept[first + i].derived())
+        }
+        KindBuffers { fields: buffer_of(fs), grids: buffer_of(gs), bounds: buffer_of(bs), on }
+    }
+
+    fn each<E: Each>(self, kept: Vec<Kept>, kinds: KindBuffers<M>, first: u32, e: mut E) {
+        if !kinds.on {
+            for i in 0..N {
+                one(self.fields[i]).drawn_by(kept, first + i, mut e)
+            }
+            return
+        }
+        if M::EXACT_MEETS {
+            let k: Seens<M, 3> = Seens { fields: kinds.fields.items(), grids: kinds.grids.items(), bounds: kinds.bounds.items() }
+            e.kind(k, N, first)
         }
     }
 }
@@ -154,13 +215,22 @@ impl<M: Field<Substance> + Surface + StateHash + Parted, const N: u32> World for
         all
     }
 
-    fn each<E: Each>(self, kept: Vec<Kept>, first: u32, e: mut E) {
+    // (One by one: a body's field (976 bytes) read from a buffer at an index, as a kind's draw
+    // reads it, cost every pass about a tenth at 64 bodies against its field passed whole to a
+    // draw of its own; kept/bodies-as-kind.patch.)
+    type Kinds = NoKinds
+
+    fn kinds(self, kept: Vec<Kept>, first: u32) -> NoKinds {
+        NoKinds { none: 0 }
+    }
+
+    fn each<E: Each>(self, kept: Vec<Kept>, kinds: NoKinds, first: u32, e: mut E) {
         for i in 0..N {
             if kept[first + i].moving {
                 let a = Rayed { field: self.fields[i], grid: kept[first + i].grid }
                 e.thing(a, first + i, kept[first + i].derived())
             } else {
-                one(self.fields[i]).each(kept, first + i, mut e)
+                one(self.fields[i]).drawn_by(kept, first + i, mut e)
             }
         }
     }
@@ -173,6 +243,26 @@ pub struct And<A, B>: Copy {
 }
 
 impl<M: Field<Substance> + StateHash> One<M> {
+    /// It handed to `e` as GPU code asks it (`World::each`; `Many` hands its things so too:
+    /// `One<M>::Kinds` is not seen to be `NoKinds` in generic code).
+    pub(package) fn drawn_by<E: Each>(self, kept: Vec<Kept>, first: u32, e: mut E) {
+        let b = kept[first].derived()
+        let w = kept[first].ways
+        if w == PARTS {
+            let a: Seen<M, 1> = Seen { field: self.field, grid: kept[first].grid, roots: kept[first].roots.items(), nodes: kept[first].nodes.items(), cells: kept[first].cells.items() }
+            e.thing(a, first, b)
+        } else if w == MET {
+            let a: Seen<M, 3> = Seen { field: self.field, grid: kept[first].grid, roots: kept[first].roots.items(), nodes: kept[first].nodes.items(), cells: kept[first].cells.items() }
+            e.thing(a, first, b)
+        } else if w == CELLS {
+            let a: Seen<M, 2> = Seen { field: self.field, grid: kept[first].grid, roots: kept[first].roots.items(), nodes: kept[first].nodes.items(), cells: kept[first].cells.items() }
+            e.thing(a, first, b)
+        } else {
+            let a: Seen<M, 0> = Seen { field: self.field, grid: kept[first].grid, roots: kept[first].roots.items(), nodes: kept[first].nodes.items(), cells: kept[first].cells.items() }
+            e.thing(a, first, b)
+        }
+    }
+
     /// This thing and the things of `other`.
     pub fn and<B: World>(self, other: B) -> And<One<M>, B> {
         And { a: self, b: other }
@@ -209,22 +299,14 @@ impl<M: Field<Substance> + StateHash> World for One<M> {
         kept[first].ready()
     }
 
-    fn each<E: Each>(self, kept: Vec<Kept>, first: u32, e: mut E) {
-        let b = kept[first].derived()
-        let w = kept[first].ways
-        if w == PARTS {
-            let a: Seen<M, 1> = Seen { field: self.field, grid: kept[first].grid, roots: kept[first].roots.items(), nodes: kept[first].nodes.items(), cells: kept[first].cells.items() }
-            e.thing(a, first, b)
-        } else if w == MET {
-            let a: Seen<M, 3> = Seen { field: self.field, grid: kept[first].grid, roots: kept[first].roots.items(), nodes: kept[first].nodes.items(), cells: kept[first].cells.items() }
-            e.thing(a, first, b)
-        } else if w == CELLS {
-            let a: Seen<M, 2> = Seen { field: self.field, grid: kept[first].grid, roots: kept[first].roots.items(), nodes: kept[first].nodes.items(), cells: kept[first].cells.items() }
-            e.thing(a, first, b)
-        } else {
-            let a: Seen<M, 0> = Seen { field: self.field, grid: kept[first].grid, roots: kept[first].roots.items(), nodes: kept[first].nodes.items(), cells: kept[first].cells.items() }
-            e.thing(a, first, b)
-        }
+    type Kinds = NoKinds
+
+    fn kinds(self, kept: Vec<Kept>, first: u32) -> NoKinds {
+        NoKinds { none: 0 }
+    }
+
+    fn each<E: Each>(self, kept: Vec<Kept>, kinds: NoKinds, first: u32, e: mut E) {
+        self.drawn_by(kept, first, mut e)
     }
 }
 
@@ -253,8 +335,14 @@ impl<A: World, B: World> World for And<A, B> {
         self.a.ready(kept, first) && self.b.ready(kept, first + self.a.count())
     }
 
-    fn each<E: Each>(self, kept: Vec<Kept>, first: u32, e: mut E) {
-        self.a.each(kept, first, mut e)
-        self.b.each(kept, first + self.a.count(), mut e)
+    type Kinds = Both<A::Kinds, B::Kinds>
+
+    fn kinds(self, kept: Vec<Kept>, first: u32) -> Both<A::Kinds, B::Kinds> {
+        Both { a: self.a.kinds(kept, first), b: self.b.kinds(kept, first + self.a.count()) }
+    }
+
+    fn each<E: Each>(self, kept: Vec<Kept>, kinds: Both<A::Kinds, B::Kinds>, first: u32, e: mut E) {
+        self.a.each(kept, kinds.a, first, mut e)
+        self.b.each(kept, kinds.b, first + self.a.count(), mut e)
     }
 }

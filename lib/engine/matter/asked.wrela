@@ -74,6 +74,123 @@ pub trait Asked: Copy {
     fn told(self, walk: Self::Walk, p: vec3, size: f32) -> Told
 }
 
+/// Things of one kind as GPU code asks them, all at once (`world::Each::kind`): each as `Asked`
+/// (`one`), and where each one's matter can be (`bound`: a cube, centre and half its side).
+pub trait Kinded: Copy {
+    type One: Asked
+
+    fn one(self, i: u32) -> Self::One
+
+    fn bound(self, i: u32) -> vec4
+}
+
+/// Things of one kind that keep no roots (answered `WHOLE` or `MET`), as GPU code asks them: their
+/// fields, grids and bounds in buffers, the `i`th asked as `Seen` asks one.
+pub borrow struct Seens<M: Field<Substance> + GpuData, const W: u32> {
+    pub(package) fields: GpuSpan<M>,
+    pub(package) grids: GpuSpan<Grid>,
+    pub(package) bounds: GpuSpan<vec4>,
+}
+
+/// A thing that keeps no roots (answered `WHOLE` or `MET`, its `W`) as GPU code asks it: its field
+/// and grid, a plain value (a group of bindings, as `Seen` is, can't be built from an index in GPU
+/// code: so a kind's `one` hands this). `Seen` answers such a thing through it: one way.
+pub struct Lone<M, const W: u32>: Copy {
+    pub(package) field: M,
+    pub(package) grid: Grid,
+}
+
+impl<M: Field<Substance>, const W: u32> Lone<M, W> {
+    /// Its whole field's value over the steepness std's shapes state, never past its surface.
+    fn lone_at(self, p: vec3) -> f32 {
+        let g = self.grid
+        clamp(self.field.distance(p), -g.scope, g.scope) / g.stated
+    }
+
+    // (Its answers as plain functions, which `Seen` calls too: `Lone<M, W>::Walk` is not seen to
+    // be `Within` in generic code.)
+    fn lone_begun(self, o: vec3, d: vec3, wide: f32, spread: f32) -> Begun<Within> {
+        // Within its grid; and, a thing that says exactly where a ray first meets it (`MET`:
+        // `Surface::meets`, std's, in closed form through its combinators), there, unmarched;
+        // where it misses, the ray marches only where the thing grown by as much as the ray must
+        // be told of (half its widest width over the grid, for its near misses) can be.
+        let g = self.grid
+        let box = box_span(o, d, g.lo, g.hi)
+        var near = box.x
+        var far = box.y
+        var k = Within { exit: -1.0, node: NO_BRICK, mask: 0, steep: 1.0 }
+        if W == MET && M::EXACT_MEETS && box.y >= box.x && box.y >= 0.0 {
+            let m = self.field.meets(o, d)
+            if m.exact() && m.near <= m.far {
+                near = m.near
+                far = m.far
+                k = Within { exit: m.near, node: HIT, mask: ALL, steep: 1.0 }
+            } else {
+                let grow = 0.5 * (wide + spread * max(box.y, 0.0))
+                let n = self.field.meets_grown(o, d, grow, 0.0)
+                near = max(near, n.near)
+                far = min(far, n.far)
+            }
+        }
+        Begun { near, far, walk: k }
+    }
+
+    fn lone_step(self, walk: Within, p: vec3, d: vec3, inv: vec3, t: f32, size: f32) -> Stepped<Within> {
+        // (Met where the thing says, and inside from there; else its whole field.)
+        let f = if W == MET && walk.node == HIT { if t >= walk.exit { -1.0e-6 } else { walk.exit - t } } else { self.lone_at(p) }
+        Stepped { x: f, y: f, walk }
+    }
+
+    fn lone_far(self, walk: Within, p: vec3, t: f32, size: f32) -> f32 {
+        self.lone_at(p)
+    }
+}
+
+impl<M: Field<Substance>, const W: u32> Asked for Lone<M, W> {
+    type Walk = Within
+
+    fn begun(self, o: vec3, d: vec3, wide: f32, spread: f32) -> Begun<Within> {
+        self.lone_begun(o, d, wide, spread)
+    }
+
+    fn step(self, walk: Within, p: vec3, d: vec3, inv: vec3, t: f32, size: f32) -> Stepped<Within> {
+        self.lone_step(walk, p, d, inv, t, size)
+    }
+
+    fn far(self, walk: Within, p: vec3, t: f32, size: f32) -> f32 {
+        self.lone_far(walk, p, t, size)
+    }
+
+    fn facing(self, walk: Within, p: vec3, t: f32, came: vec3, size: f32) -> vec3 {
+        let grad = self.field.gradient(p)
+        if dot(grad, grad) > 1.0e-8 {
+            return normalize(grad)
+        }
+        came
+    }
+
+    fn made_of(self, walk: Within, p: vec3, t: f32) -> Substance {
+        self.field.channels(p)
+    }
+
+    fn told(self, walk: Within, p: vec3, size: f32) -> Told {
+        let g = self.grid
+        Told { node: walk.node, level: 0, side: 0.0, off: 0.0, cells: 0.0, field: clamp(self.field.distance(p), -g.scope, g.scope) / g.stated, exit: walk.exit, brick: 0 }
+    }
+}
+
+impl<M: Field<Substance> + GpuData, const W: u32> Kinded for Seens<M, W> {
+    type One = Lone<M, W>
+
+    fn one(self, i: u32) -> Lone<M, W> {
+        Lone { field: self.fields[i], grid: self.grids[i] }
+    }
+
+    fn bound(self, i: u32) -> vec4 {
+        self.bounds[i]
+    }
+}
+
 /// What a walk holds at a point (`Asked::told`, an instrument): its node (or the brick of cells
 /// it reads there: its node, level, side, recorded error, and the cells' own distance; -1e9
 /// where that is a child that holds no surface), the field's own distance there over the
@@ -202,8 +319,12 @@ fn root_lo(g: Grid, p: vec3) -> vec3 {
 impl<M: Field<Substance>, const W: u32> Seen<M, W> {
     /// Its whole field's value over the steepness std's shapes state, never past its surface.
     fn whole_at(self, p: vec3) -> f32 {
-        let g = self.grid
-        clamp(self.field.distance(p), -g.scope, g.scope) / g.stated
+        self.lone().lone_at(p)
+    }
+
+    /// It as a thing that keeps no roots asks it (`Lone`).
+    fn lone(self) -> Lone<M, W> {
+        Lone { field: self.field, grid: self.grid }
     }
 
     /// Root `r`'s least corner.
@@ -344,54 +465,31 @@ impl<M: Field<Substance>, const W: u32> Asked for Seen<M, W> {
     type Walk = Within
 
     fn begun(self, o: vec3, d: vec3, wide: f32, spread: f32) -> Begun<Within> {
-        // Within its grid; and, a thing that says exactly where a ray first meets it (`MET`:
-        // `Surface::meets`, std's, in closed form through its combinators), there, unmarched;
-        // where it misses, the ray marches only where the thing grown by as much as the ray must
-        // be told of (half its widest width over the grid, for its near misses) can be. Any
-        // other thing carries none of this: its roots and live parts skip what a stretch would.
+        // (A thing that keeps no roots, as `Lone` asks it; any other within its grid: its roots
+        // and live parts skip what a stretch would.)
+        if W == WHOLE || W == MET {
+            return self.lone().lone_begun(o, d, wide, spread)
+        }
         let g = self.grid
         let box = box_span(o, d, g.lo, g.hi)
-        var near = box.x
-        var far = box.y
-        var k = Within { exit: -1.0, node: NO_BRICK, mask: 0, steep: 1.0 }
-        if W == MET && M::EXACT_MEETS && box.y >= box.x && box.y >= 0.0 {
-            let m = self.field.meets(o, d)
-            if m.exact() && m.near <= m.far {
-                near = m.near
-                far = m.far
-                k = Within { exit: m.near, node: HIT, mask: ALL, steep: 1.0 }
-            } else {
-                let grow = 0.5 * (wide + spread * max(box.y, 0.0))
-                let n = self.field.meets_grown(o, d, grow, 0.0)
-                near = max(near, n.near)
-                far = min(far, n.far)
-            }
-        }
-        Begun { near, far, walk: k }
+        Begun { near: box.x, far: box.y, walk: Within { exit: -1.0, node: NO_BRICK, mask: 0, steep: 1.0 } }
     }
 
     fn step(self, walk: Within, p: vec3, d: vec3, inv: vec3, t: f32, size: f32) -> Stepped<Within> {
-        var k = walk
-        var a = vec2(0.0)
-        if W == MET && k.node == HIT {
-            // (Met where the thing says, and inside from there.)
-            let f = if t >= k.exit { -1.0e-6 } else { k.exit - t }
-            a = vec2(f, f)
-        } else if W == WHOLE || W == MET {
-            let f = self.whole_at(p)
-            a = vec2(f, f)
-        } else {
-            if !(t < k.exit) {
-                k = self.fetched(p, inv, t)
-            }
-            a = self.answered(k, p, inv, t, along: true, size: size)
+        if W == WHOLE || W == MET {
+            return self.lone().lone_step(walk, p, d, inv, t, size)
         }
+        var k = walk
+        if !(t < k.exit) {
+            k = self.fetched(p, inv, t)
+        }
+        let a = self.answered(k, p, inv, t, along: true, size: size)
         Stepped { x: a.x, y: a.y, walk: k }
     }
 
     fn far(self, walk: Within, p: vec3, t: f32, size: f32) -> f32 {
         if W == WHOLE || W == MET {
-            return self.whole_at(p)
+            return self.lone().lone_far(walk, p, t, size)
         }
         if walk.node == NO_BRICK && walk.mask != 1 {
             // (Roots that hold nothing, from where they were fetched to where the walk now is:

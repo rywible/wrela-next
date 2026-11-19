@@ -33,7 +33,7 @@
 // `FILL` probes a frame, nothing drawn when none wait. A compute dispatch can't hold two marches
 // an invocation within the 50 ms a dispatch may take; a render pass can.
 
-use matter::asked::Asked
+use matter::asked::{Asked, Kinded}
 use matter::cells::{Kept, folded8, unfolded8}
 use matter::world::{Each, World}
 use ray::ray::{Ray, met}
@@ -41,7 +41,7 @@ use reference::traced::LEAVE
 use std::collections::Vec
 use std::field::hash_u32
 use std::gpu::{
-    Atomics, Blend, ClipPosition, FragCoord, GlobalId, GpuBuffer, GpuSpan, Pass, R8, Rgba16Float, Rgba32Float, Rgba8, Texture, VertexIndex,
+    Atomics, Blend, ClipPosition, Flat, FragCoord, GlobalId, GpuBuffer, GpuSpan, InstanceIndex, Pass, R8, Rgba16Float, Rgba32Float, Rgba8, Texture, VertexIndex,
     begin_pass, buffer, dispatch, draw, label, read, texture,
 }
 use std::io::{Pending, print}
@@ -280,12 +280,16 @@ fn chunk(head: GpuSpan<u32>) -> u32 {
 /// when no probe waits.
 @vertex
 fn fill_quad(v: VertexIndex, head: GpuSpan<u32>, rows: u32) -> ClipPosition {
+    ClipPosition { position: quad_at(v.index, head, rows) }
+}
+
+/// Corner `k` of `fill_quad`'s quad.
+fn quad_at(k: u32, head: GpuSpan<u32>, rows: u32) -> vec4 {
     let used = (chunk(head) * RING + FW - 1) / FW
     let y1 = 1.0 - 2.0 * f32(used) / f32(rows)
-    let k = v.index
     let x = if k == 1 || k == 2 || k == 4 { 1.0 } else { -1.0 }
     let y = if k == 2 || k == 4 || k == 5 { y1 } else { 1.0 }
-    ClipPosition { position: vec4(x, y, 0.5, 1.0) }
+    vec4(x, y, 0.5, 1.0)
 }
 
 /// Two unit vectors square to `n` and to each other.
@@ -322,6 +326,11 @@ fn ring_from(q: vec3, n: vec3, h: f32, r: u32) -> vec4 {
 /// (the most of every thing's is kept: `Blend::Max`).
 @fragment
 fn probe_ray<A: Asked>(pixel: FragCoord, w: A, bound: vec4, sun: vec3, table: GpuSpan<u32>, list: GpuSpan<u32>, head: GpuSpan<u32>) -> vec4 {
+    probe_rayed(pixel, w, bound, sun, table, list, head)
+}
+
+/// What a probe's ray says (`probe_ray`).
+fn probe_rayed<A: Asked>(pixel: FragCoord, w: A, bound: vec4, sun: vec3, table: GpuSpan<u32>, list: GpuSpan<u32>, head: GpuSpan<u32>) -> vec4 {
     let i = u32(pixel.position.x) + FW * u32(pixel.position.y)
     if i >= chunk(head) * RING {
         return vec4(0.0)
@@ -362,6 +371,26 @@ fn probe_ray<A: Asked>(pixel: FragCoord, w: A, bound: vec4, sun: vec3, table: Gp
         return vec4(0.0, 0.0, 1.0, 0.0)
     }
     vec4(0.0)
+}
+
+/// A corner of a kind's fill draw (`Filling::kind`), as the fragments between take it: which
+/// thing of the kind.
+pub struct FillCorner: Copy {
+    pub clip: ClipPosition,
+    pub one: Flat<u32>,
+}
+
+/// `fill_quad`, an instance a thing of a kind.
+@vertex
+fn fill_quad_kind(v: VertexIndex, i: InstanceIndex, head: GpuSpan<u32>, rows: u32) -> FillCorner {
+    FillCorner { clip: ClipPosition { position: quad_at(v.index, head, rows) }, one: Flat { value: i.index } }
+}
+
+/// The rays of the probes waiting against thing `c.one` of a still kind `k`, drawn with the rest
+/// of its kind: as `probe_ray`.
+@fragment
+fn probe_ray_kind<K: Kinded>(c: FillCorner, pixel: FragCoord, k: K, sun: vec3, table: GpuSpan<u32>, list: GpuSpan<u32>, head: GpuSpan<u32>) -> vec4 {
+    probe_rayed(pixel, k.one(c.one.value), k.bound(c.one.value), sun, table, list, head)
 }
 
 /// This frame's probes, their rays' answers gathered (`rays`, the fill's target) into their state.
@@ -480,6 +509,13 @@ borrow struct Filling {
 }
 
 impl Each for Filling {
+    fn kind<K: Kinded>(mut self, k: K, n: u32, first: u32) {
+        if self.kept[first].moving {
+            return
+        }
+        draw(self.pass, fill_quad_kind.bind(head: self.head, rows: FILL * RING / FW), probe_ray_kind.bind(k: k, sun: self.sun, table: self.table, list: self.list, head: self.head), vertices: 6, instances: n, blend: Blend::Max)
+    }
+
     fn thing<A: Asked>(mut self, a: A, k: u32, bound: vec4) {
         if self.kept[k].moving {
             return
@@ -570,7 +606,7 @@ impl Store {
 
     /// The probes waiting filled, `FILL` a frame, by a draw a still thing of `world`; nothing
     /// drawn when the last read of the list said none wait.
-    pub fn fill<W: World>(mut self, world: W, kept: Vec<Kept>, sun: vec3) {
+    pub fn fill<W: World>(mut self, world: W, kinds: W::Kinds, kept: Vec<Kept>, sun: vec3) {
         match mut self.heard {
             Some(p) => match p.poll() {
                 Some(Ok(h)) => {
@@ -592,7 +628,7 @@ impl Store {
         }
         label("light filled")
         var f = Filling { pass: begin_pass(mut self.rays, clear: vec4(0.0)), kept, sun, table: self.table.items(), list: self.list.items(), head: self.head.items() }
-        world.each(kept, 0, mut f)
+        world.each(kept, kinds, 0, mut f)
         f.pass.end()
         dispatch(probes_settled.bind(rays: self.rays, list: self.list.items(), head: self.head.items(), table: mut self.table), over: FILL)
         dispatch(probes_advanced.bind(head: mut self.head), over: 1)
