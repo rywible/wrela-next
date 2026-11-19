@@ -568,6 +568,39 @@ steepness times the distance to it): stepping by that is sound by a theorem, not
 error. **Dead if** the stack's eye is dearer than today's walk at 100 m or at 3 m, or the
 audit's count of hits off by a pixel against the cells' own surface is not zero.
 
+## The crowd: a moving thing is solved, not marched (2026-11-19, not built)
+
+With 64 creatures the frame is 50.6 ms against 16.6, and the counts say why. 88% of a creature's
+fragments in the eye's pass are spent on the cube round its body. A creature's ray takes 14.4
+steps and its outline's least about 16 asks, though at 57% of its hits one part alone is within
+the join's radius of the least, and at 39% two are. Outlines and edge rays follow the things a
+tile holds, not the pixels a thing covers. And most of a built world's nine-ray pixels are
+creases between two flat faces.
+
+So, as directions with their counts taken and nothing built:
+
+- **A smooth union of closed-form shapes is solved.** Its first hit lies between the nearest
+  meet of its parts grown by the join's lowering and their nearest sharp meet. Where one part
+  alone is within the join's radius, the hit is that part's own closed-form meet, with no ask
+  at all; elsewhere a few steps certified by a bound on how fast the field's slope can fall along
+  the ray. The same holds for the least along a ray (an outline) and for how much of the sun an
+  occluder hides. This is std's to give, and the engine then treats a creature as it treats a box.
+- **The smooth union of many does not depend on the order of its parts.** The least over weights
+  on the simplex of the weighted mix plus a quadratic penalty: for two parts it is today's join
+  exactly, for three it differs from today's fold by at most a sixteenth of the radius, and its
+  lowering for eighteen parts is 0.47 of the radius where the fold's is 0.825, which tightens
+  every bound on a creature.
+- **Fragments run where a part can be, not where a body's bound is,** and a kind's things are one
+  draw.
+- **A crease between two planes is a straight line on the screen,** exactly. A pixel crossed by
+  straight outlines and creases is its square cut by those lines, each piece shaded once, with no
+  ray; the piece's surface is taken from the neighbouring pixel that hit it.
+
+What the same argument killed: work lists in compute in place of the rasteriser; merging a far
+creature's parts for the eye (nothing merges at the fiftieth of a pixel edges are held to);
+drawing the rock without cells (its bracket is metres wide). The record is in
+`wrela-notes/coordinator/gemini/`.
+
 ## Ways of spending less that are not tried yet
 
 Since slice 1d the work has gone into making a march cheaper. The larger savings in drawing are
