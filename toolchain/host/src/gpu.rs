@@ -628,6 +628,8 @@ pub(crate) struct Gpu {
     /// What the submission being recorded holds, and how many submissions have been made.
     queued: Queued,
     submissions: u64,
+    /// The most any submission has held: its commands, and (apart) its summed bound.
+    largest: Queued,
     device: wrela_gpu::Device,
     limits: wrela_gpu::Limits,
     align: u64,
@@ -1029,6 +1031,7 @@ impl Gpu {
             counters: Counters::default(),
             queued: Queued::default(),
             submissions: 0,
+            largest: Queued::default(),
             device,
             limits,
             align,
@@ -1968,6 +1971,8 @@ impl Gpu {
         self.upload.write(&self.device, &mut self.counters);
         self.device.submit(vec![encoder.finish()]);
         self.submissions += 1;
+        self.largest.commands = self.largest.commands.max(queued.commands);
+        self.largest.bound_ms = self.largest.bound_ms.max(queued.bound_ms);
         if crate::step::logging() {
             eprintln!(
                 "step frame {} submit | dispatches and passes {} bound {:.1} ms",
@@ -2389,10 +2394,10 @@ impl Gpu {
         Ok(())
     }
 
-    /// How many submissions have been made.
+    /// How many submissions have been made, and the most any has held.
     #[cfg(test)]
-    pub(crate) fn submissions(&self) -> u64 {
-        self.submissions
+    pub(crate) fn submissions(&self) -> (u64, Queued) {
+        (self.submissions, self.largest)
     }
 
     /// In the serial mode, submits what's recorded and waits for the GPU to finish it, so the
@@ -3664,22 +3669,48 @@ mod tests {
     }
 
     /// A frame of 5,000 short dispatches (a band of an audit each, well within the guard) is
-    /// many submissions, not one job of seconds: 64 a submission (2026-11-19, the Radeon's
-    /// resets).
+    /// many submissions, none past 64 of them, not one job of seconds; and a frame of heavy ones
+    /// (each a third of the bound a submission may hold) is many too, none past that bound
+    /// (2026-11-19: the Radeon's resets, backend.md item 32). `tools/check` runs it on each
+    /// machine's GPU: any change to when the host submits is tested against it.
     #[test]
     #[ignore = "needs a GPU"]
     fn a_frame_of_many_dispatches_is_many_submissions() {
         let (manifest, shaders) = increment();
         let mut gpu = Gpu::new(&manifest, &shaders, Timing::Off, false).unwrap();
         gpu.create_buffer(1, 4);
-        let before = gpu.submissions();
+        let (before, _) = gpu.submissions();
         for _ in 0..5000 {
             gpu.dispatch(0, Ok([1, 1, 1]), &[Binding::range(1, 0, 4)], &[]).unwrap();
         }
         gpu.end_frame().unwrap();
-        let made = gpu.submissions() - before;
+        let (after, largest) = gpu.submissions();
+        let made = after - before;
         assert!(made >= 5000 / u64::from(SUBMIT_COMMANDS), "{made} submissions");
+        assert!(largest.commands <= SUBMIT_COMMANDS, "{largest:?}");
+        assert!(largest.bound_ms <= SUBMIT_BOUND_MS, "{largest:?}");
         assert_eq!(gpu.read_buffer(1).unwrap(), 5000u32.to_le_bytes());
+        gpu.check_errors().unwrap();
+
+        // Heavy by its bound (a stated bound, not real work: the kernel adds one).
+        let target = wrela_abi::Target::HERE;
+        let one = crate::step::ms_of(1, 1, target);
+        let work = (SUBMIT_BOUND_MS / 3.0 / one).floor() as u64;
+        let ms = crate::step::ms_of(work, 1, target);
+        assert!(ms <= crate::step::STEP_MS && ms > SUBMIT_BOUND_MS / 4.0, "{ms} ms");
+        let (mut manifest, shaders) = increment();
+        manifest.pipelines[0].work = vec![Some(work)];
+        let mut gpu = Gpu::new(&manifest, &shaders, Timing::Off, false).unwrap();
+        gpu.create_buffer(1, 4);
+        let (before, _) = gpu.submissions();
+        for _ in 0..30 {
+            gpu.dispatch(0, Ok([1, 1, 1]), &[Binding::range(1, 0, 4)], &[]).unwrap();
+        }
+        gpu.end_frame().unwrap();
+        let (after, largest) = gpu.submissions();
+        assert!(after - before >= 10, "{} submissions of 30 heavy dispatches", after - before);
+        assert!(largest.bound_ms <= SUBMIT_BOUND_MS, "{largest:?}");
+        assert_eq!(gpu.read_buffer(1).unwrap(), 30u32.to_le_bytes());
         gpu.check_errors().unwrap();
     }
 
