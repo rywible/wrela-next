@@ -38,7 +38,7 @@
 
 use light::moving::{SKY_ACROSS, SKY_MAP, SKY_MAPS, Sunward, map_deep, map_near, map_quad, sky_map_way, sun_from_movers, sunward, way_open}
 use light::store::{SAYS_DARK, SAYS_LIT, SKY_WAYS, Store, said, said_kept, sky_way, store}
-use matter::asked::{Asked, Cone, Kinded, box_span, cone_met}
+use matter::asked::{Asked, Cone, Kinded, LEAST_MISSED, LEAST_NONE, LEAST_SHOWN, LEAST_UNSURE, box_span, cone_met}
 use matter::cells::{Kept, begins, kept}
 use matter::sky::{Sky, seen}
 use matter::world::{Each, World}
@@ -50,9 +50,9 @@ use ray::ray::{Ray, met}
 use reference::traced::LEAVE
 use std::collections::Vec
 use std::gpu::{
-    Address, Atomics, Blend, ClipPosition, Cull, DepthPass5, DepthTexture, FragCoord, GlobalId, GpuBuffer, GpuSpan, Pass, R8,
-    Rg8, Rgba16Float, Rgba32Float, Sampler, Slots, Targets5, Texels, Texture, VertexIndex, InstanceIndex, Flat, WithDepthBehind, buffer_of, device_epoch, read, begin_pass,
-    begin_pass5_with_depth, begin_screen_pass, begin_depth_pass, buffer, depth_texture, discard, dispatch, draw, label, sampler, texture, timed,
+    Address, Atomics, Blend, ClipPosition, Cull, DepthPass, DepthPass5, DepthPass6, DepthTexture, FragCoord, GlobalId, GpuBuffer, GpuSpan, Pass, R8, R16Float, R32Float,
+    Rg8, Rgba16Float, Rgba32Float, Sampler, Slots, Targets5, Targets6, Texels, Texture, VertexIndex, InstanceIndex, Flat, WithDepth, WithDepthBehind, buffer_of, device_epoch, read, begin_pass, begin_pass_with_depth,
+    begin_pass5_with_depth, begin_pass6_with_depth, begin_screen_pass, begin_depth_pass, buffer, depth_texture, discard, dispatch, draw, label, sampler, texture, timed,
     writable_texture,
 }
 use std::io::{Pending, print}
@@ -73,6 +73,7 @@ const MOST_BANDS: u32 = 128
 /// nearer's distance, to be two surfaces; and the least cosine between two neighbours' facings for
 /// them to be one surface.
 const EDGE_LOOKS: u32 = 3
+const EDGE_RAYS: u32 = EDGE_LOOKS * EDGE_LOOKS
 const JUMP: f32 = 0.05
 const CREASE: f32 = 0.8
 
@@ -137,7 +138,8 @@ fn sky_on(table: Texture<Rgba16Float>, s: Sampler, n: vec3) -> vec3 {
 
 /// Where a fragment's ray goes through the screen: the screen's own pixels (`edges` 0), or the
 /// edge pass's rays laid out a ray a fragment (`edges` 1: ray `j` of edge pixel `e` at fragment
-/// `EDGE_LOOKS² e + j` of a picture `width` wide).
+/// `EDGE_RAYS e + j` of a picture `width` wide, its place on the screen laid out for it by
+/// `outlines_read`).
 pub struct Lay: Copy + GpuData {
     pub edges: u32,
     pub width: u32,
@@ -146,21 +148,30 @@ pub struct Lay: Copy + GpuData {
 }
 
 /// The point on the screen (px) a fragment at `at` draws the ray through (`xy`), and whether it
-/// draws one (`z` 1): an edge pixel's ray is one of `EDGE_LOOKS`² spread evenly over its pixel.
-fn spot(at: vec2, lay: Lay, list: GpuSpan<u32>, count: GpuSpan<u32>) -> vec3 {
+/// draws one (`z` 1): an edge pass's ray where `rays` (a word a ray, `outlines_read`) puts it.
+fn spot(at: vec2, lay: Lay, rays: GpuSpan<u32>, count: GpuSpan<u32>) -> vec3 {
     if lay.edges == 0 {
         return vec3(at, 1.0)
     }
     let i = u32(at.x) + lay.width * u32(at.y)
-    let n = EDGE_LOOKS * EDGE_LOOKS
-    let e = i / n
-    if e >= count[0] {
+    if i >= count[0] {
         return vec3(0.0)
     }
-    let pix = list[e]
-    let j = i % n
-    let o = (vec2(f32(j % EDGE_LOOKS), f32(j / EDGE_LOOKS)) + vec2(0.5)) / f32(EDGE_LOOKS)
-    vec3(vec2(f32(pix % lay.width), f32(pix / lay.width)) + o, 1.0)
+    let r = rays[i]
+    if r == NO_RAY {
+        return vec3(0.0)
+    }
+    vec3(f32(r & 65535), f32(r >> 16), RAY_UNIT) / RAY_UNIT
+}
+
+/// An edge pass's ray's place on the screen as a word (`spot`): x and y in 32nds of a pixel, a
+/// half word each; and a slot that draws no ray.
+const RAY_UNIT: f32 = 32.0
+const NO_RAY: u32 = 4294967295
+
+fn ray_word(p: vec2) -> u32 {
+    let q = clamp(p * RAY_UNIT, vec2(0.0), vec2(65534.0))
+    u32(q.x) | (u32(q.y) << 16)
 }
 
 /// The depth (0 to 1) of what is `t` m along a pixel's ray: the nearer, the less, on every ray.
@@ -178,14 +189,14 @@ const MISSED: f32 = 0.9999999
 /// quads (its first row's part, the rows between, its last row's part), at depth `z`. A draw's
 /// fragments are only the rays its thing can matter to.
 @vertex
-pub fn rays_tiles(v: VertexIndex, i: InstanceIndex, tile_at: GpuSpan<u32>, tx0: u32, tx1: u32, ty0: u32, tw: u32, most: u32, width: u32, height: u32, z: f32) -> ClipPosition {
-    ClipPosition { position: span_at(v.index, ty0 + i.index, tile_at, tx0, tx1, tw, most, width, height, z) }
+pub fn rays_tiles(v: VertexIndex, i: InstanceIndex, looks: u32, tile_at: GpuSpan<u32>, tx0: u32, tx1: u32, ty0: u32, tw: u32, most: u32, width: u32, lines: u32, z: f32) -> ClipPosition {
+    ClipPosition { position: span_at(v.index, looks, ty0 + i.index, tile_at, tx0, tx1, tw, most, width, lines, z) }
 }
 
 /// Corner `c` (0 to 17) of the span of the edge pass's layout holding the rays of tiles `tx0` to
 /// `tx1` of tile row `ty` (`rays_tiles`).
-fn span_at(c: u32, ty: u32, tile_at: GpuSpan<u32>, tx0: u32, tx1: u32, tw: u32, most: u32, width: u32, height: u32, z: f32) -> vec4 {
-    let n = EDGE_LOOKS * EDGE_LOOKS
+fn span_at(c: u32, looks: u32, ty: u32, tile_at: GpuSpan<u32>, tx0: u32, tx1: u32, tw: u32, most: u32, width: u32, lines: u32, z: f32) -> vec4 {
+    let n = looks
     let row = ty * tw
     let a = min(tile_at[row + tx0], most) * n
     let b = min(tile_at[row + tx1 + 1], most) * n
@@ -223,8 +234,8 @@ fn span_at(c: u32, ty: u32, tile_at: GpuSpan<u32>, tx0: u32, tx1: u32, tw: u32, 
     }
     let px = f32(if k % 2 == 0 { x0 } else { x1 })
     let py = f32(if k / 2 == 0 { y0 } else { y1 })
-    let none = x1 <= x0 || y1 <= y0 || y0 >= height
-    if none { vec4(2.0, 2.0, 2.0, 1.0) } else { vec4(px / f32(width) * 2.0 - 1.0, 1.0 - 2.0 * min(py, f32(height)) / f32(height), z, 1.0) }
+    let none = x1 <= x0 || y1 <= y0 || y0 >= lines
+    if none { vec4(2.0, 2.0, 2.0, 1.0) } else { vec4(px / f32(width) * 2.0 - 1.0, 1.0 - 2.0 * min(py, f32(lines)) / f32(lines), z, 1.0) }
 }
 
 /// A corner of a kind's draw (`Each::kind`), as the pixels between take it: which of the kind.
@@ -260,7 +271,7 @@ pub fn kind_swept<K: Kinded>(c: VertexIndex, i: InstanceIndex, v: View, k: K, aw
 /// `rows`) over its rectangle (`swept` 0: its bound's, at the depth of its nearest corner; 1: its
 /// bound swept away from the sun as `kind_swept`, at depth 1/2) (a kind's edge draws: `rays_tiles`).
 @vertex
-pub fn kind_rays<K: Kinded>(c: VertexIndex, i: InstanceIndex, v: View, k: K, rows: u32, swept: u32, away: vec3, lo: vec3, hi: vec3, tile_at: GpuSpan<u32>, most: u32, width: u32, height: u32) -> KindCorner {
+pub fn kind_rays<K: Kinded>(c: VertexIndex, i: InstanceIndex, v: View, k: K, looks: u32, rows: u32, swept: u32, away: vec3, lo: vec3, hi: vec3, tile_at: GpuSpan<u32>, most: u32, width: u32, height: u32, lines: u32) -> KindCorner {
     let one = i.index / rows
     let row = i.index % rows
     let b = k.bound(one)
@@ -275,7 +286,7 @@ pub fn kind_rays<K: Kinded>(c: VertexIndex, i: InstanceIndex, v: View, k: K, row
     let t = tiles_over(r, width, height)
     var p = vec4(2.0, 2.0, 2.0, 1.0)
     if r.z > r.x && r.w > r.y && row < t.w {
-        p = span_at(c.index, t.z + row, tile_at, t.x, t.y, tiles_of(width, height).x, most, width, height, z)
+        p = span_at(c.index, looks, t.z + row, tile_at, t.x, t.y, tiles_of(width, height).x, most, width, lines, z)
     }
     KindCorner { clip: ClipPosition { position: p }, one: Flat { value: one } }
 }
@@ -327,8 +338,9 @@ pub fn eye<A: Asked, S: Sky>(
     list: GpuSpan<u32>,
     count: GpuSpan<u32>,
     still: u32,
-) -> WithDepthBehind<Targets5<vec4, vec4, vec4, vec4, vec4>> {
-    eyed(pixel, v, w, sky, lay, list, count, still)
+    one: u32,
+) -> WithDepthBehind<Targets6<vec4, vec4, vec4, vec4, vec4, f32>> {
+    eyed(pixel, v, w, sky, lay, list, count, still, one)
 }
 
 /// The eye draw of thing `c.one` of a kind (`Kinded`), drawn with the rest of its kind: as `eye`.
@@ -343,18 +355,19 @@ pub fn eye_kind<K: Kinded, S: Sky>(
     list: GpuSpan<u32>,
     count: GpuSpan<u32>,
     still: u32,
-) -> WithDepthBehind<Targets5<vec4, vec4, vec4, vec4, vec4>> {
-    eyed(pixel, v, k.one(c.one.value), sky, lay, list, count, still)
+    first: u32,
+) -> WithDepthBehind<Targets6<vec4, vec4, vec4, vec4, vec4, f32>> {
+    eyed(pixel, v, k.one(c.one.value), sky, lay, list, count, still, first + c.one.value)
 }
 
 /// What an eye draw writes (`eye`).
-fn eyed<A: Asked, S: Sky>(pixel: FragCoord, v: View, w: A, sky: S, lay: Lay, list: GpuSpan<u32>, count: GpuSpan<u32>, still: u32) -> WithDepthBehind<Targets5<vec4, vec4, vec4, vec4, vec4>> {
+fn eyed<A: Asked, S: Sky>(pixel: FragCoord, v: View, w: A, sky: S, lay: Lay, list: GpuSpan<u32>, count: GpuSpan<u32>, still: u32, one: u32) -> WithDepthBehind<Targets6<vec4, vec4, vec4, vec4, vec4, f32>> {
     let at = spot(pixel.position.xy, lay, list, count)
     let d = v.ray(at.xy)
     let px = v.pixel()
     // (A fragment past the edge pass's last ray marches nothing: a discarded fragment goes on.)
     let m = met(w, Ray { o: v.at, d, from: 0.0, to: if at.z < 0.5 { -1.0 } else { 1.0e9 }, wide: 0.0, spread: px })
-    var out = Targets5 { first: vec4(0.0), second: vec4(0.0), third: vec4(0.0), fourth: vec4(0.0), fifth: vec4(0.0) }
+    var out = Targets6 { first: vec4(0.0), second: vec4(0.0), third: vec4(0.0), fourth: vec4(0.0), fifth: vec4(0.0), sixth: f32(one + 1) }
     var depth = MISSED
     if at.z < 0.5 || (!m.met && !(m.nearest < 0.5)) {
         discard()
@@ -735,7 +748,7 @@ fn rect_of_box(v: View, lo: vec3, hi: vec3, width: u32, height: u32) -> vec4 {
 /// The things' eye draws into one pass (`World::each`): each over its bound's rectangle within the
 /// band of rows from `y0` to `y1`.
 borrow struct Eyes<S: Sky> {
-    pass: DepthPass5<Rgba32Float, Rgba32Float, Rgba16Float, Rgba16Float, Rgba16Float>,
+    pass: DepthPass6<Rgba32Float, Rgba32Float, Rgba16Float, Rgba16Float, Rgba16Float, R32Float>,
     v: View,
     sky: S,
     lay: Lay,
@@ -758,9 +771,9 @@ impl<S: Sky> Each for Eyes<S> {
         let still: u32 = if self.kept[first].moving || self.off { 0 } else { 1 }
         if self.lay.edges == 1 {
             let rows = tiles_of(self.width, self.height).y
-            draw(self.pass, kind_rays.bind(v: self.v, k: k, rows: rows, swept: 0, away: vec3(0.0, 1.0, 0.0), lo: vec3(0.0), hi: vec3(0.0), tile_at: self.tile_at, most: self.most, width: self.width, height: self.height), eye_kind.bind(v: self.v, k: k, sky: self.sky, lay: self.lay, list: self.list, count: self.count, still: still), vertices: 18, instances: n * rows)
+            draw(self.pass, kind_rays.bind(v: self.v, k: k, looks: 1, rows: rows, swept: 0, away: vec3(0.0, 1.0, 0.0), lo: vec3(0.0), hi: vec3(0.0), tile_at: self.tile_at, most: self.most, width: self.width, height: self.height, lines: self.height), eye_kind.bind(v: self.v, k: k, sky: self.sky, lay: self.lay, list: self.list, count: self.count, still: still, first: first), vertices: 18, instances: n * rows)
         } else {
-            draw(self.pass, kind_rect.bind(v: self.v, k: k, width: self.width, height: self.height), eye_kind.bind(v: self.v, k: k, sky: self.sky, lay: self.lay, list: self.list, count: self.count, still: still), vertices: 6, instances: n)
+            draw(self.pass, kind_rect.bind(v: self.v, k: k, width: self.width, height: self.height), eye_kind.bind(v: self.v, k: k, sky: self.sky, lay: self.lay, list: self.list, count: self.count, still: still, first: first), vertices: 6, instances: n)
         }
     }
 
@@ -773,7 +786,7 @@ impl<S: Sky> Each for Eyes<S> {
                 self.pass.scissor(0, self.y0, self.width, self.y1 - self.y0)
                 let near = max(length(bound.xyz - self.v.at) - round_of(bound), 0.0)
                 let t = tiles_over(r, self.width, self.height)
-                draw(self.pass, rays_tiles.bind(tile_at: self.tile_at, tx0: t.x, tx1: t.y, ty0: t.z, tw: tiles_of(self.width, self.height).x, most: self.most, width: self.width, height: self.height, z: depth_of(near)), eye.bind(v: self.v, w: a, sky: self.sky, lay: self.lay, list: self.list, count: self.count, still: still), vertices: 18, instances: t.w)
+                draw(self.pass, rays_tiles.bind(looks: 1, tile_at: self.tile_at, tx0: t.x, tx1: t.y, ty0: t.z, tw: tiles_of(self.width, self.height).x, most: self.most, width: self.width, lines: self.height, z: depth_of(near)), eye.bind(v: self.v, w: a, sky: self.sky, lay: self.lay, list: self.list, count: self.count, still: still, one: k), vertices: 18, instances: t.w)
             }
             return
         }
@@ -783,10 +796,328 @@ impl<S: Sky> Each for Eyes<S> {
             self.pass.scissor(u32(r.x), ya, u32(r.z) - u32(r.x), yb - ya)
             // (Its nearest corner may be nearer than its centre less half its side.)
             let near = max(length(bound.xyz - self.v.at) - round_of(bound), 0.0)
-            draw(self.pass, cover_at.bind(z: depth_of(near)), eye.bind(v: self.v, w: a, sky: self.sky, lay: self.lay, list: self.list, count: self.count, still: still), vertices: 3)
+            draw(self.pass, cover_at.bind(z: depth_of(near)), eye.bind(v: self.v, w: a, sky: self.sky, lay: self.lay, list: self.list, count: self.count, still: still, one: k), vertices: 3)
         }
     }
 }
+
+/// Where thing `w`'s outline is from edge pixel `list[i]`'s middle (`i` the fragment's place in
+/// the list, a pixel a fragment, `width` to a row; `count[0]` of them), from the least value of its
+/// field along the pixel's ray (`Asked::least`, g): g over its change across the screen (the
+/// field's gradient at the least place turned onto the screen by how the ray's point there moves
+/// with the pixel: the envelope theorem) is how many pixels the outline is from the middle, signed
+/// (`s`, over 0 outside the thing), and that change's way is the way out of the thing on the
+/// screen (`m`). Into the target (`s`, `m`, what the least is), at the depth `|s|` over
+/// `REACH`: the nearest outline kept. A thing whose least can't be known near the ray, or that the
+/// ray went through unmet: at depth 0, so it is kept. Nothing within `REACH`: nothing.
+fn outlined<A: Asked>(pixel: FragCoord, v: View, w: A, one: u32, ids: Texture<R32Float>, place: Texture<Rgba32Float>, width: u32, list: GpuSpan<u32>, count: GpuSpan<u32>) -> vec4 {
+    let i = u32(pixel.position.x) + width * u32(pixel.position.y)
+    var out = vec4(2.0 * REACH, 0.0, 0.0, f32(LEAST_NONE))
+    if i < count[0] {
+        let pix = list[i]
+        // (Only a thing a pixel of the 3x3 round this one keeps: a thing whose outline crosses
+        // it shows on its own side, but where it is thinner than a pixel there, or hidden on
+        // that side: SCENE 8 at 64 lost 53 of 84,019 edge pixels' things so, the far view none.)
+        let x0 = i32(pix % width)
+        let y0 = i32(pix / width)
+        var near = false
+        for j in 0..9 {
+            let x = clamp(x0 + i32(j % 3) - 1, 0, i32(width) - 1)
+            let y = clamp(y0 + i32(j / 3) - 1, 0, i32(ids.height()) - 1)
+            near = near || u32(ids.load(u32(x), u32(y)) + 0.5) == one + 1
+        }
+        if !near {
+            return out
+        }
+        let c = vec2(f32(pix % width), f32(pix / width)) + vec2(0.5)
+        let me = place.load(pix % width, pix / width)
+        let d = v.ray(c)
+        let l = w.least(v.at, d, if me.w > 0.0 { me.w } else { 1.0e6 }, v.pixel())
+        if l.state == LEAST_UNSURE || l.state == LEAST_MISSED {
+            out = vec4(0.0, 0.0, 0.0, f32(l.state))
+        } else if l.state != LEAST_NONE {
+            let gs = vec2(dot(l.n, v.ray(c + vec2(1.0, 0.0)) - d), dot(l.n, v.ray(c + vec2(0.0, 1.0)) - d)) * l.t
+            let len = length(gs)
+            if len > 1.0e-12 {
+                out = vec4(l.g / len, gs / len, f32(l.state))
+            }
+        }
+    }
+    out
+}
+
+/// A thing's outline draw (`outlined`): the nearest kept by the depth test.
+@fragment
+pub fn outline_drawn<A: Asked>(pixel: FragCoord, v: View, w: A, one: u32, ids: Texture<R32Float>, place: Texture<Rgba32Float>, width: u32, list: GpuSpan<u32>, count: GpuSpan<u32>) -> WithDepth<vec4> {
+    outline_kept(outlined(pixel, v, w, one, ids, place, width, list, count))
+}
+
+/// The outline draw of thing `c.one` of a kind, drawn with the rest of its kind (`outlined`).
+@fragment
+pub fn outline_kind<K: Kinded>(c: KindCorner, pixel: FragCoord, v: View, k: K, first: u32, ids: Texture<R32Float>, place: Texture<Rgba32Float>, width: u32, list: GpuSpan<u32>, count: GpuSpan<u32>) -> WithDepth<vec4> {
+    outline_kept(outlined(pixel, v, k.one(c.one.value), first + c.one.value, ids, place, width, list, count))
+}
+
+fn outline_kept(o: vec4) -> WithDepth<vec4> {
+    let state = u32(o.w + 0.5)
+    if state == LEAST_NONE || abs(o.x) > REACH {
+        discard()
+    }
+    let unsure = state == LEAST_UNSURE || state == LEAST_MISSED
+    WithDepth { color: o, depth: if unsure { 0.0 } else { 0.005 + 0.99 * abs(o.x) / REACH } }
+}
+
+/// How far from a pixel's middle (px) an outline is looked for (past it, the pixel is not shared
+/// by it).
+const REACH: f32 = 1.5
+
+/// The things' outline draws into the nearest outline's target (by depth), each over its
+/// rectangle's tiles of the edge list, a pixel a fragment.
+borrow struct Outlining {
+    near: DepthPass<Rgba16Float>,
+    v: View,
+    place: borrow Texture<Rgba32Float>,
+    ids: borrow Texture<R32Float>,
+    list: GpuSpan<u32>,
+    count: GpuSpan<u32>,
+    tile_at: GpuSpan<u32>,
+    most: u32,
+    width: u32,
+    height: u32,
+    lines: u32,
+}
+
+impl Each for Outlining {
+    fn kind<K: Kinded>(mut self, k: K, n: u32, first: u32) {
+        let rows = tiles_of(self.width, self.height).y
+        let corners = kind_rays.bind(v: self.v, k: k, looks: 1, rows: rows, swept: 0, away: vec3(0.0, 1.0, 0.0), lo: vec3(0.0), hi: vec3(0.0), tile_at: self.tile_at, most: self.most, width: self.width, height: self.height, lines: self.lines)
+        draw(self.near, corners, outline_kind.bind(v: self.v, k: k, first: first, ids: self.ids, place: self.place, width: self.width, list: self.list, count: self.count), vertices: 18, instances: n * rows)
+    }
+
+    fn thing<A: Asked>(mut self, a: A, k: u32, bound: vec4) {
+        let r = rect_of(self.v, bound, self.width, self.height)
+        if u32(r.z) > u32(r.x) && u32(r.w) > u32(r.y) {
+            let t = tiles_over(r, self.width, self.height)
+            let corners = rays_tiles.bind(looks: 1, tile_at: self.tile_at, tx0: t.x, tx1: t.y, ty0: t.z, tw: tiles_of(self.width, self.height).x, most: self.most, width: self.width, lines: self.lines, z: 0.5)
+            draw(self.near, corners, outline_drawn.bind(v: self.v, w: a, one: k, ids: self.ids, place: self.place, width: self.width, list: self.list, count: self.count), vertices: 18, instances: t.w)
+        }
+    }
+}
+
+/// The share of a pixel's square (side 1, its middle at 0) where `m . x < e` (`m` unit): a straight
+/// edge's cover, in closed form (the integral of a ramp over the square: the area under the line,
+/// by the four corners' parts).
+fn square_cover(m: vec2, e: f32) -> f32 {
+    let a = max(abs(m.x), abs(m.y))
+    let b = min(abs(m.x), abs(m.y))
+    if b < 1.0e-4 {
+        return clamp(e / max(a, 1.0e-6) + 0.5, 0.0, 1.0)
+    }
+    let r0 = max(e + 0.5 * (a + b), 0.0)
+    let r1 = max(e + 0.5 * (a - b), 0.0)
+    let r2 = max(e - 0.5 * (a - b), 0.0)
+    let r3 = max(e - 0.5 * (a + b), 0.0)
+    clamp((r0 * r0 - r1 * r1 - r2 * r2 + r3 * r3) / (2.0 * a * b), 0.0, 1.0)
+}
+
+/// How each edge pixel (`list[id]`, `count[0]` of them) is drawn, from its nearest outline
+/// (`outline`, laid out a pixel a fragment as the list) and the things the pixels round it keep
+/// (`ids`): its rays' places on the screen (`rays`, `EDGE_RAYS` words a pixel, `ray_n` of them;
+/// laid one after another by `rays_placed`) and how they mix (`looks[id]`: the thing's cover of the
+/// pixel, whether the middle ray shows that thing, how it is drawn, `LOOK_*`).
+/// - One outline crosses it, not thin: two more rays, one through the screen half a pixel across
+///   the outline on its other side, one where the thing's colour is taken; the pixel is the
+///   thing's colour and the other side's, mixed by the thing's cover of its square.
+/// - Else today's nine rays spread over it, and why: two outlines cross it, its outline can't be
+///   known, none is near (a crease), or it is thin (the neighbour on the thing's side is not the
+///   thing's: a part or a gap narrower than a pixel).
+@compute(64)
+fn outlines_read(list: [u32], count: [u32], outline: Texture<Rgba16Float>, at: [u32], ids: Texture<R32Float>, place: Texture<Rgba32Float>, rays: mut Atomics<u32>, ray_n: mut Atomics<u32>, looks: mut Slots<vec4>, id: GlobalId) {
+    let k = id.x
+    if k >= count[0] {
+        return
+    }
+    let w = place.width()
+    let h = place.height()
+    let pix = list[k]
+    let x = pix % w
+    let y = pix / w
+    let c = vec2(f32(x), f32(y)) + vec2(0.5)
+    let o = outline.load(k % w, k / w)
+    // (Two outlines cross it where the pixels round it keep three things or more, the sky one:
+    // two of them meet the third there.)
+    var seen = vec3(-1.0)
+    var kinds_seen = 0.0
+    for j in 0..9 {
+        let id = ids.load(u32(clamp(i32(x) + i32(j % 3) - 1, 0, i32(w) - 1)), u32(clamp(i32(y) + i32(j / 3) - 1, 0, i32(h) - 1)))
+        if id != seen.x && id != seen.y && id != seen.z {
+            kinds_seen += 1.0
+            if kinds_seen == 1.0 { seen.x = id } else if kinds_seen == 2.0 { seen.y = id } else { seen.z = id }
+        }
+    }
+    let crossed = kinds_seen
+    let state = u32(o.w + 0.5)
+    var why = LOOK_CREASE
+    var cover = 0.0
+    var shown = 0.0
+    var other = c
+    var colour = c
+    if state == LEAST_UNSURE || state == LEAST_MISSED {
+        why = LOOK_UNSURE
+    } else if crossed > 2.5 {
+        why = LOOK_CROSSED
+    } else if state != LEAST_NONE && abs(o.x) <= REACH {
+        let s = o.x
+        let m = normalize(o.yz)
+        let own = state == LEAST_SHOWN
+        // The neighbour on the thing's side of its outline: the thing's, or it is thinner than a
+        // pixel there.
+        let me = place.load(x, y)
+        let qx = u32(clamp(f32(x) - round(m.x), 0.0, f32(w - 1)))
+        let qy = u32(clamp(f32(y) - round(m.y), 0.0, f32(h - 1)))
+        let q = place.load(qx, qy)
+        let thin = if own { !(q.w > 0.0 && abs(q.w - me.w) <= JUMP * me.w) } else { !(q.w > 0.0 && (me.w <= 0.0 || q.w < me.w)) }
+        if thin {
+            why = LOOK_THIN
+        } else if curved(outline, at, x, y, w, h, s) {
+            why = LOOK_CURVED
+        } else {
+            why = LOOK_ONE
+            cover = square_cover(m, -s)
+            shown = if own { 1.0 } else { 0.0 }
+            other = if own { c + m * (max(-s, 0.0) + ACROSS) } else { c - m * (max(s, 0.0) + ACROSS) }
+            // (The thing's colour where the covered part of the square is 4/9 deep in from the
+            // outline, along its normal through the middle: where a facing that turns as the root
+            // of the depth in takes its mean. Where the outline doesn't cross the square, the
+            // square is wholly covered and the facing turns little across it: its middle.)
+            let half = 0.5 * (abs(m.x) + abs(m.y))
+            colour = if -s >= half { c } else { c - m * (s + COLOUR_DEPTH * max(-s + half, 0.0)) }
+        }
+    }
+    for j in 0..EDGE_RAYS {
+        var word = NO_RAY
+        if why == LOOK_ONE {
+            if j == 0 {
+                word = ray_word(other)
+            } else if j == 1 {
+                word = ray_word(colour)
+            }
+        } else {
+            word = ray_word(vec2(f32(x), f32(y)) + (vec2(f32(j % EDGE_LOOKS), f32(j / EDGE_LOOKS)) + vec2(0.5)) / f32(EDGE_LOOKS))
+        }
+        rays.store(i: EDGE_RAYS * k + j, value: word)
+    }
+    ray_n.store(i: k, value: if why == LOOK_ONE { 2 } else { EDGE_RAYS })
+    looks[id] = vec4(cover, shown, f32(why), 0.0)
+}
+
+/// Each tile's edge pixels' rays (`ray_n`, the list tile by tile from `tile_at`, `count` of them)
+/// summed into `tile_rays`.
+@compute(64)
+fn rays_by_tile(tile_at: [u32], n: u32, count: [u32], ray_n: [u32], tile_rays: mut Atomics<u32>, id: GlobalId) {
+    let t = id.x
+    if t >= n {
+        return
+    }
+    let a = min(tile_at[t], count[0])
+    let b = min(tile_at[t + 1], count[0])
+    var sum: u32 = 0
+    for j in 0..(TILE * TILE) {
+        if a + j < b {
+            sum += ray_n[a + j]
+        }
+    }
+    tile_rays.store(i: t, value: sum)
+}
+
+/// Where each tile's rays begin in the edge pass's layout (`tile_rays` before it), and (at `n`) how
+/// many rays in all.
+@compute(64)
+fn rays_tile_summed(tile_rays: [u32], n: u32, ray_tile_at: mut Atomics<u32>, total: mut Atomics<u32>, id: GlobalId) {
+    let t = id.x
+    if t > n {
+        return
+    }
+    var at: u32 = 0
+    for k in 0..min(t, MOST_TILES) {
+        at += tile_rays[k]
+    }
+    ray_tile_at.store(i: t, value: at)
+    if t == n {
+        total.store(i: 0, value: at)
+    }
+}
+
+/// Each tile's pixels' rays laid one after another from where its rays begin (`ray_tile_at`): each
+/// pixel's first ray (`first`) and its rays' places (`ray_at`, from the nine a pixel `rays9`).
+@compute(64)
+fn rays_placed(tile_at: [u32], n: u32, count: [u32], ray_n: [u32], ray_tile_at: [u32], rays9: [u32], first: mut Atomics<u32>, ray_at: mut Atomics<u32>, id: GlobalId) {
+    let t = id.x
+    if t >= n {
+        return
+    }
+    let a = min(tile_at[t], count[0])
+    let b = min(tile_at[t + 1], count[0])
+    var r = ray_tile_at[t]
+    for j in 0..(TILE * TILE) {
+        let k = a + j
+        if k < b {
+            first.store(i: k, value: r)
+            for q in 0..EDGE_RAYS {
+                if q < ray_n[k] {
+                    ray_at.store(i: r, value: rays9[EDGE_RAYS * k + q])
+                    r += 1
+                }
+            }
+        }
+    }
+}
+
+/// How deep into the covered part of its square, a share of it from the outline, a one-look
+/// pixel's thing's colour is taken (`outlines_read`).
+const COLOUR_DEPTH: f32 = 0.44444445
+
+/// How far past an outline (px) a one-look pixel's other ray goes through the screen.
+const ACROSS: f32 = 0.5
+
+/// How an edge pixel is drawn (`outlines_read`): one more look across one outline; else nine rays
+/// because two outlines cross it, its outline can't be known, none is near (a crease), or it is
+/// thin.
+const LOOK_ONE: u32 = 0
+const LOOK_CROSSED: u32 = 1
+const LOOK_UNSURE: u32 = 2
+const LOOK_CREASE: u32 = 3
+const LOOK_THIN: u32 = 4
+const LOOK_CURVED: u32 = 5
+
+/// Whether the outline near pixel (`x`, `y`) curves within a pixel (`outlines_read`): the
+/// outlines' distances `s` read at its neighbours that are edge pixels too (`at`, `outline`), their
+/// second difference along either axis over `CURVED` (a straight outline's is 0). One look takes
+/// the thing's colour and cover as a straight edge's: on SCENE 0's curved outlines it lost to nine
+/// rays (4.87 against 4.20), so those take nine rays.
+fn curved(outline: Texture<Rgba16Float>, at: [u32], x: u32, y: u32, w: u32, h: u32, s: f32) -> bool {
+    var bent = false
+    for axis in 0..2 {
+        let dx = if axis == 0 { 1 } else { 0 }
+        let dy = 1 - dx
+        if x >= dx && y >= dy && x + dx < w && y + dy < h {
+            let a = at[(x - dx) + w * (y - dy)]
+            let b = at[(x + dx) + w * (y + dy)]
+            if a != NO_EDGE && b != NO_EDGE {
+                let sa = outline.load(a % w, a / w).x
+                let sb = outline.load(b % w, b / w).x
+                if abs(sa) <= REACH && abs(sb) <= REACH {
+                    bent = bent || abs(sa + sb - 2.0 * s) > CURVED
+                }
+            }
+        }
+    }
+    bent
+}
+
+/// How far a straight outline's distances across three pixels may bend before it is curved
+/// (`curved`, px).
+const CURVED: f32 = 0.2
 
 /// The things' shadow draws into one pass, each over the band of rows from `y0` to `y1`.
 borrow struct Shadows<S: Sky> {
@@ -831,7 +1162,7 @@ impl<S: Sky> Each for Shadows<S> {
         let away = -self.sky.sun().way
         if self.edge {
             let rows = tiles_of(self.width, self.height).y
-            draw(self.pass, kind_rays.bind(v: self.v, k: k, rows: rows, swept: 1, away: away, lo: self.world_lo, hi: self.world_hi, tile_at: self.tile_at, most: self.most, width: self.width, height: self.height), shadow_kind.bind(k: k, sky: self.sky, place: self.place, asks: self.asks, lit: self.lit, kept: self.said, still: still, checking: checks), vertices: 18, instances: n * rows, blend: Blend::Min)
+            draw(self.pass, kind_rays.bind(v: self.v, k: k, looks: 1, rows: rows, swept: 1, away: away, lo: self.world_lo, hi: self.world_hi, tile_at: self.tile_at, most: self.most, width: self.width, height: self.height, lines: self.height), shadow_kind.bind(k: k, sky: self.sky, place: self.place, asks: self.asks, lit: self.lit, kept: self.said, still: still, checking: checks), vertices: 18, instances: n * rows, blend: Blend::Min)
         } else {
             draw(self.pass, kind_swept.bind(v: self.v, k: k, away: away, lo: self.world_lo, hi: self.world_hi), shadow_kind.bind(k: k, sky: self.sky, place: self.place, asks: self.asks, lit: self.lit, kept: self.said, still: still, checking: checks), vertices: 36, instances: n, blend: Blend::Min, cull: Cull::Front)
         }
@@ -857,7 +1188,7 @@ impl<S: Sky> Each for Shadows<S> {
             let r = rect_of_box(self.v, lo, hi, self.width, self.height)
             if u32(r.z) > u32(r.x) && u32(r.w) > u32(r.y) {
                 let t = tiles_over(r, self.width, self.height)
-                draw(self.pass, rays_tiles.bind(tile_at: self.tile_at, tx0: t.x, tx1: t.y, ty0: t.z, tw: tiles_of(self.width, self.height).x, most: self.most, width: self.width, height: self.height, z: 0.5), shadow.bind(w: a, sky: self.sky, place: self.place, asks: self.asks, lit: self.lit, kept: self.said, still: still, checking: if self.checking { 1 } else { 0 }), vertices: 18, instances: t.w, blend: Blend::Min)
+                draw(self.pass, rays_tiles.bind(looks: 1, tile_at: self.tile_at, tx0: t.x, tx1: t.y, ty0: t.z, tw: tiles_of(self.width, self.height).x, most: self.most, width: self.width, lines: self.height, z: 0.5), shadow.bind(w: a, sky: self.sky, place: self.place, asks: self.asks, lit: self.lit, kept: self.said, still: still, checking: if self.checking { 1 } else { 0 }), vertices: 18, instances: t.w, blend: Blend::Min)
             }
         } else {
             draw(self.pass, swept_corner.bind(v: self.v, sw: sw), shadow.bind(w: a, sky: self.sky, place: self.place, asks: self.asks, lit: self.lit, kept: self.said, still: still, checking: if self.checking { 1 } else { 0 }), vertices: 36, blend: Blend::Min, cull: Cull::Front)
@@ -1053,29 +1384,64 @@ fn edges_found(place: Texture<Rgba32Float>, tile_at: [u32], tw: u32, most: u32, 
 /// The most tiles a screen has (the most passes a loop the host can bound takes: 1080p has 2,040).
 const MOST_TILES: u32 = 4096
 
-/// The picture: an edge pixel the mean of its rays, any other what its middle ray drew (`raw`);
-/// drawing `steps` 1 (the instrument) every pixel as drawn, `steps` 2 its edge pixels red.
+/// The picture: an edge pixel drawn by one more look (`looks`, `outlines_read`) its middle ray's
+/// colour (`raw`) and its other ray's mixed by the thing's cover; one drawn by rays the mean of
+/// its nine; any other what its middle ray drew. Drawing `steps` 1 (the instrument) every pixel
+/// as drawn; `steps` 2 an edge pixel by how it is drawn: one look blue, nine rays because two
+/// outlines cross it red, unsure yellow, a crease green, thin magenta.
 @compute(8, 8)
-fn edges_resolved(raw: Texture<Rgba16Float>, at: [u32], rays: Texture<Rgba16Float>, steps: u32, out: mut Texels<Rgba16Float>, id: GlobalId) {
+fn edges_resolved(raw: Texture<Rgba16Float>, at: [u32], looks: [vec4], first: [u32], rays: Texture<Rgba16Float>, place: Texture<Rgba32Float>, ray_place: Texture<Rgba32Float>, steps: u32, out: mut Texels<Rgba16Float>, cover: mut Texels<Rgba16Float>, id: GlobalId) {
     let w = raw.width()
     if id.x >= w || id.y >= raw.height() {
         return
     }
     let k = at[id.x + w * id.y]
+    // (How much of the pixel matter covers, as it is drawn: its middle ray's say; a one-look
+    // pixel's the thing's cover and what is behind it; one drawn by rays the share that met.)
+    let middle = if place.load(id.x, id.y).w > 0.0 { 1.0 } else { 0.0 }
     if k == NO_EDGE || steps == 1 {
         out.store(id, raw.load(id.x, id.y))
+        cover.store(id, vec4(middle))
+        return
+    }
+    let l = looks[k]
+    let why = u32(l.z + 0.5)
+    if steps == 3 || steps == 4 {
+        // (Instruments: a one-look pixel's cover and whether its middle ray shows the thing (3),
+        // or its other ray's colour (4); else black.)
+        let r = first[k]
+        let v4 = if why != LOOK_ONE { vec4(0.0, 0.0, 0.0, 1.0) } else if steps == 3 { vec4(l.x, l.y, 1.0, 1.0) } else { vec4(rays.load(r % w, r / w).xyz, 1.0) }
+        out.store(id, v4)
     } else if steps == 2 {
-        out.store(id, vec4(1.0, 0.0, 0.0, 1.0))
+        let tint = if why == LOOK_ONE { vec3(0.0, 0.0, 1.0) } else if why == LOOK_CROSSED { vec3(1.0, 0.0, 0.0) } else if why == LOOK_UNSURE { vec3(1.0, 1.0, 0.0) } else if why == LOOK_CREASE { vec3(0.0, 1.0, 0.0) } else { vec3(1.0, 0.0, 1.0) }
+        out.store(id, vec4(tint, 1.0))
+    } else if why == LOOK_ONE {
+        let r = first[k]
+        let mine = raw.load(id.x, id.y).xyz
+        let across = rays.load(r % w, r / w).xyz
+        let behind = if l.y > 0.5 { across } else { mine }
+        // (The thing's colour from its sample where that ray met the thing (at its depth: the
+        // middle ray's, or the other ray's where the middle shows what is behind); where it didn't,
+        // the ray of the two that shows the thing.)
+        let near = if l.y > 0.5 { place.load(id.x, id.y).w } else { ray_place.load(r % w, r / w).w }
+        let sampled = ray_place.load((r + 1) % w, (r + 1) / w).w
+        let met = sampled > 0.0 && near > 0.0 && abs(sampled - near) <= JUMP * near
+        let thing = if met { rays.load((r + 1) % w, (r + 1) / w).xyz } else if l.y > 0.5 { mine } else { across }
+        out.store(id, vec4(thing * l.x + behind * (1.0 - l.x), 1.0))
+        let behind_met = if l.y > 0.5 { (if ray_place.load(r % w, r / w).w > 0.0 { 1.0 } else { 0.0 }) } else { middle }
+        cover.store(id, vec4(l.x + (1.0 - l.x) * behind_met))
     } else {
-        let n = EDGE_LOOKS * EDGE_LOOKS
         var sum = vec3(0.0)
-        var j: u32 = 0
-        while j < n {
-            let r = n * k + j
+        var hits = 0.0
+        for j in 0..EDGE_RAYS {
+            let r = first[k] + j
             sum += rays.load(r % w, r / w).xyz
-            j += 1
+            if ray_place.load(r % w, r / w).w > 0.0 {
+                hits += 1.0
+            }
         }
-        out.store(id, vec4(sum / f32(n), 1.0))
+        out.store(id, vec4(sum / f32(EDGE_RAYS), 1.0))
+        cover.store(id, vec4(hits / f32(EDGE_RAYS)))
     }
 }
 
@@ -1110,6 +1476,22 @@ pub struct Sight {
     edge_fill: GpuBuffer<u32>,
     edge_at: GpuBuffer<u32>,
     edge_rays: Texture<Rgba16Float>,
+    /// Each edge pixel's nearest outline (`outlined`, laid out a pixel a fragment as the list) and
+    /// its depth, the outlines crossing it, how it is drawn (`outlines_read`), and its rays'
+    /// places on the screen (`spot`).
+    outline: Texture<Rgba16Float>,
+    outline_depth: DepthTexture,
+    looks: GpuBuffer<vec4>,
+    ray_at: GpuBuffer<u32>,
+    /// The edge pass's layout: each pixel's rays nine slots apart as `outlines_read` places them,
+    /// how many each has, where each tile's and each pixel's rays begin once laid one after another
+    /// (`ray_at`), each tile's rays, and how many in all.
+    ray_words9: GpuBuffer<u32>,
+    ray_n: GpuBuffer<u32>,
+    ray_first: GpuBuffer<u32>,
+    ray_tile_at: GpuBuffer<u32>,
+    tile_rays: GpuBuffer<u32>,
+    ray_total: GpuBuffer<u32>,
     /// What the eye draws hand the shade pass (the sun's light if its ray finds it, the open
     /// sky's factor, what is given off), the depth that joins things, whether the sun's ray found
     /// the sun; and the edge pass's own places and asks.
@@ -1119,6 +1501,9 @@ pub struct Sight {
     depth: DepthTexture,
     sunny: Texture<R8>,
     edge_place: Texture<Rgba32Float>,
+    /// Each pixel's kept thing's number + 1 (0: none), the middle rays' and the edge rays' own.
+    ids: Texture<R32Float>,
+    ids_edge: Texture<R32Float>,
     edge_asks: Texture<Rgba32Float>,
     burned: Texture<R8>,
     /// Light's store (`light::store`), and what it says of each pixel's sun (`said_drawn`).
@@ -1183,12 +1568,24 @@ pub fn sight() -> Sight {
         edge_fill: buffer(1),
         edge_at: buffer(1),
         edge_rays: texture(width: 1, height: 1),
+        outline: texture(width: 1, height: 1),
+        outline_depth: depth_texture(width: 1, height: 1),
+        looks: buffer(1),
+        ray_at: buffer(EDGE_RAYS),
+        ray_words9: buffer(EDGE_RAYS),
+        ray_n: buffer(1),
+        ray_first: buffer(1),
+        ray_tile_at: buffer(2),
+        tile_rays: buffer(1),
+        ray_total: buffer(1),
         lit: texture(width: 1, height: 1),
         open: texture(width: 1, height: 1),
         emits: texture(width: 1, height: 1),
         depth: depth_texture(width: 1, height: 1),
         sunny: texture(width: 1, height: 1),
         edge_place: texture(width: 1, height: 1),
+        ids: texture(width: 1, height: 1),
+        ids_edge: texture(width: 1, height: 1),
         edge_asks: texture(width: 1, height: 1),
         burned: texture(width: 1, height: 1),
         light: store(),
@@ -1329,12 +1726,12 @@ impl Sight {
             let y1 = (band + 1) * height / bands
             band += 1
             if edge {
-                let p = begin_pass5_with_depth(mut self.edge_place, mut self.edge_asks, mut self.lit, mut self.open, mut self.emits, mut self.depth, clear: vec4(0.0), keep: band > 1, keep_depth: band > 1)
-                var e = Eyes { pass: p, v, sky, lay, list: self.edge_list.items(), count: self.edge_count.items(), y0, y1, width, height, tile_at: self.edge_tile_at.items(), most: width * height / EDGE_SHARE, kept: self.kept, off: self.light.off }
+                let p = begin_pass6_with_depth(mut self.edge_place, mut self.edge_asks, mut self.lit, mut self.open, mut self.emits, mut self.ids_edge, mut self.depth, clear: vec4(0.0), keep: band > 1, keep_depth: band > 1)
+                var e = Eyes { pass: p, v, sky, lay, list: self.ray_at.items(), count: self.ray_total.items(), y0, y1, width, height, tile_at: self.ray_tile_at.items(), most: width * height / EDGE_SHARE * EDGE_RAYS, kept: self.kept, off: self.light.off }
                 world.each(self.kept, kinds, 0, mut e)
                 e.pass.end()
             } else {
-                let p = begin_pass5_with_depth(mut self.drawn.place, mut self.asks, mut self.lit, mut self.open, mut self.emits, mut self.depth, clear: vec4(0.0), keep: band > 1, keep_depth: band > 1)
+                let p = begin_pass6_with_depth(mut self.drawn.place, mut self.asks, mut self.lit, mut self.open, mut self.emits, mut self.ids, mut self.depth, clear: vec4(0.0), keep: band > 1, keep_depth: band > 1)
                 var e = Eyes { pass: p, v, sky, lay, list: self.edge_list.items(), count: self.edge_count.items(), y0, y1, width, height, tile_at: self.edge_tile_at.items(), most: width * height / EDGE_SHARE, kept: self.kept, off: self.light.off }
                 world.each(self.kept, kinds, 0, mut e)
                 e.pass.end()
@@ -1347,7 +1744,7 @@ impl Sight {
             let sun = sky.sun().way
             if edge {
                 let tt = tiles_of(width, height)
-                draw(p, rays_tiles.bind(tile_at: self.edge_tile_at.items(), tx0: 0, tx1: tt.x - 1, ty0: 0, tw: tt.x, most: width * height / EDGE_SHARE, width: width, height: height, z: 0.5), said_drawn.bind(v: v, sun: sun, place: self.edge_place, lit: self.lit, table: self.light.table(), filled_at: self.light.filled_at(), changes: self.light.changed(), lay: lay, list: self.edge_list.items(), count: self.edge_count.items()), vertices: 18, instances: tt.y)
+                draw(p, rays_tiles.bind(looks: 1, tile_at: self.ray_tile_at.items(), tx0: 0, tx1: tt.x - 1, ty0: 0, tw: tt.x, most: width * height / EDGE_SHARE * EDGE_RAYS, width: width, lines: height, z: 0.5), said_drawn.bind(v: v, sun: sun, place: self.edge_place, lit: self.lit, table: self.light.table(), filled_at: self.light.filled_at(), changes: self.light.changed(), lay: lay, list: self.ray_at.items(), count: self.ray_total.items()), vertices: 18, instances: tt.y)
             } else {
                 draw(p, cover, said_drawn.bind(v: v, sun: sun, place: self.drawn.place, lit: self.lit, table: self.light.table(), filled_at: self.light.filled_at(), changes: self.light.changed(), lay: lay, list: self.edge_list.items(), count: self.edge_count.items()), vertices: 3)
             }
@@ -1367,12 +1764,12 @@ impl Sight {
             band += 1
             if edge {
                 let p = begin_pass(mut self.sunny, clear: vec4(1.0), keep: band > 1)
-                var e = Shadows { pass: p, sky, place: self.edge_place, asks: self.edge_asks, lit: self.lit, y0, y1, width, v, edge: true, world_lo: reach_lo, world_hi: reach_hi, tile_at: self.edge_tile_at.items(), most: width * height / EDGE_SHARE, height, kept: self.kept, said: self.light_said, checking: false, mapped: mapped }
+                var e = Shadows { pass: p, sky, place: self.edge_place, asks: self.edge_asks, lit: self.lit, y0, y1, width, v, edge: true, world_lo: reach_lo, world_hi: reach_hi, tile_at: self.ray_tile_at.items(), most: width * height / EDGE_SHARE * EDGE_RAYS, height, kept: self.kept, said: self.light_said, checking: false, mapped: mapped }
                 world.each(self.kept, kinds, 0, mut e)
                 if mapped {
                     e.pass.scissor(0, y0, width, y1 - y0)
                     let tt = tiles_of(width, height)
-                    draw(e.pass, rays_tiles.bind(tile_at: self.edge_tile_at.items(), tx0: 0, tx1: tt.x - 1, ty0: 0, tw: tt.x, most: width * height / EDGE_SHARE, width: width, height: height, z: 0.5), sun_movers.bind(m: self.sunward, deep: self.map_deep, nears: self.map_near, place: self.edge_place, asks: self.edge_asks, lit: self.lit, cones: self.cones.items(), hulls: self.hulls.items(), movers: self.movers.items(), count: self.movers_count), vertices: 18, instances: tt.y, blend: Blend::Min)
+                    draw(e.pass, rays_tiles.bind(looks: 1, tile_at: self.ray_tile_at.items(), tx0: 0, tx1: tt.x - 1, ty0: 0, tw: tt.x, most: width * height / EDGE_SHARE * EDGE_RAYS, width: width, lines: height, z: 0.5), sun_movers.bind(m: self.sunward, deep: self.map_deep, nears: self.map_near, place: self.edge_place, asks: self.edge_asks, lit: self.lit, cones: self.cones.items(), hulls: self.hulls.items(), movers: self.movers.items(), count: self.movers_count), vertices: 18, instances: tt.y, blend: Blend::Min)
                 }
                 e.pass.end()
             } else {
@@ -1403,7 +1800,7 @@ impl Sight {
         if edge {
             let p = begin_pass(mut self.edge_rays)
             let tt = tiles_of(width, height)
-            draw(p, rays_tiles.bind(tile_at: self.edge_tile_at.items(), tx0: 0, tx1: tt.x - 1, ty0: 0, tw: tt.x, most: width * height / EDGE_SHARE, width: width, height: height, z: 0.5), shade.bind(v: v, sky: sky, look: look, table: self.table, s: self.s, place: self.edge_place, lit: self.lit, open: self.open, emits: self.emits, sunny: self.sunny, said: self.light_said, hidden: if self.light.off { 0 } else { 1 }, shut: self.shut, lay: lay, list: self.edge_list.items(), count: self.edge_count.items()), vertices: 18, instances: tt.y)
+            draw(p, rays_tiles.bind(looks: 1, tile_at: self.ray_tile_at.items(), tx0: 0, tx1: tt.x - 1, ty0: 0, tw: tt.x, most: width * height / EDGE_SHARE * EDGE_RAYS, width: width, lines: height, z: 0.5), shade.bind(v: v, sky: sky, look: look, table: self.table, s: self.s, place: self.edge_place, lit: self.lit, open: self.open, emits: self.emits, sunny: self.sunny, said: self.light_said, hidden: if self.light.off { 0 } else { 1 }, shut: self.shut, lay: lay, list: self.ray_at.items(), count: self.ray_total.items()), vertices: 18, instances: tt.y)
             p.end()
         } else {
             let p = begin_pass(mut self.raw)
@@ -1493,6 +1890,8 @@ impl Sight {
         if self.drawn.width() != width || self.drawn.height() != height {
             self.drawn = picture(width: width, height: height)
             self.drawn.colour = writable_texture(width: width, height: height)
+            self.drawn.cover = writable_texture(width: width, height: height)
+            self.drawn.covered = true
             self.asks = texture(width: width, height: height)
             self.raw = texture(width: width, height: height)
             let most = width * height / EDGE_SHARE
@@ -1503,6 +1902,16 @@ impl Sight {
             self.edge_tile_at = buffer(tt.x * tt.y + 1)
             self.edge_fill = buffer(tt.x * tt.y)
             self.edge_at = buffer(width * height)
+            let lines = (most + width - 1) / width
+            self.outline = texture(width: width, height: lines)
+            self.outline_depth = depth_texture(width: width, height: lines)
+            self.looks = buffer(most)
+            self.ray_at = buffer(most * EDGE_RAYS)
+            self.ray_words9 = buffer(most * EDGE_RAYS)
+            self.ray_n = buffer(most)
+            self.ray_first = buffer(most)
+            self.ray_tile_at = buffer(tt.x * tt.y + 1)
+            self.tile_rays = buffer(tt.x * tt.y)
             self.edge_rays = texture(width: width, height: height)
             self.lit = texture(width: width, height: height)
             self.open = texture(width: width, height: height)
@@ -1512,6 +1921,8 @@ impl Sight {
             self.light_said = texture(width: width, height: height)
             self.shut = texture(width: (width + SHUT - 1) / SHUT, height: (height + SHUT - 1) / SHUT)
             self.edge_place = texture(width: width, height: height)
+            self.ids = texture(width: width, height: height)
+            self.ids_edge = texture(width: width, height: height)
             self.edge_asks = texture(width: width, height: height)
         }
         // (The four banded passes timed together, each asked again once answered; bands from the
@@ -1639,11 +2050,23 @@ impl Sight {
         dispatch(edge_tiles_summed.bind(tiles: self.edge_tiles.items(), n: nt, most: most, tile_at: mut self.edge_tile_at, fill: mut self.edge_fill, count: mut self.edge_count), over: nt + 1)
         dispatch(edges_found.bind(place: self.drawn.place, tile_at: self.edge_tile_at.items(), tw: tiles_of(width, height).x, most: most, fill: mut self.edge_fill, tiles: mut self.edge_tiles, list: mut self.edge_list, at: mut self.edge_at), groups: groups)
         // (The edge rays the same three, laid out a ray a fragment.)
+        // Each edge pixel's nearest outline and the outlines crossing it (a draw a thing over its
+        // tiles of the list, a pixel a fragment), then how each is drawn and its rays' places.
+        label("outlines")
+        let lines = (most + width - 1) / width
+        let np = begin_pass_with_depth(mut self.outline, mut self.outline_depth, clear: vec4(2.0 * REACH, 0.0, 0.0, 0.0), clear_depth: 1.0)
+        var e = Outlining { near: np, v, place: self.drawn.place, ids: self.ids, list: self.edge_list.items(), count: self.edge_count.items(), tile_at: self.edge_tile_at.items(), most, width, height, lines }
+        world.each(self.kept, kinds, 0, mut e)
+        e.near.end()
+        dispatch(outlines_read.bind(list: self.edge_list.items(), count: self.edge_count.items(), outline: self.outline, at: self.edge_at.items(), ids: self.ids, place: self.drawn.place, rays: mut self.ray_words9, ray_n: mut self.ray_n, looks: mut self.looks), over: most)
+        dispatch(rays_by_tile.bind(tile_at: self.edge_tile_at.items(), n: nt, count: self.edge_count.items(), ray_n: self.ray_n.items(), tile_rays: mut self.tile_rays), over: nt)
+        dispatch(rays_tile_summed.bind(tile_rays: self.tile_rays.items(), n: nt, ray_tile_at: mut self.ray_tile_at, total: mut self.ray_total), over: nt + 1)
+        dispatch(rays_placed.bind(tile_at: self.edge_tile_at.items(), n: nt, count: self.edge_count.items(), ray_n: self.ray_n.items(), ray_tile_at: self.ray_tile_at.items(), rays9: self.ray_words9.items(), first: mut self.ray_first, ray_at: mut self.ray_at), over: nt)
         let rays = Lay { edges: 1, width, spare: 0, spare2: 0 }
         self.lit_by(world, kinds, sky, look, v, rays, bands, width, height, edge: true)
         label("edges resolved")
         dispatch(
-            edges_resolved.bind(raw: self.raw, at: self.edge_at.items(), rays: self.edge_rays, steps: self.steps, out: mut self.drawn.colour),
+            edges_resolved.bind(raw: self.raw, at: self.edge_at.items(), looks: self.looks.items(), first: self.ray_first.items(), rays: self.edge_rays, place: self.drawn.place, ray_place: self.edge_place, steps: self.steps, out: mut self.drawn.colour, cover: mut self.drawn.cover),
             groups: ((width + 7) / 8, (height + 7) / 8, 1),
         )
         self.drawn.placed = true

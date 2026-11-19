@@ -89,7 +89,113 @@ pub trait Asked: Copy {
     /// How far past its parts the joins above them can raise its surface (the most of std's
     /// `PartBound::lowers`): the flesh round its cones (0 where it gives none).
     fn flesh(self) -> f32
+
+    /// The least value its field takes along the ray from `o` along `d` (unit), `spread` m wide a
+    /// metre, near where it can be seen from a pixel that shows what is `until` m along it
+    /// (`least_by`).
+    fn least(self, o: vec3, d: vec3, until: f32, spread: f32) -> Least
 }
+
+/// The least value of a thing's field along a pixel's ray (`Asked::least`): where along it (`t`,
+/// m), the value there (`g`, m: under 0 inside), the field's facing there (`n`, unnormalised),
+/// and what it is (`LEAST_*`).
+pub struct Least: Copy {
+    pub t: f32,
+    pub g: f32,
+    pub n: vec3,
+    pub state: u32,
+}
+
+/// What a `Least` is: nothing to say (the thing is behind what the pixel shows, or far from its
+/// ray); the least of a thing the ray passes before what it shows; of the thing it shows (from its
+/// hit on, inside it); a thing the ray goes through before what it shows, that the march passed
+/// by; a thing whose field says only its bound (not known near it).
+pub const LEAST_NONE: u32 = 0
+pub const LEAST_PASSED: u32 = 1
+pub const LEAST_SHOWN: u32 = 2
+pub const LEAST_MISSED: u32 = 3
+pub const LEAST_UNSURE: u32 = 4
+
+/// The least value `field` takes along the ray from `o` along `d` (unit), `spread` m wide a metre,
+/// near what a pixel showing what is `until` m along it can see (its values over `stated`:
+/// `Asked::least`). The one place it is asked:
+/// - the thing the pixel shows (its value within half the ray's width at `until`): from there on,
+///   steps that double until the value rises again, the least between by golden sections;
+/// - else std's `Surface::passes` (exact in closed form for std's shapes and sharp unions; a
+///   smooth union's bound refined by `Pass::refined`, asked round it within half the ray's width):
+///   before `until`, passed (or gone through, which the march passed by); past it, nothing;
+/// - a field that answers only by its bound: unsure where that bound comes within `SURE` widths.
+/// The facing is the field's gradient at the least place, over `stated` as the value is (the
+/// envelope theorem turns it onto the screen: the least's change with the pixel).
+pub fn least_by<M: Field<Substance>>(field: M, o: vec3, d: vec3, until: f32, spread: f32, stated: f32) -> Least {
+    let p0 = field.passes(o, d)
+    if !p0.exact() && !(p0.blend > 0.0) {
+        let t = max(p0.t, 1.0e-3)
+        let state = if p0.distance / stated > SURE * spread * t { LEAST_NONE } else { LEAST_UNSURE }
+        return Least { t, g: p0.distance / stated, n: vec3(0.0), state }
+    }
+    let at = field.distance(o + d * until) / stated
+    if at <= 0.5 * spread * until {
+        // Its own: on from the hit by steps that double (from a tenth of the ray's width, or the
+        // value there, the more) until the value rises again; then the least between the last
+        // three by golden sections.
+        var ta = until
+        var fa = at
+        var step = max(abs(at), 0.1 * spread * until)
+        var tb = until + step
+        var fb = field.distance(o + d * tb) / stated
+        var tc = tb
+        var fc = fb
+        if fb < fa {
+            for _k in 0..LEAST_STEPS {
+                step = 2.0 * step
+                tc = tb + step
+                fc = field.distance(o + d * tc) / stated
+                if fc >= fb {
+                    break
+                }
+                ta = tb
+                fa = fb
+                tb = tc
+                fb = fc
+            }
+        } else {
+            tc = tb
+            tb = ta
+            fb = fa
+        }
+        // (The least lies between `ta` and `tc`; `tb` the least yet.)
+        var lo = ta
+        var hi = tc
+        var t = tb
+        var g = fb
+        for _k in 0..LEAST_SECTIONS {
+            let u = if t - lo > hi - t { t - 0.381966 * (t - lo) } else { t + 0.381966 * (hi - t) }
+            let fu = field.distance(o + d * u) / stated
+            if fu < g {
+                if u < t { hi = t } else { lo = t }
+                t = u
+                g = fu
+            } else {
+                if u < t { lo = u } else { hi = u }
+            }
+        }
+        return Least { t, g, n: field.gradient(o + d * t) / stated, state: LEAST_SHOWN }
+    }
+    let p = p0.refined(o, d, |q: vec3| field.distance(q), 0.5 * spread * max(p0.t, 1.0e-3))
+    if p.t > until {
+        return Least { t: p.t, g: p.distance / stated, n: vec3(0.0), state: LEAST_NONE }
+    }
+    let state = if p.distance <= 0.0 { LEAST_MISSED } else { LEAST_PASSED }
+    Least { t: p.t, g: p.distance / stated, n: field.gradient(o + d * p.t) / stated, state }
+}
+
+/// How many doubling steps past its hit a ray takes inside the thing it shows to bracket its
+/// least, and golden sections within (`least_by`); and how near, in the ray's widths, a pass that
+/// is only a bound says nothing.
+const LEAST_STEPS: u32 = 12
+const LEAST_SECTIONS: u32 = 10
+const SURE: f32 = 2.0
 
 /// A leaf of a thing's tree of bricks (`Seen::leaf_at`): its node, least corner and side, and
 /// whether it is a child that holds no surface.
@@ -283,6 +389,10 @@ impl<M: Field<Substance>, const W: u32> Asked for Lone<M, W> {
 
     fn crossed(self, walk: Within, p: vec3, d: vec3, span: f32, size: f32) -> f32 {
         -1.0
+    }
+
+    fn least(self, o: vec3, d: vec3, until: f32, spread: f32) -> Least {
+        least_by(self.field, o, d, until, spread, self.grid.stated)
     }
 
     fn told(self, walk: Within, p: vec3, size: f32) -> Told {
@@ -747,6 +857,10 @@ impl<M: Field<Substance>, const W: u32> Asked for Seen<M, W> {
         brick_crossed(self.cells, self.nodes[node * NODE], leaf.lo, leaf.side, bitcast_f32(self.nodes[node * NODE + 7]), p, d, span).x
     }
 
+    fn least(self, o: vec3, d: vec3, until: f32, spread: f32) -> Least {
+        least_by(self.field, o, d, until, spread, self.grid.stated)
+    }
+
     fn told(self, walk: Within, p: vec3, size: f32) -> Told {
         let g = self.grid
         var out = Told { node: walk.node, level: 0, side: 0.0, off: 0.0, cells: 0.0, field: clamp(self.field.distance(p), -g.scope, g.scope) / g.stated, exit: walk.exit, brick: 0 }
@@ -870,5 +984,9 @@ impl<M: Field<Substance>> Asked for Rayed<M> {
             most = max(most, self.field.part_bound(i).lowers)
         }
         most
+    }
+
+    fn least(self, o: vec3, d: vec3, until: f32, spread: f32) -> Least {
+        least_by(self.field, o, d, until, spread, self.grid.stated)
     }
 }
