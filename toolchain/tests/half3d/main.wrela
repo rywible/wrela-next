@@ -1,0 +1,103 @@
+// A one-channel 16-bit float 3D texture written by a kernel and read filtered (gap 28: a filtered
+// tap of 2 bytes a texel, where `Rgba16Float` reads 8). A kernel writes a linear function into
+// every texel; a second samples it with a linear filter between texels, and with a nearest one
+// at texel centres. A trilinear of a linear function is the function, so what's off is half's
+// rounding and the filter's weights alone. Frame 0 writes and samples; the tests read it back,
+// on both hosts.
+use std::collections::Vec
+use std::gpu::{
+    Filter, GlobalId, GpuBuffer, R16Float, Sampler, Slots, Texels3d, Texture3d, buffer, dispatch,
+    read, sampler, texture3d,
+}
+use std::io::Pending
+
+const SIDE: u32 = 8
+/// The points sampled: one in each of the 7 x 7 x 7 cells between texel centres.
+const POINTS: u32 = 343
+
+pub struct State {
+    frame: u32,
+    volume: Texture3d<R16Float>,
+    between: GpuBuffer<f32>,
+    centres: GpuBuffer<f32>,
+    pending: Vec<Pending<f32>>,
+    seen: Vec<Vec<f32>>,
+}
+
+pub fn init() -> State {
+    State {
+        frame: 0,
+        volume: texture3d(width: SIDE, height: SIDE, depth: SIDE),
+        between: buffer(POINTS),
+        centres: buffer(SIDE * SIDE * SIDE),
+        pending: Vec::new(),
+        seen: Vec::new(),
+    }
+}
+
+/// The function written: at texel `c` (whole texel coordinates), linear in each.
+fn f(c: vec3) -> f32 {
+    (c.x + 2.0 * c.y + 3.0 * c.z) / 8.0
+}
+
+@compute(4, 4, 4)
+fn write(out: mut Texels3d<R16Float>, id: GlobalId) {
+    out.store(id, f(vec3(f32(id.x), f32(id.y), f32(id.z))))
+}
+
+/// How far the linear filter's value at a point between texel centres is from the function
+/// there.
+@compute(64)
+fn filtered(t: Texture3d<R16Float>, s: Sampler, out: mut Slots<f32>, id: GlobalId) {
+    if id.x >= POINTS {
+        return
+    }
+    let c = vec3(f32(id.x % 7), f32((id.x / 7) % 7), f32(id.x / 49))
+    // Texel coordinates: centre `c` is at `c + 0.5`; the point a share of the way to `c + 1`.
+    let q = c + vec3(0.5) + vec3(0.3, 0.6, 0.45)
+    out[id] = abs(t.sample_level(s, q / f32(SIDE)) - f(q - vec3(0.5)))
+}
+
+/// How far the nearest filter's value at each texel centre is from the function there.
+@compute(64)
+fn centred(t: Texture3d<R16Float>, s: Sampler, out: mut Slots<f32>, id: GlobalId) {
+    let c = vec3(f32(id.x % SIDE), f32((id.x / SIDE) % SIDE), f32(id.x / (SIDE * SIDE)))
+    out[id] = abs(t.sample_level(s, (c + vec3(0.5)) / f32(SIDE)) - f(c))
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    if s.frame == 0 {
+        dispatch(write.bind(mut s.volume), groups: (SIDE / 4, SIDE / 4, SIDE / 4))
+        dispatch(filtered.bind(s.volume, sampler(), mut s.between), over: POINTS)
+        let nearest = sampler(filter: Filter::Nearest, mip: Filter::Nearest)
+        dispatch(centred.bind(s.volume, nearest, mut s.centres), over: SIDE * SIDE * SIDE)
+        s.pending.push(read(s.between.items()))
+        s.pending.push(read(s.centres.items()))
+    }
+    for i in 0..s.pending.len() {
+        if s.seen.len() == i {
+            if let Some(Ok(v)) = s.pending[i].poll() {
+                s.seen.push(take v)
+            }
+        }
+    }
+    s.frame += 1
+}
+
+/// A texel holds the function to half's precision: its values here are under 6, where half's
+/// step is 1/256.
+@test(frames: 4, gpu: true, hosts: both)
+fn a_kernel_writes_a_half_texel(s: State) {
+    assert(s.seen.len() == 2)
+    for i in 0..SIDE * SIDE * SIDE {
+        assert(s.seen[1][i] <= 1.0 / 512.0)
+    }
+}
+
+/// Between texels, the filter gives the function within half's step and the filter's weights.
+@test(frames: 4, gpu: true, hosts: both)
+fn a_half_texture_filters_in_3d(s: State) {
+    for i in 0..POINTS {
+        assert(s.seen[0][i] < 0.01)
+    }
+}

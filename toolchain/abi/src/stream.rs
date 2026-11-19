@@ -562,7 +562,7 @@ impl TextureFormat {
                 i.depth = true;
                 i
             }
-            TextureFormat::R16Float => row("r16float", 2, 1, 1, Yes, No, Yes, Yes, (2, 2)),
+            TextureFormat::R16Float => row("r16float", 2, 1, 1, Yes, Yes, Yes, Yes, (2, 2)),
             TextureFormat::Rg16Float => row("rg16float", 4, 1, 2, Yes, No, Yes, Yes, (4, 2)),
             TextureFormat::R32Float => row(
                 "r32float",

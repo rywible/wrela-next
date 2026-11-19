@@ -81,8 +81,8 @@ unsafe impl Send for Table {}
 unsafe impl Sync for Table {}
 
 impl Table {
-    /// An index for `id`, written into the table.
-    fn take(self: &Arc<Table>, id: MTLResourceID) -> Arc<Slot> {
+    /// An index for `held`'s `id`, written into the table.
+    fn take(self: &Arc<Table>, id: MTLResourceID, held: Held) -> Arc<Slot> {
         let index = {
             let mut f = lock(&self.free);
             match f.0.pop() {
@@ -102,15 +102,26 @@ impl Table {
             let p = self.buffer.contents().as_ptr() as *mut u64;
             p.add(index as usize).write(raw);
         }
-        Arc::new(Slot { table: self.clone(), index })
+        Arc::new(Slot { table: self.clone(), index, _held: held })
     }
 }
 
 /// An index of the table, given back when the last view or sampler holding it goes (after every
-/// command buffer that reached it: their bind groups hold it too).
+/// command buffer that reached it: their bind groups hold it too). It holds the texture or
+/// sampler its entry names: Metal gives a released object's `MTLResourceID` to the next one
+/// made, so an entry a command in flight reads must not outlive its object (a kernel bound to a
+/// sampler the program let go of before the GPU ran it read the next sampler made).
 struct Slot {
     table: Arc<Table>,
     index: u32,
+    _held: Held,
+}
+
+/// What a table entry names, held (never read: holding it is its job).
+#[allow(dead_code)]
+enum Held {
+    Texture(Id<dyn MTLTexture>),
+    Sampler(Id<dyn MTLSamplerState>),
 }
 
 impl Drop for Slot {
@@ -472,7 +483,7 @@ impl Device {
         }
         d.setSupportArgumentBuffers(true);
         let raw = self.0.raw.newSamplerStateWithDescriptor(&d).expect("Metal made no sampler");
-        let slot = self.0.table.take(raw.gpuResourceID());
+        let slot = self.0.table.take(raw.gpuResourceID(), Held::Sampler(raw.clone()));
         Sampler { raw, slot }
     }
 
@@ -1050,7 +1061,7 @@ impl Texture {
             )
         }
         .expect("Metal made no texture view");
-        let slot = Some(self.table.take(raw.gpuResourceID()));
+        let slot = Some(self.table.take(raw.gpuResourceID(), Held::Texture(raw.clone())));
         TextureView { raw, slot }
     }
 }

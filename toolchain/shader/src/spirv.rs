@@ -636,6 +636,7 @@ impl<'m> Writer<'m> {
                 let storage = match format {
                     ir::TextureFormat::Rgba8 => ImageFormat::Rgba8,
                     ir::TextureFormat::Rgba16Float => ImageFormat::Rgba16f,
+                    ir::TextureFormat::R16Float => ImageFormat::R16f,
                     ir::TextureFormat::R32Float => ImageFormat::R32f,
                     ir::TextureFormat::R32Uint => ImageFormat::R32ui,
                     ir::TextureFormat::Rg32Float => ImageFormat::Rg32f,
@@ -643,7 +644,8 @@ impl<'m> Writer<'m> {
                     ir::TextureFormat::Rg32Uint => ImageFormat::Rg32ui,
                     f => return Err(format!("internal: kernels can't write a {f:?} texture")),
                 };
-                if matches!(storage, ImageFormat::Rg32f | ImageFormat::Rg32ui) {
+                // (Vulkan's `shaderStorageImageExtendedFormats`, which the device turns on.)
+                if matches!(storage, ImageFormat::R16f | ImageFormat::Rg32f | ImageFormat::Rg32ui) {
                     self.capability(Capability::StorageImageExtendedFormats);
                 }
                 let (d, arrayed) = image_dim(dim);
@@ -2810,6 +2812,7 @@ impl FunctionWriter<'_, '_> {
         let storage = match format {
             ir::TextureFormat::Rgba8 => ImageFormat::Rgba8,
             ir::TextureFormat::Rgba16Float => ImageFormat::Rgba16f,
+            ir::TextureFormat::R16Float => ImageFormat::R16f,
             ir::TextureFormat::R32Float => ImageFormat::R32f,
             ir::TextureFormat::R32Uint => ImageFormat::R32ui,
             ir::TextureFormat::Rg32Float => ImageFormat::Rg32f,

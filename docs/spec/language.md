@@ -2501,7 +2501,7 @@ Each format says what a texel is in GPU code (`F::Texel`): a `vec4`, a `vec2`, a
 What else a format can do is a trait it has or lacks, as WebGPU's core formats allow:
 
 - `Filtered` formats are sampled (`sample`, `sample_level`). The integer formats and the 32-bit float formats are not; GPU code `load`s them. (`features().float32_filterable` says whether the device could filter the 32-bit floats; toolchain 0.6 doesn't sample them yet.)
-- `Storage` formats are written by kernels (`writable_texture`, `texture3d`, `Texels`): `Rgba8`, `Rgba16Float`, `R32Float`, `Rg32Float`, `Rgba32Float`, `R32Uint` and `Rg32Uint`.
+- `Storage` formats are written by kernels (`writable_texture`, `texture3d`, `Texels`): `Rgba8`, `Rgba16Float`, `R16Float`, `R32Float`, `Rg32Float`, `Rgba32Float`, `R32Uint` and `Rg32Uint`. (`R16Float`, `Rg32Float` and `Rg32Uint` are past WebGPU's core list: Vulkan's `shaderStorageImageExtendedFormats`, which the native host turns on; Metal writes them on every Apple GPU. `R16Float` is the one-channel format a kernel writes and GPU code filters, in 3D too: a filtered tap of 2 bytes a texel.)
 - `Target` formats are drawn into: every uncompressed format (`Rg11b10Float` on a device with `rg11b10ufloat-renderable`).
 
 A missing trait is E0400 where it is needed. Each binding in the manifest names its texture's format, and the hosts check that the bound texture has that format. Each format holds what was written, in both hosts.

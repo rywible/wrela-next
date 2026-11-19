@@ -855,6 +855,16 @@ fn a_texture_is_a_fields_data() {
     assert_eq!(crate::tests_pass(&dir), 4);
 }
 
+/// A one-channel 16-bit float 3D texture a kernel writes and GPU code filters
+/// (toolchain/tests/half3d, gap 28): each texel holds the function written to half's step, and a
+/// linear filter between texel centres gives the linear function within 0.01, on both hosts.
+#[test]
+#[ignore = "needs a GPU"]
+fn a_kernel_writes_a_half_texture_that_filters_in_3d() {
+    let dir = wrela_tests::repo_root().join("toolchain/tests/half3d");
+    assert_eq!(crate::tests_pass(&dir), 2);
+}
+
 /// Textures baked when a program is built (toolchain/tests/png, language.md §20.2): `std::png`
 /// decodes PNGs of every colour type and bit depth, plain and Adam7-interlaced, with `tRNS`,
 /// split image data and Pillow's own files, to the RGBA8 bytes made beside them; a constant holds
