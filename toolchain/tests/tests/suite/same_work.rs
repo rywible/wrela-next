@@ -443,3 +443,14 @@ fn the_engines_ask_of_a_smooth_fold_builds_shipped() {
     write_package(&dir, "met_grown", include_str!("../../met_grown/main.wrela"));
     assert_eq!(e0712(&dir), Vec::<String>::new());
 }
+
+/// The meets fixture (toolchain/tests/meets) builds shipped: a fold's lowering, an `if` on its
+/// part count that yields a constant through a local, is that constant once the branch it
+/// doesn't take is gone, so the round cones' setup it grows moves onto the CPU. From b69e231
+/// (the lowering a table) to 8eee7c0 the local's load held it in the shader: E0712, 276 work.
+#[test]
+fn the_meets_fixture_builds_shipped() {
+    let dir = scratch("same_meets");
+    write_package(&dir, "meets", include_str!("../../meets/main.wrela"));
+    assert_eq!(e0712(&dir), Vec::<String>::new());
+}

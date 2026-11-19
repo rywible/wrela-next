@@ -56,8 +56,13 @@ pub fn flatten_gpu(m: &mut Module) -> Result<()> {
             dce(&mut f);
         }
         // An inlined function given a constant `bool` keeps only the branch it takes (an
-        // `isolate: false` argument), as the CPU's inlining does.
-        fold_constant_branches(&mut f);
+        // `isolate: false` argument), as the CPU's inlining does. A local each side set (an
+        // `if` that yields a value) then has one store: its reads are that value, which
+        // hoisting can move (a load of a local, it can't).
+        if fold_constant_branches(&mut f) {
+            forward_stores(m, &mut f);
+            dce(&mut f);
+        }
         collapse_rebuilds(&mut f);
         cse(&mut f);
         dce(&mut f);
