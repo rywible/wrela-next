@@ -1870,7 +1870,11 @@ impl Gpu {
             return Ok(());
         }
         self.flush()?;
-        if bytes > self.ring.capacity() {
+        // Grown whenever it runs out, not only for a request larger than it: a ring a frame
+        // overflows submits, and waits, again every frame (64 walking bodies, 1,284 draws: the
+        // Radeon's frame spent most of its 250 ms of recording waiting so). Doubled, a frame's
+        // uniforms fit in a few frames' time and are submitted once.
+        if start + bytes > self.ring.capacity() {
             let capacity = bytes.max(self.ring.capacity() * 2).next_power_of_two();
             if capacity > self.limits.max_buffer_size {
                 return Err(Error::command(
