@@ -900,12 +900,88 @@ fn resolve_projections_in(p: &Program, ty: TyId, active: &mut Vec<TyId>) -> TyId
                 active.pop();
                 return Some(resolved);
             }
+            // In generic code (`Lone<M, W>::Walk`): where one impl alone could be the type's for
+            // any of its parameters, that impl's associated type is the projection's. If its
+            // bounds don't hold for some instantiation, the bound that names the trait is refused
+            // where it's checked; no other impl could have answered.
+            if types.has_params(self_ty)
+                && !matches!(
+                    types.kind(self_ty),
+                    TyKind::Param(_)
+                        | TyKind::Opaque(..)
+                        | TyKind::Var(_)
+                        | TyKind::Projection { .. }
+                )
+                && let Some((i, subst)) = only_impl(p, self_ty, &r)
+                && let Some(&a) = p.impl_(i).assoc_types.get(name)
+            {
+                active.push(this);
+                let resolved = resolve_projections_in(p, types.subst(a, &subst), active);
+                active.pop();
+                return Some(resolved);
+            }
             Some(this)
         }
         // Left as they are, arguments and all.
         TyKind::Opaque(..) | TyKind::Closure(..) | TyKind::FnDef(..) => Some(t),
         _ => None,
     })
+}
+
+/// The one impl of `r` that could be `ty`'s, `ty` holding generic parameters: the only impl
+/// whose type and trait arguments could match `ty`'s for any of its parameters, matching it with
+/// them held as they are (its own parameters solved). `None` where none or more than one could.
+fn only_impl(p: &Program, ty: TyId, r: &TraitRef) -> Option<(ImplId, Subst)> {
+    let mut found = None;
+    for &i in p.impls_of(r.trait_) {
+        let imp = p.impl_(i);
+        let Some(tr) = imp.trait_ref.as_ref() else { continue };
+        let could = could_match(p, imp.self_ty, ty)
+            && tr.args.len() == r.args.len()
+            && tr.args.iter().zip(&r.args).all(|(&a, &b)| could_match(p, a, b));
+        if !could {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some(i);
+    }
+    let i = found?;
+    let imp = p.impl_(i);
+    let mut subst = Subst::new();
+    let tr = imp.trait_ref.as_ref()?;
+    (match_ty(p, imp.self_ty, ty, &imp.generics, &mut subst)
+        && match_all(p, &tr.args, &r.args, &imp.generics, &mut subst)
+        && imp.generics.iter().all(|g| subst.get(*g).is_some()))
+    .then_some((i, subst))
+}
+
+/// Whether `a` and `b` could be one type for some values of the generic parameters either holds:
+/// a parameter could be anything; otherwise the same constructor, each part of which could be.
+fn could_match(p: &Program, a: TyId, b: TyId) -> bool {
+    if a == b {
+        return true;
+    }
+    let all = |xs: &[TyId], ys: &[TyId]| {
+        xs.len() == ys.len() && xs.iter().zip(ys).all(|(&x, &y)| could_match(p, x, y))
+    };
+    match (p.types.kind(a), p.types.kind(b)) {
+        (TyKind::Param(_) | TyKind::Projection { .. } | TyKind::Var(_), _)
+        | (_, TyKind::Param(_) | TyKind::Projection { .. } | TyKind::Var(_)) => true,
+        (TyKind::Adt(x, xs), TyKind::Adt(y, ys)) => x == y && all(xs, ys),
+        (TyKind::Tuple(xs), TyKind::Tuple(ys)) => all(xs, ys),
+        (TyKind::Array(x, n), TyKind::Array(y, m)) => n == m && could_match(p, *x, *y),
+        (TyKind::ArrayN(x, n), TyKind::ArrayN(y, m)) => {
+            could_match(p, *x, *y) && could_match(p, *n, *m)
+        }
+        (TyKind::Array(x, _), TyKind::ArrayN(y, _))
+        | (TyKind::ArrayN(x, _), TyKind::Array(y, _)) => could_match(p, *x, *y),
+        (TyKind::Slice(x), TyKind::Slice(y)) => could_match(p, *x, *y),
+        (TyKind::FnPtr(xs, x, _), TyKind::FnPtr(ys, y, _)) => all(xs, ys) && could_match(p, *x, *y),
+        // Scalars, vectors, constants and the rest: only the same type, found above.
+        _ => false,
+    }
 }
 
 /// A projection in `ty`, normalized, that an impl defines but resolving couldn't end: an
