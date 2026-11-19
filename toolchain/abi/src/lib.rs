@@ -345,6 +345,10 @@ pub struct TargetLimits {
     /// How many invocations the GPU runs side by side, about: a dispatch of fewer takes as long
     /// as one of this many, since one invocation alone does its bound's work in a row.
     pub step_width: u32,
+    /// How long the reference machine takes for the host's calibration kernel (a chain of sines,
+    /// `wrela-host`'s `Gpu::calibration_ns`), in nanoseconds: a device's own time over this
+    /// scales [`TargetLimits::step_femtoseconds`] there (0: no calibration).
+    pub calibration_ns: u32,
 }
 
 /// The longest one compute dispatch may hold the GPU, in milliseconds (AGENTS.md, rule 4: "at
@@ -392,6 +396,9 @@ impl TargetLimits {
         buffer_slots_per_stage: Some(31),
         step_femtoseconds: METAL_FS,
         step_width: 8192,
+        // The M4's fastest timings of `wrela-host`'s calibration kernel (8,192 invocations of a
+        // chain of 8,192 sines), warmed: 1.14 to 1.21 ms (2026-11-19).
+        calibration_ns: 1_150_000,
     };
 
     /// The floor of the Vulkan devices wrela runs on (Phase 5's minimum spec, backend.md item
@@ -435,6 +442,8 @@ impl TargetLimits {
         buffer_slots_per_stage: None,
         step_femtoseconds: VULKAN_FS,
         step_width: 4096,
+        // The Radeon 5500U's (RADV), warmed: 1.19 to 1.25 ms (2026-11-19).
+        calibration_ns: 1_180_000,
     };
 }
 

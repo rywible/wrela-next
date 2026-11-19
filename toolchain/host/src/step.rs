@@ -37,7 +37,84 @@ const MOST_PASSES: u32 = 4096;
 /// as long a unit, so a kernel made of them can run past what this says (`Behind` is then the
 /// second line).
 pub fn unit_ns(target: wrela_abi::Target) -> f64 {
-    f64::from(target.limits().step_femtoseconds) * 1e-6
+    let fs = match UNIT_FS.load(std::sync::atomic::Ordering::Relaxed) {
+        fs if fs != 0 && target == wrela_abi::Target::HERE => fs,
+        _ => target.limits().step_femtoseconds,
+    };
+    f64::from(fs) * 1e-6
+}
+
+// ---- The unit on the device the host opened (Phase 5, backend.md item 39) -----------------
+//
+// `step_femtoseconds` is measured on one machine a target; a slower GPU takes longer a unit, so
+// the guard's 50 ms would be more there. At start-up the host times one fixed kernel (a chain of
+// sines, `Gpu::calibration_ns`) and scales the target's unit by its time over the reference
+// machine's ([`wrela_abi::TargetLimits::calibration_ns`]), snapped to the target's unit times a
+// power of two, never less ([`snapped`]): the engine paces its work by `step_work`, so a machine
+// reads the same number every run. It's kept on disk per device and driver ([`unit_path`]) and
+// read there from the second run on, until the driver changes; `WRELA_GPU_UNIT_FS` forces one.
+
+/// The unit in force on this machine's device, in femtoseconds (0: the target's).
+static UNIT_FS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The environment variable that forces the unit (femtoseconds; tests).
+pub const UNIT_VAR: &str = "WRELA_GPU_UNIT_FS";
+
+/// How much slower than the reference machine a device may time the kernel and still take the
+/// target's unit (and each doubling past it): its measurement's noise, with room. (The M4 times
+/// it 1.15 to 2.1 ms from a cold start with its clock still low; the fastest of up to three
+/// timings, `ensure_unit`, stays within 1.5 of its reference.)
+pub const UNIT_SLACK: f64 = 1.5;
+
+/// The unit for a device that timed the kernel `ratio` times the reference machine's: the
+/// target's unit `target_fs` times the least power of two whose `UNIT_SLACK` holds `ratio`;
+/// never less than the target's.
+pub fn snapped(target_fs: u32, ratio: f64) -> u32 {
+    let mut k = 0u32;
+    while k < 16 && ratio > UNIT_SLACK * f64::from(1u32 << k) {
+        k += 1;
+    }
+    target_fs.saturating_mul(1 << k)
+}
+
+/// Whether `fs` is one of the units `snapped` gives for `target_fs`.
+pub fn is_snapped(target_fs: u32, fs: u32) -> bool {
+    (0..16).any(|k| target_fs.checked_mul(1 << k) == Some(fs))
+}
+
+/// The unit in force (femtoseconds): the device's, once set, else the target's.
+pub fn unit_fs() -> u32 {
+    match UNIT_FS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => wrela_abi::Target::HERE.limits().step_femtoseconds,
+        fs => fs,
+    }
+}
+
+pub(crate) fn set_unit_fs(fs: u32) {
+    UNIT_FS.store(fs, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn unit_set() -> bool {
+    UNIT_FS.load(std::sync::atomic::Ordering::Relaxed) != 0
+}
+
+/// Where the unit of the device `info` names is kept: `~/.wrela/units/<key>` (or
+/// `$WRELA_GPU_UNITS/<key>`), the key its name, PCI IDs and driver (another driver is another
+/// file, measured again).
+pub fn unit_path(info: &wrela_gpu::AdapterInfo) -> Option<std::path::PathBuf> {
+    let dir = match std::env::var_os("WRELA_GPU_UNITS") {
+        Some(d) => std::path::PathBuf::from(d),
+        None => std::path::PathBuf::from(std::env::var_os("HOME")?).join(".wrela").join("units"),
+    };
+    let raw = format!(
+        "{}-{:04x}-{:04x}-{}-{}",
+        info.name, info.vendor, info.device, info.driver, info.driver_info
+    );
+    let key: String = raw
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
+        .collect();
+    Some(dir.join(key))
 }
 
 /// How many invocations this machine's GPU runs side by side, about
@@ -542,5 +619,24 @@ impl Indirect {
             self.pending.pop_front();
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+
+    /// A device as fast as the reference, or up to `UNIT_SLACK` slower, takes the target's unit;
+    /// slower, the target's times the least power of two that holds it; never less.
+    #[test]
+    fn a_unit_snaps_to_the_targets_times_a_power_of_two() {
+        assert_eq!(snapped(2500, 0.5), 2500);
+        assert_eq!(snapped(2500, 1.0), 2500);
+        assert_eq!(snapped(2500, UNIT_SLACK), 2500);
+        assert_eq!(snapped(2500, UNIT_SLACK * 1.01), 5000);
+        assert_eq!(snapped(2500, 2.9), 5000);
+        assert_eq!(snapped(2500, 3.1), 10000);
+        assert!(is_snapped(2500, 2500) && is_snapped(2500, 10000));
+        assert!(!is_snapped(2500, 2400) && !is_snapped(2500, 3000));
     }
 }

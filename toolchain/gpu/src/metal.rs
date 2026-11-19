@@ -199,8 +199,11 @@ impl Device {
                 },
                 vendor: 0,
                 device: 0,
-                driver: String::new(),
-                driver_info: String::new(),
+                // Metal's compiler ships with the OS: its version is the driver's.
+                driver: "Metal".into(),
+                driver_info: objc2_foundation::NSProcessInfo::processInfo()
+                    .operatingSystemVersionString()
+                    .to_string(),
                 subgroup_min_size: if apple { 4 } else { 4 },
                 subgroup_max_size: 64,
             };
