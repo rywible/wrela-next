@@ -1048,8 +1048,9 @@ fn rays_tile_summed(tile_rays: [u32], n: u32, ray_tile_at: mut Atomics<u32>, tot
     }
 }
 
-/// Each tile's pixels' rays laid one after another from where its rays begin (`ray_tile_at`): each
-/// pixel's first ray (`first`) and its rays' places (`ray_at`, from the nine a pixel `rays9`).
+/// Each tile's pixels' rays laid one after another from where its rays begin (`ray_tile_at`), its
+/// one-look pixels' first: each pixel's first ray (`first`) and its rays' places (`ray_at`, from
+/// the nine a pixel `rays9`).
 @compute(64)
 fn rays_placed(tile_at: [u32], n: u32, count: [u32], ray_n: [u32], ray_tile_at: [u32], rays9: [u32], first: mut Atomics<u32>, ray_at: mut Atomics<u32>, id: GlobalId) {
     let t = id.x
@@ -1059,14 +1060,18 @@ fn rays_placed(tile_at: [u32], n: u32, count: [u32], ray_n: [u32], ray_tile_at: 
     let a = min(tile_at[t], count[0])
     let b = min(tile_at[t + 1], count[0])
     var r = ray_tile_at[t]
-    for j in 0..(TILE * TILE) {
-        let k = a + j
-        if k < b {
-            first.store(i: k, value: r)
-            for q in 0..EDGE_RAYS {
-                if q < ray_n[k] {
-                    ray_at.store(i: r, value: rays9[EDGE_RAYS * k + q])
-                    r += 1
+    // (Its one-look pixels' rays first, then its pixels drawn by nine: a run of the layout's
+    // fragments marches one kind of ray, not both.)
+    for pass in 0..2 {
+        for j in 0..(TILE * TILE) {
+            let k = a + j
+            if k < b && (ray_n[k] < EDGE_RAYS) == (pass == 0) {
+                first.store(i: k, value: r)
+                for q in 0..EDGE_RAYS {
+                    if q < ray_n[k] {
+                        ray_at.store(i: r, value: rays9[EDGE_RAYS * k + q])
+                        r += 1
+                    }
                 }
             }
         }
@@ -1390,18 +1395,18 @@ const MOST_TILES: u32 = 4096
 /// as drawn; `steps` 2 an edge pixel by how it is drawn: one look blue, nine rays because two
 /// outlines cross it red, unsure yellow, a crease green, thin magenta.
 @compute(8, 8)
-fn edges_resolved(raw: Texture<Rgba16Float>, at: [u32], looks: [vec4], first: [u32], rays: Texture<Rgba16Float>, place: Texture<Rgba32Float>, ray_place: Texture<Rgba32Float>, steps: u32, out: mut Texels<Rgba16Float>, cover: mut Texels<Rgba16Float>, id: GlobalId) {
+fn edges_resolved(raw: Texture<Rgba16Float>, at: [u32], looks: [vec4], first: [u32], rays: Texture<Rgba16Float>, place: Texture<Rgba32Float>, ray_place: Texture<Rgba32Float>, steps: u32, out: mut Texels<Rgba16Float>, cover: mut Atomics<u32>, id: GlobalId) {
     let w = raw.width()
     if id.x >= w || id.y >= raw.height() {
         return
     }
     let k = at[id.x + w * id.y]
-    // (How much of the pixel matter covers, as it is drawn: its middle ray's say; a one-look
-    // pixel's the thing's cover and what is behind it; one drawn by rays the share that met.)
+    // (How much of an edge pixel matter covers, as it is drawn (`Picture::edge_cover`): a
+    // one-look pixel's the thing's cover and what is behind it; one drawn by rays the share that
+    // met. Any other pixel's is its middle ray's say, read from its place.)
     let middle = if place.load(id.x, id.y).w > 0.0 { 1.0 } else { 0.0 }
     if k == NO_EDGE || steps == 1 {
         out.store(id, raw.load(id.x, id.y))
-        cover.store(id, vec4(middle))
         return
     }
     let l = looks[k]
@@ -1429,7 +1434,7 @@ fn edges_resolved(raw: Texture<Rgba16Float>, at: [u32], looks: [vec4], first: [u
         let thing = if met { rays.load((r + 1) % w, (r + 1) / w).xyz } else if l.y > 0.5 { mine } else { across }
         out.store(id, vec4(thing * l.x + behind * (1.0 - l.x), 1.0))
         let behind_met = if l.y > 0.5 { (if ray_place.load(r % w, r / w).w > 0.0 { 1.0 } else { 0.0 }) } else { middle }
-        cover.store(id, vec4(l.x + (1.0 - l.x) * behind_met))
+        cover.store(i: k, value: bitcast_u32(l.x + (1.0 - l.x) * behind_met))
     } else {
         var sum = vec3(0.0)
         var hits = 0.0
@@ -1441,7 +1446,7 @@ fn edges_resolved(raw: Texture<Rgba16Float>, at: [u32], looks: [vec4], first: [u
             }
         }
         out.store(id, vec4(sum / f32(EDGE_RAYS), 1.0))
-        cover.store(id, vec4(hits / f32(EDGE_RAYS)))
+        cover.store(i: k, value: bitcast_u32(hits / f32(EDGE_RAYS)))
     }
 }
 
@@ -1474,7 +1479,6 @@ pub struct Sight {
     edge_tiles: GpuBuffer<u32>,
     edge_tile_at: GpuBuffer<u32>,
     edge_fill: GpuBuffer<u32>,
-    edge_at: GpuBuffer<u32>,
     edge_rays: Texture<Rgba16Float>,
     /// Each edge pixel's nearest outline (`outlined`, laid out a pixel a fragment as the list) and
     /// its depth, the outlines crossing it, how it is drawn (`outlines_read`), and its rays'
@@ -1566,7 +1570,6 @@ pub fn sight() -> Sight {
         edge_tiles: buffer(1),
         edge_tile_at: buffer(2),
         edge_fill: buffer(1),
-        edge_at: buffer(1),
         edge_rays: texture(width: 1, height: 1),
         outline: texture(width: 1, height: 1),
         outline_depth: depth_texture(width: 1, height: 1),
@@ -1890,7 +1893,7 @@ impl Sight {
         if self.drawn.width() != width || self.drawn.height() != height {
             self.drawn = picture(width: width, height: height)
             self.drawn.colour = writable_texture(width: width, height: height)
-            self.drawn.cover = writable_texture(width: width, height: height)
+            self.drawn.edge_cover = buffer(width * height / EDGE_SHARE)
             self.drawn.covered = true
             self.asks = texture(width: width, height: height)
             self.raw = texture(width: width, height: height)
@@ -1901,7 +1904,7 @@ impl Sight {
             self.edge_tiles = buffer(tt.x * tt.y)
             self.edge_tile_at = buffer(tt.x * tt.y + 1)
             self.edge_fill = buffer(tt.x * tt.y)
-            self.edge_at = buffer(width * height)
+            self.drawn.edge_at = buffer(width * height)
             let lines = (most + width - 1) / width
             self.outline = texture(width: width, height: lines)
             self.outline_depth = depth_texture(width: width, height: lines)
@@ -2046,9 +2049,9 @@ impl Sight {
         let most = width * height / EDGE_SHARE
         let groups = ((width + 7) / 8, (height + 7) / 8, 1)
         let nt = tiles_of(width, height).x * tiles_of(width, height).y
-        dispatch(edges_counted.bind(place: self.drawn.place, asks: self.asks, tw: tiles_of(width, height).x, tiles: mut self.edge_tiles, at: mut self.edge_at), groups: groups)
+        dispatch(edges_counted.bind(place: self.drawn.place, asks: self.asks, tw: tiles_of(width, height).x, tiles: mut self.edge_tiles, at: mut self.drawn.edge_at), groups: groups)
         dispatch(edge_tiles_summed.bind(tiles: self.edge_tiles.items(), n: nt, most: most, tile_at: mut self.edge_tile_at, fill: mut self.edge_fill, count: mut self.edge_count), over: nt + 1)
-        dispatch(edges_found.bind(place: self.drawn.place, tile_at: self.edge_tile_at.items(), tw: tiles_of(width, height).x, most: most, fill: mut self.edge_fill, tiles: mut self.edge_tiles, list: mut self.edge_list, at: mut self.edge_at), groups: groups)
+        dispatch(edges_found.bind(place: self.drawn.place, tile_at: self.edge_tile_at.items(), tw: tiles_of(width, height).x, most: most, fill: mut self.edge_fill, tiles: mut self.edge_tiles, list: mut self.edge_list, at: mut self.drawn.edge_at), groups: groups)
         // (The edge rays the same three, laid out a ray a fragment.)
         // Each edge pixel's nearest outline and the outlines crossing it (a draw a thing over its
         // tiles of the list, a pixel a fragment), then how each is drawn and its rays' places.
@@ -2058,7 +2061,7 @@ impl Sight {
         var e = Outlining { near: np, v, place: self.drawn.place, ids: self.ids, list: self.edge_list.items(), count: self.edge_count.items(), tile_at: self.edge_tile_at.items(), most, width, height, lines }
         world.each(self.kept, kinds, 0, mut e)
         e.near.end()
-        dispatch(outlines_read.bind(list: self.edge_list.items(), count: self.edge_count.items(), outline: self.outline, at: self.edge_at.items(), ids: self.ids, place: self.drawn.place, rays: mut self.ray_words9, ray_n: mut self.ray_n, looks: mut self.looks), over: most)
+        dispatch(outlines_read.bind(list: self.edge_list.items(), count: self.edge_count.items(), outline: self.outline, at: self.drawn.edge_at.items(), ids: self.ids, place: self.drawn.place, rays: mut self.ray_words9, ray_n: mut self.ray_n, looks: mut self.looks), over: most)
         dispatch(rays_by_tile.bind(tile_at: self.edge_tile_at.items(), n: nt, count: self.edge_count.items(), ray_n: self.ray_n.items(), tile_rays: mut self.tile_rays), over: nt)
         dispatch(rays_tile_summed.bind(tile_rays: self.tile_rays.items(), n: nt, ray_tile_at: mut self.ray_tile_at, total: mut self.ray_total), over: nt + 1)
         dispatch(rays_placed.bind(tile_at: self.edge_tile_at.items(), n: nt, count: self.edge_count.items(), ray_n: self.ray_n.items(), ray_tile_at: self.ray_tile_at.items(), rays9: self.ray_words9.items(), first: mut self.ray_first, ray_at: mut self.ray_at), over: nt)
@@ -2066,7 +2069,7 @@ impl Sight {
         self.lit_by(world, kinds, sky, look, v, rays, bands, width, height, edge: true)
         label("edges resolved")
         dispatch(
-            edges_resolved.bind(raw: self.raw, at: self.edge_at.items(), looks: self.looks.items(), first: self.ray_first.items(), rays: self.edge_rays, place: self.drawn.place, ray_place: self.edge_place, steps: self.steps, out: mut self.drawn.colour, cover: mut self.drawn.cover),
+            edges_resolved.bind(raw: self.raw, at: self.drawn.edge_at.items(), looks: self.looks.items(), first: self.ray_first.items(), rays: self.edge_rays, place: self.drawn.place, ray_place: self.edge_place, steps: self.steps, out: mut self.drawn.colour, cover: mut self.drawn.edge_cover),
             groups: ((width + 7) / 8, (height + 7) / 8, 1),
         )
         self.drawn.placed = true
