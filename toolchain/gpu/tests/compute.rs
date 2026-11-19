@@ -68,12 +68,14 @@ fn a_kernel_writes_a_buffer_the_cpu_reads_back() {
         binding: 0,
         visibility: Stages::COMPUTE,
         ty: BindingType::Storage { read_only: false, dynamic: false, size: 0 },
+        index_at: None,
     }];
     let sizes_buffer = p.sizes.as_ref().map(|s: &BufferSizes| {
         entries.push(LayoutEntry {
             binding: s.binding,
             visibility: Stages::COMPUTE,
             ty: BindingType::Uniform { dynamic: false, size: 16 },
+            index_at: None,
         });
         let b = device.create_buffer(&BufferDesc { label: "sizes", size: 16, mappable: false });
         let mut words = [0u32; 4];

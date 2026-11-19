@@ -12,6 +12,12 @@
 //!   GPUs sample there), in nanoseconds.
 //! - A command buffer's error names the encoder it happened in (`encoderExecutionStatus`), whose
 //!   label is the pass's.
+//! - The table (`wrela_abi::table`): every texture view and sampler has an index in a shared
+//!   buffer of `MTLResourceID`s, bound at buffer slot `METAL_TABLE` of an encoder's stages once a
+//!   bind group needs it; a bind group's indices go in by `setBytes` at `METAL_BLOCK`. What a
+//!   command reaches through the table it declares with `useResources` (residency, and Metal's
+//!   hazard tracking), and the command buffer keeps its groups alive until it's done (Metal
+//!   retains only what's bound directly).
 
 use crate::*;
 use block2::RcBlock;
@@ -45,8 +51,9 @@ struct Shared {
     timestamps: Option<Id<dyn MTLCounterSet>>,
     submitted: AtomicU64,
     completed: Arc<AtomicU64>,
-    /// Command buffers committed and not yet seen complete, by submission.
-    in_flight: Mutex<Vec<(SubmissionIndex, Id<dyn MTLCommandBuffer>)>>,
+    /// Command buffers committed and not yet seen complete, by submission, with the bind groups
+    /// their commands set, kept alive until they're done (what the table names in them).
+    in_flight: Mutex<Vec<(SubmissionIndex, Id<dyn MTLCommandBuffer>, Vec<Arc<Group>>)>>,
     /// Staged writes, copied before the next submission's own work.
     pending: Mutex<Vec<PendingWrite>>,
     /// Errors the GPU reported: a failed command buffer, naming its encoder.
@@ -55,6 +62,61 @@ struct Shared {
     zeros: Mutex<Option<Id<dyn MTLBuffer>>>,
     /// Shared buffers staged writes are copied into, reused once their submission is done.
     belt: Mutex<Belt>,
+    /// The table of texture views and samplers.
+    table: Arc<Table>,
+}
+
+/// How many views and samplers the table holds at once.
+const TABLE_LEN: u32 = 1 << 16;
+
+/// The device's table (`wrela_abi::table`): a shared buffer of `MTLResourceID`s, and its free
+/// indices (those let go, and the next never used).
+struct Table {
+    buffer: Id<dyn MTLBuffer>,
+    free: Mutex<(Vec<u32>, u32)>,
+}
+
+// SAFETY: as `Shared`'s.
+unsafe impl Send for Table {}
+unsafe impl Sync for Table {}
+
+impl Table {
+    /// An index for `id`, written into the table.
+    fn take(self: &Arc<Table>, id: MTLResourceID) -> Arc<Slot> {
+        let index = {
+            let mut f = lock(&self.free);
+            match f.0.pop() {
+                Some(i) => i,
+                None => {
+                    let i = f.1;
+                    assert!(i < TABLE_LEN, "the table of views and samplers is full");
+                    f.1 += 1;
+                    i
+                }
+            }
+        };
+        // SAFETY: `MTLResourceID` is one 64-bit word; the shared buffer holds `TABLE_LEN` of
+        // them, and no command in flight reads a free index.
+        unsafe {
+            let raw: u64 = std::mem::transmute(id);
+            let p = self.buffer.contents().as_ptr() as *mut u64;
+            p.add(index as usize).write(raw);
+        }
+        Arc::new(Slot { table: self.clone(), index })
+    }
+}
+
+/// An index of the table, given back when the last view or sampler holding it goes (after every
+/// command buffer that reached it: their bind groups hold it too).
+struct Slot {
+    table: Arc<Table>,
+    index: u32,
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        lock(&self.table.free).0.push(self.index);
+    }
 }
 
 /// The staging belt: the buffer this submission's writes go into (and how much of it they
@@ -178,6 +240,14 @@ impl Device {
                 features.push("texture-compression-etc2");
                 features.push("texture-compression-astc");
             }
+            let table = raw
+                .newBufferWithLength_options(
+                    (TABLE_LEN as usize) * 8,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .ok_or("Metal made no table")?;
+            table.setLabel(Some(&ns("table")));
+            let table = Arc::new(Table { buffer: table, free: Mutex::new((Vec::new(), 0)) });
             let timestamps = timestamp_counters(&raw);
             if timestamps.is_some() {
                 features.push("timestamp-query");
@@ -198,6 +268,7 @@ impl Device {
                 submitted: AtomicU64::new(0),
                 completed: Arc::new(AtomicU64::new(0)),
                 in_flight: Mutex::new(Vec::new()),
+                table,
                 pending: Mutex::new(Vec::new()),
                 errors: Arc::new(Mutex::new(Vec::new())),
                 zeros: Mutex::new(None),
@@ -304,6 +375,7 @@ impl Device {
         let raw = self.0.raw.newTextureWithDescriptor(&d).expect("Metal made no texture");
         raw.setLabel(Some(&ns(desc.label)));
         let t = Texture {
+            table: self.0.table.clone(),
             raw,
             format: desc.format,
             width: desc.width,
@@ -400,7 +472,8 @@ impl Device {
         }
         d.setSupportArgumentBuffers(true);
         let raw = self.0.raw.newSamplerStateWithDescriptor(&d).expect("Metal made no sampler");
-        Sampler { raw }
+        let slot = self.0.table.take(raw.gpuResourceID());
+        Sampler { raw, slot }
     }
 
     pub fn create_query_set(&self, count: u32) -> Result<QuerySet> {
@@ -428,10 +501,30 @@ impl Device {
         entries: &[BindGroupEntry<'_>],
     ) -> BindGroup {
         let mut out = Vec::with_capacity(entries.len());
+        let mut block = vec![0u8; layout.0.block];
+        let (mut reads, mut writes, mut slots) = (Vec::new(), Vec::new(), Vec::new());
         for e in entries {
             let Some(k) = layout.0.entries.iter().position(|l| l.binding == e.binding) else {
                 continue;
             };
+            if let Some(at) = layout.0.entries[k].index_at {
+                let slot = match &e.resource {
+                    Resource::View(v) => {
+                        if matches!(layout.0.entries[k].ty, BindingType::StorageTexture { .. }) {
+                            writes.push(v.raw.clone());
+                        } else {
+                            reads.push(v.raw.clone());
+                        }
+                        v.slot.clone().expect("a view in the table")
+                    }
+                    Resource::Sampler(s) => s.slot.clone(),
+                    Resource::Buffer { .. } => panic!("a buffer isn't in the table"),
+                };
+                let at = at as usize;
+                block[at..at + 4].copy_from_slice(&slot.index.to_le_bytes());
+                slots.push(slot);
+                continue;
+            }
             let bound = match &e.resource {
                 Resource::Buffer { buffer, offset, .. } => {
                     Bound::Buffer(buffer.raw.clone(), *offset)
@@ -441,7 +534,14 @@ impl Device {
             };
             out.push((k, bound));
         }
-        BindGroup(Arc::new(Group { layout: layout.0.clone(), bound: out }))
+        BindGroup(Arc::new(Group {
+            layout: layout.0.clone(),
+            bound: out,
+            block,
+            reads,
+            writes,
+            _slots: slots,
+        }))
     }
 
     /// A shader's library: its MSL compiled as a passthrough shader was (`MTLCompileOptions`'
@@ -558,7 +658,13 @@ impl Device {
     }
 
     pub fn create_command_encoder(&self, label: &str) -> CommandEncoder {
-        CommandEncoder { device: self.clone(), label: label.to_string(), cb: None, blit: None }
+        CommandEncoder {
+            device: self.clone(),
+            label: label.to_string(),
+            cb: None,
+            blit: None,
+            keep: Vec::new(),
+        }
     }
 
     /// A command buffer of the queue's, reporting the encoder an error happened in.
@@ -685,7 +791,11 @@ impl Device {
                 blit.endEncoding();
                 cbs.push(cb);
             }
-            cbs.extend(buffers.into_iter().map(|b| b.raw));
+            let mut kept = Vec::new();
+            for b in buffers {
+                cbs.push(b.raw);
+                kept.extend(b.keep);
+            }
             if cbs.is_empty() {
                 // Nothing to run: a command buffer of its own marks the submission done.
                 let cb = self.command_buffer();
@@ -711,7 +821,11 @@ impl Device {
                 }
                 cb.commit();
             }
-            lock(&self.0.in_flight).push((index, cbs[last].clone()));
+            let mut f = lock(&self.0.in_flight);
+            // What's done lets go of what it kept.
+            let done = self.completed();
+            f.retain(|(i, ..)| *i > done);
+            f.push((index, cbs[last].clone(), kept));
             index
         })
     }
@@ -727,13 +841,14 @@ impl Device {
 
     /// Waits for submission `index` (and every one before it) to be done.
     pub fn wait(&self, index: SubmissionIndex) {
-        let waiting: Vec<Id<dyn MTLCommandBuffer>> = {
+        #[allow(clippy::type_complexity)]
+        let waiting: Vec<(SubmissionIndex, Id<dyn MTLCommandBuffer>, Vec<Arc<Group>>)> = {
             let mut f = lock(&self.0.in_flight);
-            let w = f.iter().filter(|(i, _)| *i <= index).map(|(_, cb)| cb.clone()).collect();
-            f.retain(|(i, _)| *i > index);
+            let (w, rest) = std::mem::take(&mut *f).into_iter().partition(|(i, ..)| *i <= index);
+            *f = rest;
             w
         };
-        for cb in waiting {
+        for (_, cb, _) in &waiting {
             cb.waitUntilCompleted();
         }
         // The handlers run on another thread, after `waitUntilCompleted` returns.
@@ -876,6 +991,8 @@ impl Clone for Buffer {
 
 #[derive(Clone)]
 pub struct Texture {
+    /// The device's table, where each view of it gets an index.
+    table: Arc<Table>,
     raw: Id<dyn MTLTexture>,
     format: TextureFormat,
     width: u32,
@@ -933,18 +1050,22 @@ impl Texture {
             )
         }
         .expect("Metal made no texture view");
-        TextureView { raw }
+        let slot = Some(self.table.take(raw.gpuResourceID()));
+        TextureView { raw, slot }
     }
 }
 
 #[derive(Clone)]
 pub struct TextureView {
     raw: Id<dyn MTLTexture>,
+    /// Its index in the device's table (none for a frame of a surface, only drawn into).
+    slot: Option<Arc<Slot>>,
 }
 
 #[derive(Clone)]
 pub struct Sampler {
     raw: Id<dyn MTLSamplerState>,
+    slot: Arc<Slot>,
 }
 
 #[derive(Clone)]
@@ -989,13 +1110,15 @@ pub struct RenderPipeline {
 
 /// A layout's entries, and each one's slot in each stage's table (`wrela_abi::metal::slots`'
 /// rule: a stage's own counter for each table, in the entries' order, counting only what the
-/// stage sees).
+/// stage sees; an entry the device's table holds takes none).
 struct Layout {
     entries: Vec<LayoutEntry>,
     /// Each entry's slot in the vertex, fragment and compute stage, where it sees it.
     slots: Vec<[Option<u8>; 3]>,
     /// The entry that takes a dynamic offset.
     dynamic: Vec<usize>,
+    /// The bytes of its block of indices: past the last entry's index.
+    block: usize,
 }
 
 impl Layout {
@@ -1003,9 +1126,15 @@ impl Layout {
         let mut counters = [[0u8; 3]; 3];
         let mut slots = Vec::with_capacity(entries.len());
         let mut dynamic = Vec::new();
+        let mut block = 0;
         for (k, e) in entries.iter().enumerate() {
             let table = e.ty.table() as usize;
             let mut s = [None; 3];
+            if let Some(at) = e.index_at {
+                block = block.max(at as usize + 4);
+                slots.push(s);
+                continue;
+            }
             for (stage, sees) in [e.visibility.vertex, e.visibility.fragment, e.visibility.compute]
                 .into_iter()
                 .enumerate()
@@ -1020,7 +1149,7 @@ impl Layout {
                 dynamic.push(k);
             }
         }
-        Layout { entries: entries.to_vec(), slots, dynamic }
+        Layout { entries: entries.to_vec(), slots, dynamic, block }
     }
 }
 
@@ -1036,6 +1165,13 @@ enum Bound {
 struct Group {
     layout: Arc<Layout>,
     bound: Vec<(usize, Bound)>,
+    /// Its block of indices in the device's table (empty where the table holds none of it).
+    block: Vec<u8>,
+    /// What it reaches through the table, as Metal declares it: textures read, and written.
+    reads: Vec<Id<dyn MTLTexture>>,
+    writes: Vec<Id<dyn MTLTexture>>,
+    /// The indices it names, alive while it is.
+    _slots: Vec<Arc<Slot>>,
 }
 
 #[derive(Clone)]
@@ -1066,6 +1202,24 @@ impl BindGroup {
     }
 }
 
+/// What group `g` reaches through the table, as `useResources` takes it: the textures it reads,
+/// and those it writes.
+#[allow(clippy::type_complexity)]
+fn declared(
+    g: &Group,
+) -> (Vec<NonNull<ProtocolObject<dyn MTLResource>>>, Vec<NonNull<ProtocolObject<dyn MTLResource>>>)
+{
+    let each = |ts: &[Id<dyn MTLTexture>]| {
+        ts.iter()
+            .map(|t| {
+                let r: &ProtocolObject<dyn MTLResource> = ProtocolObject::from_ref(&**t);
+                NonNull::from(r)
+            })
+            .collect()
+    };
+    (each(&g.reads), each(&g.writes))
+}
+
 // ---- recording ----------------------------------------------------------------------------------------
 
 /// A command buffer being recorded.
@@ -1075,10 +1229,13 @@ pub struct CommandEncoder {
     cb: Option<Id<dyn MTLCommandBuffer>>,
     /// The blit encoder copies go into, while copies follow one another.
     blit: Option<Id<dyn MTLBlitCommandEncoder>>,
+    /// The bind groups its commands set, which what they reach through the table needs alive.
+    keep: Vec<Arc<Group>>,
 }
 
 pub struct CommandBuffer {
     raw: Id<dyn MTLCommandBuffer>,
+    keep: Vec<Arc<Group>>,
 }
 
 impl CommandEncoder {
@@ -1250,7 +1407,8 @@ impl CommandEncoder {
             .computeCommandEncoderWithDescriptor(&d)
             .expect("Metal made no compute encoder");
         encoder.setLabel(Some(&ns(label)));
-        ComputePass { encoder, pipeline: None, _cb: std::marker::PhantomData }
+        let table = self.device.0.table.clone();
+        ComputePass { encoder, pipeline: None, keep: &mut self.keep, table, table_set: false }
     }
 
     pub fn begin_render_pass(&mut self, desc: &RenderPassDesc<'_>) -> RenderPass<'_> {
@@ -1295,12 +1453,14 @@ impl CommandEncoder {
             self.cb().renderCommandEncoderWithDescriptor(&d).expect("Metal made no render encoder");
         encoder.setLabel(Some(&ns(desc.label)));
         encoder.setFrontFacingWinding(MTLWinding::CounterClockwise);
-        RenderPass { encoder, index: None, _cb: std::marker::PhantomData }
+        let table = self.device.0.table.clone();
+        RenderPass { encoder, index: None, keep: &mut self.keep, table, table_set: false }
     }
 
     pub fn finish(mut self) -> CommandBuffer {
         self.end_blit();
-        CommandBuffer { raw: self.cb().clone() }
+        let keep = std::mem::take(&mut self.keep);
+        CommandBuffer { raw: self.cb().clone(), keep }
     }
 }
 
@@ -1332,7 +1492,10 @@ fn slice_of(c: &TextureCopy<'_>) -> (NSUInteger, NSUInteger) {
 pub struct ComputePass<'a> {
     encoder: Id<dyn MTLComputeCommandEncoder>,
     pipeline: Option<MTLSize>,
-    _cb: std::marker::PhantomData<&'a mut CommandEncoder>,
+    keep: &'a mut Vec<Arc<Group>>,
+    table: Arc<Table>,
+    /// Whether the table is bound in this encoder yet.
+    table_set: bool,
 }
 
 impl ComputePass<'_> {
@@ -1354,6 +1517,37 @@ impl ComputePass<'_> {
                 Bound::Sampler(s) => e.setSamplerState_atIndex(Some(s), slot as NSUInteger),
             }
         });
+        let g = &group.0;
+        if g.block.is_empty() {
+            return;
+        }
+        // SAFETY: the block's bytes are copied as the call is made; the table, and what the
+        // group names in it, are alive until the command buffer is done (`keep`).
+        unsafe {
+            if !self.table_set {
+                let at = wrela_abi::table::METAL_TABLE as NSUInteger;
+                e.setBuffer_offset_atIndex(Some(&self.table.buffer), 0, at);
+                self.table_set = true;
+            }
+            let at = wrela_abi::table::METAL_BLOCK as NSUInteger;
+            e.setBytes_length_atIndex(NonNull::from(&g.block[..]).cast(), g.block.len(), at);
+            let (reads, writes) = declared(g);
+            if !reads.is_empty() {
+                e.useResources_count_usage(
+                    NonNull::from(&reads[..]).cast(),
+                    reads.len() as NSUInteger,
+                    MTLResourceUsage::Read,
+                );
+            }
+            if !writes.is_empty() {
+                e.useResources_count_usage(
+                    NonNull::from(&writes[..]).cast(),
+                    writes.len() as NSUInteger,
+                    MTLResourceUsage::Read | MTLResourceUsage::Write,
+                );
+            }
+        }
+        self.keep.push(g.clone());
     }
 
     pub fn dispatch(&mut self, x: u32, y: u32, z: u32) {
@@ -1384,7 +1578,10 @@ pub struct RenderPass<'a> {
     encoder: Id<dyn MTLRenderCommandEncoder>,
     /// The index buffer and its offset, for the indexed draws after it.
     index: Option<(Id<dyn MTLBuffer>, u64)>,
-    _cb: std::marker::PhantomData<&'a mut CommandEncoder>,
+    keep: &'a mut Vec<Arc<Group>>,
+    table: Arc<Table>,
+    /// Whether the table is bound in this encoder's stages yet.
+    table_set: bool,
 }
 
 impl RenderPass<'_> {
@@ -1421,6 +1618,42 @@ impl RenderPass<'_> {
                 }
             });
         }
+        let g = &group.0;
+        if g.block.is_empty() {
+            return;
+        }
+        let stages = MTLRenderStages::Vertex | MTLRenderStages::Fragment;
+        // SAFETY: as `ComputePass::set_bind_group`'s.
+        unsafe {
+            if !self.table_set {
+                let at = wrela_abi::table::METAL_TABLE as NSUInteger;
+                e.setVertexBuffer_offset_atIndex(Some(&self.table.buffer), 0, at);
+                e.setFragmentBuffer_offset_atIndex(Some(&self.table.buffer), 0, at);
+                self.table_set = true;
+            }
+            let at = wrela_abi::table::METAL_BLOCK as NSUInteger;
+            let bytes = NonNull::from(&g.block[..]).cast();
+            e.setVertexBytes_length_atIndex(bytes, g.block.len(), at);
+            e.setFragmentBytes_length_atIndex(bytes, g.block.len(), at);
+            let (reads, writes) = declared(g);
+            if !reads.is_empty() {
+                e.useResources_count_usage_stages(
+                    NonNull::from(&reads[..]).cast(),
+                    reads.len() as NSUInteger,
+                    MTLResourceUsage::Read,
+                    stages,
+                );
+            }
+            if !writes.is_empty() {
+                e.useResources_count_usage_stages(
+                    NonNull::from(&writes[..]).cast(),
+                    writes.len() as NSUInteger,
+                    MTLResourceUsage::Read | MTLResourceUsage::Write,
+                    stages,
+                );
+            }
+        }
+        self.keep.push(g.clone());
     }
 
     pub fn set_viewport(&mut self, x: f32, y: f32, w: f32, h: f32, min: f32, max: f32) {
@@ -1669,6 +1902,8 @@ pub struct Surface {
     /// taken; and the next id.
     presented: Arc<Mutex<Vec<(u64, std::time::Instant)>>>,
     next_id: u64,
+    /// The device's table, which a frame's texture carries as every texture does.
+    table: Arc<Table>,
 }
 
 // SAFETY: the layer is made and used on the thread that runs the window (macOS's main thread);
@@ -1710,6 +1945,7 @@ impl Device {
             _window: window,
             presented: Arc::new(Mutex::new(Vec::new())),
             next_id: 0,
+            table: self.0.table.clone(),
         };
         surface.set_space(false, false);
         Ok(surface)
@@ -1789,6 +2025,7 @@ impl Surface {
         let raw = drawable.texture();
         let (width, height) = (raw.width() as u32, raw.height() as u32);
         let texture = Texture {
+            table: self.table.clone(),
             raw: raw.clone(),
             format: TextureFormat::Rgba16Float,
             width,
@@ -1797,7 +2034,7 @@ impl Surface {
             levels: 1,
             dimension: TextureDimension::D2,
         };
-        Ok(SurfaceTexture { drawable, texture, view: TextureView { raw } })
+        Ok(SurfaceTexture { drawable, texture, view: TextureView { raw, slot: None } })
     }
 
     /// Shows `frame` once the work submitted for it is done: its id, which

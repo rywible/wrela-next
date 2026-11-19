@@ -64,14 +64,16 @@ use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::fmt;
 
-/// The manifest's version. 15: each pipeline states the most work an invocation of each of its
+/// The manifest's version. 16: a pipeline's textures and samplers are reached through the
+/// device's one table by indices a dispatch or draw is given (`table`), not bound at slots of
+/// their own; its buffers are where they were. 15: each pipeline states the most work an invocation of each of its
 /// entry points can do (`work`, the compiler's count), or that it can't say (`null`, with the
 /// loop it can't bound in `unbounded`), which a host weighs a dispatch by before it runs it. 14:
 /// a build names its `target` (`metal`, its shaders MSL with their buffers' `sizes`; `vulkan`,
 /// its shaders SPIR-V), and each pipeline the bytes its shader keeps an invocation (`kept`). (13
 /// had MSL alone; 12, from toolchain 0.10.0, named WGSL, which this host no longer runs; a build
 /// may record its `set` since 12.)
-pub const VERSION: u32 = 15;
+pub const VERSION: u32 = 16;
 /// The screen's texture format: what a screen target's colour is, and the format of the bytes a
 /// host reads back from the screen.
 pub const SCREEN_TEXTURE: TextureFormat = TextureFormat::Rgba8;
@@ -1515,7 +1517,7 @@ mod tests {
     fn golden_json() {
         let json = sample().to_json();
         let expected = r#"{
-  "manifest_version": 15,
+  "manifest_version": 16,
   "stream_version": 13,
   "target": "metal",
   "wasm": "game.wasm",
@@ -1615,7 +1617,7 @@ mod tests {
         let mut twice = m.clone();
         twice.pipelines[0].sizes = Some(BufferSizes { binding: buffers[0], buffers });
         assert!(twice.validate().unwrap_err().0.contains("uses a binding twice"));
-        let older = json.replace("\"manifest_version\": 15", "\"manifest_version\": 14");
+        let older = json.replace("\"manifest_version\": 16", "\"manifest_version\": 15");
         assert!(Manifest::parse(&older).is_err());
     }
 

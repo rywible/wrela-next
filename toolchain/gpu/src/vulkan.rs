@@ -15,8 +15,11 @@
 //!   writes what a command since the last barrier wrote, or writes what one read (each
 //!   encoder's sets of handles); a pass begins and ends with one.
 //! - **Bindings**: set 0, each layout entry numbered by its place among the layout's entries
-//!   (`wrela_abi::vulkan::descriptor`), a uniform at a dynamic offset as
-//!   `UNIFORM_BUFFER_DYNAMIC`.
+//!   the table doesn't hold (`wrela_abi::vulkan::descriptor`), a uniform at a dynamic offset as
+//!   `UNIFORM_BUFFER_DYNAMIC`. The table (`wrela_abi::table`): one descriptor set a device,
+//!   arrays of every view as a sampled image and, where it can be one, a storage image, and of
+//!   every sampler, each at its index, written when it's made (update-after-bind, partially
+//!   bound); set 1 of a pipeline that reaches it, its indices pushed as push constants.
 //! - **Validation**: `WRELA_VULKAN_VALIDATION=1` turns on Khronos's layer, and every message it
 //!   reports is an error the host reads after the frame (`take_errors`).
 
@@ -56,6 +59,8 @@ struct Shared {
     errors: Arc<Mutex<Vec<String>>>,
     /// Pipelines and layouts made for each bind group layout, freed with the device.
     descriptor_pools: Mutex<Vec<vk::DescriptorPool>>,
+    /// The table of views and samplers.
+    table: Table,
     /// Host-visible buffers staged writes are copied into, reused once their submission is done.
     belt: Mutex<Belt>,
 }
@@ -77,6 +82,95 @@ const BELT_CHUNK: u64 = 4 << 20;
 // and the pending list are behind mutexes, and the host records on one thread at a time.
 unsafe impl Send for Shared {}
 unsafe impl Sync for Shared {}
+
+/// How many views and samplers the table holds at once.
+const TABLE_LEN: u32 = 1 << 16;
+
+/// The device's table (`wrela_abi::table`): its one descriptor set (set
+/// `wrela_abi::table::TABLE_SET` of a pipeline that reaches it) and its free indices (those let
+/// go, and the next never used).
+struct Table {
+    set_layout: vk::DescriptorSetLayout,
+    pool: vk::DescriptorPool,
+    set: vk::DescriptorSet,
+    len: u32,
+    free: Mutex<(Vec<u32>, u32)>,
+}
+
+impl Table {
+    fn take(&self) -> u32 {
+        let mut f = lock(&self.free);
+        match f.0.pop() {
+            Some(i) => i,
+            None => {
+                let i = f.1;
+                assert!(i < self.len, "the table of views and samplers is full");
+                f.1 += 1;
+                i
+            }
+        }
+    }
+
+    fn give_back(&self, index: u32) {
+        lock(&self.free).0.push(index);
+    }
+
+    /// The table of `len` views and samplers and its set.
+    ///
+    /// # Safety
+    /// `d` is a live device with descriptor indexing's update-after-bind and partially bound
+    /// features on.
+    unsafe fn new(d: &ash::Device, len: u32) -> std::result::Result<Table, vk::Result> {
+        let kinds = [
+            (wrela_abi::table::SAMPLED, vk::DescriptorType::SAMPLED_IMAGE),
+            (wrela_abi::table::STORAGE, vk::DescriptorType::STORAGE_IMAGE),
+            (wrela_abi::table::SAMPLERS, vk::DescriptorType::SAMPLER),
+        ];
+        let bindings: Vec<vk::DescriptorSetLayoutBinding<'_>> = kinds
+            .iter()
+            .map(|&(binding, ty)| {
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(binding)
+                    .descriptor_type(ty)
+                    .descriptor_count(len)
+                    .stage_flags(vk::ShaderStageFlags::ALL)
+            })
+            .collect();
+        let flags = [vk::DescriptorBindingFlags::PARTIALLY_BOUND
+            | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND
+            | vk::DescriptorBindingFlags::UPDATE_UNUSED_WHILE_PENDING; 3];
+        let mut binding_flags =
+            vk::DescriptorSetLayoutBindingFlagsCreateInfo::default().binding_flags(&flags);
+        // SAFETY: the caller's.
+        unsafe {
+            let set_layout = d.create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default()
+                    .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL)
+                    .bindings(&bindings)
+                    .push_next(&mut binding_flags),
+                None,
+            )?;
+            let sizes: Vec<vk::DescriptorPoolSize> = kinds
+                .iter()
+                .map(|&(_, ty)| vk::DescriptorPoolSize { ty, descriptor_count: len })
+                .collect();
+            let pool = d.create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .flags(vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND)
+                    .max_sets(1)
+                    .pool_sizes(&sizes),
+                None,
+            )?;
+            let layouts = [set_layout];
+            let set = d.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(pool)
+                    .set_layouts(&layouts),
+            )?[0];
+            Ok(Table { set_layout, pool, set, len, free: Mutex::new((Vec::new(), 0)) })
+        }
+    }
+}
 
 /// What a submission holds alive until it's done: what its commands use (held, never read).
 #[allow(dead_code)]
@@ -258,6 +352,22 @@ impl Device {
                 (f12.timeline_semaphore, "timeline semaphores"),
                 (f13.synchronization2, "synchronization2"),
                 (f13.dynamic_rendering, "dynamic rendering"),
+                (f12.runtime_descriptor_array, "runtime descriptor arrays"),
+                (f12.descriptor_binding_partially_bound, "partially bound descriptors"),
+                (
+                    f12.descriptor_binding_update_unused_while_pending,
+                    "descriptors updated while pending",
+                ),
+                (
+                    f12.descriptor_binding_sampled_image_update_after_bind,
+                    "sampled images updated after bind",
+                ),
+                (
+                    f12.descriptor_binding_storage_image_update_after_bind,
+                    "storage images updated after bind",
+                ),
+                (base.shader_sampled_image_array_dynamic_indexing, "sampled images indexed"),
+                (base.shader_storage_image_array_dynamic_indexing, "storage images indexed"),
             ] {
                 if have == vk::FALSE {
                     return Err(Error(format!("the GPU lacks {what}, which the host needs")));
@@ -266,10 +376,12 @@ impl Device {
             let mut sub = vk::PhysicalDeviceSubgroupProperties::default();
             let mut sub13 = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
             let mut driver = vk::PhysicalDeviceDriverProperties::default();
+            let mut indexing = vk::PhysicalDeviceDescriptorIndexingProperties::default();
             let mut props2 = vk::PhysicalDeviceProperties2::default()
                 .push_next(&mut sub)
                 .push_next(&mut sub13)
-                .push_next(&mut driver);
+                .push_next(&mut driver)
+                .push_next(&mut indexing);
             instance.get_physical_device_properties2(physical, &mut props2);
             let l = props.limits;
 
@@ -348,7 +460,12 @@ impl Device {
                 .timeline_semaphore(true)
                 .shader_float16(f16)
                 .host_query_reset(f12.host_query_reset == vk::TRUE)
-                .shader_int8(f12.shader_int8 == vk::TRUE);
+                .shader_int8(f12.shader_int8 == vk::TRUE)
+                .runtime_descriptor_array(true)
+                .descriptor_binding_partially_bound(true)
+                .descriptor_binding_update_unused_while_pending(true)
+                .descriptor_binding_sampled_image_update_after_bind(true)
+                .descriptor_binding_storage_image_update_after_bind(true);
             let mut on13 = vk::PhysicalDeviceVulkan13Features::default()
                 .synchronization2(true)
                 .dynamic_rendering(true)
@@ -373,7 +490,9 @@ impl Device {
                 )
                 .independent_blend(base.independent_blend == vk::TRUE)
                 .depth_clamp(base.depth_clamp == vk::TRUE)
-                .depth_bias_clamp(base.depth_bias_clamp == vk::TRUE);
+                .depth_bias_clamp(base.depth_bias_clamp == vk::TRUE)
+                .shader_sampled_image_array_dynamic_indexing(true)
+                .shader_storage_image_array_dynamic_indexing(true);
             let device_exts =
                 instance.enumerate_device_extension_properties(physical).unwrap_or_default();
             let device_has =
@@ -438,6 +557,16 @@ impl Device {
                 },
                 subgroup_max_size: sub13.max_subgroup_size.max(sub.subgroup_size),
             };
+            let table_len = TABLE_LEN
+                .min(indexing.max_descriptor_set_update_after_bind_sampled_images)
+                .min(indexing.max_descriptor_set_update_after_bind_storage_images)
+                .min(indexing.max_descriptor_set_update_after_bind_samplers)
+                .min(indexing.max_per_stage_descriptor_update_after_bind_sampled_images)
+                .min(indexing.max_per_stage_descriptor_update_after_bind_storage_images)
+                .min(indexing.max_per_stage_descriptor_update_after_bind_samplers)
+                .min(indexing.max_per_stage_update_after_bind_resources / 3);
+            let table = Table::new(&raw, table_len)
+                .map_err(|e| Error(format!("Vulkan made no table: {e}")))?;
             let storage_max = u64::from(l.max_storage_buffer_range).min(u64::from(u32::MAX)) & !3;
             let limits = Limits {
                 max_texture_dimension_2d: l.max_image_dimension2_d,
@@ -484,6 +613,7 @@ impl Device {
                 in_flight: Mutex::new(Vec::new()),
                 errors,
                 descriptor_pools: Mutex::new(Vec::new()),
+                table,
                 belt: Mutex::new(Belt::default()),
             })))
         }
@@ -680,6 +810,7 @@ impl Device {
                     vk::ImageAspectFlags::COLOR
                 },
                 swapchain: false,
+                usage,
                 home: if desc.usage.storage {
                     vk::ImageLayout::GENERAL
                 } else if depth {
@@ -732,7 +863,21 @@ impl Device {
         // SAFETY: a sampler.
         let raw =
             unsafe { self.raw().create_sampler(&info, None).expect("Vulkan made no sampler") };
-        Sampler { raw: Arc::new(RawSampler { device: self.0.clone(), raw }) }
+        let index = self.0.table.take();
+        let image = [vk::DescriptorImageInfo {
+            sampler: raw,
+            image_view: vk::ImageView::null(),
+            image_layout: vk::ImageLayout::UNDEFINED,
+        }];
+        let write = vk::WriteDescriptorSet::default()
+            .dst_set(self.0.table.set)
+            .dst_binding(wrela_abi::table::SAMPLERS)
+            .dst_array_element(index)
+            .descriptor_type(vk::DescriptorType::SAMPLER)
+            .image_info(&image);
+        // SAFETY: as a view's (`Texture::create_view`).
+        unsafe { self.raw().update_descriptor_sets(&[write], &[]) };
+        Sampler { raw: Arc::new(RawSampler { device: self.0.clone(), raw, index }) }
     }
 
     pub fn create_query_set(&self, count: u32) -> Result<QuerySet> {
@@ -754,8 +899,11 @@ impl Device {
     }
 
     pub fn create_bind_group_layout(&self, entries: &[LayoutEntry]) -> BindGroupLayout {
+        // What the device's table holds isn't in the set: its index is in the block, pushed.
+        let block = entries.iter().filter_map(|e| e.index_at).map(|at| at + 4).max().unwrap_or(0);
         let bindings: Vec<vk::DescriptorSetLayoutBinding<'_>> = entries
             .iter()
+            .filter(|e| e.index_at.is_none())
             .enumerate()
             .map(|(k, e)| {
                 vk::DescriptorSetLayoutBinding::default()
@@ -774,18 +922,27 @@ impl Device {
                     None,
                 )
                 .expect("Vulkan made no set layout");
-            let sets = [set];
-            let pipeline = d
-                .create_pipeline_layout(
-                    &vk::PipelineLayoutCreateInfo::default().set_layouts(&sets),
-                    None,
-                )
-                .expect("Vulkan made no pipeline layout");
+            let with_table = [set, self.0.table.set_layout];
+            let ranges = [vk::PushConstantRange {
+                stage_flags: vk::ShaderStageFlags::ALL,
+                offset: 0,
+                size: block,
+            }];
+            let info = if block == 0 {
+                vk::PipelineLayoutCreateInfo::default().set_layouts(&with_table[..1])
+            } else {
+                vk::PipelineLayoutCreateInfo::default()
+                    .set_layouts(&with_table)
+                    .push_constant_ranges(&ranges)
+            };
+            let pipeline =
+                d.create_pipeline_layout(&info, None).expect("Vulkan made no pipeline layout");
             BindGroupLayout(Arc::new(Layout {
                 device: self.0.clone(),
                 entries: entries.to_vec(),
                 set,
                 pipeline,
+                block: block as usize,
             }))
         }
     }
@@ -797,7 +954,16 @@ impl Device {
     ) -> BindGroup {
         let l = &layout.0;
         let mut sizes: Vec<vk::DescriptorPoolSize> = Vec::new();
+        // Each entry's binding in the set (none for what the table holds).
+        let mut numbers = Vec::with_capacity(l.entries.len());
+        let mut next = 0u32;
         for e in &l.entries {
+            if e.index_at.is_some() {
+                numbers.push(None);
+                continue;
+            }
+            numbers.push(Some(next));
+            next += 1;
             let ty = descriptor_type(e.ty);
             match sizes.iter_mut().find(|s| s.ty == ty) {
                 Some(s) => s.descriptor_count += 1,
@@ -832,10 +998,32 @@ impl Device {
             let mut writes: Vec<(u32, vk::DescriptorType, bool, usize)> = Vec::new();
             let mut held = Vec::new();
             let mut uses: Vec<(u64, bool)> = Vec::new();
+            let mut block = vec![0u8; l.block];
             for e in entries {
                 let Some(k) = l.entries.iter().position(|x| x.binding == e.binding) else {
                     continue;
                 };
+                if let Some(at) = l.entries[k].index_at {
+                    let index = match &e.resource {
+                        Resource::View(v) => {
+                            held.push(Held::View(v.raw.clone()));
+                            uses.push((
+                                vk::Handle::as_raw(v.raw.image.image),
+                                matches!(l.entries[k].ty, BindingType::StorageTexture { .. }),
+                            ));
+                            v.raw.index
+                        }
+                        Resource::Sampler(s) => {
+                            held.push(Held::Sampler(s.raw.clone()));
+                            s.raw.index
+                        }
+                        Resource::Buffer { .. } => panic!("a buffer isn't in the table"),
+                    };
+                    let at = at as usize;
+                    block[at..at + 4].copy_from_slice(&index.to_le_bytes());
+                    continue;
+                }
+                let k_set = numbers[k].expect("an entry of the set");
                 let ty = descriptor_type(l.entries[k].ty);
                 match &e.resource {
                     Resource::Buffer { buffer, offset, size } => {
@@ -851,7 +1039,7 @@ impl Device {
                             offset: *offset,
                             range,
                         }]);
-                        writes.push((k as u32, ty, true, buffers.len() - 1));
+                        writes.push((k_set, ty, true, buffers.len() - 1));
                         held.push(Held::Buffer(buffer.raw.clone()));
                         uses.push((
                             vk::Handle::as_raw(buffer.raw.buffer),
@@ -867,7 +1055,7 @@ impl Device {
                             image_view: v.raw.view,
                             image_layout: v.raw.image.home,
                         }]);
-                        writes.push((k as u32, ty, false, images.len() - 1));
+                        writes.push((k_set, ty, false, images.len() - 1));
                         held.push(Held::View(v.raw.clone()));
                         uses.push((
                             vk::Handle::as_raw(v.raw.image.image),
@@ -880,7 +1068,7 @@ impl Device {
                             image_view: vk::ImageView::null(),
                             image_layout: vk::ImageLayout::UNDEFINED,
                         }]);
-                        writes.push((k as u32, ty, false, images.len() - 1));
+                        writes.push((k_set, ty, false, images.len() - 1));
                         held.push(Held::Sampler(s.raw.clone()));
                     }
                 }
@@ -905,6 +1093,7 @@ impl Device {
                 set,
                 _held: held,
                 uses,
+                block,
             }))
         }
     }
@@ -1286,6 +1475,8 @@ impl Drop for Shared {
             for p in lock(&self.descriptor_pools).drain(..) {
                 self.raw.destroy_descriptor_pool(p, None);
             }
+            self.raw.destroy_descriptor_pool(self.table.pool, None);
+            self.raw.destroy_descriptor_set_layout(self.table.set_layout, None);
             self.raw.destroy_semaphore(self.timeline, None);
             self.raw.destroy_device(None);
             if let Some((du, m)) = self.debug.take() {
@@ -1386,6 +1577,8 @@ struct RawImage {
     /// A swapchain's image: not ours to free, and drawn whole each frame, so a pass takes it
     /// from `UNDEFINED`.
     swapchain: bool,
+    /// What it may be used as: a view of it is in the table's arrays it can be in.
+    usage: vk::ImageUsageFlags,
 }
 
 impl RawImage {
@@ -1515,6 +1708,48 @@ impl Texture {
                 .expect("Vulkan made no image view")
         };
         let level = desc.base_level;
+        // Its index in the table: a sampled image there, and a storage image where it can be
+        // one (a kernel may write it: one level, not a cube).
+        let device = &self.raw.device;
+        let index = device.table.take();
+        let usage = self.raw.usage;
+        let mut writes = Vec::new();
+        let sampled = [vk::DescriptorImageInfo {
+            sampler: vk::Sampler::null(),
+            image_view: view,
+            image_layout: self.raw.home,
+        }];
+        let storage = [vk::DescriptorImageInfo {
+            sampler: vk::Sampler::null(),
+            image_view: view,
+            image_layout: vk::ImageLayout::GENERAL,
+        }];
+        if usage.contains(vk::ImageUsageFlags::SAMPLED) {
+            writes.push(
+                vk::WriteDescriptorSet::default()
+                    .dst_set(device.table.set)
+                    .dst_binding(wrela_abi::table::SAMPLED)
+                    .dst_array_element(index)
+                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                    .image_info(&sampled),
+            );
+        }
+        if usage.contains(vk::ImageUsageFlags::STORAGE)
+            && range.level_count == 1
+            && ty != vk::ImageViewType::CUBE
+        {
+            writes.push(
+                vk::WriteDescriptorSet::default()
+                    .dst_set(device.table.set)
+                    .dst_binding(wrela_abi::table::STORAGE)
+                    .dst_array_element(index)
+                    .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                    .image_info(&storage),
+            );
+        }
+        // SAFETY: descriptors of a live view, at an index no command in flight reaches
+        // (update-after-bind, update-unused-while-pending).
+        unsafe { device.raw.update_descriptor_sets(&writes, &[]) };
         TextureView {
             raw: Arc::new(RawView {
                 image: self.raw.clone(),
@@ -1522,6 +1757,7 @@ impl Texture {
                 range,
                 width: (self.width >> level).max(1),
                 height: (self.height >> level).max(1),
+                index,
             }),
         }
     }
@@ -1534,12 +1770,20 @@ struct RawView {
     range: vk::ImageSubresourceRange,
     width: u32,
     height: u32,
+    /// Its index in the device's table ([`NO_INDEX`] for a swapchain's image, only drawn into).
+    index: u32,
 }
+
+/// A view's index where it has none in the table.
+const NO_INDEX: u32 = u32::MAX;
 
 impl Drop for RawView {
     fn drop(&mut self) {
         // SAFETY: nothing in flight holds it.
         unsafe { self.image.device.raw.destroy_image_view(self.view, None) };
+        if self.index != NO_INDEX {
+            self.image.device.table.give_back(self.index);
+        }
     }
 }
 
@@ -1551,12 +1795,15 @@ pub struct TextureView {
 struct RawSampler {
     device: Arc<Shared>,
     raw: vk::Sampler,
+    /// Its index in the device's table.
+    index: u32,
 }
 
 impl Drop for RawSampler {
     fn drop(&mut self) {
         // SAFETY: nothing in flight holds it.
         unsafe { self.device.raw.destroy_sampler(self.raw, None) };
+        self.device.table.give_back(self.index);
     }
 }
 
@@ -1634,7 +1881,10 @@ struct Layout {
     device: Arc<Shared>,
     entries: Vec<LayoutEntry>,
     set: vk::DescriptorSetLayout,
+    /// Its set, then (where it has a block) the table's, and the block's push constants.
     pipeline: vk::PipelineLayout,
+    /// The bytes of its block of indices in the device's table.
+    block: usize,
 }
 
 impl Drop for Layout {
@@ -1669,6 +1919,8 @@ struct Group {
     /// What it binds by its handle (a buffer's or an image's), and whether a shader may write
     /// it: what a command that sets it uses, for the encoder's hazards.
     uses: Vec<(u64, bool)>,
+    /// Its block: the index in the device's table of each view and sampler the table holds.
+    block: Vec<u8>,
 }
 
 impl Drop for Group {
@@ -2276,19 +2528,7 @@ impl ComputePass<'_> {
 
     pub fn set_bind_group(&mut self, group: &BindGroup, offsets: &[u32]) {
         let layout = self.layout.unwrap_or(group.0.layout.pipeline);
-        if group.0.set != vk::DescriptorSet::null() {
-            // SAFETY: a live set the encoder keeps.
-            unsafe {
-                self.encoder.d().cmd_bind_descriptor_sets(
-                    self.encoder.raw,
-                    vk::PipelineBindPoint::COMPUTE,
-                    layout,
-                    0,
-                    &[group.0.set],
-                    offsets,
-                )
-            };
-        }
+        bind_group(self.encoder, vk::PipelineBindPoint::COMPUTE, layout, &group.0, offsets);
         self.encoder.groups.push(group.0.clone());
         self.bound = Some(group.0.clone());
     }
@@ -2364,19 +2604,7 @@ impl RenderPass<'_> {
 
     pub fn set_bind_group(&mut self, group: &BindGroup, offsets: &[u32]) {
         let layout = self.layout.unwrap_or(group.0.layout.pipeline);
-        if group.0.set != vk::DescriptorSet::null() {
-            // SAFETY: a live set the encoder keeps.
-            unsafe {
-                self.encoder.d().cmd_bind_descriptor_sets(
-                    self.encoder.raw,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    layout,
-                    0,
-                    &[group.0.set],
-                    offsets,
-                )
-            };
-        }
+        bind_group(self.encoder, vk::PipelineBindPoint::GRAPHICS, layout, &group.0, offsets);
         self.encoder.groups.push(group.0.clone());
     }
 
@@ -2527,6 +2755,44 @@ impl Drop for RenderPass<'_> {
 /// A WebGPU viewport as Vulkan's: flipped, a negative height from its bottom edge, as wgpu-hal
 /// does, since WebGPU's clip space has y up and Vulkan's down (and the compiler's SPIR-V writes
 /// WebGPU's positions).
+/// Sets group `g` at `point` for the commands after it, under pipeline layout `layout`: its set
+/// (set 0, at `offsets`) and, where it has a block, the device's table (set
+/// `wrela_abi::table::TABLE_SET`) and the block as push constants.
+fn bind_group(
+    encoder: &CommandEncoder,
+    point: vk::PipelineBindPoint,
+    layout: vk::PipelineLayout,
+    g: &Group,
+    offsets: &[u32],
+) {
+    let d = encoder.d();
+    let table = g.device.table.set;
+    // SAFETY: live sets the encoder keeps (the group, and the device's table), and a block of the
+    // size of the layout's push constants.
+    unsafe {
+        match (g.set != vk::DescriptorSet::null(), g.block.is_empty()) {
+            (true, true) => {
+                d.cmd_bind_descriptor_sets(encoder.raw, point, layout, 0, &[g.set], offsets)
+            }
+            (true, false) => {
+                d.cmd_bind_descriptor_sets(encoder.raw, point, layout, 0, &[g.set, table], offsets)
+            }
+            (false, false) => d.cmd_bind_descriptor_sets(
+                encoder.raw,
+                point,
+                layout,
+                wrela_abi::table::TABLE_SET,
+                &[table],
+                &[],
+            ),
+            (false, true) => {}
+        }
+        if !g.block.is_empty() {
+            d.cmd_push_constants(encoder.raw, layout, vk::ShaderStageFlags::ALL, 0, &g.block);
+        }
+    }
+}
+
 fn viewport(x: f32, y: f32, w: f32, h: f32, min: f32, max: f32) -> vk::Viewport {
     vk::Viewport { x, y: y + h, width: w, height: -h, min_depth: min, max_depth: max }
 }
@@ -2948,6 +3214,7 @@ impl Surface {
                     layers: 1,
                     home: vk::ImageLayout::PRESENT_SRC_KHR,
                     swapchain: true,
+                    usage: vk::ImageUsageFlags::COLOR_ATTACHMENT,
                 });
                 let range = raw.part(0, 0, 1);
                 let view = d
@@ -2967,6 +3234,7 @@ impl Surface {
                     range,
                     width: extent.width,
                     height: extent.height,
+                    index: NO_INDEX,
                 }));
                 self.rendered.push(
                     d.raw

@@ -56,6 +56,7 @@ pub mod manifest;
 pub mod memory;
 pub mod metal;
 pub mod stream;
+pub mod table;
 pub mod ticks;
 pub mod vectors;
 pub mod vulkan;
@@ -332,7 +333,8 @@ pub struct TargetLimits {
     /// The bytes a sample of a pass's colour targets take (`maxColorAttachmentBytesPerSample`).
     pub color_attachment_bytes: u32,
     /// The buffer slots of a stage's argument table, where the target has one (Metal's 31: the
-    /// storage buffers, the uniform block, a debug build's flag and the buffers' sizes together).
+    /// storage buffers, the uniform block, a debug build's flag and the buffers' sizes together;
+    /// in a kernel that reaches the device's [`table`], two fewer).
     pub buffer_slots_per_stage: Option<usize>,
     /// The most time one unit of a kernel's work bound (language.md §18.11) takes on the
     /// machine's GPU, in femtoseconds: a dispatch's time over its bound times its invocations,
@@ -384,6 +386,8 @@ impl TargetLimits {
         storage_textures_per_stage: 32,
         varyings: 31,
         color_attachment_bytes: 64,
+        // A kernel that reaches the device's table has two fewer (`table::METAL_BLOCK`,
+        // `METAL_TABLE`).
         buffer_slots_per_stage: Some(31),
         step_femtoseconds: METAL_FS,
         step_width: 8192,

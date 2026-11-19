@@ -352,6 +352,11 @@ impl Indirect {
                 binding: e.binding,
                 visibility: e.visibility,
                 ty: crate::gpu::binding_type(e, &entry),
+                index_at: if e.table {
+                    wrela_abi::table::index_offset(&entry, e.binding)
+                } else {
+                    None
+                },
             })
             .collect();
         let layout = device.create_bind_group_layout(&entries);

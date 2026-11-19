@@ -2926,11 +2926,31 @@ fn holds_two_row_matrix(types: &ir::Types, t: ir::TypeId) -> bool {
 /// machine (Metal's argument table, through wgpu: 29): its
 /// own buffers (each shader's are its own bindings, which the other doesn't see), and the
 /// uniform block when that's in storage space and a lifted build's literals, which both see.
+///
+/// A kernel that takes a texture or a sampler reaches them through the device's table
+/// (`wrela_abi::table`), whose block and table take two of a Metal stage's buffer slots: it may
+/// bind two fewer there.
 fn check_storage_buffers(cx: &mut Cx, iface: &Interface, uniform: Option<&UniformOut>) {
-    let max = cx.data.target.limits().storage_buffers_per_stage;
+    let limits = cx.data.target.limits();
     let in_storage = uniform.is_some_and(|u| u.storage);
     let shared = usize::from(in_storage) + usize::from(crate::lift::len(cx) > 0);
     for e in 0..iface.entries.len() {
+        let kernel = matches!(cx.entry_of(iface.entries[e].func), Some(Entry::Compute(_)));
+        let tabled = kernel
+            && iface.bound.iter().any(|l| {
+                l.entry == e
+                    && matches!(
+                        l.class,
+                        ParamClass::Texture { .. }
+                            | ParamClass::MipStep { .. }
+                            | ParamClass::Sampler { .. }
+                    )
+            });
+        let max = if tabled && limits.buffer_slots_per_stage.is_some() {
+            limits.storage_buffers_per_stage - 2
+        } else {
+            limits.storage_buffers_per_stage
+        };
         // An `Append` is two buffers.
         let buffers: Vec<&Leaf> = iface
             .bound

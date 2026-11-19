@@ -720,6 +720,11 @@ fn present_pipeline(
             binding: e.binding,
             visibility: e.visibility,
             ty: binding_type(e, &entry),
+            index_at: if e.table {
+                wrela_abi::table::index_offset(&entry, e.binding)
+            } else {
+                None
+            },
         })
         .collect();
     let layout = device.create_bind_group_layout(&entries);
@@ -1246,6 +1251,7 @@ impl Builder {
                 binding: e.binding,
                 visibility: e.visibility,
                 ty: binding_type(e, p),
+                index_at: if e.table { wrela_abi::table::index_offset(p, e.binding) } else { None },
             })
             .collect();
 

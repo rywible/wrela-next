@@ -11,6 +11,11 @@
 //! submission, as wgpu's do; a render pass's draws are recorded where it ends. What wgpu decided
 //! for the host (hazards and barriers, memory, the binding model) is decided here, and said:
 //!
+//! - **The table.** Every texture view and sampler has an index in the device's one table
+//!   (`wrela_abi::table`), given when it's made. A bind group's textures and samplers that its
+//!   layout says the table holds are not bound: their indices go into a block of bytes the
+//!   group sets with its buffers (push constants, `setBytes`), and the group says what they are
+//!   for the hazards between commands (and, on Metal, their residency).
 //! - **Hazards.** Metal's resources are tracked: Metal orders what reads after what writes.
 //!   Vulkan's aren't: a tracker of each buffer's and each texture subresource's last use
 //!   inserts the barriers (and image layouts) each command needs.
@@ -367,12 +372,17 @@ impl BindingType {
 /// An entry of bind group 0's layout: the pipeline's binding number, the stages that see it, and
 /// what it is. A layout's entries come in ascending binding order: Vulkan numbers each by its
 /// place among them (`wrela_abi::vulkan::descriptor`), Metal gives each a slot of its table in
-/// each stage that sees it (`wrela_abi::metal::slots`).
+/// each stage that sees it (`wrela_abi::metal::slots`). A texture or sampler reached through the
+/// device's table (`wrela_abi::table`) takes no slot or descriptor: its index goes into the
+/// group's block at `index_at`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct LayoutEntry {
     pub binding: u32,
     pub visibility: Stages,
     pub ty: BindingType,
+    /// The byte of the block of indices that holds its index in the device's table, where the
+    /// table holds it.
+    pub index_at: Option<u32>,
 }
 
 /// What a bind group binds at one of its layout's bindings.

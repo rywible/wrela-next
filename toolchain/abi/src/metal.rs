@@ -20,6 +20,10 @@
 //!   The MSL reads it as its `_mslBufferSizes` (one member for each runtime-sized buffer, in the
 //!   module's order); the host writes each listed binding's bound
 //!   size there when it makes a bind group.
+//! - A pipeline that reaches its textures and samplers through the device's table
+//!   ([`crate::table`]) has them in its layout marked [`LayoutEntry::table`]: they take no slot,
+//!   and the stage's last two buffer slots are the table's ([`crate::table::METAL_BLOCK`],
+//!   [`crate::table::METAL_TABLE`]).
 
 use crate::manifest::{BindingKind, BindingStage, Pipeline, Stage, UniformSpace};
 
@@ -74,6 +78,8 @@ pub struct LayoutEntry {
     pub binding: u32,
     pub entry: Entry,
     pub visibility: Stages,
+    /// Reached through the device's table by its index ([`crate::table`]), not at a slot.
+    pub table: bool,
 }
 
 impl LayoutEntry {
@@ -121,6 +127,7 @@ pub enum Table {
 /// (a vertex shader doesn't write), and a storage texture only a kernel writes.
 pub fn layout(p: &Pipeline) -> Vec<LayoutEntry> {
     let compute = matches!(p.stage, Stage::Compute { .. });
+    let by_table = crate::table::by_table(p);
     let all = if compute { Stages::COMPUTE } else { Stages::VERTEX_FRAGMENT };
     let mut out = Vec::with_capacity(p.bindings.len() + 3);
     if let Some(u) = &p.uniform {
@@ -128,11 +135,12 @@ pub fn layout(p: &Pipeline) -> Vec<LayoutEntry> {
             binding: u.binding,
             entry: Entry::Uniforms { space: u.space, size: u.size },
             visibility: all,
+            table: false,
         });
     }
     if let Some(binding) = p.debug_flag {
         let visibility = if compute { all } else { Stages::FRAGMENT };
-        out.push(LayoutEntry { binding, entry: Entry::DebugFlag, visibility });
+        out.push(LayoutEntry { binding, entry: Entry::DebugFlag, visibility, table: false });
     }
     for b in &p.bindings {
         let seen = match b.stage {
@@ -145,7 +153,12 @@ pub fn layout(p: &Pipeline) -> Vec<LayoutEntry> {
             k if k.is_storage() => Stages::COMPUTE,
             _ => seen,
         };
-        out.push(LayoutEntry { binding: b.binding, entry: Entry::Binding(b.kind), visibility });
+        out.push(LayoutEntry {
+            binding: b.binding,
+            entry: Entry::Binding(b.kind),
+            visibility,
+            table: by_table && crate::table::in_table(b.kind),
+        });
     }
     if let Some(s) = &p.sizes {
         let count = s.buffers.len() as u32;
@@ -153,6 +166,7 @@ pub fn layout(p: &Pipeline) -> Vec<LayoutEntry> {
             binding: s.binding,
             entry: Entry::Sizes { count },
             visibility: all,
+            table: false,
         });
     }
     out.sort_by_key(|e| e.binding);
@@ -198,7 +212,7 @@ pub fn slots(layout: &[LayoutEntry], stage: ShaderStage) -> StageSlots {
     let mut out = StageSlots::default();
     let mut sizes = stage == ShaderStage::Vertex;
     for e in layout {
-        if !e.visibility.sees(stage) {
+        if !e.visibility.sees(stage) || e.table {
             continue;
         }
         sizes |= e.is_storage_buffer();
@@ -265,8 +279,11 @@ mod tests {
         assert_eq!(v.set_aside, Some(4));
         let f = slots(&l, ShaderStage::Fragment);
         assert_eq!(at(&f, 1), Some((Table::Buffer, 1, false)));
-        assert_eq!(at(&f, 2), Some((Table::Texture, 0, false)));
-        assert_eq!(at(&f, 3), Some((Table::Sampler, 0, false)));
+        // A texture and a sampler the device's table holds take no slot.
+        let table = crate::table::by_table(&p);
+        let slot = |s| if table { None } else { s };
+        assert_eq!(at(&f, 2), slot(Some((Table::Texture, 0, false))));
+        assert_eq!(at(&f, 3), slot(Some((Table::Sampler, 0, false))));
         assert_eq!(at(&f, 4), Some((Table::Buffer, 2, true)));
         assert_eq!(at(&f, 5), None);
         assert_eq!(at(&f, 6), Some((Table::Buffer, 3, false)));

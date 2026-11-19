@@ -1,6 +1,7 @@
 //! The Metal back end, written from the IR directly: a GPU module of [`wrela_ir`] as Metal shading
-//! language (MSL 4.0), each binding in the argument-table slot [`wrela_abi::metal`] gives it, for
-//! the host to hand the GPU as it is.
+//! language (MSL 4.0), each binding in the argument-table slot [`wrela_abi::metal`] gives it, or,
+//! a texture or sampler the device's table holds ([`wrela_abi::table`]), read from that table at
+//! its index in the block of indices: for the host to hand the GPU as it is.
 //!
 //! It computes what naga 30's MSL writer computed for the same module (`msl`, which it replaces):
 //! the same operations in the same order, with the same helpers where MSL's own operators leave a
@@ -12,6 +13,10 @@
 //!
 //! - **Buffer sizes.** Each runtime-sized buffer's bound length is read from the pipeline's own
 //!   uniform buffer ([`wrela_abi::manifest::BufferSizes`]), which the host fills.
+//! - **The table** (`constant ulong* _table [[buffer(30)]]`, the `MTLResourceID`s of every view
+//!   and sampler) is read as an array of a one-member struct of the type a resource is, at its
+//!   index in the block (`constant _Block& _blk [[buffer(29)]]`): an entry point makes each such
+//!   resource a local, and passes it on to the functions it calls as it would a bound one.
 //! - **Workgroup memory** is declared in the kernel's body, so Metal sizes it from its type.
 //! - **Conservative depth.** A fragment shader's promised depth is Metal's
 //!   `[[depth(greater)]]` or `[[depth(less)]]`.
@@ -219,6 +224,10 @@ struct Writer<'m> {
     /// Each sized buffer's member in `_mslBufferSizes`, by resource.
     size_members: HashMap<usize, String>,
     entry_names: Vec<String>,
+    /// The one-member struct each texture or sampler type is read from the device's table as,
+    /// by type; and whether the block of indices' struct is written.
+    table_types: HashMap<String, String>,
+    block_written: bool,
 }
 
 impl<'m> Writer<'m> {
@@ -265,6 +274,8 @@ impl<'m> Writer<'m> {
             runtime_arrays: HashSet::new(),
             size_members,
             entry_names: Vec::new(),
+            table_types: HashMap::new(),
+            block_written: false,
         };
         w.uses = w.resource_uses();
         Ok(w)
@@ -590,6 +601,31 @@ impl<'m> Writer<'m> {
             }
             ir::ResourceKind::Sampler { .. } => format!("metal::sampler {name}{}", at("sampler")),
         })
+    }
+
+    /// The one-member struct a texture or sampler of type `ty` is read from the table as.
+    fn table_type(&mut self, ty: &str) -> String {
+        if let Some(name) = self.table_types.get(ty) {
+            return name.clone();
+        }
+        let name = format!("_T{}", self.table_types.len());
+        let _ = writeln!(self.type_defs, "struct {name} {{\n{ty} v;\n}};");
+        self.table_types.insert(ty.to_string(), name.clone());
+        name
+    }
+
+    /// The pipeline's block of indices as a struct (`_Block`), written once: a `uint` for each
+    /// binding the device's table holds, in [`wrela_abi::table::indexed`]'s order.
+    fn block_struct(&mut self) {
+        if self.block_written {
+            return;
+        }
+        let mut members = String::new();
+        for b in wrela_abi::table::indexed(self.p) {
+            let _ = writeln!(members, "uint i{b};");
+        }
+        let _ = writeln!(self.type_defs, "struct _Block {{\n{members}}};");
+        self.block_written = true;
     }
 
     /// The type of a sized buffer of `elem`s: an array of one, named once.
@@ -960,7 +996,11 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
         let stage = Writer::stage_of(e);
         let layout = slots::layout(self.w.p);
         let st = slots::slots(&layout, stage);
-        let slots_max = wrela_abi::TargetLimits::METAL.buffer_slots_per_stage.unwrap_or(31);
+        let mut slots_max = wrela_abi::TargetLimits::METAL.buffer_slots_per_stage.unwrap_or(31);
+        if !wrela_abi::table::indexed(self.w.p).is_empty() {
+            // The block of indices and the table take the last two.
+            slots_max -= 2;
+        }
         if st.buffers() > slots_max {
             return Err(format!(
                 "internal: `{}` binds {} buffers, past Metal's {}",
@@ -1058,9 +1098,10 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
                 result = out_name;
             }
         }
-        // The resources it uses, each in its slot.
+        // The resources it uses, each in its slot, or made from the device's table.
         let used = self.w.uses[self.id.index()].clone();
         let mut workgroup = Vec::new();
+        let mut locals = String::new();
         for &r in &used {
             let res = &self.w.m.resources[r];
             match res.kind {
@@ -1069,6 +1110,21 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
                     let _ = writeln!(prelude, "{ty} {} = {{}};", self.w.resource_names[r]);
                 }
                 ir::ResourceKind::Workgroup => workgroup.push(r),
+                _ if wrela_abi::table::index_offset(self.w.p, res.binding).is_some() => {
+                    let binding = res.binding;
+                    let arg = self.w.resource_arg(r, None)?;
+                    let name = &self.w.resource_names[r];
+                    let ty = arg
+                        .strip_suffix(name.as_str())
+                        .ok_or("internal: a resource's type")?
+                        .trim_end()
+                        .to_string();
+                    let one = self.w.table_type(&ty);
+                    let _ = writeln!(
+                        locals,
+                        "{arg} = reinterpret_cast<constant {one}*>(_table)[_blk.i{binding}].v;"
+                    );
+                }
                 _ => {
                     let slot = st.of(res.binding).copied().ok_or_else(|| {
                         format!(
@@ -1099,6 +1155,18 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
                     args.push(self.w.resource_arg(r, Some(&slot))?);
                 }
             }
+        }
+        if !locals.is_empty() {
+            self.w.block_struct();
+            args.push(format!(
+                "constant _Block& _blk [[buffer({})]]",
+                wrela_abi::table::METAL_BLOCK
+            ));
+            args.push(format!(
+                "constant ulong* _table [[buffer({})]]",
+                wrela_abi::table::METAL_TABLE
+            ));
+            prelude.push_str(&locals);
         }
         if self.takes_sizes {
             let sizes =

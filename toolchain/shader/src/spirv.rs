@@ -86,6 +86,8 @@ enum TypeKey {
     /// An array of `len` (a constant's id), with a stride when laid out.
     Array(Word, Word, Option<u32>),
     RuntimeArray(Word, u32),
+    /// An array of descriptors (images or samplers) of the device's table: no stride.
+    DescriptorArray(Word),
     /// An IR struct or enum, laid out or not.
     Struct(ir::TypeId, bool),
     /// A struct of its own: a buffer's block, or a compare-exchange's result.
@@ -152,6 +154,10 @@ struct Writer<'m> {
     entry_names: Vec<String>,
     /// The structs decorated `Block`.
     blocks: BTreeSet<Word>,
+    /// The push constants' variable once declared (the block of indices), and the table's array
+    /// variables by the type of image (or sampler) they hold.
+    push: Option<Word>,
+    tables: HashMap<Word, Word>,
 }
 
 impl<'m> Writer<'m> {
@@ -189,6 +195,8 @@ impl<'m> Writer<'m> {
             uses: Vec::new(),
             entry_names: Vec::new(),
             blocks: BTreeSet::new(),
+            push: None,
+            tables: HashMap::new(),
         };
         w.glsl = w.id();
         w.capability(Capability::Shader);
@@ -277,6 +285,7 @@ impl<'m> Writer<'m> {
                 }
                 inst(Op::TypeArray, &[id, *e, *len])
             }
+            TypeKey::DescriptorArray(e) => inst(Op::TypeRuntimeArray, &[id, *e]),
             TypeKey::RuntimeArray(e, stride) => {
                 self.decorate(id, Decoration::ArrayStride, &[*stride]);
                 inst(Op::TypeRuntimeArray, &[id, *e])
@@ -563,15 +572,11 @@ impl<'m> Writer<'m> {
 
     // ---- resources ----
 
-    /// Resource `r`'s variable and storage class, declared the first time.
-    fn resource(&mut self, r: usize) -> R<(Word, StorageClass)> {
-        if let Some(v) = self.resources[r] {
-            return Ok(v);
-        }
+    /// What resource `r`'s variable points at, and its storage class (a texture or sampler of
+    /// the device's table: its element's type).
+    fn pointee(&mut self, r: usize) -> R<(Word, StorageClass)> {
         let res = &self.m.resources[r];
-        let res_name = res.name.clone();
-        let binding = res.binding;
-        let (pointee, class) = match res.kind {
+        Ok(match res.kind {
             ir::ResourceKind::Uniform { storage } => {
                 let struct_id = self.ty(res.ty, true)?;
                 if self.blocks.insert(struct_id) {
@@ -656,7 +661,26 @@ impl<'m> Writer<'m> {
             ir::ResourceKind::Sampler { .. } => {
                 (self.type_id(TypeKey::Sampler), StorageClass::UniformConstant)
             }
-        };
+        })
+    }
+
+    /// Resource `r`'s variable and storage class, declared the first time.
+    fn resource(&mut self, r: usize) -> R<(Word, StorageClass)> {
+        if let Some(v) = self.resources[r] {
+            return Ok(v);
+        }
+        let res = &self.m.resources[r];
+        let res_name = res.name.clone();
+        let binding = res.binding;
+        let (pointee, class) = self.pointee(r)?;
+        if wrela_abi::table::index_offset(self.p, binding).is_some() {
+            // Its variable is the table's array of its type; a function reaches its element.
+            let storage = matches!(res.kind, ir::ResourceKind::StorageTexture { .. });
+            let sampler = matches!(res.kind, ir::ResourceKind::Sampler { .. });
+            let var = self.table_var(pointee, storage, sampler);
+            self.resources[r] = Some((var, class));
+            return Ok((var, class));
+        }
         let ptr = self.pointer(class, pointee);
         let var = self.id();
         let init = match class {
@@ -684,6 +708,55 @@ impl<'m> Writer<'m> {
         }
         self.resources[r] = Some((var, class));
         Ok((var, class))
+    }
+
+    /// The table's array variable holding images (or samplers) of type `t`, declared the first
+    /// time: in the table's set at the binding of its kind ([`wrela_abi::table`]), aliasing every
+    /// other of that kind.
+    fn table_var(&mut self, t: Word, storage: bool, sampler: bool) -> Word {
+        if let Some(&v) = self.tables.get(&t) {
+            return v;
+        }
+        self.capability(Capability::RuntimeDescriptorArray);
+        let array = self.type_id(TypeKey::DescriptorArray(t));
+        let ptr = self.pointer(StorageClass::UniformConstant, array);
+        let var = self.id();
+        self.globals.extend(inst(Op::Variable, &[ptr, var, StorageClass::UniformConstant as u32]));
+        let binding = if sampler {
+            wrela_abi::table::SAMPLERS
+        } else if storage {
+            wrela_abi::table::STORAGE
+        } else {
+            wrela_abi::table::SAMPLED
+        };
+        self.name(var, &format!("table{binding}_{t}"));
+        self.decorate(var, Decoration::DescriptorSet, &[wrela_abi::table::TABLE_SET]);
+        self.decorate(var, Decoration::Binding, &[binding]);
+        if storage {
+            self.decorate(var, Decoration::NonReadable, &[]);
+        }
+        self.tables.insert(t, var);
+        var
+    }
+
+    /// The push constants' variable, the block of indices, declared the first time: a `u32`
+    /// for each binding the table holds, at its offset ([`wrela_abi::table::indexed`]).
+    fn push(&mut self) -> Word {
+        if let Some(v) = self.push {
+            return v;
+        }
+        let u = self.u32_ty();
+        let n = wrela_abi::table::indexed(self.p).len();
+        let members = vec![u; n];
+        let offsets: Vec<u32> = (0..n as u32).map(|k| 4 * k).collect();
+        let block = self.wrapper("indices", &members, Some(&offsets));
+        self.decorate(block, Decoration::Block, &[]);
+        let ptr = self.pointer(StorageClass::PushConstant, block);
+        let var = self.id();
+        self.globals.extend(inst(Op::Variable, &[ptr, var, StorageClass::PushConstant as u32]));
+        self.name(var, "indices");
+        self.push = Some(var);
+        var
     }
 
     // ---- the module ----
@@ -846,6 +919,9 @@ struct FunctionWriter<'a, 'm> {
     consts: HashMap<ir::ValueId, i64>,
     /// The variable each table is stored into before a read.
     table_vars: HashMap<ir::DataId, Word>,
+    /// Each texture or sampler of the device's table it reaches: a pointer to its element, made
+    /// at its top.
+    elements: HashMap<usize, Word>,
 }
 
 impl<'a, 'm> FunctionWriter<'a, 'm> {
@@ -877,6 +953,7 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
             interface: BTreeSet::new(),
             consts: HashMap::new(),
             table_vars: HashMap::new(),
+            elements: HashMap::new(),
         };
         let fid = fw.w.function_ids[id.index()];
         let mut head = Vec::new();
@@ -914,10 +991,25 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
             let var = fw.var(t);
             fw.locals.push(var);
         }
-        // The resources it reaches are its interface.
+        // The resources it reaches are its interface; one of the device's table is its element
+        // there, at the index the push constants give.
         for r in fw.w.uses[id.index()].clone() {
             let (var, _) = fw.w.resource(r)?;
             fw.interface.insert(var);
+            let binding = fw.w.m.resources[r].binding;
+            if let Some(at) = wrela_abi::table::index_offset(fw.w.p, binding) {
+                let push = fw.w.push();
+                fw.interface.insert(push);
+                let u = fw.w.u32_ty();
+                let pu = fw.w.pointer(StorageClass::PushConstant, u);
+                let k = fw.w.const_u32(at / 4);
+                let ptr = fw.op(Op::AccessChain, pu, &[push, k]);
+                let index = fw.op(Op::Load, u, &[ptr]);
+                let (t, _) = fw.w.pointee(r)?;
+                let pt = fw.w.pointer(StorageClass::UniformConstant, t);
+                let element = fw.op(Op::AccessChain, pt, &[var, index]);
+                fw.elements.insert(r, element);
+            }
         }
         if let Some(e) = entry {
             fw.entry_prologue(e)?;
@@ -2515,9 +2607,18 @@ impl FunctionWriter<'_, '_> {
         })
     }
 
+    /// Texture or sampler `r`'s variable: its element of the device's table where the table
+    /// holds it.
+    fn texture_var(&mut self, r: usize) -> R<Word> {
+        if let Some(&e) = self.elements.get(&r) {
+            return Ok(e);
+        }
+        Ok(self.w.resource(r)?.0)
+    }
+
     /// A texture's image, loaded from its variable, and its type.
     fn image(&mut self, tex: ir::ResourceId) -> R<(Word, Word)> {
-        let (var, _) = self.w.resource(tex.index())?;
+        let var = self.texture_var(tex.index())?;
         let res = &self.w.m.resources[tex.index()];
         let ty = match res.kind {
             ir::ResourceKind::Texture { depth, dim, format } => {
@@ -2576,7 +2677,7 @@ impl FunctionWriter<'_, '_> {
             | T::Gather(_)
             | T::GatherCompare => {
                 let s = sampler.ok_or("internal: sampling without a sampler")?;
-                let (svar, _) = self.w.resource(s.index())?;
+                let svar = self.texture_var(s.index())?;
                 let sampler_ty = self.w.type_id(TypeKey::Sampler);
                 let smp = self.op(Op::Load, sampler_ty, &[svar]);
                 let si_ty = self.w.type_id(TypeKey::SampledImage(image_ty));
@@ -2692,7 +2793,7 @@ impl FunctionWriter<'_, '_> {
     /// A texel's write (`ir::Expr::TextureStore`).
     fn texture_store(&mut self, tex: ir::ResourceId, args: &[ir::ValueId]) -> R<()> {
         let m = self.w.m;
-        let (var, _) = self.w.resource(tex.index())?;
+        let var = self.texture_var(tex.index())?;
         let (dim, format) = match m.resources[tex.index()].kind {
             ir::ResourceKind::StorageTexture { dim, format } => (dim, format),
             _ => {

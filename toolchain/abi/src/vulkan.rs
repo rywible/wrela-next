@@ -13,9 +13,11 @@
 use crate::manifest::Pipeline;
 
 /// Set 0's binding in Vulkan of the pipeline's binding `binding`: its place among the bindings
-/// of the pipeline's layout, in ascending order. `None` if the layout has no such binding.
+/// of the pipeline's layout that aren't in the device's table ([`crate::table`]), in ascending
+/// order. `None` if the layout has no such binding, or the table holds it.
 pub fn descriptor(p: &Pipeline, binding: u32) -> Option<u32> {
-    let at = crate::metal::layout(p).iter().position(|e| e.binding == binding)?;
+    let at =
+        crate::metal::layout(p).iter().filter(|e| !e.table).position(|e| e.binding == binding)?;
     u32::try_from(at).ok()
 }
 
