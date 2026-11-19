@@ -432,3 +432,14 @@ fn calls_with_few_varying_numbers_are_listed_for_tables() {
     let built = wrela_driver::check(&dir);
     assert!(built.pipelines.iter().all(|p| p.few.iter().all(|c| c.is_empty())));
 }
+
+/// The engine's shape of asking a smooth fold where a ray meets it (toolchain/tests/met_grown): a
+/// generic thing's `meets_grown`, under a branch on its const way, grown by a width the ray's own,
+/// from a pixel program's loop, builds shipped, with no E0712 in std's code. Its build at 0eb05c0
+/// reported two (`fold_lowering`'s loop over a parameter), as the engine's tree did.
+#[test]
+fn the_engines_ask_of_a_smooth_fold_builds_shipped() {
+    let dir = scratch("same_met_grown");
+    write_package(&dir, "met_grown", include_str!("../../met_grown/main.wrela"));
+    assert_eq!(e0712(&dir), Vec::<String>::new());
+}
