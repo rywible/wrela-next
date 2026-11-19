@@ -563,9 +563,24 @@ impl<'m> Writer<'m> {
             }
             (ir::TypeDef::Struct { fields, .. }, ir::ConstValue::Parts(parts)) => {
                 let ty = self.ty(t)?;
+                let packed = self.structs.get(&t).map(|d| d.packed.clone()).unwrap_or_default();
                 let mut values = Vec::new();
-                for ((_, ft), p) in fields.iter().zip(parts) {
-                    values.push(self.const_value(*ft, p)?);
+                for (k, ((_, ft), p)) in fields.iter().zip(parts).enumerate() {
+                    let v = self.const_value(*ft, p)?;
+                    // A packed member is given its own type: a vector converted to it is a
+                    // constructor Metal runs at program start, which it refuses
+                    // ("cannot have global constructors") where the optimizer doesn't fold it.
+                    let v = match (packed.contains(&k), m.types.get(*ft)) {
+                        (true, ir::TypeDef::Vector(sc, 3)) => {
+                            let vector = self.ty(*ft)?;
+                            let args = v
+                                .strip_prefix(vector.as_str())
+                                .ok_or("internal: a packed member's value isn't its vector's")?;
+                            format!("metal::packed_{}3{args}", scalar_name(*sc)?)
+                        }
+                        _ => v,
+                    };
+                    values.push(v);
                 }
                 Ok(format!("{ty} {}", self.braced(t, &values)))
             }

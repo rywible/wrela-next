@@ -1,0 +1,198 @@
+// A pass that keeps, per pixel, the least of a number every fragment drawn there offers: a sixth
+// colour target beside five as the engine's eye pass has them (two `Rgba32Float`s, three
+// `Rgba16Float`s: 56 of Metal's 64 attachment bytes a sample, 60 with an `R32Float`), blended
+// with `Blend::Min` while the five replace. Four rectangles at four depths each offer a number;
+// with a depth target, a fragment the depth test rejects offers nothing (one behind the first
+// offers the smallest, and must not count); without one, every fragment counts. In `R32Float`
+// and in `R16Float` (whose numbers here are exact in half). The tests read every pixel, on both
+// hosts.
+use std::collections::Vec
+use std::gpu::{
+    Blend, ClipPosition, DepthTexture, GlobalId, GpuBuffer, R16Float, R32Float, Rgba16Float, Rgba32Float, Slots,
+    Targets6, Texture, VertexIndex, begin_pass6, begin_pass6_with_depth, buffer, depth_texture, dispatch, draw, read,
+    texture,
+}
+use std::io::Pending
+
+const SIDE: u32 = 16
+
+/// The rectangles, in the target's 0..1 (x0, y0, x1, y1), each drawn at its depth offering its
+/// number, in this order.
+const RECTS: [vec4; 4] = [vec4(0.0, 0.0, 1.0, 1.0), vec4(0.0, 0.0, 0.5, 1.0), vec4(0.0, 0.0, 1.0, 0.5), vec4(0.25, 0.25, 0.75, 0.75)]
+/// The first covers all at 0.5; the second nearer (kept); the third behind the first (rejected
+/// with a depth target) offers the least; the fourth nearest.
+const DEPTHS: [f32; 4] = [0.5, 0.3, 0.7, 0.2]
+const OFFERS: [f32; 4] = [5.0, 7.0, 1.0, 2.0]
+
+@vertex
+fn rect(r: vec4, z: f32, v: VertexIndex) -> ClipPosition {
+    // Two triangles: corners 0 1 2, 2 1 3.
+    let k = if v.index < 3 { v.index } else { [2, 1, 3][v.index - 3] }
+    let x = if (k & 1) == 0 { r.x } else { r.z }
+    let y = if (k & 2) == 0 { r.y } else { r.w }
+    ClipPosition { position: vec4(x * 2.0 - 1.0, 1.0 - y * 2.0, z, 1.0) }
+}
+
+@fragment
+fn offered(n: f32) -> Targets6<vec4, vec4, vec4, vec4, vec4, f32> {
+    Targets6 { first: vec4(n), second: vec4(n), third: vec4(n), fourth: vec4(n), fifth: vec4(n), sixth: n }
+}
+
+/// The least each pixel should hold, depth tested or not.
+fn least_at(x: u32, y: u32, depth: bool) -> f32 {
+    let p = vec2((f32(x) + 0.5) / f32(SIDE), (f32(y) + 0.5) / f32(SIDE))
+    var nearest = 1.0
+    var least = 1.0e9
+    for k in 0..4 {
+        let r = RECTS[k]
+        if p.x >= r.x && p.x < r.z && p.y >= r.y && p.y < r.w {
+            if !depth || DEPTHS[k] < nearest {
+                least = min(least, OFFERS[k])
+                nearest = if depth { DEPTHS[k] } else { nearest }
+            }
+        }
+    }
+    least
+}
+
+/// A target's texels into a buffer to be read.
+@compute(64)
+fn copied32(t: Texture<R32Float>, out: mut Slots<f32>, id: GlobalId) {
+    if id.x >= SIDE * SIDE {
+        return
+    }
+    out[id] = t.load(id.x % SIDE, id.x / SIDE)
+}
+
+@compute(64)
+fn copied16(t: Texture<R16Float>, out: mut Slots<f32>, id: GlobalId) {
+    if id.x >= SIDE * SIDE {
+        return
+    }
+    out[id] = t.load(id.x % SIDE, id.x / SIDE)
+}
+
+pub struct State {
+    frame: u32,
+    place: Texture<Rgba32Float>,
+    asks: Texture<Rgba32Float>,
+    lit: Texture<Rgba16Float>,
+    open: Texture<Rgba16Float>,
+    emits: Texture<Rgba16Float>,
+    depth: DepthTexture,
+    least32: Texture<R32Float>,
+    least16: Texture<R16Float>,
+    pending: Vec<Pending<f32>>,
+    seen: Vec<Vec<f32>>,
+}
+
+fn sq<F: std::gpu::Format>() -> Texture<F> {
+    texture(width: SIDE, height: SIDE)
+}
+
+pub fn init() -> State {
+    State {
+        frame: 0,
+        place: sq(),
+        asks: sq(),
+        lit: sq(),
+        open: sq(),
+        emits: sq(),
+        depth: depth_texture(width: SIDE, height: SIDE),
+        least32: sq(),
+        least16: sq(),
+        pending: Vec::new(),
+        seen: Vec::new(),
+    }
+}
+
+/// The least of what's drawn, into `R32Float` then `R16Float`, with a depth target (`depth`) or
+/// without; each read back.
+fn record(s: mut State, depth: bool) {
+    for half in [false, true] {
+        let cleared = vec4(1.0e9)
+        if depth && !half {
+            let p = begin_pass6_with_depth(mut s.place, mut s.asks, mut s.lit, mut s.open, mut s.emits, mut s.least32, mut s.depth, clear: cleared)
+            for k in 0..4 {
+                draw(p, rect.bind(r: RECTS[k], z: DEPTHS[k]), offered.bind(n: OFFERS[k]), vertices: 6, blends: [Blend::Replace, Blend::Replace, Blend::Replace, Blend::Replace, Blend::Replace, Blend::Min])
+            }
+            p.end()
+        } else if depth {
+            let p = begin_pass6_with_depth(mut s.place, mut s.asks, mut s.lit, mut s.open, mut s.emits, mut s.least16, mut s.depth, clear: vec4(60000.0))
+            for k in 0..4 {
+                draw(p, rect.bind(r: RECTS[k], z: DEPTHS[k]), offered.bind(n: OFFERS[k]), vertices: 6, blends: [Blend::Replace, Blend::Replace, Blend::Replace, Blend::Replace, Blend::Replace, Blend::Min])
+            }
+            p.end()
+        } else if !half {
+            let p = begin_pass6(mut s.place, mut s.asks, mut s.lit, mut s.open, mut s.emits, mut s.least32, clear: cleared)
+            for k in 0..4 {
+                draw(p, rect.bind(r: RECTS[k], z: DEPTHS[k]), offered.bind(n: OFFERS[k]), vertices: 6, blends: [Blend::Replace, Blend::Replace, Blend::Replace, Blend::Replace, Blend::Replace, Blend::Min])
+            }
+            p.end()
+        } else {
+            let p = begin_pass6(mut s.place, mut s.asks, mut s.lit, mut s.open, mut s.emits, mut s.least16, clear: vec4(60000.0))
+            for k in 0..4 {
+                draw(p, rect.bind(r: RECTS[k], z: DEPTHS[k]), offered.bind(n: OFFERS[k]), vertices: 6, blends: [Blend::Replace, Blend::Replace, Blend::Replace, Blend::Replace, Blend::Replace, Blend::Min])
+            }
+            p.end()
+        }
+        var out: GpuBuffer<f32> = buffer(SIDE * SIDE)
+        if half {
+            dispatch(copied16.bind(t: s.least16, out: mut out), over: SIDE * SIDE)
+        } else {
+            dispatch(copied32.bind(t: s.least32, out: mut out), over: SIDE * SIDE)
+        }
+        s.pending.push(read(out.items()))
+    }
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    if s.frame == 0 {
+        record(mut s, depth: true)
+        record(mut s, depth: false)
+    }
+    for i in 0..s.pending.len() {
+        if s.seen.len() == i {
+            if let Some(Ok(v)) = s.pending[i].poll() {
+                s.seen.push(take v)
+            }
+        }
+    }
+    s.frame += 1
+}
+
+/// Read back `which` (0 R32Float depth tested, 1 R16Float depth tested, 2 R32Float untested,
+/// 3 R16Float untested): every pixel the least of what was drawn there and kept.
+fn holds_the_least(s: State, which: u32) {
+    assert(s.seen.len() == 4)
+    let depth = which < 2
+    for y in 0..SIDE {
+        for x in 0..SIDE {
+            let got = s.seen[which][y * SIDE + x]
+            let want = least_at(x, y, depth)
+            assert(got == want, f"pixel ({x}, {y}): {got}, not {want}")
+        }
+    }
+}
+
+/// With a depth target: what the test rejects offers nothing (the third rectangle's 1 is nowhere).
+@test(frames: 4, gpu: true, hosts: both)
+fn the_least_of_what_the_depth_test_keeps_in_r32float(s: State) {
+    holds_the_least(s, 0)
+}
+
+@test(frames: 4, gpu: true, hosts: both)
+fn the_least_of_what_the_depth_test_keeps_in_r16float(s: State) {
+    holds_the_least(s, 1)
+}
+
+/// Without one: every fragment offers.
+@test(frames: 4, gpu: true, hosts: both)
+fn the_least_of_every_fragment_in_r32float(s: State) {
+    holds_the_least(s, 2)
+}
+
+@test(frames: 4, gpu: true, hosts: both)
+fn the_least_of_every_fragment_in_r16float(s: State) {
+    holds_the_least(s, 3)
+}

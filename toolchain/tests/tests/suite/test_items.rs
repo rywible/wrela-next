@@ -865,6 +865,28 @@ fn a_kernel_writes_a_half_texture_that_filters_in_3d() {
     assert_eq!(crate::tests_pass(&dir), 2);
 }
 
+/// A table of 17 round cones (a 3-vector packed among its members) built in GPU code and read at
+/// a run-time index, in a kernel and in a fragment (toolchain/tests/table_vec3): every member
+/// reads back to the bit on both hosts. Metal refused it while a packed member's constant was a
+/// vector converted (a global constructor).
+#[test]
+#[ignore = "needs a GPU"]
+fn a_table_of_packed_structs_reads_back_in_gpu_code() {
+    let dir = wrela_tests::repo_root().join("toolchain/tests/table_vec3");
+    assert_eq!(crate::tests_pass(&dir), 2);
+}
+
+/// The least of a number each fragment offers, kept per pixel by a sixth colour target blended
+/// with `Blend::Min` beside the engine eye pass's five (toolchain/tests/least, item I): every
+/// pixel holds the least of what was drawn there and kept, with a depth target (what its test
+/// rejects offers nothing) and without, in `R32Float` and `R16Float`, on both hosts.
+#[test]
+#[ignore = "needs a GPU"]
+fn a_sixth_target_keeps_the_least_each_fragment_offers() {
+    let dir = wrela_tests::repo_root().join("toolchain/tests/least");
+    assert_eq!(crate::tests_pass(&dir), 4);
+}
+
 /// A kind's things in GPU code (toolchain/tests/kinds, gap 29): a group built in a kernel from a
 /// thing's field read in place and a run of a shared buffer (`GpuSpan::sub`), passed to generic
 /// functions and a run of the run passed on, reads what the direct reads do, to the bit, on both

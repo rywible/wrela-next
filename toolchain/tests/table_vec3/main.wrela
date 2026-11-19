@@ -1,0 +1,144 @@
+// A table of structs with 3-vectors packed among them (std's round cone: `b` packs against the
+// radii), built in GPU code and read at a run-time index, in a kernel and in a fragment: the
+// shader holds it as a constant at program scope. Metal refused a render pipeline whose table's
+// packed member was written as a vector's constructor (a global constructor, which its compiler
+// from source won't build); the tests read every member back, on both hosts.
+use std::collections::Vec
+use std::field::{RoundCone, round_cone}
+use std::gpu::{
+    ClipPosition, FragCoord, GlobalId, GpuBuffer, R32Float, Slots, Texture, VertexIndex, begin_pass, buffer,
+    dispatch, draw, read, texture,
+}
+use std::io::Pending
+
+const N: u32 = 17
+
+/// Seventeen round cones (the creature's count: a table this long Metal didn't fold), every
+/// member distinct.
+fn cones() -> [RoundCone; 17] {
+    [
+        round_cone(vec3(-7.00, -6.75, -6.50), vec3(-6.25, -6.00, -5.75), r_top: 0.500, r_bottom: 0.2500),
+        round_cone(vec3(-5.00, -4.75, -4.50), vec3(-4.25, -4.00, -3.75), r_top: 0.625, r_bottom: 0.3125),
+        round_cone(vec3(-3.00, -2.75, -2.50), vec3(-2.25, -2.00, -1.75), r_top: 0.750, r_bottom: 0.3750),
+        round_cone(vec3(-1.00, -0.75, -0.50), vec3(-0.25, 0.00, 0.25), r_top: 0.875, r_bottom: 0.4375),
+        round_cone(vec3(1.00, 1.25, 1.50), vec3(1.75, 2.00, 2.25), r_top: 1.000, r_bottom: 0.5000),
+        round_cone(vec3(3.00, 3.25, 3.50), vec3(3.75, 4.00, 4.25), r_top: 1.125, r_bottom: 0.5625),
+        round_cone(vec3(5.00, 5.25, 5.50), vec3(5.75, 6.00, 6.25), r_top: 1.250, r_bottom: 0.6250),
+        round_cone(vec3(7.00, 7.25, 7.50), vec3(7.75, 8.00, 8.25), r_top: 1.375, r_bottom: 0.6875),
+        round_cone(vec3(9.00, 9.25, 9.50), vec3(9.75, 10.00, 10.25), r_top: 1.500, r_bottom: 0.7500),
+        round_cone(vec3(11.00, 11.25, 11.50), vec3(11.75, 12.00, 12.25), r_top: 1.625, r_bottom: 0.8125),
+        round_cone(vec3(13.00, 13.25, 13.50), vec3(13.75, 14.00, 14.25), r_top: 1.750, r_bottom: 0.8750),
+        round_cone(vec3(15.00, 15.25, 15.50), vec3(15.75, 16.00, 16.25), r_top: 1.875, r_bottom: 0.9375),
+        round_cone(vec3(17.00, 17.25, 17.50), vec3(17.75, 18.00, 18.25), r_top: 2.000, r_bottom: 1.0000),
+        round_cone(vec3(19.00, 19.25, 19.50), vec3(19.75, 20.00, 20.25), r_top: 2.125, r_bottom: 1.0625),
+        round_cone(vec3(21.00, 21.25, 21.50), vec3(21.75, 22.00, 22.25), r_top: 2.250, r_bottom: 1.1250),
+        round_cone(vec3(23.00, 23.25, 23.50), vec3(23.75, 24.00, 24.25), r_top: 2.375, r_bottom: 1.1875),
+        round_cone(vec3(25.00, 25.25, 25.50), vec3(25.75, 26.00, 26.25), r_top: 2.500, r_bottom: 1.2500),
+    ]
+}
+
+/// Cone `i`'s members, eight floats a cone, read from the table at a run-time index.
+@compute(64)
+fn members(n: u32, out: mut Slots<f32>, id: GlobalId) {
+    if id.x >= n * 8 {
+        return
+    }
+    let c = cones()[(id.x / 8) % N]
+    let k = id.x % 8
+    out[id] = if k == 0 { c.a.x } else if k == 1 { c.a.y } else if k == 2 { c.a.z } else if k == 3 { c.b.x } else if k == 4 { c.b.y } else if k == 5 { c.b.z } else if k == 6 { c.r1 } else { c.r2 }
+}
+
+/// Cone `x / 8`'s member `x % 8` (a pixel's column), read in a fragment.
+fn member(x: u32) -> f32 {
+    let c = cones()[(x / 8) % N]
+    let k = x % 8
+    if k == 0 { c.a.x } else if k == 1 { c.a.y } else if k == 2 { c.a.z } else if k == 3 { c.b.x } else if k == 4 { c.b.y } else if k == 5 { c.b.z } else if k == 6 { c.r1 } else { c.r2 }
+}
+
+@vertex
+fn cover(v: VertexIndex) -> ClipPosition {
+    let x = f32((v.index << 1) & 2) * 2.0 - 1.0
+    let y = f32(v.index & 2) * 2.0 - 1.0
+    ClipPosition { position: vec4(x, y, 0.5, 1.0) }
+}
+
+@fragment
+fn drawn(pixel: FragCoord) -> f32 {
+    member(u32(pixel.position.x))
+}
+
+/// The drawn row, copied into a buffer to be read.
+@compute(64)
+fn copied(t: Texture<R32Float>, n: u32, out: mut Slots<f32>, id: GlobalId) {
+    if id.x >= n * 8 {
+        return
+    }
+    out[id] = t.load(id.x, 0)
+}
+
+pub struct State {
+    frame: u32,
+    out: GpuBuffer<f32>,
+    row: Texture<R32Float>,
+    drawn_out: GpuBuffer<f32>,
+    pending: Vec<Pending<f32>>,
+    seen: Vec<Vec<f32>>,
+}
+
+pub fn init() -> State {
+    State {
+        frame: 0,
+        out: buffer(N * 8),
+        row: texture(width: N * 8, height: 1),
+        drawn_out: buffer(N * 8),
+        pending: Vec::new(),
+        seen: Vec::new(),
+    }
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    if s.frame == 0 {
+        dispatch(members.bind(n: N, out: mut s.out), over: N * 8)
+        s.pending.push(read(s.out.items()))
+        let p = begin_pass(mut s.row, clear: vec4(0.0))
+        draw(p, cover, drawn, vertices: 3)
+        p.end()
+        dispatch(copied.bind(t: s.row, n: N, out: mut s.drawn_out), over: N * 8)
+        s.pending.push(read(s.drawn_out.items()))
+    }
+    for i in 0..s.pending.len() {
+        if s.seen.len() == i {
+            if let Some(Ok(v)) = s.pending[i].poll() {
+                s.seen.push(take v)
+            }
+        }
+    }
+    s.frame += 1
+}
+
+/// Every member of every cone as the CPU's table holds it, to the bit, in what `which` read
+/// (0 the kernel, 1 the fragment).
+fn read_back(s: State, which: u32) {
+    assert(s.seen.len() == 2)
+    let cs = cones()
+    for i in 0..N {
+        let c = cs[i]
+        let want = [c.a.x, c.a.y, c.a.z, c.b.x, c.b.y, c.b.z, c.r1, c.r2]
+        for k in 0..8 {
+            let got = s.seen[which][i * 8 + k]
+            assert(got == want[k], f"cone {i} member {k}: {got}, not {want[k]}")
+        }
+    }
+}
+
+/// Read in a kernel.
+@test(frames: 4, gpu: true, hosts: both)
+fn a_table_of_packed_structs_reads_back_in_a_kernel(s: State) {
+    read_back(s, 0)
+}
+
+/// Read in a fragment: a render pipeline holding the table (what Metal refused).
+@test(frames: 4, gpu: true, hosts: both)
+fn a_table_of_packed_structs_reads_back_in_a_fragment(s: State) {
+    read_back(s, 1)
+}

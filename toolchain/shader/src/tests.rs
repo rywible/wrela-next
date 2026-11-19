@@ -214,6 +214,42 @@ fn a_vec3_followed_by_a_member_is_packed() {
     assert!(msl.contains("metal::float3 m2_normal;"), "{msl}");
 }
 
+/// A table of structs with a packed 3-vector member: the member's constant is written as its own
+/// packed type, not converted from a vector (a constructor Metal runs at program start, which its
+/// compiler from source refuses where it isn't folded: toolchain/tests/table_vec3).
+#[test]
+fn a_tables_packed_member_is_written_as_its_packed_type() {
+    let mut b = Builder::new();
+    let f = b.scalar(Scalar::F32);
+    let v3 = b.vector(Scalar::F32, 3);
+    let cone = b.structure("Cone", &[("a", v3), ("b", v3), ("r", f), ("s", f)]);
+    let pair = b.array(cone, 2);
+    let num = |x: f32| ir::ConstValue::Scalar(ir::Const::F32(x));
+    let vec = |x: f32| ir::ConstValue::Parts(vec![num(x), num(x + 1.0), num(x + 2.0)]);
+    let one =
+        |x: f32| ir::ConstValue::Parts(vec![vec(x), vec(x + 3.0), num(x + 6.0), num(x + 7.0)]);
+    b.m.data.push(ir::Data {
+        name: "cones".into(),
+        ty: pair,
+        value: ir::ConstValue::Parts(vec![one(0.0), one(8.0)]),
+    });
+    let out = b.storage("out", 0, v3, true);
+    b.compute("k", [1, 1, 1], &[], |fb| {
+        let zero = fb.u32(0);
+        let place = ir::Place::root(ir::PlaceRoot::Data(ir::DataId(0)))
+            .with(ir::Proj::Index(zero))
+            .with(ir::Proj::Field(1));
+        let v = fb.load(v3, place);
+        fb.store(Builder::element(out, zero), v);
+    });
+    let (msl, ..) = written(&b.m, &compute_pipeline(vec![rw(0)], None), Checks::CHECKED);
+    assert!(msl.contains("metal::packed_float3 m1_b;"), "{msl}");
+    assert!(
+        msl.contains("metal::float3(0.0, 1.0, 2.0), metal::packed_float3(3.0, 4.0, 5.0)"),
+        "{msl}"
+    );
+}
+
 /// A kernel's workgroup memory: declared in its body, zeroed by its first invocation before a
 /// barrier; and a workgroup variable in SPIR-V.
 #[test]
