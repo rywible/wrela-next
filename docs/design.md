@@ -542,8 +542,34 @@ none changes what an author writes; each has its kill line; the build that measu
    rebuilt at calls; a union's code written three times). How far the whole is from what a
    person would write by hand for one march is not known. It is one afternoon to find out.
 
+8. **Let the hardware read the cells.** Cells are words in a buffer: an ask is eight loads, their
+   unpacking and seven mixes in our own code, and each word carries a facing that a marching ray
+   throws away. Kept in a 3D texture of distances alone and read with the hardware's own filter,
+   an ask is one read, and the cells take half the memory; the facing is found once, at the hit,
+   from the distances round it. (The spike read filtered textures; the engine went to a buffer
+   when it needed a tree and lost this.) **Dead if** an ask is not at least 1.5 times cheaper on
+   the M4, or the audit's count of hits off by a pixel rises (the hardware's filter weighs with
+   few bits).
+9. **Write less a pixel.** The picture keeps five full-screen targets, about 60 bytes a pixel,
+   one of them a place in 32-bit floats that the depth already says. Measure what the targets
+   cost before changing them; then fewer and smaller, and on hardware that works a tile at a
+   time, kept in the tile and never written out. **Dead if** the targets are under a tenth of
+   the frame.
+
+An outside audit of the engine and toolchain (2026-11-18, another agent, at Ryan's asking)
+reached 1, 2, 4, 6 and 7 on its own and added 8, 9 and a stronger form of 1: where a brick
+straddles the surface, take a small mesh of the surface out of its cells once, draw that, and
+let each pixel finish with one step against the cells or the field. It draws less than a brick's
+box and marches almost nothing; it also cracks where bricks of two sizes meet and loses what is
+thinner than a cell, as cells do. So boxes first, which cannot crack; the mesh is a further way
+for the build that measures to try. For edges it adds: one ray that passes within half its width
+of a surface takes that surface's share of the pixel and goes on to what is behind, which is two
+layers from one ray; that belongs with 2 in the edges slice.
+
 Light kept on cells (slice 2) already removes the shadow ray a pixel, which is a fifth of the
-frame today.
+frame today. The stand-in draws the sun's shadow once for every thing over the whole screen,
+which cannot stand for a world of many things: how light's rays find matter (the roots of every
+thing in one structure; hardware that follows rays, 6) is slice 2's first question.
 
 ## Open risks
 
