@@ -541,6 +541,21 @@ width with no edge shadow rays, which are most of what edges cost at scale. **De
 against nine rays any measure is worse by more than its spread, or edge work at 64 bodies is not
 at least halved; said plainly either way.
 
+*A, measured (2026-11-19): dead as built, and it showed where it is right.* Where one
+near-straight outline crosses the pixel the closed-form cover beats nine rays: edge error 3.9
+against 5.1 on the stage with a creature, 4.1 to 4.3 against 4.7 to 5.9 up close. It lost
+everywhere that is not true: far away (5.9 to 6.3 against 5.2 to 5.8), where a limb is a curve
+of about a pixel's radius and a straight edge covers too much (0.845 against 0.788); where a
+second outline lies within a pixel or two; and beside a smooth join, whose pass is known only
+from one side. It also cost more, not less: finding g inside a thing took 25 asks a pixel, and
+a pixel that took one look still held nine rays' places. The second half of its line (edge work
+at 64 halved) was an amount, so a target and not a kill line, by this design's own rule. The
+form that follows from the measurement: g from the toolchain in closed form on both sides; one
+look only where g is a plane across the pixel's neighbours to a stated bound (one test in place
+of thin, crease and curved), nine rays everywhere else; one place for a pixel that takes one
+look. It is built only if, on the pixels that pass that test, one look is no worse than nine
+rays on every view.
+
 **B. Solve for the surface in a cell; do not step toward it.** Cells are read by mixing eight
 values, and a ray through that mix is a cubic in the distance along it: its zero is found
 outright, with a bracket that cannot miss. So inside cells nothing steps by a value, the value
