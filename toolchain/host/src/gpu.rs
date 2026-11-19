@@ -593,8 +593,41 @@ impl Behind {
     }
 }
 
+/// The most work one submission may hold, by what bounds it: past either, what's recorded is
+/// submitted first (`Gpu::room`). A submission is one job to the GPU's driver, and a driver
+/// resets a GPU whose job runs too long (amdgpu: 10 s; a Metal command buffer of seconds hung
+/// the M4's display twice): the step guard (`crate::step`) bounds each dispatch, these bound
+/// the job. On 2026-11-19 a frame of 4,500 dispatches of a 512-step march (the engine's hole
+/// audit, 640x360), each well within the guard, made one job of seconds on the Radeon once the
+/// uniform ring stopped splitting frames (4f7fb1b), and amdgpu reset the GPU four times.
+///
+/// The guard's bounds of the dispatches queued, summed (ms): two steps' worth.
+const SUBMIT_BOUND_MS: f64 = 2.0 * crate::step::STEP_MS;
+/// The dispatches and passes queued: a pass has no bound the host knows, and by AGENTS.md's
+/// rule each holds the GPU at most about a step (50 ms), so 64 of them about 3 s at most.
+const SUBMIT_COMMANDS: u32 = 64;
+
+/// What the submission being recorded holds (`SUBMIT_BOUND_MS`, `SUBMIT_COMMANDS`).
+#[derive(Clone, Copy, Debug, Default)]
+struct Queued {
+    commands: u32,
+    bound_ms: f64,
+}
+
+impl Queued {
+    /// Whether one more dispatch (its guard bound `ms`) or pass (0) would take it past either:
+    /// never one with nothing in it (a dispatch alone is the guard's to refuse).
+    fn full(self, ms: f64) -> bool {
+        self.commands > 0
+            && (self.commands >= SUBMIT_COMMANDS || self.bound_ms + ms > SUBMIT_BOUND_MS)
+    }
+}
+
 pub(crate) struct Gpu {
     counters: Counters,
+    /// What the submission being recorded holds, and how many submissions have been made.
+    queued: Queued,
+    submissions: u64,
     device: wrela_gpu::Device,
     limits: wrela_gpu::Limits,
     align: u64,
@@ -994,6 +1027,8 @@ impl Gpu {
         let timer = timestamps.then(|| Timer::new(&device, timing == Timing::Serial, true));
         let mut gpu = Gpu {
             counters: Counters::default(),
+            queued: Queued::default(),
+            submissions: 0,
             device,
             limits,
             align,
@@ -1916,7 +1951,15 @@ impl Gpu {
     /// Submits everything recorded so far, after writing its uniform bytes (a pass that ended
     /// and waits is recorded first).
     pub(crate) fn flush(&mut self) -> Result<()> {
+        self.submit(true)
+    }
+
+    /// [`Gpu::flush`]; with `collect` false, a timed run's timestamps wait for the next flush
+    /// that collects (a submission split off by its budget, `Gpu::room`, adds no wait for them to
+    /// a frame, so its span is the GPU's as it was in one submission).
+    fn submit(&mut self, collect: bool) -> Result<()> {
         self.record_ended()?;
+        let queued = std::mem::take(&mut self.queued);
         let Some(encoder) = self.encoder.take() else {
             debug_assert!(self.ring.staging.is_empty() && self.upload.staging.is_empty());
             return Ok(());
@@ -1924,9 +1967,16 @@ impl Gpu {
         self.ring.write(&self.device, &mut self.counters);
         self.upload.write(&self.device, &mut self.counters);
         self.device.submit(vec![encoder.finish()]);
+        self.submissions += 1;
+        if crate::step::logging() {
+            eprintln!(
+                "step frame {} submit | dispatches and passes {} bound {:.1} ms",
+                self.frame, queued.commands, queued.bound_ms
+            );
+        }
         // The serial mode reads its timestamps once a frame (`collect`), so nothing waits
         // between its submissions and the GPU keeps its clocks.
-        if self.timer.as_ref().is_some_and(|t| !t.serial) {
+        if collect && self.timer.as_ref().is_some_and(|t| !t.serial) {
             self.collect()?;
         }
         Ok(())
@@ -2221,7 +2271,10 @@ impl Gpu {
         // Weighed before anything is recorded: a dispatch that could hold the GPU too long never
         // reaches it (`crate::step`).
         self.weigh(pipeline, groups)?;
-        // Everything that can flush happens before anything is recorded for this dispatch.
+        // Everything that can flush happens before anything is recorded for this dispatch: the
+        // submission's room first.
+        let ms = self.bound_ms(pipeline, groups);
+        self.room(ms)?;
         self.reserve_uniforms(Opcode::Dispatch, self.aligned(uniforms.len()))?;
         self.reserve_timestamps()?;
         let offset = self.push_uniforms(uniforms);
@@ -2308,6 +2361,38 @@ impl Gpu {
             );
         }
         crate::step::check(&p.name, &p.bound, invocations, wrela_abi::Target::HERE)
+    }
+
+    /// The guard's bound of a dispatch of `pipeline` over `groups`, in ms (`crate::step`): an
+    /// indirect dispatch's, the limit, which the GPU holds it to.
+    fn bound_ms(&self, pipeline: u32, groups: Result<[u32; 3], (u32, u32)>) -> f64 {
+        let p = &self.pipelines[pipeline as usize];
+        match (&p.bound, groups) {
+            (crate::step::Bound::Most(most), Ok([x, y, z])) => {
+                let per_group = p.workgroup.iter().map(|&n| u64::from(n)).product::<u64>();
+                let n = u64::from(x) * u64::from(y) * u64::from(z) * per_group;
+                crate::step::ms_of(*most, n, wrela_abi::Target::HERE)
+            }
+            _ => crate::step::limit_ms(),
+        }
+    }
+
+    /// Makes room in the submission being recorded for one more dispatch (its guard bound `ms`)
+    /// or pass (0): what's recorded is submitted first where it would pass `SUBMIT_BOUND_MS` or
+    /// `SUBMIT_COMMANDS`.
+    fn room(&mut self, ms: f64) -> Result<()> {
+        if self.queued.full(ms) {
+            self.submit(false)?;
+        }
+        self.queued.commands += 1;
+        self.queued.bound_ms += ms;
+        Ok(())
+    }
+
+    /// How many submissions have been made.
+    #[cfg(test)]
+    pub(crate) fn submissions(&self) -> u64 {
+        self.submissions
     }
 
     /// In the serial mode, submits what's recorded and waits for the GPU to finish it, so the
@@ -3038,7 +3123,10 @@ impl Executor for Gpu {
             Command::BeginScreenPass { clear } => {
                 self.begin_pass(Pass::one(stream::SCREEN, false, *clear))
             }
-            Command::BeginPass(pass) => self.begin_pass(*pass),
+            Command::BeginPass(pass) => {
+                self.room(0.0)?;
+                self.begin_pass(*pass)
+            }
             Command::Draw { pipeline, vertices, instances, bindings, uniforms } => {
                 let how = DrawHow::Direct { vertices: *vertices, instances: *instances };
                 self.draw(*pipeline, how, bindings, uniforms);
@@ -3561,6 +3649,38 @@ mod tests {
         p.shader = format!("increment.{}", wrela_shader::extension(target));
         let shader = b.write(p, target).unwrap();
         (manifest, [shader.bytes])
+    }
+
+    /// A submission takes dispatches and passes until one more would take it past two steps of
+    /// the guard's bound or 64 of them; one alone always goes.
+    #[test]
+    fn a_submission_is_full_at_two_steps_of_bound_or_64_commands() {
+        let q = |commands, bound_ms| Queued { commands, bound_ms };
+        assert!(!q(0, 0.0).full(1.0e9), "a dispatch alone");
+        assert!(!q(1, 50.0).full(50.0));
+        assert!(q(1, 50.0).full(50.1));
+        assert!(!q(63, 0.0).full(0.0));
+        assert!(q(64, 0.0).full(0.0));
+    }
+
+    /// A frame of 5,000 short dispatches (a band of an audit each, well within the guard) is
+    /// many submissions, not one job of seconds: 64 a submission (2026-11-19, the Radeon's
+    /// resets).
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn a_frame_of_many_dispatches_is_many_submissions() {
+        let (manifest, shaders) = increment();
+        let mut gpu = Gpu::new(&manifest, &shaders, Timing::Off, false).unwrap();
+        gpu.create_buffer(1, 4);
+        let before = gpu.submissions();
+        for _ in 0..5000 {
+            gpu.dispatch(0, Ok([1, 1, 1]), &[Binding::range(1, 0, 4)], &[]).unwrap();
+        }
+        gpu.end_frame().unwrap();
+        let made = gpu.submissions() - before;
+        assert!(made >= 5000 / u64::from(SUBMIT_COMMANDS), "{made} submissions");
+        assert_eq!(gpu.read_buffer(1).unwrap(), 5000u32.to_le_bytes());
+        gpu.check_errors().unwrap();
     }
 
     #[test]
