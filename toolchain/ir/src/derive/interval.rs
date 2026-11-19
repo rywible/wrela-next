@@ -2660,13 +2660,18 @@ impl<'a> Ivx<'a> {
         let zero = self.fc(out, ty, 0.0);
         let pos = self.cmp(out, BinOp::Ge, x, zero);
         let s = self.select(out, pos, one, neg);
+        // r2 = 0: exactly ±1 (also for x = 0, the range's end where any direction is possible).
+        // The quotient is then taken over 1, not x², so x = r2 = 0 never makes 0 / 0: a NaN the
+        // select below would drop, but one a debug build traps (a box's distance's gradient over
+        // a box where `max(q, 0)` can be the zero vector). Over x = 0 with r2 > 0 it stays
+        // infinite, and the part 0.
+        let no_r = self.cmp(out, BinOp::Eq, r2, zero);
         let xx = self.bin(out, BinOp::Mul, x, x, ty);
-        let q = self.bin(out, BinOp::Div, r2, xx, ty);
+        let den = self.select(out, no_r, one, xx);
+        let q = self.bin(out, BinOp::Div, r2, den, ty);
         let q1 = self.bin(out, BinOp::Add, one, q, ty);
         let root = self.builtin(out, Builtin::Sqrt, vec![q1], ty);
         let f = self.bin(out, BinOp::Div, s, root, ty);
-        // r2 = 0: exactly ±1 (also for x = 0, the range's end where any direction is possible).
-        let no_r = self.cmp(out, BinOp::Eq, r2, zero);
         let f = self.select(out, no_r, s, f);
         // x = 0 with r2 > 0: 0 (r2 / 0 is infinite, so f is ±0 already; NaN only for 0 / 0).
         let x0 = self.cmp(out, BinOp::Eq, x, zero);
