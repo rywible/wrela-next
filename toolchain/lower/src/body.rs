@@ -45,6 +45,10 @@ pub(crate) enum Repr {
     /// In GPU code, a group (a borrow struct, §18): each field's representation. It has no
     /// runtime value: its resources are the module's, and its values are where its fields are.
     Group(Vec<Repr>),
+    /// In GPU code, a span re-based (`GpuSpan::sub`): its buffer's place, and the IR locals
+    /// holding where it starts in the buffer and how many elements it holds. An index into it is
+    /// an index into the buffer from its start.
+    Sub(ir::Place, ir::LocalId, ir::LocalId),
     /// A projection chosen at run time (`borrow x = if c { a } else { b }`, §6.3): an IR local
     /// holding a pointer (of the IR type given) to the place each branch bound.
     Chosen(ir::LocalId, ir::TypeId),
@@ -532,6 +536,10 @@ impl<'c, 'a> Fl<'c, 'a> {
                         Repr::Place(ir::Place::root(ir::PlaceRoot::Resource(*r)));
                     continue;
                 }
+                Some(Some(Bound::Sub(r))) => {
+                    self.locals[local.index()] = self.sub_params(*r, &mut k);
+                    continue;
+                }
                 Some(Some(b @ Bound::Group(_))) => {
                     self.locals[local.index()] = self.group_params(t, b, &mut k);
                     continue;
@@ -590,15 +598,15 @@ impl<'c, 'a> Fl<'c, 'a> {
                     (_, Some(Bound::One(r))) => {
                         Repr::Place(ir::Place::root(ir::PlaceRoot::Resource(r)))
                     }
-                    (_, Some(Bound::Group(_))) => {
+                    (_, Some(Bound::Group(_) | Bound::Sub(_))) => {
                         self.cx.err(
-                            Diagnostic::new(
-                                codes::E0702,
-                                decl.span,
-                                "a closure in GPU code can't capture a group yet",
-                            )
-                            .with_help("pass the group to the closure as a parameter"),
-                        );
+                        Diagnostic::new(
+                            codes::E0702,
+                            decl.span,
+                            "a closure in GPU code can't capture a group or a span's sub-range yet",
+                        )
+                        .with_help("pass it to the closure as a parameter"),
+                    );
                         Repr::Erased
                     }
                     (_, None) => Repr::Erased,
@@ -630,6 +638,7 @@ impl<'c, 'a> Fl<'c, 'a> {
         for (j, ft) in crate::gpu::group_fields(self.cx, ty).into_iter().enumerate() {
             out.push(match bs.get(j).cloned().flatten() {
                 Some(Bound::One(r)) => Repr::Place(ir::Place::root(ir::PlaceRoot::Resource(r))),
+                Some(Bound::Sub(r)) => self.sub_params(r, k),
                 Some(g @ Bound::Group(_)) => self.group_params(ft, &g, k),
                 None if self.cx.lower_ty(self.mb, ft, self.code.span).is_none() => Repr::Erased,
                 None => {
@@ -640,6 +649,15 @@ impl<'c, 'a> Fl<'c, 'a> {
             });
         }
         Repr::Group(out)
+    }
+
+    /// A re-based span parameter (`Bound::Sub`): its buffer `r`, read from the start and for the
+    /// count IR parameters `k` and `k + 1` hold.
+    fn sub_params(&mut self, r: ir::ResourceId, k: &mut u32) -> Repr {
+        let start = self.param_local(*k);
+        let count = self.param_local(*k + 1);
+        *k += 2;
+        Repr::Sub(ir::Place::root(ir::PlaceRoot::Resource(r)), start, count)
     }
 
     /// Binds MIR local `l` to IR parameter `k` ([`Fl::param_repr`]).
@@ -995,6 +1013,16 @@ impl<'c, 'a> Fl<'c, 'a> {
             && let Some(g) = self.group_rvalue(r)
         {
             self.locals[l.index()] = g;
+            return;
+        }
+        // A span's sub-range made in GPU code (`GpuSpan::sub`): its buffer, from a start for a
+        // count the shader computes, with no value of its own.
+        if place.proj.is_empty()
+            && self.is_gpu()
+            && let Rvalue::Call(c) = r
+            && self.is_span_sub(c)
+        {
+            self.locals[l.index()] = self.span_sub(c, span);
             return;
         }
         // A texture's handle copied in GPU code (`let t = field.texels`): the texture the shader
@@ -1442,9 +1470,15 @@ impl<'c, 'a> Fl<'c, 'a> {
         }
         let (base, mut ty, skip) = self.base_of(p);
         let mut swizzle = None;
+        // A re-based span's start, added to the index into it.
+        let mut start = None;
         let ir::Place { mut root, mut path } = match base {
             Repr::Var(v) => ir::Place::local(v),
             Repr::Place(ip) => ip,
+            Repr::Sub(ip, s, _) => {
+                start = Some(s);
+                ip
+            }
             Repr::Swizzle(ip, cs) => {
                 swizzle = Some(cs);
                 ip
@@ -1513,7 +1547,13 @@ impl<'c, 'a> Fl<'c, 'a> {
                     ty = self.proj_ty(ty, proj);
                 }
                 mir::Proj::Index(t) => {
-                    let iv = self.local_value(*t)?;
+                    let mut iv = self.local_value(*t)?;
+                    if let Some(s) = start.take() {
+                        let u = self.mb.m.types.u32();
+                        let i = self.index_u32(iv);
+                        let sv = self.load(ir::Place::local(s), u);
+                        iv = self.value(u, ir::Expr::Binary(ir::BinOp::Add, sv, i));
+                    }
                     // The element's type: a lang type's is its first type argument.
                     let elem = self.proj_ty(ty, proj);
                     let lang = self.cx.checked.program.lang_of_ty(ty);
@@ -1585,10 +1625,70 @@ impl<'c, 'a> Fl<'c, 'a> {
         {
             return Repr::Group(g);
         }
+        if let Some((pl, s, n)) = self.sub_of(p) {
+            return Repr::Sub(pl, s, n);
+        }
         match self.place_parts(p) {
             Some((pl, _, None)) => Repr::Place(pl),
             Some((pl, _, Some(cs))) => Repr::Swizzle(pl, cs),
             None => Repr::Erased,
+        }
+    }
+
+    /// Whether `c` calls `GpuSpan::sub`.
+    fn is_span_sub(&self, c: &mir::Call) -> bool {
+        let p = &self.cx.checked.program;
+        let mir::Callee::Fn { func, .. } = &c.callee else { return false };
+        p.lang_adt(Lang::GpuSpan).and_then(|a| p.inherent_method(a, "sub")) == Some(*func)
+    }
+
+    /// `s.sub(start, count)` in GPU code: the span's buffer, read from `s`'s own start plus
+    /// `start`, for `count` elements, in locals of its own (`Repr::Sub`). The range isn't checked
+    /// here: an index into it is kept inside the buffer as any index is (§11.3).
+    fn span_sub(&mut self, c: &mir::Call, span: Span) -> Repr {
+        let u = self.mb.m.types.u32();
+        let (Some(s), Some(a), Some(n)) = (
+            c.args.first().and_then(|a| a.place()),
+            c.args.get(1).and_then(|a| self.arg_value(a)),
+            c.args.get(2).and_then(|a| self.arg_value(a)),
+        ) else {
+            return Repr::Erased;
+        };
+        let (place, start) = match self.sub_of(s) {
+            Some((pl, s0, _)) => {
+                let s0 = self.load(ir::Place::local(s0), u);
+                (pl, self.value(u, ir::Expr::Binary(ir::BinOp::Add, s0, a)))
+            }
+            None => match self.place(s) {
+                Some(pl @ ir::Place { root: ir::PlaceRoot::Resource(_), .. })
+                    if pl.path.is_empty() =>
+                {
+                    (pl, a)
+                }
+                _ => {
+                    self.cx.err(Diagnostic::new(
+                        codes::E0702,
+                        span,
+                        "GPU code takes a sub-range of a span only as the shader received it or made it",
+                    ));
+                    return Repr::Erased;
+                }
+            },
+        };
+        let start_l = self.local_of("start", start);
+        let count_l = self.local_of("count", n);
+        Repr::Sub(place, start_l, count_l)
+    }
+
+    /// The re-based span `p` names whole, in GPU code (`GpuSpan::sub`): its buffer's place, and
+    /// the locals holding its start and count.
+    pub(crate) fn sub_of(
+        &mut self,
+        p: &mir::Place,
+    ) -> Option<(ir::Place, ir::LocalId, ir::LocalId)> {
+        match self.base_of(p) {
+            (Repr::Sub(pl, s, n), _, k) if k == p.proj.len() => Some((pl, s, n)),
+            _ => None,
         }
     }
 
@@ -1679,6 +1779,15 @@ impl<'c, 'a> Fl<'c, 'a> {
                         if path.is_empty() =>
                     {
                         bs.push(Some(Bound::One(*id)));
+                    }
+                    Repr::Sub(ir::Place { root: ir::PlaceRoot::Resource(id), path }, s, n)
+                        if path.is_empty() =>
+                    {
+                        let u = self.mb.m.types.u32();
+                        let (s, n) = (*s, *n);
+                        out.push(ir::Arg::Value(self.load(ir::Place::local(s), u)));
+                        out.push(ir::Arg::Value(self.load(ir::Place::local(n), u)));
+                        bs.push(Some(Bound::Sub(*id)));
                     }
                     _ => return None,
                 }
@@ -2623,6 +2732,19 @@ impl<'c, 'a> Fl<'c, 'a> {
                     "a `GpuSpan` passes as a `[T]` on the GPU, where its buffer is; CPU code can't read through it (§18.3)",
                 ));
                 return None;
+            }
+            if self.is_gpu()
+                && crate::gpu::is_resource_ty(&self.cx.checked.program, pt)
+                && let Some((pl, s, n)) = a.place().and_then(|pl| self.sub_of(pl))
+                && let ir::PlaceRoot::Resource(id) = pl.root
+                && pl.path.is_empty()
+            {
+                // A re-based span: its buffer, and its start and count as values.
+                let u = self.mb.m.types.u32();
+                out.push(ir::Arg::Value(self.load(ir::Place::local(s), u)));
+                out.push(ir::Arg::Value(self.load(ir::Place::local(n), u)));
+                resources.push(Some(Bound::Sub(id)));
+                continue;
             }
             if self.is_gpu() && crate::gpu::is_resource_ty(&self.cx.checked.program, pt) {
                 let r = a.place().and_then(|pl| self.place(pl)).and_then(|pl| {

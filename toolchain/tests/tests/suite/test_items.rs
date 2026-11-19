@@ -865,6 +865,17 @@ fn a_kernel_writes_a_half_texture_that_filters_in_3d() {
     assert_eq!(crate::tests_pass(&dir), 2);
 }
 
+/// A kind's things in GPU code (toolchain/tests/kinds, gap 29): a group built in a kernel from a
+/// thing's field read in place and a run of a shared buffer (`GpuSpan::sub`), passed to generic
+/// functions and a run of the run passed on, reads what the direct reads do, to the bit, on both
+/// hosts; the CPU's `sub` narrows the range.
+#[test]
+#[ignore = "needs a GPU"]
+fn a_kinds_thing_is_a_group_built_in_a_shader() {
+    let dir = wrela_tests::repo_root().join("toolchain/tests/kinds");
+    assert_eq!(crate::tests_pass(&dir), 2);
+}
+
 /// Textures baked when a program is built (toolchain/tests/png, language.md §20.2): `std::png`
 /// decodes PNGs of every colour type and bit depth, plain and Adam7-interlaced, with `tRNS`,
 /// split image data and Pillow's own files, to the RGBA8 bytes made beside them; a constant holds

@@ -55,6 +55,9 @@ pub enum DeriveKind {
 pub enum Bound {
     /// A run, a span, a `Slots`, a texture or a sampler: its resource.
     One(ir::ResourceId),
+    /// A span re-based in GPU code (`GpuSpan::sub`): its buffer's resource, read from a start for
+    /// a count the caller passes as two `u32` parameters, in that order.
+    Sub(ir::ResourceId),
     /// A group (a borrow struct, §18): each field's, `None` for a field passed as a value.
     Group(Vec<Option<Bound>>),
 }
@@ -64,7 +67,7 @@ impl Bound {
     pub fn one(&self) -> Option<ir::ResourceId> {
         match self {
             Bound::One(r) => Some(*r),
-            Bound::Group(_) => None,
+            Bound::Sub(_) | Bound::Group(_) => None,
         }
     }
 }

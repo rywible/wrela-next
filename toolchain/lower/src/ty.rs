@@ -522,6 +522,11 @@ impl<'a> Cx<'a> {
             let field = format!("{name}_{}", names.get(j).map_or("", String::as_str));
             match bs.get(j).cloned().flatten() {
                 Some(Bound::One(_)) => {}
+                Some(Bound::Sub(_)) => {
+                    let u = mb.m.types.u32();
+                    out.push(ir::Param::value(format!("{field}_start"), u));
+                    out.push(ir::Param::value(format!("{field}_count"), u));
+                }
                 Some(g @ Bound::Group(_)) => {
                     out.extend(self.group_params(mb, ft, &g, &field, span));
                 }
@@ -567,6 +572,12 @@ impl<'a> Cx<'a> {
                     }
                     match resources.get(i) {
                         Some(Some(Bound::One(_))) => continue,
+                        Some(Some(Bound::Sub(_))) => {
+                            let u = mb.m.types.u32();
+                            params.push(ir::Param::value(format!("{}_start", p.name), u));
+                            params.push(ir::Param::value(format!("{}_count", p.name), u));
+                            continue;
+                        }
                         Some(Some(b @ Bound::Group(_))) => {
                             let b = b.clone();
                             params.extend(self.group_params(mb, t, &b, &p.name, p.span));

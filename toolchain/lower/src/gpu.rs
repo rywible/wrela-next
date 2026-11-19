@@ -1856,11 +1856,38 @@ pub(crate) fn intrinsic(
             let ptr = fl.value(fl.mb.m.types.field(t, 0)?, ir::Expr::Extract(f, 0));
             Some(fl.value(t, ir::Expr::Construct(t, vec![ptr, moved])))
         }
+        // A span's sub-range on the CPU (GPU code makes one where it's assigned: `Fl::span_sub`):
+        // the same buffer from its start plus `start`, `count` elements; past its end, a panic.
+        Some(Lang::SpanSub) => {
+            let u = fl.mb.m.types.u32();
+            let b = fl.mb.m.types.bool();
+            let v = fl.read(c.args[0].place()?)?;
+            let start = fl.arg_value(&c.args[1])?;
+            let count = fl.arg_value(&c.args[2])?;
+            let held = fl.value(u, ir::Expr::Extract(v, 2));
+            let past_start = fl.value(b, ir::Expr::Binary(ir::BinOp::Gt, start, held));
+            let left = fl.value(u, ir::Expr::Binary(ir::BinOp::Sub, held, start));
+            let past_end = fl.value(b, ir::Expr::Binary(ir::BinOp::Gt, count, left));
+            let past = fl.value(b, ir::Expr::Binary(ir::BinOp::Or, past_start, past_end));
+            fl.push_block();
+            fl.panic_text("sub: the range is past the end of the span");
+            let then = fl.pop_block();
+            fl.emit(ir::Stmt::If { cond: past, then, else_: Vec::new() });
+            let at = fl.value(u, ir::Expr::Extract(v, 1));
+            let from = fl.value(u, ir::Expr::Binary(ir::BinOp::Add, at, start));
+            let t = fl.ty(ty?, c.span)?;
+            let buffer = fl.value(fl.mb.m.types.field(t, 0)?, ir::Expr::Extract(v, 0));
+            Some(fl.value(t, ir::Expr::Construct(t, vec![buffer, from, count])))
+        }
         // A span's length: its count on the CPU, its binding's on the GPU (bound to its range).
         Some(Lang::SpanLen) => {
             let u = fl.mb.m.types.u32();
             let p = c.args[0].place()?;
             if fl.is_gpu() {
+                // A re-based span's own count; a bound one's, its binding's.
+                if let Some((_, _, n)) = fl.sub_of(p) {
+                    return Some(fl.load(ir::Place::local(n), u));
+                }
                 let place = fl.place(p)?;
                 return Some(fl.value(u, ir::Expr::ArrayLength(place)));
             }
