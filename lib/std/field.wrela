@@ -3001,6 +3001,14 @@ pub struct Warp<S, M>: Copy + GpuData + Eq + StateHash {
     pub map: M,
 }
 
+/// A part's bound as a similar map takes it out: its segment's ends through the map, its radius
+/// and reach scaled out.
+fn mapped_part_bound<M: PointMap>(m: M, c: PartBound) -> PartBound {
+    let a = m.bound(Bound { centre: c.a, radius: c.r, slope: 1.0 })
+    let b = m.bound(Bound { centre: c.b, radius: c.r, slope: 1.0 })
+    PartBound { a: a.centre, r: max(a.radius, b.radius), b: b.centre, reach: m.distance_out(c.reach), lowers: m.distance_out(c.lowers) }
+}
+
 impl<S: Surface, M: PointMap> Surface for Warp<S, M> {
     /// Its surface's, moved by a map that keeps shapes (`PointMap::SIMILAR`: a capsule's ends
     /// map as points, its radius, reach and lowering as lengths); by any other, its whole bound.
@@ -3009,10 +3017,7 @@ impl<S: Surface, M: PointMap> Surface for Warp<S, M> {
             let b = self.bound()
             return PartBound { a: b.centre, r: b.radius, b: b.centre, reach: 0.0, lowers: 0.0 }
         }
-        let c = self.inner.part_bound(i)
-        let a = self.map.bound(Bound { centre: c.a, radius: c.r, slope: 1.0 })
-        let b = self.map.bound(Bound { centre: c.b, radius: c.r, slope: 1.0 })
-        PartBound { a: a.centre, r: max(a.radius, b.radius), b: b.centre, reach: self.map.distance_out(c.reach), lowers: self.map.distance_out(c.lowers) }
+        mapped_part_bound(self.map, self.inner.part_bound(i))
     }
 
     const EXACT_MEETS: bool = S::EXACT_MEETS
@@ -3252,6 +3257,10 @@ pub struct Written: Copy + GpuData {
     len: u32,
     /// Each node's nearest map above it (`WRITTEN_NODES` for none): the maps its point passes.
     up: [u32; 64],
+    /// Each node's operator, the node it is an operand of (`WRITTEN_NODES` for the root).
+    parent: [u32; 64],
+    /// Each node's place in the tree (`W_UNDER_CUT`, `W_UNDER_UNION`), made at the door.
+    under: [u32; 64],
     /// A rotation's matrix into its operand's space, made from its quaternion at the door.
     turns: [mat3; 64],
     /// The whole's bound, made once at the door.
@@ -3406,19 +3415,52 @@ pub fn written_of(nodes: [WrittenNode; 64], len: u32, full: bool) -> Result<Writ
             up[i] = if pk == W_TRANSLATE || pk == W_ROTATE || pk == W_SCALE { pa } else { up[pa] }
         }
     }
-    var w = Written { nodes, len, up, turns, whole: UNBOUNDED, leaves }
+    // Which nodes an intersection or a cut holds (asked whole: nothing prunes in them), and
+    // which have a union, smooth or not, above them.
+    var under = [0; 64]
+    var i2 = len
+    while i2 > 0 {
+        i2 -= 1
+        let pa = parent[i2]
+        if pa < WRITTEN_NODES {
+            let pk = nodes[pa].kind
+            let cut = if pk == W_INTERSECT || pk == W_SMOOTH_SUBTRACT || pk == W_SMOOTH_INTERSECT { W_UNDER_CUT } else { 0 }
+            let union = if pk == W_UNION || pk == W_SMOOTH_UNION { W_UNDER_UNION } else { 0 }
+            under[i2] = under[pa] | cut | union
+        }
+    }
+    var w = Written { nodes, len, up, parent, under, turns, whole: UNBOUNDED, leaves }
     w.whole = w.bound_of()
     Ok(w)
+}
+
+/// `Written::under`'s flag: an intersection or a cut is above the node.
+const W_UNDER_CUT: u32 = 1
+/// `Written::under`'s flag: a union or a smooth union is above the node.
+const W_UNDER_UNION: u32 = 2
+
+/// A ray, a growth and an inner as a written field's node is asked them (`Written::ray_at`).
+struct WrittenRay: Copy {
+    o: vec3,
+    d: vec3,
+    grow: f32,
+    inner: f32,
 }
 
 impl Written {
     /// `p` taken through node `i`'s maps, the outermost first, as the compiled tree takes it.
     fn local_at(self, i: u32, p: vec3) -> vec3 {
+        self.local_within(i, WRITTEN_NODES, p)
+    }
+
+    /// `p` taken through those of node `i`'s maps that are in node `top`'s subtree (`top` itself
+    /// included), the outermost first: a point in `top`'s own space taken to `i`'s.
+    fn local_within(self, i: u32, top: u32, p: vec3) -> vec3 {
         var chain = [0; 16]
         var n: u32 = 0
         var j = self.up[i]
         for k in 0..WRITTEN_DEPTH {
-            if j >= WRITTEN_NODES {
+            if j >= WRITTEN_NODES || j > top {
                 break
             }
             chain[n] = j
@@ -3463,30 +3505,258 @@ impl Written {
 
     /// The bound, node by node as each kind's own `bound` combines its operands' (made once).
     fn bound_of(self) -> Bound {
+        if self.len == 0 {
+            return UNBOUNDED
+        }
+        self.bound_within(min(self.len, WRITTEN_NODES) - 1)
+    }
+
+    /// The first node of node `top`'s subtree: its nodes are that one to `top`, in post-order.
+    fn first_of(self, top: u32) -> u32 {
+        var j = top
+        for k in 0..WRITTEN_NODES {
+            if self.nodes[j].kind <= W_HALF_SPACE {
+                break
+            }
+            j = self.nodes[j].a
+        }
+        j
+    }
+
+    /// Node `top`'s own surface's bound, in its own space.
+    fn bound_within(self, top: u32) -> Bound {
         var st = [UNBOUNDED; 16]
-        var top: u32 = 0
-        for i in 0..min(self.len, WRITTEN_NODES) {
+        var depth: u32 = 0
+        let first = self.first_of(top)
+        for s_ in 0..WRITTEN_NODES {
+            let i = first + s_
+            if i > top {
+                break
+            }
             let n = self.nodes[i]
             let k = n.kind
             if k <= W_HALF_SPACE {
-                st[top] = self.leaf_bound(i)
-                top += 1
+                st[depth] = self.leaf_bound(i)
+                depth += 1
             } else if k == W_TRANSLATE {
-                st[top - 1] = Shift { by: n.p.xyz }.bound(st[top - 1])
+                st[depth - 1] = Shift { by: n.p.xyz }.bound(st[depth - 1])
             } else if k == W_ROTATE {
-                st[top - 1] = Turn { to_local: self.turns[i] }.bound(st[top - 1])
+                st[depth - 1] = Turn { to_local: self.turns[i] }.bound(st[depth - 1])
             } else if k == W_SCALE {
-                st[top - 1] = Size { by: n.p.x }.bound(st[top - 1])
+                st[depth - 1] = Size { by: n.p.x }.bound(st[depth - 1])
             } else if k == W_DISPLACE {
                 let r = Written::noise_of(n).range()
-                st[top - 1] = st[top - 1].lowered(abs(n.p.x) * max(abs(r.lo), abs(r.hi)))
+                st[depth - 1] = st[depth - 1].lowered(abs(n.p.x) * max(abs(r.lo), abs(r.hi)))
             } else {
-                let (a, b) = (st[top - 2], st[top - 1])
-                top -= 1
-                st[top - 1] = if k == W_UNION { a.and(b) } else if k == W_SMOOTH_UNION { a.and(b).lowered(0.25 * max(n.p.x, 0.0)) } else if k == W_SMOOTH_SUBTRACT { a } else if a.radius <= b.radius { a } else { b }
+                let (a, b) = (st[depth - 2], st[depth - 1])
+                depth -= 1
+                st[depth - 1] = if k == W_UNION { a.and(b) } else if k == W_SMOOTH_UNION { a.and(b).lowered(0.25 * max(n.p.x, 0.0)) } else if k == W_SMOOTH_SUBTRACT { a } else if a.radius <= b.radius { a } else { b }
             }
         }
         st[0]
+    }
+
+    /// Node `top`'s own surface's distance at `x`, in its own space: its subtree, node by node
+    /// as `distance` takes the whole (what a smooth join and a displacement ask where a ray
+    /// passes).
+    fn distance_within(self, top: u32, x: vec3) -> f32 {
+        var st = [0.0; 16]
+        var depth: u32 = 0
+        let first = self.first_of(top)
+        for s_ in 0..WRITTEN_NODES {
+            let i = first + s_
+            if i > top {
+                break
+            }
+            let n = self.nodes[i]
+            let k = n.kind
+            if k <= W_HALF_SPACE {
+                st[depth] = self.leaf_distance(i, self.local_within(i, top, x))
+                depth += 1
+            } else if k == W_SCALE {
+                st[depth - 1] = Size { by: n.p.x }.distance_out(st[depth - 1])
+            } else if k == W_DISPLACE {
+                st[depth - 1] = st[depth - 1] + n.p.x * Written::noise_of(n).value(self.local_within(i, top, x))
+            } else if k >= W_UNION {
+                let (a, b) = (st[depth - 2], st[depth - 1])
+                depth -= 1
+                st[depth - 1] = if k == W_UNION { min(a, b) } else if k == W_SMOOTH_UNION { smin(a, b, n.p.x) } else if k == W_INTERSECT { max(a, b) } else if k == W_SMOOTH_SUBTRACT { smax(a, -b, n.p.x) } else { smax(a, b, n.p.x) }
+            }
+        }
+        st[0]
+    }
+
+    /// The ray `o + t d`, a growth and an inner (`Surface::meets_grown`'s), as node `i`'s own
+    /// surface is asked them: taken down from the root through each node above it, as that kind
+    /// passes them to its operands (a map moves the ray and scales the lengths in, a smooth union
+    /// grows by a quarter of its width, a displacement by its reach either way).
+    fn ray_at(self, i: u32, o: vec3, d: vec3, grow: f32, inner: f32) -> WrittenRay {
+        var chain = [0; 64]
+        var n: u32 = 0
+        var j = self.parent[i]
+        for k in 0..WRITTEN_NODES {
+            if j >= WRITTEN_NODES {
+                break
+            }
+            chain[n] = j
+            n += 1
+            j = self.parent[j]
+        }
+        var r = WrittenRay { o, d, grow, inner }
+        for k in 0..WRITTEN_NODES {
+            if k >= n {
+                break
+            }
+            let a = chain[n - 1 - k]
+            let m = self.nodes[a]
+            if m.kind == W_TRANSLATE {
+                let s = Shift { by: m.p.xyz }
+                r = WrittenRay { o: s.local(r.o), d: s.local_direction(r.d), grow: s.distance_in(r.grow), inner: s.distance_in(r.inner) }
+            } else if m.kind == W_ROTATE {
+                let s = Turn { to_local: self.turns[a] }
+                r = WrittenRay { o: s.local(r.o), d: s.local_direction(r.d), grow: s.distance_in(r.grow), inner: s.distance_in(r.inner) }
+            } else if m.kind == W_SCALE {
+                let s = Size { by: m.p.x }
+                r = WrittenRay { o: s.local(r.o), d: s.local_direction(r.d), grow: s.distance_in(r.grow), inner: s.distance_in(r.inner) }
+            } else if m.kind == W_SMOOTH_UNION {
+                r.grow = r.grow + 0.25 * max(m.p.x, 0.0)
+            } else if m.kind == W_DISPLACE {
+                let nr = Written::noise_of(m).range()
+                let reach = abs(m.p.x) * max(abs(nr.lo), abs(nr.hi))
+                r.grow = r.grow + reach
+                r.inner = r.inner - reach
+            }
+        }
+        r
+    }
+
+    /// Leaf `i`'s own `part_bound`, in its own space.
+    fn leaf_part_bound(self, i: u32) -> PartBound {
+        let n = self.nodes[i]
+        let k = n.kind
+        if k == W_ROUND_CONE { round_cone(n.p.xyz, n.q.xyz, r_top: n.p.w, r_bottom: n.q.w).part_bound(0) } else if k == W_SPHERE { sphere(n.p.x).part_bound(0) } else if k == W_CUBOID { cuboid(n.p.xyz).part_bound(0) } else if k == W_ELLIPSOID { ellipsoid(n.p.xyz).part_bound(0) } else { half_space(n.p.xyz, n.p.w).part_bound(0) }
+    }
+
+    /// The node of part `i`: the `i`th leaf, in post-order (`WRITTEN_NODES` past the last).
+    fn leaf_of(self, i: u32) -> u32 {
+        var seen: u32 = 0
+        for j in 0..min(self.len, WRITTEN_NODES) {
+            if self.nodes[j].kind <= W_HALF_SPACE {
+                if seen == i {
+                    return j
+                }
+                seen += 1
+            }
+        }
+        WRITTEN_NODES
+    }
+
+    /// Leaf `i`'s own `meets_grown`, in its own space.
+    fn leaf_meets(self, i: u32, r: WrittenRay) -> Meets {
+        let n = self.nodes[i]
+        let k = n.kind
+        if k == W_ROUND_CONE { round_cone(n.p.xyz, n.q.xyz, r_top: n.p.w, r_bottom: n.q.w).meets_grown(r.o, r.d, r.grow, r.inner) } else if k == W_SPHERE { sphere(n.p.x).meets_grown(r.o, r.d, r.grow, r.inner) } else if k == W_CUBOID { cuboid(n.p.xyz).meets_grown(r.o, r.d, r.grow, r.inner) } else if k == W_ELLIPSOID { ellipsoid(n.p.xyz).meets_grown(r.o, r.d, r.grow, r.inner) } else { half_space(n.p.xyz, n.p.w).meets_grown(r.o, r.d, r.grow, r.inner) }
+    }
+
+    /// Leaf `i`'s own `passes`, in its own space.
+    fn leaf_passes(self, i: u32, r: WrittenRay) -> Pass {
+        let n = self.nodes[i]
+        let k = n.kind
+        if k == W_ROUND_CONE { round_cone(n.p.xyz, n.q.xyz, r_top: n.p.w, r_bottom: n.q.w).passes(r.o, r.d) } else if k == W_SPHERE { sphere(n.p.x).passes(r.o, r.d) } else if k == W_CUBOID { cuboid(n.p.xyz).passes(r.o, r.d) } else if k == W_ELLIPSOID { ellipsoid(n.p.xyz).passes(r.o, r.d) } else { half_space(n.p.xyz, n.p.w).passes(r.o, r.d) }
+    }
+
+    /// Node `top`'s own surface's `lipschitz(near)`: the scope each node passes its operands (as
+    /// each kind does), then each leaf's own, combined as each kind combines its operands'.
+    fn lipschitz_within(self, top: u32, near: f32) -> f32 {
+        var scope = [0.0; 64]
+        let first = self.first_of(top)
+        scope[top] = near
+        var i = top + 1
+        for _pass in 0..WRITTEN_NODES {
+            if i <= first {
+                break
+            }
+            i -= 1
+            let n = self.nodes[i]
+            let k = n.kind
+            let sc = scope[i]
+            if k == W_TRANSLATE || k == W_ROTATE {
+                scope[n.a] = sc
+            } else if k == W_SCALE {
+                scope[n.a] = Size { by: n.p.x }.length_in(sc)
+            } else if k == W_DISPLACE {
+                let r = Written::noise_of(n).range()
+                scope[n.a] = sc + abs(n.p.x) * max(abs(r.lo), abs(r.hi))
+            } else if k >= W_UNION {
+                let s2 = if k == W_UNION || k == W_INTERSECT { sc } else { sc + 1.25 * max(n.p.x, 0.0) }
+                scope[n.a] = s2
+                scope[n.b] = s2
+            }
+        }
+        var st = [0.0; 16]
+        var depth: u32 = 0
+        for s_ in 0..WRITTEN_NODES {
+            let j = first + s_
+            if j > top {
+                break
+            }
+            let n = self.nodes[j]
+            let k = n.kind
+            if k <= W_HALF_SPACE {
+                st[depth] = self.leaf_lipschitz(j, scope[j])
+                depth += 1
+            } else if k == W_DISPLACE {
+                st[depth - 1] = st[depth - 1] + abs(n.p.x) * Written::noise_of(n).lipschitz()
+            } else if k >= W_UNION {
+                let (a, b) = (st[depth - 2], st[depth - 1])
+                depth -= 1
+                st[depth - 1] = max(a, b)
+            }
+        }
+        st[0]
+    }
+
+    /// The stretch `stretch` becomes in leaf `i`'s space: through each map above it, the
+    /// outermost first, as each passes lengths in.
+    fn stretch_at(self, i: u32, stretch: f32) -> f32 {
+        var chain = [0; 16]
+        var n: u32 = 0
+        var j = self.up[i]
+        for k in 0..WRITTEN_DEPTH {
+            if j >= WRITTEN_NODES {
+                break
+            }
+            chain[n] = j
+            n += 1
+            j = self.up[j]
+        }
+        var s = stretch
+        for k in 0..WRITTEN_DEPTH {
+            if k >= n {
+                break
+            }
+            let m = self.nodes[chain[n - 1 - k]]
+            if m.kind == W_SCALE {
+                s = Size { by: m.p.x }.length_in(s)
+            }
+        }
+        s
+    }
+
+    /// The default `pruned`'s range for node `i`'s own surface, asked at `self.local_at(i,
+    /// at(q))` for `q` in `over`: its derived interval narrowed by its distance at the box's
+    /// centre and its steepness, as `Surface::pruned` narrows.
+    fn node_range<F: Copy + fn(vec3) -> vec3>(self, i: u32, over: Box3, at: F, stretch: f32) -> Interval {
+        let w = self
+        let x = interval(|q: vec3| w.distance_within(i, w.local_at(i, at(q))), over)
+        let l = self.lipschitz_within(i, max(abs(x.lo), abs(x.hi)) * 1.001 + 0.000001)
+        if !(l < 1.0e30) {
+            return x
+        }
+        let d = self.distance_within(i, self.local_at(i, at(over.center())))
+        let r = l * self.stretch_at(i, stretch) * 0.5 * length(over.hi - over.lo)
+        let e = r * 1.0e-5 + abs(d) * 1.0e-6 + 1.0e-6
+        Interval { lo: max(x.lo, d - r - e), hi: min(x.hi, d + r + e) }
     }
 
     /// How many nodes it holds.
@@ -3575,50 +3845,308 @@ impl Surface for Written {
         self.whole
     }
 
-    /// Node by node: the scope each node passes its operands (as each kind does), then each
-    /// leaf's own, combined as each kind combines its operands'.
-    fn lipschitz(self, near: f32) -> f32 {
-        var scope = [0.0; 64]
-        if self.len == 0 {
-            return 1.0
+    /// Its leaf's own, taken up through each node above it as that kind takes its operand's: a
+    /// map moves it, a smooth union reaches farther by its width and a quarter (and lowers by the
+    /// quarter), a union passes it on; an intersection, a cut and a displacement state their
+    /// whole bound instead (`Surface::part_bound`'s default). The compiled tree's, to the bit.
+    fn part_bound(self, i: u32) -> PartBound {
+        let leaf = self.leaf_of(i)
+        if leaf >= WRITTEN_NODES {
+            let b = self.whole
+            return PartBound { a: b.centre, r: b.radius, b: b.centre, reach: 0.0, lowers: 0.0 }
         }
-        scope[self.len - 1] = near
-        var i = self.len
-        while i > 0 {
-            i -= 1
+        var c = self.leaf_part_bound(leaf)
+        var j = self.parent[leaf]
+        for k in 0..WRITTEN_NODES {
+            if j >= WRITTEN_NODES {
+                break
+            }
+            let m = self.nodes[j]
+            let kind = m.kind
+            if kind == W_TRANSLATE || kind == W_ROTATE || kind == W_SCALE {
+                c = if kind == W_TRANSLATE { mapped_part_bound(Shift { by: m.p.xyz }, c) } else if kind == W_ROTATE { mapped_part_bound(Turn { to_local: self.turns[j] }, c) } else { mapped_part_bound(Size { by: m.p.x }, c) }
+            } else if kind == W_SMOOTH_UNION {
+                let kk = max(m.p.x, 0.0)
+                c.reach += kk + 0.25 * kk
+                c.lowers += 0.25 * kk
+            } else if kind != W_UNION {
+                let b = self.bound_within(j)
+                c = PartBound { a: b.centre, r: b.radius, b: b.centre, reach: 0.0, lowers: 0.0 }
+            }
+            j = self.parent[j]
+        }
+        c
+    }
+
+    /// Part `i`'s own distance at `p`: its leaf's at its point, taken up through each node above
+    /// it (a scale's lengths out, a displacement's noise added at its own point). The compiled
+    /// tree's, to the bit.
+    fn part_distance(self, p: vec3, i: u32) -> f32 {
+        let leaf = self.leaf_of(i)
+        if leaf >= WRITTEN_NODES {
+            return self.distance(p)
+        }
+        var d = self.leaf_distance(leaf, self.local_at(leaf, p))
+        var j = self.parent[leaf]
+        for k in 0..WRITTEN_NODES {
+            if j >= WRITTEN_NODES {
+                break
+            }
+            let m = self.nodes[j]
+            if m.kind == W_SCALE {
+                d = Size { by: m.p.x }.distance_out(d)
+            } else if m.kind == W_DISPLACE {
+                d = d + m.p.x * Written::noise_of(m).value(self.local_at(j, p))
+            }
+            j = self.parent[j]
+        }
+        d
+    }
+
+    /// Its distance at `p` and the part that decides it, node by node as each kind decides: a
+    /// union and a smooth union the nearer operand's (a tie `a`'s), an intersection and a smooth
+    /// intersection the farther's, a cut the cutter's where the cut is the surface. The compiled
+    /// tree's, to the bit.
+    fn part_at(self, p: vec3) -> (f32, u32) {
+        var ds = [0.0; 16]
+        var ps = [0; 16]
+        var top: u32 = 0
+        var part: u32 = 0
+        for i in 0..min(self.len, WRITTEN_NODES) {
             let n = self.nodes[i]
             let k = n.kind
-            let sc = scope[i]
-            if k == W_TRANSLATE || k == W_ROTATE {
-                scope[n.a] = sc
+            if k <= W_HALF_SPACE {
+                ds[top] = self.leaf_distance(i, self.local_at(i, p))
+                ps[top] = part
+                top += 1
+                part += 1
             } else if k == W_SCALE {
-                scope[n.a] = Size { by: n.p.x }.length_in(sc)
+                ds[top - 1] = Size { by: n.p.x }.distance_out(ds[top - 1])
             } else if k == W_DISPLACE {
-                let r = Written::noise_of(n).range()
-                scope[n.a] = sc + abs(n.p.x) * max(abs(r.lo), abs(r.hi))
+                ds[top - 1] = ds[top - 1] + n.p.x * Written::noise_of(n).value(self.local_at(i, p))
             } else if k >= W_UNION {
-                let s2 = if k == W_UNION || k == W_INTERSECT { sc } else { sc + 1.25 * max(n.p.x, 0.0) }
-                scope[n.a] = s2
-                scope[n.b] = s2
+                let (da, db) = (ds[top - 2], ds[top - 1])
+                let (ia, ib) = (ps[top - 2], ps[top - 1])
+                top -= 1
+                if k == W_UNION {
+                    ds[top - 1] = min(da, db)
+                    ps[top - 1] = if da <= db { ia } else { ib }
+                } else if k == W_SMOOTH_UNION {
+                    ds[top - 1] = smin(da, db, n.p.x)
+                    ps[top - 1] = if da <= db { ia } else { ib }
+                } else if k == W_INTERSECT {
+                    ds[top - 1] = max(da, db)
+                    ps[top - 1] = if da >= db { ia } else { ib }
+                } else if k == W_SMOOTH_SUBTRACT {
+                    ds[top - 1] = smax(da, -db, n.p.x)
+                    ps[top - 1] = if da >= -db { ia } else { ib }
+                } else {
+                    ds[top - 1] = smax(da, db, n.p.x)
+                    ps[top - 1] = if da >= db { ia } else { ib }
+                }
             }
         }
-        var st = [0.0; 16]
+        (ds[0], ps[0])
+    }
+
+    /// Node by node as each kind's own `pruned` does, `live` passed from each operand to the
+    /// next as the compiled tree passes it: a leaf's range is its derived interval narrowed by
+    /// its steepness (`Surface::pruned`'s default) through the maps above it; a scale's is its
+    /// operand's scaled out, a displacement's its operand's and its noise's; a union and a
+    /// smooth union leave out an operand the other is surely below (`joined`); an intersection
+    /// and a cut take the default over themselves, leaving their parts as they are. Its ranges and
+    /// mask are the compiled tree's of the same kinds, to the bit on the CPU.
+    fn pruned<F: Copy + fn(vec3) -> vec3>(self, over: Box3, at: F, stretch: f32, live: Live, first: u32) -> Pruned {
+        var ranges = [Interval { lo: 0.0, hi: 0.0 }; 16]
+        var firsts = [0; 16]
+        var counts = [0; 16]
         var top: u32 = 0
-        for j in 0..min(self.len, WRITTEN_NODES) {
-            let n = self.nodes[j]
+        var cur = live
+        var part = first
+        for i in 0..min(self.len, WRITTEN_NODES) {
+            let n = self.nodes[i]
+            let k = n.kind
+            let cut = (self.under[i] & W_UNDER_CUT) != 0
+            if k <= W_HALF_SPACE {
+                ranges[top] = if cut { Interval { lo: 0.0, hi: 0.0 } } else { self.node_range(i, over, at, stretch) }
+                firsts[top] = part
+                counts[top] = 1
+                top += 1
+                part += 1
+            } else if cut {
+                if k >= W_UNION {
+                    top -= 1
+                    counts[top - 1] = counts[top - 1] + counts[top]
+                }
+            } else if k == W_SCALE {
+                let sz = Size { by: n.p.x }
+                let r = ranges[top - 1]
+                ranges[top - 1] = Interval { lo: sz.distance_out(r.lo), hi: sz.distance_out(r.hi) }
+            } else if k == W_DISPLACE {
+                let w = self
+                let amp = n.p.x
+                let noise = Written::noise_of(n)
+                let x = interval(|q: vec3| amp * noise.value(w.local_at(i, at(q))), over)
+                let r = ranges[top - 1]
+                ranges[top - 1] = outward(Interval { lo: r.lo + x.lo, hi: r.hi + x.hi })
+            } else if k == W_UNION || k == W_SMOOTH_UNION {
+                let kk = if k == W_UNION { 0.0 } else { n.p.x }
+                let j = joined(ranges[top - 2], Pruned { live: cur, range: ranges[top - 1] }, firsts[top - 2], counts[top - 2], counts[top - 1], kk)
+                cur = j.live
+                top -= 1
+                ranges[top - 1] = j.range
+                counts[top - 1] = counts[top - 1] + counts[top]
+            } else if k >= W_UNION {
+                top -= 1
+                ranges[top - 1] = self.node_range(i, over, at, stretch)
+                counts[top - 1] = counts[top - 1] + counts[top]
+            }
+        }
+        Pruned { live: cur, range: ranges[0] }
+    }
+
+    /// Node by node as `distance`, asking only what the compiled tree's `masked` asks: an
+    /// operand of a union or a smooth union none of whose parts is live counts as `EMPTY`; what
+    /// an intersection or a cut holds is asked whole. A leaf is asked only where that could
+    /// matter. The compiled tree's of the same kinds, to the bit on the CPU.
+    fn masked(self, p: vec3, live: Live, first: u32) -> f32 {
+        var st = [0.0; 16]
+        var firsts = [0; 16]
+        var counts = [0; 16]
+        var top: u32 = 0
+        var part = first
+        for i in 0..min(self.len, WRITTEN_NODES) {
+            let n = self.nodes[i]
             let k = n.kind
             if k <= W_HALF_SPACE {
-                st[top] = self.leaf_lipschitz(j, scope[j])
+                // A dead leaf below a union and no cut is left out at its nearest union, which
+                // its operand is to it alone (with what moves or displaces it).
+                let u = self.under[i]
+                let asked = live.has(part) || (u & W_UNDER_CUT) != 0 || (u & W_UNDER_UNION) == 0
+                st[top] = if asked { self.leaf_distance(i, self.local_at(i, p)) } else { EMPTY }
+                firsts[top] = part
+                counts[top] = 1
                 top += 1
+                part += 1
+            } else if k == W_SCALE {
+                st[top - 1] = Size { by: n.p.x }.distance_out(st[top - 1])
             } else if k == W_DISPLACE {
-                st[top - 1] = st[top - 1] + abs(n.p.x) * Written::noise_of(n).lipschitz()
+                st[top - 1] = st[top - 1] + n.p.x * Written::noise_of(n).value(self.local_at(i, p))
             } else if k >= W_UNION {
-                let (a, b) = (st[top - 2], st[top - 1])
+                var a = st[top - 2]
+                var b = st[top - 1]
+                let cut = (self.under[i] & W_UNDER_CUT) != 0
+                if (k == W_UNION || k == W_SMOOTH_UNION) && !cut {
+                    if !live.any(firsts[top - 2], counts[top - 2]) {
+                        a = EMPTY
+                    }
+                    if !live.any(firsts[top - 1], counts[top - 1]) {
+                        b = EMPTY
+                    }
+                }
                 top -= 1
-                st[top - 1] = max(a, b)
+                st[top - 1] = if k == W_UNION { min(a, b) } else if k == W_SMOOTH_UNION { smin(a, b, n.p.x) } else if k == W_INTERSECT { max(a, b) } else if k == W_SMOOTH_SUBTRACT { smax(a, -b, n.p.x) } else { smax(a, b, n.p.x) }
+                counts[top - 1] = counts[top - 1] + counts[top]
             }
         }
         st[0]
+    }
+
+    /// Node by node as each kind's own `meets_grown` combines its operands': each leaf's, asked
+    /// the ray, growth and inner its ancestors pass it (`ray_at`); a union the nearer, an
+    /// intersection both, a smooth join and a displacement loosened, a cut its kept side's. Exact
+    /// wherever the compiled tree of the same kinds is (`Meets::exact`), to the bit on the CPU.
+    fn meets_grown(self, o: vec3, d: vec3, grow: f32, inner: f32) -> Meets {
+        var st = [bound_meets(UNBOUNDED, o, d, grow); 16]
+        var top: u32 = 0
+        for i in 0..min(self.len, WRITTEN_NODES) {
+            let n = self.nodes[i]
+            let k = n.kind
+            if k <= W_HALF_SPACE {
+                st[top] = self.leaf_meets(i, self.ray_at(i, o, d, grow: grow, inner: inner))
+                top += 1
+            } else if k == W_DISPLACE {
+                st[top - 1] = st[top - 1].loose()
+            } else if k >= W_UNION {
+                let (a, b) = (st[top - 2], st[top - 1])
+                top -= 1
+                st[top - 1] = if k == W_UNION {
+                    a.or(b)
+                } else if k == W_SMOOTH_UNION {
+                    a.or(b).loose()
+                } else if k == W_INTERSECT {
+                    let m = a.and(b)
+                    let r = self.ray_at(i, o, d, grow: grow, inner: inner)
+                    if m.exact() && r.grow == r.inner { Meets { first: m.near, ..m } } else { m }
+                } else if k == W_SMOOTH_SUBTRACT {
+                    a.unsure()
+                } else {
+                    a.and(b).unsure()
+                }
+            }
+        }
+        st[0]
+    }
+
+    /// Node by node as each kind's own `passes` combines its operands': each leaf's on the ray in
+    /// its own space, a scale's lengths out, a union the nearer, a smooth union its operands'
+    /// lowered and asked once where they pass, a displacement its operand's within its reach and
+    /// asked once, an intersection and a cut their bound's pass asked once. Exact wherever the
+    /// compiled tree of the same kinds is, to the bit on the CPU.
+    fn passes(self, o: vec3, d: vec3) -> Pass {
+        var st = [bound_passes(UNBOUNDED, o, d); 16]
+        var top: u32 = 0
+        for i in 0..min(self.len, WRITTEN_NODES) {
+            let n = self.nodes[i]
+            let k = n.kind
+            if k <= W_HALF_SPACE {
+                st[top] = self.leaf_passes(i, self.ray_at(i, o, d, grow: 0.0, inner: 0.0))
+                top += 1
+            } else if k == W_SCALE {
+                let s = Size { by: n.p.x }
+                let p = st[top - 1]
+                st[top - 1] = Pass {
+                    distance: s.distance_out(p.distance),
+                    low: s.distance_out(p.low),
+                    high: s.distance_out(p.high),
+                    other_distance: s.distance_out(p.other_distance),
+                    blend: s.distance_out(p.blend),
+                    ..p
+                }
+            } else if k == W_DISPLACE {
+                let nr = Written::noise_of(n).range()
+                let reach = abs(n.p.x) * max(abs(nr.lo), abs(nr.hi))
+                let p = st[top - 1]
+                let q = Pass { high: p.high + reach, ..p.lowered(reach, 0.0) }
+                let r = self.ray_at(i, o, d, grow: 0.0, inner: 0.0)
+                st[top - 1] = q.asked(q.t, self.distance_within(i, r.o + r.d * q.t))
+            } else if k >= W_UNION {
+                let (a, b) = (st[top - 2], st[top - 1])
+                top -= 1
+                st[top - 1] = if k == W_UNION {
+                    a.or(b)
+                } else if k == W_SMOOTH_UNION {
+                    let kk = max(n.p.x, 0.0)
+                    let p = a.or(b).lowered(0.25 * kk, kk)
+                    let r = self.ray_at(i, o, d, grow: 0.0, inner: 0.0)
+                    p.asked(p.t, self.distance_within(i, r.o + r.d * p.t))
+                } else {
+                    let r = self.ray_at(i, o, d, grow: 0.0, inner: 0.0)
+                    let p = bound_passes(self.bound_within(i), r.o, r.d)
+                    p.asked(p.t, self.distance_within(i, r.o + r.d * p.t))
+                }
+            }
+        }
+        st[0]
+    }
+
+    /// Node by node: the scope each node passes its operands (as each kind does), then each
+    /// leaf's own, combined as each kind combines its operands'.
+    fn lipschitz(self, near: f32) -> f32 {
+        if self.len == 0 {
+            return 1.0
+        }
+        self.lipschitz_within(min(self.len, WRITTEN_NODES) - 1, near)
     }
 
     /// Each leaf a part, in order.
@@ -5504,6 +6032,225 @@ fn a_written_field_is_its_compiled_tree_to_the_bit() {
     // The matter of the nearest leaf.
     assert(written.matter_at(vec3(1.1, 0.0, 0.0)) == 1)
     assert(written.matter_at(vec3(-0.6, -0.45, 0.1)) == 2)
+}
+
+/// A written field's range over a box is its compiled tree's, to the bit: `range`'s value
+/// (the affine form within the interval) and the plain interval, derived through its evaluator
+/// as through the tree, at boxes from 1 m to 8 mm.
+@test
+fn a_written_fields_range_is_its_compiled_trees() {
+    let q = Quat::axis_angle(normalize(vec3(1.0, 2.0, 0.5)), 0.7)
+    var w = writing()
+    let a = w.sphere(0.6, matter: 1)
+    let a1 = w.translate(a, vec3(0.5, 0.0, 0.0))
+    let b = w.round_cone(vec3(-0.6, -0.3, 0.1), vec3(0.1, 0.4, -0.2), r_top: 0.15, r_bottom: 0.35, matter: 2)
+    let ab = w.smooth_union(a1, b, 0.3)
+    let c = w.cuboid(vec3(0.4, 0.3, 0.2), matter: 3)
+    let c1 = w.rotate(c, q)
+    let c2 = w.translate(c1, vec3(0.2, 0.5, 0.3))
+    let abc = w.smooth_subtract(ab, c2, 0.1)
+    let e = w.ellipsoid(vec3(0.3, 0.5, 0.4), matter: 4)
+    let e1 = w.scale(e, 1.5)
+    let all = w.union(abc, e1)
+    let d = w.displace(all, amp: 0.02, freq: 4.0, octaves: 3)
+    let written = w.done().unwrap()
+    let compiled = sphere(0.6).translate(vec3(0.5, 0.0, 0.0))
+        .smooth_union(round_cone(vec3(-0.6, -0.3, 0.1), vec3(0.1, 0.4, -0.2), r_top: 0.15, r_bottom: 0.35), k: 0.3)
+        .smooth_subtract(cuboid(vec3(0.4, 0.3, 0.2)).rotate(q).translate(vec3(0.2, 0.5, 0.3)), k: 0.1)
+        .union(ellipsoid(vec3(0.3, 0.5, 0.4)).scale(1.5))
+        .displace(fbm(4.0, 3), amp: 0.02)
+    for side in [1.0, 0.12, 0.008] {
+        for i in 0..16 {
+            let c = Box3 { lo: vec3(-1.0), hi: vec3(1.0) }.sample(5, i)
+            let bx = Box3 { lo: c - vec3(0.5 * side), hi: c + vec3(0.5 * side) }
+            let (x, y) = (written.range(bx).value, compiled.range(bx).value)
+            assert(x.lo == y.lo && x.hi == y.hi, f"side {side}, box {i}: written [{x.lo}, {x.hi}], compiled [{y.lo}, {y.hi}]")
+            let (u, v) = (interval(|p: vec3| written.distance(p), bx), interval(|p: vec3| compiled.distance(p), bx))
+            assert(u.lo == v.lo && u.hi == v.hi, f"side {side}, box {i}: the plain intervals differ")
+        }
+    }
+}
+
+/// A written field's `meets` and `passes` are its compiled tree's, to the bit, on rays from all
+/// round it toward points within it: each leaf asked as the tree asks it, combined node by node
+/// as each kind combines its operands'.
+@test
+fn a_written_fields_meets_and_passes_are_its_compiled_trees() {
+    let q = Quat::axis_angle(normalize(vec3(1.0, 2.0, 0.5)), 0.7)
+    var w = writing()
+    let a = w.sphere(0.6, matter: 1)
+    let a1 = w.translate(a, vec3(0.5, 0.0, 0.0))
+    let b = w.round_cone(vec3(-0.6, -0.3, 0.1), vec3(0.1, 0.4, -0.2), r_top: 0.15, r_bottom: 0.35, matter: 2)
+    let ab = w.smooth_union(a1, b, 0.3)
+    let c = w.cuboid(vec3(0.4, 0.3, 0.2), matter: 3)
+    let c1 = w.rotate(c, q)
+    let c2 = w.translate(c1, vec3(0.2, 0.5, 0.3))
+    let abc = w.smooth_subtract(ab, c2, 0.1)
+    let e = w.ellipsoid(vec3(0.3, 0.5, 0.4), matter: 4)
+    let e1 = w.scale(e, 1.5)
+    let all = w.union(abc, e1)
+    let h = w.half_space(normalize(vec3(0.1, 1.0, 0.05)), 0.7, matter: 5)
+    let cut = w.smooth_intersect(all, h, 0.05)
+    let s1 = w.sphere(0.3, matter: 6)
+    let s2 = w.translate(s1, vec3(0.0, -1.0, 0.0))
+    let s3 = w.cuboid(vec3(0.2), matter: 7)
+    let s4 = w.scale(s3, 0.8)
+    let sharp = w.union(s2, s4)
+    let s5 = w.sphere(0.3, matter: 8)
+    let both = w.intersect(sharp, s5)
+    let top = w.union(cut, both)
+    let d = w.displace(top, amp: 0.02, freq: 4.0, octaves: 3)
+    let written = w.done().unwrap()
+    let sharp_c = sphere(0.3).translate(vec3(0.0, -1.0, 0.0)).union(cuboid(vec3(0.2)).scale(0.8)).intersect(sphere(0.3))
+    let undisplaced = sphere(0.6).translate(vec3(0.5, 0.0, 0.0))
+        .smooth_union(round_cone(vec3(-0.6, -0.3, 0.1), vec3(0.1, 0.4, -0.2), r_top: 0.15, r_bottom: 0.35), k: 0.3)
+        .smooth_subtract(cuboid(vec3(0.4, 0.3, 0.2)).rotate(q).translate(vec3(0.2, 0.5, 0.3)), k: 0.1)
+        .union(ellipsoid(vec3(0.3, 0.5, 0.4)).scale(1.5))
+        .smooth_intersect(half_space(normalize(vec3(0.1, 1.0, 0.05)), 0.7), k: 0.05)
+        .union(sharp_c)
+    let compiled = undisplaced.displace(fbm(4.0, 3), amp: 0.02)
+    for i in 0..500 {
+        let o = Box3 { lo: vec3(-3.0), hi: vec3(3.0) }.sample(7, i)
+        let to = Box3 { lo: vec3(-1.0), hi: vec3(1.0) }.sample(9, i)
+        let dir = to - o
+        let (x, y) = (written.meets(o, dir), compiled.meets(o, dir))
+        assert(x.near == y.near && x.far == y.far && x.first == y.first && x.flags == y.flags, f"ray {i}: meets differ: written [{x.near}, {x.far}] first {x.first}, compiled [{y.near}, {y.far}] first {y.first}")
+        let (u, v) = (written.passes(o, dir), compiled.passes(o, dir))
+        assert(u.t == v.t && u.distance == v.distance && u.low == v.low && u.high == v.high && u.flags == v.flags && u.other == v.other && u.other_distance == v.other_distance && u.blend == v.blend, f"ray {i}: passes differ: written t {u.t} [{u.low}, {u.high}] {u.distance}, compiled t {v.t} [{v.low}, {v.high}] {v.distance}")
+        let (m, n) = (written.meets_grown(o, dir, grow: 0.1, inner: -0.05), undisplaced.displace(fbm(4.0, 3), amp: 0.02).meets_grown(o, dir, grow: 0.1, inner: -0.05))
+        assert(m.near == n.near && m.far == n.far && m.first == n.first && m.flags == n.flags, f"ray {i}: grown meets differ")
+    }
+}
+
+/// A written field's `live` masks, `pruned` ranges and `distance_live` are its compiled tree's,
+/// to the bit: a fold of seventeen smooth unions with a wand (the body), and the tree of every
+/// kind, at boxes from 1 m to 3 cm.
+@test
+fn a_written_fields_live_parts_are_its_compiled_trees() {
+    // Six cones in a chain of smooth unions, a wand, the whole moved (the body's shape, written
+    // out: the compiled n-ary fold prunes by its own rule).
+    let cone = |i: u32| {
+        let a = f32(i) * 0.37
+        round_cone(vec3(0.12 * cos(a), 0.06 * f32(i), 0.12 * sin(a)), vec3(0.25 * cos(a), 0.06 * f32(i) + 0.12, 0.25 * sin(a)), r_top: 0.03, r_bottom: 0.045)
+    }
+    var w = writing()
+    for i in 0..6 {
+        let a = f32(i) * 0.37
+        let n = w.round_cone(vec3(0.12 * cos(a), 0.06 * f32(i), 0.12 * sin(a)), vec3(0.25 * cos(a), 0.06 * f32(i) + 0.12, 0.25 * sin(a)), r_top: 0.03, r_bottom: 0.045, matter: 1)
+        if i > 0 {
+            let u = w.smooth_union(n - 1, n, 0.03)
+        }
+    }
+    let wand = w.round_cone(vec3(-0.42, 0.87, -0.04), vec3(-0.5, 1.05, 0.26), r_top: 0.005, r_bottom: 0.005, matter: 2)
+    let all = w.smooth_union(wand - 1, wand, 0.004)
+    let moved = w.translate(all, vec3(1.0, 0.0, -2.0))
+    let written = w.done().unwrap()
+    let compiled = cone(0).smooth_union(cone(1), k: 0.03).smooth_union(cone(2), k: 0.03).smooth_union(cone(3), k: 0.03)
+        .smooth_union(cone(4), k: 0.03).smooth_union(cone(5), k: 0.03)
+        .smooth_union(round_cone(vec3(-0.42, 0.87, -0.04), vec3(-0.5, 1.05, 0.26), r_top: 0.005, r_bottom: 0.005), k: 0.004)
+        .translate(vec3(1.0, 0.0, -2.0))
+    let q = Quat::axis_angle(normalize(vec3(1.0, 2.0, 0.5)), 0.7)
+    var v = writing()
+    let a = v.sphere(0.6, matter: 1)
+    let a1 = v.translate(a, vec3(0.5, 0.0, 0.0))
+    let b = v.round_cone(vec3(-0.6, -0.3, 0.1), vec3(0.1, 0.4, -0.2), r_top: 0.15, r_bottom: 0.35, matter: 2)
+    let ab = v.smooth_union(a1, b, 0.3)
+    let c = v.cuboid(vec3(0.4, 0.3, 0.2), matter: 3)
+    let c1 = v.rotate(c, q)
+    let c2 = v.translate(c1, vec3(0.2, 0.5, 0.3))
+    let abc = v.smooth_subtract(ab, c2, 0.1)
+    let e = v.ellipsoid(vec3(0.3, 0.5, 0.4), matter: 4)
+    let e1 = v.scale(e, 1.5)
+    let all2 = v.union(abc, e1)
+    let s1 = v.sphere(0.25, matter: 5)
+    let s2 = v.translate(s1, vec3(0.0, -0.9, 0.0))
+    let all3 = v.union(all2, s2)
+    let d = v.displace(all3, amp: 0.02, freq: 4.0, octaves: 3)
+    let every = v.done().unwrap()
+    let every_c = sphere(0.6).translate(vec3(0.5, 0.0, 0.0))
+        .smooth_union(round_cone(vec3(-0.6, -0.3, 0.1), vec3(0.1, 0.4, -0.2), r_top: 0.15, r_bottom: 0.35), k: 0.3)
+        .smooth_subtract(cuboid(vec3(0.4, 0.3, 0.2)).rotate(q).translate(vec3(0.2, 0.5, 0.3)), k: 0.1)
+        .union(ellipsoid(vec3(0.3, 0.5, 0.4)).scale(1.5))
+        .union(sphere(0.25).translate(vec3(0.0, -0.9, 0.0)))
+        .displace(fbm(4.0, 3), amp: 0.02)
+    let bb = compiled.bound()
+    var differing = 0
+    var left_out = 0
+    for side in [1.0, 0.3, 0.1, 0.03] {
+        for i in 0..24 {
+            let c = Box3 { lo: bb.centre - vec3(0.8 * bb.radius), hi: bb.centre + vec3(0.8 * bb.radius) }.sample(3, i)
+            let bx = Box3 { lo: c - vec3(0.5 * side), hi: c + vec3(0.5 * side) }
+            let (x, y) = (written.pruned(bx, |p: vec3| p, 1.0, ALL_LIVE, 0), compiled.pruned(bx, |p: vec3| p, 1.0, ALL_LIVE, 0))
+            assert(x.live.words == y.live.words && x.range.lo == y.range.lo && x.range.hi == y.range.hi, f"the body, side {side}, box {i}: written [{x.range.lo}, {x.range.hi}], compiled [{y.range.lo}, {y.range.hi}]")
+            left_out += 7 - x.live.count(7)
+            for j in 0..8 {
+                let p = bx.sample(4, j + 8 * i)
+                assert(written.distance_live(p, x.live) == compiled.distance_live(p, y.live), f"the body's masked ask, side {side}, box {i}")
+            }
+            let c2_ = Box3 { lo: vec3(-1.0), hi: vec3(1.0) }.sample(6, i)
+            let by = Box3 { lo: c2_ - vec3(0.5 * side), hi: c2_ + vec3(0.5 * side) }
+            let (u, t) = (every.pruned(by, |p: vec3| p, 1.0, ALL_LIVE, 0), every_c.pruned(by, |p: vec3| p, 1.0, ALL_LIVE, 0))
+            assert(u.live.words == t.live.words && u.range.lo == t.range.lo && u.range.hi == t.range.hi, f"every kind, side {side}, box {i}: written [{u.range.lo}, {u.range.hi}], compiled [{t.range.lo}, {t.range.hi}]")
+            for j in 0..8 {
+                let p = by.sample(4, j + 8 * i)
+                assert(every.distance_live(p, u.live) == every_c.distance_live(p, t.live), f"every kind's masked ask, side {side}, box {i}")
+            }
+        }
+    }
+    assert(left_out > 40, f"only {left_out} parts left out in all")
+}
+
+/// A written field's parts are its compiled tree's, to the bit: each part's bound and own
+/// distance, and the part that decides the distance, on the tree of every kind.
+@test
+fn a_written_fields_parts_are_its_compiled_trees() {
+    let q = Quat::axis_angle(normalize(vec3(1.0, 2.0, 0.5)), 0.7)
+    var v = writing()
+    let a = v.sphere(0.6, matter: 1)
+    let a1 = v.translate(a, vec3(0.5, 0.0, 0.0))
+    let b = v.round_cone(vec3(-0.6, -0.3, 0.1), vec3(0.1, 0.4, -0.2), r_top: 0.15, r_bottom: 0.35, matter: 2)
+    let ab = v.smooth_union(a1, b, 0.3)
+    let c = v.cuboid(vec3(0.4, 0.3, 0.2), matter: 3)
+    let c1 = v.rotate(c, q)
+    let c2 = v.translate(c1, vec3(0.2, 0.5, 0.3))
+    let abc = v.smooth_subtract(ab, c2, 0.1)
+    let e = v.ellipsoid(vec3(0.3, 0.5, 0.4), matter: 4)
+    let e1 = v.scale(e, 1.5)
+    let all = v.union(abc, e1)
+    let h = v.half_space(normalize(vec3(0.1, 1.0, 0.05)), 0.7, matter: 5)
+    let cut = v.smooth_intersect(all, h, 0.05)
+    let s1 = v.round_cone(vec3(0.0, -1.2, 0.0), vec3(0.3, -0.8, 0.1), r_top: 0.05, r_bottom: 0.1, matter: 6)
+    let s2 = v.scale(s1, 0.9)
+    let s3 = v.sphere(0.2, matter: 7)
+    let s4 = v.intersect(s2, s3)
+    let top = v.smooth_union(cut, s4, 0.1)
+    let s5 = v.round_cone(vec3(0.8, 0.8, 0.0), vec3(1.0, 1.1, 0.2), r_top: 0.04, r_bottom: 0.08, matter: 8)
+    let s6 = v.rotate(s5, q)
+    let top2 = v.union(top, s6)
+    let d = v.displace(top2, amp: 0.02, freq: 4.0, octaves: 3)
+    let written = v.done().unwrap()
+    let compiled = sphere(0.6).translate(vec3(0.5, 0.0, 0.0))
+        .smooth_union(round_cone(vec3(-0.6, -0.3, 0.1), vec3(0.1, 0.4, -0.2), r_top: 0.15, r_bottom: 0.35), k: 0.3)
+        .smooth_subtract(cuboid(vec3(0.4, 0.3, 0.2)).rotate(q).translate(vec3(0.2, 0.5, 0.3)), k: 0.1)
+        .union(ellipsoid(vec3(0.3, 0.5, 0.4)).scale(1.5))
+        .smooth_intersect(half_space(normalize(vec3(0.1, 1.0, 0.05)), 0.7), k: 0.05)
+        .smooth_union(round_cone(vec3(0.0, -1.2, 0.0), vec3(0.3, -0.8, 0.1), r_top: 0.05, r_bottom: 0.1).scale(0.9).intersect(sphere(0.2)), k: 0.1)
+        .union(round_cone(vec3(0.8, 0.8, 0.0), vec3(1.0, 1.1, 0.2), r_top: 0.04, r_bottom: 0.08).rotate(q))
+        .displace(fbm(4.0, 3), amp: 0.02)
+    assert(written.parts() == compiled.parts(), "the part counts differ")
+    for i in 0..written.parts() {
+        let (x, y) = (written.part_bound(i), compiled.part_bound(i))
+        assert(x.a == y.a && x.b == y.b && x.r == y.r && x.reach == y.reach && x.lowers == y.lowers, f"part {i}'s bound differs: written r {x.r} reach {x.reach}, compiled r {y.r} reach {y.reach}")
+    }
+    for j in 0..400 {
+        let p = Box3 { lo: vec3(-1.5), hi: vec3(1.5) }.sample(8, j)
+        let (dw, pw) = written.part_at(p)
+        let (dc, pc) = compiled.part_at(p)
+        assert(dw == dc && pw == pc, f"at ({p.x}, {p.y}, {p.z}): written part {pw} at {dw}, compiled part {pc} at {dc}")
+        for i in 0..written.parts() {
+            assert(written.part_distance(p, i) == compiled.part_distance(p, i), f"part {i}'s distance at ({p.x}, {p.y}, {p.z}) differs")
+        }
+    }
 }
 
 /// `smoothstep`'s interval with its edges reversed (a fade out, as `smoothstep(8.0, 0.0, |d|)`)

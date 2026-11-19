@@ -224,8 +224,8 @@ fn derive(
     let mut pparts: Vec<Vec<u32>> = vec![Vec::new(); func.params.len()];
     for (i, p) in func.params.iter().enumerate() {
         if mask[i] != 0 {
-            if !is_float(&m.types, p.ty) {
-                return Err(Error::not_derivable("an active parameter that isn't a float"));
+            if !floaty(&m.types, p.ty) {
+                return Err(Error::not_derivable("an active parameter that isn't made of floats"));
             }
             for k in 0..=n {
                 pparts[i].push(nf.params.len() as u32);
@@ -243,7 +243,7 @@ fn derive(
             for s in ["sure", "never"] {
                 lparts[l].push(nf.new_local(format!("{}_{s}", decl.name), bool_ty));
             }
-        } else if is_float(&m.types, decl.ty) {
+        } else if floaty(&m.types, decl.ty) {
             for k in 0..=n {
                 lparts[l].push(nf.new_local(format!("{}_a{k}", decl.name), decl.ty));
             }
@@ -253,8 +253,8 @@ fn derive(
     }
     if returns {
         let r = func.ret.ok_or_else(|| Error::internal("a missing result type"))?;
-        if !is_float(&m.types, r) || func.ret_ref {
-            return Err(Error::not_derivable("an active result that isn't a float"));
+        if !floaty(&m.types, r) || func.ret_ref {
+            return Err(Error::not_derivable("an active result that isn't made of floats"));
         }
         let mut fields = vec![("c".to_string(), r)];
         for k in 0..n {
@@ -304,6 +304,19 @@ fn derive(
     let id = m.add_function(nf);
     cache.affine.insert(key, id);
     Ok(id)
+}
+
+/// Made of floats: a float, or a struct or array of what is (a pair a function returns, a stack
+/// a loop indexes). A form of one is the aggregate of its leaves' forms: built, taken apart, kept
+/// and passed whole; arithmetic and joins are on floats alone.
+fn floaty(types: &Types, t: TypeId) -> bool {
+    match types.get(t) {
+        TypeDef::Struct { fields, .. } => {
+            !fields.is_empty() && fields.iter().all(|(_, f)| floaty(types, *f))
+        }
+        &TypeDef::Array(e, _) => floaty(types, e),
+        _ => is_float(types, t),
+    }
 }
 
 fn is_float(types: &Types, t: TypeId) -> bool {
@@ -1245,7 +1258,12 @@ impl Af<'_> {
                 let mut roots = Vec::new();
                 Self::written(then, &mut roots);
                 Self::written(else_, &mut roots);
-                if roots.iter().any(|l| self.lparts[l.index()].is_empty()) {
+                // A join is of floats (or bools): an aggregate written under the branch isn't.
+                let agg = |l: &LocalId| {
+                    let t = self.f.locals[l.index()].ty;
+                    t != self.bool_ty && !is_float(&self.m.types, t)
+                };
+                if roots.iter().any(|l| self.lparts[l.index()].is_empty() || agg(l)) {
                     return Err(Error::not_derivable(
                         "a branch on the input that writes a place that isn't a float or a bool",
                     ));
@@ -1306,8 +1324,23 @@ impl Af<'_> {
             self.sure.insert(v, s);
             return Ok(());
         }
-        if !is_float(&self.m.types, ty) {
-            return Err(Error::not_derivable("an active value that isn't a float or a bool"));
+        if !floaty(&self.m.types, ty) {
+            return Err(Error::not_derivable(
+                "an active value that isn't made of floats or a bool",
+            ));
+        }
+        let aggregate = !is_float(&self.m.types, ty);
+        if aggregate
+            && !matches!(
+                e,
+                Expr::Param(_) | Expr::Load(_) | Expr::Extract(..) | Expr::Construct(..)
+            )
+            && !matches!(e, Expr::Select { cond, .. } if !self.act.value(*cond))
+            && !matches!(e, Expr::Call(..))
+        {
+            return Err(Error::not_derivable(
+                "arithmetic on an aggregate that depends on the input",
+            ));
         }
         let a = match e {
             Expr::Param(i) if !self.pparts[*i as usize].is_empty() => {
@@ -1367,7 +1400,7 @@ impl Af<'_> {
                 let e = self.emit(out, ty, Expr::Swizzle(a.e, sw.clone()));
                 A { c, l, e }
             }
-            Expr::Construct(t, comps) if is_float(&self.m.types, *t) => {
+            Expr::Construct(t, comps) if floaty(&self.m.types, *t) => {
                 let cs: Vec<A> = comps.iter().map(|x| self.of(out, *x)).collect();
                 let c = self.emit(out, ty, Expr::Construct(*t, cs.iter().map(|a| a.c).collect()));
                 let l = (0..self.n)
@@ -1780,7 +1813,7 @@ impl Af<'_> {
             Arg::Value(x) => Ok(self.of(out, *x)),
             Arg::Place(p) => {
                 let ty = place_type(self.m, self.f, p)?;
-                if !self.active_root(&p.root) || !is_float(&self.m.types, ty) {
+                if !self.active_root(&p.root) || !floaty(&self.m.types, ty) {
                     return Err(Error::not_derivable("an active argument that isn't a float"));
                 }
                 self.load_form(out, p, ty)

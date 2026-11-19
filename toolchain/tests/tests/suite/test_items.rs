@@ -889,12 +889,13 @@ fn a_sixth_target_keeps_the_least_each_fragment_offers() {
 
 /// A field written while the program runs (`std::field::Written`, toolchain/tests/written) asked
 /// in a kernel, every leaf kind, map and join and a displacement: within 1e-6 of the compiled tree
-/// of the same kinds at 4,096 points, on both hosts.
+/// of the same kinds at 4,096 points; and its rays' `meets`, deciding parts and masked asks the
+/// compiled tree's at 1,024 rays, on both hosts.
 #[test]
 #[ignore = "needs a GPU"]
 fn a_written_field_is_its_compiled_tree_on_the_gpu() {
     let dir = wrela_tests::repo_root().join("toolchain/tests/written");
-    assert_eq!(crate::tests_pass(&dir), 1);
+    assert_eq!(crate::tests_pass(&dir), 2);
 }
 
 /// A field's distance range over a box (`std::derive::affine`, `Surface::range`'s value,
