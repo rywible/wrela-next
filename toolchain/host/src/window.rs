@@ -82,6 +82,9 @@ struct App<'a> {
     /// The program that runs: another build taking its place ends the run.
     program: u64,
     pacer: Pacer,
+    /// The device's epoch at the last frame: a frame in which it changed was a device made
+    /// again (a hitch).
+    epoch: u32,
     live: Live,
     ticker: Option<Ticker>,
     /// The voice playing, once the program starts it; why it can't, if it can't.
@@ -218,9 +221,18 @@ impl App<'_> {
                 "another build took the program's place: a window doesn't hand over yet".into(),
             ));
         }
+        // A device made again this frame (`Gpu::recover`): a hitch the pacer mustn't learn as
+        // work (learned, every third frame missed its refresh for the 120 frames after a loss).
+        let epoch = self.host.device_epoch();
+        let made_again = epoch != self.epoch;
+        self.epoch = epoch;
         if let Some(id) = self.host.present()? {
             let presented = self.now();
-            self.pacer.presented(id, sampled, presented, plan.target);
+            if made_again {
+                self.pacer.presented_after_hitch(id, presented, plan.target);
+            } else {
+                self.pacer.presented(id, sampled, presented, plan.target);
+            }
             self.waiting.insert(id, (sampled, presented));
         }
         if self.run.keep {
@@ -488,11 +500,13 @@ impl WindowRan {
         arrivals(&self.arrived, &self.sampled)
     }
 
-    /// Frames shown a second after the first.
+    /// Frames shown a second, over the second half of those shown (as `settled`): a pause
+    /// before it (the first frames, a device made again) isn't the settled rate.
     pub fn rate(&self) -> Option<f64> {
-        let (first, last) = (self.shown.get(1)?, self.shown.last()?);
+        let half = self.shown.get(self.shown.len() / 2..)?;
+        let (first, last) = (half.first()?, half.last()?);
         let span = last - first;
-        (span > 0.0).then(|| (self.shown.len() - 2) as f64 / span)
+        (span > 0.0 && half.len() > 1).then(|| (half.len() - 1) as f64 / span)
     }
 }
 
@@ -615,6 +629,7 @@ pub fn run(host: &mut Host, run: &WindowRun) -> Result<WindowRan> {
         play: None,
         program: host_program,
         pacer: Pacer::new(1.0 / 60.0),
+        epoch: 0,
         live: Live::new(),
         ticker: None,
         voice: None,

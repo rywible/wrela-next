@@ -1156,6 +1156,11 @@ impl Host {
         self.p().executor().present()
     }
 
+    /// How many times the GPU device has been lost and made again (`std::gpu::device_epoch`).
+    pub fn device_epoch(&mut self) -> u32 {
+        self.p().executor().device_epoch()
+    }
+
     /// The frames the window showed since the last take: each id and when it reached the
     /// display.
     pub fn take_presented(&mut self) -> Vec<(u64, std::time::Instant)> {

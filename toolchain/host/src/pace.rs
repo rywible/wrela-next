@@ -154,6 +154,17 @@ impl Pacer {
         if work < HITCH * self.period.min(1.0 / 30.0) {
             push(&mut self.work, work, 120);
         }
+        self.waiting_for(id, presented, target);
+    }
+
+    /// Frame `id` was presented at `presented` after a hitch the caller knows of (a device made
+    /// again): waited for as any frame, but its work isn't learned (under `HITCH` refreshes,
+    /// it would still hold every plan back for 120 frames).
+    pub fn presented_after_hitch(&mut self, id: u64, presented: f64, target: Option<f64>) {
+        self.waiting_for(id, presented, target);
+    }
+
+    fn waiting_for(&mut self, id: u64, presented: f64, target: Option<f64>) {
         self.waiting.insert(id, (target, presented));
         if target.is_some() {
             self.last_target = target;

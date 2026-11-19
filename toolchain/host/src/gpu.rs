@@ -933,6 +933,10 @@ pub(crate) struct Gpu {
 struct Presenter {
     /// The window, kept to make its surface again on a new device (`Gpu::recover`).
     window: Arc<dyn wrela_gpu::Window>,
+    /// What its surface's present ids are offset by, and the next id the host gives: a surface
+    /// made again counts its ids from 0, and the window's pacing reads them as only rising.
+    id_base: u64,
+    next_id: u64,
     surface: wrela_gpu::Surface,
     /// The format its pipeline draws: the surface's.
     format: TextureFormat,
@@ -1904,7 +1908,16 @@ impl Gpu {
         surface.configure(&self.device, &config).map_err(gpu_err)?;
         let (pipeline, layout) = present_pipeline(&self.device, surface.format())?;
         let format = surface.format();
-        self.presenter = Some(Presenter { window, surface, format, config, pipeline, layout });
+        self.presenter = Some(Presenter {
+            window,
+            id_base: 0,
+            next_id: 0,
+            surface,
+            format,
+            config,
+            pipeline,
+            layout,
+        });
         Ok(())
     }
 
@@ -1923,7 +1936,13 @@ impl Gpu {
     /// The frames the window showed since the last take: each one's id ([`Gpu::present`]) and
     /// when it reached the display.
     pub(crate) fn take_presented(&mut self) -> Vec<(u64, std::time::Instant)> {
-        self.presenter.as_mut().map(|p| p.surface.take_presented()).unwrap_or_default()
+        self.presenter
+            .as_mut()
+            .map(|p| {
+                let base = p.id_base;
+                p.surface.take_presented().into_iter().map(|(id, at)| (id + base, at)).collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Draws the screen into the window's next frame and shows it: the frame's id (`None` when
@@ -1947,7 +1966,14 @@ impl Gpu {
         }
         let cb = draw_presented(&device, &p.pipeline, &p.layout, &screen.view, &frame.view);
         device.submit_frame(vec![cb], &frame);
-        p.surface.present(frame).map(Some).map_err(gpu_err)
+        let id = p.surface.present(frame).map_err(gpu_err)? + p.id_base;
+        p.next_id = id + 1;
+        Ok(Some(id))
+    }
+
+    /// How many times the device has been made again (`std::gpu::device_epoch`).
+    pub(crate) fn device_epoch(&self) -> u32 {
+        self.program_limits.epoch
     }
 
     /// A frame begins: no label carries over from the last one.
@@ -3225,11 +3251,16 @@ impl Gpu {
     /// size (the old one let go first: a window holds one swapchain), and the screen as the
     /// program last asked (HDR, Display P3) is asked again.
     fn recover(&mut self, e: &Error) -> Result<()> {
+        let began = std::time::Instant::now();
         let mut fresh = Gpu::new(&self.manifest, &self.shaders, self.timing, self.report)?;
         if let Some(p) = self.presenter.take() {
-            let (window, config) = (p.window.clone(), p.config);
+            let (window, config, next_id) = (p.window.clone(), p.config, p.next_id);
             drop(p);
             fresh.attach_window(window, config.width, config.height, config.present)?;
+            // The new surface's ids follow the old one's (the window's pacing reads them rising).
+            if let Some(q) = &mut fresh.presenter {
+                (q.id_base, q.next_id) = (next_id, next_id);
+            }
         }
         let mut made: Vec<(u32, Made)> = self.made.iter().map(|(&h, &m)| (h, m)).collect();
         made.sort_by_key(|&(h, _)| h);
@@ -3268,10 +3299,11 @@ impl Gpu {
             new.results = std::mem::take(&mut old.results);
         }
         eprintln!(
-            "wrela-host: {e}\nwrela-host: the device was made again at frame {} (epoch {}): {} buffers, textures and samplers, zeroed",
+            "wrela-host: {e}\nwrela-host: the device was made again at frame {} (epoch {}): {} buffers, textures and samplers, zeroed, in {:.0} ms",
             self.frame,
             fresh.program_limits.epoch,
-            fresh.made.len()
+            fresh.made.len(),
+            began.elapsed().as_secs_f64() * 1000.0
         );
         *self = fresh;
         Ok(())
