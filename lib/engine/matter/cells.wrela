@@ -36,7 +36,7 @@
 // `coarsed_parts`, `fill_parts`, `redeposit`), rewritten.
 
 use matter::asked::{CELLS, PARTS, WHOLE}
-use matter::cost::{CELL_READ, FETCH, part_weights}
+use matter::cost::{counted, weights}
 use matter::ranges::{bound_of, longest, stated_steepness}
 use std::derive::{Box3, gradient, interval}
 use matter::substance::Substance
@@ -253,11 +253,11 @@ fn kept_at<M: Field<Substance>>(field: M, p: vec3, side: f32) -> vec2 {
 }
 
 /// Root bricks `first` on: whether each may hold its surface, its least distance, and who answers
-/// in it, whichever an ask there weighs least by (`weights`, `cost::part_weights`): its parts live
+/// in it, whichever an ask there weighs least by (`weights`, `cost::weights`): its parts live
 /// there (`HOLDS` with their mask: what they weigh, and a mask's own work), its whole field (`HOLDS`
 /// with every bit set), or its cells (a brick pushed, its push order its node); where it holds
 /// nothing, no one (a ray crosses it in a stride, a fetch), or its whole field where that weighs
-/// less than the fetch (`cost::FETCH`). Where its parts
+/// less than the fetch. Where its parts
 /// answer, also how steep they can be there. Only a still thing with room keeps cells; held
 /// (`g.asks`), every root answers one way.
 @compute(64)
@@ -276,7 +276,7 @@ fn coarsed<M: Field<Substance>>(field: M, g: Grid, weights: [f32], first: u32, r
     var steep = -1.0
     var mask: u32 = 4294967295
     if k.x > 0.5 {
-        let n = weights.len() - 3
+        let n = weights.len() - 5
         var w = weights[n + 1]
         if g.whole == 0 {
             mask = field.live(b).word()
@@ -295,7 +295,7 @@ fn coarsed<M: Field<Substance>>(field: M, g: Grid, weights: [f32], first: u32, r
                 mask = 4294967295
             }
         }
-        let cells = g.still > 0 && g.kept > 0 && g.asks != ASKS_FIELD && (g.asks == ASKS_CELLS || w > CELL_READ)
+        let cells = g.still > 0 && g.kept > 0 && g.asks != ASKS_FIELD && (g.asks == ASKS_CELLS || w > weights[n + 3])
         if cells {
             let s = bricks.push(x | (y << 10) | (z << 20))
             if s < g.kept {
@@ -307,7 +307,7 @@ fn coarsed<M: Field<Substance>>(field: M, g: Grid, weights: [f32], first: u32, r
             steep = if s < 1.0e30 { s } else { -1.0 }
         }
     }
-    if node == NO_BRICK && k.y >= 0.0 && weights[weights.len() - 2] <= FETCH && g.asks != ASKS_CELLS {
+    if node == NO_BRICK && k.y >= 0.0 && weights[weights.len() - 4] <= weights[weights.len() - 1] && g.asks != ASKS_CELLS {
         // Holds nothing, but its whole field weighs less than the fetch a stride across it
         // would: its whole field answers here too.
         node = HOLDS
@@ -713,10 +713,13 @@ pub struct Kept {
     /// can't say yet, as std's shapes state it: `ranges::bound_of`), and whether derived.
     derived: vec4,
     bound_derived: bool,
-    /// What each of its parts weighs (`cost::part_weights`), for its roots' choice.
+    /// What its asks weigh (`cost::weights`), for its roots' choice, once the toolchain's counts of
+    /// a read of cells and a fetch (`cost::counted`) are read back.
     weights: GpuBuffer<f32>,
     weighed: bool,
     weight: Vec<f32>,
+    counts: Option<Pending<u32>>,
+    counted_out: GpuBuffer<u32>,
     /// The ways it can be answered (`asked::WHOLE`, `PARTS`, `CELLS`): chosen from the count once
     /// (again when it starts to move), a constant of the pipelines that draw it.
     pub ways: u32,
@@ -773,6 +776,8 @@ pub fn kept() -> Kept {
         weights: buffer(1),
         weighed: false,
         weight: Vec::new(),
+        counts: None,
+        counted_out: buffer(2),
         ways: 99,
         moving: false,
         held_asks: 0,
@@ -876,16 +881,16 @@ impl Kept {
     /// be (its whole ask weighs no more than a fetch, and no mask's ask less than it); else by the
     /// walk, its live parts or its whole field a root.
     fn chosen_ways(self) -> u32 {
-        let n = self.weight.len() - 3
+        let n = self.weight.len() - 5
         let whole = self.weight[n + 1]
         var least = 1.0e30
         for i in 0..n {
             least = min(least, self.weight[i])
         }
-        if !self.moving && self.held_asks != ASKS_FIELD && (self.held_asks == ASKS_CELLS || whole > CELL_READ) {
+        if !self.moving && self.held_asks != ASKS_FIELD && (self.held_asks == ASKS_CELLS || whole > self.weight[n + 3]) {
             return CELLS
         }
-        if whole <= FETCH && (n <= 1 || self.weight[n + 2] + least >= whole) {
+        if whole <= self.weight[n + 4] && (n <= 1 || self.weight[n + 2] + least >= whole) {
             return WHOLE
         }
         PARTS
@@ -906,13 +911,31 @@ impl Kept {
             print(f"engine::matter: where it can be, {how}: within {d.w} m of ({d.x}, {d.y}, {d.z})")
         }
         if !self.weighed {
-            // What each of its parts weighs, once: its roots choose by it.
-            let w = part_weights(field)
-            let n = w.len() - 3
-            print(f"engine::matter: {field.parts()} parts; an ask weighs {w[n + 1]} whole, a mask {w[n + 2]} beyond the parts it asks; a read of cells {CELL_READ}{held(self.held_asks)}")
-            self.weights = buffer_of(w)
-            self.weight = part_weights(field)
-            self.weighed = true
+            // What its asks weigh, once: its roots choose by it. (The counts of a read of cells and
+            // a fetch are the GPU's code's: counted in a kernel, read back; until then, nothing
+            // is ready.)
+            match mut self.counts {
+                Some(c) => match c.poll() {
+                    Some(Ok(v)) => {
+                        let w = weights(field, v[0], v[1])
+                        let n = w.len() - 5
+                        print(f"engine::matter: {field.parts()} parts; an ask weighs {w[n + 1]} whole, a mask {w[n + 2]} beyond the parts it asks; a read of cells {w[n + 3]}, a fetch of a root {w[n + 4]}{held(self.held_asks)}")
+                        self.weights = buffer_of(w)
+                        self.weight = weights(field, v[0], v[1])
+                        self.weighed = true
+                        self.counts = None
+                    },
+                    _ => {},
+                },
+                None => {
+                    self.counted_out = buffer(2)
+                    dispatch(counted.bind(g: self.grid, span: self.cells.items(), out: mut self.counted_out), over: 1)
+                    self.counts = Some(read(self.counted_out.items()))
+                },
+            }
+            if !self.weighed {
+                return
+            }
         }
         let now = probed(field, self.derived)
         if self.probes.len() == now.len() {

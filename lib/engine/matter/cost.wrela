@@ -1,84 +1,55 @@
-// What an ask costs, as a thing's roots weigh it to choose who answers in each: the parts of its
-// field live there, or its cells (`cells::coarsed`). A STAND-IN, in this one place, until the
-// toolchain hands the program the work it already counts (the build manifest's `work`; asked for,
-// gap 8): then this file goes, and the roots read that.
-//
-// Deterministic: the toolchain turns any field into a tape of operations (`std::derive::tape`:
-// what doesn't depend on the point is folded to constants, both sides of a branch kept), so the
-// same field weighs the same on every run and machine. Each operation weighs 1; a value noise or
-// a lattice hash (one operation on the tape, a hundred or so when run) `NOISE_WEIGHT`; an fBm
-// `FBM_OCTAVES` of them. (Slice 1a measured an ask of the creature's field, 964 operations, at
-// 0.87 to 1.15 ns on the M4 and the stack's, 158 and 6 noises, at 0.9 to 1.6 ns: a noise is about
-// 130 operations.)
-//
-// A read of cells is weighed the same way, by counting what its code does (`CELL_READ`).
+// What an ask costs, as a thing's roots weigh who answers in each (`cells::coarsed`) and a thing
+// the ways it can be answered (`cells::Kept::chosen_ways`): the toolchain's own count of work, in
+// its units (about one 32-bit operation on one invocation: an operation on a component 1, a
+// division 4, a read of a buffer 8; `std::derive::work`), the same on every run and machine. Of a
+// field, std's: its whole ask (`Surface::ask_work`), each part's (`part_work`), and what a masked
+// ask does beyond the parts it asks (`base_work`; `live_work` is the base and the live parts').
+// Of the engine's own reads, the compiler's count of their code: a read of a brick's cells
+// (`cells::read_distance`) and a ray's fetch of a root (`asked::fetched`), which read
+// buffers, so are counted as GPU code (`counted`).
 
+use matter::asked::fetched
+use matter::cells::{Grid, read_distance}
 use matter::substance::Substance
 use std::collections::Vec
-use std::derive::tape
-use std::field::{Field, Live}
-use std::stage::{FBM3, HASH, NOISE3, Tape}
+use std::derive::{UNBOUNDED_WORK, work}
+use std::field::Field
+use std::gpu::{Atomics, GlobalId, GpuSpan}
 
-/// What one value noise (or lattice hash) on a tape weighs, in operations.
-pub const NOISE_WEIGHT: f32 = 150.0
+/// A count as the engine weighs it (an unbounded one, past anything).
+fn weight(w: u32) -> f32 {
+    if w == UNBOUNDED_WORK { 1.0e30 } else { f32(w) }
+}
 
-/// The octaves an fBm on a tape is weighed as.
-const FBM_OCTAVES: f32 = 6.0
+/// What a read of a brick's cells and a ray's fetch of a root weigh (into `out`, in that order):
+/// the compiler's count of their code. (`span` stands for any buffer: the count knows nothing of
+/// what it reads.)
+@compute(1)
+pub fn counted(g: Grid, span: GpuSpan<u32>, out: mut Atomics<u32>, id: GlobalId) {
+    out.store(i: 0, value: work(|p: vec3| read_distance(span, 0, vec3(0.0), 1.0, p)))
+    out.store(i: 1, value: work(|p: vec3| fetched(span, g, p, p, p.x)))
+}
 
-/// What a step's read of cells weighs, in the toolchain's own units of work (toolchain/ir/src/
-/// work.rs: an operation on a component 1, a division 4, a read of a buffer 8), counted from its
-/// code: a level of its tree walked (a test 2, a read 8, the child's place and number 12, its
-/// record read 8: 30) and its distance read between eight texels (`cells::read_distance`: the
-/// place in the brick 24, the first texel's number 14, eight reads 64, their masks and
-/// conversions 16, seven blends 21, the scale 3: 142).
-pub const CELL_READ: f32 = 172.0
-
-/// What a ray's fetch of a root weighs, counted the same way (`asked::Seen::fetched`): the root
-/// found (the place in the grid 24, its number 6), its six words read (48), and where the ray
-/// leaves the roots it holds (24): about 100. An empty root is crossed in a stride (a fetch) only
-/// where that weighs less than asking the thing's whole field there.
-pub const FETCH: f32 = 100.0
-
-/// What an ask of `field` weighs, for its roots' choice (operations): each of its parts', in std's
-/// numbering, the first 32; then what every part past them weighs together (a mask names only the
-/// first 32: the rest are always asked); then its whole ask's; then what a masked ask weighs beyond
-/// the parts it asks (its masked ask's tape, with a mask the tape can't fold so every test of it is
-/// kept, less its whole ask's).
-pub fn part_weights<M: Field<Substance>>(field: M) -> Vec<f32> {
+/// What a thing's asks weigh, for its roots' choice: each of its parts' (`part_work`), in std's
+/// numbering, the first 32; then every part past them together (a mask names only the first 32:
+/// the rest are always asked); then its whole ask's (`ask_work`); then a masked ask's beyond its
+/// parts (`base_work`); then a read of cells (`read`) and a fetch of a root (`fetch`), as
+/// `counted` counts them.
+pub fn weights<M: Field<Substance>>(field: M, read: u32, fetch: u32) -> Vec<f32> {
     let n = field.parts()
-    var out: Vec<f32> = Vec::filled(min(n, 32) + 3, 0.0)
-    for i in 0..n {
-        let w = tape_weight(tape(|q: vec3| field.part_distance(q, i)))
+    let m = min(n, 32)
+    var out: Vec<f32> = Vec::filled(m + 5, 0.0)
+    for i in 0..min(n, 4096) {
+        let w = weight(field.part_work(i))
         if i < 32 {
             out[i] = w
         } else {
-            out[min(n, 32)] += w
+            out[m] += w
         }
     }
-    let whole = tape_weight(tape(|q: vec3| field.distance(q)))
-    let masked = tape_weight(tape(|q: vec3| field.distance_live(q, Live::from_word(if q.x > 1.0e30 { 0 } else { 4294967295 }))))
-    out[min(n, 32) + 1] = whole
-    out[min(n, 32) + 2] = max(masked - whole, 0.0)
+    out[m + 1] = weight(field.ask_work())
+    out[m + 2] = weight(field.base_work())
+    out[m + 3] = weight(read)
+    out[m + 4] = weight(fetch)
     out
-}
-
-/// What a tape's ask weighs (operations).
-fn tape_weight(t: Tape) -> f32 {
-    var w = 0.0
-    var i: u32 = 0
-    while i < t.len() {
-        let op = t.op_at(i)
-        let code = op.opcode()
-        if code == NOISE3 || code == HASH {
-            w += NOISE_WEIGHT
-        } else if code == FBM3 {
-            // (Its octaves are in the tape's table, which std keeps to itself: weighed as
-            // `FBM_OCTAVES`, until the toolchain counts the work: gap 8.)
-            w += NOISE_WEIGHT * FBM_OCTAVES
-        } else {
-            w += 1.0
-        }
-        i += 1
-    }
-    w
 }

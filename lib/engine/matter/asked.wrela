@@ -113,20 +113,62 @@ fn inside_by(p: vec3, lo: vec3, side: f32) -> f32 {
     max(min(a.x, min(a.y, a.z)), 0.0)
 }
 
+/// The roots at `p`, `t` m along a ray going `inv`, fetched: the walk in them. Its words read
+/// at once (one wait for memory, not one a word); what it holds said by data, so the step
+/// answers one way whatever it holds (`answered`).
+pub fn fetched(roots: GpuSpan<u32>, g: Grid, p: vec3, inv: vec3, t: f32) -> Within {
+    let outside = max(g.lo - p, p - g.hi)
+    let out = max(outside.x, max(outside.y, outside.z)) > 0.0
+    let r = root_of(g, p)
+    let lo = root_lo(g, p)
+    let node = roots[ROOT * r]
+    let least = bitcast_f32(roots[ROOT * r + 1])
+    let derived = bitcast_f32(roots[ROOT * r + 2])
+    let clear = roots[ROOT * r + 3]
+    let mask = roots[ROOT * r + 4]
+    let region = roots[ROOT * r + 5]
+    let empty = !out && node == NO_BRICK
+    let whole = !out && node == HOLDS && mask == ALL
+    // The roots the walk holds: outside the grid, the grid (on to where the ray enters it,
+    // nothing of it along the ray where it never does; matter at least as far as the grid);
+    // an empty root and the roots round it that hold nothing either (its clearance), crossed
+    // unasked, matter at least as far as their nearest face; a root its whole field answers
+    // and every root round it that is answered so or holds nothing (its second clearance),
+    // crossed asking its whole field by the steepness std's shapes state over the whole grid,
+    // fetching nothing; or the root alone.
+    let reach = if empty { clear } else if whole { region } else { 1 }
+    let e = f32(max(reach, 1) - 1) * g.brick
+    let blo = if out { g.lo } else { lo - vec3(e) }
+    let bhi = if out { g.hi } else { lo + vec3(g.brick + e) }
+    let s = box_crossed(p, inv, blo, bhi)
+    let clear_out = length(max(outside, vec3(0.0))) + g.nudge.x
+    let gone = s.y < s.x || s.y < 0.0
+    let x_out = if gone { 1.0e9 } else { max(s.x + g.nudge.x, clear_out) }
+    let y_empty = inside_by(p, blo, g.brick + 2.0 * e)
+    let steep = if whole { g.stated } else if derived > 0.0 { max(min(derived, g.stated), 1.0) } else { g.stated }
+    // (Holding nothing, the walk says how far on and how far matter is, as `Within` says;
+    // all inside, `mask` 1.)
+    let none = out || empty
+    Within {
+        exit: t + (if out { x_out } else if empty { s.y + g.nudge.x } else { s.y }),
+        node: if none { NO_BRICK } else { node },
+        mask: if out { 0 } else if empty { if least < 0.0 { 1 } else { 0 } } else if node == HOLDS { mask } else { r },
+        steep: if out { clear_out + t } else if empty { y_empty + t } else { steep },
+    }
+}
+
+/// The root `p` is in (its number), given `p` is inside the grid `g`.
+fn root_of(g: Grid, p: vec3) -> u32 {
+    let c = clamp(floor((p - g.lo) / g.brick), vec3(0.0), g.top)
+    u32(c.x) + g.size.x * (u32(c.y) + g.size.y * u32(c.z))
+}
+
+/// The root `p` is in, its least corner.
+fn root_lo(g: Grid, p: vec3) -> vec3 {
+    g.lo + clamp(floor((p - g.lo) / g.brick), vec3(0.0), g.top) * g.brick
+}
+
 impl<M: Field<Substance>, const W: u32> Seen<M, W> {
-    /// The root `p` is in (its number), given `p` is inside the grid.
-    fn root_of(self, p: vec3) -> u32 {
-        let g = self.grid
-        let c = clamp(floor((p - g.lo) / g.brick), vec3(0.0), g.top)
-        u32(c.x) + g.size.x * (u32(c.y) + g.size.y * u32(c.z))
-    }
-
-    /// The root `p` is in, its least corner.
-    fn root_lo(self, p: vec3) -> vec3 {
-        let g = self.grid
-        g.lo + clamp(floor((p - g.lo) / g.brick), vec3(0.0), g.top) * g.brick
-    }
-
     /// Its whole field's value over the steepness std's shapes state, never past its surface.
     fn whole_at(self, p: vec3) -> f32 {
         let g = self.grid
@@ -188,49 +230,9 @@ impl<M: Field<Substance>, const W: u32> Seen<M, W> {
         vec4(read_distance(self.cells, self.nodes[node * NODE], lo, side, p), side, 0.0, if off > OFF * size { 2.0 } else { 0.0 })
     }
 
-    /// The roots at `p`, `t` m along a ray going `inv`, fetched: the walk in them. Its words read
-    /// at once (one wait for memory, not one a word); what it holds said by data, so the step
-    /// answers one way whatever it holds (`answered`).
-    fn fetched(self, p: vec3, inv: vec3, t: f32) -> Within {
-        let g = self.grid
-        let outside = max(g.lo - p, p - g.hi)
-        let out = max(outside.x, max(outside.y, outside.z)) > 0.0
-        let r = self.root_of(p)
-        let lo = self.root_lo(p)
-        let node = self.roots[ROOT * r]
-        let least = bitcast_f32(self.roots[ROOT * r + 1])
-        let derived = bitcast_f32(self.roots[ROOT * r + 2])
-        let clear = self.roots[ROOT * r + 3]
-        let mask = self.roots[ROOT * r + 4]
-        let region = self.roots[ROOT * r + 5]
-        let empty = !out && node == NO_BRICK
-        let whole = !out && node == HOLDS && mask == ALL
-        // The roots the walk holds: outside the grid, the grid (on to where the ray enters it,
-        // nothing of it along the ray where it never does; matter at least as far as the grid);
-        // an empty root and the roots round it that hold nothing either (its clearance), crossed
-        // unasked, matter at least as far as their nearest face; a root its whole field answers
-        // and every root round it that is answered so or holds nothing (its second clearance),
-        // crossed asking its whole field by the steepness std's shapes state over the whole grid,
-        // fetching nothing; or the root alone.
-        let reach = if empty { clear } else if whole { region } else { 1 }
-        let e = f32(max(reach, 1) - 1) * g.brick
-        let blo = if out { g.lo } else { lo - vec3(e) }
-        let bhi = if out { g.hi } else { lo + vec3(g.brick + e) }
-        let s = box_crossed(p, inv, blo, bhi)
-        let clear_out = length(max(outside, vec3(0.0))) + g.nudge.x
-        let gone = s.y < s.x || s.y < 0.0
-        let x_out = if gone { 1.0e9 } else { max(s.x + g.nudge.x, clear_out) }
-        let y_empty = inside_by(p, blo, g.brick + 2.0 * e)
-        let steep = if whole { g.stated } else if derived > 0.0 { max(min(derived, g.stated), 1.0) } else { g.stated }
-        // (Holding nothing, the walk says how far on and how far matter is, as `Within` says;
-        // all inside, `mask` 1.)
-        let none = out || empty
-        Within {
-            exit: t + (if out { x_out } else if empty { s.y + g.nudge.x } else { s.y }),
-            node: if none { NO_BRICK } else { node },
-            mask: if out { 0 } else if empty { if least < 0.0 { 1 } else { 0 } } else if node == HOLDS { mask } else { r },
-            steep: if out { clear_out + t } else if empty { y_empty + t } else { steep },
-        }
+    /// The roots at `p`, `t` m along a ray going `inv`, fetched: the walk in them (`fetched`).
+    pub(package) fn fetched(self, p: vec3, inv: vec3, t: f32) -> Within {
+        fetched(self.roots, self.grid, p, inv, t)
     }
 
     /// The answer at `p` in the roots the walk `k` holds, `t` m along the ray (`along` false: no
