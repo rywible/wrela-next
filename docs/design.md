@@ -508,7 +508,12 @@ none changes what an author writes; each has its kill line; the build that measu
 2. **Use the frame before.** One ray a pixel, moved a little within the pixel each frame, and the
    picture kept as a running mean where nothing has changed: a pixel becomes the mean over it
    through time, which is what the edge pass buys with nine rays and still crawls. And a ray may
-   start from where the frame before met something, carried to this frame. **Dead if** the
+   start from where the frame before met something, carried to this frame. (Elsewhere this is
+   temporal antialiasing. Two things are ours: where a pixel was last frame is known exactly,
+   since the engine knows how each thing moved, and whether what was kept is still true can be
+   asked of the matter itself, not guessed from colours; and the reference says what the mean
+   over a pixel should be, so smear and crawl are measured, not tuned by eye. Judged still,
+   moving, and on the first frame after a cut, when nothing is kept.) **Dead if** the
    judges' crawl is still over the reference's, if a walking body smears (edge error over 8/255
    while it moves), or if what is saved in edge rays is spent keeping the history.
 3. **Do not march where the surface is plain.** March a pixel in four or in sixteen; where its
@@ -521,10 +526,14 @@ none changes what an author writes; each has its kill line; the build that measu
    at a body's outline, which march longest, then hold nobody up. **Dead if** the list's own
    cost exceeds what the waiting cost (measure the waiting first: steps a pixel, mean against
    the worst in its group).
-5. **Draw fewer pixels than the screen has.** The picture at a lower rate and brought up to the
-   screen from the frame before and from what is known exactly at each pixel (depth, facing,
-   which thing). Ryan allowed this at the start; nothing uses it. It multiplies with 2. **Dead
-   if** the judged picture at the screen's size is off by more than the lines, or thin parts go.
+5. **Draw fewer pixels than the screen has.** This is 2 with one number changed: once a pixel
+   is a mean kept through time, the rays drawn each frame can be fewer than the screen's pixels.
+   So it is built after 2 holds at the screen's own rate, not before, and it is measured the way
+   everything is: the picture at the screen's size against the reference, still and moving, at
+   each rate, so the cost of each step down is a number. **The budget's targets are held at the
+   screen's own rate.** Drawing fewer is for a larger screen and for the weakest tier, never the
+   way a share is met at 1080p. **Dead if** at three quarters of the rate the judged picture is
+   already off by more than the lines, or thin parts go.
 6. **Hardware that follows rays.** The bar's card and the M4 can walk a tree of boxes in
    hardware and call our code for what is inside one; the Radeon cannot. For rays that go every
    way (light, reflections) this may be the largest saving of all, and it is the largest piece
