@@ -247,6 +247,17 @@ pub trait Surface: Copy + GpuData {
         self.pruned(over, |q: vec3| q, 1.0, ALL_LIVE, 0).live
     }
 
+    /// Where part `i` (§23's numbering) can be, in the whole surface's frame: within `r` of the
+    /// segment from `a` to `b`, and how far the joins above it can carry its effect past that
+    /// (`reach`, a distance): a part whose bound a ray passes farther than `r + reach` from
+    /// changes the distance nowhere on the ray the surface can be (`live_along`). The default is
+    /// the whole surface's bound sphere, for every part: sound for any surface, and it leaves out
+    /// nothing a ray can come near.
+    fn part_bound(self, i: u32) -> PartBound {
+        let b = self.bound()
+        PartBound { a: b.centre, r: b.radius, b: b.centre, reach: 0.0 }
+    }
+
     /// Its distance at `p`, asking only the parts `live` names: what `distance` gives, bit for
     /// bit, wherever `live` is what `live(over)` gave for a box holding `p`. A union asks no part
     /// of an operand whose parts are all left out; a surface that is no union asks all of
@@ -739,6 +750,89 @@ fn span_bits(first: u32, count: u32, w: u32) -> u32 {
     if n == 0 { 0 } else { ones << (lo - 32 * w) }
 }
 
+/// Where a part of a surface can be (`Surface::part_bound`): within `r` of the segment from `a` to
+/// `b` (a sphere where they're one point), and how far the joins above it can carry its effect
+/// past that (`reach`).
+pub struct PartBound: Copy + GpuData {
+    pub a: vec3,
+    pub r: f32,
+    pub b: vec3,
+    pub reach: f32,
+}
+
+/// The parts of `s` a segment from `a` to `b` can come near: those whose bound
+/// (`Surface::part_bound`) it passes within the part's `r`, its `reach` and `widen` of. A part
+/// left out is farther than its reach from every point of the segment: there it changes the
+/// distance nowhere the surface can be (a smooth join of width `k` changes the distance only
+/// within `k` of where its operands meet, and lowers the rest by at most its lowering, which the
+/// reach adds), so `distance_live` with these parts is the distance wherever the surface can be
+/// on the segment, and a bound elsewhere: a march along it meets what the whole surface meets.
+/// Parts past the 128th are always asked. It asks each part's bound once: for the engine's
+/// creature (18 parts), 18 bounds and 18 segment distances, once a ray.
+pub fn live_along<S: Surface>(s: S, a: vec3, b: vec3, widen: f32) -> Live {
+    var w = vec4u(0)
+    for i in 0..min(s.parts(), 128) {
+        let c = s.part_bound(i)
+        if segments_apart(a, b, c.a, c.b) <= c.r + c.reach + widen {
+            let bit = u32(1) << (i & 31)
+            let k = i >> 5
+            if k == 0 {
+                w.x = w.x | bit
+            } else if k == 1 {
+                w.y = w.y | bit
+            } else if k == 2 {
+                w.z = w.z | bit
+            } else {
+                w.w = w.w | bit
+            }
+        }
+    }
+    Live { words: w }
+}
+
+/// The least distance between the segments from `p0` to `p1` and from `q0` to `q1` (the closest
+/// points of two segments, as Ericson's Real-Time Collision Detection §5.1.9 finds them).
+pub fn segments_apart(p0: vec3, p1: vec3, q0: vec3, q1: vec3) -> f32 {
+    let d1 = p1 - p0
+    let d2 = q1 - q0
+    let r = p0 - q0
+    let a = dot(d1, d1)
+    let e = dot(d2, d2)
+    let f = dot(d2, r)
+    if a <= 1.0e-12 && e <= 1.0e-12 {
+        return length(r)
+    }
+    var s = 0.0
+    var t = 0.0
+    if a <= 1.0e-12 {
+        t = clamp(f / e, 0.0, 1.0)
+    } else {
+        let c = dot(d1, r)
+        if e <= 1.0e-12 {
+            s = clamp(-c / a, 0.0, 1.0)
+        } else {
+            let bb = dot(d1, d2)
+            let den = a * e - bb * bb
+            s = if den > 1.0e-12 { clamp((bb * f - c * e) / den, 0.0, 1.0) } else { 0.0 }
+            t = (bb * s + f) / e
+            if t < 0.0 {
+                t = 0.0
+                s = clamp(-c / a, 0.0, 1.0)
+            } else if t > 1.0 {
+                t = 1.0
+                s = clamp((bb - c) / a, 0.0, 1.0)
+            }
+        }
+    }
+    length(p0 + d1 * s - (q0 + d2 * t))
+}
+
+/// Part `i` of an array of surfaces: which element, and which of its parts (`locate`, at once
+/// where every element is one part).
+fn part_of<S: Surface, const N: u32>(parts: [S; N], i: u32) -> (u32, u32) {
+    if array_parts(parts) == N { (min(i, N - 1), 0) } else { locate(parts, i) }
+}
+
 /// What `Surface::pruned` gives: the parts still live, and the surface's range over the box.
 pub struct Pruned: Copy + GpuData {
     pub live: Live,
@@ -1179,6 +1273,10 @@ pub fn sphere(radius: f32) -> Sphere {
 }
 
 impl Surface for Sphere {
+    fn part_bound(self, i: u32) -> PartBound {
+        PartBound { a: vec3(), r: abs(self.radius), b: vec3(), reach: 0.0 }
+    }
+
     const EXACT_MEETS: bool = true
 
     fn distance(self, p: vec3) -> f32 {
@@ -1458,6 +1556,11 @@ pub fn round_cone(a: vec3, b: vec3, r_top: f32, r_bottom: f32) -> RoundCone {
 }
 
 impl Surface for RoundCone {
+    /// Its segment, at its larger radius.
+    fn part_bound(self, i: u32) -> PartBound {
+        PartBound { a: self.a, r: max(self.r1, self.r2), b: self.b, reach: 0.0 }
+    }
+
     const EXACT_MEETS: bool = true
 
     fn distance(self, p: vec3) -> f32 {
@@ -1524,6 +1627,10 @@ pub fn cuboid(half: vec3) -> Cuboid {
 }
 
 impl Surface for Cuboid {
+    fn part_bound(self, i: u32) -> PartBound {
+        PartBound { a: vec3(), r: length(self.half), b: vec3(), reach: 0.0 }
+    }
+
     const EXACT_MEETS: bool = true
 
     /// Outside, the distance to the nearest point of the box; inside, minus the distance to
@@ -1693,6 +1800,12 @@ pub struct Union<A, B>: Copy + GpuData + Eq + StateHash {
 }
 
 impl<A: Surface, B: Surface> Surface for Union<A, B> {
+    /// Its operand's: a sharp join reaches no farther than its operands.
+    fn part_bound(self, i: u32) -> PartBound {
+        let n = self.a.parts()
+        if i < n { self.a.part_bound(i) } else { self.b.part_bound(i - n) }
+    }
+
     const EXACT_MEETS: bool = A::EXACT_MEETS && B::EXACT_MEETS
 
     fn distance(self, p: vec3) -> f32 {
@@ -1780,6 +1893,16 @@ pub struct SmoothUnion<A, B>: Copy + GpuData + Eq + StateHash {
 }
 
 impl<A: Surface, B: Surface> Surface for SmoothUnion<A, B> {
+    /// Its operand's, reaching `k` farther (where its operands are within `k` of each other the
+    /// blend can move) and a quarter of `k` more (the most it lowers the other's distance).
+    fn part_bound(self, i: u32) -> PartBound {
+        let n = self.a.parts()
+        var c = if i < n { self.a.part_bound(i) } else { self.b.part_bound(i - n) }
+        let k = max(self.k, 0.0)
+        c.reach += k + 0.25 * k
+        c
+    }
+
     fn distance(self, p: vec3) -> f32 {
         smin(self.a.distance(p), self.b.distance(p), self.k)
     }
@@ -1887,6 +2010,14 @@ pub struct UnionAll<S, const N: u32>: Copy + GpuData + Eq + StateHash {
 }
 
 impl<S: Surface, const N: u32> Surface for UnionAll<S, N> {
+    fn part_bound(self, i: u32) -> PartBound {
+        if N == 0 {
+            return PartBound { a: vec3(), r: EMPTY, b: vec3(), reach: 0.0 }
+        }
+        let (k, j) = part_of(self.parts, i)
+        self.parts[k].part_bound(j)
+    }
+
     const EXACT_MEETS: bool = S::EXACT_MEETS
 
     /// The nearest part's distance; with no parts, nowhere near (`EMPTY`).
@@ -2058,6 +2189,19 @@ pub struct SmoothUnionAll<S, const N: u32>: Copy + GpuData + Eq + StateHash {
 }
 
 impl<S: Surface, const N: u32> Surface for SmoothUnionAll<S, N> {
+    /// Its element's, reaching `k` farther and the fold's whole lowering more
+    /// (`fold_lowering`, at most `k`: 0.817 k for 17 parts).
+    fn part_bound(self, i: u32) -> PartBound {
+        if N == 0 {
+            return PartBound { a: vec3(), r: EMPTY, b: vec3(), reach: 0.0 }
+        }
+        let (e, j) = part_of(self.parts, i)
+        var c = self.parts[e].part_bound(j)
+        let k = max(self.k, 0.0)
+        c.reach += k + fold_lowering(N, k)
+        c
+    }
+
     fn distance(self, p: vec3) -> f32 {
         if N == 0 {
             return EMPTY
@@ -2307,6 +2451,11 @@ impl<A: Surface, B: Surface> Surface for Intersect<A, B> {
 /// its distances back: what each combinator that moves the point does, while the warp passes
 /// every method of the surface on through it, once for all of them.
 pub trait PointMap: Copy + GpuData {
+    /// Whether it keeps shapes (a move, a turn, a scale by one factor): a segment maps to the
+    /// segment between its ends' maps, and a distance scales as a length does. The default
+    /// claims nothing.
+    const SIMILAR: bool = false
+
     /// `p` in the surface's own space.
     fn local(self, p: vec3) -> vec3
 
@@ -2344,6 +2493,19 @@ pub struct Warp<S, M>: Copy + GpuData + Eq + StateHash {
 }
 
 impl<S: Surface, M: PointMap> Surface for Warp<S, M> {
+    /// Its surface's, moved by a map that keeps shapes (`PointMap::SIMILAR`: a capsule's ends
+    /// map as points, its radius and reach as lengths); by any other, its whole bound.
+    fn part_bound(self, i: u32) -> PartBound {
+        if !M::SIMILAR {
+            let b = self.bound()
+            return PartBound { a: b.centre, r: b.radius, b: b.centre, reach: 0.0 }
+        }
+        let c = self.inner.part_bound(i)
+        let a = self.map.bound(Bound { centre: c.a, radius: c.r, slope: 1.0 })
+        let b = self.map.bound(Bound { centre: c.b, radius: c.r, slope: 1.0 })
+        PartBound { a: a.centre, r: max(a.radius, b.radius), b: b.centre, reach: self.map.distance_out(c.reach) }
+    }
+
     const EXACT_MEETS: bool = S::EXACT_MEETS
 
     fn distance(self, p: vec3) -> f32 {
@@ -2429,6 +2591,8 @@ pub struct Shift: Copy + GpuData + Eq + StateHash {
 }
 
 impl PointMap for Shift {
+    const SIMILAR: bool = true
+
     fn local(self, p: vec3) -> vec3 {
         p - self.by
     }
@@ -2449,6 +2613,8 @@ pub struct Turn: Copy + GpuData + Eq + StateHash {
 }
 
 impl PointMap for Turn {
+    const SIMILAR: bool = true
+
     /// Column by column, as a derived interval needs (it has no matrix arithmetic).
     fn local(self, p: vec3) -> vec3 {
         let m = self.to_local
@@ -2469,6 +2635,8 @@ pub struct Size: Copy + GpuData + Eq + StateHash {
 }
 
 impl PointMap for Size {
+    const SIMILAR: bool = true
+
     fn local(self, p: vec3) -> vec3 {
         p / self.by
     }
@@ -3379,6 +3547,10 @@ pub struct With<S, C>: Copy + GpuData + Eq + StateHash {
 }
 
 impl<S: Surface, C: Copy + GpuData> Surface for With<S, C> {
+    fn part_bound(self, i: u32) -> PartBound {
+        self.inner.part_bound(i)
+    }
+
     const EXACT_MEETS: bool = S::EXACT_MEETS
 
     fn distance(self, p: vec3) -> f32 {
@@ -3803,6 +3975,65 @@ fn narrowed_intervals_enclose_the_distances_and_narrow_the_derived() {
         }
     }
     assert(narrower > 8, f"only {narrower} of 64 boxes narrowed")
+}
+
+/// A body like the engine's creature: seventeen round cones in a smooth fold, a wand joined to
+/// them, the whole moved: eighteen parts.
+fn parted_body() -> Warp<SmoothUnion<SmoothUnionAll<RoundCone, 17>, RoundCone>, Shift> {
+    var parts = [round_cone(vec3(), vec3(0.0, 1.0, 0.0), r_top: 0.05, r_bottom: 0.1); 17]
+    for i in 0..17 {
+        let a = f32(i) * 0.37
+        parts[i] = round_cone(
+            vec3(0.12 * cos(a), 0.06 * f32(i), 0.12 * sin(a)),
+            vec3(0.25 * cos(a), 0.06 * f32(i) + 0.12, 0.25 * sin(a)),
+            r_top: 0.03,
+            r_bottom: 0.045,
+        )
+    }
+    let wand = round_cone(vec3(-0.42, 0.87, -0.04), vec3(-0.5, 1.05, 0.26), r_top: 0.005, r_bottom: 0.005)
+    parts.smooth_union(k: 0.03).smooth_union(wand, k: 0.004).translate(vec3(1.0, 0.0, -2.0))
+}
+
+/// Along a segment, the parts it can come near (`live_along`) give a distance never below the
+/// whole's, and the whole's wherever the surface can be; and a segment that passes far from the
+/// body leaves every part out.
+@test
+fn a_segments_live_parts_give_its_distance_where_the_surface_can_be() {
+    let s = parted_body()
+    let b = s.bound()
+    let around = Box3 { lo: b.centre - vec3(b.radius * 1.5), hi: b.centre + vec3(b.radius * 1.5) }
+    var kept = 0
+    var near = 0
+    for i in 0..300 {
+        // Through the body's middle, give or take a third of its size, so many points are near.
+        let a = around.sample(5, i)
+        let e = b.centre * 2.0 - a + (around.sample(7, i + 300) - b.centre) * 0.3
+        let live = live_along(s, a, e, 0.0)
+        kept += live.count(18)
+        for k in 0..48 {
+            let p = a + (e - a) * (f32(k) / 47.0)
+            let d = s.distance(p)
+            let dl = s.distance_live(p, live)
+            assert(dl >= d - 1.0e-5 * (1.0 + abs(d)), f"below the distance at ({p.x}, {p.y}, {p.z}): {dl} < {d}")
+            if d <= 0.002 {
+                near += 1
+                assert(abs(dl - d) <= 1.0e-5, f"not the distance near the surface: {dl} against {d}")
+            }
+        }
+    }
+    assert(near > 100, f"only {near} points near the surface")
+    assert(kept < 300 * 18, "every segment kept every part")
+    let far = live_along(s, b.centre + vec3(5.0 * b.radius, 0.0, 0.0), b.centre + vec3(5.0 * b.radius, 1.0, 0.0), 0.0)
+    assert(far.count(18) == 0, "a far segment kept parts")
+}
+
+/// A surface with no bounds of its own for its parts (a cut) gives each the whole surface's: a
+/// segment through it keeps every part.
+@test
+fn a_part_with_no_bound_of_its_own_is_the_wholes() {
+    let s = sphere(1.0).smooth_subtract(sphere(0.5).translate(vec3(0.5, 0.0, 0.0)), k: 0.1)
+    let live = live_along(s, vec3(-2.0, 0.0, 0.0), vec3(2.0, 0.0, 0.0), 0.0)
+    assert(live.count(s.parts()) == s.parts())
 }
 
 @test
