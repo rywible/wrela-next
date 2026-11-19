@@ -3005,10 +3005,9 @@ impl<'a> Ivx<'a> {
     }
 
     fn smoothstep(&mut self, out: &mut Block, ty: TypeId, x: &[Iv]) -> R<Iv> {
-        // With e0 < e1 it's non-decreasing in x and non-increasing in both edges.
+        // With e0 < e1 it's non-decreasing in x and non-increasing in both edges: its least at
+        // (e0 hi, e1 hi, x lo), its most at (e0 lo, e1 lo, x hi).
         let (e0, e1, v) = (x[0], x[1], x[2]);
-        let lo = self.builtin(out, Builtin::Smoothstep, vec![e0.1, e1.1, v.0], ty);
-        let hi = self.builtin(out, Builtin::Smoothstep, vec![e0.0, e1.0, v.1], ty);
         let ok = self.cmp(out, BinOp::Lt, e0.1, e1.0);
         // Unless the widest e1 - e0 overflows: at ∞ its t is 0, so the result grows with e0
         // there, and the corners don't bound it.
@@ -3017,10 +3016,23 @@ impl<'a> Ivx<'a> {
         let finite = self.cmp(out, BinOp::Le, w, max);
         let bt = self.bool_ty();
         let ok = self.bin(out, BinOp::And, ok, finite, bt);
+        // With e1 < e0 it is 1 - smoothstep(e1, e0, x): non-increasing in x and non-decreasing in
+        // both edges, its least and most at the opposite corners (std's fields write a fade out
+        // this way: `smoothstep(8, 0, |d|)`).
+        let rlo = self.builtin(out, Builtin::Smoothstep, vec![e0.0, e1.0, v.1], ty);
+        let rhi = self.builtin(out, Builtin::Smoothstep, vec![e0.1, e1.1, v.0], ty);
+        let rev = self.cmp(out, BinOp::Lt, e1.1, e0.0);
+        let rw = self.bin(out, BinOp::Sub, e0.1, e1.0, ty);
+        let rfinite = self.cmp(out, BinOp::Le, rw, max);
+        let rev = self.bin(out, BinOp::And, rev, rfinite, bt);
         let z = self.fc(out, ty, 0.0);
         let one = self.fc(out, ty, 1.0);
-        let lo = self.select(out, ok, lo, z);
-        let hi = self.select(out, ok, hi, one);
+        let lo = self.select(out, rev, rlo, z);
+        let hi = self.select(out, rev, rhi, one);
+        let flo = self.builtin(out, Builtin::Smoothstep, vec![e0.1, e1.1, v.0], ty);
+        let fhi = self.builtin(out, Builtin::Smoothstep, vec![e0.0, e1.0, v.1], ty);
+        let lo = self.select(out, ok, flo, lo);
+        let hi = self.select(out, ok, fhi, hi);
         // The result is in [0, 1] and its error relative to 1 is a few roundings (WGSL: inherited
         // from t² (3 - 2t), with t from a division).
         let abs = if self.gpu() { (2f64).powi(-19) } else { (2f64).powi(-20) };
