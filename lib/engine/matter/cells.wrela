@@ -214,17 +214,21 @@ pub fn read_distance(cells: GpuSpan<u32>, slot: u32, lo: vec3, side: f32, p: vec
     (v / 65535.0 - 0.5) * 4.0 * side
 }
 
-/// How far a brick's cells are off its field at the middle of its cell `k` (m: the distance's
-/// error, or the facing's times the cell's side, whichever is more), where the surface is within
-/// two cells of it; -1 elsewhere. The brick: `slot`, least corner `lo`, side `side`.
+/// How far a brick's cells are off its field at the middle of its cell `k` (m): where the surface
+/// is within two cells of it, the distance's error or the facing's times the cell's side,
+/// whichever is more; elsewhere, how much the cells overestimate the distance (what a step by them
+/// could pass a surface by), -1 at the least. The brick: `slot`, least corner `lo`, side `side`.
+/// The most of it over a brick is the error a ray subtracts from its cells (`asked::cells_at`).
 fn off_at<M: Field<Substance>>(field: M, cells: GpuSpan<u32>, slot: u32, lo: vec3, side: f32, k: u32) -> f32 {
     let cell = side / f32(B)
     let p = lo + (vec3(f32(k % B), f32((k / B) % B), f32(k / (B * B))) + vec3(0.5)) * cell
     let f = sampled(field, p, 0.25 * cell)
-    if abs(f.x) > 2.0 * cell {
-        return -1.0
-    }
     let v = read_cells(cells, slot, lo, side, p)
+    if abs(f.x) > 2.0 * cell {
+        // (Away from the surface only an overestimate matters: a step by it could pass one.
+        // Measured only near the surface, a brick's error let rays step through bumps: 83 holes.)
+        return max(v.x - f.x, -1.0)
+    }
     let n = v.yzw / max(length(v.yzw), 1.0e-6)
     max(abs(v.x - f.x), length(n - f.yzw) * cell)
 }
@@ -385,7 +389,7 @@ fn rooted<M: Field<Substance>>(field: M, g: Grid, bricks: [u32], count: [u32], f
 /// Root bricks' cells, `first` on (cell `k` of root `i` is `512 i + k`): how far each is off its
 /// field, into its node (`off_at`).
 @compute(64)
-fn measured_roots<M: Field<Substance>>(field: M, g: Grid, count: [u32], first: u32, cells: GpuSpan<u32>, nodes: mut Atomics<u32>, roots: mut Atomics<u32>, id: GlobalId) {
+fn measured_roots<M: Field<Substance>>(field: M, g: Grid, count: [u32], first: u32, cells: GpuSpan<u32>, nodes: mut Atomics<u32>, id: GlobalId) {
     let i = first + id.x
     let node = i / (B * B * B)
     if node >= min(count[0], g.kept) {
@@ -396,14 +400,6 @@ fn measured_roots<M: Field<Substance>>(field: M, g: Grid, count: [u32], first: u
     let off = off_at(field, cells, node, lo, g.brick, i % (B * B * B))
     if off > 0.0 {
         let _ = nodes.max(i: at + 7, value: bitcast_u32(off))
-    }
-    // Off by more than `OFF` of the coarsest size a root's cells are ever read at (a cell over
-    // `CELL_PER_SIZE`): they can be true at no size, so its live parts answer there instead,
-    // decided once, here (its mask and steepness were laid with the root: `coarsed`).
-    if off > OFF * g.cell / CELL_PER_SIZE {
-        let c = floor((lo - g.lo) / g.brick + vec3(0.5))
-        let r = u32(c.x) + g.size.x * (u32(c.y) + g.size.y * u32(c.z))
-        let _ = roots.exchange(i: ROOT * r, value: HOLDS)
     }
 }
 
@@ -1134,7 +1130,7 @@ impl Kept {
                 let cells_at = self.roots_kept * B * B * B
                 r = 0
                 while r < cells_at {
-                    dispatch(measured_roots.bind(field: field, g: self.grid, count: self.bricks.count(), first: r, cells: self.cells.items(), nodes: mut self.nodes, roots: mut self.roots), over: min(BAND, cells_at - r))
+                    dispatch(measured_roots.bind(field: field, g: self.grid, count: self.bricks.count(), first: r, cells: self.cells.items(), nodes: mut self.nodes), over: min(BAND, cells_at - r))
                     r += BAND
                 }
                 self.stage = 4
