@@ -375,6 +375,18 @@ pub trait Surface: Copy + GpuData {
     fn meets_grown(self, o: vec3, d: vec3, grow: f32, inner: f32) -> Meets {
         bound_meets(self.bound(), o, d, grow)
     }
+
+    /// Where the ray `o + t d` (t >= 0; any nonzero `d`, `t` in its units) passes nearest the
+    /// surface: the least its distance comes to along the ray, and a `t` where it does
+    /// (`Pass`). std's shapes answer exactly in closed form, and their sharp unions (the least
+    /// of their members'), moved and named: `exact`, the least to rounding, never farther. A
+    /// smooth union answers its members' least less its join's lowering: a bound (the true
+    /// least is at least that), its `t` the nearest member's, which `Pass::refined` makes
+    /// nearly the true least with a few asks. Anything else answers its bound's pass: a bound.
+    /// Where `distance` is at most 0 the ray meets the surface (`meets` says where first).
+    fn passes(self, o: vec3, d: vec3) -> Pass {
+        bound_passes(self.bound(), o, d)
+    }
 }
 
 /// Where a ray can meet a surface (`Surface::meets`): the stretch `near..far` of the ray's
@@ -623,6 +635,232 @@ fn bound_meets(b: Bound, o: vec3, d: vec3, grow: f32) -> Meets {
     ball_meets(o, d, b.centre, b.radius + max(grow, 0.0) / b.slope).ahead().unsure()
 }
 
+/// Where a ray passes nearest a surface (`Surface::passes`): the least its distance comes to
+/// along the ray (`t >= 0`), and a `t` where it does. `PASS_EXACT`: `distance` is that least, to
+/// rounding, and never farther; else it is a bound below it and `t` a guess. At most 0: the ray
+/// meets the surface, and `t` is a point of the ray inside or on it. Through a union, the next
+/// nearest member's pass too (`other`, its `t`, and `other_distance`, lowered as `distance` is;
+/// `EMPTY` where there's none), and the widest smooth join that lowered it (`blend`, its `k`):
+/// where the two nearest are within `blend` of each other the true least can lie between them
+/// (a seam), which `refined` asks.
+pub struct Pass: Copy + GpuData {
+    pub t: f32,
+    pub distance: f32,
+    pub flags: u32,
+    pub other: f32,
+    pub other_distance: f32,
+    pub blend: f32,
+}
+
+/// `Pass`'s flag: `distance` is the least along the ray, not a bound of it.
+pub const PASS_EXACT: u32 = 1
+
+impl Pass {
+    /// Whether `distance` is the least along the ray (not a bound below it).
+    pub fn exact(self) -> bool {
+        (self.flags & PASS_EXACT) != 0
+    }
+
+    /// Whether the ray meets the surface.
+    pub fn meets(self) -> bool {
+        self.distance <= 0.0
+    }
+
+    /// The nearer of two surfaces' passes (a union's): exact if both are; the other's nearest
+    /// kept as `other` where it is nearer than the nearer's own.
+    pub fn or(self, b: Pass) -> Pass {
+        let flags = self.flags & b.flags
+        let blend = max(self.blend, b.blend)
+        let w = if b.distance < self.distance { b } else { self }
+        let l = if b.distance < self.distance { self } else { b }
+        if l.distance < w.other_distance {
+            Pass { t: w.t, distance: w.distance, flags, other: l.t, other_distance: l.distance, blend }
+        } else {
+            Pass { flags, blend, ..w }
+        }
+    }
+
+    /// The same, lowered by `by` (a smooth join of width `k`, its lowering): a bound.
+    pub fn lowered(self, by: f32, k: f32) -> Pass {
+        Pass {
+            t: self.t,
+            distance: self.distance - by,
+            flags: 0,
+            other: self.other,
+            other_distance: self.other_distance - by,
+            blend: max(self.blend, k),
+        }
+    }
+
+    /// A bound made nearly the least: `f` (the surface's distance, or its live parts') asked
+    /// four times along the ray: three evenly spaced, then one where the parabola through them
+    /// is least; the least asked, and where. Round `t`, `h` apart (a length, m); in a seam (the
+    /// next nearest within `blend` of the nearest), from `t` to `other`. Not a bound any more:
+    /// at least the true least, by little where `f` is smooth there (std's tests and the
+    /// toolchain's `passes` fixture measure how little). An exact pass is returned as it is.
+    pub fn refined<F: Copy + fn(vec3) -> f32>(self, o: vec3, d: vec3, f: F, h: f32) -> Pass {
+        if self.exact() {
+            return self
+        }
+        let seam = self.other_distance - self.distance < self.blend
+        let centre = if seam { 0.5 * (self.t + self.other) } else { self.t }
+        let k = max(if seam { 0.5 * abs(self.other - self.t) } else { 0.0 }, h / length(d))
+        let t1 = max(centre, k)
+        let t0 = t1 - k
+        let t2 = t1 + k
+        let f0 = f(o + d * t0)
+        let f1 = f(o + d * t1)
+        let f2 = f(o + d * t2)
+        let den = f0 - 2.0 * f1 + f2
+        let tv = if den > 0.0 { max(t1 + 0.5 * k * (f0 - f2) / den, 0.0) } else { if f0 < f2 { t0 } else { t2 } }
+        let fv = f(o + d * tv)
+        var best = pass_at(t1, f1, 0)
+        if f0 < best.distance {
+            best = pass_at(t0, f0, 0)
+        }
+        if f2 < best.distance {
+            best = pass_at(t2, f2, 0)
+        }
+        if fv < best.distance {
+            best = pass_at(tv, fv, 0)
+        }
+        best
+    }
+}
+
+/// A pass at `t`, `distance` away, of one surface (no other member's, no blend).
+fn pass_at(t: f32, distance: f32, flags: u32) -> Pass {
+    Pass { t, distance, flags, other: t, other_distance: EMPTY, blend: 0.0 }
+}
+
+/// Where the ray passes nearest the ball of radius `r` about `c`: the nearest point of the ray
+/// to `c`. Exact.
+fn ball_passes(o: vec3, d: vec3, c: vec3, r: f32) -> Pass {
+    let t = max(dot(c - o, d) / dot(d, d), 0.0)
+    pass_at(t, length(o + d * t - c) - r, PASS_EXACT)
+}
+
+/// A bound's pass: its ball's, times its slope; where it bounds nothing, it says nothing.
+fn bound_passes(b: Bound, o: vec3, d: vec3) -> Pass {
+    if b.radius >= 1.0e30 || !(b.slope > 0.0) {
+        return pass_at(0.0, -EMPTY, 0)
+    }
+    let p = ball_passes(o, d, b.centre, b.radius)
+    pass_at(p.t, b.slope * p.distance, 0)
+}
+
+/// Where the ray passes nearest the box of half-extents `h` about the origin. The squared
+/// distance from the ray's point to the box, `g(t)`, is convex: on each axis the point is
+/// outside the box's slab before the ray enters it (at `a`) and after it leaves (at `b`), and
+/// half `g`'s slope is the sum over the axes of `d^2 (t - clamp(t, a, b))`: continuous,
+/// piecewise linear and rising, with a corner at each `a` and `b`. Where the ray is in every
+/// slab at once (the most `a` at most the least `b`), it meets the box there. Else the least on
+/// `t >= 0` is at 0 where the slope is at least 0 there, or where the slope crosses 0, between
+/// the last corner where it is below 0 and the first where it is at least 0 (or past the last
+/// corner): no corner lies between, so the slope is a line there. An axis the ray runs along
+/// has no corner and no slope. Exact.
+fn box_passes(o: vec3, d: vec3, h: vec3) -> Pass {
+    let w = d * d
+    let sx = pass_slab(o.x, d.x, h.x)
+    let sy = pass_slab(o.y, d.y, h.y)
+    let sz = pass_slab(o.z, d.z, h.z)
+    let a = vec3(sx.x, sy.x, sz.x)
+    let b = vec3(sx.y, sy.y, sz.y)
+    let enter = max(a.x, max(a.y, a.z))
+    let exit = min(b.x, min(b.y, b.z))
+    let s0 = box_slope(w, a, b, 0.0)
+    var t = 0.0
+    if enter <= exit && exit >= 0.0 {
+        t = max(enter, 0.0)
+    } else if s0 < 0.0 {
+        // (lo, its slope, hi, its slope): the last corner below 0 and the first at or above it.
+        var k = vec4(0.0, s0, EMPTY, 0.0)
+        k = box_bracket(k, max(a.x, 0.0), w, a, b)
+        k = box_bracket(k, max(a.y, 0.0), w, a, b)
+        k = box_bracket(k, max(a.z, 0.0), w, a, b)
+        k = box_bracket(k, max(b.x, 0.0), w, a, b)
+        k = box_bracket(k, max(b.y, 0.0), w, a, b)
+        k = box_bracket(k, max(b.z, 0.0), w, a, b)
+        if k.z == EMPTY {
+            // Past the last corner: the slope's line from `lo`.
+            let rise = box_slope(w, a, b, k.x + 1.0) - k.y
+            t = if rise > 0.0 { k.x - k.y / rise } else { k.x }
+        } else {
+            t = k.x - k.y * (k.z - k.x) / (k.w - k.y)
+        }
+    }
+    let q = abs(o + d * t) - h
+    let m = max(q.x, max(q.y, q.z))
+    pass_at(t, if m > 0.0 { length(max(q, vec3(0.0))) } else { m }, PASS_EXACT)
+}
+
+/// Where a ray (`o` and `d` an axis's) enters and leaves the slab `-h..h` of that axis; along it,
+/// everywhere (it has no corner there).
+fn pass_slab(o: f32, d: f32, h: f32) -> vec2 {
+    if d == 0.0 {
+        return vec2(-EMPTY, EMPTY)
+    }
+    let n = (-h - o) / d
+    let f = (h - o) / d
+    vec2(min(n, f), max(n, f))
+}
+
+/// Half the slope of `box_passes`'s `g` at `t`: `w` the ray's squared components, `a` and `b`
+/// where it enters and leaves each axis's slab.
+fn box_slope(w: vec3, a: vec3, b: vec3, t: f32) -> f32 {
+    dot(w, vec3(t) - clamp(vec3(t), a, b))
+}
+
+/// `box_passes`'s bracket `k` (lo, its slope, hi, its slope) with the corner at `c` taken in.
+fn box_bracket(k: vec4, c: f32, w: vec3, a: vec3, b: vec3) -> vec4 {
+    let g = box_slope(w, a, b, c)
+    let lo = g < 0.0 && c > k.x
+    let hi = g >= 0.0 && c < k.z
+    vec4(if lo { c } else { k.x }, if lo { g } else { k.y }, if hi { c } else { k.z }, if hi { g } else { k.w })
+}
+
+/// Where the ray passes nearest the round cone `c`. The hull of two balls is the union of the
+/// balls between them, centred at `a + s (b - a)` with radius `r1 + s (r2 - r1)` for `s` in
+/// 0..1 (a mix of two balls is a ball), so the least over the ray's line of the distance is the
+/// least over `s` of the ball's centre's distance from the line less its radius: across the
+/// ray, the distance from a point to a segment less a radius that changes along it, convex in
+/// `s`, least where its slope is 0 (a quadratic's root, clamped to 0..1). Along the ray, its
+/// nearest point to that centre; where that is behind the ray's start, the least on `t >= 0`
+/// is at the start (the distance is convex along the ray). Exact.
+fn round_cone_passes(o: vec3, d: vec3, c: RoundCone) -> Pass {
+    let e = c.b - c.a
+    let l = length(e)
+    let rr = c.r1 - c.r2
+    if l <= abs(rr) {
+        return ball_passes(o, d, select(if_false: c.b, if_true: c.a, cond: rr >= 0.0), max(c.r1, c.r2))
+    }
+    let dd = dot(d, d)
+    let oa = o - c.a
+    // Across the ray: `o - a` and `b - a` less their parts along it.
+    let u = oa - d * (dot(oa, d) / dd)
+    let v = e - d * (dot(e, d) / dd)
+    let delta = c.r2 - c.r1
+    let w = dot(v, v)
+    let beta = dot(u, v)
+    var s = 0.0
+    if w > delta * delta {
+        let across = length(u - v * (beta / w))
+        s = clamp(beta / w + delta * across / sqrt(w * (w - delta * delta)), 0.0, 1.0)
+    } else if delta != 0.0 {
+        // The segment across the ray is shorter than the radii's difference: the larger end.
+        s = if delta > 0.0 { 1.0 } else { 0.0 }
+    } else {
+        // Along the ray, a cylinder's sides: every `s` alike; the end farther along the ray.
+        s = if dot(e, d) > 0.0 { 1.0 } else { 0.0 }
+    }
+    let t = dot(c.a + e * s - o, d) / dd
+    if t >= 0.0 {
+        pass_at(t, length(v * s - u) - (c.r1 + delta * s), PASS_EXACT)
+    } else {
+        pass_at(0.0, c.distance(o), PASS_EXACT)
+    }
+}
+
 /// The most a fold of `n` smooth unions of width `k` (`[..].smooth_union(k)`) lowers the least
 /// of its parts' distances: one `smin` lowers it by at most `k / 4`, and each part folded after
 /// lowers it again, the most where the distances are equal: L(1) = 0, L(i + 1) = L(i) +
@@ -636,6 +874,20 @@ fn bound_meets(b: Bound, o: vec3, d: vec3, grow: f32) -> Meets {
 fn fold_lowering(n: u32, k: f32) -> f32 {
     k * (if n > 128 { 1.0 } else { FOLD_LOWERING[n] })
 }
+
+/// The join of two parts at `p`, or of three (`smin` of their distances, `k` wide): a fold's
+/// seam, as its `passes` models it.
+fn seam_at<S: Surface>(a: S, b: S, c: S, three: bool, p: vec3, k: f32) -> f32 {
+    let ab = smin(a.distance(p), b.distance(p), k)
+    if three { smin(ab, c.distance(p), k) } else { ab }
+}
+
+/// How many even samples a fold's `passes` takes of a seam before its search.
+const SEAM_SAMPLES: u32 = 5
+
+/// How many steps a fold's `passes` takes in a seam (`SmoothUnionAll::passes`): each narrows
+/// the stretch by 0.618 and asks three parts' distances once.
+const SEAM_STEPS: u32 = 6
 
 /// `fold_lowering` of `k = 1` for 0 to 128 parts.
 const FOLD_LOWERING: [f32; 129] = fold_lowerings()
@@ -1288,6 +1540,11 @@ impl Surface for Sphere {
         length(p) - self.radius
     }
 
+    /// Exact: the ray's nearest point to its centre.
+    fn passes(self, o: vec3, d: vec3) -> Pass {
+        ball_passes(o, d, vec3(), self.radius)
+    }
+
     /// Exact: the ball of radius `radius + grow`.
     fn meets_grown(self, o: vec3, d: vec3, grow: f32, inner: f32) -> Meets {
         let m = ball_meets(o, d, vec3(), self.radius + grow).ahead()
@@ -1600,6 +1857,11 @@ impl Surface for RoundCone {
         }
     }
 
+    /// Exact, in closed form (`round_cone_passes`).
+    fn passes(self, o: vec3, d: vec3) -> Pass {
+        round_cone_passes(o, d, self)
+    }
+
     /// Exact: the hull of its two balls, each grown by `grow`.
     /// Met by `inner`'s hull, where its radii stay at least 0 (shrunk further, a round cone's
     /// erosion isn't a round cone, and nothing is said).
@@ -1647,6 +1909,11 @@ impl Surface for Cuboid {
         if m > 0.0 { length(max(q, vec3(0.0))) } else { m }
     }
 
+    /// Exact, in closed form (`box_passes`).
+    fn passes(self, o: vec3, d: vec3) -> Pass {
+        box_passes(o, d, self.half)
+    }
+
     /// Exact: where the ray is between each pair of faces. Grown, the box grown by `grow` along
     /// each axis holds it (its edges and corners are rounded inside that box): not exact.
     fn meets_grown(self, o: vec3, d: vec3, grow: f32, inner: f32) -> Meets {
@@ -1688,6 +1955,14 @@ impl Surface for HalfSpace {
 
     fn distance(self, p: vec3) -> f32 {
         dot(p, self.normal) - self.offset
+    }
+
+    /// Exact: at the start where the ray doesn't go down into it; else it meets it, where it
+    /// crosses the plane.
+    fn passes(self, o: vec3, d: vec3) -> Pass {
+        let f = self.distance(o)
+        let dn = dot(d, self.normal)
+        if dn >= 0.0 || f <= 0.0 { pass_at(0.0, f, PASS_EXACT) } else { pass_at(f / -dn, 0.0, PASS_EXACT) }
     }
 
     /// Exact: one side of the plane moved by `grow`.
@@ -1818,6 +2093,11 @@ impl<A: Surface, B: Surface> Surface for Union<A, B> {
     }
 
     /// The nearer of its operands': exact where both are.
+    fn passes(self, o: vec3, d: vec3) -> Pass {
+        self.a.passes(o, d).or(self.b.passes(o, d))
+    }
+
+    /// The nearer of its operands': exact where both are.
     fn meets_grown(self, o: vec3, d: vec3, grow: f32, inner: f32) -> Meets {
         self.a.meets_grown(o, d, grow, inner).or(self.b.meets_grown(o, d, grow, inner))
     }
@@ -1912,6 +2192,12 @@ impl<A: Surface, B: Surface> Surface for SmoothUnion<A, B> {
 
     fn distance(self, p: vec3) -> f32 {
         smin(self.a.distance(p), self.b.distance(p), self.k)
+    }
+
+    /// The nearer of its operands' less the most the blend lowers it (a quarter of `k`): a
+    /// bound, at the nearer's `t`.
+    fn passes(self, o: vec3, d: vec3) -> Pass {
+        self.a.passes(o, d).or(self.b.passes(o, d)).lowered(0.25 * max(self.k, 0.0), max(self.k, 0.0))
     }
 
     /// Its operands', each grown by `k / 4`, which is the most `smin` lowers the smaller
@@ -2034,6 +2320,18 @@ impl<S: Surface, const N: u32> Surface for UnionAll<S, N> {
             d = min(d, self.parts[i].distance(p))
         }
         d
+    }
+
+    /// The nearest of its parts': exact where every part's is. A part whose bound's pass is no
+    /// nearer than the nearest yet isn't asked.
+    fn passes(self, o: vec3, d: vec3) -> Pass {
+        var p = pass_at(0.0, EMPTY, PASS_EXACT)
+        for i in 0..N {
+            if bound_passes(self.parts[i].bound(), o, d).distance < p.distance {
+                p = p.or(self.parts[i].passes(o, d))
+            }
+        }
+        p
     }
 
     /// The nearest of its parts': exact where every part's is.
@@ -2220,6 +2518,108 @@ impl<S: Surface, const N: u32> Surface for SmoothUnionAll<S, N> {
             d = smin(d, self.parts[i].distance(p), self.k)
         }
         d
+    }
+
+    /// The nearest of its parts' less the fold's whole lowering (`fold_lowering`): a bound. Its
+    /// `t`: the nearest part's; in a seam near the surface (the nearest part within the fold's
+    /// lowering and a quarter of `k` of the ray, so the surface can be within a quarter of `k` of
+    /// it; the next nearest within `k` of it), where the join of
+    /// the three nearest parts along the ray (`smin` of their distances) is least, found over
+    /// the stretch their passes span (and a quarter more each way) by `SEAM_SAMPLES` even samples
+    /// and a golden-section search of `SEAM_STEPS` round the least (three parts' distances a
+    /// step, no ask of the whole), where that is less than theirs at the nearest's `t`; so
+    /// `refined` asks round it.
+    fn passes(self, o: vec3, d: vec3) -> Pass {
+        var p = pass_at(0.0, EMPTY, PASS_EXACT)
+        // The three nearest parts, and their passes' `t` and distance.
+        var a: u32 = 0
+        var b: u32 = 0
+        var c: u32 = 0
+        var ta = 0.0
+        var tb = 0.0
+        var tc = 0.0
+        var db = EMPTY
+        var dc = EMPTY
+        for i in 0..N {
+            // A part whose bound's pass is no nearer than the third nearest yet can't be among the
+            // three, nor the nearest: its own pass isn't asked.
+            if bound_passes(self.parts[i].bound(), o, d).distance >= dc {
+                continue
+            }
+            let q = self.parts[i].passes(o, d)
+            if q.distance < p.distance {
+                c = b
+                tc = tb
+                dc = db
+                b = a
+                tb = ta
+                db = p.distance
+                a = i
+                ta = q.t
+            } else if q.distance < db {
+                c = b
+                tc = tb
+                dc = db
+                b = i
+                tb = q.t
+                db = q.distance
+            } else if q.distance < dc {
+                c = i
+                tc = q.t
+                dc = q.distance
+            }
+            p = p.or(q)
+        }
+        let k = max(self.k, 0.0)
+        if N > 1 && db - p.distance < k && p.distance < fold_lowering(N, k) + 0.25 * k {
+            let pa = self.parts[a]
+            let pb = self.parts[b]
+            let three = N > 2 && dc - p.distance < k
+            let pc = self.parts[if three { c } else { b }]
+            let first = min(ta, if three { min(tb, tc) } else { tb })
+            let last = max(ta, if three { max(tb, tc) } else { tb })
+            // Even samples over the stretch (and a quarter more each way), then a golden-section
+            // search round the least of them: a join of three can hold two hollows.
+            let w = last - first
+            let start = max(first - 0.25 * w, 0.0)
+            let step = (last + 0.25 * w - start) / f32(SEAM_SAMPLES - 1)
+            var best = start
+            var least = EMPTY
+            for i in 0..SEAM_SAMPLES {
+                let x = start + step * f32(i)
+                let f = seam_at(pa, pb, pc, three, o + d * x, k)
+                if f < least {
+                    least = f
+                    best = x
+                }
+            }
+            var lo = max(best - step, 0.0)
+            var hi = best + step
+            let g = 0.618034
+            var x1 = hi - g * (hi - lo)
+            var x2 = lo + g * (hi - lo)
+            var f1 = seam_at(pa, pb, pc, three, o + d * x1, k)
+            var f2 = seam_at(pa, pb, pc, three, o + d * x2, k)
+            for i in 0..SEAM_STEPS {
+                if f1 < f2 {
+                    hi = x2
+                    x2 = x1
+                    f2 = f1
+                    x1 = hi - g * (hi - lo)
+                    f1 = seam_at(pa, pb, pc, three, o + d * x1, k)
+                } else {
+                    lo = x1
+                    x1 = x2
+                    f1 = f2
+                    x2 = lo + g * (hi - lo)
+                    f2 = seam_at(pa, pb, pc, three, o + d * x2, k)
+                }
+            }
+            let f0 = seam_at(pa, pb, pc, three, o + d * ta, k)
+            let t = if min(f1, f2) >= min(f0, least) { if f0 <= least { ta } else { best } } else if f1 < f2 { x1 } else { x2 }
+            p = Pass { t, other: t, other_distance: EMPTY, ..p }
+        }
+        p.lowered(fold_lowering(N, k), k)
     }
 
     /// Its parts', each grown by the fold's whole lowering (`fold_lowering`): not exact.
@@ -2519,6 +2919,21 @@ impl<S: Surface, M: PointMap> Surface for Warp<S, M> {
 
     fn distance(self, p: vec3) -> f32 {
         self.map.distance_out(self.inner.distance(self.map.local(p)))
+    }
+
+    /// The inner surface's, the ray taken into its space (`t` kept), where the map keeps shapes
+    /// (`PointMap::SIMILAR`: its distances scale as lengths do); by any other, its bound's.
+    fn passes(self, o: vec3, d: vec3) -> Pass {
+        if !M::SIMILAR {
+            return bound_passes(self.bound(), o, d)
+        }
+        let p = self.inner.passes(self.map.local(o), self.map.local_direction(d))
+        Pass {
+            distance: self.map.distance_out(p.distance),
+            other_distance: self.map.distance_out(p.other_distance),
+            blend: self.map.distance_out(p.blend),
+            ..p
+        }
     }
 
     /// The inner surface's, the ray taken into its space (the map is affine, so `t` is kept)
@@ -2981,6 +3396,10 @@ impl<S: Surface> Surface for Named<S> {
         self.inner.distance(p)
     }
 
+    fn passes(self, o: vec3, d: vec3) -> Pass {
+        self.inner.passes(o, d)
+    }
+
     fn meets_grown(self, o: vec3, d: vec3, grow: f32, inner: f32) -> Meets {
         self.inner.meets_grown(o, d, grow, inner)
     }
@@ -3262,6 +3681,12 @@ impl<S: Surface> Surface for ToBound<S> {
 
     fn distance(self, p: vec3) -> f32 {
         clamp(self.inner.distance(p), -self.near, self.near) * self.scale
+    }
+
+    /// The inner surface's, clamped and scaled as its distance is.
+    fn passes(self, o: vec3, d: vec3) -> Pass {
+        let p = self.inner.passes(o, d)
+        Pass { distance: clamp(p.distance, -self.near, self.near) * self.scale, ..p }
     }
 
     /// The inner surface's, where `grow` is within `near` in its units; past that, every point.
@@ -3566,6 +3991,10 @@ impl<S: Surface, C: Copy + GpuData> Surface for With<S, C> {
         self.inner.distance(p)
     }
 
+    fn passes(self, o: vec3, d: vec3) -> Pass {
+        self.inner.passes(o, d)
+    }
+
     fn meets_grown(self, o: vec3, d: vec3, grow: f32, inner: f32) -> Meets {
         self.inner.meets_grown(o, d, grow, inner)
     }
@@ -3642,6 +4071,10 @@ impl<S: Surface, F: Copy + GpuData> Surface for WithAt<S, F> {
 
     fn distance(self, p: vec3) -> f32 {
         self.inner.distance(p)
+    }
+
+    fn passes(self, o: vec3, d: vec3) -> Pass {
+        self.inner.passes(o, d)
     }
 
     fn meets_grown(self, o: vec3, d: vec3, grow: f32, inner: f32) -> Meets {
@@ -4080,6 +4513,137 @@ fn the_surface_is_within_its_parts_lowering() {
     }
     assert(inside > 200, f"only {inside} points inside")
     assert(lowered > 0, "no point inside needed a part's lowering")
+}
+
+/// The least of `s`'s distance along the ray `o + t d` for `t` in 0..`far` (`d` a unit vector),
+/// found by a march of `n` even samples and then a golden-section search round the least of
+/// them: what `passes` is checked against.
+fn marched_pass<S: Surface>(s: S, o: vec3, d: vec3, far: f32, n: u32) -> Pass {
+    let step = far / f32(n)
+    var best = 0.0
+    var least = EMPTY
+    for i in 0..(n + 1) {
+        let t = f32(i) * step
+        let v = s.distance(o + d * t)
+        if v < least {
+            least = v
+            best = t
+        }
+    }
+    var a = max(best - step, 0.0)
+    var b = best + step
+    let g = 0.381966
+    for i in 0..60 {
+        let x = a + g * (b - a)
+        let y = b - g * (b - a)
+        if s.distance(o + d * x) < s.distance(o + d * y) { b = y } else { a = x }
+    }
+    let t = 0.5 * (a + b)
+    let v = s.distance(o + d * t)
+    if v < least { pass_at(t, v, 0) } else { pass_at(best, least, 0) }
+}
+
+/// The engine's stage's shapes and round cones (thin, fat, one holding the other, a cylinder),
+/// each and joined sharply: `passes` is exact (within 1e-4 m of a fine march's least, never
+/// farther by more than rounding) on rays from all round that pass near them, and says where the
+/// ray meets it.
+@test
+fn passes_of_std_shapes_are_the_least_along_the_ray() {
+    let ground = cuboid(vec3(8.0, 0.25, 8.0)).translate(vec3(0.0, -0.25, 0.0))
+    let wall = cuboid(vec3(3.0, 1.5, 0.1)).translate(vec3(0.0, 1.5, 0.0))
+    let ball = sphere(1.0).translate(vec3(-4.5, 1.0, 3.0))
+    let cone = round_cone(vec3(1.0, 0.5, 2.0), vec3(1.6, 1.4, 2.3), r_top: 0.12, r_bottom: 0.03)
+    let held = round_cone(vec3(-1.0, 0.5, 2.0), vec3(-1.02, 0.52, 2.0), r_top: 0.3, r_bottom: 0.05)
+    let rod = round_cone(vec3(2.0, 0.3, -1.0), vec3(2.0, 1.8, -1.0), r_top: 0.04, r_bottom: 0.04)
+    let stage = ground.union(wall).union(ball)
+    let cones = cone.union(held).union(rod)
+    let plane = half_space(vec3(0.1, 1.0, 0.05), 0.2)
+    var near = 0
+    var met = 0
+    var worst = 0.0
+    for i in 0..1200 {
+        let k = i % 6
+        // From 3 to 15 m away, toward a point near one of them.
+        let from = Box3 { lo: vec3(-12.0, 0.5, -12.0), hi: vec3(12.0, 9.0, 12.0) }.sample(3, i)
+        let target = if k == 0 { vec3(0.0, 1.5, 0.0) } else if k == 1 { vec3(-4.5, 1.0, 3.0) } else if k == 2 { vec3(1.3, 0.95, 2.15) } else if k == 3 { vec3(-1.0, 0.5, 2.0) } else if k == 4 { vec3(2.0, 1.0, -1.0) } else { vec3(0.0, 0.0, 0.0) }
+        let jitter = (Box3 { lo: vec3(-1.0), hi: vec3(1.0) }.sample(5, i)) * (if k == 0 || k == 1 || k == 5 { 1.6 } else { 0.25 })
+        let d = normalize(target + jitter - from)
+        for c in 0..3 {
+            let p = if c == 0 { stage.passes(from, d) } else if c == 1 { cones.passes(from, d) } else { plane.passes(from, d) }
+            let m = if c == 0 { marched_pass(stage, from, d, 40.0, 4000) } else if c == 1 { marched_pass(cones, from, d, 40.0, 4000) } else { marched_pass(plane, from, d, 400.0, 4000) }
+            assert(p.exact(), "a std shape's pass not exact")
+            if c == 2 && p.meets() && p.t > 360.0 {
+                // Past the march's reach: met where it crosses the plane.
+                assert(abs(plane.distance(from + d * p.t)) <= 1.0e-3 * p.t, f"ray {i}: not on the plane at {p.t}")
+            } else if m.distance <= 0.0 {
+                met += 1
+                assert(p.distance <= 1.0e-4, f"case {c} ray {i}: the march meets it, the pass is {p.distance} away")
+            } else {
+                near += if m.distance < 0.05 { 1 } else { 0 }
+                let off = p.distance - m.distance
+                worst = max(worst, abs(off))
+                assert(off <= 1.0e-5 * (1.0 + m.distance), f"case {c} ray {i}: the pass {p.distance} farther than the march's {m.distance}")
+                assert(abs(off) <= 1.0e-4, f"case {c} ray {i}: the pass {p.distance} at {p.t}, the march {m.distance} at {m.t}")
+                let at = if c == 0 { stage.distance(from + d * p.t) } else if c == 1 { cones.distance(from + d * p.t) } else { plane.distance(from + d * p.t) }
+                assert(abs(at - p.distance) <= 1.0e-4, f"case {c} ray {i}: the distance at its t is {at}, not {p.distance}")
+            }
+        }
+    }
+    assert(near > 100 && met > 100, f"{near} near, {met} met")
+}
+
+/// The rays of `a_smooth_unions_pass_refined_*` seen from `away` m: how many pass within a
+/// footprint of the body (a fine march's least in 0..one footprint), and how many of those its
+/// pass refined by four asks puts within a twentieth of one; the bound never farther than the
+/// march's least.
+fn refined_passes(away: f32, rays: u32) -> vec2u {
+    let s = parted_body()
+    let pixel = 2.0 / (1080.0 * (1.0 / tan(0.3)))
+    let foot = pixel * away
+    var within: u32 = 0
+    var good: u32 = 0
+    for i in 0..rays {
+        // A point of the surface (near a part, taken onto it along the gradient), and a ray
+        // along the surface there, lifted off it by up to a footprint (or into it a little).
+        let part = s.part_bound(i % 18)
+        var q = part.a + (part.b - part.a) * fract(f32(i) * 0.618034) + normalize(Box3 { lo: vec3(-1.0), hi: vec3(1.0) }.sample(7, i) + vec3(0.0, 0.0, 0.01)) * part.r
+        for k in 0..6 {
+            let g = gradient(|x: vec3| s.distance(x), q)
+            q = q - g * (s.distance(q) / max(dot(g, g), 1.0e-12))
+        }
+        let n = normalize(gradient(|x: vec3| s.distance(x), q))
+        let d = normalize(cross(n, Box3 { lo: vec3(-1.0), hi: vec3(1.0) }.sample(11, i) + vec3(0.01, 0.0, 0.0)))
+        let from = q + n * (foot * (1.2 * fract(f32(i) * 0.414214) - 0.1)) - d * away
+        let p = s.passes(from, d)
+        let m = marched_pass(s, from, d, away + 1.0, 2000)
+        assert(p.distance <= m.distance + 1.0e-6, f"ray {i}: the bound {p.distance} farther than the march's {m.distance}")
+        if m.distance > 0.0 && m.distance <= foot {
+            within += 1
+            let r = p.refined(from, d, |q: vec3| s.distance(q), 0.5 * foot)
+            assert(r.distance >= m.distance - 1.0e-6, f"ray {i}: refined {r.distance} nearer than the march's {m.distance}")
+            good += if r.distance - m.distance <= foot / 20.0 { 1 } else { 0 }
+        }
+    }
+    vec2u(within, good)
+}
+
+/// A creature-like body (`parted_body`) seen from 1.5 m (the engine's near body eye): its pass is
+/// a bound, and refined by four asks it is within a twentieth of a pixel's footprint (the
+/// engine's camera: 0.6 rad high at 1080 rows, 0.57 mm a metre) of the true least on 99% of the
+/// rays that pass within a footprint.
+@test
+fn a_smooth_unions_pass_refined_is_within_a_twentieth_of_a_footprint_near() {
+    let r = refined_passes(1.5, 700)
+    assert(r.x > 100, f"only {r.x} rays within a footprint")
+    assert(r.y * 100 >= r.x * 99, f"{r.y} of {r.x} within a twentieth")
+}
+
+/// The same from 6 m (the engine's far body eye).
+@test
+fn a_smooth_unions_pass_refined_is_within_a_twentieth_of_a_footprint_far() {
+    let r = refined_passes(6.0, 700)
+    assert(r.x > 100, f"only {r.x} rays within a footprint")
+    assert(r.y * 100 >= r.x * 99, f"{r.y} of {r.x} within a twentieth")
 }
 
 /// A surface with no bounds of its own for its parts (a cut) gives each the whole surface's: a

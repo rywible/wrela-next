@@ -454,3 +454,13 @@ fn the_meets_fixture_builds_shipped() {
     write_package(&dir, "meets", include_str!("../../meets/main.wrela"));
     assert_eq!(e0712(&dir), Vec::<String>::new());
 }
+
+/// The passes fixture (toolchain/tests/passes) builds shipped: std's `passes` (a round cone's
+/// closed form, a box's corners, a fold's seam search over its three nearest parts) and
+/// `Pass::refined` from a pixel program, with no E0712 in std's code.
+#[test]
+fn the_passes_fixture_builds_shipped() {
+    let dir = scratch("same_passes");
+    write_package(&dir, "passes", include_str!("../../passes/main.wrela"));
+    assert_eq!(e0712(&dir), Vec::<String>::new());
+}
