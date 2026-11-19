@@ -27,6 +27,15 @@
 // (Read in the eye draws instead, it cost the Radeon's march its occupancy: SCENE 0 14.12 ->
 // 14.33 ms there, against 14.18 read apart.)
 //
+// A probe is only as good as the matter it was asked through. Still matter's cells split and fold
+// as the eye asks (`Kept::refine`), each change counted (`Store::changes`); a probe keeps the count
+// it was filled at (`filled_at`). Once a frame passes with no change (matter quiet), a probe whose
+// count is behind is made again: read, it says it is missing, the pixel asks its own ray, and it
+// is listed and filled anew (`probed`). While matter is changing (the eye moving, cells still
+// refining), probes are kept as they are, so a moving eye still reads them; once it has settled,
+// nothing refills. So the settled picture is that of the settled matter, whatever frame each probe
+// was first asked in.
+//
 // A probe keeps the sky too: the share of the open sky's light (by luminance) still things let
 // through to its point along `SKY_WAYS` fixed ways over its hemisphere, cosine-spread (`sky_way`:
 // the same for every probe and pixel, so a share moves in steps of one in 32 and never flickers),
@@ -83,6 +92,10 @@ const MADE: u32 = 1
 const LISTED: u32 = 2
 const FILLED: u32 = 4
 const TICKET: u32 = 16777216
+
+/// A slot's state kept when its probe is made again (`probed`): made, pointed and the tickets; not
+/// listed, not filled, no rays' answers.
+const AGAIN: u32 = 4290772993
 
 /// A slot's state: its point and facing written (`probes_pointed`). Until then its word 4 holds
 /// the complement of the least pixel that asked for it this frame (`probes_owned`): a probe's point
@@ -149,7 +162,7 @@ fn says(state: u32) -> u32 {
 
 /// The probe of the surface at `p` facing `n`, seen `size` m finely: its state; made (with `p` and
 /// `n`) and queued to be filled where there is none (0 then, as while it is being made).
-fn probed(table: mut Atomics<u32>, head: mut Atomics<u32>, list: mut Atomics<u32>, p: vec3, n: vec3, size: f32) -> u32 {
+fn probed(table: mut Atomics<u32>, head: mut Atomics<u32>, list: mut Atomics<u32>, filled_at: GpuSpan<u32>, changes: GpuSpan<u32>, p: vec3, n: vec3, size: f32) -> u32 {
     let k = key_of(p, n, size)
     var s = slot_of(k)
     var state: u32 = 0
@@ -178,6 +191,15 @@ fn probed(table: mut Atomics<u32>, head: mut Atomics<u32>, list: mut Atomics<u32
             going = false
         } else if c == k.z && table.load(i: at) == k.x && table.load(i: at + 1) == k.y {
             state = table.load(i: at + 3)
+            if stale(s, state, filled_at, changes) {
+                // (Made again: not filled, no answers, no share of the sky; its point kept. The
+                // pixel that clears its filling clears its share.)
+                let old = table.and(i: at + 3, value: AGAIN)
+                if (old & FILLED) != 0 {
+                    let _ = table.and(i: at + 7, value: 65535)
+                }
+                state = old & AGAIN
+            }
             if (state & (MADE | LISTED | FILLED)) == MADE {
                 queued(mut table, mut head, mut list, s)
             }
@@ -232,6 +254,22 @@ fn looked_up(table: GpuSpan<u32>, p: vec3, n: vec3, size: f32) -> vec2u {
 /// No slot.
 const NONE: u32 = 4294967295
 
+/// Whether the probe in `slot` (its state `state`) was filled through matter that has changed
+/// since, and matter is quiet now (`Store::changes`: the count, last frame's, quiet): to be made
+/// again.
+fn stale(slot: u32, state: u32, filled_at: GpuSpan<u32>, changes: GpuSpan<u32>) -> bool {
+    (state & FILLED) != 0 && changes[2] != 0 && filled_at[slot] != changes[0]
+}
+
+/// Matter's changes this frame weighed (`Store::changes`, at the frame's start): quiet where none
+/// came since the last frame's.
+@compute(1)
+fn matter_aged(changes: mut Atomics<u32>, id: GlobalId) {
+    let now = changes.load(i: 0)
+    changes.store(i: 2, value: if now == changes.load(i: 1) { 1 } else { 0 })
+    changes.store(i: 1, value: now)
+}
+
 /// What the store says of the sun from still things at a surface at `p` facing `n`, seen `size` m
 /// finely (an eye draw asks it as it meets the surface): `SAYS_LIT`, `SAYS_DARK`, 0 (it can't
 /// say: an edge, a probe not filled, or a surface off its probe's plane, which the probe's rays
@@ -239,9 +277,9 @@ const NONE: u32 = 4294967295
 ///
 /// And (`y`) the share of the open sky's light the still things let through to it (1 where it
 /// can't say).
-pub fn said(table: GpuSpan<u32>, p: vec3, n: vec3, size: f32) -> vec2 {
+pub fn said(table: GpuSpan<u32>, filled_at: GpuSpan<u32>, changes: GpuSpan<u32>, p: vec3, n: vec3, size: f32) -> vec2 {
     let f = looked_up(table, p, n, size)
-    if f.x == NONE || (f.y & (MADE | LISTED | FILLED)) == MADE {
+    if f.x == NONE || (f.y & (MADE | LISTED | FILLED)) == MADE || stale(f.x, f.y, filled_at, changes) {
         return vec2(f32(SAYS_MISSING), 1.0)
     }
     if (f.y & POINTED) == 0 {
@@ -280,7 +318,7 @@ pub fn said_kept(v: f32) -> u32 {
 
 /// Each pixel whose probe is missing (`said`, kept in `kept`): its probe made and listed.
 @compute(8, 8)
-fn probes_made(kept: Texture<Rg8>, place: Texture<Rgba32Float>, asks: Texture<Rgba32Float>, table: mut Atomics<u32>, head: mut Atomics<u32>, list: mut Atomics<u32>, id: GlobalId) {
+fn probes_made(kept: Texture<Rg8>, place: Texture<Rgba32Float>, asks: Texture<Rgba32Float>, filled_at: GpuSpan<u32>, changes: GpuSpan<u32>, table: mut Atomics<u32>, head: mut Atomics<u32>, list: mut Atomics<u32>, id: GlobalId) {
     if id.x >= kept.width() || id.y >= kept.height() {
         return
     }
@@ -289,7 +327,7 @@ fn probes_made(kept: Texture<Rg8>, place: Texture<Rgba32Float>, asks: Texture<Rg
     }
     let at = place.load(id.x, id.y)
     let a = asks.load(id.x, id.y)
-    let _ = probed(mut table, mut head, mut list, a.xyz, at.xyz, a.w)
+    let _ = probed(mut table, mut head, mut list, filled_at, changes, a.xyz, at.xyz, a.w)
 }
 
 /// Each pixel whose probe was missing (`kept`): offered as its probe's owner, where the probe has
@@ -502,7 +540,7 @@ fn probe_ray_kind<K: Kinded>(c: FillCorner, pixel: FragCoord, k: K, sun: vec3, t
 
 /// This frame's probes, their rays' answers gathered (`rays`, the fill's target) into their state.
 @compute(64)
-fn probes_settled<S: Sky>(rays: Texture<Rgba8>, list: [u32], head: [u32], sky: S, table: mut Atomics<u32>, id: GlobalId) {
+fn probes_settled<S: Sky>(rays: Texture<Rgba8>, list: [u32], head: [u32], sky: S, changes: [u32], table: mut Atomics<u32>, filled_at: mut Atomics<u32>, id: GlobalId) {
     let j = id.x
     let n = min(head[0], LIST)
     if n <= head[1] || j >= min(n - head[1], FILL) {
@@ -539,6 +577,7 @@ fn probes_settled<S: Sky>(rays: Texture<Rgba8>, list: [u32], head: [u32], sky: S
         }
     }
     let _ = table.or(i: slot * WORDS + 3, value: state)
+    filled_at.store(i: slot, value: changes[0])
 }
 
 /// The list's head moved past this frame's probes; once every probe on it is filled (or past its
@@ -660,6 +699,11 @@ pub struct Store {
     pub off: bool,
     counts: GpuBuffer<u32>,
     counted: Option<Pending<u32>>,
+    /// Still matter's changes (`Kept::refine` counts each split and fold into word 0), last frame's
+    /// count (1), and whether none came since (2: quiet); and the count each slot's probe was filled
+    /// at.
+    pub changes: GpuBuffer<u32>,
+    filled_at: GpuBuffer<u32>,
 }
 
 /// An empty store.
@@ -675,6 +719,8 @@ pub fn store() -> Store {
         off: false,
         counts: buffer(11),
         counted: None,
+        changes: buffer(3),
+        filled_at: buffer(SLOTS),
     }
 }
 
@@ -682,6 +728,7 @@ impl Store {
     /// Brought up to the world's still things and the sun: emptied where the sun turned or a thing
     /// began or stopped moving (what a probe knows of them is wrong then).
     pub fn kept_for(mut self, kept: Vec<Kept>, sun: vec3) {
+        dispatch(matter_aged.bind(changes: mut self.changes), over: 1)
         var same = dot(sun, self.sun) > 0.9999999 && self.moving.len() == kept.len()
         if same {
             for i in 0..kept.len() {
@@ -711,12 +758,21 @@ impl Store {
         self.table.items()
     }
 
+    /// The count each slot's probe was filled at, and matter's changes (`said`).
+    pub fn filled_at(self) -> GpuSpan<u32> {
+        self.filled_at.items()
+    }
+
+    pub fn changed(self) -> GpuSpan<u32> {
+        self.changes.items()
+    }
+
     /// The probes the picture found missing (`said`, kept in `kept`) made and listed.
     pub fn made(mut self, kept: Texture<Rg8>, place: Texture<Rgba32Float>, asks: Texture<Rgba32Float>) {
         label("light made")
         // (Three passes: a key that lost its slot to another in one makes it in the next.)
         for _ in 0..3 {
-            dispatch(probes_made.bind(kept, place, asks, table: mut self.table, head: mut self.head, list: mut self.list), groups: ((kept.width() + 7) / 8, (kept.height() + 7) / 8, 1))
+            dispatch(probes_made.bind(kept, place, asks, filled_at: self.filled_at.items(), changes: self.changes.items(), table: mut self.table, head: mut self.head, list: mut self.list), groups: ((kept.width() + 7) / 8, (kept.height() + 7) / 8, 1))
         }
         dispatch(probes_owned.bind(kept, place, asks, table: mut self.table), groups: ((kept.width() + 7) / 8, (kept.height() + 7) / 8, 1))
         dispatch(probes_pointed.bind(place, asks, list: self.list.items(), head: self.head.items(), table: mut self.table), over: LIST)
@@ -732,7 +788,7 @@ impl Store {
         var f = Filling { pass: begin_pass(mut self.rays, clear: vec4(0.0)), kept, sun, table: self.table.items(), list: self.list.items(), head: self.head.items() }
         world.each(kept, kinds, 0, mut f)
         f.pass.end()
-        dispatch(probes_settled.bind(rays: self.rays, list: self.list.items(), head: self.head.items(), sky: sky, table: mut self.table), over: FILL)
+        dispatch(probes_settled.bind(rays: self.rays, list: self.list.items(), head: self.head.items(), sky: sky, changes: self.changes.items(), table: mut self.table, filled_at: mut self.filled_at), over: FILL)
         dispatch(probes_advanced.bind(head: mut self.head), over: 1)
     }
 
