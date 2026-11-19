@@ -48,7 +48,7 @@ use reference::traced::LEAVE
 use std::collections::Vec
 use std::gpu::{
     Address, Append, AppendBuffer, Atomics, Blend, ClipPosition, DepthPass5, DepthTexture, FragCoord, GlobalId, GpuBuffer, GpuSpan, Pass, R8,
-    R32Float, Rgba16Float, Rgba32Float, Sampler, Targets5, Texels, Texture, VertexIndex, WithDepthBehind, append_buffer, begin_pass,
+    Rgba16Float, Rgba32Float, Sampler, Targets5, Texels, Texture, VertexIndex, WithDepthBehind, append_buffer, begin_pass,
     begin_pass5_with_depth, begin_screen_pass, buffer, depth_texture, discard, dispatch, draw, label, sampler, texture, timed,
     writable_texture,
 }
@@ -163,29 +163,6 @@ fn depth_of(t: f32) -> f32 {
     t / (t + 1.0)
 }
 
-/// A patch's side (px): one scout a patch (`scout`). Measured at 4, 8 and 16 (NOTES, part 2).
-pub const PATCH: u32 = 8
-
-/// Where no scout came near matter: nothing is in the patch.
-const NOWHERE: f32 = 1.0e30
-
-/// A thing's scout draw, a fragment a patch of `PATCH`² pixels: the one ray widened to a cone
-/// that holds every pixel's ray of the patch with a pixel to spare (`touch`: met where matter
-/// comes within its half width), against that thing (`w`) alone: the last place it was clear, or
-/// `NOWHERE`. The things' scouts are kept by the least (`Blend::Min`): along every ray of the
-/// patch no matter is nearer.
-@fragment
-pub fn scout<A: Asked>(pixel: FragCoord, v: View, w: A) -> vec4 {
-    let at = floor(pixel.position.xy) * f32(PATCH) + vec2(0.5 * f32(PATCH))
-    let px = v.pixel()
-    // (The cone's radius: the patch's half diagonal and a pixel, at the patch's widest, a corner,
-    // where a pixel's angle is widest too: so its whole width, twice that, with the corner's.)
-    let corner = abs(at - 0.5 * v.size) + vec2(0.5 * f32(PATCH))
-    let widest = 1.0 + dot(corner, corner) * (px * px * 0.25)
-    let m = met(w, Ray { o: v.at, d: v.ray(at), from: 0.0, to: 1.0e9, wide: 0.0, spread: px * (f32(PATCH) * 1.4143 + 2.0) * widest, touch: 0.5 })
-    vec4(if m.met { m.t } else { NOWHERE })
-}
-
 /// The depth a near miss is kept at: behind anything met.
 const MISSED: f32 = 0.9999999
 
@@ -214,20 +191,14 @@ pub fn eye<A: Asked, S: Sky>(
     lay: Lay,
     list: GpuSpan<u32>,
     count: GpuSpan<u32>,
-    scouts: Texture<R32Float>,
 ) -> WithDepthBehind<Targets5<vec4, vec4, vec4, vec4, vec4>> {
     let at = spot(pixel.position.xy, lay, list, count)
     let d = v.ray(at.xy)
     let px = v.pixel()
-    // (On the screen, from where its patch's scouts were clear; the edge pass's rays from the eye.)
-    var from = 0.0
-    if lay.edges == 0 {
-        from = scouts.load(u32(pixel.position.x) / PATCH, u32(pixel.position.y) / PATCH)
-    }
-    let m = met(w, Ray { o: v.at, d, from: min(from, 1.0e9), to: 1.0e9, wide: 0.0, spread: px, touch: 0.0 })
+    let m = met(w, Ray { o: v.at, d, from: 0.0, to: 1.0e9, wide: 0.0, spread: px })
     var out = Targets5 { first: vec4(0.0), second: vec4(0.0), third: vec4(0.0), fourth: vec4(0.0), fifth: vec4(0.0) }
     var depth = MISSED
-    if at.z < 0.5 || from >= NOWHERE || (!m.met && !(m.nearest < 0.5)) {
+    if at.z < 0.5 || (!m.met && !(m.nearest < 0.5)) {
         discard()
     } else if !m.met {
         out.second = vec4(v.at + d * m.nearest_t, px * m.nearest_t)
@@ -259,7 +230,7 @@ pub fn shadow<A: Asked, S: Sky>(pixel: FragCoord, w: A, sky: S, place: Texture<R
     var seen_sun = 1.0
     if at.w > 0.0 && lit.load(x, y).w > 0.5 {
         let a = asks.load(x, y)
-        let m = met(w, Ray { o: a.xyz + at.xyz * LEAVE, d: sky.sun().way, from: 0.0, to: 1.0e9, wide: a.w, spread: 0.0, touch: 0.0 })
+        let m = met(w, Ray { o: a.xyz + at.xyz * LEAVE, d: sky.sun().way, from: 0.0, to: 1.0e9, wide: a.w, spread: 0.0 })
         if m.met {
             seen_sun = 0.0
         }
@@ -332,7 +303,6 @@ borrow struct Eyes<S: Sky> {
     lay: Lay,
     list: GpuSpan<u32>,
     count: GpuSpan<u32>,
-    scouts: borrow Texture<R32Float>,
     y0: u32,
     y1: u32,
     width: u32,
@@ -348,29 +318,7 @@ impl<S: Sky> Each for Eyes<S> {
         if u32(r.z) > u32(r.x) && yb > ya {
             self.pass.scissor(u32(r.x), ya, u32(r.z) - u32(r.x), yb - ya)
             let near = max(length(bound.xyz - self.v.at) - bound.w, 0.0)
-            draw(self.pass, cover_at.bind(z: depth_of(near)), eye.bind(v: self.v, w: a, sky: self.sky, lay: self.lay, list: self.list, count: self.count, scouts: self.scouts), vertices: 3)
-        }
-    }
-}
-
-/// The things' scout draws into one pass, each over its bound's rectangle in patches.
-borrow struct Scouts {
-    pass: Pass<R32Float>,
-    v: View,
-    width: u32,
-    height: u32,
-}
-
-impl Each for Scouts {
-    fn thing<A: Asked>(mut self, a: A, k: u32, bound: vec4) {
-        let r = rect_of(self.v, bound, self.width * PATCH, self.height * PATCH) / f32(PATCH)
-        let x0 = u32(floor(r.x))
-        let y0 = u32(floor(r.y))
-        let x1 = min(u32(ceil(r.z)), self.width)
-        let y1 = min(u32(ceil(r.w)), self.height)
-        if x1 > x0 && y1 > y0 {
-            self.pass.scissor(x0, y0, x1 - x0, y1 - y0)
-            draw(self.pass, cover, scout.bind(v: self.v, w: a), vertices: 3, blend: Blend::Min)
+            draw(self.pass, cover_at.bind(z: depth_of(near)), eye.bind(v: self.v, w: a, sky: self.sky, lay: self.lay, list: self.list, count: self.count), vertices: 3)
         }
     }
 }
@@ -502,8 +450,6 @@ pub struct Sight {
     emits: Texture<Rgba16Float>,
     depth: DepthTexture,
     sunny: Texture<R8>,
-    /// Where each patch's scouts were clear (`scout`).
-    scouts: Texture<R32Float>,
     edge_place: Texture<Rgba32Float>,
     edge_asks: Texture<Rgba32Float>,
     burned: Texture<R8>,
@@ -538,7 +484,6 @@ pub fn sight() -> Sight {
         emits: texture(width: 1, height: 1),
         depth: depth_texture(width: 1, height: 1),
         sunny: texture(width: 1, height: 1),
-        scouts: texture(width: 1, height: 1),
         edge_place: texture(width: 1, height: 1),
         edge_asks: texture(width: 1, height: 1),
         burned: texture(width: 1, height: 1),
@@ -613,12 +558,12 @@ impl Sight {
             band += 1
             if edge {
                 let p = begin_pass5_with_depth(mut self.edge_place, mut self.edge_asks, mut self.lit, mut self.open, mut self.emits, mut self.depth, clear: vec4(0.0), keep: band > 1, keep_depth: band > 1)
-                var e = Eyes { pass: p, v, sky, lay, list: self.edge_list.items(), count: self.edge_list.count(), scouts: self.scouts, y0, y1, width, height }
+                var e = Eyes { pass: p, v, sky, lay, list: self.edge_list.items(), count: self.edge_list.count(), y0, y1, width, height }
                 world.each(self.kept, 0, mut e)
                 e.pass.end()
             } else {
                 let p = begin_pass5_with_depth(mut self.drawn.place, mut self.asks, mut self.lit, mut self.open, mut self.emits, mut self.depth, clear: vec4(0.0), keep: band > 1, keep_depth: band > 1)
-                var e = Eyes { pass: p, v, sky, lay, list: self.edge_list.items(), count: self.edge_list.count(), scouts: self.scouts, y0, y1, width, height }
+                var e = Eyes { pass: p, v, sky, lay, list: self.edge_list.items(), count: self.edge_list.count(), y0, y1, width, height }
                 world.each(self.kept, 0, mut e)
                 e.pass.end()
             }
@@ -704,7 +649,6 @@ impl Sight {
             self.emits = texture(width: width, height: height)
             self.depth = depth_texture(width: width, height: height)
             self.sunny = texture(width: width, height: height)
-            self.scouts = texture(width: (width + PATCH - 1) / PATCH, height: (height + PATCH - 1) / PATCH)
             self.edge_place = texture(width: width, height: height)
             self.edge_asks = texture(width: width, height: height)
         }
@@ -725,12 +669,6 @@ impl Sight {
         let bands = self.bands
         // The picture: each thing's eye draw, each thing's shadow draw, the shade.
         let screen = Lay { edges: 0, width, spare: 0, spare2: 0 }
-        // Looking coarsely first: each thing's scouts, a patch a fragment.
-        label("scouts")
-        let sp = begin_pass(mut self.scouts, clear: vec4(NOWHERE))
-        var sc = Scouts { pass: sp, v, width: (width + PATCH - 1) / PATCH, height: (height + PATCH - 1) / PATCH }
-        world.each(self.kept, 0, mut sc)
-        sc.pass.end()
         self.lit_by(world, sky, look, v, screen, bands, width, height, edge: false)
         label("edges")
         self.edge_list.clear()
