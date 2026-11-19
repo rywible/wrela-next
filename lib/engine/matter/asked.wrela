@@ -16,7 +16,7 @@
 use matter::cells::{B, CELL_PER_SIZE, EMPTY, Grid, HOLDS, LEVELS, NODE, NONE, NO_BRICK, ROOT, read_cells, read_distance}
 use matter::substance::Substance
 use std::derive::gradient
-use std::field::{Field, Live}
+use std::field::{Field, Live, live_along}
 use std::gpu::GpuSpan
 
 /// Every part of a field live (a root's mask: `coarsed` sets the bits past its parts).
@@ -573,4 +573,71 @@ impl<M: Field<Substance>, const W: u32> Asked for Seen<M, W> {
         out
     }
 
+}
+
+/// A thing that moves, as GPU code asks it: its field and its grid (only a box round it: a moving
+/// thing lays out no roots, `cells::Kept::deposit`). A ray finds the parts it can come near once,
+/// as it begins, from the parts' own bounds along its stretch through the box (std's
+/// `live_along`, its reach the joins' own), and its walk holds them (`mask`, a word: parts past
+/// the 32nd always asked); its steps ask only them (`Surface::distance_live`).
+pub struct Rayed<M>: Copy + GpuData {
+    pub(package) field: M,
+    pub(package) grid: Grid,
+}
+
+impl<M: Field<Substance>> Rayed<M> {
+    /// Its field's value at `p` by the parts `mask` names, over the steepness std's shapes state,
+    /// never past its surface.
+    fn live_at(self, p: vec3, mask: u32) -> f32 {
+        let g = self.grid
+        let v = if mask == ALL { self.field.distance(p) } else { self.field.distance_live(p, Live::from_word(mask)) }
+        clamp(v, -g.scope, g.scope) / g.stated
+    }
+}
+
+impl<M: Field<Substance>> Asked for Rayed<M> {
+    type Walk = Within
+
+    fn begun(self, o: vec3, d: vec3, wide: f32, spread: f32) -> Begun<Within> {
+        let g = self.grid
+        let box = box_span(o, d, g.lo, g.hi)
+        let near = max(box.x, 0.0)
+        if box.y < near {
+            return Begun { near: box.y, far: box.x - 1.0, walk: Within { exit: -1.0, node: NO_BRICK, mask: 0, steep: 1.0 } }
+        }
+        // (The parts its stretch through the box passes within their reach and half the ray's
+        // widest width there.)
+        let live = live_along(self.field, o + d * near, o + d * box.y, 0.5 * (wide + spread * box.y))
+        if !live.any(0, self.field.parts()) {
+            return Begun { near: box.y, far: box.x - 1.0, walk: Within { exit: -1.0, node: NO_BRICK, mask: 0, steep: 1.0 } }
+        }
+        Begun { near: box.x, far: box.y, walk: Within { exit: box.y, node: HOLDS, mask: live.word(), steep: g.stated } }
+    }
+
+    fn step(self, walk: Within, p: vec3, d: vec3, inv: vec3, t: f32, size: f32) -> Stepped<Within> {
+        let f = self.live_at(p, walk.mask)
+        Stepped { x: f, y: f, walk }
+    }
+
+    fn far(self, walk: Within, p: vec3, t: f32, size: f32) -> f32 {
+        self.live_at(p, walk.mask)
+    }
+
+    fn facing(self, walk: Within, p: vec3, t: f32, came: vec3, size: f32) -> vec3 {
+        let field = self.field
+        let live = Live::from_word(walk.mask)
+        let grad = if walk.mask == ALL { field.gradient(p) } else { gradient(|q: vec3| field.distance_live(q, live), p) }
+        if dot(grad, grad) > 1.0e-8 {
+            return normalize(grad)
+        }
+        came
+    }
+
+    fn made_of(self, walk: Within, p: vec3, t: f32) -> Substance {
+        self.field.channels(p)
+    }
+
+    fn told(self, walk: Within, p: vec3, size: f32) -> Told {
+        Told { node: walk.node, level: 0, side: 0.0, off: 0.0, cells: 0.0, field: self.live_at(p, ALL), exit: walk.exit, brick: walk.mask }
+    }
 }
