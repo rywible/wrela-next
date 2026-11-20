@@ -54,7 +54,6 @@ mod present;
 mod tests;
 
 pub use calibrate::keep_clocked;
-pub(crate) use calibrate::measured_unit;
 use calibrate::{CALIBRATING, KEEP_CLOCKED, WARMING, Warmer, ensure_unit};
 use present::{Presenter, draw_presented, present_pipeline};
 

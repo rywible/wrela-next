@@ -4,10 +4,11 @@
 //! otherwise:
 //!
 //! - **Submissions** are counted by one timeline semaphore: submission `n` signals `n`.
-//! - **Memory**: one allocation a resource, from the first memory type that fits (device-local
-//!   for the GPU's own, host-visible and coherent for what the CPU maps). Every resource starts
-//!   zeroed, as WebGPU's do: a fill or a clear staged before the next submission's own work.
-//!   Staged writes go through a belt of host-visible buffers reused once their submission is done.
+//! - **Memory**: ranges of shared blocks of device memory (`Heap`), by memory type and kind
+//!   (buffers, images), from the first memory type that fits (device-local for the GPU's own,
+//!   host-visible and coherent for what the CPU maps). Every resource starts zeroed, as WebGPU's
+//!   do: a fill or a clear staged before the next submission's own work. Staged writes go through
+//!   a belt of host-visible buffers reused once their submission is done.
 //! - **Images** rest in a home layout by their use (`GENERAL` where a kernel writes one, else
 //!   read-only optimal), and a pass or a copy moves what it uses out and back: in `GENERAL` (or
 //!   made `MUTABLE_FORMAT`) RADV keeps no compression of a target, which cost the opening 10%.
@@ -1922,8 +1923,68 @@ impl RawImage {
     }
 }
 
-/// `range` of `image` moved from layout `from` to `to`, everything before done and visible to
-/// everything after.
+/// The pipeline stage and access masks an image in `layout` uses: source masks wait on writes,
+/// destination masks make writes visible to the next use (no `ALL_COMMANDS` stall across unrelated
+/// stages).
+fn layout_sync(layout: vk::ImageLayout, src: bool) -> (vk::PipelineStageFlags2, vk::AccessFlags2) {
+    match layout {
+        vk::ImageLayout::UNDEFINED => (vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE),
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL => (
+            vk::PipelineStageFlags2::COPY | vk::PipelineStageFlags2::CLEAR,
+            vk::AccessFlags2::TRANSFER_WRITE,
+        ),
+        vk::ImageLayout::TRANSFER_SRC_OPTIMAL => (
+            vk::PipelineStageFlags2::COPY,
+            if src { vk::AccessFlags2::NONE } else { vk::AccessFlags2::TRANSFER_READ },
+        ),
+        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL => (
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            if src {
+                vk::AccessFlags2::COLOR_ATTACHMENT_WRITE
+            } else {
+                vk::AccessFlags2::COLOR_ATTACHMENT_READ | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE
+            },
+        ),
+        vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL => (
+            vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+            if src {
+                vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE
+            } else {
+                vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
+                    | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE
+            },
+        ),
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL => (
+            vk::PipelineStageFlags2::VERTEX_SHADER
+                | vk::PipelineStageFlags2::FRAGMENT_SHADER
+                | vk::PipelineStageFlags2::COMPUTE_SHADER,
+            if src { vk::AccessFlags2::NONE } else { vk::AccessFlags2::SHADER_READ },
+        ),
+        vk::ImageLayout::GENERAL => (
+            vk::PipelineStageFlags2::VERTEX_SHADER
+                | vk::PipelineStageFlags2::FRAGMENT_SHADER
+                | vk::PipelineStageFlags2::COMPUTE_SHADER,
+            if src {
+                vk::AccessFlags2::SHADER_WRITE
+            } else {
+                vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE
+            },
+        ),
+        vk::ImageLayout::PRESENT_SRC_KHR => (vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE),
+        _ => (
+            vk::PipelineStageFlags2::ALL_COMMANDS,
+            if src {
+                vk::AccessFlags2::MEMORY_WRITE
+            } else {
+                vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE
+            },
+        ),
+    }
+}
+
+/// `range` of `image` moved from layout `from` to `to`, with stage and access masks matched to
+/// each layout.
 fn transition(
     d: &ash::Device,
     cb: vk::CommandBuffer,
@@ -1935,11 +1996,13 @@ fn transition(
     if from == to {
         return;
     }
+    let (src_stage, src_access) = layout_sync(from, true);
+    let (dst_stage, dst_access) = layout_sync(to, false);
     let barrier = [vk::ImageMemoryBarrier2::default()
-        .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-        .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
-        .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-        .dst_access_mask(vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE)
+        .src_stage_mask(src_stage)
+        .src_access_mask(src_access)
+        .dst_stage_mask(dst_stage)
+        .dst_access_mask(dst_access)
         .old_layout(from)
         .new_layout(to)
         .image(image)
