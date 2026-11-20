@@ -1,0 +1,462 @@
+// Unified One Light for meshlet and volumetric rendering: one sun shadow map, one sky irradiance
+// table, and one 3-level world-space radiance volume (`64³` -> `32³` -> `16³`) injected from all
+// extracted still and moving meshlets and queried by hemisphere voxel cone tracing (Crassin et al.,
+// Pacific Graphics 2011).
+//
+// Because every solid, moving creature, and emissive spell injects into the same 3D radiance volume,
+// sky occlusion, multi-bounce diffuse GI, and emissive spell illumination work identically across
+// still matter, moving matter, and participating media on both Metal and Vulkan (no hardware RT
+// cores required).
+
+use matter::sky::Sky
+use matter::substance::ONE_OVER_PI
+use mesh::extract::MeshVertex
+use picture::pixels::{TABLE, octa}
+use std::gpu::{
+    Address, Atomics, ComparisonSampler, DepthTexture, DispatchArgs, Filter, GlobalId, GpuBuffer,
+    GpuSpan, One, Rgba16Float, Sampler, Slots, Texels3d, Texture, Texture3d, buffer, buffer_of,
+    dispatch, label, sampler, texture3d,
+}
+
+/// Shadow map resolution (square).
+pub const SHADOW_SIDE: u32 = 2048
+
+/// Level-0 radiance volume resolution along each axis (`64×64×64` = 262,144 voxels).
+pub const RAD_SIDE: u32 = 64
+const RAD_VOXELS: u32 = 262144
+const RAD_SCALE: f32 = 256.0
+const PI: f32 = 3.14159265
+
+/// Orthographic projection for the unified sun shadow map covering the world's bounding sphere.
+pub struct ShadowView: Copy + GpuData {
+    pub centre: vec3,
+    pub radius: f32,
+    pub u: vec3,
+    pub texel: f32,
+    pub v: vec3,
+    pub spare: f32,
+    pub w: vec3,
+    pub spare2: f32,
+}
+
+/// Builds a `ShadowView` tightly framing the world bounding sphere `(centre, radius)` from `sun_way`.
+pub fn shadow_view(centre: vec3, radius: f32, sun_way: vec3) -> ShadowView {
+    let w = normalize(sun_way)
+    let up = if abs(w.y) < 0.95 { vec3(0.0, 1.0, 0.0) } else { vec3(1.0, 0.0, 0.0) }
+    let u = normalize(cross(up, w))
+    let v = cross(w, u)
+    let r = max(radius * 1.05, 1.0)
+    ShadowView {
+        centre,
+        radius: r,
+        u,
+        texel: (2.0 * r) / f32(SHADOW_SIDE),
+        v,
+        spare: 0.0,
+        w,
+        spare2: 0.0,
+    }
+}
+
+/// Reads the open sky's irradiance on a surface facing `n` from the octahedral table.
+pub fn sky_irradiance(table: Texture<Rgba16Float>, s: Sampler, n: vec3) -> vec3 {
+    let e = octa(n) * 0.5 + vec2(0.5)
+    table.sample_level(s, (e * (f32(TABLE) - 1.0) + vec2(0.5)) / f32(TABLE), 0.0).xyz
+}
+
+/// 4-tap PCF lookup against the unified sun shadow map with normal-offset bias.
+pub fn sun_shadow(
+    shadow_map: DepthTexture,
+    cmp: ComparisonSampler,
+    sv: ShadowView,
+    wp: vec3,
+    n: vec3,
+) -> f32 {
+    let ndl = dot(n, sv.w)
+    if ndl <= 0.0 {
+        return 0.0
+    }
+    let slope = sqrt(max(1.0 - ndl * ndl, 0.0))
+    let p = wp + n * (sv.texel * (1.5 + 1.8 * slope))
+    let d = p - sv.centre
+    let sx = dot(d, sv.u) / sv.radius
+    let sy = dot(d, sv.v) / sv.radius
+    let sz = (sv.radius - dot(d, sv.w)) / (2.0 * sv.radius)
+    if abs(sx) >= 0.999 || abs(sy) >= 0.999 || sz <= 0.0 || sz >= 1.0 {
+        return 1.0
+    }
+    let uv = vec2(sx * 0.5 + 0.5, 0.5 - sy * 0.5)
+    let o = 0.5 / f32(SHADOW_SIDE)
+    let ref_z = clamp(sz - 0.0003, 0.0, 1.0)
+    var sum = 0.0
+    sum += shadow_map.sample_compare_level(cmp, uv + vec2(-o, -o), ref_z)
+    sum += shadow_map.sample_compare_level(cmp, uv + vec2(o, -o), ref_z)
+    sum += shadow_map.sample_compare_level(cmp, uv + vec2(-o, o), ref_z)
+    sum += shadow_map.sample_compare_level(cmp, uv + vec2(o, o), ref_z)
+    sum * 0.25
+}
+
+/// Single-tap sun visibility lookup for volumetrics and voxel injection (no normal offset).
+pub fn sun_vis_point(shadow_map: DepthTexture, cmp: ComparisonSampler, sv: ShadowView, wp: vec3) -> f32 {
+    let d = wp - sv.centre
+    let sx = dot(d, sv.u) / sv.radius
+    let sy = dot(d, sv.v) / sv.radius
+    let sz = (sv.radius - dot(d, sv.w)) / (2.0 * sv.radius)
+    if abs(sx) >= 0.999 || abs(sy) >= 0.999 || sz <= 0.0 || sz >= 1.0 {
+        return 1.0
+    }
+    let uv = vec2(sx * 0.5 + 0.5, 0.5 - sy * 0.5)
+    shadow_map.sample_compare_level(cmp, uv, clamp(sz - 0.0006, 0.0, 1.0))
+}
+
+/// Spatial mapping of the world-space radiance volume (`RAD_SIDE³`).
+pub struct RadGrid: Copy + GpuData {
+    pub origin: vec3,
+    pub voxel: f32,
+    pub inv_span: f32,
+    pub enabled: u32,
+    pub pad0: u32,
+    pub pad1: u32,
+}
+
+/// Builds a voxel-snapped `RadGrid` covering the active world around `(centre, radius)`.
+pub fn rad_grid(centre: vec3, radius: f32, enabled: bool) -> RadGrid {
+    let half = clamp(radius * 1.05, 4.0, 22.0)
+    let span = 2.0 * half
+    let voxel = span / f32(RAD_SIDE)
+    // Snap origin to whole voxel multiples so moving cameras don't cause voxel shimmer.
+    let raw_origin = centre - vec3(half)
+    let origin = floor(raw_origin / voxel) * voxel
+    RadGrid {
+        origin,
+        voxel,
+        inv_span: 1.0 / span,
+        enabled: if enabled { 1 } else { 0 },
+        pad0: 0,
+        pad1: 0,
+    }
+}
+
+/// Clears the `64³ × 4` fixed-point voxel accumulation buffer.
+@compute(64)
+fn rad_clear(accum: mut Slots<u32>, id: GlobalId) {
+    let i = id.x
+    if i >= RAD_VOXELS * 4 {
+        return
+    }
+    accum[id] = 0
+}
+
+/// Prepares indirect dispatch arguments for injecting a batch's vertices into the radiance volume.
+@compute(1)
+fn prep_inject(vert_count: [u32], cap_verts: u32, args: mut One<DispatchArgs>, id: GlobalId) {
+    let n = min(vert_count[0], cap_verts)
+    let groups = if n > 0 { (n + 63) / 64 } else { 0 }
+    args.set(id, DispatchArgs { x: groups, y: 1, z: 1 })
+}
+
+/// Injects extracted meshlet vertices (direct sunlit radiance + emissive glow + previous-frame
+/// 1-bounce radiance) into the `64³` atomic accumulation grid.
+@compute(64)
+fn rad_inject<S: Sky>(
+    verts: [MeshVertex],
+    vert_count: [u32],
+    cap_verts: u32,
+    grid: RadGrid,
+    sv: ShadowView,
+    sky: S,
+    sky_table: Texture<Rgba16Float>,
+    sky_s: Sampler,
+    shadow_map: DepthTexture,
+    cmp: ComparisonSampler,
+    prev_rad1: Texture3d<Rgba16Float>,
+    rad_s: Sampler,
+    accum: mut Atomics<u32>,
+    id: GlobalId,
+) {
+    let vi = id.x
+    let n = min(vert_count[0], cap_verts)
+    if vi >= n {
+        return
+    }
+    let vert = verts[vi]
+    let wp = vert.pos.xyz
+    let uvw = (wp - grid.origin) * grid.inv_span
+    if uvw.x < 0.0 || uvw.x >= 1.0 || uvw.y < 0.0 || uvw.y >= 1.0 || uvw.z < 0.0 || uvw.z >= 1.0 {
+        return
+    }
+    let vx = min(u32(uvw.x * f32(RAD_SIDE)), RAD_SIDE - 1)
+    let vy = min(u32(uvw.y * f32(RAD_SIDE)), RAD_SIDE - 1)
+    let vz = min(u32(uvw.z * f32(RAD_SIDE)), RAD_SIDE - 1)
+    let idx = (vx + (vy << 6) + (vz << 12)) * 4
+
+    let nrm = vert.normal.xyz
+    let nl2 = dot(nrm, nrm)
+    let normal = if nl2 > 1.0e-12 { nrm * (1.0 / sqrt(nl2)) } else { vec3(0.0, 1.0, 0.0) }
+    let sun = sky.sun()
+    let ndl = max(dot(normal, sun.way), 0.0)
+    let vis = if ndl > 0.0 { sun_shadow(shadow_map, cmp, sv, wp, normal) } else { 0.0 }
+    let direct = sun.light * (ndl * vis)
+
+    // Previous-frame broad bounce feedback + dampened sky irradiance so 2nd-bounce light propagates
+    // naturally without runaway energy.
+    let sample_uvw = clamp(((wp + normal * (grid.voxel * 1.5)) - grid.origin) * grid.inv_span, vec3(0.01), vec3(0.99))
+    let prev = prev_rad1.sample_level(rad_s, sample_uvw, 0.0)
+    let sky_est = sky_irradiance(sky_table, sky_s, normal) * (1.0 - clamp(prev.w, 0.0, 0.85))
+    let bounce_prev = prev.xyz * PI * 0.75
+    let outgoing = vert.emits.xyz + vert.albedo.xyz * ONE_OVER_PI * (direct + sky_est * 0.5 + bounce_prev)
+
+    let r = u32(clamp(outgoing.x * RAD_SCALE, 0.0, 2000000.0))
+    let g = u32(clamp(outgoing.y * RAD_SCALE, 0.0, 2000000.0))
+    let b = u32(clamp(outgoing.z * RAD_SCALE, 0.0, 2000000.0))
+    let _ = accum.add(idx, r)
+    let _ = accum.add(idx + 1, g)
+    let _ = accum.add(idx + 2, b)
+    let _ = accum.add(idx + 3, 1)
+}
+
+/// Resolves fixed-point atomic sums into premultiplied `(radiance * alpha, alpha)` in `rad0` (`64³`).
+@compute(4, 4, 4)
+fn rad_resolve(accum: [u32], out: mut Texels3d<Rgba16Float>, id: GlobalId) {
+    if id.x >= RAD_SIDE || id.y >= RAD_SIDE || id.z >= RAD_SIDE {
+        return
+    }
+    let idx = (id.x + (id.y << 6) + (id.z << 12)) * 4
+    let cnt = accum[idx + 3]
+    if cnt == 0 {
+        out.store(id, vec4(0.0))
+        return
+    }
+    let inv = 1.0 / (RAD_SCALE * f32(cnt))
+    let rad = vec3(f32(accum[idx]), f32(accum[idx + 1]), f32(accum[idx + 2])) * inv
+    // Opacity saturates smoothly with surface density so thin walls occlude cleanly.
+    let alpha = clamp(f32(cnt) * 0.35, 0.0, 1.0)
+    out.store(id, vec4(rad * alpha, alpha))
+}
+
+/// 2×2×2 premultiplied box downsample from `src` into `dst` (size `dst_side³`).
+@compute(4, 4, 4)
+fn rad_mip(
+    src: Texture3d<Rgba16Float>,
+    dst_side: u32,
+    out: mut Texels3d<Rgba16Float>,
+    id: GlobalId,
+) {
+    if id.x >= dst_side || id.y >= dst_side || id.z >= dst_side {
+        return
+    }
+    let bx = id.x * 2
+    let by = id.y * 2
+    let bz = id.z * 2
+    var sum = vec4(0.0)
+    sum += src.load(bx, by, bz)
+    sum += src.load(bx + 1, by, bz)
+    sum += src.load(bx, by + 1, bz)
+    sum += src.load(bx + 1, by + 1, bz)
+    sum += src.load(bx, by, bz + 1)
+    sum += src.load(bx + 1, by, bz + 1)
+    sum += src.load(bx, by + 1, bz + 1)
+    sum += src.load(bx + 1, by + 1, bz + 1)
+    // Premultiplied radiance averages linearly; boost coarse opacity slightly so thin walls survive
+    // mip downsampling (standard voxel cone tracing directional coverage approximation).
+    let avg_rad = sum.xyz * 0.125
+    let avg_a = sum.w * 0.125
+    let boosted_a = clamp(avg_a * 1.45, 0.0, 1.0)
+    let scale = if avg_a > 1.0e-4 { boosted_a / avg_a } else { 1.0 }
+    out.store(id, vec4(avg_rad * scale, boosted_a))
+}
+
+/// Traces one diffuse cone through the 3-level radiance volume, returning `vec4(bounce_rad, occlusion)`.
+fn trace_cone(
+    grid: RadGrid,
+    rad0: Texture3d<Rgba16Float>,
+    rad1: Texture3d<Rgba16Float>,
+    rad2: Texture3d<Rgba16Float>,
+    s: Sampler,
+    origin: vec3,
+    dir: vec3,
+) -> vec4 {
+    var rad = vec3(0.0)
+    var occ = 0.0
+    let v = grid.voxel
+
+    // 4 geometrically spaced steps spanning ~1.3 to 11 voxels (level 0 -> level 1 -> level 2).
+    let dists = [1.3, 2.8, 5.6, 10.8]
+    for step in 0..4 {
+        if occ >= 0.96 {
+            break
+        }
+        let p = origin + dir * (dists[step] * v)
+        let uvw = (p - grid.origin) * grid.inv_span
+        if uvw.x <= 0.01 || uvw.x >= 0.99 || uvw.y <= 0.01 || uvw.y >= 0.99 || uvw.z <= 0.01 || uvw.z >= 0.99 {
+            break
+        }
+        let smp = if step == 0 {
+            rad0.sample_level(s, uvw, 0.0)
+        } else if step < 3 {
+            rad1.sample_level(s, uvw, 0.0)
+        } else {
+            rad2.sample_level(s, uvw, 0.0)
+        }
+        let a = clamp(smp.w, 0.0, 1.0)
+        let w = 1.0 - occ
+        rad += w * smp.xyz
+        occ += w * a
+    }
+    vec4(rad, clamp(occ, 0.0, 1.0))
+}
+
+/// Computes unified indirect lighting at surface point `(wp, n)` via a 3-cone 120° hemisphere
+/// tripod (12 trilinear 3D fetches total): returns `vec4(bounce_irradiance.rgb, sky_visibility)`.
+pub fn cone_indirect(
+    grid: RadGrid,
+    rad0: Texture3d<Rgba16Float>,
+    rad1: Texture3d<Rgba16Float>,
+    rad2: Texture3d<Rgba16Float>,
+    s: Sampler,
+    wp: vec3,
+    n: vec3,
+) -> vec4 {
+    if grid.enabled == 0 {
+        return vec4(0.0, 0.0, 0.0, 1.0)
+    }
+    let up = if abs(n.y) < 0.9 { vec3(0.0, 1.0, 0.0) } else { vec3(1.0, 0.0, 0.0) }
+    let t = normalize(cross(up, n))
+    let b = cross(n, t)
+    // Start slightly outside the surface voxel so surfaces never self-occlude.
+    let p0 = wp + n * (grid.voxel * 1.15)
+
+    // 3 evenly spaced 120° cones covering the cosine-weighted hemisphere cleanly.
+    let c0 = trace_cone(grid, rad0, rad1, rad2, s, p0, normalize(n * 0.65 + t * 0.76))
+    let c1 = trace_cone(grid, rad0, rad1, rad2, s, p0, normalize(n * 0.65 - t * 0.38 + b * 0.658))
+    let c2 = trace_cone(grid, rad0, rad1, rad2, s, p0, normalize(n * 0.65 - t * 0.38 - b * 0.658))
+
+    let rad = (c0.xyz + c1.xyz + c2.xyz) * 0.33333334
+    let occ = (c0.w + c1.w + c2.w) * 0.33333334
+    // Keep a gentle 15% ambient floor inside dense folds so deeply occluded cavities stay readable.
+    let sky_vis = clamp(1.0 - occ * 0.85, 0.15, 1.0)
+    vec4(rad * PI, sky_vis)
+}
+
+/// Fast isotropic indirect radiance sample for volumetric froxels (fog, smoke, mist) from the same
+/// unified radiance volume (so emissive spells and sunlit bounce illuminate participating media).
+pub fn volume_indirect(
+    grid: RadGrid,
+    rad1: Texture3d<Rgba16Float>,
+    rad2: Texture3d<Rgba16Float>,
+    s: Sampler,
+    wp: vec3,
+) -> vec3 {
+    if grid.enabled == 0 {
+        return vec3(0.0)
+    }
+    let uvw = (wp - grid.origin) * grid.inv_span
+    if uvw.x <= 0.01 || uvw.x >= 0.99 || uvw.y <= 0.01 || uvw.y >= 0.99 || uvw.z <= 0.01 || uvw.z >= 0.99 {
+        return vec3(0.0)
+    }
+    let s1 = rad1.sample_level(s, uvw, 0.0)
+    let s2 = rad2.sample_level(s, uvw, 0.0)
+    (s1.xyz * 0.65 + s2.xyz * 0.35) * PI
+}
+
+/// Persistent GPU buffers and 3-level 3D textures for the unified world-space radiance cache.
+pub struct RadianceCache {
+    pub accum: GpuBuffer<u32>,
+    pub inject_args: GpuBuffer<DispatchArgs>,
+    pub rad0: Texture3d<Rgba16Float>,
+    pub rad1: Texture3d<Rgba16Float>,
+    pub rad2: Texture3d<Rgba16Float>,
+    pub s: Sampler,
+    pub grid: RadGrid,
+}
+
+/// Allocates a fresh `RadianceCache` (~6.3 MB total VRAM).
+pub fn radiance_cache() -> RadianceCache {
+    RadianceCache {
+        accum: buffer(RAD_VOXELS * 4),
+        inject_args: buffer_of([DispatchArgs { x: 0, y: 1, z: 1 }]),
+        rad0: texture3d(width: RAD_SIDE, height: RAD_SIDE, depth: RAD_SIDE),
+        rad1: texture3d(width: RAD_SIDE / 2, height: RAD_SIDE / 2, depth: RAD_SIDE / 2),
+        rad2: texture3d(width: RAD_SIDE / 4, height: RAD_SIDE / 4, depth: RAD_SIDE / 4),
+        s: sampler(filter: Filter::Linear, address: Address::Clamp),
+        grid: rad_grid(vec3(0.0), 10.0, enabled: false),
+    }
+}
+
+impl RadianceCache {
+    /// Begins a radiance volume rebuild for the world around `(centre, radius)`.
+    pub fn begin(mut self, centre: vec3, radius: f32, enabled: bool) {
+        self.grid = rad_grid(centre, radius, enabled: enabled)
+        if !enabled {
+            return
+        }
+        label("mesh_radiance")
+        dispatch(rad_clear.bind(accum: mut self.accum), over: RAD_VOXELS * 4)
+    }
+
+    /// Injects one meshlet batch's vertices into the active radiance volume.
+    pub fn inject<S: Sky>(
+        mut self,
+        verts: GpuSpan<MeshVertex>,
+        vert_count: GpuSpan<u32>,
+        cap_verts: u32,
+        sv: ShadowView,
+        sky: S,
+        sky_table: Texture<Rgba16Float>,
+        sky_s: Sampler,
+        shadow_map: DepthTexture,
+        cmp: ComparisonSampler,
+    ) {
+        if self.grid.enabled == 0 {
+            return
+        }
+        dispatch(
+            prep_inject.bind(
+                vert_count: vert_count,
+                cap_verts: cap_verts,
+                args: mut self.inject_args,
+            ),
+            over: 1,
+        )
+        dispatch(
+            rad_inject.bind(
+                verts: verts,
+                vert_count: vert_count,
+                cap_verts: cap_verts,
+                grid: self.grid,
+                sv: sv,
+                sky: sky,
+                sky_table: sky_table,
+                sky_s: sky_s,
+                shadow_map: shadow_map,
+                cmp: cmp,
+                prev_rad1: self.rad1,
+                rad_s: self.s,
+                accum: mut self.accum,
+            ),
+            groups: self.inject_args,
+            most: (cap_verts + 63) / 64,
+        )
+    }
+
+    /// Resolves accumulated radiance into `rad0` (`64³`) and builds the `32³` and `16³` mip chain.
+    pub fn finish(mut self) {
+        if self.grid.enabled == 0 {
+            return
+        }
+        dispatch(
+            rad_resolve.bind(accum: self.accum.items(), out: mut self.rad0),
+            over: (RAD_SIDE, RAD_SIDE, RAD_SIDE),
+        )
+        let s1 = RAD_SIDE / 2
+        dispatch(
+            rad_mip.bind(src: self.rad0, dst_side: s1, out: mut self.rad1),
+            over: (s1, s1, s1),
+        )
+        let s2 = RAD_SIDE / 4
+        dispatch(
+            rad_mip.bind(src: self.rad1, dst_side: s2, out: mut self.rad2),
+            over: (s2, s2, s2),
+        )
+    }
+}

@@ -11,27 +11,28 @@ use matter::sky::{Sky, seen}
 use matter::substance::{ONE_OVER_PI, Substance}
 use matter::world::{And, Many, One}
 use mesh::extract::{MeshBatch, MeshVertex, mesh_batch}
+use mesh::light::{
+    RadGrid, RadianceCache, SHADOW_SIDE, ShadowView, cone_indirect, radiance_cache, shadow_view,
+    sky_irradiance, sun_shadow,
+}
 use picture::eye::{Eye, View, view}
 use picture::look::{Look, Seen}
 use picture::picture::{Picture, picture}
-use picture::pixels::{TABLE, octa, skylit}
+use picture::pixels::{TABLE, skylit}
 use picture::screen::show
 use std::collections::Vec
 use std::field::Field
 use std::gpu::{
     Address, ClipPosition, Compare, ComparisonSampler, Cull, Depth, DepthBias, DepthOnlyPass,
     DepthTexture, Filter, FragCoord, MsaaDepthPass, MsaaDepthPass3, R8, Rgba16Float, Rgba32Float,
-    Sampler, Targets3, Texture, VertexIndex, begin_depth_pass, begin_pass3_msaa_with_depth,
-    begin_pass_msaa_with_depth, comparison_sampler, depth_texture, dispatch, draw, label, sampler,
-    writable_texture,
+    Sampler, Targets3, Texture, Texture3d, VertexIndex, begin_depth_pass,
+    begin_pass3_msaa_with_depth, begin_pass_msaa_with_depth, comparison_sampler, depth_texture,
+    dispatch, draw, label, sampler, writable_texture,
 }
 use std::hash::StateHash
 
 /// Reversed-Z near plane (m): `clip_z = NEAR`, `clip_w = z`, so `ndc_z = NEAR / z` in `(0, 1]`.
-const NEAR: f32 = 0.05
-
-/// Shadow map resolution (square).
-const SHADOW_SIDE: u32 = 2048
+pub const NEAR: f32 = 0.05
 
 /// Default maximum active surface bricks per batch.
 const BATCH_BRICKS: u32 = 8192
@@ -39,37 +40,6 @@ const BATCH_BRICKS: u32 = 8192
 /// Distance threshold (m) beyond which `Many` things refresh on alternating 30 Hz frames while
 /// foreground things refresh every frame (60 Hz).
 const FAR_TIER_DIST: f32 = 9.0
-
-/// Orthographic projection for the unified sun shadow map covering the world's bounding sphere.
-pub struct ShadowView: Copy + GpuData {
-    pub centre: vec3,
-    pub radius: f32,
-    pub u: vec3,
-    pub texel: f32,
-    pub v: vec3,
-    pub spare: f32,
-    pub w: vec3,
-    pub spare2: f32,
-}
-
-/// Builds a `ShadowView` tightly framing the world bounding sphere `(centre, radius)` from `sun_way`.
-fn shadow_view(centre: vec3, radius: f32, sun_way: vec3) -> ShadowView {
-    let w = normalize(sun_way)
-    let up = if abs(w.y) < 0.95 { vec3(0.0, 1.0, 0.0) } else { vec3(1.0, 0.0, 0.0) }
-    let u = normalize(cross(up, w))
-    let v = cross(w, u)
-    let r = max(radius * 1.05, 1.0)
-    ShadowView {
-        centre,
-        radius: r,
-        u,
-        texel: (2.0 * r) / f32(SHADOW_SIDE),
-        v,
-        spare: 0.0,
-        w,
-        spare2: 0.0,
-    }
-}
 
 /// Vertex shader for the unified shadow depth pass: projects `MeshVertex` into orthographic sun space.
 @vertex
@@ -119,57 +89,24 @@ fn mesh_vs(verts: [MeshVertex], v: View, vi: VertexIndex) -> MeshVary {
     }
 }
 
-/// Reads the open sky's irradiance on a surface facing `n` from the octahedral table.
-fn sky_irradiance(table: Texture<Rgba16Float>, s: Sampler, n: vec3) -> vec3 {
-    let e = octa(n) * 0.5 + vec2(0.5)
-    table.sample_level(s, (e * (f32(TABLE) - 1.0) + vec2(0.5)) / f32(TABLE), 0.0).xyz
-}
-
-/// 4-tap PCF lookup against the unified sun shadow map with normal-offset bias.
-fn sun_shadow(
-    shadow_map: DepthTexture,
-    cmp: ComparisonSampler,
-    sv: ShadowView,
-    wp: vec3,
-    n: vec3,
-) -> f32 {
-    let ndl = dot(n, sv.w)
-    if ndl <= 0.0 {
-        return 0.0
-    }
-    // Offset along surface normal proportional to shadow texel size to avoid self-shadowing.
-    let slope = sqrt(max(1.0 - ndl * ndl, 0.0))
-    let p = wp + n * (sv.texel * (1.5 + 1.8 * slope))
-    let d = p - sv.centre
-    let sx = dot(d, sv.u) / sv.radius
-    let sy = dot(d, sv.v) / sv.radius
-    let sz = (sv.radius - dot(d, sv.w)) / (2.0 * sv.radius)
-    if abs(sx) >= 0.999 || abs(sy) >= 0.999 || sz <= 0.0 || sz >= 1.0 {
-        return 1.0
-    }
-    let uv = vec2(sx * 0.5 + 0.5, 0.5 - sy * 0.5)
-    let o = 0.5 / f32(SHADOW_SIDE)
-    let ref_z = clamp(sz - 0.0003, 0.0, 1.0)
-    var sum = 0.0
-    sum += shadow_map.sample_compare_level(cmp, uv + vec2(-o, -o), ref_z)
-    sum += shadow_map.sample_compare_level(cmp, uv + vec2(o, -o), ref_z)
-    sum += shadow_map.sample_compare_level(cmp, uv + vec2(-o, o), ref_z)
-    sum += shadow_map.sample_compare_level(cmp, uv + vec2(o, o), ref_z)
-    sum * 0.25
-}
-
 /// Shared shading computation for both the gameplay colour-only pass and the judge pass:
-/// crease-preserving normals, unified sun shadow, open-sky irradiance, and `Look::tone`.
+/// crease-preserving normals, unified sun shadow, unified world-space radiance cache (sky
+/// occlusion + multi-bounce GI + emissive glow), and `Look::tone`.
 fn shade_mesh<S: Sky, L: Look>(
     vary: MeshVary,
     v: View,
     sv: ShadowView,
+    rad_grid: RadGrid,
     sky: S,
     look: L,
     table: Texture<Rgba16Float>,
     s: Sampler,
     shadow_map: DepthTexture,
     cmp: ComparisonSampler,
+    rad0: Texture3d<Rgba16Float>,
+    rad1: Texture3d<Rgba16Float>,
+    rad2: Texture3d<Rgba16Float>,
+    rad_s: Sampler,
 ) -> (vec4, vec4, f32) {
     let to_eye = v.at - vary.wp
     let dist = length(to_eye)
@@ -195,7 +132,8 @@ fn shade_mesh<S: Sky, L: Look>(
     let ndl = max(dot(n, sun.way), 0.0)
     let vis = if ndl > 0.0 { sun_shadow(shadow_map, cmp, sv, vary.wp, n) } else { 0.0 }
     let direct = sun.light * (ndl * vis)
-    let amb = sky_irradiance(table, s, n)
+    let ind = cone_indirect(rad_grid, rad0, rad1, rad2, rad_s, vary.wp, n)
+    let amb = sky_irradiance(table, s, n) * ind.w + ind.xyz
     let rad = vary.emits + vary.albedo * ONE_OVER_PI * (direct + amb)
     let toned = look.tone(Seen { light: rad })
     (vec4(toned, 1.0), vec4(n, dist), vis)
@@ -207,14 +145,19 @@ fn mesh_fs<S: Sky, L: Look>(
     vary: MeshVary,
     v: View,
     sv: ShadowView,
+    rad_grid: RadGrid,
     sky: S,
     look: L,
     table: Texture<Rgba16Float>,
     s: Sampler,
     shadow_map: DepthTexture,
     cmp: ComparisonSampler,
+    rad0: Texture3d<Rgba16Float>,
+    rad1: Texture3d<Rgba16Float>,
+    rad2: Texture3d<Rgba16Float>,
+    rad_s: Sampler,
 ) -> vec4 {
-    shade_mesh(vary, v, sv, sky, look, table, s, shadow_map, cmp).0
+    shade_mesh(vary, v, sv, rad_grid, sky, look, table, s, shadow_map, cmp, rad0, rad1, rad2, rad_s).0
 }
 
 /// Multi-target fragment shader for `drawn_only` (writes `(colour, place, sun)` for `Judge`).
@@ -223,14 +166,19 @@ fn mesh_judge_fs<S: Sky, L: Look>(
     vary: MeshVary,
     v: View,
     sv: ShadowView,
+    rad_grid: RadGrid,
     sky: S,
     look: L,
     table: Texture<Rgba16Float>,
     s: Sampler,
     shadow_map: DepthTexture,
     cmp: ComparisonSampler,
+    rad0: Texture3d<Rgba16Float>,
+    rad1: Texture3d<Rgba16Float>,
+    rad2: Texture3d<Rgba16Float>,
+    rad_s: Sampler,
 ) -> Targets3<vec4, vec4, f32> {
-    let out = shade_mesh(vary, v, sv, sky, look, table, s, shadow_map, cmp)
+    let out = shade_mesh(vary, v, sv, rad_grid, sky, look, table, s, shadow_map, cmp, rad0, rad1, rad2, rad_s)
     Targets3 { first: out.0, second: out.1, third: out.2 }
 }
 
@@ -424,10 +372,12 @@ impl<A: MeshWorld, B: MeshWorld> MeshWorld for And<A, B> {
 }
 
 /// Complete meshlet renderer state: owns extracted batches, shadow map, sky irradiance table,
-/// resolved eye depth buffer, and `Picture`.
+/// unified world-space radiance cache (GI + sky occlusion + emissive glow), resolved eye depth
+/// buffer, and `Picture`.
 pub struct MeshSight {
     pub drawn: Picture,
     pub depth: DepthTexture,
+    pub rad: RadianceCache,
     batches: Vec<MeshBatch>,
     shadow_depth: DepthTexture,
     cmp: ComparisonSampler,
@@ -436,13 +386,15 @@ pub struct MeshSight {
     sky_sun: vec3,
     sky_ready: bool,
     frame: u32,
+    pub gi: bool,
 }
 
-/// Creates a fresh `MeshSight` using 4× hardware MSAA.
-pub fn mesh_sight() -> MeshSight {
+/// Creates a fresh `MeshSight` using 4× hardware MSAA and unified world-space GI (`gi: true`).
+pub fn mesh_sight(gi: bool = true) -> MeshSight {
     MeshSight {
         drawn: picture(width: 1, height: 1),
         depth: depth_texture(width: 1, height: 1),
+        rad: radiance_cache(),
         batches: Vec::new(),
         shadow_depth: depth_texture(width: SHADOW_SIDE, height: SHADOW_SIDE),
         cmp: comparison_sampler(compare: Compare::LessEqual),
@@ -451,6 +403,7 @@ pub fn mesh_sight() -> MeshSight {
         sky_sun: vec3(0.0),
         sky_ready: false,
         frame: 0,
+        gi: gi,
     }
 }
 
@@ -527,6 +480,26 @@ impl MeshSight {
             )
         }
         sp.end()
+
+        // Pass 1b: Rebuild unified world-space radiance cache from all extracted still & moving
+        // meshlets (sky occlusion, multi-bounce diffuse GI, emissive spell glow).
+        self.rad.begin(wmid, wrad, enabled: self.gi)
+        if self.gi {
+            for i in 0..nb {
+                self.rad.inject(
+                    self.batches[i].verts.items(),
+                    self.batches[i].verts.count(),
+                    self.batches[i].cap_verts,
+                    sv,
+                    sky,
+                    self.sky_table,
+                    self.sky_sampler,
+                    self.shadow_depth,
+                    self.cmp,
+                )
+            }
+            self.rad.finish()
+        }
         (nb, v, sv)
     }
 
@@ -560,12 +533,17 @@ impl MeshSight {
                 mesh_judge_fs.bind(
                     v: v,
                     sv: sv,
+                    rad_grid: self.rad.grid,
                     sky: sky,
                     look: look,
                     table: self.sky_table,
                     s: self.sky_sampler,
                     shadow_map: self.shadow_depth,
                     cmp: self.cmp,
+                    rad0: self.rad.rad0,
+                    rad1: self.rad.rad1,
+                    rad2: self.rad.rad2,
+                    rad_s: self.rad.s,
                 ),
                 indices: self.batches[i].indices,
                 indirect: self.batches[i].draw_args,
@@ -613,12 +591,17 @@ impl MeshSight {
                 mesh_fs.bind(
                     v: v,
                     sv: sv,
+                    rad_grid: self.rad.grid,
                     sky: sky,
                     look: look,
                     table: self.sky_table,
                     s: self.sky_sampler,
                     shadow_map: self.shadow_depth,
                     cmp: self.cmp,
+                    rad0: self.rad.rad0,
+                    rad1: self.rad.rad1,
+                    rad2: self.rad.rad2,
+                    rad_s: self.rad.s,
                 ),
                 indices: self.batches[i].indices,
                 indirect: self.batches[i].draw_args,
