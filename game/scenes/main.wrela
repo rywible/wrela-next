@@ -24,6 +24,7 @@
 
 use engine::judge::audit::{Audit, audit, eye_round}
 use engine::judge::judge::{Judge, judge, marks}
+use engine::mesh::draw::{MeshSight, MeshWorld, mesh_sight}
 use engine::picture::eye::Eye
 use engine::picture::picture::{Picture, picture}
 use engine::picture::pixels::{Sight, sight, sight_held}
@@ -49,6 +50,13 @@ use std::field::cuboid
 
 /// Which scene (see the head of the file).
 pub const SCENE: u32 = 0
+
+/// Whether to realise the scene via universal GPU surface meshlets (`engine::mesh::draw::MeshSight`)
+/// instead of the per-pixel raymarcher (`Sight`).
+pub const MESH: bool = false
+
+/// Supersampling factor for `MESH` (1 native, 2 for 2×2 hardware supersampling).
+pub const SSAA: u32 = 2
 
 /// Whether the engine's picture is held to the reference.
 pub const JUDGE: bool = false
@@ -138,6 +146,7 @@ const BODY_NEAR = Eye { at: vec3(0.675, 0.78, 1.32), toward: vec3(0.0, 0.6, 0.0)
 
 pub struct Program {
     sight: Sight,
+    mesh: MeshSight,
     reference: Reference,
     truth: Truth,
     full: Truth,
@@ -177,6 +186,7 @@ pub fn init() -> Program {
     }
     Program {
         sight: s,
+        mesh: mesh_sight(ssaa: SSAA),
         reference: reference(looks: LOOKS, rays: RAYS, bounces: 0, light: if SKY_HIDDEN { WHOLE } else { SIMPLE }),
         truth: truth(),
         full: truth(),
@@ -280,6 +290,8 @@ pub fn frame(p: mut Program, time: f32, width: u32, height: u32) {
         let eye = stack_eye(mut p, field, if WALK { k } else { 0 })
         if JUDGE {
             judged(mut p, world, sky, look, eye, width, height, t)
+        } else if MESH {
+            p.mesh.draw(world, sky, look, eye, width, height)
         } else {
             p.sight.draw(world, sky, look, eye, width, height)
             if TRACE && p.frames == STILL_FRAMES {
@@ -320,6 +332,8 @@ pub fn frame(p: mut Program, time: f32, width: u32, height: u32) {
         let world = one(stage())
         if JUDGE {
             judged(mut p, world, sky, look, STAGE_EYE, width, height, t)
+        } else if MESH {
+            p.mesh.draw(world, sky, look, STAGE_EYE, width, height)
         } else {
             p.sight.draw(world, sky, look, STAGE_EYE, width, height)
         }
@@ -341,6 +355,8 @@ pub fn frame(p: mut Program, time: f32, width: u32, height: u32) {
         let world = one(stage()).and(many(bodies)).and(many(boxes))
         if JUDGE {
             judged(mut p, world, sky, look, STAGE_EYE, width, height, t)
+        } else if MESH {
+            p.mesh.draw(world, sky, look, STAGE_EYE, width, height)
         } else {
             p.sight.draw(world, sky, look, STAGE_EYE, width, height)
         }
@@ -352,6 +368,8 @@ pub fn frame(p: mut Program, time: f32, width: u32, height: u32) {
         let world = one(body)
         if JUDGE {
             judged(mut p, world, sky, look, eye, width, height, t)
+        } else if MESH {
+            p.mesh.draw(world, sky, look, eye, width, height)
         } else {
             p.sight.draw(world, sky, look, eye, width, height)
         }
@@ -360,6 +378,8 @@ pub fn frame(p: mut Program, time: f32, width: u32, height: u32) {
     let world = one(stage()).and(one(body.translate(AT)))
     if JUDGE {
         judged(mut p, world, sky, look, STAGE_EYE, width, height, t)
+    } else if MESH {
+        p.mesh.draw(world, sky, look, STAGE_EYE, width, height)
     } else {
         p.sight.draw(world, sky, look, STAGE_EYE, width, height)
     }
@@ -443,7 +463,7 @@ fn audit_eye<W: engine::matter::world::World, M: std::field::Field<engine::matte
 
 /// A frame of judging: the engine draws the moment, the reference works on it; when its looks
 /// are in, the judges hold the engine's picture to it.
-fn judged<W: engine::matter::world::World, S: engine::matter::sky::Sky, L: engine::picture::look::Look>(
+fn judged<W: engine::matter::world::World + MeshWorld, S: engine::matter::sky::Sky, L: engine::picture::look::Look>(
     p: mut Program,
     world: W,
     sky: S,
@@ -458,14 +478,20 @@ fn judged<W: engine::matter::world::World, S: engine::matter::sky::Sky, L: engin
     }
     if !p.finished {
         if !p.drawn {
-            // (The engine draws until its cells are filled for this eye: `STILL_FRAMES` frames,
-            // or the walk's.)
-            p.sight.drawn_only(world, sky, look, eye, width, height)
-            if p.sight.settled() {
+            if MESH {
+                p.mesh.drawn_only(world, sky, look, eye, width, height)
                 p.draws += 1
+                p.drawn = true
+            } else {
+                // (The engine draws until its cells are filled for this eye: `STILL_FRAMES` frames,
+                // or the walk's.)
+                p.sight.drawn_only(world, sky, look, eye, width, height)
+                if p.sight.settled() {
+                    p.draws += 1
+                }
+                let need = if WALK { WALK_FRAMES + STILL_FRAMES * p.moment } else { STILL_FRAMES }
+                p.drawn = p.draws >= need
             }
-            let need = if WALK { WALK_FRAMES + STILL_FRAMES * p.moment } else { STILL_FRAMES }
-            p.drawn = p.draws >= need
         }
         if p.drawn && !p.reference.done() {
             p.reference.work(world, sky, look, eye, width, height)
@@ -473,14 +499,26 @@ fn judged<W: engine::matter::world::World, S: engine::matter::sky::Sky, L: engin
         if p.reference.done() && p.drawn {
             p.reference.picture(0, mut p.shown, mut p.scratch)
             p.reference.settle(0, mut p.full)
-            let _ = p.judge.held(p.sight.drawn, p.full, eye, crawl: true, what: f"moment {p.moment} (walk at {t} s): the engine's picture against the reference", sun: p.sight.drawn.sun)
+            if MESH {
+                let _ = p.judge.held(p.mesh.drawn, p.full, eye, crawl: true, what: f"moment {p.moment} (walk at {t} s): the meshlet picture against the reference", sun: p.mesh.drawn.sun)
+            } else {
+                let _ = p.judge.held(p.sight.drawn, p.full, eye, crawl: true, what: f"moment {p.moment} (walk at {t} s): the engine's picture against the reference", sun: p.sight.drawn.sun)
+            }
             if p.moment == 0 {
                 p.reference.settle(1, mut p.truth)
                 p.reference.picture(2, mut p.half, mut p.scratch)
-                let _ = p.judge.held(p.half, p.truth, eye, crawl: false, what: "the reference's second half against its first (the judges' floor)", sun: p.sight.drawn.sun)
+                if MESH {
+                    let _ = p.judge.held(p.half, p.truth, eye, crawl: false, what: "the reference's second half against its first (the judges' floor)", sun: p.mesh.drawn.sun)
+                } else {
+                    let _ = p.judge.held(p.half, p.truth, eye, crawl: false, what: "the reference's second half against its first (the judges' floor)", sun: p.sight.drawn.sun)
+                }
             }
             if SHOW == 2 {
-                marks(p.sight.drawn, p.full, mut p.marked)
+                if MESH {
+                    marks(p.mesh.drawn, p.full, mut p.marked)
+                } else {
+                    marks(p.sight.drawn, p.full, mut p.marked)
+                }
             }
             print(f"moment {p.moment} done")
             p.moment += 1
@@ -512,6 +550,8 @@ fn judged<W: engine::matter::world::World, S: engine::matter::sky::Sky, L: engin
         show(p.shown.colour)
     } else if SHOW == 2 && p.marked.width() == width {
         show(p.marked.colour)
+    } else if MESH && p.mesh.drawn.placed {
+        show(p.mesh.drawn.colour)
     } else if p.sight.drawn.placed {
         show(p.sight.drawn.colour)
     } else {

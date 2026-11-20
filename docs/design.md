@@ -357,6 +357,61 @@ is dead as priced; at 2.2 or under the budget is real; any hole is a fault befor
 
 The record of the arguments and their spikes is in `wrela-notes/coordinator/gemini3/`.
 
+## Universal GPU surface meshlets (2026-11-20: built and measured on both machines)
+
+**Why the direction changed.** The per-pixel analytical SDF tile-kernel above only handled a closed
+list of families (`STAND_IN_ROUND_CONE`), took 3.98 ms alone on the M4 and 23.6 ms on the Radeon
+once its rim was made sound (and 6× worse on rows of creatures), and still left noise-displaced
+fields, ellipsoids, cuts, and analytical edge antialiasing unresolved. Meanwhile, the hardware
+rasteriser and fixed-function depth/MSAA/RT silicon win by an order of magnitude without ever
+requiring an author to write a mesh.
+
+**The unified pipeline (`lib/engine/mesh/`).** Authors still write pure `Field<Substance>` values
+only; the engine compiles any field into hardware-native surface meshlets on the GPU:
+
+1. **Sparse interval-culled brick extraction (`lib/engine/mesh/extract.wrela`):** Any `One<M>` or
+   `Many<M, N>` is interval-culled into active `6³` bricks (each evaluating an `8³` corner block
+   and `7³` dual vertices so adjacent brick halos agree bit for bit: zero cracks, zero cross-brick
+   pointers), solved via closed-form regularized Dual Contouring QEF + 1-step exact Newton surface
+   snap. Unchanged fields (`StateHash`) cost 0 ms/frame after frame 0.
+2. **One rasteriser, one shadow map (`lib/engine/mesh/draw.wrela`):** Still and moving matter draw
+   through one vertex shader and one fragment shader into one unified sun shadow map and one
+   reversed-Z supersampled target (`SSAA=2` today; `4× MSAA` + analytic-motion TAA next), with
+   derivative crease-preserving normals. Zero per-thing shader specialization, zero `StandIn`
+   families, zero 9-ray edge lists.
+3. **One light (next):** Build hardware RT BLAS/TLAS (Metal `intersector`, Vulkan `VK_KHR_ray_query`)
+   directly from the extracted meshlets + world-space sparse radiance cache for shadows, GI,
+   reflections, spell light, and glass refraction.
+
+**Measured on both machines (2026-11-20, 1920×1080, settled frames 12–24, `MESH=true`):**
+
+| Scene (1920×1080) | Old `Sight` (M4 / Radeon) | `MeshSight` SSAA=2 (M4 / Radeon) | `MeshSight` SSAA=1 (M4 / Radeon) |
+| --- | --- | --- | --- |
+| SCENE 4 (stage) | ~6–7 ms / — | 2.14 ms / 13.6 ms | — |
+| SCENE 1 (44 m noise `stack`) | 12.5–19.2 ms / — | 2.8 ms / 13.6 ms | — |
+| SCENE 3 (creature + 1 cm wand, 1.5 m) | — | 6.25 ms / 17.9 ms | — |
+| SCENE 8 (stage + 256 boxes + 64 creatures) | 50.6 ms / — | 7.85 ms / 27.4 ms | — |
+| SCENE 8 (stage + 256 boxes + 256 creatures) | 177 ms / 305.2 ms | 13.2 ms / 27.8 ms | 10.7 ms / 17.5 ms |
+
+**Judged against the brute-force `Reference` (`LOOKS=16`, M4):**
+
+- **SCENE 4 (stage, 320×180):** **0 holes**, 98.17% of surfaces within 0.05 px (mean 0.0132 px),
+  wholly-covered lit mean 0.922/255 (reference floor 0.944/255), outline 0.193 px.
+- **SCENE 3 (close-up creature + 1 cm wand, 480×270):** **0 holes**, **197 of 199 thin pixels
+  (< 2.5 cm) kept (99.0%)**, 99.8% of surfaces within 0.5 px, lit mean 0.50/255 (reference floor
+  0.54/255).
+
+**Next stages on this line:**
+
+1. **4× hardware MSAA in `toolchain/gpu` + `std::gpu`** (replaces `SSAA=2` 4K rasterization, cutting
+   Radeon fill cost ~3× while keeping M4 tile-SRAM edges nearly free) + exact analytic-motion TAA.
+2. **Rest-pose / bone-space meshlet caching & GPU skinning for articulated crowds** (drops 256
+   walking creatures from ~10 ms full re-extraction every frame to ~2–3 ms total).
+3. **Hardware inline ray tracing (`intersector` / `VK_KHR_ray_query`)** over the extracted meshlet
+   BLAS/TLAS + sparse world-space radiance cache, replacing the shadow map and fulfilling One Light.
+4. **Delete the per-pixel raymarcher (`Sight`) and remove `StandIn` / `Meets` / `Pass` / `Crease`
+   from `lib/std/field.wrela`** once `MeshSight` clears all judges and the hole audit.
+
 ## The layers
 
 Dependencies point down. Nothing below knows anything above.
@@ -367,6 +422,7 @@ lib/
   std/            the language's library
   engine/         realises matter. The only package that may touch the GPU
     matter/       where is matter, and what is it made of
+    mesh/         universal GPU field-to-meshlet extraction (Dual Contouring) and unified rasterisation
     ray/          what does this ray meet
     light/        what light arrives here
     picture/      this world, this eye, this look -> an image, within a budget

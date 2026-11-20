@@ -1,0 +1,816 @@
+// Universal field-to-meshlet extraction on the GPU (docs/design.md): any `Field<Substance>`
+// (still or moving, sharp or smooth, noise-displaced or joined) is realised as a watertight
+// triangle mesh via sparse brick interval culling and Hermite Dual Contouring (Ju et al.,
+// SIGGRAPH 2002), with 1-step exact Newton surface projection.
+//
+// Each active brick owns `BRICK`³ (6³) interior cells and evaluates `(BRICK + 2)`³ (8³ = 512)
+// corners and `(BRICK + 1)`³ (7³ = 343) dual vertices. Adjacent bricks overlap by one halo cell
+// with identical corner positions, so shared boundary vertices agree bit for bit and no cross-brick
+// lookups or cracks arise.
+
+use matter::substance::Substance
+use std::collections::Vec
+use std::derive::Box3
+use std::field::Field
+use std::gpu::{
+    Append, AppendBuffer, Atomics, DispatchArgs, DrawIndexedArgs, GlobalId, GpuBuffer, GpuSpan,
+    One, Slots, append_buffer, buffer, buffer_of, dispatch, label, write,
+}
+use std::hash::{Hasher, StateHash}
+
+/// Interior cells per brick along each axis (`6×6×6` owned edges, `7×7×7` dual vertices, `8×8×8`
+/// evaluated corners).
+pub const BRICK: u32 = 6
+const CORNERS_BRICK: u32 = 512
+const VERTS_BRICK: u32 = 343
+/// Padded vertex-index stride per brick (6 workgroups × 64 lanes = 384) so `extract_verts` writes
+/// directly via `Slots[id]` with 256-byte chunk span alignment.
+const VERTS_STRIDE: u32 = 384
+const EDGES_BRICK: u32 = 216
+const NONE: u32 = 4294967295
+
+/// Maximum bricks processed per extraction dispatch chunk so every compute dispatch stays far
+/// under the 50 ms step guard even for expensive noise-displaced fields.
+const CHUNK_BRICKS: u32 = 1024
+const CULL_CHUNK: u32 = 16384
+
+/// One extracted surface vertex (64 bytes, std430-aligned).
+/// `normal.w` is 1.0 on smooth regions and 0.0 on sharp creases/corners.
+pub struct MeshVertex: Copy + GpuData {
+    pub pos: vec4,
+    pub normal: vec4,
+    pub albedo: vec4,
+    pub emits: vec4,
+}
+
+/// Grid layout for one thing inside a `MeshBatch`.
+pub struct GridSpec: Copy + GpuData {
+    pub origin: vec3,
+    pub cell: f32,
+    pub dims: vec3u,
+    pub base_brick: u32,
+}
+
+/// Tightens a thing's bounding sphere into a tight axis-aligned box on the CPU using `field.interval`
+/// (10 binary-search steps per face = 60 cheap interval queries).
+pub fn tight_aabb<M: Field<Substance>>(field: M) -> Box3 {
+    let b = field.bound()
+    let r = min(b.radius, 1.0e4)
+    var lo = b.centre - vec3(r)
+    var hi = b.centre + vec3(r)
+    // Shrink each face while the sliced slab's interval excludes zero.
+    for _step in 0..8 {
+        let mid = 0.5 * (lo.x + hi.x)
+        let iv = field.interval(Box3 { lo, hi: vec3(mid, hi.y, hi.z) })
+        if iv.lo > 0.0 || iv.hi < 0.0 {
+            lo.x = mid
+        } else {
+            break
+        }
+    }
+    for _step in 0..8 {
+        let mid = 0.5 * (lo.x + hi.x)
+        let iv = field.interval(Box3 { lo: vec3(mid, lo.y, lo.z), hi })
+        if iv.lo > 0.0 || iv.hi < 0.0 {
+            hi.x = mid
+        } else {
+            break
+        }
+    }
+    for _step in 0..8 {
+        let mid = 0.5 * (lo.y + hi.y)
+        let iv = field.interval(Box3 { lo, hi: vec3(hi.x, mid, hi.z) })
+        if iv.lo > 0.0 || iv.hi < 0.0 {
+            lo.y = mid
+        } else {
+            break
+        }
+    }
+    for _step in 0..8 {
+        let mid = 0.5 * (lo.y + hi.y)
+        let iv = field.interval(Box3 { lo: vec3(lo.x, mid, lo.z), hi })
+        if iv.lo > 0.0 || iv.hi < 0.0 {
+            hi.y = mid
+        } else {
+            break
+        }
+    }
+    for _step in 0..8 {
+        let mid = 0.5 * (lo.z + hi.z)
+        let iv = field.interval(Box3 { lo, hi: vec3(hi.x, hi.y, mid) })
+        if iv.lo > 0.0 || iv.hi < 0.0 {
+            lo.z = mid
+        } else {
+            break
+        }
+    }
+    for _step in 0..8 {
+        let mid = 0.5 * (lo.z + hi.z)
+        let iv = field.interval(Box3 { lo: vec3(lo.x, lo.y, mid), hi })
+        if iv.lo > 0.0 || iv.hi < 0.0 {
+            hi.z = mid
+        } else {
+            break
+        }
+    }
+    Box3 { lo, hi }
+}
+
+/// Builds a `GridSpec` covering `aabb` with cell spacing `cell`, padded by 2 cells so the surface
+/// never touches the grid boundary.
+fn grid_for(aabb: Box3, cell: f32, base_brick: u32) -> GridSpec {
+    let pad = vec3(cell * 2.0)
+    let origin = aabb.lo - pad
+    let span = max(aabb.hi + pad - origin, vec3(cell))
+    let bspan = cell * f32(BRICK)
+    let nx = max(u32(ceil(span.x / bspan)), 1)
+    let ny = max(u32(ceil(span.y / bspan)), 1)
+    let nz = max(u32(ceil(span.z / bspan)), 1)
+    GridSpec { origin, cell, dims: vec3u(nx, ny, nz), base_brick }
+}
+
+/// Safe vector normalize.
+fn safe_norm(v: vec3, fallback: vec3) -> vec3 {
+    let l2 = dot(v, v)
+    if l2 > 1.0e-12 { v * (1.0 / sqrt(l2)) } else { fallback }
+}
+
+/// Finds which thing owns global brick index `gb` by binary search over `grids[i].base_brick`.
+fn owner_of(grids: [GridSpec], n: u32, gb: u32) -> u32 {
+    var lo: u32 = 0
+    var hi: u32 = n
+    for _k in 0..16 {
+        if lo + 1 >= hi {
+            break
+        }
+        let mid = (lo + hi) >> 1
+        if grids[mid].base_brick <= gb {
+            lo = mid
+        } else {
+            hi = mid
+        }
+    }
+    lo
+}
+
+/// Pass 0: Interval-culls candidate bricks across all things in a batch, appending only bricks whose
+/// distance interval straddles 0.
+@compute(64)
+fn cull_bricks<M: Field<Substance>>(
+    fields: [M],
+    grids: [GridSpec],
+    things: u32,
+    first_brick: u32,
+    total_bricks: u32,
+    active: mut Append<vec4u>,
+    id: GlobalId,
+) {
+    let gb = first_brick + id.x
+    if gb >= total_bricks {
+        return
+    }
+    let ti = owner_of(grids, things, gb)
+    let g = grids[ti]
+    let local = gb - g.base_brick
+    let xy = g.dims.x * g.dims.y
+    let bz = local / xy
+    let rem = local - bz * xy
+    let by = rem / g.dims.x
+    let bx = rem - by * g.dims.x
+    let bspan = g.cell * f32(BRICK)
+    let lo = g.origin + vec3(f32(bx), f32(by), f32(bz)) * bspan
+    // Cover the full 8×8×8 corner box (7 cells wide = BRICK + 1) so halo sign changes aren't missed.
+    let hi = lo + vec3(g.cell * f32(BRICK + 1))
+    let iv = fields[ti].interval(Box3 { lo, hi })
+    if iv.lo <= 0.0 && iv.hi >= 0.0 {
+        let _ = active.push(vec4u(bx, by, bz, ti))
+    }
+}
+
+/// Writes indirect dispatch counts for chunk `chunk_idx` (covering `CHUNK_BRICKS` bricks) and
+/// clamps to `cap_bricks`.
+@compute(1)
+fn prep_chunk(
+    active_count: [u32],
+    cap_bricks: u32,
+    chunk_start: u32,
+    eval_args: mut One<DispatchArgs>,
+    vert_args: mut One<DispatchArgs>,
+    quad_args: mut One<DispatchArgs>,
+    id: GlobalId,
+) {
+    let total = min(active_count[0], cap_bricks)
+    let n = if total > chunk_start { min(total - chunk_start, CHUNK_BRICKS) } else { 0 }
+    eval_args.set(id, DispatchArgs { x: n * 8, y: 1, z: 1 })
+    vert_args.set(id, DispatchArgs { x: n * 6, y: 1, z: 1 })
+    quad_args.set(id, DispatchArgs { x: n * 4, y: 1, z: 1 })
+}
+
+/// Pass 1: Evaluates `field.distance` at all 512 (`8×8×8`) corners of each active brick in a chunk.
+@compute(64)
+fn eval_corners<M: Field<Substance>>(
+    fields: [M],
+    grids: [GridSpec],
+    active: [vec4u],
+    active_count: [u32],
+    cap_bricks: u32,
+    chunk_start: u32,
+    corners: mut Slots<f32>,
+    id: GlobalId,
+) {
+    let brick_in_chunk = id.x / CORNERS_BRICK
+    let bi = chunk_start + brick_in_chunk
+    let total = min(active_count[0], cap_bricks)
+    if bi >= total {
+        return
+    }
+    let ci = id.x - brick_in_chunk * CORNERS_BRICK
+    let b = active[bi]
+    let g = grids[b.w]
+    let cx = ci & 7
+    let cy = (ci >> 3) & 7
+    let cz = ci >> 6
+    let bspan = g.cell * f32(BRICK)
+    let p = g.origin + vec3(f32(b.x), f32(b.y), f32(b.z)) * bspan + vec3(f32(cx), f32(cy), f32(cz)) * g.cell
+    corners[id] = fields[b.w].distance(p)
+}
+
+/// Corner distance inside a brick at `(x, y, z)` in `0..8`.
+fn cdist(corners: [f32], base: u32, x: u32, y: u32, z: u32) -> f32 {
+    corners[base + x + (y << 3) + (z << 6)]
+}
+
+/// Trilinear gradient of a cell's 8 corner distances at local `(u, v, w)` in `[0, 1]³`.
+fn tri_grad(
+    d000: f32, d100: f32, d010: f32, d110: f32,
+    d001: f32, d101: f32, d011: f32, d111: f32,
+    u: f32, v: f32, w: f32,
+) -> vec3 {
+    let gx = mix(mix(d100 - d000, d110 - d010, v), mix(d101 - d001, d111 - d011, v), w)
+    let gy = mix(mix(d010 - d000, d110 - d100, u), mix(d011 - d001, d111 - d101, u), w)
+    let gz = mix(mix(d001 - d000, d101 - d100, u), mix(d011 - d010, d111 - d110, u), v)
+    vec3(gx, gy, gz)
+}
+
+/// Corner coordinates of local cell corner `k` in `0..8`.
+fn corner_uvw(k: u32) -> vec3 {
+    vec3(f32(k & 1), f32((k >> 1) & 1), f32((k >> 2) & 1))
+}
+
+/// Reads the `k`-th corner (`0..8`) from the 8 unpacked values.
+fn corner_val(
+    d000: f32, d100: f32, d010: f32, d110: f32,
+    d001: f32, d101: f32, d011: f32, d111: f32,
+    k: u32,
+) -> f32 {
+    if k == 0 {
+        d000
+    } else if k == 1 {
+        d100
+    } else if k == 2 {
+        d010
+    } else if k == 3 {
+        d110
+    } else if k == 4 {
+        d001
+    } else if k == 5 {
+        d101
+    } else if k == 6 {
+        d011
+    } else {
+        d111
+    }
+}
+
+/// Pass 2: Solves one Dual Contouring QEF vertex per sign-changing cell (`7×7×7 = 343` cells per
+/// active brick) using ONLY the cell's own 8 corners (guaranteed bit-for-bit identical across
+/// adjacent brick halos so meshes are 100% watertight with zero seam cracks), applies 1 exact
+/// Newton snap step onto the field zero-isosurface, and stores exact analytic normal + substance.
+@compute(64)
+fn extract_verts<M: Field<Substance>>(
+    fields: [M],
+    grids: [GridSpec],
+    active: [vec4u],
+    active_count: [u32],
+    cap_bricks: u32,
+    cap_verts: u32,
+    chunk_start: u32,
+    corners: [f32],
+    cell_verts: mut Slots<u32>,
+    verts: mut Append<MeshVertex>,
+    id: GlobalId,
+) {
+    // 6 workgroups of 64 = 384 lanes per brick (covering 343 cells).
+    let brick_in_chunk = id.x / 384
+    let cell = id.x - brick_in_chunk * 384
+    let bi = chunk_start + brick_in_chunk
+    let total = min(active_count[0], cap_bricks)
+    if bi >= total || cell >= VERTS_BRICK {
+        return
+    }
+    let cz = cell / 49
+    let rem = cell - cz * 49
+    let cy = rem / 7
+    let cx = rem - cy * 7
+    let cbase = bi * CORNERS_BRICK
+    let d000 = cdist(corners, cbase, cx, cy, cz)
+    let d100 = cdist(corners, cbase, cx + 1, cy, cz)
+    let d010 = cdist(corners, cbase, cx, cy + 1, cz)
+    let d110 = cdist(corners, cbase, cx + 1, cy + 1, cz)
+    let d001 = cdist(corners, cbase, cx, cy, cz + 1)
+    let d101 = cdist(corners, cbase, cx + 1, cy, cz + 1)
+    let d011 = cdist(corners, cbase, cx, cy + 1, cz + 1)
+    let d111 = cdist(corners, cbase, cx + 1, cy + 1, cz + 1)
+    var mask: u32 = 0
+    if d000 < 0.0 { mask = mask | 1 }
+    if d100 < 0.0 { mask = mask | 2 }
+    if d010 < 0.0 { mask = mask | 4 }
+    if d110 < 0.0 { mask = mask | 8 }
+    if d001 < 0.0 { mask = mask | 16 }
+    if d101 < 0.0 { mask = mask | 32 }
+    if d011 < 0.0 { mask = mask | 64 }
+    if d111 < 0.0 { mask = mask | 128 }
+    if mask == 0 || mask == 255 {
+        cell_verts[id] = NONE
+        return
+    }
+
+    let b = active[bi]
+    let g = grids[b.w]
+    let h = g.cell
+    let bspan = h * f32(BRICK)
+    let cell_lo = g.origin + vec3(f32(b.x), f32(b.y), f32(b.z)) * bspan + vec3(f32(cx), f32(cy), f32(cz)) * h
+    let half = vec3(0.5)
+
+    // 12 edges of the cube (pairs of corner indices 0..8).
+    let e0 = [0, 2, 4, 6, 0, 1, 4, 5, 0, 1, 2, 3]
+    let e1 = [1, 3, 5, 7, 2, 3, 6, 7, 4, 5, 6, 7]
+
+    // Accumulate symmetric 3×3 QEF in local cell coordinates relative to cell center (0.5, 0.5, 0.5).
+    var a00 = 0.0
+    var a01 = 0.0
+    var a02 = 0.0
+    var a11 = 0.0
+    var a12 = 0.0
+    var a22 = 0.0
+    var bx_v = 0.0
+    var by_v = 0.0
+    var bz_v = 0.0
+    var mass = vec3(0.0)
+    var avg_n = vec3(0.0)
+    var count: u32 = 0
+
+    // Measure normal spread across crossed edges to detect sharp creases.
+    var first_n = vec3(0.0)
+    var min_dot = 1.0
+
+    for e in 0..12 {
+        let i0 = e0[e]
+        let i1 = e1[e]
+        let v0 = corner_val(d000, d100, d010, d110, d001, d101, d011, d111, i0)
+        let v1 = corner_val(d000, d100, d010, d110, d001, d101, d011, d111, i1)
+        if (v0 < 0.0) != (v1 < 0.0) {
+            let t = clamp(v0 / (v0 - v1), 0.0, 1.0)
+            let uvw = mix(corner_uvw(i0), corner_uvw(i1), t)
+            let tg = tri_grad(d000, d100, d010, d110, d001, d101, d011, d111, uvw.x, uvw.y, uvw.z)
+            let n = safe_norm(tg, vec3(0.0, 1.0, 0.0))
+            let q = uvw - half
+            let dp = dot(n, q)
+            a00 += n.x * n.x
+            a01 += n.x * n.y
+            a02 += n.x * n.z
+            a11 += n.y * n.y
+            a12 += n.y * n.z
+            a22 += n.z * n.z
+            bx_v += n.x * dp
+            by_v += n.y * dp
+            bz_v += n.z * dp
+            mass += uvw
+            avg_n += n
+            if count == 0 {
+                first_n = n
+            } else {
+                min_dot = min(min_dot, dot(first_n, n))
+            }
+            count += 1
+        }
+    }
+
+    let inv_c = 1.0 / max(f32(count), 1.0)
+    let mp = mass * inv_c
+    let mp_rel = mp - half
+
+    // Tikhonov regularization toward mass point: keeps nullspace centered while solving sharp edges.
+    let reg = 0.04 * f32(count)
+    a00 += reg
+    a11 += reg
+    a22 += reg
+    bx_v += mp_rel.x * reg
+    by_v += mp_rel.y * reg
+    bz_v += mp_rel.z * reg
+
+    // Closed-form symmetric 3×3 solve via cofactors (always SPD since reg > 0).
+    let c00 = a11 * a22 - a12 * a12
+    let c01 = a02 * a12 - a01 * a22
+    let c02 = a01 * a12 - a02 * a11
+    let c11 = a00 * a22 - a02 * a02
+    let c12 = a01 * a02 - a00 * a12
+    let c22 = a00 * a11 - a01 * a01
+    let det = a00 * c00 + a01 * c01 + a02 * c02
+    let rhs = vec3(bx_v, by_v, bz_v)
+    let sol = if det > 1.0e-12 {
+        vec3(
+            c00 * rhs.x + c01 * rhs.y + c02 * rhs.z,
+            c01 * rhs.x + c11 * rhs.y + c12 * rhs.z,
+            c02 * rhs.x + c12 * rhs.y + c22 * rhs.z,
+        ) / det
+    } else {
+        mp_rel
+    }
+    let uvw_qef = clamp(sol + half, vec3(0.0), vec3(1.0))
+    var wp = cell_lo + uvw_qef * h
+
+    // 1-step exact Newton projection onto the field zero-isosurface (stays clamped inside cell).
+    let f = fields[b.w]
+    let (dv, gv) = f.sample(wp)
+    let g2 = dot(gv, gv)
+    if g2 > 1.0e-8 {
+        let step = clamp(dv / g2, -0.75 * h, 0.75 * h)
+        let cand = wp - gv * step
+        let rel = (cand - cell_lo) / h
+        if rel.x >= 0.0 && rel.x <= 1.0 && rel.y >= 0.0 && rel.y <= 1.0 && rel.z >= 0.0 && rel.z <= 1.0 {
+            wp = cand
+        }
+    }
+
+    let n_final = safe_norm(gv, safe_norm(avg_n, vec3(0.0, 1.0, 0.0)))
+    let sub = f.channels(wp)
+    let smooth = if min_dot >= 0.88 { 1.0 } else { 0.0 }
+
+    let vi = verts.push(MeshVertex {
+        pos: vec4(wp, 1.0),
+        normal: vec4(n_final, smooth),
+        albedo: vec4(sub.albedo, 1.0),
+        emits: vec4(sub.emits, 0.0),
+    })
+    cell_verts[id] = if vi < cap_verts { vi } else { NONE }
+}
+
+/// Dual vertex index of local cell `(x, y, z)` in `0..7` inside brick `bi`.
+fn cv(cell_verts: [u32], base: u32, x: u32, y: u32, z: u32) -> u32 {
+    cell_verts[base + x + y * 7 + z * 49]
+}
+
+/// Emits one quad (2 triangles = 6 indices) with consistent outward CCW winding.
+fn emit_quad(
+    v0: u32, v1: u32, v2: u32, v3: u32,
+    flip: bool,
+    cap_indices: u32,
+    tri_count: mut Atomics<u32>,
+    indices: mut Atomics<u32>,
+) {
+    if v0 == NONE || v1 == NONE || v2 == NONE || v3 == NONE {
+        return
+    }
+    let at = tri_count.add(i: 0, value: 6)
+    if at + 6 > cap_indices {
+        return
+    }
+    if !flip {
+        indices.store(i: at, value: v0)
+        indices.store(i: at + 1, value: v1)
+        indices.store(i: at + 2, value: v2)
+        indices.store(i: at + 3, value: v0)
+        indices.store(i: at + 4, value: v2)
+        indices.store(i: at + 5, value: v3)
+    } else {
+        indices.store(i: at, value: v0)
+        indices.store(i: at + 1, value: v3)
+        indices.store(i: at + 2, value: v2)
+        indices.store(i: at + 3, value: v0)
+        indices.store(i: at + 4, value: v2)
+        indices.store(i: at + 5, value: v1)
+    }
+}
+
+/// Pass 3: Emits watertight quads for every sign-changing owned edge (`6×6×6 = 216` edges per axis
+/// per brick). Each global grid edge belongs to exactly one brick, and all 4 surrounding cells lie
+/// inside `0..7` of that brick.
+@compute(64)
+fn emit_tris(
+    active_count: [u32],
+    cap_bricks: u32,
+    cap_indices: u32,
+    chunk_start: u32,
+    corners: [f32],
+    cell_verts: [u32],
+    tri_count: mut Atomics<u32>,
+    indices: mut Atomics<u32>,
+    id: GlobalId,
+) {
+    // 4 workgroups of 64 = 256 lanes per brick (covering 216 owned edge triples).
+    let brick_in_chunk = id.x / 256
+    let eidx = id.x - brick_in_chunk * 256
+    let bi = chunk_start + brick_in_chunk
+    let total = min(active_count[0], cap_bricks)
+    if bi >= total || eidx >= EDGES_BRICK {
+        return
+    }
+    let ez = eidx / 36
+    let rem = eidx - ez * 36
+    let ey = rem / 6
+    let ex = rem - ey * 6
+    let cbase = bi * CORNERS_BRICK
+    let vbase = bi * VERTS_STRIDE
+
+    // +X edge: (ex, ey+1, ez+1) -> (ex+1, ey+1, ez+1); surrounding cells have x=ex, y in {ey, ey+1}, z in {ez, ez+1}.
+    let dx0 = cdist(corners, cbase, ex, ey + 1, ez + 1)
+    let dx1 = cdist(corners, cbase, ex + 1, ey + 1, ez + 1)
+    if (dx0 < 0.0) != (dx1 < 0.0) {
+        emit_quad(
+            cv(cell_verts, vbase, ex, ey, ez),
+            cv(cell_verts, vbase, ex, ey + 1, ez),
+            cv(cell_verts, vbase, ex, ey + 1, ez + 1),
+            cv(cell_verts, vbase, ex, ey, ez + 1),
+            flip: dx0 >= 0.0,
+            cap_indices: cap_indices,
+            tri_count: mut tri_count,
+            indices: mut indices,
+        )
+    }
+
+    // +Y edge: (ex+1, ey, ez+1) -> (ex+1, ey+1, ez+1); surrounding cells have y=ey, x in {ex, ex+1}, z in {ez, ez+1}.
+    let dy0 = cdist(corners, cbase, ex + 1, ey, ez + 1)
+    let dy1 = cdist(corners, cbase, ex + 1, ey + 1, ez + 1)
+    if (dy0 < 0.0) != (dy1 < 0.0) {
+        emit_quad(
+            cv(cell_verts, vbase, ex, ey, ez),
+            cv(cell_verts, vbase, ex, ey, ez + 1),
+            cv(cell_verts, vbase, ex + 1, ey, ez + 1),
+            cv(cell_verts, vbase, ex + 1, ey, ez),
+            flip: dy0 >= 0.0,
+            cap_indices: cap_indices,
+            tri_count: mut tri_count,
+            indices: mut indices,
+        )
+    }
+
+    // +Z edge: (ex+1, ey+1, ez) -> (ex+1, ey+1, ez+1); surrounding cells have z=ez, x in {ex, ex+1}, y in {ey, ey+1}.
+    let dz0 = cdist(corners, cbase, ex + 1, ey + 1, ez)
+    let dz1 = cdist(corners, cbase, ex + 1, ey + 1, ez + 1)
+    if (dz0 < 0.0) != (dz1 < 0.0) {
+        emit_quad(
+            cv(cell_verts, vbase, ex, ey, ez),
+            cv(cell_verts, vbase, ex + 1, ey, ez),
+            cv(cell_verts, vbase, ex + 1, ey + 1, ez),
+            cv(cell_verts, vbase, ex, ey + 1, ez),
+            flip: dz0 >= 0.0,
+            cap_indices: cap_indices,
+            tri_count: mut tri_count,
+            indices: mut indices,
+        )
+    }
+}
+
+/// Pass 4: Writes the final `DrawIndexedArgs` from the emitted index count (clamped to capacity).
+@compute(1)
+fn finish_draw(tri_count: [u32], cap_indices: u32, args: mut One<DrawIndexedArgs>, id: GlobalId) {
+    let n = min(tri_count[0], cap_indices)
+    args.set(id, DrawIndexedArgs {
+        indices: n,
+        instances: if n > 0 { 1 } else { 0 },
+        first_index: 0,
+        base_vertex: 0,
+        first_instance: 0,
+    })
+}
+
+/// GPU-extracted triangle mesh for one field or a batch of fields of the same type.
+pub struct MeshBatch {
+    pub active: AppendBuffer<vec4u>,
+    pub corners: GpuBuffer<f32>,
+    pub cell_verts: GpuBuffer<u32>,
+    pub verts: AppendBuffer<MeshVertex>,
+    pub indices: GpuBuffer<u32>,
+    pub tri_count: GpuBuffer<u32>,
+    pub draw_args: GpuBuffer<DrawIndexedArgs>,
+    pub eval_args: GpuBuffer<DispatchArgs>,
+    pub vert_args: GpuBuffer<DispatchArgs>,
+    pub quad_args: GpuBuffer<DispatchArgs>,
+    pub cap_bricks: u32,
+    pub cap_verts: u32,
+    pub cap_indices: u32,
+    pub hash: u64,
+    pub cell: f32,
+    pub built: bool,
+    pub bound: vec4,
+}
+
+/// Allocates a `MeshBatch` sized for up to `max_bricks` active surface bricks.
+pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
+    // Average surface brick emits ~50 vertices and ~300 indices; give generous headroom.
+    let cap_verts = max_bricks * 80
+    let cap_indices = max_bricks * 480
+    MeshBatch {
+        active: append_buffer(max_bricks),
+        corners: buffer(max_bricks * CORNERS_BRICK),
+        cell_verts: buffer(max_bricks * VERTS_STRIDE),
+        verts: append_buffer(cap_verts),
+        indices: buffer(cap_indices),
+        tri_count: buffer_of([0]),
+        draw_args: buffer_of([DrawIndexedArgs { indices: 0, instances: 0, first_index: 0, base_vertex: 0, first_instance: 0 }]),
+        eval_args: buffer_of([DispatchArgs { x: 0, y: 1, z: 1 }]),
+        vert_args: buffer_of([DispatchArgs { x: 0, y: 1, z: 1 }]),
+        quad_args: buffer_of([DispatchArgs { x: 0, y: 1, z: 1 }]),
+        cap_bricks: max_bricks,
+        cap_verts,
+        cap_indices,
+        hash: 0,
+        cell: 0.0,
+        built: false,
+        bound: vec4(0.0),
+    }
+}
+
+impl MeshBatch {
+    /// Extracts a single field into this batch if its state hash or requested cell size changed.
+    /// Unchanged fields do zero GPU work.
+    pub fn sync_one<M: Field<Substance> + StateHash + GpuData>(mut self, field: M, cell: f32) {
+        var h = Hasher::new()
+        field.state_hash(mut h)
+        let key = h.finish()
+        if self.built && self.hash == key && abs(self.cell - cell) <= 0.05 * max(self.cell, 1.0e-4) {
+            return
+        }
+        let aabb = tight_aabb(field)
+        let g = grid_for(aabb, cell, 0)
+        let total_bricks = g.dims.x * g.dims.y * g.dims.z
+        let fbuf = buffer_of([field])
+        let gbuf = buffer_of([g])
+        let mid = 0.5 * (aabb.lo + aabb.hi)
+        self.bound = vec4(mid, length(aabb.hi - mid))
+        self.run_extract(fbuf.items(), gbuf.items(), things: 1, total_bricks: total_bricks)
+        self.hash = key
+        self.cell = cell
+        self.built = true
+    }
+
+    /// Extracts `N` fields of one type into this shared batch (one draw call for all `N` things),
+    /// each thing using its own view-adapted cell spacing `cells[i]` (0.0 skips a thing completely).
+    pub fn sync_many<M: Field<Substance> + StateHash + GpuData, const N: u32>(mut self, fields: [M; N], cells: [f32; N]) {
+        var h = Hasher::new()
+        for i in 0..N {
+            fields[i].state_hash(mut h)
+        }
+        let key = h.finish()
+        var first_cell = 0.0
+        for i in 0..N {
+            if cells[i] > 0.0 {
+                first_cell = cells[i]
+                break
+            }
+        }
+        if self.built && self.hash == key && abs(self.cell - first_cell) <= 0.05 * max(self.cell, 1.0e-4) {
+            return
+        }
+        var grids: Vec<GridSpec> = Vec::new()
+        var kept: Vec<M> = Vec::new()
+        var total_bricks: u32 = 0
+        var wlo = vec3(1.0e20)
+        var whi = vec3(-1.0e20)
+        for i in 0..N {
+            let c = cells[i]
+            if c <= 0.0 {
+                continue
+            }
+            let b = fields[i].bound()
+            let r = min(b.radius, 1.0e4)
+            let aabb = Box3 { lo: b.centre - vec3(r), hi: b.centre + vec3(r) }
+            let g = grid_for(aabb, c, total_bricks)
+            total_bricks += g.dims.x * g.dims.y * g.dims.z
+            grids.push(g)
+            kept.push(fields[i])
+            wlo = min(wlo, aabb.lo)
+            whi = max(whi, aabb.hi)
+        }
+        let count = kept.len()
+        if count == 0 {
+            write(mut self.tri_count, 0, [0])
+            dispatch(finish_draw.bind(tri_count: self.tri_count.items(), cap_indices: self.cap_indices, args: mut self.draw_args), over: 1)
+            self.hash = key
+            self.cell = first_cell
+            self.built = true
+            return
+        }
+        let fbuf = buffer_of(kept)
+        let gbuf = buffer_of(grids)
+        let mid = 0.5 * (wlo + whi)
+        self.bound = vec4(mid, length(whi - mid))
+        self.run_extract(fbuf.items(), gbuf.items(), things: count, total_bricks: total_bricks)
+        self.hash = key
+        self.cell = first_cell
+        self.built = true
+    }
+
+    fn run_extract<M: Field<Substance>>(
+        mut self,
+        fields: GpuSpan<M>,
+        grids: GpuSpan<GridSpec>,
+        things: u32,
+        total_bricks: u32,
+    ) {
+        label("mesh_extract")
+        self.active.clear()
+        self.verts.clear()
+        write(mut self.tri_count, 0, [0])
+
+        // Pass 0: Interval-cull bricks in bounded chunks.
+        var first: u32 = 0
+        while first < total_bricks {
+            let n = min(total_bricks - first, CULL_CHUNK)
+            dispatch(
+                cull_bricks.bind(
+                    fields: fields,
+                    grids: grids,
+                    things: things,
+                    first_brick: first,
+                    total_bricks: total_bricks,
+                    active: mut self.active,
+                ),
+                over: n,
+            )
+            first += n
+        }
+
+        // Passes 1–3: Extract in bounded chunks of `CHUNK_BRICKS` active bricks (never more chunks
+        // than `total_bricks` could possibly populate).
+        let max_chunks_bricks = min(self.cap_bricks, total_bricks)
+        var chunk_start: u32 = 0
+        while chunk_start < max_chunks_bricks {
+            dispatch(
+                prep_chunk.bind(
+                    active_count: self.active.count(),
+                    cap_bricks: self.cap_bricks,
+                    chunk_start: chunk_start,
+                    eval_args: mut self.eval_args,
+                    vert_args: mut self.vert_args,
+                    quad_args: mut self.quad_args,
+                ),
+                over: 1,
+            )
+            dispatch(
+                eval_corners.bind(
+                    fields: fields,
+                    grids: grids,
+                    active: self.active.items(),
+                    active_count: self.active.count(),
+                    cap_bricks: self.cap_bricks,
+                    chunk_start: chunk_start,
+                    corners: self.corners.span_mut(start: chunk_start * CORNERS_BRICK, count: CHUNK_BRICKS * CORNERS_BRICK),
+                ),
+                groups: self.eval_args.at(0),
+                most: CHUNK_BRICKS * 8,
+            )
+            dispatch(
+                extract_verts.bind(
+                    fields: fields,
+                    grids: grids,
+                    active: self.active.items(),
+                    active_count: self.active.count(),
+                    cap_bricks: self.cap_bricks,
+                    cap_verts: self.cap_verts,
+                    chunk_start: chunk_start,
+                    corners: self.corners.items(),
+                    cell_verts: self.cell_verts.span_mut(start: chunk_start * VERTS_STRIDE, count: CHUNK_BRICKS * VERTS_STRIDE),
+                    verts: mut self.verts,
+                ),
+                groups: self.vert_args.at(0),
+                most: CHUNK_BRICKS * 6,
+            )
+            dispatch(
+                emit_tris.bind(
+                    active_count: self.active.count(),
+                    cap_bricks: self.cap_bricks,
+                    cap_indices: self.cap_indices,
+                    chunk_start: chunk_start,
+                    corners: self.corners.items(),
+                    cell_verts: self.cell_verts.items(),
+                    tri_count: mut self.tri_count,
+                    indices: mut self.indices,
+                ),
+                groups: self.quad_args.at(0),
+                most: CHUNK_BRICKS * 4,
+            )
+            chunk_start += CHUNK_BRICKS
+        }
+
+        dispatch(
+            finish_draw.bind(
+                tri_count: self.tri_count.items(),
+                cap_indices: self.cap_indices,
+                args: mut self.draw_args,
+            ),
+            over: 1,
+        )
+    }
+}

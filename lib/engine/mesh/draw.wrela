@@ -1,0 +1,553 @@
+// Unified hardware rasterization of extracted surface meshlets (`extract`): one vertex shader,
+// one fragment shader, and one shadow map for still and moving matter alike.
+//
+// Every thing in a `MeshWorld` (`One`, `Many`, `And`) extracts its sparse Dual Contouring meshlets
+// into a `MeshBatch` (0 ms/frame once built for still things), renders into one unified sun shadow
+// map, and rasterizes into a reversed-Z supersampled target (`ssaa` = 1 or 2) with automatic
+// crease-preserving shading normals, then resolves to `Picture` for display or judging against
+// `engine::reference`.
+
+use matter::sky::{Sky, seen}
+use matter::substance::{ONE_OVER_PI, Substance}
+use matter::world::{And, Many, One}
+use mesh::extract::{MeshBatch, MeshVertex, mesh_batch}
+use picture::eye::{Eye, View, view}
+use picture::look::{Look, Seen}
+use picture::picture::{Picture, picture}
+use picture::pixels::{TABLE, octa, skylit}
+use picture::screen::{cover, show}
+use std::collections::Vec
+use std::field::Field
+use std::gpu::{
+    Address, ClipPosition, Compare, ComparisonSampler, Cull, Depth, DepthBias, DepthOnlyPass,
+    DepthPass3, DepthTexture, Filter, FragCoord, R8, Rgba16Float, Rgba32Float, Sampler, Targets3,
+    Texture, VertexIndex, begin_depth_pass, begin_pass3, begin_pass3_with_depth,
+    comparison_sampler, depth_texture, dispatch, draw, label, sampler, texture, writable_texture,
+}
+use std::hash::StateHash
+
+/// Reversed-Z near plane (m): `clip_z = NEAR`, `clip_w = z`, so `ndc_z = NEAR / z` in `(0, 1]`.
+const NEAR: f32 = 0.05
+
+/// Shadow map resolution (square).
+const SHADOW_SIDE: u32 = 2048
+
+/// Default maximum active surface bricks per batch.
+const BATCH_BRICKS: u32 = 8192
+
+/// Orthographic projection for the unified sun shadow map covering the world's bounding sphere.
+pub struct ShadowView: Copy + GpuData {
+    pub centre: vec3,
+    pub radius: f32,
+    pub u: vec3,
+    pub texel: f32,
+    pub v: vec3,
+    pub spare: f32,
+    pub w: vec3,
+    pub spare2: f32,
+}
+
+/// Builds a `ShadowView` tightly framing the world bounding sphere `(centre, radius)` from `sun_way`.
+fn shadow_view(centre: vec3, radius: f32, sun_way: vec3) -> ShadowView {
+    let w = normalize(sun_way)
+    let up = if abs(w.y) < 0.95 { vec3(0.0, 1.0, 0.0) } else { vec3(1.0, 0.0, 0.0) }
+    let u = normalize(cross(up, w))
+    let v = cross(w, u)
+    let r = max(radius * 1.05, 1.0)
+    ShadowView {
+        centre,
+        radius: r,
+        u,
+        texel: (2.0 * r) / f32(SHADOW_SIDE),
+        v,
+        spare: 0.0,
+        w,
+        spare2: 0.0,
+    }
+}
+
+/// Vertex shader for the unified shadow depth pass: projects `MeshVertex` into orthographic sun space.
+@vertex
+fn shadow_vs(verts: [MeshVertex], sv: ShadowView, vi: VertexIndex) -> ClipPosition {
+    let wp = verts[vi.index].pos.xyz
+    let d = wp - sv.centre
+    let sx = dot(d, sv.u) / sv.radius
+    let sy = dot(d, sv.v) / sv.radius
+    let sz = (sv.radius - dot(d, sv.w)) / (2.0 * sv.radius)
+    ClipPosition { position: vec4(sx, sy, sz, 1.0) }
+}
+
+/// Depth-only fragment shader for the shadow pass (colour output is ignored by `DepthOnlyPass`).
+@fragment
+fn shadow_fs() -> vec4 {
+    vec4(0.0)
+}
+
+/// Interpolants carried from `mesh_vs` to `mesh_fs`.
+struct MeshVary: Copy {
+    clip: ClipPosition,
+    wp: vec3,
+    normal: vec3,
+    albedo: vec3,
+    emits: vec3,
+    smooth: f32,
+}
+
+/// Vertex shader for the unified eye pass: matches `View::ray` bit-for-bit with reversed-Z depth.
+@vertex
+fn mesh_vs(verts: [MeshVertex], v: View, vi: VertexIndex) -> MeshVary {
+    let vert = verts[vi.index]
+    let wp = vert.pos.xyz
+    let rel = wp - v.at
+    let x = dot(rel, v.right)
+    let y = dot(rel, v.up)
+    let z = dot(rel, v.forward)
+    let aspect = v.size.y / max(v.size.x, 1.0)
+    let clip = ClipPosition { position: vec4(x * v.focal * aspect, y * v.focal, NEAR, z) }
+    MeshVary {
+        clip,
+        wp,
+        normal: vert.normal.xyz,
+        albedo: vert.albedo.xyz,
+        emits: vert.emits.xyz,
+        smooth: vert.normal.w,
+    }
+}
+
+/// Reads the open sky's irradiance on a surface facing `n` from the octahedral table.
+fn sky_irradiance(table: Texture<Rgba16Float>, s: Sampler, n: vec3) -> vec3 {
+    let e = octa(n) * 0.5 + vec2(0.5)
+    table.sample_level(s, (e * (f32(TABLE) - 1.0) + vec2(0.5)) / f32(TABLE), 0.0).xyz
+}
+
+/// 4-tap PCF lookup against the unified sun shadow map with normal-offset bias.
+fn sun_shadow(
+    shadow_map: DepthTexture,
+    cmp: ComparisonSampler,
+    sv: ShadowView,
+    wp: vec3,
+    n: vec3,
+) -> f32 {
+    let ndl = dot(n, sv.w)
+    if ndl <= 0.0 {
+        return 0.0
+    }
+    // Offset along surface normal proportional to shadow texel size to avoid self-shadowing.
+    let slope = sqrt(max(1.0 - ndl * ndl, 0.0))
+    let p = wp + n * (sv.texel * (1.5 + 1.8 * slope))
+    let d = p - sv.centre
+    let sx = dot(d, sv.u) / sv.radius
+    let sy = dot(d, sv.v) / sv.radius
+    let sz = (sv.radius - dot(d, sv.w)) / (2.0 * sv.radius)
+    if abs(sx) >= 0.999 || abs(sy) >= 0.999 || sz <= 0.0 || sz >= 1.0 {
+        return 1.0
+    }
+    let uv = vec2(sx * 0.5 + 0.5, 0.5 - sy * 0.5)
+    let o = 0.5 / f32(SHADOW_SIDE)
+    let ref_z = clamp(sz - 0.0003, 0.0, 1.0)
+    var sum = 0.0
+    sum += shadow_map.sample_compare_level(cmp, uv + vec2(-o, -o), ref_z)
+    sum += shadow_map.sample_compare_level(cmp, uv + vec2(o, -o), ref_z)
+    sum += shadow_map.sample_compare_level(cmp, uv + vec2(-o, o), ref_z)
+    sum += shadow_map.sample_compare_level(cmp, uv + vec2(o, o), ref_z)
+    sum * 0.25
+}
+
+/// Fragment shader for the unified eye pass: crease-preserving normals, unified sun shadow,
+/// open-sky irradiance, and `Look::tone`, writing `(colour, place, sun)` in one pass.
+@fragment
+fn mesh_fs<S: Sky, L: Look>(
+    vary: MeshVary,
+    v: View,
+    sv: ShadowView,
+    sky: S,
+    look: L,
+    table: Texture<Rgba16Float>,
+    s: Sampler,
+    shadow_map: DepthTexture,
+    cmp: ComparisonSampler,
+) -> Targets3<vec4, vec4, f32> {
+    let to_eye = v.at - vary.wp
+    let dist = length(to_eye)
+    let ray_back = if dist > 1.0e-6 { to_eye / dist } else { -v.forward }
+
+    let nv_l2 = dot(vary.normal, vary.normal)
+    let nv = if nv_l2 > 1.0e-12 { vary.normal * (1.0 / sqrt(nv_l2)) } else { ray_back }
+
+    // Geometric face normal from screen-space derivatives of world position: keeps 90° box corners
+    // and sharp creases exact while smooth curved surfaces keep interpolated analytic normals.
+    let fraw = cross(dpdx(vary.wp), dpdy(vary.wp))
+    let fl2 = dot(fraw, fraw)
+    var nf = nv
+    if fl2 > 1.0e-18 {
+        nf = fraw * (1.0 / sqrt(fl2))
+        if dot(nf, ray_back) < 0.0 {
+            nf = -nf
+        }
+    }
+    let n = if vary.smooth < 0.5 || dot(nv, nf) < 0.85 { nf } else { nv }
+
+    let sun = sky.sun()
+    let ndl = max(dot(n, sun.way), 0.0)
+    let vis = if ndl > 0.0 { sun_shadow(shadow_map, cmp, sv, vary.wp, n) } else { 0.0 }
+    let direct = sun.light * (ndl * vis)
+    let amb = sky_irradiance(table, s, n)
+    let rad = vary.emits + vary.albedo * ONE_OVER_PI * (direct + amb)
+    let toned = look.tone(Seen { light: rad })
+    Targets3 {
+        first: vec4(toned, 1.0),
+        second: vec4(n, dist),
+        third: vis,
+    }
+}
+
+/// Fullscreen background sky shader: runs only on uncovered pixels (`Depth::Equal` at `z = 0.0`).
+@vertex
+fn sky_vs(vi: VertexIndex) -> ClipPosition {
+    let x = f32(vi.index % 2) * 4.0 - 1.0
+    let y = f32(vi.index / 2) * 4.0 - 1.0
+    ClipPosition { position: vec4(x, y, 0.0, 1.0) }
+}
+
+@fragment
+fn sky_fs<S: Sky, L: Look>(pixel: FragCoord, v: View, sky: S, look: L) -> Targets3<vec4, vec4, f32> {
+    let d = v.ray(pixel.position.xy)
+    let toned = look.tone(Seen { light: seen(sky, d) })
+    Targets3 {
+        first: vec4(toned, 1.0),
+        second: vec4(0.0, 0.0, 0.0, 0.0),
+        third: 1.0,
+    }
+}
+
+/// Resolves the `ssaa`×`ssaa` supersampled eye targets down to screen resolution (`Picture`).
+@fragment
+fn resolve_fs(
+    pixel: FragCoord,
+    hi_colour: Texture<Rgba16Float>,
+    hi_place: Texture<Rgba32Float>,
+    hi_sun: Texture<R8>,
+    ssaa: u32,
+) -> Targets3<vec4, vec4, f32> {
+    let x = u32(pixel.position.x)
+    let y = u32(pixel.position.y)
+    if ssaa <= 1 {
+        return Targets3 {
+            first: hi_colour.load(x, y),
+            second: hi_place.load(x, y),
+            third: hi_sun.load(x, y),
+        }
+    }
+    let bx = x * 2
+    let by = y * 2
+    let c00 = hi_colour.load(bx, by)
+    let c10 = hi_colour.load(bx + 1, by)
+    let c01 = hi_colour.load(bx, by + 1)
+    let c11 = hi_colour.load(bx + 1, by + 1)
+    let p00 = hi_place.load(bx, by)
+    let p10 = hi_place.load(bx + 1, by)
+    let p01 = hi_place.load(bx, by + 1)
+    let p11 = hi_place.load(bx + 1, by + 1)
+    // Average `place` over covered subpixels so the resolved surface depth sits at the pixel centre.
+    var psum = vec4(0.0)
+    var pcnt = 0.0
+    if p00.w > 0.0 { psum += p00; pcnt += 1.0 }
+    if p10.w > 0.0 { psum += p10; pcnt += 1.0 }
+    if p01.w > 0.0 { psum += p01; pcnt += 1.0 }
+    if p11.w > 0.0 { psum += p11; pcnt += 1.0 }
+    let best = if pcnt > 0.0 {
+        let avg = psum / pcnt
+        let nl = length(avg.xyz)
+        vec4(if nl > 1.0e-6 { avg.xyz / nl } else { avg.xyz }, avg.w)
+    } else {
+        vec4(0.0)
+    }
+    let s = 0.25 * (hi_sun.load(bx, by) + hi_sun.load(bx + 1, by) + hi_sun.load(bx, by + 1) + hi_sun.load(bx + 1, by + 1))
+    Targets3 {
+        first: 0.25 * (c00 + c10 + c01 + c11),
+        second: best,
+        third: s,
+    }
+}
+
+/// Computes a view- and budget-aware cell spacing for a single thing with bounding sphere `(c, r)`.
+fn cell_for_one(c: vec3, r: f32, v: View) -> f32 {
+    let near = max(length(c - v.at) - r, 0.25)
+    let px = near * v.pixel()
+    // Keep thin features (down to 5 mm) when near the eye, while respecting the batch brick budget.
+    let by_size = max(r / 150.0, 0.005)
+    clamp(max(px * 1.1, by_size), 0.005, 0.25)
+}
+
+/// Computes a view- and budget-aware cell spacing for `n` things sharing one `MeshBatch`.
+fn cell_for_many(c: vec3, r: f32, n: u32, cap_bricks: u32, v: View) -> f32 {
+    let near = max(length(c - v.at) - r, 0.25)
+    let px = near * v.pixel()
+    let per_thing = max(f32(cap_bricks) / f32(max(n, 1)), 4.0)
+    // Account for articulated surface area and interval-box padding so active bricks never overflow cap_bricks.
+    let by_budget = r / max(sqrt(per_thing * 2.5), 3.5)
+    clamp(max(px * 1.2, by_budget), 0.006, 0.25)
+}
+
+/// Any world (`One`, `Many`, `And`) that can sync its GPU meshlet batches.
+pub trait MeshWorld: Copy {
+    fn batch_count(self) -> u32
+    fn sync_batches(self, batches: mut Vec<MeshBatch>, first: u32, v: View)
+}
+
+impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for One<M> {
+    fn batch_count(self) -> u32 {
+        1
+    }
+
+    fn sync_batches(self, batches: mut Vec<MeshBatch>, first: u32, v: View) {
+        let b = self.field.bound()
+        let cell = cell_for_one(b.centre, min(b.radius, 1.0e4), v)
+        batches[first].sync_one(self.field, cell)
+    }
+}
+
+/// Whether a sphere `(c, r)` intersects the view frustum (with a generous margin so shadow-casting
+/// silhouettes just off-screen stay included).
+fn in_view(c: vec3, r: f32, v: View) -> bool {
+    let rel = c - v.at
+    let z = dot(rel, v.forward)
+    if z + r < NEAR {
+        return false
+    }
+    let aspect = v.size.x / max(v.size.y, 1.0)
+    let half_y = max(z, 0.0) / v.focal + r * 1.4
+    let half_x = half_y * aspect + r * 1.4
+    abs(dot(rel, v.up)) <= half_y && abs(dot(rel, v.right)) <= half_x
+}
+
+impl<M: Field<Substance> + StateHash + GpuData, const N: u32> MeshWorld for Many<M, N> {
+    fn batch_count(self) -> u32 {
+        1
+    }
+
+    fn sync_batches(self, batches: mut Vec<MeshBatch>, first: u32, v: View) {
+        let cap = batches[first].cap_bricks
+        // Count visible things so the brick budget focuses on what is actually on screen.
+        var vis_count: u32 = 0
+        for i in 0..N {
+            let b = self.fields[i].bound()
+            let r = min(b.radius, 1.0e4)
+            if in_view(b.centre, r, v) {
+                vis_count += 1
+            }
+        }
+        let budget_n = max(vis_count, 1)
+        var cells = [0.0; N]
+        for i in 0..N {
+            let b = self.fields[i].bound()
+            let r = min(b.radius, 1.0e4)
+            if in_view(b.centre, r, v) {
+                cells[i] = cell_for_many(b.centre, r, budget_n, cap, v)
+            }
+        }
+        batches[first].sync_many(self.fields, cells)
+    }
+}
+
+impl<A: MeshWorld, B: MeshWorld> MeshWorld for And<A, B> {
+    fn batch_count(self) -> u32 {
+        self.a.batch_count() + self.b.batch_count()
+    }
+
+    fn sync_batches(self, batches: mut Vec<MeshBatch>, first: u32, v: View) {
+        let na = self.a.batch_count()
+        self.a.sync_batches(mut batches, first, v)
+        self.b.sync_batches(mut batches, first + na, v)
+    }
+}
+
+/// Complete meshlet renderer state: owns extracted batches, shadow map, sky irradiance table,
+/// supersampled eye targets, and resolved `Picture`.
+pub struct MeshSight {
+    pub drawn: Picture,
+    batches: Vec<MeshBatch>,
+    shadow_depth: DepthTexture,
+    cmp: ComparisonSampler,
+    sky_table: Texture<Rgba16Float>,
+    sky_sampler: Sampler,
+    sky_sun: vec3,
+    sky_ready: bool,
+    hi_colour: Texture<Rgba16Float>,
+    hi_place: Texture<Rgba32Float>,
+    hi_sun: Texture<R8>,
+    hi_depth: DepthTexture,
+    pub ssaa: u32,
+}
+
+/// Creates a fresh `MeshSight` (`ssaa`: 1 for native, 2 for 2×2 hardware supersampling).
+pub fn mesh_sight(ssaa: u32 = 2) -> MeshSight {
+    MeshSight {
+        drawn: picture(width: 1, height: 1),
+        batches: Vec::new(),
+        shadow_depth: depth_texture(width: SHADOW_SIDE, height: SHADOW_SIDE),
+        cmp: comparison_sampler(compare: Compare::LessEqual),
+        sky_table: writable_texture(width: TABLE, height: TABLE),
+        sky_sampler: sampler(filter: Filter::Linear, address: Address::Clamp),
+        sky_sun: vec3(0.0),
+        sky_ready: false,
+        hi_colour: texture(width: 1, height: 1),
+        hi_place: texture(width: 1, height: 1),
+        hi_sun: texture(width: 1, height: 1),
+        hi_depth: depth_texture(width: 1, height: 1),
+        ssaa: if ssaa >= 2 { 2 } else { 1 },
+    }
+}
+
+impl MeshSight {
+    fn resize(mut self, width: u32, height: u32) {
+        if self.drawn.width() != width || self.drawn.height() != height {
+            self.drawn = picture(width: width, height: height)
+            self.drawn.placed = true
+            let hw = width * self.ssaa
+            let hh = height * self.ssaa
+            self.hi_colour = texture(width: hw, height: hh)
+            self.hi_place = texture(width: hw, height: hh)
+            self.hi_sun = texture(width: hw, height: hh)
+            self.hi_depth = depth_texture(width: hw, height: hh)
+        }
+    }
+
+    fn ensure_batches(mut self, count: u32) {
+        while self.batches.len() < count {
+            self.batches.push(mesh_batch(BATCH_BRICKS))
+        }
+    }
+
+    /// Renders `world` into `self.drawn` without presenting (for judging against `Reference`).
+    pub fn drawn_only<W: MeshWorld, S: Sky, L: Look>(
+        mut self,
+        world: W,
+        sky: S,
+        look: L,
+        eye: Eye,
+        width: u32,
+        height: u32,
+    ) {
+        self.resize(width, height)
+        let v = view(eye, width: width, height: height)
+        let v_hi = view(eye, width: width * self.ssaa, height: height * self.ssaa)
+
+        // Update sky irradiance table only when sky changes (0 ms/frame when still).
+        let sun_way = sky.sun().way
+        if !self.sky_ready || length(sun_way - self.sky_sun) > 1.0e-6 {
+            label("mesh_sky")
+            dispatch(skylit.bind(sky: sky, out: mut self.sky_table), over: (TABLE, TABLE))
+            self.sky_sun = sun_way
+            self.sky_ready = true
+        }
+
+        // Sync extracted GPU meshlets for every batch in the world.
+        let nb = world.batch_count()
+        self.ensure_batches(nb)
+        world.sync_batches(mut self.batches, 0, v)
+
+        // Compute combined world bounding sphere for the unified sun shadow map.
+        var wlo = vec3(1.0e20)
+        var whi = vec3(-1.0e20)
+        for i in 0..nb {
+            let b = self.batches[i].bound
+            if b.w > 0.0 {
+                wlo = min(wlo, b.xyz - vec3(b.w))
+                whi = max(whi, b.xyz + vec3(b.w))
+            }
+        }
+        let wmid = 0.5 * (wlo + whi)
+        let wrad = if whi.x > wlo.x { 0.5 * length(whi - wlo) } else { 10.0 }
+        let sv = shadow_view(wmid, wrad, sky.sun().way)
+
+        // Pass 1: Unified sun shadow map (all still + moving meshlets in one pass).
+        label("mesh_shadow")
+        let sp: DepthOnlyPass = begin_depth_pass(mut self.shadow_depth, clear_depth: 1.0, keep_depth: false)
+        for i in 0..nb {
+            draw(
+                sp,
+                shadow_vs.bind(verts: self.batches[i].verts.items(), sv: sv),
+                shadow_fs,
+                indices: self.batches[i].indices,
+                indirect: self.batches[i].draw_args,
+                cull: Cull::Back,
+                depth_bias: DepthBias { constant: 2, slope: 1.5, clamp: 0.0 },
+                depth: Depth { compare: Compare::Less, write: true },
+            )
+        }
+        sp.end()
+
+        // Pass 2: Unified eye pass (reversed-Z hardware rasterization + shading + background sky).
+        label("mesh_eye")
+        let ep: DepthPass3<Rgba16Float, Rgba32Float, R8> = begin_pass3_with_depth(
+            mut self.hi_colour,
+            mut self.hi_place,
+            mut self.hi_sun,
+            mut self.hi_depth,
+            clear: vec4(0.0, 0.0, 0.0, 1.0),
+            keep: false,
+            clear_depth: 0.0,
+            keep_depth: false,
+        )
+        for i in 0..nb {
+            draw(
+                ep,
+                mesh_vs.bind(verts: self.batches[i].verts.items(), v: v_hi),
+                mesh_fs.bind(
+                    v: v_hi,
+                    sv: sv,
+                    sky: sky,
+                    look: look,
+                    table: self.sky_table,
+                    s: self.sky_sampler,
+                    shadow_map: self.shadow_depth,
+                    cmp: self.cmp,
+                ),
+                indices: self.batches[i].indices,
+                indirect: self.batches[i].draw_args,
+                cull: Cull::Back,
+                depth: Depth { compare: Compare::Greater, write: true },
+            )
+        }
+        draw(
+            ep,
+            sky_vs,
+            sky_fs.bind(v: v_hi, sky: sky, look: look),
+            vertices: 3,
+            depth: Depth { compare: Compare::Equal, write: false },
+        )
+        ep.end()
+
+        // Pass 3: Resolve supersampled targets to `Picture`.
+        label("mesh_resolve")
+        let rp = begin_pass3(mut self.drawn.colour, mut self.drawn.place, mut self.drawn.sun, keep: false)
+        draw(
+            rp,
+            cover,
+            resolve_fs.bind(
+                hi_colour: self.hi_colour,
+                hi_place: self.hi_place,
+                hi_sun: self.hi_sun,
+                ssaa: self.ssaa,
+            ),
+            vertices: 3,
+        )
+        rp.end()
+        self.drawn.placed = true
+    }
+
+    /// Renders `world` and presents to the screen.
+    pub fn draw<W: MeshWorld, S: Sky, L: Look>(
+        mut self,
+        world: W,
+        sky: S,
+        look: L,
+        eye: Eye,
+        width: u32,
+        height: u32,
+    ) {
+        self.drawn_only(world, sky, look, eye, width, height)
+        show(self.drawn.colour)
+    }
+}
