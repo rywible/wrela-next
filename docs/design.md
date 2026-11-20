@@ -264,15 +264,18 @@ estimates; nothing here is measured as a frame), against the shares above:
 
 | Share | Share | Predicted, 256 creatures and 256 props | Of it |
 | --- | --- | --- | --- |
-| The eye's rays | 3.0 | 3.5 | the kernel 1.49 (measured alone), cells behind it 0.9 (measured), what a pixel shows 1.1 |
+| The eye's rays | 3.0 | 6.0 | the kernel 3.98 (measured alone, with a rim that is sound), cells behind it 0.9 (measured), what a pixel shows 1.1 |
 | Light | 3.0 | 3.55 | the sun's map 0.55; the sun read, stored light, cones a pixel 3.0 |
 | Edges | 1.5 | 1.5 | an estimate: two short solves and two shadings an edge pixel |
 | Things that move, and cells filled | 2.5 | 0.85 | stand-ins, lists, light's index (the lists alone took 1.1 ms of CPU in the kernel's measurement) |
 | Matter light passes through; the look | 3.0 | not designed here | |
-| Sum of what is designed | | 9.4 | of which only the kernel and the cells are measured |
+| Sum of what is designed | | 11.9 | of which only the kernel and the cells are measured |
 
 The shares stay as they are until a stage is measured against them. With the two shares not
-designed here the frame at 256 creatures is about 12.4 of 16.6 ms.
+designed here the frame at 256 creatures is about 14.9 of 16.6 ms, and that is with the kernel
+as it measures alone on a scene laid out kindly: on the engine's own crowd it is dearer still
+(below). The eye's share is over by 3, and the design does not hold at 256 until the kernel's
+searches at joins and its lists are cut.
 
 **What was measured the night it was written** (2026-11-19; M4 at 1080p unless said).
 
@@ -284,10 +287,23 @@ designed here the frame at 256 creatures is about 12.4 of 16.6 ms.
   variable, which sent it to memory on both GPUs (unrolled: 2.99 to 1.72 on the M4, 16.2 to 7.9
   on the Radeon); then one ask for a near miss over a pixel away, and the root found to a
   twentieth of a pixel. It asks 2.74 times a hit pixel. It is a fragment pass over the screen:
-  the guard refuses a compute walk whose length depends on data. Open: where a ray grazes a
-  join, a near miss's least is fitted by a parabola, and one pixel of 11,068 landed 1.4 px
-  behind the first surface; a stepping that cannot miss it cost 1.2 to 3.5 ms more, so the
-  rim's soundness is not settled and the engine's own judges decide it on real frames.
+  the guard refuses a compute walk whose length depends on data. THAT 1.49 WAS NOT SOUND: where
+  a ray grazes a join it fitted a near miss's least by a parabola, and on the engine's real
+  poses 1,060 mover pixels at 64 creatures were hits called misses, every one at an outline. A
+  kernel whose rim is a proof (outside a join's zone the fold is the part's own distance in
+  closed form; inside it the first root is searched, by steps or by a bound from the convexity
+  of each member's distance along a ray) has no hole, none behind and none in front on 129,600
+  pixels beyond a twentieth of a pixel, and takes 3.98 ms at 256, 2.74 at 64 and 4.38 with the
+  eye three times nearer (the Radeon 23.6 at 256). The 2.5 ms that soundness costs is the
+  searches at joins, in a pass that waits for its slowest pixel (102 to 182 asks).
+- *The kernel inside the engine* (a prototype in a scratch tree, the creature's fold written by
+  hand, never to land; the unsound rim): SCENE 8's eye pass and outlines 14.57 ms at 64
+  creatures become 5.07 with the kernel (3.01), and 107 at 256 become 10.84 (8.77); 99.4% of
+  today's mover pixels are the same thing within a pixel. At 256 the kernel is six times what
+  it measured alone because the engine's crowd stands in rows to the horizon: 40.7 list
+  entries a pixel, and 6.8 asks a hit pixel over up to 12 members of a round-cone fold. Exact
+  round cones for both hulls beat capsules. The seam is the common case: 47,403 of a frame's
+  61,492 outline records of movers lie over a still pixel.
 - *Cells through the same kernel*: 3.98 to 4.00 ms for a screen of them, against a line of 2.0
   and the rasteriser's 0.9. Dead. Holding the second form costs a round-cone scene 0.05 ms and a
   cell scene 1.43: slice 1d's fault, on one side only.
