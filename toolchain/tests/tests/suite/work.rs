@@ -58,6 +58,17 @@ fn loops_count_each_pass_and_unbounded_ones_have_no_work() {
                 "capped",
                 "    var a = 0.0\n    var i = 0\n    var done = false\n    while i < 32 && !done {\n        a = a + sin(x + a)\n        done = a > 10.0\n        i = i + 1\n    }\n    out[id] = a",
             ),
+            // The same with the invocation's flag first (`a && b` is `r = a; if a { r = b }`):
+            // the counter still ends it, on the side where the flag is false too.
+            (
+                "flag_first",
+                "    var a = 0.0\n    var i = 0\n    var done = false\n    while !done && i < 32 {\n        a = a + sin(x + a)\n        done = a > 10.0\n        i = i + 1\n    }\n    out[id] = a",
+            ),
+            // Or the other way: left when either the flag or the counter says so.
+            (
+                "either",
+                "    var a = 0.0\n    var i = 0\n    var go = true\n    while true {\n        if !go || i >= 32 {\n            break\n        }\n        a = a + sin(x + a)\n        go = a < 10.0\n        i = i + 1\n    }\n    out[id] = a",
+            ),
             // A bound the loop itself moves by the invocation's value: what the first pass knew
             // of it isn't known on the next.
             (
@@ -79,6 +90,9 @@ fn loops_count_each_pass_and_unbounded_ones_have_no_work() {
     assert!(eight < sixteen && sixteen < 2 * eight + 16, "{all:?}");
     let capped = of(&all, "capped").0.expect("a counter that reaches 32 bounds it");
     assert!(capped >= 32 * 4, "{all:?}");
+    let flag_first = of(&all, "flag_first").0.expect("the counter bounds it with the flag first");
+    assert!(flag_first.abs_diff(capped) <= 4, "the same loop but for a `!`: {all:?}");
+    of(&all, "either").0.expect("a counter in an `||` bounds it");
     assert_eq!(of(&all, "open").0, None, "{all:?}");
     assert_eq!(of(&all, "moved").0, None, "{all:?}");
 }

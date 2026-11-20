@@ -178,6 +178,7 @@ impl<'a> ExprWork<'a> {
             vals: HashMap::new(),
             most: HashMap::new(),
             parts: HashMap::new(),
+            nots: HashMap::new(),
             work: 0,
             unbounded: false,
             loop_at: None,
@@ -512,6 +513,7 @@ impl<'a> CallRuns<'a> {
             vals: HashMap::new(),
             most: HashMap::new(),
             parts: HashMap::new(),
+            nots: HashMap::new(),
             work: 0,
             unbounded: false,
             loop_at: None,
@@ -579,6 +581,10 @@ struct State {
     most: HashMap<LocalId, i64>,
     /// Locals that hold a value built of parts (a constant table), by that value.
     built: HashMap<LocalId, ValueId>,
+    /// `bool` locals whose whole value is a value not known, by that value: on each side of an
+    /// `if` on it (or on its negation), they are known. `a && b` is `r = a; if a { r = b }`,
+    /// so where `b` is known false, `r` is false on both sides.
+    copies: HashMap<LocalId, ValueId>,
 }
 
 impl State {
@@ -605,6 +611,7 @@ impl State {
         }
         self.locals.retain(|l, c| other.locals.get(l) == Some(c));
         self.built.retain(|l, v| other.built.get(l) == Some(v));
+        self.copies.retain(|l, v| other.copies.get(l) == Some(v));
         self.most = most;
     }
 
@@ -614,6 +621,25 @@ impl State {
         self.locals.retain(|l, c| entry.locals.get(l) == Some(c));
         self.most.retain(|l, m| entry.most.get(l) == Some(m));
         self.built.retain(|l, v| entry.built.get(l) == Some(v));
+        self.copies.retain(|l, v| entry.copies.get(l) == Some(v));
+    }
+
+    /// What's known on the side of an `if` on `cond` where it is `holds`: each `bool` local
+    /// that is `cond` (or its negation, `nots`) is that.
+    fn on_side(&mut self, cond: ValueId, holds: bool, nots: &HashMap<ValueId, ValueId>) {
+        let neg = nots.get(&cond).copied();
+        let mut known = Vec::new();
+        for (l, v) in &self.copies {
+            if *v == cond {
+                known.push((*l, holds));
+            } else if Some(*v) == neg {
+                known.push((*l, !holds));
+            }
+        }
+        for (l, b) in known {
+            self.locals.insert(l, Const::Bool(b));
+            self.copies.remove(&l);
+        }
     }
 }
 
@@ -641,6 +667,8 @@ struct Frame<'f> {
     /// Values built of parts (a constant table's elements, a vector's components): an element
     /// read at a known place is its part.
     parts: HashMap<ValueId, Vec<ValueId>>,
+    /// Values that are the negation of another (`!x`), by `x`.
+    nots: HashMap<ValueId, ValueId>,
     work: u64,
     unbounded: bool,
     loop_at: Option<Span>,
@@ -673,6 +701,7 @@ impl<'a> Counter<'a> {
             vals: HashMap::new(),
             most: HashMap::new(),
             parts: HashMap::new(),
+            nots: HashMap::new(),
             work: 0,
             unbounded: false,
             loop_at: None,
@@ -751,9 +780,14 @@ impl<'a> Counter<'a> {
                 // A value a loop's pass defines again forgets what an earlier pass gave it.
                 // (A local that held its earlier pass's value holds no parts of this one's.)
                 st.built.retain(|_, x| x != v);
+                st.copies.retain(|_, x| x != v);
                 match e {
                     Expr::Construct(_, parts) if self.bounds => fr.parts.insert(*v, parts.clone()),
                     _ => fr.parts.remove(v),
+                };
+                match e {
+                    Expr::Unary(UnOp::Not, x) => fr.nots.insert(*v, *x),
+                    _ => fr.nots.remove(v),
                 };
                 match self.expr(fr, st, e) {
                     Some(c) => {
@@ -782,9 +816,18 @@ impl<'a> Counter<'a> {
                         match fr.vals.get(v) {
                             Some(c) => {
                                 st.locals.insert(l, c.clone());
+                                st.copies.remove(&l);
                             }
                             None => {
                                 st.locals.remove(&l);
+                                let boolean = matches!(
+                                    self.m.types.get(fr.f.value_ty(*v)),
+                                    TypeDef::Scalar(Scalar::Bool)
+                                );
+                                match boolean {
+                                    true => st.copies.insert(l, *v),
+                                    false => st.copies.remove(&l),
+                                };
                             }
                         }
                         match fr.most.get(v) {
@@ -800,6 +843,7 @@ impl<'a> Counter<'a> {
                         st.locals.remove(&l);
                         st.most.remove(&l);
                         st.built.remove(&l);
+                        st.copies.remove(&l);
                     }
                     _ => {}
                 }
@@ -809,7 +853,7 @@ impl<'a> Counter<'a> {
                 match fr.vals.get(cond) {
                     Some(Const::Bool(true)) => return self.block(fr, st, then),
                     Some(Const::Bool(false)) => return self.block(fr, st, else_),
-                    _ => return self.both(fr, st, then, else_),
+                    _ => return self.both(fr, st, *cond, then, else_),
                 }
             }
             Stmt::Loop { body, continuing } => return self.lp(fr, st, body, continuing),
@@ -841,13 +885,22 @@ impl<'a> Counter<'a> {
     /// An `if` on a condition the count doesn't know: the costlier side's work, and what's
     /// known after it on the sides that go on. A side that leaves by `break` or `continue` left
     /// what it knew with its loop, which joins it with the loop's other ways out.
-    fn both(&mut self, fr: &mut Frame, st: &mut State, then: &[Stmt], else_: &[Stmt]) -> Flow {
+    fn both(
+        &mut self,
+        fr: &mut Frame,
+        st: &mut State,
+        cond: ValueId,
+        then: &[Stmt],
+        else_: &[Stmt],
+    ) -> Flow {
         let start = fr.work;
         let mut a = st.clone();
+        a.on_side(cond, true, &fr.nots);
         let fa = self.block(fr, &mut a, then);
         let wa = fr.work - start;
         fr.work = start;
         let mut b = st.clone();
+        b.on_side(cond, false, &fr.nots);
         let fb = self.block(fr, &mut b, else_);
         let wb = fr.work - start;
         fr.work = start.saturating_add(wa.max(wb));
@@ -1041,6 +1094,18 @@ impl<'a> Counter<'a> {
                 let n = binary_cost(&m.types, fr.f, *op, *a, *b);
                 let v = match (known(a), known(b)) {
                     (Some(x), Some(y)) => fold(*op, x, y),
+                    // One side settles it: `done && i < n` is false once `i` reaches `n`,
+                    // whatever `done` is (a loop's exit the count can see).
+                    (Some(Const::Bool(false)), _) | (_, Some(Const::Bool(false)))
+                        if *op == BinOp::And =>
+                    {
+                        Some(Const::Bool(false))
+                    }
+                    (Some(Const::Bool(true)), _) | (_, Some(Const::Bool(true)))
+                        if *op == BinOp::Or =>
+                    {
+                        Some(Const::Bool(true))
+                    }
                     (x, y) => compare_most(
                         *op,
                         (x.as_ref().and_then(int_of), fr.most.get(a).copied()),
