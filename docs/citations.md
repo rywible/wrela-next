@@ -10,9 +10,11 @@ the architecture, and merges every change. No generative image, sound, music, vo
 model makes anything here.
 
 The engine was begun again on a clean slate on 2026-11-18 (branch `engine`, merged into `backend`;
-docs/design.md). A row below that names a file under `lib/` other than `lib/std`, `lib/engine` or
-`lib/kit`, or under the old `game/` packages, names it in git history before that merge (`main` and
-pre-merge `backend`). What was carried across names its new place.
+docs/design.md), and replaced its per-pixel raymarcher (`Sight`, `lib/engine/picture/pixels.wrela`,
+`lib/engine/matter/{cells,asked,cost}.wrela`, `lib/engine/light/{moving,store}.wrela`,
+`lib/engine/ray/ray.wrela`) with universal GPU surface meshlets (`lib/engine/mesh/`) on 2026-11-20.
+A row below that names a removed legacy file names it in git history. What was carried across names
+its current place.
 
 ## Tools and models
 

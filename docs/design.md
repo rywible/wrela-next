@@ -382,14 +382,14 @@ requiring an author to write a mesh.
 | SCENE 8 (stage + 256 boxes + 256 walking creatures, + One Light GI) | 177 ms / 305.2 ms | 7.11 ms / 19.5 ms | Full 3-level radiance volume + 4-cone GI |
 | SCENE 9 (cohesion: stage + ocean `Height` + mist `Medium` + morphing spell orb + walking creature + GI) | — | 8.46 ms / 22.0 ms | Froxel volume pass 0.30 ms M4 / 0.83 ms Radeon |
 
-**Judged against the brute-force `Reference` (`LOOKS=16`, M4):**
+**Judged against the brute-force `Reference` (`LOOKS=16`, M4) and the hole audit (`SCENE 6`, 72 eyes / 1,036,800 pixels on both M4 Metal and Linux Radeon Vulkan):**
 
+- **SCENE 6 hole audit (`stage`, `creature walking`, 44 m noise `stack`, 24 eyes each = 1,036,800 px):** **0 holes, 0 extras** on all three kinds on both M4 Metal and Linux Radeon Vulkan (zero VVL errors).
+- **SCENE 0 (stage + walking creature, 160×90, 4× MSAA):** **0 holes**, coverage off **0.101 px** (beats reference 0.130 px floor), wholly-covered lit mean **1.011/255** (beats reference 1.048/255 floor), all-pixel lit mean **0.762/255** (beats reference 0.797/255 floor), 97.4% of surfaces within 0.05 px.
 - **SCENE 4 (stage, 320×180, 4× MSAA):** **0 holes**, 98.17% of surfaces within 0.05 px, outline **0.151 px** (beats the 0.184 px reference floor).
 - **SCENE 3 (close-up creature + 1 cm wand, 480×270):** **0 holes**, **197 of 199 thin pixels (< 2.5 cm) kept (99.0%)**, 99.8% of surfaces within 0.5 px, lit mean 0.50/255 (reference floor 0.54/255).
 
-**Remaining cleanup:**
-
-- Run the full `Judge` suite and hole audit (`SCENE 6`) on `MeshSight`, promote `MeshSight` to the sole renderer, and delete legacy `Sight` (`lib/engine/picture/pixels.wrela`, `lib/engine/matter/{cells,asked}.wrela`, `lib/engine/light/{moving,store}.wrela`) plus renderer-specific `StandIn`/`Meets`/`Pass`/`Crease` code from `lib/std/field.wrela`.
+**One way to draw (completed):** `MeshSight` is now the sole renderer in `lib/engine/` and `game/scenes/main.wrela`. Legacy `Sight` (`lib/engine/picture/pixels.wrela`, `lib/engine/matter/{cells,asked,cost}.wrela`, `lib/engine/light/{moving,store}.wrela`, `lib/engine/ray/ray.wrela`) has been removed (~5,500 lines deleted). `lib/std/field.wrela`'s `Meets`/`Pass`/`StandIn` remain covered by `toolchain/tests/`.
 
 ## The layers
 
@@ -400,13 +400,11 @@ toolchain/        the compiler and the host: knows fields, nothing of this game
 lib/
   std/            the language's library
   engine/         realises matter. The only package that may touch the GPU
-    matter/       where is matter, and what is it made of
-    mesh/         universal GPU field-to-meshlet extraction (Dual Contouring) and unified rasterisation
-    ray/          what does this ray meet
-    light/        what light arrives here
-    picture/      this world, this eye, this look -> an image, within a budget
+    matter/       pure field traits: Substance, Sky, World, Height, Medium, Matter, ranges
+    mesh/         universal GPU field realisation: Dual Contouring meshlets, One Light GI, Height clipmaps, Medium froxels, 4× MSAA HDR rasterisation
+    picture/      Eye, Look, Picture, screen presentation
     reference/    the same questions answered by brute force: what every fast answer is held to
-    judge/        holds a picture to the reference, in numbers
+    judge/        holds a picture to the reference and the hole audit, in numbers
   kit/            the shared library. Fields only
     shapes/       ways to write where matter is: a height, a tube, parts on bones, a base and its detail
     substances/   what matter is made of: stone, water, glass, flesh, flame
