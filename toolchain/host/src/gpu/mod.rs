@@ -54,6 +54,8 @@ mod present;
 mod tests;
 
 pub use calibrate::keep_clocked;
+#[cfg(test)]
+use calibrate::measured_unit;
 use calibrate::{CALIBRATING, KEEP_CLOCKED, WARMING, Warmer, ensure_unit};
 use present::{Presenter, draw_presented, present_pipeline};
 
