@@ -268,6 +268,28 @@ pub trait Surface: Copy + GpuData {
         PartBound { a: b.centre, r: b.radius, b: b.centre, reach: 0.0, lowers: 0.0 }
     }
 
+    // ---- stand-ins: a part as data (`StandIn`), and the joins that fold the parts ----
+
+    /// Part `i` (§23's numbering) as an exact record of one of a closed list of families, in
+    /// this surface's frame, with the innermost join that adds it and its reach
+    /// (`part_bound(i).reach`); or none, with why (`stand_in_why`). `stand_in_fold` folds a
+    /// thing's parts from these records as `distance` folds them. The default: none, not a
+    /// family.
+    fn stand_in(self, i: u32) -> StandIn {
+        no_stand_in(STAND_IN_NOT_A_FAMILY)
+    }
+
+    /// How many joins its tree holds (a smooth union, a hard one, a fold of many: one each).
+    fn join_count(self) -> u32 {
+        0
+    }
+
+    /// Join `n` of its tree, numbered in pre-order from 0 (its root): its width, the join above
+    /// it, and the parts under it (a range of the leaf order).
+    fn join_of(self, n: u32) -> Join {
+        Join { k: 0.0, parent: NO_JOIN, first: 0, count: 0 }
+    }
+
     /// Its distance at `p`, asking only the parts `live` names: what `distance` gives, bit for
     /// bit, wherever `live` is what `live(over)` gave for a box holding `p`. A union asks no part
     /// of an operand whose parts are all left out; a surface that is no union asks all of
@@ -1113,6 +1135,213 @@ pub struct PartBound: Copy + GpuData {
     pub lowers: f32,
 }
 
+/// A part of a thing as data: an exact record of one of a closed list of families
+/// (`Surface::stand_in`), in the thing's frame, so a kernel can meet it in closed form and fold
+/// it with its neighbours (`stand_in_fold`) without the thing's field. `family`:
+/// `STAND_IN_ROUND_CONE` (`a.xyz` and `a.w` its top end and radius, `b.xyz` and `b.w` its bottom's,
+/// as `RoundCone`; a sphere is a round cone with equal ends and radii) or `STAND_IN_NONE`, `why`
+/// then saying why (`stand_in_why`). `join`: the innermost join that adds it (`Surface::join_of`),
+/// `NO_JOIN` for a thing of one part. `reach`: `part_bound(i).reach`, how far its effect on the
+/// fold carries past its own surface.
+pub struct StandIn: Copy + GpuData {
+    pub family: u32,
+    pub why: u32,
+    pub join: u32,
+    pub reach: f32,
+    pub a: vec4,
+    pub b: vec4,
+    pub c: vec4,
+}
+
+/// A join of a thing's tree (`Surface::join_of`): its width (`smin`'s `k`; 0 for a hard union,
+/// which `smin` with 0 is), the join above it (`NO_JOIN` at the root), and the parts under it,
+/// `first..first + count` of the leaf order.
+pub struct Join: Copy + GpuData {
+    pub k: f32,
+    pub parent: u32,
+    pub first: u32,
+    pub count: u32,
+}
+
+/// No join: above a tree's root, or a thing of one part.
+pub const NO_JOIN: u32 = 4294967295
+/// A `StandIn`'s family: none (its `why` says why).
+pub const STAND_IN_NONE: u32 = 0
+/// A `StandIn`'s family: a round cone (a sphere is one with equal ends and radii).
+pub const STAND_IN_ROUND_CONE: u32 = 1
+/// Why a part has no stand-in: it is no family's (an ellipsoid, a box for now, a closure).
+pub const STAND_IN_NOT_A_FAMILY: u32 = 1
+/// Why a part has no stand-in: it is displaced.
+pub const STAND_IN_DISPLACED: u32 = 2
+/// Why a part has no stand-in: an intersection or a subtraction carves it.
+pub const STAND_IN_CARVED: u32 = 3
+/// Why a part has no stand-in: it is under more joins than `stand_in_fold` nests.
+pub const STAND_IN_TOO_DEEP: u32 = 4
+/// The most joins `stand_in_fold` nests (a part deeper has none: `STAND_IN_TOO_DEEP`).
+pub const MOST_JOINS: u32 = 4
+
+/// No stand-in, because of `why`.
+pub fn no_stand_in(why: u32) -> StandIn {
+    StandIn { family: STAND_IN_NONE, why, join: NO_JOIN, reach: 0.0, a: vec4(0.0), b: vec4(0.0), c: vec4(0.0) }
+}
+
+/// Why a part has no stand-in, in words the engine prints.
+pub fn stand_in_why(why: u32) -> String {
+    let words = if why == STAND_IN_NOT_A_FAMILY {
+        "not one of the families (a round cone or a sphere)"
+    } else if why == STAND_IN_DISPLACED {
+        "displaced"
+    } else if why == STAND_IN_CARVED {
+        "carved: under an intersection or a subtraction"
+    } else if why == STAND_IN_TOO_DEEP {
+        "under more joins than a fold nests (MOST_JOINS)"
+    } else {
+        "it has one"
+    }
+    String::from(words)
+}
+
+/// A stand-in's own distance at `p`: its family's, as std's primitive computes it (bit for
+/// bit); `EMPTY` for none.
+pub fn stand_in_distance(r: StandIn, p: vec3) -> f32 {
+    if r.family == STAND_IN_ROUND_CONE {
+        RoundCone { a: r.a.xyz, b: r.b.xyz, r1: r.a.w, r2: r.b.w }.distance(p)
+    } else {
+        EMPTY
+    }
+}
+
+/// A thing's distance at `p` from its parts' records (`records`, by part) and joins (`joins`,
+/// by node), folding only the `count` parts `members` names, in ascending order: each part's
+/// own distance, folded by `smin` into the join that adds it, each join's value into the join
+/// above it when the walk leaves its parts, as `distance` folds them and in its order (a masked
+/// ask's arithmetic: each join from `EMPTY`, `smin(EMPTY, d, k)` being `d`). THE PROMISE: equal to
+/// the thing's `distance(p)`, bit for bit, where every part left out is at least its `reach`
+/// farther from `p` than that distance (`stand_in_members_at` names those that aren't). GPU and
+/// CPU. A part with no stand-in, or nested deeper than `MOST_JOINS`, can't be folded.
+pub fn stand_in_fold<const M: u32>(records: [StandIn], joins: [Join], members: [u32; M], count: u32, p: vec3) -> f32 {
+    // The open joins, outermost first: at most four, held in a vector each, read and written by
+    // selects (a local array indexed by a variable is kept in memory on both GPUs).
+    var accs = vec4(EMPTY)
+    var nodes = vec4u(NO_JOIN)
+    var depth: u32 = 0
+    var alone = EMPTY
+    for m in 0..M {
+        if m >= count {
+            break
+        }
+        let i = members[m]
+        let r = records[i]
+        let d = stand_in_distance(r, p)
+        if r.join == NO_JOIN {
+            alone = d
+        } else {
+            // Close the open joins that don't hold part `i`, each into the one above.
+            for _c in 0..MOST_JOINS {
+                if depth <= 1 {
+                    break
+                }
+                let jt = joins[lane_u(nodes, depth - 1)]
+                if i >= jt.first && i - jt.first < jt.count {
+                    break
+                }
+                let v = lane(accs, depth - 1)
+                depth -= 1
+                let up = joins[lane_u(nodes, depth - 1)]
+                accs = with_lane(accs, depth - 1, smin(lane(accs, depth - 1), v, up.k))
+            }
+            // Open the joins from the innermost open one down to part `i`'s.
+            let top = if depth > 0 { lane_u(nodes, depth - 1) } else { NO_JOIN }
+            var path = vec4u(NO_JOIN)
+            var steps: u32 = 0
+            var n = r.join
+            for _c in 0..MOST_JOINS {
+                if n == top || n == NO_JOIN {
+                    break
+                }
+                path = with_lane_u(path, steps, n)
+                steps += 1
+                n = joins[n].parent
+            }
+            for c in 0..MOST_JOINS {
+                if c >= steps {
+                    break
+                }
+                nodes = with_lane_u(nodes, depth, lane_u(path, steps - 1 - c))
+                accs = with_lane(accs, depth, EMPTY)
+                depth += 1
+            }
+            accs = with_lane(accs, depth - 1, smin(lane(accs, depth - 1), d, r_join_k(joins, r)))
+        }
+    }
+    for _c in 0..MOST_JOINS {
+        if depth <= 1 {
+            break
+        }
+        let v = lane(accs, depth - 1)
+        depth -= 1
+        let up = joins[lane_u(nodes, depth - 1)]
+        accs = with_lane(accs, depth - 1, smin(lane(accs, depth - 1), v, up.k))
+    }
+    if depth == 1 { accs.x } else { alone }
+}
+
+fn r_join_k(joins: [Join], r: StandIn) -> f32 {
+    joins[r.join].k
+}
+
+/// The members a fold at `p` needs for `stand_in_fold`'s promise: the parts whose own distance
+/// is within their reach of the farthest member's (from the nearest part, grown until no part is
+/// added: a part left out is then at least its reach farther than every member, so folding it
+/// changes no bit: within one join, a part `k` or more above the running value leaves `smin`'s
+/// result as it was, and `reach` adds each join's lowering and the joins above). Into `out` in
+/// ascending order, at most `M`; how many (more than `M`: some left out, and the promise doesn't
+/// hold).
+pub fn stand_in_members_at<const M: u32>(records: [StandIn], count: u32, p: vec3, out: mut [u32; M]) -> u32 {
+    var nearest = EMPTY
+    for i in 0..count {
+        nearest = min(nearest, stand_in_distance(records[i], p))
+    }
+    var farthest = nearest
+    var n: u32 = 0
+    for _pass in 0..count + 1 {
+        var grown = farthest
+        n = 0
+        for i in 0..count {
+            let r = records[i]
+            let d = stand_in_distance(r, p)
+            if d < farthest + r.reach || d == nearest {
+                if n < M {
+                    out[n] = i
+                }
+                n += 1
+                grown = max(grown, d)
+            }
+        }
+        if grown == farthest {
+            break
+        }
+        farthest = grown
+    }
+    n
+}
+
+fn lane(v: vec4, i: u32) -> f32 {
+    if i == 0 { v.x } else if i == 1 { v.y } else if i == 2 { v.z } else { v.w }
+}
+
+fn lane_u(v: vec4u, i: u32) -> u32 {
+    if i == 0 { v.x } else if i == 1 { v.y } else if i == 2 { v.z } else { v.w }
+}
+
+fn with_lane(v: vec4, i: u32, x: f32) -> vec4 {
+    vec4(if i == 0 { x } else { v.x }, if i == 1 { x } else { v.y }, if i == 2 { x } else { v.z }, if i == 3 { x } else { v.w })
+}
+
+fn with_lane_u(v: vec4u, i: u32, x: u32) -> vec4u {
+    vec4u(if i == 0 { x } else { v.x }, if i == 1 { x } else { v.y }, if i == 2 { x } else { v.z }, if i == 3 { x } else { v.w })
+}
+
 /// The parts of `s` a segment from `a` to `b` can come near: those whose bound
 /// (`Surface::part_bound`) it passes within the part's `r`, its `reach` and `widen` of. A part
 /// left out is farther than its reach from every point of the segment: there it changes the
@@ -1667,6 +1896,12 @@ pub fn sphere(radius: f32) -> Sphere {
 }
 
 impl Surface for Sphere {
+    /// A round cone of equal ends at the origin and equal radii (its distance the same, bit for
+    /// bit: `length(p - 0) - max(r, r)`).
+    fn stand_in(self, i: u32) -> StandIn {
+        StandIn { family: STAND_IN_ROUND_CONE, why: 0, join: NO_JOIN, reach: 0.0, a: vec4(vec3(0.0), self.radius), b: vec4(vec3(0.0), self.radius), c: vec4(0.0) }
+    }
+
     fn part_bound(self, i: u32) -> PartBound {
         PartBound { a: vec3(), r: abs(self.radius), b: vec3(), reach: 0.0, lowers: 0.0 }
     }
@@ -1956,6 +2191,11 @@ pub fn round_cone(a: vec3, b: vec3, r_top: f32, r_bottom: f32) -> RoundCone {
 }
 
 impl Surface for RoundCone {
+    /// Itself.
+    fn stand_in(self, i: u32) -> StandIn {
+        StandIn { family: STAND_IN_ROUND_CONE, why: 0, join: NO_JOIN, reach: 0.0, a: vec4(self.a, self.r1), b: vec4(self.b, self.r2), c: vec4(0.0) }
+    }
+
     /// Its segment, at its larger radius.
     fn part_bound(self, i: u32) -> PartBound {
         PartBound { a: self.a, r: max(self.r1, self.r2), b: self.b, reach: 0.0, lowers: 0.0 }
@@ -2234,6 +2474,39 @@ pub struct Union<A, B>: Copy + GpuData + Eq + StateHash {
 }
 
 impl<A: Surface, B: Surface> Surface for Union<A, B> {
+    /// (A hard union is a join of width 0: `smin` with `k` 0 is `min`.) Its operand's, the innermost join renumbered in this tree (this join is 0, `a`'s next,
+    /// then `b`'s), its reach this surface's.
+    fn stand_in(self, i: u32) -> StandIn {
+        let n = self.a.parts()
+        var r = if i < n { self.a.stand_in(i) } else { self.b.stand_in(i - n) }
+        if r.family != STAND_IN_NONE {
+            r.join = if r.join == NO_JOIN { 0 } else if i < n { r.join + 1 } else { r.join + 1 + self.a.join_count() }
+            r.reach = self.part_bound(i).reach
+        }
+        r
+    }
+
+    fn join_count(self) -> u32 {
+        1 + self.a.join_count() + self.b.join_count()
+    }
+
+    fn join_of(self, n: u32) -> Join {
+        if n == 0 {
+            return Join { k: 0.0, parent: NO_JOIN, first: 0, count: self.parts() }
+        }
+        let ca = self.a.join_count()
+        if n - 1 < ca {
+            var j = self.a.join_of(n - 1)
+            j.parent = if j.parent == NO_JOIN { 0 } else { j.parent + 1 }
+            j
+        } else {
+            var j = self.b.join_of(n - 1 - ca)
+            j.parent = if j.parent == NO_JOIN { 0 } else { j.parent + 1 + ca }
+            j.first += self.a.parts()
+            j
+        }
+    }
+
     /// Its operands' own, joined by `min`, within its own (`own_near`).
     fn interval_near(self, b: Box3) -> Interval {
         let x = self.interval(b)
@@ -2345,6 +2618,39 @@ pub struct SmoothUnion<A, B>: Copy + GpuData + Eq + StateHash {
 }
 
 impl<A: Surface, B: Surface> Surface for SmoothUnion<A, B> {
+    /// Its operand's, the innermost join renumbered in this tree (this join is 0, `a`'s next,
+    /// then `b`'s), its reach this surface's.
+    fn stand_in(self, i: u32) -> StandIn {
+        let n = self.a.parts()
+        var r = if i < n { self.a.stand_in(i) } else { self.b.stand_in(i - n) }
+        if r.family != STAND_IN_NONE {
+            r.join = if r.join == NO_JOIN { 0 } else if i < n { r.join + 1 } else { r.join + 1 + self.a.join_count() }
+            r.reach = self.part_bound(i).reach
+        }
+        r
+    }
+
+    fn join_count(self) -> u32 {
+        1 + self.a.join_count() + self.b.join_count()
+    }
+
+    fn join_of(self, n: u32) -> Join {
+        if n == 0 {
+            return Join { k: self.k, parent: NO_JOIN, first: 0, count: self.parts() }
+        }
+        let ca = self.a.join_count()
+        if n - 1 < ca {
+            var j = self.a.join_of(n - 1)
+            j.parent = if j.parent == NO_JOIN { 0 } else { j.parent + 1 }
+            j
+        } else {
+            var j = self.b.join_of(n - 1 - ca)
+            j.parent = if j.parent == NO_JOIN { 0 } else { j.parent + 1 + ca }
+            j.first += self.a.parts()
+            j
+        }
+    }
+
     /// Its operands' own, joined by `smin` (which never falls as either rises), within its own
     /// (`own_near`).
     fn interval_near(self, b: Box3) -> Interval {
@@ -2714,6 +3020,57 @@ pub struct SmoothUnionAll<S, const N: u32>: Copy + GpuData + Eq + StateHash {
 }
 
 impl<S: Surface, const N: u32> Surface for SmoothUnionAll<S, N> {
+    /// Its element's, the innermost join renumbered in this tree (this fold is 0, then each
+    /// element's joins in order), its reach this surface's.
+    fn stand_in(self, i: u32) -> StandIn {
+        if N == 0 {
+            return no_stand_in(STAND_IN_NOT_A_FAMILY)
+        }
+        let (e, j) = part_of(self.parts, i)
+        var r = self.parts[e].stand_in(j)
+        if r.family != STAND_IN_NONE {
+            var before: u32 = 0
+            for x in 0..N {
+                if x < e {
+                    before += self.parts[x].join_count()
+                }
+            }
+            r.join = if r.join == NO_JOIN { 0 } else { 1 + before + r.join }
+            r.reach = self.part_bound(i).reach
+        }
+        r
+    }
+
+    fn join_count(self) -> u32 {
+        var n: u32 = 1
+        for x in 0..N {
+            n += self.parts[x].join_count()
+        }
+        n
+    }
+
+    fn join_of(self, n: u32) -> Join {
+        if n == 0 {
+            return Join { k: self.k, parent: NO_JOIN, first: 0, count: self.parts() }
+        }
+        var m = n - 1
+        var base: u32 = 1
+        var first: u32 = 0
+        for x in 0..N {
+            let c = self.parts[x].join_count()
+            if m < c {
+                var j = self.parts[x].join_of(m)
+                j.parent = if j.parent == NO_JOIN { 0 } else { j.parent + base }
+                j.first += first
+                return j
+            }
+            m -= c
+            base += c
+            first += self.parts[x].parts()
+        }
+        Join { k: 0.0, parent: NO_JOIN, first: 0, count: 0 }
+    }
+
     /// Its parts' own, folded by `smin` as its distance is, within its own
     /// (`own_near`).
     fn interval_near(self, b: Box3) -> Interval {
@@ -3062,6 +3419,11 @@ pub struct Intersect<A, B>: Copy + GpuData + Eq + StateHash {
 }
 
 impl<A: Surface, B: Surface> Surface for Intersect<A, B> {
+    /// None: an intersection (and a subtraction, which is one) carves its parts.
+    fn stand_in(self, i: u32) -> StandIn {
+        no_stand_in(STAND_IN_CARVED)
+    }
+
     /// Its operands' own, joined by `max`, within its own (`own_near`).
     fn interval_near(self, b: Box3) -> Interval {
         let x = self.interval(b)
@@ -4731,6 +5093,11 @@ pub struct Displace<S, N>: Copy + GpuData + Eq + StateHash {
 }
 
 impl<S: Surface, N: Noise> Surface for Displace<S, N> {
+    /// None: a displaced part is no family's.
+    fn stand_in(self, i: u32) -> StandIn {
+        no_stand_in(STAND_IN_DISPLACED)
+    }
+
     fn distance(self, p: vec3) -> f32 {
         self.inner.distance(p) + self.amp * self.noise.value(p)
     }
@@ -5082,6 +5449,18 @@ pub struct Named<S>: Copy + GpuData + Eq + StateHash {
 }
 
 impl<S: Surface> Surface for Named<S> {
+    fn stand_in(self, i: u32) -> StandIn {
+        self.inner.stand_in(i)
+    }
+
+    fn join_count(self) -> u32 {
+        self.inner.join_count()
+    }
+
+    fn join_of(self, n: u32) -> Join {
+        self.inner.join_of(n)
+    }
+
     const EXACT_MEETS: bool = S::EXACT_MEETS
     const EXACT_PASSES: bool = S::EXACT_PASSES
 
@@ -5684,6 +6063,18 @@ pub struct With<S, C>: Copy + GpuData + Eq + StateHash {
 }
 
 impl<S: Surface, C: Copy + GpuData> Surface for With<S, C> {
+    fn stand_in(self, i: u32) -> StandIn {
+        self.inner.stand_in(i)
+    }
+
+    fn join_count(self) -> u32 {
+        self.inner.join_count()
+    }
+
+    fn join_of(self, n: u32) -> Join {
+        self.inner.join_of(n)
+    }
+
     fn part_bound(self, i: u32) -> PartBound {
         self.inner.part_bound(i)
     }
@@ -6043,6 +6434,69 @@ fn a_negative_scale_keeps_inside_negative() {
     let s = sphere(0.5).translate(vec3(1.0, 0.0, 0.0)).scale(-2.0)
     assert(abs(s.distance(vec3(-2.0, 0.0, 0.0)) + 1.0) < 0.00001)
     assert(abs(s.distance(vec3(0.0, 0.0, 0.0)) - 1.0) < 0.00001)
+}
+
+/// A thing shaped as the engine's creature is: a fold of round cones (one a sphere) at one
+/// width, joined to a thin part at another.
+fn stand_in_thing() -> SmoothUnion<SmoothUnionAll<RoundCone, 5>, RoundCone> {
+    var parts = [round_cone(vec3(0.0), vec3(0.0), r_top: 0.0, r_bottom: 0.0); 5]
+    parts[0] = round_cone(vec3(0.0, 0.0, 0.0), vec3(0.0, 0.5, 0.0), r_top: 0.12, r_bottom: 0.1)
+    parts[1] = round_cone(vec3(0.0, 0.5, 0.0), vec3(0.0, 0.65, 0.05), r_top: 0.1, r_bottom: 0.14)
+    parts[2] = round_cone(vec3(0.05, 0.45, 0.0), vec3(0.3, 0.2, 0.05), r_top: 0.04, r_bottom: 0.035)
+    parts[3] = round_cone(vec3(-0.05, 0.45, 0.0), vec3(-0.3, 0.25, 0.0), r_top: 0.04, r_bottom: 0.035)
+    parts[4] = round_cone(vec3(0.0, 0.8, 0.02), vec3(0.0, 0.8, 0.02), r_top: 0.09, r_bottom: 0.09)
+    let wand = round_cone(vec3(0.3, 0.2, 0.05), vec3(0.25, 0.5, 0.3), r_top: 0.005, r_bottom: 0.005)
+    parts.smooth_union(k: 0.03).smooth_union(wand, k: 0.004)
+}
+
+@test
+fn stand_ins_number_their_joins_in_pre_order_with_their_parts_as_ranges() {
+    let t = stand_in_thing()
+    assert(t.join_count() == 2)
+    let root = t.join_of(0)
+    let fold = t.join_of(1)
+    assert(root.parent == NO_JOIN && root.first == 0 && root.count == 6 && root.k == 0.004)
+    assert(fold.parent == 0 && fold.first == 0 && fold.count == 5 && fold.k == 0.03)
+    for i in 0..5 {
+        let r = t.stand_in(i)
+        assert(r.family == STAND_IN_ROUND_CONE && r.join == 1, f"part {i}")
+        assert(r.reach == t.part_bound(i).reach, f"part {i}'s reach")
+    }
+    assert(t.stand_in(5).join == 0)
+    assert(t.displace(fbm(4.0, 2), amp: 0.01).stand_in(0).why == STAND_IN_DISPLACED)
+    assert(cuboid(vec3(0.1)).stand_in(0).why == STAND_IN_NOT_A_FAMILY)
+}
+
+@test
+fn a_stand_in_fold_is_the_things_distance_to_the_bit_where_its_promise_holds() {
+    let t = stand_in_thing()
+    var records = [no_stand_in(0); 6]
+    for i in 0..6 {
+        records[i] = t.stand_in(i)
+    }
+    let joins = [t.join_of(0), t.join_of(1)]
+    let all = [0, 1, 2, 3, 4, 5]
+    let space = Box3 { lo: vec3(-0.5, -0.2, -0.3), hi: vec3(0.5, 1.0, 0.4) }
+    var near: u32 = 0
+    var few: u32 = 0
+    for i in 0..20000 {
+        let p = space.sample(9, i)
+        let f = t.distance(p)
+        // Every part: the whole fold.
+        assert(stand_in_fold(records, joins, all, 6, p) == f, f"all six at ({p.x}, {p.y}, {p.z})")
+        // The members the promise needs, and no more.
+        var members: [u32; 6] = [0; 6]
+        let n = stand_in_members_at(records, 6, p, mut members)
+        let g = stand_in_fold(records, joins, members, n, p)
+        assert(g == f, f"{n} members at ({p.x}, {p.y}, {p.z}): {g} against {f}")
+        if abs(f) < 0.05 {
+            near += 1
+        }
+        if n < 6 {
+            few += 1
+        }
+    }
+    assert(near > 500 && few > 5000, f"{near} points near the surface, {few} folds of fewer parts")
 }
 
 /// A blob of every primitive, smooth-unioned, and displaced by noise: what std's field tests
