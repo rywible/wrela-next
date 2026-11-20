@@ -46,7 +46,7 @@ use std::process::ExitCode;
 use wrela_host::{CpuBuild, TickLog};
 
 const USAGE: &str = "usage:
-  wrela-host <build-dir> [--frames N] [--fps F] [--size WxH] [--input script.json] [--png out.png [--every K [--png-from N]]] [--rgba out.rgba] [--timestamps [--serial]] [--cpu] [--targets DIR] [--log out.ticks] [--pipelines] [--steps] [--capture F out.gputrace] [--workers N]
+  wrela-host <build-dir> [--frames N] [--fps F] [--size WxH] [--input script.json] [--png out.png [--every K [--png-from N]]] [--rgba out.rgba] [--timestamps [--serial]] [--keep-clocked] [--cpu] [--targets DIR] [--log out.ticks] [--pipelines] [--steps] [--capture F out.gputrace] [--workers N]
   wrela-host <build-dir> --until TEXT [--input script.json] [--frames N] [--fps F] [--size WxH] --png out.png [--pipelines] [--workers N]
   wrela-host --no-gpu <build-dir> --ticks N [--input script.json] [--log out.ticks] [--workers N]
   wrela-host --replay <log> [--no-gpu] <build-dir> [--workers N]
@@ -65,6 +65,10 @@ frames; the capture schedule and numbering stay the same.
 is the PNG; it fails if none does within --frames.
 --timestamps prints each dispatch's and pass's GPU time to stderr, and each frame's span (its
 first start to its last end); --serial runs each pass and dispatch alone, so each time is its own.
+--keep-clocked keeps the GPU's clock up while the program works on the CPU: a thread with a
+device of its own runs a piece of ~0.1 ms whenever the GPU has had nothing in flight for 1 ms,
+so a pass after the program's CPU work runs at the GPU's height, not many times slower (a judge's
+or a timing run's; it costs power, and a game is not run so).
 --cpu prints each frame's CPU time on the host's thread to stderr (`frame N  cpu total T ms
 program P check C record R blocked B`): the program's WASM and ticks, checking what it
 submits, recording the GPU's work, and waiting for the GPU. Without --timestamps: with them,
@@ -200,6 +204,7 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
             "--replay" => args.replay = Some(value("--replay")?.into()),
             "--timestamps" => args.timestamps = true,
             "--serial" => args.serial = true,
+            "--keep-clocked" => wrela_host::keep_clocked(),
             "--cpu" => args.cpu = true,
             "--pipelines" => args.pipelines = true,
             "--steps" => wrela_host::step::log_steps(),

@@ -602,11 +602,114 @@ const CALIBRATION_WARM_MS: f64 = 500.0;
 /// While the host times its calibration kernel (its own device: no calibration of that one).
 static CALIBRATING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// The calibration kernel: `x = sin(x) * 0.999 + 0.001`, `CALIBRATION_CHAIN` times a chain,
+/// Whether each device the host opens is kept clocked while the program works on the CPU
+/// (`--keep-clocked`; [`Warmer`]).
+static KEEP_CLOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Keeps the GPU clocked while the program works on the CPU, for every device opened after it
+/// (`wrela-host --keep-clocked`): see [`Warmer`].
+pub fn keep_clocked() {
+    KEEP_CLOCKED.store(true, Ordering::SeqCst);
+}
+
+thread_local! {
+    /// Whether this thread is a warmer's (its own device is not kept clocked).
+    static WARMING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The warmer's kernel: the calibration kernel's chain, shorter (a piece of about 0.04 ms on
+/// the M4 at its height). Measured on the M4 (`how_much_a_pass_slows_after_idle`): pieces of
+/// 128 to 512 a chain every 0.1 ms kept the clock up; 1024 every 0.25 ms or 1 ms, 8192 every
+/// 1 ms, and 256 every 0.3 ms did not (the clock falls in gaps of a few tenths of a ms).
+const WARM_CHAIN: u32 = 256;
+/// How long the watched device is idle before the warmer begins (ms).
+const WARM_IDLE_MS: f64 = 1.0;
+/// The warmer's gap between its pieces, and how often it looks whether the device is idle (ms).
+const WARM_GAP_MS: f64 = 0.1;
+
+/// A GPU left idle lowers its clock, and a pass after is slow for real, by its own stamps (the
+/// M4: a pass of 1.2 ms ran 4.3 times as long after a second idle, and up to 7 times in a run of
+/// passes each after 20 ms of the program's CPU work; one of 12 ms, 1.6 times at the median and
+/// 2.7 at most in that run): the guard, which holds a pass to what it held the GPU, then sees a
+/// pass run many times its cost. A warmer keeps the clock up from outside the program: a thread
+/// with a device of its own that, whenever the watched device has had nothing in flight for
+/// `WARM_IDLE_MS`, runs a piece of the calibration kernel (`WARM_CHAIN`, ~0.04 ms), waits for
+/// it, and looks again after `WARM_GAP_MS`. Each piece is far under the line, and none begins
+/// while the watched device has work in flight, so a pass waits at most one piece. Off by
+/// default: it costs a tenth of a CPU core and the GPU's power at its height through every gap,
+/// and a game paces its frames and is not judged by its first pass after a gap.
+struct Warmer {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    pieces: Arc<std::sync::atomic::AtomicU64>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Warmer {
+    fn start(watched: wrela_gpu::Device) -> Warmer {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pieces = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (s, p) = (stop.clone(), pieces.clone());
+        let thread = std::thread::Builder::new()
+            .name("keep-clocked".into())
+            .spawn(move || {
+                WARMING.with(|w| w.set(true));
+                if let Err(e) = Warmer::warm(&watched, &s, &p) {
+                    eprintln!("wrela-host: keeping the GPU clocked stopped: {e}");
+                }
+            })
+            .ok();
+        Warmer { stop, pieces, thread }
+    }
+
+    fn warm(
+        watched: &wrela_gpu::Device,
+        stop: &std::sync::atomic::AtomicBool,
+        pieces: &std::sync::atomic::AtomicU64,
+    ) -> Result<()> {
+        let (manifest, shaders) = calibration_kernel(WARM_CHAIN)?;
+        let mut gpu = Gpu::new(&manifest, &shaders, Timing::Off, false)?;
+        let n = CALIBRATION_GROUPS * 64;
+        gpu.create_buffer(1, 4 * n);
+        let gap = std::time::Duration::from_secs_f64(WARM_GAP_MS / 1e3);
+        let mut busy = std::time::Instant::now();
+        while !stop.load(Ordering::Acquire) {
+            if watched.completed() < watched.submitted() {
+                busy = std::time::Instant::now();
+            } else if busy.elapsed().as_secs_f64() * 1e3 >= WARM_IDLE_MS {
+                gpu.dispatch(
+                    0,
+                    Ok([CALIBRATION_GROUPS, 1, 1]),
+                    &[Binding::range(1, 0, 4 * n)],
+                    &[],
+                )?;
+                gpu.flush()?;
+                wait(&gpu.device)?;
+                pieces.fetch_add(1, Ordering::Relaxed);
+            }
+            std::thread::sleep(gap);
+        }
+        gpu.check_errors()
+    }
+}
+
+impl Drop for Warmer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+        eprintln!(
+            "wrela-host: kept the GPU clocked: {} pieces of the warmer's kernel",
+            self.pieces.load(Ordering::Relaxed)
+        );
+    }
+}
+
+/// The calibration kernel: `x = sin(x) * 0.999 + 0.001`, `chain` times a chain,
 /// from the invocation's index, its result written so nothing is left out. Its bound is stated
 /// (a sine, a multiply, an add and the loop's count, 32 a pass, as the compiler counts them),
 /// so the guard weighs it as any kernel.
-fn calibration_kernel() -> Result<(Manifest, Vec<Vec<u8>>)> {
+fn calibration_kernel(chain: u32) -> Result<(Manifest, Vec<Vec<u8>>)> {
     use wrela_abi::manifest::{BindingStage, Pipeline};
     use wrela_shader::build::{BinOp, Builder, Builtin, BuiltinInput, Scalar};
     let mut manifest = Manifest::new("calibrate.wasm");
@@ -627,7 +730,7 @@ fn calibration_kernel() -> Result<(Manifest, Vec<Vec<u8>>)> {
         standin: None,
         sizes: None,
         kept: 0,
-        work: vec![Some(u64::from(CALIBRATION_CHAIN) * 32 + 64)],
+        work: vec![Some(u64::from(chain) * 32 + 64)],
         unbounded: Vec::new(),
     });
     let mut b = Builder::new();
@@ -646,7 +749,7 @@ fn calibration_kernel() -> Result<(Manifest, Vec<Vec<u8>>)> {
         k.store(n.clone(), zero);
         k.loop_(|k| {
             let c = k.load(u, n.clone());
-            let limit = k.u32(CALIBRATION_CHAIN);
+            let limit = k.u32(chain);
             let done = k.binary(BinOp::Ge, c, limit);
             k.if_(done, |k| k.break_(), |_| {});
             let v = k.load(f, x.clone());
@@ -680,7 +783,7 @@ impl Gpu {
     pub(crate) fn calibration_ns() -> Result<f64> {
         CALIBRATING.store(true, Ordering::SeqCst);
         let timed = (|| {
-            let (manifest, shaders) = calibration_kernel()?;
+            let (manifest, shaders) = calibration_kernel(CALIBRATION_CHAIN)?;
             let mut gpu = Gpu::new(&manifest, &shaders, Timing::Off, false)?;
             let n = CALIBRATION_GROUPS * 64;
             gpu.create_buffer(1, 4 * n);
@@ -860,6 +963,8 @@ struct Job {
     pieces: Vec<Piece>,
     alone: bool,
     dispatches: bool,
+    /// A piece alone's own begin and end on the GPU's clock: its slot in `Gpu::stamps`.
+    stamp: Option<u32>,
 }
 
 /// What of a pass's draws a submission holds: a pass that took an eighth of the line or less
@@ -867,9 +972,16 @@ struct Job {
 /// is a submission of its own, or several, one a piece. (A sixteenth put the Radeon's `picture`
 /// of SCENE 0, 3.2 ms, in one of its own every frame: +0.1 to 0.2 ms a frame.)
 const LIGHT: f64 = 1.0 / 8.0;
+/// How many pieces measured alone the guard's timestamps ring holds (each a pair of queries): a
+/// slot is read only once its submission is done, well within this many later pieces.
+const STAMP_RING: u32 = 256;
+
 /// How many lines a piece alone may take, once, before the run ends: past it, at once (a real
 /// runaway), within it, only when the next piece of its pass alone is over the line too.
 const RECHECK_LINES: f64 = 4.0;
+/// How many times its usual a pass's draws must take before the guard says so, naming the GPU's
+/// idle before it.
+const USUAL_TIMES: f64 = 3.0;
 
 /// What the light passes of one submission may have taken, summed, as a share of the line.
 const LIGHT_JOB: f64 = 1.0 / 4.0;
@@ -902,6 +1014,9 @@ struct Cost {
     again: bool,
     alone: usize,
     suspect: bool,
+    /// The least a draw of it took measured alone and under the line (ms; 0 before one was):
+    /// its usual, which a pass run at a lowered clock is told against.
+    usual: f64,
 }
 
 impl Cost {
@@ -968,6 +1083,12 @@ pub(crate) struct Gpu {
     /// The piece the next submission holds alone, or the light passes it holds.
     job_piece: Option<Piece>,
     job_light: Vec<Piece>,
+    /// Timestamps of pieces measured alone (where the device has them and no timer stamps
+    /// passes): a ring of query pairs, the next slot, and the slot the next submission's piece
+    /// holds. The guard judges a piece over the line by its pass's own time from these.
+    stamps: Option<wrela_gpu::QuerySet>,
+    stamp_next: u32,
+    job_stamp: Option<u32>,
     /// Every measured job's piece and time, for tests.
     #[cfg(test)]
     measured: Vec<(Option<Piece>, f64)>,
@@ -1055,6 +1176,8 @@ pub(crate) struct Gpu {
     screen_asked: Option<(bool, bool)>,
     /// Whether an offscreen screen goes HDR when asked (a test's `hdr=1`): else it stays SDR.
     offscreen_hdr: bool,
+    /// Keeps this device clocked while the program works on the CPU (`--keep-clocked`).
+    warmer: Option<Warmer>,
 }
 
 /// A window the screen is shown in: its surface, and the pass that draws the screen into each
@@ -1401,6 +1524,13 @@ impl Gpu {
             jobs: std::collections::VecDeque::new(),
             job_piece: None,
             job_light: Vec::new(),
+            stamps: if device.features().has("timestamp-query") {
+                device.create_query_set(2 * STAMP_RING).ok()
+            } else {
+                None
+            },
+            stamp_next: 0,
+            job_stamp: None,
             #[cfg(test)]
             measured: Vec::new(),
             queued: Queued::default(),
@@ -1445,8 +1575,15 @@ impl Gpu {
             presenter: None,
             screen_asked: None,
             offscreen_hdr: false,
+            warmer: None,
         };
         gpu.take_pipelines(manifest, shaders)?;
+        if KEEP_CLOCKED.load(Ordering::SeqCst)
+            && !CALIBRATING.load(Ordering::SeqCst)
+            && !WARMING.with(|w| w.get())
+        {
+            gpu.warmer = Some(Warmer::start(gpu.device.clone()));
+        }
         Ok(gpu)
     }
 
@@ -2381,7 +2518,16 @@ impl Gpu {
                 None => (false, std::mem::take(&mut self.job_light)),
             };
             let dispatches = queued.bound_ms > 0.0;
-            let job = Job { index, frame: self.frame, call: self.calls, pieces, alone, dispatches };
+            let stamp = if alone { self.job_stamp.take() } else { None };
+            let job = Job {
+                index,
+                frame: self.frame,
+                call: self.calls,
+                pieces,
+                alone,
+                dispatches,
+                stamp,
+            };
             self.jobs.push_back(job);
         }
         self.measure()?;
@@ -2477,10 +2623,48 @@ impl Gpu {
             }
             return Ok(());
         }
+        // Over the line by its submission's span: judged by its pass's own begin and end where it
+        // was stamped (on Metal the span starts near the commit, so a wait before the pass ran,
+        // the GPU waking after a long stretch of CPU work, is in the span and not in the pass).
+        let ms = match (ms > line, job.stamp, &self.stamps) {
+            (true, Some(slot), Some(q)) => match stamped_ms(&self.device, q, slot) {
+                Some(own) => {
+                    if own <= line {
+                        eprintln!(
+                            "gpu: the pass `{}` took {own:.1} ms of its submission's {ms:.1} on the \
+                             GPU's clock (frame {}): judged by its own",
+                            job.pieces[0].label, job.frame
+                        );
+                    }
+                    own.min(ms)
+                }
+                None => ms,
+            },
+            _ => ms,
+        };
         let p = &job.pieces[0];
         let n = p.draws.len().max(1) as f64;
+        let idle = self.device.idle_before_ms(job.index);
         let c = self.costs.entry(p.label.clone()).or_default();
         c.at(job.call);
+        if ms <= line {
+            c.usual = if c.usual > 0.0 { c.usual.min(ms / n) } else { ms / n };
+        }
+        // Far over what it usually takes: said, with how long the GPU had been idle before it
+        // (a GPU left idle lowers its clock, and its next pass runs slow for real).
+        let usual = if c.usual > 0.0 && ms / n >= USUAL_TIMES * c.usual {
+            format!(
+                ". It ran {:.0} times its usual {:.2} ms a draw{}",
+                ms / n / c.usual,
+                c.usual,
+                idle.map_or(String::new(), |i| format!(
+                    ": the GPU had been idle {i:.0} ms before it (an idle GPU lowers its clock; \
+                     --keep-clocked keeps it up)"
+                ))
+            )
+        } else {
+            String::new()
+        };
         c.now = c.now.max(ms / n);
         c.again = false;
         c.alone = job.call;
@@ -2495,7 +2679,7 @@ impl Gpu {
             eprintln!(
                 "gpu: the pass `{}` took {ms:.1} ms in frame {} on the GPU's clock, over the line \
                  of {line:.0} ms: measured alone again before the run ends (a wait in its span is \
-                 charged to it)",
+                 charged to it){usual}",
                 p.label, job.frame
             );
             return Ok(());
@@ -2517,7 +2701,8 @@ impl Gpu {
             };
             return Err(Error::Gpu(format!(
                 "the pass `{}` held the GPU {ms:.1} ms in frame {} ({which}), over the line of \
-                 {line:.0} ms (AGENTS.md, rule 2). The run stops here, so it can't again. {cut}",
+                 {line:.0} ms (AGENTS.md, rule 2){usual}. The run stops here, so it can't again. \
+                 {cut}",
                 p.label, job.frame
             )));
         }
@@ -3142,7 +3327,7 @@ impl Gpu {
             if self.queued.passes_ms + ms > LIGHT_JOB * self.line_ms {
                 self.submit(false)?;
             }
-            self.record_piece(op, &pass, &formats, &name, open.draws, true)?;
+            self.record_piece(op, &pass, &formats, &name, open.draws, true, false)?;
             self.queued.passes_ms += ms;
             if light.is_some() {
                 self.job_light.push(Piece { label: name, draws: 0..draws, of: draws });
@@ -3180,7 +3365,7 @@ impl Gpu {
         }
         let last = parts.len() - 1;
         for (k, (items, range)) in parts.into_iter().zip(ranges).enumerate() {
-            self.record_piece(op, &pass, &formats, &name, items, k == 0)?;
+            self.record_piece(op, &pass, &formats, &name, items, k == 0, true)?;
             self.job_piece = Some(Piece { label: name.clone(), draws: range, of: draws });
             self.submit(on_screen && k == last)?;
         }
@@ -3198,6 +3383,7 @@ impl Gpu {
         label: &str,
         items: Vec<PassItem>,
         first: bool,
+        alone: bool,
     ) -> Result<()> {
         // Everything that can flush happens before anything is recorded for this pass.
         let total = items
@@ -3211,6 +3397,14 @@ impl Gpu {
         self.reserve_timestamps()?;
         let timestamps =
             self.timer.as_mut().and_then(|t| t.next_if(&self.asked, self.frame, self.calls, label));
+        // A piece measured alone, where no timer stamps it, is stamped for the guard: its pass's
+        // own begin and end, without what the GPU did or waited for before it ran.
+        let guard_stamp = (alone && timestamps.is_none() && self.stamps.is_some()).then(|| {
+            let slot = self.stamp_next;
+            self.stamp_next = (self.stamp_next + 1) % STAMP_RING;
+            slot
+        });
+        self.job_stamp = guard_stamp;
         let mut prepared = Vec::with_capacity(items.len());
         for d in &items {
             if let PassItem::Draw(d) = d {
@@ -3253,13 +3447,25 @@ impl Gpu {
         });
         // Counted here, and added once the pass, which borrows the executor, has ended.
         let mut counters = Counters::default();
+        // The GPU's name for it says its frame, so a failed command buffer names the frame.
+        let named = format!("{label} (frame {})", self.frame);
         let mut rp = encoder.begin_render_pass(&wrela_gpu::RenderPassDesc {
-            label,
+            label: &named,
             colors: &color_attachments,
             depth: depth_attachment,
-            timestamps: timestamps.zip(self.timer.as_ref()).map(|(i, t)| {
-                wrela_gpu::PassTimestamps { queries: &t.queries, begin: i, end: i + 1 }
-            }),
+            timestamps: match (timestamps, guard_stamp) {
+                (Some(i), _) => self.timer.as_ref().map(|t| wrela_gpu::PassTimestamps {
+                    queries: &t.queries,
+                    begin: i,
+                    end: i + 1,
+                }),
+                (None, Some(slot)) => self.stamps.as_ref().map(|q| wrela_gpu::PassTimestamps {
+                    queries: q,
+                    begin: 2 * slot,
+                    end: 2 * slot + 1,
+                }),
+                (None, None) => None,
+            },
         });
         let mut prepared = prepared.iter();
         for item in &items {
@@ -4162,6 +4368,24 @@ fn resolve(
     })
 }
 
+/// A piece's own time (ms) from the guard's stamps: its pass's begin and end (slot `slot`, a
+/// submission already done), on the GPU's clock. None where the stamps don't read as a time.
+fn stamped_ms(device: &wrela_gpu::Device, queries: &wrela_gpu::QuerySet, slot: u32) -> Option<f64> {
+    wait(device).ok()?;
+    let (resolved, readback) = query_buffers(device, 2);
+    let mut encoder = device.create_command_encoder("resolve a piece's stamps");
+    encoder.resolve_query_set(queries, 2 * slot, 2, &resolved, 0);
+    encoder.copy_buffer_to_buffer(&resolved, 0, &readback, 0, 16);
+    device.submit(vec![encoder.finish()]);
+    let ticks: Vec<u64> = map_read_with(device, &readback, 16, |bytes| {
+        bytes.chunks_exact(8).map(|b| u64::from_le_bytes(b.try_into().expect("8 bytes"))).collect()
+    })
+    .ok()?;
+    let period = f64::from(device.timestamp_period());
+    let (begin, end) = (ticks[0], ticks[1]);
+    (begin > 0 && end >= begin).then(|| (end - begin) as f64 * period / 1.0e6)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4434,6 +4658,193 @@ mod tests {
         assert!(after - before >= 10, "{} submissions of 30 heavy dispatches", after - before);
         assert!(largest.bound_ms <= SUBMIT_BOUND_MS, "{largest:?}");
         assert_eq!(gpu.read_buffer(1).unwrap(), 30u32.to_le_bytes());
+        gpu.check_errors().unwrap();
+    }
+
+    /// A small pass after a long stretch of CPU work, frame after frame (the engine's judge): its
+    /// submission's span on Metal starts near its commit, so a wait before it is in the span;
+    /// the guard judges a piece alone by its pass's own stamps, and the run goes on. A pass that
+    /// truly holds the GPU over the line still ends it, by its own time; over four lines, at once.
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn a_small_pass_after_cpu_work_is_judged_by_its_own_time() {
+        let (manifest, shaders) = heavy_draw();
+        let mut gpu = Gpu::new(&manifest, &shaders, Timing::Off, false).unwrap();
+        if gpu.stamps.is_none() {
+            eprintln!("this GPU stamps no passes: nothing to test");
+            return;
+        }
+        gpu.create_texture(
+            2,
+            [HEAVY_SIDE, HEAVY_SIDE, 1],
+            TextureFormat::Rgba16Float,
+            false,
+            TextureKind::D2,
+            1,
+        );
+        // The pass's own time, warmed, and kept warm (a GPU left idle runs it slow for real).
+        let warmer = Warmer::start(gpu.device.clone());
+        for _ in 0..200 {
+            heavy_frame(&mut gpu, "small", 1, 1).unwrap();
+        }
+        let slot = (gpu.stamp_next + STAMP_RING - 1) % STAMP_RING;
+        let own = stamped_ms(&gpu.device, gpu.stamps.as_ref().unwrap(), slot).expect("stamped");
+        eprintln!("the small pass's own time: {own:.4} ms");
+        // A line of four times that: a wait of more than three passes in any span would be over.
+        let line = gpu.line_ms;
+        gpu.line_ms = (4.0 * own).max(0.05);
+        let mut over_by_span = 0;
+        for _ in 0..200 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            heavy_frame(&mut gpu, "small", 1, 1).unwrap();
+            over_by_span += gpu.measured.iter().filter(|(_, ms)| *ms > gpu.line_ms).count();
+            gpu.measured.clear();
+        }
+        eprintln!("spans over the line {over_by_span} of 200, and the run went on");
+        // The same judgement, by hand: a span far over the line (within four lines), its own small.
+        let job = |label: &str, slot: u32| Job {
+            index: Default::default(),
+            frame: 0,
+            call: 0,
+            pieces: vec![Piece { label: Arc::from(label), draws: 0..1, of: 1 }],
+            alone: true,
+            dispatches: false,
+            stamp: Some(slot),
+        };
+        let slot = (gpu.stamp_next + STAMP_RING - 1) % STAMP_RING;
+        // The stamp judged by hand: the last piece measured alone, after the run above.
+        let own = stamped_ms(&gpu.device, gpu.stamps.as_ref().unwrap(), slot).expect("stamped");
+        gpu.line_ms = (4.0 * own).max(0.05);
+        for _ in 0..3 {
+            assert!(gpu.judge(job("small", slot), 3.0 * gpu.line_ms).is_ok(), "a wait in the span");
+        }
+        // Truly over: its own time over a line lowered under it ends the run the second time.
+        gpu.line_ms = own / 2.0;
+        assert!(gpu.judge(job("heavy", slot), own).is_ok());
+        let e = gpu.judge(job("heavy", slot), own).unwrap_err().to_string();
+        assert!(e.contains("the pass `heavy`"), "{e}");
+        // And far over (its own over four lines): at once.
+        gpu.line_ms = own / 8.0;
+        let e = gpu.judge(job("runaway", slot), own).unwrap_err().to_string();
+        assert!(e.contains("the pass `runaway`"), "{e}");
+        // Far over its usual (learned above, under the line): said.
+        let unstamped = Job { stamp: None, ..job("small", slot) };
+        let e = gpu.judge(unstamped, 5.0 * own).unwrap_err().to_string();
+        assert!(e.contains("times its usual"), "{e}");
+        gpu.line_ms = line;
+        drop(warmer);
+    }
+
+    /// A pass of `instances` heavy triangles: its own time (serial stamps), in ms.
+    fn own_pass_ms(gpu: &mut Gpu, instances: u32) -> f64 {
+        heavy_frame(gpu, "small", 1, instances).unwrap();
+        let t = gpu.take_timings().unwrap();
+        t.iter().filter(|t| t.label == "small").map(|t| t.nanos / 1e6).sum()
+    }
+
+    fn median(mut v: Vec<f64>) -> f64 {
+        v.sort_by(f64::total_cmp);
+        v[v.len() / 2]
+    }
+
+    /// A measurement, not a check: how much slower a pass runs, by its own time, after the GPU
+    /// sat idle (5 ms to a second), and in a run of passes each after 20 ms of CPU work (the
+    /// engine's judge's shape); passes of 1, 15 and 150 triangles; without a warmer and kept
+    /// clocked ([`Warmer`]), with the CPU it costs while the GPU idles.
+    #[test]
+    #[ignore = "a measurement: run by hand"]
+    fn how_much_a_pass_slows_after_idle() {
+        let (manifest, shaders) = heavy_draw();
+        let mut gpu = Gpu::new(&manifest, &shaders, Timing::Serial, false).unwrap();
+        gpu.create_texture(
+            2,
+            [HEAVY_SIDE, HEAVY_SIDE, 1],
+            TextureFormat::Rgba16Float,
+            false,
+            TextureKind::D2,
+            1,
+        );
+        let cpu_ms = || {
+            let pid = std::process::id().to_string();
+            let out = std::process::Command::new("ps").args(["-o", "time=", "-p", &pid]).output();
+            // `[hh:]mm:ss[.ss]` (macOS gives minutes and hundredths, Linux hours and seconds).
+            let t = String::from_utf8_lossy(&out.unwrap().stdout).trim().to_string();
+            let t = t.rsplit('-').next().unwrap_or_default();
+            t.split(':').fold(0.0, |a, f| a * 60.0 + f.parse::<f64>().unwrap()) * 1e3
+        };
+        for instances in [1, 15, 150] {
+            for kept in [false, true] {
+                let warmer = kept.then(|| Warmer::start(gpu.device.clone()));
+                for _ in 0..200 {
+                    own_pass_ms(&mut gpu, instances);
+                }
+                let busy = median((0..21).map(|_| own_pass_ms(&mut gpu, instances)).collect());
+                let mut line = format!(
+                    "{instances:>3} triangles, kept clocked {kept:>5}: back to back {busy:.3} ms; after idle (median / most of 5):"
+                );
+                for idle in [5u64, 20, 100, 1000] {
+                    let mut r = Vec::new();
+                    for _ in 0..5 {
+                        for _ in 0..10 {
+                            own_pass_ms(&mut gpu, instances);
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(idle));
+                        r.push(own_pass_ms(&mut gpu, instances));
+                    }
+                    let most = r.iter().copied().fold(0.0, f64::max);
+                    line += &format!("  {idle} ms {:.3} / {most:.3}", median(r));
+                }
+                let mut run = Vec::new();
+                for _ in 0..100 {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    run.push(own_pass_ms(&mut gpu, instances));
+                }
+                let most = run.iter().copied().fold(0.0, f64::max);
+                line += &format!("; 100 after 20 ms each {:.3} / {most:.3}", median(run));
+                let before = cpu_ms();
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                line += &format!("; CPU while idle {:.1}% of a core", (cpu_ms() - before) / 20.0);
+                eprintln!("{line}");
+                drop(warmer);
+            }
+        }
+        gpu.check_errors().unwrap();
+    }
+
+    /// Kept clocked, a pass after the program's CPU work runs at its warm time, by its own
+    /// stamps: 200 frames, each a pass of 15 triangles after 20 ms of CPU work (the engine's
+    /// judge's shape): the median within a third of the pass back to back, nine in ten within
+    /// twice it. (Without the warmer, on the M4, the median was 2.4 to 4 times.)
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn a_pass_after_cpu_work_runs_at_its_warm_time_when_kept_clocked() {
+        let (manifest, shaders) = heavy_draw();
+        let mut gpu = Gpu::new(&manifest, &shaders, Timing::Serial, false).unwrap();
+        gpu.create_texture(
+            2,
+            [HEAVY_SIDE, HEAVY_SIDE, 1],
+            TextureFormat::Rgba16Float,
+            false,
+            TextureKind::D2,
+            1,
+        );
+        let warmer = Warmer::start(gpu.device.clone());
+        for _ in 0..200 {
+            own_pass_ms(&mut gpu, 15);
+        }
+        let warm = median((0..21).map(|_| own_pass_ms(&mut gpu, 15)).collect());
+        let mut run = Vec::new();
+        for _ in 0..200 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            run.push(own_pass_ms(&mut gpu, 15) / warm);
+        }
+        drop(warmer);
+        run.sort_by(f64::total_cmp);
+        let (mid, ninth, most) = (run[100], run[180], run[199]);
+        eprintln!(
+            "kept clocked: the pass {warm:.3} ms back to back; after 20 ms of CPU work, 200 times: median {mid:.2}x, nine in ten within {ninth:.2}x, most {most:.2}x"
+        );
+        assert!(mid < 1.33 && ninth < 2.0, "{mid} {ninth}");
         gpu.check_errors().unwrap();
     }
 
@@ -4921,6 +5332,7 @@ mod tests {
             pieces: vec![Piece { label: Arc::from(label), draws: 0..1, of: 1 }],
             alone: true,
             dispatches: false,
+            stamp: None,
         };
         // A wait charged once: the run goes on; measured again it takes what it draws.
         assert!(gpu.judge(job("scissored", 1), 1.2 * line).is_ok());

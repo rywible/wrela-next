@@ -52,8 +52,9 @@ struct Shared {
     submitted: AtomicU64,
     completed: Arc<AtomicU64>,
     /// Each recent submission's span on the GPU's clock (seconds): the first of its command
-    /// buffers' starts and the last of their ends, newest last ([`Device::gpu_ms`]).
-    clock: Arc<Mutex<std::collections::VecDeque<(SubmissionIndex, f64, f64)>>>,
+    /// buffers' starts and the last of their ends, newest last ([`Device::gpu_ms`]); and how
+    /// long the GPU had nothing of this device's before it ([`Device::idle_before_ms`]).
+    clock: Arc<Mutex<std::collections::VecDeque<(SubmissionIndex, f64, f64, f64)>>>,
     /// Command buffers committed and not yet seen complete, by submission, with the bind groups
     /// their commands set, kept alive until they're done (what the table names in them).
     in_flight: Mutex<Vec<(SubmissionIndex, Id<dyn MTLCommandBuffer>, Vec<Arc<Group>>)>>,
@@ -825,11 +826,25 @@ impl Device {
                 let completed = self.0.completed.clone();
                 let clock = self.0.clock.clone();
                 let is_last = k == last;
+                let committed = std::time::Instant::now();
                 let block =
                     RcBlock::new(move |cb: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
                         let cb = unsafe { cb.as_ref() };
                         if cb.status() == MTLCommandBufferStatus::Error {
-                            lock(&errors).push(command_buffer_error(cb));
+                            let mut e = command_buffer_error(cb);
+                            e.push_str(&format!(
+                                " (submission {index}, buffer {} of {}; failed {:.0} ms after its \
+                                 commit{})",
+                                k + 1,
+                                last + 1,
+                                committed.elapsed().as_secs_f64() * 1e3,
+                                match (cb.GPUStartTime(), cb.GPUEndTime()) {
+                                    (s, e) if s > 0.0 && e > s =>
+                                        format!(", {:.1} ms on the GPU's clock", (e - s) * 1e3),
+                                    _ => String::new(),
+                                }
+                            ));
+                            lock(&errors).push(e);
                         }
                         // The submission's span: its buffers complete in order, each before
                         // the next's handler runs. A command buffer's start is near its commit,
@@ -840,10 +855,12 @@ impl Device {
                         let mut c = lock(&clock);
                         match c.back_mut() {
                             // A later buffer of the same submission starts after its first.
-                            Some((i, _, e)) if *i == index => *e = e.max(end),
+                            Some((i, _, e, _)) if *i == index => *e = e.max(end),
                             back => {
-                                let start = back.map_or(start, |(_, _, e)| start.max(*e));
-                                c.push_back((index, start, end));
+                                let before = back.map(|(_, _, e, _)| *e);
+                                let idle = before.map_or(0.0, |e| (start - e).max(0.0));
+                                let start = before.map_or(start, |e| start.max(e));
+                                c.push_back((index, start, end, idle));
                                 while c.len() > CLOCK_KEPT {
                                     c.pop_front();
                                 }
@@ -887,8 +904,20 @@ impl Device {
         }
         let c = lock(&self.0.clock);
         let k = c.binary_search_by_key(&index, |(i, ..)| *i).ok()?;
-        let (_, start, end) = c[k];
+        let (_, start, end, _) = c[k];
         (end >= start && start > 0.0).then_some((end - start) * 1e3)
+    }
+
+    /// How long the GPU had none of this device's work before submission `index` began (ms): from
+    /// the end of the submission before it to its start, on the GPU's clock; once it's done,
+    /// while it's among the last [`CLOCK_KEPT`] submissions.
+    pub fn idle_before_ms(&self, index: SubmissionIndex) -> Option<f64> {
+        if index > self.completed() {
+            return None;
+        }
+        let c = lock(&self.0.clock);
+        let k = c.binary_search_by_key(&index, |(i, ..)| *i).ok()?;
+        (k > 0).then(|| c[k].3 * 1e3)
     }
 
     pub fn submitted(&self) -> SubmissionIndex {
@@ -938,8 +967,9 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// What a failed command buffer says: its error, and the encoders that faulted (their labels
-/// are the passes').
+/// What a failed command buffer says: its error, and each of its encoders (their labels are the
+/// passes') with how far it got: done, faulted, hit by the fault (affected), not begun (pending),
+/// or not known. A hang names no faulted encoder; the one it was in is among the affected.
 fn command_buffer_error(cb: &ProtocolObject<dyn MTLCommandBuffer>) -> String {
     let label = cb.label().map(|l| l.to_string()).unwrap_or_default();
     let what = cb.error().map(|e| error_text(&e)).unwrap_or_else(|| "an error".into());
@@ -952,8 +982,17 @@ fn command_buffer_error(cb: &ProtocolObject<dyn MTLCommandBuffer>) -> String {
                 for item in list.iter() {
                     let item: Retained<ProtocolObject<dyn MTLCommandBufferEncoderInfo>> =
                         unsafe { Retained::cast_unchecked(item) };
-                    if item.errorState() == MTLCommandEncoderErrorState::Faulted {
+                    let state = item.errorState();
+                    if state == MTLCommandEncoderErrorState::Faulted {
                         out.push_str(&format!("; it faulted in `{}`", item.label()));
+                    } else {
+                        let what = match state {
+                            MTLCommandEncoderErrorState::Completed => "done",
+                            MTLCommandEncoderErrorState::Affected => "affected",
+                            MTLCommandEncoderErrorState::Pending => "not begun",
+                            _ => "not known",
+                        };
+                        out.push_str(&format!("; `{}` {what}", item.label()));
                     }
                 }
             }

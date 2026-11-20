@@ -1536,25 +1536,51 @@ impl Device {
         if first + CLOCK_KEPT as u64 <= self.0.clock_next.load(Ordering::Acquire) {
             return None;
         }
-        let read = |query: u32| -> Option<u64> {
-            let mut stamp = [0u64; 1];
-            // SAFETY: one query of the pool, read without waiting: one not yet written isn't
-            // ready, and gives nothing.
-            unsafe {
-                self.raw().get_query_pool_results(
-                    pool,
-                    query,
-                    &mut stamp,
-                    vk::QueryResultFlags::TYPE_64,
-                )
-            }
-            .ok()?;
-            Some(stamp[0])
-        };
-        let start = read(2 * (first % CLOCK_KEPT as u64) as u32)?;
-        let end = read(2 * (last % CLOCK_KEPT as u64) as u32 + 1)?;
+        let start = self.clock_stamp(pool, 2 * (first % CLOCK_KEPT as u64) as u32)?;
+        let end = self.clock_stamp(pool, 2 * (last % CLOCK_KEPT as u64) as u32 + 1)?;
         let ticks = end.wrapping_sub(start) & mask;
         Some(ticks as f64 * f64::from(self.0.timestamp_period) * 1e-6)
+    }
+
+    /// How long the GPU had none of this device's work before submission `index` began (ms): from
+    /// the end of the submission before it to its start, on the GPU's clock (0 where they
+    /// overlap); once it's done, while both are among the last [`CLOCK_KEPT`] stamped.
+    pub fn idle_before_ms(&self, index: SubmissionIndex) -> Option<f64> {
+        let (pool, mask) = self.0.clock?;
+        if index > self.completed() || index == 0 {
+            return None;
+        }
+        let (before, first) = {
+            let c = lock(&self.0.clock_of);
+            let k = c.binary_search_by_key(&index, |(i, ..)| *i).ok()?;
+            let j = c.binary_search_by_key(&(index - 1), |(i, ..)| *i).ok()?;
+            (c[j], c[k].1)
+        };
+        if before.1 + CLOCK_KEPT as u64 <= self.0.clock_next.load(Ordering::Acquire) {
+            return None;
+        }
+        let end = self.clock_stamp(pool, 2 * (before.2 % CLOCK_KEPT as u64) as u32 + 1)?;
+        let start = self.clock_stamp(pool, 2 * (first % CLOCK_KEPT as u64) as u32)?;
+        let ticks = start.wrapping_sub(end) & mask;
+        let ticks = if ticks > mask / 2 { 0 } else { ticks };
+        Some(ticks as f64 * f64::from(self.0.timestamp_period) * 1e-6)
+    }
+
+    /// One query of the device's clock pool, read without waiting: one not yet written isn't
+    /// ready, and gives nothing.
+    fn clock_stamp(&self, pool: vk::QueryPool, query: u32) -> Option<u64> {
+        let mut stamp = [0u64; 1];
+        // SAFETY: one query of the pool, read without waiting.
+        unsafe {
+            self.raw().get_query_pool_results(
+                pool,
+                query,
+                &mut stamp,
+                vk::QueryResultFlags::TYPE_64,
+            )
+        }
+        .ok()?;
+        Some(stamp[0])
     }
 
     /// The submissions done so far: every one up to this index.

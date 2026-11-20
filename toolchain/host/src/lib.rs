@@ -69,7 +69,8 @@ mod trace;
 pub use error::{Error, Result};
 #[cfg(feature = "gpu")]
 pub use gpu::{
-    Counters, GpuTiming, adapter_report, frame_spans, map_read, open_device, read_timestamps,
+    Counters, GpuTiming, adapter_report, frame_spans, keep_clocked, map_read, open_device,
+    read_timestamps,
 };
 pub use trace::{Phase, Trace, Traced};
 /// Build-time code's shared memory (constants, language.md §13), read and written by the
