@@ -244,6 +244,7 @@ pub fn costly_loops(m: &Module, quiet: &HashSet<Span>, heavy: &[HeavyCall]) -> V
             each,
             out: Vec::new(),
             in_loop: false,
+            through_locals: false,
         };
         w.scan(&f.body, &mut None);
         for c in w.out {
@@ -257,6 +258,42 @@ pub fn costly_loops(m: &Module, quiet: &HashSet<Span>, heavy: &[HeavyCall]) -> V
         w(b).cmp(&w(a)).then(a.at.start.cmp(&b.at.start))
     });
     out
+}
+
+/// Whether the loop with body `body`, in `f` (of module `m`), leaves on a test of the count the
+/// command gives (the same for every invocation): what W0014 says to make a `const`. The unroll
+/// pass leaves such a loop a loop, so it's still said.
+pub(crate) fn leaves_on_command(m: &Module, f: &Function, body: &Block) -> bool {
+    let mut defs: HashMap<ValueId, &Expr> = HashMap::new();
+    let mut stores: HashMap<LocalId, Vec<ValueId>> = HashMap::new();
+    visit::walk(&f.body, &mut |s| match s {
+        Stmt::Let(v, e) => {
+            defs.insert(*v, e);
+        }
+        Stmt::Store(p, v) if p.path.is_empty() => {
+            if let Some(l) = p.root_local() {
+                stores.entry(l).or_default().push(*v);
+            }
+        }
+        _ => {}
+    });
+    let (unfolded, quiet) = (HashSet::new(), HashSet::new());
+    let w = Walk {
+        m,
+        f,
+        id: FuncId(0),
+        passes: None,
+        defs: &defs,
+        stores: &stores,
+        work: crate::work::ExprWork::new(m),
+        unfolded: &unfolded,
+        quiet: &quiet,
+        each: "invocation",
+        out: Vec::new(),
+        in_loop: false,
+        through_locals: true,
+    };
+    w.same_count(body)
 }
 
 struct Walk<'a> {
@@ -275,6 +312,10 @@ struct Walk<'a> {
     out: Vec<Costly>,
     /// Inside a loop: its statements' work is counted.
     in_loop: bool,
+    /// Whether a part of a local is the command's where every value stored in it whole is (the
+    /// unroll pass's question, asked before values are forwarded out of locals: a wrong yes only
+    /// leaves a loop a loop).
+    through_locals: bool,
 }
 
 impl Walk<'_> {
@@ -444,7 +485,12 @@ impl Walk<'_> {
         if let Some(&k) = memo.get(&v) {
             return k;
         }
-        // (A cycle can't occur: values are defined before they're used.)
+        // (A cycle can't occur: values are defined before they're used; through locals it can,
+        // a loop's running value stored where it's read, so a value being followed is taken as
+        // the invocation's meanwhile.)
+        if self.through_locals {
+            memo.insert(v, None);
+        }
         let all = |me: &Self, xs: &mut dyn Iterator<Item = ValueId>, memo: &mut HashMap<_, _>| {
             let mut read = false;
             for x in xs {
@@ -465,6 +511,14 @@ impl Walk<'_> {
                     p.for_each_value(&mut |x| idx.push(x));
                     all(self, &mut idx.into_iter(), memo).map(|_| true)
                 }
+                PlaceRoot::Local(l) if self.through_locals => match self.stores.get(&l) {
+                    Some(stored) => {
+                        let mut xs = stored.clone();
+                        p.for_each_value(&mut |x| xs.push(x));
+                        all(self, &mut xs.into_iter(), memo)
+                    }
+                    None => None,
+                },
                 _ => None,
             },
             Some(Expr::Extract(x, i)) => match self.defs.get(x) {

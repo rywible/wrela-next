@@ -34,7 +34,7 @@ pub fn flatten_gpu(m: &mut Module) -> Result<()> {
     keep_reachable(m, &keep);
     for i in 0..m.functions.len() {
         let mut f = std::mem::take(&mut m.functions[i]);
-        crate::unroll::unroll(&mut f);
+        crate::unroll::unroll(m, &mut f);
         // A large struct local is a local per field, so a copy of a uniform with a field
         // changed (`form.only(mask)`) reads the fields it didn't change where they lie.
         split_locals(m, &mut f, Split::Gpu);
