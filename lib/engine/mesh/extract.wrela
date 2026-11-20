@@ -14,9 +14,10 @@ use std::derive::Box3
 use std::field::{ALL_LIVE, Field, Live}
 use std::gpu::{
     Append, AppendBuffer, Atomics, DispatchArgs, DrawIndexedArgs, GlobalId, GpuBuffer, GpuSpan,
-    One, Slots, append_buffer, buffer, buffer_of, dispatch, label, write,
+    One, Slots, append_buffer, buffer, buffer_of, dispatch, label, read, write,
 }
 use std::hash::{Hasher, StateHash}
+use std::io::Pending
 
 /// Interior cells per brick along each axis (`6×6×6` owned edges, `7×7×7` dual vertices, `8×8×8`
 /// evaluated corners).
@@ -36,13 +37,18 @@ const CULL_CHUNK: u32 = 8192
 /// Maximum sharp-crease cells refined per chunk (`(bi << 9) | cell`, 32 KB).
 const CAP_CREASES: u32 = 8192
 
-/// One extracted surface vertex (64 bytes, std430-aligned).
-/// `normal.w` is 1.0 on smooth regions and 0.0 on sharp creases/corners.
+/// One extracted surface vertex (80 bytes, std430-aligned, zero padding):
+///   `pos`:    `(world_x, world_y, world_z, smooth_flag)` (`1.0` smooth, `0.0` sharp crease)
+///   `normal`: `(nx, ny, nz, roughness)`
+///   `albedo`: `(r, g, b, metallic)`
+///   `emits`:  `(er, eg, eb, ior)`
+///   `optics`: `(transmission, subsurface, coat, 0.0)`
 pub struct MeshVertex: Copy + GpuData {
     pub pos: vec4,
     pub normal: vec4,
     pub albedo: vec4,
     pub emits: vec4,
+    pub optics: vec4,
 }
 
 /// One active surface brick: `(bx, by, bz, thing_idx)` plus the bitmask of parts live inside it.
@@ -483,10 +489,11 @@ fn extract_verts<M: Field<Substance>>(
     let smooth = if min_dot >= 0.88 { 1.0 } else { 0.0 }
 
     let vi = verts.push(MeshVertex {
-        pos: vec4(wp, 1.0),
-        normal: vec4(n_final, smooth),
-        albedo: vec4(sub.albedo, 1.0),
-        emits: vec4(sub.emits, 0.0),
+        pos: vec4(wp, smooth),
+        normal: vec4(n_final, sub.roughness),
+        albedo: vec4(sub.albedo, sub.metallic),
+        emits: vec4(sub.emits, sub.ior),
+        optics: vec4(sub.transmission, sub.subsurface, sub.coat, 0.0),
     })
     cell_verts[id] = if vi < cap_verts { vi } else { NONE }
     // Enqueue sharp crease/corner cells for exact Hermite edge refinement in a separate compacted
@@ -652,10 +659,11 @@ fn refine_creases<M: Field<Substance>>(
     let sub = f.channels(wp)
     let smooth = if min_dot >= 0.88 { 1.0 } else { 0.0 }
     let vi = verts.push(MeshVertex {
-        pos: vec4(wp, 1.0),
-        normal: vec4(n_final, smooth),
-        albedo: vec4(sub.albedo, 1.0),
-        emits: vec4(sub.emits, 0.0),
+        pos: vec4(wp, smooth),
+        normal: vec4(n_final, sub.roughness),
+        albedo: vec4(sub.albedo, sub.metallic),
+        emits: vec4(sub.emits, sub.ior),
+        optics: vec4(sub.transmission, sub.subsurface, sub.coat, 0.0),
     })
     if vi < cap_verts {
         cell_verts.store(i: bi * VERTS_STRIDE + cell, value: vi)
@@ -667,51 +675,84 @@ fn cv(cell_verts: [u32], base: u32, x: u32, y: u32, z: u32) -> u32 {
     cell_verts[base + x + y * 7 + z * 49]
 }
 
-/// Emits one quad (2 triangles = 6 indices) with consistent outward CCW winding.
+/// Emits one quad (2 triangles = 6 indices) with consistent outward CCW winding into either the
+/// opaque (`slot 0`) or transmissive (`slot 1`) index buffer based on vertex `optics.x` (`transmission`).
 fn emit_quad(
     v0: u32, v1: u32, v2: u32, v3: u32,
     flip: bool,
+    verts: [MeshVertex],
     cap_indices: u32,
+    cap_trans: u32,
     tri_count: mut Atomics<u32>,
     indices: mut Atomics<u32>,
+    trans_indices: mut Atomics<u32>,
 ) {
     if v0 == NONE || v1 == NONE || v2 == NONE || v3 == NONE {
         return
     }
-    let at = tri_count.add(i: 0, value: 6)
-    if at + 6 > cap_indices {
-        return
-    }
-    if !flip {
-        indices.store(i: at, value: v0)
-        indices.store(i: at + 1, value: v1)
-        indices.store(i: at + 2, value: v2)
-        indices.store(i: at + 3, value: v0)
-        indices.store(i: at + 4, value: v2)
-        indices.store(i: at + 5, value: v3)
+    let is_trans = verts[v0].optics.x > 0.02
+        || verts[v1].optics.x > 0.02
+        || verts[v2].optics.x > 0.02
+        || verts[v3].optics.x > 0.02
+    if !is_trans {
+        let at = tri_count.add(i: 0, value: 6)
+        if at + 6 > cap_indices {
+            return
+        }
+        if !flip {
+            indices.store(i: at, value: v0)
+            indices.store(i: at + 1, value: v1)
+            indices.store(i: at + 2, value: v2)
+            indices.store(i: at + 3, value: v0)
+            indices.store(i: at + 4, value: v2)
+            indices.store(i: at + 5, value: v3)
+        } else {
+            indices.store(i: at, value: v0)
+            indices.store(i: at + 1, value: v3)
+            indices.store(i: at + 2, value: v2)
+            indices.store(i: at + 3, value: v0)
+            indices.store(i: at + 4, value: v2)
+            indices.store(i: at + 5, value: v1)
+        }
     } else {
-        indices.store(i: at, value: v0)
-        indices.store(i: at + 1, value: v3)
-        indices.store(i: at + 2, value: v2)
-        indices.store(i: at + 3, value: v0)
-        indices.store(i: at + 4, value: v2)
-        indices.store(i: at + 5, value: v1)
+        let at = tri_count.add(i: 1, value: 6)
+        if at + 6 > cap_trans {
+            return
+        }
+        if !flip {
+            trans_indices.store(i: at, value: v0)
+            trans_indices.store(i: at + 1, value: v1)
+            trans_indices.store(i: at + 2, value: v2)
+            trans_indices.store(i: at + 3, value: v0)
+            trans_indices.store(i: at + 4, value: v2)
+            trans_indices.store(i: at + 5, value: v3)
+        } else {
+            trans_indices.store(i: at, value: v0)
+            trans_indices.store(i: at + 1, value: v3)
+            trans_indices.store(i: at + 2, value: v2)
+            trans_indices.store(i: at + 3, value: v0)
+            trans_indices.store(i: at + 4, value: v2)
+            trans_indices.store(i: at + 5, value: v1)
+        }
     }
 }
 
 /// Pass 3: Emits watertight quads for every sign-changing owned edge (`6×6×6 = 216` edges per axis
-/// per brick). Each global grid edge belongs to exactly one brick, and all 4 surrounding cells lie
-/// inside `0..7` of that brick.
+/// per brick), routing opaque and transmissive triangles to separate indirect index buffers so
+/// opaque rasterisation keeps full hardware Early-Z with zero `discard()`.
 @compute(64)
 fn emit_tris(
     active_count: [u32],
     cap_bricks: u32,
     cap_indices: u32,
+    cap_trans: u32,
     chunk_start: u32,
     corners: [f32],
     cell_verts: [u32],
+    verts: [MeshVertex],
     tri_count: mut Atomics<u32>,
     indices: mut Atomics<u32>,
+    trans_indices: mut Atomics<u32>,
     id: GlobalId,
 ) {
     // 4 workgroups of 64 = 256 lanes per brick (covering 216 owned edge triples).
@@ -739,9 +780,12 @@ fn emit_tris(
             cv(cell_verts, vbase, ex, ey + 1, ez + 1),
             cv(cell_verts, vbase, ex, ey, ez + 1),
             flip: dx0 >= 0.0,
+            verts: verts,
             cap_indices: cap_indices,
+            cap_trans: cap_trans,
             tri_count: mut tri_count,
             indices: mut indices,
+            trans_indices: mut trans_indices,
         )
     }
 
@@ -755,9 +799,12 @@ fn emit_tris(
             cv(cell_verts, vbase, ex + 1, ey, ez + 1),
             cv(cell_verts, vbase, ex + 1, ey, ez),
             flip: dy0 >= 0.0,
+            verts: verts,
             cap_indices: cap_indices,
+            cap_trans: cap_trans,
             tri_count: mut tri_count,
             indices: mut indices,
+            trans_indices: mut trans_indices,
         )
     }
 
@@ -771,20 +818,39 @@ fn emit_tris(
             cv(cell_verts, vbase, ex + 1, ey + 1, ez),
             cv(cell_verts, vbase, ex, ey + 1, ez),
             flip: dz0 >= 0.0,
+            verts: verts,
             cap_indices: cap_indices,
+            cap_trans: cap_trans,
             tri_count: mut tri_count,
             indices: mut indices,
+            trans_indices: mut trans_indices,
         )
     }
 }
 
-/// Pass 4: Writes the final `DrawIndexedArgs` from the emitted index count (clamped to capacity).
+/// Pass 4: Writes the final `DrawIndexedArgs` for both opaque (`tri_count[0]`) and transmissive
+/// (`tri_count[1]`) index buffers.
 @compute(1)
-fn finish_draw(tri_count: [u32], cap_indices: u32, args: mut One<DrawIndexedArgs>, id: GlobalId) {
+fn finish_draw(
+    tri_count: [u32],
+    cap_indices: u32,
+    cap_trans: u32,
+    args: mut One<DrawIndexedArgs>,
+    trans_args: mut One<DrawIndexedArgs>,
+    id: GlobalId,
+) {
     let n = min(tri_count[0], cap_indices)
     args.set(id, DrawIndexedArgs {
         indices: n,
         instances: if n > 0 { 1 } else { 0 },
+        first_index: 0,
+        base_vertex: 0,
+        first_instance: 0,
+    })
+    let nt = min(tri_count[1], cap_trans)
+    trans_args.set(id, DrawIndexedArgs {
+        indices: nt,
+        instances: if nt > 0 { 1 } else { 0 },
         first_index: 0,
         base_vertex: 0,
         first_instance: 0,
@@ -799,8 +865,10 @@ pub struct MeshBatch {
     pub verts: AppendBuffer<MeshVertex>,
     pub creases: AppendBuffer<u32>,
     pub indices: GpuBuffer<u32>,
+    pub trans_indices: GpuBuffer<u32>,
     pub tri_count: GpuBuffer<u32>,
     pub draw_args: GpuBuffer<DrawIndexedArgs>,
+    pub trans_draw_args: GpuBuffer<DrawIndexedArgs>,
     pub eval_args: GpuBuffer<DispatchArgs>,
     pub vert_args: GpuBuffer<DispatchArgs>,
     pub crease_args: GpuBuffer<DispatchArgs>,
@@ -808,10 +876,13 @@ pub struct MeshBatch {
     pub cap_bricks: u32,
     pub cap_verts: u32,
     pub cap_indices: u32,
+    pub cap_trans: u32,
     pub hash: u64,
     pub cell: f32,
     pub built: bool,
     pub bound: vec4,
+    pub has_trans: bool,
+    trans_poll: Option<Pending<u32>>,
     /// Per-thing temporal tier assignment for multi-tier `Many` batches (0 = near/60Hz, 1 = far even, 2 = far odd).
     pub tiers: Vec<u32>,
 }
@@ -821,6 +892,7 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
     // Average surface brick emits ~50 vertices and ~300 indices; give generous headroom.
     let cap_verts = max_bricks * 80
     let cap_indices = max_bricks * 480
+    let cap_trans = max_bricks * 240
     MeshBatch {
         active: append_buffer(max_bricks),
         corners: buffer(max_bricks * CORNERS_BRICK),
@@ -828,8 +900,10 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
         verts: append_buffer(cap_verts),
         creases: append_buffer(CAP_CREASES),
         indices: buffer(cap_indices),
-        tri_count: buffer_of([0]),
+        trans_indices: buffer(cap_trans),
+        tri_count: buffer_of([0, 0]),
         draw_args: buffer_of([DrawIndexedArgs { indices: 0, instances: 0, first_index: 0, base_vertex: 0, first_instance: 0 }]),
+        trans_draw_args: buffer_of([DrawIndexedArgs { indices: 0, instances: 0, first_index: 0, base_vertex: 0, first_instance: 0 }]),
         eval_args: buffer_of([DispatchArgs { x: 0, y: 1, z: 1 }]),
         vert_args: buffer_of([DispatchArgs { x: 0, y: 1, z: 1 }]),
         crease_args: buffer_of([DispatchArgs { x: 0, y: 1, z: 1 }]),
@@ -837,15 +911,36 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
         cap_bricks: max_bricks,
         cap_verts,
         cap_indices,
+        cap_trans,
         hash: 0,
         cell: 0.0,
         built: false,
         bound: vec4(0.0),
+        has_trans: true,
+        trans_poll: None,
         tiers: Vec::new(),
     }
 }
 
 impl MeshBatch {
+    /// Non-blocking poll of `tri_count[1]` to know whether this batch has any transmissive
+    /// triangles (0 ms stall; defaults to `true` on frame 0 so refraction never skips a frame).
+    pub fn poll_trans(mut self) -> bool {
+        match mut self.trans_poll {
+            Some(p) => match p.poll() {
+                Some(Ok(c)) => {
+                    self.has_trans = c.len() >= 2 && c[1] > 0
+                    self.trans_poll = None
+                },
+                Some(Err(_)) => {
+                    self.trans_poll = None
+                },
+                None => {},
+            },
+            None => {},
+        }
+        self.has_trans
+    }
     /// Extracts a single field into this batch if its state hash or requested cell size changed.
     /// Unchanged fields do zero GPU work.
     pub fn sync_one<M: Field<Substance> + StateHash + GpuData>(mut self, field: M, cell: f32) {
@@ -908,8 +1003,17 @@ impl MeshBatch {
         }
         let count = kept.len()
         if count == 0 {
-            write(mut self.tri_count, 0, [0])
-            dispatch(finish_draw.bind(tri_count: self.tri_count.items(), cap_indices: self.cap_indices, args: mut self.draw_args), over: 1)
+            write(mut self.tri_count, 0, [0, 0])
+            dispatch(
+                finish_draw.bind(
+                    tri_count: self.tri_count.items(),
+                    cap_indices: self.cap_indices,
+                    cap_trans: self.cap_trans,
+                    args: mut self.draw_args,
+                    trans_args: mut self.trans_draw_args,
+                ),
+                over: 1,
+            )
             self.hash = key
             self.cell = first_cell
             self.built = true
@@ -935,7 +1039,7 @@ impl MeshBatch {
         label("mesh_extract")
         self.active.clear()
         self.verts.clear()
-        write(mut self.tri_count, 0, [0])
+        write(mut self.tri_count, 0, [0, 0])
 
         // Pass 0: Interval-cull bricks in bounded chunks.
         var first: u32 = 0
@@ -1030,11 +1134,14 @@ impl MeshBatch {
                     active_count: self.active.count(),
                     cap_bricks: self.cap_bricks,
                     cap_indices: self.cap_indices,
+                    cap_trans: self.cap_trans,
                     chunk_start: chunk_start,
                     corners: self.corners.items(),
                     cell_verts: self.cell_verts.items(),
+                    verts: self.verts.items(),
                     tri_count: mut self.tri_count,
                     indices: mut self.indices,
+                    trans_indices: mut self.trans_indices,
                 ),
                 groups: self.quad_args.at(0),
                 most: chunk_n * 4,
@@ -1046,9 +1153,18 @@ impl MeshBatch {
             finish_draw.bind(
                 tri_count: self.tri_count.items(),
                 cap_indices: self.cap_indices,
+                cap_trans: self.cap_trans,
                 args: mut self.draw_args,
+                trans_args: mut self.trans_draw_args,
             ),
             over: 1,
         )
+        let _ = self.poll_trans()
+        match self.trans_poll {
+            None => {
+                self.trans_poll = Some(read(self.tri_count.items()))
+            },
+            Some(_) => {},
+        }
     }
 }

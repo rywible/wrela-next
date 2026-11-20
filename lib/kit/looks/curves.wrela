@@ -1,6 +1,5 @@
-// Tone curves: how a look may turn the light a ray brings back into what a screen shows, from
-// none to the screen's white, with a shoulder that rolls light brighter than white off instead of
-// clipping it.
+// Tone curves: how a look turns physical linear radiance into linear display colour (`0..1`)
+// before screen encoding, with highlight roll-off instead of hard clipping.
 
 /// The filmic curve of the Academy Color Encoding System's reference rendering, as fitted by K.
 /// Narkowicz, "ACES Filmic Tone Mapping Curve" (2016): linear light in (already exposed), the
@@ -12,4 +11,72 @@ pub fn filmic(x: vec3) -> vec3 {
     let d = 0.59
     let e = 0.14
     clamp((x * (x * a + vec3(b))) / (x * (x * c + vec3(d)) + vec3(e)), vec3(0.0), vec3(1.0))
+}
+
+/// AgX default contrast polynomial (T. Sobotka 2023; minimal fit by B. Wrensch).
+fn agx_contrast(x: vec3) -> vec3 {
+    let x2 = x * x
+    let x4 = x2 * x2
+    x4 * x2 * 15.5 -
+        x4 * x * 40.14 +
+        x4 * 31.96 -
+        x2 * x * 6.868 +
+        x2 * 0.4298 +
+        x * 0.1191 -
+        vec3(0.00232)
+}
+
+/// AgX filmic tone mapping (T. Sobotka 2023): rotates bright saturated HDR emitters (spells, fire,
+/// sunlit skies) gracefully toward white without hue shifts or neon clipping, returning linear
+/// display colour in `[0, 1]`.
+pub fn agx(x: vec3) -> vec3 {
+    let c = max(x, vec3(0.0))
+    // AgX inset gamut compression matrix (Linear sRGB -> AgX working space).
+    let inset = vec3(
+        0.84247906 * c.x + 0.07843360 * c.y + 0.07922375 * c.z,
+        0.04232824 * c.x + 0.87846864 * c.y + 0.07916613 * c.z,
+        0.04237565 * c.x + 0.07843360 * c.y + 0.87914297 * c.z,
+    )
+    let log_c = clamp((log2(max(inset, vec3(1.0e-10))) + vec3(12.47393)) / 16.5, vec3(0.0), vec3(1.0))
+    let curved = agx_contrast(log_c)
+    // AgX outset matrix back to display-encoded sRGB, then linearise for `Look::tone`.
+    let outset = clamp(
+        vec3(
+            1.19687901 * curved.x - 0.09802088 * curved.y - 0.09902974 * curved.z,
+            -0.05289685 * curved.x + 1.15190313 * curved.y - 0.09896118 * curved.z,
+            -0.05297164 * curved.x - 0.09804345 * curved.y + 1.15107367 * curved.z,
+        ),
+        vec3(0.0),
+        vec3(1.0),
+    )
+    pow(outset, vec3(2.2))
+}
+
+/// AgX with subtle punchy contrast and saturation lift (great for dramatic lighting & spells).
+pub fn agx_punchy(x: vec3) -> vec3 {
+    let base = agx(x)
+    let luma = dot(base, vec3(0.2126, 0.7152, 0.0722))
+    let sat = mix(vec3(luma), base, vec3(1.18))
+    let lifted = pow(max(sat, vec3(0.0)), vec3(1.08))
+    clamp(lifted, vec3(0.0), vec3(1.0))
+}
+
+/// Khronos PBR Neutral tone mapper (2024): preserves base material hues faithfully up to
+/// highlights, then smoothly desaturates bright emitters.
+pub fn pbr_neutral(x: vec3) -> vec3 {
+    let start_compression = 0.76
+    let desaturation = 0.15
+    var c = max(x, vec3(0.0))
+    let m = min(c.x, min(c.y, c.z))
+    let offset = if m < 0.08 { m - 6.25 * m * m } else { 0.04 }
+    c = c - vec3(offset)
+    let peak = max(c.x, max(c.y, c.z))
+    if peak < start_compression {
+        return clamp(c, vec3(0.0), vec3(1.0))
+    }
+    let d = 1.0 - start_compression
+    let new_peak = 1.0 - d * d / (peak + d - start_compression)
+    c = c * (new_peak / peak)
+    let g = 1.0 / (desaturation * (peak - new_peak) + 1.0)
+    clamp(mix(vec3(new_peak), c, vec3(g)), vec3(0.0), vec3(1.0))
 }

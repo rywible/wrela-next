@@ -4,33 +4,164 @@
 // thing is (`shape.with(substance)`, std::field's channels), and where two things are joined
 // smoothly their substances blend across the join as their shapes do (`Blend`, field by field).
 //
-// Today a substance scatters light evenly every way (a Lambertian surface) and may give off light
-// of its own. What else a substance will say (how rough or glossy, how much light passes through
-// and how it bends, how dense a medium is) is added here, as more numbers, when a thing needs it;
-// every member must blend field by field.
+// Physically based microsurface (Cook-Torrance GGX specular + Schlick Fresnel + energy-conserving
+// diffuse + clearcoat + optical transmission + subsurface scattering + HDR emission). When
+// `ior <= 1.0`, `metallic == 0.0`, `transmission == 0.0`, `subsurface == 0.0`, and `coat == 0.0`,
+// `scatters` reduces identically to pure Lambertian `albedo / π` (bit-exact with matte references).
 
-use std::field::Blend
 use std::cmp::Eq
+use std::field::Blend
 use std::hash::StateHash
+use std::math::PI
 
-/// What matter is made of here.
+/// What matter is made of here (48 bytes, std430-aligned, zero padding).
 pub struct Substance: Copy + GpuData + Blend + Eq + StateHash {
-    /// The share of the light falling on it that it scatters back, each colour (its diffuse
-    /// reflectance, linear, from 0 to 1).
+    /// Diffuse / base reflectance (linear, 0..1; for metals, specular F0 tint; for transmissive
+    /// matter like glass or water, spectral tint).
     pub albedo: vec3,
-    /// The light it gives off itself, the same every way (radiance, in the units the sky's light
-    /// is in).
+    /// Perceptual microsurface roughness (`0.0` mirror smooth .. `1.0` completely rough).
+    pub roughness: f32,
+    /// Self-emitted radiance (linear HDR, sky units; bright emitters automatically illuminate
+    /// nearby surfaces, reflections, and participating media).
     pub emits: vec3,
+    /// Metallic conductor factor (`0.0` dielectric .. `1.0` metal).
+    pub metallic: f32,
+    /// Index of refraction for dielectrics (`1.0` pure matte with no Fresnel, `1.333` water,
+    /// `1.5` glass/stone/plastics, `2.4` diamond).
+    pub ior: f32,
+    /// Optical transmission (`0.0` opaque .. `1.0` clear glass/water/crystal).
+    pub transmission: f32,
+    /// Subsurface wrap scattering / translucency (`0.0` solid .. `1.0` flesh/wax/ice/foliage).
+    pub subsurface: f32,
+    /// Clearcoat dielectric glaze (`0.0` none .. `1.0` wet/lacquered/iced coat at IOR 1.5).
+    pub coat: f32,
 }
 
 /// One over π.
 pub const ONE_OVER_PI: f32 = 0.31830988
 
+/// Pure Lambertian matte substance (zero Fresnel specular, zero emission).
+pub fn lambert(albedo: vec3) -> Substance {
+    Substance {
+        albedo,
+        roughness: 1.0,
+        emits: vec3(0.0),
+        metallic: 0.0,
+        ior: 1.0,
+        transmission: 0.0,
+        subsurface: 0.0,
+        coat: 0.0,
+    }
+}
+
+/// GGX / Trowbridge-Reitz normal distribution function `D(ndh, alpha)`.
+pub fn ggx_d(ndh: f32, a2: f32) -> f32 {
+    let d = ndh * ndh * (a2 - 1.0) + 1.0
+    a2 / max(PI * d * d, 1.0e-7)
+}
+
+/// Height-correlated Smith-GGX visibility term `V = G / (4 * ndl * ndv)`.
+pub fn ggx_v(ndl: f32, ndv: f32, a2: f32) -> f32 {
+    let gv = ndl * sqrt(ndv * ndv * (1.0 - a2) + a2)
+    let gl = ndv * sqrt(ndl * ndl * (1.0 - a2) + a2)
+    0.5 / max(gv + gl, 1.0e-6)
+}
+
+/// Schlick Fresnel approximation `F(f0, u)` with `u = dot(v, h)`.
+pub fn fresnel_schlick(f0: vec3, u: f32) -> vec3 {
+    let t = clamp(1.0 - u, 0.0, 1.0)
+    let t2 = t * t
+    let t5 = t2 * t2 * t
+    f0 + (vec3(1.0) - f0) * t5
+}
+
+/// Roughness-attenuated Schlick Fresnel for environment / IBL specular.
+pub fn fresnel_schlick_rough(f0: vec3, ndv: f32, roughness: f32) -> vec3 {
+    let t = clamp(1.0 - ndv, 0.0, 1.0)
+    let t2 = t * t
+    let t5 = t2 * t2 * t
+    let f90 = max(vec3(1.0 - roughness), f0)
+    f0 + (f90 - f0) * t5
+}
+
+/// Dielectric base reflectance `F0` from index of refraction `ior`.
+pub fn ior_to_f0(ior: f32) -> f32 {
+    let r = (ior - 1.0) / max(ior + 1.0, 1.0)
+    r * r
+}
+
+/// Analytic 2-term split-sum environment BRDF approximation (Lazarov 2013 / Karis 2013):
+/// returns `vec2(scale, bias)` such that `env_spec = prefiltered * (f0 * scale + bias)`.
+pub fn env_brdf_approx(roughness: f32, ndv: f32) -> vec2 {
+    let c0 = vec4(-1.0, -0.0275, -0.572, 0.022)
+    let c1 = vec4(1.0, 0.0425, 1.04, -0.04)
+    let r = c0 * roughness + c1
+    let a004 = min(r.x * r.x, exp2(-9.28 * ndv)) * r.x + r.y
+    vec2(-1.04, 1.04) * a004 + vec2(r.z, r.w)
+}
+
 impl Substance {
-    /// How much of the light arriving from the way `from` it sends toward the way `to` (both unit,
-    /// away from the surface), facing `n`: its scattering function (BRDF), a share of the light
-    /// arriving per unit of solid angle. Even every way: its albedo over π.
+    /// Base reflectance `F0` and Fresnel active weight (`0.0` only for pure vacuum-matched matte).
+    pub fn f0(self) -> vec3 {
+        let f0_d = ior_to_f0(max(self.ior, 1.0))
+        mix(vec3(f0_d), self.albedo, clamp(self.metallic, 0.0, 1.0))
+    }
+
+    /// Whether physical Fresnel / specular reflection is active (`0.0` for `ior == 1.0 && metallic == 0.0`).
+    pub fn spec_weight(self) -> f32 {
+        max(clamp(self.metallic, 0.0, 1.0), clamp((self.ior - 1.0) * 20.0, 0.0, 1.0))
+    }
+
+    /// Physical surface BRDF: how much of the light arriving from `from` scatters toward `to`
+    /// (both unit, away from the surface), facing `n`. Reduces identically to `albedo / π` for
+    /// pure matte substances (`lambert`).
     pub fn scatters(self, n: vec3, from: vec3, to: vec3) -> vec3 {
-        self.albedo * ONE_OVER_PI
+        let ndl = max(dot(n, from), 0.0)
+        let ndv = max(dot(n, to), 1.0e-4)
+        let sw = self.spec_weight()
+        if sw <= 1.0e-5 && self.coat <= 1.0e-5 {
+            return self.albedo * (ONE_OVER_PI * (1.0 - clamp(self.transmission, 0.0, 1.0)))
+        }
+        let h_raw = from + to
+        let hl2 = dot(h_raw, h_raw)
+        let h = if hl2 > 1.0e-10 { h_raw * (1.0 / sqrt(hl2)) } else { n }
+        let ndh = max(dot(n, h), 0.0)
+        let vdh = max(dot(to, h), 0.0)
+
+        let r = clamp(self.roughness, 0.04, 1.0)
+        let a = r * r
+        let a2 = a * a
+        let f0 = self.f0()
+        let f = fresnel_schlick(f0, vdh) * sw
+        let spec = f * (ggx_d(ndh, a2) * ggx_v(max(ndl, 1.0e-4), ndv, a2))
+
+        let kd = (vec3(1.0) - f) * (1.0 - clamp(self.metallic, 0.0, 1.0)) * (1.0 - clamp(self.transmission, 0.0, 1.0))
+        var brdf = self.albedo * (kd * ONE_OVER_PI) + spec
+
+        // Optional clearcoat dielectric glaze (fixed IOR 1.5, glossy alpha = 0.04).
+        if self.coat > 1.0e-4 {
+            let fc = fresnel_schlick(vec3(0.04), vdh).x * clamp(self.coat, 0.0, 1.0)
+            let coat_a2 = 0.0016
+            let coat_spec = fc * ggx_d(ndh, coat_a2) * ggx_v(max(ndl, 1.0e-4), ndv, coat_a2)
+            brdf = brdf * (1.0 - fc) + vec3(coat_spec)
+        }
+        brdf
+    }
+
+    /// Direct light contribution from a directional or local emitter with irradiance `light_rad`
+    /// arriving from unit direction `from`, including optional subsurface wrap translucency.
+    pub fn shade_direct(self, n: vec3, from: vec3, to: vec3, light_rad: vec3) -> vec3 {
+        let ndl_raw = dot(n, from)
+        let ndl = max(ndl_raw, 0.0)
+        var out = if ndl > 0.0 { self.scatters(n, from, to) * light_rad * ndl } else { vec3(0.0) }
+        if self.subsurface > 1.0e-4 {
+            let sss = clamp(self.subsurface, 0.0, 1.0) * (1.0 - clamp(self.metallic, 0.0, 1.0))
+            // Energy-conserving wrap diffuse + view-dependent back-scattered glow.
+            let wrap = clamp((ndl_raw + 0.5) / 1.5, 0.0, 1.0)
+            let back = pow(clamp(dot(to, normalize(-from + n * 0.45)), 0.0, 1.0), 3.0)
+            let sss_tint = self.albedo * sqrt(max(self.albedo, vec3(0.02)))
+            out += sss_tint * light_rad * (sss * ONE_OVER_PI * (max(wrap - ndl, 0.0) * 0.45 + back * 0.35))
+        }
+        out
     }
 }

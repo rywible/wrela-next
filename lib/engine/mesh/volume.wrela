@@ -1,20 +1,25 @@
-// Unified frustum-aligned volumetric froxel pass (S. Hillaire, Frostbite SIGGRAPH 2015) and
+// Unified frustum-aligned volumetric froxel pass (S. Hillaire, Frostbite SIGGRAPH 2015),
+// Dual Kawase HDR optical bloom pyramid (M. Marius / Jorge Jimenez SIGGRAPH 2014), and
 // unified linear-HDR `Look::tone` resolve pass.
 //
 // Every participating medium (`Medium`: fog, mist, smoke, fire, spell plumes) is evaluated on a
 // `160×90×32` frustum grid, lit by the exact same sun shadow map (real god-rays from still and
-// moving matter), sky irradiance table, and 3-level world-space radiance volume (bounced sunlight
-// and emissive spell glow), integrated front-to-back analytically, and composited against the
-// exact resolved reversed-Z depth buffer before the frame's single `Look::tone` pass.
+// moving matter), sky irradiance table, 3-level world-space radiance volume, and auto-extracted
+// dynamic local emitters, integrated front-to-back analytically, and composited against the exact
+// resolved reversed-Z depth buffer before optical bloom and the frame's single `Look::tone` pass.
 
 use matter::medium::Medium
 use matter::sky::Sky
-use mesh::light::{RadGrid, ShadowView, sky_irradiance, sun_vis_point, volume_indirect}
+use mesh::light::{
+    Emitter, RadGrid, ShadowView, eval_emitters_vol, sky_irradiance, sun_vis_point, volume_indirect,
+}
 use picture::eye::View
-use picture::look::{Look, Seen}
+use picture::look::{Bloom, Look, Seen}
+use picture::screen::cover
 use std::gpu::{
-    Address, ComparisonSampler, DepthTexture, Filter, FragCoord, GlobalId, Rgba16Float, Sampler,
-    Texels3d, Texture, Texture3d, dispatch, label, sampler, texture3d,
+    Address, ComparisonSampler, DepthTexture, Filter, FragCoord, GlobalId, GpuSpan, Rgba16Float,
+    Sampler, Texels3d, Texture, Texture3d, begin_pass, dispatch, draw, label, sampler, texture,
+    texture3d,
 }
 
 /// Froxel grid dimensions (`160×90×32` = 460,800 froxels, ~3.7 MB per `Rgba16Float` volume).
@@ -49,7 +54,7 @@ fn z_to_w(z: f32) -> f32 {
 }
 
 /// Pass 1: Evaluates `medium` at each froxel centre and computes in-scattered radiance from the
-/// unified One Light (sun shadow god-rays + sky ambient + 3D radiance volume GI/emissives).
+/// unified One Light (sun shadow god-rays + sky ambient + 3D radiance volume + dynamic emitters).
 @compute(4, 4, 4)
 fn froxel_scatter<Med: Medium, S: Sky>(
     medium: Med,
@@ -64,6 +69,8 @@ fn froxel_scatter<Med: Medium, S: Sky>(
     rad1: Texture3d<Rgba16Float>,
     rad2: Texture3d<Rgba16Float>,
     rad_s: Sampler,
+    emitters: [Emitter],
+    emitter_count: [u32],
     out: mut Texels3d<Rgba16Float>,
     id: GlobalId,
 ) {
@@ -87,10 +94,12 @@ fn froxel_scatter<Med: Medium, S: Sky>(
 
     let sun = sky.sun()
     let sun_vis = sun_vis_point(shadow_map, cmp, sv, wp)
-    let phase = hg_phase(dot(ray, sun.way), clamp(smp.g, -0.9, 0.9))
+    let g = clamp(smp.g, -0.9, 0.9)
+    let phase = hg_phase(dot(ray, sun.way), g)
     let direct = sun.light * (sun_vis * phase)
+    let local = eval_emitters_vol(wp, ray, g, rad_grid, emitters, emitter_count)
     let amb = (sky_irradiance(sky_table, sky_s, vec3(0.0, 1.0, 0.0)) + volume_indirect(rad_grid, rad1, rad2, rad_s, wp)) * (1.0 / FOUR_PI)
-    let inscatter = smp.emits + smp.albedo * smp.density * (direct + amb)
+    let inscatter = smp.emits + smp.albedo * smp.density * (direct + local + amb)
     out.store(id, vec4(inscatter, max(smp.density, 0.0)))
 }
 
@@ -124,7 +133,6 @@ fn froxel_integrate(
         let s = raw.load(id.x, id.y, k)
         let sigma = max(s.w, 0.0)
         let step_t = exp(-sigma * ds)
-        // Energy-conserving analytical integration across the slice (Hillaire 2015).
         let integ = if sigma > 1.0e-5 { (1.0 - step_t) / sigma } else { ds }
         accum += trans * s.xyz * integ
         trans *= step_t
@@ -132,8 +140,270 @@ fn froxel_integrate(
     out.store(id, vec4(accum, trans))
 }
 
-/// Final unified composite + `Look::tone` fragment shader: reads linear HDR radiance, composites
-/// volumetric froxels up to the exact resolved depth hit, and applies `Look::tone` ONCE.
+// ---- Optical HDR Bloom Pyramid (4-level Dual Kawase with Karis firefly suppression) ----
+
+fn karis_weight(c: vec3) -> f32 {
+    let l = dot(c, vec3(0.2126, 0.7152, 0.0722))
+    1.0 / (1.0 + max(l, 0.0))
+}
+
+fn soft_threshold(c: vec3, threshold: f32, knee: f32) -> vec3 {
+    let br = max(c.x, max(c.y, c.z))
+    let k = max(knee, 1.0e-4)
+    let rq = clamp(br - threshold + k, 0.0, 2.0 * k)
+    let soft = (rq * rq) / (4.0 * k)
+    let contrib = max(soft, br - threshold) / max(br, 1.0e-5)
+    c * max(contrib, 0.0)
+}
+
+/// Bloom prefilter: downsamples HDR image 2× with Karis firefly average and soft threshold knee.
+@fragment
+fn bloom_prefilter_fs(
+    pixel: FragCoord,
+    src: Texture<Rgba16Float>,
+    s: Sampler,
+    inv_dst: vec2,
+    inv_src: vec2,
+    bloom: Bloom,
+) -> vec4 {
+    let uv = pixel.position.xy * inv_dst
+    let o = inv_src * 0.5
+    let c0 = soft_threshold(max(src.sample_level(s, uv + vec2(-o.x, -o.y), 0.0).xyz, vec3(0.0)), bloom.threshold, bloom.knee)
+    let c1 = soft_threshold(max(src.sample_level(s, uv + vec2(o.x, -o.y), 0.0).xyz, vec3(0.0)), bloom.threshold, bloom.knee)
+    let c2 = soft_threshold(max(src.sample_level(s, uv + vec2(-o.x, o.y), 0.0).xyz, vec3(0.0)), bloom.threshold, bloom.knee)
+    let c3 = soft_threshold(max(src.sample_level(s, uv + vec2(o.x, o.y), 0.0).xyz, vec3(0.0)), bloom.threshold, bloom.knee)
+    let w0 = karis_weight(c0)
+    let w1 = karis_weight(c1)
+    let w2 = karis_weight(c2)
+    let w3 = karis_weight(c3)
+    let avg = (c0 * w0 + c1 * w1 + c2 * w2 + c3 * w3) / max(w0 + w1 + w2 + w3, 1.0e-5)
+    vec4(min(avg, vec3(64.0)), 1.0)
+}
+
+/// 5-tap Kawase downsample.
+@fragment
+fn bloom_down_fs(
+    pixel: FragCoord,
+    src: Texture<Rgba16Float>,
+    s: Sampler,
+    inv_dst: vec2,
+    inv_src: vec2,
+) -> vec4 {
+    let uv = pixel.position.xy * inv_dst
+    let o = inv_src
+    var sum = src.sample_level(s, uv, 0.0).xyz * 4.0
+    sum += src.sample_level(s, uv + vec2(-o.x, -o.y), 0.0).xyz
+    sum += src.sample_level(s, uv + vec2(o.x, -o.y), 0.0).xyz
+    sum += src.sample_level(s, uv + vec2(-o.x, o.y), 0.0).xyz
+    sum += src.sample_level(s, uv + vec2(o.x, o.y), 0.0).xyz
+    vec4(sum * 0.125, 1.0)
+}
+
+/// 9-tap tent upsample + additive blend with the finer pyramid level.
+@fragment
+fn bloom_up_fs(
+    pixel: FragCoord,
+    lo: Texture<Rgba16Float>,
+    hi: Texture<Rgba16Float>,
+    s: Sampler,
+    inv_dst: vec2,
+    inv_lo: vec2,
+    radius: f32,
+) -> vec4 {
+    let uv = pixel.position.xy * inv_dst
+    let o = inv_lo * max(radius, 0.5)
+    var tent = lo.sample_level(s, uv, 0.0).xyz * 4.0
+    tent += (lo.sample_level(s, uv + vec2(-o.x, 0.0), 0.0).xyz
+        + lo.sample_level(s, uv + vec2(o.x, 0.0), 0.0).xyz
+        + lo.sample_level(s, uv + vec2(0.0, -o.y), 0.0).xyz
+        + lo.sample_level(s, uv + vec2(0.0, o.y), 0.0).xyz) * 2.0
+    tent += lo.sample_level(s, uv + vec2(-o.x, -o.y), 0.0).xyz +
+        lo.sample_level(s, uv + vec2(o.x, -o.y), 0.0).xyz +
+        lo.sample_level(s, uv + vec2(-o.x, o.y), 0.0).xyz +
+        lo.sample_level(s, uv + vec2(o.x, o.y), 0.0).xyz
+    let base = hi.sample_level(s, uv, 0.0).xyz
+    vec4(base + tent * 0.0625, 1.0)
+}
+
+/// Persistent 4-level HDR optical bloom pyramid (`W/2 .. W/16`, ~4 MB at 1080p).
+pub struct BloomPyramid {
+    pub d0: Texture<Rgba16Float>,
+    pub d1: Texture<Rgba16Float>,
+    pub d2: Texture<Rgba16Float>,
+    pub d3: Texture<Rgba16Float>,
+    pub u2: Texture<Rgba16Float>,
+    pub u1: Texture<Rgba16Float>,
+    pub u0: Texture<Rgba16Float>,
+    pub s: Sampler,
+    w: u32,
+    h: u32,
+}
+
+pub fn bloom_pyramid() -> BloomPyramid {
+    BloomPyramid {
+        d0: texture(width: 1, height: 1),
+        d1: texture(width: 1, height: 1),
+        d2: texture(width: 1, height: 1),
+        d3: texture(width: 1, height: 1),
+        u2: texture(width: 1, height: 1),
+        u1: texture(width: 1, height: 1),
+        u0: texture(width: 1, height: 1),
+        s: sampler(filter: Filter::Linear, address: Address::Clamp),
+        w: 0,
+        h: 0,
+    }
+}
+
+impl BloomPyramid {
+    fn resize(mut self, width: u32, height: u32) {
+        if self.w == width && self.h == height {
+            return
+        }
+        let w0 = max(width / 2, 1)
+        let h0 = max(height / 2, 1)
+        let w1 = max(w0 / 2, 1)
+        let h1 = max(h0 / 2, 1)
+        let w2 = max(w1 / 2, 1)
+        let h2 = max(h1 / 2, 1)
+        let w3 = max(w2 / 2, 1)
+        let h3 = max(h2 / 2, 1)
+        self.d0 = texture(width: w0, height: h0)
+        self.d1 = texture(width: w1, height: h1)
+        self.d2 = texture(width: w2, height: h2)
+        self.d3 = texture(width: w3, height: h3)
+        self.u2 = texture(width: w2, height: h2)
+        self.u1 = texture(width: w1, height: h1)
+        self.u0 = texture(width: w0, height: h0)
+        self.w = width
+        self.h = height
+    }
+
+    /// Runs the 4-level Dual Kawase bloom pyramid if `bloom.strength > 0.0` (0 ms when disabled).
+    pub fn build(mut self, hdr: Texture<Rgba16Float>, width: u32, height: u32, bloom: Bloom) {
+        if bloom.strength <= 1.0e-5 {
+            return
+        }
+        self.resize(width, height)
+        label("mesh_bloom")
+        let w0 = max(width / 2, 1)
+        let h0 = max(height / 2, 1)
+        let w1 = max(w0 / 2, 1)
+        let h1 = max(h0 / 2, 1)
+        let w2 = max(w1 / 2, 1)
+        let h2 = max(h1 / 2, 1)
+        let w3 = max(w2 / 2, 1)
+        let h3 = max(h2 / 2, 1)
+
+        let p0 = begin_pass(mut self.d0, keep: false)
+        draw(
+            p0,
+            cover,
+            bloom_prefilter_fs.bind(
+                src: hdr,
+                s: self.s,
+                inv_dst: vec2(1.0 / f32(w0), 1.0 / f32(h0)),
+                inv_src: vec2(1.0 / f32(max(width, 1)), 1.0 / f32(max(height, 1))),
+                bloom: bloom,
+            ),
+            vertices: 3,
+        )
+        p0.end()
+
+        let p1 = begin_pass(mut self.d1, keep: false)
+        draw(
+            p1,
+            cover,
+            bloom_down_fs.bind(
+                src: self.d0,
+                s: self.s,
+                inv_dst: vec2(1.0 / f32(w1), 1.0 / f32(h1)),
+                inv_src: vec2(1.0 / f32(w0), 1.0 / f32(h0)),
+            ),
+            vertices: 3,
+        )
+        p1.end()
+
+        let p2 = begin_pass(mut self.d2, keep: false)
+        draw(
+            p2,
+            cover,
+            bloom_down_fs.bind(
+                src: self.d1,
+                s: self.s,
+                inv_dst: vec2(1.0 / f32(w2), 1.0 / f32(h2)),
+                inv_src: vec2(1.0 / f32(w1), 1.0 / f32(h1)),
+            ),
+            vertices: 3,
+        )
+        p2.end()
+
+        let p3 = begin_pass(mut self.d3, keep: false)
+        draw(
+            p3,
+            cover,
+            bloom_down_fs.bind(
+                src: self.d2,
+                s: self.s,
+                inv_dst: vec2(1.0 / f32(w3), 1.0 / f32(h3)),
+                inv_src: vec2(1.0 / f32(w2), 1.0 / f32(h2)),
+            ),
+            vertices: 3,
+        )
+        p3.end()
+
+        let pu2 = begin_pass(mut self.u2, keep: false)
+        draw(
+            pu2,
+            cover,
+            bloom_up_fs.bind(
+                lo: self.d3,
+                hi: self.d2,
+                s: self.s,
+                inv_dst: vec2(1.0 / f32(w2), 1.0 / f32(h2)),
+                inv_lo: vec2(1.0 / f32(w3), 1.0 / f32(h3)),
+                radius: bloom.radius,
+            ),
+            vertices: 3,
+        )
+        pu2.end()
+
+        let pu1 = begin_pass(mut self.u1, keep: false)
+        draw(
+            pu1,
+            cover,
+            bloom_up_fs.bind(
+                lo: self.u2,
+                hi: self.d1,
+                s: self.s,
+                inv_dst: vec2(1.0 / f32(w1), 1.0 / f32(h1)),
+                inv_lo: vec2(1.0 / f32(w2), 1.0 / f32(h2)),
+                radius: bloom.radius,
+            ),
+            vertices: 3,
+        )
+        pu1.end()
+
+        let pu0 = begin_pass(mut self.u0, keep: false)
+        draw(
+            pu0,
+            cover,
+            bloom_up_fs.bind(
+                lo: self.u1,
+                hi: self.d0,
+                s: self.s,
+                inv_dst: vec2(1.0 / f32(w0), 1.0 / f32(h0)),
+                inv_lo: vec2(1.0 / f32(w1), 1.0 / f32(h1)),
+                radius: bloom.radius,
+            ),
+            vertices: 3,
+        )
+        pu0.end()
+    }
+}
+
+/// Final unified composite + optional optical bloom + `Look::tone` fragment shader: reads linear
+/// HDR radiance, composites volumetric froxels up to the exact resolved depth hit, adds optical
+/// HDR bloom when enabled by `look.bloom()`, and applies `Look::tone` ONCE.
 @fragment
 pub fn hdr_tone_fs<L: Look>(
     pixel: FragCoord,
@@ -142,6 +412,9 @@ pub fn hdr_tone_fs<L: Look>(
     froxel_acc: Texture3d<Rgba16Float>,
     vol_s: Sampler,
     vol_active: u32,
+    bloom_tex: Texture<Rgba16Float>,
+    bloom_s: Sampler,
+    bloom_strength: f32,
     near_plane: f32,
     v: View,
     look: L,
@@ -149,13 +422,16 @@ pub fn hdr_tone_fs<L: Look>(
     let px = u32(pixel.position.x)
     let py = u32(pixel.position.y)
     var rad = hdr.load(px, py).xyz
+    let uv = pixel.position.xy / max(v.size, vec2(1.0))
     if vol_active != 0 {
         let ndc_z = depth.load(px, py)
         let lin_z = if ndc_z > 1.0e-6 { min(near_plane / ndc_z, VOL_FAR) } else { VOL_FAR }
-        let uv = pixel.position.xy / max(v.size, vec2(1.0))
         let w = z_to_w(lin_z)
         let vol = froxel_acc.sample_level(vol_s, vec3(uv.x, uv.y, w), 0.0)
         rad = rad * vol.w + vol.xyz
+    }
+    if bloom_strength > 1.0e-5 {
+        rad += bloom_tex.sample_level(bloom_s, uv, 0.0).xyz * bloom_strength
     }
     vec4(look.tone(Seen { light: rad }), 1.0)
 }
@@ -192,6 +468,8 @@ impl FroxelVolume {
         rad1: Texture3d<Rgba16Float>,
         rad2: Texture3d<Rgba16Float>,
         rad_s: Sampler,
+        emitters: GpuSpan<Emitter>,
+        emitter_count: GpuSpan<u32>,
     ) {
         if !medium.active() {
             return
@@ -211,6 +489,8 @@ impl FroxelVolume {
                 rad1: rad1,
                 rad2: rad2,
                 rad_s: rad_s,
+                emitters: emitters,
+                emitter_count: emitter_count,
                 out: mut self.raw,
             ),
             over: (FROXEL_W, FROXEL_H, FROXEL_D),

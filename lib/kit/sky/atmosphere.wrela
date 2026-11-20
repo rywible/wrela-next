@@ -1,0 +1,169 @@
+// Physical atmospheric sky (Rayleigh + Mie + ozone absorption + analytic multi-scatter ground
+// bounce, following Nishita 1993 and Hillaire 2020): pure math implementing `engine::matter::sky::Sky`.
+// Because the engine caches any `Sky` into its GPU irradiance and specular PMREM textures on
+// demand, this costs 0 ms/frame when the sun is still and works across noon, golden hour, twilight,
+// and stormy skies with zero hardcoded sky shaders in the engine.
+
+use engine::matter::sky::{Sky, Sun}
+use std::math::PI
+
+/// Physical atmosphere parameters (pure data, zero GPU code).
+pub struct Atmosphere: Copy + GpuData {
+    /// Unit vector toward the sun.
+    pub sun_dir: vec3,
+    /// Atmospheric turbidity / aerosol haze (`1.0` crisp alpine air .. `5.0` hazy golden/stormy).
+    pub turbidity: f32,
+    /// Distant ground bounce albedo (linear, visible below the horizon and in lower hemisphere GI).
+    pub ground_albedo: vec3,
+    /// Overall radiance exposure multiplier (engine sky units; `1.0` matches midday ~3–4 sun).
+    pub intensity: f32,
+}
+
+/// Constructs a physical atmospheric sky for a sun direction, aerosol turbidity, and ground tint.
+pub fn atmosphere(
+    sun: vec3,
+    turbidity: f32 = 1.8,
+    ground: vec3 = vec3(0.09, 0.095, 0.10),
+    intensity: f32 = 1.0,
+) -> Atmosphere {
+    Atmosphere {
+        sun_dir: normalize(sun),
+        turbidity: clamp(turbidity, 0.5, 8.0),
+        ground_albedo: ground,
+        intensity: max(intensity, 0.01),
+    }
+}
+
+// Planetary scale heights and sea-level scattering/absorption coefficients (per km, scaled to 6360 km Earth).
+const EARTH_R: f32 = 6360.0
+const ATMO_R: f32 = 6460.0
+const H_RAYLEIGH: f32 = 8.0
+const H_MIE: f32 = 1.2
+const BETA_R: vec3 = vec3(0.005802, 0.013558, 0.033100)
+const BETA_OZONE: vec3 = vec3(0.000650, 0.001881, 0.000085)
+const SUN_RADIUS: f32 = 0.00465
+
+/// Optical depth along a ray from altitude `h` (km) with cosine zenith `mu` via Chapman-style
+/// exponential path integration (analytic 4-step quadrature across the top of atmosphere).
+fn ray_sphere_exit(r: f32, mu: f32, top_r: f32) -> f32 {
+    let disc = max(r * r * (mu * mu - 1.0) + top_r * top_r, 0.0)
+    max(-r * mu + sqrt(disc), 0.0)
+}
+
+/// Analytic transmittance from point at radius `r` along direction with zenith cosine `mu`.
+fn transmittance(r: f32, mu: f32, beta_m: f32) -> vec3 {
+    let dist = ray_sphere_exit(r, mu, ATMO_R)
+    var od_r = 0.0
+    var od_m = 0.0
+    var od_o = 0.0
+    let ds = dist * 0.25
+    for i in 0..4 {
+        let t = (f32(i) + 0.5) * ds
+        let ri = sqrt(r * r + t * t + 2.0 * r * t * mu)
+        let h = max(ri - EARTH_R, 0.0)
+        od_r += exp(-h / H_RAYLEIGH) * ds
+        od_m += exp(-h / H_MIE) * ds
+        // Ozone layer peaks at 25 km with ~15 km half-width (gives deep twilight blues).
+        od_o += max(0.0, 1.0 - abs(h - 25.0) / 15.0) * ds
+    }
+    let tau = BETA_R * od_r + vec3(beta_m * 1.11 * od_m) + BETA_OZONE * od_o
+    exp(-tau)
+}
+
+/// Rayleigh phase function.
+fn phase_rayleigh(cos_t: f32) -> f32 {
+    0.0596831 * (1.0 + cos_t * cos_t)
+}
+
+/// Cornette-Shanks Mie phase function (`g = 0.78`).
+fn phase_mie(cos_t: f32, g: f32) -> f32 {
+    let g2 = g * g
+    let num = 3.0 * (1.0 - g2) * (1.0 + cos_t * cos_t)
+    let den = 8.0 * PI * (2.0 + g2) * pow(max(1.0 + g2 - 2.0 * g * cos_t, 1.0e-4), 1.5)
+    num / den
+}
+
+impl Atmosphere {
+    fn scatter_sky(self, d: vec3) -> vec3 {
+        let sun = self.sun_dir
+        let beta_m = 0.003996 * self.turbidity
+        let r0 = EARTH_R + 0.05
+        let sun_mu = sun.y
+        let solar = vec3(6.4, 6.2, 5.9) * self.intensity
+
+        // Single scattering along the view ray (8 geometrically spaced samples for crisp horizon).
+        let view_dist = ray_sphere_exit(r0, max(d.y, 0.002), ATMO_R)
+        let cos_t = dot(d, sun)
+        let pr = phase_rayleigh(cos_t)
+        let pm = phase_mie(cos_t, 0.78)
+
+        var inscatter = vec3(0.0)
+        var od_r = 0.0
+        var od_m = 0.0
+        var od_o = 0.0
+        var prev_t = 0.0
+        let n_steps: u32 = 8
+        for i in 0..n_steps {
+            let f1 = f32(i + 1) / f32(n_steps)
+            let t1 = view_dist * f1 * f1
+            let ds = t1 - prev_t
+            let tmid = 0.5 * (prev_t + t1)
+            prev_t = t1
+
+            let ri = sqrt(r0 * r0 + tmid * tmid + 2.0 * r0 * tmid * max(d.y, 0.002))
+            let h = max(ri - EARTH_R, 0.0)
+            let dr = exp(-h / H_RAYLEIGH)
+            let dm = exp(-h / H_MIE)
+            let doz = max(0.0, 1.0 - abs(h - 25.0) / 15.0)
+
+            od_r += dr * ds
+            od_m += dm * ds
+            od_o += doz * ds
+
+            let t_view = exp(-(BETA_R * od_r + vec3(beta_m * 1.11 * od_m) + BETA_OZONE * od_o))
+            let mu_s = clamp((r0 * sun_mu + tmid * cos_t) / max(ri, 1.0), -1.0, 1.0)
+            let horizon_vis = clamp((mu_s + 0.06) / 0.12, 0.0, 1.0)
+            let t_sun = transmittance(ri, max(mu_s, -0.02), beta_m) * horizon_vis
+
+            let scatter_r = BETA_R * (dr * pr)
+            let scatter_m = vec3(beta_m * dm * pm)
+            let ms = (BETA_R * dr + vec3(beta_m * dm)) * (0.045 * clamp(sun_mu + 0.18, 0.0, 1.0))
+            inscatter += t_view * (t_sun * (scatter_r + scatter_m) + ms) * ds
+        }
+
+        let night = vec3(0.008, 0.014, 0.028) * self.intensity * clamp(1.0 - sun_mu * 4.0, 0.0, 1.0)
+        inscatter * solar + night
+    }
+}
+
+impl Sky for Atmosphere {
+    fn light(self, way: vec3) -> vec3 {
+        let d = normalize(way)
+        if d.y >= 0.0 {
+            return self.scatter_sky(d)
+        }
+        let beta_m = 0.003996 * self.turbidity
+        let r0 = EARTH_R + 0.05
+        let sun_mu = self.sun_dir.y
+        let solar = vec3(6.4, 6.2, 5.9) * self.intensity
+        let hor = self.scatter_sky(normalize(vec3(d.x, 0.002, d.z)))
+        let t_sun = transmittance(r0, max(sun_mu, -0.05), beta_m)
+        let day_f = clamp(sun_mu * 4.0 + 0.25, 0.02, 1.0)
+        let ground = self.ground_albedo * (solar * t_sun * max(sun_mu, 0.0) * 0.22 + vec3(0.08, 0.11, 0.17) * day_f * self.intensity)
+        mix(hor, ground, vec3(clamp(pow(-d.y * 2.5, 0.65), 0.0, 1.0)))
+    }
+
+    fn sun(self) -> Sun {
+        let beta_m = 0.003996 * self.turbidity
+        let r0 = EARTH_R + 0.05
+        let horizon_vis = clamp((self.sun_dir.y + 0.02) / 0.08, 0.0, 1.0)
+        let t_sun = transmittance(r0, max(self.sun_dir.y, 0.0), beta_m) * horizon_vis
+        let solar = vec3(6.4, 6.2, 5.9) * self.intensity
+        Sun {
+            way: self.sun_dir,
+            size: SUN_RADIUS,
+            light: solar * t_sun,
+            spare: 0.0,
+        }
+    }
+}
