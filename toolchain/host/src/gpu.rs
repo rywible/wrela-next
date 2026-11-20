@@ -867,6 +867,10 @@ struct Job {
 /// is a submission of its own, or several, one a piece. (A sixteenth put the Radeon's `picture`
 /// of SCENE 0, 3.2 ms, in one of its own every frame: +0.1 to 0.2 ms a frame.)
 const LIGHT: f64 = 1.0 / 8.0;
+/// How many lines a piece alone may take, once, before the run ends: past it, at once (a real
+/// runaway), within it, only when the next piece of its pass alone is over the line too.
+const RECHECK_LINES: f64 = 4.0;
+
 /// What the light passes of one submission may have taken, summed, as a share of the line.
 const LIGHT_JOB: f64 = 1.0 / 4.0;
 /// How many frames a light pass measured alone is drawn shared before a long submission sends it
@@ -887,7 +891,8 @@ struct Piece {
 /// (`Gpu::calls`), and the worst it has taken lately (falling a tenth a frame: a pass whose
 /// draws are cheap some frames and heavy others, the engine's reference bands over sky and
 /// over things, is costed by its heavy frames); whether it's to be measured alone again (it was
-/// drawn as a light pass in a submission that took long), and when it last was.
+/// drawn as a light pass in a submission that took long), and when it last was; and whether a
+/// piece of it alone was last measured over the line (`suspect`: the next over ends the run).
 #[derive(Clone, Copy, Debug, Default)]
 struct Cost {
     call: usize,
@@ -896,6 +901,7 @@ struct Cost {
     worst: f64,
     again: bool,
     alone: usize,
+    suspect: bool,
 }
 
 impl Cost {
@@ -2478,6 +2484,25 @@ impl Gpu {
         c.now = c.now.max(ms / n);
         c.again = false;
         c.alone = job.call;
+        // A piece alone over the line, but not by much, is measured alone again before the run
+        // ends: a submission's span on the M4's clock starts near its commit, so a wait before
+        // the pass ran (the GPU waking after a long stretch of CPU work, another app's work, the
+        // compositor) is charged to it, a fixed 50-60 ms whatever the pass draws (the engine's
+        // judge, 2026-11-20: a draw scissored to 32 px "held the GPU 59 ms"). Twice running,
+        // or once over `RECHECK_LINES` lines, it's the pass's own.
+        if ms > line && ms <= RECHECK_LINES * line && !c.suspect {
+            c.suspect = true;
+            eprintln!(
+                "gpu: the pass `{}` took {ms:.1} ms in frame {} on the GPU's clock, over the line \
+                 of {line:.0} ms: measured alone again before the run ends (a wait in its span is \
+                 charged to it)",
+                p.label, job.frame
+            );
+            return Ok(());
+        }
+        if ms <= line {
+            c.suspect = false;
+        }
         if ms > line {
             let which = if p.draws.len() == 1 {
                 format!("draw {} of its {}", p.draws.start, p.of)
@@ -4829,6 +4854,37 @@ mod tests {
         assert!(error.contains("draw "), "{error}");
         let (pieces, _) = jobs(&mut gpu);
         assert!(pieces.iter().all(|&(n, _)| n == 1), "{pieces:?}");
+    }
+
+    /// A piece alone over the line once (a wait before it charged to it: a small scissored draw
+    /// after a long stretch of CPU work, the engine's judge's "59 ms" for 32 px) doesn't end the
+    /// run; the pass's next piece alone is measured, and only a second time over ends it; one over
+    /// `RECHECK_LINES` lines ends it at once.
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn a_piece_alone_over_the_line_once_is_measured_again_and_twice_ends_the_run() {
+        let (manifest, shaders) = heavy_draw();
+        let mut gpu = Gpu::new(&manifest, &shaders, Timing::Off, false).unwrap();
+        let line = gpu.line_ms;
+        let job = |label: &str, frame: usize| Job {
+            index: Default::default(),
+            frame,
+            call: frame,
+            pieces: vec![Piece { label: Arc::from(label), draws: 0..1, of: 1 }],
+            alone: true,
+            dispatches: false,
+        };
+        // A wait charged once: the run goes on; measured again it takes what it draws.
+        assert!(gpu.judge(job("scissored", 1), 1.2 * line).is_ok());
+        assert!(gpu.judge(job("scissored", 2), 0.01).is_ok());
+        assert!(gpu.judge(job("scissored", 3), 1.2 * line).is_ok(), "a second wait, later");
+        // A draw that truly holds the GPU over the line: the second time running ends the run.
+        assert!(gpu.judge(job("heavy", 4), 1.5 * line).is_ok());
+        let e = gpu.judge(job("heavy", 5), 1.5 * line).unwrap_err().to_string();
+        assert!(e.contains("the pass `heavy`") && e.contains("over the line"), "{e}");
+        // One far over the line (a runaway): at once.
+        let e = gpu.judge(job("runaway", 6), 5.0 * line).unwrap_err().to_string();
+        assert!(e.contains("the pass `runaway`"), "{e}");
     }
 
     /// `x`'s half-float bits (exact for the small multiples of 1/64 the test draws).
