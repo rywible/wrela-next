@@ -57,7 +57,7 @@ use reference::traced::{LEAVE, cosine_way}
 use std::collections::Vec
 use std::field::hash_u32
 use std::gpu::{
-    Atomics, Blend, ClipPosition, Flat, FragCoord, GlobalId, GpuBuffer, GpuSpan, InstanceIndex, Pass, R8, Rg8, Rgba16Float, Rgba32Float, Rgba8, Texture, VertexIndex,
+    Atomics, Blend, ClipPosition, Flat, FragCoord, GlobalId, GpuBuffer, GpuSpan, InstanceIndex, Pass, R8, Rg8, Rgba16Float, Rgba32Float, Rgba8, Slots, Texture, VertexIndex,
     begin_pass, buffer, dispatch, draw, label, read, texture,
 }
 use std::io::{Pending, print}
@@ -143,6 +143,13 @@ fn slot_of(k: vec3u) -> u32 {
     hash_u32(k.x ^ hash_u32(k.y ^ hash_u32(k.z))) & (SLOTS - 1)
 }
 
+/// What a key claims an empty slot with (`probes_claimed`): the complement of a hash of it other
+/// than `slot_of`'s, so the greatest claim, an atomic max from 0 (empty), is the least hash's: which
+/// key makes a contested slot hangs on the set of keys, never on which arrives first.
+fn claim_of(k: vec3u) -> u32 {
+    4294967295 ^ hash_u32(k.z ^ hash_u32(k.y ^ hash_u32(k.x ^ 2654435769)))
+}
+
 /// What a filled probe's state says: `SAYS_LIT`, `SAYS_DARK`, or 0 (an edge, or not filled).
 fn says(state: u32) -> u32 {
     if (state & FILLED) == 0 {
@@ -162,7 +169,7 @@ fn says(state: u32) -> u32 {
 
 /// The probe of the surface at `p` facing `n`, seen `size` m finely: its state; made (with `p` and
 /// `n`) and queued to be filled where there is none (0 then, as while it is being made).
-fn probed(table: mut Atomics<u32>, head: mut Atomics<u32>, list: mut Atomics<u32>, filled_at: GpuSpan<u32>, changes: GpuSpan<u32>, p: vec3, n: vec3, size: f32) -> u32 {
+fn probed(table: mut Atomics<u32>, waits: mut Atomics<u32>, claims: GpuSpan<u32>, filled_at: GpuSpan<u32>, changes: GpuSpan<u32>, p: vec3, n: vec3, size: f32) -> u32 {
     let k = key_of(p, n, size)
     var s = slot_of(k)
     var state: u32 = 0
@@ -174,20 +181,19 @@ fn probed(table: mut Atomics<u32>, head: mut Atomics<u32>, list: mut Atomics<u32
         let at = s * WORDS
         let c = table.load(i: at + 2)
         if c == 0 {
-            // (Made only where the list has room, so every probe made is listed, and pointed, in
-            // the frame it is made.)
-            if head.load(i: 0) < LIST {
+            // (Made by the key whose claim won it (`probes_claimed`); the ticket keeps two keys of
+            // one claim (a hash's collision) from both writing it. A key that lost makes its probe
+            // in the next pass, past this slot.)
+            if claims[s] == claim_of(k) {
                 let old = table.add(i: at + 3, value: TICKET)
                 if old < TICKET {
-                    // (Made here: its key, then made and listed; its point by `probes_pointed`.)
                     table.store(i: at, value: k.x)
                     table.store(i: at + 1, value: k.y)
                     table.store(i: at + 2, value: k.z)
                     let _ = table.or(i: at + 3, value: MADE)
-                    queued(mut table, mut head, mut list, s)
+                    queued(mut table, mut waits, s)
                 }
             }
-            // (Being made by another pixel, maybe of this key: the next pass makes it, if not.)
             going = false
         } else if c == k.z && table.load(i: at) == k.x && table.load(i: at + 1) == k.y {
             state = table.load(i: at + 3)
@@ -201,7 +207,7 @@ fn probed(table: mut Atomics<u32>, head: mut Atomics<u32>, list: mut Atomics<u32
                 state = old & AGAIN
             }
             if (state & (MADE | LISTED | FILLED)) == MADE {
-                queued(mut table, mut head, mut list, s)
+                queued(mut table, mut waits, s)
             }
             going = false
         }
@@ -210,20 +216,120 @@ fn probed(table: mut Atomics<u32>, head: mut Atomics<u32>, list: mut Atomics<u32
     state
 }
 
-/// Slot `s`, made and not on the list, put on the list of probes to fill, where there is room.
-fn queued(table: mut Atomics<u32>, head: mut Atomics<u32>, list: mut Atomics<u32>, s: u32) {
-    let at = s * WORDS
-    if head.load(i: 0) >= LIST {
+/// Slot `s`, made, marked to be filled: the list is made from the marks in slot order
+/// (`probes_counted`), so which probes are filled first hangs on the set waiting, not on arrival.
+fn queued(table: mut Atomics<u32>, waits: mut Atomics<u32>, s: u32) {
+    let _ = table.or(i: s * WORDS + 3, value: LISTED)
+    let _ = waits.or(i: s / 32, value: u32(1) << (s % 32))
+}
+
+/// Each pixel whose probe is missing (`kept`): the empty slot its key would make, claimed with
+/// `claim_of` (the least hash wins it: `probed`).
+@compute(8, 8)
+fn probes_claimed(kept: Texture<Rg8>, place: Texture<Rgba32Float>, asks: Texture<Rgba32Float>, table: GpuSpan<u32>, claims: mut Atomics<u32>, id: GlobalId) {
+    if id.x >= kept.width() || id.y >= kept.height() {
         return
     }
-    if (table.or(i: at + 3, value: LISTED) & LISTED) != 0 {
+    if said_kept(kept.load(id.x, id.y).x) != SAYS_MISSING {
         return
     }
-    let n = head.add(i: 0, value: 1)
-    if n < LIST {
-        list.store(i: n, value: s)
-    } else {
-        let _ = table.and(i: at + 3, value: 4294967295 ^ LISTED)
+    let at = place.load(id.x, id.y)
+    let a = asks.load(id.x, id.y)
+    let k = key_of(a.xyz, at.xyz, a.w)
+    var s = slot_of(k)
+    var going = true
+    for _ in 0..TRIES {
+        if !going {
+            continue
+        }
+        let o = s * WORDS
+        let c = table[o + 2]
+        if c == 0 {
+            let _ = claims.max(i: s, value: claim_of(k))
+            going = false
+        } else if c == k.z && table[o] == k.x && table[o + 1] == k.y {
+            going = false
+        }
+        s = (s + 1) & (SLOTS - 1)
+    }
+}
+
+/// The slots `BLOCK` a block (`LIST_BLOCKS` of them, `BLOCK` blocks a run, `LIST_RUNS` runs),
+/// counted, summed and listed in slot order: the list of probes waiting to be filled, made again
+/// each frame (`Store::made`). No invocation loops over more than `LIST_RUNS`.
+const BLOCK: u32 = 64
+const LIST_BLOCKS: u32 = SLOTS / BLOCK
+const LIST_RUNS: u32 = LIST_BLOCKS / BLOCK
+
+/// Whether slot `s`'s probe waits to be filled (`waits`: a bit a slot, set where it is listed,
+/// cleared where it is filled: 64 KB to scan, where the table's state words are 16 MB apart).
+fn waiting(waits: GpuSpan<u32>, s: u32) -> bool {
+    ((waits[s / 32] >> (s % 32)) & 1) != 0
+}
+
+/// Block `id.x`'s slots waiting, into `counts`.
+@compute(64)
+fn probes_counted(waits: GpuSpan<u32>, counts: mut Slots<u32>, id: GlobalId) {
+    if id.x >= LIST_BLOCKS {
+        return
+    }
+    var n: u32 = 0
+    for i in 0..BLOCK {
+        if waiting(waits, id.x * BLOCK + i) {
+            n += 1
+        }
+    }
+    counts[id] = n
+}
+
+/// Run `id.x`'s blocks' counts summed, into `runs`.
+@compute(64)
+fn probes_run(counts: [u32], runs: mut Slots<u32>, id: GlobalId) {
+    if id.x >= LIST_RUNS {
+        return
+    }
+    var n: u32 = 0
+    for i in 0..BLOCK {
+        n += counts[id.x * BLOCK + i]
+    }
+    runs[id] = n
+}
+
+/// Where each run begins in the list (`run_at`), and the list's length (at most `LIST`) into `head`,
+/// its fill from its first.
+@compute(1)
+fn probes_summed(runs: [u32], run_at: mut Atomics<u32>, head: mut Atomics<u32>, id: GlobalId) {
+    var at: u32 = 0
+    for r in 0..LIST_RUNS {
+        run_at.store(i: r, value: at)
+        at += runs[r]
+    }
+    head.store(i: 0, value: min(at, LIST))
+    head.store(i: 1, value: 0)
+}
+
+/// Block `id.x`'s waiting slots written into the list in slot order, from where its run begins and
+/// the blocks before it in the run end, as far as `LIST`.
+@compute(64)
+fn probes_listed(waits: GpuSpan<u32>, counts: [u32], run_at: [u32], list: mut Atomics<u32>, id: GlobalId) {
+    if id.x >= LIST_BLOCKS {
+        return
+    }
+    let first = id.x / BLOCK * BLOCK
+    var at = run_at[id.x / BLOCK]
+    for b in 0..BLOCK {
+        if first + b < id.x {
+            at += counts[first + b]
+        }
+    }
+    for i in 0..BLOCK {
+        let s = id.x * BLOCK + i
+        if waiting(waits, s) {
+            if at < LIST {
+                list.store(i: at, value: s)
+            }
+            at += 1
+        }
     }
 }
 
@@ -318,7 +424,7 @@ pub fn said_kept(v: f32) -> u32 {
 
 /// Each pixel whose probe is missing (`said`, kept in `kept`): its probe made and listed.
 @compute(8, 8)
-fn probes_made(kept: Texture<Rg8>, place: Texture<Rgba32Float>, asks: Texture<Rgba32Float>, filled_at: GpuSpan<u32>, changes: GpuSpan<u32>, table: mut Atomics<u32>, head: mut Atomics<u32>, list: mut Atomics<u32>, id: GlobalId) {
+fn probes_made(kept: Texture<Rg8>, place: Texture<Rgba32Float>, asks: Texture<Rgba32Float>, filled_at: GpuSpan<u32>, changes: GpuSpan<u32>, claims: GpuSpan<u32>, table: mut Atomics<u32>, waits: mut Atomics<u32>, id: GlobalId) {
     if id.x >= kept.width() || id.y >= kept.height() {
         return
     }
@@ -327,7 +433,7 @@ fn probes_made(kept: Texture<Rg8>, place: Texture<Rgba32Float>, asks: Texture<Rg
     }
     let at = place.load(id.x, id.y)
     let a = asks.load(id.x, id.y)
-    let _ = probed(mut table, mut head, mut list, filled_at, changes, a.xyz, at.xyz, a.w)
+    let _ = probed(mut table, mut waits, claims, filled_at, changes, a.xyz, at.xyz, a.w)
 }
 
 /// Each pixel whose probe was missing (`kept`): offered as its probe's owner, where the probe has
@@ -540,7 +646,7 @@ fn probe_ray_kind<K: Kinded>(c: FillCorner, pixel: FragCoord, k: K, sun: vec3, t
 
 /// This frame's probes, their rays' answers gathered (`rays`, the fill's target) into their state.
 @compute(64)
-fn probes_settled<S: Sky>(rays: Texture<Rgba8>, list: [u32], head: [u32], sky: S, changes: [u32], table: mut Atomics<u32>, filled_at: mut Atomics<u32>, id: GlobalId) {
+fn probes_settled<S: Sky>(rays: Texture<Rgba8>, list: [u32], head: [u32], sky: S, changes: [u32], table: mut Atomics<u32>, filled_at: mut Atomics<u32>, waits: mut Atomics<u32>, id: GlobalId) {
     let j = id.x
     let n = min(head[0], LIST)
     if n <= head[1] || j >= min(n - head[1], FILL) {
@@ -578,6 +684,7 @@ fn probes_settled<S: Sky>(rays: Texture<Rgba8>, list: [u32], head: [u32], sky: S
     }
     let _ = table.or(i: slot * WORDS + 3, value: state)
     filled_at.store(i: slot, value: changes[0])
+    let _ = waits.and(i: slot / 32, value: 4294967295 ^ (u32(1) << (slot % 32)))
 }
 
 /// The list's head moved past this frame's probes; once every probe on it is filled (or past its
@@ -713,6 +820,15 @@ fn banded(pass: mut Pass<Rgba8>, b: u32) -> bool {
 /// decided, and what it knows of the world it was filled for (the sun, which things were still).
 pub struct Store {
     table: GpuBuffer<u32>,
+    /// Each slot's claim this frame (`probes_claimed`: the least key hash's complement; 0 none).
+    claims: GpuBuffer<u32>,
+    /// A bit a slot whose probe waits to be filled (`waiting`).
+    waits: GpuBuffer<u32>,
+    /// Each block's slots waiting, each run's, and where each run begins in the list
+    /// (`probes_counted`), for the list made in slot order.
+    list_counts: GpuBuffer<u32>,
+    list_runs: GpuBuffer<u32>,
+    run_at: GpuBuffer<u32>,
     head: GpuBuffer<u32>,
     list: GpuBuffer<u32>,
     rays: Texture<Rgba8>,
@@ -735,6 +851,11 @@ pub struct Store {
 pub fn store() -> Store {
     Store {
         table: buffer(SLOTS * WORDS),
+        claims: buffer(SLOTS),
+        waits: buffer(SLOTS / 32),
+        list_counts: buffer(LIST_BLOCKS),
+        list_runs: buffer(LIST_RUNS),
+        run_at: buffer(LIST_RUNS),
         head: buffer(2),
         list: buffer(LIST),
         rays: texture(width: FW, height: FILL * RAYS / FW),
@@ -771,6 +892,8 @@ impl Store {
             first += 1048576
         }
         dispatch(zeroed.bind(words: mut self.head, n: 2, first: 0), over: 2)
+        dispatch(zeroed.bind(words: mut self.claims, n: SLOTS, first: 0), over: SLOTS)
+        dispatch(zeroed.bind(words: mut self.waits, n: SLOTS / 32, first: 0), over: SLOTS / 32)
         self.sun = sun
         self.moving = Vec::new()
         for i in 0..kept.len() {
@@ -795,11 +918,19 @@ impl Store {
     /// The probes the picture found missing (`said`, kept in `kept`) made and listed.
     pub fn made(mut self, kept: Texture<Rg8>, place: Texture<Rgba32Float>, asks: Texture<Rgba32Float>) {
         label("light made")
-        // (Three passes: a key that lost its slot to another in one makes it in the next.)
+        // (Three passes, each a claim of the empty slots and the making of those won: a key that
+        // lost its slot to another in one makes it in the next.)
+        let g = ((kept.width() + 7) / 8, (kept.height() + 7) / 8, 1)
         for _ in 0..3 {
-            dispatch(probes_made.bind(kept, place, asks, filled_at: self.filled_at.items(), changes: self.changes.items(), table: mut self.table, head: mut self.head, list: mut self.list), groups: ((kept.width() + 7) / 8, (kept.height() + 7) / 8, 1))
+            dispatch(probes_claimed.bind(kept, place, asks, table: self.table.items(), claims: mut self.claims), groups: g)
+            dispatch(probes_made.bind(kept, place, asks, filled_at: self.filled_at.items(), changes: self.changes.items(), claims: self.claims.items(), table: mut self.table, waits: mut self.waits), groups: g)
         }
-        dispatch(probes_owned.bind(kept, place, asks, table: mut self.table), groups: ((kept.width() + 7) / 8, (kept.height() + 7) / 8, 1))
+        dispatch(probes_owned.bind(kept, place, asks, table: mut self.table), groups: g)
+        // (The list made again from the marks, in slot order.)
+        dispatch(probes_counted.bind(waits: self.waits.items(), counts: mut self.list_counts), over: LIST_BLOCKS)
+        dispatch(probes_run.bind(counts: self.list_counts.items(), runs: mut self.list_runs), over: LIST_RUNS)
+        dispatch(probes_summed.bind(runs: self.list_runs.items(), run_at: mut self.run_at, head: mut self.head), over: 1)
+        dispatch(probes_listed.bind(waits: self.waits.items(), counts: self.list_counts.items(), run_at: self.run_at.items(), list: mut self.list), over: LIST_BLOCKS)
         dispatch(probes_pointed.bind(place, asks, list: self.list.items(), head: self.head.items(), table: mut self.table), over: LIST)
     }
 
@@ -813,7 +944,7 @@ impl Store {
         var f = Filling { pass: begin_pass(mut self.rays, clear: vec4(0.0)), kept, sun, table: self.table.items(), list: self.list.items(), head: self.head.items() }
         world.each(kept, kinds, 0, mut f)
         f.pass.end()
-        dispatch(probes_settled.bind(rays: self.rays, list: self.list.items(), head: self.head.items(), sky: sky, changes: self.changes.items(), table: mut self.table, filled_at: mut self.filled_at), over: FILL)
+        dispatch(probes_settled.bind(rays: self.rays, list: self.list.items(), head: self.head.items(), sky: sky, changes: self.changes.items(), table: mut self.table, filled_at: mut self.filled_at, waits: mut self.waits), over: FILL)
         dispatch(probes_advanced.bind(head: mut self.head), over: 1)
     }
 
