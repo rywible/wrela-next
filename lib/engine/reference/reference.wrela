@@ -12,13 +12,16 @@
 // error, and a second picture to calibrate the judges on: the judges hold one half to the other
 // and must find nothing wrong.
 //
-// Besides the looks, once per world: the pixel's middle ray alone (`centred`): where it meets
+// Besides the looks, once per world: the pixel's middle ray alone (its first stage): where it meets
 // matter and which way it faces there, and what the sky behind looks like along it (what the pixel
 // would show if nothing were in front). The judges read coverage from colour with it.
 //
-// Every pass is a band of rows, so no pass holds the GPU long (AGENTS.md, rule 2), and a frame
-// draws at most `PASSES` of them. `work` draws the next ones; a world that changes is begun again
-// (`begin`). It prints "reference: done" when every look is in.
+// Its work is paced (`paced`): each pixel's middle ray and looks are cut into calls of at most
+// `UNITS` steps, its state kept between them, so a dispatch's work is bounded before it is sent
+// whatever the pixel (AGENTS.md, rule 2): a run of `REGION` pixels at a time, in rounds over the
+// pixels still undone (a list made on the GPU), `CHUNK` a dispatch, until a round leaves none. `work` sends the next
+// `DISPATCHES`; a world that changes is begun again (`begin`). It prints its bound once, and
+// "reference: done" when every look is in.
 
 use matter::matter::{Matter, matter}
 use matter::world::World
@@ -28,17 +31,18 @@ use picture::eye::{Eye, View, view}
 use picture::look::{Look, Seen}
 use picture::picture::Picture
 use picture::screen::{cover, luma}
-use reference::traced::{SIMPLE, WHOLE, ends, entered, lit, thickness}
+use reference::paced::{PACED_WORDS, SAID_WORDS, Said, SURFACE_ASKS, UNITS, paced, paced_begun_all, sliced}
+use reference::traced::{SIMPLE, WHOLE}
 use std::field::{Field, hash_u32}
-use std::gpu::{FragCoord, Rgba16Float, Rgba32Float, Targets2, Targets3, Texture, begin_pass, begin_pass2, begin_pass3, draw, label, texture}
+use std::gpu::{AppendBuffer, DispatchArgs, FragCoord, GpuBuffer, append_buffer, Rgba32Float, Targets2, Targets3, Texture, begin_pass, begin_pass2, begin_pass3, buffer, copy, dispatch, draw, label, read, texture}
+use std::io::Pending
 use std::io::print
 
-/// About how many pixels a pass draws (whole rows of the screen: at least one). The stack's
-/// simple light at 1080p took up to 47 ms a pass of 4096 on the Radeon; 2048 halves it.
-pub const BAND_PIXELS: u32 = 2048
-
-/// The most passes of the reference a frame draws.
-pub const PASSES: u32 = 4
+/// How many pixels a run of the screen holds (its state's room), how many a dispatch takes, and
+/// how many dispatches a frame sends at the most.
+pub const REGION: u32 = 65536
+pub const CHUNK: u32 = 128
+pub const DISPATCHES: u32 = 64
 
 /// Point `i` of the Halton sequence in base `base`: from 0 to 1.
 pub fn halton(i: u32, base: u32) -> f32 {
@@ -66,80 +70,12 @@ pub fn jitter(half: u32, i: u32) -> vec2 {
 
 /// The dice of pixel (`x`, `y`) in look `look` (counted over both halves) of a reference whose
 /// dice are `salt`.
-fn dice(x: u32, y: u32, look: u32, salt: u32) -> u32 {
+pub fn dice(x: u32, y: u32, look: u32, salt: u32) -> u32 {
     hash_u32((x + 8192 * y) ^ hash_u32(look.wrapping_mul(2246822519).wrapping_add(salt.wrapping_mul(3266489917))))
-}
-
-/// One look of the reference at a pixel, added to the looks before it (`met_sofar`,
-/// `matter_sofar`; none where `first`): into the first target, the look's colour (toned) and 1 if
-/// its ray met matter; into the second, its colour again only if it met matter (what matter alone
-/// shows, summed), and the square of its brightness (linear luma); into the third, how far along
-/// its ray it met matter, and that squared.
-@fragment
-pub fn looked<M: Field<Substance>, S: Sky, L: Look>(
-    pixel: FragCoord,
-    view: View,
-    m: Matter<M>,
-    sky: S,
-    look: L,
-    salt: u32,
-    index: u32,
-    rays: u32,
-    bounces: u32,
-    light_kind: u32,
-    first: u32,
-    met_sofar: Texture<Rgba32Float>,
-    matter_sofar: Texture<Rgba32Float>,
-    far_sofar: Texture<Rgba32Float>,
-) -> Targets3<vec4, vec4, vec4> {
-    let x = u32(pixel.position.x)
-    let y = u32(pixel.position.y)
-    let a = if first != 0 { vec4(0.0) } else { met_sofar.load(x, y) }
-    let b = if first != 0 { vec4(0.0) } else { matter_sofar.load(x, y) }
-    let f = if first != 0 { vec4(0.0) } else { far_sofar.load(x, y) }
-    let d = view.ray(pixel.position.xy)
-    let span = m.span(view.at, d)
-    var t = -1.0
-    if span.y > max(span.x, 0.0) {
-        t = entered(m, view.at, d, max(span.x, 0.0), ends(m, view.at, d))
-    }
-    if t < 0.0 {
-        let c = look.tone(Seen { light: seen(sky, d) })
-        return Targets3 { first: a + vec4(c, 0.0), second: b, third: f }
-    }
-    let p = view.at + d * t
-    let n = m.facing(p, -d)
-    let s = m.made_of(p)
-    let light = lit(m, sky, p, n, s, -d, dice(x, y, index, salt), rays, bounces, light_kind)
-    let c = look.tone(Seen { light })
-    let l = luma(c)
-    Targets3 { first: a + vec4(c, 1.0), second: b + vec4(c, l * l), third: f + vec4(t, t * t, 0.0, 0.0) }
 }
 
 /// How thick (m) matter is counted at the most: past it, thick.
 pub const THICK: f32 = 0.1
-
-/// The pixel's middle ray alone: into the first target, which way the matter it meets faces and
-/// how far along the ray (0, 0, 0, 0 where it meets none); into the second, the sky along it as
-/// the look shows it, and 1 (2 where the ray ran out of steps: the reference failed there); into
-/// the third, how thick the matter it meets is there (`thickness`; `THICK` at the most).
-@fragment
-pub fn centred<M: Field<Substance>, S: Sky, L: Look>(pixel: FragCoord, view: View, m: Matter<M>, sky: S, look: L) -> Targets3<vec4, vec4, vec4> {
-    let d = view.ray(pixel.position.xy)
-    let behind = vec4(look.tone(Seen { light: seen(sky, d) }), 1.0)
-    let none = vec4(THICK, 0.0, 0.0, 0.0)
-    let span = m.span(view.at, d)
-    if !(span.y > max(span.x, 0.0)) {
-        return Targets3 { first: vec4(0.0), second: behind, third: none }
-    }
-    let t = entered(m, view.at, d, max(span.x, 0.0), ends(m, view.at, d))
-    if t < 0.0 {
-        return Targets3 { first: vec4(0.0), second: vec4(behind.xyz, if t < -1.5 { 2.0 } else { 1.0 }), third: none }
-    }
-    let p = view.at + d * t
-    let n = m.facing(p, -d)
-    Targets3 { first: vec4(n, t), second: behind, third: vec4(thickness(m, p, n, THICK), 0.0, 0.0, 0.0) }
-}
 
 /// The looks summed, as means: which halves (`which`: 0 both, 1 the first, 2 the second), each of
 /// `looks` looks. Into the first target, the mean colour and the share of looks that met matter
@@ -147,33 +83,22 @@ pub fn centred<M: Field<Substance>, S: Sky, L: Look>(pixel: FragCoord, view: Vie
 /// their brightness spreads; into the third, how far along their rays they met it (mean, m) and
 /// how far that spreads (its deviation over its mean).
 @fragment
-pub fn settled(
-    pixel: FragCoord,
-    met_a: Texture<Rgba32Float>,
-    matter_a: Texture<Rgba32Float>,
-    far_a: Texture<Rgba32Float>,
-    met_b: Texture<Rgba32Float>,
-    matter_b: Texture<Rgba32Float>,
-    far_b: Texture<Rgba32Float>,
-    which: u32,
-    looks: f32,
-) -> Targets3<vec4, vec4, vec4> {
-    let x = u32(pixel.position.x)
-    let y = u32(pixel.position.y)
+pub fn settled(pixel: FragCoord, said: [u32], width: u32, which: u32, looks: f32) -> Targets3<vec4, vec4, vec4> {
+    let a = said_at(said, width, u32(pixel.position.x), u32(pixel.position.y))
     var met = vec4(0.0)
     var matter = vec4(0.0)
     var far = vec4(0.0)
     var n = 0.0
     if which != 2 {
-        met += met_a.load(x, y)
-        matter += matter_a.load(x, y)
-        far += far_a.load(x, y)
+        met += a.met0
+        matter += a.matter0
+        far += vec4(a.far.x, a.far.y, 0.0, 0.0)
         n += looks
     }
     if which != 1 {
-        met += met_b.load(x, y)
-        matter += matter_b.load(x, y)
-        far += far_b.load(x, y)
+        met += a.met1
+        matter += a.matter1
+        far += vec4(a.far.z, a.far.w, 0.0, 0.0)
         n += looks
     }
     // How far the looks that met matter spread in brightness (their linear luma's deviation):
@@ -193,31 +118,6 @@ pub fn settled(
 @fragment
 pub fn pictured(pixel: FragCoord, mean: Texture<Rgba32Float>) -> vec4 {
     vec4(mean.load(u32(pixel.position.x), u32(pixel.position.y)).xyz, 1.0)
-}
-
-/// A half of the reference's looks, summed by turns into one of two pairs (a look reads the sums
-/// before it from one pair and writes them with its own into the other).
-pub struct Half {
-    met_even: Texture<Rgba32Float>,
-    matter_even: Texture<Rgba32Float>,
-    met_odd: Texture<Rgba32Float>,
-    matter_odd: Texture<Rgba32Float>,
-    far_even: Texture<Rgba32Float>,
-    far_odd: Texture<Rgba32Float>,
-    /// Looks whole.
-    looks: u32,
-}
-
-fn half(width: u32, height: u32) -> Half {
-    Half {
-        met_even: texture(width: width, height: height),
-        matter_even: texture(width: width, height: height),
-        met_odd: texture(width: width, height: height),
-        matter_odd: texture(width: width, height: height),
-        far_even: texture(width: width, height: height),
-        far_odd: texture(width: width, height: height),
-        looks: 0,
-    }
 }
 
 /// What the reference says of each pixel, as the judges read it.
@@ -247,21 +147,39 @@ pub struct Reference {
     pub rays: u32,
     pub bounces: u32,
     pub salt: u32,
-    first: Half,
-    second: Half,
-    centre: Texture<Rgba32Float>,
-    behind: Texture<Rgba32Float>,
-    thick: Texture<Rgba32Float>,
     /// Its light: `WHOLE` or `SIMPLE` (`traced`).
     pub light: u32,
-    /// Bands of the middle rays drawn, of looks' bands drawn (the current look's).
-    centred: u32,
-    band: u32,
-    passes: u32,
+    /// What each pixel of the screen says (`Said`, as words), once its run is done.
+    said: GpuBuffer<u32>,
+    /// The run under way: each pixel's state and what it has found, as words where the pixel is;
+    /// the pixels still undone, listed by turns in one and the other; each round's slices' group
+    /// counts; and each round's count asked back.
+    state: GpuBuffer<u32>,
+    found: GpuBuffer<u32>,
+    undone0: AppendBuffer<u32>,
+    undone1: AppendBuffer<u32>,
+    args: GpuBuffer<DispatchArgs>,
+    reads: Vec<Pending<u32>>,
+    /// The run's first pixel; whether begun; the list being read; the rounds sent and asked back;
+    /// the most pixels the next round can list (the last count back: counts only fall); the round
+    /// under way's slices and those sent; the first round known to leave nothing undone (`NONE`).
+    run: u32,
+    begun: bool,
+    cur: u32,
+    rounds: u32,
+    asked: u32,
+    most: u32,
+    slices: u32,
+    slice: u32,
+    finished: u32,
+    dispatches: u32,
     width: u32,
     height: u32,
-    said: bool,
+    said_bound: bool,
+    said_done: bool,
 }
+
+const NONE: u32 = 4294967295
 
 pub fn reference(looks: u32, rays: u32, bounces: u32, salt: u32 = 0, light: u32 = WHOLE) -> Reference {
     if looks % 2 != 0 || looks == 0 {
@@ -272,186 +190,187 @@ pub fn reference(looks: u32, rays: u32, bounces: u32, salt: u32 = 0, light: u32 
         rays,
         bounces,
         salt,
-        first: half(width: 1, height: 1),
-        second: half(width: 1, height: 1),
-        centre: texture(width: 1, height: 1),
-        behind: texture(width: 1, height: 1),
-        thick: texture(width: 1, height: 1),
         light,
-        centred: 0,
-        band: 0,
-        passes: 0,
+        said: buffer(1),
+        state: buffer(1),
+        found: buffer(1),
+        undone0: append_buffer(1),
+        undone1: append_buffer(1),
+        args: buffer(1),
+        reads: Vec::new(),
+        run: 0,
+        begun: false,
+        cur: 0,
+        rounds: 0,
+        asked: 0,
+        most: 0,
+        slices: 0,
+        slice: 0,
+        finished: NONE,
+        dispatches: 0,
         width: 1,
         height: 1,
-        said: false,
-    }
-}
-
-/// One band of a look of `h` (look number `index` over both halves), its rows from `y`.
-fn band_of<M: Field<Substance>, S: Sky, L: Look>(
-    h: mut Half,
-    v: View,
-    m: Matter<M>,
-    sky: S,
-    look: L,
-    salt: u32,
-    index: u32,
-    rays: u32,
-    bounces: u32,
-    light_kind: u32,
-    y: u32,
-    rows: u32,
-    width: u32,
-) {
-    let first: u32 = if h.looks == 0 { 1 } else { 0 }
-    if h.looks % 2 == 0 {
-        let p = begin_pass3(mut h.met_even, mut h.matter_even, mut h.far_even, keep: true)
-        p.scissor(0, y, width, rows)
-        draw(
-            p,
-            cover,
-            looked.bind(
-                view: v,
-                m: m,
-                sky: sky,
-                look: look,
-                salt: salt,
-                index: index,
-                rays: rays,
-                bounces: bounces,
-                light_kind: light_kind,
-                first: first,
-                met_sofar: h.met_odd,
-                matter_sofar: h.matter_odd,
-                far_sofar: h.far_odd,
-            ),
-            vertices: 3,
-        )
-        p.end()
-    } else {
-        let p = begin_pass3(mut h.met_odd, mut h.matter_odd, mut h.far_odd, keep: true)
-        p.scissor(0, y, width, rows)
-        draw(
-            p,
-            cover,
-            looked.bind(
-                view: v,
-                m: m,
-                sky: sky,
-                look: look,
-                salt: salt,
-                index: index,
-                rays: rays,
-                bounces: bounces,
-                light_kind: light_kind,
-                first: first,
-                met_sofar: h.met_even,
-                matter_sofar: h.matter_even,
-                far_sofar: h.far_even,
-            ),
-            vertices: 3,
-        )
-        p.end()
+        said_bound: false,
+        said_done: false,
     }
 }
 
 impl Reference {
-    /// How many bands of rows the screen is cut into.
-    fn bands(self) -> u32 {
-        (self.height + self.rows() - 1) / self.rows()
-    }
-
-    /// Rows of the screen a pass draws.
-    fn rows(self) -> u32 {
-        max(BAND_PIXELS / self.width, 1)
-    }
-
     /// Whether every look is in.
     pub fn done(self) -> bool {
-        self.first.looks + self.second.looks >= 2 * self.looks
+        self.run >= self.width * self.height
     }
 
-    /// Looks whole, both halves.
-    pub fn looked(self) -> u32 {
-        self.first.looks + self.second.looks
-    }
-
-    /// The passes drawn since the world was begun.
+    /// The dispatches sent since the world was begun.
     pub fn passes(self) -> u32 {
-        self.passes
+        self.dispatches
     }
 
-    /// Begins again, for a world that has changed: every look and middle ray to draw again.
+    /// Begins again, for a world that has changed: every pixel to draw again.
     pub fn begin(mut self) {
-        self.first.looks = 0
-        self.second.looks = 0
-        self.centred = 0
-        self.band = 0
-        self.passes = 0
-        self.said = false
+        self.run = 0
+        self.ran()
+        self.dispatches = 0
+        self.said_done = false
     }
 
-    /// Its targets `width` × `height` (begun again if they weren't).
+    /// The run under way begun again from nothing (the next run's, or the first's).
+    fn ran(mut self) {
+        self.begun = false
+        self.cur = 0
+        self.rounds = 0
+        self.asked = 0
+        self.most = 0
+        self.slices = 0
+        self.slice = 0
+        self.finished = NONE
+        self.reads = Vec::new()
+    }
+
+    /// Its buffers for a `width` × `height` screen (begun again if they weren't).
     fn sized(mut self, width: u32, height: u32) {
         if self.width == width && self.height == height {
             return
         }
         self.width = width
         self.height = height
-        self.first = half(width: width, height: height)
-        self.second = half(width: width, height: height)
-        self.centre = texture(width: width, height: height)
-        self.behind = texture(width: width, height: height)
-        self.thick = texture(width: width, height: height)
+        self.said = buffer(width * height * SAID_WORDS)
+        self.state = buffer(REGION * PACED_WORDS)
+        self.found = buffer(REGION * SAID_WORDS)
+        self.undone0 = append_buffer(REGION)
+        self.undone1 = append_buffer(REGION)
+        self.args = buffer((REGION + CHUNK - 1) / CHUNK)
         self.begin()
     }
 
-    /// Up to `PASSES` more bands of `m` under `sky`, seen in `look` through `eye` on a `width` ×
-    /// `height` screen: the middle rays first, then the looks, the halves by turns.
+    /// Up to `DISPATCHES` more dispatches of the reference of `world` under `sky`, seen in `look`
+    /// through `eye` on a `width` × `height` screen: the run under way begun, or its next round (its
+    /// list of pixels still undone, `CHUNK` at a time, as many slices as the last count back can
+    /// need, each booked as its most); a run whose round left none undone is said into the screen's,
+    /// and the next begun.
     pub fn work<W: World, S: Sky, L: Look>(mut self, world: W, sky: S, look: L, eye: Eye, width: u32, height: u32) {
         let m = matter(world.field())
         self.sized(width, height)
         let middle = view(eye, width, height)
-        let bands = self.bands()
-        let rows_a_band = self.rows()
-        var drawn: u32 = 0
+        if !self.said_bound {
+            self.said_bound = true
+            print(f"reference: a dispatch is at most {CHUNK} pixels of {UNITS} steps, each at most {SURFACE_ASKS} asks of matter ({world.count()} things an ask): a lane at most {UNITS * SURFACE_ASKS} asks; a frame at most {DISPATCHES} dispatches")
+        }
         label("reference")
-        while drawn < PASSES && !self.done() {
-            drawn += 1
-            self.passes += 1
-            if self.centred < bands {
-                let y = self.centred * rows_a_band
-                let p = begin_pass3(mut self.centre, mut self.behind, mut self.thick, keep: true)
-                p.scissor(0, y, width, min(rows_a_band, height - y))
-                draw(p, cover, centred.bind(view: middle, m: m, sky: sky, look: look), vertices: 3)
-                p.end()
-                self.centred += 1
+        var sent: u32 = 0
+        while sent < DISPATCHES && !self.done() {
+            self.heard()
+            let n = min(REGION, width * height - self.run)
+            if self.finished != NONE {
+                // The run is done (a round left none undone; rounds sent after it are empty): what
+                // it found into the screen's, and the next run begun.
+                copy(from: self.found.span(0, n * SAID_WORDS), to: self.said.span_mut(self.run * SAID_WORDS, n * SAID_WORDS))
+                self.run += n
+                self.ran()
                 continue
             }
-            let index = self.first.looks + self.second.looks
-            let which = index % 2
-            let y = self.band * rows_a_band
-            let rows = min(rows_a_band, height - y)
-            if which == 0 {
-                let v = middle.moved(jitter(0, self.first.looks))
-                band_of(mut self.first, v, m, sky, look, self.salt, index, self.rays, self.bounces, self.light, y, rows, width)
-            } else {
-                let v = middle.moved(jitter(1, self.second.looks))
-                band_of(mut self.second, v, m, sky, look, self.salt, index, self.rays, self.bounces, self.light, y, rows, width)
+            if !self.begun {
+                self.undone0.clear()
+                dispatch(paced_begun_all.bind(n: n, state: mut self.state, found: mut self.found, undone: mut self.undone0), over: n)
+                self.begun = true
+                self.most = n
+                sent += 1
+                self.dispatches += 1
+                continue
             }
-            self.band += 1
-            if self.band == bands {
-                self.band = 0
-                if which == 0 {
-                    self.first.looks += 1
+            if self.slice == 0 {
+                // A round begun: as many slices as the last count back can need.
+                self.slices = (self.most + CHUNK - 1) / CHUNK
+                if self.slices == 0 {
+                    // (Nothing can be left: the count that said so ends the run once heard.)
+                    return
+                }
+                if self.cur == 0 {
+                    self.undone1.clear()
+                    dispatch(sliced.bind(count: self.undone0.count(), chunk: CHUNK, slices: self.slices, args: mut self.args), over: self.slices)
                 } else {
-                    self.second.looks += 1
+                    self.undone0.clear()
+                    dispatch(sliced.bind(count: self.undone1.count(), chunk: CHUNK, slices: self.slices, args: mut self.args), over: self.slices)
                 }
             }
+            let k = self.slice
+            if self.cur == 0 {
+                dispatch(paced.bind(m: m, sky: sky, look: look, view: middle, salt: self.salt, looks: self.looks, rays: self.rays, bounces: self.bounces, light: self.light, first: self.run, width: width, undone: self.undone0.items(), count: self.undone0.count(), k: k, chunk: CHUNK, state: mut self.state, found: mut self.found, still: mut self.undone1), groups: self.args.at(k), most: CHUNK / 64)
+            } else {
+                dispatch(paced.bind(m: m, sky: sky, look: look, view: middle, salt: self.salt, looks: self.looks, rays: self.rays, bounces: self.bounces, light: self.light, first: self.run, width: width, undone: self.undone1.items(), count: self.undone1.count(), k: k, chunk: CHUNK, state: mut self.state, found: mut self.found, still: mut self.undone0), groups: self.args.at(k), most: CHUNK / 64)
+            }
+            sent += 1
+            self.dispatches += 1
+            self.slice += 1
+            if self.slice == self.slices {
+                // The round is sent: the count it leaves asked back.
+                if self.cur == 0 {
+                    self.reads.push(read(self.undone1.count().sub(0, 1)))
+                } else {
+                    self.reads.push(read(self.undone0.count().sub(0, 1)))
+                }
+                self.cur = 1 - self.cur
+                self.rounds += 1
+                self.slice = 0
+            }
         }
-        if self.done() && !self.said {
-            self.said = true
-            print(f"reference: done: {2 * self.looks} looks of {self.rays} rays and {self.bounces} bounces ({lit_by(self.light)}) at {width}x{height}, in {self.passes} passes")
+        if self.done() && !self.said_done {
+            self.said_done = true
+            print(f"reference: done: {2 * self.looks} looks of {self.rays} rays and {self.bounces} bounces ({lit_by(self.light)}) at {width}x{height}, in {self.dispatches} dispatches")
+        }
+    }
+
+    /// The rounds' counts back so far, in order: each bounds the rounds after it, and the first
+    /// that leaves nothing undone ends the run.
+    fn heard(mut self) {
+        while self.reads.len() > 0 && self.finished == NONE {
+            var got = false
+            var left: u32 = 0
+            var failed = false
+            match mut self.reads[0] {
+                r => match r.poll() {
+                    Some(Ok(v)) => {
+                        got = true
+                        left = v[0]
+                    },
+                    Some(Err(_)) => {
+                        failed = true
+                    },
+                    None => {},
+                },
+            }
+            if !got && !failed {
+                return
+            }
+            let _ = self.reads.remove(0)
+            // (A count that could not be read bounds nothing: the next says.)
+            if got {
+                self.most = min(self.most, left)
+                if left == 0 {
+                    self.finished = self.asked
+                }
+            }
+            self.asked += 1
         }
     }
 
@@ -470,30 +389,12 @@ impl Reference {
             truth.thick = texture(width: self.width, height: self.height)
         }
         label("reference settled")
-        // (Each half's looks are even, so the last of them wrote its odd pair.)
         let p = begin_pass3(mut truth.mean, mut truth.matter, mut truth.far)
-        draw(
-            p,
-            cover,
-            settled.bind(
-                met_a: self.first.met_odd,
-                matter_a: self.first.matter_odd,
-                far_a: self.first.far_odd,
-                met_b: self.second.met_odd,
-                matter_b: self.second.matter_odd,
-                far_b: self.second.far_odd,
-                which: which,
-                looks: f32(self.looks),
-            ),
-            vertices: 3,
-        )
+        draw(p, cover, settled.bind(said: self.said.items(), width: self.width, which: which, looks: f32(self.looks)), vertices: 3)
         p.end()
-        let q = begin_pass2(mut truth.centre, mut truth.behind)
-        draw(q, cover, copied2.bind(a: self.centre, b: self.behind), vertices: 3)
+        let q = begin_pass3(mut truth.centre, mut truth.behind, mut truth.thick)
+        draw(q, cover, middles.bind(said: self.said.items(), width: self.width), vertices: 3)
         q.end()
-        let r = begin_pass(mut truth.thick)
-        draw(r, cover, copied.bind(a: self.thick), vertices: 3)
-        r.end()
         truth.looks = if which == 0 { 2 * self.looks } else { self.looks }
     }
 
@@ -514,6 +415,29 @@ impl Reference {
         q.end()
         out.placed = true
     }
+}
+
+/// What pixel (`x`, `y`) of a screen `width` wide says, from its words.
+fn said_at(said: [u32], width: u32, x: u32, y: u32) -> Said {
+    let b = (x + width * y) * SAID_WORDS
+    Said {
+        centre: vec4(bitcast_f32(said[b]), bitcast_f32(said[b + 1]), bitcast_f32(said[b + 2]), bitcast_f32(said[b + 3])),
+        behind: vec4(bitcast_f32(said[b + 4]), bitcast_f32(said[b + 5]), bitcast_f32(said[b + 6]), bitcast_f32(said[b + 7])),
+        thick: vec4(bitcast_f32(said[b + 8]), bitcast_f32(said[b + 9]), bitcast_f32(said[b + 10]), bitcast_f32(said[b + 11])),
+        met0: vec4(bitcast_f32(said[b + 12]), bitcast_f32(said[b + 13]), bitcast_f32(said[b + 14]), bitcast_f32(said[b + 15])),
+        matter0: vec4(bitcast_f32(said[b + 16]), bitcast_f32(said[b + 17]), bitcast_f32(said[b + 18]), bitcast_f32(said[b + 19])),
+        met1: vec4(bitcast_f32(said[b + 20]), bitcast_f32(said[b + 21]), bitcast_f32(said[b + 22]), bitcast_f32(said[b + 23])),
+        matter1: vec4(bitcast_f32(said[b + 24]), bitcast_f32(said[b + 25]), bitcast_f32(said[b + 26]), bitcast_f32(said[b + 27])),
+        far: vec4(bitcast_f32(said[b + 28]), bitcast_f32(said[b + 29]), bitcast_f32(said[b + 30]), bitcast_f32(said[b + 31])),
+    }
+}
+
+/// Each pixel's middle ray, as the judges read it: its facing and how far, the sky behind it, and
+/// its thickness.
+@fragment
+pub fn middles(pixel: FragCoord, said: [u32], width: u32) -> Targets3<vec4, vec4, vec4> {
+    let a = said_at(said, width, u32(pixel.position.x), u32(pixel.position.y))
+    Targets3 { first: a.centre, second: a.behind, third: a.thick }
 }
 
 /// Which light, said.
@@ -540,10 +464,3 @@ pub fn copied(pixel: FragCoord, a: Texture<Rgba32Float>) -> vec4 {
     a.load(u32(pixel.position.x), u32(pixel.position.y))
 }
 
-/// Two textures copied.
-@fragment
-pub fn copied2(pixel: FragCoord, a: Texture<Rgba32Float>, b: Texture<Rgba32Float>) -> Targets2<vec4, vec4> {
-    let x = u32(pixel.position.x)
-    let y = u32(pixel.position.y)
-    Targets2 { first: a.load(x, y), second: b.load(x, y) }
-}
