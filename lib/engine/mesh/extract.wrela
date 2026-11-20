@@ -11,7 +11,7 @@
 use matter::substance::Substance
 use std::collections::Vec
 use std::derive::Box3
-use std::field::Field
+use std::field::{ALL_LIVE, Field, Live}
 use std::gpu::{
     Append, AppendBuffer, Atomics, DispatchArgs, DrawIndexedArgs, GlobalId, GpuBuffer, GpuSpan,
     One, Slots, append_buffer, buffer, buffer_of, dispatch, label, write,
@@ -41,6 +41,12 @@ pub struct MeshVertex: Copy + GpuData {
     pub normal: vec4,
     pub albedo: vec4,
     pub emits: vec4,
+}
+
+/// One active surface brick: `(bx, by, bz, thing_idx)` plus the bitmask of parts live inside it.
+pub struct ActiveBrick: Copy + GpuData {
+    pub coord: vec4u,
+    pub live: Live,
 }
 
 /// Grid layout for one thing inside a `MeshBatch`.
@@ -153,8 +159,8 @@ fn owner_of(grids: [GridSpec], n: u32, gb: u32) -> u32 {
     lo
 }
 
-/// Pass 0: Interval-culls candidate bricks across all things in a batch, appending only bricks whose
-/// distance interval straddles 0.
+/// Pass 0: Interval-culls candidate bricks across all things in a batch, computing both the
+/// Lipschitz-narrowed distance range and the per-brick live part mask in one pass.
 @compute(64)
 fn cull_bricks<M: Field<Substance>>(
     fields: [M],
@@ -162,7 +168,7 @@ fn cull_bricks<M: Field<Substance>>(
     things: u32,
     first_brick: u32,
     total_bricks: u32,
-    active: mut Append<vec4u>,
+    active: mut Append<ActiveBrick>,
     id: GlobalId,
 ) {
     let gb = first_brick + id.x
@@ -181,9 +187,9 @@ fn cull_bricks<M: Field<Substance>>(
     let lo = g.origin + vec3(f32(bx), f32(by), f32(bz)) * bspan
     // Cover the full 8×8×8 corner box (7 cells wide = BRICK + 1) so halo sign changes aren't missed.
     let hi = lo + vec3(g.cell * f32(BRICK + 1))
-    let iv = fields[ti].interval(Box3 { lo, hi })
-    if iv.lo <= 0.0 && iv.hi >= 0.0 {
-        let _ = active.push(vec4u(bx, by, bz, ti))
+    let pr = fields[ti].pruned(Box3 { lo, hi }, |q: vec3| q, 1.0, ALL_LIVE, 0)
+    if pr.range.lo <= 0.0 && pr.range.hi >= 0.0 {
+        let _ = active.push(ActiveBrick { coord: vec4u(bx, by, bz, ti), live: pr.live })
     }
 }
 
@@ -206,12 +212,13 @@ fn prep_chunk(
     quad_args.set(id, DispatchArgs { x: n * 4, y: 1, z: 1 })
 }
 
-/// Pass 1: Evaluates `field.distance` at all 512 (`8×8×8`) corners of each active brick in a chunk.
+/// Pass 1: Evaluates `field.distance_live` at all 512 (`8×8×8`) corners of each active brick in a
+/// chunk, skipping every part pruned out of the brick by `cull_bricks`.
 @compute(64)
 fn eval_corners<M: Field<Substance>>(
     fields: [M],
     grids: [GridSpec],
-    active: [vec4u],
+    active: [ActiveBrick],
     active_count: [u32],
     cap_bricks: u32,
     chunk_start: u32,
@@ -225,14 +232,15 @@ fn eval_corners<M: Field<Substance>>(
         return
     }
     let ci = id.x - brick_in_chunk * CORNERS_BRICK
-    let b = active[bi]
+    let ab = active[bi]
+    let b = ab.coord
     let g = grids[b.w]
     let cx = ci & 7
     let cy = (ci >> 3) & 7
     let cz = ci >> 6
     let bspan = g.cell * f32(BRICK)
     let p = g.origin + vec3(f32(b.x), f32(b.y), f32(b.z)) * bspan + vec3(f32(cx), f32(cy), f32(cz)) * g.cell
-    corners[id] = fields[b.w].distance(p)
+    corners[id] = fields[b.w].distance_live(p, ab.live)
 }
 
 /// Corner distance inside a brick at `(x, y, z)` in `0..8`.
@@ -290,7 +298,7 @@ fn corner_val(
 fn extract_verts<M: Field<Substance>>(
     fields: [M],
     grids: [GridSpec],
-    active: [vec4u],
+    active: [ActiveBrick],
     active_count: [u32],
     cap_bricks: u32,
     cap_verts: u32,
@@ -335,7 +343,8 @@ fn extract_verts<M: Field<Substance>>(
         return
     }
 
-    let b = active[bi]
+    let ab = active[bi]
+    let b = ab.coord
     let g = grids[b.w]
     let h = g.cell
     let bspan = h * f32(BRICK)
@@ -587,7 +596,7 @@ fn finish_draw(tri_count: [u32], cap_indices: u32, args: mut One<DrawIndexedArgs
 
 /// GPU-extracted triangle mesh for one field or a batch of fields of the same type.
 pub struct MeshBatch {
-    pub active: AppendBuffer<vec4u>,
+    pub active: AppendBuffer<ActiveBrick>,
     pub corners: GpuBuffer<f32>,
     pub cell_verts: GpuBuffer<u32>,
     pub verts: AppendBuffer<MeshVertex>,
@@ -604,6 +613,8 @@ pub struct MeshBatch {
     pub cell: f32,
     pub built: bool,
     pub bound: vec4,
+    /// Per-thing temporal tier assignment for multi-tier `Many` batches (0 = near/60Hz, 1 = far even, 2 = far odd).
+    pub tiers: Vec<u32>,
 }
 
 /// Allocates a `MeshBatch` sized for up to `max_bricks` active surface bricks.
@@ -629,6 +640,7 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
         cell: 0.0,
         built: false,
         bound: vec4(0.0),
+        tiers: Vec::new(),
     }
 }
 
@@ -659,17 +671,17 @@ impl MeshBatch {
     /// each thing using its own view-adapted cell spacing `cells[i]` (0.0 skips a thing completely).
     pub fn sync_many<M: Field<Substance> + StateHash + GpuData, const N: u32>(mut self, fields: [M; N], cells: [f32; N]) {
         var h = Hasher::new()
-        for i in 0..N {
-            fields[i].state_hash(mut h)
-        }
-        let key = h.finish()
         var first_cell = 0.0
         for i in 0..N {
             if cells[i] > 0.0 {
-                first_cell = cells[i]
-                break
+                i.state_hash(mut h)
+                fields[i].state_hash(mut h)
+                if first_cell == 0.0 {
+                    first_cell = cells[i]
+                }
             }
         }
+        let key = h.finish()
         if self.built && self.hash == key && abs(self.cell - first_cell) <= 0.05 * max(self.cell, 1.0e-4) {
             return
         }
