@@ -52,22 +52,19 @@ use std::collections::Vec
 use std::gpu::{
     Address, Atomics, Blend, ClipPosition, Cull, DepthPass, DepthPass5, DepthPass6, DepthTexture, FragCoord, GlobalId, GpuBuffer, GpuSpan, Pass, R8, R16Float, R32Float,
     Rg8, Rgba16Float, Rgba32Float, Sampler, Slots, Targets5, Targets6, Texels, Texture, VertexIndex, InstanceIndex, Flat, WithDepth, WithDepthBehind, buffer_of, device_epoch, read, begin_pass, begin_pass_with_depth,
-    begin_pass5_with_depth, begin_pass6_with_depth, begin_screen_pass, begin_depth_pass, buffer, depth_texture, discard, dispatch, draw, label, sampler, texture, timed,
+    begin_pass5_with_depth, begin_pass6_with_depth, begin_screen_pass, begin_depth_pass, buffer, depth_texture, discard, dispatch, draw, label, sampler, texture,
     writable_texture,
 }
 use std::io::{Pending, print}
 
-/// The picture is drawn in passes, each a band of the screen's rows, as many as keep a pass near
-/// `BAND_US` by the last times of the banded passes (the eye draws, the shadow draws, and
-/// the edge pass's two; timed together, the dearest sizing them all: with many things the
-/// shadows, a draw a thing over the screen, outweigh the eye draws; no pass may hold the GPU long:
-/// AGENTS.md; the timing only cuts the work in parts, it never changes what is drawn): at first `FIRST_BANDS` (the stack
-/// asked by its field took 58 ms a quarter of the screen at 1080p on the M4), and between
-/// `LEAST_BANDS` and `MOST_BANDS`.
-const BAND_US: f32 = 10000.0
-const FIRST_BANDS: u32 = 32
-const LEAST_BANDS: u32 = 1
-const MOST_BANDS: u32 = 128
+/// The picture is drawn in passes, each a band of at most `BAND_ROWS` of the screen's rows (the
+/// eye draws, the shadow draws, and the edge pass's two; the bands never change what is drawn, and
+/// a pass heavier than the line is the guard's to cut at its draws). Chosen from the screen, not
+/// from the passes' times: a count taken from the GPU's clock changed what was sent run to run
+/// (timed at 1080p, SCENE 3 flipped between 1 and 2 bands within a run; every scene settled at 1-2,
+/// the stack at 2-3). A second band costs SCENE 0 0.9 ms at 1080p, so a band is a whole 1080p
+/// screen, and the guard cuts what is heavier.
+const BAND_ROWS: u32 = 1080
 
 /// An edge pixel's rays a side; how far apart two neighbours' surfaces are, as a share of the
 /// nearer's distance, to be two surfaces; and the least cosine between two neighbours' facings for
@@ -1555,16 +1552,6 @@ pub struct Sight {
     /// An instrument: the picture shows each pixel's steps instead of its colour (1), or its edge
     /// pixels red (2).
     pub steps: u32,
-    /// How many bands the picture is drawn in (`BAND_US`), the banded passes' times asked for
-    /// (the eye draws, the shadows, the edge rays, the edge shadows: all four at once), each one's
-    /// last time (us), and which have been answered.
-    bands: u32,
-    sizing_picture: Option<Pending<f32>>,
-    sizing_shadows: Option<Pending<f32>>,
-    sizing_rays: Option<Pending<f32>>,
-    sizing_edge: Option<Pending<f32>>,
-    spent: [f32; 4],
-    answered: u32,
     /// The GPU device's epoch when it was made (`std::gpu::device_epoch`): when the device is lost
     /// and made again, everything it held is zeroed, and it is made again from nothing.
     epoch: u32,
@@ -1626,13 +1613,6 @@ pub fn sight() -> Sight {
         held_whole: 0,
         said: false,
         steps: 0,
-        bands: FIRST_BANDS,
-        sizing_picture: None,
-        sizing_shadows: None,
-        sizing_rays: None,
-        sizing_edge: None,
-        spent: [0.0; 4],
-        answered: 0,
         epoch: device_epoch(),
     }
 }
@@ -1674,11 +1654,6 @@ impl Sight {
         s.held_whole = self.held_whole
         s.light.off = self.light.off
         s.light.checking = self.light.checking
-        // (And the bands its passes were cut into, from their times: the same GPU's costs, and
-        // the bands never change what is drawn.)
-        s.bands = self.bands
-        s.spent = self.spent
-        s.answered = self.answered
         print(f"picture: the device was lost (epoch {self.epoch} -> {s.epoch}): made again from nothing")
         self = take s
     }
@@ -1709,14 +1684,6 @@ impl Sight {
         (used, room)
     }
 
-    /// The picture's bands sized for the banded passes' last times (`spent`): the dearest.
-    fn banded(mut self) {
-        var us = 0.0
-        for i in 0..4 {
-            us = max(us, self.spent[i])
-        }
-        self.bands = u32(clamp(ceil(us / BAND_US), f32(LEAST_BANDS), f32(MOST_BANDS)))
-    }
 
     /// `world` under `sky` in `look` through `eye`, on a `width` × `height` screen: its cells
     /// brought up to date, every pixel drawn into `drawn`, and shown. Until every thing's cells
@@ -1955,64 +1922,6 @@ impl Sight {
             self.ids_edge = texture(width: width, height: height)
             self.edge_asks = texture(width: width, height: height)
         }
-        // (The four banded passes timed together, each asked again once answered; bands from the
-        // dearest once all four have answered: till then `FIRST_BANDS`, at most the frames a
-        // readback takes.)
-        match mut self.sizing_picture {
-            Some(p) => match p.poll() {
-                Some(Ok(us)) => {
-                    self.spent[0] = us[0]
-                    self.answered = self.answered | 1
-                    self.sizing_picture = None
-                },
-                _ => {},
-            },
-            None => {
-                self.sizing_picture = Some(timed("picture"))
-            },
-        }
-        match mut self.sizing_shadows {
-            Some(p) => match p.poll() {
-                Some(Ok(us)) => {
-                    self.spent[1] = us[0]
-                    self.answered = self.answered | 2
-                    self.sizing_shadows = None
-                },
-                _ => {},
-            },
-            None => {
-                self.sizing_shadows = Some(timed("shadows"))
-            },
-        }
-        match mut self.sizing_rays {
-            Some(p) => match p.poll() {
-                Some(Ok(us)) => {
-                    self.spent[2] = us[0]
-                    self.answered = self.answered | 4
-                    self.sizing_rays = None
-                },
-                _ => {},
-            },
-            None => {
-                self.sizing_rays = Some(timed("edge rays"))
-            },
-        }
-        match mut self.sizing_edge {
-            Some(p) => match p.poll() {
-                Some(Ok(us)) => {
-                    self.spent[3] = us[0]
-                    self.answered = self.answered | 8
-                    self.sizing_edge = None
-                },
-                _ => {},
-            },
-            None => {
-                self.sizing_edge = Some(timed("edge shadows"))
-            },
-        }
-        if self.answered == 15 {
-            self.banded()
-        }
         self.light.kept_for(self.kept, sky.sun().way)
         // (Its kinds' values for the GPU, and moving things' parts as cones, before any pass.)
         let kinds = world.kinds(self.kept, 0)
@@ -2067,7 +1976,7 @@ impl Sight {
         label("sky table")
         dispatch(skylit.bind(sky: sky, out: mut self.table), groups: ((TABLE + 7) / 8, (TABLE + 7) / 8, 1))
         dispatch(skyward.bind(sky: sky, out: mut self.radiance), groups: ((RADIANCE + 7) / 8, (RADIANCE + 7) / 8, 1))
-        let bands = self.bands
+        let bands = (height + BAND_ROWS - 1) / BAND_ROWS
         // The picture: each thing's eye draw, each thing's shadow draw, the shade.
         let screen = Lay { edges: 0, width, spare: 0, spare2: 0 }
         self.lit_by(world, kinds, sky, look, v, screen, bands, width, height, edge: false)
