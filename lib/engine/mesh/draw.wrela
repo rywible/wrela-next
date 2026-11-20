@@ -3,9 +3,9 @@
 //
 // Every thing in a `MeshWorld` (`One`, `Many`, `And`) extracts its sparse Dual Contouring meshlets
 // into a `MeshBatch` (0 ms/frame once built for still things), renders into one unified sun shadow
-// map, and rasterizes into a reversed-Z supersampled target (`ssaa` = 1 or 2) with automatic
-// crease-preserving shading normals, then resolves to `Picture` for display or judging against
-// `engine::reference`.
+// map, and rasterizes into a 4× hardware MSAA reversed-Z target (tile-memoryless on Metal, dynamic
+// resolve on Vulkan) with automatic crease-preserving shading normals, resolving directly to
+// `Picture` for display or judging against `engine::reference`.
 
 use matter::sky::{Sky, seen}
 use matter::substance::{ONE_OVER_PI, Substance}
@@ -15,14 +15,15 @@ use picture::eye::{Eye, View, view}
 use picture::look::{Look, Seen}
 use picture::picture::{Picture, picture}
 use picture::pixels::{TABLE, octa, skylit}
-use picture::screen::{cover, show}
+use picture::screen::show
 use std::collections::Vec
 use std::field::Field
 use std::gpu::{
     Address, ClipPosition, Compare, ComparisonSampler, Cull, Depth, DepthBias, DepthOnlyPass,
-    DepthPass3, DepthTexture, Filter, FragCoord, R8, Rgba16Float, Rgba32Float, Sampler, Targets3,
-    Texture, VertexIndex, begin_depth_pass, begin_pass3, begin_pass3_with_depth,
-    comparison_sampler, depth_texture, dispatch, draw, label, sampler, texture, writable_texture,
+    DepthTexture, Filter, FragCoord, MsaaDepthPass, MsaaDepthPass3, R8, Rgba16Float, Rgba32Float,
+    Sampler, Targets3, Texture, VertexIndex, begin_depth_pass, begin_pass3_msaa_with_depth,
+    begin_pass_msaa_with_depth, comparison_sampler, depth_texture, dispatch, draw, label, sampler,
+    writable_texture,
 }
 use std::hash::StateHash
 
@@ -153,10 +154,9 @@ fn sun_shadow(
     sum * 0.25
 }
 
-/// Fragment shader for the unified eye pass: crease-preserving normals, unified sun shadow,
-/// open-sky irradiance, and `Look::tone`, writing `(colour, place, sun)` in one pass.
-@fragment
-fn mesh_fs<S: Sky, L: Look>(
+/// Shared shading computation for both the gameplay colour-only pass and the judge pass:
+/// crease-preserving normals, unified sun shadow, open-sky irradiance, and `Look::tone`.
+fn shade_mesh<S: Sky, L: Look>(
     vary: MeshVary,
     v: View,
     sv: ShadowView,
@@ -166,7 +166,7 @@ fn mesh_fs<S: Sky, L: Look>(
     s: Sampler,
     shadow_map: DepthTexture,
     cmp: ComparisonSampler,
-) -> Targets3<vec4, vec4, f32> {
+) -> (vec4, vec4, f32) {
     let to_eye = v.at - vary.wp
     let dist = length(to_eye)
     let ray_back = if dist > 1.0e-6 { to_eye / dist } else { -v.forward }
@@ -194,11 +194,40 @@ fn mesh_fs<S: Sky, L: Look>(
     let amb = sky_irradiance(table, s, n)
     let rad = vary.emits + vary.albedo * ONE_OVER_PI * (direct + amb)
     let toned = look.tone(Seen { light: rad })
-    Targets3 {
-        first: vec4(toned, 1.0),
-        second: vec4(n, dist),
-        third: vis,
-    }
+    (vec4(toned, 1.0), vec4(n, dist), vis)
+}
+
+/// Colour-only fragment shader for the 4× MSAA eye pass (normal drawing: 12 B/sample total).
+@fragment
+fn mesh_fs<S: Sky, L: Look>(
+    vary: MeshVary,
+    v: View,
+    sv: ShadowView,
+    sky: S,
+    look: L,
+    table: Texture<Rgba16Float>,
+    s: Sampler,
+    shadow_map: DepthTexture,
+    cmp: ComparisonSampler,
+) -> vec4 {
+    shade_mesh(vary, v, sv, sky, look, table, s, shadow_map, cmp).0
+}
+
+/// Multi-target fragment shader for `drawn_only` (writes `(colour, place, sun)` for `Judge`).
+@fragment
+fn mesh_judge_fs<S: Sky, L: Look>(
+    vary: MeshVary,
+    v: View,
+    sv: ShadowView,
+    sky: S,
+    look: L,
+    table: Texture<Rgba16Float>,
+    s: Sampler,
+    shadow_map: DepthTexture,
+    cmp: ComparisonSampler,
+) -> Targets3<vec4, vec4, f32> {
+    let out = shade_mesh(vary, v, sv, sky, look, table, s, shadow_map, cmp)
+    Targets3 { first: out.0, second: out.1, third: out.2 }
 }
 
 /// Fullscreen background sky shader: runs only on uncovered pixels (`Depth::Equal` at `z = 0.0`).
@@ -210,63 +239,19 @@ fn sky_vs(vi: VertexIndex) -> ClipPosition {
 }
 
 @fragment
-fn sky_fs<S: Sky, L: Look>(pixel: FragCoord, v: View, sky: S, look: L) -> Targets3<vec4, vec4, f32> {
+fn sky_fs<S: Sky, L: Look>(pixel: FragCoord, v: View, sky: S, look: L) -> vec4 {
+    let d = v.ray(pixel.position.xy)
+    vec4(look.tone(Seen { light: seen(sky, d) }), 1.0)
+}
+
+@fragment
+fn sky_judge_fs<S: Sky, L: Look>(pixel: FragCoord, v: View, sky: S, look: L) -> Targets3<vec4, vec4, f32> {
     let d = v.ray(pixel.position.xy)
     let toned = look.tone(Seen { light: seen(sky, d) })
     Targets3 {
         first: vec4(toned, 1.0),
         second: vec4(0.0, 0.0, 0.0, 0.0),
         third: 1.0,
-    }
-}
-
-/// Resolves the `ssaa`×`ssaa` supersampled eye targets down to screen resolution (`Picture`).
-@fragment
-fn resolve_fs(
-    pixel: FragCoord,
-    hi_colour: Texture<Rgba16Float>,
-    hi_place: Texture<Rgba32Float>,
-    hi_sun: Texture<R8>,
-    ssaa: u32,
-) -> Targets3<vec4, vec4, f32> {
-    let x = u32(pixel.position.x)
-    let y = u32(pixel.position.y)
-    if ssaa <= 1 {
-        return Targets3 {
-            first: hi_colour.load(x, y),
-            second: hi_place.load(x, y),
-            third: hi_sun.load(x, y),
-        }
-    }
-    let bx = x * 2
-    let by = y * 2
-    let c00 = hi_colour.load(bx, by)
-    let c10 = hi_colour.load(bx + 1, by)
-    let c01 = hi_colour.load(bx, by + 1)
-    let c11 = hi_colour.load(bx + 1, by + 1)
-    let p00 = hi_place.load(bx, by)
-    let p10 = hi_place.load(bx + 1, by)
-    let p01 = hi_place.load(bx, by + 1)
-    let p11 = hi_place.load(bx + 1, by + 1)
-    // Average `place` over covered subpixels so the resolved surface depth sits at the pixel centre.
-    var psum = vec4(0.0)
-    var pcnt = 0.0
-    if p00.w > 0.0 { psum += p00; pcnt += 1.0 }
-    if p10.w > 0.0 { psum += p10; pcnt += 1.0 }
-    if p01.w > 0.0 { psum += p01; pcnt += 1.0 }
-    if p11.w > 0.0 { psum += p11; pcnt += 1.0 }
-    let best = if pcnt > 0.0 {
-        let avg = psum / pcnt
-        let nl = length(avg.xyz)
-        vec4(if nl > 1.0e-6 { avg.xyz / nl } else { avg.xyz }, avg.w)
-    } else {
-        vec4(0.0)
-    }
-    let s = 0.25 * (hi_sun.load(bx, by) + hi_sun.load(bx + 1, by) + hi_sun.load(bx, by + 1) + hi_sun.load(bx + 1, by + 1))
-    Targets3 {
-        first: 0.25 * (c00 + c10 + c01 + c11),
-        second: best,
-        third: s,
     }
 }
 
@@ -363,9 +348,10 @@ impl<A: MeshWorld, B: MeshWorld> MeshWorld for And<A, B> {
 }
 
 /// Complete meshlet renderer state: owns extracted batches, shadow map, sky irradiance table,
-/// supersampled eye targets, and resolved `Picture`.
+/// resolved eye depth buffer, and `Picture`.
 pub struct MeshSight {
     pub drawn: Picture,
+    pub depth: DepthTexture,
     batches: Vec<MeshBatch>,
     shadow_depth: DepthTexture,
     cmp: ComparisonSampler,
@@ -373,17 +359,13 @@ pub struct MeshSight {
     sky_sampler: Sampler,
     sky_sun: vec3,
     sky_ready: bool,
-    hi_colour: Texture<Rgba16Float>,
-    hi_place: Texture<Rgba32Float>,
-    hi_sun: Texture<R8>,
-    hi_depth: DepthTexture,
-    pub ssaa: u32,
 }
 
-/// Creates a fresh `MeshSight` (`ssaa`: 1 for native, 2 for 2×2 hardware supersampling).
-pub fn mesh_sight(ssaa: u32 = 2) -> MeshSight {
+/// Creates a fresh `MeshSight` using 4× hardware MSAA.
+pub fn mesh_sight() -> MeshSight {
     MeshSight {
         drawn: picture(width: 1, height: 1),
+        depth: depth_texture(width: 1, height: 1),
         batches: Vec::new(),
         shadow_depth: depth_texture(width: SHADOW_SIDE, height: SHADOW_SIDE),
         cmp: comparison_sampler(compare: Compare::LessEqual),
@@ -391,11 +373,6 @@ pub fn mesh_sight(ssaa: u32 = 2) -> MeshSight {
         sky_sampler: sampler(filter: Filter::Linear, address: Address::Clamp),
         sky_sun: vec3(0.0),
         sky_ready: false,
-        hi_colour: texture(width: 1, height: 1),
-        hi_place: texture(width: 1, height: 1),
-        hi_sun: texture(width: 1, height: 1),
-        hi_depth: depth_texture(width: 1, height: 1),
-        ssaa: if ssaa >= 2 { 2 } else { 1 },
     }
 }
 
@@ -404,12 +381,7 @@ impl MeshSight {
         if self.drawn.width() != width || self.drawn.height() != height {
             self.drawn = picture(width: width, height: height)
             self.drawn.placed = true
-            let hw = width * self.ssaa
-            let hh = height * self.ssaa
-            self.hi_colour = texture(width: hw, height: hh)
-            self.hi_place = texture(width: hw, height: hh)
-            self.hi_sun = texture(width: hw, height: hh)
-            self.hi_depth = depth_texture(width: hw, height: hh)
+            self.depth = depth_texture(width: width, height: height)
         }
     }
 
@@ -419,19 +391,18 @@ impl MeshSight {
         }
     }
 
-    /// Renders `world` into `self.drawn` without presenting (for judging against `Reference`).
-    pub fn drawn_only<W: MeshWorld, S: Sky, L: Look>(
+    /// Updates sky irradiance, syncs extracted GPU meshlets, and renders the unified sun shadow
+    /// map. Returns `(batch_count, view, shadow_view)`.
+    fn prepare_and_shadow<W: MeshWorld, S: Sky>(
         mut self,
         world: W,
         sky: S,
-        look: L,
         eye: Eye,
         width: u32,
         height: u32,
-    ) {
+    ) -> (u32, View, ShadowView) {
         self.resize(width, height)
         let v = view(eye, width: width, height: height)
-        let v_hi = view(eye, width: width * self.ssaa, height: height * self.ssaa)
 
         // Update sky irradiance table only when sky changes (0 ms/frame when still).
         let sun_way = sky.sun().way
@@ -477,25 +448,38 @@ impl MeshSight {
             )
         }
         sp.end()
+        (nb, v, sv)
+    }
 
-        // Pass 2: Unified eye pass (reversed-Z hardware rasterization + shading + background sky).
+    /// Renders `world` into `self.drawn` (`colour`, `place`, `sun`) without presenting (for
+    /// judging against `Reference`).
+    pub fn drawn_only<W: MeshWorld, S: Sky, L: Look>(
+        mut self,
+        world: W,
+        sky: S,
+        look: L,
+        eye: Eye,
+        width: u32,
+        height: u32,
+    ) {
+        let (nb, v, sv) = self.prepare_and_shadow(world, sky, eye, width, height)
+
+        // Pass 2: Unified 4× hardware MSAA eye pass writing `(colour, place, sun)` + depth.
         label("mesh_eye")
-        let ep: DepthPass3<Rgba16Float, Rgba32Float, R8> = begin_pass3_with_depth(
-            mut self.hi_colour,
-            mut self.hi_place,
-            mut self.hi_sun,
-            mut self.hi_depth,
+        let ep: MsaaDepthPass3<Rgba16Float, Rgba32Float, R8> = begin_pass3_msaa_with_depth(
+            mut self.drawn.colour,
+            mut self.drawn.place,
+            mut self.drawn.sun,
+            mut self.depth,
             clear: vec4(0.0, 0.0, 0.0, 1.0),
-            keep: false,
             clear_depth: 0.0,
-            keep_depth: false,
         )
         for i in 0..nb {
             draw(
                 ep,
-                mesh_vs.bind(verts: self.batches[i].verts.items(), v: v_hi),
-                mesh_fs.bind(
-                    v: v_hi,
+                mesh_vs.bind(verts: self.batches[i].verts.items(), v: v),
+                mesh_judge_fs.bind(
+                    v: v,
                     sv: sv,
                     sky: sky,
                     look: look,
@@ -513,31 +497,15 @@ impl MeshSight {
         draw(
             ep,
             sky_vs,
-            sky_fs.bind(v: v_hi, sky: sky, look: look),
+            sky_judge_fs.bind(v: v, sky: sky, look: look),
             vertices: 3,
             depth: Depth { compare: Compare::Equal, write: false },
         )
         ep.end()
-
-        // Pass 3: Resolve supersampled targets to `Picture`.
-        label("mesh_resolve")
-        let rp = begin_pass3(mut self.drawn.colour, mut self.drawn.place, mut self.drawn.sun, keep: false)
-        draw(
-            rp,
-            cover,
-            resolve_fs.bind(
-                hi_colour: self.hi_colour,
-                hi_place: self.hi_place,
-                hi_sun: self.hi_sun,
-                ssaa: self.ssaa,
-            ),
-            vertices: 3,
-        )
-        rp.end()
         self.drawn.placed = true
     }
 
-    /// Renders `world` and presents to the screen.
+    /// Renders `world` with 4× hardware MSAA (colour + depth only) and presents to the screen.
     pub fn draw<W: MeshWorld, S: Sky, L: Look>(
         mut self,
         world: W,
@@ -547,7 +515,46 @@ impl MeshSight {
         width: u32,
         height: u32,
     ) {
-        self.drawn_only(world, sky, look, eye, width, height)
+        let (nb, v, sv) = self.prepare_and_shadow(world, sky, eye, width, height)
+
+        // Pass 2: Unified 4× hardware MSAA eye pass (colour + depth only: 12 B/sample total,
+        // tile-memoryless on Metal and hardware-resolved on Vulkan).
+        label("mesh_eye")
+        let ep: MsaaDepthPass<Rgba16Float> = begin_pass_msaa_with_depth(
+            mut self.drawn.colour,
+            mut self.depth,
+            clear: vec4(0.0, 0.0, 0.0, 1.0),
+            clear_depth: 0.0,
+        )
+        for i in 0..nb {
+            draw(
+                ep,
+                mesh_vs.bind(verts: self.batches[i].verts.items(), v: v),
+                mesh_fs.bind(
+                    v: v,
+                    sv: sv,
+                    sky: sky,
+                    look: look,
+                    table: self.sky_table,
+                    s: self.sky_sampler,
+                    shadow_map: self.shadow_depth,
+                    cmp: self.cmp,
+                ),
+                indices: self.batches[i].indices,
+                indirect: self.batches[i].draw_args,
+                cull: Cull::Back,
+                depth: Depth { compare: Compare::Greater, write: true },
+            )
+        }
+        draw(
+            ep,
+            sky_vs,
+            sky_fs.bind(v: v, sky: sky, look: look),
+            vertices: 3,
+            depth: Depth { compare: Compare::Equal, write: false },
+        )
+        ep.end()
+        self.drawn.placed = false
         show(self.drawn.colour)
     }
 }

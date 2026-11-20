@@ -821,23 +821,33 @@ impl Device {
     }
 
     pub fn create_texture(&self, desc: &TextureDesc<'_>) -> Texture {
+        let samples = desc.samples.max(1);
         let layers = desc.depth_or_layers.max(1);
         let levels = desc.levels.max(1);
         let format = vk_format(desc.format);
         let depth = desc.format == TextureFormat::Depth32Float;
-        let mut usage = vk::ImageUsageFlags::SAMPLED
-            | vk::ImageUsageFlags::TRANSFER_SRC
-            | vk::ImageUsageFlags::TRANSFER_DST;
-        if desc.usage.storage {
-            usage |= vk::ImageUsageFlags::STORAGE;
-        }
-        if desc.usage.render {
-            usage |= if depth {
+        let usage = if samples > 1 {
+            if depth {
                 vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
             } else {
                 vk::ImageUsageFlags::COLOR_ATTACHMENT
-            };
-        }
+            }
+        } else {
+            let mut u = vk::ImageUsageFlags::SAMPLED
+                | vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::TRANSFER_DST;
+            if desc.usage.storage {
+                u |= vk::ImageUsageFlags::STORAGE;
+            }
+            if desc.usage.render {
+                u |= if depth {
+                    vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
+                } else {
+                    vk::ImageUsageFlags::COLOR_ATTACHMENT
+                };
+            }
+            u
+        };
         let (ty, extent, array) = match desc.dimension {
             TextureDimension::D3 => (
                 vk::ImageType::TYPE_3D,
@@ -850,8 +860,12 @@ impl Device {
                 layers,
             ),
         };
-        let cube =
-            desc.dimension == TextureDimension::D2 && layers % 6 == 0 && desc.width == desc.height;
+        let cube = samples == 1
+            && desc.dimension == TextureDimension::D2
+            && layers % 6 == 0
+            && desc.width == desc.height;
+        let vk_samples =
+            if samples == 4 { vk::SampleCountFlags::TYPE_4 } else { vk::SampleCountFlags::TYPE_1 };
         // SAFETY: an image and its memory, made and bound here.
         let raw = unsafe {
             let d = self.raw();
@@ -870,7 +884,7 @@ impl Device {
                         .extent(extent)
                         .mip_levels(levels)
                         .array_layers(array)
-                        .samples(vk::SampleCountFlags::TYPE_1)
+                        .samples(vk_samples)
                         .tiling(vk::ImageTiling::OPTIMAL)
                         .usage(usage)
                         .sharing_mode(vk::SharingMode::EXCLUSIVE)
@@ -900,7 +914,14 @@ impl Device {
                 },
                 swapchain: false,
                 usage,
-                home: if desc.usage.storage {
+                samples,
+                home: if samples > 1 {
+                    if depth {
+                        vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL
+                    } else {
+                        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+                    }
+                } else if desc.usage.storage {
                     vk::ImageLayout::GENERAL
                 } else if depth {
                     vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL
@@ -911,7 +932,9 @@ impl Device {
                 layers: array,
             })
         };
-        lock(&self.0.pending).push(Pending::Clear { dst: raw.clone() });
+        if samples == 1 {
+            lock(&self.0.pending).push(Pending::Clear { dst: raw.clone() });
+        }
         Texture {
             raw,
             format: desc.format,
@@ -1266,8 +1289,13 @@ impl Device {
                 .depth_bias_slope_factor(d.bias.slope_scale)
                 .depth_bias_clamp(d.bias.clamp);
         }
-        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
-            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+        let multisample = vk::PipelineMultisampleStateCreateInfo::default().rasterization_samples(
+            if desc.samples == 4 {
+                vk::SampleCountFlags::TYPE_4
+            } else {
+                vk::SampleCountFlags::TYPE_1
+            },
+        );
         let depth_state = match &desc.depth {
             Some(d) => vk::PipelineDepthStencilStateCreateInfo::default()
                 .depth_test_enable(true)
@@ -1897,6 +1925,8 @@ struct RawImage {
     swapchain: bool,
     /// What it may be used as: a view of it is in the table's arrays it can be in.
     usage: vk::ImageUsageFlags,
+    /// Samples per pixel (`1` or `4`).
+    samples: u8,
 }
 
 impl RawImage {
@@ -2088,6 +2118,18 @@ impl Texture {
                 .expect("Vulkan made no image view")
         };
         let level = desc.base_level;
+        if self.raw.samples > 1 {
+            return TextureView {
+                raw: Arc::new(RawView {
+                    image: self.raw.clone(),
+                    view,
+                    range,
+                    width: (self.width >> level).max(1),
+                    height: (self.height >> level).max(1),
+                    index: NO_INDEX,
+                }),
+            };
+        }
         // Its index in the table: a sampled image there, and a storage image where it can be
         // one (a kernel may write it: one level, not a cube).
         let device = &self.raw.device;
@@ -2785,26 +2827,71 @@ impl CommandEncoder {
         self.barrier_all();
         self.reset(desc.timestamps);
         // Its targets, out of their homes into the layouts drawing takes.
-        let mut targets: Vec<(Arc<RawView>, vk::ImageLayout)> = desc
-            .colors
-            .iter()
-            .map(|c| (c.view.raw.clone(), vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL))
-            .collect();
-        if let Some(d) = &desc.depth {
-            targets.push((d.view.raw.clone(), vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL));
+        let mut targets: Vec<(Arc<RawView>, vk::ImageLayout)> = Vec::new();
+        for c in desc.colors {
+            let v = &c.view.raw;
+            let to = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+            if v.image.samples > 1 {
+                let from = if matches!(c.load, LoadOp::Clear(_)) {
+                    vk::ImageLayout::UNDEFINED
+                } else {
+                    v.image.home
+                };
+                transition(self.d(), self.raw, v.image.image, v.range, from, to);
+            } else {
+                let from =
+                    if v.image.swapchain { vk::ImageLayout::UNDEFINED } else { v.image.home };
+                transition(self.d(), self.raw, v.image.image, v.range, from, to);
+                targets.push((v.clone(), to));
+            }
+            if let Some(r) = c.resolve {
+                let rv = &r.raw;
+                let from =
+                    if rv.image.swapchain { vk::ImageLayout::UNDEFINED } else { rv.image.home };
+                transition(self.d(), self.raw, rv.image.image, rv.range, from, to);
+                targets.push((rv.clone(), to));
+            }
         }
-        for (v, to) in &targets {
-            let from = if v.image.swapchain { vk::ImageLayout::UNDEFINED } else { v.image.home };
-            transition(self.d(), self.raw, v.image.image, v.range, from, *to);
+        if let Some(d) = &desc.depth {
+            let v = &d.view.raw;
+            let to = vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL;
+            if v.image.samples > 1 {
+                let from = if matches!(d.load, LoadOp::Clear(_)) {
+                    vk::ImageLayout::UNDEFINED
+                } else {
+                    v.image.home
+                };
+                transition(self.d(), self.raw, v.image.image, v.range, from, to);
+            } else {
+                let from =
+                    if v.image.swapchain { vk::ImageLayout::UNDEFINED } else { v.image.home };
+                transition(self.d(), self.raw, v.image.image, v.range, from, to);
+                targets.push((v.clone(), to));
+            }
+            if let Some(r) = d.resolve {
+                let rv = &r.raw;
+                transition(self.d(), self.raw, rv.image.image, rv.range, rv.image.home, to);
+                targets.push((rv.clone(), to));
+            }
         }
         let colors: Vec<vk::RenderingAttachmentInfo<'_>> = desc
             .colors
             .iter()
             .map(|c| {
-                let a = vk::RenderingAttachmentInfo::default()
+                let mut a = vk::RenderingAttachmentInfo::default()
                     .image_view(c.view.raw.view)
                     .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                    .store_op(vk::AttachmentStoreOp::STORE);
+                    .store_op(if c.store {
+                        vk::AttachmentStoreOp::STORE
+                    } else {
+                        vk::AttachmentStoreOp::DONT_CARE
+                    });
+                if let Some(r) = c.resolve {
+                    a = a
+                        .resolve_mode(vk::ResolveModeFlags::AVERAGE)
+                        .resolve_image_view(r.raw.view)
+                        .resolve_image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+                }
                 match c.load {
                     LoadOp::Load => a.load_op(vk::AttachmentLoadOp::LOAD),
                     LoadOp::Clear(v) => {
@@ -2816,10 +2903,20 @@ impl CommandEncoder {
             })
             .collect();
         let depth = desc.depth.as_ref().map(|d| {
-            let a = vk::RenderingAttachmentInfo::default()
+            let mut a = vk::RenderingAttachmentInfo::default()
                 .image_view(d.view.raw.view)
                 .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
-                .store_op(vk::AttachmentStoreOp::STORE);
+                .store_op(if d.store {
+                    vk::AttachmentStoreOp::STORE
+                } else {
+                    vk::AttachmentStoreOp::DONT_CARE
+                });
+            if let Some(r) = d.resolve {
+                a = a
+                    .resolve_mode(vk::ResolveModeFlags::SAMPLE_ZERO)
+                    .resolve_image_view(r.raw.view)
+                    .resolve_image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL);
+            }
             match d.load {
                 LoadOp::Load => a.load_op(vk::AttachmentLoadOp::LOAD),
                 LoadOp::Clear(v) => {
@@ -2848,9 +2945,15 @@ impl CommandEncoder {
         }
         for c in desc.colors {
             self.held.push(Held::View(c.view.raw.clone()));
+            if let Some(r) = c.resolve {
+                self.held.push(Held::View(r.raw.clone()));
+            }
         }
         if let Some(d) = &desc.depth {
             self.held.push(Held::View(d.view.raw.clone()));
+            if let Some(r) = d.resolve {
+                self.held.push(Held::View(r.raw.clone()));
+            }
         }
         // SAFETY: rendering to live views in GENERAL; the viewport and scissor cover the target
         // until the pass sets its own.
@@ -3620,6 +3723,7 @@ impl Surface {
                     home: vk::ImageLayout::PRESENT_SRC_KHR,
                     swapchain: true,
                     usage: vk::ImageUsageFlags::COLOR_ATTACHMENT,
+                    samples: 1,
                 });
                 let range = raw.part(0, 0, 1);
                 let view = d

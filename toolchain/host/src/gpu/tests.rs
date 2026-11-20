@@ -85,6 +85,8 @@ fn the_present_pass_draws_the_screen_into_a_frame() {
         dimension: wrela_gpu::TextureDimension::D2,
         format: TextureFormat::Rgba8,
         usage: wrela_gpu::TextureUsage { sampled: true, copy_dst: true, ..Default::default() },
+        samples: 1,
+        transient: false,
     });
     let at =
         wrela_gpu::TextureCopy { texture: &src, level: 0, origin: [0, 0, 0], depth_only: false };
@@ -109,6 +111,8 @@ fn the_present_pass_draws_the_screen_into_a_frame() {
             dimension: wrela_gpu::TextureDimension::D2,
             format,
             usage: wrela_gpu::TextureUsage { render: true, copy_src: true, ..Default::default() },
+            samples: 1,
+            transient: false,
         });
         let cb = draw_presented(&device, &pipeline, &layout, &view(&src), &view(&dst));
         let texel = format.bytes_per_texel();

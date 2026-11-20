@@ -266,8 +266,11 @@ impl Opcode {
 /// `CreateTexture`'s format word with this bit set: kernels write the texture's texels.
 pub const WRITABLE: u32 = 1 << 16;
 
-/// `BeginPass`'s join word: the pass may join the one before it ([`Pass::join`]).
+/// `BeginPass`'s flags word: the pass may join the one before it ([`Pass::join`]).
 pub const PASS_JOIN: u32 = 1;
+
+/// `BeginPass`'s flags word: the pass draws with 4× hardware MSAA and resolves to its targets on end.
+pub const PASS_MSAA4: u32 = 4;
 
 /// The most mip levels a texture has: a side of WebGPU's largest 2D texture, 8192 texels, halved
 /// 13 times.
@@ -809,6 +812,8 @@ pub struct Pass {
     /// It may run as part of the pass before it, if that one ended right before it on the
     /// same targets and this one keeps them (the host's choice; serial timing times it alone).
     pub join: bool,
+    /// Samples per pixel: `1` or `4` (hardware 4× MSAA, resolved on pass end).
+    pub samples: u8,
     /// A depth texture, or [`NONE`].
     pub depth: u32,
     /// Its layer (of a depth array; 0 of a depth texture).
@@ -827,11 +832,17 @@ impl Pass {
             colors: all,
             count: colors.len() as u32,
             join: false,
+            samples: 1,
             depth: NONE,
             depth_layer: 0,
             keep_depth: false,
             clear_depth: 1.0,
         }
+    }
+
+    /// With `samples` samples per pixel (`1` or `4`).
+    pub fn with_samples(self, samples: u8) -> Pass {
+        Pass { samples, ..self }
     }
 
     /// A pass into one colour target, `texture` (or [`SCREEN`]), or none ([`NONE`]).
@@ -879,6 +890,8 @@ impl Pass {
     /// render pass: it may join, on the same targets, kept (not cleared), and not the screen.
     pub fn joins(&self, ended: &Pass) -> bool {
         self.join
+            && self.samples == 1
+            && ended.samples == 1
             && !self.on_screen()
             && self.count == ended.count
             && self.colors().iter().zip(ended.colors()).all(|(a, b)| a.same_place(b) && a.keep)
@@ -1606,8 +1619,8 @@ pub fn decode(batch: &[u8]) -> Result<Vec<Command<'_>>, StreamError> {
                 if words != 2 + 8 * n + 4 {
                     return Err(bad("the colour targets don't fill the payload"));
                 }
-                if w(1) > PASS_JOIN {
-                    return Err(bad("the join word is 0 or 1"));
+                if w(1) & !(PASS_JOIN | PASS_MSAA4) != 0 {
+                    return Err(bad("pass flags use only join (1) and msaa4 (4)"));
                 }
                 let mut colors = Vec::with_capacity(n);
                 for k in 0..n {
@@ -1631,7 +1644,8 @@ pub fn decode(batch: &[u8]) -> Result<Vec<Command<'_>>, StreamError> {
                     return Err(bad("a load is 0 (clear) or 1 (keep)"));
                 }
                 let mut pass = Pass::new(&colors);
-                pass.join = w(1) == PASS_JOIN;
+                pass.join = (w(1) & PASS_JOIN) != 0;
+                pass.samples = if (w(1) & PASS_MSAA4) != 0 { 4 } else { 1 };
                 pass.depth = w(d);
                 pass.depth_layer = w(d + 1);
                 pass.keep_depth = w(d + 2) == 1;
@@ -2230,7 +2244,9 @@ impl Encoder {
     }
 
     pub fn begin_pass(&mut self, pass: Pass) -> &mut Self {
-        let mut words = vec![pass.count, if pass.join { PASS_JOIN } else { 0 }];
+        let flags = (if pass.join { PASS_JOIN } else { 0 })
+            | (if pass.samples == 4 { PASS_MSAA4 } else { 0 });
+        let mut words = vec![pass.count, flags];
         for c in pass.colors() {
             words.extend([c.texture, c.level, c.layer, u32::from(c.keep)]);
             words.extend(c.clear.map(f32::to_bits));

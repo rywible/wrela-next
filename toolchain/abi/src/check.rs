@@ -761,8 +761,20 @@ impl Checker {
     /// array's layer), all the same size, within WebGPU's 32 bytes a sample.
     fn begin_pass(&mut self, op: Opcode, pass: &Pass) -> Result<()> {
         let err = |why: String| Err(CommandError { opcode: op, why });
+        if pass.samples != 1 && pass.samples != 4 {
+            return err(format!("a pass has 1 or 4 samples, not {}", pass.samples));
+        }
+        if pass.samples > 1 && pass.on_screen() {
+            return err("an MSAA pass draws into textures, not the screen".into());
+        }
         for c in pass.colors() {
+            if pass.samples > 1 && c.keep {
+                return err("an MSAA pass clears its colour targets; it resolves on end".into());
+            }
             self.clear_colour(op, &c.clear)?;
+        }
+        if pass.samples > 1 && pass.depth != NONE && pass.keep_depth {
+            return err("an MSAA pass clears its depth target; it resolves on end".into());
         }
         if !pass.clear_depth.is_finite() {
             return err("the clear depth isn't a finite number".into());
@@ -790,6 +802,13 @@ impl Checker {
                 return err(format!(
                     "texture {} is a depth texture, so it can't be a colour target",
                     c.texture
+                ));
+            }
+            if pass.samples > 1 && t.format.is_uint() {
+                return err(format!(
+                    "texture {}: an MSAA pass can't resolve integer format {}",
+                    c.texture,
+                    t.format.name()
                 ));
             }
             if let Some(need) = self.lacks(t.format.info().renderable) {
@@ -844,7 +863,11 @@ impl Checker {
         if pass.count == 0 && pass.depth == NONE {
             return err("a pass needs a colour target or a depth target".into());
         }
-        self.targets = RenderTarget { screen, ..RenderTarget::of(&formats, pass.depth != NONE) };
+        self.targets = RenderTarget {
+            screen,
+            samples: pass.samples,
+            ..RenderTarget::of(&formats, pass.depth != NONE)
+        };
         self.pass_size = size;
         Ok(())
     }

@@ -363,11 +363,16 @@ impl Device {
 
     pub fn create_texture(&self, desc: &TextureDesc<'_>) -> Texture {
         let d = MTLTextureDescriptor::new();
+        let samples = desc.samples.max(1);
         let layers = desc.depth_or_layers.max(1);
-        let ty = match desc.dimension {
-            TextureDimension::D3 => MTLTextureType::Type3D,
-            TextureDimension::D2 if layers > 1 => MTLTextureType::Type2DArray,
-            TextureDimension::D2 => MTLTextureType::Type2D,
+        let ty = if samples > 1 {
+            MTLTextureType::Type2DMultisample
+        } else {
+            match desc.dimension {
+                TextureDimension::D3 => MTLTextureType::Type3D,
+                TextureDimension::D2 if layers > 1 => MTLTextureType::Type2DArray,
+                TextureDimension::D2 => MTLTextureType::Type2D,
+            }
         };
         d.setTextureType(ty);
         d.setPixelFormat(pixel_format(desc.format));
@@ -379,17 +384,29 @@ impl Device {
                 TextureDimension::D2 => d.setArrayLength(layers as NSUInteger),
             }
             d.setMipmapLevelCount(desc.levels.max(1) as NSUInteger);
+            if samples > 1 {
+                d.setSampleCount(samples as NSUInteger);
+            }
         }
-        d.setStorageMode(MTLStorageMode::Private);
+        d.setStorageMode(if samples > 1 && desc.transient {
+            MTLStorageMode::Memoryless
+        } else {
+            MTLStorageMode::Private
+        });
         // No `PixelFormatView`: every view keeps its texture's format, and the flag would give up
         // the GPU's lossless compression of what's drawn into it.
-        let mut usage = MTLTextureUsage::ShaderRead;
-        if desc.usage.storage {
-            usage |= MTLTextureUsage::ShaderWrite;
-        }
-        if desc.usage.render {
-            usage |= MTLTextureUsage::RenderTarget;
-        }
+        let usage = if samples > 1 {
+            MTLTextureUsage::RenderTarget
+        } else {
+            let mut u = MTLTextureUsage::ShaderRead;
+            if desc.usage.storage {
+                u |= MTLTextureUsage::ShaderWrite;
+            }
+            if desc.usage.render {
+                u |= MTLTextureUsage::RenderTarget;
+            }
+            u
+        };
         d.setUsage(usage);
         let raw = self.0.raw.newTextureWithDescriptor(&d).expect("Metal made no texture");
         raw.setLabel(Some(&ns(desc.label)));
@@ -402,8 +419,11 @@ impl Device {
             depth_or_layers: layers,
             levels: desc.levels.max(1),
             dimension: desc.dimension,
+            samples,
         };
-        self.zero_texture(&t);
+        if samples == 1 {
+            self.zero_texture(&t);
+        }
         t
     }
 
@@ -626,7 +646,7 @@ impl Device {
             d.setLabel(Some(&ns(desc.label)));
             unsafe {
                 d.setInputPrimitiveTopology(MTLPrimitiveTopologyClass::Triangle);
-                d.setRasterSampleCount(1);
+                d.setRasterSampleCount(desc.samples.max(1) as NSUInteger);
             }
             let attachments = d.colorAttachments();
             for (k, c) in desc.colors.iter().enumerate() {
@@ -1102,6 +1122,7 @@ pub struct Texture {
     depth_or_layers: u32,
     levels: u32,
     dimension: TextureDimension,
+    samples: u8,
 }
 
 impl Texture {
@@ -1131,6 +1152,9 @@ impl Texture {
     }
 
     pub fn create_view(&self, desc: &ViewDesc) -> TextureView {
+        if self.samples > 1 {
+            return TextureView { raw: self.raw.clone(), slot: None };
+        }
         let levels = desc.level_count.unwrap_or(self.levels - desc.base_level);
         let all_layers = match self.dimension {
             TextureDimension::D3 => 1,
@@ -1516,10 +1540,19 @@ impl CommandEncoder {
     pub fn begin_render_pass(&mut self, desc: &RenderPassDesc<'_>) -> RenderPass<'_> {
         self.end_blit();
         let d = MTLRenderPassDescriptor::new();
+        let store_action = |store: bool, resolves: bool| match (store, resolves) {
+            (true, true) => MTLStoreAction::StoreAndMultisampleResolve,
+            (false, true) => MTLStoreAction::MultisampleResolve,
+            (true, false) => MTLStoreAction::Store,
+            (false, false) => MTLStoreAction::DontCare,
+        };
         let colors = d.colorAttachments();
         for (k, c) in desc.colors.iter().enumerate() {
             let a = unsafe { colors.objectAtIndexedSubscript(k as NSUInteger) };
             a.setTexture(Some(&c.view.raw));
+            if let Some(r) = c.resolve {
+                a.setResolveTexture(Some(&r.raw));
+            }
             match c.load {
                 LoadOp::Load => a.setLoadAction(MTLLoadAction::Load),
                 LoadOp::Clear([r, g, b, alpha]) => {
@@ -1527,11 +1560,15 @@ impl CommandEncoder {
                     a.setClearColor(MTLClearColor { red: r, green: g, blue: b, alpha });
                 }
             }
-            a.setStoreAction(MTLStoreAction::Store);
+            a.setStoreAction(store_action(c.store, c.resolve.is_some()));
         }
         if let Some(depth) = &desc.depth {
             let a = d.depthAttachment();
             a.setTexture(Some(&depth.view.raw));
+            if let Some(r) = depth.resolve {
+                a.setResolveTexture(Some(&r.raw));
+                a.setDepthResolveFilter(MTLMultisampleDepthResolveFilter::Sample0);
+            }
             match depth.load {
                 LoadOp::Load => a.setLoadAction(MTLLoadAction::Load),
                 LoadOp::Clear(z) => {
@@ -1539,7 +1576,7 @@ impl CommandEncoder {
                     a.setClearDepth(f64::from(z));
                 }
             }
-            a.setStoreAction(MTLStoreAction::Store);
+            a.setStoreAction(store_action(depth.store, depth.resolve.is_some()));
         }
         if let Some(t) = desc.timestamps {
             let a = unsafe { d.sampleBufferAttachments().objectAtIndexedSubscript(0) };
@@ -2135,6 +2172,7 @@ impl Surface {
             depth_or_layers: 1,
             levels: 1,
             dimension: TextureDimension::D2,
+            samples: 1,
         };
         Ok(SurfaceTexture { drawable, texture, view: TextureView { raw, slot: None } })
     }

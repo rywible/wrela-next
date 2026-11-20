@@ -280,7 +280,9 @@ impl Texture {
 
 /// The target formats a render pipeline is made for: its colour formats (none in a pass that
 /// draws only depths), and a depth format (or none).
-type Targets = (Vec<TextureFormat>, Option<TextureFormat>);
+type Targets = (Vec<TextureFormat>, Option<TextureFormat>, u8);
+
+type MsaaKey = (u8, u32, u32, TextureFormat, u8, bool);
 
 pub(crate) struct Pipeline {
     name: String,
@@ -852,6 +854,9 @@ pub(crate) struct Gpu {
     /// Whether each pipeline it builds is reported on stderr ([`crate::pipeline_report`]).
     report: bool,
     resources: HashMap<u32, Resource>,
+    /// Cached multisample backing textures and views for MSAA passes (transient on Metal uses
+    /// `MTLStorageModeMemoryless`; non-transient is used only if a pass splits into pieces).
+    msaa: HashMap<MsaaKey, (wrela_gpu::Texture, wrela_gpu::TextureView)>,
     /// Each pipeline's cached bind groups, by the bindings they hold.
     bind_groups: Vec<HashMap<Arc<[Binding]>, wrela_gpu::BindGroup>>,
     /// For each resource, the cached bind groups it's in: destroying it drops them.
@@ -1130,6 +1135,7 @@ impl Gpu {
             build_ms: 0.0,
             report,
             resources: HashMap::new(),
+            msaa: HashMap::new(),
             bind_groups: vec![HashMap::new(); manifest.pipelines.len()],
             bound_in: HashMap::new(),
             gone: HashMap::new(),
@@ -1460,8 +1466,14 @@ impl Builder {
                         }
                         let depth = t.depth.then_some(TextureFormat::Depth32Float);
                         let colors = t.colors().collect();
-                        render_variant(&self.device, &p.name, &layout, &mut kind, (colors, depth))
-                            .map_err(shader_err)?;
+                        render_variant(
+                            &self.device,
+                            &p.name,
+                            &layout,
+                            &mut kind,
+                            (colors, depth, t.samples),
+                        )
+                        .map_err(shader_err)?;
                     }
                     kind
                 }
@@ -1608,6 +1620,8 @@ impl Gpu {
             dimension: wrela_gpu::TextureDimension::D2,
             format,
             usage: wrela_gpu::TextureUsage { render: true, copy_src: true, ..Default::default() },
+            samples: 1,
+            transient: false,
         });
         let view = texture.create_view(&wrela_gpu::ViewDesc {
             dimension: wrela_gpu::ViewDimension::D2,
@@ -1641,6 +1655,8 @@ impl Gpu {
             dimension: wrela_gpu::TextureDimension::D2,
             format,
             usage: wrela_gpu::TextureUsage { render: true, copy_src: true, ..Default::default() },
+            samples: 1,
+            transient: false,
         });
         let view = texture.create_view(&wrela_gpu::ViewDesc {
             dimension: wrela_gpu::ViewDimension::D2,
@@ -1736,7 +1752,7 @@ impl Gpu {
             for p in &mut self.pipelines {
                 let depths = p.screen_depths.clone();
                 for depth in depths {
-                    let targets = (vec![format], depth.then_some(TextureFormat::Depth32Float));
+                    let targets = (vec![format], depth.then_some(TextureFormat::Depth32Float), 1);
                     render_variant(&device, &p.name, &p.layout, &mut p.kind, targets)
                         .map_err(|e| Error::Gpu(format!("`{}` for the HDR screen: {e}", p.name)))?;
                 }
@@ -2356,6 +2372,8 @@ impl Gpu {
             },
             format,
             usage,
+            samples: 1,
+            transient: false,
         });
         let views = std::cell::RefCell::new(HashMap::new());
         self.resources.insert(handle, Resource::Texture(Texture { texture, format, views }));
@@ -2895,7 +2913,7 @@ impl Gpu {
         let depth_format = (pass.depth != stream::NONE).then(|| self.texture(pass.depth).format);
         // Each draw's pipeline has a variant for these targets, made at load: the checker
         // checked they're among its manifest's.
-        let formats = (colors, depth_format);
+        let formats = (colors, depth_format, pass.samples);
         let name: Arc<str> = open
             .label
             .clone()
@@ -2927,7 +2945,7 @@ impl Gpu {
             if self.queued.passes_ms + ms > LIGHT_JOB * self.line_ms {
                 self.submit(false)?;
             }
-            self.record_piece(op, &pass, &formats, &name, open.draws, true, false)?;
+            self.record_piece(op, &pass, &formats, &name, open.draws, true, true, false)?;
             self.queued.passes_ms += ms;
             if light.is_some() {
                 self.job_light.push(Piece { label: name, draws: 0..draws, of: draws });
@@ -2965,7 +2983,7 @@ impl Gpu {
         }
         let last = parts.len() - 1;
         for (k, (items, range)) in parts.into_iter().zip(ranges).enumerate() {
-            self.record_piece(op, &pass, &formats, &name, items, k == 0, true)?;
+            self.record_piece(op, &pass, &formats, &name, items, k == 0, k == last, true)?;
             self.job_piece = Some(Piece { label: name.clone(), draws: range, of: draws });
             self.submit(on_screen && k == last)?;
         }
@@ -2973,16 +2991,55 @@ impl Gpu {
         if on_screen { Ok(()) } else { self.alone() }
     }
 
+    /// Cached multisample attachment view for slot `slot` (0..8 for colour, 255 for depth).
+    fn msaa_view(
+        &mut self,
+        slot: u8,
+        width: u32,
+        height: u32,
+        format: TextureFormat,
+        samples: u8,
+        transient: bool,
+    ) -> wrela_gpu::TextureView {
+        let key = (slot, width, height, format, samples, transient);
+        if let Some((_, view)) = self.msaa.get(&key) {
+            return view.clone();
+        }
+        let texture = self.device.create_texture(&wrela_gpu::TextureDesc {
+            label: &format!("msaa {samples}x slot {slot}"),
+            width,
+            height,
+            depth_or_layers: 1,
+            levels: 1,
+            dimension: wrela_gpu::TextureDimension::D2,
+            format,
+            usage: wrela_gpu::TextureUsage { render: true, ..Default::default() },
+            samples,
+            transient,
+        });
+        let view = texture.create_view(&wrela_gpu::ViewDesc {
+            dimension: wrela_gpu::ViewDimension::D2,
+            base_level: 0,
+            level_count: Some(1),
+            base_layer: 0,
+            layer_count: Some(1),
+        });
+        self.msaa.insert(key, (texture, view.clone()));
+        view
+    }
+
     /// Records `items` as one render pass of `pass` into the pending encoder: the first piece
     /// of a pass loads its targets as the pass says, every later one keeps what's there.
+    #[allow(clippy::too_many_arguments)]
     fn record_piece(
         &mut self,
         op: Opcode,
         pass: &Pass,
-        formats: &(Vec<TextureFormat>, Option<TextureFormat>),
+        formats: &Targets,
         label: &str,
         items: Vec<PassItem>,
         first: bool,
+        last: bool,
         alone: bool,
     ) -> Result<()> {
         // Everything that can flush happens before anything is recorded for this pass.
@@ -3013,6 +3070,30 @@ impl Gpu {
                 prepared.push((bind_group, offset));
             }
         }
+        let msaa = pass.samples > 1;
+        let transient = first && last;
+        let msaa_color_views: Vec<wrela_gpu::TextureView> = if msaa {
+            pass.colors()
+                .iter()
+                .enumerate()
+                .map(|(k, c)| {
+                    let t = self.texture(c.texture);
+                    let w = (t.texture.width() >> c.level).max(1);
+                    let h = (t.texture.height() >> c.level).max(1);
+                    let f = t.format;
+                    self.msaa_view(k as u8, w, h, f, pass.samples, transient)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let msaa_depth_view = if msaa && pass.depth != stream::NONE {
+            let t = self.texture(pass.depth);
+            let (w, h, f) = (t.texture.width(), t.texture.height(), t.format);
+            Some(self.msaa_view(255, w, h, f, pass.samples, transient))
+        } else {
+            None
+        };
         let mut encoder = self.take_encoder();
         let color_views: Vec<wrela_gpu::TextureView> = pass
             .colors()
@@ -3027,23 +3108,46 @@ impl Gpu {
         let color_attachments: Vec<wrela_gpu::ColorAttachment<'_>> = pass
             .colors()
             .iter()
-            .zip(&color_views)
-            .map(|(c, view)| wrela_gpu::ColorAttachment {
-                view,
-                load: if c.keep || !first {
+            .enumerate()
+            .map(|(k, c)| {
+                let load = if c.keep || !first {
                     wrela_gpu::LoadOp::Load
                 } else {
                     wrela_gpu::LoadOp::Clear(c.clear.map(f64::from))
-                },
+                };
+                if msaa {
+                    wrela_gpu::ColorAttachment {
+                        view: &msaa_color_views[k],
+                        resolve: last.then_some(&color_views[k]),
+                        load,
+                        store: !last,
+                    }
+                } else {
+                    wrela_gpu::ColorAttachment {
+                        view: &color_views[k],
+                        resolve: None,
+                        load,
+                        store: true,
+                    }
+                }
             })
             .collect();
-        let depth_attachment = depth_view.as_ref().map(|view| wrela_gpu::DepthAttachment {
-            view,
-            load: if pass.keep_depth || !first {
+        let depth_attachment = depth_view.as_ref().map(|view| {
+            let load = if pass.keep_depth || !first {
                 wrela_gpu::LoadOp::Load
             } else {
                 wrela_gpu::LoadOp::Clear(pass.clear_depth)
-            },
+            };
+            if let Some(mv) = msaa_depth_view.as_ref() {
+                wrela_gpu::DepthAttachment {
+                    view: mv,
+                    resolve: last.then_some(view),
+                    load,
+                    store: !last,
+                }
+            } else {
+                wrela_gpu::DepthAttachment { view, resolve: None, load, store: true }
+            }
         });
         // Counted here, and added once the pass, which borrows the executor, has ended.
         let mut counters = Counters::default();
@@ -3887,6 +3991,7 @@ fn render_variant(
             colors: &colors,
             depth,
             cull: *cull,
+            samples: targets.2,
         })
         .map_err(|e| e.0)?;
     variants.insert(targets, pipeline);

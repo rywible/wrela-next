@@ -1303,7 +1303,9 @@ fn draw_target(
         _ => Vec::new(),
     };
     let target = match p.lang_of_ty(t) {
-        Some(l) if let Some(depth) = l.textures_pass() => ir::RenderTarget::of(&formats, depth),
+        Some(l) if let Some(depth) = l.textures_pass() => {
+            ir::RenderTarget::of(&formats, depth).with_samples(l.pass_samples())
+        }
         Some(Lang::DepthOnlyPass | Lang::DepthLayerPass) => ir::RenderTarget::of(&[], true),
         Some(Lang::ScreenPass) => ir::RenderTarget::screen(false),
         Some(Lang::ScreenDepthPass) => ir::RenderTarget::screen(true),

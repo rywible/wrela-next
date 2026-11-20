@@ -289,12 +289,25 @@ pub enum Stage {
 /// that draws only depths), and a depth target (`depth32float`) or none. The screen's says it's
 /// the screen (`"screen": true`, which a texture's leaves out): its one colour is
 /// [`SCREEN_FORMAT`] here, and a host may draw it in another (a browser's canvas).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RenderTarget {
     /// The colours: those before the first `None`.
     pub colors: [Option<TextureFormat>; MAX_COLOR_ATTACHMENTS],
     pub depth: bool,
     pub screen: bool,
+    /// Samples per pixel: `1` or `4` (hardware 4× MSAA, resolved on pass end).
+    pub samples: u8,
+}
+
+impl Default for RenderTarget {
+    fn default() -> RenderTarget {
+        RenderTarget {
+            colors: [None; MAX_COLOR_ATTACHMENTS],
+            depth: false,
+            screen: false,
+            samples: 1,
+        }
+    }
 }
 
 impl RenderTarget {
@@ -309,7 +322,12 @@ impl RenderTarget {
         for (slot, &f) in all.iter_mut().zip(colors) {
             *slot = Some(f);
         }
-        RenderTarget { colors: all, depth, screen: false }
+        RenderTarget { colors: all, depth, screen: false, samples: 1 }
+    }
+
+    /// With `samples` samples per pixel (`1` or `4`).
+    pub fn with_samples(self, samples: u8) -> RenderTarget {
+        RenderTarget { samples, ..self }
     }
 
     /// Its colour formats.
@@ -336,23 +354,31 @@ impl fmt::Display for RenderTarget {
         }
         let names: Vec<&str> = self.colors().map(TextureFormat::name).collect();
         match (names.is_empty(), self.depth) {
-            (false, true) => write!(f, "{} with depth", names.join(" and ")),
-            (false, false) => write!(f, "{}", names.join(" and ")),
-            (true, true) => write!(f, "depth alone"),
-            (true, false) => write!(f, "nothing"),
+            (false, true) => write!(f, "{} with depth", names.join(" and "))?,
+            (false, false) => write!(f, "{}", names.join(" and "))?,
+            (true, true) => write!(f, "depth alone")?,
+            (true, false) => write!(f, "nothing")?,
         }
+        if self.samples > 1 {
+            write!(f, " ({}x)", self.samples)?;
+        }
+        Ok(())
     }
 }
 
 impl Serialize for RenderTarget {
     fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut o = s.serialize_struct("RenderTarget", 2 + usize::from(self.screen))?;
+        let extra = usize::from(self.screen) + usize::from(self.samples > 1);
+        let mut o = s.serialize_struct("RenderTarget", 2 + extra)?;
         let colors: Vec<&str> = self.colors().map(TextureFormat::name).collect();
         o.serialize_field("colors", &colors)?;
         o.serialize_field("depth", &self.depth)?;
         if self.screen {
             o.serialize_field("screen", &true)?;
+        }
+        if self.samples > 1 {
+            o.serialize_field("samples", &self.samples)?;
         }
         o.end()
     }
@@ -992,6 +1018,17 @@ impl Manifest {
                                 "pipeline {i}'s target {k} is the screen, whose one colour is {SCREEN_FORMAT}"
                             ));
                         }
+                        if t.samples != 1 && t.samples != 4 {
+                            return err(format!(
+                                "pipeline {i}'s target {k} has {} samples; only 1 or 4 are supported",
+                                t.samples
+                            ));
+                        }
+                        if t.samples > 1 && t.screen {
+                            return err(format!(
+                                "pipeline {i}'s target {k} is the screen, which doesn't use MSAA"
+                            ));
+                        }
                         let colors: Vec<TextureFormat> = t.colors().collect();
                         let bytes = crate::stream::color_attachment_bytes(&colors);
                         let blend = |c: usize| blends.get(c).copied().unwrap_or_default();
@@ -1015,6 +1052,8 @@ impl Manifest {
                                 let uint = outputs[c] == Output::Uint;
                                 if f.is_depth() || f.is_compressed() || !f.renderable() {
                                     Some(format!("a pass can't draw into {}", f.name()))
+                                } else if t.samples > 1 && f.is_uint() {
+                                    Some(format!("an MSAA pass can't resolve integer format {}", f.name()))
                                 } else if uint != f.is_uint() {
                                     Some(format!(
                                         "its fragment shader writes {} to colour {c}, and {} holds {}",
@@ -1211,7 +1250,17 @@ mod read {
                     _ => return fail(format!("{tp}.depth must be true or false")),
                 };
                 let screen = flag(to, "screen", &tp, false)?;
-                Ok(RenderTarget { screen, ..RenderTarget::of(&colors, depth) })
+                let samples = match to.get("samples") {
+                    None => 1u8,
+                    Some(v) => {
+                        let n = u32(to, "samples", &tp)?;
+                        if n != 1 && n != 4 {
+                            return fail(format!("{tp}.samples must be 1 or 4, got {v}"));
+                        }
+                        n as u8
+                    }
+                };
+                Ok(RenderTarget { screen, samples, ..RenderTarget::of(&colors, depth) })
             })
             .collect()
     }
