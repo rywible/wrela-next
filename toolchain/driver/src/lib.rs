@@ -1036,6 +1036,7 @@ fn compile_loaded_in(
         relaxed_simd: mode.relaxed_simd,
         few: mode.conditions && !mode.emit,
         target: mode.target,
+        exact: mode.exact,
         ..Default::default()
     };
     let cache = scope.cache_of(root);

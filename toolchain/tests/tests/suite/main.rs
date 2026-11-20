@@ -17,6 +17,7 @@ mod derive;
 mod diagnostics;
 mod doc_examples;
 mod encodings;
+mod exact;
 mod explain;
 mod format;
 mod fuel;

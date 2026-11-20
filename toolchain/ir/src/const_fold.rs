@@ -49,6 +49,7 @@ pub(crate) fn fold_constants(m: &mut Module, f: &mut Function) -> bool {
         changed: false,
         here: None,
         out_of_fuel: Vec::new(),
+        exact: m.exact,
     };
     let mut st = Places::default();
     f.body = fx.block(f, body, &mut st, &taken);
@@ -117,6 +118,8 @@ struct Folder<'t> {
     here: Option<wrela_diag::Span>,
     /// The loops the fuel ran out for: where each starts.
     out_of_fuel: Vec<Option<wrela_diag::Span>>,
+    /// An exact build ([`Module::exact`]): only what every GPU rounds the same is folded.
+    exact: bool,
 }
 
 impl Folder<'_> {
@@ -488,6 +491,14 @@ impl Folder<'_> {
                 {
                     return None;
                 }
+                // Exact: a float division or remainder is left to the GPU (Vulkan allows its
+                // division 2.5 ULP), so it rounds the same whether its operands are constants.
+                if self.exact
+                    && matches!(op, BinOp::Div | BinOp::Rem)
+                    && float_typed(self.types, f.value_ty(*a))
+                {
+                    return None;
+                }
                 each2(k(a)?, k(b)?, &|x, y| binary(*op, x, y))
             }
             Expr::Convert(x, s) => each1(k(x)?, &|c| convert(c, *s)),
@@ -496,6 +507,11 @@ impl Folder<'_> {
                 select(c, t, e)
             }
             Expr::Builtin(b, args) => {
+                // Exact: only a builtin every GPU rounds as the CPU does is folded (a sine, a
+                // square root, a dot product are the GPU's to round).
+                if self.exact && !rounds_alike(*b) {
+                    return None;
+                }
                 let args = args.iter().map(k).collect::<Option<Vec<_>>>()?;
                 builtin(*b, &args)
             }
@@ -777,6 +793,38 @@ fn floats(k: &K) -> Option<Vec<f32>> {
     }
 }
 
+/// Whether every GPU gives builtin `b` the bits the CPU's folding does: what selects, compares or
+/// rounds to an integer, never what computes a new rounding of its own.
+fn rounds_alike(b: Builtin) -> bool {
+    use Builtin as B;
+    matches!(
+        b,
+        B::Abs
+            | B::Min
+            | B::Max
+            | B::Clamp
+            | B::Saturate
+            | B::Floor
+            | B::Ceil
+            | B::Round
+            | B::Trunc
+            | B::Sign
+            | B::Step
+            | B::AllEqual
+            | B::CountOnes
+            | B::LeadingZeros
+            | B::TrailingZeros
+    )
+}
+
+/// Whether a value of type `t` is a float scalar or vector.
+fn float_typed(types: &Types, t: TypeId) -> bool {
+    matches!(
+        types.get(t),
+        TypeDef::Scalar(Scalar::F32 | Scalar::F16) | TypeDef::Vector(Scalar::F32 | Scalar::F16, _)
+    )
+}
+
 fn builtin(b: Builtin, args: &[K]) -> Option<K> {
     use Builtin as B;
     // Through `f64`, rounded once: within WGSL's error bound for each.
@@ -948,6 +996,7 @@ pub(crate) fn keep_tables(m: &mut Module, f: &mut Function) -> bool {
             changed: false,
             here: None,
             out_of_fuel: Vec::new(),
+            exact: m.exact,
         };
         let none = Places::default();
         visit::walk(&f.body, &mut |s| {

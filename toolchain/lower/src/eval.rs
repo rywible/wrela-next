@@ -67,6 +67,9 @@ pub struct BuildData {
     pub few: bool,
     /// The machine the pipelines are for, whose limits they're checked against.
     pub target: wrela_abi::Target,
+    /// Exact mode (`wrela build --exact`): GPU modules fold only what every GPU rounds alike
+    /// (`ir::Module::exact`).
+    pub exact: bool,
 }
 
 /// The module the build runs to compute some constants.

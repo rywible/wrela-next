@@ -3884,6 +3884,7 @@ fn verify(cx: &mut Cx, mb: &mut ModuleBuilder, name: &str) -> Option<Counts> {
         heavy = ir::rates::heavy_calls(&mb.m, &work);
     }
     if cx.emit {
+        mb.m.exact = cx.data.exact;
         checked = checked
             .and_then(|()| ir::opt::flatten_gpu(&mut mb.m))
             .map(|()| hoist_same(cx, mb))

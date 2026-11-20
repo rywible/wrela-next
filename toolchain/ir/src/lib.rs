@@ -1038,6 +1038,10 @@ pub struct Module {
     /// `__` and its name: a host calls it on a thread of its own, with the thread's number
     /// first (wrela_abi `memory`'s threads), and it runs on that thread's stack.
     pub thread_entries: Vec<(String, FuncId)>,
+    /// GPU only: an exact build's (`wrela build --exact`): what the build computes from constants
+    /// is only what every GPU rounds the same (`const_fold`), so a function's bits don't depend on
+    /// whether its arguments are constants where it's inlined.
+    pub exact: bool,
     /// CPU only: whether the program starts a voice (`std::audio`), so the module imports
     /// `wrela.audio`.
     pub audio: bool,

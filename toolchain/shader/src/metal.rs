@@ -123,6 +123,26 @@ fn entry_name(name: &str) -> String {
 
 /// A name for a struct member, local, parameter or resource: a letter that says which, then
 /// the IR's own name, so no name is a keyword or another's.
+/// The most brackets a value written where it's used may nest: Metal's compiler refuses past
+/// 256 (a sum of 300 calls written as one expression did), so a deeper one gets a name.
+const MOST_NESTING: usize = 64;
+
+/// How deep `text`'s brackets nest.
+fn nesting(text: &str) -> usize {
+    let (mut depth, mut most) = (0usize, 0usize);
+    for b in text.bytes() {
+        match b {
+            b'(' | b'[' | b'{' => {
+                depth += 1;
+                most = most.max(depth);
+            }
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    most
+}
+
 fn named(prefix: &str, name: &str, k: usize) -> String {
     format!("{prefix}{k}_{}", ir::ident(name))
 }
@@ -376,11 +396,13 @@ impl<'m> Writer<'m> {
         // Exact mode: no contraction, so a multiply and an add fused into one rounding only
         // where the product has no other use can't make a function's bits depend on the code
         // around it (`Checks::exact`).
-        out.push_str("#pragma METAL fp math_mode(relaxed)\n");
+        // Exact mode: safe math too, so the compiler can't reassociate or approximate
+        // differently around the same arithmetic as the code around it changes (a change of
+        // inlining moved 48 pixels of the engine's SCENE 8 by 1/255 under relaxed math).
         out.push_str(if self.checks.exact {
-            "#pragma METAL fp contract(off)\n"
+            "#pragma METAL fp math_mode(safe)\n#pragma METAL fp contract(off)\n"
         } else {
-            "#pragma METAL fp contract(fast)\n"
+            "#pragma METAL fp math_mode(relaxed)\n#pragma METAL fp contract(fast)\n"
         });
         // `x == x` is how GPU code asks whether a float is a number: meant, not a slip.
         out.push_str("#pragma clang diagnostic ignored \"-Wtautological-compare\"\n");
@@ -1489,7 +1511,10 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
                     if e.has_effect() && !exchanged {
                         let _ = writeln!(out, "{};", text.text);
                     }
-                } else if pure(e) && (self.uses[v.index()] <= 1 || written_at_each_use(e)) {
+                } else if pure(e)
+                    && (self.uses[v.index()] <= 1 || written_at_each_use(e))
+                    && nesting(&text.text) <= MOST_NESTING
+                {
                     self.vals[v.index()] = Some(text);
                 } else {
                     let name = format!("v{}", v.0);
