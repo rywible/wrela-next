@@ -982,6 +982,8 @@ const RECHECK_LINES: f64 = 4.0;
 /// How many times its usual a pass's draws must take before the guard says so, naming the GPU's
 /// idle before it.
 const USUAL_TIMES: f64 = 3.0;
+/// How many destroyed handles the host remembers, to say when one a command names went.
+const GONE_KEPT: usize = 1 << 16;
 
 /// What the light passes of one submission may have taken, summed, as a share of the line.
 const LIGHT_JOB: f64 = 1.0 / 4.0;
@@ -1127,6 +1129,9 @@ pub(crate) struct Gpu {
     bind_groups: Vec<HashMap<Arc<[Binding]>, wrela_gpu::BindGroup>>,
     /// For each resource, the cached bind groups it's in: destroying it drops them.
     bound_in: HashMap<u32, HashSet<BindGroupKey>>,
+    /// Handles destroyed, with the frame and the call they were destroyed in, so a command that
+    /// names one after says when it went (`no_buffer`); the oldest forgotten past `GONE_KEPT`.
+    gone: HashMap<u32, (usize, usize)>,
     /// The uniform ring, bound with dynamic offsets, and the upload ring.
     ring: Ring,
     upload: Ring,
@@ -1552,6 +1557,7 @@ impl Gpu {
             resources: HashMap::new(),
             bind_groups: vec![HashMap::new(); manifest.pipelines.len()],
             bound_in: HashMap::new(),
+            gone: HashMap::new(),
             ring,
             upload,
             encoder: None,
@@ -2428,6 +2434,10 @@ impl Gpu {
     /// Forgets a destroyed resource, and the cached bind groups it's in. Work already recorded
     /// holds its own references until the GPU is done.
     fn destroy(&mut self, handle: u32) {
+        if self.gone.len() >= GONE_KEPT {
+            self.gone.clear();
+        }
+        self.gone.insert(handle, (self.frame, self.calls));
         self.resources.remove(&handle);
         self.made.remove(&handle);
         for group in self.bound_in.remove(&handle).unwrap_or_default() {
@@ -3551,7 +3561,7 @@ impl Gpu {
     pub(crate) fn read_range(&mut self, handle: u32, offset: u32, size: u32) -> Result<Vec<u8>> {
         self.flush()?;
         let Some(Resource::Buffer(buffer)) = self.resources.get(&handle) else {
-            return Err(Error::Gpu(format!("there's no buffer {handle}")));
+            return Err(self.no_buffer(handle));
         };
         let staging = staging(&self.device, &mut self.buffer_readback, u64::from(size.max(4)));
         let bytes = self.copy_back(buffer, u64::from(offset), u64::from(size), &staging)?;
@@ -3593,8 +3603,26 @@ impl Gpu {
     pub(crate) fn buffer_size(&self, handle: u32) -> Result<u64> {
         match self.resources.get(&handle) {
             Some(Resource::Buffer(b)) => Ok(b.size()),
-            _ => Err(Error::Gpu(format!("there's no buffer {handle}"))),
+            _ => Err(self.no_buffer(handle)),
         }
+    }
+
+    /// What a command naming `handle` as a buffer finds instead: a texture or a sampler, or a
+    /// handle destroyed (when), or one never made on this device.
+    fn no_buffer(&self, handle: u32) -> Error {
+        let what = match (self.resources.get(&handle), self.gone.get(&handle)) {
+            (Some(Resource::Texture(_)), _) => "it is a texture".to_string(),
+            (Some(Resource::Sampler(_)), _) => "it is a sampler".to_string(),
+            (_, Some((frame, call))) => format!(
+                "it was destroyed in frame {frame} (call {call}; this is frame {}, call {})",
+                self.frame, self.calls
+            ),
+            _ => format!(
+                "no buffer was made with it on this device (frame {}, call {}, device epoch {})",
+                self.frame, self.calls, self.program_limits.epoch
+            ),
+        };
+        Error::Gpu(format!("there's no buffer {handle}: {what}"))
     }
 
     /// Copies a whole buffer back to the CPU (waits for the GPU): for tests.
