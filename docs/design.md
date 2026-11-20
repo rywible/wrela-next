@@ -433,11 +433,21 @@ the judge already sees 3.2 px. What would let cells grow is shading that costs b
 by the fragment: at 2 px cells, the 16 local emitters cost 3.2 ms of SCENE 10's frame and
 re-extracting its moving things 6.8 ms (each measured by removing it, `--cpu`, M4).
 
-**Serial timestamps lie about empty indirect passes on the M4.** With `--timestamps --serial`, an
+**Serial timestamps of empty passes on the M4 (fixed).** With `--timestamps --serial`, an
 indirect dispatch of zero groups (an extraction chunk past the last brick) reported 0.4 to 28 ms;
-removing those chunks changed the `--cpu` frame time by 0.01 ms (17.40 vs 17.39 ms). Judge
-extraction by `--cpu` A/B runs, not by a serial timestamp sum, until the host times such passes
-correctly.
+removing those chunks changed the `--cpu` frame time by 0.01 ms (17.40 vs 17.39 ms). The cause:
+an Apple GPU takes a compute encoder's start sample as its first threadgroup launches, so an
+encoder that launches none has no start of its own, and its slot keeps an earlier pass's start
+(an empty `eval_corners` read the previous chunk's `emit_tris` start, an empty `classify_cells`
+the previous chunk's own) or zero (frame 0's span read 271,857,503 ms). Now a timed compute pass
+on Metal launches a one-thread no-op kernel before any dispatch that may launch nothing (indirect,
+or a direct one of zero groups; `ComputePass::anchor`), which adds under 1 µs to a timed indirect
+dispatch and nothing to an untimed run. And the pieces of a cut render pass now wait for one
+another in a serial run, as passes do (the M4 overlapped them: `mesh_shadow` pieces began 150 µs
+before the one before ended). SCENE 10, M4, 1080p, frames 1 to 3 serial: passes starting before
+the one before ended 129 → 0; the frame's serial sum 30.4–35.2 → 22.0–22.5 ms (the `--cpu` frame
+is 23.1 ms); empty chunks' `eval_corners` + `classify_cells` 0.4–2.1 ms each → 1.5–2.1 µs. The
+host test `a_serial_run_times_a_dispatch_of_no_groups_as_itself` holds it (`tools/check` runs it).
 
 **Measured on both machines (2026-11-20, 1920×1080, 4× MSAA, `--cpu` steady state; HEAD = the
 commit before this one, same session):**

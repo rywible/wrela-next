@@ -2986,6 +2986,11 @@ impl Gpu {
             self.record_piece(op, &pass, &formats, &name, items, k == 0, k == last, true)?;
             self.job_piece = Some(Piece { label: name.clone(), draws: range, of: draws });
             self.submit(on_screen && k == last)?;
+            // Serial: each piece alone too, so its time is its own (on an Apple GPU a render
+            // pass's vertex work overlaps the fragments of the one submitted before it).
+            if k != last && self.timer.as_ref().is_some_and(|t| t.serial) {
+                wait(&self.device)?;
+            }
         }
         self.counters.render_passes += 1;
         if on_screen { Ok(()) } else { self.alone() }

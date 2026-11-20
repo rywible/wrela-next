@@ -1263,3 +1263,61 @@ mod target_tests {
         assert_eq!(as_rgba8(TextureFormat::Rg16Float, &t[..4]), [128, 255, 0, 255]);
     }
 }
+
+/// A serial run times a dispatch that launches no groups as itself: an indirect one whose
+/// arguments a kernel just wrote as zero groups (an extraction chunk past the last brick), and a
+/// direct one of zero groups. An Apple GPU takes an encoder's start sample as its first
+/// threadgroup launches, so such a pass's slot kept an earlier pass's start, or zero: SCENE 10's
+/// empty chunks read 0.4 to 8.6 ms, and the frame's span days (`ComputePass::anchor` in
+/// `wrela_gpu`'s Metal backend). Here the direct one shows it on the M4 every run (a start
+/// before the pass before it ended, or none); the indirect ones, here, were sampled even before.
+#[test]
+#[ignore = "needs a GPU"]
+fn a_serial_run_times_a_dispatch_of_no_groups_as_itself() {
+    // Well above the few microseconds such a pass takes, and below what it read when wrong. A
+    // label's median: one pass now and then waits on another of the GPU's clients.
+    const BOUND_US: f64 = 100.0;
+    let (manifest, shaders) = increment();
+    let mut gpu = Gpu::new(&manifest, &shaders, Timing::Serial, false).unwrap();
+    gpu.create_buffer(1, 4);
+    gpu.create_buffer(2, 12);
+    let mut times: HashMap<String, Vec<f64>> = HashMap::new();
+    for frame in 0..4 {
+        gpu.set_frame(frame);
+        for _ in 0..4 {
+            // The arguments' groups wrap to zero on the GPU, as a `prep_*` kernel writes them.
+            gpu.write_buffer(2, 0, &[u32::MAX, 1, 1].map(u32::to_le_bytes).concat()).unwrap();
+            gpu.label = Some(Arc::from("prep"));
+            gpu.dispatch(0, Ok([1, 1, 1]), &[Binding::range(2, 0, 4)], &[]).unwrap();
+            for label in ["empty indirect", "empty indirect again"] {
+                gpu.label = Some(Arc::from(label));
+                gpu.dispatch(0, Err((2, 0, 64)), &[Binding::range(1, 0, 4)], &[]).unwrap();
+            }
+            gpu.label = Some(Arc::from("empty direct"));
+            gpu.dispatch(0, Ok([0, 1, 1]), &[Binding::range(1, 0, 4)], &[]).unwrap();
+        }
+        let timings = gpu.take_timings().unwrap();
+        assert_eq!(timings.len(), 16);
+        for (k, t) in timings.iter().enumerate() {
+            // Each ran alone, after the one before it was done.
+            assert!(t.start > 0.0, "frame {frame}: `{}` has no start", t.label);
+            if let Some(before) = k.checked_sub(1).map(|k| &timings[k]) {
+                assert!(
+                    t.start >= before.end,
+                    "frame {frame}: `{}` began {:.1} us before `{}` ended",
+                    t.label,
+                    (before.end - t.start) / 1e3,
+                    before.label
+                );
+            }
+            times.entry(t.label.clone()).or_default().push(t.nanos / 1e3);
+        }
+    }
+    for (label, us) in times {
+        let median = median(us);
+        assert!(median <= BOUND_US, "`{label}` took {median:.1} us (median)");
+    }
+    // No group ran: the count is untouched.
+    assert_eq!(gpu.read_buffer(1).unwrap(), 0u32.to_le_bytes());
+    gpu.check_errors().unwrap();
+}

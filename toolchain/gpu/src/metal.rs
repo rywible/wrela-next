@@ -49,6 +49,10 @@ struct Shared {
     features: Features,
     /// The timestamp counter set, where the device samples at stage boundaries.
     timestamps: Option<Id<dyn MTLCounterSet>>,
+    /// A kernel of one thread that does nothing, launched in a timed compute pass before a
+    /// dispatch that may launch no threadgroups ([`ComputePass::anchor`]), where the device has
+    /// timestamps.
+    anchor: Option<Id<dyn MTLComputePipelineState>>,
     submitted: AtomicU64,
     completed: Arc<AtomicU64>,
     /// Each recent submission's span on the GPU's clock (seconds): the first of its command
@@ -270,6 +274,7 @@ impl Device {
             if timestamps.is_some() {
                 features.push("timestamp-query");
             }
+            let anchor = timestamps.is_some().then(|| anchor_kernel(&raw)).transpose()?;
             let features = match &options.features {
                 Some(keep) => {
                     Features(features.into_iter().filter(|f| keep.iter().any(|k| k == f)).collect())
@@ -283,6 +288,7 @@ impl Device {
                 limits,
                 features,
                 timestamps,
+                anchor,
                 submitted: AtomicU64::new(0),
                 completed: Arc::new(AtomicU64::new(0)),
                 clock: Arc::new(Mutex::new(std::collections::VecDeque::new())),
@@ -1063,6 +1069,20 @@ fn encode_write(blit: &ProtocolObject<dyn MTLBlitCommandEncoder>, w: &PendingWri
     }
 }
 
+/// The kernel that anchors a timed compute encoder's samples: one thread that does nothing.
+fn anchor_kernel(d: &ProtocolObject<dyn MTLDevice>) -> Result<Id<dyn MTLComputePipelineState>> {
+    autoreleasepool(|_| {
+        let source = "kernel void wrela_anchor() {}";
+        let library = d
+            .newLibraryWithSource_options_error(&ns(source), Some(&MTLCompileOptions::new()))
+            .map_err(|e| Error(format!("the timestamp anchor's MSL: {}", error_text(&e))))?;
+        let function =
+            library.newFunctionWithName(&ns("wrela_anchor")).ok_or("the anchor has no kernel")?;
+        d.newComputePipelineStateWithFunction_error(&function)
+            .map_err(|e| Error(format!("the timestamp anchor's pipeline: {}", error_text(&e))))
+    })
+}
+
 /// The device's timestamp counter set, where it samples at stage boundaries.
 fn timestamp_counters(d: &ProtocolObject<dyn MTLDevice>) -> Option<Id<dyn MTLCounterSet>> {
     if !d.supportsCounterSampling(MTLCounterSamplingPoint::AtStageBoundary) {
@@ -1534,7 +1554,15 @@ impl CommandEncoder {
             .expect("Metal made no compute encoder");
         encoder.setLabel(Some(&ns(label)));
         let table = self.device.0.table.clone();
-        ComputePass { encoder, pipeline: None, keep: &mut self.keep, table, table_set: false }
+        let anchor = timestamps.and(self.device.0.anchor.clone());
+        ComputePass {
+            encoder,
+            pipeline: None,
+            anchor,
+            keep: &mut self.keep,
+            table,
+            table_set: false,
+        }
     }
 
     pub fn begin_render_pass(&mut self, desc: &RenderPassDesc<'_>) -> RenderPass<'_> {
@@ -1630,7 +1658,17 @@ fn slice_of(c: &TextureCopy<'_>) -> (NSUInteger, NSUInteger) {
 
 pub struct ComputePass<'a> {
     encoder: Id<dyn MTLComputeCommandEncoder>,
-    pipeline: Option<MTLSize>,
+    /// The pipeline set, and its threadgroup's size.
+    pipeline: Option<(Id<dyn MTLComputePipelineState>, MTLSize)>,
+    /// A timed pass's anchor ([`Shared::anchor`]), until a threadgroup has launched in it.
+    ///
+    /// An Apple GPU samples an encoder's start as its first threadgroup launches: an encoder
+    /// that launches none (an indirect dispatch of zero groups, or a direct one) gets no start
+    /// of its own, and its slot keeps what was there, an earlier pass's start or zero (a serial
+    /// run read 0.4 to 8.6 ms for SCENE 10's empty extraction chunks, 1.5 to 2.1 us once
+    /// anchored). Before a dispatch that may launch none, a timed pass launches the anchor's one
+    /// thread, so both its samples are its own.
+    anchor: Option<Id<dyn MTLComputePipelineState>>,
     keep: &'a mut Vec<Arc<Group>>,
     table: Arc<Table>,
     /// Whether the table is bound in this encoder yet.
@@ -1640,7 +1678,19 @@ pub struct ComputePass<'a> {
 impl ComputePass<'_> {
     pub fn set_pipeline(&mut self, p: &ComputePipeline) {
         self.encoder.setComputePipelineState(&p.raw);
-        self.pipeline = Some(p.workgroup);
+        self.pipeline = Some((p.raw.clone(), p.workgroup));
+    }
+
+    /// Launches the anchor's one thread, if the pass is timed and nothing has launched in it
+    /// yet, then sets the pass's own pipeline again ([`ComputePass::anchor`]).
+    fn anchor(&mut self) {
+        let Some(anchor) = self.anchor.take() else { return };
+        let one = MTLSize { width: 1, height: 1, depth: 1 };
+        self.encoder.setComputePipelineState(&anchor);
+        self.encoder.dispatchThreadgroups_threadsPerThreadgroup(one, one);
+        if let Some((p, _)) = &self.pipeline {
+            self.encoder.setComputePipelineState(p);
+        }
     }
 
     pub fn set_bind_group(&mut self, group: &BindGroup, offsets: &[u32]) {
@@ -1690,18 +1740,25 @@ impl ComputePass<'_> {
     }
 
     pub fn dispatch(&mut self, x: u32, y: u32, z: u32) {
-        let wg = self.pipeline.expect("a pipeline is set");
-        self.encoder.dispatchThreadgroups_threadsPerThreadgroup(size([x, y, z]), wg);
+        if x == 0 || y == 0 || z == 0 {
+            self.anchor();
+        } else {
+            self.anchor = None;
+        }
+        let (_, wg) = self.pipeline.as_ref().expect("a pipeline is set");
+        self.encoder.dispatchThreadgroups_threadsPerThreadgroup(size([x, y, z]), *wg);
     }
 
+    /// Dispatches the groups `buffer` holds at `offset`, as the GPU reads them.
     pub fn dispatch_indirect(&mut self, buffer: &Buffer, offset: u64) {
-        let wg = self.pipeline.expect("a pipeline is set");
+        self.anchor();
+        let (_, wg) = self.pipeline.as_ref().expect("a pipeline is set");
         unsafe {
             self.encoder
                 .dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(
                     &buffer.raw,
                     offset as NSUInteger,
-                    wg,
+                    *wg,
                 );
         }
     }
