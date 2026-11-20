@@ -1,0 +1,711 @@
+// Signature parry-spellcraft showcase (`SCENE=10`): a ruined coastal basalt temple dais above
+// golden-hour ocean swells where one mage answers a storm of razor-sharp refractive glass shards
+// with a golden transmutation ward, shattering the glass into incandescent sparks and cascading
+// mineral sand that collides analytically against the wet flagstones and broken columns.
+//
+// 100% pure fields (zero GPU code, zero meshes, zero textures): the engine realises every surface,
+// refractive glass shard, ocean clipmap, volumetric sea mist, auto-extracted firelight, and
+// 16,384-grain GPU transmutation cloud automatically.
+
+use engine::matter::height::{Height, HeightSample}
+use engine::matter::medium::{Medium, MediumSample}
+use engine::matter::substance::Substance
+use engine::matter::swarm::{GrainSeed, Swarm}
+use kit::substances::pbr::{basalt, dielectric, emissive, glass, metal, sand, stone, water}
+use std::cmp::Eq
+use std::field::{Bound, Field, Surface, hash_u32}
+use std::hash::StateHash
+
+/// Smooth minimum helper for organic flame/crystal joins.
+fn smin(a: f32, b: f32, k: f32) -> f32 {
+    let h = max(k - abs(a - b), 0.0) / k
+    min(a, b) - h * h * k * 0.25
+}
+
+/// Exact SDF of an upright cylinder centred at `(cx, cz)` from `y_lo` to `y_hi` with radius `r`.
+fn sd_cyl(p: vec3, cx: f32, cz: f32, y_lo: f32, y_hi: f32, r: f32) -> f32 {
+    let dr = length(vec2(p.x - cx, p.z - cz)) - r
+    let dy = max(p.y - y_hi, y_lo - p.y)
+    length(max(vec2(dr, dy), vec2(0.0))) + min(max(dr, dy), 0.0)
+}
+
+/// Exact SDF of an axis-aligned box centred at `c` with half-extents `h`.
+fn sd_box(p: vec3, c: vec3, h: vec3) -> f32 {
+    let q = abs(p - c) - h
+    length(max(q, vec3(0.0))) + min(max(q.x, max(q.y, q.z)), 0.0)
+}
+
+/// Exact SDF of a tapered capsule/spear segment from `a` to `b` with radii `ra` -> `rb`.
+fn sd_spear(p: vec3, a: vec3, b: vec3, ra: f32, rb: f32) -> f32 {
+    let pa = p - a
+    let ba = b - a
+    let h = clamp(dot(pa, ba) / max(dot(ba, ba), 1.0e-6), 0.0, 1.0)
+    length(pa - ba * h) - mix(ra, rb, h)
+}
+
+/// Deterministic float in `[0, 1)` from integer hash `x`.
+fn rand01(x: u32) -> f32 {
+    f32(hash_u32(x) & 16777215) / 16777216.0
+}
+
+// =================================================================================================
+// 1. Stepped Rain-Slick Basalt Temple Courtyard (still, extracted once on frame 0)
+// =================================================================================================
+
+pub struct ArenaCourtyard: Copy + GpuData + Eq + StateHash {
+    pub spare: f32,
+}
+
+pub fn arena_courtyard() -> ArenaCourtyard {
+    ArenaCourtyard { spare: 0.0 }
+}
+
+impl Surface for ArenaCourtyard {
+    fn distance(self, p: vec3) -> f32 {
+        let d_top = sd_cyl(p, cx: 0.0, cz: 0.0, y_lo: -0.30, y_hi: 0.0, r: 6.2)
+        let d_mid = sd_cyl(p, cx: 0.0, cz: 0.0, y_lo: -0.62, y_hi: -0.24, r: 7.1)
+        let d_base = sd_cyl(p, cx: 0.0, cz: 0.0, y_lo: -2.0, y_hi: -0.58, r: 8.1)
+        let r = length(p.xz)
+        let d_curb_r = abs(r - 6.02) - 0.18
+        let d_curb_y = max(p.y - 0.14, -0.10 - p.y)
+        let d_curb_arc = p.z - 0.8
+        let d_curb = max(max(d_curb_r, d_curb_y), d_curb_arc)
+        min(min(min(d_top, d_mid), d_base), d_curb)
+    }
+
+    fn bound(self) -> Bound {
+        Bound { centre: vec3(0.0, -0.9, 0.0), radius: 8.6, slope: 0.5 }
+    }
+
+    fn lipschitz(self, _near: f32) -> f32 {
+        1.0
+    }
+}
+
+impl Field<Substance> for ArenaCourtyard {
+    fn channels(self, p: vec3) -> Substance {
+        let r = length(p.xz)
+        // Concentric inlaid gold arcane dueling circles flush in the upper courtyard, blended over
+        // a soft edge so the inlay reads as one clean line at the floor's material resolution.
+        let ring_inner = abs(r - 2.65)
+        let ring_outer = abs(r - 4.75)
+        let inlay = if p.y > -0.05 {
+            max(1.0 - smoothstep(0.05, 0.14, ring_inner), 1.0 - smoothstep(0.06, 0.15, ring_outer))
+        } else {
+            0.0
+        }
+        let gold = metal(vec3(0.92, 0.68, 0.24), roughness: 0.22)
+        if inlay >= 0.999 {
+            return gold
+        }
+        // Raised weathered dark stone coping blocks along the back rim.
+        if p.y > 0.025 && r > 5.75 {
+            return stone(vec3(0.16, 0.16, 0.165), roughness: 0.78, micro: 0.60)
+        }
+        // Dark volcanic basalt flagstones + glossy rain puddles for dramatic fire/parry SSR.
+        let fx = abs(fract(p.x * 0.62) - 0.5)
+        let fz = abs(fract(p.z * 0.62) - 0.5)
+        let seam = smoothstep(0.455, 0.495, max(fx, fz))
+        let puddle_wave = 0.5 + 0.5 * (
+            sin(p.x * 0.68 + p.z * 0.48) * cos(p.x * 0.34 - p.z * 0.78) +
+            0.35 * sin(p.x * 1.25 - p.z * 0.95)
+        )
+        let puddle = smoothstep(0.46, 0.78, puddle_wave) * (1.0 - seam)
+        let wet_floor = basalt(
+            albedo: mix(vec3(0.085, 0.090, 0.100), vec3(0.032, 0.038, 0.048), vec3(puddle)),
+            wetness: mix(0.20, 0.94, puddle),
+        )
+        if p.y < -0.18 {
+            let moss = smoothstep(-0.35, -0.75, p.y)
+            let step_col = mix(vec3(0.13, 0.135, 0.135), vec3(0.07, 0.12, 0.09), vec3(moss))
+            return dielectric(step_col, roughness: mix(0.76, 0.40, moss), micro: 0.55)
+        }
+        let floor = Substance {
+            albedo: wet_floor.albedo * (1.0 - seam * 0.55),
+            roughness: mix(0.52, 0.07, puddle) + seam * 0.35,
+            coat: mix(0.15, 0.94, puddle) * (1.0 - seam),
+            ..wet_floor
+        }
+        floor.blend(gold, inlay)
+    }
+}
+
+// =================================================================================================
+// 2. Broken Fluted Temple Pillars with Glowing Arcane Runes (still, extracted once on frame 0)
+// =================================================================================================
+
+pub struct ArenaPillars: Copy + GpuData + Eq + StateHash {
+    pub spare: f32,
+}
+
+pub fn arena_pillars() -> ArenaPillars {
+    ArenaPillars { spare: 0.0 }
+}
+
+/// Evaluates one fluted broken temple column at `(cx, cz)` reaching height `h_top` with tilted break.
+fn sd_pillar(p: vec3, cx: f32, cz: f32, h_top: f32, tilt_x: f32, tilt_z: f32) -> f32 {
+    let lx = p.x - cx
+    let lz = p.z - cz
+    let r = length(vec2(lx, lz))
+    let ang = atan2(lz, lx)
+    let plinth = sd_box(vec3(lx, p.y, lz), vec3(0.0, 0.22, 0.0), vec3(0.68, 0.24, 0.68))
+    let collar = sd_cyl(p, cx: cx, cz: cz, y_lo: 0.42, y_hi: 0.60, r: 0.56)
+    let flute = 0.028 * cos(ang * 10.0)
+    let cut_y = h_top + lx * tilt_x + lz * tilt_z + 0.08 * sin(ang * 3.0)
+    let shaft_r = r - (0.46 - flute)
+    let shaft_y = max(p.y - cut_y, 0.40 - p.y)
+    let shaft = length(max(vec2(shaft_r, shaft_y), vec2(0.0))) + min(max(shaft_r, shaft_y), 0.0)
+    min(min(plinth, collar), shaft)
+}
+
+impl Surface for ArenaPillars {
+    fn distance(self, p: vec3) -> f32 {
+        let p0 = sd_pillar(p, cx: -4.7, cz: -3.2, h_top: 4.9, tilt_x: 0.42, tilt_z: 0.25)
+        let p1 = sd_pillar(p, cx: -2.0, cz: -4.9, h_top: 5.6, tilt_x: -0.20, tilt_z: 0.30)
+        let p2 = sd_pillar(p, cx: 2.2, cz: -4.9, h_top: 5.2, tilt_x: 0.35, tilt_z: -0.22)
+        let p3 = sd_pillar(p, cx: 4.9, cz: -3.0, h_top: 3.8, tilt_x: -0.55, tilt_z: 0.18)
+        let lintel = sd_box(p, vec3(0.1, 5.25, -4.9), vec3(2.55, 0.34, 0.46))
+        let fallen = sd_spear(p, vec3(4.1, 0.36, -1.6), vec3(5.3, 0.34, -0.9), ra: 0.36, rb: 0.35)
+        min(min(min(min(min(p0, p1), p2), p3), lintel), fallen)
+    }
+
+    fn bound(self) -> Bound {
+        Bound { centre: vec3(0.1, 2.6, -3.2), radius: 6.8, slope: 0.5 }
+    }
+
+    fn lipschitz(self, _near: f32) -> f32 {
+        1.04
+    }
+}
+
+impl Field<Substance> for ArenaPillars {
+    fn channels(self, p: vec3) -> Substance {
+        // The toppled drum lies apart from every standing column: dry, rough, chipped basalt.
+        let fallen = sd_spear(p, vec3(4.1, 0.36, -1.6), vec3(5.3, 0.34, -0.9), ra: 0.36, rb: 0.35)
+        if fallen < 0.08 {
+            let chips = 0.5 + 0.5 * sin(p.x * 23.0 + p.z * 17.0) * sin(p.y * 29.0 - p.x * 11.0)
+            return stone(mix(vec3(0.115, 0.112, 0.108), vec3(0.20, 0.19, 0.175), vec3(chips)), roughness: 0.9, micro: 0.75)
+        }
+        if p.y > 0.44 && p.y < 0.58 {
+            return metal(vec3(0.54, 0.38, 0.19), roughness: 0.30)
+        }
+        // Softly glowing carved amber runes ringing the columns (`< EMIT_THRESH`, illuminating via 3D GI).
+        let rune_band = abs(p.y - 2.35)
+        if rune_band < 0.065 && p.z < -2.3 {
+            let pattern = sin(p.x * 11.0 + p.z * 8.5)
+            if pattern > 0.25 {
+                return emissive(vec3(1.0, 0.78, 0.36), vec3(5.8, 2.8, 0.55), roughness: 0.22)
+            }
+        }
+        let wear = clamp((p.y - 0.2) * 0.18, 0.0, 1.0)
+        let col = mix(vec3(0.14, 0.145, 0.15), vec3(0.24, 0.23, 0.215), vec3(wear))
+        stone(col, roughness: 0.82, micro: 0.65)
+    }
+}
+
+// =================================================================================================
+// 3. Wrought-Bronze Temple Braziers (still carved chalices + 4 tight `many` animated flames)
+// =================================================================================================
+
+pub struct ArenaBrazierStands: Copy + GpuData + Eq + StateHash {
+    pub spare: f32,
+}
+
+pub fn arena_brazier_stands() -> ArenaBrazierStands {
+    ArenaBrazierStands { spare: 0.0 }
+}
+
+/// Sculpted flared open bronze temple chalice resting on a stepped plinth and fluted column stem.
+fn sd_brazier_stand(p: vec3, cx: f32, cz: f32) -> f32 {
+    let base = sd_cyl(p, cx: cx, cz: cz, y_lo: 0.0, y_hi: 0.16, r: 0.40)
+    let foot = sd_cyl(p, cx: cx, cz: cz, y_lo: 0.14, y_hi: 0.30, r: 0.26)
+    let stem = sd_cyl(p, cx: cx, cz: cz, y_lo: 0.26, y_hi: 0.94, r: 0.11)
+    // Flared chalice cup (wider at top `y = 1.18`), hollowed out on top so flames sit inside.
+    let lr = length(vec2(p.x - cx, p.z - cz))
+    let cup_t = clamp((p.y - 0.88) / 0.32, 0.0, 1.0)
+    let cup_r = mix(0.16, 0.44, cup_t * 0.8 + cup_t * cup_t * 0.2)
+    let outer = max(lr - cup_r, max(p.y - 1.20, 0.88 - p.y))
+    let scoop = length(vec3(p.x - cx, (p.y - 1.30) * 1.1, p.z - cz)) - 0.38
+    let bowl = max(outer, -scoop)
+    let rim = length(vec2(lr - 0.43, p.y - 1.18)) - 0.045
+    min(min(min(base, foot), stem), min(bowl, rim))
+}
+
+impl Surface for ArenaBrazierStands {
+    fn distance(self, p: vec3) -> f32 {
+        let b0 = sd_brazier_stand(p, cx: -4.2, cz: 2.3)
+        let b1 = sd_brazier_stand(p, cx: 4.4, cz: 2.1)
+        let b2 = sd_brazier_stand(p, cx: -3.5, cz: -2.5)
+        let b3 = sd_brazier_stand(p, cx: 3.7, cz: -2.4)
+        min(min(b0, b1), min(b2, b3))
+    }
+
+    fn bound(self) -> Bound {
+        Bound { centre: vec3(0.1, 0.65, 0.0), radius: 5.8, slope: 0.5 }
+    }
+
+    fn lipschitz(self, _near: f32) -> f32 {
+        1.0
+    }
+}
+
+impl Field<Substance> for ArenaBrazierStands {
+    fn channels(self, _p: vec3) -> Substance {
+        metal(vec3(0.46, 0.31, 0.16), roughness: 0.34, micro: 0.28)
+    }
+}
+
+/// One compact animated brazier fire core (`many` extracts all 4 in < 0.1 ms/frame).
+pub struct ArenaFlame: Copy + GpuData + Eq + StateHash {
+    pub centre: vec3,
+    pub time: f32,
+    pub phase: f32,
+    pub pad0: f32,
+    pub pad1: f32,
+    pub pad2: f32,
+}
+
+pub fn arena_flames(time: f32) -> [ArenaFlame; 4] {
+    [
+        ArenaFlame { centre: vec3(-4.2, 1.16, 2.3), time, phase: 0.0, pad0: 0.0, pad1: 0.0, pad2: 0.0 },
+        ArenaFlame { centre: vec3(4.4, 1.16, 2.1), time, phase: 1.7, pad0: 0.0, pad1: 0.0, pad2: 0.0 },
+        ArenaFlame { centre: vec3(-3.5, 1.16, -2.5), time, phase: 3.4, pad0: 0.0, pad1: 0.0, pad2: 0.0 },
+        ArenaFlame { centre: vec3(3.7, 1.16, -2.4), time, phase: 5.1, pad0: 0.0, pad1: 0.0, pad2: 0.0 },
+    ]
+}
+
+impl Surface for ArenaFlame {
+    fn distance(self, p: vec3) -> f32 {
+        let c = self.centre
+        let t = self.time
+        let ph = self.phase
+        let sway_x = 0.07 * sin(t * 5.2 + ph)
+        let sway_z = 0.06 * cos(t * 4.4 + ph * 1.3)
+        let tall = 0.62 + 0.12 * sin(t * 7.0 + ph)
+        let core = sd_spear(p, c + vec3(0.0, 0.02, 0.0), c + vec3(sway_x, tall, sway_z), ra: 0.22, rb: 0.04)
+        let lick = sd_spear(
+            p,
+            c + vec3(-sway_x * 0.5, 0.12, sway_z * 0.5),
+            c + vec3(-sway_x * 1.3, tall + 0.16, -sway_z * 1.1),
+            ra: 0.12,
+            rb: 0.025,
+        )
+        smin(core, lick, 0.09)
+    }
+
+    fn bound(self) -> Bound {
+        Bound { centre: self.centre + vec3(0.0, 0.36, 0.0), radius: 0.55, slope: 0.5 }
+    }
+
+    fn lipschitz(self, _near: f32) -> f32 {
+        1.0
+    }
+}
+
+impl Field<Substance> for ArenaFlame {
+    fn channels(self, p: vec3) -> Substance {
+        let h = clamp((p.y - self.centre.y) / 0.68, 0.0, 1.0)
+        let flicker = 0.90 + 0.14 * sin(self.time * 9.0 + self.phase)
+        let emit = mix(vec3(22.0, 9.5, 1.8), vec3(13.0, 3.2, 0.45), vec3(h)) * flicker
+        emissive(vec3(1.0, 0.72, 0.28), emit, roughness: 0.25)
+    }
+}
+
+// =================================================================================================
+// 4. Golden Arcane Parry Ward Arc + Rival Sapphire Casting Orb
+// =================================================================================================
+
+pub struct ParryArc: Copy + GpuData + Eq + StateHash {
+    pub time: f32,
+    pub pad0: f32,
+    pub pad1: f32,
+    pub pad2: f32,
+}
+
+pub fn parry_arc(time: f32) -> ParryArc {
+    ParryArc { time, pad0: 0.0, pad1: 0.0, pad2: 0.0 }
+}
+
+/// Where the glass strikes the ward: the centre of its face, which the tether and the sand meet.
+const WARD_IMPACT: vec3 = vec3(-0.35, 1.38, 0.20)
+/// The ward's facing (unit, in the ground plane): toward the rival, turned 40° toward the eye so
+/// its face reads instead of being seen edge-on.
+const WARD_FACING: vec3 = vec3(0.766, 0.0, 0.643)
+const WARD_RADIUS: f32 = 1.32
+
+/// `p` in the ward's frame: `x` along its facing from the shell's centre, `y` up, `z` across.
+fn ward_local(p: vec3) -> vec3 {
+    let c = WARD_IMPACT - WARD_FACING * WARD_RADIUS
+    let q = p - c
+    vec3(dot(q, WARD_FACING), q.y, q.z * WARD_FACING.x - q.x * WARD_FACING.z)
+}
+
+impl Surface for ParryArc {
+    fn distance(self, p: vec3) -> f32 {
+        // Sculpted curved golden crescent parry ward: a clipped spherical shell around `WARD_IMPACT`.
+        let q = ward_local(p)
+        let r = length(q)
+        let wave = 0.03 * sin(q.y * 5.0 - self.time * 6.5) * cos(q.z * 4.0 + self.time * 4.0)
+        let shell = abs(r - (WARD_RADIUS + wave)) - 0.036
+        let clip_x = 0.68 - q.x
+        let clip_y = abs(q.y) - 1.05
+        let clip_z = abs(q.z) - 1.12
+        let shield = max(shell, max(clip_x, max(clip_y, clip_z)))
+
+        // Concentric golden impact ripple ring standing just proud of the parry face.
+        let r_yz = length(vec2(q.y, q.z))
+        let ring_r = 0.64 + 0.07 * sin(self.time * 4.5)
+        let ring_d = length(vec2(r_yz - ring_r, q.x - 1.18)) - 0.036
+
+        // Focused golden spell tether from the hero caster's raised wand into the parry arc core.
+        let beam = sd_spear(p, vec3(-2.45, 1.24, 0.30), WARD_IMPACT - vec3(0.01, 0.0, 0.0), ra: 0.022, rb: 0.048)
+        smin(min(shield, ring_d), beam, 0.07)
+    }
+
+    fn bound(self) -> Bound {
+        Bound { centre: vec3(-1.0, 1.38, 0.10), radius: 2.35, slope: 0.5 }
+    }
+
+    fn lipschitz(self, _near: f32) -> f32 {
+        1.05
+    }
+}
+
+impl Field<Substance> for ParryArc {
+    fn channels(self, p: vec3) -> Substance {
+        let q = ward_local(p)
+        let r_face = length(vec2(q.y, q.z))
+        // Two ripples racing outward from the point of impact: thin white-hot gold filaments
+        // (bright enough to light the arena) over a dark smoky-amber body, a hot core where the
+        // glass strikes and a warm rim, so the ward reads as carved light, not a flat slab.
+        var rings = 0.0
+        for k in 0..2 {
+            let front = fract(self.time * 0.55 + f32(k) * 0.5) * 1.15
+            let d = (r_face - front) / 0.055
+            rings += exp(-d * d) * (1.0 - smoothstep(0.85, 1.15, front))
+        }
+        let core = 1.0 - smoothstep(0.0, 0.30, r_face)
+        let rim = smoothstep(0.90, 1.16, r_face)
+        let body = vec3(0.26, 0.085, 0.012)
+        let filament = vec3(13.5, 6.2, 1.15) * rings
+        let hot = vec3(15.0, 7.6, 1.7) * (core * core)
+        let edge = vec3(1.5, 0.52, 0.06) * rim
+        emissive(vec3(0.42, 0.25, 0.07), body + filament + hot + edge, roughness: 0.14)
+    }
+}
+
+/// Rival caster's cold sapphire-cyan arcane focus orb conjuring the incoming glass shard barrage.
+pub struct RivalOrb: Copy + GpuData + Eq + StateHash {
+    pub time: f32,
+    pub pad0: f32,
+    pub pad1: f32,
+    pub pad2: f32,
+}
+
+pub fn rival_orb(time: f32) -> RivalOrb {
+    RivalOrb { time, pad0: 0.0, pad1: 0.0, pad2: 0.0 }
+}
+
+impl Surface for RivalOrb {
+    fn distance(self, p: vec3) -> f32 {
+        let c = vec3(3.15, 1.48 + 0.06 * sin(self.time * 4.0), 0.08)
+        let r = 0.20 + 0.025 * sin(self.time * 7.5)
+        length(p - c) - r
+    }
+
+    fn bound(self) -> Bound {
+        Bound { centre: vec3(3.15, 1.48, 0.08), radius: 0.38, slope: 0.5 }
+    }
+
+    fn lipschitz(self, _near: f32) -> f32 {
+        1.0
+    }
+}
+
+impl Field<Substance> for RivalOrb {
+    fn channels(self, p: vec3) -> Substance {
+        let c = vec3(3.15, 1.48 + 0.06 * sin(self.time * 4.0), 0.08)
+        let d = p - c
+        // Swirling veins of brighter energy over a deep sapphire body: saturated blue, not white.
+        let swirl = 0.5 + 0.5 * sin(d.y * 26.0 + atan2(d.z, d.x) * 3.0 + self.time * 5.0)
+        let vein = swirl * swirl * swirl
+        let deep = vec3(0.22, 0.85, 6.2)
+        let bright = vec3(0.9, 3.4, 12.5)
+        emissive(vec3(0.16, 0.36, 1.0), mix(deep, bright, vec3(vein)), roughness: 0.10)
+    }
+}
+
+// =================================================================================================
+// 5. Incoming Refractive Glass Shard Barrage (`[GlassShard; 14]`, extracted via `many` in < 0.2 ms)
+// =================================================================================================
+
+/// One razor-sharp faceted refractive glass spear hurtling toward the golden parry arc.
+pub struct GlassShard: Copy + GpuData + Eq + StateHash {
+    pub centre: vec3,
+    pub dir: vec3,
+    pub len: f32,
+    pub thick: f32,
+    pub pad0: f32,
+    pub pad1: f32,
+}
+
+pub fn glass_barrage(time: f32) -> [GlassShard; 14] {
+    var out = [GlassShard {
+        centre: vec3(1.5, 1.5, 0.0),
+        dir: vec3(-1.0, 0.0, 0.0),
+        len: 0.6,
+        thick: 0.1,
+        pad0: 0.0,
+        pad1: 0.0,
+    }; 14]
+    for i in 0..14 {
+        let f = f32(i)
+        let h0 = rand01(i * 97 + 13)
+        let h1 = rand01(i * 193 + 29)
+        let h2 = rand01(i * 317 + 47)
+        let phase = fract(h0 + time * 0.38)
+        // Fan widens slightly from rival (`x = 3.25`) toward parry arc (`x = -0.08`).
+        let x = mix(3.25, -0.05, phase)
+        let spread = mix(0.45, 1.15, phase)
+        let y = 1.45 + (h1 - 0.45) * 1.85 * spread + 0.10 * sin(time * 2.5 + f)
+        let z = (h2 - 0.5) * 2.15 * spread
+        let len = 0.52 + 0.30 * rand01(i * 431 + 7)
+        let thick = 0.085 + 0.042 * rand01(i * 557 + 11)
+        let target = vec3(-0.35, 1.38 + (h1 - 0.5) * 1.1, 0.20 + (h2 - 0.5) * 1.2)
+        let dir = normalize(target - vec3(x, y, z))
+        out[i] = GlassShard {
+            centre: vec3(x, y, z),
+            dir,
+            len,
+            thick,
+            pad0: 0.0,
+            pad1: 0.0,
+        }
+    }
+    out
+}
+
+impl Surface for GlassShard {
+    fn distance(self, p: vec3) -> f32 {
+        let tip = self.centre + self.dir * (self.len * 0.62)
+        let tail = self.centre - self.dir * (self.len * 0.48)
+        let mid = self.centre - self.dir * (self.len * 0.04)
+        let front = sd_spear(p, mid, tip, ra: self.thick, rb: 0.014)
+        let back = sd_spear(p, tail, mid, ra: 0.020, rb: self.thick)
+        min(front, back)
+    }
+
+    fn bound(self) -> Bound {
+        Bound { centre: self.centre, radius: self.len * 0.68 + self.thick + 0.06, slope: 0.5 }
+    }
+
+    fn lipschitz(self, _near: f32) -> f32 {
+        1.0
+    }
+}
+
+impl Field<Substance> for GlassShard {
+    fn channels(self, p: vec3) -> Substance {
+        // Deep sapphire-cyan crystal glass catching golden heat sparks right where tips meet the ward.
+        let impact = smoothstep(0.28, -0.18, p.x)
+        let base = glass(vec3(0.46, 0.84, 1.0), roughness: 0.028, ior: 1.56)
+        Substance {
+            emits: vec3(9.5, 5.4, 1.4) * (impact * impact),
+            ..base
+        }
+    }
+}
+
+// =================================================================================================
+// 6. 16,384-Grain Glass -> Sparks -> Sand GPU Transmutation Cloud (`impl Swarm`)
+// =================================================================================================
+
+pub struct ParrySandCloud: Copy + GpuData {
+    pub time: f32,
+    pub pad0: f32,
+    pub pad1: f32,
+    pub pad2: f32,
+}
+
+pub fn parry_sand_cloud(time: f32) -> ParrySandCloud {
+    ParrySandCloud { time, pad0: 0.0, pad1: 0.0, pad2: 0.0 }
+}
+
+impl Swarm for ParrySandCloud {
+    fn active(self) -> bool {
+        true
+    }
+
+    fn count(self) -> u32 {
+        16384
+    }
+
+    fn epoch(self) -> u32 {
+        1
+    }
+
+    fn step_dt(self) -> f32 {
+        0.016667
+    }
+
+    fn prewarm_steps(self) -> u32 {
+        56
+    }
+
+    fn looping(self) -> bool {
+        true
+    }
+
+    fn seed_delay(self, i: u32) -> f32 {
+        rand01(i * 1597334677 + 19) * 2.1
+    }
+
+    fn seed_at(self, i: u32) -> GrainSeed {
+        let h0 = rand01(i * 747796405 + 1)
+        let h1 = rand01(i * 2891336453 + 2)
+        let h2 = rand01(i * 277803737 + 3)
+        let h3 = rand01(i * 362437 + 4)
+
+        // Spawn along the golden parry ward face, deflecting outward & down into a graceful sand ribbon.
+        let theta = (h0 - 0.5) * 1.40
+        let phi = (h1 - 0.5) * 1.25
+        let nx = cos(theta) * cos(phi)
+        let ny = sin(phi)
+        let nz = sin(theta) * cos(phi)
+        let rad = 1.36 + (h2 - 0.5) * 0.10
+        let pos = vec3(-1.65 + nx * rad, 1.38 + ny * rad, 0.20 + nz * rad)
+
+        // Sweep sideways toward the foreground (+Z) and gently down so the incoming glass shards on +X stay clear!
+        let out_speed = 0.9 + h3 * 2.1
+        let vel = vec3(
+            nx * out_speed * 0.55 - 0.25,
+            0.55 + ny * 1.25 + h2 * 0.65,
+            nz * 1.55 + 1.15 + (h3 - 0.3) * 1.2,
+        )
+
+        // Fine sparkling grains (`8..17 mm`) so individual sand ribbons & golden sparks read sharply.
+        let radius = 0.0085 + h2 * h2 * 0.0095
+        let life = 1.9 + h3 * 1.4
+        GrainSeed { pos, radius, vel, life }
+    }
+
+    fn force_at(self, pos: vec3, _vel: vec3, age: f32, h: f32) -> vec3 {
+        let grav = vec3(0.0, -7.4, 0.0)
+        let swirl_fade = exp(-age * 2.8)
+        let rel_y = pos.y - 1.38
+        let vortex = vec3(0.45, 1.5 + 0.7 * sin(h * 12.0 + age * 5.0), -rel_y * 1.15 + 0.9) * swirl_fade
+        let breeze = vec3(-0.85, 0.12 * sin(pos.x * 1.4 + pos.z * 1.1), 1.45 + 0.45 * cos(h * 6.28 + age * 2.0))
+        grav + vortex + breeze
+    }
+
+    fn drag(self) -> f32 {
+        0.58
+    }
+
+    fn restitution(self) -> f32 {
+        0.22
+    }
+
+    fn substance_at(self, _pos: vec3, _vel: vec3, age: f32, h: f32) -> Substance {
+        // Phase 1 (`age < 0.12 s`): Shattered cyan crystal glints flashing right off the parry ward.
+        if age < 0.12 {
+            let f = clamp(age / 0.12, 0.0, 1.0)
+            let flash = mix(vec3(3.0, 7.5, 11.0), vec3(13.0, 7.0, 1.6), vec3(f * f))
+            return emissive(vec3(0.75, 0.95, 1.0), flash, roughness: 0.05)
+        }
+        // Phase 2 (`0.12 .. 0.40 s`): Incandescent amber-gold transmutation sparks cooling into sand.
+        if age < 0.40 {
+            let f = clamp((age - 0.12) / 0.28, 0.0, 1.0)
+            let glow = (1.0 - f) * (1.0 - f)
+            let gold_emit = vec3(14.5, 6.8, 1.2) * glow * (0.55 + 0.70 * h)
+            let col = mix(vec3(1.0, 0.80, 0.36), vec3(0.80, 0.64, 0.38), vec3(f))
+            return Substance {
+                albedo: col,
+                roughness: mix(0.20, 0.72, f),
+                emits: gold_emit,
+                metallic: mix(0.35, 0.0, f),
+                ior: 1.54,
+                transmission: 0.0,
+                subsurface: 0.12,
+                coat: 0.0,
+                micro: 0.0,
+                micro_freq: 1.0,
+                pad0: 0.0,
+                pad1: 0.0,
+            }
+        }
+        // Phase 3 (`age >= 0.40 s`): Warm golden-ochre desert sand settling and bouncing on the basalt floor.
+        let base = sand(mix(vec3(0.72, 0.56, 0.32), vec3(0.88, 0.72, 0.44), vec3(h)))
+        let ember = if h > 0.93 {
+            vec3(5.5, 2.4, 0.4) * exp(-(age - 0.40) * 1.9)
+        } else {
+            vec3(0.0)
+        }
+        Substance { emits: ember, ..base }
+    }
+}
+
+// =================================================================================================
+// 7. Coastal Golden-Hour Ocean Swells (`Height`) & Drifting Sea Mist (`Medium`)
+// =================================================================================================
+
+pub struct ArenaSea: Copy + GpuData {
+    pub time: f32,
+}
+
+pub fn arena_sea(time: f32) -> ArenaSea {
+    ArenaSea { time }
+}
+
+impl Height for ArenaSea {
+    fn active(self) -> bool {
+        true
+    }
+
+    fn height_at(self, xz: vec2) -> HeightSample {
+        let t = self.time
+        let a = xz.x * 0.34 + xz.y * 0.28 + t * 1.25
+        let b = xz.x * -0.21 + xz.y * 0.48 - t * 0.95
+        let c = xz.x * 0.68 - xz.y * 0.56 + t * 1.85
+        let y = -0.82 + 0.14 * sin(a) + 0.09 * sin(b) + 0.045 * sin(c)
+        let dx = 0.14 * 0.34 * cos(a) - 0.09 * 0.21 * cos(b) + 0.045 * 0.68 * cos(c)
+        let dz = 0.14 * 0.28 * cos(a) + 0.09 * 0.48 * cos(b) - 0.045 * 0.56 * cos(c)
+        HeightSample {
+            y,
+            normal: normalize(vec3(-dx, 1.0, -dz)),
+            sub: water(tint: vec3(0.06, 0.26, 0.36), roughness: 0.05),
+        }
+    }
+}
+
+pub struct ArenaMist: Copy + GpuData {
+    pub time: f32,
+}
+
+pub fn arena_mist(time: f32) -> ArenaMist {
+    ArenaMist { time }
+}
+
+impl Medium for ArenaMist {
+    fn active(self) -> bool {
+        true
+    }
+
+    fn sample_at(self, p: vec3) -> MediumSample {
+        let h_fade = clamp(1.0 - (p.y + 0.6) / 5.2, 0.0, 1.0)
+        if h_fade <= 0.0 {
+            return MediumSample { density: 0.0, g: 0.68, albedo: vec3(0.0), emits: vec3(0.0) }
+        }
+        let t = self.time
+        let w = 0.55 + 0.45 * sin(p.x * 0.24 + t * 0.42) * cos(p.z * 0.20 - t * 0.31)
+        let r = length(p.xz)
+        let ring_boost = 1.0 + 0.65 * smoothstep(5.5, 14.0, r)
+        let density = 0.016 * h_fade * h_fade * w * ring_boost
+        MediumSample {
+            density,
+            g: 0.68,
+            albedo: vec3(0.88, 0.80, 0.72),
+            emits: vec3(0.0),
+        }
+    }
+}

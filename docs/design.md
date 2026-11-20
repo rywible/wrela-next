@@ -391,6 +391,73 @@ requiring an author to write a mesh.
 
 **One way to draw (completed):** `MeshSight` is now the sole renderer in `lib/engine/` and `game/scenes/main.wrela`. Legacy `Sight` (`lib/engine/picture/pixels.wrela`, `lib/engine/matter/{cells,asked,cost}.wrela`, `lib/engine/light/{moving,store}.wrela`, `lib/engine/ray/ray.wrela`) has been removed (~5,500 lines deleted). `lib/std/field.wrela`'s `Meets`/`Pass`/`StandIn` remain covered by `toolchain/tests/`.
 
+## Swarms, glowing matter and the arena (2026-11-20: built and measured on both machines)
+
+**What landed.** `Swarm` (`lib/engine/matter/swarm.wrela`) is the fourth kind of content next to
+solids, heights and media: grains seeded, pushed by a force field and coloured by a `Substance`,
+simulated on the GPU (`lib/engine/mesh/swarm.wrela`, ping-pong buffers, `SWARM_CAP` 65,536) and
+collided against the world's exact signed distance. `Substance` carries a `micro` relief that tilts
+the shading normal per pixel. `MeshSight::draw_scene(world, height, medium, swarm, sky, look, ...)`
+is the one way to draw a whole scene (`draw` is its solids-only form). SCENE 10 (`game/world/arena.wrela`)
+is the parry showcase: glass shards struck by a golden ward and turned into sand, all fields.
+
+**Extraction runs on full SIMD groups.** Pass 2 of the extractor used to run the QEF solve, the
+Newton snap and the channel ask on every one of a brick's 384 lanes, returning early on the ~75%
+of cells with no sign change; surface cells are scattered, so nearly every 64-lane group paid the
+whole cost. It is now `classify_cells` (8 corner signs, append the cell to a dense list) and
+`solve_verts` (one invocation per listed cell, through an indirect dispatch), the compaction
+`refine_creases` already used. A crease cell gets its one vertex from `refine_creases` alone (it
+used to get two, the first wasted), and the snap's gradient asks only the brick's live parts.
+SCENE 10 at 1080p, same session: **25.2 → 23.1 ms on the M4** (two runs each); Radeon below.
+
+**A glowing surface is never lit by its own emitter.** Emitters are harvested from bright
+surfaces; a surface inside an emitter's own sphere that glows at all is part of it and skips it.
+Before, only surfaces brighter than the harvest threshold skipped, so the dim body of a bright
+object was lit by its own light.
+
+**Tessellation is held by the measurements, not by the frame time.** The cell size is
+`max(px × 1.65, r / 180)` for a single thing (1.1 px on steep fields) and `px × 1.2` within a
+`Many`, as before. Coarser cells were tried and measured (SCENE 6 audit and SCENE 0 judge at
+160×90, M4):
+
+| Cells | SCENE 6 holes (stage / creature / stack) | SCENE 0 lit over 8/255 | SCENE 0 edge px over 8/255 | SCENE 10, M4 |
+| --- | --- | --- | --- | --- |
+| 1.65 px, r/180 (kept) | 0 / 0 / 0 | 1.94% | 51.8% | 23.1 ms |
+| 3.2 px, r/180 | 0 / 0 / 0 | 2.63% | 66.8% | 20.0 ms |
+| 4.0 px, r/180 | 0 / 7 / 0 | — | — | — |
+| 2.4 px, r/96 | 158 / 6 / 12 | — | — | 17.4 ms |
+
+A floor of `r / 96` sets the cell of any large thing the eye is inside (its `near` clamps to
+0.25 m), and the stage's thin parts fall between its cells. Holes start between 3.6 and 4.0 px;
+the judge already sees 3.2 px. What would let cells grow is shading that costs by the pixel, not
+by the fragment: at 2 px cells, the 16 local emitters cost 3.2 ms of SCENE 10's frame and
+re-extracting its moving things 6.8 ms (each measured by removing it, `--cpu`, M4).
+
+**Serial timestamps lie about empty indirect passes on the M4.** With `--timestamps --serial`, an
+indirect dispatch of zero groups (an extraction chunk past the last brick) reported 0.4 to 28 ms;
+removing those chunks changed the `--cpu` frame time by 0.01 ms (17.40 vs 17.39 ms). Judge
+extraction by `--cpu` A/B runs, not by a serial timestamp sum, until the host times such passes
+correctly.
+
+**Measured on both machines (2026-11-20, 1920×1080, 4× MSAA, `--cpu` steady state; HEAD = the
+commit before this one, same session):**
+
+| Scene | M4 HEAD | M4 now | Radeon HEAD | Radeon now |
+| --- | --- | --- | --- | --- |
+| SCENE 4 (stage, GI) | 2.43 ms | 2.52 ms | 15.8 ms | 15.9–16.1 ms |
+| SCENE 8 (256 boxes + 256 creatures) | 13.9 ms | 9.7–12.7 ms | 35.0–36.1 ms | 33.5–34.4 ms |
+| SCENE 9 (cohesion) | 11.3 ms | 11.3 ms | 41.1–41.3 ms | 40.6–41.5 ms |
+| SCENE 10 (arena) | 25.2 ms (old extractor) | 23.1 ms | 77.3–78.4 ms (old extractor) | 74.2–75.2 ms |
+
+The M4's runs vary by up to 3 ms from one run to the next (SCENE 8: 9.7 then 12.7 ms); the
+ranges are two runs each. SCENE 10 is not at 60 fps on either machine: 43 fps on the M4 and
+13 fps on the Radeon iGPU.
+
+**Checked:** SCENE 6 audit 0 holes / 0 extras on all three kinds on both machines (Linux under the
+Khronos validation layer, no messages); SCENE 0 judge identical to the previous commit's on both
+machines; validation clean on SCENE 4, 8 (256 creatures), 9 and 10; `tools/layers` and
+`tools/check` pass.
+
 ## The layers
 
 Dependencies point down. Nothing below knows anything above.
