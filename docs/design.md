@@ -596,6 +596,14 @@ So, as directions with their counts taken and nothing built:
   straight outlines and creases is its square cut by those lines, each piece shaded once, with no
   ray; the piece's surface is taken from the neighbouring pixel that hit it.
 
+*Measured the same day:* the first two are dead. Solving a smooth union's hit in closed form is
+sound (no first root missed on 2,000 rays) and costs 1.28 to 1.41 times today's march, where its
+line was a quarter: a round cone's exact meet weighs 3.5 times its value and gradient, and at the
+fold's sound threshold one part decides only a quarter of hits. The join of many that does not
+depend on order is right as mathematics and its derived code is not usable (a range 95,557 times
+too wide) without a day of hand-written rules, which the first death makes pointless. What stands
+is what the counts found: fragments where a part can be, and creases as straight lines.
+
 What the same argument killed: work lists in compute in place of the rasteriser; merging a far
 creature's parts for the eye (nothing merges at the fiftieth of a pixel edges are held to);
 drawing the rock without cells (its bracket is metres wide). The record is in
