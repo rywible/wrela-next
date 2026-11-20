@@ -49,6 +49,24 @@ fn requests_are_answered_on_later_frames() {
     assert_eq!(stored, [1, 2, 3, 4, 5]);
 }
 
+/// A readback is answered on exactly the next call, whatever the GPU's latency (§17.1):
+/// toolchain/tests/read-arrival reads a buffer back every third frame, every other time just
+/// after a kernel that holds the GPU a few milliseconds, and records how many calls each answer
+/// took. The native host waits for the GPU's work before a read (a call that asks one stalls
+/// until it's done), so a program's state is a function of its frames, not of when the GPU
+/// finished. `tools/check` runs it on each machine's GPU.
+#[test]
+#[ignore = "needs a GPU"]
+fn a_readback_is_answered_on_the_next_call_whatever_the_gpus_latency() {
+    let (dir, _) = page("toolchain/tests/read-arrival", "read-arrival");
+    let mut host = Host::load_with(&dir, &Options::default()).expect("load");
+    let times = crate::frame_times(64);
+    host.run_frames(&times, 16, 16).expect("run");
+    let [asks, answered, least, most] = wrela_tests::one_vec4(&mut host, "answers", &[]);
+    assert_eq!((asks, answered), (20.0, 20.0), "every read was answered");
+    assert_eq!((least, most), (1.0, 1.0), "each on the call after the one that asked");
+}
+
 /// `std::io::print` puts its line on the host's console: the native host prints it, and keeps it
 /// for a test to read. `@deterministic` code prints too (`trace`, not `io`); `@audio` code
 /// doesn't.

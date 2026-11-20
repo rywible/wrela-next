@@ -1,0 +1,73 @@
+// Readbacks are answered on the next call, whatever the GPU's latency (language.md §17.1;
+// toolchain/tests/tests/suite/requests.rs): every third frame the program reads back a buffer,
+// every other time after a slow kernel has written it, and records how many calls after its ask
+// each answer arrived.
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch, read}
+use std::io::Pending
+
+/// A kernel that keeps the GPU busy a few milliseconds before the read.
+@compute(64)
+fn slow(out: mut Slots<u32>, id: GlobalId) {
+    var x = f32(id.x) * 0.001
+    for _i in 0..2048 {
+        x = sin(x) * 0.999 + 0.001
+    }
+    out[id] = u32(x * 1000.0) + 1
+}
+
+/// A kernel that does almost nothing.
+@compute(64)
+fn quick(out: mut Slots<u32>, id: GlobalId) {
+    out[id] = id.x + 1
+}
+
+pub struct Arrival {
+    frame: u32,
+    out: GpuBuffer<u32>,
+    asked: Vec<(u32, Pending<u32>)>,
+    asks: u32,
+    answered: u32,
+    least: u32,
+    most: u32,
+}
+
+pub fn init() -> Arrival {
+    Arrival { frame: 0, out: buffer(16384), asked: Vec::new(), asks: 0, answered: 0, least: 1000, most: 0 }
+}
+
+pub fn frame(state: mut Arrival, time: f32, width: u32, height: u32) {
+    state.frame += 1
+    let f = state.frame
+    // Polled first: an answer counts the calls since the one that asked.
+    var i: u32 = 0
+    while i < state.asked.len() {
+        let at = state.asked[i].0
+        match mut state.asked[i].1 {
+            p => match p.poll() {
+                Some(_) => {
+                    let lag = f - at
+                    state.least = min(state.least, lag)
+                    state.most = max(state.most, lag)
+                    state.answered += 1
+                    state.asked[i].0 = 0
+                },
+                None => {},
+            },
+        }
+        i += 1
+    }
+    if f % 3 == 0 && f <= 60 {
+        if f % 6 == 0 {
+            dispatch(slow.bind(out: mut state.out), groups: 256)
+        } else {
+            dispatch(quick.bind(out: mut state.out), groups: 256)
+        }
+        state.asked.push((f, read(state.out.span(start: 0, count: 16384))))
+        state.asks += 1
+    }
+}
+
+/// How many reads were asked and answered, and the fewest and most calls an answer took.
+pub fn answers(state: Arrival) -> vec4 {
+    vec4(f32(state.asks), f32(state.answered), f32(state.least), f32(state.most))
+}

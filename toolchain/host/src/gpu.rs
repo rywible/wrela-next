@@ -4627,10 +4627,10 @@ mod tests {
         assert!(packed, "draws measured are drawn a few to a piece");
 
         // Passes of whole draws of the size above (about half a millisecond), timed by an eighth
-        // of a pass of eight's (a submission's own cost, a tenth of a millisecond on the Radeon,
-        // spread over them): a line of 16 of them (at most 12 ms, so nothing here runs long), a
-        // heavy pass 9 of them (0.56 of the line, with room for the GPU's clock; four of them two
-        // lines and more), a cheap one 1.
+        // of the slower of two passes of eight (a submission's own cost, a tenth of a millisecond
+        // on the Radeon, spread over them): a line of 16 of them (at most 12 ms, so nothing here
+        // runs long), a heavy pass 0.4 of the line (the M4's clock has moved a draw's time 1.9
+        // times between frames; four of them 1.6 lines), a cheap one 1.
         let line = gpu.line_ms;
         for _ in 0..2 {
             passes_frame(&mut gpu, "unit", 8 * instances).unwrap();
@@ -4641,9 +4641,9 @@ mod tests {
             .map(|(_, ms)| ms)
             .collect();
         unit.sort_by(f64::total_cmp);
-        let unit = unit[unit.len() / 2] / 8.0;
+        let unit = unit[unit.len() - 1] / 8.0;
         gpu.line_ms = (16.0 * unit).min(12.0);
-        let big = ((0.5625 * gpu.line_ms / unit).round() as u32).max(2) * instances;
+        let big = ((0.4 * gpu.line_ms / unit).round() as u32).max(2) * instances;
         eprintln!(
             "a unit {unit:.3} ms: the line {:.2} ms, a heavy pass {big} triangles",
             gpu.line_ms
