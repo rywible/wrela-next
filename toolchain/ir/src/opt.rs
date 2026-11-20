@@ -27,7 +27,15 @@ use std::hash::{Hash, Hasher};
 
 /// Flattens a GPU module (see the module docs).
 pub fn flatten_gpu(m: &mut Module) -> Result<()> {
-    let keep = outlined(m);
+    let mut keep = outlined(m);
+    // Outlining is decided by size, and a pipeline's constants fold only once inlined: dead
+    // option code would push a kernel over the limit and turn its helpers into calls (a spike's
+    // kernel ran 5.33 ms as calls, 4.51 inlined). Where the first decision keeps calls, the
+    // module is inlined whole on a copy, its constants and the branches on them folded, and
+    // measured again: within the limit, every call is inlined.
+    if keep.iter().any(|&k| k) && folded_fits(m)? {
+        keep = vec![false; m.functions.len()];
+    }
     inline_all(m, &keep)?;
     // The calls left are to the kept functions, which take values: only a store writes a
     // local. The entry points and the kept functions they reach are kept (and optimized).
@@ -2892,6 +2900,37 @@ fn retain_by_index<T>(items: &mut Vec<T>, keep: impl Fn(usize) -> bool) -> Vec<O
 
 /// The statements a module flattened with `keep` holds: each entry point with what it inlines,
 /// and each kept function once, with what it inlines. `order` is `callee_order`'s.
+/// Whether module `m`, every call inlined and what its constants decide folded (constants
+/// computed, branches on them kept to the side taken, dead code dropped), has entry points
+/// within [`INLINE_LIMIT`] statements each: what `outlined` measures, after the folding that
+/// inlining makes possible.
+fn folded_fits(m: &Module) -> Result<bool> {
+    let mut c = m.clone();
+    let none = vec![false; c.functions.len()];
+    inline_all(&mut c, &none)?;
+    let entries: Vec<usize> = c.entry_points.iter().map(|e| e.function.index()).collect();
+    let mut biggest = 0;
+    for i in entries {
+        let mut f = std::mem::take(&mut c.functions[i]);
+        for _ in 0..4 {
+            let mut changed = crate::const_fold::fold_constants(&mut c, &mut f);
+            if fold_constant_branches(&mut f) {
+                forward_stores(&c, &mut f);
+                changed = true;
+            }
+            dce(&mut f);
+            if !changed {
+                break;
+            }
+        }
+        let mut sz = 0usize;
+        visit::walk(&f.body, &mut |_| sz += 1);
+        biggest = biggest.max(sz);
+        c.functions[i] = f;
+    }
+    Ok(biggest <= INLINE_LIMIT)
+}
+
 fn flattened_size(m: &Module, order: &[usize], keep: &[bool]) -> usize {
     let mut size = vec![0usize; m.functions.len()];
     for &f in order {
