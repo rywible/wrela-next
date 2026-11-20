@@ -315,6 +315,7 @@ fn checks_the_count_proves_unneeded_are_left_out() {
         set: Vec::new(),
         target: wrela_abi::Target::Metal,
         trusted_shaders: false,
+        exact: false,
     };
     let built = wrela_driver::build_for(&dir, &how);
     assert!(!built.has_errors(), "{:?}", built.diagnostics);

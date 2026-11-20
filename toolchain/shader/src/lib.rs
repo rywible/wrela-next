@@ -40,11 +40,23 @@ pub struct Checks {
     pub loops: bool,
     /// `/` and `%` of integers guarded against 0 and the most negative divided by -1.
     pub int_div: bool,
+    /// Exact mode (`wrela build --exact`): no multiply and add contracted into one rounding
+    /// (MSL `fp contract(off)`, SPIR-V `NoContraction` on float arithmetic), so a function's
+    /// bits don't depend on the code around it. For comparing two builds, not for shipping:
+    /// it costs the M4 up to 4.3% of a frame (the engine's crowd), and its bits may differ from
+    /// the default's in the last place.
+    pub exact: bool,
 }
 
 impl Checks {
-    pub const CHECKED: Checks = Checks { bounds: true, loops: true, int_div: true };
-    pub const UNCHECKED: Checks = Checks { bounds: false, loops: false, int_div: false };
+    pub const CHECKED: Checks = Checks { bounds: true, loops: true, int_div: true, exact: false };
+    pub const UNCHECKED: Checks =
+        Checks { bounds: false, loops: false, int_div: false, exact: false };
+
+    /// No run-time checks written in (exact mode aside).
+    pub fn unchecked(self) -> bool {
+        !self.bounds && !self.loops && !self.int_div
+    }
 }
 
 /// A pipeline's shader as its target takes it: Metal shading language's text, or SPIR-V's words

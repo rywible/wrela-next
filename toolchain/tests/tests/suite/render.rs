@@ -214,7 +214,8 @@ pub fn frame(time: f32, width: u32, height: u32) {
     // Each target's shaders, built as `wrela build --target` does.
     let shaders = |target: wrela_abi::Target, trusted_shaders: bool| -> Vec<u8> {
         let kind = wrela_driver::BuildKind { debug: false, testing: false };
-        let how = wrela_driver::BuildFor { kind, set: Vec::new(), target, trusted_shaders };
+        let how =
+            wrela_driver::BuildFor { kind, set: Vec::new(), target, trusted_shaders, exact: false };
         let out = wrela_driver::build_for(&pkg, &how);
         assert!(!out.has_errors(), "{:?}", out.diagnostics);
         let ext = format!(".{}", wrela_shader::extension(target));

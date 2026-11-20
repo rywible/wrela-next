@@ -15,6 +15,7 @@ fn bound_of(name: &str, sets: &[(&str, &str)], target: Target) -> Bound {
         set: sets.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
         target,
         trusted_shaders: false,
+        exact: false,
     };
     let out = wrela_driver::build_for(&pkg, &how);
     assert!(
@@ -59,6 +60,7 @@ fn the_calibration_kernels_are_bounded() {
         set: Vec::new(),
         target: Target::HERE,
         trusted_shaders: false,
+        exact: false,
     };
     let out = wrela_driver::build_for(&pkg, &how);
     assert!(!out.has_errors(), "{:?}", out.diagnostics);

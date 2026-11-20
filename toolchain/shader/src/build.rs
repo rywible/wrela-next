@@ -211,7 +211,17 @@ impl Builder {
         p: &mut wrela_abi::manifest::Pipeline,
         target: wrela_abi::Target,
     ) -> Result<Shader, String> {
-        let out = crate::emit_shader(&self.m, p, target, Checks::CHECKED)?;
+        self.write_with(p, target, Checks::CHECKED)
+    }
+
+    /// [`Builder::write`] with `checks` (exact mode's, say).
+    pub fn write_with(
+        &self,
+        p: &mut wrela_abi::manifest::Pipeline,
+        target: wrela_abi::Target,
+        checks: Checks,
+    ) -> Result<Shader, String> {
+        let out = crate::emit_shader(&self.m, p, target, checks)?;
         use wrela_abi::manifest::Stage;
         match &mut p.stage {
             Stage::Compute { entry, .. } => *entry = out.entry_points[0].clone(),

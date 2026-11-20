@@ -249,6 +249,11 @@ pub struct BuildFor {
     /// (3.9% of its frame on an M4, 1.1% on the Linux machine's Radeon; leaving every check out
     /// saved 2.9% and 1.3%, measured apart).
     pub trusted_shaders: bool,
+    /// Exact mode (`wrela build --exact`): GPU arithmetic that no GPU compiler contracts
+    /// (`wrela_shader::Checks::exact`), so a function's bits don't depend on the code around
+    /// it: what two builds are compared in, to show a change leaves a picture to the bit. Not
+    /// for shipping or timing (the M4's crowd 4.3% slower). Off unless asked for.
+    pub exact: bool,
 }
 
 /// A build as `how` says ([`build_set`] for another machine, or with trusted shaders).
@@ -258,6 +263,7 @@ pub fn build_for(root: &Path, how: &BuildFor) -> Output {
         testing: how.kind.testing,
         target: how.target,
         trusted_shaders: how.trusted_shaders,
+        exact: how.exact,
         ..Mode::RELEASE
     };
     on_compiler_thread(|| compile_set(root, mode, &how.set))
@@ -909,6 +915,8 @@ struct Mode {
     relaxed_simd: bool,
     /// Shaders written without their run-time checks ([`BuildFor::trusted_shaders`]).
     trusted_shaders: bool,
+    /// Exact mode ([`BuildFor::exact`]).
+    exact: bool,
     /// The machine the shaders are for ([`BuildFor::target`]).
     target: wrela_abi::Target,
 }
@@ -922,6 +930,7 @@ impl Mode {
         conditions: false,
         relaxed_simd: false,
         trusted_shaders: false,
+        exact: false,
         target: wrela_abi::Target::HERE,
     };
     const RELEASE: Mode = Mode { emit: true, ..Mode::CHECK };
@@ -1082,6 +1091,7 @@ fn compile_loaded_in(
             } else {
                 wrela_shader::Checks::CHECKED
             };
+            let checks = wrela_shader::Checks { exact: mode.exact, ..checks };
             let shaders = build::Shaders { target: mode.target, checks };
             let out = build::emit(
                 &lowered,

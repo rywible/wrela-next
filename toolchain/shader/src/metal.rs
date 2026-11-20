@@ -303,7 +303,7 @@ impl<'m> Writer<'m> {
             p,
             depth,
             checks,
-            proofs: if checks == Checks::UNCHECKED {
+            proofs: if checks.unchecked() {
                 wrela_ir::work::Proofs::default()
             } else {
                 wrela_ir::work::proofs(m)
@@ -373,8 +373,15 @@ impl<'m> Writer<'m> {
         out.push_str("#include <metal_stdlib>\n#include <simd/simd.h>\n");
         // Relaxed: fast math that keeps infinities and NaNs (language.md §11.3); `fast` lets the
         // compiler assume there are none, and `safe` costs the opening's frame 91% on an M4.
+        // Exact mode: no contraction, so a multiply and an add fused into one rounding only
+        // where the product has no other use can't make a function's bits depend on the code
+        // around it (`Checks::exact`).
         out.push_str("#pragma METAL fp math_mode(relaxed)\n");
-        out.push_str("#pragma METAL fp contract(fast)\n");
+        out.push_str(if self.checks.exact {
+            "#pragma METAL fp contract(off)\n"
+        } else {
+            "#pragma METAL fp contract(fast)\n"
+        });
         // `x == x` is how GPU code asks whether a float is a number: meant, not a slip.
         out.push_str("#pragma clang diagnostic ignored \"-Wtautological-compare\"\n");
         // A runtime-sized array is declared with one element; an index past it is meant.

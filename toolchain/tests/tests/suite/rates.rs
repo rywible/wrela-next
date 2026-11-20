@@ -14,6 +14,7 @@ fn fixture(name: &str, moved: bool, target: Target) -> wrela_driver::Output {
         set: vec![("MOVED".into(), moved.to_string())],
         target,
         trusted_shaders: false,
+        exact: false,
     };
     let out = wrela_driver::build_for(&pkg, &how);
     assert!(

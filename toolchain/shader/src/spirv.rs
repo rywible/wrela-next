@@ -172,7 +172,7 @@ impl<'m> Writer<'m> {
             p,
             promise,
             checks,
-            proofs: if checks == Checks::UNCHECKED {
+            proofs: if checks.unchecked() {
                 wrela_ir::work::Proofs::default()
             } else {
                 wrela_ir::work::proofs(m)
@@ -1060,6 +1060,24 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
         let mut all = vec![ty, id];
         all.extend_from_slice(operands);
         self.emit(op, &all);
+        // Exact mode: no contraction (`Checks::exact`, as Metal's `fp contract(off)`).
+        if self.w.checks.exact
+            && matches!(
+                op,
+                Op::FMul
+                    | Op::FAdd
+                    | Op::FSub
+                    | Op::FNegate
+                    | Op::VectorTimesScalar
+                    | Op::MatrixTimesScalar
+                    | Op::MatrixTimesVector
+                    | Op::VectorTimesMatrix
+                    | Op::MatrixTimesMatrix
+                    | Op::Dot
+            )
+        {
+            self.w.decorate(id, Decoration::NoContraction, &[]);
+        }
         id
     }
 

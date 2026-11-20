@@ -4392,6 +4392,135 @@ mod tests {
         gpu.check_errors().unwrap();
     }
 
+    /// How many inputs the fused-or-not fixture computes.
+    const FUSED_N: u32 = 4096;
+
+    /// A build of two compute pipelines over buffers `a`, `b`, `c` (bindings 0 to 2) and `out`
+    /// (3): `alone` computes `a * b + c` into `out`; `shared` the same, and the product into
+    /// `prod` (4) too. The same arithmetic: what a GPU compiler may contract into one rounding
+    /// (a fused multiply-add) where the product has no other use, and not where it does.
+    /// Written with `checks` (exact mode's, or the default).
+    fn fused_or_not(checks: wrela_shader::Checks) -> (Manifest, Vec<Vec<u8>>) {
+        use wrela_abi::manifest::BindingStage;
+        use wrela_shader::build::{BinOp, Builder, BuiltinInput, Scalar};
+        let mut manifest = Manifest::new("game.wasm");
+        let mut shaders = Vec::new();
+        for (name, shared) in [("alone", false), ("shared", true)] {
+            let binding = |b: u32| ResourceBinding {
+                binding: b,
+                kind: BindingKind::ReadWrite,
+                stage: BindingStage::Both,
+                format: None,
+            };
+            manifest.pipelines.push(Pipeline {
+                name: name.into(),
+                shader: String::new(),
+                stage: Stage::Compute { entry: name.into(), workgroup_size: [64, 1, 1] },
+                uniform: None,
+                bindings: (0..if shared { 5 } else { 4 }).map(binding).collect(),
+                debug_flag: None,
+                requires: Vec::new(),
+                conditional: false,
+                standin: None,
+                sizes: None,
+                kept: 0,
+                work: vec![Some(64)],
+                unbounded: Vec::new(),
+            });
+            let mut b = Builder::new();
+            let u = b.scalar(Scalar::U32);
+            let f = b.scalar(Scalar::F32);
+            let u3 = b.vector(Scalar::U32, 3);
+            let a = b.storage("a", 0, f, true);
+            let bb = b.storage("b", 1, f, true);
+            let c = b.storage("c", 2, f, true);
+            let out = b.storage("out", 3, f, true);
+            let prod = shared.then(|| b.storage("prod", 4, f, true));
+            b.compute(name, [64, 1, 1], &[BuiltinInput::GlobalInvocationId], |k| {
+                let id = k.input(0, u3);
+                let i = k.extract(u, id, 0);
+                let x = k.load(f, Builder::element(a, i));
+                let y = k.load(f, Builder::element(bb, i));
+                let z = k.load(f, Builder::element(c, i));
+                let p = k.binary(BinOp::Mul, x, y);
+                let r = k.binary(BinOp::Add, p, z);
+                k.store(Builder::element(out, i), r);
+                if let Some(prod) = prod {
+                    k.store(Builder::element(prod, i), p);
+                }
+                k.ret(None);
+            });
+            let target = wrela_abi::Target::HERE;
+            let pl = manifest.pipelines.last_mut().unwrap();
+            pl.shader = format!("{name}.{}", wrela_shader::extension(target));
+            shaders.push(b.write_with(pl, target, checks).unwrap().bytes);
+        }
+        (manifest, shaders)
+    }
+
+    /// How many of the two kernels' results differ, and how many of the first's are the CPU's
+    /// two roundings, with their shaders written with `checks`.
+    fn arithmetic_differences(checks: wrela_shader::Checks) -> (usize, usize) {
+        let (manifest, shaders) = fused_or_not(checks);
+        let mut gpu = Gpu::new(&manifest, &shaders, Timing::Off, false).unwrap();
+        let n = FUSED_N;
+        let bytes = 4 * n;
+        // a * b nearly -c: the product's rounding is what's left.
+        let mut s: u32 = 12345;
+        let mut next = || {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            (s >> 8) as f32 / (1u32 << 24) as f32
+        };
+        let (mut a, mut b, mut c) = (Vec::new(), Vec::new(), Vec::new());
+        for _ in 0..n {
+            let x = 1.0 + next();
+            let y = 1.0 + next();
+            a.push(x);
+            b.push(y);
+            c.push(-(x * y) * (1.0 + 1.0e-7 * next()));
+        }
+        let le = |v: &[f32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        for (h, v) in [(1, &a), (2, &b), (3, &c)] {
+            gpu.create_buffer(h, bytes);
+            gpu.write_buffer(h, 0, &le(v)).unwrap();
+        }
+        gpu.create_buffer(4, bytes);
+        gpu.create_buffer(5, bytes);
+        gpu.create_buffer(6, bytes);
+        let bind = |h: u32| Binding::range(h, 0, bytes);
+        let groups = Ok([n / 64, 1, 1]);
+        gpu.dispatch(0, groups, &[bind(1), bind(2), bind(3), bind(4)], &[]).unwrap();
+        gpu.dispatch(1, groups, &[bind(1), bind(2), bind(3), bind(5), bind(6)], &[]).unwrap();
+        gpu.end_frame().unwrap();
+        let (x, y) = (gpu.read_buffer(4).unwrap(), gpu.read_buffer(5).unwrap());
+        let words = |v: &[u8]| {
+            v.chunks_exact(4).map(|w| u32::from_le_bytes(w.try_into().unwrap())).collect::<Vec<_>>()
+        };
+        let (x, y) = (words(&x), words(&y));
+        let differ = x.iter().zip(&y).filter(|(p, q)| p != q).count();
+        // Two roundings, as the CPU computes it: what both give where nothing is fused.
+        let two = (0..n as usize).filter(|&i| (a[i] * b[i] + c[i]).to_bits() == x[i]).count();
+        gpu.check_errors().unwrap();
+        (differ, two)
+    }
+
+    /// In exact mode (`wrela build --exact`, `Checks::exact`) GPU arithmetic doesn't depend on
+    /// the code around it: `a * b + c` is the same to the bit in a kernel where the product has
+    /// no other use and in one where it has (so a compiler free to contract would fuse the first
+    /// into one rounding and not the second), on inputs where one rounding and two differ; and
+    /// it is the CPU's two roundings. (The default build contracts: on the M4 every one of them
+    /// differs, which it prints.) `tools/check` runs it on each machine's GPU.
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn arithmetic_is_the_same_whatever_surrounds_it_in_exact_mode() {
+        let default = arithmetic_differences(wrela_shader::Checks::CHECKED);
+        eprintln!("the default build: {default:?} (differing, the CPU's two roundings)");
+        let exact = wrela_shader::Checks { exact: true, ..wrela_shader::Checks::CHECKED };
+        let (differ, two) = arithmetic_differences(exact);
+        assert_eq!(differ, 0, "the same arithmetic gave different bits in two kernels");
+        assert_eq!(two, FUSED_N as usize, "each is the CPU's two roundings");
+    }
+
     /// The heavy draw's target's side, and its chain of sines a pixel.
     const HEAVY_SIDE: u32 = 256;
     const HEAVY_CHAIN: u32 = 128;

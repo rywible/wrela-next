@@ -118,7 +118,7 @@ mod trace;
 pub(crate) fn usage() -> ExitCode {
     let lines = [
         "wrela check <package-dir> [--json]",
-        "wrela build <package-dir> [-o <out-dir>] [--debug] [--testing] [--optimize [size|speed]] [--relaxed-simd] [--trusted-shaders] [--target metal|vulkan] [--lift <package>]... [--set NAME=VALUE]... [--report data|consts] [--json]",
+        "wrela build <package-dir> [-o <out-dir>] [--debug] [--testing] [--optimize [size|speed]] [--relaxed-simd] [--trusted-shaders] [--exact] [--target metal|vulkan] [--lift <package>]... [--set NAME=VALUE]... [--report data|consts] [--json]",
         "wrela fmt <file-or-dir>... [--check]",
         "wrela fix <package-dir> [--dry-run] [--json]",
         "wrela migrate <package-dir> [--dry-run] [--json]",
@@ -274,6 +274,9 @@ pub(crate) struct PackageArgs {
     /// `--trusted-shaders`, which only `build` takes: shaders without their run-time checks
     /// (`wrela_driver::BuildFor::trusted_shaders`).
     pub trusted_shaders: bool,
+    /// `--exact`, which only `build` takes: GPU arithmetic no GPU compiler contracts, for
+    /// comparing two builds to the bit (`wrela_driver::BuildFor::exact`).
+    pub exact: bool,
     /// `--target metal|vulkan`, which only `build` takes: the machine its shaders are for
     /// (`wrela_driver::BuildFor::target`); the machine it runs on if not given.
     pub target: Option<wrela_abi::Target>,
@@ -290,6 +293,7 @@ pub(crate) fn package_args(args: &[String], takes_out: bool) -> Result<PackageAr
     let mut set = Vec::new();
     let mut relaxed_simd = false;
     let mut trusted_shaders = false;
+    let mut exact = false;
     let mut target = None;
     let mut lift = Vec::new();
     let mut it = args.iter().peekable();
@@ -304,6 +308,7 @@ pub(crate) fn package_args(args: &[String], takes_out: bool) -> Result<PackageAr
             "--testing" if takes_out => testing = true,
             "--relaxed-simd" if takes_out => relaxed_simd = true,
             "--trusted-shaders" if takes_out => trusted_shaders = true,
+            "--exact" if takes_out => exact = true,
             "--target" if takes_out => match it.next().and_then(|t| wrela_abi::Target::parse(t)) {
                 Some(t) => target = Some(t),
                 None => {
@@ -356,9 +361,9 @@ pub(crate) fn package_args(args: &[String], takes_out: bool) -> Result<PackageAr
         );
         return Err(ExitCode::from(2));
     }
-    if (trusted_shaders || target.is_some()) && (relaxed_simd || !lift.is_empty()) {
+    if (trusted_shaders || exact || target.is_some()) && (relaxed_simd || !lift.is_empty()) {
         eprintln!(
-            "error: `--trusted-shaders` and `--target` aren't for a relaxed-SIMD or a lifted build"
+            "error: `--trusted-shaders`, `--exact` and `--target` aren't for a relaxed-SIMD or a lifted build"
         );
         return Err(ExitCode::from(2));
     }
@@ -381,6 +386,7 @@ pub(crate) fn package_args(args: &[String], takes_out: bool) -> Result<PackageAr
         set,
         relaxed_simd,
         trusted_shaders,
+        exact,
         target,
     })
 }

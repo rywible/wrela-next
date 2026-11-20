@@ -94,6 +94,7 @@ pub fn build_for(pkg: &Path, target: wrela_abi::Target) -> Result<wrela_driver::
         set: Vec::new(),
         target,
         trusted_shaders: false,
+        exact: false,
     };
     let built = wrela_driver::build_for(pkg, &how);
     if built.has_errors() {
@@ -111,6 +112,7 @@ pub fn shipped_for(pkg: &Path, target: wrela_abi::Target) -> wrela_driver::Outpu
         set: Vec::new(),
         target,
         trusted_shaders: false,
+        exact: false,
     };
     wrela_driver::build_for(pkg, &how)
 }
