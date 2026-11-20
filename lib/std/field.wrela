@@ -103,15 +103,14 @@ pub trait Surface: Copy + GpuData {
     /// the other: a culling test keeps fewer boxes with both. A displacement narrows its
     /// surface's and adds its noise's range, which is tighter than its noise's steepness allows
     /// and needs no noise at the centre.
+    ///
+    /// A join or a move takes what holds both this and its parts' own, composed (`own_near`),
+    /// each narrowed by its own bound: one part whose bound is unbounded (an ellipsoid with its
+    /// centre in scope) or steep doesn't leave the rest at their derived intervals, which over
+    /// large boxes may never leave 0 (a body's round cones', hundreds of metres away), so a
+    /// search for where it can be would not close.
     fn interval_near(self, b: Box3) -> Interval {
-        let x = self.interval(b)
-        let l = self.lipschitz(max(abs(x.lo), abs(x.hi)) * 1.001 + 0.000001)
-        if l >= 1.0e30 {
-            return x
-        }
-        let r = l * 0.5 * length(b.hi - b.lo)
-        let d = self.distance(b.center())
-        Interval { lo: max(x.lo, d - r), hi: min(x.hi, d + r) }
+        own_near(self, b, self.interval(b))
     }
 
     /// The distance, held within ±`near` and divided by `lipschitz(near)`: never more than the
@@ -1209,6 +1208,47 @@ fn outward(r: Interval) -> Interval {
     Interval { lo: r.lo - abs(r.lo) * 4.0e-7 - 1.0e-37, hi: r.hi + abs(r.hi) * 4.0e-7 + 1.0e-37 }
 }
 
+/// The scope `interval_near` asks a bound over: as far from the surface as `x` says the box can be.
+fn near_scope(x: Interval) -> f32 {
+    max(abs(x.lo), abs(x.hi)) * 1.001 + 0.000001
+}
+
+/// `x`, `s`'s derived interval over `b`, narrowed by `s`'s bound `l` there and its distance at
+/// `b`'s centre (`Surface::interval_near`).
+fn narrowed<S: Surface>(s: S, b: Box3, x: Interval, l: f32) -> Interval {
+    let r = l * 0.5 * length(b.hi - b.lo)
+    let d = s.distance(b.center())
+    Interval { lo: max(x.lo, d - r), hi: min(x.hi, d + r) }
+}
+
+/// Any surface's `interval_near` (`Surface::interval_near`) from `x`, its derived interval over
+/// `b`: narrowed by its bound where it has one. A join or a move takes what holds both this and
+/// its parts' own, composed: never looser than either (each part's bound is at most the
+/// join's), and closed where a part's bound is unbounded or steep.
+fn own_near<S: Surface>(s: S, b: Box3, x: Interval) -> Interval {
+    let l = s.lipschitz(near_scope(x))
+    if l >= 1.0e30 {
+        return x
+    }
+    narrowed(s, b, x, l)
+}
+
+/// What both intervals hold.
+fn both(x: Interval, y: Interval) -> Interval {
+    Interval { lo: max(x.lo, y.lo), hi: min(x.hi, y.hi) }
+}
+
+/// The range of `-v` for `v` in `x`.
+fn negated(x: Interval) -> Interval {
+    Interval { lo: -x.hi, hi: -x.lo }
+}
+
+/// A range of `smax(a, b, k)` (`max` for `k <= 0`) for `a` in `x`, `b` in `y`: `smin_range`'s,
+/// negated.
+fn smax_range(x: Interval, y: Interval, k: f32) -> Interval {
+    negated(smin_range(negated(x), negated(y), k))
+}
+
 /// A range holding `smin(a, b, k)` for `a` in `x` and `b` in `y`, as the target computes it:
 /// at most the smaller (it takes a non-negative amount from it), at least the smaller less
 /// `k / 4` (and that amount's rounding). With `k` 0, `min`'s, exactly.
@@ -2194,6 +2234,12 @@ pub struct Union<A, B>: Copy + GpuData + Eq + StateHash {
 }
 
 impl<A: Surface, B: Surface> Surface for Union<A, B> {
+    /// Its operands' own, joined by `min`, within its own (`own_near`).
+    fn interval_near(self, b: Box3) -> Interval {
+        let x = self.interval(b)
+        both(own_near(self, b, x), smin_range(self.a.interval_near(b), self.b.interval_near(b), 0.0))
+    }
+
     /// Its operand's: a sharp join reaches no farther than its operands.
     fn part_bound(self, i: u32) -> PartBound {
         let n = self.a.parts()
@@ -2299,6 +2345,13 @@ pub struct SmoothUnion<A, B>: Copy + GpuData + Eq + StateHash {
 }
 
 impl<A: Surface, B: Surface> Surface for SmoothUnion<A, B> {
+    /// Its operands' own, joined by `smin` (which never falls as either rises), within its own
+    /// (`own_near`).
+    fn interval_near(self, b: Box3) -> Interval {
+        let x = self.interval(b)
+        both(own_near(self, b, x), smin_range(self.a.interval_near(b), self.b.interval_near(b), self.k))
+    }
+
     /// Its operand's, reaching `k` farther (where its operands are within `k` of each other the
     /// blend can move) and a quarter of `k` more (the most it lowers the other's distance), which
     /// it lowers by too.
@@ -2435,6 +2488,16 @@ pub struct UnionAll<S, const N: u32>: Copy + GpuData + Eq + StateHash {
 }
 
 impl<S: Surface, const N: u32> Surface for UnionAll<S, N> {
+    /// Its parts' own, joined by `min`, within its own (`own_near`).
+    fn interval_near(self, b: Box3) -> Interval {
+        let x = self.interval(b)
+        var v = Interval { lo: EMPTY, hi: EMPTY }
+        for i in 0..N {
+            v = smin_range(v, self.parts[i].interval_near(b), 0.0)
+        }
+        both(own_near(self, b, x), v)
+    }
+
     fn part_bound(self, i: u32) -> PartBound {
         if N == 0 {
             return PartBound { a: vec3(), r: EMPTY, b: vec3(), reach: 0.0, lowers: 0.0 }
@@ -2651,6 +2714,20 @@ pub struct SmoothUnionAll<S, const N: u32>: Copy + GpuData + Eq + StateHash {
 }
 
 impl<S: Surface, const N: u32> Surface for SmoothUnionAll<S, N> {
+    /// Its parts' own, folded by `smin` as its distance is, within its own
+    /// (`own_near`).
+    fn interval_near(self, b: Box3) -> Interval {
+        let x = self.interval(b)
+        if N == 0 {
+            return x
+        }
+        var v = self.parts[0].interval_near(b)
+        for i in 1..N {
+            v = smin_range(v, self.parts[i].interval_near(b), self.k)
+        }
+        both(own_near(self, b, x), v)
+    }
+
     /// Its element's, reaching `k` farther and the fold's whole lowering more
     /// (`fold_lowering`, at most `k`: 0.817 k for 17 parts), which it lowers by too.
     fn part_bound(self, i: u32) -> PartBound {
@@ -2985,6 +3062,12 @@ pub struct Intersect<A, B>: Copy + GpuData + Eq + StateHash {
 }
 
 impl<A: Surface, B: Surface> Surface for Intersect<A, B> {
+    /// Its operands' own, joined by `max`, within its own (`own_near`).
+    fn interval_near(self, b: Box3) -> Interval {
+        let x = self.interval(b)
+        both(own_near(self, b, x), smax_range(self.a.interval_near(b), self.b.interval_near(b), 0.0))
+    }
+
     fn distance(self, p: vec3) -> f32 {
         max(self.a.distance(p), self.b.distance(p))
     }
@@ -3121,6 +3204,10 @@ pub trait PointMap: Copy + GpuData {
     /// A gradient of the surface's own, in this space: the gradient of `distance_out(f(local(p)))`
     /// where `f`'s is `g`. Every map states it.
     fn gradient_out(self, g: vec3) -> vec3
+
+    /// A box holding `local(p)` for every `p` in `b`: what a join's range is asked over in the
+    /// surface's own space (`Surface::interval_near`). Every map states it.
+    fn box_in(self, b: Box3) -> Box3
 }
 
 /// A surface whose points are moved before it's asked about them: `s.translate(by)`,
@@ -3139,6 +3226,15 @@ fn mapped_part_bound<M: PointMap>(m: M, c: PartBound) -> PartBound {
 }
 
 impl<S: Surface, M: PointMap> Surface for Warp<S, M> {
+    /// Its surface's own over the box moved in (`PointMap::box_in`), moved out, within its own
+    /// (`own_near`).
+    fn interval_near(self, b: Box3) -> Interval {
+        let x = self.interval(b)
+        let v = self.inner.interval_near(self.map.box_in(b))
+        let (lo, hi) = (self.map.distance_out(v.lo), self.map.distance_out(v.hi))
+        both(own_near(self, b, x), Interval { lo: min(lo, hi), hi: max(lo, hi) })
+    }
+
     /// Its surface's, moved by a map that keeps shapes (`PointMap::SIMILAR`: a capsule's ends
     /// map as points, its radius, reach and lowering as lengths); by any other, its whole bound.
     fn part_bound(self, i: u32) -> PartBound {
@@ -3277,6 +3373,11 @@ impl PointMap for Shift {
     fn gradient_out(self, g: vec3) -> vec3 {
         g
     }
+
+    /// Moved: `local` is monotone in each axis, so the corners' images hold the rest.
+    fn box_in(self, b: Box3) -> Box3 {
+        Box3 { lo: self.local(b.lo), hi: self.local(b.hi) }
+    }
 }
 
 /// Turned about the origin: `to_local` takes a point into the surface's own space.
@@ -3303,6 +3404,19 @@ impl PointMap for Turn {
     /// Turned back: the turn's transpose (`to_local`'s), times `g`.
     fn gradient_out(self, g: vec3) -> vec3 {
         g * self.to_local
+    }
+
+    /// Its centre turned, its half-widths by the turn's entries' sizes, widened by the rounding
+    /// of `local`'s sums and of this one's (each a few ulps of the sizes it sums: 2e-6 of them).
+    fn box_in(self, b: Box3) -> Box3 {
+        let m = self.to_local
+        let h = 0.5 * (b.hi - b.lo)
+        let o = 0.5 * (b.lo + b.hi)
+        let c = self.local(o)
+        let w = abs(m[0]) * h.x + abs(m[1]) * h.y + abs(m[2]) * h.z
+        let size = abs(m[0]) * (abs(o.x) + h.x) + abs(m[1]) * (abs(o.y) + h.y) + abs(m[2]) * (abs(o.z) + h.z)
+        let e = size * 2.0e-6 + vec3(1.0e-30)
+        Box3 { lo: c - w - e, hi: c + w + e }
     }
 }
 
@@ -3341,6 +3455,12 @@ impl PointMap for Size {
     /// The same: lengths in by the factor, distances out by it.
     fn gradient_out(self, g: vec3) -> vec3 {
         g
+    }
+
+    /// Divided by the factor: its corners' images, ordered (a negative factor swaps them).
+    fn box_in(self, b: Box3) -> Box3 {
+        let (u, v) = (self.local(b.lo), self.local(b.hi))
+        Box3 { lo: min(u, v), hi: max(u, v) }
     }
 }
 
@@ -4720,6 +4840,14 @@ pub struct SmoothSubtract<A, B>: Copy + GpuData + Eq + StateHash {
 }
 
 impl<A: Surface, B: Surface> Surface for SmoothSubtract<A, B> {
+    /// Its operands' own, `a`'s joined by `smax` with `b`'s negated, within its own
+    /// (`own_near`).
+    fn interval_near(self, b: Box3) -> Interval {
+        let x = self.interval(b)
+        let cut = negated(self.b.interval_near(b))
+        both(own_near(self, b, x), smax_range(self.a.interval_near(b), cut, self.k))
+    }
+
     fn distance(self, p: vec3) -> f32 {
         smax(self.a.distance(p), -self.b.distance(p), self.k)
     }
@@ -4786,6 +4914,12 @@ pub struct SmoothIntersect<A, B>: Copy + GpuData + Eq + StateHash {
 }
 
 impl<A: Surface, B: Surface> Surface for SmoothIntersect<A, B> {
+    /// Its operands' own, joined by `smax`, within its own (`own_near`).
+    fn interval_near(self, b: Box3) -> Interval {
+        let x = self.interval(b)
+        both(own_near(self, b, x), smax_range(self.a.interval_near(b), self.b.interval_near(b), self.k))
+    }
+
     fn distance(self, p: vec3) -> f32 {
         smax(self.a.distance(p), self.b.distance(p), self.k)
     }
@@ -4858,6 +4992,15 @@ fn mirrored_centre(c: vec3) -> vec3 {
 }
 
 impl<S: Surface> Surface for Mirror<S> {
+    /// Its surface's own over the box mirrored into x >= 0, within its own
+    /// (`own_near`).
+    fn interval_near(self, b: Box3) -> Interval {
+        let x = self.interval(b)
+        let ax = if b.lo.x >= 0.0 { vec2(b.lo.x, b.hi.x) } else if b.hi.x <= 0.0 { vec2(-b.hi.x, -b.lo.x) } else { vec2(0.0, max(-b.lo.x, b.hi.x)) }
+        let m = Box3 { lo: vec3(ax.x, b.lo.y, b.lo.z), hi: vec3(ax.y, b.hi.y, b.hi.z) }
+        both(own_near(self, b, x), self.inner.interval_near(m))
+    }
+
     fn distance(self, p: vec3) -> f32 {
         self.inner.distance(mirrored(p))
     }
@@ -7323,4 +7466,118 @@ fn a_field_reads_only_the_point_where_its_numbers_are_its_code() {
 
 fn check_bound_scope(p: vec3) -> f32 {
     max(abs(p.x), abs(p.y))
+}
+
+/// The engine's search for where a surface can be, in small (wrela-notes/engine,
+/// `derived_bound`): boxes over 1024 m each way from the origin, halved where `interval_near`
+/// holds 0, until a box is an eighth of what is found so far; the widest half of what is found,
+/// 0 where nothing is, or -1 where the search doesn't close (a range not a number, or what is
+/// found over a quarter of the space searched).
+fn searched_radius<S: Surface>(s: S) -> f32 {
+    let world = 1024.0
+    var boxes: Vec<Box3> = Vec::new()
+    boxes.push(Box3 { lo: vec3(-world), hi: vec3(world) })
+    var lo = vec3(1.0e30)
+    var hi = vec3(-1.0e30)
+    var found = 2.0 * world
+    var level: u32 = 0
+    while boxes.len() > 0 && level < 24 {
+        var next: Vec<Box3> = Vec::new()
+        var all_lo = lo
+        var all_hi = hi
+        for b in boxes {
+            let v = s.interval_near(b)
+            if !(abs(v.lo) < 1.0e38 && abs(v.hi) < 1.0e38) {
+                return -1.0
+            }
+            if v.lo > 0.0 {
+                continue
+            }
+            all_lo = min(all_lo, b.lo)
+            all_hi = max(all_hi, b.hi)
+            if v.hi >= 0.0 && b.hi.x - b.lo.x > 0.125 * found && next.len() + 8 <= 4096 {
+                for c in b.split() {
+                    next.push(c)
+                }
+            } else {
+                lo = min(lo, b.lo)
+                hi = max(hi, b.hi)
+            }
+        }
+        found = max(max(all_hi.x - all_lo.x, all_hi.y - all_lo.y), all_hi.z - all_lo.z)
+        boxes = take next
+        level += 1
+    }
+    for b in boxes {
+        lo = min(lo, b.lo)
+        hi = max(hi, b.hi)
+    }
+    if hi.x < lo.x {
+        return 0.0
+    }
+    let r = 0.5 * max(max(hi.x - lo.x, hi.y - lo.y), hi.z - lo.z)
+    if r > 0.25 * world { -1.0 } else { r }
+}
+
+/// A body like the engine's creature: seven round cones in a smooth union, whose derived
+/// ranges alone reach below 0 hundreds of metres away (its search closes by their bounds).
+fn coned_body() -> SmoothUnionAll<RoundCone, 7> {
+    var cones = [round_cone(vec3(), vec3(0.0, 1.0, 0.0), r_top: 0.05, r_bottom: 0.1); 7]
+    for i in 0..7 {
+        let a = f32(i) * 0.37
+        cones[i] = round_cone(vec3(0.12 * cos(a), 0.06 * f32(i), 0.12 * sin(a)), vec3(0.25 * cos(a), 0.06 * f32(i) + 0.12, 0.25 * sin(a)), r_top: 0.03, r_bottom: 0.045)
+    }
+    cones.smooth_union(0.02)
+}
+
+/// `s`'s search closes within `most` m.
+fn closes_within<S: Surface>(s: S, most: f32, what: str) {
+    let r = searched_radius(s)
+    assert(r > 0.0 && r <= most, f"{what}: where it can be is searched to {r} m")
+}
+
+/// `p`, moved onto the body (the middle of its first cone), closes alone and joined with it
+/// every way.
+fn closes_joined<P: Surface>(p: P, what: str) {
+    let body = coned_body()
+    let at = p.translate(vec3(0.185, 0.06, 0.0))
+    closes_within(at, 0.25, what)
+    closes_within(body.union(at), 1.0, f"{what}, a union")
+    closes_within(body.smooth_union(at, 0.02), 1.0, f"{what}, a smooth union")
+    closes_within(body.intersect(at), 1.0, f"{what}, an intersection")
+    closes_within(body.smooth_intersect(at, 0.02), 1.0, f"{what}, a smooth intersection")
+    closes_within(body.smooth_subtract(at, 0.02), 1.0, f"{what}, a smooth subtraction")
+    let two = [at, p.translate(vec3(0.0, 0.3, 0.1))]
+    closes_within(body.union(two.union()), 1.0, f"{what}, two in a union of many")
+    closes_within(body.smooth_union(two.smooth_union(0.02), 0.02), 1.0, f"{what}, two in a smooth union of many")
+}
+
+/// Every std surface's search for where it can be (the engine's) closes near it, alone and
+/// joined to a body every way, moved, turned, scaled and mirrored; a half-space, which has no
+/// such place, says so (`UNBOUNDED`). An ellipsoid's bound is unbounded with its centre in
+/// scope, which left every join holding one to its derived interval, and a body's never closes
+/// so (2026-11-19: the engine's SCENE 9, a body joined with a sphere and an ellipsoid, 18 of 32
+/// things refused): a join composes its parts' own where its bound is unbounded.
+@test
+fn every_surface_s_search_for_where_it_can_be_closes() {
+    closes_within(coned_body(), 1.0, "the body")
+    closes_joined(sphere(0.06), "a sphere")
+    closes_joined(ellipsoid(vec3(0.05, 0.035, 0.06)), "an ellipsoid")
+    closes_joined(oval(vec3(0.06, 0.078, 0.048)), "an oval")
+    closes_joined(round_cone(vec3(), vec3(0.06, 0.06, 0.0), r_top: 0.036, r_bottom: 0.018), "a round cone")
+    closes_joined(cuboid(vec3(0.06, 0.048, 0.036)), "a cuboid")
+    closes_joined(tube([vec3(), vec3(0.06, 0.06, 0.0), vec3(0.1, 0.0, 0.0)], [0.03, 0.02, 0.025]), "a tube")
+    // The engine's SCENE 9, a body joined with a sphere and an ellipsoid, then moved, turned,
+    // scaled and mirrored.
+    let e = ellipsoid(vec3(0.05, 0.035, 0.06)).translate(vec3(-0.15, 0.6, 0.05))
+    let joined = coned_body().smooth_union(sphere(0.06).translate(vec3(0.15, 0.9, 0.05)), 0.02).smooth_union(e, 0.02)
+    closes_within(joined, 1.0, "scene 9's body")
+    closes_within(joined.translate(vec3(4.5, 0.0, -6.3)), 1.0, "scene 9's body, moved")
+    closes_within(joined.rotate(Quat::axis_angle(vec3(0.3, 1.0, 0.2), 0.8)), 1.5, "scene 9's body, turned")
+    closes_within(joined.scale(2.5), 2.5, "scene 9's body, scaled")
+    closes_within(joined.translate(vec3(0.5, 0.0, 0.0)).mirror_x(), 1.5, "scene 9's body, mirrored")
+    // A half-space has no place it's within: it says so, and its search doesn't close.
+    let h = half_space(vec3(0.0, 1.0, 0.0), 0.0)
+    assert(h.bound().radius >= 1.0e30, "a half-space states no bound")
+    assert(searched_radius(h) < 0.0, "a half-space's search doesn't close")
 }
