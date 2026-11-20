@@ -184,7 +184,7 @@ picture, each short of the figure its own line named.) In every other case the l
 written: anything judged that got worse, anything dearer somewhere, or an idea whose machinery
 only its amount would justify, which is said when the line is written.
 
-## The frame costs by the pixel (2026-11-19: the engine's direction, not built)
+## The frame costs by the pixel (2026-11-19: the engine's direction; measured in parts, not built)
 
 **Why.** Every pass of the frame as built is "for each thing, draw its part of the screen with
 its own program": the eye's, the outlines', the edge rays', the shadows', the sun's map, a map of
@@ -215,26 +215,33 @@ every frame, the still world's included (3.3 of 6.4 ms).
 
 - **Stand-ins.** Between the game's fields and every pass sits one store. For each thing it holds
   the cheapest form of it that is proved good enough for the size the thing has on the screen
-  now: its closed-form parts; fewer parts, where a bound on the distance between the two
-  surfaces is under what the eye is held to; or cells kept once a kind in the kind's own rigid
-  frame, at the fineness the nearest of that kind needs, shared by every thing of the kind (a
-  joint is the smooth join of two such reads, which is within the cells' own error of the true
-  join because the join is monotone and steepness one in each part). With a stand-in come two
+  now, and a form is one of a closed list of families: a round cone (a sphere is its end case),
+  a box, or cells. So a thing is its closed-form parts where they are of those families; fewer
+  such parts, where a bound on the distance between the two surfaces is under what the eye is
+  held to; or cells kept once a kind in the kind's own rigid frame, at the fineness the nearest
+  of that kind needs, shared by every thing of the kind (a joint is the smooth join of two such
+  reads, which is within the cells' own error of the true join because the join is monotone and
+  steepness one in each part). A shape outside the list (an ellipsoid, a displaced thing) is
+  kept in cells or bounded by the list's shapes with a proved error; the list does not grow by
+  a thing, or the kernel below becomes the shader that holds every answer. With a stand-in come two
   hulls, one inside the surface and one outside, both proved, its bound, and its counted work.
   Matter that changes makes again only what its change's bound touches, to a fixed amount a
   frame, the coarser level standing in meanwhile. Passes and the CPU's questions ask the store,
   never the field.
-- **One way to see.** Stand-ins are listed by screen tile, nearest first. One kernel walks a
-  pixel's list: a stand-in's hulls are met in closed form, so the surface is bracketed between
-  them and found by a guarded root-finder (the inner hull's entry is asked first: away from a
-  join it is the hit). A ray that passes within a pixel of a stand-in without meeting it leaves
-  how near it came and which way the outline runs. The kernel writes what was met and how far,
-  and that edge record; nothing else. The still world's cells go through the same kernel if the
-  measurement below allows it; if not, they keep the rasteriser, and that is named as the one
-  exception with the conditions that make it invisible (the same ray's distance, the edge record
-  shared across the two, nothing after the eye knowing which found a pixel).
-- **What a pixel shows** (facing, substance) is found once a pixel after the eye's pass, by the
-  stand-in that was met.
+- **One way to see: one buffer of what was met, and two fillers of it.** Closed-form stand-ins
+  are listed by screen tile, nearest first. One kernel walks a pixel's list: a stand-in's hulls
+  are met in closed form, so the surface is bracketed between them and found by a guarded
+  root-finder (the inner hull's entry is asked first: away from a join it is the hit). A ray
+  that passes within a pixel of a stand-in without meeting it leaves how near it came and which
+  way the outline runs. The kernel writes what was met and how far, and that edge record;
+  nothing else. Cells keep the rasteriser. That is the one exception to "one way", it was
+  measured (below), and it holds only under these conditions, each of them checked: both
+  fillers write the same ray's distance; the edge record is shared across the two; and nothing
+  after the eye's pass can tell which filler found a pixel. The cohesion judges are what prove
+  it.
+- **What a pixel shows** (facing, substance) is found once a pixel after the eye's pass, by a
+  program a kind run over the pixels where that kind was met. A thing's substance stays its own
+  code, and a pixel runs only what its thing can use, as this document already requires.
 - **One light.** The question is "what light arrives at this point through this cone", answered
   by one march through one index of every stand-in and everything that glows, the level read
   following the cone's width. The sky, bounce, a spell's light, contact and a mirror's reflection
@@ -243,29 +250,60 @@ every frame, the still world's included (3.3 of 6.4 ms).
   blocker's distance; and the sky's and bounce's cones stored on surfaces, one store for still
   and moving surfaces (a still surface is a moving one whose frame does not move), filled by the
   march to a fixed amount a frame.
-- **Edges without rays.** A pixel an outline crosses is its square cut by the outlines its record
-  holds (a line, an arc's correction, a clip where two cross), each piece coloured from the
-  neighbouring pixel that met that surface. A crease between two faces is a line from the two
-  facings. A part thinner than a pixel is covered in closed form. No outline pass, no edge rays,
-  no edge shadows.
+- **Edges: today's two samples, found without a march through a draw a thing.** A pixel an
+  outline crosses is covered in closed form from its record (a line, an arc's correction, a clip
+  where two cross), as today. Its colours are NOT read from neighbouring pixels: that was
+  measured and it loses (below). They are today's two samples at today's places, each found by a
+  short solve started from a neighbouring pixel's hit, in a pass that costs by the pixel, and
+  lit by the one light. A crease between two faces of an exact thing is a line from the two
+  facings, with no ray. A part thinner than a pixel is covered in closed form. No outline pass,
+  and no pass that draws a thing again to find an edge's sample or its shadow.
 
 **What it is predicted to cost** (M4, 1080p, ms; from the engine's measured unit costs and
 estimates; nothing here is measured as a frame), against the shares above:
 
 | Share | Share | Predicted, 256 creatures and 256 props | Of it |
 | --- | --- | --- | --- |
-| The eye's rays | 3.0 | 3.35 | the eye's kernel 2.25, what a pixel shows 1.10 |
+| The eye's rays | 3.0 | 3.5 | the kernel 1.49 (measured alone), cells behind it 0.9 (measured), what a pixel shows 1.1 |
 | Light | 3.0 | 3.55 | the sun's map 0.55; the sun read, stored light, cones a pixel 3.0 |
-| Edges | 1.5 | 1.0 | |
-| Things that move, and cells filled | 2.5 | 0.85 | stand-ins, lists, light's index |
+| Edges | 1.5 | 1.5 | an estimate: two short solves and two shadings an edge pixel |
+| Things that move, and cells filled | 2.5 | 0.85 | stand-ins, lists, light's index (the lists alone took 1.1 ms of CPU in the kernel's measurement) |
 | Matter light passes through; the look | 3.0 | not designed here | |
-| Sum of what is designed | | 8.75 | still world alone 5.2; 64 creatures 6.2 |
+| Sum of what is designed | | 9.4 | of which only the kernel and the cells are measured |
 
-The shares stay as they are until a stage is measured against them.
+The shares stay as they are until a stage is measured against them. With the two shares not
+designed here the frame at 256 creatures is about 12.4 of 16.6 ms.
 
-**What is not proved.** The kernel does not exist: its time is derived from unit costs. Colours
-read from neighbours are shown on a toy scene only (2.17 of 255 against nine rays' 2.45), with no
-moving shadow edges and no crossing outlines. Every figure for light is an estimate. Two things
+**What was measured the night it was written** (2026-11-19; M4 at 1080p unless said).
+
+- *The kernel, alone, outside the engine* (`wrela-notes/next/scratch/tilekernel/`): 256 creatures
+  of 18 round cones 1.49 ms; 64, 0.99; the eye three times nearer 1.58. No holes against a
+  brute-force march on either machine. The Radeon: 6.60 at 256. Its lines were 2.2 for the
+  budget to be real, 3.0 for doubt, 4.5 for death. As first written it took 2.98 to 3.03: the
+  cut that mattered was not mathematics but the fold's loop indexing a small vector by its
+  variable, which sent it to memory on both GPUs (unrolled: 2.99 to 1.72 on the M4, 16.2 to 7.9
+  on the Radeon); then one ask for a near miss over a pixel away, and the root found to a
+  twentieth of a pixel. It asks 2.74 times a hit pixel. It is a fragment pass over the screen:
+  the guard refuses a compute walk whose length depends on data. Open: where a ray grazes a
+  join, a near miss's least is fitted by a parabola, and one pixel of 11,068 landed 1.4 px
+  behind the first surface; a stepping that cannot miss it cost 1.2 to 3.5 ms more, so the
+  rim's soundness is not settled and the engine's own judges decide it on real frames.
+- *Cells through the same kernel*: 3.98 to 4.00 ms for a screen of them, against a line of 2.0
+  and the rasteriser's 0.9. Dead. Holding the second form costs a round-cone scene 0.05 ms and a
+  cell scene 1.43: slice 1d's fault, on one side only.
+- *Colours read from neighbours*, on the engine's own frames against the reference (error of 255
+  on one-look pixels, today's / read / interpolated at today's two sample points): 3.12 / 3.62 /
+  3.43; far 2.94 / 4.89 / 4.22; near 3.03 / 4.00 / 4.04. Curved worse too (3.42 / 5.72). Dead:
+  whole pixels one to three away read shading and a shadow's edge from the wrong place. Exact
+  creases as lines win (2.66 against 3.04). And today's two samples beat nine rays on every
+  one-look class (3.12 against 3.65).
+- *Where today's edge work goes* (one-look pixels, 64 creatures, 9.4 ms): finding the samples
+  through a draw a thing 4.9, the sun's march 2.1, the edge shadows' draws themselves 1.55,
+  shading 0.65, the rest 0.25. Nine tenths is the structure, not the shading.
+
+**What is not proved.** The kernel is not in the engine, and its time there with the still
+world behind it is not known. An edge's samples found by a short solve are not built or
+counted. Every figure for light is an estimate. Two things
 this design brings back were set aside before, by argument and not by measurement, and are
 reopened only as measurements: work lists in compute in place of the rasteriser, and fewer parts
 for a far creature (nothing merges at the fiftieth of a pixel edges are held to, so the second
@@ -280,14 +318,16 @@ it is measured. Before any of them, the kernel is timed by itself, outside the e
 machines, with a brute-force check for holes: over 4.5 ms for 256 creatures on the M4 the design
 is dead as priced; at 2.2 or under the budget is real; any hole is a fault before any time.
 
-1. **Edges without rays**, in the frame as it is. Deletes edge rays, edge light, edge shadows and
-   edge shade. Kill: any judged edge measure worse than today's on a judged scene, or the work
-   replaced not at least halved at 64 creatures on the M4. It pays whatever the kernel's time is.
-2. **One way to see**: the store of stand-ins, the kernel, what a pixel shows found once.
-   Deletes a draw a thing in the eye's pass, the outline pass, and a program a kind for the eye.
-   Kill: a hole; or the eye's work at 256 creatures not under a tenth of today's. If the kernel's
-   own measurement killed it, this stage is fragments where a part's hull can be, through the
-   rasteriser, by the same stand-ins.
+1. **Creases as lines**, in the frame as it is, under the standing rule. This stage was first
+   "edges without rays" (every edge pixel's colours read from its neighbours): dead by its
+   line, as measured above. What is left of it is what won.
+2. **One way to see**: the store of stand-ins, the kernel for closed-form stand-ins, what a
+   pixel shows as a program a kind, and an edge pixel's two samples found from its neighbours'
+   hits. Deletes a draw a thing in the eye's pass, the outline pass, the edge rays' and edge
+   shadows' draws a thing, and a program a kind for the eye. Kill: a hole; the eye's work at
+   256 creatures not under a tenth of today's; or edge work at 64 not under a quarter of
+   today's. Its first slice replaces the creatures' eye pass and outlines by the kernel and
+   leaves everything after as it is.
 3. **One light**: the index, the march, the sun's one map, one store. Deletes the maps of sky a
    body, the cones, every shadow draw a thing, and every split between still and moving. Lines:
    the two cohesion judges (still against moving within 1 of 255 in the mean and 3 at the 99th
