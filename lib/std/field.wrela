@@ -59,6 +59,15 @@ pub trait Surface: Copy + GpuData {
         self.distance(p)
     }
 
+    /// What `p` (a hit) says about a crease near it (`Crease`): the runner-up branch of the sharp
+    /// join or many-faced shape that decides the surface there, its value, gradient and kind. A
+    /// box gives its second face, a union or an intersection its other operand (or the winner's
+    /// own crease where nearer), a map its operand's moved out; a smooth join or a displacement
+    /// only where the other part surely can't reach the point. The default knows none.
+    fn crease(self, p: vec3) -> Crease {
+        NO_CREASE
+    }
+
     /// A sphere outside which its distance has a lower bound (`Bound::below`): what culling and
     /// sampling read to skip a surface that can't matter at a point, and LOD to size it by.
     /// Every surface states one (language.md §20.3): a surface that has none says so with
@@ -2000,6 +2009,18 @@ impl Surface for Cuboid {
         if m > 0.0 { length(max(q, vec3(0.0))) } else { m }
     }
 
+    /// Its second face: inside (and on) the box its distance is the greatest of its faces'
+    /// planes, `|p| - half` on each axis; the runner-up is the second greatest.
+    fn crease(self, p: vec3) -> Crease {
+        let q = abs(p) - self.half
+        let s = vec3(if p.x < 0.0 { -1.0 } else { 1.0 }, if p.y < 0.0 { -1.0 } else { 1.0 }, if p.z < 0.0 { -1.0 } else { 1.0 })
+        // The greatest's axis, then the greater of the other two.
+        let first = if q.x >= q.y && q.x >= q.z { 0 } else if q.y >= q.z { 1 } else { 2 }
+        let (j, v) = if first == 0 { if q.y >= q.z { (1, q.y) } else { (2, q.z) } } else if first == 1 { if q.x >= q.z { (0, q.x) } else { (2, q.z) } } else if q.x >= q.y { (0, q.x) } else { (1, q.y) }
+        let g = if j == 0 { vec3(s.x, 0.0, 0.0) } else if j == 1 { vec3(0.0, s.y, 0.0) } else { vec3(0.0, 0.0, s.z) }
+        Crease { value: v, gradient: g, flags: CREASE_HAS | CREASE_GREATEST }
+    }
+
     /// Exact, in closed form (`box_passes`).
     fn passes(self, o: vec3, d: vec3) -> Pass {
         box_passes(o, d, self.half)
@@ -2186,6 +2207,12 @@ impl<A: Surface, B: Surface> Surface for Union<A, B> {
         min(self.a.distance(p), self.b.distance(p))
     }
 
+    /// The other operand (a least), or the nearer operand's own crease where nearer.
+    fn crease(self, p: vec3) -> Crease {
+        let (da, db) = (self.a.distance(p), self.b.distance(p))
+        if da <= db { self.a.crease(p).nearer(sibling_crease(self.b, db, p, greatest: false)) } else { self.b.crease(p).nearer(sibling_crease(self.a, da, p, greatest: false)) }
+    }
+
     /// The nearer of its operands': exact where both are.
     fn passes(self, o: vec3, d: vec3) -> Pass {
         self.a.passes(o, d).or(self.b.passes(o, d))
@@ -2286,6 +2313,14 @@ impl<A: Surface, B: Surface> Surface for SmoothUnion<A, B> {
 
     fn distance(self, p: vec3) -> f32 {
         smin(self.a.distance(p), self.b.distance(p), self.k)
+    }
+
+    /// The nearer operand's own, where the other is at least `k` farther (it changes nothing
+    /// there); else none: the blend is smooth.
+    fn crease(self, p: vec3) -> Crease {
+        let (da, db) = (self.a.distance(p), self.b.distance(p))
+        let k = max(self.k, 0.0)
+        if db - da >= k { self.a.crease(p) } else if da - db >= k { self.b.crease(p) } else { NO_CREASE }
     }
 
     /// The nearer of its operands' less the most the blend lowers it (a quarter of `k`): a
@@ -2418,6 +2453,30 @@ impl<S: Surface, const N: u32> Surface for UnionAll<S, N> {
             d = min(d, self.parts[i].distance(p))
         }
         d
+    }
+
+    /// The second nearest part (a least), or the nearest part's own crease where nearer.
+    fn crease(self, p: vec3) -> Crease {
+        if N < 2 {
+            return if N == 1 { self.parts[0].crease(p) } else { NO_CREASE }
+        }
+        var a: u32 = 0
+        var da = EMPTY
+        var b: u32 = 0
+        var db = EMPTY
+        for i in 0..N {
+            let d = self.parts[i].distance(p)
+            if d < da {
+                b = a
+                db = da
+                a = i
+                da = d
+            } else if d < db {
+                b = i
+                db = d
+            }
+        }
+        self.parts[a].crease(p).nearer(sibling_crease(self.parts[b], db, p, greatest: false))
     }
 
     /// The nearest of its parts': exact where every part's is. A part whose bound's pass is no
@@ -2616,6 +2675,25 @@ impl<S: Surface, const N: u32> Surface for SmoothUnionAll<S, N> {
             d = smin(d, self.parts[i].distance(p), self.k)
         }
         d
+    }
+
+    /// The nearest part's own, where every other is at least `k` farther (it alone decides the
+    /// surface there); else none: the blend is smooth.
+    fn crease(self, p: vec3) -> Crease {
+        var a: u32 = 0
+        var da = EMPTY
+        var db = EMPTY
+        for i in 0..N {
+            let d = self.parts[i].distance(p)
+            if d < da {
+                db = da
+                a = i
+                da = d
+            } else if d < db {
+                db = d
+            }
+        }
+        if N > 0 && db - da >= max(self.k, 0.0) { self.parts[a].crease(p) } else { NO_CREASE }
     }
 
     /// The nearest of its parts' less the fold's whole lowering (`fold_lowering`): a bound. Its
@@ -2911,6 +2989,12 @@ impl<A: Surface, B: Surface> Surface for Intersect<A, B> {
         max(self.a.distance(p), self.b.distance(p))
     }
 
+    /// The other operand (a greatest), or the farther operand's own crease where nearer.
+    fn crease(self, p: vec3) -> Crease {
+        let (da, db) = (self.a.distance(p), self.b.distance(p))
+        if da >= db { self.a.crease(p).nearer(sibling_crease(self.b, db, p, greatest: true)) } else { self.b.crease(p).nearer(sibling_crease(self.a, da, p, greatest: true)) }
+    }
+
     /// Where both can be met: exact where both are one piece along the ray.
     fn meets_grown(self, o: vec3, d: vec3, grow: f32, inner: f32) -> Meets {
         let m = self.a.meets_grown(o, d, grow, inner).and(self.b.meets_grown(o, d, grow, inner))
@@ -2956,6 +3040,47 @@ impl<A: Surface, B: Surface> Surface for Intersect<A, B> {
     }
 }
 
+/// What a point (a hit) says about a crease near it (`Surface::crease`): the runner-up branch of
+/// the sharp join or many-faced shape that decides the surface there: its value and gradient at
+/// the point, and whether the join takes the greatest of its branches (an intersection, a box's
+/// faces) or the least (a union). The crease is where that branch's value reaches the winner's.
+pub struct Crease: Copy + GpuData {
+    pub value: f32,
+    pub gradient: vec3,
+    /// `CREASE_HAS` and `CREASE_GREATEST`, as they hold.
+    pub flags: u32,
+}
+
+/// `Crease`'s flag: there is a runner-up branch (else no crease is known near the point).
+pub const CREASE_HAS: u32 = 1
+/// `Crease`'s flag: the join takes the greatest of its branches (else the least).
+pub const CREASE_GREATEST: u32 = 2
+
+/// No crease known.
+pub const NO_CREASE: Crease = Crease { value: EMPTY, gradient: vec3(), flags: 0 }
+
+impl Crease {
+    /// Whether there is one.
+    pub fn has(self) -> bool {
+        (self.flags & CREASE_HAS) != 0
+    }
+
+    /// Whether its join takes the greatest of its branches.
+    pub fn greatest(self) -> bool {
+        (self.flags & CREASE_GREATEST) != 0
+    }
+
+    /// The nearer of two: the one whose runner-up is nearer its winner (least |value|).
+    pub fn nearer(self, other: Crease) -> Crease {
+        if self.has() && (!other.has() || abs(self.value) < abs(other.value)) { self } else { other }
+    }
+}
+
+/// The crease a sharp join's sibling makes at `p`: its value and gradient there.
+fn sibling_crease<S: Surface>(s: S, value: f32, p: vec3, greatest: bool) -> Crease {
+    Crease { value, gradient: s.gradient(p), flags: CREASE_HAS | (if greatest { CREASE_GREATEST } else { 0 }) }
+}
+
 /// How a warp takes a point into its surface's own space (`translate`, `rotate`, `scale`), and
 /// its distances back: what each combinator that moves the point does, while the warp passes
 /// every method of the surface on through it, once for all of them.
@@ -2992,6 +3117,10 @@ pub trait PointMap: Copy + GpuData {
     /// The surface's bound (`Surface::bound`), in this space. Every map states it, as every
     /// surface does.
     fn bound(self, b: Bound) -> Bound
+
+    /// A gradient of the surface's own, in this space: the gradient of `distance_out(f(local(p)))`
+    /// where `f`'s is `g`. Every map states it.
+    fn gradient_out(self, g: vec3) -> vec3
 }
 
 /// A surface whose points are moved before it's asked about them: `s.translate(by)`,
@@ -3025,6 +3154,12 @@ impl<S: Surface, M: PointMap> Surface for Warp<S, M> {
 
     fn distance(self, p: vec3) -> f32 {
         self.map.distance_out(self.inner.distance(self.map.local(p)))
+    }
+
+    /// Its operand's at the point moved in, its value and gradient moved out.
+    fn crease(self, p: vec3) -> Crease {
+        let c = self.inner.crease(self.map.local(p))
+        Crease { value: self.map.distance_out(c.value), gradient: self.map.gradient_out(c.gradient), flags: c.flags }
     }
 
     /// The inner surface's, the ray taken into its space (`t` kept), where the map keeps shapes
@@ -3137,6 +3272,11 @@ impl PointMap for Shift {
     fn bound(self, b: Bound) -> Bound {
         b.moved(self.by)
     }
+
+    /// The same: a move keeps gradients.
+    fn gradient_out(self, g: vec3) -> vec3 {
+        g
+    }
 }
 
 /// Turned about the origin: `to_local` takes a point into the surface's own space.
@@ -3158,6 +3298,11 @@ impl PointMap for Turn {
     fn bound(self, b: Bound) -> Bound {
         let m = self.to_local
         Bound { centre: vec3(dot(m[0], b.centre), dot(m[1], b.centre), dot(m[2], b.centre)), ..b }
+    }
+
+    /// Turned back: the turn's transpose (`to_local`'s), times `g`.
+    fn gradient_out(self, g: vec3) -> vec3 {
+        g * self.to_local
     }
 }
 
@@ -3191,6 +3336,11 @@ impl PointMap for Size {
             return UNBOUNDED
         }
         Bound { centre: b.centre * self.by, radius: b.radius * abs(self.by), slope: b.slope }
+    }
+
+    /// The same: lengths in by the factor, distances out by it.
+    fn gradient_out(self, g: vec3) -> vec3 {
+        g
     }
 }
 
@@ -4574,6 +4724,12 @@ impl<A: Surface, B: Surface> Surface for SmoothSubtract<A, B> {
         smax(self.a.distance(p), -self.b.distance(p), self.k)
     }
 
+    /// The kept part's own, where the cut is at least `k` away from mattering; else none.
+    fn crease(self, p: vec3) -> Crease {
+        let (da, db) = (self.a.distance(p), self.b.distance(p))
+        if da - -db >= max(self.k, 0.0) { self.a.crease(p) } else { NO_CREASE }
+    }
+
     /// Within `a`'s: its distance is at least `a`'s (`smax` is at least the larger). Not exact.
     fn meets_grown(self, o: vec3, d: vec3, grow: f32, inner: f32) -> Meets {
         self.a.meets_grown(o, d, grow, inner).unsure()
@@ -4632,6 +4788,13 @@ pub struct SmoothIntersect<A, B>: Copy + GpuData + Eq + StateHash {
 impl<A: Surface, B: Surface> Surface for SmoothIntersect<A, B> {
     fn distance(self, p: vec3) -> f32 {
         smax(self.a.distance(p), self.b.distance(p), self.k)
+    }
+
+    /// The farther operand's own, where the other is at least `k` nearer; else none.
+    fn crease(self, p: vec3) -> Crease {
+        let (da, db) = (self.a.distance(p), self.b.distance(p))
+        let k = max(self.k, 0.0)
+        if da - db >= k { self.a.crease(p) } else if db - da >= k { self.b.crease(p) } else { NO_CREASE }
     }
 
     /// Within both's: its distance is at least each's. Not exact.
@@ -4697,6 +4860,13 @@ fn mirrored_centre(c: vec3) -> vec3 {
 impl<S: Surface> Surface for Mirror<S> {
     fn distance(self, p: vec3) -> f32 {
         self.inner.distance(mirrored(p))
+    }
+
+    /// Its operand's at the point mirrored, its gradient mirrored back.
+    fn crease(self, p: vec3) -> Crease {
+        let c = self.inner.crease(mirrored(p))
+        let g = if p.x < 0.0 { vec3(-c.gradient.x, c.gradient.y, c.gradient.z) } else { c.gradient }
+        Crease { gradient: g, ..c }
     }
 
     /// Within its surface's and that one's image in x = 0: not exact.
@@ -4774,6 +4944,10 @@ impl<S: Surface> Surface for Named<S> {
 
     fn distance(self, p: vec3) -> f32 {
         self.inner.distance(p)
+    }
+
+    fn crease(self, p: vec3) -> Crease {
+        self.inner.crease(p)
     }
 
     fn passes(self, o: vec3, d: vec3) -> Pass {
@@ -5378,6 +5552,10 @@ impl<S: Surface, C: Copy + GpuData> Surface for With<S, C> {
         self.inner.distance(p)
     }
 
+    fn crease(self, p: vec3) -> Crease {
+        self.inner.crease(p)
+    }
+
     fn passes(self, o: vec3, d: vec3) -> Pass {
         self.inner.passes(o, d)
     }
@@ -5459,6 +5637,10 @@ impl<S: Surface, F: Copy + GpuData> Surface for WithAt<S, F> {
 
     fn distance(self, p: vec3) -> f32 {
         self.inner.distance(p)
+    }
+
+    fn crease(self, p: vec3) -> Crease {
+        self.inner.crease(p)
     }
 
     fn passes(self, o: vec3, d: vec3) -> Pass {
@@ -6631,6 +6813,65 @@ fn a_written_fold_is_std_s_fold() {
         let (g, h) = (written.meets_grown(o, dir, grow: 0.02, inner: 0.0), compiled.meets_grown(o, dir, grow: 0.02, inner: 0.0))
         assert(g.near == h.near && g.far == h.far && g.first == h.first && g.flags == h.flags, f"ray {i}: grown meets differ")
     }
+}
+
+/// A hit's crease: on a box's face, its second face (the second greatest of `|p| - half`, its
+/// axis's sign as gradient, a greatest); through a turn and a move, the same moved out (its
+/// gradient the branch's own, by finite differences); a union's other operand (a least) or the
+/// winner's own where nearer; an intersection's other (a greatest); a smooth union's only where
+/// the other part is `k` away.
+@test
+fn a_hit_says_its_crease() {
+    let half = vec3(0.4, 0.3, 0.2)
+    let bx = cuboid(half)
+    let q = Quat::axis_angle(normalize(vec3(1.0, 2.0, 0.5)), 0.7)
+    let moved = bx.rotate(q).translate(vec3(0.3, -0.2, 0.5))
+    let turn = Turn { to_local: q.inverse().to_mat3() }
+    let h = 1.0e-3
+    for i in 0..300 {
+        // A point on a face: an axis, a side, the rest inside the face.
+        let r = Box3 { lo: vec3(-1.0), hi: vec3(1.0) }.sample(4, i)
+        let axis = i % 3
+        let side = if (i / 3) % 2 == 0 { 1.0 } else { -1.0 }
+        let p = vec3(if axis == 0 { side * half.x } else { r.x * half.x }, if axis == 1 { side * half.y } else { r.y * half.y }, if axis == 2 { side * half.z } else { r.z * half.z })
+        let c = bx.crease(p)
+        let qq = abs(p) - half
+        let others = if axis == 0 { vec2(qq.y, qq.z) } else if axis == 1 { vec2(qq.x, qq.z) } else { vec2(qq.x, qq.y) }
+        assert(c.has() && c.greatest() && c.value == max(others.x, others.y), f"point {i}: the box's second face")
+        // Turned and moved: the same branch, moved out; its gradient the branch's own.
+        let pw = q.rotate(p) + vec3(0.3, -0.2, 0.5)
+        let cm = moved.crease(pw)
+        assert(cm.has() && abs(cm.value - c.value) <= 1.0e-5, f"point {i}: the moved box's crease {cm.value}, its own {c.value}")
+        let branch = |x: vec3| {
+            let l = abs(turn.local(x - vec3(0.3, -0.2, 0.5))) - half
+            let j = if c.gradient.x != 0.0 { l.x } else if c.gradient.y != 0.0 { l.y } else { l.z }
+            j
+        }
+        let fd = vec3(branch(pw + vec3(h, 0.0, 0.0)) - branch(pw - vec3(h, 0.0, 0.0)), branch(pw + vec3(0.0, h, 0.0)) - branch(pw - vec3(0.0, h, 0.0)), branch(pw + vec3(0.0, 0.0, h)) - branch(pw - vec3(0.0, 0.0, h))) / (2.0 * h)
+        assert(length(fd - cm.gradient) <= 1.0e-3, f"point {i}: the moved crease's gradient")
+    }
+    // A union of the box and a sphere beside it: on the box's face facing the sphere, the
+    // sphere is the runner-up where it is nearer than the box's second face.
+    let ball = sphere(0.25).translate(vec3(0.7, 0.0, 0.0))
+    let both = bx.union(ball)
+    let p = vec3(0.4, 0.0, 0.0)
+    let c = both.crease(p)
+    let ds = ball.distance(p)
+    assert(c.has() && !c.greatest() && c.value == ds, f"the union's sibling: {c.value} against {ds}")
+    let g = ball.gradient(p)
+    assert(length(c.gradient - g) <= 1.0e-6, "the sibling's gradient")
+    // Near the box's edge its own second face is nearer than the sphere.
+    let e = vec3(0.4, 0.29, 0.0)
+    let ce = both.crease(e)
+    assert(ce.greatest() && abs(ce.value + 0.01) <= 1.0e-6, f"the box's own edge, nearer: {ce.value}")
+    // An intersection with a sphere round the box: the sphere's distance, a greatest.
+    let cut = bx.intersect(sphere(0.45))
+    let ci = cut.crease(vec3(0.0, 0.3, 0.0))
+    assert(ci.has() && ci.greatest(), "the intersection's crease is a greatest")
+    // A smooth union: the box's own where the sphere is at least k away, none in the blend.
+    assert(bx.smooth_union(ball, k: 0.1).crease(vec3(0.0, 0.3, 0.1)).has(), "far from the blend")
+    assert(!bx.smooth_union(ball, k: 0.5).crease(p).has(), "in the blend")
+    assert(!sphere(1.0).crease(vec3(1.0, 0.0, 0.0)).has(), "a sphere has none")
 }
 
 /// The door refuses what isn't a field: operands not the nodes before, a leaf out of range, a
