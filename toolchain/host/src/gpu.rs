@@ -982,6 +982,11 @@ const RECHECK_LINES: f64 = 4.0;
 /// How many times its usual a pass's draws must take before the guard says so, naming the GPU's
 /// idle before it.
 const USUAL_TIMES: f64 = 3.0;
+/// The flag's bit that says a lane ran out of fuel (`ir::fuel::FUEL_BIT`).
+fn ir_fuel_bit() -> u32 {
+    1 << 31
+}
+
 /// How many destroyed handles the host remembers, to say when one a command names went.
 const GONE_KEPT: usize = 1 << 16;
 
@@ -1355,8 +1360,22 @@ fn present_shader() -> wrela_shader::build::Builder {
 /// once.
 struct DebugFlag {
     buffer: wrela_gpu::Buffer,
-    readback: wrela_gpu::Buffer,
+    /// Copies of the flag, one a frame, `FLAG_RING` of them: a frame's is read once its work is
+    /// done, so no frame waits for the GPU to read it.
+    ring: wrela_gpu::Buffer,
+    next: u64,
+    /// The copy recorded in the frame being submitted: its slot.
+    queued: Option<u64>,
+    /// The copies submitted and not yet read: the submission that holds each, its slot and its
+    /// frame.
+    pending: std::collections::VecDeque<(wrela_gpu::SubmissionIndex, u64, usize)>,
+    /// The name each pipeline's last pass or dispatch had (a fault names it).
+    labels: HashMap<u32, Arc<str>>,
 }
+
+/// How many frames' copies of the flag are kept ([`DebugFlag::ring`]): more than are ever in
+/// flight.
+const FLAG_RING: u64 = 64;
 
 /// The limits a program sees, from the device's.
 pub(crate) fn limits_of(l: &wrela_gpu::Limits) -> wrela_abi::Limits {
@@ -1603,7 +1622,11 @@ impl Gpu {
                     size: 4,
                     mappable: false,
                 }),
-                readback: readback_buffer(&self.device, 4),
+                ring: readback_buffer(&self.device, 4 * FLAG_RING),
+                next: 0,
+                queued: None,
+                pending: std::collections::VecDeque::new(),
+                labels: HashMap::new(),
             });
         }
         let old_keys = std::mem::take(&mut self.pipeline_keys);
@@ -2081,6 +2104,7 @@ impl Gpu {
 
     /// The screen as linear floats, RGBA rows top to bottom (waits for the GPU).
     pub(crate) fn read_screen_floats(&mut self) -> Result<Vec<f32>> {
+        self.check_debug_flag_now()?;
         self.flush()?;
         let screen =
             self.screen.as_ref().ok_or_else(|| Error::Gpu("there's no screen yet".into()))?;
@@ -3023,6 +3047,11 @@ impl Gpu {
                 }
             }
         };
+        if let Some(f) = &mut self.debug_flag {
+            let p = &self.pipelines[pipeline as usize];
+            let l = self.label.clone().unwrap_or_else(|| Arc::from(p.name.as_str()));
+            f.labels.insert(pipeline, l);
+        }
         let p = &self.pipelines[pipeline as usize];
         let label = self.label.as_deref().unwrap_or(&p.name);
         let timestamps =
@@ -3146,6 +3175,11 @@ impl Gpu {
     }
 
     fn draw(&mut self, pipeline: u32, how: DrawHow, bindings: &[Binding], uniforms: &[u8]) {
+        if let Some(f) = &mut self.debug_flag {
+            let p = &self.pipelines[pipeline as usize];
+            let l = self.pass.as_ref().and_then(|o| o.label.clone());
+            f.labels.insert(pipeline, l.unwrap_or_else(|| Arc::from(p.name.as_str())));
+        }
         if crate::step::logging() {
             let p = &self.pipelines[pipeline as usize];
             let label = self.pass.as_ref().and_then(|o| o.label.as_deref()).unwrap_or(&p.name);
@@ -3559,6 +3593,7 @@ impl Gpu {
 
     /// A buffer's bytes `offset..offset + size`, copied back to the CPU (waits for the GPU).
     pub(crate) fn read_range(&mut self, handle: u32, offset: u32, size: u32) -> Result<Vec<u8>> {
+        self.check_debug_flag_now()?;
         self.flush()?;
         let Some(Resource::Buffer(buffer)) = self.resources.get(&handle) else {
             return Err(self.no_buffer(handle));
@@ -3646,6 +3681,7 @@ impl Gpu {
         corner: [u32; 2],
         size: [u32; 2],
     ) -> Result<Vec<u8>> {
+        self.check_debug_flag_now()?;
         self.flush()?;
         let screen =
             self.screen.as_ref().ok_or_else(|| Error::Gpu("there's no screen yet".into()))?;
@@ -3785,20 +3821,83 @@ impl Gpu {
 
     /// A debug build's: an error if a pipeline indexed an array out of range (its number, from
     /// 1, is in the flag). Waits for the GPU.
-    fn check_debug_flag(&mut self) -> Result<()> {
-        let Some(flag) = &self.debug_flag else { return Ok(()) };
-        let bytes = self.copy_back(&flag.buffer, 0, 4, &flag.readback)?;
-        let code = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        if code == 0 {
+    /// Records a copy of the flag into the next slot of its ring, in `encoder` (the frame's last
+    /// work): read once it's done ([`Gpu::check_debug_flag`]).
+    fn copy_flag(&mut self, encoder: &mut wrela_gpu::CommandEncoder) {
+        if let Some(f) = &mut self.debug_flag {
+            let slot = f.next % FLAG_RING;
+            f.next += 1;
+            encoder.copy_buffer_to_buffer(&f.buffer, 0, &f.ring, slot * 4, 4);
+            f.queued = Some(slot);
+        }
+    }
+
+    /// The copy recorded by [`Gpu::copy_flag`] was submitted, in the device's latest submission.
+    fn flag_submitted(&mut self) {
+        let (frame, last) = (self.frame, self.device.submitted());
+        if let Some(f) = &mut self.debug_flag
+            && let Some(slot) = f.queued.take()
+        {
+            f.pending.push_back((last, slot, frame));
+        }
+    }
+
+    /// The flag now: every copy submitted read, waiting for the GPU (before a readback, so what
+    /// is read back is never used as if whole when a lane ran out).
+    fn check_debug_flag_now(&mut self) -> Result<()> {
+        if self.debug_flag.is_none() {
             return Ok(());
         }
-        let name = match self.pipelines.get(code as usize - 1) {
-            Some(p) => format!("`{}`", p.name),
-            None => format!("number {code}"),
+        let mut encoder = self.take_encoder();
+        self.copy_flag(&mut encoder);
+        self.encoder = Some(encoder);
+        self.flush()?;
+        self.flag_submitted();
+        wait(&self.device)?;
+        self.check_debug_flag()
+    }
+
+    /// Reads each copy of the flag whose frame's work is done: a lane that ran out of fuel, or
+    /// (a debug build's) an index out of range, ends the run naming its pipeline.
+    fn check_debug_flag(&mut self) -> Result<()> {
+        let done = self.device.completed();
+        let Some(f) = &mut self.debug_flag else { return Ok(()) };
+        let mut found = None;
+        while let Some(&(at, slot, frame)) = f.pending.front() {
+            if at > done {
+                break;
+            }
+            f.pending.pop_front();
+            let b = f.ring.read(slot * 4, 4).map_err(|e| Error::Gpu(e.0))?;
+            let code = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            if code != 0 && found.is_none() {
+                found = Some((code, frame));
+            }
+        }
+        let Some((code, frame)) = found else { return Ok(()) };
+        let fuel = code & ir_fuel_bit() != 0;
+        let number = code & !ir_fuel_bit();
+        let (name, label) = match self.pipelines.get(number as usize - 1) {
+            Some(p) => (
+                format!("`{}`", p.name),
+                f.labels.get(&(number - 1)).map(|l| format!(" (its pass or dispatch `{l}`)")),
+            ),
+            None => (format!("number {number}"), None),
         };
+        let label = label.unwrap_or_default();
+        if fuel {
+            let most = wrela_abi::Target::HERE.limits().lane_fuel();
+            return Err(Error::Gpu(format!(
+                "pipeline {name}{label} ran out of fuel by frame {frame}: a lane did more than \
+                 {most} work, what one may do in the line's 50 ms at an idle GPU's clock \
+                 (AGENTS.md, rule 2). Its loops stopped there, so what it drew or wrote is not \
+                 whole. The run stops here. Bound its loops (a count the compiler can see), or \
+                 cut its work over frames"
+            )));
+        }
         Err(Error::Gpu(format!(
-            "debug build: pipeline {name} indexed an array out of range (in this frame, or a \
-             call before it); the shader then reads or writes an element in range, or a zero"
+            "debug build: pipeline {name} indexed an array out of range (by frame {frame}){label}; \
+             the shader then reads or writes an element in range, or a zero"
         )))
     }
 }
@@ -3894,8 +3993,10 @@ impl Gpu {
         self.record_ended()?;
         let mut encoder = self.take_encoder();
         self.indirect.end_frame(&self.device, &mut encoder);
+        self.copy_flag(&mut encoder);
         self.encoder = Some(encoder);
         self.flush()?;
+        self.flag_submitted();
         self.behind.submitted(&self.device);
         self.collect()?;
         self.calls += 1;

@@ -20,6 +20,7 @@ pub use const_fold::FUEL as FOLD_FUEL;
 pub mod depends;
 pub mod derive;
 mod error;
+pub mod fuel;
 pub mod gpu_memory;
 pub mod hoist;
 pub mod layout;

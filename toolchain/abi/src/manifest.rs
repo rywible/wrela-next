@@ -15,11 +15,12 @@
 //!   that only one of its shaders reads says which (`"stage"`: `"vertex"` or `"fragment"`);
 //!   one without is visible to both. WebGPU limits the storage buffers each stage sees, so a
 //!   pipeline's vertex and fragment shaders may bind up to that many each.
-//! - A debug build's pipeline may have a **debug flag**: a read-write storage buffer of one
-//!   `atomic<u32>` at the binding `debug_flag` names, which no command lists. The host makes
-//!   one 4-byte buffer for the program, binds it there in every dispatch and draw, and reads it
-//!   after each frame: a pipeline that indexed an array out of range stored its number in the
-//!   manifest's list, from 1 (the largest such number stays).
+//! - A pipeline may have a **debug flag**: a read-write storage buffer of one `atomic<u32>` at
+//!   the binding `debug_flag` names, which no command lists. The host makes one 4-byte buffer for
+//!   the program, binds it there in every dispatch and draw, and reads it after each frame: a
+//!   pipeline that indexed an array out of range (a debug build's checks) stored its number in
+//!   the manifest's list, from 1; one whose lane ran out of fuel (language.md §18.11, any
+//!   build), its number with the top bit set. The largest stays.
 //! - A render pipeline draws a triangle list into its pass's colour target: the screen, whose
 //!   format is [`SCREEN_FORMAT`] without sRGB encoding (so hosts produce the same bytes), or a
 //!   texture. A host may draw the screen in another 8-bit unorm format that holds the same

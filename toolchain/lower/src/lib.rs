@@ -292,6 +292,9 @@ pub(crate) struct Cx<'a> {
     /// What each render pipeline of `pipelines` is drawn into, first drawn first (the
     /// manifest's `targets`): from the draws left in the optimized CPU code, once it's emitted.
     pub pipeline_targets: Vec<Vec<ir::RenderTarget>>,
+    /// Draws left as written whose lanes may do more than their fuel (`gpu::fuel`): where each
+    /// is recorded, its name, and its bound. Named together, a warning a place (W0016).
+    pub uncounted: Vec<(Span, String, u64)>,
     /// A lifted build's literals (§23): only the program's own modules read them, never the
     /// modules that compute constants or run tests.
     pub lift: Option<&'a LiftTable>,
@@ -553,6 +556,9 @@ fn lower_in(
         let out = gpu::lower_pipeline(&mut cx, &key, iface, sites, targets);
         cx.hoist = false;
         if let Some(mut out) = out {
+            if cx.emit {
+                gpu::fuel(&mut cx, &mut out, pipelines.len() as u32 + 1);
+            }
             if data.debug && cx.emit {
                 gpu::debug_checks(&mut cx, &mut out, pipelines.len() as u32 + 1);
             }
@@ -560,6 +566,7 @@ fn lower_in(
         }
         i += 1;
     }
+    gpu::name_uncounted(&mut cx);
     if pipelines.len() == cx.pipelines.len() {
         for &(i, j) in &standins {
             gpu::match_standin(&mut cx, &mut pipelines, i as usize, j as usize);
@@ -674,6 +681,7 @@ impl<'a> Cx<'a> {
             pipelines: Vec::new(),
             pipeline_sites: Vec::new(),
             pipeline_targets: Vec::new(),
+            uncounted: Vec::new(),
             lift: None,
             hoist: false,
             works: HashMap::new(),

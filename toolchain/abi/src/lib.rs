@@ -349,6 +349,32 @@ pub struct TargetLimits {
     /// `wrela-host`'s `Gpu::calibration_ns`), in nanoseconds: a device's own time over this
     /// scales [`TargetLimits::step_femtoseconds`] there (0: no calibration).
     pub calibration_ns: u32,
+    /// How many tenths of its warm time a lane's work may take at the clock this GPU lowers to
+    /// when it sits idle: the most a pass ran slower after an idle stretch, measured
+    /// (`wrela-host`'s `how_much_a_pass_slows_after_idle`). A lane's fuel is what it does in
+    /// the line at that clock ([`TargetLimits::lane_fuel`]).
+    pub idle_slowdown_tenths: u32,
+}
+
+impl TargetLimits {
+    /// The most work one lane (one invocation) does in [`STEP_MS`] at the GPU's warm clock: one
+    /// invocation alone at [`TargetLimits::step_femtoseconds`] times
+    /// [`TargetLimits::step_width`] a unit. A draw whose lanes' bound is within it is left as
+    /// written: at the idle clock such a lane holds its tile at most
+    /// [`TargetLimits::idle_slowdown_tenths`] / 10 times the line, and the guard ends the run
+    /// after the fact; it can't hang the GPU.
+    pub fn lane_line_work(&self) -> u64 {
+        let unit_fs = u64::from(self.step_femtoseconds.max(1)) * u64::from(self.step_width.max(1));
+        u64::from(STEP_MS) * 1_000_000_000_000 / unit_fs
+    }
+
+    /// The most work one lane may do where a loop has no bound or its bound is past
+    /// [`TargetLimits::lane_line_work`]: its fuel (language.md §18.11), what it does in
+    /// [`STEP_MS`] at the idle clock. Such a loop is charged pass by pass (`ir::fuel`), and a lane
+    /// that runs out stops and flags its pipeline, so no lane runs away whatever a program does.
+    pub fn lane_fuel(&self) -> u64 {
+        self.lane_line_work() * 10 / u64::from(self.idle_slowdown_tenths.max(10))
+    }
 }
 
 /// The longest one compute dispatch may hold the GPU, in milliseconds (AGENTS.md, rule 4: "at
@@ -399,6 +425,8 @@ impl TargetLimits {
         // The M4's fastest timings of `wrela-host`'s calibration kernel (8,192 invocations of a
         // chain of 8,192 sines), warmed: 1.14 to 1.21 ms (2026-11-19).
         calibration_ns: 1_150_000,
+        // A pass of 1.24 ms took 5.33 ms after a second idle (2026-11-20).
+        idle_slowdown_tenths: 43,
     };
 
     /// The floor of the Vulkan devices wrela runs on (Phase 5's minimum spec, backend.md item
@@ -444,6 +472,8 @@ impl TargetLimits {
         step_width: 4096,
         // The Radeon 5500U's (RADV), warmed: 1.19 to 1.25 ms (2026-11-19).
         calibration_ns: 1_180_000,
+        // A pass of 0.088 ms took 0.361 ms after any idle of 5 ms or more (2026-11-20).
+        idle_slowdown_tenths: 41,
     };
 }
 

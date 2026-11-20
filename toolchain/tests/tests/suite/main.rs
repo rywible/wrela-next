@@ -19,6 +19,7 @@ mod doc_examples;
 mod encodings;
 mod explain;
 mod format;
+mod fuel;
 mod fuzz;
 mod gpu_limits;
 mod handover;

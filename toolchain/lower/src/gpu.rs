@@ -3663,6 +3663,126 @@ fn check_recursion(cx: &mut Cx, mb: &ModuleBuilder) {
     }
 }
 
+/// Fuel (`ir::fuel`, AGENTS.md rule 2, language.md §18.11): no lane runs away. A render
+/// pipeline with a loop the count can't bound, or whose lanes' bound is past the line's work at
+/// the warm clock ([`wrela_abi::TargetLimits::lane_line_work`]), has its loops charged against
+/// a lane's fuel ([`wrela_abi::TargetLimits::lane_fuel`]), and a lane that runs out sets its
+/// flag (the debug flag's binding) to `code | ir::fuel::FUEL_BIT`. One bounded within the line's
+/// work is left as written: at an idle clock a lane holds its tile at most the device's idle
+/// slowdown times the line, which the guard ends after the fact; one over its fuel is named
+/// (W0016), so the list of draws the fuel doesn't prove is in every build. A compute pipeline is
+/// left as written: the host weighs each dispatch by its kernel's bound before it runs, and
+/// refuses one with none. One with the machine's limit of storage buffers has no binding left
+/// for the flag: an error.
+pub(crate) fn fuel(cx: &mut Cx, out: &mut PipelineOut, code: u32) {
+    if let PipelineKind::Compute { .. } = out.kind {
+        return;
+    }
+    let limits = cx.data.target.limits();
+    let (fuel, line) = (limits.lane_fuel(), limits.lane_line_work());
+    // The least of two bounds of the same work: counted as the program reads (`out.work`), and
+    // as written, flattened, with what its constants compute worked out (a loop of constants
+    // is a number in the shader, and costs a lane nothing). Each bounds a lane; flattening can
+    // count more where it copies code.
+    let (each, _) = ir::work::module_work(&out.module);
+    let work: Vec<Option<u64>> = each
+        .into_iter()
+        .zip(out.work.iter().copied().chain(std::iter::repeat(None)))
+        .map(|(e, w)| match (e.work, w) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        })
+        .collect();
+    if work.iter().all(|w| w.is_some_and(|w| w <= line)) {
+        let most = work.iter().flatten().copied().max().unwrap_or(0);
+        if most > fuel
+            && let Some(&at) = out.sites.first()
+        {
+            cx.uncounted.push((at, out.name.clone(), most));
+        }
+        return;
+    }
+    let storage = out.bindings.iter().filter(|b| b.kind.is_buffer()).count()
+        + usize::from(out.uniform.as_ref().is_some_and(|u| u.storage));
+    let used =
+        out.bindings.iter().map(|b| b.binding).chain(out.uniform.as_ref().map(|u| u.binding));
+    let binding = used.max().map_or(0, |b| b + 1);
+    let mut module = out.module.clone();
+    if ir::fuel::add_fuel(&mut module, fuel, binding, code).is_none() {
+        return;
+    }
+    if storage >= cx.data.target.limits().storage_buffers_per_stage {
+        cx.err(Diagnostic::internal(format!(
+            "`{}`'s work a lane isn't bounded within its fuel ({fuel}), and it binds the machine's \
+             limit of storage buffers, so there's no binding left for the flag its loops set when \
+             a lane runs out: bind one fewer buffer",
+            out.name
+        )));
+        return;
+    }
+    match ir::verify(&module) {
+        Ok(()) => {
+            out.module = module;
+            out.debug_flag = Some(binding);
+        }
+        Err(e) => {
+            cx.err(Diagnostic::internal(format!("fuel for `{}` made malformed IR: {e}", out.name)))
+        }
+    }
+}
+
+/// W0016: the draws left as written whose lanes may do more than their fuel (`fuel`), one
+/// warning for each place that records some, naming each with its bound, so the list of draws
+/// the fuel doesn't prove is in every build.
+pub(crate) fn name_uncounted(cx: &mut Cx) {
+    let limits = cx.data.target.limits();
+    let (fuel, line) = (limits.lane_fuel(), limits.lane_line_work());
+    let idle = f64::from(limits.idle_slowdown_tenths) / 10.0;
+    let mut all = std::mem::take(&mut cx.uncounted);
+    all.sort_by(|a, b| (a.0.file, a.0.start).cmp(&(b.0.file, b.0.start)).then(b.2.cmp(&a.2)));
+    let mut i = 0;
+    while i < all.len() {
+        let at = all[i].0;
+        let here: Vec<&(Span, String, u64)> = all[i..].iter().take_while(|x| x.0 == at).collect();
+        i += here.len();
+        let times = |w: u64| w as f64 / fuel as f64;
+        let message = if let [(_, name, most)] = here.as_slice() {
+            format!(
+                "`{name}`'s lanes may do {most} work each, {:.1} times a lane's fuel ({fuel}): it's \
+                 left as written, without fuel",
+                times(*most)
+            )
+        } else {
+            format!(
+                "{} draws recorded here may do more work a lane than a lane's fuel ({fuel}): they're \
+                 left as written, without fuel",
+                here.len()
+            )
+        };
+        let mut d = Diagnostic::new(codes::W0016, at, message);
+        if here.len() > 1 {
+            for (_, name, most) in &here {
+                d = d.with_note(format!(
+                    "`{name}`: {most} work a lane, {:.1} times the fuel",
+                    times(*most)
+                ));
+            }
+        }
+        cx.err(
+            d.with_note(format!(
+                "a bound within the line's work at the warm clock ({line}) can't run away, but on an \
+                 idle GPU one lane may hold its tile up to {:.0} ms ({idle} times the line), which \
+                 the guard ends after the fact (language.md §18.11)",
+                50.0 * idle
+            ))
+            .with_help(
+                "bound its loops so the draw's work a lane is within the fuel (a smaller count, or the \
+                 work cut over frames or draws)",
+            ),
+        );
+    }
+}
+
 /// A debug build's bounds checks (`ir::bounds`), whose flag is pipeline number `code` (from
 /// 1). A pipeline that already has the machine's limit of storage buffers isn't checked.
 pub(crate) fn debug_checks(cx: &mut Cx, out: &mut PipelineOut, code: u32) {

@@ -28,13 +28,8 @@ pub fn add_checks(m: &mut Module, binding: u32, code: u32) -> Option<ResourceId>
         return None;
     }
     let u32_ty = m.types.u32();
-    let flag_ty = m.types.intern(TypeDef::Atomic(Scalar::U32));
-    let flag = m.add_resource(Resource {
-        name: "wrela_debug_flag".into(),
-        binding,
-        kind: ResourceKind::StorageReadWrite,
-        ty: flag_ty,
-    });
+    // (Fuel's flag where it has one: the same binding, `crate::fuel::flag`.)
+    let flag = crate::fuel::flag(m, binding);
     for i in 0..m.functions.len() {
         if skip.contains(&FuncId(i as u32)) {
             continue;

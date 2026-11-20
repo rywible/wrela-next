@@ -88,6 +88,7 @@ pub fn module_work(m: &Module) -> (Vec<EntryWork>, Vec<Breach>) {
         breaches: Vec::new(),
         passes: HashMap::new(),
         proof: None,
+        totals: None,
     };
     let mut out = Vec::new();
     for e in &m.entry_points {
@@ -97,6 +98,34 @@ pub fn module_work(m: &Module) -> (Vec<EntryWork>, Vec<Breach>) {
         out.push(EntryWork { work, unbounded: r.loop_at, breaches: Vec::new() });
     }
     (out, c.breaches)
+}
+
+/// Each loop's most work, all its passes together, by its body's address (`as_ptr`), as the
+/// count of each of module `m`'s entry points finds it (the host's bound, [`module_work`]'s):
+/// `None` for a loop with no bound on some way the count followed. A loop the count never
+/// reached (behind a constant branch, or after it gave up) isn't there. What fuel
+/// (`crate::fuel`) leaves uncounted.
+pub fn loop_totals(m: &Module) -> HashMap<usize, Option<u64>> {
+    let mut c = Counter {
+        m,
+        steps: 0,
+        gave_up: false,
+        bounds: true,
+        memo: HashMap::new(),
+        breaches: Vec::new(),
+        passes: HashMap::new(),
+        proof: None,
+        totals: Some(HashMap::new()),
+    };
+    for e in &m.entry_points {
+        (c.steps, c.gave_up) = (0, false);
+        c.call(e.function, &[]);
+        if c.gave_up {
+            // What it found after giving up isn't the code's: none of it is kept as a bound.
+            return HashMap::new();
+        }
+    }
+    c.totals.unwrap_or_default()
 }
 
 /// The work of entry point `f` of module `m`, and the functions over their budgets.
@@ -110,6 +139,7 @@ pub fn entry_work(m: &Module, f: FuncId) -> EntryWork {
         breaches: Vec::new(),
         passes: HashMap::new(),
         proof: None,
+        totals: None,
     };
     let r = c.call(f, &[]);
     let work = if r.unbounded || c.gave_up { None } else { Some(r.work) };
@@ -135,6 +165,7 @@ impl<'a> ExprWork<'a> {
                 breaches: Vec::new(),
                 passes: HashMap::new(),
                 proof: None,
+                totals: None,
             },
         }
     }
@@ -176,6 +207,7 @@ pub fn loop_passes(m: &Module, f: FuncId) -> HashMap<usize, u32> {
         breaches: Vec::new(),
         passes: HashMap::new(),
         proof: None,
+        totals: None,
     };
     let args = vec![None; m.functions[f.0 as usize].params.len()];
     c.call(f, &args);
@@ -230,6 +262,7 @@ pub fn proofs(m: &Module) -> Proofs {
         breaches: Vec::new(),
         passes: HashMap::new(),
         proof: Some(ProofLog::default()),
+        totals: None,
     };
     for e in &m.entry_points {
         c.steps = 0;
@@ -449,6 +482,7 @@ impl<'a> CallRuns<'a> {
                 breaches: Vec::new(),
                 passes: HashMap::new(),
                 proof: None,
+                totals: None,
             },
             steps: 0,
         }
@@ -520,6 +554,9 @@ struct Counter<'a> {
     passes: HashMap<usize, u32>,
     /// What the count proves of the run-time checks ([`proofs`]), when it's asked.
     proof: Option<ProofLog>,
+    /// Each loop's most work in all its passes, by its body's address, `None` once a way
+    /// through it had no bound ([`loop_totals`]), when it's asked.
+    totals: Option<HashMap<usize, Option<u64>>>,
 }
 
 /// How a block ended: `Normal` when some way through it goes on past it (the state is what's
@@ -861,6 +898,7 @@ impl<'a> Counter<'a> {
         let endless = fr.sites.as_ref().is_some_and(|s| s.endless.contains(&body_at));
         let proof_mark = self.proof.as_ref().map(|p| p.log.len());
         let mut ran = 0u64;
+        let work_at = fr.work;
         // (Each pass is followed knowing what's sure on every way into it, so its work is the
         // most any of them does; the loop ends when no way goes on to another pass, and what's
         // known after it is what every `break` that left it knew, from every pass.)
@@ -877,6 +915,9 @@ impl<'a> Counter<'a> {
             };
             if done {
                 fr.unbounded = true;
+                if let Some(t) = self.totals.as_mut() {
+                    t.insert(body_at, None);
+                }
                 if let (Some(p), Some(mark)) = (self.proof.as_mut(), proof_mark) {
                     p.unprove(mark, body_at);
                 }
@@ -921,6 +962,13 @@ impl<'a> Counter<'a> {
             if !on {
                 // No way goes on to another pass: after the loop is what each `break` knew.
                 let exits = fr.exits.pop().expect("this loop's exits");
+                if let Some(t) = self.totals.as_mut() {
+                    let total = fr.work.saturating_sub(work_at);
+                    let e = t.entry(body_at).or_insert(Some(0));
+                    if let Some(most) = e {
+                        *most = (*most).max(total);
+                    }
+                }
                 return match exits.breaks {
                     Some(b) => {
                         *st = b;
