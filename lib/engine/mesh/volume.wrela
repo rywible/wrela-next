@@ -1,0 +1,223 @@
+// Unified frustum-aligned volumetric froxel pass (S. Hillaire, Frostbite SIGGRAPH 2015) and
+// unified linear-HDR `Look::tone` resolve pass.
+//
+// Every participating medium (`Medium`: fog, mist, smoke, fire, spell plumes) is evaluated on a
+// `160×90×32` frustum grid, lit by the exact same sun shadow map (real god-rays from still and
+// moving matter), sky irradiance table, and 3-level world-space radiance volume (bounced sunlight
+// and emissive spell glow), integrated front-to-back analytically, and composited against the
+// exact resolved reversed-Z depth buffer before the frame's single `Look::tone` pass.
+
+use matter::medium::Medium
+use matter::sky::Sky
+use mesh::light::{RadGrid, ShadowView, sky_irradiance, sun_vis_point, volume_indirect}
+use picture::eye::View
+use picture::look::{Look, Seen}
+use std::gpu::{
+    Address, ComparisonSampler, DepthTexture, Filter, FragCoord, GlobalId, Rgba16Float, Sampler,
+    Texels3d, Texture, Texture3d, dispatch, label, sampler, texture3d,
+}
+
+/// Froxel grid dimensions (`160×90×32` = 460,800 froxels, ~3.7 MB per `Rgba16Float` volume).
+pub const FROXEL_W: u32 = 160
+pub const FROXEL_H: u32 = 90
+pub const FROXEL_D: u32 = 32
+
+/// Exponential depth range covered by the froxel grid (m).
+pub const VOL_NEAR: f32 = 0.25
+pub const VOL_FAR: f32 = 64.0
+const LOG_RATIO: f32 = 5.54517744 // ln(64.0 / 0.25) = ln(256)
+const FOUR_PI: f32 = 12.5663706
+
+/// Henyey-Greenstein phase function `p(cos_theta, g)` (integrated over sphere = 1).
+fn hg_phase(cos_t: f32, g: f32) -> f32 {
+    let g2 = g * g
+    let denom = max(1.0 + g2 - 2.0 * g * cos_t, 1.0e-4)
+    (1.0 - g2) / (FOUR_PI * denom * sqrt(denom))
+}
+
+/// Depth `z` (m along camera forward) of slice boundary `s` in `[0, FROXEL_D]`.
+fn slice_z(s: f32) -> f32 {
+    VOL_NEAR * exp(LOG_RATIO * (s / f32(FROXEL_D)))
+}
+
+/// Normalized depth coordinate `w` in `[0, 1]` corresponding to camera-forward distance `z`.
+fn z_to_w(z: f32) -> f32 {
+    if z <= VOL_NEAR {
+        return 0.0
+    }
+    clamp(log(z / VOL_NEAR) / LOG_RATIO, 0.0, 1.0)
+}
+
+/// Pass 1: Evaluates `medium` at each froxel centre and computes in-scattered radiance from the
+/// unified One Light (sun shadow god-rays + sky ambient + 3D radiance volume GI/emissives).
+@compute(4, 4, 4)
+fn froxel_scatter<Med: Medium, S: Sky>(
+    medium: Med,
+    v: View,
+    sv: ShadowView,
+    rad_grid: RadGrid,
+    sky: S,
+    sky_table: Texture<Rgba16Float>,
+    sky_s: Sampler,
+    shadow_map: DepthTexture,
+    cmp: ComparisonSampler,
+    rad1: Texture3d<Rgba16Float>,
+    rad2: Texture3d<Rgba16Float>,
+    rad_s: Sampler,
+    out: mut Texels3d<Rgba16Float>,
+    id: GlobalId,
+) {
+    if id.x >= FROXEL_W || id.y >= FROXEL_H || id.z >= FROXEL_D {
+        return
+    }
+    let px = (f32(id.x) + 0.5) * (v.size.x / f32(FROXEL_W))
+    let py = (f32(id.y) + 0.5) * (v.size.y / f32(FROXEL_H))
+    let ray = v.ray(vec2(px, py))
+    let z0 = slice_z(f32(id.z))
+    let z1 = slice_z(f32(id.z + 1))
+    let zmid = 0.5 * (z0 + z1)
+    let cos_fwd = max(dot(ray, v.forward), 0.1)
+    let wp = v.at + ray * (zmid / cos_fwd)
+
+    let smp = medium.sample_at(wp)
+    if smp.density <= 1.0e-5 && dot(smp.emits, smp.emits) <= 1.0e-10 {
+        out.store(id, vec4(0.0))
+        return
+    }
+
+    let sun = sky.sun()
+    let sun_vis = sun_vis_point(shadow_map, cmp, sv, wp)
+    let phase = hg_phase(dot(ray, sun.way), clamp(smp.g, -0.9, 0.9))
+    let direct = sun.light * (sun_vis * phase)
+    let amb = (sky_irradiance(sky_table, sky_s, vec3(0.0, 1.0, 0.0)) + volume_indirect(rad_grid, rad1, rad2, rad_s, wp)) * (1.0 / FOUR_PI)
+    let inscatter = smp.emits + smp.albedo * smp.density * (direct + amb)
+    out.store(id, vec4(inscatter, max(smp.density, 0.0)))
+}
+
+/// Pass 2: Analytically integrates each froxel `(id.x, id.y, id.z)` front-to-back over slices
+/// `0..=id.z`, storing `(accumulated_inscatter.rgb, transmittance)` in `out`.
+@compute(4, 4, 4)
+fn froxel_integrate(
+    raw: Texture3d<Rgba16Float>,
+    v: View,
+    out: mut Texels3d<Rgba16Float>,
+    id: GlobalId,
+) {
+    if id.x >= FROXEL_W || id.y >= FROXEL_H || id.z >= FROXEL_D {
+        return
+    }
+    let px = (f32(id.x) + 0.5) * (v.size.x / f32(FROXEL_W))
+    let py = (f32(id.y) + 0.5) * (v.size.y / f32(FROXEL_H))
+    let ray = v.ray(vec2(px, py))
+    let inv_cos = 1.0 / max(dot(ray, v.forward), 0.1)
+
+    var accum = vec3(0.0)
+    var trans = 1.0
+    var z_prev = VOL_NEAR
+    for k in 0..FROXEL_D {
+        if k > id.z {
+            break
+        }
+        let z_next = slice_z(f32(k + 1))
+        let ds = (z_next - z_prev) * inv_cos
+        z_prev = z_next
+        let s = raw.load(id.x, id.y, k)
+        let sigma = max(s.w, 0.0)
+        let step_t = exp(-sigma * ds)
+        // Energy-conserving analytical integration across the slice (Hillaire 2015).
+        let integ = if sigma > 1.0e-5 { (1.0 - step_t) / sigma } else { ds }
+        accum += trans * s.xyz * integ
+        trans *= step_t
+    }
+    out.store(id, vec4(accum, trans))
+}
+
+/// Final unified composite + `Look::tone` fragment shader: reads linear HDR radiance, composites
+/// volumetric froxels up to the exact resolved depth hit, and applies `Look::tone` ONCE.
+@fragment
+pub fn hdr_tone_fs<L: Look>(
+    pixel: FragCoord,
+    hdr: Texture<Rgba16Float>,
+    depth: DepthTexture,
+    froxel_acc: Texture3d<Rgba16Float>,
+    vol_s: Sampler,
+    vol_active: u32,
+    near_plane: f32,
+    v: View,
+    look: L,
+) -> vec4 {
+    let px = u32(pixel.position.x)
+    let py = u32(pixel.position.y)
+    var rad = hdr.load(px, py).xyz
+    if vol_active != 0 {
+        let ndc_z = depth.load(px, py)
+        let lin_z = if ndc_z > 1.0e-6 { min(near_plane / ndc_z, VOL_FAR) } else { VOL_FAR }
+        let uv = pixel.position.xy / max(v.size, vec2(1.0))
+        let w = z_to_w(lin_z)
+        let vol = froxel_acc.sample_level(vol_s, vec3(uv.x, uv.y, w), 0.0)
+        rad = rad * vol.w + vol.xyz
+    }
+    vec4(look.tone(Seen { light: rad }), 1.0)
+}
+
+/// Persistent GPU 3D froxel volumes for participating media.
+pub struct FroxelVolume {
+    pub raw: Texture3d<Rgba16Float>,
+    pub acc: Texture3d<Rgba16Float>,
+    pub s: Sampler,
+}
+
+/// Allocates a fresh `FroxelVolume` (~7.4 MB VRAM across `raw` and `acc`).
+pub fn froxel_volume() -> FroxelVolume {
+    FroxelVolume {
+        raw: texture3d(width: FROXEL_W, height: FROXEL_H, depth: FROXEL_D),
+        acc: texture3d(width: FROXEL_W, height: FROXEL_H, depth: FROXEL_D),
+        s: sampler(filter: Filter::Linear, address: Address::Clamp),
+    }
+}
+
+impl FroxelVolume {
+    /// Scatters and integrates `medium` across the frustum if `medium.active()` is true.
+    pub fn update<Med: Medium, S: Sky>(
+        mut self,
+        medium: Med,
+        v: View,
+        sv: ShadowView,
+        rad_grid: RadGrid,
+        sky: S,
+        sky_table: Texture<Rgba16Float>,
+        sky_s: Sampler,
+        shadow_map: DepthTexture,
+        cmp: ComparisonSampler,
+        rad1: Texture3d<Rgba16Float>,
+        rad2: Texture3d<Rgba16Float>,
+        rad_s: Sampler,
+    ) {
+        if !medium.active() {
+            return
+        }
+        label("mesh_volume")
+        dispatch(
+            froxel_scatter.bind(
+                medium: medium,
+                v: v,
+                sv: sv,
+                rad_grid: rad_grid,
+                sky: sky,
+                sky_table: sky_table,
+                sky_s: sky_s,
+                shadow_map: shadow_map,
+                cmp: cmp,
+                rad1: rad1,
+                rad2: rad2,
+                rad_s: rad_s,
+                out: mut self.raw,
+            ),
+            over: (FROXEL_W, FROXEL_H, FROXEL_D),
+        )
+        dispatch(
+            froxel_integrate.bind(raw: self.raw, v: v, out: mut self.acc),
+            over: (FROXEL_W, FROXEL_H, FROXEL_D),
+        )
+    }
+}

@@ -7,27 +7,31 @@
 // resolve on Vulkan) with automatic crease-preserving shading normals, resolving directly to
 // `Picture` for display or judging against `engine::reference`.
 
+use matter::height::{Height, NoHeight}
+use matter::medium::{Medium, NoMedium}
 use matter::sky::{Sky, seen}
 use matter::substance::{ONE_OVER_PI, Substance}
 use matter::world::{And, Many, One}
 use mesh::extract::{MeshBatch, MeshVertex, mesh_batch}
+use mesh::height::{CLIP_RINGS, CLIP_VERTS, MeshVary, height_vs}
 use mesh::light::{
     RadGrid, RadianceCache, SHADOW_SIDE, ShadowView, cone_indirect, radiance_cache, shadow_view,
     sky_irradiance, sun_shadow,
 }
+use mesh::volume::{FroxelVolume, froxel_volume, hdr_tone_fs}
 use picture::eye::{Eye, View, view}
-use picture::look::{Look, Seen}
+use picture::look::Look
 use picture::picture::{Picture, picture}
 use picture::pixels::{TABLE, skylit}
-use picture::screen::show
+use picture::screen::{cover, show}
 use std::collections::Vec
 use std::field::Field
 use std::gpu::{
     Address, ClipPosition, Compare, ComparisonSampler, Cull, Depth, DepthBias, DepthOnlyPass,
     DepthTexture, Filter, FragCoord, MsaaDepthPass, MsaaDepthPass3, R8, Rgba16Float, Rgba32Float,
-    Sampler, Targets3, Texture, Texture3d, VertexIndex, begin_depth_pass,
+    Sampler, Targets3, Texture, Texture3d, VertexIndex, begin_depth_pass, begin_pass,
     begin_pass3_msaa_with_depth, begin_pass_msaa_with_depth, comparison_sampler, depth_texture,
-    dispatch, draw, label, sampler, writable_texture,
+    dispatch, draw, label, sampler, texture, writable_texture,
 }
 use std::hash::StateHash
 
@@ -58,16 +62,6 @@ fn shadow_fs() -> vec4 {
     vec4(0.0)
 }
 
-/// Interpolants carried from `mesh_vs` to `mesh_fs`.
-struct MeshVary: Copy {
-    clip: ClipPosition,
-    wp: vec3,
-    normal: vec3,
-    albedo: vec3,
-    emits: vec3,
-    smooth: f32,
-}
-
 /// Vertex shader for the unified eye pass: matches `View::ray` bit-for-bit with reversed-Z depth.
 @vertex
 fn mesh_vs(verts: [MeshVertex], v: View, vi: VertexIndex) -> MeshVary {
@@ -89,16 +83,16 @@ fn mesh_vs(verts: [MeshVertex], v: View, vi: VertexIndex) -> MeshVary {
     }
 }
 
-/// Shared shading computation for both the gameplay colour-only pass and the judge pass:
-/// crease-preserving normals, unified sun shadow, unified world-space radiance cache (sky
-/// occlusion + multi-bounce GI + emissive glow), and `Look::tone`.
-fn shade_mesh<S: Sky, L: Look>(
+/// Shared linear-HDR shading computation for both surface meshlets and clipmap heightfields:
+/// crease-preserving normals, unified sun shadow, and unified world-space radiance cache (sky
+/// occlusion + multi-bounce GI + emissive glow). Outputs linear physical radiance; `Look::tone`
+/// runs once at the end of the frame after volumetric compositing.
+fn shade_mesh<S: Sky>(
     vary: MeshVary,
     v: View,
     sv: ShadowView,
     rad_grid: RadGrid,
     sky: S,
-    look: L,
     table: Texture<Rgba16Float>,
     s: Sampler,
     shadow_map: DepthTexture,
@@ -135,19 +129,17 @@ fn shade_mesh<S: Sky, L: Look>(
     let ind = cone_indirect(rad_grid, rad0, rad1, rad2, rad_s, vary.wp, n)
     let amb = sky_irradiance(table, s, n) * ind.w + ind.xyz
     let rad = vary.emits + vary.albedo * ONE_OVER_PI * (direct + amb)
-    let toned = look.tone(Seen { light: rad })
-    (vec4(toned, 1.0), vec4(n, dist), vis)
+    (vec4(rad, 1.0), vec4(n, dist), vis)
 }
 
-/// Colour-only fragment shader for the 4× MSAA eye pass (normal drawing: 12 B/sample total).
+/// Colour-only linear-HDR fragment shader for the 4× MSAA eye pass (12 B/sample total).
 @fragment
-fn mesh_fs<S: Sky, L: Look>(
+fn mesh_fs<S: Sky>(
     vary: MeshVary,
     v: View,
     sv: ShadowView,
     rad_grid: RadGrid,
     sky: S,
-    look: L,
     table: Texture<Rgba16Float>,
     s: Sampler,
     shadow_map: DepthTexture,
@@ -157,18 +149,17 @@ fn mesh_fs<S: Sky, L: Look>(
     rad2: Texture3d<Rgba16Float>,
     rad_s: Sampler,
 ) -> vec4 {
-    shade_mesh(vary, v, sv, rad_grid, sky, look, table, s, shadow_map, cmp, rad0, rad1, rad2, rad_s).0
+    shade_mesh(vary, v, sv, rad_grid, sky, table, s, shadow_map, cmp, rad0, rad1, rad2, rad_s).0
 }
 
-/// Multi-target fragment shader for `drawn_only` (writes `(colour, place, sun)` for `Judge`).
+/// Multi-target linear-HDR fragment shader for `drawn_only` (writes `(hdr, place, sun)` for `Judge`).
 @fragment
-fn mesh_judge_fs<S: Sky, L: Look>(
+fn mesh_judge_fs<S: Sky>(
     vary: MeshVary,
     v: View,
     sv: ShadowView,
     rad_grid: RadGrid,
     sky: S,
-    look: L,
     table: Texture<Rgba16Float>,
     s: Sampler,
     shadow_map: DepthTexture,
@@ -178,7 +169,7 @@ fn mesh_judge_fs<S: Sky, L: Look>(
     rad2: Texture3d<Rgba16Float>,
     rad_s: Sampler,
 ) -> Targets3<vec4, vec4, f32> {
-    let out = shade_mesh(vary, v, sv, rad_grid, sky, look, table, s, shadow_map, cmp, rad0, rad1, rad2, rad_s)
+    let out = shade_mesh(vary, v, sv, rad_grid, sky, table, s, shadow_map, cmp, rad0, rad1, rad2, rad_s)
     Targets3 { first: out.0, second: out.1, third: out.2 }
 }
 
@@ -191,17 +182,16 @@ fn sky_vs(vi: VertexIndex) -> ClipPosition {
 }
 
 @fragment
-fn sky_fs<S: Sky, L: Look>(pixel: FragCoord, v: View, sky: S, look: L) -> vec4 {
+fn sky_fs<S: Sky>(pixel: FragCoord, v: View, sky: S) -> vec4 {
     let d = v.ray(pixel.position.xy)
-    vec4(look.tone(Seen { light: seen(sky, d) }), 1.0)
+    vec4(seen(sky, d), 1.0)
 }
 
 @fragment
-fn sky_judge_fs<S: Sky, L: Look>(pixel: FragCoord, v: View, sky: S, look: L) -> Targets3<vec4, vec4, f32> {
+fn sky_judge_fs<S: Sky>(pixel: FragCoord, v: View, sky: S) -> Targets3<vec4, vec4, f32> {
     let d = v.ray(pixel.position.xy)
-    let toned = look.tone(Seen { light: seen(sky, d) })
     Targets3 {
-        first: vec4(toned, 1.0),
+        first: vec4(seen(sky, d), 1.0),
         second: vec4(0.0, 0.0, 0.0, 0.0),
         third: 1.0,
     }
@@ -372,12 +362,14 @@ impl<A: MeshWorld, B: MeshWorld> MeshWorld for And<A, B> {
 }
 
 /// Complete meshlet renderer state: owns extracted batches, shadow map, sky irradiance table,
-/// unified world-space radiance cache (GI + sky occlusion + emissive glow), resolved eye depth
-/// buffer, and `Picture`.
+/// unified world-space radiance cache (GI + sky occlusion + emissive glow), volumetric froxel
+/// grid, linear HDR colour + resolved eye depth buffer, and tone-mapped `Picture`.
 pub struct MeshSight {
     pub drawn: Picture,
+    pub hdr_colour: Texture<Rgba16Float>,
     pub depth: DepthTexture,
     pub rad: RadianceCache,
+    pub vol: FroxelVolume,
     batches: Vec<MeshBatch>,
     shadow_depth: DepthTexture,
     cmp: ComparisonSampler,
@@ -389,12 +381,14 @@ pub struct MeshSight {
     pub gi: bool,
 }
 
-/// Creates a fresh `MeshSight` using 4× hardware MSAA and unified world-space GI (`gi: true`).
+/// Creates a fresh `MeshSight` using 4× hardware MSAA, unified world-space GI, and froxel volumetrics.
 pub fn mesh_sight(gi: bool = true) -> MeshSight {
     MeshSight {
         drawn: picture(width: 1, height: 1),
+        hdr_colour: texture(width: 1, height: 1),
         depth: depth_texture(width: 1, height: 1),
         rad: radiance_cache(),
+        vol: froxel_volume(),
         batches: Vec::new(),
         shadow_depth: depth_texture(width: SHADOW_SIDE, height: SHADOW_SIDE),
         cmp: comparison_sampler(compare: Compare::LessEqual),
@@ -412,6 +406,7 @@ impl MeshSight {
         if self.drawn.width() != width || self.drawn.height() != height {
             self.drawn = picture(width: width, height: height)
             self.drawn.placed = true
+            self.hdr_colour = texture(width: width, height: height)
             self.depth = depth_texture(width: width, height: height)
         }
     }
@@ -516,10 +511,10 @@ impl MeshSight {
     ) {
         let (nb, v, sv) = self.prepare_and_shadow(world, sky, eye, width, height, 0)
 
-        // Pass 2: Unified 4× hardware MSAA eye pass writing `(colour, place, sun)` + depth.
+        // Pass 2: Unified 4× hardware MSAA eye pass writing linear HDR + `(place, sun)` + depth.
         label("mesh_eye")
         let ep: MsaaDepthPass3<Rgba16Float, Rgba32Float, R8> = begin_pass3_msaa_with_depth(
-            mut self.drawn.colour,
+            mut self.hdr_colour,
             mut self.drawn.place,
             mut self.drawn.sun,
             mut self.depth,
@@ -535,7 +530,6 @@ impl MeshSight {
                     sv: sv,
                     rad_grid: self.rad.grid,
                     sky: sky,
-                    look: look,
                     table: self.sky_table,
                     s: self.sky_sampler,
                     shadow_map: self.shadow_depth,
@@ -554,32 +548,54 @@ impl MeshSight {
         draw(
             ep,
             sky_vs,
-            sky_judge_fs.bind(v: v, sky: sky, look: look),
+            sky_judge_fs.bind(v: v, sky: sky),
             vertices: 3,
             depth: Depth { compare: Compare::Equal, write: false },
         )
         ep.end()
+
+        // Pass 3: Single unified `Look::tone` pass into `self.drawn.colour`.
+        label("mesh_tone")
+        let tp = begin_pass(mut self.drawn.colour, keep: false)
+        draw(
+            tp,
+            cover,
+            hdr_tone_fs.bind(
+                hdr: self.hdr_colour,
+                depth: self.depth,
+                froxel_acc: self.vol.acc,
+                vol_s: self.vol.s,
+                vol_active: 0,
+                near_plane: NEAR,
+                v: v,
+                look: look,
+            ),
+            vertices: 3,
+        )
+        tp.end()
         self.drawn.placed = true
     }
 
-    /// Renders `world` with 4× hardware MSAA (colour + depth only) and presents to the screen.
-    pub fn draw<W: MeshWorld, S: Sky, L: Look>(
+    /// Renders `world` (`Surface`s), `height` (`Height` clipmap), and `medium` (`Medium` froxels)
+    /// through ONE depth buffer, ONE light store, and ONE `Look::tone` pass, and presents.
+    pub fn draw_all<W: MeshWorld, H: Height, Med: Medium, S: Sky, L: Look>(
         mut self,
         world: W,
+        height: H,
+        medium: Med,
         sky: S,
         look: L,
         eye: Eye,
         width: u32,
-        height: u32,
+        height_px: u32,
     ) {
-        let (nb, v, sv) = self.prepare_and_shadow(world, sky, eye, width, height, self.frame)
+        let (nb, v, sv) = self.prepare_and_shadow(world, sky, eye, width, height_px, self.frame)
         self.frame += 1
 
-        // Pass 2: Unified 4× hardware MSAA eye pass (colour + depth only: 12 B/sample total,
-        // tile-memoryless on Metal and hardware-resolved on Vulkan).
+        // Pass 2: Unified 4× hardware MSAA linear-HDR eye pass (solids + height clipmap + sky).
         label("mesh_eye")
         let ep: MsaaDepthPass<Rgba16Float> = begin_pass_msaa_with_depth(
-            mut self.drawn.colour,
+            mut self.hdr_colour,
             mut self.depth,
             clear: vec4(0.0, 0.0, 0.0, 1.0),
             clear_depth: 0.0,
@@ -593,7 +609,6 @@ impl MeshSight {
                     sv: sv,
                     rad_grid: self.rad.grid,
                     sky: sky,
-                    look: look,
                     table: self.sky_table,
                     s: self.sky_sampler,
                     shadow_map: self.shadow_depth,
@@ -609,15 +624,91 @@ impl MeshSight {
                 depth: Depth { compare: Compare::Greater, write: true },
             )
         }
+        if height.active() {
+            draw(
+                ep,
+                height_vs.bind(height: height, v: v),
+                mesh_fs.bind(
+                    v: v,
+                    sv: sv,
+                    rad_grid: self.rad.grid,
+                    sky: sky,
+                    table: self.sky_table,
+                    s: self.sky_sampler,
+                    shadow_map: self.shadow_depth,
+                    cmp: self.cmp,
+                    rad0: self.rad.rad0,
+                    rad1: self.rad.rad1,
+                    rad2: self.rad.rad2,
+                    rad_s: self.rad.s,
+                ),
+                vertices: CLIP_VERTS,
+                instances: CLIP_RINGS,
+                cull: Cull::Back,
+                depth: Depth { compare: Compare::Greater, write: true },
+            )
+        }
         draw(
             ep,
             sky_vs,
-            sky_fs.bind(v: v, sky: sky, look: look),
+            sky_fs.bind(v: v, sky: sky),
             vertices: 3,
             depth: Depth { compare: Compare::Equal, write: false },
         )
         ep.end()
+
+        // Pass 2b: Unified volumetric froxel pass (0 ms when `medium.active()` is false).
+        let has_vol = medium.active()
+        if has_vol {
+            self.vol.update(
+                medium,
+                v,
+                sv,
+                self.rad.grid,
+                sky,
+                self.sky_table,
+                self.sky_sampler,
+                self.shadow_depth,
+                self.cmp,
+                self.rad.rad1,
+                self.rad.rad2,
+                self.rad.s,
+            )
+        }
+
+        // Pass 3: Unified volumetric composite + ONE `Look::tone` pass.
+        label("mesh_tone")
+        let tp = begin_pass(mut self.drawn.colour, keep: false)
+        draw(
+            tp,
+            cover,
+            hdr_tone_fs.bind(
+                hdr: self.hdr_colour,
+                depth: self.depth,
+                froxel_acc: self.vol.acc,
+                vol_s: self.vol.s,
+                vol_active: if has_vol { 1 } else { 0 },
+                near_plane: NEAR,
+                v: v,
+                look: look,
+            ),
+            vertices: 3,
+        )
+        tp.end()
         self.drawn.placed = false
         show(self.drawn.colour)
+    }
+
+    /// Renders `world` with 4× hardware MSAA, One Light GI, and One `Look`, and presents.
+    pub fn draw<W: MeshWorld, S: Sky, L: Look>(
+        mut self,
+        world: W,
+        sky: S,
+        look: L,
+        eye: Eye,
+        width: u32,
+        height: u32,
+    ) {
+        self.draw_all(world, NoHeight {}, NoMedium {}, sky, look, eye, width, height)
     }
 }

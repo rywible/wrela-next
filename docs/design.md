@@ -366,51 +366,30 @@ fields, ellipsoids, cuts, and analytical edge antialiasing unresolved. Meanwhile
 rasteriser and fixed-function depth/MSAA/RT silicon win by an order of magnitude without ever
 requiring an author to write a mesh.
 
-**The unified pipeline (`lib/engine/mesh/`).** Authors still write pure `Field<Substance>` values
-only; the engine compiles any field into hardware-native surface meshlets on the GPU:
+**The unified pipeline (`lib/engine/mesh/`).** Authors still write pure fields only (`Field<Substance>` for solids/creatures/morphing spells, `Height` for terrains and seas, `Medium` for fog/mist/smoke/plumes, `Sky` for the sky and sun, `Look` for tone). The engine compiles every field into hardware-native geometry or volumes on the GPU:
 
-1. **Sparse interval-culled brick extraction (`lib/engine/mesh/extract.wrela`):** Any `One<M>` or
-   `Many<M, N>` is interval-culled into active `6³` bricks (each evaluating an `8³` corner block
-   and `7³` dual vertices so adjacent brick halos agree bit for bit: zero cracks, zero cross-brick
-   pointers), solved via closed-form regularized Dual Contouring QEF + 1-step exact Newton surface
-   snap. Unchanged fields (`StateHash`) cost 0 ms/frame after frame 0.
-2. **One rasteriser, one shadow map (`lib/engine/mesh/draw.wrela`):** Still and moving matter draw
-   through one vertex shader and one fragment shader into one unified sun shadow map and one
-   reversed-Z supersampled target (`SSAA=2` today; `4× MSAA` + analytic-motion TAA next), with
-   derivative crease-preserving normals. Zero per-thing shader specialization, zero `StandIn`
-   families, zero 9-ray edge lists.
-3. **One light (next):** Build hardware RT BLAS/TLAS (Metal `intersector`, Vulkan `VK_KHR_ray_query`)
-   directly from the extracted meshlets + world-space sparse radiance cache for shadows, GI,
-   reflections, spell light, and glass refraction.
+1. **Sparse interval-culled Dual Contouring (`lib/engine/mesh/extract.wrela`):** Any `One<M>` or `Many<M, N>` is interval-culled and part-pruned (`pruned`/`distance_live`) into active `6³` bricks (evaluating an `8³` corner block and `7³` dual vertices so adjacent brick halos agree bit for bit: zero cracks, zero cross-brick pointers), solved via closed-form regularized Dual Contouring QEF + 1-step exact Newton surface snap. Unchanged fields (`StateHash`) cost 0 ms/frame after frame 0; moving crowds use screen-area-weighted cell budgeting and staggered 60Hz/30Hz extraction.
+2. **Unified 4× hardware MSAA linear-HDR rasteriser (`lib/engine/mesh/draw.wrela`, `lib/engine/mesh/height.wrela`):** Still solids, moving/morphing solids, and 6-ring camera-snapped `Height` clipmaps (`height_vs`, 1-quad overlap collar) all emit the shared `MeshVary` and shade through one `mesh_fs` fragment shader into one 4× MSAA `Rgba16Float` linear-HDR target + one reversed-Z depth buffer (Metal tile-SRAM `MTLStorageModeMemoryless`, Vulkan Dynamic Rendering `AVERAGE`/`SAMPLE_ZERO` resolve) and one unified sun shadow map. Zero per-thing shader specialization, zero `StandIn` families, zero 9-ray edge lists.
+3. **Unified One Light (`lib/engine/mesh/light.wrela`):** A 3-level world-space radiance volume (`64³ -> 32³ -> 16³`) injected directly from all extracted still and moving meshlets (`rad_inject`, `rad_resolve`, `rad_mip`), queried by 4-cone hemisphere Voxel Cone Tracing (`cone_indirect`) for surfaces and `volume_indirect` for participating media. Runs identically on Metal and non-RT-core Vulkan GPUs (`wrela-popos` Renoir Vega) with unified sky occlusion, multi-bounce diffuse GI, and real emissive spell illumination.
+4. **Unified participating media & single `Look::tone` (`lib/engine/mesh/volume.wrela`):** Any `Medium` scatters into a `160×90×32` frustum froxel grid lit by the exact same sun shadow map (real god-rays), sky irradiance table, and 3-level radiance volume (emissive spell glow in mist), integrates analytically front-to-back, and composites against the resolved reversed-Z depth buffer immediately before the frame's single `Look::tone` pass (`hdr_tone_fs`).
 
-**Measured on both machines (2026-11-20, 1920×1080, settled frames 12–24, `MESH=true`):**
+**Measured on both machines (2026-11-20, 1920×1080, 4× hardware MSAA, zero VVL errors on Linux Vulkan):**
 
-| Scene (1920×1080) | Old `Sight` (M4 / Radeon) | `MeshSight` SSAA=2 (M4 / Radeon) | `MeshSight` SSAA=1 (M4 / Radeon) |
+| Scene (1920×1080) | Old `Sight` (M4 / Radeon) | `MeshSight` 4× MSAA (M4 / Radeon) | Notes |
 | --- | --- | --- | --- |
-| SCENE 4 (stage) | ~6–7 ms / — | 2.14 ms / 13.6 ms | — |
-| SCENE 1 (44 m noise `stack`) | 12.5–19.2 ms / — | 2.8 ms / 13.6 ms | — |
-| SCENE 3 (creature + 1 cm wand, 1.5 m) | — | 6.25 ms / 17.9 ms | — |
-| SCENE 8 (stage + 256 boxes + 64 creatures) | 50.6 ms / — | 7.85 ms / 27.4 ms | — |
-| SCENE 8 (stage + 256 boxes + 256 creatures) | 177 ms / 305.2 ms | 13.2 ms / 27.8 ms | 10.7 ms / 17.5 ms |
+| SCENE 4 (stage, direct + GI) | ~6–7 ms / — | 1.75 ms / 9.75 ms | 0.72 ms / 6.50 ms direct only |
+| SCENE 8 (stage + 256 boxes + 256 walking creatures, direct) | 177 ms / 305.2 ms | 5.04 ms / 14.66 ms | 35.1× M4, 20.8× Radeon (60 fps on Radeon iGPU) |
+| SCENE 8 (stage + 256 boxes + 256 walking creatures, + One Light GI) | 177 ms / 305.2 ms | 7.11 ms / 19.5 ms | Full 3-level radiance volume + 4-cone GI |
+| SCENE 9 (cohesion: stage + ocean `Height` + mist `Medium` + morphing spell orb + walking creature + GI) | — | 8.46 ms / 22.0 ms | Froxel volume pass 0.30 ms M4 / 0.83 ms Radeon |
 
 **Judged against the brute-force `Reference` (`LOOKS=16`, M4):**
 
-- **SCENE 4 (stage, 320×180):** **0 holes**, 98.17% of surfaces within 0.05 px (mean 0.0132 px),
-  wholly-covered lit mean 0.922/255 (reference floor 0.944/255), outline 0.193 px.
-- **SCENE 3 (close-up creature + 1 cm wand, 480×270):** **0 holes**, **197 of 199 thin pixels
-  (< 2.5 cm) kept (99.0%)**, 99.8% of surfaces within 0.5 px, lit mean 0.50/255 (reference floor
-  0.54/255).
+- **SCENE 4 (stage, 320×180, 4× MSAA):** **0 holes**, 98.17% of surfaces within 0.05 px, outline **0.151 px** (beats the 0.184 px reference floor).
+- **SCENE 3 (close-up creature + 1 cm wand, 480×270):** **0 holes**, **197 of 199 thin pixels (< 2.5 cm) kept (99.0%)**, 99.8% of surfaces within 0.5 px, lit mean 0.50/255 (reference floor 0.54/255).
 
-**Next stages on this line:**
+**Remaining cleanup:**
 
-1. **4× hardware MSAA in `toolchain/gpu` + `std::gpu`** (replaces `SSAA=2` 4K rasterization, cutting
-   Radeon fill cost ~3× while keeping M4 tile-SRAM edges nearly free) + exact analytic-motion TAA.
-2. **Rest-pose / bone-space meshlet caching & GPU skinning for articulated crowds** (drops 256
-   walking creatures from ~10 ms full re-extraction every frame to ~2–3 ms total).
-3. **Hardware inline ray tracing (`intersector` / `VK_KHR_ray_query`)** over the extracted meshlet
-   BLAS/TLAS + sparse world-space radiance cache, replacing the shadow map and fulfilling One Light.
-4. **Delete the per-pixel raymarcher (`Sight`) and remove `StandIn` / `Meets` / `Pass` / `Crease`
-   from `lib/std/field.wrela`** once `MeshSight` clears all judges and the hole audit.
+- Run the full `Judge` suite and hole audit (`SCENE 6`) on `MeshSight`, promote `MeshSight` to the sole renderer, and delete legacy `Sight` (`lib/engine/picture/pixels.wrela`, `lib/engine/matter/{cells,asked}.wrela`, `lib/engine/light/{moving,store}.wrela`) plus renderer-specific `StandIn`/`Meets`/`Pass`/`Crease` code from `lib/std/field.wrela`.
 
 ## The layers
 

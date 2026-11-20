@@ -1,0 +1,94 @@
+// Universal GPU Geometry Clipmap realization for `Height` fields (Losasso & Hoppe, SIGGRAPH 2004):
+// draws nested square rings around the eye with zero vertex buffers directly into the unified 4×
+// MSAA reversed-Z eye pass and `MeshVary` shading pipeline, so continuous ocean swells and distant
+// terrain share the exact same depth buffer, shadows, GI radiance cache, volumetrics, and `Look`.
+
+use matter::height::Height
+use picture::eye::View
+use std::gpu::{ClipPosition, InstanceIndex, VertexIndex}
+
+/// Quads per side of each clipmap ring (`64×64` quads = 4,096 quads = 24,576 vertices per ring).
+pub const CLIP_N: u32 = 64
+pub const CLIP_VERTS: u32 = 24576
+/// Number of nested clipmap rings (base step 0.25 m -> covers ±256 m seamlessly).
+pub const CLIP_RINGS: u32 = 6
+const CLIP_BASE_STEP: f32 = 0.25
+const CLIP_NEAR: f32 = 0.05
+
+/// Interpolants shared between `mesh_vs` (Dual Contouring meshlets) and `height_vs` (clipmap rings)
+/// so both pass through the exact same unified `shade_mesh` fragment shader.
+pub struct MeshVary: Copy {
+    pub clip: ClipPosition,
+    pub wp: vec3,
+    pub normal: vec3,
+    pub albedo: vec3,
+    pub emits: vec3,
+    pub smooth: f32,
+}
+
+/// Evaluates clipmap vertex position for ring `level` and quad `(qx, qz)` with local corner `(ox, oz)`.
+@vertex
+pub fn height_vs<H: Height>(
+    height: H,
+    v: View,
+    vi: VertexIndex,
+    ii: InstanceIndex,
+) -> MeshVary {
+    let quad = vi.index / 6
+    let corner = vi.index - quad * 6
+    let qz = quad / CLIP_N
+    let qx = quad - qz * CLIP_N
+    let level = ii.index
+
+    // Mask out the interior of outer rings (`level > 0`) covered by `level - 1`, leaving a 1-quad
+    // overlap collar so nested rings never crack regardless of camera snapping parity.
+    let q4 = CLIP_N / 4
+    let q34 = CLIP_N - q4
+    if level > 0 && qx >= q4 + 1 && qx < q34 - 1 && qz >= q4 + 1 && qz < q34 - 1 {
+        return MeshVary {
+            clip: ClipPosition { position: vec4(0.0, 0.0, 0.0, 0.0) },
+            wp: vec3(0.0),
+            normal: vec3(0.0, 1.0, 0.0),
+            albedo: vec3(0.0),
+            emits: vec3(0.0),
+            smooth: 1.0,
+        }
+    }
+
+    // Two CCW triangles per quad (viewed from +Y: (0,0)-(0,1)-(1,1) and (0,0)-(1,1)-(1,0)).
+    var ox: u32 = 0
+    var oz: u32 = 0
+    if corner == 1 || corner == 2 || corner == 4 {
+        oz = 1
+    }
+    if corner == 2 || corner == 4 || corner == 5 {
+        ox = 1
+    }
+
+    let step = CLIP_BASE_STEP * f32(1 << level)
+    // Snap ring centre to `2 * step` (the parent ring's grid) so nested rings meet vertex-for-vertex.
+    let snap = step * 2.0
+    let cx = floor(v.at.x / snap) * snap
+    let cz = floor(v.at.z / snap) * snap
+    let half = f32(CLIP_N) * 0.5
+    let wx = cx + (f32(qx + ox) - half) * step
+    let wz = cz + (f32(qz + oz) - half) * step
+
+    let hs = height.height_at(vec2(wx, wz))
+    let wp = vec3(wx, hs.y, wz)
+    let rel = wp - v.at
+    let x = dot(rel, v.right)
+    let y = dot(rel, v.up)
+    let z = dot(rel, v.forward)
+    let aspect = v.size.y / max(v.size.x, 1.0)
+    let clip = ClipPosition { position: vec4(x * v.focal * aspect, y * v.focal, CLIP_NEAR, z) }
+
+    MeshVary {
+        clip,
+        wp,
+        normal: hs.normal,
+        albedo: hs.sub.albedo,
+        emits: hs.sub.emits,
+        smooth: 1.0,
+    }
+}
