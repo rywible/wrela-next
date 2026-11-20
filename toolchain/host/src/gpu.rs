@@ -899,6 +899,20 @@ impl Cost {
     }
 }
 
+/// A split forced on render passes by `WRELA_GPU_SPLIT`: `<k>` cuts every pass of two draws or
+/// more into `k` pieces (as many as it has draws, at most), `<label>:<k>` only the passes so
+/// labelled. What a test of the split (the picture the same to the bit) and a measure of its
+/// cost (each piece loads and stores its targets) set; a run never needs it.
+fn forced_split() -> Option<(Option<String>, u32)> {
+    let v = std::env::var("WRELA_GPU_SPLIT").ok()?;
+    let (label, k) = match v.rsplit_once(':') {
+        Some((l, k)) => (Some(l.to_string()), k),
+        None => (None, v.as_str()),
+    };
+    let k: u32 = k.trim().parse().ok()?;
+    (k >= 2).then_some((label, k))
+}
+
 /// The pieces of a pass of `draws` draws whose cost is `cost` (none known: each draw alone),
 /// each at most `room` ms by it; a pass of no draws is one piece.
 fn pieces(draws: u32, cost: Option<Cost>, room: f64) -> Vec<std::ops::Range<u32>> {
@@ -921,6 +935,9 @@ pub(crate) struct Gpu {
     line_ms: f64,
     /// What each label's draws cost, learned from the pieces measured.
     costs: HashMap<Arc<str>, Cost>,
+    /// A split forced on passes (`WRELA_GPU_SPLIT`, for tests and measures): the label it's
+    /// forced on (every label, `None`) and how many pieces.
+    forced: Option<(Option<String>, u32)>,
     /// The submissions not yet measured, oldest first.
     jobs: std::collections::VecDeque<Job>,
     /// The piece the next submission holds alone, or the light passes it holds.
@@ -1354,6 +1371,7 @@ impl Gpu {
         let mut gpu = Gpu {
             counters: Counters::default(),
             line_ms: crate::step::limit_ms(),
+            forced: forced_split(),
             costs: HashMap::new(),
             jobs: std::collections::VecDeque::new(),
             job_piece: None,
@@ -3043,7 +3061,13 @@ impl Gpu {
         let cost = self.costs.get(&name).copied();
         let light = cost.filter(|c| !c.again).map(|c| c.per_draw() * f64::from(draws));
         let light = light.filter(|&ms| ms <= LIGHT * self.line_ms);
-        if draws == 0 || !self.device.has_clock() || light.is_some() {
+        let forced = self
+            .forced
+            .as_ref()
+            .filter(|(l, _)| l.as_deref().is_none_or(|l| l == &*name))
+            .map(|(_, k)| (*k).min(draws))
+            .filter(|&k| k >= 2);
+        if forced.is_none() && (draws == 0 || !self.device.has_clock() || light.is_some()) {
             let ms = light.unwrap_or(0.0);
             // Its submission holds light passes that took a quarter of the line at most.
             if self.queued.passes_ms + ms > LIGHT_JOB * self.line_ms {
@@ -3057,7 +3081,10 @@ impl Gpu {
             self.counters.render_passes += 1;
             return if on_screen { self.flush() } else { self.alone() };
         }
-        let ranges = pieces(draws, cost, self.line_ms / 4.0);
+        let ranges = match forced {
+            Some(k) => (0..k).map(|j| j * draws / k..(j + 1) * draws / k).collect(),
+            None => pieces(draws, cost, self.line_ms / 4.0),
+        };
         // What's recorded before it is a submission of its own.
         self.submit(false)?;
         // Each piece's items: the scissor and viewport in force where it starts, then its own.
@@ -4470,9 +4497,11 @@ mod tests {
     /// A pass of 40 heavy draws over the whole target (the shape of 2026-11-19's 65 ms pass of
     /// edge rays) never runs as one job: first seen, each draw is a submission of its own; then
     /// pieces of a few draws, none over the line, the image the same as one pass would draw;
-    /// and where one draw alone is over the line, the run ends naming the pass. The line is
-    /// lowered here to a few of the draws, so nothing runs long. `tools/check` runs it on each
-    /// machine's GPU.
+    /// and where one draw alone is over the line, the run ends naming the pass; a split forced
+    /// (`WRELA_GPU_SPLIT`'s) draws the same image. The line is lowered here to a few of the
+    /// draws, so nothing runs long. Not bounded, and so not tested: one draw over the line on its
+    /// first frame (it runs once, then the run ends). `tools/check` runs it on each machine's
+    /// GPU.
     #[test]
     #[ignore = "needs a GPU"]
     fn a_pass_of_many_heavy_draws_is_cut_into_jobs_under_the_line() {
@@ -4546,6 +4575,14 @@ mod tests {
             image(&mut gpu);
         }
         assert!(packed, "draws measured are drawn a few to a piece");
+
+        // Forced into seven pieces of uneven draws: the same image.
+        gpu.forced = Some((Some("heavy".to_string()), 7));
+        heavy(&mut gpu).unwrap();
+        let (pieces, _) = jobs(&mut gpu);
+        assert_eq!(pieces.iter().map(|&(n, _)| n).collect::<Vec<_>>(), [5, 6, 6, 5, 6, 6, 6]);
+        image(&mut gpu);
+        gpu.forced = None;
 
         // A line under one draw: the run ends at the first, naming the pass.
         let (fastest, _) = {
