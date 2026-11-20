@@ -45,6 +45,9 @@ pub use backend::{
     SurfaceTexture, Texture, TextureView,
 };
 
+/// How many of the last submissions' GPU times a device keeps (`Device::gpu_ms`).
+pub const CLOCK_KEPT: usize = 4096;
+
 /// How a surface's frames reach the display.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 /// On Metal every mode presents as `Fifo`: turning display sync off was followed twice by

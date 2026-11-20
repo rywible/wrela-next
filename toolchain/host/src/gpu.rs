@@ -833,6 +833,9 @@ fn says_lost(e: &Error) -> bool {
 struct Queued {
     commands: u32,
     bound_ms: f64,
+    /// What the light passes in it took when last measured (ms): held under `LIGHT_JOB` of the
+    /// line.
+    passes_ms: f64,
 }
 
 impl Queued {
@@ -844,8 +847,88 @@ impl Queued {
     }
 }
 
+/// A submission, timed on the GPU's clock once it's done (`Device::gpu_ms`), and the part of a
+/// render pass it held, if any: what the host learns a pass's cost from and holds to the line.
+struct Job {
+    index: wrela_gpu::SubmissionIndex,
+    /// The program's frame, and the host's count of frames ended (`Gpu::calls`) when it was
+    /// made.
+    frame: usize,
+    call: usize,
+    /// What of passes it holds: a piece alone (`alone`), or light passes among other work.
+    pieces: Vec<Piece>,
+    alone: bool,
+}
+
+/// What of a pass's draws a submission holds: a pass that took an eighth of the line or less
+/// when last measured (`LIGHT`) shares a submission with what's recorded around it; any other
+/// is a submission of its own, or several, one a piece. (A sixteenth put the Radeon's `picture`
+/// of SCENE 0, 3.2 ms, in one of its own every frame: +0.1 to 0.2 ms a frame.)
+const LIGHT: f64 = 1.0 / 8.0;
+/// What the light passes of one submission may have taken, summed, as a share of the line.
+const LIGHT_JOB: f64 = 1.0 / 4.0;
+/// How many frames a light pass measured alone is drawn shared before a long submission sends it
+/// to be measured alone again: a submission long for its dispatches would send it every other
+/// frame (the Radeon's SCENE 0: +0.09 ms a frame).
+const AGAIN_AFTER: usize = 32;
+
+/// Draws `draws` (of `of`) of a pass labelled `label`.
+#[derive(Clone, Debug)]
+struct Piece {
+    label: Arc<str>,
+    draws: std::ops::Range<u32>,
+    of: u32,
+}
+
+/// What a pass's draws cost, by its label: the most a draw took (a piece's time over its draws)
+/// in the last frame measured and in the one being measured (ms), by the host's count of frames
+/// (`Gpu::calls`); whether it's to be measured alone again (it was drawn as a light pass in
+/// a submission that took long), and when it last was.
+#[derive(Clone, Copy, Debug, Default)]
+struct Cost {
+    call: usize,
+    last: f64,
+    now: f64,
+    again: bool,
+    alone: usize,
+}
+
+impl Cost {
+    fn per_draw(self) -> f64 {
+        self.last.max(self.now)
+    }
+}
+
+/// The pieces of a pass of `draws` draws whose cost is `cost` (none known: each draw alone),
+/// each at most `room` ms by it; a pass of no draws is one piece.
+fn pieces(draws: u32, cost: Option<Cost>, room: f64) -> Vec<std::ops::Range<u32>> {
+    let size = match cost {
+        None => 1,
+        Some(c) if c.per_draw() <= 0.0 => draws.max(1),
+        Some(c) => ((room / c.per_draw()).floor() as u32).clamp(1, draws.max(1)),
+    };
+    if draws == 0 {
+        return vec![0..0];
+    }
+    (0..draws.div_ceil(size)).map(|k| k * size..((k + 1) * size).min(draws)).collect()
+}
+
 pub(crate) struct Gpu {
     counters: Counters,
+    /// The longest any submission holding a pass may take on the GPU (ms): `crate::step`'s
+    /// limit, AGENTS.md's 50 ms. A pass is cut into pieces of at most a quarter of it by what its
+    /// draws took before; a piece measured over it ends the run.
+    line_ms: f64,
+    /// What each label's draws cost, learned from the pieces measured.
+    costs: HashMap<Arc<str>, Cost>,
+    /// The submissions not yet measured, oldest first.
+    jobs: std::collections::VecDeque<Job>,
+    /// The piece the next submission holds alone, or the light passes it holds.
+    job_piece: Option<Piece>,
+    job_light: Vec<Piece>,
+    /// Every measured job's piece and time, for tests.
+    #[cfg(test)]
+    measured: Vec<(Option<Piece>, f64)>,
     /// What the submission being recorded holds, and how many submissions have been made.
     queued: Queued,
     submissions: u64,
@@ -1270,6 +1353,13 @@ impl Gpu {
         let timer = timestamps.then(|| Timer::new(&device, timing == Timing::Serial, true));
         let mut gpu = Gpu {
             counters: Counters::default(),
+            line_ms: crate::step::limit_ms(),
+            costs: HashMap::new(),
+            jobs: std::collections::VecDeque::new(),
+            job_piece: None,
+            job_light: Vec::new(),
+            #[cfg(test)]
+            measured: Vec::new(),
             queued: Queued::default(),
             submissions: 0,
             largest: Queued::default(),
@@ -2240,8 +2330,16 @@ impl Gpu {
         };
         self.ring.write(&self.device, &mut self.counters);
         self.upload.write(&self.device, &mut self.counters);
-        self.device.submit(vec![encoder.finish()]);
+        let index = self.device.submit(vec![encoder.finish()]);
         self.submissions += 1;
+        if self.device.has_clock() {
+            let (alone, pieces) = match self.job_piece.take() {
+                Some(p) => (true, vec![p]),
+                None => (false, std::mem::take(&mut self.job_light)),
+            };
+            self.jobs.push_back(Job { index, frame: self.frame, call: self.calls, pieces, alone });
+        }
+        self.measure()?;
         self.largest.commands = self.largest.commands.max(queued.commands);
         self.largest.bound_ms = self.largest.bound_ms.max(queued.bound_ms);
         if crate::step::logging() {
@@ -2279,6 +2377,77 @@ impl Gpu {
             && !timer.pending.is_empty()
         {
             timer.collect(&self.device, &mut self.asked)?;
+        }
+        Ok(())
+    }
+
+    /// Reads the time of every submission done and not yet measured, and holds each to the line.
+    fn measure(&mut self) -> Result<()> {
+        let done = self.device.completed();
+        while self.jobs.front().is_some_and(|j| j.index <= done) {
+            let job = self.jobs.pop_front().expect("checked above");
+            if let Some(ms) = self.device.gpu_ms(job.index) {
+                self.judge(job, ms)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Learns a piece's cost from its time `ms`, and fails a job over the line: a piece of a
+    /// pass alone over it (the host cut the pass by what its draws took before, and they took
+    /// far more), or a submission of other work over two lines (what `SUBMIT_BOUND_MS` holds
+    /// dispatches to). The light passes of a submission over a quarter of the line are each
+    /// measured alone at their next drawing.
+    fn judge(&mut self, job: Job, ms: f64) -> Result<()> {
+        #[cfg(test)]
+        self.measured.push((job.alone.then(|| job.pieces[0].clone()), ms));
+        let line = self.line_ms;
+        if !job.alone {
+            if ms > LIGHT_JOB * line {
+                for p in &job.pieces {
+                    let c = self.costs.entry(p.label.clone()).or_default();
+                    if job.call >= c.alone + AGAIN_AFTER {
+                        c.again = true;
+                    }
+                }
+            }
+            if ms > 2.0 * line {
+                let passes: Vec<&str> = job.pieces.iter().map(|p| &*p.label).collect();
+                return Err(Error::Gpu(format!(
+                    "a submission of frame {} held the GPU {ms:.1} ms, over twice the line of \
+                     {line:.0} ms (AGENTS.md, rule 2), with the passes {passes:?}. The run stops \
+                     here: a dispatch's bound didn't hold it, or a pass grew past what it took",
+                    job.frame
+                )));
+            }
+            return Ok(());
+        }
+        let p = &job.pieces[0];
+        let n = p.draws.len().max(1) as f64;
+        let c = self.costs.entry(p.label.clone()).or_default();
+        if job.call > c.call {
+            *c = Cost { call: job.call, last: c.now, now: 0.0, ..*c };
+        }
+        c.now = c.now.max(ms / n);
+        c.again = false;
+        c.alone = job.call;
+        if ms > line {
+            let which = if p.draws.len() == 1 {
+                format!("draw {} of its {}", p.draws.start, p.of)
+            } else {
+                format!("draws {}..{} of its {}", p.draws.start, p.draws.end, p.of)
+            };
+            let cut = if p.draws.len() == 1 {
+                "One draw can't be cut by the host: draw less in it (fewer pixels, or less work \
+                 a pixel), or draw it over frames"
+            } else {
+                "The host cut the pass by what its draws took before; these took far more"
+            };
+            return Err(Error::Gpu(format!(
+                "the pass `{}` held the GPU {ms:.1} ms in frame {} ({which}), over the line of \
+                 {line:.0} ms (AGENTS.md, rule 2). The run stops here, so it can't again. {cut}",
+                p.label, job.frame
+            )));
         }
         Ok(())
     }
@@ -2825,7 +2994,12 @@ impl Gpu {
         }
     }
 
-    /// Records a pass's draws into one render pass.
+    /// Records a pass's draws: one render pass in a submission of its own, or, where what its
+    /// draws took before says it would hold the GPU past a quarter of the line, several, each
+    /// a piece of its draws on the target as the one before left it, in its own submission. A
+    /// pass whose draws weren't measured yet draws each alone. So no job the GPU runs holds
+    /// many heavy draws (2026-11-19: a pass of 18 bodies' edge rays, over the whole screen, held
+    /// the Radeon 65 ms in one job; render passes were counted, not weighed).
     fn record_pass(&mut self, op: Opcode, open: OpenPass) -> Result<()> {
         let pass = open.pass;
         let on_screen = pass.on_screen();
@@ -2850,18 +3024,10 @@ impl Gpu {
         // Each draw's pipeline has a variant for these targets, made at load: the checker
         // checked they're among its manifest's.
         let formats = (colors, depth_format);
-        // Everything that can flush happens before anything is recorded for this pass.
-        let total = open
-            .draws
-            .iter()
-            .map(|d| match d {
-                PassItem::Draw(d) => self.aligned(d.uniforms.len()),
-                _ => 0,
-            })
-            .sum();
-        self.reserve_uniforms(op, total)?;
-        self.reserve_timestamps()?;
-        let label = open.label.as_deref().unwrap_or(if on_screen { "screen pass" } else { "pass" });
+        let name: Arc<str> = open
+            .label
+            .clone()
+            .unwrap_or_else(|| Arc::from(if on_screen { "screen pass" } else { "pass" }));
         let target = match (pass.colors().first(), pass.depth) {
             (Some(c), _) if c.texture == stream::SCREEN => None,
             (Some(c), _) => Some((c.texture, c.level, c.layer)),
@@ -2873,10 +3039,84 @@ impl Gpu {
             self.labelled_order.retain(|l| l != name);
             self.labelled_order.push(name.clone());
         }
+        let draws = open.draws.iter().filter(|d| matches!(d, PassItem::Draw(_))).count() as u32;
+        let cost = self.costs.get(&name).copied();
+        let light = cost.filter(|c| !c.again).map(|c| c.per_draw() * f64::from(draws));
+        let light = light.filter(|&ms| ms <= LIGHT * self.line_ms);
+        if draws == 0 || !self.device.has_clock() || light.is_some() {
+            let ms = light.unwrap_or(0.0);
+            // Its submission holds light passes that took a quarter of the line at most.
+            if self.queued.passes_ms + ms > LIGHT_JOB * self.line_ms {
+                self.submit(false)?;
+            }
+            self.record_piece(op, &pass, &formats, &name, open.draws, true)?;
+            self.queued.passes_ms += ms;
+            if light.is_some() {
+                self.job_light.push(Piece { label: name, draws: 0..draws, of: draws });
+            }
+            self.counters.render_passes += 1;
+            return if on_screen { self.flush() } else { self.alone() };
+        }
+        let ranges = pieces(draws, cost, self.line_ms / 4.0);
+        // What's recorded before it is a submission of its own.
+        self.submit(false)?;
+        // Each piece's items: the scissor and viewport in force where it starts, then its own.
+        let mut parts: Vec<Vec<PassItem>> = vec![Vec::new()];
+        let (mut scissor, mut viewport) = (None, None);
+        let mut drawn = 0;
+        let mut at = 0;
+        for item in open.draws {
+            match &item {
+                PassItem::Scissor(r) => scissor = Some(*r),
+                PassItem::Viewport(v) => viewport = Some(*v),
+                PassItem::Draw(_) => {
+                    if drawn == ranges[at].end {
+                        at += 1;
+                        let mut next = Vec::new();
+                        next.extend(scissor.map(PassItem::Scissor));
+                        next.extend(viewport.map(PassItem::Viewport));
+                        parts.push(next);
+                    }
+                    drawn += 1;
+                }
+            }
+            parts.last_mut().expect("one at least").push(item);
+        }
+        let last = parts.len() - 1;
+        for (k, (items, range)) in parts.into_iter().zip(ranges).enumerate() {
+            self.record_piece(op, &pass, &formats, &name, items, k == 0)?;
+            self.job_piece = Some(Piece { label: name.clone(), draws: range, of: draws });
+            self.submit(on_screen && k == last)?;
+        }
+        self.counters.render_passes += 1;
+        if on_screen { Ok(()) } else { self.alone() }
+    }
+
+    /// Records `items` as one render pass of `pass` into the pending encoder: the first piece
+    /// of a pass loads its targets as the pass says, every later one keeps what's there.
+    fn record_piece(
+        &mut self,
+        op: Opcode,
+        pass: &Pass,
+        formats: &(Vec<TextureFormat>, Option<TextureFormat>),
+        label: &str,
+        items: Vec<PassItem>,
+        first: bool,
+    ) -> Result<()> {
+        // Everything that can flush happens before anything is recorded for this pass.
+        let total = items
+            .iter()
+            .map(|d| match d {
+                PassItem::Draw(d) => self.aligned(d.uniforms.len()),
+                _ => 0,
+            })
+            .sum();
+        self.reserve_uniforms(op, total)?;
+        self.reserve_timestamps()?;
         let timestamps =
             self.timer.as_mut().and_then(|t| t.next_if(&self.asked, self.frame, self.calls, label));
-        let mut prepared = Vec::with_capacity(open.draws.len());
-        for d in &open.draws {
+        let mut prepared = Vec::with_capacity(items.len());
+        for d in &items {
             if let PassItem::Draw(d) = d {
                 let offset = self.push_uniforms(&d.uniforms);
                 let bind_group = self.bind_group(d.pipeline, &d.bindings);
@@ -2900,7 +3140,7 @@ impl Gpu {
             .zip(&color_views)
             .map(|(c, view)| wrela_gpu::ColorAttachment {
                 view,
-                load: if c.keep {
+                load: if c.keep || !first {
                     wrela_gpu::LoadOp::Load
                 } else {
                     wrela_gpu::LoadOp::Clear(c.clear.map(f64::from))
@@ -2909,14 +3149,14 @@ impl Gpu {
             .collect();
         let depth_attachment = depth_view.as_ref().map(|view| wrela_gpu::DepthAttachment {
             view,
-            load: if pass.keep_depth {
+            load: if pass.keep_depth || !first {
                 wrela_gpu::LoadOp::Load
             } else {
                 wrela_gpu::LoadOp::Clear(pass.clear_depth)
             },
         });
         // Counted here, and added once the pass, which borrows the executor, has ended.
-        let mut counters = Counters { render_passes: 1, ..Counters::default() };
+        let mut counters = Counters::default();
         let mut rp = encoder.begin_render_pass(&wrela_gpu::RenderPassDesc {
             label,
             colors: &color_attachments,
@@ -2926,7 +3166,7 @@ impl Gpu {
             }),
         });
         let mut prepared = prepared.iter();
-        for item in &open.draws {
+        for item in &items {
             let d = match item {
                 PassItem::Scissor([x, y, w, h]) => {
                     rp.set_scissor_rect(*x, *y, *w, *h);
@@ -2942,7 +3182,7 @@ impl Gpu {
             let Kind::Render { variants, .. } = &self.pipelines[d.pipeline as usize].kind else {
                 unreachable!("the checker checked the kind");
             };
-            let Some(variant) = variants.get(&formats) else {
+            let Some(variant) = variants.get(formats) else {
                 return Err(Error::Gpu(format!(
                     "`{}` has no pipeline for its targets {formats:?}",
                     self.pipelines[d.pipeline as usize].name
@@ -3002,7 +3242,7 @@ impl Gpu {
         drop(rp);
         self.counters.add(&counters);
         self.encoder = Some(encoder);
-        if on_screen { self.flush() } else { self.alone() }
+        Ok(())
     }
 
     /// A buffer's bytes `offset..offset + size`, copied back to the CPU (waits for the GPU).
@@ -3302,6 +3542,9 @@ impl Gpu {
         fresh.program_limits.headroom = self.program_limits.headroom;
         fresh.program_limits.epoch = self.program_limits.epoch + 1;
         fresh.submissions = self.submissions;
+        // What passes cost is the scene's, not the device's.
+        fresh.costs = std::mem::take(&mut self.costs);
+        fresh.line_ms = self.line_ms;
         if let (Some(old), Some(new)) = (&mut self.timer, &mut fresh.timer) {
             new.results = std::mem::take(&mut old.results);
         }
@@ -4039,7 +4282,7 @@ mod tests {
     /// the guard's bound or 64 of them; one alone always goes.
     #[test]
     fn a_submission_is_full_at_two_steps_of_bound_or_64_commands() {
-        let q = |commands, bound_ms| Queued { commands, bound_ms };
+        let q = |commands, bound_ms| Queued { commands, bound_ms, passes_ms: 0.0 };
         assert!(!q(0, 0.0).full(1.0e9), "a dispatch alone");
         assert!(!q(1, 50.0).full(50.0));
         assert!(q(1, 50.0).full(50.1));
@@ -4091,6 +4334,242 @@ mod tests {
         assert!(largest.bound_ms <= SUBMIT_BOUND_MS, "{largest:?}");
         assert_eq!(gpu.read_buffer(1).unwrap(), 30u32.to_le_bytes());
         gpu.check_errors().unwrap();
+    }
+
+    /// The heavy draw's target's side, and its chain of sines a pixel.
+    const HEAVY_SIDE: u32 = 256;
+    const HEAVY_CHAIN: u32 = 128;
+
+    /// A build of one render pipeline, `heavy`: a triangle over the whole target whose every
+    /// pixel runs a chain of `HEAVY_CHAIN` sines and adds 1/64 to what's there.
+    fn heavy_draw() -> (Manifest, [Vec<u8>; 1]) {
+        use wrela_abi::manifest::{Output, RenderTarget};
+        use wrela_shader::build::{BinOp, Builder, Builtin, BuiltinInput, Scalar};
+        let mut manifest = Manifest::new("game.wasm");
+        manifest.pipelines.push(Pipeline {
+            name: "heavy".into(),
+            shader: String::new(),
+            stage: Stage::Render {
+                vertex_entry: "cover".into(),
+                fragment_entry: "heavy".into(),
+                blends: vec![Blend::Add],
+                cull: Cull::None,
+                depth_bias: DepthBias::default(),
+                depth: DepthState::default(),
+                writes_depth: false,
+                outputs: vec![Output::Float],
+                targets: vec![RenderTarget::of(&[TextureFormat::Rgba16Float], false)],
+            },
+            uniform: None,
+            bindings: Vec::new(),
+            debug_flag: None,
+            requires: Vec::new(),
+            conditional: false,
+            standin: None,
+            sizes: None,
+            kept: 0,
+            work: vec![Some(16), Some(u64::from(HEAVY_CHAIN) * 32 + 64)],
+            unbounded: Vec::new(),
+        });
+        let mut b = Builder::new();
+        let u = b.scalar(Scalar::U32);
+        let fl = b.scalar(Scalar::F32);
+        let v4 = b.vector(Scalar::F32, 4);
+        b.vertex("cover", &[BuiltinInput::VertexIndex], |f| {
+            let i = f.input(0, u);
+            let one = f.u32(1);
+            let xb = f.binary(BinOp::BitAnd, i, one);
+            let yb = f.binary(BinOp::Shr, i, one);
+            let (four, minus, zero, unit) = (f.f32(4.0), f.f32(1.0), f.f32(0.0), f.f32(1.0));
+            let corner = |f: &mut wrela_shader::build::Body<'_>, bit| {
+                let v = f.convert(fl, bit, Scalar::F32);
+                let v = f.binary(BinOp::Mul, v, four);
+                f.binary(BinOp::Sub, v, minus)
+            };
+            let (x, y) = (corner(f, xb), corner(f, yb));
+            let p = f.construct(v4, &[x, y, zero, unit]);
+            f.ret_clip(p);
+        });
+        b.fragment("heavy", &[BuiltinInput::Position], |f| {
+            let p = f.input(0, v4);
+            let x = f.local("x", fl);
+            let n = f.local("n", u);
+            let px = f.extract(fl, p, 0);
+            f.store(x.clone(), px);
+            let zero = f.u32(0);
+            f.store(n.clone(), zero);
+            f.loop_(|f| {
+                let c = f.load(u, n.clone());
+                let limit = f.u32(HEAVY_CHAIN);
+                let done = f.binary(BinOp::Ge, c, limit);
+                f.if_(done, |f| f.break_(), |_| {});
+                let v = f.load(fl, x.clone());
+                let s = f.builtin(fl, Builtin::Sin, &[v]);
+                let a = f.f32(0.999);
+                let m = f.binary(BinOp::Mul, s, a);
+                let b2 = f.f32(0.001);
+                let y = f.binary(BinOp::Add, m, b2);
+                f.store(x.clone(), y);
+                let one = f.u32(1);
+                let c2 = f.binary(BinOp::Add, c, one);
+                f.store(n.clone(), c2);
+            });
+            // 1/64, and the chain's end kept: it's never past 2.
+            let r = f.load(fl, x);
+            let two = f.f32(2.0);
+            let over = f.binary(BinOp::Sub, r, two);
+            let none = f.f32(0.0);
+            let kept = f.builtin(fl, Builtin::Max, &[over, none]);
+            let part = f.f32(1.0 / 64.0);
+            let v = f.binary(BinOp::Add, part, kept);
+            let out = f.construct(v4, &[v, v, v, v]);
+            f.ret(Some(out));
+        });
+        let target = wrela_abi::Target::HERE;
+        let p = &mut manifest.pipelines[0];
+        p.shader = format!("heavy.{}", wrela_shader::extension(target));
+        let shader = b.write(p, target).unwrap();
+        (manifest, [shader.bytes])
+    }
+
+    /// One pass labelled `label` of `draws` heavy draws, each of `instances` triangles over the
+    /// whole of texture 2, cleared first, then its frame's end, waited for and measured.
+    fn heavy_frame(gpu: &mut Gpu, label: &str, draws: u32, instances: u32) -> Result<()> {
+        use crate::program::Executor;
+        gpu.execute(&Command::Label { name: label })?;
+        gpu.execute(&Command::BeginPass(Pass::one(2, false, [0.0; 4])))?;
+        for _ in 0..draws {
+            gpu.execute(&Command::Draw {
+                pipeline: 0,
+                vertices: 3,
+                instances,
+                bindings: Vec::new(),
+                uniforms: &[],
+            })?;
+        }
+        gpu.execute(&Command::EndPass)?;
+        gpu.end_frame()?;
+        wait(&gpu.device)?;
+        gpu.measure()
+    }
+
+    /// The pieces of the heavy pass measured since the last take: how many draws each held, and
+    /// its time (ms); and the most any other submission took.
+    fn heavy_jobs(gpu: &mut Gpu, label: &str) -> (Vec<(u32, f64)>, f64) {
+        let mut pieces = Vec::new();
+        let mut other = 0.0f64;
+        for (piece, ms) in std::mem::take(&mut gpu.measured) {
+            match piece {
+                Some(p) if &*p.label == label => pieces.push((p.draws.len() as u32, ms)),
+                _ => other = other.max(ms),
+            }
+        }
+        (pieces, other)
+    }
+
+    /// A pass of 40 heavy draws over the whole target (the shape of 2026-11-19's 65 ms pass of
+    /// edge rays) never runs as one job: first seen, each draw is a submission of its own; then
+    /// pieces of a few draws, none over the line, the image the same as one pass would draw;
+    /// and where one draw alone is over the line, the run ends naming the pass. The line is
+    /// lowered here to a few of the draws, so nothing runs long. `tools/check` runs it on each
+    /// machine's GPU.
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn a_pass_of_many_heavy_draws_is_cut_into_jobs_under_the_line() {
+        const DRAWS: u32 = 40;
+        let (manifest, shaders) = heavy_draw();
+        let mut gpu = Gpu::new(&manifest, &shaders, Timing::Off, false).unwrap();
+        assert!(gpu.device.has_clock(), "this GPU doesn't time its submissions");
+        let side = HEAVY_SIDE;
+        gpu.create_texture(
+            2,
+            [side, side, 1],
+            TextureFormat::Rgba16Float,
+            false,
+            TextureKind::D2,
+            1,
+        );
+        // Each draw about half a millisecond on this GPU: as many triangles over the target as
+        // that takes, from the time of one (warmed, under a label of its own).
+        for _ in 0..3 {
+            heavy_frame(&mut gpu, "warm", 8, 1).unwrap();
+        }
+        let (warm, _) = heavy_jobs(&mut gpu, "warm");
+        let mut one: Vec<f64> =
+            warm.iter().rev().take(8).map(|&(n, ms)| ms / f64::from(n)).collect();
+        one.sort_by(f64::total_cmp);
+        let instances = (0.5 / one[4]).ceil().clamp(1.0, 32.0) as u32;
+        eprintln!("a triangle over the target: {:.3} ms; {instances} a draw", one[4]);
+        let heavy = |gpu: &mut Gpu| heavy_frame(gpu, "heavy", DRAWS, instances);
+        let jobs = |gpu: &mut Gpu| heavy_jobs(gpu, "heavy");
+        let image = |gpu: &mut Gpu| {
+            let (w, h, _, raw) = gpu.read_target_raw("heavy").unwrap();
+            assert_eq!((w, h), (side, side));
+            let want = half_bits((DRAWS * instances) as f32 / 64.0);
+            let texels: Vec<u16> =
+                raw.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
+            assert!(texels.iter().all(|&t| t == want), "every draw adds once");
+        };
+
+        // First seen: each draw alone.
+        heavy(&mut gpu).unwrap();
+        let (first, _) = jobs(&mut gpu);
+        assert_eq!(first.len(), DRAWS as usize, "{first:?}");
+        assert!(first.iter().all(|&(n, _)| n == 1), "{first:?}");
+        image(&mut gpu);
+        let most = first.iter().map(|&(_, ms)| ms).fold(0.0, f64::max);
+        let whole: f64 = first.iter().map(|&(_, ms)| ms).sum();
+        eprintln!("heavy draws: {DRAWS} alone, {whole:.2} ms in all, the most {most:.3} ms");
+        assert!(most > 0.02, "a draw took {most} ms: too little to test the cut");
+
+        // Two frames more, so the cost is the warm GPU's (a first draw may take ten times the
+        // rest); then a line of 20 draws by it: pieces of 5, the whole pass two lines (fewer
+        // pieces where the GPU's clock rises since, never one).
+        for _ in 0..2 {
+            heavy(&mut gpu).unwrap();
+            jobs(&mut gpu);
+        }
+        let per_draw = gpu.costs[&Arc::<str>::from("heavy")].per_draw();
+        gpu.line_ms = 20.0 * per_draw;
+        let mut packed = false;
+        for _ in 0..6 {
+            heavy(&mut gpu).unwrap();
+            let (pieces, other) = jobs(&mut gpu);
+            eprintln!("pieces of the heavy pass (the line {:.2} ms): {pieces:?}", gpu.line_ms);
+            // Never whole; a piece the GPU took slowly makes the next frame's smaller, down to
+            // single draws.
+            assert!(pieces.len() >= 2, "{pieces:?}");
+            packed |= pieces.iter().any(|&(n, _)| n > 1);
+            assert_eq!(pieces.iter().map(|&(n, _)| n).sum::<u32>(), DRAWS);
+            assert!(pieces.iter().all(|&(_, ms)| ms <= gpu.line_ms), "{pieces:?}");
+            assert!(other <= gpu.line_ms, "{other} ms");
+            image(&mut gpu);
+        }
+        assert!(packed, "draws measured are drawn a few to a piece");
+
+        // A line under one draw: the run ends at the first, naming the pass.
+        let (fastest, _) = {
+            heavy(&mut gpu).unwrap();
+            let (pieces, _) = jobs(&mut gpu);
+            let fastest =
+                pieces.iter().map(|&(n, ms)| ms / f64::from(n)).fold(f64::INFINITY, f64::min);
+            (fastest, pieces)
+        };
+        gpu.line_ms = fastest / 2.0;
+        let error = heavy(&mut gpu).unwrap_err().to_string();
+        assert!(error.contains("the pass `heavy`") && error.contains("over the line"), "{error}");
+        assert!(error.contains("draw "), "{error}");
+        let (pieces, _) = jobs(&mut gpu);
+        assert!(pieces.iter().all(|&(n, _)| n == 1), "{pieces:?}");
+    }
+
+    /// `x`'s half-float bits (exact for the small multiples of 1/64 the test draws).
+    fn half_bits(x: f32) -> u16 {
+        let b = x.to_bits();
+        let sign = ((b >> 16) & 0x8000) as u16;
+        let exp = ((b >> 23) & 0xff) as i32 - 127 + 15;
+        let man = ((b >> 13) & 0x3ff) as u16;
+        if x == 0.0 { sign } else { sign | ((exp as u16) << 10) | man }
     }
 
     /// A lost device is made again at the end of its frame (both backends; `lose`, what

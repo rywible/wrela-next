@@ -51,6 +51,9 @@ struct Shared {
     timestamps: Option<Id<dyn MTLCounterSet>>,
     submitted: AtomicU64,
     completed: Arc<AtomicU64>,
+    /// Each recent submission's span on the GPU's clock (seconds): the first of its command
+    /// buffers' starts and the last of their ends, newest last ([`Device::gpu_ms`]).
+    clock: Arc<Mutex<std::collections::VecDeque<(SubmissionIndex, f64, f64)>>>,
     /// Command buffers committed and not yet seen complete, by submission, with the bind groups
     /// their commands set, kept alive until they're done (what the table names in them).
     in_flight: Mutex<Vec<(SubmissionIndex, Id<dyn MTLCommandBuffer>, Vec<Arc<Group>>)>>,
@@ -281,6 +284,7 @@ impl Device {
                 timestamps,
                 submitted: AtomicU64::new(0),
                 completed: Arc::new(AtomicU64::new(0)),
+                clock: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 in_flight: Mutex::new(Vec::new()),
                 table,
                 pending: Mutex::new(Vec::new()),
@@ -819,6 +823,7 @@ impl Device {
             for (k, cb) in cbs.iter().enumerate() {
                 let errors = self.0.errors.clone();
                 let completed = self.0.completed.clone();
+                let clock = self.0.clock.clone();
                 let is_last = k == last;
                 let block =
                     RcBlock::new(move |cb: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
@@ -826,6 +831,25 @@ impl Device {
                         if cb.status() == MTLCommandBufferStatus::Error {
                             lock(&errors).push(command_buffer_error(cb));
                         }
+                        // The submission's span: its buffers complete in order, each before
+                        // the next's handler runs. A command buffer's start is near its commit,
+                        // not when the work before it let it run (a pass of 40 draws, each its
+                        // own submission, timed 1.4, 2.8, 4.3 ms...): it starts no earlier than
+                        // the submission before it ended.
+                        let (start, end) = (cb.GPUStartTime(), cb.GPUEndTime());
+                        let mut c = lock(&clock);
+                        match c.back_mut() {
+                            // A later buffer of the same submission starts after its first.
+                            Some((i, _, e)) if *i == index => *e = e.max(end),
+                            back => {
+                                let start = back.map_or(start, |(_, _, e)| start.max(*e));
+                                c.push_back((index, start, end));
+                                while c.len() > CLOCK_KEPT {
+                                    c.pop_front();
+                                }
+                            }
+                        }
+                        drop(c);
                         if is_last {
                             completed.fetch_max(index, Ordering::AcqRel);
                         }
@@ -847,6 +871,24 @@ impl Device {
     /// The submissions done so far: every one up to this index.
     pub fn completed(&self) -> SubmissionIndex {
         self.0.completed.load(Ordering::Acquire)
+    }
+
+    /// Whether it times its submissions ([`Device::gpu_ms`]): a Metal device always does.
+    pub fn has_clock(&self) -> bool {
+        true
+    }
+
+    /// How long submission `index` held the GPU (ms), from its first command buffer's start (or
+    /// the end of the submission before it, if later) to its last one's end on the GPU's clock: once it's done, while it's among the last
+    /// [`CLOCK_KEPT`] submissions.
+    pub fn gpu_ms(&self, index: SubmissionIndex) -> Option<f64> {
+        if index > self.completed() {
+            return None;
+        }
+        let c = lock(&self.0.clock);
+        let k = c.binary_search_by_key(&index, |(i, ..)| *i).ok()?;
+        let (_, start, end) = c[k];
+        (end >= start && start > 0.0).then_some((end - start) * 1e3)
     }
 
     pub fn submitted(&self) -> SubmissionIndex {

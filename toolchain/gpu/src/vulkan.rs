@@ -50,6 +50,14 @@ struct Shared {
     timestamp_period: f32,
     /// The timeline semaphore: submission `n` signals `n`.
     timeline: vk::Semaphore,
+    /// The pool of each command buffer's two timestamps, its start and its end, at `2 * (n %
+    /// CLOCK_KEPT)` for the `n`th buffer begun, and the mask of a timestamp's valid bits
+    /// ([`Device::gpu_ms`]).
+    clock: Option<(vk::QueryPool, u64)>,
+    /// The command buffers begun so far (each its slot in the clock's pool).
+    clock_next: AtomicU64,
+    /// Each recent submission's first and last timed command buffers, newest last.
+    clock_of: Mutex<std::collections::VecDeque<(SubmissionIndex, u64, u64)>>,
     submitted: AtomicU64,
     /// Staged writes, recorded before the next submission's own work.
     pending: Mutex<Vec<Pending>>,
@@ -338,7 +346,8 @@ impl Device {
                 })
                 .ok_or("the GPU has no queue that both draws and computes")?
                 as u32;
-            let timestamps_valid = families[queue_family as usize].timestamp_valid_bits > 0;
+            let valid_bits = families[queue_family as usize].timestamp_valid_bits;
+            let timestamps_valid = valid_bits > 0;
 
             // What it has.
             let mut f11 = vk::PhysicalDeviceVulkan11Features::default();
@@ -541,6 +550,21 @@ impl Device {
                     None,
                 )
                 .map_err(|e| Error(format!("Vulkan made no semaphore: {e}")))?;
+            // Two timestamps a command buffer, its start and its end (`Device::gpu_ms`).
+            let clock = if timestamps_valid {
+                let pool = raw
+                    .create_query_pool(
+                        &vk::QueryPoolCreateInfo::default()
+                            .query_type(vk::QueryType::TIMESTAMP)
+                            .query_count(2 * CLOCK_KEPT as u32),
+                        None,
+                    )
+                    .map_err(|e| Error(format!("Vulkan made no query pool: {e}")))?;
+                let mask = if valid_bits >= 64 { u64::MAX } else { (1u64 << valid_bits) - 1 };
+                Some((pool, mask))
+            } else {
+                None
+            };
             let memory = instance.get_physical_device_memory_properties(physical);
             let device_type = match props.device_type {
                 vk::PhysicalDeviceType::DISCRETE_GPU => DeviceType::DiscreteGpu,
@@ -615,6 +639,9 @@ impl Device {
                 features,
                 timestamp_period: l.timestamp_period,
                 timeline,
+                clock,
+                clock_next: AtomicU64::new(0),
+                clock_of: Mutex::new(std::collections::VecDeque::new()),
                 submitted: AtomicU64::new(0),
                 pending: Mutex::new(Vec::new()),
                 in_flight: Mutex::new(Vec::new()),
@@ -1400,20 +1427,30 @@ impl Device {
         let mut keep: Vec<Keep> = Vec::new();
         let mut pools = Vec::new();
         let mut cbs = Vec::new();
+        let mut timed: Vec<u64> = Vec::new();
         if !pending.is_empty() {
             let mut enc = CommandEncoder::new(self.clone(), "queue writes");
             for w in &pending {
                 enc.record_pending(w, &mut keep);
             }
             let cb = enc.finish();
+            timed.extend(cb.clock);
             pools.push(cb.pool);
             cbs.push(cb.raw);
             keep.extend(cb.keep);
         }
         for b in buffers {
+            timed.extend(b.clock);
             pools.push(b.pool);
             cbs.push(b.raw);
             keep.extend(b.keep);
+        }
+        if let (Some(&first), Some(&last)) = (timed.first(), timed.last()) {
+            let mut c = lock(&self.0.clock_of);
+            c.push_back((index, first, last));
+            while c.len() > CLOCK_KEPT {
+                c.pop_front();
+            }
         }
         let signal = [vk::SemaphoreSubmitInfo::default()
             .semaphore(self.0.timeline)
@@ -1478,6 +1515,48 @@ impl Device {
         }
     }
 
+    /// Whether it times its submissions ([`Device::gpu_ms`]): where its queue writes timestamps.
+    pub fn has_clock(&self) -> bool {
+        self.0.clock.is_some()
+    }
+
+    /// How long submission `index` held the GPU (ms): from its first command buffer's start,
+    /// stamped once everything before it is done, to its last one's end; once it's done, while
+    /// those buffers' slots aren't yet others' (the last [`CLOCK_KEPT`] buffers begun).
+    pub fn gpu_ms(&self, index: SubmissionIndex) -> Option<f64> {
+        let (pool, mask) = self.0.clock?;
+        if index > self.completed() {
+            return None;
+        }
+        let (first, last) = {
+            let c = lock(&self.0.clock_of);
+            let k = c.binary_search_by_key(&index, |(i, ..)| *i).ok()?;
+            (c[k].1, c[k].2)
+        };
+        if first + CLOCK_KEPT as u64 <= self.0.clock_next.load(Ordering::Acquire) {
+            return None;
+        }
+        let read = |query: u32| -> Option<u64> {
+            let mut stamp = [0u64; 1];
+            // SAFETY: one query of the pool, read without waiting: one not yet written isn't
+            // ready, and gives nothing.
+            unsafe {
+                self.raw().get_query_pool_results(
+                    pool,
+                    query,
+                    &mut stamp,
+                    vk::QueryResultFlags::TYPE_64,
+                )
+            }
+            .ok()?;
+            Some(stamp[0])
+        };
+        let start = read(2 * (first % CLOCK_KEPT as u64) as u32)?;
+        let end = read(2 * (last % CLOCK_KEPT as u64) as u32 + 1)?;
+        let ticks = end.wrapping_sub(start) & mask;
+        Some(ticks as f64 * f64::from(self.0.timestamp_period) * 1e-6)
+    }
+
     /// The submissions done so far: every one up to this index.
     pub fn completed(&self) -> SubmissionIndex {
         // SAFETY: the timeline semaphore's value.
@@ -1539,6 +1618,9 @@ impl Drop for Shared {
                 }
             }
             lock(&self.pending).clear();
+            if let Some((pool, _)) = self.clock {
+                self.raw.destroy_query_pool(pool, None);
+            }
             for p in lock(&self.descriptor_pools).drain(..) {
                 self.raw.destroy_descriptor_pool(p, None);
             }
@@ -2150,6 +2232,8 @@ pub struct CommandEncoder {
     device: Device,
     pool: vk::CommandPool,
     raw: vk::CommandBuffer,
+    /// Its slot in the device's clock (`Device::gpu_ms`), if it has one.
+    clock: Option<u64>,
     /// What its commands use, alive until its submission is done.
     keep: Vec<Keep>,
     groups: Vec<Arc<Group>>,
@@ -2164,6 +2248,8 @@ pub struct CommandBuffer {
     pool: vk::CommandPool,
     raw: vk::CommandBuffer,
     keep: Vec<Keep>,
+    /// Its slot in the device's clock, if it times its work.
+    clock: Option<u64>,
 }
 
 /// Everything before, done and visible to everything after: the full barrier between commands.
@@ -2209,10 +2295,19 @@ impl CommandEncoder {
             .expect("Vulkan began no command buffer");
             // What the submissions before did, this one sees.
             full_barrier(d, raw);
+            // Its slot in the clock's pool, reset, and its start once everything before is done.
+            let clock = device.0.clock.map(|(queries, _)| {
+                let seq = device.0.clock_next.fetch_add(1, Ordering::AcqRel);
+                let slot = 2 * (seq % CLOCK_KEPT as u64) as u32;
+                d.cmd_reset_query_pool(raw, queries, slot, 2);
+                d.cmd_write_timestamp2(raw, vk::PipelineStageFlags2::ALL_COMMANDS, queries, slot);
+                seq
+            });
             CommandEncoder {
                 device,
                 pool,
                 raw,
+                clock,
                 keep: Vec::new(),
                 groups: Vec::new(),
                 pipelines: Vec::new(),
@@ -2681,6 +2776,18 @@ impl CommandEncoder {
     }
 
     pub fn finish(mut self) -> CommandBuffer {
+        if let (Some(seq), Some((queries, _))) = (self.clock, self.device.0.clock) {
+            let slot = 2 * (seq % CLOCK_KEPT as u64) as u32 + 1;
+            // SAFETY: its end, after everything recorded in it.
+            unsafe {
+                self.d().cmd_write_timestamp2(
+                    self.raw,
+                    vk::PipelineStageFlags2::ALL_COMMANDS,
+                    queries,
+                    slot,
+                )
+            };
+        }
         // SAFETY: the recording ends.
         unsafe { self.d().end_command_buffer(self.raw).expect("Vulkan ended no command buffer") };
         let mut keep = std::mem::take(&mut self.keep);
@@ -2700,7 +2807,7 @@ impl CommandEncoder {
             keep.push(Keep::Held(h));
         }
         let pool = std::mem::replace(&mut self.pool, vk::CommandPool::null());
-        CommandBuffer { pool, raw: self.raw, keep }
+        CommandBuffer { pool, raw: self.raw, keep, clock: self.clock }
     }
 }
 
