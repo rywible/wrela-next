@@ -290,6 +290,13 @@ pub trait Surface: Copy + GpuData {
         Join { k: 0.0, parent: NO_JOIN, first: 0, count: 0 }
     }
 
+    /// The moves above its records (the thing's placement, `Placement`): a kernel takes a point
+    /// (or a ray) into the records' frame by them, and a distance out, as the moves themselves
+    /// compute it. None for a surface that is no move.
+    fn placement(self) -> Placement {
+        NO_PLACEMENT
+    }
+
     /// Its distance at `p`, asking only the parts `live` names: what `distance` gives, bit for
     /// bit, wherever `live` is what `live(over)` gave for a box holding `p`. A union asks no part
     /// of an operand whose parts are all left out; a surface that is no union asks all of
@@ -1177,8 +1184,137 @@ pub const STAND_IN_DISPLACED: u32 = 2
 pub const STAND_IN_CARVED: u32 = 3
 /// Why a part has no stand-in: it is under more joins than `stand_in_fold` nests.
 pub const STAND_IN_TOO_DEEP: u32 = 4
+/// Why a part has no stand-in: a map that isn't a move, a turn or one scale (or too many) moves it.
+pub const STAND_IN_STRETCHED: u32 = 5
 /// The most joins `stand_in_fold` nests (a part deeper has none: `STAND_IN_TOO_DEEP`).
 pub const MOST_JOINS: u32 = 4
+
+/// One step of a placement: `kind` a move (`a.xyz` by), a turn (`a`, `b`, `c` the columns of the
+/// matrix taking a point into the thing's frame) or a scale (`a.x` by); `MAP_OTHER` any other map.
+pub struct MapStep: Copy + GpuData {
+    pub kind: u32,
+    pub a: vec4,
+    pub b: vec4,
+    pub c: vec4,
+}
+
+/// A step's kinds.
+pub const MAP_SHIFT: u32 = 1
+/// A step's kinds: a turn.
+pub const MAP_TURN: u32 = 2
+/// A step's kinds: a scale by one factor.
+pub const MAP_SIZE: u32 = 3
+/// A step's kinds: a map no stand-in goes through (not a move, a turn or one scale).
+pub const MAP_OTHER: u32 = 4
+/// The most steps a placement holds.
+pub const MOST_STEPS: u32 = 4
+
+/// A thing's placement (`Surface::placement`): the moves above its records, outermost first, as
+/// the moves compute them, so the fold of its records at `placement_local(p)`, taken out by
+/// `placement_out`, is the placed thing's own distance to the bit. `whole` is false where a map
+/// isn't a move, a turn or one scale, or there are more than `MOST_STEPS`.
+pub struct Placement: Copy + GpuData {
+    pub steps: [MapStep; 4],
+    pub count: u32,
+    pub whole: u32,
+}
+
+/// No moves.
+pub const NO_PLACEMENT: Placement = Placement { steps: [MapStep { kind: 0, a: vec4(0.0), b: vec4(0.0), c: vec4(0.0) }; 4], count: 0, whole: 1 }
+
+/// `step` before `pl`'s steps (the move outside them).
+pub fn placement_before(step: MapStep, pl: Placement) -> Placement {
+    var out = NO_PLACEMENT
+    out.steps[0] = step
+    for k in 0..3 {
+        if k < pl.count {
+            out.steps[k + 1] = pl.steps[k]
+        }
+    }
+    out.count = min(pl.count + 1, MOST_STEPS)
+    out.whole = if pl.whole == 1 && step.kind != MAP_OTHER && pl.count < MOST_STEPS { 1 } else { 0 }
+    out
+}
+
+/// `p` taken into the records' frame, step by step as each map takes it (`PointMap::local`).
+pub fn placement_local(pl: Placement, p: vec3) -> vec3 {
+    var q = p
+    for k in 0..MOST_STEPS {
+        if k >= pl.count {
+            break
+        }
+        let st = pl.steps[k]
+        if st.kind == MAP_SHIFT {
+            q = q - st.a.xyz
+        } else if st.kind == MAP_TURN {
+            q = st.a.xyz * q.x + st.b.xyz * q.y + st.c.xyz * q.z
+        } else if st.kind == MAP_SIZE {
+            q = q / st.a.x
+        }
+    }
+    q
+}
+
+/// A direction taken into the records' frame (a ray's, once a thing): `PointMap::local_direction`.
+pub fn placement_direction(pl: Placement, d: vec3) -> vec3 {
+    var q = d
+    for k in 0..MOST_STEPS {
+        if k >= pl.count {
+            break
+        }
+        let st = pl.steps[k]
+        if st.kind == MAP_TURN {
+            q = st.a.xyz * q.x + st.b.xyz * q.y + st.c.xyz * q.z
+        } else if st.kind == MAP_SIZE {
+            q = q / st.a.x
+        }
+    }
+    q
+}
+
+/// A distance in the records' frame taken out, innermost step first (`PointMap::distance_out`).
+pub fn placement_out(pl: Placement, d: f32) -> f32 {
+    var x = d
+    for k in 0..MOST_STEPS {
+        let i = MOST_STEPS - 1 - k
+        if i < pl.count && pl.steps[i].kind == MAP_SIZE {
+            x = x * abs(pl.steps[i].a.x)
+        }
+    }
+    x
+}
+
+/// A point in the records' frame taken out to the placed one (the moves undone, innermost first).
+pub fn placement_point_out(pl: Placement, p: vec3) -> vec3 {
+    var q = p
+    for k in 0..MOST_STEPS {
+        let i = MOST_STEPS - 1 - k
+        if i < pl.count {
+            let st = pl.steps[i]
+            if st.kind == MAP_SHIFT {
+                q = q + st.a.xyz
+            } else if st.kind == MAP_TURN {
+                q = vec3(dot(st.a.xyz, q), dot(st.b.xyz, q), dot(st.c.xyz, q))
+            } else if st.kind == MAP_SIZE {
+                q = q * st.a.x
+            }
+        }
+    }
+    q
+}
+
+/// A record moved out by a placement under a join (a part moved within its thing): its ends taken
+/// out, its radii scaled: exact in arithmetic, not to the bit (the field moves the point in).
+pub fn stand_in_placed(pl: Placement, r: StandIn) -> StandIn {
+    if pl.count == 0 || r.family == STAND_IN_NONE {
+        return r
+    }
+    if pl.whole == 0 {
+        return no_stand_in(STAND_IN_STRETCHED)
+    }
+    let s = placement_out(pl, 1.0)
+    StandIn { a: vec4(placement_point_out(pl, r.a.xyz), r.a.w * s), b: vec4(placement_point_out(pl, r.b.xyz), r.b.w * s), reach: r.reach * s, ..r }
+}
 
 /// No stand-in, because of `why`.
 pub fn no_stand_in(why: u32) -> StandIn {
@@ -1195,6 +1331,8 @@ pub fn stand_in_why(why: u32) -> String {
         "carved: under an intersection or a subtraction"
     } else if why == STAND_IN_TOO_DEEP {
         "under more joins than a fold nests (MOST_JOINS)"
+    } else if why == STAND_IN_STRETCHED {
+        "stretched: under a map that isn't a move, a turn or one scale, or more than four"
     } else {
         "it has one"
     }
@@ -1207,9 +1345,14 @@ pub fn stand_in_distance(r: StandIn, p: vec3) -> f32 {
     if r.family == STAND_IN_ROUND_CONE {
         RoundCone { a: r.a.xyz, b: r.b.xyz, r1: r.a.w, r2: r.b.w }.distance(p)
     } else {
-        EMPTY
+        // Not a number, not `EMPTY`: a fold of a part with no record must show (an audit sees a
+        // NaN; `EMPTY` looks like a surface far away).
+        NOT_A_NUMBER
     }
 }
+
+/// A float that is no number: what a fold with nothing to fold gives.
+pub const NOT_A_NUMBER: f32 = bitcast_f32(2143289344)
 
 /// A thing's distance at `p` from its parts' records (`records`, by part) and joins (`joins`,
 /// by node), folding only the `count` parts `members` names, in ascending order: each part's
@@ -1283,7 +1426,8 @@ pub fn stand_in_fold<const M: u32>(records: [StandIn], joins: [Join], members: [
         let up = joins[lane_u(nodes, depth - 1)]
         accs = with_lane(accs, depth - 1, smin(lane(accs, depth - 1), v, up.k))
     }
-    if depth == 1 { accs.x } else { alone }
+    // Nothing folded (no members, or none with a record): not a number, so it shows.
+    if count == 0 { NOT_A_NUMBER } else if depth == 1 { accs.x } else { alone }
 }
 
 fn r_join_k(joins: [Join], r: StandIn) -> f32 {
@@ -2478,7 +2622,8 @@ impl<A: Surface, B: Surface> Surface for Union<A, B> {
     /// then `b`'s), its reach this surface's.
     fn stand_in(self, i: u32) -> StandIn {
         let n = self.a.parts()
-        var r = if i < n { self.a.stand_in(i) } else { self.b.stand_in(i - n) }
+        // An operand's moves are its parts' (a move under this join): taken into its records.
+        var r = if i < n { stand_in_placed(self.a.placement(), self.a.stand_in(i)) } else { stand_in_placed(self.b.placement(), self.b.stand_in(i - n)) }
         if r.family != STAND_IN_NONE {
             r.join = if r.join == NO_JOIN { 0 } else if i < n { r.join + 1 } else { r.join + 1 + self.a.join_count() }
             r.reach = self.part_bound(i).reach
@@ -2498,11 +2643,13 @@ impl<A: Surface, B: Surface> Surface for Union<A, B> {
         if n - 1 < ca {
             var j = self.a.join_of(n - 1)
             j.parent = if j.parent == NO_JOIN { 0 } else { j.parent + 1 }
+            j.k = j.k * placement_out(self.a.placement(), 1.0)
             j
         } else {
             var j = self.b.join_of(n - 1 - ca)
             j.parent = if j.parent == NO_JOIN { 0 } else { j.parent + 1 + ca }
             j.first += self.a.parts()
+            j.k = j.k * placement_out(self.b.placement(), 1.0)
             j
         }
     }
@@ -2622,7 +2769,8 @@ impl<A: Surface, B: Surface> Surface for SmoothUnion<A, B> {
     /// then `b`'s), its reach this surface's.
     fn stand_in(self, i: u32) -> StandIn {
         let n = self.a.parts()
-        var r = if i < n { self.a.stand_in(i) } else { self.b.stand_in(i - n) }
+        // An operand's moves are its parts' (a move under this join): taken into its records.
+        var r = if i < n { stand_in_placed(self.a.placement(), self.a.stand_in(i)) } else { stand_in_placed(self.b.placement(), self.b.stand_in(i - n)) }
         if r.family != STAND_IN_NONE {
             r.join = if r.join == NO_JOIN { 0 } else if i < n { r.join + 1 } else { r.join + 1 + self.a.join_count() }
             r.reach = self.part_bound(i).reach
@@ -2642,11 +2790,13 @@ impl<A: Surface, B: Surface> Surface for SmoothUnion<A, B> {
         if n - 1 < ca {
             var j = self.a.join_of(n - 1)
             j.parent = if j.parent == NO_JOIN { 0 } else { j.parent + 1 }
+            j.k = j.k * placement_out(self.a.placement(), 1.0)
             j
         } else {
             var j = self.b.join_of(n - 1 - ca)
             j.parent = if j.parent == NO_JOIN { 0 } else { j.parent + 1 + ca }
             j.first += self.a.parts()
+            j.k = j.k * placement_out(self.b.placement(), 1.0)
             j
         }
     }
@@ -3027,7 +3177,7 @@ impl<S: Surface, const N: u32> Surface for SmoothUnionAll<S, N> {
             return no_stand_in(STAND_IN_NOT_A_FAMILY)
         }
         let (e, j) = part_of(self.parts, i)
-        var r = self.parts[e].stand_in(j)
+        var r = stand_in_placed(self.parts[e].placement(), self.parts[e].stand_in(j))
         if r.family != STAND_IN_NONE {
             var before: u32 = 0
             for x in 0..N {
@@ -3062,6 +3212,7 @@ impl<S: Surface, const N: u32> Surface for SmoothUnionAll<S, N> {
                 var j = self.parts[x].join_of(m)
                 j.parent = if j.parent == NO_JOIN { 0 } else { j.parent + base }
                 j.first += first
+                j.k = j.k * placement_out(self.parts[x].placement(), 1.0)
                 return j
             }
             m -= c
@@ -3538,6 +3689,13 @@ pub trait PointMap: Copy + GpuData {
     /// `p` in the surface's own space.
     fn local(self, p: vec3) -> vec3
 
+    /// This map as a step of a thing's placement (`Surface::placement`), for a kernel to apply as
+    /// the map does: a move, a turn or a scale; `MAP_OTHER` for any other (no stand-ins through
+    /// it: STRETCHED).
+    fn step(self) -> MapStep {
+        MapStep { kind: MAP_OTHER, a: vec4(0.0), b: vec4(0.0), c: vec4(0.0) }
+    }
+
     /// A direction (a difference of two points) in the surface's own space: the map's linear
     /// part. The default takes the map of the origin from the map of `d`.
     fn local_direction(self, d: vec3) -> vec3 {
@@ -3588,6 +3746,28 @@ fn mapped_part_bound<M: PointMap>(m: M, c: PartBound) -> PartBound {
 }
 
 impl<S: Surface, M: PointMap> Surface for Warp<S, M> {
+    /// Its surface's, unmoved: the move is the placement's (`placement`), applied to the point
+    /// as this surface applies it. Through a map that isn't a move, a turn or one scale: none.
+    fn stand_in(self, i: u32) -> StandIn {
+        if self.placement().whole == 0 {
+            return no_stand_in(STAND_IN_STRETCHED)
+        }
+        self.inner.stand_in(i)
+    }
+
+    fn join_count(self) -> u32 {
+        self.inner.join_count()
+    }
+
+    fn join_of(self, n: u32) -> Join {
+        self.inner.join_of(n)
+    }
+
+    /// This move, then its surface's.
+    fn placement(self) -> Placement {
+        placement_before(self.map.step(), self.inner.placement())
+    }
+
     /// Its surface's own over the box moved in (`PointMap::box_in`), moved out, within its own
     /// (`own_near`).
     fn interval_near(self, b: Box3) -> Interval {
@@ -3718,6 +3898,10 @@ pub struct Shift: Copy + GpuData + Eq + StateHash {
 impl PointMap for Shift {
     const SIMILAR: bool = true
 
+    fn step(self) -> MapStep {
+        MapStep { kind: MAP_SHIFT, a: vec4(self.by, 0.0), b: vec4(0.0), c: vec4(0.0) }
+    }
+
     fn local(self, p: vec3) -> vec3 {
         p - self.by
     }
@@ -3749,6 +3933,11 @@ pub struct Turn: Copy + GpuData + Eq + StateHash {
 
 impl PointMap for Turn {
     const SIMILAR: bool = true
+
+    fn step(self) -> MapStep {
+        let m = self.to_local
+        MapStep { kind: MAP_TURN, a: vec4(m[0], 0.0), b: vec4(m[1], 0.0), c: vec4(m[2], 0.0) }
+    }
 
     /// Column by column, as a derived interval needs (it has no matrix arithmetic).
     fn local(self, p: vec3) -> vec3 {
@@ -3789,6 +3978,10 @@ pub struct Size: Copy + GpuData + Eq + StateHash {
 
 impl PointMap for Size {
     const SIMILAR: bool = true
+
+    fn step(self) -> MapStep {
+        MapStep { kind: MAP_SIZE, a: vec4(self.by, 0.0, 0.0, 0.0), b: vec4(0.0), c: vec4(0.0) }
+    }
 
     fn local(self, p: vec3) -> vec3 {
         p / self.by
@@ -5461,6 +5654,10 @@ impl<S: Surface> Surface for Named<S> {
         self.inner.join_of(n)
     }
 
+    fn placement(self) -> Placement {
+        self.inner.placement()
+    }
+
     const EXACT_MEETS: bool = S::EXACT_MEETS
     const EXACT_PASSES: bool = S::EXACT_PASSES
 
@@ -6075,6 +6272,10 @@ impl<S: Surface, C: Copy + GpuData> Surface for With<S, C> {
         self.inner.join_of(n)
     }
 
+    fn placement(self) -> Placement {
+        self.inner.placement()
+    }
+
     fn part_bound(self, i: u32) -> PartBound {
         self.inner.part_bound(i)
     }
@@ -6497,6 +6698,46 @@ fn a_stand_in_fold_is_the_things_distance_to_the_bit_where_its_promise_holds() {
         }
     }
     assert(near > 500 && few > 5000, f"{near} points near the surface, {few} folds of fewer parts")
+}
+
+/// A placed thing's records come in its own frame, its moves as its placement: the fold of
+/// the records at the point taken in, taken out, is its distance to the bit; and a fold of
+/// nothing is no number.
+@test
+fn a_placed_things_records_fold_through_its_placement_to_the_bit() {
+    let t = stand_in_thing()
+    let turned = std::quat::Quat::axis_angle(normalize(vec3(0.3, 1.0, -0.2)), 0.7)
+    let space = Box3 { lo: vec3(-3.0, -2.0, -3.0), hi: vec3(4.0, 3.0, 4.0) }
+    for kind in 0..3 {
+        // Moved; turned then moved; scaled then moved.
+        let placed_moved = t.translate(vec3(1.5, 0.25, -2.0))
+        let placed_turned = t.rotate(turned).translate(vec3(-0.5, 0.0, 1.0))
+        let placed_scaled = t.scale(1.7).translate(vec3(0.1, 0.2, 0.3))
+        var records = [no_stand_in(0); 6]
+        var joins = [t.join_of(0), t.join_of(1)]
+        var pl = NO_PLACEMENT
+        for i in 0..6 {
+            records[i] = if kind == 0 { placed_moved.stand_in(i) } else if kind == 1 { placed_turned.stand_in(i) } else { placed_scaled.stand_in(i) }
+        }
+        for n in 0..2 {
+            joins[n] = if kind == 0 { placed_moved.join_of(n) } else if kind == 1 { placed_turned.join_of(n) } else { placed_scaled.join_of(n) }
+        }
+        pl = if kind == 0 { placed_moved.placement() } else if kind == 1 { placed_turned.placement() } else { placed_scaled.placement() }
+        assert(pl.whole == 1 && pl.count == (if kind == 0 { 1 } else { 2 }), f"placement {kind}: {pl.count} steps")
+        let all = [0, 1, 2, 3, 4, 5]
+        for i in 0..5000 {
+            let p = space.sample(11, i)
+            let f = if kind == 0 { placed_moved.distance(p) } else if kind == 1 { placed_turned.distance(p) } else { placed_scaled.distance(p) }
+            let g = placement_out(pl, stand_in_fold(records, joins, all, 6, placement_local(pl, p)))
+            assert(bitcast_u32(g) == bitcast_u32(f), f"placement {kind} at ({p.x}, {p.y}, {p.z}): {g} against {f}")
+        }
+    }
+    // A thing with nothing to fold: no number.
+    let none: [u32; 1] = [0]
+    let g = stand_in_fold([no_stand_in(STAND_IN_NOT_A_FAMILY)], [Join { k: 0.0, parent: NO_JOIN, first: 0, count: 1 }], none, 0, vec3(0.0))
+    assert(g != g, "a fold of no members is no number")
+    let h = stand_in_fold([no_stand_in(STAND_IN_NOT_A_FAMILY)], [Join { k: 0.0, parent: NO_JOIN, first: 0, count: 1 }], none, 1, vec3(0.0))
+    assert(h != h, "a fold of a part with no record is no number")
 }
 
 /// A blob of every primitive, smooth-unioned, and displaced by noise: what std's field tests
