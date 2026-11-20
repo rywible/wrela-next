@@ -18,7 +18,7 @@ use std::collections::Vec
 use std::derive::{Box3, Interval, UNBOUNDED_WORK, affine, gradient, interval, plus_work, reads_only_input, tape, value_and_gradient, work}
 use std::stage::Tape
 use std::quat::Quat
-use std::hash::{StateHash, pcg, state_hash}
+use std::hash::{Hasher, StateHash, pcg, state_hash}
 use std::mem::debug_build
 use std::gpu::{R32Float, Texture3dHandle}
 
@@ -7580,4 +7580,96 @@ fn every_surface_s_search_for_where_it_can_be_closes() {
     let h = half_space(vec3(0.0, 1.0, 0.0), 0.0)
     assert(h.bound().radius >= 1.0e30, "a half-space states no bound")
     assert(searched_radius(h) < 0.0, "a half-space's search doesn't close")
+}
+
+/// A seeded stream of numbers for `written_corpus` (`pcg` of a counter): the same everywhere.
+struct CorpusDraw {
+    n: u32,
+}
+
+impl CorpusDraw {
+    fn word(mut self) -> u32 {
+        self.n += 1
+        pcg(self.n.wrapping_mul(2654435761).wrapping_add(12345))
+    }
+
+    /// In `lo..hi`.
+    fn number(mut self, lo: f32, hi: f32) -> f32 {
+        lo + (hi - lo) * f32(self.word() >> 8) / 16777216.0
+    }
+
+    fn point(mut self, r: f32) -> vec3 {
+        vec3(self.number(lo: -r, hi: r), self.number(lo: -r, hi: r), self.number(lo: -r, hi: r))
+    }
+}
+
+/// A seeded written field: two to four leaves of every kind, each perhaps moved, turned or
+/// scaled, joined by every kind of join, the whole perhaps displaced.
+fn corpus_field(d: mut CorpusDraw) -> Written {
+    var w = writing()
+    let leaves = 2 + d.word() % 3
+    var acc: u32 = 0
+    for i in 0..leaves {
+        let k = d.word() % 5
+        let m = d.word() % 4
+        var n = if k == 0 { w.sphere(d.number(lo: 0.1, hi: 0.6), matter: m) } else if k == 1 { w.ellipsoid(vec3(d.number(lo: 0.1, hi: 0.5), d.number(lo: 0.1, hi: 0.5), d.number(lo: 0.1, hi: 0.5)), matter: m) } else if k == 2 { w.round_cone(d.point(0.5), d.point(0.5), r_top: d.number(lo: 0.05, hi: 0.3), r_bottom: d.number(lo: 0.05, hi: 0.3), matter: m) } else if k == 3 { w.cuboid(vec3(d.number(lo: 0.1, hi: 0.5), d.number(lo: 0.1, hi: 0.5), d.number(lo: 0.1, hi: 0.5)), matter: m) } else { w.half_space(normalize(d.point(1.0) + vec3(0.0, 0.01, 0.0)), d.number(lo: -0.5, hi: 0.5), matter: m) }
+        let map = d.word() % 4
+        if map == 1 {
+            n = w.translate(n, d.point(0.5))
+        } else if map == 2 {
+            n = w.rotate(n, Quat::axis_angle(normalize(d.point(1.0) + vec3(0.01, 0.0, 0.0)), d.number(lo: -3.0, hi: 3.0)))
+        } else if map == 3 {
+            n = w.scale(n, d.number(lo: 0.5, hi: 2.0))
+        }
+        if i == 0 {
+            acc = n
+        } else {
+            let j = d.word() % 5
+            let k2 = d.number(lo: 0.01, hi: 0.3)
+            acc = if j == 0 { w.union(acc, n) } else if j == 1 { w.smooth_union(acc, n, k2) } else if j == 2 { w.intersect(acc, n) } else if j == 3 { w.smooth_subtract(acc, n, k2) } else { w.smooth_intersect(acc, n, k2) }
+        }
+    }
+    if d.word() % 3 == 0 {
+        let _ = w.displace(acc, amp: d.number(lo: 0.0, hi: 0.05), freq: d.number(lo: 1.0, hi: 8.0), octaves: 1 + d.word() % 4)
+    }
+    w.done().unwrap()
+}
+
+/// The written evaluator's answers over a seeded corpus, hashed: 20 written fields of every
+/// kind of node, each asked its distance, the part that decides it and its matter at 5,000
+/// points (10^5 in all). `@deterministic`: the compiler checks everything the evaluator
+/// reaches (strict floats, std's transcendentals, nothing that depends on the machine).
+@deterministic
+fn written_corpus() -> (u64, u64) {
+    var d = CorpusDraw { n: 0 }
+    var h = Hasher::new()
+    // Each kind of node the corpus holds, a bit each.
+    var kinds: u64 = 0
+    for f in 0..20 {
+        let w = corpus_field(mut d)
+        for k in 0..w.len {
+            kinds = kinds | (1 << w.nodes[k].kind)
+        }
+        for i in 0..5000 {
+            let p = d.point(1.5)
+            let (v, part) = w.part_at(p)
+            h.write_u32(bitcast_u32(w.distance(p)))
+            h.write_u32(bitcast_u32(v))
+            h.write_u32(part)
+            h.write_u32(w.matter_at(p))
+        }
+    }
+    (h.finish(), kinds)
+}
+
+/// The written evaluator gives the same answers to the bit on every machine (L d): its corpus's
+/// hash (`written_corpus`) is a constant, which `tools/check` checks on the M4 and on the
+/// Linux machine alike, each in the native host's WASM.
+@test
+fn a_written_corpus_hashes_the_same_on_every_machine() {
+    let (h, kinds) = written_corpus()
+    for k in [W_SPHERE, W_ELLIPSOID, W_ROUND_CONE, W_CUBOID, W_HALF_SPACE, W_TRANSLATE, W_ROTATE, W_SCALE, W_UNION, W_SMOOTH_UNION, W_INTERSECT, W_SMOOTH_SUBTRACT, W_SMOOTH_INTERSECT, W_DISPLACE] {
+        assert((kinds >> k) & 1 == 1, f"the corpus holds no node of kind {k}")
+    }
+    assert(h == 7093420595702503661, f"the written corpus hashes to {h}")
 }
