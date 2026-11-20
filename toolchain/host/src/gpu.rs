@@ -855,9 +855,11 @@ struct Job {
     /// made.
     frame: usize,
     call: usize,
-    /// What of passes it holds: a piece alone (`alone`), or light passes among other work.
+    /// What of passes it holds: a piece alone (`alone`), or light passes among other work; and
+    /// whether it holds dispatches.
     pieces: Vec<Piece>,
     alone: bool,
+    dispatches: bool,
 }
 
 /// What of a pass's draws a submission holds: a pass that took an eighth of the line or less
@@ -882,20 +884,37 @@ struct Piece {
 
 /// What a pass's draws cost, by its label: the most a draw took (a piece's time over its draws)
 /// in the last frame measured and in the one being measured (ms), by the host's count of frames
-/// (`Gpu::calls`); whether it's to be measured alone again (it was drawn as a light pass in
-/// a submission that took long), and when it last was.
+/// (`Gpu::calls`), and the worst it has taken lately (falling a tenth a frame: a pass whose
+/// draws are cheap some frames and heavy others, the engine's reference bands over sky and
+/// over things, is costed by its heavy frames); whether it's to be measured alone again (it was
+/// drawn as a light pass in a submission that took long), and when it last was.
 #[derive(Clone, Copy, Debug, Default)]
 struct Cost {
     call: usize,
     last: f64,
     now: f64,
+    worst: f64,
     again: bool,
     alone: usize,
 }
 
 impl Cost {
     fn per_draw(self) -> f64 {
-        self.last.max(self.now)
+        self.last.max(self.now).max(self.worst)
+    }
+
+    /// Moved on to frame `call` (`Gpu::calls`): the last frame's worst kept, falling.
+    fn at(&mut self, call: usize) {
+        if call > self.call {
+            let fall = 0.9f64.powi((call - self.call).min(64) as i32);
+            *self = Cost {
+                call,
+                last: self.now,
+                now: 0.0,
+                worst: self.worst.max(self.now) * fall,
+                ..*self
+            };
+        }
     }
 }
 
@@ -2355,7 +2374,9 @@ impl Gpu {
                 Some(p) => (true, vec![p]),
                 None => (false, std::mem::take(&mut self.job_light)),
             };
-            self.jobs.push_back(Job { index, frame: self.frame, call: self.calls, pieces, alone });
+            let dispatches = queued.bound_ms > 0.0;
+            let job = Job { index, frame: self.frame, call: self.calls, pieces, alone, dispatches };
+            self.jobs.push_back(job);
         }
         self.measure()?;
         self.largest.commands = self.largest.commands.max(queued.commands);
@@ -2421,20 +2442,30 @@ impl Gpu {
         self.measured.push((job.alone.then(|| job.pieces[0].clone()), ms));
         let line = self.line_ms;
         if !job.alone {
+            // Light passes that took long together: each is measured alone at its next drawing
+            // (at once where the submission held nothing else, else at most once in
+            // `AGAIN_AFTER` frames: dispatches may be what took long); over the line, each is
+            // costed as if it took the whole of it, so none shares a submission again until it
+            // is measured alone.
             if ms > LIGHT_JOB * line {
                 for p in &job.pieces {
                     let c = self.costs.entry(p.label.clone()).or_default();
-                    if job.call >= c.alone + AGAIN_AFTER {
+                    c.at(job.call);
+                    if !job.dispatches || job.call >= c.alone + AGAIN_AFTER {
                         c.again = true;
+                    }
+                    if ms > line {
+                        c.worst = c.worst.max(ms / f64::from(p.of.max(1)));
                     }
                 }
             }
-            if ms > 2.0 * line {
-                let passes: Vec<&str> = job.pieces.iter().map(|p| &*p.label).collect();
+            // A submission of dispatches is held to two lines by their bounds: past them, a
+            // bound didn't hold. (Passes that grew past what they took are cut from next time.)
+            if ms > 2.0 * line && job.pieces.is_empty() {
                 return Err(Error::Gpu(format!(
                     "a submission of frame {} held the GPU {ms:.1} ms, over twice the line of \
-                     {line:.0} ms (AGENTS.md, rule 2), with the passes {passes:?}. The run stops \
-                     here: a dispatch's bound didn't hold it, or a pass grew past what it took",
+                     {line:.0} ms (AGENTS.md, rule 2), with no passes. The run stops here: a \
+                     dispatch's bound didn't hold it",
                     job.frame
                 )));
             }
@@ -2443,9 +2474,7 @@ impl Gpu {
         let p = &job.pieces[0];
         let n = p.draws.len().max(1) as f64;
         let c = self.costs.entry(p.label.clone()).or_default();
-        if job.call > c.call {
-            *c = Cost { call: job.call, last: c.now, now: 0.0, ..*c };
-        }
+        c.at(job.call);
         c.now = c.now.max(ms / n);
         c.again = false;
         c.alone = job.call;
@@ -4480,6 +4509,27 @@ mod tests {
         gpu.measure()
     }
 
+    /// Four passes labelled `label` in one frame, each one draw of `instances` triangles over the
+    /// whole of texture 2 (kept), then its frame's end, waited for and measured.
+    fn passes_frame(gpu: &mut Gpu, label: &str, instances: u32) -> Result<()> {
+        use crate::program::Executor;
+        for _ in 0..4 {
+            gpu.execute(&Command::Label { name: label })?;
+            gpu.execute(&Command::BeginPass(Pass::one(2, true, [0.0; 4])))?;
+            gpu.execute(&Command::Draw {
+                pipeline: 0,
+                vertices: 3,
+                instances,
+                bindings: Vec::new(),
+                uniforms: &[],
+            })?;
+            gpu.execute(&Command::EndPass)?;
+        }
+        gpu.end_frame()?;
+        wait(&gpu.device)?;
+        gpu.measure()
+    }
+
     /// The pieces of the heavy pass measured since the last take: how many draws each held, and
     /// its time (ms); and the most any other submission took.
     fn heavy_jobs(gpu: &mut Gpu, label: &str) -> (Vec<(u32, f64)>, f64) {
@@ -4575,6 +4625,58 @@ mod tests {
             image(&mut gpu);
         }
         assert!(packed, "draws measured are drawn a few to a piece");
+
+        // Passes of whole draws of the size above (about half a millisecond), timed by an eighth
+        // of a pass of eight's (a submission's own cost, a tenth of a millisecond on the Radeon,
+        // spread over them): a line of 16 of them (at most 12 ms, so nothing here runs long), a
+        // heavy pass 9 of them (0.56 of the line, with room for the GPU's clock; four of them two
+        // lines and more), a cheap one 1.
+        let line = gpu.line_ms;
+        for _ in 0..2 {
+            passes_frame(&mut gpu, "unit", 8 * instances).unwrap();
+        }
+        let mut unit: Vec<f64> = std::mem::take(&mut gpu.measured)
+            .into_iter()
+            .filter(|(p, _)| p.as_ref().is_some_and(|p| &*p.label == "unit"))
+            .map(|(_, ms)| ms)
+            .collect();
+        unit.sort_by(f64::total_cmp);
+        let unit = unit[unit.len() / 2] / 8.0;
+        gpu.line_ms = (16.0 * unit).min(12.0);
+        let big = ((0.5625 * gpu.line_ms / unit).round() as u32).max(2) * instances;
+        eprintln!(
+            "a unit {unit:.3} ms: the line {:.2} ms, a heavy pass {big} triangles",
+            gpu.line_ms
+        );
+        // Four heavy passes in one frame: each a job of its own (first seen, and then by what
+        // each took), none over the line.
+        for _ in 0..3 {
+            passes_frame(&mut gpu, "four", big).unwrap();
+        }
+        let jobs_all = std::mem::take(&mut gpu.measured);
+        assert!(jobs_all.iter().all(|(_, ms)| *ms <= gpu.line_ms), "{jobs_all:?}");
+        // Four passes cheap for three frames (sharing a submission), then heavy: the frame they
+        // grow in holds them in one job over the line (over two: what ended the engine's judged
+        // run), once; the run goes on, and every job after it is under the line, each pass
+        // measured alone.
+        for _ in 0..3 {
+            passes_frame(&mut gpu, "grows", instances).unwrap();
+        }
+        let shared = std::mem::take(&mut gpu.measured);
+        assert!(shared.iter().any(|(p, _)| p.is_none()), "cheap passes share a submission");
+        passes_frame(&mut gpu, "grows", big).unwrap();
+        let grew = std::mem::take(&mut gpu.measured);
+        let most = grew.iter().map(|(_, ms)| *ms).fold(0.0, f64::max);
+        eprintln!(
+            "the frame they grew in: its longest job {most:.2} ms, the line {:.2}",
+            gpu.line_ms
+        );
+        for _ in 0..3 {
+            passes_frame(&mut gpu, "grows", big).unwrap();
+        }
+        let after = std::mem::take(&mut gpu.measured);
+        assert!(after.iter().all(|(_, ms)| *ms <= gpu.line_ms), "{after:?}");
+        gpu.line_ms = line;
 
         // Forced into seven pieces of uneven draws: the same image.
         gpu.forced = Some((Some("heavy".to_string()), 7));
