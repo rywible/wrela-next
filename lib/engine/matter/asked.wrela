@@ -126,15 +126,16 @@ pub const LEAST_UNSURE: u32 = 4
 ///   before `until`, passed (or gone through, which the march passed by); past it, nothing;
 /// - a field that answers only by its bound: unsure where that bound comes within `SURE` widths.
 /// The facing is the field's gradient at the least place, over `stated` as the value is (the
-/// envelope theorem turns it onto the screen: the least's change with the pixel).
-pub fn least_by<M: Field<Substance>>(field: M, o: vec3, d: vec3, until: f32, spread: f32, stated: f32) -> Least {
+/// envelope theorem turns it onto the screen: the least's change with the pixel). Its values are
+/// `far`'s: the field's own, or a moving thing's over the parts its ray comes near (`Rayed`).
+pub fn least_by<M: Field<Substance>, F: Copy + fn(vec3) -> f32>(field: M, far: F, o: vec3, d: vec3, until: f32, spread: f32, stated: f32) -> Least {
     let p0 = field.passes(o, d)
     if !p0.exact() && !(p0.blend > 0.0) {
         let t = max(p0.t, 1.0e-3)
         let state = if p0.distance / stated > SURE * spread * t { LEAST_NONE } else { LEAST_UNSURE }
         return Least { t, g: p0.distance / stated, n: vec3(0.0), state }
     }
-    let at = field.distance(o + d * until) / stated
+    let at = far(o + d * until) / stated
     if at <= 0.5 * spread * until {
         // Its own: on from the hit by steps that double (from a tenth of the ray's width, or the
         // value there, the more) until the value rises again; then the least between the last
@@ -143,14 +144,14 @@ pub fn least_by<M: Field<Substance>>(field: M, o: vec3, d: vec3, until: f32, spr
         var fa = at
         var step = max(abs(at), 0.1 * spread * until)
         var tb = until + step
-        var fb = field.distance(o + d * tb) / stated
+        var fb = far(o + d * tb) / stated
         var tc = tb
         var fc = fb
         if fb < fa {
             for _k in 0..LEAST_STEPS {
                 step = 2.0 * step
                 tc = tb + step
-                fc = field.distance(o + d * tc) / stated
+                fc = far(o + d * tc) / stated
                 if fc >= fb {
                     break
                 }
@@ -171,7 +172,7 @@ pub fn least_by<M: Field<Substance>>(field: M, o: vec3, d: vec3, until: f32, spr
         var g = fb
         for _k in 0..LEAST_SECTIONS {
             let u = if t - lo > hi - t { t - 0.381966 * (t - lo) } else { t + 0.381966 * (hi - t) }
-            let fu = field.distance(o + d * u) / stated
+            let fu = far(o + d * u) / stated
             if fu < g {
                 if u < t { hi = t } else { lo = t }
                 t = u
@@ -182,7 +183,7 @@ pub fn least_by<M: Field<Substance>>(field: M, o: vec3, d: vec3, until: f32, spr
         }
         return Least { t, g, n: field.gradient(o + d * t) / stated, state: LEAST_SHOWN }
     }
-    let p = p0.refined(o, d, |q: vec3| field.distance(q), 0.5 * spread * max(p0.t, 1.0e-3))
+    let p = p0.refined(o, d, far, 0.5 * spread * max(p0.t, 1.0e-3))
     if p.t > until {
         return Least { t: p.t, g: p.distance / stated, n: vec3(0.0), state: LEAST_NONE }
     }
@@ -194,6 +195,9 @@ pub fn least_by<M: Field<Substance>>(field: M, o: vec3, d: vec3, until: f32, spr
 /// least, and golden sections within (`least_by`); and how near, in the ray's widths, a pass that
 /// is only a bound says nothing.
 const LEAST_STEPS: u32 = 12
+/// How far from its ray (its widths) a part is asked for a moving thing's least (`Rayed::least`):
+/// past the outline's reach (`pixels::REACH`, 1.5) and the ray's half width, with a width to spare.
+const OUTLINE_REACH: f32 = 3.0
 const LEAST_SECTIONS: u32 = 10
 const SURE: f32 = 2.0
 
@@ -392,7 +396,8 @@ impl<M: Field<Substance>, const W: u32> Asked for Lone<M, W> {
     }
 
     fn least(self, o: vec3, d: vec3, until: f32, spread: f32) -> Least {
-        least_by(self.field, o, d, until, spread, self.grid.stated)
+        let f = self.field
+        least_by(f, |q: vec3| f.distance(q), o, d, until, spread, self.grid.stated)
     }
 
     fn told(self, walk: Within, p: vec3, size: f32) -> Told {
@@ -858,7 +863,8 @@ impl<M: Field<Substance>, const W: u32> Asked for Seen<M, W> {
     }
 
     fn least(self, o: vec3, d: vec3, until: f32, spread: f32) -> Least {
-        least_by(self.field, o, d, until, spread, self.grid.stated)
+        let f = self.field
+        least_by(f, |q: vec3| f.distance(q), o, d, until, spread, self.grid.stated)
     }
 
     fn told(self, walk: Within, p: vec3, size: f32) -> Told {
@@ -987,6 +993,20 @@ impl<M: Field<Substance>> Asked for Rayed<M> {
     }
 
     fn least(self, o: vec3, d: vec3, until: f32, spread: f32) -> Least {
-        least_by(self.field, o, d, until, spread, self.grid.stated)
+        // (Over the parts its stretch through the box comes within the outline's reach of, and
+        // the ray's half width: a part left out is farther than an outline can be drawn from
+        // (`pixels::REACH` widths), where the thing's value is its own without that part.)
+        let g = self.grid
+        let box = box_span(o, d, g.lo, g.hi)
+        let near = max(box.x, 0.0)
+        if box.y < near {
+            return Least { t: box.y, g: 1.0e9, n: vec3(0.0), state: LEAST_NONE }
+        }
+        let live = live_along(self.field, o + d * near, o + d * box.y, OUTLINE_REACH * spread * box.y)
+        if !live.any(0, self.field.parts()) {
+            return Least { t: box.y, g: 1.0e9, n: vec3(0.0), state: LEAST_NONE }
+        }
+        let f = self.field
+        least_by(f, |q: vec3| f.distance_live(q, live), o, d, until, spread, g.stated)
     }
 }
