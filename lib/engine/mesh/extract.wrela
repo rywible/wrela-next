@@ -10,7 +10,7 @@
 
 use matter::substance::Substance
 use std::collections::Vec
-use std::derive::Box3
+use std::derive::{Box3, value_and_gradient}
 use std::field::{ALL_LIVE, Field, Live}
 use std::gpu::{
     Append, AppendBuffer, Atomics, DispatchArgs, DrawIndexedArgs, GlobalId, GpuBuffer, GpuSpan,
@@ -24,7 +24,7 @@ use std::io::Pending
 pub const BRICK: u32 = 6
 const CORNERS_BRICK: u32 = 512
 const VERTS_BRICK: u32 = 343
-/// Padded vertex-index stride per brick (6 workgroups × 64 lanes = 384) so `extract_verts` writes
+/// Padded vertex-index stride per brick (6 workgroups × 64 lanes = 384) so `classify_cells` writes
 /// directly via `Slots[id]` with 256-byte chunk span alignment.
 const VERTS_STRIDE: u32 = 384
 const EDGES_BRICK: u32 = 216
@@ -36,6 +36,9 @@ const CHUNK_BRICKS: u32 = 1024
 const CULL_CHUNK: u32 = 8192
 /// Maximum sharp-crease cells refined per chunk (`(bi << 9) | cell`, 32 KB).
 const CAP_CREASES: u32 = 8192
+/// Every cell of a full chunk (`(bi << 9) | cell`, 1.4 MB): the compacted list of sign-changing
+/// cells can never overflow, so no surface cell is ever dropped.
+const CAP_SURF: u32 = CHUNK_BRICKS * VERTS_BRICK
 
 /// One extracted surface vertex (80 bytes, std430-aligned, zero padding):
 ///   `pos`:    `(world_x, world_y, world_z, smooth_flag)` (`1.0` smooth, `0.0` sharp crease)
@@ -65,8 +68,8 @@ pub struct GridSpec: Copy + GpuData {
     pub base_brick: u32,
 }
 
-/// Tightens a thing's bounding sphere into a tight axis-aligned box on the CPU using `field.interval`
-/// (8 binary-search steps per face = 48 cheap interval queries).
+/// Tightens a thing's bounding sphere into a tight axis-aligned box on the CPU using
+/// `field.interval_near` (8 binary-search steps per face = 48 Lipschitz-narrowed interval queries).
 pub fn tight_aabb<M: Field<Substance>>(field: M) -> Box3 {
     let b = field.bound()
     let r = min(b.radius, 1.0e4)
@@ -77,7 +80,7 @@ pub fn tight_aabb<M: Field<Substance>>(field: M) -> Box3 {
     var c = hi.x
     for _step in 0..8 {
         let mid = 0.5 * (a + c)
-        let iv = field.interval(Box3 { lo: vec3(lo.x, lo.y, lo.z), hi: vec3(mid, hi.y, hi.z) })
+        let iv = field.interval_near(Box3 { lo: vec3(lo.x, lo.y, lo.z), hi: vec3(mid, hi.y, hi.z) })
         if iv.lo > 0.0 || iv.hi < 0.0 { a = mid } else { c = mid }
     }
     lo.x = a
@@ -85,7 +88,7 @@ pub fn tight_aabb<M: Field<Substance>>(field: M) -> Box3 {
     c = hi.x
     for _step in 0..8 {
         let mid = 0.5 * (a + c)
-        let iv = field.interval(Box3 { lo: vec3(mid, lo.y, lo.z), hi: vec3(hi.x, hi.y, hi.z) })
+        let iv = field.interval_near(Box3 { lo: vec3(mid, lo.y, lo.z), hi: vec3(hi.x, hi.y, hi.z) })
         if iv.lo > 0.0 || iv.hi < 0.0 { c = mid } else { a = mid }
     }
     hi.x = c
@@ -94,7 +97,7 @@ pub fn tight_aabb<M: Field<Substance>>(field: M) -> Box3 {
     c = hi.y
     for _step in 0..8 {
         let mid = 0.5 * (a + c)
-        let iv = field.interval(Box3 { lo: vec3(lo.x, lo.y, lo.z), hi: vec3(hi.x, mid, hi.z) })
+        let iv = field.interval_near(Box3 { lo: vec3(lo.x, lo.y, lo.z), hi: vec3(hi.x, mid, hi.z) })
         if iv.lo > 0.0 || iv.hi < 0.0 { a = mid } else { c = mid }
     }
     lo.y = a
@@ -102,7 +105,7 @@ pub fn tight_aabb<M: Field<Substance>>(field: M) -> Box3 {
     c = hi.y
     for _step in 0..8 {
         let mid = 0.5 * (a + c)
-        let iv = field.interval(Box3 { lo: vec3(lo.x, mid, lo.z), hi: vec3(hi.x, hi.y, hi.z) })
+        let iv = field.interval_near(Box3 { lo: vec3(lo.x, mid, lo.z), hi: vec3(hi.x, hi.y, hi.z) })
         if iv.lo > 0.0 || iv.hi < 0.0 { c = mid } else { a = mid }
     }
     hi.y = c
@@ -111,7 +114,7 @@ pub fn tight_aabb<M: Field<Substance>>(field: M) -> Box3 {
     c = hi.z
     for _step in 0..8 {
         let mid = 0.5 * (a + c)
-        let iv = field.interval(Box3 { lo: vec3(lo.x, lo.y, lo.z), hi: vec3(hi.x, hi.y, mid) })
+        let iv = field.interval_near(Box3 { lo: vec3(lo.x, lo.y, lo.z), hi: vec3(hi.x, hi.y, mid) })
         if iv.lo > 0.0 || iv.hi < 0.0 { a = mid } else { c = mid }
     }
     lo.z = a
@@ -119,7 +122,7 @@ pub fn tight_aabb<M: Field<Substance>>(field: M) -> Box3 {
     c = hi.z
     for _step in 0..8 {
         let mid = 0.5 * (a + c)
-        let iv = field.interval(Box3 { lo: vec3(lo.x, lo.y, mid), hi: vec3(hi.x, hi.y, hi.z) })
+        let iv = field.interval_near(Box3 { lo: vec3(lo.x, lo.y, mid), hi: vec3(hi.x, hi.y, hi.z) })
         if iv.lo > 0.0 || iv.hi < 0.0 { c = mid } else { a = mid }
     }
     hi.z = c
@@ -321,23 +324,18 @@ fn corner_val(
     }
 }
 
-/// Pass 2: Solves one Dual Contouring QEF vertex per sign-changing cell (`7×7×7 = 343` cells per
-/// active brick) using ONLY the cell's own 8 corners (guaranteed bit-for-bit identical across
-/// adjacent brick halos so meshes are 100% watertight with zero seam cracks), applies 1 exact
-/// Newton snap step onto the field zero-isosurface, and stores exact analytic normal + substance.
+/// Pass 2a: Classifies every cell of a chunk (`7×7×7 = 343` per brick) from its 8 corner signs,
+/// clears its vertex slot, and appends only the sign-changing cells to a dense list, so the
+/// expensive QEF solve, Newton snap and channel evaluation run on full SIMD groups instead of
+/// paying for every scattered surface cell across each 64-lane group of mostly empty cells.
 @compute(64)
-fn extract_verts<M: Field<Substance>>(
-    fields: [M],
-    grids: [GridSpec],
-    active: [ActiveBrick],
+fn classify_cells(
     active_count: [u32],
     cap_bricks: u32,
-    cap_verts: u32,
     chunk_start: u32,
     corners: [f32],
     cell_verts: mut Slots<u32>,
-    verts: mut Append<MeshVertex>,
-    creases: mut Append<u32>,
+    surf: mut Append<u32>,
     id: GlobalId,
 ) {
     // 6 workgroups of 64 = 384 lanes per brick (covering 343 cells).
@@ -348,6 +346,49 @@ fn extract_verts<M: Field<Substance>>(
     if bi >= total || cell >= VERTS_BRICK {
         return
     }
+    cell_verts[id] = NONE
+    let cz = cell / 49
+    let rem = cell - cz * 49
+    let cy = rem / 7
+    let cx = rem - cy * 7
+    let cbase = bi * CORNERS_BRICK
+    var neg: u32 = 0
+    for k in 0..8 {
+        if cdist(corners, cbase, cx + (k & 1), cy + ((k >> 1) & 1), cz + (k >> 2)) < 0.0 {
+            neg += 1
+        }
+    }
+    if neg != 0 && neg != 8 {
+        let _ = surf.push((bi << 9) | cell)
+    }
+}
+
+/// Pass 2b: Solves one Dual Contouring QEF vertex per compacted sign-changing cell using ONLY the
+/// cell's own 8 corners (guaranteed bit-for-bit identical across adjacent brick halos so meshes
+/// are 100% watertight with zero seam cracks), applies 1 exact Newton snap step onto the field
+/// zero-isosurface, and stores exact analytic normal + substance. Sharp crease cells are handed
+/// to `refine_creases` instead (one vertex per cell); if its list is full they are solved here.
+@compute(64)
+fn solve_verts<M: Field<Substance>>(
+    fields: [M],
+    grids: [GridSpec],
+    active: [ActiveBrick],
+    corners: [f32],
+    surf: [u32],
+    surf_count: [u32],
+    cap_verts: u32,
+    cell_verts: mut Atomics<u32>,
+    verts: mut Append<MeshVertex>,
+    creases: mut Append<u32>,
+    id: GlobalId,
+) {
+    let n_surf = min(surf_count[0], CAP_SURF)
+    if id.x >= n_surf {
+        return
+    }
+    let packed = surf[id.x]
+    let bi = packed >> 9
+    let cell = packed & 511
     let cz = cell / 49
     let rem = cell - cz * 49
     let cy = rem / 7
@@ -361,19 +402,6 @@ fn extract_verts<M: Field<Substance>>(
     let d101 = cdist(corners, cbase, cx + 1, cy, cz + 1)
     let d011 = cdist(corners, cbase, cx, cy + 1, cz + 1)
     let d111 = cdist(corners, cbase, cx + 1, cy + 1, cz + 1)
-    var mask: u32 = 0
-    if d000 < 0.0 { mask = mask | 1 }
-    if d100 < 0.0 { mask = mask | 2 }
-    if d010 < 0.0 { mask = mask | 4 }
-    if d110 < 0.0 { mask = mask | 8 }
-    if d001 < 0.0 { mask = mask | 16 }
-    if d101 < 0.0 { mask = mask | 32 }
-    if d011 < 0.0 { mask = mask | 64 }
-    if d111 < 0.0 { mask = mask | 128 }
-    if mask == 0 || mask == 255 {
-        cell_verts[id] = NONE
-        return
-    }
 
     let ab = active[bi]
     let b = ab.coord
@@ -438,6 +466,14 @@ fn extract_verts<M: Field<Substance>>(
         }
     }
 
+    // Sharp crease/corner cells get their one vertex from exact Hermite edge refinement in a
+    // separate compacted pass, so smooth cells keep minimal registers and zero divergence.
+    if min_dot < 0.78 {
+        if creases.push(packed) < CAP_CREASES {
+            return
+        }
+    }
+
     let inv_c = 1.0 / max(f32(count), 1.0)
     let mp = mass * inv_c
     let mp_rel = mp - half
@@ -473,7 +509,9 @@ fn extract_verts<M: Field<Substance>>(
     var wp = cell_lo + uvw_qef * h
 
     // 1-step exact Newton projection onto the field zero-isosurface (stays clamped inside cell).
-    let (dv, gv) = f.sample(wp)
+    // Only the brick's live parts are asked: bit for bit the full distance inside the brick.
+    let live = ab.live
+    let (dv, gv) = value_and_gradient(|q| f.distance_live(q, live), wp)
     let g2 = dot(gv, gv)
     if g2 > 1.0e-8 {
         let step = clamp(dv / g2, -0.75 * h, 0.75 * h)
@@ -493,20 +531,17 @@ fn extract_verts<M: Field<Substance>>(
         normal: vec4(n_final, sub.roughness),
         albedo: vec4(sub.albedo, sub.metallic),
         emits: vec4(sub.emits, sub.ior),
-        optics: vec4(sub.transmission, sub.subsurface, sub.coat, 0.0),
+        optics: vec4(sub.transmission, sub.subsurface, sub.coat, sub.micro),
     })
-    cell_verts[id] = if vi < cap_verts { vi } else { NONE }
-    // Enqueue sharp crease/corner cells for exact Hermite edge refinement in a separate compacted
-    // pass so smooth cells keep minimal registers and zero warp divergence.
-    if min_dot < 0.78 && vi < cap_verts {
-        let _ = creases.push((bi << 9) | cell)
+    if vi < cap_verts {
+        cell_verts.store(i: bi * VERTS_STRIDE + cell, value: vi)
     }
 }
 
-/// Prepares indirect dispatch args for `refine_creases` (clamped to `CAP_CREASES`).
+/// Prepares indirect dispatch args for a 64-wide pass over a compacted list (clamped to `cap`).
 @compute(1)
-fn prep_creases(crease_count: [u32], args: mut One<DispatchArgs>, id: GlobalId) {
-    let n = min(crease_count[0], CAP_CREASES)
+fn prep_list(count: [u32], cap: u32, args: mut One<DispatchArgs>, id: GlobalId) {
+    let n = min(count[0], cap)
     args.set(id, DispatchArgs { x: (n + 63) / 64, y: 1, z: 1 })
 }
 
@@ -663,7 +698,7 @@ fn refine_creases<M: Field<Substance>>(
         normal: vec4(n_final, sub.roughness),
         albedo: vec4(sub.albedo, sub.metallic),
         emits: vec4(sub.emits, sub.ior),
-        optics: vec4(sub.transmission, sub.subsurface, sub.coat, 0.0),
+        optics: vec4(sub.transmission, sub.subsurface, sub.coat, sub.micro),
     })
     if vi < cap_verts {
         cell_verts.store(i: bi * VERTS_STRIDE + cell, value: vi)
@@ -864,6 +899,7 @@ pub struct MeshBatch {
     pub cell_verts: GpuBuffer<u32>,
     pub verts: AppendBuffer<MeshVertex>,
     pub creases: AppendBuffer<u32>,
+    pub surf: AppendBuffer<u32>,
     pub indices: GpuBuffer<u32>,
     pub trans_indices: GpuBuffer<u32>,
     pub tri_count: GpuBuffer<u32>,
@@ -872,6 +908,7 @@ pub struct MeshBatch {
     pub eval_args: GpuBuffer<DispatchArgs>,
     pub vert_args: GpuBuffer<DispatchArgs>,
     pub crease_args: GpuBuffer<DispatchArgs>,
+    pub surf_args: GpuBuffer<DispatchArgs>,
     pub quad_args: GpuBuffer<DispatchArgs>,
     pub cap_bricks: u32,
     pub cap_verts: u32,
@@ -883,6 +920,10 @@ pub struct MeshBatch {
     pub bound: vec4,
     pub has_trans: bool,
     trans_poll: Option<Pending<u32>>,
+    est_bricks: u32,
+    last_total_bricks: u32,
+    last_chunk_limit: u32,
+    active_poll: Option<Pending<u32>>,
     /// Per-thing temporal tier assignment for multi-tier `Many` batches (0 = near/60Hz, 1 = far even, 2 = far odd).
     pub tiers: Vec<u32>,
 }
@@ -899,6 +940,7 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
         cell_verts: buffer(max_bricks * VERTS_STRIDE),
         verts: append_buffer(cap_verts),
         creases: append_buffer(CAP_CREASES),
+        surf: append_buffer(CAP_SURF),
         indices: buffer(cap_indices),
         trans_indices: buffer(cap_trans),
         tri_count: buffer_of([0, 0]),
@@ -907,6 +949,7 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
         eval_args: buffer_of([DispatchArgs { x: 0, y: 1, z: 1 }]),
         vert_args: buffer_of([DispatchArgs { x: 0, y: 1, z: 1 }]),
         crease_args: buffer_of([DispatchArgs { x: 0, y: 1, z: 1 }]),
+        surf_args: buffer_of([DispatchArgs { x: 0, y: 1, z: 1 }]),
         quad_args: buffer_of([DispatchArgs { x: 0, y: 1, z: 1 }]),
         cap_bricks: max_bricks,
         cap_verts,
@@ -918,11 +961,40 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
         bound: vec4(0.0),
         has_trans: true,
         trans_poll: None,
+        est_bricks: 0,
+        last_total_bricks: 0,
+        last_chunk_limit: 0,
+        active_poll: None,
         tiers: Vec::new(),
     }
 }
 
 impl MeshBatch {
+    /// Non-blocking poll of `active.count()` so animated batches never dispatch empty trailing
+    /// extraction chunks (0 ms stall; expands back to full capacity automatically if saturated).
+    fn poll_active(mut self) {
+        match mut self.active_poll {
+            Some(p) => match p.poll() {
+                Some(Ok(c)) => {
+                    if c.len() >= 1 {
+                        let got = c[0]
+                        if self.last_chunk_limit > 0 && got >= self.last_chunk_limit {
+                            self.est_bricks = 0
+                        } else {
+                            self.est_bricks = max(got + got / 3 + 192, 1)
+                        }
+                    }
+                    self.active_poll = None
+                },
+                Some(Err(_)) => {
+                    self.active_poll = None
+                },
+                None => {},
+            },
+            None => {},
+        }
+    }
+
     /// Non-blocking poll of `tri_count[1]` to know whether this batch has any transmissive
     /// triangles (0 ms stall; defaults to `true` on frame 0 so refraction never skips a frame).
     pub fn poll_trans(mut self) -> bool {
@@ -991,9 +1063,13 @@ impl MeshBatch {
             if c <= 0.0 {
                 continue
             }
-            let b = fields[i].bound()
-            let r = min(b.radius, 1.0e4)
-            let aabb = Box3 { lo: b.centre - vec3(r), hi: b.centre + vec3(r) }
+            let aabb = if N <= 32 {
+                tight_aabb(fields[i])
+            } else {
+                let b = fields[i].bound()
+                let r = min(b.radius, 1.0e4)
+                Box3 { lo: b.centre - vec3(r), hi: b.centre + vec3(r) }
+            }
             let g = grid_for(aabb, c, total_bricks)
             total_bricks += g.dims.x * g.dims.y * g.dims.z
             grids.push(g)
@@ -1059,9 +1135,20 @@ impl MeshBatch {
             first += n
         }
 
-        // Passes 1–3: Extract in bounded chunks of `CHUNK_BRICKS` active bricks (never more chunks
-        // than `total_bricks` could possibly populate).
-        let max_chunks_bricks = min(self.cap_bricks, total_bricks)
+        // Passes 1–3: Extract in bounded chunks of `CHUNK_BRICKS` active bricks, using our
+        // non-blocking `active_poll` estimate to skip trailing empty chunks on animated objects.
+        self.poll_active()
+        if total_bricks > self.last_total_bricks + self.last_total_bricks / 2 + 256 {
+            self.est_bricks = 0
+        }
+        self.last_total_bricks = total_bricks
+        let hard_cap = min(self.cap_bricks, total_bricks)
+        let max_chunks_bricks = if self.est_bricks > 0 {
+            min(hard_cap, ((self.est_bricks + CHUNK_BRICKS - 1) / CHUNK_BRICKS) * CHUNK_BRICKS)
+        } else {
+            hard_cap
+        }
+        self.last_chunk_limit = max_chunks_bricks
         var chunk_start: u32 = 0
         while chunk_start < max_chunks_bricks {
             let chunk_n = min(self.cap_bricks - chunk_start, CHUNK_BRICKS)
@@ -1090,26 +1177,47 @@ impl MeshBatch {
                 most: chunk_n * 8,
             )
             self.creases.clear()
+            self.surf.clear()
             dispatch(
-                extract_verts.bind(
-                    fields: fields,
-                    grids: grids,
-                    active: self.active.items(),
+                classify_cells.bind(
                     active_count: self.active.count(),
                     cap_bricks: self.cap_bricks,
-                    cap_verts: self.cap_verts,
                     chunk_start: chunk_start,
                     corners: self.corners.items(),
                     cell_verts: self.cell_verts.span_mut(start: chunk_start * VERTS_STRIDE, count: chunk_n * VERTS_STRIDE),
-                    verts: mut self.verts,
-                    creases: mut self.creases,
+                    surf: mut self.surf,
                 ),
                 groups: self.vert_args.at(0),
                 most: chunk_n * 6,
             )
             dispatch(
-                prep_creases.bind(
-                    crease_count: self.creases.count(),
+                prep_list.bind(
+                    count: self.surf.count(),
+                    cap: CAP_SURF,
+                    args: mut self.surf_args,
+                ),
+                over: 1,
+            )
+            dispatch(
+                solve_verts.bind(
+                    fields: fields,
+                    grids: grids,
+                    active: self.active.items(),
+                    corners: self.corners.items(),
+                    surf: self.surf.items(),
+                    surf_count: self.surf.count(),
+                    cap_verts: self.cap_verts,
+                    cell_verts: mut self.cell_verts,
+                    verts: mut self.verts,
+                    creases: mut self.creases,
+                ),
+                groups: self.surf_args.at(0),
+                most: CAP_SURF / 64,
+            )
+            dispatch(
+                prep_list.bind(
+                    count: self.creases.count(),
+                    cap: CAP_CREASES,
                     args: mut self.crease_args,
                 ),
                 over: 1,
@@ -1163,6 +1271,12 @@ impl MeshBatch {
         match self.trans_poll {
             None => {
                 self.trans_poll = Some(read(self.tri_count.items()))
+            },
+            Some(_) => {},
+        }
+        match self.active_poll {
+            None => {
+                self.active_poll = Some(read(self.active.count()))
             },
             Some(_) => {},
         }

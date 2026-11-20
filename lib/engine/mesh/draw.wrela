@@ -11,7 +11,8 @@ use matter::sky::{Sky, seen}
 use matter::substance::{
     ONE_OVER_PI, Substance, env_brdf_approx, fresnel_schlick_rough,
 }
-use matter::world::{And, Many, One}
+use matter::swarm::{NoSwarm, Swarm}
+use matter::world::{And, Many, One, World}
 use mesh::extract::{MeshBatch, MeshVertex, mesh_batch}
 use mesh::height::{CLIP_RINGS, CLIP_VERTS, MeshVary, height_vs}
 use mesh::light::{
@@ -19,6 +20,7 @@ use mesh::light::{
     contact_shadow, eval_emitters, ign, radiance_cache, shadow_view, sky_background, sky_cache,
     sky_irradiance, sky_specular, spec_cone, sun_shadow, sun_shadow_csm, sun_vis_point, trace_ssr,
 }
+use mesh::swarm::{SwarmSim, swarm_fs, swarm_shadow_vs, swarm_sim, swarm_vs}
 use mesh::volume::{
     BloomPyramid, FroxelVolume, bloom_pyramid, froxel_volume, hdr_tone_fs,
 }
@@ -100,7 +102,72 @@ fn vary_substance(vary: MeshVary) -> Substance {
         transmission: clamp(vary.optics.x, 0.0, 1.0),
         subsurface: clamp(vary.optics.y, 0.0, 1.0),
         coat: clamp(vary.optics.z, 0.0, 1.0),
+        micro: clamp(vary.optics.w, 0.0, 1.0),
+        micro_freq: 1.0,
+        pad0: 0.0,
+        pad1: 0.0,
     }
+}
+
+/// Fast 3D hash-free trigonometric micro-relief field & analytic gradient (zero textures, zero UV
+/// seams): perturbs surface normal, roughness, and subtle grain contrast ONLY when `sub.micro > 0.01`.
+fn micro_field_grad(p: vec3) -> vec4 {
+    // 2 rotated isotropic 3D wave octaves (cheap GPU SFU sin/cos, zero lattice artifacts).
+    let p1 = p * 5.2
+    let p2 = vec3(p.x * 13.7 + p.z * 7.1, p.y * 15.3 - p.x * 6.4, p.z * 14.1 + p.y * 8.2)
+    let p3 = vec3(p.x * 31.0 - p.y * 19.0, p.y * 29.0 + p.z * 17.0, p.z * 33.0 + p.x * 15.0)
+    let v1 = sin(p1.x) * cos(p1.y) * sin(p1.z)
+    let g1 = vec3(
+        cos(p1.x) * cos(p1.y) * sin(p1.z) * 5.2,
+        -sin(p1.x) * sin(p1.y) * sin(p1.z) * 5.2,
+        sin(p1.x) * cos(p1.y) * cos(p1.z) * 5.2,
+    )
+    let v2 = sin(p2.x) * sin(p2.y) * cos(p2.z) * 0.45
+    let g2 = vec3(
+        (cos(p2.x) * sin(p2.y) * cos(p2.z) * 13.7 - sin(p2.x) * cos(p2.y) * cos(p2.z) * 6.4) * 0.45,
+        (sin(p2.x) * cos(p2.y) * cos(p2.z) * 15.3 - sin(p2.x) * sin(p2.y) * sin(p2.z) * 8.2) * 0.45,
+        (cos(p2.x) * sin(p2.y) * cos(p2.z) * 7.1 - sin(p2.x) * sin(p2.y) * sin(p2.z) * 14.1) * 0.45,
+    )
+    let v3 = sin(p3.x) * cos(p3.y) * sin(p3.z) * 0.18
+    let g3 = vec3(
+        (cos(p3.x) * cos(p3.y) * sin(p3.z) * 31.0 + sin(p3.x) * cos(p3.y) * cos(p3.z) * 15.0) * 0.18,
+        (-cos(p3.x) * cos(p3.y) * sin(p3.z) * 19.0 - sin(p3.x) * sin(p3.y) * sin(p3.z) * 29.0) * 0.18,
+        (-sin(p3.x) * sin(p3.y) * sin(p3.z) * 17.0 + sin(p3.x) * cos(p3.y) * cos(p3.z) * 33.0) * 0.18,
+    )
+    vec4(g1 + g2 + g3, v1 + v2 + v3)
+}
+
+/// Applies per-pixel 3D field-space microsurface relief (normal bump + roughness/albedo micro-grain)
+/// with automatic distance attenuation so distant surfaces never alias.
+fn apply_micro_relief(wp: vec3, n: vec3, sub: Substance, dist: f32) -> (vec3, Substance) {
+    if sub.micro <= 0.01 {
+        return (n, sub)
+    }
+    let fade = clamp(1.0 - (dist - 4.0) / 28.0, 0.0, 1.0)
+    if fade <= 0.01 {
+        return (n, sub)
+    }
+    let mg = micro_field_grad(wp)
+    let amp = sub.micro * fade
+    // Project 3D gradient onto tangent plane so surface normal tilts physically without flipping.
+    // Wet/coated films naturally fill stone micro-pores, keeping clearcoat reflections crisp.
+    let g_tan = mg.xyz - n * dot(mg.xyz, n)
+    let bump_s = if sub.coat > 0.2 { 0.024 } else { 0.045 }
+    let n_bumped = normalize(n - g_tan * (amp * bump_s))
+    let grain = clamp(mg.w, -1.0, 1.0)
+    let albedo_mod = clamp(sub.albedo * (1.0 + grain * amp * 0.14), vec3(0.01), vec3(1.0))
+    let rough_mod = clamp(sub.roughness + grain * amp * 0.12, 0.03, 1.0)
+    // Wet puddles subtly vary clearcoat across basalt flagstones.
+    let coat_mod = if sub.coat > 0.1 { clamp(sub.coat + grain * amp * 0.25, 0.0, 1.0) } else { sub.coat }
+    (
+        n_bumped,
+        Substance {
+            albedo: albedo_mod,
+            roughness: rough_mod,
+            coat: coat_mod,
+            ..sub
+        },
+    )
 }
 
 /// Resolves crease-preserving shading normal from interpolated analytic normal and face derivatives.
@@ -160,8 +227,9 @@ fn mesh_direct_fs<S: Sky>(
     let to_eye = v.at - vary.wp
     let dist = length(to_eye)
     let ray_back = if dist > 1.0e-6 { to_eye / dist } else { -v.forward }
-    let n = resolve_normal(vary, ray_back)
-    let sub = vary_substance(vary)
+    let n0 = resolve_normal(vary, ray_back)
+    let sub0 = vary_substance(vary)
+    let (n, sub) = apply_micro_relief(vary.wp, n0, sub0, dist)
 
     let sun = sky.sun()
     let ndl = max(dot(n, sun.way), 0.0)
@@ -389,8 +457,9 @@ fn mesh_trans_fs<S: Sky>(
     let to_eye = v.at - vary.wp
     let dist = length(to_eye)
     let ray_back = if dist > 1.0e-6 { to_eye / dist } else { -v.forward }
-    let n = resolve_normal(vary, ray_back)
-    let sub = vary_substance(vary)
+    let n0 = resolve_normal(vary, ray_back)
+    let sub0 = vary_substance(vary)
+    let (n, sub) = apply_micro_relief(vary.wp, n0, sub0, dist)
     let ndv = max(dot(n, ray_back), 0.001)
 
     let uv = pixel.position.xy / max(v.size, vec2(1.0))
@@ -718,6 +787,7 @@ pub struct MeshSight {
     pub rad: RadianceCache,
     pub vol: FroxelVolume,
     pub bloom: BloomPyramid,
+    pub swarm: SwarmSim,
     batches: Vec<MeshBatch>,
     shadow_near: DepthTexture,
     shadow_far: DepthTexture,
@@ -746,6 +816,7 @@ pub fn mesh_sight(gi: bool = true) -> MeshSight {
         rad: radiance_cache(),
         vol: froxel_volume(),
         bloom: bloom_pyramid(),
+        swarm: swarm_sim(),
         batches: Vec::new(),
         shadow_near: depth_texture(width: SHADOW_SIDE, height: SHADOW_SIDE),
         shadow_far: depth_texture(width: SHADOW_SIDE, height: SHADOW_SIDE),
@@ -782,11 +853,12 @@ impl MeshSight {
         }
     }
 
-    /// Updates Sky PMREM, syncs meshlets, renders dual-cascade sun shadows, and updates the
-    /// camera-focused radiance volume & dynamic local emitters (0 ms when world/sun are unchanged).
-    fn prepare_and_shadow<W: MeshWorld, S: Sky>(
+    /// Updates Sky PMREM, syncs meshlets, steps `swarm` against `world.field()`, renders
+    /// dual-cascade sun shadows, and updates the camera-focused radiance volume & dynamic emitters.
+    fn prepare_and_shadow<W: World + MeshWorld, Sw: Swarm, S: Sky>(
         mut self,
         world: W,
+        swarm: Sw,
         sky: S,
         eye: Eye,
         width: u32,
@@ -801,6 +873,7 @@ impl MeshSight {
         let nb = world.batch_count()
         self.ensure_batches(nb)
         world.sync_batches(mut self.batches, 0, v, frame)
+        self.swarm.update(swarm, world.field())
 
         var wlo = vec3(1.0e20)
         var whi = vec3(-1.0e20)
@@ -828,7 +901,7 @@ impl MeshSight {
             ShadowView { radius: -1.0, ..sv_far }
         }
 
-        // Pass 1: Unified sun shadow map (far world cascade + high-res near cascade when world is large).
+        // Pass 1: Unified sun shadow map (far world cascade + high-res near cascade + swarm shadows).
         label("mesh_shadow")
         let sp_far: DepthOnlyPass = begin_depth_pass(mut self.shadow_far, clear_depth: 1.0, keep_depth: false)
         for i in 0..nb {
@@ -842,6 +915,27 @@ impl MeshSight {
                 depth_bias: DepthBias { constant: 2, slope: 1.5, clamp: 0.0 },
                 depth: Depth { compare: Compare::Less, write: true },
             )
+        }
+        if self.swarm.count > 0 {
+            if self.swarm.front_is_a {
+                draw(
+                    sp_far,
+                    swarm_shadow_vs.bind(grains: self.swarm.a.items(), sv: sv_far),
+                    shadow_fs,
+                    vertices: 6,
+                    instances: self.swarm.count,
+                    depth: Depth { compare: Compare::Less, write: true },
+                )
+            } else {
+                draw(
+                    sp_far,
+                    swarm_shadow_vs.bind(grains: self.swarm.b.items(), sv: sv_far),
+                    shadow_fs,
+                    vertices: 6,
+                    instances: self.swarm.count,
+                    depth: Depth { compare: Compare::Less, write: true },
+                )
+            }
         }
         sp_far.end()
         if use_near {
@@ -858,6 +952,27 @@ impl MeshSight {
                     depth: Depth { compare: Compare::Less, write: true },
                 )
             }
+            if self.swarm.count > 0 {
+                if self.swarm.front_is_a {
+                    draw(
+                        sp_near,
+                        swarm_shadow_vs.bind(grains: self.swarm.a.items(), sv: sv_near),
+                        shadow_fs,
+                        vertices: 6,
+                        instances: self.swarm.count,
+                        depth: Depth { compare: Compare::Less, write: true },
+                    )
+                } else {
+                    draw(
+                        sp_near,
+                        swarm_shadow_vs.bind(grains: self.swarm.b.items(), sv: sv_near),
+                        shadow_fs,
+                        vertices: 6,
+                        instances: self.swarm.count,
+                        depth: Depth { compare: Compare::Less, write: true },
+                    )
+                }
+            }
             sp_near.end()
         } else if frame == 0 {
             // Initialize near cascade layout once so Vulkan validation sees a valid depth image.
@@ -866,11 +981,14 @@ impl MeshSight {
         }
 
         // Pass 1b: Camera-focused radiance cache & dynamic local emitters.
-        // Skips rebuild completely (0 ms/frame) when static world, sun, and grid origin are unchanged.
+        // Skips rebuild completely (0 ms/frame) when static world, sun, swarm, and grid are unchanged.
         let rad_centre = if wrad > 16.0 { focus } else { wmid }
         let rad_rad = min(wrad, 16.0)
         sun.way.state_hash(mut rk)
         rad_centre.state_hash(mut rk)
+        if self.swarm.count > 0 {
+            frame.state_hash(mut rk)
+        }
         let rkey = rk.finish()
         if !self.gi {
             self.rad.begin(rad_centre, rad_rad, enabled: false)
@@ -890,6 +1008,9 @@ impl MeshSight {
                     self.cmp,
                 )
             }
+            if self.swarm.count > 0 {
+                self.swarm.inject_radiance(swarm, self.rad.grid, mut self.rad.accum, mut self.rad.emit_accum)
+            }
             self.rad.finish()
             self.rad_key = rkey
             self.rad_built = true
@@ -899,7 +1020,7 @@ impl MeshSight {
 
     /// Renders `world` into `self.drawn` (`colour`, `place`, `sun`) without presenting (for
     /// judging against `Reference`).
-    pub fn drawn_only<W: MeshWorld, S: Sky, L: Look>(
+    pub fn drawn_only<W: World + MeshWorld, S: Sky, L: Look>(
         mut self,
         world: W,
         sky: S,
@@ -908,7 +1029,7 @@ impl MeshSight {
         width: u32,
         height: u32,
     ) {
-        let (nb, v, _sv_near, sv_far, _use_near) = self.prepare_and_shadow(world, sky, eye, width, height, 0)
+        let (nb, v, _sv_near, sv_far, _use_near) = self.prepare_and_shadow(world, NoSwarm {}, sky, eye, width, height, 0)
 
         label("mesh_eye")
         let ep: MsaaDepthPass3<Rgba16Float, Rgba32Float, R8> = begin_pass3_msaa_with_depth(
@@ -981,21 +1102,22 @@ impl MeshSight {
         self.drawn.placed = true
     }
 
-    /// Renders `world` (`Surface`s), `height` (`Height` clipmap), and `medium` (`Medium` froxels)
-    /// through ONE depth buffer, ONE light store, half-res bilateral GI + SSR + contact shadows,
-    /// unified refraction, froxel volumetrics, optical HDR bloom, and ONE `Look::tone` pass.
-    pub fn draw_all<W: MeshWorld, H: Height, Med: Medium, S: Sky, L: Look>(
+    /// Renders a complete scene (`world` solids, `height` clipmap, `medium` froxels, and `swarm`
+    /// field-colliding GPU grains) through ONE depth buffer, ONE light store, half-res bilateral
+    /// GI + SSR + contact shadows, unified refraction, optical HDR bloom, and ONE `Look::tone` pass.
+    pub fn draw_scene<W: World + MeshWorld, H: Height, Med: Medium, Sw: Swarm, S: Sky, L: Look>(
         mut self,
         world: W,
         height: H,
         medium: Med,
+        swarm: Sw,
         sky: S,
         look: L,
         eye: Eye,
         width: u32,
         height_px: u32,
     ) {
-        let (nb, v, sv_near, sv_far, _use_near) = self.prepare_and_shadow(world, sky, eye, width, height_px, self.frame)
+        let (nb, v, sv_near, sv_far, _use_near) = self.prepare_and_shadow(world, swarm, sky, eye, width, height_px, self.frame)
         self.frame += 1
 
         // Pass 2: Lean 4× hardware MSAA opaque direct HDR + compact `Rgba8` G-buffer pass.
@@ -1057,6 +1179,45 @@ impl MeshSight {
                 cull: Cull::Back,
                 depth: Depth { compare: Compare::Greater, write: true },
             )
+        }
+        if self.swarm.count > 0 {
+            if self.swarm.front_is_a {
+                draw(
+                    ep,
+                    swarm_vs.bind(swarm: swarm, grains: self.swarm.a.items(), v: v, near_plane: NEAR),
+                    swarm_fs.bind(
+                        v: v,
+                        sv_far: sv_far,
+                        rad_grid: self.rad.grid,
+                        sky: sky,
+                        sm_far: self.shadow_far,
+                        cmp: self.cmp,
+                        emitters: self.rad.emitters.items(),
+                        emitter_count: self.rad.emitters.count(),
+                    ),
+                    vertices: 6,
+                    instances: self.swarm.count,
+                    depth: Depth { compare: Compare::Greater, write: true },
+                )
+            } else {
+                draw(
+                    ep,
+                    swarm_vs.bind(swarm: swarm, grains: self.swarm.b.items(), v: v, near_plane: NEAR),
+                    swarm_fs.bind(
+                        v: v,
+                        sv_far: sv_far,
+                        rad_grid: self.rad.grid,
+                        sky: sky,
+                        sm_far: self.shadow_far,
+                        cmp: self.cmp,
+                        emitters: self.rad.emitters.items(),
+                        emitter_count: self.rad.emitters.count(),
+                    ),
+                    vertices: 6,
+                    instances: self.swarm.count,
+                    depth: Depth { compare: Compare::Greater, write: true },
+                )
+            }
         }
         draw(
             ep,
@@ -1259,7 +1420,7 @@ impl MeshSight {
     }
 
     /// Renders `world` (`Surface`s only) into `self.drawn` and presents it to the screen.
-    pub fn draw<W: MeshWorld, S: Sky, L: Look>(
+    pub fn draw<W: World + MeshWorld, S: Sky, L: Look>(
         mut self,
         world: W,
         sky: S,
@@ -1268,6 +1429,6 @@ impl MeshSight {
         width: u32,
         height: u32,
     ) {
-        self.draw_all(world, NoHeight {}, NoMedium {}, sky, look, eye, width, height)
+        self.draw_scene(world, NoHeight {}, NoMedium {}, NoSwarm {}, sky, look, eye, width, height)
     }
 }

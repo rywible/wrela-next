@@ -1,0 +1,477 @@
+// GPU field-driven discrete matter swarm solver (`SwarmSim`): simulates up to `SWARM_CAP` (65,536)
+// physical grains/shards/sparks on the GPU with exact analytical `World` SDF collision (`distance`
+// fast-path + `sample` normal on contact), injects luminous grains into the unified radiance
+// volume + dynamic local emitters, casts real shadows into the unified sun shadow maps, and
+// rasterises 3D shaded impostors directly into the unified 4× MSAA HDR + G-buffer eye pass.
+
+use matter::sky::Sky
+use matter::substance::Substance
+use matter::swarm::Swarm
+use mesh::light::{Emitter, RadGrid, ShadowView, eval_emitters_fast, sun_vis_point}
+use picture::eye::View
+use std::field::{Field, hash_u32}
+use std::gpu::{
+    Atomics, ClipPosition, ComparisonSampler, DepthTexture, GlobalId, GpuBuffer, InstanceIndex,
+    Slots, Targets3, VertexIndex, buffer, discard, dispatch, label,
+}
+
+/// Maximum number of simulated grains in one `SwarmSim` (65,536 grains × 48 B = 3.1 MB per buffer).
+pub const SWARM_CAP: u32 = 65536
+
+/// Per-grain GPU state (48 bytes, std430-aligned).
+pub struct Grain: Copy + GpuData {
+    /// `(world_x, world_y, world_z, radius)`.
+    pub pos_r: vec4,
+    /// `(vel_x, vel_y, vel_z, age_s)` (`age_s < 0.0` while waiting for staggered emission).
+    pub vel_age: vec4,
+    /// `(max_life_s, seed_hash_01, alive_flag, pad)`.
+    pub meta: vec4,
+}
+
+/// Interpolants for physically shaded 3D grain impostors inside `mesh_eye`.
+pub struct SwarmVary: Copy {
+    pub clip: ClipPosition,
+    pub wp: vec3,
+    pub uv: vec2,
+    pub albedo: vec3,
+    pub emits: vec3,
+    pub pbr: vec4,
+    pub optics: vec4,
+}
+
+/// Deterministic float hash in `[0, 1)` from grain index `i`.
+fn grain_hash(i: u32) -> f32 {
+    f32(hash_u32(i ^ 0x9e3779b9) & 16777215) / 16777216.0
+}
+
+/// Pass 0: Spawns grains from `swarm.seed_at(id.x)` into `dst` (runs only when `swarm.epoch()` changes).
+@compute(64)
+fn swarm_spawn<Sw: Swarm>(
+    swarm: Sw,
+    count: u32,
+    dst: mut Slots<Grain>,
+    id: GlobalId,
+) {
+    if id.x >= count {
+        return
+    }
+    let s = swarm.seed_at(id.x)
+    let delay = max(swarm.seed_delay(id.x), 0.0)
+    let alive = if s.life > 0.0 && s.radius > 1.0e-5 { 1.0 } else { 0.0 }
+    dst[id] = Grain {
+        pos_r: vec4(s.pos, max(s.radius, 0.0)),
+        vel_age: vec4(s.vel, -delay),
+        meta: vec4(max(s.life, 0.0), grain_hash(id.x), alive, 0.0),
+    }
+}
+
+/// Pass 1: Advances every grain under `swarm.force_at` + aerodynamic drag and resolves exact
+/// analytical collisions against `world_field` (`distance` fast check, `sample` gradient on contact).
+@compute(64)
+@budget(work: 24000)
+fn swarm_step<Sw: Swarm, F: Field<Substance>>(
+    swarm: Sw,
+    world_field: F,
+    count: u32,
+    src: [Grain],
+    dst: mut Slots<Grain>,
+    id: GlobalId,
+) {
+    if id.x >= count {
+        return
+    }
+    let g = src[id.x]
+    if g.meta.z < 0.5 {
+        dst[id] = g
+        return
+    }
+    let dt = clamp(swarm.step_dt(), 0.001, 0.05)
+    let age = g.vel_age.w + dt
+    // Waiting for staggered emission delay.
+    if age < 0.0 {
+        dst[id] = Grain {
+            pos_r: g.pos_r,
+            vel_age: vec4(g.vel_age.xyz, age),
+            meta: g.meta,
+        }
+        return
+    }
+    let life = g.meta.x
+    if age >= life {
+        if swarm.looping() {
+            let s = swarm.seed_at(id.x)
+            let alive = if s.life > 0.0 && s.radius > 1.0e-5 { 1.0 } else { 0.0 }
+            dst[id] = Grain {
+                pos_r: vec4(s.pos, max(s.radius, 0.0)),
+                vel_age: vec4(s.vel, 0.0),
+                meta: vec4(max(s.life, 0.0), g.meta.y, alive, 0.0),
+            }
+        } else {
+            dst[id] = Grain { pos_r: g.pos_r, vel_age: vec4(0.0, 0.0, 0.0, age), meta: vec4(life, g.meta.y, 0.0, 0.0) }
+        }
+        return
+    }
+
+    var pos = g.pos_r.xyz
+    let r = g.pos_r.w
+    var vel = g.vel_age.xyz
+    let h = g.meta.y
+
+    let acc = swarm.force_at(pos, vel, age, h)
+    let damp = exp(-max(swarm.drag(), 0.0) * dt)
+    vel = vel * damp + acc * dt
+    pos = pos + vel * dt
+
+    // Exact analytical World SDF collision: fast 1-eval distance test, full gradient only on contact.
+    let d0 = world_field.distance(pos)
+    if d0 < r {
+        let (d, grad) = world_field.sample(pos)
+        let gl2 = dot(grad, grad)
+        let n = if gl2 > 1.0e-10 { grad * (1.0 / sqrt(gl2)) } else { vec3(0.0, 1.0, 0.0) }
+        pos = pos + n * (r - d + 0.002)
+        let vn = dot(vel, n)
+        if vn < 0.0 {
+            let vt = vel - n * vn
+            let rest = clamp(swarm.restitution(), 0.0, 0.95)
+            // Coulomb friction slows sliding grains into natural sand drifts on floors & steps.
+            vel = vt * 0.74 - n * (vn * rest)
+        }
+    }
+
+    dst[id] = Grain {
+        pos_r: vec4(pos, r),
+        vel_age: vec4(vel, age),
+        meta: vec4(life, h, 1.0, 0.0),
+    }
+}
+
+/// Injects luminous grains into the unified radiance cache (`rad_accum`) and dynamic emitter bins
+/// (`emit_accum`) so glowing transmutation clouds light surrounding stone walls and mist in real time.
+@compute(64)
+fn swarm_inject_rad<Sw: Swarm>(
+    swarm: Sw,
+    grains: [Grain],
+    count: u32,
+    grid: RadGrid,
+    accum: mut Atomics<u32>,
+    emit_accum: mut Atomics<u32>,
+    id: GlobalId,
+) {
+    let gi = id.x * 4
+    if gi >= count {
+        return
+    }
+    let g = grains[gi]
+    if g.meta.z < 0.5 || g.vel_age.w < 0.0 {
+        return
+    }
+    let pos = g.pos_r.xyz
+    let sub = swarm.substance_at(pos, g.vel_age.xyz, g.vel_age.w, g.meta.y)
+    let peak = max(sub.emits.x, max(sub.emits.y, sub.emits.z))
+    if peak <= 0.2 {
+        return
+    }
+    let uvw = (pos - grid.origin) * grid.inv_span
+    if uvw.x < 0.0 || uvw.x >= 1.0 || uvw.y < 0.0 || uvw.y >= 1.0 || uvw.z < 0.0 || uvw.z >= 1.0 {
+        return
+    }
+    let vx = min(u32(uvw.x * 64.0), 63)
+    let vy = min(u32(uvw.y * 64.0), 63)
+    let vz = min(u32(uvw.z * 64.0), 63)
+    let idx = (vx + (vy << 6) + (vz << 12)) * 4
+    let boost = sub.emits * 0.45
+    let _ = accum.add(idx, u32(clamp(boost.x * 256.0, 0.0, 2000000.0)))
+    let _ = accum.add(idx + 1, u32(clamp(boost.y * 256.0, 0.0, 2000000.0)))
+    let _ = accum.add(idx + 2, u32(clamp(boost.z * 256.0, 0.0, 2000000.0)))
+    let _ = accum.add(idx + 3, 1)
+
+    if peak > 12.0 {
+        let ex = min(u32(uvw.x * 8.0), 7)
+        let ey = min(u32(uvw.y * 4.0), 3)
+        let ez = min(u32(uvw.z * 8.0), 7)
+        let eidx = (ex + (ey << 3) + (ez << 5)) * 8
+        let _ = emit_accum.add(eidx, u32(clamp(uvw.x * 4095.0, 0.0, 4095.0)))
+        let _ = emit_accum.add(eidx + 1, u32(clamp(uvw.y * 4095.0, 0.0, 4095.0)))
+        let _ = emit_accum.add(eidx + 2, u32(clamp(uvw.z * 4095.0, 0.0, 4095.0)))
+        let _ = emit_accum.add(eidx + 3, u32(clamp(sub.emits.x * 16.0, 0.0, 65535.0)))
+        let _ = emit_accum.add(eidx + 4, u32(clamp(sub.emits.y * 16.0, 0.0, 65535.0)))
+        let _ = emit_accum.add(eidx + 5, u32(clamp(sub.emits.z * 16.0, 0.0, 65535.0)))
+        let _ = emit_accum.add(eidx + 6, 1)
+    }
+}
+
+/// Shadow-map vertex shader for `Swarm` grains (billboarded toward the sun).
+@vertex
+pub fn swarm_shadow_vs(
+    grains: [Grain],
+    sv: ShadowView,
+    vi: VertexIndex,
+    ii: InstanceIndex,
+) -> ClipPosition {
+    let g = grains[ii.index]
+    if g.meta.z < 0.5 || g.vel_age.w < 0.0 || g.pos_r.w <= 1.0e-5 {
+        return ClipPosition { position: vec4(0.0, 0.0, 0.0, 0.0) }
+    }
+    let c = vi.index
+    let sx = if c == 1 || c == 2 || c == 4 { 1.0 } else { -1.0 }
+    let sy = if c == 2 || c == 4 || c == 5 { 1.0 } else { -1.0 }
+    let r = g.pos_r.w * 1.1
+    let wp = g.pos_r.xyz + sv.u * (sx * r) + sv.v * (sy * r)
+    let d = wp - sv.centre
+    let px = dot(d, sv.u) / sv.radius
+    let py = dot(d, sv.v) / sv.radius
+    let pz = (sv.radius - dot(d, sv.w)) / (2.0 * sv.radius)
+    ClipPosition { position: vec4(px, py, pz, 1.0) }
+}
+
+/// Eye-pass vertex shader for physically shaded 3D grain impostors (velocity-stretched when fast,
+/// crisp spheres/shards when slow, matching `View::ray` bit-for-bit with reversed-Z depth).
+@vertex
+pub fn swarm_vs<Sw: Swarm>(
+    swarm: Sw,
+    grains: [Grain],
+    v: View,
+    near_plane: f32,
+    vi: VertexIndex,
+    ii: InstanceIndex,
+) -> SwarmVary {
+    let g = grains[ii.index]
+    if g.meta.z < 0.5 || g.vel_age.w < 0.0 || g.pos_r.w <= 1.0e-5 {
+        return SwarmVary {
+            clip: ClipPosition { position: vec4(0.0, 0.0, 0.0, 0.0) },
+            wp: vec3(0.0),
+            uv: vec2(0.0),
+            albedo: vec3(0.0),
+            emits: vec3(0.0),
+            pbr: vec4(1.0, 0.0, 1.0, 1.0),
+            optics: vec4(0.0),
+        }
+    }
+    let c = vi.index
+    let ux = if c == 1 || c == 2 || c == 4 { 1.0 } else { -1.0 }
+    let uy = if c == 2 || c == 4 || c == 5 { 1.0 } else { -1.0 }
+
+    let pos = g.pos_r.xyz
+    let vel = g.vel_age.xyz
+    let r = g.pos_r.w
+    let rel_c = pos - v.at
+    let zc = dot(rel_c, v.forward)
+    // Ensure tiny sand grains stay at least ~1.1 screen pixels wide so they shimmer crisply without vanishing.
+    let min_r = max(zc * v.pixel() * 0.65, r)
+
+    // Subtle velocity stretch along camera-plane velocity projection for flying shards & sparks.
+    let speed = length(vel)
+    let v_cam_x = dot(vel, v.right)
+    let v_cam_y = dot(vel, v.up)
+    let v2 = v_cam_x * v_cam_x + v_cam_y * v_cam_y
+    var axis_u = v.right
+    var axis_v = v.up
+    var stretch = 1.0
+    if v2 > 0.25 {
+        let inv_v = 1.0 / sqrt(v2)
+        let dx = v_cam_x * inv_v
+        let dy = v_cam_y * inv_v
+        axis_u = v.right * dx + v.up * dy
+        axis_v = v.right * (-dy) + v.up * dx
+        stretch = clamp(1.0 + speed * 0.14, 1.0, 2.8)
+    }
+
+    let wp = pos + axis_u * (ux * min_r * stretch) + axis_v * (uy * min_r)
+    let rel = wp - v.at
+    let x = dot(rel, v.right)
+    let y = dot(rel, v.up)
+    let z = dot(rel, v.forward)
+    let aspect = v.size.y / max(v.size.x, 1.0)
+    let clip = ClipPosition { position: vec4(x * v.focal * aspect, y * v.focal, near_plane, z) }
+
+    let sub = swarm.substance_at(pos, vel, g.vel_age.w, g.meta.y)
+    SwarmVary {
+        clip,
+        wp,
+        uv: vec2(ux, uy),
+        albedo: sub.albedo,
+        emits: sub.emits,
+        pbr: vec4(sub.roughness, sub.metallic, sub.ior, 1.0),
+        optics: vec4(sub.transmission, sub.subsurface, sub.coat, 0.0),
+    }
+}
+
+fn encode_swarm_mat(sub: Substance) -> f32 {
+    if sub.metallic > 0.02 {
+        return clamp(0.5 - 0.5 * clamp(sub.metallic, 0.04, 1.0), 0.0, 0.48)
+    }
+    if sub.spec_weight() <= 1.0e-5 && sub.coat <= 1.0e-5 {
+        return 0.5
+    }
+    let c = if sub.coat > 0.04 { clamp(sub.coat, 0.05, 1.0) } else { 0.03 }
+    clamp(0.5 + 0.5 * c, 0.515, 1.0)
+}
+
+/// Physically shaded 3D sphere/shard impostor fragment shader writing into the unified 4× MSAA
+/// direct HDR + `Rgba8` G-buffer pass (`mesh_eye`).
+@fragment
+@budget(work: 12000)
+pub fn swarm_fs<S: Sky>(
+    vary: SwarmVary,
+    v: View,
+    sv_far: ShadowView,
+    rad_grid: RadGrid,
+    sky: S,
+    sm_far: DepthTexture,
+    cmp: ComparisonSampler,
+    emitters: [Emitter],
+    emitter_count: [u32],
+) -> Targets3<vec4, vec4, vec4> {
+    let r2 = dot(vary.uv, vary.uv)
+    if r2 > 1.0 {
+        discard()
+    }
+    let nz = sqrt(max(1.0 - r2, 0.0))
+    let n = normalize(v.right * vary.uv.x + v.up * vary.uv.y - v.forward * nz)
+    let to_eye = v.at - vary.wp
+    let dist = length(to_eye)
+    let ray_back = if dist > 1.0e-6 { to_eye / dist } else { -v.forward }
+    let sub = Substance {
+        albedo: clamp(vary.albedo, vec3(0.0), vec3(1.0)),
+        roughness: clamp(vary.pbr.x, 0.02, 1.0),
+        emits: max(vary.emits, vec3(0.0)),
+        metallic: clamp(vary.pbr.y, 0.0, 1.0),
+        ior: max(vary.pbr.z, 1.0),
+        transmission: 0.0,
+        subsurface: clamp(vary.optics.y, 0.0, 1.0),
+        coat: clamp(vary.optics.z, 0.0, 1.0),
+        micro: 0.0,
+        micro_freq: 1.0,
+        pad0: 0.0,
+        pad1: 0.0,
+    }
+    let sun = sky.sun()
+    let ndl = max(dot(n, sun.way), 0.0)
+    let vis = if ndl > 0.0 { sun_vis_point(sm_far, cmp, sv_far, vary.wp) } else { 0.0 }
+    let direct_sun = sub.shade_direct(n, sun.way, ray_back, sun.light * vis)
+    let local_light = eval_emitters_fast(sub, vary.wp, n, ray_back, rad_grid, emitters, emitter_count)
+    let direct = sub.emits + direct_sun + local_light
+    Targets3 {
+        first: vec4(direct, min(dist, 65000.0)),
+        second: vec4(n * 0.5 + vec3(0.5), clamp(sub.roughness, 0.02, 1.0)),
+        third: vec4(sub.albedo, encode_swarm_mat(sub)),
+    }
+}
+
+/// Persistent ping-pong GPU grain buffers for a `Swarm`.
+pub struct SwarmSim {
+    pub a: GpuBuffer<Grain>,
+    pub b: GpuBuffer<Grain>,
+    pub front_is_a: bool,
+    pub count: u32,
+    epoch: u32,
+    initialized: bool,
+}
+
+/// Allocates a fresh `SwarmSim` (`SWARM_CAP = 65,536` grains, ~6.2 MB VRAM across ping-pong buffers).
+pub fn swarm_sim() -> SwarmSim {
+    SwarmSim {
+        a: buffer(SWARM_CAP),
+        b: buffer(SWARM_CAP),
+        front_is_a: true,
+        count: 0,
+        epoch: 0,
+        initialized: false,
+    }
+}
+
+impl SwarmSim {
+    fn step_once<Sw: Swarm, F: Field<Substance>>(mut self, swarm: Sw, world_field: F, n: u32) {
+        if self.front_is_a {
+            dispatch(
+                swarm_step.bind(
+                    swarm: swarm,
+                    world_field: world_field,
+                    count: n,
+                    src: self.a.items(),
+                    dst: mut self.b,
+                ),
+                over: n,
+            )
+            self.front_is_a = false
+        } else {
+            dispatch(
+                swarm_step.bind(
+                    swarm: swarm,
+                    world_field: world_field,
+                    count: n,
+                    src: self.b.items(),
+                    dst: mut self.a,
+                ),
+                over: n,
+            )
+            self.front_is_a = true
+        }
+    }
+
+    /// Spawns (on first frame or epoch change, with optional prewarm) and steps `swarm` against `world_field`.
+    pub fn update<Sw: Swarm, F: Field<Substance>>(mut self, swarm: Sw, world_field: F) {
+        if !swarm.active() {
+            self.count = 0
+            return
+        }
+        let n = min(swarm.count(), SWARM_CAP)
+        self.count = n
+        if n == 0 {
+            return
+        }
+        label("mesh_swarm")
+        let ep = swarm.epoch()
+        if !self.initialized || self.epoch != ep {
+            dispatch(swarm_spawn.bind(swarm: swarm, count: n, dst: mut self.a), over: n)
+            self.front_is_a = true
+            self.epoch = ep
+            self.initialized = true
+            let prewarm = min(swarm.prewarm_steps(), 60)
+            for _s in 0..prewarm {
+                self.step_once(swarm, world_field, n)
+            }
+            return
+        }
+        self.step_once(swarm, world_field, n)
+    }
+
+    /// Injects bright grains from the current front buffer into the unified radiance cache.
+    pub fn inject_radiance<Sw: Swarm>(
+        self,
+        swarm: Sw,
+        grid: RadGrid,
+        accum: mut GpuBuffer<u32>,
+        emit_accum: mut GpuBuffer<u32>,
+    ) {
+        if self.count == 0 || grid.enabled == 0 {
+            return
+        }
+        let sub_n = (self.count + 3) / 4
+        if self.front_is_a {
+            dispatch(
+                swarm_inject_rad.bind(
+                    swarm: swarm,
+                    grains: self.a.items(),
+                    count: self.count,
+                    grid: grid,
+                    accum: mut accum,
+                    emit_accum: mut emit_accum,
+                ),
+                over: sub_n,
+            )
+        } else {
+            dispatch(
+                swarm_inject_rad.bind(
+                    swarm: swarm,
+                    grains: self.b.items(),
+                    count: self.count,
+                    grid: grid,
+                    accum: mut accum,
+                    emit_accum: mut emit_accum,
+                ),
+                over: sub_n,
+            )
+        }
+    }
+}

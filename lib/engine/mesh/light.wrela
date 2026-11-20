@@ -39,11 +39,11 @@ const RAD_SCALE: f32 = 256.0
 const PI: f32 = 3.14159265
 const TWO_PI: f32 = 6.2831853
 
-/// Auto-extracted dynamic local emitters (`8×4×8 = 256` coarse spatial bins -> up to 32 active lights).
+/// Auto-extracted dynamic local emitters (`8×4×8 = 256` coarse spatial bins -> up to 16 active lights).
 const EMIT_CELLS: u32 = 256
 const EMIT_STRIDE: u32 = 8
 pub const MAX_EMITTERS: u32 = 16
-const EMIT_THRESH: f32 = 1.5
+const EMIT_THRESH: f32 = 8.0
 const EMIT_SCALE: f32 = 16.0
 
 /// One auto-extracted dynamic local light harvested from emissive meshlets.
@@ -492,8 +492,10 @@ pub fn trace_ssr(
             lo = mid
         }
     }
-    // Clamp extreme HDR spikes in half-res reflections to prevent single-pixel fireflies.
-    let clamped_rgb = min(hit_rgb, vec3(9.0))
+    // Soft luminance-preserving clamp in half-res reflections to prevent single-pixel fireflies on wet/coated surfaces.
+    let luma = dot(hit_rgb, vec3(0.2126, 0.7152, 0.0722))
+    let max_l = mix(4.2, 2.2, clamp(roughness * 2.2, 0.0, 1.0))
+    let clamped_rgb = if luma > max_l { hit_rgb * (max_l / luma) } else { hit_rgb }
     let edge = min(min(hit_uv.x, 1.0 - hit_uv.x), min(hit_uv.y, 1.0 - hit_uv.y))
     let edge_fade = clamp(edge / 0.09, 0.0, 1.0)
     let rough_fade = clamp((0.52 - roughness) / 0.24, 0.0, 1.0)
@@ -687,43 +689,83 @@ fn rad_inject<S: Sky>(
     }
 }
 
-/// Compacts occupied coarse emissive clusters into the active `Emitter` list (`<= MAX_EMITTERS`).
-@compute(64)
+/// Compacts and spatially merges occupied coarse emissive bins (`8×4×8 = 256`) into at most
+/// `MAX_EMITTERS` deduplicated dynamic lights so lights straddling a grid boundary stay ONE
+/// energy-conserving emitter with zero boundary popping.
+@compute(1)
+@budget(work: 32000)
 fn emit_compact(
     emit_accum: [u32],
     grid: RadGrid,
     out: mut Append<Emitter>,
     id: GlobalId,
 ) {
-    if id.x >= EMIT_CELLS {
-        return
-    }
-    let base = id.x * EMIT_STRIDE
-    let cnt = emit_accum[base + 6]
-    if cnt == 0 {
-        return
-    }
-    let inv_cnt = 1.0 / f32(cnt)
+    let _ = id
     let span = 1.0 / max(grid.inv_span, 1.0e-6)
-    let uvw = vec3(
-        f32(emit_accum[base]) * inv_cnt,
-        f32(emit_accum[base + 1]) * inv_cnt,
-        f32(emit_accum[base + 2]) * inv_cnt,
-    ) / 4095.0
-    let pos = grid.origin + uvw * span
-    let avg_e = vec3(
-        f32(emit_accum[base + 3]),
-        f32(emit_accum[base + 4]),
-        f32(emit_accum[base + 5]),
-    ) * (inv_cnt / EMIT_SCALE)
-    // Resolution-independent effective emitter radius (clamped to physical cluster scale so
-    // brightness never varies with meshlet subdivision density or screen resolution).
-    let eff_r = clamp(grid.voxel * 0.75, 0.24, 0.42)
-    let area_w = PI * eff_r * eff_r * 1.25
-    let _ = out.push(Emitter {
-        pos_r: vec4(pos, eff_r),
-        flux_w: vec4(avg_e * area_w, 1.0),
-    })
+    let base_r = clamp(grid.voxel * 0.75, 0.24, 0.42)
+    let merge_d = max(grid.voxel * 4.5, 1.45)
+    let merge_r2 = merge_d * merge_d
+
+    var pos_acc = [vec3(0.0); 16]
+    var emit_acc = [vec3(0.0); 16]
+    var w_acc = [0.0; 16]
+    var n_cells = [0.0; 16]
+    var count: u32 = 0
+
+    for cell in 0..EMIT_CELLS {
+        let base = cell * EMIT_STRIDE
+        let cnt = emit_accum[base + 6]
+        if cnt == 0 {
+            continue
+        }
+        let inv_cnt = 1.0 / f32(cnt)
+        let uvw = vec3(
+            f32(emit_accum[base]) * inv_cnt,
+            f32(emit_accum[base + 1]) * inv_cnt,
+            f32(emit_accum[base + 2]) * inv_cnt,
+        ) / 4095.0
+        let pos = grid.origin + uvw * span
+        let avg_e = vec3(
+            f32(emit_accum[base + 3]),
+            f32(emit_accum[base + 4]),
+            f32(emit_accum[base + 5]),
+        ) * (inv_cnt / EMIT_SCALE)
+        let w = max(avg_e.x, max(avg_e.y, avg_e.z))
+
+        var merged = false
+        for k in 0..count {
+            let cur_pos = pos_acc[k] / max(w_acc[k], 1.0e-5)
+            let d = pos - cur_pos
+            if dot(d, d) <= merge_r2 {
+                pos_acc[k] += pos * w
+                emit_acc[k] += avg_e * w
+                w_acc[k] += w
+                n_cells[k] += 1.0
+                merged = true
+                break
+            }
+        }
+        if !merged && count < MAX_EMITTERS {
+            pos_acc[count] = pos * w
+            emit_acc[count] = avg_e * w
+            w_acc[count] = w
+            n_cells[count] = 1.0
+            count += 1
+        }
+    }
+
+    for k in 0..count {
+        let inv_w = 1.0 / max(w_acc[k], 1.0e-5)
+        let pos = pos_acc[k] * inv_w
+        let avg_e = emit_acc[k] * inv_w
+        let scale = clamp(1.0 + (sqrt(n_cells[k]) - 1.0) * 0.45, 1.0, 1.55)
+        let eff_r = base_r * scale
+        let area_w = PI * eff_r * eff_r * 1.25
+        let _ = out.push(Emitter {
+            pos_r: vec4(pos, eff_r),
+            flux_w: vec4(avg_e * area_w, 1.0),
+        })
+    }
 }
 
 /// Resolves fixed-point atomic sums into premultiplied `(radiance * alpha, alpha)` in `rad0` (`64³`).
@@ -798,16 +840,16 @@ fn emitter_vis(
     // Lift slightly along the surface normal so floor/wall pixels never self-shadow in their own voxel.
     let p0 = wp + n * (grid.voxel * 1.8)
     var occ = 0.0
-    for step in 0..4 {
-        let f = (f32(step) + 0.5) * 0.25
+    for step in 0..3 {
+        let f = (f32(step) + 0.5) * 0.33333334
         let t = start_t + f * span
         let p = p0 + dir * t
         let uvw = (p - grid.origin) * grid.inv_span
         if uvw.x <= 0.01 || uvw.x >= 0.99 || uvw.y <= 0.01 || uvw.y >= 0.99 || uvw.z <= 0.01 || uvw.z >= 0.99 {
             break
         }
-        let smp = if step == 0 { rad0.sample_level(s, uvw, 0.0) } else { rad1.sample_level(s, uvw, 0.0) }
-        occ += (1.0 - occ) * clamp(smp.w * 0.65, 0.0, 1.0)
+        let smp = rad1.sample_level(s, uvw, 0.0)
+        occ += (1.0 - occ) * clamp(smp.w * 0.72, 0.0, 1.0)
         if occ >= 0.92 {
             break
         }
@@ -848,7 +890,9 @@ pub fn eval_emitters(
         if d2 < 1.0e-5 {
             continue
         }
-        if d2 < r * r * 1.15 && max(sub.emits.x, max(sub.emits.y, sub.emits.z)) > EMIT_THRESH {
+        // A glowing surface inside an emitter's own sphere is part of that emitter: the light it
+        // gives is already its emission, so it is never lit by itself (however dim its glow).
+        if d2 < r * r * 1.15 && max(sub.emits.x, max(sub.emits.y, sub.emits.z)) > 1.0e-3 {
             continue
         }
         let d = sqrt(d2)
@@ -858,11 +902,58 @@ pub fn eval_emitters(
         }
         let atten = 1.0 / (d2 + r * r)
         let irrad = em.flux_w.xyz * atten
-        if max(irrad.x, max(irrad.y, irrad.z)) < 0.015 {
+        let peak_i = max(irrad.x, max(irrad.y, irrad.z))
+        if peak_i < 0.035 {
             continue
         }
-        let vis = emitter_vis(grid, rad0, rad1, rad_s, wp, n, em.pos_r.xyz, r)
+        let vis = if peak_i >= 0.085 {
+            emitter_vis(grid, rad0, rad1, rad_s, wp, n, em.pos_r.xyz, r)
+        } else {
+            1.0
+        }
         sum += sub.shade_direct(n, l, v_dir, irrad * vis)
+    }
+    sum
+}
+
+/// Fast direct dynamic emitter evaluation without per-pixel 3D occupancy shadow marching (used on
+/// tiny airborne swarm grains where shadow marches are imperceptible and 6× faster).
+@budget(work: 6000)
+pub fn eval_emitters_fast(
+    sub: Substance,
+    wp: vec3,
+    n: vec3,
+    v_dir: vec3,
+    grid: RadGrid,
+    emitters: [Emitter],
+    emitter_count: [u32],
+) -> vec3 {
+    if grid.enabled == 0 {
+        return vec3(0.0)
+    }
+    let n_emit = min(emitter_count[0], MAX_EMITTERS)
+    if n_emit == 0 {
+        return vec3(0.0)
+    }
+    var sum = vec3(0.0)
+    for i in 0..n_emit {
+        let em = emitters[i]
+        let to_l = em.pos_r.xyz - wp
+        let d2 = dot(to_l, to_l)
+        let r = em.pos_r.w
+        if d2 < 1.0e-5 {
+            continue
+        }
+        let d = sqrt(d2)
+        let l = to_l / d
+        if dot(n, l) <= 0.0 && sub.subsurface <= 1.0e-4 {
+            continue
+        }
+        let irrad = em.flux_w.xyz / (d2 + r * r)
+        if max(irrad.x, max(irrad.y, irrad.z)) < 0.04 {
+            continue
+        }
+        sum += sub.shade_direct(n, l, v_dir, irrad)
     }
     sum
 }
@@ -1155,7 +1246,7 @@ impl RadianceCache {
                 grid: self.grid,
                 out: mut self.emitters,
             ),
-            over: EMIT_CELLS,
+            over: 1,
         )
     }
 }
