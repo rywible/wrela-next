@@ -355,6 +355,8 @@ pub struct Dispatch {
     pub over: bool,
     /// Where its invocations start (`origin:`), added to each one's `GlobalId`.
     pub origin: Option<[Operand; 3]>,
+    /// An indirect dispatch's most groups (`most:`), what it's weighed and booked as.
+    pub most: Option<Operand>,
     /// One per kernel parameter that isn't a builtin, in parameter order: borrowed. None for
     /// a bound kernel's value.
     pub args: Vec<(usize, Place, Span)>,
@@ -459,7 +461,9 @@ impl Rvalue {
                     }
                 }
             }
-            Rvalue::Dispatch(d) => d.groups.iter().chain(d.origin.iter().flatten()).for_each(f),
+            Rvalue::Dispatch(d) => {
+                d.groups.iter().chain(d.origin.iter().flatten()).chain(d.most.iter()).for_each(f)
+            }
             Rvalue::Draw(d) => {
                 f(&d.vertices);
                 f(&d.instances);

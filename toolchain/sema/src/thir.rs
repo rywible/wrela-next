@@ -361,6 +361,9 @@ pub struct Dispatch {
     /// Where its invocations start (`origin:`): a `u32` (in x), a `(u32, u32)` or a
     /// `(u32, u32, u32)`, added to each invocation's `GlobalId`. Evaluated after `groups`.
     pub origin: Option<Box<Expr>>,
+    /// An indirect dispatch's most groups (`most:`, a `u32`): what the host weighs and books it
+    /// as, and the GPU's check holds it to. Evaluated after `origin`.
+    pub most: Option<Box<Expr>>,
 }
 
 /// One of `draw`'s own arguments.
@@ -677,6 +680,7 @@ impl Expr {
                 d.kernel.value().into_iter().for_each(|v| f(Child::Expr(v)));
                 f(Child::Expr(&d.groups));
                 d.origin.iter().for_each(|o| f(Child::Expr(o)));
+                d.most.iter().for_each(|m| f(Child::Expr(m)));
                 d.args.iter().for_each(|(_, a)| f(Child::Expr(a)));
             }
             ExprKind::Draw(d) => {

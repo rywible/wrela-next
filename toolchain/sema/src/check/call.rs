@@ -3485,12 +3485,13 @@ impl<'p> Checker<'p> {
             a.name.as_ref().map_or(i == 1, |n| n.name == "groups" || n.name == "over")
         };
         let is_origin = |a: &ast::Arg| a.name.as_ref().is_some_and(|n| n.name == "origin");
+        let is_most = |a: &ast::Arg| a.name.as_ref().is_some_and(|n| n.name == "most");
         // The form before binding: the kernel's arguments among `dispatch`'s own.
         let extra: Vec<&ast::Arg> = args
             .iter()
             .enumerate()
             .skip(1)
-            .filter(|(i, a)| !is_groups(*i, a) && !is_origin(a))
+            .filter(|(i, a)| !is_groups(*i, a) && !is_origin(a) && !is_most(a))
             .map(|(_, a)| a)
             .collect();
         if !extra.is_empty()
@@ -3534,7 +3535,21 @@ impl<'p> Checker<'p> {
         let mut indirect = false;
         let mut over = false;
         let mut origin: Option<Expr> = None;
+        let mut most: Option<Expr> = None;
         for (i, a) in args.iter().enumerate().skip(1) {
+            if is_most(a) {
+                let e = self.check_expr(&a.value, Some(u32_ty));
+                self.expect(e.ty, u32_ty, e.span);
+                if most.is_some() {
+                    self.err(
+                        Diagnostic::new(codes::E0304, a.span, "`dispatch` takes `most:` once")
+                            .with_help("give one most: the most groups the buffer can ask"),
+                    );
+                    continue;
+                }
+                most = Some(e);
+                continue;
+            }
             if is_origin(a) {
                 let e = self.check_expr(&a.value, None);
                 if origin.is_some() {
@@ -3618,6 +3633,20 @@ impl<'p> Checker<'p> {
                 self.err(crate::gpu::slots_in_parts(self.p, f, o.span));
             }
         }
+        // `most:` says how many groups an indirect dispatch's buffer can ask; a direct one's
+        // groups are known (E0603).
+        if let Some(m) = &most
+            && !indirect
+        {
+            self.err(
+                Diagnostic::new(
+                    codes::E0603,
+                    m.span,
+                    "`most:` is for a dispatch whose groups come from a buffer",
+                )
+                .with_help("a dispatch of `groups: n` is weighed by `n` itself: remove `most:`"),
+            );
+        }
         let groups_at = kernel_args.len();
         let d = Dispatch {
             kernel,
@@ -3627,6 +3656,7 @@ impl<'p> Checker<'p> {
             args: kernel_args,
             groups_at,
             origin: origin.map(Box::new),
+            most: most.map(Box::new),
         };
         Expr { ty: unit, span, kind: ExprKind::Dispatch(Box::new(d)) }
     }

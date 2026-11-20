@@ -2436,6 +2436,7 @@ The compiler sizes the workgroup counts from the kernel's `@compute` size. An in
 **Indirect work:** a command can take its counts from a buffer, so GPU work can size later GPU work.
 
 - `dispatch(k.bind(...), groups: buf)` takes its three group counts from a buffer.
+- `most: n` (a `u32`) beside it says the most groups (x times y times z) the buffer can ask: the host weighs the dispatch and books it in its submission as `n` groups, so a few small ones share a submission as direct ones do, and the GPU's check of the buffer holds it to `n` (past it, none of it runs and the run stops, naming the kernel). Without it the dispatch is booked at the step limit, which closes a submission every second one (backend.md 72: four tiny dispatches with groups written just before spanned 0.285 ms on the M4 unstated, 0.146 stated, against 0.021 direct). `most:` on a direct dispatch is E0603.
 - `draw(pass, vs, fs.bind(...), indirect: buf)` takes its vertex count, instance count, first vertex and first instance from a buffer.
 
 The buffer is a `GpuBuffer` or `GpuSpan` of the command's typed arguments. Each is a struct of its words, which kernels write whole:

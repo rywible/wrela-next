@@ -33,7 +33,7 @@
 //! | 13 | `DestroySampler` | `handle` |
 //! | 14 | `BeginPass` | `colours` (0 to 8), `join` (1: it may join the pass before, [`Pass::join`]), then for each colour target `texture` (a texture, or [`SCREEN`] alone), `level`, `layer` (of an array or a cube; 0 of a 2D texture), `load` (0 clear, 1 keep), the clear colour `r`, `g`, `b`, `a` as f32; then `depth` (a depth texture or [`NONE`]), `depth layer`, `depth load`, `clear depth` as f32 |
 //! | 15 | `EndPass` | none. Ends a pass that isn't on the screen. |
-//! | 16 | `DispatchIndirect` | `pipeline`, `arguments buffer`, `offset` (three `u32` group counts there), the bindings, the uniforms |
+//! | 16 | `DispatchIndirect` | `pipeline`, `arguments buffer`, `offset` (three `u32` group counts there), `most` (the most groups the program says it asks, in all; 0: unstated), the bindings, the uniforms |
 //! | 17 | `DrawIndirect` | `pipeline`, `arguments buffer`, `offset` (vertex count, instance count, first vertex, first instance there), the bindings, the uniforms |
 //! | 18 | `ReadBuffer` | `request`, `handle`, `offset`, `size`: the buffer's bytes, a request |
 //! | 19 | `StorageRead` | `request`, `path length`, then the path's UTF-8, padded to 4 bytes: the bytes stored at the path, a request |
@@ -94,7 +94,7 @@
 use std::fmt;
 
 /// The stream format's version. Bumped by any change a host could notice.
-pub const VERSION: u32 = 13;
+pub const VERSION: u32 = 14;
 pub const MAGIC: [u8; 4] = *b"WRCS";
 /// The batch header: magic, version, body length.
 pub const HEADER_LEN: usize = 12;
@@ -970,6 +970,10 @@ pub enum Command<'a> {
         pipeline: u32,
         arguments: u32,
         offset: u32,
+        /// The most groups (x times y times z) the program says the buffer can ask: the host
+        /// weighs and books the dispatch as that many, and the GPU's check refuses more. 0:
+        /// unstated (weighed at the limit).
+        most: u32,
         bindings: Vec<Binding>,
         uniforms: &'a [u8],
     },
@@ -1432,17 +1436,21 @@ pub fn decode(batch: &[u8]) -> Result<Vec<Command<'_>>, StreamError> {
                     uniforms,
                 }
             }
-            Opcode::DispatchIndirect | Opcode::DrawIndirect => {
+            Opcode::DispatchIndirect => {
+                let (bindings, uniforms) = bindings_and_uniforms(p, 4).map_err(bad)?;
+                if w(2) % 4 != 0 {
+                    return Err(bad("the arguments' offset must be a multiple of 4"));
+                }
+                let (pipeline, arguments, offset, most) = (w(0), w(1), w(2), w(3));
+                Command::DispatchIndirect { pipeline, arguments, offset, most, bindings, uniforms }
+            }
+            Opcode::DrawIndirect => {
                 let (bindings, uniforms) = bindings_and_uniforms(p, 3).map_err(bad)?;
                 if w(2) % 4 != 0 {
                     return Err(bad("the arguments' offset must be a multiple of 4"));
                 }
                 let (pipeline, arguments, offset) = (w(0), w(1), w(2));
-                if opcode == Opcode::DispatchIndirect {
-                    Command::DispatchIndirect { pipeline, arguments, offset, bindings, uniforms }
-                } else {
-                    Command::DrawIndirect { pipeline, arguments, offset, bindings, uniforms }
-                }
+                Command::DrawIndirect { pipeline, arguments, offset, bindings, uniforms }
             }
             Opcode::DrawIndexedIndirect => {
                 let (bindings, uniforms) = bindings_and_uniforms(p, 6).map_err(bad)?;
@@ -2242,6 +2250,7 @@ impl Encoder {
         self
     }
 
+    /// An indirect dispatch whose most groups are unstated (0: booked at the limit).
     pub fn dispatch_indirect(
         &mut self,
         pipeline: u32,
@@ -2250,9 +2259,22 @@ impl Encoder {
         bindings: &[Binding],
         uniforms: &[u8],
     ) -> &mut Self {
+        self.dispatch_indirect_most(pipeline, arguments, offset, 0, bindings, uniforms)
+    }
+
+    /// An indirect dispatch of at most `most` groups (`most:`).
+    pub fn dispatch_indirect_most(
+        &mut self,
+        pipeline: u32,
+        arguments: u32,
+        offset: u32,
+        most: u32,
+        bindings: &[Binding],
+        uniforms: &[u8],
+    ) -> &mut Self {
         self.bound_command(
             Opcode::DispatchIndirect,
-            &[pipeline, arguments, offset],
+            &[pipeline, arguments, offset, most],
             bindings,
             uniforms,
         );

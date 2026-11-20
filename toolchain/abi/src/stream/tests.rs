@@ -33,7 +33,7 @@ fn golden_bytes() {
         words(&[13, 4, 10]),                 // DestroySampler
         words(&[14, 56, 1, 0, 8, 0, 0, 0, 0, 0, 0, f(1.0), 9, 0, 0, f(1.0)]), // BeginPass
         words(&[15, 0]),                     // EndPass
-        words(&[16, 32, 0, 3, 4, 1, 5, 0, 0, 0]), // DispatchIndirect
+        words(&[16, 36, 0, 3, 4, 0, 1, 5, 0, 0, 0]), // DispatchIndirect (most 0)
         words(&[17, 20, 1, 3, 16, 0, 0]),    // DrawIndirect
         words(&[18, 16, 1, 3, 0, 8]),        // ReadBuffer
         words(&[19, 20, 2, 11]),             // StorageRead

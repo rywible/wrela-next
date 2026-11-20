@@ -1320,7 +1320,8 @@ pub(super) fn host(
             // dispatch; a draw's as its kind says (`ir::DrawKind::counts`).
             let (fixed, opc) = match op {
                 ir::HostOp::Dispatch { indirect: false, .. } => (4, Opcode::Dispatch),
-                ir::HostOp::Dispatch { indirect: true, .. } => (3, Opcode::DispatchIndirect),
+                // The buffer, its offset and the most groups the program says it asks.
+                ir::HostOp::Dispatch { indirect: true, .. } => (4, Opcode::DispatchIndirect),
                 ir::HostOp::Draw { kind, .. } => (kind.counts() as u32 + 1, kind.opcode()),
                 _ => unreachable!("matched a dispatch or a draw"),
             };

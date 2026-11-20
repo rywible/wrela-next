@@ -1379,6 +1379,10 @@ impl<'a> Builder<'a> {
                 }
             }
         };
+        let most = match &d.most {
+            None => None,
+            Some(m) => Some(self.value(m, Want::Read)?),
+        };
         for (i, a) in &d.args[d.groups_at..] {
             let p = self.gpu_arg(a)?;
             args.push((*i, p, a.span));
@@ -1388,6 +1392,7 @@ impl<'a> Builder<'a> {
             groups,
             over: d.over,
             origin,
+            most,
             args,
             indirect,
         })))

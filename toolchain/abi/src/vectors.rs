@@ -102,10 +102,10 @@ fn command(c: &Command) -> Value {
         Command::DestroySampler { handle } => json!({ "op": "DestroySampler", "handle": handle }),
         Command::BeginPass(p) => json!({ "op": "BeginPass", "pass": pass_json(p) }),
         Command::EndPass => json!({ "op": "EndPass" }),
-        Command::DispatchIndirect { pipeline, arguments, offset, bindings: bs, uniforms } => {
+        Command::DispatchIndirect { pipeline, arguments, offset, most, bindings: bs, uniforms } => {
             json!({
                 "op": "DispatchIndirect", "pipeline": pipeline, "arguments": arguments,
-                "offset": offset, "bindings": bindings(bs), "uniforms": uniforms,
+                "offset": offset, "most": most, "bindings": bindings(bs), "uniforms": uniforms,
             })
         }
         Command::DrawIndirect { pipeline, arguments, offset, bindings: bs, uniforms } => json!({

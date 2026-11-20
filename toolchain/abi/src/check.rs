@@ -595,7 +595,9 @@ impl Checker {
                     ));
                 }
             }
-            Command::DispatchIndirect { pipeline, arguments, offset, bindings, uniforms } => {
+            Command::DispatchIndirect {
+                pipeline, arguments, offset, bindings, uniforms, ..
+            } => {
                 self.bindings(op, *pipeline, bindings, uniforms.len())?;
                 self.read_range(op, *arguments, *offset, 12, "reading arguments:")?;
             }
@@ -1497,6 +1499,7 @@ mod tests {
                 pipeline: 1,
                 arguments: 99,
                 offset: 0,
+                most: 0,
                 bindings: vec![Binding::range(3, 0, 64), Binding::range(4, 0, 64)],
                 uniforms: &[0; 16],
             };

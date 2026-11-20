@@ -99,6 +99,7 @@ pub(crate) fn for_each_child_mut(e: &mut Expr, f: &mut impl FnMut(&mut Expr)) {
             shader(&mut d.kernel, f);
             f(&mut d.groups);
             d.origin.iter_mut().for_each(|o| f(o));
+            d.most.iter_mut().for_each(|m| f(m));
             d.args.iter_mut().for_each(|(_, a)| f(a));
         }
         ExprKind::Draw(d) => {
@@ -209,6 +210,9 @@ pub fn walk_tys(e: &mut Expr, f: &mut impl FnMut(&mut TyId)) {
             walk_tys(&mut d.groups, f);
             if let Some(o) = &mut d.origin {
                 walk_tys(o, f);
+            }
+            if let Some(m) = &mut d.most {
+                walk_tys(m, f);
             }
             for (_, a) in &mut d.args {
                 walk_tys(a, f);
@@ -757,6 +761,7 @@ impl Markers<'_> {
                 d.kernel.value().into_iter().for_each(|v| self.expr(v, false, out));
                 self.expr(&d.groups, false, out);
                 d.origin.iter().for_each(|o| self.expr(o, false, out));
+                d.most.iter().for_each(|m| self.expr(m, false, out));
                 d.args.iter().for_each(|(_, a)| self.expr(a, true, out));
             }
             // A shader's arguments are checked against its parameters where it's bound (E0503,

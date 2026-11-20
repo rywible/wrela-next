@@ -1151,6 +1151,7 @@ impl<'a> FnCheck<'a> {
                 .groups
                 .iter()
                 .chain(d.origin.iter().flatten())
+                .chain(d.most.iter())
                 .for_each(|g| self.operand(st, at, g)),
             Rvalue::Draw(d) => {
                 self.operand(st, at, &d.vertices);
@@ -2254,7 +2255,7 @@ fn rvalue_places(body: &Body, r: &Rvalue, add: &mut dyn FnMut(&Place, bool)) {
             if let Some(p) = d.kernel.value() {
                 add(p, false);
             }
-            for o in d.groups.iter().chain(d.origin.iter().flatten()) {
+            for o in d.groups.iter().chain(d.origin.iter().flatten()).chain(d.most.iter()) {
                 operand(o, add);
             }
             for (_, p, _) in &d.args {

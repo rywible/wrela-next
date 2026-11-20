@@ -1524,7 +1524,7 @@ mod tests {
         let json = sample().to_json();
         let expected = r#"{
   "manifest_version": 16,
-  "stream_version": 13,
+  "stream_version": 14,
   "target": "metal",
   "wasm": "game.wasm",
   "pipelines": [

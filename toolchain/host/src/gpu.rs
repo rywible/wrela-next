@@ -2784,7 +2784,7 @@ impl Gpu {
     fn dispatch(
         &mut self,
         pipeline: u32,
-        groups: Result<[u32; 3], (u32, u32)>,
+        groups: Result<[u32; 3], (u32, u32, u32)>,
         bindings: &[Binding],
         uniforms: &[u8],
     ) -> Result<()> {
@@ -2806,13 +2806,16 @@ impl Gpu {
         // kernel's bound allows.
         let groups = match groups {
             Ok(g) => Ok(g),
-            Err((buffer, at)) => {
+            Err((buffer, at, stated)) => {
                 let p = &self.pipelines[pipeline as usize];
                 let crate::step::Bound::Most(most) = p.bound else {
                     unreachable!("`weigh` refused a kernel without a bound");
                 };
                 let per_group = p.workgroup.iter().map(|&n| u64::from(n)).product::<u64>();
+                // The groups the GPU lets through: what the limit allows, and no more than the
+                // program said it asks (`most:`), which is what it was weighed and booked as.
                 let most = crate::step::most_groups(most, per_group, wrela_abi::Target::HERE);
+                let most = if stated > 0 { most.min(u64::from(stated)) } else { most };
                 let name = p.name.clone();
                 let source = self.buffer(buffer).clone();
                 let device = self.device.clone();
@@ -2862,12 +2865,17 @@ impl Gpu {
 
     /// Whether a dispatch of `pipeline` over `groups` (or an indirect dispatch's, read on the
     /// GPU) may run: its kernel's bound times its invocations within the limit (`crate::step`).
-    fn weigh(&self, pipeline: u32, groups: Result<[u32; 3], (u32, u32)>) -> Result<()> {
+    fn weigh(&self, pipeline: u32, groups: Result<[u32; 3], (u32, u32, u32)>) -> Result<()> {
         let p = &self.pipelines[pipeline as usize];
         let invocations = match groups {
             Ok([x, y, z]) => {
                 let per_group = p.workgroup.iter().map(|&n| u64::from(n)).product::<u64>();
                 Some(u64::from(x) * u64::from(y) * u64::from(z) * per_group)
+            }
+            // Stated (`most:`): weighed as that many groups; else unknown, the GPU's to hold.
+            Err((_, _, stated)) if stated > 0 => {
+                let per_group = p.workgroup.iter().map(|&n| u64::from(n)).product::<u64>();
+                Some(u64::from(stated) * per_group)
             }
             Err(_) => None,
         };
@@ -2886,13 +2894,20 @@ impl Gpu {
 
     /// The guard's bound of a dispatch of `pipeline` over `groups`, in ms (`crate::step`): an
     /// indirect dispatch's, the limit, which the GPU holds it to.
-    fn bound_ms(&self, pipeline: u32, groups: Result<[u32; 3], (u32, u32)>) -> f64 {
+    fn bound_ms(&self, pipeline: u32, groups: Result<[u32; 3], (u32, u32, u32)>) -> f64 {
         let p = &self.pipelines[pipeline as usize];
         match (&p.bound, groups) {
             (crate::step::Bound::Most(most), Ok([x, y, z])) => {
                 let per_group = p.workgroup.iter().map(|&n| u64::from(n)).product::<u64>();
                 let n = u64::from(x) * u64::from(y) * u64::from(z) * per_group;
                 crate::step::ms_of(*most, n, wrela_abi::Target::HERE)
+            }
+            // An indirect dispatch whose most groups are stated: booked as that many, so a few
+            // small ones share a submission as direct ones do (backend.md 72: booked at the
+            // limit, every second one closed a submission).
+            (crate::step::Bound::Most(most), Err((_, _, stated))) if stated > 0 => {
+                let per_group = p.workgroup.iter().map(|&n| u64::from(n)).product::<u64>();
+                crate::step::ms_of(*most, u64::from(stated) * per_group, wrela_abi::Target::HERE)
             }
             _ => crate::step::limit_ms(),
         }
@@ -3812,8 +3827,13 @@ impl Executor for Gpu {
             Command::Dispatch { pipeline, groups, bindings, uniforms } => {
                 return self.dispatch(*pipeline, Ok(*groups), bindings, uniforms);
             }
-            Command::DispatchIndirect { pipeline, arguments, offset, bindings, uniforms } => {
-                return self.dispatch(*pipeline, Err((*arguments, *offset)), bindings, uniforms);
+            Command::DispatchIndirect { pipeline, arguments, offset, most, bindings, uniforms } => {
+                return self.dispatch(
+                    *pipeline,
+                    Err((*arguments, *offset, *most)),
+                    bindings,
+                    uniforms,
+                );
             }
             Command::BeginScreenPass { clear } => {
                 if !self.label_fresh {
@@ -4415,6 +4435,34 @@ mod tests {
         assert!(largest.bound_ms <= SUBMIT_BOUND_MS, "{largest:?}");
         assert_eq!(gpu.read_buffer(1).unwrap(), 30u32.to_le_bytes());
         gpu.check_errors().unwrap();
+    }
+
+    /// Indirect dispatches whose most groups are stated (`most:`) are booked as that many, so a
+    /// few small ones share a submission as direct ones do; unstated, each is booked at the
+    /// limit, and every second one closes a submission (backend.md 72). The work is the same.
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn an_indirect_dispatch_of_stated_most_shares_a_submission() {
+        let (manifest, shaders) = increment();
+        let run = |most: u32| {
+            let mut gpu = Gpu::new(&manifest, &shaders, Timing::Off, false).unwrap();
+            gpu.create_buffer(1, 4);
+            gpu.create_buffer(2, 12);
+            gpu.write_buffer(2, 0, &[1u32, 1, 1].map(u32::to_le_bytes).concat()).unwrap();
+            let (before, _) = gpu.submissions();
+            for _ in 0..8 {
+                gpu.dispatch(0, Err((2, 0, most)), &[Binding::range(1, 0, 4)], &[]).unwrap();
+            }
+            gpu.end_frame().unwrap();
+            let (after, _) = gpu.submissions();
+            assert_eq!(gpu.read_buffer(1).unwrap(), 8u32.to_le_bytes());
+            gpu.check_errors().unwrap();
+            after - before
+        };
+        let unstated = run(0);
+        let stated = run(1);
+        assert!(unstated >= 4, "{unstated} submissions unstated");
+        assert!(stated <= 2, "{stated} submissions stated");
     }
 
     /// How many inputs the fused-or-not fixture computes.

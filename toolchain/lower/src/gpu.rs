@@ -1030,6 +1030,15 @@ fn record_dispatch(fl: &mut Fl, d: &mir::Dispatch, span: Span) -> Option<()> {
         Some((place, at)) => {
             let b = indirect_binding(fl, place, *at)?;
             groups.extend(b);
+            // Its most groups (`most:`), or 0: unstated (weighed at the limit).
+            let most = match &d.most {
+                Some(m) => fl.operand(m)?,
+                None => {
+                    let u = fl.mb.m.types.u32();
+                    fl.value(u, ir::Expr::Const(ir::Const::U32(0)))
+                }
+            };
+            groups.push(most);
         }
         None => {
             for g in &d.groups {
