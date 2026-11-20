@@ -3889,7 +3889,7 @@ impl Gpu {
             let most = wrela_abi::Target::HERE.limits().lane_fuel();
             return Err(Error::Gpu(format!(
                 "pipeline {name}{label} ran out of fuel by frame {frame}: a lane did more than \
-                 {most} work, what one may do in the line's 50 ms at an idle GPU's clock \
+                 {most} work, what one does in the line's 50 ms at the GPU's warm clock \
                  (AGENTS.md, rule 2). Its loops stopped there, so what it drew or wrote is not \
                  whole. The run stops here. Bound its loops (a count the compiler can see), or \
                  cut its work over frames"

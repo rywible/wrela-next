@@ -359,20 +359,30 @@ pub struct TargetLimits {
 impl TargetLimits {
     /// The most work one lane (one invocation) does in [`STEP_MS`] at the GPU's warm clock: one
     /// invocation alone at [`TargetLimits::step_femtoseconds`] times
-    /// [`TargetLimits::step_width`] a unit. A draw whose lanes' bound is within it is left as
-    /// written: at the idle clock such a lane holds its tile at most
-    /// [`TargetLimits::idle_slowdown_tenths`] / 10 times the line, and the guard ends the run
-    /// after the fact; it can't hang the GPU.
+    /// [`TargetLimits::step_width`] a unit (a lane is a small share of the GPU: the unit is the
+    /// whole GPU's a unit of work, so one lane alone takes `step_width` units' time a unit).
+    /// No lane of a draw does more: a draw whose lanes' bound is within it is left as written,
+    /// and one with a loop that could pass it is charged against it ([`TargetLimits::lane_fuel`]).
+    /// At the idle clock such a lane holds its tile at most
+    /// [`TargetLimits::idle_slowdown_tenths`] / 10 times the line, which the guard ends after the
+    /// fact; it can't hang the GPU.
     pub fn lane_line_work(&self) -> u64 {
         let unit_fs = u64::from(self.step_femtoseconds.max(1)) * u64::from(self.step_width.max(1));
         u64::from(STEP_MS) * 1_000_000_000_000 / unit_fs
     }
 
-    /// The most work one lane may do where a loop has no bound or its bound is past
-    /// [`TargetLimits::lane_line_work`]: its fuel (language.md §18.11), what it does in
-    /// [`STEP_MS`] at the idle clock. Such a loop is charged pass by pass (`ir::fuel`), and a lane
-    /// that runs out stops and flags its pipeline, so no lane runs away whatever a program does.
+    /// A lane's fuel (language.md §18.11): the most work one lane may do where a loop has no
+    /// bound or its bound is past it, which such a loop is charged against pass by pass
+    /// (`ir::fuel`); a lane that runs out stops and flags its pipeline. The same ceiling as a
+    /// lane left as written: [`TargetLimits::lane_line_work`].
     pub fn lane_fuel(&self) -> u64 {
+        self.lane_line_work()
+    }
+
+    /// The line's work at the idle clock: what one lane does in [`STEP_MS`] once the GPU has
+    /// lowered its clock. A draw whose lanes' bound is past it is named in every build (W0016),
+    /// the list of draws to bring within it.
+    pub fn lane_idle_work(&self) -> u64 {
         self.lane_line_work() * 10 / u64::from(self.idle_slowdown_tenths.max(10))
     }
 }

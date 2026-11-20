@@ -10,7 +10,7 @@ use wrela_tests::page;
 
 /// Fuel counts a draw with a loop the count can't bound, or whose lanes' bound is past the
 /// line's work at the warm clock (`TargetLimits::lane_line_work`); one bounded within it is left
-/// as written, and named (W0016) when its bound is over a lane's fuel. `under_line` and
+/// as written, and named (W0016) when its bound is over the line's work at an idle clock. `under_line` and
 /// `over_line` sit either side of Metal's line; `fixed` is within the fuel; `march` has no
 /// bound.
 #[test]
@@ -18,7 +18,8 @@ fn a_draw_is_charged_only_past_the_lines_work_or_unbounded_and_named_between() {
     let pkg = wrela_tests::repo_root().join("toolchain/tests/fuel");
     for target in [wrela_abi::Target::Metal, wrela_abi::Target::Vulkan] {
         let limits = target.limits();
-        let (fuel, line) = (limits.lane_fuel(), limits.lane_line_work());
+        let (fuel, line) = (limits.lane_idle_work(), limits.lane_line_work());
+        assert_eq!(limits.lane_fuel(), line, "a charged lane's ceiling is an uncounted one's");
         let built = wrela_tests::build_for(&pkg, target).expect("builds");
         let manifest = wrela_abi::Manifest::parse(&String::from_utf8_lossy(
             &built.files.iter().find(|(n, _)| n == "manifest.json").expect("a manifest").1,

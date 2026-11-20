@@ -285,7 +285,7 @@ codes! {
     W0013 = "W0013", "a `while` that counts an index over a run only to index it";
     W0014 = "W0014", "GPU work every invocation does again that the compiler couldn't move to an earlier rate";
     W0015 = "W0015", "a local named like a `const` parameter, which hides it";
-    W0016 = "W0016", "a draw whose lanes may do more than their fuel, left as written";
+    W0016 = "W0016", "a draw whose lanes may do more than the line's work at an idle clock, left as written";
 
     // ---- W01xx: forms the language moved away from (`MIGRATIONS`, `wrela migrate`) --------
 
