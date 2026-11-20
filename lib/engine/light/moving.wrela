@@ -1,0 +1,251 @@
+// What moving things hide of the sun, found through one map a frame, not a draw a body over the
+// screen (slice 2, part 2's second way). Each frame the moving things' parts, as round cones inside
+// them (`asked::Cone`, made on the GPU), are drawn from the sun into a map over where they can be
+// as the sun sees them (`Sunward`): an instanced draw, an instance a thing over its box. A texel
+// keeps the place nearest the sun where the ray down through its middle enters a cone shrunk by
+// the texel's diagonal (deep: every ray in the texel enters the cone there or nearer), as depth;
+// and a flag where it passes within the diagonal and the joins' flesh (std's `PartBound::lowers`)
+// of a cone without entering it shrunk (`near`). A pixel in the sun reads the four texels round
+// where it lies on the map (`sun_from_movers`): all deep and nearer the sun than it, in shadow;
+// none deep or near, in the sun; else its ray toward the sun is tested against the moving things'
+// cones whose box it crosses, in closed form (the flesh a join adds round a part is not seen
+// there: said, judged).
+
+use matter::asked::{Cone, box_span, cone_met}
+use std::gpu::{ClipPosition, DepthTexture, Flat, FragCoord, GpuSpan, InstanceIndex, R8, Texture, VertexIndex, WithDepth}
+
+/// A map from a way (the sun, or one of the sky's fixed ways): the way (`sun`) and two ways square
+/// to it (`u`, `v`), the middle of where the moving things can be (`centre`), how far the map
+/// reaches each way from it (`half`, m), how far along the way its top is from the middle (`top`)
+/// and how deep it reaches (`span`, m), its texels a side (`size`, in a texture `full` a side) and
+/// their side (m), and where in that texture its first texel is (`ox`, `oy`: the sky's maps are
+/// tiles of one).
+pub struct Sunward: Copy + GpuData {
+    pub sun: vec3,
+    pub half: f32,
+    pub u: vec3,
+    pub top: f32,
+    pub v: vec3,
+    pub span: f32,
+    pub centre: vec3,
+    pub texel: f32,
+    pub size: u32,
+    pub on: u32,
+    pub full: u32,
+    pub spare: u32,
+    pub ox: u32,
+    pub oy: u32,
+    pub spare2: u32,
+    pub spare3: u32,
+}
+
+/// The map from the sun round the boxes `boxes` (least and greatest corners, two a thing), at most
+/// `full` texels a side, a texel never finer than `finest` m (a pixel's footprint where the
+/// nearest of them is seen: finer shows nothing more).
+pub fn sunward(sun: vec3, boxes: [vec4], full: u32, finest: f32) -> Sunward {
+    let s = normalize(sun)
+    let a = if abs(s.y) < 0.9 { vec3(0.0, 1.0, 0.0) } else { vec3(1.0, 0.0, 0.0) }
+    let u = normalize(cross(s, a))
+    let v = cross(s, u)
+    var lo = vec3(1.0e30)
+    var hi = vec3(-1.0e30)
+    for i in 0..(boxes.len() / 2) {
+        lo = min(lo, boxes[2 * i].xyz)
+        hi = max(hi, boxes[2 * i + 1].xyz)
+    }
+    let centre = 0.5 * (lo + hi)
+    var half = 0.0
+    var top = 0.0
+    for k in 0..8 {
+        let c = mix(lo, hi, vec3(f32(k & 1), f32((k >> 1) & 1), f32((k >> 2) & 1))) - centre
+        half = max(half, max(abs(dot(c, u)), abs(dot(c, v))))
+        top = max(top, abs(dot(c, s)))
+    }
+    let on: u32 = if boxes.len() >= 2 { 1 } else { 0 }
+    half = max(half, 0.01)
+    let size = u32(clamp(ceil(2.0 * half / max(finest, 1.0e-4)), 16.0, f32(full)))
+    Sunward { sun: s, half, u, top: top + 0.01, v, span: 2.0 * top + 0.02, centre, texel: 2.0 * half / f32(size), size, on, full, spare: 0, ox: 0, oy: 0, spare2: 0, spare3: 0 }
+}
+
+/// A corner of a thing's draw into the map, as its texels take it: which thing.
+pub struct MapCorner: Copy {
+    pub clip: ClipPosition,
+    pub one: Flat<u32>,
+}
+
+/// Where the map holds the point `p` (from 0 to 1 each way).
+fn on_map(m: Sunward, p: vec3) -> vec2 {
+    let c = p - m.centre
+    vec2(dot(c, m.u), dot(c, m.v)) / (2.0 * m.half) + vec2(0.5)
+}
+
+/// Corner `c` of a quad over moving thing `movers[2 i]`'s box (`hulls`: its cones' box (`a`, `b`),
+/// grown by a texel's diagonal and its flesh, `rb`) on the map. (`movers`: a thing's number and
+/// its cones' count, by twos.)
+@vertex
+pub fn map_quad(c: VertexIndex, i: InstanceIndex, m: Sunward, hulls: GpuSpan<Cone>, movers: GpuSpan<u32>) -> MapCorner {
+    let h = hulls[movers[2 * i.index]]
+    let g = vec3(m.texel * 1.5 + h.rb)
+    var lo = vec2(1.0e30)
+    var hi = vec2(-1.0e30)
+    for k in 0..8 {
+        let q = on_map(m, mix(h.a - g, h.b + g, vec3(f32(k & 1), f32((k >> 1) & 1), f32((k >> 2) & 1))))
+        lo = min(lo, q)
+        hi = max(hi, q)
+    }
+    let corner = c.index
+    let x = if corner == 1 || corner == 2 || corner == 4 { hi.x } else { lo.x }
+    let y = if corner == 2 || corner == 4 || corner == 5 { hi.y } else { lo.y }
+    // (Within its own tile: a quad past the tile's side is cut to it, so no map draws on another.)
+    let f = f32(m.size) / f32(m.full)
+    let o = vec2(f32(m.ox), f32(m.oy)) / f32(m.full)
+    let px = o.x + clamp(x, 0.0, 1.0) * f
+    let py = o.y + clamp(y, 0.0, 1.0) * f
+    MapCorner { clip: ClipPosition { position: vec4(px * 2.0 - 1.0, 1.0 - py * 2.0, 0.5, 1.0) }, one: Flat { value: i.index } }
+}
+
+/// The ray down through texel `pixel`'s middle: where it starts (the map's top) and its way.
+fn texel_ray(m: Sunward, pixel: FragCoord) -> vec3 {
+    let e = ((pixel.position.xy - vec2(f32(m.ox), f32(m.oy))) / f32(m.size) - vec2(0.5)) * (2.0 * m.half)
+    m.centre + m.u * e.x + m.v * e.y + m.sun * m.top
+}
+
+/// A cone grown (`by` over 0) or shrunk (under 0), each radius never under 0.
+fn grown(c: Cone, by: f32) -> Cone {
+    Cone { a: c.a, ra: max(c.ra + by, 0.0), b: c.b, rb: max(c.rb + by, 0.0) }
+}
+
+/// The depth (0 at the map's top, 1 at its bottom) where texel `pixel`'s ray enters thing `k`'s
+/// cones (`cones[k * per..]`, `n` of them, its box `hulls[k]`) shrunk by `shrink` of the texel's
+/// diagonal (the sun's: 1, so every ray in the texel enters there or nearer; the sky's: 0, its
+/// middle's), the nearest the way; none: a depth past the map (the test keeps the nearer).
+@fragment
+pub fn map_deep(c: MapCorner, pixel: FragCoord, m: Sunward, cones: GpuSpan<Cone>, movers: GpuSpan<u32>, per: u32, shrink: f32) -> WithDepth<vec4> {
+    let o = texel_ray(m, pixel)
+    let k = movers[2 * c.one.value]
+    let n = movers[2 * c.one.value + 1]
+    let band = m.texel * 1.4142136 * shrink
+    var best = 2.0
+    for j in 0..min(n, 31) {
+        let s = grown(cones[k * per + j], -band)
+        if s.ra > 0.0 || s.rb > 0.0 {
+            let t = cone_met(o, -m.sun, s)
+            if t >= 0.0 {
+                best = min(best, t / m.span)
+            }
+        }
+    }
+    WithDepth { color: vec4(0.0), depth: min(best, 1.0) }
+}
+
+/// Whether texel `pixel`'s ray passes within the texel's diagonal and the joins' flesh of thing
+/// `k`'s cones (`near`, 1): kept by the most.
+@fragment
+pub fn map_near(c: MapCorner, pixel: FragCoord, m: Sunward, cones: GpuSpan<Cone>, hulls: GpuSpan<Cone>, movers: GpuSpan<u32>, per: u32) -> vec4 {
+    let o = texel_ray(m, pixel)
+    let k = movers[2 * c.one.value]
+    let n = movers[2 * c.one.value + 1]
+    let band = m.texel * 1.4142136 + hulls[k].rb
+    var near = 0.0
+    for j in 0..min(n, 31) {
+        if near < 0.5 && cone_met(o, -m.sun, grown(cones[k * per + j], band)) >= 0.0 {
+            near = 1.0
+        }
+    }
+    vec4(near)
+}
+
+/// Whether the moving things (`movers`, `count` of them; their cones, `per` a thing from `k * per`,
+/// and boxes, `hulls`) hide the sun from `p` (outside their matter: a pixel's surface lifted off
+/// it): the map's four texels round it (`deep`, `near`) where they say, else its ray in closed
+/// form. 0 hidden, 1 not.
+pub fn sun_from_movers(m: Sunward, deep: DepthTexture, nears: Texture<R8>, p: vec3, cones: GpuSpan<Cone>, hulls: GpuSpan<Cone>, movers: GpuSpan<u32>, count: u32, per: u32) -> f32 {
+    if m.on == 0 {
+        return 1.0
+    }
+    let q = on_map(m, p) * f32(m.size) - vec2(0.5)
+    if q.x < 0.0 || q.y < 0.0 || q.x >= f32(m.size - 1) || q.y >= f32(m.size - 1) {
+        return 1.0
+    }
+    let z = m.top - dot(p - m.centre, m.sun)
+    var all_deep = true
+    var none = true
+    for k in 0..4 {
+        let x = u32(q.x) + (k & 1)
+        let y = u32(q.y) + (k >> 1)
+        let d = deep.load(x + m.ox, y + m.oy)
+        let f: f32 = nears.load(x + m.ox, y + m.oy)
+        let hit = d < 1.0
+        // (Deep and nearer the sun than `p` by more than the texel: every ray there enters.)
+        all_deep = all_deep && hit && d * m.span < z - 2.0 * m.texel
+        none = none && !hit && f < 0.5
+    }
+    if all_deep {
+        return 0.0
+    }
+    if none {
+        return 1.0
+    }
+    for i in 0..min(count, 1024) {
+        let k = movers[2 * i]
+        let h = hulls[k]
+        let b = box_span(p, m.sun, h.a, h.b)
+        if b.y >= max(b.x, 0.0) {
+            for j in 0..min(movers[2 * i + 1], 31) {
+                if cone_met(p, m.sun, cones[k * per + j]) >= 0.0 {
+                    return 0.0
+                }
+            }
+        }
+    }
+    1.0
+}
+
+/// How much of way `m` the moving things leave clear from `p` (outside their matter: a surface
+/// lifted off it, `c` the cosine between its facing and the way), by its map (`deep`, a tile of
+/// the sky's atlas: `sky_maps`): the four texels round where `p` lies on it, each weighed by how
+/// near it is, and each hiding the way where it holds a cone nearer the way than `p` by more than
+/// `BIAS` texels and the rise of `p`'s own surface across one (its slope to the way: the texel's
+/// middle ray's entry is not `p`'s own surface's). Off the map, clear. 0 hidden, 1 clear.
+pub fn way_open(m: Sunward, deep: DepthTexture, p: vec3, c: f32) -> f32 {
+    if m.on == 0 {
+        return 1.0
+    }
+    let q = on_map(m, p) * f32(m.size) - vec2(0.5)
+    if q.x < 0.0 || q.y < 0.0 || q.x >= f32(m.size - 1) || q.y >= f32(m.size - 1) {
+        return 1.0
+    }
+    let z = m.top - dot(p - m.centre, m.sun)
+    let rise = min(sqrt(max(1.0 - c * c, 0.0)) / max(c, 0.05), 8.0)
+    let bias = (BIAS + 1.4142136 * rise) * m.texel
+    let f = fract(q)
+    var clear = 0.0
+    for k in 0..4 {
+        let x = u32(q.x) + (k & 1)
+        let y = u32(q.y) + (k >> 1)
+        let d = deep.load(x + m.ox, y + m.oy)
+        let w = (if (k & 1) == 1 { f.x } else { 1.0 - f.x }) * (if (k >> 1) == 1 { f.y } else { 1.0 - f.y })
+        if !(d < 1.0 && d * m.span < z - bias) {
+            clear += w
+        }
+    }
+    clear
+}
+
+/// How many texels nearer the way than a point a map's entry must be to hide it, beyond its own
+/// surface's rise across a texel's diagonal (`way_open`).
+const BIAS: f32 = 1.0
+
+/// The sky's fixed ways (`SKY_MAPS` of them over the sphere: a Fibonacci set, the same every
+/// frame), way `j`.
+pub fn sky_map_way(j: u32) -> vec3 {
+    let y = 1.0 - (f32(j) + 0.5) * 2.0 / f32(SKY_MAPS)
+    let r = sqrt(max(1.0 - y * y, 0.0))
+    let a = f32(j) * 2.3999632
+    vec3(r * cos(a), y, r * sin(a))
+}
+
+/// The sky's maps: how many ways, each map's texels a side, and the tiles across the atlas.
+pub const SKY_MAPS: u32 = 64
+pub const SKY_MAP: u32 = 128
+pub const SKY_ACROSS: u32 = 8

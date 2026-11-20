@@ -1,0 +1,981 @@
+// Light (docs/design.md, "The engine's four modules": light): what light arrives at a point, kept
+// in light's own store. Slice 2, part 1: the sun as still things let it through, and the open sky
+// (the stand-in's light, the reference's simple light, which this is held to).
+//
+// The store is probes on the surfaces the picture has found. A probe is a world-space cell (its
+// side a power of two of `CELL0`, at least `PROBE_PX` footprints where it was first seen) and the
+// main axis its surface faces, kept in a hash table that is light's alone: matter's cells split
+// and fold with the eye and never touch it. The first pixel that shows a surface in a cell makes
+// its probe, with that pixel's point and facing; the probe then asks the sun once and keeps the
+// answer until the sun or a still thing changes (`Store::kept_for`). So still light costs a read.
+//
+// What a probe says, of every point of its surface in its cell: LIT (the sun reaches them all),
+// DARK (it reaches none), or EDGE (it can't say: a shadow's edge, a thin thing's shadow, a corner).
+// It asks with `RING` rays from its cell's disc in its tangent plane, the middle and a ring
+// (`ring_way`): each a hit test from the surface, then, past where a tube round it is clear of its
+// own plane, a near-miss test with the tube as wide as the gaps between the rays (so the tubes
+// cover the disc, and every point's ray toward the sun lies in one); a hit is DEEP where the ray
+// is inside matter by more than the tube's radius somewhere past it (then every ray in the tube
+// is stopped there). All clear: LIT; all deep: DARK; else EDGE. A ring ray that starts inside other
+// matter (a cell across a wall's foot) meets it at once while the others don't: EDGE, so no cell
+// reads light across a wall. After the eye draws, a pass over the screen reads the probe of each
+// surface a still thing showed in the sun (`said`, from the picture's `said_drawn`) for the shadow
+// draws: LIT or DARK decides the sun from still things; EDGE, a probe not yet filled, a surface off
+// its probe's plane (another surface in the same cell, which its rays don't cover), or none: the
+// pixel's own ray, as before. The sharp edge of a shadow is the ray's; the store only says where no
+// edge can be. Probes missing are made by one pass over the screen after that (`Store::made`).
+// (Read in the eye draws instead, it cost the Radeon's march its occupancy: SCENE 0 14.12 ->
+// 14.33 ms there, against 14.18 read apart.)
+//
+// A probe is only as good as the matter it was asked through. Still matter's cells split and fold
+// as the eye asks (`Kept::refine`), each change counted (`Store::changes`); a probe keeps the count
+// it was filled at (`filled_at`). Once a frame passes with no change (matter quiet), a probe whose
+// count is behind is made again: read, it says it is missing, the pixel asks its own ray, and it
+// is listed and filled anew (`probed`). While matter is changing (the eye moving, cells still
+// refining), probes are kept as they are, so a moving eye still reads them; once it has settled,
+// nothing refills. So the settled picture is that of the settled matter, whatever frame each probe
+// was first asked in.
+//
+// A probe keeps the sky too: the share of the open sky's light (by luminance) still things let
+// through to its point along `SKY_WAYS` fixed ways over its hemisphere, cosine-spread (`sky_way`:
+// the same for every probe and pixel, so a share moves in steps of one in 32 and never flickers),
+// asked with its sun rays. A pixel's open-sky light is scaled by it; moving things' part of the sky
+// is the picture's (`pixels::sky_movers`).
+//
+// Probes are filled by drawing: a probe's ray a fragment (`probe_ray`), a draw a still thing over
+// the rays of the probes waiting (`Store::fill`, `World::each`: each thing's own code; no grid of
+// the world's things yet, and a draw a thing, where a kind's draw would do: gap 29), in at most
+// `FILL` probes a frame, nothing drawn when none wait. A compute dispatch can't hold two marches
+// an invocation within the 50 ms a dispatch may take; a render pass can.
+
+use matter::asked::{Asked, Kinded}
+use matter::cells::{Kept, folded8, unfolded8}
+use matter::sky::Sky
+use matter::world::{Each, World}
+use ray::ray::{Ray, met}
+use reference::traced::{LEAVE, cosine_way}
+use std::collections::Vec
+use std::field::hash_u32
+use std::gpu::{
+    Atomics, Blend, ClipPosition, Flat, FragCoord, GlobalId, GpuBuffer, GpuSpan, InstanceIndex, Pass, R8, Rg8, Rgba16Float, Rgba32Float, Rgba8, Slots, Texture, VertexIndex,
+    begin_pass, buffer, dispatch, draw, label, read, texture,
+}
+use std::io::{Pending, print}
+
+/// The hash table's slots (a power of two), the words a slot holds, and how many slots a key
+/// tries before it gives up (a full table: the pixel asks its own ray).
+const SLOTS: u32 = 524288
+const WORDS: u32 = 8
+const TRIES: u32 = 16
+
+/// A probe's cell is at least this many footprints a side where it was first seen; the least cell
+/// (m); and the rays a probe asks.
+const PROBE_PX: f32 = 4.0
+const CELL0: f32 = 0.0009765625
+const RING: u32 = 9
+
+/// The ways over its hemisphere a probe asks the sky along (cosine-spread, the same for every
+/// probe: `sky_way`), and the rays a probe asks in all.
+pub const SKY_WAYS: u32 = 32
+const RAYS: u32 = RING + SKY_WAYS
+
+/// The most probes waiting to be filled; the most filled a frame; the fill's rays a row.
+const LIST: u32 = 262144
+const FILL: u32 = 4096
+const FW: u32 = 1024
+
+/// A slot's state (its word 3): made, on the list, filled; its rays' answers (bits 3-11 deep,
+/// 12-20 met, 21 near); and from bit 24 the tickets of the pixels that tried to make it (the first
+/// made it). Changed by adding and or-ing only: std's `compare_exchange` tries again without a
+/// bound the compiler can see, and a kernel with it is refused (filed: the toolchain's spec).
+const MADE: u32 = 1
+const LISTED: u32 = 2
+const FILLED: u32 = 4
+const TICKET: u32 = 16777216
+
+/// A slot's state kept when its probe is made again (`probed`): made, pointed and the tickets; not
+/// listed, not filled, no rays' answers.
+const AGAIN: u32 = 4290772993
+
+/// A slot's state: its point and facing written (`probes_pointed`). Until then its word 4 holds
+/// the complement of the least pixel that asked for it this frame (`probes_owned`): a probe's point
+/// is that pixel's whatever order the pixels ran in, so the picture is the same every run.
+const POINTED: u32 = 4194304
+
+/// What a pixel's probe says: nothing, the sun reaches it, it doesn't, there is no probe yet.
+pub const SAYS_LIT: u32 = 1
+pub const SAYS_DARK: u32 = 2
+pub const SAYS_MISSING: u32 = 3
+
+/// The main axis a facing `n` turns to, as 0 to 5 (+x, -x, +y, -y, +z, -z).
+fn face_of(n: vec3) -> u32 {
+    let a = abs(n)
+    if a.x >= a.y && a.x >= a.z {
+        return if n.x >= 0.0 { 0 } else { 1 }
+    }
+    if a.y >= a.z {
+        return if n.y >= 0.0 { 2 } else { 3 }
+    }
+    if n.z >= 0.0 { 4 } else { 5 }
+}
+
+/// A probe's cell's level for a surface seen `size` m finely, and a level's side (m).
+fn level_of(size: f32) -> u32 {
+    u32(clamp(ceil(log2(max(PROBE_PX * size / CELL0, 1.0))), 0.0, 30.0))
+}
+
+fn side_of(level: u32) -> f32 {
+    CELL0 * exp2(f32(level))
+}
+
+/// The key of the probe of a surface at `p` facing `n`, seen `size` m finely: its cell (24 bits
+/// a coordinate, from 2^23 cells below 0), its face and its level; the last word never 0 (a slot
+/// whose last word is 0 is empty).
+fn key_of(p: vec3, n: vec3, size: f32) -> vec3u {
+    let level = level_of(size)
+    let c = floor(p / side_of(level)) + vec3(8388608.0)
+    let u = vec3u(u32(max(c.x, 0.0)) & 16777215, u32(max(c.y, 0.0)) & 16777215, u32(max(c.z, 0.0)) & 16777215)
+    vec3u(u.x | ((face_of(n) + 1) << 24), u.y | (level << 24), u.z | 2147483648)
+}
+
+/// The slot a key tries first.
+fn slot_of(k: vec3u) -> u32 {
+    hash_u32(k.x ^ hash_u32(k.y ^ hash_u32(k.z))) & (SLOTS - 1)
+}
+
+/// What a key claims an empty slot with (`probes_claimed`): the complement of a hash of it other
+/// than `slot_of`'s, so the greatest claim, an atomic max from 0 (empty), is the least hash's: which
+/// key makes a contested slot hangs on the set of keys, never on which arrives first.
+fn claim_of(k: vec3u) -> u32 {
+    4294967295 ^ hash_u32(k.z ^ hash_u32(k.y ^ hash_u32(k.x ^ 2654435769)))
+}
+
+/// What a filled probe's state says: `SAYS_LIT`, `SAYS_DARK`, or 0 (an edge, or not filled).
+fn says(state: u32) -> u32 {
+    if (state & FILLED) == 0 {
+        return 0
+    }
+    let deep = (state >> 3) & 511
+    let hit = (state >> 12) & 511
+    let near = (state >> 21) & 1
+    if hit == 0 && near == 0 {
+        return SAYS_LIT
+    }
+    if deep == 511 {
+        return SAYS_DARK
+    }
+    0
+}
+
+/// The probe of the surface at `p` facing `n`, seen `size` m finely: its state; made (with `p` and
+/// `n`) and queued to be filled where there is none (0 then, as while it is being made).
+fn probed(table: mut Atomics<u32>, waits: mut Atomics<u32>, claims: GpuSpan<u32>, filled_at: GpuSpan<u32>, changes: GpuSpan<u32>, p: vec3, n: vec3, size: f32) -> u32 {
+    let k = key_of(p, n, size)
+    var s = slot_of(k)
+    var state: u32 = 0
+    var going = true
+    for _ in 0..TRIES {
+        if !going {
+            continue
+        }
+        let at = s * WORDS
+        let c = table.load(i: at + 2)
+        if c == 0 {
+            // (Made by the key whose claim won it (`probes_claimed`); the ticket keeps two keys of
+            // one claim (a hash's collision) from both writing it. A key that lost makes its probe
+            // in the next pass, past this slot.)
+            if claims[s] == claim_of(k) {
+                let old = table.add(i: at + 3, value: TICKET)
+                if old < TICKET {
+                    table.store(i: at, value: k.x)
+                    table.store(i: at + 1, value: k.y)
+                    table.store(i: at + 2, value: k.z)
+                    let _ = table.or(i: at + 3, value: MADE)
+                    queued(mut table, mut waits, s)
+                }
+            }
+            going = false
+        } else if c == k.z && table.load(i: at) == k.x && table.load(i: at + 1) == k.y {
+            state = table.load(i: at + 3)
+            if stale(s, state, filled_at, changes) {
+                // (Made again: not filled, no answers, no share of the sky; its point kept. The
+                // pixel that clears its filling clears its share.)
+                let old = table.and(i: at + 3, value: AGAIN)
+                if (old & FILLED) != 0 {
+                    let _ = table.and(i: at + 7, value: 65535)
+                }
+                state = old & AGAIN
+            }
+            if (state & (MADE | LISTED | FILLED)) == MADE {
+                queued(mut table, mut waits, s)
+            }
+            going = false
+        }
+        s = (s + 1) & (SLOTS - 1)
+    }
+    state
+}
+
+/// Slot `s`, made, marked to be filled: the list is made from the marks in slot order
+/// (`probes_counted`), so which probes are filled first hangs on the set waiting, not on arrival.
+fn queued(table: mut Atomics<u32>, waits: mut Atomics<u32>, s: u32) {
+    let _ = table.or(i: s * WORDS + 3, value: LISTED)
+    let _ = waits.or(i: s / 32, value: u32(1) << (s % 32))
+}
+
+/// Each pixel whose probe is missing (`kept`): the empty slot its key would make, claimed with
+/// `claim_of` (the least hash wins it: `probed`).
+@compute(8, 8)
+fn probes_claimed(kept: Texture<Rg8>, place: Texture<Rgba32Float>, asks: Texture<Rgba32Float>, table: GpuSpan<u32>, claims: mut Atomics<u32>, id: GlobalId) {
+    if id.x >= kept.width() || id.y >= kept.height() {
+        return
+    }
+    if said_kept(kept.load(id.x, id.y).x) != SAYS_MISSING {
+        return
+    }
+    let at = place.load(id.x, id.y)
+    let a = asks.load(id.x, id.y)
+    let k = key_of(a.xyz, at.xyz, a.w)
+    var s = slot_of(k)
+    var going = true
+    for _ in 0..TRIES {
+        if !going {
+            continue
+        }
+        let o = s * WORDS
+        let c = table[o + 2]
+        if c == 0 {
+            let _ = claims.max(i: s, value: claim_of(k))
+            going = false
+        } else if c == k.z && table[o] == k.x && table[o + 1] == k.y {
+            going = false
+        }
+        s = (s + 1) & (SLOTS - 1)
+    }
+}
+
+/// The slots `BLOCK` a block (`LIST_BLOCKS` of them, `BLOCK` blocks a run, `LIST_RUNS` runs),
+/// counted, summed and listed in slot order: the list of probes waiting to be filled, made again
+/// each frame (`Store::made`). No invocation loops over more than `LIST_RUNS`.
+const BLOCK: u32 = 64
+const LIST_BLOCKS: u32 = SLOTS / BLOCK
+const LIST_RUNS: u32 = LIST_BLOCKS / BLOCK
+
+/// Whether slot `s`'s probe waits to be filled (`waits`: a bit a slot, set where it is listed,
+/// cleared where it is filled: 64 KB to scan, where the table's state words are 16 MB apart).
+fn waiting(waits: GpuSpan<u32>, s: u32) -> bool {
+    ((waits[s / 32] >> (s % 32)) & 1) != 0
+}
+
+/// Block `id.x`'s slots waiting, into `counts`.
+@compute(64)
+fn probes_counted(waits: GpuSpan<u32>, counts: mut Slots<u32>, id: GlobalId) {
+    if id.x >= LIST_BLOCKS {
+        return
+    }
+    var n: u32 = 0
+    for i in 0..BLOCK {
+        if waiting(waits, id.x * BLOCK + i) {
+            n += 1
+        }
+    }
+    counts[id] = n
+}
+
+/// Run `id.x`'s blocks' counts summed, into `runs`.
+@compute(64)
+fn probes_run(counts: [u32], runs: mut Slots<u32>, id: GlobalId) {
+    if id.x >= LIST_RUNS {
+        return
+    }
+    var n: u32 = 0
+    for i in 0..BLOCK {
+        n += counts[id.x * BLOCK + i]
+    }
+    runs[id] = n
+}
+
+/// Where each run begins in the list (`run_at`), and the list's length (at most `LIST`) into `head`,
+/// its fill from its first.
+@compute(1)
+fn probes_summed(runs: [u32], run_at: mut Atomics<u32>, head: mut Atomics<u32>, id: GlobalId) {
+    var at: u32 = 0
+    for r in 0..LIST_RUNS {
+        run_at.store(i: r, value: at)
+        at += runs[r]
+    }
+    head.store(i: 0, value: min(at, LIST))
+    head.store(i: 1, value: 0)
+}
+
+/// Block `id.x`'s waiting slots written into the list in slot order, from where its run begins and
+/// the blocks before it in the run end, as far as `LIST`.
+@compute(64)
+fn probes_listed(waits: GpuSpan<u32>, counts: [u32], run_at: [u32], list: mut Atomics<u32>, id: GlobalId) {
+    if id.x >= LIST_BLOCKS {
+        return
+    }
+    let first = id.x / BLOCK * BLOCK
+    var at = run_at[id.x / BLOCK]
+    for b in 0..BLOCK {
+        if first + b < id.x {
+            at += counts[first + b]
+        }
+    }
+    for i in 0..BLOCK {
+        let s = id.x * BLOCK + i
+        if waiting(waits, s) {
+            if at < LIST {
+                list.store(i: at, value: s)
+            }
+            at += 1
+        }
+    }
+}
+
+/// The probe of the surface at `p` facing `n`, seen `size` m finely, as read (no change): its
+/// slot and state (`NONE` where it has none, or its slot is being made).
+fn looked_up(table: GpuSpan<u32>, p: vec3, n: vec3, size: f32) -> vec2u {
+    let k = key_of(p, n, size)
+    var s = slot_of(k)
+    var found = vec2u(NONE, 0)
+    var going = true
+    for _ in 0..TRIES {
+        if !going {
+            continue
+        }
+        let at = s * WORDS
+        let c = table[at + 2]
+        if c == 0 {
+            going = false
+        } else if c == k.z && table[at] == k.x && table[at + 1] == k.y {
+            found = vec2u(s, table[at + 3])
+            going = false
+        }
+        s = (s + 1) & (SLOTS - 1)
+    }
+    found
+}
+
+/// No slot.
+const NONE: u32 = 4294967295
+
+/// Whether the probe in `slot` (its state `state`) was filled through matter that has changed
+/// since, and matter is quiet now (`Store::changes`: the count, last frame's, quiet): to be made
+/// again.
+fn stale(slot: u32, state: u32, filled_at: GpuSpan<u32>, changes: GpuSpan<u32>) -> bool {
+    (state & FILLED) != 0 && changes[2] != 0 && filled_at[slot] != changes[0]
+}
+
+/// Matter's changes this frame weighed (`Store::changes`, at the frame's start): quiet where none
+/// came since the last frame's.
+@compute(1)
+fn matter_aged(changes: mut Atomics<u32>, id: GlobalId) {
+    let now = changes.load(i: 0)
+    changes.store(i: 2, value: if now == changes.load(i: 1) { 1 } else { 0 })
+    changes.store(i: 1, value: now)
+}
+
+/// What the store says of the sun from still things at a surface at `p` facing `n`, seen `size` m
+/// finely (an eye draw asks it as it meets the surface): `SAYS_LIT`, `SAYS_DARK`, 0 (it can't
+/// say: an edge, a probe not filled, or a surface off its probe's plane, which the probe's rays
+/// don't cover), or `SAYS_MISSING` (no probe yet, or one not listed: `Store::made` makes it).
+///
+/// And (`y`) the share of the open sky's light the still things let through to it (1 where it
+/// can't say).
+pub fn said(table: GpuSpan<u32>, filled_at: GpuSpan<u32>, changes: GpuSpan<u32>, p: vec3, n: vec3, size: f32) -> vec2 {
+    let f = looked_up(table, p, n, size)
+    if f.x == NONE || (f.y & (MADE | LISTED | FILLED)) == MADE || stale(f.x, f.y, filled_at, changes) {
+        return vec2(f32(SAYS_MISSING), 1.0)
+    }
+    if (f.y & POINTED) == 0 {
+        return vec2(0.0, 1.0)
+    }
+    if (f.y & FILLED) == 0 {
+        return vec2(0.0, 1.0)
+    }
+    let at = f.x * WORDS
+    let q = vec3(bitcast_f32(table[at + 4]), bitcast_f32(table[at + 5]), bitcast_f32(table[at + 6]))
+    let h = side_of((table[at + 1] >> 24) & 31)
+    let word = table[at + 7]
+    // (Within a quarter of its ring's reach of its plane: the lift and the tubes cover that.)
+    if abs(dot(p - q, unfolded8(word))) > 0.225 * h {
+        return vec2(0.0, 1.0)
+    }
+    vec2(f32(says(f.y)), f32(word >> 16) / 65535.0)
+}
+
+/// Way `j` of `SKY_WAYS` over the hemisphere about `n`, cosine-spread (the same for every probe
+/// and pixel: no noise; a share of the sky in steps of one in `SKY_WAYS`).
+pub fn sky_way(n: vec3, j: u32) -> vec3 {
+    var bits = j
+    bits = ((bits << 16) | (bits >> 16))
+    bits = ((bits & 1431655765) << 1) | ((bits & 2863311530) >> 1)
+    bits = ((bits & 858993459) << 2) | ((bits & 3435973836) >> 2)
+    bits = ((bits & 252645135) << 4) | ((bits & 4042322160) >> 4)
+    bits = ((bits & 16711935) << 8) | ((bits & 4278255360) >> 8)
+    cosine_way(n, (f32(j) + 0.5) / f32(SKY_WAYS), f32(bits) * 2.3283064e-10)
+}
+
+/// What a pixel's probe said (`said`), as a picture keeps it (a texel of `R8`: a third a step).
+pub fn said_kept(v: f32) -> u32 {
+    u32(v * 3.0 + 0.5)
+}
+
+/// Each pixel whose probe is missing (`said`, kept in `kept`): its probe made and listed.
+@compute(8, 8)
+fn probes_made(kept: Texture<Rg8>, place: Texture<Rgba32Float>, asks: Texture<Rgba32Float>, filled_at: GpuSpan<u32>, changes: GpuSpan<u32>, claims: GpuSpan<u32>, table: mut Atomics<u32>, waits: mut Atomics<u32>, id: GlobalId) {
+    if id.x >= kept.width() || id.y >= kept.height() {
+        return
+    }
+    if said_kept(kept.load(id.x, id.y).x) != SAYS_MISSING {
+        return
+    }
+    let at = place.load(id.x, id.y)
+    let a = asks.load(id.x, id.y)
+    let _ = probed(mut table, mut waits, claims, filled_at, changes, a.xyz, at.xyz, a.w)
+}
+
+/// Each pixel whose probe was missing (`kept`): offered as its probe's owner, where the probe has
+/// no point yet: the least pixel's number is kept (its complement, by the most).
+@compute(8, 8)
+fn probes_owned(kept: Texture<Rg8>, place: Texture<Rgba32Float>, asks: Texture<Rgba32Float>, table: mut Atomics<u32>, id: GlobalId) {
+    let w = kept.width()
+    if id.x >= w || id.y >= kept.height() {
+        return
+    }
+    if said_kept(kept.load(id.x, id.y).x) != SAYS_MISSING {
+        return
+    }
+    let at = place.load(id.x, id.y)
+    let a = asks.load(id.x, id.y)
+    let k = key_of(a.xyz, at.xyz, a.w)
+    var s = slot_of(k)
+    var going = true
+    for _ in 0..TRIES {
+        if !going {
+            continue
+        }
+        let o = s * WORDS
+        let c = table.load(i: o + 2)
+        if c == 0 {
+            going = false
+        } else if c == k.z && table.load(i: o) == k.x && table.load(i: o + 1) == k.y {
+            if (table.load(i: o + 3) & POINTED) == 0 {
+                let _ = table.max(i: o + 4, value: 4294967295 ^ (id.x + w * id.y))
+            }
+            going = false
+        }
+        s = (s + 1) & (SLOTS - 1)
+    }
+}
+
+/// Each probe listed and not yet pointed: its point and facing its owner pixel's (`probes_owned`),
+/// read from this frame's picture.
+@compute(64)
+fn probes_pointed(place: Texture<Rgba32Float>, asks: Texture<Rgba32Float>, list: [u32], head: [u32], table: mut Atomics<u32>, id: GlobalId) {
+    if id.x >= min(head[0], LIST) {
+        return
+    }
+    let o = list[id.x] * WORDS
+    if (table.load(i: o + 3) & POINTED) != 0 {
+        return
+    }
+    let owner = table.load(i: o + 4)
+    if owner == 0 {
+        return
+    }
+    let pix = 4294967295 ^ owner
+    let w = place.width()
+    let at = place.load(pix % w, pix / w)
+    let p = asks.load(pix % w, pix / w).xyz
+    table.store(i: o + 4, value: bitcast_u32(p.x))
+    table.store(i: o + 5, value: bitcast_u32(p.y))
+    table.store(i: o + 6, value: bitcast_u32(p.z))
+    table.store(i: o + 7, value: folded8(at.xyz))
+    let _ = table.or(i: o + 3, value: POINTED)
+}
+
+/// `n` zeroed words of `words`, `first` on.
+@compute(64)
+fn zeroed(words: mut Atomics<u32>, n: u32, first: u32, id: GlobalId) {
+    let i = first + id.x
+    if i < n {
+        words.store(i: i, value: 0)
+    }
+}
+
+/// How many probes are filled this frame: those waiting from the last filled on, at most `FILL`.
+fn chunk(head: GpuSpan<u32>) -> u32 {
+    let n = min(head[0], LIST)
+    if n <= head[1] {
+        return 0
+    }
+    min(n - head[1], FILL)
+}
+
+/// The rows of the fill's rays this frame, as a quad over the fill's target (`rows` high): none
+/// when no probe waits.
+@vertex
+fn fill_quad(v: VertexIndex, head: GpuSpan<u32>, rows: u32) -> ClipPosition {
+    ClipPosition { position: quad_at(v.index, head, rows) }
+}
+
+/// Corner `k` of `fill_quad`'s quad.
+fn quad_at(k: u32, head: GpuSpan<u32>, rows: u32) -> vec4 {
+    let used = (chunk(head) * RAYS + FW - 1) / FW
+    let y1 = 1.0 - 2.0 * f32(used) / f32(rows)
+    let x = if k == 1 || k == 2 || k == 4 { 1.0 } else { -1.0 }
+    let y = if k == 2 || k == 4 || k == 5 { y1 } else { 1.0 }
+    vec4(x, y, 0.5, 1.0)
+}
+
+/// Two unit vectors square to `n` and to each other.
+fn tangents(n: vec3) -> (vec3, vec3) {
+    let s = if n.z >= 0.0 { 1.0 } else { -1.0 }
+    let a = -1.0 / (s + n.z)
+    let b = n.x * n.y * a
+    (vec3(1.0 + s * n.x * n.x * a, s * b, -s * n.x), vec3(b, s + n.y * n.y * a, -n.y))
+}
+
+/// Ray `r` of a probe at `q` facing `n` in a cell `h` m a side: where it starts (its cell's middle
+/// brought into its tangent plane, and for `r` over 0 a point of a ring round it as far as the
+/// cell's surface can reach, lifted off it), and the tube's radius round each ray that
+/// covers the disc with the others.
+fn ring_from(q: vec3, n: vec3, h: f32, r: u32) -> vec4 {
+    let c = (floor(q / h) + vec3(0.5)) * h
+    let mid = c - n * dot(c - q, n)
+    let reach = 0.9 * h
+    var o = mid
+    if r > 0 {
+        let (e1, e2) = tangents(n)
+        let turn = 6.2831853 * f32(r - 1) / f32(RING - 1)
+        o = mid + (e1 * cos(turn) + e2 * sin(turn)) * reach
+    }
+    // (Lifted by a twentieth of its reach: the facing is kept to about half a degree, and a ring
+    // laid in a tangent plane tilted that much starts under a flat surface; the tube round each
+    // ray covers the surface's points below it.)
+    vec4(o + n * (LEAVE + 0.05 * reach), 0.55 * reach)
+}
+
+/// One ray of one probe waiting (fragment `pixel` of the fill's target: probe `i / RING` of this
+/// frame's, its ray `i % RING`) against the still thing `w` (bound `bound`): red if it meets it and
+/// is deep in it past where it meets it, green if it meets it, blue if it passes within its tube
+/// (the most of every thing's is kept: `Blend::Max`).
+@fragment
+fn probe_ray<A: Asked>(pixel: FragCoord, w: A, bound: vec4, sun: vec3, table: GpuSpan<u32>, list: GpuSpan<u32>, head: GpuSpan<u32>) -> vec4 {
+    probe_rayed(pixel, w, bound, sun, table, list, head)
+}
+
+/// What a probe's ray says (`probe_ray`).
+fn probe_rayed<A: Asked>(pixel: FragCoord, w: A, bound: vec4, sun: vec3, table: GpuSpan<u32>, list: GpuSpan<u32>, head: GpuSpan<u32>) -> vec4 {
+    let i = u32(pixel.position.x) + FW * u32(pixel.position.y)
+    if i >= chunk(head) * RAYS {
+        return vec4(0.0)
+    }
+    let slot = list[head[1] + i / RAYS]
+    let at = slot * WORDS
+    let q = vec3(bitcast_f32(table[at + 4]), bitcast_f32(table[at + 5]), bitcast_f32(table[at + 6]))
+    let n = unfolded8(table[at + 7])
+    let h = side_of((table[at + 1] >> 24) & 31)
+    let ray = i % RAYS
+    if ray >= RING {
+        // A way to the sky, from the probe's point: green where it meets the thing.
+        let o = q + n * (LEAVE + 0.05 * h)
+        let d = sky_way(n, ray - RING)
+        let c = bound.xyz - o
+        let along = max(dot(c, d), 0.0)
+        if length(c - d * along) > bound.w * 1.7320508 {
+            return vec4(0.0)
+        }
+        let m = met(w, Ray { o, d, from: 0.0, to: 1.0e9, wide: h / PROBE_PX, spread: 0.0 })
+        return if m.met { vec4(0.0, 1.0, 0.0, 0.0) } else { vec4(0.0) }
+    }
+    let lean = dot(n, sun)
+    if lean < 0.2 {
+        // (The sun low on it: the tube can't leave its own surface soon enough to say anything.)
+        return vec4(0.0, 0.0, 1.0, 0.0)
+    }
+    let from = ring_from(q, n, h, ray)
+    let o = from.xyz
+    let rho = from.w
+    // (Nowhere near the thing: nothing to say.)
+    let c = bound.xyz - o
+    let along = max(dot(c, sun), 0.0)
+    if length(c - sun * along) > bound.w * 1.7320508 + rho {
+        return vec4(0.0)
+    }
+    let m = met(w, Ray { o, d: sun, from: 0.0, to: 1.0e9, wide: h / PROBE_PX, spread: 0.0 })
+    if m.met {
+        var deep = 0.0
+        for k in 1..9 {
+            let t = m.t + rho * 0.5 * f32(k)
+            if w.far(m.walk, o + sun * t, t, rho) < -rho {
+                deep = 1.0
+            }
+        }
+        return vec4(deep, 1.0, 0.0, 0.0)
+    }
+    // (Past where the tube is clear of its own plane, with a margin: there it touches it.)
+    let past = met(w, Ray { o, d: sun, from: 1.5 * rho / lean, to: 1.0e9, wide: 2.0 * rho, spread: 0.0 })
+    if past.met || past.nearest < 0.5 {
+        return vec4(0.0, 0.0, 1.0, 0.0)
+    }
+    vec4(0.0)
+}
+
+/// A corner of a kind's fill draw (`Filling::kind`), as the fragments between take it: which
+/// thing of the kind.
+pub struct FillCorner: Copy {
+    pub clip: ClipPosition,
+    pub one: Flat<u32>,
+}
+
+/// `fill_quad`, an instance a thing of a kind.
+@vertex
+fn fill_quad_kind(v: VertexIndex, i: InstanceIndex, head: GpuSpan<u32>, rows: u32) -> FillCorner {
+    FillCorner { clip: ClipPosition { position: quad_at(v.index, head, rows) }, one: Flat { value: i.index } }
+}
+
+/// The rays of the probes waiting against thing `c.one` of a still kind `k`, drawn with the rest
+/// of its kind: as `probe_ray`.
+@fragment
+fn probe_ray_kind<K: Kinded>(c: FillCorner, pixel: FragCoord, k: K, sun: vec3, table: GpuSpan<u32>, list: GpuSpan<u32>, head: GpuSpan<u32>) -> vec4 {
+    probe_rayed(pixel, k.one(c.one.value), k.bound(c.one.value), sun, table, list, head)
+}
+
+/// This frame's probes, their rays' answers gathered (`rays`, the fill's target) into their state.
+@compute(64)
+fn probes_settled<S: Sky>(rays: Texture<Rgba8>, list: [u32], head: [u32], sky: S, changes: [u32], table: mut Atomics<u32>, filled_at: mut Atomics<u32>, waits: mut Atomics<u32>, id: GlobalId) {
+    let j = id.x
+    let n = min(head[0], LIST)
+    if n <= head[1] || j >= min(n - head[1], FILL) {
+        return
+    }
+    let slot = list[head[1] + j]
+    // (The share of the open sky's light, by its luminance, its clear ways let through, in the
+    // high half of its facing's word.)
+    let facing = unfolded8(table.load(i: slot * WORDS + 7))
+    var open = 0.0
+    var seen = 0.0
+    for r in 0..SKY_WAYS {
+        let i = j * RAYS + RING + r
+        let l = dot(sky.light(sky_way(facing, r)), vec3(0.2126, 0.7152, 0.0722))
+        open += l
+        if rays.load(i % FW, i / FW).y < 0.5 {
+            seen += l
+        }
+    }
+    let share = if open > 0.0 { clamp(seen / open, 0.0, 1.0) } else { 1.0 }
+    let _ = table.or(i: slot * WORDS + 7, value: u32(share * 65535.0 + 0.5) << 16)
+    var state = FILLED
+    for r in 0..RING {
+        let i = j * RAYS + r
+        let v = rays.load(i % FW, i / FW)
+        if v.x > 0.5 {
+            state = state | (1 << (3 + r))
+        }
+        if v.y > 0.5 {
+            state = state | (1 << (12 + r))
+        }
+        if v.z > 0.5 {
+            state = state | (1 << 21)
+        }
+    }
+    let _ = table.or(i: slot * WORDS + 3, value: state)
+    filled_at.store(i: slot, value: changes[0])
+    let _ = waits.and(i: slot / 32, value: 4294967295 ^ (u32(1) << (slot % 32)))
+}
+
+/// The list's head moved past this frame's probes; once every probe on it is filled (or past its
+/// room: those wait unlisted and are listed again where a pixel next reads them), emptied.
+@compute(1)
+fn probes_advanced(head: mut Atomics<u32>, id: GlobalId) {
+    let n = min(head.load(i: 0), LIST)
+    let done = head.load(i: 1)
+    let next = if n > done { done + min(n - done, FILL) } else { done }
+    if next >= n {
+        head.store(i: 0, value: 0)
+        head.store(i: 1, value: 0)
+    } else {
+        head.store(i: 1, value: next)
+    }
+}
+
+/// An instrument: of the pixels the main picture showed in the sun, those whose probe decided
+/// (`said`, kept in `kept`'s alpha), held to the still things' rays alone (`sunny`, the shadow draws with every moving
+/// thing left out): pixels in the sun, decided, decided lit where the ray found shadow (light
+/// through matter: a leak), decided dark where the ray found the sun; and the slots in use.
+@compute(8, 8)
+fn probes_checked(place: Texture<Rgba32Float>, lit: Texture<Rgba16Float>, sunny: Texture<R8>, kept: Texture<Rg8>, counts: mut Atomics<u32>, id: GlobalId) {
+    let w = place.width()
+    if id.x >= w || id.y >= place.height() {
+        return
+    }
+    if place.load(id.x, id.y).w <= 0.0 || (u32(lit.load(id.x, id.y).w + 0.5) & 1) == 0 {
+        return
+    }
+    let _ = counts.add(i: 0, value: 1)
+    let s = said_kept(kept.load(id.x, id.y).x)
+    if s == SAYS_LIT || s == SAYS_DARK {
+        let _ = counts.add(i: 1, value: 1)
+        // (Checking, a still thing's shadow ray gives how far it went to meet matter, of a metre,
+        // under 0.99: `shadow`'s `checking`.)
+        let sun: f32 = sunny.load(id.x, id.y)
+        let hit = sun < 0.995
+        if s == SAYS_LIT && hit {
+            let _ = counts.add(i: 2, value: 1)
+            let _ = counts.min(i: 9, value: u32(sun * 255.0 + 0.5))
+            let _ = counts.max(i: 10, value: u32(sun * 255.0 + 0.5))
+        }
+        if s == SAYS_DARK && !hit {
+            let _ = counts.add(i: 3, value: 1)
+        }
+    }
+}
+
+/// The least of the instrument's counts' distances set at its most, before it is counted.
+@compute(1)
+fn lowest(counts: mut Atomics<u32>, id: GlobalId) {
+    counts.store(i: 9, value: 255)
+}
+
+/// The table's slots in use and filled (an instrument), `first` on.
+@compute(64)
+fn slots_counted(table: [u32], first: u32, counts: mut Atomics<u32>, id: GlobalId) {
+    let s = first + id.x
+    if s >= SLOTS {
+        return
+    }
+    if table[s * WORDS + 2] != 0 {
+        let _ = counts.add(i: 4, value: 1)
+        let st = table[s * WORDS + 3]
+        if (st & FILLED) != 0 {
+            let _ = counts.add(i: 5, value: 1)
+            let v = says(st)
+            if v == SAYS_LIT {
+                let _ = counts.add(i: 6, value: 1)
+            } else if v == SAYS_DARK {
+                let _ = counts.add(i: 7, value: 1)
+            } else if ((st >> 21) & 1) != 0 {
+                let _ = counts.add(i: 8, value: 1)
+            }
+        }
+    }
+}
+
+/// The still things' fill draws into one pass (`World::each`): a still thing's draw over the rays
+/// of this frame's probes.
+borrow struct Filling {
+    pass: Pass<Rgba8>,
+    kept: borrow Vec<Kept>,
+    sun: vec3,
+    table: GpuSpan<u32>,
+    list: GpuSpan<u32>,
+    head: GpuSpan<u32>,
+}
+
+impl Each for Filling {
+    fn kind<K: Kinded>(mut self, k: K, n: u32, first: u32) {
+        if self.kept[first].moving {
+            return
+        }
+        for b in 0..FILL_BANDS {
+            if banded(mut self.pass, b) {
+                draw(self.pass, fill_quad_kind.bind(head: self.head, rows: FILL * RAYS / FW), probe_ray_kind.bind(k: k, sun: self.sun, table: self.table, list: self.list, head: self.head), vertices: 6, instances: n, blend: Blend::Max)
+            }
+        }
+    }
+
+    fn thing<A: Asked>(mut self, a: A, k: u32, bound: vec4) {
+        if self.kept[k].moving {
+            return
+        }
+        for b in 0..FILL_BANDS {
+            if banded(mut self.pass, b) {
+                draw(self.pass, fill_quad.bind(head: self.head, rows: FILL * RAYS / FW), probe_ray.bind(w: a, bound: bound, sun: self.sun, table: self.table, list: self.list, head: self.head), vertices: 6, blend: Blend::Max)
+            }
+        }
+    }
+}
+
+/// How many draws a thing's fill is cut into, by bands of the fill's rows: a still thing's rays
+/// for a frame's `FILL` probes are a march each (the stage's held the Radeon 89 ms as one draw,
+/// which the guard can't cut), so each band is a draw of its own.
+const FILL_BANDS: u32 = 16
+
+/// The fill's pass held to band `b` of its rows (`FILL_BANDS`); false for a band past them.
+fn banded(pass: mut Pass<Rgba8>, b: u32) -> bool {
+    let rows = FILL * RAYS / FW
+    let y0 = b * rows / FILL_BANDS
+    let y1 = (b + 1) * rows / FILL_BANDS
+    if y1 <= y0 {
+        return false
+    }
+    pass.scissor(0, y0, FW, y1 - y0)
+    true
+}
+
+/// Light's store: its table of probes, the list of those waiting, what each pixel's probe
+/// decided, and what it knows of the world it was filled for (the sun, which things were still).
+pub struct Store {
+    table: GpuBuffer<u32>,
+    /// Each slot's claim this frame (`probes_claimed`: the least key hash's complement; 0 none).
+    claims: GpuBuffer<u32>,
+    /// A bit a slot whose probe waits to be filled (`waiting`).
+    waits: GpuBuffer<u32>,
+    /// Each block's slots waiting, each run's, and where each run begins in the list
+    /// (`probes_counted`), for the list made in slot order.
+    list_counts: GpuBuffer<u32>,
+    list_runs: GpuBuffer<u32>,
+    run_at: GpuBuffer<u32>,
+    head: GpuBuffer<u32>,
+    list: GpuBuffer<u32>,
+    rays: Texture<Rgba8>,
+    sun: vec3,
+    moving: Vec<bool>,
+    /// An instrument: the main picture's decided pixels held to the rays (`checked`), its counts;
+    /// and the store left out (`off`: every pixel's sun by its ray, as before the store).
+    pub checking: bool,
+    pub off: bool,
+    counts: GpuBuffer<u32>,
+    counted: Option<Pending<u32>>,
+    /// Still matter's changes (`Kept::refine` counts each split and fold into word 0), last frame's
+    /// count (1), and whether none came since (2: quiet); and the count each slot's probe was filled
+    /// at.
+    pub changes: GpuBuffer<u32>,
+    filled_at: GpuBuffer<u32>,
+}
+
+/// An empty store.
+pub fn store() -> Store {
+    Store {
+        table: buffer(SLOTS * WORDS),
+        claims: buffer(SLOTS),
+        waits: buffer(SLOTS / 32),
+        list_counts: buffer(LIST_BLOCKS),
+        list_runs: buffer(LIST_RUNS),
+        run_at: buffer(LIST_RUNS),
+        head: buffer(2),
+        list: buffer(LIST),
+        rays: texture(width: FW, height: FILL * RAYS / FW),
+        sun: vec3(0.0),
+        moving: Vec::new(),
+        checking: false,
+        off: false,
+        counts: buffer(11),
+        counted: None,
+        changes: buffer(3),
+        filled_at: buffer(SLOTS),
+    }
+}
+
+impl Store {
+    /// Brought up to the world's still things and the sun: emptied where the sun turned or a thing
+    /// began or stopped moving (what a probe knows of them is wrong then).
+    pub fn kept_for(mut self, kept: Vec<Kept>, sun: vec3) {
+        dispatch(matter_aged.bind(changes: mut self.changes), over: 1)
+        var same = dot(sun, self.sun) > 0.9999999 && self.moving.len() == kept.len()
+        if same {
+            for i in 0..kept.len() {
+                same = same && self.moving[i] == kept[i].moving
+            }
+        }
+        if same {
+            return
+        }
+        label("light emptied")
+        let n = SLOTS * WORDS
+        var first: u32 = 0
+        while first < n {
+            dispatch(zeroed.bind(words: mut self.table, n: n, first: first), over: min(1048576, n - first))
+            first += 1048576
+        }
+        dispatch(zeroed.bind(words: mut self.head, n: 2, first: 0), over: 2)
+        dispatch(zeroed.bind(words: mut self.claims, n: SLOTS, first: 0), over: SLOTS)
+        dispatch(zeroed.bind(words: mut self.waits, n: SLOTS / 32, first: 0), over: SLOTS / 32)
+        self.sun = sun
+        self.moving = Vec::new()
+        for i in 0..kept.len() {
+            self.moving.push(kept[i].moving)
+        }
+    }
+
+    /// The table, as the eye draws read it (`said`).
+    pub fn table(self) -> GpuSpan<u32> {
+        self.table.items()
+    }
+
+    /// The count each slot's probe was filled at, and matter's changes (`said`).
+    pub fn filled_at(self) -> GpuSpan<u32> {
+        self.filled_at.items()
+    }
+
+    pub fn changed(self) -> GpuSpan<u32> {
+        self.changes.items()
+    }
+
+    /// The probes the picture found missing (`said`, kept in `kept`) made and listed.
+    pub fn made(mut self, kept: Texture<Rg8>, place: Texture<Rgba32Float>, asks: Texture<Rgba32Float>) {
+        label("light made")
+        // (Three passes, each a claim of the empty slots and the making of those won: a key that
+        // lost its slot to another in one makes it in the next.)
+        let g = ((kept.width() + 7) / 8, (kept.height() + 7) / 8, 1)
+        for _ in 0..3 {
+            dispatch(probes_claimed.bind(kept, place, asks, table: self.table.items(), claims: mut self.claims), groups: g)
+            dispatch(probes_made.bind(kept, place, asks, filled_at: self.filled_at.items(), changes: self.changes.items(), claims: self.claims.items(), table: mut self.table, waits: mut self.waits), groups: g)
+        }
+        dispatch(probes_owned.bind(kept, place, asks, table: mut self.table), groups: g)
+        // (The list made again from the marks, in slot order.)
+        dispatch(probes_counted.bind(waits: self.waits.items(), counts: mut self.list_counts), over: LIST_BLOCKS)
+        dispatch(probes_run.bind(counts: self.list_counts.items(), runs: mut self.list_runs), over: LIST_RUNS)
+        dispatch(probes_summed.bind(runs: self.list_runs.items(), run_at: mut self.run_at, head: mut self.head), over: 1)
+        dispatch(probes_listed.bind(waits: self.waits.items(), counts: self.list_counts.items(), run_at: self.run_at.items(), list: mut self.list), over: LIST_BLOCKS)
+        dispatch(probes_pointed.bind(place, asks, list: self.list.items(), head: self.head.items(), table: mut self.table), over: LIST)
+    }
+
+    /// The probes waiting filled, `FILL` a frame, by a draw a still thing of `world`; nothing
+    /// drawn when the last read of the list said none wait.
+    pub fn fill<W: World, S: Sky>(mut self, world: W, kinds: W::Kinds, kept: Vec<Kept>, sky: S) {
+        let sun = sky.sun().way
+        // (Every frame, by count, never by time or a read back: what a frame holds is the same
+        // every run. With nothing waiting the draws cover nothing: `fill_quad`.)
+        label("light filled")
+        var f = Filling { pass: begin_pass(mut self.rays, clear: vec4(0.0)), kept, sun, table: self.table.items(), list: self.list.items(), head: self.head.items() }
+        world.each(kept, kinds, 0, mut f)
+        f.pass.end()
+        dispatch(probes_settled.bind(rays: self.rays, list: self.list.items(), head: self.head.items(), sky: sky, changes: self.changes.items(), table: mut self.table, filled_at: mut self.filled_at, waits: mut self.waits), over: FILL)
+        dispatch(probes_advanced.bind(head: mut self.head), over: 1)
+    }
+
+    /// An instrument (`checking`): the main picture's decided pixels held to the still things'
+    /// rays (`sunny`, drawn with the moving things' shadows left out), and the slots in use;
+    /// printed when back.
+    pub fn checked(mut self, place: Texture<Rgba32Float>, lit: Texture<Rgba16Float>, sunny: Texture<R8>, kept: Texture<Rg8>) {
+        match mut self.counted {
+            Some(p) => match p.poll() {
+                Some(Ok(c)) => {
+                    print(f"light: {c[1]} of {c[0]} px in the sun decided by their probes; lit where the ray finds shadow {c[2]} (it met matter {f32(c[9]) / 255.0} to {f32(c[10]) / 255.0} m on, 0.99: farther); dark where it finds the sun {c[3]}; probes {c[4]} ({c[5]} filled: {c[6]} lit, {c[7]} dark, {c[8]} near something) of {SLOTS}")
+                    self.counted = None
+                },
+                // (Not read: counted again.)
+                Some(Err(_)) => {
+                    self.counted = None
+                },
+                None => {},
+            },
+            None => {
+                dispatch(zeroed.bind(words: mut self.counts, n: 11, first: 0), over: 11)
+                dispatch(lowest.bind(counts: mut self.counts), over: 1)
+                dispatch(probes_checked.bind(place, lit, sunny, kept, counts: mut self.counts), groups: ((place.width() + 7) / 8, (place.height() + 7) / 8, 1))
+                dispatch(slots_counted.bind(table: self.table.items(), first: 0, counts: mut self.counts), over: SLOTS)
+                self.counted = Some(read(self.counts.items()))
+            },
+        }
+    }
+
+    /// The bytes it holds.
+    pub fn bytes(self) -> f32 {
+        f32(SLOTS * WORDS + LIST + 2) * 4.0 + f32(FW * FILL * RAYS / FW) * 4.0
+    }
+}

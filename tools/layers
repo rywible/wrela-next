@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+"""The layers' rules (docs/design.md, "The layers"), checked. Usage:
+
+    tools/layers [ROOT]
+
+Reads every package (a wrela.toml) under lib/ and game/ and every .wrela file in them, and fails
+if any of these is broken:
+
+  1. Only lib/engine touches the GPU: a .wrela file outside lib/engine and lib/std that names
+     `std::gpu` (a `use` of it or a path through it) is an engine bug.
+  2. Dependencies point down, in the design's order: std, engine, kit, then the game's world,
+     look, rules and scenes. A package may depend only on packages before it. A package not in
+     that order fails too: place it there first.
+  3. Matter never sees how it is viewed: only the look and the scenes may see the picture. A file
+     of lib/kit (outside lib/kit/looks), game/world or game/rules that names `engine::picture`, or
+     that asks a field for its value over a footprint (`.filtered(`, a pixel's or a cell's span),
+     is refused.
+  4. The engine knows properties, never things: no public name in lib/engine (a `pub` fn,
+     struct, enum, trait, type or const, or a module's file name) may hold, as one of its words,
+     a noun of the game: a public type or a file name of a package under game/. The words the
+     design gives the engine itself (sky, look, world, scene, rules, main) are allowed.
+
+Prints each fault with its file and line, and "layers: ok" when there are none.
+
+Exit status: 0 when every rule holds; 1 when one is broken; 2 for a usage error.
+"""
+
+import os
+import re
+import sys
+
+ORDER = ["std", "engine", "kit", "world", "look", "rules", "scenes"]
+ENGINE_WORDS = {"sky", "look", "world", "scene", "scenes", "rules", "main"}
+SEES_PICTURE = re.compile(r"\bengine::picture\b")
+FILTERED = re.compile(r"\.filtered\(")
+GPU = re.compile(r"\bstd::gpu\b")
+PUB = re.compile(r"^\s*pub(?:\([a-z]+\))?\s+(?:fn|struct|enum|trait|type|const)\s+([A-Za-z_][A-Za-z0-9_]*)")
+TYPE = re.compile(r"^\s*pub(?:\([a-z]+\))?\s+(?:struct|enum|trait|type)\s+([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def words(name):
+    """A name's words, lower case: snake_case and CamelCase both split."""
+    out = []
+    for part in name.split("_"):
+        out += re.findall(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|[0-9]+", part)
+    return [w.lower() for w in out if w]
+
+
+def code_lines(path):
+    """Each line of a .wrela file with its comments taken out, numbered from 1."""
+    with open(path, encoding="utf-8") as f:
+        for n, line in enumerate(f, 1):
+            # (A `//` inside a string literal is rare in these files; a string holding one would
+            # only hide the rest of its line from the check.)
+            yield n, line.split("//", 1)[0]
+
+
+def packages(root):
+    """Every package under lib/ and game/: its name, its directory, its dependencies' names."""
+    found = []
+    for top in ("lib", "game"):
+        for d, dirs, files in os.walk(os.path.join(root, top)):
+            if "target" in dirs:
+                dirs.remove("target")
+            if "wrela.toml" in files:
+                name, deps, section = None, [], None
+                with open(os.path.join(d, "wrela.toml"), encoding="utf-8") as f:
+                    for line in f:
+                        line = line.split("#", 1)[0].strip()
+                        m = re.match(r"^\[(.+)\]$", line)
+                        if m:
+                            section = m.group(1)
+                            continue
+                        m = re.match(r'^([A-Za-z_][A-Za-z0-9_-]*)\s*=\s*(.+)$', line)
+                        if not m:
+                            continue
+                        if section == "package" and m.group(1) == "name":
+                            name = m.group(2).strip().strip('"')
+                        elif section == "dependencies":
+                            deps.append(m.group(1))
+                found.append((name or os.path.basename(d), d, deps))
+    return found
+
+
+def main():
+    if len(sys.argv) > 2 or (len(sys.argv) == 2 and sys.argv[1].startswith("-")):
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    root = os.path.abspath(sys.argv[1] if len(sys.argv) == 2 else os.path.join(os.path.dirname(__file__), ".."))
+    faults = []
+    rel = lambda p: os.path.relpath(p, root)
+
+    # 2. Dependencies point down.
+    pkgs = packages(root)
+    for name, d, deps in pkgs:
+        if name == "std" and rel(d) == os.path.join("lib", "std"):
+            continue
+        if name not in ORDER:
+            faults.append(f"{rel(d)}/wrela.toml: package `{name}` is in no layer of the design's order ({', '.join(ORDER)})")
+            continue
+        for dep in deps:
+            if dep not in ORDER:
+                faults.append(f"{rel(d)}/wrela.toml: `{name}` depends on `{dep}`, which is in no layer")
+            elif ORDER.index(dep) >= ORDER.index(name):
+                faults.append(f"{rel(d)}/wrela.toml: `{name}` depends on `{dep}`, which is not below it ({', '.join(ORDER)})")
+
+    # 1, 3 and 4, file by file.
+    nouns = set()
+    engine_names = []
+    sources = []
+    for top in ("lib", "game"):
+        for d, dirs, files in os.walk(os.path.join(root, top)):
+            for f in files:
+                if f.endswith(".wrela"):
+                    sources.append(os.path.join(d, f))
+    for path in sorted(sources):
+        r = rel(path)
+        in_std = r.startswith(os.path.join("lib", "std") + os.sep)
+        in_engine = r.startswith(os.path.join("lib", "engine") + os.sep)
+        in_game = r.startswith("game" + os.sep)
+        blind = (r.startswith(os.path.join("lib", "kit") + os.sep) and not r.startswith(os.path.join("lib", "kit", "looks") + os.sep)) \
+            or r.startswith(os.path.join("game", "world") + os.sep) or r.startswith(os.path.join("game", "rules") + os.sep)
+        if in_game:
+            stem = os.path.splitext(os.path.basename(path))[0]
+            nouns.update(words(stem))
+        if in_engine:
+            engine_names.append((r, 0, os.path.splitext(os.path.basename(path))[0]))
+        for n, line in code_lines(path):
+            if not in_std and not in_engine and GPU.search(line):
+                faults.append(f"{r}:{n}: names std::gpu: only lib/engine touches the GPU")
+            if blind and SEES_PICTURE.search(line):
+                faults.append(f"{r}:{n}: names engine::picture: matter never sees how it is viewed")
+            if blind and FILTERED.search(line):
+                faults.append(f"{r}:{n}: asks a field over a footprint (`.filtered(`): matter never sees how it is viewed")
+            if in_game:
+                m = TYPE.match(line)
+                if m:
+                    nouns.update(words(m.group(1)))
+            if in_engine:
+                m = PUB.match(line)
+                if m:
+                    engine_names.append((r, n, m.group(1)))
+    nouns -= ENGINE_WORDS
+    for r, n, name in engine_names:
+        hit = [w for w in words(name) if w in nouns]
+        if hit:
+            where = f"{r}:{n}" if n else r
+            faults.append(f"{where}: the engine's name `{name}` holds the game's noun `{hit[0]}`: the engine knows properties, never things")
+
+    for f in faults:
+        print(f"layers: {f}")
+    if faults:
+        print(f"layers: {len(faults)} fault(s)")
+        return 1
+    print(f"layers: ok ({len(pkgs)} packages, {len(sources)} files; the game's nouns: {', '.join(sorted(nouns))})")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

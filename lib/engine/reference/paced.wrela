@@ -1,0 +1,521 @@
+// The reference's work, paced: each pixel's middle ray and every look, as `traced` asks them and in
+// its order, cut into calls of at most `UNITS` steps (each step one ask of matter, or one surface:
+// its facing and what it is made of), the pixel's whole state kept between calls. So one call's work
+// a pixel is bounded before it is sent, whatever the pixel (a ray that grazes a surface for its
+// whole march, a sun's ray along a floor): AGENTS.md rule 2 for a brute force that is not allowed to
+// be cut by how long it takes. A pixel's answers are `traced`'s to the bit: the same arithmetic in
+// the same order, only paused.
+
+use matter::matter::Matter
+use matter::sky::{Sky, seen}
+use matter::substance::Substance
+use picture::eye::View
+use picture::look::{Look, Seen}
+use picture::screen::luma
+use reference::reference::{THICK, dice, jitter}
+use reference::traced::{FAR, LEAVE, MOST_BOUNCES, MOST_RAYS, MOST_STEPS, SIMPLE, cosine_way, die, sun_way}
+use std::field::Field
+use std::gpu::{Append, Atomics, DispatchArgs, GlobalId, Slots}
+
+/// The most steps a call takes for a pixel: each one ask of matter (a step or a halving of a march,
+/// a step of a thickness) or one surface (its facing, the most asks a step makes: `SURFACE_ASKS`).
+pub const UNITS: u32 = 4
+
+/// The most asks of matter one step makes: a surface's facing (its gradient, and where that
+/// vanishes six asks to either side) and what it is made of.
+pub const SURFACE_ASKS: u32 = 8
+
+/// How many times the span of a march's last step is halved, and its least step (as `traced`).
+const HALVINGS: u32 = 24
+const LEAST: f32 = 0.00005
+const LEAST_FAR: f32 = 0.000005
+const LEAST_DOUBLES: f32 = 256.0
+
+/// A march under way (`traced::entered`, an ask at a time): where it starts (`o.xyz`) and how far
+/// it may go (`o.w`); its way (`d.xyz`) and how far it has come (`d.w`); the step before (`b.x`),
+/// the span being halved (`b.y` its far end, `b.z` its near) and its answer (`b.w`: m along the
+/// ray, or under 0 as `entered`'s); its steps, halvings and phase (`s`: 0 stepping, 1 halving, 2
+/// answered).
+pub struct March: Copy + GpuData {
+    pub o: vec4,
+    pub d: vec4,
+    pub b: vec4,
+    pub s: vec4u,
+}
+
+/// A march from `o` along `d` (unit), from `from` to `to` m.
+pub fn march_begun(o: vec3, d: vec3, from: f32, to: f32) -> March {
+    March { o: vec4(o, to), d: vec4(d, from), b: vec4(from, 0.0, 0.0, 0.0), s: vec4u(0) }
+}
+
+/// Whether it is answered.
+pub fn march_done(r: March) -> bool {
+    r.s.z == 2
+}
+
+/// One step of a march: `entered`'s loop's next turn (an ask at most).
+pub fn march_step<M: Field<Substance>>(m: Matter<M>, mr: March) -> March {
+    var r = mr
+    if r.s.z == 0 {
+        let t = r.d.w
+        if r.s.x < MOST_STEPS && t < r.o.w {
+            r.s.x += 1
+            let f = m.far(r.o.xyz + r.d.xyz * t)
+            if f < 0.0 {
+                r.s.z = 1
+                r.b.z = r.b.x
+                r.b.y = t
+            } else {
+                r.b.x = t
+                r.d.w = t + max(f, (LEAST + LEAST_FAR * t) * (1.0 + f32(r.s.x) / LEAST_DOUBLES))
+            }
+        } else {
+            r.b.w = if t < r.o.w { -2.0 } else { -1.0 }
+            r.s.z = 2
+        }
+    } else if r.s.z == 1 {
+        r.s.y += 1
+        let mid = 0.5 * (r.b.z + r.b.y)
+        if m.inside(r.o.xyz + r.d.xyz * mid) {
+            r.b.y = mid
+        } else {
+            r.b.z = mid
+        }
+        if r.s.y >= HALVINGS {
+            r.b.w = r.b.y
+            r.s.z = 2
+        }
+    }
+    r
+}
+
+/// A march's answer (`entered`'s).
+pub fn march_answer(r: March) -> f32 {
+    r.b.w
+}
+
+/// A pixel's reference, paced: the march under way; the look's light so far (`e.rgb`) and where
+/// its ray met matter (`e.w`); the light a ray carries (`carried.rgb`) and the sun's lean on the
+/// look's surface (`carried.w`); the look's surface (`p`, `n`: point and facing); a bounce's surface
+/// (`q`, `nq`; `nq.w` the sun's lean there; `q.w` a thickness so far); a ray's way (`way`); and where
+/// it is (`st`: x its stage, y its look, z its ray, w a thickness's steps or a ray's depth). What it
+/// has found is kept apart (`Said`), so neither is a copy of 256 bytes or more (§18.13).
+pub struct Paced: Copy + GpuData {
+    pub march: March,
+    pub e: vec4,
+    pub carried: vec4,
+    pub p: vec4,
+    pub n: vec4,
+    pub q: vec4,
+    pub nq: vec4,
+    pub way: vec4,
+    pub st: vec4u,
+}
+
+/// What a pixel's reference has found, and says when it is done: the middle ray's facing and how
+/// far (`centre`), the sky behind it and 1, or 2 where it ran out of steps (`behind`), its thickness
+/// (`thick.x`), and the halves' sums (`met0`, `matter0`, `met1`, `matter1`; `far.xy` the first
+/// half's, `far.zw` the second's).
+pub struct Said: Copy + GpuData {
+    pub centre: vec4,
+    pub behind: vec4,
+    pub thick: vec4,
+    pub met0: vec4,
+    pub matter0: vec4,
+    pub met1: vec4,
+    pub matter1: vec4,
+    pub far: vec4,
+}
+
+/// A pixel's stages.
+const BEGIN: u32 = 0
+const CENTRE: u32 = 1
+const THICKNESS: u32 = 2
+const LOOK: u32 = 3
+const LOOK_MARCH: u32 = 4
+const SUN: u32 = 5
+const RAY: u32 = 6
+const RAY_DEPTH: u32 = 7
+const RAY_MARCH: u32 = 8
+const RAY_SUN: u32 = 9
+pub const DONE: u32 = 10
+
+/// A pixel's reference begun.
+pub fn paced_begun() -> Paced {
+    let z = vec4(0.0)
+    Paced { march: march_begun(vec3(0.0), vec3(0.0), 0.0, 0.0), e: z, carried: z, p: z, n: z, q: z, nq: z, way: z, st: vec4u(BEGIN, 0, 0, 0) }
+}
+
+/// Nothing found yet.
+pub fn said_begun() -> Said {
+    let z = vec4(0.0)
+    Said { centre: z, behind: z, thick: z, met0: z, matter0: z, met1: z, matter1: z, far: z }
+}
+
+/// What the reference's work at pixel (`x`, `y`) holds fixed.
+pub struct PacedAt: Copy + GpuData {
+    pub x: u32,
+    pub y: u32,
+    pub salt: u32,
+    pub looks: u32,
+    pub rays: u32,
+    pub bounces: u32,
+    pub light: u32,
+    pub spare: u32,
+}
+
+/// The way look `index` (counted over both halves, the halves by turns) of pixel (`x`, `y`) looks.
+fn look_way(view: View, at: PacedAt, index: u32) -> vec3 {
+    view.moved(jitter(index % 2, index / 2)).ray(vec2(f32(at.x) + 0.5, f32(at.y) + 0.5))
+}
+
+/// A look's colour (`c`) added to its half's sums: met, and where it met, `t` along its ray.
+fn summed(s: mut Said, index: u32, c: vec3, met: bool, t: f32) {
+    let l = luma(c)
+    if index % 2 == 0 {
+        s.met0 = s.met0 + vec4(c, if met { 1.0 } else { 0.0 })
+        if met {
+            s.matter0 = s.matter0 + vec4(c, l * l)
+            s.far = s.far + vec4(t, t * t, 0.0, 0.0)
+        }
+    } else {
+        s.met1 = s.met1 + vec4(c, if met { 1.0 } else { 0.0 })
+        if met {
+            s.matter1 = s.matter1 + vec4(c, l * l)
+            s.far = s.far + vec4(0.0, 0.0, t, t * t)
+        }
+    }
+}
+
+/// One step of a pixel's reference (a march's step, or a surface, or a stage begun): the middle ray
+/// (`traced::entered`, its `thickness`), then each look, `lit`, in that order.
+pub fn paced_step<M: Field<Substance>, S: Sky, L: Look>(m: Matter<M>, sky: S, look: L, view: View, at: PacedAt, ps: Paced, sd: mut Said) -> Paced {
+    var s = ps
+    let stage = s.st.x
+    let sun = sky.sun()
+    if stage == BEGIN {
+        // The middle ray (`centred`).
+        let d = view.ray(vec2(f32(at.x) + 0.5, f32(at.y) + 0.5))
+        let span = m.span(view.at, d)
+        sd.behind = vec4(look.tone(Seen { light: seen(sky, d) }), 1.0)
+        if !(span.y > max(span.x, 0.0)) {
+            sd.centre = vec4(0.0)
+            sd.thick.x = THICK
+            s.st.x = LOOK
+        } else {
+            s.march = march_begun(view.at, d, max(span.x, 0.0), min(span.y, FAR))
+            s.st.x = CENTRE
+        }
+    } else if stage == CENTRE {
+        s.march = march_step(m, s.march)
+        if march_done(s.march) {
+            let t = march_answer(s.march)
+            if t < 0.0 {
+                sd.centre = vec4(0.0)
+                sd.behind.w = if t < -1.5 { 2.0 } else { 1.0 }
+                sd.thick.x = THICK
+                s.st.x = LOOK
+            } else {
+                let d = s.march.d.xyz
+                let p = view.at + d * t
+                let n = m.facing(p, -d)
+                sd.centre = vec4(n, t)
+                // Its thickness (`thickness`), from just inside it.
+                s.n = vec4(n, 0.0)
+                s.q = vec4(p - n * LEAVE, 0.0)
+                s.st.w = 0
+                s.st.x = THICKNESS
+            }
+        }
+    } else if stage == THICKNESS {
+        let o = s.q.xyz
+        let n = s.n.xyz
+        let t = s.q.w
+        if s.st.w < 512 && t < THICK && m.inside(o - n * t) {
+            s.st.w += 1
+            s.q.w = t + max(-m.far(o - n * t), LEAST)
+        } else {
+            sd.thick.x = min(t + LEAVE, THICK)
+            s.st.x = LOOK
+        }
+    } else if stage == LOOK {
+        // Look `st.y` (`looked`), the halves by turns.
+        if s.st.y >= 2 * at.looks {
+            s.st.x = DONE
+        } else {
+            let d = look_way(view, at, s.st.y)
+            let span = m.span(view.at, d)
+            if span.y > max(span.x, 0.0) {
+                s.march = march_begun(view.at, d, max(span.x, 0.0), min(span.y, FAR))
+                s.st.x = LOOK_MARCH
+            } else {
+                summed(mut sd, s.st.y, look.tone(Seen { light: seen(sky, d) }), false, 0.0)
+                s.st.y += 1
+            }
+        }
+    } else if stage == LOOK_MARCH {
+        s.march = march_step(m, s.march)
+        if march_done(s.march) {
+            let t = march_answer(s.march)
+            let d = s.march.d.xyz
+            if t < 0.0 {
+                summed(mut sd, s.st.y, look.tone(Seen { light: seen(sky, d) }), false, 0.0)
+                s.st.y += 1
+                s.st.x = LOOK
+            } else {
+                // Its light (`lit`): what it gives off, then the sun by a shadow ray.
+                let p = view.at + d * t
+                let n = m.facing(p, -d)
+                let sub = m.made_of(p)
+                s.p = vec4(p, 0.0)
+                s.n = vec4(n, 0.0)
+                s.e = vec4(sub.emits, t)
+                let a = dice(at.x, at.y, s.st.y, at.salt)
+                let w = sun_way(sun, die(a, 0), die(a, 1))
+                let lean = dot(n, w)
+                s.carried.w = lean
+                if lean <= 0.0 {
+                    s.e = vec4(s.e.xyz + sub.scatters(n, sun.way, -d) * vec3(0.0), t)
+                    s.st.z = 0
+                    s.st.x = RAY
+                } else {
+                    let o = p + n * LEAVE
+                    s.march = march_begun(o, w, 0.0, min(m.span(o, w).y, FAR))
+                    s.way = vec4(d, 0.0)
+                    s.st.x = SUN
+                }
+            }
+        }
+    } else if stage == SUN {
+        s.march = march_step(m, s.march)
+        if march_done(s.march) {
+            let lit = if march_answer(s.march) >= 0.0 { vec3(0.0) } else { sun.light * s.carried.w }
+            let sub = m.made_of(s.p.xyz)
+            s.e = vec4(s.e.xyz + sub.scatters(s.n.xyz, sun.way, -s.way.xyz) * lit, s.e.w)
+            s.st.z = 0
+            s.st.x = RAY
+        }
+    } else if stage == RAY {
+        // Ray `st.z` over the hemisphere, followed on through up to `bounces` stops.
+        let r = s.st.z
+        let index = s.st.y
+        if r < MOST_RAYS && r < at.rays {
+            let a = dice(at.x, at.y, index, at.salt)
+            let k = 2 + 32 * r
+            let p = s.p.xyz
+            let n = s.n.xyz
+            let to = -look_way(view, at, index)
+            let sub = m.made_of(p)
+            let way = cosine_way(n, die(a, k), die(a, k + 1))
+            s.carried = vec4(sub.scatters(n, way, to) * (3.14159265 / f32(at.rays)), s.carried.w)
+            s.way = vec4(way, 0.0)
+            s.st.w = 0
+            if at.light == SIMPLE {
+                s.e = vec4(s.e.xyz + s.carried.xyz * sky.light(way), s.e.w)
+                s.st.z = r + 1
+            } else {
+                s.st.x = RAY_DEPTH
+            }
+        } else {
+            // The look's light, toned, into its half.
+            let c = look.tone(Seen { light: s.e.xyz })
+            summed(mut sd, index, c, true, s.e.w)
+            s.st.y = index + 1
+            s.st.x = LOOK
+        }
+    } else if stage == RAY_DEPTH {
+        // (`st.w`: the depth reached; the stop is the depth before it.)
+        let depth = s.st.w
+        if depth <= MOST_BOUNCES && depth <= at.bounces {
+            let o = if depth == 0 { s.p.xyz + s.n.xyz * LEAVE } else { s.q.xyz + s.nq.xyz * LEAVE }
+            let way = s.way.xyz
+            s.march = march_begun(o, way, 0.0, min(m.span(o, way).y, FAR))
+            s.st.w = depth + 1
+            s.st.x = RAY_MARCH
+        } else {
+            s.st.z += 1
+            s.st.x = RAY
+        }
+    } else if stage == RAY_MARCH {
+        s.march = march_step(m, s.march)
+        if march_done(s.march) {
+            let t = march_answer(s.march)
+            let way = s.way.xyz
+            let stop = s.st.w - 1
+            if t < 0.0 {
+                s.e = vec4(s.e.xyz + s.carried.xyz * sky.light(way), s.e.w)
+                s.st.z += 1
+                s.st.x = RAY
+            } else {
+                let q = s.march.o.xyz + way * t
+                let nq = m.facing(q, -way)
+                let sq = m.made_of(q)
+                s.e = vec4(s.e.xyz + s.carried.xyz * sq.emits, s.e.w)
+                s.q = vec4(q, 0.0)
+                if stop == at.bounces {
+                    s.nq = vec4(nq, 0.0)
+                    s.st.z += 1
+                    s.st.x = RAY
+                } else {
+                    let a = dice(at.x, at.y, s.st.y, at.salt)
+                    let kq = 2 + 32 * s.st.z + 2 + 4 * stop
+                    let w = sun_way(sun, die(a, kq), die(a, kq + 1))
+                    let lean = dot(nq, w)
+                    s.nq = vec4(nq, lean)
+                    if lean <= 0.0 {
+                        s = bounced(m, sky, at, s, vec3(0.0))
+                    } else {
+                        let o = q + nq * LEAVE
+                        s.march = march_begun(o, w, 0.0, min(m.span(o, w).y, FAR))
+                        s.st.x = RAY_SUN
+                    }
+                }
+            }
+        }
+    } else if stage == RAY_SUN {
+        s.march = march_step(m, s.march)
+        if march_done(s.march) {
+            let lit = if march_answer(s.march) >= 0.0 { vec3(0.0) } else { sun.light * s.nq.w }
+            s = bounced(m, sky, at, s, lit)
+        }
+    }
+    s
+}
+
+/// After a bounce's sun (`lit` the sun's light on it), the way on from it (`lit`'s loop's end).
+fn bounced<M: Field<Substance>, S: Sky>(m: Matter<M>, sky: S, at: PacedAt, ps: Paced, lit: vec3) -> Paced {
+    var s = ps
+    let sun = sky.sun()
+    let q = s.q.xyz
+    let nq = s.nq.xyz
+    let way = s.way.xyz
+    let stop = s.st.w - 1
+    let sq = m.made_of(q)
+    s.e = vec4(s.e.xyz + s.carried.xyz * sq.scatters(nq, sun.way, -way) * lit, s.e.w)
+    let a = dice(at.x, at.y, s.st.y, at.salt)
+    let kq = 2 + 32 * s.st.z + 2 + 4 * stop
+    let next = cosine_way(nq, die(a, kq + 2), die(a, kq + 3))
+    s.carried = vec4(s.carried.xyz * sq.scatters(nq, next, -way) * 3.14159265, s.carried.w)
+    s.way = vec4(next, 0.0)
+    s.st.x = RAY_DEPTH
+    s
+}
+
+/// Words a pixel's state takes (`Paced`), and what it has found (`Said`), each kept at the pixel's
+/// place in a buffer of words, so a round may take the pixels still undone in any order (a list),
+/// each read and written where its pixel is.
+pub const PACED_WORDS: u32 = 48
+pub const SAID_WORDS: u32 = 32
+
+fn w4(a: Atomics<u32>, at: u32) -> vec4 {
+    vec4(bitcast_f32(a.load(i: at)), bitcast_f32(a.load(i: at + 1)), bitcast_f32(a.load(i: at + 2)), bitcast_f32(a.load(i: at + 3)))
+}
+
+fn w4u(a: Atomics<u32>, at: u32) -> vec4u {
+    vec4u(a.load(i: at), a.load(i: at + 1), a.load(i: at + 2), a.load(i: at + 3))
+}
+
+fn put4(a: mut Atomics<u32>, at: u32, v: vec4) {
+    a.store(i: at, value: bitcast_u32(v.x))
+    a.store(i: at + 1, value: bitcast_u32(v.y))
+    a.store(i: at + 2, value: bitcast_u32(v.z))
+    a.store(i: at + 3, value: bitcast_u32(v.w))
+}
+
+fn put4u(a: mut Atomics<u32>, at: u32, v: vec4u) {
+    a.store(i: at, value: v.x)
+    a.store(i: at + 1, value: v.y)
+    a.store(i: at + 2, value: v.z)
+    a.store(i: at + 3, value: v.w)
+}
+
+fn paced_read(a: Atomics<u32>, px: u32) -> Paced {
+    let b = px * PACED_WORDS
+    Paced { march: March { o: w4(a, b), d: w4(a, b + 4), b: w4(a, b + 8), s: w4u(a, b + 12) }, e: w4(a, b + 16), carried: w4(a, b + 20), p: w4(a, b + 24), n: w4(a, b + 28), q: w4(a, b + 32), nq: w4(a, b + 36), way: w4(a, b + 40), st: w4u(a, b + 44) }
+}
+
+fn paced_write(a: mut Atomics<u32>, px: u32, s: Paced) {
+    let b = px * PACED_WORDS
+    put4(mut a, b, s.march.o)
+    put4(mut a, b + 4, s.march.d)
+    put4(mut a, b + 8, s.march.b)
+    put4u(mut a, b + 12, s.march.s)
+    put4(mut a, b + 16, s.e)
+    put4(mut a, b + 20, s.carried)
+    put4(mut a, b + 24, s.p)
+    put4(mut a, b + 28, s.n)
+    put4(mut a, b + 32, s.q)
+    put4(mut a, b + 36, s.nq)
+    put4(mut a, b + 40, s.way)
+    put4u(mut a, b + 44, s.st)
+}
+
+fn said_read(a: Atomics<u32>, px: u32) -> Said {
+    let b = px * SAID_WORDS
+    Said { centre: w4(a, b), behind: w4(a, b + 4), thick: w4(a, b + 8), met0: w4(a, b + 12), matter0: w4(a, b + 16), met1: w4(a, b + 20), matter1: w4(a, b + 24), far: w4(a, b + 28) }
+}
+
+fn said_write(a: mut Atomics<u32>, px: u32, s: Said) {
+    let b = px * SAID_WORDS
+    put4(mut a, b, s.centre)
+    put4(mut a, b + 4, s.behind)
+    put4(mut a, b + 8, s.thick)
+    put4(mut a, b + 12, s.met0)
+    put4(mut a, b + 16, s.matter0)
+    put4(mut a, b + 20, s.met1)
+    put4(mut a, b + 24, s.matter1)
+    put4(mut a, b + 28, s.far)
+}
+
+/// Each pixel of a run of `n` begun: its state at the start, nothing found, and listed undone.
+@compute(64)
+pub fn paced_begun_all(n: u32, state: mut Atomics<u32>, found: mut Atomics<u32>, undone: mut Append<u32>, id: GlobalId) {
+    let i = id.x
+    if i >= n {
+        return
+    }
+    paced_write(mut state, i, paced_begun())
+    said_write(mut found, i, said_begun())
+    let _ = undone.push(i)
+}
+
+/// How many groups of 64 slice `k` of a list (`count[0]` long, `chunk` a slice) asks: the slices'
+/// group counts, an invocation a slice.
+@compute(64)
+pub fn sliced(count: [u32], chunk: u32, slices: u32, args: mut Slots<DispatchArgs>, id: GlobalId) {
+    let k = id.x
+    if k >= slices {
+        return
+    }
+    let first = k * chunk
+    let n = if count[0] > first { min(count[0] - first, chunk) } else { 0 }
+    args[id] = DispatchArgs { x: (n + 63) / 64, y: 1, z: 1 }
+}
+
+/// Up to `UNITS` more steps of each pixel slice `k` of the list `undone` names (`count[0]` of them,
+/// `chunk` a slice; a pixel of a run of the screen from `first`, a row `width` wide): its state and
+/// what it has found read and written where its pixel is (`state`, `found`), and the pixel listed
+/// again in `still` while it is not done.
+@compute(64)
+pub fn paced<M: Field<Substance>, S: Sky, L: Look>(m: Matter<M>, sky: S, look: L, view: View, salt: u32, looks: u32, rays: u32, bounces: u32, light: u32, first: u32, width: u32, undone: [u32], count: [u32], k: u32, chunk: u32, state: mut Atomics<u32>, found: mut Atomics<u32>, still: mut Append<u32>, id: GlobalId) {
+    let i = k * chunk + id.x
+    if id.x >= chunk || i >= count[0] {
+        return
+    }
+    let p = undone[i]
+    let px = first + p
+    let pa = PacedAt { x: px % width, y: px / width, salt, looks, rays, bounces, light, spare: 0 }
+    var s = paced_read(state, p)
+    var sd = said_read(found, p)
+    // (A while loop: a counted loop that may leave early is written out whole, a step in each.)
+    var u: u32 = 0
+    while u < UNITS && s.st.x != DONE {
+        u += 1
+        s = paced_step(m, sky, look, view, pa, s, mut sd)
+    }
+    paced_write(mut state, p, s)
+    said_write(mut found, p, sd)
+    if s.st.x != DONE {
+        let _ = still.push(p)
+    }
+}

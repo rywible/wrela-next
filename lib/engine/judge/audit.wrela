@@ -1,0 +1,241 @@
+// The hole audit: an instrument beside the judges, quick enough to run at every change. It needs
+// no reference picture: at each pixel of a small picture the engine drew, it marches the pixel's
+// middle ray through the thing's own field (`marched`: a plain march by its value over its stated
+// steepness to a sign crossing, then halvings, as the reference's) and holds the engine's first
+// hit to it. Eyes are placed
+// round each kind of thing by a fixed seed (`eye_round`), near and far, inside its bound and out,
+// looking at points in it so that some views graze; the judged views look where an author's camera
+// would, and this looks everywhere else.
+//
+// Counted, of each picture's pixels:
+// - a HOLE: the field meets matter along the middle ray and along four rays a half pixel to each
+//   side (so the pixel is wholly inside an outline), and the engine met nothing;
+// - an EXTRA: the engine met matter where the field and the four rays beside it meet none;
+// - OFF: both met it, the surface is not grazing (its facing at least a fifth toward the eye), and
+//   where they met it differs by more than the pixel's footprint there.
+//
+// What it does not cover: light, colour, edges and crawl (the judges'); a hole thinner than half a
+// pixel (outlines are the judges'); a surface the field's own march misses (it steps by the
+// field's stated steepness, as the reference does), or that it reaches only past `STEPS` steps
+// (such a ray is not counted); and only the middle ray of each pixel.
+
+use matter::matter::{Matter, matter}
+use matter::substance::Substance
+use picture::eye::{Eye, View, view}
+use reference::traced::FAR
+use std::field::Field
+use std::gpu::{Atomics, GlobalId, GpuBuffer, Rgba32Float, Texture, buffer_of, dispatch, label, read}
+use std::collections::Vec
+use std::io::{Pending, print}
+
+/// Counts kept: pixels, pixels the field met, holes, extras, offs, rays out of steps; then one
+/// off pixel's x and y, and its picture's eye (`Audit::held`'s `eye`).
+const COUNTS: u32 = 9
+
+/// The most steps the audit's march takes (a dispatch's every invocation must be short), and its
+/// halvings onto the surface.
+const STEPS: u32 = 512
+const HALVINGS: u32 = 24
+
+/// Pixels a dispatch (a band of the picture: no dispatch holds the GPU long).
+const BAND: u32 = 256
+
+/// Where the field `m` meets matter along the ray from `o` along `d`: its distance along it, -1
+/// where it doesn't, -2 where the march ran out of steps.
+fn first_hit<M: Field<Substance>>(m: Matter<M>, o: vec3, d: vec3) -> f32 {
+    var t = 0.0
+    var before = 0.0
+    var crossed = false
+    for _ in 0..STEPS {
+        if !crossed && t < FAR {
+            let f = m.far(o + d * t)
+            if f < 0.0 {
+                crossed = true
+            } else {
+                before = t
+                t += max(f, 0.00005 + 0.000005 * t)
+            }
+        }
+    }
+    var lo = before
+    var hi = t
+    for _ in 0..HALVINGS {
+        if crossed {
+            let mid = 0.5 * (lo + hi)
+            if m.inside(o + d * mid) {
+                hi = mid
+            } else {
+                lo = mid
+            }
+        }
+    }
+    if crossed { hi } else if t < FAR { -2.0 } else { -1.0 }
+}
+
+/// The ray of pixel `i / 5` of a picture `w` wide through `v`: its middle (`i % 5` 0) or a half
+/// pixel to a side (1 to 4).
+fn ray_at(v: View, w: u32, i: u32) -> vec3 {
+    let px = i / 5
+    let k = i % 5
+    let o = vec2(if k == 1 { 0.5 } else if k == 2 { -0.5 } else { 0.0 }, if k == 3 { 0.5 } else if k == 4 { -0.5 } else { 0.0 })
+    v.ray(vec2(f32(px % w) + 0.5, f32(px / w) + 0.5) + o)
+}
+
+/// Rays `first` on (`ray_at`) marched through the field `m`: into `hits`.
+@compute(64)
+fn marched<M: Field<Substance>>(m: Matter<M>, v: View, w: u32, n: u32, first: u32, hits: mut Atomics<u32>, id: GlobalId) {
+    let i = first + id.x
+    if i >= n {
+        return
+    }
+    hits.store(i: i, value: bitcast_u32(first_hit(m, v.at, ray_at(v, w, i))))
+}
+
+/// Pixels `first` on of `place` (the engine's: facing and distance, 0 where nothing) held to the
+/// field's hits (`hits`, `marched`): into `counts`.
+@compute(64)
+fn audited(v: View, place: Texture<Rgba32Float>, hits: [u32], first: u32, eye: u32, counts: mut Atomics<u32>, id: GlobalId) {
+    let w = place.width()
+    let i = first + id.x
+    if i >= w * place.height() {
+        return
+    }
+    let e = place.load(i % w, i / w)
+    let tf = bitcast_f32(hits[5 * i])
+    var out_of_steps = tf < -1.5
+    var all = tf > 0.0
+    var none = tf == -1.0
+    for k in 1..5 {
+        let h = bitcast_f32(hits[5 * i + k])
+        all = all && h > 0.0
+        none = none && h == -1.0
+        out_of_steps = out_of_steps || h < -1.5
+    }
+    let _ = counts.add(i: 0, value: 1)
+    let met = e.w > 0.0
+    if out_of_steps {
+        let _ = counts.add(i: 5, value: 1)
+    } else {
+        if tf > 0.0 {
+            let _ = counts.add(i: 1, value: 1)
+        }
+        if all && !met {
+            let _ = counts.add(i: 2, value: 1)
+        } else if none && met {
+            let _ = counts.add(i: 3, value: 1)
+        } else if tf > 0.0 && met {
+            let d = ray_at(v, w, 5 * i)
+            if abs(dot(e.xyz, d)) > 0.2 && abs(e.w - tf) > v.pixel() * tf {
+                let _ = counts.add(i: 4, value: 1)
+                counts.store(i: 6, value: i % w)
+                counts.store(i: 7, value: i / w)
+                counts.store(i: 8, value: eye)
+            }
+        }
+    }
+}
+
+/// The `k`th eye of a fixed seed round the thing `field` within the bound `b` (centre, radius);
+/// the first, straight on at its middle, close, through a long lens; the rest:
+/// a point on its surface found from outside along a way to its middle, the eye stepped back from
+/// it 0.005 to 1 bound radii (on a log scale), looking straight at it (even `k`) or past it along
+/// the surface (odd `k`: grazing), 0.6 rad across.
+pub fn eye_round<M: Field<Substance>>(field: M, b: vec4, k: u32) -> Eye {
+    let m = matter(field)
+    if k == 0 {
+        // The view the judged set once missed: straight on at its bound's middle, from the side,
+        // close (a tenth of its bound's radius off its surface), through a long lens (0.2 rad).
+        let o0 = b.xyz - vec3(0.0, 0.0, 1.5 * b.w)
+        var t0 = 0.0
+        for _ in 0..4096 {
+            let g = m.far(o0 + vec3(0.0, 0.0, t0))
+            if g > 0.00005 && t0 < 3.0 * b.w {
+                t0 += max(g, 0.0001)
+            }
+        }
+        let at0 = o0 + vec3(0.0, 0.0, t0 - 0.1 * b.w)
+        return Eye { at: at0, toward: at0 + vec3(0.0, 0.0, 1.0), wide: 0.2 }
+    }
+    let f = f32(k / 2) + 0.5
+    let u = normalize(vec3(fract(f * 0.618034), fract(f * 0.754878), fract(f * 0.569840)) * 2.0 - vec3(1.0) + vec3(1.0e-3))
+    let o = b.xyz + u * (1.5 * b.w)
+    let d = normalize(b.xyz + (vec3(fract(f * 0.381966), fract(f * 0.245122), fract(f * 0.430160)) * 2.0 - vec3(1.0)) * (0.3 * b.w) - o)
+    // (Onto the surface from outside, as the audit's march does.)
+    var t = 0.0
+    for _ in 0..4096 {
+        let g = m.far(o + d * t)
+        if g > 0.00005 && t < 3.0 * b.w {
+            t += max(g, 0.0001)
+        }
+    }
+    let s = o + d * t
+    let back = b.w * exp2(log2(0.005) * (1.0 - fract(f * 0.287148)))
+    let at = s - d * back
+    var toward = s
+    if k % 2 == 1 {
+        // (Past the point along the surface, the way the eye came turned a quarter round.)
+        let side = normalize(cross(d, vec3(0.0, 1.0, 0.0)) + vec3(1.0e-3))
+        toward = s + side * back
+    }
+    Eye { at, toward, wide: 0.6 }
+}
+
+/// What the audit has counted, and what it has been asked to say.
+pub struct Audit {
+    counts: GpuBuffer<u32>,
+    hits: GpuBuffer<u32>,
+    said: Option<Pending<u32>>,
+    pub done: bool,
+}
+
+/// An audit, as yet of nothing.
+pub fn audit() -> Audit {
+    Audit { counts: buffer_of(Vec::filled(COUNTS, 0)), hits: buffer_of(Vec::filled(1, 0)), said: None, done: false }
+}
+
+impl Audit {
+    /// The engine's picture `place` (`width` × `height`), drawn through `eye`, held to `field`.
+    pub fn held<M: Field<Substance>>(mut self, field: M, eye: Eye, place: Texture<Rgba32Float>, width: u32, height: u32, k: u32) {
+        let m = matter(field)
+        let v = view(eye, width, height)
+        label("audit")
+        let n = 5 * width * height
+        if self.hits.len() != n {
+            self.hits = buffer_of(Vec::filled(n, 0))
+        }
+        var first: u32 = 0
+        while first < n {
+            dispatch(marched.bind(m: m, v: v, w: width, n: n, first: first, hits: mut self.hits), over: min(BAND, n - first))
+            first += BAND
+        }
+        first = 0
+        while first < width * height {
+            dispatch(audited.bind(v: v, place: place, hits: self.hits.items(), first: first, eye: k, counts: mut self.counts), over: min(4096, width * height - first))
+            first += 4096
+        }
+    }
+
+    /// Asks for the counts, and once they are in says them (`what`) and starts again at nothing:
+    /// true then.
+    pub fn say(mut self, what: String) -> bool {
+        match mut self.said {
+            Some(p) => match p.poll() {
+                Some(Ok(c)) => {
+                    print(f"audit: {what}: {c[0]} px, the field meets matter at {c[1]}; holes {c[2]}, extra {c[3]}, off by more than a pixel {c[4]} (one: eye {c[8]}, pixel ({c[6]}, {c[7]})); pixels not counted (the march out of steps) {c[5]}")
+                    self.said = None
+                    self.counts = buffer_of(Vec::filled(COUNTS, 0))
+                    return true
+                },
+                // (Not read: asked again; the counts are kept until they are said.)
+                Some(Err(_)) => {
+                    self.said = None
+                },
+                None => {},
+            },
+            None => {
+                self.said = Some(read(self.counts.items()))
+            },
+        }
+        false
+    }
+}

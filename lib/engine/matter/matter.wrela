@@ -1,0 +1,104 @@
+// Matter as the engine asks it (docs/design.md, "The engine's four modules": matter). An author
+// says where matter is and what it is made of as one field: any of std::field's surfaces whose
+// points carry a `Substance` (`Field<Substance>`), built from its primitives and combinators
+// (`cuboid(...).translate(...).with(stone)`, `.union`, `.smooth_union`). This module is the only
+// place that ever reads such a field's raw value: everything else asks it how far matter is, which
+// way it faces and what it is made of, and is told a distance, never a value.
+//
+// A field's value is not its distance. Where two parts are joined smoothly and pass close, the
+// value runs level far under the distance; where a slope is steep it is over it. What the field
+// states of itself (std::field: each primitive its steepness, each combinator its parts' composed,
+// `Surface::lipschitz`; and a sphere outside which it can't be, `Surface::bound`) is worked out
+// once, on the CPU, when the engine takes the field (`matter`), and every ask divides by it: so
+// `far` is never more than the true distance, and a ray that steps by it never steps past
+// matter. Where the field states no steepness (a closure of a point), nothing can step by it:
+// `matter` says so, and the field must be written from parts that state theirs (the debts list,
+// wrela-notes/engine/NOTES.md).
+
+use std::field::{Bound, Field}
+use matter::substance::Substance
+
+/// How far from matter (m) the steepness the engine steps by must hold: a step is never longer.
+/// Past it the field's own bound (`Surface::bound`) says how far matter is at the least.
+pub const SCOPE: f32 = 1.0
+
+/// Matter, as the engine asks it: the author's field (`field`), how steep its value may be within
+/// `SCOPE` of its surface (`steep`: its gradient's length at the most there), and a sphere outside
+/// which there is none (`held`: its middle and radius; `slope`, how fast its value grows outside
+/// it). Worked out once on the CPU, so no invocation works out again what is the same for all.
+pub struct Matter<M>: Copy + GpuData {
+    pub field: M,
+    pub steep: f32,
+    pub slope: f32,
+    pub held: vec4,
+}
+
+/// `field` as matter the engine can ask. Panics where the field states no steepness: no ray can
+/// step by it.
+pub fn matter<M: Field<Substance>>(field: M) -> Matter<M> {
+    let steep = field.lipschitz(SCOPE)
+    if !(steep < 1.0e30) {
+        panic("engine::matter: a field that states no steepness can't be asked how far it is: build it from std::field's parts, which state theirs")
+    }
+    let b: Bound = field.bound()
+    Matter { field, steep: max(steep, 1.0), slope: b.slope, held: vec4(b.centre, b.radius) }
+}
+
+/// How far the facing's fallback looks to either side (m), where the field's own gradient
+/// vanishes.
+const ASIDE: f32 = 0.0002
+
+impl<M: Field<Substance>> Matter<M> {
+    /// How far matter is from `p` (m), at the least: never more than the true distance to its
+    /// surface, so a ray may step this far and not pass it. Under 0 inside matter (and then, as
+    /// far as its size goes, how far in at the least).
+    pub fn far(self, p: vec3) -> f32 {
+        let v = clamp(self.field.distance(p), -SCOPE, SCOPE) / self.steep
+        // Outside the sphere that holds it, the field says how far it is at the least.
+        let out = self.slope * (length(p - self.held.xyz) - self.held.w)
+        max(v, out)
+    }
+
+    /// Whether `p` is inside matter.
+    pub fn inside(self, p: vec3) -> bool {
+        self.field.distance(p) < 0.0
+    }
+
+    /// Where a ray from `o` along `d` (unit) leaves the sphere that holds all matter, m along it,
+    /// and where it enters it (`x`, `y`); `y` under `x` where it misses it.
+    pub fn span(self, o: vec3, d: vec3) -> vec2 {
+        let oc = o - self.held.xyz
+        let b = dot(oc, d)
+        let h = b * b - (dot(oc, oc) - self.held.w * self.held.w)
+        if !(h >= 0.0) {
+            return vec2(1.0, 0.0)
+        }
+        let s = sqrt(h)
+        vec2(-b - s, -b + s)
+    }
+
+    /// Which way matter faces at `p` on its surface (unit, out of it). Where the field's gradient
+    /// vanishes (on a flat face where two of a box's sides tie, midway through a slab), its slope
+    /// over a step to each side; where that vanishes too, back along `came` (the way a ray came
+    /// from, unit).
+    pub fn facing(self, p: vec3, came: vec3) -> vec3 {
+        let g = self.field.gradient(p)
+        if dot(g, g) > 1.0e-8 {
+            return normalize(g)
+        }
+        let side = vec3(
+            self.field.distance(p + vec3(ASIDE, 0.0, 0.0)) - self.field.distance(p - vec3(ASIDE, 0.0, 0.0)),
+            self.field.distance(p + vec3(0.0, ASIDE, 0.0)) - self.field.distance(p - vec3(0.0, ASIDE, 0.0)),
+            self.field.distance(p + vec3(0.0, 0.0, ASIDE)) - self.field.distance(p - vec3(0.0, 0.0, ASIDE)),
+        )
+        if dot(side, side) > 1.0e-16 {
+            return normalize(side)
+        }
+        came
+    }
+
+    /// What matter is made of at `p`.
+    pub fn made_of(self, p: vec3) -> Substance {
+        self.field.channels(p)
+    }
+}
