@@ -74,10 +74,13 @@ const EDGE_RAYS: u32 = EDGE_LOOKS * EDGE_LOOKS
 const JUMP: f32 = 0.05
 const CREASE: f32 = 0.8
 
-/// No edge at a pixel; one in how many of a picture's pixels may be an edge (the rest drawn by
-/// their middle ray alone): the edge rays fill a picture the screen's size.
+/// No edge at a pixel; one in how many of a picture's pixels may be an edge: as many as can each
+/// take nine rays in a layout the screen's size (the edge passes' targets), so their rays always
+/// fit. Edges follow the outlines' length, not the picture's area: a smaller picture holds more a
+/// pixel (SCENE 8 at 64 asks 1/12 of 960x540's pixels). Past it whole tiles are refused, counted
+/// and printed (`edges_counted`); stage 2 sizes the room again.
 const NO_EDGE: u32 = 4294967295
-const EDGE_SHARE: u32 = 16
+const EDGE_SHARE: u32 = EDGE_RAYS
 
 /// The sky table's texels a side (an octahedron's fold of every way a face can turn), and how
 /// many ways each texel's light is gathered from (a side of a square of them, cosine-spread).
@@ -1350,7 +1353,7 @@ const EDGE_MARK: u32 = 4294967294
 /// Where each tile's edge pixels start in the list (`tile_at`, tile `n` past the last), from the
 /// tiles' counts (`tiles`): an invocation a tile, adding the counts before it (the tiles are few:
 /// 2,040 at 1080p); how many are listed (`count`: the tiles before the first that would pass
-/// `most`, whole); and each tile's fill begun at nothing (`fill`). A tile is listed whole or not at
+/// `most`, whole) and how many asked (`count[1]`); and each tile's fill begun at nothing (`fill`). A tile is listed whole or not at
 /// all (`edges_found`): its pixels take their places in the order they arrive, so a tile cut where
 /// the room ends would list whichever of its pixels came first, another set each run.
 @compute(64)
@@ -1370,8 +1373,11 @@ fn edge_tiles_summed(tiles: [u32], n: u32, most: u32, tile_at: mut Atomics<u32>,
         if at <= most && at + tiles[t] > most {
             count.store(i: 0, value: at)
         }
-    } else if at <= most {
-        count.store(i: 0, value: at)
+    } else {
+        if at <= most {
+            count.store(i: 0, value: at)
+        }
+        count.store(i: 1, value: at)
     }
 }
 
@@ -1550,6 +1556,11 @@ pub struct Sight {
     radiance: Texture<Rgba16Float>,
     trace_out: GpuBuffer<u32>,
     trace_read: Option<Pending<u32>>,
+    /// The edge pixels that asked for a place in the list and those listed, read back every frame
+    /// (`edges_said`): how many frames said, the most that asked, and those refused, in all and in how
+    /// many frames.
+    edge_reads: Vec<Pending<u32>>,
+    edges_said: vec4u,
     /// The load beside each frame (sines a pixel; 0: none).
     pub load: u32,
     held_asks: u32,
@@ -1574,7 +1585,7 @@ pub fn sight() -> Sight {
         asks: texture(width: 1, height: 1),
         raw: texture(width: 1, height: 1),
         edge_list: buffer(1),
-        edge_count: buffer(1),
+        edge_count: buffer(2),
         edge_tiles: buffer(1),
         edge_tile_at: buffer(2),
         edge_fill: buffer(1),
@@ -1614,6 +1625,8 @@ pub fn sight() -> Sight {
         radiance: writable_texture(width: RADIANCE, height: RADIANCE),
         trace_out: buffer(1),
         trace_read: None,
+        edge_reads: Vec::new(),
+        edges_said: vec4u(0),
         load: 0,
         held_asks: 0,
         held_cell: 0.0,
@@ -1811,6 +1824,55 @@ impl Sight {
         self.trace_read = Some(read(self.trace_out.items()))
     }
 
+    /// The edge pixels refused a place so far, and in how many frames (`edges_counted`): a picture
+    /// that refused any is missing edges, and what is measured of it says so.
+    pub fn edges_refused(self) -> vec2u {
+        self.edges_said.zw
+    }
+
+    /// The edge counts read back so far (`edge_reads`, a read every frame, so what is submitted never
+    /// hangs on when one comes back), into `edges_said`: a line for each frame that refused some
+    /// (its first five), and every 60 frames said, how many asked at most and how many were refused.
+    fn edges_counted(mut self, most: u32) {
+        // (They come back in the order asked: the first not back ends the look.)
+        var going = true
+        while going && self.edge_reads.len() > 0 {
+            var said = vec2u(0)
+            var back = false
+            match mut self.edge_reads[0] {
+                r => match r.poll() {
+                    Some(Ok(c)) => {
+                        said = vec2u(c[0], c[1])
+                        back = true
+                    },
+                    Some(Err(_)) => {
+                        back = true
+                    },
+                    None => {
+                        going = false
+                    },
+                },
+            }
+            if back {
+                let _ = self.edge_reads.remove(0)
+                var e = self.edges_said
+                e.x += 1
+                e.y = max(e.y, said.y)
+                if said.y > said.x {
+                    e.z += said.y - said.x
+                    e.w += 1
+                    if e.w <= 5 {
+                        print(f"edges: {said.y - said.x} of {said.y} edge pixels refused a place (room {most})")
+                    }
+                }
+                self.edges_said = e
+                if e.x % 60 == 0 {
+                    print(f"edges: {e.x} frames said: asked at most {e.y} of room {most}; refused {e.z} in {e.w} frames")
+                }
+            }
+        }
+    }
+
     /// Prints the trace asked for (`trace`) once it is back: true then.
     pub fn traced_said(mut self) -> bool {
         match mut self.trace_read {
@@ -1900,7 +1962,7 @@ impl Sight {
             self.raw = texture(width: width, height: height)
             let most = width * height / EDGE_SHARE
             self.edge_list = buffer(most)
-            self.edge_count = buffer(1)
+            self.edge_count = buffer(2)
             let tt = tiles_of(width, height)
             self.edge_tiles = buffer(tt.x * tt.y)
             self.edge_tile_at = buffer(tt.x * tt.y + 1)
@@ -1994,6 +2056,8 @@ impl Sight {
         let nt = tiles_of(width, height).x * tiles_of(width, height).y
         dispatch(edges_counted.bind(place: self.drawn.place, asks: self.asks, tw: tiles_of(width, height).x, tiles: mut self.edge_tiles, at: mut self.drawn.edge_at), groups: groups)
         dispatch(edge_tiles_summed.bind(tiles: self.edge_tiles.items(), n: nt, most: most, tile_at: mut self.edge_tile_at, fill: mut self.edge_fill, count: mut self.edge_count), over: nt + 1)
+        self.edge_reads.push(read(self.edge_count.items()))
+        self.edges_counted(most)
         dispatch(edges_found.bind(place: self.drawn.place, tile_at: self.edge_tile_at.items(), tw: tiles_of(width, height).x, most: most, fill: mut self.edge_fill, tiles: mut self.edge_tiles, list: mut self.edge_list, at: mut self.drawn.edge_at), groups: groups)
         // (The edge rays the same three, laid out a ray a fragment.)
         // Each edge pixel's nearest outline and the outlines crossing it (a draw a thing over its
