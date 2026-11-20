@@ -32,7 +32,9 @@ const NONE: u32 = 4294967295
 /// Maximum bricks processed per extraction dispatch chunk so every compute dispatch stays far
 /// under the 50 ms step guard even for expensive noise-displaced fields.
 const CHUNK_BRICKS: u32 = 1024
-const CULL_CHUNK: u32 = 16384
+const CULL_CHUNK: u32 = 8192
+/// Maximum sharp-crease cells refined per chunk (`(bi << 9) | cell`, 32 KB).
+const CAP_CREASES: u32 = 8192
 
 /// One extracted surface vertex (64 bytes, std430-aligned).
 /// `normal.w` is 1.0 on smooth regions and 0.0 on sharp creases/corners.
@@ -58,67 +60,64 @@ pub struct GridSpec: Copy + GpuData {
 }
 
 /// Tightens a thing's bounding sphere into a tight axis-aligned box on the CPU using `field.interval`
-/// (10 binary-search steps per face = 60 cheap interval queries).
+/// (8 binary-search steps per face = 48 cheap interval queries).
 pub fn tight_aabb<M: Field<Substance>>(field: M) -> Box3 {
     let b = field.bound()
     let r = min(b.radius, 1.0e4)
     var lo = b.centre - vec3(r)
     var hi = b.centre + vec3(r)
-    // Shrink each face while the sliced slab's interval excludes zero.
+    // Binary-search each of the 6 faces inward while the sliced slab's interval excludes zero.
+    var a = lo.x
+    var c = hi.x
     for _step in 0..8 {
-        let mid = 0.5 * (lo.x + hi.x)
-        let iv = field.interval(Box3 { lo, hi: vec3(mid, hi.y, hi.z) })
-        if iv.lo > 0.0 || iv.hi < 0.0 {
-            lo.x = mid
-        } else {
-            break
-        }
+        let mid = 0.5 * (a + c)
+        let iv = field.interval(Box3 { lo: vec3(lo.x, lo.y, lo.z), hi: vec3(mid, hi.y, hi.z) })
+        if iv.lo > 0.0 || iv.hi < 0.0 { a = mid } else { c = mid }
     }
+    lo.x = a
+    a = lo.x
+    c = hi.x
     for _step in 0..8 {
-        let mid = 0.5 * (lo.x + hi.x)
-        let iv = field.interval(Box3 { lo: vec3(mid, lo.y, lo.z), hi })
-        if iv.lo > 0.0 || iv.hi < 0.0 {
-            hi.x = mid
-        } else {
-            break
-        }
+        let mid = 0.5 * (a + c)
+        let iv = field.interval(Box3 { lo: vec3(mid, lo.y, lo.z), hi: vec3(hi.x, hi.y, hi.z) })
+        if iv.lo > 0.0 || iv.hi < 0.0 { c = mid } else { a = mid }
     }
+    hi.x = c
+
+    a = lo.y
+    c = hi.y
     for _step in 0..8 {
-        let mid = 0.5 * (lo.y + hi.y)
-        let iv = field.interval(Box3 { lo, hi: vec3(hi.x, mid, hi.z) })
-        if iv.lo > 0.0 || iv.hi < 0.0 {
-            lo.y = mid
-        } else {
-            break
-        }
+        let mid = 0.5 * (a + c)
+        let iv = field.interval(Box3 { lo: vec3(lo.x, lo.y, lo.z), hi: vec3(hi.x, mid, hi.z) })
+        if iv.lo > 0.0 || iv.hi < 0.0 { a = mid } else { c = mid }
     }
+    lo.y = a
+    a = lo.y
+    c = hi.y
     for _step in 0..8 {
-        let mid = 0.5 * (lo.y + hi.y)
-        let iv = field.interval(Box3 { lo: vec3(lo.x, mid, lo.z), hi })
-        if iv.lo > 0.0 || iv.hi < 0.0 {
-            hi.y = mid
-        } else {
-            break
-        }
+        let mid = 0.5 * (a + c)
+        let iv = field.interval(Box3 { lo: vec3(lo.x, mid, lo.z), hi: vec3(hi.x, hi.y, hi.z) })
+        if iv.lo > 0.0 || iv.hi < 0.0 { c = mid } else { a = mid }
     }
+    hi.y = c
+
+    a = lo.z
+    c = hi.z
     for _step in 0..8 {
-        let mid = 0.5 * (lo.z + hi.z)
-        let iv = field.interval(Box3 { lo, hi: vec3(hi.x, hi.y, mid) })
-        if iv.lo > 0.0 || iv.hi < 0.0 {
-            lo.z = mid
-        } else {
-            break
-        }
+        let mid = 0.5 * (a + c)
+        let iv = field.interval(Box3 { lo: vec3(lo.x, lo.y, lo.z), hi: vec3(hi.x, hi.y, mid) })
+        if iv.lo > 0.0 || iv.hi < 0.0 { a = mid } else { c = mid }
     }
+    lo.z = a
+    a = lo.z
+    c = hi.z
     for _step in 0..8 {
-        let mid = 0.5 * (lo.z + hi.z)
-        let iv = field.interval(Box3 { lo: vec3(lo.x, lo.y, mid), hi })
-        if iv.lo > 0.0 || iv.hi < 0.0 {
-            hi.z = mid
-        } else {
-            break
-        }
+        let mid = 0.5 * (a + c)
+        let iv = field.interval(Box3 { lo: vec3(lo.x, lo.y, mid), hi: vec3(hi.x, hi.y, hi.z) })
+        if iv.lo > 0.0 || iv.hi < 0.0 { c = mid } else { a = mid }
     }
+    hi.z = c
+
     Box3 { lo, hi }
 }
 
@@ -189,7 +188,33 @@ fn cull_bricks<M: Field<Substance>>(
     let hi = lo + vec3(g.cell * f32(BRICK + 1))
     let pr = fields[ti].pruned(Box3 { lo, hi }, |q: vec3| q, 1.0, ALL_LIVE, 0)
     if pr.range.lo <= 0.0 && pr.range.hi >= 0.0 {
-        let _ = active.push(ActiveBrick { coord: vec4u(bx, by, bz, ti), live: pr.live })
+        var hit = true
+        // For high-steepness fields (e.g. noise-displaced rock), run a sound 8-octant interval
+        // check to discard conservative false-positive empty bricks without missing any surface.
+        if fields[ti].lipschitz(1.0) > 1.05 {
+            hit = false
+            let mid = 0.5 * (lo + hi)
+            for oct in 0..8 {
+                let olo = vec3(
+                    if (oct & 1) != 0 { mid.x } else { lo.x },
+                    if (oct & 2) != 0 { mid.y } else { lo.y },
+                    if (oct & 4) != 0 { mid.z } else { lo.z },
+                )
+                let ohi = vec3(
+                    if (oct & 1) != 0 { hi.x } else { mid.x },
+                    if (oct & 2) != 0 { hi.y } else { mid.y },
+                    if (oct & 4) != 0 { hi.z } else { mid.z },
+                )
+                let iv = fields[ti].interval(Box3 { lo: olo, hi: ohi })
+                if iv.lo <= 0.0 && iv.hi >= 0.0 {
+                    hit = true
+                    break
+                }
+            }
+        }
+        if hit {
+            let _ = active.push(ActiveBrick { coord: vec4u(bx, by, bz, ti), live: pr.live })
+        }
     }
 }
 
@@ -306,6 +331,7 @@ fn extract_verts<M: Field<Substance>>(
     corners: [f32],
     cell_verts: mut Slots<u32>,
     verts: mut Append<MeshVertex>,
+    creases: mut Append<u32>,
     id: GlobalId,
 ) {
     // 6 workgroups of 64 = 384 lanes per brick (covering 343 cells).
@@ -373,6 +399,8 @@ fn extract_verts<M: Field<Substance>>(
     var first_n = vec3(0.0)
     var min_dot = 1.0
 
+    let f = fields[b.w]
+    // Fast pass: accumulate QEF from cell-local trilinear gradients (0 extra field samples).
     for e in 0..12 {
         let i0 = e0[e]
         let i1 = e1[e]
@@ -381,8 +409,7 @@ fn extract_verts<M: Field<Substance>>(
         if (v0 < 0.0) != (v1 < 0.0) {
             let t = clamp(v0 / (v0 - v1), 0.0, 1.0)
             let uvw = mix(corner_uvw(i0), corner_uvw(i1), t)
-            let tg = tri_grad(d000, d100, d010, d110, d001, d101, d011, d111, uvw.x, uvw.y, uvw.z)
-            let n = safe_norm(tg, vec3(0.0, 1.0, 0.0))
+            let n = safe_norm(tri_grad(d000, d100, d010, d110, d001, d101, d011, d111, uvw.x, uvw.y, uvw.z), vec3(0.0, 1.0, 0.0))
             let q = uvw - half
             let dp = dot(n, q)
             a00 += n.x * n.x
@@ -440,7 +467,6 @@ fn extract_verts<M: Field<Substance>>(
     var wp = cell_lo + uvw_qef * h
 
     // 1-step exact Newton projection onto the field zero-isosurface (stays clamped inside cell).
-    let f = fields[b.w]
     let (dv, gv) = f.sample(wp)
     let g2 = dot(gv, gv)
     if g2 > 1.0e-8 {
@@ -463,6 +489,177 @@ fn extract_verts<M: Field<Substance>>(
         emits: vec4(sub.emits, 0.0),
     })
     cell_verts[id] = if vi < cap_verts { vi } else { NONE }
+    // Enqueue sharp crease/corner cells for exact Hermite edge refinement in a separate compacted
+    // pass so smooth cells keep minimal registers and zero warp divergence.
+    if min_dot < 0.78 && vi < cap_verts {
+        let _ = creases.push((bi << 9) | cell)
+    }
+}
+
+/// Prepares indirect dispatch args for `refine_creases` (clamped to `CAP_CREASES`).
+@compute(1)
+fn prep_creases(crease_count: [u32], args: mut One<DispatchArgs>, id: GlobalId) {
+    let n = min(crease_count[0], CAP_CREASES)
+    args.set(id, DispatchArgs { x: (n + 63) / 64, y: 1, z: 1 })
+}
+
+/// Pass 2b: Runs ONLY on compacted sharp-crease cells (`min_dot < 0.78`), replacing smeared
+/// trilinear gradients with exact analytic Hermite edge crossings and normals so 90° edges and
+/// corners lock onto their exact mathematical intersection with zero chamfering.
+@compute(64)
+fn refine_creases<M: Field<Substance>>(
+    fields: [M],
+    grids: [GridSpec],
+    active: [ActiveBrick],
+    corners: [f32],
+    creases: [u32],
+    crease_count: [u32],
+    cap_verts: u32,
+    cell_verts: mut Atomics<u32>,
+    verts: mut Append<MeshVertex>,
+    id: GlobalId,
+) {
+    let total = min(crease_count[0], CAP_CREASES)
+    if id.x >= total {
+        return
+    }
+    let packed = creases[id.x]
+    let bi = packed >> 9
+    let cell = packed & 511
+    let cz = cell / 49
+    let rem = cell - cz * 49
+    let cy = rem / 7
+    let cx = rem - cy * 7
+    let cbase = bi * CORNERS_BRICK
+    let d000 = cdist(corners, cbase, cx, cy, cz)
+    let d100 = cdist(corners, cbase, cx + 1, cy, cz)
+    let d010 = cdist(corners, cbase, cx, cy + 1, cz)
+    let d110 = cdist(corners, cbase, cx + 1, cy + 1, cz)
+    let d001 = cdist(corners, cbase, cx, cy, cz + 1)
+    let d101 = cdist(corners, cbase, cx + 1, cy, cz + 1)
+    let d011 = cdist(corners, cbase, cx, cy + 1, cz + 1)
+    let d111 = cdist(corners, cbase, cx + 1, cy + 1, cz + 1)
+
+    let ab = active[bi]
+    let b = ab.coord
+    let g = grids[b.w]
+    let h = g.cell
+    let bspan = h * f32(BRICK)
+    let cell_lo = g.origin + vec3(f32(b.x), f32(b.y), f32(b.z)) * bspan + vec3(f32(cx), f32(cy), f32(cz)) * h
+    let half = vec3(0.5)
+    let e0 = [0, 2, 4, 6, 0, 1, 4, 5, 0, 1, 2, 3]
+    let e1 = [1, 3, 5, 7, 2, 3, 6, 7, 4, 5, 6, 7]
+
+    var a00 = 0.0
+    var a01 = 0.0
+    var a02 = 0.0
+    var a11 = 0.0
+    var a12 = 0.0
+    var a22 = 0.0
+    var bx_v = 0.0
+    var by_v = 0.0
+    var bz_v = 0.0
+    var mass = vec3(0.0)
+    var avg_n = vec3(0.0)
+    var count: u32 = 0
+    var first_n = vec3(0.0)
+    var min_dot = 1.0
+
+    let f = fields[b.w]
+    for e in 0..12 {
+        let i0 = e0[e]
+        let i1 = e1[e]
+        let v0 = corner_val(d000, d100, d010, d110, d001, d101, d011, d111, i0)
+        let v1 = corner_val(d000, d100, d010, d110, d001, d101, d011, d111, i1)
+        if (v0 < 0.0) != (v1 < 0.0) {
+            let p0 = corner_uvw(i0)
+            let p1 = corner_uvw(i1)
+            let t0 = clamp(v0 / (v0 - v1), 0.0, 1.0)
+            var uvw = mix(p0, p1, t0)
+            let (edv, egv) = f.sample(cell_lo + uvw * h)
+            let edir = p1 - p0
+            let edot = dot(egv, edir) * h
+            if abs(edot) > 1.0e-6 {
+                let t1 = clamp(t0 - edv / edot, 0.0, 1.0)
+                uvw = mix(p0, p1, t1)
+            }
+            let n = safe_norm(egv, safe_norm(tri_grad(d000, d100, d010, d110, d001, d101, d011, d111, uvw.x, uvw.y, uvw.z), vec3(0.0, 1.0, 0.0)))
+            let q = uvw - half
+            let dp = dot(n, q)
+            a00 += n.x * n.x
+            a01 += n.x * n.y
+            a02 += n.x * n.z
+            a11 += n.y * n.y
+            a12 += n.y * n.z
+            a22 += n.z * n.z
+            bx_v += n.x * dp
+            by_v += n.y * dp
+            bz_v += n.z * dp
+            mass += uvw
+            avg_n += n
+            if count == 0 {
+                first_n = n
+            } else {
+                min_dot = min(min_dot, dot(first_n, n))
+            }
+            count += 1
+        }
+    }
+
+    let inv_c = 1.0 / max(f32(count), 1.0)
+    let mp = mass * inv_c
+    let mp_rel = mp - half
+    let reg = 0.002 * f32(count)
+    a00 += reg
+    a11 += reg
+    a22 += reg
+    bx_v += mp_rel.x * reg
+    by_v += mp_rel.y * reg
+    bz_v += mp_rel.z * reg
+
+    let c00 = a11 * a22 - a12 * a12
+    let c01 = a02 * a12 - a01 * a22
+    let c02 = a01 * a12 - a02 * a11
+    let c11 = a00 * a22 - a02 * a02
+    let c12 = a01 * a02 - a00 * a12
+    let c22 = a00 * a11 - a01 * a01
+    let det = a00 * c00 + a01 * c01 + a02 * c02
+    let rhs = vec3(bx_v, by_v, bz_v)
+    let sol = if det > 1.0e-12 {
+        vec3(
+            c00 * rhs.x + c01 * rhs.y + c02 * rhs.z,
+            c01 * rhs.x + c11 * rhs.y + c12 * rhs.z,
+            c02 * rhs.x + c12 * rhs.y + c22 * rhs.z,
+        ) / det
+    } else {
+        mp_rel
+    }
+    let uvw_qef = clamp(sol + half, vec3(0.0), vec3(1.0))
+    var wp = cell_lo + uvw_qef * h
+
+    let (dv, gv) = f.sample(wp)
+    let g2 = dot(gv, gv)
+    if g2 > 1.0e-8 {
+        let step = clamp(dv / g2, -0.75 * h, 0.75 * h)
+        let cand = wp - gv * step
+        let rel = (cand - cell_lo) / h
+        if rel.x >= 0.0 && rel.x <= 1.0 && rel.y >= 0.0 && rel.y <= 1.0 && rel.z >= 0.0 && rel.z <= 1.0 {
+            wp = cand
+        }
+    }
+
+    let n_final = safe_norm(gv, safe_norm(avg_n, vec3(0.0, 1.0, 0.0)))
+    let sub = f.channels(wp)
+    let smooth = if min_dot >= 0.88 { 1.0 } else { 0.0 }
+    let vi = verts.push(MeshVertex {
+        pos: vec4(wp, 1.0),
+        normal: vec4(n_final, smooth),
+        albedo: vec4(sub.albedo, 1.0),
+        emits: vec4(sub.emits, 0.0),
+    })
+    if vi < cap_verts {
+        cell_verts.store(i: bi * VERTS_STRIDE + cell, value: vi)
+    }
 }
 
 /// Dual vertex index of local cell `(x, y, z)` in `0..7` inside brick `bi`.
@@ -600,11 +797,13 @@ pub struct MeshBatch {
     pub corners: GpuBuffer<f32>,
     pub cell_verts: GpuBuffer<u32>,
     pub verts: AppendBuffer<MeshVertex>,
+    pub creases: AppendBuffer<u32>,
     pub indices: GpuBuffer<u32>,
     pub tri_count: GpuBuffer<u32>,
     pub draw_args: GpuBuffer<DrawIndexedArgs>,
     pub eval_args: GpuBuffer<DispatchArgs>,
     pub vert_args: GpuBuffer<DispatchArgs>,
+    pub crease_args: GpuBuffer<DispatchArgs>,
     pub quad_args: GpuBuffer<DispatchArgs>,
     pub cap_bricks: u32,
     pub cap_verts: u32,
@@ -627,11 +826,13 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
         corners: buffer(max_bricks * CORNERS_BRICK),
         cell_verts: buffer(max_bricks * VERTS_STRIDE),
         verts: append_buffer(cap_verts),
+        creases: append_buffer(CAP_CREASES),
         indices: buffer(cap_indices),
         tri_count: buffer_of([0]),
         draw_args: buffer_of([DrawIndexedArgs { indices: 0, instances: 0, first_index: 0, base_vertex: 0, first_instance: 0 }]),
         eval_args: buffer_of([DispatchArgs { x: 0, y: 1, z: 1 }]),
         vert_args: buffer_of([DispatchArgs { x: 0, y: 1, z: 1 }]),
+        crease_args: buffer_of([DispatchArgs { x: 0, y: 1, z: 1 }]),
         quad_args: buffer_of([DispatchArgs { x: 0, y: 1, z: 1 }]),
         cap_bricks: max_bricks,
         cap_verts,
@@ -759,6 +960,7 @@ impl MeshBatch {
         let max_chunks_bricks = min(self.cap_bricks, total_bricks)
         var chunk_start: u32 = 0
         while chunk_start < max_chunks_bricks {
+            let chunk_n = min(self.cap_bricks - chunk_start, CHUNK_BRICKS)
             dispatch(
                 prep_chunk.bind(
                     active_count: self.active.count(),
@@ -778,11 +980,12 @@ impl MeshBatch {
                     active_count: self.active.count(),
                     cap_bricks: self.cap_bricks,
                     chunk_start: chunk_start,
-                    corners: self.corners.span_mut(start: chunk_start * CORNERS_BRICK, count: CHUNK_BRICKS * CORNERS_BRICK),
+                    corners: self.corners.span_mut(start: chunk_start * CORNERS_BRICK, count: chunk_n * CORNERS_BRICK),
                 ),
                 groups: self.eval_args.at(0),
-                most: CHUNK_BRICKS * 8,
+                most: chunk_n * 8,
             )
+            self.creases.clear()
             dispatch(
                 extract_verts.bind(
                     fields: fields,
@@ -793,11 +996,34 @@ impl MeshBatch {
                     cap_verts: self.cap_verts,
                     chunk_start: chunk_start,
                     corners: self.corners.items(),
-                    cell_verts: self.cell_verts.span_mut(start: chunk_start * VERTS_STRIDE, count: CHUNK_BRICKS * VERTS_STRIDE),
+                    cell_verts: self.cell_verts.span_mut(start: chunk_start * VERTS_STRIDE, count: chunk_n * VERTS_STRIDE),
                     verts: mut self.verts,
+                    creases: mut self.creases,
                 ),
                 groups: self.vert_args.at(0),
-                most: CHUNK_BRICKS * 6,
+                most: chunk_n * 6,
+            )
+            dispatch(
+                prep_creases.bind(
+                    crease_count: self.creases.count(),
+                    args: mut self.crease_args,
+                ),
+                over: 1,
+            )
+            dispatch(
+                refine_creases.bind(
+                    fields: fields,
+                    grids: grids,
+                    active: self.active.items(),
+                    corners: self.corners.items(),
+                    creases: self.creases.items(),
+                    crease_count: self.creases.count(),
+                    cap_verts: self.cap_verts,
+                    cell_verts: mut self.cell_verts,
+                    verts: mut self.verts,
+                ),
+                groups: self.crease_args.at(0),
+                most: CAP_CREASES / 64,
             )
             dispatch(
                 emit_tris.bind(
@@ -811,9 +1037,9 @@ impl MeshBatch {
                     indices: mut self.indices,
                 ),
                 groups: self.quad_args.at(0),
-                most: CHUNK_BRICKS * 4,
+                most: chunk_n * 4,
             )
-            chunk_start += CHUNK_BRICKS
+            chunk_start += chunk_n
         }
 
         dispatch(
