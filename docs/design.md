@@ -184,6 +184,123 @@ picture, each short of the figure its own line named.) In every other case the l
 written: anything judged that got worse, anything dearer somewhere, or an idea whose machinery
 only its amount would justify, which is said when the line is written.
 
+## The frame costs by the pixel (2026-11-19: the engine's direction, not built)
+
+**Why.** Every pass of the frame as built is "for each thing, draw its part of the screen with
+its own program": the eye's, the outlines', the edge rays', the shadows', the sun's map, a map of
+sky a moving body. So every pass grows with things. Measured on the M4 at 1080p: a stage, 256
+boxes and one creature 12.1 ms; with 64 creatures 50; with 256, 177 (the eye 110, edge work 50,
+light and the rest 17). Where a pass already costs by the pixel the constants are fine: the whole
+screen from sampled cells is 0.9 ms, and light for the whole screen 1.6. Edges are over half of
+every frame, the still world's included (3.3 of 6.4 ms).
+
+**The rules.** They are the owner's, and every stage below is held to them.
+
+1. **Every pass costs by the pixel**, with a constant the toolchain can count. No pass draws a
+   thing again after the eye has found it.
+2. **No mechanism is chosen by what kind of thing is there.** Still or moving, a creature or
+   rock, kept in cells or written in closed form: every point of a surface asks the same
+   questions the same way, and every piece of matter answers them the same way. This is "the
+   engine knows properties, never things" applied to the frame itself.
+3. **One way to see, one way to light.** A cache is allowed only as a cache of the one answer,
+   filled from all matter alike, and it is judged against that answer.
+4. **Cohesion is measured.** The same field drawn once as still matter and once as a thing that
+   moves but does not happen to move gives the same picture. A moving thing's contact with still
+   matter is judged against brute force. Both are judges with lines, like any other.
+5. **The frame is summed before it is drawn.** What a pass will cost is its pixels times counted
+   work times the device's measured time a unit of work. Over the budget, the engine lowers a
+   rate that has a physical meaning and that every scene gets alike, never the frame's time.
+
+**The pieces.**
+
+- **Stand-ins.** Between the game's fields and every pass sits one store. For each thing it holds
+  the cheapest form of it that is proved good enough for the size the thing has on the screen
+  now: its closed-form parts; fewer parts, where a bound on the distance between the two
+  surfaces is under what the eye is held to; or cells kept once a kind in the kind's own rigid
+  frame, at the fineness the nearest of that kind needs, shared by every thing of the kind (a
+  joint is the smooth join of two such reads, which is within the cells' own error of the true
+  join because the join is monotone and steepness one in each part). With a stand-in come two
+  hulls, one inside the surface and one outside, both proved, its bound, and its counted work.
+  Matter that changes makes again only what its change's bound touches, to a fixed amount a
+  frame, the coarser level standing in meanwhile. Passes and the CPU's questions ask the store,
+  never the field.
+- **One way to see.** Stand-ins are listed by screen tile, nearest first. One kernel walks a
+  pixel's list: a stand-in's hulls are met in closed form, so the surface is bracketed between
+  them and found by a guarded root-finder (the inner hull's entry is asked first: away from a
+  join it is the hit). A ray that passes within a pixel of a stand-in without meeting it leaves
+  how near it came and which way the outline runs. The kernel writes what was met and how far,
+  and that edge record; nothing else. The still world's cells go through the same kernel if the
+  measurement below allows it; if not, they keep the rasteriser, and that is named as the one
+  exception with the conditions that make it invisible (the same ray's distance, the edge record
+  shared across the two, nothing after the eye knowing which found a pixel).
+- **What a pixel shows** (facing, substance) is found once a pixel after the eye's pass, by the
+  stand-in that was met.
+- **One light.** The question is "what light arrives at this point through this cone", answered
+  by one march through one index of every stand-in and everything that glows, the level read
+  following the cone's width. The sky, bounce, a spell's light, contact and a mirror's reflection
+  are that question with different cones. Two caches of it: the sun's cone, too thin to march at
+  every pixel, in one map filled from all matter alike and read with a blur that widens with the
+  blocker's distance; and the sky's and bounce's cones stored on surfaces, one store for still
+  and moving surfaces (a still surface is a moving one whose frame does not move), filled by the
+  march to a fixed amount a frame.
+- **Edges without rays.** A pixel an outline crosses is its square cut by the outlines its record
+  holds (a line, an arc's correction, a clip where two cross), each piece coloured from the
+  neighbouring pixel that met that surface. A crease between two faces is a line from the two
+  facings. A part thinner than a pixel is covered in closed form. No outline pass, no edge rays,
+  no edge shadows.
+
+**What it is predicted to cost** (M4, 1080p, ms; from the engine's measured unit costs and
+estimates; nothing here is measured as a frame), against the shares above:
+
+| Share | Share | Predicted, 256 creatures and 256 props | Of it |
+| --- | --- | --- | --- |
+| The eye's rays | 3.0 | 3.35 | the eye's kernel 2.25, what a pixel shows 1.10 |
+| Light | 3.0 | 3.55 | the sun's map 0.55; the sun read, stored light, cones a pixel 3.0 |
+| Edges | 1.5 | 1.0 | |
+| Things that move, and cells filled | 2.5 | 0.85 | stand-ins, lists, light's index |
+| Matter light passes through; the look | 3.0 | not designed here | |
+| Sum of what is designed | | 8.75 | still world alone 5.2; 64 creatures 6.2 |
+
+The shares stay as they are until a stage is measured against them.
+
+**What is not proved.** The kernel does not exist: its time is derived from unit costs. Colours
+read from neighbours are shown on a toy scene only (2.17 of 255 against nine rays' 2.45), with no
+moving shadow edges and no crossing outlines. Every figure for light is an estimate. Two things
+this design brings back were set aside before, by argument and not by measurement, and are
+reopened only as measurements: work lists in compute in place of the rasteriser, and fewer parts
+for a far creature (nothing merges at the fiftieth of a pixel edges are held to, so the second
+waits on a judged tolerance for far things). And one fault this document already names stands in
+its way: a shader that holds every way of answering makes every pixel pay for the widest
+(slice 1d). The kernel is allowed because a stand-in is one of two or three forms of data, not a
+thing's own code; its time with every form present, against each alone, is part of its first
+measurement.
+
+**The order.** Each stage lands alone, deletes what it replaces, and has its line written before
+it is measured. Before any of them, the kernel is timed by itself, outside the engine, on both
+machines, with a brute-force check for holes: over 4.5 ms for 256 creatures on the M4 the design
+is dead as priced; at 2.2 or under the budget is real; any hole is a fault before any time.
+
+1. **Edges without rays**, in the frame as it is. Deletes edge rays, edge light, edge shadows and
+   edge shade. Kill: any judged edge measure worse than today's on a judged scene, or the work
+   replaced not at least halved at 64 creatures on the M4. It pays whatever the kernel's time is.
+2. **One way to see**: the store of stand-ins, the kernel, what a pixel shows found once.
+   Deletes a draw a thing in the eye's pass, the outline pass, and a program a kind for the eye.
+   Kill: a hole; or the eye's work at 256 creatures not under a tenth of today's. If the kernel's
+   own measurement killed it, this stage is fragments where a part's hull can be, through the
+   rasteriser, by the same stand-ins.
+3. **One light**: the index, the march, the sun's one map, one store. Deletes the maps of sky a
+   body, the cones, every shadow draw a thing, and every split between still and moving. Lines:
+   the two cohesion judges (still against moving within 1 of 255 in the mean and 3 at the 99th
+   percentile; a foot on rock against brute force within 2.5 and 6 near the join).
+4. **Kinds kept in cells, and fewer parts far away**, inside the store. Kill: a written field of
+   64 nodes costing over one and a half times a compiled creature a pixel.
+5. **The frame summed before it is drawn**, and the rates it may lower. Kill: a crowd ten deep
+   over 12 ms.
+6. **Light's reach**: reflections with roughness, a spell's light and its shadow, light through
+   glass, all as cones of the one march.
+
+The record of the arguments and their spikes is in `wrela-notes/coordinator/gemini3/`.
+
 ## The layers
 
 Dependencies point down. Nothing below knows anything above.
@@ -410,6 +527,10 @@ at a time, into the place this document gives it.
 4. **Matter light passes through** (fog first), then the ones most likely to fail: fur, and a
    whole world round the eye.
 
+From 2026-11-19 the main line is the six stages of "The frame costs by the pixel" above. They
+take the place of what was left of 1e, 1f and 1g and of slice 2; the author test and matter light
+passes through follow them.
+
 ## Directions, not yet measured
 
 Four ideas that would each remove machinery. None is built. Each has the line that would kill it,
@@ -568,46 +689,24 @@ steepness times the distance to it): stepping by that is sound by a theorem, not
 error. **Dead if** the stack's eye is dearer than today's walk at 100 m or at 3 m, or the
 audit's count of hits off by a pixel against the cells' own surface is not zero.
 
-## The crowd: a moving thing is solved, not marched (2026-11-19, not built)
+## The crowd: what was measured before the direction changed (2026-11-19)
 
-With 64 creatures the frame is 50.6 ms against 16.6, and the counts say why. 88% of a creature's
-fragments in the eye's pass are spent on the cube round its body. A creature's ray takes 14.4
-steps and its outline's least about 16 asks, though at 57% of its hits one part alone is within
-the join's radius of the least, and at 39% two are. Outlines and edge rays follow the things a
-tile holds, not the pixels a thing covers. And most of a built world's nine-ray pixels are
-creases between two flat faces.
+With 64 creatures the frame was 50.6 ms against 16.6, and the counts said why: 88% of a
+creature's fragments in the eye's pass were spent on the cube round its body; a creature's ray
+took 14.4 steps; outlines and edge rays followed the things a tile holds, not the pixels a thing
+covers; most of a built world's nine-ray pixels were creases between two flat faces.
 
-So, as directions with their counts taken and nothing built:
+Two directions named that day were measured dead and stay dead. Solving a smooth union's hit in
+closed form is sound and costs 1.28 to 1.41 times the march, where its line was a quarter: a
+round cone's exact meet weighs 3.5 times its value and gradient. The join of many that does not
+depend on the order of its parts is right as mathematics and unusable as derived code (a range
+95,557 times too wide). A hull a part through the rasteriser died three times with hulls grown by
+the whole fold's lowering (0.825 of the join's radius): they overlapped across the body.
 
-- **A smooth union of closed-form shapes is solved.** Its first hit lies between the nearest
-  meet of its parts grown by the join's lowering and their nearest sharp meet. Where one part
-  alone is within the join's radius, the hit is that part's own closed-form meet, with no ask
-  at all; elsewhere a few steps certified by a bound on how fast the field's slope can fall along
-  the ray. The same holds for the least along a ray (an outline) and for how much of the sun an
-  occluder hides. This is std's to give, and the engine then treats a creature as it treats a box.
-- **The smooth union of many does not depend on the order of its parts.** The least over weights
-  on the simplex of the weighted mix plus a quadratic penalty: for two parts it is today's join
-  exactly, for three it differs from today's fold by at most a sixteenth of the radius, and its
-  lowering for eighteen parts is 0.47 of the radius where the fold's is 0.825, which tightens
-  every bound on a creature.
-- **Fragments run where a part can be, not where a body's bound is,** and a kind's things are one
-  draw.
-- **A crease between two planes is a straight line on the screen,** exactly. A pixel crossed by
-  straight outlines and creases is its square cut by those lines, each piece shaded once, with no
-  ray; the piece's surface is taken from the neighbouring pixel that hit it.
-
-*Measured the same day:* the first two are dead. Solving a smooth union's hit in closed form is
-sound (no first root missed on 2,000 rays) and costs 1.28 to 1.41 times today's march, where its
-line was a quarter: a round cone's exact meet weighs 3.5 times its value and gradient, and at the
-fold's sound threshold one part decides only a quarter of hits. The join of many that does not
-depend on order is right as mathematics and its derived code is not usable (a range 95,557 times
-too wide) without a day of hand-written rules, which the first death makes pointless. What stands
-is what the counts found: fragments where a part can be, and creases as straight lines.
-
-What the same argument killed: work lists in compute in place of the rasteriser; merging a far
-creature's parts for the eye (nothing merges at the fiftieth of a pixel edges are held to);
-drawing the rock without cells (its bracket is metres wide). The record is in
-`wrela-notes/coordinator/gemini/`.
+What the counts found, and "The frame costs by the pixel" above is built on: work where a part
+can be and not where a body's bound is; the lowering near a part is that of the few parts near it
+(a quarter of the radius for two, not 0.825); a crease between two planes is a straight line on
+the screen. The record is in `wrela-notes/coordinator/gemini/` and `gemini2/`.
 
 ## Ways of spending less that are not tried yet
 
