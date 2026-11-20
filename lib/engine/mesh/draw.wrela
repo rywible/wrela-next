@@ -1,8 +1,9 @@
 // Unified hardware rasterization of extracted surface meshlets (`extract`) and clipmap heightfields
-// (`height`): one physically-based shading model, one shadow map, one GPU Sky PMREM cache, one
-// world-space radiance volume + auto-extracted dynamic local emitters, one refractive/transmissive
-// pass (glass/water/crystal), one volumetric froxel pass, one optical HDR bloom pyramid, and one
-// `Look::tone` pass.
+// (`height`): dual-cascade rotated-PCF sun shadows, camera-focused world-space radiance cache +
+// auto-extracted dynamic local emitters, 4× hardware MSAA direct HDR + G-buffer pass, half-res
+// bilateral 4-cone GI + Screen-Space Specular Reflections (SSR) + micro-contact shadows, unified
+// refractive pass (glass/water/crystal with SSR + Snell refraction + Beer-Lambert absorption),
+// volumetric froxels, Dual Kawase HDR bloom, and ONE `Look::tone` pass.
 
 use matter::height::{Height, NoHeight}
 use matter::medium::{Medium, NoMedium}
@@ -15,8 +16,8 @@ use mesh::extract::{MeshBatch, MeshVertex, mesh_batch}
 use mesh::height::{CLIP_RINGS, CLIP_VERTS, MeshVary, height_vs}
 use mesh::light::{
     Emitter, RadGrid, RadianceCache, SHADOW_SIDE, ShadowView, SkyCache, cone_indirect,
-    eval_emitters, radiance_cache, shadow_view, sky_background, sky_cache, sky_irradiance,
-    sky_specular, spec_cone, sun_shadow,
+    contact_shadow, eval_emitters, ign, radiance_cache, shadow_view, sky_background, sky_cache,
+    sky_irradiance, sky_specular, spec_cone, sun_shadow, sun_shadow_csm, sun_vis_point, trace_ssr,
 }
 use mesh::volume::{
     BloomPyramid, FroxelVolume, bloom_pyramid, froxel_volume, hdr_tone_fs,
@@ -29,15 +30,18 @@ use std::collections::Vec
 use std::field::Field
 use std::gpu::{
     Address, ClipPosition, Compare, ComparisonSampler, Cull, Depth, DepthBias, DepthOnlyPass,
-    DepthPass, DepthTexture, Filter, FragCoord, MsaaDepthPass, MsaaDepthPass3, R8, Rgba16Float,
-    Rgba32Float, Sampler, Targets3, Texture, Texture3d, VertexIndex, begin_depth_pass, begin_pass,
-    begin_pass3_msaa_with_depth, begin_pass_msaa_with_depth, begin_pass_with_depth,
-    comparison_sampler, copy_texture, depth_texture, discard, draw, label, sampler, texture,
+    DepthPass, DepthTexture, Filter, FragCoord, MsaaDepthPass3, R8, Rgba8, Rgba16Float, Rgba32Float,
+    Sampler, Targets2, Targets3, Texture, Texture3d, VertexIndex, begin_depth_pass, begin_pass,
+    begin_pass2, begin_pass3_msaa_with_depth, begin_pass_with_depth, comparison_sampler,
+    copy_texture, depth_texture, discard, draw, label, sampler, texture,
 }
-use std::hash::StateHash
+use std::hash::{Hasher, StateHash}
 
 /// Reversed-Z near plane (m): `clip_z = NEAR`, `clip_w = z`, so `ndc_z = NEAR / z` in `(0, 1]`.
 pub const NEAR: f32 = 0.005
+
+/// Near shadow cascade half-extent (m): gives ~9 mm shadow texels around the camera/combat focus.
+const NEAR_CASCADE_RAD: f32 = 9.5
 
 /// Default maximum active surface bricks per batch.
 const BATCH_BRICKS: u32 = 8192
@@ -115,31 +119,44 @@ fn resolve_normal(vary: MeshVary, ray_back: vec3) -> vec3 {
     if vary.pbr.w < 0.5 || dot(nv, nf) < 0.85 { nf } else { nv }
 }
 
-/// Shared physically-based linear-HDR shading for opaque solids and terrain heightfields:
-/// Cook-Torrance GGX specular + Schlick Fresnel + Clearcoat + Subsurface wrap + unified sun shadow
-/// + auto-extracted dynamic local emitters + 3-level radiance volume GI + GPU Sky PMREM.
-/// Outputs `(vec4(linear_hdr, eye_dist), vec4(normal, eye_dist), sun_vis)`.
+/// Encodes `(metallic, ior, coat)` into `[0, 1]` for 8-bit `Rgba8` G-buffer (`0.5` = pure matte):
+///   `~0.5`   -> pure matte `lambert` (`abs(code) < 0.015`)
+///   `< 0.48` -> metallic conductor (`metallic = -code`)
+///   `> 0.52` -> dielectric (`ior = 1.5`, uncoated `0.03`, coated `coat >= 0.05`)
+fn encode_mat_unorm(sub: Substance) -> f32 {
+    if sub.metallic > 0.02 {
+        return clamp(0.5 - 0.5 * clamp(sub.metallic, 0.04, 1.0), 0.0, 0.48)
+    }
+    if sub.spec_weight() <= 1.0e-5 && sub.coat <= 1.0e-5 {
+        return 0.5
+    }
+    let c = if sub.coat > 0.04 { clamp(sub.coat, 0.05, 1.0) } else { 0.03 }
+    clamp(0.5 + 0.5 * c, 0.515, 1.0)
+}
+
+/// Lean direct-only linear-HDR + compact `Rgba8` G-buffer fragment shader for the 4× MSAA opaque
+/// eye pass (shared by both solid meshlets and opaque terrain heightfields): computes dual-cascade
+/// rotated-PCF sun lighting + auto-extracted dynamic local emitters + emission, deferring 4-cone
+/// GI and SSR to the 4× faster half-res bilateral pass. Zero `discard()` -> 100% hardware Early-Z.
+@fragment
 @budget(work: 18000)
-fn shade_mesh<S: Sky>(
+fn mesh_direct_fs<S: Sky>(
+    pixel: FragCoord,
     vary: MeshVary,
     v: View,
-    sv: ShadowView,
+    sv_near: ShadowView,
+    sv_far: ShadowView,
     rad_grid: RadGrid,
     sky: S,
-    sky_diff: Texture<Rgba16Float>,
-    sky_spec0: Texture<Rgba16Float>,
-    sky_spec1: Texture<Rgba16Float>,
-    sky_spec2: Texture<Rgba16Float>,
-    sky_s: Sampler,
-    shadow_map: DepthTexture,
+    sm_near: DepthTexture,
+    sm_far: DepthTexture,
     cmp: ComparisonSampler,
     rad0: Texture3d<Rgba16Float>,
     rad1: Texture3d<Rgba16Float>,
-    rad2: Texture3d<Rgba16Float>,
     rad_s: Sampler,
     emitters: [Emitter],
     emitter_count: [u32],
-) -> (vec4, vec4, f32) {
+) -> Targets3<vec4, vec4, vec4> {
     let to_eye = v.at - vary.wp
     let dist = length(to_eye)
     let ray_back = if dist > 1.0e-6 { to_eye / dist } else { -v.forward }
@@ -148,114 +165,205 @@ fn shade_mesh<S: Sky>(
 
     let sun = sky.sun()
     let ndl = max(dot(n, sun.way), 0.0)
-    let vis = if ndl > 0.0 { sun_shadow(shadow_map, cmp, sv, vary.wp, n) } else { 0.0 }
+    let vis = if ndl > 0.0 {
+        sun_shadow_csm(sm_near, sm_far, cmp, sv_near, sv_far, vary.wp, n, pixel.position.xy)
+    } else {
+        0.0
+    }
     let direct_sun = sub.shade_direct(n, sun.way, ray_back, sun.light * vis)
     let local_light = eval_emitters(sub, vary.wp, n, ray_back, rad_grid, rad0, rad1, rad_s, emitters, emitter_count)
+    let direct = sub.emits + direct_sun + local_light
 
-    let ind = cone_indirect(rad_grid, rad0, rad1, rad2, rad_s, vary.wp, n)
-    let sky_amb = sky_irradiance(sky_diff, sky_s, n) * ind.w + ind.xyz
+    Targets3 {
+        first: vec4(direct, min(dist, 65000.0)),
+        second: vec4(n * 0.5 + vec3(0.5), clamp(sub.roughness, 0.02, 1.0)),
+        third: vec4(sub.albedo, encode_mat_unorm(sub)),
+    }
+}
 
-    let sw = sub.spec_weight()
-    var rad = sub.emits + direct_sun + local_light
-    if sw <= 1.0e-5 && sub.coat <= 1.0e-5 {
-        // Pure matte fast path: zero specular environment fetches (bit-identical to Lambertian).
-        rad += sub.albedo * ONE_OVER_PI * sky_amb
-    } else {
-        let ndv = max(dot(n, ray_back), 0.001)
+/// Half-resolution (`W/2 × H/2`) indirect lighting pass: computes 4-cone hemisphere diffuse GI
+/// (`first = vec4(bounce_irrad, sky_vis)`), Screen-Space Specular Reflections (SSR) seamlessly
+/// falling back to `spec_cone` + `sky_specular` PMREM (`second.rgb`), and screen-space micro-contact
+/// shadow visibility (`second.w`). Runs at 1/4 the pixels of full-res with zero sky work.
+@fragment
+@budget(work: 8000)
+fn indirect_half_fs<S: Sky>(
+    pixel: FragCoord,
+    v: View,
+    rad_grid: RadGrid,
+    sky: S,
+    hdr_direct: Texture<Rgba16Float>,
+    g_normal: Texture<Rgba8>,
+    g_albedo: Texture<Rgba8>,
+    depth: DepthTexture,
+    bg_s: Sampler,
+    sky_diff: Texture<Rgba16Float>,
+    sky_spec0: Texture<Rgba16Float>,
+    sky_spec1: Texture<Rgba16Float>,
+    sky_spec2: Texture<Rgba16Float>,
+    sky_s: Sampler,
+    rad0: Texture3d<Rgba16Float>,
+    rad1: Texture3d<Rgba16Float>,
+    rad2: Texture3d<Rgba16Float>,
+    rad_s: Sampler,
+    full_w: u32,
+    full_h: u32,
+) -> Targets2<vec4, vec4> {
+    let fx = min(u32(pixel.position.x) * 2, full_w - 1)
+    let fy = min(u32(pixel.position.y) * 2, full_h - 1)
+    let gn = g_normal.load(fx, fy)
+    // Sky pixels have `g_normal.w == 0.0` (surfaces are clamped to `>= 0.02`).
+    if gn.w < 0.01 {
+        return Targets2 {
+            first: vec4(0.0, 0.0, 0.0, 1.0),
+            second: vec4(0.0, 0.0, 0.0, 1.0),
+        }
+    }
+    let ndc_z = depth.load(fx, fy)
+    if ndc_z <= 1.0e-6 {
+        return Targets2 {
+            first: vec4(0.0, 0.0, 0.0, 1.0),
+            second: vec4(0.0, 0.0, 0.0, 1.0),
+        }
+    }
+    let ray = v.ray(vec2(f32(fx) + 0.5, f32(fy) + 0.5))
+    let lin_z = NEAR / ndc_z
+    let dist = lin_z / max(dot(ray, v.forward), 0.05)
+    let wp = v.at + ray * dist
+    let n_raw = gn.xyz * 2.0 - vec3(1.0)
+    let nl2 = dot(n_raw, n_raw)
+    let n = if nl2 > 1.0e-10 { n_raw * (1.0 / sqrt(nl2)) } else { -ray }
+    let roughness = clamp(gn.w, 0.02, 1.0)
+    let mat_code = g_albedo.load(fx, fy).w * 2.0 - 1.0
+
+    let ind = cone_indirect(rad_grid, rad0, rad1, rad2, rad_s, wp, n)
+    let cshad = contact_shadow(v, depth, wp, n, sky.sun().way, NEAR)
+
+    // Skip specular SSR & voxel reflection cone completely on pure matte surfaces (`abs(mat_code) < 0.015`).
+    var env_spec = vec3(0.0)
+    if abs(mat_code) >= 0.015 {
+        let ray_back = -ray
         let refl = normalize(n * (2.0 * dot(n, ray_back)) - ray_back)
-        let f0 = sub.f0()
-        let f_env = fresnel_schlick_rough(f0, ndv, sub.roughness) * sw
-        let kd = (vec3(1.0) - f_env) * (1.0 - sub.metallic)
-        let brdf_ab = env_brdf_approx(sub.roughness, ndv)
-        let sky_refl = sky_specular(sky_spec0, sky_spec1, sky_spec2, sky_diff, sky_s, refl, sub.roughness)
-        let w_refl = spec_cone(rad_grid, rad0, rad1, rad2, rad_s, vary.wp, n, refl, sub.roughness)
-        // Specular occlusion attenuates distant sky reflections inside occluded cavities while
-        // preserving near-field world reflections.
-        let spec_occ = clamp(ind.w + (1.0 - sub.roughness) * 0.25, 0.15, 1.0)
-        let env_spec = w_refl.xyz + sky_refl * (1.0 - w_refl.w * 0.85) * spec_occ
-        var indirect = sub.albedo * (kd * ONE_OVER_PI) * sky_amb + env_spec * (f0 * brdf_ab.x + vec3(brdf_ab.y)) * sw
+        let eff_r = if mat_code > 0.15 { min(roughness, 0.12) } else { roughness }
+        let sky_refl = sky_specular(sky_spec0, sky_spec1, sky_spec2, sky_diff, sky_s, refl, eff_r)
+        let w_refl = spec_cone(rad_grid, rad0, rad1, rad2, rad_s, wp, n, refl, eff_r)
+        let spec_occ = clamp(ind.w + (1.0 - eff_r) * 0.25, 0.15, 1.0)
+        let fallback = w_refl.xyz + sky_refl * (1.0 - w_refl.w * 0.85) * spec_occ
+        let ssr = trace_ssr(v, hdr_direct, bg_s, wp, n, refl, eff_r, ign(pixel.position.xy))
+        env_spec = mix(fallback, ssr.xyz, vec3(ssr.w))
+    }
 
-        if sub.coat > 1.0e-4 {
-            let fc = fresnel_schlick_rough(vec3(0.04), ndv, 0.06).x * sub.coat
-            let coat_sky = sky_specular(sky_spec0, sky_spec1, sky_spec2, sky_diff, sky_s, refl, 0.06)
-            let coat_env = w_refl.xyz * 0.65 + coat_sky * (1.0 - w_refl.w * 0.65) * spec_occ
-            indirect = indirect * (1.0 - fc) + coat_env * fc
+    Targets2 {
+        first: ind,
+        second: vec4(env_spec, cshad),
+    }
+}
+
+/// Full-resolution depth+normal bilateral upsample of half-res GI, SSR, and micro-contact shadows
+/// combined with the 4× MSAA direct HDR buffer into `hdr_colour`.
+@fragment
+fn combine_indirect_fs<S: Sky>(
+    pixel: FragCoord,
+    v: View,
+    sky: S,
+    hdr_direct: Texture<Rgba16Float>,
+    g_normal: Texture<Rgba8>,
+    g_albedo: Texture<Rgba8>,
+    gi_diff: Texture<Rgba16Float>,
+    gi_spec: Texture<Rgba16Float>,
+    sky_diff: Texture<Rgba16Float>,
+    sky_s: Sampler,
+    full_w: u32,
+    full_h: u32,
+) -> vec4 {
+    let px = min(u32(pixel.position.x), full_w - 1)
+    let py = min(u32(pixel.position.y), full_h - 1)
+    let direct_d = hdr_direct.load(px, py)
+    let gn = g_normal.load(px, py)
+    if gn.w < 0.01 {
+        return direct_d
+    }
+    let ga = g_albedo.load(px, py)
+    let n_raw = gn.xyz * 2.0 - vec3(1.0)
+    let nl2 = dot(n_raw, n_raw)
+    let ray = v.ray(pixel.position.xy)
+    let n = if nl2 > 1.0e-10 { n_raw * (1.0 / sqrt(nl2)) } else { -ray }
+    let dist = direct_d.w
+    let roughness = clamp(gn.w, 0.02, 1.0)
+    let albedo = ga.xyz
+    let mat_code = ga.w * 2.0 - 1.0
+
+    // 4-tap depth + normal weighted bilateral upsample from half-res GI/SSR buffers.
+    let hw = max(full_w / 2, 1)
+    let hh = max(full_h / 2, 1)
+    let hx0 = min(px / 2, hw - 1)
+    let hy0 = min(py / 2, hh - 1)
+    let hx1 = min(hx0 + 1, hw - 1)
+    let hy1 = min(hy0 + 1, hh - 1)
+
+    let xs = [hx0, hx1, hx0, hx1]
+    let ys = [hy0, hy0, hy1, hy1]
+    var diff_acc = vec4(0.0)
+    var spec_acc = vec4(0.0)
+    var w_sum = 0.0
+    for k in 0..4 {
+        let sx = xs[k]
+        let sy = ys[k]
+        let fx = min(sx * 2, full_w - 1)
+        let fy = min(sy * 2, full_h - 1)
+        let sn = g_normal.load(fx, fy)
+        let sd = hdr_direct.load(fx, fy).w
+        if sn.w >= 0.01 {
+            let sn_v = normalize(sn.xyz * 2.0 - vec3(1.0))
+            let ndot = max(dot(n, sn_v), 0.0)
+            let dz = abs(dist - sd) / max(dist * 0.08, 0.15)
+            let w = (ndot * ndot * ndot * ndot + 0.001) * exp(-dz * dz)
+            diff_acc += gi_diff.load(sx, sy) * w
+            spec_acc += gi_spec.load(sx, sy) * w
+            w_sum += w
+        }
+    }
+    let ind = if w_sum > 1.0e-4 { diff_acc / w_sum } else { gi_diff.load(hx0, hy0) }
+    let spec_c = if w_sum > 1.0e-4 { spec_acc / w_sum } else { gi_spec.load(hx0, hy0) }
+
+    let direct_luma = dot(direct_d.xyz, vec3(0.2126, 0.7152, 0.0722))
+    let cshad = if direct_luma < 3.5 && dot(n, sky.sun().way) > 0.05 { spec_c.w } else { 1.0 }
+    var rad = direct_d.xyz * cshad
+
+    let sky_amb = sky_irradiance(sky_diff, sky_s, n) * ind.w + ind.xyz
+    if abs(mat_code) < 0.015 {
+        rad += albedo * ONE_OVER_PI * sky_amb
+    } else {
+        let ray_back = -ray
+        let ndv = max(dot(n, ray_back), 0.001)
+        let metallic = if mat_code < -0.015 { clamp(-mat_code, 0.0, 1.0) } else { 0.0 }
+        let coat = if mat_code > 0.04 { clamp(mat_code, 0.0, 1.0) } else { 0.0 }
+        let f0 = mix(vec3(0.04), albedo, metallic)
+        let f_env = fresnel_schlick_rough(f0, ndv, roughness)
+        let kd = (vec3(1.0) - f_env) * (1.0 - metallic)
+        let brdf_ab = env_brdf_approx(roughness, ndv)
+        var indirect = albedo * (kd * ONE_OVER_PI) * sky_amb + spec_c.xyz * (f0 * brdf_ab.x + vec3(brdf_ab.y))
+        if coat > 1.0e-4 {
+            let fc = fresnel_schlick_rough(vec3(0.04), ndv, 0.06).x * coat
+            indirect = indirect * (1.0 - fc) + spec_c.xyz * fc
         }
         rad += indirect
     }
-    (vec4(rad, min(dist, 65000.0)), vec4(n, dist), vis)
-}
-
-/// Colour-only linear-HDR fragment shader for opaque meshlets (no `discard()` -> full hardware Early-Z).
-@fragment
-fn mesh_fs<S: Sky>(
-    vary: MeshVary,
-    v: View,
-    sv: ShadowView,
-    rad_grid: RadGrid,
-    sky: S,
-    sky_diff: Texture<Rgba16Float>,
-    sky_spec0: Texture<Rgba16Float>,
-    sky_spec1: Texture<Rgba16Float>,
-    sky_spec2: Texture<Rgba16Float>,
-    sky_s: Sampler,
-    shadow_map: DepthTexture,
-    cmp: ComparisonSampler,
-    rad0: Texture3d<Rgba16Float>,
-    rad1: Texture3d<Rgba16Float>,
-    rad2: Texture3d<Rgba16Float>,
-    rad_s: Sampler,
-    emitters: [Emitter],
-    emitter_count: [u32],
-) -> vec4 {
-    shade_mesh(
-        vary, v, sv, rad_grid, sky, sky_diff, sky_spec0, sky_spec1, sky_spec2, sky_s,
-        shadow_map, cmp, rad0, rad1, rad2, rad_s, emitters, emitter_count,
-    ).0
-}
-
-/// Opaque clipmap heightfield shader (defers transmissive water fragments to `mesh_trans_fs`).
-@fragment
-fn height_opaque_fs<S: Sky>(
-    vary: MeshVary,
-    v: View,
-    sv: ShadowView,
-    rad_grid: RadGrid,
-    sky: S,
-    sky_diff: Texture<Rgba16Float>,
-    sky_spec0: Texture<Rgba16Float>,
-    sky_spec1: Texture<Rgba16Float>,
-    sky_spec2: Texture<Rgba16Float>,
-    sky_s: Sampler,
-    shadow_map: DepthTexture,
-    cmp: ComparisonSampler,
-    rad0: Texture3d<Rgba16Float>,
-    rad1: Texture3d<Rgba16Float>,
-    rad2: Texture3d<Rgba16Float>,
-    rad_s: Sampler,
-    emitters: [Emitter],
-    emitter_count: [u32],
-) -> vec4 {
-    if vary.optics.x > 0.02 {
-        discard()
-    }
-    shade_mesh(
-        vary, v, sv, rad_grid, sky, sky_diff, sky_spec0, sky_spec1, sky_spec2, sky_s,
-        shadow_map, cmp, rad0, rad1, rad2, rad_s, emitters, emitter_count,
-    ).0
+    vec4(rad, dist)
 }
 
 /// Physically-based refractive / transmissive fragment shader for glass, water, crystal, and ice:
-/// Snell screen-space refraction over the resolved opaque HDR buffer, Beer-Lambert depth absorption
-/// (`hdr_bg.w - dist`), rough frosted-glass sampling, Schlick Fresnel reflection from Sky PMREM +
-/// radiance volume, and crisp GGX specular highlights from sun and dynamic spell emitters.
+/// Snell screen-space refraction over the GI+SSR-lit opaque HDR buffer, Beer-Lambert depth
+/// absorption (`hdr_bg.w - dist`), rough frosted-glass sampling, real-time SSR + Sky PMREM +
+/// radiance-cone reflection, and crisp GGX specular from dual-cascade sun & dynamic spell emitters.
 @fragment
 @budget(work: 20000)
 fn mesh_trans_fs<S: Sky>(
     pixel: FragCoord,
     vary: MeshVary,
     v: View,
-    sv: ShadowView,
+    sv_near: ShadowView,
+    sv_far: ShadowView,
     rad_grid: RadGrid,
     sky: S,
     sky_diff: Texture<Rgba16Float>,
@@ -263,7 +371,8 @@ fn mesh_trans_fs<S: Sky>(
     sky_spec1: Texture<Rgba16Float>,
     sky_spec2: Texture<Rgba16Float>,
     sky_s: Sampler,
-    shadow_map: DepthTexture,
+    sm_near: DepthTexture,
+    sm_far: DepthTexture,
     cmp: ComparisonSampler,
     rad0: Texture3d<Rgba16Float>,
     rad1: Texture3d<Rgba16Float>,
@@ -284,7 +393,6 @@ fn mesh_trans_fs<S: Sky>(
     let sub = vary_substance(vary)
     let ndv = max(dot(n, ray_back), 0.001)
 
-    // Snell refraction vector in world space -> projected screen UV offset scaled by optical depth.
     let uv = pixel.position.xy / max(v.size, vec2(1.0))
     let bg_here = hdr_bg.sample_level(bg_s, uv, 0.0)
     let raw_thick = max(bg_here.w - dist, 0.05)
@@ -296,7 +404,6 @@ fn mesh_trans_fs<S: Sky>(
     } else {
         normalize(n * (2.0 * ndv) - ray_back)
     }
-    // Project refracted exit point `(wp + rdir * refract_dist)` to screen UV.
     let exit_wp = vary.wp + rdir * min(refract_dist * 0.45, 1.2)
     let erel = exit_wp - v.at
     let ez = max(dot(erel, v.forward), 0.05)
@@ -305,13 +412,11 @@ fn mesh_trans_fs<S: Sky>(
     let ey_ndc = (dot(erel, v.up) * v.focal) / ez
     let refr_uv = clamp(vec2(ex_ndc * 0.5 + 0.5, 0.5 - ey_ndc * 0.5), vec2(0.002), vec2(0.998))
 
-    // Reject refracted samples that hit foreground occluders nearer than the transmissive surface.
     let bg_refr = hdr_bg.sample_level(bg_s, refr_uv, 0.0)
     let use_uv = if bg_refr.w >= dist - 0.08 { refr_uv } else { uv }
     var bg_rad = if bg_refr.w >= dist - 0.08 { bg_refr.xyz } else { bg_here.xyz }
     let bg_depth = if bg_refr.w >= dist - 0.08 { bg_refr.w } else { bg_here.w }
 
-    // 4-tap frosted/rough refraction blur when `roughness > 0.06`.
     if sub.roughness > 0.06 {
         let blur = (sub.roughness * 0.012) * clamp(refract_dist, 0.25, 2.0)
         var acc = bg_rad
@@ -322,32 +427,27 @@ fn mesh_trans_fs<S: Sky>(
         bg_rad = acc * 0.2
     }
 
-    // Beer-Lambert spectral absorption through medium depth (deep water turns rich teal/abyssal;
-    // thin glass stays crystalline with subtle edge tint).
     let thickness = clamp(bg_depth - dist, 0.04, 18.0)
     let absorb = (vec3(1.0) - clamp(sub.albedo, vec3(0.03), vec3(0.98))) * 0.95
     let beer = exp(-absorb * thickness)
     let transmitted = bg_rad * beer
 
-    // Subtle deep-water volumetric scatter tint when looking into deep water/ice.
     let sun = sky.sun()
     let ndl = max(dot(n, sun.way), 0.0)
-    let vis = if ndl > 0.0 { sun_shadow(shadow_map, cmp, sv, vary.wp, n) } else { 0.0 }
-    let sky_amb = if sub.transmission > 0.7 {
-        sky_irradiance(sky_diff, sky_s, n)
-    } else {
-        let ind = cone_indirect(rad_grid, rad0, rad1, rad2, rad_s, vary.wp, n)
-        sky_irradiance(sky_diff, sky_s, n) * ind.w + ind.xyz
-    }
+    // Fast single-tap shadow on wavy transmissive water/glass (saves 7 shadow taps/px at 1080p).
+    let vis = if ndl > 0.0 { sun_vis_point(sm_far, cmp, sv_far, vary.wp) } else { 0.0 }
+    let sky_amb = sky_irradiance(sky_diff, sky_s, n)
     let deep_scatter = sub.albedo * (vec3(1.0) - beer) * ONE_OVER_PI * (sun.light * (0.25 * vis + 0.1) + sky_amb * 0.45)
 
-    // Physical Fresnel reflection (Sky PMREM + world radiance cone + sun & dynamic emitter specular).
+    // Real-time SSR over lit opaque world (`hdr_bg`), falling back seamlessly to `spec_cone` + Sky PMREM.
     let refl = normalize(n * (2.0 * ndv) - ray_back)
     let f0 = sub.f0()
     let f_env = fresnel_schlick_rough(f0, ndv, sub.roughness)
     let sky_refl = sky_specular(sky_spec0, sky_spec1, sky_spec2, sky_diff, sky_s, refl, sub.roughness)
     let w_refl = spec_cone(rad_grid, rad0, rad1, rad2, rad_s, vary.wp, n, refl, sub.roughness)
-    let env_spec = w_refl.xyz + sky_refl * (1.0 - w_refl.w * 0.85)
+    let fallback = w_refl.xyz + sky_refl * (1.0 - w_refl.w * 0.85)
+    let ssr = trace_ssr(v, hdr_bg, bg_s, vary.wp, n, refl, sub.roughness, ign(pixel.position.xy))
+    let env_spec = mix(fallback, ssr.xyz, vec3(ssr.w))
 
     let direct_spec = sub.shade_direct(n, sun.way, ray_back, sun.light * vis)
     let local_spec = eval_emitters(sub, vary.wp, n, ray_back, rad_grid, rad0, rad1, rad_s, emitters, emitter_count)
@@ -358,8 +458,9 @@ fn mesh_trans_fs<S: Sky>(
     vec4(rad, min(dist, 65000.0))
 }
 
-/// Multi-target linear-HDR fragment shader for `drawn_only` (writes `(hdr, place, sun)` for `Judge`).
+/// Self-contained reference-judging fragment shader for `drawn_only` (writes `(hdr, place, sun)`).
 @fragment
+@budget(work: 18000)
 fn mesh_judge_fs<S: Sky>(
     vary: MeshVary,
     v: View,
@@ -380,11 +481,35 @@ fn mesh_judge_fs<S: Sky>(
     emitters: [Emitter],
     emitter_count: [u32],
 ) -> Targets3<vec4, vec4, f32> {
-    let out = shade_mesh(
-        vary, v, sv, rad_grid, sky, sky_diff, sky_spec0, sky_spec1, sky_spec2, sky_s,
-        shadow_map, cmp, rad0, rad1, rad2, rad_s, emitters, emitter_count,
-    )
-    Targets3 { first: out.0, second: out.1, third: out.2 }
+    let to_eye = v.at - vary.wp
+    let dist = length(to_eye)
+    let ray_back = if dist > 1.0e-6 { to_eye / dist } else { -v.forward }
+    let n = resolve_normal(vary, ray_back)
+    let sub = vary_substance(vary)
+    let sun = sky.sun()
+    let ndl = max(dot(n, sun.way), 0.0)
+    let vis = if ndl > 0.0 { sun_shadow(shadow_map, cmp, sv, vary.wp, n) } else { 0.0 }
+    let direct_sun = sub.shade_direct(n, sun.way, ray_back, sun.light * vis)
+    let local_light = eval_emitters(sub, vary.wp, n, ray_back, rad_grid, rad0, rad1, rad_s, emitters, emitter_count)
+    let ind = cone_indirect(rad_grid, rad0, rad1, rad2, rad_s, vary.wp, n)
+    let sky_amb = sky_irradiance(sky_diff, sky_s, n) * ind.w + ind.xyz
+    let sw = sub.spec_weight()
+    var rad = sub.emits + direct_sun + local_light
+    if sw <= 1.0e-5 && sub.coat <= 1.0e-5 {
+        rad += sub.albedo * ONE_OVER_PI * sky_amb
+    } else {
+        let ndv = max(dot(n, ray_back), 0.001)
+        let refl = normalize(n * (2.0 * dot(n, ray_back)) - ray_back)
+        let f0 = sub.f0()
+        let f_env = fresnel_schlick_rough(f0, ndv, sub.roughness) * sw
+        let kd = (vec3(1.0) - f_env) * (1.0 - sub.metallic)
+        let brdf_ab = env_brdf_approx(sub.roughness, ndv)
+        let sky_refl = sky_specular(sky_spec0, sky_spec1, sky_spec2, sky_diff, sky_s, refl, sub.roughness)
+        let w_refl = spec_cone(rad_grid, rad0, rad1, rad2, rad_s, vary.wp, n, refl, sub.roughness)
+        let env_spec = w_refl.xyz + sky_refl * (1.0 - w_refl.w * 0.85)
+        rad += sub.albedo * (kd * ONE_OVER_PI) * sky_amb + env_spec * (f0 * brdf_ab.x + vec3(brdf_ab.y)) * sw
+    }
+    Targets3 { first: vec4(rad, min(dist, 65000.0)), second: vec4(n, dist), third: vis }
 }
 
 /// Fullscreen background sky shader: runs only on uncovered pixels (`Depth::Equal` at `z = 0.0`).
@@ -396,9 +521,19 @@ fn sky_vs(vi: VertexIndex) -> ClipPosition {
 }
 
 @fragment
-fn sky_fs<S: Sky>(pixel: FragCoord, v: View, sky: S, sky_spec0: Texture<Rgba16Float>, sky_s: Sampler) -> vec4 {
+fn sky_direct_fs<S: Sky>(
+    pixel: FragCoord,
+    v: View,
+    sky: S,
+    sky_spec0: Texture<Rgba16Float>,
+    sky_s: Sampler,
+) -> Targets3<vec4, vec4, vec4> {
     let d = v.ray(pixel.position.xy)
-    vec4(sky_background(sky, sky_spec0, sky_s, d), 65000.0)
+    Targets3 {
+        first: vec4(sky_background(sky, sky_spec0, sky_s, d), 65000.0),
+        second: vec4(0.5, 0.5, 0.5, 0.0),
+        third: vec4(0.0, 0.0, 0.0, 0.5),
+    }
 }
 
 @fragment
@@ -412,15 +547,16 @@ fn sky_judge_fs<S: Sky>(pixel: FragCoord, v: View, sky: S) -> Targets3<vec4, vec
 }
 
 /// Computes a view- and budget-aware cell spacing for a single thing with bounding sphere `(c, r)`.
-fn cell_for_one(c: vec3, r: f32, v: View) -> f32 {
+/// High-steepness noise fields (`steep`) keep tighter `1.1 px` cells to prevent micro-holes.
+fn cell_for_one(c: vec3, r: f32, v: View, steep: bool) -> f32 {
     let near = max(length(c - v.at) - r, 0.25)
     let px = near * v.pixel()
+    let mult = if steep { 1.1 } else { 1.65 }
     let by_size = max(r / 180.0, 0.005)
-    clamp(max(px * 1.1, by_size), 0.005, 0.25)
+    clamp(max(px * mult, by_size), 0.005, 0.25)
 }
 
-/// Computes a view- and budget-aware cell spacing for one thing in a `Many` batch, given its
-/// allocated brick share `bricks_for_this`.
+/// Computes a view- and budget-aware cell spacing for one thing in a `Many` batch.
 fn cell_for_share(c: vec3, r: f32, bricks_for_this: f32, v: View) -> f32 {
     let near = max(length(c - v.at) - r, 0.25)
     let px = near * v.pixel()
@@ -442,13 +578,13 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for One<M> {
 
     fn sync_batches(self, batches: mut Vec<MeshBatch>, first: u32, v: View, _frame: u32) {
         let b = self.field.bound()
-        let cell = cell_for_one(b.centre, min(b.radius, 1.0e4), v)
+        let steep = self.field.lipschitz(1.0) > 1.05
+        let cell = cell_for_one(b.centre, min(b.radius, 1.0e4), v, steep)
         batches[first].sync_one(self.field, cell)
     }
 }
 
-/// Whether a sphere `(c, r)` intersects the view frustum (with a generous margin so shadow-casting
-/// silhouettes just off-screen stay included).
+/// Whether a sphere `(c, r)` intersects the view frustum.
 fn in_view(c: vec3, r: f32, v: View) -> bool {
     let rel = c - v.at
     let z = dot(rel, v.forward)
@@ -565,11 +701,16 @@ impl<A: MeshWorld, B: MeshWorld> MeshWorld for And<A, B> {
     }
 }
 
-/// Complete meshlet renderer state: owns extracted batches, shadow map, GPU Sky PMREM cache,
-/// unified world-space radiance cache + dynamic emitters, volumetric froxel grid, optical HDR
-/// bloom pyramid, linear HDR colour + background refraction copy + resolved depth, and `Picture`.
+/// Complete meshlet renderer state: owns extracted batches, dual-cascade shadow maps, GPU Sky
+/// PMREM cache, camera-focused radiance cache + auto-extracted dynamic emitters, MSAA G-buffer +
+/// half-res bilateral GI/SSR buffers, volumetric froxels, optical HDR bloom pyramid, and `Picture`.
 pub struct MeshSight {
     pub drawn: Picture,
+    pub hdr_direct: Texture<Rgba16Float>,
+    pub g_normal: Texture<Rgba8>,
+    pub g_albedo: Texture<Rgba8>,
+    pub gi_diff: Texture<Rgba16Float>,
+    pub gi_spec: Texture<Rgba16Float>,
     pub hdr_colour: Texture<Rgba16Float>,
     pub hdr_bg: Texture<Rgba16Float>,
     pub depth: DepthTexture,
@@ -578,18 +719,26 @@ pub struct MeshSight {
     pub vol: FroxelVolume,
     pub bloom: BloomPyramid,
     batches: Vec<MeshBatch>,
-    shadow_depth: DepthTexture,
+    shadow_near: DepthTexture,
+    shadow_far: DepthTexture,
     cmp: ComparisonSampler,
     bg_s: Sampler,
+    rad_key: u64,
+    rad_built: bool,
     frame: u32,
     pub gi: bool,
 }
 
-/// Creates a fresh `MeshSight` using 4× hardware MSAA, PBR + refraction, One Light GI + dynamic
-/// emitters, froxel volumetrics, and optical HDR bloom.
+/// Creates a fresh `MeshSight` with 4× MSAA, dual-cascade rotated-PCF shadows, half-res bilateral
+/// GI + SSR + contact shadows, refraction, froxel volumetrics, and optical HDR bloom.
 pub fn mesh_sight(gi: bool = true) -> MeshSight {
     MeshSight {
         drawn: picture(width: 1, height: 1),
+        hdr_direct: texture(width: 1, height: 1),
+        g_normal: texture(width: 1, height: 1),
+        g_albedo: texture(width: 1, height: 1),
+        gi_diff: texture(width: 1, height: 1),
+        gi_spec: texture(width: 1, height: 1),
         hdr_colour: texture(width: 1, height: 1),
         hdr_bg: texture(width: 1, height: 1),
         depth: depth_texture(width: 1, height: 1),
@@ -598,9 +747,12 @@ pub fn mesh_sight(gi: bool = true) -> MeshSight {
         vol: froxel_volume(),
         bloom: bloom_pyramid(),
         batches: Vec::new(),
-        shadow_depth: depth_texture(width: SHADOW_SIDE, height: SHADOW_SIDE),
+        shadow_near: depth_texture(width: SHADOW_SIDE, height: SHADOW_SIDE),
+        shadow_far: depth_texture(width: SHADOW_SIDE, height: SHADOW_SIDE),
         cmp: comparison_sampler(compare: Compare::LessEqual),
         bg_s: sampler(filter: Filter::Linear, address: Address::Clamp),
+        rad_key: 0,
+        rad_built: false,
         frame: 0,
         gi: gi,
     }
@@ -609,8 +761,15 @@ pub fn mesh_sight(gi: bool = true) -> MeshSight {
 impl MeshSight {
     fn resize(mut self, width: u32, height: u32) {
         if self.drawn.width() != width || self.drawn.height() != height {
+            let hw = max(width / 2, 1)
+            let hh = max(height / 2, 1)
             self.drawn = picture(width: width, height: height)
             self.drawn.placed = true
+            self.hdr_direct = texture(width: width, height: height)
+            self.g_normal = texture(width: width, height: height)
+            self.g_albedo = texture(width: width, height: height)
+            self.gi_diff = texture(width: hw, height: hh)
+            self.gi_spec = texture(width: hw, height: hh)
             self.hdr_colour = texture(width: width, height: height)
             self.hdr_bg = texture(width: width, height: height)
             self.depth = depth_texture(width: width, height: height)
@@ -623,8 +782,8 @@ impl MeshSight {
         }
     }
 
-    /// Updates GPU Sky PMREM cache, syncs extracted GPU meshlets, renders the unified sun shadow
-    /// map, and rebuilds the radiance volume + auto-extracted dynamic local emitters.
+    /// Updates Sky PMREM, syncs meshlets, renders dual-cascade sun shadows, and updates the
+    /// camera-focused radiance volume & dynamic local emitters (0 ms when world/sun are unchanged).
     fn prepare_and_shadow<W: MeshWorld, S: Sky>(
         mut self,
         world: W,
@@ -633,23 +792,22 @@ impl MeshSight {
         width: u32,
         height: u32,
         frame: u32,
-    ) -> (u32, View, ShadowView) {
+    ) -> (u32, View, ShadowView, ShadowView, bool) {
         self.resize(width, height)
         let v = view(eye, width: width, height: height)
 
-        // Update sky diffuse irradiance + 3-level specular PMREM only when sky changes (0 ms/frame when still).
         self.sky.sync(sky)
 
-        // Sync extracted GPU meshlets for every batch in the world.
         let nb = world.batch_count()
         self.ensure_batches(nb)
         world.sync_batches(mut self.batches, 0, v, frame)
 
-        // Compute combined world bounding sphere for the unified sun shadow map.
         var wlo = vec3(1.0e20)
         var whi = vec3(-1.0e20)
+        var rk = Hasher::new()
         for i in 0..nb {
             let b = self.batches[i].bound
+            self.batches[i].hash.state_hash(mut rk)
             if b.w > 0.0 {
                 wlo = min(wlo, b.xyz - vec3(b.w))
                 whi = max(whi, b.xyz + vec3(b.w))
@@ -657,15 +815,26 @@ impl MeshSight {
         }
         let wmid = 0.5 * (wlo + whi)
         let wrad = if whi.x > wlo.x { 0.5 * length(whi - wlo) } else { 10.0 }
-        let sv = shadow_view(wmid, wrad, sky.sun().way)
+        let sun = sky.sun()
+        let sv_far = shadow_view(wmid, wrad, sun.way)
 
-        // Pass 1: Unified sun shadow map (all opaque still + moving meshlets in one pass).
+        // Focus near shadow cascade + radiance volume around camera look target (clamped to world).
+        let focus_raw = v.at + v.forward * min(NEAR_CASCADE_RAD * 0.75, wrad * 0.65)
+        let focus = clamp(focus_raw, wlo, whi)
+        let use_near = wrad > NEAR_CASCADE_RAD * 1.15
+        let sv_near = if use_near {
+            shadow_view(focus, NEAR_CASCADE_RAD, sun.way)
+        } else {
+            ShadowView { radius: -1.0, ..sv_far }
+        }
+
+        // Pass 1: Unified sun shadow map (far world cascade + high-res near cascade when world is large).
         label("mesh_shadow")
-        let sp: DepthOnlyPass = begin_depth_pass(mut self.shadow_depth, clear_depth: 1.0, keep_depth: false)
+        let sp_far: DepthOnlyPass = begin_depth_pass(mut self.shadow_far, clear_depth: 1.0, keep_depth: false)
         for i in 0..nb {
             draw(
-                sp,
-                shadow_vs.bind(verts: self.batches[i].verts.items(), sv: sv),
+                sp_far,
+                shadow_vs.bind(verts: self.batches[i].verts.items(), sv: sv_far),
                 shadow_fs,
                 indices: self.batches[i].indices,
                 indirect: self.batches[i].draw_args,
@@ -674,27 +843,58 @@ impl MeshSight {
                 depth: Depth { compare: Compare::Less, write: true },
             )
         }
-        sp.end()
+        sp_far.end()
+        if use_near {
+            let sp_near: DepthOnlyPass = begin_depth_pass(mut self.shadow_near, clear_depth: 1.0, keep_depth: false)
+            for i in 0..nb {
+                draw(
+                    sp_near,
+                    shadow_vs.bind(verts: self.batches[i].verts.items(), sv: sv_near),
+                    shadow_fs,
+                    indices: self.batches[i].indices,
+                    indirect: self.batches[i].draw_args,
+                    cull: Cull::Back,
+                    depth_bias: DepthBias { constant: 2, slope: 1.4, clamp: 0.0 },
+                    depth: Depth { compare: Compare::Less, write: true },
+                )
+            }
+            sp_near.end()
+        } else if frame == 0 {
+            // Initialize near cascade layout once so Vulkan validation sees a valid depth image.
+            let sp_init: DepthOnlyPass = begin_depth_pass(mut self.shadow_near, clear_depth: 1.0, keep_depth: false)
+            sp_init.end()
+        }
 
-        // Pass 1b: Rebuild unified world-space radiance cache & dynamic local emitters.
-        self.rad.begin(wmid, wrad, enabled: self.gi)
-        if self.gi {
+        // Pass 1b: Camera-focused radiance cache & dynamic local emitters.
+        // Skips rebuild completely (0 ms/frame) when static world, sun, and grid origin are unchanged.
+        let rad_centre = if wrad > 16.0 { focus } else { wmid }
+        let rad_rad = min(wrad, 16.0)
+        sun.way.state_hash(mut rk)
+        rad_centre.state_hash(mut rk)
+        let rkey = rk.finish()
+        if !self.gi {
+            self.rad.begin(rad_centre, rad_rad, enabled: false)
+            self.rad_built = false
+        } else if !self.rad_built || self.rad_key != rkey {
+            self.rad.begin(rad_centre, rad_rad, enabled: true)
             for i in 0..nb {
                 self.rad.inject(
                     self.batches[i].verts.items(),
                     self.batches[i].verts.count(),
                     self.batches[i].cap_verts,
-                    sv,
+                    sv_far,
                     sky,
                     self.sky.diff,
                     self.sky.s,
-                    self.shadow_depth,
+                    self.shadow_far,
                     self.cmp,
                 )
             }
             self.rad.finish()
+            self.rad_key = rkey
+            self.rad_built = true
         }
-        (nb, v, sv)
+        (nb, v, sv_near, sv_far, use_near)
     }
 
     /// Renders `world` into `self.drawn` (`colour`, `place`, `sun`) without presenting (for
@@ -708,9 +908,8 @@ impl MeshSight {
         width: u32,
         height: u32,
     ) {
-        let (nb, v, sv) = self.prepare_and_shadow(world, sky, eye, width, height, 0)
+        let (nb, v, _sv_near, sv_far, _use_near) = self.prepare_and_shadow(world, sky, eye, width, height, 0)
 
-        // Pass 2: Unified 4× hardware MSAA eye pass writing linear HDR + `(place, sun)` + depth.
         label("mesh_eye")
         let ep: MsaaDepthPass3<Rgba16Float, Rgba32Float, R8> = begin_pass3_msaa_with_depth(
             mut self.hdr_colour,
@@ -726,7 +925,7 @@ impl MeshSight {
                 mesh_vs.bind(verts: self.batches[i].verts.items(), v: v),
                 mesh_judge_fs.bind(
                     v: v,
-                    sv: sv,
+                    sv: sv_far,
                     rad_grid: self.rad.grid,
                     sky: sky,
                     sky_diff: self.sky.diff,
@@ -734,7 +933,7 @@ impl MeshSight {
                     sky_spec1: self.sky.spec1,
                     sky_spec2: self.sky.spec2,
                     sky_s: self.sky.s,
-                    shadow_map: self.shadow_depth,
+                    shadow_map: self.shadow_far,
                     cmp: self.cmp,
                     rad0: self.rad.rad0,
                     rad1: self.rad.rad1,
@@ -758,7 +957,6 @@ impl MeshSight {
         )
         ep.end()
 
-        // Pass 3: Single unified `Look::tone` pass into `self.drawn.colour`.
         label("mesh_tone")
         let tp = begin_pass(mut self.drawn.colour, keep: false)
         draw(
@@ -784,8 +982,8 @@ impl MeshSight {
     }
 
     /// Renders `world` (`Surface`s), `height` (`Height` clipmap), and `medium` (`Medium` froxels)
-    /// through ONE depth buffer, ONE light store, ONE refractive pass, optional optical HDR bloom,
-    /// and ONE `Look::tone` pass, and presents.
+    /// through ONE depth buffer, ONE light store, half-res bilateral GI + SSR + contact shadows,
+    /// unified refraction, froxel volumetrics, optical HDR bloom, and ONE `Look::tone` pass.
     pub fn draw_all<W: MeshWorld, H: Height, Med: Medium, S: Sky, L: Look>(
         mut self,
         world: W,
@@ -797,13 +995,15 @@ impl MeshSight {
         width: u32,
         height_px: u32,
     ) {
-        let (nb, v, sv) = self.prepare_and_shadow(world, sky, eye, width, height_px, self.frame)
+        let (nb, v, sv_near, sv_far, _use_near) = self.prepare_and_shadow(world, sky, eye, width, height_px, self.frame)
         self.frame += 1
 
-        // Pass 2: Unified 4× hardware MSAA opaque linear-HDR eye pass (solids + opaque height + sky).
+        // Pass 2: Lean 4× hardware MSAA opaque direct HDR + compact `Rgba8` G-buffer pass.
         label("mesh_eye")
-        let ep: MsaaDepthPass<Rgba16Float> = begin_pass_msaa_with_depth(
-            mut self.hdr_colour,
+        let ep: MsaaDepthPass3<Rgba16Float, Rgba8, Rgba8> = begin_pass3_msaa_with_depth(
+            mut self.hdr_direct,
+            mut self.g_normal,
+            mut self.g_albedo,
             mut self.depth,
             clear: vec4(0.0, 0.0, 0.0, 65000.0),
             clear_depth: 0.0,
@@ -812,21 +1012,17 @@ impl MeshSight {
             draw(
                 ep,
                 mesh_vs.bind(verts: self.batches[i].verts.items(), v: v),
-                mesh_fs.bind(
+                mesh_direct_fs.bind(
                     v: v,
-                    sv: sv,
+                    sv_near: sv_near,
+                    sv_far: sv_far,
                     rad_grid: self.rad.grid,
                     sky: sky,
-                    sky_diff: self.sky.diff,
-                    sky_spec0: self.sky.spec0,
-                    sky_spec1: self.sky.spec1,
-                    sky_spec2: self.sky.spec2,
-                    sky_s: self.sky.s,
-                    shadow_map: self.shadow_depth,
+                    sm_near: self.shadow_near,
+                    sm_far: self.shadow_far,
                     cmp: self.cmp,
                     rad0: self.rad.rad0,
                     rad1: self.rad.rad1,
-                    rad2: self.rad.rad2,
                     rad_s: self.rad.s,
                     emitters: self.rad.emitters.items(),
                     emitter_count: self.rad.emitters.count(),
@@ -840,22 +1036,18 @@ impl MeshSight {
         if height.active() {
             draw(
                 ep,
-                height_vs.bind(height: height, v: v),
-                height_opaque_fs.bind(
+                height_vs.bind(height: height, v: v, trans_pass: 0),
+                mesh_direct_fs.bind(
                     v: v,
-                    sv: sv,
+                    sv_near: sv_near,
+                    sv_far: sv_far,
                     rad_grid: self.rad.grid,
                     sky: sky,
-                    sky_diff: self.sky.diff,
-                    sky_spec0: self.sky.spec0,
-                    sky_spec1: self.sky.spec1,
-                    sky_spec2: self.sky.spec2,
-                    sky_s: self.sky.s,
-                    shadow_map: self.shadow_depth,
+                    sm_near: self.shadow_near,
+                    sm_far: self.shadow_far,
                     cmp: self.cmp,
                     rad0: self.rad.rad0,
                     rad1: self.rad.rad1,
-                    rad2: self.rad.rad2,
                     rad_s: self.rad.s,
                     emitters: self.rad.emitters.items(),
                     emitter_count: self.rad.emitters.count(),
@@ -869,13 +1061,67 @@ impl MeshSight {
         draw(
             ep,
             sky_vs,
-            sky_fs.bind(v: v, sky: sky, sky_spec0: self.sky.spec0, sky_s: self.sky.s),
+            sky_direct_fs.bind(v: v, sky: sky, sky_spec0: self.sky.spec0, sky_s: self.sky.s),
             vertices: 3,
             depth: Depth { compare: Compare::Equal, write: false },
         )
         ep.end()
 
-        // Pass 2a: Unified refractive / transmissive pass (glass, water, crystal, ice).
+        // Pass 2b: Half-res (`W/2 × H/2`) 4-cone diffuse GI + real-time SSR + micro-contact shadows.
+        label("mesh_indirect")
+        let ip = begin_pass2(mut self.gi_diff, mut self.gi_spec, keep: false)
+        draw(
+            ip,
+            cover,
+            indirect_half_fs.bind(
+                v: v,
+                rad_grid: self.rad.grid,
+                sky: sky,
+                hdr_direct: self.hdr_direct,
+                g_normal: self.g_normal,
+                g_albedo: self.g_albedo,
+                depth: self.depth,
+                bg_s: self.bg_s,
+                sky_diff: self.sky.diff,
+                sky_spec0: self.sky.spec0,
+                sky_spec1: self.sky.spec1,
+                sky_spec2: self.sky.spec2,
+                sky_s: self.sky.s,
+                rad0: self.rad.rad0,
+                rad1: self.rad.rad1,
+                rad2: self.rad.rad2,
+                rad_s: self.rad.s,
+                full_w: width,
+                full_h: height_px,
+            ),
+            vertices: 3,
+        )
+        ip.end()
+
+        // Pass 2c: Full-res depth+normal bilateral upsample & opaque HDR resolve.
+        label("mesh_combine")
+        let cp = begin_pass(mut self.hdr_colour, keep: false)
+        draw(
+            cp,
+            cover,
+            combine_indirect_fs.bind(
+                v: v,
+                sky: sky,
+                hdr_direct: self.hdr_direct,
+                g_normal: self.g_normal,
+                g_albedo: self.g_albedo,
+                gi_diff: self.gi_diff,
+                gi_spec: self.gi_spec,
+                sky_diff: self.sky.diff,
+                sky_s: self.sky.s,
+                full_w: width,
+                full_h: height_px,
+            ),
+            vertices: 3,
+        )
+        cp.end()
+
+        // Pass 2d: Unified refractive / transmissive pass (glass, water, crystal, ice) with SSR.
         // Skipped completely (0.0 ms) when no heightfield or batch contains transmissive triangles.
         var any_trans = height.active()
         for i in 0..nb {
@@ -898,7 +1144,8 @@ impl MeshSight {
                     mesh_vs.bind(verts: self.batches[i].verts.items(), v: v),
                     mesh_trans_fs.bind(
                         v: v,
-                        sv: sv,
+                        sv_near: sv_near,
+                        sv_far: sv_far,
                         rad_grid: self.rad.grid,
                         sky: sky,
                         sky_diff: self.sky.diff,
@@ -906,7 +1153,8 @@ impl MeshSight {
                         sky_spec1: self.sky.spec1,
                         sky_spec2: self.sky.spec2,
                         sky_s: self.sky.s,
-                        shadow_map: self.shadow_depth,
+                        sm_near: self.shadow_near,
+                        sm_far: self.shadow_far,
                         cmp: self.cmp,
                         rad0: self.rad.rad0,
                         rad1: self.rad.rad1,
@@ -926,10 +1174,11 @@ impl MeshSight {
             if height.active() {
                 draw(
                     rp,
-                    height_vs.bind(height: height, v: v),
+                    height_vs.bind(height: height, v: v, trans_pass: 1),
                     mesh_trans_fs.bind(
                         v: v,
-                        sv: sv,
+                        sv_near: sv_near,
+                        sv_far: sv_far,
                         rad_grid: self.rad.grid,
                         sky: sky,
                         sky_diff: self.sky.diff,
@@ -937,7 +1186,8 @@ impl MeshSight {
                         sky_spec1: self.sky.spec1,
                         sky_spec2: self.sky.spec2,
                         sky_s: self.sky.s,
-                        shadow_map: self.shadow_depth,
+                        sm_near: self.shadow_near,
+                        sm_far: self.shadow_far,
                         cmp: self.cmp,
                         rad0: self.rad.rad0,
                         rad1: self.rad.rad1,
@@ -957,18 +1207,18 @@ impl MeshSight {
             rp.end()
         }
 
-        // Pass 2b: Unified volumetric froxel pass (0 ms when `medium.active()` is false).
+        // Pass 2e: Unified volumetric froxel pass (0 ms when `medium.active()` is false).
         let has_vol = medium.active()
         if has_vol {
             self.vol.update(
                 medium,
                 v,
-                sv,
+                sv_far,
                 self.rad.grid,
                 sky,
                 self.sky.diff,
                 self.sky.s,
-                self.shadow_depth,
+                self.shadow_far,
                 self.cmp,
                 self.rad.rad1,
                 self.rad.rad2,
@@ -978,7 +1228,7 @@ impl MeshSight {
             )
         }
 
-        // Pass 2c: Optical HDR bloom pyramid (0 ms when `look.bloom().strength <= 0.0`).
+        // Pass 2f: Optical HDR bloom pyramid (0 ms when `look.bloom().strength <= 0.0`).
         let bloom_cfg = look.bloom()
         self.bloom.build(self.hdr_colour, width, height_px, bloom_cfg)
 

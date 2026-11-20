@@ -12,6 +12,7 @@
 use matter::sky::{Sky, seen}
 use matter::substance::{ONE_OVER_PI, Substance}
 use mesh::extract::MeshVertex
+use picture::eye::View
 use std::gpu::{
     Address, Append, AppendBuffer, Atomics, ComparisonSampler, DepthTexture, DispatchArgs, Filter,
     GlobalId, GpuBuffer, GpuSpan, One, Rgba16Float, Sampler, Slots, Texels, Texels3d, Texture,
@@ -292,6 +293,213 @@ pub fn shadow_view(centre: vec3, radius: f32, sun_way: vec3) -> ShadowView {
         w,
         spare2: 0.0,
     }
+}
+
+/// Interleaved Gradient Noise (J. Jimenez 2014) in `[0, 1]` for per-pixel PCF rotation.
+pub fn ign(px: vec2) -> f32 {
+    fract(52.9829189 * fract(dot(px, vec2(0.06711056, 0.00583715))))
+}
+
+/// 8-tap rotated Vogel-disk PCF lookup against one shadow cascade with normal-offset bias.
+pub fn sun_shadow_soft(
+    shadow_map: DepthTexture,
+    cmp: ComparisonSampler,
+    sv: ShadowView,
+    wp: vec3,
+    n: vec3,
+    px: vec2,
+    filter_texels: f32,
+) -> f32 {
+    let ndl = dot(n, sv.w)
+    if ndl <= 0.0 {
+        return 0.0
+    }
+    let slope = sqrt(max(1.0 - ndl * ndl, 0.0))
+    let p = wp + n * (sv.texel * (1.2 + 1.5 * slope))
+    let d = p - sv.centre
+    let sx = dot(d, sv.u) / sv.radius
+    let sy = dot(d, sv.v) / sv.radius
+    let sz = (sv.radius - dot(d, sv.w)) / (2.0 * sv.radius)
+    if abs(sx) >= 0.995 || abs(sy) >= 0.995 || sz <= 0.0 || sz >= 1.0 {
+        return 1.0
+    }
+    let uv = vec2(sx * 0.5 + 0.5, 0.5 - sy * 0.5)
+    let rad_uv = filter_texels / f32(SHADOW_SIDE)
+    let ref_z = clamp(sz - 0.00025, 0.0, 1.0)
+    let ang0 = ign(px) * TWO_PI
+    var sum = 0.0
+    for i in 0..8 {
+        let r = sqrt((f32(i) + 0.5) * 0.125) * rad_uv
+        let a = f32(i) * 2.3999632 + ang0
+        let off = vec2(cos(a) * r, sin(a) * r)
+        sum += shadow_map.sample_compare_level(cmp, uv + off, ref_z)
+    }
+    sum * 0.125
+}
+
+/// Dual-cascade sun shadow lookup (Near high-res cascade + Far world cascade) with smooth border
+/// blend and rotated 8-tap Vogel-disk soft PCF.
+pub fn sun_shadow_csm(
+    sm_near: DepthTexture,
+    sm_far: DepthTexture,
+    cmp: ComparisonSampler,
+    sv_near: ShadowView,
+    sv_far: ShadowView,
+    wp: vec3,
+    n: vec3,
+    px: vec2,
+) -> f32 {
+    let ndl = dot(n, sv_far.w)
+    if ndl <= 0.0 {
+        return 0.0
+    }
+    if sv_near.radius <= 0.0 {
+        return sun_shadow_soft(sm_far, cmp, sv_far, wp, n, px, 2.0)
+    }
+    let d = wp - sv_near.centre
+    let m = max(abs(dot(d, sv_near.u)), abs(dot(d, sv_near.v))) / max(sv_near.radius, 0.001)
+    if m < 0.84 {
+        return sun_shadow_soft(sm_near, cmp, sv_near, wp, n, px, 2.2)
+    }
+    if m >= 0.96 {
+        return sun_shadow_soft(sm_far, cmp, sv_far, wp, n, px, 1.8)
+    }
+    let t = (m - 0.84) / 0.12
+    let s0 = sun_shadow_soft(sm_near, cmp, sv_near, wp, n, px, 2.2)
+    let s1 = sun_shadow_soft(sm_far, cmp, sv_far, wp, n, px, 1.8)
+    mix(s0, s1, t)
+}
+
+/// Short screen-space micro-contact shadow along `sun_way` against resolved reversed-Z depth
+/// (grounds boots, wands, and small props in the final 1..16 cm where shadow maps bias away).
+pub fn contact_shadow(
+    v: View,
+    depth: DepthTexture,
+    wp: vec3,
+    n: vec3,
+    sun_way: vec3,
+    near_plane: f32,
+) -> f32 {
+    let ndl = dot(n, sun_way)
+    if ndl <= 0.05 {
+        return 1.0
+    }
+    let aspect = v.size.y / max(v.size.x, 1.0)
+    let w_px = v.size.x
+    let h_px = v.size.y
+    let p0 = wp + n * 0.015
+    for step in 1..6 {
+        let t = f32(step) * 0.035
+        let p = p0 + sun_way * t
+        let rel = p - v.at
+        let z = dot(rel, v.forward)
+        if z <= near_plane {
+            break
+        }
+        let x_ndc = (dot(rel, v.right) * v.focal * aspect) / z
+        let y_ndc = (dot(rel, v.up) * v.focal) / z
+        if abs(x_ndc) >= 0.995 || abs(y_ndc) >= 0.995 {
+            break
+        }
+        let sx = u32(clamp((x_ndc * 0.5 + 0.5) * w_px, 0.0, w_px - 1.0))
+        let sy = u32(clamp((0.5 - y_ndc * 0.5) * h_px, 0.0, h_px - 1.0))
+        let dz = depth.load(sx, sy)
+        if dz > 1.0e-6 {
+            let scene_z = near_plane / dz
+            let diff = z - scene_z
+            if diff > 0.012 && diff < 0.22 {
+                return 0.35
+            }
+        }
+    }
+    1.0
+}
+
+/// Screen-Space Specular Reflections (SSR): marches a reflection ray from `wp` along `refl` against
+/// `hdr_bg` (`rgb` = linear HDR radiance, `w` = linear eye distance) with 3-step binary hit
+/// refinement and smooth screen-edge fade. Returns `vec4(reflected_rgb, confidence)`.
+pub fn trace_ssr(
+    v: View,
+    hdr_bg: Texture<Rgba16Float>,
+    bg_s: Sampler,
+    wp: vec3,
+    n: vec3,
+    refl: vec3,
+    roughness: f32,
+    jitter: f32,
+) -> vec4 {
+    // Only trace sharp-to-glossy reflections; rough surfaces are already well served by `spec_cone` + PMREM.
+    if roughness > 0.52 {
+        return vec4(0.0)
+    }
+    let aspect = v.size.y / max(v.size.x, 1.0)
+    let p0 = wp + n * 0.06
+    var t_prev = 0.0
+    var hit = false
+    var hit_t = 0.0
+    var hit_uv = vec2(0.0)
+    var hit_rgb = vec3(0.0)
+
+    // 16 deterministic geometrically growing steps reaching ~14 m (zero dither speckle on bright emitters).
+    var step_len = 0.07
+    var t = 0.06
+    let _j = jitter
+    for _i in 0..16 {
+        let p = p0 + refl * t
+        let rel = p - v.at
+        let z = dot(rel, v.forward)
+        if z <= 0.05 {
+            break
+        }
+        let x_ndc = (dot(rel, v.right) * v.focal * aspect) / z
+        let y_ndc = (dot(rel, v.up) * v.focal) / z
+        if abs(x_ndc) >= 0.99 || abs(y_ndc) >= 0.99 {
+            break
+        }
+        let uv = vec2(x_ndc * 0.5 + 0.5, 0.5 - y_ndc * 0.5)
+        let smp = hdr_bg.sample_level(bg_s, uv, 0.0)
+        let ray_dist = length(rel)
+        let diff = ray_dist - smp.w
+        if diff > 0.025 && diff < max(step_len * 2.6, 0.55) && smp.w < 60000.0 {
+            hit = true
+            hit_t = t
+            hit_uv = uv
+            hit_rgb = smp.xyz
+            break
+        }
+        t_prev = t
+        t += step_len
+        step_len *= 1.18
+    }
+    if !hit {
+        return vec4(0.0)
+    }
+    // 3-step binary search refinement for crisp reflections with zero stair-stepping.
+    var lo = t_prev
+    var hi = hit_t
+    for _r in 0..3 {
+        let mid = 0.5 * (lo + hi)
+        let p = p0 + refl * mid
+        let rel = p - v.at
+        let z = max(dot(rel, v.forward), 0.05)
+        let uv = vec2((dot(rel, v.right) * v.focal * aspect) / z * 0.5 + 0.5, 0.5 - (dot(rel, v.up) * v.focal) / z * 0.5)
+        let smp = hdr_bg.sample_level(bg_s, clamp(uv, vec2(0.002), vec2(0.998)), 0.0)
+        if length(rel) > smp.w + 0.02 {
+            hi = mid
+            hit_uv = uv
+            hit_rgb = smp.xyz
+        } else {
+            lo = mid
+        }
+    }
+    // Clamp extreme HDR spikes in half-res reflections to prevent single-pixel fireflies.
+    let clamped_rgb = min(hit_rgb, vec3(9.0))
+    let edge = min(min(hit_uv.x, 1.0 - hit_uv.x), min(hit_uv.y, 1.0 - hit_uv.y))
+    let edge_fade = clamp(edge / 0.09, 0.0, 1.0)
+    let rough_fade = clamp((0.52 - roughness) / 0.24, 0.0, 1.0)
+    let back_fade = clamp(1.0 + dot(refl, v.forward) * 0.65, 0.2, 1.0)
+    let conf = edge_fade * rough_fade * back_fade
+    vec4(clamped_rgb, conf)
 }
 
 /// 4-tap PCF lookup against the unified sun shadow map with normal-offset bias.
