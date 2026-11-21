@@ -214,9 +214,7 @@ pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
     );
     let built = wrela_driver::build(&dir);
     assert!(!built.has_errors(), "{:?}", built.diagnostics);
-    let manifest = built.files.iter().find(|(f, _)| f == "manifest.json").expect("manifest");
-    let manifest =
-        wrela_abi::Manifest::parse(std::str::from_utf8(&manifest.1).unwrap()).expect("valid");
+    let manifest = wrela_tests::built_manifest(&built);
     let names: Vec<&str> = manifest.pipelines.iter().map(|p| p.name.as_str()).collect();
     assert_eq!(names, ["kept"]);
     let listed = wrela_driver::check_pipelines(&dir);

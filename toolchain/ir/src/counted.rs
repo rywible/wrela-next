@@ -54,10 +54,6 @@ pub fn counted(
     body: &[Stmt],
     continuing: &[Stmt],
 ) -> Option<Counted> {
-    let whole = |p: &Place| match p.root {
-        PlaceRoot::Local(l) if p.path.is_empty() => Some(l),
-        _ => None,
-    };
     // The body's head: pure `let`s, then the exit test.
     let mut defs: HashMap<ValueId, (&Expr, usize)> = HashMap::new();
     let mut check = None;
@@ -94,7 +90,7 @@ pub fn counted(
     };
     let &(read_e, read_at) = defs.get(&read)?;
     let Expr::Load(p) = read_e else { return None };
-    let local = whole(p)?;
+    let local = p.whole_local()?;
     test.push((read, read_at));
     let limit = consts.get(&n).filter(|c| int(c)).cloned()?;
     // The step: `continuing` holds pure `let`s and the counter's one store, its read plus a
@@ -107,9 +103,9 @@ pub fn counted(
             Stmt::Let(v, e) if pure(e) => {
                 cdefs.insert(*v, e);
             }
-            Stmt::Store(p, v) if whole(p) == Some(local) && step.is_none() => {
+            Stmt::Store(p, v) if p.whole_local() == Some(local) && step.is_none() => {
                 let Some(Expr::Binary(BinOp::Add, a, s)) = cdefs.get(v) else { return None };
-                if !matches!(cdefs.get(a), Some(Expr::Load(q)) if whole(q) == Some(local)) {
+                if !matches!(cdefs.get(a), Some(Expr::Load(q)) if q.whole_local() == Some(local)) {
                     return None;
                 }
                 step = Some(consts.get(s).cloned()?);
@@ -141,7 +137,7 @@ pub fn counted(
     let mut start = None;
     for s in before.iter().rev() {
         if let Stmt::Store(p, v) = s
-            && whole(p) == Some(local)
+            && p.whole_local() == Some(local)
         {
             start = consts.get(v).filter(|c| int(c)).cloned();
             break;

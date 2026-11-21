@@ -83,7 +83,7 @@ pub fn manifest(pipelines: &str) -> String {
 pub fn build(
     name: &str,
     manifest: &str,
-    shaders: &[(&str, &wrela_shader::build::Builder)],
+    shaders: &[(&str, wrela_shader::build::Builder)],
     wasm: &[u8],
 ) -> TempDir {
     let dir = temp_dir(name);

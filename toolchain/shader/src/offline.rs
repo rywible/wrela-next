@@ -21,15 +21,18 @@ pub enum Tool {
 }
 
 impl Tool {
-    /// The tool for a shader file named `name`, if it's a shader.
-    pub fn for_file(name: &str) -> Option<Tool> {
-        if name.ends_with(".metal") {
-            Some(Tool::Metal)
-        } else if name.ends_with(".spv") {
-            Some(Tool::SpirvVal)
-        } else {
-            None
+    /// The target whose shaders the tool checks.
+    pub fn target(self) -> wrela_abi::Target {
+        match self {
+            Tool::Metal => wrela_abi::Target::Metal,
+            Tool::SpirvVal => wrela_abi::Target::Vulkan,
         }
+    }
+
+    /// The tool for a shader file named `name`, if it's a shader ([`crate::extension`]).
+    pub fn for_file(name: &str) -> Option<Tool> {
+        let (_, ext) = name.rsplit_once('.')?;
+        [Tool::Metal, Tool::SpirvVal].into_iter().find(|t| crate::extension(t.target()) == ext)
     }
 
     /// Whether this machine has the tool (asked once a process).
@@ -64,10 +67,7 @@ pub fn check(tool: Tool, bytes: &[u8]) -> Result<bool, String> {
         return Ok(false);
     }
     let _ = std::fs::create_dir_all(&dir);
-    let ext = match tool {
-        Tool::Metal => "metal",
-        Tool::SpirvVal => "spv",
-    };
+    let ext = crate::extension(tool.target());
     let file = dir.join(format!("{hex}-{}.{ext}", std::process::id()));
     std::fs::write(&file, bytes).map_err(|e| format!("{}: {e}", file.display()))?;
     let out = match tool {

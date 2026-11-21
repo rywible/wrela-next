@@ -35,6 +35,9 @@ pub const SAMPLERS: u32 = 2;
 pub const METAL_BLOCK: u32 = 29;
 /// Metal: the buffer slot of the table of resource IDs.
 pub const METAL_TABLE: u32 = 30;
+/// Metal: how many of a stage's buffer slots reaching the table takes ([`METAL_BLOCK`]'s and
+/// [`METAL_TABLE`]'s), which a kernel that reaches it can't bind buffers at.
+pub const METAL_SLOTS: usize = 2;
 /// The most bytes a block of indices may be: Vulkan's least `maxPushConstantsSize`.
 pub const BLOCK_BYTES: u32 = 128;
 

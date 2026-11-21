@@ -1079,7 +1079,7 @@ fn local_stores(f: &Function) -> (Vec<LocalStore>, HashSet<LocalId>) {
         let mut here: std::collections::HashMap<LocalId, (bool, u32)> = Default::default();
         for s in b {
             let whole = match s {
-                Stmt::Store(p, _) if p.path.is_empty() => p.root_local(),
+                Stmt::Store(p, _) => p.whole_local(),
                 _ => None,
             };
             visit::walk(std::slice::from_ref(s), &mut |t| {

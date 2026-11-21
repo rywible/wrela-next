@@ -11,6 +11,7 @@ mod query;
 mod refactor;
 mod same;
 mod script;
+mod shaders;
 mod solve;
 mod suite;
 mod test;

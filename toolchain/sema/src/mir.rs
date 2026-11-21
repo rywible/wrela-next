@@ -364,6 +364,13 @@ pub struct Dispatch {
     pub indirect: Option<(Place, Span)>,
 }
 
+impl Dispatch {
+    /// The values it reads: its groups, then its origin's and its most groups, where it has them.
+    pub fn operands(&self) -> impl Iterator<Item = &Operand> {
+        self.groups.iter().chain(self.origin.iter().flatten()).chain(self.most.iter())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Draw {
     /// The open pass it draws into, borrowed: its type says the pass's targets.
@@ -461,9 +468,7 @@ impl Rvalue {
                     }
                 }
             }
-            Rvalue::Dispatch(d) => {
-                d.groups.iter().chain(d.origin.iter().flatten()).chain(d.most.iter()).for_each(f)
-            }
+            Rvalue::Dispatch(d) => d.operands().for_each(f),
             Rvalue::Draw(d) => {
                 f(&d.vertices);
                 f(&d.instances);

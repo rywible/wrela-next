@@ -22,12 +22,20 @@ use crate::*;
 use std::collections::{HashMap, HashSet};
 use wrela_diag::Span;
 
+/// A derivative's key in [`DeriveCache`]: the function, its active parameters, its directions
+/// and which derivative it is.
+type AdKey = (FuncId, Vec<Bits>, u8, ad::Variant);
+
+/// An affine form's operation with no rule's key in [`DeriveCache`]: the operation (its name),
+/// its operands' types, its result's type and which operands are active.
+type AffineOpKey = (String, Vec<TypeId>, TypeId, Vec<bool>);
+
 /// Derived functions already built in a module, so each is built once.
 #[derive(Debug, Default)]
 pub struct DeriveCache {
-    ad: HashMap<(FuncId, Vec<Bits>, u8), FuncId>,
+    ad: HashMap<AdKey, FuncId>,
     /// Each derivative's key in `ad`: what it was derived from.
-    ad_of: HashMap<FuncId, (FuncId, Vec<Bits>, u8)>,
+    ad_of: HashMap<FuncId, AdKey>,
     interval: HashMap<(FuncId, Vec<Bits>), FuncId>,
     /// A precision report's walks' ([`Report`]): the `f32` walk's, then the half walk's.
     report: [HashMap<(FuncId, Vec<Bits>), FuncId>; 2],
@@ -48,7 +56,7 @@ pub struct DeriveCache {
     affine_open: Vec<(FuncId, Vec<Bits>, u8)>,
     /// A function of one operation, made for an affine form to take the plain interval's rule
     /// for it, by the operation and its types.
-    affine_ops: HashMap<String, FuncId>,
+    affine_ops: HashMap<AffineOpKey, FuncId>,
 }
 
 /// A function of `f`'s captures and `x` (its last parameter) returning `(f32, X)`: `f(x)` and

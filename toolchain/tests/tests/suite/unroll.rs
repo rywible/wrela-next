@@ -14,10 +14,7 @@ fn small_counted_loops_are_written_out_and_give_the_same_results() {
     // The loops left in each kernel's MSL, built for Metal on any machine.
     let pkg = wrela_tests::repo_root().join("toolchain/tests/unroll");
     let metal = wrela_tests::build_for(&pkg, wrela_abi::Target::Metal).expect("builds");
-    let manifest = wrela_abi::Manifest::parse(&String::from_utf8_lossy(
-        &metal.files.iter().find(|(n, _)| n == "manifest.json").expect("a manifest").1,
-    ))
-    .expect("valid");
+    let manifest = wrela_tests::built_manifest(&metal);
     let loops = |name: &str| {
         let p = manifest.pipelines.iter().find(|p| p.name == name).expect(name);
         let (_, msl) = metal.files.iter().find(|(n, _)| *n == p.shader).expect("its shader");

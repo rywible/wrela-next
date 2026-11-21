@@ -37,8 +37,8 @@
 use crate::Manifest;
 use crate::manifest::{BindingKind, Blend, RenderTarget, SCREEN_TEXTURE, Stage};
 use crate::stream::{
-    Binding, Can, Command, MAX_LAYERS, MAX_TEXTURE_3D, NONE, Opcode, Pass, SCREEN, TexelAt,
-    TexelRect, TextureFormat, TextureKind, View, level_size, max_levels,
+    Binding, Can, Command, MAX_LAYERS, MAX_TEXTURE_3D, NONE, Opcode, Pass, SAMPLE_COUNTS, SCREEN,
+    TexelAt, TexelRect, TextureFormat, TextureKind, View, level_size, max_levels,
 };
 use std::collections::HashMap;
 use std::fmt;
@@ -761,7 +761,7 @@ impl Checker {
     /// array's layer), all the same size, within WebGPU's 32 bytes a sample.
     fn begin_pass(&mut self, op: Opcode, pass: &Pass) -> Result<()> {
         let err = |why: String| Err(CommandError { opcode: op, why });
-        if pass.samples != 1 && pass.samples != 4 {
+        if !SAMPLE_COUNTS.contains(&u32::from(pass.samples)) {
             return err(format!("a pass has 1 or 4 samples, not {}", pass.samples));
         }
         if pass.samples > 1 && pass.on_screen() {
@@ -804,12 +804,8 @@ impl Checker {
                     c.texture
                 ));
             }
-            if pass.samples > 1 && t.format.is_uint() {
-                return err(format!(
-                    "texture {}: an MSAA pass can't resolve integer format {}",
-                    c.texture,
-                    t.format.name()
-                ));
+            if let Some(why) = t.format.unresolvable(pass.samples) {
+                return err(format!("texture {}: {why}", c.texture));
             }
             if let Some(need) = self.lacks(t.format.info().renderable) {
                 let why = if need.is_empty() {

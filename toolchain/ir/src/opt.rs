@@ -170,7 +170,7 @@ fn as_selects(
     for st in then.iter().chain(else_) {
         match st {
             Stmt::Store(p, _) => {
-                let l = p.root_local().filter(|_| p.path.is_empty())?;
+                let l = p.whole_local()?;
                 if !selectable(m, f.locals[l.index()].ty) {
                     return None;
                 }
@@ -884,7 +884,7 @@ fn scalars(m: &Module, t: TypeId, depth: u32) -> Option<usize> {
 
 /// Callees first: an order in which every function comes after those it calls; and how many
 /// calls each function has.
-fn callee_order(m: &Module) -> Result<(Vec<usize>, Vec<u32>)> {
+pub(crate) fn callee_order(m: &Module) -> Result<(Vec<usize>, Vec<u32>)> {
     let n = m.functions.len();
     let mut order = Vec::new();
     let mut state = vec![0u8; n]; // 0 new, 1 visiting, 2 done
@@ -1699,8 +1699,7 @@ fn split_locals(m: &Module, f: &mut Function, how: Split) {
             let mut whole: HashMap<ValueId, LocalId> = HashMap::new();
             visit::walk(&f.body, &mut |s| {
                 if let Stmt::Let(v, Expr::Load(p)) = s
-                    && let Some(l) = p.root_local()
-                    && p.path.is_empty()
+                    && let Some(l) = p.whole_local()
                 {
                     whole.insert(*v, l);
                 }
@@ -1876,19 +1875,12 @@ fn narrow_loads(m: &Module, f: &mut Function) {
         });
         // Only those whose every use takes a part.
         visit::walk(&f.body, &mut |s| match s {
-            Stmt::Let(_, Expr::Extract(_, _) | Expr::ExtractDyn(_, _)) => {
-                if let Some(e) = s.expr() {
-                    let parted = match e {
-                        Expr::Extract(x, _) => Some(*x),
-                        Expr::ExtractDyn(x, _) => Some(*x),
-                        _ => None,
-                    };
-                    e.for_each_value(&mut |y| {
-                        if Some(y) != parted {
-                            whole.remove(&y);
-                        }
-                    });
-                }
+            Stmt::Let(_, e @ (Expr::Extract(parted, _) | Expr::ExtractDyn(parted, _))) => {
+                e.for_each_value(&mut |y| {
+                    if y != *parted {
+                        whole.remove(&y);
+                    }
+                });
             }
             _ => s.for_each_value(&mut |y| {
                 whole.remove(&y);
@@ -2678,8 +2670,7 @@ fn dominated(f: &Function, candidate: &[bool]) -> HashSet<LocalId> {
         let mut after: HashMap<LocalId, u32> = HashMap::new();
         for s in b.iter().rev() {
             if let Stmt::Store(p, _) = s
-                && p.path.is_empty()
-                && let Some(l) = p.root_local()
+                && let Some(l) = p.whole_local()
                 && candidate[l.index()]
                 && after.get(&l).copied().unwrap_or(0) + 1 == mentions[l.index()]
             {
@@ -2898,8 +2889,6 @@ fn retain_by_index<T>(items: &mut Vec<T>, keep: impl Fn(usize) -> bool) -> Vec<O
     remap
 }
 
-/// The statements a module flattened with `keep` holds: each entry point with what it inlines,
-/// and each kept function once, with what it inlines. `order` is `callee_order`'s.
 /// Whether module `m`, every call inlined and what its constants decide folded (constants
 /// computed, branches on them kept to the side taken, dead code dropped), has entry points
 /// within [`INLINE_LIMIT`] statements each: what `outlined` measures, after the folding that
@@ -2931,6 +2920,8 @@ fn folded_fits(m: &Module) -> Result<bool> {
     Ok(biggest <= INLINE_LIMIT)
 }
 
+/// The statements a module flattened with `keep` holds: each entry point with what it inlines,
+/// and each kept function once, with what it inlines. `order` is `callee_order`'s.
 fn flattened_size(m: &Module, order: &[usize], keep: &[bool]) -> usize {
     let mut size = vec![0usize; m.functions.len()];
     for &f in order {

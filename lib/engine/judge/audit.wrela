@@ -20,9 +20,14 @@
 // (such a ray is not counted); and only the middle ray of each pixel.
 
 use matter::matter::{Matter, matter}
+use matter::sky::Sky
 use matter::substance::Substance
+use matter::world::World
+use mesh::draw::{MeshSight, MeshWorld, mesh_sight}
 use picture::eye::{Eye, View, view}
-use reference::traced::FAR
+use picture::look::Look
+use picture::screen::show
+use reference::traced::{FAR, HALVINGS, LEAST, LEAST_FAR}
 use std::field::Field
 use std::gpu::{Atomics, GlobalId, GpuBuffer, Rgba32Float, Texture, buffer_of, dispatch, label, read}
 use std::collections::Vec
@@ -32,10 +37,9 @@ use std::io::{Pending, print}
 /// off pixel's x and y, and its picture's eye (`Audit::held`'s `eye`).
 const COUNTS: u32 = 9
 
-/// The most steps the audit's march takes (a dispatch's every invocation must be short), and its
-/// halvings onto the surface.
+/// The most steps the audit's march takes (a dispatch's every invocation must be short); its least
+/// step and its halvings onto the surface are the reference's (`traced`).
 const STEPS: u32 = 512
-const HALVINGS: u32 = 24
 
 /// Pixels a dispatch (a band of the picture: no dispatch holds the GPU long).
 const BAND: u32 = 256
@@ -53,7 +57,7 @@ fn first_hit<M: Field<Substance>>(m: Matter<M>, o: vec3, d: vec3) -> f32 {
                 crossed = true
             } else {
                 before = t
-                t += max(f, 0.00005 + 0.000005 * t)
+                t += max(f, LEAST + LEAST_FAR * t)
             }
         }
     }
@@ -135,6 +139,21 @@ fn audited(v: View, place: Texture<Rgba32Float>, hits: [u32], first: u32, eye: u
     }
 }
 
+/// How far along the ray from `o` along `d` (unit) a march from outside comes onto the surface of
+/// `m` (within 0.00005 m), or stops at `most` m: at most 4096 steps, on the CPU. (Where a step is
+/// not taken, the march stands still: every later step would ask the same point again.)
+fn onto<M: Field<Substance>>(m: Matter<M>, o: vec3, d: vec3, most: f32) -> f32 {
+    var t = 0.0
+    for _ in 0..4096 {
+        let g = m.far(o + d * t)
+        if !(g > 0.00005 && t < most) {
+            break
+        }
+        t += max(g, 0.0001)
+    }
+    t
+}
+
 /// The `k`th eye of a fixed seed round the thing `field` within the bound `b` (centre, radius);
 /// the first, straight on at its middle, close, through a long lens; the rest:
 /// a point on its surface found from outside along a way to its middle, the eye stepped back from
@@ -146,29 +165,14 @@ pub fn eye_round<M: Field<Substance>>(field: M, b: vec4, k: u32) -> Eye {
         // The view the judged set once missed: straight on at its bound's middle, from the side,
         // close (a tenth of its bound's radius off its surface), through a long lens (0.2 rad).
         let o0 = b.xyz - vec3(0.0, 0.0, 1.5 * b.w)
-        var t0 = 0.0
-        for _ in 0..4096 {
-            let g = m.far(o0 + vec3(0.0, 0.0, t0))
-            if g > 0.00005 && t0 < 3.0 * b.w {
-                t0 += max(g, 0.0001)
-            }
-        }
-        let at0 = o0 + vec3(0.0, 0.0, t0 - 0.1 * b.w)
+        let at0 = o0 + vec3(0.0, 0.0, onto(m, o0, vec3(0.0, 0.0, 1.0), 3.0 * b.w) - 0.1 * b.w)
         return Eye { at: at0, toward: at0 + vec3(0.0, 0.0, 1.0), wide: 0.2 }
     }
     let f = f32(k / 2) + 0.5
     let u = normalize(vec3(fract(f * 0.618034), fract(f * 0.754878), fract(f * 0.569840)) * 2.0 - vec3(1.0) + vec3(1.0e-3))
     let o = b.xyz + u * (1.5 * b.w)
     let d = normalize(b.xyz + (vec3(fract(f * 0.381966), fract(f * 0.245122), fract(f * 0.430160)) * 2.0 - vec3(1.0)) * (0.3 * b.w) - o)
-    // (Onto the surface from outside, as the audit's march does.)
-    var t = 0.0
-    for _ in 0..4096 {
-        let g = m.far(o + d * t)
-        if g > 0.00005 && t < 3.0 * b.w {
-            t += max(g, 0.0001)
-        }
-    }
-    let s = o + d * t
+    let s = o + d * onto(m, o, d, 3.0 * b.w)
     let back = b.w * exp2(log2(0.005) * (1.0 - fract(f * 0.287148)))
     let at = s - d * back
     var toward = s
@@ -185,12 +189,11 @@ pub struct Audit {
     counts: GpuBuffer<u32>,
     hits: GpuBuffer<u32>,
     said: Option<Pending<u32>>,
-    pub done: bool,
 }
 
 /// An audit, as yet of nothing.
 pub fn audit() -> Audit {
-    Audit { counts: buffer_of(Vec::filled(COUNTS, 0)), hits: buffer_of(Vec::filled(1, 0)), said: None, done: false }
+    Audit { counts: buffer_of(Vec::filled(COUNTS, 0)), hits: buffer_of(Vec::filled(1, 0)), said: None }
 }
 
 impl Audit {
@@ -238,4 +241,67 @@ impl Audit {
         }
         false
     }
+}
+
+/// The audit as a scene runs it: things one after another, each from `eyes` eyes round it
+/// (`eye_round`), an eye a frame, each said once its eyes are in, and the next begun.
+pub struct Auditing {
+    audit: Audit,
+    /// The thing being audited (its place in the scene's list), and its next eye.
+    thing: u32,
+    eye_k: u32,
+}
+
+/// An audit run, at its first thing.
+pub fn auditing() -> Auditing {
+    Auditing { audit: audit(), thing: 0, eye_k: 0 }
+}
+
+impl Auditing {
+    /// The thing being audited (its place in the scene's list; past its end, all are said).
+    pub fn thing(self) -> u32 {
+        self.thing
+    }
+
+    /// A frame of the audit of the thing `field` (named `what`, drawn as `world`, within the bound
+    /// `b`: centre, radius): its next of `eyes` eyes drawn by `mesh` and held to it; or, its eyes
+    /// all in, its counts said once they are back, and the next thing begun (`mesh` begun again).
+    pub fn frame<W: World + MeshWorld, M: Field<Substance>, S: Sky, L: Look>(
+        mut self,
+        mesh: mut MeshSight,
+        world: W,
+        field: M,
+        b: vec4,
+        what: str,
+        eyes: u32,
+        sky: S,
+        look: L,
+        width: u32,
+        height: u32,
+    ) {
+        if self.eye_k >= eyes {
+            if self.audit.say(f"{what}, {eyes} eyes") {
+                self.thing += 1
+                self.eye_k = 0
+                mesh = mesh_sight(gi: false)
+            }
+            return
+        }
+        let eye = out_of(field, eye_round(field, b, self.eye_k))
+        mesh.drawn_only(world, sky, look, eye, width, height)
+        self.audit.held(field, eye, mesh.drawn.place, width, height, self.eye_k)
+        self.eye_k += 1
+        show(mesh.drawn.colour)
+    }
+}
+
+/// `eye`, moved out of `field`'s matter along its way from the middle of the view where it is in it.
+fn out_of<M: Field<Substance>>(field: M, eye: Eye) -> Eye {
+    var e = eye
+    var k: u32 = 0
+    while k < 64 && field.distance(e.at) <= 0.05 {
+        e.at = e.at + normalize(e.at - e.toward) * 0.5
+        k += 1
+    }
+    e
 }

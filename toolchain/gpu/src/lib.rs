@@ -25,6 +25,7 @@
 //! The one crate that may use `unsafe`: every call into the GPU's API is here.
 
 use std::fmt;
+use std::sync::{Mutex, MutexGuard};
 
 pub use wrela_abi::manifest::{Blend, Cull, DepthBias, DepthState};
 pub use wrela_abi::stream::{Compare, TextureFormat};
@@ -243,6 +244,18 @@ pub struct DeviceOptions {
     pub features: Option<Vec<String>>,
 }
 
+impl DeviceOptions {
+    /// Of the optional features a device `found`, those it opens with: every one, or only those
+    /// [`DeviceOptions::features`] names.
+    pub(crate) fn features_of(&self, found: Vec<&'static str>) -> Features {
+        let found = Features(found);
+        match &self.features {
+            Some(keep) => found.filtered(|f| keep.iter().any(|k| k == f)),
+            None => found,
+        }
+    }
+}
+
 /// A buffer: `size` bytes, read and written by the GPU (a storage, uniform, index or indirect
 /// buffer, a copy's source or destination), or `mappable`: a copy's destination the CPU reads.
 #[derive(Clone, Debug)]
@@ -258,6 +271,18 @@ pub enum TextureDimension {
     /// 2D: `depth_or_layers` layers (6 for a cube).
     D2,
     D3,
+}
+
+impl TextureDimension {
+    /// A copy's third coordinate (`TextureCopy::origin[2]`, or an extent's third) as `(layers,
+    /// depth)`: a 2D texture's is its layers, a 3D texture's its depth; the other is `other` (0
+    /// for an origin, 1 for an extent).
+    pub(crate) fn split(self, third: u32, other: u32) -> (u32, u32) {
+        match self {
+            TextureDimension::D2 => (third, other),
+            TextureDimension::D3 => (other, third),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -509,3 +534,124 @@ pub struct RenderPassDesc<'a> {
 /// Each submission's place in the device's order: its work is done once the device's
 /// completed count is past it.
 pub type SubmissionIndex = u64;
+
+// ---- what both backends share -------------------------------------------------------------------
+
+/// `m` locked, whether or not a thread panicked holding it.
+pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// How many views and samplers the device's table (`wrela_abi::table`) holds at once (fewer where
+/// a Vulkan device's limits say so).
+pub(crate) const TABLE_LEN: u32 = 1 << 16;
+
+/// The free indices of the device's table: those let go, and the next never used.
+pub(crate) struct IndexPool {
+    len: u32,
+    free: Mutex<(Vec<u32>, u32)>,
+}
+
+impl IndexPool {
+    /// A pool of the indices `0..len`.
+    pub(crate) fn new(len: u32) -> IndexPool {
+        IndexPool { len, free: Mutex::new((Vec::new(), 0)) }
+    }
+
+    /// A free index: one let go, else the next never used.
+    pub(crate) fn take(&self) -> u32 {
+        let mut f = lock(&self.free);
+        match f.0.pop() {
+            Some(i) => i,
+            None => {
+                let i = f.1;
+                assert!(i < self.len, "the table of views and samplers is full");
+                f.1 += 1;
+                i
+            }
+        }
+    }
+
+    pub(crate) fn give_back(&self, index: u32) {
+        lock(&self.free).0.push(index);
+    }
+}
+
+/// A host-visible buffer of the staging belt.
+pub(crate) trait StagingBuffer: Clone {
+    /// Its bytes.
+    fn size(&self) -> u64;
+
+    /// Copies `data` into it at `at`.
+    ///
+    /// # Safety
+    /// It holds `at + data.len()` bytes, and no submission uses them.
+    unsafe fn write(&self, at: u64, data: &[u8]);
+}
+
+/// The least a staging buffer holds.
+const BELT_CHUNK: u64 = 4 << 20;
+
+/// How many free staging buffers the belt keeps for reuse; past them, the free ones go.
+const BELT_KEPT_FREE: usize = 8;
+
+/// The staging belt: the buffer this submission's writes go into (and how much of it they
+/// fill), the full ones this submission also uses, and those earlier submissions use or used.
+pub(crate) struct Belt<B> {
+    current: Option<(B, u64)>,
+    filled: Vec<B>,
+    in_flight: Vec<(SubmissionIndex, B)>,
+    free: Vec<B>,
+}
+
+impl<B> Default for Belt<B> {
+    fn default() -> Belt<B> {
+        Belt { current: None, filled: Vec::new(), in_flight: Vec::new(), free: Vec::new() }
+    }
+}
+
+impl<B: StagingBuffer> Belt<B> {
+    /// `data` copied into the belt at an offset aligned to `align`: the buffer and the offset,
+    /// which the next submission copies from. A buffer it needs and hasn't free is `make(len)`.
+    pub(crate) fn stage(
+        &mut self,
+        data: &[u8],
+        align: u64,
+        make: impl FnOnce(u64) -> B,
+    ) -> (B, u64) {
+        let need = data.len() as u64;
+        let (buffer, at) = match self.current.take() {
+            Some((b, used)) if used.next_multiple_of(align) + need <= b.size() => {
+                (b, used.next_multiple_of(align))
+            }
+            other => {
+                if let Some((b, _)) = other {
+                    self.filled.push(b);
+                }
+                let free = self.free.iter().position(|b| b.size() >= need);
+                let b = match free {
+                    Some(k) => self.free.swap_remove(k),
+                    None => make(need.max(BELT_CHUNK).next_power_of_two()),
+                };
+                (b, 0)
+            }
+        };
+        // SAFETY: the buffer holds `at + need` bytes; no submission uses this part of it yet.
+        unsafe { buffer.write(at, data) };
+        self.current = Some((buffer.clone(), at + need));
+        (buffer, at)
+    }
+
+    /// The buffers submission `index` uses go in flight with it; those of submissions up to
+    /// `done` are free again.
+    pub(crate) fn turn(&mut self, index: SubmissionIndex, done: SubmissionIndex) {
+        let current = self.current.take().map(|c| c.0);
+        let used: Vec<_> = self.filled.drain(..).chain(current).collect();
+        self.in_flight.extend(used.into_iter().map(|b| (index, b)));
+        let (ready, busy): (Vec<_>, Vec<_>) =
+            self.in_flight.drain(..).partition(|(i, _)| *i <= done);
+        self.in_flight = busy;
+        self.free.extend(ready.into_iter().map(|(_, b)| b));
+        self.free.truncate(BELT_KEPT_FREE);
+    }
+}

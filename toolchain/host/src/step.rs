@@ -37,9 +37,10 @@ const MOST_PASSES: u32 = 4096;
 /// as long a unit, so a kernel made of them can run past what this says (`Behind` is then the
 /// second line).
 pub fn unit_ns(target: wrela_abi::Target) -> f64 {
-    let fs = match UNIT_FS.load(std::sync::atomic::Ordering::Relaxed) {
-        fs if fs != 0 && target == wrela_abi::Target::HERE => fs,
-        _ => target.limits().step_femtoseconds,
+    let fs = if target == wrela_abi::Target::HERE {
+        unit_fs()
+    } else {
+        target.limits().step_femtoseconds
     };
     f64::from(fs) * 1e-6
 }
@@ -401,19 +402,13 @@ fn check_entry() -> wrela_abi::manifest::Pipeline {
     let binding =
         |binding, kind| ResourceBinding { binding, kind, stage: BindingStage::Both, format: None };
     Pipeline {
-        name: "indirect check".into(),
-        shader: "indirect check".into(),
-        stage: Stage::Compute { entry: "checked".into(), workgroup_size: [1, 1, 1] },
         uniform: Some(UniformBlock { binding: 2, size: 16, space: UniformSpace::Uniform }),
-        bindings: vec![binding(0, BindingKind::Read), binding(1, BindingKind::ReadWrite)],
-        debug_flag: None,
-        requires: Vec::new(),
-        conditional: false,
-        standin: None,
-        sizes: None,
-        kept: 0,
-        work: vec![Some(64)],
-        unbounded: Vec::new(),
+        ..Pipeline::hand_written(
+            "indirect check",
+            Stage::Compute { entry: "checked".into(), workgroup_size: [1, 1, 1] },
+            vec![binding(0, BindingKind::Read), binding(1, BindingKind::ReadWrite)],
+            vec![Some(64)],
+        )
     }
 }
 
@@ -423,20 +418,7 @@ impl Indirect {
         let shader = check_kernel()
             .write(&mut entry, wrela_abi::Target::HERE)
             .map_err(|e| Error::Gpu(format!("the indirect check's shader: {e}")))?;
-        let entries: Vec<wrela_gpu::LayoutEntry> = wrela_abi::metal::layout(&entry)
-            .iter()
-            .map(|e| wrela_gpu::LayoutEntry {
-                binding: e.binding,
-                visibility: e.visibility,
-                ty: crate::gpu::binding_type(e, &entry),
-                index_at: if e.table {
-                    wrela_abi::table::index_offset(&entry, e.binding)
-                } else {
-                    None
-                },
-            })
-            .collect();
-        let layout = device.create_bind_group_layout(&entries);
+        let layout = device.create_bind_group_layout(&crate::gpu::layout_entries(&entry));
         let module = device
             .create_shader_module("indirect check", &shader.bytes)
             .map_err(|e| Error::Gpu(format!("the indirect check's shader: {}", e.0)))?;
@@ -524,24 +506,12 @@ impl Indirect {
             ];
             // Metal's shader reads its buffers' sizes from a uniform of their own.
             let sizes = entry.sizes.as_ref().map(|s| {
-                let words: Vec<u32> = s
-                    .buffers
-                    .iter()
-                    .map(|&b| match b {
-                        0 => source.size() as u32,
-                        1 => args.size() as u32,
-                        _ => 0,
-                    })
-                    .collect();
-                let mut bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-                bytes.resize(bytes.len().next_multiple_of(16).max(16), 0);
-                let b = device.create_buffer(&wrela_gpu::BufferDesc {
-                    label: "indirect check sizes",
-                    size: bytes.len() as u64,
-                    mappable: false,
+                let words = s.buffers.iter().map(|&b| match b {
+                    0 => source.size() as u32,
+                    1 => args.size() as u32,
+                    _ => 0,
                 });
-                device.write_buffer(&b, 0, &bytes);
-                (s.binding, b)
+                (s.binding, crate::gpu::sizes_buffer(device, "indirect check sizes", words))
             });
             if let Some((binding, b)) = &sizes {
                 entries.push(wrela_gpu::BindGroupEntry {

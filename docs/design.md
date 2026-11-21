@@ -495,7 +495,7 @@ game/
 ```
 
 The game's packages depend in the order world, look, rules, scenes. A folder of the engine exists
-once it holds something (`ray/` and `light/` come with their slices).
+once it holds something.
 
 Three rules keep it honest, and each is to be checked by the build, not by eye (the third by a
 check that no name in the engine's interfaces is a noun of the game):
@@ -522,40 +522,38 @@ workarounds up into the game):
 - **A property with one user after that is named as an exception**, with its cost, in one list.
   It is not hidden.
 
-## The engine's four modules
+## The engine's modules
 
 Each answers one question, in its own words, and hides the rest. No module passes another's
 workings through.
 
 | Module | What a caller asks | What it hides |
 | --- | --- | --- |
-| **matter** | how far is matter from this point; what is it made of here | whether the field or its cells answer; which of a thing's parts matter here; the cells themselves; that a field's value is not its distance |
-| **ray** | what does this ray meet, and how nearly does it pass what it doesn't | how it steps; where it is safe to step far; entering and grazing |
-| **light** | what light arrives at this point, facing this way | the store; the rays that fill it; when to ask again; that still light costs nothing |
-| **picture** | draw this world for this eye in this look, within this budget | where it looks first and where it fills in; edges; smoothing; what it hands the look |
+| **matter** | what is there: things as fields of a `Substance` (`World`), a `Height`, a `Medium`, a `Swarm`, the `Sky`; and how far matter is from this point (`Matter`) | that a field's value is not its distance; the steepness every step divides by |
+| **mesh** | draw this world, its height, medium and swarm for this eye in this look (`MeshSight::draw_scene`) | the meshlets it extracts from each field and when it extracts them again; shadows; the radiance volume and the cones that read it; the froxels; bloom |
+| **picture** | where the eye stands and each pixel's ray (`Eye`); how light becomes what the screen shows (`Look`); what a drawn picture hands the judges (`Picture`) | the screen's encoding |
 
-**matter is the only module that ever sees a field's raw value.** Everything else is given a
-distance. This is the rule the spike paid for three times: a joined form's value runs level
-between two close parts and is far under the distance, and that one fact dropped bricks, lost a
-web of flesh, and put a halo beside outlines, each fixed separately because no module owned it.
+**Nothing steps by a field's raw value.** A joined form's value runs level between two close
+parts and is far under the distance, and in the spike that one fact dropped bricks, lost a web of
+flesh, and put a halo beside outlines, each fixed separately because no module owned it. So
+whatever marches through matter (the reference's rays, the audit's) asks `Matter`, which divides
+by the field's stated steepness and gives a distance. The extractor reads the value only for what
+a value tells truly: where it changes sign, and which way it rises there.
 
-**ray is one function.** The eye, a shadow, the sky's light, light that bounces, and "what is
-behind this" are that one call from another place in another direction.
+**One where it is written, many where it runs.** The compiler specialises extraction to each
+thing's field (`One<M>`, `Many<M, N>`), so the kernels that ask a field are as many as the things;
+once a field is triangles, every thing is shaded by the one `mesh_fs`, whose cost no longer
+depends on what the thing is. A single shader that asks any field is the wrong way to keep one
+way of doing a job: on a GPU every pixel pays for the widest path in the code it runs, taken or
+not. Measured three times (the spike's fast paths in one draw; rebuilding from facings; slice 1d's
+one pipeline).
 
-**One where it is written, many where it runs.** The engine is unified at what an author writes,
-at the light and at the picture, not in the inner loop. The one ask and the one ray are source:
-the compiler specialises them to each thing (its field, and only the ways of answering that
-thing can use), and the picture runs each thing's code over the pixels that thing can cover. A
-single shader that can answer for anything is the wrong way to keep one way of doing a job: on a
-GPU every pixel pays for the widest path in the code it runs, taken or not. Measured three times
-(the spike's fast paths in one draw; rebuilding from facings; slice 1d's one pipeline).
+**The reference and the judges are the engine's instruments** (`reference/`, `judge/`), beside
+the modules and below nothing: they ask the author's matter directly, so they check the engine and
+not a copy of it. A pixel is the mean of what the look shows over the pixel (toned colour, not
+light): the reference averages that, and the picture is held to the same.
 
-**The reference and the judges are the engine's instruments**, beside the four modules and
-below nothing: they ask the author's matter directly, so they check the engine and not a copy of
-it. A pixel is the mean of what the look shows over the pixel (toned colour, not light): the
-reference averages that, and the picture is held to the same.
-
-**picture hands the look everything it needs.** A look written plainly must come out smooth. In
+**The draw hands the look everything it needs.** A look written plainly must come out smooth. In
 the spike every tone's edge stepped from pixel to pixel until the pixel program was told how the
 surface turns; an author must never have to know that.
 

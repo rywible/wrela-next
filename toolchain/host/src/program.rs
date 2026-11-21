@@ -321,8 +321,9 @@ struct State<E> {
     hash: HashThread,
     sequencer: Sequencer,
     /// Checked batches wait until the export returns successfully. The program may reuse its
-    /// command memory between submits, so each batch has its own bytes.
-    pending: Vec<Vec<u8>>,
+    /// command memory between submits, so each batch has its own bytes (shared with the hash
+    /// thread: one copy a batch).
+    pending: Vec<Arc<[u8]>>,
     /// A trapped export restores the sequence state alongside the checker's resources.
     before_call: Option<Sequencer>,
     /// The typed error behind the most recent trap raised by `submit`, so the caller gets it
@@ -663,12 +664,13 @@ impl<E: Executor> State<E> {
     }
 
     fn submit(&mut self, batch: &[u8]) -> Result<()> {
+        let batch: Arc<[u8]> = Arc::from(batch);
         // The state hash covers every submitted byte, valid or not.
-        self.hash.update(batch);
+        self.hash.update(batch.clone());
         if let Some(b) = &mut self.batches {
             b.push(batch.to_vec());
         }
-        for cmd in stream::decode(batch)? {
+        for cmd in stream::decode(&batch)? {
             if let Some(first) = &self.failed {
                 return Err(Error::Command(CommandError {
                     opcode: cmd.opcode(),
@@ -697,7 +699,7 @@ impl<E: Executor> State<E> {
                 _ => {}
             }
         }
-        self.pending.push(batch.to_vec());
+        self.pending.push(batch);
         Ok(())
     }
 
@@ -2086,14 +2088,7 @@ impl<E: Executor> Program<E> {
         self.serial
     }
 
-    /// The ticker's instance, to run ticks on another thread (play's schedule,
-    /// [`crate::paced`]), and its rate; give it back with [`Program::give_tick_thread`].
-    pub(crate) fn take_ticker(&mut self) -> Result<(TickThread, u32)> {
-        let hz = self.ticker_hz().unwrap_or(0);
-        Ok((self.take_tick_thread()?, hz))
-    }
-
-    /// The ticker's instance back from another thread.
+    /// The ticker's instance back from another thread ([`Program::take_tick_thread`]).
     pub(crate) fn give_tick_thread(&mut self, thread: TickThread) {
         self.ticker = Some(thread);
     }
@@ -2104,15 +2099,10 @@ impl<E: Executor> Program<E> {
         self.records.drain(..).collect()
     }
 
-    /// Tick `k` trapped on another thread: the program's failure, as a trap in that tick.
-    pub(crate) fn tick_failed(&mut self, k: u32, trap: &wasmtime::Error) -> Error {
-        self.tick_trapped(k, trap)
-    }
-
     /// The ticker's thread's instance, made the first time, to run ticks on any OS thread
-    /// ([`TickThread::run`]); give it back by putting it in `self.ticker`. An error if the
-    /// program hasn't started a ticker.
-    fn take_tick_thread(&mut self) -> Result<TickThread> {
+    /// ([`TickThread::run`]), also on play's schedule ([`crate::paced`]); give it back with
+    /// [`Program::give_tick_thread`]. An error if the program hasn't started a ticker.
+    pub(crate) fn take_tick_thread(&mut self) -> Result<TickThread> {
         let Some((task, context, _)) = self.store.data().ticker else {
             return Err(Error::Program("it hasn't started a ticker (`std::tick::start`)".into()));
         };
@@ -2170,8 +2160,9 @@ impl<E: Executor> Program<E> {
         Ok(out)
     }
 
-    /// Tick `k` trapped: the program's panic, as the host reports it.
-    fn tick_trapped(&mut self, k: u32, trap: &wasmtime::Error) -> Error {
+    /// Tick `k` trapped (on this thread or another): the program's panic, as the host reports
+    /// it.
+    pub(crate) fn tick_trapped(&mut self, k: u32, trap: &wasmtime::Error) -> Error {
         let error = self.trapped(trap, memory::THREAD_TICK);
         if let Some(f) = &mut self.last_failure {
             f.tick = Some(k);
@@ -2742,15 +2733,16 @@ mod tests;
 /// The state hash (FNV-1a 64 of every byte submitted, in order), computed on a thread of its own:
 /// each batch is sent to it as it's submitted, and reading the value asks through the same
 /// channel, so the answer covers every batch submitted before the read, as hashing in place would.
-/// FNV-1a is a chain a byte long, so it can't be computed faster; off the frame's thread it costs
-/// the frame a copy of its bytes (64 walking bodies: about 4 ms of its 9 ms of checking, before).
+/// FNV-1a is a chain a byte long, so it can't be computed faster (64 walking bodies: about 4 ms of
+/// the frame's 9 ms of checking, in place); off the frame's thread it reads the copy of each batch
+/// the frame keeps until its call ends.
 pub(crate) struct HashThread {
     tx: Option<std::sync::mpsc::Sender<HashMsg>>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
 
 enum HashMsg {
-    Bytes(Vec<u8>),
+    Bytes(Arc<[u8]>),
     Ask(std::sync::mpsc::Sender<StateHash>),
 }
 
@@ -2774,9 +2766,9 @@ impl HashThread {
         HashThread { tx: Some(tx), worker: Some(worker) }
     }
 
-    pub(crate) fn update(&self, bytes: &[u8]) {
+    pub(crate) fn update(&self, bytes: Arc<[u8]>) {
         if let Some(tx) = &self.tx {
-            let _ = tx.send(HashMsg::Bytes(bytes.to_vec()));
+            let _ = tx.send(HashMsg::Bytes(bytes));
         }
     }
 

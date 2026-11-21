@@ -125,13 +125,10 @@ fn the_hoisted_fixture_ships_with_its_alike_work_on_the_cpu() {
     let pkg = wrela_tests::repo_root().join("toolchain/tests/hoisted");
     assert_eq!(e0712(&pkg), Vec::<String>::new());
     let built = wrela_tests::build_for(&pkg, wrela_abi::Target::Metal).expect("builds");
-    let file =
-        |name: &str| built.files.iter().find(|(n, _)| n == name).map(|(_, b)| b).expect(name);
-    let manifest =
-        wrela_abi::Manifest::parse(&String::from_utf8_lossy(file("manifest.json"))).expect("valid");
+    let manifest = wrela_tests::built_manifest(&built);
     let msl = |k: &str| {
         let p = manifest.pipelines.iter().find(|p| p.name == k).expect(k);
-        String::from_utf8_lossy(file(&p.shader)).into_owned()
+        String::from_utf8_lossy(wrela_tests::file(&built, &p.shader)).into_owned()
     };
     assert!(!msl("chained").contains("sin("), "{}", msl("chained"));
     assert!(msl("parted").contains("hoisted0.inner["), "{}", msl("parted"));
@@ -458,34 +455,53 @@ fn calls_with_few_varying_numbers_are_listed_for_tables() {
     assert!(built.pipelines.iter().all(|p| p.few.iter().all(|c| c.is_empty())));
 }
 
-/// The engine's shape of asking a smooth fold where a ray meets it (toolchain/tests/met_grown): a
-/// generic thing's `meets_grown`, under a branch on its const way, grown by a width the ray's own,
-/// from a pixel program's loop, builds shipped, with no E0712 in std's code. Its build at 0eb05c0
-/// reported two (`fold_lowering`'s loop over a parameter), as the engine's tree did.
+/// An `if` on a constant that yields its value through a local (`if n > 128 { 1.0 } else {
+/// TABLE[n] }`, `n` a constant once its function is written in) is that one value once the branch
+/// it doesn't take is gone, so alike work grown by it moves onto the CPU: a shipped build has no
+/// E0712. Until 18fa349 the local's store and load stayed, hoisting took no load of a local, and
+/// std's fold lowering held 276 work of a pixel program's setup in its shader (E0712).
 #[test]
-fn the_engines_ask_of_a_smooth_fold_builds_shipped() {
-    let dir = scratch("same_met_grown");
-    write_package(&dir, "met_grown", include_str!("../../met_grown/main.wrela"));
-    assert_eq!(e0712(&dir), Vec::<String>::new());
+fn a_value_a_constant_branch_yields_through_a_local_is_hoisted() {
+    let dir = scratch("same_branch_local");
+    let mut src = String::from(
+        "use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+struct Given: Copy + GpuData {
+    u: f32,
 }
 
-/// The meets fixture (toolchain/tests/meets) builds shipped: a fold's lowering, an `if` on its
-/// part count that yields a constant through a local, is that constant once the branch it
-/// doesn't take is gone, so the round cones' setup it grows moves onto the CPU. From b69e231
-/// (the lowering a table) to 8eee7c0 the local's load held it in the shader: E0712, 276 work.
-#[test]
-fn the_meets_fixture_builds_shipped() {
-    let dir = scratch("same_meets");
-    write_package(&dir, "meets", include_str!("../../meets/main.wrela"));
-    assert_eq!(e0712(&dir), Vec::<String>::new());
+const TABLE: [f32; 129] = table()
+
+fn table() -> [f32; 129] {
+    var out = [0.0; 129]
+    var x = 0.0
+    for i in 2..129 {
+        x += 0.25 * (1.0 - x) * (1.0 - x)
+        out[i] = x
+    }
+    out
 }
 
-/// The passes fixture (toolchain/tests/passes) builds shipped: std's `passes` (a round cone's
-/// closed form, a box's corners, a fold's seam search over its three nearest parts) and
-/// `Pass::refined` from a pixel program, with no E0712 in std's code.
-#[test]
-fn the_passes_fixture_builds_shipped() {
-    let dir = scratch("same_passes");
-    write_package(&dir, "passes", include_str!("../../passes/main.wrela"));
+fn lowering(n: u32, k: f32) -> f32 {
+    k * (if n > 128 { 1.0 } else { TABLE[n] })
+}
+
+@compute(64)
+fn k(g: Given, out: mut Slots<f32>, id: GlobalId) {
+    let x = f32(id.x)
+",
+    );
+    src.push_str(&chain("g.u + lowering(17, g.u)"));
+    src.push_str(
+        "
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var out: GpuBuffer<f32> = buffer(64)
+    dispatch(k.bind(g: Given { u: time }, out: mut out), over: 64)
+}
+",
+    );
+    write_package(&dir, "same_branch_local", &src);
     assert_eq!(e0712(&dir), Vec::<String>::new());
 }

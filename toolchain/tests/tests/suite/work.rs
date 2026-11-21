@@ -324,14 +324,7 @@ fn checks_the_count_proves_unneeded_are_left_out() {
             ),
         ],
     );
-    let how = wrela_driver::BuildFor {
-        kind: wrela_driver::BuildKind { debug: false, testing: true },
-        set: Vec::new(),
-        target: wrela_abi::Target::Metal,
-        trusted_shaders: false,
-        exact: false,
-    };
-    let built = wrela_driver::build_for(&dir, &how);
+    let built = wrela_driver::build_for(&dir, &wrela_tests::testing_for(wrela_abi::Target::Metal));
     assert!(!built.has_errors(), "{:?}", built.diagnostics);
     let msl = |entry: &str| -> String {
         built

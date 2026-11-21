@@ -55,7 +55,7 @@ pub(super) fn value_and_gradient(
     };
     let mut mask = vec![0; func.params.len()];
     mask[xi] = all_bits(&m.types, x_ty);
-    let d = derive(m, cache, f, mask.clone(), n, target, false, false)?;
+    let d = derive(m, cache, f, mask.clone(), n, target, Variant::Point)?;
     let returns = returns_active(m, cache, f, mask, Mode::Ad) != 0;
     let tuple = value_gradient_ty(&mut m.types, x_ty, payload);
     let mut g = Function::new(
@@ -137,11 +137,27 @@ fn call_seeded(
     Ok(g.let_(body, dual_ty, Expr::Call(d, args)))
 }
 
-/// The top bit of a derivation's directions in the cache's key: a filtering one.
-pub(super) const FILTERED: u8 = 0x80;
+/// Which derivative of a function a derivation writes, part of the cache's key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) enum Variant {
+    /// The derivative at a point.
+    Point,
+    /// A filtering one ([`Ad::filter`]).
+    Filtered,
+    /// One whose code only an interval reads ([`Ad::bounds`]).
+    Bounded,
+}
 
-/// The next bit: a derivation whose code only an interval reads ([`Ad::bounds`]).
-pub(super) const BOUNDED: u8 = 0x40;
+impl Variant {
+    /// What the derived function's name says it is, before its directions.
+    fn suffix(self) -> &'static str {
+        match self {
+            Variant::Point => "d",
+            Variant::Filtered => "f",
+            Variant::Bounded => "b",
+        }
+    }
+}
 
 /// A footprint narrower than this is a point: the builtin's own value is kept.
 const NARROWEST: f64 = 1.0e-6;
@@ -189,7 +205,7 @@ pub(super) fn filtered_value(
     }
     let mut mask = vec![0; func.params.len()];
     mask[xi] = all_bits(&m.types, x_ty);
-    let d = derive(m, cache, f, mask.clone(), n, target, true, false)?;
+    let d = derive(m, cache, f, mask.clone(), n, target, Variant::Filtered)?;
     let returns = returns_active(m, cache, f, mask, Mode::Ad) != 0;
     let mut params = func.params.clone();
     let width_param = params.len() as u32;
@@ -214,10 +230,8 @@ pub(super) fn filtered_value(
     Ok(m.add_function(g))
 }
 
-/// The derivative of `f` with active parameters `mask` and `n` directions; with `filter`, a
-/// filtering one (see [`Ad::filter`]); with `bounds`, one written for its interval to be tight
-/// (see [`Ad::bounds`]).
-#[allow(clippy::too_many_arguments)]
+/// The derivative of `f` with active parameters `mask` and `n` directions, the `variant` asked
+/// for.
 pub(super) fn derive(
     m: &mut Module,
     cache: &mut DeriveCache,
@@ -225,14 +239,12 @@ pub(super) fn derive(
     mask: Vec<Bits>,
     n: u8,
     target: Target,
-    filter: bool,
-    bounds: bool,
+    variant: Variant,
 ) -> Result<FuncId> {
-    // The cache's key: the directions, and the modes in the top bits.
-    let key_n = n | if filter { FILTERED } else { 0 } | if bounds { BOUNDED } else { 0 };
-    if let Some(&d) = cache.ad.get(&(f, mask.clone(), key_n)) {
+    if let Some(&d) = cache.ad.get(&(f, mask.clone(), n, variant)) {
         return Ok(d);
     }
+    let (filter, bounds) = (variant == Variant::Filtered, variant == Variant::Bounded);
     let func = m.functions[f.index()].clone();
     no_gpu_or_heap_work(&func.body)?;
     let returns = returns_active(m, cache, f, mask.clone(), Mode::Ad) != 0;
@@ -240,18 +252,7 @@ pub(super) fn derive(
     no_heap_store(&act)?;
     no_write_through_mut(&func, &act, &mask, "a derivative")?;
     let mut nf = func.clone_signature();
-    nf.name = format!(
-        "{}_{}{}",
-        func.name,
-        if filter {
-            "f"
-        } else if bounds {
-            "b"
-        } else {
-            "d"
-        },
-        n
-    );
+    nf.name = format!("{}_{}{}", func.name, variant.suffix(), n);
     // Tangent parameters, appended: n per active parameter.
     let mut tparam: Vec<Vec<u32>> = vec![Vec::new(); func.params.len()];
     for (i, p) in func.params.iter().enumerate() {
@@ -294,16 +295,16 @@ pub(super) fn derive(
     let id = m.add_function(Function::new(nf.name.clone(), nf.params.clone(), nf.ret));
     // Cached before its body is built, for calls back into it; removed again if building
     // fails, so a later request doesn't find the bodiless placeholder.
-    let key = (f, mask, key_n);
+    let key = (f, mask, n, variant);
     cache.ad.insert(key.clone(), id);
     cache.ad_of.insert(id, key.clone());
-    let single = super::interval::single_stores(m, &func);
-    let mut defs = HashMap::new();
-    crate::visit::walk(&func.body, &mut |s| {
-        if let Stmt::Let(v, e) = s {
-            defs.insert(*v, e.clone());
-        }
-    });
+    // What only a bounded derivation reads (`sum_of_squares`).
+    let (defs, single, scope) = if bounds {
+        let single = super::interval::single_stores(m, &func);
+        (crate::visit::definitions(&func.body), single, vec![false; func.values.len()])
+    } else {
+        Default::default()
+    };
     let mut b = Ad {
         m,
         cache,
@@ -316,7 +317,7 @@ pub(super) fn derive(
         bounds,
         defs,
         single,
-        scope: Vec::new(),
+        scope,
         tparam,
         tlocal,
         tv: HashMap::new(),
@@ -358,12 +359,13 @@ struct Ad<'a> {
     /// `√c dot(t / |t|, dt)`, whose interval is bounded where `t` can be 0, where the quotient
     /// `d(Σ tᵢ²) / 2√(Σ tᵢ²)` is every number. The point code is not changed.
     bounds: bool,
-    /// The primal's values, by the expression each is.
-    defs: HashMap<ValueId, Expr>,
-    /// By local: the one value stored in it, if a `let`'s.
+    /// The primal's values, by the expression each is (`bounds` only).
+    defs: HashMap<ValueId, &'a Expr>,
+    /// By local: the one value stored in it, if a `let`'s (`bounds` only).
     single: Vec<Option<ValueId>>,
-    /// The values defined in the blocks being derived, innermost last: what's in scope.
-    scope: Vec<ValueId>,
+    /// By value: whether it's defined in the blocks being derived, what's in scope (`bounds`
+    /// only).
+    scope: Vec<bool>,
     tparam: Vec<Vec<u32>>,
     tlocal: Vec<Vec<LocalId>>,
     /// Each active value's tangents (`None`: structurally zero).
@@ -403,6 +405,17 @@ impl Builder for Ad<'_> {
 }
 
 impl Ad<'_> {
+    /// Which derivative this derivation writes.
+    fn variant(&self) -> Variant {
+        if self.filter {
+            Variant::Filtered
+        } else if self.bounds {
+            Variant::Bounded
+        } else {
+            Variant::Point
+        }
+    }
+
     /// A float constant of `ty`'s element type (`f32` or `f64`), as a scalar: operations on
     /// `ty` splat it.
     fn fc(&mut self, out: &mut Block, ty: TypeId, x: f64) -> ValueId {
@@ -551,14 +564,22 @@ impl Ad<'_> {
 
     fn block(&mut self, b: &Block) -> Result<Block> {
         let mut out = Vec::new();
-        let mark = self.scope.len();
         for s in b {
             self.stmt(s, &mut out)?;
-            if let Stmt::Let(v, _) = s {
-                self.scope.push(*v);
+            if let Stmt::Let(v, _) = s
+                && let Some(x) = self.scope.get_mut(v.index())
+            {
+                *x = true;
             }
         }
-        self.scope.truncate(mark);
+        // The block's values go out of scope with it.
+        for s in b {
+            if let Stmt::Let(v, _) = s
+                && let Some(x) = self.scope.get_mut(v.index())
+            {
+                *x = false;
+            }
+        }
         Ok(out)
     }
 
@@ -566,8 +587,7 @@ impl Ad<'_> {
     /// scope) and the factor, which depends on nothing derived. Through `+`, `x * x`, `dot(x,
     /// x)` and `let` bindings.
     fn sum_of_squares(&self, v: ValueId) -> Option<(Vec<ValueId>, Option<ValueId>)> {
-        let e = self.def(v)?;
-        if let Expr::Binary(BinOp::Mul, a, b) = e {
+        if let Expr::Binary(BinOp::Mul, a, b) = *self.def(v)? {
             for (x, c) in [(a, b), (b, a)] {
                 if !self.act.value(c) && self.m.types.as_scalar(self.ty(c)).is_some() {
                     if let Some(t) = self.squares(x) {
@@ -580,7 +600,7 @@ impl Ad<'_> {
     }
 
     fn squares(&self, v: ValueId) -> Option<Vec<ValueId>> {
-        match self.def(v)? {
+        match *self.def(v)? {
             Expr::Binary(BinOp::Add, a, b) => {
                 let mut t = self.squares(a)?;
                 t.extend(self.squares(b)?);
@@ -589,7 +609,7 @@ impl Ad<'_> {
             Expr::Binary(BinOp::Mul, a, b) if self.track.same_value(a, b) || a == b => {
                 self.in_scope(a).then(|| vec![a])
             }
-            Expr::Builtin(Builtin::Dot, args)
+            Expr::Builtin(Builtin::Dot, ref args)
                 if args.len() == 2
                     && (args[0] == args[1] || self.track.same_value(args[0], args[1])) =>
             {
@@ -600,18 +620,16 @@ impl Ad<'_> {
     }
 
     /// What `v` is, through a load of a `let`'s local.
-    fn def(&self, v: ValueId) -> Option<Expr> {
-        match self.defs.get(&v)? {
-            Expr::Load(Place { root: PlaceRoot::Local(l), path }) if path.is_empty() => {
-                let src = self.single.get(l.index()).copied().flatten()?;
-                if self.in_scope(src) { self.def(src) } else { None }
-            }
-            e => Some(e.clone()),
-        }
+    fn def(&self, v: ValueId) -> Option<&Expr> {
+        let e = *self.defs.get(&v)?;
+        let Expr::Load(p) = e else { return Some(e) };
+        let Some(l) = p.whole_local() else { return Some(e) };
+        let src = self.single.get(l.index()).copied().flatten()?;
+        if self.in_scope(src) { self.def(src) } else { None }
     }
 
     fn in_scope(&self, v: ValueId) -> bool {
-        self.scope.contains(&v)
+        self.scope.get(v.index()).copied().unwrap_or(false)
     }
 
     /// The tangent along direction `k` of `sqrt(c Σ tᵢ²)` as `length`'s rule gives it (see
@@ -795,17 +813,8 @@ impl Ad<'_> {
             return Ok(());
         }
         let at = self.track.at;
-        let dg = derive(
-            self.m,
-            self.cache,
-            g,
-            mask.clone(),
-            self.n,
-            self.target,
-            self.filter,
-            self.bounds,
-        )
-        .map_err(|e| e.through(at))?;
+        let dg = derive(self.m, self.cache, g, mask.clone(), self.n, self.target, self.variant())
+            .map_err(|e| e.through(at))?;
         let mut new_args = args.to_vec();
         for (i, a) in args.iter().enumerate() {
             if mask[i] == 0 {
@@ -1235,22 +1244,21 @@ impl Ad<'_> {
                 ));
             }
             B::Fract => d[0],
-            B::Sqrt if self.bounds && d[0].is_some() && self.sum_of_squares(a0).is_some() => {
-                let (terms, factor) = self.sum_of_squares(a0).unwrap();
-                match self.root_of_squares(&terms, factor, k, ty, out) {
-                    Some(t) => Some(t),
-                    None => d[0].map(|da| {
+            B::Sqrt => {
+                if self.bounds
+                    && d[0].is_some()
+                    && let Some((terms, factor)) = self.sum_of_squares(a0)
+                    && let Some(t) = self.root_of_squares(&terms, factor, k, ty, out)
+                {
+                    Some(t)
+                } else {
+                    d[0].map(|da| {
                         let two = self.fc(out, ty, 2.0);
                         let den = self.bin(out, BinOp::Mul, v, two, ty);
                         self.div_from_zero(out, da, den, ty)
-                    }),
+                    })
                 }
             }
-            B::Sqrt => d[0].map(|da| {
-                let two = self.fc(out, ty, 2.0);
-                let den = self.bin(out, BinOp::Mul, v, two, ty);
-                self.div_from_zero(out, da, den, ty)
-            }),
             B::InverseSqrt => d[0].map(|da| {
                 let h = self.fc(out, ty, -0.5);
                 let r2 = self.bin(out, BinOp::Mul, v, v, ty);
@@ -1576,7 +1584,7 @@ mod tests {
         f.body = body;
         let id = m.add_function(f);
         verify(&m).expect("the source is valid IR");
-        derive(&mut m, &mut DeriveCache::default(), id, vec![1], 1, Target::Cpu, false, false)
+        derive(&mut m, &mut DeriveCache::default(), id, vec![1], 1, Target::Cpu, Variant::Point)
             .expect("normalization is differentiable");
         verify(&m).expect("the derivative keeps the vector's component type");
     }

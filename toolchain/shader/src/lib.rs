@@ -20,6 +20,7 @@
 //! shaders) is built as IR in Rust ([`build`]) and written the same way. Every shader the test
 //! suite builds goes through its platform's offline tool ([`offline`]).
 
+mod analysis;
 pub mod build;
 pub mod metal;
 pub mod offline;
@@ -84,24 +85,15 @@ pub fn emit_shader(
     target: wrela_abi::Target,
     checks: Checks,
 ) -> R<Shader> {
-    // The fragment shader's promise of its depth: conservative depth.
-    let promise = m.entry_points.iter().find_map(|e| match &e.stage {
-        ir::Stage::Fragment { depth: Some(_), promise: Some(d), .. } => Some(*d),
-        _ => None,
-    });
     let out = match target {
         wrela_abi::Target::Metal => {
             p.sizes = metal::buffer_sizes(m, p);
-            let depth = promise.map(|d| match d {
-                ir::DepthPromise::Greater => metal::ConservativeDepth::Greater,
-                ir::DepthPromise::Less => metal::ConservativeDepth::Less,
-            });
-            let out = metal::write(m, p, depth, checks)?;
+            let out = metal::write(m, p, checks)?;
             Shader { bytes: out.text.into_bytes(), entry_points: out.entry_points }
         }
         wrela_abi::Target::Vulkan => {
             p.sizes = None;
-            let (bytes, entry_points) = spirv::write(m, p, promise, checks)?;
+            let (bytes, entry_points) = spirv::write(m, p, checks)?;
             Shader { bytes, entry_points }
         }
     };

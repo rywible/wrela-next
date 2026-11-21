@@ -16,6 +16,7 @@
 //! queue's lock, as [`Ticker::queue`] stamps when it queued), so a check can say each record
 //! went to the first tick that started after it was queued ([`crate::window::check_ticks`]).
 
+use crate::locked;
 use crate::program::{TickThread, Ticked};
 use std::collections::VecDeque;
 use std::sync::mpsc;
@@ -50,7 +51,6 @@ pub struct Ticker {
     thread: Option<JoinHandle<TickThread>>,
     queue: Arc<(Mutex<Queue>, Condvar)>,
     ran: mpsc::Receiver<Ran>,
-    pub hz: u32,
     /// The program whose ticker it is ([`crate::Host::program_serial`]).
     pub(crate) program: u64,
 }
@@ -77,12 +77,12 @@ impl Ticker {
             .name("wrela ticker".into())
             .spawn(move || run(thread, hz, start, &script, &q, &send))
             .expect("a thread for the ticker");
-        Ticker { thread: Some(thread), queue, ran, hz, program }
+        Ticker { thread: Some(thread), queue, ran, program }
     }
 
     /// Queues `records` for the next tick to start: when they were queued.
     pub fn queue(&self, records: impl IntoIterator<Item = Record>) -> Instant {
-        let mut q = lock(&self.queue.0);
+        let mut q = locked(&self.queue.0);
         q.records.extend(records);
         Instant::now()
     }
@@ -95,16 +95,12 @@ impl Ticker {
     /// Stops the ticker after the tick it's running: its instance back, and what it did since
     /// the last look.
     pub(crate) fn stop(mut self) -> (TickThread, Vec<Ran>) {
-        lock(&self.queue.0).stop = true;
+        locked(&self.queue.0).stop = true;
         self.queue.1.notify_all();
         let thread = self.thread.take().expect("joined once").join();
         let thread = thread.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
         (thread, self.ran.try_iter().collect())
     }
-}
-
-fn lock(m: &Mutex<Queue>) -> std::sync::MutexGuard<'_, Queue> {
-    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// The ticker's thread: each tick at its time, until stopped or a tick traps.
@@ -125,7 +121,7 @@ fn run(
         let k = thread.next();
         let due = start + Duration::from_secs_f64((origin + f64::from(k) * period).max(0.0));
         let (records, took) = {
-            let mut q = lock(&queue.0);
+            let mut q = locked(&queue.0);
             loop {
                 if q.stop {
                     return thread;

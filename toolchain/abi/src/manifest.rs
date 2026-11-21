@@ -242,6 +242,35 @@ pub struct Pipeline {
     pub unbounded: Vec<Option<String>>,
 }
 
+impl Pipeline {
+    /// A pipeline written by hand rather than compiled (a host's own kernel or pass, a test's):
+    /// its shader file named as it is, its `bindings`, and each entry point's work bounded as
+    /// `work` says; no uniform block, debug flag, features, stand-in or buffer sizes, and
+    /// nothing kept.
+    pub fn hand_written(
+        name: &str,
+        stage: Stage,
+        bindings: Vec<ResourceBinding>,
+        work: Vec<Option<u64>>,
+    ) -> Pipeline {
+        Pipeline {
+            name: name.into(),
+            shader: name.into(),
+            stage,
+            uniform: None,
+            bindings,
+            debug_flag: None,
+            requires: Vec::new(),
+            conditional: false,
+            standin: None,
+            sizes: None,
+            kept: 0,
+            work,
+            unbounded: Vec::new(),
+        }
+    }
+}
+
 /// Whether no entry point's place is given (a manifest leaves `unbounded` out then).
 fn none_given(at: &[Option<String>]) -> bool {
     at.iter().all(Option::is_none)
@@ -295,7 +324,8 @@ pub struct RenderTarget {
     pub colors: [Option<TextureFormat>; MAX_COLOR_ATTACHMENTS],
     pub depth: bool,
     pub screen: bool,
-    /// Samples per pixel: `1` or `4` (hardware 4× MSAA, resolved on pass end).
+    /// Samples per pixel: one of [`crate::stream::SAMPLE_COUNTS`] (4: hardware 4× MSAA,
+    /// resolved on pass end).
     pub samples: u8,
 }
 
@@ -1018,7 +1048,7 @@ impl Manifest {
                                 "pipeline {i}'s target {k} is the screen, whose one colour is {SCREEN_FORMAT}"
                             ));
                         }
-                        if t.samples != 1 && t.samples != 4 {
+                        if !crate::stream::SAMPLE_COUNTS.contains(&u32::from(t.samples)) {
                             return err(format!(
                                 "pipeline {i}'s target {k} has {} samples; only 1 or 4 are supported",
                                 t.samples
@@ -1052,8 +1082,8 @@ impl Manifest {
                                 let uint = outputs[c] == Output::Uint;
                                 if f.is_depth() || f.is_compressed() || !f.renderable() {
                                     Some(format!("a pass can't draw into {}", f.name()))
-                                } else if t.samples > 1 && f.is_uint() {
-                                    Some(format!("an MSAA pass can't resolve integer format {}", f.name()))
+                                } else if let Some(why) = f.unresolvable(t.samples) {
+                                    Some(why)
                                 } else if uint != f.is_uint() {
                                     Some(format!(
                                         "its fragment shader writes {} to colour {c}, and {} holds {}",
@@ -1254,7 +1284,7 @@ mod read {
                     None => 1u8,
                     Some(v) => {
                         let n = u32(to, "samples", &tp)?;
-                        if n != 1 && n != 4 {
+                        if !crate::stream::SAMPLE_COUNTS.contains(&n) {
                             return fail(format!("{tp}.samples must be 1 or 4, got {v}"));
                         }
                         n as u8

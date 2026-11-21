@@ -66,14 +66,19 @@ impl Default for OncePerKey {
 /// Builds the package in `pkg` as `wrela build --testing` does (with its `@testing` exports),
 /// without writing its files: the output, or the errors rendered.
 pub fn build(pkg: &Path) -> Result<wrela_driver::Output, String> {
-    let built = wrela_driver::build_for_tests(pkg, false);
+    checked(wrela_driver::build_for_tests(pkg, false), true)
+}
+
+/// `built`, if it has no errors and its shaders pass [`offline_check`] (and, with `budget`, each
+/// Metal shader is within 288 KiB); else what's wrong, rendered.
+fn checked(built: wrela_driver::Output, budget: bool) -> Result<wrela_driver::Output, String> {
     if built.has_errors() {
         return Err(wrela_diag::render::render_all(&built.sources, &built.diagnostics));
     }
-    for (name, bytes) in &built.files {
-        if name.ends_with(".metal") && bytes.len() > 288 * 1024 {
-            return Err(format!("{name}: {} bytes, over the 288 KiB shader budget", bytes.len()));
-        }
+    let over =
+        |(name, bytes): &&(String, Vec<u8>)| name.ends_with(".metal") && bytes.len() > 288 * 1024;
+    if budget && let Some((name, bytes)) = built.files.iter().find(over) {
+        return Err(format!("{name}: {} bytes, over the 288 KiB shader budget", bytes.len()));
     }
     offline_check(&built)?;
     Ok(built)
@@ -89,32 +94,19 @@ pub fn offline_check(built: &wrela_driver::Output) -> Result<(), String> {
 /// machine's: for a test that reads a shader's text, or one of the limits of the machine its
 /// cases were written for.
 pub fn build_for(pkg: &Path, target: wrela_abi::Target) -> Result<wrela_driver::Output, String> {
-    let how = wrela_driver::BuildFor {
-        kind: wrela_driver::BuildKind { debug: false, testing: true },
-        set: Vec::new(),
-        target,
-        trusted_shaders: false,
-        exact: false,
-    };
-    let built = wrela_driver::build_for(pkg, &how);
-    if built.has_errors() {
-        return Err(wrela_diag::render::render_all(&built.sources, &built.diagnostics));
-    }
-    offline_check(&built)?;
-    Ok(built)
+    checked(wrela_driver::build_for(pkg, &testing_for(target)), false)
+}
+
+/// How [`build_for`] builds: a test build (`wrela build --testing --target`) for `target`.
+pub fn testing_for(target: wrela_abi::Target) -> wrela_driver::BuildFor {
+    let kind = wrela_driver::BuildKind { debug: false, testing: true };
+    wrela_driver::BuildFor { kind, ..wrela_driver::BuildFor::new(target) }
 }
 
 /// A shipped build of the package in `pkg` (`wrela_driver::build`), for `target`, errors and
 /// all.
 pub fn shipped_for(pkg: &Path, target: wrela_abi::Target) -> wrela_driver::Output {
-    let how = wrela_driver::BuildFor {
-        kind: wrela_driver::BuildKind::default(),
-        set: Vec::new(),
-        target,
-        trusted_shaders: false,
-        exact: false,
-    };
-    wrela_driver::build_for(pkg, &how)
+    wrela_driver::build_for(pkg, &wrela_driver::BuildFor::new(target))
 }
 
 /// Builds the package in `pkg` into `out`, as `wrela build` does. Panics with the errors if it
@@ -231,6 +223,14 @@ pub fn one_u64(host: &mut impl Exports, name: &str, args: &[Value]) -> u64 {
     }
 }
 
+/// Calls the export `name`, which must return one `vec2` (two `f32`s).
+pub fn one_vec2(host: &mut impl Exports, name: &str, args: &[Value]) -> [f32; 2] {
+    match host.call(name, args).expect(name).as_slice() {
+        [Value::F32(x), Value::F32(y)] => [*x, *y],
+        other => panic!("{name} returned {other:?}"),
+    }
+}
+
 /// Calls the export `name`, which must return one `vec3` (three `f32`s).
 pub fn one_vec3(host: &mut impl Exports, name: &str, args: &[Value]) -> [f32; 3] {
     match host.call(name, args).expect(name).as_slice() {
@@ -269,6 +269,18 @@ pub fn worse(a: f64, b: f64) -> f64 {
 pub fn manifest(dir: &Path) -> wrela_abi::Manifest {
     let text = std::fs::read_to_string(dir.join("manifest.json")).expect("manifest.json");
     wrela_abi::Manifest::parse(&text).expect("a valid manifest")
+}
+
+/// The file `name` of a build's output, as it would be written.
+pub fn file<'a>(built: &'a wrela_driver::Output, name: &str) -> &'a [u8] {
+    let found = built.files.iter().find(|(n, _)| n == name);
+    found.map(|(_, b)| b.as_slice()).unwrap_or_else(|| panic!("the build has no {name}"))
+}
+
+/// The manifest of a build's output ([`manifest`], before it's written).
+pub fn built_manifest(built: &wrela_driver::Output) -> wrela_abi::Manifest {
+    let text = std::str::from_utf8(file(built, "manifest.json")).expect("a UTF-8 manifest");
+    wrela_abi::Manifest::parse(text).expect("a valid manifest")
 }
 
 /// Builds the package at `pkg` (a path from the repo root) into `toolchain/target/tmp/<name>`. Returns the
@@ -325,16 +337,8 @@ fn built_once(pkg: &str, kind: &str, build: fn(&Path) -> wrela_driver::Output) -
     BUILDS.run(&base.display().to_string(), || {
         let _ = std::fs::remove_dir_all(&base);
         let dir = repo_root().join(pkg);
-        let built = build(&dir);
-        if built.has_errors() {
-            panic!(
-                "{pkg} doesn't build:\n{}",
-                wrela_diag::render::render_all(&built.sources, &built.diagnostics)
-            );
-        }
-        if let Err(e) = offline_check(&built) {
-            panic!("{pkg}'s shaders: {e}");
-        }
+        let built =
+            checked(build(&dir), false).unwrap_or_else(|e| panic!("{pkg} doesn't build:\n{e}"));
         built.write_to(&base).expect("write the build");
     });
     base

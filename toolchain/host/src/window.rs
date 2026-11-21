@@ -26,11 +26,10 @@
 //! (`wrela-host --replay`).
 
 use crate::live::Live;
-use crate::pace::{Pacer, Plan};
+use crate::pace::{Pacer, Plan, SLEEP_PAST, WAKE_EARLY, quantile};
 use crate::paced::{Ran, Ticker};
 use crate::voice::{Played, Playing};
 use crate::{Error, Host, Result};
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
@@ -109,8 +108,6 @@ struct App<'a> {
     trace: bool,
     /// How long the loop has waited by its own plan since the last frame: a second is a stall.
     awake: Awake,
-    /// When each frame not yet shown took its input and was presented, by its present's id.
-    waiting: HashMap<u64, (f64, f64)>,
     /// Each shown frame's latency, input sampled to photons, and of it input to presented (the
     /// frame run, recorded and submitted): milliseconds; and when it was shown (seconds).
     latencies: Vec<f64>,
@@ -138,10 +135,7 @@ impl App<'_> {
                     self.now() * 1e3
                 );
             }
-            self.pacer.shown(id, at);
-            // Frames are shown in order: one before this not shown yet was overtaken.
-            self.waiting.retain(|&k, _| k >= id);
-            if let Some((sampled, presented)) = self.waiting.remove(&id) {
+            if let Some((sampled, presented)) = self.pacer.shown(id, at) {
                 self.latencies.push((at - sampled) * 1e3);
                 self.before_present.push((presented - sampled) * 1e3);
                 self.shown.push(at);
@@ -230,11 +224,10 @@ impl App<'_> {
         if let Some(id) = self.host.present()? {
             let presented = self.now();
             if made_again {
-                self.pacer.presented_after_hitch(id, presented, plan.target);
+                self.pacer.presented_after_hitch(id, sampled, presented, plan.target);
             } else {
                 self.pacer.presented(id, sampled, presented, plan.target);
             }
-            self.waiting.insert(id, (sampled, presented));
         }
         if self.run.keep {
             self.taken.extend(events.into_iter().map(|s| (s, handed.unwrap_or(f64::NAN))));
@@ -437,7 +430,7 @@ enum Step {
     Stalled {
         waited: f64,
     },
-    /// Sleep until this (seconds), a millisecond before the frame's time: a wake can be late,
+    /// Sleep until this (seconds), [`WAKE_EARLY`] before the frame's time: a wake can be late,
     /// and the rest is waited out exactly.
     Wait(f64),
     /// The rest waited out by the loop itself, not asleep: an event that comes in the last
@@ -471,8 +464,8 @@ impl Awake {
             return Step::Draw(Plan { at: now, target: plan.target });
         }
         let early = plan.at - now;
-        if early > 0.002 {
-            self.asked = plan.at - 0.001;
+        if early > SLEEP_PAST {
+            self.asked = plan.at - WAKE_EARLY;
             return Step::Wait(self.asked);
         }
         if early > 0.0 {
@@ -535,7 +528,7 @@ pub struct Arrivals {
     /// From arriving to being taken (ms): the median, and the worst.
     pub median: f64,
     pub worst: f64,
-    /// Taken a frame (or more) later than the first frame that sampled more than [`LATE`]
+    /// Taken a frame (or more) later than the first frame that sampled more than [`HANDOVER`]
     /// after they arrived: their count, and the most a frame sampled after one of them and
     /// didn't take it (ms).
     pub late: usize,
@@ -544,7 +537,7 @@ pub struct Arrivals {
 
 /// How long after an event arrives a frame may sample without taking it (s): the time the
 /// event loop takes to hand it over.
-pub const LATE: f64 = 0.0005;
+pub const HANDOVER: f64 = 0.0005;
 
 /// How the events the frames took reached the sim ([`check_ticks`]): how many, and from their
 /// frame handing them to the ticker to the tick that took them (ms), the median and the worst.
@@ -603,7 +596,7 @@ fn arrivals(arrived: &[(f64, u32)], sampled: &[f64]) -> Option<Arrivals> {
         .iter()
         .filter_map(|&(sent, f)| {
             let before = sampled[..f as usize].last()?;
-            (*before > sent + LATE).then(|| (before - sent) * 1e3)
+            (*before > sent + HANDOVER).then(|| (before - sent) * 1e3)
         })
         .collect();
     Some(Arrivals {
@@ -687,8 +680,7 @@ fn stats(l: &[f64]) -> Option<(f64, f64, f64)> {
         return None;
     }
     l.sort_by(f64::total_cmp);
-    let at = |q: f64| l[((l.len() - 1) as f64 * q).round() as usize];
-    Some((at(0.5), at(0.9), l[l.len() - 1]))
+    Some((quantile(&l, 0.5), quantile(&l, 0.9), l[l.len() - 1]))
 }
 
 /// Runs `host`'s frames in a window as `run` says.
@@ -726,7 +718,6 @@ pub fn run(host: &mut Host, run: &WindowRun) -> Result<WindowRan> {
         sampled: Vec::new(),
         trace: std::env::var_os("WRELA_PACE_TRACE").is_some(),
         awake: Awake::new(),
-        waiting: HashMap::new(),
         latencies: Vec::new(),
         before_present: Vec::new(),
         shown: Vec::new(),
@@ -754,7 +745,7 @@ pub fn run(host: &mut Host, run: &WindowRun) -> Result<WindowRan> {
     }
     // The last frames' photons come after the loop: what's shown within a moment counts.
     let until = Instant::now() + Duration::from_millis(250);
-    while !app.waiting.is_empty() && Instant::now() < until {
+    while app.pacer.any_waiting() && Instant::now() < until {
         std::thread::sleep(Duration::from_millis(5));
         app.note_shown();
     }

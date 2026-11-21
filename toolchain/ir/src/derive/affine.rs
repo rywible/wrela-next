@@ -102,8 +102,7 @@ pub(super) fn affine(
         }
         Err(e) => return Err(e),
     };
-    let gpu = target == Target::Gpu;
-    let tiny = if gpu { 1.2e-38 } else { 1.0e-45 };
+    let tiny = tiny(target);
     let mut params = func.params[..xi].to_vec();
     params.push(Param::value("over", box_ty));
     let mut g = Function::new(format!("{}_affine", func.name), params, Some(interval_ty));
@@ -358,13 +357,18 @@ impl Builder for Af<'_> {
     }
 }
 
+/// The least positive float a target keeps: the GPU flushes subnormals to zero.
+fn tiny(target: Target) -> f64 {
+    if target == Target::Gpu { 1.2e-38 } else { 1.0e-45 }
+}
+
 impl Af<'_> {
     fn gpu(&self) -> bool {
         self.target == Target::Gpu
     }
 
     fn tiny(&self) -> f64 {
-        if self.gpu() { 1.2e-38 } else { 1.0e-45 }
+        tiny(self.target)
     }
 
     /// `(cpu, gpu)` ulps as an error factor on this target.
@@ -1731,7 +1735,7 @@ impl Af<'_> {
             Expr::Unary(op, _) => format!("{op:?}"),
             _ => unreachable!("an operation"),
         };
-        let key = format!("{shape}{tys:?}{ty:?}{active:?}");
+        let key = (shape.clone(), tys.clone(), ty, active.clone());
         let w = match self.cache.affine_ops.get(&key) {
             Some(&w) => w,
             None => {

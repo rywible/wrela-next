@@ -23,7 +23,7 @@
 //!
 //! Memory model `Logical GLSL450`, as wgpu's host enables no Vulkan memory model.
 
-use crate::Checks;
+use crate::{Checks, analysis};
 use spirv::{
     BuiltIn, Capability, Decoration, Dim, ExecutionMode, ExecutionModel, GlslStd450Op as GLOp,
     ImageFormat, Op, StorageClass,
@@ -40,15 +40,10 @@ type Word = u32;
 pub const LANGUAGE: (u8, u8) = (1, 6);
 
 /// Module `m` as SPIR-V's words in bytes (little-endian) for pipeline `p`, each of its bindings
-/// at the Vulkan binding [`wrela_abi::vulkan::descriptor`] gives it, with `promise` on its
-/// fragment shader's depth and `checks` written in; and its entry points' names.
-pub fn write(
-    m: &ir::Module,
-    p: &Pipeline,
-    promise: Option<ir::DepthPromise>,
-    checks: Checks,
-) -> R<(Vec<u8>, Vec<String>)> {
-    let mut w = Writer::new(m, p, promise, checks);
+/// at the Vulkan binding [`wrela_abi::vulkan::descriptor`] gives it, with `checks` written in;
+/// and its entry points' names.
+pub fn write(m: &ir::Module, p: &Pipeline, checks: Checks) -> R<(Vec<u8>, Vec<String>)> {
+    let mut w = Writer::new(m, p, checks);
     w.module()?;
     let words = w.finish();
     Ok((words.iter().flat_map(|w| w.to_le_bytes()).collect(), w.entry_names))
@@ -127,7 +122,6 @@ struct Value {
 struct Writer<'m> {
     m: &'m ir::Module,
     p: &'m Pipeline,
-    promise: Option<ir::DepthPromise>,
     checks: Checks,
     /// What the compiler proves of the checks: the ones it makes unneeded are left out.
     proofs: wrela_ir::work::Proofs,
@@ -161,22 +155,12 @@ struct Writer<'m> {
 }
 
 impl<'m> Writer<'m> {
-    fn new(
-        m: &'m ir::Module,
-        p: &'m Pipeline,
-        promise: Option<ir::DepthPromise>,
-        checks: Checks,
-    ) -> Writer<'m> {
+    fn new(m: &'m ir::Module, p: &'m Pipeline, checks: Checks) -> Writer<'m> {
         let mut w = Writer {
             m,
             p,
-            promise,
             checks,
-            proofs: if checks.unchecked() {
-                wrela_ir::work::Proofs::default()
-            } else {
-                wrela_ir::work::proofs(m)
-            },
+            proofs: analysis::proofs(m, checks),
             layouts: WgslLayouts::default(),
             next: 1,
             capabilities: BTreeSet::new(),
@@ -192,7 +176,7 @@ impl<'m> Writer<'m> {
             ir_types: HashMap::new(),
             resources: vec![None; m.resources.len()],
             function_ids: Vec::new(),
-            uses: Vec::new(),
+            uses: analysis::resource_uses(m),
             entry_names: Vec::new(),
             blocks: BTreeSet::new(),
             push: None,
@@ -201,7 +185,6 @@ impl<'m> Writer<'m> {
         w.glsl = w.id();
         w.capability(Capability::Shader);
         w.function_ids = (0..m.functions.len()).map(|_| w.id()).collect();
-        w.uses = resource_uses(m);
         w
     }
 
@@ -361,7 +344,8 @@ impl<'m> Writer<'m> {
 
     /// IR type `t`: `laid` with its offsets and strides (in a buffer), else without.
     fn ty(&mut self, t: ir::TypeId, laid: bool) -> R<Word> {
-        let types = &self.m.types;
+        let m = self.m;
+        let types = &m.types;
         // Only aggregates carry a layout.
         let laid = laid
             && matches!(
@@ -371,7 +355,7 @@ impl<'m> Writer<'m> {
         if let Some(&id) = self.ir_types.get(&(t, laid)) {
             return Ok(id);
         }
-        let id = match types.get(t).clone() {
+        let id = match *types.get(t) {
             ir::TypeDef::Scalar(s) | ir::TypeDef::Atomic(s) => self.scalar_ty(s)?,
             ir::TypeDef::Vector(s, n) => {
                 let c = self.scalar_ty(s)?;
@@ -394,8 +378,7 @@ impl<'m> Writer<'m> {
                 self.type_id(TypeKey::RuntimeArray(elem, stride))
             }
             ir::TypeDef::Struct { ref name, .. } | ir::TypeDef::Enum { ref name, .. } => {
-                let name = name.clone();
-                self.struct_ty(t, laid, &name)?
+                self.struct_ty(t, laid, name)?
             }
             ir::TypeDef::Run(_) | ir::TypeDef::Ptr(_) => {
                 return Err("internal: a CPU-only type in GPU code".into());
@@ -405,27 +388,11 @@ impl<'m> Writer<'m> {
         Ok(id)
     }
 
-    /// The members of a struct, or of an enum as the GPU holds it: its tag, then each payload.
-    fn members(&self, t: ir::TypeId) -> R<Vec<(String, ir::TypeId)>> {
-        let types = &self.m.types;
-        match types.get(t) {
-            ir::TypeDef::Struct { fields, .. } => {
-                Ok(fields.iter().map(|(n, f)| (n.clone(), *f)).collect())
-            }
-            ir::TypeDef::Enum { variants, .. } => {
-                let tag = types.field(t, 0).ok_or("internal: an enum's tag type")?;
-                Ok(std::iter::once(("tag".to_string(), tag))
-                    .chain(variants.iter().filter_map(|(v, p)| Some((v.clone(), (*p)?))))
-                    .collect())
-            }
-            _ => Err("internal: members of a type that has none".into()),
-        }
-    }
-
     /// Struct `t`, its members' types first; laid out, with each member's offset (and a
     /// matrix's stride).
     fn struct_ty(&mut self, t: ir::TypeId, laid: bool, name: &str) -> R<Word> {
-        let members = self.members(t)?;
+        let m = self.m;
+        let members = m.types.gpu_members(t).ok_or("internal: members of a type that has none")?;
         let mut ids = Vec::with_capacity(members.len());
         for (_, mt) in &members {
             ids.push(self.ty(*mt, laid)?);
@@ -543,7 +510,8 @@ impl<'m> Writer<'m> {
     /// Constant value `v` of IR type `t`, plain.
     fn const_value(&mut self, t: ir::TypeId, v: &ir::ConstValue) -> R<Word> {
         let ty = self.ty(t, false)?;
-        match (self.m.types.get(t).clone(), v) {
+        let m = self.m;
+        match (m.types.get(t), v) {
             (ir::TypeDef::Scalar(_), ir::ConstValue::Scalar(c)) => self.scalar_const(c),
             (ir::TypeDef::Vector(..), ir::ConstValue::Parts(parts)) => {
                 let mut ids = Vec::new();
@@ -556,7 +524,7 @@ impl<'m> Writer<'m> {
                 Ok(self.constant(ConstKey::Composite(ty, ids)))
             }
             (ir::TypeDef::Array(e, _), ir::ConstValue::Parts(parts)) => {
-                let ids = parts.iter().map(|p| self.const_value(e, p)).collect::<R<Vec<_>>>()?;
+                let ids = parts.iter().map(|p| self.const_value(*e, p)).collect::<R<Vec<_>>>()?;
                 Ok(self.constant(ConstKey::Composite(ty, ids)))
             }
             (ir::TypeDef::Struct { fields, .. }, ir::ConstValue::Parts(parts)) => {
@@ -773,32 +741,8 @@ impl<'m> Writer<'m> {
         }) {
             self.capability(Capability::Float16);
         }
-        let entries: std::collections::HashSet<ir::FuncId> =
-            m.entry_points.iter().map(|e| e.function).collect();
         // The functions that stay calls, callees first.
-        let mut done = std::collections::HashSet::new();
-        let mut order = Vec::new();
-        fn helpers_of(
-            m: &ir::Module,
-            f: ir::FuncId,
-            entries: &std::collections::HashSet<ir::FuncId>,
-            done: &mut std::collections::HashSet<ir::FuncId>,
-            order: &mut Vec<ir::FuncId>,
-        ) {
-            if !done.insert(f) {
-                return;
-            }
-            for g in ir::visit::calls(&m.functions[f.index()].body) {
-                helpers_of(m, g, entries, done, order);
-            }
-            if !entries.contains(&f) {
-                order.push(f);
-            }
-        }
-        for e in &m.entry_points {
-            helpers_of(m, e.function, &entries, &mut done, &mut order);
-        }
-        for f in order {
+        for f in analysis::helpers(m) {
             let words = FunctionWriter::write(self, f, None)?;
             self.functions.extend(words);
         }
@@ -808,48 +752,6 @@ impl<'m> Writer<'m> {
         }
         Ok(())
     }
-}
-
-/// The resources each function uses, directly or through its calls.
-fn resource_uses(m: &ir::Module) -> Vec<BTreeSet<usize>> {
-    let direct: Vec<BTreeSet<usize>> = m
-        .functions
-        .iter()
-        .map(|f| {
-            let mut used = BTreeSet::new();
-            ir::visit::walk(&f.body, &mut |s| {
-                s.for_each_place(&mut |p| {
-                    if let ir::PlaceRoot::Resource(r) = p.root {
-                        used.insert(r.index());
-                    }
-                });
-                if let Some(e) = s.expr() {
-                    match e {
-                        ir::Expr::Texture(_, t, s, _) => {
-                            used.insert(t.index());
-                            if let Some(s) = s {
-                                used.insert(s.index());
-                            }
-                        }
-                        ir::Expr::TextureStore(t, _) => {
-                            used.insert(t.index());
-                        }
-                        _ => {}
-                    }
-                }
-            });
-            used
-        })
-        .collect();
-    (0..m.functions.len())
-        .map(|f| {
-            let mut all = direct[f].clone();
-            for g in ir::visit::reachable(m, ir::FuncId(f as u32), &[]) {
-                all.extend(direct[g.index()].iter().copied());
-            }
-            all
-        })
-        .collect()
 }
 
 fn image_dim(dim: ir::TexDim) -> (Dim, bool) {
@@ -919,8 +821,8 @@ struct FunctionWriter<'a, 'm> {
     outputs: Option<Outputs>,
     /// The global variables the entry point reaches: its interface.
     interface: BTreeSet<Word>,
-    /// The integer constants among its values.
-    consts: HashMap<ir::ValueId, i64>,
+    /// The constants among its values (`ir::counted::constants`).
+    consts: HashMap<ir::ValueId, ir::Const>,
     /// The variable each table is stored into before a read.
     table_vars: HashMap<ir::DataId, Word>,
     /// Each texture or sampler of the device's table it reaches: a pointer to its element, made
@@ -956,7 +858,7 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
             frag_coord: None,
             outputs: None,
             interface: BTreeSet::new(),
-            consts: HashMap::new(),
+            consts: ir::counted::constants(f),
             table_vars: HashMap::new(),
             elements: HashMap::new(),
         };
@@ -1126,7 +1028,7 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
     fn stmt(&mut self, s: &ir::Stmt, lt: Option<LoopTargets>) -> R<()> {
         match s {
             ir::Stmt::Let(v, e) => {
-                if self.uses[v.index()] == 0 && pure(e) {
+                if self.uses[v.index()] == 0 && analysis::pure(e) {
                     return Ok(());
                 }
                 let value = self.value(*v, e)?;
@@ -1337,16 +1239,6 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
     }
 }
 
-/// Whether `e` only computes, with nothing to do if nothing reads it.
-fn pure(e: &ir::Expr) -> bool {
-    e.only_computes()
-        && !matches!(
-            e,
-            ir::Expr::ExtractDyn(..)
-                | ir::Expr::Builtin(ir::Builtin::Dpdx | ir::Builtin::Dpdy | ir::Builtin::Fwidth, _)
-        )
-}
-
 // ---- entry points ------------------------------------------------------------------------------------
 
 impl<'m> FunctionWriter<'_, 'm> {
@@ -1376,7 +1268,6 @@ impl<'m> FunctionWriter<'_, 'm> {
         let u3 = self.w.vec_ty(u, 3);
         let f = self.w.f32_ty();
         let f4 = self.w.vec_ty(f, 4);
-        let mut local_index = None;
         for b in &e.inputs {
             use ir::BuiltinInput as B;
             if in_varyings(b) {
@@ -1421,7 +1312,6 @@ impl<'m> FunctionWriter<'_, 'm> {
                         BuiltIn::LocalInvocationIndex,
                         "local_index",
                     );
-                    local_index = Some(var);
                     let index = self.op(Op::Load, u, &[var]);
                     let zero = self.w.const_u32(0);
                     let b = self.w.bool_ty();
@@ -1449,7 +1339,8 @@ impl<'m> FunctionWriter<'_, 'm> {
                 let mut vars = Vec::new();
                 let mut location = 0;
                 for (k, v) in varyings.iter().enumerate() {
-                    let pt = part_ty(&self.w.m.types, rt, &v.path)?;
+                    let pt =
+                        self.w.m.types.part_at(rt, &v.path).ok_or("internal: a varying's path")?;
                     let t = self.w.ty(pt, false)?;
                     if v.position {
                         vars.push(self.builtin_var(
@@ -1489,7 +1380,12 @@ impl<'m> FunctionWriter<'_, 'm> {
                             self.varyings_in.push(None);
                             continue;
                         }
-                        let pt = part_ty(&self.w.m.types, *vt, &v.path)?;
+                        let pt = self
+                            .w
+                            .m
+                            .types
+                            .part_at(*vt, &v.path)
+                            .ok_or("internal: a varying's path")?;
                         let t = self.w.ty(pt, false)?;
                         let var = self.io_var(StorageClass::Input, t, &format!("v{k}"));
                         self.w.decorate(var, Decoration::Location, &[location]);
@@ -1514,7 +1410,6 @@ impl<'m> FunctionWriter<'_, 'm> {
                 self.outputs = Some(Outputs::Fragment { colours, depth });
             }
         }
-        let _ = local_index;
         Ok(())
     }
 
@@ -1560,7 +1455,7 @@ impl<'m> FunctionWriter<'_, 'm> {
         let mut id = value;
         let mut t = t;
         for &k in path {
-            let member = member(&self.w.m.types, t, k);
+            let member = self.w.m.types.gpu_member(t, k);
             let next = self.w.m.types.part(t, k).ok_or("internal: a varying's path")?;
             let nt = self.w.ty(next, false)?;
             id = self.op(Op::CompositeExtract, nt, &[id, member]);
@@ -1613,7 +1508,7 @@ impl<'m> FunctionWriter<'_, 'm> {
         };
         let mut parts = Vec::with_capacity(n as usize);
         for k in 0..n {
-            let pt = part_ty(&self.w.m.types, t, &[k])?;
+            let pt = self.w.m.types.part(t, k).ok_or("internal: a varying's path")?;
             path.push(k);
             parts.push(self.rebuild(map, pt, path)?);
             path.pop();
@@ -1643,7 +1538,7 @@ impl<'m> FunctionWriter<'_, 'm> {
                 ));
             }
             ir::Stage::Vertex { .. } => {}
-            ir::Stage::Fragment { depth, .. } => {
+            ir::Stage::Fragment { depth, promise, .. } => {
                 self.w
                     .execution_modes
                     .extend(inst(Op::ExecutionMode, &[fid, ExecutionMode::OriginUpperLeft as u32]));
@@ -1652,7 +1547,8 @@ impl<'m> FunctionWriter<'_, 'm> {
                         Op::ExecutionMode,
                         &[fid, ExecutionMode::DepthReplacing as u32],
                     ));
-                    if let Some(p) = self.w.promise {
+                    // Conservative depth: never nearer than the triangle's.
+                    if let Some(p) = promise {
                         let mode = match p {
                             ir::DepthPromise::Greater => ExecutionMode::DepthGreater,
                             ir::DepthPromise::Less => ExecutionMode::DepthLess,
@@ -1663,33 +1559,6 @@ impl<'m> FunctionWriter<'_, 'm> {
             }
         }
         Ok(())
-    }
-}
-
-/// The struct member that holds field `k` of a value of type `t`: for an enum, its tag, or the
-/// payload of variant `k - 1` among the variants that have one.
-fn member(types: &ir::Types, t: ir::TypeId, k: u32) -> u32 {
-    match types.get(t) {
-        ir::TypeDef::Enum { variants, .. } if k > 0 => {
-            1 + variants[..k as usize - 1].iter().filter(|(_, p)| p.is_some()).count() as u32
-        }
-        _ => k,
-    }
-}
-
-/// The type of the part of a value of type `t` at `path`: field indexes, then a matrix column's.
-fn part_ty(types: &ir::Types, t: ir::TypeId, path: &[u32]) -> R<ir::TypeId> {
-    path.iter()
-        .try_fold(t, |t, &k| types.part(t, k))
-        .ok_or_else(|| "internal: a varying's path".to_string())
-}
-
-/// How many elements an index into a value of type `t` can reach, when the type says.
-fn static_len(types: &ir::Types, t: ir::TypeId) -> Option<u32> {
-    match types.get(t) {
-        ir::TypeDef::Array(_, n) => Some(*n),
-        ir::TypeDef::Vector(_, n) | ir::TypeDef::Matrix(n, _) => Some(u32::from(*n)),
-        _ => None,
     }
 }
 
@@ -1713,7 +1582,7 @@ impl FunctionWriter<'_, '_> {
         if !self.w.checks.bounds {
             return Ok(id);
         }
-        if let (Some(n), Some(k)) = (len, self.consts.get(&i).copied())
+        if let (Some(n), Some(k)) = (len, analysis::const_int(&self.consts, i))
             && (0..i64::from(n)).contains(&k)
         {
             return Ok(self.w.const_u32(k as u32));
@@ -1791,7 +1660,7 @@ impl FunctionWriter<'_, '_> {
                     t = Some(elem);
                 }
                 (ir::Proj::Field(k), Some(pt)) => {
-                    indices.push(self.w.const_u32(member(&m.types, pt, *k)));
+                    indices.push(self.w.const_u32(m.types.gpu_member(pt, *k)));
                     t = m.proj_ty(pt, proj);
                 }
                 (ir::Proj::Comp(c), Some(pt)) => {
@@ -1799,7 +1668,7 @@ impl FunctionWriter<'_, '_> {
                     t = m.proj_ty(pt, proj);
                 }
                 (ir::Proj::Index(i), Some(pt)) => {
-                    let len = static_len(&m.types, pt);
+                    let len = m.types.index_len(pt);
                     indices.push(self.index(*i, len, None)?);
                     t = m.proj_ty(pt, proj);
                 }
@@ -1883,7 +1752,7 @@ impl FunctionWriter<'_, '_> {
             let nt = self.w.ty(next, false)?;
             id = match proj {
                 ir::Proj::Field(k) => {
-                    self.op(Op::CompositeExtract, nt, &[id, member(&m.types, t, *k)])
+                    self.op(Op::CompositeExtract, nt, &[id, m.types.gpu_member(t, *k)])
                 }
                 ir::Proj::Comp(c) => self.op(Op::CompositeExtract, nt, &[id, u32::from(*c)]),
                 ir::Proj::Index(v) => self.dynamic_part(id, t, *v)?,
@@ -1897,7 +1766,7 @@ impl FunctionWriter<'_, '_> {
     /// `OpVectorExtractDynamic`; an array's or a matrix's through a variable it's stored in.
     fn dynamic_part(&mut self, base: Word, t: ir::TypeId, i: ir::ValueId) -> R<Word> {
         let m = self.w.m;
-        let len = static_len(&m.types, t);
+        let len = m.types.index_len(t);
         let index = self.index(i, len, None)?;
         let elem = m.proj_ty(t, &ir::Proj::Index(i)).ok_or("internal: an element's type")?;
         let et = self.w.ty(elem, false)?;
@@ -1921,18 +1790,7 @@ impl FunctionWriter<'_, '_> {
         let m = self.w.m;
         let computed = |id| Value { id, constant: false };
         Ok(match e {
-            ir::Expr::Const(c) => {
-                match c {
-                    ir::Const::I32(x) => {
-                        self.consts.insert(v, i64::from(*x));
-                    }
-                    ir::Const::U32(x) => {
-                        self.consts.insert(v, i64::from(*x));
-                    }
-                    _ => {}
-                }
-                Value { id: self.w.scalar_const(c)?, constant: true }
-            }
+            ir::Expr::Const(c) => Value { id: self.w.scalar_const(c)?, constant: true },
             ir::Expr::Zero(zt) => {
                 let ty = self.w.ty(*zt, false)?;
                 Value { id: self.w.null(ty), constant: true }
@@ -2019,7 +1877,7 @@ impl FunctionWriter<'_, '_> {
                 let xt = self.ty_of(*x);
                 let base = self.val(*x)?;
                 let ty = self.w.ty(t, false)?;
-                let index = member(&m.types, xt, *i);
+                let index = m.types.gpu_member(xt, *i);
                 computed(self.op(Op::CompositeExtract, ty, &[base, index]))
             }
             ir::Expr::Variant(et, k, payload) => {
@@ -2124,7 +1982,6 @@ impl FunctionWriter<'_, '_> {
         use ir::Scalar as S;
         Ok(match (from, s) {
             (S::Bool, _) => {
-                let st = self.w.scalar_ty(s)?;
                 let (one, zero) = match s {
                     S::F32 => (self.w.const_f32(1.0), self.w.const_f32(0.0)),
                     S::I32 => (self.w.const_i32(1), self.w.const_i32(0)),
@@ -2139,7 +1996,6 @@ impl FunctionWriter<'_, '_> {
                     }
                     _ => return Err(format!("internal: bool to {s:?}")),
                 };
-                let _ = st;
                 let (one, zero) = (self.w.splat_const(ty, one, n), self.w.splat_const(ty, zero, n));
                 self.op(Op::Select, ty, &[id, one, zero])
             }
@@ -2199,15 +2055,15 @@ impl FunctionWriter<'_, '_> {
         let m = self.w.m;
         let ty = self.w.ty(t, false)?;
         let (l, r) = (self.val(a)?, self.val(b)?);
-        let (ta, tb) = (m.types.get(self.ty_of(a)).clone(), m.types.get(self.ty_of(b)).clone());
+        let (ta, tb) = (m.types.get(self.ty_of(a)), m.types.get(self.ty_of(b)));
         let scalar = self.scalar_of(a);
         let float = scalar.is_some_and(|s| s.is_float());
         let signed = scalar == Some(ir::Scalar::I32);
         let boolean = scalar == Some(ir::Scalar::Bool);
         let is_matrix = |d: &ir::TypeDef| matches!(d, ir::TypeDef::Matrix(..));
         // Matrices: by columns, or the products SPIR-V has.
-        if is_matrix(&ta) || is_matrix(&tb) {
-            return Ok(match (op, &ta, &tb) {
+        if is_matrix(ta) || is_matrix(tb) {
+            return Ok(match (op, ta, tb) {
                 (B::Mul, ir::TypeDef::Matrix(..), ir::TypeDef::Matrix(..)) => {
                     self.op(Op::MatrixTimesMatrix, ty, &[l, r])
                 }
@@ -2345,7 +2201,6 @@ impl FunctionWriter<'_, '_> {
 
     fn builtin(&mut self, b: ir::Builtin, args: &[ir::ValueId], t: ir::TypeId) -> R<Word> {
         use ir::Builtin as B;
-        let m = self.w.m;
         let ty = self.w.ty(t, false)?;
         let ids = args.iter().map(|a| self.val(*a)).collect::<R<Vec<_>>>()?;
         let a0 = args.first().copied().ok_or("internal: a builtin with no argument")?;
@@ -2480,7 +2335,6 @@ impl FunctionWriter<'_, '_> {
                     B::Normalize => GLOp::Normalize,
                     _ => return Err(format!("internal: the builtin {b:?}")),
                 };
-                let _ = m;
                 self.ext(gl, ty, &ids)
             }
         })
@@ -2655,23 +2509,14 @@ impl FunctionWriter<'_, '_> {
     /// A texture's image, loaded from its variable, and its type.
     fn image(&mut self, tex: ir::ResourceId) -> R<(Word, Word)> {
         let var = self.texture_var(tex.index())?;
-        let res = &self.w.m.resources[tex.index()];
-        let ty = match res.kind {
-            ir::ResourceKind::Texture { depth, dim, format } => {
-                let sampled = if ir::texel_scalar(format) == ir::Scalar::U32 && !depth {
-                    self.w.u32_ty()
-                } else {
-                    self.w.f32_ty()
-                };
-                let (d, arrayed) = image_dim(dim);
-                self.w.type_id(TypeKey::Image { sampled, dim: d, depth, arrayed, storage: None })
-            }
+        match self.w.m.resources[tex.index()].kind {
+            ir::ResourceKind::Texture { .. } => {}
             ir::ResourceKind::StorageTexture { .. } => {
-                // Declared by `resource`; its type is the variable's pointee.
                 return Err("internal: a storage texture read".into());
             }
             _ => return Err("internal: an image of something that isn't a texture".into()),
-        };
+        }
+        let (ty, _) = self.w.pointee(tex.index())?;
         Ok((self.op(Op::Load, ty, &[var]), ty))
     }
 
@@ -2828,40 +2673,12 @@ impl FunctionWriter<'_, '_> {
 
     /// A texel's write (`ir::Expr::TextureStore`).
     fn texture_store(&mut self, tex: ir::ResourceId, args: &[ir::ValueId]) -> R<()> {
-        let m = self.w.m;
         let var = self.texture_var(tex.index())?;
-        let (dim, format) = match m.resources[tex.index()].kind {
-            ir::ResourceKind::StorageTexture { dim, format } => (dim, format),
-            _ => {
-                return Err(
-                    "internal: a texel write of something that isn't a storage texture".into()
-                );
-            }
-        };
-        let sampled = if ir::texel_scalar(format) == ir::Scalar::U32 {
-            self.w.u32_ty()
-        } else {
-            self.w.f32_ty()
-        };
-        let storage = match format {
-            ir::TextureFormat::Rgba8 => ImageFormat::Rgba8,
-            ir::TextureFormat::Rgba16Float => ImageFormat::Rgba16f,
-            ir::TextureFormat::R16Float => ImageFormat::R16f,
-            ir::TextureFormat::R32Float => ImageFormat::R32f,
-            ir::TextureFormat::R32Uint => ImageFormat::R32ui,
-            ir::TextureFormat::Rg32Float => ImageFormat::Rg32f,
-            ir::TextureFormat::Rgba32Float => ImageFormat::Rgba32f,
-            ir::TextureFormat::Rg32Uint => ImageFormat::Rg32ui,
-            f => return Err(format!("internal: kernels can't write a {f:?} texture")),
-        };
-        let (d, arrayed) = image_dim(dim);
-        let ity = self.w.type_id(TypeKey::Image {
-            sampled,
-            dim: d,
-            depth: false,
-            arrayed,
-            storage: Some(storage),
-        });
+        if !matches!(self.w.m.resources[tex.index()].kind, ir::ResourceKind::StorageTexture { .. })
+        {
+            return Err("internal: a texel write of something that isn't a storage texture".into());
+        }
+        let (ity, _) = self.w.pointee(tex.index())?;
         let image = self.op(Op::Load, ity, &[var]);
         let Some((&value, xs)) = args.split_last() else {
             return Err("internal: a texel's write without its arguments".into());

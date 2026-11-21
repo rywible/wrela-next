@@ -660,6 +660,14 @@ impl<'c, 'a> Fl<'c, 'a> {
         Repr::Sub(ir::Place::root(ir::PlaceRoot::Resource(r)), start, count)
     }
 
+    /// A re-based span argument's start and count (locals `start` and `count`), pushed onto
+    /// `out` as the two values [`Fl::sub_params`] binds.
+    fn sub_args(&mut self, start: ir::LocalId, count: ir::LocalId, out: &mut Vec<ir::Arg>) {
+        let u = self.mb.m.types.u32();
+        out.push(ir::Arg::Value(self.load(ir::Place::local(start), u)));
+        out.push(ir::Arg::Value(self.load(ir::Place::local(count), u)));
+    }
+
     /// Binds MIR local `l` to IR parameter `k` ([`Fl::param_repr`]).
     fn bind_param(&mut self, l: Local, k: u32) {
         self.locals[l.index()] = self.param_repr(k);
@@ -1783,10 +1791,7 @@ impl<'c, 'a> Fl<'c, 'a> {
                     Repr::Sub(ir::Place { root: ir::PlaceRoot::Resource(id), path }, s, n)
                         if path.is_empty() =>
                     {
-                        let u = self.mb.m.types.u32();
-                        let (s, n) = (*s, *n);
-                        out.push(ir::Arg::Value(self.load(ir::Place::local(s), u)));
-                        out.push(ir::Arg::Value(self.load(ir::Place::local(n), u)));
+                        self.sub_args(*s, *n, out);
                         bs.push(Some(Bound::Sub(*id)));
                     }
                     _ => return None,
@@ -2740,9 +2745,7 @@ impl<'c, 'a> Fl<'c, 'a> {
                 && pl.path.is_empty()
             {
                 // A re-based span: its buffer, and its start and count as values.
-                let u = self.mb.m.types.u32();
-                out.push(ir::Arg::Value(self.load(ir::Place::local(s), u)));
-                out.push(ir::Arg::Value(self.load(ir::Place::local(n), u)));
+                self.sub_args(s, n, &mut out);
                 resources.push(Some(Bound::Sub(id)));
                 continue;
             }

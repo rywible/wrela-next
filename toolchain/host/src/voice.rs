@@ -16,6 +16,7 @@
 //! against the time its buffer plays: a callback that takes longer is a glitch a person hears.
 
 use crate::Error;
+use crate::locked;
 use crate::program::Voice;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -137,7 +138,7 @@ impl Playing {
     /// Stops the device: the voice back (if it didn't trap), its trap, and what it played.
     pub(crate) fn stop(self) -> (Option<Voice>, Option<wasmtime::Error>, Played) {
         drop(self.stream);
-        let mut s = self.shared.lock().unwrap_or_else(|p| p.into_inner());
+        let mut s = locked(&self.shared);
         let played = Played {
             device: self.device,
             channels: self.channels,
@@ -148,7 +149,7 @@ impl Playing {
             worst: s.worst,
             over: s.over,
             busy: self.counters.busy.load(Ordering::Relaxed),
-            errors: std::mem::take(&mut *self.errors.lock().unwrap_or_else(|p| p.into_inner())),
+            errors: std::mem::take(&mut *locked(&self.errors)),
         };
         (s.voice.take(), s.trap.take(), played)
     }
@@ -207,9 +208,7 @@ pub(crate) fn play(
         s.over += u64::from(share > 1.0);
     };
     let error = move |err: cpal::Error| {
-        if let Ok(mut e) = e.lock() {
-            e.push(err.to_string());
-        }
+        locked(&e).push(err.to_string());
     };
     let stream = match device.build_output_stream::<f32, _, _>(config, data, error, None) {
         Ok(s) => s,
@@ -223,7 +222,7 @@ pub(crate) fn play(
 }
 
 fn take_back(shared: &Mutex<Shared>) -> Voice {
-    let mut s = shared.lock().unwrap_or_else(|p| p.into_inner());
+    let mut s = locked(shared);
     s.voice.take().expect("the voice was put there")
 }
 

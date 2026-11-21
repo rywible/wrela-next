@@ -36,6 +36,9 @@ const CHUNK_BRICKS: u32 = 1024
 const CULL_CHUNK: u32 = 8192
 /// Maximum sharp-crease cells refined per chunk (`(bi << 9) | cell`, 32 KB).
 const CAP_CREASES: u32 = 8192
+/// Lipschitz bound at unit scale above which a field counts as steep (noise-displaced rock):
+/// its bricks get a finer interval check and its cells a finer spacing.
+const STEEP_LIPSCHITZ: f32 = 1.05
 /// Every cell of a full chunk (`(bi << 9) | cell`, 1.4 MB): the compacted list of sign-changing
 /// cells can never overflow, so no surface cell is ever dropped.
 const CAP_SURF: u32 = CHUNK_BRICKS * VERTS_BRICK
@@ -68,6 +71,49 @@ pub struct GridSpec: Copy + GpuData {
     pub base_brick: u32,
 }
 
+/// Coordinate `axis` (`0..3`) of `p`.
+fn along(p: vec3, axis: u32) -> f32 {
+    if axis == 0 {
+        p.x
+    } else if axis == 1 {
+        p.y
+    } else {
+        p.z
+    }
+}
+
+/// `p` with coordinate `axis` (`0..3`) set to `x`.
+fn with_along(p: vec3, axis: u32, x: f32) -> vec3 {
+    vec3(
+        if axis == 0 { x } else { p.x },
+        if axis == 1 { x } else { p.y },
+        if axis == 2 { x } else { p.z },
+    )
+}
+
+/// Binary-searches the lower (or `upper`) face of box `(lo, hi)` along `axis` inward (8 steps)
+/// while the slab it sweeps provably holds no surface, returning the face's new coordinate.
+fn shrink<M: Field<Substance>>(field: M, lo: vec3, hi: vec3, axis: u32, upper: bool) -> f32 {
+    var a = along(lo, axis)
+    var c = along(hi, axis)
+    for _step in 0..8 {
+        let mid = 0.5 * (a + c)
+        let slab = if upper {
+            Box3 { lo: with_along(lo, axis, mid), hi }
+        } else {
+            Box3 { lo, hi: with_along(hi, axis, mid) }
+        }
+        let iv = field.interval_near(slab)
+        let empty = iv.lo > 0.0 || iv.hi < 0.0
+        if upper {
+            if empty { c = mid } else { a = mid }
+        } else {
+            if empty { a = mid } else { c = mid }
+        }
+    }
+    if upper { c } else { a }
+}
+
 /// Tightens a thing's bounding sphere into a tight axis-aligned box on the CPU using
 /// `field.interval_near` (8 binary-search steps per face = 48 Lipschitz-narrowed interval queries).
 pub fn tight_aabb<M: Field<Substance>>(field: M) -> Box3 {
@@ -75,58 +121,10 @@ pub fn tight_aabb<M: Field<Substance>>(field: M) -> Box3 {
     let r = min(b.radius, 1.0e4)
     var lo = b.centre - vec3(r)
     var hi = b.centre + vec3(r)
-    // Binary-search each of the 6 faces inward while the sliced slab's interval excludes zero.
-    var a = lo.x
-    var c = hi.x
-    for _step in 0..8 {
-        let mid = 0.5 * (a + c)
-        let iv = field.interval_near(Box3 { lo: vec3(lo.x, lo.y, lo.z), hi: vec3(mid, hi.y, hi.z) })
-        if iv.lo > 0.0 || iv.hi < 0.0 { a = mid } else { c = mid }
+    for axis in 0..3 {
+        lo = with_along(lo, axis, shrink(field, lo, hi, axis, upper: false))
+        hi = with_along(hi, axis, shrink(field, lo, hi, axis, upper: true))
     }
-    lo.x = a
-    a = lo.x
-    c = hi.x
-    for _step in 0..8 {
-        let mid = 0.5 * (a + c)
-        let iv = field.interval_near(Box3 { lo: vec3(mid, lo.y, lo.z), hi: vec3(hi.x, hi.y, hi.z) })
-        if iv.lo > 0.0 || iv.hi < 0.0 { c = mid } else { a = mid }
-    }
-    hi.x = c
-
-    a = lo.y
-    c = hi.y
-    for _step in 0..8 {
-        let mid = 0.5 * (a + c)
-        let iv = field.interval_near(Box3 { lo: vec3(lo.x, lo.y, lo.z), hi: vec3(hi.x, mid, hi.z) })
-        if iv.lo > 0.0 || iv.hi < 0.0 { a = mid } else { c = mid }
-    }
-    lo.y = a
-    a = lo.y
-    c = hi.y
-    for _step in 0..8 {
-        let mid = 0.5 * (a + c)
-        let iv = field.interval_near(Box3 { lo: vec3(lo.x, mid, lo.z), hi: vec3(hi.x, hi.y, hi.z) })
-        if iv.lo > 0.0 || iv.hi < 0.0 { c = mid } else { a = mid }
-    }
-    hi.y = c
-
-    a = lo.z
-    c = hi.z
-    for _step in 0..8 {
-        let mid = 0.5 * (a + c)
-        let iv = field.interval_near(Box3 { lo: vec3(lo.x, lo.y, lo.z), hi: vec3(hi.x, hi.y, mid) })
-        if iv.lo > 0.0 || iv.hi < 0.0 { a = mid } else { c = mid }
-    }
-    lo.z = a
-    a = lo.z
-    c = hi.z
-    for _step in 0..8 {
-        let mid = 0.5 * (a + c)
-        let iv = field.interval_near(Box3 { lo: vec3(lo.x, lo.y, mid), hi: vec3(hi.x, hi.y, hi.z) })
-        if iv.lo > 0.0 || iv.hi < 0.0 { c = mid } else { a = mid }
-    }
-    hi.z = c
-
     Box3 { lo, hi }
 }
 
@@ -147,6 +145,11 @@ fn grid_for(aabb: Box3, cell: f32, base_brick: u32) -> GridSpec {
 fn safe_norm(v: vec3, fallback: vec3) -> vec3 {
     let l2 = dot(v, v)
     if l2 > 1.0e-12 { v * (1.0 / sqrt(l2)) } else { fallback }
+}
+
+/// Whether `field` is steep enough (`STEEP_LIPSCHITZ`) to need finer culling and cells.
+pub fn steep<M: Field<Substance>>(field: M) -> bool {
+    field.lipschitz(1.0) > STEEP_LIPSCHITZ
 }
 
 /// Finds which thing owns global brick index `gb` by binary search over `grids[i].base_brick`.
@@ -200,7 +203,7 @@ fn cull_bricks<M: Field<Substance>>(
         var hit = true
         // For high-steepness fields (e.g. noise-displaced rock), run a sound 8-octant interval
         // check to discard conservative false-positive empty bricks without missing any surface.
-        if fields[ti].lipschitz(1.0) > 1.05 {
+        if steep(fields[ti]) {
             hit = false
             let mid = 0.5 * (lo + hi)
             for oct in 0..8 {
@@ -282,16 +285,76 @@ fn cdist(corners: [f32], base: u32, x: u32, y: u32, z: u32) -> f32 {
     corners[base + x + (y << 3) + (z << 6)]
 }
 
-/// Trilinear gradient of a cell's 8 corner distances at local `(u, v, w)` in `[0, 1]³`.
-fn tri_grad(
-    d000: f32, d100: f32, d010: f32, d110: f32,
-    d001: f32, d101: f32, d011: f32, d111: f32,
-    u: f32, v: f32, w: f32,
-) -> vec3 {
-    let gx = mix(mix(d100 - d000, d110 - d010, v), mix(d101 - d001, d111 - d011, v), w)
-    let gy = mix(mix(d010 - d000, d110 - d100, u), mix(d011 - d001, d111 - d101, u), w)
-    let gz = mix(mix(d001 - d000, d101 - d100, u), mix(d011 - d010, d111 - d110, u), v)
-    vec3(gx, gy, gz)
+/// Local cell `(x, y, z)` in `0..7` of packed cell index `cell` (`x + 7y + 49z`).
+fn decode_cell(cell: u32) -> (u32, u32, u32) {
+    let cz = cell / 49
+    let rem = cell - cz * 49
+    let cy = rem / 7
+    let cx = rem - cy * 7
+    (cx, cy, cz)
+}
+
+/// The 8 corner distances of one cell (`dXYZ` at local corner `(X, Y, Z)`).
+struct CellCorners: Copy {
+    d000: f32,
+    d100: f32,
+    d010: f32,
+    d110: f32,
+    d001: f32,
+    d101: f32,
+    d011: f32,
+    d111: f32,
+}
+
+/// Loads the 8 corner distances of local cell `(cx, cy, cz)` of the brick whose corners start
+/// at `cbase`.
+fn load_corners(corners: [f32], cbase: u32, cx: u32, cy: u32, cz: u32) -> CellCorners {
+    CellCorners {
+        d000: cdist(corners, cbase, cx, cy, cz),
+        d100: cdist(corners, cbase, cx + 1, cy, cz),
+        d010: cdist(corners, cbase, cx, cy + 1, cz),
+        d110: cdist(corners, cbase, cx + 1, cy + 1, cz),
+        d001: cdist(corners, cbase, cx, cy, cz + 1),
+        d101: cdist(corners, cbase, cx + 1, cy, cz + 1),
+        d011: cdist(corners, cbase, cx, cy + 1, cz + 1),
+        d111: cdist(corners, cbase, cx + 1, cy + 1, cz + 1),
+    }
+}
+
+impl CellCorners {
+    /// The `k`-th corner (`0..8`, bit 0 = x, bit 1 = y, bit 2 = z).
+    fn at(self, k: u32) -> f32 {
+        if k == 0 {
+            self.d000
+        } else if k == 1 {
+            self.d100
+        } else if k == 2 {
+            self.d010
+        } else if k == 3 {
+            self.d110
+        } else if k == 4 {
+            self.d001
+        } else if k == 5 {
+            self.d101
+        } else if k == 6 {
+            self.d011
+        } else {
+            self.d111
+        }
+    }
+
+    /// Trilinear gradient of the corner distances at local `uvw` in `[0, 1]³`.
+    fn grad(self, uvw: vec3) -> vec3 {
+        let u = uvw.x
+        let v = uvw.y
+        let w = uvw.z
+        let (d000, d100, d010, d110) = (self.d000, self.d100, self.d010, self.d110)
+        let (d001, d101, d011, d111) = (self.d001, self.d101, self.d011, self.d111)
+        let gx = mix(mix(d100 - d000, d110 - d010, v), mix(d101 - d001, d111 - d011, v), w)
+        let gy = mix(mix(d010 - d000, d110 - d100, u), mix(d011 - d001, d111 - d101, u), w)
+        let gz = mix(mix(d001 - d000, d101 - d100, u), mix(d011 - d010, d111 - d110, u), v)
+        vec3(gx, gy, gz)
+    }
 }
 
 /// Corner coordinates of local cell corner `k` in `0..8`.
@@ -299,28 +362,148 @@ fn corner_uvw(k: u32) -> vec3 {
     vec3(f32(k & 1), f32((k >> 1) & 1), f32((k >> 2) & 1))
 }
 
-/// Reads the `k`-th corner (`0..8`) from the 8 unpacked values.
-fn corner_val(
-    d000: f32, d100: f32, d010: f32, d110: f32,
-    d001: f32, d101: f32, d011: f32, d111: f32,
-    k: u32,
-) -> f32 {
-    if k == 0 {
-        d000
-    } else if k == 1 {
-        d100
-    } else if k == 2 {
-        d010
-    } else if k == 3 {
-        d110
-    } else if k == 4 {
-        d001
-    } else if k == 5 {
-        d101
-    } else if k == 6 {
-        d011
-    } else {
-        d111
+/// A cell's Dual Contouring QEF: the symmetric 3×3 normal equations `A x = b` of its Hermite
+/// samples in local cell coordinates relative to the cell centre `(0.5, 0.5, 0.5)`, their mass
+/// point and summed normal, and how far their normals spread (`min_dot`, to find sharp creases).
+struct Qef: Copy {
+    a00: f32,
+    a01: f32,
+    a02: f32,
+    a11: f32,
+    a12: f32,
+    a22: f32,
+    bx: f32,
+    by: f32,
+    bz: f32,
+    mass: vec3,
+    avg_n: vec3,
+    count: u32,
+    first_n: vec3,
+    min_dot: f32,
+}
+
+/// A QEF with no samples.
+fn qef_empty() -> Qef {
+    Qef {
+        a00: 0.0,
+        a01: 0.0,
+        a02: 0.0,
+        a11: 0.0,
+        a12: 0.0,
+        a22: 0.0,
+        bx: 0.0,
+        by: 0.0,
+        bz: 0.0,
+        mass: vec3(0.0),
+        avg_n: vec3(0.0),
+        count: 0,
+        first_n: vec3(0.0),
+        min_dot: 1.0,
+    }
+}
+
+impl Qef {
+    /// Adds the Hermite sample at local `uvw` with unit normal `n`.
+    fn add(mut self, uvw: vec3, n: vec3) {
+        let q = uvw - vec3(0.5)
+        let dp = dot(n, q)
+        self.a00 += n.x * n.x
+        self.a01 += n.x * n.y
+        self.a02 += n.x * n.z
+        self.a11 += n.y * n.y
+        self.a12 += n.y * n.z
+        self.a22 += n.z * n.z
+        self.bx += n.x * dp
+        self.by += n.y * dp
+        self.bz += n.z * dp
+        self.mass += uvw
+        self.avg_n += n
+        if self.count == 0 {
+            self.first_n = n
+        } else {
+            self.min_dot = min(self.min_dot, dot(self.first_n, n))
+        }
+        self.count += 1
+    }
+
+    /// The local `uvw` (clamped to the cell) minimising the QEF, with Tikhonov regularisation of
+    /// weight `reg_per` per sample toward the mass point: it keeps the nullspace centred while
+    /// sharp edges still solve.
+    fn solve(self, reg_per: f32) -> vec3 {
+        let half = vec3(0.5)
+        let inv_c = 1.0 / max(f32(self.count), 1.0)
+        let mp = self.mass * inv_c
+        let mp_rel = mp - half
+        let reg = reg_per * f32(self.count)
+        let a00 = self.a00 + reg
+        let a01 = self.a01
+        let a02 = self.a02
+        let a11 = self.a11 + reg
+        let a12 = self.a12
+        let a22 = self.a22 + reg
+        let rhs = vec3(self.bx + mp_rel.x * reg, self.by + mp_rel.y * reg, self.bz + mp_rel.z * reg)
+
+        // Closed-form symmetric 3×3 solve via cofactors (always SPD since reg > 0).
+        let c00 = a11 * a22 - a12 * a12
+        let c01 = a02 * a12 - a01 * a22
+        let c02 = a01 * a12 - a02 * a11
+        let c11 = a00 * a22 - a02 * a02
+        let c12 = a01 * a02 - a00 * a12
+        let c22 = a00 * a11 - a01 * a01
+        let det = a00 * c00 + a01 * c01 + a02 * c02
+        let sol = if det > 1.0e-12 {
+            vec3(
+                c00 * rhs.x + c01 * rhs.y + c02 * rhs.z,
+                c01 * rhs.x + c11 * rhs.y + c12 * rhs.z,
+                c02 * rhs.x + c12 * rhs.y + c22 * rhs.z,
+            ) / det
+        } else {
+            mp_rel
+        }
+        clamp(sol + half, vec3(0.0), vec3(1.0))
+    }
+}
+
+/// One Newton step from `wp` (where the field is `dv` with gradient `gv`) onto the field's
+/// zero-isosurface, kept only if it stays inside the cell `cell_lo + [0, h]³`.
+fn newton_snap(wp: vec3, dv: f32, gv: vec3, cell_lo: vec3, h: f32) -> vec3 {
+    var out = wp
+    let g2 = dot(gv, gv)
+    if g2 > 1.0e-8 {
+        let step = clamp(dv / g2, -0.75 * h, 0.75 * h)
+        let cand = wp - gv * step
+        let rel = (cand - cell_lo) / h
+        if rel.x >= 0.0 && rel.x <= 1.0 && rel.y >= 0.0 && rel.y <= 1.0 && rel.z >= 0.0 && rel.z <= 1.0 {
+            out = cand
+        }
+    }
+    out
+}
+
+/// Pushes the cell's dual vertex at `wp` (normal from the field gradient `gv`, else the QEF's
+/// summed normal; substance from `f`) and records its index in `cell_verts[slot]`.
+fn push_vertex<M: Field<Substance>>(
+    f: M,
+    wp: vec3,
+    gv: vec3,
+    qef: Qef,
+    slot: u32,
+    cap_verts: u32,
+    verts: mut Append<MeshVertex>,
+    cell_verts: mut Atomics<u32>,
+) {
+    let n_final = safe_norm(gv, safe_norm(qef.avg_n, vec3(0.0, 1.0, 0.0)))
+    let sub = f.channels(wp)
+    let smooth = if qef.min_dot >= 0.88 { 1.0 } else { 0.0 }
+    let vi = verts.push(MeshVertex {
+        pos: vec4(wp, smooth),
+        normal: vec4(n_final, sub.roughness),
+        albedo: vec4(sub.albedo, sub.metallic),
+        emits: vec4(sub.emits, sub.ior),
+        optics: vec4(sub.transmission, sub.subsurface, sub.coat, sub.micro),
+    })
+    if vi < cap_verts {
+        cell_verts.store(i: slot, value: vi)
     }
 }
 
@@ -347,10 +530,7 @@ fn classify_cells(
         return
     }
     cell_verts[id] = NONE
-    let cz = cell / 49
-    let rem = cell - cz * 49
-    let cy = rem / 7
-    let cx = rem - cy * 7
+    let (cx, cy, cz) = decode_cell(cell)
     let cbase = bi * CORNERS_BRICK
     var neg: u32 = 0
     for k in 0..8 {
@@ -389,19 +569,8 @@ fn solve_verts<M: Field<Substance>>(
     let packed = surf[id.x]
     let bi = packed >> 9
     let cell = packed & 511
-    let cz = cell / 49
-    let rem = cell - cz * 49
-    let cy = rem / 7
-    let cx = rem - cy * 7
-    let cbase = bi * CORNERS_BRICK
-    let d000 = cdist(corners, cbase, cx, cy, cz)
-    let d100 = cdist(corners, cbase, cx + 1, cy, cz)
-    let d010 = cdist(corners, cbase, cx, cy + 1, cz)
-    let d110 = cdist(corners, cbase, cx + 1, cy + 1, cz)
-    let d001 = cdist(corners, cbase, cx, cy, cz + 1)
-    let d101 = cdist(corners, cbase, cx + 1, cy, cz + 1)
-    let d011 = cdist(corners, cbase, cx, cy + 1, cz + 1)
-    let d111 = cdist(corners, cbase, cx + 1, cy + 1, cz + 1)
+    let (cx, cy, cz) = decode_cell(cell)
+    let d = load_corners(corners, bi * CORNERS_BRICK, cx, cy, cz)
 
     let ab = active[bi]
     let b = ab.coord
@@ -409,138 +578,49 @@ fn solve_verts<M: Field<Substance>>(
     let h = g.cell
     let bspan = h * f32(BRICK)
     let cell_lo = g.origin + vec3(f32(b.x), f32(b.y), f32(b.z)) * bspan + vec3(f32(cx), f32(cy), f32(cz)) * h
-    let half = vec3(0.5)
 
     // 12 edges of the cube (pairs of corner indices 0..8).
     let e0 = [0, 2, 4, 6, 0, 1, 4, 5, 0, 1, 2, 3]
     let e1 = [1, 3, 5, 7, 2, 3, 6, 7, 4, 5, 6, 7]
 
-    // Accumulate symmetric 3×3 QEF in local cell coordinates relative to cell center (0.5, 0.5, 0.5).
-    var a00 = 0.0
-    var a01 = 0.0
-    var a02 = 0.0
-    var a11 = 0.0
-    var a12 = 0.0
-    var a22 = 0.0
-    var bx_v = 0.0
-    var by_v = 0.0
-    var bz_v = 0.0
-    var mass = vec3(0.0)
-    var avg_n = vec3(0.0)
-    var count: u32 = 0
-
-    // Measure normal spread across crossed edges to detect sharp creases.
-    var first_n = vec3(0.0)
-    var min_dot = 1.0
+    var qef = qef_empty()
 
     let f = fields[b.w]
     // Fast pass: accumulate QEF from cell-local trilinear gradients (0 extra field samples).
     for e in 0..12 {
         let i0 = e0[e]
         let i1 = e1[e]
-        let v0 = corner_val(d000, d100, d010, d110, d001, d101, d011, d111, i0)
-        let v1 = corner_val(d000, d100, d010, d110, d001, d101, d011, d111, i1)
+        let v0 = d.at(i0)
+        let v1 = d.at(i1)
         if (v0 < 0.0) != (v1 < 0.0) {
             let t = clamp(v0 / (v0 - v1), 0.0, 1.0)
             let uvw = mix(corner_uvw(i0), corner_uvw(i1), t)
-            let n = safe_norm(tri_grad(d000, d100, d010, d110, d001, d101, d011, d111, uvw.x, uvw.y, uvw.z), vec3(0.0, 1.0, 0.0))
-            let q = uvw - half
-            let dp = dot(n, q)
-            a00 += n.x * n.x
-            a01 += n.x * n.y
-            a02 += n.x * n.z
-            a11 += n.y * n.y
-            a12 += n.y * n.z
-            a22 += n.z * n.z
-            bx_v += n.x * dp
-            by_v += n.y * dp
-            bz_v += n.z * dp
-            mass += uvw
-            avg_n += n
-            if count == 0 {
-                first_n = n
-            } else {
-                min_dot = min(min_dot, dot(first_n, n))
-            }
-            count += 1
+            let n = safe_norm(d.grad(uvw), vec3(0.0, 1.0, 0.0))
+            qef.add(uvw, n)
         }
     }
 
     // Sharp crease/corner cells get their one vertex from exact Hermite edge refinement in a
     // separate compacted pass, so smooth cells keep minimal registers and zero divergence.
-    if min_dot < 0.78 {
+    if qef.min_dot < 0.78 {
         if creases.push(packed) < CAP_CREASES {
             return
         }
     }
 
-    let inv_c = 1.0 / max(f32(count), 1.0)
-    let mp = mass * inv_c
-    let mp_rel = mp - half
-
-    // Tikhonov regularization toward mass point: keeps nullspace centered while solving sharp edges.
-    let reg = 0.04 * f32(count)
-    a00 += reg
-    a11 += reg
-    a22 += reg
-    bx_v += mp_rel.x * reg
-    by_v += mp_rel.y * reg
-    bz_v += mp_rel.z * reg
-
-    // Closed-form symmetric 3×3 solve via cofactors (always SPD since reg > 0).
-    let c00 = a11 * a22 - a12 * a12
-    let c01 = a02 * a12 - a01 * a22
-    let c02 = a01 * a12 - a02 * a11
-    let c11 = a00 * a22 - a02 * a02
-    let c12 = a01 * a02 - a00 * a12
-    let c22 = a00 * a11 - a01 * a01
-    let det = a00 * c00 + a01 * c01 + a02 * c02
-    let rhs = vec3(bx_v, by_v, bz_v)
-    let sol = if det > 1.0e-12 {
-        vec3(
-            c00 * rhs.x + c01 * rhs.y + c02 * rhs.z,
-            c01 * rhs.x + c11 * rhs.y + c12 * rhs.z,
-            c02 * rhs.x + c12 * rhs.y + c22 * rhs.z,
-        ) / det
-    } else {
-        mp_rel
-    }
-    let uvw_qef = clamp(sol + half, vec3(0.0), vec3(1.0))
-    var wp = cell_lo + uvw_qef * h
+    let wp = cell_lo + qef.solve(0.04) * h
 
     // 1-step exact Newton projection onto the field zero-isosurface (stays clamped inside cell).
     // Only the brick's live parts are asked: bit for bit the full distance inside the brick.
     let live = ab.live
     let (dv, gv) = value_and_gradient(|q| f.distance_live(q, live), wp)
-    let g2 = dot(gv, gv)
-    if g2 > 1.0e-8 {
-        let step = clamp(dv / g2, -0.75 * h, 0.75 * h)
-        let cand = wp - gv * step
-        let rel = (cand - cell_lo) / h
-        if rel.x >= 0.0 && rel.x <= 1.0 && rel.y >= 0.0 && rel.y <= 1.0 && rel.z >= 0.0 && rel.z <= 1.0 {
-            wp = cand
-        }
-    }
-
-    let n_final = safe_norm(gv, safe_norm(avg_n, vec3(0.0, 1.0, 0.0)))
-    let sub = f.channels(wp)
-    let smooth = if min_dot >= 0.88 { 1.0 } else { 0.0 }
-
-    let vi = verts.push(MeshVertex {
-        pos: vec4(wp, smooth),
-        normal: vec4(n_final, sub.roughness),
-        albedo: vec4(sub.albedo, sub.metallic),
-        emits: vec4(sub.emits, sub.ior),
-        optics: vec4(sub.transmission, sub.subsurface, sub.coat, sub.micro),
-    })
-    if vi < cap_verts {
-        cell_verts.store(i: bi * VERTS_STRIDE + cell, value: vi)
-    }
+    let snapped = newton_snap(wp, dv, gv, cell_lo, h)
+    push_vertex(f, snapped, gv, qef, bi * VERTS_STRIDE + cell, cap_verts, mut verts, mut cell_verts)
 }
 
 /// Prepares indirect dispatch args for a 64-wide pass over a compacted list (clamped to `cap`).
 @compute(1)
-fn prep_list(count: [u32], cap: u32, args: mut One<DispatchArgs>, id: GlobalId) {
+pub fn prep_list(count: [u32], cap: u32, args: mut One<DispatchArgs>, id: GlobalId) {
     let n = min(count[0], cap)
     args.set(id, DispatchArgs { x: (n + 63) / 64, y: 1, z: 1 })
 }
@@ -568,19 +648,8 @@ fn refine_creases<M: Field<Substance>>(
     let packed = creases[id.x]
     let bi = packed >> 9
     let cell = packed & 511
-    let cz = cell / 49
-    let rem = cell - cz * 49
-    let cy = rem / 7
-    let cx = rem - cy * 7
-    let cbase = bi * CORNERS_BRICK
-    let d000 = cdist(corners, cbase, cx, cy, cz)
-    let d100 = cdist(corners, cbase, cx + 1, cy, cz)
-    let d010 = cdist(corners, cbase, cx, cy + 1, cz)
-    let d110 = cdist(corners, cbase, cx + 1, cy + 1, cz)
-    let d001 = cdist(corners, cbase, cx, cy, cz + 1)
-    let d101 = cdist(corners, cbase, cx + 1, cy, cz + 1)
-    let d011 = cdist(corners, cbase, cx, cy + 1, cz + 1)
-    let d111 = cdist(corners, cbase, cx + 1, cy + 1, cz + 1)
+    let (cx, cy, cz) = decode_cell(cell)
+    let d = load_corners(corners, bi * CORNERS_BRICK, cx, cy, cz)
 
     let ab = active[bi]
     let b = ab.coord
@@ -588,31 +657,17 @@ fn refine_creases<M: Field<Substance>>(
     let h = g.cell
     let bspan = h * f32(BRICK)
     let cell_lo = g.origin + vec3(f32(b.x), f32(b.y), f32(b.z)) * bspan + vec3(f32(cx), f32(cy), f32(cz)) * h
-    let half = vec3(0.5)
     let e0 = [0, 2, 4, 6, 0, 1, 4, 5, 0, 1, 2, 3]
     let e1 = [1, 3, 5, 7, 2, 3, 6, 7, 4, 5, 6, 7]
 
-    var a00 = 0.0
-    var a01 = 0.0
-    var a02 = 0.0
-    var a11 = 0.0
-    var a12 = 0.0
-    var a22 = 0.0
-    var bx_v = 0.0
-    var by_v = 0.0
-    var bz_v = 0.0
-    var mass = vec3(0.0)
-    var avg_n = vec3(0.0)
-    var count: u32 = 0
-    var first_n = vec3(0.0)
-    var min_dot = 1.0
+    var qef = qef_empty()
 
     let f = fields[b.w]
     for e in 0..12 {
         let i0 = e0[e]
         let i1 = e1[e]
-        let v0 = corner_val(d000, d100, d010, d110, d001, d101, d011, d111, i0)
-        let v1 = corner_val(d000, d100, d010, d110, d001, d101, d011, d111, i1)
+        let v0 = d.at(i0)
+        let v1 = d.at(i1)
         if (v0 < 0.0) != (v1 < 0.0) {
             let p0 = corner_uvw(i0)
             let p1 = corner_uvw(i1)
@@ -625,89 +680,40 @@ fn refine_creases<M: Field<Substance>>(
                 let t1 = clamp(t0 - edv / edot, 0.0, 1.0)
                 uvw = mix(p0, p1, t1)
             }
-            let n = safe_norm(egv, safe_norm(tri_grad(d000, d100, d010, d110, d001, d101, d011, d111, uvw.x, uvw.y, uvw.z), vec3(0.0, 1.0, 0.0)))
-            let q = uvw - half
-            let dp = dot(n, q)
-            a00 += n.x * n.x
-            a01 += n.x * n.y
-            a02 += n.x * n.z
-            a11 += n.y * n.y
-            a12 += n.y * n.z
-            a22 += n.z * n.z
-            bx_v += n.x * dp
-            by_v += n.y * dp
-            bz_v += n.z * dp
-            mass += uvw
-            avg_n += n
-            if count == 0 {
-                first_n = n
-            } else {
-                min_dot = min(min_dot, dot(first_n, n))
-            }
-            count += 1
+            let n = safe_norm(egv, safe_norm(d.grad(uvw), vec3(0.0, 1.0, 0.0)))
+            qef.add(uvw, n)
         }
     }
 
-    let inv_c = 1.0 / max(f32(count), 1.0)
-    let mp = mass * inv_c
-    let mp_rel = mp - half
-    let reg = 0.002 * f32(count)
-    a00 += reg
-    a11 += reg
-    a22 += reg
-    bx_v += mp_rel.x * reg
-    by_v += mp_rel.y * reg
-    bz_v += mp_rel.z * reg
-
-    let c00 = a11 * a22 - a12 * a12
-    let c01 = a02 * a12 - a01 * a22
-    let c02 = a01 * a12 - a02 * a11
-    let c11 = a00 * a22 - a02 * a02
-    let c12 = a01 * a02 - a00 * a12
-    let c22 = a00 * a11 - a01 * a01
-    let det = a00 * c00 + a01 * c01 + a02 * c02
-    let rhs = vec3(bx_v, by_v, bz_v)
-    let sol = if det > 1.0e-12 {
-        vec3(
-            c00 * rhs.x + c01 * rhs.y + c02 * rhs.z,
-            c01 * rhs.x + c11 * rhs.y + c12 * rhs.z,
-            c02 * rhs.x + c12 * rhs.y + c22 * rhs.z,
-        ) / det
-    } else {
-        mp_rel
-    }
-    let uvw_qef = clamp(sol + half, vec3(0.0), vec3(1.0))
-    var wp = cell_lo + uvw_qef * h
-
+    let wp = cell_lo + qef.solve(0.002) * h
     let (dv, gv) = f.sample(wp)
-    let g2 = dot(gv, gv)
-    if g2 > 1.0e-8 {
-        let step = clamp(dv / g2, -0.75 * h, 0.75 * h)
-        let cand = wp - gv * step
-        let rel = (cand - cell_lo) / h
-        if rel.x >= 0.0 && rel.x <= 1.0 && rel.y >= 0.0 && rel.y <= 1.0 && rel.z >= 0.0 && rel.z <= 1.0 {
-            wp = cand
-        }
-    }
-
-    let n_final = safe_norm(gv, safe_norm(avg_n, vec3(0.0, 1.0, 0.0)))
-    let sub = f.channels(wp)
-    let smooth = if min_dot >= 0.88 { 1.0 } else { 0.0 }
-    let vi = verts.push(MeshVertex {
-        pos: vec4(wp, smooth),
-        normal: vec4(n_final, sub.roughness),
-        albedo: vec4(sub.albedo, sub.metallic),
-        emits: vec4(sub.emits, sub.ior),
-        optics: vec4(sub.transmission, sub.subsurface, sub.coat, sub.micro),
-    })
-    if vi < cap_verts {
-        cell_verts.store(i: bi * VERTS_STRIDE + cell, value: vi)
-    }
+    let snapped = newton_snap(wp, dv, gv, cell_lo, h)
+    push_vertex(f, snapped, gv, qef, bi * VERTS_STRIDE + cell, cap_verts, mut verts, mut cell_verts)
 }
 
 /// Dual vertex index of local cell `(x, y, z)` in `0..7` inside brick `bi`.
 fn cv(cell_verts: [u32], base: u32, x: u32, y: u32, z: u32) -> u32 {
     cell_verts[base + x + y * 7 + z * 49]
+}
+
+/// Stores quad `(v0, v1, v2, v3)` as 2 triangles (6 indices) at `at`, wound CCW, or the other
+/// way when `flip`.
+fn store_quad(indices: mut Atomics<u32>, at: u32, v0: u32, v1: u32, v2: u32, v3: u32, flip: bool) {
+    if !flip {
+        indices.store(i: at, value: v0)
+        indices.store(i: at + 1, value: v1)
+        indices.store(i: at + 2, value: v2)
+        indices.store(i: at + 3, value: v0)
+        indices.store(i: at + 4, value: v2)
+        indices.store(i: at + 5, value: v3)
+    } else {
+        indices.store(i: at, value: v0)
+        indices.store(i: at + 1, value: v3)
+        indices.store(i: at + 2, value: v2)
+        indices.store(i: at + 3, value: v0)
+        indices.store(i: at + 4, value: v2)
+        indices.store(i: at + 5, value: v1)
+    }
 }
 
 /// Emits one quad (2 triangles = 6 indices) with consistent outward CCW winding into either the
@@ -734,41 +740,13 @@ fn emit_quad(
         if at + 6 > cap_indices {
             return
         }
-        if !flip {
-            indices.store(i: at, value: v0)
-            indices.store(i: at + 1, value: v1)
-            indices.store(i: at + 2, value: v2)
-            indices.store(i: at + 3, value: v0)
-            indices.store(i: at + 4, value: v2)
-            indices.store(i: at + 5, value: v3)
-        } else {
-            indices.store(i: at, value: v0)
-            indices.store(i: at + 1, value: v3)
-            indices.store(i: at + 2, value: v2)
-            indices.store(i: at + 3, value: v0)
-            indices.store(i: at + 4, value: v2)
-            indices.store(i: at + 5, value: v1)
-        }
+        store_quad(mut indices, at, v0, v1, v2, v3, flip: flip)
     } else {
         let at = tri_count.add(i: 1, value: 6)
         if at + 6 > cap_trans {
             return
         }
-        if !flip {
-            trans_indices.store(i: at, value: v0)
-            trans_indices.store(i: at + 1, value: v1)
-            trans_indices.store(i: at + 2, value: v2)
-            trans_indices.store(i: at + 3, value: v0)
-            trans_indices.store(i: at + 4, value: v2)
-            trans_indices.store(i: at + 5, value: v3)
-        } else {
-            trans_indices.store(i: at, value: v0)
-            trans_indices.store(i: at + 1, value: v3)
-            trans_indices.store(i: at + 2, value: v2)
-            trans_indices.store(i: at + 3, value: v0)
-            trans_indices.store(i: at + 4, value: v2)
-            trans_indices.store(i: at + 5, value: v1)
-        }
+        store_quad(mut trans_indices, at, v0, v1, v2, v3, flip: flip)
     }
 }
 

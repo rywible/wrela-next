@@ -18,15 +18,12 @@ fn no_kernel_copies_the_uniform_body() {
     let pkg = wrela_tests::repo_root().join("toolchain/tests/copies");
     for target in [wrela_abi::Target::Metal, wrela_abi::Target::Vulkan] {
         let built = wrela_tests::build_for(&pkg, target).expect("builds");
-        let file =
-            |name: &str| built.files.iter().find(|(n, _)| n == name).map(|(_, b)| b).expect(name);
-        let manifest = wrela_abi::Manifest::parse(&String::from_utf8_lossy(file("manifest.json")))
-            .expect("valid");
+        let manifest = wrela_tests::built_manifest(&built);
         for k in KERNELS {
             let p = manifest.pipelines.iter().find(|p| p.name == k).expect(k);
             assert_eq!(p.kept, 0, "{k} ({target:?}) keeps {} bytes", p.kept);
             if target == wrela_abi::Target::Metal {
-                let msl = String::from_utf8_lossy(file(&p.shader));
+                let msl = String::from_utf8_lossy(wrela_tests::file(&built, &p.shader));
                 let copies =
                     msl.lines().filter(|l| l.contains("_Body ") && l.contains('=')).count();
                 assert_eq!(copies, 0, "{k}'s MSL copies a Body:\n{msl}");

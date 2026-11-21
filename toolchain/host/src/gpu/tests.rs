@@ -76,101 +76,56 @@ fn the_present_pass_draws_the_screen_into_a_frame() {
     let texels: Vec<u8> = (0..w * h)
         .flat_map(|i| [(i * 7) as u8, (i * 13 + 5) as u8, (i % 251) as u8, 255 - i as u8])
         .collect();
-    let src = device.create_texture(&wrela_gpu::TextureDesc {
-        label: "screen",
+    let desc = |label, format, usage| wrela_gpu::TextureDesc {
+        label,
         width: w,
         height: h,
         depth_or_layers: 1,
         levels: 1,
         dimension: wrela_gpu::TextureDimension::D2,
-        format: TextureFormat::Rgba8,
-        usage: wrela_gpu::TextureUsage { sampled: true, copy_dst: true, ..Default::default() },
+        format,
+        usage,
         samples: 1,
         transient: false,
-    });
+    };
+    let usage = wrela_gpu::TextureUsage { sampled: true, copy_dst: true, ..Default::default() };
+    let (src, src_view) = attachment(&device, &desc("screen", TextureFormat::Rgba8, usage));
     let at =
         wrela_gpu::TextureCopy { texture: &src, level: 0, origin: [0, 0, 0], depth_only: false };
     device.write_texture(at, &texels, w * 4, h, [w, h, 1]);
-    let view = |t: &wrela_gpu::Texture| {
-        t.create_view(&wrela_gpu::ViewDesc {
-            dimension: wrela_gpu::ViewDimension::D2,
-            base_level: 0,
-            level_count: Some(1),
-            base_layer: 0,
-            layer_count: Some(1),
-        })
-    };
     for format in [TextureFormat::Rgba8, TextureFormat::Rgba16Float] {
         let (pipeline, layout) = present_pipeline(&device, format).unwrap();
-        let dst = device.create_texture(&wrela_gpu::TextureDesc {
-            label: "frame",
-            width: w,
-            height: h,
-            depth_or_layers: 1,
-            levels: 1,
-            dimension: wrela_gpu::TextureDimension::D2,
-            format,
-            usage: wrela_gpu::TextureUsage { render: true, copy_src: true, ..Default::default() },
-            samples: 1,
-            transient: false,
-        });
-        let cb = draw_presented(&device, &pipeline, &layout, &view(&src), &view(&dst));
-        let texel = format.bytes_per_texel();
-        let row = align_to(u64::from(w * texel), 256) as u32;
-        let read = readback_buffer(&device, u64::from(row * h));
-        let mut enc = device.create_command_encoder("read");
-        enc.copy_texture_to_buffer(
-            wrela_gpu::TextureCopy {
-                texture: &dst,
-                level: 0,
-                origin: [0, 0, 0],
-                depth_only: false,
-            },
-            wrela_gpu::BufferCopy {
-                buffer: &read,
-                offset: 0,
-                bytes_per_row: row,
-                rows_per_image: h,
-            },
-            [w, h, 1],
-        );
-        device.submit(vec![cb, enc.finish()]);
-        let bytes = map_read(&device, &read).unwrap();
-        let got: Vec<u8> = (0..h as usize)
-            .flat_map(|y| {
-                let line = &bytes[y * row as usize..][..(w * texel) as usize];
-                line.chunks(texel as usize).flat_map(|t| as_rgba8(format, t)).collect::<Vec<_>>()
-            })
-            .collect();
+        let usage = wrela_gpu::TextureUsage { render: true, copy_src: true, ..Default::default() };
+        let (dst, dst_view) = attachment(&device, &desc("frame", format, usage));
+        device.submit(vec![draw_presented(&device, &pipeline, &layout, &src_view, &dst_view)]);
+        let raw = read_rows(&device, &mut None, &dst, 0, [0, 0, 0], [w, h], format).unwrap();
+        let texel = format.bytes_per_texel() as usize;
+        let got: Vec<u8> = raw.chunks(texel).flat_map(|t| as_rgba8(format, t)).collect();
         assert_eq!(got, texels, "{format:?}");
         assert!(device.take_errors().is_empty());
     }
 }
 
+/// A mappable buffer's bytes, once the GPU is done with what's submitted.
+fn map_read(device: &wrela_gpu::Device, buffer: &wrela_gpu::Buffer) -> Result<Vec<u8>> {
+    map_read_with(device, buffer, buffer.size(), <[u8]>::to_vec)
+}
+
 /// A build of one compute pipeline, `increment`, that adds one to its buffer's first word.
 fn increment() -> (Manifest, [Vec<u8>; 1]) {
     let mut manifest = Manifest::new("game.wasm");
-    manifest.pipelines.push(Pipeline {
-        name: "increment".into(),
-        shader: "increment.metal".into(),
-        stage: Stage::Compute { entry: "increment".into(), workgroup_size: [1, 1, 1] },
-        uniform: None,
-        bindings: vec![ResourceBinding {
+    manifest.pipelines.push(Pipeline::hand_written(
+        "increment",
+        Stage::Compute { entry: "increment".into(), workgroup_size: [1, 1, 1] },
+        vec![ResourceBinding {
             binding: 0,
             kind: BindingKind::ReadWrite,
             stage: wrela_abi::manifest::BindingStage::Both,
             format: None,
         }],
-        debug_flag: None,
-        requires: Vec::new(),
-        conditional: false,
-        standin: None,
-        sizes: None,
-        kept: 0,
         // Hand-written: its bound is stated here (a read, an add and a write).
-        work: vec![Some(24)],
-        unbounded: Vec::new(),
-    });
+        vec![Some(24)],
+    ));
     // `count[0] += 1u`, of a storage buffer of `u32`s at binding 0.
     use wrela_shader::build::{BinOp, Builder, Scalar};
     let mut b = Builder::new();
@@ -499,21 +454,12 @@ fn fused_or_not(checks: wrela_shader::Checks) -> (Manifest, Vec<Vec<u8>>) {
             stage: BindingStage::Both,
             format: None,
         };
-        manifest.pipelines.push(Pipeline {
-            name: name.into(),
-            shader: String::new(),
-            stage: Stage::Compute { entry: name.into(), workgroup_size: [64, 1, 1] },
-            uniform: None,
-            bindings: (0..if shared { 5 } else { 4 }).map(binding).collect(),
-            debug_flag: None,
-            requires: Vec::new(),
-            conditional: false,
-            standin: None,
-            sizes: None,
-            kept: 0,
-            work: vec![Some(64)],
-            unbounded: Vec::new(),
-        });
+        manifest.pipelines.push(Pipeline::hand_written(
+            name,
+            Stage::Compute { entry: name.into(), workgroup_size: [64, 1, 1] },
+            (0..if shared { 5 } else { 4 }).map(binding).collect(),
+            vec![Some(64)],
+        ));
         let mut b = Builder::new();
         let u = b.scalar(Scalar::U32);
         let f = b.scalar(Scalar::F32);
@@ -618,10 +564,9 @@ fn heavy_draw() -> (Manifest, [Vec<u8>; 1]) {
     use wrela_abi::manifest::{Output, RenderTarget};
     use wrela_shader::build::{BinOp, Builder, Builtin, BuiltinInput, Scalar};
     let mut manifest = Manifest::new("game.wasm");
-    manifest.pipelines.push(Pipeline {
-        name: "heavy".into(),
-        shader: String::new(),
-        stage: Stage::Render {
+    manifest.pipelines.push(Pipeline::hand_written(
+        "heavy",
+        Stage::Render {
             vertex_entry: "cover".into(),
             fragment_entry: "heavy".into(),
             blends: vec![Blend::Add],
@@ -632,62 +577,18 @@ fn heavy_draw() -> (Manifest, [Vec<u8>; 1]) {
             outputs: vec![Output::Float],
             targets: vec![RenderTarget::of(&[TextureFormat::Rgba16Float], false)],
         },
-        uniform: None,
-        bindings: Vec::new(),
-        debug_flag: None,
-        requires: Vec::new(),
-        conditional: false,
-        standin: None,
-        sizes: None,
-        kept: 0,
-        work: vec![Some(16), Some(u64::from(HEAVY_CHAIN) * 32 + 64)],
-        unbounded: Vec::new(),
-    });
+        Vec::new(),
+        vec![Some(16), Some(u64::from(HEAVY_CHAIN) * 32 + 64)],
+    ));
     let mut b = Builder::new();
     let u = b.scalar(Scalar::U32);
     let fl = b.scalar(Scalar::F32);
     let v4 = b.vector(Scalar::F32, 4);
-    b.vertex("cover", &[BuiltinInput::VertexIndex], |f| {
-        let i = f.input(0, u);
-        let one = f.u32(1);
-        let xb = f.binary(BinOp::BitAnd, i, one);
-        let yb = f.binary(BinOp::Shr, i, one);
-        let (four, minus, zero, unit) = (f.f32(4.0), f.f32(1.0), f.f32(0.0), f.f32(1.0));
-        let corner = |f: &mut wrela_shader::build::Body<'_>, bit| {
-            let v = f.convert(fl, bit, Scalar::F32);
-            let v = f.binary(BinOp::Mul, v, four);
-            f.binary(BinOp::Sub, v, minus)
-        };
-        let (x, y) = (corner(f, xb), corner(f, yb));
-        let p = f.construct(v4, &[x, y, zero, unit]);
-        f.ret_clip(p);
-    });
+    present::cover_vertex(&mut b, u, fl, v4);
     b.fragment("heavy", &[BuiltinInput::Position], |f| {
         let p = f.input(0, v4);
-        let x = f.local("x", fl);
-        let n = f.local("n", u);
-        let px = f.extract(fl, p, 0);
-        f.store(x.clone(), px);
-        let zero = f.u32(0);
-        f.store(n.clone(), zero);
-        f.loop_(|f| {
-            let c = f.load(u, n.clone());
-            let limit = f.u32(HEAVY_CHAIN);
-            let done = f.binary(BinOp::Ge, c, limit);
-            f.if_(done, |f| f.break_(), |_| {});
-            let v = f.load(fl, x.clone());
-            let s = f.builtin(fl, Builtin::Sin, &[v]);
-            let a = f.f32(0.999);
-            let m = f.binary(BinOp::Mul, s, a);
-            let b2 = f.f32(0.001);
-            let y = f.binary(BinOp::Add, m, b2);
-            f.store(x.clone(), y);
-            let one = f.u32(1);
-            let c2 = f.binary(BinOp::Add, c, one);
-            f.store(n.clone(), c2);
-        });
         // 1/64, and the chain's end kept: it's never past 2.
-        let r = f.load(fl, x);
+        let r = calibrate::sine_chain(f, u, fl, HEAVY_CHAIN, |f| f.extract(fl, p, 0));
         let two = f.f32(2.0);
         let over = f.binary(BinOp::Sub, r, two);
         let none = f.f32(0.0);
@@ -704,46 +605,45 @@ fn heavy_draw() -> (Manifest, [Vec<u8>; 1]) {
     (manifest, [shader.bytes])
 }
 
-/// One pass labelled `label` of `draws` heavy draws, each of `instances` triangles over the
-/// whole of texture 2, cleared first, then its frame's end, waited for and measured.
-fn heavy_frame(gpu: &mut Gpu, label: &str, draws: u32, instances: u32) -> Result<()> {
+/// `passes` passes labelled `label` in one frame, each of `draws` heavy draws of `instances`
+/// triangles over the whole of texture 2 (cleared first, unless `keep`), then its frame's end,
+/// waited for and measured.
+fn heavy_passes(
+    gpu: &mut Gpu,
+    label: &str,
+    passes: u32,
+    draws: u32,
+    instances: u32,
+    keep: bool,
+) -> Result<()> {
     use crate::program::Executor;
-    gpu.execute(&Command::Label { name: label })?;
-    gpu.execute(&Command::BeginPass(Pass::one(2, false, [0.0; 4])))?;
-    for _ in 0..draws {
-        gpu.execute(&Command::Draw {
-            pipeline: 0,
-            vertices: 3,
-            instances,
-            bindings: Vec::new(),
-            uniforms: &[],
-        })?;
-    }
-    gpu.execute(&Command::EndPass)?;
-    gpu.end_frame()?;
-    wait(&gpu.device)?;
-    gpu.measure()
-}
-
-/// Four passes labelled `label` in one frame, each one draw of `instances` triangles over the
-/// whole of texture 2 (kept), then its frame's end, waited for and measured.
-fn passes_frame(gpu: &mut Gpu, label: &str, instances: u32) -> Result<()> {
-    use crate::program::Executor;
-    for _ in 0..4 {
+    for _ in 0..passes {
         gpu.execute(&Command::Label { name: label })?;
-        gpu.execute(&Command::BeginPass(Pass::one(2, true, [0.0; 4])))?;
-        gpu.execute(&Command::Draw {
-            pipeline: 0,
-            vertices: 3,
-            instances,
-            bindings: Vec::new(),
-            uniforms: &[],
-        })?;
+        gpu.execute(&Command::BeginPass(Pass::one(2, keep, [0.0; 4])))?;
+        for _ in 0..draws {
+            gpu.execute(&Command::Draw {
+                pipeline: 0,
+                vertices: 3,
+                instances,
+                bindings: Vec::new(),
+                uniforms: &[],
+            })?;
+        }
         gpu.execute(&Command::EndPass)?;
     }
     gpu.end_frame()?;
-    wait(&gpu.device)?;
+    wait(&gpu.device);
     gpu.measure()
+}
+
+/// One pass labelled `label` of `draws` heavy draws ([`heavy_passes`]), cleared first.
+fn heavy_frame(gpu: &mut Gpu, label: &str, draws: u32, instances: u32) -> Result<()> {
+    heavy_passes(gpu, label, 1, draws, instances, false)
+}
+
+/// Four passes labelled `label`, each one heavy draw ([`heavy_passes`]), kept.
+fn passes_frame(gpu: &mut Gpu, label: &str, instances: u32) -> Result<()> {
+    heavy_passes(gpu, label, 4, 1, instances, true)
 }
 
 /// The pieces of the heavy pass measured since the last take: how many draws each held, and
@@ -1225,19 +1125,13 @@ fn texture_uploads_preserve_rows_rectangles_and_order() {
 #[test]
 fn a_pipelines_key_is_its_entry_and_code_not_its_files_name() {
     let p = |shader: &str, entry: &str| Pipeline {
-        name: "fill".into(),
         shader: shader.into(),
-        stage: Stage::Compute { entry: entry.into(), workgroup_size: [64, 1, 1] },
-        uniform: None,
-        bindings: Vec::new(),
-        debug_flag: None,
-        requires: Vec::new(),
-        conditional: false,
-        standin: None,
-        sizes: None,
-        kept: 0,
-        work: vec![Some(1)],
-        unbounded: Vec::new(),
+        ..Pipeline::hand_written(
+            "fill",
+            Stage::Compute { entry: entry.into(), workgroup_size: [64, 1, 1] },
+            Vec::new(),
+            vec![Some(1)],
+        )
     };
     let key = pipeline_key(&p("pipeline_0.metal", "main"), b"fn main() {}");
     assert_eq!(key, pipeline_key(&p("pipeline_3.metal", "main"), b"fn main() {}"));

@@ -32,8 +32,8 @@ pub struct Pacer {
     work: VecDeque<f64>,
     /// Present to the refresh that shows it, at the least.
     latch: f64,
-    /// Frames presented and not yet shown, by id: the refresh each aimed at, and its present.
-    waiting: BTreeMap<u64, (Option<f64>, f64)>,
+    /// Frames presented and not yet shown, by id.
+    waiting: BTreeMap<u64, Waiting>,
     last_target: Option<f64>,
     /// Frames shown on time since the latch last moved, and how many it takes to try a shorter
     /// latch (after the first miss; before it, the latch comes down fast).
@@ -46,6 +46,15 @@ pub struct Pacer {
     shown: u32,
 }
 
+/// A frame presented and not yet shown: the refresh it aimed at, when it took its input, and
+/// its present.
+#[derive(Clone, Copy)]
+struct Waiting {
+    target: Option<f64>,
+    sampled: f64,
+    presented: f64,
+}
+
 /// Frames shown unpaced at the start, as fast as the display takes them: their gaps are its
 /// refresh period (a paced frame aims at every refresh it thinks there is, so it can't see one
 /// faster).
@@ -53,6 +62,13 @@ const LEARN: u32 = 16;
 
 /// How far after its time a frame may still take its input and keep its refresh: a late wake.
 const LATE: f64 = 0.0005;
+/// How long a plan that holds a frame back (too many waiting to be shown) waits before planning
+/// again (s).
+const RETRY: f64 = 0.003;
+/// A window's loop sleeps until a frame's time only when that is more than this away (s), and
+/// then wakes [`WAKE_EARLY`] before it, since a wake can be late; nearer, it polls.
+pub(crate) const SLEEP_PAST: f64 = 0.002;
+pub(crate) const WAKE_EARLY: f64 = 0.001;
 /// Past what a missed frame needed, the latch's margin.
 const MARGIN: f64 = 0.001;
 /// A frame shown more than this after its aim was late.
@@ -105,10 +121,10 @@ impl Pacer {
             self.work_estimate() * 1e3,
             self.waiting
                 .iter()
-                .map(|(id, (aim, p))| (
+                .map(|(id, w)| (
                     *id,
-                    aim.map(|a| (a * 1e4).round() / 10.0),
-                    (p * 1e4).round() / 10.0
+                    w.target.map(|a| (a * 1e4).round() / 10.0),
+                    (w.presented * 1e4).round() / 10.0
                 ))
                 .collect::<Vec<_>>(),
             self.last_target.map(|a| (a * 1e4).round() / 10.0),
@@ -121,7 +137,7 @@ impl Pacer {
         let Some(grid) = self.grid.filter(|_| self.shown >= LEARN) else {
             // Refreshes not known yet: frames go as they're done, two waiting at the most.
             let at = if self.waiting.len() >= 2 && self.waiting_since(now) < LONGEST_WAIT {
-                now + 0.003
+                now + RETRY
             } else {
                 now
             };
@@ -133,7 +149,7 @@ impl Pacer {
         if self.waiting.len() as f64 > (need / t).ceil() + 2.0
             && self.waiting_since(now) < LONGEST_WAIT
         {
-            return Plan { at: now + 0.003, target: None };
+            return Plan { at: now + RETRY, target: None };
         }
         // The first refresh that input taken now can still make, and after the last aimed at:
         // one frame a refresh.
@@ -154,33 +170,45 @@ impl Pacer {
         if work < HITCH * self.period.min(1.0 / 30.0) {
             push(&mut self.work, work, 120);
         }
-        self.waiting_for(id, presented, target);
+        self.waiting_for(id, sampled, presented, target);
     }
 
-    /// Frame `id` was presented at `presented` after a hitch the caller knows of (a device made
-    /// again): waited for as any frame, but its work isn't learned (under `HITCH` refreshes,
-    /// it would still hold every plan back for 120 frames).
-    pub fn presented_after_hitch(&mut self, id: u64, presented: f64, target: Option<f64>) {
-        self.waiting_for(id, presented, target);
+    /// Frame `id` took its input at `sampled` and was presented at `presented` after a hitch
+    /// the caller knows of (a device made again): waited for as any frame, but its work isn't
+    /// learned (under `HITCH` refreshes, it would still hold every plan back for 120 frames).
+    pub fn presented_after_hitch(
+        &mut self,
+        id: u64,
+        sampled: f64,
+        presented: f64,
+        target: Option<f64>,
+    ) {
+        self.waiting_for(id, sampled, presented, target);
     }
 
-    fn waiting_for(&mut self, id: u64, presented: f64, target: Option<f64>) {
-        self.waiting.insert(id, (target, presented));
+    fn waiting_for(&mut self, id: u64, sampled: f64, presented: f64, target: Option<f64>) {
+        self.waiting.insert(id, Waiting { target, sampled, presented });
         if target.is_some() {
             self.last_target = target;
         }
     }
 
-    /// Frame `id` was shown at `at`. Frames are shown in order: one before it still waiting was
-    /// overtaken, and won't be.
-    pub fn shown(&mut self, id: u64, at: f64) {
+    /// Whether a frame presented is not yet shown.
+    pub fn any_waiting(&self) -> bool {
+        !self.waiting.is_empty()
+    }
+
+    /// Frame `id` was shown at `at`: when it took its input and was presented, if it was
+    /// waiting. Frames are shown in order: one before it still waiting was overtaken, and won't
+    /// be.
+    pub fn shown(&mut self, id: u64, at: f64) -> Option<(f64, f64)> {
         let overtaken: Vec<u64> = self.waiting.range(..id).map(|(&k, _)| k).collect();
         for k in overtaken {
-            if let Some((Some(target), presented)) = self.waiting.remove(&k) {
+            if let Some(Waiting { target: Some(target), presented, .. }) = self.waiting.remove(&k) {
                 self.miss(target - presented);
             }
         }
-        let Some((target, presented)) = self.waiting.remove(&id) else { return };
+        let Waiting { target, sampled, presented } = self.waiting.remove(&id)?;
         // Paced, the gaps between frames shown are the pacer's own doing (where a present
         // isn't held to a refresh, each a little late would teach it a slower one, and slower):
         // only the unpaced start says the display's period.
@@ -188,13 +216,13 @@ impl Pacer {
             let gap = at - last;
             if gap > 0.0 {
                 push(&mut self.gaps, gap, 64);
-                self.period = quantile(&self.gaps, 0.5);
+                self.period = median(self.gaps.make_contiguous());
             }
         }
         self.shown += 1;
         let Some(target) = target else {
             self.grid = Some(at);
-            return;
+            return Some((sampled, presented));
         };
         let t = self.period;
         // Each frame shown says where the refreshes are: exactly, on a display that holds
@@ -208,8 +236,8 @@ impl Pacer {
             // The frames still waiting were aimed at refreshes it took: they go a refresh
             // each after it, and the next frame after them.
             let mut next = at + t;
-            for (aim, _) in self.waiting.values_mut() {
-                if let Some(aim) = aim {
+            for w in self.waiting.values_mut() {
+                if let Some(aim) = &mut w.target {
                     *aim = aim.max(next);
                     next = *aim + t;
                 }
@@ -225,6 +253,7 @@ impl Pacer {
                 self.latch = (self.latch - step).max(0.0);
             }
         }
+        Some((sampled, presented))
     }
 
     /// A frame missed its refresh with `had` between its present and that refresh.
@@ -255,7 +284,7 @@ impl Pacer {
 
     /// How long the oldest frame not yet shown has waited since its present.
     fn waiting_since(&self, now: f64) -> f64 {
-        self.waiting.values().next().map_or(0.0, |&(_, presented)| now - presented)
+        self.waiting.values().next().map_or(0.0, |w| now - w.presented)
     }
 
     /// Input to present, as planned: the slowest of the last 120 frames, hitches aside (a slow
@@ -272,10 +301,16 @@ fn push(window: &mut VecDeque<f64>, v: f64, most: usize) {
     window.push_back(v);
 }
 
-fn quantile(window: &VecDeque<f64>, q: f64) -> f64 {
-    let mut v: Vec<f64> = window.iter().copied().collect();
+/// The `q` quantile of `sorted` (ascending, not empty), nearest rank.
+pub(crate) fn quantile(sorted: &[f64], q: f64) -> f64 {
+    sorted[((sorted.len() - 1) as f64 * q).round() as usize]
+}
+
+/// `values`' median.
+fn median(values: &[f64]) -> f64 {
+    let mut v = values.to_vec();
     v.sort_by(f64::total_cmp);
-    v[((v.len() - 1) as f64 * q).round() as usize]
+    quantile(&v, 0.5)
 }
 
 #[cfg(test)]
@@ -310,7 +345,7 @@ mod tests {
         let mut ran = Ran { latencies: Vec::new(), shown: Vec::new(), misses: 0 };
         for id in 0..frames {
             // As the window does: take what's been shown, plan, and if the plan is more than
-            // 2 ms off, wake 1 ms before it and plan again.
+            // SLEEP_PAST off, wake WAKE_EARLY before it and plan again.
             let plan = loop {
                 coming.sort_by(|a, b| a.0.total_cmp(&b.0));
                 for &(at, id, sampled) in coming.iter().filter(|c| c.0 <= now) {
@@ -320,8 +355,8 @@ mod tests {
                 }
                 coming.retain(|c| c.0 > now);
                 let plan = pacer.plan(now);
-                if plan.at - now > 0.002 {
-                    now = plan.at - 0.001;
+                if plan.at - now > SLEEP_PAST {
+                    now = plan.at - WAKE_EARLY;
                     continue;
                 }
                 break plan;
@@ -355,10 +390,6 @@ mod tests {
         }
         ran.misses = pacer.misses;
         ran
-    }
-
-    fn median(v: &[f64]) -> f64 {
-        quantile(&v.iter().copied().collect(), 0.5)
     }
 
     #[test]

@@ -11,11 +11,12 @@
 use matter::medium::Medium
 use matter::sky::Sky
 use mesh::light::{
-    Emitter, RadGrid, ShadowView, eval_emitters_vol, sky_irradiance, sun_vis_point, volume_indirect,
+    Emitter, FOUR_PI, NEAR, RadGrid, ShadowView, eval_emitters_vol, hg_phase, sky_irradiance,
+    sun_vis_point, volume_indirect,
 }
 use picture::eye::View
 use picture::look::{Bloom, Look, Seen}
-use picture::screen::cover
+use picture::screen::{cover, luma}
 use std::gpu::{
     Address, ComparisonSampler, DepthTexture, Filter, FragCoord, GlobalId, GpuSpan, Rgba16Float,
     Sampler, Texels3d, Texture, Texture3d, begin_pass, dispatch, draw, label, sampler, texture,
@@ -31,14 +32,6 @@ pub const FROXEL_D: u32 = 32
 pub const VOL_NEAR: f32 = 0.25
 pub const VOL_FAR: f32 = 64.0
 const LOG_RATIO: f32 = 5.54517744 // ln(64.0 / 0.25) = ln(256)
-const FOUR_PI: f32 = 12.5663706
-
-/// Henyey-Greenstein phase function `p(cos_theta, g)` (integrated over sphere = 1).
-fn hg_phase(cos_t: f32, g: f32) -> f32 {
-    let g2 = g * g
-    let denom = max(1.0 + g2 - 2.0 * g * cos_t, 1.0e-4)
-    (1.0 - g2) / (FOUR_PI * denom * sqrt(denom))
-}
 
 /// Depth `z` (m along camera forward) of slice boundary `s` in `[0, FROXEL_D]`.
 fn slice_z(s: f32) -> f32 {
@@ -143,8 +136,7 @@ fn froxel_integrate(
 // ---- Optical HDR Bloom Pyramid (4-level Dual Kawase with Karis firefly suppression) ----
 
 fn karis_weight(c: vec3) -> f32 {
-    let l = dot(c, vec3(0.2126, 0.7152, 0.0722))
-    1.0 / (1.0 + max(l, 0.0))
+    1.0 / (1.0 + max(luma(c), 0.0))
 }
 
 fn soft_threshold(c: vec3, threshold: f32, knee: f32) -> vec3 {
@@ -254,26 +246,37 @@ pub fn bloom_pyramid() -> BloomPyramid {
     }
 }
 
+/// Sizes of the 4 pyramid levels for a `width × height` image (each half the last, at least 1).
+fn levels(width: u32, height: u32) -> [vec2u; 4] {
+    var sizes = [vec2u(1, 1); 4]
+    var w = width
+    var h = height
+    for i in 0..4 {
+        w = max(w / 2, 1)
+        h = max(h / 2, 1)
+        sizes[i] = vec2u(w, h)
+    }
+    sizes
+}
+
+/// One texel's size in uv for a level of size `size`.
+fn texel(size: vec2u) -> vec2 {
+    vec2(1.0 / f32(size.x), 1.0 / f32(size.y))
+}
+
 impl BloomPyramid {
     fn resize(mut self, width: u32, height: u32) {
         if self.w == width && self.h == height {
             return
         }
-        let w0 = max(width / 2, 1)
-        let h0 = max(height / 2, 1)
-        let w1 = max(w0 / 2, 1)
-        let h1 = max(h0 / 2, 1)
-        let w2 = max(w1 / 2, 1)
-        let h2 = max(h1 / 2, 1)
-        let w3 = max(w2 / 2, 1)
-        let h3 = max(h2 / 2, 1)
-        self.d0 = texture(width: w0, height: h0)
-        self.d1 = texture(width: w1, height: h1)
-        self.d2 = texture(width: w2, height: h2)
-        self.d3 = texture(width: w3, height: h3)
-        self.u2 = texture(width: w2, height: h2)
-        self.u1 = texture(width: w1, height: h1)
-        self.u0 = texture(width: w0, height: h0)
+        let l = levels(width, height)
+        self.d0 = texture(width: l[0].x, height: l[0].y)
+        self.d1 = texture(width: l[1].x, height: l[1].y)
+        self.d2 = texture(width: l[2].x, height: l[2].y)
+        self.d3 = texture(width: l[3].x, height: l[3].y)
+        self.u2 = texture(width: l[2].x, height: l[2].y)
+        self.u1 = texture(width: l[1].x, height: l[1].y)
+        self.u0 = texture(width: l[0].x, height: l[0].y)
         self.w = width
         self.h = height
     }
@@ -285,14 +288,7 @@ impl BloomPyramid {
         }
         self.resize(width, height)
         label("mesh_bloom")
-        let w0 = max(width / 2, 1)
-        let h0 = max(height / 2, 1)
-        let w1 = max(w0 / 2, 1)
-        let h1 = max(h0 / 2, 1)
-        let w2 = max(w1 / 2, 1)
-        let h2 = max(h1 / 2, 1)
-        let w3 = max(w2 / 2, 1)
-        let h3 = max(h2 / 2, 1)
+        let l = levels(width, height)
 
         let p0 = begin_pass(mut self.d0, keep: false)
         draw(
@@ -301,8 +297,8 @@ impl BloomPyramid {
             bloom_prefilter_fs.bind(
                 src: hdr,
                 s: self.s,
-                inv_dst: vec2(1.0 / f32(w0), 1.0 / f32(h0)),
-                inv_src: vec2(1.0 / f32(max(width, 1)), 1.0 / f32(max(height, 1))),
+                inv_dst: texel(l[0]),
+                inv_src: texel(vec2u(max(width, 1), max(height, 1))),
                 bloom: bloom,
             ),
             vertices: 3,
@@ -313,12 +309,7 @@ impl BloomPyramid {
         draw(
             p1,
             cover,
-            bloom_down_fs.bind(
-                src: self.d0,
-                s: self.s,
-                inv_dst: vec2(1.0 / f32(w1), 1.0 / f32(h1)),
-                inv_src: vec2(1.0 / f32(w0), 1.0 / f32(h0)),
-            ),
+            bloom_down_fs.bind(src: self.d0, s: self.s, inv_dst: texel(l[1]), inv_src: texel(l[0])),
             vertices: 3,
         )
         p1.end()
@@ -327,12 +318,7 @@ impl BloomPyramid {
         draw(
             p2,
             cover,
-            bloom_down_fs.bind(
-                src: self.d1,
-                s: self.s,
-                inv_dst: vec2(1.0 / f32(w2), 1.0 / f32(h2)),
-                inv_src: vec2(1.0 / f32(w1), 1.0 / f32(h1)),
-            ),
+            bloom_down_fs.bind(src: self.d1, s: self.s, inv_dst: texel(l[2]), inv_src: texel(l[1])),
             vertices: 3,
         )
         p2.end()
@@ -341,12 +327,7 @@ impl BloomPyramid {
         draw(
             p3,
             cover,
-            bloom_down_fs.bind(
-                src: self.d2,
-                s: self.s,
-                inv_dst: vec2(1.0 / f32(w3), 1.0 / f32(h3)),
-                inv_src: vec2(1.0 / f32(w2), 1.0 / f32(h2)),
-            ),
+            bloom_down_fs.bind(src: self.d2, s: self.s, inv_dst: texel(l[3]), inv_src: texel(l[2])),
             vertices: 3,
         )
         p3.end()
@@ -359,8 +340,8 @@ impl BloomPyramid {
                 lo: self.d3,
                 hi: self.d2,
                 s: self.s,
-                inv_dst: vec2(1.0 / f32(w2), 1.0 / f32(h2)),
-                inv_lo: vec2(1.0 / f32(w3), 1.0 / f32(h3)),
+                inv_dst: texel(l[2]),
+                inv_lo: texel(l[3]),
                 radius: bloom.radius,
             ),
             vertices: 3,
@@ -375,8 +356,8 @@ impl BloomPyramid {
                 lo: self.u2,
                 hi: self.d1,
                 s: self.s,
-                inv_dst: vec2(1.0 / f32(w1), 1.0 / f32(h1)),
-                inv_lo: vec2(1.0 / f32(w2), 1.0 / f32(h2)),
+                inv_dst: texel(l[1]),
+                inv_lo: texel(l[2]),
                 radius: bloom.radius,
             ),
             vertices: 3,
@@ -391,8 +372,8 @@ impl BloomPyramid {
                 lo: self.u1,
                 hi: self.d0,
                 s: self.s,
-                inv_dst: vec2(1.0 / f32(w0), 1.0 / f32(h0)),
-                inv_lo: vec2(1.0 / f32(w1), 1.0 / f32(h1)),
+                inv_dst: texel(l[0]),
+                inv_lo: texel(l[1]),
                 radius: bloom.radius,
             ),
             vertices: 3,
@@ -415,7 +396,6 @@ pub fn hdr_tone_fs<L: Look>(
     bloom_tex: Texture<Rgba16Float>,
     bloom_s: Sampler,
     bloom_strength: f32,
-    near_plane: f32,
     v: View,
     look: L,
 ) -> vec4 {
@@ -425,7 +405,7 @@ pub fn hdr_tone_fs<L: Look>(
     let uv = pixel.position.xy / max(v.size, vec2(1.0))
     if vol_active != 0 {
         let ndc_z = depth.load(px, py)
-        let lin_z = if ndc_z > 1.0e-6 { min(near_plane / ndc_z, VOL_FAR) } else { VOL_FAR }
+        let lin_z = if ndc_z > 1.0e-6 { min(NEAR / ndc_z, VOL_FAR) } else { VOL_FAR }
         let w = z_to_w(lin_z)
         let vol = froxel_acc.sample_level(vol_s, vec3(uv.x, uv.y, w), 0.0)
         rad = rad * vol.w + vol.xyz

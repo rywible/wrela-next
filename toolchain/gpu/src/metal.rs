@@ -69,19 +69,16 @@ struct Shared {
     /// A buffer of zeros, shared, as large as the largest texture level zeroed so far.
     zeros: Mutex<Option<Id<dyn MTLBuffer>>>,
     /// Shared buffers staged writes are copied into, reused once their submission is done.
-    belt: Mutex<Belt>,
+    belt: Mutex<Belt<Id<dyn MTLBuffer>>>,
     /// The table of texture views and samplers.
     table: Arc<Table>,
 }
 
-/// How many views and samplers the table holds at once.
-const TABLE_LEN: u32 = 1 << 16;
-
 /// The device's table (`wrela_abi::table`): a shared buffer of `MTLResourceID`s, and its free
-/// indices (those let go, and the next never used).
+/// indices.
 struct Table {
     buffer: Id<dyn MTLBuffer>,
-    free: Mutex<(Vec<u32>, u32)>,
+    free: IndexPool,
 }
 
 // SAFETY: as `Shared`'s.
@@ -91,18 +88,7 @@ unsafe impl Sync for Table {}
 impl Table {
     /// An index for `held`'s `id`, written into the table.
     fn take(self: &Arc<Table>, id: MTLResourceID, held: Held) -> Arc<Slot> {
-        let index = {
-            let mut f = lock(&self.free);
-            match f.0.pop() {
-                Some(i) => i,
-                None => {
-                    let i = f.1;
-                    assert!(i < TABLE_LEN, "the table of views and samplers is full");
-                    f.1 += 1;
-                    i
-                }
-            }
-        };
+        let index = self.free.take();
         // SAFETY: `MTLResourceID` is one 64-bit word; the shared buffer holds `TABLE_LEN` of
         // them, and no command in flight reads a free index.
         unsafe {
@@ -134,22 +120,23 @@ enum Held {
 
 impl Drop for Slot {
     fn drop(&mut self) {
-        lock(&self.table.free).0.push(self.index);
+        self.table.free.give_back(self.index);
     }
 }
 
-/// The staging belt: the buffer this submission's writes go into (and how much of it they
-/// fill), the full ones this submission also uses, and those earlier submissions use or used.
-#[derive(Default)]
-struct Belt {
-    current: Option<(Id<dyn MTLBuffer>, u64)>,
-    filled: Vec<Id<dyn MTLBuffer>>,
-    in_flight: Vec<(SubmissionIndex, Id<dyn MTLBuffer>)>,
-    free: Vec<Id<dyn MTLBuffer>>,
-}
+impl StagingBuffer for Id<dyn MTLBuffer> {
+    fn size(&self) -> u64 {
+        self.length() as u64
+    }
 
-/// The least a staging buffer holds.
-const BELT_CHUNK: u64 = 4 << 20;
+    unsafe fn write(&self, at: u64, data: &[u8]) {
+        // SAFETY: the caller's; the buffer is shared, so its contents are the host's to write.
+        unsafe {
+            let p = self.contents().as_ptr() as *mut u8;
+            std::ptr::copy_nonoverlapping(data.as_ptr(), p.add(at as usize), data.len());
+        }
+    }
+}
 
 // SAFETY: Metal's objects are thread-safe (MTLDevice, MTLCommandQueue and resources may be used
 // from any thread); the host records on one thread at a time.
@@ -196,7 +183,6 @@ impl Device {
                 .newCommandQueueWithMaxCommandBufferCount(2048)
                 .ok_or("Metal made no command queue")?;
             queue.setLabel(Some(&ns(&options.label)));
-            let apple = raw.supportsFamily(MTLGPUFamily::Apple7);
             let info = AdapterInfo {
                 name: name.clone(),
                 backend: Backend::Metal,
@@ -212,7 +198,7 @@ impl Device {
                 driver_info: objc2_foundation::NSProcessInfo::processInfo()
                     .operatingSystemVersionString()
                     .to_string(),
-                subgroup_min_size: if apple { 4 } else { 4 },
+                subgroup_min_size: 4,
                 subgroup_max_size: 64,
             };
             let limits = Limits {
@@ -269,18 +255,13 @@ impl Device {
                 )
                 .ok_or("Metal made no table")?;
             table.setLabel(Some(&ns("table")));
-            let table = Arc::new(Table { buffer: table, free: Mutex::new((Vec::new(), 0)) });
+            let table = Arc::new(Table { buffer: table, free: IndexPool::new(TABLE_LEN) });
             let timestamps = timestamp_counters(&raw);
             if timestamps.is_some() {
                 features.push("timestamp-query");
             }
             let anchor = timestamps.is_some().then(|| anchor_kernel(&raw)).transpose()?;
-            let features = match &options.features {
-                Some(keep) => {
-                    Features(features.into_iter().filter(|f| keep.iter().any(|k| k == f)).collect())
-                }
-                None => Features(features),
-            };
+            let features = options.features_of(features);
             Ok(Device(Arc::new(Shared {
                 raw,
                 queue,
@@ -437,10 +418,7 @@ impl Device {
     fn zero_texture(&self, t: &Texture) {
         let f = t.format;
         let block = f.block();
-        let (layers, depth) = match t.dimension {
-            TextureDimension::D3 => (1, t.depth_or_layers),
-            TextureDimension::D2 => (t.depth_or_layers, 1),
-        };
+        let (layers, depth) = t.dimension.split(t.depth_or_layers, 1);
         for level in 0..t.levels {
             let w = (t.width >> level).max(1);
             let h = (t.height >> level).max(1);
@@ -555,10 +533,11 @@ impl Device {
             if let Some(at) = layout.0.entries[k].index_at {
                 let slot = match &e.resource {
                     Resource::View(v) => {
+                        let r: &ProtocolObject<dyn MTLResource> = ProtocolObject::from_ref(&*v.raw);
                         if matches!(layout.0.entries[k].ty, BindingType::StorageTexture { .. }) {
-                            writes.push(v.raw.clone());
+                            writes.push(NonNull::from(r));
                         } else {
-                            reads.push(v.raw.clone());
+                            reads.push(NonNull::from(r));
                         }
                         v.slot.clone().expect("a view in the table")
                     }
@@ -696,7 +675,7 @@ impl Device {
         if data.is_empty() {
             return;
         }
-        let (staging, staging_offset) = self.staging(data, 4);
+        let (staging, staging_offset) = self.staging(data, COPY_BUFFER_ALIGNMENT);
         lock(&self.0.pending).push(PendingWrite::Buffer {
             staging,
             staging_offset,
@@ -719,11 +698,8 @@ impl Device {
         if data.is_empty() {
             return;
         }
-        let (staging, staging_offset) = self.staging(data, 256);
-        let (slice, z) = match at.texture.dimension {
-            TextureDimension::D3 => (0, at.origin[2]),
-            TextureDimension::D2 => (at.origin[2], 0),
-        };
+        let (staging, staging_offset) = self.staging(data, u64::from(COPY_BYTES_PER_ROW_ALIGNMENT));
+        let (slice, z) = at.texture.dimension.split(at.origin[2], 0);
         lock(&self.0.pending).push(PendingWrite::Texture {
             staging,
             staging_offset,
@@ -740,54 +716,15 @@ impl Device {
     /// `data` copied into the staging belt at an offset aligned to `align`: the buffer and the
     /// offset, which the next submission copies from.
     fn staging(&self, data: &[u8], align: u64) -> (Id<dyn MTLBuffer>, u64) {
-        let need = data.len() as u64;
-        let mut belt = lock(&self.0.belt);
-        let fits = |b: &Id<dyn MTLBuffer>, used: u64| {
-            used.next_multiple_of(align) + need <= b.length() as u64
-        };
-        let (buffer, at) = match belt.current.take() {
-            Some((b, used)) if fits(&b, used) => (b, used.next_multiple_of(align)),
-            other => {
-                if let Some((b, _)) = other {
-                    belt.filled.push(b);
-                }
-                let free = belt.free.iter().position(|b| b.length() as u64 >= need);
-                let b = match free {
-                    Some(k) => belt.free.swap_remove(k),
-                    None => self
-                        .0
-                        .raw
-                        .newBufferWithLength_options(
-                            need.max(BELT_CHUNK).next_power_of_two() as NSUInteger,
-                            MTLResourceOptions::StorageModeShared,
-                        )
-                        .expect("Metal made no buffer"),
-                };
-                (b, 0)
-            }
-        };
-        // SAFETY: the buffer is shared and holds `at + need` bytes; no submission uses it yet.
-        unsafe {
-            let p = buffer.contents().as_ptr() as *mut u8;
-            std::ptr::copy_nonoverlapping(data.as_ptr(), p.add(at as usize), data.len());
-        }
-        belt.current = Some((buffer.clone(), at + need));
-        (buffer, at)
-    }
-
-    /// The staging belt's buffers this submission uses go in flight with it; those of
-    /// submissions done are free again.
-    fn turn_belt(&self, index: SubmissionIndex) {
-        let done = self.completed();
-        let mut belt = lock(&self.0.belt);
-        let current = belt.current.take().map(|c| c.0);
-        let used: Vec<_> = belt.filled.drain(..).chain(current).collect();
-        belt.in_flight.extend(used.into_iter().map(|b| (index, b)));
-        let (ready, busy): (Vec<_>, Vec<_>) =
-            belt.in_flight.drain(..).partition(|(i, _)| *i <= done);
-        belt.in_flight = busy;
-        belt.free.extend(ready.into_iter().map(|(_, b)| b));
-        belt.free.truncate(8);
+        lock(&self.0.belt).stage(data, align, |len| {
+            self.0
+                .raw
+                .newBufferWithLength_options(
+                    len as NSUInteger,
+                    MTLResourceOptions::StorageModeShared,
+                )
+                .expect("Metal made no buffer")
+        })
     }
 
     /// Commits the staged writes, then `buffers`, in order: their submission's index.
@@ -795,7 +732,8 @@ impl Device {
         autoreleasepool(|_| {
             let index = self.0.submitted.fetch_add(1, Ordering::AcqRel) + 1;
             let pending = self.take_pending();
-            self.turn_belt(index);
+            let done = self.completed();
+            lock(&self.0.belt).turn(index, done);
             let mut cbs: Vec<Id<dyn MTLCommandBuffer>> = Vec::new();
             if !pending.is_empty() {
                 let cb = self.command_buffer();
@@ -959,10 +897,6 @@ impl Device {
         lock(&self.0.errors)
             .push("the GPU failed command buffer `frame`: the device was lost: simulated (WRELA_GPU_LOSE_AT)".into());
     }
-}
-
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// What a failed command buffer says: its error, and each of its encoders (their labels are the
@@ -1181,10 +1115,7 @@ impl Texture {
             return TextureView { raw: self.raw.clone(), slot: None };
         }
         let levels = desc.level_count.unwrap_or(self.levels - desc.base_level);
-        let all_layers = match self.dimension {
-            TextureDimension::D3 => 1,
-            TextureDimension::D2 => self.depth_or_layers,
-        };
+        let (all_layers, _) = self.dimension.split(self.depth_or_layers, 1);
         let layers = desc.layer_count.unwrap_or(all_layers - desc.base_layer);
         let ty = match desc.dimension {
             ViewDimension::D2 => MTLTextureType::Type2D,
@@ -1266,8 +1197,9 @@ struct Layout {
     entries: Vec<LayoutEntry>,
     /// Each entry's slot in the vertex, fragment and compute stage, where it sees it.
     slots: Vec<[Option<u8>; 3]>,
-    /// The entry that takes a dynamic offset.
-    dynamic: Vec<usize>,
+    /// Each entry's place among those that take a dynamic offset (the place of its offset in
+    /// those a group is set with), where it takes one.
+    dynamic: Vec<Option<usize>>,
     /// The bytes of its block of indices: past the last entry's index.
     block: usize,
 }
@@ -1276,14 +1208,16 @@ impl Layout {
     fn of(entries: &[LayoutEntry]) -> Layout {
         let mut counters = [[0u8; 3]; 3];
         let mut slots = Vec::with_capacity(entries.len());
-        let mut dynamic = Vec::new();
+        let mut dynamic = Vec::with_capacity(entries.len());
+        let mut dynamics = 0;
         let mut block = 0;
-        for (k, e) in entries.iter().enumerate() {
+        for e in entries {
             let table = e.ty.table() as usize;
             let mut s = [None; 3];
             if let Some(at) = e.index_at {
                 block = block.max(at as usize + 4);
                 slots.push(s);
+                dynamic.push(None);
                 continue;
             }
             for (stage, sees) in [e.visibility.vertex, e.visibility.fragment, e.visibility.compute]
@@ -1296,9 +1230,10 @@ impl Layout {
                 }
             }
             slots.push(s);
-            if e.ty.dynamic() {
-                dynamic.push(k);
-            }
+            dynamic.push(e.ty.dynamic().then(|| {
+                dynamics += 1;
+                dynamics - 1
+            }));
         }
         Layout { entries: entries.to_vec(), slots, dynamic, block }
     }
@@ -1318,9 +1253,10 @@ struct Group {
     bound: Vec<(usize, Bound)>,
     /// Its block of indices in the device's table (empty where the table holds none of it).
     block: Vec<u8>,
-    /// What it reaches through the table, as Metal declares it: textures read, and written.
-    reads: Vec<Id<dyn MTLTexture>>,
-    writes: Vec<Id<dyn MTLTexture>>,
+    /// What it reaches through the table, as `useResources` takes it: the textures it reads, and
+    /// those it writes (each held by its view's slot, in `_slots`).
+    reads: Vec<NonNull<ProtocolObject<dyn MTLResource>>>,
+    writes: Vec<NonNull<ProtocolObject<dyn MTLResource>>>,
     /// The indices it names, alive while it is.
     _slots: Vec<Arc<Slot>>,
 }
@@ -1341,34 +1277,11 @@ impl BindGroup {
         let g = &self.0;
         for (k, b) in &g.bound {
             let Some(slot) = g.layout.slots[*k][stage] else { continue };
-            let extra = g
-                .layout
-                .dynamic
-                .iter()
-                .position(|d| d == k)
-                .and_then(|i| offsets.get(i))
-                .map_or(0, |o| u64::from(*o));
+            let extra =
+                g.layout.dynamic[*k].and_then(|i| offsets.get(i)).map_or(0, |o| u64::from(*o));
             f(b, extra, slot);
         }
     }
-}
-
-/// What group `g` reaches through the table, as `useResources` takes it: the textures it reads,
-/// and those it writes.
-#[allow(clippy::type_complexity)]
-fn declared(
-    g: &Group,
-) -> (Vec<NonNull<ProtocolObject<dyn MTLResource>>>, Vec<NonNull<ProtocolObject<dyn MTLResource>>>)
-{
-    let each = |ts: &[Id<dyn MTLTexture>]| {
-        ts.iter()
-            .map(|t| {
-                let r: &ProtocolObject<dyn MTLResource> = ProtocolObject::from_ref(&**t);
-                NonNull::from(r)
-            })
-            .collect()
-    };
-    (each(&g.reads), each(&g.writes))
 }
 
 // ---- recording ----------------------------------------------------------------------------------------
@@ -1653,12 +1566,10 @@ fn size(e: [u32; 3]) -> MTLSize {
     }
 }
 
-/// A copy's slice and depth: a 2D texture's layer is its slice; a 3D texture's is its depth.
+/// A copy's slice and depth ([`TextureDimension::split`]).
 fn slice_of(c: &TextureCopy<'_>) -> (NSUInteger, NSUInteger) {
-    match c.texture.dimension {
-        TextureDimension::D3 => (0, c.origin[2] as NSUInteger),
-        TextureDimension::D2 => (c.origin[2] as NSUInteger, 0),
-    }
+    let (slice, z) = c.texture.dimension.split(c.origin[2], 0);
+    (slice as NSUInteger, z as NSUInteger)
 }
 
 pub struct ComputePass<'a> {
@@ -1723,7 +1634,7 @@ impl ComputePass<'_> {
             }
             let at = wrela_abi::table::METAL_BLOCK as NSUInteger;
             e.setBytes_length_atIndex(NonNull::from(&g.block[..]).cast(), g.block.len(), at);
-            let (reads, writes) = declared(g);
+            let (reads, writes) = (&g.reads, &g.writes);
             if !reads.is_empty() {
                 e.useResources_count_usage(
                     NonNull::from(&reads[..]).cast(),
@@ -1835,7 +1746,7 @@ impl RenderPass<'_> {
             let bytes = NonNull::from(&g.block[..]).cast();
             e.setVertexBytes_length_atIndex(bytes, g.block.len(), at);
             e.setFragmentBytes_length_atIndex(bytes, g.block.len(), at);
-            let (reads, writes) = declared(g);
+            let (reads, writes) = (&g.reads, &g.writes);
             if !reads.is_empty() {
                 e.useResources_count_usage_stages(
                     NonNull::from(&reads[..]).cast(),
@@ -2168,8 +2079,7 @@ impl Surface {
         TextureFormat::Rgba16Float
     }
 
-    pub fn configure(&mut self, device: &Device, c: &SurfaceConfig) -> Result<()> {
-        let _ = device;
+    pub fn configure(&mut self, c: &SurfaceConfig) -> Result<()> {
         self.layer.setDrawableSize(objc2_core_foundation::CGSize {
             width: f64::from(c.width),
             height: f64::from(c.height),

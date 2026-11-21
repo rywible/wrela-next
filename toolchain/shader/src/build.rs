@@ -159,8 +159,7 @@ impl Builder {
         inputs: &[BuiltinInput],
         body: impl FnOnce(&mut Body<'_>),
     ) {
-        let v4 = self.vector(Scalar::F32, 4);
-        let clip = self.structure("ClipPosition", &[("position", v4)]);
+        let clip = self.clip_position();
         let function = self.with_body(ir::Function::new(name, Vec::new(), Some(clip)), body);
         self.m.entry_points.push(ir::EntryPoint {
             name: name.into(),
@@ -173,7 +172,7 @@ impl Builder {
     }
 
     /// The struct a vertex shader returns: its clip position (`vertex` returns one).
-    pub fn clip_position(&mut self) -> TypeId {
+    fn clip_position(&mut self) -> TypeId {
         let v4 = self.vector(Scalar::F32, 4);
         self.structure("ClipPosition", &[("position", v4)])
     }

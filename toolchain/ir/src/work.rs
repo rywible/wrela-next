@@ -79,68 +79,44 @@ pub struct EntryWork {
 /// budgets (once each). One count serves the module, so a function two entry points call is
 /// followed once for each set of known arguments.
 pub fn module_work(m: &Module) -> (Vec<EntryWork>, Vec<Breach>) {
-    let mut c = Counter {
-        m,
-        steps: 0,
-        gave_up: false,
-        bounds: true,
-        memo: HashMap::new(),
-        breaches: Vec::new(),
-        passes: HashMap::new(),
-        proof: None,
-        totals: None,
-    };
+    let (each, breaches, _) = count_entries(Counter::new(m, true));
+    (each, breaches)
+}
+
+/// [`module_work`]'s entry points, and from the same count each loop's most work, all its passes
+/// together, by its body's address (`as_ptr`): `None` for a loop with no bound on some way the
+/// count followed. A loop the count never reached (behind a constant branch) isn't there, and
+/// none is once the count gave up on an entry point (what it found after isn't the code's).
+/// What fuel (`crate::fuel`) leaves uncounted.
+pub fn work_and_loop_totals(m: &Module) -> (Vec<EntryWork>, HashMap<usize, Option<u64>>) {
+    let mut c = Counter::new(m, true);
+    c.totals = Some(HashMap::new());
+    let (each, _, totals) = count_entries(c);
+    (each, totals.unwrap_or_default())
+}
+
+/// Counts each entry point of `c`'s module in its order, starting each afresh: their work, the
+/// functions over their budgets, and the loop totals if asked (none once any gave up).
+fn count_entries(
+    mut c: Counter<'_>,
+) -> (Vec<EntryWork>, Vec<Breach>, Option<HashMap<usize, Option<u64>>>) {
     let mut out = Vec::new();
+    let mut gave_up = false;
+    let m = c.m;
     for e in &m.entry_points {
         (c.steps, c.gave_up) = (0, false);
         let r = c.call(e.function, &[]);
+        gave_up |= c.gave_up;
         let work = if r.unbounded || c.gave_up { None } else { Some(r.work) };
         out.push(EntryWork { work, unbounded: r.loop_at, breaches: Vec::new() });
     }
-    (out, c.breaches)
-}
-
-/// Each loop's most work, all its passes together, by its body's address (`as_ptr`), as the
-/// count of each of module `m`'s entry points finds it (the host's bound, [`module_work`]'s):
-/// `None` for a loop with no bound on some way the count followed. A loop the count never
-/// reached (behind a constant branch, or after it gave up) isn't there. What fuel
-/// (`crate::fuel`) leaves uncounted.
-pub fn loop_totals(m: &Module) -> HashMap<usize, Option<u64>> {
-    let mut c = Counter {
-        m,
-        steps: 0,
-        gave_up: false,
-        bounds: true,
-        memo: HashMap::new(),
-        breaches: Vec::new(),
-        passes: HashMap::new(),
-        proof: None,
-        totals: Some(HashMap::new()),
-    };
-    for e in &m.entry_points {
-        (c.steps, c.gave_up) = (0, false);
-        c.call(e.function, &[]);
-        if c.gave_up {
-            // What it found after giving up isn't the code's: none of it is kept as a bound.
-            return HashMap::new();
-        }
-    }
-    c.totals.unwrap_or_default()
+    let totals = c.totals.filter(|_| !gave_up);
+    (out, c.breaches, totals)
 }
 
 /// The work of entry point `f` of module `m`, and the functions over their budgets.
 pub fn entry_work(m: &Module, f: FuncId) -> EntryWork {
-    let mut c = Counter {
-        m,
-        steps: 0,
-        gave_up: false,
-        bounds: true,
-        memo: HashMap::new(),
-        breaches: Vec::new(),
-        passes: HashMap::new(),
-        proof: None,
-        totals: None,
-    };
+    let mut c = Counter::new(m, true);
     let r = c.call(f, &[]);
     let work = if r.unbounded || c.gave_up { None } else { Some(r.work) };
     EntryWork { work, unbounded: r.loop_at, breaches: c.breaches }
@@ -155,40 +131,12 @@ pub struct ExprWork<'a> {
 
 impl<'a> ExprWork<'a> {
     pub fn new(m: &'a Module) -> ExprWork<'a> {
-        ExprWork {
-            c: Counter {
-                m,
-                steps: 0,
-                gave_up: false,
-                bounds: false,
-                memo: HashMap::new(),
-                breaches: Vec::new(),
-                passes: HashMap::new(),
-                proof: None,
-                totals: None,
-            },
-        }
+        ExprWork { c: Counter::new(m, false) }
     }
 
     /// The most work `e`, in `f`, can do: `None` when unbounded.
     pub fn of(&mut self, f: &Function, e: &Expr) -> Option<u64> {
-        let mut fr = Frame {
-            f,
-            args: Vec::new(),
-            vals: HashMap::new(),
-            most: HashMap::new(),
-            parts: HashMap::new(),
-            nots: HashMap::new(),
-            work: 0,
-            unbounded: false,
-            loop_at: None,
-            here: None,
-            ret: None,
-            calls: HashMap::new(),
-            sites: None,
-            exits: Vec::new(),
-            left: 0,
-        };
+        let mut fr = Frame::new(f, Vec::new());
         (self.c.steps, self.c.gave_up) = (0, false);
         self.c.expr(&mut fr, &mut State::default(), e);
         (!fr.unbounded && !self.c.gave_up).then_some(fr.work)
@@ -199,17 +147,7 @@ impl<'a> ExprWork<'a> {
 /// nothing of `f`'s parameters: a loop missing ends after a number of passes the count can't
 /// bound.
 pub fn loop_passes(m: &Module, f: FuncId) -> HashMap<usize, u32> {
-    let mut c = Counter {
-        m,
-        steps: 0,
-        gave_up: false,
-        bounds: false,
-        memo: HashMap::new(),
-        breaches: Vec::new(),
-        passes: HashMap::new(),
-        proof: None,
-        totals: None,
-    };
+    let mut c = Counter::new(m, false);
     let args = vec![None; m.functions[f.0 as usize].params.len()];
     c.call(f, &args);
     if c.gave_up { HashMap::new() } else { c.passes }
@@ -254,17 +192,8 @@ impl Proofs {
 
 /// [`Proofs`] of module `m`, followed from each entry point knowing nothing of its inputs.
 pub fn proofs(m: &Module) -> Proofs {
-    let mut c = Counter {
-        m,
-        steps: 0,
-        gave_up: false,
-        bounds: true,
-        memo: HashMap::new(),
-        breaches: Vec::new(),
-        passes: HashMap::new(),
-        proof: Some(ProofLog::default()),
-        totals: None,
-    };
+    let mut c = Counter::new(m, true);
+    c.proof = Some(ProofLog::default());
     for e in &m.entry_points {
         c.steps = 0;
         c.call(e.function, &[]);
@@ -473,20 +402,7 @@ pub struct CallRuns<'a> {
 
 impl<'a> CallRuns<'a> {
     pub fn new(m: &'a Module) -> CallRuns<'a> {
-        CallRuns {
-            c: Counter {
-                m,
-                steps: 0,
-                gave_up: false,
-                bounds: false,
-                memo: HashMap::new(),
-                breaches: Vec::new(),
-                passes: HashMap::new(),
-                proof: None,
-                totals: None,
-            },
-            steps: 0,
-        }
+        CallRuns { c: Counter::new(m, false), steps: 0 }
     }
 
     /// The most work one call of `f` can do given `known` of its arguments (`None`: unbounded).
@@ -507,23 +423,8 @@ impl<'a> CallRuns<'a> {
         let func = &self.c.m.functions[f.0 as usize];
         let mut args = consts_of(known);
         args.resize(func.params.len(), None);
-        let mut fr = Frame {
-            f: func,
-            args,
-            vals: HashMap::new(),
-            most: HashMap::new(),
-            parts: HashMap::new(),
-            nots: HashMap::new(),
-            work: 0,
-            unbounded: false,
-            loop_at: None,
-            here: None,
-            ret: None,
-            calls: HashMap::new(),
-            sites: Some(SiteLog::default()),
-            exits: Vec::new(),
-            left: 0,
-        };
+        let mut fr = Frame::new(func, args);
+        fr.sites = Some(SiteLog::default());
         (self.c.steps, self.c.gave_up) = (0, false);
         self.c.block(&mut fr, &mut State::default(), &func.body);
         self.steps = self.steps.saturating_add(self.c.steps);
@@ -557,8 +458,25 @@ struct Counter<'a> {
     /// What the count proves of the run-time checks ([`proofs`]), when it's asked.
     proof: Option<ProofLog>,
     /// Each loop's most work in all its passes, by its body's address, `None` once a way
-    /// through it had no bound ([`loop_totals`]), when it's asked.
+    /// through it had no bound ([`work_and_loop_totals`]), when it's asked.
     totals: Option<HashMap<usize, Option<u64>>>,
+}
+
+impl<'a> Counter<'a> {
+    /// A count of module `m` with nothing found yet, asked for nothing past the work.
+    fn new(m: &'a Module, bounds: bool) -> Counter<'a> {
+        Counter {
+            m,
+            bounds,
+            steps: 0,
+            gave_up: false,
+            memo: HashMap::new(),
+            breaches: Vec::new(),
+            passes: HashMap::new(),
+            proof: None,
+            totals: None,
+        }
+    }
 }
 
 /// How a block ended: `Normal` when some way through it goes on past it (the state is what's
@@ -687,15 +605,10 @@ struct Frame<'f> {
     left: u64,
 }
 
-impl<'a> Counter<'a> {
-    fn call(&mut self, id: FuncId, args: &[Option<Const>]) -> Called {
-        let key = (id.0, known_of(args));
-        let args = consts_of(&key.1);
-        if let Some(c) = self.memo.get(&key) {
-            return c.clone();
-        }
-        let f = &self.m.functions[id.0 as usize];
-        let mut fr = Frame {
+impl<'f> Frame<'f> {
+    /// A frame for a call of `f` given `args`, with nothing counted or known yet.
+    fn new(f: &'f Function, args: Vec<Option<Const>>) -> Frame<'f> {
+        Frame {
             f,
             args,
             vals: HashMap::new(),
@@ -711,7 +624,19 @@ impl<'a> Counter<'a> {
             sites: None,
             exits: Vec::new(),
             left: 0,
-        };
+        }
+    }
+}
+
+impl<'a> Counter<'a> {
+    fn call(&mut self, id: FuncId, args: &[Option<Const>]) -> Called {
+        let key = (id.0, known_of(args));
+        let args = consts_of(&key.1);
+        if let Some(c) = self.memo.get(&key) {
+            return c.clone();
+        }
+        let f = &self.m.functions[id.0 as usize];
+        let mut fr = Frame::new(f, args);
         let mut st = State::default();
         self.block(&mut fr, &mut st, &f.body);
         let called = Called {

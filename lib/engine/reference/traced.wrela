@@ -18,9 +18,15 @@
 // hemisphere: M. Pharr, W. Jakob and G. Humphreys, *Physically Based Rendering*, 3rd ed., 13.6.3).
 
 use matter::matter::Matter
-use matter::sky::{Sky, Sun}
+use matter::sky::{Sky, Sun, seen}
 use matter::substance::Substance
+use picture::eye::View
+use picture::look::{Look, Seen}
+use picture::screen::luma
+use reference::paced::{PacedAt, Said, said_begun}
+use reference::reference::{THICK, dice, jitter}
 use std::field::{Field, hash_u32}
+use std::math::{PI, TAU}
 
 /// The most rays over the hemisphere a look takes, and the most stops a ray is followed
 /// through.
@@ -31,16 +37,16 @@ pub const MOST_BOUNCES: u32 = 4
 pub const MOST_STEPS: u32 = 4096
 
 /// How many times the span of a ray's last step is halved to put it on the surface.
-const HALVINGS: u32 = 24
+pub const HALVINGS: u32 = 24
 
 /// The least a step is (m), how much more a metre along the ray, and how many steps double it:
 /// so a ray that runs level with a surface, or along a narrow gap between two (a ball where it
 /// touches the ground), still goes on and gets out within its steps. A twentieth of a millimetre
 /// near the eye at first, a millimetre after 4000 steps; a thing thinner than this may be
 /// stepped over (the thinnest thing judged so far is a 1 cm wand).
-const LEAST: f32 = 0.00005
-const LEAST_FAR: f32 = 0.000005
-const LEAST_DOUBLES: f32 = 256.0
+pub const LEAST: f32 = 0.00005
+pub const LEAST_FAR: f32 = 0.000005
+pub const LEAST_DOUBLES: f32 = 256.0
 
 /// How far off a surface (m) a ray that leaves it starts: past the float's error in the point,
 /// short of any detail the world has.
@@ -109,7 +115,7 @@ fn basis(n: vec3) -> (vec3, vec3) {
 fn about(n: vec3, c: f32, turn: f32) -> vec3 {
     let (u, v) = basis(n)
     let s = sqrt(max(1.0 - c * c, 0.0))
-    let a = 6.2831853 * turn
+    let a = TAU * turn
     normalize(u * (s * cos(a)) + v * (s * sin(a)) + n * c)
 }
 
@@ -170,7 +176,7 @@ pub fn lit<M: Field<Substance>, S: Sky>(
         // A way chosen as likely as its cosine: its light times what the surface scatters, over
         // how likely the way was, is π times the scattering function times the light.
         var way = cosine_way(n, die(at, k), die(at, k + 1))
-        var carried = s.scatters(n, way, to) * (3.14159265 / f32(rays))
+        var carried = s.scatters(n, way, to) * (PI / f32(rays))
         var o = p + n * LEAVE
         var depth: u32 = 0
         var going = true
@@ -196,7 +202,7 @@ pub fn lit<M: Field<Substance>, S: Sky>(
                     let kq = k + 2 + 4 * stop
                     e += carried * sq.scatters(nq, sun.way, -way) * sunlit(m, sky, q, nq, die(at, kq), die(at, kq + 1))
                     let next = cosine_way(nq, die(at, kq + 2), die(at, kq + 3))
-                    carried = carried * sq.scatters(nq, next, -way) * 3.14159265
+                    carried = carried * sq.scatters(nq, next, -way) * PI
                     way = next
                     o = q + nq * LEAVE
                 }
@@ -220,4 +226,59 @@ pub fn thickness<M: Field<Substance>>(m: Matter<M>, p: vec3, n: vec3, most: f32)
         t += max(-m.far(o - n * t), LEAST)
     }
     min(t + LEAVE, most)
+}
+
+/// What the reference says of pixel (`at.x`, `at.y`) of the screen `middle` sees, worked whole on
+/// the CPU: its middle ray (`entered`) and that matter's `thickness`, then each look of both
+/// halves, the halves by turns, marched and `lit`. What `paced` must give to the bit (`Said`).
+pub fn traced_said<M: Field<Substance>, S: Sky, L: Look>(m: Matter<M>, sky: S, look: L, middle: View, at: PacedAt) -> Said {
+    let px = vec2(f32(at.x) + 0.5, f32(at.y) + 0.5)
+    var said = said_begun()
+    let d0 = middle.ray(px)
+    let span0 = m.span(middle.at, d0)
+    said.behind = vec4(look.tone(Seen { light: seen(sky, d0) }), 1.0)
+    said.thick.x = THICK
+    if span0.y > max(span0.x, 0.0) {
+        let t = entered(m, middle.at, d0, max(span0.x, 0.0), ends(m, middle.at, d0))
+        if t < 0.0 {
+            said.behind.w = if t < -1.5 { 2.0 } else { 1.0 }
+        } else {
+            let p = middle.at + d0 * t
+            let n = m.facing(p, -d0)
+            said.centre = vec4(n, t)
+            said.thick.x = thickness(m, p, n, THICK)
+        }
+    }
+    var met = [vec4(0.0); 2]
+    var mat = [vec4(0.0); 2]
+    var far = [vec4(0.0); 2]
+    for index in 0..(2 * at.looks) {
+        let half = index % 2
+        let v = middle.moved(jitter(half, index / 2))
+        let d = v.ray(px)
+        let span = m.span(v.at, d)
+        var t = -1.0
+        if span.y > max(span.x, 0.0) {
+            t = entered(m, v.at, d, max(span.x, 0.0), ends(m, v.at, d))
+        }
+        if t < 0.0 {
+            met[half] = met[half] + vec4(look.tone(Seen { light: seen(sky, d) }), 0.0)
+        } else {
+            let p = v.at + d * t
+            let n = m.facing(p, -d)
+            let s = m.made_of(p)
+            let light = lit(m, sky, p, n, s, -d, dice(at.x, at.y, index, at.salt), at.rays, at.bounces, at.light)
+            let c = look.tone(Seen { light })
+            let l = luma(c)
+            met[half] = met[half] + vec4(c, 1.0)
+            mat[half] = mat[half] + vec4(c, l * l)
+            far[half] = far[half] + vec4(t, t * t, 0.0, 0.0)
+        }
+    }
+    said.met0 = met[0]
+    said.matter0 = mat[0]
+    said.met1 = met[1]
+    said.matter1 = mat[1]
+    said.far = vec4(far[0].x, far[0].y, far[1].x, far[1].y)
+    said
 }

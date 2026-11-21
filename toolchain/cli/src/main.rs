@@ -43,6 +43,9 @@
 //! wrela precision <package-dir> <fn> --box <lo>..<hi>,...
 //!                                         where a half-float twin of a function would be
 //!                                         safe, operation by operation, from its interval
+//! wrela shaders <build-dir> [--jobs N]   every shader of a build through its platform's own
+//!                                         offline tool (`metal`, `spirv-val`); exit 1 if
+//!                                         one fails, 2 if this machine hasn't its tool
 //! wrela same <package-dir> --against <build-dir> [--set NAME=VALUE]... [--frames n] [--within x] [--no-gpu] [--json]
 //!                                         whether the package built now behaves as a saved
 //!                                         build does: the same commands each frame, the
@@ -108,6 +111,7 @@ mod query;
 mod refactor;
 mod same;
 mod script;
+mod shaders;
 mod solve;
 mod suite;
 mod test;
@@ -138,6 +142,7 @@ pub(crate) fn usage() -> ExitCode {
         "wrela refactor <package-dir> (rename <item> <new-name> | move <item> <module> | add-param <fn> \"<name>: <type>\" (--value <expr> | --default <expr>) | change-mode <fn> <param> <borrow|mut|take> | extract-const <file>:<line>:<col> <NAME> | inline <fn> | extract-fn <file>:<first>-<last> <name> | apply <plan.json>) [--dry-run] [--json]",
         "wrela trace <package-dir> --watch <export>[,<export>...] [--frames n] [--csv] [--fps f] [--size WxH] [--input <script.json>] [--release] [--no-gpu] [--workers N]",
         "wrela bisect <package-dir> --until \"<export> <op> <number>\" [--frames n] [--json] [--fps f] [--size WxH] [--input <script.json>] [--release] [--no-gpu] [--workers N]",
+        "wrela shaders <build-dir> [--jobs N]",
         "wrela same <package-dir> --against <build-dir> [--set NAME=VALUE]... [--frames n] [--fps f] [--size WxH] [--input <script.json>] [--within x] [--no-gpu] [--json]",
         "wrela suite [fmt | allow | wrela::<package-path>::[<test-name>]] [--workspace <dir>]",
         "wrela tool (<package-dir> | <name>) [--read NAME=DIR]... [--write NAME=DIR]... [--secret NAME]... [--net HOST]... [--allow-run NAME[=PATH]]... [--browser] [--timeout S] [--workers N] [--blob-budget B] [-- args...]",
@@ -210,6 +215,7 @@ fn main() -> ExitCode {
         }
         "suite" => suite::run(rest),
         "same" => same::run(rest),
+        "shaders" => shaders::run(rest),
         "tool" => tool::run(rest),
         "solve" => solve::run(rest),
         "precision" => precision::run(rest),

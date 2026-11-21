@@ -653,7 +653,7 @@ fn unary(op: UnOp, c: &Const) -> Option<Const> {
     })
 }
 
-fn binary(op: BinOp, a: &Const, b: &Const) -> Option<Const> {
+pub(crate) fn binary(op: BinOp, a: &Const, b: &Const) -> Option<Const> {
     use BinOp as B;
     Some(match (a, b) {
         (Const::F32(x), Const::F32(y)) => {

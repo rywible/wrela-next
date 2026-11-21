@@ -11,11 +11,8 @@ use wrela_host::step::{Bound, check, ms_of};
 fn bound_of(name: &str, sets: &[(&str, &str)], target: Target) -> Bound {
     let pkg = wrela_tests::repo_root().join("toolchain/tests/steps").join(name);
     let how = wrela_driver::BuildFor {
-        kind: wrela_driver::BuildKind::default(),
         set: sets.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
-        target,
-        trusted_shaders: false,
-        exact: false,
+        ..wrela_driver::BuildFor::new(target)
     };
     let out = wrela_driver::build_for(&pkg, &how);
     assert!(
@@ -23,8 +20,7 @@ fn bound_of(name: &str, sets: &[(&str, &str)], target: Target) -> Bound {
         "{name}: {}",
         wrela_diag::render::render_all(&out.sources, &out.diagnostics)
     );
-    let manifest = out.files.iter().find(|(f, _)| f == "manifest.json").expect("a manifest");
-    let m = wrela_abi::Manifest::parse(std::str::from_utf8(&manifest.1).unwrap()).unwrap();
+    let m = wrela_tests::built_manifest(&out);
     Bound::of(&m.pipelines[0])
 }
 
@@ -55,17 +51,9 @@ fn the_reference_that_took_the_machine_down_is_refused_before_it_runs() {
 #[test]
 fn the_calibration_kernels_are_bounded() {
     let pkg = wrela_tests::repo_root().join("toolchain/tests/steps/calibrate");
-    let how = wrela_driver::BuildFor {
-        kind: wrela_driver::BuildKind::default(),
-        set: Vec::new(),
-        target: Target::HERE,
-        trusted_shaders: false,
-        exact: false,
-    };
-    let out = wrela_driver::build_for(&pkg, &how);
+    let out = wrela_tests::shipped_for(&pkg, Target::HERE);
     assert!(!out.has_errors(), "{:?}", out.diagnostics);
-    let manifest = out.files.iter().find(|(f, _)| f == "manifest.json").expect("a manifest");
-    let m = wrela_abi::Manifest::parse(std::str::from_utf8(&manifest.1).unwrap()).unwrap();
+    let m = wrela_tests::built_manifest(&out);
     assert_eq!(m.pipelines.len(), 7);
     for p in &m.pipelines {
         assert!(matches!(Bound::of(p), Bound::Most(_)), "{}: {:?}", p.name, p.work);

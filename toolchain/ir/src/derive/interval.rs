@@ -1349,11 +1349,11 @@ impl<'a> Ivx<'a> {
 
     fn call_fn(&mut self, v: Option<ValueId>, g: FuncId, args: &[Arg], out: &mut Block) -> R<()> {
         // A derivative's interval is its twin's whose code is written for its interval
-        // (`ad::BOUNDED`): the same function, tighter where a length is written out.
+        // (`ad::Variant::Bounded`): the same function, tighter where a length is written out.
         let g = match self.cache.ad_of.get(&g).cloned() {
-            Some((f, mask, key)) if key & (ad::FILTERED | ad::BOUNDED) == 0 => {
+            Some((f, mask, n, ad::Variant::Point)) => {
                 let at = self.track.at;
-                ad::derive(self.m, self.cache, f, mask, key, self.target, false, true)
+                ad::derive(self.m, self.cache, f, mask, n, self.target, ad::Variant::Bounded)
                     .map_err(|e| e.through(at))?
             }
             _ => g,

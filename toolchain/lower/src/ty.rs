@@ -64,6 +64,13 @@ pub(crate) fn capture_passing(
     }
 }
 
+/// A re-based span parameter's (`Bound::Sub`) two values after its buffer: `{name}_start` and
+/// `{name}_count`.
+fn sub_params(mb: &mut ModuleBuilder, name: &str) -> [ir::Param; 2] {
+    let u = mb.m.types.u32();
+    [ir::Param::value(format!("{name}_start"), u), ir::Param::value(format!("{name}_count"), u)]
+}
+
 impl<'a> Cx<'a> {
     /// `t` with `subst` applied, projections normalized and return-position trait types
     /// replaced by the types their functions return.
@@ -522,11 +529,7 @@ impl<'a> Cx<'a> {
             let field = format!("{name}_{}", names.get(j).map_or("", String::as_str));
             match bs.get(j).cloned().flatten() {
                 Some(Bound::One(_)) => {}
-                Some(Bound::Sub(_)) => {
-                    let u = mb.m.types.u32();
-                    out.push(ir::Param::value(format!("{field}_start"), u));
-                    out.push(ir::Param::value(format!("{field}_count"), u));
-                }
+                Some(Bound::Sub(_)) => out.extend(sub_params(mb, &field)),
                 Some(g @ Bound::Group(_)) => {
                     out.extend(self.group_params(mb, ft, &g, &field, span));
                 }
@@ -573,9 +576,7 @@ impl<'a> Cx<'a> {
                     match resources.get(i) {
                         Some(Some(Bound::One(_))) => continue,
                         Some(Some(Bound::Sub(_))) => {
-                            let u = mb.m.types.u32();
-                            params.push(ir::Param::value(format!("{}_start", p.name), u));
-                            params.push(ir::Param::value(format!("{}_count", p.name), u));
+                            params.extend(sub_params(mb, &p.name));
                             continue;
                         }
                         Some(Some(b @ Bound::Group(_))) => {

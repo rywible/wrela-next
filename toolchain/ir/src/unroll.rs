@@ -26,38 +26,33 @@ const MOST_STATEMENTS: usize = 2000;
 
 /// Unrolls `f`'s loops that qualify (see the module docs).
 pub(crate) fn unroll(m: &Module, f: &mut Function) {
-    let mut consts = HashMap::new();
-    visit::walk(&f.body, &mut |s| {
-        if let Stmt::Let(v, Expr::Const(c)) = s {
-            consts.insert(*v, c.clone());
-        }
-    });
+    let mut consts = crate::counted::constants(f);
     // A count's limit written as constants added (`0..NB + 1`) is a constant too: this runs
     // before the module's constants are folded, so integer sums, differences and products of
-    // constants are worked out here (exactly, as the GPU wraps them; never a float).
-    loop {
-        let mut more = Vec::new();
-        visit::walk(&f.body, &mut |s| {
-            if let Stmt::Let(v, Expr::Binary(op, a, b)) = s
-                && !consts.contains_key(v)
-                && let (Some(x), Some(y)) = (consts.get(a), consts.get(b))
-                && let Some(c) = integer_op(*op, x, y)
-            {
-                more.push((*v, c));
-            }
-        });
-        if more.is_empty() {
-            break;
+    // constants are worked out here (exactly, as the GPU wraps them; never a float). One walk
+    // finds them all: a value is defined before the code that reads it (`crate::verify`).
+    visit::walk(&f.body, &mut |s| {
+        if let Stmt::Let(v, Expr::Binary(op, a, b)) = s
+            && !consts.contains_key(v)
+            && let (Some(x), Some(y)) = (consts.get(a), consts.get(b))
+            && let Some(c) = integer_op(*op, x, y)
+        {
+            consts.insert(*v, c);
         }
-        consts.extend(more);
-    }
+    });
     // The loops that leave on the count the command gives stay loops (W0014 says them), found in
     // the function as it is, before any is written out.
     let mut command = HashSet::new();
+    let mut defs = None;
     visit::walk(&f.body, &mut |s| {
         if let Stmt::Loop { body, .. } = s
             && exits(body)
-            && crate::rates::leaves_on_command(m, f, body)
+            && crate::rates::leaves_on_command(
+                m,
+                f,
+                defs.get_or_insert_with(|| crate::rates::defs_and_stores(f)),
+                body,
+            )
         {
             command.insert(body.as_ptr() as usize);
         }
@@ -91,12 +86,9 @@ fn block(
                         let mut copies = Vec::new();
                         for _ in 0..passes {
                             let mut names = HashMap::new();
-                            // The loop's own test goes; any other `break` stays.
-                            let kept = body
-                                .iter()
-                                .enumerate()
-                                .filter(|&(i, s)| i != check || !is_exit_test(s));
-                            for (_, s) in kept {
+                            // The loop's own test (`if c >= limit { break }`, as `counted` found
+                            // it) goes; any other `break` stays.
+                            for (_, s) in body.iter().enumerate().filter(|&(i, _)| i != check) {
                                 copies.push(copy(f, s, &mut names));
                             }
                             for s in &continuing {
@@ -136,21 +128,9 @@ fn block(
 /// `x op y` of two integer constants of one type, wrapping as the GPU does: a sum, a difference
 /// or a product.
 fn integer_op(op: BinOp, x: &Const, y: &Const) -> Option<Const> {
-    match (x, y) {
-        (Const::U32(x), Const::U32(y)) => Some(Const::U32(match op {
-            BinOp::Add => x.wrapping_add(*y),
-            BinOp::Sub => x.wrapping_sub(*y),
-            BinOp::Mul => x.wrapping_mul(*y),
-            _ => return None,
-        })),
-        (Const::I32(x), Const::I32(y)) => Some(Const::I32(match op {
-            BinOp::Add => x.wrapping_add(*y),
-            BinOp::Sub => x.wrapping_sub(*y),
-            BinOp::Mul => x.wrapping_mul(*y),
-            _ => return None,
-        })),
-        _ => None,
-    }
+    let sum_or_product = matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul);
+    let integers = matches!(x, Const::U32(_) | Const::I32(_));
+    (sum_or_product && integers).then(|| crate::const_fold::binary(op, x, y)).flatten()
 }
 
 /// Whether `b` calls a function.
@@ -187,23 +167,6 @@ fn plan(
         return None;
     }
     Some((passes as u32, c.check, leaves))
-}
-
-/// `if cond { break }`, with nothing else in either branch but source locations.
-fn is_exit_test(s: &Stmt) -> bool {
-    let Stmt::If { then, else_, .. } = s else { return false };
-    let only = |b: &Block, want: bool| {
-        let mut breaks = 0;
-        for s in b {
-            match s {
-                Stmt::At(_) => {}
-                Stmt::Break => breaks += 1,
-                _ => return false,
-            }
-        }
-        breaks == usize::from(want)
-    };
-    only(then, true) && only(else_, false)
 }
 
 /// Whether code leaves the loop it's in by its own `break`, `continue` (not an inner loop's).

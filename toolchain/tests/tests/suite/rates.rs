@@ -10,11 +10,8 @@ use wrela_diag::codes;
 fn fixture(name: &str, moved: bool, target: Target) -> wrela_driver::Output {
     let pkg = wrela_tests::repo_root().join("toolchain/tests/rates").join(name);
     let how = wrela_driver::BuildFor {
-        kind: wrela_driver::BuildKind::default(),
         set: vec![("MOVED".into(), moved.to_string())],
-        target,
-        trusted_shaders: false,
-        exact: false,
+        ..wrela_driver::BuildFor::new(target)
     };
     let out = wrela_driver::build_for(&pkg, &how);
     assert!(
@@ -27,17 +24,14 @@ fn fixture(name: &str, moved: bool, target: Target) -> wrela_driver::Output {
 
 /// The text of the build's shader for the pipeline named `pipeline` (Metal's).
 fn shader(out: &wrela_driver::Output, pipeline: &str) -> String {
-    let manifest = out.files.iter().find(|(f, _)| f == "manifest.json").expect("a manifest");
-    let m = wrela_abi::Manifest::parse(std::str::from_utf8(&manifest.1).unwrap()).unwrap();
+    let m = wrela_tests::built_manifest(out);
     let p = m.pipelines.iter().find(|p| p.name == pipeline).expect("the pipeline");
-    let (_, bytes) = out.files.iter().find(|(f, _)| *f == p.shader).expect("its shader");
-    String::from_utf8_lossy(bytes).into_owned()
+    String::from_utf8_lossy(wrela_tests::file(out, &p.shader)).into_owned()
 }
 
 /// Each pipeline's kept bytes, by name.
 fn kept(out: &wrela_driver::Output) -> Vec<(String, u32)> {
-    let manifest = out.files.iter().find(|(f, _)| f == "manifest.json").expect("a manifest");
-    let m = wrela_abi::Manifest::parse(std::str::from_utf8(&manifest.1).unwrap()).unwrap();
+    let m = wrela_tests::built_manifest(out);
     m.pipelines.iter().map(|p| (p.name.clone(), p.kept)).collect()
 }
 

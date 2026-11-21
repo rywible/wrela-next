@@ -274,6 +274,42 @@ impl Types {
         }
     }
 
+    /// The type of the part of a value of type `t` at `path`, each step a [`Self::part`].
+    pub fn part_at(&self, t: TypeId, path: &[u32]) -> Option<TypeId> {
+        path.iter().try_fold(t, |t, &k| self.part(t, k))
+    }
+
+    /// The members of a struct as the GPU holds it, each its name and type: a struct's fields,
+    /// or an enum's tag (`tag`) then each payload of the variants that have one. `None` for
+    /// other types.
+    pub fn gpu_members(&self, t: TypeId) -> Option<Vec<(&str, TypeId)>> {
+        match self.get(t) {
+            TypeDef::Struct { fields, .. } => {
+                Some(fields.iter().map(|(n, f)| (n.as_str(), *f)).collect())
+            }
+            TypeDef::Enum { variants, .. } => {
+                let tag = self.field(t, 0)?;
+                Some(
+                    std::iter::once(("tag", tag))
+                        .chain(variants.iter().filter_map(|(v, p)| Some((v.as_str(), (*p)?))))
+                        .collect(),
+                )
+            }
+            _ => None,
+        }
+    }
+
+    /// The member of [`Self::gpu_members`] that holds field `k` of a value of type `t`: for an
+    /// enum, its tag (0), or the payload of variant `k - 1` among the variants that have one.
+    pub fn gpu_member(&self, t: TypeId, k: u32) -> u32 {
+        match self.get(t) {
+            TypeDef::Enum { variants, .. } if k > 0 => {
+                1 + variants[..k as usize - 1].iter().filter(|(_, p)| p.is_some()).count() as u32
+            }
+            _ => k,
+        }
+    }
+
     pub fn is_vector(&self, t: TypeId) -> bool {
         matches!(self.get(t), TypeDef::Vector(..))
     }

@@ -10,13 +10,7 @@ use wrela_host::{Host, Value};
 /// two kernels' 4,096 results differ in any bit.
 fn differing(exact: bool) -> u32 {
     let pkg = wrela_tests::repo_root().join("toolchain/tests/exact");
-    let how = wrela_driver::BuildFor {
-        kind: wrela_driver::BuildKind { debug: false, testing: true },
-        set: Vec::new(),
-        target: wrela_abi::Target::HERE,
-        trusted_shaders: false,
-        exact,
-    };
+    let how = wrela_driver::BuildFor { exact, ..wrela_tests::testing_for(wrela_abi::Target::HERE) };
     let built = wrela_driver::build_for(&pkg, &how);
     assert!(
         !built.has_errors(),
@@ -24,10 +18,7 @@ fn differing(exact: bool) -> u32 {
         wrela_diag::render::render_all(&built.sources, &built.diagnostics)
     );
     // One kernel keeps `f` as a call, the other writes it in.
-    let manifest = wrela_abi::Manifest::parse(&String::from_utf8_lossy(
-        &built.files.iter().find(|(n, _)| n == "manifest.json").expect("a manifest").1,
-    ))
-    .expect("valid");
+    let manifest = wrela_tests::built_manifest(&built);
     assert_eq!(manifest.pipelines.len(), 2);
     let dir = wrela_tests::page_scratch_root().join(if exact { "exact-on" } else { "exact-off" });
     let _ = std::fs::remove_dir_all(&dir);

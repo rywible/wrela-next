@@ -212,7 +212,6 @@ author contract ("fields only") intact—the engine and `backend` toolchain requ
      cost scales with *live parts*, not total parts.
    - Per-thing micro-BVH over part bounds for `O(log N)` root pruning and ray meeting, with tight
      per-brick lowering (`fold_lowering(live_count, k)` rather than `fold_lowering(N, k)`).
-   - Avoid duplicate `cone_crossings` in `round_cone_meets` when `inner == grow`.
 4. **Mixed precision & wavefront compaction:** Enable `f16` for normals, local brick offsets, shading,
    and lighting (halving VGPR pressure / doubling ALU throughput) while keeping world positions and
    distances in `f32`; use `subgroupBallot` worklists to compact long-tail grazing silhouette rays.
@@ -232,7 +231,7 @@ build-time GPU measurer (`cd615c8`), held to the brute-force raytraced reference
    Optionally snap close-up/silhouette hits with 1 Newton step to exact field precision.
 3. **Tight proxy cages for exact, thin, and smooth-blended moving matter:** Rasterize tight
    occupied-brick/part proxies with early-Z (`depth(less)` / reversed-Z `depth(greater)`) for 1 cm
-   wands, closed-form `EXACT_MEETS` primitives, and dynamic spell/joint blends—while moving rigid
+   wands, closed-form primitives, and dynamic spell/joint blends—while moving rigid
    parts on bones reuse cached bricks/meshlets in bone space ("move the question, not the matter").
 4. **Compact Visibility Buffer + TBDR tile memory:** Compress G-buffer footprint (reconstructing
    world position and pixel footprint from depth instead of storing `Rgba32Float` position/ask

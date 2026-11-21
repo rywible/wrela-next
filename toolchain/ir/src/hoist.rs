@@ -71,8 +71,8 @@ pub fn hoist(m: &mut Module, uniform: ResourceId, least: u64) -> Vec<Hoisted> {
     // Each round moves work a call further out; GPU code doesn't recurse, so the call graph's
     // depth bounds the rounds.
     for _ in 0..4 * m.functions.len() + 8 {
-        let Some(order) = callees_first(m) else { break };
-        let (bits, patterns) = same_params(m, &order);
+        let Ok((order, _)) = crate::opt::callee_order(m) else { break };
+        let (bits, patterns, called) = same_params(m, &order);
         let mut changed = false;
         // A function some calls give same values and others not: a copy for the calls whose
         // same arguments have work to move. Then the round starts again.
@@ -110,10 +110,14 @@ pub fn hoist(m: &mut Module, uniform: ResourceId, least: u64) -> Vec<Hoisted> {
             }
             let (lifts, hoists): (Vec<_>, Vec<_>) = picked.into_iter().partition(|c| c.from_params);
             // Every recipe from the function as it is, before any value is read from the block.
-            let recipes: Vec<Function> = hoists
-                .iter()
-                .map(|c| recipe(&m.functions[f], &c.cone, c.value, c.counter.map(|k| k.0)))
-                .collect();
+            let recipes: Vec<Function> = {
+                let func = &m.functions[f];
+                let defs = visit::definitions(&func.body);
+                hoists
+                    .iter()
+                    .map(|c| recipe(func, &defs, &c.cone, c.value, c.counter.map(|k| k.0)))
+                    .collect()
+            };
             for (c, recipe) in hoists.into_iter().zip(recipes) {
                 let field = first + out.len() as u32;
                 let ty = m.functions[f].value_ty(c.value);
@@ -140,10 +144,11 @@ pub fn hoist(m: &mut Module, uniform: ResourceId, least: u64) -> Vec<Hoisted> {
                 touched[f] = true;
                 changed = true;
             }
-            // A function no code calls (an entry point) has no callers to move work into.
-            let called =
-                m.functions.iter().any(|g| visit::calls(&g.body).iter().any(|c| c.index() == f));
-            if entry.is_none() && called && !lifts.is_empty() {
+            // A function no code calls (an entry point) has no callers to move work into. (What
+            // this round has changed calls no function that wasn't called: a hoist's or a lift's
+            // own function loses only calls to its callees, already done, and a lift's callers
+            // gain only calls their callee makes.)
+            if entry.is_none() && called[f] && !lifts.is_empty() {
                 lift(m, f, &lifts);
                 touched.iter_mut().for_each(|t| *t = true);
                 changed = true;
@@ -230,8 +235,7 @@ fn counters(f: &Function) -> HashMap<ValueId, (LocalId, u32, u32)> {
             }
             visit::walk(body, &mut |s| {
                 if let Stmt::Let(v, Expr::Load(p)) = s
-                    && p.root_local() == Some(l)
-                    && p.path.is_empty()
+                    && p.whole_local() == Some(l)
                 {
                     out.insert(*v, (l, start, end));
                 }
@@ -262,44 +266,10 @@ fn read_element(f: &mut Function, v: ValueId, at: Place, wide: TypeId, n: u8) {
     });
 }
 
-/// The functions of `m` callees first, or `None` if a call cycles.
-fn callees_first(m: &Module) -> Option<Vec<usize>> {
-    let n = m.functions.len();
-    let callees: Vec<Vec<usize>> = m
-        .functions
-        .iter()
-        .map(|f| visit::calls(&f.body).iter().map(|c| c.index()).collect())
-        .collect();
-    // 0 unseen, 1 on the path, 2 done.
-    let mut state = vec![0u8; n];
-    let mut order = Vec::new();
-    fn visit(i: usize, callees: &[Vec<usize>], state: &mut [u8], order: &mut Vec<usize>) -> bool {
-        match state[i] {
-            1 => return false,
-            2 => return true,
-            _ => {}
-        }
-        state[i] = 1;
-        for &c in &callees[i] {
-            if !visit(c, callees, state, order) {
-                return false;
-            }
-        }
-        state[i] = 2;
-        order.push(i);
-        true
-    }
-    for i in 0..n {
-        if !visit(i, &callees, &mut state, &mut order) {
-            return None;
-        }
-    }
-    Some(order)
-}
-
 /// Which parameters of each function are given a same value by every call (a function no code
-/// calls: none). Callers before callees, each caller's same values found given its own.
-fn same_params(m: &Module, callees_first: &[usize]) -> (Vec<Vec<bool>>, Vec<Vec<Vec<bool>>>) {
+/// calls: none), each function's calls' patterns, and which functions some code calls. Callers
+/// before callees, each caller's same values found given its own.
+fn same_params(m: &Module, callees_first: &[usize]) -> SameParams {
     let n = m.functions.len();
     let mut bits: Vec<Vec<bool>> = m.functions.iter().map(|f| vec![true; f.params.len()]).collect();
     // Each function's calls' own patterns, each once.
@@ -336,8 +306,11 @@ fn same_params(m: &Module, callees_first: &[usize]) -> (Vec<Vec<bool>>, Vec<Vec<
             }
         }
     }
-    (bits, patterns)
+    (bits, patterns, called)
 }
+
+/// [`same_params`]' findings.
+type SameParams = (Vec<Vec<bool>>, Vec<Vec<Vec<bool>>>, Vec<bool>);
 
 /// Which of a call's arguments (to function `g`) are same values, given the caller's.
 fn call_pattern(m: &Module, g: usize, args: &[Arg], same: &HashSet<ValueId>) -> Vec<bool> {
@@ -667,12 +640,18 @@ fn pick(m: &Module, f: usize, bits: &[bool], uniform: ResourceId, least: u64) ->
 
 /// A function of no parameters computing `value` of `f` from its `cone` (in `f`'s order), whose
 /// leaves are loads of the block and constants.
-fn recipe(f: &Function, cone: &[ValueId], value: ValueId, counter: Option<ValueId>) -> Function {
+/// `defs` is `f`'s definitions ([`visit::definitions`]).
+fn recipe(
+    f: &Function,
+    defs: &HashMap<ValueId, &Expr>,
+    cone: &[ValueId],
+    value: ValueId,
+    counter: Option<ValueId>,
+) -> Function {
     let mut r = Function::new(format!("{}_hoisted", f.name), Vec::new(), Some(f.value_ty(value)));
     let mut map: HashMap<ValueId, ValueId> = HashMap::new();
-    let defs = definitions(f);
     // The counter's local, whose every read in the cone is the recipe's parameter.
-    let local = counter.and_then(|c| match &defs[&c] {
+    let local = counter.and_then(|c| match defs[&c] {
         Expr::Load(p) => p.root_local(),
         _ => None,
     });
@@ -696,17 +675,6 @@ fn recipe(f: &Function, cone: &[ValueId], value: ValueId, counter: Option<ValueI
     r
 }
 
-/// Each value's defining expression in `f`.
-fn definitions(f: &Function) -> HashMap<ValueId, Expr> {
-    let mut defs = HashMap::new();
-    visit::walk(&f.body, &mut |s| {
-        if let Stmt::Let(v, e) = s {
-            defs.insert(*v, e.clone());
-        }
-    });
-    defs
-}
-
 /// `f`'s definition of `v` becomes `e`.
 fn redefine(f: &mut Function, v: ValueId, e: Expr) {
     let mut e = Some(e);
@@ -724,7 +692,7 @@ fn redefine(f: &mut Function, v: ValueId, e: Expr) {
 /// each a parameter of `f`'s own, which every call computes from what it passes.
 fn lift(m: &mut Module, f: usize, picked: &[Picked]) {
     let func = &m.functions[f];
-    let defs = definitions(func);
+    let defs = visit::definitions(&func.body);
     // The statements every call computes, in `f`'s order: the cones together.
     let mut all: Vec<ValueId> = picked.iter().flat_map(|p| p.cone.iter().copied()).collect();
     let order: HashMap<ValueId, usize> = {

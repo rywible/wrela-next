@@ -8,7 +8,7 @@ use wrela_host::{CpuBuild, Host, Value};
 use wrela_tests::{one_u32, page};
 
 const SRC: &str = "use std::derive::{Box3, Interval, gradient, interval}
-use std::field::{Live, RoundCone, Surface, cuboid, fbm, half_space, round_cone, sphere}
+use std::field::{Live, RoundCone, Surface, cuboid, fbm, round_cone, sphere}
 use std::quat::Quat
 
 /// The engine's creature's seventeen parts at rest (toolchain/tests/masked).
@@ -52,7 +52,7 @@ fn steep<S: Surface>(s: S, side: f32, n: u32) -> vec2 {
     var misses: u32 = 0
     for i in 0..n {
         let b = box_at(i, side)
-        let g = s.range(b).gradient
+        let g = interval(|q: vec3| gradient(|r: vec3| s.distance(r), q), b)
         most = max(most, length(max(abs(g.lo), abs(g.hi))))
         for k in 0..32 {
             let q = b.sample(5, k)
@@ -116,101 +116,6 @@ pub fn masks(kind: u32, side: f32, n: u32) -> vec2 {
         masked(legs.union(arms).smooth_union(body, k: 0.03).union(block).to_bound(0.5), side, n)
     }
 }
-
-/// Over `n` rays from all round the surface's room (some starting inside it), 512 points each
-/// along the first 8 m: how many points inside the surface fall outside its `meets` (by more
-/// than 0.1 mm); of the rays `meets` calls exact, how many have a point inside before `near`, or
-/// a distance at `near` off 0 by more than 0.1 mm (or, at 0, not inside), and of those it says
-/// are met by `first`, how many are outside there or have it before `near`; how many it calls
-/// exact; and the worst distance at an exact `near`.
-fn meet_check<S: Surface>(s: S, n: u32) -> vec4 {
-    var outside: u32 = 0
-    var wrong: u32 = 0
-    var exact: u32 = 0
-    var worst = 0.0
-    for i in 0..n {
-        let o = Box3 { lo: vec3(-3.0, -1.0, -3.0), hi: vec3(3.0, 3.0, 3.0) }.sample(23, i)
-        let aim = Box3 { lo: vec3(-1.0, -0.2, -1.0), hi: vec3(1.0, 1.5, 1.0) }.sample(29, i)
-        let d = normalize(aim - o)
-        let m = s.meets(o, d)
-        var first = -1.0
-        for k in 0..512 {
-            let t = f32(k) * (8.0 / 512.0)
-            if s.distance(o + d * t) <= 0.0 {
-                if m.is_empty() || t < m.near - 0.0001 || t > m.far + 0.0001 {
-                    outside += 1
-                }
-                if first < 0.0 {
-                    first = t
-                }
-            }
-        }
-        // Met by `first`: the point there is inside or on it, and not before `near`.
-        if m.first < 1.0e29 {
-            let f = s.distance(o + d * m.first)
-            if f > 0.0001 || m.first < m.near - 0.0001 {
-                wrong += 1
-            }
-        }
-        if m.exact() {
-            exact += 1
-            if m.is_empty() {
-                if first >= 0.0 {
-                    wrong += 1
-                }
-            } else {
-                let f = s.distance(o + d * m.near)
-                let at = abs(f) < 0.0001 || (m.near == 0.0 && f <= 0.0)
-                if !at || (first >= 0.0 && first < m.near - 0.0001) {
-                    wrong += 1
-                }
-                worst = max(worst, if m.near == 0.0 { 0.0 } else { abs(f) })
-            }
-        }
-    }
-    vec4(f32(outside), f32(wrong), f32(exact), worst)
-}
-
-/// `meet_check` of: a ball (0), a box turned and scaled (1), a round cone (2), the engine's stage
-/// (two boxes and a ball, joined sharply: 3), the creature (4), the tree of every union (5), a
-/// ball cut by a plane (6), a displaced box (7), a mirrored cone (8), five balls at one place folded
-/// smoothly (9).
-pub fn meet_checks(kind: u32, n: u32) -> vec4 {
-    let c = cones()
-    let turn = Quat::axis_angle(normalize(vec3(1.0, 2.0, 0.5)), 0.7)
-    if kind == 0 {
-        meet_check(sphere(0.7).translate(vec3(0.2, 0.5, -0.1)), n)
-    } else if kind == 1 {
-        meet_check(cuboid(vec3(0.5, 0.2, 0.3)).rotate(turn).scale(1.3).translate(vec3(0.0, 0.4, 0.0)), n)
-    } else if kind == 2 {
-        meet_check(round_cone(vec3(-0.3, 0.2, 0.0), vec3(0.4, 0.9, 0.2), r_top: 0.3, r_bottom: 0.1), n)
-    } else if kind == 3 {
-        let ground = cuboid(vec3(8.0, 0.25, 8.0)).translate(vec3(0.0, -0.25, 0.0)).with(vec3(0.3))
-        let wall = cuboid(vec3(3.0, 1.5, 0.1)).translate(vec3(0.0, 1.5, 0.0)).with(vec3(0.4))
-        let ball = sphere(1.0).translate(vec3(-0.5, 1.0, 0.6)).with(vec3(0.5))
-        meet_check(ground.union(wall).union(ball), n)
-    } else if kind == 4 {
-        let wand = round_cone(vec3(-0.4236, 0.873, -0.039), vec3(-0.4956, 1.053, 0.261), r_top: 0.00504, r_bottom: 0.00504)
-        meet_check(c.smooth_union(k: 0.03).with(vec3(0.4)).smooth_union(wand.with(vec3(0.2)), k: 0.004), n)
-    } else if kind == 5 {
-        let legs = [c[6], c[7], c[8], c[13], c[14], c[15]].smooth_union(k: 0.02).translate(vec3(0.0, 0.1, 0.0))
-        let arms = [c[3], c[4], c[5], c[10], c[11], c[12]].union().rotate(turn).scale(1.3)
-        let head = sphere(0.15).translate(vec3(0.0, 1.05, 0.0)).smooth_union(c[9], k: 0.05).union(c[16])
-        let body = c[0].smooth_union(c[1], k: 0.04).with(vec3(1.0)).union(head)
-        meet_check(legs.union(arms).smooth_union(body, k: 0.03), n)
-    } else if kind == 6 {
-        meet_check(sphere(0.8).translate(vec3(0.0, 0.5, 0.0)).intersect(half_space(vec3(0.3, 1.0, 0.2), 0.6)), n)
-    } else if kind == 7 {
-        meet_check(cuboid(vec3(0.4, 0.3, 0.5)).translate(vec3(0.1, 0.4, 0.0)).displace(fbm(4.0, 3), amp: 0.05), n)
-    } else if kind == 8 {
-        meet_check(round_cone(vec3(0.2, 0.2, 0.0), vec3(0.6, 0.9, 0.2), r_top: 0.2, r_bottom: 0.1).mirror_x(), n)
-    } else {
-        // Five balls at one place, folded smoothly: the fold lowers their distance by more than
-        // one `smin` can (by L(5) = 0.55 k, not k / 4).
-        let b = sphere(0.5).translate(vec3(0.0, 0.5, 0.0))
-        meet_check([b, b, b, b, b].smooth_union(k: 0.6), n)
-    }
-}
 ";
 
 /// The package, built once for the three tests.
@@ -222,13 +127,6 @@ fn host() -> wrela_host::CpuHost {
         dir.join("build")
     });
     CpuBuild::load(build).expect("load").start().expect("start")
-}
-
-fn two(host: &mut wrela_host::CpuHost, name: &str, args: &[Value]) -> (f64, f64) {
-    match host.call_export(name, args).expect(name)[..] {
-        [Value::F32(a), Value::F32(b)] => (f64::from(a), f64::from(b)),
-        ref other => panic!("{name} returned {other:?}"),
-    }
 }
 
 /// `pow(x, y)` of a whole `y` over a range holding negatives is the power, as std's CPU `pow`
@@ -245,7 +143,8 @@ fn a_whole_power_of_a_range_holding_0_is_bounded() {
         (0.5, 2.0, 4.0),
         (-0.5, 0.25, 5.0),
     ] {
-        let (rl, rh) = two(&mut host, "pow_range", &[lo, hi, y].map(Value::F32));
+        let [rl, rh] = wrela_tests::one_vec2(&mut host, "pow_range", &[lo, hi, y].map(Value::F32))
+            .map(f64::from);
         let (mut sl, mut sh) = (f64::INFINITY, f64::NEG_INFINITY);
         for i in 0..=1000 {
             let x = lo + (hi - lo) * i as f32 / 1000.0;
@@ -264,7 +163,9 @@ fn a_whole_power_of_a_range_holding_0_is_bounded() {
         );
     }
     // A negative power of a range holding 0 has a pole there: every number.
-    let (rl, rh) = two(&mut host, "pow_range", &[-1.0f32, 1.0, -2.0].map(Value::F32));
+    let [rl, rh] =
+        wrela_tests::one_vec2(&mut host, "pow_range", &[-1.0f32, 1.0, -2.0].map(Value::F32))
+            .map(f64::from);
     assert!(rl == f64::NEG_INFINITY && rh == f64::INFINITY, "[{rl}, {rh}]");
 }
 
@@ -279,7 +180,8 @@ fn a_length_written_out_and_a_fold_of_smooth_unions_have_bounded_gradients() {
     for side in [2.0f32, 0.5, 0.125, 0.03, 0.008] {
         for (kind, most) in [(0, 2.0), (1, 3.2), (2, 3.2)] {
             let args = [Value::I32(kind), Value::F32(side), Value::I32(200)];
-            let (steepest, misses) = two(&mut host, "steepest", &args);
+            let [steepest, misses] =
+                wrela_tests::one_vec2(&mut host, "steepest", &args).map(f64::from);
             assert_eq!(misses, 0.0, "kind {kind}, boxes of {side} m: sampled gradients outside");
             assert!(steepest <= most, "kind {kind}, boxes of {side} m: gradient up to {steepest}");
         }
@@ -296,7 +198,7 @@ fn a_masked_ask_is_the_whole_ask_to_the_bit() {
     for (kind, parts) in [(0, 18.0), (1, 17.0), (2, 18.0)] {
         for side in [2.0f32, 0.5, 0.125, 0.03, 0.008] {
             let args = [Value::I32(kind), Value::F32(side), Value::I32(300)];
-            let (differ, live) = two(&mut host, "masks", &args);
+            let [differ, live] = wrela_tests::one_vec2(&mut host, "masks", &args).map(f64::from);
             assert_eq!(differ, 0.0, "kind {kind}, boxes of {side} m: masked asks differ");
             let mean = live / 300.0;
             assert!(mean >= 1.0 && mean <= parts, "kind {kind}: {mean} live of {parts}");
@@ -335,54 +237,4 @@ fn masked_and_whole_draw_the_same_picture() {
         0,
         "a kernel's facts of what a function reads differ from the CPU's"
     );
-}
-
-/// Where a ray can meet a surface (`Surface::meets`, §20.5): no point inside a surface lies
-/// outside the stretch, for std's shapes, the engine's stage and creature, and every combinator;
-/// where it says exact (std's shapes and their sharp unions and intersections), `near` is the
-/// first point inside, on the surface to 0.1 mm.
-#[test]
-fn a_ray_meets_a_surface_only_where_meets_says() {
-    let mut host = host();
-    let mut exact = Vec::new();
-    for kind in 0..10u32 {
-        let r = host
-            .call_export("meet_checks", &[Value::I32(kind as i32), Value::I32(2000)])
-            .expect("meet_checks");
-        let [Value::F32(outside), Value::F32(wrong), Value::F32(n), Value::F32(worst)] = r[..]
-        else {
-            panic!("{r:?}")
-        };
-        assert_eq!(outside, 0.0, "kind {kind}: points inside outside the stretch");
-        assert_eq!(
-            wrong, 0.0,
-            "kind {kind}: exact rays whose near isn't the first point inside (worst {worst})"
-        );
-        exact.push(n);
-    }
-    // std's shapes, the stage and a cut by a plane are exact; the smooth, displaced and mirrored aren't.
-    for kind in [0, 1, 2, 3, 6] {
-        assert_eq!(exact[kind], 2000.0, "kind {kind} is exact: {exact:?}");
-    }
-    for kind in [4, 5, 7, 8, 9] {
-        assert!(exact[kind] < 2000.0, "kind {kind} isn't exact everywhere: {exact:?}");
-    }
-}
-
-/// On the GPU, the meets fixture's two ways of finding each pixel's hit (marched from the bound,
-/// and from `meets`: the stage's exactly, the creature's from a stretch) draw the same pictures:
-/// pixels met by one way only, or shaded by their facing more than 1/255 apart, under 0.1%.
-#[test]
-#[ignore = "needs a GPU"]
-fn meeting_and_marching_draw_the_same_picture() {
-    let (dir, _) = page("toolchain/tests/meets", "meets-native");
-    let mut host = Host::load(&dir).expect("load");
-    let times = crate::frame_times(6);
-    host.run_frames(&times, 320, 180).expect("run");
-    assert_eq!(one_u32(&mut host, "compared_scenes", &[]), 2, "both scenes compared");
-    for scene in 0..2 {
-        let arg = [Value::I32(scene)];
-        let differ = one_u32(&mut host, "missed", &arg) + one_u32(&mut host, "shaded", &arg);
-        assert!(differ <= 57, "scene {scene}: {differ} of 57,600 pixels differ");
-    }
 }

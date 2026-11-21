@@ -11,14 +11,16 @@
 
 use matter::sky::{Sky, seen}
 use matter::substance::{ONE_OVER_PI, Substance}
-use mesh::extract::MeshVertex
+use mesh::extract::{MeshVertex, prep_list}
 use picture::eye::View
+use picture::screen::luma
 use std::gpu::{
-    Address, Append, AppendBuffer, Atomics, ComparisonSampler, DepthTexture, DispatchArgs, Filter,
-    GlobalId, GpuBuffer, GpuSpan, One, Rgba16Float, Sampler, Slots, Texels, Texels3d, Texture,
-    Texture3d, append_buffer, buffer, buffer_of, dispatch, label, sampler, texture3d,
-    writable_texture,
+    Address, Append, AppendBuffer, Atomics, ClipPosition, ComparisonSampler, DepthTexture,
+    DispatchArgs, Filter, GlobalId, GpuBuffer, GpuSpan, Rgba16Float, Sampler, Slots, Texels,
+    Texels3d, Texture, Texture3d, append_buffer, buffer, buffer_of, dispatch, label, sampler,
+    texture3d, writable_texture,
 }
+use std::math::{PI, TAU}
 
 /// Shadow map resolution (square).
 pub const SHADOW_SIDE: u32 = 2048
@@ -36,8 +38,11 @@ pub const SPEC2_SIDE: u32 = 16
 pub const RAD_SIDE: u32 = 64
 const RAD_VOXELS: u32 = 262144
 const RAD_SCALE: f32 = 256.0
-const PI: f32 = 3.14159265
-const TWO_PI: f32 = 6.2831853
+/// 4π: the solid angle of the whole sphere.
+pub const FOUR_PI: f32 = 12.5663706
+
+/// Reversed-Z near plane (m): `clip_z = NEAR`, `clip_w = z`, so `ndc_z = NEAR / z` in `(0, 1]`.
+pub const NEAR: f32 = 0.005
 
 /// Auto-extracted dynamic local emitters (`8×4×8 = 256` coarse spatial bins -> up to 16 active lights).
 const EMIT_CELLS: u32 = 256
@@ -82,6 +87,39 @@ fn basis(n: vec3) -> (vec3, vec3) {
     (u, v)
 }
 
+/// Projects world point `wp` into eye clip space with reversed-Z depth, matching `View::ray`
+/// bit for bit.
+pub fn clip_of(v: View, wp: vec3) -> ClipPosition {
+    let rel = wp - v.at
+    let x = dot(rel, v.right)
+    let y = dot(rel, v.up)
+    let z = dot(rel, v.forward)
+    let aspect = v.size.y / max(v.size.x, 1.0)
+    ClipPosition { position: vec4(x * v.focal * aspect, y * v.focal, NEAR, z) }
+}
+
+/// Henyey-Greenstein phase function `p(cos_theta, g)` (integrated over sphere = 1).
+pub fn hg_phase(cos_t: f32, g: f32) -> f32 {
+    let g2 = g * g
+    let denom = max(1.0 + g2 - 2.0 * g * cos_t, 1.0e-4)
+    (1.0 - g2) / (FOUR_PI * denom * sqrt(denom))
+}
+
+/// Encodes `(metallic, ior, coat)` into `[0, 1]` for the 8-bit `Rgba8` G-buffer (`0.5` = matte):
+///   `~0.5`   -> pure matte `lambert` (`abs(code) < 0.015`)
+///   `< 0.48` -> metallic conductor (`metallic = -code`)
+///   `> 0.52` -> dielectric (`ior = 1.5`, uncoated `0.03`, coated `coat >= 0.05`)
+pub fn encode_mat_unorm(sub: Substance) -> f32 {
+    if sub.metallic > 0.02 {
+        return clamp(0.5 - 0.5 * clamp(sub.metallic, 0.04, 1.0), 0.0, 0.48)
+    }
+    if sub.spec_weight() <= 1.0e-5 && sub.coat <= 1.0e-5 {
+        return 0.5
+    }
+    let c = if sub.coat > 0.04 { clamp(sub.coat, 0.05, 1.0) } else { 0.03 }
+    clamp(0.5 + 0.5 * c, 0.515, 1.0)
+}
+
 /// Integrates the open sky's cosine-weighted irradiance for every octahedral direction into a
 /// `TABLE×TABLE` lookup texture (runs only when the sky changes; 0 ms/frame when still).
 @compute(8, 8)
@@ -97,7 +135,7 @@ pub fn skylit<S: Sky>(sky: S, out: mut Texels<Rgba16Float>, id: GlobalId) {
         let e = (vec2(f32(i % GATHER), f32(i / GATHER)) + vec2(0.5)) / f32(GATHER)
         let c = sqrt(1.0 - e.x)
         let r = sqrt(max(1.0 - c * c, 0.0))
-        let turn = TWO_PI * e.y
+        let turn = TAU * e.y
         sum += sky.light(normalize(u * (r * cos(turn)) + v * (r * sin(turn)) + n * c))
     }
     out.store(id, vec4(sum * (PI / f32(GATHER * GATHER)), 1.0))
@@ -137,7 +175,7 @@ pub fn sky_spec<S: Sky>(sky: S, side: u32, roughness: f32, out: mut Texels<Rgba1
     for i in 0..n_samples {
         let xi1 = (f32(i) + 0.5) / f32(n_samples)
         let xi2 = van_der_corput(i)
-        let phi = TWO_PI * xi1
+        let phi = TAU * xi1
         let cos_t = sqrt(clamp((1.0 - xi2) / max(1.0 + (a2 - 1.0) * xi2, 1.0e-5), 0.0, 1.0))
         let sin_t = sqrt(max(1.0 - cos_t * cos_t, 0.0))
         let h = normalize(u * (cos(phi) * sin_t) + v * (sin(phi) * sin_t) + n * cos_t)
@@ -219,7 +257,7 @@ pub fn sky_background<S: Sky>(sky: S, spec0: Texture<Rgba16Float>, s: Sampler, w
     let sun = sky.sun()
     let c = cos(sun.size)
     if dot(way, sun.way) >= c {
-        return base + sun.light / (TWO_PI * max(1.0 - c, 1.0e-9))
+        return base + sun.light / (TAU * max(1.0 - c, 1.0e-9))
     }
     base
 }
@@ -270,6 +308,18 @@ pub struct ShadowView: Copy + GpuData {
     pub spare2: f32,
 }
 
+impl ShadowView {
+    /// Sun-space position of world point `p`: `(x, y)` in `[-1, 1]` across the map, `z` its depth
+    /// in `[0, 1]`.
+    pub fn project(self, p: vec3) -> vec3 {
+        let d = p - self.centre
+        let sx = dot(d, self.u) / self.radius
+        let sy = dot(d, self.v) / self.radius
+        let sz = (self.radius - dot(d, self.w)) / (2.0 * self.radius)
+        vec3(sx, sy, sz)
+    }
+}
+
 /// Builds a `ShadowView` tightly framing the world bounding sphere `(centre, radius)` from `sun_way`.
 pub fn shadow_view(centre: vec3, radius: f32, sun_way: vec3) -> ShadowView {
     let w = normalize(sun_way)
@@ -315,18 +365,14 @@ pub fn sun_shadow_soft(
         return 0.0
     }
     let slope = sqrt(max(1.0 - ndl * ndl, 0.0))
-    let p = wp + n * (sv.texel * (1.2 + 1.5 * slope))
-    let d = p - sv.centre
-    let sx = dot(d, sv.u) / sv.radius
-    let sy = dot(d, sv.v) / sv.radius
-    let sz = (sv.radius - dot(d, sv.w)) / (2.0 * sv.radius)
-    if abs(sx) >= 0.995 || abs(sy) >= 0.995 || sz <= 0.0 || sz >= 1.0 {
+    let s = sv.project(wp + n * (sv.texel * (1.2 + 1.5 * slope)))
+    if abs(s.x) >= 0.995 || abs(s.y) >= 0.995 || s.z <= 0.0 || s.z >= 1.0 {
         return 1.0
     }
-    let uv = vec2(sx * 0.5 + 0.5, 0.5 - sy * 0.5)
+    let uv = vec2(s.x * 0.5 + 0.5, 0.5 - s.y * 0.5)
     let rad_uv = filter_texels / f32(SHADOW_SIDE)
-    let ref_z = clamp(sz - 0.00025, 0.0, 1.0)
-    let ang0 = ign(px) * TWO_PI
+    let ref_z = clamp(s.z - 0.00025, 0.0, 1.0)
+    let ang0 = ign(px) * TAU
     var sum = 0.0
     for i in 0..8 {
         let r = sqrt((f32(i) + 0.5) * 0.125) * rad_uv
@@ -378,7 +424,6 @@ pub fn contact_shadow(
     wp: vec3,
     n: vec3,
     sun_way: vec3,
-    near_plane: f32,
 ) -> f32 {
     let ndl = dot(n, sun_way)
     if ndl <= 0.05 {
@@ -393,7 +438,7 @@ pub fn contact_shadow(
         let p = p0 + sun_way * t
         let rel = p - v.at
         let z = dot(rel, v.forward)
-        if z <= near_plane {
+        if z <= NEAR {
             break
         }
         let x_ndc = (dot(rel, v.right) * v.focal * aspect) / z
@@ -405,7 +450,7 @@ pub fn contact_shadow(
         let sy = u32(clamp((0.5 - y_ndc * 0.5) * h_px, 0.0, h_px - 1.0))
         let dz = depth.load(sx, sy)
         if dz > 1.0e-6 {
-            let scene_z = near_plane / dz
+            let scene_z = NEAR / dz
             let diff = z - scene_z
             if diff > 0.012 && diff < 0.22 {
                 return 0.35
@@ -426,7 +471,6 @@ pub fn trace_ssr(
     n: vec3,
     refl: vec3,
     roughness: f32,
-    jitter: f32,
 ) -> vec4 {
     // Only trace sharp-to-glossy reflections; rough surfaces are already well served by `spec_cone` + PMREM.
     if roughness > 0.52 {
@@ -443,7 +487,6 @@ pub fn trace_ssr(
     // 16 deterministic geometrically growing steps reaching ~14 m (zero dither speckle on bright emitters).
     var step_len = 0.07
     var t = 0.06
-    let _j = jitter
     for _i in 0..16 {
         let p = p0 + refl * t
         let rel = p - v.at
@@ -493,9 +536,9 @@ pub fn trace_ssr(
         }
     }
     // Soft luminance-preserving clamp in half-res reflections to prevent single-pixel fireflies on wet/coated surfaces.
-    let luma = dot(hit_rgb, vec3(0.2126, 0.7152, 0.0722))
+    let hit_l = luma(hit_rgb)
     let max_l = mix(4.2, 2.2, clamp(roughness * 2.2, 0.0, 1.0))
-    let clamped_rgb = if luma > max_l { hit_rgb * (max_l / luma) } else { hit_rgb }
+    let clamped_rgb = if hit_l > max_l { hit_rgb * (max_l / hit_l) } else { hit_rgb }
     let edge = min(min(hit_uv.x, 1.0 - hit_uv.x), min(hit_uv.y, 1.0 - hit_uv.y))
     let edge_fade = clamp(edge / 0.09, 0.0, 1.0)
     let rough_fade = clamp((0.52 - roughness) / 0.24, 0.0, 1.0)
@@ -517,17 +560,13 @@ pub fn sun_shadow(
         return 0.0
     }
     let slope = sqrt(max(1.0 - ndl * ndl, 0.0))
-    let p = wp + n * (sv.texel * (1.5 + 1.8 * slope))
-    let d = p - sv.centre
-    let sx = dot(d, sv.u) / sv.radius
-    let sy = dot(d, sv.v) / sv.radius
-    let sz = (sv.radius - dot(d, sv.w)) / (2.0 * sv.radius)
-    if abs(sx) >= 0.999 || abs(sy) >= 0.999 || sz <= 0.0 || sz >= 1.0 {
+    let s = sv.project(wp + n * (sv.texel * (1.5 + 1.8 * slope)))
+    if abs(s.x) >= 0.999 || abs(s.y) >= 0.999 || s.z <= 0.0 || s.z >= 1.0 {
         return 1.0
     }
-    let uv = vec2(sx * 0.5 + 0.5, 0.5 - sy * 0.5)
+    let uv = vec2(s.x * 0.5 + 0.5, 0.5 - s.y * 0.5)
     let o = 0.5 / f32(SHADOW_SIDE)
-    let ref_z = clamp(sz - 0.0003, 0.0, 1.0)
+    let ref_z = clamp(s.z - 0.0003, 0.0, 1.0)
     var sum = 0.0
     sum += shadow_map.sample_compare_level(cmp, uv + vec2(-o, -o), ref_z)
     sum += shadow_map.sample_compare_level(cmp, uv + vec2(o, -o), ref_z)
@@ -538,15 +577,12 @@ pub fn sun_shadow(
 
 /// Single-tap sun visibility lookup for volumetrics and voxel injection (no normal offset).
 pub fn sun_vis_point(shadow_map: DepthTexture, cmp: ComparisonSampler, sv: ShadowView, wp: vec3) -> f32 {
-    let d = wp - sv.centre
-    let sx = dot(d, sv.u) / sv.radius
-    let sy = dot(d, sv.v) / sv.radius
-    let sz = (sv.radius - dot(d, sv.w)) / (2.0 * sv.radius)
-    if abs(sx) >= 0.999 || abs(sy) >= 0.999 || sz <= 0.0 || sz >= 1.0 {
+    let s = sv.project(wp)
+    if abs(s.x) >= 0.999 || abs(s.y) >= 0.999 || s.z <= 0.0 || s.z >= 1.0 {
         return 1.0
     }
-    let uv = vec2(sx * 0.5 + 0.5, 0.5 - sy * 0.5)
-    shadow_map.sample_compare_level(cmp, uv, clamp(sz - 0.0006, 0.0, 1.0))
+    let uv = vec2(s.x * 0.5 + 0.5, 0.5 - s.y * 0.5)
+    shadow_map.sample_compare_level(cmp, uv, clamp(s.z - 0.0006, 0.0, 1.0))
 }
 
 /// Spatial mapping of the world-space radiance volume (`RAD_SIDE³`).
@@ -576,30 +612,57 @@ pub fn rad_grid(centre: vec3, radius: f32, enabled: bool) -> RadGrid {
     }
 }
 
-/// Clears the `64³ × 4` fixed-point voxel accumulation buffer.
+/// Clears the first `n` words of a fixed-point accumulation buffer.
 @compute(64)
-fn rad_clear(accum: mut Slots<u32>, id: GlobalId) {
-    if id.x >= RAD_VOXELS * 4 {
+fn clear_u32(n: u32, buf: mut Slots<u32>, id: GlobalId) {
+    if id.x >= n {
         return
     }
-    accum[id] = 0
+    buf[id] = 0
 }
 
-/// Clears the coarse `256 × 8` dynamic emitter accumulation buffer.
-@compute(64)
-fn emit_clear(emit_accum: mut Slots<u32>, id: GlobalId) {
-    if id.x >= EMIT_CELLS * EMIT_STRIDE {
-        return
+/// Adds radiance `outgoing` at grid coordinate `uvw` (in `[0, 1)³`) to its voxel in `accum` and,
+/// when `peak > thresh`, emission `emits` to its coarse `8×4×8` emitter bin in `emit_accum`.
+pub fn deposit(
+    uvw: vec3,
+    outgoing: vec3,
+    emits: vec3,
+    peak: f32,
+    thresh: f32,
+    accum: mut Atomics<u32>,
+    emit_accum: mut Atomics<u32>,
+) {
+    let vx = min(u32(uvw.x * f32(RAD_SIDE)), RAD_SIDE - 1)
+    let vy = min(u32(uvw.y * f32(RAD_SIDE)), RAD_SIDE - 1)
+    let vz = min(u32(uvw.z * f32(RAD_SIDE)), RAD_SIDE - 1)
+    let idx = (vx + (vy << 6) + (vz << 12)) * 4
+    let r = u32(clamp(outgoing.x * RAD_SCALE, 0.0, 2000000.0))
+    let g = u32(clamp(outgoing.y * RAD_SCALE, 0.0, 2000000.0))
+    let b = u32(clamp(outgoing.z * RAD_SCALE, 0.0, 2000000.0))
+    let _ = accum.add(idx, r)
+    let _ = accum.add(idx + 1, g)
+    let _ = accum.add(idx + 2, b)
+    let _ = accum.add(idx + 3, 1)
+
+    if peak > thresh {
+        let ex = min(u32(uvw.x * 8.0), 7)
+        let ey = min(u32(uvw.y * 4.0), 3)
+        let ez = min(u32(uvw.z * 8.0), 7)
+        let eidx = (ex + (ey << 3) + (ez << 5)) * EMIT_STRIDE
+        let qx = u32(clamp(uvw.x * 4095.0, 0.0, 4095.0))
+        let qy = u32(clamp(uvw.y * 4095.0, 0.0, 4095.0))
+        let qz = u32(clamp(uvw.z * 4095.0, 0.0, 4095.0))
+        let er = u32(clamp(emits.x * EMIT_SCALE, 0.0, 65535.0))
+        let eg = u32(clamp(emits.y * EMIT_SCALE, 0.0, 65535.0))
+        let eb = u32(clamp(emits.z * EMIT_SCALE, 0.0, 65535.0))
+        let _ = emit_accum.add(eidx, qx)
+        let _ = emit_accum.add(eidx + 1, qy)
+        let _ = emit_accum.add(eidx + 2, qz)
+        let _ = emit_accum.add(eidx + 3, er)
+        let _ = emit_accum.add(eidx + 4, eg)
+        let _ = emit_accum.add(eidx + 5, eb)
+        let _ = emit_accum.add(eidx + 6, 1)
     }
-    emit_accum[id] = 0
-}
-
-/// Prepares indirect dispatch arguments for injecting a batch's vertices into the radiance volume.
-@compute(1)
-fn prep_inject(vert_count: [u32], cap_verts: u32, args: mut One<DispatchArgs>, id: GlobalId) {
-    let n = min(vert_count[0], cap_verts)
-    let groups = if n > 0 { (n + 63) / 64 } else { 0 }
-    args.set(id, DispatchArgs { x: groups, y: 1, z: 1 })
 }
 
 /// Injects extracted meshlet vertices (direct sunlit radiance + emissive glow + previous-frame
@@ -634,10 +697,6 @@ fn rad_inject<S: Sky>(
     if uvw.x < 0.0 || uvw.x >= 1.0 || uvw.y < 0.0 || uvw.y >= 1.0 || uvw.z < 0.0 || uvw.z >= 1.0 {
         return
     }
-    let vx = min(u32(uvw.x * f32(RAD_SIDE)), RAD_SIDE - 1)
-    let vy = min(u32(uvw.y * f32(RAD_SIDE)), RAD_SIDE - 1)
-    let vz = min(u32(uvw.z * f32(RAD_SIDE)), RAD_SIDE - 1)
-    let idx = (vx + (vy << 6) + (vz << 12)) * 4
 
     let nrm = vert.normal.xyz
     let nl2 = dot(nrm, nrm)
@@ -658,35 +717,8 @@ fn rad_inject<S: Sky>(
     let emit_peak = max(emits.x, max(emits.y, emits.z))
     let emit_bounce = if emit_peak > EMIT_THRESH { emits * 0.55 } else { emits }
     let outgoing = emit_bounce + vert.albedo.xyz * ONE_OVER_PI * (direct + sky_est * 0.5 + bounce_prev)
-
-    let r = u32(clamp(outgoing.x * RAD_SCALE, 0.0, 2000000.0))
-    let g = u32(clamp(outgoing.y * RAD_SCALE, 0.0, 2000000.0))
-    let b = u32(clamp(outgoing.z * RAD_SCALE, 0.0, 2000000.0))
-    let _ = accum.add(idx, r)
-    let _ = accum.add(idx + 1, g)
-    let _ = accum.add(idx + 2, b)
-    let _ = accum.add(idx + 3, 1)
-
-    // Auto-extract dynamic local emitters from bright glowing meshlets (`8×4×8 = 256` coarse bins).
-    if emit_peak > EMIT_THRESH {
-        let ex = min(u32(uvw.x * 8.0), 7)
-        let ey = min(u32(uvw.y * 4.0), 3)
-        let ez = min(u32(uvw.z * 8.0), 7)
-        let eidx = (ex + (ey << 3) + (ez << 5)) * EMIT_STRIDE
-        let qx = u32(clamp(uvw.x * 4095.0, 0.0, 4095.0))
-        let qy = u32(clamp(uvw.y * 4095.0, 0.0, 4095.0))
-        let qz = u32(clamp(uvw.z * 4095.0, 0.0, 4095.0))
-        let er = u32(clamp(emits.x * EMIT_SCALE, 0.0, 65535.0))
-        let eg = u32(clamp(emits.y * EMIT_SCALE, 0.0, 65535.0))
-        let eb = u32(clamp(emits.z * EMIT_SCALE, 0.0, 65535.0))
-        let _ = emit_accum.add(eidx, qx)
-        let _ = emit_accum.add(eidx + 1, qy)
-        let _ = emit_accum.add(eidx + 2, qz)
-        let _ = emit_accum.add(eidx + 3, er)
-        let _ = emit_accum.add(eidx + 4, eg)
-        let _ = emit_accum.add(eidx + 5, eb)
-        let _ = emit_accum.add(eidx + 6, 1)
-    }
+    // Auto-extract dynamic local emitters from bright glowing meshlets.
+    deposit(uvw, outgoing, emits, emit_peak, EMIT_THRESH, mut accum, mut emit_accum)
 }
 
 /// Compacts and spatially merges occupied coarse emissive bins (`8×4×8 = 256`) into at most
@@ -974,7 +1006,6 @@ pub fn eval_emitters_vol(
     if n_emit == 0 {
         return vec3(0.0)
     }
-    let g2 = g * g
     var sum = vec3(0.0)
     for i in 0..n_emit {
         let em = emitters[i]
@@ -983,9 +1014,7 @@ pub fn eval_emitters_vol(
         let r = em.pos_r.w
         let d = sqrt(max(d2, 1.0e-4))
         let l = to_l / d
-        let cos_t = dot(ray, l)
-        let denom = max(1.0 + g2 - 2.0 * g * cos_t, 1.0e-4)
-        let phase = (1.0 - g2) / (12.5663706 * denom * sqrt(denom))
+        let phase = hg_phase(dot(ray, l), g)
         let atten = 1.0 / (d2 + r * r + 0.15)
         sum += em.flux_w.xyz * (atten * phase)
     }
@@ -1169,8 +1198,9 @@ impl RadianceCache {
             return
         }
         label("mesh_radiance")
-        dispatch(rad_clear.bind(accum: mut self.accum), over: RAD_VOXELS * 4)
-        dispatch(emit_clear.bind(emit_accum: mut self.emit_accum), over: EMIT_CELLS * EMIT_STRIDE)
+        dispatch(clear_u32.bind(n: RAD_VOXELS * 4, buf: mut self.accum), over: RAD_VOXELS * 4)
+        let emit_n = EMIT_CELLS * EMIT_STRIDE
+        dispatch(clear_u32.bind(n: emit_n, buf: mut self.emit_accum), over: emit_n)
         self.emitters.clear()
     }
 
@@ -1191,11 +1221,7 @@ impl RadianceCache {
             return
         }
         dispatch(
-            prep_inject.bind(
-                vert_count: vert_count,
-                cap_verts: cap_verts,
-                args: mut self.inject_args,
-            ),
+            prep_list.bind(count: vert_count, cap: cap_verts, args: mut self.inject_args),
             over: 1,
         )
         dispatch(

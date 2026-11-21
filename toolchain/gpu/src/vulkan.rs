@@ -71,62 +71,27 @@ struct Shared {
     /// The table of views and samplers.
     table: Table,
     /// Host-visible buffers staged writes are copied into, reused once their submission is done.
-    belt: Mutex<Belt>,
+    belt: Mutex<Belt<Arc<RawBuffer>>>,
     /// Device memory in blocks, by memory type and kind (buffers, images), each resource a range
     /// of one (`Heap`).
     heap: Mutex<Heap>,
 }
-
-/// The staging belt: the buffer this submission's writes go into (and how much of it they
-/// fill), the full ones this submission also uses, and those earlier submissions use or used.
-#[derive(Default)]
-struct Belt {
-    current: Option<(Arc<RawBuffer>, u64)>,
-    filled: Vec<Arc<RawBuffer>>,
-    in_flight: Vec<(SubmissionIndex, Arc<RawBuffer>)>,
-    free: Vec<Arc<RawBuffer>>,
-}
-
-/// The least a staging buffer holds.
-const BELT_CHUNK: u64 = 4 << 20;
 
 // SAFETY: Vulkan's handles may be used from any thread when externally synchronized; the queue
 // and the pending list are behind mutexes, and the host records on one thread at a time.
 unsafe impl Send for Shared {}
 unsafe impl Sync for Shared {}
 
-/// How many views and samplers the table holds at once.
-const TABLE_LEN: u32 = 1 << 16;
-
 /// The device's table (`wrela_abi::table`): its one descriptor set (set
-/// `wrela_abi::table::TABLE_SET` of a pipeline that reaches it) and its free indices (those let
-/// go, and the next never used).
+/// `wrela_abi::table::TABLE_SET` of a pipeline that reaches it) and its free indices.
 struct Table {
     set_layout: vk::DescriptorSetLayout,
     pool: vk::DescriptorPool,
     set: vk::DescriptorSet,
-    len: u32,
-    free: Mutex<(Vec<u32>, u32)>,
+    free: IndexPool,
 }
 
 impl Table {
-    fn take(&self) -> u32 {
-        let mut f = lock(&self.free);
-        match f.0.pop() {
-            Some(i) => i,
-            None => {
-                let i = f.1;
-                assert!(i < self.len, "the table of views and samplers is full");
-                f.1 += 1;
-                i
-            }
-        }
-    }
-
-    fn give_back(&self, index: u32) {
-        lock(&self.free).0.push(index);
-    }
-
     /// The table of `len` views and samplers and its set.
     ///
     /// # Safety
@@ -179,7 +144,7 @@ impl Table {
                     .descriptor_pool(pool)
                     .set_layouts(&layouts),
             )?[0];
-            Ok(Table { set_layout, pool, set, len, free: Mutex::new((Vec::new(), 0)) })
+            Ok(Table { set_layout, pool, set, free: IndexPool::new(len) })
         }
     }
 }
@@ -214,6 +179,24 @@ enum Pending {
     },
     /// An image cleared to zero (every level and layer), and put in `GENERAL`.
     Clear { dst: Arc<RawImage> },
+}
+
+impl Pending {
+    /// What it reads (a staging buffer), if anything, and what it writes, by handle, for the
+    /// hazards between staged writes.
+    fn uses(&self) -> (Option<u64>, u64) {
+        use vk::Handle;
+        match self {
+            Pending::Buffer { staging, dst, .. } => {
+                (Some(staging.buffer.as_raw()), dst.buffer.as_raw())
+            }
+            Pending::Fill { dst } => (None, dst.buffer.as_raw()),
+            Pending::Texture { staging, dst, .. } => {
+                (Some(staging.buffer.as_raw()), dst.image.as_raw())
+            }
+            Pending::Clear { dst } => (None, dst.image.as_raw()),
+        }
+    }
 }
 
 /// The GPU: a Vulkan device and its one queue.
@@ -457,12 +440,7 @@ impl Device {
             if timestamps_valid && l.timestamp_compute_and_graphics == vk::TRUE {
                 features.push("timestamp-query");
             }
-            let features = match &options.features {
-                Some(keep) => {
-                    Features(features.into_iter().filter(|f| keep.iter().any(|k| k == f)).collect())
-                }
-                None => Features(features),
-            };
+            let features = options.features_of(features);
 
             // The device, with what it has of what the host uses.
             let priorities = [1.0f32];
@@ -864,8 +842,6 @@ impl Device {
             && desc.dimension == TextureDimension::D2
             && layers % 6 == 0
             && desc.width == desc.height;
-        let vk_samples =
-            if samples == 4 { vk::SampleCountFlags::TYPE_4 } else { vk::SampleCountFlags::TYPE_1 };
         // SAFETY: an image and its memory, made and bound here.
         let raw = unsafe {
             let d = self.raw();
@@ -884,7 +860,7 @@ impl Device {
                         .extent(extent)
                         .mip_levels(levels)
                         .array_layers(array)
-                        .samples(vk_samples)
+                        .samples(sample_count(samples))
                         .tiling(vk::ImageTiling::OPTIMAL)
                         .usage(usage)
                         .sharing_mode(vk::SharingMode::EXCLUSIVE)
@@ -906,7 +882,7 @@ impl Device {
                 device: self.0.clone(),
                 image,
                 memory,
-                format,
+                format: desc.format,
                 aspect: if depth {
                     vk::ImageAspectFlags::DEPTH
                 } else {
@@ -975,7 +951,7 @@ impl Device {
         // SAFETY: a sampler.
         let raw =
             unsafe { self.raw().create_sampler(&info, None).expect("Vulkan made no sampler") };
-        let index = self.0.table.take();
+        let index = self.0.table.free.take();
         let image = [vk::DescriptorImageInfo {
             sampler: raw,
             image_view: vk::ImageView::null(),
@@ -1013,18 +989,29 @@ impl Device {
     pub fn create_bind_group_layout(&self, entries: &[LayoutEntry]) -> BindGroupLayout {
         // What the device's table holds isn't in the set: its index is in the block, pushed.
         let block = entries.iter().filter_map(|e| e.index_at).map(|at| at + 4).max().unwrap_or(0);
-        let bindings: Vec<vk::DescriptorSetLayoutBinding<'_>> = entries
-            .iter()
-            .filter(|e| e.index_at.is_none())
-            .enumerate()
-            .map(|(k, e)| {
+        let mut bindings: Vec<vk::DescriptorSetLayoutBinding<'_>> = Vec::new();
+        let mut numbers = Vec::with_capacity(entries.len());
+        let mut sizes: Vec<vk::DescriptorPoolSize> = Vec::new();
+        for e in entries {
+            if e.index_at.is_some() {
+                numbers.push(None);
+                continue;
+            }
+            let number = bindings.len() as u32;
+            let ty = descriptor_type(e.ty);
+            numbers.push(Some(number));
+            bindings.push(
                 vk::DescriptorSetLayoutBinding::default()
-                    .binding(k as u32)
-                    .descriptor_type(descriptor_type(e.ty))
+                    .binding(number)
+                    .descriptor_type(ty)
                     .descriptor_count(1)
-                    .stage_flags(stages(e.visibility))
-            })
-            .collect();
+                    .stage_flags(stages(e.visibility)),
+            );
+            match sizes.iter_mut().find(|s| s.ty == ty) {
+                Some(s) => s.descriptor_count += 1,
+                None => sizes.push(vk::DescriptorPoolSize { ty, descriptor_count: 1 }),
+            }
+        }
         // SAFETY: a set layout and a pipeline layout over it.
         unsafe {
             let d = self.raw();
@@ -1052,6 +1039,8 @@ impl Device {
             BindGroupLayout(Arc::new(Layout {
                 device: self.0.clone(),
                 entries: entries.to_vec(),
+                numbers,
+                sizes,
                 set,
                 pipeline,
                 block: block as usize,
@@ -1065,31 +1054,14 @@ impl Device {
         entries: &[BindGroupEntry<'_>],
     ) -> BindGroup {
         let l = &layout.0;
-        let mut sizes: Vec<vk::DescriptorPoolSize> = Vec::new();
-        // Each entry's binding in the set (none for what the table holds).
-        let mut numbers = Vec::with_capacity(l.entries.len());
-        let mut next = 0u32;
-        for e in &l.entries {
-            if e.index_at.is_some() {
-                numbers.push(None);
-                continue;
-            }
-            numbers.push(Some(next));
-            next += 1;
-            let ty = descriptor_type(e.ty);
-            match sizes.iter_mut().find(|s| s.ty == ty) {
-                Some(s) => s.descriptor_count += 1,
-                None => sizes.push(vk::DescriptorPoolSize { ty, descriptor_count: 1 }),
-            }
-        }
         // SAFETY: a pool of one set, the set, and its descriptors written from live resources.
         unsafe {
             let d = self.raw();
-            let pool = if sizes.is_empty() {
+            let pool = if l.sizes.is_empty() {
                 vk::DescriptorPool::null()
             } else {
                 d.create_descriptor_pool(
-                    &vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&sizes),
+                    &vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&l.sizes),
                     None,
                 )
                 .expect("Vulkan made no descriptor pool")
@@ -1109,7 +1081,11 @@ impl Device {
             let mut images: Vec<[vk::DescriptorImageInfo; 1]> = Vec::new();
             let mut writes: Vec<(u32, vk::DescriptorType, bool, usize)> = Vec::new();
             let mut held = Vec::new();
-            let mut uses: Vec<(u64, bool)> = Vec::new();
+            let (mut read, mut written) = (Vec::new(), Vec::new());
+            // What it binds by its handle, read or (where a shader may write it) written.
+            let mut uses = |handle: u64, writes: bool| {
+                if writes { written.push(handle) } else { read.push(handle) }
+            };
             let mut block = vec![0u8; l.block];
             for e in entries {
                 let Some(k) = l.entries.iter().position(|x| x.binding == e.binding) else {
@@ -1119,10 +1095,10 @@ impl Device {
                     let index = match &e.resource {
                         Resource::View(v) => {
                             held.push(Held::View(v.raw.clone()));
-                            uses.push((
+                            uses(
                                 vk::Handle::as_raw(v.raw.image.image),
                                 matches!(l.entries[k].ty, BindingType::StorageTexture { .. }),
-                            ));
+                            );
                             v.raw.index
                         }
                         Resource::Sampler(s) => {
@@ -1135,7 +1111,7 @@ impl Device {
                     block[at..at + 4].copy_from_slice(&index.to_le_bytes());
                     continue;
                 }
-                let k_set = numbers[k].expect("an entry of the set");
+                let k_set = l.numbers[k].expect("an entry of the set");
                 let ty = descriptor_type(l.entries[k].ty);
                 match &e.resource {
                     Resource::Buffer { buffer, offset, size } => {
@@ -1153,13 +1129,13 @@ impl Device {
                         }]);
                         writes.push((k_set, ty, true, buffers.len() - 1));
                         held.push(Held::Buffer(buffer.raw.clone()));
-                        uses.push((
+                        uses(
                             vk::Handle::as_raw(buffer.raw.buffer),
                             matches!(
                                 l.entries[k].ty,
                                 BindingType::Storage { read_only: false, .. }
                             ),
-                        ));
+                        );
                     }
                     Resource::View(v) => {
                         images.push([vk::DescriptorImageInfo {
@@ -1169,10 +1145,10 @@ impl Device {
                         }]);
                         writes.push((k_set, ty, false, images.len() - 1));
                         held.push(Held::View(v.raw.clone()));
-                        uses.push((
+                        uses(
                             vk::Handle::as_raw(v.raw.image.image),
                             matches!(l.entries[k].ty, BindingType::StorageTexture { .. }),
-                        ));
+                        );
                     }
                     Resource::Sampler(s) => {
                         images.push([vk::DescriptorImageInfo {
@@ -1204,22 +1180,27 @@ impl Device {
                 pool,
                 set,
                 _held: held,
-                uses,
+                reads: read,
+                writes: written,
                 block,
             }))
         }
     }
 
-    /// A shader module of SPIR-V words (little-endian bytes).
+    /// A shader module of SPIR-V words (little-endian bytes): whole words, a header's at least,
+    /// from its magic number.
     pub fn create_shader_module(&self, label: &str, source: &[u8]) -> Result<ShaderModule> {
-        if source.len() % 4 != 0 {
+        if source.len() % 4 != 0 || source.len() < 20 {
             return Err(Error(format!(
-                "{label}: SPIR-V of {} bytes, not whole words",
+                "{label}: it isn't SPIR-V: {} bytes, not whole words of a header and more",
                 source.len()
             )));
         }
         let words: Vec<u32> =
             source.chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        if words[0] != 0x0723_0203 {
+            return Err(Error(format!("{label}: it isn't SPIR-V: no magic number")));
+        }
         // SAFETY: a module of the words.
         let raw = unsafe {
             self.raw()
@@ -1289,13 +1270,8 @@ impl Device {
                 .depth_bias_slope_factor(d.bias.slope_scale)
                 .depth_bias_clamp(d.bias.clamp);
         }
-        let multisample = vk::PipelineMultisampleStateCreateInfo::default().rasterization_samples(
-            if desc.samples == 4 {
-                vk::SampleCountFlags::TYPE_4
-            } else {
-                vk::SampleCountFlags::TYPE_1
-            },
-        );
+        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(sample_count(desc.samples));
         let depth_state = match &desc.depth {
             Some(d) => vk::PipelineDepthStencilStateCreateInfo::default()
                 .depth_test_enable(true)
@@ -1338,8 +1314,9 @@ impl Device {
         })
     }
 
-    pub fn create_command_encoder(&self, label: &str) -> CommandEncoder {
-        CommandEncoder::new(self.clone(), label)
+    /// A command encoder (Vulkan's command buffers carry no label here).
+    pub fn create_command_encoder(&self, _label: &str) -> CommandEncoder {
+        CommandEncoder::new(self.clone())
     }
 
     /// Writes `data` at `offset` of `buffer` before the next submission's own work.
@@ -1347,7 +1324,7 @@ impl Device {
         if data.is_empty() {
             return;
         }
-        let (staging, at) = self.staging(data, 4);
+        let (staging, at) = self.staging(data, COPY_BUFFER_ALIGNMENT);
         lock(&self.0.pending).push(Pending::Buffer {
             staging,
             at,
@@ -1370,11 +1347,8 @@ impl Device {
         if data.is_empty() {
             return;
         }
-        let (staging, staged_at) = self.staging(data, 256);
-        let (layer, z) = match at.texture.dimension {
-            TextureDimension::D3 => (0, at.origin[2]),
-            TextureDimension::D2 => (at.origin[2], 0),
-        };
+        let (staging, staged_at) = self.staging(data, u64::from(COPY_BYTES_PER_ROW_ALIGNMENT));
+        let (layer, z) = at.texture.dimension.split(at.origin[2], 0);
         lock(&self.0.pending).push(Pending::Texture {
             staging,
             at: staged_at,
@@ -1391,50 +1365,9 @@ impl Device {
     /// `data` copied into the staging belt at an offset aligned to `align`: the buffer and the
     /// offset, which the next submission copies from.
     fn staging(&self, data: &[u8], align: u64) -> (Arc<RawBuffer>, u64) {
-        let need = data.len() as u64;
-        let mut belt = lock(&self.0.belt);
-        let (buffer, at) = match belt.current.take() {
-            Some((b, used)) if used.next_multiple_of(align) + need <= b.size => {
-                let at = used.next_multiple_of(align);
-                (b, at)
-            }
-            other => {
-                if let Some((b, _)) = other {
-                    belt.filled.push(b);
-                }
-                let free = belt.free.iter().position(|b| b.size >= need);
-                let b = match free {
-                    Some(k) => belt.free.swap_remove(k),
-                    None => self.raw_buffer(
-                        need.max(BELT_CHUNK).next_power_of_two(),
-                        true,
-                        vk::BufferUsageFlags::TRANSFER_SRC,
-                    ),
-                };
-                (b, 0)
-            }
-        };
-        // SAFETY: the mapping holds `at + need` bytes; no submission uses this part of it yet.
-        unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), buffer.mapped.add(at as usize), data.len())
-        };
-        belt.current = Some((buffer.clone(), at + need));
-        (buffer, at)
-    }
-
-    /// The staging belt's buffers this submission uses go in flight with it; those of
-    /// submissions done are free again.
-    fn turn_belt(&self, index: SubmissionIndex) {
-        let done = self.completed();
-        let mut belt = lock(&self.0.belt);
-        let current = belt.current.take().map(|c| c.0);
-        let used: Vec<_> = belt.filled.drain(..).chain(current).collect();
-        belt.in_flight.extend(used.into_iter().map(|b| (index, b)));
-        let (ready, busy): (Vec<_>, Vec<_>) =
-            belt.in_flight.drain(..).partition(|(i, _)| *i <= done);
-        belt.in_flight = busy;
-        belt.free.extend(ready.into_iter().map(|(_, b)| b));
-        belt.free.truncate(8);
+        lock(&self.0.belt).stage(data, align, |len| {
+            self.raw_buffer(len, true, vk::BufferUsageFlags::TRANSFER_SRC)
+        })
     }
 
     /// Records the staged writes, then submits them and `buffers`, in order: their submission's
@@ -1452,13 +1385,14 @@ impl Device {
     ) -> SubmissionIndex {
         let pending = std::mem::take(&mut *lock(&self.0.pending));
         let index = self.0.submitted.fetch_add(1, Ordering::AcqRel) + 1;
-        self.turn_belt(index);
+        let done = self.completed();
+        lock(&self.0.belt).turn(index, done);
         let mut keep: Vec<Keep> = Vec::new();
         let mut pools = Vec::new();
         let mut cbs = Vec::new();
         let mut timed: Vec<u64> = Vec::new();
         if !pending.is_empty() {
-            let mut enc = CommandEncoder::new(self.clone(), "queue writes");
+            let mut enc = CommandEncoder::new(self.clone());
             for w in &pending {
                 enc.record_pending(w, &mut keep);
             }
@@ -1557,18 +1491,13 @@ impl Device {
         if index > self.completed() {
             return None;
         }
-        let (first, last) = {
-            let c = lock(&self.0.clock_of);
-            let k = c.binary_search_by_key(&index, |(i, ..)| *i).ok()?;
-            (c[k].1, c[k].2)
-        };
+        let (first, last) = span(&lock(&self.0.clock_of), index)?;
         if first + CLOCK_KEPT as u64 <= self.0.clock_next.load(Ordering::Acquire) {
             return None;
         }
-        let start = self.clock_stamp(pool, 2 * (first % CLOCK_KEPT as u64) as u32)?;
-        let end = self.clock_stamp(pool, 2 * (last % CLOCK_KEPT as u64) as u32 + 1)?;
-        let ticks = end.wrapping_sub(start) & mask;
-        Some(ticks as f64 * f64::from(self.0.timestamp_period) * 1e-6)
+        let start = self.clock_stamp(pool, clock_slot(first, false))?;
+        let end = self.clock_stamp(pool, clock_slot(last, true))?;
+        Some(self.ticks_ms(end.wrapping_sub(start) & mask))
     }
 
     /// How long the GPU had none of this device's work before submission `index` began (ms): from
@@ -1579,20 +1508,23 @@ impl Device {
         if index > self.completed() || index == 0 {
             return None;
         }
-        let (before, first) = {
+        let (before, (first, _)) = {
             let c = lock(&self.0.clock_of);
-            let k = c.binary_search_by_key(&index, |(i, ..)| *i).ok()?;
-            let j = c.binary_search_by_key(&(index - 1), |(i, ..)| *i).ok()?;
-            (c[j], c[k].1)
+            let k = span(&c, index)?;
+            (span(&c, index - 1)?, k)
         };
-        if before.1 + CLOCK_KEPT as u64 <= self.0.clock_next.load(Ordering::Acquire) {
+        if before.0 + CLOCK_KEPT as u64 <= self.0.clock_next.load(Ordering::Acquire) {
             return None;
         }
-        let end = self.clock_stamp(pool, 2 * (before.2 % CLOCK_KEPT as u64) as u32 + 1)?;
-        let start = self.clock_stamp(pool, 2 * (first % CLOCK_KEPT as u64) as u32)?;
+        let end = self.clock_stamp(pool, clock_slot(before.1, true))?;
+        let start = self.clock_stamp(pool, clock_slot(first, false))?;
         let ticks = start.wrapping_sub(end) & mask;
-        let ticks = if ticks > mask / 2 { 0 } else { ticks };
-        Some(ticks as f64 * f64::from(self.0.timestamp_period) * 1e-6)
+        Some(self.ticks_ms(if ticks > mask / 2 { 0 } else { ticks }))
+    }
+
+    /// `ticks` of the GPU's clock in ms.
+    fn ticks_ms(&self, ticks: u64) -> f64 {
+        ticks as f64 * f64::from(self.0.timestamp_period) * 1e-6
     }
 
     /// One query of the device's clock pool, read without waiting: one not yet written isn't
@@ -1659,6 +1591,15 @@ impl Device {
     pub fn lose(&self) {
         lock(&self.0.errors).push("Vulkan lost the device: simulated (WRELA_GPU_LOSE_AT)".into());
     }
+}
+
+/// Submission `index`'s first and last timed command buffers, while `clock_of` has it.
+fn span(
+    clock_of: &std::collections::VecDeque<(SubmissionIndex, u64, u64)>,
+    index: SubmissionIndex,
+) -> Option<(u64, u64)> {
+    let k = clock_of.binary_search_by_key(&index, |(i, ..)| *i).ok()?;
+    Some((clock_of[k].1, clock_of[k].2))
 }
 
 impl Drop for Shared {
@@ -1833,10 +1774,6 @@ mod heap_tests {
     }
 }
 
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
-}
-
 fn cstr(chars: &[std::ffi::c_char]) -> String {
     // SAFETY: Vulkan's fixed-size names end in a NUL.
     unsafe { CStr::from_ptr(chars.as_ptr()) }.to_string_lossy().into_owned()
@@ -1856,6 +1793,19 @@ struct RawBuffer {
 // SAFETY: the mapping is only read or written by the host's one recording thread.
 unsafe impl Send for RawBuffer {}
 unsafe impl Sync for RawBuffer {}
+
+impl StagingBuffer for Arc<RawBuffer> {
+    fn size(&self) -> u64 {
+        self.size
+    }
+
+    unsafe fn write(&self, at: u64, data: &[u8]) {
+        // SAFETY: the caller's; a staging buffer is mapped whole.
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), self.mapped.add(at as usize), data.len())
+        };
+    }
+}
 
 impl Drop for RawBuffer {
     fn drop(&mut self) {
@@ -1911,7 +1861,7 @@ struct RawImage {
     image: vk::Image,
     /// Its memory; a swapchain's image has none of ours (`Allocation::NONE`).
     memory: Allocation,
-    format: vk::Format,
+    format: TextureFormat,
     aspect: vk::ImageAspectFlags,
     levels: u32,
     layers: u32,
@@ -2111,7 +2061,7 @@ impl Texture {
                     &vk::ImageViewCreateInfo::default()
                         .image(self.raw.image)
                         .view_type(ty)
-                        .format(self.raw.format)
+                        .format(vk_format(self.raw.format))
                         .subresource_range(range),
                     None,
                 )
@@ -2133,7 +2083,7 @@ impl Texture {
         // Its index in the table: a sampled image there, and a storage image where it can be
         // one (a kernel may write it: one level, not a cube).
         let device = &self.raw.device;
-        let index = device.table.take();
+        let index = device.table.free.take();
         let usage = self.raw.usage;
         let mut writes = Vec::new();
         let sampled = [vk::DescriptorImageInfo {
@@ -2204,7 +2154,7 @@ impl Drop for RawView {
         // SAFETY: nothing in flight holds it.
         unsafe { self.image.device.raw.destroy_image_view(self.view, None) };
         if self.index != NO_INDEX {
-            self.image.device.table.give_back(self.index);
+            self.image.device.table.free.give_back(self.index);
         }
     }
 }
@@ -2225,7 +2175,7 @@ impl Drop for RawSampler {
     fn drop(&mut self) {
         // SAFETY: nothing in flight holds it.
         unsafe { self.device.raw.destroy_sampler(self.raw, None) };
-        self.device.table.give_back(self.index);
+        self.device.table.free.give_back(self.index);
     }
 }
 
@@ -2302,6 +2252,10 @@ pub struct RenderPipeline {
 struct Layout {
     device: Arc<Shared>,
     entries: Vec<LayoutEntry>,
+    /// Each entry's binding in the set (none for what the table holds).
+    numbers: Vec<Option<u32>>,
+    /// The descriptors of each type a set of it holds, for a group's pool.
+    sizes: Vec<vk::DescriptorPoolSize>,
     set: vk::DescriptorSetLayout,
     /// Its set, then (where it has a block) the table's, and the block's push constants.
     pipeline: vk::PipelineLayout,
@@ -2338,9 +2292,10 @@ struct Group {
     set: vk::DescriptorSet,
     /// The resources it binds, alive while it is.
     _held: Vec<Held>,
-    /// What it binds by its handle (a buffer's or an image's), and whether a shader may write
-    /// it: what a command that sets it uses, for the encoder's hazards.
-    uses: Vec<(u64, bool)>,
+    /// What it binds by its handle (a buffer's or an image's) that shaders only read, and what
+    /// they may write: what a command that sets it uses, for the encoder's hazards.
+    reads: Vec<u64>,
+    writes: Vec<u64>,
     /// Its block: the index in the device's table of each view and sampler the table holds.
     block: Vec<u8>,
 }
@@ -2365,14 +2320,87 @@ pub struct CommandEncoder {
     raw: vk::CommandBuffer,
     /// Its slot in the device's clock (`Device::gpu_ms`), if it has one.
     clock: Option<u64>,
-    /// What its commands use, alive until its submission is done.
+    /// What its commands use (groups, pipelines, resources), alive until its submission is done.
     keep: Vec<Keep>,
-    groups: Vec<Arc<Group>>,
-    pipelines: Vec<Arc<RawPipeline>>,
-    held: Vec<Held>,
-    /// The resources written, and read, since the last barrier, by handle.
+    /// What its commands since the last full barrier used.
+    hazards: Hazards,
+}
+
+/// The resources commands since the last full barrier wrote, and read, by handle: whether the
+/// next command must wait on a full barrier ([`CommandEncoder::hazard`]).
+#[derive(Default)]
+struct Hazards {
     written: std::collections::HashSet<u64>,
     read: std::collections::HashSet<u64>,
+}
+
+impl Hazards {
+    /// Notes a command that reads `reads` and writes `writes`: whether a full barrier must come
+    /// before it (it reads or writes what one since the last barrier wrote, or writes what one
+    /// read), after which only its own uses are noted.
+    fn note(&mut self, reads: &[u64], writes: &[u64]) -> bool {
+        let conflict = reads.iter().any(|r| self.written.contains(r))
+            || writes.iter().any(|w| self.written.contains(w) || self.read.contains(w));
+        if conflict {
+            self.clear();
+        }
+        self.read.extend(reads);
+        self.written.extend(writes);
+        conflict
+    }
+
+    /// Nothing noted: a full barrier was recorded.
+    fn clear(&mut self) {
+        self.written.clear();
+        self.read.clear();
+    }
+}
+
+#[cfg(test)]
+mod hazard_tests {
+    use super::*;
+
+    /// Which of `writes` (each a staged write's staging read, if any, and its destination) wait
+    /// on a barrier, as `record_pending` notes them.
+    fn barriers(writes: &[(Option<u64>, u64)]) -> Vec<bool> {
+        let mut h = Hazards::default();
+        writes.iter().map(|(read, dst)| h.note(read.as_slice(), &[*dst])).collect()
+    }
+
+    #[test]
+    fn staged_writes_wait_only_on_what_they_touch() {
+        let (staging, a, b, image, other) = (1, 2, 3, 4, 5);
+        // A program's start: its resources zeroed, then written from one staging buffer.
+        let got = barriers(&[
+            (None, a),              // fill a
+            (None, b),              // fill b
+            (None, image),          // clear the image
+            (Some(staging), a),     // write a: after its fill
+            (Some(staging), b),     // write b: its fill is behind that barrier
+            (Some(staging), image), // write the image: its clear is too
+            (None, other),          // clear another image
+        ]);
+        assert_eq!(got, [false, false, false, true, false, false, false]);
+    }
+
+    #[test]
+    fn writes_into_one_resource_wait_on_each_other() {
+        let (staging, a) = (1, 2);
+        // `writes_apply_in_recorded_order`'s writes, one submission's worth: each waits on the
+        // one before, so they land in order.
+        let got =
+            barriers(&[(None, a), (Some(staging), a), (Some(staging), a), (Some(staging), a)]);
+        assert_eq!(got, [false, true, true, true]);
+    }
+
+    #[test]
+    fn a_write_into_what_was_read_waits() {
+        let mut h = Hazards::default();
+        assert!(!h.note(&[7], &[8]));
+        assert!(h.note(&[], &[7]), "a write after a read of it");
+        assert!(!h.note(&[9], &[10]));
+        assert!(h.note(&[7], &[]), "a read after a write of it");
+    }
 }
 
 pub struct CommandBuffer {
@@ -2381,6 +2409,24 @@ pub struct CommandBuffer {
     keep: Vec<Keep>,
     /// Its slot in the device's clock, if it times its work.
     clock: Option<u64>,
+}
+
+/// A timestamp of `stage` into query `query` of `pool`, reset before.
+fn stamp(
+    d: &ash::Device,
+    cb: vk::CommandBuffer,
+    stage: vk::PipelineStageFlags2,
+    pool: vk::QueryPool,
+    query: u32,
+) {
+    // SAFETY: a timestamp write in a recording command buffer, into a live pool's reset query.
+    unsafe { d.cmd_write_timestamp2(cb, stage, pool, query) };
+}
+
+/// The query of the device's clock pool that holds the `seq`th command buffer begun's start, or
+/// its `end`: two a buffer, the last [`CLOCK_KEPT`] buffers' in turn.
+fn clock_slot(seq: u64, end: bool) -> u32 {
+    2 * (seq % CLOCK_KEPT as u64) as u32 + u32::from(end)
 }
 
 /// Everything before, done and visible to everything after: the full barrier between commands.
@@ -2397,8 +2443,7 @@ fn full_barrier(d: &ash::Device, cb: vk::CommandBuffer) {
 }
 
 impl CommandEncoder {
-    fn new(device: Device, label: &str) -> CommandEncoder {
-        let _ = label;
+    fn new(device: Device) -> CommandEncoder {
         // SAFETY: a pool of one command buffer, begun for one submission.
         unsafe {
             let d = device.raw();
@@ -2429,9 +2474,9 @@ impl CommandEncoder {
             // Its slot in the clock's pool, reset, and its start once everything before is done.
             let clock = device.0.clock.map(|(queries, _)| {
                 let seq = device.0.clock_next.fetch_add(1, Ordering::AcqRel);
-                let slot = 2 * (seq % CLOCK_KEPT as u64) as u32;
+                let slot = clock_slot(seq, false);
                 d.cmd_reset_query_pool(raw, queries, slot, 2);
-                d.cmd_write_timestamp2(raw, vk::PipelineStageFlags2::ALL_COMMANDS, queries, slot);
+                stamp(d, raw, vk::PipelineStageFlags2::ALL_COMMANDS, queries, slot);
                 seq
             });
             CommandEncoder {
@@ -2440,11 +2485,7 @@ impl CommandEncoder {
                 raw,
                 clock,
                 keep: Vec::new(),
-                groups: Vec::new(),
-                pipelines: Vec::new(),
-                held: Vec::new(),
-                written: std::collections::HashSet::new(),
-                read: std::collections::HashSet::new(),
+                hazards: Hazards::default(),
             }
         }
     }
@@ -2453,28 +2494,36 @@ impl CommandEncoder {
         &self.device.0.raw
     }
 
+    /// Keeps `h` alive until the submission is done.
+    fn hold(&mut self, h: Held) {
+        self.keep.push(Keep::Held(h));
+    }
+
     /// Before a command that reads `reads` and writes `writes`: a barrier, if it reads or
     /// writes what a command since the last one wrote, or writes what one read; then notes
     /// its own.
     fn hazard(&mut self, reads: &[u64], writes: &[u64]) {
-        let conflict = reads.iter().any(|r| self.written.contains(r))
-            || writes.iter().any(|w| self.written.contains(w) || self.read.contains(w));
-        if conflict {
-            self.barrier_all();
+        if self.hazards.note(reads, writes) {
+            full_barrier(self.d(), self.raw);
         }
-        self.read.extend(reads);
-        self.written.extend(writes);
     }
 
     /// The full barrier, and nothing pending after it.
     fn barrier_all(&mut self) {
         full_barrier(self.d(), self.raw);
-        self.written.clear();
-        self.read.clear();
+        self.hazards.clear();
     }
 
-    /// One staged write.
+    /// One staged write, after a barrier only where it uses what one before it wrote (a write
+    /// into what was just filled or cleared, two writes into one resource). That is all the
+    /// ordering the staged writes need: their staging buffers are written by the host before
+    /// the submission and only read here; their layout moves are their own image barriers; and
+    /// whatever comes after them, in this submission or a later one, is recorded by another
+    /// encoder, whose command buffer begins with a full barrier ([`CommandEncoder::new`]), as
+    /// this one's does for what came before.
     fn record_pending(&mut self, w: &Pending, keep: &mut Vec<Keep>) {
+        let (read, written) = w.uses();
+        self.hazard(read.as_slice(), &[written]);
         let cb = self.raw;
         // SAFETY: copies, fills and clears in a recording command buffer, of live resources the
         // submission keeps.
@@ -2503,11 +2552,10 @@ impl CommandEncoder {
                     origin,
                     extent,
                 } => {
-                    let texel = format_texel(dst.format);
                     let region = [vk::BufferImageCopy {
                         buffer_offset: *at,
-                        buffer_row_length: bytes_per_row / texel.0 * texel.1,
-                        buffer_image_height: rows_per_image * texel.1,
+                        buffer_row_length: texels_per_row(dst.format, *bytes_per_row),
+                        buffer_image_height: rows_per_image * dst.format.block(),
                         image_subresource: vk::ImageSubresourceLayers {
                             aspect_mask: dst.aspect,
                             mip_level: *level,
@@ -2559,7 +2607,6 @@ impl CommandEncoder {
                     transition(d, cb, dst.image, range, to, dst.home);
                 }
             }
-            full_barrier(d, cb);
         }
     }
 
@@ -2579,8 +2626,8 @@ impl CommandEncoder {
         self.hazard(&[vk::Handle::as_raw(src.raw.buffer)], &[vk::Handle::as_raw(dst.raw.buffer)]);
         // SAFETY: a copy between live buffers the encoder keeps.
         unsafe { self.d().cmd_copy_buffer(self.raw, src.raw.buffer, dst.raw.buffer, &region) };
-        self.held.push(Held::Buffer(src.raw.clone()));
-        self.held.push(Held::Buffer(dst.raw.clone()));
+        self.hold(Held::Buffer(src.raw.clone()));
+        self.hold(Held::Buffer(dst.raw.clone()));
     }
 
     fn buffer_image(
@@ -2588,23 +2635,13 @@ impl CommandEncoder {
         t: &TextureCopy<'_>,
         extent: [u32; 3],
     ) -> vk::BufferImageCopy {
-        let texel = format_texel(t.texture.raw.format);
-        let (layer, z) = match t.texture.dimension {
-            TextureDimension::D3 => (0, t.origin[2]),
-            TextureDimension::D2 => (t.origin[2], 0),
-        };
-        let layers = match t.texture.dimension {
-            TextureDimension::D3 => 1,
-            TextureDimension::D2 => extent[2],
-        };
-        let depth = match t.texture.dimension {
-            TextureDimension::D3 => extent[2],
-            TextureDimension::D2 => 1,
-        };
+        let format = t.texture.raw.format;
+        let (layer, z) = t.texture.dimension.split(t.origin[2], 0);
+        let (layers, depth) = t.texture.dimension.split(extent[2], 1);
         vk::BufferImageCopy {
             buffer_offset: b.offset,
-            buffer_row_length: b.bytes_per_row / texel.0 * texel.1,
-            buffer_image_height: b.rows_per_image * texel.1,
+            buffer_row_length: texels_per_row(format, b.bytes_per_row),
+            buffer_image_height: b.rows_per_image * format.block(),
             image_subresource: vk::ImageSubresourceLayers {
                 aspect_mask: t.texture.raw.aspect,
                 mip_level: t.level,
@@ -2650,8 +2687,8 @@ impl CommandEncoder {
             )
         };
         transition(self.d(), self.raw, image.image, part, to, image.home);
-        self.held.push(Held::Buffer(src.buffer.raw.clone()));
-        self.held.push(Held::Image(image.clone()));
+        self.hold(Held::Buffer(src.buffer.raw.clone()));
+        self.hold(Held::Image(image.clone()));
     }
 
     pub fn copy_texture_to_buffer(
@@ -2684,8 +2721,8 @@ impl CommandEncoder {
             )
         };
         transition(self.d(), self.raw, image.image, part, from, image.home);
-        self.held.push(Held::Buffer(dst.buffer.raw.clone()));
-        self.held.push(Held::Image(image.clone()));
+        self.hold(Held::Buffer(dst.buffer.raw.clone()));
+        self.hold(Held::Image(image.clone()));
     }
 
     pub fn copy_texture_to_texture(
@@ -2697,16 +2734,9 @@ impl CommandEncoder {
         if extent.contains(&0) {
             return;
         }
-        let layers_of = |t: &TextureCopy<'_>| match t.texture.dimension {
-            TextureDimension::D3 => (0, t.origin[2], 1),
-            TextureDimension::D2 => (t.origin[2], 0, extent[2]),
-        };
-        let (sl, sz, n) = layers_of(&src);
-        let (dl, dz, _) = layers_of(&dst);
-        let depth = match src.texture.dimension {
-            TextureDimension::D3 => extent[2],
-            TextureDimension::D2 => 1,
-        };
+        let (sl, sz) = src.texture.dimension.split(src.origin[2], 0);
+        let (dl, dz) = dst.texture.dimension.split(dst.origin[2], 0);
+        let (n, depth) = src.texture.dimension.split(extent[2], 1);
         let region = [vk::ImageCopy {
             src_subresource: vk::ImageSubresourceLayers {
                 aspect_mask: src.texture.raw.aspect,
@@ -2754,8 +2784,8 @@ impl CommandEncoder {
         transition(d, cb, a.image, pa, from, a.home);
         transition(d, cb, b.image, pb, to, b.home);
         let (a, b) = (a.clone(), b.clone());
-        self.held.push(Held::Image(a));
-        self.held.push(Held::Image(b));
+        self.hold(Held::Image(a));
+        self.hold(Held::Image(b));
     }
 
     /// Timestamps `first..first + count` as 64-bit ticks into `dst` at `offset`.
@@ -2781,34 +2811,28 @@ impl CommandEncoder {
                 vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
             )
         };
-        self.held.push(Held::Buffer(dst.raw.clone()));
+        self.hold(Held::Buffer(dst.raw.clone()));
         self.barrier_all();
     }
 
-    fn timestamp(&mut self, queries: &QuerySet, index: u32, end: bool) {
-        // SAFETY: a timestamp write into a pool; the query was reset before its pass.
-        unsafe {
-            self.d().cmd_write_timestamp2(
-                self.raw,
-                if end {
-                    vk::PipelineStageFlags2::ALL_COMMANDS
-                } else {
-                    vk::PipelineStageFlags2::TOP_OF_PIPE
-                },
-                queries.raw.pool,
-                index,
-            )
-        };
-    }
-
+    /// A pass's timestamps reset, and its begin written.
     fn reset(&mut self, t: Option<PassTimestamps<'_>>) {
         if let Some(t) = t {
+            let pool = t.queries.raw.pool;
             // SAFETY: resets outside any pass.
             unsafe {
-                self.d().cmd_reset_query_pool(self.raw, t.queries.raw.pool, t.begin, 1);
-                self.d().cmd_reset_query_pool(self.raw, t.queries.raw.pool, t.end, 1);
+                self.d().cmd_reset_query_pool(self.raw, pool, t.begin, 1);
+                self.d().cmd_reset_query_pool(self.raw, pool, t.end, 1);
             }
-            self.timestamp(t.queries, t.begin, false);
+            stamp(self.d(), self.raw, vk::PipelineStageFlags2::TOP_OF_PIPE, pool, t.begin);
+        }
+    }
+
+    /// A pass's end timestamp, if it's timed, written as it ends; its queries kept.
+    fn end_pass(&mut self, end: Option<(Arc<RawQueries>, u32)>) {
+        if let Some((q, end)) = end {
+            stamp(self.d(), self.raw, vk::PipelineStageFlags2::ALL_COMMANDS, q.pool, end);
+            self.keep.push(Keep::Queries(q));
         }
     }
 
@@ -2823,56 +2847,54 @@ impl CommandEncoder {
         ComputePass { encoder: self, layout: None, end, bound: None }
     }
 
+    /// A pass's attachment `v`, `cleared` as it begins or not, and the view it resolves into, if
+    /// any, moved into `to`, the layout drawing takes, and kept until the submission is done. A
+    /// multisampled attachment comes from `UNDEFINED` where it's cleared and stays in `to` after
+    /// the pass; a single-sampled one, and the resolve target, go home as it ends (`targets`).
+    /// A swapchain's image comes from `UNDEFINED` (a resolve target's only where its flag says to
+    /// check).
+    fn attach(
+        &mut self,
+        targets: &mut Vec<(Arc<RawView>, vk::ImageLayout)>,
+        to: vk::ImageLayout,
+        v: &Arc<RawView>,
+        cleared: bool,
+        resolve: Option<(&Arc<RawView>, bool)>,
+    ) {
+        let undefined_if = |yes: bool, home| if yes { vk::ImageLayout::UNDEFINED } else { home };
+        let multisampled = v.image.samples > 1;
+        let from =
+            undefined_if(if multisampled { cleared } else { v.image.swapchain }, v.image.home);
+        transition(self.d(), self.raw, v.image.image, v.range, from, to);
+        if !multisampled {
+            targets.push((v.clone(), to));
+        }
+        self.hold(Held::View(v.clone()));
+        if let Some((r, swapchain_checked)) = resolve {
+            let from = undefined_if(swapchain_checked && r.image.swapchain, r.image.home);
+            transition(self.d(), self.raw, r.image.image, r.range, from, to);
+            targets.push((r.clone(), to));
+            self.hold(Held::View(r.clone()));
+        }
+    }
+
     pub fn begin_render_pass(&mut self, desc: &RenderPassDesc<'_>) -> RenderPass<'_> {
         self.barrier_all();
         self.reset(desc.timestamps);
         // Its targets, out of their homes into the layouts drawing takes.
         let mut targets: Vec<(Arc<RawView>, vk::ImageLayout)> = Vec::new();
         for c in desc.colors {
-            let v = &c.view.raw;
+            let cleared = matches!(c.load, LoadOp::Clear(_));
+            let resolve = c.resolve.map(|r| (&r.raw, true));
             let to = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
-            if v.image.samples > 1 {
-                let from = if matches!(c.load, LoadOp::Clear(_)) {
-                    vk::ImageLayout::UNDEFINED
-                } else {
-                    v.image.home
-                };
-                transition(self.d(), self.raw, v.image.image, v.range, from, to);
-            } else {
-                let from =
-                    if v.image.swapchain { vk::ImageLayout::UNDEFINED } else { v.image.home };
-                transition(self.d(), self.raw, v.image.image, v.range, from, to);
-                targets.push((v.clone(), to));
-            }
-            if let Some(r) = c.resolve {
-                let rv = &r.raw;
-                let from =
-                    if rv.image.swapchain { vk::ImageLayout::UNDEFINED } else { rv.image.home };
-                transition(self.d(), self.raw, rv.image.image, rv.range, from, to);
-                targets.push((rv.clone(), to));
-            }
+            self.attach(&mut targets, to, &c.view.raw, cleared, resolve);
         }
         if let Some(d) = &desc.depth {
-            let v = &d.view.raw;
+            let cleared = matches!(d.load, LoadOp::Clear(_));
+            // (A depth resolve target is never a swapchain's image.)
+            let resolve = d.resolve.map(|r| (&r.raw, false));
             let to = vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL;
-            if v.image.samples > 1 {
-                let from = if matches!(d.load, LoadOp::Clear(_)) {
-                    vk::ImageLayout::UNDEFINED
-                } else {
-                    v.image.home
-                };
-                transition(self.d(), self.raw, v.image.image, v.range, from, to);
-            } else {
-                let from =
-                    if v.image.swapchain { vk::ImageLayout::UNDEFINED } else { v.image.home };
-                transition(self.d(), self.raw, v.image.image, v.range, from, to);
-                targets.push((v.clone(), to));
-            }
-            if let Some(r) = d.resolve {
-                let rv = &r.raw;
-                transition(self.d(), self.raw, rv.image.image, rv.range, rv.image.home, to);
-                targets.push((rv.clone(), to));
-            }
+            self.attach(&mut targets, to, &d.view.raw, cleared, resolve);
         }
         let colors: Vec<vk::RenderingAttachmentInfo<'_>> = desc
             .colors
@@ -2943,18 +2965,6 @@ impl CommandEncoder {
         if let Some(d) = &depth {
             info = info.depth_attachment(d);
         }
-        for c in desc.colors {
-            self.held.push(Held::View(c.view.raw.clone()));
-            if let Some(r) = c.resolve {
-                self.held.push(Held::View(r.raw.clone()));
-            }
-        }
-        if let Some(d) = &desc.depth {
-            self.held.push(Held::View(d.view.raw.clone()));
-            if let Some(r) = d.resolve {
-                self.held.push(Held::View(r.raw.clone()));
-            }
-        }
         // SAFETY: rendering to live views in GENERAL; the viewport and scissor cover the target
         // until the pass sets its own.
         unsafe {
@@ -2969,35 +2979,13 @@ impl CommandEncoder {
 
     pub fn finish(mut self) -> CommandBuffer {
         if let (Some(seq), Some((queries, _))) = (self.clock, self.device.0.clock) {
-            let slot = 2 * (seq % CLOCK_KEPT as u64) as u32 + 1;
-            // SAFETY: its end, after everything recorded in it.
-            unsafe {
-                self.d().cmd_write_timestamp2(
-                    self.raw,
-                    vk::PipelineStageFlags2::ALL_COMMANDS,
-                    queries,
-                    slot,
-                )
-            };
+            // Its end, after everything recorded in it.
+            let slot = clock_slot(seq, true);
+            stamp(self.d(), self.raw, vk::PipelineStageFlags2::ALL_COMMANDS, queries, slot);
         }
         // SAFETY: the recording ends.
         unsafe { self.d().end_command_buffer(self.raw).expect("Vulkan ended no command buffer") };
-        let mut keep = std::mem::take(&mut self.keep);
-        // Groups, pipelines and resources stay alive until the submission's done.
-        for g in self.groups.drain(..) {
-            for h in &g._held {
-                if let Held::Buffer(b) = h {
-                    keep.push(Keep::Buffer(b.clone()));
-                }
-            }
-            keep.push(Keep::Group(g));
-        }
-        for p in self.pipelines.drain(..) {
-            keep.push(Keep::Pipeline(p));
-        }
-        for h in self.held.drain(..) {
-            keep.push(Keep::Held(h));
-        }
+        let keep = std::mem::take(&mut self.keep);
         let pool = std::mem::replace(&mut self.pool, vk::CommandPool::null());
         CommandBuffer { pool, raw: self.raw, keep, clock: self.clock }
     }
@@ -3031,58 +3019,45 @@ impl ComputePass<'_> {
             )
         };
         self.layout = Some(p.layout.pipeline);
-        self.encoder.pipelines.push(p.raw.clone());
+        self.encoder.keep.push(Keep::Pipeline(p.raw.clone()));
     }
 
     pub fn set_bind_group(&mut self, group: &BindGroup, offsets: &[u32]) {
         let layout = self.layout.unwrap_or(group.0.layout.pipeline);
         bind_group(self.encoder, vk::PipelineBindPoint::COMPUTE, layout, &group.0, offsets);
-        self.encoder.groups.push(group.0.clone());
+        self.encoder.keep.push(Keep::Group(group.0.clone()));
         self.bound = Some(group.0.clone());
     }
 
-    /// The bound group's resources a dispatch reads and writes, with `extra` read too.
-    fn uses(&self, extra: Option<u64>) -> (Vec<u64>, Vec<u64>) {
-        let mut reads: Vec<u64> = extra.into_iter().collect();
-        let mut writes = Vec::new();
-        for &(h, w) in self.bound.iter().flat_map(|g| g.uses.iter()) {
-            if w { writes.push(h) } else { reads.push(h) }
-        }
-        (reads, writes)
-    }
-
     pub fn dispatch(&mut self, x: u32, y: u32, z: u32) {
-        let (reads, writes) = self.uses(None);
-        self.encoder.hazard(&reads, &writes);
+        let (reads, writes) = uses(self.bound.as_deref());
+        self.encoder.hazard(reads, writes);
         // SAFETY: a dispatch of the bound pipeline, after any barrier its uses need.
         unsafe { self.encoder.d().cmd_dispatch(self.encoder.raw, x, y, z) };
     }
 
     pub fn dispatch_indirect(&mut self, buffer: &Buffer, offset: u64) {
-        let (reads, writes) = self.uses(Some(vk::Handle::as_raw(buffer.raw.buffer)));
-        self.encoder.hazard(&reads, &writes);
+        let (bound, writes) = uses(self.bound.as_deref());
+        let reads: Vec<u64> = std::iter::once(vk::Handle::as_raw(buffer.raw.buffer))
+            .chain(bound.iter().copied())
+            .collect();
+        self.encoder.hazard(&reads, writes);
         // SAFETY: an indirect dispatch of the bound pipeline, from a live buffer.
         unsafe {
             self.encoder.d().cmd_dispatch_indirect(self.encoder.raw, buffer.raw.buffer, offset)
         };
-        self.encoder.held.push(Held::Buffer(buffer.raw.clone()));
+        self.encoder.hold(Held::Buffer(buffer.raw.clone()));
     }
+}
+
+/// What a dispatch under bound group `g` reads, and writes.
+fn uses(g: Option<&Group>) -> (&[u64], &[u64]) {
+    g.map_or((&[], &[]), |g| (&g.reads, &g.writes))
 }
 
 impl Drop for ComputePass<'_> {
     fn drop(&mut self) {
-        if let Some((q, end)) = self.end.take() {
-            // SAFETY: the pass's end timestamp.
-            unsafe {
-                self.encoder.d().cmd_write_timestamp2(
-                    self.encoder.raw,
-                    vk::PipelineStageFlags2::ALL_COMMANDS,
-                    q.pool,
-                    end,
-                )
-            };
-            self.encoder.keep.push(Keep::Queries(q));
-        }
+        self.encoder.end_pass(self.end.take());
     }
 }
 
@@ -3107,13 +3082,13 @@ impl RenderPass<'_> {
             )
         };
         self.layout = Some(p.layout.pipeline);
-        self.encoder.pipelines.push(p.raw.clone());
+        self.encoder.keep.push(Keep::Pipeline(p.raw.clone()));
     }
 
     pub fn set_bind_group(&mut self, group: &BindGroup, offsets: &[u32]) {
         let layout = self.layout.unwrap_or(group.0.layout.pipeline);
         bind_group(self.encoder, vk::PipelineBindPoint::GRAPHICS, layout, &group.0, offsets);
-        self.encoder.groups.push(group.0.clone());
+        self.encoder.keep.push(Keep::Group(group.0.clone()));
     }
 
     pub fn set_viewport(&mut self, x: f32, y: f32, w: f32, h: f32, min: f32, max: f32) {
@@ -3143,7 +3118,7 @@ impl RenderPass<'_> {
 
     pub fn set_index_buffer(&mut self, buffer: &Buffer, offset: u64) {
         self.index = Some((buffer.raw.buffer, offset));
-        self.encoder.held.push(Held::Buffer(buffer.raw.clone()));
+        self.encoder.hold(Held::Buffer(buffer.raw.clone()));
         // SAFETY: a live buffer of u32 indices.
         unsafe {
             self.encoder.d().cmd_bind_index_buffer(
@@ -3198,7 +3173,7 @@ impl RenderPass<'_> {
 
     /// `count` indirect draws, their arguments 16 bytes apart from `offset`.
     pub fn multi_draw_indirect(&mut self, buffer: &Buffer, offset: u64, count: u32) {
-        self.encoder.held.push(Held::Buffer(buffer.raw.clone()));
+        self.encoder.hold(Held::Buffer(buffer.raw.clone()));
         // SAFETY: indirect draws from a live buffer.
         unsafe {
             self.encoder.d().cmd_draw_indirect(
@@ -3214,7 +3189,7 @@ impl RenderPass<'_> {
     /// `count` indexed indirect draws, their arguments 20 bytes apart from `offset`.
     pub fn multi_draw_indexed_indirect(&mut self, buffer: &Buffer, offset: u64, count: u32) {
         let _ = self.index.expect("an index buffer is set");
-        self.encoder.held.push(Held::Buffer(buffer.raw.clone()));
+        self.encoder.hold(Held::Buffer(buffer.raw.clone()));
         // SAFETY: indexed indirect draws from a live buffer.
         unsafe {
             self.encoder.d().cmd_draw_indexed_indirect(
@@ -3232,18 +3207,7 @@ impl Drop for RenderPass<'_> {
     fn drop(&mut self) {
         // SAFETY: the pass ends; what it wrote, the next command sees.
         unsafe { self.encoder.d().cmd_end_rendering(self.encoder.raw) };
-        if let Some((q, end)) = self.end.take() {
-            // SAFETY: the pass's end timestamp.
-            unsafe {
-                self.encoder.d().cmd_write_timestamp2(
-                    self.encoder.raw,
-                    vk::PipelineStageFlags2::ALL_COMMANDS,
-                    q.pool,
-                    end,
-                )
-            };
-            self.encoder.keep.push(Keep::Queries(q));
-        }
+        self.encoder.end_pass(self.end.take());
         for (v, from) in std::mem::take(&mut self.targets) {
             transition(
                 self.encoder.d(),
@@ -3260,9 +3224,6 @@ impl Drop for RenderPass<'_> {
 
 // ---- conversions ----------------------------------------------------------------------------------
 
-/// A WebGPU viewport as Vulkan's: flipped, a negative height from its bottom edge, as wgpu-hal
-/// does, since WebGPU's clip space has y up and Vulkan's down (and the compiler's SPIR-V writes
-/// WebGPU's positions).
 /// Sets group `g` at `point` for the commands after it, under pipeline layout `layout`: its set
 /// (set 0, at `offsets`) and, where it has a block, the device's table (set
 /// `wrela_abi::table::TABLE_SET`) and the block as push constants.
@@ -3301,6 +3262,9 @@ fn bind_group(
     }
 }
 
+/// A WebGPU viewport as Vulkan's: flipped, a negative height from its bottom edge, as wgpu-hal
+/// does, since WebGPU's clip space has y up and Vulkan's down (and the compiler's SPIR-V writes
+/// WebGPU's positions).
 fn viewport(x: f32, y: f32, w: f32, h: f32, min: f32, max: f32) -> vk::Viewport {
     vk::Viewport { x, y: y + h, width: w, height: -h, min_depth: min, max_depth: max }
 }
@@ -3330,28 +3294,15 @@ pub fn vk_format(f: TextureFormat) -> vk::Format {
     }
 }
 
-/// A format's bytes a block and its block's side in texels (1 for an uncompressed format), for
-/// a copy's row length in texels.
-fn format_texel(f: vk::Format) -> (u32, u32) {
-    match f {
-        vk::Format::R8_UNORM => (1, 1),
-        vk::Format::R8G8_UNORM | vk::Format::R16_SFLOAT => (2, 1),
-        vk::Format::R8G8B8A8_UNORM
-        | vk::Format::R16G16_SFLOAT
-        | vk::Format::R32_SFLOAT
-        | vk::Format::R32_UINT
-        | vk::Format::A2B10G10R10_UNORM_PACK32
-        | vk::Format::B10G11R11_UFLOAT_PACK32
-        | vk::Format::D32_SFLOAT => (4, 1),
-        vk::Format::R16G16B16A16_SFLOAT | vk::Format::R32G32_SFLOAT | vk::Format::R32G32_UINT => {
-            (8, 1)
-        }
-        vk::Format::R32G32B32A32_SFLOAT => (16, 1),
-        vk::Format::BC1_RGBA_UNORM_BLOCK
-        | vk::Format::BC4_UNORM_BLOCK
-        | vk::Format::ETC2_R8G8B8_UNORM_BLOCK => (8, 4),
-        _ => (16, 4),
-    }
+/// A copy's row of `bytes_per_row` bytes of `format`, in texels (whole blocks of a compressed
+/// format), as `VkBufferImageCopy` takes its length.
+fn texels_per_row(format: TextureFormat, bytes_per_row: u32) -> u32 {
+    bytes_per_row / format.bytes_per_texel() * format.block()
+}
+
+/// Samples per pixel (`1` or `4`) as Vulkan counts them.
+fn sample_count(samples: u8) -> vk::SampleCountFlags {
+    if samples == 4 { vk::SampleCountFlags::TYPE_4 } else { vk::SampleCountFlags::TYPE_1 }
 }
 
 fn compare_op(c: Compare) -> vk::CompareOp {
@@ -3601,12 +3552,11 @@ impl Surface {
     /// (`p3`) or sRGB, where the surface offers the colour space: what it does, `(hdr, p3)`.
     pub fn set_space(&mut self, hdr: bool, p3: bool) -> (bool, bool) {
         self.asked = (hdr, p3);
-        if let Some(c) = self.config {
-            let device = self.device.clone();
-            if self.configure(&device, &c).is_err() {
-                self.asked = (false, false);
-                let _ = self.configure(&device, &c);
-            }
+        if let Some(c) = self.config
+            && self.configure(&c).is_err()
+        {
+            self.asked = (false, false);
+            let _ = self.configure(&c);
         }
         self.done
     }
@@ -3616,8 +3566,10 @@ impl Surface {
         1.0
     }
 
-    pub fn configure(&mut self, device: &Device, c: &SurfaceConfig) -> Result<()> {
+    /// Makes its swapchain as `c` says, on the device it was made of.
+    pub fn configure(&mut self, c: &SurfaceConfig) -> Result<()> {
         self.config = Some(*c);
+        let device = self.device.clone();
         let d = &device.0;
         // SAFETY: queries of the surface, then a swapchain of it (the old one retired once the
         // device is idle), and semaphores.
@@ -3656,6 +3608,8 @@ impl Surface {
                 ),
             };
             self.done = done;
+            // The frames' format, as the host names it (Vulkan's is `format.format`).
+            let texel = self.format();
             let modes = self
                 .surface_fns
                 .get_physical_device_surface_present_modes(d.physical, self.surface)
@@ -3716,7 +3670,7 @@ impl Surface {
                     device: d.clone(),
                     image,
                     memory: Allocation::NONE,
-                    format: format.format,
+                    format: texel,
                     aspect: vk::ImageAspectFlags::COLOR,
                     levels: 1,
                     layers: 1,

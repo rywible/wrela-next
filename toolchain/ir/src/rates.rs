@@ -218,19 +218,7 @@ pub fn costly_loops(m: &Module, quiet: &HashSet<Span>, heavy: &[HeavyCall]) -> V
         if !loops {
             continue;
         }
-        let mut defs: HashMap<ValueId, &Expr> = HashMap::new();
-        let mut stores: HashMap<LocalId, Vec<ValueId>> = HashMap::new();
-        visit::walk(&f.body, &mut |s| match s {
-            Stmt::Let(v, e) => {
-                defs.insert(*v, e);
-            }
-            Stmt::Store(p, v) if p.path.is_empty() => {
-                if let Some(l) = p.root_local() {
-                    stores.entry(l).or_default().push(*v);
-                }
-            }
-            _ => {}
-        });
+        let (defs, stores) = defs_and_stores(f);
         let mut w = Walk {
             m,
             f,
@@ -260,31 +248,45 @@ pub fn costly_loops(m: &Module, quiet: &HashSet<Span>, heavy: &[HeavyCall]) -> V
     out
 }
 
-/// Whether the loop with body `body`, in `f` (of module `m`), leaves on a test of the count the
-/// command gives (the same for every invocation): what W0014 says to make a `const`. The unroll
-/// pass leaves such a loop a loop, so it's still said.
-pub(crate) fn leaves_on_command(m: &Module, f: &Function, body: &Block) -> bool {
+/// Each value's definition in `f`, and what's stored to each local, whole, anywhere: what a
+/// [`Walk`] reads of a function.
+pub(crate) type DefsAndStores<'f> = (HashMap<ValueId, &'f Expr>, HashMap<LocalId, Vec<ValueId>>);
+
+/// [`DefsAndStores`] of `f`.
+pub(crate) fn defs_and_stores(f: &Function) -> DefsAndStores<'_> {
     let mut defs: HashMap<ValueId, &Expr> = HashMap::new();
     let mut stores: HashMap<LocalId, Vec<ValueId>> = HashMap::new();
     visit::walk(&f.body, &mut |s| match s {
         Stmt::Let(v, e) => {
             defs.insert(*v, e);
         }
-        Stmt::Store(p, v) if p.path.is_empty() => {
-            if let Some(l) = p.root_local() {
+        Stmt::Store(p, v) => {
+            if let Some(l) = p.whole_local() {
                 stores.entry(l).or_default().push(*v);
             }
         }
         _ => {}
     });
+    (defs, stores)
+}
+
+/// Whether the loop with body `body`, in `f` (of module `m`, whose [`defs_and_stores`] are
+/// `ds`), leaves on a test of the count the command gives (the same for every invocation): what
+/// W0014 says to make a `const`. The unroll pass leaves such a loop a loop, so it's still said.
+pub(crate) fn leaves_on_command(
+    m: &Module,
+    f: &Function,
+    ds: &DefsAndStores<'_>,
+    body: &Block,
+) -> bool {
     let (unfolded, quiet) = (HashSet::new(), HashSet::new());
     let w = Walk {
         m,
         f,
         id: FuncId(0),
         passes: None,
-        defs: &defs,
-        stores: &stores,
+        defs: &ds.0,
+        stores: &ds.1,
         work: crate::work::ExprWork::new(m),
         unfolded: &unfolded,
         quiet: &quiet,

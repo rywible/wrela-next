@@ -26,10 +26,9 @@ pub(super) fn present_pipeline(
 ) -> Result<(wrela_gpu::RenderPipeline, wrela_gpu::BindGroupLayout)> {
     use wrela_abi::manifest::{BindingKind, BindingStage, Output, RenderTarget, ResourceBinding};
     let gpu_err = |e: wrela_gpu::Error| Error::Gpu(e.0);
-    let mut entry = wrela_abi::manifest::Pipeline {
-        name: "present".into(),
-        shader: "present".into(),
-        stage: Stage::Render {
+    let mut entry = wrela_abi::manifest::Pipeline::hand_written(
+        "present",
+        Stage::Render {
             vertex_entry: "cover".into(),
             fragment_entry: "show".into(),
             blends: Vec::new(),
@@ -40,39 +39,18 @@ pub(super) fn present_pipeline(
             outputs: vec![Output::Float],
             targets: vec![RenderTarget::of(&[format], false)],
         },
-        uniform: None,
-        bindings: vec![ResourceBinding {
+        vec![ResourceBinding {
             binding: 0,
             kind: BindingKind::Texture,
             stage: BindingStage::Fragment,
             format: Some(TextureFormat::Rgba8),
         }],
-        debug_flag: None,
-        requires: Vec::new(),
-        conditional: false,
-        standin: None,
-        sizes: None,
-        kept: 0,
-        work: vec![Some(16), Some(16)],
-        unbounded: Vec::new(),
-    };
+        vec![Some(16), Some(16)],
+    );
     let shader = present_shader()
         .write(&mut entry, wrela_abi::Target::HERE)
         .map_err(|e| Error::Gpu(format!("the present pass's shader: {e}")))?;
-    let entries: Vec<wrela_gpu::LayoutEntry> = wrela_abi::metal::layout(&entry)
-        .iter()
-        .map(|e| wrela_gpu::LayoutEntry {
-            binding: e.binding,
-            visibility: e.visibility,
-            ty: binding_type(e, &entry),
-            index_at: if e.table {
-                wrela_abi::table::index_offset(&entry, e.binding)
-            } else {
-                None
-            },
-        })
-        .collect();
-    let layout = device.create_bind_group_layout(&entries);
+    let layout = device.create_bind_group_layout(&layout_entries(&entry));
     let module = device.create_shader_module("present", &shader.bytes).map_err(gpu_err)?;
     let Stage::Render { vertex_entry, fragment_entry, .. } = &entry.stage else {
         unreachable!("a render pipeline");
@@ -137,14 +115,33 @@ pub(super) fn draw_presented(
 /// }
 /// ```
 fn present_shader() -> wrela_shader::build::Builder {
-    use wrela_shader::build::{
-        BinOp, Builder, BuiltinInput, Scalar, TexDim, TextureFormat as IrFormat,
-    };
+    use wrela_shader::build::{Builder, BuiltinInput, Scalar, TexDim, TextureFormat as IrFormat};
     let mut b = Builder::new();
     let u = b.scalar(Scalar::U32);
     let fl = b.scalar(Scalar::F32);
     let v4 = b.vector(Scalar::F32, 4);
     let screen = b.texture("screen", 0, TexDim::D2, IrFormat::Rgba8, false);
+    cover_vertex(&mut b, u, fl, v4);
+    b.fragment("show", &[BuiltinInput::Position], |f| {
+        let p = f.input(0, v4);
+        let (x, y) = (f.extract(fl, p, 0), f.extract(fl, p, 1));
+        let (x, y) = (f.convert(u, x, Scalar::U32), f.convert(u, y, Scalar::U32));
+        let level = f.u32(0);
+        let texel = f.texel(screen, x, y, level);
+        f.ret(Some(texel));
+    });
+    b
+}
+
+/// The vertex shader `cover`, of the builder's `u32`, `f32` and `vec4f` types `u`, `fl` and
+/// `v4`: a triangle over the whole target, as the present pass's shader shows it.
+pub(super) fn cover_vertex(
+    b: &mut wrela_shader::build::Builder,
+    u: wrela_shader::build::TypeId,
+    fl: wrela_shader::build::TypeId,
+    v4: wrela_shader::build::TypeId,
+) {
+    use wrela_shader::build::{BinOp, BuiltinInput, Scalar};
     b.vertex("cover", &[BuiltinInput::VertexIndex], |f| {
         let i = f.input(0, u);
         let one = f.u32(1);
@@ -160,13 +157,4 @@ fn present_shader() -> wrela_shader::build::Builder {
         let p = f.construct(v4, &[x, y, zero, unit]);
         f.ret_clip(p);
     });
-    b.fragment("show", &[BuiltinInput::Position], |f| {
-        let p = f.input(0, v4);
-        let (x, y) = (f.extract(fl, p, 0), f.extract(fl, p, 1));
-        let (x, y) = (f.convert(u, x, Scalar::U32), f.convert(u, y, Scalar::U32));
-        let level = f.u32(0);
-        let texel = f.texel(screen, x, y, level);
-        f.ret(Some(texel));
-    });
-    b
 }

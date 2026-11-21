@@ -4,19 +4,17 @@ use super::*;
 use std::sync::atomic::Ordering;
 
 /// The calibration kernel's length: each invocation's chain of sines (`Gpu::calibration_ns`).
-pub(super) const CALIBRATION_CHAIN: u32 = 8192;
+const CALIBRATION_CHAIN: u32 = 8192;
 /// Its workgroups of 64: 8,192 invocations, at least any GPU's width here.
-pub(super) const CALIBRATION_GROUPS: u32 = 128;
+const CALIBRATION_GROUPS: u32 = 128;
 /// How long the calibration kernel runs before it's timed (ms).
 const CALIBRATION_WARM_MS: f64 = 500.0;
 /// While the host times its calibration kernel (its own device: no calibration of that one).
-pub(super) static CALIBRATING: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static CALIBRATING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Whether each device the host opens is kept clocked while the program works on the CPU
 /// (`--keep-clocked`; [`Warmer`]).
-pub(super) static KEEP_CLOCKED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static KEEP_CLOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Keeps the GPU clocked while the program works on the CPU, for every device opened after it
 /// (`wrela-host --keep-clocked`): see [`Warmer`].
@@ -26,7 +24,7 @@ pub fn keep_clocked() {
 
 thread_local! {
     /// Whether this thread is a warmer's (its own device is not kept clocked).
-    pub(super) static WARMING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static WARMING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The warmer's kernel: the calibration kernel's chain, shorter (a piece of about 0.04 ms on
@@ -57,6 +55,15 @@ pub(super) struct Warmer {
 }
 
 impl Warmer {
+    /// A warmer for `watched`, where devices are kept clocked (`--keep-clocked`) and `watched`
+    /// is not one the host times its calibration on or warms with.
+    pub(super) fn for_device(watched: &wrela_gpu::Device) -> Option<Warmer> {
+        let on = KEEP_CLOCKED.load(Ordering::SeqCst)
+            && !CALIBRATING.load(Ordering::SeqCst)
+            && !WARMING.with(|w| w.get());
+        on.then(|| Warmer::start(watched.clone()))
+    }
+
     pub(super) fn start(watched: wrela_gpu::Device) -> Warmer {
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let pieces = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -78,24 +85,14 @@ impl Warmer {
         stop: &std::sync::atomic::AtomicBool,
         pieces: &std::sync::atomic::AtomicU64,
     ) -> Result<()> {
-        let (manifest, shaders) = calibration_kernel(WARM_CHAIN)?;
-        let mut gpu = Gpu::new(&manifest, &shaders, Timing::Off, false)?;
-        let n = CALIBRATION_GROUPS * 64;
-        gpu.create_buffer(1, 4 * n);
+        let mut gpu = calibration_gpu(WARM_CHAIN)?;
         let gap = std::time::Duration::from_secs_f64(WARM_GAP_MS / 1e3);
         let mut busy = std::time::Instant::now();
         while !stop.load(Ordering::Acquire) {
             if watched.completed() < watched.submitted() {
                 busy = std::time::Instant::now();
             } else if busy.elapsed().as_secs_f64() * 1e3 >= WARM_IDLE_MS {
-                gpu.dispatch(
-                    0,
-                    Ok([CALIBRATION_GROUPS, 1, 1]),
-                    &[Binding::range(1, 0, 4 * n)],
-                    &[],
-                )?;
-                gpu.flush()?;
-                wait(&gpu.device)?;
+                gpu.run_calibration()?;
                 pieces.fetch_add(1, Ordering::Relaxed);
             }
             std::thread::sleep(gap);
@@ -121,30 +118,21 @@ impl Drop for Warmer {
 /// from the invocation's index, its result written so nothing is left out. Its bound is stated
 /// (a sine, a multiply, an add and the loop's count, 32 a pass, as the compiler counts them),
 /// so the guard weighs it as any kernel.
-pub(super) fn calibration_kernel(chain: u32) -> Result<(Manifest, Vec<Vec<u8>>)> {
+fn calibration_kernel(chain: u32) -> Result<(Manifest, Vec<Vec<u8>>)> {
     use wrela_abi::manifest::{BindingStage, Pipeline};
-    use wrela_shader::build::{BinOp, Builder, Builtin, BuiltinInput, Scalar};
+    use wrela_shader::build::{Builder, BuiltinInput, Scalar};
     let mut manifest = Manifest::new("calibrate.wasm");
-    manifest.pipelines.push(Pipeline {
-        name: "calibrate".into(),
-        shader: String::new(),
-        stage: Stage::Compute { entry: "calibrate".into(), workgroup_size: [64, 1, 1] },
-        uniform: None,
-        bindings: vec![ResourceBinding {
+    manifest.pipelines.push(Pipeline::hand_written(
+        "calibrate",
+        Stage::Compute { entry: "calibrate".into(), workgroup_size: [64, 1, 1] },
+        vec![ResourceBinding {
             binding: 0,
             kind: BindingKind::ReadWrite,
             stage: BindingStage::Both,
             format: None,
         }],
-        debug_flag: None,
-        requires: Vec::new(),
-        conditional: false,
-        standin: None,
-        sizes: None,
-        kept: 0,
-        work: vec![Some(u64::from(chain) * 32 + 64)],
-        unbounded: Vec::new(),
-    });
+        vec![Some(u64::from(chain) * 32 + 64)],
+    ));
     let mut b = Builder::new();
     let u = b.scalar(Scalar::U32);
     let f = b.scalar(Scalar::F32);
@@ -153,29 +141,7 @@ pub(super) fn calibration_kernel(chain: u32) -> Result<(Manifest, Vec<Vec<u8>>)>
     b.compute("calibrate", [64, 1, 1], &[BuiltinInput::GlobalInvocationId], |k| {
         let id = k.input(0, u3);
         let i = k.extract(u, id, 0);
-        let x = k.local("x", f);
-        let n = k.local("n", u);
-        let start = k.convert(f, i, Scalar::F32);
-        k.store(x.clone(), start);
-        let zero = k.u32(0);
-        k.store(n.clone(), zero);
-        k.loop_(|k| {
-            let c = k.load(u, n.clone());
-            let limit = k.u32(chain);
-            let done = k.binary(BinOp::Ge, c, limit);
-            k.if_(done, |k| k.break_(), |_| {});
-            let v = k.load(f, x.clone());
-            let s = k.builtin(f, Builtin::Sin, &[v]);
-            let a = k.f32(0.999);
-            let m = k.binary(BinOp::Mul, s, a);
-            let b2 = k.f32(0.001);
-            let y = k.binary(BinOp::Add, m, b2);
-            k.store(x.clone(), y);
-            let one = k.u32(1);
-            let c2 = k.binary(BinOp::Add, c, one);
-            k.store(n.clone(), c2);
-        });
-        let r = k.load(f, x);
+        let r = sine_chain(k, u, f, chain, |k| k.convert(f, i, Scalar::F32));
         k.store(Builder::element(out, i), r);
         k.ret(None);
     });
@@ -187,7 +153,59 @@ pub(super) fn calibration_kernel(chain: u32) -> Result<(Manifest, Vec<Vec<u8>>)>
     Ok((manifest, vec![shader.bytes]))
 }
 
+/// The calibration kernel's chain, in a shader of the builder's `u32` and `f32` types `u` and
+/// `fl`: `x = start`, then `x = sin(x) * 0.999 + 0.001`, `chain` times; its end.
+pub(super) fn sine_chain(
+    f: &mut wrela_shader::build::Body<'_>,
+    u: wrela_shader::build::TypeId,
+    fl: wrela_shader::build::TypeId,
+    chain: u32,
+    start: impl FnOnce(&mut wrela_shader::build::Body<'_>) -> wrela_shader::build::ValueId,
+) -> wrela_shader::build::ValueId {
+    use wrela_shader::build::{BinOp, Builtin};
+    let x = f.local("x", fl);
+    let n = f.local("n", u);
+    let first = start(f);
+    f.store(x.clone(), first);
+    let zero = f.u32(0);
+    f.store(n.clone(), zero);
+    f.loop_(|f| {
+        let c = f.load(u, n.clone());
+        let limit = f.u32(chain);
+        let done = f.binary(BinOp::Ge, c, limit);
+        f.if_(done, |f| f.break_(), |_| {});
+        let v = f.load(fl, x.clone());
+        let s = f.builtin(fl, Builtin::Sin, &[v]);
+        let a = f.f32(0.999);
+        let m = f.binary(BinOp::Mul, s, a);
+        let b2 = f.f32(0.001);
+        let y = f.binary(BinOp::Add, m, b2);
+        f.store(x.clone(), y);
+        let one = f.u32(1);
+        let c2 = f.binary(BinOp::Add, c, one);
+        f.store(n.clone(), c2);
+    });
+    f.load(fl, x)
+}
+
+/// The calibration kernel of `chain` on a device of its own, with its buffer.
+fn calibration_gpu(chain: u32) -> Result<Gpu> {
+    let (manifest, shaders) = calibration_kernel(chain)?;
+    let mut gpu = Gpu::new(&manifest, &shaders, Timing::Off, false)?;
+    gpu.create_buffer(1, 4 * CALIBRATION_GROUPS * 64);
+    Ok(gpu)
+}
+
 impl Gpu {
+    /// Runs its calibration kernel ([`calibration_gpu`]) once, submitted and waited for alone.
+    fn run_calibration(&mut self) -> Result<()> {
+        let n = CALIBRATION_GROUPS * 64;
+        self.dispatch(0, Ok([CALIBRATION_GROUPS, 1, 1]), &[Binding::range(1, 0, 4 * n)], &[])?;
+        self.flush()?;
+        wait(&self.device);
+        Ok(())
+    }
+
     /// How long the calibration kernel takes on this machine's GPU, in nanoseconds: the
     /// fastest of 8 runs after `CALIBRATION_WARM_MS` of them to warm it (the GPU's clock at its
     /// height, where the guard's unit was measured), each a dispatch submitted and waited for
@@ -195,10 +213,7 @@ impl Gpu {
     pub(crate) fn calibration_ns() -> Result<f64> {
         CALIBRATING.store(true, Ordering::SeqCst);
         let timed = (|| {
-            let (manifest, shaders) = calibration_kernel(CALIBRATION_CHAIN)?;
-            let mut gpu = Gpu::new(&manifest, &shaders, Timing::Off, false)?;
-            let n = CALIBRATION_GROUPS * 64;
-            gpu.create_buffer(1, 4 * n);
+            let mut gpu = calibration_gpu(CALIBRATION_CHAIN)?;
             let mut times = Vec::new();
             let warming = std::time::Instant::now();
             let mut run = 0;
@@ -206,14 +221,7 @@ impl Gpu {
             // and raises it under load), then timed 8 times.
             while times.len() < 8 {
                 let began = std::time::Instant::now();
-                gpu.dispatch(
-                    0,
-                    Ok([CALIBRATION_GROUPS, 1, 1]),
-                    &[Binding::range(1, 0, 4 * n)],
-                    &[],
-                )?;
-                gpu.flush()?;
-                wait(&gpu.device)?;
+                gpu.run_calibration()?;
                 run += 1;
                 if warming.elapsed().as_secs_f64() * 1000.0 >= CALIBRATION_WARM_MS || run > 400 {
                     times.push(began.elapsed().as_secs_f64() * 1e9);

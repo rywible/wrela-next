@@ -47,7 +47,6 @@ use wrela_abi::stream::{
     self, Binding, Command, Compare, Opcode, Pass, TexelRect, TextureFormat, TextureKind, View,
 };
 
-/// The screen's format: `SCREEN_FORMAT` (rgba8unorm).
 mod calibrate;
 mod present;
 #[cfg(test)]
@@ -56,9 +55,10 @@ mod tests;
 pub use calibrate::keep_clocked;
 #[cfg(test)]
 use calibrate::measured_unit;
-use calibrate::{CALIBRATING, KEEP_CLOCKED, WARMING, Warmer, ensure_unit};
+use calibrate::{Warmer, ensure_unit};
 use present::{Presenter, draw_presented, present_pipeline};
 
+/// The screen's format: `SCREEN_FORMAT` (rgba8unorm).
 const SCREEN_FORMAT: TextureFormat = wrela_gpu::SCREEN_FORMAT;
 
 /// `x` rounded up to a multiple of `alignment`.
@@ -201,18 +201,13 @@ fn view_dimension(kind: BindingKind) -> wrela_gpu::ViewDimension {
     }
 }
 
-/// Whether a device with these features has the WebGPU feature `name`.
-fn device_has(features: &wrela_gpu::Features, name: &str) -> bool {
-    features.has(name)
-}
-
 /// The feature bits a program sees (`wrela_abi::Limits::features`) of a device with these
 /// features: the required ones, and the rest only where `kept` (test mode's mask: a program's
 /// fallback paths, measured).
 fn feature_bits(features: &wrela_gpu::Features, kept: impl Fn(&str) -> bool) -> u32 {
     wrela_abi::FEATURES
         .iter()
-        .filter(|name| device_has(features, name))
+        .filter(|name| features.has(name))
         .filter_map(|name| {
             let bit = wrela_abi::feature_bit(name)?;
             (bit & wrela_abi::REQUIRED_FEATURES != 0 || kept(name)).then_some(bit)
@@ -285,7 +280,7 @@ type Targets = (Vec<TextureFormat>, Option<TextureFormat>, u8);
 type MsaaKey = (u8, u32, u32, TextureFormat, u8, bool);
 
 pub(crate) struct Pipeline {
-    name: String,
+    name: Arc<str>,
     kind: Kind,
     layout: wrela_gpu::BindGroupLayout,
     /// The uniform block's binding and size, if it has one.
@@ -298,8 +293,8 @@ pub(crate) struct Pipeline {
     /// A compute pipeline's most work an invocation, as its build states it, which a dispatch is
     /// weighed by before it runs (`crate::step`).
     bound: crate::step::Bound,
-    /// A compute pipeline's workgroup size (a render pipeline's is 1 by 1 by 1).
-    workgroup: [u32; 3],
+    /// A compute pipeline's invocations a workgroup (a render pipeline's is 1).
+    per_group: u64,
     /// A render pipeline's screen targets: whether each has depth. An HDR screen draws them
     /// with its own colour format.
     screen_depths: Vec<bool>,
@@ -324,6 +319,10 @@ enum Kind {
     Unavailable,
 }
 
+/// The names of the passes the program named none: on the screen, and into textures.
+static UNNAMED_PASSES: std::sync::LazyLock<(Arc<str>, Arc<str>)> =
+    std::sync::LazyLock::new(|| (Arc::from("screen pass"), Arc::from("pass")));
+
 /// A cached bind group: its pipeline, and the bindings it holds.
 type BindGroupKey = (u32, Arc<[Binding]>);
 
@@ -336,18 +335,16 @@ enum DrawHow {
         buffer: u32,
         offset: u32,
     },
-    /// `u32` indices: `size` bytes at `at` in buffer `indices`.
+    /// `u32` indices from `at` in buffer `indices`.
     IndexedIndirect {
         indices: u32,
         at: u32,
-        size: u32,
         buffer: u32,
         offset: u32,
     },
     Indexed {
         indices: u32,
         at: u32,
-        size: u32,
         count: u32,
         instances: u32,
         first: u32,
@@ -355,9 +352,9 @@ enum DrawHow {
         first_instance: u32,
     },
     /// `count` indirect draws, their arguments one after another from `offset`, indexed when
-    /// it has `indices` (`[handle, at, size]`).
+    /// it has `indices` (`[handle, at]`).
     Multi {
-        indices: Option<[u32; 3]>,
+        indices: Option<[u32; 2]>,
         buffer: u32,
         offset: u32,
         count: u32,
@@ -424,11 +421,17 @@ impl Ring {
         self.buffer.size()
     }
 
-    /// Replaces the buffer with one of `size` bytes, after a flush (nothing is staged).
-    fn grow(&mut self, device: &wrela_gpu::Device, size: u64) {
+    /// Replaces the buffer, after a flush (nothing is staged), with one that holds `bytes`:
+    /// twice its size at least, a power of two. Whether it did: not where that's over `most`.
+    fn grow_to_fit(&mut self, device: &wrela_gpu::Device, bytes: u64, most: u64) -> bool {
         debug_assert!(self.staging.is_empty());
+        let size = bytes.max(self.capacity() * 2).next_power_of_two();
+        if size > most {
+            return false;
+        }
         let staging = std::mem::take(&mut self.staging);
         *self = Ring { staging, ..Ring::new(device, self.label, size) };
+        true
     }
 
     /// Writes this submission's staged bytes to the buffer.
@@ -606,12 +609,6 @@ impl Behind {
     }
 }
 
-/// The frame at whose end the device is reported lost (`WRELA_GPU_LOSE_AT`), if one is given:
-/// how a lost device's handling is tested on a machine whose GPU can't be made to lose it safely.
-fn lose_at() -> Option<usize> {
-    std::env::var("WRELA_GPU_LOSE_AT").ok().and_then(|v| v.trim().parse().ok())
-}
-
 /// The most work one submission may hold, by what bounds it: past either, what's recorded is
 /// submitted first (`Gpu::room`). A submission is one job to the GPU's driver, and a driver
 /// resets a GPU whose job runs too long (amdgpu: 10 s; a Metal command buffer of seconds hung
@@ -700,6 +697,14 @@ const LIGHT: f64 = 1.0 / 8.0;
 /// slot is read only once its submission is done, well within this many later pieces.
 const STAMP_RING: u32 = 256;
 
+/// The guard's timestamps of pieces measured alone: a ring of [`STAMP_RING`] query pairs, and
+/// the buffers one pair is resolved into and read back through.
+struct Stamps {
+    queries: wrela_gpu::QuerySet,
+    resolved: wrela_gpu::Buffer,
+    readback: wrela_gpu::Buffer,
+}
+
 /// How many lines a piece alone may take, once, before the run ends: past it, at once (a real
 /// runaway), within it, only when the next piece of its pass alone is over the line too.
 const RECHECK_LINES: f64 = 4.0;
@@ -707,9 +712,7 @@ const RECHECK_LINES: f64 = 4.0;
 /// idle before it.
 const USUAL_TIMES: f64 = 3.0;
 /// The flag's bit that says a lane ran out of fuel (`ir::fuel::FUEL_BIT`).
-fn ir_fuel_bit() -> u32 {
-    1 << 31
-}
+const IR_FUEL_BIT: u32 = 1 << 31;
 
 /// How many destroyed handles the host remembers, to say when one a command names went.
 const GONE_KEPT: usize = 1 << 16;
@@ -798,6 +801,16 @@ fn pieces(draws: u32, cost: Option<Cost>, room: f64) -> Vec<std::ops::Range<u32>
     (0..draws.div_ceil(size)).map(|k| k * size..((k + 1) * size).min(draws)).collect()
 }
 
+/// The invocations a dispatch of `p` over `groups` runs: an indirect dispatch's, its stated most
+/// groups' (`most:`), else unknown (the GPU's to hold).
+fn invocations(p: &Pipeline, groups: Result<[u32; 3], (u32, u32, u32)>) -> Option<u64> {
+    match groups {
+        Ok([x, y, z]) => Some(u64::from(x) * u64::from(y) * u64::from(z) * p.per_group),
+        Err((_, _, stated)) if stated > 0 => Some(u64::from(stated) * p.per_group),
+        Err(_) => None,
+    }
+}
+
 pub(crate) struct Gpu {
     counters: Counters,
     /// The longest any submission holding a pass may take on the GPU (ms): `crate::step`'s
@@ -817,7 +830,7 @@ pub(crate) struct Gpu {
     /// Timestamps of pieces measured alone (where the device has them and no timer stamps
     /// passes): a ring of query pairs, the next slot, and the slot the next submission's piece
     /// holds. The guard judges a piece over the line by its pass's own time from these.
-    stamps: Option<wrela_gpu::QuerySet>,
+    stamps: Option<Stamps>,
     stamp_next: u32,
     job_stamp: Option<u32>,
     /// Every measured job's piece and time, for tests.
@@ -915,6 +928,10 @@ pub(crate) struct Gpu {
     offscreen_hdr: bool,
     /// Keeps this device clocked while the program works on the CPU (`--keep-clocked`).
     warmer: Option<Warmer>,
+    /// The frame at whose end the device is reported lost (`WRELA_GPU_LOSE_AT`), if one is
+    /// given: how a lost device's handling is tested on a machine whose GPU can't be made to
+    /// lose it safely.
+    lose_at: Option<usize>,
 }
 
 /// The flag a debug build's bounds checks set, and the buffer it's read back through, made
@@ -956,9 +973,8 @@ pub(crate) fn limits_of(l: &wrela_gpu::Limits) -> wrela_abi::Limits {
 
 /// Waits for the device to finish its work, counted as time blocked on the GPU
 /// ([`crate::cpu_time`]).
-fn wait(device: &wrela_gpu::Device) -> Result<()> {
+fn wait(device: &wrela_gpu::Device) {
     crate::cpu_time::blocked(|| device.wait(device.submitted()));
-    Ok(())
 }
 
 /// Opens the machine's GPU (`wrela_gpu`: Metal, or Vulkan) with its optional features (those
@@ -973,7 +989,7 @@ pub fn open_device(label: &str, keep: Option<Vec<String>>) -> Result<wrela_gpu::
     })
     .map_err(|e| Error::Gpu(e.0))?;
     let info = device.info();
-    require_hardware(&info.name, info.device_type)?;
+    admits(&info.name, info.device_type, crate::software_allowed())?;
     Ok(device)
 }
 
@@ -998,10 +1014,6 @@ pub fn adapter_report() -> Result<String> {
         let _ = writeln!(s, "  {}", line.trim().trim_end_matches(','));
     }
     Ok(s)
-}
-
-fn require_hardware(name: &str, kind: wrela_gpu::DeviceType) -> Result<()> {
-    admits(name, kind, crate::software_allowed())
 }
 
 /// Whether a device of `kind` may run a build: a hardware GPU always, a software one (`Cpu`)
@@ -1029,8 +1041,6 @@ impl Gpu {
         report: bool,
     ) -> Result<Gpu> {
         let timestamps = timing != Timing::Off;
-        // Indirect arguments include first_instance, including arguments written by a
-        // kernel. Without this feature, a non-zero value can silently discard the draw.
         // Shaders are handed over as the target's own (`passthrough`): a build for another
         // machine can't run here.
         if manifest.target != wrela_abi::Target::HERE {
@@ -1110,7 +1120,10 @@ impl Gpu {
             job_piece: None,
             job_light: Vec::new(),
             stamps: if device.features().has("timestamp-query") {
-                device.create_query_set(2 * STAMP_RING).ok()
+                device.create_query_set(2 * STAMP_RING).ok().map(|queries| {
+                    let (resolved, readback) = query_buffers(&device, 2);
+                    Stamps { queries, resolved, readback }
+                })
             } else {
                 None
             },
@@ -1163,14 +1176,10 @@ impl Gpu {
             screen_asked: None,
             offscreen_hdr: false,
             warmer: None,
+            lose_at: std::env::var("WRELA_GPU_LOSE_AT").ok().and_then(|v| v.trim().parse().ok()),
         };
         gpu.take_pipelines(manifest, shaders)?;
-        if KEEP_CLOCKED.load(Ordering::SeqCst)
-            && !CALIBRATING.load(Ordering::SeqCst)
-            && !WARMING.with(|w| w.get())
-        {
-            gpu.warmer = Some(Warmer::start(gpu.device.clone()));
-        }
+        gpu.warmer = Warmer::for_device(&gpu.device);
         Ok(gpu)
     }
 
@@ -1225,11 +1234,8 @@ impl Gpu {
     /// survive. In particular, a program that doesn't draw mustn't see the last one's screen.
     pub(crate) fn restart_build(&mut self, manifest: &Manifest, shaders: &[Vec<u8>]) -> Result<()> {
         self.finish_build()?;
-        self.manifest = manifest.clone();
-        self.shaders = shaders.to_vec();
         self.screen = None;
         self.frame = 0;
-        self.debug_flag = None;
         self.spare.clear();
         // A timer the host runs from the start begins again; one the last program asked for
         // goes with it.
@@ -1237,6 +1243,15 @@ impl Gpu {
             Some(t) if t.keep => Some(Timer::new(&self.device, t.serial, true)),
             _ => None,
         };
+        self.take_build(manifest, shaders)
+    }
+
+    /// Takes the build `manifest` and `shaders` in place of the one whose work
+    /// [`Gpu::finish_build`] finished: its pipelines, keeping each of the ones it has that are
+    /// the same.
+    fn take_build(&mut self, manifest: &Manifest, shaders: &[Vec<u8>]) -> Result<()> {
+        self.manifest = manifest.clone();
+        self.shaders = shaders.to_vec();
         self.take_pipelines(manifest, shaders)
     }
 
@@ -1246,7 +1261,7 @@ impl Gpu {
         self.label = None;
         self.flush()?;
         self.collect()?;
-        wait(&self.device)?;
+        wait(&self.device);
         self.resources.clear();
         self.bound_in.clear();
         self.debug_flag = None;
@@ -1393,27 +1408,17 @@ impl Builder {
                 )));
             }
         }
-        // Bind group 0 as the compiler wrote the shader's argument tables for
-        // (`wrela_abi::metal`): the same bindings, each seen by the same stages.
-        let entries: Vec<wrela_gpu::LayoutEntry> = wrela_abi::metal::layout(p)
-            .iter()
-            .map(|e| wrela_gpu::LayoutEntry {
-                binding: e.binding,
-                visibility: e.visibility,
-                ty: binding_type(e, p),
-                index_at: if e.table { wrela_abi::table::index_offset(p, e.binding) } else { None },
-            })
-            .collect();
-
         // A shader that needs a feature this device hasn't isn't built: the checker refuses a
         // command that records it, naming the feature.
         let features = self.device.features();
-        let unavailable = p.requires.iter().any(|f| !device_has(features, f));
-        let layout = self.device.create_bind_group_layout(&entries);
+        let unavailable = p.requires.iter().any(|f| !features.has(f));
+        let layout = self.device.create_bind_group_layout(&layout_entries(p));
         let kind = if unavailable {
             Kind::Unavailable
         } else {
-            let module = shader_module(&self.device, p, source).map_err(shader_err)?;
+            // Its MSL or SPIR-V, as the compiler wrote it for this machine's API.
+            let module =
+                self.device.create_shader_module(&p.shader, source).map_err(|e| shader_err(e.0))?;
             match &p.stage {
                 Stage::Compute { entry, workgroup_size } => Kind::Compute(
                     self.device
@@ -1452,15 +1457,14 @@ impl Builder {
                     for t in targets {
                         // A target the device can't draw into (rg11b10ufloat without its feature)
                         // is one the checker refuses a pass of.
-                        if t.colors().any(|c| !c.info().renderable.on(|f| device_has(features, f)))
-                        {
+                        if t.colors().any(|c| !c.info().renderable.on(|f| features.has(f))) {
                             continue;
                         }
                         // Nor one it can't blend into as the pipeline blends (a 32-bit float
                         // target without float32-blendable): the checker refuses such a draw.
                         if t.colors().enumerate().any(|(k, c)| {
                             blends.get(k).is_some_and(|&b| b != Blend::Replace)
-                                && !c.info().blendable.on(|f| device_has(features, f))
+                                && !c.info().blendable.on(|f| features.has(f))
                         }) {
                             continue;
                         }
@@ -1483,7 +1487,7 @@ impl Builder {
             self.report(p, source, &kind, began.elapsed().as_secs_f64() * 1000.0);
         }
         Ok(Pipeline {
-            name: p.name.clone(),
+            name: p.name.as_str().into(),
             kind,
             layout,
             uniform: p.uniform.as_ref().map(|u| (u.binding, u.size)),
@@ -1497,16 +1501,51 @@ impl Builder {
                 }
                 Stage::Compute { .. } => Vec::new(),
             },
-            workgroup: match &p.stage {
-                Stage::Compute { workgroup_size, .. } => *workgroup_size,
-                Stage::Render { .. } => [1, 1, 1],
+            per_group: match &p.stage {
+                Stage::Compute { workgroup_size, .. } => {
+                    workgroup_size.iter().map(|&n| u64::from(n)).product()
+                }
+                Stage::Render { .. } => 1,
             },
         })
     }
 }
 
+/// Bind group 0's layout of pipeline `p`, as the compiler wrote the shader's argument tables for
+/// (`wrela_abi::metal`): the same bindings, each seen by the same stages.
+pub(crate) fn layout_entries(p: &wrela_abi::manifest::Pipeline) -> Vec<wrela_gpu::LayoutEntry> {
+    wrela_abi::metal::layout(p)
+        .iter()
+        .map(|e| wrela_gpu::LayoutEntry {
+            binding: e.binding,
+            visibility: e.visibility,
+            ty: binding_type(e, p),
+            index_at: if e.table { wrela_abi::table::index_offset(p, e.binding) } else { None },
+        })
+        .collect()
+}
+
+/// The uniform buffer a bind group's shader reads its storage buffers' bound sizes from
+/// (`wrela_abi::metal`): `words`, one a buffer in `BufferSizes::buffers`' order, padded to 16
+/// bytes. Staged: it lands before the submission that first binds it.
+pub(crate) fn sizes_buffer(
+    device: &wrela_gpu::Device,
+    label: &str,
+    words: impl IntoIterator<Item = u32>,
+) -> wrela_gpu::Buffer {
+    let mut bytes: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+    bytes.resize(bytes.len().next_multiple_of(16).max(16), 0);
+    let buffer = device.create_buffer(&wrela_gpu::BufferDesc {
+        label,
+        size: bytes.len() as u64,
+        mappable: false,
+    });
+    device.write_buffer(&buffer, 0, &bytes);
+    buffer
+}
+
 /// What a layout entry of pipeline `p` binds.
-pub(crate) fn binding_type(
+fn binding_type(
     e: &wrela_abi::metal::LayoutEntry,
     p: &wrela_abi::manifest::Pipeline,
 ) -> wrela_gpu::BindingType {
@@ -1559,26 +1598,6 @@ pub(crate) fn binding_type(
     }
 }
 
-/// Pipeline `p`'s shader module: its MSL or SPIR-V `source`, as the compiler wrote it for this
-/// machine's API.
-fn shader_module(
-    device: &wrela_gpu::Device,
-    p: &wrela_abi::manifest::Pipeline,
-    source: &[u8],
-) -> std::result::Result<wrela_gpu::ShaderModule, String> {
-    if wrela_abi::Target::HERE == wrela_abi::Target::Vulkan {
-        if source.len() % 4 != 0 || source.len() < 20 {
-            return Err("it isn't SPIR-V: not whole words".into());
-        }
-        if u32::from_le_bytes([source[0], source[1], source[2], source[3]]) != 0x0723_0203 {
-            return Err("it isn't SPIR-V: no magic number".into());
-        }
-    } else if std::str::from_utf8(source).is_err() {
-        return Err("its MSL isn't UTF-8".into());
-    }
-    device.create_shader_module(&p.shader, source).map_err(|e| e.0)
-}
-
 impl Builder {
     /// Reports the pipeline built of `p` on stderr, in a line, as it's built
     /// ([`crate::pipeline_report`]).
@@ -1608,30 +1627,50 @@ impl Builder {
     }
 }
 
+/// A texture made as `desc` says (2D, one level and one layer: a pass's target), and its view.
+fn attachment(
+    device: &wrela_gpu::Device,
+    desc: &wrela_gpu::TextureDesc<'_>,
+) -> (wrela_gpu::Texture, wrela_gpu::TextureView) {
+    let texture = device.create_texture(desc);
+    let view = texture.create_view(&wrela_gpu::ViewDesc {
+        dimension: wrela_gpu::ViewDimension::D2,
+        base_level: 0,
+        level_count: Some(1),
+        base_layer: 0,
+        layer_count: Some(1),
+    });
+    (texture, view)
+}
+
 impl Gpu {
     /// Makes the screen `width` x `height` in `format`, a new, cleared texture.
-    fn set_screen_format(&mut self, width: u32, height: u32, format: TextureFormat) -> Result<()> {
-        let texture = self.device.create_texture(&wrela_gpu::TextureDesc {
-            label: "screen",
-            width,
-            height,
-            depth_or_layers: 1,
-            levels: 1,
-            dimension: wrela_gpu::TextureDimension::D2,
-            format,
-            usage: wrela_gpu::TextureUsage { render: true, copy_src: true, ..Default::default() },
-            samples: 1,
-            transient: false,
-        });
-        let view = texture.create_view(&wrela_gpu::ViewDesc {
-            dimension: wrela_gpu::ViewDimension::D2,
-            base_level: 0,
-            level_count: Some(1),
-            base_layer: 0,
-            layer_count: Some(1),
-        });
+    fn set_screen_format(&mut self, width: u32, height: u32, format: TextureFormat) {
+        let (texture, view) = attachment(
+            &self.device,
+            &wrela_gpu::TextureDesc {
+                label: "screen",
+                width,
+                height,
+                depth_or_layers: 1,
+                levels: 1,
+                dimension: wrela_gpu::TextureDimension::D2,
+                format,
+                usage: wrela_gpu::TextureUsage {
+                    render: true,
+                    copy_src: true,
+                    ..Default::default()
+                },
+                samples: 1,
+                transient: false,
+            },
+        );
         self.screen = Some(Screen { texture, view, width, height, format });
-        Ok(())
+    }
+
+    /// The screen's format: [`SCREEN_FORMAT`] until it's made in another.
+    fn screen_format(&self) -> TextureFormat {
+        self.screen.as_ref().map_or(SCREEN_FORMAT, |s| s.format)
     }
 
     /// Makes the screen `width` x `height` (a new, cleared texture if the size changed).
@@ -1645,27 +1684,7 @@ impl Gpu {
         if self.screen.as_ref().is_some_and(|s| (s.width, s.height) == (width, height)) {
             return Ok(());
         }
-        let format = self.screen.as_ref().map_or(SCREEN_FORMAT, |s| s.format);
-        let texture = self.device.create_texture(&wrela_gpu::TextureDesc {
-            label: "screen",
-            width,
-            height,
-            depth_or_layers: 1,
-            levels: 1,
-            dimension: wrela_gpu::TextureDimension::D2,
-            format,
-            usage: wrela_gpu::TextureUsage { render: true, copy_src: true, ..Default::default() },
-            samples: 1,
-            transient: false,
-        });
-        let view = texture.create_view(&wrela_gpu::ViewDesc {
-            dimension: wrela_gpu::ViewDimension::D2,
-            base_level: 0,
-            level_count: Some(1),
-            base_layer: 0,
-            layer_count: Some(1),
-        });
-        self.screen = Some(Screen { texture, view, width, height, format });
+        self.set_screen_format(width, height, self.screen_format());
         Ok(())
     }
 
@@ -1681,43 +1700,27 @@ impl Gpu {
         let screen =
             self.screen.as_ref().ok_or_else(|| Error::Gpu("there's no screen yet".into()))?;
         let (w, h, format) = (screen.width, screen.height, screen.format);
-        let texel = format.bytes_per_texel();
-        let padded =
-            align_to(u64::from(w * texel), u64::from(wrela_gpu::COPY_BYTES_PER_ROW_ALIGNMENT));
-        let staging = staging(&self.device, &mut self.image_readback, padded * u64::from(h));
-        let mut encoder = self.device.create_command_encoder("read the screen");
-        encoder.copy_texture_to_buffer(
-            wrela_gpu::TextureCopy {
-                texture: &screen.texture,
-                level: 0,
-                origin: [0, 0, 0],
-                depth_only: false,
-            },
-            wrela_gpu::BufferCopy {
-                buffer: &staging,
-                offset: 0,
-                bytes_per_row: padded as u32,
-                rows_per_image: h,
-            },
-            [w, h, 1],
-        );
-        self.device.submit(vec![encoder.finish()]);
-        map_read_with(&self.device, &staging, padded * u64::from(h), |bytes| {
-            let mut out = Vec::with_capacity((w * h * 4) as usize);
-            for row in bytes.chunks_exact(padded as usize) {
-                for t in row[..(w * texel) as usize].chunks_exact(texel as usize) {
-                    if format == TextureFormat::Rgba16Float {
-                        out.extend(
-                            (0..4)
-                                .map(|k| f16_to_f32(u16::from_le_bytes([t[2 * k], t[2 * k + 1]]))),
-                        );
-                    } else {
-                        out.extend(t.iter().map(|&b| f32::from(b) / 255.0));
-                    }
-                }
+        let raw = read_rows(
+            &self.device,
+            &mut self.image_readback,
+            &screen.texture,
+            0,
+            [0, 0, 0],
+            [w, h],
+            format,
+        )?;
+        let texel = format.bytes_per_texel() as usize;
+        let mut out = Vec::with_capacity((w * h * 4) as usize);
+        for t in raw.chunks_exact(texel) {
+            if format == TextureFormat::Rgba16Float {
+                out.extend(
+                    (0..4).map(|k| f16_to_f32(u16::from_le_bytes([t[2 * k], t[2 * k + 1]]))),
+                );
+            } else {
+                out.extend(t.iter().map(|&b| f32::from(b) / 255.0));
             }
-            out
-        })
+        }
+        Ok(out)
     }
 
     /// Lets an offscreen screen go HDR when the program asks (a test's `hdr=1`): else, with no
@@ -1746,8 +1749,7 @@ impl Gpu {
             None => (false, false),
         };
         let format = if hdr { TextureFormat::Rgba16Float } else { SCREEN_FORMAT };
-        let current = self.screen.as_ref().map_or(SCREEN_FORMAT, |s| s.format);
-        if format != current {
+        if format != self.screen_format() {
             // Every pipeline that draws the screen, built for its new format first.
             for p in &mut self.pipelines {
                 let depths = p.screen_depths.clone();
@@ -1760,7 +1762,7 @@ impl Gpu {
             if let Some(screen) = &self.screen {
                 let (w, h) = (screen.width, screen.height);
                 self.screen = None;
-                self.set_screen_format(w, h, format)?;
+                self.set_screen_format(w, h, format);
             }
         }
         self.program_limits.screen = u32::from(hdr) | u32::from(p3) << 1;
@@ -1782,7 +1784,7 @@ impl Gpu {
         let gpu_err = |e: wrela_gpu::Error| Error::Gpu(e.0);
         let mut surface = self.device.create_surface(window.clone()).map_err(gpu_err)?;
         let config = wrela_gpu::SurfaceConfig { width, height, present, frames: 3 };
-        surface.configure(&self.device, &config).map_err(gpu_err)?;
+        surface.configure(&config).map_err(gpu_err)?;
         let (pipeline, layout) = present_pipeline(&self.device, surface.format())?;
         let format = surface.format();
         self.presenter = Some(Presenter {
@@ -1800,14 +1802,13 @@ impl Gpu {
 
     /// The window is now `width` × `height`.
     pub(crate) fn resize_window(&mut self, width: u32, height: u32) -> Result<()> {
-        let device = self.device.clone();
         let Some(p) = &mut self.presenter else { return Ok(()) };
         if (p.config.width, p.config.height) == (width, height) || width == 0 || height == 0 {
             return Ok(());
         }
         p.config.width = width;
         p.config.height = height;
-        p.surface.configure(&device, &p.config).map_err(|e| Error::Gpu(e.0))
+        p.surface.configure(&p.config).map_err(|e| Error::Gpu(e.0))
     }
 
     /// The frames the window showed since the last take: each one's id ([`Gpu::present`]) and
@@ -1835,7 +1836,7 @@ impl Gpu {
             Ok(f) => f,
             // The window changed under it: configured again, the frame is skipped.
             Err(_) => {
-                return p.surface.configure(&device, &p.config).map(|()| None).map_err(gpu_err);
+                return p.surface.configure(&p.config).map(|()| None).map_err(gpu_err);
             }
         };
         if self.program_limits.screen & 1 != 0 {
@@ -1902,7 +1903,6 @@ impl Gpu {
         }
     }
 
-    /// The texture `handle`.
     /// A texture pass's targets' size: its first colour target's level, or its depth's.
     fn pass_size(&self, pass: &Pass) -> (u32, u32) {
         let (handle, level) = match pass.colors().first() {
@@ -1913,6 +1913,7 @@ impl Gpu {
         stream::level_size(t.width(), t.height(), level)
     }
 
+    /// The texture `handle`.
     fn texture(&self, handle: u32) -> &Texture {
         match &self.resources[&handle] {
             Resource::Texture(t) => t,
@@ -1978,37 +1979,24 @@ impl Gpu {
         // (`wrela_abi::metal`), in a uniform buffer of this bind group's own, which the bind
         // group keeps alive.
         let sizes = p.sizes.as_ref().map(|s| {
-            let words: Vec<u32> = s
-                .buffers
-                .iter()
-                .map(|&binding| {
-                    if Some(binding) == p.debug_flag {
-                        return 4;
+            let words = s.buffers.iter().map(|&binding| {
+                if Some(binding) == p.debug_flag {
+                    return 4;
+                }
+                let at = p.bindings.iter().position(|b| b.binding == binding);
+                let (b, resource) = match at {
+                    Some(k) => (&bindings[k], &resources[k].0),
+                    None => return 0,
+                };
+                match resource {
+                    Resource::Buffer(buffer) if b.size == 0 => {
+                        u32::try_from(buffer.size().saturating_sub(u64::from(b.offset)))
+                            .unwrap_or(u32::MAX)
                     }
-                    let at = p.bindings.iter().position(|b| b.binding == binding);
-                    let (b, resource) = match at {
-                        Some(k) => (&bindings[k], &resources[k].0),
-                        None => return 0,
-                    };
-                    match resource {
-                        Resource::Buffer(buffer) if b.size == 0 => {
-                            u32::try_from(buffer.size().saturating_sub(u64::from(b.offset)))
-                                .unwrap_or(u32::MAX)
-                        }
-                        _ => b.size,
-                    }
-                })
-                .collect();
-            let mut bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-            bytes.resize(bytes.len().next_multiple_of(16).max(16), 0);
-            let buffer = self.device.create_buffer(&wrela_gpu::BufferDesc {
-                label: "buffer sizes",
-                size: bytes.len() as u64,
-                mappable: false,
+                    _ => b.size,
+                }
             });
-            // Staged: it lands before the submission that first binds it.
-            self.device.write_buffer(&buffer, 0, &bytes);
-            (s.binding, buffer)
+            (s.binding, sizes_buffer(&self.device, "buffer sizes", words))
         });
         if let Some((binding, buffer)) = &sizes {
             entries.push(wrela_gpu::BindGroupEntry {
@@ -2060,14 +2048,12 @@ impl Gpu {
         // Radeon's frame spent most of its 250 ms of recording waiting so). Doubled, a frame's
         // uniforms fit in a few frames' time and are submitted once.
         if start + bytes > self.ring.capacity() {
-            let capacity = bytes.max(self.ring.capacity() * 2).next_power_of_two();
-            if capacity > self.limits.max_buffer_size {
+            if !self.ring.grow_to_fit(&self.device, bytes, self.limits.max_buffer_size) {
                 return Err(Error::command(
                     opcode,
                     format!("{bytes} uniform bytes in one submission is over the limit"),
                 ));
             }
-            self.ring.grow(&self.device, capacity);
             // Cached bind groups point at the old ring.
             self.bind_groups.iter_mut().for_each(HashMap::clear);
             self.bound_in.clear();
@@ -2163,7 +2149,7 @@ impl Gpu {
     /// Submits what's recorded, waits for the GPU to finish it, and stops the capture, which
     /// writes its file.
     pub(crate) fn end_capture(&mut self) -> Result<()> {
-        let done = self.flush().and_then(|()| wait(&self.device));
+        let done = self.flush().map(|()| wait(&self.device));
         crate::capture::stop(&self.device);
         done
     }
@@ -2233,7 +2219,7 @@ impl Gpu {
         // was stamped (on Metal the span starts near the commit, so a wait before the pass ran,
         // the GPU waking after a long stretch of CPU work, is in the span and not in the pass).
         let ms = match (ms > line, job.stamp, &self.stamps) {
-            (true, Some(slot), Some(q)) => match stamped_ms(&self.device, q, slot) {
+            (true, Some(slot), Some(stamps)) => match stamped_ms(&self.device, stamps, slot) {
                 Some(own) => {
                     if own <= line {
                         eprintln!(
@@ -2353,7 +2339,7 @@ impl Gpu {
         let usage = wrela_gpu::TextureUsage {
             sampled: true,
             copy_src: true,
-            render: !three && format.info().renderable.on(|f| device_has(features, f)),
+            render: !three && format.info().renderable.on(|f| features.has(f)),
             copy_dst: !format.is_depth(),
             // Only where kernels write it: a storage texture may give up the GPU's compression
             // of what's drawn into it.
@@ -2437,8 +2423,7 @@ impl Gpu {
         }
         self.flush()?;
         if bytes > self.upload.capacity() {
-            let capacity = bytes.max(self.upload.capacity() * 2).next_power_of_two();
-            self.upload.grow(&self.device, capacity);
+            self.upload.grow_to_fit(&self.device, bytes, u64::MAX);
         }
         Ok(0)
     }
@@ -2604,10 +2589,9 @@ impl Gpu {
                 let crate::step::Bound::Most(most) = p.bound else {
                     unreachable!("`weigh` refused a kernel without a bound");
                 };
-                let per_group = p.workgroup.iter().map(|&n| u64::from(n)).product::<u64>();
                 // The groups the GPU lets through: what the limit allows, and no more than the
                 // program said it asks (`most:`), which is what it was weighed and booked as.
-                let most = crate::step::most_groups(most, per_group, wrela_abi::Target::HERE);
+                let most = crate::step::most_groups(most, p.per_group, wrela_abi::Target::HERE);
                 let most = if stated > 0 { most.min(u64::from(stated)) } else { most };
                 let name = p.name.clone();
                 let source = self.buffer(buffer).clone();
@@ -2623,7 +2607,7 @@ impl Gpu {
         };
         if let Some(f) = &mut self.debug_flag {
             let p = &self.pipelines[pipeline as usize];
-            let l = self.label.clone().unwrap_or_else(|| Arc::from(p.name.as_str()));
+            let l = self.label.clone().unwrap_or_else(|| p.name.clone());
             f.labels.insert(pipeline, l);
         }
         let p = &self.pipelines[pipeline as usize];
@@ -2665,18 +2649,7 @@ impl Gpu {
     /// GPU) may run: its kernel's bound times its invocations within the limit (`crate::step`).
     fn weigh(&self, pipeline: u32, groups: Result<[u32; 3], (u32, u32, u32)>) -> Result<()> {
         let p = &self.pipelines[pipeline as usize];
-        let invocations = match groups {
-            Ok([x, y, z]) => {
-                let per_group = p.workgroup.iter().map(|&n| u64::from(n)).product::<u64>();
-                Some(u64::from(x) * u64::from(y) * u64::from(z) * per_group)
-            }
-            // Stated (`most:`): weighed as that many groups; else unknown, the GPU's to hold.
-            Err((_, _, stated)) if stated > 0 => {
-                let per_group = p.workgroup.iter().map(|&n| u64::from(n)).product::<u64>();
-                Some(u64::from(stated) * per_group)
-            }
-            Err(_) => None,
-        };
+        let invocations = invocations(p, groups);
         if crate::step::logging() {
             let label = self.label.as_deref().unwrap_or(&p.name);
             let n = invocations.map_or_else(|| "indirect".to_string(), |n| n.to_string());
@@ -2694,18 +2667,12 @@ impl Gpu {
     /// indirect dispatch's, the limit, which the GPU holds it to.
     fn bound_ms(&self, pipeline: u32, groups: Result<[u32; 3], (u32, u32, u32)>) -> f64 {
         let p = &self.pipelines[pipeline as usize];
-        match (&p.bound, groups) {
-            (crate::step::Bound::Most(most), Ok([x, y, z])) => {
-                let per_group = p.workgroup.iter().map(|&n| u64::from(n)).product::<u64>();
-                let n = u64::from(x) * u64::from(y) * u64::from(z) * per_group;
+        // An indirect dispatch whose most groups are stated is booked as that many, so a few
+        // small ones share a submission as direct ones do (backend.md 72: booked at the limit,
+        // every second one closed a submission).
+        match (&p.bound, invocations(p, groups)) {
+            (crate::step::Bound::Most(most), Some(n)) => {
                 crate::step::ms_of(*most, n, wrela_abi::Target::HERE)
-            }
-            // An indirect dispatch whose most groups are stated: booked as that many, so a few
-            // small ones share a submission as direct ones do (backend.md 72: booked at the
-            // limit, every second one closed a submission).
-            (crate::step::Bound::Most(most), Err((_, _, stated))) if stated > 0 => {
-                let per_group = p.workgroup.iter().map(|&n| u64::from(n)).product::<u64>();
-                crate::step::ms_of(*most, u64::from(stated) * per_group, wrela_abi::Target::HERE)
             }
             _ => crate::step::limit_ms(),
         }
@@ -2736,7 +2703,7 @@ impl Gpu {
     fn alone(&mut self) -> Result<()> {
         if self.timer.as_ref().is_some_and(|t| t.serial) {
             self.flush()?;
-            wait(&self.device)?;
+            wait(&self.device);
         }
         Ok(())
     }
@@ -2752,7 +2719,7 @@ impl Gpu {
         if let Some(f) = &mut self.debug_flag {
             let p = &self.pipelines[pipeline as usize];
             let l = self.pass.as_ref().and_then(|o| o.label.clone());
-            f.labels.insert(pipeline, l.unwrap_or_else(|| Arc::from(p.name.as_str())));
+            f.labels.insert(pipeline, l.unwrap_or_else(|| p.name.clone()));
         }
         if crate::step::logging() {
             let p = &self.pipelines[pipeline as usize];
@@ -2904,7 +2871,7 @@ impl Gpu {
             .iter()
             .map(|c| {
                 if c.texture == stream::SCREEN {
-                    self.screen.as_ref().map_or(SCREEN_FORMAT, |s| s.format)
+                    self.screen_format()
                 } else {
                     self.texture(c.texture).format
                 }
@@ -2914,10 +2881,10 @@ impl Gpu {
         // Each draw's pipeline has a variant for these targets, made at load: the checker
         // checked they're among its manifest's.
         let formats = (colors, depth_format, pass.samples);
-        let name: Arc<str> = open
-            .label
-            .clone()
-            .unwrap_or_else(|| Arc::from(if on_screen { "screen pass" } else { "pass" }));
+        let name = open.label.clone().unwrap_or_else(|| {
+            let (screen, texture) = &*UNNAMED_PASSES;
+            if on_screen { screen } else { texture }.clone()
+        });
         let target = match (pass.colors().first(), pass.depth) {
             (Some(c), _) if c.texture == stream::SCREEN => None,
             (Some(c), _) => Some((c.texture, c.level, c.layer)),
@@ -3008,25 +2975,21 @@ impl Gpu {
         if let Some((_, view)) = self.msaa.get(&key) {
             return view.clone();
         }
-        let texture = self.device.create_texture(&wrela_gpu::TextureDesc {
-            label: &format!("msaa {samples}x slot {slot}"),
-            width,
-            height,
-            depth_or_layers: 1,
-            levels: 1,
-            dimension: wrela_gpu::TextureDimension::D2,
-            format,
-            usage: wrela_gpu::TextureUsage { render: true, ..Default::default() },
-            samples,
-            transient,
-        });
-        let view = texture.create_view(&wrela_gpu::ViewDesc {
-            dimension: wrela_gpu::ViewDimension::D2,
-            base_level: 0,
-            level_count: Some(1),
-            base_layer: 0,
-            layer_count: Some(1),
-        });
+        let (texture, view) = attachment(
+            &self.device,
+            &wrela_gpu::TextureDesc {
+                label: &format!("msaa {samples}x slot {slot}"),
+                width,
+                height,
+                depth_or_layers: 1,
+                levels: 1,
+                dimension: wrela_gpu::TextureDimension::D2,
+                format,
+                usage: wrela_gpu::TextureUsage { render: true, ..Default::default() },
+                samples,
+                transient,
+            },
+        );
         self.msaa.insert(key, (texture, view.clone()));
         view
     }
@@ -3081,8 +3044,7 @@ impl Gpu {
                 .enumerate()
                 .map(|(k, c)| {
                     let t = self.texture(c.texture);
-                    let w = (t.texture.width() >> c.level).max(1);
-                    let h = (t.texture.height() >> c.level).max(1);
+                    let (w, h) = stream::level_size(t.texture.width(), t.texture.height(), c.level);
                     let f = t.format;
                     self.msaa_view(k as u8, w, h, f, pass.samples, transient)
                 })
@@ -3166,8 +3128,8 @@ impl Gpu {
                     begin: i,
                     end: i + 1,
                 }),
-                (None, Some(slot)) => self.stamps.as_ref().map(|q| wrela_gpu::PassTimestamps {
-                    queries: q,
+                (None, Some(slot)) => self.stamps.as_ref().map(|s| wrela_gpu::PassTimestamps {
+                    queries: &s.queries,
                     begin: 2 * slot,
                     end: 2 * slot + 1,
                 }),
@@ -3206,7 +3168,7 @@ impl Gpu {
                 DrawHow::Multi { count, .. } => u64::from(count),
                 _ => 1,
             };
-            let index = |rp: &mut wrela_gpu::RenderPass<'_>, indices: u32, at: u32, _size: u32| {
+            let index = |rp: &mut wrela_gpu::RenderPass<'_>, indices: u32, at: u32| {
                 rp.set_index_buffer(self.buffer(indices), u64::from(at));
             };
             match d.how {
@@ -3214,21 +3176,20 @@ impl Gpu {
                 DrawHow::Indirect { buffer, offset } => {
                     rp.draw_indirect(self.buffer(buffer), u64::from(offset));
                 }
-                DrawHow::IndexedIndirect { indices, at, size, buffer, offset } => {
-                    index(&mut rp, indices, at, size);
+                DrawHow::IndexedIndirect { indices, at, buffer, offset } => {
+                    index(&mut rp, indices, at);
                     rp.draw_indexed_indirect(self.buffer(buffer), u64::from(offset));
                 }
                 DrawHow::Indexed {
                     indices,
                     at,
-                    size,
                     count,
                     instances,
                     first,
                     base_vertex,
                     first_instance,
                 } => {
-                    index(&mut rp, indices, at, size);
+                    index(&mut rp, indices, at);
                     rp.draw_indexed(
                         first..first + count,
                         base_vertex,
@@ -3236,8 +3197,8 @@ impl Gpu {
                     );
                 }
                 DrawHow::Multi { indices, buffer, offset, count } => match indices {
-                    Some([h, at, size]) => {
-                        index(&mut rp, h, at, size);
+                    Some([h, at]) => {
+                        index(&mut rp, h, at);
                         rp.multi_draw_indexed_indirect(
                             self.buffer(buffer),
                             u64::from(offset),
@@ -3357,48 +3318,22 @@ impl Gpu {
             )));
         }
         let format = screen.format;
-        let texel = u64::from(format.bytes_per_texel());
-        let row = u64::from(width) * texel;
-        let padded = align_to(row, u64::from(wrela_gpu::COPY_BYTES_PER_ROW_ALIGNMENT));
-        let size = padded * u64::from(height);
-        let staging = staging(&self.device, &mut self.image_readback, size);
-        let mut encoder = self.device.create_command_encoder("read the screen");
-        encoder.copy_texture_to_buffer(
-            wrela_gpu::TextureCopy {
-                texture: &screen.texture,
-                level: 0,
-                origin: [x, y, 0],
-                depth_only: false,
-            },
-            wrela_gpu::BufferCopy {
-                buffer: &staging,
-                offset: 0,
-                bytes_per_row: padded as u32,
-                rows_per_image: height,
-            },
-            [width, height, 1],
-        );
-        self.device.submit(vec![encoder.finish()]);
-        let frame = map_read_with(&self.device, &staging, size, |bytes| {
-            if padded == row && format == SCREEN_FORMAT {
-                return bytes.to_vec();
-            }
-            // An HDR screen's half floats as RGBA8, each channel clamped to 0 to 1.
-            let mut frame = Vec::with_capacity((u64::from(width) * 4 * u64::from(height)) as usize);
-            for padded_row in bytes.chunks_exact(padded as usize) {
-                let line = &padded_row[..row as usize];
-                if format == SCREEN_FORMAT {
-                    frame.extend_from_slice(line);
-                } else {
-                    for t in line.chunks_exact(texel as usize) {
-                        frame.extend_from_slice(&as_rgba8(format, t));
-                    }
-                }
-            }
-            frame
-        })?;
+        let raw = read_rows(
+            &self.device,
+            &mut self.image_readback,
+            &screen.texture,
+            0,
+            [x, y, 0],
+            [width, height],
+            format,
+        )?;
         self.check_errors()?;
-        Ok(frame)
+        if format == SCREEN_FORMAT {
+            return Ok(raw);
+        }
+        // An HDR screen's half floats as RGBA8, each channel clamped to 0 to 1.
+        let texel = format.bytes_per_texel() as usize;
+        Ok(raw.chunks_exact(texel).flat_map(|t| as_rgba8(format, t)).collect())
     }
 
     /// The target of the last pass labelled `label` (`std::gpu::label`) that drew into a texture
@@ -3448,42 +3383,19 @@ impl Gpu {
                 "the target of the pass labelled `{label}` is compressed, which no pass draws"
             )));
         }
-        let texel = u64::from(format.bytes_per_texel());
-        let row = u64::from(width) * texel;
-        let padded = align_to(row, u64::from(wrela_gpu::COPY_BYTES_PER_ROW_ALIGNMENT));
-        let size = padded * u64::from(height);
-        let staging = staging(&self.device, &mut self.image_readback, size);
-        let mut encoder = self.device.create_command_encoder("read a target");
-        encoder.copy_texture_to_buffer(
-            wrela_gpu::TextureCopy {
-                texture,
-                level,
-                origin: [0, 0, layer],
-                depth_only: format == TextureFormat::Depth32Float,
-            },
-            wrela_gpu::BufferCopy {
-                buffer: &staging,
-                offset: 0,
-                bytes_per_row: padded as u32,
-                rows_per_image: height,
-            },
-            [width, height, 1],
-        );
-        self.device.submit(vec![encoder.finish()]);
-        let raw = map_read_with(&self.device, &staging, size, |bytes| {
-            let mut out = Vec::with_capacity((row * u64::from(height)) as usize);
-            for y in 0..height as usize {
-                let at = y * padded as usize;
-                out.extend_from_slice(&bytes[at..at + row as usize]);
-            }
-            out
-        })?;
+        let raw = read_rows(
+            &self.device,
+            &mut self.image_readback,
+            texture,
+            level,
+            [0, 0, layer],
+            [width, height],
+            format,
+        )?;
         self.check_errors()?;
         Ok((width, height, format, raw))
     }
 
-    /// A debug build's: an error if a pipeline indexed an array out of range (its number, from
-    /// 1, is in the flag). Waits for the GPU.
     /// Records a copy of the flag into the next slot of its ring, in `encoder` (the frame's last
     /// work): read once it's done ([`Gpu::check_debug_flag`]).
     fn copy_flag(&mut self, encoder: &mut wrela_gpu::CommandEncoder) {
@@ -3516,7 +3428,7 @@ impl Gpu {
         self.encoder = Some(encoder);
         self.flush()?;
         self.flag_submitted();
-        wait(&self.device)?;
+        wait(&self.device);
         self.check_debug_flag()
     }
 
@@ -3538,8 +3450,8 @@ impl Gpu {
             }
         }
         let Some((code, frame)) = found else { return Ok(()) };
-        let fuel = code & ir_fuel_bit() != 0;
-        let number = code & !ir_fuel_bit();
+        let fuel = code & IR_FUEL_BIT != 0;
+        let number = code & !IR_FUEL_BIT;
         let (name, label) = match self.pipelines.get(number as usize - 1) {
             Some(p) => (
                 format!("`{}`", p.name),
@@ -3567,6 +3479,48 @@ impl Gpu {
 
 fn readback_buffer(device: &wrela_gpu::Device, size: u64) -> wrela_gpu::Buffer {
     device.create_buffer(&wrela_gpu::BufferDesc { label: "readback", size, mappable: true })
+}
+
+/// `size` (width, height) texels of `format` from `origin` (x, y, layer) of `texture`'s level
+/// `level`, copied back through the readback buffer kept in `slot` (waits for the GPU): its own
+/// texels (a depth texture's depth), rows top to bottom with no padding.
+fn read_rows(
+    device: &wrela_gpu::Device,
+    slot: &mut Option<wrela_gpu::Buffer>,
+    texture: &wrela_gpu::Texture,
+    level: u32,
+    origin: [u32; 3],
+    [width, height]: [u32; 2],
+    format: TextureFormat,
+) -> Result<Vec<u8>> {
+    let row = u64::from(width) * u64::from(format.bytes_per_texel());
+    let padded = align_to(row, u64::from(wrela_gpu::COPY_BYTES_PER_ROW_ALIGNMENT));
+    let size = padded * u64::from(height);
+    let staging = staging(device, slot, size);
+    let mut encoder = device.create_command_encoder("read a texture");
+    encoder.copy_texture_to_buffer(
+        wrela_gpu::TextureCopy {
+            texture,
+            level,
+            origin,
+            depth_only: format == TextureFormat::Depth32Float,
+        },
+        wrela_gpu::BufferCopy {
+            buffer: &staging,
+            offset: 0,
+            bytes_per_row: padded as u32,
+            rows_per_image: height,
+        },
+        [width, height, 1],
+    );
+    device.submit(vec![encoder.finish()]);
+    map_read_with(device, &staging, size, |bytes| {
+        let mut out = Vec::with_capacity((row * u64::from(height)) as usize);
+        for padded_row in bytes.chunks_exact(padded as usize) {
+            out.extend_from_slice(&padded_row[..row as usize]);
+        }
+        out
+    })
 }
 
 /// The readback buffer kept in `slot` if it holds `size` bytes, else a new one that replaces it.
@@ -3617,7 +3571,7 @@ impl Gpu {
         // In the plain format: a screen asked HDR becomes so again at the frame's end
         // (`show_screen`), its pipelines' variants built on the new device.
         if let Some(s) = &self.screen {
-            fresh.set_screen_format(s.width, s.height, SCREEN_FORMAT)?;
+            fresh.set_screen_format(s.width, s.height, SCREEN_FORMAT);
         }
         let bits = self.program_limits.screen;
         if bits != 0 {
@@ -3665,7 +3619,7 @@ impl Gpu {
         self.calls += 1;
         // A loss on demand (`WRELA_GPU_LOSE_AT=<frame>`), reported as a real one is: the
         // host's handling of it is tested so.
-        if lose_at() == Some(self.frame) && self.program_limits.epoch == 0 {
+        if self.lose_at == Some(self.frame) && self.program_limits.epoch == 0 {
             self.device.lose();
         }
         self.check_errors()?;
@@ -3748,7 +3702,6 @@ impl Executor for Gpu {
                 pipeline,
                 indices,
                 index_offset,
-                index_size,
                 index_count,
                 instances,
                 first_index,
@@ -3756,6 +3709,7 @@ impl Executor for Gpu {
                 first_instance,
                 bindings,
                 uniforms,
+                ..
             } => {
                 // Its ranges' ends are `u32`s, as a draw takes them.
                 if first_instance.checked_add(*instances).is_none() {
@@ -3779,7 +3733,6 @@ impl Executor for Gpu {
                 let how = DrawHow::Indexed {
                     indices: *indices,
                     at: *index_offset,
-                    size: *index_size,
                     count: *index_count,
                     instances: *instances,
                     first: *first_index,
@@ -3806,7 +3759,7 @@ impl Executor for Gpu {
                     ));
                 }
                 let how = DrawHow::Multi {
-                    indices: *indices,
+                    indices: indices.map(|[h, at, _]| [h, at]),
                     buffer: *arguments,
                     offset: *offset,
                     count: *count,
@@ -3855,16 +3808,15 @@ impl Executor for Gpu {
                 pipeline,
                 indices,
                 index_offset,
-                index_size,
                 arguments,
                 offset,
                 bindings,
                 uniforms,
+                ..
             } => {
                 let how = DrawHow::IndexedIndirect {
                     indices: *indices,
                     at: *index_offset,
-                    size: *index_size,
                     buffer: *arguments,
                     offset: *offset,
                 };
@@ -3951,9 +3903,7 @@ impl Executor for Gpu {
     /// pipelines. The device, the screen and the rings stay.
     fn reload(&mut self, manifest: &Manifest, shaders: &[Vec<u8>]) -> Result<()> {
         self.finish_build()?;
-        self.manifest = manifest.clone();
-        self.shaders = shaders.to_vec();
-        self.take_pipelines(manifest, shaders)
+        self.take_build(manifest, shaders)
     }
 }
 
@@ -4001,11 +3951,6 @@ fn render_variant(
     Ok(())
 }
 
-/// A mappable buffer's bytes, once the GPU is done with what's submitted.
-pub fn map_read(device: &wrela_gpu::Device, buffer: &wrela_gpu::Buffer) -> Result<Vec<u8>> {
-    map_read_with(device, buffer, buffer.size(), <[u8]>::to_vec)
-}
-
 /// A mappable buffer's first `len` bytes (whole words), converted by `read` in place, once the
 /// GPU is done with what's submitted: callers copy just the pixels or words they need.
 fn map_read_with<T>(
@@ -4014,7 +3959,7 @@ fn map_read_with<T>(
     len: u64,
     read: impl FnOnce(&[u8]) -> T,
 ) -> Result<T> {
-    wait(device)?;
+    wait(device);
     let bytes = buffer.read(0, len).map_err(|e| Error::Gpu(e.0))?;
     Ok(read(&bytes))
 }
@@ -4089,27 +4034,13 @@ impl Timer {
     }
 }
 
-/// The GPU durations of `passes` timed passes, in nanoseconds. Pass `i` wrote queries `2i`
+/// The starts and ends of `passes` timed passes, in nanoseconds on the GPU's clock (an end before
+/// its start, as a clock that wrapped, is taken as the start). Pass `i` wrote queries `2i`
 /// (start) and `2i + 1` (end) of `queries`, in a submission already made. Waits for the GPU.
 ///
 /// The queries are resolved in a later submission, after the timed one completes: on Apple GPUs
 /// a resolve in the same command buffer as the passes it times can read the previous
 /// submission's values.
-pub fn read_timestamps(
-    device: &wrela_gpu::Device,
-    queries: &wrela_gpu::QuerySet,
-    passes: u32,
-) -> Result<Vec<f64>> {
-    if passes == 0 {
-        return Ok(Vec::new());
-    }
-    let (resolved, readback) = query_buffers(device, passes * 2);
-    let spans = read_timestamp_spans(device, queries, &resolved, &readback, passes)?;
-    Ok(spans.into_iter().map(|(start, end)| end - start).collect())
-}
-
-/// [`read_timestamps`]' passes' starts and ends, in nanoseconds on the GPU's clock (an end
-/// before its start, as a clock that wrapped, is taken as the start).
 fn read_timestamp_spans(
     device: &wrela_gpu::Device,
     queries: &wrela_gpu::QuerySet,
@@ -4117,7 +4048,7 @@ fn read_timestamp_spans(
     readback: &wrela_gpu::Buffer,
     passes: u32,
 ) -> Result<Vec<(f64, f64)>> {
-    let ticks = resolve(device, queries, resolved, readback, passes * 2)?;
+    let ticks = resolve(device, queries, resolved, readback, 0, passes * 2)?;
     let period = f64::from(device.timestamp_period());
     Ok(ticks
         .chunks_exact(2)
@@ -4138,22 +4069,23 @@ fn query_buffers(device: &wrela_gpu::Device, n: u32) -> (wrela_gpu::Buffer, wrel
     (resolved, readback)
 }
 
-/// The values of the first `n` timestamp queries, in a submission already made. Waits for
+/// The values of `n` timestamp queries from `first`, in a submission already made. Waits for
 /// the GPU, then resolves them and reads them back.
 fn resolve(
     device: &wrela_gpu::Device,
     queries: &wrela_gpu::QuerySet,
     resolved: &wrela_gpu::Buffer,
     readback: &wrela_gpu::Buffer,
+    first: u32,
     n: u32,
 ) -> Result<Vec<u64>> {
     if n == 0 {
         return Ok(Vec::new());
     }
-    wait(device)?;
+    wait(device);
     let size = u64::from(n) * 8;
     let mut encoder = device.create_command_encoder("resolve timestamps");
-    encoder.resolve_query_set(queries, 0, n, resolved, 0);
+    encoder.resolve_query_set(queries, first, n, resolved, 0);
     encoder.copy_buffer_to_buffer(resolved, 0, readback, 0, size);
     device.submit(vec![encoder.finish()]);
     map_read_with(device, readback, size, |bytes| {
@@ -4163,17 +4095,9 @@ fn resolve(
 
 /// A piece's own time (ms) from the guard's stamps: its pass's begin and end (slot `slot`, a
 /// submission already done), on the GPU's clock. None where the stamps don't read as a time.
-fn stamped_ms(device: &wrela_gpu::Device, queries: &wrela_gpu::QuerySet, slot: u32) -> Option<f64> {
-    wait(device).ok()?;
-    let (resolved, readback) = query_buffers(device, 2);
-    let mut encoder = device.create_command_encoder("resolve a piece's stamps");
-    encoder.resolve_query_set(queries, 2 * slot, 2, &resolved, 0);
-    encoder.copy_buffer_to_buffer(&resolved, 0, &readback, 0, 16);
-    device.submit(vec![encoder.finish()]);
-    let ticks: Vec<u64> = map_read_with(device, &readback, 16, |bytes| {
-        bytes.chunks_exact(8).map(|b| u64::from_le_bytes(b.try_into().expect("8 bytes"))).collect()
-    })
-    .ok()?;
+fn stamped_ms(device: &wrela_gpu::Device, stamps: &Stamps, slot: u32) -> Option<f64> {
+    let Stamps { queries, resolved, readback } = stamps;
+    let ticks = resolve(device, queries, resolved, readback, 2 * slot, 2).ok()?;
     let period = f64::from(device.timestamp_period());
     let (begin, end) = (ticks[0], ticks[1]);
     (begin > 0 && end >= begin).then(|| (end - begin) as f64 * period / 1.0e6)

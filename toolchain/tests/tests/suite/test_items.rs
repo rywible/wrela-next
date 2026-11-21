@@ -887,21 +887,9 @@ fn a_sixth_target_keeps_the_least_each_fragment_offers() {
     assert_eq!(crate::tests_pass(&dir), 4);
 }
 
-/// A field written while the program runs (`std::field::Written`, toolchain/tests/written) asked
-/// in a kernel, every leaf kind, map and join and a displacement: within 1e-6 of the compiled tree
-/// of the same kinds at 4,096 points; and its rays' `meets`, deciding parts and masked asks the
-/// compiled tree's at 1,024 rays, on both hosts.
-#[test]
-#[ignore = "needs a GPU"]
-fn a_written_field_is_its_compiled_tree_on_the_gpu() {
-    let dir = wrela_tests::repo_root().join("toolchain/tests/written");
-    assert_eq!(crate::tests_pass(&dir), 2);
-}
-
-/// A field's distance range over a box (`std::derive::affine`, `Surface::range`'s value,
-/// toolchain/tests/affine) holds every sample of every box, each std kind alone and the engine's
-/// stack, creature and stage, at 1 m, 12 cm, 8 mm and 1 mm: in a kernel on both hosts, and through
-/// `range` on the CPU.
+/// A field's distance range over a box (`std::derive::affine`, toolchain/tests/affine) holds every
+/// sample of every box, each std kind alone and the engine's stack, creature and stage, at 1 m,
+/// 12 cm, 8 mm and 1 mm: in a kernel on both hosts, and on the CPU.
 #[test]
 #[ignore = "needs a GPU"]
 fn an_affine_range_holds_every_sample_in_gpu_code() {

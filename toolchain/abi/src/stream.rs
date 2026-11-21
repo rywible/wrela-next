@@ -687,7 +687,18 @@ impl TextureFormat {
     pub fn is_uint(self) -> bool {
         self.info().uint
     }
+
+    /// Why a pass of `samples` samples per pixel can't draw into a target of this format, which
+    /// it resolves on end: an MSAA pass can't resolve integers. `None` where it can.
+    pub fn unresolvable(self, samples: u8) -> Option<String> {
+        (samples > 1 && self.is_uint())
+            .then(|| format!("an MSAA pass can't resolve integer format {}", self.name()))
+    }
 }
+
+/// The samples per pixel a pass and a pipeline's target may have ([`Pass::samples`],
+/// [`crate::manifest::RenderTarget::samples`]): one, or hardware 4× MSAA.
+pub const SAMPLE_COUNTS: [u32; 2] = [1, 4];
 
 /// The colour attachments' bytes per sample of a pass drawing into `formats`, in order, by
 /// WebGPU's algorithm ("calculating color attachment bytes per sample"): for each target, the
@@ -812,7 +823,7 @@ pub struct Pass {
     /// It may run as part of the pass before it, if that one ended right before it on the
     /// same targets and this one keeps them (the host's choice; serial timing times it alone).
     pub join: bool,
-    /// Samples per pixel: `1` or `4` (hardware 4× MSAA, resolved on pass end).
+    /// Samples per pixel: one of [`SAMPLE_COUNTS`] (4: hardware 4× MSAA, resolved on pass end).
     pub samples: u8,
     /// A depth texture, or [`NONE`].
     pub depth: u32,
@@ -2275,22 +2286,9 @@ impl Encoder {
         bindings: &[Binding],
         uniforms: &[u8],
     ) -> &mut Self {
-        self.dispatch_indirect_most(pipeline, arguments, offset, 0, bindings, uniforms)
-    }
-
-    /// An indirect dispatch of at most `most` groups (`most:`).
-    pub fn dispatch_indirect_most(
-        &mut self,
-        pipeline: u32,
-        arguments: u32,
-        offset: u32,
-        most: u32,
-        bindings: &[Binding],
-        uniforms: &[u8],
-    ) -> &mut Self {
         self.bound_command(
             Opcode::DispatchIndirect,
-            &[pipeline, arguments, offset, most],
+            &[pipeline, arguments, offset, 0],
             bindings,
             uniforms,
         );

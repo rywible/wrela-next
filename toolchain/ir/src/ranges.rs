@@ -24,13 +24,7 @@ pub struct Ranges<'f> {
 
 impl<'f> Ranges<'f> {
     pub fn new(f: &'f Function) -> Ranges<'f> {
-        let mut defs = HashMap::new();
-        visit::walk(&f.body, &mut |s| {
-            if let Stmt::Let(v, e) = s {
-                defs.insert(*v, e);
-            }
-        });
-        Ranges { defs, memo: HashMap::new() }
+        Ranges { defs: visit::definitions(&f.body), memo: HashMap::new() }
     }
 
     /// The least and the most every component of `v` can be, if its definition bounds it.

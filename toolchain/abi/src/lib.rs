@@ -586,9 +586,6 @@ impl Limits {
         pairs.into_iter().find(|(_, have, need)| have < need).map(|(name, _, _)| name)
     }
 
-    /// How many there are: `wrela.limit` gives 0 for an index past the last.
-    pub const COUNT: u32 = 16;
-
     /// Whether the device has feature `name` (WebGPU's).
     pub fn has(&self, name: &str) -> bool {
         feature_bit(name).is_some_and(|b| self.features & b != 0)

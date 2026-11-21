@@ -143,8 +143,6 @@ pub(crate) struct GpuCx {
     pub domain_field: Option<u32>,
     /// With an origin: the block's field holding it, which each `GlobalId` adds.
     pub origin_field: Option<u32>,
-    /// The values its same work moved onto the CPU (`ir::hoist`): its block's last fields.
-    pub hoisted: Vec<ir::hoist::Hoisted>,
     /// A lifted build's literal table (§23): the storage buffer every pipeline binds last.
     pub literals: Option<ir::ResourceId>,
     /// A pipeline's `const` parameters' values, in the interface's order (§18.1): each folded
@@ -171,7 +169,6 @@ impl GpuCx {
             uniform_fields: Vec::new(),
             domain_field: None,
             origin_field: None,
-            hoisted: Vec::new(),
             literals: None,
             consts: None,
         }
@@ -2930,17 +2927,7 @@ fn bind_uniform(cx: &mut Cx, mb: &mut ModuleBuilder, iface: &Interface) -> Optio
     let ty =
         mb.m.types
             .intern(ir::TypeDef::Struct { name: format!("Uniforms_{}", names.join("_")), fields });
-    let size = ir::layout::round_up(16, ir::layout::layout(&mb.m.types, ty).size);
-    // A uniform binding has stricter layout rules; otherwise the same bytes are a read-only
-    // storage binding. Over 64 KiB is storage too: the machine allows a uniform binding of
-    // 4 GiB, and 64 KiB is a choice kept from WebGPU's limit, not measured since.
-    // On Vulkan, a block holding a two-row matrix is storage too: its columns are 8 bytes apart
-    // (WGSL's layout, the CPU's), and Vulkan's standard layout for a uniform block puts a
-    // matrix's columns 16 apart (std140's extended alignment); a storage block takes 8.
-    let two_row_matrix =
-        cx.data.target == wrela_abi::Target::Vulkan && holds_two_row_matrix(&mb.m.types, ty);
-    let storage =
-        !ir::layout::uniform_compatible(&mb.m.types, ty) || size > 65_536 || two_row_matrix;
+    let (size, storage) = block_space(cx, &mb.m.types, ty);
     // Named `u`: a creature's shader reads it a thousand times or more, each written out in the
     // WGSL with its whole path.
     let id = mb.m.add_resource(ir::Resource {
@@ -2953,6 +2940,21 @@ fn bind_uniform(cx: &mut Cx, mb: &mut ModuleBuilder, iface: &Interface) -> Optio
         g.uniform = Some(id);
     }
     Some(UniformOut { binding: 0, size, storage })
+}
+
+/// A uniform block of type `ty`: its size, and whether it's a read-only storage binding.
+/// A uniform binding has stricter layout rules; otherwise the same bytes are a read-only
+/// storage binding. Over 64 KiB is storage too: the machine allows a uniform binding of
+/// 4 GiB, and 64 KiB is a choice kept from WebGPU's limit, not measured since.
+/// On Vulkan, a block holding a two-row matrix is storage too: its columns are 8 bytes apart
+/// (WGSL's layout, the CPU's), and Vulkan's standard layout for a uniform block puts a
+/// matrix's columns 16 apart (std140's extended alignment); a storage block takes 8.
+fn block_space(cx: &Cx, types: &ir::Types, ty: ir::TypeId) -> (u32, bool) {
+    let size = ir::layout::round_up(16, ir::layout::layout(types, ty).size);
+    let two_row_matrix =
+        cx.data.target == wrela_abi::Target::Vulkan && holds_two_row_matrix(types, ty);
+    let storage = !ir::layout::uniform_compatible(types, ty) || size > 65_536 || two_row_matrix;
+    (size, storage)
 }
 
 /// Whether `t` is or holds a matrix of two rows.
@@ -2992,7 +2994,7 @@ fn check_storage_buffers(cx: &mut Cx, iface: &Interface, uniform: Option<&Unifor
                     )
             });
         let max = if tabled && limits.buffer_slots_per_stage.is_some() {
-            limits.storage_buffers_per_stage - 2
+            limits.storage_buffers_per_stage - wrela_abi::table::METAL_SLOTS
         } else {
             limits.storage_buffers_per_stage
         };
@@ -3170,9 +3172,8 @@ fn lower_compute(cx: &mut Cx, iface: Rc<Interface>, consts: Vec<ir::Const>) -> O
         function: entry,
         inputs,
     });
-    let (work, unbounded, weight, same, few, costly, copies) = verify(cx, &mut mb, name)?;
-    let uniform = hoisted_block(cx, &mut mb, uniform);
-    let hoisted = mb.gpu.as_mut().map(|g| std::mem::take(&mut g.hoisted)).unwrap_or_default();
+    let counts = verify(cx, &mut mb, name)?;
+    let uniform = hoisted_block(cx, &mut mb, uniform, &counts.hoisted);
     non_filtering(&mb.m, &mut bindings);
     let instances = mb.fn_instances();
     Some(PipelineOut {
@@ -3192,16 +3193,16 @@ fn lower_compute(cx: &mut Cx, iface: Rc<Interface>, consts: Vec<ir::Const>) -> O
         debug_flag: None,
         targets: Vec::new(),
         instances,
-        work,
-        unbounded,
-        weight,
-        same,
-        few,
-        costly,
-        copies,
+        work: counts.work,
+        unbounded: counts.unbounded,
+        weight: counts.weight,
+        same: counts.same,
+        few: counts.few,
+        costly: counts.costly,
+        copies: counts.copies,
         standin: None,
         stands_in: false,
-        hoisted,
+        hoisted: counts.hoisted,
     })
 }
 
@@ -3284,9 +3285,8 @@ fn lower_render(
         inputs: finputs,
     });
     let name = format!("{}_{}", ir::ident(&vdef.name), ir::ident(&fdef.name));
-    let (work, unbounded, weight, same, few, costly, copies) = verify(cx, &mut mb, &name)?;
-    let uniform = hoisted_block(cx, &mut mb, uniform);
-    let hoisted = mb.gpu.as_mut().map(|g| std::mem::take(&mut g.hoisted)).unwrap_or_default();
+    let counts = verify(cx, &mut mb, &name)?;
+    let uniform = hoisted_block(cx, &mut mb, uniform, &counts.hoisted);
     non_filtering(&mb.m, &mut bindings);
     let instances = mb.fn_instances();
     Some(PipelineOut {
@@ -3306,16 +3306,16 @@ fn lower_render(
         debug_flag: None,
         targets: Vec::new(),
         instances,
-        work,
-        unbounded,
-        weight,
-        same,
-        few,
-        costly,
-        copies,
+        work: counts.work,
+        unbounded: counts.unbounded,
+        weight: counts.weight,
+        same: counts.same,
+        few: counts.few,
+        costly: counts.costly,
+        copies: counts.copies,
         standin: None,
         stands_in: false,
-        hoisted,
+        hoisted: counts.hoisted,
     })
 }
 
@@ -3706,16 +3706,13 @@ pub(crate) fn fuel(cx: &mut Cx, out: &mut PipelineOut, code: u32) {
         }
         return;
     }
-    let storage = out.bindings.iter().filter(|b| b.kind.is_buffer()).count()
-        + usize::from(out.uniform.as_ref().is_some_and(|u| u.storage));
-    let used =
-        out.bindings.iter().map(|b| b.binding).chain(out.uniform.as_ref().map(|u| u.binding));
-    let binding = used.max().map_or(0, |b| b + 1);
+    let binding = flag_binding(cx, out);
     let mut module = out.module.clone();
-    if ir::fuel::add_fuel(&mut module, fuel, binding, code).is_none() {
+    // Whether fuel is added doesn't depend on the flag's binding: with none left, the error.
+    if ir::fuel::add_fuel(&mut module, fuel, binding.unwrap_or(0), code).is_none() {
         return;
     }
-    if storage >= cx.data.target.limits().storage_buffers_per_stage {
+    let Some(binding) = binding else {
         cx.err(Diagnostic::internal(format!(
             "`{}`'s work a lane isn't bounded within its fuel ({fuel}), and it binds the machine's \
              limit of storage buffers, so there's no binding left for the flag its loops set when \
@@ -3723,7 +3720,7 @@ pub(crate) fn fuel(cx: &mut Cx, out: &mut PipelineOut, code: u32) {
             out.name
         )));
         return;
-    }
+    };
     match ir::verify(&module) {
         Ok(()) => {
             out.module = module;
@@ -3740,7 +3737,7 @@ pub(crate) fn fuel(cx: &mut Cx, out: &mut PipelineOut, code: u32) {
 /// the list of draws to bring within it is in every build.
 pub(crate) fn name_uncounted(cx: &mut Cx) {
     let limits = cx.data.target.limits();
-    let (fuel, line) = (limits.lane_idle_work(), limits.lane_line_work());
+    let (idle_work, line) = (limits.lane_idle_work(), limits.lane_line_work());
     let idle = f64::from(limits.idle_slowdown_tenths) / 10.0;
     let mut all = std::mem::take(&mut cx.uncounted);
     all.sort_by(|a, b| (a.0.file, a.0.start).cmp(&(b.0.file, b.0.start)).then(b.2.cmp(&a.2)));
@@ -3749,17 +3746,17 @@ pub(crate) fn name_uncounted(cx: &mut Cx) {
         let at = all[i].0;
         let here: Vec<&(Span, String, u64)> = all[i..].iter().take_while(|x| x.0 == at).collect();
         i += here.len();
-        let times = |w: u64| w as f64 / fuel as f64;
+        let times = |w: u64| w as f64 / idle_work as f64;
         let message = if let [(_, name, most)] = here.as_slice() {
             format!(
                 "`{name}`'s lanes may do {most} work each, {:.1} times the line's work at an idle \
-                 clock ({fuel}): it's left as written",
+                 clock ({idle_work}): it's left as written",
                 times(*most)
             )
         } else {
             format!(
                 "{} draws recorded here may do more work a lane than the line's work at an idle \
-                 clock ({fuel}): they're left as written",
+                 clock ({idle_work}): they're left as written",
                 here.len()
             )
         };
@@ -3790,14 +3787,7 @@ pub(crate) fn name_uncounted(cx: &mut Cx) {
 /// A debug build's bounds checks (`ir::bounds`), whose flag is pipeline number `code` (from
 /// 1). A pipeline that already has the machine's limit of storage buffers isn't checked.
 pub(crate) fn debug_checks(cx: &mut Cx, out: &mut PipelineOut, code: u32) {
-    let storage = out.bindings.iter().filter(|b| b.kind.is_buffer()).count()
-        + usize::from(out.uniform.as_ref().is_some_and(|u| u.storage));
-    if storage >= cx.data.target.limits().storage_buffers_per_stage {
-        return;
-    }
-    let used =
-        out.bindings.iter().map(|b| b.binding).chain(out.uniform.as_ref().map(|u| u.binding));
-    let binding = used.max().map_or(0, |b| b + 1);
+    let Some(binding) = flag_binding(cx, out) else { return };
     if ir::bounds::add_checks(&mut out.module, binding, code).is_none() {
         return;
     }
@@ -3810,18 +3800,34 @@ pub(crate) fn debug_checks(cx: &mut Cx, out: &mut PipelineOut, code: u32) {
     }
 }
 
-/// A pipeline's counts (§18.11): each entry point's work and the loop that leaves it unbounded,
-/// its weight, the work its invocations do alike (§18.13), the calls they make with few
-/// numbers that vary, and the costly loops flattening couldn't move (§18.13).
-type Counts = (
-    Vec<Option<u64>>,
-    Vec<Option<Span>>,
-    u64,
-    Vec<ir::same::SameWork>,
-    Vec<Vec<ir::same::FewInputs>>,
-    Vec<ir::rates::Costly>,
-    Vec<ir::opt::Copied>,
-);
+/// The binding a pipeline's flag (`fuel`'s, `debug_checks`') takes, the one after its last;
+/// `None` when it already binds the machine's limit of storage buffers, leaving none for it.
+fn flag_binding(cx: &Cx, out: &PipelineOut) -> Option<u32> {
+    let storage = out.bindings.iter().filter(|b| b.kind.is_buffer()).count()
+        + usize::from(out.uniform.as_ref().is_some_and(|u| u.storage));
+    if storage >= cx.data.target.limits().storage_buffers_per_stage {
+        return None;
+    }
+    let used =
+        out.bindings.iter().map(|b| b.binding).chain(out.uniform.as_ref().map(|u| u.binding));
+    Some(used.max().map_or(0, |b| b + 1))
+}
+
+/// A pipeline's counts (§18.11), each as [`PipelineOut`]'s field of the same name: each entry
+/// point's work and the loop that leaves it unbounded, its weight, the work its invocations do
+/// alike (§18.13), the calls they make with few numbers that vary, the costly loops flattening
+/// couldn't move (§18.13), the read-only data they copy, and the values its same work moved
+/// onto the CPU (`ir::hoist`).
+struct Counts {
+    work: Vec<Option<u64>>,
+    unbounded: Vec<Option<Span>>,
+    weight: u64,
+    same: Vec<ir::same::SameWork>,
+    few: Vec<Vec<ir::same::FewInputs>>,
+    costly: Vec<ir::rates::Costly>,
+    copies: Vec<ir::opt::Copied>,
+    hoisted: Vec<ir::hoist::Hoisted>,
+}
 
 /// A function's IR name without the `_<n>` and `_d<n>` tags lowering gives each instance and
 /// derivation (`Placed_F_seen_63_d3` is `Placed_F_seen`).
@@ -3851,6 +3857,8 @@ fn verify(cx: &mut Cx, mb: &mut ModuleBuilder, name: &str) -> Option<Counts> {
     let mut few = Vec::new();
     let mut costly = Vec::new();
     let mut copies = Vec::new();
+    let mut hoisted = Vec::new();
+    let uniform = mb.gpu.as_ref().and_then(|g| g.uniform);
     // What a `@budget(work: n)` holds, taken while each function is its own: a costly loop in
     // it isn't reported (§18.13).
     let quiet = ir::rates::budgeted(&mb.m);
@@ -3889,7 +3897,7 @@ fn verify(cx: &mut Cx, mb: &mut ModuleBuilder, name: &str) -> Option<Counts> {
         mb.m.exact = cx.data.exact;
         checked = checked
             .and_then(|()| ir::opt::flatten_gpu(&mut mb.m))
-            .map(|()| hoist_same(cx, mb))
+            .map(|()| hoisted = hoist_same(cx, &mut mb.m, uniform))
             .and_then(|()| ir::gpu_memory::lay_out_gpu_memory(&mut mb.m))
             .and_then(|()| ir::verify(&mb.m));
         if checked.is_ok() {
@@ -3908,11 +3916,7 @@ fn verify(cx: &mut Cx, mb: &mut ModuleBuilder, name: &str) -> Option<Counts> {
         let mut flat = mb.m.clone();
         if ir::opt::flatten_gpu(&mut flat)
             .map(|()| {
-                if cx.hoist
-                    && let Some(u) = mb.gpu.as_ref().and_then(|g| g.uniform)
-                {
-                    ir::hoist::hoist(&mut flat, u, MOST_SAME_WORK + 1);
-                }
+                hoist_same(cx, &mut flat, uniform);
             })
             .and_then(|()| ir::gpu_memory::lay_out_gpu_memory(&mut flat))
             .is_ok()
@@ -3930,7 +3934,7 @@ fn verify(cx: &mut Cx, mb: &mut ModuleBuilder, name: &str) -> Option<Counts> {
     if wrela_diag::has_errors(&cx.diags) {
         return None;
     }
-    Some((work, unbounded, weight, same, few, costly, copies))
+    Some(Counts { work, unbounded, weight, same, few, costly, copies, hoisted })
 }
 
 /// A flattened module's weight (§18.11): its entry points' statements with each call to a
@@ -3945,34 +3949,33 @@ fn written_weight(m: &ir::Module) -> u64 {
 pub const MOST_SAME_WORK: u64 = 256;
 
 /// Moves a flattened module's same work out of its invocations (`ir::hoist`), past
-/// [`MOST_SAME_WORK`]: the values it moves onto the CPU wait in `mb.gpu` for the pipeline.
-fn hoist_same(cx: &Cx, mb: &mut ModuleBuilder) {
-    if !cx.hoist {
-        return;
-    }
-    let Some(u) = mb.gpu.as_ref().and_then(|g| g.uniform) else { return };
-    let hoisted = ir::hoist::hoist(&mut mb.m, u, MOST_SAME_WORK + 1);
-    if let Some(g) = mb.gpu.as_mut() {
-        g.hoisted = hoisted;
+/// [`MOST_SAME_WORK`], reading the uniform block `uniform`: the values it moves onto the CPU.
+fn hoist_same(
+    cx: &Cx,
+    m: &mut ir::Module,
+    uniform: Option<ir::ResourceId>,
+) -> Vec<ir::hoist::Hoisted> {
+    match uniform {
+        Some(u) if cx.hoist => ir::hoist::hoist(m, u, MOST_SAME_WORK + 1),
+        _ => Vec::new(),
     }
 }
 
-/// A pipeline's uniform block once its module is laid out, with what `hoist_same` added: its
-/// size and space as `entry_module` says, from the block's type as the module holds it now.
+/// A pipeline's uniform block once its module is laid out, with what `hoist_same` added
+/// (`hoisted`): its size and space as `entry_module` says, from the block's type as the module
+/// holds it now.
 fn hoisted_block(
     cx: &Cx,
     mb: &mut ModuleBuilder,
     uniform: Option<UniformOut>,
+    hoisted: &[ir::hoist::Hoisted],
 ) -> Option<UniformOut> {
-    let Some(mut out) = uniform else { return None };
-    let Some(g) = mb.gpu.as_ref() else { return Some(out) };
-    let Some(u) = g.uniform.filter(|_| !g.hoisted.is_empty()) else { return Some(out) };
+    let mut out = uniform?;
+    let Some(u) = mb.gpu.as_ref().and_then(|g| g.uniform).filter(|_| !hoisted.is_empty()) else {
+        return Some(out);
+    };
     let ty = mb.m.resources[u.index()].ty;
-    out.size = ir::layout::round_up(16, ir::layout::layout(&mb.m.types, ty).size);
-    let two_row_matrix =
-        cx.data.target == wrela_abi::Target::Vulkan && holds_two_row_matrix(&mb.m.types, ty);
-    out.storage =
-        !ir::layout::uniform_compatible(&mb.m.types, ty) || out.size > 65_536 || two_row_matrix;
+    (out.size, out.storage) = block_space(cx, &mb.m.types, ty);
     mb.m.resources[u.index()].kind = ir::ResourceKind::Uniform { storage: out.storage };
     Some(out)
 }
@@ -4411,15 +4414,7 @@ pub(crate) fn check_standalone(cx: &mut Cx, f: FnId, entry: Option<Entry>, subst
 /// of what it captures or is given; unbounded is `u32::MAX`. The same number wherever it's
 /// asked, on the CPU or in GPU code: each callable is counted once a build ([`Cx::works`]).
 pub(crate) fn work_call(fl: &mut Fl, c: &mir::Call) -> Option<ir::ValueId> {
-    let Some(crate::body::Repr::Callable(callable, _)) = fl.callable_arg(&c.args[0]) else {
-        fl.cx.err(Diagnostic::new(
-            codes::E0700,
-            c.args[0].span(),
-            "`work` counts a closure or a named function",
-        ));
-        return None;
-    };
-    let key = callable.instance_key();
+    let key = callable_key(fl, c, "`work` counts")?;
     // In GPU code, what it reaches may be the module's own resources (a buffer it captures):
     // it's counted beside them, once for each call.
     let n = if fl.mb.gpu.is_some() {
@@ -4436,6 +4431,20 @@ pub(crate) fn work_call(fl: &mut Fl, c: &mir::Call) -> Option<ir::ValueId> {
     }?;
     let u = fl.mb.m.types.u32();
     Some(fl.value(u, ir::Expr::Const(ir::Const::U32(n))))
+}
+
+/// The callable a `std::derive` intrinsic's call `c` is given, its instance: E0700 where it's
+/// neither a closure nor a named function (`does`: what the intrinsic does with it).
+fn callable_key(fl: &mut Fl, c: &mir::Call, does: &str) -> Option<InstanceKey> {
+    let Some(crate::body::Repr::Callable(callable, _)) = fl.callable_arg(&c.args[0]) else {
+        fl.cx.err(Diagnostic::new(
+            codes::E0700,
+            c.args[0].span(),
+            format!("{does} a closure or a named function"),
+        ));
+        return None;
+    };
+    Some(callable.instance_key())
 }
 
 /// [`work_call`]'s count of the callable `key`: `None` if it can't be GPU code (the errors say
@@ -4491,15 +4500,7 @@ fn as_gpu_code(
 /// but what it's given: none of the values it captures, nothing outside it (a resource, a builtin
 /// input). A constant of the build, as `work` is (`ir::depends`).
 pub(crate) fn reads_call(fl: &mut Fl, c: &mir::Call) -> Option<ir::ValueId> {
-    let Some(crate::body::Repr::Callable(callable, _)) = fl.callable_arg(&c.args[0]) else {
-        fl.cx.err(Diagnostic::new(
-            codes::E0700,
-            c.args[0].span(),
-            "`reads_only_input` reads a closure or a named function",
-        ));
-        return None;
-    };
-    let key = callable.instance_key();
+    let key = callable_key(fl, c, "`reads_only_input` reads")?;
     let beside = if fl.mb.gpu.is_some() { Some(&*fl.mb) } else { None };
     let (mb, id) = as_gpu_code(fl.cx, &key, c.span, beside, "reads_only_input")?;
     let f = &mb.m.functions[id.index()];

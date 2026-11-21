@@ -256,6 +256,19 @@ pub struct BuildFor {
     pub exact: bool,
 }
 
+impl BuildFor {
+    /// A shipped build for `target`: no constants set, its shaders checked, not exact.
+    pub fn new(target: wrela_abi::Target) -> BuildFor {
+        BuildFor {
+            kind: BuildKind::default(),
+            set: Vec::new(),
+            target,
+            trusted_shaders: false,
+            exact: false,
+        }
+    }
+}
+
 /// A build as `how` says ([`build_set`] for another machine, or with trusted shaders).
 pub fn build_for(root: &Path, how: &BuildFor) -> Output {
     let mode = Mode {

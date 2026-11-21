@@ -30,7 +30,7 @@
 //! bound to a name where the IR defines it (`vN`), so evaluation order is the IR's; any other is
 //! written where it's used.
 
-use crate::Checks;
+use crate::{Checks, analysis};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use wrela_abi::manifest::{BufferSizes, Pipeline, UniformSpace};
@@ -50,25 +50,6 @@ pub struct Msl {
     pub text: String,
     /// Each entry point's name in `text`, in the module's order.
     pub entry_points: Vec<String>,
-}
-
-/// What a fragment shader's depth promises (`std::gpu::WithDepthBehind`): never nearer than its
-/// triangle's depth, so the GPU may test the triangle's depth before the shader runs. Which way
-/// "nearer" is depends on the pipeline's depth test: `Greater` for a test that keeps less, `Less`
-/// for one that keeps greater (reversed depth).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ConservativeDepth {
-    Greater,
-    Less,
-}
-
-impl ConservativeDepth {
-    fn qualifier(self) -> &'static str {
-        match self {
-            ConservativeDepth::Greater => "depth(greater)",
-            ConservativeDepth::Less => "depth(less)",
-        }
-    }
 }
 
 /// The bindings of the module's runtime-sized buffers, in its order: what the sizes buffer
@@ -98,15 +79,9 @@ pub fn buffer_sizes(m: &ir::Module, p: &Pipeline) -> Option<BufferSizes> {
 }
 
 /// Module `m` as MSL for pipeline `p`, whose manifest entry (bindings, uniform block, debug flag
-/// and `sizes`, from [`buffer_sizes`]) says where its bindings go; with `depth` on its fragment
-/// shader's depth, and `checks` written in.
-pub fn write(
-    m: &ir::Module,
-    p: &Pipeline,
-    depth: Option<ConservativeDepth>,
-    checks: Checks,
-) -> R<Msl> {
-    let mut w = Writer::new(m, p, depth, checks)?;
+/// and `sizes`, from [`buffer_sizes`]) says where its bindings go; with `checks` written in.
+pub fn write(m: &ir::Module, p: &Pipeline, checks: Checks) -> R<Msl> {
+    let mut w = Writer::new(m, p, checks);
     w.module()?;
     Ok(Msl { text: w.finish(), entry_points: w.entry_names })
 }
@@ -213,7 +188,6 @@ enum Helper {
 struct Writer<'m> {
     m: &'m ir::Module,
     p: &'m Pipeline,
-    depth: Option<ConservativeDepth>,
     checks: Checks,
     /// What the compiler proves of the checks: the ones it makes unneeded are left out.
     proofs: wrela_ir::work::Proofs,
@@ -237,6 +211,8 @@ struct Writer<'m> {
     function_names: Vec<String>,
     /// The resources each function uses, itself or through the functions it calls.
     uses: Vec<BTreeSet<usize>>,
+    /// Each function's: whether it reads a sized buffer's length (it takes the sizes buffer).
+    takes_sizes: Vec<bool>,
     /// Each table's name.
     data_names: HashMap<ir::DataId, String>,
     /// The element types of sized buffers whose array type is written.
@@ -300,12 +276,7 @@ fn repeated(m: &ir::Module) -> Vec<bool> {
 }
 
 impl<'m> Writer<'m> {
-    fn new(
-        m: &'m ir::Module,
-        p: &'m Pipeline,
-        depth: Option<ConservativeDepth>,
-        checks: Checks,
-    ) -> R<Writer<'m>> {
+    fn new(m: &'m ir::Module, p: &'m Pipeline, checks: Checks) -> Writer<'m> {
         let resource_names =
             m.resources.iter().enumerate().map(|(k, r)| named("r", &r.name, k)).collect();
         let function_names =
@@ -318,16 +289,14 @@ impl<'m> Writer<'m> {
             .enumerate()
             .map(|(k, (i, _))| (i, format!("size{k}")))
             .collect();
-        let mut w = Writer {
+        let uses = analysis::resource_uses(m);
+        let takes_sizes =
+            uses.iter().map(|u| u.iter().any(|&r| is_sized(&m.resources[r]))).collect();
+        Writer {
             m,
             p,
-            depth,
             checks,
-            proofs: if checks.unchecked() {
-                wrela_ir::work::Proofs::default()
-            } else {
-                wrela_ir::work::proofs(m)
-            },
+            proofs: analysis::proofs(m, checks),
             layouts: WgslLayouts::default(),
             type_names: HashMap::new(),
             structs: HashMap::new(),
@@ -338,7 +307,8 @@ impl<'m> Writer<'m> {
             functions: String::new(),
             resource_names,
             function_names,
-            uses: Vec::new(),
+            uses,
+            takes_sizes,
             data_names: HashMap::new(),
             runtime_arrays: HashSet::new(),
             repeated: repeated(m),
@@ -346,42 +316,7 @@ impl<'m> Writer<'m> {
             entry_names: Vec::new(),
             table_types: HashMap::new(),
             block_written: false,
-        };
-        w.uses = w.resource_uses();
-        Ok(w)
-    }
-
-    /// The resources each function uses, directly or through its calls.
-    fn resource_uses(&self) -> Vec<BTreeSet<usize>> {
-        let m = self.m;
-        let direct: Vec<BTreeSet<usize>> = m
-            .functions
-            .iter()
-            .map(|f| {
-                let mut used = BTreeSet::new();
-                ir::visit::walk(&f.body, &mut |s| {
-                    s.for_each_place(&mut |p| {
-                        if let ir::PlaceRoot::Resource(r) = p.root {
-                            used.insert(r.index());
-                        }
-                    });
-                    if let Some(e) = s.expr() {
-                        expr_resources(e, &mut used);
-                    }
-                });
-                used
-            })
-            .collect();
-        (0..m.functions.len())
-            .map(|f| {
-                let mut all = BTreeSet::new();
-                for g in ir::visit::reachable(m, ir::FuncId(f as u32), &[]) {
-                    all.extend(direct[g.index()].iter().copied());
-                }
-                all.extend(direct[f].iter().copied());
-                all
-            })
-            .collect()
+        }
     }
 
     fn finish(&mut self) -> String {
@@ -440,20 +375,20 @@ impl<'m> Writer<'m> {
             return Ok(n.clone());
         }
         let m = self.m;
-        let name = match m.types.get(t).clone() {
-            ir::TypeDef::Scalar(s) => scalar_name(s)?.to_string(),
-            ir::TypeDef::Atomic(s) => format!("metal::atomic_{}", scalar_name(s)?),
-            ir::TypeDef::Vector(s, n) => vector_name(s, n)?,
+        let name = match m.types.get(t) {
+            ir::TypeDef::Scalar(s) => scalar_name(*s)?.to_string(),
+            ir::TypeDef::Atomic(s) => format!("metal::atomic_{}", scalar_name(*s)?),
+            ir::TypeDef::Vector(s, n) => vector_name(*s, *n)?,
             ir::TypeDef::Matrix(c, r) => format!("metal::float{c}x{r}"),
             ir::TypeDef::Array(e, n) => {
-                let elem = self.ty(e)?;
+                let elem = self.ty(*e)?;
                 let name = format!("A{}", t.0);
                 let _ = writeln!(self.type_defs, "struct {name} {{\n{elem} inner[{n}];\n}};");
                 name
             }
-            ir::TypeDef::RuntimeArray(e) => return self.ty(e),
+            ir::TypeDef::RuntimeArray(e) => return self.ty(*e),
             ir::TypeDef::Struct { name, .. } | ir::TypeDef::Enum { name, .. } => {
-                let name = format!("S{}_{}", t.0, short(&name));
+                let name = format!("S{}_{}", t.0, short(name));
                 self.struct_def(t, &name)?;
                 name
             }
@@ -465,28 +400,12 @@ impl<'m> Writer<'m> {
         Ok(name)
     }
 
-    /// The members of a struct, or of an enum as the GPU holds it: its tag, then each payload.
-    fn members(&self, t: ir::TypeId) -> R<Vec<(String, ir::TypeId)>> {
-        let types = &self.m.types;
-        match types.get(t) {
-            ir::TypeDef::Struct { fields, .. } => {
-                Ok(fields.iter().map(|(n, f)| (n.clone(), *f)).collect())
-            }
-            ir::TypeDef::Enum { variants, .. } => {
-                let tag = types.field(t, 0).ok_or("internal: an enum's tag type")?;
-                Ok(std::iter::once(("tag".to_string(), tag))
-                    .chain(variants.iter().filter_map(|(v, p)| Some((v.clone(), (*p)?))))
-                    .collect())
-            }
-            _ => Err("internal: members of a type that has none".into()),
-        }
-    }
-
     /// Writes struct `t` (its members' types first), each member at the IR's offset: padding
     /// before a member that would sit earlier, and a three-component vector followed tightly by
     /// the next member held packed.
     fn struct_def(&mut self, t: ir::TypeId, name: &str) -> R<()> {
-        let members = self.members(t)?;
+        let m = self.m;
+        let members = m.types.gpu_members(t).ok_or("internal: members of a type that has none")?;
         let mut types = Vec::with_capacity(members.len());
         for (_, mt) in &members {
             types.push(self.ty(*mt)?);
@@ -533,17 +452,6 @@ impl<'m> Writer<'m> {
         Ok(())
     }
 
-    /// The struct member that holds field `k` of a value of type `t`: for an enum, its tag, or
-    /// the payload of variant `k - 1` among the variants that have one.
-    fn member(&self, t: ir::TypeId, k: u32) -> u32 {
-        match self.m.types.get(t) {
-            ir::TypeDef::Enum { variants, .. } if k > 0 => {
-                1 + variants[..k as usize - 1].iter().filter(|(_, p)| p.is_some()).count() as u32
-            }
-            _ => k,
-        }
-    }
-
     /// Member `k`'s name of struct `t`, and whether it's packed.
     fn member_name(&mut self, t: ir::TypeId, k: u32) -> R<(String, bool)> {
         self.ty(t)?;
@@ -572,7 +480,7 @@ impl<'m> Writer<'m> {
 
     fn const_value(&mut self, t: ir::TypeId, v: &ir::ConstValue) -> R<String> {
         let m = self.m;
-        match (m.types.get(t).clone(), v) {
+        match (m.types.get(t), v) {
             (ir::TypeDef::Scalar(_), ir::ConstValue::Scalar(c)) => literal(c),
             (ir::TypeDef::Vector(..), ir::ConstValue::Parts(parts)) => {
                 let ty = self.ty(t)?;
@@ -587,7 +495,7 @@ impl<'m> Writer<'m> {
             }
             (ir::TypeDef::Array(e, _), ir::ConstValue::Parts(parts)) => {
                 let ty = self.ty(t)?;
-                let parts = parts.iter().map(|p| self.const_value(e, p)).collect::<R<Vec<_>>>()?;
+                let parts = parts.iter().map(|p| self.const_value(*e, p)).collect::<R<Vec<_>>>()?;
                 Ok(format!("{ty} {{{{{}}}}}", parts.join(", ")))
             }
             (ir::TypeDef::Struct { fields, .. }, ir::ConstValue::Parts(parts)) => {
@@ -639,10 +547,23 @@ impl<'m> Writer<'m> {
     /// Resource `r` as an argument of a function: its type and name, and in an entry point its
     /// slot (`slot` given).
     fn resource_arg(&mut self, r: usize, slot: Option<&slots::Slot>) -> R<String> {
+        let ty = self.resource_type(r)?;
+        let name = &self.resource_names[r];
+        let table = match self.m.resources[r].kind {
+            ir::ResourceKind::Private | ir::ResourceKind::Workgroup => None,
+            ir::ResourceKind::Texture { .. } | ir::ResourceKind::StorageTexture { .. } => {
+                Some("texture")
+            }
+            ir::ResourceKind::Sampler { .. } => Some("sampler"),
+            _ => Some("buffer"),
+        };
+        let at = slot.zip(table).map(|(s, t)| format!(" [[{t}({})]]", s.index)).unwrap_or_default();
+        Ok(format!("{ty} {name}{at}"))
+    }
+
+    /// The MSL type resource `r` is passed as.
+    fn resource_type(&mut self, r: usize) -> R<String> {
         let res = &self.m.resources[r];
-        let name = self.resource_names[r].clone();
-        let at =
-            |table: &str| slot.map(|s| format!(" [[{table}({})]]", s.index)).unwrap_or_default();
         Ok(match res.kind {
             ir::ResourceKind::Uniform { storage } => {
                 let ty = self.ty(res.ty)?;
@@ -651,36 +572,34 @@ impl<'m> Writer<'m> {
                     _ => "constant",
                 };
                 let constness = if space == "device" { " const" } else { "" };
-                format!("{space} {ty}{constness}& {name}{}", at("buffer"))
+                format!("{space} {ty}{constness}&")
             }
             // A sized buffer as a reference to an array of one element, indexed past it: as naga
             // passed one (a pointer reads the same, but Metal's fast math then meets the
             // shader's operations in another order, which can move a last bit).
             ir::ResourceKind::StorageRead => {
-                let ty = self.runtime_array(res.ty)?;
-                format!("device {ty} const& {name}{}", at("buffer"))
+                format!("device {} const&", self.runtime_array(res.ty)?)
             }
             ir::ResourceKind::StorageReadWrite => {
-                let ty = self.runtime_array(res.ty)?;
-                format!("device {ty}& {name}{}", at("buffer"))
+                format!("device {}&", self.runtime_array(res.ty)?)
             }
-            ir::ResourceKind::Private => format!("thread {}& {name}", self.ty(res.ty)?),
-            ir::ResourceKind::Workgroup => format!("threadgroup {}& {name}", self.ty(res.ty)?),
+            ir::ResourceKind::Private => format!("thread {}&", self.ty(res.ty)?),
+            ir::ResourceKind::Workgroup => format!("threadgroup {}&", self.ty(res.ty)?),
             ir::ResourceKind::Texture { depth, dim, format } => {
                 let kind =
                     if ir::texel_scalar(format) == ir::Scalar::U32 { "uint" } else { "float" };
                 let ty = match (depth, dim) {
-                    (true, ir::TexDim::D2) => "depth2d".to_string(),
-                    (true, ir::TexDim::D2Array) => "depth2d_array".to_string(),
-                    (true, ir::TexDim::Cube) => "depthcube".to_string(),
+                    (true, ir::TexDim::D2) => "depth2d",
+                    (true, ir::TexDim::D2Array) => "depth2d_array",
+                    (true, ir::TexDim::Cube) => "depthcube",
                     (true, ir::TexDim::D3) => return Err("internal: a 3D depth texture".into()),
-                    (false, ir::TexDim::D2) => "texture2d".to_string(),
-                    (false, ir::TexDim::D2Array) => "texture2d_array".to_string(),
-                    (false, ir::TexDim::Cube) => "texturecube".to_string(),
-                    (false, ir::TexDim::D3) => "texture3d".to_string(),
+                    (false, ir::TexDim::D2) => "texture2d",
+                    (false, ir::TexDim::D2Array) => "texture2d_array",
+                    (false, ir::TexDim::Cube) => "texturecube",
+                    (false, ir::TexDim::D3) => "texture3d",
                 };
                 let kind = if depth { "float" } else { kind };
-                format!("metal::{ty}<{kind}, metal::access::sample> {name}{}", at("texture"))
+                format!("metal::{ty}<{kind}, metal::access::sample>")
             }
             ir::ResourceKind::StorageTexture { dim, format } => {
                 let kind =
@@ -691,9 +610,9 @@ impl<'m> Writer<'m> {
                     ir::TexDim::D3 => "texture3d",
                     ir::TexDim::Cube => return Err("internal: a cube a kernel writes".into()),
                 };
-                format!("metal::{ty}<{kind}, metal::access::write> {name}{}", at("texture"))
+                format!("metal::{ty}<{kind}, metal::access::write>")
             }
-            ir::ResourceKind::Sampler { .. } => format!("metal::sampler {name}{}", at("sampler")),
+            ir::ResourceKind::Sampler { .. } => "metal::sampler".to_string(),
         })
     }
 
@@ -737,41 +656,11 @@ impl<'m> Writer<'m> {
         self.p.uniform.as_ref().map(|u| u.space)
     }
 
-    /// Whether resource `r` is passed to the functions that use it (not a table).
-    fn passed(&self, r: usize) -> bool {
-        let _ = r;
-        true
-    }
-
     // ---- the module ----
 
     fn module(&mut self) -> R<()> {
         let m = self.m;
-        let entries: HashSet<ir::FuncId> = m.entry_points.iter().map(|e| e.function).collect();
-        // The functions that stay calls, callees first.
-        let mut done = HashSet::new();
-        let mut order = Vec::new();
-        fn helpers_of(
-            m: &ir::Module,
-            f: ir::FuncId,
-            entries: &HashSet<ir::FuncId>,
-            done: &mut HashSet<ir::FuncId>,
-            order: &mut Vec<ir::FuncId>,
-        ) {
-            if !done.insert(f) {
-                return;
-            }
-            for g in ir::visit::calls(&m.functions[f.index()].body) {
-                helpers_of(m, g, entries, done, order);
-            }
-            if !entries.contains(&f) {
-                order.push(f);
-            }
-        }
-        for e in &m.entry_points {
-            helpers_of(m, e.function, &entries, &mut done, &mut order);
-        }
-        for f in order {
+        for f in analysis::helpers(m) {
             self.function(f, None)?;
         }
         for e in &m.entry_points {
@@ -807,22 +696,6 @@ fn short(name: &str) -> String {
     name
 }
 
-/// The resources an expression names outside its places.
-fn expr_resources(e: &ir::Expr, used: &mut BTreeSet<usize>) {
-    match e {
-        ir::Expr::Texture(_, t, s, _) => {
-            used.insert(t.index());
-            if let Some(s) = s {
-                used.insert(s.index());
-            }
-        }
-        ir::Expr::TextureStore(t, _) => {
-            used.insert(t.index());
-        }
-        _ => {}
-    }
-}
-
 /// A loop the MSL writer writes as `for` (`ir::counted`): its counter, limit and step, its test's
 /// statement `check`, and the test's own statements nothing else reads (`unused`: a value nothing
 /// reads is an error under `-Werror`).
@@ -834,9 +707,14 @@ struct Counted {
     step: ir::Const,
 }
 
-/// [`Counted`] of a loop of `f`, if it is one.
-fn counted(f: &ir::Function, body: &[ir::Stmt], continuing: &[ir::Stmt]) -> Option<Counted> {
-    let c = ir::counted::counted(&ir::counted::constants(f), &[], body, continuing)?;
+/// [`Counted`] of a loop of a function whose constants are `consts` (`ir::counted::constants`),
+/// if it is one.
+fn counted(
+    consts: &HashMap<ir::ValueId, ir::Const>,
+    body: &[ir::Stmt],
+    continuing: &[ir::Stmt],
+) -> Option<Counted> {
+    let c = ir::counted::counted(consts, &[], body, continuing)?;
     // What the rest of the body reads; then each of the test's statements whose value that
     // reads stays, with what it reads.
     let test: std::collections::HashMap<usize, ir::ValueId> =
@@ -1022,21 +900,11 @@ struct FunctionWriter<'a, 'm> {
     fresh: u32,
     /// Whether the function reads a sized buffer's length (it takes the sizes buffer).
     takes_sizes: bool,
-    /// The integer constants among its values: an index known to be in range isn't clamped.
-    consts: HashMap<ir::ValueId, i64>,
+    /// The constants among its values (`ir::counted::constants`): an index known to be in range
+    /// isn't clamped, and a counted loop's limit and step are read from them.
+    consts: HashMap<ir::ValueId, ir::Const>,
     /// How many loops the statement being written is in.
     loop_depth: u32,
-}
-
-/// Whether `e` is written where it's used: it only computes from values, and isn't a derivative
-/// (which wants the control flow it's in) or an element at a dynamic index.
-fn pure(e: &ir::Expr) -> bool {
-    e.only_computes()
-        && !matches!(
-            e,
-            ir::Expr::ExtractDyn(..)
-                | ir::Expr::Builtin(ir::Builtin::Dpdx | ir::Builtin::Dpdy | ir::Builtin::Fwidth, _)
-        )
 }
 
 /// Whether `e` is written where it's used however often it's used, never bound to a name: a
@@ -1059,7 +927,7 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
         });
         let locals = f.locals.iter().enumerate().map(|(k, l)| named("l", &l.name, k)).collect();
         let params = f.params.iter().enumerate().map(|(k, p)| named("p", &p.name, k)).collect();
-        let takes_sizes = w.uses[id.index()].iter().any(|&r| is_sized(&w.m.resources[r]));
+        let takes_sizes = w.takes_sizes[id.index()];
         Ok(FunctionWriter {
             w,
             f,
@@ -1078,7 +946,7 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
             position_arg: None,
             fresh: 0,
             takes_sizes,
-            consts: HashMap::new(),
+            consts: ir::counted::constants(f),
             loop_depth: 0,
         })
     }
@@ -1127,9 +995,7 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
             args.push(format!("{} {}", self.w.ty(p.ty)?, self.params[k]));
         }
         for r in self.w.uses[self.id.index()].clone() {
-            if self.w.passed(r) {
-                args.push(self.w.resource_arg(r, None)?);
-            }
+            args.push(self.w.resource_arg(r, None)?);
         }
         if self.takes_sizes {
             args.push("constant _mslBufferSizes& _buffer_sizes".into());
@@ -1147,10 +1013,12 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
         let stage = Writer::stage_of(e);
         let layout = slots::layout(self.w.p);
         let st = slots::slots(&layout, stage);
-        let mut slots_max = wrela_abi::TargetLimits::METAL.buffer_slots_per_stage.unwrap_or(31);
+        let mut slots_max = wrela_abi::TargetLimits::METAL
+            .buffer_slots_per_stage
+            .ok_or("internal: Metal's buffer slots per stage")?;
         if !wrela_abi::table::indexed(self.w.p).is_empty() {
             // The block of indices and the table take the last two.
-            slots_max -= 2;
+            slots_max -= wrela_abi::table::METAL_SLOTS;
         }
         if st.buffers() > slots_max {
             return Err(format!(
@@ -1193,40 +1061,15 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
             ir::Stage::Vertex { varyings } => {
                 let rt = self.f.ret.ok_or("internal: a vertex shader with no output")?;
                 let out_name = format!("{name}Output");
-                let mut def = format!("struct {out_name} {{\n");
-                let mut location = 0;
-                for (k, v) in varyings.iter().enumerate() {
-                    let ty = self.w.ty(part_ty(&self.w.m.types, rt, &v.path)?)?;
-                    if v.position {
-                        let _ = writeln!(def, "{ty} v{k} [[position]];");
-                    } else {
-                        let interp = if v.flat { "flat" } else { "center_perspective" };
-                        let _ = writeln!(def, "{ty} v{k} [[user(loc{location}), {interp}]];");
-                        location += 1;
-                    }
-                }
-                def.push_str("};\n");
-                self.w.type_defs.push_str(&def);
+                self.varying_struct(&out_name, varyings, rt, true)?;
                 self.varyings = Some((varyings, rt));
                 self.vertex_out = Some(out_name.clone());
                 result = out_name;
             }
-            ir::Stage::Fragment { varyings, outputs, depth, .. } => {
+            ir::Stage::Fragment { varyings, outputs, depth, promise } => {
                 if let Some((vt, map)) = varyings {
                     let in_name = format!("{name}Input");
-                    let mut def = format!("struct {in_name} {{\n");
-                    let mut location = 0;
-                    for (k, v) in map.iter().enumerate() {
-                        if v.position {
-                            continue;
-                        }
-                        let ty = self.w.ty(part_ty(&self.w.m.types, *vt, &v.path)?)?;
-                        let interp = if v.flat { "flat" } else { "center_perspective" };
-                        let _ = writeln!(def, "{ty} v{k} [[user(loc{location}), {interp}]];");
-                        location += 1;
-                    }
-                    def.push_str("};\n");
-                    self.w.type_defs.push_str(&def);
+                    self.varying_struct(&in_name, map, *vt, false)?;
                     args.insert(0, format!("{in_name} varyings [[stage_in]]"));
                     let position = "position".to_string();
                     args.insert(1, format!("metal::float4 {position} [[position]]"));
@@ -1240,7 +1083,12 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
                     let _ = writeln!(def, "{ty} color{location} [[color({location})]];");
                 }
                 if depth.is_some() {
-                    let q = self.w.depth.map_or("depth(any)", ConservativeDepth::qualifier);
+                    // Conservative depth: never nearer than the triangle's (`ir::DepthPromise`).
+                    let q = match promise {
+                        Some(ir::DepthPromise::Greater) => "depth(greater)",
+                        Some(ir::DepthPromise::Less) => "depth(less)",
+                        None => "depth(any)",
+                    };
                     let _ = writeln!(def, "float depth [[{q}]];");
                 }
                 def.push_str("};\n");
@@ -1263,17 +1111,12 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
                 ir::ResourceKind::Workgroup => workgroup.push(r),
                 _ if wrela_abi::table::index_offset(self.w.p, res.binding).is_some() => {
                     let binding = res.binding;
-                    let arg = self.w.resource_arg(r, None)?;
-                    let name = &self.w.resource_names[r];
-                    let ty = arg
-                        .strip_suffix(name.as_str())
-                        .ok_or("internal: a resource's type")?
-                        .trim_end()
-                        .to_string();
+                    let ty = self.w.resource_type(r)?;
                     let one = self.w.table_type(&ty);
+                    let name = &self.w.resource_names[r];
                     let _ = writeln!(
                         locals,
-                        "{arg} = reinterpret_cast<constant {one}*>(_table)[_blk.i{binding}].v;"
+                        "{ty} {name} = reinterpret_cast<constant {one}*>(_table)[_blk.i{binding}].v;"
                     );
                 }
                 _ => {
@@ -1359,6 +1202,36 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
         Ok(())
     }
 
+    /// Writes struct `name` of the varyings `map` of a value of type `t`: a vertex shader's
+    /// output, with its clip position (`position`), or a fragment shader's input, without it.
+    fn varying_struct(
+        &mut self,
+        name: &str,
+        map: &[ir::Varying],
+        t: ir::TypeId,
+        position: bool,
+    ) -> R<()> {
+        let mut def = format!("struct {name} {{\n");
+        let mut location = 0;
+        for (k, v) in map.iter().enumerate() {
+            if v.position && !position {
+                continue;
+            }
+            let pt = self.w.m.types.part_at(t, &v.path).ok_or("internal: a varying's path")?;
+            let ty = self.w.ty(pt)?;
+            if v.position {
+                let _ = writeln!(def, "{ty} v{k} [[position]];");
+            } else {
+                let interp = if v.flat { "flat" } else { "center_perspective" };
+                let _ = writeln!(def, "{ty} v{k} [[user(loc{location}), {interp}]];");
+                location += 1;
+            }
+        }
+        def.push_str("};\n");
+        self.w.type_defs.push_str(&def);
+        Ok(())
+    }
+
     /// Zeroes workgroup variable `place` of type `t`: what a brace can't (an atomic, or an array
     /// or struct holding one) member by member.
     fn zero_workgroup(
@@ -1373,7 +1246,7 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
             let _ = writeln!(out, "{place} = {{}};");
             return Ok(());
         }
-        match types.get(t).clone() {
+        match *types.get(t) {
             ir::TypeDef::Atomic(_) => {
                 let _ = writeln!(
                     out,
@@ -1387,7 +1260,8 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
                 out.push_str("}\n");
             }
             ir::TypeDef::Struct { .. } | ir::TypeDef::Enum { .. } => {
-                let members = self.w.members(t)?;
+                let members =
+                    types.gpu_members(t).ok_or("internal: members of a type that has none")?;
                 for (k, (_, mt)) in members.iter().enumerate() {
                     let (name, _) = self.w.member_name(t, k as u32)?;
                     self.zero_workgroup(*mt, format!("{place}.{name}"), out, depth)?;
@@ -1400,23 +1274,22 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
 
     // ---- values ----
 
-    fn val(&self, v: ir::ValueId) -> R<Val> {
+    fn val(&self, v: ir::ValueId) -> R<&Val> {
         self.vals
             .get(v.index())
-            .cloned()
-            .flatten()
+            .and_then(Option::as_ref)
             .ok_or_else(|| format!("internal: v{} has no MSL expression", v.0))
     }
 
     /// `v` as an operand: parenthesized unless it binds tightest.
     fn operand(&self, v: ir::ValueId) -> R<String> {
         let val = self.val(v)?;
-        Ok(if val.atom { val.text } else { format!("({})", val.text) })
+        Ok(if val.atom { val.text.clone() } else { format!("({})", val.text) })
     }
 
     /// `v` as a whole argument (a call's, an initializer's): as it is.
     fn arg(&self, v: ir::ValueId) -> R<String> {
-        Ok(self.val(v)?.text)
+        Ok(self.val(v)?.text.clone())
     }
 
     /// The loop body `b`'s leading exit test, where it has one a `for`'s condition can hold:
@@ -1431,8 +1304,8 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
                 ir::Stmt::Let(v, e) => {
                     let reads_counter =
                         matches!(e, ir::Expr::Load(p) if p.root_local() == Some(counter));
-                    let simple =
-                        matches!(e, ir::Expr::Load(p) if p.root_local().is_some()) || pure(e);
+                    let simple = matches!(e, ir::Expr::Load(p) if p.root_local().is_some())
+                        || analysis::pure(e);
                     if reads_counter || !simple {
                         return Ok(None);
                     }
@@ -1511,7 +1384,7 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
                     if e.has_effect() && !exchanged {
                         let _ = writeln!(out, "{};", text.text);
                     }
-                } else if pure(e)
+                } else if analysis::pure(e)
                     && (self.uses[v.index()] <= 1 || written_at_each_use(e))
                     && nesting(&text.text) <= MOST_NESTING
                 {
@@ -1545,7 +1418,7 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
                 _ => {}
             },
             ir::Stmt::Store(p, v) => {
-                let (place, atomic) = self.place(p, out)?;
+                let (place, atomic) = self.place(p)?;
                 let value = self.arg(*v)?;
                 if atomic {
                     let _ = writeln!(
@@ -1582,7 +1455,7 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
                 let repeats = self.loop_depth > 0 || self.w.repeated[self.id.index()];
                 if bound.is_none()
                     && repeats
-                    && let Some(c) = counted(self.f, body, continuing)
+                    && let Some(c) = counted(&self.consts, body, continuing)
                 {
                     let it = self.fresh("it");
                     let l = self.locals[c.local.index()].clone();
@@ -1667,12 +1540,8 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
                 }
             }
         }
-        for r in self.w.uses[g.index()].clone() {
-            if self.w.passed(r) {
-                texts.push(self.w.resource_names[r].clone());
-            }
-        }
-        if self.w.uses[g.index()].iter().any(|&r| is_sized(&self.w.m.resources[r])) {
+        texts.extend(self.w.uses[g.index()].iter().map(|&r| self.w.resource_names[r].clone()));
+        if self.w.takes_sizes[g.index()] {
             texts.push("_buffer_sizes".into());
         }
         Ok(format!("{}({})", self.w.function_names[g.index()], texts.join(", ")))
@@ -1734,10 +1603,9 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
         let mut text = base.to_string();
         let mut t = t;
         for &k in path {
-            let types = &self.w.m.types;
-            match types.get(t).clone() {
+            match self.w.m.types.get(t) {
                 ir::TypeDef::Struct { .. } | ir::TypeDef::Enum { .. } => {
-                    let member = self.w.member(t, k);
+                    let member = self.w.m.types.gpu_member(t, k);
                     let (name, packed) = self.w.member_name(t, member)?;
                     let next = self.w.m.types.part(t, k).ok_or("internal: a varying's path")?;
                     text = format!("{text}.{name}");
@@ -1794,24 +1662,19 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
     fn max_index(&mut self, r: usize, elem: ir::TypeId) -> R<String> {
         let member =
             self.w.size_members.get(&r).cloned().ok_or("internal: a buffer with no size")?;
+        // (naga sized a vec3 element 12 bytes, as `msl_size` does.)
         let size = msl_size(&self.w.m.types, &mut self.w.layouts, elem);
-        let size = match self.w.m.types.get(elem) {
-            // naga sized a vec3 element 12 bytes.
-            ir::TypeDef::Vector(s, 3) => s.bytes() * 3,
-            _ => size,
-        };
         let stride = self.w.layouts.get(&self.w.m.types, elem).0.stride();
         Ok(format!("(_buffer_sizes.{member} - 0 - {size}) / {stride}"))
     }
 
     /// The integer constant `v` is, if it's one.
     fn const_int(&self, v: ir::ValueId) -> Option<i64> {
-        self.consts.get(&v).copied()
+        analysis::const_int(&self.consts, v)
     }
 
     /// A place's text, and whether it's an atomic.
-    fn place(&mut self, p: &ir::Place, out: &mut String) -> R<(String, bool)> {
-        let _ = out;
+    fn place(&mut self, p: &ir::Place) -> R<(String, bool)> {
         let m = self.w.m;
         let (mut text, mut t, mut sized) = match &p.root {
             ir::PlaceRoot::Local(l) => {
@@ -1849,7 +1712,7 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
                     t = Some(elem);
                 }
                 (ir::Proj::Field(k), Some(pt)) => {
-                    let member = self.w.member(pt, *k);
+                    let member = m.types.gpu_member(pt, *k);
                     let (name, _) = self.w.member_name(pt, member)?;
                     text = format!("{text}.{name}");
                     t = m.proj_ty(pt, proj);
@@ -1859,7 +1722,7 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
                     t = m.proj_ty(pt, proj);
                 }
                 (ir::Proj::Index(i), Some(pt)) => {
-                    let len = static_len(&m.types, pt);
+                    let len = m.types.index_len(pt);
                     let index = self.index_text(*i, len, None)?;
                     let inner = if matches!(m.types.get(pt), ir::TypeDef::Array(..)) {
                         ".inner"
@@ -1887,22 +1750,6 @@ fn holds_atomic(types: &ir::Types, t: ir::TypeId) -> bool {
         }
         _ => false,
     }
-}
-
-/// How many elements an index into a value of type `t` can reach, when the type says.
-fn static_len(types: &ir::Types, t: ir::TypeId) -> Option<u32> {
-    match types.get(t) {
-        ir::TypeDef::Array(_, n) => Some(*n),
-        ir::TypeDef::Vector(_, n) | ir::TypeDef::Matrix(n, _) => Some(u32::from(*n)),
-        _ => None,
-    }
-}
-
-/// The type of the part of a value of type `t` at `path`: field indexes, then a matrix column's.
-fn part_ty(types: &ir::Types, t: ir::TypeId, path: &[u32]) -> R<ir::TypeId> {
-    path.iter()
-        .try_fold(t, |t, &k| types.part(t, k))
-        .ok_or_else(|| "internal: a varying's path".to_string())
 }
 
 /// A colour of `c.components` of `c.scalar` as four of it: missing colour channels 0, and a
@@ -1951,15 +1798,6 @@ impl FunctionWriter<'_, '_> {
         let m = self.w.m;
         Ok(match e {
             ir::Expr::Const(c) => {
-                match c {
-                    ir::Const::I32(x) => {
-                        self.consts.insert(v, i64::from(*x));
-                    }
-                    ir::Const::U32(x) => {
-                        self.consts.insert(v, i64::from(*x));
-                    }
-                    _ => {}
-                }
                 let text = literal(c)?;
                 if text.starts_with('-') || text.starts_with('(') {
                     compound(text)
@@ -2006,7 +1844,7 @@ impl FunctionWriter<'_, '_> {
                 }
             }
             ir::Expr::Load(p) => {
-                let (place, atomic) = self.place(p, out)?;
+                let (place, atomic) = self.place(p)?;
                 if atomic {
                     atom(format!(
                         "metal::atomic_load_explicit(&{place}, metal::memory_order_relaxed)"
@@ -2034,7 +1872,7 @@ impl FunctionWriter<'_, '_> {
                 atom(text)
             }
             ir::Expr::Barrier => return Err("internal: a barrier's value".into()),
-            ir::Expr::Subgroup(op, args) => self.subgroup(*op, args, t)?,
+            ir::Expr::Subgroup(op, args) => self.subgroup(*op, args)?,
             ir::Expr::TextureStore(..) => return Err("internal: a texel write's value".into()),
             ir::Expr::Discard => return Err("internal: a discard's value".into()),
             ir::Expr::Call(g, args) => {
@@ -2061,7 +1899,7 @@ impl FunctionWriter<'_, '_> {
                 let base = self.operand(*x)?;
                 match m.types.get(xt) {
                     ir::TypeDef::Struct { .. } | ir::TypeDef::Enum { .. } => {
-                        let member = self.w.member(xt, *i);
+                        let member = m.types.gpu_member(xt, *i);
                         let (name, packed) = self.w.member_name(xt, member)?;
                         if packed {
                             atom(format!("{}({base}.{name})", self.w.ty(t)?))
@@ -2095,7 +1933,7 @@ impl FunctionWriter<'_, '_> {
             ir::Expr::ExtractDyn(x, i) => {
                 let xt = self.ty_of(*x);
                 let base = self.operand(*x)?;
-                let index = self.index_text(*i, static_len(&m.types, xt), None)?;
+                let index = self.index_text(*i, m.types.index_len(xt), None)?;
                 let inner =
                     if matches!(m.types.get(xt), ir::TypeDef::Array(..)) { ".inner" } else { "" };
                 atom(format!("{base}{inner}[{index}]"))
@@ -2177,7 +2015,7 @@ impl FunctionWriter<'_, '_> {
                 }
             }
             ir::Expr::Binary(op, a, b) => self.binary(*op, *a, *b, t)?,
-            ir::Expr::Builtin(b, args) => self.builtin(*b, args, t)?,
+            ir::Expr::Builtin(b, args) => self.builtin(*b, args)?,
             ir::Expr::Host(..) => return Err("GPU code can't record GPU work".into()),
             ir::Expr::Mem(..) => return Err("GPU code can't use raw memory".into()),
             ir::Expr::Run(_) | ir::Expr::Addr(_) => {
@@ -2204,7 +2042,7 @@ impl FunctionWriter<'_, '_> {
         };
         let mut parts = Vec::with_capacity(n as usize);
         for k in 0..n {
-            let pt = part_ty(&self.w.m.types, t, &[k])?;
+            let pt = types.part(t, k).ok_or("internal: a varying's path")?;
             path.push(k);
             parts.push(self.rebuild(map, pt, path)?);
             path.pop();
@@ -2305,7 +2143,7 @@ impl FunctionWriter<'_, '_> {
         Ok(compound(format!("{l} {sym} {r}")))
     }
 
-    fn builtin(&mut self, b: ir::Builtin, args: &[ir::ValueId], t: ir::TypeId) -> R<Val> {
+    fn builtin(&mut self, b: ir::Builtin, args: &[ir::ValueId]) -> R<Val> {
         use ir::Builtin as B;
         let m = self.w.m;
         let texts = args.iter().map(|a| self.arg(*a)).collect::<R<Vec<_>>>()?;
@@ -2365,7 +2203,6 @@ impl FunctionWriter<'_, '_> {
                 atom(format!("naga_dot_{sn}{n}({}, {})", texts[0], texts[1]))
             }
             _ => {
-                let _ = t;
                 let name = match b {
                     B::Sqrt => "sqrt",
                     B::InverseSqrt => "rsqrt",
@@ -2433,7 +2270,7 @@ impl FunctionWriter<'_, '_> {
         let ir::TypeDef::Atomic(s) = *m.types.get(pt) else {
             return Err("internal: an atomic operation on something that isn't atomic".into());
         };
-        let (place, _) = self.place(p, out)?;
+        let (place, _) = self.place(p)?;
         if op == A::Load {
             return Ok(Some(format!(
                 "metal::atomic_load_explicit(&{place}, metal::memory_order_relaxed)"
@@ -2489,9 +2326,8 @@ impl FunctionWriter<'_, '_> {
     }
 
     /// A subgroup operation's value.
-    fn subgroup(&mut self, op: ir::SubgroupOp, args: &[ir::ValueId], t: ir::TypeId) -> R<Val> {
+    fn subgroup(&mut self, op: ir::SubgroupOp, args: &[ir::ValueId]) -> R<Val> {
         use ir::SubgroupOp as S;
-        let _ = t;
         let x =
             self.arg(*args.first().ok_or("internal: a subgroup operation without its operand")?)?;
         let name = match op {
@@ -2532,8 +2368,8 @@ impl FunctionWriter<'_, '_> {
         use ir::TextureOp as T;
         let m = self.w.m;
         let image = self.w.resource_names[tex.index()].clone();
-        let (dim, depth) = match m.resources[tex.index()].kind {
-            ir::ResourceKind::Texture { dim, depth, .. } => (dim, depth),
+        let dim = match m.resources[tex.index()].kind {
+            ir::ResourceKind::Texture { dim, .. } => dim,
             _ => return Err("internal: a texture read of something that isn't a texture".into()),
         };
         let arg = |fw: &Self, i: usize| -> R<String> {
@@ -2629,7 +2465,6 @@ impl FunctionWriter<'_, '_> {
                     parts.push(format!("metal::min(uint({l}), {image}.get_array_size() - 1)"));
                 }
                 parts.push(lod);
-                let _ = depth;
                 atom(format!("{image}.read({})", parts.join(", ")))
             }
             T::Width => atom(format!("{image}.get_width()")),

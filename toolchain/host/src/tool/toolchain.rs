@@ -767,7 +767,8 @@ impl<'a> Lifted<'a> {
         if planned.refused {
             return Ok(planned.answer.clone());
         }
-        let failed = |why: String| Ok(format!("{{\"why\":{},\"written\":false}}", json_text(&why)));
+        let failed =
+            |why: String| Ok(format!("{{\"why\":{},\"written\":false}}", crate::json_string(&why)));
         let mut paths = Vec::with_capacity(planned.files.len());
         for (rel, hash, _) in &planned.files {
             if job.cancelled() {
@@ -810,22 +811,6 @@ impl<'a> Lifted<'a> {
         }
         Ok(planned.answer.clone())
     }
-}
-
-/// `text` as a JSON string, quoted.
-fn json_text(text: &str) -> String {
-    let mut out = String::from("\"");
-    for c in text.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
 }
 
 /// What a request the toolchain's work stopped for gives, if it stops between phases.

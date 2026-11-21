@@ -204,7 +204,7 @@ const STORE_PIPELINES: &str = r#"[
 fn program_build(
     name: &str,
     pipelines: &str,
-    shaders: &[(&str, &Builder)],
+    shaders: &[(&str, Builder)],
     frames: &[Vec<Vec<u8>>],
 ) -> TempDir {
     let wasm = wat::parse_str(common::wat::program(frames)).expect("compiles");
@@ -216,15 +216,10 @@ fn store_shaders() -> [(&'static str, Builder); 2] {
     [("store.ir", shaders::store()), ("cell.ir", shaders::cell(None))]
 }
 
-/// Shaders as `program_build` takes them.
-fn named<'a>(shaders: &'a [(&'static str, Builder)]) -> Vec<(&'static str, &'a Builder)> {
-    shaders.iter().map(|(n, b)| (*n, b)).collect()
-}
-
 /// A program submitting `frames`, loaded with the store and cell pipelines. The build's
 /// directory comes first, so `let (_dir, host) = ...` drops the host before the directory.
 fn store_host(name: &str, frames: &[Vec<Vec<u8>>], options: &Options) -> (TempDir, Host) {
-    let dir = program_build(name, STORE_PIPELINES, &named(&store_shaders()), frames);
+    let dir = program_build(name, STORE_PIPELINES, &store_shaders(), frames);
     let host = Host::load_with(&dir, options).expect("loads");
     (dir, host)
 }
@@ -272,12 +267,8 @@ fn restarting_in_another_build_reuses_pipelines_but_starts_fresh() {
         .finish();
     // The first frame submits nothing; the second exercises fresh WASM globals, resources
     // and request IDs (the previous program already used buffer 1 and request 4).
-    let next_dir = program_build(
-        "restart-next",
-        STORE_PIPELINES,
-        &named(&store_shaders()),
-        &[vec![], vec![next]],
-    );
+    let next_dir =
+        program_build("restart-next", STORE_PIPELINES, &store_shaders(), &[vec![], vec![next]]);
     host.restart_in(&next_dir, &options).expect("restarts in the next directory");
     assert_eq!(host.pipelines_built(), pipelines, "unchanged pipelines are reused");
     assert!(host.take_batches().is_empty(), "old recorded commands are gone");
@@ -581,7 +572,7 @@ fn cached_bind_groups_follow_resource_lifetimes() {
     let dir = program_build(
         "bind-group-lifetimes",
         &format!("[{}]", pipelines.join(",")),
-        &[("sum.ir", &shaders::sum())],
+        &[("sum.ir", shaders::sum())],
         &[vec![encoder.finish()]],
     );
     let mut host = Host::load(&dir).expect("loads");
@@ -658,7 +649,7 @@ fn serial_draws_keep_pipeline_and_uniform_order() {
     let dir = program_build(
         "serial-draw-order",
         &format!("[{}]", pipelines.join(",")),
-        &[("cell.ir", &shaders::cell(None))],
+        &[("cell.ir", shaders::cell(None))],
         &[vec![encoder.present().finish()]],
     );
     let options = Options { timing: Timing::Serial, ..Options::default() };
@@ -668,9 +659,12 @@ fn serial_draws_keep_pipeline_and_uniform_order() {
     assert_eq!(pixel(&frame, 8, 0, 0), [0, 0, 255, 255], "the last draw overwrote the first");
     assert_eq!(pixel(&frame, 8, 3, 3), [255, 0, 0, 255], "outside its triangle stays red");
     assert_eq!(pixel(&frame, 8, 7, 3), [0, 255, 0, 255], "the second draw's uniforms");
+    // One pass, whose draws, never measured before, run a piece each (`Gpu::record_pass`),
+    // each timed under the pass's label.
+    assert_eq!(host.take_counters().render_passes, 1);
     let timings = host.take_timings().expect("timings");
-    assert_eq!(timings.len(), 1);
-    assert_eq!(timings[0].label, "ordered draws");
+    assert_eq!(timings.len(), 3, "a piece a draw");
+    assert!(timings.iter().all(|t| t.label == "ordered draws"), "{timings:?}");
 }
 
 #[test]
@@ -735,7 +729,7 @@ fn a_two_byte_texture_upload_reaches_the_shader() {
     let dir = program_build(
         "two-byte-texture",
         pipelines,
-        &[("read.ir", &shaders::read_texel())],
+        &[("read.ir", shaders::read_texel())],
         &[vec![batch]],
     );
     let mut host = Host::load(&dir).unwrap();
@@ -752,14 +746,17 @@ fn hot_reload_clears_the_retired_builds_debug_flag() {
     let old = program_build(
         "reload-debug-old",
         pipelines,
-        &[("flag.ir", &shaders::flag())],
+        &[("flag.ir", shaders::flag())],
         &[vec![failing]],
     );
     let clean = Encoder::new().begin_screen_pass([0.0, 1.0, 0.0, 1.0]).present().finish();
     let next = program_build("reload-debug-next", "[]", &[], &[vec![clean]]);
     let options = Options { reloadable: true, ..Options::default() };
     let mut host = Host::load_with(&old, &options).unwrap();
-    assert!(host.frame(0.0, 4, 4).unwrap_err().to_string().contains("indexed an array"));
+    // The flag is read once its frame's work is done: at that frame's end, or at the readback
+    // after, which waits for it.
+    let fault = host.frame(0.0, 4, 4).and_then(|()| host.read_screen().map(drop));
+    assert!(fault.unwrap_err().to_string().contains("indexed an array"));
     host.reload(Some(&next)).expect("loads the next build");
     host.frame(0.0, 4, 4).expect("the retired build's error does not poison its replacement");
     assert_eq!(pixel(&host.read_screen().unwrap(), 4, 0, 0), [0, 255, 0, 255]);
@@ -797,13 +794,13 @@ fn adjacent_passes_with_different_buffer_access_do_not_join() {
     let dir = program_build(
         "incompatible-pass-join",
         pipelines,
-        &[("read.ir", &shaders::read_pass()), ("write.ir", &shaders::write_pass())],
+        &[("read.ir", shaders::read_pass()), ("write.ir", shaders::write_pass())],
         &[vec![batch]],
     );
     let mut host = Host::load_with(&dir, &Options { timing: Timing::Span, ..Options::default() })
         .expect("both render pipelines are valid");
     host.frame(0.0, 4, 4).expect("individually valid usage scopes stay separate");
-    assert_eq!(host.take_timings().unwrap().len(), 2, "only compatible passes join");
+    assert_eq!(host.take_counters().render_passes, 2, "only compatible passes join");
     assert_eq!(host.read_buffer(1).unwrap()[..4], 42u32.to_le_bytes());
 }
 
@@ -818,7 +815,7 @@ const FILL_PIPELINES: &str = r#"[
 /// A program with the `fill` pipeline that submits `batch` in its one frame, run once with
 /// every pass timed. The build's directory comes first, as [`store_host`]'s.
 fn fill_host(name: &str, batch: Vec<u8>) -> (TempDir, Host) {
-    let dir = program_build(name, FILL_PIPELINES, &[("fill.ir", &shaders::fill())], &[vec![batch]]);
+    let dir = program_build(name, FILL_PIPELINES, &[("fill.ir", shaders::fill())], &[vec![batch]]);
     let mut host = Host::load_with(&dir, &Options { timing: Timing::Span, ..Options::default() })
         .expect("loads");
     host.frame(0.0, 4, 4).expect("runs");
@@ -846,7 +843,7 @@ fn a_pass_that_joins_after_a_scissor_draws_on_the_whole_target() {
         .end_pass()
         .finish();
     let (_dir, mut host) = fill_host("scissor-pass-join", batch);
-    assert_eq!(host.take_timings().unwrap().len(), 1, "the three passes join");
+    assert_eq!(host.take_counters().render_passes, 1, "the three passes join");
     let (width, height, rgba) = host.read_target("filled").expect("the joined pass's target");
     assert_eq!((width, height), (4, 4));
     assert!(rgba.chunks_exact(4).all(|p| p == [255; 4]), "every texel is drawn: {rgba:?}");
@@ -871,7 +868,7 @@ fn a_pass_that_joins_after_a_viewport_draws_on_the_whole_target() {
         .end_pass()
         .finish();
     let (_dir, mut host) = fill_host("viewport-pass-join", batch);
-    assert_eq!(host.take_timings().unwrap().len(), 1, "the two passes join");
+    assert_eq!(host.take_counters().render_passes, 1, "the two passes join");
     let (width, height, rgba) = host.read_target("filled").expect("the joined pass's target");
     assert_eq!((width, height), (4, 4));
     assert!(rgba.chunks_exact(4).all(|p| p == [255; 4]), "every texel is drawn: {rgba:?}");
@@ -898,9 +895,12 @@ fn a_pass_joins_only_a_pass_of_its_own_label() {
         .end_pass()
         .finish();
     let (_dir, mut host) = fill_host("labelled-pass-join", batch);
+    assert_eq!(host.take_counters().render_passes, 2, "the second label's two passes join");
+    // A pass never measured before runs a piece a draw (`Gpu::record_pass`), each timed.
     let timings = host.take_timings().unwrap();
-    let labels: Vec<&str> = timings.iter().map(|t| t.label.as_str()).collect();
-    assert_eq!(labels, ["first", "second"], "the second label's two passes join, apart");
+    let mut labels: Vec<&str> = timings.iter().map(|t| t.label.as_str()).collect();
+    labels.dedup();
+    assert_eq!(labels, ["first", "second"], "each label's passes timed under its own name");
     let (width, height, rgba) = host.read_target("second").expect("the second label's target");
     assert_eq!((width, height), (4, 4));
     assert!(rgba.chunks_exact(4).all(|p| p == [255; 4]), "every texel is drawn: {rgba:?}");
@@ -1090,7 +1090,7 @@ fn indexed_indirect_draws_cull_and_bias() {
     let dir = program_build(
         "indexed",
         MESH_PIPELINES,
-        &[("mesh.ir", &shaders::mesh())],
+        &[("mesh.ir", shaders::mesh())],
         &[vec![e.finish()]],
     );
     let mut host = Host::load(&dir).expect("loads");
@@ -1125,7 +1125,7 @@ fn indirect_draws_keep_their_first_instance() {
         let dir = program_build(
             "indirect-first-instance",
             pipelines,
-            &[("instance.ir", &shaders::instance())],
+            &[("instance.ir", shaders::instance())],
             &[vec![encoder.finish()]],
         );
         let mut host = Host::load(&dir).expect("loads");
@@ -1155,7 +1155,7 @@ fn safe_math_keeps_nans_and_the_order_of_sums() {
     let frames = [vec![encoder.finish()]];
     for safe in [false, true] {
         let name = format!("math-mode-{safe}");
-        let dir = program_build(&name, pipelines, &[("probe.ir", &shaders::probe())], &frames);
+        let dir = program_build(&name, pipelines, &[("probe.ir", shaders::probe())], &frames);
         if safe {
             // The math mode the writer states, made safe.
             let path = dir.join("probe.metal");
@@ -1205,12 +1205,11 @@ fn an_hdr_screen_keeps_values_past_white_where_the_host_lets_it() {
         e.present();
         vec![e.finish()]
     };
-    let shader = shaders::cell(Some(colour));
     for allowed in [false, true] {
         let dir = program_build(
             &format!("hdr-{allowed}"),
             pipelines,
-            &[("bright.ir", &shader)],
+            &[("bright.ir", shaders::cell(Some(colour)))],
             &[frame(true), frame(false)],
         );
         let options = Options { screen_hdr: allowed, ..Options::default() };

@@ -337,7 +337,6 @@ macro_rules! lang_items {
             pub fn textures_pass(self) -> Option<bool> {
                 match self {
                     Lang::Pass
-                    | Lang::MsaaPass
                     | Lang::LayerPass
                     | Lang::Pass2
                     | Lang::Pass3
@@ -347,8 +346,6 @@ macro_rules! lang_items {
                     | Lang::Pass7
                     | Lang::Pass8 => Some(false),
                     Lang::DepthPass
-                    | Lang::MsaaDepthPass
-                    | Lang::MsaaDepthPass2
                     | Lang::MsaaDepthPass3
                     | Lang::LayerDepthPass
                     | Lang::DepthPass2
@@ -365,10 +362,7 @@ macro_rules! lang_items {
             /// Samples per pixel for an open pass type (`4` for hardware 4× MSAA, `1` otherwise).
             pub fn pass_samples(self) -> u8 {
                 match self {
-                    Lang::MsaaPass
-                    | Lang::MsaaDepthPass
-                    | Lang::MsaaDepthPass2
-                    | Lang::MsaaDepthPass3 => 4,
+                    Lang::MsaaDepthPass3 => 4,
                     _ => 1,
                 }
             }
@@ -455,9 +449,6 @@ lang_items! {
     RenderPass = "std::gpu::RenderPass",
     Pass = "std::gpu::Pass",
     DepthPass = "std::gpu::DepthPass",
-    MsaaPass = "std::gpu::MsaaPass",
-    MsaaDepthPass = "std::gpu::MsaaDepthPass",
-    MsaaDepthPass2 = "std::gpu::MsaaDepthPass2",
     MsaaDepthPass3 = "std::gpu::MsaaDepthPass3",
     DepthOnlyPass = "std::gpu::DepthOnlyPass",
     ScreenPass = "std::gpu::ScreenPass",

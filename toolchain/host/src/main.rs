@@ -43,7 +43,23 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+#[cfg(feature = "gpu")]
+use wrela_host::PresentMode;
 use wrela_host::{CpuBuild, TickLog};
+
+/// Without the GPU there's no window to present to: `--window` fails when it runs.
+#[cfg(not(feature = "gpu"))]
+#[derive(Clone, Copy)]
+enum PresentMode {
+    Fifo,
+}
+
+#[cfg(not(feature = "gpu"))]
+impl PresentMode {
+    fn parse(_: &str) -> Option<PresentMode> {
+        Some(PresentMode::Fifo)
+    }
+}
 
 const USAGE: &str = "usage:
   wrela-host <build-dir> [--frames N] [--fps F] [--size WxH] [--input script.json] [--png out.png [--every K [--png-from N]]] [--rgba out.rgba] [--timestamps [--serial]] [--keep-clocked] [--cpu] [--targets DIR] [--log out.ticks] [--pipelines] [--steps] [--capture F out.gputrace] [--workers N]
@@ -104,7 +120,8 @@ program's own among them). --relaxed runs a relaxed-SIMD build's relaxed module.
 
 struct Args {
     dir: PathBuf,
-    frames: u32,
+    /// `--frames`: headless, 1 if not given ([`Args::frames`]); in a window, until it's closed.
+    frames: Option<u32>,
     fps: f64,
     size: (u32, u32),
     png: Option<PathBuf>,
@@ -130,7 +147,7 @@ struct Args {
     workers: u32,
     relaxed: bool,
     /// `--window`: shown in a window, presenting as this says.
-    window: Option<String>,
+    window: Option<PresentMode>,
     /// `--hdr`: the screen goes HDR offscreen when the program asks (as a test's `hdr=1`).
     hdr: bool,
 }
@@ -139,7 +156,7 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut dir = None;
     let mut args = Args {
         dir: PathBuf::new(),
-        frames: 1,
+        frames: None,
         fps: 60.0,
         size: (640, 360),
         png: None,
@@ -171,10 +188,17 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
             v.parse().map_err(|_| format!("{flag} needs a whole number"))
         };
         match arg.as_str() {
-            "--frames" => args.frames = whole("--frames", value("--frames")?)?,
+            "--frames" => args.frames = Some(whole("--frames", value("--frames")?)?),
             "--hdr" => args.hdr = true,
-            "--window" => args.window = Some(args.window.take().unwrap_or_else(|| "fifo".into())),
-            "--present" => args.window = Some(value("--present")?),
+            "--window" => {
+                args.window.get_or_insert(PresentMode::Fifo);
+            }
+            "--present" => {
+                let mode = value("--present")?;
+                args.window = Some(PresentMode::parse(&mode).ok_or_else(|| {
+                    format!("--present is fifo, fifo-relaxed, mailbox or immediate, not {mode}")
+                })?);
+            }
             "--ticks" => args.ticks = Some(whole("--ticks", value("--ticks")?)?),
             "--workers" => args.workers = whole("--workers", value("--workers")?)?,
             "--fps" => {
@@ -241,10 +265,10 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
                 "--capture runs with frames alone, not --until, --no-gpu or --replay\n\n{USAGE}"
             ));
         }
-        if *frame >= args.frames {
+        if *frame >= args.frames() {
             return Err(format!(
                 "--capture {frame} is past the last frame: --frames is {}",
-                args.frames
+                args.frames()
             ));
         }
         // Before the frames run, not when the capture starts (Metal checks again then).
@@ -256,6 +280,35 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
         }
     }
     Ok(args)
+}
+
+impl Args {
+    /// The frames a headless run runs.
+    fn frames(&self) -> u32 {
+        self.frames.unwrap_or(1)
+    }
+}
+
+/// The host's options, as the flags say.
+#[cfg(feature = "gpu")]
+fn options(args: &Args) -> wrela_host::Options {
+    use wrela_host::Timing;
+    let timing = match (args.timestamps, args.serial) {
+        (true, true) => Timing::Serial,
+        (true, false) => Timing::Span,
+        // --serial says how --timestamps times: alone, it asks for nothing.
+        (false, _) => Timing::Off,
+    };
+    wrela_host::Options {
+        timing,
+        report_pipelines: args.pipelines,
+        capture: args.capture.clone(),
+        workers: args.workers,
+        defer_init: true,
+        relaxed_simd: args.relaxed,
+        screen_hdr: args.hdr,
+        ..wrela_host::Options::default()
+    }
 }
 
 /// What went wrong: the host's error, or a replay that didn't match.
@@ -270,11 +323,7 @@ impl From<wrela_host::Error> for Failure {
     }
 }
 
-fn read_script(args: &Args) -> Result<Vec<wrela_host::Scripted>, wrela_host::Error> {
-    read_script_at(args.input.as_ref())
-}
-
-fn read_script_at(path: Option<&PathBuf>) -> Result<Vec<wrela_host::Scripted>, wrela_host::Error> {
+fn read_script(path: Option<&PathBuf>) -> Result<Vec<wrela_host::Scripted>, wrela_host::Error> {
     match path {
         Some(path) => {
             let text = std::fs::read_to_string(path).map_err(|e| wrela_host::Error::io(path, e))?;
@@ -325,7 +374,7 @@ fn replay(args: &Args, path: &PathBuf) -> Result<(), Failure> {
 
 /// `--no-gpu`: the ticks alone.
 fn ticks_alone(args: &Args) -> Result<(), Failure> {
-    let script = read_script(args)?;
+    let script = read_script(args.input.as_ref())?;
     let built = CpuBuild::load_choosing(&args.dir, args.relaxed)?;
     let log = built.record_ticks(args.ticks.unwrap_or(0), &script, args.workers)?;
     println!("first {}", wrela_abi::hash::hex(log.first));
@@ -342,7 +391,7 @@ fn ticks_alone(args: &Args) -> Result<(), Failure> {
 #[cfg(feature = "gpu")]
 fn still(args: &Args, until: &str) -> Result<(), Failure> {
     use wrela_host::{Host, Options};
-    let script = read_script(args)?;
+    let script = read_script(args.input.as_ref())?;
     let options = Options {
         workers: args.workers,
         relaxed_simd: args.relaxed,
@@ -351,12 +400,12 @@ fn still(args: &Args, until: &str) -> Result<(), Failure> {
     };
     let mut host = Host::load_with(&args.dir, &options)?;
     let (w, h) = args.size;
-    let run = host.run_lockstep_until(args.frames, args.fps, w, h, &script, until)?;
+    let run = host.run_lockstep_until(args.frames(), args.fps, w, h, &script, until)?;
     drop(host); // release the GPU (and its lock) before writing files
     let Some(run) = run else {
         return Err(Failure::Host(wrela_host::Error::Program(format!(
             "it didn't print {until:?} within {} frames",
-            args.frames
+            args.frames()
         ))));
     };
     if let Some(path) = &args.png {
@@ -368,29 +417,13 @@ fn still(args: &Args, until: &str) -> Result<(), Failure> {
 
 #[cfg(feature = "gpu")]
 fn frames(args: &Args) -> Result<(), Failure> {
-    use wrela_host::{Host, Options, Timing};
+    use wrela_host::Host;
     if let Some(until) = &args.until {
         return still(args, until);
     }
-    let script = read_script(args)?;
-    let timing = match (args.timestamps, args.serial) {
-        (true, true) => Timing::Serial,
-        (true, false) => Timing::Span,
-        // --serial says how --timestamps times: alone, it asks for nothing.
-        (false, _) => Timing::Off,
-    };
-    let options = Options {
-        timing,
-        report_pipelines: args.pipelines,
-        capture: args.capture.clone(),
-        workers: args.workers,
-        defer_init: true,
-        relaxed_simd: args.relaxed,
-        screen_hdr: args.hdr,
-        ..Options::default()
-    };
+    let script = read_script(args.input.as_ref())?;
     let loading = std::time::Instant::now();
-    let mut host = Host::load_with(&args.dir, &options)?;
+    let mut host = Host::load_with(&args.dir, &options(args))?;
     let loaded_ms = loading.elapsed().as_secs_f64() * 1000.0;
     let logging = args.log.is_some();
     host.want_hashes(logging);
@@ -400,7 +433,7 @@ fn frames(args: &Args) -> Result<(), Failure> {
     let stem = args.png.as_ref().map(|p| p.with_extension("")).unwrap_or_default();
     let every = args.every.unwrap_or(0);
     let (run, log) = host.run_lockstep_seen_from(
-        args.frames,
+        args.frames(),
         args.fps,
         w,
         h,
@@ -489,30 +522,25 @@ fn run(args: &Args) -> Result<(), Failure> {
     if args.no_gpu {
         return ticks_alone(args);
     }
-    if args.window.is_some() {
-        return windowed(args);
+    if let Some(present) = args.window {
+        return windowed(args, present);
     }
     frames(args)
 }
 
 /// `--window`: the frames shown in a window until it's closed (or `--frames` given, ran).
 #[cfg(feature = "gpu")]
-fn windowed(args: &Args) -> Result<(), Failure> {
-    use wrela_host::{Host, Options, PresentMode, window};
-    let mode = args.window.as_deref().unwrap_or("fifo");
-    let present = PresentMode::parse(mode).ok_or_else(|| {
-        Failure::Host(wrela_host::Error::Gpu(format!(
-            "--present is fifo, fifo-relaxed, mailbox or immediate, not {mode}"
-        )))
-    })?;
-    let options = Options { workers: args.workers, defer_init: true, ..Options::default() };
+fn windowed(args: &Args, present: PresentMode) -> Result<(), Failure> {
+    use wrela_host::{Host, Options, Timing, window};
+    // A window's frames aren't timed or captured, and its screen goes HDR where its display can.
+    let options =
+        Options { timing: Timing::Off, capture: None, screen_hdr: false, ..options(args) };
     let mut host = Host::load_with(&args.dir, &options)?;
     let logging = args.log.is_some();
     host.want_hashes(logging || args.record.is_some());
     host.init()?;
-    let frames = (args.frames > 1).then_some(args.frames);
-    let script = read_script(args)?;
-    let arrive = read_script_at(args.arrive.as_ref())?;
+    let script = read_script(args.input.as_ref())?;
+    let arrive = read_script(args.arrive.as_ref())?;
     if arrive.iter().any(|s| !matches!(s.at, wrela_host::At::Frame(_))) {
         let e = "--arrive's events arrive at frames' times: a tick's record can't arrive";
         return Err(Failure::Host(wrela_host::Error::Program(e.into())));
@@ -521,7 +549,7 @@ fn windowed(args: &Args) -> Result<(), Failure> {
     // `--record` writes the ticks' records from the log, if the program has a ticker.
     let logging = logging || args.record.is_some();
     let run = window::WindowRun {
-        frames,
+        frames: args.frames,
         fps: args.fps,
         size: args.size,
         present,
@@ -625,7 +653,7 @@ fn windowed(args: &Args) -> Result<(), Failure> {
 }
 
 #[cfg(not(feature = "gpu"))]
-fn windowed(_: &Args) -> Result<(), Failure> {
+fn windowed(_: &Args, _: PresentMode) -> Result<(), Failure> {
     Err(Failure::Host(wrela_host::Error::Gpu(
         "this wrela-host was built without the `gpu` feature".into(),
     )))

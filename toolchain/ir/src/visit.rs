@@ -44,6 +44,11 @@ impl Place {
         }
     }
 
+    /// The local the place is the whole of, if it's one.
+    pub fn whole_local(&self) -> Option<LocalId> {
+        if self.path.is_empty() { self.root_local() } else { None }
+    }
+
     /// Whether the place's path has an element index (which a value gives, and which is
     /// checked on the CPU).
     pub fn has_index(&self) -> bool {
@@ -475,6 +480,17 @@ pub fn count_local_mentions(b: &Block, counts: &mut [u32]) {
             }
         })
     });
+}
+
+/// Each value's defining expression in `b` and the blocks nested in it.
+pub fn definitions(b: &[Stmt]) -> std::collections::HashMap<ValueId, &Expr> {
+    let mut defs = std::collections::HashMap::new();
+    walk(b, &mut |s| {
+        if let Stmt::Let(v, e) = s {
+            defs.insert(*v, e);
+        }
+    });
+    defs
 }
 
 /// Every function a block calls, in order, with repeats.

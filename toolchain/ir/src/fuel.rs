@@ -60,11 +60,11 @@ pub const FLAG: &str = "wrela_debug_flag";
 /// flag at `binding` to `code | FUEL_BIT`. `None` when every entry point's work is bounded within
 /// `fuel`: the module is left as it was.
 pub fn add_fuel(m: &mut Module, fuel: u64, binding: u32, code: u32) -> Option<Fuelled> {
-    let (each, _) = work::module_work(m);
+    let (each, totals) = work::work_and_loop_totals(m);
     if each.iter().all(|e| e.work.is_some_and(|w| w <= fuel)) {
         return None;
     }
-    let plan = plan(m, fuel);
+    let plan = plan(m, fuel, &totals);
     let vertex = vertex_reach(m);
     let u32_ty = m.types.u32();
     let bool_ty = m.types.bool();
@@ -148,37 +148,49 @@ pub fn add_fuel(m: &mut Module, fuel: u64, binding: u32, code: u32) -> Option<Fu
 
 /// Each loop of each function, by its function and its place in a walk of the function's body
 /// (a loop before the loops in it): `Some(charge)` for a loop charged each pass, `None` for a
-/// small one.
-fn plan(m: &Module, fuel: u64) -> HashMap<(usize, usize), Option<u64>> {
-    let totals = work::loop_totals(m);
+/// small one. `totals` is each loop's most work in all its passes (`work::work_and_loop_totals`).
+fn plan(
+    m: &Module,
+    fuel: u64,
+    totals: &HashMap<usize, Option<u64>>,
+) -> HashMap<(usize, usize), Option<u64>> {
     let small = fuel / SMALL_SHARE;
-    // Which loops are small: by their bodies' addresses, then by place.
+    // Each function's loops, by place.
+    let loops: Vec<Vec<Loop>> = m.functions.iter().map(|f| loops_of(&f.body)).collect();
+    // Which loops are small, by place.
     let mut is_small: HashMap<(usize, usize), u64> = HashMap::new();
-    for (i, f) in m.functions.iter().enumerate() {
-        let mut ord = 0;
-        each_loop(&f.body, &mut ord, &mut |ord, body, _| {
+    for (i, ls) in loops.iter().enumerate() {
+        for (ord, (body, _)) in ls.iter().enumerate() {
             if let Some(Some(t)) = totals.get(&(body.as_ptr() as usize))
                 && *t <= small
             {
                 is_small.insert((i, ord), *t);
             }
-        });
+        }
     }
     let mut costs = Costs { m, w: ExprWork::new(m), is_small: &is_small, calls: HashMap::new() };
     let mut plan = HashMap::new();
-    for (i, f) in m.functions.iter().enumerate() {
-        let mut loops = 0;
-        each_loop(&f.body, &mut loops, &mut |_, _, _| {});
-        for ord in 0..loops {
+    for (i, (f, ls)) in m.functions.iter().zip(&loops).enumerate() {
+        for (ord, &(body, continuing)) in ls.iter().enumerate() {
             let charge = if is_small.contains_key(&(i, ord)) {
                 None
             } else {
-                Some(costs.pass(i, f, ord).clamp(1, fuel.max(1)))
+                Some(costs.pass(i, f, ord, body, continuing).clamp(1, fuel.max(1)))
             };
             plan.insert((i, ord), charge);
         }
     }
     plan
+}
+
+/// A loop's body and continuing.
+type Loop<'a> = (&'a [Stmt], &'a [Stmt]);
+
+/// The loops in `b`, by place ([`each_loop`]'s).
+fn loops_of(b: &[Stmt]) -> Vec<Loop<'_>> {
+    let mut out = Vec::new();
+    each_loop(b, &mut 0, &mut |_, body, continuing| out.push((body, continuing)));
+    out
 }
 
 /// Calls `visit(place, body, continuing)` for each loop in `b`, a loop before the loops in it,
@@ -216,16 +228,15 @@ struct Costs<'a> {
 }
 
 impl Costs<'_> {
-    /// One pass of loop `ord` of function `func` (`f`): its body and its continuing.
-    fn pass(&mut self, func: usize, f: &Function, ord: usize) -> u64 {
-        let mut found = None;
-        let mut n = 0;
-        each_loop(&f.body, &mut n, &mut |o, body, continuing| {
-            if o == ord {
-                found = Some((body, continuing));
-            }
-        });
-        let Some((body, continuing)) = found else { return u64::MAX };
+    /// One pass of loop `ord` of function `func` (`f`): its `body` and its `continuing`.
+    fn pass(
+        &mut self,
+        func: usize,
+        f: &Function,
+        ord: usize,
+        body: &[Stmt],
+        continuing: &[Stmt],
+    ) -> u64 {
         // The places of the loops inside: they follow this one's in the walk.
         let mut inner = ord + 1;
         let a = self.block(func, f, body, &mut inner);
@@ -304,19 +315,11 @@ impl Costs<'_> {
 
 /// The functions a vertex entry point reaches (they can't write the flag).
 fn vertex_reach(m: &Module) -> HashSet<FuncId> {
-    let mut seen = HashSet::new();
-    let mut todo: Vec<FuncId> = m
-        .entry_points
+    m.entry_points
         .iter()
         .filter(|e| matches!(e.stage, Stage::Vertex { .. }))
-        .map(|e| e.function)
-        .collect();
-    while let Some(f) = todo.pop() {
-        if seen.insert(f) {
-            todo.extend(visit::calls(&m.functions[f.index()].body));
-        }
-    }
-    seen
+        .flat_map(|e| visit::reachable(m, e.function, &[]))
+        .collect()
 }
 
 /// `to = from`, both `u32` places, at the end of `out`.

@@ -68,10 +68,7 @@ mod trace;
 
 pub use error::{Error, Result};
 #[cfg(feature = "gpu")]
-pub use gpu::{
-    Counters, GpuTiming, adapter_report, frame_spans, keep_clocked, map_read, open_device,
-    read_timestamps,
-};
+pub use gpu::{Counters, GpuTiming, adapter_report, frame_spans, keep_clocked, open_device};
 pub use trace::{Phase, Trace, Traced};
 /// Build-time code's shared memory (constants, language.md §13), read and written by the
 /// build's thread while its helpers wait or have stopped.
@@ -459,6 +456,15 @@ pub struct Beside {
     pub code: CodeFor,
 }
 
+/// A new device for `build`, as `options` say.
+#[cfg(feature = "gpu")]
+fn gpu_for(build: &Build, options: &Options) -> Result<Gpu> {
+    let mut gpu =
+        Gpu::new(&build.manifest, &build.shaders, options.timing, options.report_pipelines)?;
+    gpu.allow_offscreen_hdr(options.screen_hdr);
+    Ok(gpu)
+}
+
 /// A loaded program, ready to run.
 #[cfg(feature = "gpu")]
 pub struct Host {
@@ -666,17 +672,10 @@ impl Host {
                 }
             }
         } else {
-            let mut executor = Gpu::new(
-                &build.manifest,
-                &build.shaders,
-                options.timing,
-                options.report_pipelines,
-            )?;
-            executor.allow_offscreen_hdr(options.screen_hdr);
             let mut program = Program::instantiate_with(
                 &build.compiled,
                 &build.manifest,
-                executor,
+                gpu_for(&build, options)?,
                 options.io(&build, dir),
                 options.record,
                 workers(options.workers),
@@ -760,13 +759,10 @@ impl Host {
     /// Starts `build`, in `dir`, on a new device; `hands_over` lets it hand over to other builds,
     /// and its fetches read through its directory's handle if it's driven.
     fn start(build: Build, dir: &Path, options: &Options, hands_over: bool) -> Result<Host> {
-        let mut gpu =
-            Gpu::new(&build.manifest, &build.shaders, options.timing, options.report_pipelines)?;
-        gpu.allow_offscreen_hdr(options.screen_hdr);
         let mut program = Program::instantiate_with(
             &build.compiled,
             &build.manifest,
-            gpu,
+            gpu_for(&build, options)?,
             options.io(&build, dir),
             options.record,
             workers(options.workers),
@@ -948,11 +944,9 @@ impl Host {
         start: std::time::Instant,
         script: Vec<Scripted>,
     ) -> Result<Option<paced::Ticker>> {
-        if self.p().ticker_hz().is_none() {
-            return Ok(None);
-        }
+        let Some(hz) = self.p().ticker_hz() else { return Ok(None) };
         let queued = self.p().take_records();
-        let (thread, hz) = self.p().take_ticker()?;
+        let thread = self.p().take_tick_thread()?;
         let program = self.p().serial();
         Ok(Some(paced::Ticker::start(thread, hz, program, start, script, queued)))
     }
@@ -977,7 +971,7 @@ impl Host {
 
     /// Tick `tick` trapped on a ticker on play's schedule: the program's failure.
     pub fn tick_failed(&mut self, tick: u32, trap: &wasmtime::Error) -> Error {
-        self.p().tick_failed(tick, trap)
+        self.p().tick_trapped(tick, trap)
     }
 
     /// The running program's number, the host's alone: it changes when another build takes
@@ -1789,13 +1783,13 @@ impl CpuHost {
 }
 
 /// `s` as a JSON string literal.
-#[cfg(feature = "gpu")]
-fn json_string(s: &str) -> String {
+pub(crate) fn json_string(s: &str) -> String {
     let mut out = String::from("\"");
     for c in s.chars() {
         match c {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
             c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
             c => out.push(c),
         }

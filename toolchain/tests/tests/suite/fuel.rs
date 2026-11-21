@@ -21,10 +21,7 @@ fn a_draw_is_charged_only_past_the_lines_work_or_unbounded_and_named_between() {
         let (fuel, line) = (limits.lane_idle_work(), limits.lane_line_work());
         assert_eq!(limits.lane_fuel(), line, "a charged lane's ceiling is an uncounted one's");
         let built = wrela_tests::build_for(&pkg, target).expect("builds");
-        let manifest = wrela_abi::Manifest::parse(&String::from_utf8_lossy(
-            &built.files.iter().find(|(n, _)| n == "manifest.json").expect("a manifest").1,
-        ))
-        .expect("valid");
+        let manifest = wrela_tests::built_manifest(&built);
         let named = |name: &str| {
             built.diagnostics.iter().any(|d| {
                 d.code == wrela_diag::codes::W0016 && d.message.contains(&format!("`{name}`"))
