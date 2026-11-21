@@ -19,7 +19,11 @@ use mesh::light::{
     Emitter, NEAR, RadGrid, RadianceCache, SHADOW_SIDE, ShadowView, SkyCache, clip_of,
     cone_indirect, contact_shadow, decode_substance, encode_mat_signed, eval_emitters_tiled,
     radiance_cache, shadow_view, sky_background, sky_cache, sky_irradiance, sky_specular,
-    spec_cone, sun_shadow_csm, sun_vis_point, trace_ssr,
+    spec_cone, sun_shadow_hybrid, sun_vis_point, trace_ssr,
+}
+use mesh::sdf::{
+    SdfClipmap, SdfGrid, multi_bounce_ao, sdf_bent_ao, sdf_clipmap, sdf_curvature, sdf_grid,
+    sdf_thickness,
 }
 use mesh::swarm::{SwarmSim, swarm_fs, swarm_shadow_vs, swarm_sim, swarm_vs}
 use mesh::volume::{
@@ -33,7 +37,7 @@ use std::collections::Vec
 use std::field::{Field, Rigid}
 use std::gpu::{
     Address, ClipPosition, Compare, ComparisonSampler, Cull, Depth, DepthBias, DepthOnlyPass,
-    DepthPass, DepthTexture, Filter, FragCoord, InstanceIndex, MsaaDepthPass3, R8, Rgba8,
+    DepthPass, DepthTexture, Filter, FragCoord, InstanceIndex, MsaaDepthPass3, R8, R16Float, Rgba8,
     Rgba16Float, Rgba32Float, Sampler, Targets2, Targets3, Texture, Texture3d, VertexIndex,
     begin_depth_pass, begin_pass, begin_pass2, begin_pass3, begin_pass3_msaa_with_depth,
     begin_pass_with_depth, comparison_sampler, copy_texture, depth_texture, discard, draw, label,
@@ -41,8 +45,8 @@ use std::gpu::{
 }
 use std::hash::{Hasher, StateHash}
 
-/// Near shadow cascade half-extent (m): gives ~9 mm shadow texels around the camera/combat focus.
-const NEAR_CASCADE_RAD: f32 = 9.5
+/// Camera-focused clipmap / radiance focus distance (m).
+const FOCUS_RAD: f32 = 9.5
 
 /// Default maximum active surface bricks per batch.
 const BATCH_BRICKS: u32 = 8192
@@ -279,17 +283,18 @@ fn decode_gbuf_normal(gn: vec4, inv_c: f32, fallback: vec3) -> vec3 {
 }
 
 /// Shared pixel-rate direct lighting core used identically by both `draw_scene` (`deferred_direct_fs`)
-/// and `drawn_only` (`deferred_direct_judge_fs`): evaluates dual-cascade rotated-PCF sun lighting +
-/// tiled dynamic emitters ONCE per screen pixel (zero micro-triangle quad overshading).
-@budget(work: 36000)
+/// and `drawn_only` (`deferred_direct_judge_fs`): evaluates exact SDF variable-width soft shadows +
+/// analytical curvature weathering + thickness-modulated backlit SSS + tiled SDF-shadowed local
+/// emitters ONCE per screen pixel (zero micro-triangle quad overshading).
+@budget(work: 48000)
 fn shade_direct_pixel<S: Sky>(
     px: u32,
     py: u32,
     pixel_xy: vec2,
     v: View,
-    sv_near: ShadowView,
-    sv_far: ShadowView,
+    sv: ShadowView,
     rad_grid: RadGrid,
+    sdf_grid: SdfGrid,
     sky: S,
     g_normal: Texture<Rgba8>,
     g_albedo: Texture<Rgba8>,
@@ -297,12 +302,14 @@ fn shade_direct_pixel<S: Sky>(
     depth: DepthTexture,
     sky_spec0: Texture<Rgba16Float>,
     sky_s: Sampler,
-    sm_near: DepthTexture,
-    sm_far: DepthTexture,
+    shadow_map: DepthTexture,
     cmp: ComparisonSampler,
     rad0: Texture3d<Rgba16Float>,
     rad1: Texture3d<Rgba16Float>,
     rad_s: Sampler,
+    sdf0: Texture3d<R16Float>,
+    sdf1: Texture3d<R16Float>,
+    sdf_s: Sampler,
     emitters: [Emitter],
     tile_masks: [u32],
     tiles_x: u32,
@@ -323,22 +330,47 @@ fn shade_direct_pixel<S: Sky>(
     let n = decode_gbuf_normal(gn, inv_c, -ray)
     let ga = g_albedo.load(px, py)
     let ge = g_emits.load(px, py)
-    let sub = decode_substance(ga.xyz * inv_c, ga.w * inv_c, ge.xyz * inv_c, ge.w * inv_c)
+    let mat_code = ge.w * inv_c
+    var sub = decode_substance(ga.xyz * inv_c, ga.w * inv_c, ge.xyz * inv_c, mat_code)
 
     let dist = reconstruct_pixel_dist(v, ray, n, ndc_z, depth_xy)
     let wp = v.at + ray * dist
     let ray_back = -ray
 
+    // Universal world-space analytical curvature weathering (`∇²d` from 3D SDF clipmap):
+    // convex bevels/edges subtly polish & catch light; concave crevices darken & roughen.
+    if sdf_grid.enabled != 0 && abs(mat_code) >= 0.01 && max(sub.emits.x, max(sub.emits.y, sub.emits.z)) < 0.25 {
+        let curv = sdf_curvature(sdf_grid, sdf0, sdf1, sdf_s, wp)
+        let convex = clamp(curv, 0.0, 1.0)
+        let concave = clamp(-curv, 0.0, 1.0)
+        let wear_a = 1.0 + convex * 0.14 - concave * 0.26
+        let wear_r = clamp(sub.roughness - convex * 0.06 + concave * 0.10, 0.03, 1.0)
+        sub = Substance {
+            albedo: clamp(sub.albedo * wear_a, vec3(0.005), vec3(1.0)),
+            roughness: wear_r,
+            ..sub
+        }
+    }
+
     let sun = sky.sun()
     let ndl = max(dot(n, sun.way), 0.0)
     let vis = if ndl > 0.0 {
-        sun_shadow_csm(sm_near, sm_far, cmp, sv_near, sv_far, wp, n, pixel_xy)
+        sun_shadow_hybrid(shadow_map, cmp, sv, sdf_grid, sdf0, sdf1, sdf_s, wp, n, pixel_xy)
     } else {
         0.0
     }
-    let direct_sun = sub.shade_direct(n, sun.way, ray_back, sun.light * vis)
+    var direct_sun = sub.shade_direct(n, sun.way, ray_back, sun.light * vis)
+    // Exact interior thickness backlit Subsurface Scattering (SSS) via 2-tap 3D SDF thickness.
+    if sub.subsurface > 0.01 && sdf_grid.enabled != 0 {
+        let thick = sdf_thickness(sdf_grid, sdf0, sdf1, sdf_s, wp, n, sun.way)
+        let trans = exp(-thick * 3.8)
+        let back = pow(clamp(dot(ray_back, normalize(-sun.way + n * 0.35)), 0.0, 1.0), 3.0)
+        let sss_tint = sub.albedo * sqrt(max(sub.albedo, vec3(0.02)))
+        direct_sun += sss_tint * sun.light * (sub.subsurface * trans * (0.25 + 0.75 * back) * ONE_OVER_PI)
+    }
     let local_light = eval_emitters_tiled(
-        sub, wp, n, ray_back, rad_grid, rad0, rad1, rad_s, emitters, tile_masks, tiles_x, px, py,
+        sub, wp, n, ray_back, rad_grid, rad0, rad1, rad_s, sdf_grid, sdf0, sdf1, sdf_s,
+        emitters, tile_masks, tiles_x, px, py,
     )
     let direct = sub.emits + direct_sun + local_light
     (vec4(direct, min(dist, 65000.0)), vec4(n, dist), vis)
@@ -346,13 +378,13 @@ fn shade_direct_pixel<S: Sky>(
 
 /// Full-resolution 1× pixel-rate deferred direct lighting pass (`draw_scene`).
 @fragment
-@budget(work: 38000)
+@budget(work: 50000)
 fn deferred_direct_fs<S: Sky>(
     pixel: FragCoord,
     v: View,
-    sv_near: ShadowView,
-    sv_far: ShadowView,
+    sv: ShadowView,
     rad_grid: RadGrid,
+    sdf_grid: SdfGrid,
     sky: S,
     g_normal: Texture<Rgba8>,
     g_albedo: Texture<Rgba8>,
@@ -360,12 +392,14 @@ fn deferred_direct_fs<S: Sky>(
     depth: DepthTexture,
     sky_spec0: Texture<Rgba16Float>,
     sky_s: Sampler,
-    sm_near: DepthTexture,
-    sm_far: DepthTexture,
+    shadow_map: DepthTexture,
     cmp: ComparisonSampler,
     rad0: Texture3d<Rgba16Float>,
     rad1: Texture3d<Rgba16Float>,
     rad_s: Sampler,
+    sdf0: Texture3d<R16Float>,
+    sdf1: Texture3d<R16Float>,
+    sdf_s: Sampler,
     emitters: [Emitter],
     tile_masks: [u32],
     tiles_x: u32,
@@ -375,9 +409,10 @@ fn deferred_direct_fs<S: Sky>(
     let px = min(u32(pixel.position.x), full_w - 1)
     let py = min(u32(pixel.position.y), full_h - 1)
     let (hdr_d, _place, _vis) = shade_direct_pixel(
-        px, py, pixel.position.xy, v, sv_near, sv_far, rad_grid, sky,
+        px, py, pixel.position.xy, v, sv, rad_grid, sdf_grid, sky,
         g_normal, g_albedo, g_emits, depth, sky_spec0, sky_s,
-        sm_near, sm_far, cmp, rad0, rad1, rad_s, emitters, tile_masks, tiles_x, full_w, full_h,
+        shadow_map, cmp, rad0, rad1, rad_s, sdf0, sdf1, sdf_s,
+        emitters, tile_masks, tiles_x, full_w, full_h,
     )
     hdr_d
 }
@@ -385,13 +420,13 @@ fn deferred_direct_fs<S: Sky>(
 /// Identical pixel-rate deferred direct pass with `(place, sun)` diagnostic outputs for `drawn_only`
 /// so the judges and hole audit verify the exact same renderer that draws the game.
 @fragment
-@budget(work: 38000)
+@budget(work: 50000)
 fn deferred_direct_judge_fs<S: Sky>(
     pixel: FragCoord,
     v: View,
-    sv_near: ShadowView,
-    sv_far: ShadowView,
+    sv: ShadowView,
     rad_grid: RadGrid,
+    sdf_grid: SdfGrid,
     sky: S,
     g_normal: Texture<Rgba8>,
     g_albedo: Texture<Rgba8>,
@@ -399,12 +434,14 @@ fn deferred_direct_judge_fs<S: Sky>(
     depth: DepthTexture,
     sky_spec0: Texture<Rgba16Float>,
     sky_s: Sampler,
-    sm_near: DepthTexture,
-    sm_far: DepthTexture,
+    shadow_map: DepthTexture,
     cmp: ComparisonSampler,
     rad0: Texture3d<Rgba16Float>,
     rad1: Texture3d<Rgba16Float>,
     rad_s: Sampler,
+    sdf0: Texture3d<R16Float>,
+    sdf1: Texture3d<R16Float>,
+    sdf_s: Sampler,
     emitters: [Emitter],
     tile_masks: [u32],
     tiles_x: u32,
@@ -414,23 +451,25 @@ fn deferred_direct_judge_fs<S: Sky>(
     let px = min(u32(pixel.position.x), full_w - 1)
     let py = min(u32(pixel.position.y), full_h - 1)
     let (hdr_d, place, vis) = shade_direct_pixel(
-        px, py, pixel.position.xy, v, sv_near, sv_far, rad_grid, sky,
+        px, py, pixel.position.xy, v, sv, rad_grid, sdf_grid, sky,
         g_normal, g_albedo, g_emits, depth, sky_spec0, sky_s,
-        sm_near, sm_far, cmp, rad0, rad1, rad_s, emitters, tile_masks, tiles_x, full_w, full_h,
+        shadow_map, cmp, rad0, rad1, rad_s, sdf0, sdf1, sdf_s,
+        emitters, tile_masks, tiles_x, full_w, full_h,
     )
     Targets3 { first: hdr_d, second: place, third: vis }
 }
 
-/// Half-resolution (`W/2 × H/2`) indirect lighting pass: computes 4-cone hemisphere diffuse GI
-/// (`first = vec4(bounce_irrad, sky_vis)`), Screen-Space Specular Reflections (SSR) seamlessly
-/// falling back to `spec_cone` + `sky_specular` PMREM (`second.rgb`), and screen-space micro-contact
-/// shadow visibility (`second.w`). Runs at 1/4 the pixels of full-res with zero sky work.
+/// Half-resolution (`W/2 × H/2`) indirect lighting pass: computes 4-cone hemisphere diffuse GI +
+/// multi-scale 3D SDF bent-normal AO (`first = vec4(bounce + bent_sky_shift, ao)`), Screen-Space
+/// Specular Reflections (SSR) seamlessly falling back to SDF-accelerated `spec_cone` + `sky_specular`
+/// PMREM (`second.rgb`), and screen-space micro-contact shadow visibility (`second.w`).
 @fragment
-@budget(work: 8000)
+@budget(work: 12000)
 fn indirect_half_fs<S: Sky>(
     pixel: FragCoord,
     v: View,
     rad_grid: RadGrid,
+    sdf_grid: SdfGrid,
     sky: S,
     hdr_direct: Texture<Rgba16Float>,
     g_normal: Texture<Rgba8>,
@@ -447,6 +486,9 @@ fn indirect_half_fs<S: Sky>(
     rad1: Texture3d<Rgba16Float>,
     rad2: Texture3d<Rgba16Float>,
     rad_s: Sampler,
+    sdf0: Texture3d<R16Float>,
+    sdf1: Texture3d<R16Float>,
+    sdf_s: Sampler,
     full_w: u32,
     full_h: u32,
 ) -> Targets2<vec4, vec4> {
@@ -475,17 +517,30 @@ fn indirect_half_fs<S: Sky>(
     let roughness = clamp(g_albedo.load(fx, fy).w * inv_c, 0.02, 1.0)
     let mat_code = g_emits.load(fx, fy).w * inv_c
 
-    let ind = cone_indirect(rad_grid, rad0, rad1, rad2, rad_s, wp, n)
+    let ind0 = cone_indirect(rad_grid, rad0, rad1, rad2, rad_s, wp, n)
+    var ind = ind0
+    if sdf_grid.enabled != 0 {
+        let bao = sdf_bent_ao(sdf_grid, sdf0, sdf1, sdf_s, wp, n)
+        let ao = clamp(min(ind0.w, bao.w), 0.08, 1.0)
+        // Bent-normal sky tint shift steers crevice ambient toward the unoccluded sky opening
+        // while keeping full-res normal detail in `combine_indirect_fs`.
+        let sky_bent = sky_irradiance(sky_diff, sky_s, bao.xyz)
+        let sky_n = sky_irradiance(sky_diff, sky_s, n)
+        let bent_shift = (sky_bent - sky_n) * (ao * 0.75)
+        ind = vec4(max(ind0.xyz + bent_shift, vec3(0.0)), ao)
+    }
     let cshad = if rad_grid.enabled != 0 { contact_shadow(v, depth, wp, n, sky.sun().way) } else { 1.0 }
 
-    // Skip specular SSR & voxel reflection cone completely on pure matte surfaces (`abs(mat_code) < 0.01`).
+    // Skip specular SSR & voxel/SDF reflection cone completely on pure matte surfaces (`abs(mat_code) < 0.01`).
     var env_spec = vec3(0.0)
     if abs(mat_code) >= 0.01 {
         let ray_back = -ray
         let refl = normalize(n * (2.0 * dot(n, ray_back)) - ray_back)
-        let eff_r = if mat_code > 0.15 { min(roughness, 0.12) } else { roughness }
+        let eff_r = if mat_code > 0.15 && mat_code < 1.8 { min(roughness, 0.12) } else { roughness }
         let sky_refl = sky_specular(sky_spec0, sky_spec1, sky_spec2, sky_diff, sky_s, refl, eff_r)
-        let w_refl = spec_cone(rad_grid, rad0, rad1, rad2, rad_s, wp, n, refl, eff_r)
+        let w_refl = spec_cone(
+            rad_grid, rad0, rad1, rad2, rad_s, sdf_grid, sdf0, sdf1, sdf_s, wp, n, refl, eff_r,
+        )
         let spec_occ = clamp(ind.w + (1.0 - eff_r) * 0.25, 0.15, 1.0)
         let fallback = w_refl.xyz + sky_refl * (1.0 - w_refl.w * 0.85) * spec_occ
         let ssr = trace_ssr(v, hdr_direct, bg_s, wp, n, refl, eff_r)
@@ -573,14 +628,14 @@ fn combine_indirect_fs<S: Sky>(
     let cshad = if emit_luma < 0.5 && dot(n, sky.sun().way) > 0.05 { spec_c.w } else { 1.0 }
     var rad = direct_d.xyz * cshad
 
-    let sky_amb = sky_irradiance(sky_diff, sky_s, n) * ind.w + ind.xyz
+    let sky_amb = sky_irradiance(sky_diff, sky_s, n) * multi_bounce_ao(ind.w, albedo) + ind.xyz
     if abs(mat_code) < 0.01 {
         rad += albedo * ONE_OVER_PI * sky_amb
     } else {
         let ray_back = -ray
         let ndv = max(dot(n, ray_back), 0.001)
         let metallic = if mat_code < -0.01 { clamp(-mat_code, 0.0, 1.0) } else { 0.0 }
-        let coat = if mat_code > 0.03 { clamp(mat_code - 0.02, 0.0, 1.0) } else { 0.0 }
+        let coat = if mat_code > 0.03 && mat_code < 1.8 { clamp(mat_code - 0.02, 0.0, 1.0) } else { 0.0 }
         let f0 = mix(vec3(0.04), albedo, metallic)
         let f_env = fresnel_schlick_rough(f0, ndv, roughness)
         let kd = (vec3(1.0) - f_env) * (1.0 - metallic)
@@ -604,25 +659,29 @@ fn combine_indirect_fs<S: Sky>(
 /// absorption (`hdr_bg.w - dist`), rough frosted-glass sampling, real-time SSR + Sky PMREM +
 /// radiance-cone reflection, and crisp GGX specular from sun & tiled dynamic spell emitters.
 @fragment
-@budget(work: 36000)
+@budget(work: 40000)
 fn mesh_trans_fs<S: Sky>(
     pixel: FragCoord,
     vary: MeshVary,
     v: View,
-    sv_far: ShadowView,
+    sv: ShadowView,
     rad_grid: RadGrid,
+    sdf_grid: SdfGrid,
     sky: S,
     sky_diff: Texture<Rgba16Float>,
     sky_spec0: Texture<Rgba16Float>,
     sky_spec1: Texture<Rgba16Float>,
     sky_spec2: Texture<Rgba16Float>,
     sky_s: Sampler,
-    sm_far: DepthTexture,
+    shadow_map: DepthTexture,
     cmp: ComparisonSampler,
     rad0: Texture3d<Rgba16Float>,
     rad1: Texture3d<Rgba16Float>,
     rad2: Texture3d<Rgba16Float>,
     rad_s: Sampler,
+    sdf0: Texture3d<R16Float>,
+    sdf1: Texture3d<R16Float>,
+    sdf_s: Sampler,
     emitters: [Emitter],
     tile_masks: [u32],
     tiles_x: u32,
@@ -682,16 +741,18 @@ fn mesh_trans_fs<S: Sky>(
     let sun = sky.sun()
     let ndl = max(dot(n, sun.way), 0.0)
     // Fast single-tap shadow on wavy transmissive water/glass (saves 7 shadow taps/px at 1080p).
-    let vis = if ndl > 0.0 { sun_vis_point(sm_far, cmp, sv_far, vary.wp) } else { 0.0 }
+    let vis = if ndl > 0.0 { sun_vis_point(shadow_map, cmp, sv, vary.wp) } else { 0.0 }
     let sky_amb = sky_irradiance(sky_diff, sky_s, n)
     let deep_scatter = sub.albedo * (vec3(1.0) - beer) * ONE_OVER_PI * (sun.light * (0.25 * vis + 0.1) + sky_amb * 0.45)
 
-    // Real-time SSR over lit opaque world (`hdr_bg`), falling back seamlessly to `spec_cone` + Sky PMREM.
+    // Real-time SSR over lit opaque world (`hdr_bg`), falling back seamlessly to SDF `spec_cone` + Sky PMREM.
     let refl = normalize(n * (2.0 * ndv) - ray_back)
     let f0 = sub.f0()
     let f_env = fresnel_schlick_rough(f0, ndv, sub.roughness)
     let sky_refl = sky_specular(sky_spec0, sky_spec1, sky_spec2, sky_diff, sky_s, refl, sub.roughness)
-    let w_refl = spec_cone(rad_grid, rad0, rad1, rad2, rad_s, vary.wp, n, refl, sub.roughness)
+    let w_refl = spec_cone(
+        rad_grid, rad0, rad1, rad2, rad_s, sdf_grid, sdf0, sdf1, sdf_s, vary.wp, n, refl, sub.roughness,
+    )
     let fallback = w_refl.xyz + sky_refl * (1.0 - w_refl.w * 0.85)
     let ssr = trace_ssr(v, hdr_bg, bg_s, vary.wp, n, refl, sub.roughness)
     let env_spec = mix(fallback, ssr.xyz, vec3(ssr.w))
@@ -700,7 +761,8 @@ fn mesh_trans_fs<S: Sky>(
     let px = u32(max(pixel.position.x, 0.0))
     let py = u32(max(pixel.position.y, 0.0))
     let local_spec = eval_emitters_tiled(
-        sub, vary.wp, n, ray_back, rad_grid, rad0, rad1, rad_s, emitters, tile_masks, tiles_x, px, py,
+        sub, vary.wp, n, ray_back, rad_grid, rad0, rad1, rad_s, sdf_grid, sdf0, sdf1, sdf_s,
+        emitters, tile_masks, tiles_x, px, py,
     )
 
     let tr = sub.transmission
@@ -733,10 +795,19 @@ fn cell_for_share(c: vec3, r: f32, bricks_for_this: f32, v: View) -> f32 {
     clamp(max(px * mult, by_budget), 0.006, 0.25)
 }
 
-/// Any world (`One`, `Many`, `And`) that can sync its GPU meshlet batches.
+/// Any world (`One`, `Many`, `And`) that can sync its GPU meshlet batches and splat its opaque
+/// geometry into the unified 2-cascade 3D SDF clipmap.
 pub trait MeshWorld: Copy {
     fn batch_count(self) -> u32
     fn sync_batches(self, scratch: mut ExtractScratch, batches: mut Vec<MeshBatch>, first: u32, v: View, frame: u32)
+    fn splat_sdf(
+        self,
+        sdf: mut SdfClipmap,
+        batches: mut Vec<MeshBatch>,
+        first: u32,
+        static_only: bool,
+        all_batches: bool,
+    )
 }
 
 impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for One<M> {
@@ -748,6 +819,24 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for One<M> {
         let b = self.field.bound()
         let cell = cell_for_one(b.centre, min(b.radius, 1.0e4), v, steep(self.field))
         batches[first].sync_one(mut scratch, self.field, cell)
+    }
+
+    fn splat_sdf(
+        self,
+        sdf: mut SdfClipmap,
+        batches: mut Vec<MeshBatch>,
+        first: u32,
+        static_only: bool,
+        all_batches: bool,
+    ) {
+        if !batches[first].has_opaque {
+            return
+        }
+        let is_static = batches[first].still_frames >= 1
+        if !all_batches && is_static != static_only {
+            return
+        }
+        sdf.splat_one(self.field, batches[first].bound, to_static: !all_batches && static_only)
     }
 }
 
@@ -857,6 +946,29 @@ impl<M: Field<Substance> + StateHash + GpuData, const N: u32> MeshWorld for Many
             batches[first + 2].still_frames += 1
         }
     }
+
+    fn splat_sdf(
+        self,
+        sdf: mut SdfClipmap,
+        batches: mut Vec<MeshBatch>,
+        first: u32,
+        static_only: bool,
+        all_batches: bool,
+    ) {
+        let any_opaque = batches[first].has_opaque || (N >= 16 && (batches[first + 1].has_opaque || batches[first + 2].has_opaque))
+        if !any_opaque {
+            return
+        }
+        let is_static = if N < 16 {
+            batches[first].still_frames >= 1
+        } else {
+            batches[first].still_frames >= 1 && batches[first + 1].still_frames >= 1 && batches[first + 2].still_frames >= 1
+        }
+        if !all_batches && is_static != static_only {
+            return
+        }
+        sdf.splat_many(self.fields, to_static: !all_batches && static_only)
+    }
 }
 
 impl<A: MeshWorld, B: MeshWorld> MeshWorld for And<A, B> {
@@ -869,11 +981,25 @@ impl<A: MeshWorld, B: MeshWorld> MeshWorld for And<A, B> {
         self.a.sync_batches(mut scratch, mut batches, first, v, frame)
         self.b.sync_batches(mut scratch, mut batches, first + na, v, frame)
     }
+
+    fn splat_sdf(
+        self,
+        sdf: mut SdfClipmap,
+        batches: mut Vec<MeshBatch>,
+        first: u32,
+        static_only: bool,
+        all_batches: bool,
+    ) {
+        let na = self.a.batch_count()
+        self.a.splat_sdf(mut sdf, mut batches, first, static_only, all_batches)
+        self.b.splat_sdf(mut sdf, mut batches, first + na, static_only, all_batches)
+    }
 }
 
-/// Complete meshlet renderer state: owns extracted batches, dual-cascade shadow maps, GPU Sky
-/// PMREM cache, camera-focused radiance cache + auto-extracted dynamic emitters, MSAA G-buffer +
-/// half-res bilateral GI/SSR buffers, volumetric froxels, optical HDR bloom pyramid, and `Picture`.
+/// Complete meshlet renderer state: owns extracted batches, unified sun shadow map + 2-cascade
+/// 3D SDF clipmap, GPU Sky PMREM cache, camera-focused radiance cache + auto-extracted dynamic
+/// emitters, MSAA G-buffer + half-res bilateral GI/SSR buffers, volumetric froxels, optical HDR
+/// bloom pyramid, and `Picture`.
 pub struct MeshSight {
     pub drawn: Picture,
     pub hdr_direct: Texture<Rgba16Float>,
@@ -887,14 +1013,14 @@ pub struct MeshSight {
     pub depth: DepthTexture,
     pub sky: SkyCache,
     pub rad: RadianceCache,
+    pub sdf: SdfClipmap,
     pub vol: FroxelVolume,
     pub bloom: BloomPyramid,
     pub swarm: SwarmSim,
     scratch: ExtractScratch,
     clipmap: ClipmapMesh,
     batches: Vec<MeshBatch>,
-    shadow_near: DepthTexture,
-    shadow_far: DepthTexture,
+    shadow_map: DepthTexture,
     cmp: ComparisonSampler,
     bg_s: Sampler,
     rad_key: u64,
@@ -903,9 +1029,10 @@ pub struct MeshSight {
     pub gi: bool,
 }
 
-/// Creates a fresh `MeshSight` with 4× MSAA premultiplied G-buffer, pixel-rate deferred direct
-/// lighting, 16×16 tiled dynamic emitters, dual-cascade rotated-PCF shadows, half-res bilateral
-/// GI + SSR + contact shadows, refraction, froxel volumetrics, and optical HDR bloom.
+/// Creates a fresh `MeshSight` with 2-cascade 3D SDF clipmap (soft shadows, bent-normal AO,
+/// thickness SSS, curvature weathering, 1-tap swarm broad-phase), premultiplied G-buffer,
+/// pixel-rate deferred direct lighting, 16×16 tiled dynamic emitters, half-res bilateral GI + SSR,
+/// refraction, froxel volumetrics, and optical HDR bloom.
 pub fn mesh_sight(gi: bool = true) -> MeshSight {
     MeshSight {
         drawn: picture(width: 1, height: 1),
@@ -920,14 +1047,14 @@ pub fn mesh_sight(gi: bool = true) -> MeshSight {
         depth: depth_texture(width: 1, height: 1),
         sky: sky_cache(),
         rad: radiance_cache(),
+        sdf: sdf_clipmap(),
         vol: froxel_volume(),
         bloom: bloom_pyramid(),
         swarm: swarm_sim(),
         scratch: extract_scratch(BATCH_BRICKS),
         clipmap: clipmap_mesh(),
         batches: Vec::new(),
-        shadow_near: depth_texture(width: SHADOW_SIDE, height: SHADOW_SIDE),
-        shadow_far: depth_texture(width: SHADOW_SIDE, height: SHADOW_SIDE),
+        shadow_map: depth_texture(width: SHADOW_SIDE, height: SHADOW_SIDE),
         cmp: comparison_sampler(compare: Compare::LessEqual),
         bg_s: sampler(filter: Filter::Linear, address: Address::Clamp),
         rad_key: 0,
@@ -962,8 +1089,9 @@ impl MeshSight {
         }
     }
 
-    /// Updates Sky PMREM, syncs meshlets, steps `swarm` against `world.field()`, renders
-    /// dual-cascade sun shadows, and updates the camera-focused radiance volume & dynamic emitters.
+    /// Updates Sky PMREM, syncs meshlets, builds/updates the 2-cascade 3D SDF clipmap, steps
+    /// `swarm` accelerated by the SDF clipmap, renders the unified sun shadow map, and updates
+    /// the camera-focused radiance volume & dynamic emitters.
     fn prepare_and_shadow<W: World + MeshWorld, Sw: Swarm, S: Sky>(
         mut self,
         world: W,
@@ -973,7 +1101,7 @@ impl MeshSight {
         width: u32,
         height: u32,
         frame: u32,
-    ) -> (u32, View, ShadowView, ShadowView) {
+    ) -> (u32, View, ShadowView) {
         self.resize(width, height)
         let v = view(eye, width: width, height: height)
 
@@ -982,14 +1110,23 @@ impl MeshSight {
         let nb = world.batch_count()
         self.ensure_batches(nb)
         world.sync_batches(mut self.scratch, mut self.batches, 0, v, frame)
-        self.swarm.update(swarm, world.field())
 
         var wlo = vec3(1.0e20)
         var whi = vec3(-1.0e20)
         var rk = Hasher::new()
+        var sdf_fk = Hasher::new()
+        var static_opaque_count: u32 = 0
         for i in 0..nb {
+            self.batches[i].finish_poll()
             let b = self.batches[i].bound
             self.batches[i].hash.state_hash(mut rk)
+            if self.batches[i].has_opaque {
+                i.state_hash(mut sdf_fk)
+                self.batches[i].hash.state_hash(mut sdf_fk)
+                if self.batches[i].still_frames >= 1 {
+                    static_opaque_count += 1
+                }
+            }
             if b.w > 0.0 {
                 wlo = min(wlo, b.xyz - vec3(b.w))
                 whi = max(whi, b.xyz + vec3(b.w))
@@ -998,27 +1135,67 @@ impl MeshSight {
         let wmid = 0.5 * (wlo + whi)
         let wrad = if whi.x > wlo.x { 0.5 * length(whi - wlo) } else { 10.0 }
         let sun = sky.sun()
-        let sv_far = shadow_view(wmid, wrad, sun.way)
+        let sv = shadow_view(wmid, wrad, sun.way)
 
-        // Focus near shadow cascade + radiance volume around camera look target (clamped to world).
-        let focus_raw = v.at + v.forward * min(NEAR_CASCADE_RAD * 0.75, wrad * 0.65)
+        // Focus near SDF cascade + radiance volume around camera look target (clamped to world).
+        let focus_raw = v.at + v.forward * min(FOCUS_RAD * 0.75, wrad * 0.65)
         let focus = clamp(focus_raw, wlo, whi)
-        let use_near = wrad > NEAR_CASCADE_RAD * 1.15
-        let sv_near = if use_near {
-            shadow_view(focus, NEAR_CASCADE_RAD, sun.way)
+
+        // Pass 0b: Sparse 2-cascade 3D SDF clipmap (`96³` near + `64³` world, static/dynamic split).
+        // Runs BEFORE `swarm.update` so grain physics uses 1-tap hardware SDF broad-phase culling.
+        if !self.gi {
+            self.sdf.disable(focus, wmid, wrad)
         } else {
-            ShadowView { radius: -1.0, ..sv_far }
+            let sg = sdf_grid(focus, wmid, wrad, enabled: true)
+            sg.o0.state_hash(mut sdf_fk)
+            sg.v0.state_hash(mut sdf_fk)
+            sg.o1.state_hash(mut sdf_fk)
+            sg.v1.state_hash(mut sdf_fk)
+            let full_sdf_key = sdf_fk.finish()
+            if !self.sdf.full_valid || self.sdf.full_key != full_sdf_key {
+                if static_opaque_count > 0 {
+                    var ssk = Hasher::new()
+                    sg.o0.state_hash(mut ssk)
+                    sg.v0.state_hash(mut ssk)
+                    sg.o1.state_hash(mut ssk)
+                    sg.v1.state_hash(mut ssk)
+                    for i in 0..nb {
+                        if self.batches[i].has_opaque && self.batches[i].still_frames >= 1 {
+                            i.state_hash(mut ssk)
+                            self.batches[i].hash.state_hash(mut ssk)
+                        }
+                    }
+                    let skey = ssk.finish()
+                    if !self.sdf.static_valid || self.sdf.static_key != skey {
+                        self.sdf.begin_static(sg)
+                        world.splat_sdf(mut self.sdf, mut self.batches, 0, static_only: true, all_batches: false)
+                        self.sdf.static_key = skey
+                        self.sdf.static_valid = true
+                    }
+                    self.sdf.begin_from_static(sg)
+                    world.splat_sdf(mut self.sdf, mut self.batches, 0, static_only: false, all_batches: false)
+                } else {
+                    self.sdf.begin_all(sg)
+                    world.splat_sdf(mut self.sdf, mut self.batches, 0, static_only: false, all_batches: true)
+                }
+                self.sdf.finish()
+                self.sdf.full_key = full_sdf_key
+                self.sdf.full_valid = true
+            } else {
+                self.sdf.grid = sg
+            }
         }
 
-        // Pass 1: Unified sun shadow map (far world cascade + high-res near cascade + swarm shadows).
+        self.swarm.update(swarm, world.field(), self.sdf.grid, self.sdf.sdf0, self.sdf.sdf1, self.sdf.s)
+
+        // Pass 1: Unified sun shadow map (one `2048²` world map paired with exact 3D SDF cone penumbra).
         label("mesh_shadow")
-        let sp_far: DepthOnlyPass = begin_depth_pass(mut self.shadow_far, clear_depth: 1.0, keep_depth: false)
+        let sp: DepthOnlyPass = begin_depth_pass(mut self.shadow_map, clear_depth: 1.0, keep_depth: false)
         for i in 0..nb {
-            self.batches[i].finish_poll()
             if self.batches[i].has_opaque {
                 draw(
-                    sp_far,
-                    shadow_vs.bind(verts: self.batches[i].verts.items(), xforms: self.batches[i].xforms.items(), sv: sv_far),
+                    sp,
+                    shadow_vs.bind(verts: self.batches[i].verts.items(), xforms: self.batches[i].xforms.items(), sv: sv),
                     shadow_fs,
                     indices: self.batches[i].indices,
                     indirect: self.batches[i].draw_args,
@@ -1030,48 +1207,15 @@ impl MeshSight {
         }
         if self.swarm.count > 0 {
             draw(
-                sp_far,
-                swarm_shadow_vs.bind(grains: self.swarm.front(), sv: sv_far),
+                sp,
+                swarm_shadow_vs.bind(grains: self.swarm.front(), sv: sv),
                 shadow_fs,
                 vertices: 6,
                 instances: self.swarm.count,
                 depth: Depth { compare: Compare::Less, write: true },
             )
         }
-        sp_far.end()
-        if use_near {
-            let sp_near: DepthOnlyPass = begin_depth_pass(mut self.shadow_near, clear_depth: 1.0, keep_depth: false)
-            for i in 0..nb {
-                let b = self.batches[i].bound
-                if self.batches[i].has_opaque && (b.w <= 0.0 || length(b.xyz - sv_near.centre) <= b.w + sv_near.radius * 1.5) {
-                    draw(
-                        sp_near,
-                        shadow_vs.bind(verts: self.batches[i].verts.items(), xforms: self.batches[i].xforms.items(), sv: sv_near),
-                        shadow_fs,
-                        indices: self.batches[i].indices,
-                        indirect: self.batches[i].draw_args,
-                        cull: Cull::Back,
-                        depth_bias: DepthBias { constant: 2, slope: 1.4, clamp: 0.0 },
-                        depth: Depth { compare: Compare::Less, write: true },
-                    )
-                }
-            }
-            if self.swarm.count > 0 {
-                draw(
-                    sp_near,
-                    swarm_shadow_vs.bind(grains: self.swarm.front(), sv: sv_near),
-                    shadow_fs,
-                    vertices: 6,
-                    instances: self.swarm.count,
-                    depth: Depth { compare: Compare::Less, write: true },
-                )
-            }
-            sp_near.end()
-        } else if frame == 0 {
-            // Initialize near cascade layout once so Vulkan validation sees a valid depth image.
-            let sp_init: DepthOnlyPass = begin_depth_pass(mut self.shadow_near, clear_depth: 1.0, keep_depth: false)
-            sp_init.end()
-        }
+        sp.end()
 
         // Pass 1b: Camera-focused radiance cache & dynamic local emitters.
         // Skips rebuild completely (0 ms/frame) when the whole world is static; when only dynamic
@@ -1115,11 +1259,11 @@ impl MeshSight {
                                 self.batches[i].cap_verts,
                                 self.batches[i].xforms.items(),
                                 self.batches[i].inst_count,
-                                sv_far,
+                                sv,
                                 sky,
                                 self.sky.diff,
                                 self.sky.s,
-                                self.shadow_far,
+                                self.shadow_map,
                                 self.cmp,
                             )
                         }
@@ -1136,11 +1280,11 @@ impl MeshSight {
                             self.batches[i].cap_verts,
                             self.batches[i].xforms.items(),
                             self.batches[i].inst_count,
-                            sv_far,
+                            sv,
                             sky,
                             self.sky.diff,
                             self.sky.s,
-                            self.shadow_far,
+                            self.shadow_map,
                             self.cmp,
                         )
                     }
@@ -1154,11 +1298,11 @@ impl MeshSight {
                         self.batches[i].cap_verts,
                         self.batches[i].xforms.items(),
                         self.batches[i].inst_count,
-                        sv_far,
+                        sv,
                         sky,
                         self.sky.diff,
                         self.sky.s,
-                        self.shadow_far,
+                        self.shadow_map,
                         self.cmp,
                     )
                 }
@@ -1170,7 +1314,7 @@ impl MeshSight {
             self.rad_key = rkey
             self.rad_built = true
         }
-        (nb, v, sv_near, sv_far)
+        (nb, v, sv)
     }
 
     /// Shared opaque geometry + tiled emitter culling + pixel-rate deferred direct + half-res
@@ -1183,8 +1327,7 @@ impl MeshSight {
         swarm: Sw,
         sky: S,
         v: View,
-        sv_near: ShadowView,
-        sv_far: ShadowView,
+        sv: ShadowView,
         width: u32,
         height_px: u32,
         write_judge: bool,
@@ -1248,7 +1391,7 @@ impl MeshSight {
         }
         ep.end()
 
-        // Pass 2b: Full-res 1× pixel-rate deferred direct lighting (dual-cascade PCF + tiled emitters).
+        // Pass 2b: Full-res 1× pixel-rate deferred direct lighting (SDF soft shadows + curvature + SSS + tiled emitters).
         label("mesh_direct")
         if write_judge {
             let dp = begin_pass3(mut self.hdr_direct, mut self.drawn.place, mut self.drawn.sun, keep: false)
@@ -1257,9 +1400,9 @@ impl MeshSight {
                 cover,
                 deferred_direct_judge_fs.bind(
                     v: v,
-                    sv_near: sv_near,
-                    sv_far: sv_far,
+                    sv: sv,
                     rad_grid: self.rad.grid,
+                    sdf_grid: self.sdf.grid,
                     sky: sky,
                     g_normal: self.g_normal,
                     g_albedo: self.g_albedo,
@@ -1267,12 +1410,14 @@ impl MeshSight {
                     depth: self.depth,
                     sky_spec0: self.sky.spec0,
                     sky_s: self.sky.s,
-                    sm_near: self.shadow_near,
-                    sm_far: self.shadow_far,
+                    shadow_map: self.shadow_map,
                     cmp: self.cmp,
                     rad0: self.rad.rad0,
                     rad1: self.rad.rad1,
                     rad_s: self.rad.s,
+                    sdf0: self.sdf.sdf0,
+                    sdf1: self.sdf.sdf1,
+                    sdf_s: self.sdf.s,
                     emitters: self.rad.emitters.items(),
                     tile_masks: self.rad.tile_masks.items(),
                     tiles_x: self.rad.tiles_x,
@@ -1289,9 +1434,9 @@ impl MeshSight {
                 cover,
                 deferred_direct_fs.bind(
                     v: v,
-                    sv_near: sv_near,
-                    sv_far: sv_far,
+                    sv: sv,
                     rad_grid: self.rad.grid,
+                    sdf_grid: self.sdf.grid,
                     sky: sky,
                     g_normal: self.g_normal,
                     g_albedo: self.g_albedo,
@@ -1299,12 +1444,14 @@ impl MeshSight {
                     depth: self.depth,
                     sky_spec0: self.sky.spec0,
                     sky_s: self.sky.s,
-                    sm_near: self.shadow_near,
-                    sm_far: self.shadow_far,
+                    shadow_map: self.shadow_map,
                     cmp: self.cmp,
                     rad0: self.rad.rad0,
                     rad1: self.rad.rad1,
                     rad_s: self.rad.s,
+                    sdf0: self.sdf.sdf0,
+                    sdf1: self.sdf.sdf1,
+                    sdf_s: self.sdf.s,
                     emitters: self.rad.emitters.items(),
                     tile_masks: self.rad.tile_masks.items(),
                     tiles_x: self.rad.tiles_x,
@@ -1316,7 +1463,7 @@ impl MeshSight {
             dp.end()
         }
 
-        // Pass 2c: Half-res (`W/2 × H/2`) 4-cone diffuse GI + real-time SSR + micro-contact shadows.
+        // Pass 2c: Half-res (`W/2 × H/2`) 4-cone diffuse GI + SDF bent-normal AO + SSR + micro-contact shadows.
         label("mesh_indirect")
         let ip = begin_pass2(mut self.gi_diff, mut self.gi_spec, keep: false)
         draw(
@@ -1325,6 +1472,7 @@ impl MeshSight {
             indirect_half_fs.bind(
                 v: v,
                 rad_grid: self.rad.grid,
+                sdf_grid: self.sdf.grid,
                 sky: sky,
                 hdr_direct: self.hdr_direct,
                 g_normal: self.g_normal,
@@ -1341,6 +1489,9 @@ impl MeshSight {
                 rad1: self.rad.rad1,
                 rad2: self.rad.rad2,
                 rad_s: self.rad.s,
+                sdf0: self.sdf.sdf0,
+                sdf1: self.sdf.sdf1,
+                sdf_s: self.sdf.s,
                 full_w: width,
                 full_h: height_px,
             ),
@@ -1385,9 +1536,9 @@ impl MeshSight {
         width: u32,
         height: u32,
     ) {
-        let (nb, v, sv_near, sv_far) = self.prepare_and_shadow(world, NoSwarm {}, sky, eye, width, height, 0)
+        let (nb, v, sv) = self.prepare_and_shadow(world, NoSwarm {}, sky, eye, width, height, 0)
         self.render_opaque_and_indirect(
-            nb, NoHeight {}, NoSwarm {}, sky, v, sv_near, sv_far, width, height, write_judge: true,
+            nb, NoHeight {}, NoSwarm {}, sky, v, sv, width, height, write_judge: true,
         )
 
         label("mesh_tone")
@@ -1417,9 +1568,9 @@ impl MeshSight {
     }
 
     /// Renders a complete scene (`world` solids, `height` clipmap, `medium` froxels, and `swarm`
-    /// field-colliding GPU grains) through ONE depth buffer, ONE light store, 4× MSAA G-buffer +
-    /// pixel-rate deferred direct lighting + tiled emitters, half-res bilateral GI + SSR + contact
-    /// shadows, unified refraction, optical HDR bloom, and ONE `Look::tone` pass.
+    /// field-colliding GPU grains) through ONE depth buffer, ONE light store, 2-cascade 3D SDF
+    /// clipmap, 4× MSAA G-buffer + pixel-rate deferred direct lighting + tiled emitters, half-res
+    /// bilateral GI + bent-normal AO + SSR, unified refraction, optical HDR bloom, and ONE `Look::tone`.
     pub fn draw_scene<W: World + MeshWorld, H: Height, Med: Medium, Sw: Swarm, S: Sky, L: Look>(
         mut self,
         world: W,
@@ -1432,11 +1583,11 @@ impl MeshSight {
         width: u32,
         height_px: u32,
     ) {
-        let (nb, v, sv_near, sv_far) = self.prepare_and_shadow(world, swarm, sky, eye, width, height_px, self.frame)
+        let (nb, v, sv) = self.prepare_and_shadow(world, swarm, sky, eye, width, height_px, self.frame)
         self.frame += 1
 
         self.render_opaque_and_indirect(
-            nb, height, swarm, sky, v, sv_near, sv_far, width, height_px, write_judge: false,
+            nb, height, swarm, sky, v, sv, width, height_px, write_judge: false,
         )
 
         // Pass 2e: Unified refractive / transmissive pass (glass, water, crystal, ice) with SSR.
@@ -1464,20 +1615,24 @@ impl MeshSight {
                         mesh_vs.bind(verts: self.batches[i].verts.items(), xforms: self.batches[i].xforms.items(), v: v),
                         mesh_trans_fs.bind(
                             v: v,
-                            sv_far: sv_far,
+                            sv: sv,
                             rad_grid: self.rad.grid,
+                            sdf_grid: self.sdf.grid,
                             sky: sky,
                             sky_diff: self.sky.diff,
                             sky_spec0: self.sky.spec0,
                             sky_spec1: self.sky.spec1,
                             sky_spec2: self.sky.spec2,
                             sky_s: self.sky.s,
-                            sm_far: self.shadow_far,
+                            shadow_map: self.shadow_map,
                             cmp: self.cmp,
                             rad0: self.rad.rad0,
                             rad1: self.rad.rad1,
                             rad2: self.rad.rad2,
                             rad_s: self.rad.s,
+                            sdf0: self.sdf.sdf0,
+                            sdf1: self.sdf.sdf1,
+                            sdf_s: self.sdf.s,
                             emitters: self.rad.emitters.items(),
                             tile_masks: self.rad.tile_masks.items(),
                             tiles_x: self.rad.tiles_x,
@@ -1497,20 +1652,24 @@ impl MeshSight {
                     height_vs.bind(height: height, v: v, base_level: 0, trans_pass: 1),
                     mesh_trans_fs.bind(
                         v: v,
-                        sv_far: sv_far,
+                        sv: sv,
                         rad_grid: self.rad.grid,
+                        sdf_grid: self.sdf.grid,
                         sky: sky,
                         sky_diff: self.sky.diff,
                         sky_spec0: self.sky.spec0,
                         sky_spec1: self.sky.spec1,
                         sky_spec2: self.sky.spec2,
                         sky_s: self.sky.s,
-                        sm_far: self.shadow_far,
+                        shadow_map: self.shadow_map,
                         cmp: self.cmp,
                         rad0: self.rad.rad0,
                         rad1: self.rad.rad1,
                         rad2: self.rad.rad2,
                         rad_s: self.rad.s,
+                        sdf0: self.sdf.sdf0,
+                        sdf1: self.sdf.sdf1,
+                        sdf_s: self.sdf.s,
                         emitters: self.rad.emitters.items(),
                         tile_masks: self.rad.tile_masks.items(),
                         tiles_x: self.rad.tiles_x,
@@ -1528,20 +1687,24 @@ impl MeshSight {
                     height_vs.bind(height: height, v: v, base_level: 1, trans_pass: 1),
                     mesh_trans_fs.bind(
                         v: v,
-                        sv_far: sv_far,
+                        sv: sv,
                         rad_grid: self.rad.grid,
+                        sdf_grid: self.sdf.grid,
                         sky: sky,
                         sky_diff: self.sky.diff,
                         sky_spec0: self.sky.spec0,
                         sky_spec1: self.sky.spec1,
                         sky_spec2: self.sky.spec2,
                         sky_s: self.sky.s,
-                        sm_far: self.shadow_far,
+                        shadow_map: self.shadow_map,
                         cmp: self.cmp,
                         rad0: self.rad.rad0,
                         rad1: self.rad.rad1,
                         rad2: self.rad.rad2,
                         rad_s: self.rad.s,
+                        sdf0: self.sdf.sdf0,
+                        sdf1: self.sdf.sdf1,
+                        sdf_s: self.sdf.s,
                         emitters: self.rad.emitters.items(),
                         tile_masks: self.rad.tile_masks.items(),
                         tiles_x: self.rad.tiles_x,
@@ -1564,12 +1727,12 @@ impl MeshSight {
             self.vol.update(
                 medium,
                 v,
-                sv_far,
+                sv,
                 self.rad.grid,
                 sky,
                 self.sky.diff,
                 self.sky.s,
-                self.shadow_far,
+                self.shadow_map,
                 self.cmp,
                 self.rad.rad1,
                 self.rad.rad2,
