@@ -14,7 +14,7 @@ use std::derive::{Box3, value_and_gradient}
 use std::field::{ALL_LIVE, Field, Live, Rigid}
 use std::gpu::{
     Append, AppendBuffer, Atomics, DispatchArgs, DrawIndexedArgs, GlobalId, GpuBuffer, GpuSpan,
-    One, Slots, append_buffer, buffer, buffer_of, dispatch, label, read, write,
+    One, Slots, append_buffer, buffer, buffer_of, copy, dispatch, label, read, write,
 }
 use std::hash::{Hasher, StateHash}
 use std::io::Pending
@@ -34,8 +34,10 @@ const NONE: u32 = 4294967295
 /// under the 50 ms step guard even for expensive noise-displaced fields.
 const CHUNK_BRICKS: u32 = 1024
 const CULL_CHUNK: u32 = 8192
-/// Maximum sharp-crease cells refined per chunk (`(bi << 9) | cell`, 32 KB).
-const CAP_CREASES: u32 = 8192
+/// Maximum sharp-crease cells refined per chunk (`(bi << 9) | cell`, 256 KB): large enough to
+/// hold every crease cell in a `1024`-brick chunk without overflowing (preventing brick-halo
+/// cracks) while staying well under the 50 ms GPU dispatch guard on both Metal and Vulkan.
+const CAP_CREASES: u32 = 65536
 /// Lipschitz bound at unit scale above which a field counts as steep (noise-displaced rock):
 /// its bricks get a finer interval check and its cells a finer spacing.
 const STEEP_LIPSCHITZ: f32 = 1.05
@@ -531,7 +533,7 @@ fn classify_cells(
     }
     cell_verts[id] = NONE
     let (cx, cy, cz) = decode_cell(cell)
-    let cbase = bi * CORNERS_BRICK
+    let cbase = brick_in_chunk * CORNERS_BRICK
     var neg: u32 = 0
     for k in 0..8 {
         if cdist(corners, cbase, cx + (k & 1), cy + ((k >> 1) & 1), cz + (k >> 2)) < 0.0 {
@@ -539,7 +541,7 @@ fn classify_cells(
         }
     }
     if neg != 0 && neg != 8 {
-        let _ = surf.push((bi << 9) | cell)
+        let _ = surf.push((brick_in_chunk << 9) | cell)
     }
 }
 
@@ -553,6 +555,7 @@ fn solve_verts<M: Field<Substance>>(
     fields: [M],
     grids: [GridSpec],
     active: [ActiveBrick],
+    chunk_start: u32,
     corners: [f32],
     surf: [u32],
     surf_count: [u32],
@@ -567,10 +570,11 @@ fn solve_verts<M: Field<Substance>>(
         return
     }
     let packed = surf[id.x]
-    let bi = packed >> 9
+    let local_bi = packed >> 9
+    let bi = chunk_start + local_bi
     let cell = packed & 511
     let (cx, cy, cz) = decode_cell(cell)
-    let d = load_corners(corners, bi * CORNERS_BRICK, cx, cy, cz)
+    let d = load_corners(corners, local_bi * CORNERS_BRICK, cx, cy, cz)
 
     let ab = active[bi]
     let b = ab.coord
@@ -615,7 +619,7 @@ fn solve_verts<M: Field<Substance>>(
     let live = ab.live
     let (dv, gv) = value_and_gradient(|q| f.distance_live(q, live), wp)
     let snapped = newton_snap(wp, dv, gv, cell_lo, h)
-    push_vertex(f, snapped, gv, qef, bi * VERTS_STRIDE + cell, cap_verts, mut verts, mut cell_verts)
+    push_vertex(f, snapped, gv, qef, local_bi * VERTS_STRIDE + cell, cap_verts, mut verts, mut cell_verts)
 }
 
 /// Prepares indirect dispatch args for a 64-wide pass over a compacted list (clamped to `cap`).
@@ -633,6 +637,7 @@ fn refine_creases<M: Field<Substance>>(
     fields: [M],
     grids: [GridSpec],
     active: [ActiveBrick],
+    chunk_start: u32,
     corners: [f32],
     creases: [u32],
     crease_count: [u32],
@@ -646,10 +651,11 @@ fn refine_creases<M: Field<Substance>>(
         return
     }
     let packed = creases[id.x]
-    let bi = packed >> 9
+    let local_bi = packed >> 9
+    let bi = chunk_start + local_bi
     let cell = packed & 511
     let (cx, cy, cz) = decode_cell(cell)
-    let d = load_corners(corners, bi * CORNERS_BRICK, cx, cy, cz)
+    let d = load_corners(corners, local_bi * CORNERS_BRICK, cx, cy, cz)
 
     let ab = active[bi]
     let b = ab.coord
@@ -689,7 +695,7 @@ fn refine_creases<M: Field<Substance>>(
     let wp = cell_lo + qef.solve(0.002) * h
     let (dv, gv) = value_and_gradient(|q| f.distance_live(q, live), wp)
     let snapped = newton_snap(wp, dv, gv, cell_lo, h)
-    push_vertex(f, snapped, gv, qef, bi * VERTS_STRIDE + cell, cap_verts, mut verts, mut cell_verts)
+    push_vertex(f, snapped, gv, qef, local_bi * VERTS_STRIDE + cell, cap_verts, mut verts, mut cell_verts)
 }
 
 /// Dual vertex index of local cell `(x, y, z)` in `0..7` inside brick `bi`.
@@ -781,8 +787,8 @@ fn emit_tris(
     let rem = eidx - ez * 36
     let ey = rem / 6
     let ex = rem - ey * 6
-    let cbase = bi * CORNERS_BRICK
-    let vbase = bi * VERTS_STRIDE
+    let cbase = brick_in_chunk * CORNERS_BRICK
+    let vbase = brick_in_chunk * VERTS_STRIDE
 
     // +X edge: (ex, ey+1, ez+1) -> (ex+1, ey+1, ez+1); surrounding cells have x=ex, y in {ey, ey+1}, z in {ez, ez+1}.
     let dx0 = cdist(corners, cbase, ex, ey + 1, ez + 1)
@@ -949,12 +955,14 @@ pub struct ExtractScratch {
 }
 
 /// Allocates one shared `ExtractScratch` sized for up to `max_bricks` active bricks per batch.
+/// `corners` and `cell_verts` are chunk-local (`CHUNK_BRICKS = 1024`), using only 3.5 MB VRAM
+/// regardless of `max_bricks`.
 pub fn extract_scratch(max_bricks: u32) -> ExtractScratch {
     let grids_cap: u32 = 512
     ExtractScratch {
         active: append_buffer(max_bricks),
-        corners: buffer(max_bricks * CORNERS_BRICK),
-        cell_verts: buffer(max_bricks * VERTS_STRIDE),
+        corners: buffer(CHUNK_BRICKS * CORNERS_BRICK),
+        cell_verts: buffer(CHUNK_BRICKS * VERTS_STRIDE),
         creases: append_buffer(CAP_CREASES),
         surf: append_buffer(CAP_SURF),
         grids: buffer(grids_cap),
@@ -995,6 +1003,8 @@ fn bucket_bricks(want: u32, max_bricks: u32) -> u32 {
         min(2048, max_bricks)
     } else if want <= 4096 {
         min(4096, max_bricks)
+    } else if want <= 8192 {
+        min(8192, max_bricks)
     } else {
         max_bricks
     }
@@ -1011,7 +1021,9 @@ pub struct MeshBatch {
     pub draw_args: GpuBuffer<DrawIndexedArgs>,
     pub trans_draw_args: GpuBuffer<DrawIndexedArgs>,
     pub xforms: GpuBuffer<Rigid>,
+    pub prev_xforms: GpuBuffer<Rigid>,
     xforms_cap: u32,
+    prev_xforms_dirty: bool,
     pub inst_count: u32,
     extracted_xform: Rigid,
     shape_key: u64,
@@ -1049,7 +1061,9 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
         draw_args: buffer_of([DrawIndexedArgs { indices: 0, instances: 0, first_index: 0, base_vertex: 0, first_instance: 0 }]),
         trans_draw_args: buffer_of([DrawIndexedArgs { indices: 0, instances: 0, first_index: 0, base_vertex: 0, first_instance: 0 }]),
         xforms: buffer_of([Rigid::identity()]),
+        prev_xforms: buffer_of([Rigid::identity()]),
         xforms_cap: 1,
+        prev_xforms_dirty: false,
         inst_count: 1,
         extracted_xform: Rigid::identity(),
         shape_key: 0,
@@ -1078,16 +1092,20 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
 }
 
 impl MeshBatch {
-    /// Ensures `self.xforms` holds at least `count` rigid instance transforms.
-    fn ensure_xforms(mut self, count: u32) {
+    /// Ensures `self.xforms` and `self.prev_xforms` hold at least `count` rigid instance transforms.
+    fn ensure_xforms(mut self, count: u32) -> bool {
         if count > self.xforms_cap {
             var cap = max(self.xforms_cap, 16)
             while cap < count {
                 cap *= 2
             }
             self.xforms = buffer(cap)
+            self.prev_xforms = buffer(cap)
             self.xforms_cap = cap
+            self.prev_xforms_dirty = false
+            return true
         }
+        false
     }
 
     /// Grows output vertex/index buffers on demand to fit `want_bricks` active bricks.
@@ -1168,6 +1186,10 @@ impl MeshBatch {
             None => cell,
         }
         if self.built && self.hash == key && abs(self.cell - eff_cell) <= 0.05 * max(self.cell, 1.0e-4) {
+            if self.prev_xforms_dirty {
+                copy(from: self.xforms.items(), to: self.prev_xforms.items_mut())
+                self.prev_xforms_dirty = false
+            }
             self.still_frames += 1
             return
         }
@@ -1175,8 +1197,10 @@ impl MeshBatch {
             Some(sk) => {
                 if self.built && self.is_rigid_cached && !self.instanced && self.shape_key == sk &&
                     abs(self.cell - eff_cell) <= 0.15 * max(self.cell, 1.0e-4) {
+                    copy(from: self.xforms.items(), to: self.prev_xforms.items_mut())
                     let delta = rf.delta_from(self.extracted_xform)
                     write(mut self.xforms, 0, [delta])
+                    self.prev_xforms_dirty = true
                     let b = field.bound()
                     self.bound = vec4(b.centre, min(b.radius, 1.0e4))
                     self.hash = key
@@ -1195,6 +1219,8 @@ impl MeshBatch {
         let mid = 0.5 * (aabb.lo + aabb.hi)
         self.bound = vec4(mid, length(aabb.hi - mid))
         write(mut self.xforms, 0, [Rigid::identity()])
+        write(mut self.prev_xforms, 0, [Rigid::identity()])
+        self.prev_xforms_dirty = false
         self.inst_count = 1
         self.run_extract(mut scratch, fbuf.items(), things: 1, total_bricks: total_bricks, inst_count: 1)
         self.hash = key
@@ -1274,6 +1300,10 @@ impl MeshBatch {
         let key = h.finish()
         let check_cell = if all_same_rigid && vis_count > 0 { best_local_cell } else { first_cell }
         if self.built && self.hash == key && abs(self.cell - check_cell) <= 0.05 * max(self.cell, 1.0e-4) {
+            if self.prev_xforms_dirty {
+                copy(from: self.xforms.items(), to: self.prev_xforms.items_mut())
+                self.prev_xforms_dirty = false
+            }
             self.still_frames += 1
             return
         }
@@ -1315,7 +1345,14 @@ impl MeshBatch {
                         deltas.push(fields[i].rigid_frame().delta_from(self.extracted_xform))
                     }
                 }
-                self.ensure_xforms(vis_count)
+                let grew = self.ensure_xforms(vis_count)
+                if !grew && vis_count == self.inst_count {
+                    copy(from: self.xforms.items(), to: self.prev_xforms.items_mut())
+                    self.prev_xforms_dirty = true
+                } else {
+                    write(mut self.prev_xforms, 0, deltas)
+                    self.prev_xforms_dirty = false
+                }
                 write(mut self.xforms, 0, deltas)
                 if vis_count != self.inst_count {
                     label("mesh_extract")
@@ -1350,8 +1387,10 @@ impl MeshBatch {
                     deltas.push(fields[i].rigid_frame().delta_from(template_rf))
                 }
             }
-            self.ensure_xforms(vis_count)
+            let _ = self.ensure_xforms(vis_count)
             write(mut self.xforms, 0, deltas)
+            write(mut self.prev_xforms, 0, deltas)
+            self.prev_xforms_dirty = false
             self.inst_count = vis_count
             self.run_extract(mut scratch, fbuf.items(), things: 1, total_bricks: total_bricks, inst_count: vis_count)
             self.extracted_xform = template_rf
@@ -1397,6 +1436,8 @@ impl MeshBatch {
         let mid = 0.5 * (tlo + thi)
         self.bound = vec4(mid, length(thi - mid))
         write(mut self.xforms, 0, [Rigid::identity()])
+        write(mut self.prev_xforms, 0, [Rigid::identity()])
+        self.prev_xforms_dirty = false
         self.inst_count = 1
         self.run_extract(mut scratch, fbuf.items(), things: count, total_bricks: total_bricks, inst_count: 1)
         self.extracted_xform = Rigid::identity()
@@ -1489,7 +1530,7 @@ impl MeshBatch {
                     active_count: scratch.active.count(),
                     cap_bricks: effective_cap,
                     chunk_start: chunk_start,
-                    corners: scratch.corners.span_mut(start: chunk_start * CORNERS_BRICK, count: chunk_n * CORNERS_BRICK),
+                    corners: scratch.corners.span_mut(start: 0, count: chunk_n * CORNERS_BRICK),
                 ),
                 groups: scratch.eval_args.at(0),
                 most: chunk_n * 8,
@@ -1502,7 +1543,7 @@ impl MeshBatch {
                     cap_bricks: effective_cap,
                     chunk_start: chunk_start,
                     corners: scratch.corners.items(),
-                    cell_verts: scratch.cell_verts.span_mut(start: chunk_start * VERTS_STRIDE, count: chunk_n * VERTS_STRIDE),
+                    cell_verts: scratch.cell_verts.span_mut(start: 0, count: chunk_n * VERTS_STRIDE),
                     surf: mut scratch.surf,
                 ),
                 groups: scratch.vert_args.at(0),
@@ -1521,6 +1562,7 @@ impl MeshBatch {
                     fields: fields,
                     grids: grids,
                     active: scratch.active.items(),
+                    chunk_start: chunk_start,
                     corners: scratch.corners.items(),
                     surf: scratch.surf.items(),
                     surf_count: scratch.surf.count(),
@@ -1545,6 +1587,7 @@ impl MeshBatch {
                     fields: fields,
                     grids: grids,
                     active: scratch.active.items(),
+                    chunk_start: chunk_start,
                     corners: scratch.corners.items(),
                     creases: scratch.creases.items(),
                     crease_count: scratch.creases.count(),

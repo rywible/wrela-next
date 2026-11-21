@@ -1,0 +1,336 @@
+// Temporal Super-Resolution (TSR) with Halton(2, 3) subpixel jitter, closest-depth 3×3 velocity
+// dilation, 5-tap Catmull-Rom bicubic history reconstruction, Karis luma tone-weighting, and
+// Salvi (2016) YCoCg neighborhood variance clipping.
+//
+// Replaces 4× MSAA with 1× rasterization + 8-frame temporal supersampling (4× less G-buffer
+// bandwidth and VRAM, cleaner silhouettes and specular glints, and full-res reconstruction of
+// 2×2 phase-cycled half-res GI/SSR).
+
+use picture::eye::View
+use picture::screen::luma
+use std::gpu::{
+    Address, DepthTexture, Filter, FragCoord, Rg16Float, Rgba16Float, Sampler, Texture, begin_pass,
+    copy_texture, draw, label, sampler, texture,
+}
+use picture::screen::cover
+
+/// 8-frame Halton(2, 3) subpixel jitter sequence in `[-0.5, +0.5)` pixels.
+pub fn halton_jitter(frame: u32) -> vec2 {
+    let k = frame & 7
+    if k == 0 {
+        vec2(0.0, -0.1666667)
+    } else if k == 1 {
+        vec2(-0.25, 0.1666667)
+    } else if k == 2 {
+        vec2(0.25, -0.3888889)
+    } else if k == 3 {
+        vec2(-0.375, -0.0555556)
+    } else if k == 4 {
+        vec2(0.125, 0.2777778)
+    } else if k == 5 {
+        vec2(-0.125, -0.2777778)
+    } else if k == 6 {
+        vec2(0.375, 0.0555556)
+    } else {
+        vec2(-0.4375, 0.3888889)
+    }
+}
+
+/// Projects world point `wp` to unjittered normalized screen UV `[0, 1]²` under `v`.
+pub fn project_uv_unjittered(v: View, wp: vec3) -> vec2 {
+    let rel = wp - v.at
+    let z = max(dot(rel, v.forward), 0.005)
+    let aspect = v.size.y / max(v.size.x, 1.0)
+    let x_ndc = (dot(rel, v.right) * v.focal * aspect) / z
+    let y_ndc = (dot(rel, v.up) * v.focal) / z
+    vec2(x_ndc * 0.5 + 0.5, 0.5 - y_ndc * 0.5)
+}
+
+/// Reversible Karis / Reinhard luma tone compression so HDR sparks never distort temporal clamping.
+fn tsr_compress(c: vec3) -> vec3 {
+    let cl = max(c, vec3(0.0))
+    cl / (1.0 + max(luma(cl), 0.0))
+}
+
+/// Inverse of `tsr_compress`.
+fn tsr_expand(c: vec3) -> vec3 {
+    let cl = max(c, vec3(0.0))
+    cl / max(1.0 - max(luma(cl), 0.0), 0.002)
+}
+
+/// RGB -> YCoCg colour space for tighter, hue-preserving variance clamping.
+fn rgb_to_ycocg(c: vec3) -> vec3 {
+    let y = 0.25 * c.x + 0.5 * c.y + 0.25 * c.z
+    let co = 0.5 * c.x - 0.5 * c.z
+    let cg = -0.25 * c.x + 0.5 * c.y - 0.25 * c.z
+    vec3(y, co, cg)
+}
+
+/// YCoCg -> RGB inverse transform.
+fn ycocg_to_rgb(ycc: vec3) -> vec3 {
+    let t = ycc.x - ycc.z
+    max(vec3(t + ycc.y, ycc.x + ycc.z, t - ycc.y), vec3(0.0))
+}
+
+/// Clips history sample `h` toward box center `c` against AABB `[lo, hi]` in YCoCg space.
+fn clip_aabb(lo: vec3, hi: vec3, h: vec3) -> vec3 {
+    let c = 0.5 * (lo + hi)
+    let e = 0.5 * (hi - lo) + vec3(1.0e-5)
+    let v = h - c
+    let u = abs(v / e)
+    let ma = max(u.x, max(u.y, u.z))
+    if ma > 1.0 {
+        c + v / ma
+    } else {
+        h
+    }
+}
+
+/// 5-tap Catmull-Rom bicubic history lookup (Jimenez / Karis): keeps subpixel detail razor sharp
+/// without the softening of single-tap bilinear reprojection.
+fn sample_history_catmull(tex: Texture<Rgba16Float>, s: Sampler, uv: vec2, size: vec2) -> vec3 {
+    let inv_s = vec2(1.0) / max(size, vec2(1.0))
+    let pos = uv * size
+    let tc1 = floor(pos - vec2(0.5)) + vec2(0.5)
+    let f = pos - tc1
+    let f2 = f * f
+    let f3 = f2 * f
+
+    let w0 = f2 - 0.5 * (f3 + f)
+    let w1 = 1.5 * f3 - 2.5 * f2 + vec2(1.0)
+    let w3 = 0.5 * (f3 - f2)
+    let w2 = vec2(1.0) - w0 - w1 - w3
+
+    let w12 = w1 + w2
+    let off12 = w2 / max(w12, vec2(1.0e-4))
+    let tc0 = (tc1 - vec2(1.0)) * inv_s
+    let tc3 = (tc1 + vec2(2.0)) * inv_s
+    let tc12 = (tc1 + off12) * inv_s
+
+    let c0 = max(tex.sample_level(s, clamp(vec2(tc12.x, tc0.y), vec2(0.001), vec2(0.999)), 0.0).xyz, vec3(0.0))
+    let c1 = max(tex.sample_level(s, clamp(vec2(tc0.x, tc12.y), vec2(0.001), vec2(0.999)), 0.0).xyz, vec3(0.0))
+    let c2 = max(tex.sample_level(s, clamp(vec2(tc12.x, tc12.y), vec2(0.001), vec2(0.999)), 0.0).xyz, vec3(0.0))
+    let c3 = max(tex.sample_level(s, clamp(vec2(tc3.x, tc12.y), vec2(0.001), vec2(0.999)), 0.0).xyz, vec3(0.0))
+    let c4 = max(tex.sample_level(s, clamp(vec2(tc12.x, tc3.y), vec2(0.001), vec2(0.999)), 0.0).xyz, vec3(0.0))
+
+    let s0 = w12.x * w0.y
+    let s1 = w0.x * w12.y
+    let s2 = w12.x * w12.y
+    let s3 = w3.x * w12.y
+    let s4 = w12.x * w3.y
+    let norm = max(s0 + s1 + s2 + s3 + s4, 1.0e-4)
+    max((c0 * s0 + c1 * s1 + c2 * s2 + c3 * s3 + c4 * s4) / norm, vec3(0.0))
+}
+
+/// Full-resolution TSR resolve fragment shader: reprojects history via 3×3 closest-depth velocity
+/// dilation + 5-tap Catmull-Rom reconstruction, clamps in YCoCg variance space, and blends with
+/// motion-adaptive temporal weight while preserving linear eye distance in `.w`.
+@fragment
+fn tsr_resolve_fs(
+    pixel: FragCoord,
+    curr: Texture<Rgba16Float>,
+    history: Texture<Rgba16Float>,
+    motion: Texture<Rg16Float>,
+    depth: DepthTexture,
+    s: Sampler,
+    v: View,
+    prev_v: View,
+    full_w: u32,
+    full_h: u32,
+    history_valid: u32,
+) -> vec4 {
+    let px = min(u32(pixel.position.x), full_w - 1)
+    let py = min(u32(pixel.position.y), full_h - 1)
+    let center = curr.load(px, py)
+    if history_valid == 0 {
+        return center
+    }
+    let iw = i32(full_w)
+    let ih = i32(full_h)
+    let ix = i32(px)
+    let iy = i32(py)
+
+    // 3×3 neighborhood YCoCg moments (Salvi 2016) + closest-depth velocity dilation (Karis 2014).
+    var m1 = vec3(0.0)
+    var m2 = vec3(0.0)
+    var min_c = vec3(1.0e6)
+    var max_c = vec3(-1.0e6)
+    var best_z = -1.0
+    var best_x = px
+    var best_y = py
+
+    for dy in -1..2 {
+        let sy = u32(clamp(iy + dy, 0, ih - 1))
+        for dx in -1..2 {
+            let sx = u32(clamp(ix + dx, 0, iw - 1))
+            let c_ycc = rgb_to_ycocg(tsr_compress(curr.load(sx, sy).xyz))
+            m1 += c_ycc
+            m2 += c_ycc * c_ycc
+            min_c = min(min_c, c_ycc)
+            max_c = max(max_c, c_ycc)
+            let z = depth.load(sx, sy)
+            if z > best_z {
+                best_z = z
+                best_x = sx
+                best_y = sy
+            }
+        }
+    }
+
+    let inv9 = 1.0 / 9.0
+    let mean = m1 * inv9
+    let sigma = sqrt(max(m2 * inv9 - mean * mean, vec3(0.0)))
+
+    let uv = (vec2(f32(px), f32(py)) + vec2(0.5)) / max(v.size, vec2(1.0))
+    var vel = vec2(0.0)
+    if best_z > 1.0e-6 {
+        vel = motion.load(best_x, best_y)
+    } else {
+        // Analytic sky reprojection along unjittered ray so camera turns never smear the sky dome.
+        let unj = View { jitter: vec2(0.0), ..v }
+        let ray = unj.ray(vec2(f32(px) + 0.5, f32(py) + 0.5))
+        let prev_uv_sky = project_uv_unjittered(prev_v, prev_v.at + ray * 1000.0)
+        vel = prev_uv_sky - uv
+    }
+
+    let prev_uv = uv + vel
+    if prev_uv.x < 0.001 || prev_uv.x > 0.999 || prev_uv.y < 0.001 || prev_uv.y > 0.999 {
+        return center
+    }
+
+    let speed_px = length(vel * v.size)
+    let gamma = mix(1.45, 0.95, clamp(speed_px * 0.25, 0.0, 1.0))
+    let box_lo = max(min_c, mean - sigma * gamma)
+    let box_hi = min(max_c, mean + sigma * gamma)
+
+    let hist_raw = sample_history_catmull(history, s, prev_uv, v.size)
+    let hist_ycc = rgb_to_ycocg(tsr_compress(hist_raw))
+    let clamped_ycc = clip_aabb(box_lo, box_hi, hist_ycc)
+    let curr_ycc = rgb_to_ycocg(tsr_compress(center.xyz))
+
+    // Adaptive temporal blend: ~8-frame supersampling when still, responsive on rapid motion.
+    let alpha = clamp(mix(0.12, 0.34, clamp(speed_px * 0.15, 0.0, 1.0)), 0.10, 0.40)
+    let out_ycc = mix(clamped_ycc, curr_ycc, vec3(alpha))
+    let out_rgb = tsr_expand(ycocg_to_rgb(out_ycc))
+    vec4(out_rgb, center.w)
+}
+
+/// Persistent ping-pong HDR history buffers for Temporal Super-Resolution (TSR).
+pub struct TsrState {
+    pub hist_a: Texture<Rgba16Float>,
+    pub hist_b: Texture<Rgba16Float>,
+    pub s: Sampler,
+    pub prev_v: View,
+    pub front_is_a: bool,
+    pub valid: bool,
+    w: u32,
+    h: u32,
+}
+
+/// Allocates a fresh `TsrState` (resized lazily to match the render target).
+pub fn tsr_state() -> TsrState {
+    TsrState {
+        hist_a: texture(width: 1, height: 1),
+        hist_b: texture(width: 1, height: 1),
+        s: sampler(filter: Filter::Linear, address: Address::Clamp),
+        prev_v: View {
+            at: vec3(0.0),
+            focal: 1.0,
+            forward: vec3(0.0, 0.0, 1.0),
+            spare: 0.0,
+            right: vec3(1.0, 0.0, 0.0),
+            spare2: 0.0,
+            up: vec3(0.0, 1.0, 0.0),
+            spare3: 0.0,
+            size: vec2(1.0, 1.0),
+            jitter: vec2(0.0),
+        },
+        front_is_a: true,
+        valid: false,
+        w: 0,
+        h: 0,
+    }
+}
+
+impl TsrState {
+    /// Resizes history textures when resolution changes, invalidating stale history.
+    pub fn resize(mut self, width: u32, height: u32) {
+        if self.w != width || self.h != height {
+            self.hist_a = texture(width: width, height: height)
+            self.hist_b = texture(width: width, height: height)
+            self.front_is_a = true
+            self.valid = false
+            self.w = width
+            self.h = height
+        }
+    }
+
+    /// Resolves `curr` with previous-frame history and writes the resolved HDR frame back into
+    /// `curr` (preserving `.w` linear depth) while advancing ping-pong history and `prev_v`.
+    pub fn resolve(
+        mut self,
+        curr: mut Texture<Rgba16Float>,
+        motion: Texture<Rg16Float>,
+        depth: DepthTexture,
+        v_unjittered: View,
+        width: u32,
+        height: u32,
+    ) {
+        self.resize(width, height)
+        label("mesh_tsr")
+        if !self.valid {
+            // Frame 0: seed history directly without reading uninitialized texture (VVL-clean).
+            copy_texture(from: curr.level(0), to: self.hist_a.level_mut(0))
+            self.front_is_a = true
+            self.prev_v = v_unjittered
+            self.valid = true
+            return
+        }
+        if self.front_is_a {
+            let tp = begin_pass(mut self.hist_b, keep: false)
+            draw(
+                tp,
+                cover,
+                tsr_resolve_fs.bind(
+                    curr: curr,
+                    history: self.hist_a,
+                    motion: motion,
+                    depth: depth,
+                    s: self.s,
+                    v: v_unjittered,
+                    prev_v: self.prev_v,
+                    full_w: width,
+                    full_h: height,
+                    history_valid: 1,
+                ),
+                vertices: 3,
+            )
+            tp.end()
+            copy_texture(from: self.hist_b.level(0), to: curr.level_mut(0))
+            self.front_is_a = false
+        } else {
+            let tp = begin_pass(mut self.hist_a, keep: false)
+            draw(
+                tp,
+                cover,
+                tsr_resolve_fs.bind(
+                    curr: curr,
+                    history: self.hist_b,
+                    motion: motion,
+                    depth: depth,
+                    s: self.s,
+                    v: v_unjittered,
+                    prev_v: self.prev_v,
+                    full_w: width,
+                    full_h: height,
+                    history_valid: 1,
+                ),
+                vertices: 3,
+            )
+            tp.end()
+            copy_texture(from: self.hist_a.level(0), to: curr.level_mut(0))
+            self.front_is_a = true
+        }
+        self.prev_v = v_unjittered
+    }
+}

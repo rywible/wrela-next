@@ -8,11 +8,12 @@ use matter::substance::Substance
 use matter::swarm::Swarm
 use mesh::light::{RadGrid, ShadowView, clip_of, deposit, encode_mat_signed}
 use mesh::sdf::{SdfGrid, sdf_normal, sdf_sample}
+use mesh::tsr::project_uv_unjittered
 use picture::eye::View
 use std::field::{Field, hash_u32}
 use std::gpu::{
     Atomics, ClipPosition, GlobalId, GpuBuffer, GpuSpan, InstanceIndex, R16Float, Sampler, Slots,
-    Targets3, Texture3d, VertexIndex, buffer, discard, dispatch, label,
+    Targets4, Texture3d, VertexIndex, buffer, discard, dispatch, label,
 }
 
 /// Maximum number of simulated grains in one `SwarmSim` (65,536 grains × 48 B = 3.1 MB per buffer).
@@ -32,6 +33,7 @@ pub struct Grain: Copy + GpuData {
 pub struct SwarmVary: Copy {
     pub clip: ClipPosition,
     pub wp: vec3,
+    pub prev_wp: vec3,
     pub uv: vec2,
     pub albedo: vec3,
     pub emits: vec3,
@@ -234,6 +236,7 @@ pub fn swarm_vs<Sw: Swarm>(
         return SwarmVary {
             clip: ClipPosition { position: vec4(0.0, 0.0, 0.0, 0.0) },
             wp: vec3(0.0),
+            prev_wp: vec3(0.0),
             uv: vec2(0.0),
             albedo: vec3(0.0),
             emits: vec3(0.0),
@@ -271,12 +274,15 @@ pub fn swarm_vs<Sw: Swarm>(
     }
 
     let wp = pos + axis_u * (ux * min_r * stretch) + axis_v * (uy * min_r)
+    let dt = clamp(swarm.step_dt(), 0.001, 0.05)
+    let prev_wp = wp - vel * dt
     let clip = clip_of(v, wp)
 
     let sub = swarm.substance_at(pos, vel, g.vel_age.w, g.meta.y)
     SwarmVary {
         clip,
         wp,
+        prev_wp,
         uv: vec2(ux, uy),
         albedo: sub.albedo,
         emits: sub.emits,
@@ -285,14 +291,14 @@ pub fn swarm_vs<Sw: Swarm>(
     }
 }
 
-/// Lean 3D sphere/shard impostor G-buffer fragment shader writing premultiplied `(normal, cov)`,
-/// `(albedo, roughness)`, and `(emits, mat_code)` into the unified 4× MSAA eye pass (`mesh_eye`).
-/// Zero shadow or emitter math here: all direct lighting runs once per pixel in `deferred_direct_fs`.
+/// Lean 3D sphere/shard impostor G-buffer fragment shader writing `(normal, 1)`, `(albedo, roughness)`,
+/// `(emits, mat_code)`, and exact analytical screen-space motion vector into the 1× eye pass.
 @fragment
 pub fn swarm_fs(
     vary: SwarmVary,
     v: View,
-) -> Targets3<vec4, vec4, vec4> {
+    prev_v: View,
+) -> Targets4<vec4, vec4, vec4, vec2> {
     let r2 = dot(vary.uv, vary.uv)
     if r2 > 1.0 {
         discard()
@@ -313,10 +319,12 @@ pub fn swarm_fs(
         pad1: 0.0,
         pad2: 0.0,
     }
-    Targets3 {
+    let motion = project_uv_unjittered(prev_v, vary.prev_wp) - project_uv_unjittered(v, vary.wp)
+    Targets4 {
         first: vec4(n * 0.5 + vec3(0.5), 1.0),
         second: vec4(sub.albedo, sub.roughness),
         third: vec4(sub.emits, encode_mat_signed(sub)),
+        fourth: motion,
     }
 }
 
