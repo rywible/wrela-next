@@ -44,6 +44,9 @@ pub struct Pacer {
     pub misses: u32,
     /// Frames shown so far: the first [`LEARN`] go unpaced, and say the refresh period.
     shown: u32,
+    /// The refresh period the system reports for the display, if it does: frames slower than a
+    /// refresh are shown a whole number of its refreshes apart, which it tells from one.
+    reported: Option<f64>,
 }
 
 /// A frame presented and not yet shown: the refresh it aimed at, when it took its input, and
@@ -57,8 +60,13 @@ struct Waiting {
 
 /// Frames shown unpaced at the start, as fast as the display takes them: their gaps are its
 /// refresh period (a paced frame aims at every refresh it thinks there is, so it can't see one
-/// faster).
+/// faster). Frames whose work takes longer than a refresh are shown whole refreshes apart, more
+/// than one: a period the system reports ([`Pacer::of_display`]) tells those gaps from the
+/// refresh ([`Pacer::refresh_of`]).
 const LEARN: u32 = 16;
+/// How near a whole number of reported refreshes a learned gap must be to be taken as that many
+/// refreshes (a share of one).
+const WHOLE: f64 = 0.1;
 
 /// How far after its time a frame may still take its input and keep its refresh: a late wake.
 const LATE: f64 = 0.0005;
@@ -99,7 +107,25 @@ impl Pacer {
             missed_ever: false,
             misses: 0,
             shown: 0,
+            reported: None,
         }
+    }
+
+    /// A pacer for a display the system says refreshes every `period` seconds: frames shown
+    /// still say its period (a display may run at another rate than it reports), but gaps of a
+    /// whole number of its refreshes, frames slower than a refresh, are taken as one.
+    pub fn of_display(period: f64) -> Pacer {
+        Pacer { reported: Some(period), ..Pacer::new(period) }
+    }
+
+    /// The refresh period that gaps whose median is `learned` say: with a reported period, a
+    /// median of two or more of its refreshes (frames slower than a refresh) is one of them.
+    fn refresh_of(&self, learned: f64) -> f64 {
+        let Some(r) = self.reported.filter(|r| r.is_finite() && *r > 0.0) else {
+            return learned;
+        };
+        let k = (learned / r).round();
+        if k >= 2.0 && (learned - k * r).abs() <= WHOLE * r { learned / k } else { learned }
     }
 
     /// The display's refresh period as learned (seconds).
@@ -216,7 +242,8 @@ impl Pacer {
             let gap = at - last;
             if gap > 0.0 {
                 push(&mut self.gaps, gap, 64);
-                self.period = median(self.gaps.make_contiguous());
+                let learned = median(self.gaps.make_contiguous());
+                self.period = self.refresh_of(learned);
             }
         }
         self.shown += 1;
@@ -338,7 +365,12 @@ mod tests {
     }
 
     fn run(display: &Display, frames: u64, guess: f64, work: impl Fn(u64) -> f64) -> Ran {
-        let mut pacer = Pacer::new(guess);
+        run_with(display, frames, Pacer::new(guess), work)
+    }
+
+    /// [`run`] with a pacer of the caller's.
+    fn run_with(display: &Display, frames: u64, pacer: Pacer, work: impl Fn(u64) -> f64) -> Ran {
+        let mut pacer = pacer;
         let (mut now, mut last_shown) = (0.0f64, f64::NEG_INFINITY);
         // Shown, not yet told: (when, id, sampled).
         let mut coming: Vec<(f64, u64, f64)> = Vec::new();
@@ -437,6 +469,31 @@ mod tests {
         let g = median(&gaps);
         assert!((g - 1.0 / 120.0).abs() < 0.0002, "shown every {g}");
         assert!(median(&ran.latencies[600..]) < 0.0075);
+    }
+
+    #[test]
+    fn frames_slower_than_a_refresh_at_the_start_do_not_halve_the_rate_after() {
+        // A 120 Hz display the system reports; the first 40 frames take 18 ms each (more than
+        // two refreshes), so the unpaced start shows them two or three refreshes apart.
+        let display = Display {
+            period: 1.0 / 120.0,
+            phase: 0.0,
+            latch: 0.002,
+            gridless_from: u64::MAX,
+            hiccup: None,
+        };
+        let work = |i: u64| if i < 40 { 0.018 } else { 0.002 };
+        // Reported: once the work is light, a frame each refresh.
+        let ran = run_with(&display, 900, Pacer::of_display(display.period), work);
+        let gaps: Vec<f64> = ran.shown[600..].windows(2).map(|w| w[1] - w[0]).collect();
+        let g = median(&gaps);
+        assert!((g - display.period).abs() < 0.0002, "shown every {g}");
+        // A median of whole refreshes is one; one that isn't stays as it is.
+        let pacer = Pacer::of_display(1.0 / 120.0);
+        assert!((pacer.refresh_of(2.0 / 120.0) - 1.0 / 120.0).abs() < 1e-12);
+        assert!((pacer.refresh_of(3.0 / 120.0) - 1.0 / 120.0).abs() < 1e-12);
+        assert_eq!(pacer.refresh_of(0.025 * 0.75), 0.025 * 0.75);
+        assert_eq!(Pacer::new(1.0 / 120.0).refresh_of(2.0 / 120.0), 2.0 / 120.0);
     }
 
     #[test]

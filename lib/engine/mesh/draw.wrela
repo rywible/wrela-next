@@ -1,28 +1,28 @@
 // Unified hardware rasterization of extracted surface meshlets (`extract`) and clipmap heightfields
 // (`height`): dual-cascade rotated-PCF sun shadows, camera-focused world-space radiance cache +
-// auto-extracted dynamic local emitters, 4× hardware MSAA direct HDR + G-buffer pass, half-res
-// bilateral 4-cone GI + Screen-Space Specular Reflections (SSR) + micro-contact shadows, unified
-// refractive pass (glass/water/crystal with SSR + Snell refraction + Beer-Lambert absorption),
-// volumetric froxels, Dual Kawase HDR bloom, and ONE `Look::tone` pass.
+// auto-extracted dynamic local emitters, 1× Halton-jittered G-buffer + analytical motion vectors,
+// pixel-rate deferred direct lighting, phase-cycled half-res bilateral 4-cone GI + Screen-Space
+// Specular Reflections (SSR) + micro-contact shadows, unified refractive pass (glass/water/crystal
+// with SSR + Snell refraction + Beer-Lambert absorption over the field's own interior length),
+// Temporal Super-Resolution (TSR), volumetric froxels, Dual Kawase HDR bloom, and ONE `Look::tone`
+// pass.
 
 use matter::height::{Height, NoHeight}
 use matter::medium::{Medium, NoMedium}
 use matter::sky::Sky
-use matter::substance::{
-    ONE_OVER_PI, Substance, env_brdf_approx, fresnel_schlick_rough,
-}
+use matter::substance::{ONE_OVER_PI, Substance, env_brdf_approx, fresnel_schlick_rough}
 use matter::swarm::{NoSwarm, Swarm}
 use matter::world::{And, Many, One, World}
 use mesh::extract::{
-    ExtractScratch, MeshBatch, MeshVertex, eval_dqs, extract_scratch, mesh_batch, steep,
+    ExtractScratch, MeshBatch, MeshVertex, eval_dqs, extract_scratch, mesh_batch, size_floor, steep,
     unpack_oct_normal, unpack_smooth, unpack_thing,
 }
 use mesh::height::{CLIP_RINGS, ClipmapMesh, MeshVary, clipmap_mesh, height_vs}
 use mesh::light::{
     Emitter, NEAR, RadGrid, RadianceCache, SHADOW_SIDE, ShadowView, SkyCache, clip_of,
     cone_indirect, contact_shadow, decode_substance, encode_mat_signed, eval_emitters_tiled,
-    radiance_cache, shadow_view, sky_background, sky_cache, sky_irradiance, sky_specular,
-    spec_cone, sun_shadow_hybrid, sun_vis_point, trace_ssr,
+    radiance_cache, shadow_view, sky_background, sky_cache, sky_irradiance, sky_specular, spec_cone,
+    sun_shadow_hybrid, sun_vis_point, trace_ssr,
 }
 use mesh::sdf::{
     SdfClipmap, SdfGrid, multi_bounce_ao, sdf_bent_ao, sdf_clipmap, sdf_curvature, sdf_grid,
@@ -30,9 +30,7 @@ use mesh::sdf::{
 }
 use mesh::swarm::{SwarmSim, swarm_fs, swarm_shadow_vs, swarm_sim, swarm_vs}
 use mesh::tsr::{TsrState, halton_jitter, project_uv_unjittered, tsr_state}
-use mesh::volume::{
-    BloomPyramid, FroxelVolume, bloom_pyramid, froxel_volume, hdr_tone_fs,
-}
+use mesh::volume::{BloomPyramid, FroxelVolume, bloom_pyramid, froxel_volume, hdr_tone_fs}
 use picture::eye::{Eye, View, view}
 use picture::look::Look
 use picture::picture::{Picture, picture}
@@ -41,11 +39,11 @@ use std::collections::Vec
 use std::field::{DualQuat, Field, Rigid}
 use std::gpu::{
     Address, ClipPosition, Compare, ComparisonSampler, Cull, Depth, DepthBias, DepthOnlyPass,
-    DepthPass, DepthPass4, DepthTexture, Filter, FragCoord, GpuBuffer, GpuSpan, InstanceIndex, R8,
-    R16Float, Rg16Float, Rgba8, Rgba16Float, Rgba32Float, Sampler, Targets2, Targets3, Targets4,
-    Texture, Texture3d, VertexIndex, begin_depth_pass, begin_pass, begin_pass2, begin_pass3,
-    begin_pass4_with_depth, begin_pass_with_depth, buffer_of, comparison_sampler, copy_texture,
-    depth_texture, discard, draw, label, sampler, texture,
+    DepthPass, DepthPass2, DepthPass4, DepthTexture, Filter, FragCoord, GpuBuffer, GpuSpan,
+    InstanceIndex, R16Float, Rg16Float, Rgba8, Rgba16Float, Sampler, Targets2, Targets4, Texture,
+    Texture3d, VertexIndex, begin_depth_pass, begin_pass, begin_pass2, begin_pass2_with_depth,
+    begin_pass4, begin_pass4_with_depth, begin_pass_with_depth, buffer_of, comparison_sampler,
+    copy_texture, depth_texture, discard, draw, label, sampler, texture,
 }
 use std::hash::{Hasher, StateHash}
 
@@ -55,17 +53,19 @@ const FOCUS_RAD: f32 = 9.5
 /// Default maximum active surface bricks per batch.
 const BATCH_BRICKS: u32 = 8192
 
-/// Distance threshold (m) beyond which `Many` things refresh on alternating 30 Hz frames while
-/// foreground things refresh every frame (60 Hz).
+/// Distance (m) beyond which a large `Many` (`N >= 16`) puts a thing in one of its two far
+/// batches rather than its near one.
 const FAR_TIER_DIST: f32 = 9.0
 
-/// Lean 60-byte vertex-to-fragment interpolator payload for 16-byte compact visibility meshlets
-/// (2× smaller than `MeshVary`): carries ONLY geometry + motion + `(smooth, thing_id)` while
+/// Lean vertex-to-fragment interpolator payload for 16-byte compact visibility meshlets (smaller
+/// than `MeshVary`): carries ONLY geometry + motion + the extraction-space point `local_p` (which
+/// moves with the thing, so per-pixel micro relief stays locked to it) + `(smooth, thing_id)` while
 /// `field.channels(wp)` evaluates at infinite resolution at 1× pixel rate.
 struct FieldVary: Copy {
     clip: ClipPosition,
     wp: vec3,
     prev_wp: vec3,
+    local_p: vec3,
     normal: vec3,
     meta: vec2,
 }
@@ -84,7 +84,13 @@ struct SkinVary: Copy {
 /// Vertex shader for the unified shadow depth pass: projects 16-byte `MeshVertex` through its
 /// instance's rigid transform `xforms[ii.index]` into orthographic sun space (5× less fetch BW).
 @vertex
-fn shadow_vs(verts: [MeshVertex], xforms: [Rigid], sv: ShadowView, vi: VertexIndex, ii: InstanceIndex) -> ClipPosition {
+fn shadow_vs(
+    verts: [MeshVertex],
+    xforms: [Rigid],
+    sv: ShadowView,
+    vi: VertexIndex,
+    ii: InstanceIndex,
+) -> ClipPosition {
     let vert = verts[vi.index]
     let wp = xforms[ii.index].apply_point(vec3(vert.px, vert.py, vert.pz))
     ClipPosition { position: vec4(sv.project(wp), 1.0) }
@@ -143,6 +149,7 @@ fn mesh_vs(
         clip: clip_of(v, wp),
         wp,
         prev_wp,
+        local_p: lp,
         normal: n,
         meta: vec2(smooth, f32(tid) + 0.5),
     }
@@ -264,16 +271,28 @@ fn micro_field_grad(p: vec3) -> vec4 {
     )
     let v3 = sin(p3.x) * cos(p3.y) * sin(p3.z) * 0.18
     let g3 = vec3(
-        (cos(p3.x) * cos(p3.y) * sin(p3.z) * 31.0 + sin(p3.x) * cos(p3.y) * cos(p3.z) * 15.0) * 0.18,
-        (-cos(p3.x) * cos(p3.y) * sin(p3.z) * 19.0 - sin(p3.x) * sin(p3.y) * sin(p3.z) * 29.0) * 0.18,
-        (-sin(p3.x) * sin(p3.y) * sin(p3.z) * 17.0 + sin(p3.x) * cos(p3.y) * cos(p3.z) * 33.0) * 0.18,
+        (cos(p3.x) * cos(p3.y) * sin(p3.z) * 31.0 + sin(p3.x) * cos(p3.y) * cos(p3.z) * 15.0) *
+            0.18,
+        (-cos(p3.x) * cos(p3.y) * sin(p3.z) * 19.0 - sin(p3.x) * sin(p3.y) * sin(p3.z) * 29.0) *
+            0.18,
+        (-sin(p3.x) * sin(p3.y) * sin(p3.z) * 17.0 + sin(p3.x) * cos(p3.y) * cos(p3.z) * 33.0) *
+            0.18,
     )
     vec4(g1 + g2 + g3, v1 + v2 + v3)
 }
 
 /// Applies per-pixel 3D field-space microsurface relief (normal bump + roughness/albedo micro-grain)
-/// with automatic distance attenuation so distant surfaces never alias.
-fn apply_micro_relief(wp: vec3, n: vec3, sub: Substance, dist: f32) -> (vec3, Substance) {
+/// with automatic distance attenuation so distant surfaces never alias. The relief is evaluated at
+/// the material point `mp` (the thing's extraction-space or rest-pose point, which moves with it, so
+/// the grain never swims over a moving or skinned surface); its analytic gradient is carried to the
+/// world surface at `wp` through the pixel's screen derivatives of both points (Mikkelsen 2010
+/// surface-gradient bump mapping), exact for any rigid or skinned map from `mp` to `wp`.
+fn apply_micro_relief(wp: vec3, mp: vec3, n: vec3, sub: Substance, dist: f32) -> (vec3, Substance) {
+    // Derivatives first, while every pixel of the quad still runs this code.
+    let dwx = dpdx(wp)
+    let dwy = dpdy(wp)
+    let dmx = dpdx(mp)
+    let dmy = dpdy(mp)
     if sub.micro <= 0.01 {
         return (n, sub)
     }
@@ -281,12 +300,20 @@ fn apply_micro_relief(wp: vec3, n: vec3, sub: Substance, dist: f32) -> (vec3, Su
     if fade <= 0.01 {
         return (n, sub)
     }
-    let mg = micro_field_grad(wp)
+    let mg = micro_field_grad(mp)
     let amp = sub.micro * fade
-    // Project 3D gradient onto tangent plane so surface normal tilts physically without flipping.
-    // A clearcoat film (`coat > 0.2`) fills the micro-pores beneath it, so its normal tilts about
-    // half as far and its reflections stay crisp.
-    let g_tan = mg.xyz - n * dot(mg.xyz, n)
+    // World tangent-plane gradient of the relief height `h(mp(wp))`: the analytic gradient's change
+    // along each screen axis (`dot(g, dm)`) spread over the world tangent frame (`r1`, `r2`), so the
+    // normal tilts physically without flipping. A clearcoat film (`coat > 0.2`) fills the
+    // micro-pores beneath it, so its normal tilts about half as far and its reflections stay crisp.
+    let r1 = cross(dwy, n)
+    let r2 = cross(n, dwx)
+    let det = dot(dwx, r1)
+    let g_tan = if abs(det) > 1.0e-20 {
+        (r1 * dot(mg.xyz, dmx) + r2 * dot(mg.xyz, dmy)) * (1.0 / det)
+    } else {
+        mg.xyz - n * dot(mg.xyz, n)
+    }
     let bump_s = if sub.coat > 0.2 { 0.024 } else { 0.045 }
     let n_bumped = normalize(n - g_tan * (amp * bump_s))
     let grain = clamp(mg.w, -1.0, 1.0)
@@ -294,16 +321,15 @@ fn apply_micro_relief(wp: vec3, n: vec3, sub: Substance, dist: f32) -> (vec3, Su
     let rough_mod = clamp(sub.roughness + grain * amp * 0.12, 0.03, 1.0)
     // A coat's thickness follows the micro-grain, so any coated substance's (`coat > 0.1`)
     // clearcoat varies across its surface with the same relief.
-    let coat_mod = if sub.coat > 0.1 { clamp(sub.coat + grain * amp * 0.25, 0.0, 1.0) } else { sub.coat }
-    (
-        n_bumped,
-        Substance {
-            albedo: albedo_mod,
-            roughness: rough_mod,
-            coat: coat_mod,
-            ..sub
-        },
-    )
+    let coat_mod = if sub.coat > 0.1 { clamp(sub.coat + grain * amp * 0.25, 0.0, 1.0) } else {
+        sub.coat
+    }
+    (n_bumped, Substance {
+        albedo: albedo_mod,
+        roughness: rough_mod,
+        coat: coat_mod,
+        ..sub,
+    })
 }
 
 /// Resolves crease-preserving shading normal from interpolated analytic normal and face derivatives.
@@ -322,10 +348,17 @@ fn resolve_normal_from(wp: vec3, normal: vec3, smooth: f32, ray_back: vec3) -> v
     if smooth < 0.5 || dot(nv, nf) < 0.85 { nf } else { nv }
 }
 
+/// Exact screen-space motion `prev_uv - curr_uv` of a surface point now at `wp` and last frame at
+/// `prev_wp`, both projected without jitter (what `tsr` reprojects by).
+fn motion_of(wp: vec3, prev_wp: vec3, v: View, prev_v: View) -> vec2 {
+    project_uv_unjittered(prev_v, prev_wp) - project_uv_unjittered(v, wp)
+}
+
 /// Shared 1× G-buffer + analytical motion-vector writer used by compact meshlets and heightfields.
 fn shade_gbuf_core(
     wp: vec3,
     prev_wp: vec3,
+    mp: vec3,
     normal: vec3,
     smooth: f32,
     sub0: Substance,
@@ -336,8 +369,8 @@ fn shade_gbuf_core(
     let dist = length(to_eye)
     let ray_back = if dist > 1.0e-6 { to_eye / dist } else { -v.forward }
     let n0 = resolve_normal_from(wp, normal, smooth, ray_back)
-    let (n, sub) = apply_micro_relief(wp, n0, sub0, dist)
-    let motion = project_uv_unjittered(prev_v, prev_wp) - project_uv_unjittered(v, wp)
+    let (n, sub) = apply_micro_relief(wp, mp, n0, sub0, dist)
+    let motion = motion_of(wp, prev_wp, v, prev_v)
     Targets4 {
         first: vec4(n * 0.5 + vec3(0.5), 1.0),
         second: vec4(clamp(sub.albedo, vec3(0.0), vec3(1.0)), clamp(sub.roughness, 0.02, 1.0)),
@@ -357,7 +390,7 @@ fn field_gbuf_one_fs<M: Field<Substance>>(
     prev_v: View,
 ) -> Targets4<vec4, vec4, vec4, vec2> {
     let sub0 = field.channels(vary.wp)
-    shade_gbuf_core(vary.wp, vary.prev_wp, vary.normal, vary.meta.x, sub0, v, prev_v)
+    shade_gbuf_core(vary.wp, vary.prev_wp, vary.local_p, vary.normal, vary.meta.x, sub0, v, prev_v)
 }
 
 /// Pixel-rate analytical G-buffer fragment shader for `Many<M, N>` compact meshlets.
@@ -372,7 +405,7 @@ fn field_gbuf_many_fs<M: Field<Substance>>(
 ) -> Targets4<vec4, vec4, vec4, vec2> {
     let tid = min(u32(max(vary.meta.y, 0.0)), n_fields - 1)
     let sub0 = fields[tid].channels(vary.wp)
-    shade_gbuf_core(vary.wp, vary.prev_wp, vary.normal, vary.meta.x, sub0, v, prev_v)
+    shade_gbuf_core(vary.wp, vary.prev_wp, vary.local_p, vary.normal, vary.meta.x, sub0, v, prev_v)
 }
 
 /// Skin-locked pixel-rate G-buffer fragment shader for `Skinned` `One<M>` meshlets.
@@ -385,7 +418,7 @@ fn field_skin_gbuf_one_fs<M: Field<Substance>>(
     prev_v: View,
 ) -> Targets4<vec4, vec4, vec4, vec2> {
     let sub0 = field.rest_channels(vary.rest_p)
-    shade_gbuf_core(vary.wp, vary.prev_wp, vary.normal, vary.meta.x, sub0, v, prev_v)
+    shade_gbuf_core(vary.wp, vary.prev_wp, vary.rest_p, vary.normal, vary.meta.x, sub0, v, prev_v)
 }
 
 /// Skin-locked pixel-rate G-buffer fragment shader for `Skinned` `Many<M, N>` meshlets.
@@ -400,17 +433,96 @@ fn field_skin_gbuf_many_fs<M: Field<Substance>>(
 ) -> Targets4<vec4, vec4, vec4, vec2> {
     let tid = min(u32(max(vary.meta.y, 0.0)), n_fields - 1)
     let sub0 = fields[tid].rest_channels(vary.rest_p)
-    shade_gbuf_core(vary.wp, vary.prev_wp, vary.normal, vary.meta.x, sub0, v, prev_v)
+    shade_gbuf_core(vary.wp, vary.prev_wp, vary.rest_p, vary.normal, vary.meta.x, sub0, v, prev_v)
+}
+
+// The opaque side of a quad routed to the transmissive list. A quad with any transmissive vertex
+// is drawn only by the transmissive pass, which discards its pixels whose own channels are opaque;
+// these `_cut_` shaders draw the same quads into the G-buffer and keep exactly those pixels, so a
+// boundary between a glass part and an opaque part of one field is covered by one pass or the other
+// at every pixel. They are separate entry points so the plain opaque draws keep their early depth.
+
+/// The opaque pixels of `One<M>`'s transmissive quads into the G-buffer.
+@fragment
+@budget(work: 8000)
+fn field_cut_gbuf_one_fs<M: Field<Substance>>(
+    vary: FieldVary,
+    field: M,
+    v: View,
+    prev_v: View,
+) -> Targets4<vec4, vec4, vec4, vec2> {
+    let sub0 = field.channels(vary.wp)
+    if sub0.transmission > 0.02 {
+        discard()
+    }
+    shade_gbuf_core(vary.wp, vary.prev_wp, vary.local_p, vary.normal, vary.meta.x, sub0, v, prev_v)
+}
+
+/// The opaque pixels of `Many<M, N>`'s transmissive quads into the G-buffer.
+@fragment
+@budget(work: 8000)
+fn field_cut_gbuf_many_fs<M: Field<Substance>>(
+    vary: FieldVary,
+    fields: [M],
+    n_fields: u32,
+    v: View,
+    prev_v: View,
+) -> Targets4<vec4, vec4, vec4, vec2> {
+    let tid = min(u32(max(vary.meta.y, 0.0)), n_fields - 1)
+    let sub0 = fields[tid].channels(vary.wp)
+    if sub0.transmission > 0.02 {
+        discard()
+    }
+    shade_gbuf_core(vary.wp, vary.prev_wp, vary.local_p, vary.normal, vary.meta.x, sub0, v, prev_v)
+}
+
+/// The opaque pixels of a `Skinned` `One<M>`'s transmissive quads into the G-buffer.
+@fragment
+@budget(work: 8000)
+fn field_skin_cut_gbuf_one_fs<M: Field<Substance>>(
+    vary: SkinVary,
+    field: M,
+    v: View,
+    prev_v: View,
+) -> Targets4<vec4, vec4, vec4, vec2> {
+    let sub0 = field.rest_channels(vary.rest_p)
+    if sub0.transmission > 0.02 {
+        discard()
+    }
+    shade_gbuf_core(vary.wp, vary.prev_wp, vary.rest_p, vary.normal, vary.meta.x, sub0, v, prev_v)
+}
+
+/// The opaque pixels of a `Skinned` `Many<M, N>`'s transmissive quads into the G-buffer.
+@fragment
+@budget(work: 8000)
+fn field_skin_cut_gbuf_many_fs<M: Field<Substance>>(
+    vary: SkinVary,
+    fields: [M],
+    n_fields: u32,
+    v: View,
+    prev_v: View,
+) -> Targets4<vec4, vec4, vec4, vec2> {
+    let tid = min(u32(max(vary.meta.y, 0.0)), n_fields - 1)
+    let sub0 = fields[tid].rest_channels(vary.rest_p)
+    if sub0.transmission > 0.02 {
+        discard()
+    }
+    shade_gbuf_core(vary.wp, vary.prev_wp, vary.rest_p, vary.normal, vary.meta.x, sub0, v, prev_v)
 }
 
 /// Lean 1× G-buffer + motion-vector fragment shader for opaque terrain heightfields (`height_vs`).
 @fragment
-fn mesh_gbuf_fs(
-    vary: MeshVary,
-    v: View,
-    prev_v: View,
-) -> Targets4<vec4, vec4, vec4, vec2> {
-    shade_gbuf_core(vary.wp, vary.prev_wp, vary.normal, vary.pbr.w, vary_substance(vary), v, prev_v)
+fn mesh_gbuf_fs(vary: MeshVary, v: View, prev_v: View) -> Targets4<vec4, vec4, vec4, vec2> {
+    shade_gbuf_core(
+        vary.wp,
+        vary.prev_wp,
+        vary.wp,
+        vary.normal,
+        vary.pbr.w,
+        vary_substance(vary),
+        v,
+        prev_v,
+    )
 }
 
 /// Reconstructs exact world hit distance along `ray` from 1× reversed-Z depth `ndc_z`.
@@ -428,7 +540,10 @@ fn decode_gbuf_normal(gn: vec4, fallback: vec3) -> vec3 {
 /// Shared pixel-rate direct lighting core used identically by both `draw_scene` (`deferred_direct_fs`)
 /// and `drawn_only` (`deferred_direct_judge_fs`): evaluates exact SDF variable-width soft shadows +
 /// analytical curvature weathering + thickness-modulated backlit SSS + tiled SDF-shadowed local
-/// emitters ONCE per screen pixel (zero micro-triangle quad overshading).
+/// emitters ONCE per screen pixel (zero micro-triangle quad overshading). Returns the direct HDR
+/// `(light, dist)`, the judges' `(n, dist)` place, the sun visibility, and the sun's share of the
+/// direct light (`0..1` by luma), so the half-res micro-contact shadow (cast toward the sun) darkens
+/// only the sun's part and never emission or local emitters.
 @budget(work: 48000)
 fn shade_direct_pixel<S: Sky>(
     px: u32,
@@ -458,15 +573,15 @@ fn shade_direct_pixel<S: Sky>(
     tiles_x: u32,
     full_w: u32,
     full_h: u32,
-) -> (vec4, vec4, f32) {
+) -> (vec4, vec4, f32, f32) {
     let gn = g_normal.load(px, py)
     let ray = v.ray(pixel_xy)
     if gn.w <= 0.5 {
-        return (vec4(sky_background(sky, sky_spec0, sky_s, ray), 65000.0), vec4(0.0), 1.0)
+        return (vec4(sky_background(sky, sky_spec0, sky_s, ray), 65000.0), vec4(0.0), 1.0, 0.0)
     }
     let ndc_z = depth.load(px, py)
     if ndc_z <= 1.0e-6 {
-        return (vec4(sky_background(sky, sky_spec0, sky_s, ray), 65000.0), vec4(0.0), 1.0)
+        return (vec4(sky_background(sky, sky_spec0, sky_s, ray), 65000.0), vec4(0.0), 1.0, 0.0)
     }
     let n = decode_gbuf_normal(gn, -ray)
     let ga = g_albedo.load(px, py)
@@ -480,7 +595,9 @@ fn shade_direct_pixel<S: Sky>(
 
     // Universal world-space analytical curvature weathering (`∇²d` from 3D SDF clipmap):
     // convex bevels/edges subtly polish & catch light; concave crevices darken & roughen.
-    if sdf_grid.enabled != 0 && abs(mat_code) >= 0.01 && max(sub.emits.x, max(sub.emits.y, sub.emits.z)) < 0.25 {
+    if sdf_grid.enabled != 0 &&
+        abs(mat_code) >= 0.01 &&
+        max(sub.emits.x, max(sub.emits.y, sub.emits.z)) < 0.25 {
         let curv = sdf_curvature(sdf_grid, sdf0, sdf1, sdf_s, wp)
         let convex = clamp(curv, 0.0, 1.0)
         let concave = clamp(-curv, 0.0, 1.0)
@@ -489,7 +606,7 @@ fn shade_direct_pixel<S: Sky>(
         sub = Substance {
             albedo: clamp(sub.albedo * wear_a, vec3(0.005), vec3(1.0)),
             roughness: wear_r,
-            ..sub
+            ..sub,
         }
     }
 
@@ -507,14 +624,36 @@ fn shade_direct_pixel<S: Sky>(
         let trans = exp(-thick * 3.8)
         let back = pow(clamp(dot(ray_back, normalize(-sun.way + n * 0.35)), 0.0, 1.0), 3.0)
         let sss_tint = sub.albedo * sqrt(max(sub.albedo, vec3(0.02)))
-        direct_sun += sss_tint * sun.light * (sub.subsurface * trans * (0.25 + 0.75 * back) * ONE_OVER_PI)
+        direct_sun += sss_tint *
+            sun.light *
+            (sub.subsurface * trans * (0.25 + 0.75 * back) * ONE_OVER_PI)
     }
     let local_light = eval_emitters_tiled(
-        sub, wp, n, ray_back, rad_grid, rad0, rad1, rad_s, sdf_grid, sdf0, sdf1, sdf_s,
-        emitters, tile_masks, tiles_x, px, py,
+        sub,
+        wp,
+        n,
+        ray_back,
+        rad_grid,
+        rad0,
+        rad1,
+        rad_s,
+        sdf_grid,
+        sdf0,
+        sdf1,
+        sdf_s,
+        emitters,
+        tile_masks,
+        tiles_x,
+        px,
+        py,
     )
     let direct = sub.emits + direct_sun + local_light
-    (vec4(direct, min(dist, 65000.0)), vec4(n, dist), vis)
+    let sun_share = clamp(
+        luma(max(direct_sun, vec3(0.0))) / max(luma(max(direct, vec3(0.0))), 1.0e-6),
+        0.0,
+        1.0,
+    )
+    (vec4(direct, min(dist, 65000.0)), vec4(n, dist), vis, sun_share)
 }
 
 /// Full-resolution 1× pixel-rate deferred direct lighting pass (`draw_scene`).
@@ -546,16 +685,39 @@ fn deferred_direct_fs<S: Sky>(
     tiles_x: u32,
     full_w: u32,
     full_h: u32,
-) -> vec4 {
+) -> Targets2<vec4, f32> {
     let px = min(u32(pixel.position.x), full_w - 1)
     let py = min(u32(pixel.position.y), full_h - 1)
-    let (hdr_d, _place, _vis) = shade_direct_pixel(
-        px, py, pixel.position.xy, v, sv, rad_grid, sdf_grid, sky,
-        g_normal, g_albedo, g_emits, depth, sky_spec0, sky_s,
-        shadow_map, cmp, rad0, rad1, rad_s, sdf0, sdf1, sdf_s,
-        emitters, tile_masks, tiles_x, full_w, full_h,
+    let (hdr_d, _place, _vis, sun_share) = shade_direct_pixel(
+        px,
+        py,
+        pixel.position.xy,
+        v,
+        sv,
+        rad_grid,
+        sdf_grid,
+        sky,
+        g_normal,
+        g_albedo,
+        g_emits,
+        depth,
+        sky_spec0,
+        sky_s,
+        shadow_map,
+        cmp,
+        rad0,
+        rad1,
+        rad_s,
+        sdf0,
+        sdf1,
+        sdf_s,
+        emitters,
+        tile_masks,
+        tiles_x,
+        full_w,
+        full_h,
     )
-    hdr_d
+    Targets2 { first: hdr_d, second: sun_share }
 }
 
 /// Identical pixel-rate deferred direct pass with `(place, sun)` diagnostic outputs for `drawn_only`
@@ -588,16 +750,39 @@ fn deferred_direct_judge_fs<S: Sky>(
     tiles_x: u32,
     full_w: u32,
     full_h: u32,
-) -> Targets3<vec4, vec4, f32> {
+) -> Targets4<vec4, vec4, f32, f32> {
     let px = min(u32(pixel.position.x), full_w - 1)
     let py = min(u32(pixel.position.y), full_h - 1)
-    let (hdr_d, place, vis) = shade_direct_pixel(
-        px, py, pixel.position.xy, v, sv, rad_grid, sdf_grid, sky,
-        g_normal, g_albedo, g_emits, depth, sky_spec0, sky_s,
-        shadow_map, cmp, rad0, rad1, rad_s, sdf0, sdf1, sdf_s,
-        emitters, tile_masks, tiles_x, full_w, full_h,
+    let (hdr_d, place, vis, sun_share) = shade_direct_pixel(
+        px,
+        py,
+        pixel.position.xy,
+        v,
+        sv,
+        rad_grid,
+        sdf_grid,
+        sky,
+        g_normal,
+        g_albedo,
+        g_emits,
+        depth,
+        sky_spec0,
+        sky_s,
+        shadow_map,
+        cmp,
+        rad0,
+        rad1,
+        rad_s,
+        sdf0,
+        sdf1,
+        sdf_s,
+        emitters,
+        tile_masks,
+        tiles_x,
+        full_w,
+        full_h,
     )
-    Targets3 { first: hdr_d, second: place, third: vis }
+    Targets4 { first: hdr_d, second: place, third: vis, fourth: sun_share }
 }
 
 /// Half-resolution (`W/2 × H/2`) indirect lighting pass: computes 4-cone hemisphere diffuse GI +
@@ -670,7 +855,9 @@ fn indirect_half_fs<S: Sky>(
         let bent_shift = (sky_bent - sky_n) * (ao * 0.75)
         ind = vec4(max(ind0.xyz + bent_shift, vec3(0.0)), ao)
     }
-    let cshad = if rad_grid.enabled != 0 { contact_shadow(v, depth, wp, n, sky.sun().way) } else { 1.0 }
+    let cshad = if rad_grid.enabled != 0 { contact_shadow(v, depth, wp, n, sky.sun().way) } else {
+        1.0
+    }
 
     // Skip specular SSR & voxel/SDF reflection cone completely on pure matte surfaces (`abs(mat_code) < 0.01`).
     var env_spec = vec3(0.0)
@@ -680,7 +867,19 @@ fn indirect_half_fs<S: Sky>(
         let eff_r = if mat_code > 0.15 && mat_code < 1.8 { min(roughness, 0.12) } else { roughness }
         let sky_refl = sky_specular(sky_spec0, sky_spec1, sky_spec2, sky_diff, sky_s, refl, eff_r)
         let w_refl = spec_cone(
-            rad_grid, rad0, rad1, rad2, rad_s, sdf_grid, sdf0, sdf1, sdf_s, wp, n, refl, eff_r,
+            rad_grid,
+            rad0,
+            rad1,
+            rad2,
+            rad_s,
+            sdf_grid,
+            sdf0,
+            sdf1,
+            sdf_s,
+            wp,
+            n,
+            refl,
+            eff_r,
         )
         let spec_occ = clamp(ind.w + (1.0 - eff_r) * 0.25, 0.15, 1.0)
         let fallback = w_refl.xyz + sky_refl * (1.0 - w_refl.w * 0.85) * spec_occ
@@ -696,12 +895,14 @@ fn indirect_half_fs<S: Sky>(
 
 /// Full-resolution depth+normal bilateral upsample of phase-cycled half-res GI, bent-normal AO,
 /// SSR, and micro-contact shadows combined with the pixel-rate direct HDR buffer into `hdr_colour`.
+/// The contact shadow darkens only the sun's share of the direct light (`sun_share`).
 @fragment
 fn combine_indirect_fs<S: Sky>(
     pixel: FragCoord,
     v: View,
     sky: S,
     hdr_direct: Texture<Rgba16Float>,
+    sun_share: Texture<R16Float>,
     g_normal: Texture<Rgba8>,
     g_albedo: Texture<Rgba8>,
     g_emits: Texture<Rgba16Float>,
@@ -731,15 +932,20 @@ fn combine_indirect_fs<S: Sky>(
     let mat_code = ge.w
 
     // 4-tap depth + normal weighted bilateral upsample from phase-cycled half-res GI/SSR buffers.
+    // Half-res texel `h` was shaded at full-res `2 h + phase`, so the two texels bracketing `px` are
+    // `floor((px - phase) / 2)` and the next, weighted bilinearly by where `px` falls between them.
     let hw = max(full_w / 2, 1)
     let hh = max(full_h / 2, 1)
-    let hx0 = min(px / 2, hw - 1)
-    let hy0 = min(py / 2, hh - 1)
+    let hx0 = u32(clamp((i32(px) - i32(phase_x) + 2) / 2 - 1, 0, i32(hw) - 1))
+    let hy0 = u32(clamp((i32(py) - i32(phase_y) + 2) / 2 - 1, 0, i32(hh) - 1))
     let hx1 = min(hx0 + 1, hw - 1)
     let hy1 = min(hy0 + 1, hh - 1)
+    let tx = clamp((f32(px) - f32(hx0 * 2 + phase_x)) * 0.5, 0.0, 1.0)
+    let ty = clamp((f32(py) - f32(hy0 * 2 + phase_y)) * 0.5, 0.0, 1.0)
 
     let xs = [hx0, hx1, hx0, hx1]
     let ys = [hy0, hy0, hy1, hy1]
+    let bw = [(1.0 - tx) * (1.0 - ty), tx * (1.0 - ty), (1.0 - tx) * ty, tx * ty]
     var diff_acc = vec4(0.0)
     var spec_acc = vec4(0.0)
     var w_sum = 0.0
@@ -754,7 +960,7 @@ fn combine_indirect_fs<S: Sky>(
             let sn_v = decode_gbuf_normal(sn, n)
             let ndot = max(dot(n, sn_v), 0.0)
             let dz = abs(dist - sd) / max(dist * 0.08, 0.15)
-            let w = (ndot * ndot * ndot * ndot + 0.001) * exp(-dz * dz)
+            let w = (bw[k] + 0.02) * (ndot * ndot * ndot * ndot + 0.001) * exp(-dz * dz)
             diff_acc += gi_diff.load(sx, sy) * w
             spec_acc += gi_spec.load(sx, sy) * w
             w_sum += w
@@ -763,9 +969,8 @@ fn combine_indirect_fs<S: Sky>(
     let ind = if w_sum > 1.0e-4 { diff_acc / w_sum } else { gi_diff.load(hx0, hy0) }
     let spec_c = if w_sum > 1.0e-4 { spec_acc / w_sum } else { gi_spec.load(hx0, hy0) }
 
-    let emit_luma = luma(max(ge.xyz, vec3(0.0)))
-    let cshad = if emit_luma < 0.5 && dot(n, sky.sun().way) > 0.05 { spec_c.w } else { 1.0 }
-    var rad = direct_d.xyz * cshad
+    let cshad = if dot(n, sky.sun().way) > 0.05 { spec_c.w } else { 1.0 }
+    var rad = direct_d.xyz * (1.0 - sun_share.load(px, py) * (1.0 - cshad))
 
     let sky_amb = sky_irradiance(sky_diff, sky_s, n) * multi_bounce_ao(ind.w, albedo) + ind.xyz
     if abs(mat_code) < 0.01 {
@@ -774,12 +979,15 @@ fn combine_indirect_fs<S: Sky>(
         let ray_back = -ray
         let ndv = max(dot(n, ray_back), 0.001)
         let metallic = if mat_code < -0.01 { clamp(-mat_code, 0.0, 1.0) } else { 0.0 }
-        let coat = if mat_code > 0.03 && mat_code < 1.8 { clamp(mat_code - 0.02, 0.0, 1.0) } else { 0.0 }
+        let coat = if mat_code > 0.03 && mat_code < 1.8 { clamp(mat_code - 0.02, 0.0, 1.0) } else {
+            0.0
+        }
         let f0 = mix(vec3(0.04), albedo, metallic)
         let f_env = fresnel_schlick_rough(f0, ndv, roughness)
         let kd = (vec3(1.0) - f_env) * (1.0 - metallic)
         let brdf_ab = env_brdf_approx(roughness, ndv)
-        var indirect = albedo * (kd * ONE_OVER_PI) * sky_amb + spec_c.xyz * (f0 * brdf_ab.x + vec3(brdf_ab.y))
+        var indirect = albedo * (kd * ONE_OVER_PI) * sky_amb +
+            spec_c.xyz * (f0 * brdf_ab.x + vec3(brdf_ab.y))
         if coat > 1.0e-4 {
             let fc = fresnel_schlick_rough(vec3(0.04), ndv, 0.06).x * coat
             indirect = indirect * (1.0 - fc) + spec_c.xyz * fc
@@ -794,6 +1002,7 @@ fn combine_indirect_fs<S: Sky>(
 fn shade_refract_refl_core(
     pixel: FragCoord,
     wp: vec3,
+    mp: vec3,
     normal: vec3,
     smooth: f32,
     sub0: Substance,
@@ -828,13 +1037,33 @@ fn shade_refract_refl_core(
     }
     let ray_back = if dist > 1.0e-6 { to_eye / dist } else { -v.forward }
     let n0 = resolve_normal_from(wp, normal, smooth, ray_back)
-    let (n, sub) = apply_micro_relief(wp, n0, sub0, dist)
+    let (n, sub) = apply_micro_relief(wp, mp, n0, sub0, dist)
     let ndv = max(dot(n, ray_back), 0.001)
     let refl = normalize(n * (2.0 * ndv) - ray_back)
 
-    let sky_refl = sky_specular(sky_spec0, sky_spec1, sky_spec2, sky_diff, sky_s, refl, sub.roughness)
+    let sky_refl = sky_specular(
+        sky_spec0,
+        sky_spec1,
+        sky_spec2,
+        sky_diff,
+        sky_s,
+        refl,
+        sub.roughness,
+    )
     let w_refl = spec_cone(
-        rad_grid, rad0, rad1, rad2, rad_s, sdf_grid, sdf0, sdf1, sdf_s, wp, n, refl, sub.roughness,
+        rad_grid,
+        rad0,
+        rad1,
+        rad2,
+        rad_s,
+        sdf_grid,
+        sdf0,
+        sdf1,
+        sdf_s,
+        wp,
+        n,
+        refl,
+        sub.roughness,
     )
     let fallback = w_refl.xyz + sky_refl * (1.0 - w_refl.w * 0.85)
     let ssr = trace_ssr(v, hdr_bg, bg_s, wp, n, refl, sub.roughness)
@@ -870,9 +1099,30 @@ fn field_refract_refl_one_fs<M: Field<Substance>>(
 ) -> vec4 {
     let sub0 = field.channels(vary.wp)
     shade_refract_refl_core(
-        pixel, vary.wp, vary.normal, vary.meta.x, sub0, v, rad_grid, sdf_grid,
-        sky_diff, sky_spec0, sky_spec1, sky_spec2, sky_s, rad0, rad1, rad2, rad_s,
-        sdf0, sdf1, sdf_s, hdr_bg, bg_s, half_size,
+        pixel,
+        vary.wp,
+        vary.local_p,
+        vary.normal,
+        vary.meta.x,
+        sub0,
+        v,
+        rad_grid,
+        sdf_grid,
+        sky_diff,
+        sky_spec0,
+        sky_spec1,
+        sky_spec2,
+        sky_s,
+        rad0,
+        rad1,
+        rad2,
+        rad_s,
+        sdf0,
+        sdf1,
+        sdf_s,
+        hdr_bg,
+        bg_s,
+        half_size,
     )
 }
 
@@ -906,9 +1156,30 @@ fn field_refract_refl_many_fs<M: Field<Substance>>(
     let tid = min(u32(max(vary.meta.y, 0.0)), n_fields - 1)
     let sub0 = fields[tid].channels(vary.wp)
     shade_refract_refl_core(
-        pixel, vary.wp, vary.normal, vary.meta.x, sub0, v, rad_grid, sdf_grid,
-        sky_diff, sky_spec0, sky_spec1, sky_spec2, sky_s, rad0, rad1, rad2, rad_s,
-        sdf0, sdf1, sdf_s, hdr_bg, bg_s, half_size,
+        pixel,
+        vary.wp,
+        vary.local_p,
+        vary.normal,
+        vary.meta.x,
+        sub0,
+        v,
+        rad_grid,
+        sdf_grid,
+        sky_diff,
+        sky_spec0,
+        sky_spec1,
+        sky_spec2,
+        sky_s,
+        rad0,
+        rad1,
+        rad2,
+        rad_s,
+        sdf0,
+        sdf1,
+        sdf_s,
+        hdr_bg,
+        bg_s,
+        half_size,
     )
 }
 
@@ -940,9 +1211,30 @@ fn field_skin_refract_refl_one_fs<M: Field<Substance>>(
 ) -> vec4 {
     let sub0 = field.rest_channels(vary.rest_p)
     shade_refract_refl_core(
-        pixel, vary.wp, vary.normal, vary.meta.x, sub0, v, rad_grid, sdf_grid,
-        sky_diff, sky_spec0, sky_spec1, sky_spec2, sky_s, rad0, rad1, rad2, rad_s,
-        sdf0, sdf1, sdf_s, hdr_bg, bg_s, half_size,
+        pixel,
+        vary.wp,
+        vary.rest_p,
+        vary.normal,
+        vary.meta.x,
+        sub0,
+        v,
+        rad_grid,
+        sdf_grid,
+        sky_diff,
+        sky_spec0,
+        sky_spec1,
+        sky_spec2,
+        sky_s,
+        rad0,
+        rad1,
+        rad2,
+        rad_s,
+        sdf0,
+        sdf1,
+        sdf_s,
+        hdr_bg,
+        bg_s,
+        half_size,
     )
 }
 
@@ -976,9 +1268,30 @@ fn field_skin_refract_refl_many_fs<M: Field<Substance>>(
     let tid = min(u32(max(vary.meta.y, 0.0)), n_fields - 1)
     let sub0 = fields[tid].rest_channels(vary.rest_p)
     shade_refract_refl_core(
-        pixel, vary.wp, vary.normal, vary.meta.x, sub0, v, rad_grid, sdf_grid,
-        sky_diff, sky_spec0, sky_spec1, sky_spec2, sky_s, rad0, rad1, rad2, rad_s,
-        sdf0, sdf1, sdf_s, hdr_bg, bg_s, half_size,
+        pixel,
+        vary.wp,
+        vary.rest_p,
+        vary.normal,
+        vary.meta.x,
+        sub0,
+        v,
+        rad_grid,
+        sdf_grid,
+        sky_diff,
+        sky_spec0,
+        sky_spec1,
+        sky_spec2,
+        sky_s,
+        rad0,
+        rad1,
+        rad2,
+        rad_s,
+        sdf0,
+        sdf1,
+        sdf_s,
+        hdr_bg,
+        bg_s,
+        half_size,
     )
 }
 
@@ -1008,14 +1321,44 @@ fn refract_refl_fs(
     half_size: vec2,
 ) -> vec4 {
     shade_refract_refl_core(
-        pixel, vary.wp, vary.normal, vary.pbr.w, vary_substance(vary), v, rad_grid, sdf_grid,
-        sky_diff, sky_spec0, sky_spec1, sky_spec2, sky_s, rad0, rad1, rad2, rad_s,
-        sdf0, sdf1, sdf_s, hdr_bg, bg_s, half_size,
+        pixel,
+        vary.wp,
+        vary.wp,
+        vary.normal,
+        vary.pbr.w,
+        vary_substance(vary),
+        v,
+        rad_grid,
+        sdf_grid,
+        sky_diff,
+        sky_spec0,
+        sky_spec1,
+        sky_spec2,
+        sky_s,
+        rad0,
+        rad1,
+        rad2,
+        rad_s,
+        sdf0,
+        sdf1,
+        sdf_s,
+        hdr_bg,
+        bg_s,
+        half_size,
     )
 }
 
-/// Projects refracted exit point along Snell direction `rdir` at `ior` to screen UV.
-fn refract_uv_for(v: View, wp: vec3, n: vec3, ray_back: vec3, ndv: f32, ior: f32, refract_dist: f32) -> vec2 {
+/// Projects refracted exit point along Snell direction `rdir` at `ior` to screen UV in the frame's
+/// jittered raster (where `hdr_bg` holds it: a point at unjittered `q` is drawn at `q - jitter`).
+fn refract_uv_for(
+    v: View,
+    wp: vec3,
+    n: vec3,
+    ray_back: vec3,
+    ndv: f32,
+    ior: f32,
+    refract_dist: f32,
+) -> vec2 {
     let eta = 1.0 / max(ior, 1.02)
     let k = 1.0 - eta * eta * (1.0 - ndv * ndv)
     let rdir = if k > 0.0 {
@@ -1029,16 +1372,41 @@ fn refract_uv_for(v: View, wp: vec3, n: vec3, ray_back: vec3, ndv: f32, ior: f32
     let aspect = v.size.y / max(v.size.x, 1.0)
     let ex_ndc = (dot(erel, v.right) * v.focal * aspect) / ez
     let ey_ndc = (dot(erel, v.up) * v.focal) / ez
-    clamp(vec2(ex_ndc * 0.5 + 0.5, 0.5 - ey_ndc * 0.5), vec2(0.002), vec2(0.998))
+    let uv = vec2(ex_ndc * 0.5 + 0.5, 0.5 - ey_ndc * 0.5) - v.jitter / max(v.size, vec2(1.0))
+    clamp(uv, vec2(0.002), vec2(0.998))
+}
+
+/// How far a ray entering `field`'s solid at its surface point `wp` along `dir` runs inside before
+/// it leaves (m, at most `max_len`): the field's own distance sphere-traced from inside, so the
+/// Beer-Lambert path through a glass thing is its real interior length and not the gap to whatever
+/// lies behind it.
+fn interior_length<M: Field<Substance>>(field: M, wp: vec3, dir: vec3, max_len: f32) -> f32 {
+    var t = 0.004
+    var out = false
+    for _ in 0..24 {
+        if !out && t < max_len {
+            let d = field.distance(wp + dir * t)
+            if d >= 0.0 {
+                out = true
+            } else {
+                t += max(-d, 0.004)
+            }
+        }
+    }
+    min(t, max_len)
 }
 
 /// Shared physically-based refractive / transmissive shading core: 3-channel spectral chromatic
 /// dispersion, Snell refraction + Beer-Lambert absorption, 1-tap upsampled half-res SSR, thin-film
-/// iridescence, and GGX specular from sun & tiled spell emitters.
+/// iridescence, and GGX specular from sun & tiled spell emitters. `interior` is the light's path
+/// length inside the thing (`interior_length`), or negative for an open volume (a heightfield's
+/// water), whose path runs to whatever lies behind it.
 @budget(work: 38000)
 fn shade_trans_core<S: Sky>(
     pixel: FragCoord,
     wp: vec3,
+    mp: vec3,
+    interior: f32,
     normal: vec3,
     smooth: f32,
     sub0: Substance,
@@ -1075,7 +1443,7 @@ fn shade_trans_core<S: Sky>(
     let dist = length(to_eye)
     let ray_back = if dist > 1.0e-6 { to_eye / dist } else { -v.forward }
     let n0 = resolve_normal_from(wp, normal, smooth, ray_back)
-    let (n, sub) = apply_micro_relief(wp, n0, sub0, dist)
+    let (n, sub) = apply_micro_relief(wp, mp, n0, sub0, dist)
     let ndv = max(dot(n, ray_back), 0.001)
 
     let uv = pixel.position.xy / max(v.size, vec2(1.0))
@@ -1104,14 +1472,31 @@ fn shade_trans_core<S: Sky>(
     if sub.roughness > 0.06 {
         let blur = (sub.roughness * 0.012) * clamp(refract_dist, 0.25, 2.0)
         var acc = bg_rad
-        acc += hdr_bg.sample_level(bg_s, clamp(use_uv + vec2(blur, blur), vec2(0.002), vec2(0.998)), 0.0).xyz
-        acc += hdr_bg.sample_level(bg_s, clamp(use_uv + vec2(-blur, blur), vec2(0.002), vec2(0.998)), 0.0).xyz
-        acc += hdr_bg.sample_level(bg_s, clamp(use_uv + vec2(blur, -blur), vec2(0.002), vec2(0.998)), 0.0).xyz
-        acc += hdr_bg.sample_level(bg_s, clamp(use_uv + vec2(-blur, -blur), vec2(0.002), vec2(0.998)), 0.0).xyz
+        acc += hdr_bg.sample_level(
+            bg_s,
+            clamp(use_uv + vec2(blur, blur), vec2(0.002), vec2(0.998)),
+            0.0,
+        ).xyz
+        acc += hdr_bg.sample_level(
+            bg_s,
+            clamp(use_uv + vec2(-blur, blur), vec2(0.002), vec2(0.998)),
+            0.0,
+        ).xyz
+        acc += hdr_bg.sample_level(
+            bg_s,
+            clamp(use_uv + vec2(blur, -blur), vec2(0.002), vec2(0.998)),
+            0.0,
+        ).xyz
+        acc += hdr_bg.sample_level(
+            bg_s,
+            clamp(use_uv + vec2(-blur, -blur), vec2(0.002), vec2(0.998)),
+            0.0,
+        ).xyz
         bg_rad = acc * 0.2
     }
 
-    let thickness = clamp(bg_depth - dist, 0.04, 18.0)
+    let behind = bg_depth - dist
+    let thickness = clamp(if interior >= 0.0 { min(interior, behind) } else { behind }, 0.04, 18.0)
     let absorb = (vec3(1.0) - clamp(sub.albedo, vec3(0.03), vec3(0.98))) * 0.95
     let beer = exp(-absorb * thickness)
     let transmitted = bg_rad * beer
@@ -1120,7 +1505,10 @@ fn shade_trans_core<S: Sky>(
     let ndl = max(dot(n, sun.way), 0.0)
     let vis = if ndl > 0.0 { sun_vis_point(shadow_map, cmp, sv, wp) } else { 0.0 }
     let sky_amb = sky_irradiance(sky_diff, sky_s, n)
-    let deep_scatter = sub.albedo * (vec3(1.0) - beer) * ONE_OVER_PI * (sun.light * (0.25 * vis + 0.1) + sky_amb * 0.45)
+    let deep_scatter = sub.albedo *
+        (vec3(1.0) - beer) *
+        ONE_OVER_PI *
+        (sun.light * (0.25 * vis + 0.1) + sky_amb * 0.45)
 
     // 1-tap upsample of half-res SSR + SDF `spec_cone` + Sky PMREM (zero full-res raymarching!).
     let refl = normalize(n * (2.0 * ndv) - ray_back)
@@ -1129,9 +1517,17 @@ fn shade_trans_core<S: Sky>(
     // Subtle grazing thin-film spectral iridescence on crystalline glass (`ior > 1.38`).
     if sub.ior > 1.38 {
         let phase = (1.0 - ndv) * 6.2831853
-        let irid = vec3(0.5 + 0.5 * cos(phase), 0.5 + 0.5 * cos(phase + 2.0944), 0.5 + 0.5 * cos(phase + 4.1888))
+        let irid = vec3(
+            0.5 + 0.5 * cos(phase),
+            0.5 + 0.5 * cos(phase + 2.0944),
+            0.5 + 0.5 * cos(phase + 4.1888),
+        )
         let graze = (1.0 - ndv) * (1.0 - ndv) * (1.0 - sub.roughness)
-        f_env = clamp(f_env * mix(vec3(1.0), vec3(0.82) + irid * 0.36, vec3(graze * 0.65)), vec3(0.0), vec3(1.0))
+        f_env = clamp(
+            f_env * mix(vec3(1.0), vec3(0.82) + irid * 0.36, vec3(graze * 0.65)),
+            vec3(0.0),
+            vec3(1.0),
+        )
     }
     let rr = refract_refl.sample_level(bg_s, uv, 0.0)
     let env_spec = if rr.w > 0.02 {
@@ -1140,21 +1536,37 @@ fn shade_trans_core<S: Sky>(
         sky_specular(sky_spec0, sky_spec1, sky_spec2, sky_diff, sky_s, refl, sub.roughness)
     }
 
-    let direct_spec = sub.shade_direct(n, sun.way, ray_back, sun.light * vis)
+    // The sun's full BRDF on the surface (its diffuse already weighted by `1 - transmission`).
+    let direct_sun = sub.shade_direct(n, sun.way, ray_back, sun.light * vis)
     let px = u32(max(pixel.position.x, 0.0))
     let py = u32(max(pixel.position.y, 0.0))
     let local_spec = eval_emitters_tiled(
-        sub, wp, n, ray_back, rad_grid, rad0, rad1, rad_s, sdf_grid, sdf0, sdf1, sdf_s,
-        emitters, tile_masks, tiles_x, px, py,
+        sub,
+        wp,
+        n,
+        ray_back,
+        rad_grid,
+        rad0,
+        rad1,
+        rad_s,
+        sdf_grid,
+        sdf0,
+        sdf1,
+        sdf_s,
+        emitters,
+        tile_masks,
+        tiles_x,
+        px,
+        py,
     )
 
     let tr = sub.transmission
-    let body = mix(sub.albedo * ONE_OVER_PI * (sun.light * (ndl * vis) + sky_amb), transmitted + deep_scatter, vec3(tr))
-    let rad = sub.emits + body * (vec3(1.0) - f_env) + env_spec * f_env + direct_spec + local_spec
+    let body = mix(sub.albedo * ONE_OVER_PI * sky_amb, transmitted + deep_scatter, vec3(tr))
+    let rad = sub.emits + body * (vec3(1.0) - f_env) + env_spec * f_env + direct_sun + local_spec
     vec4(rad, min(dist, 65000.0))
 }
 
-/// Pixel-rate transmissive fragment shader for `One<M>` compact meshlets.
+/// Pixel-rate transmissive fragment shader for `One<M>` compact meshlets (colour + motion).
 @fragment
 @budget(work: 44000)
 fn field_trans_one_fs<M: Field<Substance>, S: Sky>(
@@ -1162,6 +1574,7 @@ fn field_trans_one_fs<M: Field<Substance>, S: Sky>(
     vary: FieldVary,
     field: M,
     v: View,
+    prev_v: View,
     sv: ShadowView,
     rad_grid: RadGrid,
     sdf_grid: SdfGrid,
@@ -1186,17 +1599,47 @@ fn field_trans_one_fs<M: Field<Substance>, S: Sky>(
     hdr_bg: Texture<Rgba16Float>,
     refract_refl: Texture<Rgba16Float>,
     bg_s: Sampler,
-) -> vec4 {
+) -> Targets2<vec4, vec2> {
     let sub0 = field.channels(vary.wp)
-    shade_trans_core(
-        pixel, vary.wp, vary.normal, vary.meta.x, sub0, v, sv, rad_grid, sdf_grid, sky,
-        sky_diff, sky_spec0, sky_spec1, sky_spec2, sky_s, shadow_map, cmp,
-        rad0, rad1, rad2, rad_s, sdf0, sdf1, sdf_s, emitters, tile_masks, tiles_x,
-        hdr_bg, refract_refl, bg_s,
+    let interior = interior_length(field, vary.wp, normalize(vary.wp - v.at), 18.0)
+    let c = shade_trans_core(
+        pixel,
+        vary.wp,
+        vary.local_p,
+        interior,
+        vary.normal,
+        vary.meta.x,
+        sub0,
+        v,
+        sv,
+        rad_grid,
+        sdf_grid,
+        sky,
+        sky_diff,
+        sky_spec0,
+        sky_spec1,
+        sky_spec2,
+        sky_s,
+        shadow_map,
+        cmp,
+        rad0,
+        rad1,
+        rad2,
+        rad_s,
+        sdf0,
+        sdf1,
+        sdf_s,
+        emitters,
+        tile_masks,
+        tiles_x,
+        hdr_bg,
+        refract_refl,
+        bg_s,
     )
+    Targets2 { first: c, second: motion_of(vary.wp, vary.prev_wp, v, prev_v) }
 }
 
-/// Pixel-rate transmissive fragment shader for `Many<M, N>` compact meshlets.
+/// Pixel-rate transmissive fragment shader for `Many<M, N>` compact meshlets (colour + motion).
 @fragment
 @budget(work: 44000)
 fn field_trans_many_fs<M: Field<Substance>, S: Sky>(
@@ -1205,6 +1648,7 @@ fn field_trans_many_fs<M: Field<Substance>, S: Sky>(
     fields: [M],
     n_fields: u32,
     v: View,
+    prev_v: View,
     sv: ShadowView,
     rad_grid: RadGrid,
     sdf_grid: SdfGrid,
@@ -1229,18 +1673,48 @@ fn field_trans_many_fs<M: Field<Substance>, S: Sky>(
     hdr_bg: Texture<Rgba16Float>,
     refract_refl: Texture<Rgba16Float>,
     bg_s: Sampler,
-) -> vec4 {
+) -> Targets2<vec4, vec2> {
     let tid = min(u32(max(vary.meta.y, 0.0)), n_fields - 1)
     let sub0 = fields[tid].channels(vary.wp)
-    shade_trans_core(
-        pixel, vary.wp, vary.normal, vary.meta.x, sub0, v, sv, rad_grid, sdf_grid, sky,
-        sky_diff, sky_spec0, sky_spec1, sky_spec2, sky_s, shadow_map, cmp,
-        rad0, rad1, rad2, rad_s, sdf0, sdf1, sdf_s, emitters, tile_masks, tiles_x,
-        hdr_bg, refract_refl, bg_s,
+    let interior = interior_length(fields[tid], vary.wp, normalize(vary.wp - v.at), 18.0)
+    let c = shade_trans_core(
+        pixel,
+        vary.wp,
+        vary.local_p,
+        interior,
+        vary.normal,
+        vary.meta.x,
+        sub0,
+        v,
+        sv,
+        rad_grid,
+        sdf_grid,
+        sky,
+        sky_diff,
+        sky_spec0,
+        sky_spec1,
+        sky_spec2,
+        sky_s,
+        shadow_map,
+        cmp,
+        rad0,
+        rad1,
+        rad2,
+        rad_s,
+        sdf0,
+        sdf1,
+        sdf_s,
+        emitters,
+        tile_masks,
+        tiles_x,
+        hdr_bg,
+        refract_refl,
+        bg_s,
     )
+    Targets2 { first: c, second: motion_of(vary.wp, vary.prev_wp, v, prev_v) }
 }
 
-/// Pixel-rate transmissive fragment shader for `Skinned` `One<M>` meshlets.
+/// Pixel-rate transmissive fragment shader for `Skinned` `One<M>` meshlets (colour + motion).
 @fragment
 @budget(work: 44000)
 fn field_skin_trans_one_fs<M: Field<Substance>, S: Sky>(
@@ -1248,6 +1722,7 @@ fn field_skin_trans_one_fs<M: Field<Substance>, S: Sky>(
     vary: SkinVary,
     field: M,
     v: View,
+    prev_v: View,
     sv: ShadowView,
     rad_grid: RadGrid,
     sdf_grid: SdfGrid,
@@ -1272,17 +1747,47 @@ fn field_skin_trans_one_fs<M: Field<Substance>, S: Sky>(
     hdr_bg: Texture<Rgba16Float>,
     refract_refl: Texture<Rgba16Float>,
     bg_s: Sampler,
-) -> vec4 {
+) -> Targets2<vec4, vec2> {
     let sub0 = field.rest_channels(vary.rest_p)
-    shade_trans_core(
-        pixel, vary.wp, vary.normal, vary.meta.x, sub0, v, sv, rad_grid, sdf_grid, sky,
-        sky_diff, sky_spec0, sky_spec1, sky_spec2, sky_s, shadow_map, cmp,
-        rad0, rad1, rad2, rad_s, sdf0, sdf1, sdf_s, emitters, tile_masks, tiles_x,
-        hdr_bg, refract_refl, bg_s,
+    let interior = interior_length(field, vary.wp, normalize(vary.wp - v.at), 18.0)
+    let c = shade_trans_core(
+        pixel,
+        vary.wp,
+        vary.rest_p,
+        interior,
+        vary.normal,
+        vary.meta.x,
+        sub0,
+        v,
+        sv,
+        rad_grid,
+        sdf_grid,
+        sky,
+        sky_diff,
+        sky_spec0,
+        sky_spec1,
+        sky_spec2,
+        sky_s,
+        shadow_map,
+        cmp,
+        rad0,
+        rad1,
+        rad2,
+        rad_s,
+        sdf0,
+        sdf1,
+        sdf_s,
+        emitters,
+        tile_masks,
+        tiles_x,
+        hdr_bg,
+        refract_refl,
+        bg_s,
     )
+    Targets2 { first: c, second: motion_of(vary.wp, vary.prev_wp, v, prev_v) }
 }
 
-/// Pixel-rate transmissive fragment shader for `Skinned` `Many<M, N>` meshlets.
+/// Pixel-rate transmissive fragment shader for `Skinned` `Many<M, N>` meshlets (colour + motion).
 @fragment
 @budget(work: 44000)
 fn field_skin_trans_many_fs<M: Field<Substance>, S: Sky>(
@@ -1291,6 +1796,7 @@ fn field_skin_trans_many_fs<M: Field<Substance>, S: Sky>(
     fields: [M],
     n_fields: u32,
     v: View,
+    prev_v: View,
     sv: ShadowView,
     rad_grid: RadGrid,
     sdf_grid: SdfGrid,
@@ -1315,24 +1821,56 @@ fn field_skin_trans_many_fs<M: Field<Substance>, S: Sky>(
     hdr_bg: Texture<Rgba16Float>,
     refract_refl: Texture<Rgba16Float>,
     bg_s: Sampler,
-) -> vec4 {
+) -> Targets2<vec4, vec2> {
     let tid = min(u32(max(vary.meta.y, 0.0)), n_fields - 1)
     let sub0 = fields[tid].rest_channels(vary.rest_p)
-    shade_trans_core(
-        pixel, vary.wp, vary.normal, vary.meta.x, sub0, v, sv, rad_grid, sdf_grid, sky,
-        sky_diff, sky_spec0, sky_spec1, sky_spec2, sky_s, shadow_map, cmp,
-        rad0, rad1, rad2, rad_s, sdf0, sdf1, sdf_s, emitters, tile_masks, tiles_x,
-        hdr_bg, refract_refl, bg_s,
+    let interior = interior_length(fields[tid], vary.wp, normalize(vary.wp - v.at), 18.0)
+    let c = shade_trans_core(
+        pixel,
+        vary.wp,
+        vary.rest_p,
+        interior,
+        vary.normal,
+        vary.meta.x,
+        sub0,
+        v,
+        sv,
+        rad_grid,
+        sdf_grid,
+        sky,
+        sky_diff,
+        sky_spec0,
+        sky_spec1,
+        sky_spec2,
+        sky_s,
+        shadow_map,
+        cmp,
+        rad0,
+        rad1,
+        rad2,
+        rad_s,
+        sdf0,
+        sdf1,
+        sdf_s,
+        emitters,
+        tile_masks,
+        tiles_x,
+        hdr_bg,
+        refract_refl,
+        bg_s,
     )
+    Targets2 { first: c, second: motion_of(vary.wp, vary.prev_wp, v, prev_v) }
 }
 
-/// Physically-based refractive / transmissive fragment shader for transmissive heightfields (`height_vs`).
+/// Physically-based refractive / transmissive fragment shader for transmissive heightfields
+/// (`height_vs`): an open volume of water, absorbing to whatever lies behind it (colour + motion).
 @fragment
-@budget(work: 38000)
+@budget(work: 44000)
 fn mesh_trans_fs<S: Sky>(
     pixel: FragCoord,
     vary: MeshVary,
     v: View,
+    prev_v: View,
     sv: ShadowView,
     rad_grid: RadGrid,
     sdf_grid: SdfGrid,
@@ -1357,26 +1895,56 @@ fn mesh_trans_fs<S: Sky>(
     hdr_bg: Texture<Rgba16Float>,
     refract_refl: Texture<Rgba16Float>,
     bg_s: Sampler,
-) -> vec4 {
-    shade_trans_core(
-        pixel, vary.wp, vary.normal, vary.pbr.w, vary_substance(vary), v, sv, rad_grid, sdf_grid, sky,
-        sky_diff, sky_spec0, sky_spec1, sky_spec2, sky_s, shadow_map, cmp,
-        rad0, rad1, rad2, rad_s, sdf0, sdf1, sdf_s, emitters, tile_masks, tiles_x,
-        hdr_bg, refract_refl, bg_s,
+) -> Targets2<vec4, vec2> {
+    let sub0 = vary_substance(vary)
+    let interior = -1.0
+    let c = shade_trans_core(
+        pixel,
+        vary.wp,
+        vary.wp,
+        interior,
+        vary.normal,
+        vary.pbr.w,
+        sub0,
+        v,
+        sv,
+        rad_grid,
+        sdf_grid,
+        sky,
+        sky_diff,
+        sky_spec0,
+        sky_spec1,
+        sky_spec2,
+        sky_s,
+        shadow_map,
+        cmp,
+        rad0,
+        rad1,
+        rad2,
+        rad_s,
+        sdf0,
+        sdf1,
+        sdf_s,
+        emitters,
+        tile_masks,
+        tiles_x,
+        hdr_bg,
+        refract_refl,
+        bg_s,
     )
+    Targets2 { first: c, second: motion_of(vary.wp, vary.prev_wp, v, prev_v) }
 }
 
 /// Computes a curvature- and budget-aware cell spacing for a single thing with bounding sphere
 /// `(c, r)`. Targets a bounded screen-space sagitta error (`c ≈ sqrt(8 * e * R_feat * px)`),
 /// keeping tight `~1.45 px` cells when an object is small on screen (or `1.1 px` for `steep`
 /// noise fields) while avoiding sub-2-pixel micro-triangles on large smooth close-ups.
-fn cell_for_one(c: vec3, r: f32, v: View, steep: bool) -> f32 {
+fn cell_for_one(c: vec3, r: f32, v: View, steep: bool, floor: f32) -> f32 {
     let near = max(length(c - v.at) - r, 0.25)
     let px = near * v.pixel()
     let r_px = r / max(px, 1.0e-5)
     let mult = if steep { 1.1 } else { clamp(0.253 * sqrt(r_px), 1.45, 2.55) }
-    let by_size = max(r / 180.0, 0.005)
-    clamp(max(px * mult, by_size), 0.005, 0.25)
+    clamp(max(px * mult, max(floor, 0.005)), 0.005, 0.25)
 }
 
 /// Computes a curvature- and budget-aware cell spacing for one thing in a `Many` batch.
@@ -1397,7 +1965,13 @@ pub trait MeshWorld: Copy {
     type FieldBufs
     fn batch_count(self) -> u32
     fn upload_fields(self) -> Self::FieldBufs
-    fn sync_batches(self, scratch: mut ExtractScratch, batches: mut Vec<MeshBatch>, first: u32, v: View, frame: u32)
+    fn sync_batches(
+        self,
+        scratch: mut ExtractScratch,
+        batches: mut Vec<MeshBatch>,
+        first: u32,
+        v: View,
+    )
     fn splat_sdf(
         self,
         sdf: mut SdfClipmap,
@@ -1458,10 +2032,11 @@ pub trait MeshWorld: Copy {
     fn draw_refract<S: Sky>(
         self,
         fbufs: Self::FieldBufs,
-        rp: DepthPass<Rgba16Float>,
+        rp: DepthPass2<Rgba16Float, Rg16Float>,
         batches: mut Vec<MeshBatch>,
         first: u32,
         v: View,
+        prev_v: View,
         sv: ShadowView,
         rad_grid: RadGrid,
         sdf_grid: SdfGrid,
@@ -1500,9 +2075,16 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for One<M> {
         0
     }
 
-    fn sync_batches(self, scratch: mut ExtractScratch, batches: mut Vec<MeshBatch>, first: u32, v: View, _frame: u32) {
+    fn sync_batches(
+        self,
+        scratch: mut ExtractScratch,
+        batches: mut Vec<MeshBatch>,
+        first: u32,
+        v: View,
+    ) {
         let b = self.field.bound()
-        let cell = cell_for_one(b.centre, min(b.radius, 1.0e4), v, steep(self.field))
+        let r = min(b.radius, 1.0e4)
+        let cell = cell_for_one(b.centre, r, v, steep(self.field), size_floor(r))
         batches[first].sync_one(mut scratch, self.field, cell)
     }
 
@@ -1561,27 +2143,6 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for One<M> {
             )
             return
         }
-        if batches[first].is_skinned {
-            rad.inject_skin_one(
-                self.field,
-                batches[first].verts.items(),
-                batches[first].skin_verts.items(),
-                batches[first].verts.count(),
-                batches[first].cap_verts,
-                batches[first].xforms.items(),
-                batches[first].bones.items(),
-                batches[first].bone_stride,
-                batches[first].inst_count,
-                sv,
-                sky,
-                sky_diff,
-                sky_s,
-                shadow_map,
-                cmp,
-                to_static: !all_batches && static_only,
-            )
-            return
-        }
         rad.inject_one(
             self.field,
             batches[first].verts.items(),
@@ -1608,67 +2169,70 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for One<M> {
         v: View,
         prev_v: View,
     ) {
-        if !batches[first].has_opaque {
-            return
-        }
+        // Opaque quads, then the opaque pixels of the transmissive quads (`_cut_` shaders).
         if batches[first].is_deformed {
-            draw(
-                ep,
-                deformed_mesh_vs.bind(
-                    verts: batches[first].deformed_verts.items(),
-                    prev_verts: batches[first].prev_deformed_verts.items(),
-                    rest_verts: batches[first].verts.items(),
-                    xforms: batches[first].xforms.items(),
-                    prev_xforms: batches[first].prev_xforms.items(),
-                    v: v,
-                ),
-                field_skin_gbuf_one_fs.bind(field: self.field, v: v, prev_v: prev_v),
-                indices: batches[first].indices,
-                indirect: batches[first].draw_args,
-                cull: Cull::Back,
-                depth: Depth { compare: Compare::Greater, write: true },
-            )
-            return
-        }
-        if batches[first].is_skinned {
-            draw(
-                ep,
-                skin_mesh_vs.bind(
-                    verts: batches[first].verts.items(),
-                    skin: batches[first].skin_verts.items(),
-                    xforms: batches[first].xforms.items(),
-                    prev_xforms: batches[first].prev_xforms.items(),
-                    bones: batches[first].bones.items(),
-                    prev_bones: batches[first].prev_bones.items(),
-                    bone_stride: batches[first].bone_stride,
-                    inst_ids: batches[first].inst_ids.items(),
-                    is_instanced: 0,
-                    v: v,
-                ),
-                field_skin_gbuf_one_fs.bind(field: self.field, v: v, prev_v: prev_v),
-                indices: batches[first].indices,
-                indirect: batches[first].draw_args,
-                cull: Cull::Back,
-                depth: Depth { compare: Compare::Greater, write: true },
-            )
-            return
-        }
-        draw(
-            ep,
-            mesh_vs.bind(
-                verts: batches[first].verts.items(),
+            let vs = deformed_mesh_vs.bind(
+                verts: batches[first].deformed_verts.items(),
+                prev_verts: batches[first].prev_deformed_verts.items(),
+                rest_verts: batches[first].verts.items(),
                 xforms: batches[first].xforms.items(),
                 prev_xforms: batches[first].prev_xforms.items(),
-                inst_ids: batches[first].inst_ids.items(),
-                is_instanced: 0,
                 v: v,
-            ),
-            field_gbuf_one_fs.bind(field: self.field, v: v, prev_v: prev_v),
-            indices: batches[first].indices,
-            indirect: batches[first].draw_args,
-            cull: Cull::Back,
-            depth: Depth { compare: Compare::Greater, write: true },
+            )
+            if batches[first].has_opaque {
+                draw(
+                    ep,
+                    vs,
+                    field_skin_gbuf_one_fs.bind(field: self.field, v: v, prev_v: prev_v),
+                    indices: batches[first].indices,
+                    indirect: batches[first].draw_args,
+                    cull: Cull::Back,
+                    depth: Depth { compare: Compare::Greater, write: true },
+                )
+            }
+            if batches[first].has_trans {
+                draw(
+                    ep,
+                    vs,
+                    field_skin_cut_gbuf_one_fs.bind(field: self.field, v: v, prev_v: prev_v),
+                    indices: batches[first].trans_indices,
+                    indirect: batches[first].trans_draw_args,
+                    cull: Cull::Back,
+                    depth: Depth { compare: Compare::Greater, write: true },
+                )
+            }
+            return
+        }
+        let vs = mesh_vs.bind(
+            verts: batches[first].verts.items(),
+            xforms: batches[first].xforms.items(),
+            prev_xforms: batches[first].prev_xforms.items(),
+            inst_ids: batches[first].inst_ids.items(),
+            is_instanced: 0,
+            v: v,
         )
+        if batches[first].has_opaque {
+            draw(
+                ep,
+                vs,
+                field_gbuf_one_fs.bind(field: self.field, v: v, prev_v: prev_v),
+                indices: batches[first].indices,
+                indirect: batches[first].draw_args,
+                cull: Cull::Back,
+                depth: Depth { compare: Compare::Greater, write: true },
+            )
+        }
+        if batches[first].has_trans {
+            draw(
+                ep,
+                vs,
+                field_cut_gbuf_one_fs.bind(field: self.field, v: v, prev_v: prev_v),
+                indices: batches[first].trans_indices,
+                indirect: batches[first].trans_draw_args,
+                cull: Cull::Back,
+                depth: Depth { compare: Compare::Greater, write: true },
+            )
+        }
     }
 
     fn draw_refract_refl(
@@ -1708,49 +2272,6 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for One<M> {
                     rest_verts: batches[first].verts.items(),
                     xforms: batches[first].xforms.items(),
                     prev_xforms: batches[first].prev_xforms.items(),
-                    v: v,
-                ),
-                field_skin_refract_refl_one_fs.bind(
-                    field: self.field,
-                    v: v,
-                    rad_grid: rad_grid,
-                    sdf_grid: sdf_grid,
-                    sky_diff: sky_diff,
-                    sky_spec0: sky_spec0,
-                    sky_spec1: sky_spec1,
-                    sky_spec2: sky_spec2,
-                    sky_s: sky_s,
-                    rad0: rad0,
-                    rad1: rad1,
-                    rad2: rad2,
-                    rad_s: rad_s,
-                    sdf0: sdf0,
-                    sdf1: sdf1,
-                    sdf_s: sdf_s,
-                    hdr_bg: hdr_bg,
-                    bg_s: bg_s,
-                    half_size: half_size,
-                ),
-                indices: batches[first].trans_indices,
-                indirect: batches[first].trans_draw_args,
-                cull: Cull::Back,
-                depth: Depth { compare: Compare::Greater, write: true },
-            )
-            return
-        }
-        if batches[first].is_skinned {
-            draw(
-                rrp,
-                skin_mesh_vs.bind(
-                    verts: batches[first].verts.items(),
-                    skin: batches[first].skin_verts.items(),
-                    xforms: batches[first].xforms.items(),
-                    prev_xforms: batches[first].prev_xforms.items(),
-                    bones: batches[first].bones.items(),
-                    prev_bones: batches[first].prev_bones.items(),
-                    bone_stride: batches[first].bone_stride,
-                    inst_ids: batches[first].inst_ids.items(),
-                    is_instanced: 0,
                     v: v,
                 ),
                 field_skin_refract_refl_one_fs.bind(
@@ -1822,10 +2343,11 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for One<M> {
     fn draw_refract<S: Sky>(
         self,
         _fbufs: u32,
-        rp: DepthPass<Rgba16Float>,
+        rp: DepthPass2<Rgba16Float, Rg16Float>,
         batches: mut Vec<MeshBatch>,
         first: u32,
         v: View,
+        prev_v: View,
         sv: ShadowView,
         rad_grid: RadGrid,
         sdf_grid: SdfGrid,
@@ -1868,56 +2390,7 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for One<M> {
                 field_skin_trans_one_fs.bind(
                     field: self.field,
                     v: v,
-                    sv: sv,
-                    rad_grid: rad_grid,
-                    sdf_grid: sdf_grid,
-                    sky: sky,
-                    sky_diff: sky_diff,
-                    sky_spec0: sky_spec0,
-                    sky_spec1: sky_spec1,
-                    sky_spec2: sky_spec2,
-                    sky_s: sky_s,
-                    shadow_map: shadow_map,
-                    cmp: cmp,
-                    rad0: rad0,
-                    rad1: rad1,
-                    rad2: rad2,
-                    rad_s: rad_s,
-                    sdf0: sdf0,
-                    sdf1: sdf1,
-                    sdf_s: sdf_s,
-                    emitters: emitters,
-                    tile_masks: tile_masks,
-                    tiles_x: tiles_x,
-                    hdr_bg: hdr_bg,
-                    refract_refl: refract_refl,
-                    bg_s: bg_s,
-                ),
-                indices: batches[first].trans_indices,
-                indirect: batches[first].trans_draw_args,
-                cull: Cull::Back,
-                depth: Depth { compare: Compare::Greater, write: true },
-            )
-            return
-        }
-        if batches[first].is_skinned {
-            draw(
-                rp,
-                skin_mesh_vs.bind(
-                    verts: batches[first].verts.items(),
-                    skin: batches[first].skin_verts.items(),
-                    xforms: batches[first].xforms.items(),
-                    prev_xforms: batches[first].prev_xforms.items(),
-                    bones: batches[first].bones.items(),
-                    prev_bones: batches[first].prev_bones.items(),
-                    bone_stride: batches[first].bone_stride,
-                    inst_ids: batches[first].inst_ids.items(),
-                    is_instanced: 0,
-                    v: v,
-                ),
-                field_skin_trans_one_fs.bind(
-                    field: self.field,
-                    v: v,
+                    prev_v: prev_v,
                     sv: sv,
                     rad_grid: rad_grid,
                     sdf_grid: sdf_grid,
@@ -1963,6 +2436,7 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for One<M> {
             field_trans_one_fs.bind(
                 field: self.field,
                 v: v,
+                prev_v: prev_v,
                 sv: sv,
                 rad_grid: rad_grid,
                 sdf_grid: sdf_grid,
@@ -2020,7 +2494,13 @@ impl<M: Field<Substance> + StateHash + GpuData, const N: u32> MeshWorld for Many
         buffer_of(self.fields)
     }
 
-    fn sync_batches(self, scratch: mut ExtractScratch, batches: mut Vec<MeshBatch>, first: u32, v: View, frame: u32) {
+    fn sync_batches(
+        self,
+        scratch: mut ExtractScratch,
+        batches: mut Vec<MeshBatch>,
+        first: u32,
+        v: View,
+    ) {
         let cap = batches[first].max_bricks
         // Each thing's bound, distance and screen-share weight (`0.0` when out of view), once.
         var centres = [vec3(0.0); N]
@@ -2055,7 +2535,13 @@ impl<M: Field<Substance> + StateHash + GpuData, const N: u32> MeshWorld for Many
                 var cells = [0.0; N]
                 for i in 0..N {
                     if weights[i] > 0.0 {
-                        cells[i] = cell_for_one(centres[i], radii[i], v, steep(self.fields[i]))
+                        cells[i] = cell_for_one(
+                            centres[i],
+                            radii[i],
+                            v,
+                            steep(self.fields[i]),
+                            size_floor(radii[i]),
+                        )
                     }
                 }
                 batches[first].sync_many(mut scratch, self.fields, cells)
@@ -2065,7 +2551,13 @@ impl<M: Field<Substance> + StateHash + GpuData, const N: u32> MeshWorld for Many
             var c_far = [0.0; N]
             for i in 0..N {
                 if weights[i] > 0.0 {
-                    let c = cell_for_one(centres[i], radii[i], v, steep(self.fields[i]))
+                    let c = cell_for_one(
+                        centres[i],
+                        radii[i],
+                        v,
+                        steep(self.fields[i]),
+                        size_floor(radii[i]),
+                    )
                     if nears[i] <= 12.0 {
                         c_near[i] = c
                     } else {
@@ -2092,42 +2584,19 @@ impl<M: Field<Substance> + StateHash + GpuData, const N: u32> MeshWorld for Many
             return
         }
 
-        let init_tiers = batches[first].tiers.len() != N
-        if init_tiers {
-            batches[first].tiers = Vec::new()
-            for _i in 0..N {
-                batches[first].tiers.push(0)
-            }
-        }
-        let update_even = init_tiers || frame == 0 || (frame & 1) == 0
-        let update_odd = init_tiers || frame == 0 || (frame & 1) == 1
-
+        // Three batches: things within `FAR_TIER_DIST` (near), and the farther ones split by index
+        // parity, so a change re-extracts only the batch it falls in. Every batch syncs every
+        // frame (a still batch's sync is a hash check), so each batch's mesh is always this
+        // frame's and is shaded by this frame's fields (`fbuf`) with exact motion vectors.
         var c_near = [0.0; N]
         var c_even = [0.0; N]
         var c_odd = [0.0; N]
         for i in 0..N {
-            let vis = weights[i] > 0.0
-            let far_slot: u32 = if (i & 1) == 0 { 1 } else { 2 }
-            let want_tier: u32 = if !vis {
-                far_slot
-            } else if nears[i] <= FAR_TIER_DIST {
-                0
-            } else {
-                far_slot
-            }
-            var cur = if init_tiers { want_tier } else { batches[first].tiers[i] }
-            let can_change = (cur == 0 && (want_tier == 0 || (want_tier == 1 && update_even) || (want_tier == 2 && update_odd)))
-                || (cur == 1 && update_even)
-                || (cur == 2 && update_odd)
-            if can_change {
-                cur = want_tier
-                batches[first].tiers[i] = cur
-            }
-            if vis {
+            if weights[i] > 0.0 {
                 let cell = cell_for_share(centres[i], radii[i], weights[i] * inv_w, v)
-                if cur == 0 {
+                if nears[i] <= FAR_TIER_DIST {
                     c_near[i] = cell
-                } else if cur == 1 {
+                } else if (i & 1) == 0 {
                     c_even[i] = cell
                 } else {
                     c_odd[i] = cell
@@ -2135,16 +2604,8 @@ impl<M: Field<Substance> + StateHash + GpuData, const N: u32> MeshWorld for Many
             }
         }
         batches[first].sync_many(mut scratch, self.fields, c_near)
-        if update_even {
-            batches[first + 1].sync_many(mut scratch, self.fields, c_even)
-        } else {
-            batches[first + 1].still_frames += 1
-        }
-        if update_odd {
-            batches[first + 2].sync_many(mut scratch, self.fields, c_odd)
-        } else {
-            batches[first + 2].still_frames += 1
-        }
+        batches[first + 1].sync_many(mut scratch, self.fields, c_even)
+        batches[first + 2].sync_many(mut scratch, self.fields, c_odd)
     }
 
     fn splat_sdf(
@@ -2155,14 +2616,17 @@ impl<M: Field<Substance> + StateHash + GpuData, const N: u32> MeshWorld for Many
         static_only: bool,
         all_batches: bool,
     ) {
-        let any_opaque = batches[first].has_opaque || (N >= 16 && (batches[first + 1].has_opaque || batches[first + 2].has_opaque))
+        let any_opaque = batches[first].has_opaque ||
+            (N >= 16 && (batches[first + 1].has_opaque || batches[first + 2].has_opaque))
         if !any_opaque {
             return
         }
         let is_static = if N < 16 {
             batches[first].still_frames >= 1
         } else {
-            batches[first].still_frames >= 1 && batches[first + 1].still_frames >= 1 && batches[first + 2].still_frames >= 1
+            batches[first].still_frames >= 1 &&
+                batches[first + 1].still_frames >= 1 &&
+                batches[first + 2].still_frames >= 1
         }
         if !all_batches && is_static != static_only {
             return
@@ -2245,46 +2709,93 @@ impl<M: Field<Substance> + StateHash + GpuData, const N: u32> MeshWorld for Many
         v: View,
         prev_v: View,
     ) {
+        // Per batch: opaque quads, then the opaque pixels of the transmissive quads (`_cut_`).
         let n_sub: u32 = if N >= 16 { 3 } else { 1 }
         for k in 0..n_sub {
             let bi = first + k
-            if batches[bi].has_opaque {
-                let is_inst: u32 = if batches[bi].instanced { 1 } else { 0 }
-                if batches[bi].is_skinned {
+            let is_inst: u32 = if batches[bi].instanced { 1 } else { 0 }
+            if batches[bi].is_skinned {
+                let vs = skin_mesh_vs.bind(
+                    verts: batches[bi].verts.items(),
+                    skin: batches[bi].skin_verts.items(),
+                    xforms: batches[bi].xforms.items(),
+                    prev_xforms: batches[bi].prev_xforms.items(),
+                    bones: batches[bi].bones.items(),
+                    prev_bones: batches[bi].prev_bones.items(),
+                    bone_stride: batches[bi].bone_stride,
+                    inst_ids: batches[bi].inst_ids.items(),
+                    is_instanced: is_inst,
+                    v: v,
+                )
+                if batches[bi].has_opaque {
                     draw(
                         ep,
-                        skin_mesh_vs.bind(
-                            verts: batches[bi].verts.items(),
-                            skin: batches[bi].skin_verts.items(),
-                            xforms: batches[bi].xforms.items(),
-                            prev_xforms: batches[bi].prev_xforms.items(),
-                            bones: batches[bi].bones.items(),
-                            prev_bones: batches[bi].prev_bones.items(),
-                            bone_stride: batches[bi].bone_stride,
-                            inst_ids: batches[bi].inst_ids.items(),
-                            is_instanced: is_inst,
+                        vs,
+                        field_skin_gbuf_many_fs.bind(
+                            fields: fbuf.items(),
+                            n_fields: N,
                             v: v,
+                            prev_v: prev_v,
                         ),
-                        field_skin_gbuf_many_fs.bind(fields: fbuf.items(), n_fields: N, v: v, prev_v: prev_v),
                         indices: batches[bi].indices,
                         indirect: batches[bi].draw_args,
                         cull: Cull::Back,
                         depth: Depth { compare: Compare::Greater, write: true },
                     )
-                } else {
+                }
+                if batches[bi].has_trans {
                     draw(
                         ep,
-                        mesh_vs.bind(
-                            verts: batches[bi].verts.items(),
-                            xforms: batches[bi].xforms.items(),
-                            prev_xforms: batches[bi].prev_xforms.items(),
-                            inst_ids: batches[bi].inst_ids.items(),
-                            is_instanced: is_inst,
+                        vs,
+                        field_skin_cut_gbuf_many_fs.bind(
+                            fields: fbuf.items(),
+                            n_fields: N,
                             v: v,
+                            prev_v: prev_v,
                         ),
-                        field_gbuf_many_fs.bind(fields: fbuf.items(), n_fields: N, v: v, prev_v: prev_v),
+                        indices: batches[bi].trans_indices,
+                        indirect: batches[bi].trans_draw_args,
+                        cull: Cull::Back,
+                        depth: Depth { compare: Compare::Greater, write: true },
+                    )
+                }
+            } else {
+                let vs = mesh_vs.bind(
+                    verts: batches[bi].verts.items(),
+                    xforms: batches[bi].xforms.items(),
+                    prev_xforms: batches[bi].prev_xforms.items(),
+                    inst_ids: batches[bi].inst_ids.items(),
+                    is_instanced: is_inst,
+                    v: v,
+                )
+                if batches[bi].has_opaque {
+                    draw(
+                        ep,
+                        vs,
+                        field_gbuf_many_fs.bind(
+                            fields: fbuf.items(),
+                            n_fields: N,
+                            v: v,
+                            prev_v: prev_v,
+                        ),
                         indices: batches[bi].indices,
                         indirect: batches[bi].draw_args,
+                        cull: Cull::Back,
+                        depth: Depth { compare: Compare::Greater, write: true },
+                    )
+                }
+                if batches[bi].has_trans {
+                    draw(
+                        ep,
+                        vs,
+                        field_cut_gbuf_many_fs.bind(
+                            fields: fbuf.items(),
+                            n_fields: N,
+                            v: v,
+                            prev_v: prev_v,
+                        ),
+                        indices: batches[bi].trans_indices,
+                        indirect: batches[bi].trans_draw_args,
                         cull: Cull::Back,
                         depth: Depth { compare: Compare::Greater, write: true },
                     )
@@ -2411,10 +2922,11 @@ impl<M: Field<Substance> + StateHash + GpuData, const N: u32> MeshWorld for Many
     fn draw_refract<S: Sky>(
         self,
         fbuf: GpuBuffer<M>,
-        rp: DepthPass<Rgba16Float>,
+        rp: DepthPass2<Rgba16Float, Rg16Float>,
         batches: mut Vec<MeshBatch>,
         first: u32,
         v: View,
+        prev_v: View,
         sv: ShadowView,
         rad_grid: RadGrid,
         sdf_grid: SdfGrid,
@@ -2464,6 +2976,7 @@ impl<M: Field<Substance> + StateHash + GpuData, const N: u32> MeshWorld for Many
                             fields: fbuf.items(),
                             n_fields: N,
                             v: v,
+                            prev_v: prev_v,
                             sv: sv,
                             rad_grid: rad_grid,
                             sdf_grid: sdf_grid,
@@ -2509,6 +3022,7 @@ impl<M: Field<Substance> + StateHash + GpuData, const N: u32> MeshWorld for Many
                             fields: fbuf.items(),
                             n_fields: N,
                             v: v,
+                            prev_v: prev_v,
                             sv: sv,
                             rad_grid: rad_grid,
                             sdf_grid: sdf_grid,
@@ -2556,10 +3070,16 @@ impl<A: MeshWorld, B: MeshWorld> MeshWorld for And<A, B> {
         (self.a.upload_fields(), self.b.upload_fields())
     }
 
-    fn sync_batches(self, scratch: mut ExtractScratch, batches: mut Vec<MeshBatch>, first: u32, v: View, frame: u32) {
+    fn sync_batches(
+        self,
+        scratch: mut ExtractScratch,
+        batches: mut Vec<MeshBatch>,
+        first: u32,
+        v: View,
+    ) {
         let na = self.a.batch_count()
-        self.a.sync_batches(mut scratch, mut batches, first, v, frame)
-        self.b.sync_batches(mut scratch, mut batches, first + na, v, frame)
+        self.a.sync_batches(mut scratch, mut batches, first, v)
+        self.b.sync_batches(mut scratch, mut batches, first + na, v)
     }
 
     fn splat_sdf(
@@ -2592,12 +3112,32 @@ impl<A: MeshWorld, B: MeshWorld> MeshWorld for And<A, B> {
     ) {
         let na = self.a.batch_count()
         self.a.inject_radiance(
-            fbufs.0, mut rad, mut batches, first, sv, sky, sky_diff, sky_s, shadow_map, cmp,
-            static_only: static_only, all_batches: all_batches,
+            fbufs.0,
+            mut rad,
+            mut batches,
+            first,
+            sv,
+            sky,
+            sky_diff,
+            sky_s,
+            shadow_map,
+            cmp,
+            static_only: static_only,
+            all_batches: all_batches,
         )
         self.b.inject_radiance(
-            fbufs.1, mut rad, mut batches, first + na, sv, sky, sky_diff, sky_s, shadow_map, cmp,
-            static_only: static_only, all_batches: all_batches,
+            fbufs.1,
+            mut rad,
+            mut batches,
+            first + na,
+            sv,
+            sky,
+            sky_diff,
+            sky_s,
+            shadow_map,
+            cmp,
+            static_only: static_only,
+            all_batches: all_batches,
         )
     }
 
@@ -2642,22 +3182,63 @@ impl<A: MeshWorld, B: MeshWorld> MeshWorld for And<A, B> {
     ) {
         let na = self.a.batch_count()
         self.a.draw_refract_refl(
-            fbufs.0, rrp, mut batches, first, v, rad_grid, sdf_grid, sky_diff, sky_spec0, sky_spec1,
-            sky_spec2, sky_s, rad0, rad1, rad2, rad_s, sdf0, sdf1, sdf_s, hdr_bg, bg_s, half_size,
+            fbufs.0,
+            rrp,
+            mut batches,
+            first,
+            v,
+            rad_grid,
+            sdf_grid,
+            sky_diff,
+            sky_spec0,
+            sky_spec1,
+            sky_spec2,
+            sky_s,
+            rad0,
+            rad1,
+            rad2,
+            rad_s,
+            sdf0,
+            sdf1,
+            sdf_s,
+            hdr_bg,
+            bg_s,
+            half_size,
         )
         self.b.draw_refract_refl(
-            fbufs.1, rrp, mut batches, first + na, v, rad_grid, sdf_grid, sky_diff, sky_spec0, sky_spec1,
-            sky_spec2, sky_s, rad0, rad1, rad2, rad_s, sdf0, sdf1, sdf_s, hdr_bg, bg_s, half_size,
+            fbufs.1,
+            rrp,
+            mut batches,
+            first + na,
+            v,
+            rad_grid,
+            sdf_grid,
+            sky_diff,
+            sky_spec0,
+            sky_spec1,
+            sky_spec2,
+            sky_s,
+            rad0,
+            rad1,
+            rad2,
+            rad_s,
+            sdf0,
+            sdf1,
+            sdf_s,
+            hdr_bg,
+            bg_s,
+            half_size,
         )
     }
 
     fn draw_refract<S: Sky>(
         self,
         fbufs: (A::FieldBufs, B::FieldBufs),
-        rp: DepthPass<Rgba16Float>,
+        rp: DepthPass2<Rgba16Float, Rg16Float>,
         batches: mut Vec<MeshBatch>,
         first: u32,
         v: View,
+        prev_v: View,
         sv: ShadowView,
         rad_grid: RadGrid,
         sdf_grid: SdfGrid,
@@ -2685,48 +3266,135 @@ impl<A: MeshWorld, B: MeshWorld> MeshWorld for And<A, B> {
     ) {
         let na = self.a.batch_count()
         self.a.draw_refract(
-            fbufs.0, rp, mut batches, first, v, sv, rad_grid, sdf_grid, sky, sky_diff, sky_spec0,
-            sky_spec1, sky_spec2, sky_s, shadow_map, cmp, rad0, rad1, rad2, rad_s, sdf0, sdf1, sdf_s,
-            emitters, tile_masks, tiles_x, hdr_bg, refract_refl, bg_s,
+            fbufs.0,
+            rp,
+            mut batches,
+            first,
+            v,
+            prev_v,
+            sv,
+            rad_grid,
+            sdf_grid,
+            sky,
+            sky_diff,
+            sky_spec0,
+            sky_spec1,
+            sky_spec2,
+            sky_s,
+            shadow_map,
+            cmp,
+            rad0,
+            rad1,
+            rad2,
+            rad_s,
+            sdf0,
+            sdf1,
+            sdf_s,
+            emitters,
+            tile_masks,
+            tiles_x,
+            hdr_bg,
+            refract_refl,
+            bg_s,
         )
         self.b.draw_refract(
-            fbufs.1, rp, mut batches, first + na, v, sv, rad_grid, sdf_grid, sky, sky_diff, sky_spec0,
-            sky_spec1, sky_spec2, sky_s, shadow_map, cmp, rad0, rad1, rad2, rad_s, sdf0, sdf1, sdf_s,
-            emitters, tile_masks, tiles_x, hdr_bg, refract_refl, bg_s,
+            fbufs.1,
+            rp,
+            mut batches,
+            first + na,
+            v,
+            prev_v,
+            sv,
+            rad_grid,
+            sdf_grid,
+            sky,
+            sky_diff,
+            sky_spec0,
+            sky_spec1,
+            sky_spec2,
+            sky_s,
+            shadow_map,
+            cmp,
+            rad0,
+            rad1,
+            rad2,
+            rad_s,
+            sdf0,
+            sdf1,
+            sdf_s,
+            emitters,
+            tile_masks,
+            tiles_x,
+            hdr_bg,
+            refract_refl,
+            bg_s,
         )
     }
 }
 
-/// Fills `prev_place` with the current jittered subframe's hit ONLY where no prior subframe hit,
-/// keeping the exact pixel-center hit from subframe 0 while recording TSR subpixel coverage.
-@fragment
-fn merge_place_fs(
-    pixel: FragCoord,
-    prev_place: Texture<Rgba32Float>,
-    g_normal: Texture<Rgba8>,
-    depth: DepthTexture,
-    v: View,
-    full_w: u32,
-    full_h: u32,
-) -> vec4 {
-    let px = min(u32(pixel.position.x), full_w - 1)
-    let py = min(u32(pixel.position.y), full_h - 1)
-    let old = prev_place.load(px, py)
-    if old.w > 0.0 {
-        return old
+/// Draws every opaque batch (or, with `static_only`, only those still since their last sync) into
+/// the sun shadow pass `sp` through `sv`: the one way the engine draws shadow casters, used for the
+/// frame's shadow map and for the static radiance cache's own.
+fn draw_shadow_casters(
+    sp: DepthOnlyPass,
+    batches: mut Vec<MeshBatch>,
+    nb: u32,
+    sv: ShadowView,
+    static_only: bool,
+) {
+    for i in 0..nb {
+        if batches[i].has_opaque && (!static_only || batches[i].still_frames >= 1) {
+            if batches[i].is_deformed {
+                draw(
+                    sp,
+                    shadow_vs.bind(
+                        verts: batches[i].deformed_verts.items(),
+                        xforms: batches[i].xforms.items(),
+                        sv: sv,
+                    ),
+                    shadow_fs,
+                    indices: batches[i].indices,
+                    indirect: batches[i].draw_args,
+                    cull: Cull::Back,
+                    depth_bias: DepthBias { constant: 2, slope: 1.5, clamp: 0.0 },
+                    depth: Depth { compare: Compare::Less, write: true },
+                )
+            } else if batches[i].is_skinned {
+                draw(
+                    sp,
+                    skin_shadow_vs.bind(
+                        verts: batches[i].verts.items(),
+                        skin: batches[i].skin_verts.items(),
+                        xforms: batches[i].xforms.items(),
+                        bones: batches[i].bones.items(),
+                        bone_stride: batches[i].bone_stride,
+                        sv: sv,
+                    ),
+                    shadow_fs,
+                    indices: batches[i].indices,
+                    indirect: batches[i].draw_args,
+                    cull: Cull::Back,
+                    depth_bias: DepthBias { constant: 2, slope: 1.5, clamp: 0.0 },
+                    depth: Depth { compare: Compare::Less, write: true },
+                )
+            } else {
+                draw(
+                    sp,
+                    shadow_vs.bind(
+                        verts: batches[i].verts.items(),
+                        xforms: batches[i].xforms.items(),
+                        sv: sv,
+                    ),
+                    shadow_fs,
+                    indices: batches[i].indices,
+                    indirect: batches[i].draw_args,
+                    cull: Cull::Back,
+                    depth_bias: DepthBias { constant: 2, slope: 1.5, clamp: 0.0 },
+                    depth: Depth { compare: Compare::Less, write: true },
+                )
+            }
+        }
     }
-    let gn = g_normal.load(px, py)
-    if gn.w <= 0.5 {
-        return old
-    }
-    let ndc_z = depth.load(px, py)
-    if ndc_z <= 1.0e-6 {
-        return old
-    }
-    let ray = v.ray(pixel.position.xy)
-    let n = decode_gbuf_normal(gn, -ray)
-    let dist = reconstruct_pixel_dist(v, ray, ndc_z)
-    vec4(n, dist)
 }
 
 /// Complete meshlet renderer state: owns extracted batches, unified sun shadow map + 2-cascade
@@ -2736,6 +3404,8 @@ fn merge_place_fs(
 pub struct MeshSight {
     pub drawn: Picture,
     pub hdr_direct: Texture<Rgba16Float>,
+    /// The sun's share of `hdr_direct` per pixel (`0..1` by luma): what the contact shadow darkens.
+    pub sun_share: Texture<R16Float>,
     pub g_normal: Texture<Rgba8>,
     pub g_albedo: Texture<Rgba8>,
     pub g_emits: Texture<Rgba16Float>,
@@ -2746,9 +3416,6 @@ pub struct MeshSight {
     pub refract_depth: DepthTexture,
     pub hdr_colour: Texture<Rgba16Float>,
     pub hdr_bg: Texture<Rgba16Float>,
-    place_tmp: Texture<Rgba32Float>,
-    place_tmp_w: u32,
-    place_tmp_h: u32,
     pub depth: DepthTexture,
     pub sky: SkyCache,
     pub rad: RadianceCache,
@@ -2761,6 +3428,9 @@ pub struct MeshSight {
     clipmap: ClipmapMesh,
     batches: Vec<MeshBatch>,
     shadow_map: DepthTexture,
+    /// The sun shadow map of the still batches alone (same `ShadowView`), drawn only when the
+    /// static radiance cache rebuilds, so moving things' shadows are never baked into it.
+    static_shadow_map: DepthTexture,
     cmp: ComparisonSampler,
     bg_s: Sampler,
     rad_key: u64,
@@ -2777,6 +3447,7 @@ pub fn mesh_sight(gi: bool = true) -> MeshSight {
     MeshSight {
         drawn: picture(width: 1, height: 1),
         hdr_direct: texture(width: 1, height: 1),
+        sun_share: texture(width: 1, height: 1),
         g_normal: texture(width: 1, height: 1),
         g_albedo: texture(width: 1, height: 1),
         g_emits: texture(width: 1, height: 1),
@@ -2787,9 +3458,6 @@ pub fn mesh_sight(gi: bool = true) -> MeshSight {
         refract_depth: depth_texture(width: 1, height: 1),
         hdr_colour: texture(width: 1, height: 1),
         hdr_bg: texture(width: 1, height: 1),
-        place_tmp: texture(width: 1, height: 1),
-        place_tmp_w: 0,
-        place_tmp_h: 0,
         depth: depth_texture(width: 1, height: 1),
         sky: sky_cache(),
         rad: radiance_cache(),
@@ -2802,6 +3470,7 @@ pub fn mesh_sight(gi: bool = true) -> MeshSight {
         clipmap: clipmap_mesh(),
         batches: Vec::new(),
         shadow_map: depth_texture(width: SHADOW_SIDE, height: SHADOW_SIDE),
+        static_shadow_map: depth_texture(width: SHADOW_SIDE, height: SHADOW_SIDE),
         cmp: comparison_sampler(compare: Compare::LessEqual),
         bg_s: sampler(filter: Filter::Linear, address: Address::Clamp),
         rad_key: 0,
@@ -2819,6 +3488,7 @@ impl MeshSight {
             self.drawn = picture(width: width, height: height)
             self.drawn.placed = true
             self.hdr_direct = texture(width: width, height: height)
+            self.sun_share = texture(width: width, height: height)
             self.g_normal = texture(width: width, height: height)
             self.g_albedo = texture(width: width, height: height)
             self.g_emits = texture(width: width, height: height)
@@ -2861,7 +3531,7 @@ impl MeshSight {
 
         let nb = world.batch_count()
         self.ensure_batches(nb)
-        world.sync_batches(mut self.scratch, mut self.batches, 0, v, frame)
+        world.sync_batches(mut self.scratch, mut self.batches, 0, v)
 
         var wlo = vec3(1.0e20)
         var whi = vec3(-1.0e20)
@@ -2920,15 +3590,33 @@ impl MeshSight {
                     let skey = ssk.finish()
                     if !self.sdf.static_valid || self.sdf.static_key != skey {
                         self.sdf.begin_static(sg)
-                        world.splat_sdf(mut self.sdf, mut self.batches, 0, static_only: true, all_batches: false)
+                        world.splat_sdf(
+                            mut self.sdf,
+                            mut self.batches,
+                            0,
+                            static_only: true,
+                            all_batches: false,
+                        )
                         self.sdf.static_key = skey
                         self.sdf.static_valid = true
                     }
                     self.sdf.begin_from_static(sg)
-                    world.splat_sdf(mut self.sdf, mut self.batches, 0, static_only: false, all_batches: false)
+                    world.splat_sdf(
+                        mut self.sdf,
+                        mut self.batches,
+                        0,
+                        static_only: false,
+                        all_batches: false,
+                    )
                 } else {
                     self.sdf.begin_all(sg)
-                    world.splat_sdf(mut self.sdf, mut self.batches, 0, static_only: false, all_batches: true)
+                    world.splat_sdf(
+                        mut self.sdf,
+                        mut self.batches,
+                        0,
+                        static_only: false,
+                        all_batches: true,
+                    )
                 }
                 self.sdf.finish()
                 self.sdf.full_key = full_sdf_key
@@ -2938,60 +3626,23 @@ impl MeshSight {
             }
         }
 
-        self.swarm.update(swarm, world.field(), self.sdf.grid, self.sdf.sdf0, self.sdf.sdf1, self.sdf.s)
+        self.swarm.update(
+            swarm,
+            world.field(),
+            self.sdf.grid,
+            self.sdf.sdf0,
+            self.sdf.sdf1,
+            self.sdf.s,
+        )
 
         // Pass 1: Unified sun shadow map (one `2048²` world map paired with exact 3D SDF cone penumbra).
         label("mesh_shadow")
-        let sp: DepthOnlyPass = begin_depth_pass(mut self.shadow_map, clear_depth: 1.0, keep_depth: false)
-        for i in 0..nb {
-            if self.batches[i].has_opaque {
-                if self.batches[i].is_deformed {
-                    draw(
-                        sp,
-                        shadow_vs.bind(
-                            verts: self.batches[i].deformed_verts.items(),
-                            xforms: self.batches[i].xforms.items(),
-                            sv: sv,
-                        ),
-                        shadow_fs,
-                        indices: self.batches[i].indices,
-                        indirect: self.batches[i].draw_args,
-                        cull: Cull::Back,
-                        depth_bias: DepthBias { constant: 2, slope: 1.5, clamp: 0.0 },
-                        depth: Depth { compare: Compare::Less, write: true },
-                    )
-                } else if self.batches[i].is_skinned {
-                    draw(
-                        sp,
-                        skin_shadow_vs.bind(
-                            verts: self.batches[i].verts.items(),
-                            skin: self.batches[i].skin_verts.items(),
-                            xforms: self.batches[i].xforms.items(),
-                            bones: self.batches[i].bones.items(),
-                            bone_stride: self.batches[i].bone_stride,
-                            sv: sv,
-                        ),
-                        shadow_fs,
-                        indices: self.batches[i].indices,
-                        indirect: self.batches[i].draw_args,
-                        cull: Cull::Back,
-                        depth_bias: DepthBias { constant: 2, slope: 1.5, clamp: 0.0 },
-                        depth: Depth { compare: Compare::Less, write: true },
-                    )
-                } else {
-                    draw(
-                        sp,
-                        shadow_vs.bind(verts: self.batches[i].verts.items(), xforms: self.batches[i].xforms.items(), sv: sv),
-                        shadow_fs,
-                        indices: self.batches[i].indices,
-                        indirect: self.batches[i].draw_args,
-                        cull: Cull::Back,
-                        depth_bias: DepthBias { constant: 2, slope: 1.5, clamp: 0.0 },
-                        depth: Depth { compare: Compare::Less, write: true },
-                    )
-                }
-            }
-        }
+        let sp: DepthOnlyPass = begin_depth_pass(
+            mut self.shadow_map,
+            clear_depth: 1.0,
+            keep_depth: false,
+        )
+        draw_shadow_casters(sp, mut self.batches, nb, sv, static_only: false)
         if self.swarm.count > 0 {
             draw(
                 sp,
@@ -3008,10 +3659,18 @@ impl MeshSight {
         // Skips rebuild completely (0 ms/frame) when the whole world is static; when only dynamic
         // batches move, copies the cached static accumulation buffers and injects only dynamic
         // batches + swarm instead of re-injecting static architecture every frame.
+        // The key holds everything injection reads: the batches (above), the sun's way and light,
+        // the sky, the volume's place, and the warm-up stage. Injection gathers its bounce from last
+        // frame's volume (`prev_rad1`), zero before the first build, so a still scene rebuilds on
+        // frames 0, 1 and 2 (`min(frame, 2)`) until the bounce has been gathered, then holds.
         let rad_centre = if wrad > 16.0 { focus } else { wmid }
         let rad_rad = min(wrad, 16.0)
+        let warmup_stage = min(frame, 2)
         sun.way.state_hash(mut rk)
+        sun.light.state_hash(mut rk)
+        self.sky.key().state_hash(mut rk)
         rad_centre.state_hash(mut rk)
+        warmup_stage.state_hash(mut rk)
         if self.swarm.count > 0 {
             frame.state_hash(mut rk)
         }
@@ -3020,12 +3679,18 @@ impl MeshSight {
             self.rad.begin(rad_centre, rad_rad, enabled: false)
             self.rad_built = false
         } else if !self.rad_built || self.rad_key != rkey {
+            // The static key holds everything static injection reads: the still batches, the sun, the sky,
+            // the volume's place and size, the warm-up stage, and the shadow view its own shadow
+            // map is drawn through (which follows the whole world's bound).
             var sk = Hasher::new()
             sun.way.state_hash(mut sk)
+            sun.light.state_hash(mut sk)
+            self.sky.key().state_hash(mut sk)
+            sv.centre.state_hash(mut sk)
+            sv.radius.state_hash(mut sk)
             rad_centre.state_hash(mut sk)
             rad_rad.state_hash(mut sk)
-            let warmup_bounce: u32 = if frame <= 1 { 1 } else { 0 }
-            warmup_bounce.state_hash(mut sk)
+            warmup_stage.state_hash(mut sk)
             var static_count: u32 = 0
             for i in 0..nb {
                 if self.batches[i].still_frames >= 1 {
@@ -3037,28 +3702,71 @@ impl MeshSight {
             let skey = sk.finish()
             if static_count > 0 {
                 if !self.rad.static_valid || self.rad.static_key != skey {
+                    label("mesh_shadow_static")
+                    let ssp: DepthOnlyPass = begin_depth_pass(
+                        mut self.static_shadow_map,
+                        clear_depth: 1.0,
+                        keep_depth: false,
+                    )
+                    draw_shadow_casters(ssp, mut self.batches, nb, sv, static_only: true)
+                    ssp.end()
                     self.rad.begin_static(rad_centre, rad_rad, enabled: true)
                     world.inject_radiance(
-                        fbufs, mut self.rad, mut self.batches, 0, sv, sky, self.sky.diff, self.sky.s,
-                        self.shadow_map, self.cmp, static_only: true, all_batches: false,
+                        fbufs,
+                        mut self.rad,
+                        mut self.batches,
+                        0,
+                        sv,
+                        sky,
+                        self.sky.diff,
+                        self.sky.s,
+                        self.static_shadow_map,
+                        self.cmp,
+                        static_only: true,
+                        all_batches: false,
                     )
                     self.rad.static_key = skey
                     self.rad.static_valid = true
                 }
                 self.rad.begin_from_static(rad_centre, rad_rad)
                 world.inject_radiance(
-                    fbufs, mut self.rad, mut self.batches, 0, sv, sky, self.sky.diff, self.sky.s,
-                    self.shadow_map, self.cmp, static_only: false, all_batches: false,
+                    fbufs,
+                    mut self.rad,
+                    mut self.batches,
+                    0,
+                    sv,
+                    sky,
+                    self.sky.diff,
+                    self.sky.s,
+                    self.shadow_map,
+                    self.cmp,
+                    static_only: false,
+                    all_batches: false,
                 )
             } else {
                 self.rad.begin(rad_centre, rad_rad, enabled: true)
                 world.inject_radiance(
-                    fbufs, mut self.rad, mut self.batches, 0, sv, sky, self.sky.diff, self.sky.s,
-                    self.shadow_map, self.cmp, static_only: false, all_batches: true,
+                    fbufs,
+                    mut self.rad,
+                    mut self.batches,
+                    0,
+                    sv,
+                    sky,
+                    self.sky.diff,
+                    self.sky.s,
+                    self.shadow_map,
+                    self.cmp,
+                    static_only: false,
+                    all_batches: true,
                 )
             }
             if self.swarm.count > 0 {
-                self.swarm.inject_radiance(swarm, self.rad.grid, mut self.rad.accum, mut self.rad.emit_accum)
+                self.swarm.inject_radiance(
+                    swarm,
+                    self.rad.grid,
+                    mut self.rad.accum,
+                    mut self.rad.emit_accum,
+                )
             }
             self.rad.finish()
             self.rad_key = rkey
@@ -3137,7 +3845,13 @@ impl MeshSight {
         // Pass 2b: Full-res 1× pixel-rate deferred direct lighting (SDF soft shadows + curvature + SSS + tiled emitters).
         label("mesh_direct")
         if write_judge {
-            let dp = begin_pass3(mut self.hdr_direct, mut self.drawn.place, mut self.drawn.sun, keep: false)
+            let dp = begin_pass4(
+                mut self.hdr_direct,
+                mut self.drawn.place,
+                mut self.drawn.sun,
+                mut self.sun_share,
+                keep: false,
+            )
             draw(
                 dp,
                 cover,
@@ -3171,7 +3885,7 @@ impl MeshSight {
             )
             dp.end()
         } else {
-            let dp = begin_pass(mut self.hdr_direct, keep: false)
+            let dp = begin_pass2(mut self.hdr_direct, mut self.sun_share, keep: false)
             draw(
                 dp,
                 cover,
@@ -3254,6 +3968,7 @@ impl MeshSight {
                 v: v,
                 sky: sky,
                 hdr_direct: self.hdr_direct,
+                sun_share: self.sun_share,
                 g_normal: self.g_normal,
                 g_albedo: self.g_albedo,
                 g_emits: self.g_emits,
@@ -3271,127 +3986,23 @@ impl MeshSight {
         cp.end()
     }
 
-    /// Renders `world` into `self.drawn` (`colour`, `place`, `sun`) without presenting (for
-    /// judging against `Reference`), executing the exact same 1× + Halton-jittered TSR pipeline as
-    /// `draw_scene` over 8 subpixel frames so offline judges verify the real temporal resolve.
-    pub fn drawn_only<W: World + MeshWorld, S: Sky, L: Look>(
+    /// Unified refractive / transmissive pass (half-res SSR pre-pass + full-res 3-channel chromatic
+    /// dispersion, Beer-Lambert absorption, tiled emitter specular, and motion vectors) over the
+    /// opaque frame in `hdr_colour`, shared by `draw_scene` and `drawn_only`. Skipped completely
+    /// (0.0 ms) when no heightfield or batch contains transmissive triangles.
+    fn render_transmissive<W: World + MeshWorld, H: Height, S: Sky>(
         mut self,
         world: W,
-        sky: S,
-        look: L,
-        eye: Eye,
-        width: u32,
-        height: u32,
-    ) {
-        let fbufs = world.upload_fields()
-        let (nb, v_unjit, sv) = self.prepare_and_shadow(world, fbufs, NoSwarm {}, sky, eye, width, height, 0)
-        if self.place_tmp_w != width || self.place_tmp_h != height {
-            self.place_tmp = texture(width: width, height: height)
-            self.place_tmp_w = width
-            self.place_tmp_h = height
-        }
-        self.tsr.valid = false
-
-        // Subframe 0: exact pixel-center view writes `drawn.place` and `drawn.sun`, and seeds TSR.
-        self.render_opaque_and_indirect(
-            world, fbufs, NoHeight {}, NoSwarm {}, sky, v_unjit, v_unjit, sv, width, height,
-            phase_x: 0, phase_y: 0, write_judge: true,
-        )
-        self.tsr.resolve(mut self.hdr_colour, self.g_motion, self.depth, v_unjit, width, height)
-
-        // Subframes 1..8: converge Halton(2, 3) TSR supersampling and record subpixel coverage
-        // within the pixel's cardinal diamond (`|jx| + |jy| <= 0.5`, matching 4× MSAA's footprint).
-        for s in 1..8 {
-            let j = halton_jitter(s)
-            let vj = v_unjit.moved(j)
-            let px = s & 1
-            let py = (s >> 1) & 1
-            self.render_opaque_and_indirect(
-                world, fbufs, NoHeight {}, NoSwarm {}, sky, vj, v_unjit, sv, width, height,
-                phase_x: px, phase_y: py, write_judge: false,
-            )
-            self.tsr.resolve(mut self.hdr_colour, self.g_motion, self.depth, v_unjit, width, height)
-            if abs(j.x) + abs(j.y) <= 0.5 {
-                let mp = begin_pass(mut self.place_tmp, keep: false)
-                draw(
-                    mp,
-                    cover,
-                    merge_place_fs.bind(
-                        prev_place: self.drawn.place,
-                        g_normal: self.g_normal,
-                        depth: self.depth,
-                        v: vj,
-                        full_w: width,
-                        full_h: height,
-                    ),
-                    vertices: 3,
-                )
-                mp.end()
-                copy_texture(from: self.place_tmp.level(0), to: self.drawn.place.level_mut(0))
-            }
-        }
-
-        label("mesh_tone")
-        let tp = begin_pass(mut self.drawn.colour, keep: false)
-        draw(
-            tp,
-            cover,
-            hdr_tone_fs.bind(
-                hdr: self.hdr_colour,
-                depth: self.depth,
-                froxel_acc: self.vol.acc,
-                vol_s: self.vol.s,
-                vol_active: 0,
-                bloom_tex: self.bloom.u0,
-                bloom_s: self.bloom.s,
-                bloom_strength: 0.0,
-                v: v_unjit,
-                look: look,
-            ),
-            vertices: 3,
-        )
-        tp.end()
-        self.drawn.placed = true
-        for i in 0..nb {
-            self.batches[i].maybe_queue_poll()
-        }
-    }
-
-    /// Renders a complete scene (`world` solids, `height` clipmap, `medium` froxels, and `swarm`
-    /// field-colliding GPU grains) through ONE depth buffer, ONE light store, 2-cascade 3D SDF
-    /// clipmap, 1× G-buffer + motion vectors, phase-cycled half-res GI/SSR, half-res refract SSR +
-    /// 3-channel chromatic dispersion, Temporal Super-Resolution (TSR), froxel volumetrics,
-    /// optical HDR bloom, and ONE `Look::tone` pass.
-    pub fn draw_scene<W: World + MeshWorld, H: Height, Med: Medium, Sw: Swarm, S: Sky, L: Look>(
-        mut self,
-        world: W,
+        fbufs: W::FieldBufs,
         height: H,
-        medium: Med,
-        swarm: Sw,
         sky: S,
-        look: L,
-        eye: Eye,
+        v: View,
+        prev_v: View,
+        sv: ShadowView,
         width: u32,
         height_px: u32,
+        nb: u32,
     ) {
-        let cur_frame = self.frame
-        let fbufs = world.upload_fields()
-        let (nb, v_unjit, sv) = self.prepare_and_shadow(world, fbufs, swarm, sky, eye, width, height_px, cur_frame)
-        self.frame += 1
-
-        let jitter = halton_jitter(cur_frame)
-        let v = v_unjit.moved(jitter)
-        let prev_v = if self.tsr.valid { self.tsr.prev_v } else { v_unjit }
-        let phase_x = cur_frame & 1
-        let phase_y = (cur_frame >> 1) & 1
-
-        self.render_opaque_and_indirect(
-            world, fbufs, height, swarm, sky, v, prev_v, sv, width, height_px, phase_x, phase_y, write_judge: false,
-        )
-
-        // Pass 2e: Unified refractive / transmissive pass (half-res SSR pre-pass + full-res
-        // 3-channel chromatic dispersion, Beer-Lambert absorption, and tiled emitter specular).
-        // Skipped completely (0.0 ms) when no heightfield or batch contains transmissive triangles.
         var any_trans = height.active() && height.has_transmissive()
         for i in 0..nb {
             self.batches[i].finish_poll()
@@ -3495,8 +4106,12 @@ impl MeshSight {
             }
             rrp.end()
 
-            let rp: DepthPass<Rgba16Float> = begin_pass_with_depth(
+            // Transmissive surfaces write their own motion beside their colour and depth, so TSR
+            // (which takes each pixel's motion where its 3×3 depth is nearest) reprojects glass and
+            // water by their own movement, not by what lies behind them.
+            let rp: DepthPass2<Rgba16Float, Rg16Float> = begin_pass2_with_depth(
                 mut self.hdr_colour,
+                mut self.g_motion,
                 mut self.depth,
                 keep: true,
                 keep_depth: true,
@@ -3507,6 +4122,7 @@ impl MeshSight {
                 mut self.batches,
                 0,
                 v,
+                prev_v,
                 sv,
                 self.rad.grid,
                 self.sdf.grid,
@@ -3538,6 +4154,7 @@ impl MeshSight {
                     height_vs.bind(height: height, v: v, base_level: 0, trans_pass: 1),
                     mesh_trans_fs.bind(
                         v: v,
+                        prev_v: prev_v,
                         sv: sv,
                         rad_grid: self.rad.grid,
                         sdf_grid: self.sdf.grid,
@@ -3574,6 +4191,7 @@ impl MeshSight {
                     height_vs.bind(height: height, v: v, base_level: 1, trans_pass: 1),
                     mesh_trans_fs.bind(
                         v: v,
+                        prev_v: prev_v,
                         sv: sv,
                         rad_grid: self.rad.grid,
                         sdf_grid: self.sdf.grid,
@@ -3608,6 +4226,181 @@ impl MeshSight {
             }
             rp.end()
         }
+    }
+
+    /// Renders `world` into `self.drawn` (`colour`, `place`, `sun`) without presenting (for
+    /// judging against `Reference`), executing the exact same 1× + Halton-jittered TSR pipeline as
+    /// `draw_scene` (opaque, indirect, transmissive, resolve) over 8 subpixel frames so offline
+    /// judges verify the real temporal resolve.
+    pub fn drawn_only<W: World + MeshWorld, S: Sky, L: Look>(
+        mut self,
+        world: W,
+        sky: S,
+        look: L,
+        eye: Eye,
+        width: u32,
+        height: u32,
+    ) {
+        let fbufs = world.upload_fields()
+        let (nb, v_unjit, sv) = self.prepare_and_shadow(
+            world,
+            fbufs,
+            NoSwarm {},
+            sky,
+            eye,
+            width,
+            height,
+            0,
+        )
+        self.tsr.valid = false
+
+        // Subframe 0: exact pixel-center view writes `drawn.place` and `drawn.sun`, and seeds TSR.
+        self.render_opaque_and_indirect(
+            world,
+            fbufs,
+            NoHeight {},
+            NoSwarm {},
+            sky,
+            v_unjit,
+            v_unjit,
+            sv,
+            width,
+            height,
+            phase_x: 0,
+            phase_y: 0,
+            write_judge: true,
+        )
+        self.render_transmissive(
+            world,
+            fbufs,
+            NoHeight {},
+            sky,
+            v_unjit,
+            v_unjit,
+            sv,
+            width,
+            height,
+            nb,
+        )
+        self.tsr.resolve(mut self.hdr_colour, self.g_motion, self.depth, v_unjit, width, height)
+
+        // Subframes 1..7: converge Halton(2, 3) TSR supersampling. `drawn.place` keeps subframe 0's
+        // middle-ray hit alone, as `Picture::place` promises, so a hole at a pixel's middle is seen.
+        for s in 1..8 {
+            let j = halton_jitter(s)
+            let vj = v_unjit.moved(j)
+            let px = s & 1
+            let py = (s >> 1) & 1
+            self.render_opaque_and_indirect(
+                world,
+                fbufs,
+                NoHeight {},
+                NoSwarm {},
+                sky,
+                vj,
+                v_unjit,
+                sv,
+                width,
+                height,
+                phase_x: px,
+                phase_y: py,
+                write_judge: false,
+            )
+            self.render_transmissive(
+                world,
+                fbufs,
+                NoHeight {},
+                sky,
+                vj,
+                v_unjit,
+                sv,
+                width,
+                height,
+                nb,
+            )
+            self.tsr.resolve(mut self.hdr_colour, self.g_motion, self.depth, v_unjit, width, height)
+        }
+
+        label("mesh_tone")
+        let tp = begin_pass(mut self.drawn.colour, keep: false)
+        draw(
+            tp,
+            cover,
+            hdr_tone_fs.bind(
+                hdr: self.hdr_colour,
+                depth: self.depth,
+                froxel_acc: self.vol.acc,
+                vol_s: self.vol.s,
+                vol_active: 0,
+                bloom_tex: self.bloom.u0,
+                bloom_s: self.bloom.s,
+                bloom_strength: 0.0,
+                v: v_unjit,
+                look: look,
+            ),
+            vertices: 3,
+        )
+        tp.end()
+        self.drawn.placed = true
+        for i in 0..nb {
+            self.batches[i].maybe_queue_poll()
+        }
+    }
+
+    /// Renders a complete scene (`world` solids, `height` clipmap, `medium` froxels, and `swarm`
+    /// field-colliding GPU grains) through ONE depth buffer, ONE light store, 2-cascade 3D SDF
+    /// clipmap, 1× G-buffer + motion vectors, phase-cycled half-res GI/SSR, half-res refract SSR +
+    /// 3-channel chromatic dispersion, Temporal Super-Resolution (TSR), froxel volumetrics,
+    /// optical HDR bloom, and ONE `Look::tone` pass.
+    pub fn draw_scene<W: World + MeshWorld, H: Height, Med: Medium, Sw: Swarm, S: Sky, L: Look>(
+        mut self,
+        world: W,
+        height: H,
+        medium: Med,
+        swarm: Sw,
+        sky: S,
+        look: L,
+        eye: Eye,
+        width: u32,
+        height_px: u32,
+    ) {
+        let cur_frame = self.frame
+        let fbufs = world.upload_fields()
+        let (nb, v_unjit, sv) = self.prepare_and_shadow(
+            world,
+            fbufs,
+            swarm,
+            sky,
+            eye,
+            width,
+            height_px,
+            cur_frame,
+        )
+        self.frame += 1
+
+        let jitter = halton_jitter(cur_frame)
+        let v = v_unjit.moved(jitter)
+        let prev_v = if self.tsr.valid { self.tsr.prev_v } else { v_unjit }
+        let phase_x = cur_frame & 1
+        let phase_y = (cur_frame >> 1) & 1
+
+        self.render_opaque_and_indirect(
+            world,
+            fbufs,
+            height,
+            swarm,
+            sky,
+            v,
+            prev_v,
+            sv,
+            width,
+            height_px,
+            phase_x,
+            phase_y,
+            write_judge: false,
+        )
+
+        self.render_transmissive(world, fbufs, height, sky, v, prev_v, sv, width, height_px, nb)
 
         // Pass 2f: Temporal Super-Resolution (TSR): merges Halton-jittered subpixel frames and
         // 2×2 phase-cycled half-res GI/SSR into crisp full-resolution supersampled HDR.

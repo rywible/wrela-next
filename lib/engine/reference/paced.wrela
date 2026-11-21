@@ -13,7 +13,10 @@ use picture::eye::View
 use picture::look::{Look, Seen}
 use picture::screen::luma
 use reference::reference::{THICK, dice, jitter}
-use reference::traced::{FAR, HALVINGS, LEAST, LEAST_DOUBLES, LEAST_FAR, LEAVE, MOST_BOUNCES, MOST_RAYS, MOST_STEPS, SIMPLE, cosine_way, die, sun_way}
+use reference::traced::{
+    FAR, HALVINGS, LEAST, LEAST_DOUBLES, LEAST_FAR, LEAVE, MOST_BOUNCES, MOST_RAYS, MOST_STEPS,
+    SIMPLE, cosine_way, die, sun_way,
+}
 use std::field::Field
 use std::gpu::{Append, Atomics, DispatchArgs, GlobalId, Slots}
 use std::math::PI
@@ -22,9 +25,10 @@ use std::math::PI
 /// a step of a thickness) or one surface (its facing, the most asks a step makes: `SURFACE_ASKS`).
 pub const UNITS: u32 = 4
 
-/// The most asks of matter one step makes: a surface's facing (its gradient, and where that
-/// vanishes six asks to either side) and what it is made of.
-pub const SURFACE_ASKS: u32 = 8
+/// The most asks of matter one step makes: the march's own ask, then at a surface its facing (its
+/// gradient, and where that vanishes six asks to either side) and what it is made of, and at a
+/// bounce whose sun isn't asked what it is made of again (`bounced`).
+pub const SURFACE_ASKS: u32 = 10
 
 /// A march under way (`traced::entered`, an ask at a time): where it starts (`o.xyz`) and how far
 /// it may go (`o.w`); its way (`d.xyz`) and how far it has come (`d.w`); the step before (`b.x`),
@@ -109,7 +113,8 @@ pub struct Paced: Copy + GpuData {
 
 /// What a pixel's reference has found, and says when it is done: the middle ray's facing and how
 /// far (`centre`), the sky behind it and 1, or 2 where it ran out of steps (`behind`), its thickness
-/// (`thick.x`), and the halves' sums (`met0`, `matter0`, `met1`, `matter1`; `far.xy` the first
+/// (`thick.x`), how many of its other marches (looks, sun rays, bounced rays) ran out of steps
+/// (`thick.y`: each taken as getting out, so the reference failed there), and the halves' sums (`met0`, `matter0`, `met1`, `matter1`; `far.xy` the first
 /// half's, `far.zw` the second's).
 pub struct Said: Copy + GpuData {
     pub centre: vec4,
@@ -124,12 +129,22 @@ pub struct Said: Copy + GpuData {
 
 /// Whether two `Said`s are the same to the bit.
 pub fn same_said(a: Said, b: Said) -> bool {
-    same4(a.centre, b.centre) && same4(a.behind, b.behind) && same4(a.thick, b.thick) && same4(a.met0, b.met0) && same4(a.matter0, b.matter0) && same4(a.met1, b.met1) && same4(a.matter1, b.matter1) && same4(a.far, b.far)
+    same4(a.centre, b.centre) &&
+        same4(a.behind, b.behind) &&
+        same4(a.thick, b.thick) &&
+        same4(a.met0, b.met0) &&
+        same4(a.matter0, b.matter0) &&
+        same4(a.met1, b.met1) &&
+        same4(a.matter1, b.matter1) &&
+        same4(a.far, b.far)
 }
 
 /// Two vectors the same to the bit.
 fn same4(a: vec4, b: vec4) -> bool {
-    bitcast_u32(a.x) == bitcast_u32(b.x) && bitcast_u32(a.y) == bitcast_u32(b.y) && bitcast_u32(a.z) == bitcast_u32(b.z) && bitcast_u32(a.w) == bitcast_u32(b.w)
+    bitcast_u32(a.x) == bitcast_u32(b.x) &&
+        bitcast_u32(a.y) == bitcast_u32(b.y) &&
+        bitcast_u32(a.z) == bitcast_u32(b.z) &&
+        bitcast_u32(a.w) == bitcast_u32(b.w)
 }
 
 /// A pixel's stages.
@@ -148,7 +163,17 @@ pub const DONE: u32 = 10
 /// A pixel's reference begun.
 pub fn paced_begun() -> Paced {
     let z = vec4(0.0)
-    Paced { march: march_begun(vec3(0.0), vec3(0.0), 0.0, 0.0), e: z, carried: z, p: z, n: z, q: z, nq: z, way: z, st: vec4u(BEGIN, 0, 0, 0) }
+    Paced {
+        march: march_begun(vec3(0.0), vec3(0.0), 0.0, 0.0),
+        e: z,
+        carried: z,
+        p: z,
+        n: z,
+        q: z,
+        nq: z,
+        way: z,
+        st: vec4u(BEGIN, 0, 0, 0),
+    }
 }
 
 /// Nothing found yet.
@@ -194,7 +219,15 @@ fn summed(s: mut Said, index: u32, c: vec3, met: bool, t: f32) {
 
 /// One step of a pixel's reference (a march's step, or a surface, or a stage begun): the middle ray
 /// (`traced::entered`, its `thickness`), then each look, `lit`, in that order.
-pub fn paced_step<M: Field<Substance>, S: Sky, L: Look>(m: Matter<M>, sky: S, look: L, view: View, at: PacedAt, ps: Paced, sd: mut Said) -> Paced {
+pub fn paced_step<M: Field<Substance>, S: Sky, L: Look>(
+    m: Matter<M>,
+    sky: S,
+    look: L,
+    view: View,
+    at: PacedAt,
+    ps: Paced,
+    sd: mut Said,
+) -> Paced {
     var s = ps
     let stage = s.st.x
     let sun = sky.sun()
@@ -263,6 +296,9 @@ pub fn paced_step<M: Field<Substance>, S: Sky, L: Look>(m: Matter<M>, sky: S, lo
         if march_done(s.march) {
             let t = march_answer(s.march)
             let d = s.march.d.xyz
+            if t < -1.5 {
+                sd.thick.y += 1.0
+            }
             if t < 0.0 {
                 summed(mut sd, s.st.y, look.tone(Seen { light: seen(sky, d) }), false, 0.0)
                 s.st.y += 1
@@ -294,6 +330,9 @@ pub fn paced_step<M: Field<Substance>, S: Sky, L: Look>(m: Matter<M>, sky: S, lo
     } else if stage == SUN {
         s.march = march_step(m, s.march)
         if march_done(s.march) {
+            if march_answer(s.march) < -1.5 {
+                sd.thick.y += 1.0
+            }
             let lit = if march_answer(s.march) >= 0.0 { vec3(0.0) } else { sun.light * s.carried.w }
             let sub = m.made_of(s.p.xyz)
             s.e = vec4(s.e.xyz + sub.scatters(s.n.xyz, sun.way, -s.way.xyz) * lit, s.e.w)
@@ -347,6 +386,9 @@ pub fn paced_step<M: Field<Substance>, S: Sky, L: Look>(m: Matter<M>, sky: S, lo
             let t = march_answer(s.march)
             let way = s.way.xyz
             let stop = s.st.w - 1
+            if t < -1.5 {
+                sd.thick.y += 1.0
+            }
             if t < 0.0 {
                 s.e = vec4(s.e.xyz + s.carried.xyz * sky.light(way), s.e.w)
                 s.st.z += 1
@@ -380,6 +422,9 @@ pub fn paced_step<M: Field<Substance>, S: Sky, L: Look>(m: Matter<M>, sky: S, lo
     } else if stage == RAY_SUN {
         s.march = march_step(m, s.march)
         if march_done(s.march) {
+            if march_answer(s.march) < -1.5 {
+                sd.thick.y += 1.0
+            }
             let lit = if march_answer(s.march) >= 0.0 { vec3(0.0) } else { sun.light * s.nq.w }
             s = bounced(m, sky, at, s, lit)
         }
@@ -388,7 +433,13 @@ pub fn paced_step<M: Field<Substance>, S: Sky, L: Look>(m: Matter<M>, sky: S, lo
 }
 
 /// After a bounce's sun (`lit` the sun's light on it), the way on from it (`lit`'s loop's end).
-fn bounced<M: Field<Substance>, S: Sky>(m: Matter<M>, sky: S, at: PacedAt, ps: Paced, lit: vec3) -> Paced {
+fn bounced<M: Field<Substance>, S: Sky>(
+    m: Matter<M>,
+    sky: S,
+    at: PacedAt,
+    ps: Paced,
+    lit: vec3,
+) -> Paced {
     var s = ps
     let sun = sky.sun()
     let q = s.q.xyz
@@ -413,7 +464,12 @@ pub const PACED_WORDS: u32 = 48
 pub const SAID_WORDS: u32 = 32
 
 fn w4(a: Atomics<u32>, at: u32) -> vec4 {
-    vec4(bitcast_f32(a.load(i: at)), bitcast_f32(a.load(i: at + 1)), bitcast_f32(a.load(i: at + 2)), bitcast_f32(a.load(i: at + 3)))
+    vec4(
+        bitcast_f32(a.load(i: at)),
+        bitcast_f32(a.load(i: at + 1)),
+        bitcast_f32(a.load(i: at + 2)),
+        bitcast_f32(a.load(i: at + 3)),
+    )
 }
 
 fn w4u(a: Atomics<u32>, at: u32) -> vec4u {
@@ -436,7 +492,17 @@ fn put4u(a: mut Atomics<u32>, at: u32, v: vec4u) {
 
 fn paced_read(a: Atomics<u32>, px: u32) -> Paced {
     let b = px * PACED_WORDS
-    Paced { march: March { o: w4(a, b), d: w4(a, b + 4), b: w4(a, b + 8), s: w4u(a, b + 12) }, e: w4(a, b + 16), carried: w4(a, b + 20), p: w4(a, b + 24), n: w4(a, b + 28), q: w4(a, b + 32), nq: w4(a, b + 36), way: w4(a, b + 40), st: w4u(a, b + 44) }
+    Paced {
+        march: March { o: w4(a, b), d: w4(a, b + 4), b: w4(a, b + 8), s: w4u(a, b + 12) },
+        e: w4(a, b + 16),
+        carried: w4(a, b + 20),
+        p: w4(a, b + 24),
+        n: w4(a, b + 28),
+        q: w4(a, b + 32),
+        nq: w4(a, b + 36),
+        way: w4(a, b + 40),
+        st: w4u(a, b + 44),
+    }
 }
 
 fn paced_write(a: mut Atomics<u32>, px: u32, s: Paced) {
@@ -457,7 +523,16 @@ fn paced_write(a: mut Atomics<u32>, px: u32, s: Paced) {
 
 fn said_read(a: Atomics<u32>, px: u32) -> Said {
     let b = px * SAID_WORDS
-    Said { centre: w4(a, b), behind: w4(a, b + 4), thick: w4(a, b + 8), met0: w4(a, b + 12), matter0: w4(a, b + 16), met1: w4(a, b + 20), matter1: w4(a, b + 24), far: w4(a, b + 28) }
+    Said {
+        centre: w4(a, b),
+        behind: w4(a, b + 4),
+        thick: w4(a, b + 8),
+        met0: w4(a, b + 12),
+        matter0: w4(a, b + 16),
+        met1: w4(a, b + 20),
+        matter1: w4(a, b + 24),
+        far: w4(a, b + 28),
+    }
 }
 
 fn said_write(a: mut Atomics<u32>, px: u32, s: Said) {
@@ -474,7 +549,13 @@ fn said_write(a: mut Atomics<u32>, px: u32, s: Said) {
 
 /// Each pixel of a run of `n` begun: its state at the start, nothing found, and listed undone.
 @compute(64)
-pub fn paced_begun_all(n: u32, state: mut Atomics<u32>, found: mut Atomics<u32>, undone: mut Append<u32>, id: GlobalId) {
+pub fn paced_begun_all(
+    n: u32,
+    state: mut Atomics<u32>,
+    found: mut Atomics<u32>,
+    undone: mut Append<u32>,
+    id: GlobalId,
+) {
     let i = id.x
     if i >= n {
         return
@@ -502,7 +583,27 @@ pub fn sliced(count: [u32], chunk: u32, slices: u32, args: mut Slots<DispatchArg
 /// what it has found read and written where its pixel is (`state`, `found`), and the pixel listed
 /// again in `still` while it is not done.
 @compute(64)
-pub fn paced<M: Field<Substance>, S: Sky, L: Look>(m: Matter<M>, sky: S, look: L, view: View, salt: u32, looks: u32, rays: u32, bounces: u32, light: u32, first: u32, width: u32, undone: [u32], count: [u32], k: u32, chunk: u32, state: mut Atomics<u32>, found: mut Atomics<u32>, still: mut Append<u32>, id: GlobalId) {
+pub fn paced<M: Field<Substance>, S: Sky, L: Look>(
+    m: Matter<M>,
+    sky: S,
+    look: L,
+    view: View,
+    salt: u32,
+    looks: u32,
+    rays: u32,
+    bounces: u32,
+    light: u32,
+    first: u32,
+    width: u32,
+    undone: [u32],
+    count: [u32],
+    k: u32,
+    chunk: u32,
+    state: mut Atomics<u32>,
+    found: mut Atomics<u32>,
+    still: mut Append<u32>,
+    id: GlobalId,
+) {
     let i = k * chunk + id.x
     if id.x >= chunk || i >= count[0] {
         return

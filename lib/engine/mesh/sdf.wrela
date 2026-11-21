@@ -153,12 +153,7 @@ fn sdf_splat_boxes<M: Field<Substance>>(
 
 /// Resolves a fixed-point `i32` SDF accumulation buffer into a hardware-filtered `Texture3d<R16Float>`.
 @compute(4, 4, 4)
-fn sdf_resolve(
-    src: [i32],
-    side: u32,
-    out: mut Texels3d<R16Float>,
-    id: GlobalId,
-) {
+fn sdf_resolve(src: [i32], side: u32, out: mut Texels3d<R16Float>, id: GlobalId) {
     if id.x >= side || id.y >= side || id.z >= side {
         return
     }
@@ -168,25 +163,6 @@ fn sdf_resolve(
 }
 
 // ---- Hardware-Trilinear 3D SDF Queries ---------------------------------------------------------
-
-/// 4-corner regular tetrahedron gradient normal of the 3D SDF clipmap at `wp` (4 cache-coherent
-/// `R16Float` taps): exact on planar floors/walls and smooth on curved geometry for fast swarms.
-pub fn sdf_normal(
-    grid: SdfGrid,
-    sdf0: Texture3d<R16Float>,
-    sdf1: Texture3d<R16Float>,
-    s: Sampler,
-    wp: vec3,
-) -> vec3 {
-    let h = max(grid.v0 * 0.45, 0.04)
-    let d0 = sdf_sample(grid, sdf0, sdf1, s, wp + vec3(h, h, h))
-    let d1 = sdf_sample(grid, sdf0, sdf1, s, wp + vec3(h, -h, -h))
-    let d2 = sdf_sample(grid, sdf0, sdf1, s, wp + vec3(-h, h, -h))
-    let d3 = sdf_sample(grid, sdf0, sdf1, s, wp + vec3(-h, -h, h))
-    let g = vec3(d0 + d1 - d2 - d3, d0 - d1 + d2 - d3, d0 - d1 - d2 + d3)
-    let gl2 = dot(g, g)
-    if gl2 > 1.0e-10 { g * (1.0 / sqrt(gl2)) } else { vec3(0.0, 1.0, 0.0) }
-}
 
 /// Samples the signed distance (m) at world point `wp` from the finest covering SDF cascade
 /// (1 hardware trilinear 2-byte `R16Float` tap).
@@ -198,11 +174,21 @@ pub fn sdf_sample(
     wp: vec3,
 ) -> f32 {
     let u0 = (wp - grid.o0) * grid.inv_s0
-    if u0.x >= 0.02 && u0.x <= 0.98 && u0.y >= 0.02 && u0.y <= 0.98 && u0.z >= 0.02 && u0.z <= 0.98 {
+    if u0.x >= 0.02 &&
+        u0.x <= 0.98 &&
+        u0.y >= 0.02 &&
+        u0.y <= 0.98 &&
+        u0.z >= 0.02 &&
+        u0.z <= 0.98 {
         return sdf0.sample_level(s, u0, 0.0)
     }
     let u1 = (wp - grid.o1) * grid.inv_s1
-    if u1.x >= 0.02 && u1.x <= 0.98 && u1.y >= 0.02 && u1.y <= 0.98 && u1.z >= 0.02 && u1.z <= 0.98 {
+    if u1.x >= 0.02 &&
+        u1.x <= 0.98 &&
+        u1.y >= 0.02 &&
+        u1.y <= 0.98 &&
+        u1.z >= 0.02 &&
+        u1.z <= 0.98 {
         return sdf1.sample_level(s, u1, 0.0)
     }
     SDF_MAX
@@ -481,13 +467,44 @@ fn box_for_sphere(
     if cx1 <= cx0 || cy1 <= cy0 || cz1 <= cz0 {
         return None
     }
-    Some(SdfBox {
-        vlo: vec3u(cx0, cy0, cz0),
-        item,
-        size: vec3u(cx1 - cx0, cy1 - cy0, cz1 - cz0),
-        base_work,
-        bound,
-    })
+    Some(
+        SdfBox {
+            vlo: vec3u(cx0, cy0, cz0),
+            item,
+            size: vec3u(cx1 - cx0, cy1 - cy0, cz1 - cz0),
+            base_work,
+            bound,
+        },
+    )
+}
+
+/// The largest swarm grain radius (m) the clipmap's "certainly clear" test is sound for: every
+/// splat pads its field's box by at least a voxel diagonal plus this.
+pub const GRAIN_MOST: f32 = 0.05
+
+/// Most voxels one splat dispatch covers in cascade 0 and 1, so no dispatch holds the GPU long
+/// (AGENTS.md rule 2): more boxes take more dispatches, and a box past it is cut into slabs.
+const SPLAT_WORK0: u32 = 524288
+const SPLAT_WORK1: u32 = 262144
+
+/// Appends `b` to `out` cut along `z` into slabs of at most `most` voxels each.
+fn cut_box(b: SdfBox, most: u32, out: mut Vec<SdfBox>) {
+    let layer = max(b.size.x * b.size.y, 1)
+    let per = max(most / layer, 1)
+    var z: u32 = 0
+    while z < b.size.z {
+        let n = min(per, b.size.z - z)
+        out.push(
+            SdfBox {
+                vlo: vec3u(b.vlo.x, b.vlo.y, b.vlo.z + z),
+                item: b.item,
+                size: vec3u(b.size.x, b.size.y, n),
+                base_work: 0,
+                bound: b.bound,
+            },
+        )
+        z += n
+    }
 }
 
 /// Persistent GPU buffers and 2-cascade `R16Float` 3D textures for the unified SDF clipmap.
@@ -585,153 +602,188 @@ impl SdfClipmap {
         }
         let pad0 = if to_static { SDF_MAX } else { 2.0 }
         let pad1 = if to_static { SDF_MAX } else { 2.5 }
-        let b0 = box_for_sphere(b, pad0, self.grid.o0, self.grid.v0, SDF0_SIDE, item: 0, base_work: 0)
-        let b1 = box_for_sphere(b, pad1, self.grid.o1, self.grid.v1, SDF1_SIDE, item: 0, base_work: 0)
-        let has0 = match b0 { Some(_) => true, None => false }
-        let has1 = match b1 { Some(_) => true, None => false }
-        if !has0 && !has1 {
+        var boxes0: Vec<SdfBox> = Vec::new()
+        var boxes1: Vec<SdfBox> = Vec::new()
+        match box_for_sphere(
+            b,
+            pad0,
+            self.grid.o0,
+            self.grid.v0,
+            SDF0_SIDE,
+            item: 0,
+            base_work: 0,
+        ) {
+            Some(bx) => cut_box(bx, SPLAT_WORK0, mut boxes0),
+            None => {},
+        }
+        match box_for_sphere(
+            b,
+            pad1,
+            self.grid.o1,
+            self.grid.v1,
+            SDF1_SIDE,
+            item: 0,
+            base_work: 0,
+        ) {
+            Some(bx) => cut_box(bx, SPLAT_WORK1, mut boxes1),
+            None => {},
+        }
+        if boxes0.len() == 0 && boxes1.len() == 0 {
             return
         }
         let fbuf = buffer_of([field])
-        match b0 {
-            Some(bx) => {
-                let work = bx.size.x * bx.size.y * bx.size.z
-                write(mut self.boxes_buf, 0, [bx])
-                if to_static {
-                    dispatch(
-                        sdf_splat_boxes.bind(
-                            fields: fbuf.items(), boxes: self.boxes_buf.items(), n_boxes: 1,
-                            total_work: work, origin: self.grid.o0, voxel: self.grid.v0,
-                            side: SDF0_SIDE, out: mut self.static_buf0,
-                        ),
-                        over: work,
-                    )
-                } else {
-                    dispatch(
-                        sdf_splat_boxes.bind(
-                            fields: fbuf.items(), boxes: self.boxes_buf.items(), n_boxes: 1,
-                            total_work: work, origin: self.grid.o0, voxel: self.grid.v0,
-                            side: SDF0_SIDE, out: mut self.work_buf0,
-                        ),
-                        over: work,
-                    )
-                }
-            },
-            None => {},
-        }
-        match b1 {
-            Some(bx) => {
-                let work = bx.size.x * bx.size.y * bx.size.z
-                write(mut self.boxes_buf, 0, [bx])
-                if to_static {
-                    dispatch(
-                        sdf_splat_boxes.bind(
-                            fields: fbuf.items(), boxes: self.boxes_buf.items(), n_boxes: 1,
-                            total_work: work, origin: self.grid.o1, voxel: self.grid.v1,
-                            side: SDF1_SIDE, out: mut self.static_buf1,
-                        ),
-                        over: work,
-                    )
-                } else {
-                    dispatch(
-                        sdf_splat_boxes.bind(
-                            fields: fbuf.items(), boxes: self.boxes_buf.items(), n_boxes: 1,
-                            total_work: work, origin: self.grid.o1, voxel: self.grid.v1,
-                            side: SDF1_SIDE, out: mut self.work_buf1,
-                        ),
-                        over: work,
-                    )
-                }
-            },
-            None => {},
-        }
+        self.splat_boxes(fbuf.items(), boxes0, cascade: 0, to_static: to_static)
+        self.splat_boxes(fbuf.items(), boxes1, cascade: 1, to_static: to_static)
     }
 
-    /// Splats an array of `N` fields into both cascades in one flat dispatch per cascade.
+    /// Splats an array of `N` fields into both cascades, as few dispatches per cascade as the
+    /// per-dispatch work bound allows (every field's box is splatted; none is dropped).
     pub fn splat_many<M: Field<Substance> + GpuData, const N: u32>(
         mut self,
         fields: [M; N],
         to_static: bool,
     ) {
-        let pad0 = if N > 32 { 0.45 } else if to_static { 2.5 } else { 1.4 }
-        let pad1 = if N > 32 { 0.85 } else if to_static { 3.5 } else { 1.8 }
+        // A swarm grain skips exact collision where the clipmap reads it clear by `r + √3 v` (one
+        // voxel diagonal past its radius), so every voxel that near a field must hold its exact
+        // distance: the pad covers that at each cascade's voxel, for grains up to `GRAIN_MOST`.
+        let pad0 = if N > 32 {
+            max(0.45, 1.75 * self.grid.v0 + GRAIN_MOST)
+        } else if to_static {
+            2.5
+        } else {
+            1.4
+        }
+        let pad1 = if N > 32 {
+            max(0.85, 1.75 * self.grid.v1 + GRAIN_MOST)
+        } else if to_static {
+            3.5
+        } else {
+            1.8
+        }
         var boxes0: Vec<SdfBox> = Vec::new()
-        var work0: u32 = 0
         var boxes1: Vec<SdfBox> = Vec::new()
-        var work1: u32 = 0
         for i in 0..N {
             let fb = fields[i].bound()
             let b = vec4(fb.centre, min(fb.radius, 1.0e4))
-            match box_for_sphere(b, pad0, self.grid.o0, self.grid.v0, SDF0_SIDE, i, work0) {
-                Some(bx) => {
-                    let w = bx.size.x * bx.size.y * bx.size.z
-                    if work0 + w <= 524288 {
-                        boxes0.push(bx)
-                        work0 += w
-                    }
-                },
+            match box_for_sphere(b, pad0, self.grid.o0, self.grid.v0, SDF0_SIDE, i, 0) {
+                Some(bx) => cut_box(bx, SPLAT_WORK0, mut boxes0),
                 None => {},
             }
-            match box_for_sphere(b, pad1, self.grid.o1, self.grid.v1, SDF1_SIDE, i, work1) {
-                Some(bx) => {
-                    let w = bx.size.x * bx.size.y * bx.size.z
-                    if work1 + w <= 262144 {
-                        boxes1.push(bx)
-                        work1 += w
-                    }
-                },
+            match box_for_sphere(b, pad1, self.grid.o1, self.grid.v1, SDF1_SIDE, i, 0) {
+                Some(bx) => cut_box(bx, SPLAT_WORK1, mut boxes1),
                 None => {},
             }
         }
-        if work0 == 0 && work1 == 0 {
+        if boxes0.len() == 0 && boxes1.len() == 0 {
             return
         }
         let fbuf = buffer_of(fields)
-        if work0 > 0 {
-            let nb0 = boxes0.len()
-            self.ensure_boxes(nb0)
-            write(mut self.boxes_buf, 0, boxes0)
+        self.splat_boxes(fbuf.items(), boxes0, cascade: 0, to_static: to_static)
+        self.splat_boxes(fbuf.items(), boxes1, cascade: 1, to_static: to_static)
+    }
+
+    /// Splats `boxes` (each at most the cascade's per-dispatch work) of `fields` into cascade
+    /// `cascade`, in consecutive dispatches of at most that work each.
+    fn splat_boxes<M: Field<Substance> + GpuData>(
+        mut self,
+        fields: GpuSpan<M>,
+        boxes: Vec<SdfBox>,
+        cascade: u32,
+        to_static: bool,
+    ) {
+        let most = if cascade == 0 { SPLAT_WORK0 } else { SPLAT_WORK1 }
+        var group: Vec<SdfBox> = Vec::new()
+        var work: u32 = 0
+        for i in 0..boxes.len() {
+            var bx = boxes[i]
+            let w = bx.size.x * bx.size.y * bx.size.z
+            if work + w > most && group.len() > 0 {
+                self.splat_group(fields, group, work, cascade, to_static)
+                group = Vec::new()
+                work = 0
+            }
+            bx.base_work = work
+            group.push(bx)
+            work += w
+        }
+        if group.len() > 0 {
+            self.splat_group(fields, group, work, cascade, to_static)
+        }
+    }
+
+    /// One splat dispatch of `group` (`work` voxels in all) into cascade `cascade`.
+    fn splat_group<M: Field<Substance> + GpuData>(
+        mut self,
+        fields: GpuSpan<M>,
+        group: Vec<SdfBox>,
+        work: u32,
+        cascade: u32,
+        to_static: bool,
+    ) {
+        let nb = group.len()
+        self.ensure_boxes(nb)
+        write(mut self.boxes_buf, 0, group)
+        let boxes = self.boxes_buf.items()
+        if cascade == 0 {
+            let (origin, voxel) = (self.grid.o0, self.grid.v0)
             if to_static {
                 dispatch(
                     sdf_splat_boxes.bind(
-                        fields: fbuf.items(), boxes: self.boxes_buf.items(), n_boxes: nb0,
-                        total_work: work0, origin: self.grid.o0, voxel: self.grid.v0,
-                        side: SDF0_SIDE, out: mut self.static_buf0,
+                        fields: fields,
+                        boxes: boxes,
+                        n_boxes: nb,
+                        total_work: work,
+                        origin: origin,
+                        voxel: voxel,
+                        side: SDF0_SIDE,
+                        out: mut self.static_buf0,
                     ),
-                    over: work0,
+                    over: work,
                 )
             } else {
                 dispatch(
                     sdf_splat_boxes.bind(
-                        fields: fbuf.items(), boxes: self.boxes_buf.items(), n_boxes: nb0,
-                        total_work: work0, origin: self.grid.o0, voxel: self.grid.v0,
-                        side: SDF0_SIDE, out: mut self.work_buf0,
+                        fields: fields,
+                        boxes: boxes,
+                        n_boxes: nb,
+                        total_work: work,
+                        origin: origin,
+                        voxel: voxel,
+                        side: SDF0_SIDE,
+                        out: mut self.work_buf0,
                     ),
-                    over: work0,
+                    over: work,
                 )
             }
-        }
-        if work1 > 0 {
-            let nb1 = boxes1.len()
-            self.ensure_boxes(nb1)
-            write(mut self.boxes_buf, 0, boxes1)
+        } else {
+            let (origin, voxel) = (self.grid.o1, self.grid.v1)
             if to_static {
                 dispatch(
                     sdf_splat_boxes.bind(
-                        fields: fbuf.items(), boxes: self.boxes_buf.items(), n_boxes: nb1,
-                        total_work: work1, origin: self.grid.o1, voxel: self.grid.v1,
-                        side: SDF1_SIDE, out: mut self.static_buf1,
+                        fields: fields,
+                        boxes: boxes,
+                        n_boxes: nb,
+                        total_work: work,
+                        origin: origin,
+                        voxel: voxel,
+                        side: SDF1_SIDE,
+                        out: mut self.static_buf1,
                     ),
-                    over: work1,
+                    over: work,
                 )
             } else {
                 dispatch(
                     sdf_splat_boxes.bind(
-                        fields: fbuf.items(), boxes: self.boxes_buf.items(), n_boxes: nb1,
-                        total_work: work1, origin: self.grid.o1, voxel: self.grid.v1,
-                        side: SDF1_SIDE, out: mut self.work_buf1,
+                        fields: fields,
+                        boxes: boxes,
+                        n_boxes: nb,
+                        total_work: work,
+                        origin: origin,
+                        voxel: voxel,
+                        side: SDF1_SIDE,
+                        out: mut self.work_buf1,
                     ),
-                    over: work1,
+                    over: work,
                 )
             }
         }

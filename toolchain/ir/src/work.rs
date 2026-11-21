@@ -877,6 +877,9 @@ impl<'a> Counter<'a> {
         let proof_mark = self.proof.as_ref().map(|p| p.log.len());
         let mut ran = 0u64;
         let work_at = fr.work;
+        // The ways that return inside the loop, apart from those before it: a pass that returns
+        // through costlier code than the passes that go on is part of the loop's total.
+        let left_at = std::mem::take(&mut fr.left);
         // (Each pass is followed knowing what's sure on every way into it, so its work is the
         // most any of them does; the loop ends when no way goes on to another pass, and what's
         // known after it is what every `break` that left it knew, from every pass.)
@@ -914,6 +917,7 @@ impl<'a> Counter<'a> {
                     st.join(b);
                 }
                 st.keep_unchanged(&entry);
+                fr.left = fr.left.max(left_at);
                 return Flow::Normal;
             }
             passes += 1;
@@ -941,12 +945,13 @@ impl<'a> Counter<'a> {
                 // No way goes on to another pass: after the loop is what each `break` knew.
                 let exits = fr.exits.pop().expect("this loop's exits");
                 if let Some(t) = self.totals.as_mut() {
-                    let total = fr.work.saturating_sub(work_at);
+                    let total = fr.work.max(fr.left).saturating_sub(work_at);
                     let e = t.entry(body_at).or_insert(Some(0));
                     if let Some(most) = e {
                         *most = (*most).max(total);
                     }
                 }
+                fr.left = fr.left.max(left_at);
                 return match exits.breaks {
                     Some(b) => {
                         *st = b;
@@ -1079,6 +1084,7 @@ impl<'a> Counter<'a> {
                         st.locals.remove(&l);
                         st.most.remove(&l);
                         st.built.remove(&l);
+                        st.copies.remove(&l);
                     }
                 }
                 let c = self.call(*id, &vals);
@@ -1399,4 +1405,110 @@ pub fn weight(m: &Module, f: FuncId) -> u64 {
         w
     }
     go(m, f, &mut HashMap::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `fn f(hit: bool) { var done = hit; clear(&mut done); if hit { loop { if done { break } } } }`
+    /// with `clear` storing `false` through its reference: after the call, `done` is no copy
+    /// of `hit` any more, so the branch on `hit` says nothing of it, and the loop (which never
+    /// leaves when `done` is false) has no bound. (The count once kept the copy across the call
+    /// and took the loop as leaving at once.)
+    #[test]
+    fn a_bool_lent_to_a_call_is_no_copy_of_what_it_held() {
+        let mut m = Module::default();
+        let b = m.types.bool();
+        let mut clear = Function::new(
+            "clear",
+            vec![Param { name: "done".into(), ty: b, by_ref: true, mutable: true }],
+            None,
+        );
+        let no = clear.new_value(b);
+        clear.body = vec![
+            Stmt::Let(no, Expr::Const(Const::Bool(false))),
+            Stmt::Store(Place::root(PlaceRoot::Param(0)), no),
+            Stmt::Return(None),
+        ];
+        let clear = m.add_function(clear);
+        let mut f = Function::new("f", vec![Param::value("hit", b)], None);
+        let done = f.new_local("done", b);
+        let (hit, d) = (f.new_value(b), f.new_value(b));
+        f.body = vec![
+            Stmt::Let(hit, Expr::Param(0)),
+            Stmt::Store(Place::local(done), hit),
+            Stmt::Eval(Expr::Call(clear, vec![Arg::Place(Place::local(done))])),
+            Stmt::If {
+                cond: hit,
+                then: vec![Stmt::Loop {
+                    body: vec![
+                        Stmt::Let(d, Expr::Load(Place::local(done))),
+                        Stmt::If { cond: d, then: vec![Stmt::Break], else_: vec![] },
+                    ],
+                    continuing: vec![],
+                }],
+                else_: vec![],
+            },
+            Stmt::Return(None),
+        ];
+        let f = m.add_function(f);
+        assert_eq!(entry_work(&m, f).work, None);
+    }
+
+    /// A loop of 4 passes, each of which may return through 50 square roots (200 work): its
+    /// total, which fuel weighs it by, holds the pass that returns (it once held only the passes
+    /// that went on, about 20).
+    #[test]
+    fn a_loop_s_total_holds_a_pass_that_returns() {
+        let mut m = Module::default();
+        let (u, b, f32_ty) = (m.types.u32(), m.types.bool(), m.types.f32());
+        let v3u = m.types.vector_of(Scalar::U32, 3);
+        let mut f = Function::new("k", Vec::new(), None);
+        let i = f.new_local("i", u);
+        let mut head = Vec::new();
+        let id = f.let_(&mut head, v3u, Expr::EntryInput(0));
+        let x = f.let_(&mut head, u, Expr::Extract(id, 0));
+        let zero = f.let_(&mut head, u, Expr::Const(Const::U32(0)));
+        let hit = f.let_(&mut head, b, Expr::Binary(BinOp::Eq, x, zero));
+        let two = f.let_(&mut head, f32_ty, Expr::Const(Const::F32(2.0)));
+        head.push(Stmt::Store(Place::local(i), zero));
+        let mut body = Vec::new();
+        let c = f.let_(&mut body, u, Expr::Load(Place::local(i)));
+        let four = f.let_(&mut body, u, Expr::Const(Const::U32(4)));
+        let t = f.let_(&mut body, b, Expr::Binary(BinOp::Ge, c, four));
+        body.push(Stmt::If { cond: t, then: vec![Stmt::Break], else_: vec![] });
+        let mut heavy = Vec::new();
+        for _ in 0..50 {
+            f.let_(&mut heavy, f32_ty, Expr::Builtin(Builtin::Sqrt, vec![two]));
+        }
+        heavy.push(Stmt::Return(None));
+        body.push(Stmt::If { cond: hit, then: heavy, else_: vec![] });
+        let mut continuing = Vec::new();
+        let r = f.let_(&mut continuing, u, Expr::Load(Place::local(i)));
+        let one = f.let_(&mut continuing, u, Expr::Const(Const::U32(1)));
+        let n = f.let_(&mut continuing, u, Expr::Binary(BinOp::Add, r, one));
+        continuing.push(Stmt::Store(Place::local(i), n));
+        head.push(Stmt::Loop { body, continuing });
+        head.push(Stmt::Return(None));
+        f.body = head;
+        let k = m.add_function(f);
+        m.entry_points.push(EntryPoint {
+            name: "k".into(),
+            stage: Stage::Compute { workgroup_size: [64, 1, 1] },
+            function: k,
+            inputs: vec![BuiltinInput::GlobalInvocationId],
+        });
+        let at = m.functions[k.index()]
+            .body
+            .iter()
+            .find_map(|s| match s {
+                Stmt::Loop { body, .. } => Some(body.as_ptr() as usize),
+                _ => None,
+            })
+            .expect("the loop");
+        let (_, totals) = work_and_loop_totals(&m);
+        let total = totals.get(&at).copied().flatten().expect("a bounded loop");
+        assert!(total >= 50 * SLOW_OP, "{total}");
+    }
 }

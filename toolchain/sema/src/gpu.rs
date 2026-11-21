@@ -66,9 +66,26 @@ pub fn writes_slots(p: &Program, f: FnId) -> bool {
     p.func(f).params.iter().any(|ps| p.lang_of_ty(ps.ty) == Some(Lang::Slots))
 }
 
+/// Whether a dispatch of kernel `f` that writes `Slots` with an origin runs one row: its count
+/// (`row_groups`: a `u32`, not from a buffer) and its origin (`row_origin`) each along x alone,
+/// and its invocations one row too. Over a count (`over`) they are, whatever the workgroup: the
+/// domain is one high and invocations past it return. By groups, the workgroup must be one
+/// high and one deep (`@compute(n)`): one of `@compute(8, 8)` runs eight rows a group, which a
+/// part numbers by its own width (E0603, [`slots_in_parts`]).
+pub fn slots_part_is_one_row(
+    p: &Program,
+    f: FnId,
+    over: bool,
+    row_groups: bool,
+    row_origin: bool,
+) -> bool {
+    let flat = matches!(p.func(f).attrs.entry, Some((Entry::Compute([_, 1, 1]), _)));
+    row_groups && row_origin && (over || flat)
+}
+
 /// E0603: kernel `f`, which writes `Slots` ([`writes_slots`]), dispatched with an origin
-/// (`span`) and more than one row: its slots are numbered by the part's own rows, not the
-/// whole's.
+/// (`span`) and more than one row ([`slots_part_is_one_row`]): its slots are numbered by the
+/// part's own rows, not the whole's.
 pub fn slots_in_parts(p: &Program, f: FnId, span: Span) -> Diagnostic {
     let name = &p.func(f).name;
     Diagnostic::new(
@@ -76,8 +93,8 @@ pub fn slots_in_parts(p: &Program, f: FnId, span: Span) -> Diagnostic {
         span,
         format!("`{name}` writes `Slots`, so it's given an origin only along one row"),
     )
-    .with_note("a `Slots` is numbered row by row across the dispatch, so a part of more than one row would number its slots by its own rows, not the whole's (§18.4)")
-    .with_help("dispatch it with a `u32` count and a `u32` origin, or write a texture (`Texels`, `Texels3d`), whose texels are where `GlobalId` says")
+    .with_note("a `Slots` is numbered row by row across the dispatch, so a part of more than one row would number its slots by its own rows, not the whole's (§18.4); a workgroup more than one high or deep dispatched by `groups:` runs more than one row")
+    .with_help("dispatch it `over:` a `u32` count with a `u32` origin (or by `groups:` a `u32`, its workgroup `@compute(n)`), or write a texture (`Texels`, `Texels3d`), whose texels are where `GlobalId` says")
 }
 
 /// E0603: kernel `f`, which shares workgroup memory ([`shares_memory`]), dispatched over a

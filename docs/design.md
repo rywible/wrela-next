@@ -368,8 +368,8 @@ requiring an author to write a mesh.
 
 **The unified pipeline (`lib/engine/mesh/`).** Authors still write pure fields only (`Field<Substance>` for solids/creatures/morphing spells, `Height` for terrains and seas, `Medium` for fog/mist/smoke/plumes, `Sky` for the sky and sun, `Look` for tone). The engine compiles every field into hardware-native geometry or volumes on the GPU:
 
-1. **Sparse interval-culled Dual Contouring (`lib/engine/mesh/extract.wrela`):** Any `One<M>` or `Many<M, N>` is interval-culled and part-pruned (`pruned`/`distance_live`) into active `6³` bricks (evaluating an `8³` corner block and `7³` dual vertices so adjacent brick halos agree bit for bit: zero cracks, zero cross-brick pointers), solved via closed-form regularized Dual Contouring QEF + 1-step exact Newton surface snap. Unchanged fields (`StateHash`) cost 0 ms/frame after frame 0; moving crowds use screen-area-weighted cell budgeting and staggered 60Hz/30Hz extraction.
-2. **Unified 4× hardware MSAA linear-HDR rasteriser (`lib/engine/mesh/draw.wrela`, `lib/engine/mesh/height.wrela`):** Still solids, moving/morphing solids, and 6-ring camera-snapped `Height` clipmaps (`height_vs`, 1-quad overlap collar) all emit the shared `MeshVary` and shade through one `mesh_fs` fragment shader into one 4× MSAA `Rgba16Float` linear-HDR target + one reversed-Z depth buffer (Metal tile-SRAM `MTLStorageModeMemoryless`, Vulkan Dynamic Rendering `AVERAGE`/`SAMPLE_ZERO` resolve) and one unified sun shadow map. Zero per-thing shader specialization, zero `StandIn` families, zero 9-ray edge lists.
+1. **Sparse interval-culled Dual Contouring (`lib/engine/mesh/extract.wrela`):** Any `One<M>` or `Many<M, N>` is interval-culled and part-pruned (`pruned`/`distance_live`) into active `6³` bricks (evaluating an `8³` corner block and `7³` dual vertices so adjacent brick halos agree bit for bit: zero cracks, zero cross-brick pointers), solved via closed-form regularized Dual Contouring QEF + 1-step exact Newton surface snap. Unchanged fields (`StateHash`) cost 0 ms/frame after frame 0; moving crowds use screen-area-weighted cell budgeting and every sub-batch syncs every frame (the earlier staggered 60Hz/30Hz far extraction paired a stale mesh with this frame's fields and previous transforms, so it was removed).
+2. **Unified 1× linear-HDR rasteriser with temporal super-resolution (`lib/engine/mesh/draw.wrela`, `lib/engine/mesh/height.wrela`, `lib/engine/mesh/tsr.wrela`):** Still solids, moving/morphing solids, and 6-ring camera-snapped `Height` clipmaps (`height_vs`, 1-quad overlap collar) all emit the shared `MeshVary` and write one Halton(2, 3)-jittered 1× G-buffer (`mesh_gbuf_fs`: `g_normal`, `g_albedo`, `g_emits`, `g_motion`) and one reversed-Z depth buffer, lit once a pixel and resolved over frames by TSR; one unified sun shadow map. (Until c1fa338 this was a 4× MSAA target resolved in hardware: leap B below replaced it, and the MSAA API has since left std, the compiler and the hosts.) Zero per-thing shader specialization, zero `StandIn` families, zero 9-ray edge lists.
 3. **Unified One Light (`lib/engine/mesh/light.wrela`):** A 3-level world-space radiance volume (`64³ -> 32³ -> 16³`) injected directly from all extracted still and moving meshlets (`rad_inject`, `rad_resolve`, `rad_mip`), queried by 4-cone hemisphere Voxel Cone Tracing (`cone_indirect`) for surfaces and `volume_indirect` for participating media. Runs identically on Metal and non-RT-core Vulkan GPUs (`wrela-popos` Renoir Vega) with unified sky occlusion, multi-bounce diffuse GI, and real emissive spell illumination.
 4. **Unified participating media & single `Look::tone` (`lib/engine/mesh/volume.wrela`):** Any `Medium` scatters into a `160×90×32` frustum froxel grid lit by the exact same sun shadow map (real god-rays), sky irradiance table, and 3-level radiance volume (emissive spell glow in mist), integrates analytically front-to-back, and composites against the resolved reversed-Z depth buffer immediately before the frame's single `Look::tone` pass (`hdr_tone_fs`).
 
@@ -382,9 +382,15 @@ requiring an author to write a mesh.
 | SCENE 8 (stage + 256 boxes + 256 walking creatures, + One Light GI) | 177 ms / 305.2 ms | 7.11 ms / 19.5 ms | Full 3-level radiance volume + 4-cone GI |
 | SCENE 9 (cohesion: stage + ocean `Height` + mist `Medium` + morphing spell orb + walking creature + GI) | — | 8.46 ms / 22.0 ms | Froxel volume pass 0.30 ms M4 / 0.83 ms Radeon |
 
+**SCENE 8's crowd, corrected (2026-11-21).** Its creatures stood eight to a row 1.8 m apart, so
+of 256 only the first 64 stood on the stage, the rest on nothing past its edge, and more than 100
+behind the eye, which the engine culls: every SCENE 8 time for 256 creatures in this document drew
+far fewer of them. They now stand on a square grid across the stage (`game/scenes/main.wrela`,
+`on_the_stage`); those times are to be measured again, and stand as they were measured until then.
+
 **Judged against the brute-force `Reference` (`LOOKS=16`, M4) and the hole audit (`SCENE 6`, 72 eyes / 1,036,800 pixels on both M4 Metal and Linux Radeon Vulkan):**
 
-- **SCENE 6 hole audit (`stage`, `creature walking`, 44 m noise `stack`, 24 eyes each = 1,036,800 px):** **0 holes, 0 extras** on all three kinds on both M4 Metal and Linux Radeon Vulkan (zero VVL errors).
+- **SCENE 6 hole audit (`stage`, `creature walking`, 44 m noise `stack`, 24 eyes each = 1,036,800 px):** **0 holes, 0 extras** on all three kinds on both M4 Metal and Linux Radeon Vulkan (zero VVL errors). **Not true of the centre ray:** this audit read `drawn.place`, which `drawn_only` then filled from jittered subframes wherever the middle ray missed, so a jitter sample beside a crack hid it. With `place` holding only the middle ray's hit, the same build (2c1e079) has 0 / 1 / 12 holes at 160×90 and 255 / 18 (39 extras) / 806 at 640×360 (stage / creature / stack, M4). After the review fixes (hidden-crease detection from the exact gradient, quads split along the diagonal the surface bends least along) the audit, now also of the arena's pillars, braziers, flame and ward, reads at 640×360: stage 0, creature 5 (37 extras), stack 335, pillars 633, braziers 65, flame 0, ward 3361; at 160×90: 0, 1, 4, 7, 2, 0, 144. What is left are 1-pixel strips along silhouettes seen from eyes so near that one cell spans 14 to 300 pixels (each thing is extracted once at a fixed cell, radius/180): a chord across a curve misses it by about cell²/(8·radius). Closing them needs a mesh finer near the eye (view-dependent bricks or nested levels with seams), not a finer uniform grid: a uniform refinement into the spare brick budget was tried and moved the error onto the stage's bevels (2,748 holes).
 - **SCENE 0 (stage + walking creature, 160×90, 4× MSAA):** **0 holes**, coverage off **0.101 px** (beats reference 0.130 px floor), wholly-covered lit mean **1.011/255** (beats reference 1.048/255 floor), all-pixel lit mean **0.762/255** (beats reference 0.797/255 floor), 97.4% of surfaces within 0.05 px.
 - **SCENE 4 (stage, 320×180, 4× MSAA):** **0 holes**, 98.17% of surfaces within 0.05 px, outline **0.151 px** (beats the 0.184 px reference floor).
 - **SCENE 3 (close-up creature + 1 cm wand, 480×270):** **0 holes**, **197 of 199 thin pixels (< 2.5 cm) kept (99.0%)**, 99.8% of surfaces within 0.5 px, lit mean 0.50/255 (reference floor 0.54/255).
@@ -482,21 +488,21 @@ Five engine-wide bottlenecks were eliminated in `lib/std/field.wrela` and `lib/e
    their draw calls automatically.
 2. **Static/dynamic split `RadianceCache` and stride-2 injection** (`lib/engine/mesh/light.wrela`):
    static batches accumulate once into `static_accum` / `static_emit_accum`, and frames with moving
-   objects GPU-copy the static base and inject only dynamic batches at stride 2; `emit_collect`
-   filters occupied coarse bins in parallel before `emit_compact`. The boundary alignment bug in
+   objects GPU-copy the static base and inject only dynamic batches at stride 2; `emit_compact`
+   scans all 256 coarse emissive bins in index order (an `emit_collect` pass that filtered occupied
+   bins first, capped at 64, was later removed). The boundary alignment bug in
    `skylit` / `sky_spec` (`/(side - 1)` matching `sample_octa`) was also fixed.
 3. **Indexed clipmaps** (`lib/engine/mesh/height.wrela`, `lib/engine/matter/height.wrela`): inner
    solid and outer hollow index buffers share `65×65` vertices per ring (hitting the post-transform
    vertex cache), and `Height::has_opaque` / `has_transmissive` skip empty heightfield passes.
-4. **Compact 4× MSAA premultiplied G-buffer + 1× pixel-rate tiled deferred direct lighting**
-   (`lib/engine/mesh/draw.wrela`, `lib/engine/mesh/swarm.wrela`): `mesh_eye` writes a compact
-   16-byte/sample premultiplied 4× MSAA G-buffer (`g_normal: Rgba8`, `g_albedo: Rgba8`,
-   `g_emits: Rgba16Float`) cleared to zero so hardware MSAA resolve yields exact coverage `cov` and
-   uncorrupted normals/materials; `cull_tile_emitters` produces a `16×16` screen-tile `u32`
-   emitter bitmask (up to 32 emitters); `deferred_direct_fs` runs CSM + tiled emitters once per
-   screen pixel using tangent-plane depth reprojection from 4× MSAA Sample 0 (`reconstruct_pixel_dist`);
-   `combine_indirect_fs` blends partial-coverage edges against sky; and `drawn_only` now runs the
-   exact same unified pipeline as `draw_scene` (removing `mesh_judge_fs`, `sky_direct_fs`,
+4. **Compact G-buffer + pixel-rate tiled deferred direct lighting** (`lib/engine/mesh/draw.wrela`,
+   `lib/engine/mesh/swarm.wrela`): the eye's pass writes a compact G-buffer (`g_normal: Rgba8`,
+   `g_albedo: Rgba8`, `g_emits: Rgba16Float`; leap B added `g_motion` and made it 1× and jittered,
+   where this step built it as a 4× MSAA target resolved for coverage); `cull_tile_emitters`
+   produces a `16×16` screen-tile `u32` emitter bitmask (up to 32 emitters); `deferred_direct_fs`
+   runs CSM + tiled emitters once per screen pixel, its distance from the depth buffer
+   (`reconstruct_pixel_dist`); `combine_indirect_fs` joins the indirect light; and `drawn_only`
+   runs the exact same unified pipeline as `draw_scene` (removing `mesh_judge_fs`, `sky_direct_fs`,
    `sky_judge_fs`).
 5. **Rigid transform caching, GPU instancing, and curvature-sagitta tessellation**
    (`lib/std/field.wrela`, `lib/engine/mesh/{extract,draw,light}.wrela`, `game/world/arena.wrela`):

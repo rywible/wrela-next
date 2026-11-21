@@ -88,7 +88,7 @@ fn smins_seams_certify() {
     let depth = 8;
     let leaf = 2.0 / (1 << depth) as f32;
     let (certified, open) = certify(&mut host, 5, creature_cube(), depth);
-    assert!(certified > 2000, "only {certified} boxes certified");
+    assert!(certified > 4000, "only {certified} boxes certified (4,534 when this was written)");
     for b in &open {
         let c = b.centre();
         let args = [Value::I32(5), Value::F32(c[0]), Value::F32(c[1]), Value::F32(c[2])];

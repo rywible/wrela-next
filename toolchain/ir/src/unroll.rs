@@ -192,12 +192,22 @@ fn breaks_set(s: Stmt, left: LocalId, yes: ValueId) -> Stmt {
 }
 
 /// `b` with what follows each statement that may set `left` run only while it's clear: the
-/// statement, then `if !left { the rest }`, nested.
+/// statement, then `if !left { the rest }`, nested. Inside an `if` that may set it, the same
+/// holds of each side: what follows a `break` in a branch (`if a { if b { break } x = 1 }`)
+/// runs only while the flag is clear, as it would only before the `break`.
 fn nest(f: &mut Function, b: Vec<Stmt>, left: LocalId, bool_ty: TypeId) -> Vec<Stmt> {
     let mut out = Vec::new();
     let mut rest = b.into_iter();
     while let Some(s) = rest.next() {
         let sets = sets_local(&s, left);
+        let s = match s {
+            Stmt::If { cond, then, else_ } if sets => Stmt::If {
+                cond,
+                then: nest(f, then, left, bool_ty),
+                else_: nest(f, else_, left, bool_ty),
+            },
+            s => s,
+        };
         out.push(s);
         if sets {
             let tail: Vec<Stmt> = rest.collect();
@@ -362,6 +372,78 @@ mod tests {
         }
         // Four `if !flag` levels (after passes 1 to 4), and the fifth pass's own early test.
         assert_eq!(deepest(&f.body), 5, "{:?}", f.body);
+    }
+
+    /// `i = 0; loop { if i >= 5 { break }; if acc == 7 { if acc == 7 { break }; acc = i } }`:
+    /// what follows the nested `break` in its branch runs only while the flag is clear, so every
+    /// copy's store to `acc` is under an `if !left` (it once ran after the `break` set it).
+    #[test]
+    fn what_follows_a_nested_break_in_its_branch_runs_only_while_the_flag_is_clear() {
+        let mut types = Types::default();
+        let (u, b) = (types.u32(), types.bool());
+        let mut f = Function::new("nested_break", Vec::new(), None);
+        let (i, acc) = (f.new_local("i", u), f.new_local("acc", u));
+        let (start, c, limit, t) = (f.new_value(u), f.new_value(u), f.new_value(u), f.new_value(b));
+        let (a, seven, hit) = (f.new_value(u), f.new_value(u), f.new_value(b));
+        let (r, one, n) = (f.new_value(u), f.new_value(u), f.new_value(u));
+        let body = vec![
+            Stmt::Let(c, Expr::Load(Place::local(i))),
+            Stmt::Let(limit, Expr::Const(Const::U32(5))),
+            Stmt::Let(t, Expr::Binary(BinOp::Ge, c, limit)),
+            Stmt::If { cond: t, then: vec![Stmt::Break], else_: vec![] },
+            Stmt::Let(a, Expr::Load(Place::local(acc))),
+            Stmt::Let(seven, Expr::Const(Const::U32(7))),
+            Stmt::Let(hit, Expr::Binary(BinOp::Eq, a, seven)),
+            Stmt::If {
+                cond: hit,
+                then: vec![
+                    Stmt::If { cond: hit, then: vec![Stmt::Break], else_: vec![] },
+                    Stmt::Store(Place::local(acc), c),
+                ],
+                else_: vec![],
+            },
+        ];
+        let continuing = vec![
+            Stmt::Let(r, Expr::Load(Place::local(i))),
+            Stmt::Let(one, Expr::Const(Const::U32(1))),
+            Stmt::Let(n, Expr::Binary(BinOp::Add, r, one)),
+            Stmt::Store(Place::local(i), n),
+        ];
+        f.body = vec![
+            Stmt::Let(start, Expr::Const(Const::U32(0))),
+            Stmt::Store(Place::local(i), start),
+            Stmt::Loop { body, continuing },
+        ];
+        unroll(&Module::default(), &mut f);
+        let mut loops = 0;
+        visit::walk(&f.body, &mut |s| loops += usize::from(matches!(s, Stmt::Loop { .. })));
+        assert_eq!(loops, 0, "{:?}", f.body);
+        // The values that are `!left`.
+        let mut clear = HashSet::new();
+        visit::walk(&f.body, &mut |s| {
+            if let Stmt::Let(v, Expr::Unary(UnOp::Not, _)) = s {
+                clear.insert(*v);
+            }
+        });
+        // Each store to `acc`, and whether an `if !left` holds it.
+        fn stores(b: &[Stmt], acc: LocalId, clear: &HashSet<ValueId>, guarded: bool) -> Vec<bool> {
+            let mut out = Vec::new();
+            for s in b {
+                match s {
+                    Stmt::Store(p, _) if p.root_local() == Some(acc) => out.push(guarded),
+                    Stmt::If { cond, then, else_ } => {
+                        let g = guarded || clear.contains(cond);
+                        out.extend(stores(then, acc, clear, g));
+                        out.extend(stores(else_, acc, clear, g));
+                    }
+                    _ => {}
+                }
+            }
+            out
+        }
+        let found = stores(&f.body, acc, &clear, false);
+        assert_eq!(found.len(), 5, "{:?}", f.body);
+        assert!(found.iter().all(|g| *g), "{:?}", f.body);
     }
 
     #[test]

@@ -889,12 +889,13 @@ fn a_sixth_target_keeps_the_least_each_fragment_offers() {
 
 /// A field's distance range over a box (`std::derive::affine`, toolchain/tests/affine) holds every
 /// sample of every box, each std kind alone and the engine's stack, creature and stage, at 1 m,
-/// 12 cm, 8 mm and 1 mm: in a kernel on both hosts, and on the CPU.
+/// 12 cm, 8 mm and 1 mm: in a kernel on both hosts, and on the CPU; and, on the CPU, through
+/// `mut` writes, quotients by what can be 0 and components whose squares underflow.
 #[test]
 #[ignore = "needs a GPU"]
 fn an_affine_range_holds_every_sample_in_gpu_code() {
     let dir = wrela_tests::repo_root().join("toolchain/tests/affine");
-    assert_eq!(crate::tests_pass(&dir), 2);
+    assert_eq!(crate::tests_pass(&dir), 3);
 }
 
 /// A kind's things in GPU code (toolchain/tests/kinds, gap 29): a group built in a kernel from a

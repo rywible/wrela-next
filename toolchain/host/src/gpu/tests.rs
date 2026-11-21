@@ -85,8 +85,6 @@ fn the_present_pass_draws_the_screen_into_a_frame() {
         dimension: wrela_gpu::TextureDimension::D2,
         format,
         usage,
-        samples: 1,
-        transient: false,
     };
     let usage = wrela_gpu::TextureUsage { sampled: true, copy_dst: true, ..Default::default() };
     let (src, src_view) = attachment(&device, &desc("screen", TextureFormat::Rgba8, usage));
@@ -166,11 +164,12 @@ fn the_calibration_kernel_snaps_this_machine_to_its_targets_unit() {
 #[test]
 fn a_submission_is_full_at_two_steps_of_bound_or_64_commands() {
     let q = |commands, bound_ms| Queued { commands, bound_ms, passes_ms: 0.0 };
-    assert!(!q(0, 0.0).full(1.0e9), "a dispatch alone");
-    assert!(!q(1, 50.0).full(50.0));
-    assert!(q(1, 50.0).full(50.1));
-    assert!(!q(63, 0.0).full(0.0));
-    assert!(q(64, 0.0).full(0.0));
+    let most = SUBMIT_LINES * 50.0;
+    assert!(!q(0, 0.0).full(1.0e9, most), "a dispatch alone");
+    assert!(!q(1, 50.0).full(50.0, most));
+    assert!(q(1, 50.0).full(50.1, most));
+    assert!(!q(63, 0.0).full(0.0, most));
+    assert!(q(64, 0.0).full(0.0, most));
 }
 
 /// A frame of 5,000 short dispatches (a band of an audit each, well within the guard) is
@@ -193,16 +192,17 @@ fn a_frame_of_many_dispatches_is_many_submissions() {
     let made = after - before;
     assert!(made >= 5000 / u64::from(SUBMIT_COMMANDS), "{made} submissions");
     assert!(largest.commands <= SUBMIT_COMMANDS, "{largest:?}");
-    assert!(largest.bound_ms <= SUBMIT_BOUND_MS, "{largest:?}");
+    assert!(largest.bound_ms <= SUBMIT_LINES * gpu.line_ms, "{largest:?}");
     assert_eq!(gpu.read_buffer(1).unwrap(), 5000u32.to_le_bytes());
     gpu.check_errors().unwrap();
 
     // Heavy by its bound (a stated bound, not real work: the kernel adds one).
     let target = wrela_abi::Target::HERE;
+    let bound = SUBMIT_LINES * crate::step::limit_ms();
     let one = crate::step::ms_of(1, 1, target);
-    let work = (SUBMIT_BOUND_MS / 3.0 / one).floor() as u64;
+    let work = (bound / 3.0 / one).floor() as u64;
     let ms = crate::step::ms_of(work, 1, target);
-    assert!(ms <= crate::step::STEP_MS && ms > SUBMIT_BOUND_MS / 4.0, "{ms} ms");
+    assert!(ms <= crate::step::limit_ms() && ms > bound / 4.0, "{ms} ms");
     let (mut manifest, shaders) = increment();
     manifest.pipelines[0].work = vec![Some(work)];
     let mut gpu = Gpu::new(&manifest, &shaders, Timing::Off, false).unwrap();
@@ -214,7 +214,7 @@ fn a_frame_of_many_dispatches_is_many_submissions() {
     gpu.end_frame().unwrap();
     let (after, largest) = gpu.submissions();
     assert!(after - before >= 10, "{} submissions of 30 heavy dispatches", after - before);
-    assert!(largest.bound_ms <= SUBMIT_BOUND_MS, "{largest:?}");
+    assert!(largest.bound_ms <= bound, "{largest:?}");
     assert_eq!(gpu.read_buffer(1).unwrap(), 30u32.to_le_bytes());
     gpu.check_errors().unwrap();
 }

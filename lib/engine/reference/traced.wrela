@@ -57,7 +57,8 @@ pub const FAR: f32 = 10000.0
 
 /// How far along the ray from `o` along `d` (unit), between `from` and `to` m, it enters matter;
 /// under 0 if it doesn't: -1 if it got to `to`, -2 if it ran out of steps first (the reference
-/// failed there, and says so). A ray that starts inside enters at `from`.
+/// failed there, and says so: the middle ray's in `Said::behind.w`, every other's counted in
+/// `Said::thick.y`). A ray that starts inside enters at `from`.
 pub fn entered<M: Field<Substance>>(m: Matter<M>, o: vec3, d: vec3, from: f32, to: f32) -> f32 {
     var t = from
     var before = from
@@ -100,7 +101,8 @@ pub fn ends<M: Field<Substance>>(m: Matter<M>, o: vec3, d: vec3) -> f32 {
 /// A number from 0 to 1, the same for the same `at` and `k` on every machine: the `k`th of a
 /// pixel's look's dice (`at`, from the pixel and the look).
 pub fn die(at: u32, k: u32) -> f32 {
-    f32(hash_u32(at ^ hash_u32(k.wrapping_mul(2654435769).wrapping_add(1013904223))) >> 8) * (1.0 / 16777216.0)
+    f32(hash_u32(at ^ hash_u32(k.wrapping_mul(2654435769).wrapping_add(1013904223))) >> 8) *
+        (1.0 / 16777216.0)
 }
 
 /// Two unit vectors square to `n` (unit) and to each other.
@@ -130,8 +132,17 @@ pub fn sun_way(sun: Sun, u: f32, v: f32) -> vec3 {
 }
 
 /// The sun's light on a face at `p` facing `n` (irradiance), where a ray toward a point of its
-/// disc (from two dice) gets out: what one look of the sun is.
-pub fn sunlit<M: Field<Substance>, S: Sky>(m: Matter<M>, sky: S, p: vec3, n: vec3, u: f32, v: f32) -> vec3 {
+/// disc (from two dice) gets out: what one look of the sun is. A shadow ray that ran out of steps
+/// is taken as getting out, and counted in `lost`.
+pub fn sunlit<M: Field<Substance>, S: Sky>(
+    m: Matter<M>,
+    sky: S,
+    p: vec3,
+    n: vec3,
+    u: f32,
+    v: f32,
+    lost: mut f32,
+) -> vec3 {
     let sun = sky.sun()
     let w = sun_way(sun, u, v)
     let lean = dot(n, w)
@@ -139,7 +150,11 @@ pub fn sunlit<M: Field<Substance>, S: Sky>(m: Matter<M>, sky: S, p: vec3, n: vec
         return vec3(0.0)
     }
     let o = p + n * LEAVE
-    if entered(m, o, w, 0.0, ends(m, o, w)) >= 0.0 {
+    let t = entered(m, o, w, 0.0, ends(m, o, w))
+    if t < -1.5 {
+        lost += 1.0
+    }
+    if t >= 0.0 {
         return vec3(0.0)
     }
     sun.light * lean
@@ -154,7 +169,8 @@ pub const SIMPLE: u32 = 1
 /// The light leaving a surface at `p`, facing `n`, made of `s`, toward the way `to` (unit, away
 /// from it): one look of it, from the dice of `at`. What it gives off; the sun on it; and the
 /// light of `rays` ways over its hemisphere, each followed on through up to `bounces` more stops
-/// (with `light` `SIMPLE`: each way's sky light alone, nothing in its way).
+/// (with `light` `SIMPLE`: each way's sky light alone, nothing in its way). Each march that ran
+/// out of steps (taken as getting out) is counted in `lost`.
 pub fn lit<M: Field<Substance>, S: Sky>(
     m: Matter<M>,
     sky: S,
@@ -166,10 +182,11 @@ pub fn lit<M: Field<Substance>, S: Sky>(
     rays: u32,
     bounces: u32,
     light: u32,
+    lost: mut f32,
 ) -> vec3 {
     var e = s.emits
     let sun = sky.sun()
-    e += s.scatters(n, sun.way, to) * sunlit(m, sky, p, n, die(at, 0), die(at, 1))
+    e += s.scatters(n, sun.way, to) * sunlit(m, sky, p, n, die(at, 0), die(at, 1), mut lost)
     var r: u32 = 0
     while r < MOST_RAYS && r < rays {
         let k = 2 + 32 * r
@@ -188,6 +205,9 @@ pub fn lit<M: Field<Substance>, S: Sky>(
             let stop = depth
             depth += 1
             let t = entered(m, o, way, 0.0, ends(m, o, way))
+            if t < -1.5 {
+                lost += 1.0
+            }
             if t < 0.0 {
                 e += carried * sky.light(way)
                 going = false
@@ -200,7 +220,9 @@ pub fn lit<M: Field<Substance>, S: Sky>(
                     going = false
                 } else {
                     let kq = k + 2 + 4 * stop
-                    e += carried * sq.scatters(nq, sun.way, -way) * sunlit(m, sky, q, nq, die(at, kq), die(at, kq + 1))
+                    e += carried *
+                        sq.scatters(nq, sun.way, -way) *
+                        sunlit(m, sky, q, nq, die(at, kq), die(at, kq + 1), mut lost)
                     let next = cosine_way(nq, die(at, kq + 2), die(at, kq + 3))
                     carried = carried * sq.scatters(nq, next, -way) * PI
                     way = next
@@ -231,7 +253,13 @@ pub fn thickness<M: Field<Substance>>(m: Matter<M>, p: vec3, n: vec3, most: f32)
 /// What the reference says of pixel (`at.x`, `at.y`) of the screen `middle` sees, worked whole on
 /// the CPU: its middle ray (`entered`) and that matter's `thickness`, then each look of both
 /// halves, the halves by turns, marched and `lit`. What `paced` must give to the bit (`Said`).
-pub fn traced_said<M: Field<Substance>, S: Sky, L: Look>(m: Matter<M>, sky: S, look: L, middle: View, at: PacedAt) -> Said {
+pub fn traced_said<M: Field<Substance>, S: Sky, L: Look>(
+    m: Matter<M>,
+    sky: S,
+    look: L,
+    middle: View,
+    at: PacedAt,
+) -> Said {
     let px = vec2(f32(at.x) + 0.5, f32(at.y) + 0.5)
     var said = said_begun()
     let d0 = middle.ray(px)
@@ -252,6 +280,7 @@ pub fn traced_said<M: Field<Substance>, S: Sky, L: Look>(m: Matter<M>, sky: S, l
     var met = [vec4(0.0); 2]
     var mat = [vec4(0.0); 2]
     var far = [vec4(0.0); 2]
+    var lost = 0.0
     for index in 0..(2 * at.looks) {
         let half = index % 2
         let v = middle.moved(jitter(half, index / 2))
@@ -261,13 +290,28 @@ pub fn traced_said<M: Field<Substance>, S: Sky, L: Look>(m: Matter<M>, sky: S, l
         if span.y > max(span.x, 0.0) {
             t = entered(m, v.at, d, max(span.x, 0.0), ends(m, v.at, d))
         }
+        if t < -1.5 {
+            lost += 1.0
+        }
         if t < 0.0 {
             met[half] = met[half] + vec4(look.tone(Seen { light: seen(sky, d) }), 0.0)
         } else {
             let p = v.at + d * t
             let n = m.facing(p, -d)
             let s = m.made_of(p)
-            let light = lit(m, sky, p, n, s, -d, dice(at.x, at.y, index, at.salt), at.rays, at.bounces, at.light)
+            let light = lit(
+                m,
+                sky,
+                p,
+                n,
+                s,
+                -d,
+                dice(at.x, at.y, index, at.salt),
+                at.rays,
+                at.bounces,
+                at.light,
+                mut lost,
+            )
             let c = look.tone(Seen { light })
             let l = luma(c)
             met[half] = met[half] + vec4(c, 1.0)
@@ -280,5 +324,6 @@ pub fn traced_said<M: Field<Substance>, S: Sky, L: Look>(m: Matter<M>, sky: S, l
     said.met1 = met[1]
     said.matter1 = mat[1]
     said.far = vec4(far[0].x, far[0].y, far[1].x, far[1].y)
+    said.thick.y = lost
     said
 }

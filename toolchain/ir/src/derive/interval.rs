@@ -2653,7 +2653,10 @@ impl<'a> Ivx<'a> {
 
     /// `x / sqrt(x² + r2)` without underflow: ±1 where `r2` is 0 (`x` ≠ 0), 0 where `x` is,
     /// and `sign(x) / sqrt(1 + r2 / x²)` otherwise; ±1 is also the answer for `x = r2 = 0`,
-    /// where the direction is any: the caller's range then spans [-1, 1].
+    /// where the direction is any: the caller's range then spans [-1, 1]. Where `x²` is below
+    /// the smallest normal (flushed to 0, or a subnormal with too few bits for the quotient)
+    /// it's taken as a hypotenuse is, from the ratio of `|x|` and `sqrt(r2)`, the smaller over
+    /// the larger, which neither overflows nor loses `x` to underflow.
     fn unit_part(&mut self, out: &mut Block, x: ValueId, r2: ValueId, ty: TypeId) -> ValueId {
         let one = self.fc(out, ty, 1.0);
         let neg = self.fc(out, ty, -1.0);
@@ -2672,6 +2675,27 @@ impl<'a> Ivx<'a> {
         let q1 = self.bin(out, BinOp::Add, one, q, ty);
         let root = self.builtin(out, Builtin::Sqrt, vec![q1], ty);
         let f = self.bin(out, BinOp::Div, s, root, ty);
+        // x² below the smallest normal: with a = |x| and b = sqrt(r2), s / sqrt(1 + (b/a)²)
+        // where a >= b, and s (a/b) / sqrt(1 + (a/b)²) where it isn't; the ratio is at most 1.
+        let normal = if self.elem(ty) == Scalar::F64 { f64::MIN_POSITIVE } else { 1.1754944e-38 };
+        let normal = self.fc(out, ty, normal);
+        let small = self.cmp(out, BinOp::Lt, xx, normal);
+        let a = self.builtin(out, Builtin::Abs, vec![x], ty);
+        let r2p = self.builtin(out, Builtin::Max, vec![r2, zero], ty);
+        let b = self.builtin(out, Builtin::Sqrt, vec![r2p], ty);
+        let a_big = self.cmp(out, BinOp::Ge, a, b);
+        let num = self.select(out, a_big, b, a);
+        let dn = self.select(out, a_big, a, b);
+        // Taken over 1 where both are 0 (no 0 / 0; that case is the select's below).
+        let dn = self.select(out, no_r, one, dn);
+        let t = self.bin(out, BinOp::Div, num, dn, ty);
+        let tt = self.bin(out, BinOp::Mul, t, t, ty);
+        let w = self.bin(out, BinOp::Add, one, tt, ty);
+        let w = self.builtin(out, Builtin::Sqrt, vec![w], ty);
+        let g = self.select(out, a_big, one, t);
+        let sg = self.bin(out, BinOp::Mul, s, g, ty);
+        let fs = self.bin(out, BinOp::Div, sg, w, ty);
+        let f = self.select(out, small, fs, f);
         let f = self.select(out, no_r, s, f);
         // x = 0 with r2 > 0: 0 (r2 / 0 is infinite, so f is ±0 already; NaN only for 0 / 0).
         let x0 = self.cmp(out, BinOp::Eq, x, zero);

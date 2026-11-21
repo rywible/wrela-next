@@ -813,11 +813,13 @@ pub(crate) struct TickThread {
 
 impl TickThread {
     /// The next tick's number.
+    #[cfg(feature = "gpu")]
     pub(crate) fn next(&self) -> u32 {
         self.next
     }
 
     /// Sets `std::tick::origin()`: the frame time (s) at which tick 0 was due.
+    #[cfg(feature = "gpu")]
     pub(crate) fn set_origin(&self, origin: f64) {
         shared::write(&self.memory, memory::TICK_ORIGIN as usize, &origin.to_le_bytes());
     }
@@ -885,6 +887,7 @@ pub struct Ticked {
 pub(crate) struct Program<E: 'static> {
     store: Store<State<E>>,
     /// This program's number, the host's alone: a program another replaced has another.
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
     serial: u64,
     /// The worker threads, which return when the program is dropped (or retired).
     _helpers: Helpers,
@@ -1879,11 +1882,13 @@ impl<E: Executor> Program<E> {
     }
 
     /// The voice back from another thread: it goes on from where it stopped.
+    #[cfg(feature = "gpu")]
     pub(crate) fn give_voice(&mut self, voice: Voice) {
         self.audio = Some(voice);
     }
 
     /// Whether the program has started its voice.
+    #[cfg(feature = "gpu")]
     pub(crate) fn has_voice(&self) -> bool {
         self.store.data().voice.is_some()
     }
@@ -2084,17 +2089,20 @@ impl<E: Executor> Program<E> {
     }
 
     /// This program's number, the host's alone ([`Program::serial`]'s field).
+    #[cfg(feature = "gpu")]
     pub(crate) fn serial(&self) -> u64 {
         self.serial
     }
 
     /// The ticker's instance back from another thread ([`Program::take_tick_thread`]).
+    #[cfg(feature = "gpu")]
     pub(crate) fn give_tick_thread(&mut self, thread: TickThread) {
         self.ticker = Some(thread);
     }
 
     /// The records queued for the ticker (what the program posted, input pushed as records),
     /// taken: for a ticker that runs on another thread.
+    #[cfg(feature = "gpu")]
     pub(crate) fn take_records(&mut self) -> Vec<[u8; EVENT_SIZE as usize]> {
         self.records.drain(..).collect()
     }

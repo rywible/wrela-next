@@ -346,7 +346,6 @@ macro_rules! lang_items {
                     | Lang::Pass7
                     | Lang::Pass8 => Some(false),
                     Lang::DepthPass
-                    | Lang::MsaaDepthPass3
                     | Lang::LayerDepthPass
                     | Lang::DepthPass2
                     | Lang::DepthPass3
@@ -356,14 +355,6 @@ macro_rules! lang_items {
                     | Lang::DepthPass7
                     | Lang::DepthPass8 => Some(true),
                     _ => None,
-                }
-            }
-
-            /// Samples per pixel for an open pass type (`4` for hardware 4× MSAA, `1` otherwise).
-            pub fn pass_samples(self) -> u8 {
-                match self {
-                    Lang::MsaaDepthPass3 => 4,
-                    _ => 1,
                 }
             }
 
@@ -449,7 +440,6 @@ lang_items! {
     RenderPass = "std::gpu::RenderPass",
     Pass = "std::gpu::Pass",
     DepthPass = "std::gpu::DepthPass",
-    MsaaDepthPass3 = "std::gpu::MsaaDepthPass3",
     DepthOnlyPass = "std::gpu::DepthOnlyPass",
     ScreenPass = "std::gpu::ScreenPass",
     ScreenDepthPass = "std::gpu::ScreenDepthPass",

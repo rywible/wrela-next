@@ -275,9 +275,7 @@ impl Texture {
 
 /// The target formats a render pipeline is made for: its colour formats (none in a pass that
 /// draws only depths), and a depth format (or none).
-type Targets = (Vec<TextureFormat>, Option<TextureFormat>, u8);
-
-type MsaaKey = (u8, u32, u32, TextureFormat, u8, bool);
+type Targets = (Vec<TextureFormat>, Option<TextureFormat>);
 
 pub(crate) struct Pipeline {
     name: Arc<str>,
@@ -617,8 +615,10 @@ impl Behind {
 /// audit, 640x360), each well within the guard, made one job of seconds on the Radeon once the
 /// uniform ring stopped splitting frames (4f7fb1b), and amdgpu reset the GPU four times.
 ///
-/// The guard's bounds of the dispatches queued, summed (ms): two steps' worth.
-const SUBMIT_BOUND_MS: f64 = 2.0 * crate::step::STEP_MS;
+/// The guard's bounds of the dispatches queued, summed, as lines (`Gpu::line_ms`, the step's
+/// limit, `WRELA_GPU_STEP` where it lowers it): two, what `Gpu::judge` holds a submission of
+/// dispatches to.
+const SUBMIT_LINES: f64 = 2.0;
 /// The dispatches and passes queued: a pass has no bound the host knows, and by AGENTS.md's
 /// rule each holds the GPU at most about a step (50 ms), so 64 of them about 3 s at most.
 const SUBMIT_COMMANDS: u32 = 64;
@@ -652,7 +652,7 @@ fn says_lost(e: &Error) -> bool {
     s.contains("lost the device") || s.contains("device was lost") || s.contains("Hang")
 }
 
-/// What the submission being recorded holds (`SUBMIT_BOUND_MS`, `SUBMIT_COMMANDS`).
+/// What the submission being recorded holds (`SUBMIT_LINES`, `SUBMIT_COMMANDS`).
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Queued {
     commands: u32,
@@ -663,11 +663,11 @@ pub(crate) struct Queued {
 }
 
 impl Queued {
-    /// Whether one more dispatch (its guard bound `ms`) or pass (0) would take it past either:
-    /// never one with nothing in it (a dispatch alone is the guard's to refuse).
-    fn full(self, ms: f64) -> bool {
-        self.commands > 0
-            && (self.commands >= SUBMIT_COMMANDS || self.bound_ms + ms > SUBMIT_BOUND_MS)
+    /// Whether one more dispatch (its guard bound `ms`) or pass (0) would take it past either,
+    /// its summed bounds past `most` ms: never one with nothing in it (a dispatch alone is the
+    /// guard's to refuse).
+    fn full(self, ms: f64, most: f64) -> bool {
+        self.commands > 0 && (self.commands >= SUBMIT_COMMANDS || self.bound_ms + ms > most)
     }
 }
 
@@ -694,7 +694,8 @@ struct Job {
 /// of SCENE 0, 3.2 ms, in one of its own every frame: +0.1 to 0.2 ms a frame.)
 const LIGHT: f64 = 1.0 / 8.0;
 /// How many pieces measured alone the guard's timestamps ring holds (each a pair of queries): a
-/// slot is read only once its submission is done, well within this many later pieces.
+/// slot is read once its submission is done, and given to no other piece before
+/// (`Gpu::stamp_held`).
 const STAMP_RING: u32 = 256;
 
 /// The guard's timestamps of pieces measured alone: a ring of [`STAMP_RING`] query pairs, and
@@ -832,6 +833,8 @@ pub(crate) struct Gpu {
     /// holds. The guard judges a piece over the line by its pass's own time from these.
     stamps: Option<Stamps>,
     stamp_next: u32,
+    /// Which slots a piece not yet measured holds: never given another before it's read.
+    stamp_held: Vec<bool>,
     job_stamp: Option<u32>,
     /// Every measured job's piece and time, for tests.
     #[cfg(test)]
@@ -867,9 +870,6 @@ pub(crate) struct Gpu {
     /// Whether each pipeline it builds is reported on stderr ([`crate::pipeline_report`]).
     report: bool,
     resources: HashMap<u32, Resource>,
-    /// Cached multisample backing textures and views for MSAA passes (transient on Metal uses
-    /// `MTLStorageModeMemoryless`; non-transient is used only if a pass splits into pieces).
-    msaa: HashMap<MsaaKey, (wrela_gpu::Texture, wrela_gpu::TextureView)>,
     /// Each pipeline's cached bind groups, by the bindings they hold.
     bind_groups: Vec<HashMap<Arc<[Binding]>, wrela_gpu::BindGroup>>,
     /// For each resource, the cached bind groups it's in: destroying it drops them.
@@ -886,6 +886,9 @@ pub(crate) struct Gpu {
     /// targets, keeps them (`Pass::joins`) and has the same label, with no `Label` between.
     ended: Option<OpenPass>,
     screen: Option<Screen>,
+    /// The screen's format, and that of the screen made next ([`Gpu::show_screen`]):
+    /// [`SCREEN_FORMAT`], or `rgba16float` once the program asks HDR and is let have it.
+    screen_format: TextureFormat,
     /// Reused between buffer reads: mapping is finished before the next copy uses it. A build
     /// that retires lets it go.
     buffer_readback: Option<wrela_gpu::Buffer>,
@@ -1128,6 +1131,7 @@ impl Gpu {
                 None
             },
             stamp_next: 0,
+            stamp_held: vec![false; STAMP_RING as usize],
             job_stamp: None,
             #[cfg(test)]
             measured: Vec::new(),
@@ -1148,7 +1152,6 @@ impl Gpu {
             build_ms: 0.0,
             report,
             resources: HashMap::new(),
-            msaa: HashMap::new(),
             bind_groups: vec![HashMap::new(); manifest.pipelines.len()],
             bound_in: HashMap::new(),
             gone: HashMap::new(),
@@ -1158,6 +1161,7 @@ impl Gpu {
             pass: None,
             ended: None,
             screen: None,
+            screen_format: SCREEN_FORMAT,
             buffer_readback: None,
             image_readback: None,
             labelled: HashMap::new(),
@@ -1227,6 +1231,8 @@ impl Gpu {
             self.spare.entry(key).or_insert((pipeline, false));
         }
         self.bind_groups = vec![HashMap::new(); manifest.pipelines.len()];
+        // Built for the screen as it is (a build taken while it's HDR draws it HDR).
+        self.screen_variants()?;
         self.check_errors()
     }
 
@@ -1234,7 +1240,13 @@ impl Gpu {
     /// survive. In particular, a program that doesn't draw mustn't see the last one's screen.
     pub(crate) fn restart_build(&mut self, manifest: &Manifest, shaders: &[Vec<u8>]) -> Result<()> {
         self.finish_build()?;
+        // The screen as a new program's is: SDR, none made, and so the program is told; a window
+        // shown HDR is set back at the frame's end unless the program asks it again.
         self.screen = None;
+        self.screen_format = SCREEN_FORMAT;
+        self.program_limits.screen = 0;
+        self.program_limits.headroom = wrela_abi::Limits::HERE.headroom;
+        self.screen_asked = Some((false, false));
         self.frame = 0;
         self.spare.clear();
         // A timer the host runs from the start begins again; one the last program asked for
@@ -1264,6 +1276,10 @@ impl Gpu {
         wait(&self.device);
         self.resources.clear();
         self.bound_in.clear();
+        // What it made and destroyed goes too: a device made again later makes only the next
+        // build's resources (`Gpu::recover`), and its handles name that build's.
+        self.made.clear();
+        self.gone.clear();
         self.debug_flag = None;
         // The retiring program's asks for a time and its labels' targets go with it: a later
         // build's requests reuse its numbers, and its handles name other resources.
@@ -1283,14 +1299,18 @@ impl Gpu {
             limits: self.limits.clone(),
             built: self.built.clone(),
             report: self.report,
+            epoch: self.program_limits.epoch,
         }
     }
 
     /// Keeps `ready`, pipelines got ready for another build (`std::reload::prepare`), until a
     /// swap takes them or [`Gpu::let_go`] drops them; `keys` are all that build's pipelines',
-    /// so the spares it would use are kept as long. One the running build has is dropped.
+    /// so the spares it would use are kept as long. One the running build has is dropped, and
+    /// so is every one built on a device lost since (`Gpu::recover`): a swap builds those again.
     pub(crate) fn keep_ready(&mut self, ready: Ready, keys: &[u64]) {
-        for (key, pipeline) in ready {
+        let pipelines =
+            if ready.epoch == self.program_limits.epoch { ready.pipelines } else { Vec::new() };
+        for (key, pipeline) in pipelines {
             if !self.pipeline_keys.contains(&key) {
                 self.spare.insert(key, (pipeline, true));
             }
@@ -1325,8 +1345,12 @@ impl Gpu {
     }
 }
 
-/// Pipelines built for another build, by key (`std::reload::prepare`).
-pub(crate) type Ready = Vec<(u64, Pipeline)>;
+/// Pipelines built for another build, by key (`std::reload::prepare`), and the device epoch
+/// they were built on (`std::gpu::device_epoch`): another epoch's are another device's.
+pub(crate) struct Ready {
+    epoch: u32,
+    pipelines: Vec<(u64, Pipeline)>,
+}
 
 /// Builds pipelines on a device: [`Gpu::builder`]'s, on a thread of its own while a program
 /// runs (`std::reload::prepare`).
@@ -1336,6 +1360,8 @@ pub(crate) struct Builder {
     built: Arc<AtomicUsize>,
     /// Whether each pipeline built is reported on stderr ([`crate::pipeline_report`]).
     report: bool,
+    /// The device epoch its device is ([`Ready::epoch`]).
+    epoch: u32,
 }
 
 impl Builder {
@@ -1355,7 +1381,8 @@ impl Builder {
                 missing.push((p, source.as_slice()));
             }
         }
-        Ok(keys.into_iter().zip(self.build_many(&missing)?).collect())
+        let pipelines = keys.into_iter().zip(self.build_many(&missing)?).collect();
+        Ok(Ready { epoch: self.epoch, pipelines })
     }
 
     /// Each of `jobs` built, in order, on as many threads as the machine has cores. Returns the
@@ -1470,14 +1497,8 @@ impl Builder {
                         }
                         let depth = t.depth.then_some(TextureFormat::Depth32Float);
                         let colors = t.colors().collect();
-                        render_variant(
-                            &self.device,
-                            &p.name,
-                            &layout,
-                            &mut kind,
-                            (colors, depth, t.samples),
-                        )
-                        .map_err(shader_err)?;
+                        render_variant(&self.device, &p.name, &layout, &mut kind, (colors, depth))
+                            .map_err(shader_err)?;
                     }
                     kind
                 }
@@ -1644,8 +1665,10 @@ fn attachment(
 }
 
 impl Gpu {
-    /// Makes the screen `width` x `height` in `format`, a new, cleared texture.
-    fn set_screen_format(&mut self, width: u32, height: u32, format: TextureFormat) {
+    /// Makes the screen `width` x `height` in its format ([`Gpu::screen_format`]), a new, cleared
+    /// texture.
+    fn make_screen(&mut self, width: u32, height: u32) {
+        let format = self.screen_format;
         let (texture, view) = attachment(
             &self.device,
             &wrela_gpu::TextureDesc {
@@ -1661,16 +1684,30 @@ impl Gpu {
                     copy_src: true,
                     ..Default::default()
                 },
-                samples: 1,
-                transient: false,
             },
         );
         self.screen = Some(Screen { texture, view, width, height, format });
     }
 
-    /// The screen's format: [`SCREEN_FORMAT`] until it's made in another.
+    /// The screen's format: what it is, or is made in once there's one.
     fn screen_format(&self) -> TextureFormat {
-        self.screen.as_ref().map_or(SCREEN_FORMAT, |s| s.format)
+        self.screen_format
+    }
+
+    /// Every render pipeline that draws the screen, built for the screen's format: those of a
+    /// build taken after an HDR screen was shown, as well as those it was shown with.
+    fn screen_variants(&mut self) -> Result<()> {
+        let (device, format) = (self.device.clone(), self.screen_format);
+        for p in &mut self.pipelines {
+            let depths = p.screen_depths.clone();
+            for depth in depths {
+                let targets = (vec![format], depth.then_some(TextureFormat::Depth32Float));
+                render_variant(&device, &p.name, &p.layout, &mut p.kind, targets).map_err(|e| {
+                    Error::Gpu(format!("`{}` for the {format:?} screen: {e}", p.name))
+                })?;
+            }
+        }
+        Ok(())
     }
 
     /// Makes the screen `width` x `height` (a new, cleared texture if the size changed).
@@ -1684,7 +1721,7 @@ impl Gpu {
         if self.screen.as_ref().is_some_and(|s| (s.width, s.height) == (width, height)) {
             return Ok(());
         }
-        self.set_screen_format(width, height, self.screen_format());
+        self.make_screen(width, height);
         Ok(())
     }
 
@@ -1749,20 +1786,15 @@ impl Gpu {
             None => (false, false),
         };
         let format = if hdr { TextureFormat::Rgba16Float } else { SCREEN_FORMAT };
-        if format != self.screen_format() {
-            // Every pipeline that draws the screen, built for its new format first.
-            for p in &mut self.pipelines {
-                let depths = p.screen_depths.clone();
-                for depth in depths {
-                    let targets = (vec![format], depth.then_some(TextureFormat::Depth32Float), 1);
-                    render_variant(&device, &p.name, &p.layout, &mut p.kind, targets)
-                        .map_err(|e| Error::Gpu(format!("`{}` for the HDR screen: {e}", p.name)))?;
-                }
-            }
+        if format != self.screen_format {
+            // Every pipeline that draws the screen, built for its new format first; a screen not
+            // made yet is made in it (`Gpu::set_screen`).
+            self.screen_format = format;
+            self.screen_variants()?;
             if let Some(screen) = &self.screen {
                 let (w, h) = (screen.width, screen.height);
                 self.screen = None;
-                self.set_screen_format(w, h, format);
+                self.make_screen(w, h);
             }
         }
         self.program_limits.screen = u32::from(hdr) | u32::from(p3) << 1;
@@ -2169,17 +2201,24 @@ impl Gpu {
         let done = self.device.completed();
         while self.jobs.front().is_some_and(|j| j.index <= done) {
             let job = self.jobs.pop_front().expect("checked above");
-            if let Some(ms) = self.device.gpu_ms(job.index) {
-                self.judge(job, ms)?;
+            let stamp = job.stamp;
+            let judged = match self.device.gpu_ms(job.index) {
+                Some(ms) => self.judge(job, ms),
+                None => Ok(()),
+            };
+            // Its stamps are read: the slot may take another piece's.
+            if let Some(slot) = stamp {
+                self.stamp_held[slot as usize] = false;
             }
+            judged?;
         }
         Ok(())
     }
 
     /// Learns a piece's cost from its time `ms`, and fails a job over the line: a piece of a
     /// pass alone over it (the host cut the pass by what its draws took before, and they took
-    /// far more), or a submission of other work over two lines (what `SUBMIT_BOUND_MS` holds
-    /// dispatches to). The light passes of a submission over a quarter of the line are each
+    /// far more), or a submission of other work over `SUBMIT_LINES` lines (what `Gpu::room`
+    /// holds dispatches to). The light passes of a submission over a quarter of the line are each
     /// measured alone at their next drawing.
     fn judge(&mut self, job: Job, ms: f64) -> Result<()> {
         #[cfg(test)]
@@ -2203,9 +2242,10 @@ impl Gpu {
                     }
                 }
             }
-            // A submission of dispatches is held to two lines by their bounds: past them, a
-            // bound didn't hold. (Passes that grew past what they took are cut from next time.)
-            if ms > 2.0 * line && job.pieces.is_empty() {
+            // A submission of dispatches is held to `SUBMIT_LINES` lines by their bounds: past
+            // them, a bound didn't hold. (Passes that grew past what they took are cut from next
+            // time.)
+            if ms > SUBMIT_LINES * line && job.pieces.is_empty() {
                 return Err(Error::Gpu(format!(
                     "a submission of frame {} held the GPU {ms:.1} ms, over twice the line of \
                      {line:.0} ms (AGENTS.md, rule 2), with no passes. The run stops here: a \
@@ -2358,8 +2398,6 @@ impl Gpu {
             },
             format,
             usage,
-            samples: 1,
-            transient: false,
         });
         let views = std::cell::RefCell::new(HashMap::new());
         self.resources.insert(handle, Resource::Texture(Texture { texture, format, views }));
@@ -2570,12 +2608,13 @@ impl Gpu {
         // Weighed before anything is recorded: a dispatch that could hold the GPU too long never
         // reaches it (`crate::step`).
         self.weigh(pipeline, groups)?;
-        // Everything that can flush happens before anything is recorded for this dispatch: the
-        // submission's room first.
+        // Everything that can flush happens before anything is recorded for this dispatch, and
+        // the submission's room last: a flush resets what the submission has booked, so a room
+        // taken before a reserve that flushes would leave this dispatch uncounted in the next.
         let ms = self.bound_ms(pipeline, groups);
-        self.room(ms)?;
         self.reserve_uniforms(Opcode::Dispatch, self.aligned(uniforms.len()))?;
         self.reserve_timestamps()?;
+        self.room(ms)?;
         let offset = self.push_uniforms(uniforms);
         let bind_group = self.bind_group(pipeline, bindings);
         let mut encoder = self.take_encoder();
@@ -2679,10 +2718,10 @@ impl Gpu {
     }
 
     /// Makes room in the submission being recorded for one more dispatch (its guard bound `ms`)
-    /// or pass (0): what's recorded is submitted first where it would pass `SUBMIT_BOUND_MS` or
+    /// or pass (0): what's recorded is submitted first where it would pass `SUBMIT_LINES` or
     /// `SUBMIT_COMMANDS`.
     fn room(&mut self, ms: f64) -> Result<()> {
-        if self.queued.full(ms) {
+        if self.queued.full(ms, SUBMIT_LINES * self.line_ms) {
             self.submit(false)?;
         }
         self.queued.commands += 1;
@@ -2880,7 +2919,7 @@ impl Gpu {
         let depth_format = (pass.depth != stream::NONE).then(|| self.texture(pass.depth).format);
         // Each draw's pipeline has a variant for these targets, made at load: the checker
         // checked they're among its manifest's.
-        let formats = (colors, depth_format, pass.samples);
+        let formats = (colors, depth_format);
         let name = open.label.clone().unwrap_or_else(|| {
             let (screen, texture) = &*UNNAMED_PASSES;
             if on_screen { screen } else { texture }.clone()
@@ -2912,7 +2951,7 @@ impl Gpu {
             if self.queued.passes_ms + ms > LIGHT_JOB * self.line_ms {
                 self.submit(false)?;
             }
-            self.record_piece(op, &pass, &formats, &name, open.draws, true, true, false)?;
+            self.record_piece(op, &pass, &formats, &name, open.draws, true, false)?;
             self.queued.passes_ms += ms;
             if light.is_some() {
                 self.job_light.push(Piece { label: name, draws: 0..draws, of: draws });
@@ -2950,7 +2989,7 @@ impl Gpu {
         }
         let last = parts.len() - 1;
         for (k, (items, range)) in parts.into_iter().zip(ranges).enumerate() {
-            self.record_piece(op, &pass, &formats, &name, items, k == 0, k == last, true)?;
+            self.record_piece(op, &pass, &formats, &name, items, k == 0, true)?;
             self.job_piece = Some(Piece { label: name.clone(), draws: range, of: draws });
             self.submit(on_screen && k == last)?;
             if k != last {
@@ -2959,39 +2998,6 @@ impl Gpu {
         }
         self.counters.render_passes += 1;
         if on_screen { Ok(()) } else { self.alone() }
-    }
-
-    /// Cached multisample attachment view for slot `slot` (0..8 for colour, 255 for depth).
-    fn msaa_view(
-        &mut self,
-        slot: u8,
-        width: u32,
-        height: u32,
-        format: TextureFormat,
-        samples: u8,
-        transient: bool,
-    ) -> wrela_gpu::TextureView {
-        let key = (slot, width, height, format, samples, transient);
-        if let Some((_, view)) = self.msaa.get(&key) {
-            return view.clone();
-        }
-        let (texture, view) = attachment(
-            &self.device,
-            &wrela_gpu::TextureDesc {
-                label: &format!("msaa {samples}x slot {slot}"),
-                width,
-                height,
-                depth_or_layers: 1,
-                levels: 1,
-                dimension: wrela_gpu::TextureDimension::D2,
-                format,
-                usage: wrela_gpu::TextureUsage { render: true, ..Default::default() },
-                samples,
-                transient,
-            },
-        );
-        self.msaa.insert(key, (texture, view.clone()));
-        view
     }
 
     /// Records `items` as one render pass of `pass` into the pending encoder: the first piece
@@ -3005,7 +3011,6 @@ impl Gpu {
         label: &str,
         items: Vec<PassItem>,
         first: bool,
-        last: bool,
         alone: bool,
     ) -> Result<()> {
         // Everything that can flush happens before anything is recorded for this pass.
@@ -3018,15 +3023,23 @@ impl Gpu {
             .sum();
         self.reserve_uniforms(op, total)?;
         self.reserve_timestamps()?;
+        // The submission's room last, as a dispatch's (`Gpu::dispatch`): a flush resets what it
+        // has booked.
+        self.room(0.0)?;
         let timestamps =
             self.timer.as_mut().and_then(|t| t.next_if(&self.asked, self.frame, self.calls, label));
         // A piece measured alone, where no timer stamps it, is stamped for the guard: its pass's
         // own begin and end, without what the GPU did or waited for before it ran.
-        let guard_stamp = (alone && timestamps.is_none() && self.stamps.is_some()).then(|| {
-            let slot = self.stamp_next;
-            self.stamp_next = (self.stamp_next + 1) % STAMP_RING;
-            slot
-        });
+        // A slot still held by a piece not yet measured (more than `STAMP_RING` pieces in
+        // flight) isn't given: this piece goes unstamped, judged by its span.
+        let free = !self.stamp_held[self.stamp_next as usize];
+        let guard_stamp =
+            (alone && timestamps.is_none() && self.stamps.is_some() && free).then(|| {
+                let slot = self.stamp_next;
+                self.stamp_held[slot as usize] = true;
+                self.stamp_next = (self.stamp_next + 1) % STAMP_RING;
+                slot
+            });
         self.job_stamp = guard_stamp;
         let mut prepared = Vec::with_capacity(items.len());
         for d in &items {
@@ -3036,29 +3049,6 @@ impl Gpu {
                 prepared.push((bind_group, offset));
             }
         }
-        let msaa = pass.samples > 1;
-        let transient = first && last;
-        let msaa_color_views: Vec<wrela_gpu::TextureView> = if msaa {
-            pass.colors()
-                .iter()
-                .enumerate()
-                .map(|(k, c)| {
-                    let t = self.texture(c.texture);
-                    let (w, h) = stream::level_size(t.texture.width(), t.texture.height(), c.level);
-                    let f = t.format;
-                    self.msaa_view(k as u8, w, h, f, pass.samples, transient)
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let msaa_depth_view = if msaa && pass.depth != stream::NONE {
-            let t = self.texture(pass.depth);
-            let (w, h, f) = (t.texture.width(), t.texture.height(), t.format);
-            Some(self.msaa_view(255, w, h, f, pass.samples, transient))
-        } else {
-            None
-        };
         let mut encoder = self.take_encoder();
         let color_views: Vec<wrela_gpu::TextureView> = pass
             .colors()
@@ -3073,28 +3063,14 @@ impl Gpu {
         let color_attachments: Vec<wrela_gpu::ColorAttachment<'_>> = pass
             .colors()
             .iter()
-            .enumerate()
-            .map(|(k, c)| {
+            .zip(&color_views)
+            .map(|(c, view)| {
                 let load = if c.keep || !first {
                     wrela_gpu::LoadOp::Load
                 } else {
                     wrela_gpu::LoadOp::Clear(c.clear.map(f64::from))
                 };
-                if msaa {
-                    wrela_gpu::ColorAttachment {
-                        view: &msaa_color_views[k],
-                        resolve: last.then_some(&color_views[k]),
-                        load,
-                        store: !last,
-                    }
-                } else {
-                    wrela_gpu::ColorAttachment {
-                        view: &color_views[k],
-                        resolve: None,
-                        load,
-                        store: true,
-                    }
-                }
+                wrela_gpu::ColorAttachment { view, load }
             })
             .collect();
         let depth_attachment = depth_view.as_ref().map(|view| {
@@ -3103,16 +3079,7 @@ impl Gpu {
             } else {
                 wrela_gpu::LoadOp::Clear(pass.clear_depth)
             };
-            if let Some(mv) = msaa_depth_view.as_ref() {
-                wrela_gpu::DepthAttachment {
-                    view: mv,
-                    resolve: last.then_some(view),
-                    load,
-                    store: !last,
-                }
-            } else {
-                wrela_gpu::DepthAttachment { view, resolve: None, load, store: true }
-            }
+            wrela_gpu::DepthAttachment { view, load }
         });
         // Counted here, and added once the pass, which borrows the executor, has ended.
         let mut counters = Counters::default();
@@ -3571,7 +3538,7 @@ impl Gpu {
         // In the plain format: a screen asked HDR becomes so again at the frame's end
         // (`show_screen`), its pipelines' variants built on the new device.
         if let Some(s) = &self.screen {
-            fresh.set_screen_format(s.width, s.height, SCREEN_FORMAT);
+            fresh.make_screen(s.width, s.height);
         }
         let bits = self.program_limits.screen;
         if bits != 0 {
@@ -3582,6 +3549,20 @@ impl Gpu {
         fresh.labelled = std::mem::take(&mut self.labelled);
         fresh.labelled_order = std::mem::take(&mut self.labelled_order);
         fresh.asked = std::mem::take(&mut self.asked);
+        // An ask not yet answered times its label's work on the new device: the program's own
+        // timer (`ask_time`) is made again there, and each ask starts at what that timer has
+        // noted (the old timer's count means nothing to it).
+        if fresh.timer.is_none()
+            && fresh.asked.iter().any(|a| a.time.is_none())
+            && fresh.device.features().has("timestamp-query")
+        {
+            fresh.timer = Some(Timer::new(&fresh.device, false, false));
+        }
+        if let Some(t) = &fresh.timer {
+            for a in fresh.asked.iter_mut().filter(|a| a.time.is_none()) {
+                a.from = t.noted;
+            }
+        }
         fresh.screen_asked = self.screen_asked.or(fresh.screen_asked);
         fresh.offscreen_hdr = self.offscreen_hdr;
         fresh.program_limits.screen = self.program_limits.screen;
@@ -3792,10 +3773,8 @@ impl Executor for Gpu {
                 }
                 self.begin_pass(Pass::one(stream::SCREEN, false, *clear))
             }
-            Command::BeginPass(pass) => {
-                self.room(0.0)?;
-                self.begin_pass(*pass)
-            }
+            // Its room in the submission is made where it's recorded (`Gpu::record_piece`).
+            Command::BeginPass(pass) => self.begin_pass(*pass),
             Command::Draw { pipeline, vertices, instances, bindings, uniforms } => {
                 let how = DrawHow::Direct { vertices: *vertices, instances: *instances };
                 self.draw(*pipeline, how, bindings, uniforms);
@@ -3944,7 +3923,6 @@ fn render_variant(
             colors: &colors,
             depth,
             cull: *cull,
-            samples: targets.2,
         })
         .map_err(|e| e.0)?;
     variants.insert(targets, pipeline);

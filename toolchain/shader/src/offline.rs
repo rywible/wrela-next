@@ -10,6 +10,7 @@
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Which tool checks a shader, by its file's extension.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,7 +69,11 @@ pub fn check(tool: Tool, bytes: &[u8]) -> Result<bool, String> {
     }
     let _ = std::fs::create_dir_all(&dir);
     let ext = crate::extension(tool.target());
-    let file = dir.join(format!("{hex}-{}.{ext}", std::process::id()));
+    // A scratch file of this call's own: two threads checking the same bytes at once would
+    // otherwise write, read and remove one file under each other.
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    let call = CALLS.fetch_add(1, Ordering::Relaxed);
+    let file = dir.join(format!("{hex}-{}-{call}.{ext}", std::process::id()));
     std::fs::write(&file, bytes).map_err(|e| format!("{}: {e}", file.display()))?;
     let out = match tool {
         Tool::Metal => Command::new("xcrun")

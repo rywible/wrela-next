@@ -60,8 +60,7 @@ pub fn run(args: &[String]) -> ExitCode {
         eprintln!("error: this machine hasn't {}", missing.join(", "));
         return ExitCode::from(2);
     }
-    // Each distinct shader is checked once: two checks of the same bytes at once would share
-    // the cache's scratch file.
+    // Each distinct shader is checked once.
     let mut by_bytes: BTreeMap<(bool, Vec<u8>), Vec<usize>> = BTreeMap::new();
     for (i, (name, tool)) in shaders.iter().enumerate() {
         let bytes = match std::fs::read(dir.join(name)) {

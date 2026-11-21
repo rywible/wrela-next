@@ -399,7 +399,225 @@ fn float_constants_at_the_edges_are_read_back() {
         }
     });
     let (msl, ..) = written(&b.m, &compute_pipeline(vec![rw(0)], None), Checks::CHECKED);
-    assert!(msl.contains("INFINITY") && msl.contains("NAN"), "{msl}");
+    // Each store's value, in order, read back as a correctly rounded parse reads it: the same
+    // float, bit for bit (any NaN a NaN).
+    let stored: Vec<&str> = msl
+        .lines()
+        .filter(|l| l.starts_with("r0_out["))
+        .filter_map(|l| l.split_once("] = ").map(|(_, v)| v.trim_end_matches(';')))
+        .collect();
+    assert_eq!(stored.len(), values.len(), "{msl}");
+    for (text, x) in stored.iter().zip(values) {
+        let back = match *text {
+            "INFINITY" => f32::INFINITY,
+            "-INFINITY" => f32::NEG_INFINITY,
+            "NAN" => f32::NAN,
+            t => t.parse::<f32>().unwrap_or_else(|e| panic!("`{t}`: {e}")),
+        };
+        if x.is_nan() {
+            assert!(back.is_nan(), "`{text}` isn't a NaN");
+        } else {
+            assert_eq!(back.to_bits(), x.to_bits(), "`{text}` reads back as {back}, not {x}");
+        }
+    }
+}
+
+/// A storage buffer of `elem`s at binding 0 and a kernel over it, built by `body`: its MSL and
+/// its SPIR-V's words.
+fn over_buffer(
+    elem: Scalar,
+    body: impl FnOnce(&mut crate::build::Body<'_>, ir::ResourceId),
+) -> (String, Vec<u32>) {
+    let mut b = Builder::new();
+    let t = b.scalar(elem);
+    let out = b.storage("out", 0, t, true);
+    b.compute("k", [1, 1, 1], &[], |fb| body(fb, out));
+    let (msl, spv, ..) = written(&b.m, &compute_pipeline(vec![rw(0)], None), Checks::CHECKED);
+    (msl, spv)
+}
+
+/// An integer `sign` of a value written where it's used, of an operator that binds looser than
+/// a comparison (`a & b`), keeps it whole: `(a & b) > 0`, not `a & (b > 0)`.
+#[test]
+fn an_integer_signs_compound_argument_is_bracketed() {
+    let mut names = (0, 0);
+    let (msl, _) = over_buffer(Scalar::I32, |fb, out| {
+        let i = fb.types().scalar(Scalar::I32);
+        let (zero, one) = (fb.u32(0), fb.u32(1));
+        let a = fb.load(i, Builder::element(out, zero));
+        let c = fb.load(i, Builder::element(out, one));
+        names = (a.0, c.0);
+        let x = fb.binary(BinOp::BitAnd, a, c);
+        let s = fb.builtin(i, ir::Builtin::Sign, &[x]);
+        fb.store(Builder::element(out, zero), s);
+    });
+    let (a, c) = names;
+    assert!(msl.contains(&format!("((v{a} & v{c}) > 0)")), "{msl}");
+    assert!(msl.contains(&format!("((v{a} & v{c}) == 0)")), "{msl}");
+}
+
+/// A half converted to an integer is clamped by halves' bounds (SPIR-V's), scalar and vector:
+/// an `f32` bound beside a `half` is an ambiguous `clamp`, and as a half an infinity.
+#[test]
+fn a_half_to_an_integer_is_clamped_in_halves() {
+    let (msl, _) = over_buffer(Scalar::F32, |fb, out| {
+        let (f, h, i, u) = {
+            let t = fb.types();
+            (t.f32(), t.scalar(Scalar::F16), t.scalar(Scalar::I32), t.u32())
+        };
+        let (h2, i2) = {
+            let t = fb.types();
+            (t.vector_of(Scalar::F16, 2), t.vector_of(Scalar::I32, 2))
+        };
+        let zero = fb.u32(0);
+        let x = fb.load(f, Builder::element(out, zero));
+        let xh = fb.convert(h, x, Scalar::F16);
+        let si = fb.convert(i, xh, Scalar::I32);
+        let ui = fb.convert(u, xh, Scalar::U32);
+        let v = fb.let_(h2, ir::Expr::Splat(xh, 2));
+        let vi = fb.convert(i2, v, Scalar::I32);
+        let vx = fb.extract(i, vi, 1);
+        let s = fb.binary(BinOp::Add, si, vx);
+        let sf = fb.convert(f, s, Scalar::F32);
+        let uf = fb.convert(f, ui, Scalar::F32);
+        let sum = fb.binary(BinOp::Add, sf, uf);
+        fb.store(Builder::element(out, zero), sum);
+    });
+    assert!(msl.contains("int naga_f2i32(half value)"), "{msl}");
+    assert!(msl.contains("metal::clamp(value, -65504.0h, 65504.0h)"), "{msl}");
+    assert!(msl.contains("metal::clamp(value, 0.0h, 65504.0h)"), "{msl}");
+    assert!(msl.contains("metal::int2 naga_f2i32(metal::half2 value)"), "{msl}");
+    assert!(!msl.contains("2147483520.0"), "{msl}");
+}
+
+/// A shift by an amount the code doesn't know is by it modulo 32, as WGSL defines it; a
+/// constant under 32 is written as it is.
+#[test]
+fn a_shifts_amount_is_taken_modulo_the_width() {
+    let mut names = (0, 0);
+    let (msl, spv) = over_buffer(Scalar::U32, |fb, out| {
+        let u = fb.types().u32();
+        let (zero, one, three) = (fb.u32(0), fb.u32(1), fb.u32(3));
+        let x = fb.load(u, Builder::element(out, zero));
+        let n = fb.load(u, Builder::element(out, one));
+        names = (x.0, n.0);
+        let l = fb.binary(BinOp::Shl, x, n);
+        let r = fb.binary(BinOp::Shr, l, three);
+        fb.store(Builder::element(out, zero), r);
+    });
+    let (x, n) = names;
+    assert!(msl.contains(&format!("(v{x} << (v{n} & 31u)) >> 3u")), "{msl}");
+    // SPIR-V: the unknown amount is a `BitwiseAnd`'s result; the constant one isn't.
+    let ins = instructions(&spv);
+    let masked: Vec<u32> = ins
+        .iter()
+        .filter(|(op, _)| *op == spirv::Op::BitwiseAnd as u32)
+        .map(|(_, ops)| ops[1])
+        .collect();
+    let amount = |op: spirv::Op| {
+        ins.iter().find(|(o, _)| *o == op as u32).map(|(_, ops)| ops[3]).expect("the shift")
+    };
+    assert!(masked.contains(&amount(spirv::Op::ShiftLeftLogical)));
+    assert!(!masked.contains(&amount(spirv::Op::ShiftRightLogical)));
+}
+
+/// A kernel's workgroup memory and a texture at the same binding number (workgroup memory has
+/// none of its own): the workgroup variable stays the kernel's own on both targets, not an
+/// entry of the device's table.
+#[test]
+fn workgroup_memory_beside_a_texture_at_its_binding_stays_workgroup_memory() {
+    let mut b = Builder::new();
+    let f = b.scalar(Scalar::F32);
+    let row = b.array(f, 64);
+    let shared = b.workgroup("row", row);
+    let image = b.texture("image", 0, ir::TexDim::D2, ir::TextureFormat::Rgba8, false);
+    let out = b.storage("out", 1, f, true);
+    b.compute("k", [64, 1, 1], &[BuiltinInput::LocalInvocationId], |fb| {
+        let (u, u3) = {
+            let t = fb.types();
+            (t.u32(), t.vector_of(Scalar::U32, 3))
+        };
+        let id = fb.input(0, u3);
+        let i = fb.extract(u, id, 0);
+        let zero = fb.u32(0);
+        let texel = fb.texel(image, i, zero, zero);
+        let x = fb.extract(f, texel, 0);
+        fb.store(Builder::whole(shared).with(ir::Proj::Index(i)), x);
+        fb.barrier();
+        let y = fb.load(f, Builder::whole(shared).with(ir::Proj::Index(i)));
+        fb.store(Builder::element(out, i), y);
+    });
+    let texture = ResourceBinding {
+        binding: 0,
+        kind: BindingKind::Texture,
+        stage: BindingStage::Both,
+        format: Some(ir::TextureFormat::Rgba8),
+    };
+    let p = compute_pipeline(vec![texture, rw(1)], None);
+    let (msl, spv, ..) = written(&b.m, &p, Checks::CHECKED);
+    let body = msl.split("kernel void k_e(").nth(1).expect("the kernel");
+    let open = body.find(") {").expect("its body");
+    assert!(body[open..].contains("threadgroup A"), "{body}");
+    assert!(body[open..].contains("_blk.i0"), "the texture is read from the table: {body}");
+    let workgroup = instructions(&spv).iter().any(|(op, ops)| {
+        *op == spirv::Op::Variable as u32
+            && ops.get(2) == Some(&(spirv::StorageClass::Workgroup as u32))
+    });
+    assert!(workgroup, "no workgroup variable");
+}
+
+/// An integer dot product wraps as WGSL's does: its products and sum taken unsigned.
+#[test]
+fn an_integer_dot_product_wraps() {
+    let (msl, _) = over_buffer(Scalar::I32, |fb, out| {
+        let (i, i3) = {
+            let t = fb.types();
+            (t.scalar(Scalar::I32), t.vector_of(Scalar::I32, 3))
+        };
+        let zero = fb.u32(0);
+        let x = fb.load(i, Builder::element(out, zero));
+        let v = fb.let_(i3, ir::Expr::Splat(x, 3));
+        let d = fb.builtin(i, ir::Builtin::Dot, &[v, v]);
+        fb.store(Builder::element(out, zero), d);
+    });
+    assert!(msl.contains("int naga_dot_int3(metal::int3 a, metal::int3 b)"), "{msl}");
+    assert!(msl.contains("as_type<uint>(a.x) * as_type<uint>(b.x)"), "{msl}");
+}
+
+/// A comparison sampled at a level samples the top one, as SPIR-V's explicit level 0 does.
+#[test]
+fn a_comparison_at_a_level_samples_the_top_level() {
+    let mut b = Builder::new();
+    let f = b.scalar(Scalar::F32);
+    let shadow = b.texture("shadow", 0, ir::TexDim::D2, ir::TextureFormat::Depth32Float, true);
+    let cmp = b.m.add_resource(ir::Resource {
+        name: "cmp".into(),
+        binding: 1,
+        kind: ir::ResourceKind::Sampler { comparison: true },
+        ty: f,
+    });
+    let out = b.storage("out", 2, f, true);
+    b.compute("k", [1, 1, 1], &[], |fb| {
+        let v2 = fb.types().vector_of(Scalar::F32, 2);
+        let half = fb.f32(0.5);
+        let uv = fb.construct(v2, &[half, half]);
+        let op = ir::TextureOp::SampleCompareLevel;
+        let s = fb.let_(f, ir::Expr::Texture(op, shadow, Some(cmp), vec![uv, half]));
+        let zero = fb.u32(0);
+        fb.store(Builder::element(out, zero), s);
+    });
+    let binding =
+        |binding, kind| ResourceBinding { binding, kind, stage: BindingStage::Both, format: None };
+    let p = compute_pipeline(
+        vec![
+            binding(0, BindingKind::DepthTexture),
+            binding(1, BindingKind::ComparisonSampler),
+            rw(2),
+        ],
+        None,
+    );
+    let (msl, ..) = written(&b.m, &p, Checks::CHECKED);
+    assert!(msl.contains(".sample_compare(") && msl.contains(", metal::level(0))"), "{msl}");
 }
 
 /// A sized buffer's length is read from the pipeline's sizes binding on Metal (in its slot,

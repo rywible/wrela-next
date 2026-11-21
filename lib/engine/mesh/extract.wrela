@@ -4,20 +4,26 @@
 // SIGGRAPH 2002), with 1-step exact Newton surface projection.
 //
 // Each active brick owns `BRICK`³ (6³) interior cells and evaluates `(BRICK + 2)`³ (8³ = 512)
-// corners and `(BRICK + 1)`³ (7³ = 343) dual vertices. Adjacent bricks overlap by one halo cell
-// with identical corner positions, so shared boundary vertices agree bit for bit and no cross-brick
-// lookups or cracks arise.
+// corners and `(BRICK + 1)`³ (7³ = 343) dual vertices. Adjacent bricks overlap by one halo cell.
+// Every position is computed from its global lattice index (`lattice`), never from a brick's
+// origin plus an offset, so a corner or halo cell two bricks share has the same `f32` position in
+// both, its corners the same values and its dual vertex the same bits: no cross-brick lookups or
+// cracks arise. The CPU tests at the end of this file mesh fields through the same per-cell
+// functions the kernels call and hold them to that.
 
-use matter::substance::Substance
+use matter::substance::{Substance, lambert}
 use std::collections::Vec
 use std::derive::{Box3, value_and_gradient}
-use std::field::{ALL_LIVE, DualQuat, Field, Live, Rigid}
+use std::field::{
+    ALL_LIVE, DualQuat, Field, Live, Rigid, cuboid, ellipsoid, fbm, half_space, round_cone, sphere,
+}
 use std::gpu::{
-    Append, AppendBuffer, Atomics, DispatchArgs, DrawIndexedArgs, GlobalId, GpuBuffer, GpuSpan,
-    One, Slots, append_buffer, buffer, buffer_of, copy, dispatch, label, read, write,
+    Append, AppendBuffer, Atomics, DispatchArgs, DrawIndexedArgs, GlobalId, GpuBuffer, GpuSpan, One,
+    Slots, append_buffer, buffer, buffer_of, copy, dispatch, label, read, write,
 }
 use std::hash::{Hasher, StateHash}
-use std::io::Pending
+use std::io::{Pending, print}
+use std::quat::Quat
 
 /// Interior cells per brick along each axis (`6×6×6` owned edges, `7×7×7` dual vertices, `8×8×8`
 /// evaluated corners).
@@ -34,10 +40,44 @@ const NONE: u32 = 4294967295
 /// under the 50 ms step guard even for expensive noise-displaced fields.
 const CHUNK_BRICKS: u32 = 1024
 const CULL_CHUNK: u32 = 8192
-/// Maximum sharp-crease cells refined per chunk (`(bi << 9) | cell`, 256 KB): large enough to
-/// hold every crease cell in a `1024`-brick chunk without overflowing (preventing brick-halo
-/// cracks) while staying well under the 50 ms GPU dispatch guard on both Metal and Vulkan.
-const CAP_CREASES: u32 = 65536
+/// Sharp-crease cells `refine_creases` solves in one dispatch: its exact Hermite solve is the
+/// heaviest per-cell work, so a chunk's crease list (which holds every surface cell, so no crease
+/// is ever solved any other way) is refined in dispatches of at most this many, each well under
+/// the 50 ms GPU dispatch guard.
+const CREASE_SLICE: u32 = 65536
+/// Skinned vertices `deform_skinned_verts` moves in one dispatch (its Newton projection evaluates
+/// the posed field up to 4 times a vertex), for the same reason.
+const DEFORM_SLICE: u32 = 262144
+/// The most slices one prepared list is dispatched in: a chunk's creases (`CAP_SURF /
+/// CREASE_SLICE`, rounded up) and a batch's vertices (`8192 · 343 / DEFORM_SLICE`, rounded up).
+const SLICES_MOST: u32 = 16
+/// A thing that extracts every frame has its extraction read back every this many (a readback
+/// stalls the frame that asks): its chunk and crease limits' headroom covers what its surface
+/// grows in that many frames, and past it `took_counts` extracts again.
+const POLL_EVERY: u32 = 32
+/// Normal spread (`Qef::min_dot`) below which a cell is a sharp crease, solved from exact Hermite
+/// edge crossings; and at or above which a vertex is shaded smooth.
+const CREASE_DOT: f32 = 0.78
+const SMOOTH_DOT: f32 = 0.88
+/// Tikhonov weight per sample toward the mass point: a smooth cell's, and a crease's (small, so
+/// sharp edges and corners solve to their exact intersection).
+const REG_SMOOTH: f32 = 0.04
+const REG_CREASE: f32 = 0.002
+
+/// A field of bound radius `r`'s finest cell before its surface is measured: 180 cells to the
+/// radius (60 bricks across its bound), which a compact thing's surface fits in a batch.
+pub fn size_floor(r: f32) -> f32 {
+    r / 180.0
+}
+
+/// Things a general (non-instanced) batch can tell apart: `MeshVertex::packed` holds 10 bits.
+pub const THING_IDS: u32 = 1024
+/// Per-brick output budgets a batch starts with (vertices, opaque and transmissive indices), and
+/// the most one brick can ever need (every cell a vertex; every owned edge of 3 axes a quad).
+const START_VERTS_PER_BRICK: u32 = 80
+const START_INDICES_PER_BRICK: u32 = 480
+const START_TRANS_PER_BRICK: u32 = 240
+const MOST_INDICES_PER_BRICK: u32 = 3888
 /// Lipschitz bound at unit scale above which a field counts as steep (noise-displaced rock):
 /// its bricks get a finer interval check and its cells a finer spacing.
 const STEEP_LIPSCHITZ: f32 = 1.05
@@ -60,23 +100,35 @@ pub struct MeshVertex: Copy + GpuData {
     pub packed: u32,
 }
 
-/// Packs unit normal `n`, batch thing index `thing_id` (`0..1023`), `smooth`, and `is_trans`
-/// into one 32-bit word via octahedral projection (Cigolle et al., JCGT 2014).
-pub fn pack_vertex_meta(n: vec3, thing_id: u32, smooth: bool, is_trans: bool) -> u32 {
-    let denom = max(abs(n.x) + abs(n.y) + abs(n.z), 1.0e-8)
-    var ox = n.x / denom
-    var oy = n.y / denom
-    if n.z < 0.0 {
-        let sx = if ox >= 0.0 { 1.0 } else { -1.0 }
-        let sy = if oy >= 0.0 { 1.0 } else { -1.0 }
-        let wx = (1.0 - abs(oy)) * sx
-        let wy = (1.0 - abs(ox)) * sy
-        ox = wx
-        oy = wy
+/// Folds a unit direction onto the octahedron `[-1, 1]²` about the z axis (Cigolle et al. 2014):
+/// the one octahedral map of the engine (packed vertex normals here, the sky maps in `light`).
+pub fn octa(n: vec3) -> vec2 {
+    let a = n / max(abs(n.x) + abs(n.y) + abs(n.z), 1.0e-8)
+    if a.z >= 0.0 {
+        return a.xy
     }
-    let ux = u32(clamp((ox * 0.5 + 0.5) * 1023.0 + 0.5, 0.0, 1023.0))
-    let uy = u32(clamp((oy * 0.5 + 0.5) * 1023.0 + 0.5, 0.0, 1023.0))
-    let tid = min(thing_id, 1023)
+    (vec2(1.0) - abs(vec2(a.y, a.x))) * vec2(if a.x >= 0.0 { 1.0 } else { -1.0 }, if a.y >= 0.0 {
+        1.0
+    } else { -1.0 })
+}
+
+/// Unfolds an octahedral coordinate in `[-1, 1]²` back to a unit direction (`octa`'s inverse).
+pub fn unocta(e: vec2) -> vec3 {
+    var v = vec3(e.x, e.y, 1.0 - abs(e.x) - abs(e.y))
+    let t = max(-v.z, 0.0)
+    v.x += if v.x >= 0.0 { -t } else { t }
+    v.y += if v.y >= 0.0 { -t } else { t }
+    normalize(v)
+}
+
+/// Packs unit normal `n`, batch thing index `thing_id` (`0..THING_IDS`), `smooth`, and
+/// `is_trans` into one 32-bit word, the normal as 10 + 10 bits of its `octa` fold.
+pub fn pack_vertex_meta(n: vec3, thing_id: u32, smooth: bool, is_trans: bool) -> u32 {
+    let o = octa(n)
+    let ux = u32(clamp((o.x * 0.5 + 0.5) * 1023.0 + 0.5, 0.0, 1023.0))
+    let uy = u32(clamp((o.y * 0.5 + 0.5) * 1023.0 + 0.5, 0.0, 1023.0))
+    // `sync_many` refuses a general batch of more than `THING_IDS` things, so this never aliases.
+    let tid = min(thing_id, THING_IDS - 1)
     let sm: u32 = if smooth { 1 } else { 0 }
     let tr: u32 = if is_trans { 1 } else { 0 }
     ux | (uy << 10) | (tid << 20) | (sm << 30) | (tr << 31)
@@ -86,17 +138,7 @@ pub fn pack_vertex_meta(n: vec3, thing_id: u32, smooth: bool, is_trans: bool) ->
 pub fn unpack_oct_normal(packed: u32) -> vec3 {
     let ox = f32(packed & 1023) * (2.0 / 1023.0) - 1.0
     let oy = f32((packed >> 10) & 1023) * (2.0 / 1023.0) - 1.0
-    let oz = 1.0 - abs(ox) - abs(oy)
-    var nx = ox
-    var ny = oy
-    if oz < 0.0 {
-        let t = -oz
-        nx = if ox >= 0.0 { ox - t } else { ox + t }
-        ny = if oy >= 0.0 { oy - t } else { oy + t }
-    }
-    let v = vec3(nx, ny, oz)
-    let l2 = dot(v, v)
-    if l2 > 1.0e-10 { v * (1.0 / sqrt(l2)) } else { vec3(0.0, 1.0, 0.0) }
+    unocta(vec2(ox, oy))
 }
 
 /// Decodes the thing index (`0..1023`) from `MeshVertex::packed`.
@@ -271,7 +313,69 @@ fn grid_for(aabb: Box3, cell: f32, base_brick: u32, orig_id: u32) -> GridSpec {
     let nx = max(u32(ceil(span.x / bspan)), 1)
     let ny = max(u32(ceil(span.y / bspan)), 1)
     let nz = max(u32(ceil(span.z / bspan)), 1)
-    GridSpec { origin, cell, dims: vec3u(nx, ny, nz), base_brick, orig_id, pad0: 0, pad1: 0, pad2: 0 }
+    GridSpec {
+        origin,
+        cell,
+        dims: vec3u(nx, ny, nz),
+        base_brick,
+        orig_id,
+        pad0: 0,
+        pad1: 0,
+        pad2: 0,
+    }
+}
+
+/// World (or rest-local) position of global lattice corner `n` of grid `g`. Every brick asks for a
+/// shared corner by the same integer, so neighbours get the same `f32` bits.
+fn lattice(g: GridSpec, n: vec3u) -> vec3 {
+    g.origin + vec3(f32(n.x), f32(n.y), f32(n.z)) * g.cell
+}
+
+/// Position of local corner `c` (each in `0..8`) of brick `b` (its `xyz`).
+fn brick_corner(g: GridSpec, b: vec3u, c: vec3u) -> vec3 {
+    lattice(g, vec3u(b.x * BRICK + c.x, b.y * BRICK + c.y, b.z * BRICK + c.z))
+}
+
+/// Brick `(bx, by, bz)` of grid `g`'s `local` brick index.
+fn brick_of(g: GridSpec, local: u32) -> vec3u {
+    let xy = g.dims.x * g.dims.y
+    let bz = local / xy
+    let rem = local - bz * xy
+    let by = rem / g.dims.x
+    vec3u(rem - by * g.dims.x, by, bz)
+}
+
+/// Whether brick `b`'s full `8×8×8` corner box (halo included) may hold `f`'s surface, and which
+/// parts are live in it. A steep field (noise-displaced rock) also needs one of the box's 8
+/// octants to straddle zero: a sound, finer check that discards conservative false positives.
+fn cull_brick<M: Field<Substance>>(f: M, g: GridSpec, b: vec3u) -> (bool, Live) {
+    let lo = brick_corner(g, b, vec3u(0, 0, 0))
+    let hi = brick_corner(g, b, vec3u(BRICK + 1, BRICK + 1, BRICK + 1))
+    let pr = f.pruned(Box3 { lo, hi }, |q: vec3| q, 1.0, ALL_LIVE, 0)
+    if !(pr.range.lo <= 0.0 && pr.range.hi >= 0.0) {
+        return (false, pr.live)
+    }
+    if !steep(f) {
+        return (true, pr.live)
+    }
+    let mid = 0.5 * (lo + hi)
+    for oct in 0..8 {
+        let olo = vec3(
+            if (oct & 1) != 0 { mid.x } else { lo.x },
+            if (oct & 2) != 0 { mid.y } else { lo.y },
+            if (oct & 4) != 0 { mid.z } else { lo.z },
+        )
+        let ohi = vec3(
+            if (oct & 1) != 0 { hi.x } else { mid.x },
+            if (oct & 2) != 0 { hi.y } else { mid.y },
+            if (oct & 4) != 0 { hi.z } else { mid.z },
+        )
+        let iv = f.interval(Box3 { lo: olo, hi: ohi })
+        if iv.lo <= 0.0 && iv.hi >= 0.0 {
+            return (true, pr.live)
+        }
+    }
+    (false, pr.live)
 }
 
 /// Safe vector normalize.
@@ -321,45 +425,10 @@ fn cull_bricks<M: Field<Substance>>(
     }
     let ti = owner_of(grids, things, gb)
     let g = grids[ti]
-    let local = gb - g.base_brick
-    let xy = g.dims.x * g.dims.y
-    let bz = local / xy
-    let rem = local - bz * xy
-    let by = rem / g.dims.x
-    let bx = rem - by * g.dims.x
-    let bspan = g.cell * f32(BRICK)
-    let lo = g.origin + vec3(f32(bx), f32(by), f32(bz)) * bspan
-    // Cover the full 8×8×8 corner box (7 cells wide = BRICK + 1) so halo sign changes aren't missed.
-    let hi = lo + vec3(g.cell * f32(BRICK + 1))
-    let pr = fields[g.orig_id].pruned(Box3 { lo, hi }, |q: vec3| q, 1.0, ALL_LIVE, 0)
-    if pr.range.lo <= 0.0 && pr.range.hi >= 0.0 {
-        var hit = true
-        // For high-steepness fields (e.g. noise-displaced rock), run a sound 8-octant interval
-        // check to discard conservative false-positive empty bricks without missing any surface.
-        if steep(fields[g.orig_id]) {
-            hit = false
-            let mid = 0.5 * (lo + hi)
-            for oct in 0..8 {
-                let olo = vec3(
-                    if (oct & 1) != 0 { mid.x } else { lo.x },
-                    if (oct & 2) != 0 { mid.y } else { lo.y },
-                    if (oct & 4) != 0 { mid.z } else { lo.z },
-                )
-                let ohi = vec3(
-                    if (oct & 1) != 0 { hi.x } else { mid.x },
-                    if (oct & 2) != 0 { hi.y } else { mid.y },
-                    if (oct & 4) != 0 { hi.z } else { mid.z },
-                )
-                let iv = fields[g.orig_id].interval(Box3 { lo: olo, hi: ohi })
-                if iv.lo <= 0.0 && iv.hi >= 0.0 {
-                    hit = true
-                    break
-                }
-            }
-        }
-        if hit {
-            let _ = active.push(ActiveBrick { coord: vec4u(bx, by, bz, ti), live: pr.live })
-        }
+    let b = brick_of(g, gb - g.base_brick)
+    let (hit, live) = cull_brick(fields[g.orig_id], g, b)
+    if hit {
+        let _ = active.push(ActiveBrick { coord: vec4u(b.x, b.y, b.z, ti), live })
     }
 }
 
@@ -408,8 +477,7 @@ fn eval_corners<M: Field<Substance>>(
     let cx = ci & 7
     let cy = (ci >> 3) & 7
     let cz = ci >> 6
-    let bspan = g.cell * f32(BRICK)
-    let p = g.origin + vec3(f32(b.x), f32(b.y), f32(b.z)) * bspan + vec3(f32(cx), f32(cy), f32(cz)) * g.cell
+    let p = brick_corner(g, b.xyz, vec3u(cx, cy, cz))
     corners[id] = fields[g.orig_id].distance_live(p, ab.live)
 }
 
@@ -589,7 +657,8 @@ impl Qef {
                 c00 * rhs.x + c01 * rhs.y + c02 * rhs.z,
                 c01 * rhs.x + c11 * rhs.y + c12 * rhs.z,
                 c02 * rhs.x + c12 * rhs.y + c22 * rhs.z,
-            ) / det
+            ) /
+                det
         } else {
             mp_rel
         }
@@ -606,11 +675,125 @@ fn newton_snap(wp: vec3, dv: f32, gv: vec3, cell_lo: vec3, h: f32) -> vec3 {
         let step = clamp(dv / g2, -0.75 * h, 0.75 * h)
         let cand = wp - gv * step
         let rel = (cand - cell_lo) / h
-        if rel.x >= 0.0 && rel.x <= 1.0 && rel.y >= 0.0 && rel.y <= 1.0 && rel.z >= 0.0 && rel.z <= 1.0 {
+        if rel.x >= 0.0 &&
+            rel.x <= 1.0 &&
+            rel.y >= 0.0 &&
+            rel.y <= 1.0 &&
+            rel.z >= 0.0 &&
+            rel.z <= 1.0 {
             out = cand
         }
     }
     out
+}
+
+/// The cube's 12 edges as pairs of corner indices (`0..8`, bit 0 = x, bit 1 = y, bit 2 = z):
+/// edges `4a..4a + 4` run along axis `a`, from a corner at `0` on it.
+fn edge_ends(e: u32) -> (u32, u32) {
+    let e0 = [0, 2, 4, 6, 0, 1, 4, 5, 0, 1, 2, 3]
+    let e1 = [1, 3, 5, 7, 2, 3, 6, 7, 4, 5, 6, 7]
+    (e0[e], e1[e])
+}
+
+/// A sign-changing cell's QEF from its 8 corners alone: each crossing edge's point by linear
+/// interpolation, its normal from the cell's trilinear gradient (no field samples).
+fn trilinear_qef(d: CellCorners) -> Qef {
+    var qef = qef_empty()
+    for e in 0..12 {
+        let (i0, i1) = edge_ends(e)
+        let v0 = d.at(i0)
+        let v1 = d.at(i1)
+        if (v0 < 0.0) != (v1 < 0.0) {
+            let t = clamp(v0 / (v0 - v1), 0.0, 1.0)
+            let uvw = mix(corner_uvw(i0), corner_uvw(i1), t)
+            qef.add(uvw, safe_norm(d.grad(uvw), vec3(0.0, 1.0, 0.0)))
+        }
+    }
+    qef
+}
+
+/// A sharp crease cell's QEF from exact Hermite data: each crossing edge's point refined by one
+/// Newton step of `dist` along the edge, and `dist`'s gradient there as its normal, so 90° edges
+/// and corners lock onto their exact intersection with no chamfer.
+fn hermite_qef<F: Copy + fn(vec3) -> f32>(dist: F, d: CellCorners, cell_lo: vec3, h: f32) -> Qef {
+    var qef = qef_empty()
+    for e in 0..12 {
+        let (i0, i1) = edge_ends(e)
+        let v0 = d.at(i0)
+        let v1 = d.at(i1)
+        if (v0 < 0.0) != (v1 < 0.0) {
+            // Edges `4a..4a + 4` run along axis `a` from corner `i0`: the edge is `i0`'s corner
+            // with that coordinate moved to `t`, and the field's slope along it is that component
+            // of its gradient.
+            let axis = e / 4
+            let p0 = corner_uvw(i0)
+            let t0 = clamp(v0 / (v0 - v1), 0.0, 1.0)
+            var uvw = with_along(p0, axis, t0)
+            let (edv, egv) = value_and_gradient(|q: vec3| dist(q), cell_lo + uvw * h)
+            let edot = along(egv, axis) * h
+            if abs(edot) > 1.0e-6 {
+                uvw = with_along(p0, axis, clamp(t0 - edv / edot, 0.0, 1.0))
+            }
+            qef.add(uvw, safe_norm(egv, safe_norm(d.grad(uvw), vec3(0.0, 1.0, 0.0))))
+        }
+    }
+    qef
+}
+
+/// Whether a cell's trilinear QEF (`trilinear_qef`) marks it a sharp crease.
+fn is_crease(trilinear: Qef) -> bool {
+    trilinear.min_dot < CREASE_DOT
+}
+
+/// Whether a cell `is_crease` calls smooth is a crease that trilinear interpolation smeared out
+/// of its normals (a cube's edge seen by a cell that holds one corner inside reads 0.96): the
+/// field's exact gradient `gv` at the trilinear solution leans from the QEF's mean normal by more
+/// than half the crease angle. (Two faces `CREASE_DOT = cos θ` apart are each `θ / 2` from their
+/// mean, `cos(θ / 2) = sqrt((1 + cos θ) / 2)`.)
+fn hidden_crease(trilinear: Qef, gv: vec3) -> bool {
+    let g2 = dot(gv, gv)
+    let m2 = dot(trilinear.avg_n, trilinear.avg_n)
+    if g2 <= 1.0e-12 || m2 <= 1.0e-12 {
+        return false
+    }
+    dot(gv, trilinear.avg_n) < sqrt(0.5 * (1.0 + CREASE_DOT)) * sqrt(g2 * m2)
+}
+
+/// The dual vertex solved from `qef` (`crease` picks its regularisation), snapped onto `dist`'s
+/// zero set by one Newton step that stays in the cell, and `dist`'s gradient at the solved point.
+fn solve_cell<F: Copy + fn(vec3) -> f32>(
+    dist: F,
+    qef: Qef,
+    crease: bool,
+    cell_lo: vec3,
+    h: f32,
+) -> (vec3, vec3) {
+    let reg = if crease { REG_CREASE } else { REG_SMOOTH }
+    let wp = cell_lo + qef.solve(reg) * h
+    let (dv, gv) = value_and_gradient(|q: vec3| dist(q), wp)
+    (newton_snap(wp, dv, gv, cell_lo, h), gv)
+}
+
+/// What every pass computes for a sign-changing cell with corners `d` at `cell_lo` (side `h`),
+/// whichever pass that is: its dual vertex, `dist`'s gradient there, and the QEF it was solved
+/// from (whose spread says whether it's shaded smooth). `solve_verts` and `refine_creases` split
+/// this between them; the CPU tests call it whole.
+fn cell_dual_vertex<F: Copy + fn(vec3) -> f32>(
+    dist: F,
+    d: CellCorners,
+    cell_lo: vec3,
+    h: f32,
+) -> (vec3, vec3, Qef) {
+    let tri = trilinear_qef(d)
+    if !is_crease(tri) {
+        let (wp, gv) = solve_cell(dist, tri, crease: false, cell_lo: cell_lo, h: h)
+        if !hidden_crease(tri, gv) {
+            return (wp, gv, tri)
+        }
+    }
+    let qef = hermite_qef(dist, d, cell_lo, h)
+    let (wp, gv) = solve_cell(dist, qef, crease: true, cell_lo: cell_lo, h: h)
+    (wp, gv, qef)
 }
 
 /// Pushes the cell's compact 16-byte dual vertex at `wp` (octahedral normal + thing index +
@@ -628,13 +811,15 @@ fn push_vertex<M: Field<Substance>>(
 ) {
     let n_final = safe_norm(gv, safe_norm(qef.avg_n, vec3(0.0, 1.0, 0.0)))
     let is_trans = f.channels(wp).transmission > 0.02
-    let smooth = qef.min_dot >= 0.88
-    let vi = verts.push(MeshVertex {
-        px: wp.x,
-        py: wp.y,
-        pz: wp.z,
-        packed: pack_vertex_meta(n_final, thing_id, smooth: smooth, is_trans: is_trans),
-    })
+    let smooth = qef.min_dot >= SMOOTH_DOT
+    let vi = verts.push(
+        MeshVertex {
+            px: wp.x,
+            py: wp.y,
+            pz: wp.z,
+            packed: pack_vertex_meta(n_final, thing_id, smooth: smooth, is_trans: is_trans),
+        },
+    )
     if vi < cap_verts {
         cell_verts.store(i: slot, value: vi)
     }
@@ -676,11 +861,11 @@ fn classify_cells(
     }
 }
 
-/// Pass 2b: Solves one Dual Contouring QEF vertex per compacted sign-changing cell using ONLY the
-/// cell's own 8 corners (guaranteed bit-for-bit identical across adjacent brick halos so meshes
-/// are 100% watertight with zero seam cracks), applies 1 exact Newton snap step onto the field
-/// zero-isosurface, and stores exact analytic normal + substance. Sharp crease cells are handed
-/// to `refine_creases` instead (one vertex per cell); if its list is full they are solved here.
+/// Pass 2b: Solves one Dual Contouring vertex per compacted sign-changing cell from ONLY the
+/// cell's own 8 corners (the same bits in every brick that shares the cell, so meshes are
+/// watertight across brick seams), snapped onto the field's zero set by one exact Newton step.
+/// Sharp crease cells are all handed to `refine_creases` (one vertex per cell; its list holds every
+/// surface cell), so a crease cell is only ever solved one way.
 @compute(64)
 fn solve_verts<M: Field<Substance>>(
     fields: [M],
@@ -702,67 +887,95 @@ fn solve_verts<M: Field<Substance>>(
     }
     let packed = surf[id.x]
     let local_bi = packed >> 9
-    let bi = chunk_start + local_bi
     let cell = packed & 511
     let (cx, cy, cz) = decode_cell(cell)
     let d = load_corners(corners, local_bi * CORNERS_BRICK, cx, cy, cz)
-
-    let ab = active[bi]
+    let tri = trilinear_qef(d)
+    let crease = is_crease(tri)
+    if crease {
+        // Solved by `refine_creases`; the list has room for every surface cell.
+        let _ = creases.push(packed)
+        return
+    }
+    let ab = active[chunk_start + local_bi]
     let b = ab.coord
     let g = grids[b.w]
     let h = g.cell
-    let bspan = h * f32(BRICK)
-    let cell_lo = g.origin + vec3(f32(b.x), f32(b.y), f32(b.z)) * bspan + vec3(f32(cx), f32(cy), f32(cz)) * h
-
-    // 12 edges of the cube (pairs of corner indices 0..8).
-    let e0 = [0, 2, 4, 6, 0, 1, 4, 5, 0, 1, 2, 3]
-    let e1 = [1, 3, 5, 7, 2, 3, 6, 7, 4, 5, 6, 7]
-
-    var qef = qef_empty()
-
+    let cell_lo = brick_corner(g, b.xyz, vec3u(cx, cy, cz))
     let f = fields[g.orig_id]
-    // Fast pass: accumulate QEF from cell-local trilinear gradients (0 extra field samples).
-    for e in 0..12 {
-        let i0 = e0[e]
-        let i1 = e1[e]
-        let v0 = d.at(i0)
-        let v1 = d.at(i1)
-        if (v0 < 0.0) != (v1 < 0.0) {
-            let t = clamp(v0 / (v0 - v1), 0.0, 1.0)
-            let uvw = mix(corner_uvw(i0), corner_uvw(i1), t)
-            let n = safe_norm(d.grad(uvw), vec3(0.0, 1.0, 0.0))
-            qef.add(uvw, n)
-        }
-    }
-
-    // Sharp crease/corner cells get their one vertex from exact Hermite edge refinement in a
-    // separate compacted pass, so smooth cells keep minimal registers and zero divergence.
-    if qef.min_dot < 0.78 {
-        if creases.push(packed) < CAP_CREASES {
-            return
-        }
-    }
-
-    let wp = cell_lo + qef.solve(0.04) * h
-
-    // 1-step exact Newton projection onto the field zero-isosurface (stays clamped inside cell).
     // Only the brick's live parts are asked: bit for bit the full distance inside the brick.
     let live = ab.live
-    let (dv, gv) = value_and_gradient(|q| f.distance_live(q, live), wp)
-    let snapped = newton_snap(wp, dv, gv, cell_lo, h)
-    push_vertex(f, g.orig_id, snapped, gv, qef, local_bi * VERTS_STRIDE + cell, cap_verts, mut verts, mut cell_verts)
+    let dist = |q: vec3| f.distance_live(q, live)
+    let qef = tri
+    let (wp, gv) = solve_cell(dist, qef, crease: false, cell_lo: cell_lo, h: h)
+    if hidden_crease(tri, gv) {
+        // A crease after all: solved by `refine_creases`, as `cell_dual_vertex` says.
+        let _ = creases.push(packed)
+        return
+    }
+    push_vertex(
+        f,
+        g.orig_id,
+        wp,
+        gv,
+        qef,
+        local_bi * VERTS_STRIDE + cell,
+        cap_verts,
+        mut verts,
+        mut cell_verts,
+    )
 }
 
-/// Prepares indirect dispatch args for a 64-wide pass over a compacted list (clamped to `cap`).
-@compute(1)
-pub fn prep_list(count: [u32], cap: u32, args: mut One<DispatchArgs>, id: GlobalId) {
+/// Prepares indirect dispatch args for `slices` 64-wide passes over a compacted list of
+/// `count[0]` items (clamped to `cap`), each over the next `most` of them (`args[k]`: items
+/// `k·most..(k + 1)·most`): no groups for a slice past the list's end. One dispatch, however many
+/// slices.
+@compute(64)
+pub fn prep_slices(
+    count: [u32],
+    cap: u32,
+    most: u32,
+    slices: u32,
+    args: mut Slots<DispatchArgs>,
+    id: GlobalId,
+) {
+    if id.x >= slices {
+        return
+    }
     let n = min(count[0], cap)
-    args.set(id, DispatchArgs { x: (n + 63) / 64, y: 1, z: 1 })
+    let first = id.x * most
+    let m = if n > first { min(n - first, most) } else { 0 }
+    args[id] = DispatchArgs { x: (m + 63) / 64, y: 1, z: 1 }
 }
 
-/// Pass 2b: Runs ONLY on compacted sharp-crease cells (`min_dot < 0.78`), replacing smeared
-/// trilinear gradients with exact analytic Hermite edge crossings and normals so 90° edges and
-/// corners lock onto their exact mathematical intersection with zero chamfering.
+/// `prep_slices` for a chunk's crease list (`slices` of `CREASE_SLICE`), noting in `seen` the
+/// most creases a chunk held (`[4]`) and whether one held more than its slices cover (`[5]`, then
+/// those were not solved: `took_counts` extracts again with slices for them).
+@compute(64)
+fn prep_creases(
+    count: [u32],
+    slices: u32,
+    args: mut Slots<DispatchArgs>,
+    seen: mut Atomics<u32>,
+    id: GlobalId,
+) {
+    if id.x >= slices {
+        return
+    }
+    let n = min(count[0], CAP_SURF)
+    let first = id.x * CREASE_SLICE
+    let m = if n > first { min(n - first, CREASE_SLICE) } else { 0 }
+    args[id] = DispatchArgs { x: (m + 63) / 64, y: 1, z: 1 }
+    if id.x == 0 {
+        let _ = seen.max(i: 4, value: n)
+        if n > slices * CREASE_SLICE {
+            let _ = seen.add(i: 5, value: 1)
+        }
+    }
+}
+
+/// Pass 2c: Runs ONLY on compacted sharp-crease cells, solving them from exact analytic Hermite
+/// edge crossings and normals (`hermite_qef`) instead of smeared trilinear gradients.
 @compute(64)
 fn refine_creases<M: Field<Substance>>(
     fields: [M],
@@ -772,61 +985,42 @@ fn refine_creases<M: Field<Substance>>(
     corners: [f32],
     creases: [u32],
     crease_count: [u32],
+    first: u32,
     cap_verts: u32,
     cell_verts: mut Atomics<u32>,
     verts: mut Append<MeshVertex>,
     id: GlobalId,
 ) {
-    let total = min(crease_count[0], CAP_CREASES)
-    if id.x >= total {
+    let i = first + id.x
+    if i >= min(crease_count[0], CAP_SURF) {
         return
     }
-    let packed = creases[id.x]
+    let packed = creases[i]
     let local_bi = packed >> 9
-    let bi = chunk_start + local_bi
     let cell = packed & 511
     let (cx, cy, cz) = decode_cell(cell)
     let d = load_corners(corners, local_bi * CORNERS_BRICK, cx, cy, cz)
-
-    let ab = active[bi]
+    let ab = active[chunk_start + local_bi]
     let b = ab.coord
     let g = grids[b.w]
     let h = g.cell
-    let bspan = h * f32(BRICK)
-    let cell_lo = g.origin + vec3(f32(b.x), f32(b.y), f32(b.z)) * bspan + vec3(f32(cx), f32(cy), f32(cz)) * h
-    let e0 = [0, 2, 4, 6, 0, 1, 4, 5, 0, 1, 2, 3]
-    let e1 = [1, 3, 5, 7, 2, 3, 6, 7, 4, 5, 6, 7]
-
-    var qef = qef_empty()
-
+    let cell_lo = brick_corner(g, b.xyz, vec3u(cx, cy, cz))
     let f = fields[g.orig_id]
     let live = ab.live
-    for e in 0..12 {
-        let i0 = e0[e]
-        let i1 = e1[e]
-        let v0 = d.at(i0)
-        let v1 = d.at(i1)
-        if (v0 < 0.0) != (v1 < 0.0) {
-            let p0 = corner_uvw(i0)
-            let p1 = corner_uvw(i1)
-            let t0 = clamp(v0 / (v0 - v1), 0.0, 1.0)
-            var uvw = mix(p0, p1, t0)
-            let (edv, egv) = value_and_gradient(|q| f.distance_live(q, live), cell_lo + uvw * h)
-            let edir = p1 - p0
-            let edot = dot(egv, edir) * h
-            if abs(edot) > 1.0e-6 {
-                let t1 = clamp(t0 - edv / edot, 0.0, 1.0)
-                uvw = mix(p0, p1, t1)
-            }
-            let n = safe_norm(egv, safe_norm(d.grad(uvw), vec3(0.0, 1.0, 0.0)))
-            qef.add(uvw, n)
-        }
-    }
-
-    let wp = cell_lo + qef.solve(0.002) * h
-    let (dv, gv) = value_and_gradient(|q| f.distance_live(q, live), wp)
-    let snapped = newton_snap(wp, dv, gv, cell_lo, h)
-    push_vertex(f, g.orig_id, snapped, gv, qef, local_bi * VERTS_STRIDE + cell, cap_verts, mut verts, mut cell_verts)
+    let dist = |q: vec3| f.distance_live(q, live)
+    let qef = hermite_qef(dist, d, cell_lo, h)
+    let (wp, gv) = solve_cell(dist, qef, crease: true, cell_lo: cell_lo, h: h)
+    push_vertex(
+        f,
+        g.orig_id,
+        wp,
+        gv,
+        qef,
+        local_bi * VERTS_STRIDE + cell,
+        cap_verts,
+        mut verts,
+        mut cell_verts,
+    )
 }
 
 /// Rest-pose Pass 0 for `Skinned` fields: interval-culls bricks against `rest_pruned`.
@@ -846,18 +1040,12 @@ fn cull_bricks_rest<M: Field<Substance>>(
     }
     let ti = owner_of(grids, things, gb)
     let g = grids[ti]
-    let local = gb - g.base_brick
-    let xy = g.dims.x * g.dims.y
-    let bz = local / xy
-    let rem = local - bz * xy
-    let by = rem / g.dims.x
-    let bx = rem - by * g.dims.x
-    let bspan = g.cell * f32(BRICK)
-    let lo = g.origin + vec3(f32(bx), f32(by), f32(bz)) * bspan
-    let hi = lo + vec3(g.cell * f32(BRICK + 1))
+    let b = brick_of(g, gb - g.base_brick)
+    let lo = brick_corner(g, b, vec3u(0, 0, 0))
+    let hi = brick_corner(g, b, vec3u(BRICK + 1, BRICK + 1, BRICK + 1))
     let pr = fields[g.orig_id].rest_pruned(Box3 { lo, hi }, |q: vec3| q, 1.0, ALL_LIVE, 0)
     if pr.range.lo <= 0.0 && pr.range.hi >= 0.0 {
-        let _ = active.push(ActiveBrick { coord: vec4u(bx, by, bz, ti), live: pr.live })
+        let _ = active.push(ActiveBrick { coord: vec4u(b.x, b.y, b.z, ti), live: pr.live })
     }
 }
 
@@ -886,8 +1074,7 @@ fn eval_corners_rest<M: Field<Substance>>(
     let cx = ci & 7
     let cy = (ci >> 3) & 7
     let cz = ci >> 6
-    let bspan = g.cell * f32(BRICK)
-    let p = g.origin + vec3(f32(b.x), f32(b.y), f32(b.z)) * bspan + vec3(f32(cx), f32(cy), f32(cz)) * g.cell
+    let p = brick_corner(g, b.xyz, vec3u(cx, cy, cz))
     corners[id] = fields[g.orig_id].rest_distance_live(p, ab.live)
 }
 
@@ -906,14 +1093,16 @@ fn push_skinned_vertex<M: Field<Substance>>(
 ) {
     let n_final = safe_norm(gv, safe_norm(qef.avg_n, vec3(0.0, 1.0, 0.0)))
     let is_trans = f.rest_channels(wp).transmission > 0.02
-    let smooth = qef.min_dot >= 0.88
+    let smooth = qef.min_dot >= SMOOTH_DOT
     let sw = f.rest_skin_weights(wp)
-    let vi = verts.push(MeshVertex {
-        px: wp.x,
-        py: wp.y,
-        pz: wp.z,
-        packed: pack_vertex_meta(n_final, thing_id, smooth: smooth, is_trans: is_trans),
-    })
+    let vi = verts.push(
+        MeshVertex {
+            px: wp.x,
+            py: wp.y,
+            pz: wp.z,
+            packed: pack_vertex_meta(n_final, thing_id, smooth: smooth, is_trans: is_trans),
+        },
+    )
     if vi < cap_verts {
         skin_verts.store(i: vi * 2, value: sw.x)
         skin_verts.store(i: vi * 2 + 1, value: sw.y)
@@ -921,8 +1110,8 @@ fn push_skinned_vertex<M: Field<Substance>>(
     }
 }
 
-/// Rest-pose Pass 2b for `Skinned` fields: solves Dual Contouring vertices on `rest_distance_live`
-/// and auto-computes per-vertex skin weights from `rest_skin_weights`.
+/// Rest-pose Pass 2b for `Skinned` fields: `solve_verts` on `rest_distance_live`, with per-vertex
+/// skin weights from `rest_skin_weights`.
 @compute(64)
 fn solve_verts_rest<M: Field<Substance>>(
     fields: [M],
@@ -945,50 +1134,46 @@ fn solve_verts_rest<M: Field<Substance>>(
     }
     let packed = surf[id.x]
     let local_bi = packed >> 9
-    let bi = chunk_start + local_bi
     let cell = packed & 511
     let (cx, cy, cz) = decode_cell(cell)
     let d = load_corners(corners, local_bi * CORNERS_BRICK, cx, cy, cz)
-
-    let ab = active[bi]
+    let tri = trilinear_qef(d)
+    let crease = is_crease(tri)
+    if crease {
+        // Solved by `refine_creases`; the list has room for every surface cell.
+        let _ = creases.push(packed)
+        return
+    }
+    let ab = active[chunk_start + local_bi]
     let b = ab.coord
     let g = grids[b.w]
     let h = g.cell
-    let bspan = h * f32(BRICK)
-    let cell_lo = g.origin + vec3(f32(b.x), f32(b.y), f32(b.z)) * bspan + vec3(f32(cx), f32(cy), f32(cz)) * h
-
-    let e0 = [0, 2, 4, 6, 0, 1, 4, 5, 0, 1, 2, 3]
-    let e1 = [1, 3, 5, 7, 2, 3, 6, 7, 4, 5, 6, 7]
-    var qef = qef_empty()
+    let cell_lo = brick_corner(g, b.xyz, vec3u(cx, cy, cz))
     let f = fields[g.orig_id]
-    for e in 0..12 {
-        let i0 = e0[e]
-        let i1 = e1[e]
-        let v0 = d.at(i0)
-        let v1 = d.at(i1)
-        if (v0 < 0.0) != (v1 < 0.0) {
-            let t = clamp(v0 / (v0 - v1), 0.0, 1.0)
-            let uvw = mix(corner_uvw(i0), corner_uvw(i1), t)
-            let n = safe_norm(d.grad(uvw), vec3(0.0, 1.0, 0.0))
-            qef.add(uvw, n)
-        }
-    }
-    if qef.min_dot < 0.78 {
-        if creases.push(packed) < CAP_CREASES {
-            return
-        }
-    }
-    let wp = cell_lo + qef.solve(0.04) * h
     let live = ab.live
-    let (dv, gv) = value_and_gradient(|q| f.rest_distance_live(q, live), wp)
-    let snapped = newton_snap(wp, dv, gv, cell_lo, h)
+    let dist = |q: vec3| f.rest_distance_live(q, live)
+    let qef = tri
+    let (wp, gv) = solve_cell(dist, qef, crease: false, cell_lo: cell_lo, h: h)
+    if hidden_crease(tri, gv) {
+        // A crease after all: solved by `refine_creases`, as `cell_dual_vertex` says.
+        let _ = creases.push(packed)
+        return
+    }
     push_skinned_vertex(
-        f, g.orig_id, snapped, gv, qef, local_bi * VERTS_STRIDE + cell, cap_verts,
-        mut verts, mut skin_verts, mut cell_verts,
+        f,
+        g.orig_id,
+        wp,
+        gv,
+        qef,
+        local_bi * VERTS_STRIDE + cell,
+        cap_verts,
+        mut verts,
+        mut skin_verts,
+        mut cell_verts,
     )
 }
 
-/// Rest-pose sharp-crease refinement for `Skinned` fields.
+/// Rest-pose `refine_creases` for `Skinned` fields.
 @compute(64)
 fn refine_creases_rest<M: Field<Substance>>(
     fields: [M],
@@ -998,68 +1183,91 @@ fn refine_creases_rest<M: Field<Substance>>(
     corners: [f32],
     creases: [u32],
     crease_count: [u32],
+    first: u32,
     cap_verts: u32,
     cell_verts: mut Atomics<u32>,
     verts: mut Append<MeshVertex>,
     skin_verts: mut Atomics<u32>,
     id: GlobalId,
 ) {
-    let total = min(crease_count[0], CAP_CREASES)
-    if id.x >= total {
+    let i = first + id.x
+    if i >= min(crease_count[0], CAP_SURF) {
         return
     }
-    let packed = creases[id.x]
+    let packed = creases[i]
     let local_bi = packed >> 9
-    let bi = chunk_start + local_bi
     let cell = packed & 511
     let (cx, cy, cz) = decode_cell(cell)
     let d = load_corners(corners, local_bi * CORNERS_BRICK, cx, cy, cz)
-
-    let ab = active[bi]
+    let ab = active[chunk_start + local_bi]
     let b = ab.coord
     let g = grids[b.w]
     let h = g.cell
-    let bspan = h * f32(BRICK)
-    let cell_lo = g.origin + vec3(f32(b.x), f32(b.y), f32(b.z)) * bspan + vec3(f32(cx), f32(cy), f32(cz)) * h
-    let e0 = [0, 2, 4, 6, 0, 1, 4, 5, 0, 1, 2, 3]
-    let e1 = [1, 3, 5, 7, 2, 3, 6, 7, 4, 5, 6, 7]
-    var qef = qef_empty()
+    let cell_lo = brick_corner(g, b.xyz, vec3u(cx, cy, cz))
     let f = fields[g.orig_id]
     let live = ab.live
-    for e in 0..12 {
-        let i0 = e0[e]
-        let i1 = e1[e]
-        let v0 = d.at(i0)
-        let v1 = d.at(i1)
-        if (v0 < 0.0) != (v1 < 0.0) {
-            let p0 = corner_uvw(i0)
-            let p1 = corner_uvw(i1)
-            let t0 = clamp(v0 / (v0 - v1), 0.0, 1.0)
-            var uvw = mix(p0, p1, t0)
-            let (edv, egv) = value_and_gradient(|q| f.rest_distance_live(q, live), cell_lo + uvw * h)
-            let edir = p1 - p0
-            let edot = dot(egv, edir) * h
-            if abs(edot) > 1.0e-6 {
-                let t1 = clamp(t0 - edv / edot, 0.0, 1.0)
-                uvw = mix(p0, p1, t1)
-            }
-            let n = safe_norm(egv, safe_norm(d.grad(uvw), vec3(0.0, 1.0, 0.0)))
-            qef.add(uvw, n)
-        }
-    }
-    let wp = cell_lo + qef.solve(0.002) * h
-    let (dv, gv) = value_and_gradient(|q| f.rest_distance_live(q, live), wp)
-    let snapped = newton_snap(wp, dv, gv, cell_lo, h)
+    let dist = |q: vec3| f.rest_distance_live(q, live)
+    let qef = hermite_qef(dist, d, cell_lo, h)
+    let (wp, gv) = solve_cell(dist, qef, crease: true, cell_lo: cell_lo, h: h)
     push_skinned_vertex(
-        f, g.orig_id, snapped, gv, qef, local_bi * VERTS_STRIDE + cell, cap_verts,
-        mut verts, mut skin_verts, mut cell_verts,
+        f,
+        g.orig_id,
+        wp,
+        gv,
+        qef,
+        local_bi * VERTS_STRIDE + cell,
+        cap_verts,
+        mut verts,
+        mut skin_verts,
+        mut cell_verts,
     )
 }
 
+/// Projects a skinned vertex at `p` (skinned normal `n_ref`) onto `dist`'s zero set by up to 3
+/// Newton steps, returning where it lands and its normal there. A step is kept only if it
+/// lowers `|dist|` and lands where the gradient still faces `n_ref`, and it moves at most twice
+/// `|dist|` (an exact distance needs exactly `|dist|`): a vertex never jumps to another sheet of
+/// the surface (the far face of a thin part) or runs off where the gradient vanishes. A vertex
+/// whose gradient already faces away from `n_ref` stays where skinning put it.
+fn project_posed<F: Copy + fn(vec3) -> f32>(dist: F, p: vec3, n_ref: vec3) -> (vec3, vec3) {
+    var wp = p
+    var nrm = n_ref
+    let (d0, g0) = value_and_gradient(|q: vec3| dist(q), wp)
+    var d = d0
+    var g = g0
+    var gl2 = dot(g, g)
+    if gl2 <= 1.0e-10 || dot(g, n_ref) <= 0.0 {
+        return (wp, nrm)
+    }
+    nrm = g * (1.0 / sqrt(gl2))
+    for _step in 0..3 {
+        if abs(d) <= 1.0e-4 {
+            break
+        }
+        var s = g * (d / gl2)
+        let sl = length(s)
+        let most = 2.0 * abs(d)
+        if sl > most {
+            s = s * (most / sl)
+        }
+        let cand = wp - s
+        let (dc, gc) = value_and_gradient(|q: vec3| dist(q), cand)
+        let gc2 = dot(gc, gc)
+        if !(abs(dc) < abs(d)) || gc2 <= 1.0e-10 || dot(gc, n_ref) <= 0.0 {
+            break
+        }
+        wp = cand
+        d = dc
+        g = gc
+        gl2 = gc2
+        nrm = g * (1.0 / sqrt(gl2))
+    }
+    (wp, nrm)
+}
+
 /// Deforms a `Skinned` `One<M>` rest-pose meshlet on the GPU via 4-bone Dual Quaternion Skinning
-/// followed by adaptive 1–3 step exact analytical Newton projection onto `fields[0].posed_local_distance`:
-/// combines 0.000 ms mesh extraction with sub-millimeter exact posed geometry and exact analytical
-/// normals (zero DQS joint pinching or silhouette lag against the analytical field).
+/// followed by guarded Newton projection (`project_posed`) onto `field.posed_local_distance`:
+/// exact posed geometry and analytical normals with no DQS joint pinching or silhouette lag.
 @compute(64)
 fn deform_skinned_verts<M: Field<Substance>>(
     field: M,
@@ -1067,41 +1275,24 @@ fn deform_skinned_verts<M: Field<Substance>>(
     skin: [u32],
     vert_count: [u32],
     cap_verts: u32,
+    first: u32,
     bones: [DualQuat],
     out: mut Slots<MeshVertex>,
     id: GlobalId,
 ) {
-    let n = min(vert_count[0], cap_verts)
-    if id.x >= n {
+    // `out` starts at vertex `first`.
+    let i = first + id.x
+    if i >= min(vert_count[0], cap_verts) {
         return
     }
-    let v = rest_verts[id.x]
-    let dq = eval_dqs(bones, 0, skin[id.x * 2], skin[id.x * 2 + 1])
+    let v = rest_verts[i]
+    let dq = eval_dqs(bones, 0, skin[i * 2], skin[i * 2 + 1])
     let lp = vec3(v.px, v.py, v.pz)
-    var wp = dq.apply_point(lp)
-    var nrm = dq.apply_normal(unpack_oct_normal(v.packed))
-    let (d0, g0) = value_and_gradient(|q| field.posed_local_distance(q), wp)
-    let gl2_0 = dot(g0, g0)
-    if gl2_0 > 1.0e-10 {
-        nrm = g0 * (1.0 / sqrt(gl2_0))
-        if abs(d0) > 0.0001 {
-            wp -= g0 * clamp(d0 / gl2_0, -0.06, 0.06)
-            let (d1, g1) = value_and_gradient(|q| field.posed_local_distance(q), wp)
-            let gl2_1 = dot(g1, g1)
-            if gl2_1 > 1.0e-10 {
-                nrm = g1 * (1.0 / sqrt(gl2_1))
-                if abs(d1) > 0.0001 {
-                    wp -= g1 * clamp(d1 / gl2_1, -0.06, 0.06)
-                    let (d2, g2) = value_and_gradient(|q| field.posed_local_distance(q), wp)
-                    let gl2_2 = dot(g2, g2)
-                    if gl2_2 > 1.0e-10 {
-                        nrm = g2 * (1.0 / sqrt(gl2_2))
-                        wp -= g2 * clamp(d2 / gl2_2, -0.06, 0.06)
-                    }
-                }
-            }
-        }
-    }
+    let (wp, nrm) = project_posed(
+        |q: vec3| field.posed_local_distance(q),
+        dq.apply_point(lp),
+        dq.apply_normal(unpack_oct_normal(v.packed)),
+    )
     let tid = unpack_thing(v.packed)
     let smooth = unpack_smooth(v.packed)
     let is_trans = unpack_is_trans(v.packed)
@@ -1118,30 +1309,58 @@ fn cv(cell_verts: [u32], base: u32, x: u32, y: u32, z: u32) -> u32 {
     cell_verts[base + x + y * 7 + z * 49]
 }
 
-/// Stores quad `(v0, v1, v2, v3)` as 2 triangles (6 indices) at `at`, wound CCW, or the other
-/// way when `flip`.
-fn store_quad(indices: mut Atomics<u32>, at: u32, v0: u32, v1: u32, v2: u32, v3: u32, flip: bool) {
-    if !flip {
-        indices.store(i: at, value: v0)
-        indices.store(i: at + 1, value: v1)
-        indices.store(i: at + 2, value: v2)
-        indices.store(i: at + 3, value: v0)
-        indices.store(i: at + 4, value: v2)
-        indices.store(i: at + 5, value: v3)
-    } else {
-        indices.store(i: at, value: v0)
-        indices.store(i: at + 1, value: v3)
-        indices.store(i: at + 2, value: v2)
-        indices.store(i: at + 3, value: v0)
-        indices.store(i: at + 4, value: v2)
-        indices.store(i: at + 5, value: v1)
-    }
+/// The quad `(p0, p1, p2, p3)` (wound in that order, unit normals `n0..n3` there) as 2 triangles:
+/// along diagonal `p0–p2`, or along `p1–p3` (`true`) where the surface runs closer to that chord.
+/// Between two points of a surface with normals `na`, `nc` the surface stands
+/// `dot(nc - na, c - a) / 8` off the chord's middle (a circle's sagitta `L² / 8R` exactly), so the
+/// diagonal that does is the one the surface bends least along. A Dual Contouring quad is rarely
+/// planar: across the other diagonal its fold cuts into the surface, or stands off it.
+fn split_13(
+    p0: vec3,
+    p1: vec3,
+    p2: vec3,
+    p3: vec3,
+    n0: vec3,
+    n1: vec3,
+    n2: vec3,
+    n3: vec3,
+) -> bool {
+    abs(dot(n3 - n1, p3 - p1)) < abs(dot(n2 - n0, p2 - p0))
+}
+
+/// The quad of cells `(v0, v1, v2, v3)` (wound counter-clockwise, or the other way when `flip`)
+/// as 6 indices: its corners in winding order, then which diagonal `split_13` picks.
+fn quad_order(v0: u32, v1: u32, v2: u32, v3: u32, flip: bool) -> (u32, u32, u32, u32) {
+    if flip { (v0, v3, v2, v1) } else { (v0, v1, v2, v3) }
+}
+
+/// Stores the wound quad `(q0, q1, q2, q3)` as 2 triangles (6 indices) at `at`, split along
+/// `q1–q3` when `split13`, else along `q0–q2`.
+fn store_quad(
+    indices: mut Atomics<u32>,
+    at: u32,
+    q0: u32,
+    q1: u32,
+    q2: u32,
+    q3: u32,
+    split13: bool,
+) {
+    let (a, b, c, d) = if split13 { (q1, q2, q3, q0) } else { (q0, q1, q2, q3) }
+    indices.store(i: at, value: a)
+    indices.store(i: at + 1, value: b)
+    indices.store(i: at + 2, value: c)
+    indices.store(i: at + 3, value: a)
+    indices.store(i: at + 4, value: c)
+    indices.store(i: at + 5, value: d)
 }
 
 /// Emits one quad (2 triangles = 6 indices) with consistent outward CCW winding into either the
 /// opaque (`slot 0`) or transmissive (`slot 1`) index buffer based on vertex `optics.x` (`transmission`).
 fn emit_quad(
-    v0: u32, v1: u32, v2: u32, v3: u32,
+    v0: u32,
+    v1: u32,
+    v2: u32,
+    v3: u32,
     flip: bool,
     verts: [MeshVertex],
     cap_indices: u32,
@@ -1157,18 +1376,72 @@ fn emit_quad(
         unpack_is_trans(verts[v1].packed) ||
         unpack_is_trans(verts[v2].packed) ||
         unpack_is_trans(verts[v3].packed)
+    let (q0, q1, q2, q3) = quad_order(v0, v1, v2, v3, flip: flip)
+    let p = |v: u32| vec3(verts[v].px, verts[v].py, verts[v].pz)
+    let n = |v: u32| unpack_oct_normal(verts[v].packed)
+    let split13 = split_13(p(q0), p(q1), p(q2), p(q3), n(q0), n(q1), n(q2), n(q3))
     if !is_trans {
         let at = tri_count.add(i: 0, value: 6)
         if at + 6 > cap_indices {
             return
         }
-        store_quad(mut indices, at, v0, v1, v2, v3, flip: flip)
+        store_quad(mut indices, at, q0, q1, q2, q3, split13: split13)
     } else {
         let at = tri_count.add(i: 1, value: 6)
         if at + 6 > cap_trans {
             return
         }
-        store_quad(mut trans_indices, at, v0, v1, v2, v3, flip: flip)
+        store_quad(mut trans_indices, at, q0, q1, q2, q3, split13: split13)
+    }
+}
+
+/// One owned edge of a brick along `axis` and the 4 cells around it, in the order that winds
+/// their quad counter-clockwise seen from the edge's `+axis` end (`flip` it when the edge's first
+/// corner is outside).
+struct OwnedEdge: Copy {
+    from: vec3u,
+    to: vec3u,
+    c0: vec3u,
+    c1: vec3u,
+    c2: vec3u,
+    c3: vec3u,
+}
+
+/// Brick-local edge `(ex, ey, ez)` (each `0..BRICK`) along `axis`: its corners run from
+/// `ex..ex+1` along `axis` at `+1` on the other two axes, so each brick owns the edges of global
+/// lattice lines `BRICK·b + 1 ..= BRICK·b + BRICK` across, and every edge of the grid is owned by
+/// exactly one brick.
+fn owned_edge(axis: u32, ex: u32, ey: u32, ez: u32) -> OwnedEdge {
+    if axis == 0 {
+        // +X edge; cells x = ex, y in {ey, ey+1}, z in {ez, ez+1}.
+        OwnedEdge {
+            from: vec3u(ex, ey + 1, ez + 1),
+            to: vec3u(ex + 1, ey + 1, ez + 1),
+            c0: vec3u(ex, ey, ez),
+            c1: vec3u(ex, ey + 1, ez),
+            c2: vec3u(ex, ey + 1, ez + 1),
+            c3: vec3u(ex, ey, ez + 1),
+        }
+    } else if axis == 1 {
+        // +Y edge; cells y = ey, x in {ex, ex+1}, z in {ez, ez+1}.
+        OwnedEdge {
+            from: vec3u(ex + 1, ey, ez + 1),
+            to: vec3u(ex + 1, ey + 1, ez + 1),
+            c0: vec3u(ex, ey, ez),
+            c1: vec3u(ex, ey, ez + 1),
+            c2: vec3u(ex + 1, ey, ez + 1),
+            c3: vec3u(ex + 1, ey, ez),
+        }
+    } else {
+        // +Z edge; cells z = ez, x in {ex, ex+1}, y in {ey, ey+1}.
+        OwnedEdge {
+            from: vec3u(ex + 1, ey + 1, ez),
+            to: vec3u(ex + 1, ey + 1, ez + 1),
+            c0: vec3u(ex, ey, ez),
+            c1: vec3u(ex + 1, ey, ez),
+            c2: vec3u(ex + 1, ey + 1, ez),
+            c3: vec3u(ex, ey + 1, ez),
+        }
     }
 }
 
@@ -1204,72 +1477,36 @@ fn emit_tris(
     let ex = rem - ey * 6
     let cbase = brick_in_chunk * CORNERS_BRICK
     let vbase = brick_in_chunk * VERTS_STRIDE
-
-    // +X edge: (ex, ey+1, ez+1) -> (ex+1, ey+1, ez+1); surrounding cells have x=ex, y in {ey, ey+1}, z in {ez, ez+1}.
-    let dx0 = cdist(corners, cbase, ex, ey + 1, ez + 1)
-    let dx1 = cdist(corners, cbase, ex + 1, ey + 1, ez + 1)
-    if (dx0 < 0.0) != (dx1 < 0.0) {
-        emit_quad(
-            cv(cell_verts, vbase, ex, ey, ez),
-            cv(cell_verts, vbase, ex, ey + 1, ez),
-            cv(cell_verts, vbase, ex, ey + 1, ez + 1),
-            cv(cell_verts, vbase, ex, ey, ez + 1),
-            flip: dx0 >= 0.0,
-            verts: verts,
-            cap_indices: cap_indices,
-            cap_trans: cap_trans,
-            tri_count: mut tri_count,
-            indices: mut indices,
-            trans_indices: mut trans_indices,
-        )
-    }
-
-    // +Y edge: (ex+1, ey, ez+1) -> (ex+1, ey+1, ez+1); surrounding cells have y=ey, x in {ex, ex+1}, z in {ez, ez+1}.
-    let dy0 = cdist(corners, cbase, ex + 1, ey, ez + 1)
-    let dy1 = cdist(corners, cbase, ex + 1, ey + 1, ez + 1)
-    if (dy0 < 0.0) != (dy1 < 0.0) {
-        emit_quad(
-            cv(cell_verts, vbase, ex, ey, ez),
-            cv(cell_verts, vbase, ex, ey, ez + 1),
-            cv(cell_verts, vbase, ex + 1, ey, ez + 1),
-            cv(cell_verts, vbase, ex + 1, ey, ez),
-            flip: dy0 >= 0.0,
-            verts: verts,
-            cap_indices: cap_indices,
-            cap_trans: cap_trans,
-            tri_count: mut tri_count,
-            indices: mut indices,
-            trans_indices: mut trans_indices,
-        )
-    }
-
-    // +Z edge: (ex+1, ey+1, ez) -> (ex+1, ey+1, ez+1); surrounding cells have z=ez, x in {ex, ex+1}, y in {ey, ey+1}.
-    let dz0 = cdist(corners, cbase, ex + 1, ey + 1, ez)
-    let dz1 = cdist(corners, cbase, ex + 1, ey + 1, ez + 1)
-    if (dz0 < 0.0) != (dz1 < 0.0) {
-        emit_quad(
-            cv(cell_verts, vbase, ex, ey, ez),
-            cv(cell_verts, vbase, ex + 1, ey, ez),
-            cv(cell_verts, vbase, ex + 1, ey + 1, ez),
-            cv(cell_verts, vbase, ex, ey + 1, ez),
-            flip: dz0 >= 0.0,
-            verts: verts,
-            cap_indices: cap_indices,
-            cap_trans: cap_trans,
-            tri_count: mut tri_count,
-            indices: mut indices,
-            trans_indices: mut trans_indices,
-        )
+    for axis in 0..3 {
+        let e = owned_edge(axis, ex, ey, ez)
+        let d0 = cdist(corners, cbase, e.from.x, e.from.y, e.from.z)
+        let d1 = cdist(corners, cbase, e.to.x, e.to.y, e.to.z)
+        if (d0 < 0.0) != (d1 < 0.0) {
+            emit_quad(
+                cv(cell_verts, vbase, e.c0.x, e.c0.y, e.c0.z),
+                cv(cell_verts, vbase, e.c1.x, e.c1.y, e.c1.z),
+                cv(cell_verts, vbase, e.c2.x, e.c2.y, e.c2.z),
+                cv(cell_verts, vbase, e.c3.x, e.c3.y, e.c3.z),
+                flip: d0 >= 0.0,
+                verts: verts,
+                cap_indices: cap_indices,
+                cap_trans: cap_trans,
+                tri_count: mut tri_count,
+                indices: mut indices,
+                trans_indices: mut trans_indices,
+            )
+        }
     }
 }
 
 /// Pass 4: Writes the final `DrawIndexedArgs` for both opaque (`tri_count[0]`) and transmissive
-/// (`tri_count[1]`) index buffers with `inst_count` instances, and records `active_count[0]` into
-/// `tri_count[2]` so a single deferred async readback learns `has_opaque`, `has_trans`, and
-/// `est_bricks` without mid-frame flushes.
+/// (`tri_count[1]`) index buffers with `inst_count` instances, and records the active bricks and
+/// vertices pushed (`tri_count[2]`, `[3]`, counted past capacity too) so one deferred readback
+/// (`MeshBatch::finish_poll`) learns what was drawn and which capacity overflowed.
 @compute(1)
 fn finish_draw(
     active_count: [u32],
+    vert_count: [u32],
     cap_indices: u32,
     cap_trans: u32,
     inst_count: u32,
@@ -1295,6 +1532,7 @@ fn finish_draw(
         first_instance: 0,
     })
     tri_count.store(i: 2, value: active_count[0])
+    tri_count.store(i: 3, value: vert_count[0])
 }
 
 /// Updates the instance count of a cached rigid-instanced batch's indirect draw args when visible
@@ -1378,12 +1616,12 @@ pub fn extract_scratch(max_bricks: u32) -> ExtractScratch {
         active: append_buffer(max_bricks),
         corners: buffer(CHUNK_BRICKS * CORNERS_BRICK),
         cell_verts: buffer(CHUNK_BRICKS * VERTS_STRIDE),
-        creases: append_buffer(CAP_CREASES),
+        creases: append_buffer(CAP_SURF),
         surf: append_buffer(CAP_SURF),
         grids: buffer(grids_cap),
         eval_args: buffer_of([DispatchArgs { x: 0, y: 1, z: 1 }]),
         vert_args: buffer_of([DispatchArgs { x: 0, y: 1, z: 1 }]),
-        crease_args: buffer_of([DispatchArgs { x: 0, y: 1, z: 1 }]),
+        crease_args: buffer_of(Vec::filled(SLICES_MOST, DispatchArgs { x: 0, y: 1, z: 1 })),
         surf_args: buffer_of([DispatchArgs { x: 0, y: 1, z: 1 }]),
         quad_args: buffer_of([DispatchArgs { x: 0, y: 1, z: 1 }]),
         max_bricks,
@@ -1474,16 +1712,56 @@ pub struct MeshBatch {
     pub built: bool,
     pub still_frames: u32,
     pub bound: vec4,
+    /// Whether the last extraction may have drawn opaque (transmissive) triangles: `true` from
+    /// every extraction until a readback of that same extraction says otherwise, so a readback
+    /// never hides geometry that is there (its draws, if empty, draw nothing).
     pub has_opaque: bool,
     pub has_trans: bool,
     stats_poll: Option<Pending<u32>>,
-    pub needs_poll: bool,
-    poll_age: u32,
-    est_bricks: u32,
-    last_total_bricks: u32,
-    last_chunk_limit: u32,
-    /// Per-thing temporal tier assignment for multi-tier `Many` batches (0 = near/60Hz, 1 = far even, 2 = far odd).
-    pub tiers: Vec<u32>,
+    /// Real extractions since the last readback was queued, and the extraction it read. A
+    /// readback stalls the frame that asks (the host answers it on the next call, §17.1), so a
+    /// thing that extracts every frame is read every `POLL_EVERY` extractions, and one that has
+    /// settled once after its last.
+    since_poll: u32,
+    polled_gen: u32,
+    /// How many times `tri_count` has been rewritten (extractions and emptyings), whether the
+    /// latest was a real extraction, and the cell scale it ran at.
+    gen: u32,
+    gen_real: bool,
+    extract_scale: f32,
+    /// The same for the extraction the pending readback reads, with the capacities it ran under
+    /// (`cap_verts`, `cap_indices`, `cap_trans`, `max_bricks`).
+    poll_gen: u32,
+    poll_real: bool,
+    poll_scale: f32,
+    poll_caps: vec4u,
+    /// The bricks each extraction meshes chunks for (`chunk_limit`): what the latest readback's
+    /// active bricks (`active_hint`, of `hint_total` candidates) say with headroom, or every one
+    /// that can be active. The latest extraction's candidates and limit, and the pending
+    /// readback's.
+    active_hint: u32,
+    hint_total: u32,
+    extract_total: u32,
+    extract_limit: u32,
+    poll_total: u32,
+    poll_limit: u32,
+    /// The most creases a chunk of the latest read extraction held (`crease_slices`).
+    crease_hint: u32,
+    /// The rest mesh's vertex count as a readback of extraction `verts_gen` gave it (`deform`).
+    verts_known: u32,
+    verts_gen: u32,
+    /// Every requested cell is multiplied by this (at least 1): raised when a readback finds more
+    /// active bricks than `max_bricks` (a brick count goes as `1 / cell²`), lowered as the need goes.
+    cell_scale: f32,
+    /// Output budgets per brick, doubled when a readback finds them overflowed.
+    verts_per_brick: u32,
+    indices_per_brick: u32,
+    trans_per_brick: u32,
+    /// The instanced paths' last instance slots on the CPU (thing per slot, its transform and
+    /// bones), so each thing's previous-frame transform follows the thing, not the slot.
+    cpu_ids: Vec<u32>,
+    cpu_xforms: Vec<Rigid>,
+    cpu_bones: Vec<DualQuat>,
 }
 
 /// Creates a lazy `MeshBatch` (minimal initial buffers; grows cleanly on demand up to `max_bricks`).
@@ -1499,9 +1777,29 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
         is_deformed: false,
         indices: buffer(6),
         trans_indices: buffer(6),
-        tri_count: buffer_of([0, 0, 0]),
-        draw_args: buffer_of([DrawIndexedArgs { indices: 0, instances: 0, first_index: 0, base_vertex: 0, first_instance: 0 }]),
-        trans_draw_args: buffer_of([DrawIndexedArgs { indices: 0, instances: 0, first_index: 0, base_vertex: 0, first_instance: 0 }]),
+        tri_count: buffer_of([0, 0, 0, 0, 0, 0]),
+        draw_args: buffer_of(
+            [
+                DrawIndexedArgs {
+                    indices: 0,
+                    instances: 0,
+                    first_index: 0,
+                    base_vertex: 0,
+                    first_instance: 0,
+                },
+            ],
+        ),
+        trans_draw_args: buffer_of(
+            [
+                DrawIndexedArgs {
+                    indices: 0,
+                    instances: 0,
+                    first_index: 0,
+                    base_vertex: 0,
+                    first_instance: 0,
+                },
+            ],
+        ),
         xforms: buffer_of([Rigid::identity()]),
         prev_xforms: buffer_of([Rigid::identity()]),
         inst_ids: buffer_of([0]),
@@ -1531,12 +1829,31 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
         has_opaque: true,
         has_trans: true,
         stats_poll: None,
-        needs_poll: false,
-        poll_age: 0,
-        est_bricks: 0,
-        last_total_bricks: 0,
-        last_chunk_limit: 0,
-        tiers: Vec::new(),
+        since_poll: 0,
+        polled_gen: 0,
+        gen: 0,
+        gen_real: false,
+        extract_scale: 1.0,
+        poll_gen: 0,
+        poll_real: false,
+        poll_scale: 1.0,
+        poll_caps: vec4u(0, 0, 0, 0),
+        cell_scale: 1.0,
+        active_hint: 0,
+        hint_total: 0,
+        extract_total: 0,
+        extract_limit: 0,
+        poll_total: 0,
+        poll_limit: 0,
+        crease_hint: 0,
+        verts_known: 0,
+        verts_gen: 0,
+        verts_per_brick: START_VERTS_PER_BRICK,
+        indices_per_brick: START_INDICES_PER_BRICK,
+        trans_per_brick: START_TRANS_PER_BRICK,
+        cpu_ids: Vec::new(),
+        cpu_xforms: Vec::new(),
+        cpu_bones: Vec::new(),
     }
 }
 
@@ -1592,38 +1909,42 @@ impl MeshBatch {
         }
     }
 
-    /// Grows output vertex/index buffers on demand to fit `want_bricks` active bricks.
+    /// Grows output vertex/index buffers on demand to fit `want_bricks` active bricks at the
+    /// batch's per-brick budgets (never shrinking).
     fn ensure_cap(mut self, want_bricks: u32) {
-        let cap = bucket_bricks(want_bricks, self.max_bricks)
-        if cap <= self.cap_bricks {
-            return
+        let cap = max(bucket_bricks(want_bricks, self.max_bricks), self.cap_bricks)
+        let cap_verts = cap * self.verts_per_brick
+        let cap_indices = cap * self.indices_per_brick
+        let cap_trans = cap * self.trans_per_brick
+        if cap_verts > self.cap_verts {
+            self.verts = append_buffer(cap_verts)
+            self.cap_verts = cap_verts
         }
-        let cap_verts = cap * 80
-        let cap_indices = cap * 480
-        let cap_trans = cap * 240
-        self.verts = append_buffer(cap_verts)
-        self.indices = buffer(cap_indices)
-        self.trans_indices = buffer(cap_trans)
+        if cap_indices > self.cap_indices {
+            self.indices = buffer(cap_indices)
+            self.cap_indices = cap_indices
+        }
+        if cap_trans > self.cap_trans {
+            self.trans_indices = buffer(cap_trans)
+            self.cap_trans = cap_trans
+        }
         self.cap_bricks = cap
-        self.cap_verts = cap_verts
-        self.cap_indices = cap_indices
-        self.cap_trans = cap_trans
     }
 
-    /// Non-blocking check of any pending `(opaque, trans, active_bricks)` stats readback.
+    /// Non-blocking check of any pending `(opaque, trans, active_bricks, vertices)` readback.
     pub fn finish_poll(mut self) {
+        var counts = vec4u(0, 0, 0, 0)
+        var creases: u32 = 0
+        var uncovered: u32 = 0
+        var have = false
         match mut self.stats_poll {
             Some(p) => match p.poll() {
                 Some(Ok(c)) => {
-                    if c.len() >= 3 {
-                        self.has_opaque = c[0] > 0
-                        self.has_trans = c[1] > 0
-                        let got = c[2]
-                        if self.last_chunk_limit > 0 && got >= self.last_chunk_limit {
-                            self.est_bricks = 0
-                        } else {
-                            self.est_bricks = max(got + got / 3 + 192, 1)
-                        }
+                    if c.len() >= 6 {
+                        counts = vec4u(c[0], c[1], c[2], c[3])
+                        creases = c[4]
+                        uncovered = c[5]
+                        have = true
                     }
                     self.stats_poll = None
                 },
@@ -1634,22 +1955,230 @@ impl MeshBatch {
             },
             None => {},
         }
+        if have {
+            self.took_counts(counts, creases: creases, uncovered: uncovered)
+        }
+    }
+
+    /// Acts on one readback of `tri_count`: `(opaque indices, transmissive indices, active
+    /// bricks, vertices)`, each counted past its capacity.
+    fn took_counts(mut self, c: vec4u, creases: u32, uncovered: u32) {
+        // Narrow what may be drawn only from the extraction that is drawn now.
+        if self.poll_gen == self.gen {
+            self.has_opaque = c.x > 0
+            self.has_trans = c.y > 0
+        }
+        if !self.poll_real {
+            return
+        }
+        // What the extraction found: its vertices (the rest mesh `deform` moves), and its
+        // active bricks, the next extraction's chunk limit. If more were active than it meshed
+        // chunks for, some went unmeshed: extract again, with chunks for them all.
+        if self.poll_gen == self.gen {
+            self.verts_known = c.w
+            self.verts_gen = self.gen
+            if c.z > self.poll_limit || uncovered > 0 {
+                self.built = false
+            }
+        }
+        self.active_hint = c.z
+        self.crease_hint = creases
+        self.hint_total = self.poll_total
+
+        // An output budget that overflowed dropped triangles: double it and extract again.
+        var regrow = false
+        if c.w > self.poll_caps.x && self.verts_per_brick < VERTS_BRICK {
+            self.verts_per_brick = min(self.verts_per_brick * 2, VERTS_BRICK)
+            regrow = true
+        }
+        if c.x > self.poll_caps.y && self.indices_per_brick < MOST_INDICES_PER_BRICK {
+            self.indices_per_brick = min(self.indices_per_brick * 2, MOST_INDICES_PER_BRICK)
+            regrow = true
+        }
+        if c.y > self.poll_caps.z && self.trans_per_brick < MOST_INDICES_PER_BRICK {
+            self.trans_per_brick = min(self.trans_per_brick * 2, MOST_INDICES_PER_BRICK)
+            regrow = true
+        }
+        if regrow {
+            self.built = false
+        }
+        // More active bricks than the batch holds dropped bricks: coarsen every cell so they fit
+        // at 70% of the limit (by at least 20%, past the cached paths' 15% cell tolerance, so the
+        // next sync extracts again); relax back once well under it.
+        let limit = f32(max(self.poll_caps.w, 1))
+        let got = f32(c.z)
+        let aim = 0.7 * limit
+        if got > limit {
+            let s = self.poll_scale * max(sqrt(got / aim), 1.2)
+            if s > self.cell_scale {
+                self.cell_scale = s
+            }
+        } else if self.poll_scale > 1.0 && got < 0.35 * limit {
+            let s = max(self.poll_scale * sqrt(max(got, 1.0) / aim), 1.0)
+            if s < 0.8 * self.cell_scale {
+                self.cell_scale = s
+            }
+        }
     }
 
     /// Schedules one deferred async readback of `tri_count` (called ONCE at frame end, never
     /// mid-frame inside `run_extract`, so extraction never forces GPU submission flushes).
     pub fn maybe_queue_poll(mut self) {
         self.finish_poll()
-        if !self.needs_poll {
+        // Read the latest real extraction, not yet read, once the thing has settled (a frame
+        // without extracting), or it has none read yet, or it extracts every frame and
+        // `POLL_EVERY` have gone unread.
+        let due = self.gen_real &&
+            self.gen != self.polled_gen &&
+            (self.still_frames >= 1 || self.active_hint == 0 || self.since_poll >= POLL_EVERY)
+        if !due {
             return
         }
         match self.stats_poll {
             None => {
                 self.stats_poll = Some(read(self.tri_count.items()))
-                self.needs_poll = false
+                self.poll_gen = self.gen
+                self.poll_real = self.gen_real
+                self.poll_scale = self.extract_scale
+                self.poll_total = self.extract_total
+                self.poll_limit = self.extract_limit
+                self.poll_caps = vec4u(
+                    self.cap_verts,
+                    self.cap_indices,
+                    self.cap_trans,
+                    self.max_bricks,
+                )
+                self.polled_gen = self.gen
+                self.since_poll = 0
             },
             Some(_) => {},
         }
+    }
+
+    /// Skins and projects this batch's rest-pose vertices into `deformed_verts`
+    /// (`deform_skinned_verts`), in dispatches of at most `DEFORM_SLICE` vertices.
+    fn deform<M: Field<Substance> + GpuData>(mut self, scratch: mut ExtractScratch, field: M) {
+        // As many slices as the rest mesh has vertices, once a readback of this extraction says
+        // how many (the rest mesh changes only when extracted again); every slot's until then.
+        let known = self.verts_gen == self.gen && self.verts_known > 0
+        let n_verts = if known { min(self.verts_known, self.cap_verts) } else { self.cap_verts }
+        let slices = max((n_verts + DEFORM_SLICE - 1) / DEFORM_SLICE, 1)
+        dispatch(
+            prep_slices.bind(
+                count: self.verts.count(),
+                cap: self.cap_verts,
+                most: DEFORM_SLICE,
+                slices: slices,
+                args: scratch.crease_args.span_mut(start: 0, count: slices),
+            ),
+            over: slices,
+        )
+        for k in 0..slices {
+            let first = k * DEFORM_SLICE
+            let n = min(self.cap_verts - first, DEFORM_SLICE)
+            dispatch(
+                deform_skinned_verts.bind(
+                    field: field,
+                    rest_verts: self.verts.items(),
+                    skin: self.skin_verts.items(),
+                    vert_count: self.verts.count(),
+                    cap_verts: self.cap_verts,
+                    first: first,
+                    bones: self.bones.items(),
+                    out: self.deformed_verts.span_mut(start: first, count: n),
+                ),
+                groups: scratch.crease_args.at(k),
+                most: (n + 63) / 64,
+            )
+        }
+    }
+
+    /// The bricks an extraction of `total` candidates (`hard_cap` of them meshable) meshes chunks
+    /// for: the last readback's active bricks with a quarter and half a chunk of headroom, while
+    /// the candidates haven't grown past a quarter of the readback's (a finer cell, a grown
+    /// thing); else all of them. A chunk dispatches its passes whether bricks reach it or not, so
+    /// this keeps a thing's dispatches to the chunks it fills; a surface that outgrows the
+    /// headroom is met by `took_counts`, which extracts again with chunks for it all.
+    fn chunk_limit(self, total: u32, hard_cap: u32) -> u32 {
+        if self.active_hint == 0 || total > self.hint_total + self.hint_total / 4 {
+            return hard_cap
+        }
+        let want = self.active_hint + self.active_hint / 4 + CHUNK_BRICKS / 2
+        min(hard_cap, ((want + CHUNK_BRICKS - 1) / CHUNK_BRICKS) * CHUNK_BRICKS)
+    }
+
+    /// The crease slices a chunk of `chunk_n` bricks dispatches: as `chunk_limit` does for
+    /// chunks, the last readback's most creases a chunk held with a quarter and a sixteenth of a
+    /// slice of headroom (or a slice for every surface cell the chunk can hold); a chunk that
+    /// outgrows them is met by `took_counts`.
+    fn crease_slices(self, chunk_n: u32) -> u32 {
+        let most = (chunk_n * VERTS_BRICK + CREASE_SLICE - 1) / CREASE_SLICE
+        if self.active_hint == 0 || self.extract_total > self.hint_total + self.hint_total / 4 {
+            return most
+        }
+        let want = self.crease_hint + self.crease_hint / 4 + CREASE_SLICE / 16
+        clamp((want + CREASE_SLICE - 1) / CREASE_SLICE, 1, most)
+    }
+
+    /// Notes that `tri_count` was rewritten by a real extraction (or emptied, `real == false`).
+    fn note_extracted(mut self, real: bool) {
+        self.gen = self.gen.wrapping_add(1)
+        self.gen_real = real
+        self.extract_scale = self.cell_scale
+        self.has_opaque = real
+        self.has_trans = real
+        if real {
+            self.since_poll += 1
+        }
+    }
+
+    /// Each of this frame's instance slots' previous-frame transform, matched by thing (`ids`
+    /// among `n` things): the thing's own last transform, or `now`'s (no motion) if it wasn't drawn.
+    fn matched_prev_xforms(self, n: u32, ids: Vec<u32>, now: Vec<Rigid>) -> Vec<Rigid> {
+        let last = self.last_slots(n)
+        var out: Vec<Rigid> = Vec::new()
+        for j in 0..ids.len() {
+            let k = last[ids[j]]
+            out.push(if k != NONE && k < self.cpu_xforms.len() { self.cpu_xforms[k] } else {
+                now[j]
+            })
+        }
+        out
+    }
+
+    /// `matched_prev_xforms` for each slot's `stride` bones.
+    fn matched_prev_bones(
+        self,
+        n: u32,
+        ids: Vec<u32>,
+        now: Vec<DualQuat>,
+        stride: u32,
+    ) -> Vec<DualQuat> {
+        let last = self.last_slots(n)
+        var out: Vec<DualQuat> = Vec::new()
+        for j in 0..ids.len() {
+            let k = last[ids[j]]
+            let had = k != NONE && (k + 1) * stride <= self.cpu_bones.len()
+            for b in 0..stride {
+                out.push(if had { self.cpu_bones[k * stride + b] } else { now[j * stride + b] })
+            }
+        }
+        out
+    }
+
+    /// Last frame's slot of each of `n` things (`NONE` where it wasn't drawn).
+    fn last_slots(self, n: u32) -> Vec<u32> {
+        var last: Vec<u32> = Vec::new()
+        for _i in 0..n {
+            last.push(NONE)
+        }
+        for k in 0..self.cpu_ids.len() {
+            let t = self.cpu_ids[k]
+            if t < n {
+                last[t] = k
+            }
+        }
+        last
     }
 
     /// Extracts a single field into this batch if its state hash or requested cell size changed.
@@ -1662,6 +2191,7 @@ impl MeshBatch {
         field: M,
         cell: f32,
     ) {
+        let cell = cell * self.cell_scale
         var h = Hasher::new()
         field.state_hash(mut h)
         let key = h.finish()
@@ -1673,7 +2203,10 @@ impl MeshBatch {
                 // bent joints (shoulders, hips, knees) stay sub-pixel accurate after DQS.
                 let eff_cell = (cell * 0.75) / max(rf.scale_factor(), 1.0e-4)
                 let bc = max(field.skin_bone_count(), 1)
-                if self.built && self.is_skinned && self.is_deformed && self.hash == key &&
+                if self.built &&
+                    self.is_skinned &&
+                    self.is_deformed &&
+                    self.hash == key &&
                     abs(self.cell - eff_cell) <= 0.05 * max(self.cell, 1.0e-4) {
                     if self.prev_xforms_dirty {
                         copy(from: self.xforms.items(), to: self.prev_xforms.items_mut())
@@ -1684,7 +2217,10 @@ impl MeshBatch {
                         self.prev_bones_dirty = false
                     }
                     if self.prev_deformed_dirty {
-                        copy(from: self.deformed_verts.items(), to: self.prev_deformed_verts.items_mut())
+                        copy(
+                            from: self.deformed_verts.items(),
+                            to: self.prev_deformed_verts.items_mut(),
+                        )
                         self.prev_deformed_dirty = false
                     }
                     self.still_frames += 1
@@ -1696,8 +2232,13 @@ impl MeshBatch {
                 }
                 let wb = field.bound()
                 self.bound = vec4(wb.centre, min(wb.radius, 1.0e4))
-                if self.built && self.is_skinned && self.is_deformed && !self.instanced && self.shape_key == sk &&
-                    self.bone_stride == bc && abs(self.cell - eff_cell) <= 0.05 * max(self.cell, 1.0e-4) {
+                if self.built &&
+                    self.is_skinned &&
+                    self.is_deformed &&
+                    !self.instanced &&
+                    self.shape_key == sk &&
+                    self.bone_stride == bc &&
+                    abs(self.cell - eff_cell) <= 0.05 * max(self.cell, 1.0e-4) {
                     copy(from: self.xforms.items(), to: self.prev_xforms.items_mut())
                     write(mut self.xforms, 0, [rf])
                     self.prev_xforms_dirty = true
@@ -1711,24 +2252,11 @@ impl MeshBatch {
                     }
                     write(mut self.bones, 0, pose_dq)
                     label("mesh_skin")
-                    copy(from: self.deformed_verts.items(), to: self.prev_deformed_verts.items_mut())
-                    dispatch(
-                        prep_list.bind(count: self.verts.count(), cap: self.cap_verts, args: mut scratch.surf_args),
-                        over: 1,
+                    copy(
+                        from: self.deformed_verts.items(),
+                        to: self.prev_deformed_verts.items_mut(),
                     )
-                    dispatch(
-                        deform_skinned_verts.bind(
-                            field: field,
-                            rest_verts: self.verts.items(),
-                            skin: self.skin_verts.items(),
-                            vert_count: self.verts.count(),
-                            cap_verts: self.cap_verts,
-                            bones: self.bones.items(),
-                            out: self.deformed_verts.span_mut(start: 0, count: self.cap_verts),
-                        ),
-                        groups: scratch.surf_args.at(0),
-                        most: (self.cap_verts + 63) / 64,
-                    )
+                    self.deform(mut scratch, field)
                     self.prev_deformed_dirty = true
                     self.hash = key
                     self.still_frames = 0
@@ -1750,27 +2278,15 @@ impl MeshBatch {
                 self.prev_bones_dirty = false
                 self.inst_count = 1
                 self.run_extract_skinned(
-                    mut scratch, fbuf.items(), things: 1, total_bricks: total_bricks, inst_count: 1,
+                    mut scratch,
+                    fbuf.items(),
+                    things: 1,
+                    total_bricks: total_bricks,
+                    inst_count: 1,
                 )
                 self.ensure_deformed_verts(self.cap_verts)
                 label("mesh_skin")
-                dispatch(
-                    prep_list.bind(count: self.verts.count(), cap: self.cap_verts, args: mut scratch.surf_args),
-                    over: 1,
-                )
-                dispatch(
-                    deform_skinned_verts.bind(
-                        field: field,
-                        rest_verts: self.verts.items(),
-                        skin: self.skin_verts.items(),
-                        vert_count: self.verts.count(),
-                        cap_verts: self.cap_verts,
-                        bones: self.bones.items(),
-                        out: self.deformed_verts.span_mut(start: 0, count: self.cap_verts),
-                    ),
-                    groups: scratch.surf_args.at(0),
-                    most: (self.cap_verts + 63) / 64,
-                )
+                self.deform(mut scratch, field)
                 copy(from: self.deformed_verts.items(), to: self.prev_deformed_verts.items_mut())
                 self.prev_deformed_dirty = false
                 self.extracted_xform = Rigid::identity()
@@ -1794,7 +2310,10 @@ impl MeshBatch {
             Some(_) => cell / max(rf.scale_factor(), 1.0e-4),
             None => cell,
         }
-        if self.built && !self.is_skinned && self.hash == key && abs(self.cell - eff_cell) <= 0.05 * max(self.cell, 1.0e-4) {
+        if self.built &&
+            !self.is_skinned &&
+            self.hash == key &&
+            abs(self.cell - eff_cell) <= 0.05 * max(self.cell, 1.0e-4) {
             if self.prev_xforms_dirty {
                 copy(from: self.xforms.items(), to: self.prev_xforms.items_mut())
                 self.prev_xforms_dirty = false
@@ -1804,7 +2323,11 @@ impl MeshBatch {
         }
         match maybe_sk {
             Some(sk) => {
-                if self.built && !self.is_skinned && self.is_rigid_cached && !self.instanced && self.shape_key == sk &&
+                if self.built &&
+                    !self.is_skinned &&
+                    self.is_rigid_cached &&
+                    !self.instanced &&
+                    self.shape_key == sk &&
                     abs(self.cell - eff_cell) <= 0.15 * max(self.cell, 1.0e-4) {
                     copy(from: self.xforms.items(), to: self.prev_xforms.items_mut())
                     let delta = rf.delta_from(self.extracted_xform)
@@ -1835,7 +2358,13 @@ impl MeshBatch {
         self.is_deformed = false
         self.bone_stride = 0
         self.inst_count = 1
-        self.run_extract(mut scratch, fbuf.items(), things: 1, total_bricks: total_bricks, inst_count: 1)
+        self.run_extract(
+            mut scratch,
+            fbuf.items(),
+            things: 1,
+            total_bricks: total_bricks,
+            inst_count: 1,
+        )
         self.hash = key
         self.cell = eff_cell
         self.built = true
@@ -1863,8 +2392,12 @@ impl MeshBatch {
         mut self,
         scratch: mut ExtractScratch,
         fields: [M; N],
-        cells: [f32; N],
+        asked: [f32; N],
     ) {
+        var cells = asked
+        for i in 0..N {
+            cells[i] = asked[i] * self.cell_scale
+        }
         var h = Hasher::new()
         var first_cell = 0.0
         var vis_count: u32 = 0
@@ -1945,7 +2478,9 @@ impl MeshBatch {
         } else {
             first_cell
         }
-        if self.built && self.hash == key && abs(self.cell - check_cell) <= 0.05 * max(self.cell, 1.0e-4) {
+        if self.built &&
+            self.hash == key &&
+            abs(self.cell - check_cell) <= 0.05 * max(self.cell, 1.0e-4) {
             if self.prev_xforms_dirty {
                 copy(from: self.xforms.items(), to: self.prev_xforms.items_mut())
                 self.prev_xforms_dirty = false
@@ -1958,11 +2493,12 @@ impl MeshBatch {
             return
         }
         if vis_count == 0 {
-            write(mut self.tri_count, 0, [0, 0, 0])
+            write(mut self.tri_count, 0, [0, 0, 0, 0, 0, 0])
             scratch.active.clear()
             dispatch(
                 finish_draw.bind(
                     active_count: scratch.active.count(),
+                    vert_count: scratch.active.count(),
                     cap_indices: self.cap_indices,
                     cap_trans: self.cap_trans,
                     inst_count: 0,
@@ -1977,8 +2513,10 @@ impl MeshBatch {
             self.built = true
             self.still_frames = 0
             self.inst_count = 0
-            self.has_opaque = false
-            self.has_trans = false
+            self.note_extracted(false)
+            self.cpu_ids = Vec::new()
+            self.cpu_xforms = Vec::new()
+            self.cpu_bones = Vec::new()
             return
         }
 
@@ -1999,24 +2537,26 @@ impl MeshBatch {
                     }
                 }
             }
-            if self.built && self.instanced && self.is_skinned && self.shape_key == shared_skin_sk &&
-                self.bone_stride == shared_bc && abs(self.cell - best_skin_cell) <= 0.15 * max(self.cell, 1.0e-4) {
-                let grew_x = self.ensure_xforms(vis_count)
-                let grew_b = self.ensure_bones(vis_count * shared_bc)
-                if !grew_x && !grew_b && vis_count == self.inst_count {
-                    copy(from: self.xforms.items(), to: self.prev_xforms.items_mut())
-                    copy(from: self.bones.items(), to: self.prev_bones.items_mut())
-                    self.prev_xforms_dirty = true
-                    self.prev_bones_dirty = true
-                } else {
-                    write(mut self.prev_xforms, 0, deltas)
-                    write(mut self.prev_bones, 0, all_bones)
-                    self.prev_xforms_dirty = false
-                    self.prev_bones_dirty = false
-                }
+            if self.built &&
+                self.instanced &&
+                self.is_skinned &&
+                self.shape_key == shared_skin_sk &&
+                self.bone_stride == shared_bc &&
+                abs(self.cell - best_skin_cell) <= 0.15 * max(self.cell, 1.0e-4) {
+                let _ = self.ensure_xforms(vis_count)
+                let _ = self.ensure_bones(vis_count * shared_bc)
+                // Last frame's transform and bones of each slot's own thing (the slots may hold
+                // other things than last frame's, even when their count is the same).
+                write(mut self.prev_xforms, 0, self.matched_prev_xforms(N, ids, deltas))
+                write(mut self.prev_bones, 0, self.matched_prev_bones(N, ids, all_bones, shared_bc))
+                self.prev_xforms_dirty = true
+                self.prev_bones_dirty = true
                 write(mut self.xforms, 0, deltas)
                 write(mut self.inst_ids, 0, ids)
                 write(mut self.bones, 0, all_bones)
+                self.cpu_ids = take ids
+                self.cpu_xforms = take deltas
+                self.cpu_bones = take all_bones
                 if vis_count != self.inst_count {
                     label("mesh_extract")
                     dispatch(
@@ -2052,9 +2592,16 @@ impl MeshBatch {
             write(mut self.prev_bones, 0, all_bones)
             self.prev_xforms_dirty = false
             self.prev_bones_dirty = false
+            self.cpu_ids = take ids
+            self.cpu_xforms = take deltas
+            self.cpu_bones = take all_bones
             self.inst_count = vis_count
             self.run_extract_skinned(
-                mut scratch, fbuf.items(), things: 1, total_bricks: total_bricks, inst_count: vis_count,
+                mut scratch,
+                fbuf.items(),
+                things: 1,
+                total_bricks: total_bricks,
+                inst_count: vis_count,
             )
             self.extracted_xform = Rigid::identity()
             self.shape_key = shared_skin_sk
@@ -2075,7 +2622,10 @@ impl MeshBatch {
         if all_same_rigid {
             let mid = 0.5 * (wlo + whi)
             self.bound = vec4(mid, length(whi - mid))
-            if self.built && self.instanced && self.is_rigid_cached && self.shape_key == shared_sk &&
+            if self.built &&
+                self.instanced &&
+                self.is_rigid_cached &&
+                self.shape_key == shared_sk &&
                 abs(self.cell - best_local_cell) <= 0.15 * max(self.cell, 1.0e-4) {
                 var deltas: Vec<Rigid> = Vec::new()
                 var ids: Vec<u32> = Vec::new()
@@ -2085,16 +2635,14 @@ impl MeshBatch {
                         ids.push(i)
                     }
                 }
-                let grew = self.ensure_xforms(vis_count)
-                if !grew && vis_count == self.inst_count {
-                    copy(from: self.xforms.items(), to: self.prev_xforms.items_mut())
-                    self.prev_xforms_dirty = true
-                } else {
-                    write(mut self.prev_xforms, 0, deltas)
-                    self.prev_xforms_dirty = false
-                }
+                let _ = self.ensure_xforms(vis_count)
+                // Last frame's transform of each slot's own thing (see fast path A).
+                write(mut self.prev_xforms, 0, self.matched_prev_xforms(N, ids, deltas))
+                self.prev_xforms_dirty = true
                 write(mut self.xforms, 0, deltas)
                 write(mut self.inst_ids, 0, ids)
+                self.cpu_ids = take ids
+                self.cpu_xforms = take deltas
                 if vis_count != self.inst_count {
                     label("mesh_extract")
                     dispatch(
@@ -2135,11 +2683,22 @@ impl MeshBatch {
             write(mut self.prev_xforms, 0, deltas)
             write(mut self.inst_ids, 0, ids)
             self.prev_xforms_dirty = false
+            self.cpu_ids = take ids
+            self.cpu_xforms = take deltas
             self.inst_count = vis_count
-            self.run_extract(mut scratch, fbuf.items(), things: 1, total_bricks: total_bricks, inst_count: vis_count)
+            self.run_extract(
+                mut scratch,
+                fbuf.items(),
+                things: 1,
+                total_bricks: total_bricks,
+                inst_count: vis_count,
+            )
             self.extracted_xform = template_rf
             self.shape_key = shared_sk
             self.is_rigid_cached = true
+            self.is_skinned = false
+            self.is_deformed = false
+            self.bone_stride = 0
             self.instanced = true
             self.hash = key
             self.cell = best_local_cell
@@ -2150,7 +2709,12 @@ impl MeshBatch {
 
         // General path: heterogeneous or deforming fields packed into one shared world-space mesh.
         // Pass the full `fields` array so each `GridSpec` carries its original index `orig_id = i`
-        // directly into `MeshVertex::packed` for exact pixel-rate `fields[orig_id].channels(wp)`.
+        // directly into `MeshVertex::packed` for exact pixel-rate `fields[orig_id].channels(wp)`,
+        // which holds `THING_IDS` of them.
+        assert(
+            N <= THING_IDS,
+            "engine::mesh: a batch of more than THING_IDS things that aren't one shape can't tell its things apart",
+        )
         var grids: Vec<GridSpec> = Vec::new()
         var total_bricks: u32 = 0
         var tlo = vec3(1.0e20)
@@ -2184,10 +2748,19 @@ impl MeshBatch {
         write(mut self.inst_ids, 0, [0])
         self.prev_xforms_dirty = false
         self.inst_count = 1
-        self.run_extract(mut scratch, fbuf.items(), things: count, total_bricks: total_bricks, inst_count: 1)
+        self.run_extract(
+            mut scratch,
+            fbuf.items(),
+            things: count,
+            total_bricks: total_bricks,
+            inst_count: 1,
+        )
         self.extracted_xform = Rigid::identity()
         self.shape_key = 0
         self.is_rigid_cached = false
+        self.is_skinned = false
+        self.is_deformed = false
+        self.bone_stride = 0
         self.instanced = false
         self.hash = key
         self.cell = first_cell
@@ -2204,25 +2777,13 @@ impl MeshBatch {
         inst_count: u32,
     ) {
         label("mesh_extract")
-        self.finish_poll()
-        let grew = total_bricks > self.last_total_bricks + self.last_total_bricks / 2 + 256
-        if grew {
-            self.est_bricks = 0
-        }
-        self.last_total_bricks = total_bricks
-
-        // Right-size this batch's output buffers from candidate bricks (or known active estimate).
-        let cap_want = if self.est_bricks > 0 {
-            min(self.est_bricks + 256, min(total_bricks, self.max_bricks))
-        } else {
-            min(total_bricks, self.max_bricks)
-        }
-        self.ensure_cap(cap_want)
+        // Size this batch's output buffers for every candidate brick (active ones are a subset).
+        self.ensure_cap(min(total_bricks, self.max_bricks))
 
         let effective_cap = min(self.cap_bricks, scratch.max_bricks)
         scratch.active.clear()
         self.verts.clear()
-        write(mut self.tri_count, 0, [0, 0, 0])
+        write(mut self.tri_count, 0, [0, 0, 0, 0, 0, 0])
 
         let grids = scratch.grids.items()
 
@@ -2244,18 +2805,15 @@ impl MeshBatch {
             first += n
         }
 
-        // Passes 1–3: Extract in bounded chunks of `CHUNK_BRICKS` active bricks, using our
-        // deferred `est_bricks` estimate to skip trailing empty chunks on animated objects.
-        let hard_cap = min(effective_cap, total_bricks)
-        let max_chunks_bricks = if self.est_bricks > 0 {
-            min(hard_cap, ((self.est_bricks + CHUNK_BRICKS - 1) / CHUNK_BRICKS) * CHUNK_BRICKS)
-        } else {
-            hard_cap
-        }
-        self.last_chunk_limit = max_chunks_bricks
+        // Passes 1–3: Extract in bounded chunks of `CHUNK_BRICKS` active bricks, up to
+        // `chunk_limit` (a chunk past the active count dispatches no groups); a batch with more
+        // active bricks than `max_bricks` coarsens its cells (`took_counts`).
+        let hard_cap = self.chunk_limit(total_bricks, min(effective_cap, total_bricks))
+        self.extract_total = total_bricks
+        self.extract_limit = hard_cap
         var chunk_start: u32 = 0
-        while chunk_start < max_chunks_bricks {
-            let chunk_n = min(effective_cap - chunk_start, CHUNK_BRICKS)
+        while chunk_start < hard_cap {
+            let chunk_n = min(hard_cap - chunk_start, CHUNK_BRICKS)
             dispatch(
                 prep_chunk.bind(
                     active_count: scratch.active.count(),
@@ -2288,17 +2846,22 @@ impl MeshBatch {
                     cap_bricks: effective_cap,
                     chunk_start: chunk_start,
                     corners: scratch.corners.items(),
-                    cell_verts: scratch.cell_verts.span_mut(start: 0, count: chunk_n * VERTS_STRIDE),
+                    cell_verts: scratch.cell_verts.span_mut(
+                        start: 0,
+                        count: chunk_n * VERTS_STRIDE,
+                    ),
                     surf: mut scratch.surf,
                 ),
                 groups: scratch.vert_args.at(0),
                 most: chunk_n * 6,
             )
             dispatch(
-                prep_list.bind(
+                prep_slices.bind(
                     count: scratch.surf.count(),
                     cap: CAP_SURF,
-                    args: mut scratch.surf_args,
+                    most: CAP_SURF,
+                    slices: 1,
+                    args: scratch.surf_args.span_mut(start: 0, count: 1),
                 ),
                 over: 1,
             )
@@ -2319,30 +2882,37 @@ impl MeshBatch {
                 groups: scratch.surf_args.at(0),
                 most: CAP_SURF / 64,
             )
+            // The chunk's creases, in dispatches of at most `CREASE_SLICE` cells, their counts
+            // prepared in one dispatch (a slice past the list's end dispatches no groups).
+            let crease_slices = self.crease_slices(chunk_n)
             dispatch(
-                prep_list.bind(
+                prep_creases.bind(
                     count: scratch.creases.count(),
-                    cap: CAP_CREASES,
-                    args: mut scratch.crease_args,
+                    slices: crease_slices,
+                    args: scratch.crease_args.span_mut(start: 0, count: crease_slices),
+                    seen: mut self.tri_count,
                 ),
-                over: 1,
+                over: crease_slices,
             )
-            dispatch(
-                refine_creases.bind(
-                    fields: fields,
-                    grids: grids,
-                    active: scratch.active.items(),
-                    chunk_start: chunk_start,
-                    corners: scratch.corners.items(),
-                    creases: scratch.creases.items(),
-                    crease_count: scratch.creases.count(),
-                    cap_verts: self.cap_verts,
-                    cell_verts: mut scratch.cell_verts,
-                    verts: mut self.verts,
-                ),
-                groups: scratch.crease_args.at(0),
-                most: CAP_CREASES / 64,
-            )
+            for k in 0..crease_slices {
+                dispatch(
+                    refine_creases.bind(
+                        fields: fields,
+                        grids: grids,
+                        active: scratch.active.items(),
+                        chunk_start: chunk_start,
+                        corners: scratch.corners.items(),
+                        creases: scratch.creases.items(),
+                        crease_count: scratch.creases.count(),
+                        first: k * CREASE_SLICE,
+                        cap_verts: self.cap_verts,
+                        cell_verts: mut scratch.cell_verts,
+                        verts: mut self.verts,
+                    ),
+                    groups: scratch.crease_args.at(k),
+                    most: CREASE_SLICE / 64,
+                )
+            }
             dispatch(
                 emit_tris.bind(
                     active_count: scratch.active.count(),
@@ -2366,6 +2936,7 @@ impl MeshBatch {
         dispatch(
             finish_draw.bind(
                 active_count: scratch.active.count(),
+                vert_count: self.verts.count(),
                 cap_indices: self.cap_indices,
                 cap_trans: self.cap_trans,
                 inst_count: inst_count,
@@ -2375,14 +2946,9 @@ impl MeshBatch {
             ),
             over: 1,
         )
-        // Poll stats on initial extract, when candidate bricks jumped, or every 32 animated frames
-        // (queued at frame end, never here, so mid-frame extraction never flushes the GPU).
-        if !self.built || grew || self.est_bricks == 0 || self.poll_age >= 32 {
-            self.needs_poll = true
-            self.poll_age = 0
-        } else {
-            self.poll_age += 1
-        }
+        // Read back what was drawn (queued at frame end, never here, so mid-frame extraction
+        // never flushes the GPU).
+        self.note_extracted(true)
     }
 
     /// Runs the 4-pass GPU rest-pose Hermite Dual Contouring pipeline for `Skinned` fields,
@@ -2396,25 +2962,13 @@ impl MeshBatch {
         inst_count: u32,
     ) {
         label("mesh_extract")
-        self.finish_poll()
-        let grew = total_bricks > self.last_total_bricks + self.last_total_bricks / 2 + 256
-        if grew {
-            self.est_bricks = 0
-        }
-        self.last_total_bricks = total_bricks
-
-        let cap_want = if self.est_bricks > 0 {
-            min(self.est_bricks + 256, min(total_bricks, self.max_bricks))
-        } else {
-            min(total_bricks, self.max_bricks)
-        }
-        self.ensure_cap(cap_want)
+        self.ensure_cap(min(total_bricks, self.max_bricks))
         self.ensure_skin_verts(self.cap_verts)
 
         let effective_cap = min(self.cap_bricks, scratch.max_bricks)
         scratch.active.clear()
         self.verts.clear()
-        write(mut self.tri_count, 0, [0, 0, 0])
+        write(mut self.tri_count, 0, [0, 0, 0, 0, 0, 0])
 
         let grids = scratch.grids.items()
         var first: u32 = 0
@@ -2434,16 +2988,12 @@ impl MeshBatch {
             first += n
         }
 
-        let hard_cap = min(effective_cap, total_bricks)
-        let max_chunks_bricks = if self.est_bricks > 0 {
-            min(hard_cap, ((self.est_bricks + CHUNK_BRICKS - 1) / CHUNK_BRICKS) * CHUNK_BRICKS)
-        } else {
-            hard_cap
-        }
-        self.last_chunk_limit = max_chunks_bricks
+        let hard_cap = self.chunk_limit(total_bricks, min(effective_cap, total_bricks))
+        self.extract_total = total_bricks
+        self.extract_limit = hard_cap
         var chunk_start: u32 = 0
-        while chunk_start < max_chunks_bricks {
-            let chunk_n = min(effective_cap - chunk_start, CHUNK_BRICKS)
+        while chunk_start < hard_cap {
+            let chunk_n = min(hard_cap - chunk_start, CHUNK_BRICKS)
             dispatch(
                 prep_chunk.bind(
                     active_count: scratch.active.count(),
@@ -2476,17 +3026,22 @@ impl MeshBatch {
                     cap_bricks: effective_cap,
                     chunk_start: chunk_start,
                     corners: scratch.corners.items(),
-                    cell_verts: scratch.cell_verts.span_mut(start: 0, count: chunk_n * VERTS_STRIDE),
+                    cell_verts: scratch.cell_verts.span_mut(
+                        start: 0,
+                        count: chunk_n * VERTS_STRIDE,
+                    ),
                     surf: mut scratch.surf,
                 ),
                 groups: scratch.vert_args.at(0),
                 most: chunk_n * 6,
             )
             dispatch(
-                prep_list.bind(
+                prep_slices.bind(
                     count: scratch.surf.count(),
                     cap: CAP_SURF,
-                    args: mut scratch.surf_args,
+                    most: CAP_SURF,
+                    slices: 1,
+                    args: scratch.surf_args.span_mut(start: 0, count: 1),
                 ),
                 over: 1,
             )
@@ -2508,31 +3063,38 @@ impl MeshBatch {
                 groups: scratch.surf_args.at(0),
                 most: CAP_SURF / 64,
             )
+            // The chunk's creases, in dispatches of at most `CREASE_SLICE` cells, their counts
+            // prepared in one dispatch (a slice past the list's end dispatches no groups).
+            let crease_slices = self.crease_slices(chunk_n)
             dispatch(
-                prep_list.bind(
+                prep_creases.bind(
                     count: scratch.creases.count(),
-                    cap: CAP_CREASES,
-                    args: mut scratch.crease_args,
+                    slices: crease_slices,
+                    args: scratch.crease_args.span_mut(start: 0, count: crease_slices),
+                    seen: mut self.tri_count,
                 ),
-                over: 1,
+                over: crease_slices,
             )
-            dispatch(
-                refine_creases_rest.bind(
-                    fields: fields,
-                    grids: grids,
-                    active: scratch.active.items(),
-                    chunk_start: chunk_start,
-                    corners: scratch.corners.items(),
-                    creases: scratch.creases.items(),
-                    crease_count: scratch.creases.count(),
-                    cap_verts: self.cap_verts,
-                    cell_verts: mut scratch.cell_verts,
-                    verts: mut self.verts,
-                    skin_verts: mut self.skin_verts,
-                ),
-                groups: scratch.crease_args.at(0),
-                most: CAP_CREASES / 64,
-            )
+            for k in 0..crease_slices {
+                dispatch(
+                    refine_creases_rest.bind(
+                        fields: fields,
+                        grids: grids,
+                        active: scratch.active.items(),
+                        chunk_start: chunk_start,
+                        corners: scratch.corners.items(),
+                        creases: scratch.creases.items(),
+                        crease_count: scratch.creases.count(),
+                        first: k * CREASE_SLICE,
+                        cap_verts: self.cap_verts,
+                        cell_verts: mut scratch.cell_verts,
+                        verts: mut self.verts,
+                        skin_verts: mut self.skin_verts,
+                    ),
+                    groups: scratch.crease_args.at(k),
+                    most: CREASE_SLICE / 64,
+                )
+            }
             dispatch(
                 emit_tris.bind(
                     active_count: scratch.active.count(),
@@ -2556,6 +3118,7 @@ impl MeshBatch {
         dispatch(
             finish_draw.bind(
                 active_count: scratch.active.count(),
+                vert_count: self.verts.count(),
                 cap_indices: self.cap_indices,
                 cap_trans: self.cap_trans,
                 inst_count: inst_count,
@@ -2565,13 +3128,510 @@ impl MeshBatch {
             ),
             over: 1,
         )
-        self.has_opaque = true
-        self.has_trans = true
-        if !self.built || grew || self.est_bricks == 0 || self.poll_age >= 32 {
-            self.needs_poll = true
-            self.poll_age = 0
-        } else {
-            self.poll_age += 1
+        self.note_extracted(true)
+    }
+}
+
+// ---- CPU checks ---------------------------------------------------------------------------------
+// The kernels above are thin: each brick, corner, cell and edge goes through a plain function
+// (`cull_brick`, `brick_corner`, `cell_dual_vertex`, `owned_edge`, `project_posed`), and these
+// tests run those same functions on the CPU, meshing whole fields brick by brick as the GPU passes
+// do and holding the result to the solid: closed, facing out of it, and the same as one mesh of
+// the whole grid at once.
+
+/// A triangle by its three vertices' positions' bits, in winding order.
+struct Tri: Copy {
+    a: vec3u,
+    b: vec3u,
+    c: vec3u,
+}
+
+/// A position's bits.
+fn bits(p: vec3) -> vec3u {
+    vec3u(bitcast_u32(p.x), bitcast_u32(p.y), bitcast_u32(p.z))
+}
+
+/// Whether `x` sorts before `y`, component by component.
+fn key_before(x: vec3u, y: vec3u) -> bool {
+    if x.x != y.x {
+        return x.x < y.x
+    }
+    if x.y != y.y {
+        return x.y < y.y
+    }
+    x.z < y.z
+}
+
+/// `t` turned (keeping its winding) to start at its least vertex, so equal triangles compare equal.
+fn canonical(t: Tri) -> Tri {
+    if !key_before(t.b, t.a) && !key_before(t.c, t.a) {
+        t
+    } else if !key_before(t.c, t.b) {
+        Tri { a: t.b, b: t.c, c: t.a }
+    } else {
+        Tri { a: t.c, b: t.a, c: t.b }
+    }
+}
+
+/// Whether triangle `x` sorts before `y`.
+fn tri_before(x: Tri, y: Tri) -> bool {
+    if x.a != y.a {
+        return key_before(x.a, y.a)
+    }
+    if x.b != y.b {
+        return key_before(x.b, y.b)
+    }
+    key_before(x.c, y.c)
+}
+
+/// A vertex's normal as `push_vertex` stores it and `emit_quad` reads it back.
+fn packed_normal(gv: vec3, q: Qef) -> vec3 {
+    let n = safe_norm(gv, safe_norm(q.avg_n, vec3(0.0, 1.0, 0.0)))
+    unpack_oct_normal(pack_vertex_meta(n, 0, smooth: false, is_trans: false))
+}
+
+/// Pushes the two triangles of the quad of cell vertices `i` (in `at`, normals `nm`), wound and
+/// split as `emit_quad` does.
+fn push_quad(tris: mut Vec<Tri>, at: Vec<vec3>, nm: Vec<vec3>, i: [u32; 4], flip: bool) {
+    let (j0, j1, j2, j3) = if flip { (i[0], i[3], i[2], i[1]) } else { (i[0], i[1], i[2], i[3]) }
+    let (q0, q1, q2, q3) = (at[j0], at[j1], at[j2], at[j3])
+    let split = split_13(q0, q1, q2, q3, nm[j0], nm[j1], nm[j2], nm[j3])
+    let (a, b, c, d) = if split { (q1, q2, q3, q0) } else { (q0, q1, q2, q3) }
+    tris.push(Tri { a: bits(a), b: bits(b), c: bits(c) })
+    tris.push(Tri { a: bits(a), b: bits(c), c: bits(d) })
+}
+
+/// Meshes `f` over grid `g` on the CPU as the GPU passes do: each brick culled by `cull_brick`,
+/// its `8³` corners from `distance_live` at `brick_corner`, each sign-changing cell's vertex from
+/// `cell_dual_vertex`, each owned edge's quad from `owned_edge`. A halo cell is solved by both
+/// bricks that hold it, as on the GPU.
+fn mesh_bricked<M: Field<Substance>>(f: M, g: GridSpec) -> Vec<Tri> {
+    var tris: Vec<Tri> = Vec::new()
+    for local in 0..g.dims.x * g.dims.y * g.dims.z {
+        let b = brick_of(g, local)
+        let (hit, live) = cull_brick(f, g, b)
+        if !hit {
+            continue
+        }
+        var corners: Vec<f32> = Vec::new()
+        for ci in 0..CORNERS_BRICK {
+            corners.push(
+                f.distance_live(brick_corner(g, b, vec3u(ci & 7, (ci >> 3) & 7, ci >> 6)), live),
+            )
+        }
+        var at: Vec<vec3> = Vec::new()
+        var nm: Vec<vec3> = Vec::new()
+        var solved: Vec<bool> = Vec::new()
+        for cell in 0..VERTS_BRICK {
+            let (cx, cy, cz) = decode_cell(cell)
+            let d = load_corners(corners, 0, cx, cy, cz)
+            var neg: u32 = 0
+            for k in 0..8 {
+                if d.at(k) < 0.0 {
+                    neg += 1
+                }
+            }
+            if neg != 0 && neg != 8 {
+                let dist = |q: vec3| f.distance_live(q, live)
+                let (wp, gv, q) = cell_dual_vertex(
+                    dist,
+                    d,
+                    brick_corner(g, b, vec3u(cx, cy, cz)),
+                    g.cell,
+                )
+                at.push(wp)
+                nm.push(packed_normal(gv, q))
+                solved.push(true)
+            } else {
+                at.push(vec3(0.0))
+                nm.push(vec3(0.0))
+                solved.push(false)
+            }
+        }
+        for eidx in 0..EDGES_BRICK {
+            let ez = eidx / 36
+            let ey = (eidx - ez * 36) / 6
+            let ex = eidx - ez * 36 - ey * 6
+            for axis in 0..3 {
+                let e = owned_edge(axis, ex, ey, ez)
+                let d0 = cdist(corners, 0, e.from.x, e.from.y, e.from.z)
+                let d1 = cdist(corners, 0, e.to.x, e.to.y, e.to.z)
+                if (d0 < 0.0) != (d1 < 0.0) {
+                    let i0 = e.c0.x + e.c0.y * 7 + e.c0.z * 49
+                    let i1 = e.c1.x + e.c1.y * 7 + e.c1.z * 49
+                    let i2 = e.c2.x + e.c2.y * 7 + e.c2.z * 49
+                    let i3 = e.c3.x + e.c3.y * 7 + e.c3.z * 49
+                    assert(
+                        solved[i0] && solved[i1] && solved[i2] && solved[i3],
+                        "a crossing edge's cells all have vertices",
+                    )
+                    push_quad(mut tris, at, nm, [i0, i1, i2, i3], flip: d0 >= 0.0)
+                }
+            }
         }
     }
+    tris
+}
+
+/// Meshes `f` over grid `g` on the CPU as one brick the size of the whole grid, with every part
+/// live: no culling, no halo, one vertex per cell. What `mesh_bricked` must equal bit for bit.
+fn mesh_whole<M: Field<Substance>>(f: M, g: GridSpec) -> Vec<Tri> {
+    let n = vec3u(g.dims.x * BRICK, g.dims.y * BRICK, g.dims.z * BRICK)
+    let nc = n + vec3u(2, 2, 2)
+    let ncell = n + vec3u(1, 1, 1)
+    var corners: Vec<f32> = Vec::new()
+    for z in 0..nc.z {
+        for y in 0..nc.y {
+            for x in 0..nc.x {
+                corners.push(f.distance_live(lattice(g, vec3u(x, y, z)), ALL_LIVE))
+            }
+        }
+    }
+    let cidx = |c: vec3u| c.x + (c.y + c.z * nc.y) * nc.x
+    var at: Vec<vec3> = Vec::new()
+    var nm: Vec<vec3> = Vec::new()
+    var solved: Vec<bool> = Vec::new()
+    for z in 0..ncell.z {
+        for y in 0..ncell.y {
+            for x in 0..ncell.x {
+                let d = CellCorners {
+                    d000: corners[cidx(vec3u(x, y, z))],
+                    d100: corners[cidx(vec3u(x + 1, y, z))],
+                    d010: corners[cidx(vec3u(x, y + 1, z))],
+                    d110: corners[cidx(vec3u(x + 1, y + 1, z))],
+                    d001: corners[cidx(vec3u(x, y, z + 1))],
+                    d101: corners[cidx(vec3u(x + 1, y, z + 1))],
+                    d011: corners[cidx(vec3u(x, y + 1, z + 1))],
+                    d111: corners[cidx(vec3u(x + 1, y + 1, z + 1))],
+                }
+                var neg: u32 = 0
+                for k in 0..8 {
+                    if d.at(k) < 0.0 {
+                        neg += 1
+                    }
+                }
+                if neg != 0 && neg != 8 {
+                    let dist = |q: vec3| f.distance_live(q, ALL_LIVE)
+                    let (wp, gv, q) = cell_dual_vertex(dist, d, lattice(g, vec3u(x, y, z)), g.cell)
+                    at.push(wp)
+                    nm.push(packed_normal(gv, q))
+                    solved.push(true)
+                } else {
+                    at.push(vec3(0.0))
+                    nm.push(vec3(0.0))
+                    solved.push(false)
+                }
+            }
+        }
+    }
+    let vidx = |c: vec3u| c.x + (c.y + c.z * ncell.y) * ncell.x
+    var tris: Vec<Tri> = Vec::new()
+    for ez in 0..n.z {
+        for ey in 0..n.y {
+            for ex in 0..n.x {
+                for axis in 0..3 {
+                    let e = owned_edge(axis, ex, ey, ez)
+                    let d0 = corners[cidx(e.from)]
+                    let d1 = corners[cidx(e.to)]
+                    if (d0 < 0.0) != (d1 < 0.0) {
+                        let (i0, i1, i2, i3) = (vidx(e.c0), vidx(e.c1), vidx(e.c2), vidx(e.c3))
+                        assert(
+                            solved[i0] && solved[i1] && solved[i2] && solved[i3],
+                            "a crossing edge's cells all have vertices",
+                        )
+                        push_quad(mut tris, at, nm, [i0, i1, i2, i3], flip: d0 >= 0.0)
+                    }
+                }
+            }
+        }
+    }
+    tris
+}
+
+/// How many of `tris`' edges (by their two vertices' bits, either way round) are not shared by
+/// exactly `2` triangles (`even`: by an even number, which non-manifold Dual Contouring may give
+/// at a pinch but a crack or hole never does).
+fn open_edges(tris: Vec<Tri>, even: bool) -> u32 {
+    // Each vertex's index among the distinct positions.
+    var keys: Vec<vec3u> = Vec::new()
+    for i in 0..tris.len() {
+        keys.push(tris[i].a)
+        keys.push(tris[i].b)
+        keys.push(tris[i].c)
+    }
+    keys.sort_by(|x: vec3u, y: vec3u| key_before(x, y))
+    var unique: Vec<vec3u> = Vec::new()
+    for i in 0..keys.len() {
+        if i == 0 || keys[i] != keys[i - 1] {
+            unique.push(keys[i])
+        }
+    }
+    let id = |k: vec3u| {
+        var lo: u32 = 0
+        var hi: u32 = unique.len()
+        while lo + 1 < hi {
+            let mid = (lo + hi) / 2
+            if key_before(k, unique[mid]) {
+                hi = mid
+            } else {
+                lo = mid
+            }
+        }
+        lo
+    }
+    var edges: Vec<u64> = Vec::new()
+    for i in 0..tris.len() {
+        let v = [id(tris[i].a), id(tris[i].b), id(tris[i].c)]
+        for k in 0..3 {
+            let p = v[k]
+            let q = v[(k + 1) % 3]
+            edges.push((u64(min(p, q)) << 32) | u64(max(p, q)))
+        }
+    }
+    edges.sort_by(|x: u64, y: u64| x < y)
+    var open: u32 = 0
+    var i: u32 = 0
+    while i < edges.len() {
+        var j = i + 1
+        while j < edges.len() && edges[j] == edges[i] {
+            j += 1
+        }
+        let n = j - i
+        if (even && n % 2 != 0) || (!even && n != 2) {
+            open += 1
+        }
+        i = j
+    }
+    open
+}
+
+/// How many of `tris` face into `f`'s solid: their right-handed normal against `f`'s gradient at
+/// their centroid and at each of their corners (a triangle bridging a sharp crease may lean past
+/// one face's normal, but it still faces out of the other's; a triangle too small to have a
+/// direction is skipped).
+fn inward<M: Field<Substance>>(f: M, tris: Vec<Tri>) -> u32 {
+    var bad: u32 = 0
+    for i in 0..tris.len() {
+        let a = vec3(bitcast_f32(tris[i].a.x), bitcast_f32(tris[i].a.y), bitcast_f32(tris[i].a.z))
+        let b = vec3(bitcast_f32(tris[i].b.x), bitcast_f32(tris[i].b.y), bitcast_f32(tris[i].b.z))
+        let c = vec3(bitcast_f32(tris[i].c.x), bitcast_f32(tris[i].c.y), bitcast_f32(tris[i].c.z))
+        let n = cross(b - a, c - a)
+        if dot(n, n) > 1.0e-14 {
+            var faces_out = false
+            for p in [(a + b + c) * (1.0 / 3.0), a, b, c] {
+                let (_d, g) = value_and_gradient(|q: vec3| f.distance(q), p)
+                if dot(n, g) > 0.0 {
+                    faces_out = true
+                }
+            }
+            if !faces_out {
+                bad += 1
+            }
+        }
+    }
+    bad
+}
+
+/// Whether two triangle lists hold the same triangles, wound the same way, bit for bit.
+fn same_tris(x: Vec<Tri>, y: Vec<Tri>) -> bool {
+    if x.len() != y.len() {
+        return false
+    }
+    var cx: Vec<Tri> = Vec::new()
+    var cy: Vec<Tri> = Vec::new()
+    for i in 0..x.len() {
+        cx.push(canonical(x[i]))
+        cy.push(canonical(y[i]))
+    }
+    cx.sort_by(|p: Tri, q: Tri| tri_before(p, q))
+    cy.sort_by(|p: Tri, q: Tri| tri_before(p, q))
+    for i in 0..cx.len() {
+        if cx[i].a != cy[i].a || cx[i].b != cy[i].b || cx[i].c != cy[i].c {
+            return false
+        }
+    }
+    true
+}
+
+/// Meshes `f` at cell `cell` on the grid `sync_one` would, brick by brick, and holds the mesh to
+/// the solid: at least `least` triangles, closed (`manifold`: every edge 2 triangles'; else an
+/// even number, as Dual Contouring may pinch), none facing into the solid, and bit for bit the
+/// mesh of the whole grid meshed at once with every part live.
+fn held_to_solid<M: Field<Substance>>(name: Text, f: M, cell: f32, manifold: bool, least: u32) {
+    let g = grid_for(tight_aabb(f), cell, base_brick: 0, orig_id: 0)
+    let bricked = mesh_bricked(f, g)
+    print(f"{name}: {bricked.len()} triangles in {g.dims.x * g.dims.y * g.dims.z} bricks")
+    assert(bricked.len() >= least, f"{name}'s mesh has triangles")
+    let open = open_edges(bricked, even: !manifold)
+    assert(open == 0, f"{name}'s mesh has {open} open edges")
+    let bad = inward(f, bricked)
+    assert(bad == 0, f"{bad} of {name}'s triangles face into it")
+    assert(
+        same_tris(bricked, mesh_whole(f, g)),
+        f"{name} meshed in bricks isn't the whole grid's mesh",
+    )
+}
+
+@test
+fn a_vertexs_normal_and_flags_survive_packing() {
+    var worst = 1.0
+    for i in 0..400 {
+        // Directions over the whole sphere, the poles and the octahedron's folds among them.
+        let z = 1.0 - 2.0 * (f32(i) + 0.5) / 400.0
+        let r = sqrt(max(1.0 - z * z, 0.0))
+        let a = f32(i) * 2.39996323
+        let n = vec3(r * cos(a), r * sin(a), z)
+        let packed = pack_vertex_meta(
+            n,
+            i % THING_IDS,
+            smooth: (i & 1) != 0,
+            is_trans: (i & 2) != 0,
+        )
+        worst = min(worst, dot(unpack_oct_normal(packed), n))
+        assert(unpack_thing(packed) == i % THING_IDS, "the thing survives packing")
+        assert(unpack_smooth(packed) == ((i & 1) != 0), "the smooth flag survives packing")
+        assert(unpack_is_trans(packed) == ((i & 2) != 0), "the transmissive flag survives packing")
+    }
+    for n in [
+        vec3(0.0, 0.0, -1.0),
+        vec3(1.0, 0.0, 0.0),
+        vec3(0.0, -1.0, 0.0),
+        vec3(0.0, 0.0, 1.0),
+    ] {
+        worst = min(
+            worst,
+            dot(unpack_oct_normal(pack_vertex_meta(n, 0, smooth: true, is_trans: false)), n),
+        )
+    }
+    // 10 bits a component: within a quarter of a degree.
+    assert(
+        worst >= cos(0.25 * 3.14159265 / 180.0),
+        f"a normal comes back {acos(worst) * 180.0 / 3.14159265}° off",
+    )
+}
+
+@test
+fn neighbouring_bricks_share_their_halo_bit_for_bit() {
+    for cell in [0.1, 0.0137, 0.25, 0.005] {
+        let g = GridSpec {
+            origin: vec3(-3.71, 0.0193, 12.5),
+            cell,
+            dims: vec3u(64, 64, 64),
+            base_brick: 0,
+            orig_id: 0,
+            pad0: 0,
+            pad1: 0,
+            pad2: 0,
+        }
+        for b in 0..63 {
+            for c in 0..2 {
+                let mine = brick_corner(g, vec3u(b, b, b), vec3u(BRICK + c, BRICK + c, BRICK + c))
+                let next = brick_corner(g, vec3u(b + 1, b + 1, b + 1), vec3u(c, c, c))
+                assert(
+                    bits(mine) == bits(next),
+                    f"brick {b}'s halo corner {c} isn't its neighbour's at cell {cell}",
+                )
+            }
+        }
+    }
+}
+
+@test
+fn a_crease_cell_solves_onto_its_edge() {
+    let c = vec3(0.013, 0.021, 0.007)
+    let half = vec3(0.4, 0.3, 0.35)
+    let f = cuboid(half: half).translate(c)
+    // A cell holding the cube's `+x +y` edge, off the lattice of its faces.
+    let edge = vec2(c.x + half.x, c.y + half.y)
+    let h = 0.05
+    let lo = vec3(edge.x, edge.y, c.z) - vec3(0.31, 0.57, 0.44) * h
+    var v = [0.0; 8]
+    for k in 0..8 {
+        v[k] = f.distance(lo + corner_uvw(k) * h)
+    }
+    let d = CellCorners {
+        d000: v[0],
+        d100: v[1],
+        d010: v[2],
+        d110: v[3],
+        d001: v[4],
+        d101: v[5],
+        d011: v[6],
+        d111: v[7],
+    }
+    // Trilinear interpolation smears this edge's normals (0.96 apart): the exact gradient at the
+    // trilinear solution finds it (`hidden_crease`), and it is solved from exact Hermite data.
+    assert(!is_crease(trilinear_qef(d)), "the trilinear normals of this edge cell look smooth")
+    let (wp, _gv, q) = cell_dual_vertex(|p: vec3| f.distance(p), d, lo, h)
+    assert(q.min_dot < SMOOTH_DOT, "a cube's edge cell is solved and shaded as a crease")
+    let off = length(wp.xy - edge)
+    assert(off <= 0.02 * h, f"the edge cell's vertex {wp} is {off / h} cells off the edge")
+}
+
+@test
+fn a_skinned_vertex_is_projected_onto_its_own_sheet() {
+    // A slab 2 cm thick (`|y| < 0.01`): the near side of its top face and the far side.
+    let slab = |p: vec3| abs(p.y) - 0.01
+    let up = vec3(0.0, 1.0, 0.0)
+    let (top, n_top) = project_posed(slab, vec3(0.2, 0.004, -0.1), up)
+    assert(
+        abs(top.y - 0.01) <= 1.0e-4 && dot(n_top, up) > 0.99,
+        f"a vertex inside the top half goes to the top face, not {top}",
+    )
+    let (above, _n) = project_posed(slab, vec3(0.0, 0.05, 0.0), up)
+    assert(abs(above.y - 0.01) <= 1.0e-4, f"a vertex above goes down to the top face, not {above}")
+    // Past the middle the gradient faces the bottom: skinning's top-face vertex stays put rather
+    // than jump to the far sheet.
+    let (past, n_past) = project_posed(slab, vec3(0.0, -0.003, 0.0), up)
+    assert(
+        past.y == -0.003 && dot(n_past, up) > 0.99,
+        f"a top-face vertex past the middle jumped to {past}",
+    )
+}
+
+@test
+fn dual_quaternions_blend_the_short_way() {
+    let q = Quat::axis_angle(vec3(0.0, 1.0, 0.0), 1.2)
+    let a = DualQuat::from_qt(q, vec3(0.3, -0.2, 0.5))
+    // The same transform with its quaternions' signs flipped.
+    let b = DualQuat { real: -a.real, dual: -a.dual }
+    let bones = [a, b]
+    let p = vec3(0.4, 0.1, -0.7)
+    let want = a.apply_point(p)
+    // Bone 0 and bone 1 half each (`128 + 127`): the same transform, not a collapse to the origin.
+    let got = eval_dqs(bones, 0, 0 | (1 << 8), 128 | (127 << 8)).apply_point(p)
+    assert(length(got - want) <= 1.0e-5, f"an antipodal blend moves {p} to {got}, not {want}")
+}
+
+@test
+@fuel(2 ** 42)
+fn a_spheres_mesh_is_closed_faces_out_and_is_the_same_in_bricks() {
+    let f = sphere(radius: 0.5).translate(vec3(0.013, -0.021, 0.007)).with(lambert(vec3(0.5)))
+    held_to_solid("the sphere", f, 0.04, manifold: true, least: 2000)
+}
+
+@test
+@fuel(2 ** 43)
+fn a_rocks_mesh_is_closed_faces_out_and_is_the_same_in_bricks() {
+    // An oval cut by five planes and weathered by a noise: creases, and steep (octant culling).
+    let f = ellipsoid(vec3(0.55, 0.4, 0.45))
+        .intersect(half_space(vec3(0.3, 1.0, 0.1), 0.3))
+        .intersect(half_space(vec3(1.0, 0.2, -0.3), 0.42))
+        .intersect(half_space(vec3(-0.8, 0.3, 0.6), 0.36))
+        .intersect(half_space(vec3(0.1, -0.2, -1.0), 0.33))
+        .intersect(half_space(vec3(-0.2, 0.5, 1.0), 0.38))
+        .displace(fbm(freq: 5.0, octaves: 3, offset: vec3(1.0, 4.0, 2.0)), amp: 0.012)
+        .with(lambert(vec3(0.5)))
+    held_to_solid("the rock", f, 0.03, manifold: false, least: 2000)
+}
+
+@test
+@fuel(2 ** 43)
+fn a_blobs_mesh_is_closed_faces_out_and_is_the_same_in_bricks() {
+    // A body, a neck and a head, smoothly joined: parts each brick prunes.
+    let body = ellipsoid(vec3(0.62, 0.42, 0.42))
+    let neck = round_cone(vec3(0.35, 0.15, 0.0), vec3(0.75, 0.62, 0.0), r_top: 0.16, r_bottom: 0.1)
+    let head = sphere(radius: 0.2).translate(vec3(0.82, 0.72, 0.0))
+    let f = body.smooth_union(neck, k: 0.12).smooth_union(head, k: 0.08).with(lambert(vec3(0.5)))
+    held_to_solid("the blob", f, 0.03, manifold: true, least: 2000)
 }

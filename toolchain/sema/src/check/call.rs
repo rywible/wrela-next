@@ -3547,6 +3547,19 @@ impl<'p> Checker<'p> {
                     );
                     continue;
                 }
+                // 0 is the stream's "unstated" (booked at the step limit): a constant 0 says
+                // nothing a dispatch could mean, and is refused; one computed at run time is
+                // that, unstated (§18.7).
+                if self.const_u32(&a.value) == Some(0) {
+                    self.err(
+                        Diagnostic::new(
+                            codes::E0603,
+                            a.span,
+                            "`most: 0` states no groups at all, and 0 is an unstated `most:`",
+                        )
+                        .with_help("state the most groups the buffer can ask (1 or more), or leave `most:` out"),
+                    );
+                }
                 most = Some(e);
                 continue;
             }
@@ -3629,7 +3642,8 @@ impl<'p> Checker<'p> {
             && crate::gpu::writes_slots(self.p, f)
         {
             let row = |t: TyId, s: &Self| !matches!(s.kind(t), TyKind::Tuple(_) | TyKind::Adt(..));
-            if indirect || !row(groups.ty, self) || !row(o.ty, self) {
+            let (row_groups, row_origin) = (!indirect && row(groups.ty, self), row(o.ty, self));
+            if !crate::gpu::slots_part_is_one_row(self.p, f, over, row_groups, row_origin) {
                 self.err(crate::gpu::slots_in_parts(self.p, f, o.span));
             }
         }

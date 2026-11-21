@@ -55,6 +55,7 @@ pub(crate) fn recording<T>(f: impl FnOnce() -> T) -> T {
 }
 
 /// Runs `f`, counting its time as blocked on the GPU.
+#[cfg_attr(not(feature = "gpu"), allow(dead_code))]
 pub(crate) fn blocked<T>(f: impl FnOnce() -> T) -> T {
     let began = Instant::now();
     let out = f();
@@ -75,6 +76,7 @@ pub struct CpuFrame {
 }
 
 /// Times one frame: the counters are zeroed, `f` runs, and the frame's split is read.
+#[cfg_attr(not(feature = "gpu"), allow(dead_code))]
 pub(crate) fn frame<T>(frame: usize, f: impl FnOnce() -> T) -> (T, CpuFrame) {
     take();
     let began = Instant::now();
@@ -95,6 +97,7 @@ pub(crate) fn frame<T>(frame: usize, f: impl FnOnce() -> T) -> (T, CpuFrame) {
 }
 
 /// The counters since the last take (check, record, blocked, in nanoseconds), zeroed.
+#[cfg_attr(not(feature = "gpu"), allow(dead_code))]
 fn take() -> [u64; 3] {
     [&CHECK, &RECORD, &BLOCKED].map(|c| c.with(|c| c.replace(0)))
 }
@@ -105,15 +108,22 @@ mod tests {
 
     #[test]
     fn blocked_time_inside_record_counts_as_blocked() {
-        let ((), split) = frame(0, || {
+        // The recording's own wall time: what record and blocked split between them, whatever
+        // the sleeps took on a busy machine.
+        let (wall, split) = frame(0, || {
+            let began = Instant::now();
             recording(|| {
                 std::thread::sleep(Duration::from_millis(4));
                 blocked(|| std::thread::sleep(Duration::from_millis(10)));
             });
+            let wall = began.elapsed().as_secs_f64() * 1e3;
             checking(|| std::thread::sleep(Duration::from_millis(2)));
+            wall
         });
         assert!(split.blocked >= 10.0, "{split:?}");
-        assert!(split.record >= 4.0 && split.record < 9.0, "{split:?}");
+        assert!(split.record >= 4.0, "{split:?}");
+        // Counted once: as blocked, not as record too (that would be 10 ms more than the wall).
+        assert!(split.record + split.blocked <= wall + 0.01, "{split:?} in {wall} ms");
         assert!(split.check >= 2.0, "{split:?}");
         let sum = split.program + split.check + split.record + split.blocked;
         assert!((sum - split.total).abs() < 0.01, "{split:?}");

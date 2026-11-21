@@ -1245,8 +1245,10 @@ impl Ad<'_> {
             }
             B::Fract => d[0],
             B::Sqrt => {
+                // A length written out is a scalar's root; a vector's is a root per component.
                 if self.bounds
                     && d[0].is_some()
+                    && self.m.types.as_scalar(ty).is_some()
                     && let Some((terms, factor)) = self.sum_of_squares(a0)
                     && let Some(t) = self.root_of_squares(&terms, factor, k, ty, out)
                 {
@@ -1587,5 +1589,25 @@ mod tests {
         derive(&mut m, &mut DeriveCache::default(), id, vec![1], 1, Target::Cpu, Variant::Point)
             .expect("normalization is differentiable");
         verify(&m).expect("the derivative keeps the vector's component type");
+    }
+
+    /// `sqrt(x * x)` of a vector is a root per component, not a length: the bounded twin keeps
+    /// `sqrt`'s own rule for it, and its code is valid.
+    #[test]
+    fn a_vectors_root_of_its_squares_has_a_valid_bounded_derivative() {
+        let mut m = Module::default();
+        let ty = m.types.vector_of(Scalar::F32, 3);
+        let mut f = Function::new("root_of_squares", vec![Param::value("x", ty)], Some(ty));
+        let mut body = Vec::new();
+        let x = f.let_(&mut body, ty, Expr::Param(0));
+        let xx = f.let_(&mut body, ty, Expr::Binary(BinOp::Mul, x, x));
+        let r = f.let_(&mut body, ty, Expr::Builtin(Builtin::Sqrt, vec![xx]));
+        body.push(Stmt::Return(Some(r)));
+        f.body = body;
+        let id = m.add_function(f);
+        verify(&m).expect("the source is valid IR");
+        derive(&mut m, &mut DeriveCache::default(), id, vec![1], 1, Target::Cpu, Variant::Bounded)
+            .expect("a vector's root is differentiable");
+        verify(&m).expect("the bounded derivative of a vector's root is valid IR");
     }
 }

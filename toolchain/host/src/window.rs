@@ -270,8 +270,10 @@ impl App<'_> {
         Ok(())
     }
 
+    /// The run fails with `e`, unless it has failed already: the first failure is its cause,
+    /// and what fails after it (a resize of the window it left, say) only follows from it.
     fn fail(&mut self, e: Error, el: &ActiveEventLoop) {
-        self.failed = Some(e);
+        self.failed.get_or_insert(e);
         el.exit();
     }
 
@@ -334,6 +336,13 @@ impl ApplicationHandler<Arrival> for App<'_> {
         };
         let size = window.inner_size();
         self.size = (size.width.max(1), size.height.max(1));
+        // The refresh the system reports for the window's display, if it does: the pacer
+        // still learns the period from the frames shown, and tells by it gaps of several
+        // refreshes (frames slower than one) from one. No frame has been drawn yet.
+        let reported = window.current_monitor().and_then(|m| m.refresh_rate_millihertz());
+        if let Some(mhz) = reported.filter(|&mhz| mhz > 0) {
+            self.pacer = Pacer::of_display(1000.0 / f64::from(mhz));
+        }
         let handle: Arc<dyn wrela_gpu::Window> = window.clone();
         if let Err(e) = self.host.attach_window(handle, self.size.0, self.size.1, self.run.present)
         {

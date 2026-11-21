@@ -11,7 +11,7 @@
 
 use matter::sky::{Sky, seen}
 use matter::substance::{ONE_OVER_PI, Substance}
-use mesh::extract::{MeshVertex, eval_dqs, unpack_oct_normal, unpack_thing}
+use mesh::extract::{MeshVertex, eval_dqs, octa, unocta, unpack_oct_normal, unpack_thing}
 use mesh::sdf::{SdfGrid, sdf_local_shadow, sdf_soft_shadow, sdf_spec_hit}
 use picture::eye::View
 use picture::screen::luma
@@ -22,6 +22,7 @@ use std::gpu::{
     Texels, Texels3d, Texture, Texture3d, append_buffer, buffer, buffer_of, copy, dispatch, label,
     sampler, texture3d, writable_texture,
 }
+use std::hash::{Hasher, StateHash}
 use std::math::{PI, TAU}
 
 /// Shadow map resolution (square).
@@ -36,6 +37,11 @@ pub const SPEC0_SIDE: u32 = 128
 pub const SPEC1_SIDE: u32 = 32
 pub const SPEC2_SIDE: u32 = 16
 
+/// The perceptual roughness each specular level is prefiltered for (`spec0` is the mirror level).
+const SPEC0_ROUGH: f32 = 0.04
+const SPEC1_ROUGH: f32 = 0.35
+const SPEC2_ROUGH: f32 = 0.68
+
 /// Level-0 radiance volume resolution along each axis (`64×64×64` = 262,144 voxels).
 pub const RAD_SIDE: u32 = 64
 const RAD_VOXELS: u32 = 262144
@@ -46,41 +52,39 @@ pub const FOUR_PI: f32 = 12.5663706
 /// Reversed-Z near plane (m): `clip_z = NEAR`, `clip_w = z`, so `ndc_z = NEAR / z` in `(0, 1]`.
 pub const NEAR: f32 = 0.005
 
-/// Auto-extracted dynamic local emitters (`8×4×8 = 256` coarse spatial bins -> up to 32 active lights).
+/// Auto-extracted dynamic local emitters (`8×4×8 = 256` coarse spatial bins -> up to 32 active
+/// lights). A bin's words: the sums of its samples' quantized places (0..2), of their emission
+/// (3..5), their count (6), the largest quantized place (7..9) and the largest `4095 - place`
+/// (10..12) on each axis, so that zeroed words start every bound empty.
 const EMIT_CELLS: u32 = 256
-const EMIT_STRIDE: u32 = 8
+const EMIT_STRIDE: u32 = 16
 pub const MAX_EMITTERS: u32 = 32
+/// The brightest channel of emission (sky units) at which a surface starts to hand its emission
+/// from the radiance volume to a local light; by twice it, all of it.
 const EMIT_THRESH: f32 = 8.0
 const EMIT_SCALE: f32 = 16.0
-const MAX_ACTIVE_BINS: u32 = 64
+/// Quantization of a place within the radiance grid for the emitter bins (per axis).
+const EMIT_PLACES: f32 = 4095.0
 
 /// Screen-space emitter culling tile size in pixels (`16×16`).
 pub const TILE_SIZE: u32 = 16
 
 /// One auto-extracted dynamic local light harvested from emissive meshlets.
 pub struct Emitter: Copy + GpuData {
-    /// `(world_x, world_y, world_z, effective_radius_m)`.
+    /// `(world_x, world_y, world_z, r)`: its centre, and the radius (m) of the sphere that sends
+    /// the same light on average (`pi r^2` is its mean projected area).
     pub pos_r: vec4,
-    /// `(radiance_r, radiance_g, radiance_b, area_weight)`.
+    /// `(flux_r, flux_g, flux_b, bound)`: its radiance times its mean projected area (so the
+    /// irradiance `d` m away is `flux / d^2`), and the radius (m) of a sphere about its centre
+    /// that holds all of it.
     pub flux_w: vec4,
 }
 
-/// Folds a unit direction vector onto an octahedron in `[-1, 1]²`.
-pub fn octa(n: vec3) -> vec2 {
-    let a = n / (abs(n.x) + abs(n.y) + abs(n.z))
-    if a.y >= 0.0 {
-        return a.xz
-    }
-    (vec2(1.0) - abs(vec2(a.z, a.x))) * vec2(if a.x >= 0.0 { 1.0 } else { -1.0 }, if a.z >= 0.0 { 1.0 } else { -1.0 })
-}
-
-/// Unfolds an octahedral coordinate in `[-1, 1]²` back to a unit direction vector.
-pub fn unocta(e: vec2) -> vec3 {
-    var v = vec3(e.x, 1.0 - abs(e.x) - abs(e.y), e.y)
-    let t = max(-v.y, 0.0)
-    v.x += if v.x >= 0.0 { -t } else { t }
-    v.z += if v.z >= 0.0 { -t } else { t }
-    normalize(v)
+/// A direction in the sky maps' frame, and back (it is its own inverse): the sky's up (+y) on the
+/// octahedron's pole, so the whole upper hemisphere is the map's inner square and its fold lies
+/// on the horizon, below which the sky changes slowly.
+fn sky_frame(d: vec3) -> vec3 {
+    vec3(d.x, d.z, d.y)
 }
 
 /// Builds an orthonormal tangent frame `(u, v)` around unit vector `n` (Duff et al. 2017).
@@ -113,8 +117,8 @@ pub fn hg_phase(cos_t: f32, g: f32) -> f32 {
     (1.0 - g2) / (FOUR_PI * denom * sqrt(denom))
 }
 
-/// Encodes `(metallic, ior, coat, subsurface)` as a linear signed float for the premultiplied
-/// `Rgba16Float` G-buffer so resolve stays uncorrupted by empty sky samples (`0.0`):
+/// Encodes `(metallic, ior, coat, subsurface)` as one signed float in the `w` of the 1× G-buffer's
+/// `Rgba16Float` emission target (`0.0`, the target's clear, is also what an empty sky pixel holds):
 ///   `0.0`           -> pure matte `lambert` (`abs(code) < 0.01`)
 ///   `[-1.0, -0.02]` -> metallic conductor (`metallic = -code`)
 ///   `[0.02, 1.02]`  -> dielectric (`ior = 1.5`, `coat = max(code - 0.02, 0.0)`)
@@ -163,7 +167,7 @@ pub fn skylit<S: Sky>(sky: S, out: mut Texels<Rgba16Float>, id: GlobalId) {
     if id.x >= TABLE || id.y >= TABLE {
         return
     }
-    let n = unocta(vec2(f32(id.x), f32(id.y)) / f32(TABLE - 1) * 2.0 - vec2(1.0))
+    let n = sky_frame(unocta(vec2(f32(id.x), f32(id.y)) / f32(TABLE - 1) * 2.0 - vec2(1.0)))
     let (u, v) = basis(n)
     var sum = vec3(0.0)
     for i in 0..(GATHER * GATHER) {
@@ -190,12 +194,18 @@ fn van_der_corput(bits_in: u32) -> f32 {
 /// texture of side `side` (runs only when the sky changes; 0 ms/frame when static).
 @compute(8, 8)
 @budget(work: 80000)
-pub fn sky_spec<S: Sky>(sky: S, side: u32, roughness: f32, out: mut Texels<Rgba16Float>, id: GlobalId) {
+pub fn sky_spec<S: Sky>(
+    sky: S,
+    side: u32,
+    roughness: f32,
+    out: mut Texels<Rgba16Float>,
+    id: GlobalId,
+) {
     if id.x >= side || id.y >= side {
         return
     }
-    let n = unocta(vec2(f32(id.x), f32(id.y)) / f32(side - 1) * 2.0 - vec2(1.0))
-    if roughness <= 0.06 {
+    let n = sky_frame(unocta(vec2(f32(id.x), f32(id.y)) / f32(side - 1) * 2.0 - vec2(1.0)))
+    if roughness <= SPEC0_ROUGH {
         // Mirror level: direct sky evaluation (excluding raw sun disc so direct sun specular isn't
         // double-counted, while keeping atmospheric Mie corona and horizon glow razor sharp).
         out.store(id, vec4(sky.light(n), 1.0))
@@ -232,8 +242,7 @@ pub struct SkyCache {
     pub spec1: Texture<Rgba16Float>,
     pub spec2: Texture<Rgba16Float>,
     pub s: Sampler,
-    sun_way: vec3,
-    sun_light: vec3,
+    key: u64,
     ready: bool,
 }
 
@@ -245,42 +254,54 @@ pub fn sky_cache() -> SkyCache {
         spec1: writable_texture(width: SPEC1_SIDE, height: SPEC1_SIDE),
         spec2: writable_texture(width: SPEC2_SIDE, height: SPEC2_SIDE),
         s: sampler(filter: Filter::Linear, address: Address::Clamp),
-        sun_way: vec3(0.0),
-        sun_light: vec3(0.0),
+        key: 0,
         ready: false,
     }
 }
 
 impl SkyCache {
+    /// The hash of the sky its maps were made from ([`sky_key`]): what light from the sky
+    /// depends on.
+    pub fn key(self) -> u64 {
+        self.key
+    }
+
     /// Recomputes sky irradiance and specular PMREM only when `sky` changes (0 ms/frame when static).
     pub fn sync<S: Sky>(mut self, sky: S) {
-        let sun = sky.sun()
-        if self.ready && length(sun.way - self.sun_way) <= 1.0e-6 && length(sun.light - self.sun_light) <= 1.0e-5 {
+        let key = sky_key(sky)
+        if self.ready && key == self.key {
             return
         }
         label("mesh_sky")
         dispatch(skylit.bind(sky: sky, out: mut self.diff), over: (TABLE, TABLE))
         dispatch(
-            sky_spec.bind(sky: sky, side: SPEC0_SIDE, roughness: 0.04, out: mut self.spec0),
+            sky_spec.bind(sky: sky, side: SPEC0_SIDE, roughness: SPEC0_ROUGH, out: mut self.spec0),
             over: (SPEC0_SIDE, SPEC0_SIDE),
         )
         dispatch(
-            sky_spec.bind(sky: sky, side: SPEC1_SIDE, roughness: 0.35, out: mut self.spec1),
+            sky_spec.bind(sky: sky, side: SPEC1_SIDE, roughness: SPEC1_ROUGH, out: mut self.spec1),
             over: (SPEC1_SIDE, SPEC1_SIDE),
         )
         dispatch(
-            sky_spec.bind(sky: sky, side: SPEC2_SIDE, roughness: 0.68, out: mut self.spec2),
+            sky_spec.bind(sky: sky, side: SPEC2_SIDE, roughness: SPEC2_ROUGH, out: mut self.spec2),
             over: (SPEC2_SIDE, SPEC2_SIDE),
         )
-        self.sun_way = sun.way
-        self.sun_light = sun.light
+        self.key = key
         self.ready = true
     }
 }
 
+/// What the cached maps depend on: the sky's own state (`Sky: StateHash`), so any change of the
+/// sky (another sky, its sun, its ground, its haze, its brightness) rebuilds them.
+fn sky_key<S: Sky>(sky: S) -> u64 {
+    var h = Hasher::new()
+    sky.state_hash(mut h)
+    h.finish()
+}
+
 /// Reads an octahedral map of resolution `side` at direction `d`.
 fn sample_octa(tex: Texture<Rgba16Float>, s: Sampler, d: vec3, side: u32) -> vec3 {
-    let e = octa(d) * 0.5 + vec2(0.5)
+    let e = octa(sky_frame(d)) * 0.5 + vec2(0.5)
     let fside = f32(side)
     tex.sample_level(s, (e * (fside - 1.0) + vec2(0.5)) / fside, 0.0).xyz
 }
@@ -313,19 +334,19 @@ pub fn sky_specular(
     roughness: f32,
 ) -> vec3 {
     let r = clamp(roughness, 0.0, 1.0)
-    if r <= 0.35 {
-        let t = r / 0.35
+    if r <= SPEC1_ROUGH {
+        let t = clamp((r - SPEC0_ROUGH) / (SPEC1_ROUGH - SPEC0_ROUGH), 0.0, 1.0)
         let a = sample_octa(spec0, s, refl, SPEC0_SIDE)
         let b = sample_octa(spec1, s, refl, SPEC1_SIDE)
         return mix(a, b, vec3(t))
     }
-    if r <= 0.68 {
-        let t = (r - 0.35) / 0.33
+    if r <= SPEC2_ROUGH {
+        let t = (r - SPEC1_ROUGH) / (SPEC2_ROUGH - SPEC1_ROUGH)
         let a = sample_octa(spec1, s, refl, SPEC1_SIDE)
         let b = sample_octa(spec2, s, refl, SPEC2_SIDE)
         return mix(a, b, vec3(t))
     }
-    let t = (r - 0.68) / 0.32
+    let t = (r - SPEC2_ROUGH) / (1.0 - SPEC2_ROUGH)
     let a = sample_octa(spec2, s, refl, SPEC2_SIDE)
     let b = sample_octa(diff, s, refl, TABLE) * ONE_OVER_PI
     mix(a, b, vec3(t))
@@ -491,13 +512,7 @@ pub fn sun_shadow_hybrid(
 
 /// Short screen-space micro-contact shadow along `sun_way` against resolved reversed-Z depth
 /// (grounds boots, wands, and small props in the final 1..16 cm where shadow maps bias away).
-pub fn contact_shadow(
-    v: View,
-    depth: DepthTexture,
-    wp: vec3,
-    n: vec3,
-    sun_way: vec3,
-) -> f32 {
+pub fn contact_shadow(v: View, depth: DepthTexture, wp: vec3, n: vec3, sun_way: vec3) -> f32 {
     let ndl = dot(n, sun_way)
     if ndl <= 0.05 {
         return 1.0
@@ -598,7 +613,10 @@ pub fn trace_ssr(
         let p = p0 + refl * mid
         let rel = p - v.at
         let z = max(dot(rel, v.forward), 0.05)
-        let uv = vec2((dot(rel, v.right) * v.focal * aspect) / z * 0.5 + 0.5, 0.5 - (dot(rel, v.up) * v.focal) / z * 0.5)
+        let uv = vec2(
+            (dot(rel, v.right) * v.focal * aspect) / z * 0.5 + 0.5,
+            0.5 - (dot(rel, v.up) * v.focal) / z * 0.5,
+        )
         let smp = hdr_bg.sample_level(bg_s, clamp(uv, vec2(0.002), vec2(0.998)), 0.0)
         if length(rel) > smp.w + 0.02 {
             hi = mid
@@ -649,7 +667,12 @@ pub fn sun_shadow(
 }
 
 /// Single-tap sun visibility lookup for volumetrics and voxel injection (no normal offset).
-pub fn sun_vis_point(shadow_map: DepthTexture, cmp: ComparisonSampler, sv: ShadowView, wp: vec3) -> f32 {
+pub fn sun_vis_point(
+    shadow_map: DepthTexture,
+    cmp: ComparisonSampler,
+    sv: ShadowView,
+    wp: vec3,
+) -> f32 {
     let s = sv.project(wp)
     if abs(s.x) >= 0.999 || abs(s.y) >= 0.999 || s.z <= 0.0 || s.z >= 1.0 {
         return 1.0
@@ -694,17 +717,27 @@ fn clear_u32(n: u32, buf: mut Slots<u32>, id: GlobalId) {
     buf[id] = 0
 }
 
-/// Adds radiance `outgoing` at grid coordinate `uvw` (in `[0, 1)³`) to its voxel in `accum` and,
-/// when `peak > thresh`, emission `emits` to its coarse `8×4×8` emitter bin in `emit_accum`.
+/// How much of a surface's emission a local light carries instead of the radiance volume, by its
+/// brightest channel: none below `EMIT_THRESH`, all from twice it, smoothly between, so the light
+/// is never counted twice and never pops on as a glow brightens.
+fn emitter_share(peak: f32) -> f32 {
+    smoothstep(EMIT_THRESH, 2.0 * EMIT_THRESH, peak)
+}
+
+/// Adds a sample at grid coordinate `uvw` (in `[0, 1)³`) that reflects `reflected` and emits
+/// `emits`: to its voxel in `accum` its reflected light and the share of its emission no local
+/// light carries, and the rest of its emission, its place and its bounds to its coarse `8×4×8`
+/// emitter bin in `emit_accum`.
 pub fn deposit(
     uvw: vec3,
-    outgoing: vec3,
+    reflected: vec3,
     emits: vec3,
-    peak: f32,
-    thresh: f32,
     accum: mut Atomics<u32>,
     emit_accum: mut Atomics<u32>,
 ) {
+    let peak = max(emits.x, max(emits.y, emits.z))
+    let share = emitter_share(peak)
+    let outgoing = reflected + emits * (1.0 - share)
     let vx = min(u32(uvw.x * f32(RAD_SIDE)), RAD_SIDE - 1)
     let vy = min(u32(uvw.y * f32(RAD_SIDE)), RAD_SIDE - 1)
     let vz = min(u32(uvw.z * f32(RAD_SIDE)), RAD_SIDE - 1)
@@ -717,17 +750,19 @@ pub fn deposit(
     let _ = accum.add(idx + 2, b)
     let _ = accum.add(idx + 3, 1)
 
-    if peak > thresh {
+    if share > 0.0 {
+        let carried = emits * share
         let ex = min(u32(uvw.x * 8.0), 7)
         let ey = min(u32(uvw.y * 4.0), 3)
         let ez = min(u32(uvw.z * 8.0), 7)
         let eidx = (ex + (ey << 3) + (ez << 5)) * EMIT_STRIDE
-        let qx = u32(clamp(uvw.x * 4095.0, 0.0, 4095.0))
-        let qy = u32(clamp(uvw.y * 4095.0, 0.0, 4095.0))
-        let qz = u32(clamp(uvw.z * 4095.0, 0.0, 4095.0))
-        let er = u32(clamp(emits.x * EMIT_SCALE, 0.0, 65535.0))
-        let eg = u32(clamp(emits.y * EMIT_SCALE, 0.0, 65535.0))
-        let eb = u32(clamp(emits.z * EMIT_SCALE, 0.0, 65535.0))
+        let qx = u32(clamp(uvw.x * EMIT_PLACES, 0.0, EMIT_PLACES))
+        let qy = u32(clamp(uvw.y * EMIT_PLACES, 0.0, EMIT_PLACES))
+        let qz = u32(clamp(uvw.z * EMIT_PLACES, 0.0, EMIT_PLACES))
+        let er = u32(clamp(carried.x * EMIT_SCALE, 0.0, 65535.0))
+        let eg = u32(clamp(carried.y * EMIT_SCALE, 0.0, 65535.0))
+        let eb = u32(clamp(carried.z * EMIT_SCALE, 0.0, 65535.0))
+        let top = u32(EMIT_PLACES)
         let _ = emit_accum.add(eidx, qx)
         let _ = emit_accum.add(eidx + 1, qy)
         let _ = emit_accum.add(eidx + 2, qz)
@@ -735,6 +770,12 @@ pub fn deposit(
         let _ = emit_accum.add(eidx + 4, eg)
         let _ = emit_accum.add(eidx + 5, eb)
         let _ = emit_accum.add(eidx + 6, 1)
+        let _ = emit_accum.max(eidx + 7, qx)
+        let _ = emit_accum.max(eidx + 8, qy)
+        let _ = emit_accum.max(eidx + 9, qz)
+        let _ = emit_accum.max(eidx + 10, top - qx)
+        let _ = emit_accum.max(eidx + 11, top - qy)
+        let _ = emit_accum.max(eidx + 12, top - qz)
     }
 }
 
@@ -753,6 +794,7 @@ fn rad_inject_sample<S: Sky>(
     shadow_map: DepthTexture,
     cmp: ComparisonSampler,
     prev_rad1: Texture3d<Rgba16Float>,
+    prev_grid: RadGrid,
     rad_s: Sampler,
     accum: mut Atomics<u32>,
     emit_accum: mut Atomics<u32>,
@@ -768,18 +810,20 @@ fn rad_inject_sample<S: Sky>(
     let vis = if ndl > 0.0 { sun_shadow(shadow_map, cmp, sv, wp, normal) } else { 0.0 }
     let direct = sun.light * (ndl * vis)
 
-    let sample_uvw = clamp(((wp + normal * (grid.voxel * 1.5)) - grid.origin) * grid.inv_span, vec3(0.01), vec3(0.99))
-    let prev = prev_rad1.sample_level(rad_s, sample_uvw, 0.0)
+    // Last build's volume, read where it was laid out (`prev_grid`): the grid follows the eye, and
+    // a place outside the last grid has nothing known yet.
+    let prev_p = ((wp + normal * (grid.voxel * 1.5)) - prev_grid.origin) * prev_grid.inv_span
+    let prev_lo = min(prev_p.x, min(prev_p.y, prev_p.z))
+    let prev_hi = max(prev_p.x, max(prev_p.y, prev_p.z))
+    let prev_inside = prev_grid.enabled != 0 && prev_lo >= 0.0 && prev_hi <= 1.0
+    let prev = if prev_inside {
+        prev_rad1.sample_level(rad_s, clamp(prev_p, vec3(0.01), vec3(0.99)), 0.0)
+    } else { vec4(0.0) }
     let sky_est = sky_irradiance(sky_table, sky_s, normal) * (1.0 - clamp(prev.w, 0.0, 0.85))
     let bounce_prev = prev.xyz * PI * 0.75
 
-    // Attenuate raw emission slightly in the voxel bounce grid because auto-extracted local
-    // emitters deliver crisp direct illumination & specular; keeps multi-bounce GI natural.
-    let emits = sub.emits
-    let emit_peak = max(emits.x, max(emits.y, emits.z))
-    let emit_bounce = if emit_peak > EMIT_THRESH { emits * 0.55 } else { emits }
-    let outgoing = emit_bounce + sub.albedo * ONE_OVER_PI * (direct + sky_est * 0.5 + bounce_prev)
-    deposit(uvw, outgoing, emits, emit_peak, EMIT_THRESH, mut accum, mut emit_accum)
+    let reflected = sub.albedo * ONE_OVER_PI * (direct + sky_est * 0.5 + bounce_prev)
+    deposit(uvw, reflected, sub.emits, mut accum, mut emit_accum)
 }
 
 /// Maximum radiance-injection vertex samples per batch (keeps instanced crowds within <0.2 ms
@@ -814,6 +858,7 @@ fn rad_inject_one<M: Field<Substance>, S: Sky>(
     shadow_map: DepthTexture,
     cmp: ComparisonSampler,
     prev_rad1: Texture3d<Rgba16Float>,
+    prev_grid: RadGrid,
     rad_s: Sampler,
     accum: mut Atomics<u32>,
     emit_accum: mut Atomics<u32>,
@@ -840,8 +885,21 @@ fn rad_inject_one<M: Field<Substance>, S: Sky>(
     let nrm = xf.apply_normal(unpack_oct_normal(vert.packed))
     let sub = field.channels(wp)
     rad_inject_sample(
-        wp, nrm, sub, grid, sv, sky, sky_table, sky_s, shadow_map, cmp, prev_rad1, rad_s,
-        mut accum, mut emit_accum,
+        wp,
+        nrm,
+        sub,
+        grid,
+        sv,
+        sky,
+        sky_table,
+        sky_s,
+        shadow_map,
+        cmp,
+        prev_rad1,
+        prev_grid,
+        rad_s,
+        mut accum,
+        mut emit_accum,
     )
 }
 
@@ -866,6 +924,7 @@ fn rad_inject_many<M: Field<Substance>, S: Sky>(
     shadow_map: DepthTexture,
     cmp: ComparisonSampler,
     prev_rad1: Texture3d<Rgba16Float>,
+    prev_grid: RadGrid,
     rad_s: Sampler,
     accum: mut Atomics<u32>,
     emit_accum: mut Atomics<u32>,
@@ -894,62 +953,21 @@ fn rad_inject_many<M: Field<Substance>, S: Sky>(
     let tid = min(raw_tid, n_fields - 1)
     let sub = fields[tid].channels(wp)
     rad_inject_sample(
-        wp, nrm, sub, grid, sv, sky, sky_table, sky_s, shadow_map, cmp, prev_rad1, rad_s,
-        mut accum, mut emit_accum,
-    )
-}
-
-/// Injects one `Skinned` `One<M>` batch's vertices into the radiance volume via GPU Dual Quaternion Skinning.
-@compute(64)
-fn rad_inject_skin_one<M: Field<Substance>, S: Sky>(
-    field: M,
-    verts: [MeshVertex],
-    skin: [u32],
-    vert_count: [u32],
-    cap_verts: u32,
-    stride: u32,
-    xforms: [Rigid],
-    bones: [DualQuat],
-    bone_stride: u32,
-    inst_count: u32,
-    grid: RadGrid,
-    sv: ShadowView,
-    sky: S,
-    sky_table: Texture<Rgba16Float>,
-    sky_s: Sampler,
-    shadow_map: DepthTexture,
-    cmp: ComparisonSampler,
-    prev_rad1: Texture3d<Rgba16Float>,
-    rad_s: Sampler,
-    accum: mut Atomics<u32>,
-    emit_accum: mut Atomics<u32>,
-    id: GlobalId,
-) {
-    let n = min(vert_count[0], cap_verts)
-    let st = max(stride, 1)
-    let per_inst = (n + st - 1) / st
-    if per_inst == 0 || inst_count == 0 {
-        return
-    }
-    let inst = id.x / per_inst
-    let vi = (id.x - inst * per_inst) * st
-    if inst >= inst_count || vi >= n {
-        return
-    }
-    let xf = xforms[inst]
-    let vert = verts[vi]
-    let lp = vec3(vert.px, vert.py, vert.pz)
-    let dq = eval_dqs(bones, inst * bone_stride, skin[vi * 2], skin[vi * 2 + 1])
-    let wp = xf.apply_point(dq.apply_point(lp))
-    let uvw = (wp - grid.origin) * grid.inv_span
-    if uvw.x < 0.0 || uvw.x >= 1.0 || uvw.y < 0.0 || uvw.y >= 1.0 || uvw.z < 0.0 || uvw.z >= 1.0 {
-        return
-    }
-    let nrm = xf.apply_normal(dq.apply_normal(unpack_oct_normal(vert.packed)))
-    let sub = field.rest_channels(lp)
-    rad_inject_sample(
-        wp, nrm, sub, grid, sv, sky, sky_table, sky_s, shadow_map, cmp, prev_rad1, rad_s,
-        mut accum, mut emit_accum,
+        wp,
+        nrm,
+        sub,
+        grid,
+        sv,
+        sky,
+        sky_table,
+        sky_s,
+        shadow_map,
+        cmp,
+        prev_rad1,
+        prev_grid,
+        rad_s,
+        mut accum,
+        mut emit_accum,
     )
 }
 
@@ -976,6 +994,7 @@ fn rad_inject_skin_many<M: Field<Substance>, S: Sky>(
     shadow_map: DepthTexture,
     cmp: ComparisonSampler,
     prev_rad1: Texture3d<Rgba16Float>,
+    prev_grid: RadGrid,
     rad_s: Sampler,
     accum: mut Atomics<u32>,
     emit_accum: mut Atomics<u32>,
@@ -1005,110 +1024,116 @@ fn rad_inject_skin_many<M: Field<Substance>, S: Sky>(
     let tid = min(inst_ids[inst], n_fields - 1)
     let sub = fields[tid].rest_channels(lp)
     rad_inject_sample(
-        wp, nrm, sub, grid, sv, sky, sky_table, sky_s, shadow_map, cmp, prev_rad1, rad_s,
-        mut accum, mut emit_accum,
+        wp,
+        nrm,
+        sub,
+        grid,
+        sv,
+        sky,
+        sky_table,
+        sky_s,
+        shadow_map,
+        cmp,
+        prev_rad1,
+        prev_grid,
+        rad_s,
+        mut accum,
+        mut emit_accum,
     )
 }
 
-/// Parallel filter over the `8×4×8 = 256` coarse emitter bins: appends only non-empty bins so
-/// `emit_compact` merges only occupied bins instead of scanning all 256 on one thread.
-@compute(64)
-fn emit_collect(
-    emit_accum: [u32],
-    active_bins: mut Append<u32>,
-    id: GlobalId,
-) {
-    if id.x >= EMIT_CELLS {
-        return
-    }
-    if emit_accum[id.x * EMIT_STRIDE + 6] > 0 {
-        let _ = active_bins.push(id.x)
-    }
-}
-
-/// Compacts and spatially merges occupied coarse emissive bins (`active_bins`) into at most
-/// `MAX_EMITTERS` deduplicated dynamic lights so lights straddling a grid boundary stay ONE
-/// energy-conserving emitter with zero boundary popping.
+/// Merges the occupied coarse emissive bins, in bin order (so the same bins always give the same
+/// lights), into at most `MAX_EMITTERS` lights: a light straddling bins stays one light. Each
+/// bin's light is its mean carried radiance over the mean projected area of its samples' bounding
+/// box (a convex body's mean projected area is a quarter of its surface, Cauchy's formula; a box
+/// of half-extents `a, b, c` is taken as the ellipsoid inside it, surface `4π(ab + bc + ca) / 3`),
+/// and merged lights add their fluxes.
 @compute(1)
 @budget(work: 64000)
-fn emit_compact(
-    emit_accum: [u32],
-    active_bins: [u32],
-    active_count: [u32],
-    grid: RadGrid,
-    out: mut Append<Emitter>,
-    id: GlobalId,
-) {
+fn emit_compact(emit_accum: [u32], grid: RadGrid, out: mut Append<Emitter>, id: GlobalId) {
     let _ = id
-    let n_bins = min(active_count[0], MAX_ACTIVE_BINS)
-    if n_bins == 0 {
-        return
-    }
     let span = 1.0 / max(grid.inv_span, 1.0e-6)
-    let base_r = clamp(grid.voxel * 0.75, 0.24, 0.42)
+    let to_m = span / EMIT_PLACES
     let merge_d = max(grid.voxel * 4.5, 1.45)
     let merge_r2 = merge_d * merge_d
 
     var pos_acc = [vec3(0.0); 32]
-    var emit_acc = [vec3(0.0); 32]
+    var flux_acc = [vec3(0.0); 32]
+    var r2_acc = [0.0; 32]
     var w_acc = [0.0; 32]
-    var n_cells = [0.0; 32]
+    var lo_acc = [vec3(0.0); 32]
+    var hi_acc = [vec3(0.0); 32]
     var count: u32 = 0
 
-    for bi in 0..n_bins {
-        let cell = active_bins[bi]
+    for cell in 0..EMIT_CELLS {
         let base = cell * EMIT_STRIDE
         let cnt = emit_accum[base + 6]
         if cnt == 0 {
             continue
         }
         let inv_cnt = 1.0 / f32(cnt)
-        let uvw = vec3(
-            f32(emit_accum[base]) * inv_cnt,
-            f32(emit_accum[base + 1]) * inv_cnt,
-            f32(emit_accum[base + 2]) * inv_cnt,
-        ) / 4095.0
-        let pos = grid.origin + uvw * span
+        let q = vec3(f32(emit_accum[base]), f32(emit_accum[base + 1]), f32(emit_accum[base + 2])) *
+            inv_cnt
+        let pos = grid.origin + q * to_m
         let avg_e = vec3(
             f32(emit_accum[base + 3]),
             f32(emit_accum[base + 4]),
             f32(emit_accum[base + 5]),
-        ) * (inv_cnt / EMIT_SCALE)
-        let w = max(avg_e.x, max(avg_e.y, avg_e.z))
+        ) *
+            (inv_cnt / EMIT_SCALE)
+        // The bounding box of the bin's samples, one quantum wider so a lone sample has a size.
+        let q_hi = vec3(
+            f32(emit_accum[base + 7]),
+            f32(emit_accum[base + 8]),
+            f32(emit_accum[base + 9]),
+        )
+        let q_lo = vec3(EMIT_PLACES) -
+            vec3(f32(emit_accum[base + 10]), f32(emit_accum[base + 11]), f32(emit_accum[base + 12]))
+        let lo = grid.origin + q_lo * to_m
+        let hi = grid.origin + (q_hi + vec3(1.0)) * to_m
+        let ext = 0.5 * (hi - lo)
+        let r2 = (ext.x * ext.y + ext.y * ext.z + ext.z * ext.x) / 3.0
+        let flux = avg_e * (PI * r2)
+        let w = max(flux.x, max(flux.y, flux.z))
+        if w <= 0.0 {
+            continue
+        }
 
         var merged = false
         for k in 0..count {
-            let cur_pos = pos_acc[k] / max(w_acc[k], 1.0e-5)
+            let cur_pos = pos_acc[k] / max(w_acc[k], 1.0e-12)
             let d = pos - cur_pos
             if dot(d, d) <= merge_r2 {
                 pos_acc[k] += pos * w
-                emit_acc[k] += avg_e * w
+                flux_acc[k] += flux
+                r2_acc[k] += r2
                 w_acc[k] += w
-                n_cells[k] += 1.0
+                lo_acc[k] = min(lo_acc[k], lo)
+                hi_acc[k] = max(hi_acc[k], hi)
                 merged = true
                 break
             }
         }
         if !merged && count < MAX_EMITTERS {
             pos_acc[count] = pos * w
-            emit_acc[count] = avg_e * w
+            flux_acc[count] = flux
+            r2_acc[count] = r2
             w_acc[count] = w
-            n_cells[count] = 1.0
+            lo_acc[count] = lo
+            hi_acc[count] = hi
             count += 1
         }
     }
 
     for k in 0..count {
-        let inv_w = 1.0 / max(w_acc[k], 1.0e-5)
-        let pos = pos_acc[k] * inv_w
-        let avg_e = emit_acc[k] * inv_w
-        let scale = clamp(1.0 + (sqrt(n_cells[k]) - 1.0) * 0.45, 1.0, 1.55)
-        let eff_r = base_r * scale
-        let area_w = PI * eff_r * eff_r * 1.25
-        let _ = out.push(Emitter {
-            pos_r: vec4(pos, eff_r),
-            flux_w: vec4(avg_e * area_w, 1.0),
-        })
+        let pos = pos_acc[k] / max(w_acc[k], 1.0e-12)
+        let bound = length(max(hi_acc[k] - pos, pos - lo_acc[k]))
+        let _ = out.push(
+            Emitter {
+                pos_r: vec4(pos, sqrt(r2_acc[k])),
+                flux_w: vec4(flux_acc[k], bound),
+            },
+        )
     }
 }
 
@@ -1189,7 +1214,12 @@ fn emitter_vis(
         let t = start_t + f * span
         let p = p0 + dir * t
         let uvw = (p - grid.origin) * grid.inv_span
-        if uvw.x <= 0.01 || uvw.x >= 0.99 || uvw.y <= 0.01 || uvw.y >= 0.99 || uvw.z <= 0.01 || uvw.z >= 0.99 {
+        if uvw.x <= 0.01 ||
+            uvw.x >= 0.99 ||
+            uvw.y <= 0.01 ||
+            uvw.y >= 0.99 ||
+            uvw.z <= 0.01 ||
+            uvw.z >= 0.99 {
             break
         }
         let smp = rad1.sample_level(s, uvw, 0.0)
@@ -1205,7 +1235,14 @@ fn emitter_vis(
 
 /// Prepares indirect dispatch args for a 64-wide strided instanced pass (`rad_inject`).
 @compute(1)
-fn prep_rad_list(count: [u32], cap: u32, stride: u32, inst_count: u32, args: mut One<DispatchArgs>, id: GlobalId) {
+fn prep_rad_list(
+    count: [u32],
+    cap: u32,
+    stride: u32,
+    inst_count: u32,
+    args: mut One<DispatchArgs>,
+    id: GlobalId,
+) {
     let st = max(stride, 1)
     let n = ((min(count[0], cap) + st - 1) / st) * inst_count
     args.set(id, DispatchArgs { x: (n + 63) / 64, y: 1, z: 1 })
@@ -1256,7 +1293,8 @@ fn cull_tile_emitters(
     let sin_cone = max(
         max(length(r00 - center_ray), length(r10 - center_ray)),
         max(length(r01 - center_ray), length(r11 - center_ray)),
-    ) * 1.05
+    ) *
+        1.05
 
     var mask: u32 = 0
     for i in 0..n_emit {
@@ -1320,12 +1358,13 @@ pub fn eval_emitters_tiled(
         let to_l = em.pos_r.xyz - wp
         let d2 = dot(to_l, to_l)
         let r = em.pos_r.w
+        let bound = em.flux_w.w
         if d2 < 1.0e-5 {
             continue
         }
-        // A glowing surface inside an emitter's own sphere is part of that emitter: the light it
-        // gives is already its emission, so it is never lit by itself (however dim its glow).
-        if d2 < r * r * 1.15 && max(sub.emits.x, max(sub.emits.y, sub.emits.z)) > 1.0e-3 {
+        // A glowing surface inside an emitter's bound is part of that emitter: the light it gives
+        // is already its emission, so it is never lit by itself (however dim its glow).
+        if d2 < bound * bound * 1.1 && max(sub.emits.x, max(sub.emits.y, sub.emits.z)) > 1.0e-3 {
             continue
         }
         let d = sqrt(d2)
@@ -1341,9 +1380,9 @@ pub fn eval_emitters_tiled(
         }
         let vis = if peak_i >= 0.085 {
             if sdf_grid.enabled != 0 {
-                sdf_local_shadow(sdf_grid, sdf0, sdf1, sdf_s, wp, n, em.pos_r.xyz, r)
+                sdf_local_shadow(sdf_grid, sdf0, sdf1, sdf_s, wp, n, em.pos_r.xyz, bound)
             } else {
-                emitter_vis(grid, rad0, rad1, rad_s, wp, n, em.pos_r.xyz, r)
+                emitter_vis(grid, rad0, rad1, rad_s, wp, n, em.pos_r.xyz, bound)
             }
         } else {
             1.0
@@ -1405,7 +1444,12 @@ fn trace_cone(
         }
         let p = origin + dir * (dists[step] * v)
         let uvw = (p - grid.origin) * grid.inv_span
-        if uvw.x <= 0.01 || uvw.x >= 0.99 || uvw.y <= 0.01 || uvw.y >= 0.99 || uvw.z <= 0.01 || uvw.z >= 0.99 {
+        if uvw.x <= 0.01 ||
+            uvw.x >= 0.99 ||
+            uvw.y <= 0.01 ||
+            uvw.y >= 0.99 ||
+            uvw.z <= 0.01 ||
+            uvw.z >= 0.99 {
             break
         }
         let smp_occ = if step == 0 {
@@ -1485,7 +1529,12 @@ pub fn spec_cone(
         let hit = sdf_spec_hit(sdf_grid, sdf0, sdf1, sdf_s, wp, n, refl, max_dist: 12.0)
         if hit.w > 0.01 {
             let uvw = (hit.xyz - grid.origin) * grid.inv_span
-            if uvw.x > 0.01 && uvw.x < 0.99 && uvw.y > 0.01 && uvw.y < 0.99 && uvw.z > 0.01 && uvw.z < 0.99 {
+            if uvw.x > 0.01 &&
+                uvw.x < 0.99 &&
+                uvw.y > 0.01 &&
+                uvw.y < 0.99 &&
+                uvw.z > 0.01 &&
+                uvw.z < 0.99 {
                 let smp = if roughness < 0.22 {
                     rad0.sample_level(s, uvw, 0.0)
                 } else {
@@ -1508,7 +1557,12 @@ pub fn spec_cone(
         }
         let p = p0 + refl * (dists[step] * v)
         let uvw = (p - grid.origin) * grid.inv_span
-        if uvw.x <= 0.01 || uvw.x >= 0.99 || uvw.y <= 0.01 || uvw.y >= 0.99 || uvw.z <= 0.01 || uvw.z >= 0.99 {
+        if uvw.x <= 0.01 ||
+            uvw.x >= 0.99 ||
+            uvw.y <= 0.01 ||
+            uvw.y >= 0.99 ||
+            uvw.z <= 0.01 ||
+            uvw.z >= 0.99 {
             break
         }
         let use_coarse = roughness > 0.45 || step >= 2
@@ -1538,7 +1592,12 @@ pub fn volume_indirect(
         return vec3(0.0)
     }
     let uvw = (wp - grid.origin) * grid.inv_span
-    if uvw.x <= 0.01 || uvw.x >= 0.99 || uvw.y <= 0.01 || uvw.y >= 0.99 || uvw.z <= 0.01 || uvw.z >= 0.99 {
+    if uvw.x <= 0.01 ||
+        uvw.x >= 0.99 ||
+        uvw.y <= 0.01 ||
+        uvw.y >= 0.99 ||
+        uvw.z <= 0.01 ||
+        uvw.z >= 0.99 {
         return vec3(0.0)
     }
     let s1 = rad1.sample_level(s, uvw, 0.0)
@@ -1555,7 +1614,6 @@ pub struct RadianceCache {
     pub emit_accum: GpuBuffer<u32>,
     pub static_accum: GpuBuffer<u32>,
     pub static_emit_accum: GpuBuffer<u32>,
-    pub active_bins: AppendBuffer<u32>,
     pub emitters: AppendBuffer<Emitter>,
     pub tile_masks: GpuBuffer<u32>,
     pub tiles_x: u32,
@@ -1566,6 +1624,8 @@ pub struct RadianceCache {
     pub rad2: Texture3d<Rgba16Float>,
     pub s: Sampler,
     pub grid: RadGrid,
+    /// The grid `rad0`..`rad2` were last resolved in (what injection reads them by).
+    rad1_grid: RadGrid,
     pub static_key: u64,
     pub static_valid: bool,
 }
@@ -1577,7 +1637,6 @@ pub fn radiance_cache() -> RadianceCache {
         emit_accum: buffer(EMIT_CELLS * EMIT_STRIDE),
         static_accum: buffer(RAD_VOXELS * 4),
         static_emit_accum: buffer(EMIT_CELLS * EMIT_STRIDE),
-        active_bins: append_buffer(MAX_ACTIVE_BINS),
         emitters: append_buffer(MAX_EMITTERS),
         tile_masks: buffer(1),
         tiles_x: 1,
@@ -1588,6 +1647,7 @@ pub fn radiance_cache() -> RadianceCache {
         rad2: texture3d(width: RAD_SIDE / 4, height: RAD_SIDE / 4, depth: RAD_SIDE / 4),
         s: sampler(filter: Filter::Linear, address: Address::Clamp),
         grid: rad_grid(vec3(0.0), 10.0, enabled: false),
+        rad1_grid: rad_grid(vec3(0.0), 10.0, enabled: false),
         static_key: 0,
         static_valid: false,
     }
@@ -1626,7 +1686,10 @@ impl RadianceCache {
             return
         }
         label("mesh_radiance")
-        dispatch(clear_u32.bind(n: RAD_VOXELS * 4, buf: mut self.static_accum), over: RAD_VOXELS * 4)
+        dispatch(
+            clear_u32.bind(n: RAD_VOXELS * 4, buf: mut self.static_accum),
+            over: RAD_VOXELS * 4,
+        )
         let emit_n = EMIT_CELLS * EMIT_STRIDE
         dispatch(clear_u32.bind(n: emit_n, buf: mut self.static_emit_accum), over: emit_n)
     }
@@ -1653,17 +1716,37 @@ impl RadianceCache {
         }
         let stride = rad_stride(cap_verts, inst_count)
         dispatch(
-            prep_rad_list.bind(count: vert_count, cap: cap_verts, stride: stride, inst_count: inst_count, args: mut self.inject_args),
+            prep_rad_list.bind(
+                count: vert_count,
+                cap: cap_verts,
+                stride: stride,
+                inst_count: inst_count,
+                args: mut self.inject_args,
+            ),
             over: 1,
         )
         let groups_most = (((cap_verts + stride - 1) / stride) * inst_count + 63) / 64
         if to_static {
             dispatch(
                 rad_inject_one.bind(
-                    field: field, verts: verts, vert_count: vert_count, cap_verts: cap_verts,
-                    stride: stride, xforms: xforms, inst_count: inst_count, grid: self.grid, sv: sv,
-                    sky: sky, sky_table: sky_table, sky_s: sky_s, shadow_map: shadow_map, cmp: cmp,
-                    prev_rad1: self.rad1, rad_s: self.s, accum: mut self.static_accum,
+                    field: field,
+                    verts: verts,
+                    vert_count: vert_count,
+                    cap_verts: cap_verts,
+                    stride: stride,
+                    xforms: xforms,
+                    inst_count: inst_count,
+                    grid: self.grid,
+                    sv: sv,
+                    sky: sky,
+                    sky_table: sky_table,
+                    sky_s: sky_s,
+                    shadow_map: shadow_map,
+                    cmp: cmp,
+                    prev_rad1: self.rad1,
+                    prev_grid: self.rad1_grid,
+                    rad_s: self.s,
+                    accum: mut self.static_accum,
                     emit_accum: mut self.static_emit_accum,
                 ),
                 groups: self.inject_args,
@@ -1672,10 +1755,24 @@ impl RadianceCache {
         } else {
             dispatch(
                 rad_inject_one.bind(
-                    field: field, verts: verts, vert_count: vert_count, cap_verts: cap_verts,
-                    stride: stride, xforms: xforms, inst_count: inst_count, grid: self.grid, sv: sv,
-                    sky: sky, sky_table: sky_table, sky_s: sky_s, shadow_map: shadow_map, cmp: cmp,
-                    prev_rad1: self.rad1, rad_s: self.s, accum: mut self.accum,
+                    field: field,
+                    verts: verts,
+                    vert_count: vert_count,
+                    cap_verts: cap_verts,
+                    stride: stride,
+                    xforms: xforms,
+                    inst_count: inst_count,
+                    grid: self.grid,
+                    sv: sv,
+                    sky: sky,
+                    sky_table: sky_table,
+                    sky_s: sky_s,
+                    shadow_map: shadow_map,
+                    cmp: cmp,
+                    prev_rad1: self.rad1,
+                    prev_grid: self.rad1_grid,
+                    rad_s: self.s,
+                    accum: mut self.accum,
                     emit_accum: mut self.emit_accum,
                 ),
                 groups: self.inject_args,
@@ -1709,18 +1806,40 @@ impl RadianceCache {
         }
         let stride = rad_stride(cap_verts, inst_count)
         dispatch(
-            prep_rad_list.bind(count: vert_count, cap: cap_verts, stride: stride, inst_count: inst_count, args: mut self.inject_args),
+            prep_rad_list.bind(
+                count: vert_count,
+                cap: cap_verts,
+                stride: stride,
+                inst_count: inst_count,
+                args: mut self.inject_args,
+            ),
             over: 1,
         )
         let groups_most = (((cap_verts + stride - 1) / stride) * inst_count + 63) / 64
         if to_static {
             dispatch(
                 rad_inject_many.bind(
-                    fields: fields, n_fields: n_fields, verts: verts, vert_count: vert_count,
-                    cap_verts: cap_verts, stride: stride, xforms: xforms, inst_ids: inst_ids,
-                    is_instanced: is_instanced, inst_count: inst_count, grid: self.grid, sv: sv,
-                    sky: sky, sky_table: sky_table, sky_s: sky_s, shadow_map: shadow_map, cmp: cmp,
-                    prev_rad1: self.rad1, rad_s: self.s, accum: mut self.static_accum,
+                    fields: fields,
+                    n_fields: n_fields,
+                    verts: verts,
+                    vert_count: vert_count,
+                    cap_verts: cap_verts,
+                    stride: stride,
+                    xforms: xforms,
+                    inst_ids: inst_ids,
+                    is_instanced: is_instanced,
+                    inst_count: inst_count,
+                    grid: self.grid,
+                    sv: sv,
+                    sky: sky,
+                    sky_table: sky_table,
+                    sky_s: sky_s,
+                    shadow_map: shadow_map,
+                    cmp: cmp,
+                    prev_rad1: self.rad1,
+                    prev_grid: self.rad1_grid,
+                    rad_s: self.s,
+                    accum: mut self.static_accum,
                     emit_accum: mut self.static_emit_accum,
                 ),
                 groups: self.inject_args,
@@ -1729,68 +1848,28 @@ impl RadianceCache {
         } else {
             dispatch(
                 rad_inject_many.bind(
-                    fields: fields, n_fields: n_fields, verts: verts, vert_count: vert_count,
-                    cap_verts: cap_verts, stride: stride, xforms: xforms, inst_ids: inst_ids,
-                    is_instanced: is_instanced, inst_count: inst_count, grid: self.grid, sv: sv,
-                    sky: sky, sky_table: sky_table, sky_s: sky_s, shadow_map: shadow_map, cmp: cmp,
-                    prev_rad1: self.rad1, rad_s: self.s, accum: mut self.accum,
+                    fields: fields,
+                    n_fields: n_fields,
+                    verts: verts,
+                    vert_count: vert_count,
+                    cap_verts: cap_verts,
+                    stride: stride,
+                    xforms: xforms,
+                    inst_ids: inst_ids,
+                    is_instanced: is_instanced,
+                    inst_count: inst_count,
+                    grid: self.grid,
+                    sv: sv,
+                    sky: sky,
+                    sky_table: sky_table,
+                    sky_s: sky_s,
+                    shadow_map: shadow_map,
+                    cmp: cmp,
+                    prev_rad1: self.rad1,
+                    prev_grid: self.rad1_grid,
+                    rad_s: self.s,
+                    accum: mut self.accum,
                     emit_accum: mut self.emit_accum,
-                ),
-                groups: self.inject_args,
-                most: groups_most,
-            )
-        }
-    }
-
-    /// Injects one `Skinned` `One<M>` meshlet batch into either cached static or active radiance buffers.
-    pub fn inject_skin_one<M: Field<Substance>, S: Sky>(
-        mut self,
-        field: M,
-        verts: GpuSpan<MeshVertex>,
-        skin: GpuSpan<u32>,
-        vert_count: GpuSpan<u32>,
-        cap_verts: u32,
-        xforms: GpuSpan<Rigid>,
-        bones: GpuSpan<DualQuat>,
-        bone_stride: u32,
-        inst_count: u32,
-        sv: ShadowView,
-        sky: S,
-        sky_table: Texture<Rgba16Float>,
-        sky_s: Sampler,
-        shadow_map: DepthTexture,
-        cmp: ComparisonSampler,
-        to_static: bool,
-    ) {
-        if self.grid.enabled == 0 || cap_verts == 0 || inst_count == 0 {
-            return
-        }
-        let stride = rad_stride(cap_verts, inst_count)
-        dispatch(
-            prep_rad_list.bind(count: vert_count, cap: cap_verts, stride: stride, inst_count: inst_count, args: mut self.inject_args),
-            over: 1,
-        )
-        let groups_most = (((cap_verts + stride - 1) / stride) * inst_count + 63) / 64
-        if to_static {
-            dispatch(
-                rad_inject_skin_one.bind(
-                    field: field, verts: verts, skin: skin, vert_count: vert_count, cap_verts: cap_verts,
-                    stride: stride, xforms: xforms, bones: bones, bone_stride: bone_stride,
-                    inst_count: inst_count, grid: self.grid, sv: sv, sky: sky, sky_table: sky_table,
-                    sky_s: sky_s, shadow_map: shadow_map, cmp: cmp, prev_rad1: self.rad1, rad_s: self.s,
-                    accum: mut self.static_accum, emit_accum: mut self.static_emit_accum,
-                ),
-                groups: self.inject_args,
-                most: groups_most,
-            )
-        } else {
-            dispatch(
-                rad_inject_skin_one.bind(
-                    field: field, verts: verts, skin: skin, vert_count: vert_count, cap_verts: cap_verts,
-                    stride: stride, xforms: xforms, bones: bones, bone_stride: bone_stride,
-                    inst_count: inst_count, grid: self.grid, sv: sv, sky: sky, sky_table: sky_table,
-                    sky_s: sky_s, shadow_map: shadow_map, cmp: cmp, prev_rad1: self.rad1, rad_s: self.s,
-                    accum: mut self.accum, emit_accum: mut self.emit_accum,
                 ),
                 groups: self.inject_args,
                 most: groups_most,
@@ -1825,19 +1904,43 @@ impl RadianceCache {
         }
         let stride = rad_stride(cap_verts, inst_count)
         dispatch(
-            prep_rad_list.bind(count: vert_count, cap: cap_verts, stride: stride, inst_count: inst_count, args: mut self.inject_args),
+            prep_rad_list.bind(
+                count: vert_count,
+                cap: cap_verts,
+                stride: stride,
+                inst_count: inst_count,
+                args: mut self.inject_args,
+            ),
             over: 1,
         )
         let groups_most = (((cap_verts + stride - 1) / stride) * inst_count + 63) / 64
         if to_static {
             dispatch(
                 rad_inject_skin_many.bind(
-                    fields: fields, n_fields: n_fields, verts: verts, skin: skin,
-                    vert_count: vert_count, cap_verts: cap_verts, stride: stride, xforms: xforms,
-                    bones: bones, bone_stride: bone_stride, inst_ids: inst_ids, inst_count: inst_count,
-                    grid: self.grid, sv: sv, sky: sky, sky_table: sky_table, sky_s: sky_s,
-                    shadow_map: shadow_map, cmp: cmp, prev_rad1: self.rad1, rad_s: self.s,
-                    accum: mut self.static_accum, emit_accum: mut self.static_emit_accum,
+                    fields: fields,
+                    n_fields: n_fields,
+                    verts: verts,
+                    skin: skin,
+                    vert_count: vert_count,
+                    cap_verts: cap_verts,
+                    stride: stride,
+                    xforms: xforms,
+                    bones: bones,
+                    bone_stride: bone_stride,
+                    inst_ids: inst_ids,
+                    inst_count: inst_count,
+                    grid: self.grid,
+                    sv: sv,
+                    sky: sky,
+                    sky_table: sky_table,
+                    sky_s: sky_s,
+                    shadow_map: shadow_map,
+                    cmp: cmp,
+                    prev_rad1: self.rad1,
+                    prev_grid: self.rad1_grid,
+                    rad_s: self.s,
+                    accum: mut self.static_accum,
+                    emit_accum: mut self.static_emit_accum,
                 ),
                 groups: self.inject_args,
                 most: groups_most,
@@ -1845,12 +1948,30 @@ impl RadianceCache {
         } else {
             dispatch(
                 rad_inject_skin_many.bind(
-                    fields: fields, n_fields: n_fields, verts: verts, skin: skin,
-                    vert_count: vert_count, cap_verts: cap_verts, stride: stride, xforms: xforms,
-                    bones: bones, bone_stride: bone_stride, inst_ids: inst_ids, inst_count: inst_count,
-                    grid: self.grid, sv: sv, sky: sky, sky_table: sky_table, sky_s: sky_s,
-                    shadow_map: shadow_map, cmp: cmp, prev_rad1: self.rad1, rad_s: self.s,
-                    accum: mut self.accum, emit_accum: mut self.emit_accum,
+                    fields: fields,
+                    n_fields: n_fields,
+                    verts: verts,
+                    skin: skin,
+                    vert_count: vert_count,
+                    cap_verts: cap_verts,
+                    stride: stride,
+                    xforms: xforms,
+                    bones: bones,
+                    bone_stride: bone_stride,
+                    inst_ids: inst_ids,
+                    inst_count: inst_count,
+                    grid: self.grid,
+                    sv: sv,
+                    sky: sky,
+                    sky_table: sky_table,
+                    sky_s: sky_s,
+                    shadow_map: shadow_map,
+                    cmp: cmp,
+                    prev_rad1: self.rad1,
+                    prev_grid: self.rad1_grid,
+                    rad_s: self.s,
+                    accum: mut self.accum,
+                    emit_accum: mut self.emit_accum,
                 ),
                 groups: self.inject_args,
                 most: groups_most,
@@ -1864,7 +1985,6 @@ impl RadianceCache {
         label("mesh_radiance")
         copy(from: self.static_accum.items(), to: self.accum.items_mut())
         copy(from: self.static_emit_accum.items(), to: self.emit_accum.items_mut())
-        self.active_bins.clear()
         self.emitters.clear()
     }
 
@@ -1878,7 +1998,6 @@ impl RadianceCache {
         dispatch(clear_u32.bind(n: RAD_VOXELS * 4, buf: mut self.accum), over: RAD_VOXELS * 4)
         let emit_n = EMIT_CELLS * EMIT_STRIDE
         dispatch(clear_u32.bind(n: emit_n, buf: mut self.emit_accum), over: emit_n)
-        self.active_bins.clear()
         self.emitters.clear()
     }
 
@@ -1903,21 +2022,13 @@ impl RadianceCache {
             over: (s2, s2, s2),
         )
         dispatch(
-            emit_collect.bind(
-                emit_accum: self.emit_accum.items(),
-                active_bins: mut self.active_bins,
-            ),
-            over: EMIT_CELLS,
-        )
-        dispatch(
             emit_compact.bind(
                 emit_accum: self.emit_accum.items(),
-                active_bins: self.active_bins.items(),
-                active_count: self.active_bins.count(),
                 grid: self.grid,
                 out: mut self.emitters,
             ),
             over: 1,
         )
+        self.rad1_grid = self.grid
     }
 }

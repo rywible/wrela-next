@@ -52,6 +52,7 @@ pub mod loopback;
 pub mod pace;
 #[cfg(feature = "gpu")]
 pub mod paced;
+#[cfg(feature = "gpu")]
 mod pipeline_report;
 mod program;
 mod shared;

@@ -228,9 +228,11 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
             "--replay" => args.replay = Some(value("--replay")?.into()),
             "--timestamps" => args.timestamps = true,
             "--serial" => args.serial = true,
+            #[cfg(feature = "gpu")]
             "--keep-clocked" => wrela_host::keep_clocked(),
             "--cpu" => args.cpu = true,
             "--pipelines" => args.pipelines = true,
+            #[cfg(feature = "gpu")]
             "--steps" => wrela_host::step::log_steps(),
             "--capture" => {
                 let frame = whole("--capture", value("--capture")?)?;
@@ -539,6 +541,12 @@ fn windowed(args: &Args, present: PresentMode) -> Result<(), Failure> {
     let logging = args.log.is_some();
     host.want_hashes(logging || args.record.is_some());
     host.init()?;
+    // A tick log is the ticker's, as a headless run's is: without one, `--log` fails rather than
+    // writing nothing.
+    if logging && host.ticker_hz().is_none() {
+        let e = "--log writes the ticker's ticks, and it starts no ticker in `init` (`std::tick::start`)";
+        return Err(Failure::Host(wrela_host::Error::Program(e.into())));
+    }
     let script = read_script(args.input.as_ref())?;
     let arrive = read_script(args.arrive.as_ref())?;
     if arrive.iter().any(|s| !matches!(s.at, wrela_host::At::Frame(_))) {

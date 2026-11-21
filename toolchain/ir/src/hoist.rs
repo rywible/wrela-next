@@ -49,6 +49,12 @@ pub const MOST_PASSES: u32 = 64;
 /// docs say: `uniform` is its uniform block (a struct), whose type gains a field for each
 /// value hoisted onto the CPU. `least` is the work an invocation, at least, that moves.
 pub fn hoist(m: &mut Module, uniform: ResourceId, least: u64) -> Vec<Hoisted> {
+    // An exact build's bits don't depend on the code around a function (language.md §11.3):
+    // what moves onto the CPU is rounded as the CPU does, and whether a value moves depends on
+    // the work beside it. Its same work stays where it is.
+    if m.exact {
+        return Vec::new();
+    }
     let TypeDef::Struct { fields, .. } = m.types.get(m.resources[uniform.index()].ty).clone()
     else {
         return Vec::new();
@@ -391,10 +397,38 @@ fn pick(m: &Module, f: usize, bits: &[bool], uniform: ResourceId, least: u64) ->
     });
     let ty = |v: ValueId| func.value_ty(v);
     let counted_loops = counters(func);
+    let consts = crate::counted::constants(func);
+    // Whether index `i` into a value of type `t` is in range wherever the CPU computes it: a
+    // constant under its length, or a counted loop's counter that stops at its length or
+    // before (the CPU computes a counted pass's values for each counter from its start to its
+    // stop). The CPU traps on any other index out of range, where the GPU keeps it inside and
+    // its code may never reach it (a branch, a loop's early exit).
+    let in_range = |i: ValueId, t: TypeId| {
+        let Some(n) = m.types.index_len(t) else { return false };
+        let k = match consts.get(&i) {
+            Some(Const::U32(k)) => Some(*k),
+            Some(Const::I32(k)) => u32::try_from(*k).ok(),
+            _ => None,
+        };
+        k.is_some_and(|k| k < n) || counted_loops.get(&i).is_some_and(|c| c.2 <= n)
+    };
+    // Whether the integers of type `t`'s values are an integer or a vector of them.
+    let int = |t: TypeId| match m.types.get(t) {
+        TypeDef::Scalar(s) | TypeDef::Vector(s, _) => s.is_int(),
+        _ => false,
+    };
     // The values the CPU computes as the GPU does, from parameters the calls give same values,
-    // the block, constants and counted loops' counters.
+    // the block, constants and counted loops' counters. What traps on the CPU (language.md
+    // §11.3: an integer's overflow, division or shift by its width, a float out of an integer's
+    // range, an index out of range) stays: the CPU computes a value whatever branch the GPU's
+    // code computes it under, and it would stop the program where the GPU's code goes on. What's
+    // computed from parameters moves into the callers (`lifted`), still GPU code, so it may trap
+    // on the CPU: the callers' own move onto the CPU asks again.
+    let def_of: HashMap<ValueId, &Expr> = defs.iter().copied().collect();
     let mut region: HashSet<ValueId> = HashSet::new();
     let mut params: HashSet<ValueId> = HashSet::new();
+    // The region's values computed from a parameter.
+    let mut lifted: HashSet<ValueId> = HashSet::new();
     // The region's values computed from a counter.
     let mut counted: HashSet<ValueId> = HashSet::new();
     for &(v, e) in &defs {
@@ -403,6 +437,8 @@ fn pick(m: &Module, f: usize, bits: &[bool], uniform: ResourceId, least: u64) ->
         }
         let mut all = true;
         e.for_each_value(&mut |x| all &= region.contains(&x));
+        let mut fed = false;
+        e.for_each_value(&mut |x| fed |= lifted.contains(&x));
         let ok = all
             && match e {
                 Expr::Const(_) | Expr::Zero(_) => true,
@@ -418,15 +454,58 @@ fn pick(m: &Module, f: usize, bits: &[bool], uniform: ResourceId, least: u64) ->
                     counted.insert(v);
                     true
                 }
-                // (An element's index is in the region, `all` says.)
-                Expr::Load(p) => p.root == PlaceRoot::Resource(uniform),
-                Expr::Binary(op, a, _) => {
-                    let int = |t: TypeId| match m.types.get(t) {
-                        TypeDef::Scalar(s) | TypeDef::Vector(s, _) => s.is_int(),
-                        _ => false,
-                    };
-                    !(matches!(op, BinOp::Div | BinOp::Rem) && int(ty(*a)))
+                // (An element's index is in the region, `all` says; in range, `in_range`.)
+                Expr::Load(p) => {
+                    p.root == PlaceRoot::Resource(uniform)
+                        && m.place_start(func, p).is_some_and(|(mut t, path)| {
+                            path.iter().all(|x| {
+                                let ok = match x {
+                                    Proj::Index(i) => lifted.contains(i) || in_range(*i, t),
+                                    _ => true,
+                                };
+                                match m.proj_ty(t, x) {
+                                    Some(next) if ok => {
+                                        t = next;
+                                        true
+                                    }
+                                    _ => false,
+                                }
+                            })
+                        })
                 }
+                // Integer arithmetic is checked on the CPU and wraps on the GPU: only the
+                // wrapping ops, and those that can't trap, move.
+                // A shift traps only by the width or more: by a constant under it, it moves.
+                // (Bitwise `& | ^` and comparisons never trap.)
+                Expr::Binary(..) | Expr::Unary(..) | Expr::ExtractDyn(..) | Expr::Convert(..)
+                    if fed =>
+                {
+                    true
+                }
+                Expr::Binary(BinOp::Shl | BinOp::Shr, a, b) if int(ty(*a)) => {
+                    let width = match m.types.get(ty(*a)) {
+                        TypeDef::Scalar(s) | TypeDef::Vector(s, _) => s.bits(),
+                        _ => 0,
+                    };
+                    let amount = match def_of.get(b) {
+                        Some(Expr::Splat(x, _)) => consts.get(x),
+                        _ => consts.get(b),
+                    };
+                    match amount {
+                        Some(Const::U32(k)) => *k < width,
+                        Some(Const::I32(k)) => u32::try_from(*k).is_ok_and(|k| k < width),
+                        _ => false,
+                    }
+                }
+                Expr::Binary(op, a, _) => {
+                    !(int(ty(*a))
+                        && matches!(
+                            op,
+                            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem
+                        ))
+                }
+                Expr::Unary(UnOp::Neg, x) => !int(ty(*x)),
+                Expr::ExtractDyn(x, i) => in_range(*i, ty(*x)),
                 // A float to an integer traps out of range on the CPU.
                 Expr::Convert(x, to) => {
                     let from_float = match m.types.get(ty(*x)) {
@@ -441,7 +520,6 @@ fn pick(m: &Module, f: usize, bits: &[bool], uniform: ResourceId, least: u64) ->
                 Expr::Unary(..)
                 | Expr::Construct(..)
                 | Expr::Extract(..)
-                | Expr::ExtractDyn(..)
                 | Expr::Splat(..)
                 | Expr::Swizzle(..)
                 | Expr::Bitcast(..)
@@ -450,6 +528,9 @@ fn pick(m: &Module, f: usize, bits: &[bool], uniform: ResourceId, least: u64) ->
             };
         if ok {
             region.insert(v);
+            if fed || matches!(e, Expr::Param(_)) {
+                lifted.insert(v);
+            }
             let mut from_counter = false;
             e.for_each_value(&mut |x| from_counter |= counted.contains(&x));
             if from_counter {
@@ -872,5 +953,132 @@ mod tests {
         let before = m.clone();
         assert!(hoist(&mut m, u, 1_000_000).is_empty());
         assert_eq!(m.functions, before.functions);
+    }
+
+    /// A kernel computing `sqrt(f32(u.x << k))` from its uniform's `u32`s `x` and `y`, `k`
+    /// the constant 16 (`by_field`: `u.y`), plus its own place; and whether a shift is left on
+    /// the GPU once hoisted.
+    fn shifted(by_field: bool) -> (Vec<Hoisted>, bool) {
+        let mut m = Module::default();
+        let (f32_ty, u32_ty) = (m.types.f32(), m.types.u32());
+        let v3u = m.types.vector_of(Scalar::U32, 3);
+        let block = m.types.intern(TypeDef::Struct {
+            name: "Uniforms".into(),
+            fields: vec![("x".into(), u32_ty), ("y".into(), u32_ty)],
+        });
+        let u = m.add_resource(Resource {
+            name: "u".into(),
+            binding: 0,
+            kind: ResourceKind::Uniform { storage: false },
+            ty: block,
+        });
+        let field = |k| Place::root(PlaceRoot::Resource(u)).with(Proj::Field(k));
+        let mut e = Function::new("k", Vec::new(), None);
+        let mut b = Vec::new();
+        let id = e.let_(&mut b, v3u, Expr::EntryInput(0));
+        let ix = e.let_(&mut b, u32_ty, Expr::Extract(id, 0));
+        let pf = e.let_(&mut b, f32_ty, Expr::Convert(ix, Scalar::F32));
+        let x = e.let_(&mut b, u32_ty, Expr::Load(field(0)));
+        let k = match by_field {
+            true => e.let_(&mut b, u32_ty, Expr::Load(field(1))),
+            false => e.let_(&mut b, u32_ty, Expr::Const(Const::U32(16))),
+        };
+        let s = e.let_(&mut b, u32_ty, Expr::Binary(BinOp::Shl, x, k));
+        let f = e.let_(&mut b, f32_ty, Expr::Convert(s, Scalar::F32));
+        let r = e.let_(&mut b, f32_ty, Expr::Builtin(Builtin::Sqrt, vec![f]));
+        e.let_(&mut b, f32_ty, Expr::Binary(BinOp::Add, r, pf));
+        b.push(Stmt::Return(None));
+        e.body = b;
+        let eid = m.add_function(e);
+        m.entry_points.push(EntryPoint {
+            name: "k".into(),
+            stage: Stage::Compute { workgroup_size: [64, 1, 1] },
+            function: eid,
+            inputs: vec![BuiltinInput::GlobalInvocationId],
+        });
+        let hoisted = hoist(&mut m, u, 1);
+        let mut shifts = false;
+        visit::walk(&m.functions[0].body, &mut |s| {
+            shifts |= matches!(s, Stmt::Let(_, Expr::Binary(BinOp::Shl, ..)));
+        });
+        (hoisted, shifts)
+    }
+
+    /// `g(x: u32, p: f32)` computes `sqrt(f32(x - 1)) + p`, its kernel calling it with its
+    /// uniform's `x`: `x - 1` may trap on the CPU (at `x = 0`) but not on the GPU, so it moves
+    /// into the kernel, as GPU code, and stays there, not onto the CPU.
+    #[test]
+    fn what_traps_on_the_cpu_moves_into_callers_but_not_onto_the_cpu() {
+        let mut m = Module::default();
+        let (f32_ty, u32_ty) = (m.types.f32(), m.types.u32());
+        let v3u = m.types.vector_of(Scalar::U32, 3);
+        let block = m.types.intern(TypeDef::Struct {
+            name: "Uniforms".into(),
+            fields: vec![("x".into(), u32_ty)],
+        });
+        let u = m.add_resource(Resource {
+            name: "u".into(),
+            binding: 0,
+            kind: ResourceKind::Uniform { storage: false },
+            ty: block,
+        });
+        let mut g = Function::new(
+            "g",
+            vec![Param::value("x", u32_ty), Param::value("p", f32_ty)],
+            Some(f32_ty),
+        );
+        let mut b = Vec::new();
+        let x = g.let_(&mut b, u32_ty, Expr::Param(0));
+        let p = g.let_(&mut b, f32_ty, Expr::Param(1));
+        let one = g.let_(&mut b, u32_ty, Expr::Const(Const::U32(1)));
+        let less = g.let_(&mut b, u32_ty, Expr::Binary(BinOp::Sub, x, one));
+        let f = g.let_(&mut b, f32_ty, Expr::Convert(less, Scalar::F32));
+        let r = g.let_(&mut b, f32_ty, Expr::Builtin(Builtin::Sqrt, vec![f]));
+        let out = g.let_(&mut b, f32_ty, Expr::Binary(BinOp::Add, r, p));
+        b.push(Stmt::Return(Some(out)));
+        g.body = b;
+        let gid = m.add_function(g);
+        let mut e = Function::new("k", Vec::new(), None);
+        let mut b = Vec::new();
+        let id = e.let_(&mut b, v3u, Expr::EntryInput(0));
+        let ix = e.let_(&mut b, u32_ty, Expr::Extract(id, 0));
+        let pf = e.let_(&mut b, f32_ty, Expr::Convert(ix, Scalar::F32));
+        let at = Place::root(PlaceRoot::Resource(u)).with(Proj::Field(0));
+        let xu = e.let_(&mut b, u32_ty, Expr::Load(at));
+        e.let_(&mut b, f32_ty, Expr::Call(gid, vec![Arg::Value(xu), Arg::Value(pf)]));
+        b.push(Stmt::Return(None));
+        e.body = b;
+        let eid = m.add_function(e);
+        m.entry_points.push(EntryPoint {
+            name: "k".into(),
+            stage: Stage::Compute { workgroup_size: [64, 1, 1] },
+            function: eid,
+            inputs: vec![BuiltinInput::GlobalInvocationId],
+        });
+        let hoisted = hoist(&mut m, u, 1);
+        assert!(hoisted.is_empty(), "{hoisted:?}");
+        assert!(crate::verify(&m).is_ok(), "{}", crate::print::print(&m));
+        let subtracts = |f: &Function| {
+            let mut n = 0;
+            visit::walk(&f.body, &mut |s| {
+                n += usize::from(matches!(s, Stmt::Let(_, Expr::Binary(BinOp::Sub, ..))));
+            });
+            n
+        };
+        assert_eq!(subtracts(&m.functions[0]), 0, "{}", crate::print::print(&m));
+        assert_eq!(subtracts(&m.functions[1]), 1, "{}", crate::print::print(&m));
+    }
+
+    /// A shift by a constant under its width can't trap on the CPU, so it moves there (a radical
+    /// inverse's bit reversal, in a GGX prefilter's sample loop); one by an amount the uniform
+    /// gives may reach the width, where the CPU traps and the GPU doesn't: it stays.
+    #[test]
+    fn a_shift_by_a_constant_moves_and_one_by_a_uniform_stays() {
+        let (hoisted, shifts) = shifted(false);
+        assert_eq!(hoisted.len(), 1, "{hoisted:?}");
+        assert!(!shifts);
+        let (hoisted, shifts) = shifted(true);
+        assert!(hoisted.is_empty(), "{hoisted:?}");
+        assert!(shifts);
     }
 }

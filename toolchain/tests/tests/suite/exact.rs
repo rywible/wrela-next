@@ -27,8 +27,11 @@ fn differing(exact: bool) -> u32 {
     for _ in 0..20 {
         host.run_frames(&crate::frame_times(1), 16, 16).expect("a frame");
         match host.call_export("differ", &[]).expect("differ").as_slice() {
+            // A count, 0 to 4,097; the fixture's `NOT_IN` (`u32::MAX`, -1 as an `i32`) until
+            // the results arrive.
             [Value::I32(n)] if *n as u32 <= 4097 => return *n as u32,
-            _ => {}
+            [Value::I32(-1)] => {}
+            other => panic!("differ returned {other:?}"),
         }
     }
     panic!("the results never arrived")

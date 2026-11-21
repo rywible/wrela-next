@@ -177,9 +177,12 @@ enum Helper {
     Neg(String, String),
     /// `naga_abs` of a signed type and its unsigned twin.
     Abs(String, String),
-    /// `naga_f2i32` or `naga_f2u32` from a float type to an int type.
-    F2I(String, String, bool),
-    /// `naga_dot_<int type>` of an integer vector type and its size.
+    /// `naga_f2i32` or `naga_f2u32` (signed) from a float type to an int type, and whether the
+    /// float is a half (its bounds are then halves: an `f32` bound beside a `half` value is an
+    /// ambiguous `clamp`, and as a half it's an infinity, clamping nothing).
+    F2I(String, String, bool, bool),
+    /// `naga_dot_<int type>` of an integer vector type, its scalar's name and its size; signed,
+    /// its products and sum are taken unsigned, so they wrap as WGSL's do.
     Dot(String, String, u8),
     /// The compare-exchange of an atomic of this scalar, and the result struct's name.
     CompareExchange(String, String),
@@ -761,20 +764,21 @@ fn literal(c: &ir::Const) -> R<String> {
         ir::Const::I32(x) => x.to_string(),
         ir::Const::U32(x) => format!("{x}u"),
         ir::Const::F32(x) => float_literal(*x),
-        ir::Const::F16(x) => {
-            let h = half::f16::from_f32(*x);
-            if h.is_infinite() {
-                format!("{}INFINITY", if h.is_sign_negative() { "-" } else { "" })
-            } else if h.is_nan() {
-                "NAN".into()
-            } else if h.to_f32().fract() == 0.0 {
-                format!("{h}.0h")
-            } else {
-                format!("{h}h")
-            }
-        }
+        ir::Const::F16(x) => half_literal(half::f16::from_f32(*x)),
         other => return Err(format!("internal: the constant {other:?} in GPU code")),
     })
+}
+
+fn half_literal(h: half::f16) -> String {
+    if h.is_infinite() {
+        format!("{}INFINITY", if h.is_sign_negative() { "-" } else { "" })
+    } else if h.is_nan() {
+        "NAN".into()
+    } else if h.to_f32().fract() == 0.0 {
+        format!("{h}.0h")
+    } else {
+        format!("{h}h")
+    }
 }
 
 fn float_literal(x: f32) -> String {
@@ -829,11 +833,20 @@ fn write_helper(out: &mut String, h: &Helper) {
                 "{t} naga_abs({t} val) {{\nreturn metal::select(as_type<{t}>(-as_type<{u}>(val)), val, val >= 0);\n}}\n"
             );
         }
-        Helper::F2I(from, to, signed) => {
-            let (name, lo, hi) = if *signed {
-                ("naga_f2i32", float_literal(-2147483648.0), float_literal(2147483520.0))
-            } else {
-                ("naga_f2u32", float_literal(0.0), float_literal(4294967040.0))
+        Helper::F2I(from, to, signed, half) => {
+            // The float range the integer holds, in the float's own type: a half's whole
+            // finite range fits either integer but the unsigned one's negatives.
+            let (name, lo, hi) = match (*signed, *half) {
+                (true, false) => {
+                    ("naga_f2i32", float_literal(-2147483648.0), float_literal(2147483520.0))
+                }
+                (false, false) => ("naga_f2u32", float_literal(0.0), float_literal(4294967040.0)),
+                (true, true) => {
+                    ("naga_f2i32", half_literal(half::f16::MIN), half_literal(half::f16::MAX))
+                }
+                (false, true) => {
+                    ("naga_f2u32", half_literal(half::f16::ZERO), half_literal(half::f16::MAX))
+                }
             };
             let _ = writeln!(
                 out,
@@ -842,12 +855,27 @@ fn write_helper(out: &mut String, h: &Helper) {
         }
         Helper::Dot(vec, scalar, n) => {
             let name = format!("naga_dot_{}{n}", scalar);
-            let _ = write!(out, "{scalar} {name}({vec} a, {vec} b) {{\nreturn (");
+            let _ = write!(out, "{scalar} {name}({vec} a, {vec} b) {{\nreturn ");
+            // Signed: each product and the sum unsigned, so an overflow wraps (MSL leaves a
+            // signed one undefined), as the SPIR-V's `IMul` and `IAdd` do.
+            let signed = scalar == "int";
+            if signed {
+                out.push_str("as_type<int>(");
+            }
+            out.push('(');
             for k in 0..usize::from(*n) {
                 let c = ["x", "y", "z", "w"][k];
-                let _ = write!(out, " + a.{c} * b.{c}");
+                if signed {
+                    let _ = write!(out, " + as_type<uint>(a.{c}) * as_type<uint>(b.{c})");
+                } else {
+                    let _ = write!(out, " + a.{c} * b.{c}");
+                }
             }
-            out.push_str(");\n}\n\n");
+            out.push(')');
+            if signed {
+                out.push(')');
+            }
+            out.push_str(";\n}\n\n");
         }
         Helper::CompareExchange(scalar, result) => {
             for space in ["device", "threadgroup"] {
@@ -1966,7 +1994,8 @@ impl FunctionWriter<'_, '_> {
                 if from.is_float() && matches!(s, ir::Scalar::I32 | ir::Scalar::U32) && !bounded {
                     let from_name = self.numeric_like(xt, from)?;
                     let signed = *s == ir::Scalar::I32;
-                    self.w.helpers.insert(Helper::F2I(from_name, to.clone(), signed));
+                    let half = from == ir::Scalar::F16;
+                    self.w.helpers.insert(Helper::F2I(from_name, to.clone(), signed, half));
                     let name = if signed { "naga_f2i32" } else { "naga_f2u32" };
                     atom(format!("{name}({})", self.arg(*x)?))
                 } else {
@@ -2140,6 +2169,13 @@ impl FunctionWriter<'_, '_> {
             let ub = format!("as_type<{un}>({})", self.arg(b)?);
             return Ok(atom(format!("as_type<{tn}>({ua} {sym} {ub})")));
         }
+        // A shift by the width or more shifts by the amount modulo the width, as WGSL defines it
+        // (language.md §11.3); MSL leaves such a shift undefined. A constant under 32 is kept.
+        if matches!(op, B::Shl | B::Shr)
+            && !analysis::const_int(&self.consts, b).is_some_and(|k| (0..32).contains(&k))
+        {
+            return Ok(compound(format!("{l} {sym} ({} & 31u)", self.arg(b)?)));
+        }
         Ok(compound(format!("{l} {sym} {r}")))
     }
 
@@ -2184,7 +2220,9 @@ impl FunctionWriter<'_, '_> {
                     ir::TypeDef::Vector(_, n) => (format!("int{n}(-1)"), format!("int{n}(1)")),
                     _ => ("int(-1)".to_string(), "int(1)".to_string()),
                 };
-                let x = &texts[0];
+                // An operand, bracketed: a compound argument (`a & b`, `c ? a : b`) binds looser
+                // than the comparisons it's put in.
+                let x = self.operand(a0)?;
                 atom(format!(
                     "metal::select(metal::select({minus}, {plus}, ({x} > 0)), int(0), ({x} == 0))"
                 ))
@@ -2408,6 +2446,9 @@ impl FunctionWriter<'_, '_> {
                 match op {
                     T::SampleLevel => parts.push(format!("metal::level({})", arg(self, rest)?)),
                     T::SampleBias => parts.push(format!("metal::bias({})", arg(self, rest)?)),
+                    // The top level, as SPIR-V's explicit level 0: with no level a fragment
+                    // shader's comparison picks one from its derivatives.
+                    T::SampleCompareLevel => parts.push("metal::level(0)".into()),
                     T::SampleGrad => {
                         let g = match dim {
                             ir::TexDim::D3 => "gradient3d",

@@ -177,8 +177,11 @@ enum Pending {
         origin: [u32; 3],
         extent: [u32; 3],
     },
-    /// An image cleared to zero (every level and layer), and put in `GENERAL`.
-    Clear { dst: Arc<RawImage> },
+    /// An image zeroed (every level and layer), and put in its home layout: cleared, or, where
+    /// its format is compressed (which Vulkan clears not, VUID-vkCmdClearColorImage-image-00007),
+    /// each level copied from `zeros`, a staging buffer's zeroed bytes at `at` as many as its
+    /// first level holds (`extent`, its width, height and depth).
+    Clear { dst: Arc<RawImage>, zeros: Option<(Arc<RawBuffer>, u64, vk::Extent3D)> },
 }
 
 impl Pending {
@@ -194,14 +197,50 @@ impl Pending {
             Pending::Texture { staging, dst, .. } => {
                 (Some(staging.buffer.as_raw()), dst.image.as_raw())
             }
-            Pending::Clear { dst } => (None, dst.image.as_raw()),
+            Pending::Clear { dst, zeros } => {
+                (zeros.as_ref().map(|z| z.0.buffer.as_raw()), dst.image.as_raw())
+            }
         }
     }
 }
 
 /// The GPU: a Vulkan device and its one queue.
 #[derive(Clone)]
-pub struct Device(Arc<Shared>);
+pub struct Device(Arc<Owner>);
+
+/// What the device's handles (and the encoders and surfaces made of them) hold: the device. Its
+/// resources hold the device too (`Arc<Shared>`), and the device holds some of them (staged
+/// writes, the belt, what submissions keep), so once the last handle goes those are let go
+/// here, after the GPU is idle: else they would keep the device, and themselves, alive for good.
+struct Owner(Arc<Shared>);
+
+impl std::ops::Deref for Owner {
+    type Target = Shared;
+
+    fn deref(&self) -> &Shared {
+        &self.0
+    }
+}
+
+impl Drop for Owner {
+    fn drop(&mut self) {
+        let s = &self.0;
+        // SAFETY: once the device is idle nothing in flight uses what submissions kept.
+        unsafe {
+            let _ = s.raw.device_wait_idle();
+        }
+        drop(std::mem::take(&mut *lock(&s.pending)));
+        let flights = std::mem::take(&mut *lock(&s.in_flight));
+        for (_, pool, keep) in flights {
+            if pool != vk::CommandPool::null() {
+                // SAFETY: the device is idle.
+                unsafe { s.raw.destroy_command_pool(pool, None) };
+            }
+            drop(keep);
+        }
+        drop(std::mem::take(&mut *lock(&s.belt)));
+    }
+}
 
 unsafe extern "system" fn on_message(
     severity: vk::DebugUtilsMessageSeverityFlagsEXT,
@@ -602,7 +641,7 @@ impl Device {
                     .min(l.max_compute_work_group_count[1])
                     .min(l.max_compute_work_group_count[2]),
             };
-            Ok(Device(Arc::new(Shared {
+            Ok(Device(Arc::new(Owner(Arc::new(Shared {
                 entry,
                 swapchain,
                 present_wait,
@@ -629,8 +668,13 @@ impl Device {
                 table,
                 belt: Mutex::new(Belt::default()),
                 heap: Mutex::new(Heap::default()),
-            })))
+            })))))
         }
+    }
+
+    /// The device, as its resources hold it.
+    fn shared(&self) -> Arc<Shared> {
+        self.0.0.clone()
     }
 
     pub fn info(&self) -> &AdapterInfo {
@@ -773,7 +817,7 @@ impl Device {
             } else {
                 std::ptr::null_mut()
             };
-            Arc::new(RawBuffer { device: self.0.clone(), buffer, memory, size, mapped })
+            Arc::new(RawBuffer { device: self.shared(), buffer, memory, size, mapped })
         }
     }
 
@@ -799,33 +843,23 @@ impl Device {
     }
 
     pub fn create_texture(&self, desc: &TextureDesc<'_>) -> Texture {
-        let samples = desc.samples.max(1);
         let layers = desc.depth_or_layers.max(1);
         let levels = desc.levels.max(1);
         let format = vk_format(desc.format);
         let depth = desc.format == TextureFormat::Depth32Float;
-        let usage = if samples > 1 {
-            if depth {
+        let mut usage = vk::ImageUsageFlags::SAMPLED
+            | vk::ImageUsageFlags::TRANSFER_SRC
+            | vk::ImageUsageFlags::TRANSFER_DST;
+        if desc.usage.storage {
+            usage |= vk::ImageUsageFlags::STORAGE;
+        }
+        if desc.usage.render {
+            usage |= if depth {
                 vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
             } else {
                 vk::ImageUsageFlags::COLOR_ATTACHMENT
-            }
-        } else {
-            let mut u = vk::ImageUsageFlags::SAMPLED
-                | vk::ImageUsageFlags::TRANSFER_SRC
-                | vk::ImageUsageFlags::TRANSFER_DST;
-            if desc.usage.storage {
-                u |= vk::ImageUsageFlags::STORAGE;
-            }
-            if desc.usage.render {
-                u |= if depth {
-                    vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
-                } else {
-                    vk::ImageUsageFlags::COLOR_ATTACHMENT
-                };
-            }
-            u
-        };
+            };
+        }
         let (ty, extent, array) = match desc.dimension {
             TextureDimension::D3 => (
                 vk::ImageType::TYPE_3D,
@@ -838,10 +872,8 @@ impl Device {
                 layers,
             ),
         };
-        let cube = samples == 1
-            && desc.dimension == TextureDimension::D2
-            && layers % 6 == 0
-            && desc.width == desc.height;
+        let cube =
+            desc.dimension == TextureDimension::D2 && layers % 6 == 0 && desc.width == desc.height;
         // SAFETY: an image and its memory, made and bound here.
         let raw = unsafe {
             let d = self.raw();
@@ -860,7 +892,7 @@ impl Device {
                         .extent(extent)
                         .mip_levels(levels)
                         .array_layers(array)
-                        .samples(sample_count(samples))
+                        .samples(vk::SampleCountFlags::TYPE_1)
                         .tiling(vk::ImageTiling::OPTIMAL)
                         .usage(usage)
                         .sharing_mode(vk::SharingMode::EXCLUSIVE)
@@ -879,7 +911,7 @@ impl Device {
             d.bind_image_memory(image, memory.memory, memory.offset)
                 .expect("Vulkan bound no memory");
             Arc::new(RawImage {
-                device: self.0.clone(),
+                device: self.shared(),
                 image,
                 memory,
                 format: desc.format,
@@ -890,14 +922,7 @@ impl Device {
                 },
                 swapchain: false,
                 usage,
-                samples,
-                home: if samples > 1 {
-                    if depth {
-                        vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL
-                    } else {
-                        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
-                    }
-                } else if desc.usage.storage {
+                home: if desc.usage.storage {
                     vk::ImageLayout::GENERAL
                 } else if depth {
                     vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL
@@ -908,9 +933,16 @@ impl Device {
                 layers: array,
             })
         };
-        if samples == 1 {
-            lock(&self.0.pending).push(Pending::Clear { dst: raw.clone() });
-        }
+        // A compressed format is zeroed by copies, from zeros enough for its first level.
+        let zeros = desc.format.is_compressed().then(|| {
+            let bytes = desc.format.bytes_of(extent.width, extent.height)
+                * u64::from(extent.depth)
+                * u64::from(array);
+            let zeros = vec![0u8; bytes as usize];
+            let (staging, at) = self.staging(&zeros, u64::from(COPY_BYTES_PER_ROW_ALIGNMENT));
+            (staging, at, extent)
+        });
+        lock(&self.0.pending).push(Pending::Clear { dst: raw.clone(), zeros });
         Texture {
             raw,
             format: desc.format,
@@ -965,7 +997,7 @@ impl Device {
             .image_info(&image);
         // SAFETY: as a view's (`Texture::create_view`).
         unsafe { self.raw().update_descriptor_sets(&[write], &[]) };
-        Sampler { raw: Arc::new(RawSampler { device: self.0.clone(), raw, index }) }
+        Sampler { raw: Arc::new(RawSampler { device: self.shared(), raw, index }) }
     }
 
     pub fn create_query_set(&self, count: u32) -> Result<QuerySet> {
@@ -983,7 +1015,7 @@ impl Device {
                 )
                 .map_err(|e| Error(format!("Vulkan made no query pool: {e}")))?
         };
-        Ok(QuerySet { raw: Arc::new(RawQueries { device: self.0.clone(), pool, count }) })
+        Ok(QuerySet { raw: Arc::new(RawQueries { device: self.shared(), pool, count }) })
     }
 
     pub fn create_bind_group_layout(&self, entries: &[LayoutEntry]) -> BindGroupLayout {
@@ -1037,7 +1069,7 @@ impl Device {
             let pipeline =
                 d.create_pipeline_layout(&info, None).expect("Vulkan made no pipeline layout");
             BindGroupLayout(Arc::new(Layout {
-                device: self.0.clone(),
+                device: self.shared(),
                 entries: entries.to_vec(),
                 numbers,
                 sizes,
@@ -1175,7 +1207,7 @@ impl Device {
                 d.update_descriptor_sets(&vk_writes, &[]);
             }
             BindGroup(Arc::new(Group {
-                device: self.0.clone(),
+                device: self.shared(),
                 layout: layout.0.clone(),
                 pool,
                 set,
@@ -1207,7 +1239,7 @@ impl Device {
                 .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)
                 .map_err(|e| Error(format!("{label}: Vulkan made no shader module: {e}")))?
         };
-        Ok(ShaderModule { raw: Arc::new(RawModule { device: self.0.clone(), raw }) })
+        Ok(ShaderModule { raw: Arc::new(RawModule { device: self.shared(), raw }) })
     }
 
     pub fn create_compute_pipeline(
@@ -1228,7 +1260,7 @@ impl Device {
             )?[0]
         };
         Ok(ComputePipeline {
-            raw: Arc::new(RawPipeline { device: self.0.clone(), raw }),
+            raw: Arc::new(RawPipeline { device: self.shared(), raw }),
             layout: desc.layout.0.clone(),
         })
     }
@@ -1271,7 +1303,7 @@ impl Device {
                 .depth_bias_clamp(d.bias.clamp);
         }
         let multisample = vk::PipelineMultisampleStateCreateInfo::default()
-            .rasterization_samples(sample_count(desc.samples));
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
         let depth_state = match &desc.depth {
             Some(d) => vk::PipelineDepthStencilStateCreateInfo::default()
                 .depth_test_enable(true)
@@ -1309,7 +1341,7 @@ impl Device {
             )?[0]
         };
         Ok(RenderPipeline {
-            raw: Arc::new(RawPipeline { device: self.0.clone(), raw }),
+            raw: Arc::new(RawPipeline { device: self.shared(), raw }),
             layout: desc.layout.0.clone(),
         })
     }
@@ -1446,16 +1478,34 @@ impl Device {
         let r = unsafe { self.raw().queue_submit2(self.0.queue, &[submit], vk::Fence::null()) };
         if let Err(e) = r {
             lock(&self.0.errors).push(format!("Vulkan refused a submission: {e}"));
+            // Nothing will signal `index`: once every submission before it is done, the host
+            // does, so a wait for it ends and what it held is let go (its command buffers never
+            // ran). A lost device fails the wait, and is reported so.
+            let sems = [self.0.timeline];
+            let before = [index - 1];
+            let info = vk::SemaphoreWaitInfo::default().semaphores(&sems).values(&before);
+            // SAFETY: waiting on, then signalling, the timeline semaphore past every value
+            // signalled or to be signalled (this is the latest submission).
+            let signalled = unsafe {
+                self.raw().wait_semaphores(&info, u64::MAX).and_then(|()| {
+                    self.raw().signal_semaphore(
+                        &vk::SemaphoreSignalInfo::default().semaphore(self.0.timeline).value(index),
+                    )
+                })
+            };
+            if let Err(e) = signalled {
+                lock(&self.0.errors).push(format!("Vulkan lost the device: {e}"));
+            }
         }
         let mut f = lock(&self.0.in_flight);
-        for p in pools {
-            f.push((index, p, Vec::new()));
+        // Its pools, the last holding what it keeps (none: an entry of its own, never one of a
+        // submission before it).
+        let mut entries: Vec<_> = pools.into_iter().map(|p| (index, p, Vec::new())).collect();
+        match entries.last_mut() {
+            Some(last) => last.2 = keep,
+            None => entries.push((index, vk::CommandPool::null(), keep)),
         }
-        if let Some(last) = f.last_mut() {
-            last.2 = keep;
-        } else {
-            f.push((index, vk::CommandPool::null(), keep));
-        }
+        f.extend(entries);
         drop(f);
         self.reclaim();
         index
@@ -1875,8 +1925,6 @@ struct RawImage {
     swapchain: bool,
     /// What it may be used as: a view of it is in the table's arrays it can be in.
     usage: vk::ImageUsageFlags,
-    /// Samples per pixel (`1` or `4`).
-    samples: u8,
 }
 
 impl RawImage {
@@ -1908,7 +1956,13 @@ impl RawImage {
 /// stages).
 fn layout_sync(layout: vk::ImageLayout, src: bool) -> (vk::PipelineStageFlags2, vk::AccessFlags2) {
     match layout {
-        vk::ImageLayout::UNDEFINED => (vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE),
+        // Its contents dropped, but the move still waits on everything before (no access): the
+        // stage chains it to a frame's acquisition and to the last barrier, so it can't land
+        // while the display or an earlier pass still uses the image (`NONE` would order it after
+        // nothing).
+        vk::ImageLayout::UNDEFINED => {
+            (vk::PipelineStageFlags2::ALL_COMMANDS, vk::AccessFlags2::NONE)
+        }
         vk::ImageLayout::TRANSFER_DST_OPTIMAL => (
             vk::PipelineStageFlags2::COPY | vk::PipelineStageFlags2::CLEAR,
             vk::AccessFlags2::TRANSFER_WRITE,
@@ -2068,18 +2122,6 @@ impl Texture {
                 .expect("Vulkan made no image view")
         };
         let level = desc.base_level;
-        if self.raw.samples > 1 {
-            return TextureView {
-                raw: Arc::new(RawView {
-                    image: self.raw.clone(),
-                    view,
-                    range,
-                    width: (self.width >> level).max(1),
-                    height: (self.height >> level).max(1),
-                    index: NO_INDEX,
-                }),
-            };
-        }
         // Its index in the table: a sampled image there, and a storage image where it can be
         // one (a kernel may write it: one level, not a cube).
         let device = &self.raw.device;
@@ -2581,13 +2623,36 @@ impl CommandEncoder {
                     keep.push(Keep::Buffer(staging.clone()));
                     keep.push(Keep::Image(dst.clone()));
                 }
-                Pending::Clear { dst } => {
+                Pending::Clear { dst, zeros } => {
                     keep.push(Keep::Image(dst.clone()));
                     // From nothing to a copy's target, zeroed, then home.
                     let range = dst.all();
                     let to = vk::ImageLayout::TRANSFER_DST_OPTIMAL;
                     transition(d, cb, dst.image, range, vk::ImageLayout::UNDEFINED, to);
-                    if dst.aspect == vk::ImageAspectFlags::DEPTH {
+                    if let Some((staging, at, extent)) = zeros {
+                        // Each level whole, every layer, from the same zeros (tightly packed).
+                        let regions: Vec<vk::BufferImageCopy> = (0..dst.levels)
+                            .map(|level| vk::BufferImageCopy {
+                                buffer_offset: *at,
+                                buffer_row_length: 0,
+                                buffer_image_height: 0,
+                                image_subresource: vk::ImageSubresourceLayers {
+                                    aspect_mask: dst.aspect,
+                                    mip_level: level,
+                                    base_array_layer: 0,
+                                    layer_count: dst.layers,
+                                },
+                                image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+                                image_extent: vk::Extent3D {
+                                    width: (extent.width >> level).max(1),
+                                    height: (extent.height >> level).max(1),
+                                    depth: (extent.depth >> level).max(1),
+                                },
+                            })
+                            .collect();
+                        d.cmd_copy_buffer_to_image(cb, staging.buffer, dst.image, to, &regions);
+                        keep.push(Keep::Buffer(staging.clone()));
+                    } else if dst.aspect == vk::ImageAspectFlags::DEPTH {
                         d.cmd_clear_depth_stencil_image(
                             cb,
                             dst.image,
@@ -2798,7 +2863,9 @@ impl CommandEncoder {
         offset: u64,
     ) {
         self.barrier_all();
-        // SAFETY: results of written queries, into a live buffer.
+        // SAFETY: results of written queries, into a live buffer. Without `WAIT`: the barrier
+        // before has every timestamp recorded before it written, and one never written leaves
+        // its slot as it was, where `WAIT` would hold the GPU until it's lost.
         unsafe {
             self.d().cmd_copy_query_pool_results(
                 self.raw,
@@ -2808,10 +2875,11 @@ impl CommandEncoder {
                 dst.raw.buffer,
                 offset,
                 8,
-                vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+                vk::QueryResultFlags::TYPE_64,
             )
         };
         self.hold(Held::Buffer(dst.raw.clone()));
+        self.keep.push(Keep::Queries(queries.raw.clone()));
         self.barrier_all();
     }
 
@@ -2847,35 +2915,19 @@ impl CommandEncoder {
         ComputePass { encoder: self, layout: None, end, bound: None }
     }
 
-    /// A pass's attachment `v`, `cleared` as it begins or not, and the view it resolves into, if
-    /// any, moved into `to`, the layout drawing takes, and kept until the submission is done. A
-    /// multisampled attachment comes from `UNDEFINED` where it's cleared and stays in `to` after
-    /// the pass; a single-sampled one, and the resolve target, go home as it ends (`targets`).
-    /// A swapchain's image comes from `UNDEFINED` (a resolve target's only where its flag says to
-    /// check).
+    /// A pass's attachment `v` moved out of its home into `to`, the layout drawing takes, to go
+    /// home as the pass ends (`targets`), and kept until the submission is done. A swapchain's
+    /// image comes from `UNDEFINED`: it's drawn whole each frame.
     fn attach(
         &mut self,
         targets: &mut Vec<(Arc<RawView>, vk::ImageLayout)>,
         to: vk::ImageLayout,
         v: &Arc<RawView>,
-        cleared: bool,
-        resolve: Option<(&Arc<RawView>, bool)>,
     ) {
-        let undefined_if = |yes: bool, home| if yes { vk::ImageLayout::UNDEFINED } else { home };
-        let multisampled = v.image.samples > 1;
-        let from =
-            undefined_if(if multisampled { cleared } else { v.image.swapchain }, v.image.home);
+        let from = if v.image.swapchain { vk::ImageLayout::UNDEFINED } else { v.image.home };
         transition(self.d(), self.raw, v.image.image, v.range, from, to);
-        if !multisampled {
-            targets.push((v.clone(), to));
-        }
+        targets.push((v.clone(), to));
         self.hold(Held::View(v.clone()));
-        if let Some((r, swapchain_checked)) = resolve {
-            let from = undefined_if(swapchain_checked && r.image.swapchain, r.image.home);
-            transition(self.d(), self.raw, r.image.image, r.range, from, to);
-            targets.push((r.clone(), to));
-            self.hold(Held::View(r.clone()));
-        }
     }
 
     pub fn begin_render_pass(&mut self, desc: &RenderPassDesc<'_>) -> RenderPass<'_> {
@@ -2884,36 +2936,19 @@ impl CommandEncoder {
         // Its targets, out of their homes into the layouts drawing takes.
         let mut targets: Vec<(Arc<RawView>, vk::ImageLayout)> = Vec::new();
         for c in desc.colors {
-            let cleared = matches!(c.load, LoadOp::Clear(_));
-            let resolve = c.resolve.map(|r| (&r.raw, true));
-            let to = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
-            self.attach(&mut targets, to, &c.view.raw, cleared, resolve);
+            self.attach(&mut targets, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, &c.view.raw);
         }
         if let Some(d) = &desc.depth {
-            let cleared = matches!(d.load, LoadOp::Clear(_));
-            // (A depth resolve target is never a swapchain's image.)
-            let resolve = d.resolve.map(|r| (&r.raw, false));
-            let to = vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL;
-            self.attach(&mut targets, to, &d.view.raw, cleared, resolve);
+            self.attach(&mut targets, vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL, &d.view.raw);
         }
         let colors: Vec<vk::RenderingAttachmentInfo<'_>> = desc
             .colors
             .iter()
             .map(|c| {
-                let mut a = vk::RenderingAttachmentInfo::default()
+                let a = vk::RenderingAttachmentInfo::default()
                     .image_view(c.view.raw.view)
                     .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                    .store_op(if c.store {
-                        vk::AttachmentStoreOp::STORE
-                    } else {
-                        vk::AttachmentStoreOp::DONT_CARE
-                    });
-                if let Some(r) = c.resolve {
-                    a = a
-                        .resolve_mode(vk::ResolveModeFlags::AVERAGE)
-                        .resolve_image_view(r.raw.view)
-                        .resolve_image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
-                }
+                    .store_op(vk::AttachmentStoreOp::STORE);
                 match c.load {
                     LoadOp::Load => a.load_op(vk::AttachmentLoadOp::LOAD),
                     LoadOp::Clear(v) => {
@@ -2925,20 +2960,10 @@ impl CommandEncoder {
             })
             .collect();
         let depth = desc.depth.as_ref().map(|d| {
-            let mut a = vk::RenderingAttachmentInfo::default()
+            let a = vk::RenderingAttachmentInfo::default()
                 .image_view(d.view.raw.view)
                 .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
-                .store_op(if d.store {
-                    vk::AttachmentStoreOp::STORE
-                } else {
-                    vk::AttachmentStoreOp::DONT_CARE
-                });
-            if let Some(r) = d.resolve {
-                a = a
-                    .resolve_mode(vk::ResolveModeFlags::SAMPLE_ZERO)
-                    .resolve_image_view(r.raw.view)
-                    .resolve_image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL);
-            }
+                .store_op(vk::AttachmentStoreOp::STORE);
             match d.load {
                 LoadOp::Load => a.load_op(vk::AttachmentLoadOp::LOAD),
                 LoadOp::Clear(v) => {
@@ -2983,6 +3008,21 @@ impl CommandEncoder {
             let slot = clock_slot(seq, true);
             stamp(self.d(), self.raw, vk::PipelineStageFlags2::ALL_COMMANDS, queries, slot);
         }
+        // What it wrote, the host sees once its submission is done (a mappable buffer read in
+        // place, `Buffer::read`): waiting for the submission alone makes no write visible to
+        // the host.
+        let to_host = [vk::MemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+            .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::HOST)
+            .dst_access_mask(vk::AccessFlags2::HOST_READ)];
+        // SAFETY: a barrier in a recording command buffer.
+        unsafe {
+            self.d().cmd_pipeline_barrier2(
+                self.raw,
+                &vk::DependencyInfo::default().memory_barriers(&to_host),
+            )
+        };
         // SAFETY: the recording ends.
         unsafe { self.d().end_command_buffer(self.raw).expect("Vulkan ended no command buffer") };
         let keep = std::mem::take(&mut self.keep);
@@ -3298,11 +3338,6 @@ pub fn vk_format(f: TextureFormat) -> vk::Format {
 /// format), as `VkBufferImageCopy` takes its length.
 fn texels_per_row(format: TextureFormat, bytes_per_row: u32) -> u32 {
     bytes_per_row / format.bytes_per_texel() * format.block()
-}
-
-/// Samples per pixel (`1` or `4`) as Vulkan counts them.
-fn sample_count(samples: u8) -> vk::SampleCountFlags {
-    if samples == 4 { vk::SampleCountFlags::TYPE_4 } else { vk::SampleCountFlags::TYPE_1 }
 }
 
 fn compare_op(c: Compare) -> vk::CompareOp {
@@ -3633,6 +3668,11 @@ impl Surface {
             }
             let old = self.swapchain;
             let _ = d.raw.device_wait_idle();
+            // Every wait for a present of the old swapchain done while it can still be waited
+            // on: making the new one retires it (VUID-vkWaitForPresentKHR-swapchain-04997).
+            if let Some(w) = &self.waiter {
+                w.drain();
+            }
             let swapchain = self
                 .swapchain_fns
                 .create_swapchain(
@@ -3654,9 +3694,6 @@ impl Surface {
                 )
                 .map_err(|e| Error(format!("Vulkan made no swapchain: {e}")))?;
             self.release();
-            if let Some(w) = &self.waiter {
-                w.drain();
-            }
             if old != vk::SwapchainKHR::null() {
                 self.swapchain_fns.destroy_swapchain(old, None);
             }
@@ -3667,7 +3704,7 @@ impl Surface {
                 .map_err(|e| Error(format!("the swapchain: {e}")))?;
             for image in images {
                 let raw = Arc::new(RawImage {
-                    device: d.clone(),
+                    device: device.shared(),
                     image,
                     memory: Allocation::NONE,
                     format: texel,
@@ -3677,7 +3714,6 @@ impl Surface {
                     home: vk::ImageLayout::PRESENT_SRC_KHR,
                     swapchain: true,
                     usage: vk::ImageUsageFlags::COLOR_ATTACHMENT,
-                    samples: 1,
                 });
                 let range = raw.part(0, 0, 1);
                 let view = d
@@ -3787,8 +3823,21 @@ impl Surface {
             info = info.push_next(&mut present_id);
         }
         // SAFETY: the image was acquired and its rendering submitted, signalling `rendered`.
-        unsafe { self.swapchain_fns.queue_present(self.device.0.queue, &info) }
-            .map_err(|e| Error(format!("the swapchain: {e}")))?;
+        match unsafe { self.swapchain_fns.queue_present(self.device.0.queue, &info) } {
+            Ok(_) => {}
+            // The window changed under it (a resize between acquiring and presenting): the
+            // frame isn't shown, and the swapchain is made again as configured, as an
+            // acquisition's out-of-date error has the host do. The present's wait on
+            // `rendered` still runs; configuring waits for the device to be idle.
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                drop(frame);
+                if let Some(c) = self.config {
+                    self.configure(&c)?;
+                }
+                return Ok(id);
+            }
+            Err(e) => return Err(Error(format!("the swapchain: {e}"))),
+        }
         if self.device.0.present_wait {
             let presented = self.presented.clone();
             let w = self.waiter.get_or_insert_with(|| Waiter::new(&self.device, presented));

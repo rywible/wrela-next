@@ -26,6 +26,10 @@ use std::collections::{HashMap, HashSet};
 /// pass by pass: it is charged whole to the pass it is in.
 pub const SMALL_SHARE: u64 = 64;
 
+/// The work of a pass's charge ([`Charge::head`]), as the work count counts it: the comparison,
+/// its `if` and the subtraction. A pass pays for its own charge.
+const HEAD: u64 = 3 * work::OP;
+
 /// The flag's bit that says a lane ran out of fuel (the rest of the flag is the pipeline's
 /// number, from 1). A bounds check's flag is the number alone, so a fuel fault is the larger:
 /// the flag keeps the largest.
@@ -228,7 +232,8 @@ struct Costs<'a> {
 }
 
 impl Costs<'_> {
-    /// One pass of loop `ord` of function `func` (`f`): its `body` and its `continuing`.
+    /// One pass of loop `ord` of function `func` (`f`): its `body` and its `continuing`, and the
+    /// charge itself ([`HEAD`]).
     fn pass(
         &mut self,
         func: usize,
@@ -241,7 +246,7 @@ impl Costs<'_> {
         let mut inner = ord + 1;
         let a = self.block(func, f, body, &mut inner);
         let b = self.block(func, f, continuing, &mut inner);
-        a.saturating_add(b)
+        a.saturating_add(b).saturating_add(HEAD)
     }
 
     /// The most a way through `b` can do, its small loops whole and its charged ones not at
@@ -252,10 +257,11 @@ impl Costs<'_> {
             let c = match s {
                 Stmt::Let(_, e) | Stmt::Eval(e) => self.expr(f, e),
                 Stmt::Store(p, _) => self.store(p),
+                // The test, as the work count counts it, and the costlier side.
                 Stmt::If { then, else_, .. } => {
                     let t = self.block(func, f, then, ord);
                     let e = self.block(func, f, else_, ord);
-                    t.max(e)
+                    work::OP.saturating_add(t.max(e))
                 }
                 Stmt::Loop { body, continuing } => {
                     let here = *ord;
@@ -299,17 +305,20 @@ impl Costs<'_> {
         c
     }
 
-    /// A store's own cost (the value's is its `Let`'s): a write of storage or workgroup memory.
+    /// A store's own cost (the value's is its `Let`'s): a write of storage or workgroup memory,
+    /// and its index, as the work count counts it.
     fn store(&self, p: &Place) -> u64 {
-        match &p.root {
-            PlaceRoot::Resource(r) => match self.m.resources[r.index()].kind {
-                ResourceKind::StorageReadWrite => work::MEMORY,
-                ResourceKind::Workgroup => work::SHARED,
+        let index = if p.has_index() { work::OP } else { 0 };
+        index
+            + match &p.root {
+                PlaceRoot::Resource(r) => match self.m.resources[r.index()].kind {
+                    ResourceKind::StorageReadWrite => work::MEMORY,
+                    ResourceKind::Workgroup => work::SHARED,
+                    _ => 0,
+                },
+                PlaceRoot::Ptr(_) | PlaceRoot::Param(_) => work::MEMORY,
                 _ => 0,
-            },
-            PlaceRoot::Ptr(_) | PlaceRoot::Param(_) => work::MEMORY,
-            _ => 0,
-        }
+            }
     }
 }
 

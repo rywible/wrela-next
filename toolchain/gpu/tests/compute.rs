@@ -115,7 +115,8 @@ fn a_kernel_writes_a_buffer_the_cpu_reads_back() {
     enc.copy_buffer_to_buffer(&out, 0, &read, 0, u64::from(n) * 4);
     let done = device.submit(vec![enc.finish()]);
     device.wait(done);
-    assert!(device.take_errors().is_empty(), "{:?}", device.take_errors());
+    let errors = device.take_errors();
+    assert!(errors.is_empty(), "{errors:?}");
     let bytes = read.read(0, u64::from(n) * 4).expect("read back");
     let words: Vec<u32> =
         bytes.chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();

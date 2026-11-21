@@ -25,7 +25,10 @@
 //! magnitude (`|c| + Σ|lᵢ| + err`), as many as its own arithmetic and the point code's rounding of
 //! the same operation take together (more on the GPU, by WGSL's bounds), and a subnormal. The
 //! input's centre carries its own rounding in its error. An unbounded error is held at `BIG`, so
-//! no `∞ × 0` makes a NaN; a NaN that gets through makes the plain interval the answer.
+//! no `∞ × 0` makes a NaN. A form that reaches past `CAP` stands for no bound: what a product, a
+//! quotient or a builtin makes of it is every number (a small factor doesn't bound it), a
+//! comparison of it decides nothing, and as the answer it leaves the plain interval's ends, as a
+//! NaN that gets through does.
 
 use super::*;
 use std::collections::{HashMap, HashSet};
@@ -176,10 +179,15 @@ pub(super) fn affine(
     let p = g.let_(&mut body, interval_ty, Expr::Call(plain, pargs));
     let plo = g.let_(&mut body, f32, Expr::Extract(p, 0));
     let phi = g.let_(&mut body, f32, Expr::Extract(p, 1));
-    // The tighter end of the two; a NaN end of the form's leaves the plain one.
+    // The tighter end of the two; a NaN end of the form's leaves the plain one, and so does a
+    // form that reaches past `CAP`, which stands for no bound (`Af::within`).
     let b = m.types.bool();
+    let cap = g.let_(&mut body, f32, Expr::Const(Const::F32(CAP as f32)));
+    let fine = g.let_(&mut body, b, Expr::Binary(BinOp::Le, mg, cap));
     let lo_ok = g.let_(&mut body, b, Expr::Binary(BinOp::Gt, alo, plo));
+    let lo_ok = g.let_(&mut body, b, Expr::Binary(BinOp::And, lo_ok, fine));
     let hi_ok = g.let_(&mut body, b, Expr::Binary(BinOp::Lt, ahi, phi));
+    let hi_ok = g.let_(&mut body, b, Expr::Binary(BinOp::And, hi_ok, fine));
     let rlo = g.let_(&mut body, f32, Expr::Select { cond: lo_ok, if_true: alo, if_false: plo });
     let rhi = g.let_(&mut body, f32, Expr::Select { cond: hi_ok, if_true: ahi, if_false: phi });
     let out = g.let_(&mut body, interval_ty, Expr::Construct(interval_ty, vec![rlo, rhi]));
@@ -229,7 +237,8 @@ fn derive(
             for k in 0..=n {
                 pparts[i].push(nf.params.len() as u32);
                 let name = if k < n { format!("{}_l{k}", p.name) } else { format!("{}_e", p.name) };
-                nf.params.push(Param { name, ty: p.ty, by_ref: p.by_ref, mutable: false });
+                // A `mut` parameter's slopes and error are written with it.
+                nf.params.push(Param { name, ty: p.ty, by_ref: p.by_ref, mutable: p.mutable });
             }
         }
     }
@@ -267,6 +276,7 @@ fn derive(
         }));
     }
     cache.affine_open.push(key.clone());
+    let ptrs = Pointers::of(m, &func);
     let mut b = Af {
         m,
         cache,
@@ -283,6 +293,7 @@ fn derive(
         zeros: HashSet::new(),
         returns,
         speculative: 0,
+        ptrs,
     };
     let built = (|| -> R<Block> {
         let mut body = Vec::new();
@@ -343,6 +354,9 @@ struct Af<'a> {
     returns: bool,
     /// How many branches on the input the code being derived is under.
     speculative: u32,
+    /// Where each pointer may point: a write through one into an active place would change its
+    /// centre and leave its slopes and error behind.
+    ptrs: Pointers,
 }
 
 impl Builder for Af<'_> {
@@ -653,7 +667,7 @@ impl Af<'_> {
     }
 
     /// `a × b`: `a.c b.c + a.c b.l + b.c a.l`, and in `err` each error through the other's
-    /// centre and the product of the radii (each held at `CAP`).
+    /// centre and the product of the radii; every number where either reaches past `CAP`.
     fn mul(&mut self, out: &mut Block, a: &A, b: &A, ty: TypeId) -> A {
         if self.is_exact(b) {
             return self.scale(out, a, b.c, ty);
@@ -661,8 +675,9 @@ impl Af<'_> {
         if self.is_exact(a) {
             return self.scale(out, b, a.c, ty);
         }
-        let a = &self.held(out, a, ty);
-        let b = &self.held(out, b, ty);
+        let (a, oka) = self.held(out, a, ty);
+        let (b, okb) = self.held(out, b, ty);
+        let (a, b) = (&a, &b);
         let c = self.bin(out, BinOp::Mul, a.c, b.c, ty);
         let mut l = Vec::new();
         for i in 0..self.n {
@@ -703,12 +718,29 @@ impl Af<'_> {
         // And the margin's own rounding: an ulp of it.
         let k = self.k(out, ty, 1.0 + 2.0 * EPS);
         let m = self.bin(out, BinOp::Mul, m, k, ty);
-        self.grown(out, A { c, l, e }, ty, (0.0, 0.0), Some(m))
+        let r = self.grown(out, A { c, l, e }, ty, (0.0, 0.0), Some(m));
+        // An operand past `CAP` (every number) makes every number of the product: its radius
+        // was held to `CAP` above only to keep the arithmetic finite, which bounds nothing.
+        let bt = self.bool_ty;
+        let ok = self.emit(out, bt, Expr::Binary(BinOp::And, oka, okb));
+        let every = self.every(out, ty);
+        self.pick(out, ok, &r, &every)
     }
 
     /// `a`, or every number where it reaches past `CAP` (so a product of two stays finite and
-    /// makes no `∞ × 0`).
-    fn held(&mut self, out: &mut Block, a: &A, ty: TypeId) -> A {
+    /// makes no `∞ × 0`), and whether it reaches no further than `CAP` (`within`).
+    fn held(&mut self, out: &mut Block, a: &A, ty: TypeId) -> (A, ValueId) {
+        let ok = self.within(out, a);
+        let every = self.every(out, ty);
+        (self.pick(out, ok, a, &every), ok)
+    }
+
+    /// Whether every value of `a` is within `CAP` of 0 (a `bool`; false for a NaN). One that
+    /// reaches past it is taken as every number, as an error of `BIG` is: `BIG` stands for no
+    /// bound, so what a rule makes of it (a scaling by a small number, a product, a root) is
+    /// no bound either, however small the number it comes to.
+    fn within(&mut self, out: &mut Block, a: &A) -> ValueId {
+        let ty = self.ty(a.c);
         let m = self.magnitude(out, a, ty);
         // A vector's largest component (a select takes one `bool`): the whole vector is every
         // number where any component is.
@@ -725,9 +757,23 @@ impl Af<'_> {
             None => m,
         };
         let cap = self.k(out, f, CAP);
-        let ok = self.cmp(out, BinOp::Le, m, cap);
+        self.cmp(out, BinOp::Le, m, cap)
+    }
+
+    /// `r`, or every number unless each of `forms` is `within` `CAP`.
+    fn unless_unbounded(&mut self, out: &mut Block, forms: &[A], r: A, ty: TypeId) -> A {
+        let bt = self.bool_ty;
+        let mut ok = None;
+        for a in forms {
+            let w = self.within(out, a);
+            ok = Some(match ok {
+                Some(o) => self.emit(out, bt, Expr::Binary(BinOp::And, o, w)),
+                None => w,
+            });
+        }
+        let Some(ok) = ok else { return r };
         let every = self.every(out, ty);
-        self.pick(out, ok, a, &every)
+        self.pick(out, ok, &r, &every)
     }
 
     /// Every number: centre 0, error `BIG`.
@@ -1101,7 +1147,7 @@ impl Af<'_> {
         let d = self.add(out, &a, &b, ty, true);
         let (lo, hi) = self.ends(out, &d, ty);
         let z = self.k(out, ty, 0.0);
-        Ok(match op {
+        let (st, sf) = match op {
             BinOp::Lt => (self.cmp(out, BinOp::Lt, hi, z), self.cmp(out, BinOp::Ge, lo, z)),
             BinOp::Le => (self.cmp(out, BinOp::Le, hi, z), self.cmp(out, BinOp::Gt, lo, z)),
             BinOp::Gt => (self.cmp(out, BinOp::Gt, lo, z), self.cmp(out, BinOp::Le, hi, z)),
@@ -1115,7 +1161,17 @@ impl Af<'_> {
                 if op == BinOp::Eq { (never, apart) } else { (apart, never) }
             }
             _ => return Err(Error::not_derivable("a comparison with no affine rule")),
-        })
+        };
+        // An operand of no bound (`within`) decides nothing.
+        let active: Vec<A> = [x, y].iter().filter_map(|v| self.forms.get(v).cloned()).collect();
+        let mut sure = (st, sf);
+        for a in &active {
+            let ok = self.within(out, a);
+            let bt = self.bool_ty;
+            sure.0 = self.emit(out, bt, Expr::Binary(BinOp::And, sure.0, ok));
+            sure.1 = self.emit(out, bt, Expr::Binary(BinOp::And, sure.1, ok));
+        }
+        Ok(sure)
     }
 
     /// The type two operands meet at (the vector, where one is a scalar).
@@ -1208,28 +1264,68 @@ impl Af<'_> {
         Ok(())
     }
 
-    fn written(b: &Block, into: &mut Vec<LocalId>) {
-        crate::visit::walk(b, &mut |s| {
-            if let Stmt::Store(Place { root: PlaceRoot::Local(l), .. }, _) = s
-                && !into.contains(l)
-            {
-                into.push(*l);
+    /// The locals and parameters a block may write: by a store, or lent to a callee's `mut`
+    /// parameter. (A write through a pointer into an active place is refused where it is.)
+    fn written(&self, b: &Block, into: &mut Vec<PlaceRoot>) {
+        let mut add = |r: &PlaceRoot| {
+            if matches!(r, PlaceRoot::Local(_) | PlaceRoot::Param(_)) && !into.contains(r) {
+                into.push(r.clone());
             }
+        };
+        crate::visit::walk(b, &mut |s| match s {
+            Stmt::Store(p, _) => add(&p.root),
+            Stmt::Let(_, Expr::Call(g, args)) | Stmt::Eval(Expr::Call(g, args)) => {
+                for (a, p) in args.iter().zip(&self.m.functions[g.index()].params) {
+                    if let (Arg::Place(pl), true) = (a, p.mutable) {
+                        add(&pl.root);
+                    }
+                }
+            }
+            _ => {}
         });
     }
 
-    /// A local's whole state: its form, or its certainty.
-    fn load_state(&mut self, out: &mut Block, l: LocalId) -> R<State> {
-        let p = Place::local(l);
-        if self.is_bool_root(&p.root) {
+    /// The type of a local or a parameter.
+    fn root_ty(&self, r: &PlaceRoot) -> R<TypeId> {
+        match r {
+            PlaceRoot::Local(l) => Ok(self.f.locals[l.index()].ty),
+            PlaceRoot::Param(i) => Ok(self.f.params[*i as usize].ty),
+            _ => Err(Error::internal("a joined place that isn't a local or a parameter")),
+        }
+    }
+
+    /// Whether a write to a place with root `r` may reach an active local or parameter through
+    /// a pointer (any, where it isn't known where it points).
+    fn reaches_active(&self, r: &PlaceRoot) -> bool {
+        let PlaceRoot::Ptr(v) = r else { return false };
+        let mut roots = Vec::new();
+        if self.ptrs.roots(*v, &mut roots).is_none() {
+            return self.lparts.iter().any(|p| !p.is_empty())
+                || self.pparts.iter().any(|p| !p.is_empty());
+        }
+        roots.iter().any(|r| self.active_root(r))
+    }
+
+    /// Whether a call lends a `mut` parameter a place through a pointer that may reach an
+    /// active local or parameter.
+    fn lends_through_pointer(&self, g: FuncId, args: &[Arg]) -> bool {
+        args.iter()
+            .zip(&self.m.functions[g.index()].params)
+            .any(|(a, p)| matches!(a, Arg::Place(pl) if p.mutable && self.reaches_active(&pl.root)))
+    }
+
+    /// A local's or parameter's whole state: its form, or its certainty.
+    fn load_state(&mut self, out: &mut Block, r: &PlaceRoot) -> R<State> {
+        let p = Place::root(r.clone());
+        if self.is_bool_root(r) {
             return Ok(State::Bool(self.load_sure(out, &p)?));
         }
-        let ty = self.f.locals[l.index()].ty;
+        let ty = self.root_ty(r)?;
         Ok(State::Float(self.load_form(out, &p, ty)?))
     }
 
-    fn store_state(&mut self, out: &mut Block, l: LocalId, s: &State) -> R<()> {
-        let p = Place::local(l);
+    fn store_state(&mut self, out: &mut Block, r: &PlaceRoot, s: &State) -> R<()> {
+        let p = Place::root(r.clone());
         match s {
             State::Bool(b) => self.store_sure(out, &p, *b),
             State::Float(a) => self.store_form(out, &p, a),
@@ -1238,6 +1334,13 @@ impl Af<'_> {
 
     fn stmt(&mut self, s: &Stmt, out: &mut Block) -> R<()> {
         match s {
+            Stmt::Let(_, Expr::Call(g, args)) | Stmt::Eval(Expr::Call(g, args))
+                if self.lends_through_pointer(*g, args) =>
+            {
+                Err(Error::not_derivable(
+                    "a call that may write through a pointer into what depends on the input",
+                ))
+            }
             Stmt::Let(v, Expr::Call(g, args)) if self.any_active(args) => {
                 self.call(Some(*v), *g, args, out)
             }
@@ -1257,39 +1360,42 @@ impl Af<'_> {
             Stmt::Store(_, v) if self.act.value(*v) => {
                 Err(Error::not_derivable("a store of what depends on the input into another place"))
             }
+            Stmt::Store(p, _) if self.reaches_active(&p.root) => Err(Error::not_derivable(
+                "a store through a pointer that may reach what depends on the input",
+            )),
             Stmt::If { cond, then, else_ } if self.act.value(*cond) => {
                 let sure = self.sure_of(out, *cond);
                 let mut roots = Vec::new();
-                Self::written(then, &mut roots);
-                Self::written(else_, &mut roots);
+                self.written(then, &mut roots);
+                self.written(else_, &mut roots);
                 // A join is of floats (or bools): an aggregate written under the branch isn't.
-                let agg = |l: &LocalId| {
-                    let t = self.f.locals[l.index()].ty;
-                    t != self.bool_ty && !is_float(&self.m.types, t)
-                };
-                if roots.iter().any(|l| self.lparts[l.index()].is_empty() || agg(l)) {
-                    return Err(Error::not_derivable(
-                        "a branch on the input that writes a place that isn't a float or a bool",
-                    ));
+                for r in &roots {
+                    let t = self.root_ty(r)?;
+                    if !self.active_root(r) || (t != self.bool_ty && !is_float(&self.m.types, t)) {
+                        return Err(Error::not_derivable(
+                            "a branch on the input that writes a place that isn't a float or a \
+                             bool",
+                        ));
+                    }
                 }
                 let mut before = Vec::new();
-                for l in &roots {
-                    before.push(self.load_state(out, *l)?);
+                for r in &roots {
+                    before.push(self.load_state(out, r)?);
                 }
                 self.speculative += 1;
                 self.block_into(then, out)?;
                 let mut after = Vec::new();
-                for (l, b) in roots.iter().zip(&before) {
-                    after.push(self.load_state(out, *l)?);
-                    self.store_state(out, *l, b)?;
+                for (r, b) in roots.iter().zip(&before) {
+                    after.push(self.load_state(out, r)?);
+                    self.store_state(out, r, b)?;
                 }
                 self.block_into(else_, out)?;
                 self.speculative -= 1;
-                for (l, t) in roots.iter().zip(after) {
-                    let e = self.load_state(out, *l)?;
+                for (r, t) in roots.iter().zip(after) {
+                    let e = self.load_state(out, r)?;
                     let j = match (t, e) {
                         (State::Float(t), State::Float(e)) => {
-                            let ty = self.f.locals[l.index()].ty;
+                            let ty = self.root_ty(r)?;
                             State::Float(self.join(out, sure, &t, &e, ty))
                         }
                         (State::Bool(t), State::Bool(e)) => {
@@ -1297,7 +1403,7 @@ impl Af<'_> {
                         }
                         _ => return Err(Error::internal("a local's state changed kind")),
                     };
-                    self.store_state(out, *l, &j)?;
+                    self.store_state(out, r, &j)?;
                 }
                 Ok(())
             }
@@ -1429,6 +1535,22 @@ impl Af<'_> {
             Expr::Binary(..) | Expr::Unary(..) => self.by_interval(out, e, ty)?,
             _ => return Err(Error::not_derivable("an expression with no affine rule")),
         };
+        // What can make a smaller number of no bound (`within`): a product, a quotient, a
+        // builtin, an interval's rule. A sum, a negation and what only moves parts keep an
+        // error of `BIG` as it is.
+        let operands: Vec<ValueId> = match e {
+            Expr::Binary(BinOp::Add | BinOp::Sub, ..) | Expr::Unary(UnOp::Neg, _) => Vec::new(),
+            Expr::Binary(_, x, y) => vec![*x, *y],
+            Expr::Unary(_, x) => vec![*x],
+            Expr::Builtin(_, xs) => xs.clone(),
+            _ => Vec::new(),
+        };
+        let forms: Vec<A> = operands
+            .iter()
+            .filter(|x| is_float(&self.m.types, self.f.value_ty(**x)))
+            .filter_map(|x| self.forms.get(x).cloned())
+            .collect();
+        let a = self.unless_unbounded(out, &forms, a, ty);
         self.forms.insert(v, a);
         Ok(())
     }
@@ -1842,6 +1964,10 @@ impl Af<'_> {
                     (&args[0], &args[1], &args[2])
             {
                 let r = self.smin(out, *a, *b, *k);
+                let ab: Vec<A> =
+                    [a, b].iter().filter_map(|x| self.forms.get(*x).cloned()).collect();
+                let f32 = self.m.types.f32();
+                let r = self.unless_unbounded(out, &ab, r, f32);
                 self.forms.insert(v, r);
                 return Ok(());
             }
@@ -1863,14 +1989,25 @@ impl Af<'_> {
                 new_args.push(a.clone());
                 continue;
             }
-            let f = self.arg_form(out, a)?;
             match a {
-                Arg::Place(_) => new_args.push(a.clone()),
-                Arg::Value(_) => new_args.push(Arg::Value(f.c)),
-            }
-            for x in f.l.iter().chain(std::iter::once(&f.e)) {
-                let arg = self.pass(out, *x, p.by_ref);
-                extra.push(arg);
+                // A place is lent with its slopes' and error's places, so what the callee writes
+                // through a `mut` parameter reaches all of the form.
+                Arg::Place(pl) if p.by_ref => {
+                    let ty = place_type(self.m, self.f, pl)?;
+                    if !self.active_root(&pl.root) || !floaty(&self.m.types, ty) {
+                        return Err(Error::not_derivable("an active argument that isn't a float"));
+                    }
+                    new_args.push(a.clone());
+                    extra.extend(self.place_parts(pl)?.into_iter().map(Arg::Place));
+                }
+                _ => {
+                    let f = self.arg_form(out, a)?;
+                    new_args.push(Arg::Value(f.c));
+                    for x in f.l.iter().chain(std::iter::once(&f.e)) {
+                        let arg = self.pass(out, *x, p.by_ref);
+                        extra.push(arg);
+                    }
+                }
             }
         }
         new_args.extend(extra);
@@ -1894,6 +2031,9 @@ impl Af<'_> {
     }
 
     /// A call whose callee has no affine form: its plain interval, from the arguments' ranges.
+    /// Each active argument is a float or a vector (a range of an aggregate is the interval's
+    /// own shape, which a form isn't turned into here); a place lent to a `mut` parameter gets
+    /// back the form of the range the callee leaves in it.
     fn call_by_interval(
         &mut self,
         out: &mut Block,
@@ -1907,11 +2047,25 @@ impl Af<'_> {
         if !is_float(&self.m.types, ty) {
             return Err(Error::not_derivable("a call with no affine form that isn't a float's"));
         }
+        for (a, bits) in args.iter().zip(mask) {
+            let t = match a {
+                Arg::Value(x) => self.f.value_ty(*x),
+                Arg::Place(p) => place_type(self.m, self.f, p)?,
+            };
+            if *bits != 0 && !is_float(&self.m.types, t) {
+                return Err(Error::not_derivable(
+                    "a call with no affine form given an aggregate that depends on the input",
+                ));
+            }
+        }
         let spec = self.speculative > 0;
         let dg =
             super::interval::derive(self.m, self.cache, g, mask.to_vec(), self.target, spec, None)?;
         let mut new_args = Vec::new();
         let mut his = Vec::new();
+        // The places lent to `mut` parameters, with the locals their range is passed in.
+        let mut back = Vec::new();
+        let mut given = Vec::new();
         for ((a, bits), p) in args.iter().zip(mask).zip(params) {
             if *bits == 0 {
                 new_args.push(a.clone());
@@ -1920,14 +2074,34 @@ impl Af<'_> {
             let f = self.arg_form(out, a)?;
             let t = self.ty(f.c);
             let (lo, hi) = self.ends(out, &f, t);
-            let lo = self.pass(out, lo, p.by_ref);
-            let hi = self.pass(out, hi, p.by_ref);
-            new_args.push(lo);
-            his.push(hi);
+            given.push(f);
+            if !p.by_ref {
+                new_args.push(Arg::Value(lo));
+                his.push(Arg::Value(hi));
+                continue;
+            }
+            let (ll, hl) = (self.nf.new_local("lo", t), self.nf.new_local("hi", t));
+            out.push(Stmt::Store(Place::local(ll), lo));
+            out.push(Stmt::Store(Place::local(hl), hi));
+            new_args.push(Arg::Place(Place::local(ll)));
+            his.push(Arg::Place(Place::local(hl)));
+            if let (Arg::Place(pl), true) = (a, p.mutable) {
+                back.push((pl.clone(), ll, hl, t));
+            }
         }
         new_args.extend(his);
+        // An argument of no bound (`within`) was passed as its form's ends, which bound
+        // nothing: what comes back is every number.
         let a = self.call_interval(out, dg, new_args, ty)?;
+        let a = self.unless_unbounded(out, &given, a, ty);
         self.forms.insert(v, a);
+        for (pl, ll, hl, t) in back {
+            let lo = self.emit(out, t, Expr::Load(Place::local(ll)));
+            let hi = self.emit(out, t, Expr::Load(Place::local(hl)));
+            let f = self.of_ends(out, lo, hi, t);
+            let f = self.unless_unbounded(out, &given, f, t);
+            self.store_form(out, &pl, &f)?;
+        }
         Ok(())
     }
 
@@ -1998,5 +2172,207 @@ impl Af<'_> {
         let whole = A { c: z, l: vec![z; self.n], e: one };
         let tighter = self.cmp(out, BinOp::Lt, wide, one);
         Ok(self.pick(out, tighter, &a, &whole))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `fn bump(x: mut f32) { x = x * 2.0 }` (`+ 1.0` with `add`).
+    fn bump(m: &mut Module, add: bool) -> FuncId {
+        let f32 = m.types.f32();
+        let x = Param { name: "x".into(), ty: f32, by_ref: true, mutable: true };
+        let mut g = Function::new("bump", vec![x], None);
+        let mut body = Vec::new();
+        let v = g.let_(&mut body, f32, Expr::Load(Place::root(PlaceRoot::Param(0))));
+        let k = g.let_(&mut body, f32, Expr::Const(Const::F32(if add { 1.0 } else { 2.0 })));
+        let op = if add { BinOp::Add } else { BinOp::Mul };
+        let w = g.let_(&mut body, f32, Expr::Binary(op, v, k));
+        body.push(Stmt::Store(Place::root(PlaceRoot::Param(0)), w));
+        body.push(Stmt::Return(None));
+        g.body = body;
+        m.add_function(g)
+    }
+
+    /// The derived function's statements, nested blocks included, in order.
+    fn flat(b: &Block, into: &mut Vec<Stmt>) {
+        for s in b {
+            into.push(s.clone());
+            for inner in s.blocks() {
+                flat(inner, into);
+            }
+        }
+    }
+
+    fn local_named(f: &Function, p: &Place) -> Option<String> {
+        match p.root {
+            PlaceRoot::Local(l) => Some(f.locals[l.index()].name.clone()),
+            _ => None,
+        }
+    }
+
+    /// A local lent to a `mut` parameter is lent with its slopes and error: the callee's writes
+    /// reach the whole form, not copies of its parts.
+    #[test]
+    fn a_mut_argument_lends_its_slopes_and_error() {
+        let mut m = Module::default();
+        let f32 = m.types.f32();
+        let g = bump(&mut m, false);
+        let mut f = Function::new("doubled", vec![Param::value("q", f32)], Some(f32));
+        let r = f.new_local("r", f32);
+        let mut body = Vec::new();
+        let q = f.let_(&mut body, f32, Expr::Param(0));
+        body.push(Stmt::Store(Place::local(r), q));
+        body.push(Stmt::Eval(Expr::Call(g, vec![Arg::Place(Place::local(r))])));
+        let y = f.let_(&mut body, f32, Expr::Load(Place::local(r)));
+        body.push(Stmt::Return(Some(y)));
+        f.body = body;
+        let id = m.add_function(f);
+        verify(&m).expect("the source is valid IR");
+        let d = derive(&mut m, &mut DeriveCache::default(), id, vec![1], 1, Target::Cpu)
+            .expect("a call through a `mut` parameter has an affine form");
+        verify(&m).expect("the affine form is valid IR");
+        let df = &m.functions[d.index()];
+        let mut all = Vec::new();
+        flat(&df.body, &mut all);
+        let lent: Vec<Vec<Option<String>>> = all
+            .iter()
+            .filter_map(|s| match s {
+                Stmt::Eval(Expr::Call(_, args)) => Some(
+                    args.iter()
+                        .map(|a| match a {
+                            Arg::Place(p) => local_named(df, p),
+                            Arg::Value(_) => None,
+                        })
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .collect();
+        let want = [Some("r".to_string()), Some("r_a0".to_string()), Some("r_a1".to_string())];
+        assert_eq!(lent, vec![want.to_vec()], "the call lends r's own parts");
+        let called = all.iter().find_map(|s| match s {
+            Stmt::Eval(Expr::Call(c, _)) => Some(*c),
+            _ => None,
+        });
+        let callee = &m.functions[called.expect("the call is there").index()];
+        assert!(callee.params.iter().all(|p| p.mutable), "the callee writes every part");
+    }
+
+    /// A branch on the input whose side writes a local through a call, or writes a `mut`
+    /// parameter, restores it for the other side and joins the two after.
+    #[test]
+    fn a_branch_joins_what_a_call_or_a_mut_parameter_writes() {
+        let mut m = Module::default();
+        let f32 = m.types.f32();
+        let bool_ty = m.types.bool();
+        let g = bump(&mut m, true);
+        // fn bumped(q: f32, y: f32) -> f32 { var r = q; if y > 0 { bump(mut r) }; r }
+        let mut f = Function::new(
+            "bumped",
+            vec![Param::value("q", f32), Param::value("y", f32)],
+            Some(f32),
+        );
+        let r = f.new_local("r", f32);
+        let mut body = Vec::new();
+        let q = f.let_(&mut body, f32, Expr::Param(0));
+        let y = f.let_(&mut body, f32, Expr::Param(1));
+        body.push(Stmt::Store(Place::local(r), q));
+        let z = f.let_(&mut body, f32, Expr::Const(Const::F32(0.0)));
+        let c = f.let_(&mut body, bool_ty, Expr::Binary(BinOp::Gt, y, z));
+        let then = vec![Stmt::Eval(Expr::Call(g, vec![Arg::Place(Place::local(r))]))];
+        body.push(Stmt::If { cond: c, then, else_: Vec::new() });
+        let v = f.let_(&mut body, f32, Expr::Load(Place::local(r)));
+        body.push(Stmt::Return(Some(v)));
+        f.body = body;
+        let id = m.add_function(f);
+        // fn bump_if(x: mut f32, y: f32) { if y > 0 { x = x + 1 } }
+        let x = Param { name: "x".into(), ty: f32, by_ref: true, mutable: true };
+        let mut h = Function::new("bump_if", vec![x, Param::value("y", f32)], None);
+        let mut body = Vec::new();
+        let y = h.let_(&mut body, f32, Expr::Param(1));
+        let z = h.let_(&mut body, f32, Expr::Const(Const::F32(0.0)));
+        let c = h.let_(&mut body, bool_ty, Expr::Binary(BinOp::Gt, y, z));
+        let mut then = Vec::new();
+        let v = h.let_(&mut then, f32, Expr::Load(Place::root(PlaceRoot::Param(0))));
+        let one = h.let_(&mut then, f32, Expr::Const(Const::F32(1.0)));
+        let w = h.let_(&mut then, f32, Expr::Binary(BinOp::Add, v, one));
+        then.push(Stmt::Store(Place::root(PlaceRoot::Param(0)), w));
+        body.push(Stmt::If { cond: c, then, else_: Vec::new() });
+        body.push(Stmt::Return(None));
+        h.body = body;
+        let hid = m.add_function(h);
+        verify(&m).expect("the source is valid IR");
+        let mut cache = DeriveCache::default();
+        let d = derive(&mut m, &mut cache, id, vec![1, 1], 2, Target::Cpu)
+            .expect("a branch around a call has an affine form");
+        let dh = derive(&mut m, &mut cache, hid, vec![1, 1], 2, Target::Cpu)
+            .expect("a branch writing a `mut` parameter has an affine form");
+        verify(&m).expect("the affine forms are valid IR");
+        // After the call, r is stored again: restored for the other side, then joined.
+        let df = &m.functions[d.index()];
+        let mut all = Vec::new();
+        flat(&df.body, &mut all);
+        let call = all
+            .iter()
+            .position(|s| matches!(s, Stmt::Eval(Expr::Call(..))))
+            .expect("the call is derived");
+        let stores_r = all[call..]
+            .iter()
+            .filter(
+                |s| matches!(s, Stmt::Store(p, _) if local_named(df, p).as_deref() == Some("r")),
+            )
+            .count();
+        assert!(stores_r >= 2, "r is restored and joined after the call ({stores_r} stores)");
+        // The parameter is stored by the side, restored, and joined: three times, not once.
+        let dhf = &m.functions[dh.index()];
+        let mut all = Vec::new();
+        flat(&dhf.body, &mut all);
+        let stores_x = all
+            .iter()
+            .filter(|s| matches!(s, Stmt::Store(p, _) if p.root == PlaceRoot::Param(0)))
+            .count();
+        assert!(stores_x >= 3, "x is restored and joined ({stores_x} stores)");
+    }
+
+    /// A call whose callee has no affine form, given an aggregate that depends on the input,
+    /// leaves the whole function to the plain interval rather than bounding the aggregate as a
+    /// float.
+    #[test]
+    fn an_aggregate_given_to_a_call_with_no_form_leaves_the_interval() {
+        let mut m = Module::default();
+        let f32 = m.types.f32();
+        let pair = m.types.intern(TypeDef::Struct {
+            name: "Pair".into(),
+            fields: vec![("a".into(), f32), ("b".into(), f32)],
+        });
+        let range = m.types.intern(TypeDef::Struct {
+            name: "Range".into(),
+            fields: vec![("lo".into(), f32), ("hi".into(), f32)],
+        });
+        // fn g(p: Pair) -> f32 { f32(i32(p.a)) }: a conversion, which has no affine rule.
+        let mut g = Function::new("g", vec![Param::value("p", pair)], Some(f32));
+        let mut body = Vec::new();
+        let p = g.let_(&mut body, pair, Expr::Param(0));
+        let a = g.let_(&mut body, f32, Expr::Extract(p, 0));
+        let i32t = m.types.scalar(Scalar::I32);
+        let i = g.let_(&mut body, i32t, Expr::Convert(a, Scalar::I32));
+        let back = g.let_(&mut body, f32, Expr::Convert(i, Scalar::F32));
+        body.push(Stmt::Return(Some(back)));
+        g.body = body;
+        let gid = m.add_function(g);
+        let mut f = Function::new("f", vec![Param::value("q", f32)], Some(f32));
+        let mut body = Vec::new();
+        let q = f.let_(&mut body, f32, Expr::Param(0));
+        let p = f.let_(&mut body, pair, Expr::Construct(pair, vec![q, q]));
+        let r = f.let_(&mut body, f32, Expr::Call(gid, vec![Arg::Value(p)]));
+        body.push(Stmt::Return(Some(r)));
+        f.body = body;
+        let id = m.add_function(f);
+        verify(&m).expect("the source is valid IR");
+        affine(&mut m, &mut DeriveCache::default(), id, 0, Target::Cpu, (range, range))
+            .expect("the plain interval answers");
+        verify(&m).expect("no form of an aggregate is bounded as a float");
     }
 }

@@ -304,10 +304,6 @@ pub struct TextureDesc<'a> {
     pub dimension: TextureDimension,
     pub format: TextureFormat,
     pub usage: TextureUsage,
-    /// Samples per pixel: `1` (normal) or `4` (multisample attachment).
-    pub samples: u8,
-    /// Attachment-only memoryless/transient backing (never read or stored across passes).
-    pub transient: bool,
 }
 
 /// How a view sees a texture.
@@ -471,8 +467,6 @@ pub struct RenderPipelineDesc<'a> {
     pub colors: &'a [ColorTarget],
     pub depth: Option<DepthDesc>,
     pub cull: Cull,
-    /// Samples per pixel: `1` or `4`.
-    pub samples: u8,
 }
 
 /// A copy's place in a buffer: rows `bytes_per_row` apart from `offset`, `rows_per_image` of
@@ -502,18 +496,17 @@ pub enum LoadOp<T> {
     Clear(T),
 }
 
+/// A colour target of a render pass: what it does with it as it begins (it always stores what
+/// the pass drew).
 pub struct ColorAttachment<'a> {
     pub view: &'a TextureView,
-    pub resolve: Option<&'a TextureView>,
     pub load: LoadOp<[f64; 4]>,
-    pub store: bool,
 }
 
+/// A depth target of a render pass: what it does with it as it begins (it always stores it).
 pub struct DepthAttachment<'a> {
     pub view: &'a TextureView,
-    pub resolve: Option<&'a TextureView>,
     pub load: LoadOp<f32>,
-    pub store: bool,
 }
 
 /// Timestamps written as a pass begins and ends, at two indices of a query set.

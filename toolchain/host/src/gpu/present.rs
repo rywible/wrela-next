@@ -65,7 +65,6 @@ pub(super) fn present_pipeline(
             colors: &[wrela_gpu::ColorTarget { format, blend: Blend::Replace }],
             depth: None,
             cull: Cull::None,
-            samples: 1,
         })
         .map_err(gpu_err)?;
     Ok((pipeline, layout))
@@ -87,9 +86,7 @@ pub(super) fn draw_presented(
     {
         let colors = [wrela_gpu::ColorAttachment {
             view: dst,
-            resolve: None,
             load: wrela_gpu::LoadOp::Clear([0.0, 0.0, 0.0, 1.0]),
-            store: true,
         }];
         let mut rp = encoder.begin_render_pass(&wrela_gpu::RenderPassDesc {
             label: "present",

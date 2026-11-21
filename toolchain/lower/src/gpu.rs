@@ -1008,7 +1008,13 @@ fn record_dispatch(fl: &mut Fl, d: &mir::Dispatch, span: Span) -> Option<()> {
     if let Some(o) = &d.origin
         && kernel.value.is_some()
         && wrela_sema::gpu::writes_slots(&fl.cx.checked.program, kernel.func)
-        && (d.indirect.is_some() || !one_row(&d.groups) || !one_row(o))
+        && !wrela_sema::gpu::slots_part_is_one_row(
+            &fl.cx.checked.program,
+            kernel.func,
+            d.over,
+            d.indirect.is_none() && one_row(&d.groups),
+            one_row(o),
+        )
     {
         fl.cx.err(wrela_sema::gpu::slots_in_parts(&fl.cx.checked.program, kernel.func, span));
         return None;
@@ -1027,7 +1033,8 @@ fn record_dispatch(fl: &mut Fl, d: &mir::Dispatch, span: Span) -> Option<()> {
         Some((place, at)) => {
             let b = indirect_binding(fl, place, *at)?;
             groups.extend(b);
-            // Its most groups (`most:`), or 0: unstated (weighed at the limit).
+            // Its most groups (`most:`), or 0: unstated (weighed at the limit). A `most:`
+            // computed as 0 at run time is unstated too: the checker refuses a constant 0.
             let most = match &d.most {
                 Some(m) => fl.operand(m)?,
                 None => {
@@ -1300,9 +1307,7 @@ fn draw_target(
         _ => Vec::new(),
     };
     let target = match p.lang_of_ty(t) {
-        Some(l) if let Some(depth) = l.textures_pass() => {
-            ir::RenderTarget::of(&formats, depth).with_samples(l.pass_samples())
-        }
+        Some(l) if let Some(depth) = l.textures_pass() => ir::RenderTarget::of(&formats, depth),
         Some(Lang::DepthOnlyPass | Lang::DepthLayerPass) => ir::RenderTarget::of(&[], true),
         Some(Lang::ScreenPass) => ir::RenderTarget::screen(false),
         Some(Lang::ScreenDepthPass) => ir::RenderTarget::screen(true),
@@ -2969,6 +2974,19 @@ fn holds_two_row_matrix(types: &ir::Types, t: ir::TypeId) -> bool {
     }
 }
 
+/// The storage buffers a stage of a pipeline may bind on the machine: its limit, less the two
+/// buffer slots of a Metal stage that reach the device's table (`wrela_abi::table::METAL_SLOTS`)
+/// where the pipeline is a kernel that takes a texture or a sampler (`tabled`). What
+/// [`check_storage_buffers`] holds a pipeline to and [`flag_binding`] leaves a flag room within.
+fn storage_buffers_per_stage(cx: &Cx, tabled: bool) -> usize {
+    let limits = cx.data.target.limits();
+    if tabled && limits.buffer_slots_per_stage.is_some() {
+        limits.storage_buffers_per_stage - wrela_abi::table::METAL_SLOTS
+    } else {
+        limits.storage_buffers_per_stage
+    }
+}
+
 /// E0602 when a shader of a pipeline binds more storage buffers than a stage may on the
 /// machine (Metal's argument table, through wgpu: 29): its
 /// own buffers (each shader's are its own bindings, which the other doesn't see), and the
@@ -2978,7 +2996,6 @@ fn holds_two_row_matrix(types: &ir::Types, t: ir::TypeId) -> bool {
 /// (`wrela_abi::table`), whose block and table take two of a Metal stage's buffer slots: it may
 /// bind two fewer there.
 fn check_storage_buffers(cx: &mut Cx, iface: &Interface, uniform: Option<&UniformOut>) {
-    let limits = cx.data.target.limits();
     let in_storage = uniform.is_some_and(|u| u.storage);
     let shared = usize::from(in_storage) + usize::from(crate::lift::len(cx) > 0);
     for e in 0..iface.entries.len() {
@@ -2993,11 +3010,7 @@ fn check_storage_buffers(cx: &mut Cx, iface: &Interface, uniform: Option<&Unifor
                             | ParamClass::Sampler { .. }
                     )
             });
-        let max = if tabled && limits.buffer_slots_per_stage.is_some() {
-            limits.storage_buffers_per_stage - wrela_abi::table::METAL_SLOTS
-        } else {
-            limits.storage_buffers_per_stage
-        };
+        let max = storage_buffers_per_stage(cx, tabled);
         // An `Append` is two buffers.
         let buffers: Vec<&Leaf> = iface
             .bound
@@ -3805,7 +3818,10 @@ pub(crate) fn debug_checks(cx: &mut Cx, out: &mut PipelineOut, code: u32) {
 fn flag_binding(cx: &Cx, out: &PipelineOut) -> Option<u32> {
     let storage = out.bindings.iter().filter(|b| b.kind.is_buffer()).count()
         + usize::from(out.uniform.as_ref().is_some_and(|u| u.storage));
-    if storage >= cx.data.target.limits().storage_buffers_per_stage {
+    // A kernel that takes a texture or a sampler reaches them through the device's table.
+    let tabled = matches!(out.kind, PipelineKind::Compute { .. })
+        && out.bindings.iter().any(|b| wrela_abi::table::in_table(b.kind));
+    if storage >= storage_buffers_per_stage(cx, tabled) {
         return None;
     }
     let used =
@@ -3950,13 +3966,15 @@ pub const MOST_SAME_WORK: u64 = 256;
 
 /// Moves a flattened module's same work out of its invocations (`ir::hoist`), past
 /// [`MOST_SAME_WORK`], reading the uniform block `uniform`: the values it moves onto the CPU.
+/// Not in a debug build, whose CPU code traps where a float operation makes a NaN that the GPU's
+/// would have given as a value (language.md §11).
 fn hoist_same(
     cx: &Cx,
     m: &mut ir::Module,
     uniform: Option<ir::ResourceId>,
 ) -> Vec<ir::hoist::Hoisted> {
     match uniform {
-        Some(u) if cx.hoist => ir::hoist::hoist(m, u, MOST_SAME_WORK + 1),
+        Some(u) if cx.hoist && !cx.data.debug => ir::hoist::hoist(m, u, MOST_SAME_WORK + 1),
         _ => Vec::new(),
     }
 }
@@ -4126,8 +4144,17 @@ fn cpu_recipe(
                         let (mut at, mut at_ty) = (block, t);
                         for x in &p.path {
                             if let ir::Proj::Index(i) = x {
-                                let ir::TypeDef::Array(e, _) = cpu.types.get(at_ty).clone() else {
-                                    return None;
+                                // An array's element, a vector's component or a matrix's
+                                // column: IR indexes each of them.
+                                let e = match cpu.types.get(at_ty).clone() {
+                                    ir::TypeDef::Array(e, _) => e,
+                                    ir::TypeDef::Vector(s, _) => {
+                                        cpu.types.intern(ir::TypeDef::Scalar(s))
+                                    }
+                                    ir::TypeDef::Matrix(_, r) => {
+                                        cpu.types.intern(ir::TypeDef::Vector(ir::Scalar::F32, r))
+                                    }
+                                    _ => return None,
                                 };
                                 at = f.let_(out, e, ir::Expr::ExtractDyn(at, *map.get(i)?));
                                 at_ty = e;
@@ -4142,9 +4169,6 @@ fn cpu_recipe(
                                 ir::TypeDef::Struct { fields, .. } => fields.get(k as usize)?.1,
                                 ir::TypeDef::Vector(s, _) => {
                                     cpu.types.intern(ir::TypeDef::Scalar(s))
-                                }
-                                ir::TypeDef::Matrix(_, r) => {
-                                    cpu.types.intern(ir::TypeDef::Vector(ir::Scalar::F32, r))
                                 }
                                 _ => return None,
                             };

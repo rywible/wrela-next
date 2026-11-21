@@ -46,15 +46,31 @@ pub fn write(m: &ir::Module, p: &Pipeline, checks: Checks) -> R<(Vec<u8>, Vec<St
     let mut w = Writer::new(m, p, checks);
     w.module()?;
     let words = w.finish();
+    // An instruction too long for SPIR-V's 16-bit word count (`inst` writes its count as 0).
+    let mut at = 5;
+    while at < words.len() {
+        let count = (words[at] >> 16) as usize;
+        if count == 0 {
+            return Err(format!(
+                "a {:?} of more than {} words, which SPIR-V can't hold (a constant table that \
+                 large is too big for the GPU)",
+                Op::from_u32(words[at] & 0xffff),
+                u16::MAX
+            ));
+        }
+        at += count;
+    }
     Ok((words.iter().flat_map(|w| w.to_le_bytes()).collect(), w.entry_names))
 }
 
 // ---- instructions ----------------------------------------------------------------------------------
 
-/// One instruction's words, its opcode and word count first.
+/// One instruction's words, its opcode and word count first. One too long for the count's 16
+/// bits has a count of 0, which [`write`] rejects.
 fn inst(op: Op, operands: &[Word]) -> Vec<Word> {
     let mut out = Vec::with_capacity(operands.len() + 1);
-    out.push(((operands.len() as u32 + 1) << 16) | op as u32);
+    let count = u16::try_from(operands.len() + 1).map_or(0, u32::from);
+    out.push((count << 16) | op as u32);
     out.extend_from_slice(operands);
     out
 }
@@ -634,6 +650,21 @@ impl<'m> Writer<'m> {
         })
     }
 
+    /// The byte of the block of indices that holds resource `r`'s index, if the pipeline reaches
+    /// it through the device's table ([`wrela_abi::table`]): only a texture or a sampler is
+    /// there, whatever number another resource's binding has (workgroup memory built by
+    /// [`crate::build`] is at 0).
+    fn table_offset(&self, r: usize) -> Option<u32> {
+        let res = &self.m.resources[r];
+        let in_table = matches!(
+            res.kind,
+            ir::ResourceKind::Texture { .. }
+                | ir::ResourceKind::StorageTexture { .. }
+                | ir::ResourceKind::Sampler { .. }
+        );
+        if in_table { wrela_abi::table::index_offset(self.p, res.binding) } else { None }
+    }
+
     /// Resource `r`'s variable and storage class, declared the first time.
     fn resource(&mut self, r: usize) -> R<(Word, StorageClass)> {
         if let Some(v) = self.resources[r] {
@@ -643,7 +674,7 @@ impl<'m> Writer<'m> {
         let res_name = res.name.clone();
         let binding = res.binding;
         let (pointee, class) = self.pointee(r)?;
-        if wrela_abi::table::index_offset(self.p, binding).is_some() {
+        if self.table_offset(r).is_some() {
             // Its variable is the table's array of its type; a function reaches its element.
             let storage = matches!(res.kind, ir::ResourceKind::StorageTexture { .. });
             let sampler = matches!(res.kind, ir::ResourceKind::Sampler { .. });
@@ -903,8 +934,7 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
         for r in fw.w.uses[id.index()].clone() {
             let (var, _) = fw.w.resource(r)?;
             fw.interface.insert(var);
-            let binding = fw.w.m.resources[r].binding;
-            if let Some(at) = wrela_abi::table::index_offset(fw.w.p, binding) {
+            if let Some(at) = fw.w.table_offset(r) {
                 let push = fw.w.push();
                 fw.interface.insert(push);
                 let u = fw.w.u32_ty();
@@ -2115,6 +2145,9 @@ impl FunctionWriter<'_, '_> {
                 (_, false) => self.op(Op::UMod, ty, &[l, divisor]),
             });
         }
+        // A shift by the width or more shifts by the amount modulo the width, as WGSL defines it
+        // (language.md §11.3); SPIR-V leaves such a shift undefined.
+        let r = if matches!(op, B::Shl | B::Shr) { self.shift_amount(b, r)? } else { r };
         let sop = match op {
             B::Add | B::WrappingAdd => {
                 if float {
@@ -2169,6 +2202,19 @@ impl FunctionWriter<'_, '_> {
             B::Ge => Op::UGreaterThanEqual,
         };
         Ok(self.op(sop, ty, &[l, r]))
+    }
+
+    /// Shift amount `b` (`u32`s, whose id is `id`) modulo the 32 bits of what it shifts: each
+    /// component masked by 31, unless it's a constant already under 32.
+    fn shift_amount(&mut self, b: ir::ValueId, id: Word) -> R<Word> {
+        if analysis::const_int(&self.consts, b).is_some_and(|k| (0..32).contains(&k)) {
+            return Ok(id);
+        }
+        let n = self.width_of(b);
+        let bt = self.w.ty(self.ty_of(b), false)?;
+        let mask = self.w.const_u32(31);
+        let mask = self.w.splat_const(bt, mask, n);
+        Ok(self.op(Op::BitwiseAnd, bt, &[id, mask]))
     }
 
     /// `rhs`, or 1 where dividing `lhs` by it isn't defined: by 0, or (signed) the most negative

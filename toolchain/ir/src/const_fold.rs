@@ -499,7 +499,13 @@ impl Folder<'_> {
                 {
                     return None;
                 }
-                each2(k(a)?, k(b)?, &|x, y| binary(*op, x, y))
+                let r = each2(k(a)?, k(b)?, &|x, y| binary(*op, x, y))?;
+                // Exact: a float result below the smallest normal is left to the GPU too, which
+                // may flush it to 0 where the fold would keep it.
+                if self.exact && has_subnormal(&r) {
+                    return None;
+                }
+                Some(r)
             }
             Expr::Convert(x, s) => each1(k(x)?, &|c| convert(c, *s)),
             Expr::Select { cond, if_true, if_false } => {
@@ -815,6 +821,15 @@ fn rounds_alike(b: Builtin) -> bool {
             | B::LeadingZeros
             | B::TrailingZeros
     )
+}
+
+/// Whether a folded value holds an `f32` subnormal (nonzero, below the smallest normal).
+fn has_subnormal(k: &K) -> bool {
+    match k {
+        K::S(Const::F32(x)) => x.is_subnormal(),
+        K::S(_) => false,
+        K::P(ps) => ps.iter().any(has_subnormal),
+    }
 }
 
 /// Whether a value of type `t` is a float scalar or vector.
@@ -1154,5 +1169,36 @@ fn const_value(k: &K) -> ConstValue {
     match k {
         K::S(c) => ConstValue::Scalar(c.clone()),
         K::P(parts) => ConstValue::Parts(parts.iter().map(const_value).collect()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Whether `x * y` of two constants folds, in an exact build or not.
+    fn folds(x: f32, y: f32, exact: bool) -> bool {
+        let mut m = Module { exact, ..Module::default() };
+        let f32t = m.types.f32();
+        let mut f = Function::new("product", Vec::new(), Some(f32t));
+        let mut body = Vec::new();
+        let a = f.let_(&mut body, f32t, Expr::Const(Const::F32(x)));
+        let b = f.let_(&mut body, f32t, Expr::Const(Const::F32(y)));
+        let p = f.let_(&mut body, f32t, Expr::Binary(BinOp::Mul, a, b));
+        body.push(Stmt::Return(Some(p)));
+        f.body = body;
+        fold_constants(&mut m, &mut f);
+        let mut left = false;
+        visit::walk(&f.body, &mut |s| left |= matches!(s, Stmt::Let(_, Expr::Binary(..))));
+        !left
+    }
+
+    /// An exact build leaves a product whose result is subnormal to the GPU, which may flush it
+    /// to 0; a normal one it folds, and a build that isn't exact folds both.
+    #[test]
+    fn an_exact_build_leaves_a_subnormal_result_to_the_gpu() {
+        assert!(folds(1.5, 2.0, true));
+        assert!(!folds(1.0e-20, 1.0e-20, true));
+        assert!(folds(1.0e-20, 1.0e-20, false));
     }
 }

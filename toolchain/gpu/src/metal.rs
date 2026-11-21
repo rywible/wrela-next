@@ -350,16 +350,11 @@ impl Device {
 
     pub fn create_texture(&self, desc: &TextureDesc<'_>) -> Texture {
         let d = MTLTextureDescriptor::new();
-        let samples = desc.samples.max(1);
         let layers = desc.depth_or_layers.max(1);
-        let ty = if samples > 1 {
-            MTLTextureType::Type2DMultisample
-        } else {
-            match desc.dimension {
-                TextureDimension::D3 => MTLTextureType::Type3D,
-                TextureDimension::D2 if layers > 1 => MTLTextureType::Type2DArray,
-                TextureDimension::D2 => MTLTextureType::Type2D,
-            }
+        let ty = match desc.dimension {
+            TextureDimension::D3 => MTLTextureType::Type3D,
+            TextureDimension::D2 if layers > 1 => MTLTextureType::Type2DArray,
+            TextureDimension::D2 => MTLTextureType::Type2D,
         };
         d.setTextureType(ty);
         d.setPixelFormat(pixel_format(desc.format));
@@ -371,29 +366,17 @@ impl Device {
                 TextureDimension::D2 => d.setArrayLength(layers as NSUInteger),
             }
             d.setMipmapLevelCount(desc.levels.max(1) as NSUInteger);
-            if samples > 1 {
-                d.setSampleCount(samples as NSUInteger);
-            }
         }
-        d.setStorageMode(if samples > 1 && desc.transient {
-            MTLStorageMode::Memoryless
-        } else {
-            MTLStorageMode::Private
-        });
+        d.setStorageMode(MTLStorageMode::Private);
         // No `PixelFormatView`: every view keeps its texture's format, and the flag would give up
         // the GPU's lossless compression of what's drawn into it.
-        let usage = if samples > 1 {
-            MTLTextureUsage::RenderTarget
-        } else {
-            let mut u = MTLTextureUsage::ShaderRead;
-            if desc.usage.storage {
-                u |= MTLTextureUsage::ShaderWrite;
-            }
-            if desc.usage.render {
-                u |= MTLTextureUsage::RenderTarget;
-            }
-            u
-        };
+        let mut usage = MTLTextureUsage::ShaderRead;
+        if desc.usage.storage {
+            usage |= MTLTextureUsage::ShaderWrite;
+        }
+        if desc.usage.render {
+            usage |= MTLTextureUsage::RenderTarget;
+        }
         d.setUsage(usage);
         let raw = self.0.raw.newTextureWithDescriptor(&d).expect("Metal made no texture");
         raw.setLabel(Some(&ns(desc.label)));
@@ -406,11 +389,8 @@ impl Device {
             depth_or_layers: layers,
             levels: desc.levels.max(1),
             dimension: desc.dimension,
-            samples,
         };
-        if samples == 1 {
-            self.zero_texture(&t);
-        }
+        self.zero_texture(&t);
         t
     }
 
@@ -441,7 +421,9 @@ impl Device {
                     level,
                     slice,
                     origin: [0, 0, 0],
-                    size: [w.div_ceil(block) * block, h.div_ceil(block) * block, d],
+                    // The level's own size: Metal takes a compressed level's last blocks
+                    // clamped to its edge ([`level_extent`]).
+                    size: [w, h, d],
                 });
             }
         }
@@ -582,6 +564,18 @@ impl Device {
         autoreleasepool(|_| {
             let raw = compute_state(&self.0.raw, &desc.module.library, desc.entry, desc.label)?;
             let [x, y, z] = desc.workgroup_size;
+            // A kernel whose registers hold its threadgroups below its workgroup can't run one:
+            // said here, not by each dispatch failing on the GPU.
+            let threads = u64::from(x) * u64::from(y) * u64::from(z);
+            let most = raw.maxTotalThreadsPerThreadgroup() as u64;
+            if threads > most {
+                return Err(Error(format!(
+                    "new compute pipeline state: `{}`'s workgroup of {x}x{y}x{z} = {threads} \
+                     threads is more than the {most} a threadgroup of it may have on this GPU \
+                     (`maxTotalThreadsPerThreadgroup`)",
+                    desc.entry
+                )));
+            }
             Ok(ComputePipeline {
                 raw,
                 workgroup: MTLSize {
@@ -603,7 +597,7 @@ impl Device {
             d.setLabel(Some(&ns(desc.label)));
             unsafe {
                 d.setInputPrimitiveTopology(MTLPrimitiveTopologyClass::Triangle);
-                d.setRasterSampleCount(desc.samples.max(1) as NSUInteger);
+                d.setRasterSampleCount(1);
             }
             let attachments = d.colorAttachments();
             for (k, c) in desc.colors.iter().enumerate() {
@@ -664,10 +658,16 @@ impl Device {
     }
 
     /// A command buffer of the queue's, reporting the encoder an error happened in.
+    ///
+    /// Metal gives command buffers and encoders autoreleased, so each is made in a pool of its
+    /// own: a pool the thread never drains (a headless run's main thread has none) would keep
+    /// every one, and all it bound, until the thread ends.
     fn command_buffer(&self) -> Id<dyn MTLCommandBuffer> {
-        let d = MTLCommandBufferDescriptor::new();
-        d.setErrorOptions(MTLCommandBufferErrorOption::EncoderExecutionStatus);
-        self.0.queue.commandBufferWithDescriptor(&d).expect("Metal made no command buffer")
+        autoreleasepool(|_| {
+            let d = MTLCommandBufferDescriptor::new();
+            d.setErrorOptions(MTLCommandBufferErrorOption::EncoderExecutionStatus);
+            self.0.queue.commandBufferWithDescriptor(&d).expect("Metal made no command buffer")
+        })
     }
 
     /// Writes `data` at `offset` of `buffer` before the next submission's own work.
@@ -695,7 +695,9 @@ impl Device {
         rows_per_image: u32,
         extent: [u32; 3],
     ) {
-        if data.is_empty() {
+        let extent = level_extent(&at, extent);
+        // An empty write is nothing (WebGPU allows one; Metal's copy doesn't).
+        if data.is_empty() || extent.contains(&0) {
             return;
         }
         let (staging, staging_offset) = self.staging(data, u64::from(COPY_BYTES_PER_ROW_ALIGNMENT));
@@ -729,6 +731,17 @@ impl Device {
 
     /// Commits the staged writes, then `buffers`, in order: their submission's index.
     pub fn submit(&self, buffers: Vec<CommandBuffer>) -> SubmissionIndex {
+        self.submit_presenting(buffers, None)
+    }
+
+    /// [`Device::submit`], and with `frame`, its drawable presented by the last command buffer
+    /// (`presentDrawable`: once that buffer is scheduled, so the frame shows the work drawn
+    /// into it, not what its texture held before).
+    fn submit_presenting(
+        &self,
+        buffers: Vec<CommandBuffer>,
+        frame: Option<&SurfaceTexture>,
+    ) -> SubmissionIndex {
         autoreleasepool(|_| {
             let index = self.0.submitted.fetch_add(1, Ordering::AcqRel) + 1;
             let pending = self.take_pending();
@@ -809,6 +822,9 @@ impl Device {
                     });
                 unsafe {
                     cb.addCompletedHandler(RcBlock::as_ptr(&block));
+                }
+                if let Some(frame) = frame.filter(|_| is_last) {
+                    frame.present_with(cb);
                 }
                 cb.commit();
             }
@@ -1081,7 +1097,6 @@ pub struct Texture {
     depth_or_layers: u32,
     levels: u32,
     dimension: TextureDimension,
-    samples: u8,
 }
 
 impl Texture {
@@ -1111,9 +1126,6 @@ impl Texture {
     }
 
     pub fn create_view(&self, desc: &ViewDesc) -> TextureView {
-        if self.samples > 1 {
-            return TextureView { raw: self.raw.clone(), slot: None };
-        }
         let levels = desc.level_count.unwrap_or(self.levels - desc.base_level);
         let (all_layers, _) = self.dimension.split(self.depth_or_layers, 1);
         let layers = desc.layer_count.unwrap_or(all_layers - desc.base_layer);
@@ -1320,7 +1332,10 @@ impl CommandEncoder {
 
     fn blit(&mut self) -> &Id<dyn MTLBlitCommandEncoder> {
         if self.blit.is_none() {
-            let b = self.cb().blitCommandEncoder().expect("Metal made no blit encoder");
+            let cb = self.cb();
+            // In a pool of its own ([`Device::command_buffer`]).
+            let b =
+                autoreleasepool(|_| cb.blitCommandEncoder().expect("Metal made no blit encoder"));
             b.setLabel(Some(&ns("copies")));
             self.blit = Some(b);
         }
@@ -1357,6 +1372,7 @@ impl CommandEncoder {
         dst: TextureCopy<'_>,
         extent: [u32; 3],
     ) {
+        let extent = level_extent(&dst, extent);
         if extent.contains(&0) {
             return;
         }
@@ -1383,6 +1399,7 @@ impl CommandEncoder {
         dst: BufferCopy<'_>,
         extent: [u32; 3],
     ) {
+        let extent = level_extent(&src, extent);
         if extent.contains(&0) {
             return;
         }
@@ -1409,6 +1426,7 @@ impl CommandEncoder {
         dst: TextureCopy<'_>,
         extent: [u32; 3],
     ) {
+        let extent = level_extent(&dst, level_extent(&src, extent));
         if extent.contains(&0) {
             return;
         }
@@ -1457,19 +1475,20 @@ impl CommandEncoder {
         timestamps: Option<PassTimestamps<'_>>,
     ) -> ComputePass<'_> {
         self.end_blit();
-        let d = MTLComputePassDescriptor::new();
-        if let Some(t) = timestamps {
-            let a = unsafe { d.sampleBufferAttachments().objectAtIndexedSubscript(0) };
-            a.setSampleBuffer(Some(&t.queries.raw));
-            unsafe {
-                a.setStartOfEncoderSampleIndex(t.begin as NSUInteger);
-                a.setEndOfEncoderSampleIndex(t.end as NSUInteger);
+        let cb = self.cb().clone();
+        // Its descriptor and encoder made in a pool of their own ([`Device::command_buffer`]).
+        let encoder = autoreleasepool(|_| {
+            let d = MTLComputePassDescriptor::new();
+            if let Some(t) = timestamps {
+                let a = unsafe { d.sampleBufferAttachments().objectAtIndexedSubscript(0) };
+                a.setSampleBuffer(Some(&t.queries.raw));
+                unsafe {
+                    a.setStartOfEncoderSampleIndex(t.begin as NSUInteger);
+                    a.setEndOfEncoderSampleIndex(t.end as NSUInteger);
+                }
             }
-        }
-        let encoder = self
-            .cb()
-            .computeCommandEncoderWithDescriptor(&d)
-            .expect("Metal made no compute encoder");
+            cb.computeCommandEncoderWithDescriptor(&d).expect("Metal made no compute encoder")
+        });
         encoder.setLabel(Some(&ns(label)));
         let table = self.device.0.table.clone();
         let anchor = timestamps.and_then(|_| self.device.0.anchor.clone());
@@ -1485,57 +1504,47 @@ impl CommandEncoder {
 
     pub fn begin_render_pass(&mut self, desc: &RenderPassDesc<'_>) -> RenderPass<'_> {
         self.end_blit();
-        let d = MTLRenderPassDescriptor::new();
-        let store_action = |store: bool, resolves: bool| match (store, resolves) {
-            (true, true) => MTLStoreAction::StoreAndMultisampleResolve,
-            (false, true) => MTLStoreAction::MultisampleResolve,
-            (true, false) => MTLStoreAction::Store,
-            (false, false) => MTLStoreAction::DontCare,
-        };
-        let colors = d.colorAttachments();
-        for (k, c) in desc.colors.iter().enumerate() {
-            let a = unsafe { colors.objectAtIndexedSubscript(k as NSUInteger) };
-            a.setTexture(Some(&c.view.raw));
-            if let Some(r) = c.resolve {
-                a.setResolveTexture(Some(&r.raw));
+        let cb = self.cb().clone();
+        // Its descriptor and encoder made in a pool of their own ([`Device::command_buffer`]).
+        let encoder = autoreleasepool(|_| {
+            let d = MTLRenderPassDescriptor::new();
+            let colors = d.colorAttachments();
+            for (k, c) in desc.colors.iter().enumerate() {
+                let a = unsafe { colors.objectAtIndexedSubscript(k as NSUInteger) };
+                a.setTexture(Some(&c.view.raw));
+                match c.load {
+                    LoadOp::Load => a.setLoadAction(MTLLoadAction::Load),
+                    LoadOp::Clear([r, g, b, alpha]) => {
+                        a.setLoadAction(MTLLoadAction::Clear);
+                        a.setClearColor(MTLClearColor { red: r, green: g, blue: b, alpha });
+                    }
+                }
+                a.setStoreAction(MTLStoreAction::Store);
             }
-            match c.load {
-                LoadOp::Load => a.setLoadAction(MTLLoadAction::Load),
-                LoadOp::Clear([r, g, b, alpha]) => {
-                    a.setLoadAction(MTLLoadAction::Clear);
-                    a.setClearColor(MTLClearColor { red: r, green: g, blue: b, alpha });
+            if let Some(depth) = &desc.depth {
+                let a = d.depthAttachment();
+                a.setTexture(Some(&depth.view.raw));
+                match depth.load {
+                    LoadOp::Load => a.setLoadAction(MTLLoadAction::Load),
+                    LoadOp::Clear(z) => {
+                        a.setLoadAction(MTLLoadAction::Clear);
+                        a.setClearDepth(f64::from(z));
+                    }
+                }
+                a.setStoreAction(MTLStoreAction::Store);
+            }
+            if let Some(t) = desc.timestamps {
+                let a = unsafe { d.sampleBufferAttachments().objectAtIndexedSubscript(0) };
+                a.setSampleBuffer(Some(&t.queries.raw));
+                unsafe {
+                    a.setStartOfVertexSampleIndex(t.begin as NSUInteger);
+                    a.setEndOfVertexSampleIndex(MTLCounterDontSample);
+                    a.setStartOfFragmentSampleIndex(MTLCounterDontSample);
+                    a.setEndOfFragmentSampleIndex(t.end as NSUInteger);
                 }
             }
-            a.setStoreAction(store_action(c.store, c.resolve.is_some()));
-        }
-        if let Some(depth) = &desc.depth {
-            let a = d.depthAttachment();
-            a.setTexture(Some(&depth.view.raw));
-            if let Some(r) = depth.resolve {
-                a.setResolveTexture(Some(&r.raw));
-                a.setDepthResolveFilter(MTLMultisampleDepthResolveFilter::Sample0);
-            }
-            match depth.load {
-                LoadOp::Load => a.setLoadAction(MTLLoadAction::Load),
-                LoadOp::Clear(z) => {
-                    a.setLoadAction(MTLLoadAction::Clear);
-                    a.setClearDepth(f64::from(z));
-                }
-            }
-            a.setStoreAction(store_action(depth.store, depth.resolve.is_some()));
-        }
-        if let Some(t) = desc.timestamps {
-            let a = unsafe { d.sampleBufferAttachments().objectAtIndexedSubscript(0) };
-            a.setSampleBuffer(Some(&t.queries.raw));
-            unsafe {
-                a.setStartOfVertexSampleIndex(t.begin as NSUInteger);
-                a.setEndOfVertexSampleIndex(MTLCounterDontSample);
-                a.setStartOfFragmentSampleIndex(MTLCounterDontSample);
-                a.setEndOfFragmentSampleIndex(t.end as NSUInteger);
-            }
-        }
-        let encoder =
-            self.cb().renderCommandEncoderWithDescriptor(&d).expect("Metal made no render encoder");
+            cb.renderCommandEncoderWithDescriptor(&d).expect("Metal made no render encoder")
+        });
         encoder.setLabel(Some(&ns(desc.label)));
         encoder.setFrontFacingWinding(MTLWinding::CounterClockwise);
         let table = self.device.0.table.clone();
@@ -1564,6 +1573,24 @@ fn size(e: [u32; 3]) -> MTLSize {
         height: e[1] as NSUInteger,
         depth: e[2].max(1) as NSUInteger,
     }
+}
+
+/// `extent` of a copy at `c` as Metal takes it: of a compressed format, clamped to the level's
+/// edge. WebGPU (and the host) round a copy up to whole blocks, past a level whose size isn't a
+/// multiple of its block (a mip of 2 × 2 or 1 × 1 texels); Metal wants the level's own size there
+/// (wgpu-hal clamps so too).
+fn level_extent(c: &TextureCopy<'_>, extent: [u32; 3]) -> [u32; 3] {
+    let t = c.texture;
+    if !t.format.is_compressed() {
+        return extent;
+    }
+    let w = (t.width >> c.level).max(1);
+    let h = (t.height >> c.level).max(1);
+    [
+        extent[0].min(w.saturating_sub(c.origin[0])),
+        extent[1].min(h.saturating_sub(c.origin[1])),
+        extent[2],
+    ]
 }
 
 /// A copy's slice and depth ([`TextureDimension::split`]).
@@ -1654,12 +1681,17 @@ impl ComputePass<'_> {
     }
 
     pub fn dispatch(&mut self, x: u32, y: u32, z: u32) {
-        let groups = size([x, y, z]);
+        // The groups as given: a depth of 0 launches none, as on Vulkan (not `size`, which rounds
+        // a copy's depth up to 1).
+        let groups =
+            MTLSize { width: x as NSUInteger, height: y as NSUInteger, depth: z as NSUInteger };
         if groups.width * groups.height * groups.depth == 0 {
+            // Nothing to launch (Metal's validation refuses a grid with a side of 0): a timed
+            // pass still launches its anchor.
             self.anchor();
-        } else {
-            self.anchor = None;
+            return;
         }
+        self.anchor = None;
         let (_, wg) = self.pipeline.as_ref().expect("a pipeline is set");
         self.encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, *wg);
     }
@@ -2010,7 +2042,7 @@ pub struct Surface {
     /// The window, alive while its layer is drawn into.
     _window: Arc<dyn Window>,
     /// When each frame presented reached the display, by its id ([`Surface::present`]), until
-    /// taken; and the next id.
+    /// taken; and the next frame's id (given as it's acquired).
     presented: Arc<Mutex<Vec<(u64, std::time::Instant)>>>,
     next_id: u64,
     /// The device's table, which a frame's texture carries as every texture does.
@@ -2021,11 +2053,47 @@ pub struct Surface {
 // the host keeps its surface there.
 unsafe impl Send for Surface {}
 
-/// A frame of a surface to draw into, then [`Surface::present`].
+/// A frame of a surface to draw into, then [`Device::submit_frame`] and [`Surface::present`].
 pub struct SurfaceTexture {
     drawable: objc2::rc::Retained<ProtocolObject<dyn objc2_quartz_core::CAMetalDrawable>>,
     pub texture: Texture,
     pub view: TextureView,
+    /// Its id ([`Surface::present`]), and where the time it reached the display goes.
+    id: u64,
+    presented: Arc<Mutex<Vec<(u64, std::time::Instant)>>>,
+    /// Whether a submission's command buffer presents it ([`Device::submit_frame`]).
+    submitted: std::cell::Cell<bool>,
+}
+
+impl SurfaceTexture {
+    /// Has `cb` present it once `cb` is scheduled (`presentDrawable`), and says when it reached
+    /// the display. A drawable presented by itself before the work drawing it is scheduled can
+    /// show what its texture held before; a command buffer's present waits for that work.
+    fn present_with(&self, cb: &ProtocolObject<dyn MTLCommandBuffer>) {
+        self.handle_presented();
+        cb.presentDrawable(ProtocolObject::from_ref(&*self.drawable));
+        self.submitted.set(true);
+    }
+
+    /// Puts when it reached the display into the surface's list, once Metal says.
+    fn handle_presented(&self) {
+        let (id, sink) = (self.id, self.presented.clone());
+        // Metal says when the frame was shown (`presentedTime`, Core Animation's clock), or 0 if
+        // it never was (a frame replaced before its refresh).
+        let block = RcBlock::new(move |d: NonNull<ProtocolObject<dyn MTLDrawable>>| {
+            // SAFETY: Metal passes the drawable that was presented.
+            let shown = unsafe { d.as_ref() }.presentedTime();
+            if shown > 0.0 {
+                let ago = (objc2_quartz_core::CACurrentMediaTime() - shown).max(0.0);
+                let now = std::time::Instant::now();
+                let at = now.checked_sub(std::time::Duration::from_secs_f64(ago)).unwrap_or(now);
+                lock(&sink).push((id, at));
+            }
+        });
+        // SAFETY: a handler of the drawable's own, which Metal copies; added before it's
+        // presented.
+        unsafe { self.drawable.addPresentedHandler(RcBlock::as_ptr(&block)) };
+    }
 }
 
 impl Device {
@@ -2062,14 +2130,14 @@ impl Device {
         Ok(surface)
     }
 
-    /// Submits `buffers` for `frame`: on Metal, as any other submission.
+    /// Submits `buffers` for `frame`, whose last command buffer presents it once it's scheduled
+    /// (after the work drawing it).
     pub fn submit_frame(
         &self,
         buffers: Vec<CommandBuffer>,
         frame: &SurfaceTexture,
     ) -> SubmissionIndex {
-        let _ = frame;
-        self.submit(buffers)
+        self.submit_presenting(buffers, Some(frame))
     }
 }
 
@@ -2131,8 +2199,13 @@ impl Surface {
     /// The next frame to draw into (waits for one the display is done with).
     pub fn acquire(&mut self) -> Result<SurfaceTexture> {
         use objc2_quartz_core::CAMetalDrawable;
-        let drawable = self.layer.nextDrawable().ok_or("the layer gave no drawable")?;
-        let raw = drawable.texture();
+        // In a pool of its own: the drawable comes autoreleased, and one held by a pool the
+        // thread never drains is never given back to the layer.
+        let (drawable, raw) = autoreleasepool(|_| {
+            let drawable = self.layer.nextDrawable().ok_or("the layer gave no drawable")?;
+            let raw = drawable.texture();
+            Ok::<_, Error>((drawable, raw))
+        })?;
         let (width, height) = (raw.width() as u32, raw.height() as u32);
         let texture = Texture {
             table: self.table.clone(),
@@ -2143,32 +2216,29 @@ impl Surface {
             depth_or_layers: 1,
             levels: 1,
             dimension: TextureDimension::D2,
-            samples: 1,
         };
-        Ok(SurfaceTexture { drawable, texture, view: TextureView { raw, slot: None } })
-    }
-
-    /// Shows `frame` once the work submitted for it is done: its id, which
-    /// [`Surface::take_presented`] gives with the time it reached the display.
-    pub fn present(&mut self, frame: SurfaceTexture) -> Result<u64> {
         let id = self.next_id;
         self.next_id += 1;
-        let sink = self.presented.clone();
-        // Metal says when the frame was shown (`presentedTime`, Core Animation's clock), or 0 if
-        // it never was (a frame replaced before its refresh).
-        let block = RcBlock::new(move |d: NonNull<ProtocolObject<dyn MTLDrawable>>| {
-            // SAFETY: Metal passes the drawable that was presented.
-            let shown = unsafe { d.as_ref() }.presentedTime();
-            if shown > 0.0 {
-                let ago = (objc2_quartz_core::CACurrentMediaTime() - shown).max(0.0);
-                let at = std::time::Instant::now() - std::time::Duration::from_secs_f64(ago);
-                lock(&sink).push((id, at));
-            }
-        });
-        // SAFETY: a handler of the drawable's own, which Metal copies.
-        unsafe { frame.drawable.addPresentedHandler(RcBlock::as_ptr(&block)) };
-        frame.drawable.present();
-        Ok(id)
+        Ok(SurfaceTexture {
+            drawable,
+            texture,
+            view: TextureView { raw, slot: None },
+            id,
+            presented: self.presented.clone(),
+            submitted: std::cell::Cell::new(false),
+        })
+    }
+
+    /// Shows `frame` once the work submitted for it is done (its submission's last command
+    /// buffer presents it, [`Device::submit_frame`]; one never submitted is presented as it
+    /// is): its id, which [`Surface::take_presented`] gives with the time it reached the
+    /// display.
+    pub fn present(&mut self, frame: SurfaceTexture) -> Result<u64> {
+        if !frame.submitted.get() {
+            frame.handle_presented();
+            frame.drawable.present();
+        }
+        Ok(frame.id)
     }
 
     /// The frames shown since the last take: each id and when it reached the display.
