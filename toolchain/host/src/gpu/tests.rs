@@ -1266,11 +1266,10 @@ mod target_tests {
 
 /// A serial run times a dispatch that launches no groups as itself: an indirect one whose
 /// arguments a kernel just wrote as zero groups (an extraction chunk past the last brick), and a
-/// direct one of zero groups. An Apple GPU takes an encoder's start sample as its first
-/// threadgroup launches, so such a pass's slot kept an earlier pass's start, or zero: SCENE 10's
-/// empty chunks read 0.4 to 8.6 ms, and the frame's span days (`ComputePass::anchor` in
-/// `wrela_gpu`'s Metal backend). Here the direct one shows it on the M4 every run (a start
-/// before the pass before it ended, or none); the indirect ones, here, were sampled even before.
+/// direct one of zero groups (`ComputePass::anchor` in `wrela_gpu`'s Metal backend; docs/design.md,
+/// "Serial timestamps of empty passes"). The direct one fails on the M4 without the anchor; the
+/// indirect ones cover the path SCENE 10 takes, which this small case sampled correctly even
+/// before.
 #[test]
 #[ignore = "needs a GPU"]
 fn a_serial_run_times_a_dispatch_of_no_groups_as_itself() {

@@ -593,23 +593,7 @@ impl Device {
     /// defaults: Metal's newest language, fast math, which the text states besides).
     pub fn create_shader_module(&self, label: &str, source: &[u8]) -> Result<ShaderModule> {
         let text = std::str::from_utf8(source).map_err(|_| Error("its MSL isn't UTF-8".into()))?;
-        autoreleasepool(|_| {
-            let options = MTLCompileOptions::new();
-            let library = self
-                .0
-                .raw
-                .newLibraryWithSource_options_error(&ns(text), Some(&options))
-                .map_err(|e| Error(format!("MSL: {}", error_text(&e))))?;
-            library.setLabel(Some(&ns(label)));
-            Ok(ShaderModule { library })
-        })
-    }
-
-    fn function(&self, module: &ShaderModule, entry: &str) -> Result<Id<dyn MTLFunction>> {
-        module
-            .library
-            .newFunctionWithName(&ns(entry))
-            .ok_or_else(|| Error(format!("the shader has no entry point `{entry}`")))
+        autoreleasepool(|_| Ok(ShaderModule { library: library(&self.0.raw, label, text)? }))
     }
 
     pub fn create_compute_pipeline(
@@ -617,19 +601,7 @@ impl Device {
         desc: &ComputePipelineDesc<'_>,
     ) -> Result<ComputePipeline> {
         autoreleasepool(|_| {
-            let function = self.function(desc.module, desc.entry)?;
-            let d = MTLComputePipelineDescriptor::new();
-            d.setComputeFunction(Some(&function));
-            d.setLabel(Some(&ns(desc.label)));
-            let raw = self
-                .0
-                .raw
-                .newComputePipelineStateWithDescriptor_options_reflection_error(
-                    &d,
-                    MTLPipelineOption::empty(),
-                    None,
-                )
-                .map_err(|e| Error(format!("new compute pipeline state: {}", error_text(&e))))?;
+            let raw = compute_state(&self.0.raw, &desc.module.library, desc.entry, desc.label)?;
             let [x, y, z] = desc.workgroup_size;
             Ok(ComputePipeline {
                 raw,
@@ -644,8 +616,8 @@ impl Device {
 
     pub fn create_render_pipeline(&self, desc: &RenderPipelineDesc<'_>) -> Result<RenderPipeline> {
         autoreleasepool(|_| {
-            let vertex = self.function(desc.module, desc.vertex_entry)?;
-            let fragment = self.function(desc.module, desc.fragment_entry)?;
+            let vertex = function(&desc.module.library, desc.vertex_entry)?;
+            let fragment = function(&desc.module.library, desc.fragment_entry)?;
             let d = MTLRenderPipelineDescriptor::new();
             d.setVertexFunction(Some(&vertex));
             d.setFragmentFunction(Some(&fragment));
@@ -1069,17 +1041,50 @@ fn encode_write(blit: &ProtocolObject<dyn MTLBlitCommandEncoder>, w: &PendingWri
     }
 }
 
+/// A library of MSL compiled as a passthrough shader was (`MTLCompileOptions`' defaults:
+/// Metal's newest language, fast math, which the text states besides).
+fn library(
+    d: &ProtocolObject<dyn MTLDevice>,
+    label: &str,
+    text: &str,
+) -> Result<Id<dyn MTLLibrary>> {
+    let library = d
+        .newLibraryWithSource_options_error(&ns(text), Some(&MTLCompileOptions::new()))
+        .map_err(|e| Error(format!("MSL: {}", error_text(&e))))?;
+    library.setLabel(Some(&ns(label)));
+    Ok(library)
+}
+
+fn function(library: &ProtocolObject<dyn MTLLibrary>, entry: &str) -> Result<Id<dyn MTLFunction>> {
+    library
+        .newFunctionWithName(&ns(entry))
+        .ok_or_else(|| Error(format!("the shader has no entry point `{entry}`")))
+}
+
+/// The compute pipeline state of `library`'s kernel `entry`.
+fn compute_state(
+    d: &ProtocolObject<dyn MTLDevice>,
+    library: &ProtocolObject<dyn MTLLibrary>,
+    entry: &str,
+    label: &str,
+) -> Result<Id<dyn MTLComputePipelineState>> {
+    let desc = MTLComputePipelineDescriptor::new();
+    let function = function(library, entry)?;
+    desc.setComputeFunction(Some(&function));
+    desc.setLabel(Some(&ns(label)));
+    d.newComputePipelineStateWithDescriptor_options_reflection_error(
+        &desc,
+        MTLPipelineOption::empty(),
+        None,
+    )
+    .map_err(|e| Error(format!("new compute pipeline state: {}", error_text(&e))))
+}
+
 /// The kernel that anchors a timed compute encoder's samples: one thread that does nothing.
 fn anchor_kernel(d: &ProtocolObject<dyn MTLDevice>) -> Result<Id<dyn MTLComputePipelineState>> {
     autoreleasepool(|_| {
-        let source = "kernel void wrela_anchor() {}";
-        let library = d
-            .newLibraryWithSource_options_error(&ns(source), Some(&MTLCompileOptions::new()))
-            .map_err(|e| Error(format!("the timestamp anchor's MSL: {}", error_text(&e))))?;
-        let function =
-            library.newFunctionWithName(&ns("wrela_anchor")).ok_or("the anchor has no kernel")?;
-        d.newComputePipelineStateWithFunction_error(&function)
-            .map_err(|e| Error(format!("the timestamp anchor's pipeline: {}", error_text(&e))))
+        let library = library(d, "timestamp anchor", "kernel void wrela_anchor() {}")?;
+        compute_state(d, &library, "wrela_anchor", "timestamp anchor")
     })
 }
 
@@ -1554,7 +1559,7 @@ impl CommandEncoder {
             .expect("Metal made no compute encoder");
         encoder.setLabel(Some(&ns(label)));
         let table = self.device.0.table.clone();
-        let anchor = timestamps.and(self.device.0.anchor.clone());
+        let anchor = timestamps.and_then(|_| self.device.0.anchor.clone());
         ComputePass {
             encoder,
             pipeline: None,
@@ -1662,12 +1667,10 @@ pub struct ComputePass<'a> {
     pipeline: Option<(Id<dyn MTLComputePipelineState>, MTLSize)>,
     /// A timed pass's anchor ([`Shared::anchor`]), until a threadgroup has launched in it.
     ///
-    /// An Apple GPU samples an encoder's start as its first threadgroup launches: an encoder
-    /// that launches none (an indirect dispatch of zero groups, or a direct one) gets no start
-    /// of its own, and its slot keeps what was there, an earlier pass's start or zero (a serial
-    /// run read 0.4 to 8.6 ms for SCENE 10's empty extraction chunks, 1.5 to 2.1 us once
-    /// anchored). Before a dispatch that may launch none, a timed pass launches the anchor's one
-    /// thread, so both its samples are its own.
+    /// An Apple GPU samples an encoder's start as its first threadgroup launches, so an encoder
+    /// that launches none keeps a stale start; before a dispatch that may launch none, a timed
+    /// pass launches the anchor's one thread (docs/design.md, "Serial timestamps of empty
+    /// passes").
     anchor: Option<Id<dyn MTLComputePipelineState>>,
     keep: &'a mut Vec<Arc<Group>>,
     table: Arc<Table>,
@@ -1740,13 +1743,14 @@ impl ComputePass<'_> {
     }
 
     pub fn dispatch(&mut self, x: u32, y: u32, z: u32) {
-        if x == 0 || y == 0 || z == 0 {
+        let groups = size([x, y, z]);
+        if groups.width * groups.height * groups.depth == 0 {
             self.anchor();
         } else {
             self.anchor = None;
         }
         let (_, wg) = self.pipeline.as_ref().expect("a pipeline is set");
-        self.encoder.dispatchThreadgroups_threadsPerThreadgroup(size([x, y, z]), *wg);
+        self.encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, *wg);
     }
 
     /// Dispatches the groups `buffer` holds at `offset`, as the GPU reads them.
