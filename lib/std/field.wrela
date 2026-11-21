@@ -281,6 +281,486 @@ pub trait Surface: Copy + GpuData {
     fn rigid_shape_hash(self) -> Option<u64> {
         None
     }
+
+    /// Skinning template identity: `Some(hash)` when this surface is a `Skinned` rest-pose field
+    /// (possibly wrapped in outer `Translate`/`Rotate`/`Scale`/`With`), `None` otherwise.
+    fn skin_shape_hash(self) -> Option<u64> {
+        None
+    }
+
+    /// Evaluates the rest-pose local distance at `p` (before skeletal deformation and outer rigid
+    /// transforms). Used once when extracting a skinned surface's reusable rest-pose meshlet.
+    fn rest_distance_live(self, p: vec3, live: Live) -> f32 {
+        self.distance_live(p, live)
+    }
+
+    /// Interval-prunes the rest-pose local field over `over`.
+    fn rest_pruned<F: Copy + fn(vec3) -> vec3>(
+        self,
+        over: Box3,
+        at: F,
+        stretch: f32,
+        live: Live,
+        first: u32,
+    ) -> Pruned {
+        self.pruned(over, at, stretch, live, first)
+    }
+
+    /// Bounding sphere of the rest-pose local field.
+    fn rest_bound(self) -> Bound {
+        self.bound()
+    }
+
+    /// Tight interval of the rest-pose local field over `b`.
+    fn rest_interval_near(self, b: Box3) -> Interval {
+        self.interval_near(b)
+    }
+
+    /// Auto-computed packed 4-bone indices (`x`) and 4 normalized 8-bit weights (`y`, summing to
+    /// 255) at rest-pose local point `p`, derived from per-part signed distances.
+    fn rest_skin_weights(self, p: vec3) -> vec2u {
+        vec2u(0, 255)
+    }
+
+    /// Number of active bones in this surface's skinning palette (`0` when not skinned).
+    fn skin_bone_count(self) -> u32 {
+        0
+    }
+
+    /// Bone `i`'s current Dual Quaternion transform in the rest-pose field's local space.
+    fn skin_bone(self, i: u32) -> DualQuat {
+        DualQuat::identity()
+    }
+
+    /// Evaluates the exact posed field's distance in local space (before outer rigid warps) for
+    /// exact analytical Newton projection of GPU-skinned hero vertices.
+    fn posed_local_distance(self, p: vec3) -> f32 {
+        self.distance(p)
+    }
+}
+
+/// Maximum bones supported in a single `Skinned` field's GPU Dual Quaternion palette.
+pub const MAX_SKIN_BONES: u32 = 24
+
+/// Maximum leaf parts mapped in `Skinned::part_bones` (packed 4 × u8 per `u32`).
+pub const MAX_SKIN_PARTS: u32 = 32
+
+/// Unit Dual Quaternion representing a 3D rigid transform `(q: Quat, t: vec3)` in 32 bytes
+/// (Kavan et al., I3D 2007 / ACM TOG 2008): `real` is unit rotation quaternion `(qx, qy, qz, qw)`
+/// and `dual = 0.5 * (tx, ty, tz, 0) * real`.
+pub struct DualQuat: Copy + GpuData + Eq + StateHash {
+    pub real: vec4,
+    pub dual: vec4,
+}
+
+impl DualQuat {
+    /// Identity rigid transform (no rotation, zero translation).
+    pub fn identity() -> DualQuat {
+        DualQuat { real: vec4(0.0, 0.0, 0.0, 1.0), dual: vec4(0.0) }
+    }
+
+    /// Builds a unit dual quaternion from unit rotation `q` and translation `t`.
+    pub fn from_qt(q: Quat, t: vec3) -> DualQuat {
+        let r = q.v
+        let d = vec4(
+            0.5 * (t.x * r.w + t.y * r.z - t.z * r.y),
+            0.5 * (-t.x * r.z + t.y * r.w + t.z * r.x),
+            0.5 * (t.x * r.y - t.y * r.x + t.z * r.w),
+            -0.5 * (t.x * r.x + t.y * r.y + t.z * r.z),
+        )
+        DualQuat { real: r, dual: d }
+    }
+
+    /// Extracts a unit dual quaternion from a rigid 4×4 matrix `m` (with translation scaled by `s`,
+    /// matching uniform skeleton scale `p_posed * s = R * (p_rest * s) + t * s`).
+    pub fn from_mat4_scaled(m: mat4, s: f32) -> DualQuat {
+        let q = Quat::from_mat3(mat3(m[0].xyz, m[1].xyz, m[2].xyz))
+        DualQuat::from_qt(q, m[3].xyz * s)
+    }
+
+    /// Extracts a unit dual quaternion from a rigid 4×4 matrix `m`.
+    pub fn from_mat4(m: mat4) -> DualQuat {
+        DualQuat::from_mat4_scaled(m, 1.0)
+    }
+
+    /// Normalizes a blended dual quaternion by `1 / |real|`.
+    pub fn normalized(self) -> DualQuat {
+        let l2 = dot(self.real, self.real)
+        let inv = if l2 > 1.0e-12 { 1.0 / sqrt(l2) } else { 1.0 }
+        DualQuat { real: self.real * inv, dual: self.dual * inv }
+    }
+
+    /// Applies this unit dual quaternion's rigid transform to point `p`.
+    pub fn apply_point(self, p: vec3) -> vec3 {
+        let r = self.real
+        let d = self.dual
+        let t = 2.0 * (r.w * d.xyz - d.w * r.xyz + cross(r.xyz, d.xyz))
+        let uv = 2.0 * cross(r.xyz, p)
+        p + r.w * uv + cross(r.xyz, uv) + t
+    }
+
+    /// Rotates unit normal `n` by this unit dual quaternion's rotation part.
+    pub fn apply_normal(self, n: vec3) -> vec3 {
+        let r = self.real
+        let uv = 2.0 * cross(r.xyz, n)
+        let out = n + r.w * uv + cross(r.xyz, uv)
+        let l2 = dot(out, out)
+        if l2 > 1.0e-12 { out * (1.0 / sqrt(l2)) } else { n }
+    }
+}
+
+/// Packs up to 32 per-part bone indices (`0..23`) into 8 `u32` words (4 × u8 per word).
+pub fn pack_part_bones(bones: [u32; MAX_SKIN_PARTS]) -> [u32; 8] {
+    var out = [0; 8]
+    for w in 0..8 {
+        let i = w * 4
+        out[w] = (bones[i] & 255) |
+            ((bones[i + 1] & 255) << 8) |
+            ((bones[i + 2] & 255) << 16) |
+            ((bones[i + 3] & 255) << 24)
+    }
+    out
+}
+
+/// Unpacks part `i`'s bone index from `packed`.
+fn unpack_part_bone(packed: [u32; 8], i: u32) -> u32 {
+    let idx = min(i, MAX_SKIN_PARTS - 1)
+    let word = packed[idx >> 2]
+    (word >> ((idx & 3) * 8)) & 255
+}
+
+/// Accumulates weight `w` for bone `bone` into a register-allocated top-4 `(b0..b3, w0..w3)` set.
+struct Top4Weights: Copy {
+    b0: u32,
+    b1: u32,
+    b2: u32,
+    b3: u32,
+    w0: f32,
+    w1: f32,
+    w2: f32,
+    w3: f32,
+}
+
+impl Top4Weights {
+    fn empty() -> Top4Weights {
+        Top4Weights { b0: 0, b1: 0, b2: 0, b3: 0, w0: 0.0, w1: 0.0, w2: 0.0, w3: 0.0 }
+    }
+
+    fn add(mut self, bone: u32, w: f32) {
+        if w <= 1.0e-6 {
+            return
+        }
+        if self.w0 > 0.0 && self.b0 == bone {
+            self.w0 += w
+            return
+        }
+        if self.w1 > 0.0 && self.b1 == bone {
+            self.w1 += w
+            return
+        }
+        if self.w2 > 0.0 && self.b2 == bone {
+            self.w2 += w
+            return
+        }
+        if self.w3 > 0.0 && self.b3 == bone {
+            self.w3 += w
+            return
+        }
+        if self.w0 <= self.w1 && self.w0 <= self.w2 && self.w0 <= self.w3 {
+            if w > self.w0 {
+                self.b0 = bone
+                self.w0 = w
+            }
+        } else if self.w1 <= self.w2 && self.w1 <= self.w3 {
+            if w > self.w1 {
+                self.b1 = bone
+                self.w1 = w
+            }
+        } else if self.w2 <= self.w3 {
+            if w > self.w2 {
+                self.b2 = bone
+                self.w2 = w
+            }
+        } else if w > self.w3 {
+            self.b3 = bone
+            self.w3 = w
+        }
+    }
+
+    /// Normalizes and packs the top 4 bones into `(bones_u32, weights_u32)` with weights summing
+    /// to 255 and the strongest bone in slot 0 (antipodal anchor for Dual Quaternion Skinning).
+    fn pack(self) -> vec2u {
+        var b0 = self.b0
+        var b1 = self.b1
+        var b2 = self.b2
+        var b3 = self.b3
+        var w0 = self.w0
+        var w1 = self.w1
+        var w2 = self.w2
+        var w3 = self.w3
+        // Place the largest weight in slot 0 so DQS antipodal sign alignment uses the dominant bone.
+        if w1 > w0 {
+            let tb = b0
+            let tw = w0
+            b0 = b1
+            w0 = w1
+            b1 = tb
+            w1 = tw
+        }
+        if w2 > w0 {
+            let tb = b0
+            let tw = w0
+            b0 = b2
+            w0 = w2
+            b2 = tb
+            w2 = tw
+        }
+        if w3 > w0 {
+            let tb = b0
+            let tw = w0
+            b0 = b3
+            w0 = w3
+            b3 = tb
+            w3 = tw
+        }
+        let sum = w0 + w1 + w2 + w3
+        if sum <= 1.0e-7 {
+            return vec2u(b0 & 255, 255)
+        }
+        let inv = 255.0 / sum
+        let q1 = u32(clamp(w1 * inv + 0.5, 0.0, 255.0))
+        let q2 = u32(clamp(w2 * inv + 0.5, 0.0, 255.0))
+        let q3 = u32(clamp(w3 * inv + 0.5, 0.0, 255.0))
+        let rem = q1 + q2 + q3
+        var q0: u32 = if rem < 255 { 255 - rem } else { 0 }
+        var a1 = q1
+        var a2 = q2
+        var a3 = q3
+        if rem > 255 {
+            let over = rem - 255
+            let d3 = min(a3, over)
+            a3 -= d3
+            let o2 = over - d3
+            let d2 = min(a2, o2)
+            a2 -= d2
+            let o1 = o2 - d2
+            a1 = if a1 > o1 { a1 - o1 } else { 0 }
+            q0 = 255 - (a1 + a2 + a3)
+        }
+        let bones_u = (b0 & 255) | ((b1 & 255) << 8) | ((b2 & 255) << 16) | ((b3 & 255) << 24)
+        let weights_u = (q0 & 255) | ((a1 & 255) << 8) | ((a2 & 255) << 16) | ((a3 & 255) << 24)
+        vec2u(bones_u, weights_u)
+    }
+}
+
+/// A skeletal/articulated pure field: `posed` gives the exact analytical distance and channels for
+/// reference raymarching, probes, and SDF splatting, while `rest` + `bones` (`[DualQuat; 24]`) let
+/// the engine extract the rest-pose meshlet ONCE with auto-computed per-vertex skin weights from
+/// `rest.part_distance` and deform it every frame on the GPU via Dual Quaternion Skinning.
+pub struct Skinned<S>: Copy + GpuData + Eq + StateHash {
+    pub posed: S,
+    pub rest: S,
+    pub bones: [DualQuat; MAX_SKIN_BONES],
+    pub joints: [vec4; MAX_SKIN_BONES],
+    pub bone_count: u32,
+    pub part_bones: [u32; 8],
+    pub part_end_bones: [u32; 8],
+    pub blend_k: f32,
+    pub rest_key_lo: u32,
+    pub rest_key_hi: u32,
+    pub pad0: u32,
+    pub pad1: u32,
+}
+
+/// Wraps an articulated pure field `posed` with its rest-pose template `rest`, per-bone Dual
+/// Quaternions `bones`, rest-pose joint positions `joints`, per-part start/end bone mappings, and
+/// smooth-union blend width `blend_k` for automatic GPU Dual Quaternion Skinning.
+pub fn skinned<S: Surface + StateHash>(
+    posed: S,
+    rest: S,
+    bones: [DualQuat; MAX_SKIN_BONES],
+    joints: [vec4; MAX_SKIN_BONES],
+    bone_count: u32,
+    part_bones: [u32; 8],
+    part_end_bones: [u32; 8],
+    blend_k: f32,
+) -> Skinned<S> {
+    var h = Hasher::new()
+    StateHash::state_hash(rest, mut h)
+    StateHash::state_hash(bone_count, mut h)
+    StateHash::state_hash(part_bones, mut h)
+    StateHash::state_hash(part_end_bones, mut h)
+    StateHash::state_hash(blend_k, mut h)
+    let key = h.finish()
+    Skinned {
+        posed,
+        rest,
+        bones,
+        joints,
+        bone_count: min(bone_count, MAX_SKIN_BONES),
+        part_bones,
+        part_end_bones,
+        blend_k,
+        rest_key_lo: u32(key),
+        rest_key_hi: u32(key >> 32),
+        pad0: 0,
+        pad1: 0,
+    }
+}
+
+impl<S: Surface> Surface for Skinned<S> {
+    fn distance(self, p: vec3) -> f32 {
+        self.posed.distance(p)
+    }
+
+    fn masked(self, p: vec3, live: Live, first: u32) -> f32 {
+        self.posed.masked(p, live, first)
+    }
+
+    fn pruned<F: Copy + fn(vec3) -> vec3>(self, over: Box3, at: F, stretch: f32, live: Live, first: u32) -> Pruned {
+        self.posed.pruned(over, at, stretch, live, first)
+    }
+
+    fn bound(self) -> Bound {
+        self.posed.bound()
+    }
+
+    fn filtered(self, p: vec3, footprint: f32) -> f32 {
+        self.posed.filtered(p, footprint)
+    }
+
+    fn part_offset(self, p: vec3, i: u32, by: f32) -> f32 {
+        self.posed.part_offset(p, i, by)
+    }
+
+    fn parts(self) -> u32 {
+        self.posed.parts()
+    }
+
+    fn part_at(self, p: vec3) -> (f32, u32) {
+        self.posed.part_at(p)
+    }
+
+    fn part_distance(self, p: vec3, i: u32) -> f32 {
+        self.posed.part_distance(p, i)
+    }
+
+    fn part_name(self, i: u32) -> PartName {
+        self.posed.part_name(i)
+    }
+
+    fn lipschitz(self, near: f32) -> f32 {
+        self.posed.lipschitz(near)
+    }
+
+    fn interval_near(self, b: Box3) -> Interval {
+        self.posed.interval_near(b)
+    }
+
+    fn skin_shape_hash(self) -> Option<u64> {
+        Some((u64(self.rest_key_hi) << 32) | u64(self.rest_key_lo))
+    }
+
+    fn rest_distance_live(self, p: vec3, live: Live) -> f32 {
+        self.rest.distance_live(p, live)
+    }
+
+    fn rest_pruned<F: Copy + fn(vec3) -> vec3>(
+        self,
+        over: Box3,
+        at: F,
+        stretch: f32,
+        live: Live,
+        first: u32,
+    ) -> Pruned {
+        self.rest.pruned(over, at, stretch, live, first)
+    }
+
+    fn rest_bound(self) -> Bound {
+        self.rest.bound()
+    }
+
+    fn rest_interval_near(self, b: Box3) -> Interval {
+        self.rest.interval_near(b)
+    }
+
+    fn rest_skin_weights(self, p: vec3) -> vec2u {
+        let n_parts = min(self.rest.parts(), MAX_SKIN_PARTS)
+        if n_parts == 0 || self.bone_count == 0 {
+            return vec2u(0, 255)
+        }
+        var d_min = 1.0e20
+        var best_part: u32 = 0
+        for i in 0..n_parts {
+            let d = self.rest.part_distance(p, i)
+            if d < d_min {
+                d_min = d
+                best_part = i
+            }
+        }
+        let blend_w = max(self.blend_k * 1.5, 0.008)
+        var top = Top4Weights::empty()
+        for i in 0..n_parts {
+            let d = self.rest.part_distance(p, i)
+            let gap = max(d - d_min, 0.0)
+            if gap < blend_w {
+                let u = 1.0 - gap / blend_w
+                let pw = u * u
+                let ba = min(unpack_part_bone(self.part_bones, i), self.bone_count - 1)
+                let bb = min(unpack_part_bone(self.part_end_bones, i), self.bone_count - 1)
+                if ba == bb {
+                    top.add(ba, pw)
+                } else {
+                    let ja = self.joints[ba].xyz
+                    let jb = self.joints[bb].xyz
+                    let seg = jb - ja
+                    let l2 = max(dot(seg, seg), 1.0e-8)
+                    let frac = clamp(dot(p - ja, seg) / l2, 0.0, 1.0)
+                    top.add(ba, pw * (1.0 - frac))
+                    top.add(bb, pw * frac)
+                }
+            }
+        }
+        if top.w0 <= 1.0e-6 {
+            let ba = min(unpack_part_bone(self.part_bones, best_part), self.bone_count - 1)
+            return vec2u(ba & 255, 255)
+        }
+        top.pack()
+    }
+
+    fn skin_bone_count(self) -> u32 {
+        self.bone_count
+    }
+
+    fn skin_bone(self, i: u32) -> DualQuat {
+        self.bones[min(i, MAX_SKIN_BONES - 1)]
+    }
+
+    fn posed_local_distance(self, p: vec3) -> f32 {
+        self.posed.distance(p)
+    }
+}
+
+impl<C, S: Field<C>> Field<C> for Skinned<S> {
+    fn channels(self, p: vec3) -> C {
+        self.posed.channels(p)
+    }
+
+    fn distance_and_channels(self, p: vec3) -> (f32, C) {
+        self.posed.distance_and_channels(p)
+    }
+
+    fn has_constant_channels(self) -> bool {
+        self.posed.has_constant_channels()
+    }
+
+    fn has_local_channels(self) -> bool {
+        self.posed.has_local_channels()
+    }
+
+    fn rest_channels(self, p: vec3) -> C {
+        self.rest.channels(p)
+    }
 }
 
 /// A 3D rigid similarity transform (`world(p) = s * R * p + t`, `s > 0`, `R` orthonormal) stored
@@ -2191,6 +2671,52 @@ impl<S: Surface, M: PointMap> Surface for Warp<S, M> {
             None => None,
         }
     }
+
+    fn skin_shape_hash(self) -> Option<u64> {
+        match self.map.rigid() {
+            Some(_) => self.inner.skin_shape_hash(),
+            None => None,
+        }
+    }
+
+    fn rest_distance_live(self, p: vec3, live: Live) -> f32 {
+        self.inner.rest_distance_live(p, live)
+    }
+
+    fn rest_pruned<F: Copy + fn(vec3) -> vec3>(
+        self,
+        over: Box3,
+        at: F,
+        stretch: f32,
+        live: Live,
+        first: u32,
+    ) -> Pruned {
+        self.inner.rest_pruned(over, at, stretch, live, first)
+    }
+
+    fn rest_bound(self) -> Bound {
+        self.inner.rest_bound()
+    }
+
+    fn rest_interval_near(self, b: Box3) -> Interval {
+        self.inner.rest_interval_near(b)
+    }
+
+    fn rest_skin_weights(self, p: vec3) -> vec2u {
+        self.inner.rest_skin_weights(p)
+    }
+
+    fn skin_bone_count(self) -> u32 {
+        self.inner.skin_bone_count()
+    }
+
+    fn skin_bone(self, i: u32) -> DualQuat {
+        self.inner.skin_bone(i)
+    }
+
+    fn posed_local_distance(self, p: vec3) -> f32 {
+        self.inner.posed_local_distance(p)
+    }
 }
 
 /// A surface moved by `by`: `s.translate(by)`.
@@ -3111,6 +3637,12 @@ pub trait Field<C>: Surface {
     fn has_local_channels(self) -> bool {
         false
     }
+
+    /// Evaluates channels at rest-pose local point `p` for skinned fields (falling back to
+    /// `channels(p)` for non-skinned fields).
+    fn rest_channels(self, p: vec3) -> C {
+        self.channels(p)
+    }
 }
 
 /// How channels mix where surfaces blend. A channel struct declares it and gets it field by
@@ -3264,6 +3796,49 @@ impl<S: Surface, C: Copy + GpuData> Surface for With<S, C> {
     fn rigid_shape_hash(self) -> Option<u64> {
         self.inner.rigid_shape_hash()
     }
+
+    fn skin_shape_hash(self) -> Option<u64> {
+        self.inner.skin_shape_hash()
+    }
+
+    fn rest_distance_live(self, p: vec3, live: Live) -> f32 {
+        self.inner.rest_distance_live(p, live)
+    }
+
+    fn rest_pruned<F: Copy + fn(vec3) -> vec3>(
+        self,
+        over: Box3,
+        at: F,
+        stretch: f32,
+        live: Live,
+        first: u32,
+    ) -> Pruned {
+        self.inner.rest_pruned(over, at, stretch, live, first)
+    }
+
+    fn rest_bound(self) -> Bound {
+        self.inner.rest_bound()
+    }
+
+    fn rest_interval_near(self, b: Box3) -> Interval {
+        self.inner.rest_interval_near(b)
+    }
+
+    fn rest_skin_weights(self, p: vec3) -> vec2u {
+        self.inner.rest_skin_weights(p)
+    }
+
+    fn skin_bone_count(self) -> u32 {
+        self.inner.skin_bone_count()
+    }
+
+    fn skin_bone(self, i: u32) -> DualQuat {
+        self.inner.skin_bone(i)
+    }
+
+    fn posed_local_distance(self, p: vec3) -> f32 {
+        self.inner.posed_local_distance(p)
+    }
 }
 
 impl<S: Surface, C: Copy + GpuData> Field<C> for With<S, C> {
@@ -3277,6 +3852,10 @@ impl<S: Surface, C: Copy + GpuData> Field<C> for With<S, C> {
 
     fn has_constant_channels(self) -> bool {
         true
+    }
+
+    fn rest_channels(self, p: vec3) -> C {
+        self.value
     }
 }
 
@@ -3334,10 +3913,57 @@ impl<S: Surface, F: Copy + GpuData> Surface for WithAt<S, F> {
     fn interval_near(self, b: Box3) -> Interval {
         self.inner.interval_near(b)
     }
+
+    fn skin_shape_hash(self) -> Option<u64> {
+        self.inner.skin_shape_hash()
+    }
+
+    fn rest_distance_live(self, p: vec3, live: Live) -> f32 {
+        self.inner.rest_distance_live(p, live)
+    }
+
+    fn rest_pruned<G: Copy + fn(vec3) -> vec3>(
+        self,
+        over: Box3,
+        at: G,
+        stretch: f32,
+        live: Live,
+        first: u32,
+    ) -> Pruned {
+        self.inner.rest_pruned(over, at, stretch, live, first)
+    }
+
+    fn rest_bound(self) -> Bound {
+        self.inner.rest_bound()
+    }
+
+    fn rest_interval_near(self, b: Box3) -> Interval {
+        self.inner.rest_interval_near(b)
+    }
+
+    fn rest_skin_weights(self, p: vec3) -> vec2u {
+        self.inner.rest_skin_weights(p)
+    }
+
+    fn skin_bone_count(self) -> u32 {
+        self.inner.skin_bone_count()
+    }
+
+    fn skin_bone(self, i: u32) -> DualQuat {
+        self.inner.skin_bone(i)
+    }
+
+    fn posed_local_distance(self, p: vec3) -> f32 {
+        self.inner.posed_local_distance(p)
+    }
 }
 
 impl<S: Surface, C, F: Copy + GpuData + fn(vec3) -> C> Field<C> for WithAt<S, F> {
     fn channels(self, p: vec3) -> C {
+        (self.at)(p)
+    }
+
+    fn rest_channels(self, p: vec3) -> C {
         (self.at)(p)
     }
 }
@@ -3425,6 +4051,10 @@ impl<C, S: Field<C>, M: PointMap> Field<C> for Warp<S, M> {
 
     fn has_local_channels(self) -> bool {
         self.inner.has_local_channels()
+    }
+
+    fn rest_channels(self, p: vec3) -> C {
+        self.inner.rest_channels(p)
     }
 }
 
@@ -3530,6 +4160,23 @@ impl<C, S: Field<C>> Field<C> for Named<S> {
 }
 
 // ---- tests (the suite runs std's: `std_tests_pass`) --------------------------------------------
+
+@test
+fn dual_quat_matches_rigid_matrix() {
+    let q = Quat::axis_angle(vec3(0.3, 0.8, -0.5), 1.23)
+    let r = q.to_mat3()
+    let t = vec3(1.4, -0.7, 2.2)
+    let m = mat4(vec4(r[0], 0.0), vec4(r[1], 0.0), vec4(r[2], 0.0), vec4(t, 1.0))
+    let s = 0.6
+    let dq = DualQuat::from_mat4_scaled(m, s)
+    let p = vec3(0.4, 1.1, -0.3)
+    let expected = (m * vec4(p, 1.0)).xyz * s
+    let got = dq.apply_point(p * s)
+    assert(length(got - expected) < 0.0001)
+    let n = normalize(vec3(-0.2, 0.9, 0.4))
+    let n_exp = normalize(r * n)
+    assert(length(dq.apply_normal(n) - n_exp) < 0.0001)
+}
 
 @test
 fn a_hit_can_start_inside_the_surface() {

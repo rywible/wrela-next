@@ -525,6 +525,65 @@ off > 1 px 378 → 190, creature walking 782 → 172, stack 19066 → 18939/1893
 outline off **0.152 px** (reference floor 0.143 px), surface error mean **0.024 px** (down from
 0.098 px); `tools/layers` and `tools/check` pass.
 
+## Four architectural leaps: 3D SDF clipmap, 1× TSR, 16-byte visibility meshlets, and GPU DQS skinning (2026-11-20)
+
+Four orthogonal engine upgrades landed across `lib/std/field.wrela`, `lib/engine/mesh/`, and
+`game/world/creature.wrela`, raising visual realism while slashing GPU cost on both Apple M4 (Metal)
+and AMD Radeon Renoir (Vulkan):
+
+1. **Leap A — Sparse 2-cascade hardware 3D SDF clipmap (`lib/engine/mesh/sdf.wrela`):** A `96³`
+   camera-focused near cascade + `64³` world cascade (`R16Float`, static/dynamic split, ~2.3 MB VRAM)
+   powers Aaltonen (2018) cone-penumbra soft sun shadows paired with a single `2048²` PCSS shadow map
+   (replacing 2-cascade CSM), SDF-shadowed local emitters, multi-scale bent-normal AO + Jimenez
+   (2016) multi-bounce colored AO, physical interior thickness for backlit SSS, world-space mean
+   curvature weathering (`∇²d`), offscreen SDF specular reflections, and 1-tap hardware SDF broad-phase
+   swarm collisions (`mesh_swarm` 25.6× faster on M4, 36.2× faster on Radeon). Guards Aaltonen's
+   cone intersection against `+SDF_MAX` splat-box boundaries (`d < prev_d * 1.9 && d < SDF_MAX * 0.9`)
+   so isolated dynamic objects never cast false self-shadows.
+2. **Leap B — 1× rasterization + Halton(2, 3) TSR + half-res refract SSR + chromatic dispersion
+   (`lib/engine/mesh/tsr.wrela`, `draw.wrela`, `extract.wrela`):** Replaces 4× MSAA with a lean 1×
+   `DepthPass4` G-buffer (`g_normal`, `g_albedo`, `g_emits`, `g_motion`) and 8-frame Halton(2, 3)
+   Temporal Super Resolution (Catmull-Rom 5-tap history + 3×3 YCoCg variance clipping + analytical
+   per-vertex motion vectors), 2×2 phase-cycled half-res GI/SSR, half-res premultiplied transmissive
+   SSR, 3-channel spectral chromatic dispersion + grazing thin-film iridescence on glass, and
+   chunk-local `ExtractScratch` (3.5 MB VRAM regardless of `max_bricks`). `drawn_only` runs 8
+   Halton subframes so offline judges verify the exact real-time TSR path.
+3. **Leap C — 16-byte compact visibility meshlets + pixel-rate analytical shading
+   (`lib/engine/mesh/extract.wrela`, `draw.wrela`, `light.wrela`):** Compresses `MeshVertex` from
+   80 B to **16 B** (5× smaller vertex buffers / fetch bandwidth) using Cigolle et al. (2014)
+   10+10-bit octahedral unit normals + 10-bit thing ID + smooth/transmissive flags; moves `Field`
+   uniform/storage uploads to a pre-pass `MeshWorld::FieldBufs` and evaluates `field.channels(wp)`
+   analytically per pixel for crisp material boundaries and infinite-resolution procedural detail.
+4. **Leap D — Rest-pose auto-skinned fields with GPU Dual Quaternion Skinning (`lib/std/field.wrela`,
+   `lib/engine/mesh/{extract,draw,light}.wrela`, `game/world/creature.wrela`):** `DualQuat` +
+   `Skinned<S>` extract a relaxed A-pose rest meshlet ONCE with auto-computed 4-bone weights from
+   `rest.part_distance` (8 B/vert `skin_verts`, allocated only for skinned batches). Single hero
+   characters (`One<Skinned>`) deform via `deform_skinned_verts` (GPU DQS + adaptive 1–3 step exact
+   analytical Newton projection onto `posed_local_distance`) in ~0.1–0.2 ms with exact analytical
+   normals and exact previous-frame motion vectors; articulated crowds (`Many<Skinned>`) split into
+   2 distance-matched LOD templates and render all visible characters in 1–2 GPU-instanced DQS draw
+   calls with **0.000 ms per-frame extraction**, while `rad_stride` caps crowd radiance injection at
+   65,536 samples/batch.
+
+**Measured across Leaps A → D on both machines (1920×1080, `--cpu` steady state & `--timestamps --serial`):**
+
+| Scene (1920×1080) | Metric | Before Leaps (`12af0cb`) | After Leaps A–D | Speedup / Delta |
+| --- | --- | --- | --- | --- |
+| SCENE 10 (arena, M4 Metal) | `--cpu` frame total | 15.05 ms | **12.8 ms** (~78 fps) | -15.0% (+ full SDF shadows/AO/SSS/TSR/dispersion) |
+| SCENE 10 (arena, Radeon Vulkan) | `--cpu` frame total | 58.64 ms | **37.67 ms** (~26.5 fps) | **-35.8%** (1.56× faster) |
+| SCENE 10 (M4 Metal `--serial`) | `mesh_extract` | 2.00 ms (101 passes) | **1.19 ms** (80 passes) | -40.5% (+0.23 ms `mesh_skin`) |
+| SCENE 10 (M4 Metal `--serial`) | `mesh_radiance` | 0.63 ms | **0.30 ms** | -52.4% |
+| SCENE 8 (256 walking creatures, M4) | `mesh_extract` / `--cpu` | 2.01 ms (61 passes) / 9.5 ms | **0.000 ms (0 passes)** / **8.1–8.8 ms** (~115 fps) | **∞ extract**, span 29.4 → **13 ms** (2.26×) |
+| SCENE 8 (256 walking creatures, Radeon) | `mesh_extract` / `--cpu` | — / 28.6 ms | **0.000 ms (0 passes)** / **17.7–17.9 ms** (~56 fps) | **-37.8%** (1.61× faster) |
+
+**Checked:** SCENE 6 72-eye audit **0 holes / 0 extras** on all three kinds on both M4 Metal and
+Linux Radeon Vulkan (creature walking off > 1 px dropped from 172 → **27**; bit-identical hash
+`65c374f1c7d51fd1`, 0 Vulkan validation errors); SCENE 8 (256 creatures) bit-identical hash
+`1442fbeeb2ba33d1` on both Metal and Vulkan (0 VVL errors); SCENE 0 judge (`96×54`, 8-subframe
+Halton TSR) **0 holes**, **100% of surfaces within 0.05 px (`mean 0 px, most 0 px`)**, lit mean
+**0.61/255**, edges mean **3.54/255** (7.1% over 8/255); `wrela test --std dual_quat`, `tools/layers`,
+and `tools/check` (331 tests) all pass.
+
 ## The layers
 
 Dependencies point down. Nothing below knows anything above.
@@ -535,7 +594,7 @@ lib/
   std/            the language's library
   engine/         realises matter. The only package that may touch the GPU
     matter/       pure field traits: Substance, Sky, World, Height, Medium, Matter, ranges
-    mesh/         universal GPU field realisation: Dual Contouring meshlets, One Light GI, Height clipmaps, Medium froxels, 4× MSAA HDR rasterisation
+    mesh/         universal GPU field realisation: Dual Contouring 16-byte visibility meshlets, GPU DQS skinning, 3D SDF clipmap, One Light GI, Height clipmaps, Medium froxels, 1× + Halton TSR HDR rasterisation
     picture/      Eye, Look, Picture, screen presentation
     reference/    the same questions answered by brute force: what every fast answer is held to
     judge/        holds a picture to the reference and the hole audit, in numbers

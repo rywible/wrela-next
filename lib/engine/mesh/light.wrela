@@ -11,11 +11,11 @@
 
 use matter::sky::{Sky, seen}
 use matter::substance::{ONE_OVER_PI, Substance}
-use mesh::extract::{MeshVertex, unpack_oct_normal, unpack_thing}
+use mesh::extract::{MeshVertex, eval_dqs, unpack_oct_normal, unpack_thing}
 use mesh::sdf::{SdfGrid, sdf_local_shadow, sdf_soft_shadow, sdf_spec_hit}
 use picture::eye::View
 use picture::screen::luma
-use std::field::{Field, Rigid}
+use std::field::{DualQuat, Field, Rigid}
 use std::gpu::{
     Address, Append, AppendBuffer, Atomics, ClipPosition, ComparisonSampler, DepthTexture,
     DispatchArgs, Filter, GlobalId, GpuBuffer, GpuSpan, One, R16Float, Rgba16Float, Sampler, Slots,
@@ -782,6 +782,20 @@ fn rad_inject_sample<S: Sky>(
     deposit(uvw, outgoing, emits, emit_peak, EMIT_THRESH, mut accum, mut emit_accum)
 }
 
+/// Maximum radiance-injection vertex samples per batch (keeps instanced crowds within <0.2 ms
+/// and well below the GPU dispatch guard while sampling evenly across all instances).
+const MAX_RAD_SAMPLES: u32 = 65536
+
+/// Computes the vertex stride (>= 2) keeping `((cap_verts + stride - 1) / stride) * inst_count <= MAX_RAD_SAMPLES`.
+fn rad_stride(cap_verts: u32, inst_count: u32) -> u32 {
+    if cap_verts == 0 || inst_count == 0 {
+        return 2
+    }
+    let per_inst_cap = max(MAX_RAD_SAMPLES / inst_count, 1)
+    let s = (cap_verts + per_inst_cap - 1) / per_inst_cap
+    max(s, 2)
+}
+
 /// Injects one `One<M>` batch's 16-byte compact meshlets into the radiance volume and emitter bins.
 @compute(64)
 fn rad_inject_one<M: Field<Substance>, S: Sky>(
@@ -789,6 +803,7 @@ fn rad_inject_one<M: Field<Substance>, S: Sky>(
     verts: [MeshVertex],
     vert_count: [u32],
     cap_verts: u32,
+    stride: u32,
     xforms: [Rigid],
     inst_count: u32,
     grid: RadGrid,
@@ -805,12 +820,13 @@ fn rad_inject_one<M: Field<Substance>, S: Sky>(
     id: GlobalId,
 ) {
     let n = min(vert_count[0], cap_verts)
-    let half_n = (n + 1) / 2
-    if half_n == 0 || inst_count == 0 {
+    let st = max(stride, 1)
+    let per_inst = (n + st - 1) / st
+    if per_inst == 0 || inst_count == 0 {
         return
     }
-    let inst = id.x / half_n
-    let vi = (id.x - inst * half_n) * 2
+    let inst = id.x / per_inst
+    let vi = (id.x - inst * per_inst) * st
     if inst >= inst_count || vi >= n {
         return
     }
@@ -837,6 +853,7 @@ fn rad_inject_many<M: Field<Substance>, S: Sky>(
     verts: [MeshVertex],
     vert_count: [u32],
     cap_verts: u32,
+    stride: u32,
     xforms: [Rigid],
     inst_ids: [u32],
     is_instanced: u32,
@@ -855,12 +872,13 @@ fn rad_inject_many<M: Field<Substance>, S: Sky>(
     id: GlobalId,
 ) {
     let n = min(vert_count[0], cap_verts)
-    let half_n = (n + 1) / 2
-    if half_n == 0 || inst_count == 0 || n_fields == 0 {
+    let st = max(stride, 1)
+    let per_inst = (n + st - 1) / st
+    if per_inst == 0 || inst_count == 0 || n_fields == 0 {
         return
     }
-    let inst = id.x / half_n
-    let vi = (id.x - inst * half_n) * 2
+    let inst = id.x / per_inst
+    let vi = (id.x - inst * per_inst) * st
     if inst >= inst_count || vi >= n {
         return
     }
@@ -875,6 +893,117 @@ fn rad_inject_many<M: Field<Substance>, S: Sky>(
     let raw_tid = if is_instanced != 0 { inst_ids[inst] } else { unpack_thing(vert.packed) }
     let tid = min(raw_tid, n_fields - 1)
     let sub = fields[tid].channels(wp)
+    rad_inject_sample(
+        wp, nrm, sub, grid, sv, sky, sky_table, sky_s, shadow_map, cmp, prev_rad1, rad_s,
+        mut accum, mut emit_accum,
+    )
+}
+
+/// Injects one `Skinned` `One<M>` batch's vertices into the radiance volume via GPU Dual Quaternion Skinning.
+@compute(64)
+fn rad_inject_skin_one<M: Field<Substance>, S: Sky>(
+    field: M,
+    verts: [MeshVertex],
+    skin: [u32],
+    vert_count: [u32],
+    cap_verts: u32,
+    stride: u32,
+    xforms: [Rigid],
+    bones: [DualQuat],
+    bone_stride: u32,
+    inst_count: u32,
+    grid: RadGrid,
+    sv: ShadowView,
+    sky: S,
+    sky_table: Texture<Rgba16Float>,
+    sky_s: Sampler,
+    shadow_map: DepthTexture,
+    cmp: ComparisonSampler,
+    prev_rad1: Texture3d<Rgba16Float>,
+    rad_s: Sampler,
+    accum: mut Atomics<u32>,
+    emit_accum: mut Atomics<u32>,
+    id: GlobalId,
+) {
+    let n = min(vert_count[0], cap_verts)
+    let st = max(stride, 1)
+    let per_inst = (n + st - 1) / st
+    if per_inst == 0 || inst_count == 0 {
+        return
+    }
+    let inst = id.x / per_inst
+    let vi = (id.x - inst * per_inst) * st
+    if inst >= inst_count || vi >= n {
+        return
+    }
+    let xf = xforms[inst]
+    let vert = verts[vi]
+    let lp = vec3(vert.px, vert.py, vert.pz)
+    let dq = eval_dqs(bones, inst * bone_stride, skin[vi * 2], skin[vi * 2 + 1])
+    let wp = xf.apply_point(dq.apply_point(lp))
+    let uvw = (wp - grid.origin) * grid.inv_span
+    if uvw.x < 0.0 || uvw.x >= 1.0 || uvw.y < 0.0 || uvw.y >= 1.0 || uvw.z < 0.0 || uvw.z >= 1.0 {
+        return
+    }
+    let nrm = xf.apply_normal(dq.apply_normal(unpack_oct_normal(vert.packed)))
+    let sub = field.rest_channels(lp)
+    rad_inject_sample(
+        wp, nrm, sub, grid, sv, sky, sky_table, sky_s, shadow_map, cmp, prev_rad1, rad_s,
+        mut accum, mut emit_accum,
+    )
+}
+
+/// Injects one `Skinned` `Many<M, N>` instanced crowd batch into the radiance volume via GPU DQS.
+@compute(64)
+fn rad_inject_skin_many<M: Field<Substance>, S: Sky>(
+    fields: [M],
+    n_fields: u32,
+    verts: [MeshVertex],
+    skin: [u32],
+    vert_count: [u32],
+    cap_verts: u32,
+    stride: u32,
+    xforms: [Rigid],
+    bones: [DualQuat],
+    bone_stride: u32,
+    inst_ids: [u32],
+    inst_count: u32,
+    grid: RadGrid,
+    sv: ShadowView,
+    sky: S,
+    sky_table: Texture<Rgba16Float>,
+    sky_s: Sampler,
+    shadow_map: DepthTexture,
+    cmp: ComparisonSampler,
+    prev_rad1: Texture3d<Rgba16Float>,
+    rad_s: Sampler,
+    accum: mut Atomics<u32>,
+    emit_accum: mut Atomics<u32>,
+    id: GlobalId,
+) {
+    let n = min(vert_count[0], cap_verts)
+    let st = max(stride, 1)
+    let per_inst = (n + st - 1) / st
+    if per_inst == 0 || inst_count == 0 || n_fields == 0 {
+        return
+    }
+    let inst = id.x / per_inst
+    let vi = (id.x - inst * per_inst) * st
+    if inst >= inst_count || vi >= n {
+        return
+    }
+    let xf = xforms[inst]
+    let vert = verts[vi]
+    let lp = vec3(vert.px, vert.py, vert.pz)
+    let dq = eval_dqs(bones, inst * bone_stride, skin[vi * 2], skin[vi * 2 + 1])
+    let wp = xf.apply_point(dq.apply_point(lp))
+    let uvw = (wp - grid.origin) * grid.inv_span
+    if uvw.x < 0.0 || uvw.x >= 1.0 || uvw.y < 0.0 || uvw.y >= 1.0 || uvw.z < 0.0 || uvw.z >= 1.0 {
+        return
+    }
+    let nrm = xf.apply_normal(dq.apply_normal(unpack_oct_normal(vert.packed)))
+    let tid = min(inst_ids[inst], n_fields - 1)
+    let sub = fields[tid].rest_channels(lp)
     rad_inject_sample(
         wp, nrm, sub, grid, sv, sky, sky_table, sky_s, shadow_map, cmp, prev_rad1, rad_s,
         mut accum, mut emit_accum,
@@ -1074,10 +1203,11 @@ fn emitter_vis(
     clamp(1.0 - occ * fade, 0.12, 1.0)
 }
 
-/// Prepares indirect dispatch args for a 64-wide stride-2 instanced pass (`rad_inject`).
+/// Prepares indirect dispatch args for a 64-wide strided instanced pass (`rad_inject`).
 @compute(1)
-fn prep_rad_list(count: [u32], cap: u32, inst_count: u32, args: mut One<DispatchArgs>, id: GlobalId) {
-    let n = ((min(count[0], cap) + 1) / 2) * inst_count
+fn prep_rad_list(count: [u32], cap: u32, stride: u32, inst_count: u32, args: mut One<DispatchArgs>, id: GlobalId) {
+    let st = max(stride, 1)
+    let n = ((min(count[0], cap) + st - 1) / st) * inst_count
     args.set(id, DispatchArgs { x: (n + 63) / 64, y: 1, z: 1 })
 }
 
@@ -1521,17 +1651,18 @@ impl RadianceCache {
         if self.grid.enabled == 0 || cap_verts == 0 || inst_count == 0 {
             return
         }
+        let stride = rad_stride(cap_verts, inst_count)
         dispatch(
-            prep_rad_list.bind(count: vert_count, cap: cap_verts, inst_count: inst_count, args: mut self.inject_args),
+            prep_rad_list.bind(count: vert_count, cap: cap_verts, stride: stride, inst_count: inst_count, args: mut self.inject_args),
             over: 1,
         )
-        let groups_most = (((cap_verts + 1) / 2) * inst_count + 63) / 64
+        let groups_most = (((cap_verts + stride - 1) / stride) * inst_count + 63) / 64
         if to_static {
             dispatch(
                 rad_inject_one.bind(
                     field: field, verts: verts, vert_count: vert_count, cap_verts: cap_verts,
-                    xforms: xforms, inst_count: inst_count, grid: self.grid, sv: sv, sky: sky,
-                    sky_table: sky_table, sky_s: sky_s, shadow_map: shadow_map, cmp: cmp,
+                    stride: stride, xforms: xforms, inst_count: inst_count, grid: self.grid, sv: sv,
+                    sky: sky, sky_table: sky_table, sky_s: sky_s, shadow_map: shadow_map, cmp: cmp,
                     prev_rad1: self.rad1, rad_s: self.s, accum: mut self.static_accum,
                     emit_accum: mut self.static_emit_accum,
                 ),
@@ -1542,8 +1673,8 @@ impl RadianceCache {
             dispatch(
                 rad_inject_one.bind(
                     field: field, verts: verts, vert_count: vert_count, cap_verts: cap_verts,
-                    xforms: xforms, inst_count: inst_count, grid: self.grid, sv: sv, sky: sky,
-                    sky_table: sky_table, sky_s: sky_s, shadow_map: shadow_map, cmp: cmp,
+                    stride: stride, xforms: xforms, inst_count: inst_count, grid: self.grid, sv: sv,
+                    sky: sky, sky_table: sky_table, sky_s: sky_s, shadow_map: shadow_map, cmp: cmp,
                     prev_rad1: self.rad1, rad_s: self.s, accum: mut self.accum,
                     emit_accum: mut self.emit_accum,
                 ),
@@ -1576,16 +1707,17 @@ impl RadianceCache {
         if self.grid.enabled == 0 || cap_verts == 0 || inst_count == 0 || n_fields == 0 {
             return
         }
+        let stride = rad_stride(cap_verts, inst_count)
         dispatch(
-            prep_rad_list.bind(count: vert_count, cap: cap_verts, inst_count: inst_count, args: mut self.inject_args),
+            prep_rad_list.bind(count: vert_count, cap: cap_verts, stride: stride, inst_count: inst_count, args: mut self.inject_args),
             over: 1,
         )
-        let groups_most = (((cap_verts + 1) / 2) * inst_count + 63) / 64
+        let groups_most = (((cap_verts + stride - 1) / stride) * inst_count + 63) / 64
         if to_static {
             dispatch(
                 rad_inject_many.bind(
                     fields: fields, n_fields: n_fields, verts: verts, vert_count: vert_count,
-                    cap_verts: cap_verts, xforms: xforms, inst_ids: inst_ids,
+                    cap_verts: cap_verts, stride: stride, xforms: xforms, inst_ids: inst_ids,
                     is_instanced: is_instanced, inst_count: inst_count, grid: self.grid, sv: sv,
                     sky: sky, sky_table: sky_table, sky_s: sky_s, shadow_map: shadow_map, cmp: cmp,
                     prev_rad1: self.rad1, rad_s: self.s, accum: mut self.static_accum,
@@ -1598,11 +1730,127 @@ impl RadianceCache {
             dispatch(
                 rad_inject_many.bind(
                     fields: fields, n_fields: n_fields, verts: verts, vert_count: vert_count,
-                    cap_verts: cap_verts, xforms: xforms, inst_ids: inst_ids,
+                    cap_verts: cap_verts, stride: stride, xforms: xforms, inst_ids: inst_ids,
                     is_instanced: is_instanced, inst_count: inst_count, grid: self.grid, sv: sv,
                     sky: sky, sky_table: sky_table, sky_s: sky_s, shadow_map: shadow_map, cmp: cmp,
                     prev_rad1: self.rad1, rad_s: self.s, accum: mut self.accum,
                     emit_accum: mut self.emit_accum,
+                ),
+                groups: self.inject_args,
+                most: groups_most,
+            )
+        }
+    }
+
+    /// Injects one `Skinned` `One<M>` meshlet batch into either cached static or active radiance buffers.
+    pub fn inject_skin_one<M: Field<Substance>, S: Sky>(
+        mut self,
+        field: M,
+        verts: GpuSpan<MeshVertex>,
+        skin: GpuSpan<u32>,
+        vert_count: GpuSpan<u32>,
+        cap_verts: u32,
+        xforms: GpuSpan<Rigid>,
+        bones: GpuSpan<DualQuat>,
+        bone_stride: u32,
+        inst_count: u32,
+        sv: ShadowView,
+        sky: S,
+        sky_table: Texture<Rgba16Float>,
+        sky_s: Sampler,
+        shadow_map: DepthTexture,
+        cmp: ComparisonSampler,
+        to_static: bool,
+    ) {
+        if self.grid.enabled == 0 || cap_verts == 0 || inst_count == 0 {
+            return
+        }
+        let stride = rad_stride(cap_verts, inst_count)
+        dispatch(
+            prep_rad_list.bind(count: vert_count, cap: cap_verts, stride: stride, inst_count: inst_count, args: mut self.inject_args),
+            over: 1,
+        )
+        let groups_most = (((cap_verts + stride - 1) / stride) * inst_count + 63) / 64
+        if to_static {
+            dispatch(
+                rad_inject_skin_one.bind(
+                    field: field, verts: verts, skin: skin, vert_count: vert_count, cap_verts: cap_verts,
+                    stride: stride, xforms: xforms, bones: bones, bone_stride: bone_stride,
+                    inst_count: inst_count, grid: self.grid, sv: sv, sky: sky, sky_table: sky_table,
+                    sky_s: sky_s, shadow_map: shadow_map, cmp: cmp, prev_rad1: self.rad1, rad_s: self.s,
+                    accum: mut self.static_accum, emit_accum: mut self.static_emit_accum,
+                ),
+                groups: self.inject_args,
+                most: groups_most,
+            )
+        } else {
+            dispatch(
+                rad_inject_skin_one.bind(
+                    field: field, verts: verts, skin: skin, vert_count: vert_count, cap_verts: cap_verts,
+                    stride: stride, xforms: xforms, bones: bones, bone_stride: bone_stride,
+                    inst_count: inst_count, grid: self.grid, sv: sv, sky: sky, sky_table: sky_table,
+                    sky_s: sky_s, shadow_map: shadow_map, cmp: cmp, prev_rad1: self.rad1, rad_s: self.s,
+                    accum: mut self.accum, emit_accum: mut self.emit_accum,
+                ),
+                groups: self.inject_args,
+                most: groups_most,
+            )
+        }
+    }
+
+    /// Injects one `Skinned` `Many<M, N>` meshlet batch into either cached static or active radiance buffers.
+    pub fn inject_skin_many<M: Field<Substance>, S: Sky>(
+        mut self,
+        fields: GpuSpan<M>,
+        n_fields: u32,
+        verts: GpuSpan<MeshVertex>,
+        skin: GpuSpan<u32>,
+        vert_count: GpuSpan<u32>,
+        cap_verts: u32,
+        xforms: GpuSpan<Rigid>,
+        bones: GpuSpan<DualQuat>,
+        bone_stride: u32,
+        inst_ids: GpuSpan<u32>,
+        inst_count: u32,
+        sv: ShadowView,
+        sky: S,
+        sky_table: Texture<Rgba16Float>,
+        sky_s: Sampler,
+        shadow_map: DepthTexture,
+        cmp: ComparisonSampler,
+        to_static: bool,
+    ) {
+        if self.grid.enabled == 0 || cap_verts == 0 || inst_count == 0 || n_fields == 0 {
+            return
+        }
+        let stride = rad_stride(cap_verts, inst_count)
+        dispatch(
+            prep_rad_list.bind(count: vert_count, cap: cap_verts, stride: stride, inst_count: inst_count, args: mut self.inject_args),
+            over: 1,
+        )
+        let groups_most = (((cap_verts + stride - 1) / stride) * inst_count + 63) / 64
+        if to_static {
+            dispatch(
+                rad_inject_skin_many.bind(
+                    fields: fields, n_fields: n_fields, verts: verts, skin: skin,
+                    vert_count: vert_count, cap_verts: cap_verts, stride: stride, xforms: xforms,
+                    bones: bones, bone_stride: bone_stride, inst_ids: inst_ids, inst_count: inst_count,
+                    grid: self.grid, sv: sv, sky: sky, sky_table: sky_table, sky_s: sky_s,
+                    shadow_map: shadow_map, cmp: cmp, prev_rad1: self.rad1, rad_s: self.s,
+                    accum: mut self.static_accum, emit_accum: mut self.static_emit_accum,
+                ),
+                groups: self.inject_args,
+                most: groups_most,
+            )
+        } else {
+            dispatch(
+                rad_inject_skin_many.bind(
+                    fields: fields, n_fields: n_fields, verts: verts, skin: skin,
+                    vert_count: vert_count, cap_verts: cap_verts, stride: stride, xforms: xforms,
+                    bones: bones, bone_stride: bone_stride, inst_ids: inst_ids, inst_count: inst_count,
+                    grid: self.grid, sv: sv, sky: sky, sky_table: sky_table, sky_s: sky_s,
+                    shadow_map: shadow_map, cmp: cmp, prev_rad1: self.rad1, rad_s: self.s,
+                    accum: mut self.accum, emit_accum: mut self.emit_accum,
                 ),
                 groups: self.inject_args,
                 most: groups_most,

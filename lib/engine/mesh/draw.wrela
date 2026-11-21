@@ -14,8 +14,8 @@ use matter::substance::{
 use matter::swarm::{NoSwarm, Swarm}
 use matter::world::{And, Many, One, World}
 use mesh::extract::{
-    ExtractScratch, MeshBatch, MeshVertex, extract_scratch, mesh_batch, steep, unpack_oct_normal,
-    unpack_smooth, unpack_thing,
+    ExtractScratch, MeshBatch, MeshVertex, eval_dqs, extract_scratch, mesh_batch, steep,
+    unpack_oct_normal, unpack_smooth, unpack_thing,
 }
 use mesh::height::{CLIP_RINGS, ClipmapMesh, MeshVary, clipmap_mesh, height_vs}
 use mesh::light::{
@@ -38,7 +38,7 @@ use picture::look::Look
 use picture::picture::{Picture, picture}
 use picture::screen::{cover, luma, show}
 use std::collections::Vec
-use std::field::{Field, Rigid}
+use std::field::{DualQuat, Field, Rigid}
 use std::gpu::{
     Address, ClipPosition, Compare, ComparisonSampler, Cull, Depth, DepthBias, DepthOnlyPass,
     DepthPass, DepthPass4, DepthTexture, Filter, FragCoord, GpuBuffer, GpuSpan, InstanceIndex, R8,
@@ -70,12 +70,43 @@ struct FieldVary: Copy {
     meta: vec2,
 }
 
+/// Interpolator payload for GPU Dual Quaternion Skinned meshlets: adds rest-pose local `rest_p`
+/// so procedural materials (`rest_channels(rest_p)`) remain locked to the moving skin.
+struct SkinVary: Copy {
+    clip: ClipPosition,
+    wp: vec3,
+    prev_wp: vec3,
+    rest_p: vec3,
+    normal: vec3,
+    meta: vec2,
+}
+
 /// Vertex shader for the unified shadow depth pass: projects 16-byte `MeshVertex` through its
 /// instance's rigid transform `xforms[ii.index]` into orthographic sun space (5× less fetch BW).
 @vertex
 fn shadow_vs(verts: [MeshVertex], xforms: [Rigid], sv: ShadowView, vi: VertexIndex, ii: InstanceIndex) -> ClipPosition {
     let vert = verts[vi.index]
     let wp = xforms[ii.index].apply_point(vec3(vert.px, vert.py, vert.pz))
+    ClipPosition { position: vec4(sv.project(wp), 1.0) }
+}
+
+/// Shadow depth vertex shader for `Skinned` meshlets: evaluates 4-bone Dual Quaternion Skinning
+/// (Kavan et al. 2007/2008) on rest-pose vertices before applying the instance rigid transform.
+@vertex
+fn skin_shadow_vs(
+    verts: [MeshVertex],
+    skin: [u32],
+    xforms: [Rigid],
+    bones: [DualQuat],
+    bone_stride: u32,
+    sv: ShadowView,
+    vi: VertexIndex,
+    ii: InstanceIndex,
+) -> ClipPosition {
+    let vert = verts[vi.index]
+    let dq = eval_dqs(bones, ii.index * bone_stride, skin[vi.index * 2], skin[vi.index * 2 + 1])
+    let sp = dq.apply_point(vec3(vert.px, vert.py, vert.pz))
+    let wp = xforms[ii.index].apply_point(sp)
     ClipPosition { position: vec4(sv.project(wp), 1.0) }
 }
 
@@ -112,6 +143,82 @@ fn mesh_vs(
         clip: clip_of(v, wp),
         wp,
         prev_wp,
+        normal: n,
+        meta: vec2(smooth, f32(tid) + 0.5),
+    }
+}
+
+/// Vertex shader for exact pre-deformed `One<Skinned>` meshlets (`deform_skinned_verts`): reads
+/// exact posed local vertex + analytical normal from `verts`, previous-frame posed vertex from
+/// `prev_verts` for exact TSR motion vectors, and rest-pose `rest_verts` for skin-locked materials
+/// (zero DQS math in the vertex shader).
+@vertex
+fn deformed_mesh_vs(
+    verts: [MeshVertex],
+    prev_verts: [MeshVertex],
+    rest_verts: [MeshVertex],
+    xforms: [Rigid],
+    prev_xforms: [Rigid],
+    v: View,
+    vi: VertexIndex,
+    ii: InstanceIndex,
+) -> SkinVary {
+    let vert = verts[vi.index]
+    let pvert = prev_verts[vi.index]
+    let rvert = rest_verts[vi.index]
+    let xf = xforms[ii.index]
+    let pxf = prev_xforms[ii.index]
+    let wp = xf.apply_point(vec3(vert.px, vert.py, vert.pz))
+    let prev_wp = pxf.apply_point(vec3(pvert.px, pvert.py, pvert.pz))
+    let n = xf.apply_normal(unpack_oct_normal(vert.packed))
+    let smooth = if unpack_smooth(vert.packed) { 1.0 } else { 0.0 }
+    let tid = unpack_thing(vert.packed)
+    SkinVary {
+        clip: clip_of(v, wp),
+        wp,
+        prev_wp,
+        rest_p: vec3(rvert.px, rvert.py, rvert.pz),
+        normal: n,
+        meta: vec2(smooth, f32(tid) + 0.5),
+    }
+}
+
+/// Eye/refract vertex shader for `Skinned` meshlets: evaluates Dual Quaternion Skinning for both
+/// current (`bones`) and previous (`prev_bones`) frames for exact analytical TSR motion vectors.
+@vertex
+fn skin_mesh_vs(
+    verts: [MeshVertex],
+    skin: [u32],
+    xforms: [Rigid],
+    prev_xforms: [Rigid],
+    bones: [DualQuat],
+    prev_bones: [DualQuat],
+    bone_stride: u32,
+    inst_ids: [u32],
+    is_instanced: u32,
+    v: View,
+    vi: VertexIndex,
+    ii: InstanceIndex,
+) -> SkinVary {
+    let vert = verts[vi.index]
+    let pb = skin[vi.index * 2]
+    let pw = skin[vi.index * 2 + 1]
+    let base = ii.index * bone_stride
+    let dq = eval_dqs(bones, base, pb, pw)
+    let pdq = eval_dqs(prev_bones, base, pb, pw)
+    let xf = xforms[ii.index]
+    let pxf = prev_xforms[ii.index]
+    let lp = vec3(vert.px, vert.py, vert.pz)
+    let wp = xf.apply_point(dq.apply_point(lp))
+    let prev_wp = pxf.apply_point(pdq.apply_point(lp))
+    let n = xf.apply_normal(dq.apply_normal(unpack_oct_normal(vert.packed)))
+    let smooth = if unpack_smooth(vert.packed) { 1.0 } else { 0.0 }
+    let tid = if is_instanced != 0 { inst_ids[ii.index] } else { unpack_thing(vert.packed) }
+    SkinVary {
+        clip: clip_of(v, wp),
+        wp,
+        prev_wp,
+        rest_p: lp,
         normal: n,
         meta: vec2(smooth, f32(tid) + 0.5),
     }
@@ -265,6 +372,34 @@ fn field_gbuf_many_fs<M: Field<Substance>>(
 ) -> Targets4<vec4, vec4, vec4, vec2> {
     let tid = min(u32(max(vary.meta.y, 0.0)), n_fields - 1)
     let sub0 = fields[tid].channels(vary.wp)
+    shade_gbuf_core(vary.wp, vary.prev_wp, vary.normal, vary.meta.x, sub0, v, prev_v)
+}
+
+/// Skin-locked pixel-rate G-buffer fragment shader for `Skinned` `One<M>` meshlets.
+@fragment
+@budget(work: 8000)
+fn field_skin_gbuf_one_fs<M: Field<Substance>>(
+    vary: SkinVary,
+    field: M,
+    v: View,
+    prev_v: View,
+) -> Targets4<vec4, vec4, vec4, vec2> {
+    let sub0 = field.rest_channels(vary.rest_p)
+    shade_gbuf_core(vary.wp, vary.prev_wp, vary.normal, vary.meta.x, sub0, v, prev_v)
+}
+
+/// Skin-locked pixel-rate G-buffer fragment shader for `Skinned` `Many<M, N>` meshlets.
+@fragment
+@budget(work: 8000)
+fn field_skin_gbuf_many_fs<M: Field<Substance>>(
+    vary: SkinVary,
+    fields: [M],
+    n_fields: u32,
+    v: View,
+    prev_v: View,
+) -> Targets4<vec4, vec4, vec4, vec2> {
+    let tid = min(u32(max(vary.meta.y, 0.0)), n_fields - 1)
+    let sub0 = fields[tid].rest_channels(vary.rest_p)
     shade_gbuf_core(vary.wp, vary.prev_wp, vary.normal, vary.meta.x, sub0, v, prev_v)
 }
 
@@ -777,6 +912,76 @@ fn field_refract_refl_many_fs<M: Field<Substance>>(
     )
 }
 
+/// Half-res transmissive reflection pre-pass for `Skinned` `One<M>` meshlets.
+@fragment
+@budget(work: 20000)
+fn field_skin_refract_refl_one_fs<M: Field<Substance>>(
+    pixel: FragCoord,
+    vary: SkinVary,
+    field: M,
+    v: View,
+    rad_grid: RadGrid,
+    sdf_grid: SdfGrid,
+    sky_diff: Texture<Rgba16Float>,
+    sky_spec0: Texture<Rgba16Float>,
+    sky_spec1: Texture<Rgba16Float>,
+    sky_spec2: Texture<Rgba16Float>,
+    sky_s: Sampler,
+    rad0: Texture3d<Rgba16Float>,
+    rad1: Texture3d<Rgba16Float>,
+    rad2: Texture3d<Rgba16Float>,
+    rad_s: Sampler,
+    sdf0: Texture3d<R16Float>,
+    sdf1: Texture3d<R16Float>,
+    sdf_s: Sampler,
+    hdr_bg: Texture<Rgba16Float>,
+    bg_s: Sampler,
+    half_size: vec2,
+) -> vec4 {
+    let sub0 = field.rest_channels(vary.rest_p)
+    shade_refract_refl_core(
+        pixel, vary.wp, vary.normal, vary.meta.x, sub0, v, rad_grid, sdf_grid,
+        sky_diff, sky_spec0, sky_spec1, sky_spec2, sky_s, rad0, rad1, rad2, rad_s,
+        sdf0, sdf1, sdf_s, hdr_bg, bg_s, half_size,
+    )
+}
+
+/// Half-res transmissive reflection pre-pass for `Skinned` `Many<M, N>` meshlets.
+@fragment
+@budget(work: 20000)
+fn field_skin_refract_refl_many_fs<M: Field<Substance>>(
+    pixel: FragCoord,
+    vary: SkinVary,
+    fields: [M],
+    n_fields: u32,
+    v: View,
+    rad_grid: RadGrid,
+    sdf_grid: SdfGrid,
+    sky_diff: Texture<Rgba16Float>,
+    sky_spec0: Texture<Rgba16Float>,
+    sky_spec1: Texture<Rgba16Float>,
+    sky_spec2: Texture<Rgba16Float>,
+    sky_s: Sampler,
+    rad0: Texture3d<Rgba16Float>,
+    rad1: Texture3d<Rgba16Float>,
+    rad2: Texture3d<Rgba16Float>,
+    rad_s: Sampler,
+    sdf0: Texture3d<R16Float>,
+    sdf1: Texture3d<R16Float>,
+    sdf_s: Sampler,
+    hdr_bg: Texture<Rgba16Float>,
+    bg_s: Sampler,
+    half_size: vec2,
+) -> vec4 {
+    let tid = min(u32(max(vary.meta.y, 0.0)), n_fields - 1)
+    let sub0 = fields[tid].rest_channels(vary.rest_p)
+    shade_refract_refl_core(
+        pixel, vary.wp, vary.normal, vary.meta.x, sub0, v, rad_grid, sdf_grid,
+        sky_diff, sky_spec0, sky_spec1, sky_spec2, sky_s, rad0, rad1, rad2, rad_s,
+        sdf0, sdf1, sdf_s, hdr_bg, bg_s, half_size,
+    )
+}
+
 /// Half-resolution (`W/2 × H/2`) reflection pre-pass for transmissive heightfields (`height_vs`).
 @fragment
 @budget(work: 16000)
@@ -1035,6 +1240,92 @@ fn field_trans_many_fs<M: Field<Substance>, S: Sky>(
     )
 }
 
+/// Pixel-rate transmissive fragment shader for `Skinned` `One<M>` meshlets.
+@fragment
+@budget(work: 44000)
+fn field_skin_trans_one_fs<M: Field<Substance>, S: Sky>(
+    pixel: FragCoord,
+    vary: SkinVary,
+    field: M,
+    v: View,
+    sv: ShadowView,
+    rad_grid: RadGrid,
+    sdf_grid: SdfGrid,
+    sky: S,
+    sky_diff: Texture<Rgba16Float>,
+    sky_spec0: Texture<Rgba16Float>,
+    sky_spec1: Texture<Rgba16Float>,
+    sky_spec2: Texture<Rgba16Float>,
+    sky_s: Sampler,
+    shadow_map: DepthTexture,
+    cmp: ComparisonSampler,
+    rad0: Texture3d<Rgba16Float>,
+    rad1: Texture3d<Rgba16Float>,
+    rad2: Texture3d<Rgba16Float>,
+    rad_s: Sampler,
+    sdf0: Texture3d<R16Float>,
+    sdf1: Texture3d<R16Float>,
+    sdf_s: Sampler,
+    emitters: [Emitter],
+    tile_masks: [u32],
+    tiles_x: u32,
+    hdr_bg: Texture<Rgba16Float>,
+    refract_refl: Texture<Rgba16Float>,
+    bg_s: Sampler,
+) -> vec4 {
+    let sub0 = field.rest_channels(vary.rest_p)
+    shade_trans_core(
+        pixel, vary.wp, vary.normal, vary.meta.x, sub0, v, sv, rad_grid, sdf_grid, sky,
+        sky_diff, sky_spec0, sky_spec1, sky_spec2, sky_s, shadow_map, cmp,
+        rad0, rad1, rad2, rad_s, sdf0, sdf1, sdf_s, emitters, tile_masks, tiles_x,
+        hdr_bg, refract_refl, bg_s,
+    )
+}
+
+/// Pixel-rate transmissive fragment shader for `Skinned` `Many<M, N>` meshlets.
+@fragment
+@budget(work: 44000)
+fn field_skin_trans_many_fs<M: Field<Substance>, S: Sky>(
+    pixel: FragCoord,
+    vary: SkinVary,
+    fields: [M],
+    n_fields: u32,
+    v: View,
+    sv: ShadowView,
+    rad_grid: RadGrid,
+    sdf_grid: SdfGrid,
+    sky: S,
+    sky_diff: Texture<Rgba16Float>,
+    sky_spec0: Texture<Rgba16Float>,
+    sky_spec1: Texture<Rgba16Float>,
+    sky_spec2: Texture<Rgba16Float>,
+    sky_s: Sampler,
+    shadow_map: DepthTexture,
+    cmp: ComparisonSampler,
+    rad0: Texture3d<Rgba16Float>,
+    rad1: Texture3d<Rgba16Float>,
+    rad2: Texture3d<Rgba16Float>,
+    rad_s: Sampler,
+    sdf0: Texture3d<R16Float>,
+    sdf1: Texture3d<R16Float>,
+    sdf_s: Sampler,
+    emitters: [Emitter],
+    tile_masks: [u32],
+    tiles_x: u32,
+    hdr_bg: Texture<Rgba16Float>,
+    refract_refl: Texture<Rgba16Float>,
+    bg_s: Sampler,
+) -> vec4 {
+    let tid = min(u32(max(vary.meta.y, 0.0)), n_fields - 1)
+    let sub0 = fields[tid].rest_channels(vary.rest_p)
+    shade_trans_core(
+        pixel, vary.wp, vary.normal, vary.meta.x, sub0, v, sv, rad_grid, sdf_grid, sky,
+        sky_diff, sky_spec0, sky_spec1, sky_spec2, sky_s, shadow_map, cmp,
+        rad0, rad1, rad2, rad_s, sdf0, sdf1, sdf_s, emitters, tile_masks, tiles_x,
+        hdr_bg, refract_refl, bg_s,
+    )
+}
+
 /// Physically-based refractive / transmissive fragment shader for transmissive heightfields (`height_vs`).
 @fragment
 @budget(work: 38000)
@@ -1252,6 +1543,45 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for One<M> {
         if !all_batches && is_static != static_only {
             return
         }
+        if batches[first].is_deformed {
+            rad.inject_one(
+                self.field,
+                batches[first].deformed_verts.items(),
+                batches[first].verts.count(),
+                batches[first].cap_verts,
+                batches[first].xforms.items(),
+                batches[first].inst_count,
+                sv,
+                sky,
+                sky_diff,
+                sky_s,
+                shadow_map,
+                cmp,
+                to_static: !all_batches && static_only,
+            )
+            return
+        }
+        if batches[first].is_skinned {
+            rad.inject_skin_one(
+                self.field,
+                batches[first].verts.items(),
+                batches[first].skin_verts.items(),
+                batches[first].verts.count(),
+                batches[first].cap_verts,
+                batches[first].xforms.items(),
+                batches[first].bones.items(),
+                batches[first].bone_stride,
+                batches[first].inst_count,
+                sv,
+                sky,
+                sky_diff,
+                sky_s,
+                shadow_map,
+                cmp,
+                to_static: !all_batches && static_only,
+            )
+            return
+        }
         rad.inject_one(
             self.field,
             batches[first].verts.items(),
@@ -1279,6 +1609,48 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for One<M> {
         prev_v: View,
     ) {
         if !batches[first].has_opaque {
+            return
+        }
+        if batches[first].is_deformed {
+            draw(
+                ep,
+                deformed_mesh_vs.bind(
+                    verts: batches[first].deformed_verts.items(),
+                    prev_verts: batches[first].prev_deformed_verts.items(),
+                    rest_verts: batches[first].verts.items(),
+                    xforms: batches[first].xforms.items(),
+                    prev_xforms: batches[first].prev_xforms.items(),
+                    v: v,
+                ),
+                field_skin_gbuf_one_fs.bind(field: self.field, v: v, prev_v: prev_v),
+                indices: batches[first].indices,
+                indirect: batches[first].draw_args,
+                cull: Cull::Back,
+                depth: Depth { compare: Compare::Greater, write: true },
+            )
+            return
+        }
+        if batches[first].is_skinned {
+            draw(
+                ep,
+                skin_mesh_vs.bind(
+                    verts: batches[first].verts.items(),
+                    skin: batches[first].skin_verts.items(),
+                    xforms: batches[first].xforms.items(),
+                    prev_xforms: batches[first].prev_xforms.items(),
+                    bones: batches[first].bones.items(),
+                    prev_bones: batches[first].prev_bones.items(),
+                    bone_stride: batches[first].bone_stride,
+                    inst_ids: batches[first].inst_ids.items(),
+                    is_instanced: 0,
+                    v: v,
+                ),
+                field_skin_gbuf_one_fs.bind(field: self.field, v: v, prev_v: prev_v),
+                indices: batches[first].indices,
+                indirect: batches[first].draw_args,
+                cull: Cull::Back,
+                depth: Depth { compare: Compare::Greater, write: true },
+            )
             return
         }
         draw(
@@ -1325,6 +1697,88 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for One<M> {
         half_size: vec2,
     ) {
         if !batches[first].has_trans {
+            return
+        }
+        if batches[first].is_deformed {
+            draw(
+                rrp,
+                deformed_mesh_vs.bind(
+                    verts: batches[first].deformed_verts.items(),
+                    prev_verts: batches[first].prev_deformed_verts.items(),
+                    rest_verts: batches[first].verts.items(),
+                    xforms: batches[first].xforms.items(),
+                    prev_xforms: batches[first].prev_xforms.items(),
+                    v: v,
+                ),
+                field_skin_refract_refl_one_fs.bind(
+                    field: self.field,
+                    v: v,
+                    rad_grid: rad_grid,
+                    sdf_grid: sdf_grid,
+                    sky_diff: sky_diff,
+                    sky_spec0: sky_spec0,
+                    sky_spec1: sky_spec1,
+                    sky_spec2: sky_spec2,
+                    sky_s: sky_s,
+                    rad0: rad0,
+                    rad1: rad1,
+                    rad2: rad2,
+                    rad_s: rad_s,
+                    sdf0: sdf0,
+                    sdf1: sdf1,
+                    sdf_s: sdf_s,
+                    hdr_bg: hdr_bg,
+                    bg_s: bg_s,
+                    half_size: half_size,
+                ),
+                indices: batches[first].trans_indices,
+                indirect: batches[first].trans_draw_args,
+                cull: Cull::Back,
+                depth: Depth { compare: Compare::Greater, write: true },
+            )
+            return
+        }
+        if batches[first].is_skinned {
+            draw(
+                rrp,
+                skin_mesh_vs.bind(
+                    verts: batches[first].verts.items(),
+                    skin: batches[first].skin_verts.items(),
+                    xforms: batches[first].xforms.items(),
+                    prev_xforms: batches[first].prev_xforms.items(),
+                    bones: batches[first].bones.items(),
+                    prev_bones: batches[first].prev_bones.items(),
+                    bone_stride: batches[first].bone_stride,
+                    inst_ids: batches[first].inst_ids.items(),
+                    is_instanced: 0,
+                    v: v,
+                ),
+                field_skin_refract_refl_one_fs.bind(
+                    field: self.field,
+                    v: v,
+                    rad_grid: rad_grid,
+                    sdf_grid: sdf_grid,
+                    sky_diff: sky_diff,
+                    sky_spec0: sky_spec0,
+                    sky_spec1: sky_spec1,
+                    sky_spec2: sky_spec2,
+                    sky_s: sky_s,
+                    rad0: rad0,
+                    rad1: rad1,
+                    rad2: rad2,
+                    rad_s: rad_s,
+                    sdf0: sdf0,
+                    sdf1: sdf1,
+                    sdf_s: sdf_s,
+                    hdr_bg: hdr_bg,
+                    bg_s: bg_s,
+                    half_size: half_size,
+                ),
+                indices: batches[first].trans_indices,
+                indirect: batches[first].trans_draw_args,
+                cull: Cull::Back,
+                depth: Depth { compare: Compare::Greater, write: true },
+            )
             return
         }
         draw(
@@ -1398,6 +1852,102 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for One<M> {
         bg_s: Sampler,
     ) {
         if !batches[first].has_trans {
+            return
+        }
+        if batches[first].is_deformed {
+            draw(
+                rp,
+                deformed_mesh_vs.bind(
+                    verts: batches[first].deformed_verts.items(),
+                    prev_verts: batches[first].prev_deformed_verts.items(),
+                    rest_verts: batches[first].verts.items(),
+                    xforms: batches[first].xforms.items(),
+                    prev_xforms: batches[first].prev_xforms.items(),
+                    v: v,
+                ),
+                field_skin_trans_one_fs.bind(
+                    field: self.field,
+                    v: v,
+                    sv: sv,
+                    rad_grid: rad_grid,
+                    sdf_grid: sdf_grid,
+                    sky: sky,
+                    sky_diff: sky_diff,
+                    sky_spec0: sky_spec0,
+                    sky_spec1: sky_spec1,
+                    sky_spec2: sky_spec2,
+                    sky_s: sky_s,
+                    shadow_map: shadow_map,
+                    cmp: cmp,
+                    rad0: rad0,
+                    rad1: rad1,
+                    rad2: rad2,
+                    rad_s: rad_s,
+                    sdf0: sdf0,
+                    sdf1: sdf1,
+                    sdf_s: sdf_s,
+                    emitters: emitters,
+                    tile_masks: tile_masks,
+                    tiles_x: tiles_x,
+                    hdr_bg: hdr_bg,
+                    refract_refl: refract_refl,
+                    bg_s: bg_s,
+                ),
+                indices: batches[first].trans_indices,
+                indirect: batches[first].trans_draw_args,
+                cull: Cull::Back,
+                depth: Depth { compare: Compare::Greater, write: true },
+            )
+            return
+        }
+        if batches[first].is_skinned {
+            draw(
+                rp,
+                skin_mesh_vs.bind(
+                    verts: batches[first].verts.items(),
+                    skin: batches[first].skin_verts.items(),
+                    xforms: batches[first].xforms.items(),
+                    prev_xforms: batches[first].prev_xforms.items(),
+                    bones: batches[first].bones.items(),
+                    prev_bones: batches[first].prev_bones.items(),
+                    bone_stride: batches[first].bone_stride,
+                    inst_ids: batches[first].inst_ids.items(),
+                    is_instanced: 0,
+                    v: v,
+                ),
+                field_skin_trans_one_fs.bind(
+                    field: self.field,
+                    v: v,
+                    sv: sv,
+                    rad_grid: rad_grid,
+                    sdf_grid: sdf_grid,
+                    sky: sky,
+                    sky_diff: sky_diff,
+                    sky_spec0: sky_spec0,
+                    sky_spec1: sky_spec1,
+                    sky_spec2: sky_spec2,
+                    sky_s: sky_s,
+                    shadow_map: shadow_map,
+                    cmp: cmp,
+                    rad0: rad0,
+                    rad1: rad1,
+                    rad2: rad2,
+                    rad_s: rad_s,
+                    sdf0: sdf0,
+                    sdf1: sdf1,
+                    sdf_s: sdf_s,
+                    emitters: emitters,
+                    tile_masks: tile_masks,
+                    tiles_x: tiles_x,
+                    hdr_bg: hdr_bg,
+                    refract_refl: refract_refl,
+                    bg_s: bg_s,
+                ),
+                indices: batches[first].trans_indices,
+                indirect: batches[first].trans_draw_args,
+                cull: Cull::Back,
+                depth: Depth { compare: Compare::Greater, write: true },
+            )
             return
         }
         draw(
@@ -1493,6 +2043,44 @@ impl<M: Field<Substance> + StateHash + GpuData, const N: u32> MeshWorld for Many
         }
         let inv_w = if total_w > 1.0e-6 { f32(cap) / total_w } else { f32(cap) }
 
+        // Fast path for skinned crowds: split `N >= 16` into 2 distance LOD templates (`<= 12 m`
+        // near, `> 12 m` far) so every visible character renders at distance-appropriate density
+        // with 0.000 ms per-frame extraction and 1–2 GPU-instanced DQS draw calls.
+        let first_skinned = match self.fields[0].skin_shape_hash() {
+            Some(_) => true,
+            None => false,
+        }
+        if first_skinned {
+            if N < 16 {
+                var cells = [0.0; N]
+                for i in 0..N {
+                    if weights[i] > 0.0 {
+                        cells[i] = cell_for_one(centres[i], radii[i], v, steep(self.fields[i]))
+                    }
+                }
+                batches[first].sync_many(mut scratch, self.fields, cells)
+                return
+            }
+            var c_near = [0.0; N]
+            var c_far = [0.0; N]
+            for i in 0..N {
+                if weights[i] > 0.0 {
+                    let c = cell_for_one(centres[i], radii[i], v, steep(self.fields[i]))
+                    if nears[i] <= 12.0 {
+                        c_near[i] = c
+                    } else {
+                        c_far[i] = c
+                    }
+                }
+            }
+            batches[first].sync_many(mut scratch, self.fields, c_near)
+            batches[first + 1].sync_many(mut scratch, self.fields, c_far)
+            batches[first + 2].has_opaque = false
+            batches[first + 2].has_trans = false
+            batches[first + 2].inst_count = 0
+            batches[first + 2].still_frames += 1
+            return
+        }
         if N < 16 {
             var cells = [0.0; N]
             for i in 0..N {
@@ -1602,25 +2190,48 @@ impl<M: Field<Substance> + StateHash + GpuData, const N: u32> MeshWorld for Many
             let bi = first + k
             let is_static = batches[bi].still_frames >= 1
             if all_batches || is_static == static_only {
-                let is_inst: u32 = if batches[bi].instanced { 1 } else { 0 }
-                rad.inject_many(
-                    fbuf.items(),
-                    N,
-                    batches[bi].verts.items(),
-                    batches[bi].verts.count(),
-                    batches[bi].cap_verts,
-                    batches[bi].xforms.items(),
-                    batches[bi].inst_ids.items(),
-                    is_inst,
-                    batches[bi].inst_count,
-                    sv,
-                    sky,
-                    sky_diff,
-                    sky_s,
-                    shadow_map,
-                    cmp,
-                    to_static: !all_batches && static_only,
-                )
+                if batches[bi].is_skinned {
+                    rad.inject_skin_many(
+                        fbuf.items(),
+                        N,
+                        batches[bi].verts.items(),
+                        batches[bi].skin_verts.items(),
+                        batches[bi].verts.count(),
+                        batches[bi].cap_verts,
+                        batches[bi].xforms.items(),
+                        batches[bi].bones.items(),
+                        batches[bi].bone_stride,
+                        batches[bi].inst_ids.items(),
+                        batches[bi].inst_count,
+                        sv,
+                        sky,
+                        sky_diff,
+                        sky_s,
+                        shadow_map,
+                        cmp,
+                        to_static: !all_batches && static_only,
+                    )
+                } else {
+                    let is_inst: u32 = if batches[bi].instanced { 1 } else { 0 }
+                    rad.inject_many(
+                        fbuf.items(),
+                        N,
+                        batches[bi].verts.items(),
+                        batches[bi].verts.count(),
+                        batches[bi].cap_verts,
+                        batches[bi].xforms.items(),
+                        batches[bi].inst_ids.items(),
+                        is_inst,
+                        batches[bi].inst_count,
+                        sv,
+                        sky,
+                        sky_diff,
+                        sky_s,
+                        shadow_map,
+                        cmp,
+                        to_static: !all_batches && static_only,
+                    )
+                }
             }
         }
     }
@@ -1639,22 +2250,45 @@ impl<M: Field<Substance> + StateHash + GpuData, const N: u32> MeshWorld for Many
             let bi = first + k
             if batches[bi].has_opaque {
                 let is_inst: u32 = if batches[bi].instanced { 1 } else { 0 }
-                draw(
-                    ep,
-                    mesh_vs.bind(
-                        verts: batches[bi].verts.items(),
-                        xforms: batches[bi].xforms.items(),
-                        prev_xforms: batches[bi].prev_xforms.items(),
-                        inst_ids: batches[bi].inst_ids.items(),
-                        is_instanced: is_inst,
-                        v: v,
-                    ),
-                    field_gbuf_many_fs.bind(fields: fbuf.items(), n_fields: N, v: v, prev_v: prev_v),
-                    indices: batches[bi].indices,
-                    indirect: batches[bi].draw_args,
-                    cull: Cull::Back,
-                    depth: Depth { compare: Compare::Greater, write: true },
-                )
+                if batches[bi].is_skinned {
+                    draw(
+                        ep,
+                        skin_mesh_vs.bind(
+                            verts: batches[bi].verts.items(),
+                            skin: batches[bi].skin_verts.items(),
+                            xforms: batches[bi].xforms.items(),
+                            prev_xforms: batches[bi].prev_xforms.items(),
+                            bones: batches[bi].bones.items(),
+                            prev_bones: batches[bi].prev_bones.items(),
+                            bone_stride: batches[bi].bone_stride,
+                            inst_ids: batches[bi].inst_ids.items(),
+                            is_instanced: is_inst,
+                            v: v,
+                        ),
+                        field_skin_gbuf_many_fs.bind(fields: fbuf.items(), n_fields: N, v: v, prev_v: prev_v),
+                        indices: batches[bi].indices,
+                        indirect: batches[bi].draw_args,
+                        cull: Cull::Back,
+                        depth: Depth { compare: Compare::Greater, write: true },
+                    )
+                } else {
+                    draw(
+                        ep,
+                        mesh_vs.bind(
+                            verts: batches[bi].verts.items(),
+                            xforms: batches[bi].xforms.items(),
+                            prev_xforms: batches[bi].prev_xforms.items(),
+                            inst_ids: batches[bi].inst_ids.items(),
+                            is_instanced: is_inst,
+                            v: v,
+                        ),
+                        field_gbuf_many_fs.bind(fields: fbuf.items(), n_fields: N, v: v, prev_v: prev_v),
+                        indices: batches[bi].indices,
+                        indirect: batches[bi].draw_args,
+                        cull: Cull::Back,
+                        depth: Depth { compare: Compare::Greater, write: true },
+                    )
+                }
             }
         }
     }
@@ -1689,43 +2323,87 @@ impl<M: Field<Substance> + StateHash + GpuData, const N: u32> MeshWorld for Many
             let bi = first + k
             if batches[bi].has_trans {
                 let is_inst: u32 = if batches[bi].instanced { 1 } else { 0 }
-                draw(
-                    rrp,
-                    mesh_vs.bind(
-                        verts: batches[bi].verts.items(),
-                        xforms: batches[bi].xforms.items(),
-                        prev_xforms: batches[bi].prev_xforms.items(),
-                        inst_ids: batches[bi].inst_ids.items(),
-                        is_instanced: is_inst,
-                        v: v,
-                    ),
-                    field_refract_refl_many_fs.bind(
-                        fields: fbuf.items(),
-                        n_fields: N,
-                        v: v,
-                        rad_grid: rad_grid,
-                        sdf_grid: sdf_grid,
-                        sky_diff: sky_diff,
-                        sky_spec0: sky_spec0,
-                        sky_spec1: sky_spec1,
-                        sky_spec2: sky_spec2,
-                        sky_s: sky_s,
-                        rad0: rad0,
-                        rad1: rad1,
-                        rad2: rad2,
-                        rad_s: rad_s,
-                        sdf0: sdf0,
-                        sdf1: sdf1,
-                        sdf_s: sdf_s,
-                        hdr_bg: hdr_bg,
-                        bg_s: bg_s,
-                        half_size: half_size,
-                    ),
-                    indices: batches[bi].trans_indices,
-                    indirect: batches[bi].trans_draw_args,
-                    cull: Cull::Back,
-                    depth: Depth { compare: Compare::Greater, write: true },
-                )
+                if batches[bi].is_skinned {
+                    draw(
+                        rrp,
+                        skin_mesh_vs.bind(
+                            verts: batches[bi].verts.items(),
+                            skin: batches[bi].skin_verts.items(),
+                            xforms: batches[bi].xforms.items(),
+                            prev_xforms: batches[bi].prev_xforms.items(),
+                            bones: batches[bi].bones.items(),
+                            prev_bones: batches[bi].prev_bones.items(),
+                            bone_stride: batches[bi].bone_stride,
+                            inst_ids: batches[bi].inst_ids.items(),
+                            is_instanced: is_inst,
+                            v: v,
+                        ),
+                        field_skin_refract_refl_many_fs.bind(
+                            fields: fbuf.items(),
+                            n_fields: N,
+                            v: v,
+                            rad_grid: rad_grid,
+                            sdf_grid: sdf_grid,
+                            sky_diff: sky_diff,
+                            sky_spec0: sky_spec0,
+                            sky_spec1: sky_spec1,
+                            sky_spec2: sky_spec2,
+                            sky_s: sky_s,
+                            rad0: rad0,
+                            rad1: rad1,
+                            rad2: rad2,
+                            rad_s: rad_s,
+                            sdf0: sdf0,
+                            sdf1: sdf1,
+                            sdf_s: sdf_s,
+                            hdr_bg: hdr_bg,
+                            bg_s: bg_s,
+                            half_size: half_size,
+                        ),
+                        indices: batches[bi].trans_indices,
+                        indirect: batches[bi].trans_draw_args,
+                        cull: Cull::Back,
+                        depth: Depth { compare: Compare::Greater, write: true },
+                    )
+                } else {
+                    draw(
+                        rrp,
+                        mesh_vs.bind(
+                            verts: batches[bi].verts.items(),
+                            xforms: batches[bi].xforms.items(),
+                            prev_xforms: batches[bi].prev_xforms.items(),
+                            inst_ids: batches[bi].inst_ids.items(),
+                            is_instanced: is_inst,
+                            v: v,
+                        ),
+                        field_refract_refl_many_fs.bind(
+                            fields: fbuf.items(),
+                            n_fields: N,
+                            v: v,
+                            rad_grid: rad_grid,
+                            sdf_grid: sdf_grid,
+                            sky_diff: sky_diff,
+                            sky_spec0: sky_spec0,
+                            sky_spec1: sky_spec1,
+                            sky_spec2: sky_spec2,
+                            sky_s: sky_s,
+                            rad0: rad0,
+                            rad1: rad1,
+                            rad2: rad2,
+                            rad_s: rad_s,
+                            sdf0: sdf0,
+                            sdf1: sdf1,
+                            sdf_s: sdf_s,
+                            hdr_bg: hdr_bg,
+                            bg_s: bg_s,
+                            half_size: half_size,
+                        ),
+                        indices: batches[bi].trans_indices,
+                        indirect: batches[bi].trans_draw_args,
+                        cull: Cull::Back,
+                        depth: Depth { compare: Compare::Greater, write: true },
+                    )
+                }
             }
         }
     }
@@ -1767,50 +2445,101 @@ impl<M: Field<Substance> + StateHash + GpuData, const N: u32> MeshWorld for Many
             let bi = first + k
             if batches[bi].has_trans {
                 let is_inst: u32 = if batches[bi].instanced { 1 } else { 0 }
-                draw(
-                    rp,
-                    mesh_vs.bind(
-                        verts: batches[bi].verts.items(),
-                        xforms: batches[bi].xforms.items(),
-                        prev_xforms: batches[bi].prev_xforms.items(),
-                        inst_ids: batches[bi].inst_ids.items(),
-                        is_instanced: is_inst,
-                        v: v,
-                    ),
-                    field_trans_many_fs.bind(
-                        fields: fbuf.items(),
-                        n_fields: N,
-                        v: v,
-                        sv: sv,
-                        rad_grid: rad_grid,
-                        sdf_grid: sdf_grid,
-                        sky: sky,
-                        sky_diff: sky_diff,
-                        sky_spec0: sky_spec0,
-                        sky_spec1: sky_spec1,
-                        sky_spec2: sky_spec2,
-                        sky_s: sky_s,
-                        shadow_map: shadow_map,
-                        cmp: cmp,
-                        rad0: rad0,
-                        rad1: rad1,
-                        rad2: rad2,
-                        rad_s: rad_s,
-                        sdf0: sdf0,
-                        sdf1: sdf1,
-                        sdf_s: sdf_s,
-                        emitters: emitters,
-                        tile_masks: tile_masks,
-                        tiles_x: tiles_x,
-                        hdr_bg: hdr_bg,
-                        refract_refl: refract_refl,
-                        bg_s: bg_s,
-                    ),
-                    indices: batches[bi].trans_indices,
-                    indirect: batches[bi].trans_draw_args,
-                    cull: Cull::Back,
-                    depth: Depth { compare: Compare::Greater, write: true },
-                )
+                if batches[bi].is_skinned {
+                    draw(
+                        rp,
+                        skin_mesh_vs.bind(
+                            verts: batches[bi].verts.items(),
+                            skin: batches[bi].skin_verts.items(),
+                            xforms: batches[bi].xforms.items(),
+                            prev_xforms: batches[bi].prev_xforms.items(),
+                            bones: batches[bi].bones.items(),
+                            prev_bones: batches[bi].prev_bones.items(),
+                            bone_stride: batches[bi].bone_stride,
+                            inst_ids: batches[bi].inst_ids.items(),
+                            is_instanced: is_inst,
+                            v: v,
+                        ),
+                        field_skin_trans_many_fs.bind(
+                            fields: fbuf.items(),
+                            n_fields: N,
+                            v: v,
+                            sv: sv,
+                            rad_grid: rad_grid,
+                            sdf_grid: sdf_grid,
+                            sky: sky,
+                            sky_diff: sky_diff,
+                            sky_spec0: sky_spec0,
+                            sky_spec1: sky_spec1,
+                            sky_spec2: sky_spec2,
+                            sky_s: sky_s,
+                            shadow_map: shadow_map,
+                            cmp: cmp,
+                            rad0: rad0,
+                            rad1: rad1,
+                            rad2: rad2,
+                            rad_s: rad_s,
+                            sdf0: sdf0,
+                            sdf1: sdf1,
+                            sdf_s: sdf_s,
+                            emitters: emitters,
+                            tile_masks: tile_masks,
+                            tiles_x: tiles_x,
+                            hdr_bg: hdr_bg,
+                            refract_refl: refract_refl,
+                            bg_s: bg_s,
+                        ),
+                        indices: batches[bi].trans_indices,
+                        indirect: batches[bi].trans_draw_args,
+                        cull: Cull::Back,
+                        depth: Depth { compare: Compare::Greater, write: true },
+                    )
+                } else {
+                    draw(
+                        rp,
+                        mesh_vs.bind(
+                            verts: batches[bi].verts.items(),
+                            xforms: batches[bi].xforms.items(),
+                            prev_xforms: batches[bi].prev_xforms.items(),
+                            inst_ids: batches[bi].inst_ids.items(),
+                            is_instanced: is_inst,
+                            v: v,
+                        ),
+                        field_trans_many_fs.bind(
+                            fields: fbuf.items(),
+                            n_fields: N,
+                            v: v,
+                            sv: sv,
+                            rad_grid: rad_grid,
+                            sdf_grid: sdf_grid,
+                            sky: sky,
+                            sky_diff: sky_diff,
+                            sky_spec0: sky_spec0,
+                            sky_spec1: sky_spec1,
+                            sky_spec2: sky_spec2,
+                            sky_s: sky_s,
+                            shadow_map: shadow_map,
+                            cmp: cmp,
+                            rad0: rad0,
+                            rad1: rad1,
+                            rad2: rad2,
+                            rad_s: rad_s,
+                            sdf0: sdf0,
+                            sdf1: sdf1,
+                            sdf_s: sdf_s,
+                            emitters: emitters,
+                            tile_masks: tile_masks,
+                            tiles_x: tiles_x,
+                            hdr_bg: hdr_bg,
+                            refract_refl: refract_refl,
+                            bg_s: bg_s,
+                        ),
+                        indices: batches[bi].trans_indices,
+                        indirect: batches[bi].trans_draw_args,
+                        cull: Cull::Back,
+                        depth: Depth { compare: Compare::Greater, write: true },
+                    )
+                }
             }
         }
     }
@@ -2216,16 +2945,51 @@ impl MeshSight {
         let sp: DepthOnlyPass = begin_depth_pass(mut self.shadow_map, clear_depth: 1.0, keep_depth: false)
         for i in 0..nb {
             if self.batches[i].has_opaque {
-                draw(
-                    sp,
-                    shadow_vs.bind(verts: self.batches[i].verts.items(), xforms: self.batches[i].xforms.items(), sv: sv),
-                    shadow_fs,
-                    indices: self.batches[i].indices,
-                    indirect: self.batches[i].draw_args,
-                    cull: Cull::Back,
-                    depth_bias: DepthBias { constant: 2, slope: 1.5, clamp: 0.0 },
-                    depth: Depth { compare: Compare::Less, write: true },
-                )
+                if self.batches[i].is_deformed {
+                    draw(
+                        sp,
+                        shadow_vs.bind(
+                            verts: self.batches[i].deformed_verts.items(),
+                            xforms: self.batches[i].xforms.items(),
+                            sv: sv,
+                        ),
+                        shadow_fs,
+                        indices: self.batches[i].indices,
+                        indirect: self.batches[i].draw_args,
+                        cull: Cull::Back,
+                        depth_bias: DepthBias { constant: 2, slope: 1.5, clamp: 0.0 },
+                        depth: Depth { compare: Compare::Less, write: true },
+                    )
+                } else if self.batches[i].is_skinned {
+                    draw(
+                        sp,
+                        skin_shadow_vs.bind(
+                            verts: self.batches[i].verts.items(),
+                            skin: self.batches[i].skin_verts.items(),
+                            xforms: self.batches[i].xforms.items(),
+                            bones: self.batches[i].bones.items(),
+                            bone_stride: self.batches[i].bone_stride,
+                            sv: sv,
+                        ),
+                        shadow_fs,
+                        indices: self.batches[i].indices,
+                        indirect: self.batches[i].draw_args,
+                        cull: Cull::Back,
+                        depth_bias: DepthBias { constant: 2, slope: 1.5, clamp: 0.0 },
+                        depth: Depth { compare: Compare::Less, write: true },
+                    )
+                } else {
+                    draw(
+                        sp,
+                        shadow_vs.bind(verts: self.batches[i].verts.items(), xforms: self.batches[i].xforms.items(), sv: sv),
+                        shadow_fs,
+                        indices: self.batches[i].indices,
+                        indirect: self.batches[i].draw_args,
+                        cull: Cull::Back,
+                        depth_bias: DepthBias { constant: 2, slope: 1.5, clamp: 0.0 },
+                        depth: Depth { compare: Compare::Less, write: true },
+                    )
+                }
             }
         }
         if self.swarm.count > 0 {
