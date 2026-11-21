@@ -11,7 +11,7 @@
 use matter::substance::Substance
 use std::collections::Vec
 use std::derive::{Box3, value_and_gradient}
-use std::field::{ALL_LIVE, Field, Live}
+use std::field::{ALL_LIVE, Field, Live, Rigid}
 use std::gpu::{
     Append, AppendBuffer, Atomics, DispatchArgs, DrawIndexedArgs, GlobalId, GpuBuffer, GpuSpan,
     One, Slots, append_buffer, buffer, buffer_of, dispatch, label, read, write,
@@ -663,6 +663,7 @@ fn refine_creases<M: Field<Substance>>(
     var qef = qef_empty()
 
     let f = fields[b.w]
+    let live = ab.live
     for e in 0..12 {
         let i0 = e0[e]
         let i1 = e1[e]
@@ -673,7 +674,7 @@ fn refine_creases<M: Field<Substance>>(
             let p1 = corner_uvw(i1)
             let t0 = clamp(v0 / (v0 - v1), 0.0, 1.0)
             var uvw = mix(p0, p1, t0)
-            let (edv, egv) = f.sample(cell_lo + uvw * h)
+            let (edv, egv) = value_and_gradient(|q| f.distance_live(q, live), cell_lo + uvw * h)
             let edir = p1 - p0
             let edot = dot(egv, edir) * h
             if abs(edot) > 1.0e-6 {
@@ -686,7 +687,7 @@ fn refine_creases<M: Field<Substance>>(
     }
 
     let wp = cell_lo + qef.solve(0.002) * h
-    let (dv, gv) = f.sample(wp)
+    let (dv, gv) = value_and_gradient(|q| f.distance_live(q, live), wp)
     let snapped = newton_snap(wp, dv, gv, cell_lo, h)
     push_vertex(f, snapped, gv, qef, bi * VERTS_STRIDE + cell, cap_verts, mut verts, mut cell_verts)
 }
@@ -842,12 +843,47 @@ fn emit_tris(
 }
 
 /// Pass 4: Writes the final `DrawIndexedArgs` for both opaque (`tri_count[0]`) and transmissive
-/// (`tri_count[1]`) index buffers.
+/// (`tri_count[1]`) index buffers with `inst_count` instances, and records `active_count[0]` into
+/// `tri_count[2]` so a single deferred async readback learns `has_opaque`, `has_trans`, and
+/// `est_bricks` without mid-frame flushes.
 @compute(1)
 fn finish_draw(
+    active_count: [u32],
+    cap_indices: u32,
+    cap_trans: u32,
+    inst_count: u32,
+    tri_count: mut Atomics<u32>,
+    args: mut One<DrawIndexedArgs>,
+    trans_args: mut One<DrawIndexedArgs>,
+    id: GlobalId,
+) {
+    let n = min(tri_count.load(i: 0), cap_indices)
+    args.set(id, DrawIndexedArgs {
+        indices: n,
+        instances: if n > 0 { inst_count } else { 0 },
+        first_index: 0,
+        base_vertex: 0,
+        first_instance: 0,
+    })
+    let nt = min(tri_count.load(i: 1), cap_trans)
+    trans_args.set(id, DrawIndexedArgs {
+        indices: nt,
+        instances: if nt > 0 { inst_count } else { 0 },
+        first_index: 0,
+        base_vertex: 0,
+        first_instance: 0,
+    })
+    tri_count.store(i: 2, value: active_count[0])
+}
+
+/// Updates the instance count of a cached rigid-instanced batch's indirect draw args when visible
+/// instance count changes, without re-extracting geometry or stalling on CPU readbacks.
+@compute(1)
+fn set_instances(
     tri_count: [u32],
     cap_indices: u32,
     cap_trans: u32,
+    inst_count: u32,
     args: mut One<DrawIndexedArgs>,
     trans_args: mut One<DrawIndexedArgs>,
     id: GlobalId,
@@ -855,7 +891,7 @@ fn finish_draw(
     let n = min(tri_count[0], cap_indices)
     args.set(id, DrawIndexedArgs {
         indices: n,
-        instances: if n > 0 { 1 } else { 0 },
+        instances: if n > 0 { inst_count } else { 0 },
         first_index: 0,
         base_vertex: 0,
         first_instance: 0,
@@ -863,31 +899,125 @@ fn finish_draw(
     let nt = min(tri_count[1], cap_trans)
     trans_args.set(id, DrawIndexedArgs {
         indices: nt,
-        instances: if nt > 0 { 1 } else { 0 },
+        instances: if nt > 0 { inst_count } else { 0 },
         first_index: 0,
         base_vertex: 0,
         first_instance: 0,
     })
 }
 
-/// GPU-extracted triangle mesh for one field or a batch of fields of the same type.
-pub struct MeshBatch {
+/// Factors `field` into `(rigid_frame, Some(local_shape_key))` when `field` is an outer rigid
+/// warp of a local shape whose channels are constant (`With<S, C>`) or purely local-space,
+/// or `(Rigid::identity(), None)` otherwise.
+fn rigid_key<M: Field<Substance> + StateHash>(field: M) -> (Rigid, Option<u64>) {
+    let rf = field.rigid_frame()
+    if rf.is_rigid() {
+        match field.rigid_shape_hash() {
+            Some(sh) => {
+                if field.has_constant_channels() {
+                    var h = Hasher::new()
+                    sh.state_hash(mut h)
+                    field.channels(vec3(0.0)).state_hash(mut h)
+                    return (rf, Some(h.finish()))
+                }
+                if field.has_local_channels() {
+                    return (rf, Some(sh))
+                }
+            },
+            None => {},
+        }
+    }
+    (Rigid::identity(), None)
+}
+
+/// Shared temporary GPU workspace used during `MeshBatch` extraction (~31 MB total for the
+/// whole engine, regardless of how many batches exist in the scene).
+pub struct ExtractScratch {
     pub active: AppendBuffer<ActiveBrick>,
     pub corners: GpuBuffer<f32>,
     pub cell_verts: GpuBuffer<u32>,
-    pub verts: AppendBuffer<MeshVertex>,
     pub creases: AppendBuffer<u32>,
     pub surf: AppendBuffer<u32>,
-    pub indices: GpuBuffer<u32>,
-    pub trans_indices: GpuBuffer<u32>,
-    pub tri_count: GpuBuffer<u32>,
-    pub draw_args: GpuBuffer<DrawIndexedArgs>,
-    pub trans_draw_args: GpuBuffer<DrawIndexedArgs>,
+    pub grids: GpuBuffer<GridSpec>,
     pub eval_args: GpuBuffer<DispatchArgs>,
     pub vert_args: GpuBuffer<DispatchArgs>,
     pub crease_args: GpuBuffer<DispatchArgs>,
     pub surf_args: GpuBuffer<DispatchArgs>,
     pub quad_args: GpuBuffer<DispatchArgs>,
+    pub max_bricks: u32,
+    pub grids_cap: u32,
+}
+
+/// Allocates one shared `ExtractScratch` sized for up to `max_bricks` active bricks per batch.
+pub fn extract_scratch(max_bricks: u32) -> ExtractScratch {
+    let grids_cap: u32 = 512
+    ExtractScratch {
+        active: append_buffer(max_bricks),
+        corners: buffer(max_bricks * CORNERS_BRICK),
+        cell_verts: buffer(max_bricks * VERTS_STRIDE),
+        creases: append_buffer(CAP_CREASES),
+        surf: append_buffer(CAP_SURF),
+        grids: buffer(grids_cap),
+        eval_args: buffer_of([DispatchArgs { x: 0, y: 1, z: 1 }]),
+        vert_args: buffer_of([DispatchArgs { x: 0, y: 1, z: 1 }]),
+        crease_args: buffer_of([DispatchArgs { x: 0, y: 1, z: 1 }]),
+        surf_args: buffer_of([DispatchArgs { x: 0, y: 1, z: 1 }]),
+        quad_args: buffer_of([DispatchArgs { x: 0, y: 1, z: 1 }]),
+        max_bricks,
+        grids_cap,
+    }
+}
+
+impl ExtractScratch {
+    /// Ensures `self.grids` holds at least `count` entries without reallocating every frame.
+    fn ensure_grids(mut self, count: u32) {
+        if count > self.grids_cap {
+            var cap = max(self.grids_cap, 512)
+            while cap < count {
+                cap *= 2
+            }
+            self.grids = buffer(cap)
+            self.grids_cap = cap
+        }
+    }
+}
+
+/// Rounds `want` up to a power-of-two brick bucket in `[128, max_bricks]` so small objects never
+/// pre-allocate tens of megabytes of unused vertex/index storage.
+fn bucket_bricks(want: u32, max_bricks: u32) -> u32 {
+    if want <= 128 {
+        min(128, max_bricks)
+    } else if want <= 512 {
+        min(512, max_bricks)
+    } else if want <= 1024 {
+        min(1024, max_bricks)
+    } else if want <= 2048 {
+        min(2048, max_bricks)
+    } else if want <= 4096 {
+        min(4096, max_bricks)
+    } else {
+        max_bricks
+    }
+}
+
+/// GPU-extracted triangle mesh for one field or a batch of fields of the same type.
+/// Owns ONLY its output geometry (`verts`, `indices`, `trans_indices`, draw args, instance
+/// `xforms`); temporary extraction buffers live once in `ExtractScratch`.
+pub struct MeshBatch {
+    pub verts: AppendBuffer<MeshVertex>,
+    pub indices: GpuBuffer<u32>,
+    pub trans_indices: GpuBuffer<u32>,
+    pub tri_count: GpuBuffer<u32>,
+    pub draw_args: GpuBuffer<DrawIndexedArgs>,
+    pub trans_draw_args: GpuBuffer<DrawIndexedArgs>,
+    pub xforms: GpuBuffer<Rigid>,
+    xforms_cap: u32,
+    pub inst_count: u32,
+    extracted_xform: Rigid,
+    shape_key: u64,
+    is_rigid_cached: bool,
+    instanced: bool,
+    pub max_bricks: u32,
     pub cap_bricks: u32,
     pub cap_verts: u32,
     pub cap_indices: u32,
@@ -895,77 +1025,108 @@ pub struct MeshBatch {
     pub hash: u64,
     pub cell: f32,
     pub built: bool,
+    pub still_frames: u32,
     pub bound: vec4,
+    pub has_opaque: bool,
     pub has_trans: bool,
-    trans_poll: Option<Pending<u32>>,
+    stats_poll: Option<Pending<u32>>,
+    pub needs_poll: bool,
+    poll_age: u32,
     est_bricks: u32,
     last_total_bricks: u32,
     last_chunk_limit: u32,
-    active_poll: Option<Pending<u32>>,
     /// Per-thing temporal tier assignment for multi-tier `Many` batches (0 = near/60Hz, 1 = far even, 2 = far odd).
     pub tiers: Vec<u32>,
 }
 
-/// Allocates a `MeshBatch` sized for up to `max_bricks` active surface bricks.
+/// Creates a lazy `MeshBatch` (minimal initial buffers; grows cleanly on demand up to `max_bricks`).
 pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
-    // Average surface brick emits ~50 vertices and ~300 indices; give generous headroom.
-    let cap_verts = max_bricks * 80
-    let cap_indices = max_bricks * 480
-    let cap_trans = max_bricks * 240
     MeshBatch {
-        active: append_buffer(max_bricks),
-        corners: buffer(max_bricks * CORNERS_BRICK),
-        cell_verts: buffer(max_bricks * VERTS_STRIDE),
-        verts: append_buffer(cap_verts),
-        creases: append_buffer(CAP_CREASES),
-        surf: append_buffer(CAP_SURF),
-        indices: buffer(cap_indices),
-        trans_indices: buffer(cap_trans),
-        tri_count: buffer_of([0, 0]),
+        verts: append_buffer(1),
+        indices: buffer(6),
+        trans_indices: buffer(6),
+        tri_count: buffer_of([0, 0, 0]),
         draw_args: buffer_of([DrawIndexedArgs { indices: 0, instances: 0, first_index: 0, base_vertex: 0, first_instance: 0 }]),
         trans_draw_args: buffer_of([DrawIndexedArgs { indices: 0, instances: 0, first_index: 0, base_vertex: 0, first_instance: 0 }]),
-        eval_args: buffer_of([DispatchArgs { x: 0, y: 1, z: 1 }]),
-        vert_args: buffer_of([DispatchArgs { x: 0, y: 1, z: 1 }]),
-        crease_args: buffer_of([DispatchArgs { x: 0, y: 1, z: 1 }]),
-        surf_args: buffer_of([DispatchArgs { x: 0, y: 1, z: 1 }]),
-        quad_args: buffer_of([DispatchArgs { x: 0, y: 1, z: 1 }]),
-        cap_bricks: max_bricks,
-        cap_verts,
-        cap_indices,
-        cap_trans,
+        xforms: buffer_of([Rigid::identity()]),
+        xforms_cap: 1,
+        inst_count: 1,
+        extracted_xform: Rigid::identity(),
+        shape_key: 0,
+        is_rigid_cached: false,
+        instanced: false,
+        max_bricks,
+        cap_bricks: 0,
+        cap_verts: 0,
+        cap_indices: 0,
+        cap_trans: 0,
         hash: 0,
         cell: 0.0,
         built: false,
+        still_frames: 0,
         bound: vec4(0.0),
+        has_opaque: true,
         has_trans: true,
-        trans_poll: None,
+        stats_poll: None,
+        needs_poll: false,
+        poll_age: 0,
         est_bricks: 0,
         last_total_bricks: 0,
         last_chunk_limit: 0,
-        active_poll: None,
         tiers: Vec::new(),
     }
 }
 
 impl MeshBatch {
-    /// Non-blocking poll of `active.count()` so animated batches never dispatch empty trailing
-    /// extraction chunks (0 ms stall; expands back to full capacity automatically if saturated).
-    fn poll_active(mut self) {
-        match mut self.active_poll {
+    /// Ensures `self.xforms` holds at least `count` rigid instance transforms.
+    fn ensure_xforms(mut self, count: u32) {
+        if count > self.xforms_cap {
+            var cap = max(self.xforms_cap, 16)
+            while cap < count {
+                cap *= 2
+            }
+            self.xforms = buffer(cap)
+            self.xforms_cap = cap
+        }
+    }
+
+    /// Grows output vertex/index buffers on demand to fit `want_bricks` active bricks.
+    fn ensure_cap(mut self, want_bricks: u32) {
+        let cap = bucket_bricks(want_bricks, self.max_bricks)
+        if cap <= self.cap_bricks {
+            return
+        }
+        let cap_verts = cap * 80
+        let cap_indices = cap * 480
+        let cap_trans = cap * 240
+        self.verts = append_buffer(cap_verts)
+        self.indices = buffer(cap_indices)
+        self.trans_indices = buffer(cap_trans)
+        self.cap_bricks = cap
+        self.cap_verts = cap_verts
+        self.cap_indices = cap_indices
+        self.cap_trans = cap_trans
+    }
+
+    /// Non-blocking check of any pending `(opaque, trans, active_bricks)` stats readback.
+    pub fn finish_poll(mut self) {
+        match mut self.stats_poll {
             Some(p) => match p.poll() {
                 Some(Ok(c)) => {
-                    if c.len() >= 1 {
-                        let got = c[0]
+                    if c.len() >= 3 {
+                        self.has_opaque = c[0] > 0
+                        self.has_trans = c[1] > 0
+                        let got = c[2]
                         if self.last_chunk_limit > 0 && got >= self.last_chunk_limit {
                             self.est_bricks = 0
                         } else {
                             self.est_bricks = max(got + got / 3 + 192, 1)
                         }
                     }
-                    self.active_poll = None
+                    self.stats_poll = None
                 },
                 Some(Err(_)) => {
-                    self.active_poll = None
+                    self.stats_poll = None
                 },
                 None => {},
             },
@@ -973,69 +1134,243 @@ impl MeshBatch {
         }
     }
 
-    /// Non-blocking poll of `tri_count[1]` to know whether this batch has any transmissive
-    /// triangles (0 ms stall; defaults to `true` on frame 0 so refraction never skips a frame).
-    pub fn poll_trans(mut self) -> bool {
-        match mut self.trans_poll {
-            Some(p) => match p.poll() {
-                Some(Ok(c)) => {
-                    self.has_trans = c.len() >= 2 && c[1] > 0
-                    self.trans_poll = None
-                },
-                Some(Err(_)) => {
-                    self.trans_poll = None
-                },
-                None => {},
-            },
-            None => {},
+    /// Schedules one deferred async readback of `tri_count` (called ONCE at frame end, never
+    /// mid-frame inside `run_extract`, so extraction never forces GPU submission flushes).
+    pub fn maybe_queue_poll(mut self) {
+        self.finish_poll()
+        if !self.needs_poll {
+            return
         }
-        self.has_trans
+        match self.stats_poll {
+            None => {
+                self.stats_poll = Some(read(self.tri_count.items()))
+                self.needs_poll = false
+            },
+            Some(_) => {},
+        }
     }
+
     /// Extracts a single field into this batch if its state hash or requested cell size changed.
-    /// Unchanged fields do zero GPU work.
-    pub fn sync_one<M: Field<Substance> + StateHash + GpuData>(mut self, field: M, cell: f32) {
+    /// Rigidly transformed fields (`Translate`/`Rotate`/`Scale` over a local shape) update only
+    /// their 64-byte GPU transform matrix with zero re-extraction.
+    pub fn sync_one<M: Field<Substance> + StateHash + GpuData>(
+        mut self,
+        scratch: mut ExtractScratch,
+        field: M,
+        cell: f32,
+    ) {
         var h = Hasher::new()
         field.state_hash(mut h)
         let key = h.finish()
-        if self.built && self.hash == key && abs(self.cell - cell) <= 0.05 * max(self.cell, 1.0e-4) {
+        let (rf, maybe_sk) = rigid_key(field)
+        let eff_cell = match maybe_sk {
+            Some(_) => cell / max(rf.scale_factor(), 1.0e-4),
+            None => cell,
+        }
+        if self.built && self.hash == key && abs(self.cell - eff_cell) <= 0.05 * max(self.cell, 1.0e-4) {
+            self.still_frames += 1
             return
+        }
+        match maybe_sk {
+            Some(sk) => {
+                if self.built && self.is_rigid_cached && !self.instanced && self.shape_key == sk &&
+                    abs(self.cell - eff_cell) <= 0.15 * max(self.cell, 1.0e-4) {
+                    let delta = rf.delta_from(self.extracted_xform)
+                    write(mut self.xforms, 0, [delta])
+                    let b = field.bound()
+                    self.bound = vec4(b.centre, min(b.radius, 1.0e4))
+                    self.hash = key
+                    self.still_frames = 0
+                    return
+                }
+            },
+            None => {},
         }
         let aabb = tight_aabb(field)
         let g = grid_for(aabb, cell, 0)
         let total_bricks = g.dims.x * g.dims.y * g.dims.z
         let fbuf = buffer_of([field])
-        let gbuf = buffer_of([g])
+        scratch.ensure_grids(1)
+        write(mut scratch.grids, 0, [g])
         let mid = 0.5 * (aabb.lo + aabb.hi)
         self.bound = vec4(mid, length(aabb.hi - mid))
-        self.run_extract(fbuf.items(), gbuf.items(), things: 1, total_bricks: total_bricks)
+        write(mut self.xforms, 0, [Rigid::identity()])
+        self.inst_count = 1
+        self.run_extract(mut scratch, fbuf.items(), things: 1, total_bricks: total_bricks, inst_count: 1)
         self.hash = key
-        self.cell = cell
+        self.cell = eff_cell
         self.built = true
+        self.still_frames = 0
+        self.instanced = false
+        match maybe_sk {
+            Some(sk) => {
+                self.extracted_xform = rf
+                self.shape_key = sk
+                self.is_rigid_cached = true
+            },
+            None => {
+                self.extracted_xform = Rigid::identity()
+                self.shape_key = 0
+                self.is_rigid_cached = false
+            },
+        }
     }
 
     /// Extracts `N` fields of one type into this shared batch (one draw call for all `N` things),
     /// each thing using its own view-adapted cell spacing `cells[i]` (0.0 skips a thing completely).
-    pub fn sync_many<M: Field<Substance> + StateHash + GpuData, const N: u32>(mut self, fields: [M; N], cells: [f32; N]) {
+    /// When all visible items are rigid transforms of the same local shape, extracts ONE template
+    /// mesh once and renders all visible items via GPU instancing with zero per-frame re-extraction.
+    pub fn sync_many<M: Field<Substance> + StateHash + GpuData, const N: u32>(
+        mut self,
+        scratch: mut ExtractScratch,
+        fields: [M; N],
+        cells: [f32; N],
+    ) {
         var h = Hasher::new()
         var first_cell = 0.0
+        var vis_count: u32 = 0
+        var all_same_rigid = true
+        var shared_sk: u64 = 0
+        var best_i: u32 = 0
+        var best_local_cell: f32 = 1.0e20
+        var wlo = vec3(1.0e20)
+        var whi = vec3(-1.0e20)
+
         for i in 0..N {
-            if cells[i] > 0.0 {
+            let c = cells[i]
+            if c > 0.0 {
                 i.state_hash(mut h)
                 fields[i].state_hash(mut h)
                 if first_cell == 0.0 {
-                    first_cell = cells[i]
+                    first_cell = c
                 }
+                let b = fields[i].bound()
+                let r = min(b.radius, 1.0e4)
+                wlo = min(wlo, b.centre - vec3(r))
+                whi = max(whi, b.centre + vec3(r))
+                if all_same_rigid {
+                    let (rf, maybe_sk) = rigid_key(fields[i])
+                    match maybe_sk {
+                        Some(sk) => {
+                            if vis_count == 0 {
+                                shared_sk = sk
+                            } else if sk != shared_sk {
+                                all_same_rigid = false
+                            }
+                            let lc = c / max(rf.scale_factor(), 1.0e-4)
+                            if lc < best_local_cell {
+                                best_local_cell = lc
+                                best_i = i
+                            }
+                        },
+                        None => {
+                            all_same_rigid = false
+                        },
+                    }
+                }
+                vis_count += 1
             }
         }
         let key = h.finish()
-        if self.built && self.hash == key && abs(self.cell - first_cell) <= 0.05 * max(self.cell, 1.0e-4) {
+        let check_cell = if all_same_rigid && vis_count > 0 { best_local_cell } else { first_cell }
+        if self.built && self.hash == key && abs(self.cell - check_cell) <= 0.05 * max(self.cell, 1.0e-4) {
+            self.still_frames += 1
             return
         }
+        if vis_count == 0 {
+            write(mut self.tri_count, 0, [0, 0, 0])
+            scratch.active.clear()
+            dispatch(
+                finish_draw.bind(
+                    active_count: scratch.active.count(),
+                    cap_indices: self.cap_indices,
+                    cap_trans: self.cap_trans,
+                    inst_count: 0,
+                    tri_count: mut self.tri_count,
+                    args: mut self.draw_args,
+                    trans_args: mut self.trans_draw_args,
+                ),
+                over: 1,
+            )
+            self.hash = key
+            self.cell = first_cell
+            self.built = true
+            self.still_frames = 0
+            self.inst_count = 0
+            self.has_opaque = false
+            self.has_trans = false
+            return
+        }
+
+        // Fast path: all visible items share one rigid local shape -> extract 1 template mesh and
+        // GPU-instance all `vis_count` items via `self.xforms` (0 ms extraction on motion!).
+        if all_same_rigid {
+            let mid = 0.5 * (wlo + whi)
+            self.bound = vec4(mid, length(whi - mid))
+            if self.built && self.instanced && self.is_rigid_cached && self.shape_key == shared_sk &&
+                abs(self.cell - best_local_cell) <= 0.15 * max(self.cell, 1.0e-4) {
+                var deltas: Vec<Rigid> = Vec::new()
+                for i in 0..N {
+                    if cells[i] > 0.0 {
+                        deltas.push(fields[i].rigid_frame().delta_from(self.extracted_xform))
+                    }
+                }
+                self.ensure_xforms(vis_count)
+                write(mut self.xforms, 0, deltas)
+                if vis_count != self.inst_count {
+                    label("mesh_extract")
+                    dispatch(
+                        set_instances.bind(
+                            tri_count: self.tri_count.items(),
+                            cap_indices: self.cap_indices,
+                            cap_trans: self.cap_trans,
+                            inst_count: vis_count,
+                            args: mut self.draw_args,
+                            trans_args: mut self.trans_draw_args,
+                        ),
+                        over: 1,
+                    )
+                    self.inst_count = vis_count
+                }
+                self.hash = key
+                self.still_frames = 0
+                return
+            }
+            let template = fields[best_i]
+            let template_rf = template.rigid_frame()
+            let aabb = tight_aabb(template)
+            let g = grid_for(aabb, cells[best_i], 0)
+            let total_bricks = g.dims.x * g.dims.y * g.dims.z
+            let fbuf = buffer_of([template])
+            scratch.ensure_grids(1)
+            write(mut scratch.grids, 0, [g])
+            var deltas: Vec<Rigid> = Vec::new()
+            for i in 0..N {
+                if cells[i] > 0.0 {
+                    deltas.push(fields[i].rigid_frame().delta_from(template_rf))
+                }
+            }
+            self.ensure_xforms(vis_count)
+            write(mut self.xforms, 0, deltas)
+            self.inst_count = vis_count
+            self.run_extract(mut scratch, fbuf.items(), things: 1, total_bricks: total_bricks, inst_count: vis_count)
+            self.extracted_xform = template_rf
+            self.shape_key = shared_sk
+            self.is_rigid_cached = true
+            self.instanced = true
+            self.hash = key
+            self.cell = best_local_cell
+            self.built = true
+            self.still_frames = 0
+            return
+        }
+
+        // General path: heterogeneous or deforming fields packed into one shared world-space mesh.
         var grids: Vec<GridSpec> = Vec::new()
         var kept: Vec<M> = Vec::new()
         var total_bricks: u32 = 0
-        var wlo = vec3(1.0e20)
-        var whi = vec3(-1.0e20)
+        var tlo = vec3(1.0e20)
+        var thi = vec3(-1.0e20)
         for i in 0..N {
             let c = cells[i]
             if c <= 0.0 {
@@ -1052,48 +1387,58 @@ impl MeshBatch {
             total_bricks += g.dims.x * g.dims.y * g.dims.z
             grids.push(g)
             kept.push(fields[i])
-            wlo = min(wlo, aabb.lo)
-            whi = max(whi, aabb.hi)
+            tlo = min(tlo, aabb.lo)
+            thi = max(thi, aabb.hi)
         }
         let count = kept.len()
-        if count == 0 {
-            write(mut self.tri_count, 0, [0, 0])
-            dispatch(
-                finish_draw.bind(
-                    tri_count: self.tri_count.items(),
-                    cap_indices: self.cap_indices,
-                    cap_trans: self.cap_trans,
-                    args: mut self.draw_args,
-                    trans_args: mut self.trans_draw_args,
-                ),
-                over: 1,
-            )
-            self.hash = key
-            self.cell = first_cell
-            self.built = true
-            return
-        }
         let fbuf = buffer_of(kept)
-        let gbuf = buffer_of(grids)
-        let mid = 0.5 * (wlo + whi)
-        self.bound = vec4(mid, length(whi - mid))
-        self.run_extract(fbuf.items(), gbuf.items(), things: count, total_bricks: total_bricks)
+        scratch.ensure_grids(count)
+        write(mut scratch.grids, 0, grids)
+        let mid = 0.5 * (tlo + thi)
+        self.bound = vec4(mid, length(thi - mid))
+        write(mut self.xforms, 0, [Rigid::identity()])
+        self.inst_count = 1
+        self.run_extract(mut scratch, fbuf.items(), things: count, total_bricks: total_bricks, inst_count: 1)
+        self.extracted_xform = Rigid::identity()
+        self.shape_key = 0
+        self.is_rigid_cached = false
+        self.instanced = false
         self.hash = key
         self.cell = first_cell
         self.built = true
+        self.still_frames = 0
     }
 
     fn run_extract<M: Field<Substance>>(
         mut self,
+        scratch: mut ExtractScratch,
         fields: GpuSpan<M>,
-        grids: GpuSpan<GridSpec>,
         things: u32,
         total_bricks: u32,
+        inst_count: u32,
     ) {
         label("mesh_extract")
-        self.active.clear()
+        self.finish_poll()
+        let grew = total_bricks > self.last_total_bricks + self.last_total_bricks / 2 + 256
+        if grew {
+            self.est_bricks = 0
+        }
+        self.last_total_bricks = total_bricks
+
+        // Right-size this batch's output buffers from candidate bricks (or known active estimate).
+        let cap_want = if self.est_bricks > 0 {
+            min(self.est_bricks + 256, min(total_bricks, self.max_bricks))
+        } else {
+            min(total_bricks, self.max_bricks)
+        }
+        self.ensure_cap(cap_want)
+
+        let effective_cap = min(self.cap_bricks, scratch.max_bricks)
+        scratch.active.clear()
         self.verts.clear()
-        write(mut self.tri_count, 0, [0, 0])
+        write(mut self.tri_count, 0, [0, 0, 0])
+
+        let grids = scratch.grids.items()
 
         // Pass 0: Interval-cull bricks in bounded chunks.
         var first: u32 = 0
@@ -1106,7 +1451,7 @@ impl MeshBatch {
                     things: things,
                     first_brick: first,
                     total_bricks: total_bricks,
-                    active: mut self.active,
+                    active: mut scratch.active,
                 ),
                 over: n,
             )
@@ -1114,13 +1459,8 @@ impl MeshBatch {
         }
 
         // Passes 1–3: Extract in bounded chunks of `CHUNK_BRICKS` active bricks, using our
-        // non-blocking `active_poll` estimate to skip trailing empty chunks on animated objects.
-        self.poll_active()
-        if total_bricks > self.last_total_bricks + self.last_total_bricks / 2 + 256 {
-            self.est_bricks = 0
-        }
-        self.last_total_bricks = total_bricks
-        let hard_cap = min(self.cap_bricks, total_bricks)
+        // deferred `est_bricks` estimate to skip trailing empty chunks on animated objects.
+        let hard_cap = min(effective_cap, total_bricks)
         let max_chunks_bricks = if self.est_bricks > 0 {
             min(hard_cap, ((self.est_bricks + CHUNK_BRICKS - 1) / CHUNK_BRICKS) * CHUNK_BRICKS)
         } else {
@@ -1129,15 +1469,15 @@ impl MeshBatch {
         self.last_chunk_limit = max_chunks_bricks
         var chunk_start: u32 = 0
         while chunk_start < max_chunks_bricks {
-            let chunk_n = min(self.cap_bricks - chunk_start, CHUNK_BRICKS)
+            let chunk_n = min(effective_cap - chunk_start, CHUNK_BRICKS)
             dispatch(
                 prep_chunk.bind(
-                    active_count: self.active.count(),
-                    cap_bricks: self.cap_bricks,
+                    active_count: scratch.active.count(),
+                    cap_bricks: effective_cap,
                     chunk_start: chunk_start,
-                    eval_args: mut self.eval_args,
-                    vert_args: mut self.vert_args,
-                    quad_args: mut self.quad_args,
+                    eval_args: mut scratch.eval_args,
+                    vert_args: mut scratch.vert_args,
+                    quad_args: mut scratch.quad_args,
                 ),
                 over: 1,
             )
@@ -1145,34 +1485,34 @@ impl MeshBatch {
                 eval_corners.bind(
                     fields: fields,
                     grids: grids,
-                    active: self.active.items(),
-                    active_count: self.active.count(),
-                    cap_bricks: self.cap_bricks,
+                    active: scratch.active.items(),
+                    active_count: scratch.active.count(),
+                    cap_bricks: effective_cap,
                     chunk_start: chunk_start,
-                    corners: self.corners.span_mut(start: chunk_start * CORNERS_BRICK, count: chunk_n * CORNERS_BRICK),
+                    corners: scratch.corners.span_mut(start: chunk_start * CORNERS_BRICK, count: chunk_n * CORNERS_BRICK),
                 ),
-                groups: self.eval_args.at(0),
+                groups: scratch.eval_args.at(0),
                 most: chunk_n * 8,
             )
-            self.creases.clear()
-            self.surf.clear()
+            scratch.creases.clear()
+            scratch.surf.clear()
             dispatch(
                 classify_cells.bind(
-                    active_count: self.active.count(),
-                    cap_bricks: self.cap_bricks,
+                    active_count: scratch.active.count(),
+                    cap_bricks: effective_cap,
                     chunk_start: chunk_start,
-                    corners: self.corners.items(),
-                    cell_verts: self.cell_verts.span_mut(start: chunk_start * VERTS_STRIDE, count: chunk_n * VERTS_STRIDE),
-                    surf: mut self.surf,
+                    corners: scratch.corners.items(),
+                    cell_verts: scratch.cell_verts.span_mut(start: chunk_start * VERTS_STRIDE, count: chunk_n * VERTS_STRIDE),
+                    surf: mut scratch.surf,
                 ),
-                groups: self.vert_args.at(0),
+                groups: scratch.vert_args.at(0),
                 most: chunk_n * 6,
             )
             dispatch(
                 prep_list.bind(
-                    count: self.surf.count(),
+                    count: scratch.surf.count(),
                     cap: CAP_SURF,
-                    args: mut self.surf_args,
+                    args: mut scratch.surf_args,
                 ),
                 over: 1,
             )
@@ -1180,23 +1520,23 @@ impl MeshBatch {
                 solve_verts.bind(
                     fields: fields,
                     grids: grids,
-                    active: self.active.items(),
-                    corners: self.corners.items(),
-                    surf: self.surf.items(),
-                    surf_count: self.surf.count(),
+                    active: scratch.active.items(),
+                    corners: scratch.corners.items(),
+                    surf: scratch.surf.items(),
+                    surf_count: scratch.surf.count(),
                     cap_verts: self.cap_verts,
-                    cell_verts: mut self.cell_verts,
+                    cell_verts: mut scratch.cell_verts,
                     verts: mut self.verts,
-                    creases: mut self.creases,
+                    creases: mut scratch.creases,
                 ),
-                groups: self.surf_args.at(0),
+                groups: scratch.surf_args.at(0),
                 most: CAP_SURF / 64,
             )
             dispatch(
                 prep_list.bind(
-                    count: self.creases.count(),
+                    count: scratch.creases.count(),
                     cap: CAP_CREASES,
-                    args: mut self.crease_args,
+                    args: mut scratch.crease_args,
                 ),
                 over: 1,
             )
@@ -1204,32 +1544,32 @@ impl MeshBatch {
                 refine_creases.bind(
                     fields: fields,
                     grids: grids,
-                    active: self.active.items(),
-                    corners: self.corners.items(),
-                    creases: self.creases.items(),
-                    crease_count: self.creases.count(),
+                    active: scratch.active.items(),
+                    corners: scratch.corners.items(),
+                    creases: scratch.creases.items(),
+                    crease_count: scratch.creases.count(),
                     cap_verts: self.cap_verts,
-                    cell_verts: mut self.cell_verts,
+                    cell_verts: mut scratch.cell_verts,
                     verts: mut self.verts,
                 ),
-                groups: self.crease_args.at(0),
+                groups: scratch.crease_args.at(0),
                 most: CAP_CREASES / 64,
             )
             dispatch(
                 emit_tris.bind(
-                    active_count: self.active.count(),
-                    cap_bricks: self.cap_bricks,
+                    active_count: scratch.active.count(),
+                    cap_bricks: effective_cap,
                     cap_indices: self.cap_indices,
                     cap_trans: self.cap_trans,
                     chunk_start: chunk_start,
-                    corners: self.corners.items(),
-                    cell_verts: self.cell_verts.items(),
+                    corners: scratch.corners.items(),
+                    cell_verts: scratch.cell_verts.items(),
                     verts: self.verts.items(),
                     tri_count: mut self.tri_count,
                     indices: mut self.indices,
                     trans_indices: mut self.trans_indices,
                 ),
-                groups: self.quad_args.at(0),
+                groups: scratch.quad_args.at(0),
                 most: chunk_n * 4,
             )
             chunk_start += chunk_n
@@ -1237,26 +1577,23 @@ impl MeshBatch {
 
         dispatch(
             finish_draw.bind(
-                tri_count: self.tri_count.items(),
+                active_count: scratch.active.count(),
                 cap_indices: self.cap_indices,
                 cap_trans: self.cap_trans,
+                inst_count: inst_count,
+                tri_count: mut self.tri_count,
                 args: mut self.draw_args,
                 trans_args: mut self.trans_draw_args,
             ),
             over: 1,
         )
-        let _ = self.poll_trans()
-        match self.trans_poll {
-            None => {
-                self.trans_poll = Some(read(self.tri_count.items()))
-            },
-            Some(_) => {},
-        }
-        match self.active_poll {
-            None => {
-                self.active_poll = Some(read(self.active.count()))
-            },
-            Some(_) => {},
+        // Poll stats on initial extract, when candidate bricks jumped, or every 32 animated frames
+        // (queued at frame end, never here, so mid-frame extraction never flushes the GPU).
+        if !self.built || grew || self.est_bricks == 0 || self.poll_age >= 32 {
+            self.needs_poll = true
+            self.poll_age = 0
+        } else {
+            self.poll_age += 1
         }
     }
 }

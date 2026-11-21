@@ -4,18 +4,14 @@
 // volume + dynamic local emitters, casts real shadows into the unified sun shadow maps, and
 // rasterises 3D shaded impostors directly into the unified 4× MSAA HDR + G-buffer eye pass.
 
-use matter::sky::Sky
 use matter::substance::Substance
 use matter::swarm::Swarm
-use mesh::light::{
-    Emitter, RadGrid, ShadowView, clip_of, deposit, encode_mat_unorm, eval_emitters_fast,
-    sun_vis_point,
-}
+use mesh::light::{RadGrid, ShadowView, clip_of, deposit, encode_mat_signed}
 use picture::eye::View
 use std::field::{Field, hash_u32}
 use std::gpu::{
-    Atomics, ClipPosition, ComparisonSampler, DepthTexture, GlobalId, GpuBuffer, GpuSpan,
-    InstanceIndex, Slots, Targets3, VertexIndex, buffer, discard, dispatch, label,
+    Atomics, ClipPosition, GlobalId, GpuBuffer, GpuSpan, InstanceIndex, Slots, Targets3,
+    VertexIndex, buffer, discard, dispatch, label,
 }
 
 /// Maximum number of simulated grains in one `SwarmSim` (65,536 grains × 48 B = 3.1 MB per buffer).
@@ -268,20 +264,13 @@ pub fn swarm_vs<Sw: Swarm>(
     }
 }
 
-/// Physically shaded 3D sphere/shard impostor fragment shader writing into the unified 4× MSAA
-/// direct HDR + `Rgba8` G-buffer pass (`mesh_eye`).
+/// Lean 3D sphere/shard impostor G-buffer fragment shader writing premultiplied `(normal, cov)`,
+/// `(albedo, roughness)`, and `(emits, mat_code)` into the unified 4× MSAA eye pass (`mesh_eye`).
+/// Zero shadow or emitter math here: all direct lighting runs once per pixel in `deferred_direct_fs`.
 @fragment
-@budget(work: 12000)
-pub fn swarm_fs<S: Sky>(
+pub fn swarm_fs(
     vary: SwarmVary,
     v: View,
-    sv_far: ShadowView,
-    rad_grid: RadGrid,
-    sky: S,
-    sm_far: DepthTexture,
-    cmp: ComparisonSampler,
-    emitters: [Emitter],
-    emitter_count: [u32],
 ) -> Targets3<vec4, vec4, vec4> {
     let r2 = dot(vary.uv, vary.uv)
     if r2 > 1.0 {
@@ -289,9 +278,6 @@ pub fn swarm_fs<S: Sky>(
     }
     let nz = sqrt(max(1.0 - r2, 0.0))
     let n = normalize(v.right * vary.uv.x + v.up * vary.uv.y - v.forward * nz)
-    let to_eye = v.at - vary.wp
-    let dist = length(to_eye)
-    let ray_back = if dist > 1.0e-6 { to_eye / dist } else { -v.forward }
     let sub = Substance {
         albedo: clamp(vary.albedo, vec3(0.0), vec3(1.0)),
         roughness: clamp(vary.pbr.x, 0.02, 1.0),
@@ -306,16 +292,10 @@ pub fn swarm_fs<S: Sky>(
         pad1: 0.0,
         pad2: 0.0,
     }
-    let sun = sky.sun()
-    let ndl = max(dot(n, sun.way), 0.0)
-    let vis = if ndl > 0.0 { sun_vis_point(sm_far, cmp, sv_far, vary.wp) } else { 0.0 }
-    let direct_sun = sub.shade_direct(n, sun.way, ray_back, sun.light * vis)
-    let local_light = eval_emitters_fast(sub, vary.wp, n, ray_back, rad_grid, emitters, emitter_count)
-    let direct = sub.emits + direct_sun + local_light
     Targets3 {
-        first: vec4(direct, min(dist, 65000.0)),
-        second: vec4(n * 0.5 + vec3(0.5), clamp(sub.roughness, 0.02, 1.0)),
-        third: vec4(sub.albedo, encode_mat_unorm(sub)),
+        first: vec4(n * 0.5 + vec3(0.5), 1.0),
+        second: vec4(sub.albedo, sub.roughness),
+        third: vec4(sub.emits, encode_mat_signed(sub)),
     }
 }
 

@@ -14,8 +14,8 @@ use engine::matter::height::{Height, HeightSample}
 use sea::swells
 use kit::substances::pbr::{basalt, dielectric, emissive, glass, metal, sand, stone}
 use std::cmp::Eq
-use std::field::{Bound, Field, Surface, hash_u32}
-use std::hash::StateHash
+use std::field::{Bound, Field, Rotate, RoundCone, Scale, Surface, Translate, Union, With, hash_u32, round_cone}
+use std::hash::{StateHash, state_hash}
 
 /// Smooth minimum helper for organic flame/crystal joins.
 fn smin(a: f32, b: f32, k: f32) -> f32 {
@@ -398,17 +398,12 @@ impl Field<Substance> for ParryArc {
     }
 }
 
-/// Rival caster's cold sapphire-cyan arcane focus orb conjuring the incoming glass shard barrage.
-pub struct RivalOrb: Copy + GpuData + Eq + StateHash {
-    pub time: f32,
-    pub pad0: f32,
-    pub pad1: f32,
-    pub pad2: f32,
-}
+/// Rival caster's cold sapphire-cyan arcane focus orb conjuring the incoming glass shard barrage:
+/// local sphere + swirling veins composed via rigid `.scale().rotate().translate()`, so the engine
+/// extracts its mesh ONCE and updates only a 64-byte transform matrix per frame (0.00 ms extract).
+pub struct RivalOrbShape: Copy + GpuData + Eq + StateHash {}
 
-pub fn rival_orb(time: f32) -> RivalOrb {
-    RivalOrb { time, pad0: 0.0, pad1: 0.0, pad2: 0.0 }
-}
+pub type RivalOrb = Translate<Rotate<Scale<RivalOrbShape>>>
 
 /// Where the rival's orb hangs at rest, and where it bobs to `time` s in.
 const ORB_AT = vec3(3.15, 1.48, 0.08)
@@ -417,57 +412,71 @@ fn orb_centre(time: f32) -> vec3 {
     vec3(ORB_AT.x, ORB_AT.y + 0.06 * sin(time * 4.0), ORB_AT.z)
 }
 
-impl Surface for RivalOrb {
+pub fn rival_orb(time: f32) -> RivalOrb {
+    let pulse = 1.0 + 0.125 * sin(time * 7.5)
+    let spin = Quat::axis_angle(vec3(0.0, 1.0, 0.0), -time * 1.6667)
+    RivalOrbShape {}.scale(pulse).rotate(spin).translate(orb_centre(time))
+}
+
+impl Surface for RivalOrbShape {
     fn distance(self, p: vec3) -> f32 {
-        let c = orb_centre(self.time)
-        let r = 0.20 + 0.025 * sin(self.time * 7.5)
-        length(p - c) - r
+        length(p) - 0.20
     }
 
     fn bound(self) -> Bound {
-        Bound { centre: ORB_AT, radius: 0.38, slope: 0.5 }
+        Bound { centre: vec3(0.0), radius: 0.22, slope: 1.0 }
     }
 
     fn lipschitz(self, _near: f32) -> f32 {
         1.0
     }
+
+    fn rigid_shape_hash(self) -> Option<u64> {
+        Some(state_hash(self))
+    }
 }
 
-impl Field<Substance> for RivalOrb {
+impl Field<Substance> for RivalOrbShape {
     fn channels(self, p: vec3) -> Substance {
-        let d = p - orb_centre(self.time)
         // Swirling veins of brighter energy over a deep sapphire body: saturated blue, not white.
-        let swirl = 0.5 + 0.5 * sin(d.y * 26.0 + atan2(d.z, d.x) * 3.0 + self.time * 5.0)
+        let swirl = 0.5 + 0.5 * sin(p.y * 26.0 + atan2(p.z, p.x) * 3.0)
         let vein = swirl * swirl * swirl
         let deep = vec3(0.22, 0.85, 6.2)
         let bright = vec3(0.9, 3.4, 12.5)
         emissive(vec3(0.16, 0.36, 1.0), mix(deep, bright, vec3(vein)), roughness: 0.10)
     }
+
+    fn has_local_channels(self) -> bool {
+        true
+    }
 }
 
 // =================================================================================================
-// 5. Incoming Refractive Glass Shard Barrage (`[GlassShard; 14]`, extracted via `many` in < 0.2 ms)
+// 5. Incoming Refractive Glass Shard Barrage (`[GlassShard; 14]`, 1 template mesh GPU-instanced)
 // =================================================================================================
 
-/// One razor-sharp faceted refractive glass spear hurtling toward the golden parry arc.
-pub struct GlassShard: Copy + GpuData + Eq + StateHash {
-    pub centre: vec3,
-    pub dir: vec3,
-    pub len: f32,
-    pub thick: f32,
-    pub pad0: f32,
-    pub pad1: f32,
+/// One razor-sharp refractive glass spear built from pure `std::field` combinators and rigid warps,
+/// so `many` extracts ONE template shard once and renders all 14 via GPU instancing (0.00 ms/frame).
+pub type GlassShard = Translate<Rotate<Scale<With<Union<RoundCone, RoundCone>, Substance>>>>
+
+/// Builds a rotation quaternion aligning local `+Z` to unit vector `dir`.
+fn orient_z(dir: vec3) -> Quat {
+    let f = normalize(dir)
+    let up = if abs(f.y) < 0.95 { vec3(0.0, 1.0, 0.0) } else { vec3(1.0, 0.0, 0.0) }
+    let r = normalize(cross(up, f))
+    let u = cross(f, r)
+    Quat::from_mat3(mat3(r, u, f))
+}
+
+fn shard_template() -> With<Union<RoundCone, RoundCone>, Substance> {
+    let front = round_cone(vec3(0.0, 0.0, -0.04), vec3(0.0, 0.0, 0.62), r_top: 0.15, r_bottom: 0.020)
+    let back = round_cone(vec3(0.0, 0.0, -0.48), vec3(0.0, 0.0, -0.04), r_top: 0.028, r_bottom: 0.15)
+    front.union(back).with(glass(vec3(0.46, 0.84, 1.0), roughness: 0.028, ior: 1.56))
 }
 
 pub fn glass_barrage(time: f32) -> [GlassShard; 14] {
-    var out = [GlassShard {
-        centre: vec3(1.5, 1.5, 0.0),
-        dir: vec3(-1.0, 0.0, 0.0),
-        len: 0.6,
-        thick: 0.1,
-        pad0: 0.0,
-        pad1: 0.0,
-    }; 14]
+    let base = shard_template()
+    var out = [base.scale(0.6).rotate(Quat::identity()).translate(vec3(1.5, 1.5, 0.0)); 14]
     for i in 0..14 {
         let f = f32(i)
         let h0 = rand01(i * 97 + 13)
@@ -480,50 +489,11 @@ pub fn glass_barrage(time: f32) -> [GlassShard; 14] {
         let y = 1.45 + (h1 - 0.45) * 1.85 * spread + 0.10 * sin(time * 2.5 + f)
         let z = (h2 - 0.5) * 2.15 * spread
         let len = 0.52 + 0.30 * rand01(i * 431 + 7)
-        let thick = 0.085 + 0.042 * rand01(i * 557 + 11)
         let target = vec3(-0.35, 1.38 + (h1 - 0.5) * 1.1, 0.20 + (h2 - 0.5) * 1.2)
         let dir = normalize(target - vec3(x, y, z))
-        out[i] = GlassShard {
-            centre: vec3(x, y, z),
-            dir,
-            len,
-            thick,
-            pad0: 0.0,
-            pad1: 0.0,
-        }
+        out[i] = base.scale(len).rotate(orient_z(dir)).translate(vec3(x, y, z))
     }
     out
-}
-
-impl Surface for GlassShard {
-    fn distance(self, p: vec3) -> f32 {
-        let tip = self.centre + self.dir * (self.len * 0.62)
-        let tail = self.centre - self.dir * (self.len * 0.48)
-        let mid = self.centre - self.dir * (self.len * 0.04)
-        let front = sd_spear(p, mid, tip, ra: self.thick, rb: 0.014)
-        let back = sd_spear(p, tail, mid, ra: 0.020, rb: self.thick)
-        min(front, back)
-    }
-
-    fn bound(self) -> Bound {
-        Bound { centre: self.centre, radius: self.len * 0.68 + self.thick + 0.06, slope: 0.5 }
-    }
-
-    fn lipschitz(self, _near: f32) -> f32 {
-        1.0
-    }
-}
-
-impl Field<Substance> for GlassShard {
-    fn channels(self, p: vec3) -> Substance {
-        // Deep sapphire-cyan crystal glass catching golden heat sparks right where tips meet the ward.
-        let impact = smoothstep(0.28, -0.18, p.x)
-        let base = glass(vec3(0.46, 0.84, 1.0), roughness: 0.028, ior: 1.56)
-        Substance {
-            emits: vec3(9.5, 5.4, 1.4) * (impact * impact),
-            ..base
-        }
-    }
 }
 
 // =================================================================================================
@@ -654,6 +624,10 @@ pub fn arena_sea(time: f32) -> ArenaSea {
 }
 
 impl Height for ArenaSea {
+    fn has_opaque(self) -> bool {
+        false
+    }
+
     fn height_at(self, xz: vec2) -> HeightSample {
         let a = vec4(0.34, 0.28, 1.25, 0.14)
         let b = vec4(0.21, 0.48, 0.95, 0.09)

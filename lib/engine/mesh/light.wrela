@@ -11,13 +11,14 @@
 
 use matter::sky::{Sky, seen}
 use matter::substance::{ONE_OVER_PI, Substance}
-use mesh::extract::{MeshVertex, prep_list}
+use mesh::extract::MeshVertex
 use picture::eye::View
 use picture::screen::luma
+use std::field::Rigid
 use std::gpu::{
     Address, Append, AppendBuffer, Atomics, ClipPosition, ComparisonSampler, DepthTexture,
-    DispatchArgs, Filter, GlobalId, GpuBuffer, GpuSpan, Rgba16Float, Sampler, Slots, Texels,
-    Texels3d, Texture, Texture3d, append_buffer, buffer, buffer_of, dispatch, label, sampler,
+    DispatchArgs, Filter, GlobalId, GpuBuffer, GpuSpan, One, Rgba16Float, Sampler, Slots, Texels,
+    Texels3d, Texture, Texture3d, append_buffer, buffer, buffer_of, copy, dispatch, label, sampler,
     texture3d, writable_texture,
 }
 use std::math::{PI, TAU}
@@ -44,12 +45,16 @@ pub const FOUR_PI: f32 = 12.5663706
 /// Reversed-Z near plane (m): `clip_z = NEAR`, `clip_w = z`, so `ndc_z = NEAR / z` in `(0, 1]`.
 pub const NEAR: f32 = 0.005
 
-/// Auto-extracted dynamic local emitters (`8×4×8 = 256` coarse spatial bins -> up to 16 active lights).
+/// Auto-extracted dynamic local emitters (`8×4×8 = 256` coarse spatial bins -> up to 32 active lights).
 const EMIT_CELLS: u32 = 256
 const EMIT_STRIDE: u32 = 8
-pub const MAX_EMITTERS: u32 = 16
+pub const MAX_EMITTERS: u32 = 32
 const EMIT_THRESH: f32 = 8.0
 const EMIT_SCALE: f32 = 16.0
+const MAX_ACTIVE_BINS: u32 = 64
+
+/// Screen-space emitter culling tile size in pixels (`16×16`).
+pub const TILE_SIZE: u32 = 16
 
 /// One auto-extracted dynamic local light harvested from emissive meshlets.
 pub struct Emitter: Copy + GpuData {
@@ -105,19 +110,40 @@ pub fn hg_phase(cos_t: f32, g: f32) -> f32 {
     (1.0 - g2) / (FOUR_PI * denom * sqrt(denom))
 }
 
-/// Encodes `(metallic, ior, coat)` into `[0, 1]` for the 8-bit `Rgba8` G-buffer (`0.5` = matte):
-///   `~0.5`   -> pure matte `lambert` (`abs(code) < 0.015`)
-///   `< 0.48` -> metallic conductor (`metallic = -code`)
-///   `> 0.52` -> dielectric (`ior = 1.5`, uncoated `0.03`, coated `coat >= 0.05`)
-pub fn encode_mat_unorm(sub: Substance) -> f32 {
+/// Encodes `(metallic, ior, coat)` as a linear signed float for the premultiplied `Rgba16Float`
+/// G-buffer so 4× MSAA resolve stays uncorrupted by empty sky samples (`0.0`):
+///   `0.0`      -> pure matte `lambert` (`abs(code) < 0.01`)
+///   `< -0.01`  -> metallic conductor (`metallic = -code`)
+///   `> 0.01`   -> dielectric (`ior = 1.5`, uncoated `0.02`, coated `0.02 + coat`)
+pub fn encode_mat_signed(sub: Substance) -> f32 {
     if sub.metallic > 0.02 {
-        return clamp(0.5 - 0.5 * clamp(sub.metallic, 0.04, 1.0), 0.0, 0.48)
+        return -clamp(sub.metallic, 0.02, 1.0)
     }
     if sub.spec_weight() <= 1.0e-5 && sub.coat <= 1.0e-5 {
-        return 0.5
+        return 0.0
     }
-    let c = if sub.coat > 0.04 { clamp(sub.coat, 0.05, 1.0) } else { 0.03 }
-    clamp(0.5 + 0.5 * c, 0.515, 1.0)
+    0.02 + clamp(sub.coat, 0.0, 1.0)
+}
+
+/// Reconstructs a `Substance` from un-premultiplied G-buffer channels `(albedo, roughness, emits, mat)`.
+pub fn decode_substance(albedo: vec3, roughness: f32, emits: vec3, mat: f32) -> Substance {
+    let metallic = if mat < -0.01 { clamp(-mat, 0.0, 1.0) } else { 0.0 }
+    let ior = if abs(mat) >= 0.01 { 1.5 } else { 1.0 }
+    let coat = if mat > 0.03 { clamp(mat - 0.02, 0.0, 1.0) } else { 0.0 }
+    Substance {
+        albedo: clamp(albedo, vec3(0.0), vec3(1.0)),
+        roughness: clamp(roughness, 0.02, 1.0),
+        emits: max(emits, vec3(0.0)),
+        metallic,
+        ior,
+        transmission: 0.0,
+        subsurface: 0.0,
+        coat,
+        micro: 0.0,
+        pad0: 0.0,
+        pad1: 0.0,
+        pad2: 0.0,
+    }
 }
 
 /// Integrates the open sky's cosine-weighted irradiance for every octahedral direction into a
@@ -128,7 +154,7 @@ pub fn skylit<S: Sky>(sky: S, out: mut Texels<Rgba16Float>, id: GlobalId) {
     if id.x >= TABLE || id.y >= TABLE {
         return
     }
-    let n = unocta((vec2(f32(id.x), f32(id.y)) + vec2(0.5)) / f32(TABLE) * 2.0 - vec2(1.0))
+    let n = unocta(vec2(f32(id.x), f32(id.y)) / f32(TABLE - 1) * 2.0 - vec2(1.0))
     let (u, v) = basis(n)
     var sum = vec3(0.0)
     for i in 0..(GATHER * GATHER) {
@@ -159,7 +185,7 @@ pub fn sky_spec<S: Sky>(sky: S, side: u32, roughness: f32, out: mut Texels<Rgba1
     if id.x >= side || id.y >= side {
         return
     }
-    let n = unocta((vec2(f32(id.x), f32(id.y)) + vec2(0.5)) / f32(side) * 2.0 - vec2(1.0))
+    let n = unocta(vec2(f32(id.x), f32(id.y)) / f32(side - 1) * 2.0 - vec2(1.0))
     if roughness <= 0.06 {
         // Mirror level: direct sky evaluation (excluding raw sun disc so direct sun specular isn't
         // double-counted, while keeping atmospheric Mie corona and horizon glow razor sharp).
@@ -673,6 +699,8 @@ fn rad_inject<S: Sky>(
     verts: [MeshVertex],
     vert_count: [u32],
     cap_verts: u32,
+    xforms: [Rigid],
+    inst_count: u32,
     grid: RadGrid,
     sv: ShadowView,
     sky: S,
@@ -686,19 +714,25 @@ fn rad_inject<S: Sky>(
     emit_accum: mut Atomics<u32>,
     id: GlobalId,
 ) {
-    let vi = id.x
     let n = min(vert_count[0], cap_verts)
-    if vi >= n {
+    let half_n = (n + 1) / 2
+    if half_n == 0 || inst_count == 0 {
         return
     }
+    let inst = id.x / half_n
+    let vi = (id.x - inst * half_n) * 2
+    if inst >= inst_count || vi >= n {
+        return
+    }
+    let xf = xforms[inst]
     let vert = verts[vi]
-    let wp = vert.pos.xyz
+    let wp = xf.apply_point(vert.pos.xyz)
     let uvw = (wp - grid.origin) * grid.inv_span
     if uvw.x < 0.0 || uvw.x >= 1.0 || uvw.y < 0.0 || uvw.y >= 1.0 || uvw.z < 0.0 || uvw.z >= 1.0 {
         return
     }
 
-    let nrm = vert.normal.xyz
+    let nrm = xf.apply_normal(vert.normal.xyz)
     let nl2 = dot(nrm, nrm)
     let normal = if nl2 > 1.0e-12 { nrm * (1.0 / sqrt(nl2)) } else { vec3(0.0, 1.0, 0.0) }
     let sun = sky.sun()
@@ -721,30 +755,53 @@ fn rad_inject<S: Sky>(
     deposit(uvw, outgoing, emits, emit_peak, EMIT_THRESH, mut accum, mut emit_accum)
 }
 
-/// Compacts and spatially merges occupied coarse emissive bins (`8×4×8 = 256`) into at most
+/// Parallel filter over the `8×4×8 = 256` coarse emitter bins: appends only non-empty bins so
+/// `emit_compact` merges only occupied bins instead of scanning all 256 on one thread.
+@compute(64)
+fn emit_collect(
+    emit_accum: [u32],
+    active_bins: mut Append<u32>,
+    id: GlobalId,
+) {
+    if id.x >= EMIT_CELLS {
+        return
+    }
+    if emit_accum[id.x * EMIT_STRIDE + 6] > 0 {
+        let _ = active_bins.push(id.x)
+    }
+}
+
+/// Compacts and spatially merges occupied coarse emissive bins (`active_bins`) into at most
 /// `MAX_EMITTERS` deduplicated dynamic lights so lights straddling a grid boundary stay ONE
 /// energy-conserving emitter with zero boundary popping.
 @compute(1)
-@budget(work: 32000)
+@budget(work: 64000)
 fn emit_compact(
     emit_accum: [u32],
+    active_bins: [u32],
+    active_count: [u32],
     grid: RadGrid,
     out: mut Append<Emitter>,
     id: GlobalId,
 ) {
     let _ = id
+    let n_bins = min(active_count[0], MAX_ACTIVE_BINS)
+    if n_bins == 0 {
+        return
+    }
     let span = 1.0 / max(grid.inv_span, 1.0e-6)
     let base_r = clamp(grid.voxel * 0.75, 0.24, 0.42)
     let merge_d = max(grid.voxel * 4.5, 1.45)
     let merge_r2 = merge_d * merge_d
 
-    var pos_acc = [vec3(0.0); 16]
-    var emit_acc = [vec3(0.0); 16]
-    var w_acc = [0.0; 16]
-    var n_cells = [0.0; 16]
+    var pos_acc = [vec3(0.0); 32]
+    var emit_acc = [vec3(0.0); 32]
+    var w_acc = [0.0; 32]
+    var n_cells = [0.0; 32]
     var count: u32 = 0
 
-    for cell in 0..EMIT_CELLS {
+    for bi in 0..n_bins {
+        let cell = active_bins[bi]
         let base = cell * EMIT_STRIDE
         let cnt = emit_accum[base + 6]
         if cnt == 0 {
@@ -891,10 +948,84 @@ fn emitter_vis(
     clamp(1.0 - occ * fade, 0.12, 1.0)
 }
 
-/// Evaluates all auto-extracted dynamic local emitters at surface point `(wp, n)` for view `v_dir`.
-/// Costs zero loop iterations when no bright emissive matter exists in the scene.
-@budget(work: 16000)
-pub fn eval_emitters(
+/// Prepares indirect dispatch args for a 64-wide stride-2 instanced pass (`rad_inject`).
+@compute(1)
+fn prep_rad_list(count: [u32], cap: u32, inst_count: u32, args: mut One<DispatchArgs>, id: GlobalId) {
+    let n = ((min(count[0], cap) + 1) / 2) * inst_count
+    args.set(id, DispatchArgs { x: (n + 63) / 64, y: 1, z: 1 })
+}
+
+/// Conservative 16×16 screen-tile emitter culling: tests each active emitter's physical influence
+/// sphere (`peak_flux / (d² + r²) >= 0.035`) against the tile's camera-space frustum ray cone,
+/// writing one `u32` bitmask per tile (up to `MAX_EMITTERS = 32`). Shared by both opaque
+/// `deferred_direct_fs` and transmissive `mesh_trans_fs`.
+@compute(64)
+@budget(work: 12000)
+fn cull_tile_emitters(
+    v: View,
+    grid: RadGrid,
+    emitters: [Emitter],
+    emitter_count: [u32],
+    tiles_x: u32,
+    tiles_y: u32,
+    masks: mut Slots<u32>,
+    id: GlobalId,
+) {
+    let total = tiles_x * tiles_y
+    if id.x >= total {
+        return
+    }
+    if grid.enabled == 0 {
+        masks[id] = 0
+        return
+    }
+    let n_emit = min(emitter_count[0], MAX_EMITTERS)
+    if n_emit == 0 {
+        masks[id] = 0
+        return
+    }
+    let ty = id.x / tiles_x
+    let tx = id.x - ty * tiles_x
+    let x0 = f32(tx * TILE_SIZE)
+    let y0 = f32(ty * TILE_SIZE)
+    let x1 = min(x0 + f32(TILE_SIZE), v.size.x)
+    let y1 = min(y0 + f32(TILE_SIZE), v.size.y)
+    let cx = 0.5 * (x0 + x1)
+    let cy = 0.5 * (y0 + y1)
+    let center_ray = v.ray(vec2(cx, cy))
+    let r00 = v.ray(vec2(x0, y0))
+    let r10 = v.ray(vec2(x1, y0))
+    let r01 = v.ray(vec2(x0, y1))
+    let r11 = v.ray(vec2(x1, y1))
+    let sin_cone = max(
+        max(length(r00 - center_ray), length(r10 - center_ray)),
+        max(length(r01 - center_ray), length(r11 - center_ray)),
+    ) * 1.05
+
+    var mask: u32 = 0
+    for i in 0..n_emit {
+        let em = emitters[i]
+        let peak_f = max(em.flux_w.x, max(em.flux_w.y, em.flux_w.z))
+        let r = em.pos_r.w
+        let infl_r = sqrt(max(peak_f / 0.035 - r * r, 0.0)) + r
+        let to_e = em.pos_r.xyz - v.at
+        let proj = dot(to_e, center_ray)
+        if proj + infl_r > 0.0 {
+            let t = max(proj, 0.0)
+            let perp2 = max(dot(to_e, to_e) - t * t, 0.0)
+            let cone_r = t * sin_cone + infl_r
+            if perp2 <= cone_r * cone_r {
+                mask |= (1 << i)
+            }
+        }
+    }
+    masks[id] = mask
+}
+
+/// Evaluates only the dynamic local emitters active in this pixel's 16×16 screen tile (`tile_masks`).
+/// Tiles far from emitters run zero loop iterations; tiles near emitters stay 100% SIMD-coherent.
+@budget(work: 32000)
+pub fn eval_emitters_tiled(
     sub: Substance,
     wp: vec3,
     n: vec3,
@@ -904,17 +1035,26 @@ pub fn eval_emitters(
     rad1: Texture3d<Rgba16Float>,
     rad_s: Sampler,
     emitters: [Emitter],
-    emitter_count: [u32],
+    tile_masks: [u32],
+    tiles_x: u32,
+    px: u32,
+    py: u32,
 ) -> vec3 {
     if grid.enabled == 0 {
         return vec3(0.0)
     }
-    let n_emit = min(emitter_count[0], MAX_EMITTERS)
-    if n_emit == 0 {
+    let tidx = (py / TILE_SIZE) * tiles_x + (px / TILE_SIZE)
+    var mask = tile_masks[tidx]
+    if mask == 0 {
         return vec3(0.0)
     }
     var sum = vec3(0.0)
-    for i in 0..n_emit {
+    for _step in 0..MAX_EMITTERS {
+        if mask == 0 {
+            break
+        }
+        let i = mask.trailing_zeros()
+        mask &= mask - 1
         let em = emitters[i]
         let to_l = em.pos_r.xyz - wp
         let d2 = dot(to_l, to_l)
@@ -944,48 +1084,6 @@ pub fn eval_emitters(
             1.0
         }
         sum += sub.shade_direct(n, l, v_dir, irrad * vis)
-    }
-    sum
-}
-
-/// Fast direct dynamic emitter evaluation without per-pixel 3D occupancy shadow marching (used on
-/// tiny airborne swarm grains where shadow marches are imperceptible and 6× faster).
-@budget(work: 6000)
-pub fn eval_emitters_fast(
-    sub: Substance,
-    wp: vec3,
-    n: vec3,
-    v_dir: vec3,
-    grid: RadGrid,
-    emitters: [Emitter],
-    emitter_count: [u32],
-) -> vec3 {
-    if grid.enabled == 0 {
-        return vec3(0.0)
-    }
-    let n_emit = min(emitter_count[0], MAX_EMITTERS)
-    if n_emit == 0 {
-        return vec3(0.0)
-    }
-    var sum = vec3(0.0)
-    for i in 0..n_emit {
-        let em = emitters[i]
-        let to_l = em.pos_r.xyz - wp
-        let d2 = dot(to_l, to_l)
-        let r = em.pos_r.w
-        if d2 < 1.0e-5 {
-            continue
-        }
-        let d = sqrt(d2)
-        let l = to_l / d
-        if dot(n, l) <= 0.0 && sub.subsurface <= 1.0e-4 {
-            continue
-        }
-        let irrad = em.flux_w.xyz / (d2 + r * r)
-        if max(irrad.x, max(irrad.y, irrad.z)) < 0.04 {
-            continue
-        }
-        sum += sub.shade_direct(n, l, v_dir, irrad)
     }
     sum
 }
@@ -1162,36 +1260,147 @@ pub fn volume_indirect(
 }
 
 /// Persistent GPU buffers and 3-level 3D textures for the unified world-space radiance cache
-/// and auto-extracted dynamic local emitters.
+/// and auto-extracted dynamic local emitters. Static geometry accumulates into `static_accum` /
+/// `static_emit_accum` only when static batches, the sun, or the radiance grid change; frames with
+/// only moving objects GPU-copy the static base (~0.04 ms) and inject only dynamic batches.
 pub struct RadianceCache {
     pub accum: GpuBuffer<u32>,
     pub emit_accum: GpuBuffer<u32>,
+    pub static_accum: GpuBuffer<u32>,
+    pub static_emit_accum: GpuBuffer<u32>,
+    pub active_bins: AppendBuffer<u32>,
     pub emitters: AppendBuffer<Emitter>,
+    pub tile_masks: GpuBuffer<u32>,
+    pub tiles_x: u32,
+    pub tiles_y: u32,
     pub inject_args: GpuBuffer<DispatchArgs>,
     pub rad0: Texture3d<Rgba16Float>,
     pub rad1: Texture3d<Rgba16Float>,
     pub rad2: Texture3d<Rgba16Float>,
     pub s: Sampler,
     pub grid: RadGrid,
+    pub static_key: u64,
+    pub static_valid: bool,
 }
 
-/// Allocates a fresh `RadianceCache` (~6.3 MB total VRAM).
+/// Allocates a fresh `RadianceCache` (~10.5 MB total VRAM).
 pub fn radiance_cache() -> RadianceCache {
     RadianceCache {
         accum: buffer(RAD_VOXELS * 4),
         emit_accum: buffer(EMIT_CELLS * EMIT_STRIDE),
+        static_accum: buffer(RAD_VOXELS * 4),
+        static_emit_accum: buffer(EMIT_CELLS * EMIT_STRIDE),
+        active_bins: append_buffer(MAX_ACTIVE_BINS),
         emitters: append_buffer(MAX_EMITTERS),
+        tile_masks: buffer(1),
+        tiles_x: 1,
+        tiles_y: 1,
         inject_args: buffer_of([DispatchArgs { x: 0, y: 1, z: 1 }]),
         rad0: texture3d(width: RAD_SIDE, height: RAD_SIDE, depth: RAD_SIDE),
         rad1: texture3d(width: RAD_SIDE / 2, height: RAD_SIDE / 2, depth: RAD_SIDE / 2),
         rad2: texture3d(width: RAD_SIDE / 4, height: RAD_SIDE / 4, depth: RAD_SIDE / 4),
         s: sampler(filter: Filter::Linear, address: Address::Clamp),
         grid: rad_grid(vec3(0.0), 10.0, enabled: false),
+        static_key: 0,
+        static_valid: false,
     }
 }
 
 impl RadianceCache {
-    /// Begins a radiance volume + dynamic emitter rebuild for the world around `(centre, radius)`.
+    /// Culls active dynamic emitters into `16×16` screen-tile `u32` bitmasks for the current view.
+    pub fn cull_tiles(mut self, v: View, width: u32, height: u32) {
+        let tx = max((width + TILE_SIZE - 1) / TILE_SIZE, 1)
+        let ty = max((height + TILE_SIZE - 1) / TILE_SIZE, 1)
+        if tx != self.tiles_x || ty != self.tiles_y {
+            self.tile_masks = buffer(tx * ty)
+            self.tiles_x = tx
+            self.tiles_y = ty
+        }
+        label("mesh_tiles")
+        dispatch(
+            cull_tile_emitters.bind(
+                v: v,
+                grid: self.grid,
+                emitters: self.emitters.items(),
+                emitter_count: self.emitters.count(),
+                tiles_x: tx,
+                tiles_y: ty,
+                masks: mut self.tile_masks,
+            ),
+            over: tx * ty,
+        )
+    }
+
+    /// Updates `self.grid` and clears the static accumulation buffers prior to injecting static batches.
+    pub fn begin_static(mut self, centre: vec3, radius: f32, enabled: bool) {
+        self.grid = rad_grid(centre, radius, enabled: enabled)
+        if !enabled {
+            self.static_valid = false
+            return
+        }
+        label("mesh_radiance")
+        dispatch(clear_u32.bind(n: RAD_VOXELS * 4, buf: mut self.static_accum), over: RAD_VOXELS * 4)
+        let emit_n = EMIT_CELLS * EMIT_STRIDE
+        dispatch(clear_u32.bind(n: emit_n, buf: mut self.static_emit_accum), over: emit_n)
+    }
+
+    /// Injects one static meshlet batch's vertices into the cached static radiance buffers.
+    pub fn inject_static<S: Sky>(
+        mut self,
+        verts: GpuSpan<MeshVertex>,
+        vert_count: GpuSpan<u32>,
+        cap_verts: u32,
+        xforms: GpuSpan<Rigid>,
+        inst_count: u32,
+        sv: ShadowView,
+        sky: S,
+        sky_table: Texture<Rgba16Float>,
+        sky_s: Sampler,
+        shadow_map: DepthTexture,
+        cmp: ComparisonSampler,
+    ) {
+        if self.grid.enabled == 0 || cap_verts == 0 || inst_count == 0 {
+            return
+        }
+        dispatch(
+            prep_rad_list.bind(count: vert_count, cap: cap_verts, inst_count: inst_count, args: mut self.inject_args),
+            over: 1,
+        )
+        dispatch(
+            rad_inject.bind(
+                verts: verts,
+                vert_count: vert_count,
+                cap_verts: cap_verts,
+                xforms: xforms,
+                inst_count: inst_count,
+                grid: self.grid,
+                sv: sv,
+                sky: sky,
+                sky_table: sky_table,
+                sky_s: sky_s,
+                shadow_map: shadow_map,
+                cmp: cmp,
+                prev_rad1: self.rad1,
+                rad_s: self.s,
+                accum: mut self.static_accum,
+                emit_accum: mut self.static_emit_accum,
+            ),
+            groups: self.inject_args,
+            most: (((cap_verts + 1) / 2) * inst_count + 63) / 64,
+        )
+    }
+
+    /// Seeds the frame's working radiance buffers from the cached static buffers via fast GPU copy.
+    pub fn begin_from_static(mut self, centre: vec3, radius: f32) {
+        self.grid = rad_grid(centre, radius, enabled: true)
+        label("mesh_radiance")
+        copy(from: self.static_accum.items(), to: self.accum.items_mut())
+        copy(from: self.static_emit_accum.items(), to: self.emit_accum.items_mut())
+        self.active_bins.clear()
+        self.emitters.clear()
+    }
+
+    /// Begins a full-clear radiance rebuild (used when no static cache is active).
     pub fn begin(mut self, centre: vec3, radius: f32, enabled: bool) {
         self.grid = rad_grid(centre, radius, enabled: enabled)
         if !enabled {
@@ -1201,15 +1410,18 @@ impl RadianceCache {
         dispatch(clear_u32.bind(n: RAD_VOXELS * 4, buf: mut self.accum), over: RAD_VOXELS * 4)
         let emit_n = EMIT_CELLS * EMIT_STRIDE
         dispatch(clear_u32.bind(n: emit_n, buf: mut self.emit_accum), over: emit_n)
+        self.active_bins.clear()
         self.emitters.clear()
     }
 
-    /// Injects one meshlet batch's vertices into the active radiance volume and emitter bins.
+    /// Injects one dynamic meshlet batch's vertices into the active radiance volume and emitter bins.
     pub fn inject<S: Sky>(
         mut self,
         verts: GpuSpan<MeshVertex>,
         vert_count: GpuSpan<u32>,
         cap_verts: u32,
+        xforms: GpuSpan<Rigid>,
+        inst_count: u32,
         sv: ShadowView,
         sky: S,
         sky_table: Texture<Rgba16Float>,
@@ -1217,11 +1429,11 @@ impl RadianceCache {
         shadow_map: DepthTexture,
         cmp: ComparisonSampler,
     ) {
-        if self.grid.enabled == 0 {
+        if self.grid.enabled == 0 || cap_verts == 0 || inst_count == 0 {
             return
         }
         dispatch(
-            prep_list.bind(count: vert_count, cap: cap_verts, args: mut self.inject_args),
+            prep_rad_list.bind(count: vert_count, cap: cap_verts, inst_count: inst_count, args: mut self.inject_args),
             over: 1,
         )
         dispatch(
@@ -1229,6 +1441,8 @@ impl RadianceCache {
                 verts: verts,
                 vert_count: vert_count,
                 cap_verts: cap_verts,
+                xforms: xforms,
+                inst_count: inst_count,
                 grid: self.grid,
                 sv: sv,
                 sky: sky,
@@ -1242,7 +1456,7 @@ impl RadianceCache {
                 emit_accum: mut self.emit_accum,
             ),
             groups: self.inject_args,
-            most: (cap_verts + 63) / 64,
+            most: (((cap_verts + 1) / 2) * inst_count + 63) / 64,
         )
     }
 
@@ -1267,8 +1481,17 @@ impl RadianceCache {
             over: (s2, s2, s2),
         )
         dispatch(
+            emit_collect.bind(
+                emit_accum: self.emit_accum.items(),
+                active_bins: mut self.active_bins,
+            ),
+            over: EMIT_CELLS,
+        )
+        dispatch(
             emit_compact.bind(
                 emit_accum: self.emit_accum.items(),
+                active_bins: self.active_bins.items(),
+                active_count: self.active_bins.count(),
                 grid: self.grid,
                 out: mut self.emitters,
             ),

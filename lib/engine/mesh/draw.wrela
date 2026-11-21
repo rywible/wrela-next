@@ -7,19 +7,19 @@
 
 use matter::height::{Height, NoHeight}
 use matter::medium::{Medium, NoMedium}
-use matter::sky::{Sky, seen}
+use matter::sky::Sky
 use matter::substance::{
     ONE_OVER_PI, Substance, env_brdf_approx, fresnel_schlick_rough,
 }
 use matter::swarm::{NoSwarm, Swarm}
 use matter::world::{And, Many, One, World}
-use mesh::extract::{MeshBatch, MeshVertex, mesh_batch, steep}
-use mesh::height::{CLIP_RINGS, CLIP_VERTS, MeshVary, height_vs}
+use mesh::extract::{ExtractScratch, MeshBatch, MeshVertex, extract_scratch, mesh_batch, steep}
+use mesh::height::{CLIP_RINGS, ClipmapMesh, MeshVary, clipmap_mesh, height_vs}
 use mesh::light::{
     Emitter, NEAR, RadGrid, RadianceCache, SHADOW_SIDE, ShadowView, SkyCache, clip_of,
-    cone_indirect, contact_shadow, encode_mat_unorm, eval_emitters, radiance_cache, shadow_view,
-    sky_background, sky_cache, sky_irradiance, sky_specular, spec_cone, sun_shadow, sun_shadow_csm,
-    sun_vis_point, trace_ssr,
+    cone_indirect, contact_shadow, decode_substance, encode_mat_signed, eval_emitters_tiled,
+    radiance_cache, shadow_view, sky_background, sky_cache, sky_irradiance, sky_specular,
+    spec_cone, sun_shadow_csm, sun_vis_point, trace_ssr,
 }
 use mesh::swarm::{SwarmSim, swarm_fs, swarm_shadow_vs, swarm_sim, swarm_vs}
 use mesh::volume::{
@@ -30,13 +30,14 @@ use picture::look::Look
 use picture::picture::{Picture, picture}
 use picture::screen::{cover, luma, show}
 use std::collections::Vec
-use std::field::Field
+use std::field::{Field, Rigid}
 use std::gpu::{
     Address, ClipPosition, Compare, ComparisonSampler, Cull, Depth, DepthBias, DepthOnlyPass,
-    DepthPass, DepthTexture, Filter, FragCoord, MsaaDepthPass3, R8, Rgba8, Rgba16Float, Rgba32Float,
-    Sampler, Targets2, Targets3, Texture, Texture3d, VertexIndex, begin_depth_pass, begin_pass,
-    begin_pass2, begin_pass3_msaa_with_depth, begin_pass_with_depth, comparison_sampler,
-    copy_texture, depth_texture, discard, draw, label, sampler, texture,
+    DepthPass, DepthTexture, Filter, FragCoord, InstanceIndex, MsaaDepthPass3, R8, Rgba8,
+    Rgba16Float, Rgba32Float, Sampler, Targets2, Targets3, Texture, Texture3d, VertexIndex,
+    begin_depth_pass, begin_pass, begin_pass2, begin_pass3, begin_pass3_msaa_with_depth,
+    begin_pass_with_depth, comparison_sampler, copy_texture, depth_texture, discard, draw, label,
+    sampler, texture,
 }
 use std::hash::{Hasher, StateHash}
 
@@ -50,10 +51,12 @@ const BATCH_BRICKS: u32 = 8192
 /// foreground things refresh every frame (60 Hz).
 const FAR_TIER_DIST: f32 = 9.0
 
-/// Vertex shader for the unified shadow depth pass: projects `MeshVertex` into orthographic sun space.
+/// Vertex shader for the unified shadow depth pass: projects `MeshVertex` through its instance's
+/// rigid transform `xforms[ii.index]` into orthographic sun space.
 @vertex
-fn shadow_vs(verts: [MeshVertex], sv: ShadowView, vi: VertexIndex) -> ClipPosition {
-    ClipPosition { position: vec4(sv.project(verts[vi.index].pos.xyz), 1.0) }
+fn shadow_vs(verts: [MeshVertex], xforms: [Rigid], sv: ShadowView, vi: VertexIndex, ii: InstanceIndex) -> ClipPosition {
+    let wp = xforms[ii.index].apply_point(verts[vi.index].pos.xyz)
+    ClipPosition { position: vec4(sv.project(wp), 1.0) }
 }
 
 /// Depth-only fragment shader for the shadow pass (colour output is ignored by `DepthOnlyPass`).
@@ -62,15 +65,17 @@ fn shadow_fs() -> vec4 {
     vec4(0.0)
 }
 
-/// Vertex shader for the unified eye pass: matches `View::ray` bit-for-bit with reversed-Z depth.
+/// Vertex shader for the unified eye pass: transforms `MeshVertex` by `xforms[ii.index]` and
+/// matches `View::ray` bit-for-bit with reversed-Z depth.
 @vertex
-fn mesh_vs(verts: [MeshVertex], v: View, vi: VertexIndex) -> MeshVary {
+fn mesh_vs(verts: [MeshVertex], xforms: [Rigid], v: View, vi: VertexIndex, ii: InstanceIndex) -> MeshVary {
     let vert = verts[vi.index]
-    let wp = vert.pos.xyz
+    let xf = xforms[ii.index]
+    let wp = xf.apply_point(vert.pos.xyz)
     MeshVary {
         clip: clip_of(v, wp),
         wp,
-        normal: vert.normal.xyz,
+        normal: xf.apply_normal(vert.normal.xyz),
         albedo: vert.albedo.xyz,
         emits: vert.emits.xyz,
         pbr: vec4(vert.normal.w, vert.albedo.w, vert.emits.w, vert.pos.w),
@@ -176,28 +181,16 @@ fn resolve_normal(vary: MeshVary, ray_back: vec3) -> vec3 {
     if vary.pbr.w < 0.5 || dot(nv, nf) < 0.85 { nf } else { nv }
 }
 
-/// Lean direct-only linear-HDR + compact `Rgba8` G-buffer fragment shader for the 4× MSAA opaque
-/// eye pass (shared by both solid meshlets and opaque terrain heightfields): computes dual-cascade
-/// rotated-PCF sun lighting + auto-extracted dynamic local emitters + emission, deferring 4-cone
-/// GI and SSR to the 4× faster half-res bilateral pass. Zero `discard()` -> 100% hardware Early-Z.
+/// Lean premultiplied G-buffer fragment shader for the 4× MSAA opaque eye pass (shared by both
+/// solid meshlets and opaque terrain heightfields). Writes ONLY premultiplied `(n, 1.0)`,
+/// `(albedo, roughness)`, and `(emits, mat_code)` into `Rgba16Float` targets cleared to zero:
+/// uncovered sky samples remain zero so hardware 4× MSAA resolve yields exact coverage `c = g_normal.w`
+/// and uncorrupted normals/albedo/emits (`val / c`). Zero shadows, zero emitters, zero `discard()` ->
+/// 100% Early-Z and zero micro-triangle shading amplification.
 @fragment
-@budget(work: 18000)
-fn mesh_direct_fs<S: Sky>(
-    pixel: FragCoord,
+fn mesh_gbuf_fs(
     vary: MeshVary,
     v: View,
-    sv_near: ShadowView,
-    sv_far: ShadowView,
-    rad_grid: RadGrid,
-    sky: S,
-    sm_near: DepthTexture,
-    sm_far: DepthTexture,
-    cmp: ComparisonSampler,
-    rad0: Texture3d<Rgba16Float>,
-    rad1: Texture3d<Rgba16Float>,
-    rad_s: Sampler,
-    emitters: [Emitter],
-    emitter_count: [u32],
 ) -> Targets3<vec4, vec4, vec4> {
     let to_eye = v.at - vary.wp
     let dist = length(to_eye)
@@ -205,23 +198,227 @@ fn mesh_direct_fs<S: Sky>(
     let n0 = resolve_normal(vary, ray_back)
     let sub0 = vary_substance(vary)
     let (n, sub) = apply_micro_relief(vary.wp, n0, sub0, dist)
+    Targets3 {
+        first: vec4(n * 0.5 + vec3(0.5), 1.0),
+        second: vec4(sub.albedo, clamp(sub.roughness, 0.02, 1.0)),
+        third: vec4(sub.emits, encode_mat_signed(sub)),
+    }
+}
+
+/// Reads reversed-Z depth at `(px, py)` and returns `(ndc_z, depth_xy)`, falling back to the
+/// nearest solid cardinal neighbor ONLY on partial-coverage MSAA edge pixels where sample 0 missed.
+fn sample_solid_depth(depth: DepthTexture, px: u32, py: u32, full_w: u32, full_h: u32) -> (f32, vec2) {
+    var z = depth.load(px, py)
+    if z > 1.0e-6 {
+        return (z, vec2(f32(px) + 0.5, f32(py) + 0.5))
+    }
+    var bx = px
+    var by = py
+    if px > 0 {
+        let zn = depth.load(px - 1, py)
+        if zn > z {
+            z = zn
+            bx = px - 1
+            by = py
+        }
+    }
+    if px + 1 < full_w {
+        let zn = depth.load(px + 1, py)
+        if zn > z {
+            z = zn
+            bx = px + 1
+            by = py
+        }
+    }
+    if py > 0 {
+        let zn = depth.load(px, py - 1)
+        if zn > z {
+            z = zn
+            bx = px
+            by = py - 1
+        }
+    }
+    if py + 1 < full_h {
+        let zn = depth.load(px, py + 1)
+        if zn > z {
+            z = zn
+            bx = px
+            by = py + 1
+        }
+    }
+    (z, vec2(f32(bx) + 0.5, f32(by) + 0.5))
+}
+
+/// Reconstructs the pixel-center world hit distance from resolved 4× MSAA Sample 0 depth
+/// (`(-0.125, -0.375)` px offset in Metal and Vulkan) by intersecting the pixel-center ray with the
+/// surface tangent plane through Sample 0's hit point. Eliminates subpixel depth bias on grazing
+/// surfaces with zero extra G-buffer storage.
+fn reconstruct_pixel_dist(v: View, ray: vec3, n: vec3, ndc_z: f32, depth_xy: vec2) -> f32 {
+    let lin_z = NEAR / ndc_z
+    let dist0 = lin_z / max(dot(ray, v.forward), 0.05)
+    let denom = dot(ray, n)
+    if abs(denom) <= 0.05 {
+        return dist0
+    }
+    let ray_s0 = v.ray(depth_xy + vec2(-0.125, -0.375))
+    let wp0 = v.at + ray_s0 * (lin_z / max(dot(ray_s0, v.forward), 0.05))
+    let dist_p = dot(wp0 - v.at, n) / denom
+    if dist_p > 0.01 && abs(dist_p - dist0) < dist0 * 0.25 {
+        dist_p
+    } else {
+        dist0
+    }
+}
+
+/// Unpacks an un-premultiplied unit normal from premultiplied `Rgba8`
+/// `g_normal = (cov * (n * 0.5 + 0.5), cov)`.
+fn decode_gbuf_normal(gn: vec4, inv_c: f32, fallback: vec3) -> vec3 {
+    let nr = gn.xyz * (2.0 * inv_c) - vec3(1.0)
+    let nl2 = dot(nr, nr)
+    if nl2 > 1.0e-10 { nr * (1.0 / sqrt(nl2)) } else { fallback }
+}
+
+/// Shared pixel-rate direct lighting core used identically by both `draw_scene` (`deferred_direct_fs`)
+/// and `drawn_only` (`deferred_direct_judge_fs`): evaluates dual-cascade rotated-PCF sun lighting +
+/// tiled dynamic emitters ONCE per screen pixel (zero micro-triangle quad overshading).
+@budget(work: 36000)
+fn shade_direct_pixel<S: Sky>(
+    px: u32,
+    py: u32,
+    pixel_xy: vec2,
+    v: View,
+    sv_near: ShadowView,
+    sv_far: ShadowView,
+    rad_grid: RadGrid,
+    sky: S,
+    g_normal: Texture<Rgba8>,
+    g_albedo: Texture<Rgba8>,
+    g_emits: Texture<Rgba16Float>,
+    depth: DepthTexture,
+    sky_spec0: Texture<Rgba16Float>,
+    sky_s: Sampler,
+    sm_near: DepthTexture,
+    sm_far: DepthTexture,
+    cmp: ComparisonSampler,
+    rad0: Texture3d<Rgba16Float>,
+    rad1: Texture3d<Rgba16Float>,
+    rad_s: Sampler,
+    emitters: [Emitter],
+    tile_masks: [u32],
+    tiles_x: u32,
+    full_w: u32,
+    full_h: u32,
+) -> (vec4, vec4, f32) {
+    let gn = g_normal.load(px, py)
+    let cov = gn.w
+    let ray = v.ray(pixel_xy)
+    if cov <= 0.001 {
+        return (vec4(sky_background(sky, sky_spec0, sky_s, ray), 65000.0), vec4(0.0), 1.0)
+    }
+    let (ndc_z, depth_xy) = sample_solid_depth(depth, px, py, full_w, full_h)
+    if ndc_z <= 1.0e-6 {
+        return (vec4(sky_background(sky, sky_spec0, sky_s, ray), 65000.0), vec4(0.0), 1.0)
+    }
+    let inv_c = 1.0 / cov
+    let n = decode_gbuf_normal(gn, inv_c, -ray)
+    let ga = g_albedo.load(px, py)
+    let ge = g_emits.load(px, py)
+    let sub = decode_substance(ga.xyz * inv_c, ga.w * inv_c, ge.xyz * inv_c, ge.w * inv_c)
+
+    let dist = reconstruct_pixel_dist(v, ray, n, ndc_z, depth_xy)
+    let wp = v.at + ray * dist
+    let ray_back = -ray
 
     let sun = sky.sun()
     let ndl = max(dot(n, sun.way), 0.0)
     let vis = if ndl > 0.0 {
-        sun_shadow_csm(sm_near, sm_far, cmp, sv_near, sv_far, vary.wp, n, pixel.position.xy)
+        sun_shadow_csm(sm_near, sm_far, cmp, sv_near, sv_far, wp, n, pixel_xy)
     } else {
         0.0
     }
     let direct_sun = sub.shade_direct(n, sun.way, ray_back, sun.light * vis)
-    let local_light = eval_emitters(sub, vary.wp, n, ray_back, rad_grid, rad0, rad1, rad_s, emitters, emitter_count)
+    let local_light = eval_emitters_tiled(
+        sub, wp, n, ray_back, rad_grid, rad0, rad1, rad_s, emitters, tile_masks, tiles_x, px, py,
+    )
     let direct = sub.emits + direct_sun + local_light
+    (vec4(direct, min(dist, 65000.0)), vec4(n, dist), vis)
+}
 
-    Targets3 {
-        first: vec4(direct, min(dist, 65000.0)),
-        second: vec4(n * 0.5 + vec3(0.5), clamp(sub.roughness, 0.02, 1.0)),
-        third: vec4(sub.albedo, encode_mat_unorm(sub)),
-    }
+/// Full-resolution 1× pixel-rate deferred direct lighting pass (`draw_scene`).
+@fragment
+@budget(work: 38000)
+fn deferred_direct_fs<S: Sky>(
+    pixel: FragCoord,
+    v: View,
+    sv_near: ShadowView,
+    sv_far: ShadowView,
+    rad_grid: RadGrid,
+    sky: S,
+    g_normal: Texture<Rgba8>,
+    g_albedo: Texture<Rgba8>,
+    g_emits: Texture<Rgba16Float>,
+    depth: DepthTexture,
+    sky_spec0: Texture<Rgba16Float>,
+    sky_s: Sampler,
+    sm_near: DepthTexture,
+    sm_far: DepthTexture,
+    cmp: ComparisonSampler,
+    rad0: Texture3d<Rgba16Float>,
+    rad1: Texture3d<Rgba16Float>,
+    rad_s: Sampler,
+    emitters: [Emitter],
+    tile_masks: [u32],
+    tiles_x: u32,
+    full_w: u32,
+    full_h: u32,
+) -> vec4 {
+    let px = min(u32(pixel.position.x), full_w - 1)
+    let py = min(u32(pixel.position.y), full_h - 1)
+    let (hdr_d, _place, _vis) = shade_direct_pixel(
+        px, py, pixel.position.xy, v, sv_near, sv_far, rad_grid, sky,
+        g_normal, g_albedo, g_emits, depth, sky_spec0, sky_s,
+        sm_near, sm_far, cmp, rad0, rad1, rad_s, emitters, tile_masks, tiles_x, full_w, full_h,
+    )
+    hdr_d
+}
+
+/// Identical pixel-rate deferred direct pass with `(place, sun)` diagnostic outputs for `drawn_only`
+/// so the judges and hole audit verify the exact same renderer that draws the game.
+@fragment
+@budget(work: 38000)
+fn deferred_direct_judge_fs<S: Sky>(
+    pixel: FragCoord,
+    v: View,
+    sv_near: ShadowView,
+    sv_far: ShadowView,
+    rad_grid: RadGrid,
+    sky: S,
+    g_normal: Texture<Rgba8>,
+    g_albedo: Texture<Rgba8>,
+    g_emits: Texture<Rgba16Float>,
+    depth: DepthTexture,
+    sky_spec0: Texture<Rgba16Float>,
+    sky_s: Sampler,
+    sm_near: DepthTexture,
+    sm_far: DepthTexture,
+    cmp: ComparisonSampler,
+    rad0: Texture3d<Rgba16Float>,
+    rad1: Texture3d<Rgba16Float>,
+    rad_s: Sampler,
+    emitters: [Emitter],
+    tile_masks: [u32],
+    tiles_x: u32,
+    full_w: u32,
+    full_h: u32,
+) -> Targets3<vec4, vec4, f32> {
+    let px = min(u32(pixel.position.x), full_w - 1)
+    let py = min(u32(pixel.position.y), full_h - 1)
+    let (hdr_d, place, vis) = shade_direct_pixel(
+        px, py, pixel.position.xy, v, sv_near, sv_far, rad_grid, sky,
+        g_normal, g_albedo, g_emits, depth, sky_spec0, sky_s,
+        sm_near, sm_far, cmp, rad0, rad1, rad_s, emitters, tile_masks, tiles_x, full_w, full_h,
+    )
+    Targets3 { first: hdr_d, second: place, third: vis }
 }
 
 /// Half-resolution (`W/2 × H/2`) indirect lighting pass: computes 4-cone hemisphere diffuse GI
@@ -238,6 +435,7 @@ fn indirect_half_fs<S: Sky>(
     hdr_direct: Texture<Rgba16Float>,
     g_normal: Texture<Rgba8>,
     g_albedo: Texture<Rgba8>,
+    g_emits: Texture<Rgba16Float>,
     depth: DepthTexture,
     bg_s: Sampler,
     sky_diff: Texture<Rgba16Float>,
@@ -255,36 +453,34 @@ fn indirect_half_fs<S: Sky>(
     let fx = min(u32(pixel.position.x) * 2, full_w - 1)
     let fy = min(u32(pixel.position.y) * 2, full_h - 1)
     let gn = g_normal.load(fx, fy)
-    // Sky pixels have `g_normal.w == 0.0` (surfaces are clamped to `>= 0.02`).
-    if gn.w < 0.01 {
+    let cov = gn.w
+    if cov <= 0.001 {
         return Targets2 {
             first: vec4(0.0, 0.0, 0.0, 1.0),
             second: vec4(0.0, 0.0, 0.0, 1.0),
         }
     }
-    let ndc_z = depth.load(fx, fy)
+    let (ndc_z, depth_xy) = sample_solid_depth(depth, fx, fy, full_w, full_h)
     if ndc_z <= 1.0e-6 {
         return Targets2 {
             first: vec4(0.0, 0.0, 0.0, 1.0),
             second: vec4(0.0, 0.0, 0.0, 1.0),
         }
     }
+    let inv_c = 1.0 / cov
     let ray = v.ray(vec2(f32(fx) + 0.5, f32(fy) + 0.5))
-    let lin_z = NEAR / ndc_z
-    let dist = lin_z / max(dot(ray, v.forward), 0.05)
+    let n = decode_gbuf_normal(gn, inv_c, -ray)
+    let dist = reconstruct_pixel_dist(v, ray, n, ndc_z, depth_xy)
     let wp = v.at + ray * dist
-    let n_raw = gn.xyz * 2.0 - vec3(1.0)
-    let nl2 = dot(n_raw, n_raw)
-    let n = if nl2 > 1.0e-10 { n_raw * (1.0 / sqrt(nl2)) } else { -ray }
-    let roughness = clamp(gn.w, 0.02, 1.0)
-    let mat_code = g_albedo.load(fx, fy).w * 2.0 - 1.0
+    let roughness = clamp(g_albedo.load(fx, fy).w * inv_c, 0.02, 1.0)
+    let mat_code = g_emits.load(fx, fy).w * inv_c
 
     let ind = cone_indirect(rad_grid, rad0, rad1, rad2, rad_s, wp, n)
-    let cshad = contact_shadow(v, depth, wp, n, sky.sun().way)
+    let cshad = if rad_grid.enabled != 0 { contact_shadow(v, depth, wp, n, sky.sun().way) } else { 1.0 }
 
-    // Skip specular SSR & voxel reflection cone completely on pure matte surfaces (`abs(mat_code) < 0.015`).
+    // Skip specular SSR & voxel reflection cone completely on pure matte surfaces (`abs(mat_code) < 0.01`).
     var env_spec = vec3(0.0)
-    if abs(mat_code) >= 0.015 {
+    if abs(mat_code) >= 0.01 {
         let ray_back = -ray
         let refl = normalize(n * (2.0 * dot(n, ray_back)) - ray_back)
         let eff_r = if mat_code > 0.15 { min(roughness, 0.12) } else { roughness }
@@ -303,7 +499,8 @@ fn indirect_half_fs<S: Sky>(
 }
 
 /// Full-resolution depth+normal bilateral upsample of half-res GI, SSR, and micro-contact shadows
-/// combined with the 4× MSAA direct HDR buffer into `hdr_colour`.
+/// combined with the pixel-rate direct HDR buffer into `hdr_colour`, with exact 4× MSAA silhouette
+/// coverage blending against the sky on partial-coverage edge pixels (`cov < 0.999`).
 @fragment
 fn combine_indirect_fs<S: Sky>(
     pixel: FragCoord,
@@ -312,9 +509,11 @@ fn combine_indirect_fs<S: Sky>(
     hdr_direct: Texture<Rgba16Float>,
     g_normal: Texture<Rgba8>,
     g_albedo: Texture<Rgba8>,
+    g_emits: Texture<Rgba16Float>,
     gi_diff: Texture<Rgba16Float>,
     gi_spec: Texture<Rgba16Float>,
     sky_diff: Texture<Rgba16Float>,
+    sky_spec0: Texture<Rgba16Float>,
     sky_s: Sampler,
     full_w: u32,
     full_h: u32,
@@ -323,18 +522,19 @@ fn combine_indirect_fs<S: Sky>(
     let py = min(u32(pixel.position.y), full_h - 1)
     let direct_d = hdr_direct.load(px, py)
     let gn = g_normal.load(px, py)
-    if gn.w < 0.01 {
+    let cov = gn.w
+    if cov <= 0.001 {
         return direct_d
     }
+    let inv_c = 1.0 / cov
     let ga = g_albedo.load(px, py)
-    let n_raw = gn.xyz * 2.0 - vec3(1.0)
-    let nl2 = dot(n_raw, n_raw)
+    let ge = g_emits.load(px, py)
     let ray = v.ray(pixel.position.xy)
-    let n = if nl2 > 1.0e-10 { n_raw * (1.0 / sqrt(nl2)) } else { -ray }
+    let n = decode_gbuf_normal(gn, inv_c, -ray)
     let dist = direct_d.w
-    let roughness = clamp(gn.w, 0.02, 1.0)
-    let albedo = ga.xyz
-    let mat_code = ga.w * 2.0 - 1.0
+    let albedo = clamp(ga.xyz * inv_c, vec3(0.0), vec3(1.0))
+    let roughness = clamp(ga.w * inv_c, 0.02, 1.0)
+    let mat_code = ge.w * inv_c
 
     // 4-tap depth + normal weighted bilateral upsample from half-res GI/SSR buffers.
     let hw = max(full_w / 2, 1)
@@ -356,8 +556,8 @@ fn combine_indirect_fs<S: Sky>(
         let fy = min(sy * 2, full_h - 1)
         let sn = g_normal.load(fx, fy)
         let sd = hdr_direct.load(fx, fy).w
-        if sn.w >= 0.01 {
-            let sn_v = normalize(sn.xyz * 2.0 - vec3(1.0))
+        if sn.w > 0.001 {
+            let sn_v = decode_gbuf_normal(sn, 1.0 / sn.w, n)
             let ndot = max(dot(n, sn_v), 0.0)
             let dz = abs(dist - sd) / max(dist * 0.08, 0.15)
             let w = (ndot * ndot * ndot * ndot + 0.001) * exp(-dz * dz)
@@ -369,18 +569,18 @@ fn combine_indirect_fs<S: Sky>(
     let ind = if w_sum > 1.0e-4 { diff_acc / w_sum } else { gi_diff.load(hx0, hy0) }
     let spec_c = if w_sum > 1.0e-4 { spec_acc / w_sum } else { gi_spec.load(hx0, hy0) }
 
-    let direct_luma = luma(direct_d.xyz)
-    let cshad = if direct_luma < 3.5 && dot(n, sky.sun().way) > 0.05 { spec_c.w } else { 1.0 }
+    let emit_luma = luma(max(ge.xyz * inv_c, vec3(0.0)))
+    let cshad = if emit_luma < 0.5 && dot(n, sky.sun().way) > 0.05 { spec_c.w } else { 1.0 }
     var rad = direct_d.xyz * cshad
 
     let sky_amb = sky_irradiance(sky_diff, sky_s, n) * ind.w + ind.xyz
-    if abs(mat_code) < 0.015 {
+    if abs(mat_code) < 0.01 {
         rad += albedo * ONE_OVER_PI * sky_amb
     } else {
         let ray_back = -ray
         let ndv = max(dot(n, ray_back), 0.001)
-        let metallic = if mat_code < -0.015 { clamp(-mat_code, 0.0, 1.0) } else { 0.0 }
-        let coat = if mat_code > 0.04 { clamp(mat_code, 0.0, 1.0) } else { 0.0 }
+        let metallic = if mat_code < -0.01 { clamp(-mat_code, 0.0, 1.0) } else { 0.0 }
+        let coat = if mat_code > 0.03 { clamp(mat_code - 0.02, 0.0, 1.0) } else { 0.0 }
         let f0 = mix(vec3(0.04), albedo, metallic)
         let f_env = fresnel_schlick_rough(f0, ndv, roughness)
         let kd = (vec3(1.0) - f_env) * (1.0 - metallic)
@@ -392,15 +592,19 @@ fn combine_indirect_fs<S: Sky>(
         }
         rad += indirect
     }
+    if cov < 0.999 {
+        let bg = sky_background(sky, sky_spec0, sky_s, ray)
+        rad = mix(bg, rad, vec3(cov))
+    }
     vec4(rad, dist)
 }
 
 /// Physically-based refractive / transmissive fragment shader for glass, water, crystal, and ice:
 /// Snell screen-space refraction over the GI+SSR-lit opaque HDR buffer, Beer-Lambert depth
 /// absorption (`hdr_bg.w - dist`), rough frosted-glass sampling, real-time SSR + Sky PMREM +
-/// radiance-cone reflection, and crisp GGX specular from dual-cascade sun & dynamic spell emitters.
+/// radiance-cone reflection, and crisp GGX specular from sun & tiled dynamic spell emitters.
 @fragment
-@budget(work: 20000)
+@budget(work: 36000)
 fn mesh_trans_fs<S: Sky>(
     pixel: FragCoord,
     vary: MeshVary,
@@ -420,7 +624,8 @@ fn mesh_trans_fs<S: Sky>(
     rad2: Texture3d<Rgba16Float>,
     rad_s: Sampler,
     emitters: [Emitter],
-    emitter_count: [u32],
+    tile_masks: [u32],
+    tiles_x: u32,
     hdr_bg: Texture<Rgba16Float>,
     bg_s: Sampler,
 ) -> vec4 {
@@ -492,7 +697,11 @@ fn mesh_trans_fs<S: Sky>(
     let env_spec = mix(fallback, ssr.xyz, vec3(ssr.w))
 
     let direct_spec = sub.shade_direct(n, sun.way, ray_back, sun.light * vis)
-    let local_spec = eval_emitters(sub, vary.wp, n, ray_back, rad_grid, rad0, rad1, rad_s, emitters, emitter_count)
+    let px = u32(max(pixel.position.x, 0.0))
+    let py = u32(max(pixel.position.y, 0.0))
+    let local_spec = eval_emitters_tiled(
+        sub, vary.wp, n, ray_back, rad_grid, rad0, rad1, rad_s, emitters, tile_masks, tiles_x, px, py,
+    )
 
     let tr = sub.transmission
     let body = mix(sub.albedo * ONE_OVER_PI * (sun.light * (ndl * vis) + sky_amb), transmitted + deep_scatter, vec3(tr))
@@ -500,111 +709,34 @@ fn mesh_trans_fs<S: Sky>(
     vec4(rad, min(dist, 65000.0))
 }
 
-/// Self-contained reference-judging fragment shader for `drawn_only` (writes `(hdr, place, sun)`).
-@fragment
-@budget(work: 18000)
-fn mesh_judge_fs<S: Sky>(
-    vary: MeshVary,
-    v: View,
-    sv: ShadowView,
-    rad_grid: RadGrid,
-    sky: S,
-    sky_diff: Texture<Rgba16Float>,
-    sky_spec0: Texture<Rgba16Float>,
-    sky_spec1: Texture<Rgba16Float>,
-    sky_spec2: Texture<Rgba16Float>,
-    sky_s: Sampler,
-    shadow_map: DepthTexture,
-    cmp: ComparisonSampler,
-    rad0: Texture3d<Rgba16Float>,
-    rad1: Texture3d<Rgba16Float>,
-    rad2: Texture3d<Rgba16Float>,
-    rad_s: Sampler,
-    emitters: [Emitter],
-    emitter_count: [u32],
-) -> Targets3<vec4, vec4, f32> {
-    let to_eye = v.at - vary.wp
-    let dist = length(to_eye)
-    let ray_back = if dist > 1.0e-6 { to_eye / dist } else { -v.forward }
-    let n = resolve_normal(vary, ray_back)
-    let sub = vary_substance(vary)
-    let sun = sky.sun()
-    let ndl = max(dot(n, sun.way), 0.0)
-    let vis = if ndl > 0.0 { sun_shadow(shadow_map, cmp, sv, vary.wp, n) } else { 0.0 }
-    let direct_sun = sub.shade_direct(n, sun.way, ray_back, sun.light * vis)
-    let local_light = eval_emitters(sub, vary.wp, n, ray_back, rad_grid, rad0, rad1, rad_s, emitters, emitter_count)
-    let ind = cone_indirect(rad_grid, rad0, rad1, rad2, rad_s, vary.wp, n)
-    let sky_amb = sky_irradiance(sky_diff, sky_s, n) * ind.w + ind.xyz
-    let sw = sub.spec_weight()
-    var rad = sub.emits + direct_sun + local_light
-    if sw <= 1.0e-5 && sub.coat <= 1.0e-5 {
-        rad += sub.albedo * ONE_OVER_PI * sky_amb
-    } else {
-        let ndv = max(dot(n, ray_back), 0.001)
-        let refl = normalize(n * (2.0 * dot(n, ray_back)) - ray_back)
-        let f0 = sub.f0()
-        let f_env = fresnel_schlick_rough(f0, ndv, sub.roughness) * sw
-        let kd = (vec3(1.0) - f_env) * (1.0 - sub.metallic)
-        let brdf_ab = env_brdf_approx(sub.roughness, ndv)
-        let sky_refl = sky_specular(sky_spec0, sky_spec1, sky_spec2, sky_diff, sky_s, refl, sub.roughness)
-        let w_refl = spec_cone(rad_grid, rad0, rad1, rad2, rad_s, vary.wp, n, refl, sub.roughness)
-        let env_spec = w_refl.xyz + sky_refl * (1.0 - w_refl.w * 0.85)
-        rad += sub.albedo * (kd * ONE_OVER_PI) * sky_amb + env_spec * (f0 * brdf_ab.x + vec3(brdf_ab.y)) * sw
-    }
-    Targets3 { first: vec4(rad, min(dist, 65000.0)), second: vec4(n, dist), third: vis }
-}
-
-/// Background sky shader, drawn over `cover`: runs only on uncovered pixels (`Depth::Equal` at
-/// `z = 0.0`).
-@fragment
-fn sky_direct_fs<S: Sky>(
-    pixel: FragCoord,
-    v: View,
-    sky: S,
-    sky_spec0: Texture<Rgba16Float>,
-    sky_s: Sampler,
-) -> Targets3<vec4, vec4, vec4> {
-    let d = v.ray(pixel.position.xy)
-    Targets3 {
-        first: vec4(sky_background(sky, sky_spec0, sky_s, d), 65000.0),
-        second: vec4(0.5, 0.5, 0.5, 0.0),
-        third: vec4(0.0, 0.0, 0.0, 0.5),
-    }
-}
-
-@fragment
-fn sky_judge_fs<S: Sky>(pixel: FragCoord, v: View, sky: S) -> Targets3<vec4, vec4, f32> {
-    let d = v.ray(pixel.position.xy)
-    Targets3 {
-        first: vec4(seen(sky, d), 65000.0),
-        second: vec4(0.0, 0.0, 0.0, 0.0),
-        third: 1.0,
-    }
-}
-
-/// Computes a view- and budget-aware cell spacing for a single thing with bounding sphere `(c, r)`.
-/// High-steepness noise fields (`steep`) keep tighter `1.1 px` cells to prevent micro-holes.
+/// Computes a curvature- and budget-aware cell spacing for a single thing with bounding sphere
+/// `(c, r)`. Targets a bounded screen-space sagitta error (`c ≈ sqrt(8 * e * R_feat * px)`),
+/// keeping tight `~1.45 px` cells when an object is small on screen (or `1.1 px` for `steep`
+/// noise fields) while avoiding sub-2-pixel micro-triangles on large smooth close-ups.
 fn cell_for_one(c: vec3, r: f32, v: View, steep: bool) -> f32 {
     let near = max(length(c - v.at) - r, 0.25)
     let px = near * v.pixel()
-    let mult = if steep { 1.1 } else { 1.65 }
+    let r_px = r / max(px, 1.0e-5)
+    let mult = if steep { 1.1 } else { clamp(0.253 * sqrt(r_px), 1.45, 2.55) }
     let by_size = max(r / 180.0, 0.005)
     clamp(max(px * mult, by_size), 0.005, 0.25)
 }
 
-/// Computes a view- and budget-aware cell spacing for one thing in a `Many` batch.
+/// Computes a curvature- and budget-aware cell spacing for one thing in a `Many` batch.
 fn cell_for_share(c: vec3, r: f32, bricks_for_this: f32, v: View) -> f32 {
     let near = max(length(c - v.at) - r, 0.25)
     let px = near * v.pixel()
+    let r_px = r / max(px, 1.0e-5)
+    let mult = clamp(0.253 * sqrt(r_px), 1.35, 2.50)
     let per_thing = max(bricks_for_this, 4.0)
     let by_budget = r / max(sqrt(per_thing * 2.5), 3.5)
-    clamp(max(px * 1.2, by_budget), 0.006, 0.25)
+    clamp(max(px * mult, by_budget), 0.006, 0.25)
 }
 
 /// Any world (`One`, `Many`, `And`) that can sync its GPU meshlet batches.
 pub trait MeshWorld: Copy {
     fn batch_count(self) -> u32
-    fn sync_batches(self, batches: mut Vec<MeshBatch>, first: u32, v: View, frame: u32)
+    fn sync_batches(self, scratch: mut ExtractScratch, batches: mut Vec<MeshBatch>, first: u32, v: View, frame: u32)
 }
 
 impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for One<M> {
@@ -612,10 +744,10 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for One<M> {
         1
     }
 
-    fn sync_batches(self, batches: mut Vec<MeshBatch>, first: u32, v: View, _frame: u32) {
+    fn sync_batches(self, scratch: mut ExtractScratch, batches: mut Vec<MeshBatch>, first: u32, v: View, _frame: u32) {
         let b = self.field.bound()
         let cell = cell_for_one(b.centre, min(b.radius, 1.0e4), v, steep(self.field))
-        batches[first].sync_one(self.field, cell)
+        batches[first].sync_one(mut scratch, self.field, cell)
     }
 }
 
@@ -637,8 +769,8 @@ impl<M: Field<Substance> + StateHash + GpuData, const N: u32> MeshWorld for Many
         if N >= 16 { 3 } else { 1 }
     }
 
-    fn sync_batches(self, batches: mut Vec<MeshBatch>, first: u32, v: View, frame: u32) {
-        let cap = batches[first].cap_bricks
+    fn sync_batches(self, scratch: mut ExtractScratch, batches: mut Vec<MeshBatch>, first: u32, v: View, frame: u32) {
+        let cap = batches[first].max_bricks
         // Each thing's bound, distance and screen-share weight (`0.0` when out of view), once.
         var centres = [vec3(0.0); N]
         var radii = [0.0; N]
@@ -667,7 +799,7 @@ impl<M: Field<Substance> + StateHash + GpuData, const N: u32> MeshWorld for Many
                     cells[i] = cell_for_share(centres[i], radii[i], weights[i] * inv_w, v)
                 }
             }
-            batches[first].sync_many(self.fields, cells)
+            batches[first].sync_many(mut scratch, self.fields, cells)
             return
         }
 
@@ -713,12 +845,16 @@ impl<M: Field<Substance> + StateHash + GpuData, const N: u32> MeshWorld for Many
                 }
             }
         }
-        batches[first].sync_many(self.fields, c_near)
+        batches[first].sync_many(mut scratch, self.fields, c_near)
         if update_even {
-            batches[first + 1].sync_many(self.fields, c_even)
+            batches[first + 1].sync_many(mut scratch, self.fields, c_even)
+        } else {
+            batches[first + 1].still_frames += 1
         }
         if update_odd {
-            batches[first + 2].sync_many(self.fields, c_odd)
+            batches[first + 2].sync_many(mut scratch, self.fields, c_odd)
+        } else {
+            batches[first + 2].still_frames += 1
         }
     }
 }
@@ -728,10 +864,10 @@ impl<A: MeshWorld, B: MeshWorld> MeshWorld for And<A, B> {
         self.a.batch_count() + self.b.batch_count()
     }
 
-    fn sync_batches(self, batches: mut Vec<MeshBatch>, first: u32, v: View, frame: u32) {
+    fn sync_batches(self, scratch: mut ExtractScratch, batches: mut Vec<MeshBatch>, first: u32, v: View, frame: u32) {
         let na = self.a.batch_count()
-        self.a.sync_batches(mut batches, first, v, frame)
-        self.b.sync_batches(mut batches, first + na, v, frame)
+        self.a.sync_batches(mut scratch, mut batches, first, v, frame)
+        self.b.sync_batches(mut scratch, mut batches, first + na, v, frame)
     }
 }
 
@@ -743,6 +879,7 @@ pub struct MeshSight {
     pub hdr_direct: Texture<Rgba16Float>,
     pub g_normal: Texture<Rgba8>,
     pub g_albedo: Texture<Rgba8>,
+    pub g_emits: Texture<Rgba16Float>,
     pub gi_diff: Texture<Rgba16Float>,
     pub gi_spec: Texture<Rgba16Float>,
     pub hdr_colour: Texture<Rgba16Float>,
@@ -753,6 +890,8 @@ pub struct MeshSight {
     pub vol: FroxelVolume,
     pub bloom: BloomPyramid,
     pub swarm: SwarmSim,
+    scratch: ExtractScratch,
+    clipmap: ClipmapMesh,
     batches: Vec<MeshBatch>,
     shadow_near: DepthTexture,
     shadow_far: DepthTexture,
@@ -764,7 +903,8 @@ pub struct MeshSight {
     pub gi: bool,
 }
 
-/// Creates a fresh `MeshSight` with 4× MSAA, dual-cascade rotated-PCF shadows, half-res bilateral
+/// Creates a fresh `MeshSight` with 4× MSAA premultiplied G-buffer, pixel-rate deferred direct
+/// lighting, 16×16 tiled dynamic emitters, dual-cascade rotated-PCF shadows, half-res bilateral
 /// GI + SSR + contact shadows, refraction, froxel volumetrics, and optical HDR bloom.
 pub fn mesh_sight(gi: bool = true) -> MeshSight {
     MeshSight {
@@ -772,6 +912,7 @@ pub fn mesh_sight(gi: bool = true) -> MeshSight {
         hdr_direct: texture(width: 1, height: 1),
         g_normal: texture(width: 1, height: 1),
         g_albedo: texture(width: 1, height: 1),
+        g_emits: texture(width: 1, height: 1),
         gi_diff: texture(width: 1, height: 1),
         gi_spec: texture(width: 1, height: 1),
         hdr_colour: texture(width: 1, height: 1),
@@ -782,6 +923,8 @@ pub fn mesh_sight(gi: bool = true) -> MeshSight {
         vol: froxel_volume(),
         bloom: bloom_pyramid(),
         swarm: swarm_sim(),
+        scratch: extract_scratch(BATCH_BRICKS),
+        clipmap: clipmap_mesh(),
         batches: Vec::new(),
         shadow_near: depth_texture(width: SHADOW_SIDE, height: SHADOW_SIDE),
         shadow_far: depth_texture(width: SHADOW_SIDE, height: SHADOW_SIDE),
@@ -804,6 +947,7 @@ impl MeshSight {
             self.hdr_direct = texture(width: width, height: height)
             self.g_normal = texture(width: width, height: height)
             self.g_albedo = texture(width: width, height: height)
+            self.g_emits = texture(width: width, height: height)
             self.gi_diff = texture(width: hw, height: hh)
             self.gi_spec = texture(width: hw, height: hh)
             self.hdr_colour = texture(width: width, height: height)
@@ -837,7 +981,7 @@ impl MeshSight {
 
         let nb = world.batch_count()
         self.ensure_batches(nb)
-        world.sync_batches(mut self.batches, 0, v, frame)
+        world.sync_batches(mut self.scratch, mut self.batches, 0, v, frame)
         self.swarm.update(swarm, world.field())
 
         var wlo = vec3(1.0e20)
@@ -870,16 +1014,19 @@ impl MeshSight {
         label("mesh_shadow")
         let sp_far: DepthOnlyPass = begin_depth_pass(mut self.shadow_far, clear_depth: 1.0, keep_depth: false)
         for i in 0..nb {
-            draw(
-                sp_far,
-                shadow_vs.bind(verts: self.batches[i].verts.items(), sv: sv_far),
-                shadow_fs,
-                indices: self.batches[i].indices,
-                indirect: self.batches[i].draw_args,
-                cull: Cull::Back,
-                depth_bias: DepthBias { constant: 2, slope: 1.5, clamp: 0.0 },
-                depth: Depth { compare: Compare::Less, write: true },
-            )
+            self.batches[i].finish_poll()
+            if self.batches[i].has_opaque {
+                draw(
+                    sp_far,
+                    shadow_vs.bind(verts: self.batches[i].verts.items(), xforms: self.batches[i].xforms.items(), sv: sv_far),
+                    shadow_fs,
+                    indices: self.batches[i].indices,
+                    indirect: self.batches[i].draw_args,
+                    cull: Cull::Back,
+                    depth_bias: DepthBias { constant: 2, slope: 1.5, clamp: 0.0 },
+                    depth: Depth { compare: Compare::Less, write: true },
+                )
+            }
         }
         if self.swarm.count > 0 {
             draw(
@@ -895,16 +1042,19 @@ impl MeshSight {
         if use_near {
             let sp_near: DepthOnlyPass = begin_depth_pass(mut self.shadow_near, clear_depth: 1.0, keep_depth: false)
             for i in 0..nb {
-                draw(
-                    sp_near,
-                    shadow_vs.bind(verts: self.batches[i].verts.items(), sv: sv_near),
-                    shadow_fs,
-                    indices: self.batches[i].indices,
-                    indirect: self.batches[i].draw_args,
-                    cull: Cull::Back,
-                    depth_bias: DepthBias { constant: 2, slope: 1.4, clamp: 0.0 },
-                    depth: Depth { compare: Compare::Less, write: true },
-                )
+                let b = self.batches[i].bound
+                if self.batches[i].has_opaque && (b.w <= 0.0 || length(b.xyz - sv_near.centre) <= b.w + sv_near.radius * 1.5) {
+                    draw(
+                        sp_near,
+                        shadow_vs.bind(verts: self.batches[i].verts.items(), xforms: self.batches[i].xforms.items(), sv: sv_near),
+                        shadow_fs,
+                        indices: self.batches[i].indices,
+                        indirect: self.batches[i].draw_args,
+                        cull: Cull::Back,
+                        depth_bias: DepthBias { constant: 2, slope: 1.4, clamp: 0.0 },
+                        depth: Depth { compare: Compare::Less, write: true },
+                    )
+                }
             }
             if self.swarm.count > 0 {
                 draw(
@@ -924,7 +1074,9 @@ impl MeshSight {
         }
 
         // Pass 1b: Camera-focused radiance cache & dynamic local emitters.
-        // Skips rebuild completely (0 ms/frame) when static world, sun, swarm, and grid are unchanged.
+        // Skips rebuild completely (0 ms/frame) when the whole world is static; when only dynamic
+        // batches move, copies the cached static accumulation buffers and injects only dynamic
+        // batches + swarm instead of re-injecting static architecture every frame.
         let rad_centre = if wrad > 16.0 { focus } else { wmid }
         let rad_rad = min(wrad, 16.0)
         sun.way.state_hash(mut rk)
@@ -937,19 +1089,79 @@ impl MeshSight {
             self.rad.begin(rad_centre, rad_rad, enabled: false)
             self.rad_built = false
         } else if !self.rad_built || self.rad_key != rkey {
-            self.rad.begin(rad_centre, rad_rad, enabled: true)
+            var sk = Hasher::new()
+            sun.way.state_hash(mut sk)
+            rad_centre.state_hash(mut sk)
+            rad_rad.state_hash(mut sk)
+            let warmup_bounce: u32 = if frame <= 1 { 1 } else { 0 }
+            warmup_bounce.state_hash(mut sk)
+            var static_count: u32 = 0
             for i in 0..nb {
-                self.rad.inject(
-                    self.batches[i].verts.items(),
-                    self.batches[i].verts.count(),
-                    self.batches[i].cap_verts,
-                    sv_far,
-                    sky,
-                    self.sky.diff,
-                    self.sky.s,
-                    self.shadow_far,
-                    self.cmp,
-                )
+                if self.batches[i].still_frames >= 1 {
+                    i.state_hash(mut sk)
+                    self.batches[i].hash.state_hash(mut sk)
+                    static_count += 1
+                }
+            }
+            let skey = sk.finish()
+            if static_count > 0 {
+                if !self.rad.static_valid || self.rad.static_key != skey {
+                    self.rad.begin_static(rad_centre, rad_rad, enabled: true)
+                    for i in 0..nb {
+                        if self.batches[i].still_frames >= 1 {
+                            self.rad.inject_static(
+                                self.batches[i].verts.items(),
+                                self.batches[i].verts.count(),
+                                self.batches[i].cap_verts,
+                                self.batches[i].xforms.items(),
+                                self.batches[i].inst_count,
+                                sv_far,
+                                sky,
+                                self.sky.diff,
+                                self.sky.s,
+                                self.shadow_far,
+                                self.cmp,
+                            )
+                        }
+                    }
+                    self.rad.static_key = skey
+                    self.rad.static_valid = true
+                }
+                self.rad.begin_from_static(rad_centre, rad_rad)
+                for i in 0..nb {
+                    if self.batches[i].still_frames == 0 {
+                        self.rad.inject(
+                            self.batches[i].verts.items(),
+                            self.batches[i].verts.count(),
+                            self.batches[i].cap_verts,
+                            self.batches[i].xforms.items(),
+                            self.batches[i].inst_count,
+                            sv_far,
+                            sky,
+                            self.sky.diff,
+                            self.sky.s,
+                            self.shadow_far,
+                            self.cmp,
+                        )
+                    }
+                }
+            } else {
+                self.rad.begin(rad_centre, rad_rad, enabled: true)
+                for i in 0..nb {
+                    self.rad.inject(
+                        self.batches[i].verts.items(),
+                        self.batches[i].verts.count(),
+                        self.batches[i].cap_verts,
+                        self.batches[i].xforms.items(),
+                        self.batches[i].inst_count,
+                        sv_far,
+                        sky,
+                        self.sky.diff,
+                        self.sky.s,
+                        self.shadow_far,
+                        self.cmp,
+                    )
+                }
             }
             if self.swarm.count > 0 {
                 self.swarm.inject_radiance(swarm, self.rad.grid, mut self.rad.accum, mut self.rad.emit_accum)
@@ -961,8 +1173,209 @@ impl MeshSight {
         (nb, v, sv_near, sv_far)
     }
 
+    /// Shared opaque geometry + tiled emitter culling + pixel-rate deferred direct + half-res
+    /// bilateral GI/SSR + full-res combine pipeline used identically by BOTH `draw_scene` and
+    /// `drawn_only` (the judges test the exact same renderer that draws the game).
+    fn render_opaque_and_indirect<H: Height, Sw: Swarm, S: Sky>(
+        mut self,
+        nb: u32,
+        height: H,
+        swarm: Sw,
+        sky: S,
+        v: View,
+        sv_near: ShadowView,
+        sv_far: ShadowView,
+        width: u32,
+        height_px: u32,
+        write_judge: bool,
+    ) {
+        self.rad.cull_tiles(v, width, height_px)
+
+        // Pass 2a: Lean 4× hardware MSAA premultiplied G-buffer pass (zero shadows/emitters/sky).
+        label("mesh_eye")
+        let ep: MsaaDepthPass3<Rgba8, Rgba8, Rgba16Float> = begin_pass3_msaa_with_depth(
+            mut self.g_normal,
+            mut self.g_albedo,
+            mut self.g_emits,
+            mut self.depth,
+            clear: vec4(0.0, 0.0, 0.0, 0.0),
+            clear_depth: 0.0,
+        )
+        for i in 0..nb {
+            if self.batches[i].has_opaque {
+                draw(
+                    ep,
+                    mesh_vs.bind(verts: self.batches[i].verts.items(), xforms: self.batches[i].xforms.items(), v: v),
+                    mesh_gbuf_fs.bind(v: v),
+                    indices: self.batches[i].indices,
+                    indirect: self.batches[i].draw_args,
+                    cull: Cull::Back,
+                    depth: Depth { compare: Compare::Greater, write: true },
+                )
+            }
+        }
+        if height.active() && height.has_opaque() {
+            draw(
+                ep,
+                height_vs.bind(height: height, v: v, base_level: 0, trans_pass: 0),
+                mesh_gbuf_fs.bind(v: v),
+                indices: self.clipmap.inner_indices,
+                index_count: self.clipmap.inner_count,
+                instances: 1,
+                cull: Cull::Back,
+                depth: Depth { compare: Compare::Greater, write: true },
+            )
+            draw(
+                ep,
+                height_vs.bind(height: height, v: v, base_level: 1, trans_pass: 0),
+                mesh_gbuf_fs.bind(v: v),
+                indices: self.clipmap.outer_indices,
+                index_count: self.clipmap.outer_count,
+                instances: CLIP_RINGS - 1,
+                cull: Cull::Back,
+                depth: Depth { compare: Compare::Greater, write: true },
+            )
+        }
+        if self.swarm.count > 0 {
+            draw(
+                ep,
+                swarm_vs.bind(swarm: swarm, grains: self.swarm.front(), v: v),
+                swarm_fs.bind(v: v),
+                vertices: 6,
+                instances: self.swarm.count,
+                depth: Depth { compare: Compare::Greater, write: true },
+            )
+        }
+        ep.end()
+
+        // Pass 2b: Full-res 1× pixel-rate deferred direct lighting (dual-cascade PCF + tiled emitters).
+        label("mesh_direct")
+        if write_judge {
+            let dp = begin_pass3(mut self.hdr_direct, mut self.drawn.place, mut self.drawn.sun, keep: false)
+            draw(
+                dp,
+                cover,
+                deferred_direct_judge_fs.bind(
+                    v: v,
+                    sv_near: sv_near,
+                    sv_far: sv_far,
+                    rad_grid: self.rad.grid,
+                    sky: sky,
+                    g_normal: self.g_normal,
+                    g_albedo: self.g_albedo,
+                    g_emits: self.g_emits,
+                    depth: self.depth,
+                    sky_spec0: self.sky.spec0,
+                    sky_s: self.sky.s,
+                    sm_near: self.shadow_near,
+                    sm_far: self.shadow_far,
+                    cmp: self.cmp,
+                    rad0: self.rad.rad0,
+                    rad1: self.rad.rad1,
+                    rad_s: self.rad.s,
+                    emitters: self.rad.emitters.items(),
+                    tile_masks: self.rad.tile_masks.items(),
+                    tiles_x: self.rad.tiles_x,
+                    full_w: width,
+                    full_h: height_px,
+                ),
+                vertices: 3,
+            )
+            dp.end()
+        } else {
+            let dp = begin_pass(mut self.hdr_direct, keep: false)
+            draw(
+                dp,
+                cover,
+                deferred_direct_fs.bind(
+                    v: v,
+                    sv_near: sv_near,
+                    sv_far: sv_far,
+                    rad_grid: self.rad.grid,
+                    sky: sky,
+                    g_normal: self.g_normal,
+                    g_albedo: self.g_albedo,
+                    g_emits: self.g_emits,
+                    depth: self.depth,
+                    sky_spec0: self.sky.spec0,
+                    sky_s: self.sky.s,
+                    sm_near: self.shadow_near,
+                    sm_far: self.shadow_far,
+                    cmp: self.cmp,
+                    rad0: self.rad.rad0,
+                    rad1: self.rad.rad1,
+                    rad_s: self.rad.s,
+                    emitters: self.rad.emitters.items(),
+                    tile_masks: self.rad.tile_masks.items(),
+                    tiles_x: self.rad.tiles_x,
+                    full_w: width,
+                    full_h: height_px,
+                ),
+                vertices: 3,
+            )
+            dp.end()
+        }
+
+        // Pass 2c: Half-res (`W/2 × H/2`) 4-cone diffuse GI + real-time SSR + micro-contact shadows.
+        label("mesh_indirect")
+        let ip = begin_pass2(mut self.gi_diff, mut self.gi_spec, keep: false)
+        draw(
+            ip,
+            cover,
+            indirect_half_fs.bind(
+                v: v,
+                rad_grid: self.rad.grid,
+                sky: sky,
+                hdr_direct: self.hdr_direct,
+                g_normal: self.g_normal,
+                g_albedo: self.g_albedo,
+                g_emits: self.g_emits,
+                depth: self.depth,
+                bg_s: self.bg_s,
+                sky_diff: self.sky.diff,
+                sky_spec0: self.sky.spec0,
+                sky_spec1: self.sky.spec1,
+                sky_spec2: self.sky.spec2,
+                sky_s: self.sky.s,
+                rad0: self.rad.rad0,
+                rad1: self.rad.rad1,
+                rad2: self.rad.rad2,
+                rad_s: self.rad.s,
+                full_w: width,
+                full_h: height_px,
+            ),
+            vertices: 3,
+        )
+        ip.end()
+
+        // Pass 2d: Full-res depth+normal bilateral upsample + exact 4× MSAA silhouette sky blend.
+        label("mesh_combine")
+        let cp = begin_pass(mut self.hdr_colour, keep: false)
+        draw(
+            cp,
+            cover,
+            combine_indirect_fs.bind(
+                v: v,
+                sky: sky,
+                hdr_direct: self.hdr_direct,
+                g_normal: self.g_normal,
+                g_albedo: self.g_albedo,
+                g_emits: self.g_emits,
+                gi_diff: self.gi_diff,
+                gi_spec: self.gi_spec,
+                sky_diff: self.sky.diff,
+                sky_spec0: self.sky.spec0,
+                sky_s: self.sky.s,
+                full_w: width,
+                full_h: height_px,
+            ),
+            vertices: 3,
+        )
+        cp.end()
+    }
+
     /// Renders `world` into `self.drawn` (`colour`, `place`, `sun`) without presenting (for
-    /// judging against `Reference`).
+    /// judging against `Reference`), executing the exact same pipeline as `draw_scene`.
     pub fn drawn_only<W: World + MeshWorld, S: Sky, L: Look>(
         mut self,
         world: W,
@@ -972,54 +1385,10 @@ impl MeshSight {
         width: u32,
         height: u32,
     ) {
-        let (nb, v, _sv_near, sv_far) = self.prepare_and_shadow(world, NoSwarm {}, sky, eye, width, height, 0)
-
-        label("mesh_eye")
-        let ep: MsaaDepthPass3<Rgba16Float, Rgba32Float, R8> = begin_pass3_msaa_with_depth(
-            mut self.hdr_colour,
-            mut self.drawn.place,
-            mut self.drawn.sun,
-            mut self.depth,
-            clear: vec4(0.0, 0.0, 0.0, 65000.0),
-            clear_depth: 0.0,
+        let (nb, v, sv_near, sv_far) = self.prepare_and_shadow(world, NoSwarm {}, sky, eye, width, height, 0)
+        self.render_opaque_and_indirect(
+            nb, NoHeight {}, NoSwarm {}, sky, v, sv_near, sv_far, width, height, write_judge: true,
         )
-        for i in 0..nb {
-            draw(
-                ep,
-                mesh_vs.bind(verts: self.batches[i].verts.items(), v: v),
-                mesh_judge_fs.bind(
-                    v: v,
-                    sv: sv_far,
-                    rad_grid: self.rad.grid,
-                    sky: sky,
-                    sky_diff: self.sky.diff,
-                    sky_spec0: self.sky.spec0,
-                    sky_spec1: self.sky.spec1,
-                    sky_spec2: self.sky.spec2,
-                    sky_s: self.sky.s,
-                    shadow_map: self.shadow_far,
-                    cmp: self.cmp,
-                    rad0: self.rad.rad0,
-                    rad1: self.rad.rad1,
-                    rad2: self.rad.rad2,
-                    rad_s: self.rad.s,
-                    emitters: self.rad.emitters.items(),
-                    emitter_count: self.rad.emitters.count(),
-                ),
-                indices: self.batches[i].indices,
-                indirect: self.batches[i].draw_args,
-                cull: Cull::Back,
-                depth: Depth { compare: Compare::Greater, write: true },
-            )
-        }
-        draw(
-            ep,
-            cover,
-            sky_judge_fs.bind(v: v, sky: sky),
-            vertices: 3,
-            depth: Depth { compare: Compare::Equal, write: false },
-        )
-        ep.end()
 
         label("mesh_tone")
         let tp = begin_pass(mut self.drawn.colour, keep: false)
@@ -1042,11 +1411,15 @@ impl MeshSight {
         )
         tp.end()
         self.drawn.placed = true
+        for i in 0..nb {
+            self.batches[i].maybe_queue_poll()
+        }
     }
 
     /// Renders a complete scene (`world` solids, `height` clipmap, `medium` froxels, and `swarm`
-    /// field-colliding GPU grains) through ONE depth buffer, ONE light store, half-res bilateral
-    /// GI + SSR + contact shadows, unified refraction, optical HDR bloom, and ONE `Look::tone` pass.
+    /// field-colliding GPU grains) through ONE depth buffer, ONE light store, 4× MSAA G-buffer +
+    /// pixel-rate deferred direct lighting + tiled emitters, half-res bilateral GI + SSR + contact
+    /// shadows, unified refraction, optical HDR bloom, and ONE `Look::tone` pass.
     pub fn draw_scene<W: World + MeshWorld, H: Height, Med: Medium, Sw: Swarm, S: Sky, L: Look>(
         mut self,
         world: W,
@@ -1062,153 +1435,16 @@ impl MeshSight {
         let (nb, v, sv_near, sv_far) = self.prepare_and_shadow(world, swarm, sky, eye, width, height_px, self.frame)
         self.frame += 1
 
-        // Pass 2: Lean 4× hardware MSAA opaque direct HDR + compact `Rgba8` G-buffer pass.
-        label("mesh_eye")
-        let ep: MsaaDepthPass3<Rgba16Float, Rgba8, Rgba8> = begin_pass3_msaa_with_depth(
-            mut self.hdr_direct,
-            mut self.g_normal,
-            mut self.g_albedo,
-            mut self.depth,
-            clear: vec4(0.0, 0.0, 0.0, 65000.0),
-            clear_depth: 0.0,
+        self.render_opaque_and_indirect(
+            nb, height, swarm, sky, v, sv_near, sv_far, width, height_px, write_judge: false,
         )
-        for i in 0..nb {
-            draw(
-                ep,
-                mesh_vs.bind(verts: self.batches[i].verts.items(), v: v),
-                mesh_direct_fs.bind(
-                    v: v,
-                    sv_near: sv_near,
-                    sv_far: sv_far,
-                    rad_grid: self.rad.grid,
-                    sky: sky,
-                    sm_near: self.shadow_near,
-                    sm_far: self.shadow_far,
-                    cmp: self.cmp,
-                    rad0: self.rad.rad0,
-                    rad1: self.rad.rad1,
-                    rad_s: self.rad.s,
-                    emitters: self.rad.emitters.items(),
-                    emitter_count: self.rad.emitters.count(),
-                ),
-                indices: self.batches[i].indices,
-                indirect: self.batches[i].draw_args,
-                cull: Cull::Back,
-                depth: Depth { compare: Compare::Greater, write: true },
-            )
-        }
-        if height.active() {
-            draw(
-                ep,
-                height_vs.bind(height: height, v: v, trans_pass: 0),
-                mesh_direct_fs.bind(
-                    v: v,
-                    sv_near: sv_near,
-                    sv_far: sv_far,
-                    rad_grid: self.rad.grid,
-                    sky: sky,
-                    sm_near: self.shadow_near,
-                    sm_far: self.shadow_far,
-                    cmp: self.cmp,
-                    rad0: self.rad.rad0,
-                    rad1: self.rad.rad1,
-                    rad_s: self.rad.s,
-                    emitters: self.rad.emitters.items(),
-                    emitter_count: self.rad.emitters.count(),
-                ),
-                vertices: CLIP_VERTS,
-                instances: CLIP_RINGS,
-                cull: Cull::Back,
-                depth: Depth { compare: Compare::Greater, write: true },
-            )
-        }
-        if self.swarm.count > 0 {
-            draw(
-                ep,
-                swarm_vs.bind(swarm: swarm, grains: self.swarm.front(), v: v),
-                swarm_fs.bind(
-                    v: v,
-                    sv_far: sv_far,
-                    rad_grid: self.rad.grid,
-                    sky: sky,
-                    sm_far: self.shadow_far,
-                    cmp: self.cmp,
-                    emitters: self.rad.emitters.items(),
-                    emitter_count: self.rad.emitters.count(),
-                ),
-                vertices: 6,
-                instances: self.swarm.count,
-                depth: Depth { compare: Compare::Greater, write: true },
-            )
-        }
-        draw(
-            ep,
-            cover,
-            sky_direct_fs.bind(v: v, sky: sky, sky_spec0: self.sky.spec0, sky_s: self.sky.s),
-            vertices: 3,
-            depth: Depth { compare: Compare::Equal, write: false },
-        )
-        ep.end()
 
-        // Pass 2b: Half-res (`W/2 × H/2`) 4-cone diffuse GI + real-time SSR + micro-contact shadows.
-        label("mesh_indirect")
-        let ip = begin_pass2(mut self.gi_diff, mut self.gi_spec, keep: false)
-        draw(
-            ip,
-            cover,
-            indirect_half_fs.bind(
-                v: v,
-                rad_grid: self.rad.grid,
-                sky: sky,
-                hdr_direct: self.hdr_direct,
-                g_normal: self.g_normal,
-                g_albedo: self.g_albedo,
-                depth: self.depth,
-                bg_s: self.bg_s,
-                sky_diff: self.sky.diff,
-                sky_spec0: self.sky.spec0,
-                sky_spec1: self.sky.spec1,
-                sky_spec2: self.sky.spec2,
-                sky_s: self.sky.s,
-                rad0: self.rad.rad0,
-                rad1: self.rad.rad1,
-                rad2: self.rad.rad2,
-                rad_s: self.rad.s,
-                full_w: width,
-                full_h: height_px,
-            ),
-            vertices: 3,
-        )
-        ip.end()
-
-        // Pass 2c: Full-res depth+normal bilateral upsample & opaque HDR resolve.
-        label("mesh_combine")
-        let cp = begin_pass(mut self.hdr_colour, keep: false)
-        draw(
-            cp,
-            cover,
-            combine_indirect_fs.bind(
-                v: v,
-                sky: sky,
-                hdr_direct: self.hdr_direct,
-                g_normal: self.g_normal,
-                g_albedo: self.g_albedo,
-                gi_diff: self.gi_diff,
-                gi_spec: self.gi_spec,
-                sky_diff: self.sky.diff,
-                sky_s: self.sky.s,
-                full_w: width,
-                full_h: height_px,
-            ),
-            vertices: 3,
-        )
-        cp.end()
-
-        // Pass 2d: Unified refractive / transmissive pass (glass, water, crystal, ice) with SSR.
+        // Pass 2e: Unified refractive / transmissive pass (glass, water, crystal, ice) with SSR.
         // Skipped completely (0.0 ms) when no heightfield or batch contains transmissive triangles.
-        var any_trans = height.active()
+        var any_trans = height.active() && height.has_transmissive()
         for i in 0..nb {
-            if self.batches[i].poll_trans() {
+            self.batches[i].finish_poll()
+            if self.batches[i].has_trans {
                 any_trans = true
             }
         }
@@ -1222,9 +1458,43 @@ impl MeshSight {
                 keep_depth: true,
             )
             for i in 0..nb {
+                if self.batches[i].has_trans {
+                    draw(
+                        rp,
+                        mesh_vs.bind(verts: self.batches[i].verts.items(), xforms: self.batches[i].xforms.items(), v: v),
+                        mesh_trans_fs.bind(
+                            v: v,
+                            sv_far: sv_far,
+                            rad_grid: self.rad.grid,
+                            sky: sky,
+                            sky_diff: self.sky.diff,
+                            sky_spec0: self.sky.spec0,
+                            sky_spec1: self.sky.spec1,
+                            sky_spec2: self.sky.spec2,
+                            sky_s: self.sky.s,
+                            sm_far: self.shadow_far,
+                            cmp: self.cmp,
+                            rad0: self.rad.rad0,
+                            rad1: self.rad.rad1,
+                            rad2: self.rad.rad2,
+                            rad_s: self.rad.s,
+                            emitters: self.rad.emitters.items(),
+                            tile_masks: self.rad.tile_masks.items(),
+                            tiles_x: self.rad.tiles_x,
+                            hdr_bg: self.hdr_bg,
+                            bg_s: self.bg_s,
+                        ),
+                        indices: self.batches[i].trans_indices,
+                        indirect: self.batches[i].trans_draw_args,
+                        cull: Cull::Back,
+                        depth: Depth { compare: Compare::Greater, write: true },
+                    )
+                }
+            }
+            if height.active() && height.has_transmissive() {
                 draw(
                     rp,
-                    mesh_vs.bind(verts: self.batches[i].verts.items(), v: v),
+                    height_vs.bind(height: height, v: v, base_level: 0, trans_pass: 1),
                     mesh_trans_fs.bind(
                         v: v,
                         sv_far: sv_far,
@@ -1242,20 +1512,20 @@ impl MeshSight {
                         rad2: self.rad.rad2,
                         rad_s: self.rad.s,
                         emitters: self.rad.emitters.items(),
-                        emitter_count: self.rad.emitters.count(),
+                        tile_masks: self.rad.tile_masks.items(),
+                        tiles_x: self.rad.tiles_x,
                         hdr_bg: self.hdr_bg,
                         bg_s: self.bg_s,
                     ),
-                    indices: self.batches[i].trans_indices,
-                    indirect: self.batches[i].trans_draw_args,
+                    indices: self.clipmap.inner_indices,
+                    index_count: self.clipmap.inner_count,
+                    instances: 1,
                     cull: Cull::Back,
                     depth: Depth { compare: Compare::Greater, write: true },
                 )
-            }
-            if height.active() {
                 draw(
                     rp,
-                    height_vs.bind(height: height, v: v, trans_pass: 1),
+                    height_vs.bind(height: height, v: v, base_level: 1, trans_pass: 1),
                     mesh_trans_fs.bind(
                         v: v,
                         sv_far: sv_far,
@@ -1273,12 +1543,14 @@ impl MeshSight {
                         rad2: self.rad.rad2,
                         rad_s: self.rad.s,
                         emitters: self.rad.emitters.items(),
-                        emitter_count: self.rad.emitters.count(),
+                        tile_masks: self.rad.tile_masks.items(),
+                        tiles_x: self.rad.tiles_x,
                         hdr_bg: self.hdr_bg,
                         bg_s: self.bg_s,
                     ),
-                    vertices: CLIP_VERTS,
-                    instances: CLIP_RINGS,
+                    indices: self.clipmap.outer_indices,
+                    index_count: self.clipmap.outer_count,
+                    instances: CLIP_RINGS - 1,
                     cull: Cull::Back,
                     depth: Depth { compare: Compare::Greater, write: true },
                 )
@@ -1334,6 +1606,9 @@ impl MeshSight {
         tp.end()
         self.drawn.placed = false
         show(self.drawn.colour)
+        for i in 0..nb {
+            self.batches[i].maybe_queue_poll()
+        }
     }
 
     /// Renders `world` (`Surface`s only) into `self.drawn` and presents it to the screen.

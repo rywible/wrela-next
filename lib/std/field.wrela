@@ -18,7 +18,7 @@ use std::collections::Vec
 use std::derive::{Box3, Interval, affine, gradient, interval, reads_only_input, tape, value_and_gradient}
 use std::stage::Tape
 use std::quat::Quat
-use std::hash::{StateHash, pcg, state_hash}
+use std::hash::{Hasher, StateHash, pcg, state_hash}
 use std::mem::debug_build
 use std::gpu::{R32Float, Texture3dHandle}
 
@@ -268,6 +268,158 @@ pub trait Surface: Copy + GpuData {
         let r = l * stretch * 0.5 * length(over.hi - over.lo)
         let e = r * 1.0e-5 + abs(d) * 1.0e-6 + 1.0e-6
         Pruned { live, range: Interval { lo: max(x.lo, d - r - e), hi: min(x.hi, d + r + e) } }
+    }
+    /// A rigid similarity transform `(R * s, t)` mapping this surface's local frame into world
+    /// space when the surface is built from outer rigid `translate` / `rotate` / `scale` warps.
+    /// Defaults to the identity transform.
+    fn rigid_frame(self) -> Rigid {
+        Rigid::identity()
+    }
+
+    /// A hash of this surface's geometry in its local frame (independent of outer rigid warps),
+    /// or `None` when the surface cannot be factored into a local shape plus `rigid_frame()`.
+    fn rigid_shape_hash(self) -> Option<u64> {
+        None
+    }
+}
+
+/// A 3D rigid similarity transform (`world(p) = s * R * p + t`, `s > 0`, `R` orthonormal) stored
+/// as three `vec4` rows of the affine matrix plus `meta = (s, active_flag, 0, 0)` so vertex and
+/// compute shaders apply points and normals with 3 dot products.
+pub struct Rigid: Copy + GpuData + Eq + StateHash {
+    pub row0: vec4,
+    pub row1: vec4,
+    pub row2: vec4,
+    pub meta: vec4,
+}
+
+impl Rigid {
+    /// Identity transform (`active = 0.0`, indicating no outer rigid warp).
+    pub fn identity() -> Rigid {
+        Rigid {
+            row0: vec4(1.0, 0.0, 0.0, 0.0),
+            row1: vec4(0.0, 1.0, 0.0, 0.0),
+            row2: vec4(0.0, 0.0, 1.0, 0.0),
+            meta: vec4(1.0, 0.0, 0.0, 0.0),
+        }
+    }
+
+    /// Pure translation `world(p) = p + by`.
+    pub fn translation(by: vec3) -> Rigid {
+        Rigid {
+            row0: vec4(1.0, 0.0, 0.0, by.x),
+            row1: vec4(0.0, 1.0, 0.0, by.y),
+            row2: vec4(0.0, 0.0, 1.0, by.z),
+            meta: vec4(1.0, 1.0, 0.0, 0.0),
+        }
+    }
+
+    /// Pure rotation from `Turn::to_local` (`local(p) = to_local * p`, so `world(q) = to_local^T * q`,
+    /// whose rows are the columns of `to_local`).
+    pub fn rotation(to_local: mat3) -> Rigid {
+        Rigid {
+            row0: vec4(to_local[0], 0.0),
+            row1: vec4(to_local[1], 0.0),
+            row2: vec4(to_local[2], 0.0),
+            meta: vec4(1.0, 1.0, 0.0, 0.0),
+        }
+    }
+
+    /// Pure positive uniform scale `world(p) = s * p`.
+    pub fn uniform_scale(s: f32) -> Rigid {
+        Rigid {
+            row0: vec4(s, 0.0, 0.0, 0.0),
+            row1: vec4(0.0, s, 0.0, 0.0),
+            row2: vec4(0.0, 0.0, s, 0.0),
+            meta: vec4(s, 1.0, 0.0, 0.0),
+        }
+    }
+
+    /// Whether this transform came from at least one rigid warp (`translate`, `rotate`, `scale`).
+    pub fn is_rigid(self) -> bool {
+        self.meta.y > 0.5
+    }
+
+    /// Positive uniform scale factor.
+    pub fn scale_factor(self) -> f32 {
+        self.meta.x
+    }
+
+    /// Maps local point `p` to world space (`M * p + t`).
+    pub fn apply_point(self, p: vec3) -> vec3 {
+        vec3(
+            dot(self.row0.xyz, p) + self.row0.w,
+            dot(self.row1.xyz, p) + self.row1.w,
+            dot(self.row2.xyz, p) + self.row2.w,
+        )
+    }
+
+    /// Maps local unit normal `n` to world space (uniform positive scale preserves normal direction).
+    pub fn apply_normal(self, n: vec3) -> vec3 {
+        let v = vec3(
+            dot(self.row0.xyz, n),
+            dot(self.row1.xyz, n),
+            dot(self.row2.xyz, n),
+        )
+        let l2 = dot(v, v)
+        if l2 > 1.0e-12 { v * (1.0 / sqrt(l2)) } else { n }
+    }
+
+    /// Composes `self(inner(p))`.
+    pub fn compose(self, inner: Rigid) -> Rigid {
+        let c0 = vec3(inner.row0.x, inner.row1.x, inner.row2.x)
+        let c1 = vec3(inner.row0.y, inner.row1.y, inner.row2.y)
+        let c2 = vec3(inner.row0.z, inner.row1.z, inner.row2.z)
+        let t = vec3(inner.row0.w, inner.row1.w, inner.row2.w)
+        let nt = self.apply_point(t)
+        Rigid {
+            row0: vec4(dot(self.row0.xyz, c0), dot(self.row0.xyz, c1), dot(self.row0.xyz, c2), nt.x),
+            row1: vec4(dot(self.row1.xyz, c0), dot(self.row1.xyz, c1), dot(self.row1.xyz, c2), nt.y),
+            row2: vec4(dot(self.row2.xyz, c0), dot(self.row2.xyz, c1), dot(self.row2.xyz, c2), nt.z),
+            meta: vec4(self.meta.x * inner.meta.x, max(self.meta.y, inner.meta.y), 0.0, 0.0),
+        }
+    }
+
+    /// Exact inverse of `self` (`M^{-1} = (1 / s²) * M^T`, `t^{-1} = -M^{-1} * t`).
+    pub fn inverse(self) -> Rigid {
+        let s = max(self.meta.x, 1.0e-6)
+        let inv_s2 = 1.0 / (s * s)
+        let r0 = vec3(self.row0.x, self.row1.x, self.row2.x) * inv_s2
+        let r1 = vec3(self.row0.y, self.row1.y, self.row2.y) * inv_s2
+        let r2 = vec3(self.row0.z, self.row1.z, self.row2.z) * inv_s2
+        let t = vec3(self.row0.w, self.row1.w, self.row2.w)
+        Rigid {
+            row0: vec4(r0, -dot(r0, t)),
+            row1: vec4(r1, -dot(r1, t)),
+            row2: vec4(r2, -dot(r2, t)),
+            meta: vec4(1.0 / s, self.meta.y, 0.0, 0.0),
+        }
+    }
+
+    /// Delta transform mapping vertices extracted at pose `extracted` into this pose (`self * inv(extracted)`).
+    pub fn delta_from(self, extracted: Rigid) -> Rigid {
+        self.compose(extracted.inverse())
+    }
+}
+
+/// Combines two child surfaces' local shape hashes (and their internal relative transforms) with
+/// an operator tag `tag` and blend width `k`.
+fn pair_shape_hash<A: Surface, B: Surface>(tag: u32, a: A, b: B, k: f32) -> Option<u64> {
+    match a.rigid_shape_hash() {
+        Some(ha) => match b.rigid_shape_hash() {
+            Some(hb) => {
+                var h = Hasher::new()
+                std::hash::StateHash::state_hash(tag, mut h)
+                std::hash::StateHash::state_hash(ha, mut h)
+                std::hash::StateHash::state_hash(a.rigid_frame(), mut h)
+                std::hash::StateHash::state_hash(hb, mut h)
+                std::hash::StateHash::state_hash(b.rigid_frame(), mut h)
+                std::hash::StateHash::state_hash(k, mut h)
+                Some(h.finish())
+            },
+            None => None,
+        },
+        None => None,
     }
 }
 
@@ -877,6 +1029,10 @@ impl Surface for Sphere {
     fn lipschitz(self, near: f32) -> f32 {
         1.0
     }
+
+    fn rigid_shape_hash(self) -> Option<u64> {
+        Some(state_hash(self))
+    }
 }
 
 /// A surface whose distance is a texture's data (language.md §20.3): a 3D texture of distances,
@@ -1030,6 +1186,10 @@ impl Surface for Ellipsoid {
         let r = hi / lo
         (first + e * r * r / (1.0 - e)) * 1.001
     }
+
+    fn rigid_shape_hash(self) -> Option<u64> {
+        Some(state_hash(self))
+    }
 }
 
 /// An ellipsoid whose distance stays well behaved: outside it's `Ellipsoid`'s, which is near
@@ -1068,6 +1228,10 @@ impl Surface for Oval {
         let e = max(near, 0.0) / lo
         let r = hi / lo
         max(1.0, 2.0 - 1.0 / (1.0 + e) + e * r * r / (1.0 + e)) * 1.001
+    }
+
+    fn rigid_shape_hash(self) -> Option<u64> {
+        Some(state_hash(self))
     }
 }
 
@@ -1118,6 +1282,10 @@ impl<const N: u32> Surface for Tube<N> {
     /// A union of exact distances: 1.
     fn lipschitz(self, near: f32) -> f32 {
         1.0
+    }
+
+    fn rigid_shape_hash(self) -> Option<u64> {
+        Some(state_hash(self))
     }
 }
 
@@ -1177,6 +1345,10 @@ impl Surface for RoundCone {
     fn lipschitz(self, near: f32) -> f32 {
         1.0
     }
+
+    fn rigid_shape_hash(self) -> Option<u64> {
+        Some(state_hash(self))
+    }
 }
 
 /// A box centred at the origin, with half-extents `half`. Exact.
@@ -1206,6 +1378,10 @@ impl Surface for Cuboid {
     /// Exact.
     fn lipschitz(self, near: f32) -> f32 {
         1.0
+    }
+
+    fn rigid_shape_hash(self) -> Option<u64> {
+        Some(state_hash(self))
     }
 }
 
@@ -1445,6 +1621,10 @@ impl<A: Surface, B: Surface> Surface for Union<A, B> {
     fn lipschitz(self, near: f32) -> f32 {
         max(self.a.lipschitz(near), self.b.lipschitz(near))
     }
+
+    fn rigid_shape_hash(self) -> Option<u64> {
+        pair_shape_hash(1, self.a, self.b, 0.0)
+    }
 }
 
 /// Two surfaces joined by a rounded seam: `a.smooth_union(b, k)`.
@@ -1517,6 +1697,10 @@ impl<A: Surface, B: Surface> Surface for SmoothUnion<A, B> {
     fn lipschitz(self, near: f32) -> f32 {
         let scope = near + 1.25 * max(self.k, 0.0)
         max(self.a.lipschitz(scope), self.b.lipschitz(scope))
+    }
+
+    fn rigid_shape_hash(self) -> Option<u64> {
+        pair_shape_hash(2, self.a, self.b, self.k)
     }
 }
 
@@ -1876,6 +2060,10 @@ impl<A: Surface, B: Surface> Surface for Intersect<A, B> {
     fn lipschitz(self, near: f32) -> f32 {
         max(self.a.lipschitz(near), self.b.lipschitz(near))
     }
+
+    fn rigid_shape_hash(self) -> Option<u64> {
+        pair_shape_hash(3, self.a, self.b, 0.0)
+    }
 }
 
 /// How a warp takes a point into its surface's own space (`translate`, `rotate`, `scale`), and
@@ -1911,6 +2099,12 @@ pub trait PointMap: Copy + GpuData {
     /// A box holding `local(p)` for every `p` in `b`: what a join's range is asked over in the
     /// surface's own space (`Surface::interval_near`). Every map states it.
     fn box_in(self, b: Box3) -> Box3
+
+    /// If this map is an orientation-preserving rigid similarity (`s > 0`), its local-to-world
+    /// matrix; `None` otherwise.
+    fn rigid(self) -> Option<Rigid> {
+        None
+    }
 }
 
 /// A surface whose points are moved before it's asked about them: `s.translate(by)`,
@@ -1983,6 +2177,20 @@ impl<S: Surface, M: PointMap> Surface for Warp<S, M> {
     fn lipschitz(self, near: f32) -> f32 {
         self.inner.lipschitz(self.map.length_in(near))
     }
+
+    fn rigid_frame(self) -> Rigid {
+        match self.map.rigid() {
+            Some(outer) => outer.compose(self.inner.rigid_frame()),
+            None => Rigid::identity(),
+        }
+    }
+
+    fn rigid_shape_hash(self) -> Option<u64> {
+        match self.map.rigid() {
+            Some(_) => self.inner.rigid_shape_hash(),
+            None => None,
+        }
+    }
 }
 
 /// A surface moved by `by`: `s.translate(by)`.
@@ -2017,6 +2225,10 @@ impl PointMap for Shift {
     /// Moved: `local` is monotone in each axis, so the corners' images hold the rest.
     fn box_in(self, b: Box3) -> Box3 {
         Box3 { lo: self.local(b.lo), hi: self.local(b.hi) }
+    }
+
+    fn rigid(self) -> Option<Rigid> {
+        Some(Rigid::translation(self.by))
     }
 }
 
@@ -2055,6 +2267,10 @@ impl PointMap for Turn {
         let size = abs(m[0]) * (abs(o.x) + h.x) + abs(m[1]) * (abs(o.y) + h.y) + abs(m[2]) * (abs(o.z) + h.z)
         let e = size * 2.0e-6 + vec3(1.0e-30)
         Box3 { lo: c - w - e, hi: c + w + e }
+    }
+
+    fn rigid(self) -> Option<Rigid> {
+        Some(Rigid::rotation(self.to_local))
     }
 }
 
@@ -2097,6 +2313,14 @@ impl PointMap for Size {
     fn box_in(self, b: Box3) -> Box3 {
         let (u, v) = (self.local(b.lo), self.local(b.hi))
         Box3 { lo: min(u, v), hi: max(u, v) }
+    }
+
+    fn rigid(self) -> Option<Rigid> {
+        if self.by > 0.0 {
+            Some(Rigid::uniform_scale(self.by))
+        } else {
+            None
+        }
     }
 }
 
@@ -2249,6 +2473,10 @@ impl<A: Surface, B: Surface> Surface for SmoothSubtract<A, B> {
         let scope = near + 1.25 * max(self.k, 0.0)
         max(self.a.lipschitz(scope), self.b.lipschitz(scope))
     }
+
+    fn rigid_shape_hash(self) -> Option<u64> {
+        pair_shape_hash(4, self.a, self.b, self.k)
+    }
 }
 
 /// What two surfaces hold in common, rounded: `a.smooth_intersect(b, k)`.
@@ -2306,6 +2534,10 @@ impl<A: Surface, B: Surface> Surface for SmoothIntersect<A, B> {
     fn lipschitz(self, near: f32) -> f32 {
         let scope = near + 1.25 * max(self.k, 0.0)
         max(self.a.lipschitz(scope), self.b.lipschitz(scope))
+    }
+
+    fn rigid_shape_hash(self) -> Option<u64> {
+        pair_shape_hash(5, self.a, self.b, self.k)
     }
 }
 
@@ -2868,6 +3100,17 @@ pub trait Field<C>: Surface {
     fn distance_and_channels(self, p: vec3) -> (f32, C) {
         (self.distance(p), self.channels(p))
     }
+
+    /// True when `channels(p)` is independent of `p` (e.g. `With<S, C>` or a rigid warp of one).
+    fn has_constant_channels(self) -> bool {
+        false
+    }
+
+    /// True when `channels(p)` depends only on local coordinates in `rigid_frame()`'s local space
+    /// and is completely determined by `rigid_shape_hash()`.
+    fn has_local_channels(self) -> bool {
+        false
+    }
 }
 
 /// How channels mix where surfaces blend. A channel struct declares it and gets it field by
@@ -3013,6 +3256,14 @@ impl<S: Surface, C: Copy + GpuData> Surface for With<S, C> {
     fn interval_near(self, b: Box3) -> Interval {
         self.inner.interval_near(b)
     }
+
+    fn rigid_frame(self) -> Rigid {
+        self.inner.rigid_frame()
+    }
+
+    fn rigid_shape_hash(self) -> Option<u64> {
+        self.inner.rigid_shape_hash()
+    }
 }
 
 impl<S: Surface, C: Copy + GpuData> Field<C> for With<S, C> {
@@ -3022,6 +3273,10 @@ impl<S: Surface, C: Copy + GpuData> Field<C> for With<S, C> {
 
     fn distance_and_channels(self, p: vec3) -> (f32, C) {
         (self.inner.distance(p), self.value)
+    }
+
+    fn has_constant_channels(self) -> bool {
+        true
     }
 }
 
@@ -3162,6 +3417,14 @@ impl<C, S: Field<C>, M: PointMap> Field<C> for Warp<S, M> {
     fn distance_and_channels(self, p: vec3) -> (f32, C) {
         let (d, c) = self.inner.distance_and_channels(self.map.local(p))
         (self.map.distance_out(d), c)
+    }
+
+    fn has_constant_channels(self) -> bool {
+        self.inner.has_constant_channels()
+    }
+
+    fn has_local_channels(self) -> bool {
+        self.inner.has_local_channels()
     }
 }
 

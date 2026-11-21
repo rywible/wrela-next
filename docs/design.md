@@ -389,7 +389,7 @@ requiring an author to write a mesh.
 - **SCENE 4 (stage, 320×180, 4× MSAA):** **0 holes**, 98.17% of surfaces within 0.05 px, outline **0.151 px** (beats the 0.184 px reference floor).
 - **SCENE 3 (close-up creature + 1 cm wand, 480×270):** **0 holes**, **197 of 199 thin pixels (< 2.5 cm) kept (99.0%)**, 99.8% of surfaces within 0.5 px, lit mean 0.50/255 (reference floor 0.54/255).
 
-**One way to draw (completed):** `MeshSight` is now the sole renderer in `lib/engine/` and `game/scenes/main.wrela`. Legacy `Sight` (`lib/engine/picture/pixels.wrela`, `lib/engine/matter/{cells,asked,cost}.wrela`, `lib/engine/light/{moving,store}.wrela`, `lib/engine/ray/ray.wrela`) has been removed (~5,500 lines deleted). `lib/std/field.wrela`'s `Meets`/`Pass`/`StandIn` remain covered by `toolchain/tests/`.
+**One way to draw (completed):** `MeshSight` is now the sole renderer in `lib/engine/` and `game/scenes/main.wrela`. Legacy `Sight` (`lib/engine/picture/pixels.wrela`, `lib/engine/matter/{cells,asked,cost}.wrela`, `lib/engine/light/{moving,store}.wrela`, `lib/engine/ray/ray.wrela`) and `lib/std/field.wrela`'s unused `Meets`/`Pass`/`StandIn` helpers have been removed.
 
 ## Swarms, glowing matter and the arena (2026-11-20: built and measured on both machines)
 
@@ -467,6 +467,63 @@ ranges are two runs each. SCENE 10 is not at 60 fps on either machine: 43 fps on
 Khronos validation layer, no messages); SCENE 0 judge identical to the previous commit's on both
 machines; validation clean on SCENE 4, 8 (256 creatures), 9 and 10; `tools/layers` and
 `tools/check` pass.
+
+## Pixel-rate deferred direct, static radiance caching and rigid-transform instancing (2026-11-20)
+
+Five engine-wide bottlenecks were eliminated in `lib/std/field.wrela` and `lib/engine/mesh/`:
+
+1. **Shared extraction scratch, lazy bucketed output buffers, and frame-end stat polling**
+   (`lib/engine/mesh/extract.wrela`): temporary extraction buffers (`active`, `corners`,
+   `cell_verts`, `creases`, `surf`, `grids`, indirect args) live once in `ExtractScratch` per
+   `MeshSight` instead of per batch; each `MeshBatch` allocates only its output vertex/index
+   buffers lazily in power-of-two brick buckets (`128..8192`); `refine_creases` uses `ab.live`
+   part pruning; and a single `(opaque, trans, active_bricks)` stats readback is queued at frame
+   end (eliminating mid-frame GPU submission flushes) so empty opaque or transmissive batches skip
+   their draw calls automatically.
+2. **Static/dynamic split `RadianceCache` and stride-2 injection** (`lib/engine/mesh/light.wrela`):
+   static batches accumulate once into `static_accum` / `static_emit_accum`, and frames with moving
+   objects GPU-copy the static base and inject only dynamic batches at stride 2; `emit_collect`
+   filters occupied coarse bins in parallel before `emit_compact`. The boundary alignment bug in
+   `skylit` / `sky_spec` (`/(side - 1)` matching `sample_octa`) was also fixed.
+3. **Indexed clipmaps** (`lib/engine/mesh/height.wrela`, `lib/engine/matter/height.wrela`): inner
+   solid and outer hollow index buffers share `65×65` vertices per ring (hitting the post-transform
+   vertex cache), and `Height::has_opaque` / `has_transmissive` skip empty heightfield passes.
+4. **Compact 4× MSAA premultiplied G-buffer + 1× pixel-rate tiled deferred direct lighting**
+   (`lib/engine/mesh/draw.wrela`, `lib/engine/mesh/swarm.wrela`): `mesh_eye` writes a compact
+   16-byte/sample premultiplied 4× MSAA G-buffer (`g_normal: Rgba8`, `g_albedo: Rgba8`,
+   `g_emits: Rgba16Float`) cleared to zero so hardware MSAA resolve yields exact coverage `cov` and
+   uncorrupted normals/materials; `cull_tile_emitters` produces a `16×16` screen-tile `u32`
+   emitter bitmask (up to 32 emitters); `deferred_direct_fs` runs CSM + tiled emitters once per
+   screen pixel using tangent-plane depth reprojection from 4× MSAA Sample 0 (`reconstruct_pixel_dist`);
+   `combine_indirect_fs` blends partial-coverage edges against sky; and `drawn_only` now runs the
+   exact same unified pipeline as `draw_scene` (removing `mesh_judge_fs`, `sky_direct_fs`,
+   `sky_judge_fs`).
+5. **Rigid transform caching, GPU instancing, and curvature-sagitta tessellation**
+   (`lib/std/field.wrela`, `lib/engine/mesh/{extract,draw,light}.wrela`, `game/world/arena.wrela`):
+   outer rigid `Translate`/`Rotate`/`Scale` chains expose `Rigid` transforms and a local
+   `rigid_shape_hash`, so moving rigid fields (`One`) update only a 64-byte transform matrix with
+   zero re-extraction, and homogeneous rigid `Many` batches (such as `glass_barrage`'s 14 shards)
+   extract one template mesh once and draw all visible instances in one GPU-instanced draw call.
+   `cell_for_one` and `cell_for_share` scale smoothly with screen-space radius `sqrt(r / px)` to
+   avoid sub-2-pixel micro-triangles on large smooth close-ups while keeping small features and
+   `steep` noise fields tight.
+
+**Measured on both machines (`tools/bench` interleaved A/B against `a6f6f6d`, 1920×1080, frames 6–15, 3 runs):**
+
+| Scene (1920×1080) | Metric | M4 before → after | Radeon before → after |
+| --- | --- | --- | --- |
+| SCENE 10 (arena) | GPU frame span | 28.37 → **19.39 ms** (-31.7%) | 72.22 → **52.95 ms** (-26.7%) |
+| SCENE 10 (arena) | `--cpu` frame total | 22.55 → **13.80 ms** (-38.8%, 72.5 fps) | 73.31 → **58.64 ms** (-20.0%) |
+| SCENE 10 (`--serial`) | `mesh_extract` | 3.64 → **2.00 ms** (-45.1%) | 7.18 → **3.96 ms** (-44.8%) |
+| SCENE 10 (`--serial`) | `mesh_radiance` | 2.42 → **0.62 ms** (-74.4%) | 3.74 → **1.10 ms** (-70.6%) |
+| SCENE 10 (`--serial`) | `mesh_eye` (+`tiles`+`direct`) | 7.36 → **4.99 ms** (-32.2%) | 22.75 → **21.30 ms** (-6.4%) |
+| SCENE 8 (256 creatures) | `--cpu` frame total | 8.65 → **6.45 ms** (-25.4%, 155 fps) | 33.72 → **28.60 ms** (-15.2%; span 32.37 → **27.48 ms**) |
+
+**Checked:** SCENE 6 72-eye audit **0 holes / 0 extras** on both M4 Metal and Radeon Vulkan (stage
+off > 1 px 378 → 190, creature walking 782 → 172, stack 19066 → 18939/18930; identical state hash
+`6b6d7aad04533a34`, 0 Vulkan validation messages); SCENE 0 judge (`96×54`, 32 looks) **0 holes**,
+outline off **0.152 px** (reference floor 0.143 px), surface error mean **0.024 px** (down from
+0.098 px); `tools/layers` and `tools/check` pass.
 
 ## The layers
 
