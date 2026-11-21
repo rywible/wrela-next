@@ -11,11 +11,11 @@
 
 use matter::sky::{Sky, seen}
 use matter::substance::{ONE_OVER_PI, Substance}
-use mesh::extract::MeshVertex
+use mesh::extract::{MeshVertex, unpack_oct_normal, unpack_thing}
 use mesh::sdf::{SdfGrid, sdf_local_shadow, sdf_soft_shadow, sdf_spec_hit}
 use picture::eye::View
 use picture::screen::luma
-use std::field::Rigid
+use std::field::{Field, Rigid}
 use std::gpu::{
     Address, Append, AppendBuffer, Atomics, ClipPosition, ComparisonSampler, DepthTexture,
     DispatchArgs, Filter, GlobalId, GpuBuffer, GpuSpan, One, R16Float, Rgba16Float, Sampler, Slots,
@@ -738,11 +738,54 @@ pub fn deposit(
     }
 }
 
-/// Injects extracted meshlet vertices (direct sunlit radiance + emissive glow + previous-frame
-/// 1-bounce radiance) into the `64³` atomic accumulation grid AND bins bright emissive vertices
-/// into coarse spatial emitter clusters for crisp dynamic specular + local shadow lighting.
+/// Shared vertex-radiance injection core for 16-byte compact `MeshVertex`: evaluates direct sunlit
+/// radiance + emissive glow + previous-frame 1-bounce radiance from analytical `sub` and deposits
+/// into the `64³` atomic radiance grid and coarse emitter bins.
+fn rad_inject_sample<S: Sky>(
+    wp: vec3,
+    nrm: vec3,
+    sub: Substance,
+    grid: RadGrid,
+    sv: ShadowView,
+    sky: S,
+    sky_table: Texture<Rgba16Float>,
+    sky_s: Sampler,
+    shadow_map: DepthTexture,
+    cmp: ComparisonSampler,
+    prev_rad1: Texture3d<Rgba16Float>,
+    rad_s: Sampler,
+    accum: mut Atomics<u32>,
+    emit_accum: mut Atomics<u32>,
+) {
+    let uvw = (wp - grid.origin) * grid.inv_span
+    if uvw.x < 0.0 || uvw.x >= 1.0 || uvw.y < 0.0 || uvw.y >= 1.0 || uvw.z < 0.0 || uvw.z >= 1.0 {
+        return
+    }
+    let nl2 = dot(nrm, nrm)
+    let normal = if nl2 > 1.0e-12 { nrm * (1.0 / sqrt(nl2)) } else { vec3(0.0, 1.0, 0.0) }
+    let sun = sky.sun()
+    let ndl = max(dot(normal, sun.way), 0.0)
+    let vis = if ndl > 0.0 { sun_shadow(shadow_map, cmp, sv, wp, normal) } else { 0.0 }
+    let direct = sun.light * (ndl * vis)
+
+    let sample_uvw = clamp(((wp + normal * (grid.voxel * 1.5)) - grid.origin) * grid.inv_span, vec3(0.01), vec3(0.99))
+    let prev = prev_rad1.sample_level(rad_s, sample_uvw, 0.0)
+    let sky_est = sky_irradiance(sky_table, sky_s, normal) * (1.0 - clamp(prev.w, 0.0, 0.85))
+    let bounce_prev = prev.xyz * PI * 0.75
+
+    // Attenuate raw emission slightly in the voxel bounce grid because auto-extracted local
+    // emitters deliver crisp direct illumination & specular; keeps multi-bounce GI natural.
+    let emits = sub.emits
+    let emit_peak = max(emits.x, max(emits.y, emits.z))
+    let emit_bounce = if emit_peak > EMIT_THRESH { emits * 0.55 } else { emits }
+    let outgoing = emit_bounce + sub.albedo * ONE_OVER_PI * (direct + sky_est * 0.5 + bounce_prev)
+    deposit(uvw, outgoing, emits, emit_peak, EMIT_THRESH, mut accum, mut emit_accum)
+}
+
+/// Injects one `One<M>` batch's 16-byte compact meshlets into the radiance volume and emitter bins.
 @compute(64)
-fn rad_inject<S: Sky>(
+fn rad_inject_one<M: Field<Substance>, S: Sky>(
+    field: M,
     verts: [MeshVertex],
     vert_count: [u32],
     cap_verts: u32,
@@ -773,33 +816,69 @@ fn rad_inject<S: Sky>(
     }
     let xf = xforms[inst]
     let vert = verts[vi]
-    let wp = xf.apply_point(vert.pos.xyz)
+    let wp = xf.apply_point(vec3(vert.px, vert.py, vert.pz))
     let uvw = (wp - grid.origin) * grid.inv_span
     if uvw.x < 0.0 || uvw.x >= 1.0 || uvw.y < 0.0 || uvw.y >= 1.0 || uvw.z < 0.0 || uvw.z >= 1.0 {
         return
     }
+    let nrm = xf.apply_normal(unpack_oct_normal(vert.packed))
+    let sub = field.channels(wp)
+    rad_inject_sample(
+        wp, nrm, sub, grid, sv, sky, sky_table, sky_s, shadow_map, cmp, prev_rad1, rad_s,
+        mut accum, mut emit_accum,
+    )
+}
 
-    let nrm = xf.apply_normal(vert.normal.xyz)
-    let nl2 = dot(nrm, nrm)
-    let normal = if nl2 > 1.0e-12 { nrm * (1.0 / sqrt(nl2)) } else { vec3(0.0, 1.0, 0.0) }
-    let sun = sky.sun()
-    let ndl = max(dot(normal, sun.way), 0.0)
-    let vis = if ndl > 0.0 { sun_shadow(shadow_map, cmp, sv, wp, normal) } else { 0.0 }
-    let direct = sun.light * (ndl * vis)
-
-    let sample_uvw = clamp(((wp + normal * (grid.voxel * 1.5)) - grid.origin) * grid.inv_span, vec3(0.01), vec3(0.99))
-    let prev = prev_rad1.sample_level(rad_s, sample_uvw, 0.0)
-    let sky_est = sky_irradiance(sky_table, sky_s, normal) * (1.0 - clamp(prev.w, 0.0, 0.85))
-    let bounce_prev = prev.xyz * PI * 0.75
-
-    // Attenuate raw emission slightly in the voxel bounce grid because auto-extracted local
-    // emitters deliver crisp direct illumination & specular; keeps multi-bounce GI natural.
-    let emits = vert.emits.xyz
-    let emit_peak = max(emits.x, max(emits.y, emits.z))
-    let emit_bounce = if emit_peak > EMIT_THRESH { emits * 0.55 } else { emits }
-    let outgoing = emit_bounce + vert.albedo.xyz * ONE_OVER_PI * (direct + sky_est * 0.5 + bounce_prev)
-    // Auto-extract dynamic local emitters from bright glowing meshlets.
-    deposit(uvw, outgoing, emits, emit_peak, EMIT_THRESH, mut accum, mut emit_accum)
+/// Injects one `Many<M, N>` batch's 16-byte compact meshlets into the radiance volume and emitter bins.
+@compute(64)
+fn rad_inject_many<M: Field<Substance>, S: Sky>(
+    fields: [M],
+    n_fields: u32,
+    verts: [MeshVertex],
+    vert_count: [u32],
+    cap_verts: u32,
+    xforms: [Rigid],
+    inst_ids: [u32],
+    is_instanced: u32,
+    inst_count: u32,
+    grid: RadGrid,
+    sv: ShadowView,
+    sky: S,
+    sky_table: Texture<Rgba16Float>,
+    sky_s: Sampler,
+    shadow_map: DepthTexture,
+    cmp: ComparisonSampler,
+    prev_rad1: Texture3d<Rgba16Float>,
+    rad_s: Sampler,
+    accum: mut Atomics<u32>,
+    emit_accum: mut Atomics<u32>,
+    id: GlobalId,
+) {
+    let n = min(vert_count[0], cap_verts)
+    let half_n = (n + 1) / 2
+    if half_n == 0 || inst_count == 0 || n_fields == 0 {
+        return
+    }
+    let inst = id.x / half_n
+    let vi = (id.x - inst * half_n) * 2
+    if inst >= inst_count || vi >= n {
+        return
+    }
+    let xf = xforms[inst]
+    let vert = verts[vi]
+    let wp = xf.apply_point(vec3(vert.px, vert.py, vert.pz))
+    let uvw = (wp - grid.origin) * grid.inv_span
+    if uvw.x < 0.0 || uvw.x >= 1.0 || uvw.y < 0.0 || uvw.y >= 1.0 || uvw.z < 0.0 || uvw.z >= 1.0 {
+        return
+    }
+    let nrm = xf.apply_normal(unpack_oct_normal(vert.packed))
+    let raw_tid = if is_instanced != 0 { inst_ids[inst] } else { unpack_thing(vert.packed) }
+    let tid = min(raw_tid, n_fields - 1)
+    let sub = fields[tid].channels(wp)
+    rad_inject_sample(
+        wp, nrm, sub, grid, sv, sky, sky_table, sky_s, shadow_map, cmp, prev_rad1, rad_s,
+        mut accum, mut emit_accum,
+    )
 }
 
 /// Parallel filter over the `8×4×8 = 256` coarse emitter bins: appends only non-empty bins so
@@ -1422,9 +1501,10 @@ impl RadianceCache {
         dispatch(clear_u32.bind(n: emit_n, buf: mut self.static_emit_accum), over: emit_n)
     }
 
-    /// Injects one static meshlet batch's vertices into the cached static radiance buffers.
-    pub fn inject_static<S: Sky>(
+    /// Injects one `One<M>` meshlet batch into either the cached static buffers or active buffers.
+    pub fn inject_one<M: Field<Substance>, S: Sky>(
         mut self,
+        field: M,
         verts: GpuSpan<MeshVertex>,
         vert_count: GpuSpan<u32>,
         cap_verts: u32,
@@ -1436,6 +1516,7 @@ impl RadianceCache {
         sky_s: Sampler,
         shadow_map: DepthTexture,
         cmp: ComparisonSampler,
+        to_static: bool,
     ) {
         if self.grid.enabled == 0 || cap_verts == 0 || inst_count == 0 {
             return
@@ -1444,28 +1525,89 @@ impl RadianceCache {
             prep_rad_list.bind(count: vert_count, cap: cap_verts, inst_count: inst_count, args: mut self.inject_args),
             over: 1,
         )
+        let groups_most = (((cap_verts + 1) / 2) * inst_count + 63) / 64
+        if to_static {
+            dispatch(
+                rad_inject_one.bind(
+                    field: field, verts: verts, vert_count: vert_count, cap_verts: cap_verts,
+                    xforms: xforms, inst_count: inst_count, grid: self.grid, sv: sv, sky: sky,
+                    sky_table: sky_table, sky_s: sky_s, shadow_map: shadow_map, cmp: cmp,
+                    prev_rad1: self.rad1, rad_s: self.s, accum: mut self.static_accum,
+                    emit_accum: mut self.static_emit_accum,
+                ),
+                groups: self.inject_args,
+                most: groups_most,
+            )
+        } else {
+            dispatch(
+                rad_inject_one.bind(
+                    field: field, verts: verts, vert_count: vert_count, cap_verts: cap_verts,
+                    xforms: xforms, inst_count: inst_count, grid: self.grid, sv: sv, sky: sky,
+                    sky_table: sky_table, sky_s: sky_s, shadow_map: shadow_map, cmp: cmp,
+                    prev_rad1: self.rad1, rad_s: self.s, accum: mut self.accum,
+                    emit_accum: mut self.emit_accum,
+                ),
+                groups: self.inject_args,
+                most: groups_most,
+            )
+        }
+    }
+
+    /// Injects one `Many<M, N>` meshlet batch into either the cached static buffers or active buffers.
+    pub fn inject_many<M: Field<Substance>, S: Sky>(
+        mut self,
+        fields: GpuSpan<M>,
+        n_fields: u32,
+        verts: GpuSpan<MeshVertex>,
+        vert_count: GpuSpan<u32>,
+        cap_verts: u32,
+        xforms: GpuSpan<Rigid>,
+        inst_ids: GpuSpan<u32>,
+        is_instanced: u32,
+        inst_count: u32,
+        sv: ShadowView,
+        sky: S,
+        sky_table: Texture<Rgba16Float>,
+        sky_s: Sampler,
+        shadow_map: DepthTexture,
+        cmp: ComparisonSampler,
+        to_static: bool,
+    ) {
+        if self.grid.enabled == 0 || cap_verts == 0 || inst_count == 0 || n_fields == 0 {
+            return
+        }
         dispatch(
-            rad_inject.bind(
-                verts: verts,
-                vert_count: vert_count,
-                cap_verts: cap_verts,
-                xforms: xforms,
-                inst_count: inst_count,
-                grid: self.grid,
-                sv: sv,
-                sky: sky,
-                sky_table: sky_table,
-                sky_s: sky_s,
-                shadow_map: shadow_map,
-                cmp: cmp,
-                prev_rad1: self.rad1,
-                rad_s: self.s,
-                accum: mut self.static_accum,
-                emit_accum: mut self.static_emit_accum,
-            ),
-            groups: self.inject_args,
-            most: (((cap_verts + 1) / 2) * inst_count + 63) / 64,
+            prep_rad_list.bind(count: vert_count, cap: cap_verts, inst_count: inst_count, args: mut self.inject_args),
+            over: 1,
         )
+        let groups_most = (((cap_verts + 1) / 2) * inst_count + 63) / 64
+        if to_static {
+            dispatch(
+                rad_inject_many.bind(
+                    fields: fields, n_fields: n_fields, verts: verts, vert_count: vert_count,
+                    cap_verts: cap_verts, xforms: xforms, inst_ids: inst_ids,
+                    is_instanced: is_instanced, inst_count: inst_count, grid: self.grid, sv: sv,
+                    sky: sky, sky_table: sky_table, sky_s: sky_s, shadow_map: shadow_map, cmp: cmp,
+                    prev_rad1: self.rad1, rad_s: self.s, accum: mut self.static_accum,
+                    emit_accum: mut self.static_emit_accum,
+                ),
+                groups: self.inject_args,
+                most: groups_most,
+            )
+        } else {
+            dispatch(
+                rad_inject_many.bind(
+                    fields: fields, n_fields: n_fields, verts: verts, vert_count: vert_count,
+                    cap_verts: cap_verts, xforms: xforms, inst_ids: inst_ids,
+                    is_instanced: is_instanced, inst_count: inst_count, grid: self.grid, sv: sv,
+                    sky: sky, sky_table: sky_table, sky_s: sky_s, shadow_map: shadow_map, cmp: cmp,
+                    prev_rad1: self.rad1, rad_s: self.s, accum: mut self.accum,
+                    emit_accum: mut self.emit_accum,
+                ),
+                groups: self.inject_args,
+                most: groups_most,
+            )
+        }
     }
 
     /// Seeds the frame's working radiance buffers from the cached static buffers via fast GPU copy.
@@ -1490,52 +1632,6 @@ impl RadianceCache {
         dispatch(clear_u32.bind(n: emit_n, buf: mut self.emit_accum), over: emit_n)
         self.active_bins.clear()
         self.emitters.clear()
-    }
-
-    /// Injects one dynamic meshlet batch's vertices into the active radiance volume and emitter bins.
-    pub fn inject<S: Sky>(
-        mut self,
-        verts: GpuSpan<MeshVertex>,
-        vert_count: GpuSpan<u32>,
-        cap_verts: u32,
-        xforms: GpuSpan<Rigid>,
-        inst_count: u32,
-        sv: ShadowView,
-        sky: S,
-        sky_table: Texture<Rgba16Float>,
-        sky_s: Sampler,
-        shadow_map: DepthTexture,
-        cmp: ComparisonSampler,
-    ) {
-        if self.grid.enabled == 0 || cap_verts == 0 || inst_count == 0 {
-            return
-        }
-        dispatch(
-            prep_rad_list.bind(count: vert_count, cap: cap_verts, inst_count: inst_count, args: mut self.inject_args),
-            over: 1,
-        )
-        dispatch(
-            rad_inject.bind(
-                verts: verts,
-                vert_count: vert_count,
-                cap_verts: cap_verts,
-                xforms: xforms,
-                inst_count: inst_count,
-                grid: self.grid,
-                sv: sv,
-                sky: sky,
-                sky_table: sky_table,
-                sky_s: sky_s,
-                shadow_map: shadow_map,
-                cmp: cmp,
-                prev_rad1: self.rad1,
-                rad_s: self.s,
-                accum: mut self.accum,
-                emit_accum: mut self.emit_accum,
-            ),
-            groups: self.inject_args,
-            most: (((cap_verts + 1) / 2) * inst_count + 63) / 64,
-        )
     }
 
     /// Resolves accumulated radiance into `rad0` (`64³`), builds the `32³` and `16³` mip chain,

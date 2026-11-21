@@ -45,32 +45,91 @@ const STEEP_LIPSCHITZ: f32 = 1.05
 /// cells can never overflow, so no surface cell is ever dropped.
 const CAP_SURF: u32 = CHUNK_BRICKS * VERTS_BRICK
 
-/// One extracted surface vertex (80 bytes, std430-aligned, zero padding):
-///   `pos`:    `(world_x, world_y, world_z, smooth_flag)` (`1.0` smooth, `0.0` sharp crease)
-///   `normal`: `(nx, ny, nz, roughness)`
-///   `albedo`: `(r, g, b, metallic)`
-///   `emits`:  `(er, eg, eb, ior)`
-///   `optics`: `(transmission, subsurface, coat, 0.0)`
+/// Compact 16-byte extracted surface vertex (std430-aligned, 5× smaller than 80 B material
+/// vertices; Cigolle et al. 2014 octahedral normal encoding):
+///   `px, py, pz`: local-space vertex position (`3 × f32`)
+///   `packed`:     bits  `0..9`  octahedral unit normal X (`0..1023`, ~0.11° precision)
+///                 bits `10..19` octahedral unit normal Y (`0..1023`)
+///                 bits `20..29` thing index within batch (`0..1023`)
+///                 bit  `30`     smooth shading flag (`1` = smooth, `0` = sharp crease)
+///                 bit  `31`     transmissive flag (`1` = transmissive, `0` = opaque)
 pub struct MeshVertex: Copy + GpuData {
-    pub pos: vec4,
-    pub normal: vec4,
-    pub albedo: vec4,
-    pub emits: vec4,
-    pub optics: vec4,
+    pub px: f32,
+    pub py: f32,
+    pub pz: f32,
+    pub packed: u32,
 }
 
-/// One active surface brick: `(bx, by, bz, thing_idx)` plus the bitmask of parts live inside it.
+/// Packs unit normal `n`, batch thing index `thing_id` (`0..1023`), `smooth`, and `is_trans`
+/// into one 32-bit word via octahedral projection (Cigolle et al., JCGT 2014).
+pub fn pack_vertex_meta(n: vec3, thing_id: u32, smooth: bool, is_trans: bool) -> u32 {
+    let denom = max(abs(n.x) + abs(n.y) + abs(n.z), 1.0e-8)
+    var ox = n.x / denom
+    var oy = n.y / denom
+    if n.z < 0.0 {
+        let sx = if ox >= 0.0 { 1.0 } else { -1.0 }
+        let sy = if oy >= 0.0 { 1.0 } else { -1.0 }
+        let wx = (1.0 - abs(oy)) * sx
+        let wy = (1.0 - abs(ox)) * sy
+        ox = wx
+        oy = wy
+    }
+    let ux = u32(clamp((ox * 0.5 + 0.5) * 1023.0 + 0.5, 0.0, 1023.0))
+    let uy = u32(clamp((oy * 0.5 + 0.5) * 1023.0 + 0.5, 0.0, 1023.0))
+    let tid = min(thing_id, 1023)
+    let sm: u32 = if smooth { 1 } else { 0 }
+    let tr: u32 = if is_trans { 1 } else { 0 }
+    ux | (uy << 10) | (tid << 20) | (sm << 30) | (tr << 31)
+}
+
+/// Decodes the unit normal from `MeshVertex::packed`.
+pub fn unpack_oct_normal(packed: u32) -> vec3 {
+    let ox = f32(packed & 1023) * (2.0 / 1023.0) - 1.0
+    let oy = f32((packed >> 10) & 1023) * (2.0 / 1023.0) - 1.0
+    let oz = 1.0 - abs(ox) - abs(oy)
+    var nx = ox
+    var ny = oy
+    if oz < 0.0 {
+        let t = -oz
+        nx = if ox >= 0.0 { ox - t } else { ox + t }
+        ny = if oy >= 0.0 { oy - t } else { oy + t }
+    }
+    let v = vec3(nx, ny, oz)
+    let l2 = dot(v, v)
+    if l2 > 1.0e-10 { v * (1.0 / sqrt(l2)) } else { vec3(0.0, 1.0, 0.0) }
+}
+
+/// Decodes the thing index (`0..1023`) from `MeshVertex::packed`.
+pub fn unpack_thing(packed: u32) -> u32 {
+    (packed >> 20) & 1023
+}
+
+/// Decodes the smooth-shading flag from `MeshVertex::packed`.
+pub fn unpack_smooth(packed: u32) -> bool {
+    ((packed >> 30) & 1) != 0
+}
+
+/// Decodes the transmissive-material flag from `MeshVertex::packed`.
+pub fn unpack_is_trans(packed: u32) -> bool {
+    (packed >> 31) != 0
+}
+
+/// One active surface brick: `(bx, by, bz, grid_idx)` plus the bitmask of parts live inside it.
 pub struct ActiveBrick: Copy + GpuData {
     pub coord: vec4u,
     pub live: Live,
 }
 
-/// Grid layout for one thing inside a `MeshBatch`.
+/// Grid layout for one thing inside a `MeshBatch` (48 bytes, std430-aligned).
 pub struct GridSpec: Copy + GpuData {
     pub origin: vec3,
     pub cell: f32,
     pub dims: vec3u,
     pub base_brick: u32,
+    pub orig_id: u32,
+    pub pad0: u32,
+    pub pad1: u32,
+    pub pad2: u32,
 }
 
 /// Coordinate `axis` (`0..3`) of `p`.
@@ -132,7 +191,7 @@ pub fn tight_aabb<M: Field<Substance>>(field: M) -> Box3 {
 
 /// Builds a `GridSpec` covering `aabb` with cell spacing `cell`, padded by 2 cells so the surface
 /// never touches the grid boundary.
-fn grid_for(aabb: Box3, cell: f32, base_brick: u32) -> GridSpec {
+fn grid_for(aabb: Box3, cell: f32, base_brick: u32, orig_id: u32) -> GridSpec {
     let pad = vec3(cell * 2.0)
     let origin = aabb.lo - pad
     let span = max(aabb.hi + pad - origin, vec3(cell))
@@ -140,7 +199,7 @@ fn grid_for(aabb: Box3, cell: f32, base_brick: u32) -> GridSpec {
     let nx = max(u32(ceil(span.x / bspan)), 1)
     let ny = max(u32(ceil(span.y / bspan)), 1)
     let nz = max(u32(ceil(span.z / bspan)), 1)
-    GridSpec { origin, cell, dims: vec3u(nx, ny, nz), base_brick }
+    GridSpec { origin, cell, dims: vec3u(nx, ny, nz), base_brick, orig_id, pad0: 0, pad1: 0, pad2: 0 }
 }
 
 /// Safe vector normalize.
@@ -200,12 +259,12 @@ fn cull_bricks<M: Field<Substance>>(
     let lo = g.origin + vec3(f32(bx), f32(by), f32(bz)) * bspan
     // Cover the full 8×8×8 corner box (7 cells wide = BRICK + 1) so halo sign changes aren't missed.
     let hi = lo + vec3(g.cell * f32(BRICK + 1))
-    let pr = fields[ti].pruned(Box3 { lo, hi }, |q: vec3| q, 1.0, ALL_LIVE, 0)
+    let pr = fields[g.orig_id].pruned(Box3 { lo, hi }, |q: vec3| q, 1.0, ALL_LIVE, 0)
     if pr.range.lo <= 0.0 && pr.range.hi >= 0.0 {
         var hit = true
         // For high-steepness fields (e.g. noise-displaced rock), run a sound 8-octant interval
         // check to discard conservative false-positive empty bricks without missing any surface.
-        if steep(fields[ti]) {
+        if steep(fields[g.orig_id]) {
             hit = false
             let mid = 0.5 * (lo + hi)
             for oct in 0..8 {
@@ -219,7 +278,7 @@ fn cull_bricks<M: Field<Substance>>(
                     if (oct & 2) != 0 { hi.y } else { mid.y },
                     if (oct & 4) != 0 { hi.z } else { mid.z },
                 )
-                let iv = fields[ti].interval(Box3 { lo: olo, hi: ohi })
+                let iv = fields[g.orig_id].interval(Box3 { lo: olo, hi: ohi })
                 if iv.lo <= 0.0 && iv.hi >= 0.0 {
                     hit = true
                     break
@@ -279,7 +338,7 @@ fn eval_corners<M: Field<Substance>>(
     let cz = ci >> 6
     let bspan = g.cell * f32(BRICK)
     let p = g.origin + vec3(f32(b.x), f32(b.y), f32(b.z)) * bspan + vec3(f32(cx), f32(cy), f32(cz)) * g.cell
-    corners[id] = fields[b.w].distance_live(p, ab.live)
+    corners[id] = fields[g.orig_id].distance_live(p, ab.live)
 }
 
 /// Corner distance inside a brick at `(x, y, z)` in `0..8`.
@@ -482,10 +541,11 @@ fn newton_snap(wp: vec3, dv: f32, gv: vec3, cell_lo: vec3, h: f32) -> vec3 {
     out
 }
 
-/// Pushes the cell's dual vertex at `wp` (normal from the field gradient `gv`, else the QEF's
-/// summed normal; substance from `f`) and records its index in `cell_verts[slot]`.
+/// Pushes the cell's compact 16-byte dual vertex at `wp` (octahedral normal + thing index +
+/// smooth/transmissive flags; full procedural `channels(wp)` runs at 1× pixel rate in `mesh_eye`).
 fn push_vertex<M: Field<Substance>>(
     f: M,
+    thing_id: u32,
     wp: vec3,
     gv: vec3,
     qef: Qef,
@@ -495,14 +555,13 @@ fn push_vertex<M: Field<Substance>>(
     cell_verts: mut Atomics<u32>,
 ) {
     let n_final = safe_norm(gv, safe_norm(qef.avg_n, vec3(0.0, 1.0, 0.0)))
-    let sub = f.channels(wp)
-    let smooth = if qef.min_dot >= 0.88 { 1.0 } else { 0.0 }
+    let is_trans = f.channels(wp).transmission > 0.02
+    let smooth = qef.min_dot >= 0.88
     let vi = verts.push(MeshVertex {
-        pos: vec4(wp, smooth),
-        normal: vec4(n_final, sub.roughness),
-        albedo: vec4(sub.albedo, sub.metallic),
-        emits: vec4(sub.emits, sub.ior),
-        optics: vec4(sub.transmission, sub.subsurface, sub.coat, sub.micro),
+        px: wp.x,
+        py: wp.y,
+        pz: wp.z,
+        packed: pack_vertex_meta(n_final, thing_id, smooth: smooth, is_trans: is_trans),
     })
     if vi < cap_verts {
         cell_verts.store(i: slot, value: vi)
@@ -589,7 +648,7 @@ fn solve_verts<M: Field<Substance>>(
 
     var qef = qef_empty()
 
-    let f = fields[b.w]
+    let f = fields[g.orig_id]
     // Fast pass: accumulate QEF from cell-local trilinear gradients (0 extra field samples).
     for e in 0..12 {
         let i0 = e0[e]
@@ -619,7 +678,7 @@ fn solve_verts<M: Field<Substance>>(
     let live = ab.live
     let (dv, gv) = value_and_gradient(|q| f.distance_live(q, live), wp)
     let snapped = newton_snap(wp, dv, gv, cell_lo, h)
-    push_vertex(f, snapped, gv, qef, local_bi * VERTS_STRIDE + cell, cap_verts, mut verts, mut cell_verts)
+    push_vertex(f, g.orig_id, snapped, gv, qef, local_bi * VERTS_STRIDE + cell, cap_verts, mut verts, mut cell_verts)
 }
 
 /// Prepares indirect dispatch args for a 64-wide pass over a compacted list (clamped to `cap`).
@@ -668,7 +727,7 @@ fn refine_creases<M: Field<Substance>>(
 
     var qef = qef_empty()
 
-    let f = fields[b.w]
+    let f = fields[g.orig_id]
     let live = ab.live
     for e in 0..12 {
         let i0 = e0[e]
@@ -695,7 +754,7 @@ fn refine_creases<M: Field<Substance>>(
     let wp = cell_lo + qef.solve(0.002) * h
     let (dv, gv) = value_and_gradient(|q| f.distance_live(q, live), wp)
     let snapped = newton_snap(wp, dv, gv, cell_lo, h)
-    push_vertex(f, snapped, gv, qef, local_bi * VERTS_STRIDE + cell, cap_verts, mut verts, mut cell_verts)
+    push_vertex(f, g.orig_id, snapped, gv, qef, local_bi * VERTS_STRIDE + cell, cap_verts, mut verts, mut cell_verts)
 }
 
 /// Dual vertex index of local cell `(x, y, z)` in `0..7` inside brick `bi`.
@@ -738,10 +797,10 @@ fn emit_quad(
     if v0 == NONE || v1 == NONE || v2 == NONE || v3 == NONE {
         return
     }
-    let is_trans = verts[v0].optics.x > 0.02
-        || verts[v1].optics.x > 0.02
-        || verts[v2].optics.x > 0.02
-        || verts[v3].optics.x > 0.02
+    let is_trans = unpack_is_trans(verts[v0].packed) ||
+        unpack_is_trans(verts[v1].packed) ||
+        unpack_is_trans(verts[v2].packed) ||
+        unpack_is_trans(verts[v3].packed)
     if !is_trans {
         let at = tri_count.add(i: 0, value: 6)
         if at + 6 > cap_indices {
@@ -1022,13 +1081,14 @@ pub struct MeshBatch {
     pub trans_draw_args: GpuBuffer<DrawIndexedArgs>,
     pub xforms: GpuBuffer<Rigid>,
     pub prev_xforms: GpuBuffer<Rigid>,
+    pub inst_ids: GpuBuffer<u32>,
     xforms_cap: u32,
     prev_xforms_dirty: bool,
     pub inst_count: u32,
     extracted_xform: Rigid,
     shape_key: u64,
     is_rigid_cached: bool,
-    instanced: bool,
+    pub instanced: bool,
     pub max_bricks: u32,
     pub cap_bricks: u32,
     pub cap_verts: u32,
@@ -1062,6 +1122,7 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
         trans_draw_args: buffer_of([DrawIndexedArgs { indices: 0, instances: 0, first_index: 0, base_vertex: 0, first_instance: 0 }]),
         xforms: buffer_of([Rigid::identity()]),
         prev_xforms: buffer_of([Rigid::identity()]),
+        inst_ids: buffer_of([0]),
         xforms_cap: 1,
         prev_xforms_dirty: false,
         inst_count: 1,
@@ -1092,7 +1153,7 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
 }
 
 impl MeshBatch {
-    /// Ensures `self.xforms` and `self.prev_xforms` hold at least `count` rigid instance transforms.
+    /// Ensures `self.xforms`, `self.prev_xforms`, and `self.inst_ids` hold at least `count` entries.
     fn ensure_xforms(mut self, count: u32) -> bool {
         if count > self.xforms_cap {
             var cap = max(self.xforms_cap, 16)
@@ -1101,6 +1162,7 @@ impl MeshBatch {
             }
             self.xforms = buffer(cap)
             self.prev_xforms = buffer(cap)
+            self.inst_ids = buffer(cap)
             self.xforms_cap = cap
             self.prev_xforms_dirty = false
             return true
@@ -1211,7 +1273,7 @@ impl MeshBatch {
             None => {},
         }
         let aabb = tight_aabb(field)
-        let g = grid_for(aabb, cell, 0)
+        let g = grid_for(aabb, cell, base_brick: 0, orig_id: 0)
         let total_bricks = g.dims.x * g.dims.y * g.dims.z
         let fbuf = buffer_of([field])
         scratch.ensure_grids(1)
@@ -1220,6 +1282,7 @@ impl MeshBatch {
         self.bound = vec4(mid, length(aabb.hi - mid))
         write(mut self.xforms, 0, [Rigid::identity()])
         write(mut self.prev_xforms, 0, [Rigid::identity()])
+        write(mut self.inst_ids, 0, [0])
         self.prev_xforms_dirty = false
         self.inst_count = 1
         self.run_extract(mut scratch, fbuf.items(), things: 1, total_bricks: total_bricks, inst_count: 1)
@@ -1340,9 +1403,11 @@ impl MeshBatch {
             if self.built && self.instanced && self.is_rigid_cached && self.shape_key == shared_sk &&
                 abs(self.cell - best_local_cell) <= 0.15 * max(self.cell, 1.0e-4) {
                 var deltas: Vec<Rigid> = Vec::new()
+                var ids: Vec<u32> = Vec::new()
                 for i in 0..N {
                     if cells[i] > 0.0 {
                         deltas.push(fields[i].rigid_frame().delta_from(self.extracted_xform))
+                        ids.push(i)
                     }
                 }
                 let grew = self.ensure_xforms(vis_count)
@@ -1354,6 +1419,7 @@ impl MeshBatch {
                     self.prev_xforms_dirty = false
                 }
                 write(mut self.xforms, 0, deltas)
+                write(mut self.inst_ids, 0, ids)
                 if vis_count != self.inst_count {
                     label("mesh_extract")
                     dispatch(
@@ -1376,20 +1442,23 @@ impl MeshBatch {
             let template = fields[best_i]
             let template_rf = template.rigid_frame()
             let aabb = tight_aabb(template)
-            let g = grid_for(aabb, cells[best_i], 0)
+            let g = grid_for(aabb, cells[best_i], base_brick: 0, orig_id: 0)
             let total_bricks = g.dims.x * g.dims.y * g.dims.z
             let fbuf = buffer_of([template])
             scratch.ensure_grids(1)
             write(mut scratch.grids, 0, [g])
             var deltas: Vec<Rigid> = Vec::new()
+            var ids: Vec<u32> = Vec::new()
             for i in 0..N {
                 if cells[i] > 0.0 {
                     deltas.push(fields[i].rigid_frame().delta_from(template_rf))
+                    ids.push(i)
                 }
             }
             let _ = self.ensure_xforms(vis_count)
             write(mut self.xforms, 0, deltas)
             write(mut self.prev_xforms, 0, deltas)
+            write(mut self.inst_ids, 0, ids)
             self.prev_xforms_dirty = false
             self.inst_count = vis_count
             self.run_extract(mut scratch, fbuf.items(), things: 1, total_bricks: total_bricks, inst_count: vis_count)
@@ -1405,8 +1474,9 @@ impl MeshBatch {
         }
 
         // General path: heterogeneous or deforming fields packed into one shared world-space mesh.
+        // Pass the full `fields` array so each `GridSpec` carries its original index `orig_id = i`
+        // directly into `MeshVertex::packed` for exact pixel-rate `fields[orig_id].channels(wp)`.
         var grids: Vec<GridSpec> = Vec::new()
-        var kept: Vec<M> = Vec::new()
         var total_bricks: u32 = 0
         var tlo = vec3(1.0e20)
         var thi = vec3(-1.0e20)
@@ -1422,21 +1492,21 @@ impl MeshBatch {
                 let r = min(b.radius, 1.0e4)
                 Box3 { lo: b.centre - vec3(r), hi: b.centre + vec3(r) }
             }
-            let g = grid_for(aabb, c, total_bricks)
+            let g = grid_for(aabb, c, base_brick: total_bricks, orig_id: i)
             total_bricks += g.dims.x * g.dims.y * g.dims.z
             grids.push(g)
-            kept.push(fields[i])
             tlo = min(tlo, aabb.lo)
             thi = max(thi, aabb.hi)
         }
-        let count = kept.len()
-        let fbuf = buffer_of(kept)
+        let count = grids.len()
+        let fbuf = buffer_of(fields)
         scratch.ensure_grids(count)
         write(mut scratch.grids, 0, grids)
         let mid = 0.5 * (tlo + thi)
         self.bound = vec4(mid, length(thi - mid))
         write(mut self.xforms, 0, [Rigid::identity()])
         write(mut self.prev_xforms, 0, [Rigid::identity()])
+        write(mut self.inst_ids, 0, [0])
         self.prev_xforms_dirty = false
         self.inst_count = 1
         self.run_extract(mut scratch, fbuf.items(), things: count, total_bricks: total_bricks, inst_count: 1)
