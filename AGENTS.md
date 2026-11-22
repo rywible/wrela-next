@@ -7,10 +7,14 @@ the quality of the tools agents have and the loops that tell them whether their 
 ## The game
 
 We are still finding what the game looks and feels like. The working idea is a **parry-based
-spellcraft game**, somewhere between Clair Obscur: Expedition 33 and Hogwarts Legacy. The
-defining image is Dumbledore parrying Voldemort by turning the glass hurled at him into sand: a
-parry is not only a block on a timing window but a spell that answers the incoming spell,
-transforming it. Build toward that feeling, and treat everything else about the design as open.
+spellcraft game**: timed, reactive defence, where reading an attack and answering it is the
+skill, in an open world of magic seen over the caster's shoulder. The defining image is a duel in
+which one caster hurls a storm of glass and the other turns it to sand in mid-air: a parry is not
+only a block on a timing window but a spell that answers the incoming spell, transforming it.
+Build toward that feeling, and treat everything else about the design as open.
+
+The game is its own. Code, docs, commit messages and image prompts never name or borrow from
+other games, films or books.
 
 **Visual style:** realistic first. Get light, materials and motion physically right, then
 specialize: add style on top of a believable base, rather than starting stylized and faking
