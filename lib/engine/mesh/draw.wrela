@@ -12,10 +12,11 @@ use matter::medium::{Medium, NoMedium}
 use matter::sky::Sky
 use matter::substance::{ONE_OVER_PI, Substance, env_brdf_approx, fresnel_schlick_rough}
 use matter::swarm::{NoSwarm, Swarm}
-use matter::world::{And, Many, One, World}
+use matter::world::{And, One, Pool}
+use mesh::cull::{HiZCuller, hiz_culler}
 use mesh::extract::{
-    ExtractScratch, MeshBatch, MeshVertex, eval_dqs, extract_scratch, mesh_batch, size_floor, steep,
-    unpack_oct_normal, unpack_smooth, unpack_thing,
+    CELL_PX, ExtractScratch, MeshBatch, MeshVertex, eval_dqs, extract_scratch, mesh_batch,
+    probe_visible_near, size_floor, steep, unpack_oct_normal, unpack_smooth, unpack_thing,
 }
 use mesh::height::{CLIP_RINGS, ClipmapMesh, MeshVary, clipmap_mesh, height_vs}
 use mesh::light::{
@@ -36,14 +37,16 @@ use picture::look::Look
 use picture::picture::{Picture, picture}
 use picture::screen::{cover, luma, show}
 use std::collections::Vec
-use std::field::{DualQuat, Field, Rigid}
+use std::derive::value_and_gradient
+use std::field::{Bound, DualQuat, Field, Rigid}
 use std::gpu::{
     Address, ClipPosition, Compare, ComparisonSampler, Cull, Depth, DepthBias, DepthOnlyPass,
     DepthPass, DepthPass2, DepthPass4, DepthTexture, Filter, FragCoord, GpuBuffer, GpuSpan,
     InstanceIndex, R16Float, Rg16Float, Rgba8, Rgba16Float, Sampler, Targets2, Targets4, Texture,
     Texture3d, VertexIndex, begin_depth_pass, begin_pass, begin_pass2, begin_pass2_with_depth,
-    begin_pass4, begin_pass4_with_depth, begin_pass_with_depth, buffer_of, comparison_sampler,
-    copy_texture, depth_texture, discard, draw, label, sampler, texture,
+    begin_pass4, begin_pass4_with_depth, begin_pass_with_depth, buffer, buffer_of,
+    comparison_sampler, copy_texture, depth_texture, discard, draw, draw_multi, label, sampler,
+    texture,
 }
 use std::hash::{Hasher, StateHash}
 
@@ -51,9 +54,9 @@ use std::hash::{Hasher, StateHash}
 const FOCUS_RAD: f32 = 9.5
 
 /// Default maximum active surface bricks per batch.
-const BATCH_BRICKS: u32 = 8192
+const BATCH_BRICKS: u32 = 65536
 
-/// Distance (m) beyond which a large `Many` (`N >= 16`) puts a thing in one of its two far
+/// Distance (m) beyond which a large `Pool` (16 things or more) puts a thing in one of its two far
 /// batches rather than its near one.
 const FAR_TIER_DIST: f32 = 9.0
 
@@ -393,7 +396,7 @@ fn field_gbuf_one_fs<M: Field<Substance>>(
     shade_gbuf_core(vary.wp, vary.prev_wp, vary.local_p, vary.normal, vary.meta.x, sub0, v, prev_v)
 }
 
-/// Pixel-rate analytical G-buffer fragment shader for `Many<M, N>` compact meshlets.
+/// Pixel-rate analytical G-buffer fragment shader for `Pool<M>` compact meshlets.
 @fragment
 @budget(work: 8000)
 fn field_gbuf_many_fs<M: Field<Substance>>(
@@ -421,7 +424,7 @@ fn field_skin_gbuf_one_fs<M: Field<Substance>>(
     shade_gbuf_core(vary.wp, vary.prev_wp, vary.rest_p, vary.normal, vary.meta.x, sub0, v, prev_v)
 }
 
-/// Skin-locked pixel-rate G-buffer fragment shader for `Skinned` `Many<M, N>` meshlets.
+/// Skin-locked pixel-rate G-buffer fragment shader for `Skinned` `Pool<M>` meshlets.
 @fragment
 @budget(work: 8000)
 fn field_skin_gbuf_many_fs<M: Field<Substance>>(
@@ -460,7 +463,7 @@ fn field_cut_gbuf_one_fs<M: Field<Substance>>(
     shade_gbuf_core(vary.wp, vary.prev_wp, vary.local_p, vary.normal, vary.meta.x, sub0, v, prev_v)
 }
 
-/// The opaque pixels of `Many<M, N>`'s transmissive quads into the G-buffer.
+/// The opaque pixels of `Pool<M>`'s transmissive quads into the G-buffer.
 @fragment
 @budget(work: 8000)
 fn field_cut_gbuf_many_fs<M: Field<Substance>>(
@@ -494,7 +497,7 @@ fn field_skin_cut_gbuf_one_fs<M: Field<Substance>>(
     shade_gbuf_core(vary.wp, vary.prev_wp, vary.rest_p, vary.normal, vary.meta.x, sub0, v, prev_v)
 }
 
-/// The opaque pixels of a `Skinned` `Many<M, N>`'s transmissive quads into the G-buffer.
+/// The opaque pixels of a `Skinned` `Pool<M>`'s transmissive quads into the G-buffer.
 @fragment
 @budget(work: 8000)
 fn field_skin_cut_gbuf_many_fs<M: Field<Substance>>(
@@ -563,6 +566,8 @@ fn shade_direct_pixel<S: Sky>(
     sky_spec0: Texture<Rgba16Float>,
     sky_s: Sampler,
     shadow_map: DepthTexture,
+    static_shadow_map: DepthTexture,
+    has_static_shadow: u32,
     cmp: ComparisonSampler,
     rad0: Texture3d<Rgba16Float>,
     rad1: Texture3d<Rgba16Float>,
@@ -615,7 +620,20 @@ fn shade_direct_pixel<S: Sky>(
     let sun = sky.sun()
     let ndl = max(dot(n, sun.way), 0.0)
     let vis = if ndl > 0.0 {
-        sun_shadow_hybrid(shadow_map, cmp, sv, sdf_grid, sdf0, sdf1, sdf_s, wp, n, pixel_xy)
+        sun_shadow_hybrid(
+            shadow_map,
+            static_shadow_map,
+            has_static_shadow,
+            cmp,
+            sv,
+            sdf_grid,
+            sdf0,
+            sdf1,
+            sdf_s,
+            wp,
+            n,
+            pixel_xy,
+        )
     } else {
         0.0
     }
@@ -675,6 +693,8 @@ fn deferred_direct_fs<S: Sky>(
     sky_spec0: Texture<Rgba16Float>,
     sky_s: Sampler,
     shadow_map: DepthTexture,
+    static_shadow_map: DepthTexture,
+    has_static_shadow: u32,
     cmp: ComparisonSampler,
     rad0: Texture3d<Rgba16Float>,
     rad1: Texture3d<Rgba16Float>,
@@ -706,6 +726,8 @@ fn deferred_direct_fs<S: Sky>(
         sky_spec0,
         sky_s,
         shadow_map,
+        static_shadow_map,
+        has_static_shadow,
         cmp,
         rad0,
         rad1,
@@ -740,6 +762,8 @@ fn deferred_direct_judge_fs<S: Sky>(
     sky_spec0: Texture<Rgba16Float>,
     sky_s: Sampler,
     shadow_map: DepthTexture,
+    static_shadow_map: DepthTexture,
+    has_static_shadow: u32,
     cmp: ComparisonSampler,
     rad0: Texture3d<Rgba16Float>,
     rad1: Texture3d<Rgba16Float>,
@@ -771,6 +795,8 @@ fn deferred_direct_judge_fs<S: Sky>(
         sky_spec0,
         sky_s,
         shadow_map,
+        static_shadow_map,
+        has_static_shadow,
         cmp,
         rad0,
         rad1,
@@ -1128,7 +1154,7 @@ fn field_refract_refl_one_fs<M: Field<Substance>>(
     )
 }
 
-/// Half-res transmissive reflection pre-pass for `Many<M, N>` compact meshlets.
+/// Half-res transmissive reflection pre-pass for `Pool<M>` compact meshlets.
 @fragment
 @budget(work: 20000)
 fn field_refract_refl_many_fs<M: Field<Substance>>(
@@ -1240,7 +1266,7 @@ fn field_skin_refract_refl_one_fs<M: Field<Substance>>(
     )
 }
 
-/// Half-res transmissive reflection pre-pass for `Skinned` `Many<M, N>` meshlets.
+/// Half-res transmissive reflection pre-pass for `Skinned` `Pool<M>` meshlets.
 @fragment
 @budget(work: 20000)
 fn field_skin_refract_refl_many_fs<M: Field<Substance>>(
@@ -1431,6 +1457,8 @@ fn shade_trans_core<S: Sky>(
     sky_spec2: Texture<Rgba16Float>,
     sky_s: Sampler,
     shadow_map: DepthTexture,
+    static_shadow_map: DepthTexture,
+    has_static_shadow: u32,
     cmp: ComparisonSampler,
     rad0: Texture3d<Rgba16Float>,
     rad1: Texture3d<Rgba16Float>,
@@ -1513,7 +1541,12 @@ fn shade_trans_core<S: Sky>(
 
     let sun = sky.sun()
     let ndl = max(dot(n, sun.way), 0.0)
-    let vis = if ndl > 0.0 { sun_vis_point(shadow_map, cmp, sv, wp) } else { 0.0 }
+    let vis_dyn = if ndl > 0.0 { sun_vis_point(shadow_map, cmp, sv, wp) } else { 0.0 }
+    let vis = if ndl > 0.0 && has_static_shadow != 0 {
+        min(vis_dyn, sun_vis_point(static_shadow_map, cmp, sv, wp))
+    } else {
+        vis_dyn
+    }
     let sky_amb = sky_irradiance(sky_diff, sky_s, n)
     let deep_scatter = sub.albedo *
         (vec3(1.0) - beer) *
@@ -1595,6 +1628,8 @@ fn field_trans_one_fs<M: Field<Substance>, S: Sky>(
     sky_spec2: Texture<Rgba16Float>,
     sky_s: Sampler,
     shadow_map: DepthTexture,
+    static_shadow_map: DepthTexture,
+    has_static_shadow: u32,
     cmp: ComparisonSampler,
     rad0: Texture3d<Rgba16Float>,
     rad1: Texture3d<Rgba16Float>,
@@ -1631,6 +1666,8 @@ fn field_trans_one_fs<M: Field<Substance>, S: Sky>(
         sky_spec2,
         sky_s,
         shadow_map,
+        static_shadow_map,
+        has_static_shadow,
         cmp,
         rad0,
         rad1,
@@ -1649,7 +1686,7 @@ fn field_trans_one_fs<M: Field<Substance>, S: Sky>(
     Targets2 { first: c, second: motion_of(vary.wp, vary.prev_wp, v, prev_v) }
 }
 
-/// Pixel-rate transmissive fragment shader for `Many<M, N>` compact meshlets (colour + motion).
+/// Pixel-rate transmissive fragment shader for `Pool<M>` compact meshlets (colour + motion).
 @fragment
 @budget(work: 44000)
 fn field_trans_many_fs<M: Field<Substance>, S: Sky>(
@@ -1669,6 +1706,8 @@ fn field_trans_many_fs<M: Field<Substance>, S: Sky>(
     sky_spec2: Texture<Rgba16Float>,
     sky_s: Sampler,
     shadow_map: DepthTexture,
+    static_shadow_map: DepthTexture,
+    has_static_shadow: u32,
     cmp: ComparisonSampler,
     rad0: Texture3d<Rgba16Float>,
     rad1: Texture3d<Rgba16Float>,
@@ -1706,6 +1745,8 @@ fn field_trans_many_fs<M: Field<Substance>, S: Sky>(
         sky_spec2,
         sky_s,
         shadow_map,
+        static_shadow_map,
+        has_static_shadow,
         cmp,
         rad0,
         rad1,
@@ -1743,6 +1784,8 @@ fn field_skin_trans_one_fs<M: Field<Substance>, S: Sky>(
     sky_spec2: Texture<Rgba16Float>,
     sky_s: Sampler,
     shadow_map: DepthTexture,
+    static_shadow_map: DepthTexture,
+    has_static_shadow: u32,
     cmp: ComparisonSampler,
     rad0: Texture3d<Rgba16Float>,
     rad1: Texture3d<Rgba16Float>,
@@ -1779,6 +1822,8 @@ fn field_skin_trans_one_fs<M: Field<Substance>, S: Sky>(
         sky_spec2,
         sky_s,
         shadow_map,
+        static_shadow_map,
+        has_static_shadow,
         cmp,
         rad0,
         rad1,
@@ -1797,7 +1842,7 @@ fn field_skin_trans_one_fs<M: Field<Substance>, S: Sky>(
     Targets2 { first: c, second: motion_of(vary.wp, vary.prev_wp, v, prev_v) }
 }
 
-/// Pixel-rate transmissive fragment shader for `Skinned` `Many<M, N>` meshlets (colour + motion).
+/// Pixel-rate transmissive fragment shader for `Skinned` `Pool<M>` meshlets (colour + motion).
 @fragment
 @budget(work: 44000)
 fn field_skin_trans_many_fs<M: Field<Substance>, S: Sky>(
@@ -1817,6 +1862,8 @@ fn field_skin_trans_many_fs<M: Field<Substance>, S: Sky>(
     sky_spec2: Texture<Rgba16Float>,
     sky_s: Sampler,
     shadow_map: DepthTexture,
+    static_shadow_map: DepthTexture,
+    has_static_shadow: u32,
     cmp: ComparisonSampler,
     rad0: Texture3d<Rgba16Float>,
     rad1: Texture3d<Rgba16Float>,
@@ -1854,6 +1901,8 @@ fn field_skin_trans_many_fs<M: Field<Substance>, S: Sky>(
         sky_spec2,
         sky_s,
         shadow_map,
+        static_shadow_map,
+        has_static_shadow,
         cmp,
         rad0,
         rad1,
@@ -1891,6 +1940,8 @@ fn mesh_trans_fs<S: Sky>(
     sky_spec2: Texture<Rgba16Float>,
     sky_s: Sampler,
     shadow_map: DepthTexture,
+    static_shadow_map: DepthTexture,
+    has_static_shadow: u32,
     cmp: ComparisonSampler,
     rad0: Texture3d<Rgba16Float>,
     rad1: Texture3d<Rgba16Float>,
@@ -1927,6 +1978,8 @@ fn mesh_trans_fs<S: Sky>(
         sky_spec2,
         sky_s,
         shadow_map,
+        static_shadow_map,
+        has_static_shadow,
         cmp,
         rad0,
         rad1,
@@ -1957,7 +2010,7 @@ fn cell_for_one(c: vec3, r: f32, v: View, steep: bool, floor: f32) -> f32 {
     clamp(max(px * mult, max(floor, 0.005)), 0.005, 0.25)
 }
 
-/// Computes a curvature- and budget-aware cell spacing for one thing in a `Many` batch.
+/// Computes a curvature- and budget-aware cell spacing for one thing in a `Pool` batch.
 fn cell_for_share(c: vec3, r: f32, bricks_for_this: f32, v: View) -> f32 {
     let near = max(length(c - v.at) - r, 0.25)
     let px = near * v.pixel()
@@ -1968,10 +2021,10 @@ fn cell_for_share(c: vec3, r: f32, bricks_for_this: f32, v: View) -> f32 {
     clamp(max(px * mult, by_budget), 0.006, 0.25)
 }
 
-/// Any world (`One`, `Many`, `And`) that can sync its 16-byte GPU meshlet batches, splat its
-/// opaque geometry into the 3D SDF clipmap, inject analytical vertex radiance, and draw directly
-/// with pixel-rate analytical `field.channels(wp)`.
-pub trait MeshWorld: Copy {
+/// Any world (`One`, `Pool`, `And`) that can sync its 16-byte GPU meshlet batches, splat its
+/// opaque geometry into the 3D SDF clipmap, collide swarms analytically, inject analytical vertex
+/// radiance, and draw directly with pixel-rate analytical `field.channels(wp)`.
+pub trait MeshWorld {
     type FieldBufs
     fn batch_count(self) -> u32
     fn upload_fields(self) -> Self::FieldBufs
@@ -1989,6 +2042,13 @@ pub trait MeshWorld: Copy {
         first: u32,
         static_only: bool,
         all_batches: bool,
+    )
+    fn collide_swarm(
+        self,
+        fbufs: Self::FieldBufs,
+        sim: mut SwarmSim,
+        restitution: f32,
+        friction: f32,
     )
     fn inject_radiance<S: Sky>(
         self,
@@ -2010,7 +2070,9 @@ pub trait MeshWorld: Copy {
         fbufs: Self::FieldBufs,
         ep: DepthPass4<Rgba8, Rgba8, Rgba16Float, Rg16Float>,
         batches: mut Vec<MeshBatch>,
+        cull: mut HiZCuller,
         first: u32,
+        pass_idx: u32,
         v: View,
         prev_v: View,
     )
@@ -2057,6 +2119,8 @@ pub trait MeshWorld: Copy {
         sky_spec2: Texture<Rgba16Float>,
         sky_s: Sampler,
         shadow_map: DepthTexture,
+        static_shadow_map: DepthTexture,
+        has_static_shadow: u32,
         cmp: ComparisonSampler,
         rad0: Texture3d<Rgba16Float>,
         rad1: Texture3d<Rgba16Float>,
@@ -2094,8 +2158,21 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for One<M> {
     ) {
         let b = self.field.bound()
         let r = min(b.radius, 1.0e4)
-        let cell = cell_for_one(b.centre, r, v, steep(self.field), size_floor(r))
-        batches[first].sync_one(mut scratch, self.field, cell)
+        let is_steep = steep(self.field)
+        let h_top = cell_for_one(b.centre, r, v, is_steep, size_floor(r))
+        let lip = max(self.field.lipschitz(1.0), 1.0)
+        let d_at = abs(self.field.distance(v.at)) / lip
+        let d_surf = max(d_at, max(length(b.centre - v.at) - r, 0.0))
+        let force_direct = d_surf < 1.5 * r
+        var z_vis = d_surf
+        var h_near = h_top
+        if d_surf < 2.0 * r {
+            z_vis = probe_visible_near(self.field, v, d_surf, length(b.centre - v.at) + r)
+            let px_near = max(z_vis, 0.004) * v.pixel()
+            let mult = CELL_PX * (if is_steep { 0.55 } else { 0.90 })
+            h_near = clamp(px_near * mult, max(h_top / 64.0, 0.0004), h_top)
+        }
+        batches[first].sync_one_lod(mut scratch, self.field, v, z_vis, h_near, h_top, force_direct)
     }
 
     fn splat_sdf(
@@ -2114,6 +2191,10 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for One<M> {
             return
         }
         sdf.splat_one(self.field, batches[first].bound, to_static: !all_batches && static_only)
+    }
+
+    fn collide_swarm(self, _fbufs: u32, sim: mut SwarmSim, restitution: f32, friction: f32) {
+        sim.collide_one(self.field, restitution, friction)
     }
 
     fn inject_radiance<S: Sky>(
@@ -2175,12 +2256,17 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for One<M> {
         _fbufs: u32,
         ep: DepthPass4<Rgba8, Rgba8, Rgba16Float, Rg16Float>,
         batches: mut Vec<MeshBatch>,
+        cull: mut HiZCuller,
         first: u32,
+        pass_idx: u32,
         v: View,
         prev_v: View,
     ) {
         // Opaque quads, then the opaque pixels of the transmissive quads (`_cut_` shaders).
         if batches[first].is_deformed {
+            if pass_idx != 0 {
+                return
+            }
             let vs = deformed_mesh_vs.bind(
                 verts: batches[first].deformed_verts.items(),
                 prev_verts: batches[first].prev_deformed_verts.items(),
@@ -2221,11 +2307,15 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for One<M> {
             is_instanced: 0,
             v: v,
         )
+        let fs = field_gbuf_one_fs.bind(field: self.field, v: v, prev_v: prev_v)
+        if pass_idx != 0 {
+            return
+        }
         if batches[first].has_opaque {
             draw(
                 ep,
                 vs,
-                field_gbuf_one_fs.bind(field: self.field, v: v, prev_v: prev_v),
+                fs,
                 indices: batches[first].indices,
                 indirect: batches[first].draw_args,
                 cull: Cull::Back,
@@ -2368,6 +2458,8 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for One<M> {
         sky_spec2: Texture<Rgba16Float>,
         sky_s: Sampler,
         shadow_map: DepthTexture,
+        static_shadow_map: DepthTexture,
+        has_static_shadow: u32,
         cmp: ComparisonSampler,
         rad0: Texture3d<Rgba16Float>,
         rad1: Texture3d<Rgba16Float>,
@@ -2411,6 +2503,8 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for One<M> {
                     sky_spec2: sky_spec2,
                     sky_s: sky_s,
                     shadow_map: shadow_map,
+                    static_shadow_map: static_shadow_map,
+                    has_static_shadow: has_static_shadow,
                     cmp: cmp,
                     rad0: rad0,
                     rad1: rad1,
@@ -2457,6 +2551,8 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for One<M> {
                 sky_spec2: sky_spec2,
                 sky_s: sky_s,
                 shadow_map: shadow_map,
+                static_shadow_map: static_shadow_map,
+                has_static_shadow: has_static_shadow,
                 cmp: cmp,
                 rad0: rad0,
                 rad1: rad1,
@@ -2493,14 +2589,17 @@ fn in_view(c: vec3, r: f32, v: View) -> bool {
     abs(dot(rel, v.up)) <= half_y && abs(dot(rel, v.right)) <= half_x
 }
 
-impl<M: Field<Substance> + StateHash + GpuData, const N: u32> MeshWorld for Many<M, N> {
+impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for Pool<M> {
     type FieldBufs = GpuBuffer<M>
 
     fn batch_count(self) -> u32 {
-        if N >= 16 { 3 } else { 1 }
+        3
     }
 
     fn upload_fields(self) -> GpuBuffer<M> {
+        if self.fields.len() == 0 {
+            return buffer(1)
+        }
         buffer_of(self.fields)
     }
 
@@ -2511,29 +2610,43 @@ impl<M: Field<Substance> + StateHash + GpuData, const N: u32> MeshWorld for Many
         first: u32,
         v: View,
     ) {
+        let n = self.fields.len()
+        if n == 0 {
+            let empty_cells: Vec<f32> = Vec::new()
+            batches[first].sync_pool(mut scratch, self.fields, empty_cells)
+            for k in 1..3 {
+                batches[first + k].has_opaque = false
+                batches[first + k].has_trans = false
+                batches[first + k].inst_count = 0
+                batches[first + k].still_frames += 1
+            }
+            return
+        }
         let cap = batches[first].max_bricks
-        // Each thing's bound, distance and screen-share weight (`0.0` when out of view), once.
-        var centres = [vec3(0.0); N]
-        var radii = [0.0; N]
-        var nears = [0.0; N]
-        var weights = [0.0; N]
+        var centres: Vec<vec3> = Vec::new()
+        var radii: Vec<f32> = Vec::new()
+        var nears: Vec<f32> = Vec::new()
+        var weights: Vec<f32> = Vec::new()
         var total_w = 0.0
-        for i in 0..N {
+        for i in 0..n {
             let b = self.fields[i].bound()
             let r = min(b.radius, 1.0e4)
             let near = max(length(b.centre - v.at) - r, 0.25)
-            centres[i] = b.centre
-            radii[i] = r
-            nears[i] = near
+            centres.push(b.centre)
+            radii.push(r)
+            nears.push(near)
             if in_view(b.centre, r, v) {
                 let s = r / near
-                weights[i] = clamp(s * s, 0.002, 4.0)
-                total_w += weights[i]
+                let w = clamp(s * s, 0.002, 4.0)
+                weights.push(w)
+                total_w += w
+            } else {
+                weights.push(0.0)
             }
         }
         let inv_w = if total_w > 1.0e-6 { f32(cap) / total_w } else { f32(cap) }
 
-        // Fast path for skinned crowds: split `N >= 16` into 2 distance LOD templates (`<= 12 m`
+        // Fast path for skinned crowds: split `n >= 16` into 2 distance LOD templates (`<= 12 m`
         // near, `> 12 m` far) so every visible character renders at distance-appropriate density
         // with 0.000 ms per-frame extraction and 1–2 GPU-instanced DQS draw calls.
         let first_skinned = match self.fields[0].skin_shape_hash() {
@@ -2541,9 +2654,9 @@ impl<M: Field<Substance> + StateHash + GpuData, const N: u32> MeshWorld for Many
             None => false,
         }
         if first_skinned {
-            if N < 16 {
-                var cells = [0.0; N]
-                for i in 0..N {
+            if n < 16 {
+                var cells = Vec::filled(n, 0.0)
+                for i in 0..n {
                     if weights[i] > 0.0 {
                         cells[i] = cell_for_one(
                             centres[i],
@@ -2554,12 +2667,18 @@ impl<M: Field<Substance> + StateHash + GpuData, const N: u32> MeshWorld for Many
                         )
                     }
                 }
-                batches[first].sync_many(mut scratch, self.fields, cells)
+                batches[first].sync_pool(mut scratch, self.fields, cells)
+                for k in 1..3 {
+                    batches[first + k].has_opaque = false
+                    batches[first + k].has_trans = false
+                    batches[first + k].inst_count = 0
+                    batches[first + k].still_frames += 1
+                }
                 return
             }
-            var c_near = [0.0; N]
-            var c_far = [0.0; N]
-            for i in 0..N {
+            var c_near = Vec::filled(n, 0.0)
+            var c_far = Vec::filled(n, 0.0)
+            for i in 0..n {
                 if weights[i] > 0.0 {
                     let c = cell_for_one(
                         centres[i],
@@ -2575,22 +2694,28 @@ impl<M: Field<Substance> + StateHash + GpuData, const N: u32> MeshWorld for Many
                     }
                 }
             }
-            batches[first].sync_many(mut scratch, self.fields, c_near)
-            batches[first + 1].sync_many(mut scratch, self.fields, c_far)
+            batches[first].sync_pool(mut scratch, self.fields, c_near)
+            batches[first + 1].sync_pool(mut scratch, self.fields, c_far)
             batches[first + 2].has_opaque = false
             batches[first + 2].has_trans = false
             batches[first + 2].inst_count = 0
             batches[first + 2].still_frames += 1
             return
         }
-        if N < 16 {
-            var cells = [0.0; N]
-            for i in 0..N {
+        if n < 16 {
+            var cells = Vec::filled(n, 0.0)
+            for i in 0..n {
                 if weights[i] > 0.0 {
                     cells[i] = cell_for_share(centres[i], radii[i], weights[i] * inv_w, v)
                 }
             }
-            batches[first].sync_many(mut scratch, self.fields, cells)
+            batches[first].sync_pool(mut scratch, self.fields, cells)
+            for k in 1..3 {
+                batches[first + k].has_opaque = false
+                batches[first + k].has_trans = false
+                batches[first + k].inst_count = 0
+                batches[first + k].still_frames += 1
+            }
             return
         }
 
@@ -2598,10 +2723,10 @@ impl<M: Field<Substance> + StateHash + GpuData, const N: u32> MeshWorld for Many
         // parity, so a change re-extracts only the batch it falls in. Every batch syncs every
         // frame (a still batch's sync is a hash check), so each batch's mesh is always this
         // frame's and is shaded by this frame's fields (`fbuf`) with exact motion vectors.
-        var c_near = [0.0; N]
-        var c_even = [0.0; N]
-        var c_odd = [0.0; N]
-        for i in 0..N {
+        var c_near = Vec::filled(n, 0.0)
+        var c_even = Vec::filled(n, 0.0)
+        var c_odd = Vec::filled(n, 0.0)
+        for i in 0..n {
             if weights[i] > 0.0 {
                 let cell = cell_for_share(centres[i], radii[i], weights[i] * inv_w, v)
                 if nears[i] <= FAR_TIER_DIST {
@@ -2613,9 +2738,9 @@ impl<M: Field<Substance> + StateHash + GpuData, const N: u32> MeshWorld for Many
                 }
             }
         }
-        batches[first].sync_many(mut scratch, self.fields, c_near)
-        batches[first + 1].sync_many(mut scratch, self.fields, c_even)
-        batches[first + 2].sync_many(mut scratch, self.fields, c_odd)
+        batches[first].sync_pool(mut scratch, self.fields, c_near)
+        batches[first + 1].sync_pool(mut scratch, self.fields, c_even)
+        batches[first + 2].sync_pool(mut scratch, self.fields, c_odd)
     }
 
     fn splat_sdf(
@@ -2626,22 +2751,36 @@ impl<M: Field<Substance> + StateHash + GpuData, const N: u32> MeshWorld for Many
         static_only: bool,
         all_batches: bool,
     ) {
+        let n = self.fields.len()
+        if n == 0 {
+            return
+        }
         let any_opaque = batches[first].has_opaque ||
-            (N >= 16 && (batches[first + 1].has_opaque || batches[first + 2].has_opaque))
+            batches[first + 1].has_opaque ||
+            batches[first + 2].has_opaque
         if !any_opaque {
             return
         }
-        let is_static = if N < 16 {
-            batches[first].still_frames >= 1
-        } else {
-            batches[first].still_frames >= 1 &&
-                batches[first + 1].still_frames >= 1 &&
-                batches[first + 2].still_frames >= 1
-        }
+        let is_static = batches[first].still_frames >= 1 &&
+            batches[first + 1].still_frames >= 1 &&
+            batches[first + 2].still_frames >= 1
         if !all_batches && is_static != static_only {
             return
         }
-        sdf.splat_many(self.fields, to_static: !all_batches && static_only)
+        sdf.splat_pool(self.fields, to_static: !all_batches && static_only)
+    }
+
+    fn collide_swarm(self, fbuf: GpuBuffer<M>, sim: mut SwarmSim, restitution: f32, friction: f32) {
+        let n = self.fields.len()
+        if n == 0 || sim.count == 0 {
+            return
+        }
+        var bounds: Vec<Bound> = Vec::new()
+        for i in 0..n {
+            bounds.push(self.fields[i].bound())
+        }
+        let bbuf = buffer_of(bounds)
+        sim.collide_pool(fbuf.items(), bbuf.items(), n, restitution, friction)
     }
 
     fn inject_radiance<S: Sky>(
@@ -2659,7 +2798,11 @@ impl<M: Field<Substance> + StateHash + GpuData, const N: u32> MeshWorld for Many
         static_only: bool,
         all_batches: bool,
     ) {
-        let n_sub: u32 = if N >= 16 { 3 } else { 1 }
+        let n = self.fields.len()
+        if n == 0 {
+            return
+        }
+        let n_sub: u32 = if n >= 16 { 3 } else { 1 }
         for k in 0..n_sub {
             let bi = first + k
             let is_static = batches[bi].still_frames >= 1
@@ -2667,7 +2810,7 @@ impl<M: Field<Substance> + StateHash + GpuData, const N: u32> MeshWorld for Many
                 if batches[bi].is_skinned {
                     rad.inject_skin_many(
                         fbuf.items(),
-                        N,
+                        n,
                         batches[bi].verts.items(),
                         batches[bi].skin_verts.items(),
                         batches[bi].verts.count(),
@@ -2689,7 +2832,7 @@ impl<M: Field<Substance> + StateHash + GpuData, const N: u32> MeshWorld for Many
                     let is_inst: u32 = if batches[bi].instanced { 1 } else { 0 }
                     rad.inject_many(
                         fbuf.items(),
-                        N,
+                        n,
                         batches[bi].verts.items(),
                         batches[bi].verts.count(),
                         batches[bi].cap_verts,
@@ -2715,15 +2858,26 @@ impl<M: Field<Substance> + StateHash + GpuData, const N: u32> MeshWorld for Many
         fbuf: GpuBuffer<M>,
         ep: DepthPass4<Rgba8, Rgba8, Rgba16Float, Rg16Float>,
         batches: mut Vec<MeshBatch>,
+        cull: mut HiZCuller,
         first: u32,
+        pass_idx: u32,
         v: View,
         prev_v: View,
     ) {
-        // Per batch: opaque quads, then the opaque pixels of the transmissive quads (`_cut_`).
-        let n_sub: u32 = if N >= 16 { 3 } else { 1 }
+        let n = self.fields.len()
+        if n == 0 {
+            return
+        }
+        // Per batch: opaque quads (via 2-pass Hi-Z `draw_multi()` for large instanced crowds),
+        // then opaque pixels of transmissive quads (`_cut_`, Pass 1 only).
+        let n_sub: u32 = if n >= 16 { 3 } else { 1 }
         for k in 0..n_sub {
             let bi = first + k
             let is_inst: u32 = if batches[bi].instanced { 1 } else { 0 }
+            let inst_cull = cull.active && batches[bi].use_inst_cull()
+            if !inst_cull && pass_idx != 0 {
+                continue
+            }
             if batches[bi].is_skinned {
                 let vs = skin_mesh_vs.bind(
                     verts: batches[bi].verts.items(),
@@ -2737,29 +2891,56 @@ impl<M: Field<Substance> + StateHash + GpuData, const N: u32> MeshWorld for Many
                     is_instanced: is_inst,
                     v: v,
                 )
+                let fs = field_skin_gbuf_many_fs.bind(
+                    fields: fbuf.items(),
+                    n_fields: n,
+                    v: v,
+                    prev_v: prev_v,
+                )
                 if batches[bi].has_opaque {
-                    draw(
-                        ep,
-                        vs,
-                        field_skin_gbuf_many_fs.bind(
-                            fields: fbuf.items(),
-                            n_fields: N,
-                            v: v,
-                            prev_v: prev_v,
-                        ),
-                        indices: batches[bi].indices,
-                        indirect: batches[bi].draw_args,
-                        cull: Cull::Back,
-                        depth: Depth { compare: Compare::Greater, write: true },
-                    )
+                    if inst_cull && batches[bi].inst_count > 0 {
+                        if pass_idx == 0 {
+                            draw_multi(
+                                ep,
+                                vs,
+                                fs,
+                                indices: batches[bi].indices,
+                                indirect: cull.batch_bufs[bi].vis_draws_1,
+                                count: batches[bi].inst_count,
+                                cull: Cull::Back,
+                                depth: Depth { compare: Compare::Greater, write: true },
+                            )
+                        } else {
+                            draw_multi(
+                                ep,
+                                vs,
+                                fs,
+                                indices: batches[bi].indices,
+                                indirect: cull.batch_bufs[bi].vis_draws_2,
+                                count: batches[bi].inst_count,
+                                cull: Cull::Back,
+                                depth: Depth { compare: Compare::Greater, write: true },
+                            )
+                        }
+                    } else if pass_idx == 0 {
+                        draw(
+                            ep,
+                            vs,
+                            fs,
+                            indices: batches[bi].indices,
+                            indirect: batches[bi].draw_args,
+                            cull: Cull::Back,
+                            depth: Depth { compare: Compare::Greater, write: true },
+                        )
+                    }
                 }
-                if batches[bi].has_trans {
+                if pass_idx == 0 && batches[bi].has_trans {
                     draw(
                         ep,
                         vs,
                         field_skin_cut_gbuf_many_fs.bind(
                             fields: fbuf.items(),
-                            n_fields: N,
+                            n_fields: n,
                             v: v,
                             prev_v: prev_v,
                         ),
@@ -2778,29 +2959,56 @@ impl<M: Field<Substance> + StateHash + GpuData, const N: u32> MeshWorld for Many
                     is_instanced: is_inst,
                     v: v,
                 )
+                let fs = field_gbuf_many_fs.bind(
+                    fields: fbuf.items(),
+                    n_fields: n,
+                    v: v,
+                    prev_v: prev_v,
+                )
                 if batches[bi].has_opaque {
-                    draw(
-                        ep,
-                        vs,
-                        field_gbuf_many_fs.bind(
-                            fields: fbuf.items(),
-                            n_fields: N,
-                            v: v,
-                            prev_v: prev_v,
-                        ),
-                        indices: batches[bi].indices,
-                        indirect: batches[bi].draw_args,
-                        cull: Cull::Back,
-                        depth: Depth { compare: Compare::Greater, write: true },
-                    )
+                    if inst_cull && batches[bi].inst_count > 0 {
+                        if pass_idx == 0 {
+                            draw_multi(
+                                ep,
+                                vs,
+                                fs,
+                                indices: batches[bi].indices,
+                                indirect: cull.batch_bufs[bi].vis_draws_1,
+                                count: batches[bi].inst_count,
+                                cull: Cull::Back,
+                                depth: Depth { compare: Compare::Greater, write: true },
+                            )
+                        } else {
+                            draw_multi(
+                                ep,
+                                vs,
+                                fs,
+                                indices: batches[bi].indices,
+                                indirect: cull.batch_bufs[bi].vis_draws_2,
+                                count: batches[bi].inst_count,
+                                cull: Cull::Back,
+                                depth: Depth { compare: Compare::Greater, write: true },
+                            )
+                        }
+                    } else if pass_idx == 0 {
+                        draw(
+                            ep,
+                            vs,
+                            fs,
+                            indices: batches[bi].indices,
+                            indirect: batches[bi].draw_args,
+                            cull: Cull::Back,
+                            depth: Depth { compare: Compare::Greater, write: true },
+                        )
+                    }
                 }
-                if batches[bi].has_trans {
+                if pass_idx == 0 && batches[bi].has_trans {
                     draw(
                         ep,
                         vs,
                         field_cut_gbuf_many_fs.bind(
                             fields: fbuf.items(),
-                            n_fields: N,
+                            n_fields: n,
                             v: v,
                             prev_v: prev_v,
                         ),
@@ -2839,7 +3047,11 @@ impl<M: Field<Substance> + StateHash + GpuData, const N: u32> MeshWorld for Many
         bg_s: Sampler,
         half_size: vec2,
     ) {
-        let n_sub: u32 = if N >= 16 { 3 } else { 1 }
+        let n = self.fields.len()
+        if n == 0 {
+            return
+        }
+        let n_sub: u32 = if n >= 16 { 3 } else { 1 }
         for k in 0..n_sub {
             let bi = first + k
             if batches[bi].has_trans {
@@ -2861,7 +3073,7 @@ impl<M: Field<Substance> + StateHash + GpuData, const N: u32> MeshWorld for Many
                         ),
                         field_skin_refract_refl_many_fs.bind(
                             fields: fbuf.items(),
-                            n_fields: N,
+                            n_fields: n,
                             v: v,
                             rad_grid: rad_grid,
                             sdf_grid: sdf_grid,
@@ -2899,7 +3111,7 @@ impl<M: Field<Substance> + StateHash + GpuData, const N: u32> MeshWorld for Many
                         ),
                         field_refract_refl_many_fs.bind(
                             fields: fbuf.items(),
-                            n_fields: N,
+                            n_fields: n,
                             v: v,
                             rad_grid: rad_grid,
                             sdf_grid: sdf_grid,
@@ -2947,6 +3159,8 @@ impl<M: Field<Substance> + StateHash + GpuData, const N: u32> MeshWorld for Many
         sky_spec2: Texture<Rgba16Float>,
         sky_s: Sampler,
         shadow_map: DepthTexture,
+        static_shadow_map: DepthTexture,
+        has_static_shadow: u32,
         cmp: ComparisonSampler,
         rad0: Texture3d<Rgba16Float>,
         rad1: Texture3d<Rgba16Float>,
@@ -2962,7 +3176,11 @@ impl<M: Field<Substance> + StateHash + GpuData, const N: u32> MeshWorld for Many
         refract_refl: Texture<Rgba16Float>,
         bg_s: Sampler,
     ) {
-        let n_sub: u32 = if N >= 16 { 3 } else { 1 }
+        let n = self.fields.len()
+        if n == 0 {
+            return
+        }
+        let n_sub: u32 = if n >= 16 { 3 } else { 1 }
         for k in 0..n_sub {
             let bi = first + k
             if batches[bi].has_trans {
@@ -2984,7 +3202,7 @@ impl<M: Field<Substance> + StateHash + GpuData, const N: u32> MeshWorld for Many
                         ),
                         field_skin_trans_many_fs.bind(
                             fields: fbuf.items(),
-                            n_fields: N,
+                            n_fields: n,
                             v: v,
                             prev_v: prev_v,
                             sv: sv,
@@ -2997,6 +3215,8 @@ impl<M: Field<Substance> + StateHash + GpuData, const N: u32> MeshWorld for Many
                             sky_spec2: sky_spec2,
                             sky_s: sky_s,
                             shadow_map: shadow_map,
+                            static_shadow_map: static_shadow_map,
+                            has_static_shadow: has_static_shadow,
                             cmp: cmp,
                             rad0: rad0,
                             rad1: rad1,
@@ -3030,7 +3250,7 @@ impl<M: Field<Substance> + StateHash + GpuData, const N: u32> MeshWorld for Many
                         ),
                         field_trans_many_fs.bind(
                             fields: fbuf.items(),
-                            n_fields: N,
+                            n_fields: n,
                             v: v,
                             prev_v: prev_v,
                             sv: sv,
@@ -3043,6 +3263,8 @@ impl<M: Field<Substance> + StateHash + GpuData, const N: u32> MeshWorld for Many
                             sky_spec2: sky_spec2,
                             sky_s: sky_s,
                             shadow_map: shadow_map,
+                            static_shadow_map: static_shadow_map,
+                            has_static_shadow: has_static_shadow,
                             cmp: cmp,
                             rad0: rad0,
                             rad1: rad1,
@@ -3105,6 +3327,17 @@ impl<A: MeshWorld, B: MeshWorld> MeshWorld for And<A, B> {
         self.b.splat_sdf(mut sdf, mut batches, first + na, static_only, all_batches)
     }
 
+    fn collide_swarm(
+        self,
+        fbufs: (A::FieldBufs, B::FieldBufs),
+        sim: mut SwarmSim,
+        restitution: f32,
+        friction: f32,
+    ) {
+        self.a.collide_swarm(fbufs.0, mut sim, restitution, friction)
+        self.b.collide_swarm(fbufs.1, mut sim, restitution, friction)
+    }
+
     fn inject_radiance<S: Sky>(
         self,
         fbufs: (A::FieldBufs, B::FieldBufs),
@@ -3156,13 +3389,15 @@ impl<A: MeshWorld, B: MeshWorld> MeshWorld for And<A, B> {
         fbufs: (A::FieldBufs, B::FieldBufs),
         ep: DepthPass4<Rgba8, Rgba8, Rgba16Float, Rg16Float>,
         batches: mut Vec<MeshBatch>,
+        cull: mut HiZCuller,
         first: u32,
+        pass_idx: u32,
         v: View,
         prev_v: View,
     ) {
         let na = self.a.batch_count()
-        self.a.draw_eye(fbufs.0, ep, mut batches, first, v, prev_v)
-        self.b.draw_eye(fbufs.1, ep, mut batches, first + na, v, prev_v)
+        self.a.draw_eye(fbufs.0, ep, mut batches, mut cull, first, pass_idx, v, prev_v)
+        self.b.draw_eye(fbufs.1, ep, mut batches, mut cull, first + na, pass_idx, v, prev_v)
     }
 
     fn draw_refract_refl(
@@ -3259,6 +3494,8 @@ impl<A: MeshWorld, B: MeshWorld> MeshWorld for And<A, B> {
         sky_spec2: Texture<Rgba16Float>,
         sky_s: Sampler,
         shadow_map: DepthTexture,
+        static_shadow_map: DepthTexture,
+        has_static_shadow: u32,
         cmp: ComparisonSampler,
         rad0: Texture3d<Rgba16Float>,
         rad1: Texture3d<Rgba16Float>,
@@ -3292,6 +3529,8 @@ impl<A: MeshWorld, B: MeshWorld> MeshWorld for And<A, B> {
             sky_spec2,
             sky_s,
             shadow_map,
+            static_shadow_map,
+            has_static_shadow,
             cmp,
             rad0,
             rad1,
@@ -3324,6 +3563,8 @@ impl<A: MeshWorld, B: MeshWorld> MeshWorld for And<A, B> {
             sky_spec2,
             sky_s,
             shadow_map,
+            static_shadow_map,
+            has_static_shadow,
             cmp,
             rad0,
             rad1,
@@ -3342,18 +3583,20 @@ impl<A: MeshWorld, B: MeshWorld> MeshWorld for And<A, B> {
     }
 }
 
-/// Draws every opaque batch (or, with `static_only`, only those still since their last sync) into
-/// the sun shadow pass `sp` through `sv`: the one way the engine draws shadow casters, used for the
-/// frame's shadow map and for the static radiance cache's own.
+/// Draws opaque shadow casters into `sp` through `sv`: `mode == 0` draws all batches,
+/// `mode == 1` draws only still batches (`still_frames >= 1`, cached in `static_shadow_map`),
+/// `mode == 2` draws only dynamic batches (`still_frames == 0`, drawn every frame into `shadow_map`).
 fn draw_shadow_casters(
     sp: DepthOnlyPass,
     batches: mut Vec<MeshBatch>,
     nb: u32,
     sv: ShadowView,
-    static_only: bool,
+    mode: u32,
 ) {
     for i in 0..nb {
-        if batches[i].has_opaque && (!static_only || batches[i].still_frames >= 1) {
+        let is_still = batches[i].still_frames >= 1
+        let take_batch = if mode == 1 { is_still } else if mode == 2 { !is_still } else { true }
+        if batches[i].has_opaque && take_batch {
             if batches[i].is_deformed {
                 draw(
                     sp,
@@ -3434,6 +3677,7 @@ pub struct MeshSight {
     pub vol: FroxelVolume,
     pub bloom: BloomPyramid,
     pub swarm: SwarmSim,
+    pub cull: HiZCuller,
     scratch: ExtractScratch,
     clipmap: ClipmapMesh,
     batches: Vec<MeshBatch>,
@@ -3445,6 +3689,9 @@ pub struct MeshSight {
     bg_s: Sampler,
     rad_key: u64,
     rad_built: bool,
+    static_shadow_key: u64,
+    static_shadow_valid: bool,
+    has_static_shadow: bool,
     frame: u32,
     pub gi: bool,
 }
@@ -3476,6 +3723,7 @@ pub fn mesh_sight(gi: bool = true) -> MeshSight {
         vol: froxel_volume(),
         bloom: bloom_pyramid(),
         swarm: swarm_sim(),
+        cull: hiz_culler(),
         scratch: extract_scratch(BATCH_BRICKS),
         clipmap: clipmap_mesh(),
         batches: Vec::new(),
@@ -3485,6 +3733,9 @@ pub fn mesh_sight(gi: bool = true) -> MeshSight {
         bg_s: sampler(filter: Filter::Linear, address: Address::Clamp),
         rad_key: 0,
         rad_built: false,
+        static_shadow_key: 0,
+        static_shadow_valid: false,
+        has_static_shadow: false,
         frame: 0,
         gi: gi,
     }
@@ -3511,6 +3762,7 @@ impl MeshSight {
             self.hdr_bg = texture(width: width, height: height)
             self.depth = depth_texture(width: width, height: height)
             self.tsr.resize(width, height)
+            self.cull.resize(width, height)
         }
     }
 
@@ -3523,7 +3775,7 @@ impl MeshSight {
     /// Updates Sky PMREM, syncs meshlets, builds/updates the 2-cascade 3D SDF clipmap, steps
     /// `swarm` accelerated by the SDF clipmap, renders the unified sun shadow map, and updates
     /// the camera-focused radiance volume & dynamic emitters.
-    fn prepare_and_shadow<W: World + MeshWorld, Sw: Swarm, S: Sky>(
+    fn prepare_and_shadow<W: MeshWorld, Sw: Swarm, S: Sky>(
         mut self,
         world: W,
         fbufs: W::FieldBufs,
@@ -3541,6 +3793,7 @@ impl MeshSight {
 
         let nb = world.batch_count()
         self.ensure_batches(nb)
+        self.scratch.begin_frame()
         world.sync_batches(mut self.scratch, mut self.batches, 0, v)
 
         var wlo = vec3(1.0e20)
@@ -3636,34 +3889,89 @@ impl MeshSight {
             }
         }
 
-        self.swarm.update(
-            swarm,
-            world.field(),
-            self.sdf.grid,
-            self.sdf.sdf0,
-            self.sdf.sdf1,
-            self.sdf.s,
-        )
-
-        // Pass 1: Unified sun shadow map (one `2048²` world map paired with exact 3D SDF cone penumbra).
-        label("mesh_shadow")
-        let sp: DepthOnlyPass = begin_depth_pass(
-            mut self.shadow_map,
-            clear_depth: 1.0,
-            keep_depth: false,
-        )
-        draw_shadow_casters(sp, mut self.batches, nb, sv, static_only: false)
-        if self.swarm.count > 0 {
-            draw(
-                sp,
-                swarm_shadow_vs.bind(grains: self.swarm.front(), sv: sv),
-                shadow_fs,
-                vertices: 6,
-                instances: self.swarm.count,
-                depth: Depth { compare: Compare::Less, write: true },
-            )
+        let swarm_steps = self.swarm.begin_update(swarm)
+        if swarm_steps > 0 {
+            let rest = swarm.restitution()
+            let fric = swarm.friction()
+            for _s in 0..swarm_steps {
+                self.swarm.integrate_once(
+                    swarm,
+                    self.sdf.grid,
+                    self.sdf.sdf0,
+                    self.sdf.sdf1,
+                    self.sdf.s,
+                )
+                world.collide_swarm(fbufs, mut self.swarm, rest, fric)
+            }
         }
-        sp.end()
+
+        // Pass 1: Static/dynamic split sun shadow maps (one cached `2048²` static map rebuilt only
+        // when still architecture or sun changes — 0.000 ms on steady frames — plus one dynamic
+        // map for moving characters/spells/swarm, paired with exact 3D SDF cone penumbra).
+        var static_sh_key = Hasher::new()
+        sv.centre.state_hash(mut static_sh_key)
+        sv.radius.state_hash(mut static_sh_key)
+        sun.way.state_hash(mut static_sh_key)
+        for i in 0..nb {
+            if self.batches[i].has_opaque && self.batches[i].still_frames >= 1 {
+                i.state_hash(mut static_sh_key)
+                self.batches[i].hash.state_hash(mut static_sh_key)
+            }
+        }
+        let sh_key = static_sh_key.finish()
+        if static_opaque_count > 0 {
+            if !self.static_shadow_valid || self.static_shadow_key != sh_key {
+                label("mesh_shadow_static")
+                let ssp: DepthOnlyPass = begin_depth_pass(
+                    mut self.static_shadow_map,
+                    clear_depth: 1.0,
+                    keep_depth: false,
+                )
+                draw_shadow_casters(ssp, mut self.batches, nb, sv, mode: 1)
+                ssp.end()
+                self.static_shadow_key = sh_key
+                self.static_shadow_valid = true
+            }
+            label("mesh_shadow")
+            let sp: DepthOnlyPass = begin_depth_pass(
+                mut self.shadow_map,
+                clear_depth: 1.0,
+                keep_depth: false,
+            )
+            draw_shadow_casters(sp, mut self.batches, nb, sv, mode: 2)
+            if self.swarm.count > 0 {
+                draw(
+                    sp,
+                    swarm_shadow_vs.bind(grains: self.swarm.front(), sv: sv),
+                    shadow_fs,
+                    vertices: 6,
+                    instances: self.swarm.count,
+                    depth: Depth { compare: Compare::Less, write: true },
+                )
+            }
+            sp.end()
+            self.has_static_shadow = true
+        } else {
+            label("mesh_shadow")
+            let sp: DepthOnlyPass = begin_depth_pass(
+                mut self.shadow_map,
+                clear_depth: 1.0,
+                keep_depth: false,
+            )
+            draw_shadow_casters(sp, mut self.batches, nb, sv, mode: 0)
+            if self.swarm.count > 0 {
+                draw(
+                    sp,
+                    swarm_shadow_vs.bind(grains: self.swarm.front(), sv: sv),
+                    shadow_fs,
+                    vertices: 6,
+                    instances: self.swarm.count,
+                    depth: Depth { compare: Compare::Less, write: true },
+                )
+            }
+            sp.end()
+            self.has_static_shadow = false
+        }
 
         // Pass 1b: Camera-focused radiance cache & dynamic local emitters.
         // Skips rebuild completely (0 ms/frame) when the whole world is static; when only dynamic
@@ -3712,14 +4020,16 @@ impl MeshSight {
             let skey = sk.finish()
             if static_count > 0 {
                 if !self.rad.static_valid || self.rad.static_key != skey {
-                    label("mesh_shadow_static")
-                    let ssp: DepthOnlyPass = begin_depth_pass(
-                        mut self.static_shadow_map,
-                        clear_depth: 1.0,
-                        keep_depth: false,
-                    )
-                    draw_shadow_casters(ssp, mut self.batches, nb, sv, static_only: true)
-                    ssp.end()
+                    if !self.has_static_shadow {
+                        label("mesh_shadow_static")
+                        let ssp: DepthOnlyPass = begin_depth_pass(
+                            mut self.static_shadow_map,
+                            clear_depth: 1.0,
+                            keep_depth: false,
+                        )
+                        draw_shadow_casters(ssp, mut self.batches, nb, sv, mode: 1)
+                        ssp.end()
+                    }
                     self.rad.begin_static(rad_centre, rad_rad, enabled: true)
                     world.inject_radiance(
                         fbufs,
@@ -3739,20 +4049,37 @@ impl MeshSight {
                     self.rad.static_valid = true
                 }
                 self.rad.begin_from_static(rad_centre, rad_rad)
-                world.inject_radiance(
-                    fbufs,
-                    mut self.rad,
-                    mut self.batches,
-                    0,
-                    sv,
-                    sky,
-                    self.sky.diff,
-                    self.sky.s,
-                    self.shadow_map,
-                    self.cmp,
-                    static_only: false,
-                    all_batches: false,
-                )
+                if self.has_static_shadow {
+                    world.inject_radiance(
+                        fbufs,
+                        mut self.rad,
+                        mut self.batches,
+                        0,
+                        sv,
+                        sky,
+                        self.sky.diff,
+                        self.sky.s,
+                        self.static_shadow_map,
+                        self.cmp,
+                        static_only: false,
+                        all_batches: false,
+                    )
+                } else {
+                    world.inject_radiance(
+                        fbufs,
+                        mut self.rad,
+                        mut self.batches,
+                        0,
+                        sv,
+                        sky,
+                        self.sky.diff,
+                        self.sky.s,
+                        self.shadow_map,
+                        self.cmp,
+                        static_only: false,
+                        all_batches: false,
+                    )
+                }
             } else {
                 self.rad.begin(rad_centre, rad_rad, enabled: true)
                 world.inject_radiance(
@@ -3788,7 +4115,7 @@ impl MeshSight {
     /// Shared opaque geometry + tiled emitter culling + pixel-rate deferred direct + phase-cycled
     /// half-res bilateral GI/SSR + full-res combine pipeline used identically by BOTH `draw_scene`
     /// and `drawn_only` (the judges test the exact same renderer that draws the game).
-    fn render_opaque_and_indirect<W: World + MeshWorld, H: Height, Sw: Swarm, S: Sky>(
+    fn render_opaque_and_indirect<W: MeshWorld, H: Height, Sw: Swarm, S: Sky>(
         mut self,
         world: W,
         fbufs: W::FieldBufs,
@@ -3806,7 +4133,14 @@ impl MeshSight {
     ) {
         self.rad.cull_tiles(v, width, height_px)
 
-        // Pass 2a: Lean 1× G-buffer + analytical motion-vector pass with pixel-rate `channels(wp)`.
+        // Pass 2a: 2-pass Reversed-Z Hi-Z occlusion culling + lean 1× G-buffer + analytical motion
+        // vectors with pixel-rate `channels(wp)`.
+        let nb = world.batch_count()
+        let use_hiz = self.cull.begin(mut self.batches, nb)
+        let do_pass2 = use_hiz && self.cull.hiz_ready
+        if use_hiz {
+            self.cull.cull_pass1(mut self.batches, nb, v)
+        }
         label("mesh_eye")
         let ep: DepthPass4<Rgba8, Rgba8, Rgba16Float, Rg16Float> = begin_pass4_with_depth(
             mut self.g_normal,
@@ -3817,7 +4151,16 @@ impl MeshSight {
             clear: vec4(0.0, 0.0, 0.0, 0.0),
             clear_depth: 0.0,
         )
-        world.draw_eye(fbufs, ep, mut self.batches, 0, v, prev_v)
+        world.draw_eye(
+            fbufs,
+            ep,
+            mut self.batches,
+            mut self.cull,
+            first: 0,
+            pass_idx: 0,
+            v: v,
+            prev_v: prev_v,
+        )
         if height.active() && height.has_opaque() {
             draw(
                 ep,
@@ -3852,6 +4195,35 @@ impl MeshSight {
         }
         ep.end()
 
+        if use_hiz {
+            self.cull.build_hiz(self.depth, width, height_px)
+            if do_pass2 {
+                self.cull.cull_pass2(mut self.batches, nb, v)
+                label("mesh_eye_pass2")
+                let ep2: DepthPass4<Rgba8, Rgba8, Rgba16Float, Rg16Float> = begin_pass4_with_depth(
+                    mut self.g_normal,
+                    mut self.g_albedo,
+                    mut self.g_emits,
+                    mut self.g_motion,
+                    mut self.depth,
+                    keep: true,
+                    keep_depth: true,
+                )
+                world.draw_eye(
+                    fbufs,
+                    ep2,
+                    mut self.batches,
+                    mut self.cull,
+                    first: 0,
+                    pass_idx: 1,
+                    v: v,
+                    prev_v: prev_v,
+                )
+                ep2.end()
+            }
+            self.cull.finish_frame(v)
+        }
+
         // Pass 2b: Full-res 1× pixel-rate deferred direct lighting (SDF soft shadows + curvature + SSS + tiled emitters).
         label("mesh_direct")
         if write_judge {
@@ -3878,6 +4250,8 @@ impl MeshSight {
                     sky_spec0: self.sky.spec0,
                     sky_s: self.sky.s,
                     shadow_map: self.shadow_map,
+                    static_shadow_map: self.static_shadow_map,
+                    has_static_shadow: if self.has_static_shadow { 1 } else { 0 },
                     cmp: self.cmp,
                     rad0: self.rad.rad0,
                     rad1: self.rad.rad1,
@@ -3912,6 +4286,8 @@ impl MeshSight {
                     sky_spec0: self.sky.spec0,
                     sky_s: self.sky.s,
                     shadow_map: self.shadow_map,
+                    static_shadow_map: self.static_shadow_map,
+                    has_static_shadow: if self.has_static_shadow { 1 } else { 0 },
                     cmp: self.cmp,
                     rad0: self.rad.rad0,
                     rad1: self.rad.rad1,
@@ -4000,7 +4376,7 @@ impl MeshSight {
     /// dispersion, Beer-Lambert absorption, tiled emitter specular, and motion vectors) over the
     /// opaque frame in `hdr_colour`, shared by `draw_scene` and `drawn_only`. Skipped completely
     /// (0.0 ms) when no heightfield or batch contains transmissive triangles.
-    fn render_transmissive<W: World + MeshWorld, H: Height, S: Sky>(
+    fn render_transmissive<W: MeshWorld, H: Height, S: Sky>(
         mut self,
         world: W,
         fbufs: W::FieldBufs,
@@ -4143,6 +4519,8 @@ impl MeshSight {
                 self.sky.spec2,
                 self.sky.s,
                 self.shadow_map,
+                self.static_shadow_map,
+                if self.has_static_shadow { 1 } else { 0 },
                 self.cmp,
                 self.rad.rad0,
                 self.rad.rad1,
@@ -4175,6 +4553,8 @@ impl MeshSight {
                         sky_spec2: self.sky.spec2,
                         sky_s: self.sky.s,
                         shadow_map: self.shadow_map,
+                        static_shadow_map: self.static_shadow_map,
+                        has_static_shadow: if self.has_static_shadow { 1 } else { 0 },
                         cmp: self.cmp,
                         rad0: self.rad.rad0,
                         rad1: self.rad.rad1,
@@ -4212,6 +4592,8 @@ impl MeshSight {
                         sky_spec2: self.sky.spec2,
                         sky_s: self.sky.s,
                         shadow_map: self.shadow_map,
+                        static_shadow_map: self.static_shadow_map,
+                        has_static_shadow: if self.has_static_shadow { 1 } else { 0 },
                         cmp: self.cmp,
                         rad0: self.rad.rad0,
                         rad1: self.rad.rad1,
@@ -4238,11 +4620,24 @@ impl MeshSight {
         }
     }
 
+    /// Whether every batch's mesh drawn this frame is known complete (`MeshBatch::settled`): a
+    /// frame drawn from a view not seen before can be drawn from meshes extracted for it whose
+    /// counts are not yet back, so a picture judged as the engine's settled picture of a view is
+    /// one drawn when this holds.
+    pub fn settled(self) -> bool {
+        for i in 0..self.batches.len() {
+            if !self.batches[i].settled() {
+                return false
+            }
+        }
+        true
+    }
+
     /// Renders `world` into `self.drawn` (`colour`, `place`, `sun`) without presenting (for
     /// judging against `Reference`), executing the exact same 1× + Halton-jittered TSR pipeline as
     /// `draw_scene` (opaque, indirect, transmissive, resolve) over 8 subpixel frames so offline
     /// judges verify the real temporal resolve.
-    pub fn drawn_only<W: World + MeshWorld, S: Sky, L: Look>(
+    pub fn drawn_only<W: MeshWorld, S: Sky, L: Look>(
         mut self,
         world: W,
         sky: S,
@@ -4362,7 +4757,7 @@ impl MeshSight {
     /// clipmap, 1× G-buffer + motion vectors, phase-cycled half-res GI/SSR, half-res refract SSR +
     /// 3-channel chromatic dispersion, Temporal Super-Resolution (TSR), froxel volumetrics,
     /// optical HDR bloom, and ONE `Look::tone` pass.
-    pub fn draw_scene<W: World + MeshWorld, H: Height, Med: Medium, Sw: Swarm, S: Sky, L: Look>(
+    pub fn draw_scene<W: MeshWorld, H: Height, Med: Medium, Sw: Swarm, S: Sky, L: Look>(
         mut self,
         world: W,
         height: H,
@@ -4428,6 +4823,8 @@ impl MeshSight {
                 self.sky.diff,
                 self.sky.s,
                 self.shadow_map,
+                self.static_shadow_map,
+                if self.has_static_shadow { 1 } else { 0 },
                 self.cmp,
                 self.rad.rad1,
                 self.rad.rad2,
@@ -4470,7 +4867,7 @@ impl MeshSight {
     }
 
     /// Renders `world` (`Surface`s only) into `self.drawn` and presents it to the screen.
-    pub fn draw<W: World + MeshWorld, S: Sky, L: Look>(
+    pub fn draw<W: MeshWorld, S: Sky, L: Look>(
         mut self,
         world: W,
         sky: S,

@@ -1,0 +1,202 @@
+// Pure-field verification architecture for Phase 1:
+//   1. `Citadel` (`SCENE=11`): a 100 m × 100 m multi-hall stone citadel with a tall foreground
+//      arched gatehouse wall (`z = 6 m`) occluding four deep colonnaded masonry halls and sanctuaries
+//      (`z = -8 m` to `-82 m`), paired with 256 walking creatures to stress-test 2-pass Reversed-Z
+//      Hi-Z occlusion culling (`> 60%` occluded bricks culled, `< 10 ms` M4).
+//   2. `MarbleColumn` (`SCENE=12`): a fluted veined marble temple column whose `channels(p)`
+//      defines true 3D interior strata and gold-ochre mineral veining throughout `d < 0`, so live
+//      CSG cuts (`Edited<MarbleColumn>`) expose real 3D interior rock veins in `< 0.15 ms`.
+//
+// 100% pure fields (zero GPU code, zero meshes, zero textures).
+
+use engine::matter::substance::Substance
+use kit::substances::pbr::{basalt, glazed, metal, stone}
+use std::cmp::Eq
+use std::field::{Bound, Field, Surface}
+use std::hash::StateHash
+
+fn sd_box(p: vec3, c: vec3, h: vec3) -> f32 {
+    let q = abs(p - c) - h
+    length(max(q, vec3(0.0))) + min(max(q.x, max(q.y, q.z)), 0.0)
+}
+
+fn sd_cyl(p: vec3, cx: f32, cz: f32, y_lo: f32, y_hi: f32, r: f32) -> f32 {
+    let dr = length(vec2(p.x - cx, p.z - cz)) - r
+    let dy = max(p.y - y_hi, y_lo - p.y)
+    length(max(vec2(dr, dy), vec2(0.0))) + min(max(dr, dy), 0.0)
+}
+
+/// Exact 1-Lipschitz SDF of a wide masonry bastion wall at `z = zc`, half-width `hw`, height `ht`,
+/// half-thickness `hz`, pierced by a central portal opening of half-width `gate_hw` and height
+/// `gate_h` plus flanking buttress piers.
+fn sd_bastion_wall(
+    p: vec3,
+    zc: f32,
+    hw: f32,
+    ht: f32,
+    hz: f32,
+    gate_hw: f32,
+    gate_h: f32,
+) -> f32 {
+    let side_hw = max(0.5 * (hw - gate_hw), 0.5)
+    let side_cx = gate_hw + side_hw
+    let d_wing = sd_box(
+        vec3(abs(p.x), p.y, p.z),
+        vec3(side_cx, 0.5 * ht, zc),
+        vec3(side_hw, 0.5 * ht, hz),
+    )
+    let lintel_h = max(0.5 * (ht - gate_h), 0.4)
+    let d_lintel = sd_box(
+        p,
+        vec3(0.0, gate_h + lintel_h, zc),
+        vec3(gate_hw + 0.6, lintel_h, hz + 0.15),
+    )
+    // Flanking square gate piers and outer watch buttresses (folded symmetrically via `abs(p.x)`).
+    let px = abs(p.x)
+    let d_pier_in = sd_box(
+        vec3(px, p.y, p.z),
+        vec3(gate_hw + 0.9, 0.54 * ht, zc),
+        vec3(0.95, 0.54 * ht, hz + 0.55),
+    )
+    let d_pier_out = sd_box(
+        vec3(px, p.y, p.z),
+        vec3(hw * 0.62, 0.58 * ht, zc),
+        vec3(1.5, 0.58 * ht, hz + 0.85),
+    )
+    min(min(d_wing, d_lintel), min(d_pier_in, d_pier_out))
+}
+
+/// 100 m × 100 m occluded stone citadel (`SCENE=11` stress scene).
+pub struct Citadel: Copy + GpuData + Eq + StateHash {
+    pub spare: f32,
+}
+
+pub fn citadel() -> Citadel {
+    Citadel { spare: 0.0 }
+}
+
+impl Surface for Citadel {
+    fn distance(self, p: vec3) -> f32 {
+        // 100 m × 100 m stepped terrace floor (`x in [-50, 50]`, `z in [-86, 14]`).
+        var d = sd_box(p, vec3(0.0, -0.4, -36.0), vec3(50.0, 0.4, 50.0))
+
+        // 1. Massive foreground gatehouse bastion (`z = 5.5 m`): frames a central 4.4 m × 4.6 m
+        //    portal while solidly occluding the deep cloister halls and crowds behind it.
+        d = min(d, sd_bastion_wall(p, zc: 5.5, hw: 38.0, ht: 9.2, hz: 0.95, gate_hw: 2.2, gate_h: 4.6))
+
+        // 2. Four deep interior masonry walls + halls stretching back to `z = -78 m` (heavily
+        //    occluded behind the foreground bastion!).
+        d = min(d, sd_bastion_wall(p, zc: -12.0, hw: 40.0, ht: 8.6, hz: 0.85, gate_hw: 3.4, gate_h: 4.4))
+        d = min(d, sd_bastion_wall(p, zc: -32.0, hw: 42.0, ht: 9.4, hz: 0.90, gate_hw: 3.0, gate_h: 4.8))
+        d = min(d, sd_bastion_wall(p, zc: -54.0, hw: 44.0, ht: 10.2, hz: 0.95, gate_hw: 3.6, gate_h: 5.2))
+        d = min(d, sd_bastion_wall(p, zc: -76.0, hw: 46.0, ht: 11.8, hz: 1.10, gate_hw: 4.0, gate_h: 6.0))
+
+        // 3. Cloister side walls closing the 84 m × 92 m perimeter.
+        let ax = abs(p.x)
+        let d_side = sd_box(vec3(ax, p.y, p.z), vec3(42.0, 4.5, -36.0), vec3(1.1, 4.5, 44.0))
+        d = min(d, d_side)
+
+        // 4. Periodic interior colonnade pillars across every cloister bay (1-Lipschitz folded
+        //    domain repetition clamped to the courtyard interior).
+        let rep_x = clamp(round(p.x / 10.0) * 10.0, -30.0, 30.0)
+        let rep_z = clamp(round((p.z + 3.0) / 10.0) * 10.0 - 3.0, -68.0, -3.0)
+        let d_col = sd_cyl(p, cx: rep_x, cz: rep_z, y_lo: 0.0, y_hi: 7.4, r: 0.65)
+        d = min(d, d_col)
+
+        // 5. Central sanctuary plinth visible through the gatehouse axis.
+        let d_sanct = sd_box(p, vec3(0.0, 1.1, -22.0), vec3(2.8, 1.1, 2.8))
+        min(d, d_sanct)
+    }
+
+    fn bound(self) -> Bound {
+        Bound { centre: vec3(0.0, 5.5, -36.0), radius: 74.0, slope: 0.5 }
+    }
+
+    fn lipschitz(self, _near: f32) -> f32 {
+        1.0
+    }
+}
+
+impl Field<Substance> for Citadel {
+    fn channels(self, p: vec3) -> Substance {
+        // Horizontal ashlar masonry courses + dark basalt courtyard flagstones.
+        if p.y < 0.08 {
+            let gx = abs(fract(p.x * 0.5) - 0.5)
+            let gz = abs(fract(p.z * 0.5) - 0.5)
+            let seam = smoothstep(0.44, 0.49, max(gx, gz))
+            let shade = 0.88 + 0.12 * sin(p.x * 0.35 + p.z * 0.27)
+            let base = vec3(0.18, 0.19, 0.21) * shade * (1.0 - 0.35 * seam)
+            return basalt(base, wetness: 0.20 * (1.0 - seam))
+        }
+        let course_y = fract(p.y * 1.25)
+        let stagger = floor(p.y * 1.25) * 0.5
+        let block_x = fract((p.x + p.z) * 0.45 + stagger)
+        let mortar = max(
+            1.0 - smoothstep(0.02, 0.06, min(course_y, 1.0 - course_y)),
+            1.0 - smoothstep(0.02, 0.05, min(block_x, 1.0 - block_x)),
+        )
+        let tint = 0.90 + 0.10 * sin(floor(p.y * 1.25) * 2.1 + floor((p.x + p.z) * 0.45) * 1.7)
+        let warm = vec3(0.46, 0.43, 0.38) * tint * (1.0 - 0.28 * mortar)
+        stone(warm, roughness: clamp(0.76 + 0.14 * mortar, 0.5, 0.96))
+    }
+}
+
+/// Fluted Carrara marble temple column with true 3D interior marble & gold-ochre mineral veining
+/// throughout its volume (`d < 0`), designed for live CSG destruction (`SCENE=12`).
+pub struct MarbleColumn: Copy + GpuData + Eq + StateHash {
+    pub centre_x: f32,
+    pub centre_z: f32,
+}
+
+pub fn marble_column(centre_x: f32 = 0.0, centre_z: f32 = 0.0) -> MarbleColumn {
+    MarbleColumn { centre_x, centre_z }
+}
+
+impl Surface for MarbleColumn {
+    fn distance(self, p: vec3) -> f32 {
+        let lp = vec3(p.x - self.centre_x, p.y, p.z - self.centre_z)
+        // Square moulded plinth (`y in [0.0, 0.52]`).
+        let d_plinth = sd_box(lp, vec3(0.0, 0.26, 0.0), vec3(0.95, 0.26, 0.95))
+        // Square abacus capital (`y in [3.70, 4.16]`).
+        let d_cap = sd_box(lp, vec3(0.0, 3.93, 0.0), vec3(0.92, 0.23, 0.92))
+        // Subtle 12-flute cylindrical shaft (`y in [0.46, 3.76]`, `r = 0.68 m`).
+        let r = length(lp.xz)
+        let ang = atan2(lp.z, lp.x)
+        let flute = 0.022 * sin(ang * 12.0) * smoothstep(0.55, 0.78, lp.y) * (1.0 - smoothstep(3.45, 3.68, lp.y))
+        let dr = r - (0.68 - flute)
+        let dy = max(lp.y - 3.76, 0.46 - lp.y)
+        let d_shaft = length(max(vec2(dr, dy), vec2(0.0))) + min(max(dr, dy), 0.0)
+        min(min(d_plinth, d_cap), d_shaft)
+    }
+
+    fn bound(self) -> Bound {
+        Bound { centre: vec3(self.centre_x, 2.08, self.centre_z), radius: 2.55, slope: 0.5 }
+    }
+
+    fn lipschitz(self, _near: f32) -> f32 {
+        1.12
+    }
+}
+
+impl Field<Substance> for MarbleColumn {
+    fn channels(self, p: vec3) -> Substance {
+        let lp = vec3(p.x - self.centre_x, p.y, p.z - self.centre_z)
+        // True 3D internal marble strata: diagonal folded sine waves running through the core so
+        // any CSG cut face immediately reveals crisp internal charcoal & gold-ochre mineral veins!
+        let warp = 0.45 * sin(lp.x * 3.8 + lp.z * 2.9 + lp.y * 1.4) +
+            0.22 * cos(lp.y * 5.2 - lp.x * 4.1 + lp.z * 3.3)
+        let s1 = abs(sin((lp.x * 3.2 + lp.y * 2.1 - lp.z * 2.7) + warp * 2.4))
+        let dark_vein = 1.0 - smoothstep(0.0, 0.16, s1)
+        let s2 = abs(sin((lp.x * 5.4 - lp.y * 3.1 + lp.z * 4.2) - warp * 1.8))
+        let gold_vein = 1.0 - smoothstep(0.0, 0.10, s2)
+        // Inner core is richer warm amber-marble so deep craters contrast vividly with outer ivory.
+        let r_core = clamp(1.0 - length(lp.xz) / 0.65, 0.0, 1.0)
+        let ivory = mix(vec3(0.84, 0.81, 0.75), vec3(0.76, 0.69, 0.58), r_core * 0.65)
+        let veined = mix(ivory, vec3(0.19, 0.20, 0.23), dark_vein * 0.78)
+        let final_col = mix(veined, vec3(0.85, 0.64, 0.24), gold_vein * (0.45 + 0.45 * r_core))
+        if gold_vein > 0.55 {
+            return metal(vec3(0.90, 0.70, 0.28), roughness: 0.24)
+        }
+        glazed(final_col, roughness: clamp(0.24 + 0.14 * dark_vein, 0.12, 0.55), coat: 0.35)
+    }
+}

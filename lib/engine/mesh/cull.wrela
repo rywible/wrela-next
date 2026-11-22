@@ -1,0 +1,710 @@
+// Two-pass Reversed-Z Hierarchical-Z (`R32Float`) occlusion culling and multi-draw indirect
+// dispatch (`draw_multi()`) for large GPU-instanced `Pool<M>` crowds (`first_instance`): a draw an
+// instance.
+//
+// Not culled: the bricks of one thing. One draw a brick cost the M4 7.2 ms a frame recording
+// SCENE 10 (Metal's multi-draw is a loop of draws on the CPU), and bricks drawn 4 or 64 slots at
+// a time culled 17.6% and 0% of the citadel's (SCENE 11) where one at a time culled 37.6%: the
+// extraction appends a thing's bricks in no spatial order, so neighbouring slots are not
+// neighbouring bricks. Culling them wants an ordered compaction of the active bricks, or a
+// compacted index buffer drawn once (docs/design.md).
+//
+// Algorithm (Karis et al. 2021 Nanite two-pass occlusion; Wihlidal 2016):
+//   - Pass 1: Frustum-cull against current `View` and occlusion-cull against previous frame's
+//     conservative MIN-depth Reversed-Z Hi-Z pyramid (`prev_v`). Bricks/instances outside `prev_v`
+//     are treated as visible in Pass 1; those occluded by `prev_hiz` are marked in `occluded_mask`.
+//   - Build current-frame half-res `R32Float` MIN-depth Hi-Z pyramid from Pass 1 `DepthTexture`
+//     (with conservative 3-tap odd-dimension edge reduction so non-power-of-two screens never leak).
+//   - Pass 2: Re-test only `occluded_mask != 0` candidates against current `View` + Pass 1 Hi-Z,
+//     drawing any newly disoccluded geometry into the loaded G-buffer + depth (zero popping).
+//   - The Pass 1 pyramid is also next frame's: built once a frame (what Pass 2 draws is missing
+//     from it, which only makes next frame's Pass 1 cull less). Non-stalling telemetry
+//     (`CullStats`, `read_settled`) says whether culling finds anything, and culling runs only
+//     while it does (`HiZCuller::begin`).
+
+use mesh::extract::MeshBatch
+use mesh::light::NEAR
+use picture::eye::{Eye, View, view}
+use std::collections::Vec
+use std::field::Rigid
+use std::gpu::{
+    Atomics, DepthTexture, DrawIndexedArgs, GlobalId, GpuBuffer, MipStep, R32Float, Slots, Texels,
+    Texture, buffer, buffer_of, dispatch, label, mip_levels, read_settled, writable_texture, write,
+}
+use std::io::Pending
+
+/// Side length of mip level `level` of a texture whose level-0 side is `side` (WebGPU/Metal/Vulkan).
+fn hiz_level_side(side: u32, level: u32) -> u32 {
+    max(side >> level, 1)
+}
+
+/// Zeroed `DrawIndexedArgs` (skips rendering in `draw_multi()`).
+fn empty_draw_args() -> DrawIndexedArgs {
+    DrawIndexedArgs {
+        indices: 0,
+        instances: 0,
+        first_index: 0,
+        base_vertex: 0,
+        first_instance: 0,
+    }
+}
+
+/// Transforms axis-aligned box `[lo, hi]` by rigid transform `xf` into a tight world-space AABB.
+fn transform_aabb(xf: Rigid, lo: vec3, hi: vec3) -> (vec3, vec3) {
+    var wlo = vec3(1.0e30)
+    var whi = vec3(-1.0e30)
+    for k in 0..8 {
+        let cx = if (k & 1) != 0 { hi.x } else { lo.x }
+        let cy = if (k & 2) != 0 { hi.y } else { lo.y }
+        let cz = if (k & 4) != 0 { hi.z } else { lo.z }
+        let wp = xf.apply_point(vec3(cx, cy, cz))
+        wlo = min(wlo, wp)
+        whi = max(whi, wp)
+    }
+    (wlo, whi)
+}
+
+/// Projects world-space AABB `[lo, hi]` onto `v`'s screen UV space `[0, 1]^2` (top-left origin,
+/// matching `depth.load(px, py)` and `clip_of(v, wp)`).
+/// Returns `(status, vec4(u0, v0, u1, v1), box_z_max)`:
+///   - `0`: completely behind near plane or outside frustum (frustum-culled)
+///   - `1`: straddles near plane (`z_min <= 2 * NEAR`; always visible, skip Hi-Z)
+///   - `2`: strictly in front of near plane and overlaps frustum (clamped 1-px-padded UV + nearest
+///          Reversed-Z depth `box_z_max = NEAR / z_min`)
+fn project_aabb_uv(lo: vec3, hi: vec3, v: View) -> (u32, vec4, f32) {
+    var z_min: f32 = 1.0e30
+    var z_max: f32 = -1.0e30
+    for k in 0..8 {
+        let cx = if (k & 1) != 0 { hi.x } else { lo.x }
+        let cy = if (k & 2) != 0 { hi.y } else { lo.y }
+        let cz = if (k & 4) != 0 { hi.z } else { lo.z }
+        let z = dot(vec3(cx, cy, cz) - v.at, v.forward)
+        z_min = min(z_min, z)
+        z_max = max(z_max, z)
+    }
+    if z_max <= NEAR {
+        return (0, vec4(0.0), 0.0)
+    }
+    if z_min <= 2.0 * NEAR {
+        return (1, vec4(0.0, 0.0, 1.0, 1.0), 1.0)
+    }
+    let aspect = v.size.y / max(v.size.x, 1.0)
+    let jx = 2.0 * v.jitter.x / max(v.size.x, 1.0)
+    let jy = 2.0 * v.jitter.y / max(v.size.y, 1.0)
+    var u_min: f32 = 1.0e30
+    var u_max: f32 = -1.0e30
+    var v_min: f32 = 1.0e30
+    var v_max: f32 = -1.0e30
+    for k in 0..8 {
+        let cx = if (k & 1) != 0 { hi.x } else { lo.x }
+        let cy = if (k & 2) != 0 { hi.y } else { lo.y }
+        let cz = if (k & 4) != 0 { hi.z } else { lo.z }
+        let rel = vec3(cx, cy, cz) - v.at
+        let x = dot(rel, v.right)
+        let y = dot(rel, v.up)
+        let z = dot(rel, v.forward)
+        let ndc_x = (x * v.focal * aspect) / z - jx
+        let ndc_y = (y * v.focal) / z + jy
+        let u = 0.5 * (ndc_x + 1.0)
+        let vc = 0.5 * (1.0 - ndc_y)
+        u_min = min(u_min, u)
+        u_max = max(u_max, u)
+        v_min = min(v_min, vc)
+        v_max = max(v_max, vc)
+    }
+    if u_max < 0.0 || u_min > 1.0 || v_max < 0.0 || v_min > 1.0 {
+        return (0, vec4(0.0), 0.0)
+    }
+    // 1-pixel conservative UV pad absorbs Halton subpixel jitter (±0.5 px) and raster tie-breaks.
+    let pad_u = 1.0 / max(v.size.x, 1.0)
+    let pad_v = 1.0 / max(v.size.y, 1.0)
+    let u0 = clamp(u_min - pad_u, 0.0, 1.0)
+    let v0 = clamp(v_min - pad_v, 0.0, 1.0)
+    let u1 = clamp(u_max + pad_u, 0.0, 1.0)
+    let v1 = clamp(v_max + pad_v, 0.0, 1.0)
+    let box_z_max = NEAR / z_min
+    (2, vec4(u0, v0, u1, v1), box_z_max)
+}
+
+/// Selects the finest Hi-Z mip level `mip` at which screen UV rect `[u0..u1] × [v0..v1]` spans
+/// at most `2 × 2` texels `(mx0..=mx1) × (my0..=my1)` (100% conservative for both even and odd
+/// pyramid dimensions because odd reductions fold the trailing border texel into the last bin).
+fn choose_hiz_mip(uv: vec4, hiz_w: u32, hiz_h: u32, levels: u32) -> (u32, u32, u32, u32, u32) {
+    let fw = f32(hiz_w)
+    let fh = f32(hiz_h)
+    let ix0 = u32(clamp(floor(uv.x * fw), 0.0, fw - 1.0))
+    let iy0 = u32(clamp(floor(uv.y * fh), 0.0, fh - 1.0))
+    let ix1 = u32(clamp(floor(uv.z * fw), 0.0, fw - 1.0))
+    let iy1 = u32(clamp(floor(uv.w * fh), 0.0, fh - 1.0))
+    var mip: u32 = 0
+    var mx0 = ix0
+    var my0 = iy0
+    var mx1 = ix1
+    var my1 = iy1
+    for _step in 0..14 {
+        if (mx1 - mx0) <= 1 && (my1 - my0) <= 1 {
+            break
+        }
+        if mip + 1 >= levels {
+            break
+        }
+        mip += 1
+        let mw = hiz_level_side(hiz_w, mip)
+        let mh = hiz_level_side(hiz_h, mip)
+        mx0 = min(ix0 >> mip, mw - 1)
+        my0 = min(iy0 >> mip, mh - 1)
+        mx1 = min(ix1 >> mip, mw - 1)
+        my1 = min(iy1 >> mip, mh - 1)
+    }
+    (mip, mx0, my0, mx1, my1)
+}
+
+/// Tests whether world AABB `[lo, hi]` is strictly occluded by Reversed-Z conservative MIN-depth
+/// pyramid `hiz` rendered from view `hiz_v`. Returns `false` if outside `hiz_v` or straddling near.
+fn hiz_is_occluded(
+    lo: vec3,
+    hi: vec3,
+    hiz_v: View,
+    hiz: Texture<R32Float>,
+    hiz_w: u32,
+    hiz_h: u32,
+    levels: u32,
+) -> bool {
+    let (st, uv, box_z_max) = project_aabb_uv(lo, hi, hiz_v)
+    if st != 2 {
+        return false
+    }
+    let (mip, mx0, my0, mx1, my1) = choose_hiz_mip(uv, hiz_w, hiz_h, levels)
+    let d00 = hiz.load(mx0, my0, level: mip)
+    let d10 = hiz.load(mx1, my0, level: mip)
+    let d01 = hiz.load(mx0, my1, level: mip)
+    let d11 = hiz.load(mx1, my1, level: mip)
+    let hiz_min = min(min(d00, d10), min(d01, d11))
+    box_z_max * 1.0002 < hiz_min
+}
+
+/// Reduces full-resolution Reversed-Z `DepthTexture` (`full_w × full_h`) to half-resolution Hi-Z
+/// level 0 (`hiz_w × hiz_h`) via conservative MIN (folding the 3rd border column/row on odd sizes).
+@compute(8, 8)
+fn depth_to_hiz_level0(
+    depth: DepthTexture,
+    full_w: u32,
+    full_h: u32,
+    hiz_w: u32,
+    hiz_h: u32,
+    out: mut Texels<R32Float>,
+    id: GlobalId,
+) {
+    if id.x >= hiz_w || id.y >= hiz_h {
+        return
+    }
+    let x0 = id.x * 2
+    let y0 = id.y * 2
+    let x1 = min(x0 + 1, full_w - 1)
+    let y1 = min(y0 + 1, full_h - 1)
+    var d = min(
+        min(depth.load(x0, y0), depth.load(x1, y0)),
+        min(depth.load(x0, y1), depth.load(x1, y1)),
+    )
+    let extra_x = (full_w & 1) != 0 && id.x + 1 == hiz_w && x1 + 1 < full_w
+    let extra_y = (full_h & 1) != 0 && id.y + 1 == hiz_h && y1 + 1 < full_h
+    if extra_x {
+        d = min(d, min(depth.load(x1 + 1, y0), depth.load(x1 + 1, y1)))
+    }
+    if extra_y {
+        d = min(d, min(depth.load(x0, y1 + 1), depth.load(x1, y1 + 1)))
+    }
+    if extra_x && extra_y {
+        d = min(d, depth.load(x1 + 1, y1 + 1))
+    }
+    out.store(id, d)
+}
+
+/// Conservative MIN reduction for Hi-Z mip level `i` from level `i - 1` (with 3-tap odd borders).
+@compute(8, 8)
+fn reduce_hiz_mip(step: mut MipStep<R32Float>, dst_w: u32, dst_h: u32, id: GlobalId) {
+    if id.x >= dst_w || id.y >= dst_h {
+        return
+    }
+    let src = step.source_size()
+    let x0 = id.x * 2
+    let y0 = id.y * 2
+    let x1 = min(x0 + 1, src.x - 1)
+    let y1 = min(y0 + 1, src.y - 1)
+    var d = min(
+        min(step.load(x0, y0), step.load(x1, y0)),
+        min(step.load(x0, y1), step.load(x1, y1)),
+    )
+    let extra_x = (src.x & 1) != 0 && id.x + 1 == dst_w && x1 + 1 < src.x
+    let extra_y = (src.y & 1) != 0 && id.y + 1 == dst_h && y1 + 1 < src.y
+    if extra_x {
+        d = min(d, min(step.load(x1 + 1, y0), step.load(x1 + 1, y1)))
+    }
+    if extra_y {
+        d = min(d, min(step.load(x0, y1 + 1), step.load(x1, y1 + 1)))
+    }
+    if extra_x && extra_y {
+        d = min(d, step.load(x1 + 1, y1 + 1))
+    }
+    step.store(id, d)
+}
+
+/// Pass 1 per-instance culling for large `Pool<M>` crowds (`>= 16` instances): transforms the
+/// template AABB by `xforms[i]`, frustum + `prev_hiz` culls, and writes `first_instance = i`.
+@compute(64)
+fn cull_instances_pass1(
+    template_args: [DrawIndexedArgs],
+    xforms: [Rigid],
+    template_lo: vec3,
+    template_hi: vec3,
+    v: View,
+    prev_v: View,
+    hiz: Texture<R32Float>,
+    hiz_w: u32,
+    hiz_h: u32,
+    hiz_levels: u32,
+    hiz_ready: u32,
+    count: u32,
+    vis_draws_1: mut Slots<DrawIndexedArgs>,
+    occluded_mask: mut Slots<u32>,
+    stats: mut Atomics<u32>,
+    id: GlobalId,
+) {
+    let i = id.x
+    if i >= count {
+        return
+    }
+    let base = template_args[0]
+    if base.indices == 0 || base.instances == 0 {
+        vis_draws_1[id] = empty_draw_args()
+        occluded_mask[id] = 0
+        return
+    }
+    let _ = stats.add(i: 0, value: 1)
+    let (wlo, whi) = transform_aabb(xforms[i], template_lo, template_hi)
+    let (cur_st, _uv, _zm) = project_aabb_uv(wlo, whi, v)
+    if cur_st == 0 {
+        vis_draws_1[id] = empty_draw_args()
+        occluded_mask[id] = 0
+        let _ = stats.add(i: 1, value: 1)
+        return
+    }
+    if hiz_ready != 0 && cur_st == 2 {
+        if hiz_is_occluded(wlo, whi, prev_v, hiz, hiz_w, hiz_h, hiz_levels) {
+            vis_draws_1[id] = empty_draw_args()
+            occluded_mask[id] = 1
+            return
+        }
+    }
+    vis_draws_1[id] = DrawIndexedArgs {
+        indices: base.indices,
+        instances: 1,
+        first_index: base.first_index,
+        base_vertex: base.base_vertex,
+        first_instance: i,
+    }
+    occluded_mask[id] = 0
+    let _ = stats.add(i: 3, value: 1)
+}
+
+/// Pass 2 per-instance disocclusion re-test for large `Pool<M>` crowds.
+@compute(64)
+fn cull_instances_pass2(
+    template_args: [DrawIndexedArgs],
+    xforms: [Rigid],
+    occluded_mask: [u32],
+    template_lo: vec3,
+    template_hi: vec3,
+    v: View,
+    hiz: Texture<R32Float>,
+    hiz_w: u32,
+    hiz_h: u32,
+    hiz_levels: u32,
+    count: u32,
+    vis_draws_2: mut Slots<DrawIndexedArgs>,
+    stats: mut Atomics<u32>,
+    id: GlobalId,
+) {
+    let i = id.x
+    if i >= count {
+        return
+    }
+    if occluded_mask[i] == 0 {
+        vis_draws_2[id] = empty_draw_args()
+        return
+    }
+    let (wlo, whi) = transform_aabb(xforms[i], template_lo, template_hi)
+    if hiz_is_occluded(wlo, whi, v, hiz, hiz_w, hiz_h, hiz_levels) {
+        vis_draws_2[id] = empty_draw_args()
+        let _ = stats.add(i: 2, value: 1)
+        return
+    }
+    let base = template_args[0]
+    vis_draws_2[id] = DrawIndexedArgs {
+        indices: base.indices,
+        instances: 1,
+        first_index: base.first_index,
+        base_vertex: base.base_vertex,
+        first_instance: i,
+    }
+    let _ = stats.add(i: 4, value: 1)
+}
+
+/// Per-batch GPU indirect draw buffers populated by `HiZCuller` for Pass 1 and Pass 2 `draw_multi`.
+pub struct CullBatch {
+    pub vis_draws_1: GpuBuffer<DrawIndexedArgs>,
+    pub vis_draws_2: GpuBuffer<DrawIndexedArgs>,
+    pub occluded_mask: GpuBuffer<u32>,
+    pub cap: u32,
+}
+
+fn cull_batch() -> CullBatch {
+    CullBatch {
+        vis_draws_1: buffer(64),
+        vis_draws_2: buffer(64),
+        occluded_mask: buffer(64),
+        cap: 64,
+    }
+}
+
+impl CullBatch {
+    fn ensure_cap(mut self, need: u32) {
+        let aligned = max(((need + 63) / 64) * 64, 64)
+        if aligned > self.cap {
+            self.vis_draws_1 = buffer(aligned)
+            self.vis_draws_2 = buffer(aligned)
+            self.occluded_mask = buffer(aligned)
+            self.cap = aligned
+        }
+    }
+}
+
+/// Non-stalling occlusion telemetry reported from `HiZCuller`.
+pub struct CullStats: Copy {
+    pub total: u32,
+    pub frustum_culled: u32,
+    pub hiz_culled: u32,
+    pub pass1_drawn: u32,
+    pub pass2_drawn: u32,
+}
+
+impl CullStats {
+    /// Total fraction of alive bricks/instances culled (frustum + Hi-Z).
+    pub fn culled_fraction(self) -> f32 {
+        if self.total == 0 {
+            0.0
+        } else {
+            f32(self.frustum_culled + self.hiz_culled) / f32(self.total)
+        }
+    }
+
+    /// Fraction of in-frustum bricks/instances culled strictly by Hi-Z occlusion.
+    pub fn hiz_fraction(self) -> f32 {
+        let in_frustum = if self.total > self.frustum_culled {
+            self.total - self.frustum_culled
+        } else {
+            0
+        }
+        if in_frustum == 0 {
+            0.0
+        } else {
+            f32(self.hiz_culled) / f32(in_frustum)
+        }
+    }
+}
+
+/// Persistent GPU 2-pass Reversed-Z Hi-Z occlusion culler owned by `MeshSight`.
+pub struct HiZCuller {
+    pub hiz: Texture<R32Float>,
+    pub hiz_w: u32,
+    pub hiz_h: u32,
+    pub hiz_levels: u32,
+    pub hiz_ready: bool,
+    pub prev_v: View,
+    pub batch_bufs: Vec<CullBatch>,
+    pub stats_gpu: GpuBuffer<u32>,
+    stats_poll: Option<Pending<u32>>,
+    last_stats: CullStats,
+    /// Whether this run culls (`begin`): the pools' draws then take the culled draws.
+    pub active: bool,
+    /// Readbacks in a row that found nothing occluded, and the runs `begin` has seen.
+    quiet: u32,
+    runs: u32,
+}
+
+/// Readbacks in a row that found nothing occluded after which culling stops (but for `PROBE`).
+const QUIET_READS: u32 = 4
+
+/// While culling is stopped it runs two runs in every this many (a pyramid, then a test against
+/// it), to find whether something has come to be occluded. The pyramid and the split eye pass
+/// cost 0.67 ms on the Radeon in SCENE 8 where nothing is occluded; where 72% of a crowd is
+/// (SCENE 11) culling saved 1.09 ms of the eye pass on the Radeon against 0.78 ms of pyramid.
+const PROBE: u32 = 32
+
+/// Creates a lazy `HiZCuller` (resizes on first rendered frame).
+pub fn hiz_culler() -> HiZCuller {
+    HiZCuller {
+        hiz: writable_texture(width: 1, height: 1, levels: 1),
+        hiz_w: 1,
+        hiz_h: 1,
+        hiz_levels: 1,
+        hiz_ready: false,
+        prev_v: view(
+            Eye { at: vec3(0.0, 0.0, 1.0), toward: vec3(0.0), wide: 1.0 },
+            width: 1,
+            height: 1,
+        ),
+        batch_bufs: Vec::new(),
+        stats_gpu: buffer_of([0, 0, 0, 0, 0]),
+        stats_poll: None,
+        active: false,
+        quiet: 0,
+        runs: 0,
+        last_stats: CullStats {
+            total: 0,
+            frustum_culled: 0,
+            hiz_culled: 0,
+            pass1_drawn: 0,
+            pass2_drawn: 0,
+        },
+    }
+}
+
+impl HiZCuller {
+    /// Resizes the half-resolution `R32Float` Hi-Z pyramid when viewport dimensions change.
+    pub fn resize(mut self, width: u32, height: u32) {
+        let hw = max(width / 2, 1)
+        let hh = max(height / 2, 1)
+        if hw != self.hiz_w || hh != self.hiz_h {
+            let lvls = mip_levels(hw, hh)
+            self.hiz = writable_texture(width: hw, height: hh, levels: lvls)
+            self.hiz_w = hw
+            self.hiz_h = hh
+            self.hiz_levels = lvls
+            self.hiz_ready = false
+        }
+    }
+
+    /// Ensures `self.batch_bufs` has at least `nb` entries.
+    pub fn ensure_batches(mut self, nb: u32) {
+        while self.batch_bufs.len() < nb {
+            self.batch_bufs.push(cull_batch())
+        }
+    }
+
+    /// Returns whether any batch in `0..nb` uses 2-pass Hi-Z brick or instance culling.
+    pub fn has_any_culled(self, batches: mut Vec<MeshBatch>, nb: u32) -> bool {
+        for i in 0..nb {
+            if batches[i].use_inst_cull() {
+                return true
+            }
+        }
+        false
+    }
+
+    /// Begins a run (a draw of the eye): whether it culls. It culls a world with a pool to cull
+    /// while culling keeps finding something occluded, and two runs in every `PROBE` otherwise.
+    pub fn begin(mut self, batches: mut Vec<MeshBatch>, nb: u32) -> bool {
+        self.poll_stats()
+        let probe = self.runs % PROBE < 2
+        self.runs += 1
+        self.active = self.has_any_culled(mut batches, nb) && (self.quiet < QUIET_READS || probe)
+        if !self.active {
+            // (The pyramid is not kept up while culling is stopped.)
+            self.hiz_ready = false
+        }
+        self.active
+    }
+
+    /// Polls any settled async occlusion telemetry readback without stalling.
+    pub fn poll_stats(mut self) {
+        match mut self.stats_poll {
+            Some(p) => match p.poll() {
+                Some(Ok(c)) => {
+                    if c.len() >= 5 {
+                        self.quiet = if c[2] == 0 { self.quiet + 1 } else { 0 }
+                        self.last_stats = CullStats {
+                            total: c[0],
+                            frustum_culled: c[1],
+                            hiz_culled: c[2],
+                            pass1_drawn: c[3],
+                            pass2_drawn: c[4],
+                        }
+                    }
+                    self.stats_poll = None
+                },
+                Some(Err(_)) => {
+                    self.stats_poll = None
+                },
+                None => {},
+            },
+            None => {},
+        }
+    }
+
+    /// Returns the most recently settled GPU occlusion statistics.
+    pub fn stats(self) -> CullStats {
+        self.last_stats
+    }
+
+    /// Runs Pass 1 frustum + previous-frame Hi-Z culling for all eligible batches.
+    pub fn cull_pass1(mut self, batches: mut Vec<MeshBatch>, nb: u32, v: View) {
+        self.ensure_batches(nb)
+        write(mut self.stats_gpu, 0, [0, 0, 0, 0, 0])
+        label("mesh_cull")
+        let ready: u32 = if self.hiz_ready { 1 } else { 0 }
+        for i in 0..nb {
+            if batches[i].use_inst_cull() {
+                let n = batches[i].inst_count
+                if n > 0 {
+                    self.batch_bufs[i].ensure_cap(n)
+                    dispatch(
+                        cull_instances_pass1.bind(
+                            template_args: batches[i].draw_args.items(),
+                            xforms: batches[i].xforms.items(),
+                            template_lo: batches[i].template_lo,
+                            template_hi: batches[i].template_hi,
+                            v: v,
+                            prev_v: self.prev_v,
+                            hiz: self.hiz,
+                            hiz_w: self.hiz_w,
+                            hiz_h: self.hiz_h,
+                            hiz_levels: self.hiz_levels,
+                            hiz_ready: ready,
+                            count: n,
+                            vis_draws_1: self.batch_bufs[i].vis_draws_1.span_mut(
+                                start: 0,
+                                count: n,
+                            ),
+                            occluded_mask: self.batch_bufs[i].occluded_mask.span_mut(
+                                start: 0,
+                                count: n,
+                            ),
+                            stats: mut self.stats_gpu,
+                        ),
+                        over: n,
+                    )
+                }
+            }
+        }
+    }
+
+    /// Builds the full conservative MIN-depth Reversed-Z Hi-Z mip pyramid from `depth`.
+    pub fn build_hiz(mut self, depth: DepthTexture, full_w: u32, full_h: u32) {
+        label("mesh_hiz")
+        dispatch(
+            depth_to_hiz_level0.bind(
+                depth: depth,
+                full_w: full_w,
+                full_h: full_h,
+                hiz_w: self.hiz_w,
+                hiz_h: self.hiz_h,
+                out: self.hiz.level_mut(0),
+            ),
+            groups: ((self.hiz_w + 7) / 8, (self.hiz_h + 7) / 8, 1),
+        )
+        for lvl in 1..self.hiz_levels {
+            let dw = hiz_level_side(self.hiz_w, lvl)
+            let dh = hiz_level_side(self.hiz_h, lvl)
+            dispatch(
+                reduce_hiz_mip.bind(step: self.hiz.mip_step(lvl), dst_w: dw, dst_h: dh),
+                groups: ((dw + 7) / 8, (dh + 7) / 8, 1),
+            )
+        }
+    }
+
+    /// Runs Pass 2 disocclusion re-testing against current `v` + Pass 1 `self.hiz`.
+    pub fn cull_pass2(mut self, batches: mut Vec<MeshBatch>, nb: u32, v: View) {
+        label("mesh_cull_pass2")
+        for i in 0..nb {
+            if batches[i].use_inst_cull() {
+                let n = batches[i].inst_count
+                if n > 0 {
+                    dispatch(
+                        cull_instances_pass2.bind(
+                            template_args: batches[i].draw_args.items(),
+                            xforms: batches[i].xforms.items(),
+                            occluded_mask: self.batch_bufs[i].occluded_mask.items(),
+                            template_lo: batches[i].template_lo,
+                            template_hi: batches[i].template_hi,
+                            v: v,
+                            hiz: self.hiz,
+                            hiz_w: self.hiz_w,
+                            hiz_h: self.hiz_h,
+                            hiz_levels: self.hiz_levels,
+                            count: n,
+                            vis_draws_2: self.batch_bufs[i].vis_draws_2.span_mut(
+                                start: 0,
+                                count: n,
+                            ),
+                            stats: mut self.stats_gpu,
+                        ),
+                        over: n,
+                    )
+                }
+            }
+        }
+    }
+
+    /// Records `v` as next frame's `prev_v` and schedules a non-stalling telemetry readback.
+    pub fn finish_frame(mut self, v: View) {
+        self.prev_v = v
+        self.hiz_ready = true
+        match self.stats_poll {
+            None => {
+                self.stats_poll = Some(read_settled(self.stats_gpu.items()))
+            },
+            Some(_) => {},
+        }
+    }
+}
+
+// ---- CPU checks ---------------------------------------------------------------------------------
+
+@test
+fn hiz_projection_classifies_behind_near_outside_and_inside() {
+    let v = view(
+        Eye { at: vec3(0.0, 1.5, 0.0), toward: vec3(0.0, 1.5, -10.0), wide: 1.0 },
+        width: 1920,
+        height: 1080,
+    )
+    // Behind camera -> frustum culled (0).
+    let (s_behind, _, _) = project_aabb_uv(vec3(-1.0, 0.5, 2.0), vec3(1.0, 2.5, 4.0), v)
+    assert(s_behind == 0, "box behind camera must be frustum-culled")
+
+    // Straddling near plane -> always visible (1).
+    let (s_near, _, _) = project_aabb_uv(vec3(-1.0, 0.5, -1.0), vec3(1.0, 2.5, 1.0), v)
+    assert(s_near == 1, "box straddling near plane must stay visible")
+
+    // Far off to the right -> frustum culled (0).
+    let (s_off, _, _) = project_aabb_uv(vec3(50.0, 0.5, -10.0), vec3(52.0, 2.5, -8.0), v)
+    assert(s_off == 0, "box outside right frustum plane must be culled")
+
+    // Centered in front at z = [9, 11] -> ready for Hi-Z (2) with box_z_max = NEAR / 9.0.
+    let (s_in, uv, zm) = project_aabb_uv(vec3(-1.0, 0.5, -11.0), vec3(1.0, 2.5, -9.0), v)
+    assert(s_in == 2, "centered in-frustum box must return status 2")
+    assert(
+        uv.x < 0.5 && uv.z > 0.5 && uv.y < 0.5 && uv.w > 0.5,
+        "centered box must straddle center",
+    )
+    assert(abs(zm - NEAR / 9.0) < 1.0e-7, "box_z_max must equal NEAR / z_min")
+}
+
+@test
+fn hiz_mip_selection_covers_all_odd_and_even_widths_conservatively() {
+    // Check 1080p half-res (960x540), odd 11x7, and 320x180.
+    let ws = [960, 11, 320]
+    let hs = [540, 7, 180]
+    for k in 0..3 {
+        let w = ws[k]
+        let h = hs[k]
+        let lvls = mip_levels(w, h)
+        let (mip, mx0, my0, mx1, my1) = choose_hiz_mip(vec4(0.25, 0.25, 0.75, 0.75), w, h, lvls)
+        let mw = hiz_level_side(w, mip)
+        let mh = hiz_level_side(h, mip)
+        assert(mip < lvls, "chosen mip must be in range")
+        assert(mx0 <= mx1 && mx1 < mw, "mx range must be valid")
+        assert(my0 <= my1 && my1 < mh, "my range must be valid")
+        assert((mx1 - mx0) <= 1 && (my1 - my0) <= 1, "selected mip must span at most 2x2 texels")
+    }
+}

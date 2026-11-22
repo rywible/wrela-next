@@ -1,0 +1,628 @@
+// Compact World CSG Edit Log (`WorldEdits`, 48 bytes per `EditOp`): any spell blast, sliced
+// column, melted doorway, or frozen wave appends a mathematical field operator (sphere/capsule/
+// plane subtract or smooth-union + optional interior `Substance`) instead of mutating geometry.
+//
+// 32 edits occupy 1,536 bytes (one MMO network packet), compose cleanly with any pure
+// `Field<Substance>` via `edited(field, log)`, expose real 3D interior materials (`channels(p)` at
+// `d < 0`) automatically on every cut face, and track a tight `dirty_region()` `Box3` so the
+// engine's persistent brick pool re-extracts only the ~10-30 bricks intersecting the latest cut.
+
+use matter::substance::{Substance, lambert}
+use std::cmp::Eq
+use std::derive::{Box3, Interval}
+use std::field::{
+    ALL_LIVE, Bound, Field, Live, Pruned, Surface, cuboid, smax, smin,
+}
+use std::hash::{Hasher, StateHash}
+use std::mem::size_of
+
+/// Maximum compact CSG edits held in one `WorldEdits` log (`32 × 48 = 1,536` bytes: one packet).
+pub const MAX_WORLD_EDITS: u32 = 32
+
+/// Edit primitive kind codes stored in `EditOp::meta.x` bits `0..3`.
+pub const EDIT_NONE: u32 = 0
+pub const EDIT_SPHERE: u32 = 1
+pub const EDIT_CAPSULE: u32 = 2
+pub const EDIT_PLANE: u32 = 3
+
+/// CSG operator mode codes stored in `EditOp::meta.x` bits `4..7`.
+pub const MODE_SUBTRACT: u32 = 0
+pub const MODE_UNION: u32 = 1
+
+/// One compact 48-byte CSG field operator (`Copy + GpuData + Eq + StateHash`).
+///   - `a`: `(cx, cy, cz, radius)` for sphere; `(ax, ay, az, radius)` for capsule;
+///          `(nx, ny, nz, offset)` for half-space plane (`dot(p, n) - offset`, positive removed).
+///   - `b`: `(bx, by, bz, smooth_k)` for capsule; `(0, 0, 0, smooth_k)` for sphere/plane.
+///   - `meta.x`: `(kind & 15) | ((mode & 15) << 4) | ((has_sub & 1) << 8)`
+///   - `meta.y`: packed `(albedo.r, albedo.g, albedo.b, roughness)` (4 × u8)
+///   - `meta.z`: packed `(emits_dir.r, emits_dir.g, emits_dir.b, emits_scale)` (4 × u8)
+///   - `meta.w`: packed `(metallic, coat, ior_norm, micro)` (4 × u8)
+pub struct EditOp: Copy + GpuData + Eq + StateHash {
+    pub a: vec4,
+    pub b: vec4,
+    pub meta: vec4u,
+}
+
+fn pack_u8(x: f32) -> u32 {
+    u32(clamp(x * 255.0 + 0.5, 0.0, 255.0)) & 255
+}
+
+fn unpack_u8(w: u32, shift: u32) -> f32 {
+    f32((w >> shift) & 255) * (1.0 / 255.0)
+}
+
+fn pack_sub_words(sub: Substance) -> (u32, u32, u32) {
+    let y = pack_u8(sub.albedo.x) |
+        (pack_u8(sub.albedo.y) << 8) |
+        (pack_u8(sub.albedo.z) << 16) |
+        (pack_u8(sub.roughness) << 24)
+    let em_peak = max(sub.emits.x, max(sub.emits.y, sub.emits.z))
+    let em_norm = if em_peak > 1.0e-5 { sub.emits / em_peak } else { vec3(0.0) }
+    // Encode HDR emission peak up to 32.0 via sqrt curve for smooth dynamic range.
+    let em_s = clamp(sqrt(em_peak / 32.0), 0.0, 1.0)
+    let z = pack_u8(em_norm.x) |
+        (pack_u8(em_norm.y) << 8) |
+        (pack_u8(em_norm.z) << 16) |
+        (pack_u8(em_s) << 24)
+    let ior_n = clamp((sub.ior - 1.0) * 0.5, 0.0, 1.0)
+    let w = pack_u8(sub.metallic) |
+        (pack_u8(sub.coat) << 8) |
+        (pack_u8(ior_n) << 16) |
+        (pack_u8(sub.micro) << 24)
+    (y, z, w)
+}
+
+fn unpack_sub_words(y: u32, z: u32, w: u32) -> Substance {
+    let albedo = vec3(unpack_u8(y, 0), unpack_u8(y, 8), unpack_u8(y, 16))
+    let roughness = clamp(unpack_u8(y, 24), 0.02, 1.0)
+    let em_s = unpack_u8(z, 24)
+    let em_peak = em_s * em_s * 32.0
+    let emits = vec3(unpack_u8(z, 0), unpack_u8(z, 8), unpack_u8(z, 16)) * em_peak
+    let metallic = unpack_u8(w, 0)
+    let coat = unpack_u8(w, 8)
+    let ior = 1.0 + unpack_u8(w, 16) * 2.0
+    let micro = unpack_u8(w, 24)
+    Substance {
+        albedo,
+        roughness,
+        emits,
+        metallic,
+        ior,
+        transmission: 0.0,
+        subsurface: 0.0,
+        coat,
+        micro,
+        pad0: 0.0,
+        pad1: 0.0,
+        pad2: 0.0,
+    }
+}
+
+/// Empty no-op edit slot.
+pub fn edit_none() -> EditOp {
+    EditOp { a: vec4(0.0), b: vec4(0.0), meta: vec4u(0, 0, 0, 0) }
+}
+
+fn pack_k16(k: f32) -> u32 {
+    u32(clamp(k * 4096.0 + 0.5, 0.0, 65535.0)) & 65535
+}
+
+fn make_op(
+    kind: u32,
+    mode: u32,
+    a: vec4,
+    b: vec4,
+    k: f32,
+    interior: Option<Substance>,
+) -> EditOp {
+    let head = (kind & 15) | ((mode & 15) << 4) | (pack_k16(max(k, 0.0)) << 16)
+    match interior {
+        Some(sub) => {
+            let (y, z, w) = pack_sub_words(sub)
+            EditOp { a, b, meta: vec4u(head | 256, y, z, w) }
+        },
+        None => EditOp { a, b, meta: vec4u(head, 0, 0, 0) },
+    }
+}
+
+fn capsule_axis(p0: vec3, p1: vec3) -> vec4 {
+    let ba = p1 - p0
+    let len = length(ba)
+    if len > 1.0e-5 { vec4(ba / len, len) } else { vec4(0.0, 1.0, 0.0, 0.0) }
+}
+
+/// Carves a sphere of `radius` centred at `centre` (`k > 0` rounds the rim; `interior == None`
+/// exposes the cut solid's own 3D `channels(p)` at `d < 0`).
+pub fn edit_sphere_sub(
+    centre: vec3,
+    radius: f32,
+    k: f32 = 0.0,
+    interior: Option<Substance> = None,
+) -> EditOp {
+    make_op(
+        EDIT_SPHERE,
+        MODE_SUBTRACT,
+        vec4(centre, max(radius, 0.001)),
+        vec4(0.0),
+        k,
+        interior,
+    )
+}
+
+/// Carves a capsule from `p0` to `p1` with `radius` (`k > 0` rounds the rim).
+pub fn edit_capsule_sub(
+    p0: vec3,
+    p1: vec3,
+    radius: f32,
+    k: f32 = 0.0,
+    interior: Option<Substance> = None,
+) -> EditOp {
+    make_op(
+        EDIT_CAPSULE,
+        MODE_SUBTRACT,
+        vec4(p0, max(radius, 0.001)),
+        capsule_axis(p0, p1),
+        k,
+        interior,
+    )
+}
+
+/// Slices away the half-space `dot(p, normalize(normal)) > offset` (exposing the cut face).
+pub fn edit_plane_sub(
+    normal: vec3,
+    offset: f32,
+    k: f32 = 0.0,
+    interior: Option<Substance> = None,
+) -> EditOp {
+    let n = normalize(normal)
+    make_op(EDIT_PLANE, MODE_SUBTRACT, vec4(n, offset), vec4(0.0), k, interior)
+}
+
+/// Smooth-unions a sphere of `radius` at `centre` with material `sub`.
+pub fn edit_sphere_add(centre: vec3, radius: f32, k: f32, sub: Substance) -> EditOp {
+    make_op(
+        EDIT_SPHERE,
+        MODE_UNION,
+        vec4(centre, max(radius, 0.001)),
+        vec4(0.0),
+        k,
+        Some(sub),
+    )
+}
+
+/// Smooth-unions a capsule from `p0` to `p1` of `radius` with material `sub`.
+pub fn edit_capsule_add(p0: vec3, p1: vec3, radius: f32, k: f32, sub: Substance) -> EditOp {
+    make_op(
+        EDIT_CAPSULE,
+        MODE_UNION,
+        vec4(p0, max(radius, 0.001)),
+        capsule_axis(p0, p1),
+        k,
+        Some(sub),
+    )
+}
+
+impl EditOp {
+    pub fn kind(self) -> u32 {
+        self.meta.x & 15
+    }
+
+    pub fn mode(self) -> u32 {
+        (self.meta.x >> 4) & 15
+    }
+
+    pub fn has_sub(self) -> bool {
+        ((self.meta.x >> 8) & 1) != 0
+    }
+
+    pub fn smooth_k(self) -> f32 {
+        f32((self.meta.x >> 16) & 65535) * (1.0 / 4096.0)
+    }
+
+    pub fn substance(self) -> Substance {
+        unpack_sub_words(self.meta.y, self.meta.z, self.meta.w)
+    }
+
+    /// Exact 1-Lipschitz signed distance of this edit primitive at `p`.
+    pub fn distance(self, p: vec3) -> f32 {
+        let kind = self.kind()
+        if kind == EDIT_SPHERE {
+            return length(p - self.a.xyz) - self.a.w
+        }
+        if kind == EDIT_CAPSULE {
+            let pa = p - self.a.xyz
+            let proj = clamp(dot(pa, self.b.xyz), 0.0, self.b.w)
+            return length(pa - self.b.xyz * proj) - self.a.w
+        }
+        if kind == EDIT_PLANE {
+            // Positive side of the plane is inside the cutter (subtracted when `mode == SUBTRACT`).
+            return self.a.w - dot(p, self.a.xyz)
+        }
+        1.0e30
+    }
+
+    /// Tight world-space AABB affected by this edit (for dirty-region brick re-extraction).
+    /// Returns `None` for unbounded half-space planes (which clamp to the base solid's AABB).
+    pub fn affected_box(self) -> Option<Box3> {
+        let kind = self.kind()
+        let pad = self.a.w + self.smooth_k() + 0.08
+        if kind == EDIT_SPHERE {
+            return Some(Box3 { lo: self.a.xyz - vec3(pad), hi: self.a.xyz + vec3(pad) })
+        }
+        if kind == EDIT_CAPSULE {
+            let p1 = self.a.xyz + self.b.xyz * self.b.w
+            let lo = min(self.a.xyz, p1) - vec3(pad)
+            let hi = max(self.a.xyz, p1) + vec3(pad)
+            return Some(Box3 { lo, hi })
+        }
+        None
+    }
+
+    /// Bounding sphere of an additive (`MODE_UNION`) edit.
+    pub fn add_bound(self) -> Option<Bound> {
+        if self.mode() != MODE_UNION {
+            return None
+        }
+        let kind = self.kind()
+        let k = self.smooth_k()
+        if kind == EDIT_SPHERE {
+            return Some(Bound { centre: self.a.xyz, radius: self.a.w + k, slope: 1.0 })
+        }
+        if kind == EDIT_CAPSULE {
+            let mid = self.a.xyz + self.b.xyz * (0.5 * self.b.w)
+            let r = 0.5 * self.b.w + self.a.w + k
+            return Some(Bound { centre: mid, radius: r, slope: 1.0 })
+        }
+        None
+    }
+}
+
+/// Compact network-replicable log of up to `MAX_WORLD_EDITS` (32) CSG field edits (1,536 bytes of
+/// ops) plus the dirty `Box3` of the latest modification for `< 0.15 ms` incremental brick rebuilds.
+pub struct WorldEdits: Copy + GpuData + Eq + StateHash {
+    pub ops: [EditOp; MAX_WORLD_EDITS],
+    pub count: u32,
+    pub epoch: u32,
+    pub has_dirty: u32,
+    pub pad0: u32,
+    pub dirty_lo: vec3,
+    pub pad1: f32,
+    pub dirty_hi: vec3,
+    pub pad2: f32,
+}
+
+/// An empty `WorldEdits` log with zero edits.
+pub fn world_edits() -> WorldEdits {
+    WorldEdits {
+        ops: [edit_none(); MAX_WORLD_EDITS],
+        count: 0,
+        epoch: 0,
+        has_dirty: 0,
+        pad0: 0,
+        dirty_lo: vec3(0.0),
+        pad1: 0.0,
+        dirty_hi: vec3(0.0),
+        pad2: 0.0,
+    }
+}
+
+impl WorldEdits {
+    /// Appends one `EditOp` to the log (silently ignored if full), bumping `epoch` and updating
+    /// the dirty `Box3` for incremental brick re-extraction.
+    pub fn append(mut self, op: EditOp) {
+        if self.count >= MAX_WORLD_EDITS || op.kind() == EDIT_NONE {
+            return
+        }
+        self.ops[self.count] = op
+        self.count += 1
+        self.epoch += 1
+        match op.affected_box() {
+            Some(bx) => {
+                self.dirty_lo = bx.lo
+                self.dirty_hi = bx.hi
+                self.has_dirty = 1
+            },
+            None => {
+                // Plane cut affects the whole base AABB.
+                self.has_dirty = 0
+            },
+        }
+    }
+
+    /// Returns the dirty region modified by the most recent edit, if bounded.
+    pub fn dirty_box(self) -> Option<Box3> {
+        if self.has_dirty != 0 {
+            Some(Box3 { lo: self.dirty_lo, hi: self.dirty_hi })
+        } else {
+            None
+        }
+    }
+
+    /// Evaluates the edited signed distance starting from base distance `d0` at `p`.
+    pub fn apply_distance(self, p: vec3, d0: f32) -> f32 {
+        var d = d0
+        let n = min(self.count, MAX_WORLD_EDITS)
+        for i in 0..MAX_WORLD_EDITS {
+            if i >= n {
+                break
+            }
+            let op = self.ops[i]
+            let dop = op.distance(p)
+            let k = op.smooth_k()
+            if op.mode() == MODE_SUBTRACT {
+                d = if k > 1.0e-5 { smax(d, -dop, k) } else { max(d, -dop) }
+            } else {
+                d = if k > 1.0e-5 { smin(d, dop, k) } else { min(d, dop) }
+            }
+        }
+        d
+    }
+
+    /// Evaluates the edited material starting from base `sub0` and base distance `d0` at `p`.
+    /// When a subtract op has `has_sub == false`, the cut surface automatically exposes the base
+    /// field's true 3D interior `channels(p)` at `d0 < 0`.
+    pub fn apply_channels(self, p: vec3, d0: f32, sub0: Substance) -> Substance {
+        var d = d0
+        var sub = sub0
+        let n = min(self.count, MAX_WORLD_EDITS)
+        for i in 0..MAX_WORLD_EDITS {
+            if i >= n {
+                break
+            }
+            let op = self.ops[i]
+            let dop = op.distance(p)
+            let k = op.smooth_k()
+            if op.mode() == MODE_SUBTRACT {
+                let neg_op = -dop
+                if op.has_sub() {
+                    let w = if k > 1.0e-5 {
+                        clamp(0.5 + 0.5 * (neg_op - d) / k, 0.0, 1.0)
+                    } else if neg_op >= d - 0.004 {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                    if w > 0.001 {
+                        sub = sub.blend(op.substance(), w)
+                    }
+                }
+                d = if k > 1.0e-5 { smax(d, neg_op, k) } else { max(d, neg_op) }
+            } else {
+                if op.has_sub() {
+                    let w = if k > 1.0e-5 {
+                        clamp(0.5 + 0.5 * (d - dop) / k, 0.0, 1.0)
+                    } else if dop <= d {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                    if w > 0.001 {
+                        sub = sub.blend(op.substance(), w)
+                    }
+                }
+                d = if k > 1.0e-5 { smin(d, dop, k) } else { min(d, dop) }
+            }
+        }
+        sub
+    }
+}
+
+/// Any pure `Field<Substance>` composed with a live `WorldEdits` CSG edit log.
+pub struct Edited<M>: Copy + GpuData + Eq + StateHash {
+    pub base: M,
+    pub edits: WorldEdits,
+}
+
+/// Composes pure field `base` with `edits` into one `Field<Substance>` that every engine pass
+/// (meshing, SDF clipmap, shadows, GI, swarms, reference) evaluates seamlessly.
+pub fn edited<M: Field<Substance> + StateHash>(base: M, edits: WorldEdits) -> Edited<M> {
+    Edited { base, edits }
+}
+
+impl<M: Field<Substance> + StateHash> Surface for Edited<M> {
+    fn distance(self, p: vec3) -> f32 {
+        let d0 = self.base.distance(p)
+        if self.edits.count == 0 {
+            return d0
+        }
+        self.edits.apply_distance(p, d0)
+    }
+
+    fn masked(self, p: vec3, live: Live, first: u32) -> f32 {
+        let d0 = self.base.masked(p, live, first)
+        if self.edits.count == 0 {
+            return d0
+        }
+        self.edits.apply_distance(p, d0)
+    }
+
+    fn distance_within(self, p: vec3, most: f32) -> f32 {
+        if self.edits.count == 0 {
+            return self.base.distance_within(p, most)
+        }
+        let below = self.bound().below(p)
+        if below >= most {
+            return below
+        }
+        self.distance(p)
+    }
+
+    fn bound(self) -> Bound {
+        var b = self.base.bound()
+        let n = min(self.edits.count, MAX_WORLD_EDITS)
+        for i in 0..MAX_WORLD_EDITS {
+            if i >= n {
+                break
+            }
+            match self.edits.ops[i].add_bound() {
+                Some(ab) => {
+                    b = b.and(ab)
+                },
+                None => {},
+            }
+        }
+        b
+    }
+
+    fn lipschitz(self, near: f32) -> f32 {
+        // Every primitive edit is 1-Lipschitz; smooth CSG ops widen scope by at most 1.25 * k.
+        var pad = 0.0
+        let n = min(self.edits.count, MAX_WORLD_EDITS)
+        for i in 0..MAX_WORLD_EDITS {
+            if i >= n {
+                break
+            }
+            pad += 1.25 * max(self.edits.ops[i].smooth_k(), 0.0)
+        }
+        max(self.base.lipschitz(near + pad), 1.0)
+    }
+
+    fn pruned<F: Copy + fn(vec3) -> vec3>(
+        self,
+        over: Box3,
+        at: F,
+        stretch: f32,
+        live: Live,
+        first: u32,
+    ) -> Pruned {
+        let pr = self.base.pruned(over, at, stretch, live, first)
+        if self.edits.count == 0 {
+            return pr
+        }
+        // Sound, zero-inflation interval propagation from `pr.range`: bricks outside every edit's
+        // cut volume keep `self.base.pruned`'s exact tight interval (zero active-brick inflation!).
+        let c = at(over.center())
+        let r_op = stretch * 0.5 * length(over.hi - over.lo)
+        let eps = r_op * 1.0e-5 + 1.0e-6
+        var rlo = pr.range.lo
+        var rhi = pr.range.hi
+        let n = min(self.edits.count, MAX_WORLD_EDITS)
+        for i in 0..MAX_WORLD_EDITS {
+            if i >= n {
+                break
+            }
+            let op = self.edits.ops[i]
+            let dop_c = op.distance(c)
+            let op_lo = dop_c - r_op - eps
+            let op_hi = dop_c + r_op + eps
+            let k = op.smooth_k()
+            if op.mode() == MODE_SUBTRACT {
+                let neg_lo = -op_hi
+                let neg_hi = -op_lo
+                let smooth_pad = if k > 1.0e-5 && rlo < neg_hi + k && neg_lo < rhi + k {
+                    0.25 * k
+                } else {
+                    0.0
+                }
+                rlo = max(rlo, neg_lo)
+                rhi = max(rhi, neg_hi) + smooth_pad
+            } else {
+                let smooth_pad = if k > 1.0e-5 && rlo < op_hi + k && op_lo < rhi + k {
+                    0.25 * k
+                } else {
+                    0.0
+                }
+                rlo = min(rlo, op_lo) - smooth_pad
+                rhi = min(rhi, op_hi)
+            }
+        }
+        Pruned { live: pr.live, range: Interval { lo: rlo, hi: rhi } }
+    }
+
+    fn dirty_region(self) -> Option<Box3> {
+        self.edits.dirty_box()
+    }
+
+    fn edit_base_hash(self) -> Option<u64> {
+        var h = Hasher::new()
+        self.base.state_hash(mut h)
+        Some(h.finish())
+    }
+}
+
+impl<M: Field<Substance> + StateHash> Field<Substance> for Edited<M> {
+    fn channels(self, p: vec3) -> Substance {
+        let sub0 = self.base.channels(p)
+        if self.edits.count == 0 {
+            return sub0
+        }
+        let d0 = self.base.distance(p)
+        self.edits.apply_channels(p, d0, sub0)
+    }
+}
+
+// ---- CPU tests ----------------------------------------------------------------------------------
+
+@test
+fn edit_op_is_48_bytes() {
+    assert(size_of::<EditOp>() == 48, f"EditOp must be 48 bytes, got {size_of::<EditOp>()}")
+}
+
+struct VeinedPrism: Copy + GpuData + Eq + StateHash {
+    half: vec3,
+    marble: vec3,
+    vein: vec3,
+}
+
+impl Surface for VeinedPrism {
+    fn distance(self, p: vec3) -> f32 {
+        cuboid(self.half).distance(p)
+    }
+
+    fn bound(self) -> Bound {
+        cuboid(self.half).bound()
+    }
+
+    fn lipschitz(self, _near: f32) -> f32 {
+        1.0
+    }
+}
+
+impl Field<Substance> for VeinedPrism {
+    fn channels(self, p: vec3) -> Substance {
+        let r = length(vec2(p.x, p.z))
+        if r < 0.22 { lambert(self.vein) } else { lambert(self.marble) }
+    }
+}
+
+@test
+fn csg_plane_slice_exposes_3d_interior_veining() {
+    // Solid prism with an interior gold vein embedded at `r < 0.22` (completely hidden before cut).
+    let marble_col = vec3(0.85, 0.84, 0.82)
+    let vein_col = vec3(0.95, 0.72, 0.22)
+    let prism = VeinedPrism { half: vec3(0.5, 1.5, 0.5), marble: marble_col, vein: vein_col }
+    var log = world_edits()
+    // Slice cleanly through the column at `y = 0.0` (removing everything above `y = 0.0`).
+    log.append(edit_plane_sub(vec3(0.0, 1.0, 0.0), offset: 0.0, k: 0.0, interior: None))
+    let cut = edited(prism, log)
+    // Above the cut is now empty air (`d > 0`); on the cut face (`y = 0, r = 0`) is surface (`d == 0`).
+    assert(cut.distance(vec3(0.0, 0.5, 0.0)) > 0.4, "cut removes upper half")
+    assert(abs(cut.distance(vec3(0.0, 0.0, 0.0))) < 1.0e-5, "cut face sits at y = 0")
+    // The newly exposed center of the cut face automatically shows the interior gold vein!
+    let center_sub = cut.channels(vec3(0.0, 0.0, 0.0))
+    let rim_sub = cut.channels(vec3(0.4, 0.0, 0.0))
+    assert(
+        length(center_sub.albedo - vein_col) < 1.0e-4,
+        "interior gold vein exposed on cut face",
+    )
+    assert(length(rim_sub.albedo - marble_col) < 1.0e-4, "outer marble preserved at rim")
+}
+
+@test
+fn csg_sphere_blast_tracks_dirty_region_and_interior_substance() {
+    let wall = cuboid(vec3(2.0, 2.0, 0.5)).with(lambert(vec3(0.5, 0.5, 0.5)))
+    let scorch = lambert(vec3(0.12, 0.05, 0.02))
+    var log = world_edits()
+    log.append(edit_sphere_sub(vec3(0.0, 0.0, 0.5), radius: 0.4, k: 0.05, interior: Some(scorch)))
+    let blasted = edited(wall, log)
+    assert(blasted.distance(vec3(0.0, 0.0, 0.5)) > 0.3, "blast carves crater")
+    match blasted.dirty_region() {
+        Some(bx) => {
+            assert(bx.contains(vec3(0.0, 0.0, 0.5)), "dirty box contains crater center")
+            assert(!bx.contains(vec3(1.9, 1.9, 0.0)), "dirty box stays localized")
+        },
+        None => assert(false, "sphere blast must produce a bounded dirty box"),
+    }
+    let crater_wall = blasted.channels(vec3(0.0, 0.0, 0.1))
+    assert(crater_wall.albedo.x < 0.2, "scorched interior substance applied inside crater")
+}

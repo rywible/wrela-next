@@ -12,7 +12,7 @@ use mesh::sdf::{GRAIN_MOST, SDF_MAX, SdfGrid, sdf_sample}
 use mesh::tsr::project_uv_unjittered
 use picture::eye::View
 use std::derive::value_and_gradient
-use std::field::{Field, hash_u32}
+use std::field::{Bound, Field, hash_u32}
 use std::gpu::{
     Atomics, ClipPosition, GlobalId, GpuBuffer, GpuSpan, InstanceIndex, R16Float, Sampler, Slots,
     Targets4, Texture3d, VertexIndex, buffer, discard, dispatch, label,
@@ -66,14 +66,12 @@ fn swarm_spawn<Sw: Swarm>(swarm: Sw, count: u32, dst: mut Slots<Grain>, id: Glob
     }
 }
 
-/// Pass 1: Advances every grain under `swarm.force_at` + aerodynamic drag and resolves exact
-/// analytical collisions against `world_field`, using 1-tap hardware 3D SDF clipmap broad-phase
-/// culling to skip expensive analytical SDF evaluation for >90% of grains in flight.
+/// Pass 1a: Advances every grain under `swarm.force_at` + aerodynamic drag and tests the 1-tap
+/// hardware 3D SDF clipmap broad-phase, setting `meta.w = 1.0` only for grains near a surface so
+/// subsequent analytical collision passes skip >90% of grains in flight.
 @compute(64)
-@budget(work: 24000)
-fn swarm_step<Sw: Swarm, F: Field<Substance>>(
+fn swarm_integrate<Sw: Swarm>(
     swarm: Sw,
-    world_field: F,
     sdf_grid: SdfGrid,
     sdf0: Texture3d<R16Float>,
     sdf1: Texture3d<R16Float>,
@@ -93,12 +91,11 @@ fn swarm_step<Sw: Swarm, F: Field<Substance>>(
     }
     let dt = clamp(swarm.step_dt(), 0.001, 0.05)
     let age = g.vel_age.w + dt
-    // Waiting for staggered emission delay.
     if age < 0.0 {
         dst[id] = Grain {
             pos_r: g.pos_r,
             vel_age: vec4(g.vel_age.xyz, age),
-            meta: g.meta,
+            meta: vec4(g.meta.x, g.meta.y, g.meta.z, 0.0),
         }
         return
     }
@@ -132,41 +129,112 @@ fn swarm_step<Sw: Swarm, F: Field<Substance>>(
     vel = vel * damp + acc * dt
     pos = pos + vel * dt
 
-    // Exact analytical World SDF collision. The clipmap's trilinear distance is within a voxel
-    // diagonal of the true distance (the true one is 1-Lipschitz and stored exactly at voxel
-    // centres; `v1` is the coarser cascade's voxel), so a grain it puts farther than that from
-    // everything is certainly clear and skips the field. Outside the clipmap it reads `SDF_MAX`,
-    // which proves nothing, and the splat's pads hold exact distances only as far as a grain of
-    // `GRAIN_MOST`, so a larger grain always asks the field.
     var near = true
     if sdf_grid.enabled != 0 && r <= GRAIN_MOST {
         let coarse = sdf_sample(sdf_grid, sdf0, sdf1, sdf_s, pos)
         near = coarse >= SDF_MAX * 0.999 || coarse < r + 1.7320508 * sdf_grid.v1
     }
-    if near {
-        // Only the parts that can be within the grain's radius are asked (`distance_within`):
-        // the distance, and its gradient on contact, are the world's own there, bit for bit.
-        let d0 = world_field.distance_within(pos, r)
+
+    dst[id] = Grain {
+        pos_r: vec4(pos, r),
+        vel_age: vec4(vel, age),
+        meta: vec4(life, h, 1.0, if near { 1.0 } else { 0.0 }),
+    }
+}
+
+/// Pass 1b (single field): Resolves exact analytical SDF collision against `field` for any grain
+/// flagged `near` (`meta.w > 0.5`) by the 3D SDF clipmap broad-phase. `bound` is precomputed on the
+/// CPU so the GPU skips out-of-bound grains in O(1) without recomputing uniform bounds per thread.
+@compute(64)
+@budget(work: 20000)
+fn swarm_collide_one<F: Field<Substance>>(
+    field: F,
+    bound: Bound,
+    restitution: f32,
+    friction: f32,
+    count: u32,
+    src: [Grain],
+    dst: mut Slots<Grain>,
+    id: GlobalId,
+) {
+    if id.x >= count {
+        return
+    }
+    let g = src[id.x]
+    if g.meta.z < 0.5 || g.vel_age.w < 0.0 || g.meta.w < 0.5 {
+        dst[id] = g
+        return
+    }
+    var pos = g.pos_r.xyz
+    let r = g.pos_r.w
+    var vel = g.vel_age.xyz
+    if bound.below(pos) < r {
+        let d0 = field.distance(pos)
         if d0 < r {
-            let (d, grad) = value_and_gradient(|q| world_field.distance_within(q, r), pos)
+            let (d, grad) = value_and_gradient(|q| field.distance(q), pos)
             let gl2 = dot(grad, grad)
             let n = if gl2 > 1.0e-10 { grad * (1.0 / sqrt(gl2)) } else { vec3(0.0, 1.0, 0.0) }
             pos = pos + n * (r - d + 0.002)
             let vn = dot(vel, n)
             if vn < 0.0 {
                 let vt = vel - n * vn
-                let rest = clamp(swarm.restitution(), 0.0, 0.95)
-                // Coulomb friction slows sliding grains into natural sand drifts on floors & steps.
-                vel = vt * swarm.friction() - n * (vn * rest)
+                vel = vt * friction - n * (vn * restitution)
             }
         }
     }
+    dst[id] = Grain { pos_r: vec4(pos, r), vel_age: vec4(vel, g.vel_age.w), meta: g.meta }
+}
 
-    dst[id] = Grain {
-        pos_r: vec4(pos, r),
-        vel_age: vec4(vel, age),
-        meta: vec4(life, h, 1.0, 0.0),
+/// Maximum number of pool fields tested per `swarm_collide_pool` dispatch so the GPU guard can
+/// prove every dispatch finishes well under 50 ms for arbitrarily large dynamic `Pool`s.
+const COLLIDE_CHUNK: u32 = 32
+
+/// Pass 1b (dynamic pool): Resolves exact analytical SDF collision against a chunk of up to
+/// `COLLIDE_CHUNK` fields in a dynamic `Pool<M>` (skipping out-of-bound fields in O(1) via
+/// precomputed `bounds[i].below(pos)`).
+@compute(64)
+@budget(work: 24000)
+fn swarm_collide_pool<F: Field<Substance>>(
+    fields: [F],
+    bounds: [Bound],
+    n_fields: u32,
+    restitution: f32,
+    friction: f32,
+    count: u32,
+    src: [Grain],
+    dst: mut Slots<Grain>,
+    id: GlobalId,
+) {
+    if id.x >= count {
+        return
     }
+    let g = src[id.x]
+    if g.meta.z < 0.5 || g.vel_age.w < 0.0 || g.meta.w < 0.5 {
+        dst[id] = g
+        return
+    }
+    var pos = g.pos_r.xyz
+    let r = g.pos_r.w
+    var vel = g.vel_age.xyz
+    let lim = min(n_fields, COLLIDE_CHUNK)
+    for i in 0..lim {
+        if bounds[i].below(pos) < r {
+            let f = fields[i]
+            let d0 = f.distance(pos)
+            if d0 < r {
+                let (d, grad) = value_and_gradient(|q| f.distance(q), pos)
+                let gl2 = dot(grad, grad)
+                let n = if gl2 > 1.0e-10 { grad * (1.0 / sqrt(gl2)) } else { vec3(0.0, 1.0, 0.0) }
+                pos = pos + n * (r - d + 0.002)
+                let vn = dot(vel, n)
+                if vn < 0.0 {
+                    let vt = vel - n * vn
+                    vel = vt * friction - n * (vn * restitution)
+                }
+            }
+        }
+    }
+    dst[id] = Grain { pos_r: vec4(pos, r), vel_age: vec4(vel, g.vel_age.w), meta: g.meta }
 }
 
 /// Injects luminous grains into the unified radiance cache (`rad_accum`) and dynamic emitter bins
@@ -356,21 +424,47 @@ impl SwarmSim {
         if self.front_is_a { self.a.items() } else { self.b.items() }
     }
 
-    fn step_once<Sw: Swarm, F: Field<Substance>>(
+    /// Prepares the swarm for stepping this frame: spawns if uninitialized or epoch changed, and
+    /// returns how many `(integrate + collide)` steps to execute (`0` if inactive).
+    pub fn begin_update<Sw: Swarm>(mut self, swarm: Sw) -> u32 {
+        if !swarm.active() {
+            self.count = 0
+            return 0
+        }
+        let n = min(swarm.count(), SWARM_CAP)
+        self.count = n
+        if n == 0 {
+            return 0
+        }
+        label("mesh_swarm")
+        let ep = swarm.epoch()
+        if !self.initialized || self.epoch != ep {
+            dispatch(swarm_spawn.bind(swarm: swarm, count: n, dst: mut self.a), over: n)
+            self.front_is_a = true
+            self.epoch = ep
+            self.initialized = true
+            return min(swarm.prewarm_steps(), 60)
+        }
+        1
+    }
+
+    /// Integrates one step of forces + drag + SDF clipmap broad-phase (`meta.w` near flag).
+    pub fn integrate_once<Sw: Swarm>(
         mut self,
         swarm: Sw,
-        world_field: F,
         sdf_grid: SdfGrid,
         sdf0: Texture3d<R16Float>,
         sdf1: Texture3d<R16Float>,
         sdf_s: Sampler,
-        n: u32,
     ) {
+        let n = self.count
+        if n == 0 {
+            return
+        }
         if self.front_is_a {
             dispatch(
-                swarm_step.bind(
+                swarm_integrate.bind(
                     swarm: swarm,
-                    world_field: world_field,
                     sdf_grid: sdf_grid,
                     sdf0: sdf0,
                     sdf1: sdf1,
@@ -384,9 +478,8 @@ impl SwarmSim {
             self.front_is_a = false
         } else {
             dispatch(
-                swarm_step.bind(
+                swarm_integrate.bind(
                     swarm: swarm,
-                    world_field: world_field,
                     sdf_grid: sdf_grid,
                     sdf0: sdf0,
                     sdf1: sdf1,
@@ -401,40 +494,101 @@ impl SwarmSim {
         }
     }
 
-    /// Spawns (on first frame or epoch change, with optional prewarm) and steps `swarm` against
-    /// `world_field` accelerated by the unified 3D SDF clipmap.
-    pub fn update<Sw: Swarm, F: Field<Substance>>(
+    /// Resolves exact analytical collision of all `near` grains against a single `field`.
+    pub fn collide_one<F: Field<Substance>>(
         mut self,
-        swarm: Sw,
-        world_field: F,
-        sdf_grid: SdfGrid,
-        sdf0: Texture3d<R16Float>,
-        sdf1: Texture3d<R16Float>,
-        sdf_s: Sampler,
+        field: F,
+        restitution: f32,
+        friction: f32,
     ) {
-        if !swarm.active() {
-            self.count = 0
-            return
-        }
-        let n = min(swarm.count(), SWARM_CAP)
-        self.count = n
+        let n = self.count
         if n == 0 {
             return
         }
-        label("mesh_swarm")
-        let ep = swarm.epoch()
-        if !self.initialized || self.epoch != ep {
-            dispatch(swarm_spawn.bind(swarm: swarm, count: n, dst: mut self.a), over: n)
+        let b = field.bound()
+        let rest = clamp(restitution, 0.0, 0.95)
+        if self.front_is_a {
+            dispatch(
+                swarm_collide_one.bind(
+                    field: field,
+                    bound: b,
+                    restitution: rest,
+                    friction: friction,
+                    count: n,
+                    src: self.a.items(),
+                    dst: mut self.b,
+                ),
+                over: n,
+            )
+            self.front_is_a = false
+        } else {
+            dispatch(
+                swarm_collide_one.bind(
+                    field: field,
+                    bound: b,
+                    restitution: rest,
+                    friction: friction,
+                    count: n,
+                    src: self.b.items(),
+                    dst: mut self.a,
+                ),
+                over: n,
+            )
             self.front_is_a = true
-            self.epoch = ep
-            self.initialized = true
-            let prewarm = min(swarm.prewarm_steps(), 60)
-            for _s in 0..prewarm {
-                self.step_once(swarm, world_field, sdf_grid, sdf0, sdf1, sdf_s, n)
-            }
+        }
+    }
+
+    /// Resolves exact analytical collision of all `near` grains against a dynamic `Pool<F>` in
+    /// bounded `COLLIDE_CHUNK` slices.
+    pub fn collide_pool<F: Field<Substance>>(
+        mut self,
+        fields: GpuSpan<F>,
+        bounds: GpuSpan<Bound>,
+        n_fields: u32,
+        restitution: f32,
+        friction: f32,
+    ) {
+        let n = self.count
+        if n == 0 || n_fields == 0 {
             return
         }
-        self.step_once(swarm, world_field, sdf_grid, sdf0, sdf1, sdf_s, n)
+        let rest = clamp(restitution, 0.0, 0.95)
+        var start: u32 = 0
+        while start < n_fields {
+            let chunk = min(n_fields - start, COLLIDE_CHUNK)
+            if self.front_is_a {
+                dispatch(
+                    swarm_collide_pool.bind(
+                        fields: fields.sub(start: start, count: chunk),
+                        bounds: bounds.sub(start: start, count: chunk),
+                        n_fields: chunk,
+                        restitution: rest,
+                        friction: friction,
+                        count: n,
+                        src: self.a.items(),
+                        dst: mut self.b,
+                    ),
+                    over: n,
+                )
+                self.front_is_a = false
+            } else {
+                dispatch(
+                    swarm_collide_pool.bind(
+                        fields: fields.sub(start: start, count: chunk),
+                        bounds: bounds.sub(start: start, count: chunk),
+                        n_fields: chunk,
+                        restitution: rest,
+                        friction: friction,
+                        count: n,
+                        src: self.b.items(),
+                        dst: mut self.a,
+                    ),
+                    over: n,
+                )
+                self.front_is_a = true
+            }
+            start += chunk
+        }
     }
 
     /// Injects bright grains from the current front buffer into the unified radiance cache.

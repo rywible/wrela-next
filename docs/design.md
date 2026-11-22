@@ -590,6 +590,91 @@ Halton TSR) **0 holes**, **100% of surfaces within 0.05 px (`mean 0 px, most 0 p
 **0.61/255**, edges mean **3.54/255** (7.1% over 8/255); `wrela test --std dual_quat`, `tools/layers`,
 and `tools/check` (331 tests) all pass.
 
+## View-dependent bricks, the settled picture, CSG edit logs, pools and crowd occlusion (2026-11-22)
+
+Phase 1 of the seven-phase plan (dynamic scene store, edit log, multi-LOD bricks, Hi-Z culling,
+compiler pruning). What landed, what was measured, and what was measured and taken out.
+
+1. **`Pool<M>` (`lib/engine/matter/world.wrela`).** `Many<M, N>` is gone: a thing of one kind
+   any number of times is a `Pool<M>` over a `Vec<M>` (`pool(things)`, `pool_of(array)`), so
+   things come and go at run time. `One` and `And` are no longer `Copy`.
+2. **`WorldEdits` (`lib/engine/matter/edits.wrela`).** A log of up to 32 CSG operators of 48 bytes
+   (sphere, capsule or half-space; subtract or smooth union; an optional interior `Substance`),
+   1,536 bytes in all, applied to any field by `edited(field, log)`. A cut shows the field's own
+   `channels(p)` at `d < 0`: SCENE 12's marble column shows its gold veins inside the blast. An
+   edit reports the box it changed (`Surface::dirty_region`, `edit_base_hash`), and the mesher
+   re-extracts only the bricks in it, clearing the old ones in place (`clear_dirty_bricks`, which
+   now also makes a cleared brick's index slice degenerate, so the whole mesh is drawn as one).
+3. **View-dependent nested bricks (`extract.wrela`, `build_lod_grids_view`, `sync_one_lod`).** A
+   thing seen close is extracted as nested 2:1 levels fitted to the view frustum, finest at the
+   nearest visible surface, crack-free across levels (seam corners inherited from the parent),
+   within an area budget. One knob says how fine: `CELL_PX`, the width of the finest cells in
+   pixels (1). The honest centre-ray SCENE 6 audit at 640x360, against HEAD 7004e44:
+
+   | kind | holes HEAD → now | extras | off > 1 px HEAD → now |
+   |---|---|---|---|
+   | stage | 0 → **0** | 0 | 15 → 2 |
+   | creature walking | 5 → **0** | 37 → **0** | 3,047 → 11 |
+   | stack | 335 → **0** | 0 | 737,354 → 1,548 |
+   | arena's pillars | 633 → **0** | 0 | 549,804 → 43 |
+   | braziers | 65 → **0** | 0 | 262,167 → 0 |
+   | flame | 0 → **0** | 0 | 0 → 0 |
+   | ward | 3,361 → **0** | 0 | 17,163 → 24 |
+
+   The same on the Radeon (Vulkan, validation silent). `CELL_PX` 2 also gave 0 holes; 2 with a
+   quarter of the budget opened 21; 3 opened 3 on the stack. SCENE 0's judge (M4, 96x54, 64
+   looks) improved on every count: missed 11 → 3 px, outline off 0.190 → 0.114 px, coverage off
+   0.156 → 0.141 px, lit over 8/255 2.84% → 2.68%, edges 11.6 → 10.2/255, within 0.05 px 99.19% →
+   99.74% (most 21.9 → 4.75 px).
+4. **The settled picture (`MeshBatch::settled`, `MeshSight::settled`).** An extraction is sized from
+   the previous one's counts, read back without stalling a frame or more later, so the first
+   frame after a camera cut can be meshed from too few chunks. With view-dependent bricks every
+   audit eye is a cut, and the audit as first run read 1.9 M holes, varying run to run. Now a
+   batch knows when its drawn mesh is confirmed complete; the audit draws each eye until settled
+   (at most `SETTLE_MOST` frames) and holds both that picture and the cut's first frame to the
+   field, and says how long settling took. A cut (the eye moved half its distance to the surface
+   or turned 20°) meshes chunks for at least `CUT_BRICKS` (65,536: the audit's largest cut found
+   62,924 active), so even the cut's first frame has 0 holes on every kind on both machines.
+   Settling takes at most 5 frames on the M4 (its read-back latency) and 2 on the Radeon. Every
+   batch's chunks now share a frame's indirect-dispatch budget (`EXTRACT_INDIRECT`, 2,560 of the
+   host's 4,096): a cold first frame of SCENE 10 had exceeded it.
+5. **Occlusion culling of crowds (`lib/engine/mesh/cull.wrela`).** Two-pass reversed-Z Hi-Z
+   culling of a pool's instances (pass 1 against the last frame's pyramid, pass 2 re-tests what it
+   culled against a pyramid of pass 1's depth, which is also next frame's: one pyramid a frame).
+   In SCENE 11 (the citadel: a gatehouse wall before 100 m of halls, 256 walking creatures) it
+   culls 72% of the creatures in the frustum. It runs only while it finds something occluded
+   (`HiZCuller::begin`: stopped after 4 read-backs in a row with nothing culled, probed two runs
+   in every 32), since the pyramid and the split eye pass cost 0.67 ms on the Radeon where
+   nothing is (SCENE 8). SCENE 11, culling against none, 1080p: Radeon 24.98 → **24.38 ms** (eye
+   pass -1.05 ms, pyramid 0.39 ms); M4 14.38 → 14.46 ms, inside the noise (eye pass -0.46 ms).
+
+**Measured and taken out:**
+
+- *Per-brick occlusion culling.* One indirect draw a brick: Metal's multi-draw is a loop of draws
+  on the CPU, and SCENE 10 recorded 7.2 ms a frame (HEAD 1.6). Bricks culled and drawn 64 or 4
+  slots at a time culled 0% and 17.6% of the citadel's bricks, where one at a time culled 37.6%:
+  the extraction appends bricks in no spatial order, so neighbouring slots are not neighbouring
+  bricks. A version that pays wants an ordered compaction of the active bricks (each workgroup's
+  survivors appended together, bricks visited in blocks) or a compacted index buffer drawn once.
+- *Leaf pruning in `UnionAll` / `SmoothUnionAll` evaluation and affine ranges in `pruned`.* Kill
+  line: extraction 1.5x faster. Measured (SCENE 10, 1080p, M4, extraction timed serially): 2.68 ms
+  a frame with it, 2.42 ms with HEAD's evaluation, so slower; and the compiler's bound on a crease
+  solve doubled, so the Radeon's dispatch guard refused the stack's crease slices.
+
+**What it costs.** SCENE 10 at 1080p on the M4 (two A/B pairs, same session): span **16.0 → 21.3
+ms**: `mesh_eye` 1.82 → 4.73 ms (cells a pixel wide near the eye are two triangles a pixel, drawn
+into a G-buffer whose fragments are shaded in 2x2 quads), extraction 1.49 → 2.00 ms, the Hi-Z
+pyramid 0.2 ms. SCENE 8 (256 creatures): 15.1 → 15.4 ms, inside the noise (culling stopped: nothing occluded).
+On the Radeon (Vulkan), SCENE 10 **36.6 → 42.8 ms** (`mesh_eye` 5.21 → 8.21, extraction 2.66 →
+3.81) and SCENE 8 27.0 → 27.5 ms (the stage's denser near mesh: `mesh_eye` +1.08 ms).
+The eye pass's cost is the next thing to take down: a visibility buffer (phase 2) rasterises only
+ids, so tiny triangles stop costing a material evaluation each.
+
+**Checked:** SCENE 6 audit as above on both machines (Radeon under the Khronos validation layer,
+no messages), settled and at the frame of each cut; Vulkan validation silent on SCENES 8, 10, 11
+and 12; SCENE 0 judge on the M4 as above; SCENES 10, 11 and 12 inspected; `tools/layers`;
+`tools/check` on both machines; `wrela test lib/engine` (19).
+
 ## The layers
 
 Dependencies point down. Nothing below knows anything above.
@@ -663,7 +748,7 @@ by the field's stated steepness and gives a distance. The extractor reads the va
 a value tells truly: where it changes sign, and which way it rises there.
 
 **One where it is written, many where it runs.** The compiler specialises extraction to each
-thing's field (`One<M>`, `Many<M, N>`), so the kernels that ask a field are as many as the things;
+thing's field (`One<M>`, `Pool<M>`), so the kernels that ask a field are as many as the things;
 once a field is triangles, every thing is shaded by the one `mesh_fs`, whose cost no longer
 depends on what the thing is. A single shader that asks any field is the wrong way to keep one
 way of doing a job: on a GPU every pixel pays for the widest path in the code it runs, taken or

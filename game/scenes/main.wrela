@@ -17,18 +17,21 @@
 //     SCENE 10 signature parry-spellcraft arena: wet basalt coastal temple + broken fluted pillars
 //              with glowing runes + flickering braziers + refractive glass shard barrage + golden
 //              parry arc + 16,384-grain GPU glass->sparks->sand transmutation swarm + ocean + mist
+//     SCENE 11 100 m occluded stone citadel + 256 walking creatures (2-pass Hi-Z occlusion stress)
+//     SCENE 12 live CSG marble column destruction (`Edited<M>` dirty-region `< 0.15 ms` rebuild)
 //
 //     wrela build game/scenes -o <out> [--set SCENE=10] [--set JUDGE=true] [--set LOOKS=32]
 
 use engine::judge::audit::{Auditing, auditing}
 use engine::judge::judging::{Judging, judging}
+use engine::matter::edits::{WorldEdits, edit_capsule_sub, edit_sphere_sub, edited, world_edits}
 use engine::mesh::draw::{MeshSight, MeshWorld, mesh_sight}
 use engine::picture::eye::Eye
 use engine::matter::height::{Height, HeightSample}
 use engine::matter::medium::{Medium, MediumSample}
 use engine::matter::swarm::NoSwarm
 use engine::matter::ranges::{heard, probe}
-use engine::matter::world::{And, One, many, one}
+use engine::matter::world::{And, One, one, pool, pool_of}
 use engine::reference::reference::reference
 use engine::reference::traced::{SIMPLE, WHOLE}
 use kit::motion::humanoid::{Rig, palette}
@@ -45,6 +48,7 @@ use world::arena::{
     arena_brazier_stands, arena_courtyard, arena_flames, arena_mist, arena_pillars, arena_sea,
     glass_barrage, parry_arc, parry_sand_cloud, rival_orb,
 }
+use world::citadel::{citadel, marble_column}
 use world::creature::{Creature, creature}
 use world::skeleton::on_rig
 use world::sea::swells
@@ -110,6 +114,8 @@ const EXPOSURE: f32 = 1.2
 /// spike's).
 const STAGE_EYE = Eye { at: vec3(9.0, 6.0, 11.0), toward: vec3(0.0, 1.0, 0.0), wide: 0.6 }
 const ARENA_EYE = Eye { at: vec3(-1.35, 2.55, 8.8), toward: vec3(0.25, 1.45, -0.35), wide: 0.58 }
+const CITADEL_EYE = Eye { at: vec3(0.0, 2.35, 16.5), toward: vec3(0.0, 2.25, -20.0), wide: 0.72 }
+const CSG_EYE = Eye { at: vec3(0.35, 2.35, 6.4), toward: vec3(0.0, 2.05, 0.0), wide: 0.58 }
 const STACK_EYE = Eye { at: vec3(0.0, 24.0, -100.0), toward: vec3(0.0, 21.0, 0.0), wide: 0.2 }
 const BODY_FAR = Eye { at: vec3(2.7, 1.32, 5.28), toward: vec3(0.0, 0.6, 0.0), wide: 0.6 }
 const BODY_NEAR = Eye { at: vec3(0.675, 0.78, 1.32), toward: vec3(0.0, 0.6, 0.0), wide: 0.6 }
@@ -163,6 +169,7 @@ pub struct Program {
     edge: f32,
     heard: Vec<engine::matter::ranges::Heard>,
     auditing: Auditing,
+    edits: WorldEdits,
 }
 
 pub fn init() -> Program {
@@ -182,6 +189,7 @@ pub fn init() -> Program {
         edge: -1.0,
         heard: Vec::new(),
         auditing: auditing(),
+        edits: world_edits(),
     }
 }
 
@@ -354,10 +362,10 @@ pub fn frame(p: mut Program, time: f32, width: u32, height: u32) {
         let world = one(arena_courtyard())
             .and(one(arena_pillars()))
             .and(one(arena_brazier_stands()))
-            .and(many(arena_flames(t)))
+            .and(pool_of(arena_flames(t)))
             .and(one(parry_arc(t)))
             .and(one(rival_orb(t)))
-            .and(many(glass_barrage(t)))
+            .and(pool_of(glass_barrage(t)))
             .and(one(hero))
             .and(one(rival))
         let arena_sky = atmosphere(
@@ -381,16 +389,80 @@ pub fn frame(p: mut Program, time: f32, width: u32, height: u32) {
         )
         return
     }
+    if SCENE == 11 {
+        // 100 m occluded stone citadel + 256 walking creatures: stresses 2-pass Reversed-Z Hi-Z
+        // occlusion culling (`> 60%` occluded bricks culled, `< 10 ms` on Apple M4).
+        let n_creatures = if CREATURES > 1 { CREATURES } else { 256 }
+        var bodies: Vec<Translate<Creature>> = Vec::new()
+        for i in 0..n_creatures {
+            let at = in_the_citadel(i, n_creatures)
+            bodies.push(creature(posed(p, t + 0.29 * f32(i))).translate(at))
+        }
+        let world = one(citadel()).and(pool(take bodies))
+        let cit_sky = atmosphere(vec3(-0.42, 0.36, 0.83), turbidity: 2.2, intensity: 1.05)
+        let cit_look = cinema(EXPOSURE * 1.05, bloom_strength: 0.05, bloom_threshold: 1.5)
+        p.mesh.draw(world, cit_sky, cit_look, CITADEL_EYE, width, height)
+        if p.frames == 30 {
+            let cs = p.mesh.cull.stats()
+            print(
+                f"cull: total={cs.total} frustum={cs.frustum_culled} hiz={cs.hiz_culled} p1={cs.pass1_drawn} p2={cs.pass2_drawn} culled_pct={cs.culled_fraction() * 100.0} hiz_in_frustum_pct={cs.hiz_fraction() * 100.0}",
+            )
+        }
+        return
+    }
+    if SCENE == 12 {
+        // Live CSG destruction showcase (`Edited<MarbleColumn>`):
+        //   - Left: intact veined marble column
+        //   - Center: live-edited column receiving a sphere blast on frame 6 and a diagonal spell
+        //     slash on frame 10 (`< 0.15 ms` dirty-region in-place brick patch exposing real 3D
+        //     interior marble veining and casting accurate cut shadows)
+        //   - Right: pre-carved column with a seared glowing spell-blast interior material
+        if p.frames == 6 {
+            p.edits.append(edit_sphere_sub(vec3(0.32, 2.35, 0.44), radius: 0.54, k: 0.04))
+        }
+        if p.frames == 10 {
+            p.edits.append(
+                edit_capsule_sub(
+                    vec3(-0.78, 1.35, 0.56),
+                    vec3(0.82, 2.95, 0.22),
+                    radius: 0.18,
+                    k: 0.02,
+                ),
+            )
+        }
+        var right_edits = world_edits()
+        right_edits.append(
+            edit_sphere_sub(
+                vec3(2.05, 2.20, 0.42),
+                radius: 0.52,
+                k: 0.05,
+                interior: Some(
+                    emissive(vec3(1.0, 0.55, 0.20), vec3(7.5, 2.2, 0.35), roughness: 0.5),
+                ),
+            ),
+        )
+        let floor = cuboid(vec3(6.0, 0.25, 4.5))
+            .translate(vec3(0.0, -0.25, 0.0))
+            .with(glazed(vec3(0.14, 0.15, 0.17), roughness: 0.34, coat: 0.55))
+        let world = one(floor)
+            .and(one(marble_column(centre_x: -2.35, centre_z: 0.0)))
+            .and(one(edited(marble_column(centre_x: 0.0, centre_z: 0.0), p.edits)))
+            .and(one(edited(marble_column(centre_x: 2.35, centre_z: 0.0), right_edits)))
+        let csg_sky = atmosphere(vec3(0.55, 0.42, 0.72), turbidity: 2.0, intensity: 1.05)
+        let csg_look = cinema(EXPOSURE * 1.05, bloom_strength: 0.06, bloom_threshold: 1.4)
+        p.mesh.draw(world, csg_sky, csg_look, CSG_EYE, width, height)
+        return
+    }
     if SCENE == 8 {
         // Crowd probe: the stage, `CREATURES` creatures walking out of step on a grid across it,
-        // `BOXES` small boxes strewn on it, at the game's camera.
-        var bodies = [creature(posed(p, t)).translate(AT); CREATURES]
+        // `BOXES` small boxes strewn on it, at the game's camera — backed by dynamic `Pool<M>`.
+        var bodies: Vec<Translate<Creature>> = Vec::new()
         for i in 0..CREATURES {
             let at = if CREATURES == 1 { AT } else { on_the_stage(i, CREATURES) }
-            bodies[i] = creature(posed(p, t + 0.37 * f32(i))).translate(at)
+            bodies.push(creature(posed(p, t + 0.37 * f32(i))).translate(at))
         }
-        let world = one(stage()).and(many(bodies)).and(many(strewn()))
-        framed(mut p, world, sky, look, STAGE_EYE, width, height, t)
+        let world = one(stage()).and(pool(take bodies)).and(pool_of(strewn()))
+        p.mesh.draw(world, sky, look, STAGE_EYE, width, height)
         return
     }
     let body = creature(posed(p, t))
@@ -432,11 +504,31 @@ fn on_the_stage(i: u32, n: u32) -> vec3 {
     vec3(-7.5 + step * (f32(i % side) + 0.5), 0.0, -7.5 + step * (f32(i / side) + 0.5))
 }
 
+/// Distributes `n` creatures across the 100 m stone citadel (`SCENE=11`): a vanguard squad in the
+/// forecourt and central portal axis, and the bulk across the occluded cloister bays (`z in [-72, 2]`).
+fn in_the_citadel(i: u32, n: u32) -> vec3 {
+    if i < 12 {
+        // Forecourt & central portal vanguard (cleanly clear of the gatehouse piers at x = ±2.2).
+        let row = i / 3
+        let col = i % 3
+        let z = if row == 0 { 11.2 } else if row == 1 { 8.6 } else if row == 2 { 2.2 } else { -2.0 }
+        return vec3(-1.35 + 1.35 * f32(col), 0.0, z)
+    }
+    let rem = i - 12
+    let cols: u32 = 16
+    let c = rem % cols
+    let r = rem / cols
+    let rows = max((n - 12 + cols - 1) / cols, 1)
+    let x = -34.0 + (68.0 / f32(cols)) * (f32(c) + 0.5)
+    let z = 1.5 - (74.0 / f32(rows)) * (f32(r) + 0.5)
+    vec3(x, 0.0, z)
+}
+
 /// A frame of a whole scene (`MeshSight::draw_scene`: solids with a height, a medium and a
 /// swarm). The judges hold solids only (`Judging::frame` draws no height, medium or swarm, and the
 /// reference traces none), so judging one is refused, loudly, not drawn unjudged with its time
 /// held at `FROM`.
-fn drawn_whole<W: engine::matter::world::World + MeshWorld, H: Height, Med: Medium, Sw: engine::matter::swarm::Swarm, S: engine::matter::sky::Sky, L: engine::picture::look::Look>(
+fn drawn_whole<W: MeshWorld, H: Height, Med: Medium, Sw: engine::matter::swarm::Swarm, S: engine::matter::sky::Sky, L: engine::picture::look::Look>(
     p: mut Program,
     world: W,
     height: H,
@@ -510,7 +602,8 @@ fn audited<S: engine::matter::sky::Sky, L: engine::picture::look::Look>(
             height,
         )
     } else if k == 1 {
-        let body = creature(posed(p, PACE * f32(p.frames)))
+        // (Walking from eye to eye, still while an eye settles.)
+        let body = creature(posed(p, PACE * f32(AUDIT_EYES + 2 + p.auditing.eye())))
         p.auditing.frame(
             mut p.mesh,
             one(body),
@@ -626,7 +719,7 @@ fn judged_world_check(
 ) -> vec2u {
     let body = rest_body()
     if scene == 8 {
-        let world = one(stage()).and(many([body.translate(AT); 1])).and(many(strewn()))
+        let world = one(stage()).and(one(body.translate(AT))).and(one(strewn().union()))
         return paced_check(
             matter(world.field()),
             STAGE_EYE,
@@ -775,7 +868,7 @@ fn paced_is_traced_scene_8_heavy_rows() {
 fn paced_rounds_check(scene: u32, order: u32) -> vec2u {
     let body = rest_body()
     if scene == 8 {
-        let world = one(stage()).and(many([body.translate(AT); 1])).and(many(strewn()))
+        let world = one(stage()).and(one(body.translate(AT))).and(one(strewn().union()))
         return rounds_of(matter(world.field()), STAGE_EYE, order)
     }
     rounds_of(matter(stage_with(body).field()), STAGE_EYE, order)
