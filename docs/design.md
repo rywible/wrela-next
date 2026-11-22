@@ -683,10 +683,21 @@ and 12; SCENE 0 judge on the M4 as above; SCENES 10, 11 and 12 inspected; `tools
   fell only 4.71 → 3.86 ms (HEAD: 1.82). A visibility buffer alone would not take it back; fewer
   triangles would, with the exact silhouette restored per pixel (a hull drawn slightly outside
   the surface, the pixel's ray met with the field and the fragment pushed back or discarded).
-- **The toolchain has the conservative depth that needs, for one target only.**
-  `std::gpu::WithDepthBehind` keeps early depth testing for a fragment pushed back from its
-  triangle, but takes one colour; the four-target G-buffer (`Targets4`) needs it too (the
-  compiler and both shader writers).
+- **The toolchain already has the conservative depth that needs.** `WithDepthBehind` of a
+  `Targets4` compiles and draws (its output check takes any `Targets`; only `std::gpu`'s doc
+  says one colour).
+- **The per-pixel snap, tried (branch `phase2-snap-wip`, not landed).** The opaque G-buffer draws
+  a hull grown `HULL_PX` (0.5) pixels along the mesh's normals; its fragment carries the pixel's
+  ray onto the field (sphere steps of at least `1/SNAP_STEPS` of the reach, secant steps once
+  inside), shades the material there and pushes depth back. SCENE 6 at 640x360, `CELL_PX` 1:
+  plain sphere tracing lost whole grazing floors (stage 190k holes); bracketing with a reach of
+  4 hull widths gave 0 extras on every kind with holes on the stack (671), pillars (120), ward
+  (43) and creature (22); a reach of 12 cut those to 125, 6, 69 and 0; keeping rays that come
+  within half a pixel of the surface gave 0 holes but on one stack eye (231) and extras up to
+  878. The cause: where a thing's area budget binds, its levels' cells are wider than `CELL_PX`
+  pixels, so a hull sized in pixels does not cover their chords. A hull must be sized from the
+  cell a vertex was meshed at, which the 16-byte vertex has no bits for (normal 20, thing 10,
+  flags 2): the next step is a vertex that carries its level, or a per-brick hull width.
 - **A moving eye does not re-extract every frame at walking pace**: SCENE 10 with the eye
   swinging 0.6 m measured extraction at 2.46 ms a frame, as still.
 - **Geometric specular antialiasing (Tokuyoshi and Kaplanyan 2019) was tried and not landed.**
