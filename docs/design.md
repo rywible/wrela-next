@@ -675,6 +675,27 @@ no messages), settled and at the frame of each cut; Vulkan validation silent on 
 and 12; SCENE 0 judge on the M4 as above; SCENES 10, 11 and 12 inspected; `tools/layers`;
 `tools/check` on both machines; `wrela test lib/engine` (19).
 
+### What phase 2 starts from (measured 2026-11-22, after the above)
+
+- **The eye pass's new cost is geometry, not shading.** SCENE 10 at 1080p meshes about 4 M
+  triangles (the pillars 1.96 M in 43k bricks of 3 mm cells, the courtyard 1.55 M): two a pixel,
+  as cells a pixel wide must. With the G-buffer shader's field evaluation stubbed out, `mesh_eye`
+  fell only 4.71 → 3.86 ms (HEAD: 1.82). A visibility buffer alone would not take it back; fewer
+  triangles would, with the exact silhouette restored per pixel (a hull drawn slightly outside
+  the surface, the pixel's ray met with the field and the fragment pushed back or discarded).
+- **The toolchain has the conservative depth that needs, for one target only.**
+  `std::gpu::WithDepthBehind` keeps early depth testing for a fragment pushed back from its
+  triangle, but takes one colour; the four-target G-buffer (`Targets4`) needs it too (the
+  compiler and both shader writers).
+- **A moving eye does not re-extract every frame at walking pace**: SCENE 10 with the eye
+  swinging 0.6 m measured extraction at 2.46 ms a frame, as still.
+- **Geometric specular antialiasing (Tokuyoshi and Kaplanyan 2019) was tried and not landed.**
+  The SCENE 0 judge cannot see it (its reference is diffuse: the simple light), and against SCENE
+  10 rendered at 3840x2160 and box-filtered to 1280x720 it moved the 1280x720 picture away
+  (mean 6.16 → 6.33/255), on a frame that is not bit-repeatable run to run. The check that
+  should decide it is a judge with specular light, or the variance of a pixel across a still
+  eye's jittered subframes before the temporal resolve.
+
 ## The layers
 
 Dependencies point down. Nothing below knows anything above.
