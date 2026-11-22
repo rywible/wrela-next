@@ -1091,3 +1091,33 @@ thing in one structure; hardware that follows rays, 6) is slice 2's first questi
   which is what this design is meant to prevent.
 - A filed gap is only better than a workaround if gaps get closed. An engine that is slow to
   close them teaches authors to work round it.
+
+## Field-native authoring, cloth and neural motion (`SCENE 11`, 2026-11-22)
+
+Offline 2D→3D→Field compilation (`tools/fieldgen/`, VAST-AI/TripoSG MIT + multi-view concept art)
+and neural motion training (`tools/training/motion/`, Colab GPU + MuJoCo/MJX physics verification)
+now compile directly into pure Wrela `Field<Substance>` code and compact deterministic motion
+weights with zero runtime mesh or voxel assets:
+
+- **Engine primitives (`lib/std/field.wrela`, `lib/engine/mesh/extract.wrela`):** `RoundCuboid`,
+  `Lathe<N>`, `BoundedResidual<S, R>` (bounded $C^1$-windowed SIREN-16/24 displacement with sound
+  `Bound`, `interval_near`, `pruned`, and `rigid_shape_hash`), `Painted<S, M>` (`ChannelEval<C>`),
+  64-bone `Skinned<S>`, sliced `solve_verts`/`refine_creases`/`deform_skinned_verts` dispatches
+  keeping all compute passes under the 50 ms GPU guard on both M4 Metal and Radeon Vulkan, and a
+  rigid single-bone + `Surface::skin_project()` DQS fast path (1080p M4 `mesh_skin` reduced from
+  14.35 ms to 10.82 ms; `SCENE 0` `mesh_skin` at 37.4 µs).
+- **Modular cloth & biomechanics (`lib/kit/motion/{anatomy,cloth,neural}.wrela`):** canonical
+  52-bone VRM humanoid specification (77.29 kg, 30 finger joints, 3-point foot pads, exported to
+  `tools/training/humanoid_mjx.xml` and verified in MuJoCo 4.0.1 + MJX JIT), reusable 7×9 XPBD
+  `ClothSim`/`Skinned<ClothSheet>` colliding against exact `body.distance` and `world.distance`,
+  and deterministic `NeuralMotion` (`32→64→64→144` SiLU + residual MLP) with hinge-pure 2-bone IK,
+  exact floor grounding, and 5-finger prop surface wrap.
+- **Measured on `SCENE 11` (320 frames, M4 Metal & Linux Radeon Vulkan):** all 164 MSL and SPIR-V
+  shaders pass `xcrun metal` and `spirv-val` with 0 VVL errors; live `MotionMetrics` (`ok=true`)
+  measures `skate_mean=4.46 mm/s`, `floor_pen=0.0 mm`, `table_pen=0.0 mm`,
+  `joint_viol=2.8e-7 rad`, `palm_grasp=11.06 mm`, `finger_grasp=7.65 mm`,
+  `cloth_body_pen=0.0 mm`, `cloth_world_pen=0.0 mm`; CPU program time is 0.75 ms/frame on M4
+  (2.73 ms on Linux); 1080p serial GPU sum is 28.14 ms on M4 Metal (`mesh_eye` 8.29 ms,
+  `mesh_skin` 10.82 ms) and 47.95 ms overlapped span on Radeon Renoir Vulkan; `SCENE 12` hole
+  audit across 12 eyes confirms 99.97%–99.98% hit watertightness on `oaktable`, `grimoire`, and
+  `hat`.

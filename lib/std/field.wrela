@@ -359,6 +359,13 @@ pub trait Surface: Copy + GpuData {
     fn posed_local_distance(self, p: vec3) -> f32 {
         self.distance(p)
     }
+
+    /// Whether GPU-skinned multi-bone blend zones run analytical Newton projection onto
+    /// `posed_local_distance` (`true` for volumetric rigs; `false` for particle-skinned sheets
+    /// whose DQS interpolation is already smooth and exact).
+    fn skin_project(self) -> bool {
+        true
+    }
 }
 
 /// Maximum bones supported in a single `Skinned` field's GPU Dual Quaternion palette
@@ -774,6 +781,10 @@ impl<S: Surface> Surface for Skinned<S> {
 
     fn posed_local_distance(self, p: vec3) -> f32 {
         self.posed.distance(p)
+    }
+
+    fn skin_project(self) -> bool {
+        self.rest.skin_project()
     }
 }
 
@@ -1917,6 +1928,125 @@ impl Surface for Cuboid {
     }
 
     /// Exact.
+    fn lipschitz(self, near: f32) -> f32 {
+        1.0
+    }
+
+    fn rigid_shape_hash(self) -> Option<u64> {
+        Some(state_hash(self))
+    }
+}
+
+/// A box centred at the origin with half-extents `half` and edge rounding `radius`. Exact.
+pub struct RoundCuboid: Copy + GpuData + Eq + StateHash {
+    pub half: vec3,
+    pub radius: f32,
+}
+
+/// A rounded box with outer half-extents `half` and bevel/rounding `radius`.
+pub fn round_cuboid(half: vec3, radius: f32) -> RoundCuboid {
+    let r = max(radius, 0.0)
+    let inner = max(half - vec3(r), vec3(0.0))
+    RoundCuboid { half: inner, radius: r }
+}
+
+impl Surface for RoundCuboid {
+    fn distance(self, p: vec3) -> f32 {
+        let q = abs(p) - self.half
+        let m = max(q.x, max(q.y, q.z))
+        (if m > 0.0 { length(max(q, vec3(0.0))) } else { m }) - self.radius
+    }
+
+    fn bound(self) -> Bound {
+        Bound { centre: vec3(), radius: length(self.half) + self.radius, slope: 1.0 }
+    }
+
+    fn lipschitz(self, near: f32) -> f32 {
+        1.0
+    }
+
+    fn rigid_shape_hash(self) -> Option<u64> {
+        Some(state_hash(self))
+    }
+}
+
+/// A solid of revolution about the Y axis defined by an `N`-point radial profile `(r, y)` sorted
+/// from bottom (`profile[0].y`) to top (`profile[N - 1].y`), closed back to the axis at both ends,
+/// with optional rounding `bevel`. Exact (Lipschitz = 1.0).
+pub struct Lathe<const N: u32>: Copy + GpuData + Eq + StateHash {
+    pub profile: [vec2; N],
+    pub bevel: f32,
+}
+
+/// A solid of revolution around the Y axis through `profile` (`vec2(radius, y)`), rounded by `bevel`.
+pub fn lathe<const N: u32>(profile: [vec2; N], bevel: f32 = 0.0) -> Lathe<N> {
+    Lathe { profile, bevel: max(bevel, 0.0) }
+}
+
+/// Signed distance in the 2D `(r, y)` half-plane (`r >= 0`) to segment `a -> b`, updating minimum
+/// squared distance `d2` and winding sign `s` (negative inside).
+fn lathe_edge(q: vec2, a: vec2, b: vec2, d2: f32, s: f32) -> (f32, f32) {
+    let e = b - a
+    let w = q - a
+    let t = clamp(dot(w, e) / max(dot(e, e), 1.0e-12), 0.0, 1.0)
+    let diff = w - e * t
+    let nd2 = min(d2, dot(diff, diff))
+    let c1 = q.y >= a.y
+    let c2 = q.y < b.y
+    let c3 = e.x * w.y > e.y * w.x
+    let flip = (c1 && c2 && c3) || (!c1 && !c2 && !c3)
+    (nd2, if flip { -s } else { s })
+}
+
+impl<const N: u32> Surface for Lathe<N> {
+    fn distance(self, p: vec3) -> f32 {
+        let q = vec2(length(p.xz), p.y)
+        let y_lo = self.profile[0].y
+        let y_hi = self.profile[N - 1].y
+        let a0 = vec2(0.0, y_lo)
+        let an = vec2(0.0, y_hi)
+        var d2 = 1.0e20
+        var s = 1.0
+        let r0 = lathe_edge(q, a0, self.profile[0], d2, s)
+        d2 = r0.0
+        s = r0.1
+        for i in 1..N {
+            let ri = lathe_edge(q, self.profile[i - 1], self.profile[i], d2, s)
+            d2 = ri.0
+            s = ri.1
+        }
+        let rt = lathe_edge(q, self.profile[N - 1], an, d2, s)
+        d2 = rt.0
+        s = rt.1
+        let e_ax = a0 - an
+        let w_ax = q - an
+        let c1 = q.y >= an.y
+        let c2 = q.y < a0.y
+        let c3 = e_ax.x * w_ax.y > e_ax.y * w_ax.x
+        if (c1 && c2 && c3) || (!c1 && !c2 && !c3) {
+            s = -s
+        }
+        s * sqrt(max(d2, 0.0)) - self.bevel
+    }
+
+    fn bound(self) -> Bound {
+        var y_min = self.profile[0].y
+        var y_max = self.profile[0].y
+        var r_max = max(self.profile[0].x, 0.0)
+        for i in 1..N {
+            y_min = min(y_min, self.profile[i].y)
+            y_max = max(y_max, self.profile[i].y)
+            r_max = max(r_max, self.profile[i].x)
+        }
+        let yc = 0.5 * (y_min + y_max)
+        let yh = 0.5 * (y_max - y_min)
+        Bound {
+            centre: vec3(0.0, yc, 0.0),
+            radius: sqrt(r_max * r_max + yh * yh) + self.bevel,
+            slope: 1.0,
+        }
+    }
+
     fn lipschitz(self, near: f32) -> f32 {
         1.0
     }
@@ -3081,6 +3211,379 @@ impl<S: Surface, N: Noise> Surface for Displace<S, N> {
     }
 }
 
+/// Evaluates a bounded continuous residual scalar in `[-1, 1]` at normalized local coordinate `q`
+/// (typically `[-1, 1]³`) for `BoundedResidual`. Implemented by compact SIREN / Fourier MLPs whose
+/// weights live as typed Wrela `const` arrays — pure math, identical on CPU and GPU.
+pub trait ResidualEval: Copy + GpuData + Eq + StateHash {
+    /// Bounded residual in `[-1, 1]` at normalized local point `q`.
+    fn eval_sdf(self, q: vec3) -> f32
+}
+
+/// Analytical base surface `inner` refined by a compact bounded continuous residual `residual`:
+/// `d(p) = d_base(p) + w(|d_base(p)|) * max_delta * residual.eval_sdf((p - center) * inv_extent)`.
+///
+/// Outside the smooth surface band (`|d_base| >= band`), `residual` is never evaluated (0 FLOPs),
+/// and `bound`, `interval_near`, and `pruned` use the exact analytical base expanded by `max_delta`
+/// without calling the residual at all.
+pub struct BoundedResidual<S, R>: Copy + GpuData + Eq + StateHash {
+    pub inner: S,
+    pub residual: R,
+    pub center: vec3,
+    pub inv_extent: vec3,
+    pub max_delta: f32,
+    pub lip_extra: f32,
+}
+
+/// Wraps analytical surface `inner` with bounded residual `residual` over the local box centred at
+/// `center` with half-extents `extent`, displacement amplitude `max_delta` (m), and Lipschitz
+/// gradient budget `lip_extra`.
+pub fn bounded_residual<S: Surface, R: ResidualEval>(
+    inner: S,
+    residual: R,
+    center: vec3,
+    extent: vec3,
+    max_delta: f32,
+    lip_extra: f32 = 0.35,
+) -> BoundedResidual<S, R> {
+    BoundedResidual {
+        inner,
+        residual,
+        center,
+        inv_extent: vec3(
+            1.0 / max(extent.x, 1.0e-5),
+            1.0 / max(extent.y, 1.0e-5),
+            1.0 / max(extent.z, 1.0e-5),
+        ),
+        max_delta: abs(max_delta),
+        lip_extra: max(lip_extra, 0.0),
+    }
+}
+
+impl<S: Surface, R: ResidualEval> BoundedResidual<S, R> {
+    fn band(self) -> f32 {
+        self.max_delta * 2.5 + 0.015
+    }
+
+    fn apply_residual(self, db: f32, p: vec3) -> f32 {
+        let b = self.band()
+        let ad = abs(db)
+        if ad >= b || self.max_delta <= 1.0e-7 {
+            return db
+        }
+        let t = 1.0 - ad / b
+        let w = t * t * (3.0 - 2.0 * t)
+        let q = (p - self.center) * self.inv_extent
+        db + w * self.max_delta * clamp(self.residual.eval_sdf(q), -1.0, 1.0)
+    }
+}
+
+impl<S: Surface, R: ResidualEval> Surface for BoundedResidual<S, R> {
+    fn distance(self, p: vec3) -> f32 {
+        self.apply_residual(self.inner.distance(p), p)
+    }
+
+    fn masked(self, p: vec3, live: Live, first: u32) -> f32 {
+        self.apply_residual(self.inner.masked(p, live, first), p)
+    }
+
+    fn pruned<F: Copy + fn(vec3) -> vec3>(
+        self,
+        over: Box3,
+        at: F,
+        stretch: f32,
+        live: Live,
+        first: u32,
+    ) -> Pruned {
+        let r = self.inner.pruned(over, at, stretch, live, first)
+        let d = self.max_delta
+        Pruned {
+            live: r.live,
+            range: outward(Interval { lo: r.range.lo - d, hi: r.range.hi + d }),
+        }
+    }
+
+    fn bound(self) -> Bound {
+        self.inner.bound().lowered(self.max_delta)
+    }
+
+    fn filtered(self, p: vec3, footprint: f32) -> f32 {
+        let db = self.inner.filtered(p, footprint)
+        let fade = clamp(1.0 - footprint / max(self.max_delta * 4.0, 0.01), 0.0, 1.0)
+        if fade <= 0.0 {
+            return db
+        }
+        let d = self.apply_residual(db, p)
+        db + fade * (d - db)
+    }
+
+    fn part_offset(self, p: vec3, i: u32, by: f32) -> f32 {
+        self.apply_residual(self.inner.part_offset(p, i, by), p)
+    }
+
+    fn parts(self) -> u32 {
+        self.inner.parts()
+    }
+
+    fn part_at(self, p: vec3) -> (f32, u32) {
+        let (db, i) = self.inner.part_at(p)
+        (self.apply_residual(db, p), i)
+    }
+
+    fn part_distance(self, p: vec3, i: u32) -> f32 {
+        self.inner.part_distance(p, i)
+    }
+
+    fn part_name(self, i: u32) -> PartName {
+        self.inner.part_name(i)
+    }
+
+    fn lipschitz(self, near: f32) -> f32 {
+        self.inner.lipschitz(near + self.max_delta) + self.lip_extra
+    }
+
+    fn interval_near(self, b: Box3) -> Interval {
+        let x = self.inner.interval_near(b)
+        let d = self.max_delta
+        let lo = x.lo - d
+        let hi = x.hi + d
+        Interval { lo: lo - 1.0e-5 * abs(lo) - 1.0e-6, hi: hi + 1.0e-5 * abs(hi) + 1.0e-6 }
+    }
+
+    fn rigid_shape_hash(self) -> Option<u64> {
+        match self.inner.rigid_shape_hash() {
+            Some(ih) => {
+                var h = Hasher::new()
+                StateHash::state_hash(ih, mut h)
+                StateHash::state_hash(self.residual, mut h)
+                StateHash::state_hash(self.center, mut h)
+                StateHash::state_hash(self.inv_extent, mut h)
+                StateHash::state_hash(self.max_delta, mut h)
+                Some(h.finish())
+            }
+            None => None,
+        }
+    }
+}
+
+/// Evaluates a compact 2-hidden-layer SIREN MLP of width 16 (`4 × vec4`) at 3D point `q`:
+/// returns `(tanh(raw_d), albedo_rgb, roughness, metallic)` in pure CPU/GPU math.
+pub fn siren16_sdf_pbr(
+    q: vec3,
+    w0: [vec4; 16],
+    w1: [vec4; 64],
+    b1: [vec4; 4],
+    out_w: [vec4; 24],
+    out_b0: vec4,
+    out_b1: vec4,
+) -> (f32, vec3, f32, f32) {
+    let q4 = vec4(q, 1.0)
+    var h0 = [vec4(0.0); 4]
+    for g in 0..4 {
+        let k = g * 4
+        h0[g] = sin(
+            vec4(
+                dot(w0[k], q4),
+                dot(w0[k + 1], q4),
+                dot(w0[k + 2], q4),
+                dot(w0[k + 3], q4),
+            ),
+        )
+    }
+    var h1 = [vec4(0.0); 4]
+    for g in 0..4 {
+        let base = g * 16
+        let r0 = dot(w1[base], h0[0]) +
+            dot(w1[base + 1], h0[1]) +
+            dot(w1[base + 2], h0[2]) +
+            dot(w1[base + 3], h0[3])
+        let r1 = dot(w1[base + 4], h0[0]) +
+            dot(w1[base + 5], h0[1]) +
+            dot(w1[base + 6], h0[2]) +
+            dot(w1[base + 7], h0[3])
+        let r2 = dot(w1[base + 8], h0[0]) +
+            dot(w1[base + 9], h0[1]) +
+            dot(w1[base + 10], h0[2]) +
+            dot(w1[base + 11], h0[3])
+        let r3 = dot(w1[base + 12], h0[0]) +
+            dot(w1[base + 13], h0[1]) +
+            dot(w1[base + 14], h0[2]) +
+            dot(w1[base + 15], h0[3])
+        h1[g] = sin(vec4(r0, r1, r2, r3) + b1[g])
+    }
+    let ch = |c: u32| -> f32 {
+        let o = c * 4
+        dot(out_w[o], h1[0]) +
+            dot(out_w[o + 1], h1[1]) +
+            dot(out_w[o + 2], h1[2]) +
+            dot(out_w[o + 3], h1[3])
+    }
+    let raw_d = ch(0) + out_b0.x
+    let ed = exp(clamp(2.0 * raw_d, -16.0, 16.0))
+    let delta = (ed - 1.0) / (ed + 1.0)
+    let sig = |x: f32| -> f32 { 1.0 / (1.0 + exp(-clamp(x, -12.0, 12.0))) }
+    let albedo = vec3(sig(ch(1) + out_b0.y), sig(ch(2) + out_b0.z), sig(ch(3) + out_b0.w))
+    let rough = 0.06 + 0.92 * sig(ch(4) + out_b1.x)
+    let metal = sig(ch(5) + out_b1.y)
+    (delta, albedo, rough, metal)
+}
+
+/// Evaluates only the bounded SDF residual `delta` in `[-1, 1]` of a width-16 SIREN MLP.
+pub fn siren16_sdf(
+    q: vec3,
+    w0: [vec4; 16],
+    w1: [vec4; 64],
+    b1: [vec4; 4],
+    out_w0: [vec4; 4],
+    out_b0: f32,
+) -> f32 {
+    let q4 = vec4(q, 1.0)
+    var h0 = [vec4(0.0); 4]
+    for g in 0..4 {
+        let k = g * 4
+        h0[g] = sin(
+            vec4(
+                dot(w0[k], q4),
+                dot(w0[k + 1], q4),
+                dot(w0[k + 2], q4),
+                dot(w0[k + 3], q4),
+            ),
+        )
+    }
+    var h1 = [vec4(0.0); 4]
+    for g in 0..4 {
+        let base = g * 16
+        let r0 = dot(w1[base], h0[0]) +
+            dot(w1[base + 1], h0[1]) +
+            dot(w1[base + 2], h0[2]) +
+            dot(w1[base + 3], h0[3])
+        let r1 = dot(w1[base + 4], h0[0]) +
+            dot(w1[base + 5], h0[1]) +
+            dot(w1[base + 6], h0[2]) +
+            dot(w1[base + 7], h0[3])
+        let r2 = dot(w1[base + 8], h0[0]) +
+            dot(w1[base + 9], h0[1]) +
+            dot(w1[base + 10], h0[2]) +
+            dot(w1[base + 11], h0[3])
+        let r3 = dot(w1[base + 12], h0[0]) +
+            dot(w1[base + 13], h0[1]) +
+            dot(w1[base + 14], h0[2]) +
+            dot(w1[base + 15], h0[3])
+        h1[g] = sin(vec4(r0, r1, r2, r3) + b1[g])
+    }
+    let raw_d = dot(out_w0[0], h1[0]) +
+        dot(out_w0[1], h1[1]) +
+        dot(out_w0[2], h1[2]) +
+        dot(out_w0[3], h1[3]) +
+        out_b0
+    let ed = exp(clamp(2.0 * raw_d, -16.0, 16.0))
+    (ed - 1.0) / (ed + 1.0)
+}
+
+/// Evaluates a 2-hidden-layer SIREN MLP of width 24 (`6 × vec4`) for richer SDF + PBR detail.
+pub fn siren24_sdf_pbr(
+    q: vec3,
+    w0: [vec4; 24],
+    w1: [vec4; 144],
+    b1: [vec4; 6],
+    out_w: [vec4; 36],
+    out_b0: vec4,
+    out_b1: vec4,
+) -> (f32, vec3, f32, f32) {
+    let q4 = vec4(q, 1.0)
+    var h0 = [vec4(0.0); 6]
+    for g in 0..6 {
+        let k = g * 4
+        h0[g] = sin(
+            vec4(
+                dot(w0[k], q4),
+                dot(w0[k + 1], q4),
+                dot(w0[k + 2], q4),
+                dot(w0[k + 3], q4),
+            ),
+        )
+    }
+    var h1 = [vec4(0.0); 6]
+    for g in 0..6 {
+        let base = g * 24
+        var acc = [0.0; 4]
+        for r in 0..4 {
+            let o = base + r * 6
+            acc[r] = dot(w1[o], h0[0]) +
+                dot(w1[o + 1], h0[1]) +
+                dot(w1[o + 2], h0[2]) +
+                dot(w1[o + 3], h0[3]) +
+                dot(w1[o + 4], h0[4]) +
+                dot(w1[o + 5], h0[5])
+        }
+        h1[g] = sin(vec4(acc[0], acc[1], acc[2], acc[3]) + b1[g])
+    }
+    let ch = |c: u32| -> f32 {
+        let o = c * 6
+        dot(out_w[o], h1[0]) +
+            dot(out_w[o + 1], h1[1]) +
+            dot(out_w[o + 2], h1[2]) +
+            dot(out_w[o + 3], h1[3]) +
+            dot(out_w[o + 4], h1[4]) +
+            dot(out_w[o + 5], h1[5])
+    }
+    let raw_d = ch(0) + out_b0.x
+    let ed = exp(clamp(2.0 * raw_d, -16.0, 16.0))
+    let delta = (ed - 1.0) / (ed + 1.0)
+    let sig = |x: f32| -> f32 { 1.0 / (1.0 + exp(-clamp(x, -12.0, 12.0))) }
+    let albedo = vec3(sig(ch(1) + out_b0.y), sig(ch(2) + out_b0.z), sig(ch(3) + out_b0.w))
+    let rough = 0.06 + 0.92 * sig(ch(4) + out_b1.x)
+    let metal = sig(ch(5) + out_b1.y)
+    (delta, albedo, rough, metal)
+}
+
+/// Evaluates only the bounded SDF residual `delta` in `[-1, 1]` of a width-24 SIREN MLP.
+pub fn siren24_sdf(
+    q: vec3,
+    w0: [vec4; 24],
+    w1: [vec4; 144],
+    b1: [vec4; 6],
+    out_w0: [vec4; 6],
+    out_b0: f32,
+) -> f32 {
+    let q4 = vec4(q, 1.0)
+    var h0 = [vec4(0.0); 6]
+    for g in 0..6 {
+        let k = g * 4
+        h0[g] = sin(
+            vec4(
+                dot(w0[k], q4),
+                dot(w0[k + 1], q4),
+                dot(w0[k + 2], q4),
+                dot(w0[k + 3], q4),
+            ),
+        )
+    }
+    var h1 = [vec4(0.0); 6]
+    for g in 0..6 {
+        let base = g * 24
+        var acc = [0.0; 4]
+        for r in 0..4 {
+            let o = base + r * 6
+            acc[r] = dot(w1[o], h0[0]) +
+                dot(w1[o + 1], h0[1]) +
+                dot(w1[o + 2], h0[2]) +
+                dot(w1[o + 3], h0[3]) +
+                dot(w1[o + 4], h0[4]) +
+                dot(w1[o + 5], h0[5])
+        }
+        h1[g] = sin(vec4(acc[0], acc[1], acc[2], acc[3]) + b1[g])
+    }
+    let raw_d = dot(out_w0[0], h1[0]) +
+        dot(out_w0[1], h1[1]) +
+        dot(out_w0[2], h1[2]) +
+        dot(out_w0[3], h1[3]) +
+        dot(out_w0[4], h1[4]) +
+        dot(out_w0[5], h1[5]) +
+        out_b0
+    let ed = exp(clamp(2.0 * raw_d, -16.0, 16.0))
+    (ed - 1.0) / (ed + 1.0)
+}
+
 /// The smooth maximum of two distances: `-smin(-a, -b, k)`. Where they're `k` or more apart
 /// it's exactly the larger; with `k <= 0` it's `max(a, b)`.
 pub fn smax(a: f32, b: f32, k: f32) -> f32 {
@@ -4149,6 +4652,154 @@ impl<S: Surface, C, F: Copy + GpuData + fn(vec3) -> C> Field<C> for WithAt<S, F>
     }
 }
 
+/// A named, data-carrying channel evaluator attached to a surface via `painted(surface, paint)`
+/// so a field with procedural or neural per-point channels can be named cleanly in `pub type`
+/// aliases while preserving `interval_near`, `pruned`, `parts`, and `rigid_shape_hash`.
+pub trait ChannelEval<C>: Copy + GpuData + Eq + StateHash {
+    fn eval_channels(self, p: vec3) -> C
+}
+
+/// A surface paired with a named `ChannelEval<C>` evaluator: `painted(surface, paint)`.
+pub struct Painted<S, M>: Copy + GpuData + Eq + StateHash {
+    pub inner: S,
+    pub paint: M,
+}
+
+/// Wraps surface `inner` with named per-point channel evaluator `paint`.
+pub fn painted<S: Surface, M: Copy>(inner: S, paint: M) -> Painted<S, M> {
+    Painted { inner, paint }
+}
+
+impl<S: Surface, M: Copy + GpuData + StateHash> Surface for Painted<S, M> {
+    fn distance(self, p: vec3) -> f32 {
+        self.inner.distance(p)
+    }
+
+    fn rigid_frame(self) -> Rigid {
+        self.inner.rigid_frame()
+    }
+
+    fn masked(self, p: vec3, live: Live, first: u32) -> f32 {
+        self.inner.masked(p, live, first)
+    }
+
+    fn pruned<G: Copy + fn(vec3) -> vec3>(
+        self,
+        over: Box3,
+        at: G,
+        stretch: f32,
+        live: Live,
+        first: u32,
+    ) -> Pruned {
+        self.inner.pruned(over, at, stretch, live, first)
+    }
+
+    fn bound(self) -> Bound {
+        self.inner.bound()
+    }
+
+    fn filtered(self, p: vec3, footprint: f32) -> f32 {
+        self.inner.filtered(p, footprint)
+    }
+
+    fn part_offset(self, p: vec3, i: u32, by: f32) -> f32 {
+        self.inner.part_offset(p, i, by)
+    }
+
+    fn parts(self) -> u32 {
+        self.inner.parts()
+    }
+
+    fn part_at(self, p: vec3) -> (f32, u32) {
+        self.inner.part_at(p)
+    }
+
+    fn part_distance(self, p: vec3, i: u32) -> f32 {
+        self.inner.part_distance(p, i)
+    }
+
+    fn part_name(self, i: u32) -> PartName {
+        self.inner.part_name(i)
+    }
+
+    fn lipschitz(self, near: f32) -> f32 {
+        self.inner.lipschitz(near)
+    }
+
+    fn interval_near(self, b: Box3) -> Interval {
+        self.inner.interval_near(b)
+    }
+
+    fn rigid_shape_hash(self) -> Option<u64> {
+        match self.inner.rigid_shape_hash() {
+            Some(ih) => {
+                var h = Hasher::new()
+                StateHash::state_hash(ih, mut h)
+                StateHash::state_hash(self.paint, mut h)
+                Some(h.finish())
+            },
+            None => None,
+        }
+    }
+
+    fn skin_shape_hash(self) -> Option<u64> {
+        self.inner.skin_shape_hash()
+    }
+
+    fn rest_distance_live(self, p: vec3, live: Live) -> f32 {
+        self.inner.rest_distance_live(p, live)
+    }
+
+    fn rest_pruned<G: Copy + fn(vec3) -> vec3>(
+        self,
+        over: Box3,
+        at: G,
+        stretch: f32,
+        live: Live,
+        first: u32,
+    ) -> Pruned {
+        self.inner.rest_pruned(over, at, stretch, live, first)
+    }
+
+    fn rest_bound(self) -> Bound {
+        self.inner.rest_bound()
+    }
+
+    fn rest_interval_near(self, b: Box3) -> Interval {
+        self.inner.rest_interval_near(b)
+    }
+
+    fn rest_skin_weights(self, p: vec3) -> vec2u {
+        self.inner.rest_skin_weights(p)
+    }
+
+    fn skin_bone_count(self) -> u32 {
+        self.inner.skin_bone_count()
+    }
+
+    fn skin_bone(self, i: u32) -> DualQuat {
+        self.inner.skin_bone(i)
+    }
+
+    fn posed_local_distance(self, p: vec3) -> f32 {
+        self.inner.posed_local_distance(p)
+    }
+
+    fn skin_project(self) -> bool {
+        self.inner.skin_project()
+    }
+}
+
+impl<S: Surface, C, M: ChannelEval<C>> Field<C> for Painted<S, M> {
+    fn channels(self, p: vec3) -> C {
+        self.paint.eval_channels(p)
+    }
+
+    fn rest_channels(self, p: vec3) -> C {
+        self.paint.eval_channels(p)
+    }
+}
+
 /// How much of `b` a smooth union of distances `a` and `b` takes, from 0 to 1: the weight
 /// `smin`'s gradient gives `b`'s, which a field's channels blend by too.
 pub fn smin_weight(a: f32, b: f32, k: f32) -> f32 {
@@ -4247,6 +4898,17 @@ impl<C, S: Field<C>, N: Noise> Field<C> for Displace<S, N> {
     fn distance_and_channels(self, p: vec3) -> (f32, C) {
         let (d, c) = self.inner.distance_and_channels(p)
         (d + self.amp * self.noise.value(p), c)
+    }
+}
+
+impl<C, S: Field<C>, R: ResidualEval> Field<C> for BoundedResidual<S, R> {
+    fn channels(self, p: vec3) -> C {
+        self.inner.channels(p)
+    }
+
+    fn distance_and_channels(self, p: vec3) -> (f32, C) {
+        let (db, c) = self.inner.distance_and_channels(p)
+        (self.apply_residual(db, p), c)
     }
 }
 
@@ -5109,6 +5771,11 @@ fn every_surface_s_search_for_where_it_can_be_closes() {
         "a round cone",
     )
     closes_joined(cuboid(vec3(0.06, 0.048, 0.036)), "a cuboid")
+    closes_joined(round_cuboid(vec3(0.06, 0.048, 0.036), 0.008), "a round cuboid")
+    closes_joined(
+        lathe([vec2(0.03, -0.05), vec2(0.05, 0.0), vec2(0.025, 0.05)], bevel: 0.004),
+        "a lathe",
+    )
     closes_joined(
         tube([vec3(), vec3(0.06, 0.06, 0.0), vec3(0.1, 0.0, 0.0)], [0.03, 0.02, 0.025]),
         "a tube",
@@ -5132,4 +5799,35 @@ fn every_surface_s_search_for_where_it_can_be_closes() {
     let h = half_space(vec3(0.0, 1.0, 0.0), 0.0)
     assert(h.bound().radius >= 1.0e30, "a half-space states no bound")
     assert(searched_radius(h) < 0.0, "a half-space's search doesn't close")
+}
+
+struct TestConstResidual: Copy + GpuData + Eq + StateHash {
+    val: f32,
+}
+
+impl ResidualEval for TestConstResidual {
+    fn eval_sdf(self, q: vec3) -> f32 {
+        self.val
+    }
+}
+
+@test
+fn bounded_residual_fades_outside_band_and_preserves_bounds() {
+    let base = sphere(0.5)
+    let f = bounded_residual(
+        base,
+        TestConstResidual { val: 0.5 },
+        center: vec3(0.0),
+        extent: vec3(0.5),
+        max_delta: 0.02,
+    )
+    // On the base surface (d_base == 0), full residual applies (+0.01 m).
+    let d0 = f.distance(vec3(0.5, 0.0, 0.0))
+    assert(abs(d0 - 0.01) < 1.0e-5, f"on-surface residual was {d0}")
+    // Far outside the band (d_base = 1.5 >> band), residual is skipped completely.
+    let dfar = f.distance(vec3(2.0, 0.0, 0.0))
+    assert(abs(dfar - 1.5) < 1.0e-6, f"far distance was {dfar}")
+    // Bound encloses the displaced surface.
+    assert(f.bound().radius >= 0.519, f"bound radius {f.bound().radius}")
+    closes_within(f, 1.0, "bounded residual sphere")
 }

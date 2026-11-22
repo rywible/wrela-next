@@ -1,0 +1,742 @@
+// Deterministic real-time neural character motion runtime (`NeuralMotion`), pairing a compact
+// goal- & phase-conditioned MLP (Zhou et al. 2019 6D continuous rotations; Holden et al. 2020
+// Learned Motion Matching / Starke et al. 2022 DeepPhase) with Wrela's exact `Surface` field
+// grounding: anatomical joint clamping, 3-point foot-roll IK onto `world.distance == 0`, and
+// 5-finger surface-contact grasp refinement onto an interactive prop's exact `Field`.
+
+use motion::anatomy::{
+    apply_clavicle_coupling, apply_finger_grasp, clamp_pose_to_anatomy, foot_pads, from_body_delta,
+    hand_contacts, quat_log, to_body_delta,
+}
+use motion::humanoid::{NONE, Pose, Rig, Rigid, arc, pose_world}
+use std::field::Surface
+use std::math::TAU
+use std::quat::Quat
+
+/// The 22 core articulated VRM bones predicted directly by the neural motion MLP (remaining 30
+/// finger bones are articulated via grasp synergies + exact prop-field fingertip contact).
+pub const CORE_VRM: [u32; 22] = [
+    0, // 0: hips
+    1, // 1: spine
+    2, // 2: chest
+    3, // 3: upperChest
+    4, // 4: neck
+    5, // 5: head
+    9, // 6: leftUpperLeg
+    10, // 7: leftLowerLeg
+    11, // 8: leftFoot
+    12, // 9: leftToes
+    13, // 10: rightUpperLeg
+    14, // 11: rightLowerLeg
+    15, // 12: rightFoot
+    16, // 13: rightToes
+    17, // 14: leftShoulder
+    18, // 15: leftUpperArm
+    19, // 16: leftLowerArm
+    20, // 17: leftHand
+    21, // 18: rightShoulder
+    22, // 19: rightUpperArm
+    23, // 20: rightLowerArm
+    24, // 21: rightHand
+]
+
+/// Fixed neural controller dimensions (all multiples of 4 for SIMD `vec4` math):
+/// - `NM_IN = 32` (`8 × vec4`):
+///   `[sin(p0), cos(p0), sin(p1), cos(p1),` (gait + reach phase)
+///   ` vel_x, vel_z, yaw_rate, speed,`      (current root velocity in body frame)
+///   ` goal_dx, goal_dz, goal_dist, goal_yaw,` (target stand point in body frame)
+///   ` traj1_x, traj1_z, traj2_x, traj2_z,` (future desired root trajectory +0.25s, +0.6s)
+///   ` obj_x, obj_y, obj_z, obj_dist,`      (grimoire target in body-local space)
+///   ` table_h, floor_l, floor_r, grasp_intent,` (SDF terrain + grasp trigger)
+///   ` prev_l_foot_c, prev_r_foot_c, prev_r_hand_c, reach_prog,` (contact & reach progress)
+///   ` carry_weight, turn_hint, idle_blend, spare]`
+/// - `NM_H = 64` (`16 × vec4` hidden width × 2 SiLU layers: fast <20 µs CPU, 100% deterministic)
+/// - `NM_OUT = 144` (`36 × vec4`):
+///   - `0..132`: 22 core bones × 6D continuous rotation `(c0.xyz, c1.xyz)` in body-delta frame
+///   - `132..135`: hips local translation delta `(dx, dy, dz)` (m, normalized by `hips_height`)
+///   - `135..138`: predicted next root velocity `(vx, vz, yaw_rate)`
+///   - `138..144`: `[l_heel_c, l_toe_c, r_heel_c, r_toe_c, r_hand_c, finger_curl]` (sigmoid)
+pub const NM_IN: u32 = 32
+pub const NM_IN4: u32 = 8
+pub const NM_H: u32 = 64
+pub const NM_H4: u32 = 16
+pub const NM_OUT: u32 = 144
+pub const NM_OUT4: u32 = 36
+
+/// Output of one neural motion step before/after field refinement.
+pub struct NeuralStep: Copy {
+    pub pose: Pose,
+    pub vel_local: vec2,
+    pub yaw_rate: f32,
+    pub l_heel_contact: f32,
+    pub l_toe_contact: f32,
+    pub r_heel_contact: f32,
+    pub r_toe_contact: f32,
+    pub r_hand_contact: f32,
+    pub finger_curl: f32,
+}
+
+/// Live recurrent state of one character driven by `NeuralMotion`.
+pub struct MotionState: Copy {
+    pub root_pos: vec3,
+    pub heading: f32,
+    pub vel_local: vec2,
+    pub yaw_rate: f32,
+    pub gait_phase: f32,
+    pub reach_phase: f32,
+    pub l_contact: f32,
+    pub r_contact: f32,
+    pub r_hand_contact: f32,
+    pub carrying: bool,
+    pub l_lock_pos: vec3,
+    pub r_lock_pos: vec3,
+    pub l_locked: bool,
+    pub r_locked: bool,
+}
+
+impl MotionState {
+    pub fn start(pos: vec3, heading: f32) -> MotionState {
+        MotionState {
+            root_pos: pos,
+            heading,
+            vel_local: vec2(0.0),
+            yaw_rate: 0.0,
+            gait_phase: 0.0,
+            reach_phase: 0.0,
+            l_contact: 1.0,
+            r_contact: 1.0,
+            r_hand_contact: 0.0,
+            carrying: false,
+            l_lock_pos: pos,
+            r_lock_pos: pos,
+            l_locked: false,
+            r_locked: false,
+        }
+    }
+}
+
+/// Converts Zhou et al. (CVPR 2019) 6D continuous rotation `(a, b)` into a unit `Quat` via
+/// Gram-Schmidt orthonormalization (zero double-cover discontinuity during training & inference).
+pub fn rot6d_to_quat(a: vec3, b: vec3) -> Quat {
+    let c0 = normalize(if length(a) > 1.0e-6 { a } else { vec3(1.0, 0.0, 0.0) })
+    let b_orth = b - c0 * dot(c0, b)
+    let c1 = normalize(
+        if length(b_orth) > 1.0e-6 {
+            b_orth
+        } else if abs(c0.x) < 0.9 {
+            cross(vec3(1.0, 0.0, 0.0), c0)
+        } else {
+            cross(vec3(0.0, 1.0, 0.0), c0)
+        },
+    )
+    let c2 = cross(c0, c1)
+    Quat::from_mat3(mat3(c0, c1, c2))
+}
+
+fn silu4(x: vec4) -> vec4 {
+    let e = vec4(
+        exp(-clamp(x.x, -12.0, 12.0)),
+        exp(-clamp(x.y, -12.0, 12.0)),
+        exp(-clamp(x.z, -12.0, 12.0)),
+        exp(-clamp(x.w, -12.0, 12.0)),
+    )
+    x / (vec4(1.0) + e)
+}
+
+fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + exp(-clamp(x, -12.0, 12.0)))
+}
+
+/// Evaluates the deterministic 2-hidden-layer SiLU `NeuralMotion` MLP (`32 -> 64 -> 64 -> 144`)
+/// using SIMD `vec4` dot products and decodes the 22-bone body pose + root velocity + contacts.
+pub fn eval_neural_motion(
+    rig: Rig,
+    features: [vec4; NM_IN4],
+    w0: [vec4; 512], // 64 rows × 8 vec4
+    b0: [vec4; NM_H4],
+    w1: [vec4; 1024], // 64 rows × 16 vec4
+    b1: [vec4; NM_H4],
+    w2: [vec4; 2304], // 144 rows × 16 vec4
+    b2: [vec4; NM_OUT4],
+) -> NeuralStep {
+    // Layer 0: 32 -> 64 (SiLU)
+    var h0 = [vec4(0.0); NM_H4]
+    for g in 0..NM_H4 {
+        var r = [0.0; 4]
+        for k in 0..4 {
+            let row = (g * 4 + k) * NM_IN4
+            var s = 0.0
+            for j in 0..NM_IN4 {
+                s += dot(w0[row + j], features[j])
+            }
+            r[k] = s
+        }
+        h0[g] = silu4(vec4(r[0], r[1], r[2], r[3]) + b0[g])
+    }
+    // Layer 1: 64 -> 64 (SiLU + residual connection for smooth gradient flow)
+    var h1 = [vec4(0.0); NM_H4]
+    for g in 0..NM_H4 {
+        var r = [0.0; 4]
+        for k in 0..4 {
+            let row = (g * 4 + k) * NM_H4
+            var s = 0.0
+            for j in 0..NM_H4 {
+                s += dot(w1[row + j], h0[j])
+            }
+            r[k] = s
+        }
+        h1[g] = silu4(vec4(r[0], r[1], r[2], r[3]) + b1[g]) + h0[g] * 0.25
+    }
+    // Layer 2: 64 -> 144
+    var out = [0.0; NM_OUT]
+    for g in 0..NM_OUT4 {
+        let bv = b2[g]
+        let b_arr = [bv.x, bv.y, bv.z, bv.w]
+        for k in 0..4 {
+            let o_idx = g * 4 + k
+            let row = o_idx * NM_H4
+            var s = b_arr[k]
+            for j in 0..NM_H4 {
+                s += dot(w2[row + j], h1[j])
+            }
+            out[o_idx] = s
+        }
+    }
+
+    // Decode 22 core bone rotations from 6D body-delta representation onto `rig`.
+    let rw = rig.rest_frames()
+    let h_rest = rw[0].t.y
+    var pose = Pose { turns: [Quat::identity(); 64], hips: rig.bones[0].rest.t }
+    for b in 0..rig.bones.len() {
+        pose.turns[b] = rig.bones[b].rest.q
+    }
+    for ci in 0..22 {
+        let vrm = CORE_VRM[ci]
+        let b = rig.of[vrm]
+        if b == NONE {
+            continue
+        }
+        let o = ci * 6
+        let a = vec3(out[o], out[o + 1], out[o + 2])
+        let bv = vec3(out[o + 3], out[o + 4], out[o + 5])
+        let delta = rot6d_to_quat(a, bv)
+        let p = rig.bones[b].parent
+        let up = if p == NONE { rig.base.q } else { rw[p].q }
+        pose.turns[b] = from_body_delta(delta, rw[b].q, up)
+    }
+    let hip_delta = vec3(out[132], out[133], out[134]) * h_rest
+    pose.hips = rig.bones[0].rest.t + rig.base.q.inverse().rotate(hip_delta)
+
+    let l_heel = sigmoid(out[138])
+    let l_toe = sigmoid(out[139])
+    let r_heel = sigmoid(out[140])
+    let r_toe = sigmoid(out[141])
+    let r_hand = sigmoid(out[142])
+    let f_curl = sigmoid(out[143])
+
+    // Apply natural finger pose & clavicle coupling + strict anatomical joint clamping.
+    pose = apply_finger_grasp(
+        rig,
+        pose,
+        left: true,
+        thumb_curl: 0.15,
+        index_curl: 0.22,
+        middle_curl: 0.28,
+        ring_curl: 0.34,
+        little_curl: 0.38,
+        splay: 0.1,
+    )
+    pose = apply_finger_grasp(
+        rig,
+        pose,
+        left: false,
+        thumb_curl: 0.15 + 0.75 * f_curl,
+        index_curl: 0.20 + 0.72 * f_curl,
+        middle_curl: 0.24 + 0.72 * f_curl,
+        ring_curl: 0.28 + 0.70 * f_curl,
+        little_curl: 0.32 + 0.68 * f_curl,
+        splay: 0.15 * (1.0 - f_curl),
+    )
+    pose = apply_clavicle_coupling(rig, pose)
+    let (clamped, _) = clamp_pose_to_anatomy(rig, pose)
+
+    NeuralStep {
+        pose: clamped,
+        vel_local: vec2(out[135], out[136]),
+        yaw_rate: out[137],
+        l_heel_contact: l_heel,
+        l_toe_contact: l_toe,
+        r_heel_contact: r_heel,
+        r_toe_contact: r_toe,
+        r_hand_contact: r_hand,
+        finger_curl: f_curl,
+    }
+}
+
+/// Exact anatomical hinge-preserving 2-bone IK (hip->knee->ankle or shoulder->elbow->wrist):
+/// solves the lower joint purely about its physiological hinge axis (zero illegal twist, so
+/// `clamp_pose_to_anatomy` never fights the IK!) and solves the upper ball joint in closed form
+/// via orthonormal frame alignment so the end joint hits `target_body` to sub-millimeter precision.
+pub fn solve_two_bone_ik(
+    rig: Rig,
+    pose: Pose,
+    upper_vrm: u32,
+    lower_vrm: u32,
+    end_vrm: u32,
+    target_body: vec3,
+    pole_body: vec3,
+    weight: f32,
+) -> Pose {
+    if weight <= 1.0e-4 {
+        return pose
+    }
+    let bu = rig.of[upper_vrm]
+    let bl = rig.of[lower_vrm]
+    let be = rig.of[end_vrm]
+    if bu == NONE || bl == NONE || be == NONE {
+        return pose
+    }
+    let w0 = pose_world(rig, pose)
+    let rw = rig.rest_frames()
+    let a = w0[bu].t
+    let b = w0[bl].t
+    let c = w0[be].t
+    let l1 = length(b - a)
+    let l2 = length(c - b)
+    if l1 < 1.0e-4 || l2 < 1.0e-4 {
+        return pose
+    }
+    let desired = mix(c, target_body, vec3(clamp(weight, 0.0, 1.0)))
+    let to_t = desired - a
+    let d_raw = length(to_t)
+    let d = clamp(d_raw, abs(l1 - l2) + 0.008, (l1 + l2) - 0.003)
+    let dir = if d_raw > 1.0e-5 { to_t / d_raw } else { normalize(c - a) }
+
+    // Determine exact physiological hinge axis in rest-body space for knees (10,14) & elbows (19,23).
+    // Knees bend backward (+x); left elbow bends forward (-y); right elbow bends forward (+y).
+    let h_axis = if lower_vrm == 10 || lower_vrm == 14 {
+        vec3(1.0, 0.0, 0.0)
+    } else if lower_vrm == 19 {
+        vec3(0.0, -1.0, 0.0)
+    } else if lower_vrm == 23 {
+        vec3(0.0, 1.0, 0.0)
+    } else {
+        vec3(1.0, 0.0, 0.0)
+    }
+
+    // Law of cosines for exact positive hinge flexion angle `theta` in `[0.02, 2.45]` rad (~140°).
+    let cos_int = clamp((l1 * l1 + l2 * l2 - d * d) / (2.0 * l1 * l2), -1.0, 1.0)
+    let theta = clamp(3.14159265 - acos(cos_int), 0.02, 2.45)
+
+    // Rest-frame limb geometry after pure hinge bend `q_hinge` on lower bone.
+    let q_hinge = Quat::axis_angle(h_axis, theta)
+    let u_rest = rw[bl].t - rw[bu].t
+    let v_low_rest = rw[be].t - rw[bl].t
+    let c_bent = u_rest + q_hinge.rotate(v_low_rest)
+    let f_rest = normalize(c_bent)
+    var n_rest = u_rest - f_rest * dot(u_rest, f_rest)
+    if length(n_rest) < 1.0e-5 {
+        // Nearly straight limb: pole direction is perpendicular to `h_axis` and `u_rest`.
+        n_rest = cross(u_rest, h_axis)
+    }
+    n_rest = normalize(n_rest)
+    let s_rest = cross(f_rest, n_rest)
+
+    // Target orthonormal frame in body space: `dir` along a->target, `bend_dir` toward `pole_body`.
+    var bend_dir = pole_body - dir * dot(pole_body, dir)
+    if length(bend_dir) < 1.0e-5 {
+        bend_dir = (b - a) - dir * dot(b - a, dir)
+    }
+    bend_dir = normalize(bend_dir)
+    let s_tgt = cross(dir, bend_dir)
+
+    // Exact rotation `q_upper_body` mapping `(f_rest, n_rest, s_rest) -> (dir, bend_dir, s_tgt)`.
+    let m_tgt = mat3(dir, bend_dir, s_tgt)
+    let m_rst_t = mat3(
+        vec3(f_rest.x, n_rest.x, s_rest.x),
+        vec3(f_rest.y, n_rest.y, s_rest.y),
+        vec3(f_rest.z, n_rest.z, s_rest.z),
+    )
+    let q_upper_delta = Quat::from_mat3(m_tgt * m_rst_t)
+
+    let pu = rig.bones[bu].parent
+    let up_u = if pu == NONE { rig.base.q } else { w0[pu].q }
+    let target_wu = q_upper_delta.mul(rw[bu].q)
+    let target_tu = up_u.inverse().mul(target_wu)
+
+    let target_wl = q_upper_delta.mul(q_hinge).mul(rw[bl].q)
+    let target_tl = target_wu.inverse().mul(target_wl)
+
+    var out = pose
+    let w = clamp(weight, 0.0, 1.0)
+    out.turns[bu] = pose.turns[bu].nlerp(target_tu, w)
+    out.turns[bl] = pose.turns[bl].nlerp(target_tl, w)
+    out
+}
+
+/// Refines a character's pose against the exact world floor `Surface` so planted feet never skate
+/// or penetrate (`world.distance(pad) >= 0`), lowering the pelvis slightly if a target foot lies
+/// near max leg reach and aligning the planted sole flat against the ground.
+pub fn ground_pose_to_world<W: Surface>(
+    rig: Rig,
+    pose: Pose,
+    root_pos: vec3,
+    heading: f32,
+    l_contact: f32,
+    r_contact: f32,
+    l_lock_world: vec3,
+    r_lock_world: vec3,
+    world: W,
+) -> Pose {
+    let q_root = Quat::axis_angle(vec3(0.0, 1.0, 0.0), heading)
+    let q_inv = q_root.inverse()
+    let to_world = |p_body: vec3| -> vec3 { root_pos + q_root.rotate(p_body) }
+    let to_body = |p_world: vec3| -> vec3 { q_inv.rotate(p_world - root_pos) }
+
+    var out = pose
+    let rw = rig.rest_frames()
+    let contacts = [l_contact, r_contact]
+    let locks = [l_lock_world, r_lock_world]
+    let up_vrms = [9, 13]
+    let lo_vrms = [10, 14]
+    let end_vrms = [11, 15]
+    let toe_vrms = [12, 16]
+
+    // First, check if any locked stance foot would stretch past 98% of leg length; if so, lower
+    // pelvis slightly so 2-bone leg IK reaches the exact locked sole point without dragging it!
+    let w_init = pose_world(rig, out)
+    var hip_drop = 0.0
+    for side in 0..2 {
+        let cw = clamp((contacts[side] - 0.45) / 0.12, 0.0, 1.0)
+        if cw <= 0.05 {
+            continue
+        }
+        let bu = rig.of[up_vrms[side]]
+        let bl = rig.of[lo_vrms[side]]
+        let be = rig.of[end_vrms[side]]
+        let l1 = length(rw[bl].t - rw[bu].t)
+        let l2 = length(rw[be].t - rw[bl].t)
+        let max_r = (l1 + l2) * 0.985
+        let hip_b = w_init[bu].t
+        // Approximate ankle target from locked sole midpoint
+        let ground_y = -world.distance(vec3(locks[side].x, 0.0, locks[side].z))
+        let sole_to_ankle = vec3(0.0, 0.088, -0.052)
+        let ank_b = to_body(vec3(locks[side].x, ground_y, locks[side].z)) + sole_to_ankle
+        let diff = ank_b - hip_b
+        let horiz2 = diff.x * diff.x + diff.z * diff.z
+        if horiz2 < max_r * max_r {
+            let max_dy = sqrt(max_r * max_r - horiz2)
+            let cur_dy = hip_b.y - ank_b.y
+            if cur_dy > max_dy {
+                hip_drop = max(hip_drop, min(cur_dy - max_dy + 0.004, 0.09))
+            }
+        }
+    }
+    if hip_drop > 0.0005 {
+        out.hips = out.hips - rig.base.q.inverse().rotate(vec3(0.0, hip_drop, 0.0))
+    }
+
+    // Lock planted left/right sole midpoints (`0.5 * (heel + ball_inner)`) via exact hinge-pure
+    // 2-bone leg IK + flat world-ground foot orientation; during swing (`contacts[side] < 0.5`),
+    // ensure clean ground clearance so a swinging foot lifts cleanly off the floor rather than skimming.
+    for side in 0..2 {
+        let foot_b = rig.of[end_vrms[side]]
+        let toe_b = rig.of[toe_vrms[side]]
+        let cw = clamp((contacts[side] - 0.45) / 0.12, 0.0, 1.0)
+        if cw <= 0.01 {
+            // Swing clearance: keep the swinging foot cleanly >= 4.2 cm above the ground with a
+            // neutral dorsiflexed ankle so neither heel nor toe tip ever skims or drags during swing.
+            let swing_w = clamp((0.45 - contacts[side]) / 0.20, 0.0, 1.0)
+            if swing_w > 0.05 {
+                let wf = pose_world(rig, out)
+                let p_foot = rig.bones[foot_b].parent
+                let up_f = if p_foot == NONE { rig.base.q } else { wf[p_foot].q }
+                let flat_f = up_f.inverse().mul(rw[foot_b].q)
+                out.turns[foot_b] = out.turns[foot_b].nlerp(flat_f, 0.85 * swing_w)
+                if toe_b != NONE {
+                    out.turns[toe_b] = out.turns[toe_b].nlerp(rig.bones[toe_b].rest.q, 0.85 * swing_w)
+                }
+                let wf1 = pose_world(rig, out)
+                let pads = foot_pads(rig, wf1, left: side == 0)
+                let mid_w = to_world(0.5 * (pads.heel + pads.ball_inner))
+                let ground_y = -world.distance(vec3(mid_w.x, 0.0, mid_w.z))
+                let sole_min_y = min(pads.heel.y, min(pads.ball_inner.y, min(pads.ball_outer.y, pads.toe_tip.y)))
+                let min_clear = ground_y + 0.048 * swing_w
+                if sole_min_y < min_clear {
+                    let lift = min_clear - sole_min_y + 0.004
+                    let target_ank = wf1[foot_b].t + vec3(0.0, lift, 0.0)
+                    out = solve_two_bone_ik(
+                        rig,
+                        out,
+                        upper_vrm: up_vrms[side],
+                        lower_vrm: lo_vrms[side],
+                        end_vrm: end_vrms[side],
+                        target_body: target_ank,
+                        pole_body: vec3(0.0, 0.0, 1.0),
+                        weight: 1.0,
+                    )
+                    // Re-flatten foot after swing knee lift so toes don't dip down
+                    let wf2 = pose_world(rig, out)
+                    let up_f2 = if p_foot == NONE { rig.base.q } else { wf2[p_foot].q }
+                    out.turns[foot_b] = out.turns[foot_b].nlerp(up_f2.inverse().mul(rw[foot_b].q), 0.9 * swing_w)
+                }
+            }
+            continue
+        }
+        // 2 quick iterations so ankle-to-sole-midpoint offset converges to < 0.2 mm
+        for _iter in 0..2 {
+            let wf = pose_world(rig, out)
+            let pads = foot_pads(rig, wf, left: side == 0)
+            let mid_b = 0.5 * (pads.heel + pads.ball_inner)
+            let sole_min_y = min(pads.heel.y, min(pads.ball_inner.y, min(pads.ball_outer.y, pads.toe_tip.y)))
+            let ground_y = -world.distance(vec3(locks[side].x, 0.0, locks[side].z))
+            let lock_b = to_body(vec3(locks[side].x, ground_y, locks[side].z))
+            let shift_xz = vec3(lock_b.x - mid_b.x, 0.0, lock_b.z - mid_b.z)
+            let shift_y = (lock_b.y + 0.001 - sole_min_y)
+            let target_ank = wf[foot_b].t + vec3(shift_xz.x, shift_y, shift_xz.z)
+            out = solve_two_bone_ik(
+                rig,
+                out,
+                upper_vrm: up_vrms[side],
+                lower_vrm: lo_vrms[side],
+                end_vrm: end_vrms[side],
+                target_body: target_ank,
+                pole_body: vec3(0.0, 0.0, 1.0),
+                weight: cw,
+            )
+            // Keep planted foot flat on the floor (zero pitch/roll in body frame)
+            let wf2 = pose_world(rig, out)
+            let p_foot = rig.bones[foot_b].parent
+            let up_f = if p_foot == NONE { rig.base.q } else { wf2[p_foot].q }
+            let flat_f = up_f.inverse().mul(rw[foot_b].q)
+            out.turns[foot_b] = out.turns[foot_b].nlerp(flat_f, cw)
+            if toe_b != NONE {
+                out.turns[toe_b] = out.turns[toe_b].nlerp(rig.bones[toe_b].rest.q, cw)
+            }
+        }
+    }
+    let (clamped, _) = clamp_pose_to_anatomy(rig, out)
+    out = clamped
+
+    // Final floor-clearance pass AFTER anatomical clamping (pure vertical pelvis shift never
+    // violates any joint limit and guarantees 0.0 mm floor penetration).
+    let w_post = pose_world(rig, out)
+    var post_sink = 0.0
+    for side in 0..2 {
+        let pads = foot_pads(rig, w_post, left: side == 0)
+        let pts = [pads.heel, pads.ball_inner, pads.ball_outer, pads.toe_tip]
+        for k in 0..4 {
+            let d = world.distance(to_world(pts[k]))
+            if d < 0.0 {
+                post_sink = max(post_sink, -d)
+            }
+        }
+    }
+    if post_sink > 0.0001 {
+        out.hips = out.hips + rig.base.q.inverse().rotate(vec3(0.0, post_sink + 0.0005, 0.0))
+    }
+    out
+}
+
+/// Refines the right arm + wrist + 5 fingers over the final reach onto an interactive prop's exact
+/// `Field` surface (`prop`) while staying clear of the supporting surface (`table`).
+pub fn refine_right_hand_grasp<T: Surface, G: Surface>(
+    rig: Rig,
+    pose: Pose,
+    root_pos: vec3,
+    heading: f32,
+    target_palm_world: vec3,
+    reach_weight: f32,
+    grasp_weight: f32,
+    table: T,
+    grimoire: G,
+) -> Pose {
+    if reach_weight <= 0.01 && grasp_weight <= 0.01 {
+        return pose
+    }
+    let q_root = Quat::axis_angle(vec3(0.0, 1.0, 0.0), heading)
+    let q_inv = q_root.inverse()
+    let to_body = |pw: vec3| -> vec3 { q_inv.rotate(pw - root_pos) }
+
+    var out = pose
+    let rw = rig.rest_frames()
+    let hand_b = rig.of[24]
+
+    if reach_weight > 0.01 {
+        // Natural cumulative forward lean from lumbar through upper chest + slight turn toward
+        // the grimoire (`from_body_delta` specifies cumulative body-space orientation, so each
+        // segment adds ~12° cleanly within physiological limits), plus gentle neck/head gaze down
+        // toward the book!
+        let rw_clamped = clamp(reach_weight, 0.0, 1.0)
+        let s1 = rig.of[1]
+        let s2 = rig.of[2]
+        let s3 = rig.of[3]
+        let neck_b = rig.of[4]
+        let head_b = rig.of[5]
+        if s1 != NONE {
+            let lean1 = Quat::axis_angle(vec3(0.0, 1.0, 0.0), 0.06 * rw_clamped)
+                .mul(Quat::axis_angle(vec3(1.0, 0.0, 0.0), 0.22 * rw_clamped))
+            let p1 = rig.bones[s1].parent
+            let w_tmp = pose_world(rig, out)
+            let up1 = if p1 == NONE { rig.base.q } else { w_tmp[p1].q }
+            out.turns[s1] = out.turns[s1].nlerp(from_body_delta(lean1, rw[s1].q, up1), 0.90 * rw_clamped)
+        }
+        if s2 != NONE {
+            let lean2 = Quat::axis_angle(vec3(0.0, 1.0, 0.0), 0.12 * rw_clamped)
+                .mul(Quat::axis_angle(vec3(1.0, 0.0, 0.0), 0.44 * rw_clamped))
+            let p2 = rig.bones[s2].parent
+            let w_tmp = pose_world(rig, out)
+            let up2 = if p2 == NONE { rig.base.q } else { w_tmp[p2].q }
+            out.turns[s2] = out.turns[s2].nlerp(from_body_delta(lean2, rw[s2].q, up2), 0.90 * rw_clamped)
+        }
+        if s3 != NONE {
+            let lean3 = Quat::axis_angle(vec3(0.0, 1.0, 0.0), 0.16 * rw_clamped)
+                .mul(Quat::axis_angle(vec3(1.0, 0.0, 0.0), 0.62 * rw_clamped))
+            let p3 = rig.bones[s3].parent
+            let w_tmp = pose_world(rig, out)
+            let up3 = if p3 == NONE { rig.base.q } else { w_tmp[p3].q }
+            out.turns[s3] = out.turns[s3].nlerp(from_body_delta(lean3, rw[s3].q, up3), 0.90 * rw_clamped)
+        }
+        if neck_b != NONE {
+            let gaze_n = Quat::axis_angle(vec3(1.0, 0.0, 0.0), 0.48 * rw_clamped)
+            let pn = rig.bones[neck_b].parent
+            let w_tmp = pose_world(rig, out)
+            let upn = if pn == NONE { rig.base.q } else { w_tmp[pn].q }
+            out.turns[neck_b] = out.turns[neck_b].nlerp(from_body_delta(gaze_n, rw[neck_b].q, upn), 0.85 * rw_clamped)
+        }
+        if head_b != NONE {
+            let gaze_h = Quat::axis_angle(vec3(1.0, 0.0, 0.0), 0.36 * rw_clamped)
+            let ph = rig.bones[head_b].parent
+            let w_tmp = pose_world(rig, out)
+            let uph = if ph == NONE { rig.base.q } else { w_tmp[ph].q }
+            out.turns[head_b] = out.turns[head_b].nlerp(from_body_delta(gaze_h, rw[head_b].q, uph), 0.85 * rw_clamped)
+        }
+
+        // Keep palm safely above table surface (`table.distance >= 0.048 m`) so curled fingers
+        // wrap naturally over the grimoire without ever penetrating the oak tabletop.
+        var safe_target = target_palm_world
+        let dt = table.distance(safe_target)
+        if dt < 0.048 {
+            let g = table.gradient(safe_target)
+            let n = g / max(length(g), 1.0e-5)
+            safe_target = safe_target + n * (0.048 - dt)
+        }
+
+        // 3-pass hinge-pure right-arm IK + palm-down wrist orientation onto `safe_target`
+        for _pass in 0..3 {
+            let wp = pose_world(rig, out)
+            let hc0 = hand_contacts(rig, wp, left: false)
+            let palm_off = hc0.palm - wp[hand_b].t
+            let target_b = to_body(safe_target) - palm_off
+            out = solve_two_bone_ik(
+                rig,
+                out,
+                upper_vrm: 22,
+                lower_vrm: 23,
+                end_vrm: 24,
+                target_body: target_b,
+                pole_body: vec3(-0.75, -0.30, -0.45),
+                weight: rw_clamped,
+            )
+            // Orient right wrist gently palm-down toward grimoire (fingers pointing forward +z)
+            let wp2 = pose_world(rig, out)
+            let p_hand = rig.bones[hand_b].parent
+            let up_h = if p_hand == NONE { rig.base.q } else { wp2[p_hand].q }
+            let palm_down_q = Quat::axis_angle(vec3(0.0, 1.0, 0.0), 1.45).mul(rw[hand_b].q)
+            out.turns[hand_b] = out.turns[hand_b].nlerp(up_h.inverse().mul(palm_down_q), 0.85 * rw_clamped)
+        }
+        out = apply_clavicle_coupling(rig, out)
+    }
+
+    // Progressive 5-finger wrap against `grimoire.distance(tip)` with strict `table.distance(tip) >= 0.004 m`:
+    // curl each finger until its tip rests flush on the grimoire surface without touching wood.
+    if grasp_weight > 0.05 {
+        var c_thumb = 0.20 + 0.45 * grasp_weight
+        var c_idx = 0.18 + 0.45 * grasp_weight
+        var c_mid = 0.20 + 0.45 * grasp_weight
+        var c_rng = 0.22 + 0.45 * grasp_weight
+        var c_lit = 0.24 + 0.45 * grasp_weight
+        for _step in 0..5 {
+            let trial = apply_finger_grasp(
+                rig,
+                out,
+                left: false,
+                thumb_curl: c_thumb,
+                index_curl: c_idx,
+                middle_curl: c_mid,
+                ring_curl: c_rng,
+                little_curl: c_lit,
+                splay: 0.06,
+            )
+            let wf = pose_world(rig, trial)
+            let hc = hand_contacts(rig, wf, left: false)
+            let tips = [hc.thumb_tip, hc.index_tip, hc.middle_tip, hc.ring_tip, hc.little_tip]
+            var curls = [c_thumb, c_idx, c_mid, c_rng, c_lit]
+            for ti in 0..5 {
+                let tw = root_pos + q_root.rotate(tips[ti])
+                let dg = grimoire.distance(tw)
+                let dt_tip = table.distance(tw)
+                if dt_tip < 0.008 {
+                    curls[ti] = clamp(curls[ti] - (0.010 - dt_tip) * 16.0, 0.05, 0.96)
+                } else {
+                    curls[ti] = clamp(curls[ti] + clamp(dg * 7.5, -0.16, 0.16), 0.08, 0.96)
+                }
+            }
+            c_thumb = curls[0]
+            c_idx = curls[1]
+            c_mid = curls[2]
+            c_rng = curls[3]
+            c_lit = curls[4]
+        }
+        out = apply_finger_grasp(
+            rig,
+            out,
+            left: false,
+            thumb_curl: c_thumb,
+            index_curl: c_idx,
+            middle_curl: c_mid,
+            ring_curl: c_rng,
+            little_curl: c_lit,
+            splay: 0.06,
+        )
+    }
+
+    // Strict table-clearance guard across the entire reach + grasp + lift sequence:
+    // if palm or any fingertip is closer than 6 mm to `table`, lift wrist cleanly above wood!
+    let (clamped0, _) = clamp_pose_to_anatomy(rig, out)
+    out = clamped0
+    for _guard in 0..2 {
+        let wf_chk = pose_world(rig, out)
+        let hc_chk = hand_contacts(rig, wf_chk, left: false)
+        var min_tbl = table.distance(root_pos + q_root.rotate(hc_chk.palm))
+        min_tbl = min(min_tbl, table.distance(root_pos + q_root.rotate(hc_chk.thumb_tip)))
+        min_tbl = min(min_tbl, table.distance(root_pos + q_root.rotate(hc_chk.index_tip)))
+        min_tbl = min(min_tbl, table.distance(root_pos + q_root.rotate(hc_chk.middle_tip)))
+        min_tbl = min(min_tbl, table.distance(root_pos + q_root.rotate(hc_chk.ring_tip)))
+        min_tbl = min(min_tbl, table.distance(root_pos + q_root.rotate(hc_chk.little_tip)))
+        if min_tbl < 0.006 {
+            let lift = 0.009 - min_tbl
+            out = solve_two_bone_ik(
+                rig,
+                out,
+                upper_vrm: 22,
+                lower_vrm: 23,
+                end_vrm: 24,
+                target_body: wf_chk[hand_b].t + vec3(0.0, lift, 0.0),
+                pole_body: vec3(-0.75, -0.30, -0.45),
+                weight: 1.0,
+            )
+            let (clamped1, _) = clamp_pose_to_anatomy(rig, out)
+            out = clamped1
+        }
+    }
+    out
+}
+
+@test
+fn rot6d_produces_exact_unit_rotations() {
+    let q = rot6d_to_quat(vec3(0.0, 1.0, 0.0), vec3(-1.0, 0.0, 0.0))
+    assert(abs(length(q.v) - 1.0) < 1.0e-5, f"non-unit quat {q.v}")
+    let v = q.rotate(vec3(1.0, 0.0, 0.0))
+    assert(length(v - vec3(0.0, 1.0, 0.0)) < 1.0e-4, f"rotated x = {v}")
+}

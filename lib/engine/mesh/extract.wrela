@@ -44,13 +44,16 @@ const CULL_CHUNK: u32 = 8192
 /// heaviest per-cell work, so a chunk's crease list (which holds every surface cell, so no crease
 /// is ever solved any other way) is refined in dispatches of at most this many, each well under
 /// the 50 ms GPU dispatch guard.
-const CREASE_SLICE: u32 = 65536
+const CREASE_SLICE: u32 = 16384
+/// Surface cells `solve_verts` / `solve_verts_rest` solve in one dispatch so complex multi-part
+/// skinned or bounded-residual fields stay well under the 50 ms GPU dispatch guard.
+const SURF_SLICE: u32 = 32768
 /// Skinned vertices `deform_skinned_verts` moves in one dispatch (its Newton projection evaluates
 /// the posed field up to 4 times a vertex), for the same reason.
-const DEFORM_SLICE: u32 = 262144
-/// The most slices one prepared list is dispatched in: a chunk's creases (`CAP_SURF /
-/// CREASE_SLICE`, rounded up) and a batch's vertices (`8192 · 343 / DEFORM_SLICE`, rounded up).
-const SLICES_MOST: u32 = 16
+const DEFORM_SLICE: u32 = 32768
+/// The most slices one prepared list is dispatched in: a chunk's surface/crease cells and a
+/// batch's vertices (`8192 · 343 / DEFORM_SLICE`, rounded up).
+const SLICES_MOST: u32 = 96
 /// Normal spread (`Qef::min_dot`) below which a cell is a sharp crease, solved from exact Hermite
 /// edge crossings; and at or above which a vertex is shaded smooth.
 const CREASE_DOT: f32 = 0.78
@@ -871,6 +874,7 @@ fn solve_verts<M: Field<Substance>>(
     corners: [f32],
     surf: [u32],
     surf_count: [u32],
+    first: u32,
     cap_verts: u32,
     cell_verts: mut Atomics<u32>,
     verts: mut Append<MeshVertex>,
@@ -878,10 +882,11 @@ fn solve_verts<M: Field<Substance>>(
     id: GlobalId,
 ) {
     let n_surf = min(surf_count[0], CAP_SURF)
-    if id.x >= n_surf {
+    let idx = first + id.x
+    if idx >= n_surf {
         return
     }
-    let packed = surf[id.x]
+    let packed = surf[idx]
     let local_bi = packed >> 9
     let cell = packed & 511
     let (cx, cy, cz) = decode_cell(cell)
@@ -1117,6 +1122,7 @@ fn solve_verts_rest<M: Field<Substance>>(
     corners: [f32],
     surf: [u32],
     surf_count: [u32],
+    first: u32,
     cap_verts: u32,
     cell_verts: mut Atomics<u32>,
     verts: mut Append<MeshVertex>,
@@ -1125,10 +1131,11 @@ fn solve_verts_rest<M: Field<Substance>>(
     id: GlobalId,
 ) {
     let n_surf = min(surf_count[0], CAP_SURF)
-    if id.x >= n_surf {
+    let idx = first + id.x
+    if idx >= n_surf {
         return
     }
-    let packed = surf[id.x]
+    let packed = surf[idx]
     let local_bi = packed >> 9
     let cell = packed & 511
     let (cx, cy, cz) = decode_cell(cell)
@@ -1282,13 +1289,20 @@ fn deform_skinned_verts<M: Field<Substance>>(
         return
     }
     let v = rest_verts[i]
-    let dq = eval_dqs(bones, 0, skin[i * 2], skin[i * 2 + 1])
+    let sw_idx = skin[i * 2]
+    let sw_w = skin[i * 2 + 1]
+    let dq = eval_dqs(bones, 0, sw_idx, sw_w)
     let lp = vec3(v.px, v.py, v.pz)
-    let (wp, nrm) = project_posed(
-        |q: vec3| field.posed_local_distance(q),
-        dq.apply_point(lp),
-        dq.apply_normal(unpack_oct_normal(v.packed)),
-    )
+    let dp = dq.apply_point(lp)
+    let dn = dq.apply_normal(unpack_oct_normal(v.packed))
+    // Rigid single-bone vertices (`w0 >= 250 / 255`) and smooth particle-skinned sheets
+    // (`!field.skin_project()`) are already positioned cleanly by Dual Quaternion Skinning;
+    // analytical Newton projection runs only at multi-bone volumetric joint blend zones!
+    let (wp, nrm) = if !field.skin_project() || (sw_w & 255) >= 250 {
+        (dp, dn)
+    } else {
+        project_posed(|q: vec3| field.posed_local_distance(q), dp, dn)
+    }
     let tid = unpack_thing(v.packed)
     let smooth = unpack_smooth(v.packed)
     let is_trans = unpack_is_trans(v.packed)
@@ -1647,7 +1661,7 @@ pub fn extract_scratch(max_bricks: u32) -> ExtractScratch {
         eval_args: buffer_of([DispatchArgs { x: 0, y: 1, z: 1 }]),
         vert_args: buffer_of([DispatchArgs { x: 0, y: 1, z: 1 }]),
         crease_args: buffer_of(Vec::filled(SLICES_MOST, DispatchArgs { x: 0, y: 1, z: 1 })),
-        surf_args: buffer_of([DispatchArgs { x: 0, y: 1, z: 1 }]),
+        surf_args: buffer_of(Vec::filled(SLICES_MOST, DispatchArgs { x: 0, y: 1, z: 1 })),
         quad_args: buffer_of([DispatchArgs { x: 0, y: 1, z: 1 }]),
         max_bricks,
         grids_cap,
@@ -2891,33 +2905,37 @@ impl MeshBatch {
                 groups: scratch.vert_args.at(0),
                 most: chunk_n * 6,
             )
+            let surf_slices = max((chunk_n * VERTS_BRICK + SURF_SLICE - 1) / SURF_SLICE, 1)
             dispatch(
                 prep_slices.bind(
                     count: scratch.surf.count(),
                     cap: CAP_SURF,
-                    most: CAP_SURF,
-                    slices: 1,
-                    args: scratch.surf_args.span_mut(start: 0, count: 1),
+                    most: SURF_SLICE,
+                    slices: surf_slices,
+                    args: scratch.surf_args.span_mut(start: 0, count: surf_slices),
                 ),
-                over: 1,
+                over: surf_slices,
             )
-            dispatch(
-                solve_verts.bind(
-                    fields: fields,
-                    grids: grids,
-                    active: scratch.active.items(),
-                    chunk_start: chunk_start,
-                    corners: scratch.corners.items(),
-                    surf: scratch.surf.items(),
-                    surf_count: scratch.surf.count(),
-                    cap_verts: self.cap_verts,
-                    cell_verts: mut scratch.cell_verts,
-                    verts: mut self.verts,
-                    creases: mut scratch.creases,
-                ),
-                groups: scratch.surf_args.at(0),
-                most: CAP_SURF / 64,
-            )
+            for k in 0..surf_slices {
+                dispatch(
+                    solve_verts.bind(
+                        fields: fields,
+                        grids: grids,
+                        active: scratch.active.items(),
+                        chunk_start: chunk_start,
+                        corners: scratch.corners.items(),
+                        surf: scratch.surf.items(),
+                        surf_count: scratch.surf.count(),
+                        first: k * SURF_SLICE,
+                        cap_verts: self.cap_verts,
+                        cell_verts: mut scratch.cell_verts,
+                        verts: mut self.verts,
+                        creases: mut scratch.creases,
+                    ),
+                    groups: scratch.surf_args.at(k),
+                    most: SURF_SLICE / 64,
+                )
+            }
             // The chunk's creases, in dispatches of at most `CREASE_SLICE` cells, their counts
             // prepared in one dispatch (a slice past the list's end dispatches no groups).
             let crease_slices = self.crease_slices(chunk_n)
@@ -3073,34 +3091,38 @@ impl MeshBatch {
                 groups: scratch.vert_args.at(0),
                 most: chunk_n * 6,
             )
+            let surf_slices = max((chunk_n * VERTS_BRICK + SURF_SLICE - 1) / SURF_SLICE, 1)
             dispatch(
                 prep_slices.bind(
                     count: scratch.surf.count(),
                     cap: CAP_SURF,
-                    most: CAP_SURF,
-                    slices: 1,
-                    args: scratch.surf_args.span_mut(start: 0, count: 1),
+                    most: SURF_SLICE,
+                    slices: surf_slices,
+                    args: scratch.surf_args.span_mut(start: 0, count: surf_slices),
                 ),
-                over: 1,
+                over: surf_slices,
             )
-            dispatch(
-                solve_verts_rest.bind(
-                    fields: fields,
-                    grids: grids,
-                    active: scratch.active.items(),
-                    chunk_start: chunk_start,
-                    corners: scratch.corners.items(),
-                    surf: scratch.surf.items(),
-                    surf_count: scratch.surf.count(),
-                    cap_verts: self.cap_verts,
-                    cell_verts: mut scratch.cell_verts,
-                    verts: mut self.verts,
-                    skin_verts: mut self.skin_verts,
-                    creases: mut scratch.creases,
-                ),
-                groups: scratch.surf_args.at(0),
-                most: CAP_SURF / 64,
-            )
+            for k in 0..surf_slices {
+                dispatch(
+                    solve_verts_rest.bind(
+                        fields: fields,
+                        grids: grids,
+                        active: scratch.active.items(),
+                        chunk_start: chunk_start,
+                        corners: scratch.corners.items(),
+                        surf: scratch.surf.items(),
+                        surf_count: scratch.surf.count(),
+                        first: k * SURF_SLICE,
+                        cap_verts: self.cap_verts,
+                        cell_verts: mut scratch.cell_verts,
+                        verts: mut self.verts,
+                        skin_verts: mut self.skin_verts,
+                        creases: mut scratch.creases,
+                    ),
+                    groups: scratch.surf_args.at(k),
+                    most: SURF_SLICE / 64,
+                )
+            }
             // The chunk's creases, in dispatches of at most `CREASE_SLICE` cells, their counts
             // prepared in one dispatch (a slice past the list's end dispatches no groups).
             let crease_slices = self.crease_slices(chunk_n)

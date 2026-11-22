@@ -1,0 +1,648 @@
+// AAA modular battle-mage character (`Mage`, `mage_hat`, `mage_cape_pins`, `mage_cape_substance`):
+//   1. Articulated 52-bone VRM humanoid body (`Skinned<MageBody>` using our 64-bone skinning
+//      palette, including clavicles, 3-segment spine, toes, and all 30 articulated finger
+//      phalanges!) with bone-local `BoundedResidual` SIREN-24 fields on Head/Face and Torso/Tunic
+//      fitted from VAST-AI/TripoSG (MIT) + multi-view studio concept art.
+//   2. Separate removable wizard hat (`mage_hat`, bone-socketed onto `pose[HEAD]`).
+//   3. Separate shoulder-pinned XPBD flowing cape (`mage_cape_pins` + `ClothSheet` with woven
+//      wool `Substance`, colliding against exact `mage.distance` and `world.distance`).
+
+use engine::matter::substance::Substance
+use hat::{Hat, hat}
+use kit::motion::cloth::{CLOTH_W, ClothSheet}
+use mage_residuals::{
+    MHEAD_CENTER_LOCAL, MHEAD_EXTENT, MHEAD_MAX_DELTA, MTORSO_CENTER_LOCAL, MTORSO_EXTENT,
+    MTORSO_MAX_DELTA, MageHeadResidual, MageTorsoResidual, mage_head_substance, mage_torso_substance,
+}
+use skeleton::{
+    BALL_LEFT, BALL_RIGHT, CALF_LEFT, CALF_RIGHT, COLLARBONE_LEFT, COLLARBONE_RIGHT, FINGER_BONES,
+    FINGER_JOINTS, FOOT_LEFT, FOOT_RIGHT, FOREARM_LEFT, FOREARM_RIGHT, HAND_LEFT, HAND_RIGHT, HEAD,
+    NECK, PELVIS, REST, SPINE_1, SPINE_2, SPINE_3, THIGH_LEFT, THIGH_RIGHT, UPPER_ARM_LEFT,
+    UPPER_ARM_RIGHT, posed,
+}
+use std::field::{
+    BoundedResidual, ChannelEval, DualQuat, MAX_SKIN_BONES, MAX_SKIN_PARTS, Painted, Rotate,
+    RoundCone, SKIN_PART_WORDS, Skinned, SmoothUnion, SmoothUnionAll, Surface, Translate, With,
+    bounded_residual, pack_part_bones, painted, round_cone, skinned,
+}
+use std::hash::StateHash
+use std::quat::Quat
+use std::transform::{rotate_z, translate}
+
+/// Relaxed A-pose shoulder drop angle (~50° down from T-pose), matching the TripoSG mage rest pose.
+const A_POSE_ARM: f32 = 0.87
+
+/// Smooth join widths (m): soft flesh/cloth seams for limbs/torso, crisp seams for fingers.
+const BODY_JOIN: f32 = 0.022
+const HAND_JOIN: f32 = 0.005
+
+/// All 52 active VRM bones mapped into Hakuro's skeleton indices (`0..52` of `MAX_SKIN_BONES = 64`).
+const MAGE_BONES: u32 = 52
+const MAGE_RIG_BONES: [u32; MAGE_BONES] = [
+    PELVIS, // 0
+    SPINE_1, // 1
+    SPINE_2, // 2
+    SPINE_3, // 3
+    NECK, // 4
+    HEAD, // 5
+    THIGH_LEFT, // 6
+    CALF_LEFT, // 7
+    FOOT_LEFT, // 8
+    BALL_LEFT, // 9
+    THIGH_RIGHT, // 10
+    CALF_RIGHT, // 11
+    FOOT_RIGHT, // 12
+    BALL_RIGHT, // 13
+    COLLARBONE_LEFT, // 14
+    UPPER_ARM_LEFT, // 15
+    FOREARM_LEFT, // 16
+    HAND_LEFT, // 17
+    COLLARBONE_RIGHT, // 18
+    UPPER_ARM_RIGHT, // 19
+    FOREARM_RIGHT, // 20
+    HAND_RIGHT, // 21
+    // 15 Left finger bones (thumb, index, middle, ring, little × 3)
+    50, 52, 54, // 22..24: L thumb
+    26, 28, 30, // 25..27: L index
+    32, 34, 36, // 28..30: L middle
+    38, 40, 42, // 31..33: L ring
+    44, 46, 48, // 34..36: L little
+    // 15 Right finger bones (thumb, index, middle, ring, little × 3)
+    51, 53, 55, // 37..39: R thumb
+    27, 29, 31, // 40..42: R index
+    33, 35, 37, // 43..45: R middle
+    39, 41, 43, // 46..48: R ring
+    45, 47, 49, // 49..51: R little
+]
+
+fn is_left_arm_bone(b: u32) -> bool {
+    b == UPPER_ARM_LEFT ||
+        b == FOREARM_LEFT ||
+        b == HAND_LEFT ||
+        (b >= FINGER_BONES && b < 56 && (b % 2) == 0)
+}
+
+fn is_right_arm_bone(b: u32) -> bool {
+    b == UPPER_ARM_RIGHT ||
+        b == FOREARM_RIGHT ||
+        b == HAND_RIGHT ||
+        (b >= FINGER_BONES && b < 56 && (b % 2) == 1)
+}
+
+fn bind_mat(bone: u32) -> mat4 {
+    if is_left_arm_bone(bone) {
+        let p = REST[UPPER_ARM_LEFT]
+        return translate(p) * rotate_z(-A_POSE_ARM) * translate(-p)
+    }
+    if is_right_arm_bone(bone) {
+        let p = REST[UPPER_ARM_RIGHT]
+        return translate(p) * rotate_z(A_POSE_ARM) * translate(-p)
+    }
+    translate(vec3(0.0))
+}
+
+fn inv_bind_mat(bone: u32) -> mat4 {
+    if is_left_arm_bone(bone) {
+        let p = REST[UPPER_ARM_LEFT]
+        return translate(p) * rotate_z(A_POSE_ARM) * translate(-p)
+    }
+    if is_right_arm_bone(bone) {
+        let p = REST[UPPER_ARM_RIGHT]
+        return translate(p) * rotate_z(-A_POSE_ARM) * translate(-p)
+    }
+    translate(vec3(0.0))
+}
+
+fn rest_joint_apose(bone: u32, off: vec3) -> vec3 {
+    let p = REST[bone] + off
+    (bind_mat(bone) * vec4(p, 1.0)).xyz
+}
+
+fn rest_point_on(bone: u32, p_rest: vec3) -> vec3 {
+    (bind_mat(bone) * vec4(p_rest, 1.0)).xyz
+}
+
+fn mage_joints_rest() -> [vec4; MAX_SKIN_BONES] {
+    var out = [vec4(0.0); MAX_SKIN_BONES]
+    for b in 0..MAGE_BONES {
+        out[b] = vec4(rest_joint_apose(MAGE_RIG_BONES[b], vec3(0.0)), 1.0)
+    }
+    out
+}
+
+fn mage_inv_binds() -> [mat4; MAGE_BONES] {
+    var out = [translate(vec3(0.0)); MAGE_BONES]
+    for b in 0..MAGE_BONES {
+        out[b] = inv_bind_mat(MAGE_RIG_BONES[b])
+    }
+    out
+}
+
+pub struct MageLimbPaint: Copy + GpuData + Eq + StateHash {
+    pub tag: u32,
+}
+
+impl ChannelEval<Substance> for MageLimbPaint {
+    fn eval_channels(self, p: vec3) -> Substance {
+        limb_substance(p)
+    }
+}
+
+/// Bone-local head/face field: analytical skull + TripoSG-fitted `MageHeadResidual`.
+pub type MageHeadField = Translate<Rotate<Painted<BoundedResidual<RoundCone, MageHeadResidual>, MageHeadResidual>>>
+
+/// Bone-local torso/tunic field: analytical chest/pelvis + TripoSG-fitted `MageTorsoResidual`.
+pub type MageTorsoField = Translate<
+    Rotate<Painted<BoundedResidual<SmoothUnion<RoundCone, RoundCone>, MageTorsoResidual>, MageTorsoResidual>>,
+>
+
+/// Articulated limbs (neck, clavicles, arms, legs, boots, toes = 17 parts) + both 5-finger hands
+/// (2 palms + 30 finger phalanges = 32 parts) = 49 parts, smoothly joined with Torso (2) & Head (1).
+pub type MageBody = SmoothUnion<
+    SmoothUnion<
+        SmoothUnion<
+            Painted<SmoothUnionAll<RoundCone, 17>, MageLimbPaint>,
+            With<SmoothUnionAll<RoundCone, 32>, Substance>,
+        >,
+        MageTorsoField,
+    >,
+    MageHeadField,
+>
+
+pub type Mage = Skinned<MageBody>
+
+/// Part-to-bone mapping for all 52 leaf parts (`17` limbs + `32` hands/fingers + `2` torso + `1` head).
+fn build_part_bones_start() -> [u32; MAX_SKIN_PARTS] {
+    var a = [0; MAX_SKIN_PARTS]
+    // 0..16: 17 limb parts
+    a[0] = 4 // neck
+    a[1] = 14 // clavicle L
+    a[2] = 15 // upper arm L
+    a[3] = 16 // forearm L
+    a[4] = 6 // thigh L
+    a[5] = 7 // calf L
+    a[6] = 8 // foot L
+    a[7] = 9 // toes L
+    a[8] = 18 // clavicle R
+    a[9] = 19 // upper arm R
+    a[10] = 20 // forearm R
+    a[11] = 10 // thigh R
+    a[12] = 11 // calf R
+    a[13] = 12 // foot R
+    a[14] = 13 // toes R
+    a[15] = 1 // waist/pelvis hip bridge L
+    a[16] = 1 // waist/pelvis hip bridge R
+    // 17..48: 32 hand/finger parts (palm L, palm R, then 15 L phalanges + 15 R phalanges)
+    a[17] = 17 // palm L
+    a[18] = 21 // palm R
+    // Left fingers: index(25..27), middle(28..30), ring(31..33), little(34..36), thumb(22..24)
+    let lf = [25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 22, 23, 24]
+    let rf = [40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 37, 38, 39]
+    for i in 0..15 {
+        a[19 + i] = lf[i]
+        a[34 + i] = rf[i]
+    }
+    // 49..50: torso (lower pelvis->spine2, upper spine2->spine3)
+    a[49] = 0
+    a[50] = 2
+    // 51: head
+    a[51] = 5
+    a
+}
+
+fn build_part_bones_end() -> [u32; MAX_SKIN_PARTS] {
+    var a = build_part_bones_start()
+    a[0] = 5 // neck blends neck -> head
+    a[1] = 15 // clavicle L -> upper arm L
+    a[8] = 19 // clavicle R -> upper arm R
+    a[49] = 2 // lower torso blends pelvis -> spine2
+    a[50] = 3 // upper torso blends spine2 -> spine3
+    a
+}
+
+fn limb_substance(p: vec3) -> Substance {
+    // Grounded realistic scholar materials matching `mage_turnaround_final`:
+    //   y < 0.44: weathered brown leather knee-high boots
+    //   0.44..0.88: dark charcoal wool trousers
+    //   0.88..1.52: dark navy wool sleeves & brown leather forearm bracers
+    //   y > 1.52: neck warm skin
+    if p.y < 0.44 {
+        return Substance {
+            albedo: vec3(0.078, 0.044, 0.025),
+            roughness: 0.62,
+            emits: vec3(0.0),
+            metallic: 0.0,
+            ior: 1.5,
+            transmission: 0.0,
+            subsurface: 0.0,
+            coat: 0.02,
+            micro: 0.16,
+            pad0: 0.0,
+            pad1: 0.0,
+            pad2: 0.0,
+        }
+    }
+    if p.y < 0.88 {
+        return Substance {
+            albedo: vec3(0.042, 0.044, 0.050),
+            roughness: 0.86,
+            emits: vec3(0.0),
+            metallic: 0.0,
+            ior: 1.45,
+            transmission: 0.0,
+            subsurface: 0.0,
+            coat: 0.0,
+            micro: 0.14,
+            pad0: 0.0,
+            pad1: 0.0,
+            pad2: 0.0,
+        }
+    }
+    if p.y > 1.51 && abs(p.x) < 0.075 {
+        return Substance {
+            albedo: vec3(0.42, 0.24, 0.16),
+            roughness: 0.50,
+            emits: vec3(0.0),
+            metallic: 0.0,
+            ior: 1.44,
+            transmission: 0.0,
+            subsurface: 0.25,
+            coat: 0.0,
+            micro: 0.04,
+            pad0: 0.0,
+            pad1: 0.0,
+            pad2: 0.0,
+        }
+    }
+    // Fitted lower-forearm leather bracer (only past mid-forearm, leaving upper arm & elbow navy wool)
+    let is_bracer = abs(p.x) > 0.405 && p.y < 1.18
+    if is_bracer {
+        let is_cuff = abs(p.x) < 0.422
+        return Substance {
+            albedo: if is_cuff { vec3(0.58, 0.44, 0.18) } else { vec3(0.075, 0.042, 0.024) },
+            roughness: if is_cuff { 0.34 } else { 0.62 },
+            emits: vec3(0.0),
+            metallic: if is_cuff { 0.78 } else { 0.0 },
+            ior: 1.5,
+            transmission: 0.0,
+            subsurface: 0.0,
+            coat: 0.01,
+            micro: 0.14,
+            pad0: 0.0,
+            pad1: 0.0,
+            pad2: 0.0,
+        }
+    }
+    Substance {
+        albedo: vec3(0.042, 0.060, 0.098),
+        roughness: 0.86,
+        emits: vec3(0.0),
+        metallic: 0.0,
+        ior: 1.45,
+        transmission: 0.0,
+        subsurface: 0.0,
+        coat: 0.0,
+        micro: 0.15,
+        pad0: 0.0,
+        pad1: 0.0,
+        pad2: 0.0,
+    }
+}
+
+fn hand_skin_substance(_p: vec3) -> Substance {
+    Substance {
+        albedo: vec3(0.45, 0.26, 0.17),
+        roughness: 0.46,
+        emits: vec3(0.0),
+        metallic: 0.0,
+        ior: 1.44,
+        transmission: 0.0,
+        subsurface: 0.28,
+        coat: 0.0,
+        micro: 0.04,
+        pad0: 0.0,
+        pad1: 0.0,
+        pad2: 0.0,
+    }
+}
+
+fn mat4_rot_t(m: mat4) -> (Quat, vec3) {
+    let q = Quat::from_mat3(mat3(m[0].xyz, m[1].xyz, m[2].xyz))
+    (q, m[3].xyz)
+}
+
+fn head_field_at(q: Quat, t: vec3) -> MageHeadField {
+    // Head base in HEAD-bone local coordinates (HEAD rest is (0, 1.60, -0.017))
+    let base = round_cone(
+        vec3(0.0, 0.02, 0.017),
+        vec3(0.0, 0.11, 0.012),
+        r_top: 0.092,
+        r_bottom: 0.088,
+    )
+    painted(
+        bounded_residual(
+            base,
+            MageHeadResidual { tag: 1 },
+            center: MHEAD_CENTER_LOCAL,
+            extent: MHEAD_EXTENT,
+            max_delta: MHEAD_MAX_DELTA,
+            lip_extra: 0.04,
+        ),
+        MageHeadResidual { tag: 1 },
+    )
+        .rotate(q)
+        .translate(t)
+}
+
+fn torso_field_at(q: Quat, t: vec3) -> MageTorsoField {
+    // Sleek athletic scholar torso base in SPINE_2-bone local coords (SPINE_2 rest (0, 1.178, 0.004))
+    let lo = round_cone(
+        vec3(0.0, -0.285, -0.018),
+        vec3(0.0, 0.002, -0.004),
+        r_top: 0.128,
+        r_bottom: 0.116,
+    )
+    let hi = round_cone(
+        vec3(0.0, 0.002, -0.004),
+        vec3(0.0, 0.275, -0.012),
+        r_top: 0.116,
+        r_bottom: 0.136,
+    )
+    painted(
+        bounded_residual(
+            lo.smooth_union(hi, k: 0.04),
+            MageTorsoResidual { tag: 2 },
+            center: MTORSO_CENTER_LOCAL,
+            extent: MTORSO_EXTENT,
+            max_delta: 0.016,
+            lip_extra: 0.04,
+        ),
+        MageTorsoResidual { tag: 2 },
+    )
+        .rotate(q)
+        .translate(t)
+}
+
+fn build_mage_body(pose: [mat4; 64], is_rest: bool) -> MageBody {
+    let pt = |bone: u32, p_rest: vec3| -> vec3 {
+        if is_rest { rest_point_on(bone, p_rest) } else { posed(pose, bone, p_rest) }
+    }
+    let j = |bone: u32, off: vec3| -> vec3 { pt(bone, REST[bone] + off) }
+
+    var limbs = [round_cone(vec3(0.0), vec3(0.0), r_top: 0.0, r_bottom: 0.0); 17]
+    // 0: neck
+    limbs[0] = round_cone(j(SPINE_3, vec3(0.0, 0.14, -0.01)), j(HEAD, vec3(0.0, 0.02, 0.0)), r_top: 0.068, r_bottom: 0.056)
+    // Left (1..7) and Right (8..14)
+    for side in 0..2 {
+        let o: u32 = 1 + side * 7
+        let sx = if side == 0 { 1.0 } else { -1.0 }
+        limbs[o] = round_cone(
+            j(COLLARBONE_LEFT + side, vec3(0.0)),
+            j(UPPER_ARM_LEFT + side, vec3(0.0)),
+            r_top: 0.064,
+            r_bottom: 0.062,
+        )
+        limbs[o + 1] = round_cone(
+            j(UPPER_ARM_LEFT + side, vec3(0.0)),
+            j(FOREARM_LEFT + side, vec3(0.0)),
+            r_top: 0.056,
+            r_bottom: 0.048,
+        )
+        limbs[o + 2] = round_cone(
+            j(FOREARM_LEFT + side, vec3(0.0)),
+            j(HAND_LEFT + side, vec3(0.0)),
+            r_top: 0.046,
+            r_bottom: 0.036,
+        )
+        limbs[o + 3] = round_cone(
+            j(THIGH_LEFT + side, vec3(0.0, 0.03, 0.0)),
+            j(CALF_LEFT + side, vec3(0.0)),
+            r_top: 0.095,
+            r_bottom: 0.068,
+        )
+        limbs[o + 4] = round_cone(
+            j(CALF_LEFT + side, vec3(0.0)),
+            j(FOOT_LEFT + side, vec3(0.0, 0.01, 0.0)),
+            r_top: 0.066,
+            r_bottom: 0.050,
+        )
+        limbs[o + 5] = round_cone(
+            j(FOOT_LEFT + side, vec3(0.0, -0.042, -0.035)),
+            j(BALL_LEFT + side, vec3(0.0, 0.022, 0.0)),
+            r_top: 0.044,
+            r_bottom: 0.040,
+        )
+        limbs[o + 6] = round_cone(
+            j(BALL_LEFT + side, vec3(0.0, 0.018, 0.0)),
+            j(BALL_LEFT + side, vec3(0.0, 0.012, 0.075)),
+            r_top: 0.036,
+            r_bottom: 0.024,
+        )
+        // Sleek pelvis/hip trouser connectors (15, 16)
+        limbs[15 + side] = round_cone(
+            j(PELVIS, vec3(0.055 * sx, -0.04, 0.0)),
+            j(THIGH_LEFT + side, vec3(0.0, -0.04, 0.0)),
+            r_top: 0.074,
+            r_bottom: 0.072,
+        )
+    }
+
+    // 32 hand & articulated 5-finger phalanx parts (palm L, palm R, 15 L phalanges, 15 R phalanges)
+    var hands = [round_cone(vec3(0.0), vec3(0.0), r_top: 0.0, r_bottom: 0.0); 32]
+    hands[0] = round_cone(
+        j(HAND_LEFT, vec3(0.015, 0.0, 0.0)),
+        j(HAND_LEFT, vec3(0.088, 0.0, 0.0)),
+        r_top: 0.036,
+        r_bottom: 0.034,
+    )
+    hands[1] = round_cone(
+        j(HAND_RIGHT, vec3(-0.015, 0.0, 0.0)),
+        j(HAND_RIGHT, vec3(-0.088, 0.0, 0.0)),
+        r_top: 0.036,
+        r_bottom: 0.034,
+    )
+    let f_radii = [
+        0.0105, 0.0088, 0.0072, // index
+        0.0110, 0.0092, 0.0075, // middle
+        0.0102, 0.0085, 0.0070, // ring
+        0.0090, 0.0076, 0.0062, // little
+        0.0135, 0.0112, 0.0090, // thumb
+    ]
+    for side in 0..2 {
+        let sx = if side == 0 { 1.0 } else { -1.0 }
+        let base_idx: u32 = 2 + side * 15
+        for f in 0..5 {
+            for k in 0..3 {
+                let bone = FINGER_BONES + 6 * f + 2 * k + side
+                let pa_r = FINGER_JOINTS[f * 4 + k]
+                let pb_r = FINGER_JOINTS[f * 4 + k + 1]
+                let pa = pt(bone, vec3(pa_r.x * sx, pa_r.y, pa_r.z))
+                let pb = pt(bone, vec3(pb_r.x * sx, pb_r.y, pb_r.z))
+                let r0 = f_radii[f * 3 + k]
+                let r1 = r0 * 0.86
+                hands[base_idx + f * 3 + k] = round_cone(pa, pb, r_top: r0, r_bottom: r1)
+            }
+        }
+    }
+
+    let (qh, th) = if is_rest {
+        (Quat::identity(), REST[HEAD])
+    } else {
+        let m = pose[HEAD] * translate(REST[HEAD])
+        mat4_rot_t(m)
+    }
+    let (qt, tt) = if is_rest {
+        (Quat::identity(), REST[SPINE_2])
+    } else {
+        let m = pose[SPINE_2] * translate(REST[SPINE_2])
+        mat4_rot_t(m)
+    }
+
+    painted(limbs.smooth_union(k: BODY_JOIN), MageLimbPaint { tag: 1 })
+        .smooth_union(hands.smooth_union(k: HAND_JOIN).with(hand_skin_substance(vec3(0.0))), k: 0.008)
+        .smooth_union(torso_field_at(qt, tt), k: 0.018)
+        .smooth_union(head_field_at(qh, th), k: 0.014)
+}
+
+const MAGE_REST_BODY: MageBody = build_mage_body([translate(vec3(0.0)); 64], is_rest: true)
+const MAGE_JOINTS: [vec4; MAX_SKIN_BONES] = mage_joints_rest()
+const MAGE_INV_BINDS: [mat4; MAGE_BONES] = mage_inv_binds()
+const MAGE_PART_START: [u32; SKIN_PART_WORDS] = pack_part_bones(build_part_bones_start())
+const MAGE_PART_END: [u32; SKIN_PART_WORDS] = pack_part_bones(build_part_bones_end())
+
+/// Returns the articulated 52-bone `Skinned<MageBody>` posed by `pose` (`skeleton::on_rig` palette).
+pub fn mage(pose: [mat4; 64]) -> Mage {
+    let posed_body = build_mage_body(pose, is_rest: false)
+    var bones = [DualQuat::identity(); MAX_SKIN_BONES]
+    for b in 0..MAGE_BONES {
+        bones[b] = DualQuat::from_mat4(pose[MAGE_RIG_BONES[b]] * MAGE_INV_BINDS[b])
+    }
+    skinned(
+        posed_body,
+        MAGE_REST_BODY,
+        bones,
+        MAGE_JOINTS,
+        MAGE_BONES,
+        MAGE_PART_START,
+        MAGE_PART_END,
+        BODY_JOIN,
+    )
+}
+
+/// Separate, removable/swappable pointed mage hat (`2D -> 3D -> Field`), mounted rigidly onto
+/// `pose[HEAD]` with natural brow fit.
+pub type MountedHat = Translate<Rotate<Hat>>
+
+pub fn mage_hat(pose: [mat4; 64]) -> MountedHat {
+    let m = pose[HEAD] * translate(REST[HEAD] + vec3(0.0, 0.105, -0.004))
+    let (q, t) = mat4_rot_t(m)
+    let tilt = Quat::axis_angle(vec3(1.0, 0.0, 0.0), -0.08)
+    hat().rotate(q.mul(tilt)).translate(t)
+}
+
+/// 7 collar/shoulder anchor points across `pose[SPINE_3]` and clavicles for the XPBD `ClothSim` cape.
+pub fn mage_cape_pins(pose: [mat4; 64]) -> [vec3; CLOTH_W] {
+    var pins = [vec3(0.0); CLOTH_W]
+    for x in 0..CLOTH_W {
+        let u = (f32(x) / f32(CLOTH_W - 1)) * 2.0 - 1.0
+        // Curved yoke wrapping smoothly from left shoulder around back of collar to right shoulder
+        let px = u * 0.215
+        let py = 1.470 - 0.028 * u * u
+        let pz = -0.105 + 0.038 * u * u
+        pins[x] = posed(pose, SPINE_3, vec3(px, py, pz))
+    }
+    pins
+}
+
+/// Physical heavy woven charcoal-indigo wool `Substance` for the flowing `ClothSheet` mage cape.
+pub fn mage_cape_substance(p: vec3) -> Substance {
+    // Subtle woven twill modulation + warm antique-gold trim near lower hem
+    let weave = 0.92 + 0.08 * sin(p.x * 160.0) * sin(p.y * 160.0)
+    let hem = smoothstep(0.42, 0.36, p.y)
+    let wool = vec3(0.042, 0.056, 0.098) * weave
+    let gold_trim = vec3(0.55, 0.40, 0.14)
+    Substance {
+        albedo: mix(wool, gold_trim, vec3(hem * 0.65)),
+        roughness: mix(0.88, 0.42, hem * 0.65),
+        emits: vec3(0.0),
+        metallic: mix(0.0, 0.65, hem * 0.65),
+        ior: 1.45,
+        transmission: 0.0,
+        subsurface: 0.06,
+        coat: 0.0,
+        micro: 0.18,
+        pad0: 0.0,
+        pad1: 0.0,
+        pad2: 0.0,
+    }
+}
+
+pub struct MageCapePaint: Copy + GpuData + Eq + StateHash {
+    pub tag: u32,
+}
+
+impl ChannelEval<Substance> for MageCapePaint {
+    fn eval_channels(self, p: vec3) -> Substance {
+        mage_cape_substance(p)
+    }
+}
+
+pub type MageCape = Painted<Skinned<ClothSheet>, MageCapePaint>
+
+/// Wraps a GPU-skinned XPBD `Skinned<ClothSheet>` into the mage's pure `Field<Substance>` cape.
+pub fn mage_cape(sheet: Skinned<ClothSheet>) -> MageCape {
+    painted(sheet, MageCapePaint { tag: 1 })
+}
+
+/// Finds the exact Y surface height of `oaktable()` directly above `(x, z)` via binary search
+/// on `table.distance`, so any prop (like `grimoire()`) seats flush to `< 0.5 mm`.
+pub fn surface_y_at<S: Surface>(surf: S, x: f32, z: f32, y_lo: f32, y_hi: f32) -> f32 {
+    var lo = y_lo
+    var hi = y_hi
+    for _ in 0..20 {
+        let mid = 0.5 * (lo + hi)
+        if surf.distance(vec3(x, mid, z)) <= 0.0 {
+            lo = mid
+        } else {
+            hi = mid
+        }
+    }
+    0.5 * (lo + hi)
+}
+
+@test
+fn props_and_modular_mage_fields_are_finite_bounded_and_seated() {
+    let tbl = oaktable::oaktable()
+    let grm = grimoire::grimoire()
+    let h = hat()
+    let top_y = surface_y_at(tbl, x: 0.0, z: 0.0, y_lo: 0.72, y_hi: 0.84)
+    var glo = -0.04
+    var ghi = 0.028
+    for _ in 0..20 {
+        let mid = 0.5 * (glo + ghi)
+        if grm.distance(vec3(0.0, mid, 0.0)) <= 0.0 {
+            ghi = mid
+        } else {
+            glo = mid
+        }
+    }
+    let grm_bottom = 0.5 * (glo + ghi)
+    let seat_y = top_y - grm_bottom
+    let seated_grm = grm.translate(vec3(0.0, seat_y, 0.0))
+    let contact_d = tbl.distance(vec3(0.0, top_y, 0.0))
+    let grm_at_contact = seated_grm.distance(vec3(0.0, top_y, 0.0))
+    std::io::print(
+        f"props: table_top_y={top_y} grm_bottom={grm_bottom} seat_y={seat_y} contact_tbl={contact_d} contact_grm={grm_at_contact} hat_d0={h.distance(vec3(0.0, 0.02, 0.0))}",
+    )
+    assert(top_y > 0.74 && top_y < 0.82, "table top should be near 0.78m")
+    assert(abs(contact_d) < 0.002, "table surface at top_y within 2mm")
+    assert(abs(grm_at_contact) < 0.002, "seated grimoire bottom within 2mm of table top")
+    let m = mage([translate(vec3(0.0)); 64])
+    assert(m.skin_bone_count() == 52, "mage uses all 52 VRM bones")
+    assert(m.rest.parts() == 52, "mage body has 52 leaf parts")
+    let head_d = m.distance(vec3(0.0, 1.66, 0.0))
+    let chest_d = m.distance(vec3(0.0, 1.25, 0.0))
+    std::io::print(f"mage: bones={m.skin_bone_count()} parts={m.rest.parts()} head_d={head_d} chest_d={chest_d}")
+    assert(head_d < 0.0, "mage head interior is negative SDF")
+    assert(chest_d < 0.0, "mage chest interior is negative SDF")
+}

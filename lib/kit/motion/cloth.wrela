@@ -1,0 +1,475 @@
+// Reusable real-time XPBD cloth simulation and pure `Field<Substance>` cloth sheet (`ClothField`),
+// following Macklin, Müller & Chentanez (MIG 2016). Collides every cloth particle directly against
+// exact body and world `Surface` signed distance fields (`distance` + `gradient`) with zero fake
+// collision capsules.
+
+use std::field::{
+    Bound, DualQuat, MAX_SKIN_BONES, MAX_SKIN_PARTS, SKIN_PART_WORDS, Skinned, Surface, half_space,
+    pack_part_bones, skinned, sphere,
+}
+use std::hash::{StateHash, state_hash}
+use std::quat::Quat
+
+/// Cloth sheet grid dimensions (`CLOTH_W` columns × `CLOTH_H` rows = 63 particles, 48 quads).
+pub const CLOTH_W: u32 = 7
+pub const CLOTH_H: u32 = 9
+pub const CLOTH_N: u32 = 63
+
+/// Live XPBD cloth simulation state (CPU-updated per frame, producing an exact `ClothSheet` or
+/// GPU-skinned `Skinned<ClothSheet>` snapshot for zero-reextraction rendering).
+pub struct ClothSim: Clone {
+    pub pos: [vec3; CLOTH_N],
+    pub prev: [vec3; CLOTH_N],
+    pub rest_pos: [vec3; CLOTH_N],
+    pub inv_mass: [f32; CLOTH_N],
+    pub rest_u: [f32; CLOTH_N],
+    pub rest_v: [f32; CLOTH_N],
+    pub thickness: f32,
+    pub damping: f32,
+}
+
+/// Pure `Surface` representing a simulated cloth sheet of finite physical thickness `thickness` (m):
+/// exact unsigned distance to the 96 triangles of the `(CLOTH_W × CLOTH_H)` cloth surface minus
+/// `thickness`, with per-row bounding spheres for fast broad-phase culling on CPU and GPU.
+pub struct ClothSheet: Copy + GpuData + Eq + StateHash {
+    pub pts: [vec4; CLOTH_N],
+    pub row_bounds: [vec4; 8],
+    pub bound_sphere: vec4,
+    pub thickness: f32,
+    pub pad0: f32,
+    pub pad1: f32,
+    pub pad2: f32,
+}
+
+/// Helper: grid index `(x, y)` into `0..CLOTH_N`.
+pub fn cloth_idx(x: u32, y: u32) -> u32 {
+    y * CLOTH_W + x
+}
+
+/// Initializes a shoulder-draped cape (`CLOTH_W × CLOTH_H`) hanging down from `pins` (top row,
+/// left-to-right across the collar/shoulders) with total length `drop_len` (m), hem flare factor
+/// `flare` (>= 1.0 widens smoothly toward the bottom), and physical thickness `thickness` (m).
+pub fn init_cape(
+    pins: [vec3; CLOTH_W],
+    back_dir: vec3,
+    drop_len: f32,
+    flare: f32,
+    thickness: f32 = 0.004,
+) -> ClothSim {
+    var pos = [vec3(0.0); CLOTH_N]
+    var inv_mass = [1.0; CLOTH_N]
+    var rest_u = [0.0; CLOTH_N]
+    var rest_v = [0.0; CLOTH_N]
+    let back = normalize(back_dir)
+    var mid = vec3(0.0)
+    for x in 0..CLOTH_W {
+        mid += pins[x]
+    }
+    mid = mid * (1.0 / f32(CLOTH_W))
+    for y in 0..CLOTH_H {
+        let fy = f32(y) / f32(CLOTH_H - 1)
+        let w_scale = 1.0 + (flare - 1.0) * fy
+        for x in 0..CLOTH_W {
+            let i = cloth_idx(x, y)
+            let off_x = (pins[x] - mid) * w_scale
+            // Slight natural backward drape off the shoulder blades.
+            let p = mid + off_x + vec3(0.0, -drop_len * fy, 0.0) + back * (0.04 + 0.14 * fy)
+            pos[i] = p
+            inv_mass[i] = if y == 0 { 0.0 } else { 1.0 }
+        }
+    }
+    // Measure rest edge lengths in u (horizontal) and v (vertical).
+    for y in 0..CLOTH_H {
+        for x in 0..CLOTH_W {
+            let i = cloth_idx(x, y)
+            if x + 1 < CLOTH_W {
+                rest_u[i] = length(pos[cloth_idx(x + 1, y)] - pos[i])
+            }
+            if y + 1 < CLOTH_H {
+                rest_v[i] = length(pos[cloth_idx(x, y + 1)] - pos[i])
+            }
+        }
+    }
+    ClothSim { pos, prev: pos, rest_pos: pos, inv_mass, rest_u, rest_v, thickness, damping: 0.975 }
+}
+
+/// Projects one XPBD distance constraint between particles `ia` and `ib` toward `rest_len`.
+fn solve_edge(
+    pos: mut [vec3; CLOTH_N],
+    inv_mass: [f32; CLOTH_N],
+    ia: u32,
+    ib: u32,
+    rest_len: f32,
+    stiffness: f32,
+) {
+    let wa = inv_mass[ia]
+    let wb = inv_mass[ib]
+    let wsum = wa + wb
+    if wsum <= 1.0e-8 || rest_len <= 1.0e-6 {
+        return
+    }
+    let d = pos[ib] - pos[ia]
+    let l = length(d)
+    if l <= 1.0e-7 {
+        return
+    }
+    let corr = d * (((l - rest_len) / l) * stiffness / wsum)
+    pos[ia] = pos[ia] + corr * wa
+    pos[ib] = pos[ib] - corr * wb
+}
+
+impl ClothSim {
+    /// Advances the XPBD cloth simulation by `dt` seconds (`substeps` sub-iterations), updating top
+    /// row anchors to `pins` and colliding every free particle against exact body and world SDFs
+    /// (`body_sdf` and `world_sdf`, returning `(distance, outward_normal)`).
+    pub fn step<B: Surface, W: Surface>(
+        mut self,
+        pins: [vec3; CLOTH_W],
+        dt: f32,
+        substeps: u32,
+        wind: vec3,
+        body: B,
+        world: W,
+    ) {
+        let n_sub = max(substeps, 1)
+        let h = dt / f32(n_sub)
+        let h2 = h * h
+        let grav = vec3(0.0, -9.81, 0.0) + wind
+        let pad_body = self.thickness + 0.008
+        let pad_world = self.thickness + 0.004
+
+        for _s in 0..n_sub {
+            let frac = f32(_s + 1) / f32(n_sub)
+            // Pin top row smoothly toward target shoulder anchors.
+            for x in 0..CLOTH_W {
+                let i = cloth_idx(x, 0)
+                let target = mix(self.pos[i], pins[x], vec3(frac))
+                self.prev[i] = target
+                self.pos[i] = target
+            }
+            // Verlet / XPBD predict free particles.
+            for i in CLOTH_W..CLOTH_N {
+                if self.inv_mass[i] <= 0.0 {
+                    continue
+                }
+                let p = self.pos[i]
+                let v = (p - self.prev[i]) * self.damping
+                self.prev[i] = p
+                self.pos[i] = p + v + grav * h2
+            }
+            // Constraint relaxation: structural stretch + shear + 2-hop bending.
+            for _it in 0..4 {
+                for y in 0..CLOTH_H {
+                    for x in 0..CLOTH_W {
+                        let i = cloth_idx(x, y)
+                        if x + 1 < CLOTH_W {
+                            solve_edge(mut self.pos, self.inv_mass, i, i + 1, self.rest_u[i], 0.85)
+                        }
+                        if y + 1 < CLOTH_H {
+                            solve_edge(
+                                mut self.pos,
+                                self.inv_mass,
+                                i,
+                                i + CLOTH_W,
+                                self.rest_v[i],
+                                0.95,
+                            )
+                        }
+                        if x + 1 < CLOTH_W && y + 1 < CLOTH_H {
+                            let diag = sqrt(
+                                self.rest_u[i] * self.rest_u[i] + self.rest_v[i] * self.rest_v[i],
+                            )
+                            solve_edge(
+                                mut self.pos,
+                                self.inv_mass,
+                                i,
+                                i + CLOTH_W + 1,
+                                diag,
+                                0.45,
+                            )
+                            solve_edge(
+                                mut self.pos,
+                                self.inv_mass,
+                                i + 1,
+                                i + CLOTH_W,
+                                diag,
+                                0.45,
+                            )
+                        }
+                        if y + 2 < CLOTH_H {
+                            let b_len = self.rest_v[i] + self.rest_v[i + CLOTH_W]
+                            solve_edge(
+                                mut self.pos,
+                                self.inv_mass,
+                                i,
+                                i + 2 * CLOTH_W,
+                                b_len,
+                                0.25,
+                            )
+                        }
+                    }
+                }
+                // Exact SDF collision against body & world (zero fake capsules!).
+                for i in CLOTH_W..CLOTH_N {
+                    var p = self.pos[i]
+                    let db = body.distance(p)
+                    if db < pad_body {
+                        let g = body.gradient(p)
+                        let gl = max(length(g), 1.0e-5)
+                        let n = g / gl
+                        p = p + n * (pad_body - db)
+                        // Tangential friction on contact.
+                        let disp = p - self.prev[i]
+                        let vn = n * dot(disp, n)
+                        self.prev[i] = p - vn - (disp - vn) * 0.72
+                    }
+                    let dw = world.distance(p)
+                    if dw < pad_world {
+                        let g = world.gradient(p)
+                        let gl = max(length(g), 1.0e-5)
+                        let n = g / gl
+                        p = p + n * (pad_world - dw)
+                        let disp = p - self.prev[i]
+                        let vn = n * dot(disp, n)
+                        self.prev[i] = p - vn - (disp - vn) * 0.65
+                    }
+                    self.pos[i] = p
+                }
+            }
+        }
+    }
+}
+
+fn build_sheet(src: [vec3; CLOTH_N], thickness: f32) -> ClothSheet {
+    var pts = [vec4(0.0); CLOTH_N]
+    var lo = src[0]
+    var hi = src[0]
+    for i in 0..CLOTH_N {
+        let p = src[i]
+        pts[i] = vec4(p, 1.0)
+        lo = min(lo, p)
+        hi = max(hi, p)
+    }
+    let c = 0.5 * (lo + hi)
+    var rmax = 0.0
+    for i in 0..CLOTH_N {
+        rmax = max(rmax, length(src[i] - c))
+    }
+    var row_bounds = [vec4(0.0); 8]
+    for row in 0..8 {
+        var rlo = src[cloth_idx(0, row)]
+        var rhi = rlo
+        for dy in 0..2 {
+            for x in 0..CLOTH_W {
+                let p = src[cloth_idx(x, row + dy)]
+                rlo = min(rlo, p)
+                rhi = max(rhi, p)
+            }
+        }
+        let rc = 0.5 * (rlo + rhi)
+        var rr = 0.0
+        for dy in 0..2 {
+            for x in 0..CLOTH_W {
+                rr = max(rr, length(src[cloth_idx(x, row + dy)] - rc))
+            }
+        }
+        row_bounds[row] = vec4(rc, rr + thickness + 0.002)
+    }
+    ClothSheet {
+        pts,
+        row_bounds,
+        bound_sphere: vec4(c, rmax + thickness + 0.002),
+        thickness: thickness,
+        pad0: 0.0,
+        pad1: 0.0,
+        pad2: 0.0,
+    }
+}
+
+/// Computes an orthonormal surface frame `(u_dir, v_dir, normal)` at grid particle `(x, y)`.
+fn cloth_particle_frame(src: [vec3; CLOTH_N], x: u32, y: u32) -> mat3 {
+    let xl = if x > 0 { x - 1 } else { 0 }
+    let xr = if x + 1 < CLOTH_W { x + 1 } else { CLOTH_W - 1 }
+    let yu = if y > 0 { y - 1 } else { 0 }
+    let yd = if y + 1 < CLOTH_H { y + 1 } else { CLOTH_H - 1 }
+    let du_raw = src[cloth_idx(xr, y)] - src[cloth_idx(xl, y)]
+    let dv_raw = src[cloth_idx(x, yd)] - src[cloth_idx(x, yu)]
+    let u = if length(du_raw) > 1.0e-5 { normalize(du_raw) } else { vec3(1.0, 0.0, 0.0) }
+    var n = cross(u, dv_raw)
+    if length(n) < 1.0e-5 {
+        n = vec3(0.0, 0.0, 1.0)
+    } else {
+        n = normalize(n)
+    }
+    let v = cross(n, u)
+    mat3(u, v, n)
+}
+
+fn cloth_part_bones_packed() -> [u32; SKIN_PART_WORDS] {
+    var pb = [0; MAX_SKIN_PARTS]
+    for i in 0..CLOTH_N {
+        pb[i] = i
+    }
+    pack_part_bones(pb)
+}
+
+const CLOTH_PART_BONES: [u32; SKIN_PART_WORDS] = cloth_part_bones_packed()
+
+impl ClothSim {
+    /// Snapshots the live simulation into an immutable, GPU-ready `ClothSheet` `Surface`.
+    pub fn sheet(self) -> ClothSheet {
+        build_sheet(self.pos, self.thickness)
+    }
+
+    /// Snapshots the live simulation as a 63-bone GPU-skinned `Skinned<ClothSheet>` so the engine
+    /// extracts the rest cape mesh ONCE on frame 0 and deforms + projects it on the GPU in <0.5 ms!
+    pub fn skinned_sheet(self) -> Skinned<ClothSheet> {
+        let rest_sheet = build_sheet(self.rest_pos, self.thickness)
+        let posed_sheet = build_sheet(self.pos, self.thickness)
+        var bones = [DualQuat::identity(); MAX_SKIN_BONES]
+        var joints = [vec4(0.0); MAX_SKIN_BONES]
+        for y in 0..CLOTH_H {
+            for x in 0..CLOTH_W {
+                let i = cloth_idx(x, y)
+                let mr = cloth_particle_frame(self.rest_pos, x, y)
+                let mn = cloth_particle_frame(self.pos, x, y)
+                let mr_t = mat3(
+                    vec3(mr[0].x, mr[1].x, mr[2].x),
+                    vec3(mr[0].y, mr[1].y, mr[2].y),
+                    vec3(mr[0].z, mr[1].z, mr[2].z),
+                )
+                let q = Quat::from_mat3(mn * mr_t)
+                let t = self.pos[i] - q.rotate(self.rest_pos[i])
+                bones[i] = DualQuat::from_qt(q, t)
+                joints[i] = vec4(self.rest_pos[i], 1.0)
+            }
+        }
+        skinned(
+            posed_sheet,
+            rest_sheet,
+            bones,
+            joints,
+            CLOTH_N,
+            CLOTH_PART_BONES,
+            CLOTH_PART_BONES,
+            0.22,
+        )
+    }
+
+    /// Maximum penetration depth (m, >= 0) of any free cloth particle into `surface`.
+    pub fn max_penetration<S: Surface>(self, surface: S) -> f32 {
+        var worst = 0.0
+        for i in CLOTH_W..CLOTH_N {
+            let d = surface.distance(self.pos[i])
+            if d < 0.0 {
+                worst = max(worst, -d)
+            }
+        }
+        worst
+    }
+}
+
+/// Exact squared unsigned distance from point `p` to 3D triangle `(a, b, c)` (Inigo Quilez).
+fn tri_dist_sq(p: vec3, a: vec3, b: vec3, c: vec3) -> f32 {
+    let ba = b - a
+    let pa = p - a
+    let cb = c - b
+    let pb = p - b
+    let ac = a - c
+    let pc = p - c
+    let nor = cross(ba, ac)
+    let inside = sign(dot(cross(ba, nor), pa)) +
+        sign(dot(cross(cb, nor), pb)) +
+        sign(dot(cross(ac, nor), pc)) <
+        2.0
+    if inside {
+        let d1 = ba * clamp(dot(ba, pa) / max(dot(ba, ba), 1.0e-12), 0.0, 1.0) - pa
+        let d2 = cb * clamp(dot(cb, pb) / max(dot(cb, cb), 1.0e-12), 0.0, 1.0) - pb
+        let d3 = ac * clamp(dot(ac, pc) / max(dot(ac, ac), 1.0e-12), 0.0, 1.0) - pc
+        return min(dot(d1, d1), min(dot(d2, d2), dot(d3, d3)))
+    }
+    let dn = dot(nor, pa)
+    dn * dn / max(dot(nor, nor), 1.0e-12)
+}
+
+impl Surface for ClothSheet {
+    fn distance(self, p: vec3) -> f32 {
+        var best_d = 1.0e20
+        var best_sq = 1.0e20
+        for row in 0..8 {
+            let rb = self.row_bounds[row]
+            let lb = length(p - rb.xyz) - rb.w
+            if lb >= best_d {
+                continue
+            }
+            for x in 0..6 {
+                let p00 = self.pts[cloth_idx(x, row)].xyz
+                let p10 = self.pts[cloth_idx(x + 1, row)].xyz
+                let p01 = self.pts[cloth_idx(x, row + 1)].xyz
+                let p11 = self.pts[cloth_idx(x + 1, row + 1)].xyz
+                let s0 = tri_dist_sq(p, p00, p10, p11)
+                let s1 = tri_dist_sq(p, p00, p11, p01)
+                let ms = min(s0, s1)
+                if ms < best_sq {
+                    best_sq = ms
+                    best_d = sqrt(best_sq)
+                }
+            }
+        }
+        best_d - self.thickness
+    }
+
+    fn bound(self) -> Bound {
+        Bound { centre: self.bound_sphere.xyz, radius: self.bound_sphere.w, slope: 1.0 }
+    }
+
+    fn lipschitz(self, near: f32) -> f32 {
+        1.0
+    }
+
+    fn parts(self) -> u32 {
+        CLOTH_N
+    }
+
+    fn part_distance(self, p: vec3, i: u32) -> f32 {
+        length(p - self.pts[min(i, CLOTH_N - 1)].xyz)
+    }
+
+    fn rigid_shape_hash(self) -> Option<u64> {
+        Some(state_hash(self))
+    }
+
+    fn skin_project(self) -> bool {
+        false
+    }
+}
+
+@test
+fn cape_collides_cleanly_with_sphere_and_floor() {
+    var pins = [vec3(0.0); CLOTH_W]
+    for x in 0..CLOTH_W {
+        let u = (f32(x) / f32(CLOTH_W - 1)) * 2.0 - 1.0
+        pins[x] = vec3(u * 0.2, 1.35, -0.08)
+    }
+    var cape = init_cape(pins, back_dir: vec3(0.0, 0.0, -1.0), drop_len: 0.9, flare: 1.45)
+    let body = sphere(0.25).translate(vec3(0.0, 1.0, 0.0))
+    let floor = half_space(vec3(0.0, 1.0, 0.0), 0.0)
+    for _ in 0..30 {
+        cape.step(
+            pins,
+            dt: 0.016667,
+            substeps: 3,
+            wind: vec3(0.0, 0.0, -0.4),
+            body: body,
+            world: floor,
+        )
+    }
+    let pen_body = cape.max_penetration(body)
+    let pen_floor = cape.max_penetration(floor)
+    assert(pen_body < 0.002, f"body penetration {pen_body}")
+    assert(pen_floor < 0.002, f"floor penetration {pen_floor}")
+    let sh = cape.sheet()
+    // On a cloth vertex, signed distance must equal -thickness.
+    let dv = sh.distance(cape.pos[cloth_idx(x: 3, y: 4)])
+    assert(abs(dv + cape.thickness) < 1.0e-4, f"sheet vertex dist {dv}")
+}
