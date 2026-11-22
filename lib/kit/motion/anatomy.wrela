@@ -1,0 +1,438 @@
+// Canonical humanoid biomechanical specification: anatomical joint types, physiological swing/twist
+// angle limits, clavicle-shoulder coupling, 3-point foot support pads, 5-finger contact geometry,
+// and human segment mass distribution (~75 kg total).
+//
+// Single source of truth shared between runtime pose clamping / IK / motion judges and our offline
+// MuJoCo MJX training model (`tools/training/export_mjx.py`). Operates in the VRM 1.0 humanoid
+// bone convention (`kit::motion::humanoid`, +y up, +z forward, +x body's left).
+
+use motion::cycle::exp
+use motion::humanoid::{NONE, Pose, Rig, Rigid, pose_world}
+use std::math::PI
+use std::quat::Quat
+
+/// Anatomical joint kinematic class.
+pub const JOINT_FREE: u32 = 0 // Pelvis root (6-DOF free joint)
+pub const JOINT_HINGE: u32 = 1 // 1-DOF flexion hinge (knees, elbows, toes, finger PIP/DIP)
+pub const JOINT_UNIVERSAL: u32 = 2 // 2-DOF flex + abduct/adduct (ankles, wrists, finger MCP)
+pub const JOINT_BALL: u32 = 3 // 3-DOF swing-twist cone (hips, shoulders, spine, neck, head)
+pub const JOINT_SADDLE: u32 = 4 // 2-DOF opposition saddle (thumb CMC)
+
+/// Degrees to radians helper.
+const DEG: f32 = PI / 180.0
+
+/// Biomechanical specification of one VRM humanoid bone (`vrm` in `0..55`).
+///
+/// Angles are relative to the T-pose rest orientation in the body-aligned joint frame
+/// (`+x` left, `+y` up, `+z` forward at rest):
+/// - `lo` / `hi`: minimum and maximum signed rotation angles (rad) about local `(x, y, z)`
+///   body-frame axes (`x` pitch/flexion, `y` yaw/twist, `z` roll/abduction).
+/// - `mass`: physical segment mass (kg), totaling ~75 kg across the 52 active bones.
+/// - `stiffness`: nominal PD proportional gain (N·m/rad) for physics simulation & recoil damping.
+/// - `torque_max`: maximum physiological joint torque (N·m).
+pub struct JointSpec: Copy {
+    pub vrm: u32,
+    pub kind: u32,
+    pub lo: vec3,
+    pub hi: vec3,
+    pub mass: f32,
+    pub stiffness: f32,
+    pub torque_max: f32,
+}
+
+fn spec(
+    vrm: u32,
+    kind: u32,
+    lo_deg: vec3,
+    hi_deg: vec3,
+    mass: f32,
+    stiffness: f32,
+    torque_max: f32,
+) -> JointSpec {
+    JointSpec {
+        vrm,
+        kind,
+        lo: lo_deg * DEG,
+        hi: hi_deg * DEG,
+        mass,
+        stiffness,
+        torque_max,
+    }
+}
+
+/// Complete biomechanical table indexed by VRM 1.0 bone index (`0..55`).
+/// Unused face bones (`jaw=6`, `leftEye=7`, `rightEye=8`) carry zero mass and zero range.
+///
+/// Sign convention in body frame (`+x` left, `+y` up, `+z` forward, right-handed):
+/// - `+x` rotation pitches forward/down (hips/spine bend forward, thigh swings back, knee bends back!)
+///   Specifically: rotating `(0,-1,0)` by `+x` moves `(0,-1,0) -> (0,-cos, -sin)` (backward!).
+///   So knee flexion bends lower leg backward (`+x` in `[0, +145°]`), hip flexion lifts thigh
+///   forward (`-x` in `[-125°, +35°]`), ankle dorsiflexion lifts toes (`-x` in `[-35°, +50°]`),
+///   toe-break bends toes upward on push-off (`-x` in `[-65°, +25°]`).
+/// - Left arm (`+x` along arm): elbow bends forward (`-y` in `[-145°, 0°]` around `+y` up),
+///   left fingers curl inward toward palm (`-y` or `+z` depending on palm-down T-pose).
+///   Right arm (`-x` along arm): mirrored (`y` and `z` inverted).
+pub const ANATOMY: [JointSpec; 55] = [
+    // 0: hips (root)
+    spec(0, JOINT_FREE, vec3(-180.0, -180.0, -180.0), vec3(180.0, 180.0, 180.0), mass: 11.2, stiffness: 0.0, torque_max: 0.0),
+    // 1..3: 3-segment spine (lumbar -> thoracic -> upper chest)
+    spec(1, JOINT_BALL, vec3(-22.0, -25.0, -20.0), vec3(35.0, 25.0, 20.0), mass: 9.5, stiffness: 220.0, torque_max: 180.0),
+    spec(2, JOINT_BALL, vec3(-18.0, -25.0, -18.0), vec3(30.0, 25.0, 18.0), mass: 9.0, stiffness: 200.0, torque_max: 160.0),
+    spec(3, JOINT_BALL, vec3(-15.0, -20.0, -15.0), vec3(25.0, 20.0, 15.0), mass: 7.8, stiffness: 180.0, torque_max: 140.0),
+    // 4..5: neck & head
+    spec(4, JOINT_BALL, vec3(-35.0, -45.0, -30.0), vec3(40.0, 45.0, 30.0), mass: 1.4, stiffness: 55.0, torque_max: 40.0),
+    spec(5, JOINT_BALL, vec3(-30.0, -45.0, -25.0), vec3(35.0, 45.0, 25.0), mass: 4.6, stiffness: 50.0, torque_max: 35.0),
+    // 6..8: unused face bones in VRM 52-bone rig
+    spec(6, JOINT_HINGE, vec3(0.0), vec3(0.0), mass: 0.0, stiffness: 0.0, torque_max: 0.0),
+    spec(7, JOINT_UNIVERSAL, vec3(0.0), vec3(0.0), mass: 0.0, stiffness: 0.0, torque_max: 0.0),
+    spec(8, JOINT_UNIVERSAL, vec3(0.0), vec3(0.0), mass: 0.0, stiffness: 0.0, torque_max: 0.0),
+    // 9..12: left leg (hip, 1-DOF knee, 2-DOF ankle, 1-DOF toe-break)
+    spec(9, JOINT_BALL, vec3(-125.0, -45.0, -25.0), vec3(35.0, 45.0, 50.0), mass: 7.5, stiffness: 190.0, torque_max: 180.0),
+    spec(10, JOINT_HINGE, vec3(0.0, -4.0, -3.0), vec3(145.0, 4.0, 3.0), mass: 3.6, stiffness: 150.0, torque_max: 140.0),
+    spec(11, JOINT_UNIVERSAL, vec3(-38.0, -18.0, -28.0), vec3(52.0, 18.0, 22.0), mass: 0.85, stiffness: 85.0, torque_max: 90.0),
+    spec(12, JOINT_HINGE, vec3(-65.0, -4.0, -4.0), vec3(25.0, 4.0, 4.0), mass: 0.25, stiffness: 25.0, torque_max: 25.0),
+    // 13..16: right leg (mirrored y/z bounds)
+    spec(13, JOINT_BALL, vec3(-125.0, -45.0, -50.0), vec3(35.0, 45.0, 25.0), mass: 7.5, stiffness: 190.0, torque_max: 180.0),
+    spec(14, JOINT_HINGE, vec3(0.0, -4.0, -3.0), vec3(145.0, 4.0, 3.0), mass: 3.6, stiffness: 150.0, torque_max: 140.0),
+    spec(15, JOINT_UNIVERSAL, vec3(-38.0, -18.0, -22.0), vec3(52.0, 18.0, 28.0), mass: 0.85, stiffness: 85.0, torque_max: 90.0),
+    spec(16, JOINT_HINGE, vec3(-65.0, -4.0, -4.0), vec3(25.0, 4.0, 4.0), mass: 0.25, stiffness: 25.0, torque_max: 25.0),
+    // 17..20: left arm (clavicle, shoulder ball, 1-DOF elbow, 2-DOF wrist)
+    spec(17, JOINT_UNIVERSAL, vec3(-12.0, -22.0, -15.0), vec3(12.0, 22.0, 30.0), mass: 0.65, stiffness: 90.0, torque_max: 75.0),
+    spec(18, JOINT_BALL, vec3(-90.0, -95.0, -105.0), vec3(95.0, 125.0, 95.0), mass: 2.1, stiffness: 110.0, torque_max: 100.0),
+    spec(19, JOINT_HINGE, vec3(-75.0, -145.0, -8.0), vec3(85.0, 0.0, 8.0), mass: 1.35, stiffness: 80.0, torque_max: 75.0),
+    spec(20, JOINT_UNIVERSAL, vec3(-20.0, -35.0, -75.0), vec3(20.0, 25.0, 70.0), mass: 0.42, stiffness: 35.0, torque_max: 30.0),
+    // 21..24: right arm (mirrored)
+    spec(21, JOINT_UNIVERSAL, vec3(-12.0, -22.0, -30.0), vec3(12.0, 22.0, 15.0), mass: 0.65, stiffness: 90.0, torque_max: 75.0),
+    spec(22, JOINT_BALL, vec3(-90.0, -125.0, -95.0), vec3(95.0, 95.0, 105.0), mass: 2.1, stiffness: 110.0, torque_max: 100.0),
+    spec(23, JOINT_HINGE, vec3(-85.0, 0.0, -8.0), vec3(75.0, 145.0, 8.0), mass: 1.35, stiffness: 80.0, torque_max: 75.0),
+    spec(24, JOINT_UNIVERSAL, vec3(-20.0, -25.0, -70.0), vec3(20.0, 35.0, 75.0), mass: 0.42, stiffness: 35.0, torque_max: 30.0),
+    // 25..27: left thumb (CMC saddle opposition + proximal + distal)
+    spec(25, JOINT_SADDLE, vec3(-45.0, -55.0, -40.0), vec3(45.0, 40.0, 45.0), mass: 0.025, stiffness: 8.0, torque_max: 6.0),
+    spec(26, JOINT_HINGE, vec3(-15.0, -65.0, -15.0), vec3(15.0, 15.0, 15.0), mass: 0.015, stiffness: 6.0, torque_max: 5.0),
+    spec(27, JOINT_HINGE, vec3(-10.0, -80.0, -10.0), vec3(10.0, 15.0, 10.0), mass: 0.01, stiffness: 5.0, torque_max: 4.0),
+    // 28..30: left index (MCP 2-DOF, PIP 1-DOF, DIP 1-DOF)
+    spec(28, JOINT_UNIVERSAL, vec3(-10.0, -20.0, -90.0), vec3(10.0, 20.0, 20.0), mass: 0.015, stiffness: 6.0, torque_max: 5.0),
+    spec(29, JOINT_HINGE, vec3(-5.0, -5.0, -105.0), vec3(5.0, 5.0, 5.0), mass: 0.01, stiffness: 5.0, torque_max: 4.0),
+    spec(30, JOINT_HINGE, vec3(-5.0, -5.0, -85.0), vec3(5.0, 5.0, 5.0), mass: 0.008, stiffness: 4.0, torque_max: 3.0),
+    // 31..33: left middle
+    spec(31, JOINT_UNIVERSAL, vec3(-10.0, -15.0, -90.0), vec3(10.0, 15.0, 20.0), mass: 0.016, stiffness: 6.0, torque_max: 5.0),
+    spec(32, JOINT_HINGE, vec3(-5.0, -5.0, -105.0), vec3(5.0, 5.0, 5.0), mass: 0.011, stiffness: 5.0, torque_max: 4.0),
+    spec(33, JOINT_HINGE, vec3(-5.0, -5.0, -85.0), vec3(5.0, 5.0, 5.0), mass: 0.008, stiffness: 4.0, torque_max: 3.0),
+    // 34..36: left ring
+    spec(34, JOINT_UNIVERSAL, vec3(-10.0, -15.0, -90.0), vec3(10.0, 15.0, 20.0), mass: 0.014, stiffness: 6.0, torque_max: 5.0),
+    spec(35, JOINT_HINGE, vec3(-5.0, -5.0, -105.0), vec3(5.0, 5.0, 5.0), mass: 0.01, stiffness: 5.0, torque_max: 4.0),
+    spec(36, JOINT_HINGE, vec3(-5.0, -5.0, -85.0), vec3(5.0, 5.0, 5.0), mass: 0.007, stiffness: 4.0, torque_max: 3.0),
+    // 37..39: left little
+    spec(37, JOINT_UNIVERSAL, vec3(-10.0, -20.0, -90.0), vec3(10.0, 20.0, 20.0), mass: 0.011, stiffness: 5.0, torque_max: 4.0),
+    spec(38, JOINT_HINGE, vec3(-5.0, -5.0, -105.0), vec3(5.0, 5.0, 5.0), mass: 0.008, stiffness: 4.0, torque_max: 3.0),
+    spec(39, JOINT_HINGE, vec3(-5.0, -5.0, -85.0), vec3(5.0, 5.0, 5.0), mass: 0.006, stiffness: 3.0, torque_max: 2.5),
+    // 40..42: right thumb (mirrored)
+    spec(40, JOINT_SADDLE, vec3(-45.0, -40.0, -45.0), vec3(45.0, 55.0, 40.0), mass: 0.025, stiffness: 8.0, torque_max: 6.0),
+    spec(41, JOINT_HINGE, vec3(-15.0, -15.0, -15.0), vec3(15.0, 65.0, 15.0), mass: 0.015, stiffness: 6.0, torque_max: 5.0),
+    spec(42, JOINT_HINGE, vec3(-10.0, -15.0, -10.0), vec3(10.0, 80.0, 10.0), mass: 0.01, stiffness: 5.0, torque_max: 4.0),
+    // 43..45: right index
+    spec(43, JOINT_UNIVERSAL, vec3(-10.0, -20.0, -20.0), vec3(10.0, 20.0, 90.0), mass: 0.015, stiffness: 6.0, torque_max: 5.0),
+    spec(44, JOINT_HINGE, vec3(-5.0, -5.0, -5.0), vec3(5.0, 5.0, 105.0), mass: 0.01, stiffness: 5.0, torque_max: 4.0),
+    spec(45, JOINT_HINGE, vec3(-5.0, -5.0, -5.0), vec3(5.0, 5.0, 85.0), mass: 0.008, stiffness: 4.0, torque_max: 3.0),
+    // 46..48: right middle
+    spec(46, JOINT_UNIVERSAL, vec3(-10.0, -15.0, -20.0), vec3(10.0, 15.0, 90.0), mass: 0.016, stiffness: 6.0, torque_max: 5.0),
+    spec(47, JOINT_HINGE, vec3(-5.0, -5.0, -5.0), vec3(5.0, 5.0, 105.0), mass: 0.011, stiffness: 5.0, torque_max: 4.0),
+    spec(48, JOINT_HINGE, vec3(-5.0, -5.0, -5.0), vec3(5.0, 5.0, 85.0), mass: 0.008, stiffness: 4.0, torque_max: 3.0),
+    // 49..51: right ring
+    spec(49, JOINT_UNIVERSAL, vec3(-10.0, -15.0, -20.0), vec3(10.0, 15.0, 90.0), mass: 0.014, stiffness: 6.0, torque_max: 5.0),
+    spec(50, JOINT_HINGE, vec3(-5.0, -5.0, -5.0), vec3(5.0, 5.0, 105.0), mass: 0.01, stiffness: 5.0, torque_max: 4.0),
+    spec(51, JOINT_HINGE, vec3(-5.0, -5.0, -5.0), vec3(5.0, 5.0, 85.0), mass: 0.007, stiffness: 4.0, torque_max: 3.0),
+    // 52..54: right little
+    spec(52, JOINT_UNIVERSAL, vec3(-10.0, -20.0, -20.0), vec3(10.0, 20.0, 90.0), mass: 0.011, stiffness: 5.0, torque_max: 4.0),
+    spec(53, JOINT_HINGE, vec3(-5.0, -5.0, -5.0), vec3(5.0, 5.0, 105.0), mass: 0.008, stiffness: 4.0, torque_max: 3.0),
+    spec(54, JOINT_HINGE, vec3(-5.0, -5.0, -5.0), vec3(5.0, 5.0, 85.0), mass: 0.006, stiffness: 3.0, torque_max: 2.5),
+]
+
+/// Total physical body mass (kg) summed over all active biomechanical segments.
+pub fn total_mass() -> f32 {
+    var m = 0.0
+    for i in 0..55 {
+        m += ANATOMY[i].mass
+    }
+    m
+}
+
+/// 3-point foot support contact points in body-space at rest (relative to the foot/toe joints, m):
+/// heel pad, inner/outer metatarsal ball pads, and toe tip, so stance and push-off model true
+/// heel -> flat -> toe-off foot roll.
+pub struct FootPads: Copy {
+    pub heel: vec3,
+    pub ball_inner: vec3,
+    pub ball_outer: vec3,
+    pub toe_tip: vec3,
+}
+
+/// Palm and 5 fingertip positions in world/body space for grasping exact `Field` surfaces.
+pub struct HandContacts: Copy {
+    pub palm: vec3,
+    pub thumb_tip: vec3,
+    pub index_tip: vec3,
+    pub middle_tip: vec3,
+    pub ring_tip: vec3,
+    pub little_tip: vec3,
+}
+
+/// Logarithm of a unit quaternion: the rotation vector `r = theta * axis` (`|r| <= PI`) whose
+/// `exp(r)` equals `q` (choosing the shorter hemisphere `q.w >= 0`).
+pub fn quat_log(q: Quat) -> vec3 {
+    var v = q.v
+    if v.w < 0.0 {
+        v = -v
+    }
+    let s = length(v.xyz)
+    if s < 1.0e-7 {
+        return v.xyz * 2.0
+    }
+    let theta = 2.0 * atan2(s, clamp(v.w, -1.0, 1.0))
+    v.xyz * (theta / s)
+}
+
+/// Converts a bone's local turn `q` (in its parent's frame) into a body-frame delta rotation
+/// relative to its T-pose rest orientation (`rest_world` of the bone and its parent).
+pub fn to_body_delta(q: Quat, own_rest_world: Quat, parent_rest_world: Quat) -> Quat {
+    parent_rest_world.mul(q).mul(own_rest_world.inverse())
+}
+
+/// Converts a body-frame delta rotation `delta` back into the bone's local turn in its parent.
+pub fn from_body_delta(delta: Quat, own_rest_world: Quat, parent_rest_world: Quat) -> Quat {
+    parent_rest_world.inverse().mul(delta).mul(own_rest_world)
+}
+
+/// Returns how many radians bone `b` of `pose` violates its anatomical limits (`0.0` when valid).
+pub fn joint_violation(rig: Rig, pose: Pose, b: u32) -> f32 {
+    if b >= rig.bones.len() {
+        return 0.0
+    }
+    let vrm = rig.bones[b].vrm
+    if vrm == 0 || vrm >= 55 {
+        return 0.0
+    }
+    let rw = rig.rest_frames()
+    let p = rig.bones[b].parent
+    let up = if p == NONE { rig.base.q } else { rw[p].q }
+    let d = to_body_delta(pose.turns[b], rw[b].q, up)
+    let r = quat_log(d)
+    let sp = ANATOMY[vrm]
+    let c = clamp(r, sp.lo, sp.hi)
+    length(r - c)
+}
+
+/// Clamps every bone of `pose` strictly within its physiological `ANATOMY` limits in body-aligned
+/// coordinates. Returns the clamped pose and the maximum violation (rad) that was corrected.
+pub fn clamp_pose_to_anatomy(rig: Rig, pose: Pose) -> (Pose, f32) {
+    let rw = rig.rest_frames()
+    var out = pose
+    var max_v = 0.0
+    let nb = rig.bones.len()
+    for b in 0..nb {
+        let vrm = rig.bones[b].vrm
+        if vrm == 0 || vrm >= 55 {
+            continue
+        }
+        let p = rig.bones[b].parent
+        let up = if p == NONE { rig.base.q } else { rw[p].q }
+        let d = to_body_delta(pose.turns[b], rw[b].q, up)
+        let r = quat_log(d)
+        let sp = ANATOMY[vrm]
+        let c = clamp(r, sp.lo, sp.hi)
+        let err = length(r - c)
+        if err > max_v {
+            max_v = err
+        }
+        if err > 1.0e-6 {
+            out.turns[b] = from_body_delta(exp(c), rw[b].q, up)
+        }
+    }
+    (out, max_v)
+}
+
+/// Couples upper-arm elevation & forward reach naturally into clavicle elevation & protraction
+/// (`leftShoulder` / `rightShoulder`), matching human scapulohumeral rhythm (~25% clavicle share
+/// past 25° of humeral lift) so raising an arm to reach a table never pinches the shoulder.
+pub fn apply_clavicle_coupling(rig: Rig, pose: Pose) -> Pose {
+    let rw = rig.rest_frames()
+    var out = pose
+    let sides_clav = [17, 21]
+    let sides_arm = [18, 22]
+    for s in 0..2 {
+        let cb = rig.of[sides_clav[s]]
+        let ab = rig.of[sides_arm[s]]
+        if cb == NONE || ab == NONE {
+            continue
+        }
+        let sign_x = if s == 0 { 1.0 } else { -1.0 }
+        let cp = rig.bones[cb].parent
+        let ap = rig.bones[ab].parent
+        let cup = if cp == NONE { rig.base.q } else { rw[cp].q }
+        let aup = if ap == NONE { rig.base.q } else { rw[ap].q }
+        let arm_r = quat_log(to_body_delta(out.turns[ab], rw[ab].q, aup))
+        // Arm elevation above horizontal: +z on left arm raises arm; -z on right arm raises arm.
+        let elev = max(arm_r.z * sign_x, 0.0)
+        // Forward reach: -y on left arm swings arm forward (+z); +y on right arm swings forward.
+        let reach = max(-arm_r.y * sign_x, 0.0)
+        let clav_elev = clamp(elev * 0.25, 0.0, 22.0 * DEG)
+        let clav_prot = clamp(reach * 0.18, 0.0, 16.0 * DEG)
+        let clav_r = vec3(0.0, -clav_prot * sign_x, clav_elev * sign_x)
+        let clav_d = exp(clav_r)
+        out.turns[cb] = from_body_delta(clav_d, rw[cb].q, cup)
+        // Compensate upper arm by the inverse clavicle delta so the hand keeps its target aim.
+        let new_arm_d = clav_d.inverse().mul(to_body_delta(out.turns[ab], rw[ab].q, aup))
+        out.turns[ab] = from_body_delta(new_arm_d, rw[ab].q, aup)
+    }
+    out
+}
+
+/// Applies physiological 5-finger curl (`0.0` = relaxed open, `1.0` = full wrap grasp) and thumb
+/// opposition to either hand (`left = true` for left hand, `false` for right hand).
+pub fn apply_finger_grasp(
+    rig: Rig,
+    pose: Pose,
+    left: bool,
+    thumb_curl: f32,
+    index_curl: f32,
+    middle_curl: f32,
+    ring_curl: f32,
+    little_curl: f32,
+    splay: f32,
+) -> Pose {
+    let rw = rig.rest_frames()
+    var out = pose
+    let sign_z = if left { -1.0 } else { 1.0 }
+    let sign_y = if left { -1.0 } else { 1.0 }
+    let base_vrm: u32 = if left { 25 } else { 40 }
+    // Thumb CMC opposition + proximal/distal flexion
+    let t0 = rig.of[base_vrm]
+    let t1 = rig.of[base_vrm + 1]
+    let t2 = rig.of[base_vrm + 2]
+    let tc = clamp(thumb_curl, 0.0, 1.0)
+    if t0 != NONE {
+        let p = rig.bones[t0].parent
+        let up = if p == NONE { rig.base.q } else { rw[p].q }
+        let d = exp(vec3(tc * 0.35, sign_y * tc * 0.65, sign_z * tc * 0.25))
+        out.turns[t0] = from_body_delta(d, rw[t0].q, up)
+    }
+    if t1 != NONE {
+        let p = rig.bones[t1].parent
+        let up = if p == NONE { rig.base.q } else { rw[p].q }
+        let d = exp(vec3(0.0, sign_y * tc * 0.72, 0.0))
+        out.turns[t1] = from_body_delta(d, rw[t1].q, up)
+    }
+    if t2 != NONE {
+        let p = rig.bones[t2].parent
+        let up = if p == NONE { rig.base.q } else { rw[p].q }
+        let d = exp(vec3(0.0, sign_y * tc * 0.85, 0.0))
+        out.turns[t2] = from_body_delta(d, rw[t2].q, up)
+    }
+    // Four fingers: index, middle, ring, little (3 joints each: MCP, PIP, DIP)
+    let curls = [index_curl, middle_curl, ring_curl, little_curl]
+    let splays = [1.0, 0.25, -0.35, -0.95]
+    for f in 0..4 {
+        let c = clamp(curls[f], 0.0, 1.0)
+        let f_base = base_vrm + 3 + f * 3
+        let angles = [c * 1.15, c * 1.35, c * 0.95]
+        for j in 0..3 {
+            let b = rig.of[f_base + j]
+            if b == NONE {
+                continue
+            }
+            let p = rig.bones[b].parent
+            let up = if p == NONE { rig.base.q } else { rw[p].q }
+            let yaw = if j == 0 { sign_y * splay * splays[f] * 0.22 } else { 0.0 }
+            let d = exp(vec3(0.0, yaw, sign_z * angles[j]))
+            out.turns[b] = from_body_delta(d, rw[b].q, up)
+        }
+    }
+    out
+}
+
+/// Computes the 4 foot support pad points (`heel`, `ball_inner`, `ball_outer`, `toe_tip`) in body
+/// space from the posed bone world frames (`pose_world(rig, pose)`).
+pub fn foot_pads(rig: Rig, world: [Rigid; 64], left: bool) -> FootPads {
+    let rw = rig.rest_frames()
+    let foot_b = rig.of[if left { 11 } else { 15 }]
+    let toe_b = rig.of[if left { 12 } else { 16 }]
+    let foot_f = world[foot_b]
+    let toe_f = world[toe_b]
+    let foot_r = rw[foot_b]
+    let toe_r = rw[toe_b]
+    let side = if left { 1.0 } else { -1.0 }
+    // Rest-pose foot pad offsets in body coordinates (derived from the Quaternius/VRM foot height
+    // where ankle is at y ≈ 0.086 m and ball/toe base is at y ≈ 0.015 m, sole touching y = 0.0).
+    let heel_off = foot_r.q.inverse().rotate(vec3(0.0, -foot_r.t.y, -0.055))
+    let ball_in_off = toe_r.q.inverse().rotate(vec3(-0.032 * side, -toe_r.t.y, 0.005))
+    let ball_out_off = toe_r.q.inverse().rotate(vec3(0.038 * side, -toe_r.t.y, -0.005))
+    let toe_tip_off = toe_r.q.inverse().rotate(vec3(0.0, -toe_r.t.y, 0.095))
+    FootPads {
+        heel: foot_f.t + foot_f.q.rotate(heel_off),
+        ball_inner: toe_f.t + toe_f.q.rotate(ball_in_off),
+        ball_outer: toe_f.t + toe_f.q.rotate(ball_out_off),
+        toe_tip: toe_f.t + toe_f.q.rotate(toe_tip_off),
+    }
+}
+
+/// Computes palm center and all 5 fingertip world positions in body space for grasp verification
+/// and exact `Field`-surface finger wrapping.
+pub fn hand_contacts(rig: Rig, world: [Rigid; 64], left: bool) -> HandContacts {
+    let rw = rig.rest_frames()
+    let side = if left { 1.0 } else { -1.0 }
+    let hand_b = rig.of[if left { 20 } else { 24 }]
+    let base_vrm: u32 = if left { 25 } else { 40 }
+    let palm_off = rw[hand_b].q.inverse().rotate(vec3(0.062 * side, -0.022, 0.0))
+    let palm = world[hand_b].t + world[hand_b].q.rotate(palm_off)
+
+    let tip_at = |vrm_distal: u32, len: f32| -> vec3 {
+        let b = rig.of[vrm_distal]
+        if b == NONE {
+            return palm
+        }
+        let off = rw[b].q.inverse().rotate(vec3(len * side, 0.0, 0.0))
+        world[b].t + world[b].q.rotate(off)
+    }
+
+    HandContacts {
+        palm,
+        thumb_tip: tip_at(base_vrm + 2, 0.028),
+        index_tip: tip_at(base_vrm + 5, 0.024),
+        middle_tip: tip_at(base_vrm + 8, 0.026),
+        ring_tip: tip_at(base_vrm + 11, 0.024),
+        little_tip: tip_at(base_vrm + 14, 0.020),
+    }
+}
+
+// ---- unit tests --------------------------------------------------------------------------------
+
+@test
+fn humanoid_anatomy_has_realistic_mass_and_valid_limits() {
+    let m = total_mass()
+    assert(m > 70.0 && m < 80.0, f"humanoid mass {m} kg should be realistic (~75 kg)")
+    for i in 0..55 {
+        let s = ANATOMY[i]
+        assert(s.vrm == i, f"VRM index mismatch at {i}")
+        assert(
+            s.lo.x <= s.hi.x && s.lo.y <= s.hi.y && s.lo.z <= s.hi.z,
+            f"inverted limits at VRM bone {i}",
+        )
+    }
+    // Knees (10, 14) must forbid hyperextension (lo.x >= 0) and allow deep flexion (>= 140°).
+    assert(ANATOMY[10].lo.x >= 0.0 && ANATOMY[10].hi.x >= 140.0 * DEG)
+    assert(ANATOMY[14].lo.x >= 0.0 && ANATOMY[14].hi.x >= 140.0 * DEG)
+}
+
+@test
+fn quat_log_exp_roundtrips_cleanly() {
+    let axes = [
+        vec3(0.4, -0.2, 0.7),
+        vec3(-1.1, 0.0, 0.3),
+        vec3(0.0, 0.0, 0.0),
+        vec3(0.0, 2.2, 0.0),
+    ]
+    for r in axes {
+        let r2 = quat_log(exp(r))
+        assert(length(r2 - r) < 1.0e-5, f"log(exp({r})) = {r2}")
+    }
+}

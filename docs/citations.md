@@ -5,9 +5,11 @@ If a line here is wrong, fix it in the same change that makes it wrong. The tool
 from `rywible/wrela-compiler` at 0.33.0 on 2026-11-15; its record before the split on 2026-10-21
 is in `rywible/wrela`'s `docs/process.md`.
 
-Claude and Codex agents write almost all of the code, tests and docs; Ryan decides the goals and
-the architecture, and merges every change. No generative image, sound, music, voice or video
-model makes anything here.
+Claude, Codex, and Antigravity agents write almost all of the code, tests and docs; Ryan decides
+the goals and the architecture, and merges every change. Offline 2D reference generation,
+open-weight 2D→3D geometry/PBR fitting, and neural motion training (run on Google Colab via
+`google-colab-cli`) are used as authoring compilers that emit pure Wrela `Field<Substance>` code
+and compact deterministic motion weights; no prebaked mesh or voxel asset ships at runtime.
 
 The engine was begun again on a clean slate on 2026-11-18 (branch `engine`, merged into `backend`;
 docs/design.md), and replaced its per-pixel raymarcher (`Sight`, `lib/engine/picture/pixels.wrela`,
@@ -23,6 +25,12 @@ names it in git history. What was carried across names its current place.
 | [Claude Code](https://claude.com/claude-code) (Anthropic), mostly Claude Opus 5.5 | Service | Writes the code, tests and docs, and researches sources |
 | [OpenAI Codex](https://openai.com/codex/) (GPT-6, GPT-6.1) | Service | Reviews performance and security, and implements fixes with their regression tests |
 | GPT-6.1-Sol and GPT-6-Astra (OpenAI) | Service | Read-only reviewers in a council on a plan or a pull request; they do not edit |
+| Google Antigravity & built-in `image-generator` | Service | Agentic coding, research, and offline multi-view 2D concept generation for the 2D→3D→Field compiler |
+| [google-colab-cli](https://github.com/googlecolab/google-colab-cli) (Google Colab) | Apache-2.0 | Official headless CLI used to run GPU 2D→3D→Field fitting and `NeuralMotion` training jobs on Colab (`T4`/`L4`/`A100`) and download pure Wrela weights/modules |
+| [MuJoCo / MJX](https://github.com/google-deepmind/mujoco) (Google DeepMind) | Apache-2.0 | Physics simulation used offline on Colab (`A100`) to validate our exported Wrela humanoid biomechanical spec and train physics-grounded `NeuralMotion` policies; nothing of it ships in the engine |
+| V. Sitzmann, J. N. P. Martel, A. W. Bergman, D. B. Lindell and G. Wetzstein, "Implicit Neural Representations with Periodic Activation Functions" (SIREN, *NeurIPS* 2020) | Published method | Periodic-activation residual coordinate MLP used in `std::field::BoundedResidual` for compact, continuous, differentiable surface & `Substance` detail on top of analytical base fields |
+| M. Macklin, M. Müller and N. Chentanez, "XPBD: Position-Based Simulation of Compliant Constrained Dynamics" (*MIG* 2016) | Published method | Real-time cloth constraint solver in `lib/kit/motion/cloth.wrela`, collided directly against exact body and world SDFs |
+| D. Holden, O. Kanoun, M. Perepichka and T. Popa, "Learned Motion Matching" (*SIGGRAPH* 2020); S. Starke, I. Mason and T. Komura, "DeepPhase: Periodic Autoencoders for Learning Motion Phase Manifolds" (*SIGGRAPH* 2022); Y. Zhou et al., "On the Continuity of Rotation Representations in Neural Networks" (*CVPR* 2019) | Published methods | Architecture and 6D continuous rotation representation for `lib/kit/motion/neural.wrela` and our Colab motion trainer |
 | [Binaryen](https://github.com/WebAssembly/binaryen) `wasm-opt` 133 | Apache-2.0 | Shrinks a build's WASM (`wrela build --optimize`, `-Oz`) and keeps its trap locations as a source map. Found on the machine; it runs at build time, and nothing of it ships in a game |
 | Khronos [SPIRV-Tools](https://github.com/KhronosGroup/SPIRV-Tools) (`spirv-val`, `spirv-dis`), the [Vulkan validation layers](https://github.com/KhronosGroup/Vulkan-ValidationLayers) 1.3.275 and gdb, as Ubuntu 24.04 packages them; SPIRV-Tools 2026.4 from Homebrew on the Mac | Apache-2.0; GPL-3.0 (gdb) | To check the compiler's SPIR-V (`spirv-val`, on both machines: the test suite runs every SPIR-V module it builds through it, `toolchain/shader/src/offline.rs`, and `wrela shaders` (`tools/shaders`) a build's, through it) and the host's Vulkan use, and to find where RADV crashed (docs/vulkan.md). Nothing of them is in the toolchain |
 | Apple's offline Metal compiler (`xcrun metal`, MetalToolchain 17.3) | Apple's Xcode licence; found on the machine | The test suite compiles every MSL shader the compiler writes with it, warnings as errors (`toolchain/shader/src/offline.rs`), and `wrela shaders` (`tools/shaders`) a build's, through it. Nothing of it is in the toolchain |
