@@ -130,6 +130,10 @@ fn command(c: &Command) -> Value {
             "op": "ReadBuffer", "request": request, "handle": handle, "offset": offset,
             "size": size,
         }),
+        Command::ReadSettled { request, handle, offset, size } => json!({
+            "op": "ReadSettled", "request": request, "handle": handle, "offset": offset,
+            "size": size,
+        }),
         Command::StorageRead { request, path } => {
             json!({ "op": "StorageRead", "request": request, "path": path })
         }
@@ -287,6 +291,7 @@ pub(crate) fn golden_batch() -> Vec<u8> {
         .multi_draw_indirect(1, None, [3, 16], [4, NONE, 0], &[], &[])
         .multi_draw_indirect(1, Some([3, 0, 12]), [5, 0], [2, 6, 8], &[], &[])
         .configure_screen(true, 1)
+        .read_settled(17, 1, 0, 8)
         .finish()
 }
 

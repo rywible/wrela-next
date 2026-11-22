@@ -69,6 +69,7 @@ fn golden_bytes() {
         words(&[37, 32, 1, 3, 16, 4, NONE, 0, 0, 0]),          // MultiDrawIndirect
         words(&[38, 44, 1, 3, 0, 12, 5, 0, 2, 6, 8, 0, 0]),    // MultiDrawIndexedIndirect
         words(&[39, 8, 1, 1]),                                 // ConfigureScreen
+        words(&[40, 16, 17, 1, 0, 8]),                         // ReadSettled
     ]
     .concat();
     expected.extend(words(&[VERSION, body.len() as u32]));

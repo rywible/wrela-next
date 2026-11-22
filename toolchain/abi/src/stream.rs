@@ -56,6 +56,7 @@
 //! | 36 | `DrawIndexed` | `pipeline`, `index buffer`, `index offset`, `index size` (as `DrawIndexedIndirect`'s), `indices`, `instances`, `first index`, `base vertex` (an `i32`), `first instance`, the bindings, the uniforms |
 //! | 37 | `MultiDrawIndirect` | `pipeline`, `arguments buffer`, `offset`, `count` (the most draws: `DrawArgs` one after another there), `count buffer` (a `u32` there holds how many of them to draw, or [`NONE`]: all of them), `count offset`, the bindings, the uniforms |
 //! | 38 | `MultiDrawIndexedIndirect` | `pipeline`, `index buffer`, `index offset`, `index size`, `arguments buffer`, `offset`, `count`, `count buffer`, `count offset` (as `MultiDrawIndirect`'s, of `DrawIndexedArgs`), the bindings, the uniforms |
+//! | 40 | `ReadSettled` | `request`, `handle`, `offset`, `size`: the buffer's bytes as `ReadBuffer` reads them, a request answered on the first call after the GPU has done the work recorded before it, without waiting for it: when, the GPU decides (as `Timed`'s) |
 //! | 39 | `ConfigureScreen` | `hdr` (0 or 1), `gamut` (0: sRGB, 1: Display P3): how the screen is shown, from a later frame on; a host that can't, or test mode, keeps it as it was. What the host did, `wrela.limit`'s [`SCREEN_LIMIT`] says. |
 //!
 //! **Requests** (language.md §17.1) are answered on a later call: the program polls each with
@@ -153,10 +154,11 @@ pub enum Opcode {
     MultiDrawIndirect = 37,
     MultiDrawIndexedIndirect = 38,
     ConfigureScreen = 39,
+    ReadSettled = 40,
 }
 
 impl Opcode {
-    pub const ALL: [Opcode; 38] = [
+    pub const ALL: [Opcode; 39] = [
         Opcode::CreateBuffer,
         Opcode::WriteBuffer,
         Opcode::Dispatch,
@@ -195,6 +197,7 @@ impl Opcode {
         Opcode::MultiDrawIndirect,
         Opcode::MultiDrawIndexedIndirect,
         Opcode::ConfigureScreen,
+        Opcode::ReadSettled,
     ];
 
     pub fn from_u32(v: u32) -> Option<Opcode> {
@@ -241,6 +244,7 @@ impl Opcode {
             Opcode::MultiDrawIndirect => "MultiDrawIndirect",
             Opcode::MultiDrawIndexedIndirect => "MultiDrawIndexedIndirect",
             Opcode::ConfigureScreen => "ConfigureScreen",
+            Opcode::ReadSettled => "ReadSettled",
         }
     }
 
@@ -1001,6 +1005,14 @@ pub enum Command<'a> {
         offset: u32,
         size: u32,
     },
+    /// [`Command::ReadBuffer`]'s read, answered once the GPU is done with the work before it,
+    /// without waiting for it.
+    ReadSettled {
+        request: u32,
+        handle: u32,
+        offset: u32,
+        size: u32,
+    },
     StorageRead {
         request: u32,
         path: &'a str,
@@ -1173,6 +1185,7 @@ impl Command<'_> {
             Command::DrawIndirect { .. } => Opcode::DrawIndirect,
             Command::DrawIndexedIndirect { .. } => Opcode::DrawIndexedIndirect,
             Command::ReadBuffer { .. } => Opcode::ReadBuffer,
+            Command::ReadSettled { .. } => Opcode::ReadSettled,
             Command::StorageRead { .. } => Opcode::StorageRead,
             Command::StorageWrite { .. } => Opcode::StorageWrite,
             Command::Fetch { .. } => Opcode::Fetch,
@@ -1220,6 +1233,7 @@ impl Command<'_> {
             | Command::BeginPass(_)
             | Command::EndPass
             | Command::ReadBuffer { .. }
+            | Command::ReadSettled { .. }
             | Command::StorageRead { .. }
             | Command::StorageWrite { .. }
             | Command::Fetch { .. }
@@ -1748,12 +1762,17 @@ pub fn decode(batch: &[u8]) -> Result<Vec<Command<'_>>, StreamError> {
                     uniforms,
                 }
             }
-            Opcode::ReadBuffer => {
+            Opcode::ReadBuffer | Opcode::ReadSettled => {
                 exactly(4)?;
                 if w(2) % 4 != 0 || w(3) % 4 != 0 {
                     return Err(bad("offset and size must be multiples of 4"));
                 }
-                Command::ReadBuffer { request: w(0), handle: w(1), offset: w(2), size: w(3) }
+                let (request, handle, offset, size) = (w(0), w(1), w(2), w(3));
+                if opcode == Opcode::ReadBuffer {
+                    Command::ReadBuffer { request, handle, offset, size }
+                } else {
+                    Command::ReadSettled { request, handle, offset, size }
+                }
             }
             Opcode::StorageRead
             | Opcode::Fetch
@@ -2303,6 +2322,11 @@ impl Encoder {
 
     pub fn read_buffer(&mut self, request: u32, handle: u32, offset: u32, size: u32) -> &mut Self {
         self.command(Opcode::ReadBuffer, &[request, handle, offset, size], &[]);
+        self
+    }
+
+    pub fn read_settled(&mut self, request: u32, handle: u32, offset: u32, size: u32) -> &mut Self {
+        self.command(Opcode::ReadSettled, &[request, handle, offset, size], &[]);
         self
     }
 

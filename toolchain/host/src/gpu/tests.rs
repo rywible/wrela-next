@@ -1214,3 +1214,36 @@ fn a_serial_run_times_a_dispatch_of_no_groups_as_itself() {
     assert_eq!(gpu.read_buffer(1).unwrap(), 0u32.to_le_bytes());
     gpu.check_errors().unwrap();
 }
+
+#[test]
+#[ignore = "needs a GPU"]
+fn a_settled_read_holds_the_work_before_it_and_waits_for_none() {
+    let (manifest, shaders) = increment();
+    let mut gpu = Gpu::new(&manifest, &shaders, Timing::Off, false).unwrap();
+    gpu.create_buffer(1, 4);
+    for _ in 0..3 {
+        gpu.dispatch(0, Ok([1, 1, 1]), &[Binding::range(1, 0, 4)], &[]).unwrap();
+    }
+    // Asked after three increments, it reads three, whatever is recorded after it.
+    assert!(gpu.read_settled(7, 1, 0, 4).is_none(), "answered later, not at once");
+    gpu.dispatch(0, Ok([1, 1, 1]), &[Binding::range(1, 0, 4)], &[]).unwrap();
+    gpu.end_frame().unwrap();
+    let mut answer = Vec::new();
+    for _ in 0..1000 {
+        answer = gpu.settled();
+        if !answer.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert_eq!(answer, vec![(7, Ok(3u32.to_le_bytes().to_vec()))]);
+    assert!(gpu.settled().is_empty(), "answered once");
+    // A read whose device is lost before it's done says so.
+    assert!(gpu.read_settled(8, 1, 0, 4).is_none());
+    gpu.device.lose();
+    gpu.end_frame().unwrap();
+    let lost = gpu.settled();
+    assert_eq!(lost.len(), 1);
+    assert!(lost[0].0 == 8 && lost[0].1.is_err(), "{lost:?}");
+    gpu.check_errors().unwrap();
+}

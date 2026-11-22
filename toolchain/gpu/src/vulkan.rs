@@ -3441,6 +3441,11 @@ pub struct Surface {
     presented: Arc<Mutex<Vec<(u64, std::time::Instant)>>>,
     next_id: u64,
     waiter: Option<Waiter>,
+    /// Held around each call that touches the swapchain from either thread: Vulkan requires host
+    /// access to it to be externally synchronized, `vkWaitForPresentKHR`'s included
+    /// (docs/citations.md). The waiter takes it a millisecond at a time, so presenting never
+    /// waits on it for longer.
+    chain: Arc<Mutex<()>>,
     /// The window, alive while its surface is.
     _window: Arc<dyn Window>,
 }
@@ -3459,17 +3464,37 @@ struct Waiter {
 }
 
 impl Waiter {
-    fn new(device: &Device, presented: Arc<Mutex<Vec<(u64, std::time::Instant)>>>) -> Waiter {
+    fn new(
+        device: &Device,
+        presented: Arc<Mutex<Vec<(u64, std::time::Instant)>>>,
+        held: Arc<Mutex<()>>,
+    ) -> Waiter {
         let fns = ash::khr::present_wait::Device::new(&device.0.instance, &device.0.raw);
         let (asks, waits) = std::sync::mpsc::channel::<Wait>();
         let thread = std::thread::spawn(move || {
             for w in waits {
                 match w {
                     Wait::Present(chain, id) => {
-                        // SAFETY: the swapchain lives until this thread says it's drained.
-                        let r = unsafe { fns.wait_for_present(chain, id + 1, 1_000_000_000) };
-                        if r.is_ok() {
-                            lock(&presented).push((id, std::time::Instant::now()));
+                        // At most a second in all, in waits of a millisecond, each under the
+                        // swapchain's lock (`Surface::chain`) and none longer: the main thread's
+                        // acquisitions and presents take the lock between them.
+                        let began = std::time::Instant::now();
+                        loop {
+                            let r = {
+                                let _held = lock(&held);
+                                // SAFETY: the swapchain lives until this thread says it's
+                                // drained, and its host access is held.
+                                unsafe { fns.wait_for_present(chain, id + 1, 1_000_000) }
+                            };
+                            match r {
+                                Ok(()) => {
+                                    lock(&presented).push((id, std::time::Instant::now()));
+                                    break;
+                                }
+                                Err(vk::Result::TIMEOUT)
+                                    if began.elapsed() < std::time::Duration::from_secs(1) => {}
+                                Err(_) => break,
+                            }
                         }
                     }
                     Wait::Drained(done) => {
@@ -3562,6 +3587,7 @@ impl Device {
             presented: Arc::new(Mutex::new(Vec::new())),
             next_id: 0,
             waiter: None,
+            chain: Arc::new(Mutex::new(())),
             _window: window,
         })
     }
@@ -3777,9 +3803,18 @@ impl Surface {
         let (sem, used) = self.acquired[slot];
         // The semaphore's last wait must be done before it's signalled again.
         self.device.wait(used);
-        // SAFETY: an acquisition signalling an unsignalled semaphore.
-        let (index, _) = unsafe {
-            self.swapchain_fns.acquire_next_image(self.swapchain, u64::MAX, sem, vk::Fence::null())
+        let (index, _) = {
+            let _held = lock(&self.chain);
+            // SAFETY: an acquisition signalling an unsignalled semaphore, the swapchain's host
+            // access held.
+            unsafe {
+                self.swapchain_fns.acquire_next_image(
+                    self.swapchain,
+                    u64::MAX,
+                    sem,
+                    vk::Fence::null(),
+                )
+            }
         }
         .map_err(|e| Error(format!("the swapchain: {e}")))?;
         let view = self.images[index as usize].clone();
@@ -3822,8 +3857,13 @@ impl Surface {
         if self.device.0.present_wait {
             info = info.push_next(&mut present_id);
         }
-        // SAFETY: the image was acquired and its rendering submitted, signalling `rendered`.
-        match unsafe { self.swapchain_fns.queue_present(self.device.0.queue, &info) } {
+        let presented = {
+            let _held = lock(&self.chain);
+            // SAFETY: the image was acquired and its rendering submitted, signalling `rendered`;
+            // the swapchain's host access held.
+            unsafe { self.swapchain_fns.queue_present(self.device.0.queue, &info) }
+        };
+        match presented {
             Ok(_) => {}
             // The window changed under it (a resize between acquiring and presenting): the
             // frame isn't shown, and the swapchain is made again as configured, as an
@@ -3840,7 +3880,8 @@ impl Surface {
         }
         if self.device.0.present_wait {
             let presented = self.presented.clone();
-            let w = self.waiter.get_or_insert_with(|| Waiter::new(&self.device, presented));
+            let held = self.chain.clone();
+            let w = self.waiter.get_or_insert_with(|| Waiter::new(&self.device, presented, held));
             let _ = w.asks.send(Wait::Present(self.swapchain, id));
         }
         Ok(id)

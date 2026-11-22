@@ -221,6 +221,7 @@ macro_rules! lang_items {
                         | Lang::ScreenCommand
                         | Lang::LabelCommand
                         | Lang::ReadBufferCommand
+                        | Lang::ReadSettledCommand
                         | Lang::TimedCommand
                 )
             }
@@ -258,6 +259,7 @@ macro_rules! lang_items {
                     Lang::RequestStatus
                         | Lang::RequestTake
                         | Lang::ReadBufferCommand
+                        | Lang::ReadSettledCommand
                         | Lang::TimedCommand
                         | Lang::Limit
                         | Lang::InputTake
@@ -563,6 +565,7 @@ lang_items! {
     SpanLen = "std::gpu::span_len",
     SpanSub = "std::gpu::span_sub",
     ReadBufferCommand = "std::gpu::read_buffer_command",
+    ReadSettledCommand = "std::gpu::read_settled_command",
     TimedCommand = "std::gpu::timed_command",
     NextRequest = "std::io::next_request",
     RequestStatus = "std::io::request_status",

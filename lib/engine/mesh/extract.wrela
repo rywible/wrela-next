@@ -19,7 +19,7 @@ use std::field::{
 }
 use std::gpu::{
     Append, AppendBuffer, Atomics, DispatchArgs, DrawIndexedArgs, GlobalId, GpuBuffer, GpuSpan, One,
-    Slots, append_buffer, buffer, buffer_of, copy, dispatch, label, read, write,
+    Slots, append_buffer, buffer, buffer_of, copy, dispatch, label, read_settled, write,
 }
 use std::hash::{Hasher, StateHash}
 use std::io::{Pending, print}
@@ -51,10 +51,6 @@ const DEFORM_SLICE: u32 = 262144
 /// The most slices one prepared list is dispatched in: a chunk's creases (`CAP_SURF /
 /// CREASE_SLICE`, rounded up) and a batch's vertices (`8192 · 343 / DEFORM_SLICE`, rounded up).
 const SLICES_MOST: u32 = 16
-/// A thing that extracts every frame has its extraction read back every this many (a readback
-/// stalls the frame that asks): its chunk and crease limits' headroom covers what its surface
-/// grows in that many frames, and past it `took_counts` extracts again.
-const POLL_EVERY: u32 = 32
 /// Normal spread (`Qef::min_dot`) below which a cell is a sharp crease, solved from exact Hermite
 /// edge crossings; and at or above which a vertex is shaded smooth.
 const CREASE_DOT: f32 = 0.78
@@ -1368,14 +1364,16 @@ fn emit_quad(
     tri_count: mut Atomics<u32>,
     indices: mut Atomics<u32>,
     trans_indices: mut Atomics<u32>,
+    cut_indices: mut Atomics<u32>,
 ) {
     if v0 == NONE || v1 == NONE || v2 == NONE || v3 == NONE {
         return
     }
-    let is_trans = unpack_is_trans(verts[v0].packed) ||
-        unpack_is_trans(verts[v1].packed) ||
-        unpack_is_trans(verts[v2].packed) ||
-        unpack_is_trans(verts[v3].packed)
+    let t0 = unpack_is_trans(verts[v0].packed)
+    let t1 = unpack_is_trans(verts[v1].packed)
+    let t2 = unpack_is_trans(verts[v2].packed)
+    let t3 = unpack_is_trans(verts[v3].packed)
+    let is_trans = t0 || t1 || t2 || t3
     let (q0, q1, q2, q3) = quad_order(v0, v1, v2, v3, flip: flip)
     let p = |v: u32| vec3(verts[v].px, verts[v].py, verts[v].pz)
     let n = |v: u32| unpack_oct_normal(verts[v].packed)
@@ -1388,10 +1386,17 @@ fn emit_quad(
         store_quad(mut indices, at, q0, q1, q2, q3, split13: split13)
     } else {
         let at = tri_count.add(i: 1, value: 6)
-        if at + 6 > cap_trans {
-            return
+        if at + 6 <= cap_trans {
+            store_quad(mut trans_indices, at, q0, q1, q2, q3, split13: split13)
         }
-        store_quad(mut trans_indices, at, q0, q1, q2, q3, split13: split13)
+        // A quad only partly transmissive also goes to the cut list, whose opaque pixels the
+        // G-buffer's `_cut_` draw keeps; a wholly transmissive one (glass) has none, and isn't.
+        if !(t0 && t1 && t2 && t3) {
+            let ac = tri_count.add(i: 6, value: 6)
+            if ac + 6 <= cap_trans {
+                store_quad(mut cut_indices, ac, q0, q1, q2, q3, split13: split13)
+            }
+        }
     }
 }
 
@@ -1461,6 +1466,7 @@ fn emit_tris(
     tri_count: mut Atomics<u32>,
     indices: mut Atomics<u32>,
     trans_indices: mut Atomics<u32>,
+    cut_indices: mut Atomics<u32>,
     id: GlobalId,
 ) {
     // 4 workgroups of 64 = 256 lanes per brick (covering 216 owned edge triples).
@@ -1494,6 +1500,7 @@ fn emit_tris(
                 tri_count: mut tri_count,
                 indices: mut indices,
                 trans_indices: mut trans_indices,
+                cut_indices: mut cut_indices,
             )
         }
     }
@@ -1513,6 +1520,7 @@ fn finish_draw(
     tri_count: mut Atomics<u32>,
     args: mut One<DrawIndexedArgs>,
     trans_args: mut One<DrawIndexedArgs>,
+    cut_args: mut One<DrawIndexedArgs>,
     id: GlobalId,
 ) {
     let n = min(tri_count.load(i: 0), cap_indices)
@@ -1531,6 +1539,14 @@ fn finish_draw(
         base_vertex: 0,
         first_instance: 0,
     })
+    let nc = min(tri_count.load(i: 6), cap_trans)
+    cut_args.set(id, DrawIndexedArgs {
+        indices: nc,
+        instances: if nc > 0 { inst_count } else { 0 },
+        first_index: 0,
+        base_vertex: 0,
+        first_instance: 0,
+    })
     tri_count.store(i: 2, value: active_count[0])
     tri_count.store(i: 3, value: vert_count[0])
 }
@@ -1545,6 +1561,7 @@ fn set_instances(
     inst_count: u32,
     args: mut One<DrawIndexedArgs>,
     trans_args: mut One<DrawIndexedArgs>,
+    cut_args: mut One<DrawIndexedArgs>,
     id: GlobalId,
 ) {
     let n = min(tri_count[0], cap_indices)
@@ -1559,6 +1576,14 @@ fn set_instances(
     trans_args.set(id, DrawIndexedArgs {
         indices: nt,
         instances: if nt > 0 { inst_count } else { 0 },
+        first_index: 0,
+        base_vertex: 0,
+        first_instance: 0,
+    })
+    let nc = min(tri_count[6], cap_trans)
+    cut_args.set(id, DrawIndexedArgs {
+        indices: nc,
+        instances: if nc > 0 { inst_count } else { 0 },
         first_index: 0,
         base_vertex: 0,
         first_instance: 0,
@@ -1681,9 +1706,13 @@ pub struct MeshBatch {
     pub is_deformed: bool,
     pub indices: GpuBuffer<u32>,
     pub trans_indices: GpuBuffer<u32>,
+    /// The partly transmissive quads of `trans_indices` again (`emit_quad`): what the G-buffer's
+    /// `_cut_` draw reads, so a wholly transmissive thing's quads never reach the G-buffer.
+    pub cut_indices: GpuBuffer<u32>,
     pub tri_count: GpuBuffer<u32>,
     pub draw_args: GpuBuffer<DrawIndexedArgs>,
     pub trans_draw_args: GpuBuffer<DrawIndexedArgs>,
+    pub cut_draw_args: GpuBuffer<DrawIndexedArgs>,
     pub xforms: GpuBuffer<Rigid>,
     pub prev_xforms: GpuBuffer<Rigid>,
     pub inst_ids: GpuBuffer<u32>,
@@ -1718,11 +1747,11 @@ pub struct MeshBatch {
     pub has_opaque: bool,
     pub has_trans: bool,
     stats_poll: Option<Pending<u32>>,
-    /// Real extractions since the last readback was queued, and the extraction it read. A
-    /// readback stalls the frame that asks (the host answers it on the next call, §17.1), so a
-    /// thing that extracts every frame is read every `POLL_EVERY` extractions, and one that has
-    /// settled once after its last.
-    since_poll: u32,
+    /// The extraction last read back. Every real extraction is read, as a settled read
+    /// (`std::gpu::read_settled`): answered once the GPU has done it, a frame or two later, and
+    /// never by stalling a frame; one at a time, so a thing that extracts every frame has its
+    /// limits from an extraction at most a few frames old, which their headroom covers (and past
+    /// it `took_counts` extracts again).
     polled_gen: u32,
     /// How many times `tri_count` has been rewritten (extractions and emptyings), whether the
     /// latest was a real extraction, and the cell scale it ran at.
@@ -1777,7 +1806,8 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
         is_deformed: false,
         indices: buffer(6),
         trans_indices: buffer(6),
-        tri_count: buffer_of([0, 0, 0, 0, 0, 0]),
+        cut_indices: buffer(6),
+        tri_count: buffer_of([0, 0, 0, 0, 0, 0, 0]),
         draw_args: buffer_of(
             [
                 DrawIndexedArgs {
@@ -1790,6 +1820,17 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
             ],
         ),
         trans_draw_args: buffer_of(
+            [
+                DrawIndexedArgs {
+                    indices: 0,
+                    instances: 0,
+                    first_index: 0,
+                    base_vertex: 0,
+                    first_instance: 0,
+                },
+            ],
+        ),
+        cut_draw_args: buffer_of(
             [
                 DrawIndexedArgs {
                     indices: 0,
@@ -1829,7 +1870,6 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
         has_opaque: true,
         has_trans: true,
         stats_poll: None,
-        since_poll: 0,
         polled_gen: 0,
         gen: 0,
         gen_real: false,
@@ -1926,6 +1966,7 @@ impl MeshBatch {
         }
         if cap_trans > self.cap_trans {
             self.trans_indices = buffer(cap_trans)
+            self.cut_indices = buffer(cap_trans)
             self.cap_trans = cap_trans
         }
         self.cap_bricks = cap
@@ -2025,18 +2066,14 @@ impl MeshBatch {
     /// mid-frame inside `run_extract`, so extraction never forces GPU submission flushes).
     pub fn maybe_queue_poll(mut self) {
         self.finish_poll()
-        // Read the latest real extraction, not yet read, once the thing has settled (a frame
-        // without extracting), or it has none read yet, or it extracts every frame and
-        // `POLL_EVERY` have gone unread.
-        let due = self.gen_real &&
-            self.gen != self.polled_gen &&
-            (self.still_frames >= 1 || self.active_hint == 0 || self.since_poll >= POLL_EVERY)
+        // Read the latest real extraction not yet read, settled: it costs the frame nothing.
+        let due = self.gen_real && self.gen != self.polled_gen
         if !due {
             return
         }
         match self.stats_poll {
             None => {
-                self.stats_poll = Some(read(self.tri_count.items()))
+                self.stats_poll = Some(read_settled(self.tri_count.items()))
                 self.poll_gen = self.gen
                 self.poll_real = self.gen_real
                 self.poll_scale = self.extract_scale
@@ -2049,7 +2086,6 @@ impl MeshBatch {
                     self.max_bricks,
                 )
                 self.polled_gen = self.gen
-                self.since_poll = 0
             },
             Some(_) => {},
         }
@@ -2127,9 +2163,6 @@ impl MeshBatch {
         self.extract_scale = self.cell_scale
         self.has_opaque = real
         self.has_trans = real
-        if real {
-            self.since_poll += 1
-        }
     }
 
     /// Each of this frame's instance slots' previous-frame transform, matched by thing (`ids`
@@ -2493,7 +2526,7 @@ impl MeshBatch {
             return
         }
         if vis_count == 0 {
-            write(mut self.tri_count, 0, [0, 0, 0, 0, 0, 0])
+            write(mut self.tri_count, 0, [0, 0, 0, 0, 0, 0, 0])
             scratch.active.clear()
             dispatch(
                 finish_draw.bind(
@@ -2505,6 +2538,7 @@ impl MeshBatch {
                     tri_count: mut self.tri_count,
                     args: mut self.draw_args,
                     trans_args: mut self.trans_draw_args,
+                    cut_args: mut self.cut_draw_args,
                 ),
                 over: 1,
             )
@@ -2567,6 +2601,7 @@ impl MeshBatch {
                             inst_count: vis_count,
                             args: mut self.draw_args,
                             trans_args: mut self.trans_draw_args,
+                            cut_args: mut self.cut_draw_args,
                         ),
                         over: 1,
                     )
@@ -2653,6 +2688,7 @@ impl MeshBatch {
                             inst_count: vis_count,
                             args: mut self.draw_args,
                             trans_args: mut self.trans_draw_args,
+                            cut_args: mut self.cut_draw_args,
                         ),
                         over: 1,
                     )
@@ -2783,7 +2819,7 @@ impl MeshBatch {
         let effective_cap = min(self.cap_bricks, scratch.max_bricks)
         scratch.active.clear()
         self.verts.clear()
-        write(mut self.tri_count, 0, [0, 0, 0, 0, 0, 0])
+        write(mut self.tri_count, 0, [0, 0, 0, 0, 0, 0, 0])
 
         let grids = scratch.grids.items()
 
@@ -2926,6 +2962,7 @@ impl MeshBatch {
                     tri_count: mut self.tri_count,
                     indices: mut self.indices,
                     trans_indices: mut self.trans_indices,
+                    cut_indices: mut self.cut_indices,
                 ),
                 groups: scratch.quad_args.at(0),
                 most: chunk_n * 4,
@@ -2943,6 +2980,7 @@ impl MeshBatch {
                 tri_count: mut self.tri_count,
                 args: mut self.draw_args,
                 trans_args: mut self.trans_draw_args,
+                cut_args: mut self.cut_draw_args,
             ),
             over: 1,
         )
@@ -2968,7 +3006,7 @@ impl MeshBatch {
         let effective_cap = min(self.cap_bricks, scratch.max_bricks)
         scratch.active.clear()
         self.verts.clear()
-        write(mut self.tri_count, 0, [0, 0, 0, 0, 0, 0])
+        write(mut self.tri_count, 0, [0, 0, 0, 0, 0, 0, 0])
 
         let grids = scratch.grids.items()
         var first: u32 = 0
@@ -3108,6 +3146,7 @@ impl MeshBatch {
                     tri_count: mut self.tri_count,
                     indices: mut self.indices,
                     trans_indices: mut self.trans_indices,
+                    cut_indices: mut self.cut_indices,
                 ),
                 groups: scratch.quad_args.at(0),
                 most: chunk_n * 4,
@@ -3125,6 +3164,7 @@ impl MeshBatch {
                 tri_count: mut self.tri_count,
                 args: mut self.draw_args,
                 trans_args: mut self.trans_draw_args,
+                cut_args: mut self.cut_draw_args,
             ),
             over: 1,
         )

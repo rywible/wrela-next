@@ -472,6 +472,17 @@ struct Timed {
     at: u64,
 }
 
+/// A program's settled read (`std::gpu::read_settled`): its copy, made after the work recorded
+/// before it, and the submission it is in, once submitted.
+struct Settling {
+    request: u32,
+    staging: wrela_gpu::Buffer,
+    size: u64,
+    done_at: Option<wrela_gpu::SubmissionIndex>,
+    /// The device it was copied on was lost.
+    lost: bool,
+}
+
 /// A program's ask for a label's time (`std::gpu::timed`).
 struct Ask {
     request: u32,
@@ -903,6 +914,9 @@ pub(crate) struct Gpu {
     labelled_order: Vec<Arc<str>>,
     /// The program's asks for a label's time (`std::gpu::timed`) not yet answered.
     asked: Vec<Ask>,
+    /// The program's settled reads (`std::gpu::read_settled`) not yet answered, in the order
+    /// asked.
+    settling: Vec<Settling>,
     /// The calls ended so far: a timing's call, and an ask's.
     calls: usize,
     /// The display's guard: how far behind the GPU is on this run's frames.
@@ -1167,6 +1181,7 @@ impl Gpu {
             labelled: HashMap::new(),
             labelled_order: Vec::new(),
             asked: Vec::new(),
+            settling: Vec::new(),
             calls: 0,
             behind: Behind::new(),
             indirect,
@@ -1284,6 +1299,7 @@ impl Gpu {
         // The retiring program's asks for a time and its labels' targets go with it: a later
         // build's requests reuse its numbers, and its handles name other resources.
         self.asked.clear();
+        self.settling.clear();
         self.labelled.clear();
         self.labelled_order.clear();
         // Its largest read sized these; the next build makes its own as it reads.
@@ -2136,6 +2152,9 @@ impl Gpu {
         self.upload.write(&self.device, &mut self.counters);
         let index = self.device.submit(vec![encoder.finish()]);
         self.submissions += 1;
+        for s in self.settling.iter_mut().filter(|s| s.done_at.is_none()) {
+            s.done_at = Some(index);
+        }
         if self.device.has_clock() {
             let (alone, pieces) = match self.job_piece.take() {
                 Some(p) => (true, vec![p]),
@@ -3549,6 +3568,11 @@ impl Gpu {
         fresh.labelled = std::mem::take(&mut self.labelled);
         fresh.labelled_order = std::mem::take(&mut self.labelled_order);
         fresh.asked = std::mem::take(&mut self.asked);
+        // A settled read's copy was on the lost device: it says so, on the next call.
+        fresh.settling = std::mem::take(&mut self.settling)
+            .into_iter()
+            .map(|s| Settling { lost: true, ..s })
+            .collect();
         // An ask not yet answered times its label's work on the new device: the program's own
         // timer (`ask_time`) is made again there, and each ask starts at what that timer has
         // noted (the old timer's count means nothing to it).
@@ -3808,6 +3832,7 @@ impl Executor for Gpu {
             | Command::DestroySampler { handle } => self.destroy(*handle),
             // Requests are the program's host's business (`program`), not the GPU's.
             Command::ReadBuffer { .. }
+            | Command::ReadSettled { .. }
             | Command::StorageRead { .. }
             | Command::StorageWrite { .. }
             | Command::Fetch { .. }
@@ -3872,6 +3897,62 @@ impl Executor for Gpu {
 
     fn read_back(&mut self, handle: u32, offset: u32, size: u32) -> Result<Vec<u8>> {
         self.read_range(handle, offset, size)
+    }
+
+    /// Copies the range, after the work recorded so far, into a buffer of its own, and answers
+    /// once its submission is done ([`Executor::settled`]): nothing waits for the GPU.
+    fn read_settled(
+        &mut self,
+        request: u32,
+        handle: u32,
+        offset: u32,
+        size: u32,
+    ) -> Option<Result<Vec<u8>>> {
+        if let Err(e) = self.record_ended() {
+            return Some(Err(e));
+        }
+        let Some(Resource::Buffer(buffer)) = self.resources.get(&handle) else {
+            return Some(Err(self.no_buffer(handle)));
+        };
+        let buffer = buffer.clone();
+        let staging = readback_buffer(&self.device, u64::from(size.max(4)));
+        let mut encoder = self.take_encoder();
+        encoder.copy_buffer_to_buffer(&buffer, u64::from(offset), &staging, 0, u64::from(size));
+        self.encoder = Some(encoder);
+        self.settling.push(Settling {
+            request,
+            staging,
+            size: u64::from(size),
+            done_at: None,
+            lost: false,
+        });
+        None
+    }
+
+    fn settled(&mut self) -> Vec<(u32, std::result::Result<Vec<u8>, String>)> {
+        let done = self.device.completed();
+        let mut answered = Vec::new();
+        self.settling.retain(|s| {
+            let answer = if s.lost {
+                Err("the device was lost before the read's work was done".to_string())
+            } else {
+                match s.done_at {
+                    Some(at) if at <= done => {
+                        // Its submission is done: mapping it doesn't wait.
+                        let mapped = align_to(s.size, wrela_gpu::COPY_BUFFER_ALIGNMENT)
+                            .clamp(4, s.staging.size());
+                        s.staging
+                            .read(0, mapped)
+                            .map(|bytes| bytes[..s.size as usize].to_vec())
+                            .map_err(|e| e.0)
+                    }
+                    _ => return true,
+                }
+            };
+            answered.push((s.request, answer));
+            false
+        });
+        answered
     }
 
     fn limits(&self) -> wrela_abi::Limits {

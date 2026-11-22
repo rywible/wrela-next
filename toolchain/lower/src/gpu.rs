@@ -1691,6 +1691,7 @@ pub(crate) fn intrinsic(
         }
         Some(
             l @ (Lang::ReadBufferCommand
+            | Lang::ReadSettledCommand
             | Lang::TimedCommand
             | Lang::StorageReadCommand
             | Lang::StorageWriteCommand
@@ -1706,6 +1707,7 @@ pub(crate) fn intrinsic(
             // URL, the bytes to store, a line to print, a label, a build's path.
             let (opcode, words) = match l {
                 Lang::ReadBufferCommand => (Opcode::ReadBuffer, 4),
+                Lang::ReadSettledCommand => (Opcode::ReadSettled, 4),
                 Lang::TimedCommand => (Opcode::Timed, 1),
                 Lang::StorageReadCommand => (Opcode::StorageRead, 1),
                 Lang::StorageWriteCommand => (Opcode::StorageWrite, 1),

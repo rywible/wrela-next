@@ -489,7 +489,8 @@ impl Checker {
             Command::WriteBuffer { handle, offset, data } => {
                 self.range(op, *handle, *offset, data.len() as u32, "writing")?;
             }
-            Command::ReadBuffer { handle, offset, size, .. } => {
+            Command::ReadBuffer { handle, offset, size, .. }
+            | Command::ReadSettled { handle, offset, size, .. } => {
                 self.range(op, *handle, *offset, *size, "reading")?;
             }
             Command::CopyBuffer {

@@ -241,6 +241,23 @@ pub(crate) trait Executor: 'static {
     /// A buffer's bytes `offset..offset + size`, for a `ReadBuffer` request: the GPU's work
     /// recorded so far, done.
     fn read_back(&mut self, handle: u32, offset: u32, size: u32) -> Result<Vec<u8>>;
+    /// A buffer's bytes `offset..offset + size`, for a `ReadSettled` request: the answer now, if
+    /// this host has it at once ([`Executor::read_back`]'s, by default), or `None` when it comes
+    /// later, from [`Executor::settled`], once the GPU is done with the work recorded so far.
+    fn read_settled(
+        &mut self,
+        _request: u32,
+        handle: u32,
+        offset: u32,
+        size: u32,
+    ) -> Option<Result<Vec<u8>>> {
+        Some(self.read_back(handle, offset, size))
+    }
+    /// The `ReadSettled` requests the GPU has done the work before, answered now: each request
+    /// and its bytes (or why not).
+    fn settled(&mut self) -> Vec<(u32, std::result::Result<Vec<u8>, String>)> {
+        Vec::new()
+    }
     /// The device's limits, which commands are checked against and `wrela.limit` gives.
     fn limits(&self) -> wrela_abi::Limits {
         wrela_abi::Limits::HERE
@@ -685,6 +702,7 @@ impl<E: Executor> State<E> {
             }
             match &cmd {
                 Command::ReadBuffer { request, .. }
+                | Command::ReadSettled { request, .. }
                 | Command::StorageRead { request, .. }
                 | Command::StorageWrite { request, .. }
                 | Command::Fetch { request, .. }
@@ -715,6 +733,15 @@ impl<E: Executor> State<E> {
                 let answer =
                     self.executor.read_back(*handle, *offset, *size).map_err(|e| e.to_string());
                 self.requests.arriving.push((*request, answer));
+            }
+            Command::ReadSettled { request, handle, offset, size } => {
+                self.requests.start(*request, cmd.opcode())?;
+                match self.executor.read_settled(*request, *handle, *offset, *size) {
+                    Some(answer) => {
+                        self.requests.arriving.push((*request, answer.map_err(|e| e.to_string())))
+                    }
+                    None => self.requests.waiting.push(*request),
+                }
             }
             // A record posted into the ticks (runtime/abi `input`): never answered.
             Command::HostRequest { service, body, .. } if *service == SERVICE_POST => {
@@ -1751,7 +1778,9 @@ impl<E: Executor> Program<E> {
         }
         // The times asked for that this call's work answered: the program sees them from its
         // next call on.
-        for (request, answer) in state.executor.times() {
+        // And the settled reads whose work is done.
+        for (request, answer) in state.executor.times().into_iter().chain(state.executor.settled())
+        {
             state.requests.waiting.retain(|&r| r != request);
             state.requests.answered.insert(request, answer);
         }
