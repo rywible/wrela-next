@@ -46,7 +46,7 @@ use std::gpu::{
     Texture3d, VertexIndex, begin_depth_pass, begin_pass, begin_pass2, begin_pass2_with_depth,
     begin_pass4, begin_pass4_with_depth, begin_pass_with_depth, buffer, buffer_of,
     comparison_sampler, copy_texture, depth_texture, discard, draw, draw_multi, label, sampler,
-    texture,
+    texture, WithDepthBehind,
 }
 use std::hash::{Hasher, StateHash}
 
@@ -135,6 +135,7 @@ fn mesh_vs(
     prev_xforms: [Rigid],
     inst_ids: [u32],
     is_instanced: u32,
+    hull_px: f32,
     v: View,
     vi: VertexIndex,
     ii: InstanceIndex,
@@ -143,9 +144,14 @@ fn mesh_vs(
     let xf = xforms[ii.index]
     let pxf = prev_xforms[ii.index]
     let lp = vec3(vert.px, vert.py, vert.pz)
-    let wp = xf.apply_point(lp)
-    let prev_wp = pxf.apply_point(lp)
     let n = xf.apply_normal(unpack_oct_normal(vert.packed))
+    // The hull (`hull_px > 0`): the mesh moved out along its normal by `hull_px` pixels at its
+    // distance, so it covers the field's surface wherever a cell's chord cuts inside it; the
+    // fragment shader carries each pixel's ray on to the surface itself (`snap_onto`).
+    let w0 = xf.apply_point(lp)
+    let grow = hull_px * length(w0 - v.at) * v.pixel()
+    let wp = w0 + n * grow
+    let prev_wp = pxf.apply_point(lp) + pxf.apply_normal(unpack_oct_normal(vert.packed)) * grow
     let smooth = if unpack_smooth(vert.packed) { 1.0 } else { 0.0 }
     let tid = if is_instanced != 0 { inst_ids[ii.index] } else { unpack_thing(vert.packed) }
     FieldVary {
@@ -382,33 +388,164 @@ fn shade_gbuf_core(
     }
 }
 
-/// Pixel-rate analytical G-buffer fragment shader for `One<M>` compact meshlets: evaluates
-/// `field.channels(wp)` once per visible 1× screen pixel for infinite-resolution procedural detail.
+/// How far, in pixels at its distance, the opaque G-buffer draws move a mesh out along its normal
+/// (`mesh_vs`'s `hull_px`): far enough that the hull covers the field's surface wherever a cell's
+/// chord cuts inside it, so every pixel whose ray meets the surface has a fragment that finds it
+/// (`snap_onto`). A cell's chord across a curve of radius `R` lies `cell² / (8 R)` inside it.
+pub const HULL_PX: f32 = 0.5
+
+/// The most steps `snap_onto` takes from the hull to the surface; how far it goes, in hull
+/// widths along the hull's normal, before it says the ray passes the surface by; and the secant
+/// steps that pin the crossing once a step lands inside.
+const SNAP_STEPS: u32 = 12
+const SNAP_REACH: f32 = 8.0
+
+/// How near, in pixels, a ray that finds no crossing must come to the surface to be kept, at its
+/// nearest: nearer, the pixel straddles the surface (a dent deeper than the reach, a knife edge
+/// thinner than a step); farther, the ray passes the surface by.
+const SNAP_KEEP: f32 = 0.5
+const SNAP_SECANTS: u32 = 4
+
+/// The pixel's ray (from the eye through the hull point `wp`, whose hull normal is `n`) carried on
+/// from `wp` to `field`'s surface: steps of the distance over the field's Lipschitz bound, but at
+/// least `1 / SNAP_STEPS` of the reach (`SNAP_REACH` hull widths along `n`, so farther along a
+/// grazing ray: a displaced field's distance need not shrink steadily along a ray, so the search
+/// brackets rather than trusts it), and once a step lands inside, secant steps between it and the
+/// last outside. `xyz` is where it meets the surface (to 2% of a pixel), `w` 1 if it does; with
+/// no step inside within the reach, its nearest approach if within `SNAP_KEEP` pixels, else `w`
+/// 0 (the hull beside a silhouette). A ray
+/// that starts inside matter (a hull folded into a concave corner) meets it where it starts: a
+/// fragment is never brought nearer than its hull.
+fn snap_onto<M: Field<Substance>>(field: M, v: View, wp: vec3, n: vec3) -> vec4 {
+    let rel = wp - v.at
+    let dist = length(rel)
+    let d = rel / max(dist, 1.0e-6)
+    let px = max(dist * v.pixel(), 1.0e-7)
+    let cos_i = max(abs(dot(n, d)), 0.05)
+    let reach = SNAP_REACH * HULL_PX * px / cos_i
+    let l0 = field.lipschitz(reach)
+    let lip = if l0 < 1.0e30 { max(l0, 1.0) } else { 1.0 }
+    let tol = 0.02 * px
+    let least = reach / f32(SNAP_STEPS)
+    var t0 = 0.0
+    var f0 = field.distance(wp)
+    if f0 <= tol {
+        return vec4(wp, 1.0)
+    }
+    var t_near = 0.0
+    var f_near = f0
+    for _ in 0..SNAP_STEPS {
+        let t1 = t0 + max(f0 / lip, least)
+        if t1 > reach {
+            return nearest(wp, d, t_near, f_near, px)
+        }
+        let f1 = field.distance(wp + d * t1)
+        if f1 <= tol {
+            if f1 >= -tol {
+                return vec4(wp + d * t1, 1.0)
+            }
+            var a = t0
+            var fa = f0
+            var b = t1
+            var fb = f1
+            for _ in 0..SNAP_SECANTS {
+                let m = a + (b - a) * fa / max(fa - fb, 1.0e-12)
+                let fm = field.distance(wp + d * m)
+                if fm > 0.0 {
+                    a = m
+                    fa = fm
+                } else {
+                    b = m
+                    fb = fm
+                }
+            }
+            let tm = a + (b - a) * fa / max(fa - fb, 1.0e-12)
+            return vec4(wp + d * tm, 1.0)
+        }
+        if f1 < f_near {
+            f_near = f1
+            t_near = t1
+        }
+        t0 = t1
+        f0 = f1
+    }
+    nearest(wp, d, t_near, f_near, px)
+}
+
+/// Where a ray that found no crossing is kept (`snap_onto`): at its nearest to the surface, if
+/// that was within `SNAP_KEEP` pixels (`w` 1), else nowhere (`w` 0).
+fn nearest(wp: vec3, d: vec3, t: f32, f: f32, px: f32) -> vec4 {
+    vec4(wp + d * t, if f <= SNAP_KEEP * px { 1.0 } else { 0.0 })
+}
+
+/// Reversed depth (`NEAR / z`, as `clip_of` gives a vertex) of the world point `p` seen by `v`.
+fn depth_of(v: View, p: vec3) -> f32 {
+    NEAR / max(dot(p - v.at, v.forward), NEAR)
+}
+
+/// Pixel-rate analytical G-buffer fragment shader for `One<M>` compact meshlets drawn as a hull
+/// (`HULL_PX`): the pixel's ray is carried onto the field's surface (`snap_onto`), its material is
+/// the field's `channels` there, and its depth is pushed back to it (never nearer than the hull's,
+/// so the early depth test holds); where the ray passes the surface by, nothing is drawn.
 @fragment
-@budget(work: 8000)
+@budget(work: 40000)
 fn field_gbuf_one_fs<M: Field<Substance>>(
     vary: FieldVary,
     field: M,
     v: View,
     prev_v: View,
-) -> Targets4<vec4, vec4, vec4, vec2> {
-    let sub0 = field.channels(vary.wp)
-    shade_gbuf_core(vary.wp, vary.prev_wp, vary.local_p, vary.normal, vary.meta.x, sub0, v, prev_v)
+) -> WithDepthBehind<Targets4<vec4, vec4, vec4, vec2>> {
+    let hit = snap_onto(field, v, vary.wp, vary.normal)
+    let p = hit.xyz
+    let moved = p - vary.wp
+    let sub0 = field.channels(p)
+    let out = shade_gbuf_core(
+        p,
+        vary.prev_wp + moved,
+        vary.local_p + moved,
+        vary.normal,
+        vary.meta.x,
+        sub0,
+        v,
+        prev_v,
+    )
+    if hit.w < 0.5 {
+        discard()
+    }
+    WithDepthBehind { color: out, depth: depth_of(v, p) }
 }
 
-/// Pixel-rate analytical G-buffer fragment shader for `Pool<M>` compact meshlets.
+/// Pixel-rate analytical G-buffer fragment shader for `Pool<M>` compact meshlets, drawn as a hull
+/// and carried onto each thing's surface as `field_gbuf_one_fs` does.
 @fragment
-@budget(work: 8000)
+@budget(work: 40000)
 fn field_gbuf_many_fs<M: Field<Substance>>(
     vary: FieldVary,
     fields: [M],
     n_fields: u32,
     v: View,
     prev_v: View,
-) -> Targets4<vec4, vec4, vec4, vec2> {
+) -> WithDepthBehind<Targets4<vec4, vec4, vec4, vec2>> {
     let tid = min(u32(max(vary.meta.y, 0.0)), n_fields - 1)
-    let sub0 = fields[tid].channels(vary.wp)
-    shade_gbuf_core(vary.wp, vary.prev_wp, vary.local_p, vary.normal, vary.meta.x, sub0, v, prev_v)
+    let field = fields[tid]
+    let hit = snap_onto(field, v, vary.wp, vary.normal)
+    let p = hit.xyz
+    let moved = p - vary.wp
+    let sub0 = field.channels(p)
+    let out = shade_gbuf_core(
+        p,
+        vary.prev_wp + moved,
+        vary.local_p + moved,
+        vary.normal,
+        vary.meta.x,
+        sub0,
+        v,
+        prev_v,
+    )
+    if hit.w < 0.5 {
+        discard()
+    }
+    WithDepthBehind { color: out, depth: depth_of(v, p) }
 }
 
 /// Skin-locked pixel-rate G-buffer fragment shader for `Skinned` `One<M>` meshlets.
@@ -2305,6 +2442,16 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for One<M> {
             prev_xforms: batches[first].prev_xforms.items(),
             inst_ids: batches[first].inst_ids.items(),
             is_instanced: 0,
+            hull_px: HULL_PX,
+            v: v,
+        )
+        let cut_vs = mesh_vs.bind(
+            verts: batches[first].verts.items(),
+            xforms: batches[first].xforms.items(),
+            prev_xforms: batches[first].prev_xforms.items(),
+            inst_ids: batches[first].inst_ids.items(),
+            is_instanced: 0,
+            hull_px: 0.0,
             v: v,
         )
         let fs = field_gbuf_one_fs.bind(field: self.field, v: v, prev_v: prev_v)
@@ -2325,7 +2472,7 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for One<M> {
         if batches[first].has_trans {
             draw(
                 ep,
-                vs,
+                cut_vs,
                 field_cut_gbuf_one_fs.bind(field: self.field, v: v, prev_v: prev_v),
                 indices: batches[first].cut_indices,
                 indirect: batches[first].cut_draw_args,
@@ -2410,6 +2557,7 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for One<M> {
                 prev_xforms: batches[first].prev_xforms.items(),
                 inst_ids: batches[first].inst_ids.items(),
                 is_instanced: 0,
+                hull_px: 0.0,
                 v: v,
             ),
             field_refract_refl_one_fs.bind(
@@ -2535,6 +2683,7 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for One<M> {
                 prev_xforms: batches[first].prev_xforms.items(),
                 inst_ids: batches[first].inst_ids.items(),
                 is_instanced: 0,
+                hull_px: 0.0,
                 v: v,
             ),
             field_trans_one_fs.bind(
@@ -2957,6 +3106,16 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for Pool<M> {
                     prev_xforms: batches[bi].prev_xforms.items(),
                     inst_ids: batches[bi].inst_ids.items(),
                     is_instanced: is_inst,
+                    hull_px: HULL_PX,
+                    v: v,
+                )
+                let cut_vs = mesh_vs.bind(
+                    verts: batches[bi].verts.items(),
+                    xforms: batches[bi].xforms.items(),
+                    prev_xforms: batches[bi].prev_xforms.items(),
+                    inst_ids: batches[bi].inst_ids.items(),
+                    is_instanced: is_inst,
+                    hull_px: 0.0,
                     v: v,
                 )
                 let fs = field_gbuf_many_fs.bind(
@@ -3005,7 +3164,7 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for Pool<M> {
                 if pass_idx == 0 && batches[bi].has_trans {
                     draw(
                         ep,
-                        vs,
+                        cut_vs,
                         field_cut_gbuf_many_fs.bind(
                             fields: fbuf.items(),
                             n_fields: n,
@@ -3107,6 +3266,7 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for Pool<M> {
                             prev_xforms: batches[bi].prev_xforms.items(),
                             inst_ids: batches[bi].inst_ids.items(),
                             is_instanced: is_inst,
+                            hull_px: 0.0,
                             v: v,
                         ),
                         field_refract_refl_many_fs.bind(
@@ -3246,6 +3406,7 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for Pool<M> {
                             prev_xforms: batches[bi].prev_xforms.items(),
                             inst_ids: batches[bi].inst_ids.items(),
                             is_instanced: is_inst,
+                            hull_px: 0.0,
                             v: v,
                         ),
                         field_trans_many_fs.bind(
