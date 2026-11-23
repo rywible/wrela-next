@@ -218,6 +218,9 @@ pub fn eval_dqs(bones: [DualQuat], base: u32, packed_bones: u32, packed_weights:
 const CAP_SEAM: u32 = 131072
 /// Maximum seam cells refined per `refine_seam_creases` dispatch (keeps GPU work well under 50 ms).
 const SEAM_SLICE: u32 = 16384
+/// The slices of `SEAM_SLICE` seam cells a batch's seams are emitted in (and its exact cells'
+/// seam cells tested in).
+const SEAM_SLICES: u32 = 16
 /// Maximum nested 2:1 LOD levels in a single `MeshBatch` (7 levels = up to 64× resolution ratio).
 const MAX_LOD_LEVELS: u32 = 7
 
@@ -4423,6 +4426,10 @@ pub struct MeshBatch {
     lod_view_at: vec3,
     lod_view_fwd: vec3,
     lod_cut: bool,
+    /// Whether the latest extraction meshed fewer chunks than it wanted, the frame's
+    /// indirect-dispatch budget spent (`ExtractScratch::indirect_left`): it meshes the rest a
+    /// frame later, and till then what it draws may have holes.
+    pub budget_short: bool,
     extract_total: u32,
     extract_limit: u32,
     poll_total: u32,
@@ -4547,6 +4554,7 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
         lod_view_at: vec3(0.0),
         lod_view_fwd: vec3(0.0, 0.0, -1.0),
         lod_cut: false,
+        budget_short: false,
         edit_grids: Vec::new(),
         edit_append_cursor: 0,
         xforms: buffer_of([Rigid::identity()]),
@@ -6506,10 +6514,21 @@ impl MeshBatch {
         // Passes 1–3: Extract in bounded chunks of `CHUNK_BRICKS` active bricks using `chunk_limit`
         // (generous 1.5× + 1-chunk headroom; `took_counts` re-extracts automatically if exceeded).
         let wanted = self.chunk_limit(total_bricks, min(effective_cap, total_bricks))
-        let exact_indirect: u32 = if use_exact { 1 } else { 0 }
+        // A chunk's exact cells make `dilate_outline`'s and every `filter_thin_cells` slice's
+        // dispatch; a batch's seams make each slice's emit (and its exact cells', if exact).
+        let exact_indirect: u32 = if use_exact { 1 + THIN_SLICES } else { 0 }
         let per_chunk = CHUNK_INDIRECT + exact_indirect + self.crease_slices(CHUNK_BRICKS)
+        let seam_indirect: u32 = if !has_seams {
+            0
+        } else if use_exact {
+            2 * SEAM_SLICES
+        } else {
+            SEAM_SLICES
+        }
+        scratch.indirect_left -= min(scratch.indirect_left, seam_indirect)
         let fit = max(scratch.indirect_left / per_chunk, 1)
         let hard_cap = min(wanted, fit * CHUNK_BRICKS)
+        self.budget_short = hard_cap < wanted
         let chunks = (hard_cap + CHUNK_BRICKS - 1) / CHUNK_BRICKS
         scratch.indirect_left -= min(scratch.indirect_left, chunks * per_chunk)
         self.ensure_brick_draws(hard_cap + extra_bricks)
@@ -6850,7 +6869,7 @@ impl MeshBatch {
                 ),
                 over: 1,
             )
-            let seam_slices: u32 = 16
+            let seam_slices: u32 = SEAM_SLICES
             dispatch(
                 prep_slices.bind(
                     count: scratch.seam_cells.count(),

@@ -28,7 +28,10 @@ use picture::look::Look
 use picture::screen::show
 use reference::traced::{FAR, HALVINGS, LEAST, LEAST_FAR}
 use std::field::{Field, Union, UnionAll}
-use std::gpu::{Atomics, GlobalId, GpuBuffer, Rgba32Float, Texture, buffer_of, dispatch, label, read}
+use std::gpu::{
+    Atomics, GlobalId, GpuBuffer, Rgba32Float, Texture, buffer_of, copy_texture, dispatch, label,
+    read, texture,
+}
 use std::collections::Vec
 use std::io::{Pending, print}
 
@@ -58,6 +61,10 @@ const STEPS: u32 = 512
 
 /// Pixels a dispatch (a band of the picture: no dispatch holds the GPU long).
 const BAND: u32 = 256
+
+/// The rays of an eye's march a frame marches (`Auditing::frame`): an eye's march is spread over
+/// frames, so no frame holds the GPU long however steep (and so slow to march) its field is.
+const MARCH_FRAME: u32 = 256 * BAND
 
 /// Where the field `m` meets matter along the ray from `o` along `d`: its distance along it, -1
 /// where it doesn't, -2 where the march ran out of steps.
@@ -148,9 +155,18 @@ pub trait Marched: Copy {
     type Field: Field<Substance>
     fn field(self) -> Self::Field
 
-    /// The `n` rays of a picture `w` wide through `v` (`ray_at`) marched into `hits`: joined with
-    /// what it holds (`keep`), or replacing it.
-    fn march(self, v: View, w: u32, n: u32, keep: bool, hits: mut GpuBuffer<u32>)
+    /// Rays `first` to `last` of the `n` of a picture `w` wide through `v` (`ray_at`) marched
+    /// into `hits`: joined with what it holds (`keep`), or replacing it.
+    fn march(
+        self,
+        v: View,
+        w: u32,
+        n: u32,
+        first: u32,
+        last: u32,
+        keep: bool,
+        hits: mut GpuBuffer<u32>,
+    )
 }
 
 /// A field marched whole (`whole`).
@@ -170,15 +186,25 @@ impl<M: Field<Substance>> Marched for Whole<M> {
         self.field
     }
 
-    fn march(self, v: View, w: u32, n: u32, keep: bool, hits: mut GpuBuffer<u32>) {
+    fn march(
+        self,
+        v: View,
+        w: u32,
+        n: u32,
+        first: u32,
+        last: u32,
+        keep: bool,
+        hits: mut GpuBuffer<u32>,
+    ) {
         let m = matter(self.field)
-        var first: u32 = 0
-        while first < n {
+        let end = min(last, n)
+        var at = first
+        while at < end {
             dispatch(
-                marched.bind(m: m, v: v, w: w, n: n, first: first, keep: keep, hits: mut hits),
-                over: min(BAND, n - first),
+                marched.bind(m: m, v: v, w: w, n: n, first: at, keep: keep, hits: mut hits),
+                over: min(BAND, end - at),
             )
-            first += BAND
+            at += BAND
         }
     }
 }
@@ -200,9 +226,18 @@ impl<M: Field<Substance>, const N: u32> Marched for Each<M, N> {
         self.parts.union()
     }
 
-    fn march(self, v: View, w: u32, n: u32, keep: bool, hits: mut GpuBuffer<u32>) {
+    fn march(
+        self,
+        v: View,
+        w: u32,
+        n: u32,
+        first: u32,
+        last: u32,
+        keep: bool,
+        hits: mut GpuBuffer<u32>,
+    ) {
         for i in 0..N {
-            whole(self.parts[i]).march(v, w, n, keep: keep || i > 0, hits: mut hits)
+            whole(self.parts[i]).march(v, w, n, first, last, keep: keep || i > 0, hits: mut hits)
         }
     }
 }
@@ -225,9 +260,18 @@ impl<A: Marched, B: Marched> Marched for Both<A, B> {
         Union { a: self.a.field(), b: self.b.field() }
     }
 
-    fn march(self, v: View, w: u32, n: u32, keep: bool, hits: mut GpuBuffer<u32>) {
-        self.a.march(v, w, n, keep: keep, hits: mut hits)
-        self.b.march(v, w, n, keep: true, hits: mut hits)
+    fn march(
+        self,
+        v: View,
+        w: u32,
+        n: u32,
+        first: u32,
+        last: u32,
+        keep: bool,
+        hits: mut GpuBuffer<u32>,
+    ) {
+        self.a.march(v, w, n, first, last, keep: keep, hits: mut hits)
+        self.b.march(v, w, n, first, last, keep: true, hits: mut hits)
     }
 }
 
@@ -428,7 +472,6 @@ pub fn eye_round<M: Field<Substance>>(field: M, b: vec4, k: u32) -> Eye {
 /// What the audit has counted, and what it has been asked to say.
 pub struct Audit {
     counts: GpuBuffer<u32>,
-    hits: GpuBuffer<u32>,
     said: Option<Pending<u32>>,
 }
 
@@ -436,16 +479,16 @@ pub struct Audit {
 pub fn audit() -> Audit {
     Audit {
         counts: buffer_of(Vec::filled(COUNTS, 0)),
-        hits: buffer_of(Vec::filled(1, 0)),
         said: None,
     }
 }
 
 impl Audit {
-    /// The engine's picture `place` (`width` × `height`), drawn through `eye`, held to `thing`.
-    pub fn held<T: Marched>(
+    /// The engine's picture `place` (`width` × `height`), drawn through `eye`, held to the field's
+    /// march through it (`hits`, `Marched::march`).
+    pub fn held(
         mut self,
-        thing: T,
+        hits: GpuBuffer<u32>,
         eye: Eye,
         place: Texture<Rgba32Float>,
         width: u32,
@@ -454,18 +497,13 @@ impl Audit {
     ) {
         let v = view(eye, width, height)
         label("audit")
-        let n = 5 * width * height
-        if self.hits.len() != n {
-            self.hits = buffer_of(Vec::filled(n, 0))
-        }
-        thing.march(v, width, n, keep: false, hits: mut self.hits)
         var first: u32 = 0
         while first < width * height {
             dispatch(
                 audited.bind(
                     v: v,
                     place: place,
-                    hits: self.hits.items(),
+                    hits: hits.items(),
                     first: first,
                     eye: k,
                     counts: mut self.counts,
@@ -533,15 +571,23 @@ pub const SETTLE_MOST: u32 = 12
 
 /// The audit as a scene runs it: things one after another, each from `eyes` eyes round it
 /// (`eye_round`), each eye drawn until the engine's meshes for it are settled (at most
-/// `SETTLE_MOST` frames) and then held to the field, each thing said once its eyes are in, and the
-/// next begun. A new eye is a camera cut: the frames it takes to settle are the engine's lag after
-/// one, and are said with the holes.
+/// `SETTLE_MOST` frames) and its field's march through it is in (a slice a frame), and then held to
+/// the field, as is its first frame's picture; each thing said once its eyes are in, and the next
+/// begun. A new eye is a camera cut: the frames it takes to settle are the engine's lag after one,
+/// and are said with the holes.
 pub struct Auditing {
     audit: Audit,
     /// The same eyes held to the field at the frame of the cut to them (their first), and
     /// whether its counts have been said for the thing being audited.
     cut: Audit,
     cut_said: bool,
+    /// The eye's march (`Marched::march`), its first `marched` rays of `5 · width · height` in, a
+    /// slice a frame (`MARCH_FRAME`); the picture of the frame of the cut, kept till it is.
+    hits: GpuBuffer<u32>,
+    marched: u32,
+    cut_place: Texture<Rgba32Float>,
+    /// The frames the eye took to settle, once it has (0 till then).
+    settle_drawn: u32,
     /// The thing being audited (its place in the scene's list), and its next eye.
     thing: u32,
     eye_k: u32,
@@ -571,6 +617,10 @@ pub fn auditing() -> Auditing {
         audit: audit(),
         cut: audit(),
         cut_said: false,
+        hits: buffer_of(Vec::filled(1, 0)),
+        marched: 0,
+        cut_place: texture(width: 1, height: 1),
+        settle_drawn: 0,
         thing: 0,
         eye_k: 0,
         drawn: 0,
@@ -665,27 +715,57 @@ impl Auditing {
         } else {
             out_of(field, placed)
         }
+        let n = 5 * width * height
+        if self.hits.len() != n {
+            self.hits = buffer_of(Vec::filled(n, 0))
+        }
+        if self.cut_place.width() != width || self.cut_place.height() != height {
+            self.cut_place = texture(width: width, height: height)
+            return
+        }
         mesh.drawn_only(world, sky, look, eye, width, height)
         self.drawn += 1
         show(mesh.drawn.colour)
         if self.drawn == 1 {
-            self.cut.held(thing, eye, mesh.drawn.place, width, height, self.eye_k)
+            copy_texture(from: mesh.drawn.place.level(0), to: self.cut_place.level_mut(0))
+            self.marched = 0
         }
-        let settled = mesh.settled()
-        if !settled && self.drawn < SETTLE_MOST {
+        if self.marched < n {
+            label("audit")
+            let last = min(self.marched + MARCH_FRAME, n)
+            thing.march(
+                view(eye, width, height),
+                width,
+                n,
+                self.marched,
+                last,
+                keep: false,
+                hits: mut self.hits,
+            )
+            self.marched = last
+        }
+        if self.settle_drawn == 0 {
+            let settled = mesh.settled()
+            if settled || self.drawn >= SETTLE_MOST {
+                self.settle_drawn = self.drawn
+                if !settled {
+                    self.unsettled += 1
+                }
+                if mesh.overflowed() != 0 {
+                    self.overflows += 1
+                    self.overflow_bits |= mesh.overflowed()
+                }
+            }
+        }
+        if self.settle_drawn == 0 || self.marched < n {
             return
         }
-        if !settled {
-            self.unsettled += 1
-        }
-        if mesh.overflowed() != 0 {
-            self.overflows += 1
-            self.overflow_bits |= mesh.overflowed()
-        }
-        self.most = max(self.most, self.drawn)
-        self.summed += self.drawn
+        self.cut.held(self.hits, eye, self.cut_place, width, height, self.eye_k)
+        self.audit.held(self.hits, eye, mesh.drawn.place, width, height, self.eye_k)
+        self.most = max(self.most, self.settle_drawn)
+        self.summed += self.settle_drawn
         self.drawn = 0
-        self.audit.held(thing, eye, mesh.drawn.place, width, height, self.eye_k)
+        self.settle_drawn = 0
         self.eye_k += 1
     }
 }

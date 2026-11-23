@@ -48,8 +48,8 @@ use std::field::{Bound, DualQuat, Field, Live, Rigid}
 use std::gpu::{
     Address, ClipPosition, Compare, ComparisonSampler, Cull, Depth, DepthBias, DepthOnlyPass,
     DepthPass, DepthPass2, DepthPass4, DepthTexture, Filter, Flat, FragCoord, GlobalId, GpuBuffer,
-    GpuSpan, InstanceIndex, R16Float, R32Float, Rg16Float, Rgba8, Rgba16Float, Sampler, Targets2,
-    Targets4, Texels, Texture, Texture3d, VertexIndex, WithDepthBehind, begin_depth_pass,
+    GpuSpan, InstanceIndex, R16Float, R32Float, Rg16Float, Rgba8, Rgba16Float, Rgba32Float, Sampler,
+    Targets2, Targets4, Texels, Texture, Texture3d, VertexIndex, WithDepthBehind, begin_depth_pass,
     begin_pass, begin_pass2, begin_pass2_with_depth, begin_pass4, begin_pass4_with_depth,
     begin_pass_with_depth, buffer, buffer_of, comparison_sampler, copy_texture, depth_texture,
     dispatch, draw, draw_multi, label, sampler, texture, writable_texture,
@@ -705,6 +705,33 @@ fn mesh_gbuf_fs(vary: MeshVary, v: View, prev_v: View) -> Targets4<vec4, vec4, v
 /// Reconstructs exact world hit distance along `ray` from 1× reversed-Z depth `ndc_z`.
 fn reconstruct_pixel_dist(v: View, ray: vec3, ndc_z: f32) -> f32 {
     (NEAR / ndc_z) / max(dot(ray, v.forward), 0.05)
+}
+
+/// `place` (the opaque surfaces' facing and distance, `Picture::place`) with the transmissive
+/// surfaces drawn in front of them put in: where the depth after the transmissive pass is nearer
+/// than the opaque surface there, the pixel's middle ray met glass, at that depth, facing as the
+/// depth turns across the screen. So the hole audit holds glass to its field too.
+@fragment
+fn place_with_glass_fs(
+    depth: DepthTexture,
+    place: Texture<Rgba32Float>,
+    v: View,
+    frag: FragCoord,
+) -> vec4 {
+    let x = u32(frag.position.x)
+    let y = u32(frag.position.y)
+    let e = place.load(x, y)
+    let z = depth.load(x, y)
+    let ray = v.ray(vec2(f32(x) + 0.5, f32(y) + 0.5))
+    let dist = if z > 1.0e-6 { reconstruct_pixel_dist(v, ray, z) } else { 0.0 }
+    let wp = v.at + ray * dist
+    let f = cross(dpdx(wp), dpdy(wp))
+    let fl = length(f)
+    if dist <= 0.0 || (e.w > 0.0 && dist >= e.w - max(1.0e-4, 0.5 * dist * v.pixel())) {
+        return e
+    }
+    let n0 = if fl > 1.0e-12 { f / fl } else { -ray }
+    vec4(if dot(n0, ray) > 0.0 { -n0 } else { n0 }, dist)
 }
 
 /// Unpacks a unit normal from `Rgba8` `g_normal = (n * 0.5 + 0.5, 1.0)`.
@@ -2798,7 +2825,7 @@ const POOL_SHARED: u32 = 3
 /// `One` is (view-dependent nested bricks and exact cells): a pool's shared mesh is one grid a
 /// thing (or one rest-pose template for them all) and can't be as fine as a thing seen close needs.
 /// More things near than this sets `OVERFLOW_NEAR` (the rest are drawn from the shared mesh).
-const NEAR_SLOTS: u32 = 4
+const NEAR_SLOTS: u32 = 16
 
 /// How near the eye, in bound radii from a thing's surface, the thing is meshed directly from its
 /// field, view-dependent (`One::sync_batches`' `force_direct`; a `Pool`'s near batches).
@@ -2811,16 +2838,17 @@ fn surface_from_eye<M: Field<Substance>>(field: M, c: vec3, r: f32, v: View) -> 
     max(abs(field.distance(v.at)) / lip, max(length(c - v.at) - r, 0.0))
 }
 
-/// Which of `pool`'s things in view are near the eye (within `DIRECT_RADII` bound radii of its
-/// surface, as `One::sync_batches` meshes a thing directly), each given one of its near batches (`MeshBatch::near_id`: kept by the thing it held
-/// last frame while it stays near, else the nearest not yet given one): the things given one.
-/// Sets `OVERFLOW_NEAR` on its first batch when more are near than it has near batches.
+/// Gives each of `pool`'s things in view near the eye (within `DIRECT_RADII` bound radii of its
+/// surface, as `One::sync_batches` meshes a thing directly) one of its near batches
+/// (`MeshBatch::near_id`: kept by the thing it held last frame while it stays near, else the
+/// nearest not yet given one). Sets `OVERFLOW_NEAR` on its first batch when more are near than it
+/// has near batches.
 fn near_things<M: Field<Substance> + StateHash + GpuData>(
     pool: Pool<M>,
     batches: mut Vec<MeshBatch>,
     first: u32,
     v: View,
-) -> Vec<bool> {
+) {
     let n = pool.fields.len()
     var given = Vec::filled(n, false)
     var d_of = Vec::filled(n, -1.0)
@@ -2867,11 +2895,10 @@ fn near_things<M: Field<Substance> + StateHash + GpuData>(
         }
     }
     batches[first].near_over = want > held
-    given
 }
 
 /// The shared meshes of `pool` (its batches `first` to `first + POOL_SHARED`): every thing in view
-/// but those near the eye (`near_eye`, meshed as `One`s in its near batches).
+/// but those its near batches have meshed whole this frame (`near_eye`, meshed as `One`s there).
 fn sync_pool_shared<M: Field<Substance> + StateHash + GpuData>(
     pool: Pool<M>,
     scratch: mut ExtractScratch,
@@ -3034,17 +3061,22 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for Pool<M> {
         first: u32,
         v: View,
     ) {
-        let near_eye = near_things(self, mut batches, first, v)
-        sync_pool_shared(self, mut scratch, mut batches, first, v, near_eye)
+        near_things(self, mut batches, first, v)
+        // The near batches first: the shared mesh leaves out a thing only once its own batch has
+        // meshed it whole, this frame's extraction not cut short by the frame's budget.
+        let n = self.fields.len()
+        var shown = Vec::filled(n, false)
         for s in 0..NEAR_SLOTS {
             let bi = first + POOL_SHARED + s
             let id = batches[bi].near_id
-            if id < self.fields.len() {
+            if id < n {
                 one(self.fields[id]).sync_batches(mut scratch, mut batches, bi, v)
+                shown[id] = !batches[bi].budget_short
             } else {
                 batches[bi].forget()
             }
         }
+        sync_pool_shared(self, mut scratch, mut batches, first, v, shown)
     }
 
     fn splat_sdf(
@@ -4103,6 +4135,8 @@ fn draw_shadow_casters(
 /// GI/SSR + half-res refract SSR buffers, volumetric froxels, optical HDR bloom, and `Picture`.
 pub struct MeshSight {
     pub drawn: Picture,
+    /// `drawn.place` with transmissive surfaces in it (`place_with_glass_fs`), copied back.
+    place_all: Texture<Rgba32Float>,
     pub hdr_direct: Texture<Rgba16Float>,
     /// The sun's share of `hdr_direct` per pixel (`0..1` by luma): what the contact shadow darkens.
     pub sun_share: Texture<R16Float>,
@@ -4152,6 +4186,7 @@ pub struct MeshSight {
 pub fn mesh_sight(gi: bool = true) -> MeshSight {
     MeshSight {
         drawn: picture(width: 1, height: 1),
+        place_all: texture(width: 1, height: 1),
         hdr_direct: texture(width: 1, height: 1),
         sun_share: texture(width: 1, height: 1),
         g_normal: texture(width: 1, height: 1),
@@ -4200,6 +4235,7 @@ impl MeshSight {
             let hh = max(height / 2, 1)
             self.drawn = picture(width: width, height: height)
             self.drawn.placed = true
+            self.place_all = texture(width: width, height: height)
             self.hdr_direct = texture(width: width, height: height)
             self.sun_share = texture(width: width, height: height)
             self.g_normal = texture(width: width, height: height)
@@ -5197,6 +5233,15 @@ impl MeshSight {
             height,
             nb,
         )
+        let pp = begin_pass(mut self.place_all, keep: false)
+        draw(
+            pp,
+            cover,
+            place_with_glass_fs.bind(depth: self.depth, place: self.drawn.place, v: v_unjit),
+            vertices: 3,
+        )
+        pp.end()
+        copy_texture(from: self.place_all.level(0), to: self.drawn.place.level_mut(0))
         self.tsr.resolve(mut self.hdr_colour, self.g_motion, self.depth, v_unjit, width, height)
 
         // Subframes 1..7: converge Halton(2, 3) TSR supersampling. `drawn.place` keeps subframe 0's

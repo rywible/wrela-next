@@ -740,8 +740,11 @@ so what it doesn't understand costs time, which the bench sees, and not holes.
   a pixel to keep its outline, so the eye pass draws about a sixth of the triangles.
 - **A pool meshes what it can't share (`draw.wrela`).** A `Pool`'s things within
   `DIRECT_RADII` (1.5) bound radii of the eye are meshed as `One`s, view-dependent with exact
-  cells, in `NEAR_SLOTS` (4) batches beside its shared ones (`near_things`; more near raises
-  `OVERFLOW_NEAR`; a batch given up forgets its mesh, `MeshBatch::forget`). Its skinned shared
+  cells, in `NEAR_SLOTS` (16; it was 4, which a barrage of glass shards overran) batches beside
+  its shared ones (`near_things`; more near raises `OVERFLOW_NEAR`; a batch given up forgets its
+  mesh, `MeshBatch::forget`). The near batches mesh first, and the shared mesh leaves a thing out
+  only once its own batch has meshed it whole that frame (`MeshBatch::budget_short` false): a
+  thing coming near, or re-meshed after a cut, is never drawn by neither. Its skinned shared
   mesh is projected onto each thing's own posed field in the vertex shader (`skin_mesh_vs`), as a
   `One`'s is in `deform_skinned_verts`: DQS alone drew the crowd's bodies off their fields.
 - **The audit covers what it didn't.** Two kinds join it: a crowd (one `Pool` of twelve skinned
@@ -782,12 +785,11 @@ so what it doesn't understand costs time, which the bench sees, and not holes.
   `a_bent_bodys_posed_distance_asks_only_near_parts_and_is_the_same`). SCENE 11's eye pass 6.1-7.0
   → 5.1-5.4 ms on the M4; the crowd's audit unchanged.
 
-**Known gaps, not yet closed.** Glass: the audit's picture is the opaque G-buffer, so it can't see
-a transmissive surface, and the exact pass discards one; a glass kind needs transmissive coverage
-recorded first. An outline cell on a brick's low face can't give its outside neighbour across
-that face an exact cell (the neighbour's corners and live parts are the next brick's). Both are
-met by construction by exact coverage done in screen space, over what the mesh drew (phase 2's
-visibility buffer), which is where the exact pass is headed.
+**Known gaps, not yet closed.** An outline cell on a brick's low face can't give its outside
+neighbour across that face an exact cell (the neighbour's corners and live parts are the next
+brick's). It is met by construction by exact coverage done in screen space, over what the mesh
+drew (phase 2's visibility buffer), which is where the exact pass is headed. (Glass, the other gap
+named here, is now audited: below.)
 
 **Measured** (SCENE 6, 640x360, 24 eyes a kind, M4): the crowd before any of this, at one eye at
 320x180, 465 holes, 360 extras and 14,036 pixels off by a pixel (DQS without projection); after,
@@ -861,6 +863,80 @@ projection is the eye pass's 7 ms on the Radeon; it has to ask a body's every pa
   are the mesh's, not the solver's (above).
 - *A sagitta-sized shared mesh from measured curvature.* Not built: the shared mesh's holes are on
   features a pixel or two across, which a cell that size can't resolve to measure.
+
+### Contracts proven, glass seen (2026-11-23)
+
+**A field's contracts are the compiler's to check, every field's.** `verify_surface_soundness`
+(`matter::verify`) no longer samples alone: over 6³ boxes tiling 1.5 bound radii it proves each
+contract a field states by the derived interval (`std::derive::interval`), halving a box up to
+`HALVINGS_MOST` (3) times where the interval is too wide and sampling it past that: the bound
+(`distance - below` over the box, where `below` is positive, the only place it is read), the
+steepness (the interval of the gradient, `interval` of `gradient`, no longer than `lipschitz`
+wherever the distance can be within `near`), and `interval_near` and `pruned` (each must hold the
+derived interval of every box). It says how many boxes it proved and how many it sampled.
+`tools/layers` refuses a file under game/ or lib/kit/ that implements `Surface` or `Field<…>` for
+a type of its own and doesn't call it. To run at all it needed the compiler's intervals not to
+make NaNs: `0 · ∞` (a product of a zero range and an unbounded one) and a division by a range
+holding zero (`ir::derive::interval`: endpoints held finite, a divisor's zero corners taken as 1
+before the result is widened to the whole line), which the debug build traps.
+
+It found two broken contracts, both under the old sampled check's eye. The stack stated a
+steepness of 3.5 and reached 24 at its crown, 98 deep inside: its lobes and crags are cut by the
+direction from its axis, and every direction meets at the axis. Its lobes now fade to its middle's
+within `CORE` (6 m) of the axis and its crags within `CRAG_CORE` (12 m), and its worst over 48,000
+points within a metre of its surface is 2.43 (5.04 with the crags over a 6 m core, the crown alone
+over 3.5). The marble column stated 1.12 and reached 1.137-1.145 where its flutes meet its axis:
+they fade out within 0.62 of it (`fade12`), and it states 1.5 (1.42 sampled). The arena's
+pillars and the creature (bent as well as standing) hold theirs. The stack's crown was also why
+the audit's frame took over 1.5 s with its steepness honest (below).
+
+**Measured and not kept: a brick's own steepness from the interval of its gradient.** The thin
+candidates (`classify_cells`) take a cell's reach from the field's one steepness, so a field steep
+in one place is taken as steep everywhere: the stack at 6 overflowed the thin slices on every eye
+(`OVERFLOW_THIN`). A pass took each brick's from the interval of the gradient over its box. On the
+stack the interval is no use: over boxes 0.75, 1.5 and 3 m in half-width near its surface its
+length averaged 89, 100 and 100 (capped at 100), and no box of 900 came under 6. Value noise's
+derived gradient is that loose, so the field was mended instead (above).
+
+**Glass is audited.** The audit's picture was the opaque G-buffer's place, so it couldn't see a
+transmissive surface. After the transmissive pass, `place_with_glass_fs` writes the place of
+whatever is nearer, opaque or glass, into the picture the audit reads (the glass's normal from its
+place's screen derivatives). A thirteenth kind, the glass barrage (a `Pool` of the 14 shards of
+`glass_barrage(0.5)`, marched a shard at a time), passes with no hole and no extra, settled and on
+the frame of each cut, by the shards' mesh alone: the exact pass still discards a transmissive hit
+(`prove_transmissive_only`), so glass with a feature finer than its mesh's cells would hole where
+an opaque one wouldn't. The audit found none to need it; a glass kind with one is what would.
+
+Getting there found three things the audit hadn't asked of the engine:
+- *A frame's indirect-dispatch budget was counted short.* `EXTRACT_INDIRECT` (2,560 of the host's
+  4,096) was spent at one dispatch a chunk for its exact cells where they make nine
+  (`dilate_outline` and the eight `filter_thin_cells` slices), and none for a batch's seams (16
+  slices, 32 with exact cells). Sixteen near shards meshed after a cut made more than 4,096 and
+  the host refused the frame. Both are counted now.
+- *A thing coming near left its pool's shared mesh before its own batch had meshed it.* With the
+  budget honest, a cut that re-meshes many near things can't mesh them all in one frame, and a
+  batch cut short drew its part. The near batches now mesh before the shared one, and a thing
+  stays in the shared mesh until its batch is not `budget_short` (it had been 221,259 cracks on
+  the barrage's cut frames, eyes 20 to 23 most). It settles in 7.9 frames, mean, where 4 near
+  batches (overflowed) took 9.7.
+- *The audit marched each eye twice, in one frame each.* The reference is marched once an eye now,
+  `MARCH_FRAME` (65,536) rays a frame, the frame of the cut's picture kept (`cut_place`) and both
+  pictures held to it once it is in. The stack, honestly steep, had taken one frame over the host's
+  1.5 s (602 ms of audit at 320x180).
+- *Measured and not kept: reserving a cold or cut extraction's chunks by the pixels its thing
+  covers* (`BRICKS_PER_PX` 0.28, from the 62,924 bricks a cut found filling 640x360), so a small
+  near shard needn't reserve 16 or 64 chunks. It under-reserves wherever cells can't be as coarse
+  in pixels as at 640x360: at 160x90 every kind's first frame was drawn partly (12,060 holes on
+  the pillars' first eye). The flat reserves stand.
+
+**Measured** (SCENE 6, 640x360, 24 eyes a kind): all 13 kinds pass on the M4 and on the Radeon
+(Vulkan validation silent), no crack, outlines within budget, no overflow; the stack's 4 holes
+one pixel inside its outline are gone on the M4 (its crown's mesh, now less steep). `tools/check`
+passes on both (its 160x90 audit 13 kinds). **What it costs** (1920x1080, frame span against
+a42da44, same session, three runs a build): nothing seen. M4: SCENE 10 24.1-25.1 against
+24.5-24.9 ms, SCENE 11 14.1-15.0 and 14.3-14.4 against 13.8-14.7 ms (two sessions of runs; the
+eye pass 5.07 against 5.04 ms). Radeon: SCENE 10 49.4-50.0 against 49.6-50.1 ms, SCENE 11
+40.8-41.1 against 40.9-41.5 ms.
 
 ## The layers
 

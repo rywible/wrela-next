@@ -8,51 +8,208 @@
 
 use matter::edits::Edited
 use matter::substance::Substance
-use std::derive::{Box3, gradient}
+use std::derive::{Box3, Interval, gradient}
 use std::field::{ALL_LIVE, Field, Surface}
 use std::hash::StateHash
+use std::io::print
 
-/// Verifies every culling and marching contract of `s` (`bound`, `lipschitz`, `interval_near`,
-/// `pruned`, and `distance_live`) across `samples` deterministic Sobol points and `boxes`
-/// multi-scale test boxes. Panics with an actionable diagnostic on any hole-inducing violation.
+/// How a contract's check over a region came out: boxes proven by the compiler's intervals
+/// (`std::derive::interval`, IEEE-754 sound), boxes too small to halve again that intervals
+/// couldn't prove and samples didn't break, and boxes not asked (out of the contract's reach).
+pub struct Proven: Copy {
+    pub proven: u32,
+    pub unproven: u32,
+}
+
+/// The box `b`'s `k`th of 8 octants.
+fn octant(b: Box3, k: u32) -> Box3 {
+    let mid = 0.5 * (b.lo + b.hi)
+    let lo = vec3(
+        if (k & 1) != 0 { mid.x } else { b.lo.x },
+        if (k & 2) != 0 { mid.y } else { b.lo.y },
+        if (k & 4) != 0 { mid.z } else { b.lo.z },
+    )
+    Box3 { lo, hi: lo + 0.5 * (b.hi - b.lo) }
+}
+
+/// Where a box too small to halve again is sampled: near its middle, and 8 points just in from its
+/// corners, none on a line a tiling shares with a field's own (an axis through the middle of a
+/// tile, a corner) (a corner of a tiling lines up with a field's own lines, where a gradient may not exist:
+/// `length` at the zero vector).
+fn probes(b: Box3, k: u32) -> vec3 {
+    if k == 8 {
+        b.lo + (b.hi - b.lo) * vec3(0.47, 0.52, 0.49)
+    } else {
+        let t = vec3(
+            if (k & 1) != 0 { 0.87 } else { 0.13 },
+            if (k & 2) != 0 { 0.89 } else { 0.11 },
+            if (k & 4) != 0 { 0.83 } else { 0.17 },
+        )
+        b.lo + (b.hi - b.lo) * t
+    }
+}
+
+/// The `i`th of `n`³ boxes tiling `[lo, lo + n·step]`.
+fn tile(lo: vec3, step: f32, n: u32, i: u32) -> Box3 {
+    let c = lo + vec3(f32(i % n), f32((i / n) % n), f32(i / (n * n))) * step
+    Box3 { lo: c, hi: c + vec3(step) }
+}
+
+/// The most times a box is halved before its check is left to samples.
+const HALVINGS_MOST: u32 = 3
+
+/// Proves `bound().below(p) <= distance(p)` (to `slack`) wherever `below(p) > 0` in box `b` (the
+/// only place it is read): by the derived interval of `distance - below`, halving where it is too
+/// wide.
+fn prove_bound<S: Surface>(s: S, b: Box3, depth: u32, slack: f32, label: str) -> Proven {
+    let bd = s.bound()
+    // Only where `below` is positive is it read (what is farther than it is skipped), so only
+    // there is it held to the distance.
+    if std::derive::interval(|q: vec3| bd.below(q), b).hi <= 0.0 {
+        return Proven { proven: 0, unproven: 0 }
+    }
+    let r = std::derive::interval(|q: vec3| s.distance(q) - bd.below(q), b)
+    if r.lo >= -slack {
+        return Proven { proven: 1, unproven: 0 }
+    }
+    if depth >= HALVINGS_MOST {
+        for k in 0..9 {
+            let p = probes(b, k)
+            let below = bd.below(p)
+            let d = s.distance(p)
+            assert(
+                below <= 0.0 || below <= d + slack,
+                f"verify({label}): bound().below({p})={below} exceeds distance={d} (culling would drop matter)",
+            )
+        }
+        return Proven { proven: 0, unproven: 1 }
+    }
+    var out = Proven { proven: 0, unproven: 0 }
+    for k in 0..8 {
+        let sub = prove_bound(s, octant(b, k), depth + 1, slack, label)
+        out = Proven { proven: out.proven + sub.proven, unproven: out.unproven + sub.unproven }
+    }
+    out
+}
+
+/// Proves `|∇distance| <= lip` wherever `|distance| < near` in box `b`: a box whose derived
+/// distance interval lies outside `±near` isn't asked; one whose derived gradient (the interval of
+/// `std::derive::gradient`) is no longer than `lip` is proven; else it is halved.
+fn prove_lipschitz<S: Surface>(
+    s: S,
+    b: Box3,
+    near: f32,
+    lip: f32,
+    depth: u32,
+    label: str,
+) -> Proven {
+    let f = std::derive::interval(|q: vec3| s.distance(q), b)
+    if f.lo >= near || f.hi <= -near {
+        return Proven { proven: 0, unproven: 0 }
+    }
+    let g = std::derive::interval(|q: vec3| gradient(|p: vec3| s.distance(p), q), b)
+    let most = length(max(abs(g.lo), abs(g.hi)))
+    if most <= lip * 1.0001 + 1.0e-6 {
+        return Proven { proven: 1, unproven: 0 }
+    }
+    if depth >= HALVINGS_MOST {
+        for k in 0..9 {
+            let p = probes(b, k)
+            if abs(s.distance(p)) < near {
+                let gl = length(gradient(|q: vec3| s.distance(q), p))
+                assert(
+                    gl <= lip * 1.001 + 1.0e-4,
+                    f"verify({label}): ||grad({p})||={gl} exceeds lipschitz({near})={lip} (marching would step through surface)",
+                )
+            }
+        }
+        return Proven { proven: 0, unproven: 1 }
+    }
+    var out = Proven { proven: 0, unproven: 0 }
+    for k in 0..8 {
+        let sub = prove_lipschitz(s, octant(b, k), near, lip, depth + 1, label)
+        out = Proven { proven: out.proven + sub.proven, unproven: out.unproven + sub.unproven }
+    }
+    out
+}
+
+/// Proves the range `range` (a contract's, over a box holding `b`) holds the distance over `b`:
+/// the derived interval inside it proves it; else `b` is halved.
+fn prove_holds<S: Surface>(
+    s: S,
+    b: Box3,
+    range: Interval,
+    depth: u32,
+    what: str,
+    label: str,
+) -> Proven {
+    let f = std::derive::interval(|q: vec3| s.distance(q), b)
+    let slack = 1.0e-4 * max(abs(range.lo), max(abs(range.hi), 1.0))
+    if f.lo >= range.lo - slack && f.hi <= range.hi + slack {
+        return Proven { proven: 1, unproven: 0 }
+    }
+    if depth >= HALVINGS_MOST {
+        for k in 0..9 {
+            let p = probes(b, k)
+            let d = s.distance(p)
+            assert(
+                range.lo <= d + 1.0e-3 && d <= range.hi + 1.0e-3,
+                f"verify({label}): {what} [{range.lo}, {range.hi}] missed d={d} at {p}",
+            )
+        }
+        return Proven { proven: 0, unproven: 1 }
+    }
+    var out = Proven { proven: 0, unproven: 0 }
+    for k in 0..8 {
+        let sub = prove_holds(s, octant(b, k), range, depth + 1, what, label)
+        out = Proven { proven: out.proven + sub.proven, unproven: out.unproven + sub.unproven }
+    }
+    out
+}
+
+/// Verifies every culling and marching contract of `s` by the compiler's intervals, halving a box
+/// up to `HALVINGS_MOST` times where its interval is too wide to prove it and sampling it past
+/// that (a sample that breaks a contract fails the check, naming where):
+/// - `bound()`: `below(p) <= distance(p)` wherever `below(p) > 0`, over an `n`³ tiling of 1.5
+///   bound radii;
+/// - `lipschitz(scope)`: `|∇distance| <= lipschitz(scope)` wherever `|distance| < scope` there;
+/// - `interval_near(box)` and `pruned(box).range`: each holds the distance over `boxes` boxes of
+///   three scales, and `distance_live` with `pruned`'s live parts is the distance there (sampled:
+///   an equality isn't an interval's to prove).
+/// Says how many boxes each proved and how many it left to samples.
 pub fn verify_surface_soundness<S: Surface>(s: S, label: str, boxes: u32 = 24, samples: u32 = 128) {
     let b = s.bound()
     let bounded = b.radius > 0.0 && b.radius < 1.0e12
     assert(bounded, f"verify({label}): surface bound radius {b.radius} is not finite positive")
-
     let r = b.radius
-    let outer = Box3 { lo: b.centre - vec3(1.5 * r), hi: b.centre + vec3(1.5 * r) }
-    let inner = Box3 { lo: b.centre - vec3(r), hi: b.centre + vec3(r) }
-    let lip_scope = max(0.25 * r, 0.25)
-    let lip = s.lipschitz(lip_scope)
+    let n: u32 = 6
+    let step = 3.0 * r / f32(n)
+    let lo = b.centre - vec3(1.5 * r)
+    var bound_p = Proven { proven: 0, unproven: 0 }
+    var lip_p = Proven { proven: 0, unproven: 0 }
+    let scope = max(0.25 * r, 0.25)
+    let lip = s.lipschitz(scope)
     let check_lip = lip > 0.0 && lip < 1.0e12
-
-    // 1. Bound lower-bound & Lipschitz soundness across Sobol samples.
-    for i in 0..samples {
-        let p = outer.sample(17, i)
-        let d = s.distance(p)
-        let below = b.below(p)
-        assert(
-            below <= d + 2.0e-3,
-            f"verify({label}): bound().below({p})={below} exceeds distance={d} (culling would drop matter)",
-        )
-        if below > 2.0e-3 {
-            assert(
-                d >= -2.0e-3,
-                f"verify({label}): point {p} outside bound (below={below}) is inside surface (d={d})",
-            )
+    for i in 0..(n * n * n) {
+        let bx = tile(lo, step, n, i)
+        let far = length(max(abs(bx.lo - b.centre), abs(bx.hi - b.centre)))
+        if far > r {
+            let p = prove_bound(s, bx, 0, 2.0e-3, label)
+            bound_p = Proven {
+                proven: bound_p.proven + p.proven,
+                unproven: bound_p.unproven + p.unproven,
+            }
         }
-        if check_lip && abs(d) < lip_scope {
-            let g = gradient(|q: vec3| s.distance(q), p)
-            let gl = length(g)
-            assert(
-                gl <= lip * 1.05 + 2.0e-3,
-                f"verify({label}): ||grad({p})||={gl} exceeds lipschitz({lip_scope})={lip} (marching would step through surface)",
-            )
+        if check_lip {
+            let p = prove_lipschitz(s, bx, scope, lip, 0, label)
+            lip_p = Proven {
+                proven: lip_p.proven + p.proven,
+                unproven: lip_p.unproven + p.unproven,
+            }
         }
     }
-
-    // 2. Multi-scale `pruned`, `interval_near`, and `distance_live` soundness.
+    let inner = Box3 { lo: b.centre - vec3(r), hi: b.centre + vec3(r) }
+    var near_p = Proven { proven: 0, unproven: 0 }
     for bi in 0..boxes {
         let c = inner.sample(31, bi)
         let tier = bi % 3
@@ -65,20 +222,16 @@ pub fn verify_surface_soundness<S: Surface>(s: S, label: str, boxes: u32 = 24, s
         }
         let bx = Box3 { lo: c - vec3(half), hi: c + vec3(half) }
         let pr = s.pruned(bx, |q: vec3| q, 1.0, ALL_LIVE, 0)
-        let iv = s.interval_near(bx)
-        let straddles = pr.range.lo <= 0.0 && pr.range.hi >= 0.0
-        for si in 0..16 {
-            let p = bx.sample(101 + bi, si)
-            let d = s.distance(p)
-            assert(
-                pr.range.lo <= d + 1.0e-3 && d <= pr.range.hi + 1.0e-3,
-                f"verify({label}): pruned range [{pr.range.lo}, {pr.range.hi}] missed d={d} at {p}",
-            )
-            assert(
-                iv.lo <= d + 1.0e-3 && d <= iv.hi + 1.0e-3,
-                f"verify({label}): interval_near [{iv.lo}, {iv.hi}] missed d={d} at {p}",
-            )
-            if straddles {
+        let a = prove_holds(s, bx, s.interval_near(bx), 0, "interval_near", label)
+        let c2 = prove_holds(s, bx, pr.range, 0, "pruned range", label)
+        near_p = Proven {
+            proven: near_p.proven + a.proven + c2.proven,
+            unproven: near_p.unproven + a.unproven + c2.unproven,
+        }
+        if pr.range.lo <= 0.0 && pr.range.hi >= 0.0 {
+            for si in 0..16 {
+                let p = bx.sample(101 + bi, si)
+                let d = s.distance(p)
                 let dl = s.distance_live(p, pr.live)
                 assert(
                     abs(dl - d) <= 1.0e-3,
@@ -87,6 +240,10 @@ pub fn verify_surface_soundness<S: Surface>(s: S, label: str, boxes: u32 = 24, s
             }
         }
     }
+    let _ = samples
+    print(
+        f"verify({label}): bound proven on {bound_p.proven} boxes ({bound_p.unproven} sampled), lipschitz on {lip_p.proven} ({lip_p.unproven} sampled), intervals on {near_p.proven} ({near_p.unproven} sampled)",
+    )
 }
 
 /// Verifies that `Edited<M>`'s `dirty_region()` encloses every point where `edited.distance(p)`

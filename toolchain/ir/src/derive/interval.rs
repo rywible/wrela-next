@@ -2148,7 +2148,31 @@ impl<'a> Ivx<'a> {
 
     /// The four corner products' extremes (unwidened).
     fn mul(&mut self, out: &mut Block, a: Iv, b: Iv, ty: TypeId) -> Iv {
-        self.corners(out, ty, a, b, |s, out, x, y| s.bin(out, BinOp::Mul, x, y, ty))
+        self.corners(out, ty, a, b, |s, out, x, y| {
+            let x = s.finite(out, x, ty);
+            let y = s.finite(out, y, ty);
+            s.bin(out, BinOp::Mul, x, y, ty)
+        })
+    }
+
+    /// `x` held to the largest finite float of its type, on the CPU, where a range's infinite
+    /// bound stands for "unbounded": a product or quotient of bounds then makes no NaN (`0 · MAX`
+    /// is 0, the product of 0 and any finite value, where `0 · ∞` was NaN, which a debug build
+    /// traps as a float operation creating one). Every value is finite, so no range narrows. The
+    /// GPU's bounds are `MAX` already (`inf`).
+    fn finite(&mut self, out: &mut Block, x: ValueId, ty: TypeId) -> ValueId {
+        if matches!(self.target, Target::Gpu) {
+            return x;
+        }
+        let most = match self.elem(ty) {
+            Scalar::F64 => f64::MAX,
+            Scalar::F16 => 65504.0,
+            _ => f32::MAX as f64,
+        };
+        let hi = self.fc(out, ty, most);
+        let lo = self.fc(out, ty, -most);
+        let held = self.builtin(out, Builtin::Min, vec![x, hi], ty);
+        self.builtin(out, Builtin::Max, vec![held, lo], ty)
     }
 
     /// The extremes of `op` at the four corners of `a` × `b` (unwidened).
@@ -2240,7 +2264,21 @@ impl<'a> Ivx<'a> {
 
     fn div(&mut self, out: &mut Block, ty: TypeId, x: &[Iv]) -> R<Iv> {
         let (a, b) = (x[0], x[1]);
-        let r = self.corners(out, ty, a, b, |s, out, x, y| s.bin(out, BinOp::Div, x, y, ty));
+        // Where the divisor's range holds zero the quotient is the whole range
+        // (`unless_divisor_zero`): its corners are divided by 1 there, so none is `0 / 0`.
+        let z0 = self.fc(out, ty, 0.0);
+        let le = self.cmp(out, BinOp::Le, b.0, z0);
+        let ge = self.cmp(out, BinOp::Ge, b.1, z0);
+        let bt = self.bool_ty();
+        let zero_in = self.bin(out, BinOp::And, le, ge, bt);
+        let one = self.fc(out, ty, 1.0);
+        let b0 = self.finite(out, b.0, ty);
+        let b1 = self.finite(out, b.1, ty);
+        let safe = (self.select(out, zero_in, one, b0), self.select(out, zero_in, one, b1));
+        let r = self.corners(out, ty, a, safe, |s, out, x, y| {
+            let x = s.finite(out, x, ty);
+            s.bin(out, BinOp::Div, x, y, ty)
+        });
         // WGSL: 2.5 ulp; WASM: correctly rounded.
         let ulps = if self.gpu() { 6.0 } else { 1.0 };
         let r = self.widen(out, r, ty, ulps, 0.0);
