@@ -876,6 +876,135 @@ impl Af<'_> {
         self.chebyshev(out, a, (lo, hi), alpha, xs, &mut f, ty, (0.5, 5.0))
     }
 
+    /// `sin(a)` or (`cos`) `cos(a)`: the tangent line at the form's centre, with Taylor's
+    /// remainder in `err` (both bend by at most 1, so off the line by at most half the form's
+    /// reach squared), never more than the range `[-1, 1]` allows.
+    fn sin_cos(&mut self, out: &mut Block, a: &A, ty: TypeId, cos: bool) -> A {
+        let r = if cos {
+            self.per_comp(out, &[a], ty, |s, out, x, t| s.sin_cos(out, &x[0], t, true))
+        } else {
+            self.per_comp(out, &[a], ty, |s, out, x, t| s.sin_cos(out, &x[0], t, false))
+        };
+        if let Some(r) = r {
+            return r;
+        }
+        let (f, df) = if cos {
+            let c = self.builtin(out, Builtin::Cos, vec![a.c], ty);
+            let sn = self.builtin(out, Builtin::Sin, vec![a.c], ty);
+            let d = self.emit(out, ty, Expr::Unary(UnOp::Neg, sn));
+            (c, d)
+        } else {
+            let c = self.builtin(out, Builtin::Sin, vec![a.c], ty);
+            let d = self.builtin(out, Builtin::Cos, vec![a.c], ty);
+            (c, d)
+        };
+        let l = (0..self.n).map(|i| self.bin(out, BinOp::Mul, df, a.l[i], ty)).collect();
+        let adf = self.builtin(out, Builtin::Abs, vec![df], ty);
+        let e = self.bin(out, BinOp::Mul, adf, a.e, ty);
+        let r = self.rad(out, a, ty);
+        let r2 = self.bin(out, BinOp::Mul, r, r, ty);
+        let half = self.k(out, ty, 0.5);
+        let rem = self.bin(out, BinOp::Mul, r2, half, ty);
+        // WGSL's sin and cos: within 2^-11 absolutely on [-pi, pi]; past it, nothing: the
+        // range's.
+        let abs_err = self.k(out, ty, if self.gpu() { (2f64).powi(-11) } else { 0.0 });
+        let rem = self.bin(out, BinOp::Add, rem, abs_err, ty);
+        let form = self.grown(out, A { c: f, l, e }, ty, (4.0, 4.0), Some(rem));
+        let one = self.k(out, ty, 1.0);
+        let none = self.k(out, ty, -1.0);
+        let full = self.of_ends(out, none, one, ty);
+        let bt = self.bool_ty;
+        let fine = self.within(out, a);
+        let lim = self.k(out, ty, std::f64::consts::PI);
+        let ac = self.builtin(out, Builtin::Abs, vec![a.c], ty);
+        let reach = self.bin(out, BinOp::Add, ac, r, ty);
+        let in_range = self.cmp(out, BinOp::Le, reach, lim);
+        let gpu_ok = if self.gpu() { in_range } else { fine };
+        let ok = self.emit(out, bt, Expr::Binary(BinOp::And, fine, gpu_ok));
+        // A tighter of the two where the line's reach passes the range: the range alone.
+        let (lo, hi) = self.ends(out, &form, ty);
+        let wide = self.bin(out, BinOp::Sub, hi, lo, ty);
+        let two = self.k(out, ty, 2.0);
+        let narrow = self.cmp(out, BinOp::Lt, wide, two);
+        let ok = self.emit(out, bt, Expr::Binary(BinOp::And, ok, narrow));
+        self.pick(out, ok, &form, &full)
+    }
+
+    /// `atan2(y, x)`: its tangent plane at the forms' centres, with Taylor's remainder in `err`:
+    /// the Hessian of `atan2` has norm `1 / r²`, so off the plane it is within half of that,
+    /// least `r` over the forms' ranges, times their reach squared. Where those ranges hold the
+    /// origin or reach the cut along the negative x-axis, all of `[-pi, pi]`.
+    fn atan2(&mut self, out: &mut Block, y: &A, x: &A, ty: TypeId) -> A {
+        if let Some(r) =
+            self.per_comp(out, &[y, x], ty, |s, out, a, t| s.atan2(out, &a[0], &a[1], t))
+        {
+            return r;
+        }
+        let ry = self.rad(out, y, ty);
+        let rx = self.rad(out, x, ty);
+        let z = self.k(out, ty, 0.0);
+        let ay = self.builtin(out, Builtin::Abs, vec![y.c], ty);
+        let ax = self.builtin(out, Builtin::Abs, vec![x.c], ty);
+        let dy = self.bin(out, BinOp::Sub, ay, ry, ty);
+        let dy = self.builtin(out, Builtin::Max, vec![dy, z], ty);
+        let dx = self.bin(out, BinOp::Sub, ax, rx, ty);
+        let dx = self.builtin(out, Builtin::Max, vec![dx, z], ty);
+        let dy2 = self.bin(out, BinOp::Mul, dy, dy, ty);
+        let dx2 = self.bin(out, BinOp::Mul, dx, dx, ty);
+        let rmin2 = self.bin(out, BinOp::Add, dy2, dx2, ty);
+        // The least r², rounded down a little: the remainder's divisor.
+        let shrink = self.k(out, ty, 1.0 - 16.0 * EPS);
+        let rmin2 = self.bin(out, BinOp::Mul, rmin2, shrink, ty);
+        let cy2 = self.bin(out, BinOp::Mul, y.c, y.c, ty);
+        let cx2 = self.bin(out, BinOp::Mul, x.c, x.c, ty);
+        let rc2 = self.bin(out, BinOp::Add, cy2, cx2, ty);
+        let tiny = self.k(out, ty, 1.0e-30);
+        let rc2 = self.builtin(out, Builtin::Max, vec![rc2, tiny], ty);
+        let ddy = self.bin(out, BinOp::Div, x.c, rc2, ty);
+        let ncy = self.emit(out, ty, Expr::Unary(UnOp::Neg, y.c));
+        let ddx = self.bin(out, BinOp::Div, ncy, rc2, ty);
+        let c = self.builtin(out, Builtin::Atan2, vec![y.c, x.c], ty);
+        let l = (0..self.n)
+            .map(|i| {
+                let a = self.bin(out, BinOp::Mul, ddy, y.l[i], ty);
+                let b = self.bin(out, BinOp::Mul, ddx, x.l[i], ty);
+                self.bin(out, BinOp::Add, a, b, ty)
+            })
+            .collect();
+        let ady = self.builtin(out, Builtin::Abs, vec![ddy], ty);
+        let adx = self.builtin(out, Builtin::Abs, vec![ddx], ty);
+        let ey = self.bin(out, BinOp::Mul, ady, y.e, ty);
+        let ex = self.bin(out, BinOp::Mul, adx, x.e, ty);
+        let e = self.bin(out, BinOp::Add, ey, ex, ty);
+        let ry2 = self.bin(out, BinOp::Mul, ry, ry, ty);
+        let rx2 = self.bin(out, BinOp::Mul, rx, rx, ty);
+        let reach2 = self.bin(out, BinOp::Add, ry2, rx2, ty);
+        let half = self.k(out, ty, 0.5);
+        let rem = self.bin(out, BinOp::Mul, reach2, half, ty);
+        let safe = self.builtin(out, Builtin::Max, vec![rmin2, tiny], ty);
+        let rem = self.bin(out, BinOp::Div, rem, safe, ty);
+        // The partials' own rounding, and WGSL's atan2 (within 4096 ulps of pi, and 2^-20).
+        let abs_err = self.k(out, ty, if self.gpu() { (2f64).powi(-20) } else { 0.0 });
+        let rem = self.bin(out, BinOp::Add, rem, abs_err, ty);
+        let form = self.grown(out, A { c, l, e }, ty, (8.0, 8192.0), Some(rem));
+        // The cut: x reaching zero or below while y spans zero (which the origin also needs).
+        let bt = self.bool_ty;
+        let xlo = self.bin(out, BinOp::Sub, x.c, rx, ty);
+        let x_neg = self.cmp(out, BinOp::Le, xlo, z);
+        let y_spans = self.cmp(out, BinOp::Le, ay, ry);
+        let cut = self.emit(out, bt, Expr::Binary(BinOp::And, x_neg, y_spans));
+        let pi = std::f64::consts::PI;
+        let lo = self.k(out, ty, -pi);
+        let hi = self.k(out, ty, pi);
+        let full = self.of_ends(out, lo, hi, ty);
+        let w = self.within(out, y);
+        let w2 = self.within(out, x);
+        let ok = self.emit(out, bt, Expr::Binary(BinOp::And, w, w2));
+        let not_cut = self.emit(out, bt, Expr::Unary(UnOp::Not, cut));
+        let ok = self.emit(out, bt, Expr::Binary(BinOp::And, ok, not_cut));
+        self.pick(out, ok, &form, &full)
+    }
+
     fn exp(&mut self, out: &mut Block, a: &A, ty: TypeId) -> A {
         if let Some(r) = self.per_comp(out, &[a], ty, |s, out, x, t| s.exp(out, &x[0], t)) {
             return r;
@@ -1702,6 +1831,15 @@ impl Af<'_> {
             B::Sqrt => {
                 let a = self.of_as(out, args[0], ty);
                 self.sqrt(out, &a, ty)
+            }
+            B::Sin | B::Cos => {
+                let a = self.of_as(out, args[0], ty);
+                self.sin_cos(out, &a, ty, b == B::Cos)
+            }
+            B::Atan2 => {
+                let y = self.of_as(out, args[0], ty);
+                let x = self.of_as(out, args[1], ty);
+                self.atan2(out, &y, &x, ty)
             }
             B::InverseSqrt => {
                 let a = self.of_as(out, args[0], ty);

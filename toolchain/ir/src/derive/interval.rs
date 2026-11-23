@@ -2507,11 +2507,7 @@ impl<'a> Ivx<'a> {
                 let x = if b == B::Acos { (fh, fl) } else { (fl, fh) };
                 self.inverse_trig_widen(out, x, ty)
             }
-            B::Atan2 => {
-                let pi = std::f64::consts::PI;
-                let x = (self.fc(out, ty, -pi), self.fc(out, ty, pi));
-                self.inverse_trig_widen(out, x, ty)
-            }
+            B::Atan2 => self.per_comp(out, ty, &r, Self::atan2)?,
             B::Fract => self.per_comp(out, ty, &r, Self::fract)?,
             B::Mix => self.per_comp(out, ty, &r, Self::mix)?,
             B::Smoothstep => self.per_comp(out, ty, &r, Self::smoothstep)?,
@@ -2757,6 +2753,42 @@ impl<'a> Ivx<'a> {
         let hi = self.select(out, pos, hi, fh);
         let ulps = if self.gpu() { 4.0 } else { 2.0 };
         Ok(self.widen(out, (lo, hi), ty, ulps, 0.0))
+    }
+
+    /// `atan2(y, x)` over a box of `(y, x)`: the angles of its corners where the box neither holds
+    /// the origin nor reaches the cut along the negative x-axis (there the angle is continuous,
+    /// and a convex region's angular extent, seen from a point outside it, is spanned by its
+    /// corners), else all of `[-pi, pi]`.
+    fn atan2(&mut self, out: &mut Block, ty: TypeId, a: &[Iv]) -> R<Iv> {
+        let (y, x) = (a[0], a[1]);
+        let z = self.fc(out, ty, 0.0);
+        let pi = std::f64::consts::PI;
+        let full = (self.fc(out, ty, -pi), self.fc(out, ty, pi));
+        let mut lo = None;
+        let mut hi = None;
+        for yy in [y.0, y.1] {
+            for xx in [x.0, x.1] {
+                let c = self.builtin(out, Builtin::Atan2, vec![yy, xx], ty);
+                lo = Some(match lo {
+                    None => c,
+                    Some(l) => self.builtin(out, Builtin::Min, vec![l, c], ty),
+                });
+                hi = Some(match hi {
+                    None => c,
+                    Some(h) => self.builtin(out, Builtin::Max, vec![h, c], ty),
+                });
+            }
+        }
+        // The cut: x reaching zero or below while y spans zero (the origin among it).
+        let bt = self.bool_ty();
+        let x_neg = self.cmp(out, BinOp::Le, x.0, z);
+        let y_lo = self.cmp(out, BinOp::Le, y.0, z);
+        let y_hi = self.cmp(out, BinOp::Ge, y.1, z);
+        let ys = self.bin(out, BinOp::And, y_lo, y_hi, bt);
+        let cut = self.bin(out, BinOp::And, x_neg, ys, bt);
+        let l = self.select(out, cut, full.0, lo.unwrap());
+        let h = self.select(out, cut, full.1, hi.unwrap());
+        Ok(self.inverse_trig_widen(out, (l, h), ty))
     }
 
     fn pow(&mut self, out: &mut Block, ty: TypeId, x: &[Iv]) -> R<Iv> {

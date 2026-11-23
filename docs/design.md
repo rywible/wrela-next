@@ -726,10 +726,9 @@ so what it doesn't understand costs time, which the bench sees, and not holes.
 - **Exact cells by rule, not by tuning (`extract.wrela`).** `needs_exact_cell` and its fifteen
   constants are gone. A quad gets exact cells for its four cells when it may hold the mesh's
   outline seen from the eye (`on_outline`: a triangle or vertex normal faces it and one faces
-  away, allowing the eye to move a step, `eye_step`, as far as `EYE_ANGLE` turns a plane before
-  the eye's key re-meshes), or when a triangle is wound against its normals (folded, so culled);
-  a quad whose normals turn too little for its chord to stand half a pixel off the surface
-  (`(L/2)·tan(θ/4)`, a circle's arc) is passed. Each outline cell's wholly outside face
+  away, allowing the eye to move a step, `eye_step`, before the eye's key re-meshes), or when a
+  triangle is wound against its normals (folded, so culled). (Since 2026-11-23 an outline quad's
+  cells are certified or solved, and nothing is passed on its normals alone: below.) Each outline cell's wholly outside face
   neighbours get one too (`dilate_outline`: a tip or crest finer than a cell reaches into them;
   the broken pillar's tip was a hole until it did). Every coarse cell on a 2:1 seam between
   levels gets one, with its live parts (`box_seam_cells`; the fine side's cells alone didn't close
@@ -937,6 +936,87 @@ a42da44, same session, three runs a build): nothing seen. M4: SCENE 10 24.1-25.1
 24.5-24.9 ms, SCENE 11 14.1-15.0 and 14.3-14.4 against 13.8-14.7 ms (two sessions of runs; the
 eye pass 5.07 against 5.04 ms). Radeon: SCENE 10 49.4-50.0 against 49.6-50.1 ms, SCENE 11
 40.8-41.1 against 40.9-41.5 ms.
+
+### Outline cells certified, not passed on their normals (2026-11-23)
+
+The last rule by eye in the exact cells was the curvature exemption: an outline quad whose
+vertex normals turned too little for a circle's arc between them to stand half a pixel off its
+chord was given no exact cells. A field that bends between two vertices (a bump, a fold the
+normals don't see) was passed on that assumption. It is gone. Every outline quad's cells are put
+up for a certificate (`box_outline`, once each), and after a batch's chunks `certify_outline`
+certifies each or gives it an exact cell; a folded quad's cells are solved at once, as before.
+
+**The certificate** (`engine::matter::certify::certify_sheet`): the surface inside the cell
+provably lies in a slab a pixel wide (two `HOLE_PX`) parallel to the plane of the cell's mesh
+vertex. The vertex lies on the surface, so the mesh's vertices and triangles lie in any slab that
+holds the surface's, and mesh and surface stand within the slab's width of each other across it:
+the outline's error the audit budgets, never a crack. The proof runs in the plane's own frame (the
+field composed with the rotation, which affine forms carry exactly), over a box holding the cell,
+halved only across the plane, at most `SHEET_VISITS` (7) parts. A part is done when its affine
+range keeps off zero (no surface), when it is thin enough to lie in the slab, or when the affine
+range of what the field differs from the plane by places its surface in the slab (sums are exact
+in affine arithmetic: the plane's part cancels and only the field's bending is left). Not
+certified is not a fault: the cell is solved.
+
+**The compiler, made able to prove it** (the scoreboard, `game/world/certificates.wrela`, run in
+`tools/check`: for each field, cells at 1, 2.7 and 8 cm round points where rays meet its surface,
+and the share certified):
+- `atan2`'s interval was all of `[-pi, pi]` over any box: its corners now bound it where the box
+  holds neither the origin nor the cut (`ir::derive::interval`). The fluted pillars went from 45%
+  to 98% certified (plain intervals, a quarter-cell slab), the marble column from 25% to 99%.
+- `sin`, `cos` and `atan2` had no affine rule (the form lost its slopes there and took the
+  interval's range): each is now its tangent at the centre with Taylor's remainder (`ir::derive::
+  affine`: `sin` and `cos` bend by at most 1, `atan2` by `1 / r²`, `r` least over the ranges).
+- The residual trick took the stack from 6% to 96-100% (plain intervals can't see that a field is
+  its tangent plane plus a little; affine forms can).
+- Halving across the plane, not into eight: a box-built field's `length(max(q, 0)) + min(max(q),
+  0)` loses its affine slopes wherever a box straddles the face, and only thinning the box across
+  it settles that in a few halvings (with eight-way halving the citadel and stage were 1-7%).
+
+Certified with a pixel-wide slab (`h / 2.5`), 8 parts, at 1 / 2.7 / 8 cm: stage, courtyard and
+citadel 96-100%; stack 100 / 98 / 15%; glass shard 96 / 10 / 0%; parry arc 55 / 51 / 10%; rival orb
+60 / 35 / 0 of 60; fluted pillars 47 / 44 / 35%; marble column 33 / 29 / 17%; the creature 0-1%
+(skinned: its posed field's derivation is out of the frame proof's reach, and its cells are
+solved). What fails is the fluted shafts' own `max` straddling the surface while the flutes bend
+it, and small things' real curvature at coarse cells.
+
+**What it costs** (1080p, frame span against 1842c65, same session, three runs a build; passes timed
+alone). M4: SCENE 10 **25.0-26.5 → 27.0-27.9 ms** (+1.5 to 3 ms over the day's runs; the exact pass
+1.72 → 2.15 ms, certifying 0.26 ms); SCENE 11 **14.2-14.5 → 13.8-14.2 ms** (the exact pass 2.55 →
+1.34 ms). Radeon (validation silent): SCENE 10 **48.8-49.2 → 48.7-49.5 ms** (the exact pass 4.01 →
+3.46 ms, certifying 0.31 ms); SCENE 11 **41.0-41.2 → 35.0-35.5 ms** (the exact pass 9.82 → 4.48 ms).
+The exact pass is where it shows: certified box faces leave it (the citadel's most), fluted shafts
+that the curvature rule passed join it (the arena's). On the M4 this misses the line set for it (no
+slower on either scene) on SCENE 10, and lands anyway: what it costs there is cells that were passed
+on an assumption and are now proven or solved, and the Radeon, the slower machine, gains. The way
+back is the affine forms of `max` and `min` where they straddle (the box-built formula's two halves
+lose their slopes independently and don't cancel), a compiler change the scoreboard measures
+directly.
+
+**The extraction, to carry it:**
+- *The facing test's slack was the eye's angle times each quad's distance:* far beyond the eye,
+  every grazing quad (a floor to the horizon) was both facing and not, and the curvature rule
+  had hidden it. A plane's side of the eye changes by no more than the eye moves (`facing`'s
+  `reach`: `√3 · eye_step` of the nearest surface, `MeshBatch::eye_reach`), however far the
+  plane is.
+- *Certification runs once a batch, not a chunk* (its candidates carry their brick in the batch's
+  active list and their vertex), in `CERT_SLICES` (22) slices of `CERT_SLICE` (6,144: the Radeon guard's limit is 7,177 for the stack): each slice
+  dispatched even when empty, and 16 a chunk had cost SCENE 10 about 2 ms of dispatch alone.
+  Past them, `OVERFLOW_THIN`.
+
+**Measured and not kept.**
+- *A model of up to three planes from the cell's own Hermite data* (sheets, creases and corners,
+  as Dual Contouring's vertex is), proven by axis-aligned halving: the box-built fields reached
+  98-100%, but its GPU kernel was 327 KiB of Metal, over the 288 KiB limit, until its closures
+  were made one; then one invocation's worst case held the GPU past 50 ms at any slice size until
+  its visits were cut to where creases rarely certified. The vertex's plane needs no model, no
+  gradients and a fifth of the work.
+- *A brick's own steepness from the interval of its gradient* (above): no use on noise.
+
+**Known gap found on the way:** at 320x180, 12 eyes, the committed engine already left 14 cracks
+on the citadel's gate with the crowd behind it and put the crowd's outline over budget (23 against
+12), as it does with this change; the gate's sizes (160x90, 640x360) don't show it. The crowd's
+shared, skinned mesh has no exact cells: the next hole to close.
 
 ## The layers
 
