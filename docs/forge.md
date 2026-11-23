@@ -24,7 +24,7 @@ beside it. Change this file in the same change that makes it wrong.
 | Its test fixture | `tools/forge-fixtures/leg/` (a leg written well and written badly) |
 | Concept views and references on Colab | `tools/forge-notebooks/` |
 | An asset's working material | `.forge/<asset>/`: `brief.md`, `forge.json` (its source, field, size, fit stages and chain), `prompts.json`, `reference/` (mesh, `samples.bin`), `work/` (the fitter's copy), `judge/`, `fits/`, `scores.json` |
-| The vocabulary | `lib/kit/shapes/` (`outline`, `making`, `carve`, `ornament`, `made`) and `lib/kit/substances/` (`wood`, `leather`, `brass`, `paper`) |
+| The vocabulary | `lib/kit/shapes/` (`outline`, `making`, `carve`, `ornament`, `wear`, `made`, `craft`) and `lib/kit/substances/` (`wood`, `leather`, `brass`, `paper`) |
 | The judge's and fitter's wrela | `lib/engine/judge/samples.wrela` |
 | The first gold assets | `game/world/table.wrela`, `game/world/grimoire.wrela`; SCENE 11 shows them |
 
@@ -48,7 +48,15 @@ first and a model comes last and has to earn its place. The ladder, and what of 
    angle it cuts (`kit::shapes::carve`: `groove`); wear comes from the shape's own story
    (`kit::shapes::made::Story`: a convex edge is exposed and rubbed, a cove or a carving's ground
    is recessed and dirty; brass is polished where exposed and tarnished in hollows). The shape and
-   its look come from the same numbers, so they agree.
+   its look come from the same numbers, so they agree. Use and the hand leave their own marks
+   (`kit::shapes::wear`): `dinged` (shallow dents, recessed in the story so dirt and wax sit in
+   them), `cupped` (a board moved with the seasons); a carving's gouge leaves facets on what stands
+   (`carved`'s `tooling`) and a carver's hand makes each of a row a little different (`row`'s
+   `wander`); oak's rings differ year to year and its surface carries scratches, grime and a worn
+   finish, leather crazes, scuffs and wears through at its edges, paper stains, brass smudges.
+   Every mark keeps a part's bound near 1 (a test holds each gold asset to 1.05, the engine's
+   steepness): a mark that would step a surface (a book's uneven gatherings, set back in the
+   shape, made the grimoire's bound 8.8) belongs to its material.
 4. **Ornament rules** (`kit::shapes::ornament`): motifs built from blades (lens-shaped lobes on a
    bowed spine) and grooves (U-gouge cuts) — `acanthus`, `scroll`, `rosette`, `bead_and_reel`,
    `egg_and_dart`, `flute`, `lobe` — and the rules they repeat by: `mirrored`, `row` (along a path,
@@ -92,18 +100,53 @@ them, and none is a weight.
 - **No fixed cell floor.** A thing's cells were never finer than 5 mm, beside the batch's own
   budget floor (`size_floor`: its bound's radius over 180). A book or a candlestick at 60 cm got
   5 mm cells (facets 15 to 30 px wide); now they get what the budget allows, about a millimetre.
+- **A pixel asks only its part, and only what changes from pixel to pixel.** Every pixel of the
+  table asked the whole table's shape (to tell its story: exposed, recessed, which piece) and
+  every part's material, about four fifths of what a pixel cost. Now a field says which part
+  decides a point and what slow-changing numbers it keeps there (`Field::kept_at`: for a made
+  shape, its story), the mesher works them out once a vertex (`keep_verts`) and the vertex carries
+  them, and a pixel asks only that part's material with them (`Field::channels_kept`). A union
+  routes by part, so a pixel never asks a material that isn't its own. A material may use what is
+  kept smoothly; a sharp edge in it alone draws the mesh's triangles, so a sharp change (leather
+  worn through) is broken by noise at the pixel.
+- **No vertex kernel asks a material.** Making a vertex asked its field's whole material only to
+  learn whether it lets light through (which triangles it goes with), so every kernel that made
+  vertices carried the oak's grain, scratches and grime: the worn table's `refine_creases` came
+  to 348 KiB. Now `keep_verts`, run on each chunk's vertices before its triangles are made, is
+  the one kernel that asks a material, and the vertex's kept word carries the answer
+  (`KEPT_TRANS`); the skinned path does the same (`keep_rest_verts`).
+- **The finer cull asks what the coarse one does.** A steep thing's bricks are checked again in
+  octants, and that check derived its range by interval arithmetic through the whole field (the
+  dented table's `cull_bricks` 381 KiB); it now asks the same range the brick's own check does
+  (`Surface::pruned`), which a made shape answers from its bound and a union part by part.
+
+- **Physical material bump at pixel rate (`Substance::bump`).** Features finer than a mesh cell
+  (oak's sunken pores, latewood ridges, plank seams and hand-chiseled gouge facets; leather's
+  pebbles, crazing and blind-tooled grooves; paper's stacked deckled leaf edges; brass hammering
+  and corrosion pits) return a physical height offset in metres (`Substance::bump`), tilted into
+  the shading normal at pixel rate via Mikkelsen (2010) screen-space surface gradients in
+  `lib/engine/mesh/draw.wrela::apply_micro_relief` with footprint attenuation and clearcoat fill,
+  at zero extra geometry cost and Lipschitz 1.
+- **Sculpted C¹ carving & unbroken running scrolls.** `Blade` switched from a sharp-walled
+  `1 - x⁴` mesa to a C¹ `(1 - x²)^(3/2)` cushion profile (cutting its slope bound 2.5× so carvings
+  mesh cleanly even at `r / 180` without faceted spikes), `Row`'s hand `wander` tapers to zero at
+  cell edges (`cos(π s / period)`) so running scrolls never sever between cells, and
+  `resolve_normal_from` relaxes its smooth-normal threshold (`0.85` to `0.65`) so curved relief
+  stays smooth while crisp creases stay sharp.
+- **Fluent, unit-suffixed asset vocabulary (`kit::shapes::craft`).** Gold assets compose parts
+  left-to-right with `.at(...)`, `.carve_round(...)`, `.joined_to(...)`, `.named_piece(...)` and
+  `.in_material(...)`, pair profile points with their bows (`pt(vec2(...), bow: ...)`), write
+  physical measures with Wrela SI suffixes (`cm`, `mm`, `deg`), and return opaque `Craft` /
+  `Asset` trait types with zero nested type-alias boilerplate.
+- **Spatial judge diagnostics.** `tools/forge judge` reports `by_part` and `by_height` error
+  breakdowns (mean and 95th-percentile mm per named part and across 5 vertical bands) alongside
+  overall scores, and handles SI unit literals in literal counts and scrambling.
 
 Gaps filed (an author needed this, for that):
 
-- **A thing has one cell size.** The extractor sizes a thing's cells once, from its nearest point
-  to the eye and its budget (its bound's radius over 180), so a 1.2 m table is meshed at 4.4 mm
-  everywhere, its carving at 60 cm too: the relief is there in the field (a CPU depth map of the
-  frieze shows the rosette and the scroll whole) and comes out faceted on the screen. Carving at
-  the hero distance needs cells that follow the eye across a thing (bricks nearer the eye finer,
-  with their seams kept closed): the next piece of engine work this showcase asks for, and what
-  phase 1's kill line has to wait on, since a carving the engine can't show can't be judged at
-  the hero distance.
-
+- **A thing still has one uniform cell size.** `size_floor = r / 180` keeps all existing scenes
+  within the 8,192-brick batch budget; view-adaptive per-brick LOD (bricks nearer the eye finer,
+  with seams kept closed) remains the general engine fix for even finer hero-distance carving.
 - **A scene's kinds of thing share one shader.** The SDF clipmap's splat (`sdf_splat_boxes`)
   holds every kind of thing's distance code in one pipeline: SCENE 11 (the stage, the table, the
   grimoire) reached 290 KiB of MSL, over Metal's 288, when outlines kept a record of each segment
@@ -114,14 +157,18 @@ Gaps filed (an author needed this, for that):
   radii) depend only on the asset's numbers, yet the shading pass computed them at every pixel:
   the compiler refused the candlestick's 22 of them (E0712, 304 work). Outlines now work each
   segment out where they are built (`outline::arc_of`), which the fitter still differentiates.
-- The engine's micro relief (`Substance::micro`) has one fixed world scale (features 0.2 to
-  1.2 m): a material can't say its grain is 1 mm (leather's pebbles), so the materials leave it at 0.
+- ~~The engine's micro relief (`Substance::micro`) has one fixed world scale~~: closed for
+  material-authored scale via `Substance::bump` (above).
 - Channels are evaluated at a pixel's centre with no footprint, and `lib/kit` may not ask for one
   (tools/layers rule 3): oak's 2 mm rings shimmer at room distance until TSR settles them. The
   engine should filter channels by the pixel's footprint, as it does distances.
-- Union's channels ask every part's material (`Field<C>` for `Union`); the forge's assets put one
-  material over all their pieces (`Story::piece` picks each piece's log) to stay within the
-  shading shader's `@budget(work: 8000)`.
+- ~~Union's channels ask every part's material~~: closed, a pixel asks only its part's
+  (`Field::channels_kept`, above). The assets still put one oak over all a table's pieces
+  (`Story::piece` picks each piece's log), as a joiner works one stock.
+- **A thing with one dent is steep everywhere.** The engine knows one Lipschitz bound a thing, so
+  a mark's slope anywhere sets how finely the whole thing is meshed and culled: dents had to be
+  made gentle (1 in 40) to keep the gold set's bounds under 1.05. Bounds by region, as cells by
+  region (above), would let a carving be steep where it is carved alone.
 
 ## The judge
 

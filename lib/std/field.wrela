@@ -3799,6 +3799,31 @@ pub trait Field<C>: Surface {
     fn rest_channels(self, p: vec3) -> C {
         self.channels(p)
     }
+
+    /// What the field keeps at a point `p` of its surface where the engine makes a mesh of it,
+    /// `part` being the part there (`part_at`): four numbers in [0, 1] that change slowly across
+    /// the surface (how worn a point is, how deep a cut, from the shape that made it), worked out
+    /// once, at each vertex, and blended across each triangle, so a pixel need not work them out
+    /// again (`channels_kept`). None by default.
+    fn kept(self, p: vec3, part: u32) -> vec4 {
+        vec4(0.0)
+    }
+
+    /// The channels at `p`, `part` being the part it is on (as the mesh keeps it, the part at the
+    /// triangle's first vertex) and `kept` what `kept` gave there, blended: what a pixel asks. A
+    /// union asks only the part, not every part; a field that keeps what it would otherwise work
+    /// out again at every pixel answers from it. By default, `channels(p)`.
+    fn channels_kept(self, p: vec3, part: u32, kept: vec4) -> C {
+        self.channels(p)
+    }
+
+    /// The distance at `p`, the part there (`part_at`) and what the field keeps there (`kept`),
+    /// from one evaluation where a field can give them so: what the engine asks of each vertex
+    /// of its mesh.
+    fn kept_at(self, p: vec3) -> (f32, u32, vec4) {
+        let (d, i) = self.part_at(p)
+        (d, i, self.kept(p, i))
+    }
 }
 
 /// How channels mix where surfaces blend. A channel struct declares it and gets it field by
@@ -4176,6 +4201,27 @@ impl<C: Blend, A: Field<C>, B: Field<C>> Field<C> for Union<A, B> {
         self.distance_and_channels(p).1
     }
 
+    /// The part's own operand's.
+    fn kept(self, p: vec3, part: u32) -> vec4 {
+        let n = self.a.parts()
+        if part < n { self.a.kept(p, part) } else { self.b.kept(p, part - n) }
+    }
+
+    /// The part's own operand's, the other not asked.
+    fn channels_kept(self, p: vec3, part: u32, kept: vec4) -> C {
+        let n = self.a.parts()
+        if part < n { self.a.channels_kept(p, part, kept) } else {
+            self.b.channels_kept(p, part - n, kept)
+        }
+    }
+
+    /// The nearer operand's; a tie takes `a`'s.
+    fn kept_at(self, p: vec3) -> (f32, u32, vec4) {
+        let (da, ia, ka) = self.a.kept_at(p)
+        let (db, ib, kb) = self.b.kept_at(p)
+        if da <= db { (da, ia, ka) } else { (db, self.a.parts() + ib, kb) }
+    }
+
     /// The nearer part's channels; a tie takes `a`'s.
     fn distance_and_channels(self, p: vec3) -> (f32, C) {
         let (da, ca) = self.a.distance_and_channels(p)
@@ -4216,6 +4262,19 @@ impl<C, S: Field<C>, M: PointMap> Field<C> for Warp<S, M> {
         self.inner.channels(self.map.local(p))
     }
 
+    fn kept(self, p: vec3, part: u32) -> vec4 {
+        self.inner.kept(self.map.local(p), part)
+    }
+
+    fn channels_kept(self, p: vec3, part: u32, kept: vec4) -> C {
+        self.inner.channels_kept(self.map.local(p), part, kept)
+    }
+
+    fn kept_at(self, p: vec3) -> (f32, u32, vec4) {
+        let (d, i, k) = self.inner.kept_at(self.map.local(p))
+        (self.map.distance_out(d), i, k)
+    }
+
     fn distance_and_channels(self, p: vec3) -> (f32, C) {
         let (d, c) = self.inner.distance_and_channels(self.map.local(p))
         (self.map.distance_out(d), c)
@@ -4250,6 +4309,36 @@ impl<C, S: Field<C>, N: Noise> Field<C> for Displace<S, N> {
 impl<C: Blend, S: Field<C>, const N: u32> Field<C> for UnionAll<S, N> {
     fn channels(self, p: vec3) -> C {
         self.distance_and_channels(p).1
+    }
+
+    /// The part's own element's, its parts numbered after the elements' before it.
+    fn kept(self, p: vec3, part: u32) -> vec4 {
+        var first: u32 = 0
+        var k = vec4(0.0)
+        for i in 0..N {
+            let n = self.parts[i].parts()
+            if part >= first && part < first + n {
+                k = self.parts[i].kept(p, part - first)
+            }
+            first += n
+        }
+        k
+    }
+
+    /// The part's own element's, no other asked.
+    fn channels_kept(self, p: vec3, part: u32, kept: vec4) -> C {
+        var first: u32 = 0
+        var at: u32 = 0
+        var local: u32 = 0
+        for i in 0..N {
+            let n = self.parts[i].parts()
+            if part >= first && part < first + n {
+                at = i
+                local = part - first
+            }
+            first += n
+        }
+        self.parts[at].channels_kept(p, local, kept)
     }
 
     fn distance_and_channels(self, p: vec3) -> (f32, C) {
@@ -4320,6 +4409,15 @@ impl<C, S: Field<C>> Field<C> for Mirror<S> {
         self.inner.channels(mirrored(p))
     }
 
+    /// A part as written or its image (`parts`): the part's own, at the point mirrored.
+    fn kept(self, p: vec3, part: u32) -> vec4 {
+        self.inner.kept(mirrored(p), part % self.inner.parts())
+    }
+
+    fn channels_kept(self, p: vec3, part: u32, kept: vec4) -> C {
+        self.inner.channels_kept(mirrored(p), part % self.inner.parts(), kept)
+    }
+
     fn distance_and_channels(self, p: vec3) -> (f32, C) {
         self.inner.distance_and_channels(mirrored(p))
     }
@@ -4328,6 +4426,18 @@ impl<C, S: Field<C>> Field<C> for Mirror<S> {
 impl<C, S: Field<C>> Field<C> for Named<S> {
     fn channels(self, p: vec3) -> C {
         self.inner.channels(p)
+    }
+
+    /// Its inner field's, where that is one part; one named part of several parts can't say which
+    /// of them a point is on, so it keeps nothing and a pixel asks the whole.
+    fn kept(self, p: vec3, part: u32) -> vec4 {
+        if self.inner.parts() == 1 { self.inner.kept(p, 0) } else { vec4(0.0) }
+    }
+
+    fn channels_kept(self, p: vec3, part: u32, kept: vec4) -> C {
+        if self.inner.parts() == 1 { self.inner.channels_kept(p, 0, kept) } else {
+            self.inner.channels(p)
+        }
     }
 
     fn distance_and_channels(self, p: vec3) -> (f32, C) {

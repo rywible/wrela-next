@@ -15,7 +15,7 @@ use matter::swarm::{NoSwarm, Swarm}
 use matter::world::{And, Many, One, World}
 use mesh::extract::{
     ExtractScratch, MeshBatch, MeshVertex, eval_dqs, extract_scratch, mesh_batch, size_floor, steep,
-    unpack_oct_normal, unpack_smooth, unpack_thing,
+    unpack_oct_normal, unpack_smooth, unpack_thing, kept_part, unpack_kept,
 }
 use mesh::height::{CLIP_RINGS, ClipmapMesh, MeshVary, clipmap_mesh, height_vs}
 use mesh::light::{
@@ -68,6 +68,10 @@ struct FieldVary: Copy {
     local_p: vec3,
     normal: vec3,
     meta: vec2,
+    /// The part the triangle's first vertex is on (not interpolated: an integer), and what the
+    /// field kept at each vertex, blended (`Field::kept`, `channels_kept`).
+    part: u32,
+    kept: vec4,
 }
 
 /// Interpolator payload for GPU Dual Quaternion Skinned meshlets: adds rest-pose local `rest_p`
@@ -128,6 +132,7 @@ fn shadow_fs() -> vec4 {
 @vertex
 fn mesh_vs(
     verts: [MeshVertex],
+    vert_kept: [u32],
     xforms: [Rigid],
     prev_xforms: [Rigid],
     inst_ids: [u32],
@@ -152,6 +157,8 @@ fn mesh_vs(
         local_p: lp,
         normal: n,
         meta: vec2(smooth, f32(tid) + 0.5),
+        part: kept_part(vert_kept[2 * vi.index]),
+        kept: unpack_kept(vert_kept[2 * vi.index + 1]),
     }
 }
 
@@ -243,7 +250,7 @@ fn vary_substance(vary: MeshVary) -> Substance {
         subsurface: clamp(vary.optics.y, 0.0, 1.0),
         coat: clamp(vary.optics.z, 0.0, 1.0),
         micro: clamp(vary.optics.w, 0.0, 1.0),
-        pad0: 0.0,
+        bump: 0.0,
         pad1: 0.0,
         pad2: 0.0,
     }
@@ -281,24 +288,47 @@ fn micro_field_grad(p: vec3) -> vec4 {
     vec4(g1 + g2 + g3, v1 + v2 + v3)
 }
 
-/// Applies per-pixel 3D field-space microsurface relief (normal bump + roughness/albedo micro-grain)
-/// with automatic distance attenuation so distant surfaces never alias. The relief is evaluated at
-/// the material point `mp` (the thing's extraction-space or rest-pose point, which moves with it, so
-/// the grain never swims over a moving or skinned surface); its analytic gradient is carried to the
-/// world surface at `wp` through the pixel's screen derivatives of both points (Mikkelsen 2010
-/// surface-gradient bump mapping), exact for any rigid or skinned map from `mp` to `wp`.
+/// Applies per-pixel surface-gradient microsurface relief to the shading normal and material:
+/// first from any material-authored physical height offset `sub.bump` (in metres: wood pores,
+/// leather grain, blind tooling, paper leaves, gouge facets) via Mikkelsen (2010) screen-space
+/// surface gradients; then, when `sub.micro > 0.01`, from the analytic 3D wave field at `mp`.
+/// Both fade out gracefully with pixel footprint / distance so distant surfaces never alias.
 fn apply_micro_relief(wp: vec3, mp: vec3, n: vec3, sub: Substance, dist: f32) -> (vec3, Substance) {
     // Derivatives first, while every pixel of the quad still runs this code.
     let dwx = dpdx(wp)
     let dwy = dpdy(wp)
     let dmx = dpdx(mp)
     let dmy = dpdy(mp)
+    let dbx = dpdx(sub.bump)
+    let dby = dpdy(sub.bump)
+    var n_cur = n
+    let r1 = cross(dwy, n)
+    let r2 = cross(n, dwx)
+    let det = dot(dwx, r1)
+    if abs(dbx) + abs(dby) > 1.0e-9 && abs(det) > 1.0e-12 {
+        // Pixel tangent-plane footprint (m) and slope of `sub.bump` (dimensionless, m / m).
+        let px_span = sqrt(abs(det))
+        let bump_fade = clamp(1.0 - (px_span - 0.008) / 0.025, 0.0, 1.0)
+        // Skip silhouette jumps where one quad spans a huge depth discontinuity.
+        let quad_jump = max(length(dwx), length(dwy))
+        if bump_fade > 0.01 && quad_jump < 0.05 {
+            let g_raw = (r1 * dbx + r2 * dby) * (1.0 / det)
+            let coat_fill = 1.0 - 0.35 * clamp(sub.coat, 0.0, 1.0)
+            let g_scaled = g_raw * (bump_fade * coat_fill)
+            let gl = length(g_scaled)
+            let g_clamped = if gl > 1.15 { g_scaled * (1.15 / gl) } else { g_scaled }
+            let n_try = normalize(n - g_clamped)
+            if dot(n_try, n) > 0.25 {
+                n_cur = n_try
+            }
+        }
+    }
     if sub.micro <= 0.01 {
-        return (n, sub)
+        return (n_cur, sub)
     }
     let fade = clamp(1.0 - (dist - 4.0) / 28.0, 0.0, 1.0)
     if fade <= 0.01 {
-        return (n, sub)
+        return (n_cur, sub)
     }
     let mg = micro_field_grad(mp)
     let amp = sub.micro * fade
@@ -306,16 +336,13 @@ fn apply_micro_relief(wp: vec3, mp: vec3, n: vec3, sub: Substance, dist: f32) ->
     // along each screen axis (`dot(g, dm)`) spread over the world tangent frame (`r1`, `r2`), so the
     // normal tilts physically without flipping. A clearcoat film (`coat > 0.2`) fills the
     // micro-pores beneath it, so its normal tilts about half as far and its reflections stay crisp.
-    let r1 = cross(dwy, n)
-    let r2 = cross(n, dwx)
-    let det = dot(dwx, r1)
     let g_tan = if abs(det) > 1.0e-20 {
         (r1 * dot(mg.xyz, dmx) + r2 * dot(mg.xyz, dmy)) * (1.0 / det)
     } else {
-        mg.xyz - n * dot(mg.xyz, n)
+        mg.xyz - n_cur * dot(mg.xyz, n_cur)
     }
     let bump_s = if sub.coat > 0.2 { 0.024 } else { 0.045 }
-    let n_bumped = normalize(n - g_tan * (amp * bump_s))
+    let n_bumped = normalize(n_cur - g_tan * (amp * bump_s))
     let grain = clamp(mg.w, -1.0, 1.0)
     let albedo_mod = clamp(sub.albedo * (1.0 + grain * amp * 0.14), vec3(0.01), vec3(1.0))
     let rough_mod = clamp(sub.roughness + grain * amp * 0.12, 0.03, 1.0)
@@ -345,7 +372,7 @@ fn resolve_normal_from(wp: vec3, normal: vec3, smooth: f32, ray_back: vec3) -> v
             nf = -nf
         }
     }
-    if smooth < 0.5 || dot(nv, nf) < 0.85 { nf } else { nv }
+    if smooth < 0.5 || dot(nv, nf) < 0.65 { nf } else { nv }
 }
 
 /// Exact screen-space motion `prev_uv - curr_uv` of a surface point now at `wp` and last frame at
@@ -389,7 +416,7 @@ fn field_gbuf_one_fs<M: Field<Substance>>(
     v: View,
     prev_v: View,
 ) -> Targets4<vec4, vec4, vec4, vec2> {
-    let sub0 = field.channels(vary.wp)
+    let sub0 = field.channels_kept(vary.wp, vary.part, vary.kept)
     shade_gbuf_core(vary.wp, vary.prev_wp, vary.local_p, vary.normal, vary.meta.x, sub0, v, prev_v)
 }
 
@@ -404,7 +431,7 @@ fn field_gbuf_many_fs<M: Field<Substance>>(
     prev_v: View,
 ) -> Targets4<vec4, vec4, vec4, vec2> {
     let tid = min(u32(max(vary.meta.y, 0.0)), n_fields - 1)
-    let sub0 = fields[tid].channels(vary.wp)
+    let sub0 = fields[tid].channels_kept(vary.wp, vary.part, vary.kept)
     shade_gbuf_core(vary.wp, vary.prev_wp, vary.local_p, vary.normal, vary.meta.x, sub0, v, prev_v)
 }
 
@@ -453,7 +480,7 @@ fn field_cut_gbuf_one_fs<M: Field<Substance>>(
     v: View,
     prev_v: View,
 ) -> Targets4<vec4, vec4, vec4, vec2> {
-    let sub0 = field.channels(vary.wp)
+    let sub0 = field.channels_kept(vary.wp, vary.part, vary.kept)
     if sub0.transmission > 0.02 {
         discard()
     }
@@ -471,7 +498,7 @@ fn field_cut_gbuf_many_fs<M: Field<Substance>>(
     prev_v: View,
 ) -> Targets4<vec4, vec4, vec4, vec2> {
     let tid = min(u32(max(vary.meta.y, 0.0)), n_fields - 1)
-    let sub0 = fields[tid].channels(vary.wp)
+    let sub0 = fields[tid].channels_kept(vary.wp, vary.part, vary.kept)
     if sub0.transmission > 0.02 {
         discard()
     }
@@ -1099,7 +1126,7 @@ fn field_refract_refl_one_fs<M: Field<Substance>>(
     bg_s: Sampler,
     half_size: vec2,
 ) -> vec4 {
-    let sub0 = field.channels(vary.wp)
+    let sub0 = field.channels_kept(vary.wp, vary.part, vary.kept)
     shade_refract_refl_core(
         pixel,
         vary.wp,
@@ -1156,7 +1183,7 @@ fn field_refract_refl_many_fs<M: Field<Substance>>(
     half_size: vec2,
 ) -> vec4 {
     let tid = min(u32(max(vary.meta.y, 0.0)), n_fields - 1)
-    let sub0 = fields[tid].channels(vary.wp)
+    let sub0 = fields[tid].channels_kept(vary.wp, vary.part, vary.kept)
     shade_refract_refl_core(
         pixel,
         vary.wp,
@@ -1610,7 +1637,7 @@ fn field_trans_one_fs<M: Field<Substance>, S: Sky>(
     refract_refl: Texture<Rgba16Float>,
     bg_s: Sampler,
 ) -> Targets2<vec4, vec2> {
-    let sub0 = field.channels(vary.wp)
+    let sub0 = field.channels_kept(vary.wp, vary.part, vary.kept)
     let interior = interior_length(field, vary.wp, normalize(vary.wp - v.at), 18.0)
     let c = shade_trans_core(
         pixel,
@@ -1685,7 +1712,7 @@ fn field_trans_many_fs<M: Field<Substance>, S: Sky>(
     bg_s: Sampler,
 ) -> Targets2<vec4, vec2> {
     let tid = min(u32(max(vary.meta.y, 0.0)), n_fields - 1)
-    let sub0 = fields[tid].channels(vary.wp)
+    let sub0 = fields[tid].channels_kept(vary.wp, vary.part, vary.kept)
     let interior = interior_length(fields[tid], vary.wp, normalize(vary.wp - v.at), 18.0)
     let c = shade_trans_core(
         pixel,
@@ -2222,6 +2249,7 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for One<M> {
         }
         let vs = mesh_vs.bind(
             verts: batches[first].verts.items(),
+            vert_kept: batches[first].vert_kept.items(),
             xforms: batches[first].xforms.items(),
             prev_xforms: batches[first].prev_xforms.items(),
             inst_ids: batches[first].inst_ids.items(),
@@ -2323,6 +2351,7 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for One<M> {
             rrp,
             mesh_vs.bind(
                 verts: batches[first].verts.items(),
+                vert_kept: batches[first].vert_kept.items(),
                 xforms: batches[first].xforms.items(),
                 prev_xforms: batches[first].prev_xforms.items(),
                 inst_ids: batches[first].inst_ids.items(),
@@ -2444,6 +2473,7 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for One<M> {
             rp,
             mesh_vs.bind(
                 verts: batches[first].verts.items(),
+                vert_kept: batches[first].vert_kept.items(),
                 xforms: batches[first].xforms.items(),
                 prev_xforms: batches[first].prev_xforms.items(),
                 inst_ids: batches[first].inst_ids.items(),
@@ -2779,6 +2809,7 @@ impl<M: Field<Substance> + StateHash + GpuData, const N: u32> MeshWorld for Many
             } else {
                 let vs = mesh_vs.bind(
                     verts: batches[bi].verts.items(),
+                    vert_kept: batches[bi].vert_kept.items(),
                     xforms: batches[bi].xforms.items(),
                     prev_xforms: batches[bi].prev_xforms.items(),
                     inst_ids: batches[bi].inst_ids.items(),
@@ -2898,6 +2929,7 @@ impl<M: Field<Substance> + StateHash + GpuData, const N: u32> MeshWorld for Many
                         rrp,
                         mesh_vs.bind(
                             verts: batches[bi].verts.items(),
+                            vert_kept: batches[bi].vert_kept.items(),
                             xforms: batches[bi].xforms.items(),
                             prev_xforms: batches[bi].prev_xforms.items(),
                             inst_ids: batches[bi].inst_ids.items(),
@@ -3029,6 +3061,7 @@ impl<M: Field<Substance> + StateHash + GpuData, const N: u32> MeshWorld for Many
                         rp,
                         mesh_vs.bind(
                             verts: batches[bi].verts.items(),
+                            vert_kept: batches[bi].vert_kept.items(),
                             xforms: batches[bi].xforms.items(),
                             prev_xforms: batches[bi].prev_xforms.items(),
                             inst_ids: batches[bi].inst_ids.items(),

@@ -716,7 +716,7 @@ def write_judge(asset, brute, cell, views):
         f.write(f"""// The forge's judge for `{asset}` (tools/forge): its shape against its reference, its parts,
 // and its outlines from the concept views, as one line of JSON.
 
-use engine::judge::samples::{{Ortho, SurfaceScores, judged, judged_brute, overlap, samples, silhouette, splatted}}
+use engine::judge::samples::{{BandScore, Ortho, SurfaceScores, judged, judged_brute, judged_by_height, judged_by_part, overlap, samples, silhouette, splatted}}
 use forge_{asset}::asset::{cfg['field']}
 use std::field::Surface
 use std::io::print
@@ -740,6 +740,23 @@ pub fn tool() -> u32 {{
     line.push_str("]")
     scores(mut line, "shape", judged(f, s, cell: {cell}))
     {"scores(mut line, \"brute\", judged_brute(f, s, cell: " + str(cell) + "))" if brute else ""}
+    let by_p = judged_by_part(f, s)
+    line.push_str(", \\"by_part\\": [")
+    for i in 0..by_p.len() {{
+        let b = by_p[i]
+        let nm = f.part_name(i).name
+        if i > 0 {{ line.push_str(", ") }}
+        line.push_str(f"{{{{\\"name\\": \\"{{nm}}\\", \\"mean_mm\\": {{b.mean_mm}}, \\"p95_mm\\": {{b.p95_mm}}, \\"samples\\": {{b.count}}}}}}")
+    }}
+    line.push_str("]")
+    let by_h = judged_by_height(f, s, bands: 5)
+    line.push_str(", \\"by_height\\": [")
+    for i in 0..by_h.len() {{
+        let b = by_h[i]
+        if i > 0 {{ line.push_str(", ") }}
+        line.push_str(f"{{{{\\"y_lo_m\\": {{b.lo}}, \\"y_hi_m\\": {{b.hi}}, \\"mean_mm\\": {{b.mean_mm}}, \\"p95_mm\\": {{b.p95_mm}}, \\"samples\\": {{b.count}}}}}}")
+    }}
+    line.push_str("]")
     let (lo, hi) = s.extent()
     let c = 0.5 * (lo + hi)
     let size = 1.1 * max(hi.x - lo.x, max(hi.y - lo.y, hi.z - lo.z))
@@ -922,7 +939,7 @@ def literals_of(path):
     code = code_of(text)
     spans = named_spans(code)
     out = []
-    for m in NUM.finditer(code):
+    for m in NUM_FLOAT.finditer(code):
         name = next((k for k, (a, b) in spans.items() if a <= m.start() < b), None)
         out.append({"at": m.start(), "text": m.group(0), "name": name})
     return out
@@ -952,7 +969,20 @@ def named_spans(text):
     return spans
 
 
-NUM = re.compile(r"(?<![A-Za-z_0-9.])-?\d+\.\d+(?:[eE][-+]?\d+)?")
+NUM = re.compile(r"(?<![A-Za-z_0-9.])(-?(?:\d+\.\d+(?:[eE][-+]?\d+)?|\d+)(?:mm|cm|m|deg|rad)?)(?![A-Za-z_0-9.])")
+NUM_FLOAT = re.compile(r"(?<![A-Za-z_0-9.])(-?(?:\d+\.\d+(?:[eE][-+]?\d+)?(?:mm|cm|m|deg|rad)?|\d+(?:mm|cm|m|deg|rad)))(?![A-Za-z_0-9.])")
+UNIT_SCALE = {"": 1.0, "m": 1.0, "cm": 0.01, "mm": 0.001, "deg": math.pi / 180.0, "rad": 1.0}
+
+
+def split_num(tok):
+    """Splits a float/unit literal token like `3.5mm` into (value_in_unit, suffix, decimals)."""
+    for suf in ("mm", "cm", "deg", "rad", "m"):
+        if tok.endswith(suf):
+            body = tok[:-len(suf)]
+            dec = len(body.split(".")[1].split("e")[0].split("E")[0]) if "." in body else 1
+            return float(body), suf, dec
+    dec = len(tok.split(".")[1].split("e")[0].split("E")[0]) if "." in tok else 0
+    return float(tok), "", dec
 
 
 def cmd_scramble(args):
@@ -974,14 +1004,14 @@ def cmd_scramble(args):
         if nm not in spans:
             die(f"the source binds no `{nm}`")
         a, b = spans[nm]
-        for m in NUM.finditer(text, a, b):
-            v = float(m.group(0))
+        for m in NUM_FLOAT.finditer(text, a, b):
+            v, suf, decimals = split_num(m.group(0))
             if v == 0.0:
                 continue
             # By a share of itself, or (`--move`) by up to that many metres, each its own way.
-            nv = v + move * (2.0 * rng.random() - 1.0) if move > 0 else v * (1.0 + by * (2.0 * rng.random() - 1.0))
-            decimals = len(m.group(0).split(".")[1].split("e")[0])
-            edits.append((m.start(), m.end(), f"{nv:.{max(decimals, 4)}f}"))
+            step = move / UNIT_SCALE[suf]
+            nv = v + step * (2.0 * rng.random() - 1.0) if move > 0 else v * (1.0 + by * (2.0 * rng.random() - 1.0))
+            edits.append((m.start(), m.end(), f"{nv:.{max(decimals, 4)}f}{suf}"))
     for s0, e0, t in sorted(edits, reverse=True):
         text = text[:s0] + t + text[e0:]
     open(path, "w").write(text)
@@ -1075,13 +1105,12 @@ def moved_first(text, name, k, starts):
     if name not in spans:
         return text
     a, b = spans[name]
-    m = NUM.search(text, a, b)
+    m = NUM_FLOAT.search(text, a, b)
     if not m:
         return text
-    v = float(m.group(0))
+    v, suf, dec = split_num(m.group(0))
     nv = v * (0.5 + k / max(starts - 1, 1))
-    dec = len(m.group(0).split(".")[1].split("e")[0])
-    return text[:m.start()] + f"{nv:.{max(dec, 4)}f}" + text[m.end():]
+    return text[:m.start()] + f"{nv:.{max(dec, 4)}f}{suf}" + text[m.end():]
 
 
 # ---- the judge -----------------------------------------------------------------------------------

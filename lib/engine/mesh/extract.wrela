@@ -123,17 +123,17 @@ pub fn unocta(e: vec2) -> vec3 {
     normalize(v)
 }
 
-/// Packs unit normal `n`, batch thing index `thing_id` (`0..THING_IDS`), `smooth`, and
-/// `is_trans` into one 32-bit word, the normal as 10 + 10 bits of its `octa` fold.
-pub fn pack_vertex_meta(n: vec3, thing_id: u32, smooth: bool, is_trans: bool) -> u32 {
+/// Packs unit normal `n`, batch thing index `thing_id` (`0..THING_IDS`) and `smooth` into one
+/// 32-bit word, the normal as 10 + 10 bits of its `octa` fold. Whether the vertex lets light
+/// through is its kept part word's (`KEPT_TRANS`).
+pub fn pack_vertex_meta(n: vec3, thing_id: u32, smooth: bool) -> u32 {
     let o = octa(n)
     let ux = u32(clamp((o.x * 0.5 + 0.5) * 1023.0 + 0.5, 0.0, 1023.0))
     let uy = u32(clamp((o.y * 0.5 + 0.5) * 1023.0 + 0.5, 0.0, 1023.0))
     // `sync_many` refuses a general batch of more than `THING_IDS` things, so this never aliases.
     let tid = min(thing_id, THING_IDS - 1)
     let sm: u32 = if smooth { 1 } else { 0 }
-    let tr: u32 = if is_trans { 1 } else { 0 }
-    ux | (uy << 10) | (tid << 20) | (sm << 30) | (tr << 31)
+    ux | (uy << 10) | (tid << 20) | (sm << 30)
 }
 
 /// Decodes the unit normal from `MeshVertex::packed`.
@@ -153,9 +153,13 @@ pub fn unpack_smooth(packed: u32) -> bool {
     ((packed >> 30) & 1) != 0
 }
 
-/// Decodes the transmissive-material flag from `MeshVertex::packed`.
-pub fn unpack_is_trans(packed: u32) -> bool {
-    (packed >> 31) != 0
+/// The bit of a vertex's kept part word (`MeshBatch::vert_kept`) saying its material lets light
+/// through, so its triangles are drawn with the transmissive ones.
+pub const KEPT_TRANS: u32 = 2147483648
+
+/// The part a vertex's kept part word names.
+pub fn kept_part(w: u32) -> u32 {
+    w & (KEPT_TRANS - 1)
 }
 
 /// Evaluates 4-bone Dual Quaternion Skinning (Kavan et al., I3D 2007 / ACM TOG 2008) from packed
@@ -372,7 +376,7 @@ fn cull_brick<M: Field<Substance>>(f: M, g: GridSpec, b: vec3u) -> (bool, Live) 
             if (oct & 2) != 0 { hi.y } else { mid.y },
             if (oct & 4) != 0 { hi.z } else { mid.z },
         )
-        let iv = f.interval(Box3 { lo: olo, hi: ohi })
+        let iv = f.pruned(Box3 { lo: olo, hi: ohi }, |q: vec3| q, 1.0, pr.live, 0).range
         if iv.lo <= 0.0 && iv.hi >= 0.0 {
             return (true, pr.live)
         }
@@ -799,9 +803,9 @@ fn cell_dual_vertex<F: Copy + fn(vec3) -> f32>(
 }
 
 /// Pushes the cell's compact 16-byte dual vertex at `wp` (octahedral normal + thing index +
-/// smooth/transmissive flags; full procedural `channels(wp)` runs at 1× pixel rate in `mesh_eye`).
-fn push_vertex<M: Field<Substance>>(
-    f: M,
+/// smooth flag). Its material is asked once, by `keep_verts`, never here: a field's material
+/// (a carved table's oak: grain, scratches, grime) would swell every kernel that makes vertices.
+fn push_vertex(
     thing_id: u32,
     wp: vec3,
     gv: vec3,
@@ -812,19 +816,125 @@ fn push_vertex<M: Field<Substance>>(
     cell_verts: mut Atomics<u32>,
 ) {
     let n_final = safe_norm(gv, safe_norm(qef.avg_n, vec3(0.0, 1.0, 0.0)))
-    let is_trans = f.channels(wp).transmission > 0.02
     let smooth = qef.min_dot >= SMOOTH_DOT
     let vi = verts.push(
         MeshVertex {
             px: wp.x,
             py: wp.y,
             pz: wp.z,
-            packed: pack_vertex_meta(n_final, thing_id, smooth: smooth, is_trans: is_trans),
+            packed: pack_vertex_meta(n_final, thing_id, smooth: smooth),
         },
     )
     if vi < cap_verts {
         cell_verts.store(i: slot, value: vi)
     }
+}
+
+/// After a chunk's vertices are made: each vertex's part and what its field keeps there
+/// (`Field::kept_at`), worked out once so the pixels drawn from it ask only that part, and only
+/// what changes from pixel to pixel (`Field::channels_kept`), and whether its material lets light
+/// through (which triangles `emit_quad` puts it with). The chunk's vertices from `first[0]`
+/// (`mark_first`), `from` on, to the batch's count; two words a vertex in `vert_kept`: the part
+/// (`KEPT_TRANS` set where it lets light through) and `pack_kept`'s bytes. The one kernel that asks
+/// a field's material while making its mesh.
+@compute(64)
+fn keep_verts<M: Field<Substance>>(
+    fields: [M],
+    verts: [MeshVertex],
+    vert_count: [u32],
+    cap_verts: u32,
+    first: [u32],
+    from: u32,
+    vert_kept: mut Atomics<u32>,
+    id: GlobalId,
+) {
+    let vi = first[0] + from + id.x
+    if vi >= min(vert_count[0], cap_verts) {
+        return
+    }
+    let v = verts[vi]
+    let p = vec3(v.px, v.py, v.pz)
+    let f = fields[unpack_thing(v.packed)]
+    let (_, part, kept) = f.kept_at(p)
+    let trans = if f.channels_kept(p, part, kept).transmission > 0.02 { KEPT_TRANS } else { 0 }
+    vert_kept.store(i: 2 * vi, value: part | trans)
+    vert_kept.store(i: 2 * vi + 1, value: pack_kept(kept))
+}
+
+/// `keep_verts` for a skinned field's rest-pose vertices: whether each lets light through
+/// (`Field::rest_channels`), its part word's `KEPT_TRANS` alone (a skinned field's pixels ask
+/// their channels whole).
+@compute(64)
+fn keep_rest_verts<M: Field<Substance>>(
+    fields: [M],
+    verts: [MeshVertex],
+    vert_count: [u32],
+    cap_verts: u32,
+    first: [u32],
+    from: u32,
+    vert_kept: mut Atomics<u32>,
+    id: GlobalId,
+) {
+    let vi = first[0] + from + id.x
+    if vi >= min(vert_count[0], cap_verts) {
+        return
+    }
+    let v = verts[vi]
+    let c = fields[unpack_thing(v.packed)].rest_channels(vec3(v.px, v.py, v.pz))
+    vert_kept.store(i: 2 * vi, value: if c.transmission > 0.02 { KEPT_TRANS } else { 0 })
+    vert_kept.store(i: 2 * vi + 1, value: 0)
+}
+
+/// What one vertex of `keep_verts` asks of a field, for the compiler's count of its work.
+fn keep_vert_work<M: Field<Substance>>(f: M, p: vec3) -> vec4 {
+    let (d, part, k) = f.kept_at(p)
+    k + vec4(d + f.channels_kept(p, part, k).transmission, f32(part), 0.0, 0.0)
+}
+
+/// Where the chunk about to be made starts in the batch's vertices (`keep_verts`).
+@compute(1)
+fn mark_first(vert_count: [u32], cap_verts: u32, first: mut One<u32>, id: GlobalId) {
+    first.set(id, min(vert_count[0], cap_verts))
+}
+
+/// The vertices one `keep_verts` dispatch may take for a field like `sample`, as
+/// `crease_slice_of` counts.
+fn keep_slice_of<M: Field<Substance>>(sample: M) -> u32 {
+    let cell = f32(max(std::derive::work(|p: vec3| keep_vert_work(sample, p)), 1))
+    let step = f32(limits().step_work) * 1000.0
+    let n = u32(clamp(step / (cell * 1.2 + 2000.0), 1024.0, 1048576.0))
+    max((n / 64) * 64, 1024)
+}
+
+/// `prep_slices` from item `first[0]`: args for `slices` passes over items `first[0] + k·most` on.
+@compute(64)
+fn prep_from(
+    count: [u32],
+    cap: u32,
+    first: [u32],
+    most: u32,
+    slices: u32,
+    args: mut Slots<DispatchArgs>,
+    id: GlobalId,
+) {
+    if id.x >= slices {
+        return
+    }
+    let n = min(count[0], cap)
+    let at = first[0] + id.x * most
+    let m = if n > at { min(n - at, most) } else { 0 }
+    args[id] = DispatchArgs { x: (m + 63) / 64, y: 1, z: 1 }
+}
+
+/// Four numbers in [0, 1] (`Field::kept`) as a byte each.
+pub fn pack_kept(k: vec4) -> u32 {
+    let b = vec4u(clamp(k, vec4(0.0), vec4(1.0)) * 255.0 + vec4(0.5))
+    b.x | (b.y << 8) | (b.z << 16) | (b.w << 24)
+}
+
+/// `pack_kept`'s four numbers.
+pub fn unpack_kept(w: u32) -> vec4 {
+    vec4(f32(w & 255), f32((w >> 8) & 255), f32((w >> 16) & 255), f32(w >> 24)) * (1.0 / 255.0)
 }
 
 /// Pass 2a: Classifies every cell of a chunk (`7×7×7 = 343` per brick) from its 8 corner signs,
@@ -918,7 +1028,6 @@ fn solve_verts<M: Field<Substance>>(
         return
     }
     push_vertex(
-        f,
         g.orig_id,
         wp,
         gv,
@@ -1059,7 +1168,6 @@ fn refine_creases<M: Field<Substance>>(
     let qef = hermite_qef(dist, d, cell_lo, h)
     let (wp, gv) = solve_cell(dist, qef, crease: true, cell_lo: cell_lo, h: h)
     push_vertex(
-        f,
         g.orig_id,
         wp,
         gv,
@@ -1140,7 +1248,6 @@ fn push_skinned_vertex<M: Field<Substance>>(
     cell_verts: mut Atomics<u32>,
 ) {
     let n_final = safe_norm(gv, safe_norm(qef.avg_n, vec3(0.0, 1.0, 0.0)))
-    let is_trans = f.rest_channels(wp).transmission > 0.02
     let smooth = qef.min_dot >= SMOOTH_DOT
     let sw = f.rest_skin_weights(wp)
     let vi = verts.push(
@@ -1148,7 +1255,7 @@ fn push_skinned_vertex<M: Field<Substance>>(
             px: wp.x,
             py: wp.y,
             pz: wp.z,
-            packed: pack_vertex_meta(n_final, thing_id, smooth: smooth, is_trans: is_trans),
+            packed: pack_vertex_meta(n_final, thing_id, smooth: smooth),
         },
     )
     if vi < cap_verts {
@@ -1345,12 +1452,11 @@ fn deform_skinned_verts<M: Field<Substance>>(
     )
     let tid = unpack_thing(v.packed)
     let smooth = unpack_smooth(v.packed)
-    let is_trans = unpack_is_trans(v.packed)
     out[id] = MeshVertex {
         px: wp.x,
         py: wp.y,
         pz: wp.z,
-        packed: pack_vertex_meta(nrm, tid, smooth: smooth, is_trans: is_trans),
+        packed: pack_vertex_meta(nrm, tid, smooth: smooth),
     }
 }
 
@@ -1413,6 +1519,7 @@ fn emit_quad(
     v3: u32,
     flip: bool,
     verts: [MeshVertex],
+    vert_kept: [u32],
     cap_indices: u32,
     cap_trans: u32,
     tri_count: mut Atomics<u32>,
@@ -1423,10 +1530,10 @@ fn emit_quad(
     if v0 == NONE || v1 == NONE || v2 == NONE || v3 == NONE {
         return
     }
-    let t0 = unpack_is_trans(verts[v0].packed)
-    let t1 = unpack_is_trans(verts[v1].packed)
-    let t2 = unpack_is_trans(verts[v2].packed)
-    let t3 = unpack_is_trans(verts[v3].packed)
+    let t0 = (vert_kept[2 * v0] & KEPT_TRANS) != 0
+    let t1 = (vert_kept[2 * v1] & KEPT_TRANS) != 0
+    let t2 = (vert_kept[2 * v2] & KEPT_TRANS) != 0
+    let t3 = (vert_kept[2 * v3] & KEPT_TRANS) != 0
     let is_trans = t0 || t1 || t2 || t3
     let (q0, q1, q2, q3) = quad_order(v0, v1, v2, v3, flip: flip)
     let p = |v: u32| vec3(verts[v].px, verts[v].py, verts[v].pz)
@@ -1517,6 +1624,7 @@ fn emit_tris(
     corners: [f32],
     cell_verts: [u32],
     verts: [MeshVertex],
+    vert_kept: [u32],
     tri_count: mut Atomics<u32>,
     indices: mut Atomics<u32>,
     trans_indices: mut Atomics<u32>,
@@ -1549,6 +1657,7 @@ fn emit_tris(
                 cv(cell_verts, vbase, e.c3.x, e.c3.y, e.c3.z),
                 flip: d0 >= 0.0,
                 verts: verts,
+                vert_kept: vert_kept,
                 cap_indices: cap_indices,
                 cap_trans: cap_trans,
                 tri_count: mut tri_count,
@@ -1747,6 +1856,14 @@ fn bucket_bricks(want: u32, max_bricks: u32) -> u32 {
 /// `xforms`); temporary extraction buffers live once in `ExtractScratch`.
 pub struct MeshBatch {
     pub verts: AppendBuffer<MeshVertex>,
+    /// Each vertex's part and what its field keeps there (`keep_verts`): two words a vertex,
+    /// the part (`KEPT_TRANS` set where its material lets light through) and `pack_kept`'s bytes.
+    pub vert_kept: GpuBuffer<u32>,
+    /// `keep_verts`'s slice for the field extracted now, its dispatches' prepared counts, and
+    /// where the chunk being made starts in `verts` (`mark_first`).
+    keep_slice: u32,
+    keep_args: GpuBuffer<DispatchArgs>,
+    keep_first: GpuBuffer<u32>,
     /// Packed 8-byte per-vertex skin weights (`[bones_u32, weights_u32]` per vertex); allocated
     /// ONLY when `is_skinned` is true (dummy 2-u32 buffer otherwise).
     pub skin_verts: GpuBuffer<u32>,
@@ -1857,6 +1974,10 @@ pub struct MeshBatch {
 pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
     MeshBatch {
         verts: append_buffer(1),
+        vert_kept: buffer(2),
+        keep_slice: 65536,
+        keep_args: buffer_of(Vec::filled(SLICES_MOST, DispatchArgs { x: 0, y: 1, z: 1 })),
+        keep_first: buffer(1),
         skin_verts: buffer_of([0, 255]),
         skin_cap: 1,
         deformed_verts: buffer_of([MeshVertex { px: 0.0, py: 0.0, pz: 0.0, packed: 0 }]),
@@ -2020,6 +2141,7 @@ impl MeshBatch {
         let cap_trans = cap * self.trans_per_brick
         if cap_verts > self.cap_verts {
             self.verts = append_buffer(cap_verts)
+            self.vert_kept = buffer(2 * cap_verts)
             self.cap_verts = cap_verts
         }
         if cap_indices > self.cap_indices {
@@ -2884,6 +3006,7 @@ impl MeshBatch {
         label("mesh_extract")
         self.crease_slice = crease_slice_of(sample)
         self.surf_slice = surf_slice_of(sample)
+        self.keep_slice = keep_slice_of(sample)
         // Size this batch's output buffers for every candidate brick (active ones are a subset).
         self.ensure_cap(min(total_bricks, self.max_bricks))
 
@@ -2929,6 +3052,14 @@ impl MeshBatch {
                     eval_args: mut scratch.eval_args,
                     vert_args: mut scratch.vert_args,
                     quad_args: mut scratch.quad_args,
+                ),
+                over: 1,
+            )
+            dispatch(
+                mark_first.bind(
+                    vert_count: self.verts.count(),
+                    cap_verts: self.cap_verts,
+                    first: mut self.keep_first,
                 ),
                 over: 1,
             )
@@ -3031,6 +3162,39 @@ impl MeshBatch {
                     most: self.crease_slice / 64,
                 )
             }
+            // The chunk's vertices' parts, what their fields keep there and whether they let light
+            // through (`keep_verts`), in slices sized by the field's work: enough for every
+            // vertex the chunk can make, their counts prepared in one dispatch.
+            let keep_slices = min(
+                (chunk_n * VERTS_BRICK + self.keep_slice - 1) / self.keep_slice,
+                SLICES_MOST,
+            )
+            dispatch(
+                prep_from.bind(
+                    count: self.verts.count(),
+                    cap: self.cap_verts,
+                    first: self.keep_first.items(),
+                    most: self.keep_slice,
+                    slices: keep_slices,
+                    args: self.keep_args.span_mut(start: 0, count: keep_slices),
+                ),
+                over: keep_slices,
+            )
+            for k in 0..keep_slices {
+                dispatch(
+                    keep_verts.bind(
+                        fields: fields,
+                        verts: self.verts.items(),
+                        vert_count: self.verts.count(),
+                        cap_verts: self.cap_verts,
+                        first: self.keep_first.items(),
+                        from: k * self.keep_slice,
+                        vert_kept: mut self.vert_kept,
+                    ),
+                    groups: self.keep_args.at(k),
+                    most: self.keep_slice / 64,
+                )
+            }
             dispatch(
                 emit_tris.bind(
                     active_count: scratch.active.count(),
@@ -3041,6 +3205,7 @@ impl MeshBatch {
                     corners: scratch.corners.items(),
                     cell_verts: scratch.cell_verts.items(),
                     verts: self.verts.items(),
+                    vert_kept: self.vert_kept.items(),
                     tri_count: mut self.tri_count,
                     indices: mut self.indices,
                     trans_indices: mut self.trans_indices,
@@ -3085,6 +3250,7 @@ impl MeshBatch {
         label("mesh_extract")
         self.crease_slice = crease_slice_of(sample)
         self.surf_slice = surf_slice_of(sample)
+        self.keep_slice = keep_slice_of(sample)
         self.ensure_cap(min(total_bricks, self.max_bricks))
         self.ensure_skin_verts(self.cap_verts)
 
@@ -3125,6 +3291,14 @@ impl MeshBatch {
                     eval_args: mut scratch.eval_args,
                     vert_args: mut scratch.vert_args,
                     quad_args: mut scratch.quad_args,
+                ),
+                over: 1,
+            )
+            dispatch(
+                mark_first.bind(
+                    vert_count: self.verts.count(),
+                    cap_verts: self.cap_verts,
+                    first: mut self.keep_first,
                 ),
                 over: 1,
             )
@@ -3229,6 +3403,37 @@ impl MeshBatch {
                     most: self.crease_slice / 64,
                 )
             }
+            // Whether the chunk's vertices let light through (`keep_rest_verts`), as `run_extract`.
+            let keep_slices = min(
+                (chunk_n * VERTS_BRICK + self.keep_slice - 1) / self.keep_slice,
+                SLICES_MOST,
+            )
+            dispatch(
+                prep_from.bind(
+                    count: self.verts.count(),
+                    cap: self.cap_verts,
+                    first: self.keep_first.items(),
+                    most: self.keep_slice,
+                    slices: keep_slices,
+                    args: self.keep_args.span_mut(start: 0, count: keep_slices),
+                ),
+                over: keep_slices,
+            )
+            for k in 0..keep_slices {
+                dispatch(
+                    keep_rest_verts.bind(
+                        fields: fields,
+                        verts: self.verts.items(),
+                        vert_count: self.verts.count(),
+                        cap_verts: self.cap_verts,
+                        first: self.keep_first.items(),
+                        from: k * self.keep_slice,
+                        vert_kept: mut self.vert_kept,
+                    ),
+                    groups: self.keep_args.at(k),
+                    most: self.keep_slice / 64,
+                )
+            }
             dispatch(
                 emit_tris.bind(
                     active_count: scratch.active.count(),
@@ -3239,6 +3444,7 @@ impl MeshBatch {
                     corners: scratch.corners.items(),
                     cell_verts: scratch.cell_verts.items(),
                     verts: self.verts.items(),
+                    vert_kept: self.vert_kept.items(),
                     tri_count: mut self.tri_count,
                     indices: mut self.indices,
                     trans_indices: mut self.trans_indices,
@@ -3323,7 +3529,7 @@ fn tri_before(x: Tri, y: Tri) -> bool {
 /// A vertex's normal as `push_vertex` stores it and `emit_quad` reads it back.
 fn packed_normal(gv: vec3, q: Qef) -> vec3 {
     let n = safe_norm(gv, safe_norm(q.avg_n, vec3(0.0, 1.0, 0.0)))
-    unpack_oct_normal(pack_vertex_meta(n, 0, smooth: false, is_trans: false))
+    unpack_oct_normal(pack_vertex_meta(n, 0, smooth: false))
 }
 
 /// Pushes the two triangles of the quad of cell vertices `i` (in `at`, normals `nm`), wound and
@@ -3617,16 +3823,10 @@ fn a_vertexs_normal_and_flags_survive_packing() {
         let r = sqrt(max(1.0 - z * z, 0.0))
         let a = f32(i) * 2.39996323
         let n = vec3(r * cos(a), r * sin(a), z)
-        let packed = pack_vertex_meta(
-            n,
-            i % THING_IDS,
-            smooth: (i & 1) != 0,
-            is_trans: (i & 2) != 0,
-        )
+        let packed = pack_vertex_meta(n, i % THING_IDS, smooth: (i & 1) != 0)
         worst = min(worst, dot(unpack_oct_normal(packed), n))
         assert(unpack_thing(packed) == i % THING_IDS, "the thing survives packing")
         assert(unpack_smooth(packed) == ((i & 1) != 0), "the smooth flag survives packing")
-        assert(unpack_is_trans(packed) == ((i & 2) != 0), "the transmissive flag survives packing")
     }
     for n in [
         vec3(0.0, 0.0, -1.0),
@@ -3636,7 +3836,7 @@ fn a_vertexs_normal_and_flags_survive_packing() {
     ] {
         worst = min(
             worst,
-            dot(unpack_oct_normal(pack_vertex_meta(n, 0, smooth: true, is_trans: false)), n),
+            dot(unpack_oct_normal(pack_vertex_meta(n, 0, smooth: true)), n),
         )
     }
     // 10 bits a component: within a quarter of a degree.

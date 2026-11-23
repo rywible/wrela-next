@@ -178,17 +178,20 @@ impl Blade {
         if q.x <= 0.0 || q.x >= 1.0 || x >= 1.0 {
             return 0.0
         }
-        // Full across its top, falling to its edge: 1 - x⁴.
-        let x2 = x * x
-        self.height * share * (1.0 - x2 * x2)
+        // Sculpted C¹ cushion profile: `(1 - x²)^(3/2)` is full across its crest and lands
+        // smoothly on the ground with zero cliff wall, keeping max slope at 3 * height / width
+        // (2.7× gentler than 1 - x⁴) so carvings mesh cleanly without faceted spikes.
+        let m = max(1.0 - x * x, 0.0)
+        self.height * share * m * sqrt(m)
     }
 
-    /// Its steepness: across its top, 4 height over its half-width at its edge; along it, as its
-    /// width swells, and stretched where its spine bows.
+    /// Its steepness: across its cushion (`(1 - x²)^(3/2)` peaks at slope 1.5 over half-width,
+    /// i.e. 3 height / width), plus longitudinal swell along the lens, stretched where its spine
+    /// bows.
     pub fn slope_of(self) -> f32 {
         let l = max(length(self.b - self.a), 1.0e-6)
-        let across = 8.0 * abs(self.height) / max(self.width, 1.0e-6)
-        let swell = 8.0 *
+        let across = 3.2 * abs(self.height) / max(self.width, 1.0e-6)
+        let swell = 4.2 *
             (1.0 - self.fill) *
             abs(self.height) /
             (min(self.belly, 1.0 - self.belly) * l)
@@ -346,15 +349,18 @@ impl<const G: u32> Motif for Cuts<G> {
 /// `region` (s and t from its `.xy` to its `.zw`) and the motif left standing in it, back up to
 /// the face at most.
 pub struct Carved<S, F, M>: Copy + GpuData + Eq + StateHash {
-    pub face: F,
-    pub part: S,
     pub region: vec4,
-    pub ground: f32,
+    pub face: F,
     pub motif: M,
+    pub part: S,
+    pub ground: f32,
     /// What the carved surface's height over the face is divided by, so that the cut's distance
     /// is a bound: from the motif's steepness and the face's stretch, when it is carved
     /// (`carved`), so no point asks it again.
     pub steep: f32,
+    /// The facets the gouge left on what stands (`carved`'s `tooling`): how wide each is (m) and
+    /// how deep (m); 0 deep for a surface sanded smooth.
+    pub tooling: vec2,
 }
 
 /// `part` with `motif` carved into `face` (`Carved`).
@@ -364,12 +370,14 @@ pub fn carved<S: Shaped, F: Face, M: Motif>(
     motif: M,
     ground: f32,
     region: vec4,
+    tooling: vec2 = vec2(0.0),
 ) -> Carved<S, F, M> {
     // Across a flat face the motif's slope adds square to w's; across a round or draped face,
-    // where w is the part's distance and may lean, it adds.
-    let g = motif.slope() * face.stretch()
+    // where w is the part's distance and may lean, it adds. The gouge's facets add theirs.
+    let facets = if tooling.y > 0.0 { 6.0 * tooling.y / max(tooling.x, 1.0e-5) } else { 0.0 }
+    let g = (motif.slope() + facets) * face.stretch()
     let steep = if face.flat() { sqrt(1.0 + g * g) } else { 1.0 + g }
-    Carved { part, face, motif, ground, region, steep }
+    Carved { part, face, motif, ground, region, steep, tooling }
 }
 
 /// The signed distance in (s, t) from the rectangle from `r.xy` to `r.zw` (positive outside).
@@ -384,12 +392,27 @@ impl<S: Shaped, F: Face, M: Motif> Carved<S, F, M> {
     /// The carved surface's height over the face at (s, t): the ground, and the motif standing up
     /// from it, never above the face.
     fn surface_at(self, st: vec2) -> f32 {
-        min(-self.ground + self.motif.height(st), 0.0)
+        let h = min(-self.ground + self.motif.height(st), 0.0)
+        if self.tooling.y <= 0.0 {
+            return h
+        }
+        // The gouge's facets on what stands: shallow scoops in rows, their rows bending as the
+        // carver's strokes did, fading out toward the ground.
+        let size = max(self.tooling.x, 1.0e-5)
+        let u = (st.x + 0.6 * st.y + 0.3 * size * sin(2.1 * st.y / size)) / size
+        let scoop = 0.5 - 0.5 * cos(6.2831853 * u)
+        let stands = clamp((h + self.ground) / max(0.3 * self.ground, 1.0e-5), 0.0, 1.0)
+        h - self.tooling.y * scoop * stands
     }
 
     /// The part's distance and its story, the cut's distance, and the carved height at `p`.
     fn cut(self, p: vec3) -> (f32, Story, f32, f32) {
         let (d, story) = self.part.shaped(p)
+        self.cut_from(p, d, story)
+    }
+
+    /// `cut`, the part's distance and story at `p` given.
+    fn cut_from(self, p: vec3, d: f32, story: Story) -> (f32, Story, f32, f32) {
         let l = self.face.local(p, d)
         let inside = -region_distance(l.xy, self.region) / self.face.stretch()
         let h = self.surface_at(l.xy)
@@ -456,8 +479,27 @@ impl<S: Shaped, F: Face, M: Motif> Surface for Carved<S, F, M> {
 }
 
 impl<S: Shaped, F: Face, M: Motif> Shaped for Carved<S, F, M> {
+    fn piece_of(self, part: u32) -> u32 {
+        self.part.piece_of(part)
+    }
+
     fn shaped(self, p: vec3) -> (f32, Story) {
         let (d, story, c, h) = self.cut(p)
+        self.carved_story(d, story, c, h)
+    }
+
+    /// The part's own part at `p`, carved.
+    fn shaped_part(self, p: vec3) -> (f32, Story, u32) {
+        let (d0, s0, i) = self.part.shaped_part(p)
+        let (d, story, c, h) = self.cut_from(p, d0, s0)
+        let (e, st) = self.carved_story(d, story, c, h)
+        (e, st, i)
+    }
+}
+
+impl<S: Shaped, F: Face, M: Motif> Carved<S, F, M> {
+    /// The distance and story where the part's are `d`, `story` and the cut's `c` at height `h`.
+    fn carved_story(self, d: f32, story: Story, c: f32, h: f32) -> (f32, Story) {
         if c <= d {
             return (d, story)
         }

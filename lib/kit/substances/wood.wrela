@@ -15,19 +15,23 @@
 use engine::matter::substance::Substance
 use shapes::made::{Material, Story}
 use std::cmp::Eq
-use std::field::value_noise
+use std::field::{hash_u32, value_noise}
 use std::hash::StateHash
 
 /// Where a part's wood grew: the line its log's heart ran along (through `pith`, along `axis`,
 /// both in the part's own frame), the width of a year's ring (m), how far its rings wander off
-/// round (m), how tall its rays run along the grain (m; oak's are centimetres), and a seed.
+/// round (m), how tall its rays run along the grain (m; oak's are centimetres), a seed, and
+/// optional multi-plank joinery (`plank` m wide across the board, 0 for one solid timber;
+/// `breadboard` m half-span beyond which end-cleat boards run perpendicular to the field planks).
 pub struct Log: Copy + GpuData + Eq + StateHash {
     pub pith: vec3,
-    pub axis: vec3,
     pub ring: f32,
+    pub axis: vec3,
     pub wander: f32,
     pub ray: f32,
     pub seed: f32,
+    pub plank: f32,
+    pub breadboard: f32,
 }
 
 /// A log (`Log`), its axis made unit.
@@ -38,59 +42,137 @@ pub fn log(
     wander: f32 = 0.009,
     ray: f32 = 0.025,
     seed: f32 = 0.0,
+    plank: f32 = 0.0,
+    breadboard: f32 = 0.0,
 ) -> Log {
-    Log { pith, axis: normalize(axis), ring, wander, ray, seed }
+    Log { pith, axis: normalize(axis), ring, wander, ray, seed, plank, breadboard }
 }
 
 /// What the wood is at a point: how far into a year's latewood (0 earlywood, 1 the dense band
-/// that closes a ring), whether a ray runs there (0 to 1), and whether an open pore does (0 to 1:
-/// a ring-porous wood's pores are in its earlywood).
+/// that closes a ring), whether a ray runs there (0 to 1), whether an open pore does (0 to 1: a
+/// ring-porous wood's pores are in its earlywood), how the log's colour wanders there (-1 to 1),
+/// which board it lies on (-0.5 to 0.5 tint shift), and whether it sits in a plank glue-seam (0..1).
 pub struct Grain: Copy {
     pub late: f32,
     pub ray: f32,
     pub pore: f32,
+    pub streak: f32,
+    pub board_tone: f32,
+    pub seam: f32,
+}
+
+/// A number in [0, 1) from two integers and a seed, the same everywhere.
+fn cell01(x: f32, y: f32, seed: f32) -> f32 {
+    let a = u32(i32(x) + 1048576).wrapping_mul(747796405)
+    let b = u32(i32(y) + 1048576).wrapping_mul(2891336453)
+    let c = u32(seed * 1000.0).wrapping_mul(277803737)
+    f32(hash_u32(a ^ b ^ c) >> 8) * (1.0 / 16777216.0)
 }
 
 /// The grain at `p` (in the part's frame) of wood from `log`.
 pub fn grain(log: Log, p: vec3) -> Grain {
-    let v = p - log.pith
-    let along = dot(v, log.axis)
-    let across = v - log.axis * along
+    // Support edge-joined planks and optional perpendicular breadboard ends (a real wide oak
+    // tabletop is 4-5 joined boards with end cleats, never one continuous 75 cm cathedral arch).
+    var axis = log.axis
+    var pith = log.pith
+    var seed_val = log.seed
+    var board_tone = 0.0
+    var seam = 0.0
+    if log.breadboard > 0.0 || log.plank > 0.0 {
+        let h_ref = if abs(axis.y) < 0.9 { vec3(0.0, 1.0, 0.0) } else { vec3(1.0, 0.0, 0.0) }
+        let across_dir = normalize(cross(axis, h_ref))
+        let along_orig = dot(p, axis)
+        if log.breadboard > 0.0 && abs(along_orig) > log.breadboard {
+            // Breadboard end cleat: grain runs perpendicular across the table end, with a visible
+            // haunched-tenon joint seam at `|along_orig| == breadboard`.
+            let end_side = if along_orig > 0.0 { 1.0 } else { -1.0 }
+            let d_joint = abs(abs(along_orig) - log.breadboard)
+            seam = max(seam, smoothstep(0.0014, 0.0002, d_joint))
+            axis = across_dir
+            pith = pith + vec3(end_side * 0.14, 0.06, end_side * 0.08)
+            seed_val = seed_val + 17.0 + 3.0 * end_side
+            board_tone = (cell01(end_side, y: 11.0, seed: log.seed) - 0.5) * 0.85
+        } else {
+            if log.breadboard > 0.0 {
+                let d_joint = abs(abs(along_orig) - log.breadboard)
+                seam = max(seam, smoothstep(0.0014, 0.0002, d_joint))
+            }
+            if log.plank > 0.0 {
+                let u = dot(p, across_dir) / log.plank
+                let idx = floor(u)
+                let f = u - idx
+                let d_edge = min(f, 1.0 - f) * log.plank
+                seam = max(seam, smoothstep(0.0011, 0.00015, d_edge))
+                // Alternate heart-up / heart-down and shift each board's pith in its own log.
+                let flip = if abs(idx - 2.0 * floor(0.5 * idx)) > 0.5 { 1.0 } else { -1.0 }
+                let jx = (cell01(idx, y: 1.0, seed: log.seed) - 0.5) * 0.12
+                let jy = flip * (0.04 + 0.05 * cell01(idx, y: 2.0, seed: log.seed))
+                let jz = (cell01(idx, y: 3.0, seed: log.seed) - 0.5) * 0.14
+                pith = pith + vec3(jx, jy, jz)
+                seed_val = seed_val + 5.3 * idx
+                board_tone = cell01(idx, y: 4.0, seed: log.seed) - 0.5
+            }
+        }
+    }
+    let v = p - pith
+    let along = dot(v, axis)
+    let across = v - axis * along
     let rho = max(length(across), 1.0e-6)
     let dir = across / rho
     // The rings wander slowly round the log and along it.
-    let seed = vec3(log.seed * 13.1, log.seed * 7.7, 0.0)
+    let seed = vec3(seed_val * 13.1, seed_val * 7.7, 0.0)
     let wobble = log.wander *
         value_noise(vec3(dir.x * 2.0, dir.y * 2.0, along * 6.0 + dir.z * 2.0) + seed)
     // Each year's ring is as wide as that year's growth: wider in good years, narrower in poor,
-    // the years running in spells.
+    // the years running in spells (a decade's swing) and differing from one year to the next (a
+    // year's), from about half to twice the log's ring; the warp never folds a ring back.
     let r = (rho + wobble) / log.ring
     let year = r +
-        1.6 * value_noise(vec3(r * 0.11, log.seed * 3.1, 0.5)) +
-        0.6 * value_noise(vec3(r * 0.43, log.seed * 5.3, 1.5))
+        1.6 * value_noise(vec3(r * 0.11, seed_val * 3.1, 0.5)) +
+        0.3 * value_noise(vec3(r * 0.6, seed_val * 5.3, 2.5))
     let phase = year - floor(year)
-    // Earlywood opens a ring; latewood thickens toward its end and stops sharp at the next.
-    let late = smoothstep(0.45, 0.85, phase)
+    // Earlywood opens a ring; latewood thickens through the year, more of it in a dry summer
+    // (each year's own share), and fades into the next ring's earlywood over a tenth of a ring
+    // (as a ring is seen at a reading distance, not a line).
+    let summer = cell01(floor(year), 3.0, seed_val)
+    let late = smoothstep(0.25 + 0.3 * summer, 0.85, phase) *
+        (1.0 - smoothstep(0.9, 1.0, phase)) *
+        (0.75 + 0.25 * summer)
     // Rays: thin plates running out from the heart, about every 1.5 mm round at each radius,
     // each a lens `ray` m tall along the grain.
-    let helper = if abs(log.axis.y) < 0.9 { vec3(0.0, 1.0, 0.0) } else { vec3(1.0, 0.0, 0.0) }
-    let e1 = normalize(cross(log.axis, helper))
-    let e2 = cross(log.axis, e1)
+    let helper = if abs(axis.y) < 0.9 { vec3(0.0, 1.0, 0.0) } else { vec3(1.0, 0.0, 0.0) }
+    let e1 = normalize(cross(axis, helper))
+    let e2 = cross(axis, e1)
     let round = atan2(dot(dir, e2), dot(dir, e1))
     let arc = round * rho / 0.0015
     let lane = arc - floor(arc)
-    let lens = value_noise(vec3(floor(arc) * 0.37, along / log.ray, log.seed))
-    let ray = smoothstep(0.82, 0.95, 1.0 - abs(lane - 0.5) * 2.0) * smoothstep(0.1, 0.4, lens)
-    // Pores: open vessels in the earlywood, long along the grain, a few tenths of a mm across.
-    let pore_field = value_noise(vec3(arc * 2.7, along / 0.0015, year * 3.0 + log.seed))
-    let pore = smoothstep(0.35, 0.7, pore_field) * (1.0 - smoothstep(0.15, 0.4, phase))
-    Grain { late, ray, pore }
+    let tall = along / log.ray + cell01(floor(arc), 0.0, seed_val)
+    let in_lens = 1.0 - abs(2.0 * (tall - floor(tall)) - 1.0)
+    let ray = smoothstep(0.8, 0.95, 1.0 - abs(lane - 0.5) * 2.0) *
+        smoothstep(0.2, 0.6, in_lens) *
+        step(0.35, cell01(floor(arc), floor(tall), seed_val + 1.0))
+    // Pores: open vessels in the earlywood, each a streak a few mm long along the grain and a few
+    // tenths of a mm across, in cells of that size, one in about half of them.
+    let pa = round * rho / 0.00045 + 0.5 * floor(along / 0.0032)
+    let pl = along / 0.0032 + cell01(floor(pa), 7.0, seed_val)
+    let fa = pa - floor(pa)
+    let fl = pl - floor(pl)
+    let here = step(0.45, cell01(floor(pa), floor(pl), seed_val + 2.0))
+    let pore = here *
+        smoothstep(0.42, 0.18, abs(fa - 0.5)) *
+        smoothstep(0.0, 0.22, fl) *
+        smoothstep(1.0, 0.72, fl) *
+        (1.0 - smoothstep(0.22, 0.48, phase))
+    // The log's colour wanders in long streaks along the grain.
+    let streak = value_noise(vec3(dir.x * 3.0 + seed_val, dir.y * 3.0, along * 1.5))
+    Grain { late, ray, pore, streak, board_tone, seam }
 }
 
-/// A ring-porous oak, as a joiner finishes it and time ages it: the logs its `N` pieces were cut
-/// from, its earlywood's and latewood's
-/// albedo, how much wax or varnish it carries (0 bare to 1 a full build), how far it has darkened
-/// with age (0 new, 1 old), and how much dirt and old wax sit in its recesses (0 none, 1 black).
+/// A ring-porous oak, as a joiner finishes it and time and use age it: the logs its `N` pieces
+/// were cut from, its earlywood's and latewood's albedo, how much wax it carries (0 bare to 1 a
+/// full build), how far it has darkened and yellowed with age (0 new, 1 old), how much dirt and
+/// old wax sit in its recesses (0 none, 1 black), and how much it has been used (0 new, 1 a
+/// century at a desk: scratches, rubbed-through finish, stains).
 pub struct Oak<const N: u32>: Copy + GpuData + Eq + StateHash {
     /// The log each piece of the whole was cut from (`made::Story::piece`).
     pub logs: [Log; N],
@@ -99,51 +181,114 @@ pub struct Oak<const N: u32>: Copy + GpuData + Eq + StateHash {
     pub finish: f32,
     pub age: f32,
     pub grime: f32,
+    pub use_: f32,
 }
 
-/// An oak (`Oak`) whose pieces were cut from `logs`: by default, an old waxed oak, darkened, dirt
-/// in its recesses.
+/// An oak (`Oak`) whose pieces were cut from `logs`: by default, rich antique waxed English oak,
+/// oxidized umber-amber with dark wax in its open pores and recesses and burnished edges.
 pub fn oak<const N: u32>(
     logs: [Log; N],
-    early: vec3 = vec3(0.3, 0.17, 0.08),
-    late: vec3 = vec3(0.22, 0.12, 0.055),
-    finish: f32 = 0.6,
-    age: f32 = 0.6,
-    grime: f32 = 0.5,
+    early: vec3 = vec3(0.20, 0.112, 0.048),
+    late: vec3 = vec3(0.132, 0.070, 0.028),
+    finish: f32 = 0.65,
+    age: f32 = 0.65,
+    grime: f32 = 0.65,
+    use_: f32 = 0.65,
 ) -> Oak<N> {
-    Oak { logs, early, late, finish, age, grime }
+    Oak { logs, early, late, finish, age, grime, use_ }
+}
+
+/// Scratches: fine cuts a few cm long in every direction, as things slid across a surface left
+/// them, one in a few of the 2 cm cells of space, a cut where the cell's random plane passes
+/// within a tenth of a mm (its line on the surface); how much is scratched at `p` (0 to 1).
+fn scratched(p: vec3, seed: f32) -> f32 {
+    let q = p / 0.022
+    let c = floor(q)
+    let k = cell01(c.x + 31.0 * c.z, c.y, seed)
+    let n = normalize(
+        vec3(
+            cell01(c.x, c.y + 3.0, seed) - 0.5,
+            cell01(c.z, c.y + 5.0, seed) - 0.5,
+            cell01(c.x + c.z, c.y + 7.0, seed) - 0.5,
+        ),
+    )
+    let centre = (c + vec3(0.5)) * 0.022
+    let across = abs(dot(p - centre, n))
+    let reach = length(p - centre)
+    step(0.62, k) * smoothstep(0.00014, 0.00004, across) * smoothstep(0.013, 0.006, reach)
 }
 
 impl<const N: u32> Material for Oak<N> {
     fn at(self, p: vec3, story: Story) -> Substance {
-        let g = grain(self.logs[min(story.piece, N - 1)], p)
+        let log = self.logs[min(story.piece, N - 1)]
+        let g = grain(log, p)
         var albedo = mix(self.early, self.late, g.late)
-        // Rays are paler and denser than the wood round them; pores hold dark wax.
-        albedo = mix(albedo, albedo * vec3(1.35, 1.3, 1.2), g.ray)
-        albedo = albedo * (1.0 - 0.45 * g.pore)
-        // Age darkens and warms the whole surface.
-        albedo = albedo * mix(vec3(1.0), vec3(0.62, 0.52, 0.42), self.age)
-        // Rubbed high points wear through to paler wood; recesses hold grime and old wax.
+        // Each piece and each edge-joined plank has its own warm/cool timber shift.
+        let piece_shift = cell01(log.seed, y: 0.0, seed: 9.0) - 0.5
+        albedo = albedo * (1.0 + 0.14 * piece_shift + 0.22 * g.board_tone + 0.12 * g.streak)
+        // Medullary rays gleam pale golden-amber; open earlywood pores hold dark aged wax.
+        albedo = mix(albedo, albedo * vec3(1.34, 1.26, 1.14), g.ray)
+        albedo = albedo * (1.0 - 0.58 * g.pore)
+        // Plank glue-line / breadboard seam darkens slightly with centuries of wax and dust.
+        albedo = albedo * (1.0 - 0.42 * g.seam)
+        // Age: oak oxidizes deeper and warmer in broad uneven patches where light & hands reached.
+        let blotch = value_noise(p * 5.5 + vec3(log.seed))
+        albedo = albedo * mix(vec3(1.0), vec3(0.76, 0.62, 0.45), self.age * (0.82 + 0.18 * blotch))
+        // Use: rubbed high points polish pale honey-amber; recesses & carved grounds hold dark wax.
         let rubbed = max(story.exposure, 0.0)
         let recess = max(-story.exposure, 0.0)
-        albedo = albedo * (1.0 + 0.25 * rubbed) * (1.0 - 0.7 * self.grime * recess)
-        // A finish is glossier where it is rubbed, duller where dust settles, open at pores.
+        let deep = clamp(story.depth / 0.0045, 0.0, 1.0)
+        albedo = albedo *
+            (1.0 + 0.42 * self.use_ * rubbed) *
+            (1.0 - 0.62 * self.grime * recess) *
+            (1.0 - 0.32 * self.grime * deep)
+        // Scratches catch light paler and duller on used surfaces.
+        let scratch = self.use_ * scratched(p, log.seed) * (1.0 - recess)
+        albedo = mix(albedo, albedo * vec3(1.38, 1.32, 1.20), 0.65 * scratch)
+        // Pixel-rate hand-carved gouge facets wherever a surface was cut (`story.depth`): soft,
+        // organically warped chisel scallops rather than a uniform grid.
+        let carved_mask = smoothstep(0.0003, 0.0014, story.depth)
+        let warp = value_noise(p * 42.0 + vec3(log.seed * 3.7))
+        let gouge_u = (p.x * 95.0 + p.y * 65.0 + p.z * 85.0) + 1.35 * warp
+        let gouge_scoop = (0.5 - 0.5 * cos(6.2831853 * gouge_u)) * carved_mask
+        // Subtle hand-planed surface ripple across wide boards (catches soft living reflections).
+        let plane_ripple = value_noise(p * 18.0 + vec3(log.seed * 2.1))
+        // Physical microsurface height offset (m) for Mikkelsen surface-gradient bump mapping.
+        let bump = -0.00020 * g.pore +
+            0.000050 * g.late +
+            0.000025 * g.ray -
+            0.00026 * g.seam -
+            0.00014 * scratch -
+            0.000075 * gouge_scoop +
+            0.000035 * plane_ripple
+        // Wax finish: satin-glossy where rubbed, matte in open pores, seams, scratches and hollows.
         let rough = clamp(
-            0.55 - 0.3 * self.finish * (0.5 + 0.5 * rubbed) + 0.25 * recess + 0.15 * g.pore,
+            0.40 -
+                0.24 * self.finish * (0.45 + 0.55 * rubbed) +
+                0.28 * recess +
+                0.24 * g.pore +
+                0.22 * g.seam +
+                0.30 * scratch +
+                0.06 * blotch -
+                0.10 * g.ray,
             0.12,
-            0.95,
+            0.94,
         )
         Substance {
-            albedo: clamp(albedo, vec3(0.0), vec3(0.9)),
+            albedo: clamp(albedo, vec3(0.0), vec3(0.88)),
             roughness: rough,
             emits: vec3(0.0),
             metallic: 0.0,
             ior: 1.5,
             transmission: 0.0,
-            subsurface: 0.04,
-            coat: clamp(self.finish * (0.35 + 0.5 * rubbed - 0.3 * recess), 0.0, 1.0),
+            subsurface: 0.03,
+            coat: clamp(
+                self.finish * (0.28 + 0.52 * rubbed - 0.35 * recess - 0.45 * g.pore - 0.5 * scratch),
+                0.0,
+                0.9,
+            ),
             micro: 0.0,
-            pad0: 0.0,
+            bump: bump,
             pad1: 0.0,
             pad2: 0.0,
         }

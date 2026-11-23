@@ -557,9 +557,12 @@ and AMD Radeon Renoir (Vulkan):
 3. **Leap C — 16-byte compact visibility meshlets + pixel-rate analytical shading
    (`lib/engine/mesh/extract.wrela`, `draw.wrela`, `light.wrela`):** Compresses `MeshVertex` from
    80 B to **16 B** (5× smaller vertex buffers / fetch bandwidth) using Cigolle et al. (2014)
-   10+10-bit octahedral unit normals + 10-bit thing ID + smooth/transmissive flags; moves `Field`
-   uniform/storage uploads to a pre-pass `MeshWorld::FieldBufs` and evaluates `field.channels(wp)`
-   analytically per pixel for crisp material boundaries and infinite-resolution procedural detail.
+   10+10-bit octahedral unit normals + 10-bit thing ID + smooth flag; moves `Field`
+   uniform/storage uploads to a pre-pass `MeshWorld::FieldBufs` and evaluates the field's channels
+   analytically per pixel for crisp material boundaries and infinite-resolution procedural detail:
+   only the part the vertex lies on, told what changes slowly there (`Field::channels_kept`, from
+   the part and four numbers `keep_verts` keeps a vertex beside it, with whether it lets light
+   through).
 4. **Leap D — Rest-pose auto-skinned fields with GPU Dual Quaternion Skinning (`lib/std/field.wrela`,
    `lib/engine/mesh/{extract,draw,light}.wrela`, `game/world/creature.wrela`):** `DualQuat` +
    `Skinned<S>` extract a relaxed A-pose rest meshlet ONCE with auto-computed 4-bone weights from
