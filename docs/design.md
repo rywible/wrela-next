@@ -590,6 +590,59 @@ Halton TSR) **0 holes**, **100% of surfaces within 0.05 px (`mean 0 px, most 0 p
 **0.61/255**, edges mean **3.54/255** (7.1% over 8/255); `wrela test --std dual_quat`, `tools/layers`,
 and `tools/check` (331 tests) all pass.
 
+## What the forge's assets asked of the engine (2026-11-22)
+
+The forge (docs/forge.md) wrote the first assets made the way an author is meant to make them:
+carved, turned and moulded parts from a vocabulary in `lib/kit/shapes`, each a few named numbers.
+They found five places where the engine assumed fields as light as the stage's and the arena's:
+
+- **Crease and surface slices sized by work.** `refine_creases` and `solve_verts` were dispatched
+  in fixed slices (65,536 cells, and a chunk's whole surface list); the carved table's 319,294 work
+  a crease cell made a slice 52 ms on the M4, and its 38,646 work a surface cell 68 ms on the
+  Radeon, both over the guard's 50, which refused them. Each slice is now the compiler's count of a
+  cell's work for the field extracted (`std::derive::work`) against the GPU's step
+  (`crease_slice_of`, `surf_slice_of` in `mesh/extract.wrela`): a light field's surface list is
+  still one dispatch, a heavy one's is cut.
+- **The audit marches in passes.** `judge::audit`'s march took its 512 steps in one invocation:
+  5.8M work for the table, refused. It marches in passes of 512, 128, 32 or 8 steps (a pipeline
+  constant), chosen the same way.
+- **No fixed cell floor.** A thing's cells were never finer than 5 mm beside its budget's floor
+  (`size_floor`, its radius over 180); a book at 60 cm got 5 mm cells and toothed edges. It now gets
+  what its budget allows (about 1 mm). The creature's audit improved with it (extras 37 to 20, off
+  by more than a pixel 3,046 to 2,068); the other kinds are as they were.
+- **`TABLE` became `IRRADIANCE_SIDE`** (`mesh/light.wrela`): the game now has a table (tools/layers,
+  rule 4).
+
+Measured, 1920x1080, frames 60 to 179, each run's median span (tools/bench), HEAD (7004e44)
+against this change, the same machine and session: two runs each, and three on the M4 for SCENES
+8 and 9, whose first pair met a run disturbed by other work on the machine (frames from 7.5 to
+16.8 ms).
+
+| | M4 HEAD | M4 now | Radeon HEAD | Radeon now |
+|---|---|---|---|---|
+| SCENE 0 | 4.10, 4.14 ms | 3.93, 3.92 ms | 10.67, 10.67 ms | 10.68, 10.68 ms |
+| SCENE 8 | 4.12, 4.13, 4.67 ms | 4.12, 4.13, 4.11 ms | 10.93, 11.00 ms | 10.97, 10.98 ms |
+| SCENE 9 | 7.57, 7.56, 7.58 ms | 7.55, 7.56, 7.56 ms | 22.40, 22.39 ms | 22.47, 22.46 ms |
+| SCENE 10 | 15.41, 16.34 ms | 15.57, 16.69 ms | 36.52, 36.50 ms | 36.50, 36.44 ms |
+| SCENE 11, room / carving / book | (new) | 10.07, 10.02 / 12.26, 12.26 / 21.12, 21.11 ms | (new) | 21.61, 21.40 / 38.08, 38.02 / 61.89, 61.85 ms |
+| SCENE 12, the gold set | (new) | 9.88, 9.92 ms | (new) | (not run) |
+
+**Checked:** SCENE 6's audit, on both machines: every kind it held before the same holes and extras
+as HEAD (stage 0, creature 5, stack 335, pillars 633, braziers 65, flame 0, ward 3361), the
+creature's extras fewer; the two new kinds not clean (the table 154 holes and 47 extras, the
+grimoire 136 and 24, over 24 eyes each), filed as theirs to close.
+
+The same holes and extras on the Radeon as on the M4, kind by kind. Vulkan validation silent on
+SCENES 0, 6, 8, 9, 10 and SCENE 11's three views; `tools/check` passes on both machines
+(with the vocabulary's and the assets' own tests, `tools/forge-test --quick`), and
+`tools/forge-test` on both.
+
+**Not solved:** a thing has one cell size, so the 1.2 m table is meshed at 4.4 mm everywhere and its
+carving at 60 cm is faceted (docs/forge.md, "Gaps filed"). **Open target:** SCENE 11's book view,
+the table's top filling the screen, is 21 ms on the M4 and 62 ms on the Radeon: every pixel asks
+the whole table's oak (three value noises) and its parts' distances, which a pixel-rate material
+pays for whole (docs/forge.md, "Gaps filed": a union asks every part's material).
+
 ## The layers
 
 Dependencies point down. Nothing below knows anything above.

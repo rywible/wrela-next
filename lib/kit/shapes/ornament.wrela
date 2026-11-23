@@ -1,0 +1,448 @@
+// Ornament: motifs, and the rules by which they repeat (AGENTS.md, "The vocabulary ladder": rung
+// 4). Real ornament is mostly a few motifs under symmetry: a leaf mirrored about its midrib, a
+// bead and a reel repeated along a moulding, a petal turned about a rosette's centre. So a motif
+// here is a carving (`carve::Carving`, blades and grooves), and these place it:
+//
+//   mirrored(m)              m and its image across s = 0 (a leaf about its midrib)
+//   row(m, period, count)    m repeated along s every `period` m, `count` times centred on 0, or
+//                            without end (count 0, as round a turned part, where the period
+//                            divides the circumference); every other one mirrored if `alternate`
+//                            (a running scroll)
+//   ring(m, n)               m turned about (0, 0) n times (a rosette's petals)
+//   set(m, at, turn, size)   m moved to `at`, turned `turn` rad and scaled `size` within the face
+//   pair(a, b)               both, the prouder standing (a motif and its border)
+//
+// and these build the classical motifs from a few numbers each, all in metres:
+//
+//   acanthus(length, width, height, curl)   a leaf of three lobes a side, veined, mirrored
+//   bead_and_reel(bead, reel, height)       one cell: an oval bead and two thin reels
+//   egg_and_dart(egg, height)               one cell: an egg in its shell, and a dart
+//   rosette(radius, petals, height)         petals round a boss
+//   scroll(period, span, height)            one wave of a running scroll: stem, leaves, buds
+//   flute(length, width, depth)             one fluting's groove, along t
+//
+// A repeat reads the motif in the cell a point is in, alone: a motif keeps within its cell (half a
+// period either side of its centre, or its sector of a ring), as a carver lays a repeat out.
+// Motifs that reach over each other are two rows, `pair`ed. (Reading the next cell too doubled
+// every repeat's code, which a carved table's shaders could not hold.)
+
+use shapes::carve::{Carving, Cuts, Motif, Raised, blade, carving, cuts, groove, raised}
+use std::cmp::Eq
+use std::hash::StateHash
+
+/// Two motifs' heights at one place, as carving leaves them: where either cuts below the ground,
+/// the deeper cut; else the prouder.
+pub fn joined(a: f32, b: f32) -> f32 {
+    if min(a, b) < 0.0 { min(a, b) } else { max(a, b) }
+}
+
+/// A motif and its image across s = 0.
+pub struct Mirrored<M>: Copy + GpuData + Eq + StateHash {
+    pub motif: M,
+}
+
+/// `motif` mirrored across s = 0 (`Mirrored`).
+pub fn mirrored<M: Motif>(motif: M) -> Mirrored<M> {
+    Mirrored { motif }
+}
+
+impl<M: Motif> Motif for Mirrored<M> {
+    fn height(self, st: vec2) -> f32 {
+        self.motif.height(vec2(abs(st.x), st.y))
+    }
+
+    fn slope(self) -> f32 {
+        self.motif.slope()
+    }
+}
+
+/// A motif repeated along s (`row`).
+pub struct Row<M>: Copy + GpuData + Eq + StateHash {
+    pub motif: M,
+    pub period: f32,
+    /// How many, centred on s = 0; 0 for no end.
+    pub count: u32,
+    pub alternate: bool,
+}
+
+/// `motif` every `period` m along s, `count` times centred on s = 0 (0: without end), every other
+/// one mirrored across its own centre if `alternate`.
+pub fn row<M: Motif>(motif: M, period: f32, count: u32 = 0, alternate: bool = false) -> Row<M> {
+    Row { motif, period, count, alternate }
+}
+
+impl<M: Motif> Motif for Row<M> {
+    /// The motif in the cell `st` is in: cell `k` of `count` is centred `(k - (count - 1) / 2)`
+    /// periods along s (without end, `k` periods).
+    fn height(self, st: vec2) -> f32 {
+        let middle = if self.count > 0 { 0.5 * f32(self.count - 1) } else { 0.0 }
+        var k = round(st.x / self.period + middle)
+        if self.count > 0 {
+            k = clamp(k, 0.0, f32(self.count - 1))
+        }
+        let s = st.x - (k - middle) * self.period
+        let odd = self.alternate && abs(k - 2.0 * floor(0.5 * k)) > 0.5
+        self.motif.height(vec2(if odd { -s } else { s }, st.y))
+    }
+
+    fn slope(self) -> f32 {
+        self.motif.slope()
+    }
+}
+
+/// A motif turned about (0, 0) `n` times (`ring`).
+pub struct Ring<M>: Copy + GpuData + Eq + StateHash {
+    pub motif: M,
+    pub n: u32,
+}
+
+/// `motif` turned about (0, 0) `n` times, evenly: its copy at angle 0 points along +t.
+pub fn ring<M: Motif>(motif: M, n: u32) -> Ring<M> {
+    Ring { motif, n: max(n, 1) }
+}
+
+/// `st` turned by `-a` rad.
+fn unturned(st: vec2, a: f32) -> vec2 {
+    let c = cos(a)
+    let s = sin(a)
+    vec2(c * st.x + s * st.y, -s * st.x + c * st.y)
+}
+
+impl<M: Motif> Motif for Ring<M> {
+    fn height(self, st: vec2) -> f32 {
+        let step = 6.2831853 / f32(self.n)
+        // The angle from +t, clockwise toward +s.
+        let k = round(atan2(st.x, st.y) / step)
+        self.motif.height(unturned(st, -k * step))
+    }
+
+    fn slope(self) -> f32 {
+        self.motif.slope()
+    }
+}
+
+/// A motif moved, turned and scaled within its face (`set`).
+pub struct Set<M>: Copy + GpuData + Eq + StateHash {
+    pub motif: M,
+    pub at: vec2,
+    pub turn: f32,
+    pub size: f32,
+}
+
+/// `motif` moved to `at`, turned `turn` rad (from +t toward +s) and scaled by `size`.
+pub fn set<M: Motif>(motif: M, at: vec2, turn: f32 = 0.0, size: f32 = 1.0) -> Set<M> {
+    Set { motif, at, turn, size }
+}
+
+impl<M: Motif> Motif for Set<M> {
+    fn height(self, st: vec2) -> f32 {
+        self.size * self.motif.height(unturned(st - self.at, -self.turn) / self.size)
+    }
+
+    fn slope(self) -> f32 {
+        self.motif.slope()
+    }
+}
+
+/// Two motifs on one face (`pair`).
+pub struct Pair<A, B>: Copy + GpuData + Eq + StateHash {
+    pub a: A,
+    pub b: B,
+}
+
+/// `a` and `b` together: the prouder stands, the deeper groove cuts.
+pub fn pair<A: Motif, B: Motif>(a: A, b: B) -> Pair<A, B> {
+    Pair { a, b }
+}
+
+impl<A: Motif, B: Motif> Motif for Pair<A, B> {
+    fn height(self, st: vec2) -> f32 {
+        joined(self.a.height(st), self.b.height(st))
+    }
+
+    fn slope(self) -> f32 {
+        max(self.a.slope(), self.b.slope())
+    }
+}
+
+// ---- the classical motifs -----------------------------------------------------------------------
+
+/// An acanthus leaf as one side of it (`mirrored` makes the whole leaf): its midrib up t from
+/// (0, 0), `length` m long and `width` m across at its widest, `height` m proud, its lobes curled
+/// over by `curl` (0 straight, 1 their tips turned down as far as a leaf's turn): three broad
+/// lobes reaching out and up from the midrib, the lowest widest, and the leaf's tip running on up
+/// it, each lobe hollowed along its middle by a gouge, as a carver models them.
+pub type Acanthus = Carving<4, 4>
+
+/// One side of an acanthus leaf (`Acanthus`).
+pub fn acanthus(length: f32, width: f32, height: f32, curl: f32 = 0.5) -> Acanthus {
+    let l = length
+    let w = 0.5 * width
+    let roots = [vec2(0.0, 0.04 * l), vec2(0.0, 0.3 * l), vec2(0.0, 0.54 * l)]
+    let tips = [vec2(0.92 * w, 0.4 * l), vec2(0.8 * w, 0.68 * l), vec2(0.56 * w, 0.9 * l)]
+    let widths = [0.9 * w, 0.8 * w, 0.66 * w]
+    let bow = -0.1 * curl * l
+    var blades = [blade(vec2(0.0), vec2(0.0, l), width: w, height: height); 4]
+    var grooves = [groove(vec2(0.0), vec2(0.0, l), depth: 0.2 * height, tool: 0.1 * w); 4]
+    for i in 0..3 {
+        blades[i] = blade(
+            roots[i],
+            tips[i],
+            bend: bow,
+            width: widths[i],
+            belly: 0.45,
+            height: (1.0 - 0.06 * f32(i)) * height,
+        )
+        // The lobe's hollow, down its middle from near its root almost to its tip.
+        grooves[i] = groove(
+            roots[i] + (tips[i] - roots[i]) * 0.15,
+            tips[i] - (tips[i] - roots[i]) * 0.12,
+            bend: bow,
+            depth: 0.35 * height,
+            tool: 0.16 * widths[i],
+        )
+    }
+    // The tip: a lobe up the midrib's top, and the midrib's own groove under the leaf's length.
+    blades[3] = blade(
+        vec2(0.0, 0.62 * l),
+        vec2(0.0, 1.0 * l),
+        width: 0.7 * w,
+        belly: 0.4,
+        height: 0.9 * height,
+    )
+    grooves[3] = groove(
+        vec2(0.0, 0.02 * l),
+        vec2(0.0, 0.97 * l),
+        depth: 0.22 * height,
+        tool: 0.07 * w,
+    )
+    carving(blades, grooves)
+}
+
+/// A cell of bead and reel, centred on (0, 0) along s: an oval bead `bead` m long, and a reel (two
+/// thin discs side by side) `reel` m long at each end of the cell, standing `height` m: repeated
+/// every `bead + reel` m (`row`).
+pub type BeadAndReel = Raised<3>
+
+/// A bead-and-reel cell (`BeadAndReel`).
+pub fn bead_and_reel(bead: f32, reel: f32, height: f32) -> BeadAndReel {
+    let cell = bead + reel
+    let b = blade(
+        vec2(-0.5 * bead, 0.0),
+        vec2(0.5 * bead, 0.0),
+        width: 2.0 * height,
+        height: height,
+    )
+    // The reels lie across the moulding, at the cell's ends: half a reel each side.
+    let r0 = blade(
+        vec2(0.5 * cell - 0.25 * reel, -0.9 * height),
+        vec2(0.5 * cell - 0.25 * reel, 0.9 * height),
+        width: 0.45 * reel,
+        height: 0.8 * height,
+    )
+    let r1 = blade(
+        vec2(-0.5 * cell + 0.25 * reel, -0.9 * height),
+        vec2(-0.5 * cell + 0.25 * reel, 0.9 * height),
+        width: 0.45 * reel,
+        height: 0.8 * height,
+    )
+    raised([b, r0, r1])
+}
+
+/// A cell of egg and dart, centred on (0, 0): an egg `egg` m tall standing `height` m proud in a
+/// shell cut round it, and a dart between it and the next: repeated every `0.8 * egg` m (`row`).
+pub type EggAndDart = Carving<3, 2>
+
+/// An egg-and-dart cell (`EggAndDart`).
+pub fn egg_and_dart(egg: f32, height: f32) -> EggAndDart {
+    let e = egg
+    let cell = 0.8 * e
+    // The egg points down; the shell is two grooves round it; the dart stands between cells.
+    let body = blade(
+        vec2(0.0, 0.5 * e),
+        vec2(0.0, -0.5 * e),
+        width: 0.62 * e,
+        belly: 0.42,
+        height: height,
+    )
+    let shell_l = groove(
+        vec2(0.0, 0.55 * e),
+        vec2(0.0, -0.58 * e),
+        bend: -0.38 * e,
+        depth: 0.35 * height,
+        tool: 0.06 * e,
+    )
+    let shell_r = groove(
+        vec2(0.0, 0.55 * e),
+        vec2(0.0, -0.58 * e),
+        bend: 0.38 * e,
+        depth: 0.35 * height,
+        tool: 0.06 * e,
+    )
+    let dart = blade(
+        vec2(0.5 * cell, 0.5 * e),
+        vec2(0.5 * cell, -0.6 * e),
+        width: 0.16 * e,
+        belly: 0.3,
+        height: 0.7 * height,
+    )
+    let dart_back = blade(
+        vec2(-0.5 * cell, 0.5 * e),
+        vec2(-0.5 * cell, -0.6 * e),
+        width: 0.16 * e,
+        belly: 0.3,
+        height: 0.7 * height,
+    )
+    carving([body, dart, dart_back], [shell_l, shell_r])
+}
+
+/// One wave of a running scroll, centred on (0, 0) along s, `period` m long and `span` m across
+/// (t from -span/2 to span/2), standing `height` m proud: a stem waving up and down through the
+/// cell, a leaf springing from each crest and curling into the hollow beyond it, each leaf veined
+/// and ending in a bud. Repeated without a break every `period` m (`row`), its stem runs on from
+/// cell to cell.
+pub type Scroll = Carving<6, 3>
+
+/// A wave of running scroll (`Scroll`).
+pub fn scroll(period: f32, span: f32, height: f32) -> Scroll {
+    let p = period
+    let a = 0.22 * span
+    let w = 0.13 * span
+    // The stem: up through the first half, down through the second, its ends square across the
+    // cell's edges so the next cell's stem meets it.
+    let stem_up = blade(
+        vec2(-0.5 * p, 0.0),
+        vec2(0.0, 0.0),
+        bend: -a,
+        width: w,
+        belly: 0.5,
+        height: 0.8 * height,
+        fill: 1.0,
+    )
+    let stem_down = blade(
+        vec2(0.0, 0.0),
+        vec2(0.5 * p, 0.0),
+        bend: a,
+        width: w,
+        belly: 0.5,
+        height: 0.8 * height,
+        fill: 1.0,
+    )
+    // A leaf from each crest, sweeping on and curling into the hollow the stem leaves.
+    let leaf_up = blade(
+        vec2(-0.3 * p, 0.12 * span),
+        vec2(0.22 * p, 0.36 * span),
+        bend: 0.12 * p,
+        width: 0.4 * span,
+        belly: 0.35,
+        height: height,
+    )
+    let leaf_down = blade(
+        vec2(0.2 * p, -0.12 * span),
+        vec2(-0.32 * p, -0.36 * span),
+        bend: 0.12 * p,
+        width: 0.4 * span,
+        belly: 0.35,
+        height: height,
+    )
+    // Buds where the leaves curl.
+    let bud_up = blade(
+        vec2(0.18 * p, 0.3 * span),
+        vec2(0.3 * p, 0.2 * span),
+        bend: 0.02 * p,
+        width: 0.2 * span,
+        height: 0.9 * height,
+    )
+    let bud_down = blade(
+        vec2(-0.28 * p, -0.3 * span),
+        vec2(-0.4 * p, -0.2 * span),
+        bend: 0.02 * p,
+        width: 0.2 * span,
+        height: 0.9 * height,
+    )
+    let vein_up = groove(
+        vec2(-0.25 * p, 0.14 * span),
+        vec2(0.16 * p, 0.33 * span),
+        bend: 0.1 * p,
+        depth: 0.35 * height,
+        tool: 0.05 * span,
+    )
+    let vein_down = groove(
+        vec2(0.15 * p, -0.14 * span),
+        vec2(-0.26 * p, -0.33 * span),
+        bend: 0.1 * p,
+        depth: 0.35 * height,
+        tool: 0.05 * span,
+    )
+    let stem_line = groove(
+        vec2(-0.5 * p, 0.0),
+        vec2(0.5 * p, 0.0),
+        depth: 0.2 * height,
+        tool: 0.03 * span,
+    )
+    carving(
+        [stem_up, stem_down, leaf_up, leaf_down, bud_up, bud_down],
+        [vein_up, vein_down, stem_line],
+    )
+}
+
+/// One petal of a rosette `radius` m round, pointing along +t from near the centre, `height` m
+/// proud, with a vein; `rosette` turns it round and adds the boss.
+pub type Petal = Carving<1, 1>
+
+/// One petal (`Petal`) of a rosette of `petals` petals.
+pub fn petal(radius: f32, petals: u32, height: f32) -> Petal {
+    let w = 6.2831853 * 0.55 * radius / f32(max(petals, 3))
+    let p = blade(vec2(0.0, 0.18 * radius), vec2(0.0, radius), width: w, belly: 0.6, height: height)
+    let v = groove(
+        vec2(0.0, 0.2 * radius),
+        vec2(0.0, 0.92 * radius),
+        depth: 0.3 * height,
+        tool: 0.12 * w,
+    )
+    carving([p], [v])
+}
+
+/// A rosette: `petals` petals round a domed boss, `radius` m round, `height` m proud.
+pub type Rosette = Pair<Ring<Petal>, Raised<1>>
+
+/// A rosette (`Rosette`).
+pub fn rosette(radius: f32, petals: u32, height: f32) -> Rosette {
+    let boss = blade(
+        vec2(0.0, -0.24 * radius),
+        vec2(0.0, 0.24 * radius),
+        width: 0.48 * radius,
+        height: 1.1 * height,
+        fill: 0.6,
+    )
+    pair(ring(petal(radius, petals, height), n: petals), raised([boss]))
+}
+
+/// One flute: a groove `length` m long up t, cut by a gouge `width` m across, `depth` m deep
+/// (repeated round a turned part by `row`, its period the circumference over the count).
+pub type Flute = Cuts<1>
+
+/// A flute (`Flute`).
+pub fn flute(length: f32, width: f32, depth: f32) -> Flute {
+    // A gouge as wide as the flute is deep enough: its radius is half its width over the sine of
+    // the angle its depth leaves.
+    let r = (0.25 * width * width + depth * depth) / (2.0 * max(depth, 1.0e-5))
+    cuts([groove(vec2(0.0, 0.0), vec2(0.0, length), depth: depth, tool: max(r, depth / 0.6))])
+}
+
+/// Blades alone (a reed, a gadroon: lens-shaped lobes side by side).
+pub type Lobe = Raised<1>
+
+/// A lobe `length` m long up t, `width` m across, `height` m proud (`row` sets them side by side:
+/// gadrooning, reeding).
+pub fn lobe(length: f32, width: f32, height: f32, belly: f32 = 0.5) -> Lobe {
+    raised([blade(vec2(0.0, 0.0), vec2(0.0, length), width: width, belly: belly, height: height)])
+}
+
+/// Groove alone: a line cut by a gouge (a border, a fillet's line, a book's blind tooling).
+pub type Line = Cuts<1>
+
+/// A line (`Line`) from `a` to `b`, bowed `bend`, `depth` deep, cut by a gouge of radius `tool`.
+pub fn line(a: vec2, b: vec2, bend: f32 = 0.0, depth: f32, tool: f32) -> Line {
+    cuts([groove(a, b, bend: bend, depth: depth, tool: tool)])
+}

@@ -1,0 +1,254 @@
+// The making operations, each held to its surface drawn another way: a dense cloud of points on
+// it, made from its outline walked point by point (`outline::on_segment`), and the brute-force
+// nearest of them; and its side, from the outline's polyline by the even-odd rule. A distance
+// that is exact must agree with the cloud's to within what the cloud's spacing can tell.
+
+use shapes::made::Shaped
+use shapes::making::{board, extruded, folded, joined, moulded, plan_distance, turned}
+use shapes::outline::{crosses, on_segment}
+use std::collections::Vec
+use std::field::{Surface, check_lipschitz}
+use std::io::print
+
+/// The least distance from `p` to the points of `cloud`.
+fn nearest(p: vec3, cloud: Vec<vec3>) -> f32 {
+    var d2 = 1.0e30
+    for q in cloud {
+        let e = p - q
+        d2 = min(d2, dot(e, e))
+    }
+    sqrt(d2)
+}
+
+/// Whether `p` is inside the closed polyline `pts`, by the even-odd rule.
+fn inside(p: vec2, pts: Vec<vec2>) -> bool {
+    var r = false
+    let n = pts.len()
+    for i in 0..n {
+        let a = pts[i]
+        let b = pts[(i + 1) % n]
+        if crosses(p, a, b) {
+            r = !r
+        }
+    }
+    r
+}
+
+/// An open profile walked as `Profile` closes it: its segments, then across to x = -`far`, down
+/// it, and back.
+fn profile_walk(points: [vec2; 5], bulges: [f32; 5], far: f32, per: u32) -> Vec<vec2> {
+    var pts = Vec::new()
+    for i in 1..5 {
+        for k in 0..per {
+            pts.push(on_segment(points[i - 1], points[i], bulges[i - 1], k: k, n: per))
+        }
+    }
+    pts.push(points[4])
+    pts.push(vec2(-far, points[4].y))
+    pts.push(vec2(-far, points[0].y))
+    pts
+}
+
+/// A baluster's profile: a foot, a bead, a long vase bowed out, a neck and a head.
+const LEG_POINTS = [
+    vec2(0.022, 0.0),
+    vec2(0.028, 0.012),
+    vec2(0.03, 0.12),
+    vec2(0.016, 0.16),
+    vec2(0.024, 0.2),
+]
+const LEG_BULGES = [0.004, -0.002, 0.012, -0.004, 0.0]
+
+/// Points near the surfaces checked: a grid round them, from `lo` to `hi`, `n` a side.
+fn probes(lo: vec3, hi: vec3, n: u32) -> Vec<vec3> {
+    var v = Vec::new()
+    for i in 0..n {
+        for j in 0..n {
+            for k in 0..n {
+                let t = vec3(f32(i), f32(j), f32(k)) / f32(n - 1)
+                v.push(lo + (hi - lo) * t)
+            }
+        }
+    }
+    v
+}
+
+@test
+fn a_turned_leg_is_its_profile_spun() {
+    let leg = turned(LEG_POINTS, LEG_BULGES)
+    let walk = profile_walk(LEG_POINTS, LEG_BULGES, far: leg.profile.far, per: 300)
+    // The surface: the profile's outer side spun round 480 ways, and its ends' discs.
+    var cloud = Vec::new()
+    for a in 0..480 {
+        let t = 6.2831853 * f32(a) / 480.0
+        let c = vec2(cos(t), sin(t))
+        for q in walk {
+            if q.x >= 0.0 {
+                cloud.push(vec3(c.x * q.x, q.y, c.y * q.x))
+            }
+        }
+        for r in 0..40 {
+            let x = 0.022 * f32(r) / 40.0
+            cloud.push(vec3(c.x * x, 0.0, c.y * x))
+            cloud.push(vec3(c.x * 0.024 * f32(r) / 40.0, 0.2, c.y * 0.024 * f32(r) / 40.0))
+        }
+    }
+    var worst = 0.0
+    for p in probes(vec3(-0.045, -0.02, 0.001), vec3(0.045, 0.22, 0.044), n: 7) {
+        let fast = leg.distance(p)
+        let slow = nearest(p, cloud)
+        let side = inside(vec2(length(p.xz), p.y), walk)
+        assert((fast < 0.0) == side || abs(fast) < 1.0e-4, "a turned leg's side")
+        worst = max(worst, abs(abs(fast) - slow))
+    }
+    print(f"turned: {cloud.len()} cloud points, worst {worst} m")
+    // The cloud's points are at most 0.4 mm apart: it can tell a distance to about 0.1 mm.
+    assert(worst < 2.0e-4, f"a turned leg's distance is off its cloud's by {worst} m")
+    check_lipschitz(leg, near: 0.05, l: leg.lipschitz(0.05))
+    // Its story: the bead (bowed out 4 mm over 14 mm) is exposed, the cove under the head is
+    // recessed.
+    let (_, bead) = leg.shaped(vec3(0.0281, 0.006, 0.0))
+    assert(bead.exposure > 0.3, f"a bead reads exposed: {bead.exposure}")
+}
+
+@test
+fn a_moulded_top_is_its_edge_run_round_its_plan() {
+    // A top 0.5 by 0.3 m with its corners rounded 4 cm, its edge a thumbnail: a quarter-round
+    // bowed out over a fillet, 3 cm thick.
+    let pts = [
+        vec2(-0.01, 0.0),
+        vec2(0.0, 0.004),
+        vec2(0.0, 0.012),
+        vec2(-0.004, 0.026),
+        vec2(-0.02, 0.03),
+    ]
+    let bul = [0.002, 0.0, 0.006, 0.003, 0.0]
+    let top = moulded(vec2(0.25, 0.15), corner: 0.04, points: pts, bulges: bul)
+    let walk = profile_walk(pts, bul, far: top.edge.far, per: 200)
+    // The surface: the edge's profile run round the plan's outline offset by each point's x, and
+    // the top and bottom as grids.
+    var cloud = Vec::new()
+    for q in walk {
+        if q.x >= -0.02 {
+            for k in 0..1200 {
+                cloud.push(on_plan(f32(k) / 1200.0, vec2(0.25, 0.15), 0.04, out: q.x, y: q.y))
+            }
+        }
+    }
+    // (The faces over the corner the probes are round, 0.5 mm apart.)
+    for i in 0..241 {
+        for j in 0..241 {
+            let xz = vec2(0.13 + 0.12 * f32(i) / 240.0, 0.03 + 0.12 * f32(j) / 240.0)
+            if plan_distance(xz, vec2(0.25, 0.15), 0.04) < -0.02 {
+                cloud.push(vec3(xz.x, 0.03, xz.y))
+            }
+            if plan_distance(xz, vec2(0.25, 0.15), 0.04) < -0.01 {
+                cloud.push(vec3(xz.x, 0.0, xz.y))
+            }
+        }
+    }
+    var worst = 0.0
+    for p in probes(vec3(0.15, -0.01, 0.05), vec3(0.29, 0.045, 0.19), n: 7) {
+        let fast = top.distance(p)
+        let slow = nearest(p, cloud)
+        worst = max(worst, abs(abs(fast) - slow))
+    }
+    print(f"moulded: {cloud.len()} cloud points, worst {worst} m")
+    // Plan points 0.7 mm apart round, and faces 0.5 mm apart: it can tell to about 0.3 mm.
+    assert(worst < 3.0e-4, f"a moulded top's distance is off its cloud's by {worst} m")
+    check_lipschitz(top, near: 0.05, l: top.lipschitz(0.05))
+}
+
+/// The point a fraction `f` round a rounded rectangle's outline offset `out` (positive outward),
+/// at height `y`: along its four sides and four corner arcs, by length.
+fn on_plan(f: f32, half: vec2, corner: f32, out: f32, y: f32) -> vec3 {
+    let a = half - vec2(corner)
+    let r = corner + out
+    let sides = vec4(2.0 * a.x, 2.0 * a.y, 2.0 * a.x, 2.0 * a.y)
+    let arc = 1.5707963 * max(r, 0.0)
+    let total = sides.x + sides.y + sides.z + sides.w + 4.0 * arc
+    var s = f * total
+    // Side, corner, side, corner, ... from (-a.x, a.y + r) going +x.
+    let starts = [vec2(-a.x, a.y), vec2(a.x, a.y), vec2(a.x, -a.y), vec2(-a.x, -a.y)]
+    let dirs = [vec2(1.0, 0.0), vec2(0.0, -1.0), vec2(-1.0, 0.0), vec2(0.0, 1.0)]
+    let outs = [vec2(0.0, 1.0), vec2(1.0, 0.0), vec2(0.0, -1.0), vec2(-1.0, 0.0)]
+    let lens = [sides.x, sides.y, sides.z, sides.w]
+    for i in 0..4 {
+        if s <= lens[i] {
+            let q = starts[i] + dirs[i] * s + outs[i] * r
+            return vec3(q.x, y, q.y)
+        }
+        s -= lens[i]
+        if s <= arc {
+            let t = s / max(arc, 1.0e-9) * 1.5707963
+            let c = starts[i] + dirs[i] * lens[i]
+            let q = c + (outs[i] * cos(t) + dirs[i] * sin(t)) * r
+            return vec3(q.x, y, q.y)
+        }
+        s -= arc
+    }
+    vec3(-a.x, y, a.y + r)
+}
+
+@test
+fn a_rail_is_its_section_run_straight() {
+    // A rail 30 cm long, its section 2 cm square with its top edges rounded.
+    let pts = [
+        vec2(-0.01, 0.0),
+        vec2(0.01, 0.0),
+        vec2(0.01, 0.016),
+        vec2(0.006, 0.02),
+        vec2(-0.006, 0.02),
+        vec2(-0.01, 0.016),
+    ]
+    let bul = [0.0, 0.0, 0.0017, 0.0, 0.0017, 0.0]
+    let rail = extruded(pts, bul, length: 0.3)
+    // Its middle's sections, away from its ends: a 2D distance.
+    var worst = 0.0
+    for p in probes(vec3(-0.1, -0.01, -0.02), vec3(0.1, 0.03, 0.02), n: 6) {
+        worst = max(worst, abs(rail.distance(p) - rail.section.distance(p.zy)))
+    }
+    assert(worst < 1.0e-6, f"a rail's middle is its section: off by {worst}")
+    // Past its end by 5 mm, straight out from its section: 5 mm.
+    assert(abs(rail.distance(vec3(0.155, 0.01, 0.0)) - 0.005) < 1.0e-6)
+    check_lipschitz(rail, near: 0.05, l: rail.lipschitz(0.05))
+}
+
+@test
+fn a_seam_shows_where_two_boards_meet() {
+    // Two boards side by side along x, overlapping by a centimetre about x = 0 (as a tenon is in
+    // its mortise: joined parts overlap, so the joint is solid inside).
+    let a = board(vec3(0.05, 0.01, 0.05), round: 0.001)
+    let b = board(vec3(0.05, 0.01, 0.05), round: 0.001)
+    let ab = joined(
+        shapes::making::placed(a, at: vec3(-0.045, 0.0, 0.0)),
+        shapes::making::placed(b, at: vec3(0.045, 0.0, 0.0)),
+        gap: 0.0006,
+        depth: 0.0005,
+    )
+    // On the top face at the seam, the surface is cut: the point just under it is outside.
+    assert(ab.distance(vec3(0.0, 0.0099, 0.0)) > 0.0, "the seam is open at the face")
+    // Below the seam's depth, the boards are solid across it.
+    assert(ab.distance(vec3(0.0, 0.008, 0.0)) < 0.0, "the joint is solid below the seam")
+    // Off the seam, the face is where the board's is.
+    assert(abs(ab.distance(vec3(0.03, 0.0101, 0.0)) - 0.0001) < 1.0e-6)
+    check_lipschitz(ab, near: 0.02, l: ab.lipschitz(0.02))
+    let (_, story) = ab.shaped(vec3(0.0, 0.0099, 0.0))
+    assert(story.exposure < -0.5, "a seam is a recess")
+}
+
+@test
+fn a_folded_part_stands_at_four_corners() {
+    let leg = shapes::making::placed(turned(LEG_POINTS, LEG_BULGES), at: vec3(0.3, 0.0, 0.2))
+    let legs = folded(leg)
+    for c in [vec2(0.3, 0.2), vec2(-0.3, 0.2), vec2(0.3, -0.2), vec2(-0.3, -0.2)] {
+        assert(legs.distance(vec3(c.x, 0.1, c.y)) < 0.0, "a leg at each corner")
+    }
+    let b = legs.bound()
+    for c in [vec2(0.3, 0.2), vec2(-0.3, -0.2)] {
+        assert(
+            b.below(vec3(c.x, 0.1, c.y)) <= legs.distance(vec3(c.x, 0.1, c.y)),
+            "its bound holds",
+        )
+    }
+}

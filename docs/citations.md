@@ -7,7 +7,10 @@ is in `rywible/wrela`'s `docs/process.md`.
 
 Claude and Codex agents write almost all of the code, tests and docs; Ryan decides the goals and
 the architecture, and merges every change. No generative image, sound, music, voice or video
-model makes anything here.
+model makes anything that ships here. The forge (docs/forge.md) may use an image model and an
+image-to-3D model to make reference material for an agent to fit a program to; that material
+stays in the git-ignored `.forge/`, nothing in `game/` or `lib/` reads it, and each asset's
+provenance record names the models, versions, prompts and seeds. None has been run yet.
 
 The engine was begun again on a clean slate on 2026-11-18 (branch `engine`, merged into `backend`;
 docs/design.md), and replaced its per-pixel raymarcher (`Sight`, `lib/engine/picture/pixels.wrela`,
@@ -224,6 +227,23 @@ made up; `table`'s 57 joints are made-up points.
 The image fixtures in `toolchain/tests/images` are four flat colours that Claude made. The PNG and
 zlib fixtures in `toolchain/tests/png` are generated patterns that Claude made with Python's
 `zlib` and Pillow (HPND), and Pillow's decoder checked the 8-bit ones.
+
+## The forge
+
+The authoring pipeline from a brief to a gold asset (docs/forge.md, `tools/forge`). No code was
+copied from any of these.
+
+| Source | Rights | How and why we use it |
+|---|---|---|
+| Microsoft, [TRELLIS.2](https://microsoft.github.io/TRELLIS.2) (model card: [huggingface.co/microsoft/TRELLIS.2-4B](https://huggingface.co/microsoft/TRELLIS.2-4B)), a 4B-parameter image-to-3D model with PBR materials | MIT (code and weights); its README names dependencies, nvdiffrast and nvdiffrec, under NVIDIA's Source Code License (research or evaluation) | `tools/forge-notebooks/reference_trellis.ipynb` runs it on Colab to turn an asset's concept views into a textured mesh, which `tools/forge reference` turns into samples for the fitter and the judge. The mesh never ships. Not run yet |
+| D. Rukhovich, E. Dupont, D. Mallis, K. Cherenkova, A. Kacem and D. Aouada, "CAD-Recode: Reverse Engineering CAD Code from Point Clouds" ([arXiv:2412.14042](https://arxiv.org/abs/2412.14042), *ICCV* 2025) | Published method | The precedent for the forge's last, gated phase: a small code model fine-tuned on a million generated programs to write CAD code from point clouds. Read as a method; nothing built |
+| Google's Gemini image models, through the Gemini API on Colab | Google's API terms (they don't claim ownership of what is generated) | `tools/forge-notebooks/concept_views.ipynb` makes an asset's concept views from its linted prompts, recording the model, its version and the seed. The images never ship. Not run yet |
+| I. Quilez, "2D distance functions" (iquilezles.org: the polygon's distance with its winding sign, the arc's) | Published articles, read as methods | `lib/kit/shapes/outline.wrela`: an outline's signed distance, its segments straight or circular arcs, its side by crossings and by the caps between chord and arc |
+| J. J. Park, P. Florence, J. Straub, R. Newcombe and S. Lovegrove, "DeepSDF: Learning Continuous Signed Distance Functions for Shape Representation" (*CVPR* 2019) | Published method | `tools/forge` (`mesh_samples`): a reference's volume samples taken a little off its surface each side along its normals, their sides and distances known, beside samples through its box |
+| Y. Chen and G. Medioni, "Object Modelling by Registration of Multiple Range Images" (*Image and Vision Computing* 10(3), 1992), the point-to-plane distance | Published method | `lib/engine/judge/samples.wrela` (`to_sample`) and `tools/forge` (`nearest_distance`): a point's distance from a sampled surface taken to the nearest sample's plane, so samples millimetres apart still measure tenths of a millimetre |
+| K. Levenberg (1944) and D. Marquardt (1963), least squares | Published method | Already the toolchain's (`std::lift::Minimize::fit`, `wrela solve --fit`); the forge's fitter is it, over an asset's literals |
+| Z. Wang, A. C. Bovik, H. R. Sheikh and E. P. Simoncelli, "Image Quality Assessment: From Error Visibility to Structural Similarity" (*IEEE Transactions on Image Processing* 13(4), 2004); CIE 1976 L\*a\*b\* and its colour difference ΔE\*ab | Published method; CIE standard | `tools/forge` (`look_scores`): a render against a concept image, by SSIM of lightness and mean ΔE over the object, after its exposure is matched |
+| D. R. Peachey, "Solid Texturing of Complex Surfaces" (*SIGGRAPH* 1985); J. Liu, J. Dorsey et al., "Simulating the Structure and Texture of Solid Wood" (*ACM Transactions on Graphics* 35(6), *SIGGRAPH Asia* 2016) | Published methods | `lib/kit/substances/wood.wrela`: wood's figure as a solid texture of the log it grew in (rings round its pith, rays out from it, pores in its earlywood), so a cut shows the grain inside at the angle it makes |
 
 ## What the game is aimed at
 

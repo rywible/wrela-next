@@ -1,0 +1,399 @@
+// Outlines: the 2D curves the making operations are drawn from (a turner's profile, a moulding's
+// section, a carved leaf's spine). An outline is points joined by segments, each straight or bowed
+// into a circular arc by its bulge: how far its middle stands off the straight line between its
+// ends, in metres. A bead is a segment bowed out, a cove one bowed in, an ogee two bowed opposite
+// ways; so a turned leg or a moulded edge is a dozen points and a dozen bulges, each a number a
+// woodworker would name, where a polygon would need a hundred points to hold the same curve.
+//
+// The distance is exact (an arc's, or a straight segment's) wherever a segment bows by more than
+// 2% of its length, and within 0.4% of it where it bows less, where an arc is taken as the
+// parabola it is to second order: so the distance changes smoothly with a bulge through 0, and a
+// fit can bow a straight segment (`std::lift::gradient` of a straight segment by its bulge isn't
+// 0).
+//
+// Orientation: an outline is traced with its inside on the left. A positive bulge bows to the
+// right of the way it is traced: out of the solid, a bead; a negative one into it, a cove.
+
+use std::cmp::Eq
+use std::hash::StateHash
+
+/// Where `p` is against one segment of an outline: the square of its distance from the segment,
+/// whether `p` is in the cap between the segment's chord and its arc (which changes which side
+/// of the outline `p` is on), whether a ray from `p` toward +x crosses the chord (the same), the
+/// segment's curvature where it is nearest (1/radius; positive bowed out, 0 straight), and,
+/// where the nearest point is inside the segment (not an end), the signed offset to it (positive
+/// to the right of the way it runs: out of an outline traced with its inside on the left).
+pub struct Near2: Copy {
+    pub d2: f32,
+    pub cap: bool,
+    pub cross: bool,
+    pub bend: f32,
+    pub off: f32,
+    pub inner: bool,
+}
+
+/// Below this share of its length a segment's bow is taken as a parabola, not an arc.
+const SHALLOW: f32 = 0.02
+
+/// Whether a ray from `p` toward +x crosses the straight segment from `a` to `b` (a level
+/// segment never does).
+pub fn crosses(p: vec2, a: vec2, b: vec2) -> bool {
+    let dy = b.y - a.y
+    let safe = if abs(dy) > 1.0e-30 { dy } else { 1.0e-30 }
+    ((a.y > p.y) != (b.y > p.y)) && p.x < a.x + (p.y - a.y) * (b.x - a.x) / safe
+}
+
+/// What a segment's arc is, worked out once from its ends and its bulge (`arc_of`) where it is
+/// built, so a point asks only what depends on the point: its length, and for a segment bowed as
+/// an arc, its circle's centre and radius and the cosine of half the angle it spans (a radius of
+/// 0 for a segment taken as straight or a parabola).
+pub struct Arc: Copy + GpuData + Eq + StateHash {
+    pub centre: vec2,
+    pub length: f32,
+    pub radius: f32,
+    pub open: f32,
+}
+
+/// The segment from `a` to `b` bowed `bulge`, worked out (`Arc`).
+pub fn arc_of(a: vec2, b: vec2, bulge: f32) -> Arc {
+    let c = b - a
+    let l = sqrt(max(dot(c, c), 1.0e-20))
+    if abs(bulge) < SHALLOW * l {
+        return Arc { centre: vec2(0.0), length: l, radius: 0.0, open: 0.0 }
+    }
+    let h = abs(bulge)
+    let r = (0.25 * l * l + h * h) / (2.0 * h)
+    let right = vec2(c.y, -c.x) / l
+    let centre = 0.5 * (a + b) + right * (sign(bulge) * (h - r))
+    Arc { centre, length: l, radius: r, open: (r - h) / r }
+}
+
+/// `p` against the segment from `a` to `b` bowed `bulge` (m) to the right of the way from `a` to
+/// `b` (its arc worked out each time: `segment_of` is the same, given it worked out once).
+pub fn segment(p: vec2, a: vec2, b: vec2, bulge: f32) -> Near2 {
+    segment_of(p, a, b, bulge, arc_of(a, b, bulge))
+}
+
+/// `p` against the segment from `a` to `b` bowed `bulge`, worked out as `arc` (`arc_of`).
+pub fn segment_of(p: vec2, a: vec2, b: vec2, bulge: f32, arc: Arc) -> Near2 {
+    let c = b - a
+    let l = arc.length
+    let l2 = l * l
+    let right = vec2(c.y, -c.x) / l
+    let cross = crosses(p, a, b)
+    if arc.radius <= 0.0 {
+        // Straight, or bowed so little that the arc is its parabola: the bow at `u` along it is
+        // `bulge * 4u(1 - u)`.
+        let u = dot(p - a, c) / l2
+        let k = clamp(u, 0.0, 1.0)
+        let e = p - a - c * k
+        let s = dot(e, right)
+        let t = dot(e, c) / l
+        let bow = bulge * 4.0 * k * (1.0 - k)
+        let off = s - bow
+        let cap = u > 0.0 && u < 1.0 && (if bulge > 0.0 { s > 0.0 && s < bow } else {
+            s < 0.0 && s > bow
+        })
+        // A parabola's curvature at its apex, 8 h / L², where it is nearest the middle.
+        return Near2 {
+            d2: t * t + off * off,
+            cap,
+            cross,
+            bend: 8.0 * bulge / l2,
+            off,
+            inner: u > 0.0 && u < 1.0,
+        }
+    }
+    let side = sign(bulge)
+    let r = arc.radius
+    let v = p - arc.centre
+    let lv = max(length(v), 1.0e-20)
+    // On the arc's side of its circle: within the angle the arc spans about its centre.
+    let on_arc = dot(v, right) * side >= lv * arc.open
+    let cap = lv < r && dot(p - 0.5 * (a + b), right) * side > 0.0
+    let e = lv - r
+    let d2 = if on_arc { e * e } else { min(dot(p - a, p - a), dot(p - b, p - b)) }
+    Near2 { d2, cap, cross, bend: side / r, off: side * e, inner: on_arc }
+}
+
+/// What an outline's segments make of `p` together: the signed distance (negative inside) and
+/// the curvature of the segment nearest `p` (positive where the outline bows out).
+pub struct Signed2: Copy {
+    pub d2: f32,
+    pub inside: bool,
+    pub bend: f32,
+    /// The nearest segment's signed offset, and whether the nearest point is inside it.
+    pub off: f32,
+    pub inner: bool,
+}
+
+/// Nothing yet: no segment met.
+pub fn none() -> Signed2 {
+    Signed2 { d2: 1.0e30, inside: false, bend: 0.0, off: 0.0, inner: false }
+}
+
+impl Signed2 {
+    /// With one more segment.
+    pub fn and(self, n: Near2) -> Signed2 {
+        let flip = n.cap != n.cross
+        let nearer = n.d2 < self.d2
+        Signed2 {
+            d2: min(self.d2, n.d2),
+            inside: if flip { !self.inside } else { self.inside },
+            bend: if nearer { n.bend } else { self.bend },
+            off: if nearer { n.off } else { self.off },
+            inner: if nearer { n.inner } else { self.inner },
+        }
+    }
+
+    /// The signed distance: the nearest segment's signed offset where the nearest point is inside
+    /// it, which is smooth through the outline, so its gradient there is the outline's normal (a
+    /// distance's root, `sqrt(d2)`, has none on the outline itself); at a segment's end, the
+    /// distance to the end, signed by which side the point is on.
+    pub fn distance(self) -> f32 {
+        if self.inner {
+            return self.off
+        }
+        let d = sqrt(self.d2)
+        if self.inside { -d } else { d }
+    }
+}
+
+/// A closed outline of `N` points: segment `i` runs from point `i` to point `i + 1` (the last back
+/// to the first), bowed `bulges[i]`.
+pub struct Outline<const N: u32>: Copy + GpuData + Eq + StateHash {
+    pub points: [vec2; N],
+    pub bulges: [f32; N],
+    /// Each segment worked out (`arc_of`), when it is built.
+    pub arcs: [Arc; N],
+}
+
+/// A closed outline (`Outline`), traced with its inside on the left.
+pub fn outline<const N: u32>(points: [vec2; N], bulges: [f32; N]) -> Outline<N> {
+    var arcs = [arc_of(points[0], points[0], 0.0); N]
+    for i in 0..N {
+        let j = if i + 1 == N { 0 } else { i + 1 }
+        arcs[i] = arc_of(points[i], points[j], bulges[i])
+    }
+    Outline { points, bulges, arcs }
+}
+
+impl<const N: u32> Outline<N> {
+    /// Its segments' sum at `p`.
+    pub fn at(self, p: vec2) -> Signed2 {
+        var s = none()
+        for i in 0..N {
+            let j = if i + 1 == N { 0 } else { i + 1 }
+            s = s.and(segment_of(p, self.points[i], self.points[j], self.bulges[i], self.arcs[i]))
+        }
+        s
+    }
+
+    /// The signed distance from `p` to it (negative inside): exact, as the head of the file says.
+    pub fn distance(self, p: vec2) -> f32 {
+        self.at(p).distance()
+    }
+
+    /// The farthest any point of it is from `centre`: its points', and each bow's.
+    pub fn reach(self, centre: vec2) -> f32 {
+        var r = 0.0
+        for i in 0..N {
+            r = max(r, length(self.points[i] - centre) + abs(self.bulges[i]))
+        }
+        r
+    }
+}
+
+/// An open profile of `N` points, closed toward minus x: segment `i` runs from point `i` to point
+/// `i + 1`, bowed `bulges[i]` (the last bulge is unused), and the first and last points are joined
+/// by lines straight across to x = -`far` and down it. A turner's profile, from its foot to its
+/// head with the axis toward minus x, or a moulding's section, from its bottom to its top with the
+/// inside of the board toward minus x, is traced this way: the solid is on the left going up.
+pub struct Profile<const N: u32>: Copy + GpuData + Eq + StateHash {
+    pub points: [vec2; N],
+    pub bulges: [f32; N],
+    pub far: f32,
+    /// Each segment worked out (`arc_of`), when it is built: segment `i` from point `i` to
+    /// `i + 1` (the last unused).
+    pub arcs: [Arc; N],
+}
+
+/// An open profile (`Profile`), its far side `far` m past x = 0.
+pub fn profile<const N: u32>(points: [vec2; N], bulges: [f32; N], far: f32 = 1.0) -> Profile<N> {
+    var arcs = [arc_of(points[0], points[0], 0.0); N]
+    for i in 1..N {
+        arcs[i - 1] = arc_of(points[i - 1], points[i], bulges[i - 1])
+    }
+    Profile { points, bulges, far, arcs }
+}
+
+impl<const N: u32> Profile<N> {
+    /// Its segments' sum at `p`, its closing lines included.
+    pub fn at(self, p: vec2) -> Signed2 {
+        var s = none()
+        for i in 1..N {
+            s = s.and(
+                segment_of(
+                    p,
+                    self.points[i - 1],
+                    self.points[i],
+                    self.bulges[i - 1],
+                    self.arcs[i - 1],
+                ),
+            )
+        }
+        let first = self.points[0]
+        let last = self.points[N - 1]
+        let top = vec2(-self.far, last.y)
+        let bottom = vec2(-self.far, first.y)
+        s = s.and(segment(p, last, top, 0.0))
+        s = s.and(segment(p, top, bottom, 0.0))
+        s.and(segment(p, bottom, first, 0.0))
+    }
+
+    /// The signed distance from `p` to it (negative inside).
+    pub fn distance(self, p: vec2) -> f32 {
+        self.at(p).distance()
+    }
+
+    /// The most x and the least and most y it reaches, its bows included.
+    pub fn extent(self) -> vec3 {
+        var e = vec3(0.0, self.points[0].y, self.points[0].y)
+        for i in 0..N {
+            let q = self.points[i]
+            let bow = abs(self.bulges[i])
+            e = vec3(max(e.x, q.x + bow), min(e.y, q.y - bow), max(e.z, q.y + bow))
+        }
+        e
+    }
+}
+
+/// The nearest point of a bowed segment's spine to `p`: how far along it (0 at `a`, 1 at `b`, by
+/// the chord) and how far off it, signed (positive to the right of the way from `a` to `b`), with
+/// the bow taken as the parabola `bulge * 4u(1 - u)` (a carved blade's spine: the bulges it is
+/// given are a few percent of its length, where the parabola is the arc).
+pub fn along(p: vec2, a: vec2, b: vec2, bulge: f32) -> vec2 {
+    let c = b - a
+    let l2 = max(dot(c, c), 1.0e-20)
+    let l = sqrt(l2)
+    let right = vec2(c.y, -c.x) / l
+    let u = dot(p - a, c) / l2
+    let k = clamp(u, 0.0, 1.0)
+    let e = p - a - c * k
+    let s = dot(e, right) - bulge * 4.0 * k * (1.0 - k)
+    let t = dot(e, c) / l
+    // Past an end, the distance to the end, its sign kept.
+    let off = if t == 0.0 { s } else { sign(s) * sqrt(s * s + t * t) }
+    vec2(u, off)
+}
+
+// ---- the check: each outline against itself drawn another way -------------------------------
+
+/// Point `k` of `n` along a segment bowed as `segment` takes it (a reference for checks): on its arc, or on its parabola
+/// where it bows by less than `SHALLOW` of its length. The brute-force reference walks these.
+pub fn on_segment(a: vec2, b: vec2, bulge: f32, k: u32, n: u32) -> vec2 {
+    let u = f32(k) / f32(n)
+    let c = b - a
+    let l = length(c)
+    let right = vec2(c.y, -c.x) / l
+    if abs(bulge) < SHALLOW * l {
+        return a + c * u + right * (bulge * 4.0 * u * (1.0 - u))
+    }
+    // The arc through `a`, its apex and `b`: about its centre, from `a`'s angle to `b`'s the way
+    // that passes the apex.
+    let h = abs(bulge)
+    let side = sign(bulge)
+    let r = (0.25 * l * l + h * h) / (2.0 * h)
+    let o = 0.5 * (a + b) + right * (side * (h - r))
+    let apex = 0.5 * (a + b) + right * bulge
+    let t0 = atan2(a.y - o.y, a.x - o.x)
+    let tm = atan2(apex.y - o.y, apex.x - o.x)
+    // The sweep from `a` to the apex, the short way, doubled: the arc is symmetric about it.
+    var half = tm - t0
+    if half > 3.14159265 { half -= 6.2831853 }
+    if half < -3.14159265 { half += 6.2831853 }
+    let t = t0 + 2.0 * half * u
+    o + vec2(cos(t), sin(t)) * r
+}
+
+/// The brute-force signed distance of `p` from a closed polyline of `pts` (the nearest of its
+/// edges, and the even-odd rule).
+fn polyline_distance(p: vec2, pts: std::collections::Vec<vec2>) -> f32 {
+    var d2 = 1.0e30
+    var inside = false
+    let n = pts.len()
+    for i in 0..n {
+        let a = pts[i]
+        let b = pts[(i + 1) % n]
+        let e = b - a
+        let k = clamp(dot(p - a, e) / max(dot(e, e), 1.0e-20), 0.0, 1.0)
+        let q = p - a - e * k
+        d2 = min(d2, dot(q, q))
+        if crosses(p, a, b) {
+            inside = !inside
+        }
+    }
+    if inside { -sqrt(d2) } else { sqrt(d2) }
+}
+
+/// A closed outline walked as a fine polyline, `per` points a segment.
+fn walked<const N: u32>(o: Outline<N>, per: u32) -> std::collections::Vec<vec2> {
+    var pts = std::collections::Vec::new()
+    for i in 0..N {
+        let j = if i + 1 == N { 0 } else { i + 1 }
+        for k in 0..per {
+            pts.push(on_segment(o.points[i], o.points[j], o.bulges[i], k: k, n: per))
+        }
+    }
+    pts
+}
+
+/// A test outline: a rounded slab section with a bead, a cove and a shallow bow, both ways.
+fn sample_outline() -> Outline<6> {
+    outline(
+        [
+            vec2(0.0, 0.0),
+            vec2(0.04, 0.0),
+            vec2(0.05, 0.012),
+            vec2(0.045, 0.024),
+            vec2(0.03, 0.03),
+            vec2(0.0, 0.03),
+        ],
+        [0.0, 0.004, -0.003, 0.006, 0.0002, -0.0001],
+    )
+}
+
+@test
+fn an_outline_is_its_fine_polyline() {
+    let o = sample_outline()
+    let pts = walked(o, per: 2000)
+    var worst = 0.0
+    for i in 0..41 {
+        for j in 0..31 {
+            let p = vec2(-0.01 + 0.0018 * f32(i), -0.008 + 0.0015 * f32(j))
+            let fast = o.distance(p)
+            let slow = polyline_distance(p, pts)
+            // Within what a 2000-point walk can tell, and on the same side.
+            // (A parabola's bow is taken by its offset across the chord: within 0.4% of the
+            // distance, as the head of the file says.)
+            worst = max(worst, abs(fast - slow) - 0.004 * abs(slow))
+            assert(sign(fast) == sign(slow) || abs(slow) < 1.0e-5, "an outline's side")
+        }
+    }
+    assert(worst < 2.0e-6, f"an outline's distance off its polyline's by {worst} m")
+}
+
+@test
+fn a_profile_closes_toward_its_axis() {
+    // A bead on a stem: the profile of a turned knob, from its foot to its head.
+    let k = profile(
+        [vec2(0.02, 0.0), vec2(0.02, 0.05), vec2(0.03, 0.08)],
+        [0.01, 0.0, 0.0],
+        far: 0.1,
+    )
+    // On the axis, between foot and head, inside; above the head, outside by the height.
+    assert(k.distance(vec2(0.0, 0.04)) < 0.0)
+    assert(abs(k.distance(vec2(0.0, 0.1)) - 0.02) < 1.0e-6)
+    // The bead bows the stem out by 1 cm at its middle.
+    assert(abs(k.distance(vec2(0.031, 0.025)) - 0.001) < 1.0e-5)
+}
