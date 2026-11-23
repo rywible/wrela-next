@@ -818,6 +818,21 @@ per cell; the exact cells as the visibility buffer's second pass (phase 2). The 
 projection is the eye pass's 7 ms on the Radeon; it has to ask a body's every part (below).
 
 **Measured and not kept.**
+- *Exact coverage in screen space* (the review's step 3, before a visibility buffer): each thing's
+  exact cells binned to 16x16 tiles (count, prefix sum, fill), the tiles that hold any listed, and
+  each of their pixels solved once over the merged bracket of the cells its ray crosses, the hits
+  packed into buffers and copied into the G-buffer by one full-screen pass. Kill line: SCENE 10
+  and 11 no slower than the box pass. Holes: the smoke audit passed on all 12 kinds once the solve
+  had 48 steps (a merged bracket runs farther than a cell's: with 16, the creature had 38 extras a
+  pixel outside). Cost, 1080p on the M4 against the box pass, same session: SCENE 10 **24.2 →
+  49.3-50.7 ms**, SCENE 11 **14.2 → 16.8 ms**. A thing with exact cells became tens of dependent
+  dispatches (a resolve's worst case, a 32-step solve through the citadel's field, let the GPU
+  guard take 128 tiles a dispatch, so 64 of them a thing at 1080p, most empty, each waiting on
+  the last), where the box pass is one draw a thing the GPU overlaps with the rest. Two things a
+  kernel can't do shaped it: write a texel other than its own invocation's (so the hits went to
+  buffers, packed as the G-buffer holds them), and take screen derivatives (so the footprint came
+  from the next pixels' rays met with the hit's plane, `plane_footprint`). Screen-space exact
+  coverage pays only inside a visibility buffer, where one resolve covers every thing at once.
 - *Projecting a crowd's vertices onto only the parts live in the rest-pose brick they were meshed
   in.* SCENE 11's eye pass 1.3 ms less on the M4, and 19 cracks on the crowd: a walking pose brings
   an arm within blend width of the torso, which its rest-pose brick doesn't hold.
