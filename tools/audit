@@ -1,0 +1,207 @@
+#!/usr/bin/env python3
+"""Automated GPU zero-hole audit gate (SCENE 6). Usage:
+
+    tools/audit [--size WxH] [--eyes N] [--kind K] [--eye E] [--set NAME=VALUE]... [--timeout S] [--keep DIR]
+
+Builds `game/scenes` with `SCENE=6` (and optional `AUDIT_EYES=N`), launches it through `tools/gpu`
+until `scene: done`, and fails non-zero if ANY audited kind reports, on the frame of a cut or
+settled:
+  - a crack: a hole 3 px or more inside the field's own outline (solid matter seen through), or
+    an extra 3 px or more outside it (matter where there is none)
+  - more holes and extras within 2 px of the outline than OUTLINE_BUDGET of the pixels the field
+    meets: an outline a pixel or two off is the outline's error (the judges'), held to a budget,
+    not a hole
+  - overflows > 0 (any `OVERFLOW_*` extraction capacity truncation)
+  - eyes held unsettled > 0
+  - fewer kinds completed than the scene says it audits (`audit: kinds N`), or a kind whose
+    field met matter at no pixel (an audit of nothing)
+
+Defaults: `--size 640x360`, `--eyes 24`, `--timeout 300`.
+Use `--size 160x90 --eyes 12` for a quick smoke gate during iteration, and `--kind K` to audit
+the scene's Kth kind alone (its place in `audited`'s list in game/scenes/main.wrela), `--eye E` to
+hold each kind to its Eth eye alone (as the full audit places it), `--set NAME=VALUE` to pass a
+setting of the scene's on to its build (`--set BY_FIELD=true`). `--keep DIR`
+keeps the build and the last frame drawn (`DIR/audit.png`).
+"""
+
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+WRELA = os.path.join(ROOT, "tools", "wrela")
+GPU = os.path.join(ROOT, "tools", "gpu")
+
+AUDIT_COUNTS = re.compile(
+    r"^audit:\s+(?P<what>.+?):\s+(?P<px>\d+)\s+px,\s+the field meets matter at\s+(?P<met>\d+);\s+"
+    r"holes\s+(?P<holes>\d+),\s+extra\s+(?P<extra>\d+),\s+off by more than a pixel\s+(?P<off>\d+)"
+)
+AUDIT_DEPTHS = re.compile(
+    r"^audit:\s+(?P<what>.+?):\s+holes by how far inside the field's outline \(px 1, 2, 3-4, deeper\):\s+"
+    r"(?P<h1>\d+), (?P<h2>\d+), (?P<h3>\d+), (?P<h5>\d+); extras by how far outside it: "
+    r"(?P<e1>\d+), (?P<e2>\d+), (?P<e3>\d+), (?P<e5>\d+)"
+)
+# Holes and extras within 2 px of the field's outline a kind may have, as a share of the pixels
+# its field meets (one in ten thousand).
+OUTLINE_BUDGET = 1.0e-4
+AUDIT_SETTLE = re.compile(
+    r"^audit:\s+(?P<what>.+?):\s+frames to settle after a cut:.*?eyes held unsettled\s+(?P<unsettled>\d+);\s+overflows\s+(?P<overflows>\d+)"
+)
+
+
+def parse_args(argv):
+    opts = {"size": "640x360", "eyes": 24, "timeout": 300, "keep": None, "kind": None, "eye": None, "set": []}
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-h", "--help"):
+            print(__doc__.strip())
+            sys.exit(0)
+        if a in ("--size", "--eyes", "--timeout", "--keep", "--kind", "--eye", "--set") and i + 1 < len(argv):
+            val = argv[i + 1]
+            if a == "--eyes":
+                opts["eyes"] = int(val)
+            elif a == "--set":
+                opts["set"].append(val)
+            elif a == "--eye":
+                opts["eye"] = int(val)
+            elif a == "--kind":
+                opts["kind"] = int(val)
+            elif a == "--timeout":
+                opts["timeout"] = int(val)
+            elif a == "--size":
+                opts["size"] = val
+            else:
+                opts["keep"] = val
+            i += 2
+            continue
+        print(f"audit: unknown argument `{a}`", file=sys.stderr)
+        sys.exit(2)
+    return opts
+
+
+def main():
+    opts = parse_args(sys.argv[1:])
+    tmp = None
+    out_dir = opts["keep"]
+    if out_dir is None:
+        tmp = tempfile.mkdtemp(prefix="wrela-audit-")
+        out_dir = os.path.join(tmp, "scene6")
+    try:
+        build_cmd = [
+            WRELA, "build", os.path.join(ROOT, "game", "scenes"),
+            "-o", out_dir,
+            "--set", "SCENE=6",
+            "--set", f"AUDIT_EYES={opts['eyes']}",
+        ]
+        if opts["kind"] is not None:
+            build_cmd += ["--set", f"AUDIT_KIND={opts['kind']}"]
+        if opts["eye"] is not None:
+            build_cmd += ["--set", f"AUDIT_EYE={opts['eye']}"]
+        for kv in opts["set"]:
+            build_cmd += ["--set", kv]
+        print(f"audit: building SCENE=6 (AUDIT_EYES={opts['eyes']}, size={opts['size']})", file=sys.stderr)
+        subprocess.check_call(build_cmd)
+
+        max_frames = 16 * (opts["eyes"] * 14 + 32)
+        png_path = os.path.join(out_dir, "audit.png")
+        run_cmd = [
+            GPU, "--timeout", str(opts["timeout"]),
+            out_dir,
+            "--size", opts["size"],
+            "--frames", str(max_frames),
+            "--until", "scene: done",
+            "--png", png_path,
+        ]
+        proc = subprocess.run(run_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        print(proc.stdout, end="")
+        if proc.returncode != 0:
+            tail = [l for l in proc.stdout.splitlines() if l.strip()][-12:]
+            print("\n".join(tail), file=sys.stderr)
+            print(f"audit: FAILED (host exited with {proc.returncode})", file=sys.stderr)
+            return proc.returncode
+
+        faults = []
+        settled_seen = 0
+        cut_seen = 0
+        done_seen = False
+        kinds = None
+        met = {}
+        depths_seen = set()
+        pending = {}
+        for raw in proc.stdout.splitlines():
+            line = raw.strip()
+            if line.startswith("wrela: "):
+                line = line[len("wrela: "):].strip()
+            if line == "scene: done":
+                done_seen = True
+            mk = re.match(r"^audit: kinds (\d+)$", line)
+            if mk:
+                kinds = int(mk.group(1))
+            m = AUDIT_COUNTS.match(line)
+            if m:
+                what = m.group("what")
+                holes = int(m.group("holes"))
+                extra = int(m.group("extra"))
+                if "settled" in what:
+                    settled_seen += 1
+                elif "frame of the cut" in what:
+                    cut_seen += 1
+                met[what] = int(m.group("met"))
+                if holes + extra > 0 and what not in depths_seen:
+                    pending[what] = (holes, extra)
+                if int(m.group("met")) == 0:
+                    faults.append(f"{what}: the field met matter at no pixel (an audit of nothing)")
+                continue
+            md = AUDIT_DEPTHS.match(line)
+            if md:
+                what = md.group("what")
+                depths_seen.add(what)
+                pending.pop(what, None)
+                g = {k: int(v) for k, v in md.groupdict().items() if k != "what"}
+                cracks = g["h3"] + g["h5"]
+                ghosts = g["e3"] + g["e5"]
+                near = g["h1"] + g["h2"] + g["e1"] + g["e2"]
+                if cracks > 0 or ghosts > 0:
+                    faults.append(f"{what}: {cracks} holes 3 px or more inside the outline (cracks), {ghosts} extras 3 px or more outside it")
+                allowed = OUTLINE_BUDGET * met.get(what, 0)
+                if near > allowed:
+                    faults.append(f"{what}: {near} holes and extras at the outline, over its budget of {allowed:.0f}")
+                continue
+            ms = AUDIT_SETTLE.match(line)
+            if ms:
+                what = ms.group("what")
+                unsettled = int(ms.group("unsettled"))
+                overflows = int(ms.group("overflows"))
+                if unsettled > 0 or overflows > 0:
+                    faults.append(f"{what}: unsettled={unsettled}, overflows={overflows}")
+
+        for what, (holes, extra) in pending.items():
+            faults.append(f"{what}: holes={holes}, extra={extra}, and no line saying how deep they are")
+        if not done_seen:
+            faults.append("did not reach `scene: done`")
+        if kinds is None:
+            faults.append("the scene did not say how many kinds it audits (`audit: kinds N`)")
+        elif settled_seen < kinds or cut_seen < kinds:
+            faults.append(
+                f"incomplete audit: saw {cut_seen} cut and {settled_seen} settled reports (expected {kinds})"
+            )
+
+        if faults:
+            print("audit: FAILED:", file=sys.stderr)
+            for f in faults:
+                print(f"  - {f}", file=sys.stderr)
+            return 1
+
+        print(f"audit: PASSED ({kinds} kinds, {opts['eyes']} eyes @ {opts['size']}: no cracks, outlines within budget, 0 overflows)", file=sys.stderr)
+        return 0
+    finally:
+        if tmp is not None:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

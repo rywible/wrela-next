@@ -1,0 +1,134 @@
+// Build-time mathematical soundness verification for `Surface`, `Field<Substance>`, and `Edited<M>`.
+//
+// Any under-approximated `bound()`, `lipschitz()`, `pruned()`, `interval_near()`, or
+// `dirty_region()` causes brick culling, tight AABBs, Lipschitz ray marching, or incremental CSG
+// re-extraction to silently drop geometry and open holes. Calling these checks from `@test` suites
+// (run automatically by `tools/check`) catches unsound field contracts at build time with zero
+// runtime overhead.
+
+use matter::edits::Edited
+use matter::substance::Substance
+use std::derive::{Box3, gradient}
+use std::field::{ALL_LIVE, Field, Surface}
+use std::hash::StateHash
+
+/// Verifies every culling and marching contract of `s` (`bound`, `lipschitz`, `interval_near`,
+/// `pruned`, and `distance_live`) across `samples` deterministic Sobol points and `boxes`
+/// multi-scale test boxes. Panics with an actionable diagnostic on any hole-inducing violation.
+pub fn verify_surface_soundness<S: Surface>(s: S, label: str, boxes: u32 = 24, samples: u32 = 128) {
+    let b = s.bound()
+    let bounded = b.radius > 0.0 && b.radius < 1.0e12
+    assert(bounded, f"verify({label}): surface bound radius {b.radius} is not finite positive")
+
+    let r = b.radius
+    let outer = Box3 { lo: b.centre - vec3(1.5 * r), hi: b.centre + vec3(1.5 * r) }
+    let inner = Box3 { lo: b.centre - vec3(r), hi: b.centre + vec3(r) }
+    let lip_scope = max(0.25 * r, 0.25)
+    let lip = s.lipschitz(lip_scope)
+    let check_lip = lip > 0.0 && lip < 1.0e12
+
+    // 1. Bound lower-bound & Lipschitz soundness across Sobol samples.
+    for i in 0..samples {
+        let p = outer.sample(17, i)
+        let d = s.distance(p)
+        let below = b.below(p)
+        assert(
+            below <= d + 2.0e-3,
+            f"verify({label}): bound().below({p})={below} exceeds distance={d} (culling would drop matter)",
+        )
+        if below > 2.0e-3 {
+            assert(
+                d >= -2.0e-3,
+                f"verify({label}): point {p} outside bound (below={below}) is inside surface (d={d})",
+            )
+        }
+        if check_lip && abs(d) < lip_scope {
+            let g = gradient(|q: vec3| s.distance(q), p)
+            let gl = length(g)
+            assert(
+                gl <= lip * 1.05 + 2.0e-3,
+                f"verify({label}): ||grad({p})||={gl} exceeds lipschitz({lip_scope})={lip} (marching would step through surface)",
+            )
+        }
+    }
+
+    // 2. Multi-scale `pruned`, `interval_near`, and `distance_live` soundness.
+    for bi in 0..boxes {
+        let c = inner.sample(31, bi)
+        let tier = bi % 3
+        let half = if tier == 0 {
+            max(0.20 * r, 0.05)
+        } else if tier == 1 {
+            max(0.05 * r, 0.02)
+        } else {
+            max(0.01 * r, 0.005)
+        }
+        let bx = Box3 { lo: c - vec3(half), hi: c + vec3(half) }
+        let pr = s.pruned(bx, |q: vec3| q, 1.0, ALL_LIVE, 0)
+        let iv = s.interval_near(bx)
+        let straddles = pr.range.lo <= 0.0 && pr.range.hi >= 0.0
+        for si in 0..16 {
+            let p = bx.sample(101 + bi, si)
+            let d = s.distance(p)
+            assert(
+                pr.range.lo <= d + 1.0e-3 && d <= pr.range.hi + 1.0e-3,
+                f"verify({label}): pruned range [{pr.range.lo}, {pr.range.hi}] missed d={d} at {p}",
+            )
+            assert(
+                iv.lo <= d + 1.0e-3 && d <= iv.hi + 1.0e-3,
+                f"verify({label}): interval_near [{iv.lo}, {iv.hi}] missed d={d} at {p}",
+            )
+            if straddles {
+                let dl = s.distance_live(p, pr.live)
+                assert(
+                    abs(dl - d) <= 1.0e-3,
+                    f"verify({label}): distance_live={dl} diverged from distance={d} at {p}",
+                )
+            }
+        }
+    }
+}
+
+/// Verifies that `Edited<M>`'s `dirty_region()` encloses every point where `edited.distance(p)`
+/// differs from `base.distance(p)`, ensuring incremental CSG brick re-extraction never leaves stale
+/// bricks (holes or ghost geometry).
+pub fn verify_edits_soundness<M: Field<Substance> + StateHash>(
+    base: M,
+    ed: Edited<M>,
+    label: str,
+    samples: u32 = 512,
+) {
+    verify_surface_soundness(ed, label, boxes: 18, samples: 96)
+    let dirty = match ed.dirty_region() {
+        Some(bx) => bx,
+        None => {
+            // No dirty region reported => edited field must match base everywhere.
+            let b = base.bound()
+            let bx = Box3 { lo: b.centre - vec3(b.radius), hi: b.centre + vec3(b.radius) }
+            for i in 0..samples {
+                let p = bx.sample(59, i)
+                assert(
+                    abs(ed.distance(p) - base.distance(p)) <= 1.0e-4,
+                    f"verify_edits({label}): dirty_region() is None but distance changed at {p}",
+                )
+            }
+            return
+        },
+    }
+    let b = ed.bound()
+    let search = Box3 { lo: b.centre - vec3(b.radius), hi: b.centre + vec3(b.radius) }
+    let pad_dirty = Box3 { lo: dirty.lo - vec3(1.0e-3), hi: dirty.hi + vec3(1.0e-3) }
+    for i in 0..samples {
+        let p = search.sample(73, i)
+        let db = base.distance(p)
+        let de = ed.distance(p)
+        let sign_changed = (db < 0.0) != (de < 0.0)
+        let near_surface = min(abs(db), abs(de)) <= 0.08
+        if sign_changed || (near_surface && abs(de - db) > 1.0e-4) {
+            assert(
+                pad_dirty.contains(p),
+                f"verify_edits({label}): surface/band changed ({db} -> {de}) at {p} outside dirty_region [{dirty.lo}, {dirty.hi}]",
+            )
+        }
+    }
+}

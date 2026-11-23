@@ -22,13 +22,12 @@
 use matter::matter::{Matter, matter}
 use matter::sky::Sky
 use matter::substance::Substance
-use matter::world::World
 use mesh::draw::{MeshSight, MeshWorld, mesh_sight}
 use picture::eye::{Eye, View, view}
 use picture::look::Look
 use picture::screen::show
 use reference::traced::{FAR, HALVINGS, LEAST, LEAST_FAR}
-use std::field::Field
+use std::field::{Field, Union, UnionAll}
 use std::gpu::{Atomics, GlobalId, GpuBuffer, Rgba32Float, Texture, buffer_of, dispatch, label, read}
 use std::collections::Vec
 use std::io::{Pending, print}
@@ -36,8 +35,19 @@ use std::io::{Pending, print}
 /// Counts kept: pixels, pixels the field met, holes, extras, offs, rays out of steps; then whether
 /// an off pixel has been named (claimed once, so the three words after it are of one pixel), and
 /// that pixel's x and y, and its picture's eye (`Audit::held`'s `eye`).
-/// After them, each of the first `EYES_SAID` eyes' holes.
-const COUNTS: u32 = 10 + EYES_SAID
+/// After them, each of the first `EYES_SAID` eyes' holes, then the first hole's `(claimed, x, y,
+/// eye, the field's distance there)` and the first extra's `(claimed, x, y, eye)`.
+const FIRST_HOLE: u32 = 10 + EYES_SAID
+const FIRST_EXTRA: u32 = FIRST_HOLE + 5
+/// Then the holes by how far inside the field's own outline they lie (`DEPTHS`: a pixel, two,
+/// three or four, deeper: a crack), and the extras by how far outside it.
+const HOLE_DEPTHS: u32 = FIRST_EXTRA + 4
+const EXTRA_DEPTHS: u32 = HOLE_DEPTHS + 4
+const COUNTS: u32 = EXTRA_DEPTHS + 4
+
+/// The farthest, in pixels (a square ring), the audit looks from a hole for a pixel the field
+/// misses, or from an extra for one it meets: past this, a hole is a crack.
+const DEPTH_MOST: u32 = 4
 
 /// The eyes whose holes the audit says one by one (eyes past these are in the totals alone).
 const EYES_SAID: u32 = 64
@@ -92,7 +102,24 @@ fn ray_at(v: View, w: u32, i: u32) -> vec3 {
     v.ray(vec2(f32(px % w) + 0.5, f32(px / w) + 0.5) + o)
 }
 
-/// Rays `first` on (`ray_at`) marched through the field `m`: into `hits`.
+/// Of two first hits along one ray (`first_hit`'s), the union's: the nearer where either met
+/// matter, else out of steps where either march ran out, else none.
+fn nearer(a: f32, b: f32) -> f32 {
+    if a > 0.0 && b > 0.0 {
+        min(a, b)
+    } else if a > 0.0 {
+        a
+    } else if b > 0.0 {
+        b
+    } else if a < -1.5 || b < -1.5 {
+        -2.0
+    } else {
+        -1.0
+    }
+}
+
+/// Rays `first` on (`ray_at`) marched through the field `m`: into `hits`, or (`keep`) into
+/// `hits` joined with what it holds (`nearer`: `m` one part of a union).
 @compute(64)
 fn marched<M: Field<Substance>>(
     m: Matter<M>,
@@ -100,6 +127,7 @@ fn marched<M: Field<Substance>>(
     w: u32,
     n: u32,
     first: u32,
+    keep: bool,
     hits: mut Atomics<u32>,
     id: GlobalId,
 ) {
@@ -107,7 +135,128 @@ fn marched<M: Field<Substance>>(
     if i >= n {
         return
     }
-    hits.store(i: i, value: bitcast_u32(first_hit(m, v.at, ray_at(v, w, i))))
+    let t = first_hit(m, v.at, ray_at(v, w, i))
+    let joined = if keep { nearer(bitcast_f32(hits.load(i: i)), t) } else { t }
+    hits.store(i: i, value: bitcast_u32(joined))
+}
+
+/// What the audit holds a picture to: a thing's field, marched whole, or a union marched a part at
+/// a time (a union's first hit is its parts' nearest, so no dispatch asks every part at every step:
+/// a crowd's union of bodies, marched whole, is more than a dispatch may hold the GPU for).
+pub trait Marched: Copy {
+    /// The thing as one field, on the CPU: where the audit's eyes are placed round it.
+    type Field: Field<Substance>
+    fn field(self) -> Self::Field
+
+    /// The `n` rays of a picture `w` wide through `v` (`ray_at`) marched into `hits`: joined with
+    /// what it holds (`keep`), or replacing it.
+    fn march(self, v: View, w: u32, n: u32, keep: bool, hits: mut GpuBuffer<u32>)
+}
+
+/// A field marched whole (`whole`).
+pub struct Whole<M>: Copy {
+    field: M,
+}
+
+/// `field`, marched whole.
+pub fn whole<M: Field<Substance>>(field: M) -> Whole<M> {
+    Whole { field }
+}
+
+impl<M: Field<Substance>> Marched for Whole<M> {
+    type Field = M
+
+    fn field(self) -> M {
+        self.field
+    }
+
+    fn march(self, v: View, w: u32, n: u32, keep: bool, hits: mut GpuBuffer<u32>) {
+        let m = matter(self.field)
+        var first: u32 = 0
+        while first < n {
+            dispatch(
+                marched.bind(m: m, v: v, w: w, n: n, first: first, keep: keep, hits: mut hits),
+                over: min(BAND, n - first),
+            )
+            first += BAND
+        }
+    }
+}
+
+/// The union of a fixed array of fields, marched a part at a time (`each`).
+pub struct Each<M, const N: u32>: Copy {
+    parts: [M; N],
+}
+
+/// `parts`' union, marched a part at a time.
+pub fn each<M: Field<Substance>, const N: u32>(parts: [M; N]) -> Each<M, N> {
+    Each { parts }
+}
+
+impl<M: Field<Substance>, const N: u32> Marched for Each<M, N> {
+    type Field = UnionAll<M, N>
+
+    fn field(self) -> UnionAll<M, N> {
+        self.parts.union()
+    }
+
+    fn march(self, v: View, w: u32, n: u32, keep: bool, hits: mut GpuBuffer<u32>) {
+        for i in 0..N {
+            whole(self.parts[i]).march(v, w, n, keep: keep || i > 0, hits: mut hits)
+        }
+    }
+}
+
+/// The union of two marched things, each marched as itself (`both`).
+pub struct Both<A, B>: Copy {
+    a: A,
+    b: B,
+}
+
+/// `a` and `b`'s union, each marched as itself.
+pub fn both<A: Marched, B: Marched>(a: A, b: B) -> Both<A, B> {
+    Both { a, b }
+}
+
+impl<A: Marched, B: Marched> Marched for Both<A, B> {
+    type Field = Union<A::Field, B::Field>
+
+    fn field(self) -> Union<A::Field, B::Field> {
+        Union { a: self.a.field(), b: self.b.field() }
+    }
+
+    fn march(self, v: View, w: u32, n: u32, keep: bool, hits: mut GpuBuffer<u32>) {
+        self.a.march(v, w, n, keep: keep, hits: mut hits)
+        self.b.march(v, w, n, keep: true, hits: mut hits)
+    }
+}
+
+/// How many pixels (square rings) from pixel `i` of a picture `w` × `h` the nearest pixel is whose
+/// middle ray (`hits`) the field meets (`met`) or misses (`!met`): 1 to `DEPTH_MOST`, or
+/// `DEPTH_MOST + 1` where none is that near.
+fn depth_to(hits: [u32], w: u32, h: u32, i: u32, met: bool) -> u32 {
+    let x = i32(i % w)
+    let y = i32(i / w)
+    var best = DEPTH_MOST + 1
+    for dy in -4..5 {
+        for dx in -4..5 {
+            let r = u32(max(abs(dx), abs(dy)))
+            let px = x + dx
+            let py = y + dy
+            if r > 0 && px >= 0 && py >= 0 && px < i32(w) && py < i32(h) {
+                let t = bitcast_f32(hits[5 * (u32(py) * w + u32(px))])
+                if (met && t > 0.0) || (!met && t == -1.0) {
+                    best = min(best, r)
+                }
+            }
+        }
+    }
+    best
+}
+
+/// The slot of depth `d` (`depth_to`) among four: 1, 2, 3 or 4, deeper.
+fn depth_slot(d: u32) -> u32 {
+    if d <= 1 { 0 } else if d == 2 { 1 } else if d <= DEPTH_MOST { 2 } else { 3 }
 }
 
 /// Pixels `first` on of `place` (the engine's: facing and distance, 0 where nothing) held to the
@@ -151,8 +300,27 @@ fn audited(
             if eye < EYES_SAID {
                 let _ = counts.add(i: 10 + eye, value: 1)
             }
+            let _ = counts.add(
+                i: HOLE_DEPTHS + depth_slot(depth_to(hits, w, place.height(), i, met: false)),
+                value: 1,
+            )
+            if counts.exchange(i: FIRST_HOLE, value: 1) == 0 {
+                counts.store(i: FIRST_HOLE + 1, value: i % w)
+                counts.store(i: FIRST_HOLE + 2, value: i / w)
+                counts.store(i: FIRST_HOLE + 3, value: eye)
+                counts.store(i: FIRST_HOLE + 4, value: bitcast_u32(tf))
+            }
         } else if none && met {
             let _ = counts.add(i: 3, value: 1)
+            let _ = counts.add(
+                i: EXTRA_DEPTHS + depth_slot(depth_to(hits, w, place.height(), i, met: true)),
+                value: 1,
+            )
+            if counts.exchange(i: FIRST_EXTRA, value: 1) == 0 {
+                counts.store(i: FIRST_EXTRA + 1, value: i % w)
+                counts.store(i: FIRST_EXTRA + 2, value: i / w)
+                counts.store(i: FIRST_EXTRA + 3, value: eye)
+            }
         } else if tf > 0.0 && met {
             let d = ray_at(v, w, 5 * i)
             if abs(dot(e.xyz, d)) > 0.2 && abs(e.w - tf) > v.pixel() * tf {
@@ -182,6 +350,38 @@ fn onto<M: Field<Substance>>(m: Matter<M>, o: vec3, d: vec3, most: f32) -> f32 {
     t
 }
 
+/// A point on the surface of `field` (`m` its matter) seen from `o` along `d` (unit): where a march
+/// from `o` comes onto it (`onto`, within `most` m), or, where the march passes it by (a sparse
+/// thing, a crowd, whose bound's middle is air), the point it passed nearest, carried onto the
+/// surface down the field's gradient: so every eye looks at matter, and no audited picture is of
+/// nothing.
+fn on_it<M: Field<Substance>>(field: M, m: Matter<M>, o: vec3, d: vec3, most: f32) -> vec3 {
+    let t = onto(m, o, d, most)
+    if t < most {
+        return o + d * t
+    }
+    var nearest = o
+    var least = 1.0e30
+    for k in 0..256 {
+        let p = o + d * (most * (f32(k) + 0.5) / 256.0)
+        let g = field.distance(p)
+        if g < least {
+            least = g
+            nearest = p
+        }
+    }
+    var p = nearest
+    for _ in 0..64 {
+        let (g, n) = field.sample(p)
+        let len = length(n)
+        if abs(g) < 0.00005 || len < 1.0e-6 {
+            break
+        }
+        p = p - n * (g / (len * len))
+    }
+    p
+}
+
 /// The `k`th eye of a fixed seed round the thing `field` within the bound `b` (centre, radius);
 /// the first, straight on at its middle, close, through a long lens; the rest:
 /// a point on its surface found from outside along a way to its middle, the eye stepped back from
@@ -193,8 +393,10 @@ pub fn eye_round<M: Field<Substance>>(field: M, b: vec4, k: u32) -> Eye {
         // The view the judged set once missed: straight on at its bound's middle, from the side,
         // close (a tenth of its bound's radius off its surface), through a long lens (0.2 rad).
         let o0 = b.xyz - vec3(0.0, 0.0, 1.5 * b.w)
-        let at0 = o0 + vec3(0.0, 0.0, onto(m, o0, vec3(0.0, 0.0, 1.0), 3.0 * b.w) - 0.1 * b.w)
-        return Eye { at: at0, toward: at0 + vec3(0.0, 0.0, 1.0), wide: 0.2 }
+        let s0 = on_it(field, m, o0, vec3(0.0, 0.0, 1.0), 3.0 * b.w)
+        let d0 = normalize(s0 - o0)
+        let at0 = s0 - d0 * (0.1 * b.w)
+        return Eye { at: at0, toward: s0, wide: 0.2 }
     }
     let f = f32(k / 2) + 0.5
     let u = normalize(
@@ -210,7 +412,8 @@ pub fn eye_round<M: Field<Substance>>(field: M, b: vec4, k: u32) -> Eye {
                 (0.3 * b.w) -
             o,
     )
-    let s = o + d * onto(m, o, d, 3.0 * b.w)
+    let s = on_it(field, m, o, d, 3.0 * b.w)
+    let d = normalize(s - o)
     let back = b.w * exp2(log2(0.005) * (1.0 - fract(f * 0.287148)))
     let at = s - d * back
     var toward = s
@@ -239,32 +442,24 @@ pub fn audit() -> Audit {
 }
 
 impl Audit {
-    /// The engine's picture `place` (`width` × `height`), drawn through `eye`, held to `field`.
-    pub fn held<M: Field<Substance>>(
+    /// The engine's picture `place` (`width` × `height`), drawn through `eye`, held to `thing`.
+    pub fn held<T: Marched>(
         mut self,
-        field: M,
+        thing: T,
         eye: Eye,
         place: Texture<Rgba32Float>,
         width: u32,
         height: u32,
         k: u32,
     ) {
-        let m = matter(field)
         let v = view(eye, width, height)
         label("audit")
         let n = 5 * width * height
         if self.hits.len() != n {
             self.hits = buffer_of(Vec::filled(n, 0))
         }
+        thing.march(v, width, n, keep: false, hits: mut self.hits)
         var first: u32 = 0
-        while first < n {
-            dispatch(
-                marched.bind(m: m, v: v, w: width, n: n, first: first, hits: mut self.hits),
-                over: min(BAND, n - first),
-            )
-            first += BAND
-        }
-        first = 0
         while first < width * height {
             dispatch(
                 audited.bind(
@@ -298,6 +493,21 @@ impl Audit {
                     }
                     if each.len() > 0 {
                         print(f"audit: {what}: holes by eye (eye:holes):{each}")
+                    }
+                    if c[2] + c[3] > 0 {
+                        print(
+                            f"audit: {what}: holes by how far inside the field's outline (px 1, 2, 3-4, deeper): {c[HOLE_DEPTHS]}, {c[HOLE_DEPTHS + 1]}, {c[HOLE_DEPTHS + 2]}, {c[HOLE_DEPTHS + 3]}; extras by how far outside it: {c[EXTRA_DEPTHS]}, {c[EXTRA_DEPTHS + 1]}, {c[EXTRA_DEPTHS + 2]}, {c[EXTRA_DEPTHS + 3]}",
+                        )
+                    }
+                    if c[FIRST_HOLE] != 0 {
+                        print(
+                            f"audit: {what}: first hole: eye {c[FIRST_HOLE + 3]}, pixel ({c[FIRST_HOLE + 1]}, {c[FIRST_HOLE + 2]}), the field met {bitcast_f32(c[FIRST_HOLE + 4])} m out",
+                        )
+                    }
+                    if c[FIRST_EXTRA] != 0 {
+                        print(
+                            f"audit: {what}: first extra: eye {c[FIRST_EXTRA + 3]}, pixel ({c[FIRST_EXTRA + 1]}, {c[FIRST_EXTRA + 2]})",
+                        )
                     }
                     self.said = None
                     self.counts = buffer_of(Vec::filled(COUNTS, 0))
@@ -336,11 +546,23 @@ pub struct Auditing {
     thing: u32,
     eye_k: u32,
     /// Frames the eye being audited has been drawn for, and over this thing's eyes: the most an
-    /// eye took to settle, the frames summed, and the eyes held unsettled (at `SETTLE_MOST`).
+    /// eye took to settle, the frames summed, the eyes held unsettled (at `SETTLE_MOST`), and any
+    /// eyes whose settled mesh still reported a non-zero `OVERFLOW_*` bitflag.
     drawn: u32,
     most: u32,
     summed: u32,
     unsettled: u32,
+    overflows: u32,
+    /// The `OVERFLOW_*` bits those eyes' meshes raised, together.
+    overflow_bits: u32,
+    /// The one eye of each thing audited (`only_eye`), or every eye (`eyes` or more).
+    only: u32,
+    /// Eyes in pairs (`pair_eyes`): eye `2j + 1` is eye `2j`'s place again, so what changed
+    /// between them (an edit, a pose) is met by the mesh as it was, not by a mesh begun afresh.
+    paired: bool,
+    /// A stroll (`stroll`): eye `k` is eye 1's place moved `k` times this far, so each eye is the
+    /// mesh of the eye before it, moved a little.
+    stroll_step: vec3,
 }
 
 /// An audit run, at its first thing.
@@ -355,6 +577,11 @@ pub fn auditing() -> Auditing {
         most: 0,
         summed: 0,
         unsettled: 0,
+        overflows: 0,
+        overflow_bits: 0,
+        only: 4294967295,
+        paired: false,
+        stroll_step: vec3(0.0),
     }
 }
 
@@ -364,20 +591,36 @@ impl Auditing {
         self.thing
     }
 
+    /// Audits only eye `k` of each thing (its picture is the last drawn): to look at one eye's
+    /// holes (`tools/audit --eye`).
+    pub fn only_eye(mut self, k: u32) {
+        self.only = k
+    }
+
+    /// Eyes in pairs: each odd eye stands where the even eye before it stood (`paired`).
+    pub fn pair_eyes(mut self) {
+        self.paired = true
+    }
+
+    /// Eyes on a stroll: eye `k` is eye 1 moved by `k · step` (`stroll_step`).
+    pub fn stroll(mut self, step: vec3) {
+        self.stroll_step = step
+    }
+
     /// The eye of the thing being audited (a moving thing is held still while an eye settles:
     /// its time is best taken from this, not from the frame).
     pub fn eye(self) -> u32 {
         self.eye_k
     }
 
-    /// A frame of the audit of the thing `field` (named `what`, drawn as `world`, within the bound
-    /// `b`: centre, radius): its next of `eyes` eyes drawn by `mesh` and held to it; or, its eyes
-    /// all in, its counts said once they are back, and the next thing begun (`mesh` begun again).
-    pub fn frame<W: World + MeshWorld, M: Field<Substance>, S: Sky, L: Look>(
+    /// A frame of the audit of `thing` (named `what`, drawn as `world`, within the bound `b`:
+    /// centre, radius): its next of `eyes` eyes drawn by `mesh` and held to it; or, its eyes all
+    /// in, its counts said once they are back, and the next thing begun (`mesh` begun again).
+    pub fn frame<W: MeshWorld, T: Marched, S: Sky, L: Look>(
         mut self,
         mesh: mut MeshSight,
         world: W,
-        field: M,
+        thing: T,
         b: vec4,
         what: str,
         eyes: u32,
@@ -386,7 +629,10 @@ impl Auditing {
         width: u32,
         height: u32,
     ) {
-        if self.eye_k >= eyes {
+        if self.only < eyes && self.eye_k < self.only {
+            self.eye_k = self.only
+        }
+        if self.eye_k >= eyes || (self.only < eyes && self.eye_k > self.only) {
             if !self.cut_said {
                 self.cut_said = self.cut.say(f"{what}, the frame of the cut to each of {eyes} eyes")
                 return
@@ -394,23 +640,36 @@ impl Auditing {
             if self.audit.say(f"{what}, {eyes} eyes, settled") {
                 self.cut_said = false
                 print(
-                    f"audit: {what}: frames to settle after a cut: most {self.most}, mean {f32(self.summed) / f32(max(eyes, 1))}; eyes held unsettled {self.unsettled}",
+                    f"audit: {what}: frames to settle after a cut: most {self.most}, mean {f32(self.summed) / f32(max(eyes, 1))}; eyes held unsettled {self.unsettled}; overflows {self.overflows} (bits {self.overflow_bits})",
                 )
                 self.thing += 1
                 self.eye_k = 0
                 self.most = 0
                 self.summed = 0
                 self.unsettled = 0
+                self.overflows = 0
+                self.overflow_bits = 0
+                self.paired = false
+                self.stroll_step = vec3(0.0)
                 mesh = mesh_sight(gi: false)
             }
             return
         }
-        let eye = out_of(field, eye_round(field, b, self.eye_k))
+        let field = thing.field()
+        let seed = if self.paired { self.eye_k - (self.eye_k % 2) } else { self.eye_k }
+        let strolling = dot(self.stroll_step, self.stroll_step) > 0.0
+        let placed = eye_round(field, b, if strolling { 1 } else { seed })
+        let moved = self.stroll_step * f32(self.eye_k)
+        let eye = if strolling {
+            Eye { at: placed.at + moved, toward: placed.toward + moved, wide: placed.wide }
+        } else {
+            out_of(field, placed)
+        }
         mesh.drawn_only(world, sky, look, eye, width, height)
         self.drawn += 1
         show(mesh.drawn.colour)
         if self.drawn == 1 {
-            self.cut.held(field, eye, mesh.drawn.place, width, height, self.eye_k)
+            self.cut.held(thing, eye, mesh.drawn.place, width, height, self.eye_k)
         }
         let settled = mesh.settled()
         if !settled && self.drawn < SETTLE_MOST {
@@ -419,10 +678,14 @@ impl Auditing {
         if !settled {
             self.unsettled += 1
         }
+        if mesh.overflowed() != 0 {
+            self.overflows += 1
+            self.overflow_bits |= mesh.overflowed()
+        }
         self.most = max(self.most, self.drawn)
         self.summed += self.drawn
         self.drawn = 0
-        self.audit.held(field, eye, mesh.drawn.place, width, height, self.eye_k)
+        self.audit.held(thing, eye, mesh.drawn.place, width, height, self.eye_k)
         self.eye_k += 1
     }
 }

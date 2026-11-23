@@ -12,11 +12,12 @@ use matter::medium::{Medium, NoMedium}
 use matter::sky::Sky
 use matter::substance::{ONE_OVER_PI, Substance, env_brdf_approx, fresnel_schlick_rough}
 use matter::swarm::{NoSwarm, Swarm}
-use matter::world::{And, One, Pool}
+use matter::world::{And, One, Pool, one}
 use mesh::cull::{HiZCuller, hiz_culler}
 use mesh::extract::{
-    CELL_PX, ExtractScratch, MeshBatch, MeshVertex, eval_dqs, extract_scratch, mesh_batch,
-    probe_visible_near, size_floor, steep, unpack_oct_normal, unpack_smooth, unpack_thing,
+    CELL_PX, HOLE_PX, NO_THING, ExactCell, ExtractScratch, MeshBatch, MeshVertex, eval_dqs,
+    extract_scratch, mesh_batch, probe_visible_near, project_posed, size_floor, steep,
+    unpack_oct_normal, unpack_smooth, unpack_thing,
 }
 use mesh::height::{CLIP_RINGS, ClipmapMesh, MeshVary, clipmap_mesh, height_vs}
 use mesh::light::{
@@ -24,6 +25,11 @@ use mesh::light::{
     cone_indirect, contact_shadow, decode_substance, encode_mat_signed, eval_emitters_tiled,
     radiance_cache, shadow_view, sky_background, sky_cache, sky_irradiance, sky_specular, spec_cone,
     sun_shadow_hybrid, sun_vis_point, trace_ssr,
+}
+use mesh::proof::{
+    CellRay, discard_proven, prove_box_unseen, prove_opaque_only, prove_point_behind_opaque,
+    prove_transmissive_only, ray_box_bracket, seen_part, solve_cell_ray, ray_box_interval,
+    solve_cell_ray_lipschitz,
 }
 use mesh::sdf::{
     SdfClipmap, SdfGrid, multi_bounce_ao, sdf_bent_ao, sdf_clipmap, sdf_curvature, sdf_grid,
@@ -38,15 +44,15 @@ use picture::picture::{Picture, picture}
 use picture::screen::{cover, luma, show}
 use std::collections::Vec
 use std::derive::value_and_gradient
-use std::field::{Bound, DualQuat, Field, Rigid}
+use std::field::{Bound, DualQuat, Field, Live, Rigid}
 use std::gpu::{
     Address, ClipPosition, Compare, ComparisonSampler, Cull, Depth, DepthBias, DepthOnlyPass,
-    DepthPass, DepthPass2, DepthPass4, DepthTexture, Filter, FragCoord, GpuBuffer, GpuSpan,
-    InstanceIndex, R16Float, Rg16Float, Rgba8, Rgba16Float, Sampler, Targets2, Targets4, Texture,
-    Texture3d, VertexIndex, begin_depth_pass, begin_pass, begin_pass2, begin_pass2_with_depth,
-    begin_pass4, begin_pass4_with_depth, begin_pass_with_depth, buffer, buffer_of,
-    comparison_sampler, copy_texture, depth_texture, discard, draw, draw_multi, label, sampler,
-    texture,
+    DepthPass, DepthPass2, DepthPass4, DepthTexture, Filter, Flat, FragCoord, GlobalId, GpuBuffer,
+    GpuSpan, InstanceIndex, R16Float, R32Float, Rg16Float, Rgba8, Rgba16Float, Sampler, Targets2,
+    Targets4, Texels, Texture, Texture3d, VertexIndex, WithDepthBehind, begin_depth_pass,
+    begin_pass, begin_pass2, begin_pass2_with_depth, begin_pass4, begin_pass4_with_depth,
+    begin_pass_with_depth, buffer, buffer_of, comparison_sampler, copy_texture, depth_texture,
+    dispatch, draw, draw_multi, label, sampler, texture, writable_texture,
 }
 use std::hash::{Hasher, StateHash}
 
@@ -193,10 +199,17 @@ fn deformed_mesh_vs(
     }
 }
 
-/// Eye/refract vertex shader for `Skinned` meshlets: evaluates Dual Quaternion Skinning for both
-/// current (`bones`) and previous (`prev_bones`) frames for exact analytical TSR motion vectors.
+/// Eye/refract vertex shader for `Skinned` meshlets drawn from a `Pool` (instanced, or one mesh
+/// of many things): 4-bone Dual Quaternion Skinning of the rest-pose vertex, then the same guarded
+/// Newton projection onto the thing's own posed field (`project_posed` on
+/// `fields[thing].posed_local_distance`) that `deform_skinned_verts` gives a `One`: DQS alone
+/// pinches and lags at joints, so a crowd drawn by it alone is not its fields (the SCENE 6 audit's
+/// crowd: 465 holes and 14,036 pixels off at one eye, 320x180). The previous frame's point is the
+/// projected one moved by the DQS delta between frames (for TSR motion vectors).
 @vertex
-fn skin_mesh_vs(
+fn skin_mesh_vs<M: Field<Substance>>(
+    fields: [M],
+    n_fields: u32,
     verts: [MeshVertex],
     skin: [u32],
     xforms: [Rigid],
@@ -219,11 +232,19 @@ fn skin_mesh_vs(
     let xf = xforms[ii.index]
     let pxf = prev_xforms[ii.index]
     let lp = vec3(vert.px, vert.py, vert.pz)
-    let wp = xf.apply_point(dq.apply_point(lp))
-    let prev_wp = pxf.apply_point(pdq.apply_point(lp))
-    let n = xf.apply_normal(dq.apply_normal(unpack_oct_normal(vert.packed)))
-    let smooth = if unpack_smooth(vert.packed) { 1.0 } else { 0.0 }
     let tid = if is_instanced != 0 { inst_ids[ii.index] } else { unpack_thing(vert.packed) }
+    let f = fields[min(tid, n_fields - 1)]
+    let skinned = dq.apply_point(lp)
+    let skinned_n = dq.apply_normal(unpack_oct_normal(vert.packed))
+    // Every vertex, of every part of its body: within a smooth union's blend width of another
+    // part the posed field isn't one part's rigid motion (projecting only vertices whose weights
+    // blend bones left the SCENE 6 crowd 3 cracks, 3 to 4 pixels deep), and a pose brings parts
+    // together that a vertex's rest-pose brick doesn't hold (asking only those parts: 19 cracks).
+    let (posed, posed_n) = project_posed(|q: vec3| f.posed_local_distance(q), skinned, skinned_n)
+    let wp = xf.apply_point(posed)
+    let prev_wp = pxf.apply_point(posed + (pdq.apply_point(lp) - skinned))
+    let n = xf.apply_normal(posed_n)
+    let smooth = if unpack_smooth(vert.packed) { 1.0 } else { 0.0 }
     SkinVary {
         clip: clip_of(v, wp),
         wp,
@@ -457,8 +478,9 @@ fn field_cut_gbuf_one_fs<M: Field<Substance>>(
     prev_v: View,
 ) -> Targets4<vec4, vec4, vec4, vec2> {
     let sub0 = field.channels(vary.wp)
-    if sub0.transmission > 0.02 {
-        discard()
+    match prove_transmissive_only(sub0) {
+        Some(p) => discard_proven(p),
+        None => {},
     }
     shade_gbuf_core(vary.wp, vary.prev_wp, vary.local_p, vary.normal, vary.meta.x, sub0, v, prev_v)
 }
@@ -475,8 +497,9 @@ fn field_cut_gbuf_many_fs<M: Field<Substance>>(
 ) -> Targets4<vec4, vec4, vec4, vec2> {
     let tid = min(u32(max(vary.meta.y, 0.0)), n_fields - 1)
     let sub0 = fields[tid].channels(vary.wp)
-    if sub0.transmission > 0.02 {
-        discard()
+    match prove_transmissive_only(sub0) {
+        Some(p) => discard_proven(p),
+        None => {},
     }
     shade_gbuf_core(vary.wp, vary.prev_wp, vary.local_p, vary.normal, vary.meta.x, sub0, v, prev_v)
 }
@@ -491,8 +514,9 @@ fn field_skin_cut_gbuf_one_fs<M: Field<Substance>>(
     prev_v: View,
 ) -> Targets4<vec4, vec4, vec4, vec2> {
     let sub0 = field.rest_channels(vary.rest_p)
-    if sub0.transmission > 0.02 {
-        discard()
+    match prove_transmissive_only(sub0) {
+        Some(p) => discard_proven(p),
+        None => {},
     }
     shade_gbuf_core(vary.wp, vary.prev_wp, vary.rest_p, vary.normal, vary.meta.x, sub0, v, prev_v)
 }
@@ -509,10 +533,158 @@ fn field_skin_cut_gbuf_many_fs<M: Field<Substance>>(
 ) -> Targets4<vec4, vec4, vec4, vec2> {
     let tid = min(u32(max(vary.meta.y, 0.0)), n_fields - 1)
     let sub0 = fields[tid].rest_channels(vary.rest_p)
-    if sub0.transmission > 0.02 {
-        discard()
+    match prove_transmissive_only(sub0) {
+        Some(p) => discard_proven(p),
+        None => {},
     }
     shade_gbuf_core(vary.wp, vary.prev_wp, vary.rest_p, vary.normal, vary.meta.x, sub0, v, prev_v)
+}
+
+/// Lean interpolator for Tier-2 `ExactCell` AABB shells (`exact_box_vs` -> `exact_box_one_fs`):
+/// passes the cell box `[lo, lo + h]` and brick live-part mask as `Flat` attributes plus the
+/// interpolated front-face world point `wp`.
+struct ExactVary: Copy {
+    clip: ClipPosition,
+    wp: vec3,
+    cell_lo_h: Flat<vec4>,
+    cell_meta: Flat<vec4u>,
+}
+
+/// A box's 12 triangles, outward and counter-clockwise, as corners `k = x | (y << 1) | (z << 2)`,
+/// a face (2 triangles) at a time: -Z, +Z, -X, +X, -Y, +Y.
+const BOX_CORNERS: [u32; 36] = [
+    0, 2, 3, 0, 3, 1, 4, 5, 7, 4, 7, 6, 0, 4, 6, 0, 6, 2, 1, 3, 7, 1, 7, 5, 0, 1, 5, 0, 5, 4, 2, 6,
+    7, 2, 7, 3,
+]
+
+/// Vertex shader for exact cells (`ExactCell`), 36 vertices an instance, drawn with no culling:
+/// a face turned away from the eye is folded to nothing, so each pixel the box covers is drawn
+/// once, from its near face. With the eye inside the box (or within the near plane of it) every
+/// face is kept and set at the near plane: every ray leaves the box through a face in front of the
+/// eye, and its depth, the nearest there is, keeps `WithDepthBehind`'s promise. (Drawn with back
+/// faces culled, a box the eye stood in was drawn nowhere.)
+@vertex
+fn exact_box_vs(
+    cells: [ExactCell],
+    xforms: [Rigid],
+    v: View,
+    vi: VertexIndex,
+    ii: InstanceIndex,
+) -> ExactVary {
+    let c = cells[ii.index]
+    let k = BOX_CORNERS[vi.index]
+    let face = vi.index / 6
+    let lp = c.lo + vec3(f32(k & 1), f32((k >> 1) & 1), f32((k >> 2) & 1)) * c.h
+    let xf = xforms[0]
+    let wp = xf.apply_point(lp)
+    let axis = face / 2
+    let sign = if (face & 1) == 1 { 1.0 } else { -1.0 }
+    let n_local = vec3(if axis == 2 { sign } else { 0.0 }, if axis == 1 { sign } else {
+        0.0
+    }, if axis == 0 {
+        sign
+    } else { 0.0 })
+    let centre = c.lo + vec3(0.5 * c.h)
+    let eye_in = xf.apply_point(centre) - v.at
+    let reach = 0.5 * c.h * xf.scale_factor() + 2.0 * NEAR
+    let inside = abs(dot(eye_in, xf.apply_normal(vec3(1.0, 0.0, 0.0)))) < reach &&
+        abs(dot(eye_in, xf.apply_normal(vec3(0.0, 1.0, 0.0)))) < reach &&
+        abs(dot(eye_in, xf.apply_normal(vec3(0.0, 0.0, 1.0)))) < reach
+    let face_c = xf.apply_point(centre + n_local * (0.5 * c.h))
+    let faces_eye = dot(xf.apply_normal(n_local), v.at - face_c) > 0.0
+    var clip = clip_of(v, wp)
+    if inside {
+        clip.position.z = clip.position.w
+    } else if !faces_eye {
+        clip.position = vec4(0.0, 0.0, 0.0, 1.0)
+    }
+    ExactVary {
+        clip,
+        wp,
+        cell_lo_h: Flat { value: vec4(c.lo, c.h) },
+        cell_meta: Flat { value: c.live.words },
+    }
+}
+
+/// Reversed-Z NDC depth (`NEAR / z`, matching `clip_of`) of world point `p` seen by `v`.
+fn depth_of(v: View, p: vec3) -> f32 {
+    NEAR / max(dot(p - v.at, v.forward), NEAR)
+}
+
+/// Snapshots the Pass-1 opaque DC reversed-Z depth buffer into an `R32Float` readable texture
+/// (~0.07 ms at 1080p) so Tier-2 `exact_box_one_fs` rejects the ~95% of box pixels already covered
+/// by DC on Line 1 via `prove_behind_opaque` before running a single field evaluation.
+@compute(8, 8)
+fn copy_dc_depth(depth: DepthTexture, w: u32, h: u32, out: mut Texels<R32Float>, id: GlobalId) {
+    if id.x >= w || id.y >= h {
+        return
+    }
+    out.store(id, depth.load(id.x, id.y))
+}
+
+/// Tier-2 `ExactCell` AABB fragment shader for `One<M>`: checks the Pass-1 DC depth snapshot on
+/// Line 1 (`prove_behind_opaque` skips ~95% of box pixels already covered by DC with zero field
+/// evaluations), intersects the pixel's ray against the exact cell cube `[lo, lo + h]`, runs
+/// `mesh::proof::solve_cell_ray_lipschitz` (`EmptyProof`-gated discard — zero holes, zero extras),
+/// shades analytically at the exact surface hit, and writes conservative `WithDepthBehind` depth.
+@fragment
+@budget(work: 36000)
+fn exact_box_one_fs<M: Field<Substance>>(
+    vary: ExactVary,
+    field: M,
+    dc_depth: Texture<R32Float>,
+    v: View,
+    prev_v: View,
+    frag: FragCoord,
+) -> WithDepthBehind<Targets4<vec4, vec4, vec4, vec2>> {
+    let ch = vary.cell_lo_h.value
+    let meta = vary.cell_meta.value
+    let lo = ch.xyz
+    let h = ch.w
+    let hi = lo + vec3(h)
+    let rel = vary.wp - v.at
+    let dist0 = length(rel)
+    let d = rel / max(dist0, 1.0e-6)
+    let rb = ray_box_bracket(v.at, d, v.forward, lo, hi)
+    let z_dc = dc_depth.load(u32(frag.position.x), u32(frag.position.y))
+    let bg_z = if z_dc > 0.0 { NEAR / z_dc } else { 1.0e30 }
+    match prove_box_unseen(rb, bg_z) {
+        Some(proof) => discard_proven(proof),
+        None => {},
+    }
+    let live = Live { words: meta }
+    let px = max(max(rb.t_enter, 0.004) * v.pixel(), 1.0e-6)
+    // Only what is in front of what the mesh drew here, less half a pixel: a surface nearer by
+    // less shows as the mesh within the outline's error, and one past it is hidden.
+    let (t0, t1) = seen_part(rb, bg_z, margin: HOLE_PX * px)
+    let lip = field.lipschitz(1.7320508 * h)
+    // A field that states no bound here (a closure, a warp) is solved by intervals over the ray
+    // (`solve_cell_ray`'s affine halving), never taken to fill the box.
+    let res = if lip > 0.0 && lip < 1.0e12 {
+        solve_cell_ray_lipschitz(field, live, v.at, d, t0, t1, px, lip)
+    } else {
+        solve_cell_ray(|q: vec3| field.distance_live(q, live), v.at, d, t0, t1, px, lip)
+    }
+    var t_hit = t0
+    match res {
+        CellRay::Hit(t) => {
+            t_hit = max(t, t0)
+        },
+        CellRay::Empty(proof) => {
+            discard_proven(proof)
+        },
+    }
+    let hit_p = v.at + d * t_hit
+    let sub0 = field.channels(hit_p)
+    match prove_transmissive_only(sub0) {
+        Some(proof) => discard_proven(proof),
+        None => {},
+    }
+    let (_, gv) = value_and_gradient(|q: vec3| field.distance_live(q, live), hit_p)
+    let gl = length(gv)
+    let n = if gl > 1.0e-6 { gv / gl } else { -d }
+    let out = shade_gbuf_core(hit_p, hit_p, hit_p, n, 1.0, sub0, v, prev_v)
+    WithDepthBehind { color: out, depth: depth_of(v, hit_p) }
 }
 
 /// Lean 1× G-buffer + motion-vector fragment shader for opaque terrain heightfields (`height_vs`).
@@ -1053,15 +1225,17 @@ fn shade_refract_refl_core(
     bg_s: Sampler,
     half_size: vec2,
 ) -> vec4 {
-    if sub0.transmission <= 0.02 {
-        discard()
+    match prove_opaque_only(sub0) {
+        Some(p) => discard_proven(p),
+        None => {},
     }
     let to_eye = v.at - wp
     let dist = length(to_eye)
     let uv = pixel.position.xy / max(half_size, vec2(1.0))
     let bg_d = hdr_bg.sample_level(bg_s, uv, 0.0).w
-    if dist > bg_d + 0.25 {
-        discard()
+    match prove_point_behind_opaque(dist, bg_d, 0.25) {
+        Some(p) => discard_proven(p),
+        None => {},
     }
     let ray_back = if dist > 1.0e-6 { to_eye / dist } else { -v.forward }
     let n0 = resolve_normal_from(wp, normal, smooth, ray_back)
@@ -1474,8 +1648,9 @@ fn shade_trans_core<S: Sky>(
     refract_refl: Texture<Rgba16Float>,
     bg_s: Sampler,
 ) -> vec4 {
-    if sub0.transmission <= 0.02 {
-        discard()
+    match prove_opaque_only(sub0) {
+        Some(p) => discard_proven(p),
+        None => {},
     }
     let to_eye = v.at - wp
     let dist = length(to_eye)
@@ -2071,6 +2246,8 @@ pub trait MeshWorld {
         ep: DepthPass4<Rgba8, Rgba8, Rgba16Float, Rg16Float>,
         batches: mut Vec<MeshBatch>,
         cull: mut HiZCuller,
+        cube_indices: GpuBuffer<u32>,
+        dc_depth: Texture<R32Float>,
         first: u32,
         pass_idx: u32,
         v: View,
@@ -2161,15 +2338,15 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for One<M> {
         let is_steep = steep(self.field)
         let h_top = cell_for_one(b.centre, r, v, is_steep, size_floor(r))
         let lip = max(self.field.lipschitz(1.0), 1.0)
-        let d_at = abs(self.field.distance(v.at)) / lip
-        let d_surf = max(d_at, max(length(b.centre - v.at) - r, 0.0))
-        let force_direct = d_surf < 1.5 * r
+        let d_surf = surface_from_eye(self.field, b.centre, r, v)
+        let force_direct = d_surf < DIRECT_RADII * r
         var z_vis = d_surf
         var h_near = h_top
         if d_surf < 2.0 * r {
             z_vis = probe_visible_near(self.field, v, d_surf, length(b.centre - v.at) + r)
             let px_near = max(z_vis, 0.004) * v.pixel()
-            let mult = CELL_PX * (if is_steep { 0.55 } else { 0.90 })
+            let eff_cpx = if lip > 2.5 { min(CELL_PX, 2.0) } else { CELL_PX }
+            let mult = eff_cpx * (if is_steep { 0.55 } else { 0.90 })
             h_near = clamp(px_near * mult, max(h_top / 64.0, 0.0004), h_top)
         }
         batches[first].sync_one_lod(mut scratch, self.field, v, z_vis, h_near, h_top, force_direct)
@@ -2257,6 +2434,8 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for One<M> {
         ep: DepthPass4<Rgba8, Rgba8, Rgba16Float, Rg16Float>,
         batches: mut Vec<MeshBatch>,
         cull: mut HiZCuller,
+        cube_indices: GpuBuffer<u32>,
+        dc_depth: Texture<R32Float>,
         first: u32,
         pass_idx: u32,
         v: View,
@@ -2299,6 +2478,32 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for One<M> {
             }
             return
         }
+        if pass_idx == 2 {
+            if batches[first].has_exact {
+                draw(
+                    ep,
+                    exact_box_vs.bind(
+                        cells: batches[first].exact_cells.items(),
+                        xforms: batches[first].xforms.items(),
+                        v: v,
+                    ),
+                    exact_box_one_fs.bind(
+                        field: self.field,
+                        dc_depth: dc_depth,
+                        v: v,
+                        prev_v: prev_v,
+                    ),
+                    indices: cube_indices,
+                    indirect: batches[first].exact_draw_args,
+                    cull: Cull::None,
+                    depth: Depth { compare: Compare::Greater, write: true },
+                )
+            }
+            return
+        }
+        if pass_idx != 0 {
+            return
+        }
         let vs = mesh_vs.bind(
             verts: batches[first].verts.items(),
             xforms: batches[first].xforms.items(),
@@ -2308,9 +2513,6 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for One<M> {
             v: v,
         )
         let fs = field_gbuf_one_fs.bind(field: self.field, v: v, prev_v: prev_v)
-        if pass_idx != 0 {
-            return
-        }
         if batches[first].has_opaque {
             draw(
                 ep,
@@ -2589,11 +2791,233 @@ fn in_view(c: vec3, r: f32, v: View) -> bool {
     abs(dot(rel, v.up)) <= half_y && abs(dot(rel, v.right)) <= half_x
 }
 
+/// The batches a `Pool` meshes its things in together (near, and far by parity: `sync_pool`).
+const POOL_SHARED: u32 = 3
+
+/// The batches a `Pool` keeps beside its shared ones for things near the eye, each meshed as a
+/// `One` is (view-dependent nested bricks and exact cells): a pool's shared mesh is one grid a
+/// thing (or one rest-pose template for them all) and can't be as fine as a thing seen close needs.
+/// More things near than this sets `OVERFLOW_NEAR` (the rest are drawn from the shared mesh).
+const NEAR_SLOTS: u32 = 4
+
+/// How near the eye, in bound radii from a thing's surface, the thing is meshed directly from its
+/// field, view-dependent (`One::sync_batches`' `force_direct`; a `Pool`'s near batches).
+const DIRECT_RADII: f32 = 1.5
+
+/// How far the eye is from the surface of `field` (bound `c`, `r`), as `One::sync_batches` reads
+/// it: its distance at the eye over its steepness, or its bound's, the greater.
+fn surface_from_eye<M: Field<Substance>>(field: M, c: vec3, r: f32, v: View) -> f32 {
+    let lip = max(field.lipschitz(1.0), 1.0)
+    max(abs(field.distance(v.at)) / lip, max(length(c - v.at) - r, 0.0))
+}
+
+/// Which of `pool`'s things in view are near the eye (within `DIRECT_RADII` bound radii of its
+/// surface, as `One::sync_batches` meshes a thing directly), each given one of its near batches (`MeshBatch::near_id`: kept by the thing it held
+/// last frame while it stays near, else the nearest not yet given one): the things given one.
+/// Sets `OVERFLOW_NEAR` on its first batch when more are near than it has near batches.
+fn near_things<M: Field<Substance> + StateHash + GpuData>(
+    pool: Pool<M>,
+    batches: mut Vec<MeshBatch>,
+    first: u32,
+    v: View,
+) -> Vec<bool> {
+    let n = pool.fields.len()
+    var given = Vec::filled(n, false)
+    var d_of = Vec::filled(n, -1.0)
+    var want: u32 = 0
+    for i in 0..n {
+        let b = pool.fields[i].bound()
+        let r = min(b.radius, 1.0e4)
+        if in_view(b.centre, r, v) && length(b.centre - v.at) - r < DIRECT_RADII * r {
+            let d = surface_from_eye(pool.fields[i], b.centre, r, v)
+            if d < DIRECT_RADII * r {
+                d_of[i] = d
+                want += 1
+            }
+        }
+    }
+    for s in 0..NEAR_SLOTS {
+        let bi = first + POOL_SHARED + s
+        let id = batches[bi].near_id
+        if id < n && d_of[id] >= 0.0 && !given[id] {
+            given[id] = true
+        } else {
+            batches[bi].near_id = NO_THING
+        }
+    }
+    var held: u32 = 0
+    for s in 0..NEAR_SLOTS {
+        let bi = first + POOL_SHARED + s
+        if batches[bi].near_id >= n {
+            var best = n
+            var best_d = 1.0e30
+            for i in 0..n {
+                if !given[i] && d_of[i] >= 0.0 && d_of[i] < best_d {
+                    best_d = d_of[i]
+                    best = i
+                }
+            }
+            if best < n {
+                given[best] = true
+                batches[bi].near_id = best
+            }
+        }
+        if batches[bi].near_id < n {
+            held += 1
+        }
+    }
+    batches[first].near_over = want > held
+    given
+}
+
+/// The shared meshes of `pool` (its batches `first` to `first + POOL_SHARED`): every thing in view
+/// but those near the eye (`near_eye`, meshed as `One`s in its near batches).
+fn sync_pool_shared<M: Field<Substance> + StateHash + GpuData>(
+    pool: Pool<M>,
+    scratch: mut ExtractScratch,
+    batches: mut Vec<MeshBatch>,
+    first: u32,
+    v: View,
+    near_eye: Vec<bool>,
+) {
+    let n = pool.fields.len()
+    if n == 0 {
+        let empty_cells: Vec<f32> = Vec::new()
+        batches[first].sync_pool(mut scratch, pool.fields, empty_cells)
+        for k in 1..3 {
+            batches[first + k].has_opaque = false
+            batches[first + k].has_trans = false
+            batches[first + k].inst_count = 0
+            batches[first + k].still_frames += 1
+        }
+        return
+    }
+    let cap = batches[first].max_bricks
+    var centres: Vec<vec3> = Vec::new()
+    var radii: Vec<f32> = Vec::new()
+    var nears: Vec<f32> = Vec::new()
+    var weights: Vec<f32> = Vec::new()
+    var total_w = 0.0
+    for i in 0..n {
+        let b = pool.fields[i].bound()
+        let r = min(b.radius, 1.0e4)
+        let near = max(length(b.centre - v.at) - r, 0.25)
+        centres.push(b.centre)
+        radii.push(r)
+        nears.push(near)
+        if in_view(b.centre, r, v) && !near_eye[i] {
+            let s = r / near
+            let w = clamp(s * s, 0.002, 4.0)
+            weights.push(w)
+            total_w += w
+        } else {
+            weights.push(0.0)
+        }
+    }
+    let inv_w = if total_w > 1.0e-6 { f32(cap) / total_w } else { f32(cap) }
+
+    // Fast path for skinned crowds: split `n >= 16` into 2 distance LOD templates (`<= 12 m`
+    // near, `> 12 m` far) so every visible character renders at distance-appropriate density
+    // with 0.000 ms per-frame extraction and 1–2 GPU-instanced DQS draw calls.
+    let first_skinned = match pool.fields[0].skin_shape_hash() {
+        Some(_) => true,
+        None => false,
+    }
+    if first_skinned {
+        if n < 16 {
+            var cells = Vec::filled(n, 0.0)
+            for i in 0..n {
+                if weights[i] > 0.0 {
+                    cells[i] = cell_for_one(
+                        centres[i],
+                        radii[i],
+                        v,
+                        steep(pool.fields[i]),
+                        size_floor(radii[i]),
+                    )
+                }
+            }
+            batches[first].sync_pool(mut scratch, pool.fields, cells)
+            for k in 1..3 {
+                batches[first + k].has_opaque = false
+                batches[first + k].has_trans = false
+                batches[first + k].inst_count = 0
+                batches[first + k].still_frames += 1
+            }
+            return
+        }
+        var c_near = Vec::filled(n, 0.0)
+        var c_far = Vec::filled(n, 0.0)
+        for i in 0..n {
+            if weights[i] > 0.0 {
+                let c = cell_for_one(
+                    centres[i],
+                    radii[i],
+                    v,
+                    steep(pool.fields[i]),
+                    size_floor(radii[i]),
+                )
+                if nears[i] <= 12.0 {
+                    c_near[i] = c
+                } else {
+                    c_far[i] = c
+                }
+            }
+        }
+        batches[first].sync_pool(mut scratch, pool.fields, c_near)
+        batches[first + 1].sync_pool(mut scratch, pool.fields, c_far)
+        batches[first + 2].has_opaque = false
+        batches[first + 2].has_trans = false
+        batches[first + 2].inst_count = 0
+        batches[first + 2].still_frames += 1
+        return
+    }
+    if n < 16 {
+        var cells = Vec::filled(n, 0.0)
+        for i in 0..n {
+            if weights[i] > 0.0 {
+                cells[i] = cell_for_share(centres[i], radii[i], weights[i] * inv_w, v)
+            }
+        }
+        batches[first].sync_pool(mut scratch, pool.fields, cells)
+        for k in 1..3 {
+            batches[first + k].has_opaque = false
+            batches[first + k].has_trans = false
+            batches[first + k].inst_count = 0
+            batches[first + k].still_frames += 1
+        }
+        return
+    }
+
+    // Three batches: things within `FAR_TIER_DIST` (near), and the farther ones split by index
+    // parity, so a change re-extracts only the batch it falls in. Every batch syncs every
+    // frame (a still batch's sync is a hash check), so each batch's mesh is always this
+    // frame's and is shaded by this frame's fields (`fbuf`) with exact motion vectors.
+    var c_near = Vec::filled(n, 0.0)
+    var c_even = Vec::filled(n, 0.0)
+    var c_odd = Vec::filled(n, 0.0)
+    for i in 0..n {
+        if weights[i] > 0.0 {
+            let cell = cell_for_share(centres[i], radii[i], weights[i] * inv_w, v)
+            if nears[i] <= FAR_TIER_DIST {
+                c_near[i] = cell
+            } else if (i & 1) == 0 {
+                c_even[i] = cell
+            } else {
+                c_odd[i] = cell
+            }
+        }
+    }
+    batches[first].sync_pool(mut scratch, pool.fields, c_near)
+    batches[first + 1].sync_pool(mut scratch, pool.fields, c_even)
+    batches[first + 2].sync_pool(mut scratch, pool.fields, c_odd)
+}
+
 impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for Pool<M> {
     type FieldBufs = GpuBuffer<M>
 
     fn batch_count(self) -> u32 {
-        3
+        POOL_SHARED + NEAR_SLOTS
     }
 
     fn upload_fields(self) -> GpuBuffer<M> {
@@ -2610,137 +3034,17 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for Pool<M> {
         first: u32,
         v: View,
     ) {
-        let n = self.fields.len()
-        if n == 0 {
-            let empty_cells: Vec<f32> = Vec::new()
-            batches[first].sync_pool(mut scratch, self.fields, empty_cells)
-            for k in 1..3 {
-                batches[first + k].has_opaque = false
-                batches[first + k].has_trans = false
-                batches[first + k].inst_count = 0
-                batches[first + k].still_frames += 1
-            }
-            return
-        }
-        let cap = batches[first].max_bricks
-        var centres: Vec<vec3> = Vec::new()
-        var radii: Vec<f32> = Vec::new()
-        var nears: Vec<f32> = Vec::new()
-        var weights: Vec<f32> = Vec::new()
-        var total_w = 0.0
-        for i in 0..n {
-            let b = self.fields[i].bound()
-            let r = min(b.radius, 1.0e4)
-            let near = max(length(b.centre - v.at) - r, 0.25)
-            centres.push(b.centre)
-            radii.push(r)
-            nears.push(near)
-            if in_view(b.centre, r, v) {
-                let s = r / near
-                let w = clamp(s * s, 0.002, 4.0)
-                weights.push(w)
-                total_w += w
+        let near_eye = near_things(self, mut batches, first, v)
+        sync_pool_shared(self, mut scratch, mut batches, first, v, near_eye)
+        for s in 0..NEAR_SLOTS {
+            let bi = first + POOL_SHARED + s
+            let id = batches[bi].near_id
+            if id < self.fields.len() {
+                one(self.fields[id]).sync_batches(mut scratch, mut batches, bi, v)
             } else {
-                weights.push(0.0)
+                batches[bi].forget()
             }
         }
-        let inv_w = if total_w > 1.0e-6 { f32(cap) / total_w } else { f32(cap) }
-
-        // Fast path for skinned crowds: split `n >= 16` into 2 distance LOD templates (`<= 12 m`
-        // near, `> 12 m` far) so every visible character renders at distance-appropriate density
-        // with 0.000 ms per-frame extraction and 1–2 GPU-instanced DQS draw calls.
-        let first_skinned = match self.fields[0].skin_shape_hash() {
-            Some(_) => true,
-            None => false,
-        }
-        if first_skinned {
-            if n < 16 {
-                var cells = Vec::filled(n, 0.0)
-                for i in 0..n {
-                    if weights[i] > 0.0 {
-                        cells[i] = cell_for_one(
-                            centres[i],
-                            radii[i],
-                            v,
-                            steep(self.fields[i]),
-                            size_floor(radii[i]),
-                        )
-                    }
-                }
-                batches[first].sync_pool(mut scratch, self.fields, cells)
-                for k in 1..3 {
-                    batches[first + k].has_opaque = false
-                    batches[first + k].has_trans = false
-                    batches[first + k].inst_count = 0
-                    batches[first + k].still_frames += 1
-                }
-                return
-            }
-            var c_near = Vec::filled(n, 0.0)
-            var c_far = Vec::filled(n, 0.0)
-            for i in 0..n {
-                if weights[i] > 0.0 {
-                    let c = cell_for_one(
-                        centres[i],
-                        radii[i],
-                        v,
-                        steep(self.fields[i]),
-                        size_floor(radii[i]),
-                    )
-                    if nears[i] <= 12.0 {
-                        c_near[i] = c
-                    } else {
-                        c_far[i] = c
-                    }
-                }
-            }
-            batches[first].sync_pool(mut scratch, self.fields, c_near)
-            batches[first + 1].sync_pool(mut scratch, self.fields, c_far)
-            batches[first + 2].has_opaque = false
-            batches[first + 2].has_trans = false
-            batches[first + 2].inst_count = 0
-            batches[first + 2].still_frames += 1
-            return
-        }
-        if n < 16 {
-            var cells = Vec::filled(n, 0.0)
-            for i in 0..n {
-                if weights[i] > 0.0 {
-                    cells[i] = cell_for_share(centres[i], radii[i], weights[i] * inv_w, v)
-                }
-            }
-            batches[first].sync_pool(mut scratch, self.fields, cells)
-            for k in 1..3 {
-                batches[first + k].has_opaque = false
-                batches[first + k].has_trans = false
-                batches[first + k].inst_count = 0
-                batches[first + k].still_frames += 1
-            }
-            return
-        }
-
-        // Three batches: things within `FAR_TIER_DIST` (near), and the farther ones split by index
-        // parity, so a change re-extracts only the batch it falls in. Every batch syncs every
-        // frame (a still batch's sync is a hash check), so each batch's mesh is always this
-        // frame's and is shaded by this frame's fields (`fbuf`) with exact motion vectors.
-        var c_near = Vec::filled(n, 0.0)
-        var c_even = Vec::filled(n, 0.0)
-        var c_odd = Vec::filled(n, 0.0)
-        for i in 0..n {
-            if weights[i] > 0.0 {
-                let cell = cell_for_share(centres[i], radii[i], weights[i] * inv_w, v)
-                if nears[i] <= FAR_TIER_DIST {
-                    c_near[i] = cell
-                } else if (i & 1) == 0 {
-                    c_even[i] = cell
-                } else {
-                    c_odd[i] = cell
-                }
-            }
-        }
-        batches[first].sync_pool(mut scratch, self.fields, c_near)
-        batches[first + 1].sync_pool(mut scratch, self.fields, c_even)
-        batches[first + 2].sync_pool(mut scratch, self.fields, c_odd)
     }
 
     fn splat_sdf(
@@ -2798,6 +3102,26 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for Pool<M> {
         static_only: bool,
         all_batches: bool,
     ) {
+        for s in 0..NEAR_SLOTS {
+            let bi = first + POOL_SHARED + s
+            let id = batches[bi].near_id
+            if id < self.fields.len() {
+                one(self.fields[id]).inject_radiance(
+                    0,
+                    mut rad,
+                    mut batches,
+                    bi,
+                    sv,
+                    sky,
+                    sky_diff,
+                    sky_s,
+                    shadow_map,
+                    cmp,
+                    static_only: static_only,
+                    all_batches: all_batches,
+                )
+            }
+        }
         let n = self.fields.len()
         if n == 0 {
             return
@@ -2859,11 +3183,34 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for Pool<M> {
         ep: DepthPass4<Rgba8, Rgba8, Rgba16Float, Rg16Float>,
         batches: mut Vec<MeshBatch>,
         cull: mut HiZCuller,
+        cube_indices: GpuBuffer<u32>,
+        dc_depth: Texture<R32Float>,
         first: u32,
         pass_idx: u32,
         v: View,
         prev_v: View,
     ) {
+        for s in 0..NEAR_SLOTS {
+            let bi = first + POOL_SHARED + s
+            let id = batches[bi].near_id
+            if id < self.fields.len() {
+                one(self.fields[id]).draw_eye(
+                    0,
+                    ep,
+                    mut batches,
+                    mut cull,
+                    cube_indices,
+                    dc_depth,
+                    bi,
+                    pass_idx,
+                    v,
+                    prev_v,
+                )
+            }
+        }
+        if pass_idx == 2 {
+            return
+        }
         let n = self.fields.len()
         if n == 0 {
             return
@@ -2880,6 +3227,8 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for Pool<M> {
             }
             if batches[bi].is_skinned {
                 let vs = skin_mesh_vs.bind(
+                    fields: fbuf.items(),
+                    n_fields: n,
                     verts: batches[bi].verts.items(),
                     skin: batches[bi].skin_verts.items(),
                     xforms: batches[bi].xforms.items(),
@@ -3047,6 +3396,36 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for Pool<M> {
         bg_s: Sampler,
         half_size: vec2,
     ) {
+        for s in 0..NEAR_SLOTS {
+            let bi = first + POOL_SHARED + s
+            let id = batches[bi].near_id
+            if id < self.fields.len() {
+                one(self.fields[id]).draw_refract_refl(
+                    0,
+                    rrp,
+                    mut batches,
+                    bi,
+                    v,
+                    rad_grid,
+                    sdf_grid,
+                    sky_diff,
+                    sky_spec0,
+                    sky_spec1,
+                    sky_spec2,
+                    sky_s,
+                    rad0,
+                    rad1,
+                    rad2,
+                    rad_s,
+                    sdf0,
+                    sdf1,
+                    sdf_s,
+                    hdr_bg,
+                    bg_s,
+                    half_size,
+                )
+            }
+        }
         let n = self.fields.len()
         if n == 0 {
             return
@@ -3060,6 +3439,8 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for Pool<M> {
                     draw(
                         rrp,
                         skin_mesh_vs.bind(
+                            fields: fbuf.items(),
+                            n_fields: n,
                             verts: batches[bi].verts.items(),
                             skin: batches[bi].skin_verts.items(),
                             xforms: batches[bi].xforms.items(),
@@ -3176,6 +3557,46 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for Pool<M> {
         refract_refl: Texture<Rgba16Float>,
         bg_s: Sampler,
     ) {
+        for s in 0..NEAR_SLOTS {
+            let bi = first + POOL_SHARED + s
+            let id = batches[bi].near_id
+            if id < self.fields.len() {
+                one(self.fields[id]).draw_refract(
+                    0,
+                    rp,
+                    mut batches,
+                    bi,
+                    v,
+                    prev_v,
+                    sv,
+                    rad_grid,
+                    sdf_grid,
+                    sky,
+                    sky_diff,
+                    sky_spec0,
+                    sky_spec1,
+                    sky_spec2,
+                    sky_s,
+                    shadow_map,
+                    static_shadow_map,
+                    has_static_shadow,
+                    cmp,
+                    rad0,
+                    rad1,
+                    rad2,
+                    rad_s,
+                    sdf0,
+                    sdf1,
+                    sdf_s,
+                    emitters,
+                    tile_masks,
+                    tiles_x,
+                    hdr_bg,
+                    refract_refl,
+                    bg_s,
+                )
+            }
+        }
         let n = self.fields.len()
         if n == 0 {
             return
@@ -3189,6 +3610,8 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for Pool<M> {
                     draw(
                         rp,
                         skin_mesh_vs.bind(
+                            fields: fbuf.items(),
+                            n_fields: n,
                             verts: batches[bi].verts.items(),
                             skin: batches[bi].skin_verts.items(),
                             xforms: batches[bi].xforms.items(),
@@ -3390,14 +3813,38 @@ impl<A: MeshWorld, B: MeshWorld> MeshWorld for And<A, B> {
         ep: DepthPass4<Rgba8, Rgba8, Rgba16Float, Rg16Float>,
         batches: mut Vec<MeshBatch>,
         cull: mut HiZCuller,
+        cube_indices: GpuBuffer<u32>,
+        dc_depth: Texture<R32Float>,
         first: u32,
         pass_idx: u32,
         v: View,
         prev_v: View,
     ) {
         let na = self.a.batch_count()
-        self.a.draw_eye(fbufs.0, ep, mut batches, mut cull, first, pass_idx, v, prev_v)
-        self.b.draw_eye(fbufs.1, ep, mut batches, mut cull, first + na, pass_idx, v, prev_v)
+        self.a.draw_eye(
+            fbufs.0,
+            ep,
+            mut batches,
+            mut cull,
+            cube_indices,
+            dc_depth,
+            first,
+            pass_idx,
+            v,
+            prev_v,
+        )
+        self.b.draw_eye(
+            fbufs.1,
+            ep,
+            mut batches,
+            mut cull,
+            cube_indices,
+            dc_depth,
+            first + na,
+            pass_idx,
+            v,
+            prev_v,
+        )
     }
 
     fn draw_refract_refl(
@@ -3670,6 +4117,7 @@ pub struct MeshSight {
     pub hdr_colour: Texture<Rgba16Float>,
     pub hdr_bg: Texture<Rgba16Float>,
     pub depth: DepthTexture,
+    dc_depth: Texture<R32Float>,
     pub sky: SkyCache,
     pub rad: RadianceCache,
     pub sdf: SdfClipmap,
@@ -3680,6 +4128,7 @@ pub struct MeshSight {
     pub cull: HiZCuller,
     scratch: ExtractScratch,
     clipmap: ClipmapMesh,
+    cube_indices: GpuBuffer<u32>,
     batches: Vec<MeshBatch>,
     shadow_map: DepthTexture,
     /// The sun shadow map of the still batches alone (same `ShadowView`), drawn only when the
@@ -3716,6 +4165,7 @@ pub fn mesh_sight(gi: bool = true) -> MeshSight {
         hdr_colour: texture(width: 1, height: 1),
         hdr_bg: texture(width: 1, height: 1),
         depth: depth_texture(width: 1, height: 1),
+        dc_depth: writable_texture(width: 1, height: 1, levels: 1),
         sky: sky_cache(),
         rad: radiance_cache(),
         sdf: sdf_clipmap(),
@@ -3726,6 +4176,8 @@ pub fn mesh_sight(gi: bool = true) -> MeshSight {
         cull: hiz_culler(),
         scratch: extract_scratch(BATCH_BRICKS),
         clipmap: clipmap_mesh(),
+        // A box's 36 vertices in order (`exact_box_vs` reads each one's corner and face).
+        cube_indices: buffer_of(Vec::from_fn(36, |i: u32| i)),
         batches: Vec::new(),
         shadow_map: depth_texture(width: SHADOW_SIDE, height: SHADOW_SIDE),
         static_shadow_map: depth_texture(width: SHADOW_SIDE, height: SHADOW_SIDE),
@@ -3761,6 +4213,7 @@ impl MeshSight {
             self.hdr_colour = texture(width: width, height: height)
             self.hdr_bg = texture(width: width, height: height)
             self.depth = depth_texture(width: width, height: height)
+            self.dc_depth = writable_texture(width: width, height: height, levels: 1)
             self.tsr.resize(width, height)
             self.cull.resize(width, height)
         }
@@ -4156,6 +4609,8 @@ impl MeshSight {
             ep,
             mut self.batches,
             mut self.cull,
+            self.cube_indices,
+            self.dc_depth,
             first: 0,
             pass_idx: 0,
             v: v,
@@ -4214,6 +4669,8 @@ impl MeshSight {
                     ep2,
                     mut self.batches,
                     mut self.cull,
+                    self.cube_indices,
+                    self.dc_depth,
                     first: 0,
                     pass_idx: 1,
                     v: v,
@@ -4222,6 +4679,50 @@ impl MeshSight {
                 ep2.end()
             }
             self.cull.finish_frame(v)
+        }
+
+        // Pass 2a-exact: Snapshot DC reversed-Z depth (~0.07 ms) and resolve Tier-2 `ExactCell`
+        // AABBs ONLY on the ~2–5% of pixels not already covered in front of `z_back` by DC.
+        var any_exact = false
+        for i in 0..nb {
+            if self.batches[i].has_exact {
+                any_exact = true
+            }
+        }
+        if any_exact {
+            label("mesh_exact_depth")
+            dispatch(
+                copy_dc_depth.bind(
+                    depth: self.depth,
+                    w: width,
+                    h: height_px,
+                    out: self.dc_depth.level_mut(0),
+                ),
+                groups: ((width + 7) / 8, (height_px + 7) / 8, 1),
+            )
+            label("mesh_exact")
+            let epx: DepthPass4<Rgba8, Rgba8, Rgba16Float, Rg16Float> = begin_pass4_with_depth(
+                mut self.g_normal,
+                mut self.g_albedo,
+                mut self.g_emits,
+                mut self.g_motion,
+                mut self.depth,
+                keep: true,
+                keep_depth: true,
+            )
+            world.draw_eye(
+                fbufs,
+                epx,
+                mut self.batches,
+                mut self.cull,
+                self.cube_indices,
+                self.dc_depth,
+                first: 0,
+                pass_idx: 2,
+                v: v,
+                prev_v: prev_v,
+            )
+            epx.end()
         }
 
         // Pass 2b: Full-res 1× pixel-rate deferred direct lighting (SDF soft shadows + curvature + SSS + tiled emitters).
@@ -4631,6 +5132,15 @@ impl MeshSight {
             }
         }
         true
+    }
+
+    /// Bitwise OR of all batches' `OVERFLOW_*` bitflags (`0` = no capacity truncation anywhere).
+    pub fn overflowed(self) -> u32 {
+        var flags: u32 = 0
+        for i in 0..self.batches.len() {
+            flags |= self.batches[i].overflowed()
+        }
+        flags
     }
 
     /// Renders `world` into `self.drawn` (`colour`, `place`, `sun`) without presenting (for

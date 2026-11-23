@@ -707,6 +707,146 @@ and 12; SCENE 0 judge on the M4 as above; SCENES 10, 11 and 12 inspected; `tools
   should decide it is a judge with specular light, or the variance of a pixel across a still
   eye's jittered subframes before the temporal resolve.
 
+### Holes: what one is, what may never be drawn, and how the engine keeps to it
+
+**What counts.** The hole audit (SCENE 6, `tools/audit`) now says how far each hole lies inside
+the field's own outline and each extra outside it. A hole three pixels or more inside is a
+**crack** (solid matter seen through), an extra three or more outside is **ghost matter**: both
+are a hard zero. Holes and extras within two pixels of the outline are the outline's error (the
+judges' to measure) and are held to a budget: one in ten thousand of the pixels the field meets.
+Measured with the rest of this section in place, every hole left in the audit was such an
+outline pixel but one, a crack (below).
+
+**Where holes came from.** A pixel is missed only where something other than the field decides
+coverage: a mesh's chords, a level's seam, a shared template's shape, a culling bound, a buffer
+that ran out. The engine's rule is that anything it can't show is covered gets an exact cell
+(`mesh::proof`: the pixel's ray solved against the field, a discard only on proof of no surface),
+so what it doesn't understand costs time, which the bench sees, and not holes.
+
+- **Exact cells by rule, not by tuning (`extract.wrela`).** `needs_exact_cell` and its fifteen
+  constants are gone. A quad gets exact cells for its four cells when it may hold the mesh's
+  outline seen from the eye (`on_outline`: a triangle or vertex normal faces it and one faces
+  away, allowing the eye to move a step, `eye_step`, as far as `EYE_ANGLE` turns a plane before
+  the eye's key re-meshes), or when a triangle is wound against its normals (folded, so culled);
+  a quad whose normals turn too little for its chord to stand half a pixel off the surface
+  (`(L/2)·tan(θ/4)`, a circle's arc) is passed. Each outline cell's wholly outside face
+  neighbours get one too (`dilate_outline`: a tip or crest finer than a cell reaches into them;
+  the broken pillar's tip was a hole until it did). Every coarse cell on a 2:1 seam between
+  levels gets one, with its live parts (`box_seam_cells`; the fine side's cells alone didn't close
+  the crowd's pinhole, and adding them cost SCENE 11's exact pass 0.6 ms more). A cell with no corner inside and no surface beside
+  it gets one where an affine range of its core (the cell less a quarter pixel each side) can't be
+  proven empty (`filter_thin_cells`: a detached wand). Exact cells may number 262,144 a batch.
+  With the outline carried by exact cells, `CELL_PX` is 2.5 (it was 1): a mesh's cells needn't be
+  a pixel to keep its outline, so the eye pass draws about a sixth of the triangles.
+- **A pool meshes what it can't share (`draw.wrela`).** A `Pool`'s things within
+  `DIRECT_RADII` (1.5) bound radii of the eye are meshed as `One`s, view-dependent with exact
+  cells, in `NEAR_SLOTS` (4) batches beside its shared ones (`near_things`; more near raises
+  `OVERFLOW_NEAR`; a batch given up forgets its mesh, `MeshBatch::forget`). Its skinned shared
+  mesh is projected onto each thing's own posed field in the vertex shader (`skin_mesh_vs`), as a
+  `One`'s is in `deform_skinned_verts`: DQS alone drew the crowd's bodies off their fields.
+- **The audit covers what it didn't.** Two kinds join it: a crowd (one `Pool` of twelve skinned
+  creatures) and the citadel's gate with that crowd behind it (Hi-Z culling). A union is marched
+  a part at a time (`Marched`: `whole`, `each`, `both`), as a crowd's union in one dispatch was
+  more than the GPU guard allows; every eye looks at matter (`on_it`); an audit of nothing fails;
+  `--kind` and `--eye` audit one kind or one eye, and the first hole says the field's distance
+  there. `tools/check` runs it at 160x90, 12 eyes (31 s on the M4).
+
+**Loopholes closed after a review of the above.**
+- *A box's far side stood where its near side belonged.* The exact pass skipped a box when its
+  far exit was behind the opaque depth drawn there, so a wand in front of a wall, in a cell that
+  reached past the wall, was skipped. A box is now a `RayBox`, made only by `ray_box_bracket`
+  (`mesh::proof`), and proved unseen (`prove_box_unseen`) only from its nearest point; its solve
+  runs over the part in front of what is drawn there, less half a pixel (`seen_part`). The point
+  test keeps its own name (`prove_point_behind_opaque`). `tools/layers` now also refuses an
+  engine file that imports `discard` from `std::gpu` under any name.
+- *A box the eye stood in was drawn nowhere* (front faces clipped, back faces culled). A box is
+  drawn as 36 vertices with no culling; faces turned away fold to nothing, and with the eye inside
+  (or within the near plane) every face is kept at the near plane, which keeps
+  `WithDepthBehind`'s promise (`exact_box_vs`).
+- *An unbounded field filled its cells.* Where a field states no bound, the exact pass solves by
+  affine intervals over the ray (`solve_cell_ray`), never taking the box as hit. The thin-cell
+  candidates' bound is now the field's over the coarsest cell's diagonal, not over a metre.
+- *A live cut was meshed without exact cells, and could leave bricks unmeshed on its frame.* A
+  patch (`try_patch_dirty`) now finds its bricks' exact cells as a full extraction does, for the
+  eye of the last one; a cut whose dirty box holds more than `PATCH_MOST` (4,096) bricks is
+  re-extracted whole (it had meshed 4,096 of up to 27,360 and left the rest for a readback: 8,238
+  cracks on the cut's frame); an edited thing's "eye still" shortcut allows an `eye_step`, not 5 cm.
+- *Two audit kinds:* the column cut while seen (eyes in pairs, `Auditing::pair_eyes`: each odd
+  eye where the even one stood, only its column cut; eyes from four times its bound out, where a
+  cut patches rather than crossing a seam), and a walk past the pillars (`Auditing::stroll`: each eye
+  7 mm on from the last, so each is met by the mesh of the eye before). Both: no hole, no extra.
+- *A crowd's projection asks only parts that can matter* (`SmoothUnionAll::distance_within`,
+  `SmoothUnion`'s, `With`'s): after the first part, each part is asked only within the blend width
+  `k` of what is folded so far, where `smin` returns the fold exactly, so `Skinned::
+  posed_local_distance` is the posed distance bit for bit (a bent creature's, 4,096 points:
+  `a_bent_bodys_posed_distance_asks_only_near_parts_and_is_the_same`). SCENE 11's eye pass 6.1-7.0
+  → 5.1-5.4 ms on the M4; the crowd's audit unchanged.
+
+**Known gaps, not yet closed.** Glass: the audit's picture is the opaque G-buffer, so it can't see
+a transmissive surface, and the exact pass discards one; a glass kind needs transmissive coverage
+recorded first. An outline cell on a brick's low face can't give its outside neighbour across
+that face an exact cell (the neighbour's corners and live parts are the next brick's). Both are
+met by construction by exact coverage done in screen space, over what the mesh drew (phase 2's
+visibility buffer), which is where the exact pass is headed.
+
+**Measured** (SCENE 6, 640x360, 24 eyes a kind, M4): the crowd before any of this, at one eye at
+320x180, 465 holes, 360 extras and 14,036 pixels off by a pixel (DQS without projection); after,
+on all 24 eyes: 56 holes (54 one pixel inside the outline, 2 two), 5 extras (one pixel), no
+crack. The crack was a pinhole at a 2:1 seam 12 cm from the eye (gone when the body was meshed at
+one level; gone with the seams' exact cells). Every other kind: no hole; the creature 2 extras,
+the citadel with the crowd 3 holes, all one pixel from the outline. Off by more than a pixel
+(stack 1,778, citadel 1,622) is the mesh's own vertices, as at HEAD: with exact cells off, 1,785
+and 1,781, and 12 and 5 holes.
+
+**What it costs** (1920x1080, frame span against HEAD 99ed9cd, same session, three runs a build;
+passes timed alone). M4: SCENE 10 **19.0 → 23.2-25.8 ms** (the M4 was shared with another
+session's work; the runs spread): the eye pass 4.70 → 2.65 ms (`CELL_PX` 2.5), exact cells 2.23
+ms, extraction 1.97 → 2.79 ms; SCENE 11 **13.7-14.5 → 14.4-15.3 ms**: the eye pass 3.14 → 5.01 ms
+(the crowd's vertices projected onto their fields), exact cells 2.52 ms. SCENE 10's span grows
+more than its passes do (the CPU's recording +0.3 ms): the exact pass waits on a copy of the
+mesh's depth and lighting waits on it, so less of the frame overlaps. Radeon (Vulkan, validation
+silent): SCENE 10 **42.8 → 49.3-49.5 ms**: the eye pass 8.18 → 5.89 ms, exact cells 4.75 ms,
+extraction 3.83 → 5.07 ms; SCENE 11 **24.4 → 41.1-41.3 ms**: the eye pass 8.33 → 14.58 ms, exact
+cells 10.02 ms. The cuts so far: each seam coarse cell boxed once (an exact table of
+cells seen, `first_seam_sight`; SCENE 11's exact pass 3.5 → 2.3 ms on the M4), an outline cell's
+outside neighbours boxed only where their core may hold surface, and those filtered with the thin
+cells in one pass a chunk (`dilate_outline`, `filter_thin_cells`, `OVERFLOW_THIN` past their
+slices). The exact pass is its shader's work (0.73 of SCENE 11's 3.5 ms with a shader that
+discards at once): pixels beside the outline that no surface covers, each solved to prove it.
+Where more can come from: boxes drawn per outline quad, as tight as the quad's chord bound, not
+per cell; the exact cells as the visibility buffer's second pass (phase 2). The crowd's
+projection is the eye pass's 7 ms on the Radeon; it has to ask a body's every part (below).
+
+**Measured and not kept.**
+- *Projecting a crowd's vertices onto only the parts live in the rest-pose brick they were meshed
+  in.* SCENE 11's eye pass 1.3 ms less on the M4, and 19 cracks on the crowd: a walking pose brings
+  an arm within blend width of the torso, which its rest-pose brick doesn't hold.
+- *A pool's skinned templates in three tiers a factor of two apart by the cell each body needs.*
+  The crowd failed the gate (5 cracks, outline over budget) and SCENE 11 was slower: the cell a
+  body "needs" (`cell_for_one`) was never hole-free, and sharing the nearest body's finer template
+  had hidden it.
+- *Projecting only a crowd's vertices whose weights blend bones.* SCENE 11's eye pass 0.5 ms
+  less, and 3 cracks (3 to 4 px) on the crowd: within a smooth union's blend width the posed field
+  isn't one part's rigid motion, whatever the weights say. The gate failed it.
+- *One-pixel cells for a pool's shared mesh.* Crowd holes 23 to 1 at 320x180; SCENE 11's eye pass
+  +10 ms and shadows +3 ms at 1080p on the M4. The shared mesh's last holes are posed contact (an
+  arm near the torso blends into it once posed; the rest-pose template has no surface there) and
+  no cell size gives it that.
+- *Meshing directly everything whose own grid can't be a pixel fine.* SCENE 10's extraction 3.4
+  to 9.7 ms and SCENE 11's eye pass 3.3 to 18.6 ms (shards and near bodies re-meshed every frame),
+  the crowd's holes unchanged.
+- *Drawing a thing by its field alone* (no mesh: the boxes of the bricks an interval can't prove
+  empty, each pixel solved against the field). No hole on the stage, the creature or the crowd
+  (57 meshed), which is the claim; but 10% of the stage's pixels off by more than a pixel (a
+  march by safe steps alone doesn't converge on slanted surfaces in its budget), one creature
+  close at 640x360 53.4 ms in one pass, over the 50 ms line, and the stack's frame over 1.5 s,
+  stopped by the host. Without a mesh first, every box a ray crosses runs a whole solve. The mesh
+  is the accelerator; the field decides only where it may not cover.
+- *A bracketed Newton step in the cell solver.* Not built: the off-by-a-pixel counts it was for
+  are the mesh's, not the solver's (above).
+- *A sagitta-sized shared mesh from measured curvature.* Not built: the shared mesh's holes are on
+  features a pixel or two across, which a cell that size can't resolve to measure.
+
 ## The layers
 
 Dependencies point down. Nothing below knows anything above.
