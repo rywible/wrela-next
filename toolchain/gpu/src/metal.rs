@@ -653,6 +653,7 @@ impl Device {
             label: label.to_string(),
             cb: None,
             blit: None,
+            compute: None,
             keep: Vec::new(),
         }
     }
@@ -1298,6 +1299,16 @@ impl BindGroup {
 
 // ---- recording ----------------------------------------------------------------------------------------
 
+/// An untimed serial compute encoder kept open across consecutive untimed compute dispatches,
+/// avoiding per-dispatch encoder open/close overhead on Apple GPUs while preserving memory
+/// visibility via intra-encoder barriers.
+struct OpenCompute {
+    encoder: Id<dyn MTLComputeCommandEncoder>,
+    table_set: bool,
+    dispatched: bool,
+    wrote_texture: bool,
+}
+
 /// A command buffer being recorded.
 pub struct CommandEncoder {
     device: Device,
@@ -1305,6 +1316,9 @@ pub struct CommandEncoder {
     cb: Option<Id<dyn MTLCommandBuffer>>,
     /// The blit encoder copies go into, while copies follow one another.
     blit: Option<Id<dyn MTLBlitCommandEncoder>>,
+    /// The untimed compute encoder consecutive untimed dispatches share (closed before any blit,
+    /// render pass, timed compute pass, or finish).
+    compute: Option<OpenCompute>,
     /// The bind groups its commands set, which what they reach through the table needs alive.
     keep: Vec<Arc<Group>>,
 }
@@ -1330,7 +1344,14 @@ impl CommandEncoder {
         }
     }
 
+    fn end_compute(&mut self) {
+        if let Some(c) = self.compute.take() {
+            c.encoder.endEncoding();
+        }
+    }
+
     fn blit(&mut self) -> &Id<dyn MTLBlitCommandEncoder> {
+        self.end_compute();
         if self.blit.is_none() {
             let cb = self.cb();
             // In a pool of its own ([`Device::command_buffer`]).
@@ -1475,35 +1496,65 @@ impl CommandEncoder {
         timestamps: Option<PassTimestamps<'_>>,
     ) -> ComputePass<'_> {
         self.end_blit();
-        let cb = self.cb().clone();
-        // Its descriptor and encoder made in a pool of their own ([`Device::command_buffer`]).
-        let encoder = autoreleasepool(|_| {
-            let d = MTLComputePassDescriptor::new();
-            if let Some(t) = timestamps {
+        let table = self.device.0.table.clone();
+        if let Some(t) = timestamps {
+            self.end_compute();
+            let cb = self.cb().clone();
+            // Its descriptor and encoder made in a pool of their own ([`Device::command_buffer`]).
+            let encoder = autoreleasepool(|_| {
+                let d = MTLComputePassDescriptor::new();
                 let a = unsafe { d.sampleBufferAttachments().objectAtIndexedSubscript(0) };
                 a.setSampleBuffer(Some(&t.queries.raw));
                 unsafe {
                     a.setStartOfEncoderSampleIndex(t.begin as NSUInteger);
                     a.setEndOfEncoderSampleIndex(t.end as NSUInteger);
                 }
+                cb.computeCommandEncoderWithDescriptor(&d).expect("Metal made no compute encoder")
+            });
+            encoder.setLabel(Some(&ns(label)));
+            let anchor = self.device.0.anchor.clone();
+            return ComputePass {
+                open: Some(OpenCompute {
+                    encoder,
+                    table_set: false,
+                    dispatched: false,
+                    wrote_texture: false,
+                }),
+                return_to: None,
+                pipeline: None,
+                anchor,
+                keep: &mut self.keep,
+                table,
+                cur_writes_texture: false,
+            };
+        }
+        let open = match self.compute.take() {
+            Some(c) => c,
+            None => {
+                let cb = self.cb().clone();
+                let encoder = autoreleasepool(|_| {
+                    let d = MTLComputePassDescriptor::new();
+                    cb.computeCommandEncoderWithDescriptor(&d)
+                        .expect("Metal made no compute encoder")
+                });
+                encoder.setLabel(Some(&ns("compute")));
+                OpenCompute { encoder, table_set: false, dispatched: false, wrote_texture: false }
             }
-            cb.computeCommandEncoderWithDescriptor(&d).expect("Metal made no compute encoder")
-        });
-        encoder.setLabel(Some(&ns(label)));
-        let table = self.device.0.table.clone();
-        let anchor = timestamps.and_then(|_| self.device.0.anchor.clone());
+        };
         ComputePass {
-            encoder,
+            open: Some(open),
+            return_to: Some(&mut self.compute),
             pipeline: None,
-            anchor,
+            anchor: None,
             keep: &mut self.keep,
             table,
-            table_set: false,
+            cur_writes_texture: false,
         }
     }
 
     pub fn begin_render_pass(&mut self, desc: &RenderPassDesc<'_>) -> RenderPass<'_> {
         self.end_blit();
+        self.end_compute();
         let cb = self.cb().clone();
         // Its descriptor and encoder made in a pool of their own ([`Device::command_buffer`]).
         let encoder = autoreleasepool(|_| {
@@ -1553,17 +1604,19 @@ impl CommandEncoder {
 
     pub fn finish(mut self) -> CommandBuffer {
         self.end_blit();
+        self.end_compute();
         let keep = std::mem::take(&mut self.keep);
         CommandBuffer { raw: self.cb().clone(), keep }
     }
 }
 
-/// An encoder dropped unfinished (its recording failed part way) ends its open blit encoder:
-/// Metal asserts on an encoder released without `endEncoding`, which ended the whole process
-/// (the GPU tests' run stopped at the first test whose recording failed after a copy).
+/// An encoder dropped unfinished (its recording failed part way) ends its open blit and compute
+/// encoders: Metal asserts on an encoder released without `endEncoding`, which ended the whole
+/// process (the GPU tests' run stopped at the first test whose recording failed after a copy).
 impl Drop for CommandEncoder {
     fn drop(&mut self) {
         self.end_blit();
+        self.end_compute();
     }
 }
 
@@ -1600,7 +1653,10 @@ fn slice_of(c: &TextureCopy<'_>) -> (NSUInteger, NSUInteger) {
 }
 
 pub struct ComputePass<'a> {
-    encoder: Id<dyn MTLComputeCommandEncoder>,
+    /// The active compute encoder (moved back to `return_to` on drop when untimed, or ended when
+    /// timed).
+    open: Option<OpenCompute>,
+    return_to: Option<&'a mut Option<OpenCompute>>,
     /// The pipeline set, and its threadgroup's size.
     pipeline: Option<(Id<dyn MTLComputePipelineState>, MTLSize)>,
     /// A timed pass's anchor ([`Shared::anchor`]), until a threadgroup has launched in it.
@@ -1612,13 +1668,20 @@ pub struct ComputePass<'a> {
     anchor: Option<Id<dyn MTLComputePipelineState>>,
     keep: &'a mut Vec<Arc<Group>>,
     table: Arc<Table>,
-    /// Whether the table is bound in this encoder yet.
-    table_set: bool,
+    cur_writes_texture: bool,
 }
 
 impl ComputePass<'_> {
+    fn open(&self) -> &OpenCompute {
+        self.open.as_ref().expect("live until drop")
+    }
+
+    fn open_mut(&mut self) -> &mut OpenCompute {
+        self.open.as_mut().expect("live until drop")
+    }
+
     pub fn set_pipeline(&mut self, p: &ComputePipeline) {
-        self.encoder.setComputePipelineState(&p.raw);
+        self.open().encoder.setComputePipelineState(&p.raw);
         self.pipeline = Some((p.raw.clone(), p.workgroup));
     }
 
@@ -1627,15 +1690,19 @@ impl ComputePass<'_> {
     fn anchor(&mut self) {
         let Some(anchor) = self.anchor.take() else { return };
         let one = MTLSize { width: 1, height: 1, depth: 1 };
-        self.encoder.setComputePipelineState(&anchor);
-        self.encoder.dispatchThreadgroups_threadsPerThreadgroup(one, one);
+        let e = &self.open().encoder;
+        e.setComputePipelineState(&anchor);
+        e.dispatchThreadgroups_threadsPerThreadgroup(one, one);
         if let Some((p, _)) = &self.pipeline {
-            self.encoder.setComputePipelineState(p);
+            e.setComputePipelineState(p);
         }
     }
 
     pub fn set_bind_group(&mut self, group: &BindGroup, offsets: &[u32]) {
-        let e = &self.encoder;
+        self.cur_writes_texture = !group.0.writes.is_empty();
+        let table_buf = self.table.buffer.clone();
+        let open = self.open_mut();
+        let e = &open.encoder;
         group.each(2, offsets, |b, extra, slot| unsafe {
             match b {
                 Bound::Buffer(buf, offset) => e.setBuffer_offset_atIndex(
@@ -1654,10 +1721,10 @@ impl ComputePass<'_> {
         // SAFETY: the block's bytes are copied as the call is made; the table, and what the
         // group names in it, are alive until the command buffer is done (`keep`).
         unsafe {
-            if !self.table_set {
+            if !open.table_set {
                 let at = wrela_abi::table::METAL_TABLE as NSUInteger;
-                e.setBuffer_offset_atIndex(Some(&self.table.buffer), 0, at);
-                self.table_set = true;
+                e.setBuffer_offset_atIndex(Some(&table_buf), 0, at);
+                open.table_set = true;
             }
             let at = wrela_abi::table::METAL_BLOCK as NSUInteger;
             e.setBytes_length_atIndex(NonNull::from(&g.block[..]).cast(), g.block.len(), at);
@@ -1680,6 +1747,22 @@ impl ComputePass<'_> {
         self.keep.push(g.clone());
     }
 
+    /// Synchronises writes from an earlier dispatch in a shared serial compute encoder before the
+    /// next dispatch reads them (indirect buffers, storage buffers, and table-bound textures).
+    fn barrier_if_reused(&mut self) {
+        let open = self.open_mut();
+        if !open.dispatched {
+            return;
+        }
+        let scope = if open.wrote_texture {
+            open.wrote_texture = false;
+            MTLBarrierScope::Buffers | MTLBarrierScope::Textures
+        } else {
+            MTLBarrierScope::Buffers
+        };
+        open.encoder.memoryBarrierWithScope(scope);
+    }
+
     pub fn dispatch(&mut self, x: u32, y: u32, z: u32) {
         // The groups as given: a depth of 0 launches none, as on Vulkan (not `size`, which rounds
         // a copy's depth up to 1).
@@ -1692,28 +1775,46 @@ impl ComputePass<'_> {
             return;
         }
         self.anchor = None;
+        self.barrier_if_reused();
         let (_, wg) = self.pipeline.as_ref().expect("a pipeline is set");
-        self.encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, *wg);
+        let wg = *wg;
+        let writes_tex = self.cur_writes_texture;
+        let open = self.open_mut();
+        open.encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, wg);
+        open.dispatched = true;
+        open.wrote_texture = writes_tex;
     }
 
     /// Dispatches the groups `buffer` holds at `offset`, as the GPU reads them.
     pub fn dispatch_indirect(&mut self, buffer: &Buffer, offset: u64) {
         self.anchor();
+        self.barrier_if_reused();
         let (_, wg) = self.pipeline.as_ref().expect("a pipeline is set");
+        let wg = *wg;
+        let writes_tex = self.cur_writes_texture;
+        let open = self.open_mut();
         unsafe {
-            self.encoder
+            open.encoder
                 .dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(
                     &buffer.raw,
                     offset as NSUInteger,
-                    *wg,
+                    wg,
                 );
         }
+        open.dispatched = true;
+        open.wrote_texture = writes_tex;
     }
 }
 
 impl Drop for ComputePass<'_> {
     fn drop(&mut self) {
-        self.encoder.endEncoding();
+        if let Some(open) = self.open.take() {
+            if let Some(slot) = self.return_to.take() {
+                *slot = Some(open);
+            } else {
+                open.encoder.endEncoding();
+            }
+        }
     }
 }
 
