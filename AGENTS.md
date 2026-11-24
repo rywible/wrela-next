@@ -92,7 +92,9 @@ Because agents author the whole game, tooling and verification are product work,
    directory, `toolchain/target`, and waits for any other cargo to finish.
 4. **Two machines, two targets.** Metal on this Mac (the M4) and Vulkan with SPIR-V on the Linux
    machine (`ssh wrela-popos`). A change to how anything is drawn is measured on both before it
-   is called done. On the Linux machine this repository lives in `~/projects/wrela-next`, sent
-   from here, never edited there; the same rules hold there. Touch nothing else on it.
-5. **Commit locally, never push.** A message is one sentence saying what is now true, with no
-   trailing period.
+   is called done. On the Linux machine this repository is a full checkout in
+   `~/projects/wrela-next`, and agents work and commit there just as on the Mac; the two
+   machines share work through GitHub. The same rules hold there. Touch nothing else on it.
+5. **Commit and push freely; open no pull requests.** The repository is
+   `github.com/rywible/wrela-next`; push your branches to `origin` whenever you like. A commit
+   message is one sentence saying what is now true, with no trailing period.
