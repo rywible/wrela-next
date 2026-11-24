@@ -86,9 +86,14 @@ pub fn text(out: &TestOutput) -> String {
         }
     }
     let failed: Vec<&Diagnostic> = out.results.iter().filter_map(|r| r.failure.as_ref()).collect();
-    for d in &failed {
+    for r in &out.results {
+        let Some(d) = r.failure.as_ref() else { continue };
         s.push('\n');
         s.push_str(&wrela_diag::render::render(&out.sources, d));
+        // A field contract that failed noted its derivation over the failing box: what made it.
+        if let Some(why) = crate::precision::blame(&r.traced.lines, &out.sources) {
+            s.push_str(&format!("  = cause: {why}\n"));
+        }
     }
     if !failed.is_empty() {
         s.push('\n');

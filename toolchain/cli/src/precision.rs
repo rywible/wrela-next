@@ -178,6 +178,64 @@ fn notes(lines: &[String], order: &mut Vec<Key>) -> Result<HashMap<Key, Seen>, S
     Ok(seen)
 }
 
+/// The operation a failed field contract's precision notes blame (`engine::matter::verify` notes
+/// the derivation that failed over the box where it failed, `std::derive::precision`), of the
+/// author's own (not std's, not an integer's): the first the walk reached whose range is unbounded
+/// or past `BLAME_PAST`, else the widest, said as where
+/// it is, what it is, its range, and what usually holds such an operation in. `None` where the
+/// lines hold no notes.
+pub fn blame(lines: &[String], sources: &wrela_diag::SourceMap) -> Option<String> {
+    let mut order = Vec::new();
+    let seen = notes(lines, &mut order).ok()?;
+    // The author's own operations, of floats: std's (a hash's integer mixing, its noises) are
+    // what an author can't change, and a wide one there is its input's fault.
+    let at = |k: &Key| sources.file(wrela_diag::FileId(k.0)).location(k.1);
+    let own = |k: &Key| !k.3 && !at(k).starts_with('<');
+    let range = |k: &Key| seen.get(k).filter(|_| own(k)).and_then(|s| s.ranges[0]);
+    let wild = |r: (f64, f64)| {
+        !r.0.is_finite() || !r.1.is_finite() || r.0.abs().max(r.1.abs()) > BLAME_PAST
+    };
+    let unbounded = order.iter().find(|k| range(k).is_some_and(wild)).cloned();
+    let first = unbounded.clone().or_else(|| {
+        seen.keys()
+            .filter_map(|k| range(k).map(|r| (k, r.1 - r.0)))
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(k, _)| k.clone())
+    })?;
+    let (lo, hi) = range(&first)?;
+    let at = at(&first);
+    let op = first.2.as_str();
+    // Nothing unbounded: the field is steeper there than it says, and this term is what changes
+    // fastest over the box.
+    if unbounded.is_none() {
+        return Some(format!(
+            "{at}: `{op}` changes most over the failing box ({lo:.3e}..{hi:.3e}): the field is \
+             steeper here than it states; state at least the steepness the check reached, or make \
+             this term change more slowly"
+        ));
+    }
+    let fix = match op {
+        "div" | "/" => {
+            "a divisor that reaches zero: hold it away (`max(x, r)` for a length, a radius)"
+        }
+        "sqrt" | "length" | "distance" | "normalize" | "inversesqrt" => {
+            "a length at zero, whose slope has no bound: hold its argument away, or round the point off"
+        }
+        "atan2" | "atan" => {
+            "an angle about an axis it turns arbitrarily fast near: fade what it drives in near the axis"
+        }
+        "pow" | "log" | "log2" | "exp" | "exp2" => {
+            "a power or log near zero: hold its base away, or use a polynomial"
+        }
+        "mul" | "*" => "a product that grows with the box: one of its factors is unbounded there",
+        _ => "an operation whose range the box can't bound: hold its inputs in",
+    };
+    Some(format!("{at}: `{op}` ranges {lo:.3e}..{hi:.3e} over the failing box: {fix}"))
+}
+
+/// A range past which an operation of a failed contract's derivation is taken as its cause.
+const BLAME_PAST: f64 = 1.0e6;
+
 /// What the report says of one operation, its worst box's.
 #[derive(Clone, Debug, Default)]
 struct Op {

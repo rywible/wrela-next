@@ -1037,6 +1037,28 @@ idle time fell to 3.9 ms a frame, its 1080p span on the M4 from **24.3-25.6 ms (
 extraction's remaining dispatches (a chunk's passes depend on each other) and a few submissions
 the host closes on the guard's booked bounds (`SUBMIT_LINES`).
 
+### Field contracts fail the build, and say where (2026-11-23)
+
+Building any package under game/ (`tools/wrela build`) first proves the content's field
+contracts (`game/world`'s `*_are_sound` tests: each field's bound, steepness, `interval_near` and
+`pruned`, by the compiler's intervals and samples past them, `verify_surface_soundness`); a
+broken one stops the build. A tree of sources that has passed with a compiler isn't asked again
+(a stamp keyed by both, `~/.wrela/contracts`), so the audit's and the bench's many builds pay
+nothing; `WRELA_SKIP_CONTRACTS=1` builds without it.
+
+Where a steepness fails, the verifier notes the gradient's derivation over a small box round the
+failing point (`std::derive::precision`), and `wrela test` names the operation to blame in the
+author's own code (not std's, not an integer's: `precision::blame`), with what usually holds such
+an operation in: the first whose range is unbounded (a divisor reaching zero, a length at the
+origin, an angle about its axis), else the one that changes most over the box (the field is
+steeper there than it states). Measured: the stack stated as 1.0 steep stops the build at
+`stack.wrela:75`; with its crown's fade undone (`dir = v / max(rv, 1e-3)`), at `stack.wrela:79`,
+the crags its direction drives.
+
+Not yet: a steepness the compiler derives instead of one the author states (a pass over the
+field's operations, `ir::derive`), which would make the stated number go away rather than be
+checked.
+
 ## The layers
 
 Dependencies point down. Nothing below knows anything above.
