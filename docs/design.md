@@ -1107,6 +1107,32 @@ against a frame's budget on the slowest machine): the dispatches' sizes are the 
 (`most:`), so today a dispatch too heavy for a machine is found when that machine first runs it
 (the certificates' slices on the Radeon).
 
+### Coverage gaps measured, not closed (2026-11-23)
+
+**Measured and not kept: solving the bricks a mesh cut short leaves out.** An extraction that
+meshes fewer active bricks than it found (its chunks cut short by the frame's dispatch budget, or
+more active than the last readback said) draws what it has, and the rest is drawn by nothing
+until a later frame. Each such brick as one exact cell the size of the brick (`box_unmeshed`):
+with the budget starved to 200 indirect dispatches a frame at 320x180, the stack's cut frames went
+from 544,801 cracks to 4,073. But a cold frame of the citadel at 1080p (its chunks capped at 16)
+boxed tens of thousands of bricks, and the exact pass held the M4 65 ms in one draw: the host
+stopped the run (AGENTS.md rule 2). A fallback that solves by the pixel whatever is missing costs
+what is missing, with no bound; a mesh cut short has to keep its last whole mesh instead (double
+buffering), which isn't built.
+
+**Open: the crowd's shared mesh has no exact cells.** At 320x180, eye 4 of the citadel's gate
+with the crowd behind it leaves 14 cracks on a distant crowd member (neither Hi-Z nor frustum
+culling: each switched off, the 14 stay); the shared mesh is one rest-pose template drawn per
+body, and its outline has nothing to certify or solve it. Covering it needs exact cells for an
+instanced template (each body's outline cells, posed, solved against its own field), which isn't
+built.
+
+**Not done: affine rules for `max` and `min` that keep a box-built field's slopes where a box
+straddles its face.** The compiler's affine forms keep one error term (AF1): a nonlinear
+operation's error joins it, so `length(max(q, 0))` and `min(max(q), 0)`, whose straddles cancel
+exactly, can't be made to cancel there; it needs an error symbol for each such operation (full
+affine arithmetic), which the certificates' scoreboard would measure.
+
 ## The layers
 
 Dependencies point down. Nothing below knows anything above.
