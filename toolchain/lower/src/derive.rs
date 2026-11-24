@@ -44,7 +44,7 @@ pub(crate) fn call(
             (substs[0], substs.get(1).copied())
         }
         DeriveKind::AffineForm | DeriveKind::Lipschitz => (substs[0], None),
-        DeriveKind::Filtered => (substs[0], None),
+        DeriveKind::Filtered => (substs[0], substs.get(1).copied()),
         // `gradient<const N>`: the literals' type and the result's are the call's.
         DeriveKind::Literals => {
             let which = fl.place_src_ty(c.args[1].place()?);
@@ -162,12 +162,12 @@ pub(crate) fn signature(cx: &mut Cx, mb: &mut ModuleBuilder, key: &InstanceKey) 
             ir::Function::new("value_and_gradient", params, None)
         }
         DeriveKind::Filtered => {
-            let f32 = mb.m.types.f32();
+            let r = output.and_then(|o| cx.lower_ty(mb, o, span));
             if let Some(x) = x {
                 params.push(ir::Param::value("x", x));
                 params.push(ir::Param::value("width", x));
             }
-            ir::Function::new("filtered", params, Some(f32))
+            ir::Function::new("filtered", params, r)
         }
         // `input` is the literals' array type.
         DeriveKind::Literals => {

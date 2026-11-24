@@ -15,8 +15,10 @@ use mesh::light::{
     spec_cone, sun_shadow_hybrid, sun_vis_point, trace_ssr,
 }
 use mesh::proof::{
-    CellRay, discard_proven, prove_box_unseen, prove_opaque_only, prove_point_behind_opaque,
-    prove_transmissive_only, ray_box_bracket, seen_part, solve_cell_ray, solve_cell_ray_lipschitz,
+    CellRay, FilteredSubstance, clamp_footprint_vec, discard_proven, filter_channels,
+    filter_channels_kept, filter_rest_channels, pixel_tangent_footprint, prove_box_unseen,
+    prove_opaque_only, prove_point_behind_opaque, prove_transmissive_only, prove_vertex_filtered,
+    ray_box_bracket, seen_part, solve_cell_ray, solve_cell_ray_lipschitz,
 }
 use mesh::sdf::{SdfGrid, multi_bounce_ao, sdf_bent_ao, sdf_curvature, sdf_thickness}
 use mesh::tsr::project_uv_unjittered
@@ -525,7 +527,7 @@ pub(package) fn shade_gbuf_rigid(
     face_n: vec3,
     normal: vec3,
     smooth: f32,
-    sub0: Substance,
+    sub_f: FilteredSubstance,
     v: View,
     prev_v: View,
     facts: FieldFacts = FieldFacts::unknown(),
@@ -535,7 +537,7 @@ pub(package) fn shade_gbuf_rigid(
     dbx: f32 = 0.0,
     dby: f32 = 0.0,
 ) -> Targets4<vec4, vec4, vec4, vec2> {
-    let sub_in = sanitize_substance(sub0, facts)
+    let sub_in = sanitize_substance(sub_f.sub, facts)
     let to_eye = v.at - wp
     let dist = length(to_eye)
     let ray_back = UnitNormal::normalize_safe(to_eye, -v.forward).v
@@ -592,12 +594,12 @@ pub(package) fn shade_gbuf_exact(
     face_n: vec3,
     normal: vec3,
     smooth: f32,
-    sub0: Substance,
+    sub_f: FilteredSubstance,
     v: View,
     prev_v: View,
     facts: FieldFacts = FieldFacts::unknown(),
 ) -> Targets4<vec4, vec4, vec4, vec2> {
-    let sub_in = sanitize_substance(sub0, facts)
+    let sub_in = sanitize_substance(sub_f.sub, facts)
     let to_eye = v.at - wp
     let dist = length(to_eye)
     let ray_back = UnitNormal::normalize_safe(to_eye, -v.forward).v
@@ -646,13 +648,13 @@ fn shade_gbuf_core(
     mp: vec3,
     normal: vec3,
     smooth: f32,
-    sub0: Substance,
+    sub_f: FilteredSubstance,
     v: View,
     prev_v: View,
     facts: FieldFacts = FieldFacts::unknown(),
     exact_normal: bool = false,
 ) -> Targets4<vec4, vec4, vec4, vec2> {
-    let sub_in = sanitize_substance(sub0, facts)
+    let sub_in = sanitize_substance(sub_f.sub, facts)
     let to_eye = v.at - wp
     let dist = length(to_eye)
     let ray_back = UnitNormal::normalize_safe(to_eye, -v.forward).v
@@ -708,7 +710,10 @@ pub(package) fn field_gbuf_many_fs<M: Field<Substance>>(
 ) -> Targets4<vec4, vec4, vec4, vec2> {
     let tid = min(u32(max(vary.meta.y, 0.0)), n_fields - 1)
     let f = fields[tid]
-    let sub0 = f.channels(vary.wp)
+    let max_fp = max(length(v.at - vary.wp) * v.pixel() * 6.0, 1.0e-4)
+    let dwx = clamp_footprint_vec(dpdx(vary.wp), max_fp)
+    let dwy = clamp_footprint_vec(dpdy(vary.wp), max_fp)
+    let sub0 = filter_channels(f, vary.wp, dwx, dwy)
     shade_gbuf_core(
         vary.wp,
         vary.prev_wp,
@@ -734,7 +739,10 @@ pub(package) fn field_skin_gbuf_many_fs<M: Field<Substance>>(
 ) -> Targets4<vec4, vec4, vec4, vec2> {
     let tid = min(u32(max(vary.meta.y, 0.0)), n_fields - 1)
     let f = fields[tid]
-    let sub0 = f.rest_channels(vary.rest_p)
+    let max_fp = max(length(v.at - vary.wp) * v.pixel() * 6.0, 1.0e-4)
+    let dmx = clamp_footprint_vec(dpdx(vary.rest_p), max_fp)
+    let dmy = clamp_footprint_vec(dpdy(vary.rest_p), max_fp)
+    let sub0 = filter_rest_channels(f, vary.rest_p, dmx, dmy)
     shade_gbuf_core(
         vary.wp,
         vary.prev_wp,
@@ -761,9 +769,12 @@ pub(package) fn field_skin_cut_gbuf_many_fs<M: Field<Substance>>(
     let tid = min(u32(max(vary.meta.y, 0.0)), n_fields - 1)
     let f = fields[tid]
     let facts = f.field_facts()
-    let sub0 = f.rest_channels(vary.rest_p)
+    let max_fp = max(length(v.at - vary.wp) * v.pixel() * 6.0, 1.0e-4)
+    let dmx = clamp_footprint_vec(dpdx(vary.rest_p), max_fp)
+    let dmy = clamp_footprint_vec(dpdy(vary.rest_p), max_fp)
+    let sub0 = filter_rest_channels(f, vary.rest_p, dmx, dmy)
     if facts.may_transmit {
-        match prove_transmissive_only(sub0) {
+        match prove_transmissive_only(sub0.sub) {
             Some(p) => discard_proven(p),
             None => {},
         }
@@ -923,15 +934,22 @@ pub(package) fn exact_box_one_fs<M: Field<Substance>>(
         },
     }
     let hit_p = v.at + d * t_hit
-    let sub0 = field.channels(hit_p)
+    let (_, gv) = value_and_gradient(|q: vec3| field.distance_live(q, live), hit_p)
+    let n = UnitNormal::normalize_safe(gv, -d).v
+    let (fp_x, fp_y) = pixel_tangent_footprint(v, frag.position.xy, hit_p, n)
+    let sub0 = if field.uses_kept() {
+        let (_, part) = field.part_at(hit_p)
+        let kept = field.kept(hit_p, part)
+        filter_channels_kept(field, hit_p, part, kept, fp_x, fp_y)
+    } else {
+        filter_channels(field, hit_p, fp_x, fp_y)
+    }
     if facts.may_transmit {
-        match prove_transmissive_only(sub0) {
+        match prove_transmissive_only(sub0.sub) {
             Some(proof) => discard_proven(proof),
             None => {},
         }
     }
-    let (_, gv) = value_and_gradient(|q: vec3| field.distance_live(q, live), hit_p)
-    let n = UnitNormal::normalize_safe(gv, -d).v
     let out = shade_gbuf_core(hit_p, hit_p, hit_p, n, 1.0, sub0, v, prev_v, facts, exact_normal: true)
     WithDepthBehind { color: out, depth: depth_of(v, hit_p) }
 }
@@ -945,7 +963,7 @@ pub(package) fn mesh_gbuf_fs(vary: MeshVary, v: View, prev_v: View) -> Targets4<
         vary.wp,
         vary.normal,
         vary.pbr.w,
-        vary_substance(vary),
+        prove_vertex_filtered(vary_substance(vary)),
         v,
         prev_v,
     )

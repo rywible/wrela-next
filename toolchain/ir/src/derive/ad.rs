@@ -162,8 +162,8 @@ impl Variant {
 /// A footprint narrower than this is a point: the builtin's own value is kept.
 const NARROWEST: f64 = 1.0e-6;
 
-/// The builtins a filtering derivation box-filters: those that jump (or kink, for `abs`,
-/// `min`, `max` and the clamps), where a point sample aliases.
+/// The builtins a filtering derivation box-filters: those that jump, kink, oscillate, or transition
+/// steeply (`fract`..`saturate`, `sin`, `cos`, `smoothstep`), where a point sample aliases.
 fn filters(b: Builtin) -> bool {
     use Builtin as B;
     matches!(
@@ -180,6 +180,9 @@ fn filters(b: Builtin) -> bool {
             | B::Max
             | B::Clamp
             | B::Saturate
+            | B::Sin
+            | B::Cos
+            | B::Smoothstep
     )
 }
 
@@ -187,7 +190,7 @@ fn filters(b: Builtin) -> bool {
 /// box-filtered over a footprint `width` wide along each of `x`'s components (`filtered`,
 /// language.md §14): forward-mode differentiation with each direction's seed its width, so
 /// every value's tangents span its range over the footprint (to first order), and each
-/// discontinuous builtin's value replaced by its average over that range.
+/// aliasing builtin or lattice noise is replaced by its filtered average over that range.
 pub(super) fn filtered_value(
     m: &mut Module,
     cache: &mut DeriveCache,
@@ -200,9 +203,14 @@ pub(super) fn filtered_value(
     let x_ty = func.params.get(xi).ok_or_else(|| Error::internal("no input parameter"))?.ty;
     let n = dims(m, x_ty)?;
     let f32 = m.types.f32();
-    if func.ret != Some(f32) || func.ret_ref {
-        return Err(Error::not_derivable("`filtered` needs a function that returns an `f32`"));
+    if func.ret_ref {
+        return Err(Error::not_derivable(
+            "`filtered` needs a function that returns a value, not a reference",
+        ));
     }
+    let Some(ret_ty) = func.ret else {
+        return Err(Error::not_derivable("`filtered` needs a function that returns a value"));
+    };
     let mut mask = vec![0; func.params.len()];
     mask[xi] = all_bits(&m.types, x_ty);
     let d = derive(m, cache, f, mask.clone(), n, target, Variant::Filtered)?;
@@ -210,7 +218,7 @@ pub(super) fn filtered_value(
     let mut params = func.params.clone();
     let width_param = params.len() as u32;
     params.push(Param::value("width", x_ty));
-    let mut g = Function::new(format!("{}_filtered", func.name), params, Some(f32));
+    let mut g = Function::new(format!("{}_filtered", func.name), params, Some(ret_ty));
     let mut body = Vec::new();
     let args: Vec<Arg> = (0..func.params.len() as u32).map(|i| g.param_arg(i, &mut body)).collect();
     let width = g.let_(&mut body, x_ty, Expr::Param(width_param));
@@ -224,7 +232,7 @@ pub(super) fn filtered_value(
         let comps = (0..n).map(|c| if c == k { wk } else { zero }).collect();
         g.let_(body, x_ty, Expr::Construct(x_ty, comps))
     })?;
-    let value = if returns { g.let_(&mut body, f32, Expr::Extract(r, 0)) } else { r };
+    let value = if returns { g.let_(&mut body, ret_ty, Expr::Extract(r, 0)) } else { r };
     body.push(Stmt::Return(Some(value)));
     g.body = body;
     Ok(m.add_function(g))
@@ -770,6 +778,73 @@ impl Ad<'_> {
             out.push(let_or_eval(v, Expr::Call(g, args.to_vec())));
             return Ok(());
         }
+        if self.filter
+            && let (Some(v), true) = (v, returns)
+            && self.m.functions[g.index()].known == Some(Known::ValueNoise)
+            && args.len() == 1
+        {
+            // Box-filtered `value_noise(p)`: keep lattice coordinates exact via `Variant::Point`
+            // (so `floor(p)` inside `value_noise` never fractionalises before hashing), and fade
+            // both value and tangents smoothly to the analytic mean (0.0) as the widest per-axis
+            // lattice footprint crosses Nyquist [0.35, 1.5] cells.
+            let at = self.track.at;
+            let dg =
+                derive(self.m, self.cache, g, mask.clone(), self.n, self.target, Variant::Point)
+                    .map_err(|e| e.through(at))?;
+            let p_ty = self.m.functions[g.index()].params[0].ty;
+            let mut new_args = vec![args[0].clone()];
+            let mut w_sum: Option<ValueId> = None;
+            for k in 0..self.n as usize {
+                let (arg_k, tk_val) = match &args[0] {
+                    Arg::Value(x) => {
+                        let tv = self.t(*x, k);
+                        (Arg::Value(self.tangent_or_zero(out, tv, p_ty)), tv)
+                    }
+                    Arg::Place(pl) => {
+                        let tpl = self.place(pl, k)?;
+                        let tv = self.emit(out, p_ty, Expr::Load(tpl.clone()));
+                        (Arg::Place(tpl), Some(tv))
+                    }
+                };
+                new_args.push(arg_k);
+                if let Some(tk) = tk_val {
+                    let size = self.builtin(out, Builtin::Abs, vec![tk], p_ty);
+                    w_sum = Some(match w_sum {
+                        None => size,
+                        Some(s) => self.bin(out, BinOp::Add, s, size, p_ty),
+                    });
+                }
+            }
+            let dual = self.m.functions[dg.index()]
+                .ret
+                .ok_or_else(|| Error::internal("a missing result type"))?;
+            let r = self.emit(out, dual, Expr::Call(dg, new_args));
+            let ty = self.ty(v);
+            let raw_v = self.emit(out, ty, Expr::Extract(r, 0));
+            let atten = if let Some(w_vec) = w_sum {
+                let wx = self.emit(out, ty, Expr::Extract(w_vec, 0));
+                let wy = self.emit(out, ty, Expr::Extract(w_vec, 1));
+                let wz = self.emit(out, ty, Expr::Extract(w_vec, 2));
+                let wxy = self.builtin(out, Builtin::Max, vec![wx, wy], ty);
+                let wmax = self.builtin(out, Builtin::Max, vec![wxy, wz], ty);
+                let lo = self.fc(out, ty, 0.35);
+                let hi = self.fc(out, ty, 1.5);
+                let one = self.fc(out, ty, 1.0);
+                let fade = self.builtin(out, Builtin::Smoothstep, vec![lo, hi, wmax], ty);
+                self.bin(out, BinOp::Sub, one, fade, ty)
+            } else {
+                self.fc(out, ty, 1.0)
+            };
+            out.push(Stmt::Let(v, Expr::Binary(BinOp::Mul, raw_v, atten)));
+            let mut ts = Vec::new();
+            for k in 0..self.n as usize {
+                let dt = self.emit(out, ty, Expr::Extract(r, 1 + k as u32));
+                let adt = self.bin(out, BinOp::Mul, dt, atten, ty);
+                ts.push(Some(adt));
+            }
+            self.tv.insert(v, ts);
+            return Ok(());
+        }
         if self.bounds
             && let (Some(v), true) = (v, returns)
             && self.m.functions[g.index()].known == Some(Known::Smin)
@@ -974,6 +1049,14 @@ impl Ad<'_> {
                 (l, h) => l.or(h),
             };
             (w, Some((wl, wh)))
+        } else if b == B::Smoothstep {
+            let wl = self.footprint(out, args[2], Some(args[0]), ty);
+            let wh = self.footprint(out, args[2], Some(args[1]), ty);
+            let w = match (wl, wh) {
+                (Some(l), Some(h)) => Some(self.builtin(out, B::Max, vec![l, h], ty)),
+                (l, h) => l.or(h),
+            };
+            (w, None)
         } else {
             (self.footprint(out, a, minus, ty), None)
         };
@@ -1052,6 +1135,52 @@ impl Ad<'_> {
                 let k = self.bin(out, BinOp::Sub, kl, kh, ty);
                 let k = self.bin(out, BinOp::Mul, k, half, ty);
                 self.bin(out, BinOp::Add, own, k, ty)
+            }
+            B::Sin | B::Cos => {
+                // Exact box integral over [x - w/2, x + w/2]: sin(x)*sinc(w/2), cos(x)*sinc(w/2).
+                let h = self.bin(out, BinOp::Mul, w, half, ty);
+                let sh = self.builtin(out, B::Sin, vec![h], ty);
+                let sinc = self.bin(out, BinOp::Div, sh, h, ty);
+                self.bin(out, BinOp::Mul, own, sinc, ty)
+            }
+            B::Smoothstep => {
+                // Exact analytical box integral of smoothstep(e0, e1, x) over [x - w/2, x + w/2],
+                // factored to avoid cancellation for small w and large |u|:
+                //   ∫ S(t) dt = C(saturate(t)) + max(t - 1, 0),  C(c) = c³ - c⁴/2.
+                let (e0, e1, xv) = (args[0], args[1], args[2]);
+                let zero = self.zero(out, ty);
+                let two = self.fc(out, ty, 2.0);
+                let span = self.bin(out, BinOp::Sub, e1, e0, ty);
+                let aspan = self.builtin(out, B::Abs, vec![span], ty);
+                let safe_aspan = self.widened(out, aspan, ty);
+                let pos = self.builtin(out, B::Step, vec![zero, span], ty);
+                let sgn2 = self.bin(out, BinOp::Mul, pos, two, ty);
+                let sgn = self.bin(out, BinOp::Sub, sgn2, one, ty);
+                let safe_span = self.bin(out, BinOp::Mul, sgn, safe_aspan, ty);
+                let xe = self.bin(out, BinOp::Sub, xv, e0, ty);
+                let u = self.bin(out, BinOp::Div, xe, safe_span, ty);
+                let wu = self.bin(out, BinOp::Div, w, safe_aspan, ty);
+                let wu = self.widened(out, wu, ty);
+                let hw = self.bin(out, BinOp::Mul, wu, half, ty);
+                let ua = self.bin(out, BinOp::Sub, u, hw, ty);
+                let ub = self.bin(out, BinOp::Add, u, hw, ty);
+                let ca = self.builtin(out, B::Saturate, vec![ua], ty);
+                let cb = self.builtin(out, B::Saturate, vec![ub], ty);
+                let dc = self.bin(out, BinOp::Sub, cb, ca, ty);
+                let frac = self.bin(out, BinOp::Div, dc, wu, ty);
+                let ca2 = self.bin(out, BinOp::Mul, ca, ca, ty);
+                let cb2 = self.bin(out, BinOp::Mul, cb, cb, ty);
+                let cab = self.bin(out, BinOp::Mul, ca, cb, ty);
+                let sum_sq = self.bin(out, BinOp::Add, ca2, cb2, ty);
+                let q1 = self.bin(out, BinOp::Add, sum_sq, cab, ty);
+                let sum_c = self.bin(out, BinOp::Add, ca, cb, ty);
+                let q2 = self.bin(out, BinOp::Mul, sum_c, sum_sq, ty);
+                let q2 = self.bin(out, BinOp::Mul, q2, half, ty);
+                let poly = self.bin(out, BinOp::Sub, q1, q2, ty);
+                let curved = self.bin(out, BinOp::Mul, frac, poly, ty);
+                let um1 = self.bin(out, BinOp::Sub, u, one, ty);
+                let ramp = self.filtered_step(out, um1, wu, ty);
+                self.bin(out, BinOp::Add, curved, ramp, ty)
             }
             _ => own,
         };

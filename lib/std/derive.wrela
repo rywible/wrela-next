@@ -571,16 +571,17 @@ pub fn precision_note(
 
 /// `f(at)` box-filtered over a footprint `width` wide along each of `at`'s components (a pixel's
 /// spread in `f`'s input, say): each `fract`, `floor`, `ceil`, `round`, `trunc`, `step`, `sign`,
-/// `abs`, `min`, `max`, `clamp` and `saturate` on the input's path is replaced by its average
-/// over the range its operand spans in the footprint (to first order: the operand's derivative
-/// along each component, times the width there, summed in size). A point sample of a stripe or
-/// a checker aliases where its stripes are finer than a pixel; this one fades them to their
-/// mean. What a branch on the input chooses isn't filtered: write it with `step` or `mix`. Each
-/// value is averaged alone, to first order: a product of patterns along different components
-/// averages exactly, but `abs` of a difference of two averaged patterns doesn't (a checker is
-/// best a product of its stripes).
+/// `abs`, `min`, `max`, `clamp`, `saturate`, `sin`, `cos`, `smoothstep`, and `value_noise` on the
+/// input's path is replaced by its filtered average over the range its operand spans in the
+/// footprint (to first order: the operand's derivative along each component, times the width there,
+/// summed in size). Works for any value-returning `Y` (`f32`, vectors, structs such as `Substance`).
+/// A point sample of stripes, rings, or noise finer than a pixel aliases; this fades them to their
+/// mean. What a branch on the input chooses isn't filtered: write it with `step`, `smoothstep` or
+/// `mix`. Each value is averaged alone, to first order: a product of patterns along different
+/// components averages exactly, but `abs` of a difference of two averaged patterns doesn't (a
+/// checker is best a product of its stripes).
 @intrinsic
-pub fn filtered<X: Domain>(f: fn(X) -> f32, at: X, width: X) -> f32 {}
+pub fn filtered<X: Domain, Y>(f: fn(X) -> Y, at: X, width: X) -> Y {}
 
 /// The tape of `f` (`std::stage`): its body as a run of the tape's operations, built once, on
 /// the CPU, for a GPU kernel or the CPU to interpret. What doesn't depend on the point (a part's
@@ -819,6 +820,62 @@ fn filtered_builtins_are_their_footprints_average() {
     near(filtered(sign_of, at: 0.25, width: 1.0), 0.5, "sign beside 0")
     let step_of = |u: f32| step(0.0, u)
     near(filtered(step_of, at: 0.25, width: 1.0), 0.75, "step beside 0")
+}
+
+struct FilteredSample: Copy {
+    rgb: vec3,
+    rough: f32,
+    tag: u32,
+}
+
+@test
+fn filtered_sin_cos_smoothstep_and_structs_match_box_integral() {
+    let f_sin = |u: f32| sin(u * 6.0)
+    let f_cos = |u: f32| cos(u * 5.0 + 0.3)
+    let f_ss = |u: f32| smoothstep(0.2, 0.8, u)
+    let f_ss_rev = |u: f32| smoothstep(0.8, 0.2, u)
+    let f_ss_steep = |u: f32| smoothstep(0.0, 0.002, u)
+    // Zero width keeps exact point value.
+    assert(filtered(f_sin, 0.37, 0.0) == f_sin(0.37), "sin w=0")
+    assert(filtered(f_cos, 0.37, 0.0) == f_cos(0.37), "cos w=0")
+    assert(filtered(f_ss, 0.37, 0.0) == f_ss(0.37), "smoothstep w=0")
+    assert(filtered(f_ss_rev, 0.37, 0.0) == f_ss_rev(0.37), "rev smoothstep w=0")
+    // Analytic box integral matches 4096-sample mean across small and large widths.
+    for x in [-0.7, 0.0, 0.25, 0.5, 0.9, 2.3] {
+        for w in [0.005, 0.08, 0.5, 2.0, 7.0] {
+            let ms = mean_over(f_sin, x, w, 4096)
+            let mc = mean_over(f_cos, x, w, 4096)
+            let mss = mean_over(f_ss, x, w, 4096)
+            let msr = mean_over(f_ss_rev, x, w, 4096)
+            let mst = mean_over(f_ss_steep, x, w, 4096)
+            assert(abs(filtered(f_sin, x, w) - ms) < 2.0e-3, f"sin ({x}, {w})")
+            assert(abs(filtered(f_cos, x, w) - mc) < 2.0e-3, f"cos ({x}, {w})")
+            assert(abs(filtered(f_ss, x, w) - mss) < 2.0e-3, f"ss ({x}, {w})")
+            assert(abs(filtered(f_ss_rev, x, w) - msr) < 2.0e-3, f"ss_rev ({x}, {w})")
+            assert(abs(filtered(f_ss_steep, x, w) - mst) < 2.0e-3, f"ss_steep ({x}, {w})")
+        }
+    }
+    // Arbitrary return types (vec3 and struct with non-float field).
+    let f_vec = |p: vec2| vec3(sin(p.x * 20.0), cos(p.y * 20.0), smoothstep(0.0, 0.1, p.x))
+    let v_far = filtered(f_vec, vec2(0.05, 0.05), vec2(10.0, 10.0))
+    assert(abs(v_far.x) < 0.05 && abs(v_far.y) < 0.05 && abs(v_far.z - 0.5) < 0.02, f"vec3 {v_far}")
+    let f_struct = |p: vec2| FilteredSample {
+        rgb: vec3(0.5 + 0.5 * sin(p.x * 50.0), 0.4, 0.5 + 0.5 * cos(p.y * 50.0)),
+        rough: 0.2 + 0.6 * step(0.5, fract(p.x * 10.0)),
+        tag: 7,
+    }
+    let s_pt = filtered(f_struct, vec2(0.13, 0.27), vec2(0.0))
+    let s_raw = f_struct(vec2(0.13, 0.27))
+    assert(s_pt.rgb == s_raw.rgb && s_pt.rough == s_raw.rough && s_pt.tag == 7, "struct w=0")
+    let s_far = filtered(f_struct, vec2(0.13, 0.27), vec2(4.0, 4.0))
+    assert(
+        abs(s_far.rgb.x - 0.5) < 0.05 &&
+            abs(s_far.rgb.y - 0.4) < 1.0e-5 &&
+            abs(s_far.rgb.z - 0.5) < 0.05 &&
+            abs(s_far.rough - 0.5) < 0.05 &&
+            s_far.tag == 7,
+        f"struct far {s_far.rgb} {s_far.rough} {s_far.tag}",
+    )
 }
 
 @test

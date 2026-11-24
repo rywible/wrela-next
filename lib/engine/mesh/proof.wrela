@@ -16,7 +16,8 @@
 //     heuristic minimum step) or by compiler-derived IEEE-754-sound 1D `std::derive::affine`.
 
 use matter::substance::{Substance, lambert}
-use std::derive::{Interval, affine_form}
+use picture::eye::View
+use std::derive::{Interval, affine_form, filtered}
 use std::field::{ALL_LIVE, Field, Live, Surface, fbm, round_cone, sphere}
 use std::gpu::discard
 use std::mem::size_of
@@ -181,6 +182,151 @@ pub fn prove_vis_not_batch(vis_header: u32, batch_id: u32) -> Option<EmptyProof>
 /// The only place in `lib/engine/` permitted to invoke `std::gpu::discard()`.
 pub fn discard_proven(_proof: EmptyProof) {
     discard()
+}
+
+/// Unforgeable zero-sized proof token witnessing that a `Substance` was evaluated through
+/// compiler-derived Nyquist filtering (`std::derive::filtered` over the pixel's screen-space
+/// tangent footprint), proven spatially constant (`has_constant_channels()`), or pre-bandlimited
+/// by vertex interpolation. Erases to 0 bytes across CPU, Metal, and SPIR-V.
+pub struct FilteredProof: Copy {
+    seal: (),
+}
+
+/// A `Substance` paired with its zero-byte `FilteredProof` witness. All G-buffer shading entry
+/// points accept `FilteredSubstance` rather than raw `Substance`, making unfiltered procedural
+/// channel shading structurally unconstructable.
+pub struct FilteredSubstance: Copy {
+    pub sub: Substance,
+    pub proof: FilteredProof,
+}
+
+/// Placeholder `FilteredSubstance` for inactive visibility-buffer quad lanes that are discarded
+/// immediately after hardware quad derivatives finish.
+pub fn unshaded_filtered_placeholder() -> FilteredSubstance {
+    FilteredSubstance {
+        sub: Substance {
+            albedo: vec3(0.5),
+            roughness: 0.5,
+            emits: vec3(0.0),
+            metallic: 0.0,
+            ior: 1.5,
+            transmission: 0.0,
+            subsurface: 0.0,
+            coat: 0.0,
+            micro: 0.0,
+            bump: 0.0,
+            pad1: 0.0,
+            pad2: 0.0,
+        },
+        proof: FilteredProof { seal: () },
+    }
+}
+
+/// Witnesses a vertex-interpolated `Substance` (e.g. terrain `MeshVary`) already band-limited by
+/// mesh vertex spacing rather than high-frequency per-fragment procedural evaluation.
+pub fn prove_vertex_filtered(sub: Substance) -> FilteredSubstance {
+    FilteredSubstance { sub, proof: FilteredProof { seal: () } }
+}
+
+/// Analytic world-space pixel tangent-plane footprint `(dwx, dwy)` at surface hit `wp` with
+/// normal `n_raw`, computed directly from perspective camera `v` and pixel center `frag_xy`.
+/// Zero 2×2 quad-derivative dependency (safe after `discard_proven`) and clamped to <= 6.7×
+/// grazing anisotropy so silhouette edges never diverge.
+pub fn pixel_tangent_footprint(v: View, frag_xy: vec2, wp: vec3, n_raw: vec3) -> (vec3, vec3) {
+    let w = max(v.size.x, 1.0)
+    let h = max(v.size.y, 1.0)
+    let aspect = h / w
+    let fx = max(v.focal * aspect, 1.0e-6)
+    let fy = max(v.focal, 1.0e-6)
+    let x_ndc = 2.0 * frag_xy.x / w - 1.0
+    let y_ndc = 1.0 - 2.0 * frag_xy.y / h
+    let jx = 2.0 * v.jitter.x / w
+    let jy = 2.0 * v.jitter.y / h
+    let r = v.forward + v.right * ((x_ndc + jx) / fx) + v.up * ((y_ndc - jy) / fy)
+    let dr_dx = v.right * (2.0 / (w * fx))
+    let dr_dy = -v.up * (2.0 / (h * fy))
+    let z = max(dot(wp - v.at, v.forward), 1.0e-4)
+    let nl2 = dot(n_raw, n_raw)
+    let n = if nl2 > 1.0e-12 { n_raw * (1.0 / sqrt(nl2)) } else { -v.forward }
+    let rn_raw = dot(r, n)
+    let min_rn = 0.15 * length(r)
+    let rn = if abs(rn_raw) >= min_rn {
+        rn_raw
+    } else if rn_raw < 0.0 {
+        -min_rn
+    } else {
+        min_rn
+    }
+    let inv_rn = 1.0 / rn
+    let dwx = (dr_dx - r * (dot(dr_dx, n) * inv_rn)) * z
+    let dwy = (dr_dy - r * (dot(dr_dy, n) * inv_rn)) * z
+    (dwx, dwy)
+}
+
+/// Clamps a screen-space derivative vector so depth discontinuities across 2×2 quads never blow
+/// up the filter footprint.
+pub fn clamp_footprint_vec(d: vec3, max_len: f32) -> vec3 {
+    let l2 = dot(d, d)
+    if l2 > max_len * max_len { d * (max_len / sqrt(l2)) } else { d }
+}
+
+/// Evaluates `field.channels` through compiler-derived anisotropic 2D Nyquist filtering over the
+/// pixel's tangent-plane footprint `(dwx, dwy)`. When `field.has_constant_channels()` is statically
+/// true, constant folding erases the filter completely (0 extra GPU instructions).
+pub fn filter_channels<M: Field<Substance>>(
+    field: M,
+    wp: vec3,
+    dwx: vec3,
+    dwy: vec3,
+) -> FilteredSubstance {
+    let sub = if field.has_constant_channels() {
+        field.channels(wp)
+    } else {
+        filtered(|uv: vec2| field.channels(wp + dwx * uv.x + dwy * uv.y), vec2(0.0), vec2(1.0))
+    }
+    FilteredSubstance { sub, proof: FilteredProof { seal: () } }
+}
+
+/// Evaluates `field.channels_kept` through compiler-derived anisotropic 2D Nyquist filtering over
+/// the pixel's tangent-plane footprint `(dwx, dwy)`.
+pub fn filter_channels_kept<M: Field<Substance>>(
+    field: M,
+    wp: vec3,
+    part: u32,
+    kept: vec4,
+    dwx: vec3,
+    dwy: vec3,
+) -> FilteredSubstance {
+    let sub = if field.has_constant_channels() {
+        field.channels_kept(wp, part, kept)
+    } else {
+        filtered(
+            |uv: vec2| field.channels_kept(wp + dwx * uv.x + dwy * uv.y, part, kept),
+            vec2(0.0),
+            vec2(1.0),
+        )
+    }
+    FilteredSubstance { sub, proof: FilteredProof { seal: () } }
+}
+
+/// Evaluates `field.rest_channels` through compiler-derived anisotropic 2D Nyquist filtering over
+/// the pixel's rest-pose tangent footprint `(dmx, dmy)` for skinned meshes.
+pub fn filter_rest_channels<M: Field<Substance>>(
+    field: M,
+    rest_p: vec3,
+    dmx: vec3,
+    dmy: vec3,
+) -> FilteredSubstance {
+    let sub = if field.has_constant_channels() {
+        field.rest_channels(rest_p)
+    } else {
+        filtered(
+            |uv: vec2| field.rest_channels(rest_p + dmx * uv.x + dmy * uv.y),
+            vec2(0.0),
+            vec2(1.0),
+        )
+    }
+    FilteredSubstance { sub, proof: FilteredProof { seal: () } }
 }
 
 /// Exact slab intersection of ray `(o, d)` with axis-aligned box `[lo, hi]`.
@@ -874,4 +1020,43 @@ fn ray_sphere_bracket_matches_exact_sphere() {
     assert(abs(hit.t_enter - 3.0) < 1.0e-4 && abs(hit.t_exit - 5.0) < 1.0e-4, "wrong sphere bracket")
     let miss = ray_sphere_bracket(vec3(1.1, 0.0, -4.0), fwd, fwd, vec3(0.0), 1.0)
     assert(miss.t_enter > miss.t_exit, "outside ray must miss sphere")
+}
+
+@test
+fn filtered_proof_is_zero_sized_and_cuts_nyquist_shimmer() {
+    assert(size_of::<FilteredProof>() == 0, "FilteredProof must erase to 0 bytes")
+    // High-frequency procedural gilded-lettering + oak-ring field evaluated across 32 distant
+    // pixels: compare unfiltered point samples vs. `filter_channels` against 64-sample brute-force
+    // box average over each pixel's tangent footprint.
+    let f = sphere(2.0).with_at(|p: vec3| -> Substance {
+        let rings = 0.5 + 0.5 * sin(p.x * 180.0 + 0.6 * std::field::value_noise(p * 30.0))
+        let stripe = smoothstep(0.45, 0.55, fract(p.y * 90.0))
+        lambert(vec3(0.15 + 0.7 * rings, 0.1 + 0.6 * stripe, 0.2))
+    })
+    let dwx = vec3(0.06, 0.0, 0.0)
+    let dwy = vec3(0.0, 0.06, 0.0)
+    var err_raw = 0.0
+    var err_flt = 0.0
+    for i in 0..32 {
+        let wp = vec3(-0.5 + f32(i) * 0.031, -0.3 + f32((i * 7) & 15) * 0.04, 1.8)
+        // 8×8 = 64-sample brute-force reference over [wp - 0.5*dwx - 0.5*dwy, wp + 0.5*dwx + 0.5*dwy].
+        var ref_col = vec3(0.0)
+        for sx in 0..8 {
+            for sy in 0..8 {
+                let u = (f32(sx) + 0.5) / 8.0 - 0.5
+                let v = (f32(sy) + 0.5) / 8.0 - 0.5
+                let s_ref = Field::<Substance>::channels(f, wp + dwx * u + dwy * v)
+                ref_col = ref_col + s_ref.albedo
+            }
+        }
+        ref_col = ref_col * (1.0 / 64.0)
+        let raw_col = Field::<Substance>::channels(f, wp).albedo
+        let flt_col = filter_channels(f, wp, dwx, dwy).sub.albedo
+        err_raw += length(raw_col - ref_col)
+        err_flt += length(flt_col - ref_col)
+    }
+    assert(
+        err_flt <= 0.35 * err_raw,
+        f"Nyquist error did not drop >=65%: filtered={err_flt}, raw={err_raw}",
+    )
 }
