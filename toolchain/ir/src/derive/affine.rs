@@ -81,7 +81,7 @@ pub(super) fn affine(
     (box_ty, interval_ty): (TypeId, TypeId),
 ) -> R<FuncId> {
     let plain = super::interval::interval(m, cache, f, ncap, target, (box_ty, interval_ty), None)?;
-    let func = m.functions[f.index()].clone_signature();
+    let func = m.functions[f.index()].derived_signature();
     let xi = ncap as usize;
     let x_ty = func.params[xi].ty;
     let n = match m.types.get(x_ty) {
@@ -226,7 +226,7 @@ fn derive(
     no_heap_store(&act)?;
     no_write_through_mut(&func, &act, &mask, "an affine form")?;
     let bool_ty = m.types.bool();
-    let mut nf = func.clone_signature();
+    let mut nf = func.derived_signature();
     nf.name = format!("{}_a{n}", func.name);
     let mut pparts: Vec<Vec<u32>> = vec![Vec::new(); func.params.len()];
     for (i, p) in func.params.iter().enumerate() {

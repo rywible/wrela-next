@@ -36,7 +36,7 @@ pub fn literal_gradient(
             "a parameter gradient takes at most 255 literals at once; ask in parts",
         ));
     }
-    let func = m.functions[f.index()].clone_signature();
+    let func = m.functions[f.index()].derived_signature();
     let value_t = match func.ret {
         Some(r) if !func.ret_ref => r,
         _ => {

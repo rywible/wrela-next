@@ -142,7 +142,7 @@ pub(super) fn tape(
         return Err(Error::not_tapeable("a tape is made on the CPU, once, and uploaded"));
     }
     let lay = Layout::of(&m.types, fns)?;
-    let func = m.functions[f.index()].clone_signature();
+    let func = m.functions[f.index()].derived_signature();
     let xi = ncap as usize;
     let x_ty = func.params.get(xi).ok_or_else(|| Error::internal("no input parameter"))?.ty;
     if m.types.get(x_ty) != &TypeDef::Vector(Scalar::F32, 3) {
@@ -536,7 +536,7 @@ pub(super) fn derive(
     }
     no_heap_store(&act)?;
     no_write_through_mut(&func, &act, &mask, "registers")?;
-    let mut nf = func.clone_signature();
+    let mut nf = func.derived_signature();
     nf.name = format!("{}_taped", func.name);
     let mut rparam: Vec<Option<u32>> = vec![None; func.params.len()];
     for (i, p) in func.params.iter().enumerate() {

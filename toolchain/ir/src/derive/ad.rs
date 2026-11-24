@@ -25,7 +25,7 @@ pub(super) fn value_and_gradient(
     target: Target,
     with: bool,
 ) -> Result<FuncId> {
-    let func = m.functions[f.index()].clone_signature();
+    let func = m.functions[f.index()].derived_signature();
     let xi = ncap as usize;
     let x_ty = func.params.get(xi).ok_or_else(|| Error::internal("no input parameter"))?.ty;
     let n = dims(m, x_ty)?;
@@ -195,7 +195,7 @@ pub(super) fn filtered_value(
     ncap: u32,
     target: Target,
 ) -> Result<FuncId> {
-    let func = m.functions[f.index()].clone_signature();
+    let func = m.functions[f.index()].derived_signature();
     let xi = ncap as usize;
     let x_ty = func.params.get(xi).ok_or_else(|| Error::internal("no input parameter"))?.ty;
     let n = dims(m, x_ty)?;
@@ -251,7 +251,7 @@ pub(super) fn derive(
     let act = body_activity(m, cache, f, &mask, Mode::Ad);
     no_heap_store(&act)?;
     no_write_through_mut(&func, &act, &mask, "a derivative")?;
-    let mut nf = func.clone_signature();
+    let mut nf = func.derived_signature();
     nf.name = format!("{}_{}{}", func.name, variant.suffix(), n);
     // Tangent parameters, appended: n per active parameter.
     let mut tparam: Vec<Vec<u32>> = vec![Vec::new(); func.params.len()];

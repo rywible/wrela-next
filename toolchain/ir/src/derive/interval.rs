@@ -67,7 +67,7 @@ pub(super) fn interval(
     (box_ty, interval_ty): (TypeId, TypeId),
     report: Option<Report>,
 ) -> R<FuncId> {
-    let func = m.functions[f.index()].clone_signature();
+    let func = m.functions[f.index()].derived_signature();
     let xi = ncap as usize;
     let x_ty = func.params.get(xi).ok_or_else(|| Error::internal("no input parameter"))?.ty;
     if !matches!(m.types.get(x_ty), TypeDef::Scalar(Scalar::F32) | TypeDef::Vector(Scalar::F32, _))
@@ -195,7 +195,7 @@ pub(super) fn derive(
     no_heap_store(&act)?;
     no_write_through_mut(&func, &act, &mask, "a range")?;
     no_half_ranges(m, &func, &act)?;
-    let mut nf = func.clone_signature();
+    let mut nf = func.derived_signature();
     nf.name = match report {
         Some(r) => format!("{}_iv{}", func.name, if r.half { 16 } else { 32 }),
         None => format!("{}_iv", func.name),

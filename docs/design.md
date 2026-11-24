@@ -1087,6 +1087,26 @@ Not yet: a field's high-frequency channels asked for their filtered form where a
 is wider than their detail (the `filtered` contract exists, unasked), and types that keep metres
 from pixels and linear colour from sRGB.
 
+### A field's cost is stated, and held at build (2026-11-23)
+
+Every field's `distance` now states its evaluation's work as `@budget(work: n)`, which the
+compiler holds it to (E0710, naming the calls that do the most of it: "`n01` 2418, `pick` 84" for
+the stack), and `tools/layers` (rule 7) refuses a field without one or with one past
+`FIELD_WORK_MOST` (4,096 units, about one 32-bit operation on one invocation each). The budgets,
+a quarter over what each does: the orb 16 (does 8), courtyard 128 (87), marble column 128 (103),
+flame and parry arc 160 (126, 118), brazier stands 640 (499), pillars 768 (547), citadel 896
+(704), stack 3,328 (2,631).
+
+A derived function (a field's interval, gradient or affine form) no longer inherits its source's
+budget (`Function::derived_signature`): a derivation does many times the work (the stack's
+interval of its gradient, 1,198,206), and is the cost of the pass that asks for it, which the GPU's
+guard bounds where it runs; held to the author's number, every field failed.
+
+Not yet: each pass's worst case at build (its kernels' work times the most it is dispatched over,
+against a frame's budget on the slowest machine): the dispatches' sizes are the CPU's at run time
+(`most:`), so today a dispatch too heavy for a machine is found when that machine first runs it
+(the certificates' slices on the Radeon).
+
 ## The layers
 
 Dependencies point down. Nothing below knows anything above.

@@ -843,6 +843,15 @@ impl Function {
         }
     }
 
+    /// [`Self::clone_signature`] for a function derived from this one (its interval, gradient,
+    /// affine form): without its `@budget`, which holds the author's own evaluation; what a
+    /// derivation costs is the pass's that asks for it, bounded where it runs (the GPU's guard).
+    pub fn derived_signature(&self) -> Function {
+        let mut f = self.clone_signature();
+        f.budget = None;
+        f
+    }
+
     /// Parameter `i` passed on as a call's argument: its place if it's by reference, else its
     /// value, read in `body`.
     pub fn param_arg(&mut self, i: u32, body: &mut Block) -> Arg {
