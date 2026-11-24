@@ -219,8 +219,8 @@ pub fn eval_dqs(bones: [DualQuat], base: u32, packed_bones: u32, packed_weights:
 const CAP_SEAM: u32 = 131072
 /// Maximum seam cells refined per `refine_seam_creases` dispatch (keeps GPU work well under 50 ms).
 const SEAM_SLICE: u32 = 16384
-/// The slices of `SEAM_SLICE` seam cells a batch's seams are emitted in (and its exact cells'
-/// seam cells tested in).
+/// The most slices of `SEAM_SLICE` seam cells a batch's seams are solved, refined and boxed in
+/// (`seam_slices`: as many as its last readback says).
 const SEAM_SLICES: u32 = 16
 /// Maximum nested 2:1 LOD levels in a single `MeshBatch` (7 levels = up to 64× resolution ratio).
 const MAX_LOD_LEVELS: u32 = 7
@@ -240,7 +240,8 @@ pub const OVERFLOW_EXACT: u32 = 128
 pub const OVERFLOW_NEAR: u32 = 256
 /// A chunk had more candidate cells for exact cells (thin, beside the outline, or on it) than its
 /// `filter_thin_cells` slices test (`THIN_SLICES · THIN_SLICE`) or its `certify_outline` slices
-/// certify (`CERT_SLICES · CERT_SLICE`): the rest were not tested.
+/// certify (`CERT_SLICES · CERT_SLICE`), or more seam cells than its seam slices take: the rest
+/// were not tested.
 pub const OVERFLOW_THIN: u32 = 512
 
 /// Maximum `ExactCell` AABB shells per batch (32 B each = 8 MB max, allocated as needed).
@@ -1943,9 +1944,12 @@ fn classify_cells(
 /// Counts in `tri_count[9]` a chunk's candidates past what its `filter_thin_cells` slices test
 /// (`OVERFLOW_THIN`, raised by `finish_draw`).
 @compute(64)
-fn note_untested(thin_count: [u32], tri_count: mut Atomics<u32>, id: GlobalId) {
-    if id.x == 0 && thin_count[0] > THIN_SLICES * THIN_SLICE {
-        let _ = tri_count.add(i: 9, value: thin_count[0] - THIN_SLICES * THIN_SLICE)
+fn note_untested(thin_count: [u32], slices: u32, tri_count: mut Atomics<u32>, id: GlobalId) {
+    if id.x == 0 {
+        let _ = tri_count.max(i: 10, value: thin_count[0])
+        if thin_count[0] > slices * THIN_SLICE {
+            let _ = tri_count.add(i: 9, value: thin_count[0] - slices * THIN_SLICE)
+        }
     }
 }
 
@@ -3072,12 +3076,27 @@ fn box_outline(
     }
 }
 
+/// Notes in `tri_count[12]` a batch's seam cells (`seam_slices`), and counts in `tri_count[9]` those
+/// past what its seam slices take (`OVERFLOW_THIN`: they were neither solved nor boxed).
+@compute(1)
+fn note_seams(seam_count: [u32], slices: u32, tri_count: mut Atomics<u32>, id: GlobalId) {
+    if id.x == 0 {
+        let _ = tri_count.max(i: 12, value: seam_count[0])
+        if seam_count[0] > slices * SEAM_SLICE {
+            let _ = tri_count.add(i: 9, value: seam_count[0] - slices * SEAM_SLICE)
+        }
+    }
+}
+
 /// Counts in `tri_count[9]` a batch's outline cells past what its `certify_outline` slices
 /// certify (`OVERFLOW_THIN`: those cells have neither a certificate nor an exact cell).
 @compute(1)
-fn note_uncertified(cert_count: [u32], tri_count: mut Atomics<u32>, id: GlobalId) {
-    if id.x == 0 && cert_count[0] > CERT_SLICES * CERT_SLICE {
-        let _ = tri_count.add(i: 9, value: cert_count[0] - CERT_SLICES * CERT_SLICE)
+fn note_uncertified(cert_count: [u32], slices: u32, tri_count: mut Atomics<u32>, id: GlobalId) {
+    if id.x == 0 {
+        let _ = tri_count.max(i: 11, value: cert_count[0])
+        if cert_count[0] > slices * CERT_SLICE {
+            let _ = tri_count.add(i: 9, value: cert_count[0] - slices * CERT_SLICE)
+        }
     }
 }
 
@@ -4545,6 +4564,16 @@ pub struct MeshBatch {
     poll_limit: u32,
     /// The most creases a chunk of the latest read extraction held (`crease_slices`).
     crease_hint: u32,
+    /// The most thin candidates a chunk of the latest read extraction held, and the outline cells
+    /// its batch put up for a certificate (`thin_slices`, `cert_slices`).
+    thin_hint: u32,
+    cert_hint: u32,
+    /// Its seam cells (`seam_slices`).
+    seam_hint: u32,
+    /// The latest readback's of them, for `took_counts`.
+    thin_read: u32,
+    cert_read: u32,
+    seam_read: u32,
     /// The rest mesh's vertex count as a readback of extraction `verts_gen` gave it (`deform`).
     verts_known: u32,
     verts_gen: u32,
@@ -4583,7 +4612,7 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
         indices: buffer(6),
         trans_indices: buffer(6),
         cut_indices: buffer(6),
-        tri_count: buffer_of([0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+        tri_count: buffer_of([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
         draw_args: buffer_of(
             [
                 DrawIndexedArgs {
@@ -4712,6 +4741,12 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
         poll_total: 0,
         poll_limit: 0,
         crease_hint: 0,
+        thin_hint: 0,
+        cert_hint: 0,
+        seam_hint: 0,
+        thin_read: 0,
+        cert_read: 0,
+        seam_read: 0,
         verts_known: 0,
         verts_gen: 0,
         verts_per_brick: START_VERTS_PER_BRICK,
@@ -4889,6 +4924,11 @@ impl MeshBatch {
                         cut_indices = c[6]
                         gpu_ovf = c[7]
                         exact_count = c[8]
+                        if c.len() >= 13 {
+                            self.thin_read = c[10]
+                            self.cert_read = c[11]
+                            self.seam_read = c[12]
+                        }
                         have = true
                     } else if c.len() >= 8 {
                         counts = vec4u(c[0], c[1], c[2], c[3])
@@ -4990,6 +5030,13 @@ impl MeshBatch {
         }
         self.active_hint = c.z
         self.crease_hint = creases
+        self.thin_hint = self.thin_read
+        self.cert_hint = self.cert_read
+        self.seam_hint = self.seam_read
+        // A list that outgrew its slices left cells untested: extract again, with slices for it.
+        if self.poll_gen == self.gen && (gpu_ovf & OVERFLOW_THIN) != 0 {
+            self.built = false
+        }
         self.hint_total = self.poll_total
 
         // An output budget that overflowed dropped triangles: double it and extract again.
@@ -5133,6 +5180,46 @@ impl MeshBatch {
         }
         let want = self.crease_hint + self.crease_hint / 4 + CREASE_SLICE / 16
         clamp((want + CREASE_SLICE - 1) / CREASE_SLICE, 1, most)
+    }
+
+    /// The `filter_thin_cells` slices a chunk dispatches: as `crease_slices` does, the last
+    /// readback's most thin candidates a chunk held with a quarter and a sixteenth of a slice of
+    /// headroom, or all of them (`THIN_SLICES`) cold or after a cut. Each slice dispatched costs a
+    /// dispatch's start however few cells reach it; a chunk that outgrows them sets
+    /// `OVERFLOW_THIN` and is met by `took_counts`, which extracts again with slices for it.
+    fn thin_slices(self) -> u32 {
+        if self.active_hint == 0 ||
+            self.lod_cut ||
+            self.extract_total > self.hint_total + self.hint_total / 4 {
+            return THIN_SLICES
+        }
+        let want = self.thin_hint + self.thin_hint / 4 + THIN_SLICE / 16
+        clamp((want + THIN_SLICE - 1) / THIN_SLICE, 1, THIN_SLICES)
+    }
+
+    /// The `certify_outline` slices a batch dispatches: as `thin_slices` does, by the last
+    /// readback's outline cells, all of them (`CERT_SLICES`) cold or after a cut.
+    fn cert_slices(self) -> u32 {
+        if self.active_hint == 0 ||
+            self.lod_cut ||
+            self.extract_total > self.hint_total + self.hint_total / 4 {
+            return CERT_SLICES
+        }
+        let want = self.cert_hint + self.cert_hint / 4 + CERT_SLICE / 16
+        clamp((want + CERT_SLICE - 1) / CERT_SLICE, 1, CERT_SLICES)
+    }
+
+    /// The seam slices a batch dispatches (`SEAM_SLICE` seam cells each, for each seam pass): as
+    /// `thin_slices` does, by the last readback's seam cells, all of them (`SEAM_SLICES`) cold or
+    /// after a cut.
+    fn seam_slices(self) -> u32 {
+        if self.active_hint == 0 ||
+            self.lod_cut ||
+            self.extract_total > self.hint_total + self.hint_total / 4 {
+            return SEAM_SLICES
+        }
+        let want = self.seam_hint + self.seam_hint / 4 + SEAM_SLICE / 16
+        clamp((want + SEAM_SLICE - 1) / SEAM_SLICE, 1, SEAM_SLICES)
     }
 
     /// Notes that `tri_count` was rewritten by a real extraction (or emptied, `real == false`).
@@ -5768,7 +5855,7 @@ impl MeshBatch {
             return
         }
         if vis_count == 0 {
-            write(mut self.tri_count, 0, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+            write(mut self.tri_count, 0, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
             scratch.active.clear()
             self.exact_cells.clear()
             dispatch(
@@ -6493,7 +6580,7 @@ impl MeshBatch {
                     groups: scratch.vert_args.at(0),
                     most: chunk_n * 6,
                 )
-                let thin_slices: u32 = THIN_SLICES
+                let thin_slices = self.thin_slices()
                 dispatch(
                     prep_slices.bind(
                         count: scratch.thin_cands.count(),
@@ -6525,6 +6612,7 @@ impl MeshBatch {
                 dispatch(
                     note_untested.bind(
                         thin_count: scratch.thin_cands.count(),
+                        slices: thin_slices,
                         tri_count: mut self.tri_count,
                     ),
                     over: 1,
@@ -6536,17 +6624,18 @@ impl MeshBatch {
             let exact_eye = self.exact_eye
             // The outline's cells certified, or given exact cells.
             label("mesh_certify")
+            let cert_slices = self.cert_slices()
             dispatch(
                 prep_slices.bind(
                     count: scratch.cert_cands.count(),
                     cap: CAP_SURF,
                     most: CERT_SLICE,
-                    slices: CERT_SLICES,
-                    args: scratch.crease_args.span_mut(start: 0, count: CERT_SLICES),
+                    slices: cert_slices,
+                    args: scratch.crease_args.span_mut(start: 0, count: cert_slices),
                 ),
                 over: 1,
             )
-            for cs in 0..CERT_SLICES {
+            for cs in 0..cert_slices {
                 dispatch(
                     certify_outline.bind(
                         fields: fbuf.items(),
@@ -6566,6 +6655,7 @@ impl MeshBatch {
             dispatch(
                 note_uncertified.bind(
                     cert_count: scratch.cert_cands.count(),
+                    slices: cert_slices,
                     tri_count: mut self.tri_count,
                 ),
                 over: 1,
@@ -6638,7 +6728,7 @@ impl MeshBatch {
         scratch.active.clear()
         self.verts.clear()
         self.exact_cells.clear()
-        write(mut self.tri_count, 0, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+        write(mut self.tri_count, 0, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
         if has_seams {
             scratch.seam_quads.clear()
             scratch.seam_cells.clear()
@@ -6671,16 +6761,16 @@ impl MeshBatch {
         let wanted = self.chunk_limit(total_bricks, min(effective_cap, total_bricks))
         // A chunk's exact cells make `dilate_outline`'s and every `filter_thin_cells` slice's
         // dispatch, and a batch's its `certify_outline` slices'; a batch's seams make each slice's emit (and its exact cells', if exact).
-        let exact_indirect: u32 = if use_exact { 1 + THIN_SLICES } else { 0 }
+        let exact_indirect: u32 = if use_exact { 1 + self.thin_slices() } else { 0 }
         let per_chunk = CHUNK_INDIRECT + exact_indirect + self.crease_slices(CHUNK_BRICKS)
         let seam_indirect: u32 = if !has_seams {
             0
         } else if use_exact {
-            2 * SEAM_SLICES
+            3 * self.seam_slices()
         } else {
-            SEAM_SLICES
+            2 * self.seam_slices()
         }
-        let cert_indirect: u32 = if use_exact { CERT_SLICES } else { 0 }
+        let cert_indirect: u32 = if use_exact { self.cert_slices() } else { 0 }
         scratch.indirect_left -= min(scratch.indirect_left, seam_indirect + cert_indirect)
         let fit = max(scratch.indirect_left / per_chunk, 1)
         let hard_cap = min(wanted, fit * CHUNK_BRICKS)
@@ -6980,7 +7070,7 @@ impl MeshBatch {
                     groups: scratch.vert_args.at(0),
                     most: chunk_n * 6,
                 )
-                let thin_slices: u32 = THIN_SLICES
+                let thin_slices = self.thin_slices()
                 dispatch(
                     prep_slices.bind(
                         count: scratch.thin_cands.count(),
@@ -7012,6 +7102,7 @@ impl MeshBatch {
                 dispatch(
                     note_untested.bind(
                         thin_count: scratch.thin_cands.count(),
+                        slices: thin_slices,
                         tri_count: mut self.tri_count,
                     ),
                     over: 1,
@@ -7022,17 +7113,18 @@ impl MeshBatch {
         if use_exact {
             // The outline's cells certified, or given exact cells.
             label("mesh_certify")
+            let cert_slices = self.cert_slices()
             dispatch(
                 prep_slices.bind(
                     count: scratch.cert_cands.count(),
                     cap: CAP_SURF,
                     most: CERT_SLICE,
-                    slices: CERT_SLICES,
-                    args: scratch.crease_args.span_mut(start: 0, count: CERT_SLICES),
+                    slices: cert_slices,
+                    args: scratch.crease_args.span_mut(start: 0, count: cert_slices),
                 ),
                 over: 1,
             )
-            for cs in 0..CERT_SLICES {
+            for cs in 0..cert_slices {
                 dispatch(
                     certify_outline.bind(
                         fields: fields,
@@ -7052,6 +7144,7 @@ impl MeshBatch {
             dispatch(
                 note_uncertified.bind(
                     cert_count: scratch.cert_cands.count(),
+                    slices: cert_slices,
                     tri_count: mut self.tri_count,
                 ),
                 over: 1,
@@ -7068,7 +7161,15 @@ impl MeshBatch {
                 ),
                 over: 1,
             )
-            let seam_slices: u32 = SEAM_SLICES
+            let seam_slices = self.seam_slices()
+            dispatch(
+                note_seams.bind(
+                    seam_count: scratch.seam_cells.count(),
+                    slices: seam_slices,
+                    tri_count: mut self.tri_count,
+                ),
+                over: 1,
+            )
             dispatch(
                 prep_slices.bind(
                     count: scratch.seam_cells.count(),
@@ -7225,7 +7326,7 @@ impl MeshBatch {
         scratch.active.clear()
         self.verts.clear()
         self.exact_cells.clear()
-        write(mut self.tri_count, 0, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+        write(mut self.tri_count, 0, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
 
         let grids = scratch.grids.items()
         var first: u32 = 0

@@ -473,6 +473,11 @@ fn frames(args: &Args) -> Result<(), Failure> {
     for (frame, ms) in wrela_host::frame_spans(&run.timings) {
         eprintln!("frame {frame:>4}  span {ms:.3} ms");
     }
+    for (frame, idle, gaps) in wrela_host::frame_gaps(&run.timings) {
+        let said: Vec<String> =
+            gaps.iter().map(|(g, a, b)| format!("{g:.3} ms after `{a}` before `{b}`")).collect();
+        eprintln!("frame {frame:>4}  idle {idle:.3} ms; longest: {}", said.join(", "));
+    }
     if args.cpu {
         eprintln!(
             "load  {loaded_ms:.1} ms, of which pipelines {} built in {pipelines_ms:.1} ms",

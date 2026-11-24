@@ -101,6 +101,46 @@ pub fn frame_spans(timings: &[GpuTiming]) -> Vec<(usize, f64)> {
     spans.into_iter().map(|(k, (a, b))| (k, (b - a) / 1e6)).collect()
 }
 
+/// A gap in a frame's timed work: its length (ms) and the labels of the pieces that end before
+/// it and begin after it.
+pub type Gap = (f64, String, String);
+
+/// Each frame's idle time inside its span (ms: the span less the union of its timed pieces), and
+/// its longest gaps, longest first ([`GAPS_SAID`] at most). What a span holds besides work: the
+/// GPU waiting on the CPU between submissions.
+pub fn frame_gaps(timings: &[GpuTiming]) -> Vec<(usize, f64, Vec<Gap>)> {
+    let mut by: std::collections::BTreeMap<usize, Vec<&GpuTiming>> = Default::default();
+    for t in timings {
+        by.entry(t.frame).or_default().push(t);
+    }
+    let mut out = Vec::new();
+    for (frame, mut ts) in by {
+        ts.sort_by(|a, b| a.start.total_cmp(&b.start));
+        let mut end = ts[0].end;
+        let mut end_label = ts[0].label.clone();
+        let mut idle = 0.0;
+        let mut gaps: Vec<Gap> = Vec::new();
+        for t in &ts[1..] {
+            if t.start > end {
+                let g = t.start - end;
+                idle += g;
+                gaps.push((g / 1e6, end_label.clone(), t.label.clone()));
+            }
+            if t.end > end {
+                end = t.end;
+                end_label = t.label.clone();
+            }
+        }
+        gaps.sort_by(|a, b| b.0.total_cmp(&a.0));
+        gaps.truncate(GAPS_SAID);
+        out.push((frame, idle / 1e6, gaps));
+    }
+    out
+}
+
+/// How many of a frame's longest gaps `frame_gaps` says.
+pub const GAPS_SAID: usize = 5;
+
 /// A copy's extent in whole blocks of `format`: a rectangle of a compressed texture that reaches
 /// its level's edge (the checker allows no other part block) covers that edge's last block, which
 /// WebGPU counts in the level's physical size (a 4 × 4 BC level 1 is one 4 × 4 block).

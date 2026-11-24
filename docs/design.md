@@ -1018,6 +1018,25 @@ on the citadel's gate with the crowd behind it and put the crowd's outline over 
 12), as it does with this change; the gate's sizes (160x90, 640x360) don't show it. The crowd's
 shared, skinned mesh has no exact cells: the next hole to close.
 
+### The frame's idle time: dispatches nobody needed (2026-11-23)
+
+SCENE 10's frame spanned 28.4 ms on the GPU's clock where its passes, timed alone, summed to
+16.9. `--timestamps` now says where a frame's span isn't work (`frame_gaps`: the span less the
+union of its timed pieces, and its longest gaps with the labels either side): 8 to 10 ms idle a
+frame, in 273 gaps, 220 of them between two extraction dispatches, about 20 us each on the M4:
+each dispatch is a compute pass of its own, and the GPU drains before the next. Most of them did
+nothing: every chunk dispatched its 8 `filter_thin_cells` slices, every batch its 16 (or 32)
+seam slices and its certificate slices, however few cells there were.
+
+Each such list is now sliced as the crease list already was: by what the last readback found it
+held (`thin_slices`, `cert_slices`, `seam_slices`; the readback's `tri_count` 10 to 12) with a
+quarter and a sixteenth of a slice of headroom, all of them cold or after a cut; a list that
+outgrows its slices raises `OVERFLOW_THIN` and is extracted again (`took_counts`). SCENE 10's
+idle time fell to 3.9 ms a frame, its 1080p span on the M4 from **24.3-25.6 ms (HEAD a69c6d5) to
+21.4-21.5 ms**; SCENE 11 **14.7-15.0 → 14.2-14.6 ms**. What's left is the drain before each of the
+extraction's remaining dispatches (a chunk's passes depend on each other) and a few submissions
+the host closes on the guard's booked bounds (`SUBMIT_LINES`).
+
 ## The layers
 
 Dependencies point down. Nothing below knows anything above.
