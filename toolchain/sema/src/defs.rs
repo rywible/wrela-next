@@ -415,6 +415,7 @@ lang_items! {
     WorkgroupId = "std::gpu::WorkgroupId",
     VertexIndex = "std::gpu::VertexIndex",
     InstanceIndex = "std::gpu::InstanceIndex",
+    PrimitiveIndex = "std::gpu::PrimitiveIndex",
     SubgroupInvocation = "std::gpu::SubgroupInvocation",
     SubgroupSize = "std::gpu::SubgroupSize",
     FragCoord = "std::gpu::FragCoord",

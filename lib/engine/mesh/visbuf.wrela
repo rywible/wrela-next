@@ -1,0 +1,724 @@
+// 64-bit Visibility Buffer (`Rg32Uint` + Reversed-Z Depth) and 16×16 screen-tile material
+// classifier + exact pixel-rate resolve (Burns & Hunt 2013, JCGT; Möller & Trumbore 1997).
+//
+// Pass 2a (`mesh_eye`) rasterises opaque meshlets into ONE 64-bit `Rg32Uint` target (8 B/px vs.
+// 20 B/px for the 4-target G-buffer) with ZERO material/field evaluation during rasterisation:
+//   - `vis.x = (1 << 31) | ((kind & 3) << 29) | ((batch_id & 8191) << 16) | (inst_id & 65535)`
+//   - `vis.y = tri_id` (`PrimitiveIndex.index`)
+//
+// Pass 2b (`vis_classify`) scans `vis` once in 16×16 tiles (via `SharedAtomics<8>`, supporting up
+// to 256 batches) and emits dense per-batch tile worklists and `DrawArgs`.
+//
+// Pass 2c (`vis_resolve`) draws ONLY the visible 16×16 tiles of each batch into the compressed
+// G-buffer (`DepthPass4`), reconstructing exact perspective-correct barycentrics and exact
+// analytical screen-space derivatives `(du/dx, dv/dx, du/dy, dv/dy)` via world-space ray-triangle
+// intersection (zero near-plane clipping singularities, zero overdraw, zero 2×2 helper-lane
+// overshading, and safe after per-pixel `discard_proven`).
+
+use matter::substance::Substance
+use mesh::extract::{
+    MeshVertex, unpack_oct_normal, unpack_smooth, unpack_thing,
+}
+use mesh::light::clip_of
+use mesh::proof::{discard_proven, prove_transmissive_only, prove_vis_not_batch}
+use mesh::shade::{shade_gbuf_exact, shade_gbuf_rigid}
+use picture::eye::{Eye, View, view}
+use std::field::{Field, Rigid}
+use std::gpu::{
+    Atomics, ClipPosition, DrawArgs, Flat, FragCoord, GlobalId, GpuBuffer, InstanceIndex, LocalId,
+    PrimitiveIndex, Rg32Uint, SharedAtomics, Slots, Targets4, Texture, VertexIndex, WorkgroupId,
+    buffer, dispatch, label, texture,
+}
+
+/// Screen tile width/height (pixels) for Visibility Buffer material classification.
+pub(package) const VIS_TILE: u32 = 16
+
+/// Maximum distinct batches classified in one pass (`8 × 32 = 256` bits in `SharedAtomics<8>`).
+pub(package) const VIS_MAX_BATCHES: u32 = 256
+
+/// Packs `(batch_id, inst_id, kind)` into `vis.x` with bit 31 set (`kind`: 0 = opaque `indices`,
+/// 1 = mixed `cut_indices`).
+fn vis_header(batch_id: u32, inst_id: u32, kind: u32) -> u32 {
+    2147483648 | ((kind & 3) << 29) | ((batch_id & 8191) << 16) | (inst_id & 65535)
+}
+
+/// Lean Visibility Buffer vertex output: clip position plus flat packed `(batch, inst, kind)` id.
+struct VisVary: Copy {
+    clip: ClipPosition,
+    header: Flat<u32>,
+}
+
+/// Cut-quad Visibility Buffer vertex output (only for quads straddling opaque/transmissive seams).
+struct VisCutVary: Copy {
+    clip: ClipPosition,
+    wp: vec3,
+    header: Flat<u32>,
+    tid: Flat<u32>,
+}
+
+/// Deformed/skinned cut-quad Visibility Buffer vertex output.
+struct VisDeformedCutVary: Copy {
+    clip: ClipPosition,
+    rest_p: vec3,
+    header: Flat<u32>,
+}
+
+/// Ultra-lean Visibility Buffer vertex shader for rigid/static `MeshBatch`es (transforms ONLY clip
+/// position — no `prev_xforms`, no normals, no local coordinates).
+@vertex
+pub(package) fn vis_mesh_vs(
+    verts: [MeshVertex],
+    xforms: [Rigid],
+    batch_id: u32,
+    kind: u32,
+    v: View,
+    vi: VertexIndex,
+    ii: InstanceIndex,
+) -> VisVary {
+    let vert = verts[vi.index]
+    let wp = xforms[ii.index].apply_point(vec3(vert.px, vert.py, vert.pz))
+    VisVary {
+        clip: clip_of(v, wp),
+        header: Flat { value: vis_header(batch_id, ii.index, kind) },
+    }
+}
+
+/// Ultra-lean Visibility Buffer vertex shader for pre-deformed `One<Skinned>` meshlets.
+@vertex
+pub(package) fn vis_deformed_vs(
+    verts: [MeshVertex],
+    xforms: [Rigid],
+    batch_id: u32,
+    kind: u32,
+    v: View,
+    vi: VertexIndex,
+    ii: InstanceIndex,
+) -> VisVary {
+    let vert = verts[vi.index]
+    let wp = xforms[ii.index].apply_point(vec3(vert.px, vert.py, vert.pz))
+    VisVary {
+        clip: clip_of(v, wp),
+        header: Flat { value: vis_header(batch_id, ii.index, kind) },
+    }
+}
+
+/// Universal 64-bit Visibility Buffer fragment shader: writes `(header, tri_id)` with zero
+/// material work and full hardware Early-Z.
+@fragment
+pub(package) fn vis_fs(vary: VisVary, prim: PrimitiveIndex) -> vec2u {
+    vec2u(vary.header.value, prim.index)
+}
+
+/// Visibility Buffer vertex shader for partly-transmissive cut quads (`cut_indices`).
+@vertex
+pub(package) fn vis_cut_vs(
+    verts: [MeshVertex],
+    xforms: [Rigid],
+    inst_ids: [u32],
+    is_instanced: u32,
+    batch_id: u32,
+    v: View,
+    vi: VertexIndex,
+    ii: InstanceIndex,
+) -> VisCutVary {
+    let vert = verts[vi.index]
+    let wp = xforms[ii.index].apply_point(vec3(vert.px, vert.py, vert.pz))
+    let tid = if is_instanced != 0 { inst_ids[ii.index] } else { unpack_thing(vert.packed) }
+    VisCutVary {
+        clip: clip_of(v, wp),
+        wp,
+        header: Flat { value: vis_header(batch_id, ii.index, 1) },
+        tid: Flat { value: tid },
+    }
+}
+
+/// Visibility Buffer vertex shader for pre-deformed `One<Skinned>` cut quads.
+@vertex
+pub(package) fn vis_deformed_cut_vs(
+    verts: [MeshVertex],
+    rest_verts: [MeshVertex],
+    xforms: [Rigid],
+    batch_id: u32,
+    v: View,
+    vi: VertexIndex,
+    ii: InstanceIndex,
+) -> VisDeformedCutVary {
+    let vert = verts[vi.index]
+    let rvert = rest_verts[vi.index]
+    let wp = xforms[ii.index].apply_point(vec3(vert.px, vert.py, vert.pz))
+    VisDeformedCutVary {
+        clip: clip_of(v, wp),
+        rest_p: vec3(rvert.px, rvert.py, rvert.pz),
+        header: Flat { value: vis_header(batch_id, ii.index, 1) },
+    }
+}
+
+/// Visibility Buffer fragment shader for `One<M>` cut quads: discards transmissive pixels through
+/// `EmptyProof` and writes ONLY 64-bit visibility IDs for opaque pixels.
+@fragment
+@budget(work: 8000)
+pub(package) fn vis_cut_one_fs<M: Field<Substance>>(
+    vary: VisCutVary,
+    field: M,
+    prim: PrimitiveIndex,
+) -> vec2u {
+    let sub0 = field.channels(vary.wp)
+    match prove_transmissive_only(sub0) {
+        Some(p) => discard_proven(p),
+        None => {},
+    }
+    vec2u(vary.header.value, prim.index)
+}
+
+/// Visibility Buffer fragment shader for `Pool<M>` non-skinned cut quads.
+@fragment
+@budget(work: 8000)
+pub(package) fn vis_cut_many_fs<M: Field<Substance>>(
+    vary: VisCutVary,
+    fields: [M],
+    n_fields: u32,
+    prim: PrimitiveIndex,
+) -> vec2u {
+    let tid = min(vary.tid.value, n_fields - 1)
+    let sub0 = fields[tid].channels(vary.wp)
+    match prove_transmissive_only(sub0) {
+        Some(p) => discard_proven(p),
+        None => {},
+    }
+    vec2u(vary.header.value, prim.index)
+}
+
+/// Visibility Buffer fragment shader for pre-deformed `One<Skinned>` cut quads.
+@fragment
+@budget(work: 8000)
+pub(package) fn vis_deformed_cut_one_fs<M: Field<Substance>>(
+    vary: VisDeformedCutVary,
+    field: M,
+    prim: PrimitiveIndex,
+) -> vec2u {
+    let sub0 = field.rest_channels(vary.rest_p)
+    match prove_transmissive_only(sub0) {
+        Some(p) => discard_proven(p),
+        None => {},
+    }
+    vec2u(vary.header.value, prim.index)
+}
+
+/// Zeroes per-batch tile counters before classification.
+@compute(64)
+fn vis_zero_counts(counts: mut Slots<u32>, n_batches: u32, id: GlobalId) {
+    if id.x < n_batches {
+        counts[id] = 0
+    }
+}
+
+/// 16×16 screen-tile Visibility Buffer material classifier (`@compute(8, 8)` = 64 threads per tile,
+/// each thread inspecting a 2×2 pixel block). Bins visible tiles into dense per-batch lists using
+/// workgroup-shared `SharedAtomics<8>` (zero contention, supports up to 256 batches).
+@compute(8, 8)
+fn vis_classify(
+    vis: Texture<Rg32Uint>,
+    width: u32,
+    height: u32,
+    n_batches: u32,
+    max_tiles: u32,
+    tile_lists: mut Atomics<u32>,
+    tile_counts: mut Atomics<u32>,
+    mask: mut SharedAtomics<8>,
+    lid: LocalId,
+    wid: WorkgroupId,
+) {
+    let tid = lid.y * 8 + lid.x
+    let bx = wid.x * 16 + lid.x * 2
+    let by = wid.y * 16 + lid.y * 2
+    for dy in 0..2 {
+        for dx in 0..2 {
+            let px = bx + dx
+            let py = by + dy
+            if px < width && py < height {
+                let h = vis.load(px, py).x
+                if (h & 2147483648) != 0 {
+                    let b = (h >> 16) & 8191
+                    if b < n_batches && b < VIS_MAX_BATCHES {
+                        let _ = mask.or(b >> 5, 1 << (b & 31))
+                    }
+                }
+            }
+        }
+    }
+    mask.barrier()
+    let tile_xy = wid.x | (wid.y << 16)
+    for pass in 0..4 {
+        let b = pass * 64 + tid
+        if b < n_batches && b < VIS_MAX_BATCHES {
+            let m = mask.load(b >> 5)
+            if (m & (1 << (b & 31))) != 0 {
+                let slot = tile_counts.add(b, 1)
+                if slot < max_tiles {
+                    tile_lists.store(b * max_tiles + slot, tile_xy)
+                }
+            }
+        }
+    }
+}
+
+/// Writes per-batch indirect `DrawArgs` (`6` vertices × `tile_count` instances) for tile-quad
+/// Visibility Buffer resolve.
+@compute(64)
+fn vis_prep_draws(
+    tile_counts: [u32],
+    n_batches: u32,
+    max_tiles: u32,
+    draws: mut Slots<DrawArgs>,
+    id: GlobalId,
+) {
+    let b = id.x
+    if b >= n_batches {
+        return
+    }
+    let count = min(tile_counts[b], max_tiles)
+    draws[id] = DrawArgs { vertices: 6, instances: count, first_vertex: 0, first_instance: 0 }
+}
+
+/// Emits one 16×16-pixel screen quad for instance `ii.index` of batch `tile_base`'s classified
+/// tile list (drawn with `Cull::None` and `Compare::Always, write: false`).
+@vertex
+pub(package) fn vis_tile_vs(
+    tile_lists: [u32],
+    tile_base: u32,
+    inv_size: vec2,
+    vi: VertexIndex,
+    ii: InstanceIndex,
+) -> ClipPosition {
+    let tile_xy = tile_lists[tile_base + ii.index]
+    let tx = f32(tile_xy & 65535) * 16.0
+    let ty = f32(tile_xy >> 16) * 16.0
+    let cx = if vi.index == 1 || vi.index == 2 || vi.index == 4 { 16.0 } else { 0.0 }
+    let cy = if vi.index == 2 || vi.index == 4 || vi.index == 5 { 16.0 } else { 0.0 }
+    let uv = vec2(tx + cx, ty + cy) * inv_size
+    ClipPosition { position: vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.5, 1.0) }
+}
+
+/// Lean local-space barycentric hit for similarity-transformed (`Rigid`) meshlets: no screen-space
+/// partial derivatives needed (exact tangent bump gradient comes directly from `xf`).
+struct RigidHit: Copy {
+    u: f32,
+    v: f32,
+    ng: vec3,
+}
+
+fn vis_bary_rigid(v: View, frag_xy: vec2, xf: Rigid, l0: vec3, l1: vec3, l2: vec3) -> RigidHit {
+    let w = max(v.size.x, 1.0)
+    let h = max(v.size.y, 1.0)
+    let aspect = h / w
+    let fx = max(v.focal * aspect, 1.0e-6)
+    let fy = max(v.focal, 1.0e-6)
+    let x_ndc = 2.0 * frag_xy.x / w - 1.0
+    let y_ndc = 1.0 - 2.0 * frag_xy.y / h
+    let jx = 2.0 * v.jitter.x / w
+    let jy = 2.0 * v.jitter.y / h
+    let r_w = v.forward + v.right * ((x_ndc + jx) / fx) + v.up * ((y_ndc - jy) / fy)
+    let sc = max(xf.scale_factor(), 1.0e-6)
+    let inv_s2 = 1.0 / (sc * sc)
+    let d_at = v.at - vec3(xf.row0.w, xf.row1.w, xf.row2.w)
+    let at_l = (xf.row0.xyz * d_at.x + xf.row1.xyz * d_at.y + xf.row2.xyz * d_at.z) * inv_s2
+    let r_l = xf.row0.xyz * r_w.x + xf.row1.xyz * r_w.y + xf.row2.xyz * r_w.z
+    let e1 = l1 - l0
+    let e2 = l2 - l0
+    let ng = cross(e1, e2)
+    let s = at_l - l0
+    let denom = dot(r_l, ng)
+    let inv_d = if abs(denom) > 1.0e-18 { 1.0 / denom } else { 0.0 }
+    let u = clamp(dot(r_l, cross(s, e2)) * inv_d, -0.05, 1.05)
+    let vb = clamp(dot(r_l, cross(e1, s)) * inv_d, -0.05, 1.05)
+    RigidHit { u, v: vb, ng }
+}
+
+/// Exact perspective-correct barycentrics `(u, v)` (weights `(1 - u - v, u, v)` on `(p0, p1, p2)`),
+/// exact per-pixel partial derivatives `(du_dx, dv_dx, du_dy, dv_dy)`, and unnormalized geometric
+/// face normal `ng = cross(p1 - p0, p2 - p0)` computed via world-space Möller–Trumbore ray-triangle
+/// intersection (exact even when triangle vertices lie behind the near plane).
+struct BaryHit: Copy {
+    u: f32,
+    v: f32,
+    du_dx: f32,
+    dv_dx: f32,
+    du_dy: f32,
+    dv_dy: f32,
+    ng: vec3,
+}
+
+fn vis_bary(v: View, frag_xy: vec2, p0: vec3, p1: vec3, p2: vec3) -> BaryHit {
+    let w = max(v.size.x, 1.0)
+    let h = max(v.size.y, 1.0)
+    let aspect = h / w
+    let fx = max(v.focal * aspect, 1.0e-6)
+    let fy = max(v.focal, 1.0e-6)
+    let x_ndc = 2.0 * frag_xy.x / w - 1.0
+    let y_ndc = 1.0 - 2.0 * frag_xy.y / h
+    let jx = 2.0 * v.jitter.x / w
+    let jy = 2.0 * v.jitter.y / h
+    let r = v.forward + v.right * ((x_ndc + jx) / fx) + v.up * ((y_ndc - jy) / fy)
+    let dr_dx = v.right * (2.0 / (w * fx))
+    let dr_dy = -v.up * (2.0 / (h * fy))
+    let e1 = p1 - p0
+    let e2 = p2 - p0
+    let ng = cross(e1, e2)
+    let s = v.at - p0
+    let au = cross(s, e2)
+    let av = cross(e1, s)
+    let denom = dot(r, ng)
+    let inv_d = if abs(denom) > 1.0e-18 { 1.0 / denom } else { 0.0 }
+    let u_raw = dot(r, au) * inv_d
+    let v_raw = dot(r, av) * inv_d
+    // Guard extreme grazing sub-pixel hits from extrapolating far outside the triangle.
+    let u = clamp(u_raw, -0.05, 1.05)
+    let vb = clamp(v_raw, -0.05, 1.05)
+    let dn_dx = dot(dr_dx, ng)
+    let dn_dy = dot(dr_dy, ng)
+    let du_dx = (dot(dr_dx, au) - u_raw * dn_dx) * inv_d
+    let dv_dx = (dot(dr_dx, av) - v_raw * dn_dx) * inv_d
+    let du_dy = (dot(dr_dy, au) - u_raw * dn_dy) * inv_d
+    let dv_dy = (dot(dr_dy, av) - v_raw * dn_dy) * inv_d
+    BaryHit { u, v: vb, du_dx, dv_dx, du_dy, dv_dy, ng }
+}
+
+fn interp3(a0: vec3, a1: vec3, a2: vec3, bh: BaryHit) -> vec3 {
+    a0 + (a1 - a0) * bh.u + (a2 - a0) * bh.v
+}
+
+fn deriv_x(a0: vec3, a1: vec3, a2: vec3, bh: BaryHit) -> vec3 {
+    (a1 - a0) * bh.du_dx + (a2 - a0) * bh.dv_dx
+}
+
+fn deriv_y(a0: vec3, a1: vec3, a2: vec3, bh: BaryHit) -> vec3 {
+    (a1 - a0) * bh.du_dy + (a2 - a0) * bh.dv_dy
+}
+
+/// Pixel-rate Visibility Buffer resolve fragment shader for `One<M>` rigid/static meshlets.
+@fragment
+@budget(work: 8000)
+pub(package) fn vis_resolve_one_fs<M: Field<Substance>>(
+    vis: Texture<Rg32Uint>,
+    verts: [MeshVertex],
+    indices: [u32],
+    cut_indices: [u32],
+    xforms: [Rigid],
+    prev_xforms: [Rigid],
+    field: M,
+    batch_id: u32,
+    v: View,
+    prev_v: View,
+    frag: FragCoord,
+) -> Targets4<vec4, vec4, vec4, vec2> {
+    let px = u32(frag.position.x)
+    let py = u32(frag.position.y)
+    let vid = vis.load(px, py)
+    match prove_vis_not_batch(vid.x, batch_id) {
+        Some(p) => discard_proven(p),
+        None => {},
+    }
+    let kind = (vid.x >> 29) & 3
+    let base = vid.y * 3
+    let i0 = if kind == 1 { cut_indices[base] } else { indices[base] }
+    let i1 = if kind == 1 { cut_indices[base + 1] } else { indices[base + 1] }
+    let i2 = if kind == 1 { cut_indices[base + 2] } else { indices[base + 2] }
+    let v0 = verts[i0]
+    let v1 = verts[i1]
+    let v2 = verts[i2]
+    let xf = xforms[0]
+    let pxf = prev_xforms[0]
+    let l0 = vec3(v0.px, v0.py, v0.pz)
+    let l1 = vec3(v1.px, v1.py, v1.pz)
+    let l2 = vec3(v2.px, v2.py, v2.pz)
+    let rh = vis_bary_rigid(v, frag.position.xy, xf, l0, l1, l2)
+    let lp = l0 + (l1 - l0) * rh.u + (l2 - l0) * rh.v
+    let wp = xf.apply_point(lp)
+    let prev_wp = pxf.apply_point(lp)
+    let n0 = unpack_oct_normal(v0.packed)
+    let n1 = unpack_oct_normal(v1.packed)
+    let n2 = unpack_oct_normal(v2.packed)
+    let nl = n0 + (n1 - n0) * rh.u + (n2 - n0) * rh.v
+    let normal = xf.apply_normal(nl)
+    let face_n = xf.apply_normal(rh.ng)
+    let s0 = if unpack_smooth(v0.packed) { 1.0 } else { 0.0 }
+    let s1 = if unpack_smooth(v1.packed) { 1.0 } else { 0.0 }
+    let s2 = if unpack_smooth(v2.packed) { 1.0 } else { 0.0 }
+    let smooth = s0 + (s1 - s0) * rh.u + (s2 - s0) * rh.v
+    let sub0 = field.channels(wp)
+    shade_gbuf_rigid(wp, prev_wp, lp, xf, face_n, normal, smooth, sub0, v, prev_v)
+}
+
+/// Pixel-rate Visibility Buffer resolve fragment shader for pre-deformed `One<Skinned>` meshlets.
+@fragment
+@budget(work: 8000)
+pub(package) fn vis_resolve_deformed_one_fs<M: Field<Substance>>(
+    vis: Texture<Rg32Uint>,
+    verts: [MeshVertex],
+    prev_verts: [MeshVertex],
+    rest_verts: [MeshVertex],
+    indices: [u32],
+    cut_indices: [u32],
+    xforms: [Rigid],
+    prev_xforms: [Rigid],
+    field: M,
+    batch_id: u32,
+    v: View,
+    prev_v: View,
+    frag: FragCoord,
+) -> Targets4<vec4, vec4, vec4, vec2> {
+    let px = u32(frag.position.x)
+    let py = u32(frag.position.y)
+    let vid = vis.load(px, py)
+    match prove_vis_not_batch(vid.x, batch_id) {
+        Some(p) => discard_proven(p),
+        None => {},
+    }
+    let kind = (vid.x >> 29) & 3
+    let base = vid.y * 3
+    let i0 = if kind == 1 { cut_indices[base] } else { indices[base] }
+    let i1 = if kind == 1 { cut_indices[base + 1] } else { indices[base + 1] }
+    let i2 = if kind == 1 { cut_indices[base + 2] } else { indices[base + 2] }
+    let v0 = verts[i0]
+    let v1 = verts[i1]
+    let v2 = verts[i2]
+    let pv0 = prev_verts[i0]
+    let pv1 = prev_verts[i1]
+    let pv2 = prev_verts[i2]
+    let rv0 = rest_verts[i0]
+    let rv1 = rest_verts[i1]
+    let rv2 = rest_verts[i2]
+    let xf = xforms[0]
+    let pxf = prev_xforms[0]
+    let p0 = xf.apply_point(vec3(v0.px, v0.py, v0.pz))
+    let p1 = xf.apply_point(vec3(v1.px, v1.py, v1.pz))
+    let p2 = xf.apply_point(vec3(v2.px, v2.py, v2.pz))
+    let bh = vis_bary(v, frag.position.xy, p0, p1, p2)
+    let wp = interp3(p0, p1, p2, bh)
+    let dwx = deriv_x(p0, p1, p2, bh)
+    let dwy = deriv_y(p0, p1, p2, bh)
+    let r0 = vec3(rv0.px, rv0.py, rv0.pz)
+    let r1 = vec3(rv1.px, rv1.py, rv1.pz)
+    let r2 = vec3(rv2.px, rv2.py, rv2.pz)
+    let rest_p = interp3(r0, r1, r2, bh)
+    let dmx = deriv_x(r0, r1, r2, bh)
+    let dmy = deriv_y(r0, r1, r2, bh)
+    let pp0 = pxf.apply_point(vec3(pv0.px, pv0.py, pv0.pz))
+    let pp1 = pxf.apply_point(vec3(pv1.px, pv1.py, pv1.pz))
+    let pp2 = pxf.apply_point(vec3(pv2.px, pv2.py, pv2.pz))
+    let prev_wp = interp3(pp0, pp1, pp2, bh)
+    let n0 = xf.apply_normal(unpack_oct_normal(v0.packed))
+    let n1 = xf.apply_normal(unpack_oct_normal(v1.packed))
+    let n2 = xf.apply_normal(unpack_oct_normal(v2.packed))
+    let normal = interp3(n0, n1, n2, bh)
+    let s0 = if unpack_smooth(v0.packed) { 1.0 } else { 0.0 }
+    let s1 = if unpack_smooth(v1.packed) { 1.0 } else { 0.0 }
+    let s2 = if unpack_smooth(v2.packed) { 1.0 } else { 0.0 }
+    let smooth = s0 + (s1 - s0) * bh.u + (s2 - s0) * bh.v
+    let sub0 = field.rest_channels(rest_p)
+    shade_gbuf_exact(wp, prev_wp, rest_p, dwx, dwy, dmx, dmy, bh.ng, normal, smooth, sub0, v, prev_v)
+}
+
+/// Pixel-rate Visibility Buffer resolve fragment shader for non-skinned `Pool<M>` meshlets.
+@fragment
+@budget(work: 8000)
+pub(package) fn vis_resolve_many_fs<M: Field<Substance>>(
+    vis: Texture<Rg32Uint>,
+    verts: [MeshVertex],
+    indices: [u32],
+    cut_indices: [u32],
+    xforms: [Rigid],
+    prev_xforms: [Rigid],
+    inst_ids: [u32],
+    is_instanced: u32,
+    fields: [M],
+    n_fields: u32,
+    batch_id: u32,
+    v: View,
+    prev_v: View,
+    frag: FragCoord,
+) -> Targets4<vec4, vec4, vec4, vec2> {
+    let px = u32(frag.position.x)
+    let py = u32(frag.position.y)
+    let vid = vis.load(px, py)
+    match prove_vis_not_batch(vid.x, batch_id) {
+        Some(p) => discard_proven(p),
+        None => {},
+    }
+    let inst = vid.x & 65535
+    let kind = (vid.x >> 29) & 3
+    let base = vid.y * 3
+    let i0 = if kind == 1 { cut_indices[base] } else { indices[base] }
+    let i1 = if kind == 1 { cut_indices[base + 1] } else { indices[base + 1] }
+    let i2 = if kind == 1 { cut_indices[base + 2] } else { indices[base + 2] }
+    let v0 = verts[i0]
+    let v1 = verts[i1]
+    let v2 = verts[i2]
+    let xf = xforms[inst]
+    let pxf = prev_xforms[inst]
+    let l0 = vec3(v0.px, v0.py, v0.pz)
+    let l1 = vec3(v1.px, v1.py, v1.pz)
+    let l2 = vec3(v2.px, v2.py, v2.pz)
+    let rh = vis_bary_rigid(v, frag.position.xy, xf, l0, l1, l2)
+    let lp = l0 + (l1 - l0) * rh.u + (l2 - l0) * rh.v
+    let wp = xf.apply_point(lp)
+    let prev_wp = pxf.apply_point(lp)
+    let n0 = unpack_oct_normal(v0.packed)
+    let n1 = unpack_oct_normal(v1.packed)
+    let n2 = unpack_oct_normal(v2.packed)
+    let nl = n0 + (n1 - n0) * rh.u + (n2 - n0) * rh.v
+    let normal = xf.apply_normal(nl)
+    let face_n = xf.apply_normal(rh.ng)
+    let s0 = if unpack_smooth(v0.packed) { 1.0 } else { 0.0 }
+    let s1 = if unpack_smooth(v1.packed) { 1.0 } else { 0.0 }
+    let s2 = if unpack_smooth(v2.packed) { 1.0 } else { 0.0 }
+    let smooth = s0 + (s1 - s0) * rh.u + (s2 - s0) * rh.v
+    let raw_tid = if is_instanced != 0 { inst_ids[inst] } else { unpack_thing(v0.packed) }
+    let tid = min(raw_tid, n_fields - 1)
+    let sub0 = fields[tid].channels(wp)
+    shade_gbuf_rigid(wp, prev_wp, lp, xf, face_n, normal, smooth, sub0, v, prev_v)
+}
+
+/// GPU resources for the 64-bit Visibility Buffer and 16×16 screen-tile material classifier.
+pub(package) struct VisState {
+    pub(package) tex: Texture<Rg32Uint>,
+    pub(package) tile_lists: GpuBuffer<u32>,
+    pub(package) tile_counts: GpuBuffer<u32>,
+    pub(package) tile_draws: GpuBuffer<DrawArgs>,
+    pub(package) width: u32,
+    pub(package) height: u32,
+    pub(package) max_tiles: u32,
+    pub(package) cap_batches: u32,
+}
+
+pub(package) fn vis_state() -> VisState {
+    VisState {
+        tex: texture(width: 1, height: 1),
+        tile_lists: buffer(1),
+        tile_counts: buffer(1),
+        tile_draws: buffer(1),
+        width: 0,
+        height: 0,
+        max_tiles: 1,
+        cap_batches: 0,
+    }
+}
+
+impl VisState {
+    pub(package) fn prepare(mut self, width: u32, height: u32, n_batches: u32) {
+        let tx = (width + VIS_TILE - 1) / VIS_TILE
+        let ty = (height + VIS_TILE - 1) / VIS_TILE
+        let max_tiles = max(tx * ty, 1)
+        let want_b = min(max(n_batches, 1), VIS_MAX_BATCHES)
+        if self.width != width || self.height != height {
+            self.tex = texture(width: width, height: height)
+            self.width = width
+            self.height = height
+            self.max_tiles = max_tiles
+            self.cap_batches = max(self.cap_batches, want_b)
+            self.tile_lists = buffer(self.cap_batches * self.max_tiles)
+            self.tile_counts = buffer(self.cap_batches)
+            self.tile_draws = buffer(self.cap_batches)
+        } else if want_b > self.cap_batches {
+            self.cap_batches = want_b
+            self.tile_lists = buffer(self.cap_batches * self.max_tiles)
+            self.tile_counts = buffer(self.cap_batches)
+            self.tile_draws = buffer(self.cap_batches)
+        }
+    }
+
+    /// Classifies visible 16×16 tiles into per-batch dense tile lists and prepares indirect
+    /// `DrawArgs` for `vis_tile_vs`.
+    pub(package) fn classify(mut self, width: u32, height: u32, n_batches: u32) {
+        let nb = min(n_batches, self.cap_batches)
+        if nb == 0 {
+            return
+        }
+        let tx = (width + VIS_TILE - 1) / VIS_TILE
+        let ty = (height + VIS_TILE - 1) / VIS_TILE
+        label("mesh_vis_classify")
+        dispatch(
+            vis_zero_counts.bind(counts: self.tile_counts.items_mut(), n_batches: nb),
+            groups: ((nb + 63) / 64, 1, 1),
+        )
+        dispatch(
+            vis_classify.bind(
+                vis: self.tex,
+                width: width,
+                height: height,
+                n_batches: nb,
+                max_tiles: self.max_tiles,
+                tile_lists: self.tile_lists.items_mut(),
+                tile_counts: self.tile_counts.items_mut(),
+            ),
+            groups: (tx, ty, 1),
+        )
+        dispatch(
+            vis_prep_draws.bind(
+                tile_counts: self.tile_counts.items(),
+                n_batches: nb,
+                max_tiles: self.max_tiles,
+                draws: self.tile_draws.items_mut(),
+            ),
+            groups: ((nb + 63) / 64, 1, 1),
+        )
+    }
+}
+
+// ---- CPU unit test for analytical barycentrics and screen-space partial derivatives ----
+
+@test
+fn vis_bary_matches_finite_differences_including_near_plane_straddle() {
+    let eye = Eye { at: vec3(0.0, 1.5, 4.0), toward: vec3(0.0, 0.5, 0.0), wide: 0.8 }
+    var v = view(eye, width: 1280, height: 720)
+    v.jitter = vec2(0.25, -0.375)
+    // Triangle straddling the plane behind the camera (`p0` is behind `eye.at` at z = 6.0!).
+    let p0 = vec3(-2.5, 0.0, 6.0)
+    let p1 = vec3(3.0, 0.2, -2.0)
+    let p2 = vec3(-1.5, 3.2, -3.0)
+    let px = vec2(612.5, 341.5)
+    let bh = vis_bary(v, px, p0, p1, p2)
+    let bh_x = vis_bary(v, px + vec2(0.01, 0.0), p0, p1, p2)
+    let bh_y = vis_bary(v, px + vec2(0.0, 0.01), p0, p1, p2)
+    // Verify analytical barycentric point projects back onto exact pixel center `px`.
+    let wp = interp3(p0, p1, p2, bh)
+    let cp = clip_of(v, wp).position
+    let proj_x = (cp.x / cp.w * 0.5 + 0.5) * 1280.0
+    let proj_y = (0.5 - cp.y / cp.w * 0.5) * 720.0
+    assert(abs(proj_x - px.x) < 1.0e-3, f"proj_x {proj_x} != {px.x}")
+    assert(abs(proj_y - px.y) < 1.0e-3, f"proj_y {proj_y} != {px.y}")
+    // Verify analytical partial derivatives match finite differences to 1e-4.
+    let wp_x = interp3(p0, p1, p2, bh_x)
+    let wp_y = interp3(p0, p1, p2, bh_y)
+    let fd_x = (wp_x - wp) * 100.0
+    let fd_y = (wp_y - wp) * 100.0
+    let an_x = deriv_x(p0, p1, p2, bh)
+    let an_y = deriv_y(p0, p1, p2, bh)
+    assert(length(fd_x - an_x) < 1.0e-3, f"dwx mismatch: {an_x} vs {fd_x}")
+    assert(length(fd_y - an_y) < 1.0e-3, f"dwy mismatch: {an_y} vs {fd_y}")
+}
+
+@test
+fn vis_bary_rigid_matches_world_bary_under_rotation_translation_and_scale() {
+    let eye = Eye { at: vec3(0.0, 1.5, 4.0), toward: vec3(0.0, 0.5, 0.0), wide: 0.8 }
+    var v = view(eye, width: 1280, height: 720)
+    v.jitter = vec2(-0.125, 0.25)
+    let c = cos(0.7)
+    let s = sin(0.7)
+    let rot = Rigid::rotation(mat3(vec3(c, 0.0, -s), vec3(0.0, 1.0, 0.0), vec3(s, 0.0, c)))
+    let xf = Rigid::translation(vec3(0.4, -0.3, -0.8)).compose(rot.compose(Rigid::uniform_scale(1.75)))
+    let l0 = vec3(-1.2, 0.1, 1.5)
+    let l1 = vec3(1.6, 0.2, -1.1)
+    let l2 = vec3(-0.7, 1.9, -1.4)
+    let p0 = xf.apply_point(l0)
+    let p1 = xf.apply_point(l1)
+    let p2 = xf.apply_point(l2)
+    let px = vec2(612.5, 341.5)
+    let bh = vis_bary(v, px, p0, p1, p2)
+    let rh = vis_bary_rigid(v, px, xf, l0, l1, l2)
+    assert(abs(bh.u - rh.u) < 1.0e-5, f"u mismatch: {bh.u} vs {rh.u}")
+    assert(abs(bh.v - rh.v) < 1.0e-5, f"v mismatch: {bh.v} vs {rh.v}")
+    let ng_w = normalize(bh.ng)
+    let ng_r = normalize(xf.apply_normal(rh.ng))
+    assert(length(ng_w - ng_r) < 1.0e-5, f"ng mismatch: {ng_w} vs {ng_r}")
+}

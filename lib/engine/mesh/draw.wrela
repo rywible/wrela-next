@@ -20,6 +20,7 @@ use mesh::shade::{
 }
 use mesh::swarm::{SwarmSim, swarm_fs, swarm_shadow_vs, swarm_sim, swarm_vs}
 use mesh::tsr::{TsrState, halton_jitter, tsr_state}
+use mesh::visbuf::{VisState, vis_state}
 use mesh::volume::{BloomPyramid, FroxelVolume, bloom_pyramid, froxel_volume, hdr_tone_fs}
 use mesh::world_draw::draw_shadow_casters
 use picture::eye::{Eye, View, view}
@@ -29,11 +30,11 @@ use picture::screen::{cover, luma, show}
 use std::collections::Vec
 use std::gpu::{
     Address, Compare, ComparisonSampler, Cull, Depth, DepthBias, DepthOnlyPass, DepthPass,
-    DepthPass2, DepthPass4, DepthTexture, Filter, GpuBuffer, R16Float, R32Float, Rg16Float, Rgba8,
-    Rgba16Float, Rgba32Float, Sampler, Texture, begin_depth_pass, begin_pass, begin_pass2,
-    begin_pass2_with_depth, begin_pass4, begin_pass4_with_depth, begin_pass_with_depth, buffer_of,
-    comparison_sampler, copy_texture, depth_texture, dispatch, draw, label, sampler, texture,
-    writable_texture,
+    DepthPass2, DepthPass4, DepthTexture, Filter, GpuBuffer, R16Float, R32Float, Rg16Float,
+    Rg32Uint, Rgba8, Rgba16Float, Rgba32Float, Sampler, Texture, begin_depth_pass, begin_pass,
+    begin_pass2, begin_pass2_with_depth, begin_pass4, begin_pass4_with_depth,
+    begin_pass_with_depth, buffer_of, comparison_sampler, copy_texture, depth_texture, dispatch,
+    draw, label, sampler, texture, writable_texture,
 }
 use std::hash::Hasher
 
@@ -66,6 +67,7 @@ pub struct MeshSight {
     pub bloom: BloomPyramid,
     pub swarm: SwarmSim,
     pub cull: HiZCuller,
+    vis: VisState,
     scratch: ExtractScratch,
     clipmap: ClipmapMesh,
     cube_indices: GpuBuffer<u32>,
@@ -115,6 +117,7 @@ pub fn mesh_sight(gi: bool = true) -> MeshSight {
         bloom: bloom_pyramid(),
         swarm: swarm_sim(),
         cull: hiz_culler(),
+        vis: vis_state(),
         scratch: extract_scratch(BATCH_BRICKS),
         clipmap: clipmap_mesh(),
         // A box's 36 vertices in order (`exact_box_vs` reads each one's corner and face).
@@ -528,15 +531,29 @@ impl MeshSight {
     ) {
         self.rad.cull_tiles(v, width, height_px)
 
-        // Pass 2a: 2-pass Reversed-Z Hi-Z occlusion culling + lean 1× G-buffer + analytical motion
-        // vectors with pixel-rate `channels(wp)`.
+        // Pass 2a: 64-bit Visibility Buffer (`Rg32Uint` + Reversed-Z Depth, 8 B/px, zero material
+        // evaluation during opaque rasterisation) + 16×16 screen-tile material classifier +
+        // pixel-rate exact-derivative Visibility Resolve into the compressed G-buffer.
         let nb = world.batch_count()
+        self.vis.prepare(width, height_px, nb)
         let use_hiz = self.cull.begin(mut self.batches, nb)
         let do_pass2 = use_hiz && self.cull.hiz_ready
         if use_hiz {
             self.cull.cull_pass1(mut self.batches, nb, v)
         }
         label("mesh_eye")
+        let vp: DepthPass<Rg32Uint> = begin_pass_with_depth(
+            mut self.vis.tex,
+            mut self.depth,
+            clear: vec4(0.0, 0.0, 0.0, 0.0),
+            clear_depth: 0.0,
+        )
+        world.draw_vis(fbufs, vp, mut self.batches, mut self.cull, first: 0, v: v)
+        vp.end()
+
+        self.vis.classify(width, height_px, nb)
+
+        label("mesh_vis_resolve")
         let ep: DepthPass4<Rgba8, Rgba8, Rgba16Float, Rg16Float> = begin_pass4_with_depth(
             mut self.g_normal,
             mut self.g_albedo,
@@ -544,7 +561,16 @@ impl MeshSight {
             mut self.g_motion,
             mut self.depth,
             clear: vec4(0.0, 0.0, 0.0, 0.0),
-            clear_depth: 0.0,
+            keep_depth: true,
+        )
+        world.draw_vis_resolve(
+            fbufs,
+            ep,
+            self.vis,
+            mut self.batches,
+            first: 0,
+            v: v,
+            prev_v: prev_v,
         )
         world.draw_eye(
             fbufs,

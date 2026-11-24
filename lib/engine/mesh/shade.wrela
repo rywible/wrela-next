@@ -277,18 +277,16 @@ fn micro_field_grad(p: vec3) -> vec4 {
     vec4(g1 + g2 + g3, v1 + v2 + v3)
 }
 
-/// Applies per-pixel 3D field-space microsurface relief (normal bump + roughness/albedo micro-grain)
-/// with automatic distance attenuation so distant surfaces never alias. The relief is evaluated at
-/// the material point `mp` (the thing's extraction-space or rest-pose point, which moves with it, so
-/// the grain never swims over a moving or skinned surface); its analytic gradient is carried to the
-/// world surface at `wp` through the pixel's screen derivatives of both points (Mikkelsen 2010
-/// surface-gradient bump mapping), exact for any rigid or skinned map from `mp` to `wp`.
-fn apply_micro_relief(wp: vec3, mp: vec3, n: vec3, sub: Substance, dist: f32) -> (vec3, Substance) {
-    // Derivatives first, while every pixel of the quad still runs this code.
-    let dwx = dpdx(wp)
-    let dwy = dpdy(wp)
-    let dmx = dpdx(mp)
-    let dmy = dpdy(mp)
+fn apply_micro_relief_deriv(
+    dwx: vec3,
+    dwy: vec3,
+    dmx: vec3,
+    dmy: vec3,
+    mp: vec3,
+    n: vec3,
+    sub: Substance,
+    dist: f32,
+) -> (vec3, Substance) {
     if sub.micro <= 0.01 {
         return (n, sub)
     }
@@ -328,11 +326,65 @@ fn apply_micro_relief(wp: vec3, mp: vec3, n: vec3, sub: Substance, dist: f32) ->
     })
 }
 
-/// Resolves crease-preserving shading normal from interpolated analytic normal and face derivatives.
-fn resolve_normal_from(wp: vec3, normal: vec3, smooth: f32, ray_back: vec3) -> vec3 {
+/// Applies per-pixel 3D field-space microsurface relief for any similarity-transformed (`Rigid`)
+/// meshlet where `wp = s * R * mp + t`: the world tangent-plane gradient is the exact orthogonal
+/// projection of `(M * mg.xyz) / s^2` onto the tangent plane perpendicular to `n` (zero screen
+/// derivatives needed, identical to `apply_micro_relief_deriv`).
+fn apply_micro_relief_rigid(
+    xf: Rigid,
+    mp: vec3,
+    n: vec3,
+    sub: Substance,
+    dist: f32,
+) -> (vec3, Substance) {
+    if sub.micro <= 0.01 {
+        return (n, sub)
+    }
+    let fade = clamp(1.0 - (dist - 4.0) / 28.0, 0.0, 1.0)
+    if fade <= 0.01 {
+        return (n, sub)
+    }
+    let mg = micro_field_grad(mp)
+    let amp = sub.micro * fade
+    let s = max(xf.scale_factor(), 1.0e-6)
+    let inv_s2 = 1.0 / (s * s)
+    let g_w = vec3(
+        dot(xf.row0.xyz, mg.xyz),
+        dot(xf.row1.xyz, mg.xyz),
+        dot(xf.row2.xyz, mg.xyz),
+    ) * inv_s2
+    let g_tan = g_w - n * dot(g_w, n)
+    let bump_s = if sub.coat > 0.2 { 0.024 } else { 0.045 }
+    let n_bumped = normalize(n - g_tan * (amp * bump_s))
+    let grain = clamp(mg.w, -1.0, 1.0)
+    let albedo_mod = clamp(sub.albedo * (1.0 + grain * amp * 0.14), vec3(0.01), vec3(1.0))
+    let rough_mod = clamp(sub.roughness + grain * amp * 0.12, 0.03, 1.0)
+    let coat_mod = if sub.coat > 0.1 { clamp(sub.coat + grain * amp * 0.25, 0.0, 1.0) } else {
+        sub.coat
+    }
+    (n_bumped, Substance {
+        albedo: albedo_mod,
+        roughness: rough_mod,
+        coat: coat_mod,
+        ..sub,
+    })
+}
+
+/// Applies per-pixel 3D field-space microsurface relief using hardware quad screen derivatives.
+fn apply_micro_relief(wp: vec3, mp: vec3, n: vec3, sub: Substance, dist: f32) -> (vec3, Substance) {
+    // Derivatives first, while every pixel of the quad still runs this code.
+    let dwx = dpdx(wp)
+    let dwy = dpdy(wp)
+    let dmx = dpdx(mp)
+    let dmy = dpdy(mp)
+    apply_micro_relief_deriv(dwx, dwy, dmx, dmy, mp, n, sub, dist)
+}
+
+/// Resolves crease-preserving shading normal from interpolated analytic normal and explicit
+/// geometric face normal `fraw` (zero quad-derivative artifacts).
+fn resolve_normal_exact(fraw: vec3, normal: vec3, smooth: f32, ray_back: vec3) -> vec3 {
     let nv_l2 = dot(normal, normal)
     let nv = if nv_l2 > 1.0e-12 { normal * (1.0 / sqrt(nv_l2)) } else { ray_back }
-    let fraw = cross(dpdx(wp), dpdy(wp))
     let fl2 = dot(fraw, fraw)
     var nf = nv
     if fl2 > 1.0e-18 {
@@ -344,13 +396,80 @@ fn resolve_normal_from(wp: vec3, normal: vec3, smooth: f32, ray_back: vec3) -> v
     if smooth < 0.5 || dot(nv, nf) < 0.85 { nf } else { nv }
 }
 
+/// Resolves crease-preserving shading normal from interpolated analytic normal and face derivatives.
+fn resolve_normal_from(wp: vec3, normal: vec3, smooth: f32, ray_back: vec3) -> vec3 {
+    resolve_normal_exact(cross(dpdx(wp), dpdy(wp)), normal, smooth, ray_back)
+}
+
 /// Exact screen-space motion `prev_uv - curr_uv` of a surface point now at `wp` and last frame at
 /// `prev_wp`, both projected without jitter (what `tsr` reprojects by).
 fn motion_of(wp: vec3, prev_wp: vec3, v: View, prev_v: View) -> vec2 {
     project_uv_unjittered(prev_v, prev_wp) - project_uv_unjittered(v, wp)
 }
 
-/// Shared 1× G-buffer + analytical motion-vector writer used by compact meshlets and heightfields.
+/// Lean Visibility-buffer 1× G-buffer writer for similarity-transformed (`Rigid`) meshlets:
+/// computes the exact tangent micro-relief gradient directly from `xf` with zero screen-space
+/// derivative math (halving live registers vs. `shade_gbuf_exact`).
+pub(package) fn shade_gbuf_rigid(
+    wp: vec3,
+    prev_wp: vec3,
+    mp: vec3,
+    xf: Rigid,
+    face_n: vec3,
+    normal: vec3,
+    smooth: f32,
+    sub0: Substance,
+    v: View,
+    prev_v: View,
+) -> Targets4<vec4, vec4, vec4, vec2> {
+    let to_eye = v.at - wp
+    let dist = length(to_eye)
+    let ray_back = if dist > 1.0e-6 { to_eye / dist } else { -v.forward }
+    let n0 = resolve_normal_exact(face_n, normal, smooth, ray_back)
+    let (n, sub) = apply_micro_relief_rigid(xf, mp, n0, sub0, dist)
+    let motion = motion_of(wp, prev_wp, v, prev_v)
+    Targets4 {
+        first: vec4(n * 0.5 + vec3(0.5), 1.0),
+        second: vec4(clamp(sub.albedo, vec3(0.0), vec3(1.0)), clamp(sub.roughness, 0.02, 1.0)),
+        third: vec4(max(sub.emits, vec3(0.0)), encode_mat_signed(sub)),
+        fourth: motion,
+    }
+}
+
+/// Visibility-buffer 1× G-buffer writer using exact analytical screen-space derivatives
+/// `(dwx, dwy, dmx, dmy)` and exact triangle face normal `face_n` (zero 2×2 helper-lane quad
+/// overshading and safe after per-pixel `discard_proven`).
+pub(package) fn shade_gbuf_exact(
+    wp: vec3,
+    prev_wp: vec3,
+    mp: vec3,
+    dwx: vec3,
+    dwy: vec3,
+    dmx: vec3,
+    dmy: vec3,
+    face_n: vec3,
+    normal: vec3,
+    smooth: f32,
+    sub0: Substance,
+    v: View,
+    prev_v: View,
+) -> Targets4<vec4, vec4, vec4, vec2> {
+    let to_eye = v.at - wp
+    let dist = length(to_eye)
+    let ray_back = if dist > 1.0e-6 { to_eye / dist } else { -v.forward }
+    let n0 = resolve_normal_exact(face_n, normal, smooth, ray_back)
+    let (n, sub) = apply_micro_relief_deriv(dwx, dwy, dmx, dmy, mp, n0, sub0, dist)
+    let motion = motion_of(wp, prev_wp, v, prev_v)
+    Targets4 {
+        first: vec4(n * 0.5 + vec3(0.5), 1.0),
+        second: vec4(clamp(sub.albedo, vec3(0.0), vec3(1.0)), clamp(sub.roughness, 0.02, 1.0)),
+        third: vec4(max(sub.emits, vec3(0.0)), encode_mat_signed(sub)),
+        fourth: motion,
+    }
+}
+
+/// Shared 1× G-buffer + analytical motion-vector writer used by heightfields, exact cells, and
+/// instanced skinned crowds.
 fn shade_gbuf_core(
     wp: vec3,
     prev_wp: vec3,
@@ -375,21 +494,7 @@ fn shade_gbuf_core(
     }
 }
 
-/// Pixel-rate analytical G-buffer fragment shader for `One<M>` compact meshlets: evaluates
-/// `field.channels(wp)` once per visible 1× screen pixel for infinite-resolution procedural detail.
-@fragment
-@budget(work: 8000)
-pub(package) fn field_gbuf_one_fs<M: Field<Substance>>(
-    vary: FieldVary,
-    field: M,
-    v: View,
-    prev_v: View,
-) -> Targets4<vec4, vec4, vec4, vec2> {
-    let sub0 = field.channels(vary.wp)
-    shade_gbuf_core(vary.wp, vary.prev_wp, vary.local_p, vary.normal, vary.meta.x, sub0, v, prev_v)
-}
-
-/// Pixel-rate analytical G-buffer fragment shader for `Pool<M>` compact meshlets.
+/// Pixel-rate analytical G-buffer fragment shader for Pass-2 Hi-Z disoccluded `Pool<M>` meshlets.
 @fragment
 @budget(work: 8000)
 pub(package) fn field_gbuf_many_fs<M: Field<Substance>>(
@@ -404,20 +509,7 @@ pub(package) fn field_gbuf_many_fs<M: Field<Substance>>(
     shade_gbuf_core(vary.wp, vary.prev_wp, vary.local_p, vary.normal, vary.meta.x, sub0, v, prev_v)
 }
 
-/// Skin-locked pixel-rate G-buffer fragment shader for `Skinned` `One<M>` meshlets.
-@fragment
-@budget(work: 8000)
-pub(package) fn field_skin_gbuf_one_fs<M: Field<Substance>>(
-    vary: SkinVary,
-    field: M,
-    v: View,
-    prev_v: View,
-) -> Targets4<vec4, vec4, vec4, vec2> {
-    let sub0 = field.rest_channels(vary.rest_p)
-    shade_gbuf_core(vary.wp, vary.prev_wp, vary.rest_p, vary.normal, vary.meta.x, sub0, v, prev_v)
-}
-
-/// Skin-locked pixel-rate G-buffer fragment shader for `Skinned` `Pool<M>` meshlets.
+/// Skin-locked pixel-rate G-buffer fragment shader for `Skinned` `Pool<M>` crowds.
 @fragment
 @budget(work: 8000)
 pub(package) fn field_skin_gbuf_many_fs<M: Field<Substance>>(
@@ -429,67 +521,6 @@ pub(package) fn field_skin_gbuf_many_fs<M: Field<Substance>>(
 ) -> Targets4<vec4, vec4, vec4, vec2> {
     let tid = min(u32(max(vary.meta.y, 0.0)), n_fields - 1)
     let sub0 = fields[tid].rest_channels(vary.rest_p)
-    shade_gbuf_core(vary.wp, vary.prev_wp, vary.rest_p, vary.normal, vary.meta.x, sub0, v, prev_v)
-}
-
-// The opaque side of a quad routed to the transmissive list. A quad with any transmissive vertex
-// is drawn only by the transmissive pass, which discards its pixels whose own channels are opaque;
-// these `_cut_` shaders draw the same quads (those with an opaque vertex too: `cut_indices`) into
-// the G-buffer and keep exactly those pixels, so a boundary between a glass part and an opaque
-// part of one field is covered by one pass or the other at every pixel (an opaque detail finer
-// than a quad inside one whose every vertex is glass is the glass's). They are separate entry
-// points so the plain opaque draws keep their early depth.
-
-/// The opaque pixels of `One<M>`'s transmissive quads into the G-buffer.
-@fragment
-@budget(work: 8000)
-pub(package) fn field_cut_gbuf_one_fs<M: Field<Substance>>(
-    vary: FieldVary,
-    field: M,
-    v: View,
-    prev_v: View,
-) -> Targets4<vec4, vec4, vec4, vec2> {
-    let sub0 = field.channels(vary.wp)
-    match prove_transmissive_only(sub0) {
-        Some(p) => discard_proven(p),
-        None => {},
-    }
-    shade_gbuf_core(vary.wp, vary.prev_wp, vary.local_p, vary.normal, vary.meta.x, sub0, v, prev_v)
-}
-
-/// The opaque pixels of `Pool<M>`'s transmissive quads into the G-buffer.
-@fragment
-@budget(work: 8000)
-pub(package) fn field_cut_gbuf_many_fs<M: Field<Substance>>(
-    vary: FieldVary,
-    fields: [M],
-    n_fields: u32,
-    v: View,
-    prev_v: View,
-) -> Targets4<vec4, vec4, vec4, vec2> {
-    let tid = min(u32(max(vary.meta.y, 0.0)), n_fields - 1)
-    let sub0 = fields[tid].channels(vary.wp)
-    match prove_transmissive_only(sub0) {
-        Some(p) => discard_proven(p),
-        None => {},
-    }
-    shade_gbuf_core(vary.wp, vary.prev_wp, vary.local_p, vary.normal, vary.meta.x, sub0, v, prev_v)
-}
-
-/// The opaque pixels of a `Skinned` `One<M>`'s transmissive quads into the G-buffer.
-@fragment
-@budget(work: 8000)
-pub(package) fn field_skin_cut_gbuf_one_fs<M: Field<Substance>>(
-    vary: SkinVary,
-    field: M,
-    v: View,
-    prev_v: View,
-) -> Targets4<vec4, vec4, vec4, vec2> {
-    let sub0 = field.rest_channels(vary.rest_p)
-    match prove_transmissive_only(sub0) {
-        Some(p) => discard_proven(p),
-        None => {},
-    }
     shade_gbuf_core(vary.wp, vary.prev_wp, vary.rest_p, vary.normal, vary.meta.x, sub0, v, prev_v)
 }
 

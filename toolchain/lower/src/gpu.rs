@@ -253,6 +253,7 @@ fn classify(cx: &Cx, f: FnId, param: usize, ty: TyId, varyings: Option<TyId>) ->
             BuiltinInput::WorkgroupId => ir::BuiltinInput::WorkgroupId,
             BuiltinInput::VertexIndex => ir::BuiltinInput::VertexIndex,
             BuiltinInput::InstanceIndex => ir::BuiltinInput::InstanceIndex,
+            BuiltinInput::PrimitiveIndex => ir::BuiltinInput::PrimitiveIndex,
             BuiltinInput::FragCoord => ir::BuiltinInput::Position,
             BuiltinInput::SubgroupInvocation => ir::BuiltinInput::SubgroupInvocationId,
             BuiltinInput::SubgroupSize => ir::BuiltinInput::SubgroupSize,

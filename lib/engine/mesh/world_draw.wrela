@@ -11,21 +11,24 @@ use mesh::extract::{
 use mesh::light::{Emitter, NEAR, RadGrid, RadianceCache, ShadowView}
 use mesh::sdf::{SdfClipmap, SdfGrid}
 use mesh::shade::{
-    FAR_TIER_DIST, deformed_mesh_vs, exact_box_one_fs, exact_box_vs, field_cut_gbuf_many_fs,
-    field_cut_gbuf_one_fs, field_gbuf_many_fs, field_gbuf_one_fs, field_refract_refl_many_fs,
-    field_refract_refl_one_fs, field_skin_cut_gbuf_many_fs, field_skin_cut_gbuf_one_fs,
-    field_skin_gbuf_many_fs, field_skin_gbuf_one_fs, field_skin_refract_refl_many_fs,
-    field_skin_refract_refl_one_fs, field_skin_trans_many_fs, field_skin_trans_one_fs,
-    field_trans_many_fs, field_trans_one_fs, mesh_vs, shadow_fs, shadow_vs, skin_mesh_vs,
-    skin_shadow_vs,
+    FAR_TIER_DIST, deformed_mesh_vs, exact_box_one_fs, exact_box_vs, field_gbuf_many_fs,
+    field_refract_refl_many_fs, field_refract_refl_one_fs, field_skin_cut_gbuf_many_fs,
+    field_skin_gbuf_many_fs, field_skin_refract_refl_many_fs, field_skin_refract_refl_one_fs,
+    field_skin_trans_many_fs, field_skin_trans_one_fs, field_trans_many_fs, field_trans_one_fs,
+    mesh_vs, shadow_fs, shadow_vs, skin_mesh_vs, skin_shadow_vs,
 }
 use mesh::swarm::SwarmSim
+use mesh::visbuf::{
+    VisState, vis_cut_many_fs, vis_cut_one_fs, vis_cut_vs, vis_deformed_cut_one_fs,
+    vis_deformed_cut_vs, vis_deformed_vs, vis_fs, vis_mesh_vs, vis_resolve_deformed_one_fs,
+    vis_resolve_many_fs, vis_resolve_one_fs, vis_tile_vs,
+}
 use picture::eye::View
 use std::collections::Vec
 use std::field::{Bound, Field, Rigid}
 use std::gpu::{
     Compare, ComparisonSampler, Cull, Depth, DepthBias, DepthOnlyPass, DepthPass, DepthPass2,
-    DepthPass4, DepthTexture, GpuBuffer, GpuSpan, R16Float, R32Float, Rg16Float, Rgba8,
+    DepthPass4, DepthTexture, GpuBuffer, GpuSpan, R16Float, R32Float, Rg16Float, Rg32Uint, Rgba8,
     Rgba16Float, Sampler, Texture, Texture3d, buffer, buffer_of, draw, draw_multi,
 }
 use std::hash::StateHash
@@ -92,6 +95,25 @@ pub trait MeshWorld {
         cmp: ComparisonSampler,
         static_only: bool,
         all_batches: bool,
+    )
+    fn draw_vis(
+        self,
+        fbufs: Self::FieldBufs,
+        vp: DepthPass<Rg32Uint>,
+        batches: mut Vec<MeshBatch>,
+        cull: mut HiZCuller,
+        first: u32,
+        v: View,
+    )
+    fn draw_vis_resolve(
+        self,
+        fbufs: Self::FieldBufs,
+        ep: DepthPass4<Rgba8, Rgba8, Rgba16Float, Rg16Float>,
+        vis: VisState,
+        batches: mut Vec<MeshBatch>,
+        first: u32,
+        v: View,
+        prev_v: View,
     )
     fn draw_eye(
         self,
@@ -281,37 +303,27 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for One<M> {
         )
     }
 
-    fn draw_eye(
+    fn draw_vis(
         self,
         _fbufs: u32,
-        ep: DepthPass4<Rgba8, Rgba8, Rgba16Float, Rg16Float>,
+        vp: DepthPass<Rg32Uint>,
         batches: mut Vec<MeshBatch>,
-        cull: mut HiZCuller,
-        cube_indices: GpuBuffer<u32>,
-        dc_depth: Texture<R32Float>,
+        _cull: mut HiZCuller,
         first: u32,
-        pass_idx: u32,
         v: View,
-        prev_v: View,
     ) {
-        // Opaque quads, then the opaque pixels of the transmissive quads (`_cut_` shaders).
         if batches[first].is_deformed {
-            if pass_idx != 0 {
-                return
-            }
-            let vs = deformed_mesh_vs.bind(
-                verts: batches[first].deformed_verts.items(),
-                prev_verts: batches[first].prev_deformed_verts.items(),
-                rest_verts: batches[first].verts.items(),
-                xforms: batches[first].xforms.items(),
-                prev_xforms: batches[first].prev_xforms.items(),
-                v: v,
-            )
             if batches[first].has_opaque {
                 draw(
-                    ep,
-                    vs,
-                    field_skin_gbuf_one_fs.bind(field: self.field, v: v, prev_v: prev_v),
+                    vp,
+                    vis_deformed_vs.bind(
+                        verts: batches[first].deformed_verts.items(),
+                        xforms: batches[first].xforms.items(),
+                        batch_id: first,
+                        kind: 0,
+                        v: v,
+                    ),
+                    vis_fs,
                     indices: batches[first].indices,
                     indirect: batches[first].draw_args,
                     cull: Cull::Back,
@@ -320,9 +332,15 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for One<M> {
             }
             if batches[first].has_trans {
                 draw(
-                    ep,
-                    vs,
-                    field_skin_cut_gbuf_one_fs.bind(field: self.field, v: v, prev_v: prev_v),
+                    vp,
+                    vis_deformed_cut_vs.bind(
+                        verts: batches[first].deformed_verts.items(),
+                        rest_verts: batches[first].verts.items(),
+                        xforms: batches[first].xforms.items(),
+                        batch_id: first,
+                        v: v,
+                    ),
+                    vis_deformed_cut_one_fs.bind(field: self.field),
                     indices: batches[first].cut_indices,
                     indirect: batches[first].cut_draw_args,
                     cull: Cull::Back,
@@ -331,46 +349,17 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for One<M> {
             }
             return
         }
-        if pass_idx == 2 {
-            if batches[first].has_exact {
-                draw(
-                    ep,
-                    exact_box_vs.bind(
-                        cells: batches[first].exact_cells.items(),
-                        xforms: batches[first].xforms.items(),
-                        v: v,
-                    ),
-                    exact_box_one_fs.bind(
-                        field: self.field,
-                        dc_depth: dc_depth,
-                        v: v,
-                        prev_v: prev_v,
-                    ),
-                    indices: cube_indices,
-                    indirect: batches[first].exact_draw_args,
-                    cull: Cull::None,
-                    depth: Depth { compare: Compare::Greater, write: true },
-                )
-            }
-            return
-        }
-        if pass_idx != 0 {
-            return
-        }
-        let vs = mesh_vs.bind(
-            verts: batches[first].verts.items(),
-            xforms: batches[first].xforms.items(),
-            prev_xforms: batches[first].prev_xforms.items(),
-            inst_ids: batches[first].inst_ids.items(),
-            is_instanced: 0,
-            v: v,
-        )
-        let fs = field_gbuf_one_fs.bind(field: self.field, v: v, prev_v: prev_v)
         if batches[first].has_opaque {
             draw(
-                ep,
-                vs,
-                fs,
+                vp,
+                vis_mesh_vs.bind(
+                    verts: batches[first].verts.items(),
+                    xforms: batches[first].xforms.items(),
+                    batch_id: first,
+                    kind: 0,
+                    v: v,
+                ),
+                vis_fs,
                 indices: batches[first].indices,
                 indirect: batches[first].draw_args,
                 cull: Cull::Back,
@@ -379,12 +368,121 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for One<M> {
         }
         if batches[first].has_trans {
             draw(
-                ep,
-                vs,
-                field_cut_gbuf_one_fs.bind(field: self.field, v: v, prev_v: prev_v),
+                vp,
+                vis_cut_vs.bind(
+                    verts: batches[first].verts.items(),
+                    xforms: batches[first].xforms.items(),
+                    inst_ids: batches[first].inst_ids.items(),
+                    is_instanced: 0,
+                    batch_id: first,
+                    v: v,
+                ),
+                vis_cut_one_fs.bind(field: self.field),
                 indices: batches[first].cut_indices,
                 indirect: batches[first].cut_draw_args,
                 cull: Cull::Back,
+                depth: Depth { compare: Compare::Greater, write: true },
+            )
+        }
+    }
+
+    fn draw_vis_resolve(
+        self,
+        _fbufs: u32,
+        ep: DepthPass4<Rgba8, Rgba8, Rgba16Float, Rg16Float>,
+        vis: VisState,
+        batches: mut Vec<MeshBatch>,
+        first: u32,
+        v: View,
+        prev_v: View,
+    ) {
+        if first >= vis.cap_batches {
+            return
+        }
+        if !batches[first].has_opaque && !batches[first].has_trans {
+            return
+        }
+        let inv_size = vec2(1.0 / max(v.size.x, 1.0), 1.0 / max(v.size.y, 1.0))
+        let tile_vs = vis_tile_vs.bind(
+            tile_lists: vis.tile_lists.items(),
+            tile_base: first * vis.max_tiles,
+            inv_size: inv_size,
+        )
+        if batches[first].is_deformed {
+            draw(
+                ep,
+                tile_vs,
+                vis_resolve_deformed_one_fs.bind(
+                    vis: vis.tex,
+                    verts: batches[first].deformed_verts.items(),
+                    prev_verts: batches[first].prev_deformed_verts.items(),
+                    rest_verts: batches[first].verts.items(),
+                    indices: batches[first].indices.items(),
+                    cut_indices: batches[first].cut_indices.items(),
+                    xforms: batches[first].xforms.items(),
+                    prev_xforms: batches[first].prev_xforms.items(),
+                    field: self.field,
+                    batch_id: first,
+                    v: v,
+                    prev_v: prev_v,
+                ),
+                indirect: vis.tile_draws.at(first),
+                cull: Cull::None,
+                depth: Depth { compare: Compare::Always, write: false },
+            )
+            return
+        }
+        draw(
+            ep,
+            tile_vs,
+            vis_resolve_one_fs.bind(
+                vis: vis.tex,
+                verts: batches[first].verts.items(),
+                indices: batches[first].indices.items(),
+                cut_indices: batches[first].cut_indices.items(),
+                xforms: batches[first].xforms.items(),
+                prev_xforms: batches[first].prev_xforms.items(),
+                field: self.field,
+                batch_id: first,
+                v: v,
+                prev_v: prev_v,
+            ),
+            indirect: vis.tile_draws.at(first),
+            cull: Cull::None,
+            depth: Depth { compare: Compare::Always, write: false },
+        )
+    }
+
+    fn draw_eye(
+        self,
+        _fbufs: u32,
+        ep: DepthPass4<Rgba8, Rgba8, Rgba16Float, Rg16Float>,
+        batches: mut Vec<MeshBatch>,
+        _cull: mut HiZCuller,
+        cube_indices: GpuBuffer<u32>,
+        dc_depth: Texture<R32Float>,
+        first: u32,
+        pass_idx: u32,
+        v: View,
+        prev_v: View,
+    ) {
+        if pass_idx == 2 && !batches[first].is_deformed && batches[first].has_exact {
+            draw(
+                ep,
+                exact_box_vs.bind(
+                    cells: batches[first].exact_cells.items(),
+                    xforms: batches[first].xforms.items(),
+                    v: v,
+                ),
+                exact_box_one_fs.bind(
+                    field: self.field,
+                    dc_depth: dc_depth,
+                    v: v,
+                    prev_v: prev_v,
+                ),
+                indices: cube_indices,
+                indirect: batches[first].exact_draw_args,
+                cull: Cull::None,
                 depth: Depth { compare: Compare::Greater, write: true },
             )
         }
@@ -1035,6 +1133,147 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for Pool<M> {
         }
     }
 
+    fn draw_vis(
+        self,
+        fbuf: GpuBuffer<M>,
+        vp: DepthPass<Rg32Uint>,
+        batches: mut Vec<MeshBatch>,
+        cull: mut HiZCuller,
+        first: u32,
+        v: View,
+    ) {
+        for s in 0..NEAR_SLOTS {
+            let bi = first + POOL_SHARED + s
+            let id = batches[bi].near_id
+            if id < self.fields.len() {
+                one(self.fields[id]).draw_vis(0, vp, mut batches, mut cull, bi, v)
+            }
+        }
+        let n = self.fields.len()
+        if n == 0 {
+            return
+        }
+        let n_sub: u32 = if n >= 16 { 3 } else { 1 }
+        for k in 0..n_sub {
+            let bi = first + k
+            if batches[bi].is_skinned {
+                continue
+            }
+            let is_inst: u32 = if batches[bi].instanced { 1 } else { 0 }
+            let inst_cull = cull.active && batches[bi].use_inst_cull()
+            if batches[bi].has_opaque {
+                let vs = vis_mesh_vs.bind(
+                    verts: batches[bi].verts.items(),
+                    xforms: batches[bi].xforms.items(),
+                    batch_id: bi,
+                    kind: 0,
+                    v: v,
+                )
+                if inst_cull && batches[bi].inst_count > 0 {
+                    draw_multi(
+                        vp,
+                        vs,
+                        vis_fs,
+                        indices: batches[bi].indices,
+                        indirect: cull.batch_bufs[bi].vis_draws_1,
+                        count: batches[bi].inst_count,
+                        cull: Cull::Back,
+                        depth: Depth { compare: Compare::Greater, write: true },
+                    )
+                } else {
+                    draw(
+                        vp,
+                        vs,
+                        vis_fs,
+                        indices: batches[bi].indices,
+                        indirect: batches[bi].draw_args,
+                        cull: Cull::Back,
+                        depth: Depth { compare: Compare::Greater, write: true },
+                    )
+                }
+            }
+            if batches[bi].has_trans {
+                draw(
+                    vp,
+                    vis_cut_vs.bind(
+                        verts: batches[bi].verts.items(),
+                        xforms: batches[bi].xforms.items(),
+                        inst_ids: batches[bi].inst_ids.items(),
+                        is_instanced: is_inst,
+                        batch_id: bi,
+                        v: v,
+                    ),
+                    vis_cut_many_fs.bind(fields: fbuf.items(), n_fields: n),
+                    indices: batches[bi].cut_indices,
+                    indirect: batches[bi].cut_draw_args,
+                    cull: Cull::Back,
+                    depth: Depth { compare: Compare::Greater, write: true },
+                )
+            }
+        }
+    }
+
+    fn draw_vis_resolve(
+        self,
+        fbuf: GpuBuffer<M>,
+        ep: DepthPass4<Rgba8, Rgba8, Rgba16Float, Rg16Float>,
+        vis: VisState,
+        batches: mut Vec<MeshBatch>,
+        first: u32,
+        v: View,
+        prev_v: View,
+    ) {
+        for s in 0..NEAR_SLOTS {
+            let bi = first + POOL_SHARED + s
+            let id = batches[bi].near_id
+            if id < self.fields.len() {
+                one(self.fields[id]).draw_vis_resolve(0, ep, vis, mut batches, bi, v, prev_v)
+            }
+        }
+        let n = self.fields.len()
+        if n == 0 {
+            return
+        }
+        let inv_size = vec2(1.0 / max(v.size.x, 1.0), 1.0 / max(v.size.y, 1.0))
+        let n_sub: u32 = if n >= 16 { 3 } else { 1 }
+        for k in 0..n_sub {
+            let bi = first + k
+            if batches[bi].is_skinned || bi >= vis.cap_batches {
+                continue
+            }
+            if !batches[bi].has_opaque && !batches[bi].has_trans {
+                continue
+            }
+            let is_inst: u32 = if batches[bi].instanced { 1 } else { 0 }
+            draw(
+                ep,
+                vis_tile_vs.bind(
+                    tile_lists: vis.tile_lists.items(),
+                    tile_base: bi * vis.max_tiles,
+                    inv_size: inv_size,
+                ),
+                vis_resolve_many_fs.bind(
+                    vis: vis.tex,
+                    verts: batches[bi].verts.items(),
+                    indices: batches[bi].indices.items(),
+                    cut_indices: batches[bi].cut_indices.items(),
+                    xforms: batches[bi].xforms.items(),
+                    prev_xforms: batches[bi].prev_xforms.items(),
+                    inst_ids: batches[bi].inst_ids.items(),
+                    is_instanced: is_inst,
+                    fields: fbuf.items(),
+                    n_fields: n,
+                    batch_id: bi,
+                    v: v,
+                    prev_v: prev_v,
+                ),
+                indirect: vis.tile_draws.at(bi),
+                cull: Cull::None,
+                depth: Depth { compare: Compare::Always, write: false },
+            )
+        }
+    }
+
     fn draw_eye(
         self,
         fbuf: GpuBuffer<M>,
@@ -1073,8 +1312,9 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for Pool<M> {
         if n == 0 {
             return
         }
-        // Per batch: opaque quads (via 2-pass Hi-Z `draw_multi()` for large instanced crowds),
-        // then opaque pixels of transmissive quads (`_cut_`, Pass 1 only).
+        // Skinned shared crowds draw directly (vertex-shader DQS + posed Newton projection);
+        // non-skinned shared batches use the Visibility Buffer in Pass 1 and only draw newly
+        // disoccluded Pass-2 Hi-Z instances here.
         let n_sub: u32 = if n >= 16 { 3 } else { 1 }
         for k in 0..n_sub {
             let bi = first + k
@@ -1157,7 +1397,7 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for Pool<M> {
                         depth: Depth { compare: Compare::Greater, write: true },
                     )
                 }
-            } else {
+            } else if pass_idx == 1 && inst_cull && batches[bi].has_opaque && batches[bi].inst_count > 0 {
                 let vs = mesh_vs.bind(
                     verts: batches[bi].verts.items(),
                     xforms: batches[bi].xforms.items(),
@@ -1172,59 +1412,16 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for Pool<M> {
                     v: v,
                     prev_v: prev_v,
                 )
-                if batches[bi].has_opaque {
-                    if inst_cull && batches[bi].inst_count > 0 {
-                        if pass_idx == 0 {
-                            draw_multi(
-                                ep,
-                                vs,
-                                fs,
-                                indices: batches[bi].indices,
-                                indirect: cull.batch_bufs[bi].vis_draws_1,
-                                count: batches[bi].inst_count,
-                                cull: Cull::Back,
-                                depth: Depth { compare: Compare::Greater, write: true },
-                            )
-                        } else {
-                            draw_multi(
-                                ep,
-                                vs,
-                                fs,
-                                indices: batches[bi].indices,
-                                indirect: cull.batch_bufs[bi].vis_draws_2,
-                                count: batches[bi].inst_count,
-                                cull: Cull::Back,
-                                depth: Depth { compare: Compare::Greater, write: true },
-                            )
-                        }
-                    } else if pass_idx == 0 {
-                        draw(
-                            ep,
-                            vs,
-                            fs,
-                            indices: batches[bi].indices,
-                            indirect: batches[bi].draw_args,
-                            cull: Cull::Back,
-                            depth: Depth { compare: Compare::Greater, write: true },
-                        )
-                    }
-                }
-                if pass_idx == 0 && batches[bi].has_trans {
-                    draw(
-                        ep,
-                        vs,
-                        field_cut_gbuf_many_fs.bind(
-                            fields: fbuf.items(),
-                            n_fields: n,
-                            v: v,
-                            prev_v: prev_v,
-                        ),
-                        indices: batches[bi].cut_indices,
-                        indirect: batches[bi].cut_draw_args,
-                        cull: Cull::Back,
-                        depth: Depth { compare: Compare::Greater, write: true },
-                    )
-                }
+                draw_multi(
+                    ep,
+                    vs,
+                    fs,
+                    indices: batches[bi].indices,
+                    indirect: cull.batch_bufs[bi].vis_draws_2,
+                    count: batches[bi].inst_count,
+                    cull: Cull::Back,
+                    depth: Depth { compare: Compare::Greater, write: true },
+                )
             }
         }
     }
@@ -1663,6 +1860,35 @@ impl<A: MeshWorld, B: MeshWorld> MeshWorld for And<A, B> {
             static_only: static_only,
             all_batches: all_batches,
         )
+    }
+
+    fn draw_vis(
+        self,
+        fbufs: (A::FieldBufs, B::FieldBufs),
+        vp: DepthPass<Rg32Uint>,
+        batches: mut Vec<MeshBatch>,
+        cull: mut HiZCuller,
+        first: u32,
+        v: View,
+    ) {
+        let na = self.a.batch_count()
+        self.a.draw_vis(fbufs.0, vp, mut batches, mut cull, first, v)
+        self.b.draw_vis(fbufs.1, vp, mut batches, mut cull, first + na, v)
+    }
+
+    fn draw_vis_resolve(
+        self,
+        fbufs: (A::FieldBufs, B::FieldBufs),
+        ep: DepthPass4<Rgba8, Rgba8, Rgba16Float, Rg16Float>,
+        vis: VisState,
+        batches: mut Vec<MeshBatch>,
+        first: u32,
+        v: View,
+        prev_v: View,
+    ) {
+        let na = self.a.batch_count()
+        self.a.draw_vis_resolve(fbufs.0, ep, vis, mut batches, first, v, prev_v)
+        self.b.draw_vis_resolve(fbufs.1, ep, vis, mut batches, first + na, v, prev_v)
     }
 
     fn draw_eye(

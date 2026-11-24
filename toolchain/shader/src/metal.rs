@@ -1077,6 +1077,7 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
                 B::NumWorkgroups => ("metal::uint3", "threadgroups_per_grid"),
                 B::VertexIndex => ("uint", "vertex_id"),
                 B::InstanceIndex => ("uint", "instance_id"),
+                B::PrimitiveIndex => ("uint", "primitive_id"),
                 B::Position => ("metal::float4", "position"),
                 B::SubgroupInvocationId => ("uint", "thread_index_in_simdgroup"),
                 B::SubgroupSize => ("uint", "threads_per_simdgroup"),

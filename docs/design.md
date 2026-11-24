@@ -1133,6 +1133,66 @@ operation's error joins it, so `length(max(q, 0))` and `min(max(q), 0)`, whose s
 exactly, can't be made to cancel there; it needs an error symbol for each such operation (full
 affine arithmetic), which the certificates' scoreboard would measure.
 
+### Module split, Metal compute batching, and 64-bit Visibility Buffer (2026-11-23)
+
+**Modular engine layout (`34945d4`).** The two monolithic mesh files were split into strictly
+acyclic modules with unchanged public entry points: `extract.wrela` (8,971 lines) into
+`grid.wrela`, `dc.wrela`, `emit.wrela`, `extract.wrela` (orchestration + re-exports), and
+`extract_tests.wrela`; `draw.wrela` (5,436 lines) into `shade.wrela`, `world_draw.wrela`, and
+`draw.wrela`. All engine/world tests, `tools/layers`, and the 13-kind hole audit pass.
+
+**Metal untimed compute encoder batching (`17afb4e`).** `toolchain/gpu/src/metal.rs` now keeps one
+serial `MTLComputeCommandEncoder` open across consecutive untimed `begin_compute_pass(..., None)`
+calls, issuing `memoryBarrierWithScope(Buffers | Textures)` when a prior dispatch in the batch
+wrote a texture (caught by `tools/hosts` on `mesh_indirect`'s `rad_resolve` → `rad_mip` texture
+handoff) and `Buffers` otherwise, closing before blits, render passes, timed compute passes,
+`finish()`, and `Drop`. Measured on Apple M4 at 1080p: `SCENE=10` cold frame 0 `record` dropped
+from `45.14 ms` to `40.41 ms` (`-4.7 ms`), steady-state `record` dropped `~15%` (`1.16–1.23 ms` →
+`0.92–1.11 ms`), and `SCENE=11` extraction frame 10 `record` dropped `-24%` (`3.20 → 2.43 ms`)
+with identical state hashes (`839c1f5bd9cb186d` / `7e6a1b3e03d28510`).
+
+**64-bit Visibility Buffer + 16×16 tile classifier + analytical resolve (Phase 2.1 + 2.2).**
+Added compiler `std::gpu::PrimitiveIndex` (`[[primitive_id]]` in Metal; `BuiltIn::PrimitiveId` +
+`Capability::Geometry` + `Decoration::Flat` in SPIR-V, validated by `spirv-val` and VVL, with
+Vulkan `geometry_shader` enabled when supported) and `lib/engine/mesh/visbuf.wrela`:
+- `mesh_eye` now rasterises `One<M>`, pre-deformed `One<Skinned>`, and non-skinned `Pool<M>`
+  Pass-1 meshlets into ONE 64-bit `Rg32Uint` target (8 B/px vs. 20 B/px) + Reversed-Z depth with
+  zero material/field work during rasterisation, deleting 5 duplicated opaque G-buffer fragment
+  shaders in `shade.wrela`.
+- `vis_classify` (`@compute(8, 8)` over 16×16 tiles using `SharedAtomics<8>`, up to 256 batches)
+  bins visible tiles into dense per-batch indirect `DrawArgs`. Measuring 8×8 vs. 16×16 tiles on M4
+  showed 8×8 added `+0.34 ms` of tile-quad overhead on `SCENE=10` (`1.165 → 1.466 ms`), so 16×16
+  was kept.
+- `vis_resolve_*_fs` draws only classified tiles into `DepthPass4` (preserving RADV DCC and M4
+  TBDR tile memory). Rigid `One<M>` / `Pool<M>` resolve uses local-space Möller–Trumbore
+  `vis_bary_rigid` + `shade_gbuf_rigid` (exact tangent micro-relief gradient from `xf` with zero
+  screen-space derivatives, cutting M4 `SCENE=10` resolve from `1.165` to `1.052 ms`); pre-deformed
+  skinned resolve uses world-space Möller–Trumbore `vis_bary` + exact quotient-rule partial
+  derivatives (`shade_gbuf_exact`), with zero near-plane clipping singularities.
+- **Visual fix:** Replacing 2×2 quad `cross(dpdx(wp), dpdy(wp))` with the exact triangle face
+  normal `bh.ng` eliminated the 1-pixel dark shadow halos around recessed pillar slits, bevels, and
+  floor ring inlays where 2×2 helper lanes straddled sharp creases.
+- **Verification:** M4 `SCENE=6` 640×360 24-eye audit PASSED (13/13 kinds, 0 cracks, 0 overflows);
+  M4 `SCENE=0` judge (160×90, 32 looks) matched the reference floor (`outline off 0.15 px`,
+  `0 holes`, `lit mean 0.966/255`, `apart 99.60% < 0.05 px`); Radeon Vulkan passed
+  `WRELA_VULKAN_VALIDATION=1` with **0 VVL errors** across `SCENE=10`, `SCENE=11`, and the 13-kind
+  `SCENE=6` audit, with bit-for-bit identical state hashes to Apple M4 (`70f3b86de5759a1c` /
+  `fdec2efb4604950d`).
+- **Dual-machine 1080p measurements (exact `17afb4e` vs. VisBuf, steady-state frame 10 serial):**
+  - **Apple M4 Metal:** `SCENE=10` `mesh_eye` `2.642 → 1.286 ms` (`-51%`), `vis_classify`
+    `0.175 ms`, `vis_resolve` `1.052 ms`, eye total `2.642 → 2.513 ms` (`-4.9%`), full serial sum
+    `16.467 → 16.081 ms` (`-0.39 ms`). `SCENE=11` `mesh_eye` `4.993 → 1.183 ms` (`-76%`),
+    `vis_classify` `0.317 ms`, `vis_resolve` (incl. 240 distant skinned) `4.542 ms`, eye total
+    `4.993 → 6.041 ms` (`+1.05 ms` from 16 separate near-slot indirect resolves).
+  - **Linux AMD Radeon Vulkan (`wrela-popos`):** `SCENE=10` `mesh_eye` `5.310 → 2.525 ms` (`-52%`),
+    `vis_classify` `0.262 ms`, `vis_resolve` `3.136 ms`, eye total `5.310 → 5.923 ms` (`+0.61 ms`),
+    overlapped `48.7–50.0 → 50.0–51.6 ms`. `SCENE=11` `mesh_eye` `14.441 → 3.823 ms` (`-74%`),
+    `vis_classify` `0.362 ms`, `vis_resolve` `10.170 ms`, eye total `14.441 → 14.355 ms` (`-0.6%`),
+    overlapped `35.3–35.8 → 35.4–35.6 ms` (parity).
+  - Because the pipeline still writes the 4-target G-buffer before `mesh_direct`, total frame time
+    is near break-even today; the big bandwidth win lands when resolve fuses directly into shading
+    (and unlocks Phase 2.3 analytical silhouette ray-snap directly on the winning `Field`).
+
 ## The layers
 
 Dependencies point down. Nothing below knows anything above.

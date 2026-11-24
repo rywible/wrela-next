@@ -375,6 +375,36 @@ fn derivatives_are_fine() {
     assert!(!has_op(&spv, spirv::Op::DPdx));
 }
 
+/// `PrimitiveIndex` emits `[[primitive_id]]` in Metal and `BuiltIn::PrimitiveId` with
+/// `Capability::Geometry` + `Decoration::Flat` in SPIR-V (validated by `spirv-val` and Metal).
+#[test]
+fn primitive_index_emits_metal_and_spirv() {
+    let mut b = Builder::new();
+    b.vertex("v", &[], |f| {
+        let zero = f.f32(0.0);
+        let v4 = f.types().vector(4);
+        let p = f.construct(v4, &[zero, zero, zero, zero]);
+        f.ret_clip(p);
+    });
+    b.fragment("f", &[BuiltinInput::PrimitiveIndex], |f| {
+        let u = f.types().scalar(Scalar::U32);
+        let fl = f.types().scalar(Scalar::F32);
+        let pi = f.types().intern(ir::TypeDef::Struct {
+            name: "PrimitiveIndex".into(),
+            fields: vec![("index".into(), u)],
+        });
+        let prim = f.input(0, pi);
+        let id = f.extract(u, prim, 0);
+        let idf = f.bitcast(fl, id, Scalar::F32);
+        let v4 = f.types().vector(4);
+        let out = f.construct(v4, &[idf, idf, idf, idf]);
+        f.ret(Some(out));
+    });
+    let (msl, spv, ..) = written(&b.m, &render_pipeline(Vec::new()), Checks::CHECKED);
+    assert!(msl.contains("[[primitive_id]]"), "{msl}");
+    assert!(has_op(&spv, spirv::Op::Capability));
+}
+
 /// Float constants at the edges of what a float holds are written so each tool reads them back:
 /// the largest, the smallest normal, infinities and NaN.
 #[test]

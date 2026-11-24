@@ -1311,6 +1311,10 @@ impl<'m> FunctionWriter<'_, 'm> {
                 B::NumWorkgroups => (u3, BuiltIn::NumWorkgroups, "num_workgroups"),
                 B::VertexIndex => (u, BuiltIn::VertexIndex, "vertex_index"),
                 B::InstanceIndex => (u, BuiltIn::InstanceIndex, "instance_index"),
+                B::PrimitiveIndex => {
+                    self.w.capability(Capability::Geometry);
+                    (u, BuiltIn::PrimitiveId, "primitive_id")
+                }
                 B::Position => (f4, BuiltIn::FragCoord, "frag_coord"),
                 B::SubgroupInvocationId => {
                     self.w.capability(Capability::GroupNonUniform);
@@ -1322,6 +1326,9 @@ impl<'m> FunctionWriter<'_, 'm> {
                 }
             };
             let var = self.builtin_var(StorageClass::Input, t, builtin, name);
+            if *b == B::PrimitiveIndex {
+                self.w.decorate(var, Decoration::Flat, &[]);
+            }
             if *b == B::Position {
                 self.frag_coord = Some((var, f4));
             }

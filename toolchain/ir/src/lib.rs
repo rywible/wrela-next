@@ -913,6 +913,8 @@ pub enum BuiltinInput {
     NumWorkgroups,
     VertexIndex,
     InstanceIndex,
+    /// The fragment's triangle (primitive) index within its draw.
+    PrimitiveIndex,
     /// The fragment's position.
     Position,
     /// The invocation's index in its subgroup, and the subgroup's size (`subgroups` only).

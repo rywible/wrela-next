@@ -269,6 +269,7 @@ pub enum BuiltinInput {
     WorkgroupId,
     VertexIndex,
     InstanceIndex,
+    PrimitiveIndex,
     FragCoord,
     SubgroupInvocation,
     SubgroupSize,
@@ -283,6 +284,7 @@ impl BuiltinInput {
             Lang::WorkgroupId => BuiltinInput::WorkgroupId,
             Lang::VertexIndex => BuiltinInput::VertexIndex,
             Lang::InstanceIndex => BuiltinInput::InstanceIndex,
+            Lang::PrimitiveIndex => BuiltinInput::PrimitiveIndex,
             Lang::FragCoord => BuiltinInput::FragCoord,
             Lang::SubgroupInvocation => BuiltinInput::SubgroupInvocation,
             Lang::SubgroupSize => BuiltinInput::SubgroupSize,
@@ -299,7 +301,7 @@ impl BuiltinInput {
             | BuiltinInput::SubgroupInvocation
             | BuiltinInput::SubgroupSize => matches!(entry, Entry::Compute(_)),
             BuiltinInput::VertexIndex | BuiltinInput::InstanceIndex => entry == Entry::Vertex,
-            BuiltinInput::FragCoord => entry == Entry::Fragment,
+            BuiltinInput::FragCoord | BuiltinInput::PrimitiveIndex => entry == Entry::Fragment,
         }
     }
 }

@@ -509,6 +509,7 @@ impl Device {
                 );
             let on = vk::PhysicalDeviceFeatures::default()
                 .robust_buffer_access(true)
+                .geometry_shader(base.geometry_shader == vk::TRUE)
                 .multi_draw_indirect(base.multi_draw_indirect == vk::TRUE)
                 .draw_indirect_first_instance(base.draw_indirect_first_instance == vk::TRUE)
                 .sampler_anisotropy(base.sampler_anisotropy == vk::TRUE)
