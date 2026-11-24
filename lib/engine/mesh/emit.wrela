@@ -1,0 +1,1835 @@
+// GPU triangle emission, prefix-scan compaction, brick metadata, outline certification and
+// dilation, multi-LOD seam stitching, and indirect draw-argument finalisation.
+
+use matter::certify::certify_sheet
+use matter::substance::Substance
+use mesh::dc::{
+    CERT_MARKS, CellCorners, HOLE_PX, OUTLINE_MARKS, QUAD_FOLDED, QUAD_INSIDE, Qef, cdist,
+    claim_exact_cell, decode_cell, finer_than_a_hole, hermite_qef, hidden_crease, is_crease,
+    on_outline, solve_cell, trilinear_qef,
+}
+use mesh::grid::{
+    ActiveBrick, BRICK, BrickBound, CAP_SEAM, CAP_SURF, CERT_SLICE, CORNERS_BRICK, EDGES_BRICK,
+    ExactCell, GridSpec, MOST_INDICES_PER_BRICK, MeshVertex, NONE, OVERFLOW_CREASES, OVERFLOW_CUT,
+    OVERFLOW_EXACT, OVERFLOW_INDICES, OVERFLOW_SEAMS, OVERFLOW_THIN, OVERFLOW_TRANS, SEAM_SLICE,
+    SMOOTH_DOT, SeamCell, SeamQuad, VERTS_BRICK, VERTS_STRIDE, brick_corner, lattice,
+    pack_vertex_meta, safe_norm, unpack_is_trans, unpack_oct_normal,
+}
+use std::derive::{Box3, value_and_gradient}
+use std::field::{ALL_LIVE, Field, Live, Rigid}
+use std::gpu::{
+    Append, Atomics, DrawIndexedArgs, GlobalId, GpuBuffer, GpuSpan, One, Slots, dispatch,
+}
+
+fn cv(cell_verts: [u32], base: u32, x: u32, y: u32, z: u32) -> u32 {
+    cell_verts[base + x + y * 7 + z * 49]
+}
+
+/// The quad `(p0, p1, p2, p3)` (wound in that order, unit normals `n0..n3` there) as 2 triangles:
+/// along diagonal `p0–p2`, or along `p1–p3` (`true`) where the surface runs closer to that chord.
+/// Between two points of a surface with normals `na`, `nc` the surface stands
+/// `dot(nc - na, c - a) / 8` off the chord's middle (a circle's sagitta `L² / 8R` exactly), so the
+/// diagonal that does is the one the surface bends least along. A Dual Contouring quad is rarely
+/// planar: across the other diagonal its fold cuts into the surface, or stands off it.
+fn split_13(
+    p0: vec3,
+    p1: vec3,
+    p2: vec3,
+    p3: vec3,
+    n0: vec3,
+    n1: vec3,
+    n2: vec3,
+    n3: vec3,
+) -> bool {
+    abs(dot(n3 - n1, p3 - p1)) < abs(dot(n2 - n0, p2 - p0))
+}
+
+/// The quad of cells `(v0, v1, v2, v3)` (wound counter-clockwise, or the other way when `flip`)
+/// as 6 indices: its corners in winding order, then which diagonal `split_13` picks.
+pub(package) fn quad_order(v0: u32, v1: u32, v2: u32, v3: u32, flip: bool) -> (u32, u32, u32, u32) {
+    if flip { (v0, v3, v2, v1) } else { (v0, v1, v2, v3) }
+}
+
+/// Stores the wound quad `(q0, q1, q2, q3)` as 2 triangles (6 indices) at `at`, split along
+/// `q1–q3` when `split13`, else along `q0–q2`.
+fn store_quad(
+    indices: mut Atomics<u32>,
+    at: u32,
+    q0: u32,
+    q1: u32,
+    q2: u32,
+    q3: u32,
+    split13: bool,
+) {
+    let (a, b, c, d) = if split13 { (q1, q2, q3, q0) } else { (q0, q1, q2, q3) }
+    indices.store(i: at, value: a)
+    indices.store(i: at + 1, value: b)
+    indices.store(i: at + 2, value: c)
+    indices.store(i: at + 3, value: a)
+    indices.store(i: at + 4, value: c)
+    indices.store(i: at + 5, value: d)
+}
+
+/// One owned edge of a brick along `axis` and the 4 cells around it, in the order that winds
+/// their quad counter-clockwise seen from the edge's `+axis` end (`flip` it when the edge's first
+/// corner is outside).
+pub(package) struct OwnedEdge: Copy {
+    pub(package) from: vec3u,
+    pub(package) to: vec3u,
+    pub(package) c0: vec3u,
+    pub(package) c1: vec3u,
+    pub(package) c2: vec3u,
+    pub(package) c3: vec3u,
+}
+
+/// Brick-local edge `(ex, ey, ez)` (each `0..BRICK`) along `axis`: its corners run from
+/// `ex..ex+1` along `axis` at `+1` on the other two axes, so each brick owns the edges of global
+/// lattice lines `BRICK·b + 1 ..= BRICK·b + BRICK` across, and every edge of the grid is owned by
+/// exactly one brick.
+pub(package) fn owned_edge(axis: u32, ex: u32, ey: u32, ez: u32) -> OwnedEdge {
+    if axis == 0 {
+        // +X edge; cells x = ex, y in {ey, ey+1}, z in {ez, ez+1}.
+        OwnedEdge {
+            from: vec3u(ex, ey + 1, ez + 1),
+            to: vec3u(ex + 1, ey + 1, ez + 1),
+            c0: vec3u(ex, ey, ez),
+            c1: vec3u(ex, ey + 1, ez),
+            c2: vec3u(ex, ey + 1, ez + 1),
+            c3: vec3u(ex, ey, ez + 1),
+        }
+    } else if axis == 1 {
+        // +Y edge; cells y = ey, x in {ex, ex+1}, z in {ez, ez+1}.
+        OwnedEdge {
+            from: vec3u(ex + 1, ey, ez + 1),
+            to: vec3u(ex + 1, ey + 1, ez + 1),
+            c0: vec3u(ex, ey, ez),
+            c1: vec3u(ex, ey, ez + 1),
+            c2: vec3u(ex + 1, ey, ez + 1),
+            c3: vec3u(ex + 1, ey, ez),
+        }
+    } else {
+        // +Z edge; cells z = ez, x in {ex, ex+1}, y in {ey, ey+1}.
+        OwnedEdge {
+            from: vec3u(ex + 1, ey + 1, ez),
+            to: vec3u(ex + 1, ey + 1, ez + 1),
+            c0: vec3u(ex, ey, ez),
+            c1: vec3u(ex + 1, ey, ez),
+            c2: vec3u(ex + 1, ey + 1, ez),
+            c3: vec3u(ex, ey + 1, ez),
+        }
+    }
+}
+
+/// Returns `6` if `(v0, v1, v2, v3)` forms a valid opaque quad, or `0` otherwise.
+fn quad_opaque_count(v0: u32, v1: u32, v2: u32, v3: u32, verts: [MeshVertex]) -> u32 {
+    if v0 == NONE || v1 == NONE || v2 == NONE || v3 == NONE {
+        return 0
+    }
+    let is_trans = unpack_is_trans(verts[v0].packed) ||
+        unpack_is_trans(verts[v1].packed) ||
+        unpack_is_trans(verts[v2].packed) ||
+        unpack_is_trans(verts[v3].packed)
+    if is_trans { 0 } else { 6 }
+}
+
+/// Emits one quad into its brick's contiguous opaque index slice (`brick_idx_offsets[brick] +
+/// atomic brick_idx_counts[brick]`), routing transmissive/cut quads to `trans_indices`/`cut_indices`.
+/// Returns, seen from `exact_eye` (`w > 0`), what the opaque quad is to the mesh's outline
+/// (`on_outline`): the caller boxes its 4 cells (`box_outline`).
+fn emit_quad_brick(
+    v0: u32,
+    v1: u32,
+    v2: u32,
+    v3: u32,
+    flip: bool,
+    brick_in_chunk: u32,
+    exact_eye: vec4,
+    eye_reach: f32,
+    verts: [MeshVertex],
+    cap_indices: u32,
+    cap_trans: u32,
+    brick_idx_offsets: [u32],
+    brick_idx_counts: mut Atomics<u32>,
+    tri_count: mut Atomics<u32>,
+    indices: mut Atomics<u32>,
+    trans_indices: mut Atomics<u32>,
+    cut_indices: mut Atomics<u32>,
+) -> u32 {
+    if v0 == NONE || v1 == NONE || v2 == NONE || v3 == NONE {
+        return QUAD_INSIDE
+    }
+    let t0 = unpack_is_trans(verts[v0].packed)
+    let t1 = unpack_is_trans(verts[v1].packed)
+    let t2 = unpack_is_trans(verts[v2].packed)
+    let t3 = unpack_is_trans(verts[v3].packed)
+    let is_trans = t0 || t1 || t2 || t3
+    let (q0, q1, q2, q3) = quad_order(v0, v1, v2, v3, flip: flip)
+    let p0 = vec3(verts[q0].px, verts[q0].py, verts[q0].pz)
+    let p1 = vec3(verts[q1].px, verts[q1].py, verts[q1].pz)
+    let p2 = vec3(verts[q2].px, verts[q2].py, verts[q2].pz)
+    let p3 = vec3(verts[q3].px, verts[q3].py, verts[q3].pz)
+    let n0 = unpack_oct_normal(verts[q0].packed)
+    let n1 = unpack_oct_normal(verts[q1].packed)
+    let n2 = unpack_oct_normal(verts[q2].packed)
+    let n3 = unpack_oct_normal(verts[q3].packed)
+    let split13 = split_seam_13(p0, p1, p2, p3, n0, n1, n2, n3)
+    if !is_trans {
+        let local = brick_idx_counts.add(i: brick_in_chunk, value: 6)
+        let at = brick_idx_offsets[brick_in_chunk] + local
+        if at + 6 > cap_indices {
+            return QUAD_INSIDE
+        }
+        store_quad(mut indices, at, q0, q1, q2, q3, split13: split13)
+        if exact_eye.w <= 0.0 {
+            return QUAD_INSIDE
+        }
+        return on_outline(
+            p0,
+            p1,
+            p2,
+            p3,
+            n0,
+            n1,
+            n2,
+            n3,
+            split13: split13,
+            e: exact_eye.xyz,
+            reach: eye_reach,
+        )
+    } else {
+        let at = tri_count.add(i: 1, value: 6)
+        if at + 6 <= cap_trans {
+            store_quad(mut trans_indices, at, q0, q1, q2, q3, split13: split13)
+        }
+        if !(t0 && t1 && t2 && t3) {
+            let ac = tri_count.add(i: 6, value: 6)
+            if ac + 6 <= cap_trans {
+                store_quad(mut cut_indices, ac, q0, q1, q2, q3, split13: split13)
+            }
+        }
+    }
+    QUAD_INSIDE
+}
+
+/// Zeroes per-brick opaque index counts and scatter cursors for the current chunk.
+@compute(64)
+pub(package) fn zero_chunk_counts(counts: mut Slots<u32>, cursors: mut Slots<u32>, id: GlobalId) {
+    counts[id] = 0
+    cursors[id] = 0
+}
+
+/// Pass 3a: Counts opaque indices emitted by each active brick in the chunk so `scan_brick_counts`
+/// can pack every brick's indices into a contiguous `DrawIndexedArgs` sub-range.
+@compute(64)
+pub(package) fn count_brick_tris(
+    active_count: [u32],
+    cap_bricks: u32,
+    chunk_start: u32,
+    corners: [f32],
+    cell_verts: [u32],
+    verts: [MeshVertex],
+    brick_idx_counts: mut Atomics<u32>,
+    id: GlobalId,
+) {
+    let brick_in_chunk = id.x / 256
+    let eidx = id.x - brick_in_chunk * 256
+    let bi = chunk_start + brick_in_chunk
+    let total = min(active_count[0], cap_bricks)
+    if bi >= total || eidx >= EDGES_BRICK {
+        return
+    }
+    let ez = eidx / 36
+    let rem = eidx - ez * 36
+    let ey = rem / 6
+    let ex = rem - ey * 6
+    let cbase = brick_in_chunk * CORNERS_BRICK
+    let vbase = brick_in_chunk * VERTS_STRIDE
+    var cnt: u32 = 0
+    for axis in 0..3 {
+        let e = owned_edge(axis, ex, ey, ez)
+        let d0 = cdist(corners, cbase, e.from.x, e.from.y, e.from.z)
+        let d1 = cdist(corners, cbase, e.to.x, e.to.y, e.to.z)
+        if (d0 < 0.0) != (d1 < 0.0) {
+            cnt += quad_opaque_count(
+                cv(cell_verts, vbase, e.c0.x, e.c0.y, e.c0.z),
+                cv(cell_verts, vbase, e.c1.x, e.c1.y, e.c1.z),
+                cv(cell_verts, vbase, e.c2.x, e.c2.y, e.c2.z),
+                cv(cell_verts, vbase, e.c3.x, e.c3.y, e.c3.z),
+                verts,
+            )
+        }
+    }
+    if cnt > 0 {
+        let _ = brick_idx_counts.add(i: brick_in_chunk, value: cnt)
+    }
+}
+
+/// Pass 3b-1a: 64-way parallel group reduction (`64 × 16 = CHUNK_BRICKS = 1024`) reading cached
+/// `[u32]` per-brick counts (~1.5 µs).
+@compute(64)
+fn scan_brick_groups(
+    active_count: [u32],
+    cap_bricks: u32,
+    chunk_start: u32,
+    chunk_n: u32,
+    brick_idx_counts: [u32],
+    group_sums: mut Slots<u32>,
+    id: GlobalId,
+) {
+    let g = id.x
+    if g >= 64 {
+        return
+    }
+    let total = min(active_count[0], cap_bricks)
+    let n = if total > chunk_start { min(total - chunk_start, chunk_n) } else { 0 }
+    var sum: u32 = 0
+    let base = g * 16
+    for k in 0..16 {
+        let j = base + k
+        if j < n {
+            sum += brick_idx_counts[j]
+        }
+    }
+    group_sums[id] = sum
+}
+
+/// Pass 3b-1b: Exclusive prefix sum over the 64 group totals + ONE atomic reservation in
+/// `tri_count[0]` (~2 µs).
+@compute(1)
+fn scan_group_sums(
+    group_sums: [u32],
+    tri_count: mut Atomics<u32>,
+    group_offsets: mut Atomics<u32>,
+    id: GlobalId,
+) {
+    let _ = id
+    var total_sum: u32 = 0
+    for g in 0..64 {
+        total_sum += group_sums[g]
+    }
+    let base = if total_sum > 0 { tri_count.add(i: 0, value: total_sum) } else {
+        tri_count.load(i: 0)
+    }
+    var rel: u32 = 0
+    for g in 0..64 {
+        group_offsets.store(i: g, value: base + rel)
+        rel += group_sums[g]
+    }
+}
+
+/// Pass 3b-1c: 64-way parallel intra-group prefix sum writing final per-brick `brick_idx_offsets`
+/// (~2.5 µs).
+@compute(64)
+fn scan_brick_local(
+    active_count: [u32],
+    cap_bricks: u32,
+    chunk_start: u32,
+    chunk_n: u32,
+    group_offsets: [u32],
+    brick_idx_counts: [u32],
+    brick_idx_offsets: mut Atomics<u32>,
+    id: GlobalId,
+) {
+    let g = id.x
+    if g >= 64 {
+        return
+    }
+    let total = min(active_count[0], cap_bricks)
+    let n = if total > chunk_start { min(total - chunk_start, chunk_n) } else { 0 }
+    var off = group_offsets[g]
+    let base = g * 16
+    for k in 0..16 {
+        let j = base + k
+        if j < n {
+            brick_idx_offsets.store(i: j, value: off)
+            off += brick_idx_counts[j]
+        }
+    }
+}
+
+/// 64-way parallel 2-level exclusive prefix sum over `brick_idx_counts[0..chunk_n]`, reserving
+/// contiguous opaque index ranges in `tri_count[0]` (~6 µs per 1024-brick chunk).
+pub(package) fn scan_chunk_offsets(
+    active_count: GpuSpan<u32>,
+    brick_idx_counts: GpuSpan<u32>,
+    group_sums: mut GpuBuffer<u32>,
+    group_offsets: mut GpuBuffer<u32>,
+    brick_idx_offsets: mut GpuBuffer<u32>,
+    tri_count: mut GpuBuffer<u32>,
+    cap_bricks: u32,
+    chunk_start: u32,
+    chunk_n: u32,
+) {
+    dispatch(
+        scan_brick_groups.bind(
+            active_count: active_count,
+            cap_bricks: cap_bricks,
+            chunk_start: chunk_start,
+            chunk_n: chunk_n,
+            brick_idx_counts: brick_idx_counts,
+            group_sums: group_sums.span_mut(start: 0, count: 64),
+        ),
+        over: 64,
+    )
+    dispatch(
+        scan_group_sums.bind(
+            group_sums: group_sums.items(),
+            tri_count: mut tri_count,
+            group_offsets: mut group_offsets,
+        ),
+        over: 1,
+    )
+    dispatch(
+        scan_brick_local.bind(
+            active_count: active_count,
+            cap_bricks: cap_bricks,
+            chunk_start: chunk_start,
+            chunk_n: chunk_n,
+            group_offsets: group_offsets.items(),
+            brick_idx_counts: brick_idx_counts,
+            brick_idx_offsets: mut brick_idx_offsets,
+        ),
+        over: 64,
+    )
+}
+
+/// Pass 3b-2: Writes per-brick world-space `BrickBound`s, `DrawIndexedArgs`, and alive flags for
+/// the current chunk into the batch's persistent per-brick buffers.
+@compute(64)
+pub(package) fn write_brick_meta(
+    grids: [GridSpec],
+    active: [ActiveBrick],
+    active_count: [u32],
+    cap_bricks: u32,
+    cap_indices: u32,
+    inst_count: u32,
+    chunk_start: u32,
+    use_parent_tag: u32,
+    brick_idx_saved: [u32],
+    brick_idx_offsets: [u32],
+    brick_bounds: mut Slots<BrickBound>,
+    brick_draws: mut Slots<DrawIndexedArgs>,
+    brick_alive: mut Slots<u32>,
+    id: GlobalId,
+) {
+    let j = id.x
+    let bi = chunk_start + j
+    let total = min(active_count[0], cap_bricks)
+    if bi >= total {
+        brick_bounds[id] = BrickBound { lo: vec3(0.0), pad0: 0, hi: vec3(0.0), pad1: 0 }
+        brick_draws[id] = DrawIndexedArgs {
+            indices: 0,
+            instances: 0,
+            first_index: 0,
+            base_vertex: 0,
+            first_instance: 0,
+        }
+        brick_alive[id] = 0
+        return
+    }
+    let cnt = brick_idx_saved[j]
+    let first = brick_idx_offsets[j]
+    let clamped = if first >= cap_indices { 0 } else { min(cnt, cap_indices - first) }
+    let ab = active[bi]
+    let g = grids[ab.coord.w]
+    let b = ab.coord.xyz
+    let tag = if use_parent_tag != 0 { g.parent_grid } else { ab.coord.w }
+    let pad = g.cell * 1.15
+    let blo = brick_corner(g, b, vec3u(0, 0, 0)) - vec3(pad)
+    let bhi = brick_corner(g, b, vec3u(BRICK + 1, BRICK + 1, BRICK + 1)) + vec3(pad)
+    brick_bounds[id] = BrickBound { lo: blo, pad0: tag, hi: bhi, pad1: 0 }
+    brick_draws[id] = DrawIndexedArgs {
+        indices: clamped,
+        instances: if clamped > 0 { inst_count } else { 0 },
+        first_index: first,
+        base_vertex: 0,
+        first_instance: 0,
+    }
+    brick_alive[id] = if clamped > 0 { 1 } else { 0 }
+}
+
+/// Invalidates existing bricks of `target_grid` whose brick centers fall inside `[clear_lo, clear_hi]`
+/// (the exact integer brick box `[bmin, bmax)` being re-extracted) in place (`< 5 µs`) so a live
+/// CSG edit (`Edited<M>`) can append freshly re-extracted bricks with zero gaps and zero duplicates.
+/// A cleared brick's index slice is made degenerate (every index its first), so the whole mesh's
+/// draw (`draw_args`, every index up to the last patch's) draws none of its old triangles.
+@compute(64)
+pub(package) fn reset_dirty_bricks(
+    brick_bounds: [BrickBound],
+    clear_lo: vec3,
+    clear_hi: vec3,
+    target_grid: u32,
+    live_slots: u32,
+    brick_draws: mut Slots<DrawIndexedArgs>,
+    brick_alive: mut Atomics<u32>,
+    indices: mut Atomics<u32>,
+    id: GlobalId,
+) {
+    let i = id.x
+    if i >= live_slots {
+        return
+    }
+    if brick_alive.load(i: i) == 0 {
+        return
+    }
+    let bb = brick_bounds[i]
+    if bb.pad0 != target_grid {
+        return
+    }
+    let c = 0.5 * (bb.lo + bb.hi)
+    let inside = c.x >= clear_lo.x &&
+        c.x <= clear_hi.x &&
+        c.y >= clear_lo.y &&
+        c.y <= clear_hi.y &&
+        c.z >= clear_lo.z &&
+        c.z <= clear_hi.z
+    if inside {
+        brick_alive.store(i: i, value: 0)
+        let d = brick_draws[id]
+        if d.indices > 0 {
+            let v0 = indices.load(i: d.first_index)
+            for k in 1..min(d.indices, MOST_INDICES_PER_BRICK) {
+                indices.store(i: d.first_index + k, value: v0)
+            }
+        }
+        brick_draws[id] = DrawIndexedArgs {
+            indices: 0,
+            instances: 0,
+            first_index: 0,
+            base_vertex: 0,
+            first_instance: 0,
+        }
+    }
+}
+
+/// Pass 3: Emits watertight quads for every sign-changing owned edge (`6×6×6 = 216` edges per axis
+/// per brick), packing opaque indices contiguously per brick and routing transmissive triangles
+/// to separate indirect index buffers so opaque rasterisation keeps full hardware Early-Z.
+@compute(64)
+pub(package) fn emit_tris(
+    grids: [GridSpec],
+    active: [ActiveBrick],
+    active_count: [u32],
+    cap_bricks: u32,
+    cap_indices: u32,
+    cap_trans: u32,
+    chunk_start: u32,
+    exact_eye: vec4,
+    eye_reach: f32,
+    corners: [f32],
+    cell_verts: [u32],
+    verts: [MeshVertex],
+    brick_idx_offsets: [u32],
+    brick_idx_counts: mut Atomics<u32>,
+    tri_count: mut Atomics<u32>,
+    indices: mut Atomics<u32>,
+    trans_indices: mut Atomics<u32>,
+    cut_indices: mut Atomics<u32>,
+    exact_seen: mut Atomics<u32>,
+    exact_cells: mut Append<ExactCell>,
+    cert_cands: mut Append<vec2u>,
+    id: GlobalId,
+) {
+    // 4 workgroups of 64 = 256 lanes per brick (covering 216 owned edge triples).
+    let brick_in_chunk = id.x / 256
+    let eidx = id.x - brick_in_chunk * 256
+    let bi = chunk_start + brick_in_chunk
+    let total = min(active_count[0], cap_bricks)
+    if bi >= total || eidx >= EDGES_BRICK {
+        return
+    }
+    let ez = eidx / 36
+    let rem = eidx - ez * 36
+    let ey = rem / 6
+    let ex = rem - ey * 6
+    let cbase = brick_in_chunk * CORNERS_BRICK
+    let vbase = brick_in_chunk * VERTS_STRIDE
+    for axis in 0..3 {
+        let e = owned_edge(axis, ex, ey, ez)
+        let d0 = cdist(corners, cbase, e.from.x, e.from.y, e.from.z)
+        let d1 = cdist(corners, cbase, e.to.x, e.to.y, e.to.z)
+        if (d0 < 0.0) != (d1 < 0.0) {
+            let vs = [
+                cv(cell_verts, vbase, e.c0.x, e.c0.y, e.c0.z),
+                cv(cell_verts, vbase, e.c1.x, e.c1.y, e.c1.z),
+                cv(cell_verts, vbase, e.c2.x, e.c2.y, e.c2.z),
+                cv(cell_verts, vbase, e.c3.x, e.c3.y, e.c3.z),
+            ]
+            let outline = emit_quad_brick(
+                vs[0],
+                vs[1],
+                vs[2],
+                vs[3],
+                flip: d0 >= 0.0,
+                brick_in_chunk: brick_in_chunk,
+                exact_eye: exact_eye,
+                eye_reach: eye_reach,
+                verts: verts,
+                cap_indices: cap_indices,
+                cap_trans: cap_trans,
+                brick_idx_offsets: brick_idx_offsets,
+                brick_idx_counts: mut brick_idx_counts,
+                tri_count: mut tri_count,
+                indices: mut indices,
+                trans_indices: mut trans_indices,
+                cut_indices: mut cut_indices,
+            )
+            if outline != QUAD_INSIDE {
+                let ab = active[bi]
+                let g = grids[ab.coord.w]
+                let cmin = min(min(e.c0, e.c1), min(e.c2, e.c3))
+                if !finer_than_a_hole(brick_corner(g, ab.coord.xyz, cmin), g.cell, exact_eye) {
+                    box_outline(
+                        [e.c0, e.c1, e.c2, e.c3],
+                        vs,
+                        outline,
+                        bi,
+                        g,
+                        ab.coord.xyz,
+                        ab.live,
+                        brick_in_chunk,
+                        mut exact_seen,
+                        mut exact_cells,
+                        mut cert_cands,
+                    )
+                }
+            }
+        }
+    }
+}
+
+/// An outline quad's 4 cells `cs` (local to the brick at `b` of grid `g`), each marked as on the
+/// outline (`OUTLINE_MARKS`, for `dilate_outline`): a folded quad's cells are given exact cells; an
+/// outline quad's are put up for a certificate, once each (`CERT_MARKS`, `certify_outline`), and
+/// given exact cells where none is proven.
+pub(package) fn box_outline(
+    cs: [vec3u; 4],
+    vs: [u32; 4],
+    kind: u32,
+    active_at: u32,
+    g: GridSpec,
+    b: vec3u,
+    live: Live,
+    brick_in_chunk: u32,
+    exact_seen: mut Atomics<u32>,
+    exact_cells: mut Append<ExactCell>,
+    cert_cands: mut Append<vec2u>,
+) {
+    for k in 0..4 {
+        let ck = cs[k]
+        let cell = ck.z * 49 + ck.y * 7 + ck.x
+        let word = brick_in_chunk * 12 + (cell >> 5)
+        let bit = 1 << (cell & 31)
+        let _ = exact_seen.or(i: OUTLINE_MARKS + word, value: bit)
+        if kind == QUAD_FOLDED {
+            if claim_exact_cell(mut exact_seen, brick_in_chunk, cell) {
+                let _ = exact_cells.push(ExactCell { lo: brick_corner(g, b, ck), h: g.cell, live })
+            }
+        } else if (exact_seen.or(i: CERT_MARKS + word, value: bit) & bit) == 0 {
+            let _ = cert_cands.push(vec2u((active_at << 9) | cell, vs[k]))
+        }
+    }
+}
+
+/// Notes in `tri_count[12]` a batch's seam cells (`seam_slices`), and counts in `tri_count[9]` those
+/// past what its seam slices take (`OVERFLOW_THIN`: they were neither solved nor boxed).
+@compute(1)
+pub(package) fn note_seams(seam_count: [u32], slices: u32, tri_count: mut Atomics<u32>, id: GlobalId) {
+    if id.x == 0 {
+        let _ = tri_count.max(i: 12, value: seam_count[0])
+        if seam_count[0] > slices * SEAM_SLICE {
+            let _ = tri_count.add(i: 9, value: seam_count[0] - slices * SEAM_SLICE)
+        }
+    }
+}
+
+/// Counts in `tri_count[9]` a batch's outline cells past what its `certify_outline` slices
+/// certify (`OVERFLOW_THIN`: those cells have neither a certificate nor an exact cell).
+@compute(1)
+pub(package) fn note_uncertified(cert_count: [u32], slices: u32, tri_count: mut Atomics<u32>, id: GlobalId) {
+    if id.x == 0 {
+        let _ = tri_count.max(i: 11, value: cert_count[0])
+        if cert_count[0] > slices * CERT_SLICE {
+            let _ = tri_count.add(i: 9, value: cert_count[0] - slices * CERT_SLICE)
+        }
+    }
+}
+
+/// After a batch's chunks (with exact cells): each outline cell put up for a certificate
+/// (`box_outline`) is certified (`certify_sheet`: the surface inside it provably in a slab two
+/// `HOLE_PX` (a pixel) wide parallel to the plane of its mesh vertex, which lies on the surface,
+/// so mesh and surface stand within a pixel of each other across it: what the hole audit holds an
+/// outline to), or given an exact cell, its pixels solved.
+@compute(64)
+pub(package) fn certify_outline<M: Field<Substance>>(
+    fields: [M],
+    grids: [GridSpec],
+    active: [ActiveBrick],
+    verts: [MeshVertex],
+    cert_cands: [vec2u],
+    cert_count: [u32],
+    first: u32,
+    exact_eye: vec4,
+    exact_cells: mut Append<ExactCell>,
+    id: GlobalId,
+) {
+    let i = first + id.x
+    if i >= min(cert_count[0], CAP_SURF) {
+        return
+    }
+    let packed = cert_cands[i].x
+    let vi = cert_cands[i].y
+    let cell = packed & 511
+    let (cx, cy, cz) = decode_cell(cell)
+    let ab = active[packed >> 9]
+    let g = grids[ab.coord.w]
+    let h = g.cell
+    let cell_lo = brick_corner(g, ab.coord.xyz, vec3u(cx, cy, cz))
+    let live = ab.live
+    let px = length(exact_eye.xyz - (cell_lo + vec3(0.5 * h))) * exact_eye.w
+    if vi != NONE {
+        let v = verts[vi]
+        let at = vec3(v.px, v.py, v.pz)
+        let (_, gv) = value_and_gradient(|q: vec3| fields[g.orig_id].distance_live(q, live), at)
+        let rise = length(gv)
+        let n = unpack_oct_normal(v.packed)
+        if certify_sheet(fields, g.orig_id, live, cell_lo, h, at, n, rise, 2.0 * HOLE_PX * px) {
+            return
+        }
+    }
+    let _ = exact_cells.push(ExactCell { lo: cell_lo, h, live })
+}
+
+/// Pass 3e (with exact cells): each wholly outside cell (all 8 corners) beside an outline cell
+/// (`box_outline`'s marks) across a face, not yet given an exact cell, as a candidate for one
+/// (`filter_thin_cells`, which gives it one where its core may hold surface). What of the field
+/// stands past the mesh's outline (a chord's sagitta; a tip or crest finer than a cell) lies in an
+/// outline cell or reaches into such a neighbour's core; a surface that only meets its face
+/// reaches less than a quarter pixel in, thinner than a hole. A neighbour with a corner inside is
+/// a surface cell, meshed, and an outline cell itself if the outline passes it.
+@compute(64)
+pub(package) fn dilate_outline(
+    active_count: [u32],
+    cap_bricks: u32,
+    chunk_start: u32,
+    corners: [f32],
+    exact_seen: mut Atomics<u32>,
+    thin_cands: mut Append<u32>,
+    id: GlobalId,
+) {
+    let brick_in_chunk = id.x / 384
+    let cell = id.x - brick_in_chunk * 384
+    let bi = chunk_start + brick_in_chunk
+    if bi >= min(active_count[0], cap_bricks) || cell >= VERTS_BRICK {
+        return
+    }
+    let (cx, cy, cz) = decode_cell(cell)
+    let cbase = brick_in_chunk * CORNERS_BRICK
+    for j in 0..8 {
+        if cdist(corners, cbase, cx + (j & 1), cy + ((j >> 1) & 1), cz + (j >> 2)) < 0.0 {
+            return
+        }
+    }
+    if (exact_seen.load(i: brick_in_chunk * 12 + (cell >> 5)) & (1 << (cell & 31))) != 0 {
+        return
+    }
+    let marks = OUTLINE_MARKS + brick_in_chunk * 12
+    var beside = false
+    for a in 0..6 {
+        let axis = a >> 1
+        let up = (a & 1) == 1
+        let at = if axis == 0 { cx } else if axis == 1 { cy } else { cz }
+        if (up && at < 6) || (!up && at > 0) {
+            let step = if axis == 0 { 1 } else if axis == 1 { 7 } else { 49 }
+            let n = if up { cell + step } else { cell - step }
+            if (exact_seen.load(i: marks + (n >> 5)) & (1 << (n & 31))) != 0 {
+                beside = true
+            }
+        }
+    }
+    if beside {
+        let _ = thin_cands.push((brick_in_chunk << 9) | cell)
+    }
+}
+
+/// Stores one single triangle `(a, b, c)` at `at`.
+fn store_tri(indices: mut Atomics<u32>, at: u32, a: u32, b: u32, c: u32) {
+    indices.store(i: at, value: a)
+    indices.store(i: at + 1, value: b)
+    indices.store(i: at + 2, value: c)
+}
+
+/// Emits one non-degenerate triangle `(a, b, c)` into the opaque or transmissive index buffers.
+fn emit_single_tri(
+    a: u32,
+    b: u32,
+    c: u32,
+    verts: [MeshVertex],
+    cap_indices: u32,
+    cap_trans: u32,
+    tri_count: mut Atomics<u32>,
+    indices: mut Atomics<u32>,
+    trans_indices: mut Atomics<u32>,
+    cut_indices: mut Atomics<u32>,
+) {
+    if a == b || b == c || c == a {
+        return
+    }
+    let ta = unpack_is_trans(verts[a].packed)
+    let tb = unpack_is_trans(verts[b].packed)
+    let tc = unpack_is_trans(verts[c].packed)
+    let is_trans = ta || tb || tc
+    if !is_trans {
+        let at = tri_count.add(i: 0, value: 3)
+        if at + 3 > cap_indices {
+            return
+        }
+        store_tri(mut indices, at, a, b, c)
+    } else {
+        let at = tri_count.add(i: 1, value: 3)
+        if at + 3 <= cap_trans {
+            store_tri(mut trans_indices, at, a, b, c)
+        }
+        if !(ta && tb && tc) {
+            let ac = tri_count.add(i: 6, value: 3)
+            if ac + 3 <= cap_trans {
+                store_tri(mut cut_indices, ac, a, b, c)
+            }
+        }
+    }
+}
+
+/// Chooses diagonal `1-3` over `0-2` for a seam quad: prefers any split where both triangles face
+/// outward (`dot(tri_n, avg_n) > 0`), falling back to `split_13` when both splits agree.
+pub(package) fn split_seam_13(
+    p0: vec3,
+    p1: vec3,
+    p2: vec3,
+    p3: vec3,
+    n0: vec3,
+    n1: vec3,
+    n2: vec3,
+    n3: vec3,
+) -> bool {
+    // Only apply the hemisphere foldback guard when all 4 vertex normals share one hemisphere;
+    // on acute wedges (`dot(na, nb) <= 0`), the two triangles legitimately face opposing directions
+    // and `split_13` must align the diagonal along the crease.
+    if dot(n0, n2) > 0.0 && dot(n1, n3) > 0.0 && dot(n0, n1) > 0.0 && dot(n2, n3) > 0.0 {
+        let navg = n0 + n1 + n2 + n3
+        let w02 = min(dot(cross(p1 - p0, p2 - p0), navg), dot(cross(p2 - p0, p3 - p0), navg))
+        let w13 = min(dot(cross(p2 - p1, p3 - p1), navg), dot(cross(p3 - p1, p0 - p1), navg))
+        if w02 <= 0.0 && w13 > w02 {
+            return true
+        }
+        if w13 <= 0.0 && w02 > w13 {
+            return false
+        }
+    }
+    split_13(p0, p1, p2, p3, n0, n1, n2, n3)
+}
+
+/// Emits a 2:1 seam polygon `(v0, v1, v2, v3)` (3 distinct vertices -> 1 triangle; 4 distinct ->
+/// 1 quad split via `split_seam_13`), skipping degenerate edges where two adjacent quadrants share
+/// the same enclosing coarse cell.
+fn emit_seam_quad(
+    v0: u32,
+    v1: u32,
+    v2: u32,
+    v3: u32,
+    flip: bool,
+    verts: [MeshVertex],
+    cap_indices: u32,
+    cap_trans: u32,
+    tri_count: mut Atomics<u32>,
+    indices: mut Atomics<u32>,
+    trans_indices: mut Atomics<u32>,
+    cut_indices: mut Atomics<u32>,
+) {
+    if v0 == NONE || v1 == NONE || v2 == NONE || v3 == NONE {
+        return
+    }
+    if v0 != v1 && v1 != v2 && v2 != v3 && v3 != v0 && v0 != v2 && v1 != v3 {
+        let t0 = unpack_is_trans(verts[v0].packed)
+        let t1 = unpack_is_trans(verts[v1].packed)
+        let t2 = unpack_is_trans(verts[v2].packed)
+        let t3 = unpack_is_trans(verts[v3].packed)
+        let is_trans = t0 || t1 || t2 || t3
+        let (q0, q1, q2, q3) = quad_order(v0, v1, v2, v3, flip: flip)
+        let p = |v: u32| vec3(verts[v].px, verts[v].py, verts[v].pz)
+        let n = |v: u32| unpack_oct_normal(verts[v].packed)
+        let s13 = split_seam_13(p(q0), p(q1), p(q2), p(q3), n(q0), n(q1), n(q2), n(q3))
+        if !is_trans {
+            let at = tri_count.add(i: 0, value: 6)
+            if at + 6 <= cap_indices {
+                store_quad(mut indices, at, q0, q1, q2, q3, split13: s13)
+            }
+        } else {
+            let at = tri_count.add(i: 1, value: 6)
+            if at + 6 <= cap_trans {
+                store_quad(mut trans_indices, at, q0, q1, q2, q3, split13: s13)
+            }
+            if !(t0 && t1 && t2 && t3) {
+                let ac = tri_count.add(i: 6, value: 6)
+                if ac + 6 <= cap_trans {
+                    store_quad(mut cut_indices, ac, q0, q1, q2, q3, split13: s13)
+                }
+            }
+        }
+        return
+    }
+    let (q0, q1, q2, q3) = quad_order(v0, v1, v2, v3, flip: flip)
+    emit_single_tri(
+        q0,
+        q1,
+        q2,
+        verts: verts,
+        cap_indices: cap_indices,
+        cap_trans: cap_trans,
+        tri_count: mut tri_count,
+        indices: mut indices,
+        trans_indices: mut trans_indices,
+        cut_indices: mut cut_indices,
+    )
+    emit_single_tri(
+        q0,
+        q2,
+        q3,
+        verts: verts,
+        cap_indices: cap_indices,
+        cap_trans: cap_trans,
+        tri_count: mut tri_count,
+        indices: mut indices,
+        trans_indices: mut trans_indices,
+        cut_indices: mut cut_indices,
+    )
+}
+
+/// Whether global cell `qp - 1` lies inside `g`'s refined child hole `[hole_min, hole_max)`.
+pub(package) fn cell_in_hole_p(g: GridSpec, qp: vec3u) -> bool {
+    g.has_hole != 0 &&
+        qp.x > g.hole_min.x &&
+        qp.x <= g.hole_max.x &&
+        qp.y > g.hole_min.y &&
+        qp.y <= g.hole_max.y &&
+        qp.z > g.hole_min.z &&
+        qp.z <= g.hole_max.z
+}
+
+/// Whether global cell `qp - 1` lies across a 2:1 seam face of `g` (`seam_mask != 0`).
+pub(package) fn cell_outside_seam_p(g: GridSpec, qp: vec3u) -> bool {
+    if g.seam_mask == 0 {
+        return false
+    }
+    let nx = g.dims.x * BRICK
+    let ny = g.dims.y * BRICK
+    let nz = g.dims.z * BRICK
+    (qp.x == 0 && (g.seam_mask & 1) != 0) ||
+        (qp.x > nx && (g.seam_mask & 2) != 0) ||
+        (qp.y == 0 && (g.seam_mask & 4) != 0) ||
+        (qp.y > ny && (g.seam_mask & 8) != 0) ||
+        (qp.z == 0 && (g.seam_mask & 16) != 0) ||
+        (qp.z > nz && (g.seam_mask & 32) != 0)
+}
+
+/// Enclosing coarse parent cell coordinate of fine cell `qp - 1` (valid whenever `qp` is adjacent
+/// to a seam face of `g`).
+pub(package) fn parent_cell_of_p(g: GridSpec, qp: vec3u) -> vec3u {
+    vec3u(
+        g.parent_hole_min.x + ((qp.x + 1) >> 1) - 1,
+        g.parent_hole_min.y + ((qp.y + 1) >> 1) - 1,
+        g.parent_hole_min.z + ((qp.z + 1) >> 1) - 1,
+    )
+}
+
+/// Counts interior opaque indices (`0` or `6`) for one Multi-LOD owned edge along `axis`.
+fn count_lod_edge(
+    g: GridSpec,
+    b: vec3u,
+    axis: u32,
+    lp: vec3u,
+    cbase: u32,
+    vbase: u32,
+    corners: [f32],
+    cell_verts: [u32],
+    verts: [MeshVertex],
+) -> u32 {
+    let ua = if axis == 0 { vec3u(1, 0, 0) } else if axis == 1 { vec3u(0, 1, 0) } else {
+        vec3u(0, 0, 1)
+    }
+    let ub = if axis == 0 { vec3u(0, 1, 0) } else if axis == 1 { vec3u(0, 0, 1) } else {
+        vec3u(1, 0, 0)
+    }
+    let uc = if axis == 0 { vec3u(0, 0, 1) } else if axis == 1 { vec3u(1, 0, 0) } else {
+        vec3u(0, 1, 0)
+    }
+    let tp = lp + ua
+    let d0 = cdist(corners, cbase, lp.x, lp.y, lp.z)
+    let d1 = cdist(corners, cbase, tp.x, tp.y, tp.z)
+    if (d0 < 0.0) == (d1 < 0.0) {
+        return 0
+    }
+    let bbase = vec3u(b.x * BRICK, b.y * BRICK, b.z * BRICK)
+    let gp = bbase + lp
+    let q0p = gp + vec3u(1, 1, 1) - ub - uc
+    let q1p = gp + vec3u(1, 1, 1) - uc
+    let q2p = gp + vec3u(1, 1, 1)
+    let q3p = gp + vec3u(1, 1, 1) - ub
+    if cell_in_hole_p(g, q0p) ||
+        cell_in_hole_p(g, q1p) ||
+        cell_in_hole_p(g, q2p) ||
+        cell_in_hole_p(g, q3p) {
+        return 0
+    }
+    if cell_outside_seam_p(g, q0p) ||
+        cell_outside_seam_p(g, q1p) ||
+        cell_outside_seam_p(g, q2p) ||
+        cell_outside_seam_p(g, q3p) {
+        return 0
+    }
+    let l0 = q0p - vec3u(1, 1, 1) - bbase
+    let l1 = q1p - vec3u(1, 1, 1) - bbase
+    let l2 = q2p - vec3u(1, 1, 1) - bbase
+    let l3 = q3p - vec3u(1, 1, 1) - bbase
+    quad_opaque_count(
+        cv(cell_verts, vbase, l0.x, l0.y, l0.z),
+        cv(cell_verts, vbase, l1.x, l1.y, l1.z),
+        cv(cell_verts, vbase, l2.x, l2.y, l2.z),
+        cv(cell_verts, vbase, l3.x, l3.y, l3.z),
+        verts,
+    )
+}
+
+/// Pass 3a (Multi-LOD): Counts interior opaque indices per active brick in the chunk.
+@compute(64)
+pub(package) fn count_brick_tris_lod(
+    grids: [GridSpec],
+    active: [ActiveBrick],
+    active_count: [u32],
+    cap_bricks: u32,
+    chunk_start: u32,
+    corners: [f32],
+    cell_verts: [u32],
+    verts: [MeshVertex],
+    brick_idx_counts: mut Atomics<u32>,
+    id: GlobalId,
+) {
+    let brick_in_chunk = id.x / 256
+    let eidx = id.x - brick_in_chunk * 256
+    let bi = chunk_start + brick_in_chunk
+    let total = min(active_count[0], cap_bricks)
+    if bi >= total || eidx >= EDGES_BRICK {
+        return
+    }
+    let ez = eidx / 36
+    let rem = eidx - ez * 36
+    let ey = rem / 6
+    let ex = rem - ey * 6
+    let ab = active[bi]
+    let b = ab.coord.xyz
+    let g = grids[ab.coord.w]
+    let cbase = brick_in_chunk * CORNERS_BRICK
+    let vbase = brick_in_chunk * VERTS_STRIDE
+    var cnt: u32 = 0
+    cnt += count_lod_edge(
+        g,
+        b,
+        axis: 0,
+        lp: vec3u(ex, ey + 1, ez + 1),
+        cbase: cbase,
+        vbase: vbase,
+        corners: corners,
+        cell_verts: cell_verts,
+        verts: verts,
+    )
+    cnt += count_lod_edge(
+        g,
+        b,
+        axis: 1,
+        lp: vec3u(ex + 1, ey, ez + 1),
+        cbase: cbase,
+        vbase: vbase,
+        corners: corners,
+        cell_verts: cell_verts,
+        verts: verts,
+    )
+    cnt += count_lod_edge(
+        g,
+        b,
+        axis: 2,
+        lp: vec3u(ex + 1, ey + 1, ez),
+        cbase: cbase,
+        vbase: vbase,
+        corners: corners,
+        cell_verts: cell_verts,
+        verts: verts,
+    )
+    if cnt > 0 {
+        let _ = brick_idx_counts.add(i: brick_in_chunk, value: cnt)
+    }
+}
+
+/// Processes one edge along `axis` starting at local corner `lp` of brick `b` in a Multi-LOD grid:
+/// skips coarse edges touching a refined child hole, emits interior quads into their brick's
+/// contiguous index slice, and appends 2:1 boundary edges to `seam_quads` + `seam_cells`.
+fn process_lod_edge(
+    g: GridSpec,
+    b: vec3u,
+    axis: u32,
+    lp: vec3u,
+    brick_in_chunk: u32,
+    active_at: u32,
+    cbase: u32,
+    vbase: u32,
+    corners: [f32],
+    cell_verts: [u32],
+    verts: [MeshVertex],
+    cap_indices: u32,
+    cap_trans: u32,
+    brick_idx_offsets: [u32],
+    brick_idx_counts: mut Atomics<u32>,
+    tri_count: mut Atomics<u32>,
+    indices: mut Atomics<u32>,
+    trans_indices: mut Atomics<u32>,
+    cut_indices: mut Atomics<u32>,
+    seam_quads: mut Append<SeamQuad>,
+    seam_cells: mut Append<SeamCell>,
+    seam_verts: mut Atomics<u32>,
+    live: Live,
+    exact_eye: vec4,
+    eye_reach: f32,
+    exact_seen: mut Atomics<u32>,
+    exact_cells: mut Append<ExactCell>,
+    cert_cands: mut Append<vec2u>,
+) {
+    let ua = if axis == 0 { vec3u(1, 0, 0) } else if axis == 1 { vec3u(0, 1, 0) } else {
+        vec3u(0, 0, 1)
+    }
+    let ub = if axis == 0 { vec3u(0, 1, 0) } else if axis == 1 { vec3u(0, 0, 1) } else {
+        vec3u(1, 0, 0)
+    }
+    let uc = if axis == 0 { vec3u(0, 0, 1) } else if axis == 1 { vec3u(1, 0, 0) } else {
+        vec3u(0, 1, 0)
+    }
+    let tp = lp + ua
+    let d0 = cdist(corners, cbase, lp.x, lp.y, lp.z)
+    let d1 = cdist(corners, cbase, tp.x, tp.y, tp.z)
+    if (d0 < 0.0) == (d1 < 0.0) {
+        return
+    }
+    let bbase = vec3u(b.x * BRICK, b.y * BRICK, b.z * BRICK)
+    let gp = bbase + lp
+    let q0p = gp + vec3u(1, 1, 1) - ub - uc
+    let q1p = gp + vec3u(1, 1, 1) - uc
+    let q2p = gp + vec3u(1, 1, 1)
+    let q3p = gp + vec3u(1, 1, 1) - ub
+    if cell_in_hole_p(g, q0p) ||
+        cell_in_hole_p(g, q1p) ||
+        cell_in_hole_p(g, q2p) ||
+        cell_in_hole_p(g, q3p) {
+        return
+    }
+    let o0 = cell_outside_seam_p(g, q0p)
+    let o1 = cell_outside_seam_p(g, q1p)
+    let o2 = cell_outside_seam_p(g, q2p)
+    let o3 = cell_outside_seam_p(g, q3p)
+    let flip = d0 >= 0.0
+    if !(o0 || o1 || o2 || o3) {
+        let l0 = q0p - vec3u(1, 1, 1) - bbase
+        let l1 = q1p - vec3u(1, 1, 1) - bbase
+        let l2 = q2p - vec3u(1, 1, 1) - bbase
+        let l3 = q3p - vec3u(1, 1, 1) - bbase
+        let vs = [
+            cv(cell_verts, vbase, l0.x, l0.y, l0.z),
+            cv(cell_verts, vbase, l1.x, l1.y, l1.z),
+            cv(cell_verts, vbase, l2.x, l2.y, l2.z),
+            cv(cell_verts, vbase, l3.x, l3.y, l3.z),
+        ]
+        let outline = emit_quad_brick(
+            vs[0],
+            vs[1],
+            vs[2],
+            vs[3],
+            flip: flip,
+            brick_in_chunk: brick_in_chunk,
+            exact_eye: exact_eye,
+            eye_reach: eye_reach,
+            verts: verts,
+            cap_indices: cap_indices,
+            cap_trans: cap_trans,
+            brick_idx_offsets: brick_idx_offsets,
+            brick_idx_counts: mut brick_idx_counts,
+            tri_count: mut tri_count,
+            indices: mut indices,
+            trans_indices: mut trans_indices,
+            cut_indices: mut cut_indices,
+        )
+        if outline != QUAD_INSIDE {
+            if !finer_than_a_hole(brick_corner(g, b, l0), g.cell, exact_eye) {
+                box_outline(
+                    [l0, l1, l2, l3],
+                    vs,
+                    outline,
+                    active_at,
+                    g,
+                    b,
+                    live,
+                    brick_in_chunk,
+                    mut exact_seen,
+                    mut exact_cells,
+                    mut cert_cands,
+                )
+            }
+        }
+        return
+    }
+    let qi = seam_quads.push(
+        SeamQuad { flags: if flip { 1 } else { 0 }, pad0: 0, pad1: 0, pad2: 0 },
+    )
+    if qi >= CAP_SEAM {
+        return
+    }
+    let qps = [q0p, q1p, q2p, q3p]
+    let outs = [o0, o1, o2, o3]
+    var c_coords = [vec3u(0, 0, 0); 4]
+    var c_masks = [0; 4]
+    var n_coarse: u32 = 0
+    for k in 0..4 {
+        if !outs[k] {
+            let lk = qps[k] - vec3u(1, 1, 1) - bbase
+            let vi = cv(cell_verts, vbase, lk.x, lk.y, lk.z)
+            seam_verts.store(i: qi * 4 + k, value: vi)
+        } else {
+            seam_verts.store(i: qi * 4 + k, value: NONE)
+            let pc = parent_cell_of_p(g, qps[k])
+            var found = false
+            for j in 0..4 {
+                if j < n_coarse && c_coords[j] == pc {
+                    c_masks[j] |= 1 << k
+                    found = true
+                }
+            }
+            if !found && n_coarse < 4 {
+                c_coords[n_coarse] = pc
+                c_masks[n_coarse] = 1 << k
+                n_coarse += 1
+            }
+        }
+    }
+    for j in 0..4 {
+        if j < n_coarse {
+            let pc = c_coords[j]
+            let _ = seam_cells.push(
+                SeamCell {
+                    cell_grid: vec4u(pc.x, pc.y, pc.z, g.parent_grid),
+                    quad_idx: qi,
+                    slot_mask: c_masks[j],
+                    pad0: 0,
+                    pad1: 0,
+                },
+            )
+        }
+    }
+}
+
+/// Pass 3 (Multi-LOD): Emits interior quads into each brick's contiguous index slice and records
+/// 2:1 seam boundary edges across all 6 faces and 12 box edges of each refined ring while skipping
+/// coarse edges owned by a child ring.
+@compute(64)
+pub(package) fn emit_tris_lod(
+    grids: [GridSpec],
+    active: [ActiveBrick],
+    active_count: [u32],
+    cap_bricks: u32,
+    cap_indices: u32,
+    cap_trans: u32,
+    chunk_start: u32,
+    corners: [f32],
+    cell_verts: [u32],
+    verts: [MeshVertex],
+    brick_idx_offsets: [u32],
+    brick_idx_counts: mut Atomics<u32>,
+    tri_count: mut Atomics<u32>,
+    indices: mut Atomics<u32>,
+    trans_indices: mut Atomics<u32>,
+    cut_indices: mut Atomics<u32>,
+    seam_quads: mut Append<SeamQuad>,
+    seam_cells: mut Append<SeamCell>,
+    seam_verts: mut Atomics<u32>,
+    exact_eye: vec4,
+    eye_reach: f32,
+    exact_seen: mut Atomics<u32>,
+    exact_cells: mut Append<ExactCell>,
+    cert_cands: mut Append<vec2u>,
+    id: GlobalId,
+) {
+    let brick_in_chunk = id.x / 256
+    let eidx = id.x - brick_in_chunk * 256
+    let bi = chunk_start + brick_in_chunk
+    let total = min(active_count[0], cap_bricks)
+    if bi >= total || eidx >= EDGES_BRICK {
+        return
+    }
+    let ez = eidx / 36
+    let rem = eidx - ez * 36
+    let ey = rem / 6
+    let ex = rem - ey * 6
+    let ab = active[bi]
+    let b = ab.coord.xyz
+    let g = grids[ab.coord.w]
+    let cbase = brick_in_chunk * CORNERS_BRICK
+    let vbase = brick_in_chunk * VERTS_STRIDE
+
+    for axis in 0..3 {
+        let eb = if axis == 0 { ey } else if axis == 1 { ez } else { ex }
+        let ec = if axis == 0 { ez } else if axis == 1 { ex } else { ey }
+        let bb = if axis == 0 { b.y } else if axis == 1 { b.z } else { b.x }
+        let bc = if axis == 0 { b.z } else if axis == 1 { b.x } else { b.y }
+        let mb: u32 = if axis == 0 { 4 } else if axis == 1 { 16 } else { 1 }
+        let mc: u32 = if axis == 0 { 16 } else if axis == 1 { 1 } else { 4 }
+        let ub = if axis == 0 { vec3u(0, 1, 0) } else if axis == 1 { vec3u(0, 0, 1) } else {
+            vec3u(1, 0, 0)
+        }
+        let uc = if axis == 0 { vec3u(0, 0, 1) } else if axis == 1 { vec3u(1, 0, 0) } else {
+            vec3u(0, 1, 0)
+        }
+        let lp0 = if axis == 0 {
+            vec3u(ex, ey + 1, ez + 1)
+        } else if axis == 1 {
+            vec3u(ex + 1, ey, ez + 1)
+        } else {
+            vec3u(ex + 1, ey + 1, ez)
+        }
+        for slot in 0..4 {
+            let run = if slot == 0 {
+                true
+            } else if slot == 1 {
+                eb == 0 && bb == 0 && (g.seam_mask & mb) != 0
+            } else if slot == 2 {
+                ec == 0 && bc == 0 && (g.seam_mask & mc) != 0
+            } else {
+                eb == 0 &&
+                    ec == 0 &&
+                    bb == 0 &&
+                    bc == 0 &&
+                    ((g.seam_mask & mb) != 0 || (g.seam_mask & mc) != 0)
+            }
+            if run {
+                let lp = if slot == 0 {
+                    lp0
+                } else if slot == 1 {
+                    lp0 - ub
+                } else if slot == 2 {
+                    lp0 - uc
+                } else {
+                    lp0 - ub - uc
+                }
+                process_lod_edge(
+                    g,
+                    b,
+                    axis: axis,
+                    lp: lp,
+                    brick_in_chunk: brick_in_chunk,
+                    active_at: bi,
+                    cbase: cbase,
+                    vbase: vbase,
+                    corners: corners,
+                    cell_verts: cell_verts,
+                    verts: verts,
+                    cap_indices: cap_indices,
+                    cap_trans: cap_trans,
+                    brick_idx_offsets: brick_idx_offsets,
+                    brick_idx_counts: mut brick_idx_counts,
+                    tri_count: mut tri_count,
+                    indices: mut indices,
+                    trans_indices: mut trans_indices,
+                    cut_indices: mut cut_indices,
+                    seam_quads: mut seam_quads,
+                    seam_cells: mut seam_cells,
+                    seam_verts: mut seam_verts,
+                    live: ab.live,
+                    exact_eye: exact_eye,
+                    eye_reach: eye_reach,
+                    exact_seen: mut exact_seen,
+                    exact_cells: mut exact_cells,
+                    cert_cands: mut cert_cands,
+                )
+            }
+        }
+    }
+}
+
+/// Evaluates the 8 coarse corners of cell `nc` in parent grid `pg` directly from `f.distance`,
+/// bit-for-bit identical to level `pg`'s own `eval_corners` (2:1 balance keeps `nc` away from
+/// `pg`'s own outer seam).
+pub(package) fn coarse_cell_corners<M: Field<Substance>>(f: M, pg: GridSpec, nc: vec3u) -> CellCorners {
+    CellCorners {
+        d000: f.distance(lattice(pg, vec3u(nc.x, nc.y, nc.z))),
+        d100: f.distance(lattice(pg, vec3u(nc.x + 1, nc.y, nc.z))),
+        d010: f.distance(lattice(pg, vec3u(nc.x, nc.y + 1, nc.z))),
+        d110: f.distance(lattice(pg, vec3u(nc.x + 1, nc.y + 1, nc.z))),
+        d001: f.distance(lattice(pg, vec3u(nc.x, nc.y, nc.z + 1))),
+        d101: f.distance(lattice(pg, vec3u(nc.x + 1, nc.y, nc.z + 1))),
+        d011: f.distance(lattice(pg, vec3u(nc.x, nc.y + 1, nc.z + 1))),
+        d111: f.distance(lattice(pg, vec3u(nc.x + 1, nc.y + 1, nc.z + 1))),
+    }
+}
+
+/// Pushes a solved coarse seam vertex into `verts` and writes its index to every slot set in `mask`.
+fn store_seam_vertex<M: Field<Substance>>(
+    f: M,
+    thing_id: u32,
+    wp: vec3,
+    gv: vec3,
+    qef: Qef,
+    quad_idx: u32,
+    slot_mask: u32,
+    cap_verts: u32,
+    verts: mut Append<MeshVertex>,
+    seam_verts: mut Atomics<u32>,
+) {
+    let n_final = safe_norm(gv, safe_norm(qef.avg_n, vec3(0.0, 1.0, 0.0)))
+    let is_trans = f.channels(wp).transmission > 0.02
+    let smooth = qef.min_dot >= SMOOTH_DOT
+    let vi = verts.push(
+        MeshVertex {
+            px: wp.x,
+            py: wp.y,
+            pz: wp.z,
+            packed: pack_vertex_meta(n_final, thing_id, smooth: smooth, is_trans: is_trans),
+        },
+    )
+    if vi < cap_verts {
+        for s in 0..4 {
+            if (slot_mask & (1 << s)) != 0 {
+                seam_verts.store(i: quad_idx * 4 + s, value: vi)
+            }
+        }
+    }
+}
+
+/// Pass 3b (Multi-LOD): Solves smooth coarse parent cells adjacent to 2:1 seams on the fly
+/// (bit-for-bit identical to the parent level's dual vertex) and hands crease cells to
+/// `refine_seam_creases`.
+@compute(64)
+pub(package) fn solve_seam_smooth<M: Field<Substance>>(
+    fields: [M],
+    grids: [GridSpec],
+    seam_cells: [SeamCell],
+    seam_cell_count: [u32],
+    first: u32,
+    cap_verts: u32,
+    verts: mut Append<MeshVertex>,
+    seam_verts: mut Atomics<u32>,
+    seam_creases: mut Append<u32>,
+    id: GlobalId,
+) {
+    let n = min(seam_cell_count[0], CAP_SEAM * 2)
+    let idx = first + id.x
+    if idx >= n {
+        return
+    }
+    let sc = seam_cells[idx]
+    let pg = grids[sc.cell_grid.w]
+    let nc = sc.cell_grid.xyz
+    let f = fields[pg.orig_id]
+    let d = coarse_cell_corners(f, pg, nc)
+    let tri = trilinear_qef(d)
+    if is_crease(tri) {
+        let _ = seam_creases.push(idx)
+        return
+    }
+    let cell_lo = lattice(pg, nc)
+    let dist = |q: vec3| f.distance(q)
+    let (wp, dv, gv) = solve_cell(dist, tri, crease: false, cell_lo: cell_lo, h: pg.cell)
+    if hidden_crease(tri, dv, gv, pg.cell) {
+        let _ = seam_creases.push(idx)
+        return
+    }
+    store_seam_vertex(
+        f,
+        pg.orig_id,
+        wp,
+        gv,
+        tri,
+        sc.quad_idx,
+        sc.slot_mask,
+        cap_verts,
+        mut verts,
+        mut seam_verts,
+    )
+}
+
+/// Slots of `ExtractScratch::seam_seen`: a coarse cell is listed once for each seam quad that
+/// meets it (up to about a dozen), and given one exact cell.
+pub(package) const SEAM_SEEN: u32 = 65536
+
+/// Whether coarse cell `c` (`xyz` in level `w`) may not have an exact cell yet this extraction
+/// (`seam_seen`: each slot keeps the greatest key put in it, `Atomics::max`, one bounded operation).
+/// Only finding its own exact key says it has one, so two cells are never taken for one; a cell
+/// too far out to key, or whose slots hold greater keys, counts as new (a cell boxed twice is
+/// drawn twice, never left out).
+fn first_seam_sight(seam_seen: mut Atomics<u32>, c: vec4u) -> bool {
+    if c.x >= 1024 || c.y >= 1024 || c.z >= 512 || c.w >= 7 {
+        return true
+    }
+    let key = ((c.w << 29) | (c.x << 19) | (c.y << 9) | c.z) + 1
+    var at = (key * 2654435761) & (SEAM_SEEN - 1)
+    for _ in 0..4 {
+        let old = seam_seen.max(i: at, value: key)
+        if old == key {
+            return false
+        }
+        if old < key {
+            return true
+        }
+        at = (at + 1) & (SEAM_SEEN - 1)
+    }
+    true
+}
+
+/// Empties `ExtractScratch::seam_seen`.
+@compute(64)
+pub(package) fn reset_seam_seen(seam_seen: mut Slots<u32>, id: GlobalId) {
+    seam_seen[id] = 0
+}
+
+/// Pass 3e (Multi-LOD, with exact cells): an exact cell for each coarse parent cell on a 2:1 seam,
+/// with the parts live in it (`Surface::pruned`, as `cull_brick` finds a brick's), so where two
+/// levels meet, a pixel the stitch between them misses is still solved (SCENE 6's crowd: a pinhole
+/// 12 cm from the eye, gone when the body is meshed at one level, and with these cells; exact
+/// cells for the seam's fine side alone left it).
+@compute(64)
+pub(package) fn box_seam_cells<M: Field<Substance>>(
+    fields: [M],
+    grids: [GridSpec],
+    seam_cells: [SeamCell],
+    seam_cell_count: [u32],
+    first: u32,
+    seam_seen: mut Atomics<u32>,
+    exact_cells: mut Append<ExactCell>,
+    id: GlobalId,
+) {
+    let idx = first + id.x
+    if idx >= min(seam_cell_count[0], CAP_SEAM * 2) {
+        return
+    }
+    let sc = seam_cells[idx]
+    if !first_seam_sight(mut seam_seen, sc.cell_grid) {
+        return
+    }
+    let pg = grids[sc.cell_grid.w]
+    let lo = lattice(pg, sc.cell_grid.xyz)
+    let pr = fields[pg.orig_id].pruned(
+        Box3 { lo, hi: lo + vec3(pg.cell) },
+        |q: vec3| q,
+        1.0,
+        ALL_LIVE,
+        0,
+    )
+    let _ = exact_cells.push(ExactCell { lo, h: pg.cell, live: pr.live })
+}
+
+/// Pass 3c (Multi-LOD): Exact Hermite QEF + Newton snap for sharp-crease coarse parent cells on
+/// 2:1 seams, bit-for-bit identical to `refine_creases` at the parent level.
+@compute(64)
+pub(package) fn refine_seam_creases<M: Field<Substance>>(
+    fields: [M],
+    grids: [GridSpec],
+    seam_cells: [SeamCell],
+    seam_creases: [u32],
+    seam_crease_count: [u32],
+    first: u32,
+    cap_verts: u32,
+    verts: mut Append<MeshVertex>,
+    seam_verts: mut Atomics<u32>,
+    id: GlobalId,
+) {
+    let n = min(seam_crease_count[0], CAP_SEAM * 2)
+    let si = first + id.x
+    if si >= n {
+        return
+    }
+    let sc = seam_cells[seam_creases[si]]
+    let pg = grids[sc.cell_grid.w]
+    let nc = sc.cell_grid.xyz
+    let f = fields[pg.orig_id]
+    let d = coarse_cell_corners(f, pg, nc)
+    let cell_lo = lattice(pg, nc)
+    let dist = |q: vec3| f.distance(q)
+    let qef = hermite_qef(dist, d, cell_lo, pg.cell)
+    let tri = trilinear_qef(d)
+    let use_hermite = is_crease(tri) || qef.min_dot < 0.92
+    let final_qef = if use_hermite { qef } else { tri }
+    let (wp, _dv, gv) = solve_cell(
+        dist,
+        final_qef,
+        crease: use_hermite,
+        cell_lo: cell_lo,
+        h: pg.cell,
+    )
+    store_seam_vertex(
+        f,
+        pg.orig_id,
+        wp,
+        gv,
+        qef,
+        sc.quad_idx,
+        sc.slot_mask,
+        cap_verts,
+        mut verts,
+        mut seam_verts,
+    )
+}
+
+/// Pass 3d (Multi-LOD): Emits watertight seam triangles/quads for every recorded `SeamQuad`.
+@compute(64)
+pub(package) fn finish_seam_tris(
+    seam_quads: [SeamQuad],
+    seam_quad_count: [u32],
+    seam_verts: [u32],
+    verts: [MeshVertex],
+    cap_indices: u32,
+    cap_trans: u32,
+    tri_count: mut Atomics<u32>,
+    indices: mut Atomics<u32>,
+    trans_indices: mut Atomics<u32>,
+    cut_indices: mut Atomics<u32>,
+    id: GlobalId,
+) {
+    let n = min(seam_quad_count[0], CAP_SEAM)
+    if id.x >= n {
+        return
+    }
+    let sq = seam_quads[id.x]
+    let base = id.x * 4
+    emit_seam_quad(
+        seam_verts[base],
+        seam_verts[base + 1],
+        seam_verts[base + 2],
+        seam_verts[base + 3],
+        flip: (sq.flags & 1) != 0,
+        verts: verts,
+        cap_indices: cap_indices,
+        cap_trans: cap_trans,
+        tri_count: mut tri_count,
+        indices: mut indices,
+        trans_indices: mut trans_indices,
+        cut_indices: mut cut_indices,
+    )
+}
+
+/// Records the opaque index count before Multi-LOD seam triangles are appended so `finish_draw`
+/// can emit a dedicated `seam_draw_args` for the seam strip alongside per-brick `brick_draws`.
+@compute(1)
+pub(package) fn record_seam_start(tri_count: [u32], seam_start: mut One<u32>, id: GlobalId) {
+    seam_start.set(id, tri_count[0])
+}
+
+/// Pass 4: Writes the final `DrawIndexedArgs` for opaque (`tri_count[0]`), transmissive
+/// (`tri_count[1]`), cut-out (`tri_count[6]`), and Multi-LOD seam strip (`seam_start[0]..n`),
+/// and records the active bricks, vertices pushed (`tri_count[2]`, `[3]`, counted past capacity
+/// too), and sticky `OVERFLOW_*` bitflags (`tri_count[7]`) so one deferred readback
+/// (`MeshBatch::finish_poll`) learns what was drawn and which capacity overflowed.
+@compute(1)
+pub(package) fn finish_draw(
+    active_count: [u32],
+    vert_count: [u32],
+    seam_quad_count: [u32],
+    seam_cell_count: [u32],
+    exact_count: [u32],
+    seam_start: [u32],
+    has_seams: u32,
+    cap_indices: u32,
+    cap_trans: u32,
+    cap_exact: u32,
+    inst_count: u32,
+    tri_count: mut Atomics<u32>,
+    args: mut One<DrawIndexedArgs>,
+    trans_args: mut One<DrawIndexedArgs>,
+    cut_args: mut One<DrawIndexedArgs>,
+    seam_args: mut One<DrawIndexedArgs>,
+    exact_args: mut One<DrawIndexedArgs>,
+    id: GlobalId,
+) {
+    let raw_idx = tri_count.load(i: 0)
+    let n = min(raw_idx, cap_indices)
+    args.set(id, DrawIndexedArgs {
+        indices: n,
+        instances: if n > 0 { inst_count } else { 0 },
+        first_index: 0,
+        base_vertex: 0,
+        first_instance: 0,
+    })
+    let ss = if has_seams != 0 { min(seam_start[0], n) } else { n }
+    let sn = n - ss
+    seam_args.set(id, DrawIndexedArgs {
+        indices: sn,
+        instances: if sn > 0 { inst_count } else { 0 },
+        first_index: ss,
+        base_vertex: 0,
+        first_instance: 0,
+    })
+    let raw_trans = tri_count.load(i: 1)
+    let nt = min(raw_trans, cap_trans)
+    trans_args.set(id, DrawIndexedArgs {
+        indices: nt,
+        instances: if nt > 0 { inst_count } else { 0 },
+        first_index: 0,
+        base_vertex: 0,
+        first_instance: 0,
+    })
+    let raw_cut = tri_count.load(i: 6)
+    let nc = min(raw_cut, cap_trans)
+    cut_args.set(id, DrawIndexedArgs {
+        indices: nc,
+        instances: if nc > 0 { inst_count } else { 0 },
+        first_index: 0,
+        base_vertex: 0,
+        first_instance: 0,
+    })
+    let raw_ex = exact_count[0]
+    let nex = min(raw_ex, cap_exact)
+    exact_args.set(id, DrawIndexedArgs {
+        indices: if nex > 0 { 36 } else { 0 },
+        instances: nex,
+        first_index: 0,
+        base_vertex: 0,
+        first_instance: 0,
+    })
+    var ovf: u32 = 0
+    if has_seams != 0 && (seam_quad_count[0] > CAP_SEAM || seam_cell_count[0] > CAP_SEAM) {
+        ovf |= OVERFLOW_SEAMS
+    }
+    if raw_cut > cap_trans {
+        ovf |= OVERFLOW_CUT
+    }
+    if raw_idx > cap_indices {
+        ovf |= OVERFLOW_INDICES
+    }
+    if raw_trans > cap_trans {
+        ovf |= OVERFLOW_TRANS
+    }
+    if tri_count.load(i: 5) > 0 {
+        ovf |= OVERFLOW_CREASES
+    }
+    if cap_exact > 0 && raw_ex > cap_exact {
+        ovf |= OVERFLOW_EXACT
+    }
+    if tri_count.load(i: 9) > 0 {
+        ovf |= OVERFLOW_THIN
+    }
+    tri_count.store(i: 2, value: active_count[0])
+    tri_count.store(i: 3, value: vert_count[0])
+    tri_count.store(i: 7, value: ovf)
+    tri_count.store(i: 8, value: raw_ex)
+}
+
+/// After a patch (`try_patch_dirty`) appended exact cells: the exact draw's instances, its count
+/// for the readback (`tri_count[8]`), and `OVERFLOW_EXACT` past its capacity.
+@compute(64)
+pub(package) fn set_exact_args(
+    exact_count: [u32],
+    cap_exact: u32,
+    tri_count: mut Atomics<u32>,
+    exact_args: mut One<DrawIndexedArgs>,
+    id: GlobalId,
+) {
+    let raw = exact_count[0]
+    let n = min(raw, cap_exact)
+    exact_args.set(id, DrawIndexedArgs {
+        indices: if n > 0 { 36 } else { 0 },
+        instances: n,
+        first_index: 0,
+        base_vertex: 0,
+        first_instance: 0,
+    })
+    tri_count.store(i: 8, value: raw)
+    if raw > cap_exact {
+        let _ = tri_count.or(i: 7, value: OVERFLOW_EXACT)
+    }
+}
+
+/// Finalizes an in-place dirty-region CSG patch appended at brick slot `dst_base`.
+@compute(1)
+pub(package) fn finish_draw_patch(
+    dst_base: u32,
+    patch_active_count: [u32],
+    vert_count: [u32],
+    cap_indices: u32,
+    cap_trans: u32,
+    inst_count: u32,
+    tri_count: mut Atomics<u32>,
+    args: mut One<DrawIndexedArgs>,
+    trans_args: mut One<DrawIndexedArgs>,
+    cut_args: mut One<DrawIndexedArgs>,
+    id: GlobalId,
+) {
+    let n = min(tri_count.load(i: 0), cap_indices)
+    args.set(id, DrawIndexedArgs {
+        indices: n,
+        instances: if n > 0 { inst_count } else { 0 },
+        first_index: 0,
+        base_vertex: 0,
+        first_instance: 0,
+    })
+    let nt = min(tri_count.load(i: 1), cap_trans)
+    trans_args.set(id, DrawIndexedArgs {
+        indices: nt,
+        instances: if nt > 0 { inst_count } else { 0 },
+        first_index: 0,
+        base_vertex: 0,
+        first_instance: 0,
+    })
+    let nc = min(tri_count.load(i: 6), cap_trans)
+    cut_args.set(id, DrawIndexedArgs {
+        indices: nc,
+        instances: if nc > 0 { inst_count } else { 0 },
+        first_index: 0,
+        base_vertex: 0,
+        first_instance: 0,
+    })
+    tri_count.store(i: 2, value: dst_base + patch_active_count[0])
+    tri_count.store(i: 3, value: vert_count[0])
+}
+
+/// Updates the instance count of a cached rigid-instanced batch's indirect draw args when visible
+/// instance count changes, without re-extracting geometry or stalling on CPU readbacks.
+@compute(1)
+pub(package) fn set_instances(
+    tri_count: [u32],
+    cap_indices: u32,
+    cap_trans: u32,
+    inst_count: u32,
+    args: mut One<DrawIndexedArgs>,
+    trans_args: mut One<DrawIndexedArgs>,
+    cut_args: mut One<DrawIndexedArgs>,
+    id: GlobalId,
+) {
+    let n = min(tri_count[0], cap_indices)
+    args.set(id, DrawIndexedArgs {
+        indices: n,
+        instances: if n > 0 { inst_count } else { 0 },
+        first_index: 0,
+        base_vertex: 0,
+        first_instance: 0,
+    })
+    let nt = min(tri_count[1], cap_trans)
+    trans_args.set(id, DrawIndexedArgs {
+        indices: nt,
+        instances: if nt > 0 { inst_count } else { 0 },
+        first_index: 0,
+        base_vertex: 0,
+        first_instance: 0,
+    })
+    let nc = min(tri_count[6], cap_trans)
+    cut_args.set(id, DrawIndexedArgs {
+        indices: nc,
+        instances: if nc > 0 { inst_count } else { 0 },
+        first_index: 0,
+        base_vertex: 0,
+        first_instance: 0,
+    })
+}
+
+/// Factors `field` into `(rigid_frame, Some(local_shape_key))` when `field` is an outer rigid
+/// warp of a local shape whose channels are constant (`With<S, C>`) or purely local-space,

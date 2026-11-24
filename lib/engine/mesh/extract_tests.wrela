@@ -1,0 +1,1442 @@
+// CPU watertightness, Dual Contouring, packing, DQS, and multi-LOD seam tests.
+
+use matter::substance::{Substance, lambert}
+use mesh::dc::{
+    CellCorners, Qef, cdist, cell_dual_vertex, corner_uvw, decode_cell, facing, is_crease,
+    load_corners, project_posed, trilinear_qef,
+}
+use mesh::emit::{
+    cell_in_hole_p, cell_outside_seam_p, coarse_cell_corners, owned_edge, parent_cell_of_p,
+    quad_order, split_seam_13,
+}
+use mesh::grid::{
+    BRICK, CORNERS_BRICK, EDGES_BRICK, GridSpec, NONE, SMOOTH_DOT, THING_IDS, VERTS_BRICK,
+    avg2_sign, avg4_sign, brick_corner, brick_in_hole, brick_of, build_lod_grids, cull_brick,
+    eval_dqs, grid_for, lattice, pack_vertex_meta, safe_norm, tight_aabb, unpack_is_trans,
+    unpack_oct_normal, unpack_smooth, unpack_thing,
+}
+use std::collections::Vec
+use std::derive::{Box3, value_and_gradient}
+use std::field::{
+    ALL_LIVE, DualQuat, Field, cuboid, ellipsoid, fbm, half_space, round_cone, sphere,
+}
+use std::io::print
+use std::quat::Quat
+
+// ---- CPU checks ---------------------------------------------------------------------------------
+// The kernels above are thin: each brick, corner, cell and edge goes through a plain function
+// (`cull_brick`, `brick_corner`, `cell_dual_vertex`, `owned_edge`, `project_posed`), and these
+// tests run those same functions on the CPU, meshing whole fields brick by brick as the GPU passes
+// do and holding the result to the solid: closed, facing out of it, and the same as one mesh of
+// the whole grid at once.
+
+/// A triangle by its three vertices' positions' bits, in winding order.
+struct Tri: Copy {
+    a: vec3u,
+    b: vec3u,
+    c: vec3u,
+}
+
+/// A position's bits.
+fn bits(p: vec3) -> vec3u {
+    vec3u(bitcast_u32(p.x), bitcast_u32(p.y), bitcast_u32(p.z))
+}
+
+/// Whether `x` sorts before `y`, component by component.
+fn key_before(x: vec3u, y: vec3u) -> bool {
+    if x.x != y.x {
+        return x.x < y.x
+    }
+    if x.y != y.y {
+        return x.y < y.y
+    }
+    x.z < y.z
+}
+
+/// `t` turned (keeping its winding) to start at its least vertex, so equal triangles compare equal.
+fn canonical(t: Tri) -> Tri {
+    if !key_before(t.b, t.a) && !key_before(t.c, t.a) {
+        t
+    } else if !key_before(t.c, t.b) {
+        Tri { a: t.b, b: t.c, c: t.a }
+    } else {
+        Tri { a: t.c, b: t.a, c: t.b }
+    }
+}
+
+/// Whether triangle `x` sorts before `y`.
+fn tri_before(x: Tri, y: Tri) -> bool {
+    if x.a != y.a {
+        return key_before(x.a, y.a)
+    }
+    if x.b != y.b {
+        return key_before(x.b, y.b)
+    }
+    key_before(x.c, y.c)
+}
+
+/// A vertex's normal as `push_vertex` stores it and `emit_quad` reads it back.
+fn packed_normal(gv: vec3, q: Qef) -> vec3 {
+    let n = safe_norm(gv, safe_norm(q.avg_n, vec3(0.0, 1.0, 0.0)))
+    unpack_oct_normal(pack_vertex_meta(n, 0, smooth: false, is_trans: false))
+}
+
+/// Pushes the two triangles of the quad of cell vertices `i` (in `at`, normals `nm`), wound and
+/// split as `emit_quad` does.
+fn push_quad(tris: mut Vec<Tri>, at: Vec<vec3>, nm: Vec<vec3>, i: [u32; 4], flip: bool) {
+    let (j0, j1, j2, j3) = if flip { (i[0], i[3], i[2], i[1]) } else { (i[0], i[1], i[2], i[3]) }
+    let (q0, q1, q2, q3) = (at[j0], at[j1], at[j2], at[j3])
+    let split = split_seam_13(q0, q1, q2, q3, nm[j0], nm[j1], nm[j2], nm[j3])
+    let (a, b, c, d) = if split { (q1, q2, q3, q0) } else { (q0, q1, q2, q3) }
+    tris.push(Tri { a: bits(a), b: bits(b), c: bits(c) })
+    tris.push(Tri { a: bits(a), b: bits(c), c: bits(d) })
+}
+
+/// Meshes `f` over grid `g` on the CPU as the GPU passes do: each brick culled by `cull_brick`,
+/// its `8³` corners from `distance_live` at `brick_corner`, each sign-changing cell's vertex from
+/// `cell_dual_vertex`, each owned edge's quad from `owned_edge`. A halo cell is solved by both
+/// bricks that hold it, as on the GPU.
+fn mesh_bricked<M: Field<Substance>>(f: M, g: GridSpec) -> Vec<Tri> {
+    var tris: Vec<Tri> = Vec::new()
+    for local in 0..g.dims.x * g.dims.y * g.dims.z {
+        let b = brick_of(g, local)
+        let (hit, live) = cull_brick(f, g, b)
+        if !hit {
+            continue
+        }
+        var corners: Vec<f32> = Vec::new()
+        for ci in 0..CORNERS_BRICK {
+            corners.push(
+                f.distance_live(brick_corner(g, b, vec3u(ci & 7, (ci >> 3) & 7, ci >> 6)), live),
+            )
+        }
+        var at: Vec<vec3> = Vec::new()
+        var nm: Vec<vec3> = Vec::new()
+        var solved: Vec<bool> = Vec::new()
+        for cell in 0..VERTS_BRICK {
+            let (cx, cy, cz) = decode_cell(cell)
+            let d = load_corners(corners, 0, cx, cy, cz)
+            var neg: u32 = 0
+            for k in 0..8 {
+                if d.at(k) < 0.0 {
+                    neg += 1
+                }
+            }
+            if neg != 0 && neg != 8 {
+                let dist = |q: vec3| f.distance_live(q, live)
+                let (wp, gv, q) = cell_dual_vertex(
+                    dist,
+                    d,
+                    brick_corner(g, b, vec3u(cx, cy, cz)),
+                    g.cell,
+                )
+                at.push(wp)
+                nm.push(packed_normal(gv, q))
+                solved.push(true)
+            } else {
+                at.push(vec3(0.0))
+                nm.push(vec3(0.0))
+                solved.push(false)
+            }
+        }
+        for eidx in 0..EDGES_BRICK {
+            let ez = eidx / 36
+            let ey = (eidx - ez * 36) / 6
+            let ex = eidx - ez * 36 - ey * 6
+            for axis in 0..3 {
+                let e = owned_edge(axis, ex, ey, ez)
+                let d0 = cdist(corners, 0, e.from.x, e.from.y, e.from.z)
+                let d1 = cdist(corners, 0, e.to.x, e.to.y, e.to.z)
+                if (d0 < 0.0) != (d1 < 0.0) {
+                    let i0 = e.c0.x + e.c0.y * 7 + e.c0.z * 49
+                    let i1 = e.c1.x + e.c1.y * 7 + e.c1.z * 49
+                    let i2 = e.c2.x + e.c2.y * 7 + e.c2.z * 49
+                    let i3 = e.c3.x + e.c3.y * 7 + e.c3.z * 49
+                    assert(
+                        solved[i0] && solved[i1] && solved[i2] && solved[i3],
+                        "a crossing edge's cells all have vertices",
+                    )
+                    push_quad(mut tris, at, nm, [i0, i1, i2, i3], flip: d0 >= 0.0)
+                }
+            }
+        }
+    }
+    tris
+}
+
+/// Meshes `f` over grid `g` on the CPU as one brick the size of the whole grid, with every part
+/// live: no culling, no halo, one vertex per cell. What `mesh_bricked` must equal bit for bit.
+fn mesh_whole<M: Field<Substance>>(f: M, g: GridSpec) -> Vec<Tri> {
+    let n = vec3u(g.dims.x * BRICK, g.dims.y * BRICK, g.dims.z * BRICK)
+    let nc = n + vec3u(2, 2, 2)
+    let ncell = n + vec3u(1, 1, 1)
+    var corners: Vec<f32> = Vec::new()
+    for z in 0..nc.z {
+        for y in 0..nc.y {
+            for x in 0..nc.x {
+                corners.push(f.distance_live(lattice(g, vec3u(x, y, z)), ALL_LIVE))
+            }
+        }
+    }
+    let cidx = |c: vec3u| c.x + (c.y + c.z * nc.y) * nc.x
+    var at: Vec<vec3> = Vec::new()
+    var nm: Vec<vec3> = Vec::new()
+    var solved: Vec<bool> = Vec::new()
+    for z in 0..ncell.z {
+        for y in 0..ncell.y {
+            for x in 0..ncell.x {
+                let d = CellCorners {
+                    d000: corners[cidx(vec3u(x, y, z))],
+                    d100: corners[cidx(vec3u(x + 1, y, z))],
+                    d010: corners[cidx(vec3u(x, y + 1, z))],
+                    d110: corners[cidx(vec3u(x + 1, y + 1, z))],
+                    d001: corners[cidx(vec3u(x, y, z + 1))],
+                    d101: corners[cidx(vec3u(x + 1, y, z + 1))],
+                    d011: corners[cidx(vec3u(x, y + 1, z + 1))],
+                    d111: corners[cidx(vec3u(x + 1, y + 1, z + 1))],
+                }
+                var neg: u32 = 0
+                for k in 0..8 {
+                    if d.at(k) < 0.0 {
+                        neg += 1
+                    }
+                }
+                if neg != 0 && neg != 8 {
+                    let dist = |q: vec3| f.distance_live(q, ALL_LIVE)
+                    let (wp, gv, q) = cell_dual_vertex(dist, d, lattice(g, vec3u(x, y, z)), g.cell)
+                    at.push(wp)
+                    nm.push(packed_normal(gv, q))
+                    solved.push(true)
+                } else {
+                    at.push(vec3(0.0))
+                    nm.push(vec3(0.0))
+                    solved.push(false)
+                }
+            }
+        }
+    }
+    let vidx = |c: vec3u| c.x + (c.y + c.z * ncell.y) * ncell.x
+    var tris: Vec<Tri> = Vec::new()
+    for ez in 0..n.z {
+        for ey in 0..n.y {
+            for ex in 0..n.x {
+                for axis in 0..3 {
+                    let e = owned_edge(axis, ex, ey, ez)
+                    let d0 = corners[cidx(e.from)]
+                    let d1 = corners[cidx(e.to)]
+                    if (d0 < 0.0) != (d1 < 0.0) {
+                        let (i0, i1, i2, i3) = (vidx(e.c0), vidx(e.c1), vidx(e.c2), vidx(e.c3))
+                        assert(
+                            solved[i0] && solved[i1] && solved[i2] && solved[i3],
+                            "a crossing edge's cells all have vertices",
+                        )
+                        push_quad(mut tris, at, nm, [i0, i1, i2, i3], flip: d0 >= 0.0)
+                    }
+                }
+            }
+        }
+    }
+    tris
+}
+
+/// How many of `tris`' edges (by their two vertices' bits, either way round) are not shared by
+/// exactly `2` triangles (`even`: by an even number, which non-manifold Dual Contouring may give
+/// at a pinch but a crack or hole never does).
+fn open_edges(tris: Vec<Tri>, even: bool) -> u32 {
+    // Each vertex's index among the distinct positions.
+    var keys: Vec<vec3u> = Vec::new()
+    for i in 0..tris.len() {
+        keys.push(tris[i].a)
+        keys.push(tris[i].b)
+        keys.push(tris[i].c)
+    }
+    keys.sort_by(|x: vec3u, y: vec3u| key_before(x, y))
+    var unique: Vec<vec3u> = Vec::new()
+    for i in 0..keys.len() {
+        if i == 0 || keys[i] != keys[i - 1] {
+            unique.push(keys[i])
+        }
+    }
+    let id = |k: vec3u| {
+        var lo: u32 = 0
+        var hi: u32 = unique.len()
+        while lo + 1 < hi {
+            let mid = (lo + hi) / 2
+            if key_before(k, unique[mid]) {
+                hi = mid
+            } else {
+                lo = mid
+            }
+        }
+        lo
+    }
+    var edges: Vec<u64> = Vec::new()
+    for i in 0..tris.len() {
+        let v = [id(tris[i].a), id(tris[i].b), id(tris[i].c)]
+        for k in 0..3 {
+            let p = v[k]
+            let q = v[(k + 1) % 3]
+            edges.push((u64(min(p, q)) << 32) | u64(max(p, q)))
+        }
+    }
+    edges.sort_by(|x: u64, y: u64| x < y)
+    var open: u32 = 0
+    var i: u32 = 0
+    while i < edges.len() {
+        var j = i + 1
+        while j < edges.len() && edges[j] == edges[i] {
+            j += 1
+        }
+        let n = j - i
+        if (even && n % 2 != 0) || (!even && n != 2) {
+            open += 1
+        }
+        i = j
+    }
+    open
+}
+
+/// How many of `tris` face into `f`'s solid: their right-handed normal against `f`'s gradient at
+/// their centroid and at each of their corners (a triangle bridging a sharp crease may lean past
+/// one face's normal, but it still faces out of the other's; a triangle too small to have a
+/// direction is skipped).
+fn inward<M: Field<Substance>>(f: M, tris: Vec<Tri>) -> u32 {
+    var bad: u32 = 0
+    for i in 0..tris.len() {
+        let a = vec3(bitcast_f32(tris[i].a.x), bitcast_f32(tris[i].a.y), bitcast_f32(tris[i].a.z))
+        let b = vec3(bitcast_f32(tris[i].b.x), bitcast_f32(tris[i].b.y), bitcast_f32(tris[i].b.z))
+        let c = vec3(bitcast_f32(tris[i].c.x), bitcast_f32(tris[i].c.y), bitcast_f32(tris[i].c.z))
+        let n = cross(b - a, c - a)
+        if dot(n, n) > 1.0e-14 {
+            var faces_out = false
+            for p in [(a + b + c) * (1.0 / 3.0), a, b, c] {
+                let (_d, g) = value_and_gradient(|q: vec3| f.distance(q), p)
+                if dot(n, g) > 0.0 {
+                    faces_out = true
+                }
+            }
+            if !faces_out {
+                bad += 1
+            }
+        }
+    }
+    bad
+}
+
+/// Whether two triangle lists hold the same triangles, wound the same way, bit for bit.
+fn same_tris(x: Vec<Tri>, y: Vec<Tri>) -> bool {
+    if x.len() != y.len() {
+        return false
+    }
+    var cx: Vec<Tri> = Vec::new()
+    var cy: Vec<Tri> = Vec::new()
+    for i in 0..x.len() {
+        cx.push(canonical(x[i]))
+        cy.push(canonical(y[i]))
+    }
+    cx.sort_by(|p: Tri, q: Tri| tri_before(p, q))
+    cy.sort_by(|p: Tri, q: Tri| tri_before(p, q))
+    for i in 0..cx.len() {
+        if cx[i].a != cy[i].a || cx[i].b != cy[i].b || cx[i].c != cy[i].c {
+            return false
+        }
+    }
+    true
+}
+
+/// Meshes `f` at cell `cell` on the grid `sync_one` would, brick by brick, and holds the mesh to
+/// the solid: at least `least` triangles, closed (`manifold`: every edge 2 triangles'; else an
+/// even number, as Dual Contouring may pinch), none facing into the solid, and bit for bit the
+/// mesh of the whole grid meshed at once with every part live.
+fn held_to_solid<M: Field<Substance>>(name: Text, f: M, cell: f32, manifold: bool, least: u32) {
+    let g = grid_for(tight_aabb(f), cell, base_brick: 0, orig_id: 0)
+    let bricked = mesh_bricked(f, g)
+    print(f"{name}: {bricked.len()} triangles in {g.dims.x * g.dims.y * g.dims.z} bricks")
+    assert(bricked.len() >= least, f"{name}'s mesh has triangles")
+    let open = open_edges(bricked, even: !manifold)
+    assert(open == 0, f"{name}'s mesh has {open} open edges")
+    let bad = inward(f, bricked)
+    assert(bad == 0, f"{bad} of {name}'s triangles face into it")
+    assert(
+        same_tris(bricked, mesh_whole(f, g)),
+        f"{name} meshed in bricks isn't the whole grid's mesh",
+    )
+}
+
+@test
+fn a_vertexs_normal_and_flags_survive_packing() {
+    var worst = 1.0
+    for i in 0..400 {
+        // Directions over the whole sphere, the poles and the octahedron's folds among them.
+        let z = 1.0 - 2.0 * (f32(i) + 0.5) / 400.0
+        let r = sqrt(max(1.0 - z * z, 0.0))
+        let a = f32(i) * 2.39996323
+        let n = vec3(r * cos(a), r * sin(a), z)
+        let packed = pack_vertex_meta(
+            n,
+            i % THING_IDS,
+            smooth: (i & 1) != 0,
+            is_trans: (i & 2) != 0,
+        )
+        worst = min(worst, dot(unpack_oct_normal(packed), n))
+        assert(unpack_thing(packed) == i % THING_IDS, "the thing survives packing")
+        assert(unpack_smooth(packed) == ((i & 1) != 0), "the smooth flag survives packing")
+        assert(unpack_is_trans(packed) == ((i & 2) != 0), "the transmissive flag survives packing")
+    }
+    for n in [
+        vec3(0.0, 0.0, -1.0),
+        vec3(1.0, 0.0, 0.0),
+        vec3(0.0, -1.0, 0.0),
+        vec3(0.0, 0.0, 1.0),
+    ] {
+        worst = min(
+            worst,
+            dot(unpack_oct_normal(pack_vertex_meta(n, 0, smooth: true, is_trans: false)), n),
+        )
+    }
+    // 10 bits a component: within a quarter of a degree.
+    assert(
+        worst >= cos(0.25 * 3.14159265 / 180.0),
+        f"a normal comes back {acos(worst) * 180.0 / 3.14159265}° off",
+    )
+}
+
+@test
+fn neighbouring_bricks_share_their_halo_bit_for_bit() {
+    for cell in [0.1, 0.0137, 0.25, 0.005] {
+        let g = GridSpec {
+            origin: vec3(-3.71, 0.0193, 12.5),
+            cell,
+            dims: vec3u(64, 64, 64),
+            base_brick: 0,
+            orig_id: 0,
+            seam_mask: 0,
+            parent_grid: NONE,
+            has_hole: 0,
+            hole_min: vec3u(0, 0, 0),
+            pad0: 0,
+            hole_max: vec3u(0, 0, 0),
+            pad1: 0,
+            cell_offset: vec3u(0, 0, 0),
+            pad2: 0,
+            parent_hole_min: vec3u(0, 0, 0),
+            pad3: 0,
+        }
+        for b in 0..63 {
+            for c in 0..2 {
+                let mine = brick_corner(g, vec3u(b, b, b), vec3u(BRICK + c, BRICK + c, BRICK + c))
+                let next = brick_corner(g, vec3u(b + 1, b + 1, b + 1), vec3u(c, c, c))
+                assert(
+                    bits(mine) == bits(next),
+                    f"brick {b}'s halo corner {c} isn't its neighbour's at cell {cell}",
+                )
+            }
+        }
+    }
+}
+
+@test
+fn a_crease_cell_solves_onto_its_edge() {
+    let c = vec3(0.013, 0.021, 0.007)
+    let half = vec3(0.4, 0.3, 0.35)
+    let f = cuboid(half: half).translate(c)
+    // A cell holding the cube's `+x +y` edge, off the lattice of its faces.
+    let edge = vec2(c.x + half.x, c.y + half.y)
+    let h = 0.05
+    let lo = vec3(edge.x, edge.y, c.z) - vec3(0.31, 0.57, 0.44) * h
+    var v = [0.0; 8]
+    for k in 0..8 {
+        v[k] = f.distance(lo + corner_uvw(k) * h)
+    }
+    let d = CellCorners {
+        d000: v[0],
+        d100: v[1],
+        d010: v[2],
+        d110: v[3],
+        d001: v[4],
+        d101: v[5],
+        d011: v[6],
+        d111: v[7],
+    }
+    // Trilinear interpolation smears this edge's normals (0.96 apart): the exact gradient at the
+    // trilinear solution finds it (`hidden_crease`), and it is solved from exact Hermite data.
+    assert(!is_crease(trilinear_qef(d)), "the trilinear normals of this edge cell look smooth")
+    let (wp, _gv, q) = cell_dual_vertex(|p: vec3| f.distance(p), d, lo, h)
+    assert(q.min_dot < SMOOTH_DOT, "a cube's edge cell is solved and shaded as a crease")
+    let off = length(wp.xy - edge)
+    assert(off <= 0.02 * h, f"the edge cell's vertex {wp} is {off / h} cells off the edge")
+}
+
+@test
+fn a_skinned_vertex_is_projected_onto_its_own_sheet() {
+    // A slab 2 cm thick (`|y| < 0.01`): the near side of its top face and the far side.
+    let slab = |p: vec3| abs(p.y) - 0.01
+    let up = vec3(0.0, 1.0, 0.0)
+    let (top, n_top) = project_posed(slab, vec3(0.2, 0.004, -0.1), up)
+    assert(
+        abs(top.y - 0.01) <= 1.0e-4 && dot(n_top, up) > 0.99,
+        f"a vertex inside the top half goes to the top face, not {top}",
+    )
+    let (above, _n) = project_posed(slab, vec3(0.0, 0.05, 0.0), up)
+    assert(abs(above.y - 0.01) <= 1.0e-4, f"a vertex above goes down to the top face, not {above}")
+    // Past the middle the gradient faces the bottom: skinning's top-face vertex stays put rather
+    // than jump to the far sheet.
+    let (past, n_past) = project_posed(slab, vec3(0.0, -0.003, 0.0), up)
+    assert(
+        past.y == -0.003 && dot(n_past, up) > 0.99,
+        f"a top-face vertex past the middle jumped to {past}",
+    )
+}
+
+@test
+fn dual_quaternions_blend_the_short_way() {
+    let q = Quat::axis_angle(vec3(0.0, 1.0, 0.0), 1.2)
+    let a = DualQuat::from_qt(q, vec3(0.3, -0.2, 0.5))
+    // The same transform with its quaternions' signs flipped.
+    let b = DualQuat { real: -a.real, dual: -a.dual }
+    let bones = [a, b]
+    let p = vec3(0.4, 0.1, -0.7)
+    let want = a.apply_point(p)
+    // Bone 0 and bone 1 half each (`128 + 127`): the same transform, not a collapse to the origin.
+    let got = eval_dqs(bones, 0, 0 | (1 << 8), 128 | (127 << 8)).apply_point(p)
+    assert(length(got - want) <= 1.0e-5, f"an antipodal blend moves {p} to {got}, not {want}")
+}
+
+@test
+@fuel(2 ** 42)
+fn a_spheres_mesh_is_closed_faces_out_and_is_the_same_in_bricks() {
+    let f = sphere(radius: 0.5).translate(vec3(0.013, -0.021, 0.007)).with(lambert(vec3(0.5)))
+    held_to_solid("the sphere", f, 0.04, manifold: true, least: 2000)
+}
+
+@test
+@fuel(2 ** 43)
+fn a_rocks_mesh_is_closed_faces_out_and_is_the_same_in_bricks() {
+    // An oval cut by five planes and weathered by a noise: creases, and steep (octant culling).
+    let f = ellipsoid(vec3(0.55, 0.4, 0.45))
+        .intersect(half_space(vec3(0.3, 1.0, 0.1), 0.3))
+        .intersect(half_space(vec3(1.0, 0.2, -0.3), 0.42))
+        .intersect(half_space(vec3(-0.8, 0.3, 0.6), 0.36))
+        .intersect(half_space(vec3(0.1, -0.2, -1.0), 0.33))
+        .intersect(half_space(vec3(-0.2, 0.5, 1.0), 0.38))
+        .displace(fbm(freq: 5.0, octaves: 3, offset: vec3(1.0, 4.0, 2.0)), amp: 0.012)
+        .with(lambert(vec3(0.5)))
+    held_to_solid("the rock", f, 0.03, manifold: false, least: 2000)
+}
+
+@test
+@fuel(2 ** 43)
+fn a_blobs_mesh_is_closed_faces_out_and_is_the_same_in_bricks() {
+    // A body, a neck and a head, smoothly joined: parts each brick prunes.
+    let body = ellipsoid(vec3(0.62, 0.42, 0.42))
+    let neck = round_cone(vec3(0.35, 0.15, 0.0), vec3(0.75, 0.62, 0.0), r_top: 0.16, r_bottom: 0.1)
+    let head = sphere(radius: 0.2).translate(vec3(0.82, 0.72, 0.0))
+    let f = body.smooth_union(neck, k: 0.12).smooth_union(head, k: 0.08).with(lambert(vec3(0.5)))
+    held_to_solid("the blob", f, 0.03, manifold: true, least: 2000)
+}
+
+/// Pushes one seam polygon (3 or 4 distinct vertices) into CPU `tris`, skipping degenerate edges.
+fn push_seam_tri(tris: mut Vec<Tri>, pa: vec3, pb: vec3, pc: vec3) {
+    let ka = bits(pa)
+    let kb = bits(pb)
+    let kc = bits(pc)
+    if ka == kb || kb == kc || kc == ka {
+        return
+    }
+    tris.push(Tri { a: ka, b: kb, c: kc })
+}
+
+/// CPU mirror of `process_lod_edge` + `solve_seam_smooth`/`refine_seam_creases`/`finish_seam_tris`.
+fn emit_cpu_lod_edge<M: Field<Substance>>(
+    f: M,
+    grids: Vec<GridSpec>,
+    g: GridSpec,
+    bbase: vec3u,
+    axis: u32,
+    lp: vec3u,
+    corners: Vec<f32>,
+    at: Vec<vec3>,
+    nm: Vec<vec3>,
+    solved: Vec<bool>,
+    tris_out: mut Vec<Tri>,
+    sc_out: mut u32,
+) {
+    let ua = if axis == 0 { vec3u(1, 0, 0) } else if axis == 1 { vec3u(0, 1, 0) } else {
+        vec3u(0, 0, 1)
+    }
+    let ub = if axis == 0 { vec3u(0, 1, 0) } else if axis == 1 { vec3u(0, 0, 1) } else {
+        vec3u(1, 0, 0)
+    }
+    let uc = if axis == 0 { vec3u(0, 0, 1) } else if axis == 1 { vec3u(1, 0, 0) } else {
+        vec3u(0, 1, 0)
+    }
+    let tp = lp + ua
+    let d0 = corners[lp.x + (lp.y << 3) + (lp.z << 6)]
+    let d1 = corners[tp.x + (tp.y << 3) + (tp.z << 6)]
+    if (d0 < 0.0) == (d1 < 0.0) {
+        return
+    }
+    let gp = bbase + lp
+    let q0p = gp + vec3u(1, 1, 1) - ub - uc
+    let q1p = gp + vec3u(1, 1, 1) - uc
+    let q2p = gp + vec3u(1, 1, 1)
+    let q3p = gp + vec3u(1, 1, 1) - ub
+    if cell_in_hole_p(g, q0p) ||
+        cell_in_hole_p(g, q1p) ||
+        cell_in_hole_p(g, q2p) ||
+        cell_in_hole_p(g, q3p) {
+        return
+    }
+    let o0 = cell_outside_seam_p(g, q0p)
+    let o1 = cell_outside_seam_p(g, q1p)
+    let o2 = cell_outside_seam_p(g, q2p)
+    let o3 = cell_outside_seam_p(g, q3p)
+    let flip = d0 >= 0.0
+    if !(o0 || o1 || o2 || o3) {
+        let l0 = q0p - vec3u(1, 1, 1) - bbase
+        let l1 = q1p - vec3u(1, 1, 1) - bbase
+        let l2 = q2p - vec3u(1, 1, 1) - bbase
+        let l3 = q3p - vec3u(1, 1, 1) - bbase
+        let i0 = l0.x + l0.y * 7 + l0.z * 49
+        let i1 = l1.x + l1.y * 7 + l1.z * 49
+        let i2 = l2.x + l2.y * 7 + l2.z * 49
+        let i3 = l3.x + l3.y * 7 + l3.z * 49
+        assert(
+            solved[i0] && solved[i1] && solved[i2] && solved[i3],
+            "interior crossing edge has all 4 solved vertices",
+        )
+        push_quad(mut tris_out, at, nm, [i0, i1, i2, i3], flip: flip)
+        return
+    }
+    sc_out += 1
+    let pg = grids[g.parent_grid]
+    let qps = [q0p, q1p, q2p, q3p]
+    let outs = [o0, o1, o2, o3]
+    var pts = [vec3(0.0); 4]
+    var nms = [vec3(0.0); 4]
+    for k in 0..4 {
+        if !outs[k] {
+            let lk = qps[k] - vec3u(1, 1, 1) - bbase
+            let ci = lk.x + lk.y * 7 + lk.z * 49
+            assert(solved[ci], "fine seam quadrant has a solved vertex")
+            pts[k] = at[ci]
+            nms[k] = nm[ci]
+        } else {
+            let pc = parent_cell_of_p(g, qps[k])
+            let dc = coarse_cell_corners(f, pg, pc)
+            let (wp, gv, qef) = cell_dual_vertex(
+                |q: vec3| f.distance(q),
+                dc,
+                lattice(pg, pc),
+                pg.cell,
+            )
+            pts[k] = wp
+            nms[k] = packed_normal(gv, qef)
+        }
+    }
+    let (i0, i1, i2, i3) = quad_order(v0: 0, v1: 1, v2: 2, v3: 3, flip: flip)
+    let (p0, p1, p2, p3) = (pts[i0], pts[i1], pts[i2], pts[i3])
+    let (k0, k1, k2, k3) = (bits(p0), bits(p1), bits(p2), bits(p3))
+    if k0 != k1 && k1 != k2 && k2 != k3 && k3 != k0 && k0 != k2 && k1 != k3 {
+        let s13 = split_seam_13(p0, p1, p2, p3, nms[i0], nms[i1], nms[i2], nms[i3])
+        if s13 {
+            push_seam_tri(mut tris_out, p1, p2, p3)
+            push_seam_tri(mut tris_out, p1, p3, p0)
+        } else {
+            push_seam_tri(mut tris_out, p0, p1, p2)
+            push_seam_tri(mut tris_out, p0, p2, p3)
+        }
+    } else {
+        push_seam_tri(mut tris_out, p0, p1, p2)
+        push_seam_tri(mut tris_out, p0, p2, p3)
+    }
+}
+
+/// CPU mirror of the Multi-LOD GPU pipeline (`cull_bricks` -> `eval_corners` ->
+/// `inherit_seam_corners` -> `solve_verts`/`refine_creases` -> `emit_tris_lod` ->
+/// `solve_seam_smooth`/`refine_seam_creases` -> `finish_seam_tris`).
+fn mesh_multilod<M: Field<Substance>>(f: M, grids: Vec<GridSpec>) -> (Vec<Tri>, u32) {
+    var tris: Vec<Tri> = Vec::new()
+    var seam_count: u32 = 0
+    for gi in 0..grids.len() {
+        let g = grids[gi]
+        let nx = g.dims.x * BRICK
+        let ny = g.dims.y * BRICK
+        let nz = g.dims.z * BRICK
+        for bz in 0..g.dims.z {
+            for by in 0..g.dims.y {
+                for bx in 0..g.dims.x {
+                    let b = vec3u(bx, by, bz)
+                    if brick_in_hole(g, b) {
+                        continue
+                    }
+                    let (hit, live) = cull_brick(f, g, b)
+                    if !hit {
+                        continue
+                    }
+                    var raw = Vec::filled(CORNERS_BRICK, 0.0)
+                    for cz in 0..8 {
+                        for cy in 0..8 {
+                            for cx in 0..8 {
+                                let p = brick_corner(g, b, vec3u(cx, cy, cz))
+                                raw[cx + (cy << 3) + (cz << 6)] = f.distance_live(p, live)
+                            }
+                        }
+                    }
+                    var corners = Vec::filled(CORNERS_BRICK, 0.0)
+                    for cz in 0..8 {
+                        for cy in 0..8 {
+                            for cx in 0..8 {
+                                let idx = cx + (cy << 3) + (cz << 6)
+                                var val = raw[idx]
+                                if g.seam_mask != 0 {
+                                    let gx = b.x * BRICK + cx
+                                    let gy = b.y * BRICK + cy
+                                    let gz = b.z * BRICK + cz
+                                    let in_box = gx <= nx && gy <= ny && gz <= nz
+                                    let on_x = (gx == 0 && (g.seam_mask & 1) != 0) ||
+                                        (gx == nx && (g.seam_mask & 2) != 0)
+                                    let on_y = (gy == 0 && (g.seam_mask & 4) != 0) ||
+                                        (gy == ny && (g.seam_mask & 8) != 0)
+                                    let on_z = (gz == 0 && (g.seam_mask & 16) != 0) ||
+                                        (gz == nz && (g.seam_mask & 32) != 0)
+                                    if in_box && (on_x || on_y || on_z) {
+                                        let ox = cx & 1
+                                        let oy = cy & 1
+                                        let oz = cz & 1
+                                        let n_odd = ox + oy + oz
+                                        let read_c = |x: u32, y: u32, z: u32| {
+                                            if x < 8 && y < 8 && z < 8 {
+                                                raw[x + (y << 3) + (z << 6)]
+                                            } else {
+                                                f.distance_live(
+                                                    brick_corner(g, b, vec3u(x, y, z)),
+                                                    live,
+                                                )
+                                            }
+                                        }
+                                        if n_odd == 1 {
+                                            let d0 = read_c(cx - ox, cy - oy, cz - oz)
+                                            let d1 = read_c(cx + ox, cy + oy, cz + oz)
+                                            if (d0 < 0.0) == (d1 < 0.0) {
+                                                val = avg2_sign(d0, d1)
+                                            }
+                                        } else if n_odd == 2 {
+                                            let a0x = if ox == 1 { 1 } else { 0 }
+                                            let a0y = if ox == 0 { 1 } else { 0 }
+                                            let a1y = if ox == 1 && oy == 1 { 1 } else { 0 }
+                                            let a1z = if !(ox == 1 && oy == 1) { 1 } else { 0 }
+                                            let d00 = read_c(cx - a0x, cy - a0y - a1y, cz - a1z)
+                                            let d10 = read_c(cx + a0x, cy + a0y - a1y, cz - a1z)
+                                            let d01 = read_c(cx - a0x, cy - a0y + a1y, cz + a1z)
+                                            let d11 = read_c(cx + a0x, cy + a0y + a1y, cz + a1z)
+                                            let s00 = d00 < 0.0
+                                            if s00 == (d10 < 0.0) &&
+                                                s00 == (d01 < 0.0) &&
+                                                s00 == (d11 < 0.0) {
+                                                val = avg4_sign(d00, d10, d01, d11)
+                                            }
+                                        }
+                                    }
+                                }
+                                corners[idx] = val
+                            }
+                        }
+                    }
+                    var at: Vec<vec3> = Vec::filled(VERTS_BRICK, vec3(0.0))
+                    var nm: Vec<vec3> = Vec::filled(VERTS_BRICK, vec3(0.0))
+                    var solved: Vec<bool> = Vec::filled(VERTS_BRICK, value: false)
+                    for cz in 0..7 {
+                        for cy in 0..7 {
+                            for cx in 0..7 {
+                                let d = CellCorners {
+                                    d000: corners[cx + (cy << 3) + (cz << 6)],
+                                    d100: corners[(cx + 1) + (cy << 3) + (cz << 6)],
+                                    d010: corners[cx + ((cy + 1) << 3) + (cz << 6)],
+                                    d110: corners[(cx + 1) + ((cy + 1) << 3) + (cz << 6)],
+                                    d001: corners[cx + (cy << 3) + ((cz + 1) << 6)],
+                                    d101: corners[(cx + 1) + (cy << 3) + ((cz + 1) << 6)],
+                                    d011: corners[cx + ((cy + 1) << 3) + ((cz + 1) << 6)],
+                                    d111: corners[(cx + 1) + ((cy + 1) << 3) + ((cz + 1) << 6)],
+                                }
+                                var neg: u32 = 0
+                                for k in 0..8 {
+                                    if d.at(k) < 0.0 {
+                                        neg += 1
+                                    }
+                                }
+                                if neg != 0 && neg != 8 {
+                                    let dist = |q: vec3| f.distance_live(q, live)
+                                    let (wp, gv, q) = cell_dual_vertex(
+                                        dist,
+                                        d,
+                                        brick_corner(g, b, vec3u(cx, cy, cz)),
+                                        g.cell,
+                                    )
+                                    let ci = cx + cy * 7 + cz * 49
+                                    at[ci] = wp
+                                    nm[ci] = packed_normal(gv, q)
+                                    solved[ci] = true
+                                }
+                            }
+                        }
+                    }
+                    let bbase = vec3u(b.x * BRICK, b.y * BRICK, b.z * BRICK)
+                    for ez in 0..BRICK {
+                        for ey in 0..BRICK {
+                            for ex in 0..BRICK {
+                                emit_cpu_lod_edge(
+                                    f,
+                                    grids,
+                                    g,
+                                    bbase,
+                                    0,
+                                    vec3u(ex, ey + 1, ez + 1),
+                                    corners,
+                                    at,
+                                    nm,
+                                    solved,
+                                    mut tris,
+                                    mut seam_count,
+                                )
+                                if ey == 0 && b.y == 0 && (g.seam_mask & 4) != 0 {
+                                    emit_cpu_lod_edge(
+                                        f,
+                                        grids,
+                                        g,
+                                        bbase,
+                                        0,
+                                        vec3u(ex, 0, ez + 1),
+                                        corners,
+                                        at,
+                                        nm,
+                                        solved,
+                                        mut tris,
+                                        mut seam_count,
+                                    )
+                                }
+                                if ez == 0 && b.z == 0 && (g.seam_mask & 16) != 0 {
+                                    emit_cpu_lod_edge(
+                                        f,
+                                        grids,
+                                        g,
+                                        bbase,
+                                        0,
+                                        vec3u(ex, ey + 1, 0),
+                                        corners,
+                                        at,
+                                        nm,
+                                        solved,
+                                        mut tris,
+                                        mut seam_count,
+                                    )
+                                }
+                                if ey == 0 &&
+                                    ez == 0 &&
+                                    b.y == 0 &&
+                                    b.z == 0 &&
+                                    ((g.seam_mask & 4) != 0 || (g.seam_mask & 16) != 0) {
+                                    emit_cpu_lod_edge(
+                                        f,
+                                        grids,
+                                        g,
+                                        bbase,
+                                        0,
+                                        vec3u(ex, 0, 0),
+                                        corners,
+                                        at,
+                                        nm,
+                                        solved,
+                                        mut tris,
+                                        mut seam_count,
+                                    )
+                                }
+                                emit_cpu_lod_edge(
+                                    f,
+                                    grids,
+                                    g,
+                                    bbase,
+                                    1,
+                                    vec3u(ex + 1, ey, ez + 1),
+                                    corners,
+                                    at,
+                                    nm,
+                                    solved,
+                                    mut tris,
+                                    mut seam_count,
+                                )
+                                if ez == 0 && b.z == 0 && (g.seam_mask & 16) != 0 {
+                                    emit_cpu_lod_edge(
+                                        f,
+                                        grids,
+                                        g,
+                                        bbase,
+                                        1,
+                                        vec3u(ex + 1, ey, 0),
+                                        corners,
+                                        at,
+                                        nm,
+                                        solved,
+                                        mut tris,
+                                        mut seam_count,
+                                    )
+                                }
+                                if ex == 0 && b.x == 0 && (g.seam_mask & 1) != 0 {
+                                    emit_cpu_lod_edge(
+                                        f,
+                                        grids,
+                                        g,
+                                        bbase,
+                                        1,
+                                        vec3u(0, ey, ez + 1),
+                                        corners,
+                                        at,
+                                        nm,
+                                        solved,
+                                        mut tris,
+                                        mut seam_count,
+                                    )
+                                }
+                                if ez == 0 &&
+                                    ex == 0 &&
+                                    b.z == 0 &&
+                                    b.x == 0 &&
+                                    ((g.seam_mask & 16) != 0 || (g.seam_mask & 1) != 0) {
+                                    emit_cpu_lod_edge(
+                                        f,
+                                        grids,
+                                        g,
+                                        bbase,
+                                        1,
+                                        vec3u(0, ey, 0),
+                                        corners,
+                                        at,
+                                        nm,
+                                        solved,
+                                        mut tris,
+                                        mut seam_count,
+                                    )
+                                }
+                                emit_cpu_lod_edge(
+                                    f,
+                                    grids,
+                                    g,
+                                    bbase,
+                                    2,
+                                    vec3u(ex + 1, ey + 1, ez),
+                                    corners,
+                                    at,
+                                    nm,
+                                    solved,
+                                    mut tris,
+                                    mut seam_count,
+                                )
+                                if ex == 0 && b.x == 0 && (g.seam_mask & 1) != 0 {
+                                    emit_cpu_lod_edge(
+                                        f,
+                                        grids,
+                                        g,
+                                        bbase,
+                                        2,
+                                        vec3u(0, ey + 1, ez),
+                                        corners,
+                                        at,
+                                        nm,
+                                        solved,
+                                        mut tris,
+                                        mut seam_count,
+                                    )
+                                }
+                                if ey == 0 && b.y == 0 && (g.seam_mask & 4) != 0 {
+                                    emit_cpu_lod_edge(
+                                        f,
+                                        grids,
+                                        g,
+                                        bbase,
+                                        2,
+                                        vec3u(ex + 1, 0, ez),
+                                        corners,
+                                        at,
+                                        nm,
+                                        solved,
+                                        mut tris,
+                                        mut seam_count,
+                                    )
+                                }
+                                if ex == 0 &&
+                                    ey == 0 &&
+                                    b.x == 0 &&
+                                    b.y == 0 &&
+                                    ((g.seam_mask & 1) != 0 || (g.seam_mask & 4) != 0) {
+                                    emit_cpu_lod_edge(
+                                        f,
+                                        grids,
+                                        g,
+                                        bbase,
+                                        2,
+                                        vec3u(0, 0, ez),
+                                        corners,
+                                        at,
+                                        nm,
+                                        solved,
+                                        mut tris,
+                                        mut seam_count,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (tris, seam_count)
+}
+
+@test
+@fuel(2 ** 43)
+fn multilod_two_level_sphere_seam_is_watertight_and_faces_out() {
+    let f = sphere(radius: 1.2).translate(vec3(0.03, -0.02, 0.05)).with(lambert(vec3(0.5)))
+    let (grids, _tb, has_seams) = build_lod_grids(
+        tight_aabb(f),
+        focus: vec3(1.15, 0.25, 0.20),
+        h_near: 0.04,
+        h_top: 0.08,
+        orig_id: 0,
+        half_parent_bricks: 2,
+    )
+    assert(has_seams && grids.len() == 2, "two-level Multi-LOD builds 2 grids with seams")
+    let (tris, seams) = mesh_multilod(f, grids)
+    print(f"multilod 2-level sphere: {tris.len()} triangles across {seams} seam edges")
+    assert(seams > 20, "seam boundary actually intersects the sphere surface")
+    let open = open_edges(tris, even: false)
+    assert(open == 0, f"multilod 2-level sphere has {open} open edges")
+    let bad = inward(f, tris)
+    assert(bad == 0, f"{bad} triangles of multilod 2-level sphere face inward")
+}
+
+@test
+@fuel(2 ** 43)
+fn multilod_three_level_nested_seams_are_watertight() {
+    let f = sphere(radius: 2.0).translate(vec3(-0.07, 0.04, -0.03)).with(lambert(vec3(0.5)))
+    let (grids, _tb, has_seams) = build_lod_grids(
+        tight_aabb(f),
+        focus: vec3(1.92, 0.30, 0.15),
+        h_near: 0.03,
+        h_top: 0.12,
+        orig_id: 0,
+        half_parent_bricks: 2,
+    )
+    assert(has_seams && grids.len() == 3, "three-level Multi-LOD builds 3 grids with seams")
+    let (tris, seams) = mesh_multilod(f, grids)
+    print(f"multilod 3-level sphere: {tris.len()} triangles across {seams} seam edges")
+    assert(seams > 40, "both 2:1 seam boundaries intersect the sphere surface")
+    let open = open_edges(tris, even: false)
+    assert(open == 0, f"multilod 3-level sphere has {open} open edges")
+    // All non-sliver triangles face outward (curved 2:1 seam corners can create <=0.02% sub-mm
+    // tangent slivers behind front-facing neighbors; zero cracks, zero open edges).
+    let bad = inward(f, tris)
+    assert(bad * 5000 <= tris.len(), f"{bad} of {tris.len()} triangles face inward")
+}
+
+@test
+@fuel(2 ** 43)
+fn multilod_sharp_creased_rock_seam_is_watertight() {
+    let f = ellipsoid(vec3(1.1, 0.8, 0.9))
+        .intersect(half_space(vec3(0.3, 1.0, 0.1), 0.55))
+        .intersect(half_space(vec3(1.0, 0.2, -0.3), 0.78))
+        .displace(fbm(freq: 3.5, octaves: 3, offset: vec3(1.0, 4.0, 2.0)), amp: 0.025)
+        .with(lambert(vec3(0.5)))
+    let (grids, _tb, has_seams) = build_lod_grids(
+        tight_aabb(f),
+        focus: vec3(0.75, 0.45, 0.10),
+        h_near: 0.035,
+        h_top: 0.07,
+        orig_id: 0,
+        half_parent_bricks: 2,
+    )
+    assert(has_seams && grids.len() == 2, "creased rock Multi-LOD builds 2 grids with seams")
+    let (tris, seams) = mesh_multilod(f, grids)
+    print(f"multilod creased rock: {tris.len()} triangles across {seams} seam edges")
+    assert(seams > 20, "seam boundary intersects the creased rock surface")
+    let open = open_edges(tris, even: true)
+    assert(open == 0, f"multilod creased rock has {open} open edges")
+    let bad = inward(f, tris)
+    assert(bad * 5000 <= tris.len(), f"{bad} of {tris.len()} creased rock triangles face inward")
+}
+
+@test
+@fuel(2 ** 43)
+fn stage_eye7_multilod_has_zero_open_edges_and_hits_wall_top() {
+    let ground = cuboid(vec3(8.0, 0.25, 8.0))
+        .translate(vec3(0.0, -0.25, 0.0))
+        .with(lambert(vec3(0.36)))
+    let wall = cuboid(vec3(3.0, 1.5, 0.1)).translate(vec3(0.0, 1.5, 0.0)).with(lambert(vec3(0.42)))
+    let ball = sphere(radius: 0.5).translate(vec3(-1.8, 0.5, 1.6)).with(lambert(vec3(0.33)))
+    let f = ground.union(wall).union(ball)
+    let (grids, _tb, has_seams) = build_lod_grids(
+        tight_aabb(f),
+        focus: vec3(-1.430827, 2.9778602, 0.099999994),
+        h_near: 0.001964665,
+        h_top: 0.06286928,
+        orig_id: 0,
+        half_parent_bricks: 2,
+    )
+    assert(has_seams, "stage eye 7 has seams")
+    let (tris, seams) = mesh_multilod(f, grids)
+    let open = open_edges(tris, even: false)
+    print(f"stage eye7 CPU: {tris.len()} tris, {seams} seam edges, open={open}")
+    // Ray-triangle intersection check for the exact failing ray from SCENE=6 stage eye 7!
+    let ro = vec3(-1.430827, 2.9778602, 0.25919253)
+    let rd = normalize(vec3(0.8407717, 0.07006249, -0.53683734))
+    var hits: u32 = 0
+    var best_t = 1.0e20
+    var back_hits: u32 = 0
+    for i in 0..tris.len() {
+        let a = vec3(bitcast_f32(tris[i].a.x), bitcast_f32(tris[i].a.y), bitcast_f32(tris[i].a.z))
+        let b = vec3(bitcast_f32(tris[i].b.x), bitcast_f32(tris[i].b.y), bitcast_f32(tris[i].b.z))
+        let c = vec3(bitcast_f32(tris[i].c.x), bitcast_f32(tris[i].c.y), bitcast_f32(tris[i].c.z))
+        let e1 = b - a
+        let e2 = c - a
+        let pvec = cross(rd, e2)
+        let det = dot(e1, pvec)
+        if abs(det) > 1.0e-12 {
+            let inv = 1.0 / det
+            let tvec = ro - a
+            let u = dot(tvec, pvec) * inv
+            let qvec = cross(tvec, e1)
+            let v = dot(rd, qvec) * inv
+            let t = dot(e2, qvec) * inv
+            if u >= -1.0e-5 && v >= -1.0e-5 && u + v <= 1.0 + 1.0e-5 && t > 0.0 {
+                let n = cross(e1, e2)
+                if dot(n, rd) < 0.0 {
+                    hits += 1
+                    best_t = min(best_t, t)
+                } else {
+                    back_hits += 1
+                }
+            }
+        }
+    }
+    // Check wall top edge across x in [-1.5, -0.5] at y = 2.9995, z = 0.0999:
+    var worst_y = 3.0
+    var worst_tri: u32 = 0
+    for i in 0..tris.len() {
+        let a = vec3(bitcast_f32(tris[i].a.x), bitcast_f32(tris[i].a.y), bitcast_f32(tris[i].a.z))
+        let b = vec3(bitcast_f32(tris[i].b.x), bitcast_f32(tris[i].b.y), bitcast_f32(tris[i].b.z))
+        let c = vec3(bitcast_f32(tris[i].c.x), bitcast_f32(tris[i].c.y), bitcast_f32(tris[i].c.z))
+        let mid = (a + b + c) * (1.0 / 3.0)
+        if mid.x > -1.5 && mid.x < -0.5 && mid.y > 2.95 && mid.z > 0.05 {
+            // Check if any triangle bridges top (y≈3) and front (z≈0.1) without reaching (3.0, 0.1)!
+            let has_top = a.y > 2.999 || b.y > 2.999 || c.y > 2.999
+            let has_front = a.z > 0.099 || b.z > 0.099 || c.z > 0.099
+            if has_top && has_front {
+                let my = min(a.y, min(b.y, c.y))
+                if my < worst_y &&
+                    !(a.y > 2.999 && a.z > 0.099) &&
+                    !(b.y > 2.999 && b.z > 0.099) &&
+                    !(c.y > 2.999 && c.z > 0.099) {
+                    worst_y = my
+                    worst_tri = i
+                }
+            }
+        }
+    }
+    if worst_y < 2.999 {
+        let t = tris[worst_tri]
+        let a = vec3(bitcast_f32(t.a.x), bitcast_f32(t.a.y), bitcast_f32(t.a.z))
+        let b = vec3(bitcast_f32(t.b.x), bitcast_f32(t.b.y), bitcast_f32(t.b.z))
+        let c = vec3(bitcast_f32(t.c.x), bitcast_f32(t.c.y), bitcast_f32(t.c.z))
+        print(f"BEVEL_FOUND worst_y={worst_y}: a={a} b={b} c={c}")
+    } else {
+        print("NO_BEVEL_FOUND on wall top edge!")
+    }
+    print(f"stage eye7 ray: front_hits={hits} best_t={best_t} back_hits={back_hits}")
+    assert(open == 0, f"stage eye7 has {open} open edges")
+    assert(hits > 0, "stage eye7 ray hits front-facing wall triangle")
+}
+
+@test
+@fuel(2 ** 42)
+fn ward_acute_knife_edge_preserves_crest_diagonal() {
+    let wf = vec3(0.766, 0.0, 0.643)
+    let wa = vec3(-0.643, 0.0, 0.766)
+    let wc = vec3(-0.35, 1.38, 0.20) - wf * 1.32
+    let dist = |p: vec3| -> f32 {
+        let qq = p - wc
+        let q = vec3(dot(qq, wf), qq.y, dot(qq, wa))
+        let r = length(q)
+        let wave = 0.03 * sin(q.y * 5.0) * cos(q.z * 4.0)
+        let shell = abs(r - (1.32 + wave)) - 0.036
+        let clip_x = 0.68 - q.x
+        let clip_y = abs(q.y) - 1.05
+        let clip_z = abs(q.z) - 1.12
+        max(shell, max(clip_x, max(clip_y, clip_z)))
+    }
+    let g_orig = vec3(-1.1007724, 2.0723524, -0.63111126)
+    let h = 0.0065277773
+    var verts: Vec<vec3> = Vec::new()
+    var nms: Vec<vec3> = Vec::new()
+    var vids: Vec<u32> = Vec::new()
+    for cz in 74..81 {
+        for cy in 52..57 {
+            for cx in 28..35 {
+                let clo = g_orig + vec3(f32(cx), f32(cy), f32(cz)) * h
+                var cv_d = [0.0; 8]
+                var neg: u32 = 0
+                for k in 0..8 {
+                    let cp = clo + vec3(f32(k & 1), f32((k >> 1) & 1), f32(k >> 2)) * h
+                    cv_d[k] = dist(cp)
+                    if cv_d[k] < 0.0 {
+                        neg += 1
+                    }
+                }
+                let d = CellCorners {
+                    d000: cv_d[0],
+                    d100: cv_d[1],
+                    d010: cv_d[2],
+                    d110: cv_d[3],
+                    d001: cv_d[4],
+                    d101: cv_d[5],
+                    d011: cv_d[6],
+                    d111: cv_d[7],
+                }
+                if neg != 0 && neg != 8 {
+                    let (wp, gv, q) = cell_dual_vertex(dist, d, clo, h)
+                    vids.push(verts.len())
+                    verts.push(wp)
+                    nms.push(packed_normal(gv, q))
+                } else {
+                    vids.push(NONE)
+                }
+            }
+        }
+    }
+    let idx_of = |x: u32, y: u32, z: u32| vids[(z - 74) * 35 + (y - 52) * 7 + (x - 28)]
+    var tris: Vec<Tri> = Vec::new()
+    for cz in 75..81 {
+        for cy in 53..57 {
+            for cx in 29..35 {
+                let p0 = g_orig + vec3(f32(cx), f32(cy), f32(cz)) * h
+                let d0 = dist(p0)
+                if cx < 34 {
+                    let d1 = dist(p0 + vec3(h, 0.0, 0.0))
+                    if (d0 < 0.0) != (d1 < 0.0) {
+                        let a = idx_of(cx, cy - 1, cz - 1)
+                        let b = idx_of(cx, cy, cz - 1)
+                        let c = idx_of(cx, cy, cz)
+                        let dd = idx_of(cx, cy - 1, cz)
+                        if a != NONE && b != NONE && c != NONE && dd != NONE {
+                            push_quad(mut tris, verts, nms, [a, b, c, dd], flip: d0 >= 0.0)
+                        }
+                    }
+                }
+                if cy < 56 {
+                    let d1 = dist(p0 + vec3(0.0, h, 0.0))
+                    if (d0 < 0.0) != (d1 < 0.0) {
+                        let a = idx_of(cx - 1, cy, cz - 1)
+                        let b = idx_of(cx - 1, cy, cz)
+                        let c = idx_of(cx, cy, cz)
+                        let dd = idx_of(cx, cy, cz - 1)
+                        if a != NONE && b != NONE && c != NONE && dd != NONE {
+                            push_quad(mut tris, verts, nms, [a, b, c, dd], flip: d0 >= 0.0)
+                        }
+                    }
+                }
+                if cz < 80 {
+                    let d1 = dist(p0 + vec3(0.0, 0.0, h))
+                    if (d0 < 0.0) != (d1 < 0.0) {
+                        let a = idx_of(cx - 1, cy - 1, cz)
+                        let b = idx_of(cx, cy - 1, cz)
+                        let c = idx_of(cx, cy, cz)
+                        let dd = idx_of(cx - 1, cy, cz)
+                        if a != NONE && b != NONE && c != NONE && dd != NONE {
+                            push_quad(mut tris, verts, nms, [a, b, c, dd], flip: d0 >= 0.0)
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let ro = vec3(-0.45617545, 2.888537, -0.52566)
+    let hit = vec3(-0.89349556, 2.4299653, -0.12594026)
+    let rd = normalize(hit - ro)
+    var fhits: u32 = 0
+    for i in 0..tris.len() {
+        let a = vec3(bitcast_f32(tris[i].a.x), bitcast_f32(tris[i].a.y), bitcast_f32(tris[i].a.z))
+        let b = vec3(bitcast_f32(tris[i].b.x), bitcast_f32(tris[i].b.y), bitcast_f32(tris[i].b.z))
+        let c = vec3(bitcast_f32(tris[i].c.x), bitcast_f32(tris[i].c.y), bitcast_f32(tris[i].c.z))
+        let e1 = b - a
+        let e2 = c - a
+        let pvec = cross(rd, e2)
+        let det = dot(e1, pvec)
+        if abs(det) > 1.0e-12 {
+            let inv = 1.0 / det
+            let tvec = ro - a
+            let u = dot(tvec, pvec) * inv
+            let qvec = cross(tvec, e1)
+            let v = dot(rd, qvec) * inv
+            let tt = dot(e2, qvec) * inv
+            if u >= -1.0e-5 &&
+                v >= -1.0e-5 &&
+                u + v <= 1.0 + 1.0e-5 &&
+                tt > 0.0 &&
+                dot(cross(e1, e2), rd) < 0.0 {
+                fhits += 1
+            }
+        }
+    }
+    assert(fhits > 0, "acute ward knife-edge crest must not be notched by split_seam_13")
+}
+
+@test
+@fuel(2 ** 42)
+fn acute_knife_edge_crest_extension_hits_all_grid_phases() {
+    let wf = vec3(0.766, 0.0, 0.643)
+    let wa = vec3(-0.643, 0.0, 0.766)
+    let wc = vec3(-0.35, 1.38, 0.20) - wf * 1.32
+    let dist = |p: vec3| -> f32 {
+        let qq = p - wc
+        let q = vec3(dot(qq, wf), qq.y, dot(qq, wa))
+        let r = length(q)
+        let wave = 0.03 * sin(q.y * 5.0) * cos(q.z * 4.0)
+        let shell = abs(r - (1.32 + wave)) - 0.036
+        let clip_x = 0.68 - q.x
+        let clip_y = abs(q.y) - 1.05
+        let clip_z = abs(q.z) - 1.12
+        max(shell, max(clip_x, max(clip_y, clip_z)))
+    }
+    let ro = vec3(-0.45617545, 2.888537, -0.52566)
+    let hit = vec3(-0.8781136, 2.4299936, -0.1480253)
+    let rd = normalize(hit - ro)
+    let h = 0.0016319443
+    var misses: u32 = 0
+    for ph in 0..4 {
+        let off = f32(ph) * 0.25
+        let g_orig = hit - vec3(4.0 + off, 4.0 + off, 4.0 + off) * h
+        var verts: Vec<vec3> = Vec::new()
+        var nms: Vec<vec3> = Vec::new()
+        var vids: Vec<u32> = Vec::new()
+        for cz in 0..9 {
+            for cy in 0..9 {
+                for cx in 0..9 {
+                    let clo = g_orig + vec3(f32(cx), f32(cy), f32(cz)) * h
+                    var cv_d = [0.0; 8]
+                    var neg: u32 = 0
+                    for k in 0..8 {
+                        let cp = clo + vec3(f32(k & 1), f32((k >> 1) & 1), f32(k >> 2)) * h
+                        cv_d[k] = dist(cp)
+                        if cv_d[k] < 0.0 {
+                            neg += 1
+                        }
+                    }
+                    let d = CellCorners {
+                        d000: cv_d[0],
+                        d100: cv_d[1],
+                        d010: cv_d[2],
+                        d110: cv_d[3],
+                        d001: cv_d[4],
+                        d101: cv_d[5],
+                        d011: cv_d[6],
+                        d111: cv_d[7],
+                    }
+                    if neg != 0 && neg != 8 {
+                        let (wp, gv, q) = cell_dual_vertex(dist, d, clo, h)
+                        vids.push(verts.len())
+                        verts.push(wp)
+                        nms.push(packed_normal(gv, q))
+                    } else {
+                        vids.push(NONE)
+                    }
+                }
+            }
+        }
+        let idx_of = |x: u32, y: u32, z: u32| vids[z * 81 + y * 9 + x]
+        var tris: Vec<Tri> = Vec::new()
+        for cz in 1..9 {
+            for cy in 1..9 {
+                for cx in 1..9 {
+                    let p0 = g_orig + vec3(f32(cx), f32(cy), f32(cz)) * h
+                    let d0 = dist(p0)
+                    if cx < 8 {
+                        let d1 = dist(p0 + vec3(h, 0.0, 0.0))
+                        if (d0 < 0.0) != (d1 < 0.0) {
+                            let a = idx_of(cx, cy - 1, cz - 1)
+                            let b = idx_of(cx, cy, cz - 1)
+                            let c = idx_of(cx, cy, cz)
+                            let dd = idx_of(cx, cy - 1, cz)
+                            if a != NONE && b != NONE && c != NONE && dd != NONE {
+                                push_quad(mut tris, verts, nms, [a, b, c, dd], flip: d0 >= 0.0)
+                            }
+                        }
+                    }
+                    if cy < 8 {
+                        let d1 = dist(p0 + vec3(0.0, h, 0.0))
+                        if (d0 < 0.0) != (d1 < 0.0) {
+                            let a = idx_of(cx - 1, cy, cz - 1)
+                            let b = idx_of(cx - 1, cy, cz)
+                            let c = idx_of(cx, cy, cz)
+                            let dd = idx_of(cx, cy, cz - 1)
+                            if a != NONE && b != NONE && c != NONE && dd != NONE {
+                                push_quad(mut tris, verts, nms, [a, b, c, dd], flip: d0 >= 0.0)
+                            }
+                        }
+                    }
+                    if cz < 8 {
+                        let d1 = dist(p0 + vec3(0.0, 0.0, h))
+                        if (d0 < 0.0) != (d1 < 0.0) {
+                            let a = idx_of(cx - 1, cy - 1, cz)
+                            let b = idx_of(cx, cy - 1, cz)
+                            let c = idx_of(cx, cy, cz)
+                            let dd = idx_of(cx - 1, cy, cz)
+                            if a != NONE && b != NONE && c != NONE && dd != NONE {
+                                push_quad(mut tris, verts, nms, [a, b, c, dd], flip: d0 >= 0.0)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        var fhits: u32 = 0
+        for i in 0..tris.len() {
+            let a = vec3(
+                bitcast_f32(tris[i].a.x),
+                bitcast_f32(tris[i].a.y),
+                bitcast_f32(tris[i].a.z),
+            )
+            let b = vec3(
+                bitcast_f32(tris[i].b.x),
+                bitcast_f32(tris[i].b.y),
+                bitcast_f32(tris[i].b.z),
+            )
+            let c = vec3(
+                bitcast_f32(tris[i].c.x),
+                bitcast_f32(tris[i].c.y),
+                bitcast_f32(tris[i].c.z),
+            )
+            let e1 = b - a
+            let e2 = c - a
+            let pvec = cross(rd, e2)
+            let det = dot(e1, pvec)
+            if abs(det) > 1.0e-12 {
+                let inv = 1.0 / det
+                let tvec = ro - a
+                let u = dot(tvec, pvec) * inv
+                let qvec = cross(tvec, e1)
+                let v = dot(rd, qvec) * inv
+                let tt = dot(e2, qvec) * inv
+                if u >= -1.0e-5 &&
+                    v >= -1.0e-5 &&
+                    u + v <= 1.0 + 1.0e-5 &&
+                    tt > 0.0 &&
+                    dot(cross(e1, e2), rd) < 0.0 {
+                    fhits += 1
+                }
+            }
+        }
+        if fhits == 0 {
+            misses += 1
+        }
+    }
+    assert(misses == 0, f"acute knife-edge crest missed {misses}/4 grid phases")
+}

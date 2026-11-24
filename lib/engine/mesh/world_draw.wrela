@@ -1,0 +1,1961 @@
+// `MeshWorld` trait and implementations for `One<M>`, `Pool<M>`, and `And<A, B>`, plus shared
+// shadow-caster drawing.
+
+use matter::sky::Sky
+use matter::substance::Substance
+use matter::world::{And, One, Pool, one}
+use mesh::cull::HiZCuller
+use mesh::extract::{
+    CELL_PX, ExtractScratch, MeshBatch, NO_THING, probe_visible_near, size_floor, steep,
+}
+use mesh::light::{Emitter, NEAR, RadGrid, RadianceCache, ShadowView}
+use mesh::sdf::{SdfClipmap, SdfGrid}
+use mesh::shade::{
+    FAR_TIER_DIST, deformed_mesh_vs, exact_box_one_fs, exact_box_vs, field_cut_gbuf_many_fs,
+    field_cut_gbuf_one_fs, field_gbuf_many_fs, field_gbuf_one_fs, field_refract_refl_many_fs,
+    field_refract_refl_one_fs, field_skin_cut_gbuf_many_fs, field_skin_cut_gbuf_one_fs,
+    field_skin_gbuf_many_fs, field_skin_gbuf_one_fs, field_skin_refract_refl_many_fs,
+    field_skin_refract_refl_one_fs, field_skin_trans_many_fs, field_skin_trans_one_fs,
+    field_trans_many_fs, field_trans_one_fs, mesh_vs, shadow_fs, shadow_vs, skin_mesh_vs,
+    skin_shadow_vs,
+}
+use mesh::swarm::SwarmSim
+use picture::eye::View
+use std::collections::Vec
+use std::field::{Bound, Field, Rigid}
+use std::gpu::{
+    Compare, ComparisonSampler, Cull, Depth, DepthBias, DepthOnlyPass, DepthPass, DepthPass2,
+    DepthPass4, DepthTexture, GpuBuffer, GpuSpan, R16Float, R32Float, Rg16Float, Rgba8,
+    Rgba16Float, Sampler, Texture, Texture3d, buffer, buffer_of, draw, draw_multi,
+}
+use std::hash::StateHash
+
+fn cell_for_one(c: vec3, r: f32, v: View, steep: bool, floor: f32) -> f32 {
+    let near = max(length(c - v.at) - r, 0.25)
+    let px = near * v.pixel()
+    let r_px = r / max(px, 1.0e-5)
+    let mult = if steep { 1.1 } else { clamp(0.253 * sqrt(r_px), 1.45, 2.55) }
+    clamp(max(px * mult, max(floor, 0.005)), 0.005, 0.25)
+}
+
+/// Computes a curvature- and budget-aware cell spacing for one thing in a `Pool` batch.
+fn cell_for_share(c: vec3, r: f32, bricks_for_this: f32, v: View) -> f32 {
+    let near = max(length(c - v.at) - r, 0.25)
+    let px = near * v.pixel()
+    let r_px = r / max(px, 1.0e-5)
+    let mult = clamp(0.253 * sqrt(r_px), 1.35, 2.50)
+    let per_thing = max(bricks_for_this, 4.0)
+    let by_budget = r / max(sqrt(per_thing * 2.5), 3.5)
+    clamp(max(px * mult, by_budget), 0.006, 0.25)
+}
+
+/// Any world (`One`, `Pool`, `And`) that can sync its 16-byte GPU meshlet batches, splat its
+/// opaque geometry into the 3D SDF clipmap, collide swarms analytically, inject analytical vertex
+/// radiance, and draw directly with pixel-rate analytical `field.channels(wp)`.
+pub trait MeshWorld {
+    type FieldBufs
+    fn batch_count(self) -> u32
+    fn upload_fields(self) -> Self::FieldBufs
+    fn sync_batches(
+        self,
+        scratch: mut ExtractScratch,
+        batches: mut Vec<MeshBatch>,
+        first: u32,
+        v: View,
+    )
+    fn splat_sdf(
+        self,
+        sdf: mut SdfClipmap,
+        batches: mut Vec<MeshBatch>,
+        first: u32,
+        static_only: bool,
+        all_batches: bool,
+    )
+    fn collide_swarm(
+        self,
+        fbufs: Self::FieldBufs,
+        sim: mut SwarmSim,
+        restitution: f32,
+        friction: f32,
+    )
+    fn inject_radiance<S: Sky>(
+        self,
+        fbufs: Self::FieldBufs,
+        rad: mut RadianceCache,
+        batches: mut Vec<MeshBatch>,
+        first: u32,
+        sv: ShadowView,
+        sky: S,
+        sky_diff: Texture<Rgba16Float>,
+        sky_s: Sampler,
+        shadow_map: DepthTexture,
+        cmp: ComparisonSampler,
+        static_only: bool,
+        all_batches: bool,
+    )
+    fn draw_eye(
+        self,
+        fbufs: Self::FieldBufs,
+        ep: DepthPass4<Rgba8, Rgba8, Rgba16Float, Rg16Float>,
+        batches: mut Vec<MeshBatch>,
+        cull: mut HiZCuller,
+        cube_indices: GpuBuffer<u32>,
+        dc_depth: Texture<R32Float>,
+        first: u32,
+        pass_idx: u32,
+        v: View,
+        prev_v: View,
+    )
+    fn draw_refract_refl(
+        self,
+        fbufs: Self::FieldBufs,
+        rrp: DepthPass<Rgba16Float>,
+        batches: mut Vec<MeshBatch>,
+        first: u32,
+        v: View,
+        rad_grid: RadGrid,
+        sdf_grid: SdfGrid,
+        sky_diff: Texture<Rgba16Float>,
+        sky_spec0: Texture<Rgba16Float>,
+        sky_spec1: Texture<Rgba16Float>,
+        sky_spec2: Texture<Rgba16Float>,
+        sky_s: Sampler,
+        rad0: Texture3d<Rgba16Float>,
+        rad1: Texture3d<Rgba16Float>,
+        rad2: Texture3d<Rgba16Float>,
+        rad_s: Sampler,
+        sdf0: Texture3d<R16Float>,
+        sdf1: Texture3d<R16Float>,
+        sdf_s: Sampler,
+        hdr_bg: Texture<Rgba16Float>,
+        bg_s: Sampler,
+        half_size: vec2,
+    )
+    fn draw_refract<S: Sky>(
+        self,
+        fbufs: Self::FieldBufs,
+        rp: DepthPass2<Rgba16Float, Rg16Float>,
+        batches: mut Vec<MeshBatch>,
+        first: u32,
+        v: View,
+        prev_v: View,
+        sv: ShadowView,
+        rad_grid: RadGrid,
+        sdf_grid: SdfGrid,
+        sky: S,
+        sky_diff: Texture<Rgba16Float>,
+        sky_spec0: Texture<Rgba16Float>,
+        sky_spec1: Texture<Rgba16Float>,
+        sky_spec2: Texture<Rgba16Float>,
+        sky_s: Sampler,
+        shadow_map: DepthTexture,
+        static_shadow_map: DepthTexture,
+        has_static_shadow: u32,
+        cmp: ComparisonSampler,
+        rad0: Texture3d<Rgba16Float>,
+        rad1: Texture3d<Rgba16Float>,
+        rad2: Texture3d<Rgba16Float>,
+        rad_s: Sampler,
+        sdf0: Texture3d<R16Float>,
+        sdf1: Texture3d<R16Float>,
+        sdf_s: Sampler,
+        emitters: GpuSpan<Emitter>,
+        tile_masks: GpuSpan<u32>,
+        tiles_x: u32,
+        hdr_bg: Texture<Rgba16Float>,
+        refract_refl: Texture<Rgba16Float>,
+        bg_s: Sampler,
+    )
+}
+
+impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for One<M> {
+    type FieldBufs = u32
+
+    fn batch_count(self) -> u32 {
+        1
+    }
+
+    fn upload_fields(self) -> u32 {
+        0
+    }
+
+    fn sync_batches(
+        self,
+        scratch: mut ExtractScratch,
+        batches: mut Vec<MeshBatch>,
+        first: u32,
+        v: View,
+    ) {
+        let b = self.field.bound()
+        let r = min(b.radius, 1.0e4)
+        let is_steep = steep(self.field)
+        let h_top = cell_for_one(b.centre, r, v, is_steep, size_floor(r))
+        let lip = max(self.field.lipschitz(1.0), 1.0)
+        let d_surf = surface_from_eye(self.field, b.centre, r, v)
+        let force_direct = d_surf < DIRECT_RADII * r
+        var z_vis = d_surf
+        var h_near = h_top
+        if d_surf < 2.0 * r {
+            z_vis = probe_visible_near(self.field, v, d_surf, length(b.centre - v.at) + r)
+            let px_near = max(z_vis, 0.004) * v.pixel()
+            let eff_cpx = if lip > 2.5 { min(CELL_PX, 2.0) } else { CELL_PX }
+            let mult = eff_cpx * (if is_steep { 0.55 } else { 0.90 })
+            h_near = clamp(px_near * mult, max(h_top / 64.0, 0.0004), h_top)
+        }
+        batches[first].sync_one_lod(mut scratch, self.field, v, z_vis, h_near, h_top, force_direct)
+    }
+
+    fn splat_sdf(
+        self,
+        sdf: mut SdfClipmap,
+        batches: mut Vec<MeshBatch>,
+        first: u32,
+        static_only: bool,
+        all_batches: bool,
+    ) {
+        if !batches[first].has_opaque {
+            return
+        }
+        let is_static = batches[first].still_frames >= 1
+        if !all_batches && is_static != static_only {
+            return
+        }
+        sdf.splat_one(self.field, batches[first].bound, to_static: !all_batches && static_only)
+    }
+
+    fn collide_swarm(self, _fbufs: u32, sim: mut SwarmSim, restitution: f32, friction: f32) {
+        sim.collide_one(self.field, restitution, friction)
+    }
+
+    fn inject_radiance<S: Sky>(
+        self,
+        _fbufs: u32,
+        rad: mut RadianceCache,
+        batches: mut Vec<MeshBatch>,
+        first: u32,
+        sv: ShadowView,
+        sky: S,
+        sky_diff: Texture<Rgba16Float>,
+        sky_s: Sampler,
+        shadow_map: DepthTexture,
+        cmp: ComparisonSampler,
+        static_only: bool,
+        all_batches: bool,
+    ) {
+        let is_static = batches[first].still_frames >= 1
+        if !all_batches && is_static != static_only {
+            return
+        }
+        if batches[first].is_deformed {
+            rad.inject_one(
+                self.field,
+                batches[first].deformed_verts.items(),
+                batches[first].verts.count(),
+                batches[first].cap_verts,
+                batches[first].xforms.items(),
+                batches[first].inst_count,
+                sv,
+                sky,
+                sky_diff,
+                sky_s,
+                shadow_map,
+                cmp,
+                to_static: !all_batches && static_only,
+            )
+            return
+        }
+        rad.inject_one(
+            self.field,
+            batches[first].verts.items(),
+            batches[first].verts.count(),
+            batches[first].cap_verts,
+            batches[first].xforms.items(),
+            batches[first].inst_count,
+            sv,
+            sky,
+            sky_diff,
+            sky_s,
+            shadow_map,
+            cmp,
+            to_static: !all_batches && static_only,
+        )
+    }
+
+    fn draw_eye(
+        self,
+        _fbufs: u32,
+        ep: DepthPass4<Rgba8, Rgba8, Rgba16Float, Rg16Float>,
+        batches: mut Vec<MeshBatch>,
+        cull: mut HiZCuller,
+        cube_indices: GpuBuffer<u32>,
+        dc_depth: Texture<R32Float>,
+        first: u32,
+        pass_idx: u32,
+        v: View,
+        prev_v: View,
+    ) {
+        // Opaque quads, then the opaque pixels of the transmissive quads (`_cut_` shaders).
+        if batches[first].is_deformed {
+            if pass_idx != 0 {
+                return
+            }
+            let vs = deformed_mesh_vs.bind(
+                verts: batches[first].deformed_verts.items(),
+                prev_verts: batches[first].prev_deformed_verts.items(),
+                rest_verts: batches[first].verts.items(),
+                xforms: batches[first].xforms.items(),
+                prev_xforms: batches[first].prev_xforms.items(),
+                v: v,
+            )
+            if batches[first].has_opaque {
+                draw(
+                    ep,
+                    vs,
+                    field_skin_gbuf_one_fs.bind(field: self.field, v: v, prev_v: prev_v),
+                    indices: batches[first].indices,
+                    indirect: batches[first].draw_args,
+                    cull: Cull::Back,
+                    depth: Depth { compare: Compare::Greater, write: true },
+                )
+            }
+            if batches[first].has_trans {
+                draw(
+                    ep,
+                    vs,
+                    field_skin_cut_gbuf_one_fs.bind(field: self.field, v: v, prev_v: prev_v),
+                    indices: batches[first].cut_indices,
+                    indirect: batches[first].cut_draw_args,
+                    cull: Cull::Back,
+                    depth: Depth { compare: Compare::Greater, write: true },
+                )
+            }
+            return
+        }
+        if pass_idx == 2 {
+            if batches[first].has_exact {
+                draw(
+                    ep,
+                    exact_box_vs.bind(
+                        cells: batches[first].exact_cells.items(),
+                        xforms: batches[first].xforms.items(),
+                        v: v,
+                    ),
+                    exact_box_one_fs.bind(
+                        field: self.field,
+                        dc_depth: dc_depth,
+                        v: v,
+                        prev_v: prev_v,
+                    ),
+                    indices: cube_indices,
+                    indirect: batches[first].exact_draw_args,
+                    cull: Cull::None,
+                    depth: Depth { compare: Compare::Greater, write: true },
+                )
+            }
+            return
+        }
+        if pass_idx != 0 {
+            return
+        }
+        let vs = mesh_vs.bind(
+            verts: batches[first].verts.items(),
+            xforms: batches[first].xforms.items(),
+            prev_xforms: batches[first].prev_xforms.items(),
+            inst_ids: batches[first].inst_ids.items(),
+            is_instanced: 0,
+            v: v,
+        )
+        let fs = field_gbuf_one_fs.bind(field: self.field, v: v, prev_v: prev_v)
+        if batches[first].has_opaque {
+            draw(
+                ep,
+                vs,
+                fs,
+                indices: batches[first].indices,
+                indirect: batches[first].draw_args,
+                cull: Cull::Back,
+                depth: Depth { compare: Compare::Greater, write: true },
+            )
+        }
+        if batches[first].has_trans {
+            draw(
+                ep,
+                vs,
+                field_cut_gbuf_one_fs.bind(field: self.field, v: v, prev_v: prev_v),
+                indices: batches[first].cut_indices,
+                indirect: batches[first].cut_draw_args,
+                cull: Cull::Back,
+                depth: Depth { compare: Compare::Greater, write: true },
+            )
+        }
+    }
+
+    fn draw_refract_refl(
+        self,
+        _fbufs: u32,
+        rrp: DepthPass<Rgba16Float>,
+        batches: mut Vec<MeshBatch>,
+        first: u32,
+        v: View,
+        rad_grid: RadGrid,
+        sdf_grid: SdfGrid,
+        sky_diff: Texture<Rgba16Float>,
+        sky_spec0: Texture<Rgba16Float>,
+        sky_spec1: Texture<Rgba16Float>,
+        sky_spec2: Texture<Rgba16Float>,
+        sky_s: Sampler,
+        rad0: Texture3d<Rgba16Float>,
+        rad1: Texture3d<Rgba16Float>,
+        rad2: Texture3d<Rgba16Float>,
+        rad_s: Sampler,
+        sdf0: Texture3d<R16Float>,
+        sdf1: Texture3d<R16Float>,
+        sdf_s: Sampler,
+        hdr_bg: Texture<Rgba16Float>,
+        bg_s: Sampler,
+        half_size: vec2,
+    ) {
+        if !batches[first].has_trans {
+            return
+        }
+        if batches[first].is_deformed {
+            draw(
+                rrp,
+                deformed_mesh_vs.bind(
+                    verts: batches[first].deformed_verts.items(),
+                    prev_verts: batches[first].prev_deformed_verts.items(),
+                    rest_verts: batches[first].verts.items(),
+                    xforms: batches[first].xforms.items(),
+                    prev_xforms: batches[first].prev_xforms.items(),
+                    v: v,
+                ),
+                field_skin_refract_refl_one_fs.bind(
+                    field: self.field,
+                    v: v,
+                    rad_grid: rad_grid,
+                    sdf_grid: sdf_grid,
+                    sky_diff: sky_diff,
+                    sky_spec0: sky_spec0,
+                    sky_spec1: sky_spec1,
+                    sky_spec2: sky_spec2,
+                    sky_s: sky_s,
+                    rad0: rad0,
+                    rad1: rad1,
+                    rad2: rad2,
+                    rad_s: rad_s,
+                    sdf0: sdf0,
+                    sdf1: sdf1,
+                    sdf_s: sdf_s,
+                    hdr_bg: hdr_bg,
+                    bg_s: bg_s,
+                    half_size: half_size,
+                ),
+                indices: batches[first].trans_indices,
+                indirect: batches[first].trans_draw_args,
+                cull: Cull::Back,
+                depth: Depth { compare: Compare::Greater, write: true },
+            )
+            return
+        }
+        draw(
+            rrp,
+            mesh_vs.bind(
+                verts: batches[first].verts.items(),
+                xforms: batches[first].xforms.items(),
+                prev_xforms: batches[first].prev_xforms.items(),
+                inst_ids: batches[first].inst_ids.items(),
+                is_instanced: 0,
+                v: v,
+            ),
+            field_refract_refl_one_fs.bind(
+                field: self.field,
+                v: v,
+                rad_grid: rad_grid,
+                sdf_grid: sdf_grid,
+                sky_diff: sky_diff,
+                sky_spec0: sky_spec0,
+                sky_spec1: sky_spec1,
+                sky_spec2: sky_spec2,
+                sky_s: sky_s,
+                rad0: rad0,
+                rad1: rad1,
+                rad2: rad2,
+                rad_s: rad_s,
+                sdf0: sdf0,
+                sdf1: sdf1,
+                sdf_s: sdf_s,
+                hdr_bg: hdr_bg,
+                bg_s: bg_s,
+                half_size: half_size,
+            ),
+            indices: batches[first].trans_indices,
+            indirect: batches[first].trans_draw_args,
+            cull: Cull::Back,
+            depth: Depth { compare: Compare::Greater, write: true },
+        )
+    }
+
+    fn draw_refract<S: Sky>(
+        self,
+        _fbufs: u32,
+        rp: DepthPass2<Rgba16Float, Rg16Float>,
+        batches: mut Vec<MeshBatch>,
+        first: u32,
+        v: View,
+        prev_v: View,
+        sv: ShadowView,
+        rad_grid: RadGrid,
+        sdf_grid: SdfGrid,
+        sky: S,
+        sky_diff: Texture<Rgba16Float>,
+        sky_spec0: Texture<Rgba16Float>,
+        sky_spec1: Texture<Rgba16Float>,
+        sky_spec2: Texture<Rgba16Float>,
+        sky_s: Sampler,
+        shadow_map: DepthTexture,
+        static_shadow_map: DepthTexture,
+        has_static_shadow: u32,
+        cmp: ComparisonSampler,
+        rad0: Texture3d<Rgba16Float>,
+        rad1: Texture3d<Rgba16Float>,
+        rad2: Texture3d<Rgba16Float>,
+        rad_s: Sampler,
+        sdf0: Texture3d<R16Float>,
+        sdf1: Texture3d<R16Float>,
+        sdf_s: Sampler,
+        emitters: GpuSpan<Emitter>,
+        tile_masks: GpuSpan<u32>,
+        tiles_x: u32,
+        hdr_bg: Texture<Rgba16Float>,
+        refract_refl: Texture<Rgba16Float>,
+        bg_s: Sampler,
+    ) {
+        if !batches[first].has_trans {
+            return
+        }
+        if batches[first].is_deformed {
+            draw(
+                rp,
+                deformed_mesh_vs.bind(
+                    verts: batches[first].deformed_verts.items(),
+                    prev_verts: batches[first].prev_deformed_verts.items(),
+                    rest_verts: batches[first].verts.items(),
+                    xforms: batches[first].xforms.items(),
+                    prev_xforms: batches[first].prev_xforms.items(),
+                    v: v,
+                ),
+                field_skin_trans_one_fs.bind(
+                    field: self.field,
+                    v: v,
+                    prev_v: prev_v,
+                    sv: sv,
+                    rad_grid: rad_grid,
+                    sdf_grid: sdf_grid,
+                    sky: sky,
+                    sky_diff: sky_diff,
+                    sky_spec0: sky_spec0,
+                    sky_spec1: sky_spec1,
+                    sky_spec2: sky_spec2,
+                    sky_s: sky_s,
+                    shadow_map: shadow_map,
+                    static_shadow_map: static_shadow_map,
+                    has_static_shadow: has_static_shadow,
+                    cmp: cmp,
+                    rad0: rad0,
+                    rad1: rad1,
+                    rad2: rad2,
+                    rad_s: rad_s,
+                    sdf0: sdf0,
+                    sdf1: sdf1,
+                    sdf_s: sdf_s,
+                    emitters: emitters,
+                    tile_masks: tile_masks,
+                    tiles_x: tiles_x,
+                    hdr_bg: hdr_bg,
+                    refract_refl: refract_refl,
+                    bg_s: bg_s,
+                ),
+                indices: batches[first].trans_indices,
+                indirect: batches[first].trans_draw_args,
+                cull: Cull::Back,
+                depth: Depth { compare: Compare::Greater, write: true },
+            )
+            return
+        }
+        draw(
+            rp,
+            mesh_vs.bind(
+                verts: batches[first].verts.items(),
+                xforms: batches[first].xforms.items(),
+                prev_xforms: batches[first].prev_xforms.items(),
+                inst_ids: batches[first].inst_ids.items(),
+                is_instanced: 0,
+                v: v,
+            ),
+            field_trans_one_fs.bind(
+                field: self.field,
+                v: v,
+                prev_v: prev_v,
+                sv: sv,
+                rad_grid: rad_grid,
+                sdf_grid: sdf_grid,
+                sky: sky,
+                sky_diff: sky_diff,
+                sky_spec0: sky_spec0,
+                sky_spec1: sky_spec1,
+                sky_spec2: sky_spec2,
+                sky_s: sky_s,
+                shadow_map: shadow_map,
+                static_shadow_map: static_shadow_map,
+                has_static_shadow: has_static_shadow,
+                cmp: cmp,
+                rad0: rad0,
+                rad1: rad1,
+                rad2: rad2,
+                rad_s: rad_s,
+                sdf0: sdf0,
+                sdf1: sdf1,
+                sdf_s: sdf_s,
+                emitters: emitters,
+                tile_masks: tile_masks,
+                tiles_x: tiles_x,
+                hdr_bg: hdr_bg,
+                refract_refl: refract_refl,
+                bg_s: bg_s,
+            ),
+            indices: batches[first].trans_indices,
+            indirect: batches[first].trans_draw_args,
+            cull: Cull::Back,
+            depth: Depth { compare: Compare::Greater, write: true },
+        )
+    }
+}
+
+/// Whether a sphere `(c, r)` intersects the view frustum.
+fn in_view(c: vec3, r: f32, v: View) -> bool {
+    let rel = c - v.at
+    let z = dot(rel, v.forward)
+    if z + r < NEAR {
+        return false
+    }
+    let aspect = v.size.x / max(v.size.y, 1.0)
+    let half_y = max(z, 0.0) / v.focal + r * 1.4
+    let half_x = half_y * aspect + r * 1.4
+    abs(dot(rel, v.up)) <= half_y && abs(dot(rel, v.right)) <= half_x
+}
+
+/// The batches a `Pool` meshes its things in together (near, and far by parity: `sync_pool`).
+const POOL_SHARED: u32 = 3
+
+/// The batches a `Pool` keeps beside its shared ones for things near the eye, each meshed as a
+/// `One` is (view-dependent nested bricks and exact cells): a pool's shared mesh is one grid a
+/// thing (or one rest-pose template for them all) and can't be as fine as a thing seen close needs.
+/// More things near than this sets `OVERFLOW_NEAR` (the rest are drawn from the shared mesh).
+const NEAR_SLOTS: u32 = 16
+
+/// How near the eye, in bound radii from a thing's surface, the thing is meshed directly from its
+/// field, view-dependent (`One::sync_batches`' `force_direct`; a `Pool`'s near batches).
+const DIRECT_RADII: f32 = 1.5
+
+/// How far the eye is from the surface of `field` (bound `c`, `r`), as `One::sync_batches` reads
+/// it: its distance at the eye over its steepness, or its bound's, the greater.
+fn surface_from_eye<M: Field<Substance>>(field: M, c: vec3, r: f32, v: View) -> f32 {
+    let lip = max(field.lipschitz(1.0), 1.0)
+    max(abs(field.distance(v.at)) / lip, max(length(c - v.at) - r, 0.0))
+}
+
+/// Gives each of `pool`'s things in view near the eye (within `DIRECT_RADII` bound radii of its
+/// surface, as `One::sync_batches` meshes a thing directly) one of its near batches
+/// (`MeshBatch::near_id`: kept by the thing it held last frame while it stays near, else the
+/// nearest not yet given one). Sets `OVERFLOW_NEAR` on its first batch when more are near than it
+/// has near batches.
+fn near_things<M: Field<Substance> + StateHash + GpuData>(
+    pool: Pool<M>,
+    batches: mut Vec<MeshBatch>,
+    first: u32,
+    v: View,
+) {
+    let n = pool.fields.len()
+    var given = Vec::filled(n, false)
+    var d_of = Vec::filled(n, -1.0)
+    var want: u32 = 0
+    for i in 0..n {
+        let b = pool.fields[i].bound()
+        let r = min(b.radius, 1.0e4)
+        if in_view(b.centre, r, v) && length(b.centre - v.at) - r < DIRECT_RADII * r {
+            let d = surface_from_eye(pool.fields[i], b.centre, r, v)
+            if d < DIRECT_RADII * r {
+                d_of[i] = d
+                want += 1
+            }
+        }
+    }
+    for s in 0..NEAR_SLOTS {
+        let bi = first + POOL_SHARED + s
+        let id = batches[bi].near_id
+        if id < n && d_of[id] >= 0.0 && !given[id] {
+            given[id] = true
+        } else {
+            batches[bi].near_id = NO_THING
+        }
+    }
+    var held: u32 = 0
+    for s in 0..NEAR_SLOTS {
+        let bi = first + POOL_SHARED + s
+        if batches[bi].near_id >= n {
+            var best = n
+            var best_d = 1.0e30
+            for i in 0..n {
+                if !given[i] && d_of[i] >= 0.0 && d_of[i] < best_d {
+                    best_d = d_of[i]
+                    best = i
+                }
+            }
+            if best < n {
+                given[best] = true
+                batches[bi].near_id = best
+            }
+        }
+        if batches[bi].near_id < n {
+            held += 1
+        }
+    }
+    batches[first].near_over = want > held
+}
+
+/// The shared meshes of `pool` (its batches `first` to `first + POOL_SHARED`): every thing in view
+/// but those its near batches have meshed whole this frame (`near_eye`, meshed as `One`s there).
+fn sync_pool_shared<M: Field<Substance> + StateHash + GpuData>(
+    pool: Pool<M>,
+    scratch: mut ExtractScratch,
+    batches: mut Vec<MeshBatch>,
+    first: u32,
+    v: View,
+    near_eye: Vec<bool>,
+) {
+    let n = pool.fields.len()
+    if n == 0 {
+        let empty_cells: Vec<f32> = Vec::new()
+        batches[first].sync_pool(mut scratch, pool.fields, empty_cells)
+        for k in 1..3 {
+            batches[first + k].has_opaque = false
+            batches[first + k].has_trans = false
+            batches[first + k].inst_count = 0
+            batches[first + k].still_frames += 1
+        }
+        return
+    }
+    let cap = batches[first].max_bricks
+    var centres: Vec<vec3> = Vec::new()
+    var radii: Vec<f32> = Vec::new()
+    var nears: Vec<f32> = Vec::new()
+    var weights: Vec<f32> = Vec::new()
+    var total_w = 0.0
+    for i in 0..n {
+        let b = pool.fields[i].bound()
+        let r = min(b.radius, 1.0e4)
+        let near = max(length(b.centre - v.at) - r, 0.25)
+        centres.push(b.centre)
+        radii.push(r)
+        nears.push(near)
+        if in_view(b.centre, r, v) && !near_eye[i] {
+            let s = r / near
+            let w = clamp(s * s, 0.002, 4.0)
+            weights.push(w)
+            total_w += w
+        } else {
+            weights.push(0.0)
+        }
+    }
+    let inv_w = if total_w > 1.0e-6 { f32(cap) / total_w } else { f32(cap) }
+
+    // Fast path for skinned crowds: split `n >= 16` into 2 distance LOD templates (`<= 12 m`
+    // near, `> 12 m` far) so every visible character renders at distance-appropriate density
+    // with 0.000 ms per-frame extraction and 1–2 GPU-instanced DQS draw calls.
+    let first_skinned = match pool.fields[0].skin_shape_hash() {
+        Some(_) => true,
+        None => false,
+    }
+    if first_skinned {
+        if n < 16 {
+            var cells = Vec::filled(n, 0.0)
+            for i in 0..n {
+                if weights[i] > 0.0 {
+                    cells[i] = cell_for_one(
+                        centres[i],
+                        radii[i],
+                        v,
+                        steep(pool.fields[i]),
+                        size_floor(radii[i]),
+                    )
+                }
+            }
+            batches[first].sync_pool(mut scratch, pool.fields, cells)
+            for k in 1..3 {
+                batches[first + k].has_opaque = false
+                batches[first + k].has_trans = false
+                batches[first + k].inst_count = 0
+                batches[first + k].still_frames += 1
+            }
+            return
+        }
+        var c_near = Vec::filled(n, 0.0)
+        var c_far = Vec::filled(n, 0.0)
+        for i in 0..n {
+            if weights[i] > 0.0 {
+                let c = cell_for_one(
+                    centres[i],
+                    radii[i],
+                    v,
+                    steep(pool.fields[i]),
+                    size_floor(radii[i]),
+                )
+                if nears[i] <= 12.0 {
+                    c_near[i] = c
+                } else {
+                    c_far[i] = c
+                }
+            }
+        }
+        batches[first].sync_pool(mut scratch, pool.fields, c_near)
+        batches[first + 1].sync_pool(mut scratch, pool.fields, c_far)
+        batches[first + 2].has_opaque = false
+        batches[first + 2].has_trans = false
+        batches[first + 2].inst_count = 0
+        batches[first + 2].still_frames += 1
+        return
+    }
+    if n < 16 {
+        var cells = Vec::filled(n, 0.0)
+        for i in 0..n {
+            if weights[i] > 0.0 {
+                cells[i] = cell_for_share(centres[i], radii[i], weights[i] * inv_w, v)
+            }
+        }
+        batches[first].sync_pool(mut scratch, pool.fields, cells)
+        for k in 1..3 {
+            batches[first + k].has_opaque = false
+            batches[first + k].has_trans = false
+            batches[first + k].inst_count = 0
+            batches[first + k].still_frames += 1
+        }
+        return
+    }
+
+    // Three batches: things within `FAR_TIER_DIST` (near), and the farther ones split by index
+    // parity, so a change re-extracts only the batch it falls in. Every batch syncs every
+    // frame (a still batch's sync is a hash check), so each batch's mesh is always this
+    // frame's and is shaded by this frame's fields (`fbuf`) with exact motion vectors.
+    var c_near = Vec::filled(n, 0.0)
+    var c_even = Vec::filled(n, 0.0)
+    var c_odd = Vec::filled(n, 0.0)
+    for i in 0..n {
+        if weights[i] > 0.0 {
+            let cell = cell_for_share(centres[i], radii[i], weights[i] * inv_w, v)
+            if nears[i] <= FAR_TIER_DIST {
+                c_near[i] = cell
+            } else if (i & 1) == 0 {
+                c_even[i] = cell
+            } else {
+                c_odd[i] = cell
+            }
+        }
+    }
+    batches[first].sync_pool(mut scratch, pool.fields, c_near)
+    batches[first + 1].sync_pool(mut scratch, pool.fields, c_even)
+    batches[first + 2].sync_pool(mut scratch, pool.fields, c_odd)
+}
+
+impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for Pool<M> {
+    type FieldBufs = GpuBuffer<M>
+
+    fn batch_count(self) -> u32 {
+        POOL_SHARED + NEAR_SLOTS
+    }
+
+    fn upload_fields(self) -> GpuBuffer<M> {
+        if self.fields.len() == 0 {
+            return buffer(1)
+        }
+        buffer_of(self.fields)
+    }
+
+    fn sync_batches(
+        self,
+        scratch: mut ExtractScratch,
+        batches: mut Vec<MeshBatch>,
+        first: u32,
+        v: View,
+    ) {
+        near_things(self, mut batches, first, v)
+        // The near batches first: the shared mesh leaves out a thing only once its own batch has
+        // meshed it whole, this frame's extraction not cut short by the frame's budget.
+        let n = self.fields.len()
+        var shown = Vec::filled(n, false)
+        for s in 0..NEAR_SLOTS {
+            let bi = first + POOL_SHARED + s
+            let id = batches[bi].near_id
+            if id < n {
+                one(self.fields[id]).sync_batches(mut scratch, mut batches, bi, v)
+                shown[id] = !batches[bi].budget_short
+            } else {
+                batches[bi].forget()
+            }
+        }
+        sync_pool_shared(self, mut scratch, mut batches, first, v, shown)
+    }
+
+    fn splat_sdf(
+        self,
+        sdf: mut SdfClipmap,
+        batches: mut Vec<MeshBatch>,
+        first: u32,
+        static_only: bool,
+        all_batches: bool,
+    ) {
+        let n = self.fields.len()
+        if n == 0 {
+            return
+        }
+        let any_opaque = batches[first].has_opaque ||
+            batches[first + 1].has_opaque ||
+            batches[first + 2].has_opaque
+        if !any_opaque {
+            return
+        }
+        let is_static = batches[first].still_frames >= 1 &&
+            batches[first + 1].still_frames >= 1 &&
+            batches[first + 2].still_frames >= 1
+        if !all_batches && is_static != static_only {
+            return
+        }
+        sdf.splat_pool(self.fields, to_static: !all_batches && static_only)
+    }
+
+    fn collide_swarm(self, fbuf: GpuBuffer<M>, sim: mut SwarmSim, restitution: f32, friction: f32) {
+        let n = self.fields.len()
+        if n == 0 || sim.count == 0 {
+            return
+        }
+        var bounds: Vec<Bound> = Vec::new()
+        for i in 0..n {
+            bounds.push(self.fields[i].bound())
+        }
+        let bbuf = buffer_of(bounds)
+        sim.collide_pool(fbuf.items(), bbuf.items(), n, restitution, friction)
+    }
+
+    fn inject_radiance<S: Sky>(
+        self,
+        fbuf: GpuBuffer<M>,
+        rad: mut RadianceCache,
+        batches: mut Vec<MeshBatch>,
+        first: u32,
+        sv: ShadowView,
+        sky: S,
+        sky_diff: Texture<Rgba16Float>,
+        sky_s: Sampler,
+        shadow_map: DepthTexture,
+        cmp: ComparisonSampler,
+        static_only: bool,
+        all_batches: bool,
+    ) {
+        for s in 0..NEAR_SLOTS {
+            let bi = first + POOL_SHARED + s
+            let id = batches[bi].near_id
+            if id < self.fields.len() {
+                one(self.fields[id]).inject_radiance(
+                    0,
+                    mut rad,
+                    mut batches,
+                    bi,
+                    sv,
+                    sky,
+                    sky_diff,
+                    sky_s,
+                    shadow_map,
+                    cmp,
+                    static_only: static_only,
+                    all_batches: all_batches,
+                )
+            }
+        }
+        let n = self.fields.len()
+        if n == 0 {
+            return
+        }
+        let n_sub: u32 = if n >= 16 { 3 } else { 1 }
+        for k in 0..n_sub {
+            let bi = first + k
+            let is_static = batches[bi].still_frames >= 1
+            if all_batches || is_static == static_only {
+                if batches[bi].is_skinned {
+                    rad.inject_skin_many(
+                        fbuf.items(),
+                        n,
+                        batches[bi].verts.items(),
+                        batches[bi].skin_verts.items(),
+                        batches[bi].verts.count(),
+                        batches[bi].cap_verts,
+                        batches[bi].xforms.items(),
+                        batches[bi].bones.items(),
+                        batches[bi].bone_stride,
+                        batches[bi].inst_ids.items(),
+                        batches[bi].inst_count,
+                        sv,
+                        sky,
+                        sky_diff,
+                        sky_s,
+                        shadow_map,
+                        cmp,
+                        to_static: !all_batches && static_only,
+                    )
+                } else {
+                    let is_inst: u32 = if batches[bi].instanced { 1 } else { 0 }
+                    rad.inject_many(
+                        fbuf.items(),
+                        n,
+                        batches[bi].verts.items(),
+                        batches[bi].verts.count(),
+                        batches[bi].cap_verts,
+                        batches[bi].xforms.items(),
+                        batches[bi].inst_ids.items(),
+                        is_inst,
+                        batches[bi].inst_count,
+                        sv,
+                        sky,
+                        sky_diff,
+                        sky_s,
+                        shadow_map,
+                        cmp,
+                        to_static: !all_batches && static_only,
+                    )
+                }
+            }
+        }
+    }
+
+    fn draw_eye(
+        self,
+        fbuf: GpuBuffer<M>,
+        ep: DepthPass4<Rgba8, Rgba8, Rgba16Float, Rg16Float>,
+        batches: mut Vec<MeshBatch>,
+        cull: mut HiZCuller,
+        cube_indices: GpuBuffer<u32>,
+        dc_depth: Texture<R32Float>,
+        first: u32,
+        pass_idx: u32,
+        v: View,
+        prev_v: View,
+    ) {
+        for s in 0..NEAR_SLOTS {
+            let bi = first + POOL_SHARED + s
+            let id = batches[bi].near_id
+            if id < self.fields.len() {
+                one(self.fields[id]).draw_eye(
+                    0,
+                    ep,
+                    mut batches,
+                    mut cull,
+                    cube_indices,
+                    dc_depth,
+                    bi,
+                    pass_idx,
+                    v,
+                    prev_v,
+                )
+            }
+        }
+        if pass_idx == 2 {
+            return
+        }
+        let n = self.fields.len()
+        if n == 0 {
+            return
+        }
+        // Per batch: opaque quads (via 2-pass Hi-Z `draw_multi()` for large instanced crowds),
+        // then opaque pixels of transmissive quads (`_cut_`, Pass 1 only).
+        let n_sub: u32 = if n >= 16 { 3 } else { 1 }
+        for k in 0..n_sub {
+            let bi = first + k
+            let is_inst: u32 = if batches[bi].instanced { 1 } else { 0 }
+            let inst_cull = cull.active && batches[bi].use_inst_cull()
+            if !inst_cull && pass_idx != 0 {
+                continue
+            }
+            if batches[bi].is_skinned {
+                let vs = skin_mesh_vs.bind(
+                    fields: fbuf.items(),
+                    n_fields: n,
+                    verts: batches[bi].verts.items(),
+                    skin: batches[bi].skin_verts.items(),
+                    xforms: batches[bi].xforms.items(),
+                    prev_xforms: batches[bi].prev_xforms.items(),
+                    bones: batches[bi].bones.items(),
+                    prev_bones: batches[bi].prev_bones.items(),
+                    bone_stride: batches[bi].bone_stride,
+                    inst_ids: batches[bi].inst_ids.items(),
+                    is_instanced: is_inst,
+                    v: v,
+                )
+                let fs = field_skin_gbuf_many_fs.bind(
+                    fields: fbuf.items(),
+                    n_fields: n,
+                    v: v,
+                    prev_v: prev_v,
+                )
+                if batches[bi].has_opaque {
+                    if inst_cull && batches[bi].inst_count > 0 {
+                        if pass_idx == 0 {
+                            draw_multi(
+                                ep,
+                                vs,
+                                fs,
+                                indices: batches[bi].indices,
+                                indirect: cull.batch_bufs[bi].vis_draws_1,
+                                count: batches[bi].inst_count,
+                                cull: Cull::Back,
+                                depth: Depth { compare: Compare::Greater, write: true },
+                            )
+                        } else {
+                            draw_multi(
+                                ep,
+                                vs,
+                                fs,
+                                indices: batches[bi].indices,
+                                indirect: cull.batch_bufs[bi].vis_draws_2,
+                                count: batches[bi].inst_count,
+                                cull: Cull::Back,
+                                depth: Depth { compare: Compare::Greater, write: true },
+                            )
+                        }
+                    } else if pass_idx == 0 {
+                        draw(
+                            ep,
+                            vs,
+                            fs,
+                            indices: batches[bi].indices,
+                            indirect: batches[bi].draw_args,
+                            cull: Cull::Back,
+                            depth: Depth { compare: Compare::Greater, write: true },
+                        )
+                    }
+                }
+                if pass_idx == 0 && batches[bi].has_trans {
+                    draw(
+                        ep,
+                        vs,
+                        field_skin_cut_gbuf_many_fs.bind(
+                            fields: fbuf.items(),
+                            n_fields: n,
+                            v: v,
+                            prev_v: prev_v,
+                        ),
+                        indices: batches[bi].cut_indices,
+                        indirect: batches[bi].cut_draw_args,
+                        cull: Cull::Back,
+                        depth: Depth { compare: Compare::Greater, write: true },
+                    )
+                }
+            } else {
+                let vs = mesh_vs.bind(
+                    verts: batches[bi].verts.items(),
+                    xforms: batches[bi].xforms.items(),
+                    prev_xforms: batches[bi].prev_xforms.items(),
+                    inst_ids: batches[bi].inst_ids.items(),
+                    is_instanced: is_inst,
+                    v: v,
+                )
+                let fs = field_gbuf_many_fs.bind(
+                    fields: fbuf.items(),
+                    n_fields: n,
+                    v: v,
+                    prev_v: prev_v,
+                )
+                if batches[bi].has_opaque {
+                    if inst_cull && batches[bi].inst_count > 0 {
+                        if pass_idx == 0 {
+                            draw_multi(
+                                ep,
+                                vs,
+                                fs,
+                                indices: batches[bi].indices,
+                                indirect: cull.batch_bufs[bi].vis_draws_1,
+                                count: batches[bi].inst_count,
+                                cull: Cull::Back,
+                                depth: Depth { compare: Compare::Greater, write: true },
+                            )
+                        } else {
+                            draw_multi(
+                                ep,
+                                vs,
+                                fs,
+                                indices: batches[bi].indices,
+                                indirect: cull.batch_bufs[bi].vis_draws_2,
+                                count: batches[bi].inst_count,
+                                cull: Cull::Back,
+                                depth: Depth { compare: Compare::Greater, write: true },
+                            )
+                        }
+                    } else if pass_idx == 0 {
+                        draw(
+                            ep,
+                            vs,
+                            fs,
+                            indices: batches[bi].indices,
+                            indirect: batches[bi].draw_args,
+                            cull: Cull::Back,
+                            depth: Depth { compare: Compare::Greater, write: true },
+                        )
+                    }
+                }
+                if pass_idx == 0 && batches[bi].has_trans {
+                    draw(
+                        ep,
+                        vs,
+                        field_cut_gbuf_many_fs.bind(
+                            fields: fbuf.items(),
+                            n_fields: n,
+                            v: v,
+                            prev_v: prev_v,
+                        ),
+                        indices: batches[bi].cut_indices,
+                        indirect: batches[bi].cut_draw_args,
+                        cull: Cull::Back,
+                        depth: Depth { compare: Compare::Greater, write: true },
+                    )
+                }
+            }
+        }
+    }
+
+    fn draw_refract_refl(
+        self,
+        fbuf: GpuBuffer<M>,
+        rrp: DepthPass<Rgba16Float>,
+        batches: mut Vec<MeshBatch>,
+        first: u32,
+        v: View,
+        rad_grid: RadGrid,
+        sdf_grid: SdfGrid,
+        sky_diff: Texture<Rgba16Float>,
+        sky_spec0: Texture<Rgba16Float>,
+        sky_spec1: Texture<Rgba16Float>,
+        sky_spec2: Texture<Rgba16Float>,
+        sky_s: Sampler,
+        rad0: Texture3d<Rgba16Float>,
+        rad1: Texture3d<Rgba16Float>,
+        rad2: Texture3d<Rgba16Float>,
+        rad_s: Sampler,
+        sdf0: Texture3d<R16Float>,
+        sdf1: Texture3d<R16Float>,
+        sdf_s: Sampler,
+        hdr_bg: Texture<Rgba16Float>,
+        bg_s: Sampler,
+        half_size: vec2,
+    ) {
+        for s in 0..NEAR_SLOTS {
+            let bi = first + POOL_SHARED + s
+            let id = batches[bi].near_id
+            if id < self.fields.len() {
+                one(self.fields[id]).draw_refract_refl(
+                    0,
+                    rrp,
+                    mut batches,
+                    bi,
+                    v,
+                    rad_grid,
+                    sdf_grid,
+                    sky_diff,
+                    sky_spec0,
+                    sky_spec1,
+                    sky_spec2,
+                    sky_s,
+                    rad0,
+                    rad1,
+                    rad2,
+                    rad_s,
+                    sdf0,
+                    sdf1,
+                    sdf_s,
+                    hdr_bg,
+                    bg_s,
+                    half_size,
+                )
+            }
+        }
+        let n = self.fields.len()
+        if n == 0 {
+            return
+        }
+        let n_sub: u32 = if n >= 16 { 3 } else { 1 }
+        for k in 0..n_sub {
+            let bi = first + k
+            if batches[bi].has_trans {
+                let is_inst: u32 = if batches[bi].instanced { 1 } else { 0 }
+                if batches[bi].is_skinned {
+                    draw(
+                        rrp,
+                        skin_mesh_vs.bind(
+                            fields: fbuf.items(),
+                            n_fields: n,
+                            verts: batches[bi].verts.items(),
+                            skin: batches[bi].skin_verts.items(),
+                            xforms: batches[bi].xforms.items(),
+                            prev_xforms: batches[bi].prev_xforms.items(),
+                            bones: batches[bi].bones.items(),
+                            prev_bones: batches[bi].prev_bones.items(),
+                            bone_stride: batches[bi].bone_stride,
+                            inst_ids: batches[bi].inst_ids.items(),
+                            is_instanced: is_inst,
+                            v: v,
+                        ),
+                        field_skin_refract_refl_many_fs.bind(
+                            fields: fbuf.items(),
+                            n_fields: n,
+                            v: v,
+                            rad_grid: rad_grid,
+                            sdf_grid: sdf_grid,
+                            sky_diff: sky_diff,
+                            sky_spec0: sky_spec0,
+                            sky_spec1: sky_spec1,
+                            sky_spec2: sky_spec2,
+                            sky_s: sky_s,
+                            rad0: rad0,
+                            rad1: rad1,
+                            rad2: rad2,
+                            rad_s: rad_s,
+                            sdf0: sdf0,
+                            sdf1: sdf1,
+                            sdf_s: sdf_s,
+                            hdr_bg: hdr_bg,
+                            bg_s: bg_s,
+                            half_size: half_size,
+                        ),
+                        indices: batches[bi].trans_indices,
+                        indirect: batches[bi].trans_draw_args,
+                        cull: Cull::Back,
+                        depth: Depth { compare: Compare::Greater, write: true },
+                    )
+                } else {
+                    draw(
+                        rrp,
+                        mesh_vs.bind(
+                            verts: batches[bi].verts.items(),
+                            xforms: batches[bi].xforms.items(),
+                            prev_xforms: batches[bi].prev_xforms.items(),
+                            inst_ids: batches[bi].inst_ids.items(),
+                            is_instanced: is_inst,
+                            v: v,
+                        ),
+                        field_refract_refl_many_fs.bind(
+                            fields: fbuf.items(),
+                            n_fields: n,
+                            v: v,
+                            rad_grid: rad_grid,
+                            sdf_grid: sdf_grid,
+                            sky_diff: sky_diff,
+                            sky_spec0: sky_spec0,
+                            sky_spec1: sky_spec1,
+                            sky_spec2: sky_spec2,
+                            sky_s: sky_s,
+                            rad0: rad0,
+                            rad1: rad1,
+                            rad2: rad2,
+                            rad_s: rad_s,
+                            sdf0: sdf0,
+                            sdf1: sdf1,
+                            sdf_s: sdf_s,
+                            hdr_bg: hdr_bg,
+                            bg_s: bg_s,
+                            half_size: half_size,
+                        ),
+                        indices: batches[bi].trans_indices,
+                        indirect: batches[bi].trans_draw_args,
+                        cull: Cull::Back,
+                        depth: Depth { compare: Compare::Greater, write: true },
+                    )
+                }
+            }
+        }
+    }
+
+    fn draw_refract<S: Sky>(
+        self,
+        fbuf: GpuBuffer<M>,
+        rp: DepthPass2<Rgba16Float, Rg16Float>,
+        batches: mut Vec<MeshBatch>,
+        first: u32,
+        v: View,
+        prev_v: View,
+        sv: ShadowView,
+        rad_grid: RadGrid,
+        sdf_grid: SdfGrid,
+        sky: S,
+        sky_diff: Texture<Rgba16Float>,
+        sky_spec0: Texture<Rgba16Float>,
+        sky_spec1: Texture<Rgba16Float>,
+        sky_spec2: Texture<Rgba16Float>,
+        sky_s: Sampler,
+        shadow_map: DepthTexture,
+        static_shadow_map: DepthTexture,
+        has_static_shadow: u32,
+        cmp: ComparisonSampler,
+        rad0: Texture3d<Rgba16Float>,
+        rad1: Texture3d<Rgba16Float>,
+        rad2: Texture3d<Rgba16Float>,
+        rad_s: Sampler,
+        sdf0: Texture3d<R16Float>,
+        sdf1: Texture3d<R16Float>,
+        sdf_s: Sampler,
+        emitters: GpuSpan<Emitter>,
+        tile_masks: GpuSpan<u32>,
+        tiles_x: u32,
+        hdr_bg: Texture<Rgba16Float>,
+        refract_refl: Texture<Rgba16Float>,
+        bg_s: Sampler,
+    ) {
+        for s in 0..NEAR_SLOTS {
+            let bi = first + POOL_SHARED + s
+            let id = batches[bi].near_id
+            if id < self.fields.len() {
+                one(self.fields[id]).draw_refract(
+                    0,
+                    rp,
+                    mut batches,
+                    bi,
+                    v,
+                    prev_v,
+                    sv,
+                    rad_grid,
+                    sdf_grid,
+                    sky,
+                    sky_diff,
+                    sky_spec0,
+                    sky_spec1,
+                    sky_spec2,
+                    sky_s,
+                    shadow_map,
+                    static_shadow_map,
+                    has_static_shadow,
+                    cmp,
+                    rad0,
+                    rad1,
+                    rad2,
+                    rad_s,
+                    sdf0,
+                    sdf1,
+                    sdf_s,
+                    emitters,
+                    tile_masks,
+                    tiles_x,
+                    hdr_bg,
+                    refract_refl,
+                    bg_s,
+                )
+            }
+        }
+        let n = self.fields.len()
+        if n == 0 {
+            return
+        }
+        let n_sub: u32 = if n >= 16 { 3 } else { 1 }
+        for k in 0..n_sub {
+            let bi = first + k
+            if batches[bi].has_trans {
+                let is_inst: u32 = if batches[bi].instanced { 1 } else { 0 }
+                if batches[bi].is_skinned {
+                    draw(
+                        rp,
+                        skin_mesh_vs.bind(
+                            fields: fbuf.items(),
+                            n_fields: n,
+                            verts: batches[bi].verts.items(),
+                            skin: batches[bi].skin_verts.items(),
+                            xforms: batches[bi].xforms.items(),
+                            prev_xforms: batches[bi].prev_xforms.items(),
+                            bones: batches[bi].bones.items(),
+                            prev_bones: batches[bi].prev_bones.items(),
+                            bone_stride: batches[bi].bone_stride,
+                            inst_ids: batches[bi].inst_ids.items(),
+                            is_instanced: is_inst,
+                            v: v,
+                        ),
+                        field_skin_trans_many_fs.bind(
+                            fields: fbuf.items(),
+                            n_fields: n,
+                            v: v,
+                            prev_v: prev_v,
+                            sv: sv,
+                            rad_grid: rad_grid,
+                            sdf_grid: sdf_grid,
+                            sky: sky,
+                            sky_diff: sky_diff,
+                            sky_spec0: sky_spec0,
+                            sky_spec1: sky_spec1,
+                            sky_spec2: sky_spec2,
+                            sky_s: sky_s,
+                            shadow_map: shadow_map,
+                            static_shadow_map: static_shadow_map,
+                            has_static_shadow: has_static_shadow,
+                            cmp: cmp,
+                            rad0: rad0,
+                            rad1: rad1,
+                            rad2: rad2,
+                            rad_s: rad_s,
+                            sdf0: sdf0,
+                            sdf1: sdf1,
+                            sdf_s: sdf_s,
+                            emitters: emitters,
+                            tile_masks: tile_masks,
+                            tiles_x: tiles_x,
+                            hdr_bg: hdr_bg,
+                            refract_refl: refract_refl,
+                            bg_s: bg_s,
+                        ),
+                        indices: batches[bi].trans_indices,
+                        indirect: batches[bi].trans_draw_args,
+                        cull: Cull::Back,
+                        depth: Depth { compare: Compare::Greater, write: true },
+                    )
+                } else {
+                    draw(
+                        rp,
+                        mesh_vs.bind(
+                            verts: batches[bi].verts.items(),
+                            xforms: batches[bi].xforms.items(),
+                            prev_xforms: batches[bi].prev_xforms.items(),
+                            inst_ids: batches[bi].inst_ids.items(),
+                            is_instanced: is_inst,
+                            v: v,
+                        ),
+                        field_trans_many_fs.bind(
+                            fields: fbuf.items(),
+                            n_fields: n,
+                            v: v,
+                            prev_v: prev_v,
+                            sv: sv,
+                            rad_grid: rad_grid,
+                            sdf_grid: sdf_grid,
+                            sky: sky,
+                            sky_diff: sky_diff,
+                            sky_spec0: sky_spec0,
+                            sky_spec1: sky_spec1,
+                            sky_spec2: sky_spec2,
+                            sky_s: sky_s,
+                            shadow_map: shadow_map,
+                            static_shadow_map: static_shadow_map,
+                            has_static_shadow: has_static_shadow,
+                            cmp: cmp,
+                            rad0: rad0,
+                            rad1: rad1,
+                            rad2: rad2,
+                            rad_s: rad_s,
+                            sdf0: sdf0,
+                            sdf1: sdf1,
+                            sdf_s: sdf_s,
+                            emitters: emitters,
+                            tile_masks: tile_masks,
+                            tiles_x: tiles_x,
+                            hdr_bg: hdr_bg,
+                            refract_refl: refract_refl,
+                            bg_s: bg_s,
+                        ),
+                        indices: batches[bi].trans_indices,
+                        indirect: batches[bi].trans_draw_args,
+                        cull: Cull::Back,
+                        depth: Depth { compare: Compare::Greater, write: true },
+                    )
+                }
+            }
+        }
+    }
+}
+
+impl<A: MeshWorld, B: MeshWorld> MeshWorld for And<A, B> {
+    type FieldBufs = (A::FieldBufs, B::FieldBufs)
+
+    fn batch_count(self) -> u32 {
+        self.a.batch_count() + self.b.batch_count()
+    }
+
+    fn upload_fields(self) -> (A::FieldBufs, B::FieldBufs) {
+        (self.a.upload_fields(), self.b.upload_fields())
+    }
+
+    fn sync_batches(
+        self,
+        scratch: mut ExtractScratch,
+        batches: mut Vec<MeshBatch>,
+        first: u32,
+        v: View,
+    ) {
+        let na = self.a.batch_count()
+        self.a.sync_batches(mut scratch, mut batches, first, v)
+        self.b.sync_batches(mut scratch, mut batches, first + na, v)
+    }
+
+    fn splat_sdf(
+        self,
+        sdf: mut SdfClipmap,
+        batches: mut Vec<MeshBatch>,
+        first: u32,
+        static_only: bool,
+        all_batches: bool,
+    ) {
+        let na = self.a.batch_count()
+        self.a.splat_sdf(mut sdf, mut batches, first, static_only, all_batches)
+        self.b.splat_sdf(mut sdf, mut batches, first + na, static_only, all_batches)
+    }
+
+    fn collide_swarm(
+        self,
+        fbufs: (A::FieldBufs, B::FieldBufs),
+        sim: mut SwarmSim,
+        restitution: f32,
+        friction: f32,
+    ) {
+        self.a.collide_swarm(fbufs.0, mut sim, restitution, friction)
+        self.b.collide_swarm(fbufs.1, mut sim, restitution, friction)
+    }
+
+    fn inject_radiance<S: Sky>(
+        self,
+        fbufs: (A::FieldBufs, B::FieldBufs),
+        rad: mut RadianceCache,
+        batches: mut Vec<MeshBatch>,
+        first: u32,
+        sv: ShadowView,
+        sky: S,
+        sky_diff: Texture<Rgba16Float>,
+        sky_s: Sampler,
+        shadow_map: DepthTexture,
+        cmp: ComparisonSampler,
+        static_only: bool,
+        all_batches: bool,
+    ) {
+        let na = self.a.batch_count()
+        self.a.inject_radiance(
+            fbufs.0,
+            mut rad,
+            mut batches,
+            first,
+            sv,
+            sky,
+            sky_diff,
+            sky_s,
+            shadow_map,
+            cmp,
+            static_only: static_only,
+            all_batches: all_batches,
+        )
+        self.b.inject_radiance(
+            fbufs.1,
+            mut rad,
+            mut batches,
+            first + na,
+            sv,
+            sky,
+            sky_diff,
+            sky_s,
+            shadow_map,
+            cmp,
+            static_only: static_only,
+            all_batches: all_batches,
+        )
+    }
+
+    fn draw_eye(
+        self,
+        fbufs: (A::FieldBufs, B::FieldBufs),
+        ep: DepthPass4<Rgba8, Rgba8, Rgba16Float, Rg16Float>,
+        batches: mut Vec<MeshBatch>,
+        cull: mut HiZCuller,
+        cube_indices: GpuBuffer<u32>,
+        dc_depth: Texture<R32Float>,
+        first: u32,
+        pass_idx: u32,
+        v: View,
+        prev_v: View,
+    ) {
+        let na = self.a.batch_count()
+        self.a.draw_eye(
+            fbufs.0,
+            ep,
+            mut batches,
+            mut cull,
+            cube_indices,
+            dc_depth,
+            first,
+            pass_idx,
+            v,
+            prev_v,
+        )
+        self.b.draw_eye(
+            fbufs.1,
+            ep,
+            mut batches,
+            mut cull,
+            cube_indices,
+            dc_depth,
+            first + na,
+            pass_idx,
+            v,
+            prev_v,
+        )
+    }
+
+    fn draw_refract_refl(
+        self,
+        fbufs: (A::FieldBufs, B::FieldBufs),
+        rrp: DepthPass<Rgba16Float>,
+        batches: mut Vec<MeshBatch>,
+        first: u32,
+        v: View,
+        rad_grid: RadGrid,
+        sdf_grid: SdfGrid,
+        sky_diff: Texture<Rgba16Float>,
+        sky_spec0: Texture<Rgba16Float>,
+        sky_spec1: Texture<Rgba16Float>,
+        sky_spec2: Texture<Rgba16Float>,
+        sky_s: Sampler,
+        rad0: Texture3d<Rgba16Float>,
+        rad1: Texture3d<Rgba16Float>,
+        rad2: Texture3d<Rgba16Float>,
+        rad_s: Sampler,
+        sdf0: Texture3d<R16Float>,
+        sdf1: Texture3d<R16Float>,
+        sdf_s: Sampler,
+        hdr_bg: Texture<Rgba16Float>,
+        bg_s: Sampler,
+        half_size: vec2,
+    ) {
+        let na = self.a.batch_count()
+        self.a.draw_refract_refl(
+            fbufs.0,
+            rrp,
+            mut batches,
+            first,
+            v,
+            rad_grid,
+            sdf_grid,
+            sky_diff,
+            sky_spec0,
+            sky_spec1,
+            sky_spec2,
+            sky_s,
+            rad0,
+            rad1,
+            rad2,
+            rad_s,
+            sdf0,
+            sdf1,
+            sdf_s,
+            hdr_bg,
+            bg_s,
+            half_size,
+        )
+        self.b.draw_refract_refl(
+            fbufs.1,
+            rrp,
+            mut batches,
+            first + na,
+            v,
+            rad_grid,
+            sdf_grid,
+            sky_diff,
+            sky_spec0,
+            sky_spec1,
+            sky_spec2,
+            sky_s,
+            rad0,
+            rad1,
+            rad2,
+            rad_s,
+            sdf0,
+            sdf1,
+            sdf_s,
+            hdr_bg,
+            bg_s,
+            half_size,
+        )
+    }
+
+    fn draw_refract<S: Sky>(
+        self,
+        fbufs: (A::FieldBufs, B::FieldBufs),
+        rp: DepthPass2<Rgba16Float, Rg16Float>,
+        batches: mut Vec<MeshBatch>,
+        first: u32,
+        v: View,
+        prev_v: View,
+        sv: ShadowView,
+        rad_grid: RadGrid,
+        sdf_grid: SdfGrid,
+        sky: S,
+        sky_diff: Texture<Rgba16Float>,
+        sky_spec0: Texture<Rgba16Float>,
+        sky_spec1: Texture<Rgba16Float>,
+        sky_spec2: Texture<Rgba16Float>,
+        sky_s: Sampler,
+        shadow_map: DepthTexture,
+        static_shadow_map: DepthTexture,
+        has_static_shadow: u32,
+        cmp: ComparisonSampler,
+        rad0: Texture3d<Rgba16Float>,
+        rad1: Texture3d<Rgba16Float>,
+        rad2: Texture3d<Rgba16Float>,
+        rad_s: Sampler,
+        sdf0: Texture3d<R16Float>,
+        sdf1: Texture3d<R16Float>,
+        sdf_s: Sampler,
+        emitters: GpuSpan<Emitter>,
+        tile_masks: GpuSpan<u32>,
+        tiles_x: u32,
+        hdr_bg: Texture<Rgba16Float>,
+        refract_refl: Texture<Rgba16Float>,
+        bg_s: Sampler,
+    ) {
+        let na = self.a.batch_count()
+        self.a.draw_refract(
+            fbufs.0,
+            rp,
+            mut batches,
+            first,
+            v,
+            prev_v,
+            sv,
+            rad_grid,
+            sdf_grid,
+            sky,
+            sky_diff,
+            sky_spec0,
+            sky_spec1,
+            sky_spec2,
+            sky_s,
+            shadow_map,
+            static_shadow_map,
+            has_static_shadow,
+            cmp,
+            rad0,
+            rad1,
+            rad2,
+            rad_s,
+            sdf0,
+            sdf1,
+            sdf_s,
+            emitters,
+            tile_masks,
+            tiles_x,
+            hdr_bg,
+            refract_refl,
+            bg_s,
+        )
+        self.b.draw_refract(
+            fbufs.1,
+            rp,
+            mut batches,
+            first + na,
+            v,
+            prev_v,
+            sv,
+            rad_grid,
+            sdf_grid,
+            sky,
+            sky_diff,
+            sky_spec0,
+            sky_spec1,
+            sky_spec2,
+            sky_s,
+            shadow_map,
+            static_shadow_map,
+            has_static_shadow,
+            cmp,
+            rad0,
+            rad1,
+            rad2,
+            rad_s,
+            sdf0,
+            sdf1,
+            sdf_s,
+            emitters,
+            tile_masks,
+            tiles_x,
+            hdr_bg,
+            refract_refl,
+            bg_s,
+        )
+    }
+}
+
+/// Draws opaque shadow casters into `sp` through `sv`: `mode == 0` draws all batches,
+/// `mode == 1` draws only still batches (`still_frames >= 1`, cached in `static_shadow_map`),
+/// `mode == 2` draws only dynamic batches (`still_frames == 0`, drawn every frame into `shadow_map`).
+pub(package) fn draw_shadow_casters(
+    sp: DepthOnlyPass,
+    batches: mut Vec<MeshBatch>,
+    nb: u32,
+    sv: ShadowView,
+    mode: u32,
+) {
+    for i in 0..nb {
+        let is_still = batches[i].still_frames >= 1
+        let take_batch = if mode == 1 { is_still } else if mode == 2 { !is_still } else { true }
+        if batches[i].has_opaque && take_batch {
+            if batches[i].is_deformed {
+                draw(
+                    sp,
+                    shadow_vs.bind(
+                        verts: batches[i].deformed_verts.items(),
+                        xforms: batches[i].xforms.items(),
+                        sv: sv,
+                    ),
+                    shadow_fs,
+                    indices: batches[i].indices,
+                    indirect: batches[i].draw_args,
+                    cull: Cull::Back,
+                    depth_bias: DepthBias { constant: 2, slope: 1.5, clamp: 0.0 },
+                    depth: Depth { compare: Compare::Less, write: true },
+                )
+            } else if batches[i].is_skinned {
+                draw(
+                    sp,
+                    skin_shadow_vs.bind(
+                        verts: batches[i].verts.items(),
+                        skin: batches[i].skin_verts.items(),
+                        xforms: batches[i].xforms.items(),
+                        bones: batches[i].bones.items(),
+                        bone_stride: batches[i].bone_stride,
+                        sv: sv,
+                    ),
+                    shadow_fs,
+                    indices: batches[i].indices,
+                    indirect: batches[i].draw_args,
+                    cull: Cull::Back,
+                    depth_bias: DepthBias { constant: 2, slope: 1.5, clamp: 0.0 },
+                    depth: Depth { compare: Compare::Less, write: true },
+                )
+            } else {
+                draw(
+                    sp,
+                    shadow_vs.bind(
+                        verts: batches[i].verts.items(),
+                        xforms: batches[i].xforms.items(),
+                        sv: sv,
+                    ),
+                    shadow_fs,
+                    indices: batches[i].indices,
+                    indirect: batches[i].draw_args,
+                    cull: Cull::Back,
+                    depth_bias: DepthBias { constant: 2, slope: 1.5, clamp: 0.0 },
+                    depth: Depth { compare: Compare::Less, write: true },
+                )
+            }
+        }
+    }
+}
+
+/// Complete meshlet renderer state: owns extracted batches, unified sun shadow map + 2-cascade
+/// 3D SDF clipmap, GPU Sky PMREM cache, camera-focused radiance cache + auto-extracted dynamic
+/// emitters, 1× G-buffer + motion vectors, Temporal Super-Resolution (TSR), half-res phase-cycled
+/// GI/SSR + half-res refract SSR buffers, volumetric froxels, optical HDR bloom, and `Picture`.

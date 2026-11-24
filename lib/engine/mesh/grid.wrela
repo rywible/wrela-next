@@ -1,0 +1,1075 @@
+// Extraction grid specifications, packed vertex/brick/seam records, frustum culling,
+// tight AABBs, and view-dependent nested 2:1 multi-LOD grid construction.
+
+use matter::substance::Substance
+use picture::eye::View
+use std::collections::Vec
+use std::derive::{Box3, affine}
+use std::field::{ALL_LIVE, DualQuat, Field, Live}
+use std::quat::Quat
+
+/// Interior cells per brick along each axis (`6×6×6` owned edges, `7×7×7` dual vertices, `8×8×8`
+/// evaluated corners).
+pub const BRICK: u32 = 6
+pub(package) const CORNERS_BRICK: u32 = 512
+pub(package) const VERTS_BRICK: u32 = 343
+/// Padded vertex-index stride per brick (6 workgroups × 64 lanes = 384) so `classify_cells` writes
+/// directly via `Slots[id]` with 256-byte chunk span alignment.
+pub(package) const VERTS_STRIDE: u32 = 384
+pub(package) const EDGES_BRICK: u32 = 216
+pub(package) const NONE: u32 = 4294967295
+/// The most bricks a live cut's patch (`MeshBatch::try_patch_dirty`) meshes: a cut whose dirty
+/// box holds more is re-extracted whole.
+pub(package) const PATCH_MOST: u32 = 4096
+
+/// No thing (an index no thing has).
+pub const NO_THING: u32 = NONE
+
+/// Maximum bricks processed per extraction dispatch chunk so every compute dispatch stays far
+/// under the 50 ms step guard even for expensive noise-displaced fields.
+pub(package) const CHUNK_BRICKS: u32 = 1024
+
+/// The active bricks a view-dependent extraction after a cut meshes chunks for at least
+/// (`chunk_limit`): the most the SCENE 6 audit's cuts found active at 640x360 was 62,924.
+pub(package) const CUT_BRICKS: u32 = 65536
+
+/// How wide, in pixels at the surface seen, a view-dependent extraction makes its finest Tier-1
+/// Dual Contouring cells (`sync_one_lod`, `MeshWorld::sync_batches`): Tier-1 DC meshes smooth
+/// interiors at this coarse rate (6.25× fewer triangles than 1 px cells), while Tier-2
+/// `ExactCell` AABBs automatically cover every silhouette, grazing, high-curvature, budget-capped,
+/// and sub-cell thin feature with mathematically proved zero-hole `EmptyProof` ray solving.
+pub const CELL_PX: f32 = 2.5
+
+pub(package) const CULL_CHUNK: u32 = 8192
+/// Sharp-crease cells `refine_creases` solves in one dispatch: its exact Hermite solve is the
+/// heaviest per-cell work, so a chunk's crease list (which holds every surface cell, so no crease
+/// is ever solved any other way) is refined in dispatches of at most this many, each well under
+/// the 50 ms GPU dispatch guard. A slice is the heaviest field's: on the Radeon the guard allowed
+/// the stack's at most 32,597 a dispatch and the walking creature's, extracted posed near the eye,
+/// at most 36,974; the program can't ask a kernel's bound, so every field's slice is this.
+pub(package) const CREASE_SLICE: u32 = 16384
+
+/// The crease slices a chunk dispatches with no readback to go by (cold, after a cut): 65,536
+/// creases; the SCENE 6 audit's chunks held at most 4,045.
+pub(package) const COLD_CREASE_SLICES: u32 = 4
+/// Skinned vertices `deform_skinned_verts` moves in one dispatch (its Newton projection evaluates
+/// the posed field up to 4 times a vertex), for the same reason.
+pub(package) const DEFORM_SLICE: u32 = 262144
+/// The most slices one prepared list is dispatched in: a chunk's creases (`CAP_SURF /
+/// CREASE_SLICE`, rounded up) and a batch's vertices (`8192 · 343 / DEFORM_SLICE`, rounded up).
+pub(package) const SLICES_MOST: u32 = 128
+/// Normal spread (`Qef::min_dot`) below which a cell is a sharp crease, solved from exact Hermite
+/// edge crossings; and at or above which a vertex is shaded smooth.
+pub(package) const CREASE_DOT: f32 = 0.78
+pub(package) const SMOOTH_DOT: f32 = 0.88
+/// Tikhonov weight per sample toward the mass point: a smooth cell's, and a crease's (small, so
+/// sharp edges and corners solve to their exact intersection).
+pub(package) const REG_SMOOTH: f32 = 0.04
+pub(package) const REG_CREASE: f32 = 0.002
+
+/// A field of bound radius `r`'s finest cell before its surface is measured: 180 cells to the
+/// radius (60 bricks across its bound), which a compact thing's surface fits in a batch.
+pub fn size_floor(r: f32) -> f32 {
+    r / 180.0
+}
+
+/// Things a general (non-instanced) batch can tell apart: `MeshVertex::packed` holds 10 bits.
+pub const THING_IDS: u32 = 1024
+/// Per-brick output budgets a batch starts with (vertices, opaque and transmissive indices), and
+/// the most one brick can ever need (every cell a vertex; every owned edge of 3 axes a quad).
+pub(package) const START_VERTS_PER_BRICK: u32 = 40
+pub(package) const START_INDICES_PER_BRICK: u32 = 240
+pub(package) const START_TRANS_PER_BRICK: u32 = 96
+pub(package) const MOST_INDICES_PER_BRICK: u32 = 3888
+/// Lipschitz bound at unit scale above which a field counts as steep (noise-displaced rock,
+/// fluted columns, clipped shells): its bricks get 8-octant culling and its cells a finer spacing.
+pub(package) const STEEP_LIPSCHITZ: f32 = 1.15
+/// Every cell of a full chunk (`(bi << 9) | cell`, 1.4 MB): the compacted list of sign-changing
+/// cells can never overflow, so no surface cell is ever dropped.
+pub(package) const CAP_SURF: u32 = CHUNK_BRICKS * VERTS_BRICK
+
+/// Compact 16-byte extracted surface vertex (std430-aligned, 5× smaller than 80 B material
+/// vertices; Cigolle et al. 2014 octahedral normal encoding):
+///   `px, py, pz`: local-space vertex position (`3 × f32`)
+///   `packed`:     bits  `0..9`  octahedral unit normal X (`0..1023`, ~0.11° precision)
+///                 bits `10..19` octahedral unit normal Y (`0..1023`)
+///                 bits `20..29` thing index within batch (`0..1023`)
+///                 bit  `30`     smooth shading flag (`1` = smooth, `0` = sharp crease)
+///                 bit  `31`     transmissive flag (`1` = transmissive, `0` = opaque)
+pub struct MeshVertex: Copy + GpuData {
+    pub px: f32,
+    pub py: f32,
+    pub pz: f32,
+    pub packed: u32,
+}
+
+/// Folds a unit direction onto the octahedron `[-1, 1]²` about the z axis (Cigolle et al. 2014):
+/// the one octahedral map of the engine (packed vertex normals here, the sky maps in `light`).
+pub fn octa(n: vec3) -> vec2 {
+    let a = n / max(abs(n.x) + abs(n.y) + abs(n.z), 1.0e-8)
+    if a.z >= 0.0 {
+        return a.xy
+    }
+    (vec2(1.0) - abs(vec2(a.y, a.x))) * vec2(if a.x >= 0.0 { 1.0 } else { -1.0 }, if a.y >= 0.0 {
+        1.0
+    } else { -1.0 })
+}
+
+/// Unfolds an octahedral coordinate in `[-1, 1]²` back to a unit direction (`octa`'s inverse).
+pub fn unocta(e: vec2) -> vec3 {
+    var v = vec3(e.x, e.y, 1.0 - abs(e.x) - abs(e.y))
+    let t = max(-v.z, 0.0)
+    v.x += if v.x >= 0.0 { -t } else { t }
+    v.y += if v.y >= 0.0 { -t } else { t }
+    normalize(v)
+}
+
+/// Packs unit normal `n`, batch thing index `thing_id` (`0..THING_IDS`), `smooth`, and
+/// `is_trans` into one 32-bit word, the normal as 10 + 10 bits of its `octa` fold.
+pub fn pack_vertex_meta(n: vec3, thing_id: u32, smooth: bool, is_trans: bool) -> u32 {
+    let o = octa(n)
+    let ux = u32(clamp((o.x * 0.5 + 0.5) * 1023.0 + 0.5, 0.0, 1023.0))
+    let uy = u32(clamp((o.y * 0.5 + 0.5) * 1023.0 + 0.5, 0.0, 1023.0))
+    // `sync_many` refuses a general batch of more than `THING_IDS` things, so this never aliases.
+    let tid = min(thing_id, THING_IDS - 1)
+    let sm: u32 = if smooth { 1 } else { 0 }
+    let tr: u32 = if is_trans { 1 } else { 0 }
+    ux | (uy << 10) | (tid << 20) | (sm << 30) | (tr << 31)
+}
+
+/// Decodes the unit normal from `MeshVertex::packed`.
+pub fn unpack_oct_normal(packed: u32) -> vec3 {
+    let ox = f32(packed & 1023) * (2.0 / 1023.0) - 1.0
+    let oy = f32((packed >> 10) & 1023) * (2.0 / 1023.0) - 1.0
+    unocta(vec2(ox, oy))
+}
+
+/// Decodes the thing index (`0..1023`) from `MeshVertex::packed`.
+pub fn unpack_thing(packed: u32) -> u32 {
+    (packed >> 20) & 1023
+}
+
+/// Decodes the smooth-shading flag from `MeshVertex::packed`.
+pub fn unpack_smooth(packed: u32) -> bool {
+    ((packed >> 30) & 1) != 0
+}
+
+/// Decodes the transmissive-material flag from `MeshVertex::packed`.
+pub fn unpack_is_trans(packed: u32) -> bool {
+    (packed >> 31) != 0
+}
+
+/// Evaluates 4-bone Dual Quaternion Skinning (Kavan et al., I3D 2007 / ACM TOG 2008) from packed
+/// `(bones_u32, weights_u32)` and a flat bone palette `bones[base..base + stride]`, aligning
+/// quaternion signs to the dominant bone (`b0`) for shortest-path volume-preserving blending.
+pub fn eval_dqs(bones: [DualQuat], base: u32, packed_bones: u32, packed_weights: u32) -> DualQuat {
+    let b0 = packed_bones & 255
+    let b1 = (packed_bones >> 8) & 255
+    let b2 = (packed_bones >> 16) & 255
+    let b3 = packed_bones >> 24
+    let inv255 = 1.0 / 255.0
+    let w0 = f32(packed_weights & 255) * inv255
+    let w1 = f32((packed_weights >> 8) & 255) * inv255
+    let w2 = f32((packed_weights >> 16) & 255) * inv255
+    let w3 = f32(packed_weights >> 24) * inv255
+    let dq0 = bones[base + b0]
+    var sr = dq0.real * w0
+    var sd = dq0.dual * w0
+    if w1 > 0.0 {
+        let dq1 = bones[base + b1]
+        let s1 = if dot(dq0.real, dq1.real) < 0.0 { -w1 } else { w1 }
+        sr += dq1.real * s1
+        sd += dq1.dual * s1
+    }
+    if w2 > 0.0 {
+        let dq2 = bones[base + b2]
+        let s2 = if dot(dq0.real, dq2.real) < 0.0 { -w2 } else { w2 }
+        sr += dq2.real * s2
+        sd += dq2.dual * s2
+    }
+    if w3 > 0.0 {
+        let dq3 = bones[base + b3]
+        let s3 = if dot(dq0.real, dq3.real) < 0.0 { -w3 } else { w3 }
+        sr += dq3.real * s3
+        sd += dq3.dual * s3
+    }
+    DualQuat { real: sr, dual: sd }.normalized()
+}
+
+/// Maximum seam quads and unique coarse seam cells per Multi-LOD extraction.
+pub(package) const CAP_SEAM: u32 = 131072
+/// Maximum seam cells refined per `refine_seam_creases` dispatch (keeps GPU work well under 50 ms).
+pub(package) const SEAM_SLICE: u32 = 16384
+/// The most slices of `SEAM_SLICE` seam cells a batch's seams are solved, refined and boxed in
+/// (`seam_slices`: as many as its last readback says).
+pub(package) const SEAM_SLICES: u32 = 16
+/// Maximum nested 2:1 LOD levels in a single `MeshBatch` (7 levels = up to 64× resolution ratio).
+pub(package) const MAX_LOD_LEVELS: u32 = 7
+
+/// Sticky overflow bitflags reported in `tri_count[7]` and `MeshBatch::overflowed()`: any non-zero
+/// bit means an extraction hit a capacity limit and could have dropped geometry if drawn unsettled.
+pub const OVERFLOW_SEAMS: u32 = 1
+pub const OVERFLOW_CUT: u32 = 2
+pub const OVERFLOW_BRICKS: u32 = 4
+pub const OVERFLOW_VERTS: u32 = 8
+pub const OVERFLOW_INDICES: u32 = 16
+pub const OVERFLOW_TRANS: u32 = 32
+pub const OVERFLOW_CREASES: u32 = 64
+pub const OVERFLOW_EXACT: u32 = 128
+/// More things of a `Pool` came near the eye than it has batches to mesh them as `One`s
+/// (`NEAR_SLOTS`, in `mesh::draw`): the rest were drawn from the pool's shared mesh.
+pub const OVERFLOW_NEAR: u32 = 256
+/// A chunk had more candidate cells for exact cells (thin, beside the outline, or on it) than its
+/// `filter_thin_cells` slices test (`THIN_SLICES · THIN_SLICE`) or its `certify_outline` slices
+/// certify (`CERT_SLICES · CERT_SLICE`), or more seam cells than its seam slices take: the rest
+/// were not tested.
+pub const OVERFLOW_THIN: u32 = 512
+
+/// Maximum `ExactCell` AABB shells per batch (32 B each = 8 MB max, allocated as needed).
+pub(package) const CAP_EXACT_MAX: u32 = 262144
+/// Most thin-feature candidate cells one `filter_thin_cells` dispatch checks (its octants' affine
+/// ranges: 16,384 could hold the Radeon 51 ms at worst, over the 50 ms line).
+pub(package) const THIN_SLICE: u32 = 8192
+/// The `filter_thin_cells` slices a chunk dispatches (past them: `OVERFLOW_THIN`).
+pub(package) const THIN_SLICES: u32 = 8
+/// Most outline cells one `certify_outline` dispatch certifies (each a few dozen affine ranges at
+/// most: `engine::matter::certify`'s visits).
+pub(package) const CERT_SLICE: u32 = 6144
+/// The `certify_outline` slices a batch dispatches, after its chunks (past them: `OVERFLOW_THIN`).
+pub(package) const CERT_SLICES: u32 = 22
+
+/// One exact-bracket surface cell `[lo, lo + h]` rendered as a conservative AABB shell (32 B,
+/// std430-aligned) whose fragment shader solves `field.distance_live(p, live) == 0` via
+/// `mesh::proof::solve_cell_ray` (`WithDepthBehind` + `EmptyProof`-gated discards).
+///   `meta`: `(orig_id, live.lo, live.hi, flags)` (bit 0 = sub-cell thin feature, bit 1 = silhouette/coarse)
+pub struct ExactCell: Copy + GpuData {
+    pub lo: vec3,
+    pub h: f32,
+    pub live: Live,
+}
+
+/// One active surface brick: `(bx, by, bz, grid_idx)` plus the bitmask of parts live inside it.
+pub struct ActiveBrick: Copy + GpuData {
+    pub coord: vec4u,
+    pub live: Live,
+}
+
+/// World-space (or local-space) AABB of one extracted surface brick (`32 B`, std430-aligned).
+pub struct BrickBound: Copy + GpuData {
+    pub lo: vec3,
+    pub pad0: u32,
+    pub hi: vec3,
+    pub pad1: u32,
+}
+
+/// One sign-changing fine edge lying on a 2:1 LOD seam boundary `∂Ω`.
+/// Its 4 corner vertex slots live in `seam_verts[quad_idx * 4 .. +4]` (fine slots written by
+/// `emit_tris`, coarse slots written by `solve_seam_smooth` / `refine_seam_creases`).
+pub struct SeamQuad: Copy + GpuData {
+    pub flags: u32,
+    pub pad0: u32,
+    pub pad1: u32,
+    pub pad2: u32,
+}
+
+/// One unique coarse parent cell adjacent to a `SeamQuad` on the outside of `∂Ω`.
+pub struct SeamCell: Copy + GpuData {
+    /// `(coarse_cx, coarse_cy, coarse_cz, parent_grid_idx)`.
+    pub cell_grid: vec4u,
+    pub quad_idx: u32,
+    /// 4-bit mask of which slots (`0..4`) of `SeamQuad` map to this coarse cell.
+    pub slot_mask: u32,
+    pub pad0: u32,
+    pub pad1: u32,
+}
+
+/// Grid layout for one thing or nested 2:1 LOD ring inside a `MeshBatch` (std430-aligned).
+/// Every nested ring shares the root grid's `origin` and uses `cell_offset` in its own integer
+/// lattice units (`2 * (parent.cell_offset + parent_hole_min)`), guaranteeing
+/// `lattice(child, 2 * k) == lattice(parent, parent_hole_min + k)` bit-for-bit in IEEE-754 float.
+pub struct GridSpec: Copy + GpuData {
+    pub origin: vec3,
+    pub cell: f32,
+    pub dims: vec3u,
+    pub base_brick: u32,
+    pub orig_id: u32,
+    /// 6-bit mask of faces (`-X,+X,-Y,+Y,-Z,+Z`) that form a 2:1 seam with `parent_grid`.
+    pub seam_mask: u32,
+    /// Index into `grids` of the coarser parent level (`NONE` when coarsest or single-LOD).
+    pub parent_grid: u32,
+    /// Non-zero when `[hole_min, hole_max)` is refined by a finer child level.
+    pub has_hole: u32,
+    pub hole_min: vec3u,
+    pub pad0: u32,
+    pub hole_max: vec3u,
+    pub pad1: u32,
+    pub cell_offset: vec3u,
+    pub pad2: u32,
+    pub parent_hole_min: vec3u,
+    pub pad3: u32,
+}
+
+/// Coordinate `axis` (`0..3`) of `p`.
+pub(package) fn along(p: vec3, axis: u32) -> f32 {
+    if axis == 0 {
+        p.x
+    } else if axis == 1 {
+        p.y
+    } else {
+        p.z
+    }
+}
+
+/// `p` with coordinate `axis` (`0..3`) set to `x`.
+pub(package) fn with_along(p: vec3, axis: u32, x: f32) -> vec3 {
+    vec3(
+        if axis == 0 { x } else { p.x },
+        if axis == 1 { x } else { p.y },
+        if axis == 2 { x } else { p.z },
+    )
+}
+
+/// Binary-searches the lower (or `upper`) face of box `(lo, hi)` along `axis` inward (8 steps)
+/// while the slab it sweeps provably holds no surface, returning the face's new coordinate.
+fn shrink<M: Field<Substance>>(field: M, lo: vec3, hi: vec3, axis: u32, upper: bool) -> f32 {
+    var a = along(lo, axis)
+    var c = along(hi, axis)
+    for _step in 0..8 {
+        let mid = 0.5 * (a + c)
+        let slab = if upper {
+            Box3 { lo: with_along(lo, axis, mid), hi }
+        } else {
+            Box3 { lo, hi: with_along(hi, axis, mid) }
+        }
+        let iv = field.interval_near(slab)
+        let empty = iv.lo > 0.0 || iv.hi < 0.0
+        if upper {
+            if empty { c = mid } else { a = mid }
+        } else {
+            if empty { a = mid } else { c = mid }
+        }
+    }
+    if upper { c } else { a }
+}
+
+/// Tightens a thing's bounding sphere into a tight axis-aligned box on the CPU using
+/// `field.interval_near` (8 binary-search steps per face = 48 Lipschitz-narrowed interval queries).
+pub fn tight_aabb<M: Field<Substance>>(field: M) -> Box3 {
+    let b = field.bound()
+    let r = min(b.radius, 1.0e4)
+    var lo = b.centre - vec3(r)
+    var hi = b.centre + vec3(r)
+    for axis in 0..3 {
+        lo = with_along(lo, axis, shrink(field, lo, hi, axis, upper: false))
+        hi = with_along(hi, axis, shrink(field, lo, hi, axis, upper: true))
+    }
+    Box3 { lo, hi }
+}
+
+/// Binary-searches one face of a skinned field's rest-pose AABB via `rest_interval_near`.
+fn shrink_rest<M: Field<Substance>>(field: M, lo: vec3, hi: vec3, axis: u32, upper: bool) -> f32 {
+    var a = along(lo, axis)
+    var c = along(hi, axis)
+    for _step in 0..8 {
+        let mid = 0.5 * (a + c)
+        let slab = if upper {
+            Box3 { lo: with_along(lo, axis, mid), hi: with_along(hi, axis, c) }
+        } else {
+            Box3 { lo: with_along(lo, axis, a), hi: with_along(hi, axis, mid) }
+        }
+        let iv = field.rest_interval_near(slab)
+        let empty = iv.lo > 0.0 || iv.hi < 0.0
+        if upper {
+            if empty { c = mid } else { a = mid }
+        } else {
+            if empty { a = mid } else { c = mid }
+        }
+    }
+    if upper { c } else { a }
+}
+
+/// Tightens a skinned field's rest-pose bounding sphere into a tight local AABB.
+pub(package) fn tight_aabb_rest<M: Field<Substance>>(field: M) -> Box3 {
+    let b = field.rest_bound()
+    let r = min(b.radius, 1.0e4)
+    var lo = b.centre - vec3(r)
+    var hi = b.centre + vec3(r)
+    for axis in 0..3 {
+        lo = with_along(lo, axis, shrink_rest(field, lo, hi, axis, upper: false))
+        hi = with_along(hi, axis, shrink_rest(field, lo, hi, axis, upper: true))
+    }
+    Box3 { lo, hi }
+}
+
+/// Builds a single-LOD `GridSpec` covering `aabb` with cell spacing `cell`, padded by 2 cells so
+/// the surface never touches the grid boundary.
+pub(package) fn grid_for(aabb: Box3, cell: f32, base_brick: u32, orig_id: u32) -> GridSpec {
+    let pad = vec3(cell * 2.0)
+    let origin = aabb.lo - pad
+    let span = max(aabb.hi + pad - origin, vec3(cell))
+    let bspan = cell * f32(BRICK)
+    let nx = max(u32(ceil(span.x / bspan)), 1)
+    let ny = max(u32(ceil(span.y / bspan)), 1)
+    let nz = max(u32(ceil(span.z / bspan)), 1)
+    GridSpec {
+        origin,
+        cell,
+        dims: vec3u(nx, ny, nz),
+        base_brick,
+        orig_id,
+        seam_mask: 0,
+        parent_grid: NONE,
+        has_hole: 0,
+        hole_min: vec3u(0, 0, 0),
+        pad0: 0,
+        hole_max: vec3u(0, 0, 0),
+        pad1: 0,
+        cell_offset: vec3u(0, 0, 0),
+        pad2: 0,
+        parent_hole_min: vec3u(0, 0, 0),
+        pad3: 0,
+    }
+}
+
+/// Builds a strictly 2:1-balanced hierarchy of nested clipmap `GridSpec`s covering `aabb` with
+/// finest spacing `h_near` around `focus` stepping up by `2×` per ring to coarsest spacing `h_top`.
+/// Every finer ring snaps to integer coarse brick boundaries and keeps a >=1 coarse-brick margin
+/// inside any parent seam face so 2:1 balance holds by construction (zero 4:1 transitions).
+/// Returns `(grids, total_bricks, has_seams)`.
+pub fn build_lod_grids(
+    aabb: Box3,
+    focus: vec3,
+    h_near: f32,
+    h_top: f32,
+    orig_id: u32,
+    half_parent_bricks: u32,
+) -> (Vec<GridSpec>, u32, bool) {
+    if h_top <= h_near * 1.45 {
+        let g = grid_for(aabb, h_near, base_brick: 0, orig_id: orig_id)
+        let tb = g.dims.x * g.dims.y * g.dims.z
+        var out: Vec<GridSpec> = Vec::new()
+        out.push(g)
+        return (out, tb, false)
+    }
+    // Start at the exact coarsest spacing `h_top` and halve per nested ring down to `h_near`,
+    // so level 0 never multiplies the whole object's coarse brick count beyond `h_top`.
+    var levels: u32 = 1
+    var scale = 1.0
+    while levels < MAX_LOD_LEVELS && h_near * scale * 1.95 < h_top {
+        scale *= 2.0
+        levels += 1
+    }
+    // Align the root cell size to the power-of-two ladder ending at `h_near` (clamped to
+    // `[0.60 * h_top, h_top]`) so intermediate levels hit screen-space targets without a 1.6×
+    // phase mismatch.
+    let h_root = clamp(h_near * scale, 0.60 * h_top, h_top)
+    var grids: Vec<GridSpec> = Vec::new()
+    grids.push(grid_for(aabb, h_root, base_brick: 0, orig_id: orig_id))
+    let fclamped = clamp(focus, aabb.lo, aabb.hi)
+    let hb = max(half_parent_bricks, 2)
+    for _lvl in 1..levels {
+        let pi = grids.len() - 1
+        let prev = grids[pi]
+        let pbspan = prev.cell * f32(BRICK)
+        let prev_origin = prev.origin +
+            vec3(f32(prev.cell_offset.x), f32(prev.cell_offset.y), f32(prev.cell_offset.z)) *
+                prev.cell
+        let rel = (fclamped - prev_origin) / pbspan
+        let cx = i32(floor(rel.x))
+        let cy = i32(floor(rel.y))
+        let cz = i32(floor(rel.z))
+        let min_x: i32 = if (prev.seam_mask & 1) != 0 { 1 } else { 0 }
+        let min_y: i32 = if (prev.seam_mask & 4) != 0 { 1 } else { 0 }
+        let min_z: i32 = if (prev.seam_mask & 16) != 0 { 1 } else { 0 }
+        let max_x: i32 = i32(prev.dims.x) - (if (prev.seam_mask & 2) != 0 { 1 } else { 0 })
+        let max_y: i32 = i32(prev.dims.y) - (if (prev.seam_mask & 8) != 0 { 1 } else { 0 })
+        let max_z: i32 = i32(prev.dims.z) - (if (prev.seam_mask & 32) != 0 { 1 } else { 0 })
+        if min_x >= max_x || min_y >= max_y || min_z >= max_z {
+            break
+        }
+        let hbi = i32(hb)
+        var lo_x = max(min_x, cx - hbi)
+        var hi_x = min(max_x, cx + hbi + 1)
+        var lo_y = max(min_y, cy - hbi)
+        var hi_y = min(max_y, cy + hbi + 1)
+        var lo_z = max(min_z, cz - hbi)
+        var hi_z = min(max_z, cz + hbi + 1)
+        if lo_x >= hi_x {
+            lo_x = min(max(cx, min_x), max_x - 1)
+            hi_x = lo_x + 1
+        }
+        if lo_y >= hi_y {
+            lo_y = min(max(cy, min_y), max_y - 1)
+            hi_y = lo_y + 1
+        }
+        if lo_z >= hi_z {
+            lo_z = min(max(cz, min_z), max_z - 1)
+            hi_z = lo_z + 1
+        }
+        let blo = vec3u(u32(lo_x), u32(lo_y), u32(lo_z))
+        let bhi = vec3u(u32(hi_x), u32(hi_y), u32(hi_z))
+        let hole_min = vec3u(blo.x * BRICK, blo.y * BRICK, blo.z * BRICK)
+        let hole_max = vec3u(bhi.x * BRICK, bhi.y * BRICK, bhi.z * BRICK)
+        var sm: u32 = 0
+        if blo.x > 0 {
+            sm |= 1
+        }
+        if bhi.x < prev.dims.x {
+            sm |= 2
+        }
+        if blo.y > 0 {
+            sm |= 4
+        }
+        if bhi.y < prev.dims.y {
+            sm |= 8
+        }
+        if blo.z > 0 {
+            sm |= 16
+        }
+        if bhi.z < prev.dims.z {
+            sm |= 32
+        }
+        let child_dims = vec3u((bhi.x - blo.x) * 2, (bhi.y - blo.y) * 2, (bhi.z - blo.z) * 2)
+        let child_off = vec3u(
+            (prev.cell_offset.x + hole_min.x) * 2,
+            (prev.cell_offset.y + hole_min.y) * 2,
+            (prev.cell_offset.z + hole_min.z) * 2,
+        )
+        if sm == 0 && prev.seam_mask == 0 {
+            // Child replaces 100% of root grid cleanly — drop the empty parent so it wastes zero
+            // cull bricks and keeps `grids.len() == 1` (single-grid fast path!).
+            grids[pi] = GridSpec {
+                origin: prev.origin,
+                cell: 0.5 * prev.cell,
+                dims: child_dims,
+                base_brick: 0,
+                orig_id,
+                seam_mask: 0,
+                parent_grid: pi,
+                has_hole: 0,
+                hole_min: vec3u(0, 0, 0),
+                pad0: 0,
+                hole_max: vec3u(0, 0, 0),
+                pad1: 0,
+                cell_offset: child_off,
+                pad2: 0,
+                parent_hole_min: vec3u(0, 0, 0),
+                pad3: 0,
+            }
+        } else {
+            grids[pi] = GridSpec { has_hole: 1, hole_min, hole_max, ..prev }
+            grids.push(
+                GridSpec {
+                    origin: prev.origin,
+                    cell: 0.5 * prev.cell,
+                    dims: child_dims,
+                    base_brick: 0,
+                    orig_id,
+                    seam_mask: sm,
+                    parent_grid: pi,
+                    has_hole: 0,
+                    hole_min: vec3u(0, 0, 0),
+                    pad0: 0,
+                    hole_max: vec3u(0, 0, 0),
+                    pad1: 0,
+                    cell_offset: child_off,
+                    pad2: 0,
+                    parent_hole_min: hole_min,
+                    pad3: 0,
+                },
+            )
+        }
+    }
+    var total_bricks: u32 = 0
+    var has_seams = false
+    for i in 0..grids.len() {
+        let g = grids[i]
+        grids[i] = GridSpec { base_brick: total_bricks, ..g }
+        total_bricks += g.dims.x * g.dims.y * g.dims.z
+        if g.seam_mask != 0 {
+            has_seams = true
+        }
+    }
+    (grids, total_bricks, has_seams)
+}
+
+/// Estimates the nearest visible surface depth inside camera `v`'s view frustum via a 5×5 CPU
+/// ray probe grid spanning `[2%, 98%]` of the viewport. Prevents fine Multi-LOD clipmap rings
+/// from centering on empty air or off-screen geometry beside/behind the eye while staying safely
+/// in front of the nearest visible hit (`0.85 * min_hit`, floored at `d_surf`).
+pub fn probe_visible_near<M: Field<Substance>>(field: M, v: View, d_surf: f32, max_t: f32) -> f32 {
+    let lip = max(field.lipschitz(1.0), 1.0)
+    let inv_lip = 1.0 / lip
+    let t_cap = max(max_t, d_surf + 0.1)
+    var min_t = t_cap
+    var any_hit = false
+    for iy in 0..5 {
+        let py = (0.02 + 0.24 * f32(iy)) * v.size.y
+        for ix in 0..5 {
+            let px = (0.02 + 0.24 * f32(ix)) * v.size.x
+            let d = v.ray(vec2(px, py))
+            var t = 0.0
+            for _step in 0..32 {
+                if t >= min_t {
+                    break
+                }
+                let f = field.distance(v.at + d * t)
+                if f <= 0.002 {
+                    min_t = t
+                    any_hit = true
+                    break
+                }
+                t += max(f * inv_lip, 0.002 + 0.001 * t)
+            }
+        }
+    }
+    let floor_d = if lip > 2.0 { 0.75 * d_surf } else { d_surf }
+    if !any_hit {
+        return floor_d
+    }
+    max(0.85 * min_t, floor_d)
+}
+
+/// Builds a strictly 2:1-balanced hierarchy of frustum-fitted nested clipmap `GridSpec`s covering
+/// `aabb` for camera `v`: Level 0 spans the whole `aabb` at `h_top` (so shadows, GI and SDF
+/// splatting stay complete off-screen), while each finer level `lvl >= 1` (`h = h_top / 2^lvl`)
+/// tightly encloses the truncated view frustum out to depth `R = h_parent / (k_px * v.pixel())`
+/// (with 1-parent-brick eye padding and a 12% edge margin), snapped to integer coarse brick
+/// boundaries with a `>= 1` parent-brick margin inside any parent seam face.
+/// Returns `(grids, total_bricks, has_seams)`.
+pub fn build_lod_grids_view(
+    aabb: Box3,
+    v: View,
+    h_near: f32,
+    h_top: f32,
+    z_near: f32,
+    orig_id: u32,
+    k_px: f32,
+    max_parent_span: u32,
+    area_budget: u32,
+    root_min_ratio: f32,
+) -> (Vec<GridSpec>, u32, bool) {
+    if h_top <= h_near * 1.45 {
+        let g = grid_for(aabb, h_near, base_brick: 0, orig_id: orig_id)
+        let tb = g.dims.x * g.dims.y * g.dims.z
+        var out: Vec<GridSpec> = Vec::new()
+        out.push(g)
+        return (out, tb, false)
+    }
+    var levels: u32 = 1
+    var scale = 1.0
+    while levels < MAX_LOD_LEVELS && h_near * scale * 1.95 < h_top {
+        scale *= 2.0
+        levels += 1
+    }
+    // Align the root cell size to the power-of-two ladder ending at `h_near` (clamped to
+    // `[root_min_ratio * h_top, h_top]`) so intermediate levels hit screen-space targets without a
+    // 1.6× phase mismatch.
+    let h_root = clamp(h_near * scale, root_min_ratio * h_top, h_top)
+    var grids: Vec<GridSpec> = Vec::new()
+    grids.push(grid_for(aabb, h_root, base_brick: 0, orig_id: orig_id))
+    let tan_y = 1.12 / max(v.focal, 1.0e-4)
+    let tan_x = (v.size.x / max(v.size.y, 1.0)) * tan_y
+    let px_rad = max(v.pixel(), 1.0e-5)
+    let dx_far = max(abs(v.at.x - aabb.lo.x), abs(v.at.x - aabb.hi.x))
+    let dy_far = max(abs(v.at.y - aabb.lo.y), abs(v.at.y - aabb.hi.y))
+    let dz_far = max(abs(v.at.z - aabb.lo.z), abs(v.at.z - aabb.hi.z))
+    let max_reach = sqrt(dx_far * dx_far + dy_far * dy_far + dz_far * dz_far)
+    let span_cap = i32(max(max_parent_span, 4))
+    let vol_cap: i32 = 160000
+    // Total parent-brick surface-area budget across all finer levels (with GPU per-brick frustum
+    // refinement culling off-screen corners of the rotated world AABB before field evaluation).
+    var rem_area: i32 = i32(max(area_budget, 1200))
+    for lvl in 1..levels {
+        let pi = grids.len() - 1
+        let prev = grids[pi]
+        let pbspan = prev.cell * f32(BRICK)
+        let prev_origin = prev.origin +
+            vec3(f32(prev.cell_offset.x), f32(prev.cell_offset.y), f32(prev.cell_offset.z)) *
+                prev.cell
+        let min_x: i32 = if (prev.seam_mask & 1) != 0 { 1 } else { 0 }
+        let min_y: i32 = if (prev.seam_mask & 4) != 0 { 1 } else { 0 }
+        let min_z: i32 = if (prev.seam_mask & 16) != 0 { 1 } else { 0 }
+        let max_x: i32 = i32(prev.dims.x) - (if (prev.seam_mask & 2) != 0 { 1 } else { 0 })
+        let max_y: i32 = i32(prev.dims.y) - (if (prev.seam_mask & 8) != 0 { 1 } else { 0 })
+        let max_z: i32 = i32(prev.dims.z) - (if (prev.seam_mask & 32) != 0 { 1 } else { 0 })
+        if min_x >= max_x || min_y >= max_y || min_z >= max_z {
+            break
+        }
+        let rem_lvls = max(i32(levels - lvl), 1)
+        let area_cap = clamp((rem_area * 5) / (rem_lvls * 4 + 1), 400, 9000)
+        let r_want = prev.cell / (max(k_px, 0.5) * px_rad)
+        let zn = max(z_near - 2.0 * pbspan, 0.0)
+        // Skip levels whose entire reach falls inside the empty air gap `[0, z_near)` in front of the eye.
+        if r_want < zn {
+            break
+        }
+        var reach = clamp(r_want, zn + 2.0 * pbspan, max(max_reach, zn + 2.0 * pbspan))
+        var fov_s = 1.0
+        let pad = pbspan
+        var lo_x: i32 = 0
+        var hi_x: i32 = 0
+        var lo_y: i32 = 0
+        var hi_y: i32 = 0
+        var lo_z: i32 = 0
+        var hi_z: i32 = 0
+        for iter in 0..6 {
+            let near_c = v.at + v.forward * zn
+            let nrx = v.right * (zn * tan_x * fov_s)
+            let nry = v.up * (zn * tan_y * fov_s)
+            let n0 = near_c - nrx - nry
+            let n1 = near_c + nrx - nry
+            let n2 = near_c - nrx + nry
+            let n3 = near_c + nrx + nry
+            let far_c = v.at + v.forward * reach
+            let rx = v.right * (reach * tan_x * fov_s)
+            let ry = v.up * (reach * tan_y * fov_s)
+            let c0 = far_c - rx - ry
+            let c1 = far_c + rx - ry
+            let c2 = far_c - rx + ry
+            let c3 = far_c + rx + ry
+            let box_lo = min(min(min(n0, n1), min(n2, n3)), min(min(c0, c1), min(c2, c3))) -
+                vec3(pad)
+            let box_hi = max(max(max(n0, n1), max(n2, n3)), max(max(c0, c1), max(c2, c3))) +
+                vec3(pad)
+            let lo_f = (box_lo - prev_origin) / pbspan
+            let hi_f = (box_hi - prev_origin) / pbspan
+            lo_x = max(min_x, i32(floor(lo_f.x)))
+            hi_x = min(max_x, i32(ceil(hi_f.x)))
+            lo_y = max(min_y, i32(floor(lo_f.y)))
+            hi_y = min(max_y, i32(ceil(hi_f.y)))
+            lo_z = max(min_z, i32(floor(lo_f.z)))
+            hi_z = min(max_z, i32(ceil(hi_f.z)))
+            let sx = max(hi_x - lo_x, 0)
+            let sy = max(hi_y - lo_y, 0)
+            let sz = max(hi_z - lo_z, 0)
+            let mspan = max(sx, max(sy, sz))
+            let area = sx * sy + sy * sz + sz * sx
+            let vol = sx * sy * sz
+            if (mspan <= span_cap && area <= area_cap && vol <= vol_cap) || iter == 5 {
+                break
+            }
+            var scale = 1.0
+            if mspan > span_cap {
+                scale = min(scale, (f32(span_cap) / f32(mspan)) * 0.90)
+            }
+            if area > area_cap {
+                scale = min(scale, sqrt(f32(area_cap) / f32(area)) * 0.90)
+            }
+            if vol > vol_cap {
+                scale = min(scale, pow(f32(vol_cap) / f32(vol), 0.3333) * 0.92)
+            }
+            if reach > zn + 2.5 * pbspan {
+                reach = zn + max(2.0 * pbspan, (reach - zn) * scale)
+            } else {
+                fov_s = max(0.15, fov_s * scale)
+            }
+        }
+        // Final hard clamp per axis around the frustum's near-mid point so the near plane at `zn`
+        // can never exceed `span_cap`.
+        let focus_p = v.at + v.forward * (0.5 * (zn + reach))
+        let foc_b = (focus_p - prev_origin) / pbspan
+        if hi_x - lo_x > span_cap {
+            let mid = clamp(i32(round(foc_b.x)), lo_x + span_cap / 2, hi_x - span_cap / 2)
+            lo_x = max(min_x, mid - span_cap / 2)
+            hi_x = min(max_x, lo_x + span_cap)
+        }
+        if hi_y - lo_y > span_cap {
+            let mid = clamp(i32(round(foc_b.y)), lo_y + span_cap / 2, hi_y - span_cap / 2)
+            lo_y = max(min_y, mid - span_cap / 2)
+            hi_y = min(max_y, lo_y + span_cap)
+        }
+        if hi_z - lo_z > span_cap {
+            let mid = clamp(i32(round(foc_b.z)), lo_z + span_cap / 2, hi_z - span_cap / 2)
+            lo_z = max(min_z, mid - span_cap / 2)
+            hi_z = min(max_z, lo_z + span_cap)
+        }
+        if lo_x >= hi_x || lo_y >= hi_y || lo_z >= hi_z {
+            break
+        }
+        let used_sx = hi_x - lo_x
+        let used_sy = hi_y - lo_y
+        let used_sz = hi_z - lo_z
+        let used_area = used_sx * used_sy + used_sy * used_sz + used_sz * used_sx
+        rem_area = max(rem_area - used_area, 400)
+        let blo = vec3u(u32(lo_x), u32(lo_y), u32(lo_z))
+        let bhi = vec3u(u32(hi_x), u32(hi_y), u32(hi_z))
+        let hole_min = vec3u(blo.x * BRICK, blo.y * BRICK, blo.z * BRICK)
+        let hole_max = vec3u(bhi.x * BRICK, bhi.y * BRICK, bhi.z * BRICK)
+        var sm: u32 = 0
+        if blo.x > 0 {
+            sm |= 1
+        }
+        if bhi.x < prev.dims.x {
+            sm |= 2
+        }
+        if blo.y > 0 {
+            sm |= 4
+        }
+        if bhi.y < prev.dims.y {
+            sm |= 8
+        }
+        if blo.z > 0 {
+            sm |= 16
+        }
+        if bhi.z < prev.dims.z {
+            sm |= 32
+        }
+        let child_dims = vec3u((bhi.x - blo.x) * 2, (bhi.y - blo.y) * 2, (bhi.z - blo.z) * 2)
+        let child_off = vec3u(
+            (prev.cell_offset.x + hole_min.x) * 2,
+            (prev.cell_offset.y + hole_min.y) * 2,
+            (prev.cell_offset.z + hole_min.z) * 2,
+        )
+        if sm == 0 && prev.seam_mask == 0 {
+            // Child replaces 100% of root grid cleanly — drop the empty parent so it wastes zero
+            // cull bricks and keeps `grids.len() == 1` (single-grid fast path!).
+            grids[pi] = GridSpec {
+                origin: prev.origin,
+                cell: 0.5 * prev.cell,
+                dims: child_dims,
+                base_brick: 0,
+                orig_id,
+                seam_mask: 0,
+                parent_grid: pi,
+                has_hole: 0,
+                hole_min: vec3u(0, 0, 0),
+                pad0: 0,
+                hole_max: vec3u(0, 0, 0),
+                pad1: 0,
+                cell_offset: child_off,
+                pad2: 0,
+                parent_hole_min: vec3u(0, 0, 0),
+                pad3: 0,
+            }
+        } else {
+            grids[pi] = GridSpec { has_hole: 1, hole_min, hole_max, ..prev }
+            grids.push(
+                GridSpec {
+                    origin: prev.origin,
+                    cell: 0.5 * prev.cell,
+                    dims: child_dims,
+                    base_brick: 0,
+                    orig_id,
+                    seam_mask: sm,
+                    parent_grid: pi,
+                    has_hole: 0,
+                    hole_min: vec3u(0, 0, 0),
+                    pad0: 0,
+                    hole_max: vec3u(0, 0, 0),
+                    pad1: 0,
+                    cell_offset: child_off,
+                    pad2: 0,
+                    parent_hole_min: hole_min,
+                    pad3: 0,
+                },
+            )
+        }
+    }
+    var total_bricks: u32 = 0
+    var has_seams = false
+    for i in 0..grids.len() {
+        let g = grids[i]
+        grids[i] = GridSpec { base_brick: total_bricks, ..g }
+        total_bricks += g.dims.x * g.dims.y * g.dims.z
+        if g.seam_mask != 0 {
+            has_seams = true
+        }
+    }
+    (grids, total_bricks, has_seams)
+}
+
+/// World (or rest-local) position of global lattice corner `n` of grid `g`. Every brick and nested
+/// LOD level asks for a shared corner by its root-aligned integer `(n + cell_offset)`, so
+/// neighbours across bricks and across 2:1 LOD boundaries get the exact same `f32` bits.
+pub(package) fn lattice(g: GridSpec, n: vec3u) -> vec3 {
+    let gidx = n + g.cell_offset
+    g.origin + vec3(f32(gidx.x), f32(gidx.y), f32(gidx.z)) * g.cell
+}
+
+/// Whether brick `b` of grid `g` lies strictly inside `g`'s refined child hole `[hole_min, hole_max)`.
+pub(package) fn brick_in_hole(g: GridSpec, b: vec3u) -> bool {
+    if g.has_hole == 0 {
+        return false
+    }
+    let bx = b.x * BRICK
+    let by = b.y * BRICK
+    let bz = b.z * BRICK
+    bx >= g.hole_min.x &&
+        bx < g.hole_max.x &&
+        by >= g.hole_min.y &&
+        by < g.hole_max.y &&
+        bz >= g.hole_min.z &&
+        bz < g.hole_max.z
+}
+
+/// Sign-preserving average of two distances (coarse-edge midpoint on a 2:1 seam boundary).
+pub(package) fn avg2_sign(a: f32, b: f32) -> f32 {
+    let m = 0.5 * (a + b)
+    if a < 0.0 && b < 0.0 && m >= 0.0 {
+        return -1.0e-30
+    }
+    if a >= 0.0 && b >= 0.0 && m < 0.0 {
+        return 0.0
+    }
+    m
+}
+
+/// Sign-preserving average of four distances (coarse-face center on a 2:1 seam boundary).
+pub(package) fn avg4_sign(a: f32, b: f32, c: f32, d: f32) -> f32 {
+    let m = 0.25 * (a + b + c + d)
+    if a < 0.0 && b < 0.0 && c < 0.0 && d < 0.0 && m >= 0.0 {
+        return -1.0e-30
+    }
+    if a >= 0.0 && b >= 0.0 && c >= 0.0 && d >= 0.0 && m < 0.0 {
+        return 0.0
+    }
+    m
+}
+
+/// Position of local corner `c` (each in `0..8`) of brick `b` (its `xyz`).
+pub(package) fn brick_corner(g: GridSpec, b: vec3u, c: vec3u) -> vec3 {
+    lattice(g, vec3u(b.x * BRICK + c.x, b.y * BRICK + c.y, b.z * BRICK + c.z))
+}
+
+/// Brick `(bx, by, bz)` of grid `g`'s `local` brick index.
+pub(package) fn brick_of(g: GridSpec, local: u32) -> vec3u {
+    let xy = g.dims.x * g.dims.y
+    let bz = local / xy
+    let rem = local - bz * xy
+    let by = rem / g.dims.x
+    vec3u(rem - by * g.dims.x, by, bz)
+}
+
+/// Whether brick `b`'s full `8×8×8` corner box (halo included) may hold `f`'s surface, and which
+/// parts are live in it. A steep field (noise-displaced rock) also needs one of the box's 8
+/// octants to straddle zero: a sound, finer check that discards conservative false positives.
+pub(package) fn cull_brick<M: Field<Substance>>(f: M, g: GridSpec, b: vec3u) -> (bool, Live) {
+    let lo = brick_corner(g, b, vec3u(0, 0, 0))
+    let hi_c: u32 = if g.seam_mask != 0 { BRICK + 2 } else { BRICK + 1 }
+    let hi = brick_corner(g, b, vec3u(hi_c, hi_c, hi_c))
+    if !steep(f) {
+        let pr = f.pruned(Box3 { lo, hi }, |q: vec3| q, 1.0, ALL_LIVE, 0)
+        return (pr.range.lo <= 0.0 && pr.range.hi >= 0.0, pr.live)
+    }
+    let use_affine = f.lipschitz(1.0) > 2.5
+    let pr0 = f.pruned(Box3 { lo, hi }, |q: vec3| q, 1.0, ALL_LIVE, 0)
+    if use_affine {
+        let iv_all = affine(|q: vec3| f.distance(q), Box3 { lo, hi })
+        if !(iv_all.lo <= 0.0 && iv_all.hi >= 0.0) {
+            return (false, ALL_LIVE)
+        }
+    } else if !(pr0.range.lo <= 0.0 && pr0.range.hi >= 0.0) {
+        return (false, ALL_LIVE)
+    }
+    let mid = 0.5 * (lo + hi)
+    for oct in 0..8 {
+        let olo = vec3(
+            if (oct & 1) != 0 { mid.x } else { lo.x },
+            if (oct & 2) != 0 { mid.y } else { lo.y },
+            if (oct & 4) != 0 { mid.z } else { lo.z },
+        )
+        let ohi = vec3(
+            if (oct & 1) != 0 { hi.x } else { mid.x },
+            if (oct & 2) != 0 { hi.y } else { mid.y },
+            if (oct & 4) != 0 { hi.z } else { mid.z },
+        )
+        let iv = if use_affine {
+            affine(|q: vec3| f.distance(q), Box3 { lo: olo, hi: ohi })
+        } else {
+            f.pruned(Box3 { lo: olo, hi: ohi }, |q: vec3| q, 1.0, pr0.live, 0).range
+        }
+        if iv.lo <= 0.0 && iv.hi >= 0.0 {
+            let live = if pr0.range.lo <= 0.0 && pr0.range.hi >= 0.0 { pr0.live } else { ALL_LIVE }
+            return (true, live)
+        }
+    }
+    (false, ALL_LIVE)
+}
+
+/// Safe vector normalize.
+pub(package) fn safe_norm(v: vec3, fallback: vec3) -> vec3 {
+    let l2 = dot(v, v)
+    if l2 > 1.0e-12 { v * (1.0 / sqrt(l2)) } else { fallback }
+}
+
+/// Whether `field` is steep enough (`STEEP_LIPSCHITZ`) to need finer culling and cells.
+pub fn steep<M: Field<Substance>>(field: M) -> bool {
+    field.lipschitz(1.0) > STEEP_LIPSCHITZ
+}
+
+/// Finds which thing owns global brick index `gb` by binary search over `grids[i].base_brick`.
+pub(package) fn owner_of(grids: [GridSpec], n: u32, gb: u32) -> u32 {
+    var lo: u32 = 0
+    var hi: u32 = n
+    for _k in 0..16 {
+        if lo + 1 >= hi {
+            break
+        }
+        let mid = (lo + hi) >> 1
+        if grids[mid].base_brick <= gb {
+            lo = mid
+        } else {
+            hi = mid
+        }
+    }
+    lo
+}
+
+/// Five inward-facing frustum half-spaces (near + left/right/bottom/top) for monotonic per-brick
+/// Multi-LOD refinement in `cull_bricks`. Because `B_child ⊂ B_parent` implies
+/// `in_frust(B_child) => in_frust(B_parent)`, off-screen parent bricks stay at coarse resolution
+/// (keeping off-screen shadows, GI and SDF complete) while all 8 of their off-screen child bricks
+/// are skipped immediately before field evaluation.
+pub struct FrustumCull: Copy + GpuData {
+    pub origin: vec4,
+    pub p0: vec4,
+    pub p1: vec4,
+    pub p2: vec4,
+    pub p3: vec4,
+    pub p4: vec4,
+}
+
+/// Disabled frustum refinement (refines the entire `hole` box).
+pub fn frustum_cull_none() -> FrustumCull {
+    FrustumCull {
+        origin: vec4(0.0),
+        p0: vec4(0.0),
+        p1: vec4(0.0),
+        p2: vec4(0.0),
+        p3: vec4(0.0),
+        p4: vec4(0.0),
+    }
+}
+
+/// Padded view frustum (`margin` > 1 widens FOV beyond the viewport edges so no screen ray ever
+/// approaches the off-screen coarse/fine boundary).
+pub fn frustum_cull_view(v: View, margin: f32) -> FrustumCull {
+    let ty = margin / max(v.focal, 1.0e-4)
+    let tx = (v.size.x / max(v.size.y, 1.0)) * ty
+    FrustumCull {
+        origin: vec4(v.at, 1.0),
+        p0: vec4(v.forward, 0.05),
+        p1: vec4(v.forward * tx + v.right, 0.0),
+        p2: vec4(v.forward * tx - v.right, 0.0),
+        p3: vec4(v.forward * ty + v.up, 0.0),
+        p4: vec4(v.forward * ty - v.up, 0.0),
+    }
+}
+
+/// True iff AABB `[lo, hi]` intersects the padded view frustum `fc` (or `fc` is disabled).
+pub(package) fn box_in_frustum(lo: vec3, hi: vec3, fc: FrustumCull) -> bool {
+    if fc.origin.w < 0.5 {
+        return true
+    }
+    let c = 0.5 * (lo + hi) - fc.origin.xyz
+    let e = 0.5 * (hi - lo)
+    dot(fc.p0.xyz, c) + dot(abs(fc.p0.xyz), e) + fc.p0.w >= 0.0 &&
+        dot(fc.p1.xyz, c) + dot(abs(fc.p1.xyz), e) + fc.p1.w >= 0.0 &&
+        dot(fc.p2.xyz, c) + dot(abs(fc.p2.xyz), e) + fc.p2.w >= 0.0 &&
+        dot(fc.p3.xyz, c) + dot(abs(fc.p3.xyz), e) + fc.p3.w >= 0.0 &&
+        dot(fc.p4.xyz, c) + dot(abs(fc.p4.xyz), e) + fc.p4.w >= 0.0
+}
+
+/// Pass 0: Interval-culls candidate bricks across all things in a batch, computing both the
+/// Lipschitz-narrowed distance range and the per-brick live part mask in one pass.
