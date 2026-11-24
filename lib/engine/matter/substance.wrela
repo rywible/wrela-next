@@ -149,12 +149,18 @@ impl Substance {
             (1.0 - clamp(self.transmission, 0.0, 1.0))
         var brdf = self.albedo * (kd * ONE_OVER_PI) + spec
 
-        // Optional clearcoat dielectric glaze (fixed IOR 1.5, glossy alpha = 0.04).
+        // Optional clearcoat dielectric glaze (fixed IOR 1.5, glossy alpha = 0.04). What lies under
+        // it gets the light the coat lets through on the way in and on the way out (its Fresnel
+        // at each direction's own angle): with the coat's own half-vector Fresnel instead, a white
+        // glass under a full coat reflected 1.06 of what fell on it at grazing.
         if self.coat > 1.0e-4 {
-            let fc = fresnel_schlick(vec3(0.04), vdh).x * clamp(self.coat, 0.0, 1.0)
+            let k = clamp(self.coat, 0.0, 1.0)
+            let fc = fresnel_schlick(vec3(0.04), vdh).x * k
+            let fc_in = fresnel_schlick(vec3(0.04), ndl).x * k
+            let fc_out = fresnel_schlick(vec3(0.04), ndv).x * k
             let coat_a2 = 0.0016
             let coat_spec = fc * ggx_d(ndh, coat_a2) * ggx_v(max(ndl, 1.0e-4), ndv, coat_a2)
-            brdf = brdf * (1.0 - fc) + vec3(coat_spec)
+            brdf = brdf * ((1.0 - fc_in) * (1.0 - fc_out)) + vec3(coat_spec)
         }
         brdf
     }
@@ -177,4 +183,174 @@ impl Substance {
         }
         out
     }
+}
+
+/// A direction away from the surface `(0, 0, 1)` at polar angle `t` and azimuth `p`.
+fn away(t: f32, p: f32) -> vec3 {
+    vec3(sin(t) * cos(p), sin(t) * sin(p), cos(t))
+}
+
+/// Substances at the corners and middle of every channel's range (`verify::channels_hold`): what
+/// the shading proofs below hold every substance in range to.
+fn corner_substances() -> [Substance; 12] {
+    let s = |albedo: f32, roughness: f32, metallic: f32, ior: f32, transmission: f32, coat: f32| Substance {
+        albedo: vec3(albedo),
+        roughness,
+        emits: vec3(0.0),
+        metallic,
+        ior,
+        transmission,
+        subsurface: 0.0,
+        coat,
+        micro: 0.0,
+        pad0: 0.0,
+        pad1: 0.0,
+        pad2: 0.0,
+    }
+    [
+        s(1.0, 0.0, 0.0, 1.0, 0.0, 0.0),
+        s(1.0, 0.0, 1.0, 1.5, 0.0, 0.0),
+        s(1.0, 1.0, 1.0, 1.5, 0.0, 0.0),
+        s(1.0, 0.04, 0.0, 3.0, 0.0, 0.0),
+        s(1.0, 1.0, 0.0, 3.0, 0.0, 0.0),
+        s(0.5, 0.5, 0.5, 1.5, 0.5, 0.5),
+        s(1.0, 0.0, 0.0, 1.5, 0.0, 1.0),
+        s(1.0, 0.3, 1.0, 1.0, 0.0, 1.0),
+        s(0.0, 0.0, 0.0, 1.5, 1.0, 0.0),
+        s(1.0, 0.2, 0.0, 1.33, 1.0, 1.0),
+        s(1.0, 1.0, 0.0, 1.0, 0.0, 0.0),
+        s(1.0, 0.04, 1.0, 3.0, 1.0, 1.0),
+    ]
+}
+
+/// The reflectance (`scatters`) of every substance in range is finite and never negative, for
+/// every pair of directions above the surface: proven by the compiler's intervals over boxes of
+/// the two directions' angles, each box halved until proven, and sampled past 6 halvings (a
+/// sample that breaks it fails, naming it).
+@test
+fn reflectance_is_finite_and_never_negative() {
+    let n = vec3(0.0, 0.0, 1.0)
+    let subs = corner_substances()
+    var proven: u32 = 0
+    var sampled: u32 = 0
+    for si in 0..12 {
+        let sub = subs[si]
+        let f = |a: vec4| sub.scatters(n, away(a.x, a.y), away(a.z, a.w))
+        // Boxes of (polar from, azimuth from, polar to, azimuth to), each split 2 x 4 x 2 x 4.
+        var stack: Vec<(vec4, vec4, u32)> = Vec::new()
+        for k in 0..64 {
+            let lo = vec4(
+                f32(k & 1) * 0.785,
+                f32((k >> 1) & 3) * 1.571,
+                f32((k >> 3) & 1) * 0.785,
+                f32((k >> 4) & 3) * 1.571,
+            )
+            stack.push((lo, lo + vec4(0.785, 1.571, 0.785, 1.571), 0))
+        }
+        while stack.len() > 0 {
+            let (lo, hi, depth) = match stack.pop() {
+                Some(t) => t,
+                None => (vec4(0.0), vec4(0.0), 0),
+            }
+            let r = std::derive::interval(f, std::derive::Box4 { lo, hi })
+            // Not below zero by more than the interval's own rounding.
+            let ok = r.lo.x >= -1.0e-5 &&
+                r.lo.y >= -1.0e-5 &&
+                r.lo.z >= -1.0e-5 &&
+                r.hi.x < 1.0e30 &&
+                r.hi.y < 1.0e30 &&
+                r.hi.z < 1.0e30
+            if ok {
+                proven += 1
+                continue
+            }
+            if depth >= 6 {
+                // Past what the interval can settle (a mirror's peak, grazing): its corners and
+                // middle, as points.
+                for c in 0..17 {
+                    let t = if c == 16 {
+                        vec4(0.5)
+                    } else {
+                        vec4(f32(c & 1), f32((c >> 1) & 1), f32((c >> 2) & 1), f32((c >> 3) & 1))
+                    }
+                    let a = lo + (hi - lo) * t
+                    let v = f(a)
+                    assert(
+                        v.x >= 0.0 &&
+                            v.y >= 0.0 &&
+                            v.z >= 0.0 &&
+                            v.x < 1.0e30 &&
+                            v.y < 1.0e30 &&
+                            v.z < 1.0e30,
+                        f"substance {si}: its reflectance at angles {a} is {v}: negative, or not finite",
+                    )
+                }
+                sampled += 1
+                continue
+            }
+            // Halved along its widest angle.
+            let ext = hi - lo
+            let axis = if ext.x >= ext.y && ext.x >= ext.z && ext.x >= ext.w {
+                0
+            } else if ext.y >= ext.z && ext.y >= ext.w {
+                1
+            } else if ext.z >= ext.w {
+                2
+            } else {
+                3
+            }
+            let cut = if axis == 0 {
+                vec4(0.5 * ext.x, 0.0, 0.0, 0.0)
+            } else if axis == 1 {
+                vec4(0.0, 0.5 * ext.y, 0.0, 0.0)
+            } else if axis == 2 {
+                vec4(0.0, 0.0, 0.5 * ext.z, 0.0)
+            } else {
+                vec4(0.0, 0.0, 0.0, 0.5 * ext.w)
+            }
+            stack.push((lo, hi - cut, depth + 1))
+            stack.push((lo + cut, hi, depth + 1))
+        }
+    }
+    std::io::print(
+        f"reflectance: finite and not negative, proven on {proven} boxes of directions ({sampled} sampled)",
+    )
+}
+
+/// No substance in range reflects more light than falls on it, from any direction: its
+/// directional albedo (the reflectance times the cosine, integrated over every direction it
+/// leaves by) is at most 1 (a white furnace), by a 64 x 128 midpoint sum per incoming angle at 8
+/// angles, within the sum's own error (a white matte sums to 1.0001). Measured, not proven: it
+/// found the clearcoat reflecting 1.06 at grazing, under its half-vector Fresnel.
+@test
+fn no_substance_reflects_more_than_falls_on_it() {
+    let n = vec3(0.0, 0.0, 1.0)
+    let subs = corner_substances()
+    var worst = 0.0
+    for si in 0..12 {
+        let sub = subs[si]
+        for ai in 0..8 {
+            let from = away((f32(ai) + 0.5) * (1.5707964 / 8.0), 0.0)
+            var sum = vec3(0.0)
+            let (nt, np) = (64, 128)
+            let dt = 1.5707964 / f32(nt)
+            let dp = 6.2831853 / f32(np)
+            for i in 0..nt {
+                let t = (f32(i) + 0.5) * dt
+                for j in 0..np {
+                    let to = away(t, (f32(j) + 0.5) * dp)
+                    sum += sub.scatters(n, from, to) * (cos(t) * sin(t) * dt * dp)
+                }
+            }
+            let m = max(max(sum.x, sum.y), sum.z)
+            worst = max(worst, m)
+            assert(
+                m <= 1.002,
+                f"substance {si} from {from}: reflects {m} of the light falling on it, more than all of it",
+            )
+        }
+    }
+    std::io::print(
+        f"reflectance: the most any substance in range reflects is {worst} of what falls on it",
+    )
 }

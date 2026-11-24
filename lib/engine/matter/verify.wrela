@@ -298,3 +298,127 @@ pub fn verify_edits_soundness<M: Field<Substance> + StateHash>(
         }
     }
 }
+
+/// The ranges a substance's channels hold to: every one finite; albedo, roughness, metalness,
+/// transmission, subsurface, coat and relief in `[0, 1]` (albedo above 1 reflects more light than
+/// falls on it); index of refraction in `[1, 3]`; emission at least 0.
+fn channels_hold(
+    albedo: Box3,
+    roughness: Interval,
+    emits: Box3,
+    metallic: Interval,
+    ior: Interval,
+    transmission: Interval,
+    subsurface: Interval,
+    coat: Interval,
+    micro: Interval,
+) -> bool {
+    let unit = |x: Interval| x.lo >= 0.0 && x.hi <= 1.0
+    let unit3 = |x: Box3| x.lo.x >= 0.0 &&
+        x.lo.y >= 0.0 &&
+        x.lo.z >= 0.0 &&
+        x.hi.x <= 1.0 &&
+        x.hi.y <= 1.0 &&
+        x.hi.z <= 1.0
+    let finite = emits.hi.x < 1.0e30 && emits.hi.y < 1.0e30 && emits.hi.z < 1.0e30
+    unit3(albedo) &&
+        unit(roughness) &&
+        emits.lo.x >= 0.0 &&
+        emits.lo.y >= 0.0 &&
+        emits.lo.z >= 0.0 &&
+        finite &&
+        unit(metallic) &&
+        ior.lo >= 1.0 &&
+        ior.hi <= 3.0 &&
+        unit(transmission) &&
+        unit(subsurface) &&
+        unit(coat) &&
+        unit(micro)
+}
+
+/// Whether one substance, at a point, holds to `channels_hold`'s ranges (a NaN holds to none).
+fn substance_holds(c: Substance) -> bool {
+    let point = |x: f32| Interval { lo: x, hi: x }
+    let p3 = |v: vec3| Box3 { lo: v, hi: v }
+    channels_hold(
+        p3(c.albedo),
+        point(c.roughness),
+        p3(c.emits),
+        point(c.metallic),
+        point(c.ior),
+        point(c.transmission),
+        point(c.subsurface),
+        point(c.coat),
+        point(c.micro),
+    )
+}
+
+/// Proves `f`'s substance holds to `channels_hold`'s ranges over `b` where its surface can be
+/// (`near` of it, by the derived interval of its distance): by the derived interval of each
+/// channel, halving where too wide, sampling past `HALVINGS_MOST` (a sample that breaks it fails
+/// the check, its channel's derivation noted for `wrela test` to blame).
+fn prove_channels<F: Field<Substance>>(f: F, b: Box3, near: f32, depth: u32, label: str) -> Proven {
+    let d = std::derive::interval(|q: vec3| f.distance(q), b)
+    if d.lo > near || d.hi < -near {
+        return Proven { proven: 0, unproven: 0 }
+    }
+    let ok = channels_hold(
+        std::derive::interval(|q: vec3| f.channels(q).albedo, b),
+        std::derive::interval(|q: vec3| f.channels(q).roughness, b),
+        std::derive::interval(|q: vec3| f.channels(q).emits, b),
+        std::derive::interval(|q: vec3| f.channels(q).metallic, b),
+        std::derive::interval(|q: vec3| f.channels(q).ior, b),
+        std::derive::interval(|q: vec3| f.channels(q).transmission, b),
+        std::derive::interval(|q: vec3| f.channels(q).subsurface, b),
+        std::derive::interval(|q: vec3| f.channels(q).coat, b),
+        std::derive::interval(|q: vec3| f.channels(q).micro, b),
+    )
+    if ok {
+        return Proven { proven: 1, unproven: 0 }
+    }
+    if depth >= HALVINGS_MOST {
+        for k in 0..9 {
+            let p = probes(b, k)
+            let c = f.channels(p)
+            if !substance_holds(c) {
+                // What made it: the albedo's derivation over a small box round the point (the
+                // channel most often out of its range), for `wrela test` to say which.
+                let w = 0.01 * (b.hi - b.lo)
+                std::derive::precision(
+                    |q: vec3| f.channels(q).albedo,
+                    Box3 { lo: p - w, hi: p + w },
+                )
+            }
+            assert(
+                substance_holds(c),
+                f"verify({label}): the substance at {p} leaves its ranges (albedo {c.albedo}, roughness {c.roughness}, emits {c.emits}, metallic {c.metallic}, ior {c.ior}, transmission {c.transmission}, subsurface {c.subsurface}, coat {c.coat}, micro {c.micro}): albedo, roughness, metallic, transmission, subsurface, coat and micro each in [0, 1], ior in [1, 3], emits at least 0, none NaN",
+            )
+        }
+        return Proven { proven: 0, unproven: 1 }
+    }
+    var out = Proven { proven: 0, unproven: 0 }
+    for k in 0..8 {
+        let sub = prove_channels(f, octant(b, k), near, depth + 1, label)
+        out = Proven { proven: out.proven + sub.proven, unproven: out.unproven + sub.unproven }
+    }
+    out
+}
+
+/// Verifies a field: its surface's contracts (`verify_surface_soundness`), and its substance,
+/// wherever its surface can be (within a fiftieth of its bound radius), holds to the physical
+/// ranges of `channels_hold` (proven by the compiler's intervals, sampled past them).
+pub fn verify_field_soundness<F: Field<Substance>>(f: F, label: str) {
+    verify_surface_soundness(f, label)
+    let b = f.bound()
+    let r = b.radius
+    let n: u32 = 6
+    let step = 3.0 * r / f32(n)
+    let lo = b.centre - vec3(1.5 * r)
+    let near = max(0.02 * r, 0.01)
+    var p = Proven { proven: 0, unproven: 0 }
+    for i in 0..(n * n * n) {
+        let sub = prove_channels(f, tile(lo, step, n, i), near, 0, label)
+        p = Proven { proven: p.proven + sub.proven, unproven: p.unproven + sub.unproven }
+    }
+    print(f"verify({label}): substance in range, proven on {p.proven} boxes ({p.unproven} sampled)")
+}

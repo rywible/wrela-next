@@ -1059,6 +1059,34 @@ Not yet: a steepness the compiler derives instead of one the author states (a pa
 field's operations, `ir::derive`), which would make the stated number go away rather than be
 checked.
 
+### Materials and reflectance held to physics (2026-11-23)
+
+**Every field's substance is in range, at build** (`verify_field_soundness`, which `tools/layers`
+asks of every file that implements a `Field<...>`, and which the build's contract proofs run):
+wherever its surface can be, each channel's derived interval lies in its physical range (albedo,
+roughness, metalness, transmission, subsurface, coat and relief in [0, 1], index of refraction in
+[1, 3], emission at least 0, none NaN), halved where the interval is too wide and sampled past
+that. Every field of the game holds (the creature and the marble column's veins only by samples:
+their channels' intervals don't settle). An albedo of 1.2 on the stack stops the build, naming the
+point and the channel.
+
+**The reflectance can't make NaN, infinities or negative light** (`reflectance_is_finite_and_never_negative`):
+for substances at the corners and middle of every channel's range, the compiler's interval of
+`Substance::scatters` over boxes of the two directions' angles is finite and not below zero (by
+more than its own rounding), proven on all 768 boxes.
+
+**No substance reflects more light than falls on it** (`no_substance_reflects_more_than_falls_on_it`,
+a white furnace: the directional albedo by a 64 x 128 sum, at most 1 within the sum's error). It
+found the clearcoat breaking it: a white glass under a full coat reflected **1.06** of what fell on
+it at grazing, because what lay under the coat was dimmed by the coat's Fresnel at the half vector,
+not by what the coat takes from each direction. What lies under it now gets what the coat lets
+through on the way in and on the way out (its Fresnel at `n·l` and at `n·v`): **0.88**. Every
+substance in range is at most 1.0001 (a white matte's sum).
+
+Not yet: a field's high-frequency channels asked for their filtered form where a pixel's footprint
+is wider than their detail (the `filtered` contract exists, unasked), and types that keep metres
+from pixels and linear colour from sRGB.
+
 ## The layers
 
 Dependencies point down. Nothing below knows anything above.
