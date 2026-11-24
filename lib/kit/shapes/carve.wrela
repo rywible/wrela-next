@@ -38,6 +38,9 @@ pub trait Face: Copy + GpuData + Eq + StateHash {
     /// Whether w is a plane's height (whose gradient is square to (s, t)'s), or a part's
     /// distance (which may lean on them).
     fn flat(self) -> bool
+    /// Whether `p` lies near this face (not on the opposite side of the part), for pixel-rate
+    /// detail refinement (`Carved::detail_at`).
+    fn near_face(self, p: vec3, ground: f32) -> bool
 }
 
 /// A flat face: its origin, and the directions of s and t across it (unit, square to each
@@ -65,6 +68,11 @@ impl Face for FlatFace {
 
     fn flat(self) -> bool {
         true
+    }
+
+    fn near_face(self, p: vec3, ground: f32) -> bool {
+        let w = dot(p - self.origin, cross(self.s, self.t))
+        w <= 0.006 && w >= -(ground + 0.006)
     }
 }
 
@@ -94,6 +102,10 @@ impl Face for RoundFace {
     fn flat(self) -> bool {
         false
     }
+
+    fn near_face(self, p: vec3, ground: f32) -> bool {
+        true
+    }
 }
 
 /// A face draped over a gently curved part: s and t across a plane, as `FlatFace`'s, and w the
@@ -122,6 +134,11 @@ impl Face for DrapedFace {
 
     fn flat(self) -> bool {
         false
+    }
+
+    fn near_face(self, p: vec3, ground: f32) -> bool {
+        let w = dot(p - self.origin, cross(self.s, self.t))
+        abs(w) <= ground + 0.012
     }
 }
 
@@ -494,6 +511,52 @@ impl<S: Shaped, F: Face, M: Motif> Shaped for Carved<S, F, M> {
         let (d, story, c, h) = self.cut_from(p, d0, s0)
         let (e, st) = self.carved_story(d, story, c, h)
         (e, st, i)
+    }
+
+    /// Evaluates the carved motif at exact pixel resolution inside `region` on this face alone,
+    /// sharpening crevice exposure, cut depth, and sub-cell relief normal (`bump`) far beyond
+    /// mesh vertex resolution.
+    fn detail_at(self, p: vec3, part: u32, story: Story) -> (Story, f32) {
+        let base = self.part.detail_at(p, part, story)
+        var st = base.0
+        var rel = base.1
+        if !self.face.near_face(p, self.ground) {
+            return (st, rel)
+        }
+        let l = self.face.local(p, 0.0)
+        let rd = region_distance(l.xy, self.region)
+        if rd > 0.001 {
+            return (st, rel)
+        }
+        let edge_in = clamp(-rd / 0.0015, 0.0, 1.0)
+        let h = self.surface_at(l.xy)
+        if self.ground > 1.0e-5 {
+            let stands = clamp((h + self.ground) / self.ground, 0.0, 1.0)
+            // Crisp pixel-rate crevice darkening on ground & veins, burnished highlight on crests.
+            // Keep bump gentle (0.16×) so fine veins sharpen without double-counting the macro
+            // mesh displacement already captured in vertex normals.
+            let target_exp = 2.0 * stands - 1.0
+            st = Story {
+                exposure: mix(st.exposure, target_exp, edge_in),
+                depth: max(st.depth, -h * edge_in),
+                piece: st.piece,
+            }
+            rel += (h + self.ground) * 0.16 * edge_in
+        } else {
+            // Incised cuts: sub-millimetre blind tooling gets full pixel-rate groove relief; deeper
+            // mesh-resolved flutes taper smoothly down to a gentle 0.20× polish.
+            let cut = max(-h, 0.0) * edge_in
+            if cut > 1.0e-6 {
+                let sub_voxel = clamp(1.0 - (cut - 0.0008) / 0.0012, 0.20, 1.0)
+                st = Story {
+                    exposure: min(st.exposure, -clamp(cut / 0.0005, 0.0, 1.0)),
+                    depth: max(st.depth, cut),
+                    piece: st.piece,
+                }
+                rel -= cut * 0.85 * sub_voxel
+            }
+        }
+        (st, rel)
     }
 }
 

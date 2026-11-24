@@ -120,19 +120,30 @@ them, and none is a weight.
   dented table's `cull_bricks` 381 KiB); it now asks the same range the brick's own check does
   (`Surface::pruned`), which a made shape answers from its bound and a union part by part.
 
-- **Physical material bump at pixel rate (`Substance::bump`).** Features finer than a mesh cell
-  (oak's sunken pores, latewood ridges, plank seams and hand-chiseled gouge facets; leather's
+- **Physical material bump & pixel-rate carving detail (`Substance::bump`, `Shaped::detail_at`).**
+  Features finer than a mesh cell (oak's irregular earlywood pores, longitudinal cellulose fibres,
+  hand-planed plank seams, drawbore oak dowel pegs and gouge facets; leather's supple hide ripples,
   pebbles, crazing and blind-tooled grooves; paper's stacked deckled leaf edges; brass hammering
   and corrosion pits) return a physical height offset in metres (`Substance::bump`), tilted into
   the shading normal at pixel rate via Mikkelsen (2010) screen-space surface gradients in
-  `lib/engine/mesh/draw.wrela::apply_micro_relief` with footprint attenuation and clearcoat fill,
-  at zero extra geometry cost and Lipschitz 1.
-- **Sculpted C¹ carving & unbroken running scrolls.** `Blade` switched from a sharp-walled
-  `1 - x⁴` mesa to a C¹ `(1 - x²)^(3/2)` cushion profile (cutting its slope bound 2.5× so carvings
-  mesh cleanly even at `r / 180` without faceted spikes), `Row`'s hand `wander` tapers to zero at
-  cell edges (`cos(π s / period)`) so running scrolls never sever between cells, and
-  `resolve_normal_from` relaxes its smooth-normal threshold (`0.85` to `0.65`) so curved relief
+  `lib/engine/mesh/draw.wrela::apply_micro_relief` with footprint attenuation and view-hemisphere
+  safety. `Shaped::detail_at` routes by `part` so carved faces (`Carved::detail_at`) evaluate their
+  exact motif at pixel resolution inside `region` — sharpening crevice `Story` darkening, cut
+  depth, and fine groove/vein normals without raising the global mesh budget.
+- **Sculpted C¹ carving, circular lunettes & seamless round repeats.** `Blade` uses a C¹
+  `(1 - x²)^(3/2)` cushion profile (cutting its slope bound 2.5× so carvings mesh cleanly at
+  `r / 180` without faceted spikes), `Scroll` is a self-contained semicircular Jacobean fluted
+  lunette-and-palmette arcade (true circular arch moulding, springpoint bosses, upper spandrel
+  jewels, calyx heart and radiating 3-petal palmette fan), `Rosette` pairs veined petals with a
+  circular domed `Button`, `Row`'s hand `wander` tapers to zero at cell edges (`cos(π s / period)`)
+  and wraps cell IDs modulo `wrap` on `RoundFace` so turned carvings never tear across `atan2 = ±π`,
+  and `resolve_normal_from` relaxes its smooth-normal threshold (`0.85` to `0.65`) so curved relief
   stays smooth while crisp creases stay sharp.
+- **Natural matte-satin antique materials.** `Oak` and `Leather` drop mirror clearcoat (`coat = 0`)
+  and drive authentic beeswax and hand-rubbed calfskin sheen strictly through GGX roughness, paired
+  with turbulent multi-octave oak grain, non-lattice pores, floor-proximity dust, antique cordovan hide
+  with restrained gold-leaf traces in blind-tooled recesses, warm cast bronze-brass, and aged
+  thumb-worn rag paper.
 - **Fluent, unit-suffixed asset vocabulary (`kit::shapes::craft`).** Gold assets compose parts
   left-to-right with `.at(...)`, `.carve_round(...)`, `.joined_to(...)`, `.named_piece(...)` and
   `.in_material(...)`, pair profile points with their bows (`pt(vec2(...), bow: ...)`), write
@@ -273,17 +284,19 @@ reference, scramble, fit, judge) replays with every step the same in 4.6 s.
 
 ## The showcase: a carved oak table and a grimoire
 
-`game/world/table.wrela`: a library table 1.2 by 0.75 m, 76 cm high: a moulded top (ovolo over a
-cove), a frieze carved with a rosette between running scrolls, set back 3 mm from the legs'
-blocks, four turned baluster legs (gadrooned bulbs, acanthus round their necks, fluted columns)
-joined to the frieze with their shoulder lines showing, and an H-stretcher of turned rails. One
-oak over four pieces, each from its own log (the top and frieze plain-sawn, the legs and rails
-quarter-sawn). Four named parts: top, frieze, legs, stretcher.
+`game/world/table.wrela`: a library table 1.2 by 0.75 m, 76 cm high: a planked breadboard-end top
+with drawbore oak dowel pegs and an ovolo-over-cove edge, a frieze carved with an 8-petal rosette
+between semicircular Jacobean lunette-and-palmette arches set back 3 mm from the legs' die-blocks
+(each carrying a carved corner rosette medallion), four turned baluster legs (gadrooned bulbs,
+acanthus round their necks, fluted columns) joined to the frieze with shoulder lines showing, and
+an H-stretcher of turned rails. One oak over four pieces, each from its own log (the top and frieze
+plain-sawn, the legs and rails quarter-sawn). Four named parts: top, frieze, legs, stretcher.
 
-`game/world/grimoire.wrela`: a book 26 by 19 by 7 cm: leather over boards, tooled blind with a
-border, a lozenge and the joint's crease, a rounded spine with four raised bands, a hollowed
-fore-edge with its gatherings showing, brass corners folded over the boards and a turned brass boss
-carved with a rosette. Five named parts: covers, spine, pages, corners, boss.
+`game/world/grimoire.wrela`: a book 26 by 19 by 7 cm: dark cordovan leather over wooden boards,
+blind- and gold-tooled with a border, a central lozenge and French-groove hinge crease, a rounded
+spine with four tucked raised cord bands, a hollowed fore-edge with thumb-worn deckled gatherings,
+riveted L-bracket brass corner mounts, two hinged brass fore-edge clasps, and a turned brass boss
+carved with an 8-petal rosette. Six named parts: covers, spine, pages, corners, clasps, boss.
 
 SCENE 11 shows them on the stage (`VIEW` 0 the room, 1 the carving at 60 cm, 2 the book at 60 cm).
 Neither has a reference yet: the concept views and the TRELLIS.2 reference are made on Colab
