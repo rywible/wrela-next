@@ -9,9 +9,11 @@ the quality of the tools agents have and the loops that tell them whether their 
 We are still finding what the game looks and feels like. The working idea is a **parry-based
 spellcraft game**: timed, reactive defence, where reading an attack and answering it is the
 skill, in an open world of magic seen over the caster's shoulder. The defining image is a duel in
-which one caster hurls a storm of glass and the other turns it to sand in mid-air: a parry is not
-only a block on a timing window but a spell that answers the incoming spell, transforming it.
-Build toward that feeling, and treat everything else about the design as open.
+which one caster hurls a bolt of lightning and the other throws a veil of sand into its path: the
+bolt fuses the sand into a branching sculpture of glass that hangs in the air, glowing, and then
+shatters. A parry is not only a block on a timing window but a spell that answers the incoming
+spell, transforming it. Build toward that feeling, and treat everything else about the design as
+open.
 
 The game is its own. Code, docs, commit messages and image prompts never name or borrow from
 other games, films or books.

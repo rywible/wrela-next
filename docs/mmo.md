@@ -30,7 +30,7 @@ Magic is not "combine fire + ice to spawn a fireball with snowflakes." Spells ar
 manipulations of matter, motion, and energy** operating on the world's shared physical substrate:
 
 - **Form:** shaping, carving, extruding, compressing, hollowing, shattering, and binding matter.
-- **Substance & phase:** transmuting materials across space and time (`glass -> sand`,
+- **Substance & phase:** transmuting materials across space and time (`sand -> glass`,
   `water -> ice`, `stone -> molten`, `air -> dense mist`), where every substance has real physical
   properties (mass, hardness, brittleness, buoyancy, refractive index, heat capacity, conductivity,
   emission).
@@ -39,11 +39,12 @@ manipulations of matter, motion, and energy** operating on the world's shared ph
 - **Weaves (triggers & conditions):** binding operators to physical events—contact, velocity
   thresholds, parry timing windows, light intensity, or fracture.
 
-**Parrying is spellcraft in real time.** The defining image is turning hurled glass into sand: a
-parry is not a generic block on a timer, but a counter-operator applied to an incoming spell at the
-moment of contact—granulating a lethal blade of glass into blinding sand, melting and spinning it
-back as molten slag, locking shards in stasis mid-air as stepping stones, or raising a curved ice
-lens to refract a beam.
+**Parrying is spellcraft in real time.** The defining image is a bolt of lightning answered by a
+veil of sand: the bolt fuses the sand into a branching sculpture of glass that hangs in the air,
+glowing, and then shatters. A parry is not a generic block on a timer, but a counter-operator
+applied to an incoming spell at the moment of contact—grounding a bolt through thrown sand into
+glass, quenching a stream of molten stone into falling obsidian, locking shards in stasis mid-air
+as stepping stones, or raising a curved ice lens to refract a beam.
 
 Because every spell carries real physical trade-offs (mass, velocity, cast geometry, visibility,
 recoil, environmental dependence) and can be physically read and counter-parried, **no single
@@ -268,7 +269,7 @@ Do not build 10,000-player server meshing before the core loop is electric:
 1. **Slice A — The Living Archipelago (Single Authoritative Server):** One seamless ocean region
    with sailing, one Warded Trade Port (with a dueling circle), and 3–4 wild islands.
 2. **Slice B — Physical Spellcraft & Parry Combat:** Core form/substance/motion operators (proving
-   the *glass -> sand* parry end-to-end with real lighting, sound, physics, and bounded player
+   the *lightning -> sand -> glass* parry end-to-end with real lighting, sound, physics, and bounded player
    remixing).
 3. **Slice C — Wandcraft, Grimoires & Provenance:** Physical wand carving as fields, maker's marks,
    grimoire inscription/forking, and the first unique discoverable physical principles.
