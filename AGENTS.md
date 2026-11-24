@@ -94,7 +94,9 @@ Because agents author the whole game, tooling and verification are product work,
    machine (`ssh wrela-popos`). A change to how anything is drawn is measured on both before it
    is called done. On the Linux machine this repository is a full checkout in
    `~/projects/wrela-next`, and agents work and commit there just as on the Mac; the two
-   machines share work through GitHub. The same rules hold there. Touch nothing else on it.
+   machines share work through GitHub. To measure a change on the Linux machine, commit and push
+   it, then `git pull` in that checkout and run it there; never copy files across another way.
+   The same rules hold there. Touch nothing else on it.
 5. **Commit and push freely; open no pull requests.** The repository is
    `github.com/rywible/wrela-next`; push your branches to `origin` whenever you like. A commit
    message is one sentence saying what is now true, with no trailing period.
