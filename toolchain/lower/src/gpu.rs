@@ -3916,12 +3916,29 @@ fn verify(cx: &mut Cx, mb: &mut ModuleBuilder, name: &str) -> Option<Counts> {
     }
     if cx.emit {
         mb.m.exact = cx.data.exact;
+        let mut folded_branch = false;
         checked = checked
-            .and_then(|()| ir::opt::flatten_gpu(&mut mb.m))
+            .and_then(|()| {
+                folded_branch = ir::opt::flatten_gpu_folded(&mut mb.m)?;
+                Ok(())
+            })
             .map(|()| hoisted = hoist_same(cx, &mut mb.m, uniform))
             .and_then(|()| ir::gpu_memory::lay_out_gpu_memory(&mut mb.m))
             .and_then(|()| ir::verify(&mb.m));
         if checked.is_ok() {
+            if folded_branch {
+                let (flat_each, _) = ir::work::module_work(&mb.m);
+                for (idx, fw) in flat_each.into_iter().enumerate() {
+                    if let Some(w) = fw.work {
+                        if let Some(slot) = work.get_mut(idx) {
+                            *slot = Some(slot.map_or(w, |pre| pre.min(w)));
+                        }
+                        if let Some(u) = unbounded.get_mut(idx) {
+                            *u = None;
+                        }
+                    }
+                }
+            }
             weight = written_weight(&mb.m);
             same = ir::same::same_work(&mb.m, MOST_SAME_WORK + 1);
             copies = ir::opt::read_only_copies(&mb.m, ir::opt::MOST_COPIED_BYTES);

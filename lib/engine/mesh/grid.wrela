@@ -48,6 +48,8 @@ pub(package) const CULL_CHUNK: u32 = 8192
 /// the stack's at most 32,597 a dispatch and the walking creature's, extracted posed near the eye,
 /// at most 36,974; the program can't ask a kernel's bound, so every field's slice is this.
 pub(package) const CREASE_SLICE: u32 = 16384
+/// The fewest cells a work-sized crease or surface slice is cut to for heavy fields.
+pub(package) const CREASE_SLICE_LEAST: u32 = 1024
 
 /// The crease slices a chunk dispatches with no readback to go by (cold, after a cut): 65,536
 /// creases; the SCENE 6 audit's chunks held at most 4,045.
@@ -56,8 +58,9 @@ pub(package) const COLD_CREASE_SLICES: u32 = 4
 /// the posed field up to 4 times a vertex), for the same reason.
 pub(package) const DEFORM_SLICE: u32 = 262144
 /// The most slices one prepared list is dispatched in: a chunk's creases (`CAP_SURF /
-/// CREASE_SLICE`, rounded up) and a batch's vertices (`8192 · 343 / DEFORM_SLICE`, rounded up).
-pub(package) const SLICES_MOST: u32 = 128
+/// CREASE_SLICE_LEAST`, rounded up, for the heaviest field) and a batch's vertices (`8192 · 343 /
+/// DEFORM_SLICE`, rounded up).
+pub(package) const SLICES_MOST: u32 = 352
 /// Normal spread (`Qef::min_dot`) below which a cell is a sharp crease, solved from exact Hermite
 /// edge crossings; and at or above which a vertex is shaded smooth.
 pub(package) const CREASE_DOT: f32 = 0.78
@@ -157,6 +160,26 @@ pub fn unpack_smooth(packed: u32) -> bool {
 /// Decodes the transmissive-material flag from `MeshVertex::packed`.
 pub fn unpack_is_trans(packed: u32) -> bool {
     (packed >> 31) != 0
+}
+
+/// The bit of a vertex's kept part word (`MeshBatch::vert_kept`) saying its material lets light
+/// through.
+pub const KEPT_TRANS: u32 = 2147483648
+
+/// The part a vertex's kept part word names.
+pub fn kept_part(w: u32) -> u32 {
+    w & (KEPT_TRANS - 1)
+}
+
+/// Four numbers in [0, 1] (`Field::kept`) packed as a byte each.
+pub fn pack_kept(k: vec4) -> u32 {
+    let b = vec4u(clamp(k, vec4(0.0), vec4(1.0)) * 255.0 + vec4(0.5))
+    b.x | (b.y << 8) | (b.z << 16) | (b.w << 24)
+}
+
+/// Unpacks `pack_kept`'s four numbers in [0, 1].
+pub fn unpack_kept(w: u32) -> vec4 {
+    vec4(f32(w & 255), f32((w >> 8) & 255), f32((w >> 16) & 255), f32(w >> 24)) * (1.0 / 255.0)
 }
 
 /// Evaluates 4-bone Dual Quaternion Skinning (Kavan et al., I3D 2007 / ACM TOG 2008) from packed
@@ -948,13 +971,13 @@ pub(package) fn cull_brick<M: Field<Substance>>(f: M, g: GridSpec, b: vec3u) -> 
     let lo = brick_corner(g, b, vec3u(0, 0, 0))
     let hi_c: u32 = if g.seam_mask != 0 { BRICK + 2 } else { BRICK + 1 }
     let hi = brick_corner(g, b, vec3u(hi_c, hi_c, hi_c))
-    if !steep(f) {
-        let pr = f.pruned(Box3 { lo, hi }, |q: vec3| q, 1.0, ALL_LIVE, 0)
-        return (pr.range.lo <= 0.0 && pr.range.hi >= 0.0, pr.live)
-    }
-    let use_affine = f.lipschitz(1.0) > 2.5
     let pr0 = f.pruned(Box3 { lo, hi }, |q: vec3| q, 1.0, ALL_LIVE, 0)
-    if use_affine {
+    if !steep(f) {
+        return (pr0.range.lo <= 0.0 && pr0.range.hi >= 0.0, pr0.live)
+    }
+    let stepped = f.field_facts().use_stepped_bounds
+    let use_affine = !stepped && f.lipschitz(1.0) > 2.5
+    if !stepped && use_affine {
         let iv_all = affine(|q: vec3| f.distance(q), Box3 { lo, hi })
         if !(iv_all.lo <= 0.0 && iv_all.hi >= 0.0) {
             return (false, ALL_LIVE)
@@ -974,7 +997,7 @@ pub(package) fn cull_brick<M: Field<Substance>>(f: M, g: GridSpec, b: vec3u) -> 
             if (oct & 2) != 0 { hi.y } else { mid.y },
             if (oct & 4) != 0 { hi.z } else { mid.z },
         )
-        let iv = if use_affine {
+        let iv = if !stepped && use_affine {
             affine(|q: vec3| f.distance(q), Box3 { lo: olo, hi: ohi })
         } else {
             f.pruned(Box3 { lo: olo, hi: ohi }, |q: vec3| q, 1.0, pr0.live, 0).range

@@ -1,0 +1,1397 @@
+#!/usr/bin/env python3
+"""The forge: the authoring pipeline from a brief to a gold asset (docs/forge.md). Usage:
+
+    tools/forge new <asset> --source game/world/<file>.wrela --field <fn> --size X,Y,Z
+                [--brief "<text>"] [--gold]       (a gold asset's record goes beside its source)
+    tools/forge prompts <asset>               the concept views' prompts, from the brief, linted
+    tools/forge lint "<prompt>"...            a prompt against the forge's rules (exit 1 if broken)
+    tools/forge reference <asset> --mesh <file.glb|.obj|.ply> [--up y|z] [--seed N]
+                [--surface N] [--volume N] [--model NAME --version V]
+                                              a reference mesh turned into samples
+    tools/forge synth <asset> --program <dir> --field <module::fn> [--cell M]
+                                              samples of a known program (a synthetic reference)
+    tools/forge scramble <asset> --names A,B,... [--by F] [--seed N]
+                                              the work copy's named literals moved off (a test)
+    tools/forge fit <asset> [--stage NAME]... [--steps N] [--starts K] [--write] [--dry]
+                                              the work copy's free literals fitted, coarse to fine
+    tools/forge judge <asset> [--brute] [--of work|source]
+                                              the asset's numbers against its reference
+    tools/forge look <asset> --render <png> --concept <png>
+                                              a render against a concept image, exposure matched
+    tools/forge record <asset>                the provenance record, next to the source
+    tools/forge replay <asset>                the chain run again from its record, and compared
+    tools/forge test                          the forge's own checks (no GPU)
+
+An asset's working material is in .forge/<asset>/ (git-ignored): its brief, prompts, concept
+images, reference mesh and samples, the work package the fitter runs on (a copy of the asset's
+source beside the samples it embeds), fit logs and scores. Nothing in game/ or lib/ reads it. What
+ships is the .wrela file in game/, and its provenance record beside it (<file>.provenance.json).
+
+The fitter is `wrela solve --fit` (language.md §23.9) over the work copy: the misses of a stage's
+samples (lib/engine/judge/samples.wrela, `misses`) made small by Levenberg-Marquardt on the copy's
+literals, which `wrela edit` writes back in the form they were written. `fit --write` copies the
+fitted file over the source in game/, refusing if the source changed since the copy was taken.
+
+Prompts never name another game, film, book, character or living artist, and never ask for a
+style "of" anyone: they describe the thing itself (`lint`).
+
+Exit status: 0 done; 1 a check failed or a step refused; 2 a usage error.
+"""
+
+import hashlib
+import json
+import math
+import os
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+FORGE = os.path.join(ROOT, ".forge")
+WRELA = os.path.join(ROOT, "tools", "wrela")
+
+MAGIC = b"WFS1"
+HEAD = 32
+
+
+def die(msg, code=1):
+    print(f"forge: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def now():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+# ---- the workspace -------------------------------------------------------------------------------
+
+
+def asset_dir(asset):
+    if not re.fullmatch(r"[a-z][a-z0-9_]*", asset or ""):
+        die(f"an asset's name is lower case letters, digits and _: `{asset}`", 2)
+    return os.path.join(FORGE, asset)
+
+
+def load_config(asset):
+    p = os.path.join(asset_dir(asset), "forge.json")
+    if not os.path.exists(p):
+        die(f"no asset `{asset}`: make it with `tools/forge new {asset} ...`")
+    with open(p) as f:
+        return json.load(f)
+
+
+def save_config(asset, cfg):
+    with open(os.path.join(asset_dir(asset), "forge.json"), "w") as f:
+        json.dump(cfg, f, indent=2)
+        f.write("\n")
+
+
+# The command line of the step running now (its options after the asset), kept in its record so
+# `replay` can run it again.
+RUNNING = {"command": None, "args": []}
+
+
+def log_step(asset, step):
+    """Appends a step to the asset's chain (its record's `chain`), with the command that made it."""
+    cfg = load_config(asset)
+    step = dict(step, at=now(), command=RUNNING["command"], args=RUNNING["args"])
+    cfg.setdefault("chain", []).append(step)
+    save_config(asset, cfg)
+
+
+def cmd_new(args):
+    asset = args.pop(0)
+    opts = parse_opts(args, {"--source": 1, "--field": 1, "--size": 1, "--brief": 1, "--gold": 0})
+    d = asset_dir(asset)
+    if os.path.exists(os.path.join(d, "forge.json")):
+        die(f"`{asset}` already exists in {d}")
+    src = opts.get("--source") or die("give --source game/world/<file>.wrela", 2)
+    if not os.path.exists(os.path.join(ROOT, src)):
+        die(f"no source `{src}`")
+    field = opts.get("--field") or die("give --field <fn>, the function that gives its shape", 2)
+    size = [float(v) for v in (opts.get("--size") or die("give --size X,Y,Z (m)", 2)).split(",")]
+    os.makedirs(d, exist_ok=True)
+    brief = opts.get("--brief", "")
+    with open(os.path.join(d, "brief.md"), "w") as f:
+        f.write(brief.strip() + "\n")
+    save_config(asset, {"asset": asset, "source": src, "field": field, "size": size,
+                        "gold": "--gold" in opts, "chain": []})
+    print(f"forge: {asset} in {os.path.relpath(d, ROOT)}")
+
+
+# ---- prompts -------------------------------------------------------------------------------------
+
+# A prompt says what the thing is. It never asks for a style of anyone or anything, and never
+# names a work or a maker (AGENTS.md; docs/forge.md, "Risks"). The list catches the common forms;
+# a name the list doesn't know is the author's to keep out, and the record keeps every prompt.
+BANNED = [
+    (r"\bin the style of\b", "asks for someone's style"),
+    (r"\bstyle of\b", "asks for someone's style"),
+    (r"\b(inspired by|reminiscent of|like in|as seen in|from the (?:game|film|movie|show|book|series))\b",
+     "points at another work"),
+    (r"\b(artstation|deviantart|unreal engine|octane|by greg|trending on)\b", "names a maker or a site"),
+    (r"\b(harry potter|hogwarts|dumbledore|voldemort|clair obscur|expedition 33|lord of the rings|"
+     r"skyrim|elden ring|dark souls|witcher|zelda|disney|pixar|marvel|warhammer)\b",
+     "names another work or its characters"),
+    (r"\b[A-Z][a-z]+ [A-Z][a-z]+'s\b", "credits a named person"),
+]
+
+
+def lint(prompt):
+    """The rules `prompt` breaks, each with why."""
+    out = []
+    for pat, why in BANNED:
+        flags = 0 if "[A-Z]" in pat else re.IGNORECASE
+        m = re.search(pat, prompt, flags)
+        if m:
+            out.append(f"`{m.group(0)}`: {why}")
+    return out
+
+
+def cmd_lint(args):
+    bad = 0
+    for p in args:
+        faults = lint(p)
+        for f in faults:
+            print(f"forge: lint: {f}")
+        bad += bool(faults)
+    sys.exit(1 if bad else 0)
+
+
+VIEWS = [
+    ("front", "seen straight from the front, at the height of its middle"),
+    ("side", "seen straight from its right side, at the height of its middle"),
+    ("top", "seen straight from above"),
+    ("three_quarter", "seen from the front right and a little above, three-quarter view"),
+    ("ornament", "a close-up of its carved ornament, filling the frame"),
+]
+
+
+def cmd_prompts(args):
+    asset = args.pop(0)
+    d = asset_dir(asset)
+    brief = open(os.path.join(d, "brief.md")).read().strip()
+    if not brief:
+        die("the brief is empty: write .forge/<asset>/brief.md first")
+    prompts = []
+    for view, how in VIEWS:
+        text = (f"{brief} Product photograph of the object alone, {how}, on a plain mid-grey "
+                f"background, soft even studio light from all sides, no shadows on the background, "
+                f"sharp focus, true colours, no text, no people.")
+        faults = lint(text)
+        if faults:
+            die(f"the {view} prompt breaks the rules: " + "; ".join(faults))
+        prompts.append({"view": view, "prompt": text})
+    with open(os.path.join(d, "prompts.json"), "w") as f:
+        json.dump(prompts, f, indent=2)
+        f.write("\n")
+    log_step(asset, {"step": "prompts", "count": len(prompts),
+                     "prompts_sha256": sha256(os.path.join(d, "prompts.json"))})
+    print(f"forge: {len(prompts)} prompts in {os.path.relpath(os.path.join(d, 'prompts.json'), ROOT)}")
+
+
+# ---- meshes --------------------------------------------------------------------------------------
+
+
+def np():
+    import numpy
+    return numpy
+
+
+def load_mesh(path):
+    """(vertices N×3, faces M×3, colours N×3 or None, uv N×2 or None, texture HxWx3 or None)."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".obj":
+        return load_obj(path)
+    if ext == ".ply":
+        return load_ply(path)
+    if ext in (".glb", ".gltf"):
+        return load_glb(path)
+    die(f"a reference mesh is .glb, .obj or .ply: `{path}`", 2)
+
+
+def load_obj(path):
+    n = np()
+    vs, cs, fs = [], [], []
+    with open(path) as f:
+        for line in f:
+            p = line.split()
+            if not p:
+                continue
+            if p[0] == "v":
+                vs.append([float(x) for x in p[1:4]])
+                if len(p) >= 7:
+                    cs.append([float(x) for x in p[4:7]])
+            elif p[0] == "f":
+                idx = [int(q.split("/")[0]) for q in p[1:]]
+                idx = [i - 1 if i > 0 else len(vs) + i for i in idx]
+                for k in range(1, len(idx) - 1):
+                    fs.append([idx[0], idx[k], idx[k + 1]])
+    col = n.array(cs, dtype=n.float64) if len(cs) == len(vs) and cs else None
+    return n.array(vs, dtype=n.float64), n.array(fs, dtype=n.int64), col, None, None
+
+
+def load_ply(path):
+    n = np()
+    with open(path, "rb") as f:
+        header = []
+        while True:
+            line = f.readline().decode("ascii").strip()
+            header.append(line)
+            if line == "end_header":
+                break
+        fmt = next(h.split()[1] for h in header if h.startswith("format"))
+        elems, cur = [], None
+        for h in header:
+            p = h.split()
+            if p[0] == "element":
+                cur = {"name": p[1], "count": int(p[2]), "props": []}
+                elems.append(cur)
+            elif p[0] == "property":
+                cur["props"].append(p[1:])
+        types = {"char": "b", "uchar": "B", "short": "h", "ushort": "H", "int": "i", "uint": "I",
+                 "float": "f", "double": "d", "int8": "b", "uint8": "B", "int16": "h", "uint16": "H",
+                 "int32": "i", "uint32": "I", "float32": "f", "float64": "d"}
+        verts, faces = None, []
+        if fmt == "ascii":
+            data = f.read().decode("ascii").split()
+            pos = 0
+            for e in elems:
+                rows = []
+                for _ in range(e["count"]):
+                    row = []
+                    for pr in e["props"]:
+                        if pr[0] == "list":
+                            k = int(data[pos]); pos += 1
+                            row.append([float(x) for x in data[pos:pos + k]]); pos += k
+                        else:
+                            row.append(float(data[pos])); pos += 1
+                    rows.append(row)
+                e["rows"] = rows
+        else:
+            endian = "<" if "little" in fmt else ">"
+            for e in elems:
+                rows = []
+                for _ in range(e["count"]):
+                    row = []
+                    for pr in e["props"]:
+                        if pr[0] == "list":
+                            (k,) = struct.unpack(endian + types[pr[1]], f.read(struct.calcsize(types[pr[1]])))
+                            t = types[pr[2]]
+                            row.append(list(struct.unpack(endian + t * k, f.read(struct.calcsize(t) * k))))
+                        else:
+                            t = types[pr[0]]
+                            (v,) = struct.unpack(endian + t, f.read(struct.calcsize(t)))
+                            row.append(v)
+                    rows.append(row)
+                e["rows"] = rows
+    for e in elems:
+        names = [pr[-1] for pr in e["props"]]
+        if e["name"] == "vertex":
+            a = n.array(e["rows"], dtype=n.float64)
+            verts = a[:, [names.index("x"), names.index("y"), names.index("z")]]
+            col = None
+            if "red" in names:
+                col = a[:, [names.index("red"), names.index("green"), names.index("blue")]] / 255.0
+        elif e["name"] == "face":
+            for row in e["rows"]:
+                idx = [int(i) for i in row[0]]
+                for k in range(1, len(idx) - 1):
+                    faces.append([idx[0], idx[k], idx[k + 1]])
+    return verts, n.array(faces, dtype=n.int64), col, None, None
+
+
+def load_glb(path):
+    """A binary glTF's meshes, every primitive's node transforms applied: positions, triangles,
+    vertex colours or the base colour texture and its coordinates (TRELLIS.2 writes these)."""
+    n = np()
+    raw = open(path, "rb").read()
+    if raw[:4] != b"glTF":
+        die(f"`{path}` isn't a binary glTF")
+    off = 12
+    js, binc = None, b""
+    while off < len(raw):
+        ln, kind = struct.unpack_from("<II", raw, off)
+        chunk = raw[off + 8: off + 8 + ln]
+        if kind == 0x4E4F534A:
+            js = json.loads(chunk)
+        elif kind == 0x004E4942:
+            binc = chunk
+        off += 8 + ln
+    comp = {5120: "b", 5121: "B", 5122: "h", 5123: "H", 5125: "I", 5126: "f"}
+    width = {"SCALAR": 1, "VEC2": 2, "VEC3": 3, "VEC4": 4, "MAT4": 16}
+
+    def accessor(i):
+        a = js["accessors"][i]
+        bv = js["bufferViews"][a["bufferView"]]
+        t = comp[a["componentType"]]
+        k = width[a["type"]]
+        start = bv.get("byteOffset", 0) + a.get("byteOffset", 0)
+        stride = bv.get("byteStride", 0) or struct.calcsize(t) * k
+        dt = n.dtype("<" + t)
+        out = n.empty((a["count"], k), dtype=dt)
+        for r in range(a["count"]):
+            out[r] = n.frombuffer(binc, dtype=dt, count=k, offset=start + r * stride)
+        if a.get("normalized"):
+            out = out.astype(n.float64) / {"B": 255.0, "H": 65535.0, "b": 127.0, "h": 32767.0}.get(t, 1.0)
+        return out
+
+    def node_matrix(nd):
+        if "matrix" in nd:
+            return n.array(nd["matrix"], dtype=n.float64).reshape(4, 4).T
+        m = n.eye(4)
+        if "scale" in nd:
+            m = n.diag(list(nd["scale"]) + [1.0]) @ m
+        if "rotation" in nd:
+            x, y, z, w = nd["rotation"]
+            r = n.array([[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                         [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                         [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]])
+            rm = n.eye(4); rm[:3, :3] = r
+            m = rm @ m
+        if "translation" in nd:
+            t = n.eye(4); t[:3, 3] = nd["translation"]
+            m = t @ m
+        return m
+
+    verts, faces, cols, uvs, tex = [], [], [], [], None
+
+    def visit(i, parent):
+        nd = js["nodes"][i]
+        m = parent @ node_matrix(nd)
+        if "mesh" in nd:
+            for prim in js["meshes"][nd["mesh"]]["primitives"]:
+                if prim.get("mode", 4) != 4:
+                    continue
+                p = accessor(prim["attributes"]["POSITION"]).astype(n.float64)
+                p = (n.c_[p, n.ones(len(p))] @ m.T)[:, :3]
+                base = sum(len(v) for v in verts)
+                idx = (accessor(prim["indices"]).reshape(-1) if "indices" in prim
+                       else n.arange(len(p))).astype(n.int64)
+                verts.append(p)
+                faces.append(idx.reshape(-1, 3) + base)
+                at = prim["attributes"]
+                cols.append(accessor(at["COLOR_0"])[:, :3].astype(n.float64) if "COLOR_0" in at else None)
+                uvs.append(accessor(at["TEXCOORD_0"]).astype(n.float64) if "TEXCOORD_0" in at else None)
+                nonlocal tex
+                if tex is None and "material" in prim:
+                    pbr = js["materials"][prim["material"]].get("pbrMetallicRoughness", {})
+                    if "baseColorTexture" in pbr:
+                        img = js["images"][js["textures"][pbr["baseColorTexture"]["index"]]["source"]]
+                        bv = js["bufferViews"][img["bufferView"]]
+                        from io import BytesIO
+                        from PIL import Image
+                        data = binc[bv.get("byteOffset", 0): bv.get("byteOffset", 0) + bv["byteLength"]]
+                        tex = n.asarray(Image.open(BytesIO(data)).convert("RGB"), dtype=n.float64) / 255.0
+        for c in nd.get("children", []):
+            visit(c, m)
+
+    scene = js.get("scenes", [{"nodes": list(range(len(js.get("nodes", []))))}])[js.get("scene", 0)]
+    for i in scene["nodes"]:
+        visit(i, n.eye(4))
+    v = n.concatenate(verts)
+    f = n.concatenate(faces)
+    col = n.concatenate(cols) if all(c is not None for c in cols) else None
+    uv = n.concatenate(uvs) if all(u is not None for u in uvs) and tex is not None else None
+    return v, f, col, uv, tex
+
+
+def srgb_to_linear(c):
+    n = np()
+    return n.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
+
+
+def mesh_samples(v, f, col, uv, tex, surface, volume, seed):
+    """Area-weighted surface samples with their faces' normals, colours where the mesh has them,
+    and volume samples a little off the surface each side (their side from the normal), and some
+    far outside."""
+    n = np()
+    rng = n.random.default_rng(seed)
+    a, b, c = v[f[:, 0]], v[f[:, 1]], v[f[:, 2]]
+    cr = n.cross(b - a, c - a)
+    area2 = n.linalg.norm(cr, axis=1)
+    keep = area2 > 1e-18
+    f, a, b, c, cr, area2 = f[keep], a[keep], b[keep], c[keep], cr[keep], area2[keep]
+    total = 0.5 * area2.sum()
+    pick = rng.choice(len(f), size=surface, p=area2 / area2.sum())
+    r1 = n.sqrt(rng.random(surface))
+    r2 = rng.random(surface)
+    w0, w1, w2 = 1 - r1, r1 * (1 - r2), r1 * r2
+    pts = a[pick] * w0[:, None] + b[pick] * w1[:, None] + c[pick] * w2[:, None]
+    nrm = cr[pick] / area2[pick][:, None]
+    colours = None
+    if col is not None:
+        cc = col[f[pick]]
+        colours = cc[:, 0] * w0[:, None] + cc[:, 1] * w1[:, None] + cc[:, 2] * w2[:, None]
+    elif uv is not None and tex is not None:
+        uu = uv[f[pick]]
+        t = uu[:, 0] * w0[:, None] + uu[:, 1] * w1[:, None] + uu[:, 2] * w2[:, None]
+        h, wd = tex.shape[:2]
+        x = n.clip((t[:, 0] % 1.0) * (wd - 1), 0, wd - 1).astype(int)
+        y = n.clip((t[:, 1] % 1.0) * (h - 1), 0, h - 1).astype(int)
+        colours = srgb_to_linear(tex[y, x])
+    spacing = math.sqrt(total / surface)
+    # Volume: half near the surface each side (up to two spacings off, their side from the
+    # normal), half through the whole box (their side from the mesh's own inside: `solid_grid`).
+    near = volume // 2
+    i = rng.integers(0, surface, size=near)
+    off = spacing * (0.25 + 1.75 * rng.random(near))
+    side = n.where(rng.random(near) < 0.5, -1.0, 1.0)
+    vp = pts[i] + nrm[i] * (off * side)[:, None]
+    lo, hi = pts.min(0), pts.max(0)
+    ext = (hi - lo) * 0.1 + spacing
+    bp = lo - ext + rng.random((volume - near, 3)) * (hi - lo + 2 * ext)
+    solid, glo, gcell = solid_grid(v, f, lo - ext, hi + ext, 256)
+    gi = n.clip(((bp - glo) / gcell).astype(int), 0, n.array(solid.shape) - 1)
+    bside = n.where(solid[gi[:, 0], gi[:, 1], gi[:, 2]], -1.0, 1.0)
+    bdist, bfacing, bplane = nearest_distance(bp, pts, nrm, spacing)
+    # Within a cell and a half of the fill of the surface, its cells can't tell (a point and its
+    # cell's middle can be either side): where the point lies over its nearest sample (within a
+    # spacing of it along its plane), the sample's plane says which side.
+    bside = n.where(bplane < 1.5 * gcell, bfacing, bside)
+    vdist, _, _ = nearest_distance(vp, pts, nrm, spacing)
+    vol = n.c_[n.r_[vp, bp], n.r_[side * vdist, bside * bdist]]
+    return pts, nrm, colours, vol, spacing, total
+
+
+def nearest_distance(q, pts, nrm, spacing):
+    """Each of `q`'s distance from the surface its samples say: to the plane of its nearest
+    sample, as far as half the spacing reaches along it (the judge's `to_sample`); which side of
+    that sample's plane it is on (1 the side its normal points to); and how far from the plane
+    it is where it lies over the sample (within a spacing of it along the plane; else infinite)."""
+    n = np()
+    out = n.empty(len(q))
+    facing = n.empty(len(q))
+    plane = n.empty(len(q))
+    for a in range(0, len(q), 512):
+        b = q[a:a + 512]
+        d2 = ((b[:, None, :] - pts[None, :, :]) ** 2).sum(-1)
+        k = d2.argmin(1)
+        vv = b - pts[k]
+        along = (vv * nrm[k]).sum(1)
+        lateral = n.linalg.norm(vv - nrm[k] * along[:, None], axis=1)
+        across = n.maximum(lateral - 0.5 * spacing, 0)
+        out[a:a + 512] = n.sqrt(along ** 2 + across ** 2)
+        facing[a:a + 512] = n.where(along < 0, -1.0, 1.0)
+        plane[a:a + 512] = n.where(lateral < spacing, n.abs(along), n.inf)
+    return out, facing, plane
+
+
+def solid_grid(v, f, lo, hi, res):
+    """Which cells of a grid over `lo`..`hi` (`res` along its longest side) lie inside the mesh:
+    each column along z crossed by the triangles over it, the cells between an odd and an even
+    crossing inside (the even-odd rule, as a scanline fills)."""
+    n = np()
+    size = hi - lo
+    cell = size.max() / res
+    dims = n.maximum(n.ceil(size / cell).astype(int), 1)
+    a, b, c = v[f[:, 0]], v[f[:, 1]], v[f[:, 2]]
+    # Each triangle's column centres in x, y it covers.
+    tlo = n.minimum(n.minimum(a, b), c)[:, :2]
+    thi = n.maximum(n.maximum(a, b), c)[:, :2]
+    ilo = n.ceil((tlo - lo[:2]) / cell - 0.5).astype(int)
+    ihi = n.floor((thi - lo[:2]) / cell - 0.5).astype(int)
+    cols = {}
+    span = n.maximum(ihi - ilo + 1, 0)
+    for sx in range(int(span[:, 0].max(initial=0))):
+        for sy in range(int(span[:, 1].max(initial=0))):
+            m = (span[:, 0] > sx) & (span[:, 1] > sy)
+            if not m.any():
+                continue
+            ix, iy = ilo[m, 0] + sx, ilo[m, 1] + sy
+            px = lo[0] + (ix + 0.5) * cell
+            py = lo[1] + (iy + 0.5) * cell
+            A, B, C = a[m], b[m], c[m]
+            # Barycentrics of (px, py) in the triangle's projection.
+            d = (B[:, 1] - C[:, 1]) * (A[:, 0] - C[:, 0]) + (C[:, 0] - B[:, 0]) * (A[:, 1] - C[:, 1])
+            ok = n.abs(d) > 1e-20
+            d = n.where(ok, d, 1.0)
+            l1 = ((B[:, 1] - C[:, 1]) * (px - C[:, 0]) + (C[:, 0] - B[:, 0]) * (py - C[:, 1])) / d
+            l2 = ((C[:, 1] - A[:, 1]) * (px - C[:, 0]) + (A[:, 0] - C[:, 0]) * (py - C[:, 1])) / d
+            l3 = 1 - l1 - l2
+            hit = ok & (l1 >= 0) & (l2 >= 0) & (l3 > 0)
+            z = l1 * A[:, 2] + l2 * B[:, 2] + l3 * C[:, 2]
+            for x, y, zz in zip(ix[hit], iy[hit], z[hit]):
+                if 0 <= x < dims[0] and 0 <= y < dims[1]:
+                    cols.setdefault((int(x), int(y)), []).append(float(zz))
+    solid = n.zeros(dims, dtype=bool)
+    zc = lo[2] + (n.arange(dims[2]) + 0.5) * cell
+    for (x, y), zs in cols.items():
+        zs = sorted(zs)
+        for k in range(0, len(zs) - 1, 2):
+            solid[x, y, (zc >= zs[k]) & (zc <= zs[k + 1])] = True
+    return solid, lo, cell
+
+
+def write_samples(path, pts, nrm, vol, colours, spacing, cpts=None):
+    n = np()
+    nc = 0 if colours is None else len(colours)
+    with open(path, "wb") as f:
+        f.write(MAGIC + struct.pack("<IIIf", len(pts), len(vol), nc, spacing) + b"\0" * 12)
+        f.write(n.c_[pts, nrm].astype("<f4").tobytes())
+        f.write(n.asarray(vol).astype("<f4").tobytes())
+        if nc:
+            f.write(n.c_[pts if cpts is None else cpts, colours].astype("<f4").tobytes())
+
+
+def read_samples(path):
+    n = np()
+    raw = open(path, "rb").read()
+    if raw[:4] != MAGIC:
+        die(f"`{path}` isn't a samples file")
+    ns, nv, nc, spacing = struct.unpack_from("<IIIf", raw, 4)
+    a = n.frombuffer(raw, dtype="<f4", count=ns * 6, offset=HEAD).reshape(ns, 6)
+    b = n.frombuffer(raw, dtype="<f4", count=nv * 4, offset=HEAD + 24 * ns).reshape(nv, 4)
+    c = n.frombuffer(raw, dtype="<f4", count=nc * 6, offset=HEAD + 24 * ns + 16 * nv).reshape(nc, 6)
+    return a, b, c, spacing
+
+
+def align(v, size, up):
+    """The mesh in the asset's frame: up the y axis, its feet at y = 0 and its middle over the
+    origin, scaled uniformly so its height is the brief's. Returns the vertices and the transform
+    (scale, offset), applied as v * scale + offset after the axis swap."""
+    n = np()
+    if up == "z":
+        v = v[:, [0, 2, 1]] * n.array([1.0, 1.0, -1.0])
+    lo, hi = v.min(0), v.max(0)
+    scale = size[1] / max(hi[1] - lo[1], 1e-12)
+    mid = 0.5 * (lo + hi)
+    offset = n.array([-mid[0] * scale, -lo[1] * scale, -mid[2] * scale])
+    return v * scale + offset, float(scale), offset.tolist()
+
+
+def cmd_reference(args):
+    asset = args.pop(0)
+    opts = parse_opts(args, {"--mesh": 1, "--up": 1, "--seed": 1, "--surface": 1, "--volume": 1,
+                             "--model": 1, "--version": 1, "--inputs": 1})
+    cfg = load_config(asset)
+    d = asset_dir(asset)
+    mesh = opts.get("--mesh") or die("give --mesh <file>", 2)
+    seed = int(opts.get("--seed", 7))
+    v, f, col, uv, tex = load_mesh(mesh)
+    v, scale, offset = align(v, cfg["size"], opts.get("--up", "y"))
+    pts, nrm, colours, vol, spacing, area = mesh_samples(
+        v, f, col, uv, tex, int(opts.get("--surface", 60000)), int(opts.get("--volume", 20000)), seed)
+    os.makedirs(os.path.join(d, "reference"), exist_ok=True)
+    kept = os.path.join(d, "reference", "mesh" + os.path.splitext(mesh)[1].lower())
+    if os.path.abspath(mesh) != os.path.abspath(kept):
+        shutil.copyfile(mesh, kept)
+    out = os.path.join(d, "reference", "samples.bin")
+    write_samples(out, pts, nrm, vol, colours, spacing)
+    info = {"step": "reference", "kind": "mesh", "mesh": os.path.relpath(kept, ROOT),
+            "mesh_sha256": sha256(kept), "model": opts.get("--model", "unknown"),
+            "version": opts.get("--version", "unknown"), "inputs": opts.get("--inputs", ""),
+            "up": opts.get("--up", "y"), "scale": scale, "offset": offset, "seed": seed,
+            "surface": len(pts), "volume": len(vol), "colour": 0 if colours is None else len(colours),
+            "spacing_m": spacing, "area_m2": area, "samples_sha256": sha256(out)}
+    log_step(asset, info)
+    print(f"forge: {len(pts)} surface, {len(vol)} volume samples, {spacing * 1000:.2f} mm apart, "
+          f"in {os.path.relpath(out, ROOT)}")
+
+
+# ---- the work package ----------------------------------------------------------------------------
+
+
+def rel(a, b):
+    return os.path.relpath(a, b)
+
+
+def module_of(cfg):
+    return os.path.splitext(os.path.basename(cfg["source"]))[0]
+
+
+def make_work(asset, fresh=False):
+    """The work package: a copy of the asset's source (`asset.wrela`) beside the reference's
+    samples, and the fit's misses (`fit.wrela`), its dependencies the source package's. Kept
+    across fits; `fresh` copies the source again."""
+    cfg = load_config(asset)
+    d = asset_dir(asset)
+    w = os.path.join(d, "work")
+    os.makedirs(w, exist_ok=True)
+    src = os.path.join(ROOT, cfg["source"])
+    copy = os.path.join(w, "asset.wrela")
+    # An author who edits the source after a fit means the edit: the copy is taken again.
+    edited = cfg.get("work_from_sha256") not in (None, sha256(src))
+    if edited and not fresh:
+        print(f"forge: {cfg['source']} changed since the work copy was taken: taking it again", file=sys.stderr)
+    if fresh or edited or not os.path.exists(copy):
+        shutil.copyfile(src, copy)
+        cfg["work_from_sha256"] = sha256(src)
+        save_config(asset, cfg)
+    samples = os.path.join(d, "reference", "samples.bin")
+    if os.path.exists(samples):
+        shutil.copyfile(samples, os.path.join(w, "samples.bin"))
+    elif os.path.exists(os.path.join(w, "samples.bin")):
+        os.remove(os.path.join(w, "samples.bin"))
+    with open(os.path.join(w, "wrela.toml"), "w") as f:
+        f.write(f"# The forge's work package for `{asset}` (tools/forge): a copy of its source and "
+                f"its reference's samples.\n[package]\nname = \"forge_{asset}\"\n\n[dependencies]\n"
+                f"engine = {{ path = \"{rel(os.path.join(ROOT, 'lib/engine'), w)}\" }}\n"
+                f"kit = {{ path = \"{rel(os.path.join(ROOT, 'lib/kit'), w)}\" }}\n")
+    return w
+
+
+def write_fit(asset, surface, volume, sigma):
+    cfg = load_config(asset)
+    w = os.path.join(asset_dir(asset), "work")
+    if not os.path.exists(os.path.join(w, "samples.bin")):
+        die(f"`{asset}` has no reference yet: `tools/forge reference` or `tools/forge synth` first")
+    m = surface + volume
+    with open(os.path.join(w, "fit.wrela"), "w") as f:
+        f.write(f"""// The fit's misses for `{asset}` (tools/forge): {surface} surface samples and {volume}
+// volume samples of its reference, over {sigma} m.
+
+use asset::{cfg['field']}
+use engine::judge::samples::{{misses, samples}}
+use std::string::Bytes
+
+const SAMPLES: Bytes = embed("samples.bin")
+
+pub fn residuals() -> [f32; {m}] {{
+    misses({cfg['field']}(), samples(SAMPLES), surface: {surface}, sigma: {sigma})
+}}
+""")
+
+
+def write_readability(asset):
+    """The judge's tool for an asset with no reference yet: its parts and their names alone."""
+    cfg = load_config(asset)
+    j = os.path.join(asset_dir(asset), "judge")
+    os.makedirs(j, exist_ok=True)
+    with open(os.path.join(j, "wrela.toml"), "w") as f:
+        f.write(f"[package]\nname = \"forge_{asset}_judge\"\n\n[dependencies]\n"
+                f"forge_{asset} = {{ path = \"../work\" }}\n")
+    with open(os.path.join(j, "main.wrela"), "w") as f:
+        f.write(f"""// The forge's judge for `{asset}` with no reference yet (tools/forge): its parts, as JSON.
+
+use forge_{asset}::asset::{cfg['field']}
+use std::field::Surface
+use std::io::print
+
+pub fn tool() -> u32 {{
+    let f = {cfg['field']}()
+    var line = String::from("{{\\"forge\\": \\"judge\\"")
+    line.push_str(f", \\"parts\\": {{f.parts()}}, \\"names\\": [")
+    for i in 0..f.parts() {{
+        let nm = f.part_name(i).name
+        line.push_str(if i == 0 {{ f"\\"{{nm}}\\"" }} else {{ f", \\"{{nm}}\\"" }})
+    }}
+    line.push_str("]}}")
+    print(line.as_str())
+    0
+}}
+""")
+    return j
+
+
+def write_judge(asset, brute, cell, views):
+    """The judge's tool package beside the work package: it prints one line of JSON."""
+    cfg = load_config(asset)
+    d = asset_dir(asset)
+    j = os.path.join(d, "judge")
+    os.makedirs(j, exist_ok=True)
+    with open(os.path.join(j, "wrela.toml"), "w") as f:
+        f.write(f"[package]\nname = \"forge_{asset}_judge\"\n\n[dependencies]\n"
+                f"engine = {{ path = \"{rel(os.path.join(ROOT, 'lib/engine'), j)}\" }}\n"
+                f"forge_{asset} = {{ path = \"../work\" }}\n")
+    view_code = ""
+    for name, frm, up in views:
+        view_code += (f"    let v = Ortho {{ centre: c, from: vec3({frm[0]}, {frm[1]}, {frm[2]}), "
+                      f"up: vec3({up[0]}, {up[1]}, {up[2]}), size: size }}\n"
+                      f"    let o = overlap(silhouette(f, v, n: 256), splatted(s, v, n: 256))\n"
+                      f"    line.push_str(f\", \\\"silhouette_{name}\\\": {{o}}\")\n")
+    with open(os.path.join(j, "main.wrela"), "w") as f:
+        f.write(f"""// The forge's judge for `{asset}` (tools/forge): its shape against its reference, its parts,
+// and its outlines from the concept views, as one line of JSON.
+
+use engine::judge::samples::{{BandScore, Ortho, SurfaceScores, judged, judged_brute, judged_by_height, judged_by_part, overlap, samples, silhouette, splatted}}
+use forge_{asset}::asset::{cfg['field']}
+use std::field::Surface
+use std::io::print
+use std::string::Bytes
+
+const SAMPLES: Bytes = embed("samples.bin")
+
+fn scores(line: mut String, key: str, x: SurfaceScores) {{
+    line.push_str(f", \\"{{key}}\\": {{{{\\"to_field_mean\\": {{x.to_field_mean}}, \\"to_field_p95\\": {{x.to_field_p95}}, \\"to_reference_mean\\": {{x.to_reference_mean}}, \\"to_reference_p95\\": {{x.to_reference_p95}}, \\"normal_mean\\": {{x.normal_mean}}, \\"normal_within\\": {{x.normal_within}}, \\"sides\\": {{x.sides}}, \\"field_points\\": {{x.field_points}}}}}}")
+}}
+
+pub fn tool() -> u32 {{
+    let f = {cfg['field']}()
+    let s = samples(SAMPLES)
+    var line = String::from("{{\\"forge\\": \\"judge\\"")
+    line.push_str(f", \\"parts\\": {{f.parts()}}, \\"names\\": [")
+    for i in 0..f.parts() {{
+        let nm = f.part_name(i).name
+        line.push_str(if i == 0 {{ f"\\"{{nm}}\\"" }} else {{ f", \\"{{nm}}\\"" }})
+    }}
+    line.push_str("]")
+    scores(mut line, "shape", judged(f, s, cell: {cell}))
+    {"scores(mut line, \"brute\", judged_brute(f, s, cell: " + str(cell) + "))" if brute else ""}
+    let by_p = judged_by_part(f, s)
+    line.push_str(", \\"by_part\\": [")
+    for i in 0..by_p.len() {{
+        let b = by_p[i]
+        let nm = f.part_name(i).name
+        if i > 0 {{ line.push_str(", ") }}
+        line.push_str(f"{{{{\\"name\\": \\"{{nm}}\\", \\"mean_mm\\": {{b.mean_mm}}, \\"p95_mm\\": {{b.p95_mm}}, \\"samples\\": {{b.count}}}}}}")
+    }}
+    line.push_str("]")
+    let by_h = judged_by_height(f, s, bands: 5)
+    line.push_str(", \\"by_height\\": [")
+    for i in 0..by_h.len() {{
+        let b = by_h[i]
+        if i > 0 {{ line.push_str(", ") }}
+        line.push_str(f"{{{{\\"y_lo_m\\": {{b.lo}}, \\"y_hi_m\\": {{b.hi}}, \\"mean_mm\\": {{b.mean_mm}}, \\"p95_mm\\": {{b.p95_mm}}, \\"samples\\": {{b.count}}}}}}")
+    }}
+    line.push_str("]")
+    let (lo, hi) = s.extent()
+    let c = 0.5 * (lo + hi)
+    let size = 1.1 * max(hi.x - lo.x, max(hi.y - lo.y, hi.z - lo.z))
+{view_code}    line.push_str("}}")
+    print(line.as_str())
+    0
+}}
+""")
+    return j
+
+
+def run(cmd, cwd=None, check=True, quiet=False):
+    p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    if check and p.returncode != 0:
+        sys.stderr.write(p.stdout[-4000:] + p.stderr[-8000:])
+        die(f"`{' '.join(cmd[:3])} ...` failed ({p.returncode})")
+    return p
+
+
+def last_json(text):
+    """The last JSON value in `text`: a line of it, or one printed over many lines."""
+    lines = text.splitlines()
+    for i in range(len(lines) - 1, -1, -1):
+        if lines[i].startswith("{"):
+            try:
+                return json.loads("\n".join(lines[i:]))
+            except ValueError:
+                try:
+                    return json.loads(lines[i])
+                except ValueError:
+                    continue
+    return None
+
+
+# ---- synthetic references ------------------------------------------------------------------------
+
+
+def cmd_synth(args):
+    """Samples of a known program: the program's field sampled by a wrela tool (its surface
+    found by the judge's own projection, its normals its gradient), so a fit to them has a known
+    answer."""
+    asset = args.pop(0)
+    opts = parse_opts(args, {"--program": 1, "--field": 1, "--cell": 1, "--seed": 1})
+    cfg = load_config(asset)
+    d = asset_dir(asset)
+    prog = os.path.abspath(opts.get("--program") or die("give --program <package dir>", 2))
+    field = opts.get("--field") or die("give --field <module::fn>", 2)
+    cell = float(opts.get("--cell", 0.004))
+    t = os.path.join(d, "synth")
+    os.makedirs(t, exist_ok=True)
+    toml = open(os.path.join(prog, "wrela.toml")).read()
+    pname = re.search(r'name\s*=\s*"([^"]+)"', toml).group(1)
+    module, fn = field.rsplit("::", 1)
+    with open(os.path.join(t, "wrela.toml"), "w") as f:
+        f.write(f"[package]\nname = \"forge_{asset}_synth\"\n\n[dependencies]\n"
+                f"engine = {{ path = \"{rel(os.path.join(ROOT, 'lib/engine'), t)}\" }}\n"
+                f"{pname} = {{ path = \"{rel(prog, t)}\" }}\n")
+    with open(os.path.join(t, "main.wrela"), "w") as f:
+        f.write(f"""// Samples of a known program for `{asset}` (tools/forge synth): its surface, its sides, as
+// numbers on lines, read back by the forge.
+
+use engine::judge::samples::{{projected, surface_points}}
+use {pname}::{module}::{fn}
+use std::field::{{Surface, hash_u32}}
+use std::io::print
+
+fn unit(k: u32) -> f32 {{
+    f32(hash_u32(k) >> 8) * (1.0 / 16777216.0)
+}}
+
+pub fn tool() -> u32 {{
+    let f = {fn}()
+    let b = f.bound()
+    let lo = b.centre - vec3(b.radius)
+    let hi = b.centre + vec3(b.radius)
+    let pts = surface_points(f, lo, hi, cell: {cell})
+    for q in pts {{
+        let (_, g) = projected(f, q)
+        let n = normalize(g)
+        print(f"s {{q.x}} {{q.y}} {{q.z}} {{n.x}} {{n.y}} {{n.z}}")
+    }}
+    var k = {int(opts.get('--seed', 11)) * 7919}
+    // Volume: near the surface each side, then through the whole box; each with its signed
+    // distance (the program's own, which is exact or a bound: a bound is less, never more).
+    var j = 0
+    while j < 3 * pts.len() / 10 {{
+        let i = hash_u32(k) % pts.len()
+        k += 3
+        let (_, g) = projected(f, pts[i])
+        let n = normalize(g)
+        let off = {cell} * (0.25 + 1.75 * unit(k))
+        let side = if unit(k + 1) < 0.5 {{ -1.0 }} else {{ 1.0 }}
+        k += 2
+        let p = pts[i] + n * (off * side)
+        print(f"v {{p.x}} {{p.y}} {{p.z}} {{f.distance(p)}}")
+        j += 1
+    }}
+    var box_lo = vec3(1.0e30)
+    var box_hi = vec3(-1.0e30)
+    for q in pts {{
+        box_lo = min(box_lo, q)
+        box_hi = max(box_hi, q)
+    }}
+    let ext = (box_hi - box_lo) * 0.1 + vec3({cell})
+    j = 0
+    while j < 3 * pts.len() / 10 {{
+        let u = vec3(unit(k), unit(k + 1), unit(k + 2))
+        k += 3
+        let p = box_lo - ext + u * (box_hi - box_lo + 2.0 * ext)
+        print(f"v {{p.x}} {{p.y}} {{p.z}} {{f.distance(p)}}")
+        j += 1
+    }}
+    0
+}}
+""")
+    p = run([WRELA, "tool", t, "--timeout", "3000"])
+    n = np()
+    s, v = [], []
+    for line in p.stdout.splitlines():
+        parts = line.split()
+        if parts and parts[0] == "s":
+            s.append([float(x) for x in parts[1:7]])
+        elif parts and parts[0] == "v":
+            v.append([float(x) for x in parts[1:5]])
+    s = n.array(s)
+    v = n.array(v)
+    os.makedirs(os.path.join(d, "reference"), exist_ok=True)
+    out = os.path.join(d, "reference", "samples.bin")
+    # Grid points projected crowd where the surface crosses cells at a slant; the spacing is the
+    # cell's.
+    write_samples(out, s[:, :3], s[:, 3:], v, None, cell)
+    log_step(asset, {"step": "reference", "kind": "synthetic", "program": rel(prog, ROOT),
+                     "field": field, "cell_m": cell, "surface": len(s), "volume": len(v),
+                     "spacing_m": cell, "samples_sha256": sha256(out),
+                     "program_sha256": tree_sha256(prog)})
+    print(f"forge: {len(s)} surface and {len(v)} volume samples of {field} in "
+          f"{os.path.relpath(out, ROOT)}")
+
+
+def tree_sha256(d):
+    h = hashlib.sha256()
+    for base, dirs, files in sorted(os.walk(d)):
+        dirs[:] = sorted(x for x in dirs if x not in ("build", "target"))
+        for f in sorted(files):
+            if f.endswith(".wrela") or f == "wrela.toml":
+                p = os.path.join(base, f)
+                h.update(os.path.relpath(p, d).encode() + b"\0" + open(p, "rb").read())
+    return h.hexdigest()
+
+
+# ---- literals ------------------------------------------------------------------------------------
+
+
+def code_of(text):
+    """`text` with its comments and strings blanked, the same length: what literals are counted in."""
+    out = []
+    i = 0
+    while i < len(text):
+        if text.startswith("//", i):
+            j = text.find("\n", i)
+            j = len(text) if j < 0 else j
+            out.append(" " * (j - i))
+            i = j
+        elif text[i] == '"':
+            j = i + 1
+            while j < len(text) and text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            out.append(" " * (j + 1 - i))
+            i = j + 1
+        else:
+            out.append(text[i])
+            i += 1
+    return "".join(out)
+
+
+def literals_of(path):
+    """The float literals in a .wrela file's code (what a lifted build lifts, §23.1): each with
+    its place and the name it is bound to, if a `const` or `let` binds it."""
+    text = open(path).read()
+    code = code_of(text)
+    spans = named_spans(code)
+    out = []
+    for m in NUM_FLOAT.finditer(code):
+        name = next((k for k, (a, b) in spans.items() if a <= m.start() < b), None)
+        out.append({"at": m.start(), "text": m.group(0), "name": name})
+    return out
+
+
+def work_name(work):
+    toml = open(os.path.join(work, "wrela.toml")).read()
+    return re.search(r'name\s*=\s*"([^"]+)"', toml).group(1)
+
+
+def named_spans(text):
+    """Each `pub const NAME` / `const NAME` / `let NAME` binding's byte span in a file."""
+    spans = {}
+    for m in re.finditer(r"^\s*(?:pub\s+)?(?:const|let|var)\s+([A-Za-z_][A-Za-z0-9_]*)\b[^=]*=", text, re.M):
+        start = m.end()
+        depth, i = 0, start
+        while i < len(text):
+            ch = text[i]
+            if ch in "([{":
+                depth += 1
+            elif ch in ")]}":
+                depth -= 1
+            elif ch == "\n" and depth <= 0:
+                break
+            i += 1
+        spans.setdefault(m.group(1), (start, i))
+    return spans
+
+
+NUM = re.compile(r"(?<![A-Za-z_0-9.])(-?(?:\d+\.\d+(?:[eE][-+]?\d+)?|\d+)(?:mm|cm|m|deg|rad)?)(?![A-Za-z_0-9.])")
+NUM_FLOAT = re.compile(r"(?<![A-Za-z_0-9.])(-?(?:\d+\.\d+(?:[eE][-+]?\d+)?(?:mm|cm|m|deg|rad)?|\d+(?:mm|cm|m|deg|rad)))(?![A-Za-z_0-9.])")
+UNIT_SCALE = {"": 1.0, "m": 1.0, "cm": 0.01, "mm": 0.001, "deg": math.pi / 180.0, "rad": 1.0}
+
+
+def split_num(tok):
+    """Splits a float/unit literal token like `3.5mm` into (value_in_unit, suffix, decimals)."""
+    for suf in ("mm", "cm", "deg", "rad", "m"):
+        if tok.endswith(suf):
+            body = tok[:-len(suf)]
+            dec = len(body.split(".")[1].split("e")[0].split("E")[0]) if "." in body else 1
+            return float(body), suf, dec
+    dec = len(tok.split(".")[1].split("e")[0].split("E")[0]) if "." in tok else 0
+    return float(tok), "", dec
+
+
+def cmd_scramble(args):
+    """Moves the work copy's literals bound to `names` off by up to `by` of themselves, each its
+    own way (seeded): what the fitter must undo in the synthetic test."""
+    asset = args.pop(0)
+    opts = parse_opts(args, {"--names": 1, "--by": 1, "--move": 1, "--seed": 1})
+    w = make_work(asset, fresh=True)
+    import random
+    rng = random.Random(int(opts.get("--seed", 3)))
+    by = float(opts.get("--by", 0.1))
+    move = float(opts.get("--move", 0.0))
+    path = os.path.join(w, "asset.wrela")
+    text = open(path).read()
+    spans = named_spans(text)
+    names = (opts.get("--names") or die("give --names A,B,...", 2)).split(",")
+    edits = []
+    for nm in names:
+        if nm not in spans:
+            die(f"the source binds no `{nm}`")
+        a, b = spans[nm]
+        for m in NUM_FLOAT.finditer(text, a, b):
+            v, suf, decimals = split_num(m.group(0))
+            if v == 0.0:
+                continue
+            # By a share of itself, or (`--move`) by up to that many metres, each its own way.
+            step = move / UNIT_SCALE[suf]
+            nv = v + step * (2.0 * rng.random() - 1.0) if move > 0 else v * (1.0 + by * (2.0 * rng.random() - 1.0))
+            edits.append((m.start(), m.end(), f"{nv:.{max(decimals, 4)}f}{suf}"))
+    for s0, e0, t in sorted(edits, reverse=True):
+        text = text[:s0] + t + text[e0:]
+    open(path, "w").write(text)
+    log_step(asset, {"step": "scramble", "names": names, "by": by, "move_m": move, "seed": int(opts.get("--seed", 3)),
+                     "literals": len(edits), "work_sha256": sha256(path)})
+    how = f"{move * 1000:g} mm" if move > 0 else f"{by:.0%}"
+    print(f"forge: scrambled {len(edits)} literals of {', '.join(names)} by up to {how}")
+
+
+# ---- the fit -------------------------------------------------------------------------------------
+
+DEFAULT_STAGES = [
+    {"name": "proportions", "surface": 768, "volume": 256, "steps": 40},
+    {"name": "parts", "surface": 1536, "volume": 512, "steps": 60},
+    {"name": "ornament", "surface": 2048, "volume": 512, "steps": 60},
+]
+
+
+def cmd_fit(args):
+    """Fits the work copy's literals, stage by stage, coarse to fine: each stage frees the names
+    its `free` lists (forge.json's `stages`) and fits the misses of its samples by `wrela solve
+    --fit`. `--starts K` tries K starting values for each stage's first literal (a motif's phase
+    along its path, say: a loss of many minima) and keeps the best. `--write` copies the fitted
+    copy over the source."""
+    asset = args.pop(0)
+    opts = parse_opts(args, {"--stage": -1, "--steps": 1, "--starts": 1, "--write": 0, "--sigma": 1, "--dry": 0})
+    dry = "--dry" in opts
+    cfg = load_config(asset)
+    stages = cfg.get("stages") or die("forge.json has no `stages`: name what each frees", 1)
+    only = opts.get("--stage") or []
+    w = make_work(asset)
+    sigma = float(opts.get("--sigma", 0.001))
+    logs = []
+    for st in stages:
+        if only and st["name"] not in only:
+            continue
+        surface, volume = st.get("surface", 1024), st.get("volume", 256)
+        write_fit(asset, surface, volume, sigma)
+        free = "asset.wrela:" + ",".join(st["free"])
+        steps = str(opts.get("--steps", st.get("steps", 60)))
+        starts = int(opts.get("--starts", st.get("starts", 1)))
+        best = None
+        tried = []
+        base_text = open(os.path.join(w, "asset.wrela")).read()
+        for k in range(starts):
+            text = base_text
+            if k > 0:
+                text = moved_first(base_text, st["free"][0], k, starts)
+            open(os.path.join(w, "asset.wrela"), "w").write(text)
+            began = time.time()
+            p = run([WRELA, "solve", w, "--fit", "fit::residuals", "--free", free, "--steps", steps,
+                     "--json"] + ([] if dry else ["--write"]), check=False)
+            rep = last_json(p.stdout) or {"solved": False, "why": p.stderr[-2000:]}
+            rep["seconds"] = round(time.time() - began, 1)
+            rep["start"] = k
+            tried.append({"start": k, "loss_after": rep.get("loss_after"), "seconds": rep["seconds"]})
+            if not rep.get("solved"):
+                die(f"stage {st['name']}: the solve failed: {rep.get('why', '')[-1500:]}")
+            if best is None or rep["loss_after"] < best[0]["loss_after"]:
+                best = (rep, open(os.path.join(w, "asset.wrela")).read())
+        rep, text = best
+        open(os.path.join(w, "asset.wrela"), "w").write(text)
+        dead = [f"{l['file']}:{l['line']} {l['text']}" for l in rep.get("literals", []) if not l.get("changes")]
+        entry = {"stage": st["name"], "free": st["free"], "surface": surface, "volume": volume,
+                 "sigma_m": sigma, "steps": rep.get("steps"), "loss_before": rep.get("loss_before"),
+                 "loss_after": rep.get("loss_after"), "literals": len(rep.get("literals", [])),
+                 "dead": dead, "starts": tried, "seconds": rep["seconds"]}
+        logs.append(entry)
+        os.makedirs(os.path.join(asset_dir(asset), "fits"), exist_ok=True)
+        with open(os.path.join(asset_dir(asset), "fits", f"{st['name']}.json"), "w") as f:
+            json.dump(rep, f, indent=2)
+        print(f"forge: fit {st['name']}: loss {rep.get('loss_before'):.4g} -> {rep.get('loss_after'):.4g} "
+              f"in {rep.get('steps')} steps over {entry['literals']} literals, {len(dead)} never moved, "
+              f"{rep['seconds']} s")
+    log_step(asset, {"step": "fit", "dry": dry, "stages": logs, "work_sha256": sha256(os.path.join(w, "asset.wrela"))})
+    if "--write" in opts and not dry:
+        src = os.path.join(ROOT, cfg["source"])
+        if cfg.get("work_from_sha256") and sha256(src) != cfg["work_from_sha256"]:
+            die(f"{cfg['source']} changed since the work copy was taken: not written over")
+        shutil.copyfile(os.path.join(w, "asset.wrela"), src)
+        cfg = load_config(asset)
+        cfg["work_from_sha256"] = sha256(src)
+        save_config(asset, cfg)
+        print(f"forge: wrote the fitted literals to {cfg['source']}")
+
+
+def moved_first(text, name, k, starts):
+    """`text` with the first literal bound to `name` moved to its k-th of `starts` starting values
+    (spread over ±50% of it)."""
+    spans = named_spans(text)
+    if name not in spans:
+        return text
+    a, b = spans[name]
+    m = NUM_FLOAT.search(text, a, b)
+    if not m:
+        return text
+    v, suf, dec = split_num(m.group(0))
+    nv = v * (0.5 + k / max(starts - 1, 1))
+    return text[:m.start()] + f"{nv:.{max(dec, 4)}f}{suf}" + text[m.end():]
+
+
+# ---- the judge -----------------------------------------------------------------------------------
+
+JUDGE_VIEWS = [
+    ("front", (0.0, 0.0, 1.0), (0.0, 1.0, 0.0)),
+    ("side", (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)),
+    ("top", (0.0, 1.0, 0.0), (0.0, 0.0, -1.0)),
+    ("three_quarter", (1.0, 0.6, 1.0), (0.0, 1.0, 0.0)),
+]
+
+
+def judge(asset, brute=False, of="work", cell=None):
+    """The asset's numbers: shape (both ways, mm), normals, sides, outlines from the concept
+    views, named parts, literals and those the fits never moved."""
+    cfg = load_config(asset)
+    w = make_work(asset, fresh=(of == "source"))
+    if os.path.exists(os.path.join(w, "samples.bin")):
+        spacing = read_samples(os.path.join(w, "samples.bin"))[3]
+        cell = cell or max(spacing, 0.002)
+        j = write_judge(asset, brute, cell, JUDGE_VIEWS)
+        # (`embed` reads only inside its package: the judge has its own copy of the samples.)
+        shutil.copyfile(os.path.join(w, "samples.bin"), os.path.join(j, "samples.bin"))
+    else:
+        j = write_readability(asset)
+    began = time.time()
+    p = run([WRELA, "tool", j, "--timeout", "3000"])
+    out = last_json(p.stdout) or die("the judge printed no scores")
+    out["seconds"] = round(time.time() - began, 1)
+    lits = literals_of(os.path.join(w, "asset.wrela"))
+    out["literals"] = len(lits)
+    dead = set()
+    for st in cfg.get("chain", []):
+        if st.get("step") == "fit":
+            for s in st.get("stages", []):
+                dead.update(s.get("dead", []))
+    out["literals_never_moved"] = len(dead)
+    out["cell_m"] = cell
+    out["named_parts"] = sum(1 for n in out.get("names", []) if n)
+    if not os.path.exists(os.path.join(w, "samples.bin")):
+        out["reference"] = "none yet: shape, outlines and look are measured against a reference"
+    return out
+
+
+def cmd_judge(args):
+    asset = args.pop(0)
+    opts = parse_opts(args, {"--brute": 0, "--of": 1, "--cell": 1})
+    out = judge(asset, brute="--brute" in opts, of=opts.get("--of", "work"),
+                cell=float(opts["--cell"]) if "--cell" in opts else None)
+    d = asset_dir(asset)
+    with open(os.path.join(d, "scores.json"), "w") as f:
+        json.dump(out, f, indent=2)
+    log_step(asset, {"step": "judge", "of": opts.get("--of", "work"), "scores": out})
+    print(json.dumps(out, indent=2))
+
+
+# ---- the look ------------------------------------------------------------------------------------
+
+
+def load_rgb(path):
+    n = np()
+    from PIL import Image
+    return n.asarray(Image.open(path).convert("RGB"), dtype=n.float64) / 255.0
+
+
+def lab(rgb):
+    """CIE L*a*b* (D65) of sRGB."""
+    n = np()
+    lin = srgb_to_linear(rgb)
+    m = n.array([[0.4124, 0.3576, 0.1805], [0.2126, 0.7152, 0.0722], [0.0193, 0.1192, 0.9505]])
+    xyz = lin @ m.T / n.array([0.95047, 1.0, 1.08883])
+    f = n.where(xyz > 0.008856, n.cbrt(xyz), 7.787 * xyz + 16 / 116)
+    return n.stack([116 * f[..., 1] - 16, 500 * (f[..., 0] - f[..., 1]), 200 * (f[..., 1] - f[..., 2])], -1)
+
+
+def look_scores(render, concept, background=None):
+    """A render against a concept image of the same view: the render's exposure matched to the
+    concept's over the object (a scale of its linear light), then the mean colour difference (ΔE,
+    CIE76) and the structure's agreement (SSIM of lightness, 8 px windows) over the object, which
+    is where the concept differs from its plain background (or `background`'s mask)."""
+    n = np()
+    from PIL import Image
+    c = concept
+    r = render
+    if r.shape != c.shape:
+        r = n.asarray(Image.fromarray((r * 255).astype("uint8")).resize((c.shape[1], c.shape[0]), Image.BILINEAR),
+                      dtype=n.float64) / 255.0
+    if background is None:
+        # The concept's background is plain: the median of its border.
+        border = n.r_[c[0], c[-1], c[:, 0], c[:, -1]]
+        bg = n.median(border, axis=0)
+        mask = n.linalg.norm(c - bg, axis=-1) > 0.06
+    else:
+        mask = background
+    if mask.sum() < 16:
+        return {"error": "the concept image shows no object against its background"}
+    rl, cl = srgb_to_linear(r), srgb_to_linear(c)
+    lum = lambda x: (x @ n.array([0.2126, 0.7152, 0.0722]))
+    k = lum(cl)[mask].mean() / max(lum(rl)[mask].mean(), 1e-6)
+    matched = n.clip(rl * k, 0, 1)
+    enc = n.where(matched <= 0.0031308, matched * 12.92, 1.055 * matched ** (1 / 2.4) - 0.055)
+    de = n.linalg.norm(lab(enc) - lab(c), axis=-1)[mask].mean()
+    L1, L2 = lab(enc)[..., 0], lab(c)[..., 0]
+    ssims = []
+    h, wd = L1.shape
+    for y in range(0, h - 8, 8):
+        for x in range(0, wd - 8, 8):
+            if mask[y:y + 8, x:x + 8].mean() < 0.5:
+                continue
+            a, b = L1[y:y + 8, x:x + 8], L2[y:y + 8, x:x + 8]
+            ma, mb = a.mean(), b.mean()
+            va, vb = a.var(), b.var()
+            cov = ((a - ma) * (b - mb)).mean()
+            c1, c2 = (0.01 * 100) ** 2, (0.03 * 100) ** 2
+            ssims.append(((2 * ma * mb + c1) * (2 * cov + c2)) / ((ma * ma + mb * mb + c1) * (va + vb + c2)))
+    return {"exposure_scale": float(k), "delta_e": float(de),
+            "ssim": float(n.mean(ssims)) if ssims else 0.0, "pixels": int(mask.sum())}
+
+
+def cmd_look(args):
+    asset = args.pop(0)
+    opts = parse_opts(args, {"--render": 1, "--concept": 1})
+    out = look_scores(load_rgb(opts["--render"]), load_rgb(opts["--concept"]))
+    log_step(asset, {"step": "look", "render": opts["--render"], "concept": opts["--concept"], "scores": out})
+    print(json.dumps(out, indent=2))
+
+
+# ---- the record ----------------------------------------------------------------------------------
+
+
+def record_path(cfg):
+    """Where an asset's record lives: beside its source for a gold asset (`gold` in forge.json),
+    else in its forge folder (a test's, a trial's)."""
+    if cfg.get("gold"):
+        return os.path.splitext(os.path.join(ROOT, cfg["source"]))[0] + ".provenance.json"
+    return os.path.join(asset_dir(cfg["asset"]), "provenance.json")
+
+
+def cmd_record(args):
+    """Writes the asset's provenance record: the brief, each prompt, the image and reference
+    models and their versions and seeds, the reference's hashes, each step's command and what it
+    made (each fit's settings, losses and literals never moved), and the judge's scores."""
+    asset = args.pop(0)
+    cfg = load_config(asset)
+    d = asset_dir(asset)
+    src = os.path.join(ROOT, cfg["source"])
+    rec = {
+        "asset": asset,
+        "source": cfg["source"],
+        "source_sha256": sha256(src),
+        "field": cfg["field"],
+        "size_m": cfg["size"],
+        "brief": open(os.path.join(d, "brief.md")).read().strip(),
+        "prompts": json.load(open(os.path.join(d, "prompts.json"))) if os.path.exists(os.path.join(d, "prompts.json")) else [],
+        "concepts": cfg.get("concepts", []),
+        "stages": cfg.get("stages", []),
+        "chain": cfg.get("chain", []),
+        "recorded": now(),
+        "revision": run(["git", "-C", ROOT, "rev-parse", "HEAD"], check=False).stdout.strip(),
+    }
+    out = record_path(cfg)
+    with open(out, "w") as f:
+        json.dump(rec, f, indent=2)
+        f.write("\n")
+    print(f"forge: recorded {os.path.relpath(out, ROOT)}")
+
+
+# What each step's record is held to on replay: the hashes it made, and its scores.
+REPLAYED = {
+    "prompts": ["prompts_sha256"],
+    "reference": ["samples_sha256"],
+    "synth": ["samples_sha256"],
+    "scramble": ["work_sha256"],
+    "fit": ["work_sha256"],
+    "judge": ["scores"],
+}
+
+
+def cmd_replay(args):
+    """Runs an asset's chain again from its record, step by step, in a scratch asset of its own
+    (`<asset>__replay`), and compares what each step made with what the record says it made: the
+    prompts' and samples' hashes, the work copy's after each scramble and fit, the judge's
+    scores. A reference made from a mesh is made again from the kept mesh, checked against the
+    record's hash first."""
+    asset = args.pop(0)
+    cfg = load_config(asset)
+    rec = json.load(open(record_path(cfg)))
+    twin = asset + "__replay"
+    d = asset_dir(twin)
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(d)
+    shutil.copyfile(os.path.join(asset_dir(asset), "brief.md"), os.path.join(d, "brief.md"))
+    save_config(twin, {"asset": twin, "source": rec["source"], "field": rec["field"],
+                       "size": rec["size_m"], "stages": rec["stages"], "chain": []})
+    failed = []
+    for i, st in enumerate(rec["chain"]):
+        cmd = st.get("command")
+        if cmd not in REPLAYED:
+            continue
+        if cmd == "reference" and st.get("mesh") and sha256(os.path.join(ROOT, st["mesh"])) != st["mesh_sha256"]:
+            failed.append(f"step {i} ({cmd}): the kept mesh isn't the record's")
+            continue
+        args = list(st.get("args", []))
+        if cmd == "reference" and "--mesh" in args:
+            # The mesh as the record kept it (its hash checked above), wherever it first came from.
+            args[args.index("--mesh") + 1] = os.path.join(ROOT, st["mesh"])
+        RUNNING["command"], RUNNING["args"] = cmd, args
+        try:
+            COMMANDS[cmd]([twin] + args)
+        except SystemExit as e:
+            if e.code:
+                failed.append(f"step {i} ({cmd}): failed ({e.code})")
+                continue
+        again = load_config(twin)["chain"][-1]
+        for key in REPLAYED[cmd]:
+            a, b = st.get(key), again.get(key)
+            if key == "scores":
+                a = {k: v for k, v in (a or {}).items() if k != "seconds"}
+                b = {k: v for k, v in (b or {}).items() if k != "seconds"}
+            if a != b:
+                failed.append(f"step {i} ({cmd}): {key} differs")
+        print(f"forge: replay: step {i} ({cmd} {' '.join(st.get('args', []))}): "
+              + ("the same" if not failed or not failed[-1].startswith(f"step {i} ") else "DIFFERS"))
+    print("forge: replay: " + ("the chain holds, every step the same" if not failed else "differs: " + "; ".join(failed)))
+    sys.exit(1 if failed else 0)
+
+
+# ---- options -------------------------------------------------------------------------------------
+
+
+def parse_opts(args, takes):
+    """`--name value` options (`takes[name]` values; -1 for repeatable), and flags (0)."""
+    out = {}
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a not in takes:
+            die(f"unknown option `{a}`", 2)
+        k = takes[a]
+        if k == 0:
+            out[a] = True
+            i += 1
+        elif k == -1:
+            out.setdefault(a, []).append(args[i + 1])
+            i += 2
+        else:
+            if i + 1 >= len(args):
+                die(f"`{a}` takes a value", 2)
+            out[a] = args[i + 1]
+            i += 2
+    return out
+
+
+COMMANDS = {
+    "new": cmd_new, "prompts": cmd_prompts, "lint": cmd_lint, "reference": cmd_reference,
+    "synth": cmd_synth, "scramble": cmd_scramble, "fit": cmd_fit, "judge": cmd_judge,
+    "look": cmd_look, "record": cmd_record, "replay": cmd_replay,
+}
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__)
+        return 2
+    cmd = argv[0]
+    if cmd == "test":
+        import importlib.util
+        from importlib.machinery import SourceFileLoader
+        path = os.path.join(ROOT, "tools", "forge-test")
+        spec = importlib.util.spec_from_loader("forge_test", SourceFileLoader("forge_test", path))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.main()
+    if cmd not in COMMANDS:
+        die(f"no command `{cmd}`", 2)
+    if cmd != "lint" and len(argv) < 2:
+        die(f"`{cmd}` takes an asset", 2)
+    RUNNING["command"], RUNNING["args"] = cmd, list(argv[2:])
+    COMMANDS[cmd](argv[1:])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

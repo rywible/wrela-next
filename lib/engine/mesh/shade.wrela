@@ -240,7 +240,7 @@ fn vary_substance(vary: MeshVary) -> Substance {
         subsurface: clamp(vary.optics.y, 0.0, 1.0),
         coat: clamp(vary.optics.z, 0.0, 1.0),
         micro: clamp(vary.optics.w, 0.0, 1.0),
-        pad0: 0.0,
+        bump: 0.0,
         pad1: 0.0,
         pad2: 0.0,
     }
@@ -379,6 +379,44 @@ fn apply_micro_relief_rigid(
     })
 }
 
+/// Mikkelsen (2010) surface-gradient bump perturbation from a material's physical height offset
+/// `sub.bump` (in metres: wood pores, leather grain, blind tooling, carved micro-relief) using
+/// pre-computed screen derivatives `(dwx, dwy, dbx, dby)`. Guarded against silhouette depth jumps
+/// and view-hemisphere flips so steep carved crests never produce backface artifacts.
+fn apply_bump_grad(
+    dwx: vec3,
+    dwy: vec3,
+    dbx: f32,
+    dby: f32,
+    n: vec3,
+    sub: Substance,
+    ray_back: vec3,
+    quad_ok: bool,
+) -> vec3 {
+    if !quad_ok || abs(dbx) + abs(dby) <= 1.0e-9 {
+        return n
+    }
+    let r1 = cross(dwy, n)
+    let r2 = cross(n, dwx)
+    let det = dot(dwx, r1)
+    if abs(det) <= 1.0e-12 {
+        return n
+    }
+    let px_span = sqrt(abs(det))
+    let bump_fade = clamp(1.0 - (px_span - 0.008) / 0.025, 0.0, 1.0)
+    let quad_jump = max(length(dwx), length(dwy))
+    if bump_fade <= 0.01 || quad_jump >= 0.05 {
+        return n
+    }
+    let g_raw = (r1 * dbx + r2 * dby) * (1.0 / det)
+    let coat_fill = 1.0 - 0.35 * clamp(sub.coat, 0.0, 1.0)
+    let g_scaled = g_raw * (bump_fade * coat_fill)
+    let gl = length(g_scaled)
+    let g_clamped = if gl > 0.78 { g_scaled * (0.78 / gl) } else { g_scaled }
+    let n_try = normalize(n - g_clamped)
+    if dot(n_try, n) > 0.55 && dot(n_try, ray_back) > 0.06 { n_try } else { n }
+}
+
 /// Applies per-pixel 3D field-space microsurface relief using hardware quad screen derivatives.
 fn apply_micro_relief(
     wp: vec3,
@@ -388,16 +426,28 @@ fn apply_micro_relief(
     dist: f32,
     may_micro: bool = true,
     may_coat: bool = true,
+    may_bump: bool = false,
+    ray_back: vec3 = vec3(0.0, 1.0, 0.0),
 ) -> (vec3, Substance) {
-    if !may_micro {
+    if !may_micro && !may_bump {
         return (n, sub)
     }
     // Derivatives first, while every pixel of the quad still runs this code.
     let dwx = dpdx(wp)
     let dwy = dpdy(wp)
-    let dmx = dpdx(mp)
-    let dmy = dpdy(mp)
-    apply_micro_relief_deriv(dwx, dwy, dmx, dmy, mp, n, sub, dist, may_micro, may_coat)
+    let dmx = if may_micro { dpdx(mp) } else { vec3(0.0) }
+    let dmy = if may_micro { dpdy(mp) } else { vec3(0.0) }
+    let n_cur = if may_bump {
+        let dbx = dpdx(sub.bump)
+        let dby = dpdy(sub.bump)
+        apply_bump_grad(dwx, dwy, dbx, dby, n, sub, ray_back, quad_ok: true)
+    } else {
+        n
+    }
+    if !may_micro {
+        return (n_cur, sub)
+    }
+    apply_micro_relief_deriv(dwx, dwy, dmx, dmy, mp, n_cur, sub, dist, may_micro, may_coat)
 }
 
 /// Resolves crease-preserving shading normal from interpolated analytic normal and explicit
@@ -413,7 +463,7 @@ fn resolve_normal_exact(fraw: vec3, normal: vec3, smooth: f32, ray_back: vec3) -
             nf = -nf
         }
     }
-    if smooth < 0.5 || dot(nv, nf) < 0.85 { nf } else { nv }
+    if smooth < 0.5 || dot(nv, nf) < 0.65 { nf } else { nv }
 }
 
 /// Resolves crease-preserving shading normal from interpolated analytic normal and face derivatives.
@@ -450,7 +500,7 @@ fn sanitize_substance(sub: Substance, facts: FieldFacts) -> Substance {
         subsurface: finite_clamp(sub.subsurface, lo: 0.0, hi: 1.0, fallback: 0.0),
         coat: finite_clamp(sub.coat, lo: 0.0, hi: 1.0, fallback: 0.0),
         micro: finite_clamp(sub.micro, lo: 0.0, hi: 1.0, fallback: 0.0),
-        pad0: 0.0,
+        bump: finite_clamp(sub.bump, lo: -0.05, hi: 0.05, fallback: 0.0),
         pad1: 0.0,
         pad2: 0.0,
     }
@@ -479,12 +529,22 @@ pub(package) fn shade_gbuf_rigid(
     v: View,
     prev_v: View,
     facts: FieldFacts = FieldFacts::unknown(),
+    bump_quad_ok: bool = false,
+    dwx: vec3 = vec3(0.0),
+    dwy: vec3 = vec3(0.0),
+    dbx: f32 = 0.0,
+    dby: f32 = 0.0,
 ) -> Targets4<vec4, vec4, vec4, vec2> {
     let sub_in = sanitize_substance(sub0, facts)
     let to_eye = v.at - wp
     let dist = length(to_eye)
     let ray_back = UnitNormal::normalize_safe(to_eye, -v.forward).v
     let n0 = resolve_normal_exact(face_n, normal, smooth, ray_back)
+    let n_bump = if facts.may_bump {
+        apply_bump_grad(dwx, dwy, dbx, dby, n0, sub_in, ray_back, bump_quad_ok)
+    } else {
+        n0
+    }
     let sub_nyq = if facts.may_micro {
         let att = nyquist_micro_atten(dist, v.pixel(), facts.max_freq)
         Substance { micro: sub_in.micro * att, ..sub_in }
@@ -494,7 +554,7 @@ pub(package) fn shade_gbuf_rigid(
     let (n, sub) = apply_micro_relief_rigid(
         xf,
         mp,
-        n0,
+        n_bump,
         sub_nyq,
         dist,
         facts.may_micro,
@@ -590,19 +650,34 @@ fn shade_gbuf_core(
     v: View,
     prev_v: View,
     facts: FieldFacts = FieldFacts::unknown(),
+    exact_normal: bool = false,
 ) -> Targets4<vec4, vec4, vec4, vec2> {
     let sub_in = sanitize_substance(sub0, facts)
     let to_eye = v.at - wp
     let dist = length(to_eye)
     let ray_back = UnitNormal::normalize_safe(to_eye, -v.forward).v
-    let n0 = resolve_normal_from(wp, normal, smooth, ray_back)
+    let n0 = if exact_normal {
+        UnitNormal::normalize_safe(normal, ray_back).v
+    } else {
+        resolve_normal_from(wp, normal, smooth, ray_back)
+    }
     let sub_nyq = if facts.may_micro {
         let att = nyquist_micro_atten(dist, v.pixel(), facts.max_freq)
         Substance { micro: sub_in.micro * att, ..sub_in }
     } else {
         sub_in
     }
-    let (n, sub) = apply_micro_relief(wp, mp, n0, sub_nyq, dist, facts.may_micro, facts.may_coat)
+    let (n, sub) = apply_micro_relief(
+        wp,
+        mp,
+        n0,
+        sub_nyq,
+        dist,
+        facts.may_micro,
+        facts.may_coat,
+        facts.may_bump && !exact_normal,
+        ray_back,
+    )
     let motion = motion_of(wp, prev_wp, v, prev_v)
     let emits = if facts.may_emit {
         if facts.channels_proven {
@@ -857,7 +932,7 @@ pub(package) fn exact_box_one_fs<M: Field<Substance>>(
     }
     let (_, gv) = value_and_gradient(|q: vec3| field.distance_live(q, live), hit_p)
     let n = UnitNormal::normalize_safe(gv, -d).v
-    let out = shade_gbuf_core(hit_p, hit_p, hit_p, n, 1.0, sub0, v, prev_v, facts)
+    let out = shade_gbuf_core(hit_p, hit_p, hit_p, n, 1.0, sub0, v, prev_v, facts, exact_normal: true)
     WithDepthBehind { color: out, depth: depth_of(v, hit_p) }
 }
 

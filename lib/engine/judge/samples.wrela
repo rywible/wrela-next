@@ -1,0 +1,636 @@
+// The asset judge's surfaces (docs/forge.md, "The judge"): how far a field's surface is from a
+// reference's, in numbers, in place of looking. A reference is samples: points on its surface with
+// their normals, points known to be inside or outside it, and points with their colour, as the
+// forge turns a reference mesh (or a field) into them (tools/forge, `samples.bin`). Every number
+// here is computed on the CPU, from the field's own code, the same on every machine.
+//
+//   misses(field, samples, surface, sigma)   the fitter's: how far each of M samples misses, over
+//                                            `sigma` (the field's value at a surface sample; how
+//                                            far a volume sample is on the wrong side)
+//   judged(field, samples, cell)             the judge's: both ways' distances (mean and 95th
+//                                            percentile, mm), normals' agreement, sides
+//   judged_brute(field, samples, cell)       the same by brute force, another way: the field's
+//                                            surface found by sign changes on a grid (no
+//                                            gradient, no projection), every pair of points
+//                                            compared, normals by central differences
+//   silhouette(field, view, n) / splatted    a view's outline, the field's traced, the
+//                                            reference's from its samples; `overlap` of two
+//
+// Distances to the reference are to its surface as its samples say it is: to the plane of the
+// nearest sample, as far as the samples' spacing reaches along it, so a reference sampled 3 mm
+// apart can still say a surface is 0.2 mm off.
+
+use std::collections::Vec
+use std::field::Surface
+use std::string::Bytes
+
+/// "WFS1" as a little-endian `u32`: the first bytes of a samples file.
+pub const MAGIC: u32 = 827541079
+
+/// The bytes of a samples file's head: its magic, its counts of surface, volume and colour
+/// samples, and the surface samples' spacing (m, `f32`), then padding to 32.
+pub const HEAD: u32 = 32
+
+/// A reference's samples (`samples`).
+pub struct Samples: Copy {
+    pub bytes: Bytes,
+    pub surface: u32,
+    pub volume: u32,
+    pub colour: u32,
+    /// How far apart its surface samples are, about (m).
+    pub spacing: f32,
+}
+
+/// The samples in `bytes` (a samples file, as tools/forge writes it).
+pub fn samples(bytes: Bytes) -> Samples {
+    if bytes.len() < HEAD || bytes.u32_le(0) != MAGIC {
+        panic("samples: not a samples file (its magic isn't WFS1)")
+    }
+    let s = Samples {
+        bytes,
+        surface: bytes.u32_le(4),
+        volume: bytes.u32_le(8),
+        colour: bytes.u32_le(12),
+        spacing: bytes.f32_le(16),
+    }
+    if bytes.len() != HEAD + 24 * s.surface + 16 * s.volume + 24 * s.colour {
+        panic("samples: its length isn't what its counts say")
+    }
+    s
+}
+
+impl Samples {
+    fn v3(self, at: u32) -> vec3 {
+        vec3(self.bytes.f32_le(at), self.bytes.f32_le(at + 4), self.bytes.f32_le(at + 8))
+    }
+
+    /// Surface sample `i`'s place.
+    pub fn point(self, i: u32) -> vec3 {
+        self.v3(HEAD + 24 * i)
+    }
+
+    /// Surface sample `i`'s normal (unit, outward).
+    pub fn normal(self, i: u32) -> vec3 {
+        self.v3(HEAD + 24 * i + 12)
+    }
+
+    /// Volume sample `j`: its place, and its signed distance from the reference's surface
+    /// (negative inside; its sign is its side).
+    pub fn side(self, j: u32) -> vec4 {
+        let at = HEAD + 24 * self.surface + 16 * j
+        vec4(self.v3(at), self.bytes.f32_le(at + 12))
+    }
+
+    /// Colour sample `k`: its place and its colour (linear RGB).
+    pub fn coloured(self, k: u32) -> (vec3, vec3) {
+        let at = HEAD + 24 * self.surface + 16 * self.volume + 24 * k
+        (self.v3(at), self.v3(at + 12))
+    }
+
+    /// The box round its surface samples.
+    pub fn extent(self) -> (vec3, vec3) {
+        var lo = vec3(1.0e30)
+        var hi = vec3(-1.0e30)
+        for i in 0..self.surface {
+            let p = self.point(i)
+            lo = min(lo, p)
+            hi = max(hi, p)
+        }
+        (lo, hi)
+    }
+}
+
+// ---- the fitter's misses ------------------------------------------------------------------------
+
+/// How far each of `M` samples misses `field`, over `sigma` (m): the first `surface` of them
+/// surface samples spread evenly over all of them, each the field's value there (0 where the
+/// surface passes through it); the rest volume samples spread evenly, each how far the field puts
+/// it on the wrong side, and, where the reference is within `sigma` times four of it, how far the
+/// field's value is from the reference's distance (a quarter as much). The volume samples fill the
+/// reference's box, so a fit can't satisfy the surface samples by growing surface the reference
+/// hasn't. A least-squares fit of these (`wrela solve --fit`) pulls the surface through the
+/// reference. Nothing here allocates, so `std::lift::jacobian` derives it.
+pub fn misses<S: Surface, const M: u32>(
+    field: S,
+    s: Samples,
+    surface: u32,
+    sigma: f32,
+) -> [f32; M] {
+    var r = [0.0; M]
+    let n = min(surface, M)
+    for i in 0..n {
+        let k = u32(u64(i) * u64(s.surface) / u64(max(n, 1)))
+        r[i] = field.distance(s.point(k)) / sigma
+    }
+    let v = M - n
+    for j in 0..v {
+        let k = u32(u64(j) * u64(s.volume) / u64(max(v, 1)))
+        let q = s.side(k)
+        let d = field.distance(q.xyz)
+        let wrong = max(0.0, -sign(q.w) * d)
+        let near = if abs(q.w) < 4.0 * sigma { 0.25 * (d - q.w) } else { 0.0 }
+        r[n + j] = (wrong + near) / sigma
+    }
+    r
+}
+
+// ---- the judge ----------------------------------------------------------------------------------
+
+/// A field's shape against a reference, in numbers.
+pub struct SurfaceScores: Copy {
+    /// From each reference surface sample to the field's surface (mm): mean, 95th percentile.
+    pub to_field_mean: f32,
+    pub to_field_p95: f32,
+    /// From the field's surface to the reference's (mm): mean, 95th percentile.
+    pub to_reference_mean: f32,
+    pub to_reference_p95: f32,
+    /// The angle between the field's normal and each reference sample's (degrees): mean, and the
+    /// share within 10°.
+    pub normal_mean: f32,
+    pub normal_within: f32,
+    /// The share of volume samples the field puts on their own side.
+    pub sides: f32,
+    /// How many points of the field's surface were measured.
+    pub field_points: u32,
+}
+
+/// The value at share `q` (0 to 1) of `xs`, sorted.
+fn percentile(xs: mut Vec<f32>, q: f32) -> f32 {
+    if xs.len() == 0 {
+        return 0.0
+    }
+    xs.sort_by(|a: f32, b: f32| a < b)
+    xs[min(u32(q * f32(xs.len() - 1) + 0.5), xs.len() - 1)]
+}
+
+fn mean(xs: Vec<f32>) -> f32 {
+    var s = 0.0
+    for x in xs {
+        s += x
+    }
+    s / f32(max(xs.len(), 1))
+}
+
+/// `p` moved onto `field`'s surface by Newton steps along its gradient (at most 16), and the
+/// gradient there.
+pub fn projected<S: Surface>(field: S, p: vec3) -> (vec3, vec3) {
+    var q = p
+    var g = vec3(0.0, 1.0, 0.0)
+    for _ in 0..16 {
+        let (d, gq) = field.sample(q)
+        let g2 = dot(gq, gq)
+        // (A gradient that is no number, or none, where the field has a ridge: stop there.)
+        if !(g2 >= 1.0e-12) {
+            break
+        }
+        g = gq
+        if abs(d) < 1.0e-7 {
+            break
+        }
+        q = q - gq * (d / g2)
+    }
+    (q, g)
+}
+
+/// How far `q` is from the reference's surface as sample `i` (at `p`, normal `n`) says it is: to
+/// the sample's plane, as far as half the samples' spacing reaches along it, and straight to it
+/// beyond.
+fn to_sample(q: vec3, p: vec3, n: vec3, spacing: f32) -> f32 {
+    let v = q - p
+    let along = dot(v, n)
+    let across = max(length(v - n * along) - 0.5 * spacing, 0.0)
+    sqrt(along * along + across * across)
+}
+
+/// A grid of the reference's surface samples, for finding the nearest (`Grid::nearest`).
+struct Grid {
+    lo: vec3,
+    cell: f32,
+    dims: vec3u,
+    starts: Vec<u32>,
+    items: Vec<u32>,
+}
+
+fn grid_of(s: Samples, cell: f32) -> Grid {
+    let (lo0, hi0) = s.extent()
+    let lo = lo0 - vec3(cell)
+    let n = vec3u(max((hi0 - lo) / cell + vec3(2.0), vec3(1.0)))
+    let cells = n.x * n.y * n.z
+    var counts = Vec::filled(cells + 1, 0)
+    for i in 0..s.surface {
+        let c = cell_index(s.point(i), lo, cell, n)
+        counts[c + 1] += 1
+    }
+    for c in 0..cells {
+        counts[c + 1] += counts[c]
+    }
+    var fill = Vec::filled(cells, 0)
+    var items = Vec::filled(s.surface, 0)
+    for i in 0..s.surface {
+        let c = cell_index(s.point(i), lo, cell, n)
+        items[counts[c] + fill[c]] = i
+        fill[c] += 1
+    }
+    Grid { lo, cell, dims: n, starts: counts, items }
+}
+
+fn cell_of(p: vec3, lo: vec3, cell: f32, n: vec3u) -> vec3u {
+    vec3u(clamp(floor((p - lo) / cell), vec3(0.0), vec3(n) - vec3(1.0)))
+}
+
+fn cell_index(p: vec3, lo: vec3, cell: f32, n: vec3u) -> u32 {
+    let c = cell_of(p, lo, cell, n)
+    c.x + n.x * (c.y + n.y * c.z)
+}
+
+impl Grid {
+    /// The surface sample nearest `q` by the judge's measure (`to_sample`: to its plane, as far
+    /// as half the spacing reaches), searching rings of cells out from `q`'s, four at most, until
+    /// the ring searched holds one nearer than any farther ring can; the sample's index.
+    fn nearest(self, s: Samples, q: vec3) -> u32 {
+        let c = cell_of(q, self.lo, self.cell, self.dims)
+        var best = 0
+        var best_d = 1.0e30
+        for r in 1..5 {
+            let lo = vec3i(c) - vec3i(i32(r))
+            let hi = vec3i(c) + vec3i(i32(r))
+            for z in max(lo.z, 0)..min(hi.z + 1, i32(self.dims.z)) {
+                for y in max(lo.y, 0)..min(hi.y + 1, i32(self.dims.y)) {
+                    for x in max(lo.x, 0)..min(hi.x + 1, i32(self.dims.x)) {
+                        let ci = u32(x) + self.dims.x * (u32(y) + self.dims.y * u32(z))
+                        for k in self.starts[ci]..self.starts[ci + 1] {
+                            let i = self.items[k]
+                            let d = to_sample(q, s.point(i), s.normal(i), s.spacing)
+                            if d < best_d {
+                                best_d = d
+                                best = i
+                            }
+                        }
+                    }
+                }
+            }
+            // Found within the ring searched: a sample in a farther ring is at least r cells away,
+            // less the half spacing the measure forgives.
+            if best_d < f32(r) * self.cell - 0.5 * s.spacing {
+                return best
+            }
+        }
+        best
+    }
+}
+
+/// The field's surface as points: each point of a grid `cell` m apart over the reference's box
+/// (and `cell` round it) that is within a cell of the surface by the field's value, moved onto the
+/// surface (`projected`).
+pub fn surface_points<S: Surface>(field: S, lo: vec3, hi: vec3, cell: f32) -> Vec<vec3> {
+    var out = Vec::new()
+    let a = lo - vec3(cell)
+    let n = vec3u((hi - lo) / cell + vec3(3.0))
+    for z in 0..n.z {
+        for y in 0..n.y {
+            for x in 0..n.x {
+                let p = a + vec3(f32(x), f32(y), f32(z)) * cell
+                if abs(field.distance(p)) < 0.75 * cell {
+                    let (q, _) = projected(field, p)
+                    if abs(field.distance(q)) < 1.0e-5 {
+                        out.push(q)
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `field` against the reference `s`: each reference sample projected onto the field, and the
+/// field's surface (a grid `cell` m apart, projected) measured to the reference's.
+pub fn judged<S: Surface>(field: S, s: Samples, cell: f32) -> SurfaceScores {
+    var to_field = Vec::new()
+    var angles = Vec::new()
+    var within = 0
+    for i in 0..s.surface {
+        let p = s.point(i)
+        let (q, g) = projected(field, p)
+        to_field.push(length(p - q) * 1000.0)
+        let c = clamp(dot(normalize(g), s.normal(i)), -1.0, 1.0)
+        let a = acos(c) * 57.29578
+        angles.push(a)
+        if a <= 10.0 {
+            within += 1
+        }
+    }
+    var sides = 0
+    for j in 0..s.volume {
+        let v = s.side(j)
+        if field.distance(v.xyz) * v.w >= 0.0 {
+            sides += 1
+        }
+    }
+    let (lo, hi) = s.extent()
+    let pts = surface_points(field, lo, hi, cell)
+    let grid = grid_of(s, max(2.0 * s.spacing, cell))
+    var to_ref = Vec::new()
+    for q in pts {
+        let i = grid.nearest(s, q)
+        to_ref.push(to_sample(q, s.point(i), s.normal(i), s.spacing) * 1000.0)
+    }
+    SurfaceScores {
+        to_field_mean: mean(to_field),
+        to_field_p95: percentile(mut to_field, 0.95),
+        to_reference_mean: mean(to_ref),
+        to_reference_p95: percentile(mut to_ref, 0.95),
+        normal_mean: mean(angles),
+        normal_within: f32(within) / f32(max(s.surface, 1)),
+        sides: f32(sides) / f32(max(s.volume, 1)),
+        field_points: pts.len(),
+    }
+}
+
+/// Spatial error summary for one named part or one horizontal height band (mm).
+pub struct BandScore: Copy {
+    pub lo: f32,
+    pub hi: f32,
+    pub mean_mm: f32,
+    pub p95_mm: f32,
+    pub count: u32,
+}
+
+/// Per-part error breakdown of reference surface samples projected onto `field`: each element `k`
+/// corresponds to part `k` (`field.part_name(k)`), helping an author pinpoint which part misses.
+pub fn judged_by_part<S: Surface>(field: S, s: Samples) -> Vec<BandScore> {
+    let n = max(field.parts(), 1)
+    var out = Vec::new()
+    for part_i in 0..n {
+        var errs = Vec::new()
+        for i in 0..s.surface {
+            let p = s.point(i)
+            let (_, pid) = field.part_at(p)
+            if pid == part_i {
+                let (q, _) = projected(field, p)
+                errs.push(length(p - q) * 1000.0)
+            }
+        }
+        let c = errs.len()
+        out.push(
+            BandScore {
+                lo: f32(part_i),
+                hi: f32(part_i),
+                mean_mm: mean(errs),
+                p95_mm: percentile(mut errs, 0.95),
+                count: c,
+            },
+        )
+    }
+    out
+}
+
+/// Horizontal height-slice error breakdown (`bands` equal slices across the reference's y extent):
+/// tells an author at which height (foot, bulb, frieze, top) the field misses the reference.
+pub fn judged_by_height<S: Surface>(field: S, s: Samples, bands: u32 = 5) -> Vec<BandScore> {
+    let (lo, hi) = s.extent()
+    let m = max(bands, 1)
+    let span = max(hi.y - lo.y, 1.0e-5)
+    var out = Vec::new()
+    for b in 0..m {
+        let y0 = lo.y + span * f32(b) / f32(m)
+        let y1 = lo.y + span * f32(b + 1) / f32(m)
+        var errs = Vec::new()
+        for i in 0..s.surface {
+            let p = s.point(i)
+            let in_band = p.y >= y0 && (p.y < y1 || (b + 1 == m && p.y <= y1))
+            if in_band {
+                let (q, _) = projected(field, p)
+                errs.push(length(p - q) * 1000.0)
+            }
+        }
+        let c = errs.len()
+        out.push(
+            BandScore {
+                lo: y0,
+                hi: y1,
+                mean_mm: mean(errs),
+                p95_mm: percentile(mut errs, 0.95),
+                count: c,
+            },
+        )
+    }
+    out
+}
+
+/// The field's surface by brute force: on each edge of a grid `cell` m apart over the box where
+/// the field's value changes sign, the crossing found by halving the edge 24 times. No gradient
+/// and no projection: the other way the judge is checked against.
+pub fn crossings<S: Surface>(field: S, lo: vec3, hi: vec3, cell: f32) -> Vec<vec3> {
+    var out = Vec::new()
+    let a = lo - vec3(cell)
+    let n = vec3u((hi - lo) / cell + vec3(3.0))
+    let steps = [vec3(cell, 0.0, 0.0), vec3(0.0, cell, 0.0), vec3(0.0, 0.0, cell)]
+    for z in 0..n.z {
+        for y in 0..n.y {
+            for x in 0..n.x {
+                let p = a + vec3(f32(x), f32(y), f32(z)) * cell
+                let dp = field.distance(p)
+                for e in steps {
+                    let q = p + e
+                    let dq = field.distance(q)
+                    if (dp < 0.0) != (dq < 0.0) {
+                        var u = 0.0
+                        var v = 1.0
+                        for _ in 0..24 {
+                            let m = 0.5 * (u + v)
+                            if (field.distance(p + e * m) < 0.0) == (dp < 0.0) { u = m } else {
+                                v = m
+                            }
+                        }
+                        out.push(p + e * (0.5 * (u + v)))
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The field's normal at `p` by central differences 0.1 mm wide: no derived gradient.
+fn differenced<S: Surface>(field: S, p: vec3) -> vec3 {
+    let h = 1.0e-4
+    normalize(
+        vec3(
+            field.distance(p + vec3(h, 0.0, 0.0)) - field.distance(p - vec3(h, 0.0, 0.0)),
+            field.distance(p + vec3(0.0, h, 0.0)) - field.distance(p - vec3(0.0, h, 0.0)),
+            field.distance(p + vec3(0.0, 0.0, h)) - field.distance(p - vec3(0.0, 0.0, h)),
+        ),
+    )
+}
+
+/// `judged` by brute force (`crossings`), every pair of points compared: each reference sample to
+/// the field's surface as its crossings say it is (to the plane of each crossing, its normal by
+/// central differences, as far as half the grid's cell reaches along it: the measure the fast
+/// path takes of the reference, taken of the field), each crossing to the reference's samples
+/// the same way, and normals at the crossing that measure finds nearest.
+pub fn judged_brute<S: Surface>(field: S, s: Samples, cell: f32) -> SurfaceScores {
+    let (lo, hi) = s.extent()
+    let pts = crossings(field, lo, hi, cell)
+    var normals = Vec::new()
+    for q in pts {
+        normals.push(differenced(field, q))
+    }
+    var to_field = Vec::new()
+    var angles = Vec::new()
+    var within = 0
+    for i in 0..s.surface {
+        let p = s.point(i)
+        var best = 1.0e30
+        var bn = vec3(0.0, 1.0, 0.0)
+        for k in 0..pts.len() {
+            let d = to_sample(p, pts[k], normals[k], cell)
+            if d < best {
+                best = d
+                bn = normals[k]
+            }
+        }
+        to_field.push(best * 1000.0)
+        let a = acos(clamp(dot(bn, s.normal(i)), -1.0, 1.0)) * 57.29578
+        angles.push(a)
+        if a <= 10.0 {
+            within += 1
+        }
+    }
+    var sides = 0
+    for j in 0..s.volume {
+        let v = s.side(j)
+        if field.distance(v.xyz) * v.w >= 0.0 {
+            sides += 1
+        }
+    }
+    var to_ref = Vec::new()
+    for q in pts {
+        var best = 1.0e30
+        for i in 0..s.surface {
+            best = min(best, to_sample(q, s.point(i), s.normal(i), s.spacing))
+        }
+        to_ref.push(best * 1000.0)
+    }
+    SurfaceScores {
+        to_field_mean: mean(to_field),
+        to_field_p95: percentile(mut to_field, 0.95),
+        to_reference_mean: mean(to_ref),
+        to_reference_p95: percentile(mut to_ref, 0.95),
+        normal_mean: mean(angles),
+        normal_within: f32(within) / f32(max(s.surface, 1)),
+        sides: f32(sides) / f32(max(s.volume, 1)),
+        field_points: pts.len(),
+    }
+}
+
+// ---- outlines from a view -----------------------------------------------------------------------
+
+/// A view of an asset, as its concept images are drawn: orthographic, from `from` (a direction,
+/// any length) toward `centre`, `size` m across its square, `up` toward its top.
+pub struct Ortho: Copy {
+    pub centre: vec3,
+    pub from: vec3,
+    pub up: vec3,
+    pub size: f32,
+}
+
+impl Ortho {
+    /// Its axes: right, up, and toward the eye.
+    fn axes(self) -> (vec3, vec3, vec3) {
+        let w = normalize(self.from)
+        let r = normalize(cross(self.up, w))
+        (r, cross(w, r), w)
+    }
+}
+
+/// Which pixels of an `n` by `n` picture from `view` the field covers: 1 where a ray from in front
+/// of the asset meets its surface, rows from the top.
+pub fn silhouette<S: Surface>(field: S, view: Ortho, n: u32) -> Vec<u8> {
+    let (r, u, w) = view.axes()
+    var out = Vec::filled(n * n, 0)
+    let step = field.lipschitz(1.0e30)
+    for y in 0..n {
+        for x in 0..n {
+            let px = (f32(x) + 0.5) / f32(n) - 0.5
+            let py = 0.5 - (f32(y) + 0.5) / f32(n)
+            var p = view.centre + (r * px + u * py) * view.size + w * view.size
+            var t = 0.0
+            for _ in 0..400 {
+                let d = field.distance(p)
+                if d < 1.0e-4 {
+                    out[x + n * y] = 1
+                    break
+                }
+                p = p - w * (d / step)
+                t += d / step
+                if t > 2.0 * view.size {
+                    break
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The reference's outline in `view`: each surface sample marked where it falls, then holes a
+/// pixel wide closed (the samples are a few pixels apart at most at the forge's sizes).
+pub fn splatted(s: Samples, view: Ortho, n: u32) -> Vec<u8> {
+    let (r, u, _) = view.axes()
+    var hit = Vec::filled(n * n, 0)
+    for i in 0..s.surface {
+        let v = s.point(i) - view.centre
+        let x = (dot(v, r) / view.size + 0.5) * f32(n)
+        let y = (0.5 - dot(v, u) / view.size) * f32(n)
+        if x >= 0.0 && y >= 0.0 && x < f32(n) && y < f32(n) {
+            hit[u32(x) + n * u32(y)] = 1
+        }
+    }
+    // Closed: grown a pixel, then shrunk a pixel.
+    let grown = morph(hit, n, grow: true)
+    morph(grown, n, grow: false)
+}
+
+fn morph(m: Vec<u8>, n: u32, grow: bool) -> Vec<u8> {
+    var out = Vec::filled(n * n, 0)
+    for y in 0..n {
+        for x in 0..n {
+            var any = false
+            var all = true
+            for dy in 0..3 {
+                for dx in 0..3 {
+                    let xx = i32(x) + i32(dx) - 1
+                    let yy = i32(y) + i32(dy) - 1
+                    let v = if xx >= 0 && yy >= 0 && xx < i32(n) && yy < i32(n) {
+                        m[u32(xx) + n * u32(yy)]
+                    } else { 0 }
+                    any = any || v != 0
+                    all = all && v != 0
+                }
+            }
+            out[x + n * y] = if (grow && any) || (!grow && all) { 1 } else { 0 }
+        }
+    }
+    out
+}
+
+/// How much two outlines agree: the pixels both cover over the pixels either covers, where a
+/// pixel either covers counts as both's if the other covers a pixel beside it (an outline one
+/// pixel off, as two ways of finding it differ, costs nothing; one more, the pixels it misses).
+pub fn overlap(a: Vec<u8>, b: Vec<u8>) -> f32 {
+    let n = u32(sqrt(f32(a.len())) + 0.5)
+    let ga = morph(a, n, grow: true)
+    let gb = morph(b, n, grow: true)
+    var both = 0
+    var either = 0
+    for i in 0..a.len() {
+        let ia = a[i] != 0
+        let ib = b[i] != 0
+        if ia || ib {
+            either += 1
+            if (ia || ga[i] != 0) && (ib || gb[i] != 0) {
+                both += 1
+            }
+        }
+    }
+    f32(both) / f32(max(either, 1))
+}

@@ -1,0 +1,222 @@
+// Carving held to itself drawn another way: the carved face as a fine grid of its heights, its
+// sunk panel's walls and the rest of the board as points, and the brute-force nearest; its side
+// from the carving's own rule (in the board, and not in the region above the carved height). A
+// carving's distance is a bound, so it must never be more than the brute force's, and should not
+// be much less near the surface (a loose bound only slows a tracer, but too loose is a bug).
+// Each motif's steepness (`Motif::slope`, from its own numbers) must hold over its gradient
+// measured by finite differences.
+
+use shapes::carve::{Motif, carved, flat_face, round_face}
+use shapes::making::{board, turned}
+use shapes::ornament::{acanthus, bead_and_reel, egg_and_dart, flute, mirrored, rosette, row, scroll}
+use std::collections::Vec
+use std::field::{Surface, check_lipschitz}
+use std::io::print
+
+/// The most a motif's height changes over `step` m anywhere on a grid over `lo`..`hi`, over the
+/// step: its steepness measured.
+fn measured_slope<M: Motif>(m: M, lo: vec2, hi: vec2, n: u32, step: f32) -> f32 {
+    var worst = 0.0
+    for i in 0..n {
+        for j in 0..n {
+            let st = lo + (hi - lo) * vec2(f32(i), f32(j)) / f32(n - 1)
+            let h = m.height(st)
+            let gx = (m.height(st + vec2(step, 0.0)) - h) / step
+            let gy = (m.height(st + vec2(0.0, step)) - h) / step
+            worst = max(worst, length(vec2(gx, gy)))
+        }
+    }
+    worst
+}
+
+@test
+fn each_motif_is_no_steeper_than_its_numbers_say() {
+    let leaf = mirrored(acanthus(length: 0.08, width: 0.06, height: 0.004, curl: 0.6))
+    let beads = row(bead_and_reel(bead: 0.012, reel: 0.006, height: 0.003), period: 0.018, count: 0)
+    let eggs = row(egg_and_dart(egg: 0.02, height: 0.004), period: 0.016, count: 0)
+    let rose = rosette(radius: 0.03, petals: 8, height: 0.004)
+    let fl = row(flute(length: 0.1, width: 0.008, depth: 0.002), period: 0.012, count: 0)
+    let a = measured_slope(leaf, vec2(-0.04, -0.01), vec2(0.04, 0.09), n: 120, step: 2.0e-5)
+    let b = measured_slope(beads, vec2(-0.03, -0.01), vec2(0.03, 0.01), n: 120, step: 2.0e-5)
+    let c = measured_slope(eggs, vec2(-0.03, -0.02), vec2(0.03, 0.02), n: 120, step: 2.0e-5)
+    let d = measured_slope(rose, vec2(-0.035, -0.035), vec2(0.035, 0.035), n: 120, step: 2.0e-5)
+    let e = measured_slope(fl, vec2(-0.02, -0.01), vec2(0.02, 0.11), n: 120, step: 2.0e-5)
+    print(
+        f"slopes measured/stated: leaf {a}/{leaf.slope()} beads {b}/{beads.slope()} eggs {c}/{eggs.slope()} rosette {d}/{rose.slope()} flutes {e}/{fl.slope()}",
+    )
+    assert(a <= leaf.slope(), "a leaf's slope")
+    assert(b <= beads.slope(), "beads' slope")
+    assert(c <= eggs.slope(), "eggs' slope")
+    assert(d <= rose.slope(), "a rosette's slope")
+    assert(e <= fl.slope(), "flutes' slope")
+    // And not far above it: a bound ten times too loose would slow every ray that passes.
+    assert(leaf.slope() < 10.0 * a && rose.slope() < 10.0 * d, "slopes not too loose")
+}
+
+@test
+fn a_row_without_end_wraps_round_a_turned_part() {
+    // Twelve flutes round a column 4 cm in radius: the row's period divides the circumference,
+    // so the flute either side of the back seam (s = ±π r) is whole.
+    let r = 0.04
+    let fl = row(
+        flute(length: 0.1, width: 0.008, depth: 0.002),
+        period: 6.2831853 * r / 12.0,
+        count: 0,
+    )
+    let seam = 3.14159265 * r
+    for t in [0.02, 0.05, 0.08] {
+        let a = fl.height(vec2(seam - 0.0001, t))
+        let b = fl.height(vec2(-seam + 0.0001, t))
+        let c = fl.height(vec2(seam - 0.0001 - 6.2831853 * r / 12.0, t))
+        assert(
+            abs(a - c) < 1.0e-6 &&
+                abs(b - fl.height(vec2(-seam + 0.0001 + 6.2831853 * r / 12.0, t))) < 1.0e-6,
+            "flutes repeat across the seam",
+        )
+    }
+}
+
+/// Whether `p` is in the carved board as the carving's own rule has it: in the board, and not in
+/// the region above the carved height.
+fn in_carving<M: Motif>(p: vec3, half: vec3, region: vec4, ground: f32, m: M) -> bool {
+    let in_board = abs(p.x) <= half.x && abs(p.y) <= half.y && abs(p.z) <= half.z
+    let st = vec2(p.x, p.y)
+    let in_region = st.x > region.x && st.x < region.z && st.y > region.y && st.y < region.w
+    let w = p.z - half.z
+    let h = min(-ground + m.height(st), 0.0)
+    in_board && !(in_region && w > h)
+}
+
+@test
+fn a_carved_panel_is_its_carving_drawn_point_by_point() {
+    // A board 16 by 12 cm and 2 cm thick, a leaf carved in its front face (z = +1 cm) over a
+    // panel 10 by 10 cm, its ground 5 mm deep.
+    let half = vec3(0.08, 0.06, 0.01)
+    let b = board(half, round: 0.0)
+    // The leaf's midrib starts 4 cm below the face's middle.
+    let shifted = shapes::ornament::set(
+        mirrored(acanthus(length: 0.08, width: 0.07, height: 0.005, curl: 0.5)),
+        at: vec2(0.0, -0.04),
+    )
+    let region = vec4(-0.05, -0.05, 0.05, 0.05)
+    let c = carved(
+        b,
+        flat_face(vec3(0.0, 0.0, half.z), s: vec3(1.0, 0.0, 0.0), t: vec3(0.0, 1.0, 0.0)),
+        shifted,
+        ground: 0.005,
+        region: region,
+    )
+    // The surface as points: the carved face's heights 0.25 mm apart, the panel's walls, and the
+    // board's front face round the panel.
+    var cloud = Vec::new()
+    for i in 0..401 {
+        for j in 0..401 {
+            let st = vec2(-0.05 + 0.1 * f32(i) / 400.0, -0.05 + 0.1 * f32(j) / 400.0)
+            let h = min(-0.005 + shifted.height(st), 0.0)
+            cloud.push(vec3(st.x, st.y, half.z + h))
+        }
+    }
+    for k in 0..400 {
+        let u = -0.05 + 0.1 * f32(k) / 399.0
+        for z in 0..20 {
+            let w = half.z - 0.005 * f32(z) / 19.0
+            cloud.push(vec3(u, -0.05, w))
+            cloud.push(vec3(u, 0.05, w))
+            cloud.push(vec3(-0.05, u, w))
+            cloud.push(vec3(0.05, u, w))
+        }
+    }
+    for i in 0..161 {
+        for j in 0..121 {
+            let q = vec2(-0.08 + 0.16 * f32(i) / 160.0, -0.06 + 0.12 * f32(j) / 120.0)
+            if abs(q.x) > 0.05 || abs(q.y) > 0.05 {
+                cloud.push(vec3(q.x, q.y, half.z))
+            }
+        }
+    }
+    var over = 0.0
+    var loosest = 1.0
+    var checked = 0
+    for i in 0..13 {
+        for j in 0..13 {
+            for k in 0..5 {
+                let p = vec3(
+                    -0.055 + 0.11 * f32(i) / 12.0,
+                    -0.055 + 0.11 * f32(j) / 12.0,
+                    half.z - 0.0061 + 0.0083 * f32(k) / 4.0,
+                )
+                let fast = c.distance(p)
+                var d2 = 1.0e30
+                for q in cloud {
+                    d2 = min(d2, dot(p - q, p - q))
+                }
+                let slow = sqrt(d2)
+                let side = in_carving(p, half, region, 0.005, shifted)
+                // Its side, wherever the cloud can tell (more than its spacing from the surface).
+                if slow > 3.0e-4 {
+                    assert((fast < 0.0) == side, f"a carving's side at ({p.x}, {p.y}, {p.z})")
+                    over = max(over, abs(fast) - slow)
+                    loosest = min(loosest, abs(fast) / slow)
+                    checked += 1
+                }
+            }
+        }
+    }
+    print(f"carved: {checked} probes, most over the brute force {over} m, loosest share {loosest}")
+    // A bound: never more than the distance, beyond what the cloud's spacing can tell.
+    assert(over < 2.0e-4, f"a carving's distance overstates by {over} m")
+    assert(loosest > 0.05, f"a carving's bound is looser than a twentieth: {loosest}")
+    check_lipschitz(c, near: 0.02, l: c.lipschitz(0.02))
+}
+
+@test
+fn a_turned_part_carries_carving_round_it() {
+    // A column 4 cm in radius and 20 cm tall, twelve flutes 2 mm deep round it from 4 to 16 cm.
+    let col = turned([vec2(0.04, 0.0), vec2(0.04, 0.2)], [0.0, 0.0])
+    let r = 0.04
+    let fl = row(
+        flute(length: 0.12, width: 0.008, depth: 0.002),
+        period: 6.2831853 * r / 12.0,
+        count: 0,
+    )
+    let c = carved(
+        col,
+        round_face(radius: r, base: 0.04, inner: 0.035),
+        fl,
+        ground: 0.0,
+        region: vec4(-1.0, 0.0, 1.0, 0.12),
+    )
+    // In a flute's middle, the surface is 2 mm in; between flutes, at the column's face.
+    let mid = c.distance(vec3(0.0, 0.1, 0.0395))
+    assert(mid > 0.0, f"a flute's middle is cut: {mid}")
+    let between = 6.2831853 / 24.0
+    let edge = c.distance(vec3(sin(between) * 0.0399, 0.1, cos(between) * 0.0399))
+    assert(edge < 0.0, f"between flutes, the column stands: {edge}")
+    check_lipschitz(c, near: 0.02, l: c.lipschitz(0.02))
+}
+
+@test
+fn a_wandering_running_scroll_stays_continuous_across_cells() {
+    let run = row(scroll(period: 0.1, span: 0.08, height: 0.005), period: 0.1, count: 4, wander: 0.4)
+    let slope_m = measured_slope(run, vec2(-0.18, -0.04), vec2(0.18, 0.04), n: 120, step: 2.0e-5)
+    assert(slope_m <= run.slope(), f"scroll slope {slope_m} > {run.slope()}")
+    // At the cell seam s = 0 between cells 1 and 2 (arch springpoint boss at y = -0.30 * span),
+    // height must match within 0.05 mm across ±0.02 mm.
+    let y0 = -0.30 * 0.08
+    let left = run.height(vec2(-2.0e-5, y0))
+    let right = run.height(vec2(2.0e-5, y0))
+    assert(left > 0.003 && abs(left - right) < 5.0e-5, f"scroll seam split: {left} vs {right}")
+    // And a wandering row wrapped round a turned cylinder has zero jump across atan2 = ±π.
+    let r = 0.04
+    let wrapped = row(
+        flute(length: 0.1, width: 0.008, depth: 0.002),
+        period: 6.2831853 * r / 12.0,
+        count: 0,
+        wander: 0.4,
+        wrap: 12,
+    )
+    let seam = 3.14159265 * r
+    let a = wrapped.height(vec2(seam - 2.0e-5, 0.05))
+    let b = wrapped.height(vec2(-seam + 2.0e-5, 0.05))
+    assert(abs(a - b) < 5.0e-5, f"wrapped round seam tear: {a} vs {b}")
+}

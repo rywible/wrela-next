@@ -27,7 +27,13 @@ use std::hash::{Hash, Hasher};
 
 /// Flattens a GPU module (see the module docs).
 pub fn flatten_gpu(m: &mut Module) -> Result<()> {
+    flatten_gpu_folded(m).map(|_| ())
+}
+
+/// Flattens a GPU module and reports whether constant-branch folding erased any dead branch.
+pub fn flatten_gpu_folded(m: &mut Module) -> Result<bool> {
     let mut keep = outlined(m);
+    let mut folded_branch = false;
     // Outlining is decided by size, and a pipeline's constants fold only once inlined: dead
     // option code would push a kernel over the limit and turn its helpers into calls (a spike's
     // kernel ran 5.33 ms as calls, 4.51 inlined). Where the first decision keeps calls, the
@@ -70,6 +76,7 @@ pub fn flatten_gpu(m: &mut Module) -> Result<()> {
                 changed = true;
             }
             if fold_constant_branches(m, &mut f) {
+                folded_branch = true;
                 forward_stores(m, &mut f);
                 forward_extracts(m, &mut f);
                 changed = true;
@@ -89,7 +96,9 @@ pub fn flatten_gpu(m: &mut Module) -> Result<()> {
         dce(&mut f);
         if_convert(m, &mut f);
         if simplify_select_cmp(&mut f) {
-            fold_constant_branches(m, &mut f);
+            if fold_constant_branches(m, &mut f) {
+                folded_branch = true;
+            }
         }
         cse(&mut f);
         dce(&mut f);
@@ -104,7 +113,13 @@ pub fn flatten_gpu(m: &mut Module) -> Result<()> {
         crate::merge_calls::merge_calls(m, &mut f);
         m.functions[i] = f;
     }
-    Ok(())
+    // Drop outlined helpers whose only call sites were erased by constant-branch folding / DCE.
+    let roots = m.entry_points.iter().map(|e| e.function.index()).collect();
+    let remap = retain_reached(m, roots);
+    for e in &mut m.entry_points {
+        e.function = FuncId(remap[e.function.index()].expect("an entry point is kept"));
+    }
+    Ok(folded_branch)
 }
 
 // ---- small branches as selects (GPU) ----------------------------------------------------------
@@ -1150,14 +1165,20 @@ fn outlined_with(
     let n = m.functions.len();
     let mut keep = vec![false; n];
     let entry: HashSet<usize> = m.entry_points.iter().map(|e| e.function.index()).collect();
-    // A body's size with its inlined callees, and whether it only computes.
+    // A body's size with its inlined callees, whether it only computes, and whether it does real
+    // arithmetic/loops (pure metadata/facts combinators stay inlined so constant folding can erase
+    // dead solver/material branches before shader emission).
     let mut size = vec![0usize; n];
     let mut pure = vec![false; n];
+    let mut math = vec![false; n];
     for &f in order {
         let func = &m.functions[f];
-        let (mut sz, mut ok) = (0usize, true);
+        let (mut sz, mut ok, mut has_math) = (0usize, true, false);
         visit::walk(&func.body, &mut |s| {
             sz += 1;
+            if matches!(s, Stmt::Loop { .. }) {
+                has_math = true;
+            }
             if let Stmt::Store(p, _) = s
                 && !matches!(p.root, PlaceRoot::Local(_) | PlaceRoot::Param(_))
             {
@@ -1169,7 +1190,28 @@ fn outlined_with(
                         if !keep[g.index()] {
                             sz += size[g.index()];
                             ok &= pure[g.index()];
+                            has_math |= math[g.index()];
+                        } else {
+                            has_math = true;
                         }
+                    }
+                    Expr::Binary(op, _, _)
+                        if !matches!(
+                            op,
+                            BinOp::And
+                                | BinOp::Or
+                                | BinOp::Eq
+                                | BinOp::Ne
+                                | BinOp::Lt
+                                | BinOp::Le
+                                | BinOp::Gt
+                                | BinOp::Ge
+                        ) =>
+                    {
+                        has_math = true;
+                    }
+                    Expr::Builtin(b, _) if !matches!(b, Builtin::Min | Builtin::Max) => {
+                        has_math = true;
                     }
                     Expr::EntryInput(_)
                     | Expr::Barrier
@@ -1192,13 +1234,17 @@ fn outlined_with(
                     PlaceRoot::Param(_) => {}
                     // A copy specialized to uniform data reads it (`specialize_uniform_calls`).
                     PlaceRoot::Resource(_)
-                        if small_calls && matches!(e, Expr::Load(_)) && read_only(m, p) => {}
+                        if small_calls && matches!(e, Expr::Load(_)) && read_only(m, p) =>
+                    {
+                        has_math = true;
+                    }
                     _ => ok = false,
                 });
             }
         });
         size[f] = sz;
         pure[f] = ok;
+        math[f] = has_math;
         // How many scalars the arguments and the result hold: `None` if one isn't passed in
         // registers (or is passed by reference).
         let args = func.params.iter().try_fold(0usize, |n, p| {
@@ -1219,7 +1265,7 @@ fn outlined_with(
             small_calls && small && sz >= OUTLINE_SMALL
         };
         let shared = !copies.get(f).copied().unwrap_or(false) || calls[f] >= 2;
-        keep[f] = !entry.contains(&f) && ok && signature && big && shared;
+        keep[f] = !entry.contains(&f) && ok && has_math && signature && big && shared;
     }
     let biggest = entry.iter().map(|&e| size[e]).max().unwrap_or(0);
     (keep, biggest)

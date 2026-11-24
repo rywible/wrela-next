@@ -1,0 +1,369 @@
+// How a thing was made, as a field: its shape and the story of each point of it, from the same
+// numbers (AGENTS.md, "All content is fields"). A making operation (a turned leg, a moulded slab,
+// a carved panel) gives the distance and, beside it, what the making did there: whether the point
+// stands out where hands rub it or lies back where dust and wax settle, and how deep a cut went
+// below the face the board had before it was carved. A material reads the story with the point
+// and gives what the point is made of there (`Material`), so a cut that shows end grain, a
+// polished edge and a dark recess all come from the shape that made them, never painted on.
+//
+// `dressed(shape, material)` is a field the engine draws: a `Field<Substance>` whose channels are
+// the material's at each point, told the shape's story.
+
+use engine::matter::substance::{Substance, lambert}
+use engine::matter::verify::verify_field_soundness
+use std::cmp::Eq
+use std::derive::{Box3, Interval}
+use std::field::{Bound, Field, FieldFacts, Live, PartName, Pruned, Surface}
+use std::hash::{StateHash, state_hash}
+
+/// What making did at a point. Both are 0 on a plain face.
+pub struct Story: Copy + GpuData {
+    /// How exposed the point is, from -1 (deep in a recess: a cove, a carving's ground, a seam)
+    /// to 1 (on a sharp convex edge or the proudest part of a relief, where hands and cloths
+    /// rub).
+    pub exposure: f32,
+    /// How far below the surface the board had before it was cut the point lies (m): 0 off a
+    /// cut.
+    pub depth: f32,
+    /// Which piece of the whole the point is in (`piece`): which board of a table, so one
+    /// material can give each its own grain.
+    pub piece: u32,
+}
+
+/// A plain face's story.
+pub fn plain() -> Story {
+    Story { exposure: 0.0, depth: 0.0, piece: 0 }
+}
+
+/// A story of `exposure` and `depth`, in piece 0 (`piece` says another).
+pub fn story(exposure: f32, depth: f32 = 0.0) -> Story {
+    Story { exposure, depth, piece: 0 }
+}
+
+/// The exposure of a surface curved by `bend` (1/radius; positive convex): an edge rounded to a
+/// radius of `TOUCH` reads 0.76, a flat face 0, a cove of that radius -0.76. A rounded edge's
+/// radius is what a hand or a cloth meets, so it sets how much it is rubbed.
+pub fn exposure_of(bend: f32) -> f32 {
+    tanh(bend * TOUCH)
+}
+
+/// The radius of an edge rubbed about as much as an edge gets (m).
+pub const TOUCH: f32 = 0.003
+
+/// A surface that tells its story: what making did at each point, with the distance from one
+/// evaluation.
+pub trait Shaped: Surface + StateHash + Eq {
+    /// The distance at `p` (the same as `distance(p)`, bit for bit) and the story there.
+    fn shaped(self, p: vec3) -> (f32, Story)
+
+    /// Which piece part `part` (`part_at`'s numbering) is (`Story::piece`): 0 unless a `piece`
+    /// says.
+    fn piece_of(self, part: u32) -> u32 {
+        0
+    }
+
+    /// `shaped` and the part that decides it (`part_at`'s numbering), from one evaluation.
+    fn shaped_part(self, p: vec3) -> (f32, Story, u32) {
+        let (d, s) = self.shaped(p)
+        (d, s, 0)
+    }
+
+    /// Optional pixel-rate detail refinement for `part` at `p` (local space): returns refined
+    /// `(story, relief_m)` so carved motifs and incised tooling resolve at exact pixel resolution
+    /// instead of vertex interpolation, with zero extra work on uncarved parts.
+    fn detail_at(self, p: vec3, part: u32, story: Story) -> (Story, f32) {
+        (story, 0.0)
+    }
+}
+
+/// A finished game asset: a dressed field ready for the engine, the judge and the fitter, returned
+/// as an opaque concrete type (`pub fn table() -> Asset`) without spelling out its nested wrappers.
+pub trait Asset: Field<Substance> + StateHash + Eq {}
+
+impl<T: Field<Substance> + StateHash + Eq> Asset for T {}
+
+/// How deep a cut the story keeps at a vertex can say (m): 1 cm, in 255 steps of 0.04 mm.
+pub const KEPT_DEPTH: f32 = 0.01
+
+/// A story as the four numbers a mesh keeps at a vertex (`Field::kept`).
+pub fn kept_of(s: Story) -> vec4 {
+    vec4(0.5 + 0.5 * clamp(s.exposure, -1.0, 1.0), clamp(s.depth / KEPT_DEPTH, 0.0, 1.0), 0.0, 1.0)
+}
+
+/// The story a mesh kept at a point (`kept_of`), in piece `piece`.
+pub fn story_kept(k: vec4, piece: u32) -> Story {
+    Story { exposure: 2.0 * k.x - 1.0, depth: k.y * KEPT_DEPTH, piece }
+}
+
+// ---- ranges over a box, from the bound alone ------------------------------------------------------
+//
+// Every made shape has a Lipschitz bound it states from its own numbers, and over a box its
+// distance is within that bound times the box's half-diagonal of its distance at the box's centre.
+// That range is what the engine's culling asks (`Surface::pruned`, `interval_near`); deriving it
+// instead through every blade and groove of a carving (interval arithmetic over the whole tree)
+// gave shaders past the size a pipeline may be (Metal's 288 KiB: a carved table's brick culling
+// came to 351 KiB) and ranges no tighter where the shape is a bound. So made shapes answer from
+// the bound, and the combinators above them pass the question down.
+
+/// `s`'s range over `over` as `pruned` asks it (each point taken where `at` takes it, lengths
+/// stretched at most `stretch`): its distance at the centre, give or take its bound times the
+/// half-diagonal, and a margin for rounding. Every part stays live.
+pub fn stepped<S: Surface, F: Copy + fn(vec3) -> vec3>(
+    s: S,
+    over: Box3,
+    at: F,
+    stretch: f32,
+    live: Live,
+) -> Pruned {
+    let d = s.distance(at(over.center()))
+    let r = s.lipschitz(1.0e30) * stretch * 0.5 * length(over.hi - over.lo)
+    let e = r * 1.0e-5 + abs(d) * 1.0e-6 + 1.0e-6
+    Pruned { live, range: Interval { lo: d - r - e, hi: d + r + e } }
+}
+
+/// `s`'s range over `b` (`interval_near`), from its bound alone.
+pub fn stepped_near<S: Surface>(s: S, b: Box3) -> Interval {
+    let d = s.distance(b.center())
+    let r = s.lipschitz(1.0e30) * 0.5 * length(b.hi - b.lo)
+    let e = r * 1.0e-5 + abs(d) * 1.0e-6 + 1.0e-6
+    Interval { lo: d - r - e, hi: d + r + e }
+}
+
+/// A made part said to be piece `k` of its whole, named `name`: its story says which piece
+/// (`Story::piece`), and it is one named part of the whole (language.md §23.3), however it was
+/// made.
+pub struct Piece<S>: Copy + GpuData + Eq + StateHash {
+    pub part: S,
+    pub k: u32,
+    pub name: Text,
+}
+
+/// `part` as piece `k`, named `name` (`Piece`).
+pub fn piece<S: Shaped>(k: u32, name: Text, part: S) -> Piece<S> {
+    Piece { part, k, name }
+}
+
+impl<S: Shaped> Surface for Piece<S> {
+    fn interval_near(self, b: Box3) -> Interval {
+        stepped_near(self, b)
+    }
+
+    fn pruned<F: Copy + fn(vec3) -> vec3>(
+        self,
+        over: Box3,
+        at: F,
+        stretch: f32,
+        live: Live,
+        first: u32,
+    ) -> Pruned {
+        stepped(self, over, at, stretch, live)
+    }
+    fn distance(self, p: vec3) -> f32 {
+        self.part.distance(p)
+    }
+
+    fn part_name(self, i: u32) -> PartName {
+        PartName { name: self.name, group: "", frame: "", mirrored: false }
+    }
+
+    fn bound(self) -> Bound {
+        self.part.bound()
+    }
+
+    fn lipschitz(self, near: f32) -> f32 {
+        self.part.lipschitz(near)
+    }
+
+    fn rigid_shape_hash(self) -> Option<u64> {
+        match self.part.rigid_shape_hash() {
+            Some(_) => Some(state_hash(self)),
+            None => None,
+        }
+    }
+}
+
+impl<S: Shaped> Shaped for Piece<S> {
+    fn shaped(self, p: vec3) -> (f32, Story) {
+        let (d, s) = self.part.shaped(p)
+        (d, Story { piece: self.k, ..s })
+    }
+
+    fn piece_of(self, part: u32) -> u32 {
+        self.k
+    }
+
+    fn detail_at(self, p: vec3, part: u32, story: Story) -> (Story, f32) {
+        let (s, r) = self.part.detail_at(p, part, story)
+        (Story { piece: self.k, ..s }, r)
+    }
+}
+
+/// What a material is at a point, told its story: physical numbers, never a tone.
+pub trait Material: Copy + GpuData + StateHash {
+    fn at(self, p: vec3, story: Story) -> Substance
+
+    /// True if this material may emit transmissive (`transmission > 0.02`) surfaces.
+    fn may_transmit(self) -> bool {
+        false
+    }
+}
+
+/// A made shape in its material: a field the engine draws.
+pub struct Dressed<S, M>: Copy + GpuData + Eq + StateHash {
+    pub shape: S,
+    pub material: M,
+}
+
+/// `shape` made of `material`.
+pub fn dressed<S: Shaped, M: Material>(shape: S, material: M) -> Dressed<S, M> {
+    Dressed { shape, material }
+}
+
+impl<S: Shaped, M: Material> Surface for Dressed<S, M> {
+    fn interval_near(self, b: Box3) -> Interval {
+        stepped_near(self, b)
+    }
+
+    fn masked(self, p: vec3, live: Live, first: u32) -> f32 {
+        self.shape.masked(p, live, first)
+    }
+
+    fn pruned<F: Copy + fn(vec3) -> vec3>(
+        self,
+        over: Box3,
+        at: F,
+        stretch: f32,
+        live: Live,
+        first: u32,
+    ) -> Pruned {
+        self.shape.pruned(over, at, stretch, live, first)
+    }
+    fn distance(self, p: vec3) -> f32 {
+        self.shape.distance(p)
+    }
+
+    fn parts(self) -> u32 {
+        self.shape.parts()
+    }
+
+    fn part_at(self, p: vec3) -> (f32, u32) {
+        self.shape.part_at(p)
+    }
+
+    fn part_distance(self, p: vec3, i: u32) -> f32 {
+        self.shape.part_distance(p, i)
+    }
+
+    fn part_name(self, i: u32) -> PartName {
+        self.shape.part_name(i)
+    }
+
+    fn part_offset(self, p: vec3, i: u32, by: f32) -> f32 {
+        self.shape.part_offset(p, i, by)
+    }
+
+    fn bound(self) -> Bound {
+        self.shape.bound()
+    }
+
+    fn lipschitz(self, near: f32) -> f32 {
+        self.shape.lipschitz(near)
+    }
+
+    /// Its shape's and its material's together, where its shape has one.
+    fn rigid_shape_hash(self) -> Option<u64> {
+        match self.shape.rigid_shape_hash() {
+            Some(_) => Some(state_hash(self)),
+            None => None,
+        }
+    }
+}
+
+const DRESSED_FACTS: FieldFacts = FieldFacts::proven(
+    lip: 1.0e6,
+    may_transmit: false,
+    may_emit: false,
+    may_coat: true,
+    may_subsurface: true,
+    may_micro: false,
+    channels_proven: false,
+    max_freq: 1.0 / 0.0,
+    may_bump: true,
+    use_stepped_bounds: true,
+)
+
+impl<S: Shaped, M: Material> Field<Substance> for Dressed<S, M> {
+    fn channels(self, p: vec3) -> Substance {
+        self.distance_and_channels(p).1
+    }
+
+    fn distance_and_channels(self, p: vec3) -> (f32, Substance) {
+        let (d, story) = self.shape.shaped(p)
+        (d, self.material.at(p, story))
+    }
+
+    /// Its material is a function of the point in the shape's own frame.
+    fn has_local_channels(self) -> bool {
+        true
+    }
+
+    fn uses_kept(self) -> bool {
+        true
+    }
+
+    fn field_facts(self) -> FieldFacts {
+        if self.material.may_transmit() {
+            FieldFacts::proven(
+                lip: 1.0e6,
+                may_transmit: true,
+                may_emit: false,
+                may_coat: true,
+                may_subsurface: true,
+                may_micro: false,
+                channels_proven: false,
+                max_freq: 1.0 / 0.0,
+                may_bump: true,
+                use_stepped_bounds: true,
+            )
+        } else {
+            DRESSED_FACTS
+        }
+    }
+
+    /// The shape's story at the vertex: worked out once, where the mesh is made.
+    fn kept(self, p: vec3, part: u32) -> vec4 {
+        kept_of(self.shape.shaped(p).1)
+    }
+
+    /// The distance, the part and the story from one evaluation of the shape.
+    fn kept_at(self, p: vec3) -> (f32, u32, vec4) {
+        let (d, s, i) = self.shape.shaped_part(p)
+        (d, i, kept_of(s))
+    }
+
+    /// The material told the story the mesh kept, refined at pixel rate by any carved motif on
+    /// this part alone (`Shaped::detail_at`), carrying sub-cell relief into `Substance::bump`.
+    fn channels_kept(self, p: vec3, part: u32, kept: vec4) -> Substance {
+        let base = story_kept(kept, self.shape.piece_of(part))
+        let (s, relief) = self.shape.detail_at(p, part, base)
+        let sub = self.material.at(p, s)
+        Substance { bump: sub.bump + relief, ..sub }
+    }
+}
+
+struct PlainMat: Copy + GpuData + Eq + StateHash {
+    tint: vec3,
+}
+
+impl Material for PlainMat {
+    fn at(self, _p: vec3, s: Story) -> Substance {
+        lambert(clamp(self.tint * (0.9 + 0.1 * s.exposure), vec3(0.05), vec3(0.95)))
+    }
+}
+
+@test
+fn dressed_field_is_sound() {
+    let body = piece(0, "board", shapes::making::board(vec3(0.12, 0.02, 0.08), round: 0.003))
+    let f = dressed(body, PlainMat { tint: vec3(0.45, 0.32, 0.22) })
+    verify_field_soundness(f, "kit_dressed")
+}

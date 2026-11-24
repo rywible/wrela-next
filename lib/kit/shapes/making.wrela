@@ -1,0 +1,1135 @@
+// Making operations: forms as a joiner or a turner makes them, each from a few numbers with a
+// physical meaning (AGENTS.md, "The vocabulary ladder": rung 2).
+//
+//   turned(profile)              a profile spun on a lathe about the local y axis (a leg, a
+//                                stretcher, a finial, a candle's stem)
+//   moulded(plan, corner, edge)  a slab with a rounded-rectangle plan whose edge is run with a
+//                                moulding's profile (a table's top, a book's board)
+//   banded(plan, corner, section) a band of a closed section run round a rounded-rectangle plan
+//                                (an apron's frame, a picture frame, a book's spine bands)
+//   extruded(section, length)    a closed section run straight along x with square ends (a
+//                                rail, a stretcher's square middle, a shelf's lip)
+//   board(half, round)           a board with its edges eased to a radius
+//   joined(a, b, gap, depth)     two parts butted together, the seam between them showing (a
+//                                mortise-and-tenon's shoulder line, a board's glue line)
+//   folded(part)                 a part made once and set at each corner of a symmetric whole
+//                                (`folded_across` for any of the three planes)
+//   placed(part, at, axes)       a part moved and turned into the whole's frame
+//   grown(part, by)              a part grown by a layer `by` m thick all over (leather over a
+//                                board, a coat of gesso)
+//   sheathed(part, t, region)    a sheet `t` m thick laid over a part's surface within a region (a
+//                                brass corner over a book's board, a strap)
+//   both(a, b)                   two parts as one
+//
+// Each is exact or a bound (it never says a point is farther than it is), with a Lipschitz bound
+// of 1, and tells its story (`made::Story`): a convex edge's curvature makes it exposed, a cove's
+// recessed, a seam's recessed. A profile's points and bulges are in metres (`outline`).
+
+use engine::matter::verify::verify_surface_soundness
+use shapes::made::{Shaped, Story, exposure_of, plain, story}
+use shapes::outline::{Outline, Profile, outline, profile}
+use std::cmp::Eq
+use shapes::made::{stepped, stepped_near}
+use std::derive::{Box3, Interval}
+use std::field::{Bound, Live, PartName, Pruned, Surface, pair_masked, pair_pruned}
+use std::hash::{StateHash, state_hash}
+
+// ---- turned -------------------------------------------------------------------------------------
+
+/// A profile (radius, height) spun about the local y axis: what a lathe makes. The profile runs
+/// from the foot to the head with the axis toward minus x, as `outline::Profile` says.
+pub struct Turned<const N: u32>: Copy + GpuData + Eq + StateHash {
+    pub profile: Profile<N>,
+}
+
+/// A turned form from its profile's points (radius, height) and bulges (m), foot to head.
+pub fn turned<const N: u32>(points: [vec2; N], bulges: [f32; N]) -> Turned<N> {
+    var widest = 0.0
+    for i in 0..N {
+        widest = max(widest, points[i].x + abs(bulges[i]))
+    }
+    Turned { profile: profile(points, bulges, far: widest + 0.01) }
+}
+
+/// A point's distance from the y axis, smoothed within a nanometre of it so its gradient is a
+/// number there (a turned part's foot and head cross the axis).
+pub fn radius_of(p: vec3) -> f32 {
+    sqrt(p.x * p.x + p.z * p.z + 1.0e-18)
+}
+
+impl<const N: u32> Surface for Turned<N> {
+    fn interval_near(self, b: Box3) -> Interval {
+        stepped_near(self, b)
+    }
+
+    fn pruned<F: Copy + fn(vec3) -> vec3>(
+        self,
+        over: Box3,
+        at: F,
+        stretch: f32,
+        live: Live,
+        first: u32,
+    ) -> Pruned {
+        stepped(self, over, at, stretch, live)
+    }
+    @budget(work: 4096)
+    fn distance(self, p: vec3) -> f32 {
+        self.profile.distance(vec2(radius_of(p), p.y))
+    }
+
+    /// The sphere round its widest and its height.
+    fn bound(self) -> Bound {
+        let e = self.profile.extent()
+        let half = 0.5 * (e.z - e.y)
+        Bound {
+            centre: vec3(0.0, 0.5 * (e.y + e.z), 0.0),
+            radius: length(vec2(e.x, half)),
+            slope: 1.0,
+        }
+    }
+
+    /// A 2D distance of the point's radius and height: exact.
+    fn lipschitz(self, near: f32) -> f32 {
+        1.0
+    }
+
+    fn rigid_shape_hash(self) -> Option<u64> {
+        Some(state_hash(self))
+    }
+}
+
+impl<const N: u32> Shaped for Turned<N> {
+    fn shaped(self, p: vec3) -> (f32, Story) {
+        let s = self.profile.at(vec2(radius_of(p), p.y))
+        (s.distance(), story(exposure_of(s.bend)))
+    }
+}
+
+// ---- plans --------------------------------------------------------------------------------------
+
+/// The signed distance in the plane from a rectangle of half-size `half` with its corners rounded
+/// to `corner` (positive outside): exact outside, and the distance to the nearest side inside.
+pub fn plan_distance(q: vec2, half: vec2, corner: f32) -> f32 {
+    let c = min(corner, min(half.x, half.y))
+    let d = abs(q) - half + vec2(c)
+    length(max(d, vec2(0.0))) + min(max(d.x, d.y), 0.0) - c
+}
+
+// ---- moulded ------------------------------------------------------------------------------------
+
+/// A slab whose plan is a rectangle `half` with corners rounded to `corner`, its edge run with a
+/// moulding's profile: the profile's x is how far out from the plan's edge (inward toward minus
+/// x), its y the height, from the slab's bottom to its top.
+pub struct Moulded<const N: u32>: Copy + GpuData + Eq + StateHash {
+    pub half: vec2,
+    pub corner: f32,
+    pub edge: Profile<N>,
+}
+
+/// A moulded slab (`Moulded`) from its plan and its edge's points (out, height) and bulges (m).
+pub fn moulded<const N: u32>(
+    half: vec2,
+    corner: f32,
+    points: [vec2; N],
+    bulges: [f32; N],
+) -> Moulded<N> {
+    Moulded { half, corner, edge: profile(points, bulges, far: max(half.x, half.y) + 0.01) }
+}
+
+impl<const N: u32> Moulded<N> {
+    fn section(self, p: vec3) -> vec2 {
+        vec2(plan_distance(p.xz, self.half, self.corner), p.y)
+    }
+}
+
+impl<const N: u32> Surface for Moulded<N> {
+    fn interval_near(self, b: Box3) -> Interval {
+        stepped_near(self, b)
+    }
+
+    fn pruned<F: Copy + fn(vec3) -> vec3>(
+        self,
+        over: Box3,
+        at: F,
+        stretch: f32,
+        live: Live,
+        first: u32,
+    ) -> Pruned {
+        stepped(self, over, at, stretch, live)
+    }
+    @budget(work: 2048)
+    fn distance(self, p: vec3) -> f32 {
+        self.edge.distance(self.section(p))
+    }
+
+    fn bound(self) -> Bound {
+        let e = self.edge.extent()
+        let r = length(
+            vec3(self.half.x + max(e.x, 0.0), 0.5 * (e.z - e.y), self.half.y + max(e.x, 0.0)),
+        )
+        Bound { centre: vec3(0.0, 0.5 * (e.y + e.z), 0.0), radius: r, slope: 1.0 }
+    }
+
+    /// A 2D distance of a 1-Lipschitz map of the point (the plan's distance, the height).
+    fn lipschitz(self, near: f32) -> f32 {
+        1.0
+    }
+
+    fn rigid_shape_hash(self) -> Option<u64> {
+        Some(state_hash(self))
+    }
+}
+
+impl<const N: u32> Shaped for Moulded<N> {
+    fn shaped(self, p: vec3) -> (f32, Story) {
+        let s = self.edge.at(self.section(p))
+        (s.distance(), story(exposure_of(s.bend)))
+    }
+}
+
+// ---- banded -------------------------------------------------------------------------------------
+
+/// A closed section run round a rectangle `half` with corners rounded to `corner`: the section's
+/// x is how far out from the plan's edge, its y the height (an apron's board with its mouldings,
+/// round a table; a frame).
+pub struct Banded<const N: u32>: Copy + GpuData + Eq + StateHash {
+    pub half: vec2,
+    pub corner: f32,
+    pub section: Outline<N>,
+}
+
+/// A band (`Banded`) from its plan and its closed section's points (out, height) and bulges (m),
+/// traced with the band's inside on the left.
+pub fn banded<const N: u32>(
+    half: vec2,
+    corner: f32,
+    points: [vec2; N],
+    bulges: [f32; N],
+) -> Banded<N> {
+    Banded { half, corner, section: outline(points, bulges) }
+}
+
+impl<const N: u32> Banded<N> {
+    fn local(self, p: vec3) -> vec2 {
+        vec2(plan_distance(p.xz, self.half, self.corner), p.y)
+    }
+}
+
+impl<const N: u32> Surface for Banded<N> {
+    fn interval_near(self, b: Box3) -> Interval {
+        stepped_near(self, b)
+    }
+
+    fn pruned<F: Copy + fn(vec3) -> vec3>(
+        self,
+        over: Box3,
+        at: F,
+        stretch: f32,
+        live: Live,
+        first: u32,
+    ) -> Pruned {
+        stepped(self, over, at, stretch, live)
+    }
+    @budget(work: 2048)
+    fn distance(self, p: vec3) -> f32 {
+        self.section.distance(self.local(p))
+    }
+
+    fn bound(self) -> Bound {
+        let y = self.section.points[0].y
+        let reach = self.section.reach(vec2(0.0, y))
+        let r = length(vec3(self.half.x + reach, reach, self.half.y + reach))
+        Bound { centre: vec3(0.0, y, 0.0), radius: r, slope: 1.0 }
+    }
+
+    fn lipschitz(self, near: f32) -> f32 {
+        1.0
+    }
+
+    fn rigid_shape_hash(self) -> Option<u64> {
+        Some(state_hash(self))
+    }
+}
+
+impl<const N: u32> Shaped for Banded<N> {
+    fn shaped(self, p: vec3) -> (f32, Story) {
+        let s = self.section.at(self.local(p))
+        (s.distance(), story(exposure_of(s.bend)))
+    }
+}
+
+// ---- extruded -----------------------------------------------------------------------------------
+
+/// A closed section (z, y) run straight along x, `length` m long and centred on the origin, its
+/// ends square.
+pub struct Extruded<const N: u32>: Copy + GpuData + Eq + StateHash {
+    pub section: Outline<N>,
+    pub length: f32,
+}
+
+/// A rail (`Extruded`) from its section's points (z, height) and bulges (m) and its length.
+pub fn extruded<const N: u32>(points: [vec2; N], bulges: [f32; N], length: f32) -> Extruded<N> {
+    Extruded { section: outline(points, bulges), length }
+}
+
+impl<const N: u32> Extruded<N> {
+    /// The section's distance and how far past an end, and the section's own sum.
+    fn parts(self, p: vec3) -> (vec2, f32) {
+        let s = self.section.at(p.zy)
+        (vec2(s.distance(), abs(p.x) - 0.5 * self.length), s.bend)
+    }
+}
+
+/// The distance of an extrusion from its section's distance and how far past its end: exact.
+fn extrusion(w: vec2) -> f32 {
+    min(max(w.x, w.y), 0.0) + length(max(w, vec2(0.0)))
+}
+
+impl<const N: u32> Surface for Extruded<N> {
+    fn interval_near(self, b: Box3) -> Interval {
+        stepped_near(self, b)
+    }
+
+    fn pruned<F: Copy + fn(vec3) -> vec3>(
+        self,
+        over: Box3,
+        at: F,
+        stretch: f32,
+        live: Live,
+        first: u32,
+    ) -> Pruned {
+        stepped(self, over, at, stretch, live)
+    }
+    @budget(work: 2048)
+    fn distance(self, p: vec3) -> f32 {
+        extrusion(self.parts(p).0)
+    }
+
+    fn bound(self) -> Bound {
+        let c = self.section.points[0]
+        let reach = self.section.reach(c)
+        Bound {
+            centre: vec3(0.0, c.y, c.x),
+            radius: length(vec2(0.5 * self.length, reach)),
+            slope: 1.0,
+        }
+    }
+
+    fn lipschitz(self, near: f32) -> f32 {
+        1.0
+    }
+
+    fn rigid_shape_hash(self) -> Option<u64> {
+        Some(state_hash(self))
+    }
+}
+
+impl<const N: u32> Shaped for Extruded<N> {
+    fn shaped(self, p: vec3) -> (f32, Story) {
+        let (w, bend) = self.parts(p)
+        // Its square ends' edges are exposed as a sharp edge is, its section's as they bow.
+        let at_end = clamp(1.0 - abs(w.y) / 0.002, 0.0, 1.0) *
+            clamp(1.0 - abs(w.x) / 0.002, 0.0, 1.0)
+        (extrusion(w), story(max(exposure_of(bend), at_end)))
+    }
+}
+
+// ---- board --------------------------------------------------------------------------------------
+
+/// A board of half-size `half`, its edges and corners eased to radius `round`.
+pub struct Board: Copy + GpuData + Eq + StateHash {
+    pub half: vec3,
+    pub round: f32,
+}
+
+/// A board (`Board`).
+pub fn board(half: vec3, round: f32) -> Board {
+    Board { half, round: min(round, min(half.x, min(half.y, half.z))) }
+}
+
+impl Surface for Board {
+    fn interval_near(self, b: Box3) -> Interval {
+        stepped_near(self, b)
+    }
+
+    fn pruned<F: Copy + fn(vec3) -> vec3>(
+        self,
+        over: Box3,
+        at: F,
+        stretch: f32,
+        live: Live,
+        first: u32,
+    ) -> Pruned {
+        stepped(self, over, at, stretch, live)
+    }
+    @budget(work: 64)
+    fn distance(self, p: vec3) -> f32 {
+        let q = abs(p) - self.half + vec3(self.round)
+        length(max(q, vec3(0.0))) + min(max(q.x, max(q.y, q.z)), 0.0) - self.round
+    }
+
+    fn bound(self) -> Bound {
+        Bound { centre: vec3(), radius: length(self.half), slope: 1.0 }
+    }
+
+    fn lipschitz(self, near: f32) -> f32 {
+        1.0
+    }
+
+    fn rigid_shape_hash(self) -> Option<u64> {
+        Some(state_hash(self))
+    }
+}
+
+impl Shaped for Board {
+    fn shaped(self, p: vec3) -> (f32, Story) {
+        let q = abs(p) - self.half + vec3(self.round)
+        // On an eased edge, as rounded as `round`: past two faces' insides at once.
+        let over = max(q, vec3(0.0))
+        let edge = if (over.x > 0.0 && over.y > 0.0) ||
+            (over.y > 0.0 && over.z > 0.0) ||
+            (over.x > 0.0 && over.z > 0.0) {
+            exposure_of(1.0 / max(self.round, 1.0e-4))
+        } else { 0.0 }
+        (self.distance(p), story(edge))
+    }
+}
+
+// ---- joined -------------------------------------------------------------------------------------
+
+/// Two parts butted together with the seam between them showing: a groove `gap` m wide at the
+/// surface where their distances are equal, `depth` m deep (a mortise-and-tenon's shoulder line,
+/// a glue line). Where the parts don't meet there is no seam. Joined parts overlap, as a tenon
+/// lies in its mortise: two that only touch have a face of nought between them, which reads as
+/// the surface, and the seam would open all along it.
+pub struct Joined<A, B>: Copy + GpuData + Eq + StateHash {
+    pub a: A,
+    pub b: B,
+    pub gap: f32,
+    pub depth: f32,
+}
+
+/// `a` and `b` joined (`Joined`).
+pub fn joined<A: Shaped, B: Shaped>(a: A, b: B, gap: f32, depth: f32) -> Joined<A, B> {
+    Joined { a, b, gap, depth }
+}
+
+/// The union, cut where the two distances are within `gap` of each other near its surface (the
+/// seam is removed where `|da - db| / 2 < gap / 2` and the union is no deeper than `depth`).
+fn seamed(da: f32, db: f32, gap: f32, depth: f32) -> f32 {
+    let u = min(da, db)
+    let s = 0.5 * abs(da - db)
+    max(u, min(0.5 * gap - s, u + depth))
+}
+
+impl<A: Shaped, B: Shaped> Surface for Joined<A, B> {
+    fn interval_near(self, b: Box3) -> Interval {
+        stepped_near(self, b)
+    }
+
+    fn masked(self, p: vec3, live: Live, first: u32) -> f32 {
+        pair_masked(
+            self.a,
+            self.b,
+            p,
+            live,
+            first,
+            |x: f32, y: f32| seamed(x, y, self.gap, self.depth),
+        )
+    }
+
+    fn pruned<F: Copy + fn(vec3) -> vec3>(
+        self,
+        over: Box3,
+        at: F,
+        stretch: f32,
+        live: Live,
+        first: u32,
+    ) -> Pruned {
+        let na = self.a.parts()
+        let nb = self.b.parts()
+        let ra = self.a.pruned(over, at, stretch, live, first)
+        let rb = self.b.pruned(over, at, stretch, ra.live, first + na)
+        let gap = max(self.gap, 0.0)
+        if ra.range.lo + rb.range.lo > gap {
+            if rb.range.lo > ra.range.hi + gap {
+                return Pruned { live: rb.live.without(first + na, nb), range: ra.range }
+            }
+            if ra.range.lo > rb.range.hi + gap {
+                return Pruned { live: rb.live.without(first, na), range: rb.range }
+            }
+        }
+        Pruned {
+            live: rb.live,
+            range: Interval {
+                lo: min(ra.range.lo, rb.range.lo),
+                hi: min(ra.range.hi, rb.range.hi) + max(self.depth, 0.0),
+            },
+        }
+    }
+    fn distance(self, p: vec3) -> f32 {
+        seamed(self.a.distance(p), self.b.distance(p), self.gap, self.depth)
+    }
+
+    fn parts(self) -> u32 {
+        self.a.parts() + self.b.parts()
+    }
+
+    /// The nearer part's, as a union's.
+    fn part_at(self, p: vec3) -> (f32, u32) {
+        let (_, ia) = self.a.part_at(p)
+        let (_, ib) = self.b.part_at(p)
+        let nearer_a = self.a.distance(p) <= self.b.distance(p)
+        (self.distance(p), if nearer_a { ia } else { self.a.parts() + ib })
+    }
+
+    fn part_distance(self, p: vec3, i: u32) -> f32 {
+        let n = self.a.parts()
+        if i < n { self.a.part_distance(p, i) } else { self.b.part_distance(p, i - n) }
+    }
+
+    fn part_name(self, i: u32) -> PartName {
+        let n = self.a.parts()
+        if i < n { self.a.part_name(i) } else { self.b.part_name(i - n) }
+    }
+
+    fn part_offset(self, p: vec3, i: u32, by: f32) -> f32 {
+        let n = self.a.parts()
+        let da = if i < n { self.a.part_offset(p, i, by) } else { self.a.distance(p) }
+        let db = if i < n { self.b.distance(p) } else { self.b.part_offset(p, i - n, by) }
+        min(da, db)
+    }
+
+    fn bound(self) -> Bound {
+        self.a.bound().and(self.b.bound())
+    }
+
+    /// The union's and the seam's cut are each 1-Lipschitz (half the difference of two
+    /// 1-Lipschitz distances is too), and a max and a min of them are.
+    fn lipschitz(self, near: f32) -> f32 {
+        max(self.a.lipschitz(near), self.b.lipschitz(near))
+    }
+
+    fn rigid_shape_hash(self) -> Option<u64> {
+        match (self.a.rigid_shape_hash(), self.b.rigid_shape_hash()) {
+            (Some(_), Some(_)) => Some(state_hash(self)),
+            _ => None,
+        }
+    }
+}
+
+impl<A: Shaped, B: Shaped> Shaped for Joined<A, B> {
+    fn shaped_part(self, p: vec3) -> (f32, Story, u32) {
+        let (da, sa, ia) = self.a.shaped_part(p)
+        let (db, sb, ib) = self.b.shaped_part(p)
+        let n = self.a.parts()
+        let d = seamed(da, db, self.gap, self.depth)
+        if 0.5 * abs(da - db) < self.gap {
+            let piece = if da <= db { sa.piece } else { sb.piece }
+            return (d, Story { exposure: -1.0, depth: self.depth, piece }, if da <= db { ia } else {
+                n + ib
+            })
+        }
+        if da <= db { (d, sa, ia) } else { (d, sb, n + ib) }
+    }
+
+    fn piece_of(self, part: u32) -> u32 {
+        let n = self.a.parts()
+        if part < n { self.a.piece_of(part) } else { self.b.piece_of(part - n) }
+    }
+
+    fn detail_at(self, p: vec3, part: u32, story: Story) -> (Story, f32) {
+        let n = self.a.parts()
+        if part < n {
+            self.a.detail_at(p, part, story)
+        } else {
+            self.b.detail_at(p, part - n, story)
+        }
+    }
+
+    fn shaped(self, p: vec3) -> (f32, Story) {
+        let (da, sa) = self.a.shaped(p)
+        let (db, sb) = self.b.shaped(p)
+        let d = seamed(da, db, self.gap, self.depth)
+        let near_seam = 0.5 * abs(da - db) < self.gap
+        let story = if near_seam {
+            Story { exposure: -1.0, depth: self.depth, piece: if da <= db {
+                sa.piece
+            } else { sb.piece } }
+        } else if da <= db {
+            sa
+        } else { sb }
+        (d, story)
+    }
+}
+
+// ---- folded -------------------------------------------------------------------------------------
+
+/// A part made once on the positive side of some of the planes x = 0, y = 0 and z = 0 and set
+/// again as its mirror image across each (a table's legs at its four corners; a book's corners,
+/// top and bottom, front and back): one part, asked once.
+pub struct Folded<S>: Copy + GpuData + Eq + StateHash {
+    pub part: S,
+    /// Which planes it is mirrored across: 1 for each of x, y and z that is, else 0.
+    pub across: vec3,
+}
+
+/// `part` mirrored across x = 0 and z = 0, so at four corners (`Folded`).
+pub fn folded<S: Shaped>(part: S) -> Folded<S> {
+    Folded { part, across: vec3(1.0, 0.0, 1.0) }
+}
+
+/// `part` mirrored across each plane `x`, `y` and `z` says (`Folded`).
+pub fn folded_across<S: Shaped>(
+    part: S,
+    x: bool = false,
+    y: bool = false,
+    z: bool = false,
+) -> Folded<S> {
+    Folded { part, across: vec3(if x { 1.0 } else { 0.0 }, if y { 1.0 } else { 0.0 }, if z {
+        1.0
+    } else { 0.0 }) }
+}
+
+impl<S: Shaped> Folded<S> {
+    fn fold(self, p: vec3) -> vec3 {
+        mix(p, abs(p), self.across)
+    }
+}
+
+impl<S: Shaped> Surface for Folded<S> {
+    fn interval_near(self, b: Box3) -> Interval {
+        stepped_near(self, b)
+    }
+
+    fn pruned<F: Copy + fn(vec3) -> vec3>(
+        self,
+        over: Box3,
+        at: F,
+        stretch: f32,
+        live: Live,
+        first: u32,
+    ) -> Pruned {
+        stepped(self, over, at, stretch, live)
+    }
+    fn distance(self, p: vec3) -> f32 {
+        self.part.distance(self.fold(p))
+    }
+
+    /// The part's bound and its images', joined.
+    fn bound(self) -> Bound {
+        let b = self.part.bound()
+        let c = b.centre
+        let m = vec3(1.0) - 2.0 * self.across
+        // The image across every folded plane at once holds the others' between it and the part.
+        let far = Bound { centre: c * m, ..b }
+        let x = Bound { centre: c * vec3(m.x, 1.0, 1.0), ..b }
+        let z = Bound { centre: c * vec3(1.0, 1.0, m.z), ..b }
+        let y = Bound { centre: c * vec3(1.0, m.y, 1.0), ..b }
+        b.and(far).and(x).and(y).and(z)
+    }
+
+    /// The part's (folding is 1-Lipschitz).
+    fn lipschitz(self, near: f32) -> f32 {
+        self.part.lipschitz(near)
+    }
+
+    fn rigid_shape_hash(self) -> Option<u64> {
+        match self.part.rigid_shape_hash() {
+            Some(_) => Some(state_hash(self)),
+            None => None,
+        }
+    }
+
+    fn parts(self) -> u32 {
+        self.part.parts()
+    }
+
+    fn part_at(self, p: vec3) -> (f32, u32) {
+        (self.distance(p), self.part.part_at(self.fold(p)).1)
+    }
+
+    fn part_distance(self, p: vec3, i: u32) -> f32 {
+        self.part.part_distance(self.fold(p), i)
+    }
+
+    fn part_name(self, i: u32) -> PartName {
+        self.part.part_name(i)
+    }
+
+    fn part_offset(self, p: vec3, i: u32, by: f32) -> f32 {
+        self.part.part_offset(self.fold(p), i, by)
+    }
+}
+
+impl<S: Shaped> Shaped for Folded<S> {
+    fn shaped_part(self, p: vec3) -> (f32, Story, u32) {
+        let (d, st, i) = self.part.shaped_part(self.fold(p))
+        (d, st, i)
+    }
+
+    fn piece_of(self, part: u32) -> u32 {
+        self.part.piece_of(part)
+    }
+
+    fn detail_at(self, p: vec3, part: u32, story: Story) -> (Story, f32) {
+        self.part.detail_at(self.fold(p), part, story)
+    }
+
+    fn shaped(self, p: vec3) -> (f32, Story) {
+        self.part.shaped(self.fold(p))
+    }
+}
+
+// ---- placed -------------------------------------------------------------------------------------
+
+/// Where a part's own axes point in the whole: a rotation, by the images of its x, y and z.
+pub struct Axes: Copy + GpuData + Eq + StateHash {
+    pub x: vec3,
+    pub y: vec3,
+    pub z: vec3,
+}
+
+/// A part's axes as the whole's.
+pub fn upright() -> Axes {
+    Axes { x: vec3(1.0, 0.0, 0.0), y: vec3(0.0, 1.0, 0.0), z: vec3(0.0, 0.0, 1.0) }
+}
+
+/// A part's y axis laid along the whole's x (a turned stretcher lying along x).
+pub fn lying_x() -> Axes {
+    Axes { x: vec3(0.0, -1.0, 0.0), y: vec3(1.0, 0.0, 0.0), z: vec3(0.0, 0.0, 1.0) }
+}
+
+/// A part's x axis laid along the whole's z, its z along the whole's minus x (a rail or a book's
+/// spine running along z, drawn from a section in its own (z, y)).
+pub fn running_z() -> Axes {
+    Axes { x: vec3(0.0, 0.0, 1.0), y: vec3(0.0, 1.0, 0.0), z: vec3(-1.0, 0.0, 0.0) }
+}
+
+/// A part turned `a` rad about the whole's y axis (from +x toward -z).
+pub fn turned_y(a: f32) -> Axes {
+    let c = cos(a)
+    let s = sin(a)
+    Axes { x: vec3(c, 0.0, -s), y: vec3(0.0, 1.0, 0.0), z: vec3(s, 0.0, c) }
+}
+
+/// A part's y axis laid along the whole's z.
+pub fn lying_z() -> Axes {
+    Axes { x: vec3(1.0, 0.0, 0.0), y: vec3(0.0, 0.0, 1.0), z: vec3(0.0, -1.0, 0.0) }
+}
+
+/// A part moved to `at` and turned so its axes lie along `axes`: a leg at its corner, a stretcher
+/// laid along x. Rigid, so exact.
+pub struct Placed<S>: Copy + GpuData + Eq + StateHash {
+    pub part: S,
+    pub at: vec3,
+    pub axes: Axes,
+}
+
+/// `part` placed at `at`, its axes along `axes` (`Placed`).
+pub fn placed<S: Shaped>(part: S, at: vec3, axes: Axes = upright()) -> Placed<S> {
+    Placed { part, at, axes }
+}
+
+impl<S: Shaped> Placed<S> {
+    /// `p` in the part's own frame.
+    fn local(self, p: vec3) -> vec3 {
+        let v = p - self.at
+        vec3(dot(v, self.axes.x), dot(v, self.axes.y), dot(v, self.axes.z))
+    }
+}
+
+impl<S: Shaped> Surface for Placed<S> {
+    fn interval_near(self, b: Box3) -> Interval {
+        stepped_near(self, b)
+    }
+
+    fn pruned<F: Copy + fn(vec3) -> vec3>(
+        self,
+        over: Box3,
+        at: F,
+        stretch: f32,
+        live: Live,
+        first: u32,
+    ) -> Pruned {
+        stepped(self, over, at, stretch, live)
+    }
+    fn distance(self, p: vec3) -> f32 {
+        self.part.distance(self.local(p))
+    }
+
+    fn parts(self) -> u32 {
+        self.part.parts()
+    }
+
+    fn part_at(self, p: vec3) -> (f32, u32) {
+        (self.distance(p), self.part.part_at(self.local(p)).1)
+    }
+
+    fn part_distance(self, p: vec3, i: u32) -> f32 {
+        self.part.part_distance(self.local(p), i)
+    }
+
+    fn part_name(self, i: u32) -> PartName {
+        self.part.part_name(i)
+    }
+
+    fn part_offset(self, p: vec3, i: u32, by: f32) -> f32 {
+        self.part.part_offset(self.local(p), i, by)
+    }
+
+    fn bound(self) -> Bound {
+        let b = self.part.bound()
+        let c = b.centre
+        Bound { centre: self.axes.x * c.x + self.axes.y * c.y + self.axes.z * c.z + self.at, ..b }
+    }
+
+    fn lipschitz(self, near: f32) -> f32 {
+        self.part.lipschitz(near)
+    }
+
+    fn rigid_shape_hash(self) -> Option<u64> {
+        match self.part.rigid_shape_hash() {
+            Some(_) => Some(state_hash(self)),
+            None => None,
+        }
+    }
+}
+
+impl<S: Shaped> Shaped for Placed<S> {
+    fn shaped_part(self, p: vec3) -> (f32, Story, u32) {
+        let (d, st, i) = self.part.shaped_part(self.local(p))
+        (d, st, i)
+    }
+
+    fn piece_of(self, part: u32) -> u32 {
+        self.part.piece_of(part)
+    }
+
+    fn detail_at(self, p: vec3, part: u32, story: Story) -> (Story, f32) {
+        self.part.detail_at(self.local(p), part, story)
+    }
+
+    fn shaped(self, p: vec3) -> (f32, Story) {
+        self.part.shaped(self.local(p))
+    }
+}
+
+// ---- several ------------------------------------------------------------------------------------
+
+/// Two made parts as one (a union), each telling its own story where it is nearer.
+pub struct Both<A, B>: Copy + GpuData + Eq + StateHash {
+    pub a: A,
+    pub b: B,
+}
+
+/// `a` and `b` as one part (`Both`).
+pub fn both<A: Shaped, B: Shaped>(a: A, b: B) -> Both<A, B> {
+    Both { a, b }
+}
+
+impl<A: Shaped, B: Shaped> Surface for Both<A, B> {
+    fn interval_near(self, b: Box3) -> Interval {
+        stepped_near(self, b)
+    }
+
+    fn masked(self, p: vec3, live: Live, first: u32) -> f32 {
+        pair_masked(self.a, self.b, p, live, first, |x: f32, y: f32| min(x, y))
+    }
+
+    fn pruned<F: Copy + fn(vec3) -> vec3>(
+        self,
+        over: Box3,
+        at: F,
+        stretch: f32,
+        live: Live,
+        first: u32,
+    ) -> Pruned {
+        pair_pruned(self.a, self.b, over, at, stretch, live, first, 0.0)
+    }
+    fn distance(self, p: vec3) -> f32 {
+        min(self.a.distance(p), self.b.distance(p))
+    }
+
+    fn parts(self) -> u32 {
+        self.a.parts() + self.b.parts()
+    }
+
+    /// The nearer part's, as a union's.
+    fn part_at(self, p: vec3) -> (f32, u32) {
+        let (_, ia) = self.a.part_at(p)
+        let (_, ib) = self.b.part_at(p)
+        let nearer_a = self.a.distance(p) <= self.b.distance(p)
+        (self.distance(p), if nearer_a { ia } else { self.a.parts() + ib })
+    }
+
+    fn part_distance(self, p: vec3, i: u32) -> f32 {
+        let n = self.a.parts()
+        if i < n { self.a.part_distance(p, i) } else { self.b.part_distance(p, i - n) }
+    }
+
+    fn part_name(self, i: u32) -> PartName {
+        let n = self.a.parts()
+        if i < n { self.a.part_name(i) } else { self.b.part_name(i - n) }
+    }
+
+    fn part_offset(self, p: vec3, i: u32, by: f32) -> f32 {
+        let n = self.a.parts()
+        let da = if i < n { self.a.part_offset(p, i, by) } else { self.a.distance(p) }
+        let db = if i < n { self.b.distance(p) } else { self.b.part_offset(p, i - n, by) }
+        min(da, db)
+    }
+
+    fn bound(self) -> Bound {
+        self.a.bound().and(self.b.bound())
+    }
+
+    fn lipschitz(self, near: f32) -> f32 {
+        max(self.a.lipschitz(near), self.b.lipschitz(near))
+    }
+
+    fn rigid_shape_hash(self) -> Option<u64> {
+        match (self.a.rigid_shape_hash(), self.b.rigid_shape_hash()) {
+            (Some(_), Some(_)) => Some(state_hash(self)),
+            _ => None,
+        }
+    }
+}
+
+impl<A: Shaped, B: Shaped> Shaped for Both<A, B> {
+    fn shaped_part(self, p: vec3) -> (f32, Story, u32) {
+        let (da, sa, ia) = self.a.shaped_part(p)
+        let (db, sb, ib) = self.b.shaped_part(p)
+        let n = self.a.parts()
+        if da <= db { (da, sa, ia) } else { (db, sb, n + ib) }
+    }
+
+    fn piece_of(self, part: u32) -> u32 {
+        let n = self.a.parts()
+        if part < n { self.a.piece_of(part) } else { self.b.piece_of(part - n) }
+    }
+
+    fn detail_at(self, p: vec3, part: u32, story: Story) -> (Story, f32) {
+        let n = self.a.parts()
+        if part < n {
+            self.a.detail_at(p, part, story)
+        } else {
+            self.b.detail_at(p, part - n, story)
+        }
+    }
+
+    fn shaped(self, p: vec3) -> (f32, Story) {
+        let (da, sa) = self.a.shaped(p)
+        let (db, sb) = self.b.shaped(p)
+        if da <= db { (da, sa) } else { (db, sb) }
+    }
+}
+
+// ---- grown --------------------------------------------------------------------------------------
+
+/// A part grown by a layer `by` m thick all over: leather turned over a board, its corners
+/// rounded by the layer as leather's are.
+pub struct Grown<S>: Copy + GpuData + Eq + StateHash {
+    pub part: S,
+    pub by: f32,
+}
+
+/// `part` grown by `by` (`Grown`).
+pub fn grown<S: Shaped>(part: S, by: f32) -> Grown<S> {
+    Grown { part, by }
+}
+
+impl<S: Shaped> Surface for Grown<S> {
+    fn interval_near(self, b: Box3) -> Interval {
+        stepped_near(self, b)
+    }
+
+    fn pruned<F: Copy + fn(vec3) -> vec3>(
+        self,
+        over: Box3,
+        at: F,
+        stretch: f32,
+        live: Live,
+        first: u32,
+    ) -> Pruned {
+        stepped(self, over, at, stretch, live)
+    }
+    fn distance(self, p: vec3) -> f32 {
+        self.part.distance(p) - self.by
+    }
+
+    fn parts(self) -> u32 {
+        self.part.parts()
+    }
+
+    fn part_at(self, p: vec3) -> (f32, u32) {
+        (self.distance(p), self.part.part_at(p).1)
+    }
+
+    fn part_distance(self, p: vec3, i: u32) -> f32 {
+        self.part.part_distance(p, i) - self.by
+    }
+
+    fn part_name(self, i: u32) -> PartName {
+        self.part.part_name(i)
+    }
+
+    fn part_offset(self, p: vec3, i: u32, by: f32) -> f32 {
+        self.part.part_offset(p, i, by) - self.by
+    }
+
+    fn bound(self) -> Bound {
+        self.part.bound().lowered(self.by)
+    }
+
+    fn lipschitz(self, near: f32) -> f32 {
+        self.part.lipschitz(near + abs(self.by))
+    }
+
+    fn rigid_shape_hash(self) -> Option<u64> {
+        match self.part.rigid_shape_hash() {
+            Some(_) => Some(state_hash(self)),
+            None => None,
+        }
+    }
+}
+
+impl<S: Shaped> Shaped for Grown<S> {
+    fn shaped_part(self, p: vec3) -> (f32, Story, u32) {
+        let (d, st, i) = self.part.shaped_part(p)
+        (d - self.by, st, i)
+    }
+
+    fn piece_of(self, part: u32) -> u32 {
+        self.part.piece_of(part)
+    }
+
+    fn detail_at(self, p: vec3, part: u32, story: Story) -> (Story, f32) {
+        self.part.detail_at(p, part, story)
+    }
+
+    fn shaped(self, p: vec3) -> (f32, Story) {
+        let (d, s) = self.part.shaped(p)
+        (d - self.by, s)
+    }
+}
+
+// ---- sheathed -----------------------------------------------------------------------------------
+
+/// A sheet `thick` m thick laid over a part's surface where `region` is (its distance below 0): a
+/// brass corner over a book's board, a strap round a box. Its rim, where the region ends, is a
+/// sharp edge and is exposed; over the part's edges it is exposed as they are.
+pub struct Sheathed<S, R>: Copy + GpuData + Eq + StateHash {
+    pub part: S,
+    pub thick: f32,
+    pub region: R,
+}
+
+/// A sheet over `part` within `region` (`Sheathed`): only the sheet, not the part.
+pub fn sheathed<S: Shaped, R: Surface + StateHash + Eq>(
+    part: S,
+    thick: f32,
+    region: R,
+) -> Sheathed<S, R> {
+    Sheathed { part, thick, region }
+}
+
+impl<S: Shaped, R: Surface + StateHash + Eq> Sheathed<S, R> {
+    fn sheet(self, d: f32, r: f32) -> f32 {
+        max(abs(d - 0.5 * self.thick) - 0.5 * self.thick, r)
+    }
+}
+
+impl<S: Shaped, R: Surface + StateHash + Eq> Surface for Sheathed<S, R> {
+    fn interval_near(self, b: Box3) -> Interval {
+        stepped_near(self, b)
+    }
+
+    fn pruned<F: Copy + fn(vec3) -> vec3>(
+        self,
+        over: Box3,
+        at: F,
+        stretch: f32,
+        live: Live,
+        first: u32,
+    ) -> Pruned {
+        stepped(self, over, at, stretch, live)
+    }
+    fn distance(self, p: vec3) -> f32 {
+        self.sheet(self.part.distance(p), self.region.distance(p))
+    }
+
+    /// The region's, where the sheet can be.
+    fn bound(self) -> Bound {
+        self.region.bound()
+    }
+
+    fn lipschitz(self, near: f32) -> f32 {
+        max(self.part.lipschitz(near + self.thick), self.region.lipschitz(near))
+    }
+
+    fn rigid_shape_hash(self) -> Option<u64> {
+        match (self.part.rigid_shape_hash(), self.region.rigid_shape_hash()) {
+            (Some(_), Some(_)) => Some(state_hash(self)),
+            _ => None,
+        }
+    }
+}
+
+impl<S: Shaped, R: Surface + StateHash + Eq> Shaped for Sheathed<S, R> {
+    fn piece_of(self, part: u32) -> u32 {
+        self.part.piece_of(part)
+    }
+
+    fn shaped(self, p: vec3) -> (f32, Story) {
+        let (d, s) = self.part.shaped(p)
+        let r = self.region.distance(p)
+        let rim = clamp(1.0 + r / max(self.thick, 1.0e-5), 0.0, 1.0)
+        (self.sheet(d, r), Story { exposure: max(s.exposure, rim), ..s })
+    }
+}
+
+/// Plain story for surfaces that tell none.
+pub fn untold(d: f32) -> (f32, Story) {
+    (d, plain())
+}
+
+@test
+fn making_surfaces_are_sound() {
+    let b = board(vec3(0.12, 0.02, 0.08), round: 0.004)
+    verify_surface_soundness(b, "kit_board")
+    let leg = turned(
+        [vec2(0.02, 0.0), vec2(0.03, 0.08), vec2(0.018, 0.16), vec2(0.024, 0.2)],
+        [0.004, 0.008, -0.003, 0.0],
+    )
+    verify_surface_soundness(leg, "kit_turned")
+    let top = moulded(
+        vec2(0.16, 0.10),
+        corner: 0.015,
+        points: [vec2(-0.01, 0.0), vec2(0.0, 0.005), vec2(-0.01, 0.02)],
+        bulges: [0.002, 0.003, 0.0],
+    )
+    verify_surface_soundness(top, "kit_moulded")
+    let frame = banded(
+        vec2(0.12, 0.08),
+        corner: 0.01,
+        points: [vec2(-0.015, 0.0), vec2(0.0, 0.0), vec2(0.0, 0.04), vec2(-0.015, 0.04)],
+        bulges: [0.0, 0.002, 0.0, 0.0],
+    )
+    verify_surface_soundness(frame, "kit_banded")
+    let rail = extruded(
+        points: [vec2(-0.01, -0.01), vec2(0.01, -0.01), vec2(0.01, 0.01), vec2(-0.01, 0.01)],
+        bulges: [0.0, 0.0, 0.0, 0.0],
+        length: 0.2,
+    )
+    verify_surface_soundness(rail, "kit_extruded")
+    let p = placed(b, at: vec3(0.05, 0.04, 0.0), axes: upright())
+    verify_surface_soundness(joined(b, p, gap: 0.002, depth: 0.001), "kit_joined")
+    verify_surface_soundness(folded(p), "kit_folded")
+    verify_surface_soundness(both(b, p), "kit_both")
+    verify_surface_soundness(grown(b, by: 0.003), "kit_grown")
+    verify_surface_soundness(
+        sheathed(b, thick: 0.002, region: board(vec3(0.06, 0.04, 0.05), round: 0.002)),
+        "kit_sheathed",
+    )
+}

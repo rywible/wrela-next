@@ -2043,7 +2043,7 @@ fn pair_part_name<A: Surface, B: Surface>(a: A, b: B, i: u32) -> PartName {
 /// asked; when only one operand has live parts it is returned directly without invoking `join`
 /// against `EMPTY` (which exceeds affine arithmetic's finite cap). One exit, each operand written
 /// once.
-fn pair_masked<A: Surface, B: Surface, J: Copy + fn(f32, f32) -> f32>(
+pub fn pair_masked<A: Surface, B: Surface, J: Copy + fn(f32, f32) -> f32>(
     a: A,
     b: B,
     p: vec3,
@@ -2069,7 +2069,7 @@ fn pair_masked<A: Surface, B: Surface, J: Copy + fn(f32, f32) -> f32>(
 
 /// `pruned` of `a` and `b` joined by `smin` of width `k` (`min` for 0): each operand's, then
 /// `joined`'s.
-fn pair_pruned<A: Surface, B: Surface, F: Copy + fn(vec3) -> vec3>(
+pub fn pair_pruned<A: Surface, B: Surface, F: Copy + fn(vec3) -> vec3>(
     a: A,
     b: B,
     over: Box3,
@@ -3746,6 +3746,8 @@ impl<C, S: Field<C>> Field<C> for ToBound<S> {
             f.may_micro,
             f.channels_proven,
             f.max_freq,
+            f.may_bump,
+            f.use_stepped_bounds,
         )
     }
 }
@@ -3873,6 +3875,11 @@ pub struct FieldFacts: Copy {
     pub may_coat: bool,
     pub may_subsurface: bool,
     pub may_micro: bool,
+    pub may_bump: bool,
+    /// True when the field overrides `pruned` / `interval_near` with Lipschitz-stepped bounds
+    /// instead of compiler-derived interval/affine trees (large composite carved shapes whose
+    /// full affine tree would exceed Metal's 288 KiB shader size budget).
+    pub use_stepped_bounds: bool,
     /// True only when build-time zero-sample affine verification proved every channel finite and
     /// within physical PBR ranges across the surface, allowing runtime NaN/range guards to erase.
     pub channels_proven: bool,
@@ -3893,6 +3900,8 @@ impl FieldFacts {
             may_coat: true,
             may_subsurface: true,
             may_micro: true,
+            may_bump: true,
+            use_stepped_bounds: false,
             channels_proven: false,
             max_freq: 1.0 / 0.0,
             seal: (),
@@ -3909,6 +3918,8 @@ impl FieldFacts {
         may_micro: bool,
         channels_proven: bool = false,
         max_freq: f32 = 1.0 / 0.0,
+        may_bump: bool = false,
+        use_stepped_bounds: bool = false,
     ) -> FieldFacts {
         FieldFacts {
             lip,
@@ -3917,6 +3928,8 @@ impl FieldFacts {
             may_coat,
             may_subsurface,
             may_micro,
+            may_bump,
+            use_stepped_bounds,
             channels_proven,
             max_freq,
             seal: (),
@@ -3932,6 +3945,8 @@ impl FieldFacts {
             may_coat: self.may_coat || other.may_coat,
             may_subsurface: self.may_subsurface || other.may_subsurface,
             may_micro: self.may_micro || other.may_micro,
+            may_bump: self.may_bump || other.may_bump,
+            use_stepped_bounds: self.use_stepped_bounds || other.use_stepped_bounds,
             channels_proven: self.channels_proven && other.channels_proven,
             max_freq: max(self.max_freq, other.max_freq),
             seal: (),
@@ -3972,10 +3987,42 @@ pub trait Field<C>: Surface {
     }
 
     /// Build-time proven static facts about this field (Lipschitz bound, transmission, emission,
-    /// coat, subsurface, micro-detail). Override to return a `const` witness so the compiler
+    /// coat, subsurface, micro-detail, bump). Override to return a `const` witness so the compiler
     /// erases dead branches and verifiers at build time.
     fn field_facts(self) -> FieldFacts {
         FieldFacts::unknown()
+    }
+
+    /// True when this field overrides `kept` / `channels_kept` so the mesher should run
+    /// `keep_verts` and the visibility resolve should shade via `channels_kept`; false by default
+    /// so fields without per-vertex kept data pay zero memory, dispatch, or register overhead.
+    fn uses_kept(self) -> bool {
+        false
+    }
+
+    /// What the field keeps at a point `p` of its surface where the engine makes a mesh of it,
+    /// `part` being the part there (`part_at`): four numbers in [0, 1] that change slowly across
+    /// the surface (how worn a point is, how deep a cut, from the shape that made it), worked out
+    /// once, at each vertex, and blended across each triangle, so a pixel need not work them out
+    /// again (`channels_kept`). None by default.
+    fn kept(self, p: vec3, part: u32) -> vec4 {
+        vec4(0.0)
+    }
+
+    /// The channels at `p`, `part` being the part it is on (as the mesh keeps it, the part at the
+    /// triangle's first vertex) and `kept` what `kept` gave there, blended: what a pixel asks. A
+    /// union asks only the part, not every part; a field that keeps what it would otherwise work
+    /// out again at every pixel answers from it. By default, `channels(p)`.
+    fn channels_kept(self, p: vec3, part: u32, kept: vec4) -> C {
+        self.channels(p)
+    }
+
+    /// The distance at `p`, the part there (`part_at`) and what the field keeps there (`kept`),
+    /// from one evaluation where a field can give them so: what the engine asks of each vertex
+    /// of its mesh.
+    fn kept_at(self, p: vec3) -> (f32, u32, vec4) {
+        let (d, i) = self.part_at(p)
+        (d, i, self.kept(p, i))
     }
 }
 
@@ -4358,6 +4405,27 @@ impl<C: Blend, A: Field<C>, B: Field<C>> Field<C> for Union<A, B> {
         self.distance_and_channels(p).1
     }
 
+    /// The part's own operand's.
+    fn kept(self, p: vec3, part: u32) -> vec4 {
+        let n = self.a.parts()
+        if part < n { self.a.kept(p, part) } else { self.b.kept(p, part - n) }
+    }
+
+    /// The part's own operand's, the other not asked.
+    fn channels_kept(self, p: vec3, part: u32, kept: vec4) -> C {
+        let n = self.a.parts()
+        if part < n { self.a.channels_kept(p, part, kept) } else {
+            self.b.channels_kept(p, part - n, kept)
+        }
+    }
+
+    /// The nearer operand's; a tie takes `a`'s.
+    fn kept_at(self, p: vec3) -> (f32, u32, vec4) {
+        let (da, ia, ka) = self.a.kept_at(p)
+        let (db, ib, kb) = self.b.kept_at(p)
+        if da <= db { (da, ia, ka) } else { (db, self.a.parts() + ib, kb) }
+    }
+
     /// The nearer part's channels; a tie takes `a`'s.
     fn distance_and_channels(self, p: vec3) -> (f32, C) {
         let (da, ca) = self.a.distance_and_channels(p)
@@ -4367,6 +4435,10 @@ impl<C: Blend, A: Field<C>, B: Field<C>> Field<C> for Union<A, B> {
 
     fn field_facts(self) -> FieldFacts {
         self.a.field_facts().join(self.b.field_facts())
+    }
+
+    fn uses_kept(self) -> bool {
+        self.a.uses_kept() || self.b.uses_kept()
     }
 }
 
@@ -4410,6 +4482,19 @@ impl<C, S: Field<C>, M: PointMap> Field<C> for Warp<S, M> {
         self.inner.channels(self.map.local(p))
     }
 
+    fn kept(self, p: vec3, part: u32) -> vec4 {
+        self.inner.kept(self.map.local(p), part)
+    }
+
+    fn channels_kept(self, p: vec3, part: u32, kept: vec4) -> C {
+        self.inner.channels_kept(self.map.local(p), part, kept)
+    }
+
+    fn kept_at(self, p: vec3) -> (f32, u32, vec4) {
+        let (d, i, k) = self.inner.kept_at(self.map.local(p))
+        (self.map.distance_out(d), i, k)
+    }
+
     fn distance_and_channels(self, p: vec3) -> (f32, C) {
         let (d, c) = self.inner.distance_and_channels(self.map.local(p))
         (self.map.distance_out(d), c)
@@ -4429,6 +4514,10 @@ impl<C, S: Field<C>, M: PointMap> Field<C> for Warp<S, M> {
 
     fn field_facts(self) -> FieldFacts {
         self.inner.field_facts()
+    }
+
+    fn uses_kept(self) -> bool {
+        self.inner.uses_kept()
     }
 }
 
@@ -4453,6 +4542,8 @@ impl<C, S: Field<C>, N: Noise> Field<C> for Displace<S, N> {
             f.may_micro,
             f.channels_proven,
             f.max_freq,
+            f.may_bump,
+            f.use_stepped_bounds,
         )
     }
 }
@@ -4460,8 +4551,45 @@ impl<C, S: Field<C>, N: Noise> Field<C> for Displace<S, N> {
 /// The nearest part's channels; a tie takes the earlier part's, as `a.union(b)` does. A union
 /// of no parts has no channels: asking for them indexes past the end (§11).
 impl<C: Blend, S: Field<C>, const N: u32> Field<C> for UnionAll<S, N> {
+    fn uses_kept(self) -> bool {
+        if N == 0 {
+            return false
+        }
+        self.parts[0].uses_kept()
+    }
+
     fn channels(self, p: vec3) -> C {
         self.distance_and_channels(p).1
+    }
+
+    /// The part's own element's, its parts numbered after the elements' before it.
+    fn kept(self, p: vec3, part: u32) -> vec4 {
+        var first: u32 = 0
+        var k = vec4(0.0)
+        for i in 0..N {
+            let n = self.parts[i].parts()
+            if part >= first && part < first + n {
+                k = self.parts[i].kept(p, part - first)
+            }
+            first += n
+        }
+        k
+    }
+
+    /// The part's own element's, no other asked.
+    fn channels_kept(self, p: vec3, part: u32, kept: vec4) -> C {
+        var first: u32 = 0
+        var at: u32 = 0
+        var local: u32 = 0
+        for i in 0..N {
+            let n = self.parts[i].parts()
+            if part >= first && part < first + n {
+                at = i
+                local = part - first
+            }
+            first += n
+        }
+        self.parts[at].channels_kept(p, local, kept)
     }
 
     fn distance_and_channels(self, p: vec3) -> (f32, C) {
@@ -4546,6 +4674,8 @@ impl<C, A: Field<C>, B: Surface> Field<C> for SmoothSubtract<A, B> {
             f.may_micro,
             f.channels_proven,
             f.max_freq,
+            f.may_bump,
+            f.use_stepped_bounds,
         )
     }
 }
@@ -4568,8 +4698,21 @@ impl<C: Blend, A: Field<C>, B: Field<C>> Field<C> for SmoothIntersect<A, B> {
 }
 
 impl<C, S: Field<C>> Field<C> for Mirror<S> {
+    fn uses_kept(self) -> bool {
+        self.inner.uses_kept()
+    }
+
     fn channels(self, p: vec3) -> C {
         self.inner.channels(mirrored(p))
+    }
+
+    /// A part as written or its image (`parts`): the part's own, at the point mirrored.
+    fn kept(self, p: vec3, part: u32) -> vec4 {
+        self.inner.kept(mirrored(p), part % self.inner.parts())
+    }
+
+    fn channels_kept(self, p: vec3, part: u32, kept: vec4) -> C {
+        self.inner.channels_kept(mirrored(p), part % self.inner.parts(), kept)
     }
 
     fn distance_and_channels(self, p: vec3) -> (f32, C) {
@@ -4582,8 +4725,23 @@ impl<C, S: Field<C>> Field<C> for Mirror<S> {
 }
 
 impl<C, S: Field<C>> Field<C> for Named<S> {
+    fn uses_kept(self) -> bool {
+        self.inner.parts() == 1 && self.inner.uses_kept()
+    }
     fn channels(self, p: vec3) -> C {
         self.inner.channels(p)
+    }
+
+    /// Its inner field's, where that is one part; one named part of several parts can't say which
+    /// of them a point is on, so it keeps nothing and a pixel asks the whole.
+    fn kept(self, p: vec3, part: u32) -> vec4 {
+        if self.inner.parts() == 1 { self.inner.kept(p, 0) } else { vec4(0.0) }
+    }
+
+    fn channels_kept(self, p: vec3, part: u32, kept: vec4) -> C {
+        if self.inner.parts() == 1 { self.inner.channels_kept(p, 0, kept) } else {
+            self.inner.channels(p)
+        }
     }
 
     fn distance_and_channels(self, p: vec3) -> (f32, C) {

@@ -1,0 +1,314 @@
+// Wear and the hand: what use and making leave on a part that its drawing doesn't (AGENTS.md,
+// "The vocabulary ladder": rung 3, processes). Nothing a person makes is exact and nothing old is
+// unmarked, so a gold asset says how it was used, and these make the marks from that:
+//
+//   dinged(part, spacing, radius, depth, seed)   dents where the part gets knocked, about one in
+//                                                each `spacing` m of its surface, each a dimple
+//                                                `radius` m round and up to `depth` m deep, and
+//                                                recessed in its story (dirt and wax settle in them)
+//   cupped(part, across, cup, twist)             a board moved with the seasons: cupped `cup` m
+//                                                across its width (`across`, half its width) and
+//                                                twisted `twist` m end to end
+//
+// Each keeps the part's story and its Lipschitz bound, raised by what its marks can add, from its
+// own numbers, and a mark is gentle enough that the bound stays near 1: a part whose bound passes
+// the engine's steepness (1.05) is extracted at finer cells, every frame, as noise-displaced rock
+// is, and a mark a few hundredths of a millimetre deep is not worth that. A dent is at most 1 in
+// 40 deep for its width (as a real ding is: a wide, shallow dimple seen by the light it bends and
+// the dirt in it), so it adds 0.04 to the bound. A dent's place comes from a hash of the cell of
+// space it is in, the same on every machine. Marks that would step a surface (the uneven edges of
+// a book's gatherings) belong to its material, not its shape: a step's slope is a bound of 8.
+
+use engine::matter::verify::verify_surface_soundness
+use shapes::made::{Shaped, Story, stepped, stepped_near}
+use std::cmp::Eq
+use std::derive::{Box3, Interval}
+use std::field::{Bound, Live, PartName, Pruned, Surface, hash_u32}
+use std::hash::{StateHash, state_hash}
+
+/// A number in [0, 1) from three integers and a seed, the same everywhere.
+fn hash01(c: vec3i, seed: u32) -> f32 {
+    let x = u32(c.x).wrapping_mul(73856093)
+    let y = u32(c.y).wrapping_mul(19349663)
+    let z = u32(c.z).wrapping_mul(83492791)
+    let h = hash_u32(x ^ y ^ z ^ seed.wrapping_mul(2654435761))
+    f32(h >> 8) * (1.0 / 16777216.0)
+}
+
+// ---- dinged -------------------------------------------------------------------------------------
+
+/// A part knocked about where it stands out (`dinged`).
+pub struct Dinged<S>: Copy + GpuData + Eq + StateHash {
+    pub part: S,
+    pub spacing: f32,
+    pub radius: f32,
+    pub depth: f32,
+    pub seed: u32,
+}
+
+/// `part` dented about once in each `spacing` m of its surface, each dent `radius` m round and up
+/// to `depth` m deep (`Dinged`): the radius at most a quarter of the spacing, the depth at most a
+/// fortieth of the radius.
+pub fn dinged<S: Shaped>(
+    part: S,
+    spacing: f32,
+    radius: f32 = 0.004,
+    depth: f32 = 0.0001,
+    seed: u32 = 1,
+) -> Dinged<S> {
+    let r = min(radius, 0.24 * spacing)
+    Dinged { part, spacing, radius: r, depth: min(depth, DENT_SLOPE * r), seed }
+}
+
+/// The deepest a dent is for its radius: 1 in 40, so a dent adds at most 0.04 to its part's bound.
+pub const DENT_SLOPE: f32 = 0.025
+
+impl<S: Shaped> Dinged<S> {
+    /// How deep the dents go at `p` (m, at least 0): the dent of the cell of space `p` is in, if
+    /// that cell has one (half of them do; each dent lies wholly in its cell: its centre a quarter
+    /// of a cell in from the cell's sides, its radius at most a quarter of one), a smooth dimple.
+    /// It reads only the point, not the part's story, so the part's distance alone gives it (the
+    /// story's code would swell every shader that asks the distance).
+    fn dent(self, p: vec3) -> f32 {
+        let q = p / self.spacing
+        let c = vec3i(floor(q))
+        let centre = (vec3(c) +
+            vec3(0.25) +
+            0.5 * vec3(hash01(c, self.seed), hash01(c, self.seed + 1), hash01(c, self.seed + 2))) *
+            self.spacing
+        let r = length(p - centre) / self.radius
+        let has = hash01(c, self.seed + 3) < 0.5
+        if !has || r >= 1.0 {
+            return 0.0
+        }
+        let u = 1.0 - r * r
+        self.depth * u * u * (0.6 + 0.4 * hash01(c, self.seed + 4))
+    }
+
+    /// The most a dent's depth changes over a metre: its dimple's steepest wall.
+    fn steepness(self) -> f32 {
+        // d/dr of (1 - r²)² at its steepest (r = 1/√3), times depth over radius.
+        1.54 * self.depth / self.radius
+    }
+}
+
+impl<S: Shaped> Surface for Dinged<S> {
+    fn interval_near(self, b: Box3) -> Interval {
+        stepped_near(self, b)
+    }
+
+    fn masked(self, p: vec3, live: Live, first: u32) -> f32 {
+        let d = self.part.masked(p, live, first)
+        if abs(d) > 2.0 * self.depth { d } else { d + self.dent(p) }
+    }
+
+    fn pruned<F: Copy + fn(vec3) -> vec3>(
+        self,
+        over: Box3,
+        at: F,
+        stretch: f32,
+        live: Live,
+        first: u32,
+    ) -> Pruned {
+        let r = self.part.pruned(over, at, stretch, live, first)
+        Pruned { live: r.live, range: Interval { lo: r.range.lo, hi: r.range.hi + self.depth } }
+    }
+
+    fn distance(self, p: vec3) -> f32 {
+        let d = self.part.distance(p)
+        if abs(d) > 2.0 * self.depth { d } else { d + self.dent(p) }
+    }
+
+    fn bound(self) -> Bound {
+        self.part.bound()
+    }
+
+    /// The part's, and its dents' steepness: a dent's depth is added to the part's distance.
+    fn lipschitz(self, near: f32) -> f32 {
+        self.part.lipschitz(near + self.depth) + self.steepness()
+    }
+
+    fn rigid_shape_hash(self) -> Option<u64> {
+        match self.part.rigid_shape_hash() {
+            Some(_) => Some(state_hash(self)),
+            None => None,
+        }
+    }
+
+    fn parts(self) -> u32 {
+        self.part.parts()
+    }
+
+    fn part_at(self, p: vec3) -> (f32, u32) {
+        (self.distance(p), self.part.part_at(p).1)
+    }
+
+    fn part_distance(self, p: vec3, i: u32) -> f32 {
+        self.part.part_distance(p, i)
+    }
+
+    fn part_name(self, i: u32) -> PartName {
+        self.part.part_name(i)
+    }
+
+    fn part_offset(self, p: vec3, i: u32, by: f32) -> f32 {
+        self.part.part_offset(p, i, by)
+    }
+}
+
+impl<S: Shaped> Shaped for Dinged<S> {
+    /// The part's distance with its dents pressed in, near its surface (a dent changes nothing
+    /// more than its depth away); a dent is a recess, and its story says so.
+    fn shaped(self, p: vec3) -> (f32, Story) {
+        let (d, s) = self.part.shaped(p)
+        if abs(d) > 2.0 * self.depth {
+            return (d, s)
+        }
+        let dent = self.dent(p)
+        let story = if dent > 0.1 * self.depth {
+            Story { exposure: min(s.exposure, -0.3 * dent / self.depth), ..s }
+        } else { s }
+        (d + dent, story)
+    }
+
+    fn shaped_part(self, p: vec3) -> (f32, Story, u32) {
+        let (d, s, i) = self.part.shaped_part(p)
+        if abs(d) > 2.0 * self.depth {
+            return (d, s, i)
+        }
+        let dent = self.dent(p)
+        let story = if dent > 0.1 * self.depth {
+            Story { exposure: min(s.exposure, -0.3 * dent / self.depth), ..s }
+        } else { s }
+        (d + dent, story, i)
+    }
+
+    fn piece_of(self, part: u32) -> u32 {
+        self.part.piece_of(part)
+    }
+
+    fn detail_at(self, p: vec3, part: u32, story: Story) -> (Story, f32) {
+        self.part.detail_at(p, part, story)
+    }
+}
+
+// ---- cupped -------------------------------------------------------------------------------------
+
+/// A board that has moved with the seasons (`cupped`).
+pub struct Cupped<S>: Copy + GpuData + Eq + StateHash {
+    pub part: S,
+    pub across: vec2,
+    pub cup: f32,
+    pub twist: f32,
+}
+
+/// `part` cupped `cup` m across its width along z (half-widths `across`: x, z) and twisted
+/// `twist` m from end to end along x (`Cupped`).
+pub fn cupped<S: Shaped>(part: S, across: vec2, cup: f32, twist: f32 = 0.0) -> Cupped<S> {
+    Cupped { part, across, cup, twist }
+}
+
+impl<S: Shaped> Cupped<S> {
+    /// `p` in the board's straight frame: lifted back by the cup and the twist at its place.
+    /// Clamped to `[-1, 1]` beyond the board's plan so the lift stays bounded and `lean()` holds
+    /// globally across all of `ℝ³` (not only on the board itself).
+    fn straight(self, p: vec3) -> vec3 {
+        let u = clamp(p.x / self.across.x, -1.0, 1.0)
+        let v = clamp(p.z / self.across.y, -1.0, 1.0)
+        vec3(p.x, p.y - self.cup * v * v - 0.5 * self.twist * u * v, p.z)
+    }
+
+    /// The most the map leans: the slope of the lift across the board.
+    fn lean(self) -> f32 {
+        2.0 * abs(self.cup) / self.across.y +
+            abs(self.twist) * (0.5 / self.across.x + 0.5 / self.across.y)
+    }
+}
+
+impl<S: Shaped> Surface for Cupped<S> {
+    fn interval_near(self, b: Box3) -> Interval {
+        stepped_near(self, b)
+    }
+
+    fn pruned<F: Copy + fn(vec3) -> vec3>(
+        self,
+        over: Box3,
+        at: F,
+        stretch: f32,
+        live: Live,
+        first: u32,
+    ) -> Pruned {
+        stepped(self, over, at, stretch, live)
+    }
+
+    fn distance(self, p: vec3) -> f32 {
+        self.part.distance(self.straight(p))
+    }
+
+    fn bound(self) -> Bound {
+        self.part.bound().lowered(abs(self.cup) + abs(self.twist))
+    }
+
+    /// The part's, stretched by how far the map leans.
+    fn lipschitz(self, near: f32) -> f32 {
+        self.part.lipschitz(near) * (1.0 + self.lean())
+    }
+
+    fn rigid_shape_hash(self) -> Option<u64> {
+        match self.part.rigid_shape_hash() {
+            Some(_) => Some(state_hash(self)),
+            None => None,
+        }
+    }
+
+    fn parts(self) -> u32 {
+        self.part.parts()
+    }
+
+    fn part_at(self, p: vec3) -> (f32, u32) {
+        self.part.part_at(self.straight(p))
+    }
+
+    fn part_distance(self, p: vec3, i: u32) -> f32 {
+        self.part.part_distance(self.straight(p), i)
+    }
+
+    fn part_name(self, i: u32) -> PartName {
+        self.part.part_name(i)
+    }
+
+    fn part_offset(self, p: vec3, i: u32, by: f32) -> f32 {
+        self.part.part_offset(self.straight(p), i, by)
+    }
+}
+
+impl<S: Shaped> Shaped for Cupped<S> {
+    fn shaped(self, p: vec3) -> (f32, Story) {
+        self.part.shaped(self.straight(p))
+    }
+
+    fn shaped_part(self, p: vec3) -> (f32, Story, u32) {
+        self.part.shaped_part(self.straight(p))
+    }
+
+    fn piece_of(self, part: u32) -> u32 {
+        self.part.piece_of(part)
+    }
+
+    fn detail_at(self, p: vec3, part: u32, story: Story) -> (Story, f32) {
+        self.part.detail_at(self.straight(p), part, story)
+    }
+}
+
+@test
+fn worn_surfaces_are_sound() {
+    let base = shapes::making::board(vec3(0.15, 0.02, 0.10), round: 0.003)
+    verify_surface_soundness(
+        dinged(base, spacing: 0.06, radius: 0.01, depth: 0.0002, seed: 7),
+        "kit_dinged",
+    )
+    verify_surface_soundness(
+        cupped(base, across: vec2(0.15, 0.10), cup: 0.001, twist: 0.0005),
+        "kit_cupped",
+    )
+}

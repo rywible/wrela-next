@@ -29,8 +29,8 @@ use picture::screen::show
 use reference::traced::{FAR, HALVINGS, LEAST, LEAST_FAR}
 use std::field::{Field, Union, UnionAll}
 use std::gpu::{
-    Atomics, GlobalId, GpuBuffer, Rgba32Float, Texture, buffer_of, copy_texture, dispatch, label,
-    read, texture,
+    Atomics, GlobalId, GpuBuffer, Rgba32Float, Slots, Texture, buffer_of, copy_texture, dispatch,
+    label, limits, read, texture,
 }
 use std::collections::Vec
 use std::io::{Pending, print}
@@ -55,8 +55,8 @@ const DEPTH_MOST: u32 = 4
 /// The eyes whose holes the audit says one by one (eyes past these are in the totals alone).
 const EYES_SAID: u32 = 64
 
-/// The most steps the audit's march takes (a dispatch's every invocation must be short); its least
-/// step and its halvings onto the surface are the reference's (`traced`).
+/// The most steps the audit's march takes; its least step and its halvings onto the surface are
+/// the reference's (`traced`).
 const STEPS: u32 = 512
 
 /// Pixels a dispatch (a band of the picture: no dispatch holds the GPU long).
@@ -66,13 +66,14 @@ const BAND: u32 = 256
 /// frames, so no frame holds the GPU long however steep (and so slow to march) its field is.
 const MARCH_FRAME: u32 = 256 * BAND
 
-/// Where the field `m` meets matter along the ray from `o` along `d`: its distance along it, -1
-/// where it doesn't, -2 where the march ran out of steps.
-fn first_hit<M: Field<Substance>>(m: Matter<M>, o: vec3, d: vec3) -> f32 {
-    var t = 0.0
-    var before = 0.0
-    var crossed = false
-    for _ in 0..STEPS {
+/// A ray's march as far as it has gone (`marching`): how far along it is, where its last step
+/// outside the field began, whether it has crossed into matter (1) and the steps it has taken.
+/// A fresh march is all 0.
+fn marched_on<M: Field<Substance>>(m: Matter<M>, o: vec3, d: vec3, from: vec4, steps: u32) -> vec4 {
+    var t = from.x
+    var before = from.y
+    var crossed = from.z > 0.5
+    for _ in 0..steps {
         if !crossed && t < FAR {
             let f = m.far(o + d * t)
             if f < 0.0 {
@@ -83,8 +84,15 @@ fn first_hit<M: Field<Substance>>(m: Matter<M>, o: vec3, d: vec3) -> f32 {
             }
         }
     }
-    var lo = before
-    var hi = t
+    vec4(t, before, if crossed { 1.0 } else { 0.0 }, from.w + f32(steps))
+}
+
+/// Where a march that has run (`marched_on`) met matter: halved onto the surface, its distance
+/// along the ray; -1 where it met none; -2 where it ran out of steps.
+fn settled_hit<M: Field<Substance>>(m: Matter<M>, o: vec3, d: vec3, s: vec4) -> f32 {
+    let crossed = s.z > 0.5
+    var lo = s.y
+    var hi = s.x
     for _ in 0..HALVINGS {
         if crossed {
             let mid = 0.5 * (lo + hi)
@@ -95,7 +103,7 @@ fn first_hit<M: Field<Substance>>(m: Matter<M>, o: vec3, d: vec3) -> f32 {
             }
         }
     }
-    if crossed { hi } else if t < FAR { -2.0 } else { -1.0 }
+    if crossed { hi } else if s.x < FAR { -2.0 } else { -1.0 }
 }
 
 /// The ray of pixel `i / 5` of a picture `w` wide through `v`: its middle (`i % 5` 0) or a half
@@ -109,7 +117,7 @@ fn ray_at(v: View, w: u32, i: u32) -> vec3 {
     v.ray(vec2(f32(px % w) + 0.5, f32(px / w) + 0.5) + o)
 }
 
-/// Of two first hits along one ray (`first_hit`'s), the union's: the nearer where either met
+/// Of two first hits along one ray (`settled_hit`'s), the union's: the nearer where either met
 /// matter, else out of steps where either march ran out, else none.
 fn nearer(a: f32, b: f32) -> f32 {
     if a > 0.0 && b > 0.0 {
@@ -125,7 +133,32 @@ fn nearer(a: f32, b: f32) -> f32 {
     }
 }
 
-/// Rays `first` on (`ray_at`) marched through the field `m`: into `hits`, or (`keep`) into
+/// Rays `first` on (`ray_at`) marched `steps` steps further through the field `m`, each from where
+/// its march stands in `state` (bound from ray `first`). A heavy field's march is cut into several
+/// dispatches of fewer steps, so no invocation holds the GPU long (`march_steps`); `steps` is the
+/// pipeline's, so the compiler bounds each one's work by it.
+@compute(64)
+fn marching<M: Field<Substance>>(
+    m: Matter<M>,
+    v: View,
+    w: u32,
+    n: u32,
+    first: u32,
+    steps: const u32,
+    begun: u32,
+    state: mut Slots<vec4>,
+    id: GlobalId,
+) {
+    let i = first + id.x
+    if i >= n {
+        return
+    }
+    // The first pass starts each ray afresh; the others go on from where it stands.
+    let from = if begun == 0 { vec4(0.0) } else { state[id] }
+    state[id] = marched_on(m, v.at, ray_at(v, w, i), from, steps)
+}
+
+/// Rays `first` on, marched (`marching`), halved onto the surface: into `hits`, or (`keep`) into
 /// `hits` joined with what it holds (`nearer`: `m` one part of a union).
 @compute(64)
 fn marched<M: Field<Substance>>(
@@ -135,6 +168,7 @@ fn marched<M: Field<Substance>>(
     n: u32,
     first: u32,
     keep: bool,
+    state: [vec4],
     hits: mut Atomics<u32>,
     id: GlobalId,
 ) {
@@ -142,9 +176,21 @@ fn marched<M: Field<Substance>>(
     if i >= n {
         return
     }
-    let t = first_hit(m, v.at, ray_at(v, w, i))
+    let t = settled_hit(m, v.at, ray_at(v, w, i), state[i])
     let joined = if keep { nearer(bitcast_f32(hits.load(i: i)), t) } else { t }
     hits.store(i: i, value: bitcast_u32(joined))
+}
+
+/// The steps one `marching` dispatch takes for the field `m`: the most of 512, 128, 32 and 8 whose
+/// march, at the compiler's count of a step's work (`std::derive::work`) and a fifth more, keeps a
+/// dispatch within the GPU's step (`limits().step_work`), counted as the host counts it, as if the
+/// GPU's whole width of invocations ran it. (512 steps of a carved table's field came to 5.8M
+/// work an invocation: 120 ms, which the host refused.)
+fn march_steps<M: Field<Substance>>(m: Matter<M>) -> u32 {
+    let step = f32(max(std::derive::work(|p: vec3| m.far(p)), 1)) * 1.2 + 16.0
+    let most = f32(limits().step_work) * 1000.0 / 4096.0
+    if 512.0 * step <= most { 512 } else if 128.0 * step <= most { 128 } else if 32.0 * step <=
+        most { 32 } else { 8 }
 }
 
 /// What the audit holds a picture to: a thing's field, marched whole, or a union marched a part at
@@ -165,6 +211,7 @@ pub trait Marched: Copy {
         first: u32,
         last: u32,
         keep: bool,
+        state: mut GpuBuffer<vec4>,
         hits: mut GpuBuffer<u32>,
     )
 }
@@ -194,15 +241,88 @@ impl<M: Field<Substance>> Marched for Whole<M> {
         first: u32,
         last: u32,
         keep: bool,
+        state: mut GpuBuffer<vec4>,
         hits: mut GpuBuffer<u32>,
     ) {
         let m = matter(self.field)
+        let steps = march_steps(m)
         let end = min(last, n)
         var at = first
         while at < end {
+            let over = min(BAND, end - at)
+            var done: u32 = 0
+            while done < STEPS {
+                if steps == 512 {
+                    dispatch(
+                        marching.bind(
+                            m: m,
+                            v: v,
+                            w: w,
+                            n: n,
+                            first: at,
+                            steps: 512,
+                            begun: done,
+                            state: state.span_mut(start: at, count: over),
+                        ),
+                        over: over,
+                    )
+                } else if steps == 128 {
+                    dispatch(
+                        marching.bind(
+                            m: m,
+                            v: v,
+                            w: w,
+                            n: n,
+                            first: at,
+                            steps: 128,
+                            begun: done,
+                            state: state.span_mut(start: at, count: over),
+                        ),
+                        over: over,
+                    )
+                } else if steps == 32 {
+                    dispatch(
+                        marching.bind(
+                            m: m,
+                            v: v,
+                            w: w,
+                            n: n,
+                            first: at,
+                            steps: 32,
+                            begun: done,
+                            state: state.span_mut(start: at, count: over),
+                        ),
+                        over: over,
+                    )
+                } else {
+                    dispatch(
+                        marching.bind(
+                            m: m,
+                            v: v,
+                            w: w,
+                            n: n,
+                            first: at,
+                            steps: 8,
+                            begun: done,
+                            state: state.span_mut(start: at, count: over),
+                        ),
+                        over: over,
+                    )
+                }
+                done += steps
+            }
             dispatch(
-                marched.bind(m: m, v: v, w: w, n: n, first: at, keep: keep, hits: mut hits),
-                over: min(BAND, end - at),
+                marched.bind(
+                    m: m,
+                    v: v,
+                    w: w,
+                    n: n,
+                    first: at,
+                    keep: keep,
+                    state: state.items(),
+                    hits: mut hits,
+                ),
+                over: over,
             )
             at += BAND
         }
@@ -234,10 +354,20 @@ impl<M: Field<Substance>, const N: u32> Marched for Each<M, N> {
         first: u32,
         last: u32,
         keep: bool,
+        state: mut GpuBuffer<vec4>,
         hits: mut GpuBuffer<u32>,
     ) {
         for i in 0..N {
-            whole(self.parts[i]).march(v, w, n, first, last, keep: keep || i > 0, hits: mut hits)
+            whole(self.parts[i]).march(
+                v,
+                w,
+                n,
+                first,
+                last,
+                keep: keep || i > 0,
+                state: mut state,
+                hits: mut hits,
+            )
         }
     }
 }
@@ -268,10 +398,11 @@ impl<A: Marched, B: Marched> Marched for Both<A, B> {
         first: u32,
         last: u32,
         keep: bool,
+        state: mut GpuBuffer<vec4>,
         hits: mut GpuBuffer<u32>,
     ) {
-        self.a.march(v, w, n, first, last, keep: keep, hits: mut hits)
-        self.b.march(v, w, n, first, last, keep: true, hits: mut hits)
+        self.a.march(v, w, n, first, last, keep: keep, state: mut state, hits: mut hits)
+        self.b.march(v, w, n, first, last, keep: true, state: mut state, hits: mut hits)
     }
 }
 
@@ -584,6 +715,7 @@ pub struct Auditing {
     /// The eye's march (`Marched::march`), its first `marched` rays of `5 · width · height` in, a
     /// slice a frame (`MARCH_FRAME`); the picture of the frame of the cut, kept till it is.
     hits: GpuBuffer<u32>,
+    state: GpuBuffer<vec4>,
     marched: u32,
     cut_place: Texture<Rgba32Float>,
     /// The frames the eye took to settle, once it has (0 till then).
@@ -618,6 +750,7 @@ pub fn auditing() -> Auditing {
         cut: audit(),
         cut_said: false,
         hits: buffer_of(Vec::filled(1, 0)),
+        state: buffer_of(Vec::filled(1, vec4(0.0))),
         marched: 0,
         cut_place: texture(width: 1, height: 1),
         settle_drawn: 0,
@@ -719,6 +852,9 @@ impl Auditing {
         if self.hits.len() != n {
             self.hits = buffer_of(Vec::filled(n, 0))
         }
+        if self.state.len() != n {
+            self.state = buffer_of(Vec::filled(n, vec4(0.0)))
+        }
         if self.cut_place.width() != width || self.cut_place.height() != height {
             self.cut_place = texture(width: width, height: height)
             return
@@ -740,6 +876,7 @@ impl Auditing {
                 self.marched,
                 last,
                 keep: false,
+                state: mut self.state,
                 hits: mut self.hits,
             )
             self.marched = last

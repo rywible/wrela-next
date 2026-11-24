@@ -5,15 +5,15 @@
 use matter::substance::Substance
 use mesh::grid::{
     ActiveBrick, BRICK, CAP_SURF, CHUNK_BRICKS, CORNERS_BRICK, CREASE_DOT, CREASE_SLICE,
-    ExactCell, FrustumCull, GridSpec, MeshVertex, NONE, OVERFLOW_THIN, REG_CREASE, REG_SMOOTH,
-    SMOOTH_DOT, THIN_SLICE, VERTS_BRICK, VERTS_STRIDE, along, avg2_sign, avg4_sign,
-    box_in_frustum, brick_corner, brick_in_hole, brick_of, cull_brick, eval_dqs, owner_of,
-    pack_vertex_meta, safe_norm, unpack_is_trans, unpack_oct_normal, unpack_smooth, unpack_thing,
-    with_along,
+    CREASE_SLICE_LEAST, ExactCell, FrustumCull, GridSpec, KEPT_TRANS, MeshVertex, NONE,
+    OVERFLOW_THIN, REG_CREASE, REG_SMOOTH, SMOOTH_DOT, THIN_SLICE, VERTS_BRICK, VERTS_STRIDE,
+    along, avg2_sign, avg4_sign, box_in_frustum, brick_corner, brick_in_hole, brick_of, cull_brick,
+    eval_dqs, owner_of, pack_kept, pack_vertex_meta, safe_norm, unpack_is_trans, unpack_oct_normal,
+    unpack_smooth, unpack_thing, with_along,
 }
 use std::derive::{Box3, affine_form, value_and_gradient}
 use std::field::{ALL_LIVE, DualQuat, Field, Live}
-use std::gpu::{Append, Atomics, DispatchArgs, GlobalId, One, Slots}
+use std::gpu::{Append, Atomics, DispatchArgs, GlobalId, One, Slots, limits}
 
 @compute(64)
 pub(package) fn cull_bricks<M: Field<Substance>>(
@@ -139,21 +139,23 @@ pub(package) fn inherit_seam_corners<M: Field<Substance>>(
     active_count: [u32],
     cap_bricks: u32,
     chunk_start: u32,
+    brick_off: u32,
     corners_in: [f32],
     corners_out: mut Slots<f32>,
     id: GlobalId,
 ) {
-    let brick_in_chunk = id.x / CORNERS_BRICK
+    let local_id = brick_off * CORNERS_BRICK + id.x
+    let brick_in_chunk = brick_off + id.x / CORNERS_BRICK
     let bi = chunk_start + brick_in_chunk
     let total = min(active_count[0], cap_bricks)
     if bi >= total {
         return
     }
-    let ci = id.x - brick_in_chunk * CORNERS_BRICK
+    let ci = local_id - brick_in_chunk * CORNERS_BRICK
     let ab = active[bi]
     let b = ab.coord
     let g = grids[b.w]
-    let raw = corners_in[id.x]
+    let raw = corners_in[local_id]
     if g.seam_mask == 0 {
         corners_out[id] = raw
         return
@@ -181,93 +183,48 @@ pub(package) fn inherit_seam_corners<M: Field<Substance>>(
     let n_odd = ox + oy + oz
     let cbase = brick_in_chunk * CORNERS_BRICK
     let f = fields[g.orig_id]
-    if n_odd == 1 {
-        let d0 = seam_even_corner(
-            f,
-            g,
-            b.xyz,
-            ab.live,
-            corners_in,
-            cbase,
-            cx - ox,
-            cy - oy,
-            cz - oz,
-        )
-        let d1 = seam_even_corner(
-            f,
-            g,
-            b.xyz,
-            ab.live,
-            corners_in,
-            cbase,
-            cx + ox,
-            cy + oy,
-            cz + oz,
-        )
-        // Only override with coarse average when the coarse edge has NO sign change; when it DOES
-        // cross zero, preserving `raw` keeps exact topology (still exactly 1 fine crossing) with
-        // zero linear-interpolation shift on sharp creases and thin shells.
-        if (d0 < 0.0) == (d1 < 0.0) {
-            corners_out[id] = avg2_sign(d0, d1)
+    if n_odd == 1 || n_odd == 2 {
+        var cnt: u32 = 2
+        var cs: [vec3u; 4] = [vec3u(0, 0, 0); 4]
+        if n_odd == 1 {
+            cs[0] = vec3u(cx - ox, cy - oy, cz - oz)
+            cs[1] = vec3u(cx + ox, cy + oy, cz + oz)
         } else {
-            corners_out[id] = raw
+            cnt = 4
+            let sx = ox
+            let sz = if ox == 1 && oy == 1 { 0 } else { 1 }
+            let a0x = if sx == 1 { 1 } else { 0 }
+            let a0y = if sx == 0 { 1 } else { 0 }
+            let a1y = if sx == 1 && oy == 1 { 1 } else { 0 }
+            let a1z = if sz == 1 { 1 } else { 0 }
+            cs[0] = vec3u(cx - a0x, cy - a0y - a1y, cz - a1z)
+            cs[1] = vec3u(cx + a0x, cy + a0y - a1y, cz - a1z)
+            cs[2] = vec3u(cx - a0x, cy - a0y + a1y, cz + a1z)
+            cs[3] = vec3u(cx + a0x, cy + a0y + a1y, cz + a1z)
         }
-    } else if n_odd == 2 {
-        let sx = ox
-        let sz = if ox == 1 && oy == 1 { 0 } else { 1 }
-        let a0x = if sx == 1 { 1 } else { 0 }
-        let a0y = if sx == 0 { 1 } else { 0 }
-        let a1y = if sx == 1 && oy == 1 { 1 } else { 0 }
-        let a1z = if sz == 1 { 1 } else { 0 }
-        let d00 = seam_even_corner(
-            f,
-            g,
-            b.xyz,
-            ab.live,
-            corners_in,
-            cbase,
-            cx - a0x,
-            cy - a0y - a1y,
-            cz - a1z,
-        )
-        let d10 = seam_even_corner(
-            f,
-            g,
-            b.xyz,
-            ab.live,
-            corners_in,
-            cbase,
-            cx + a0x,
-            cy + a0y - a1y,
-            cz - a1z,
-        )
-        let d01 = seam_even_corner(
-            f,
-            g,
-            b.xyz,
-            ab.live,
-            corners_in,
-            cbase,
-            cx - a0x,
-            cy - a0y + a1y,
-            cz + a1z,
-        )
-        let d11 = seam_even_corner(
-            f,
-            g,
-            b.xyz,
-            ab.live,
-            corners_in,
-            cbase,
-            cx + a0x,
-            cy + a0y + a1y,
-            cz + a1z,
-        )
-        let s00 = d00 < 0.0
-        if s00 == (d10 < 0.0) && s00 == (d01 < 0.0) && s00 == (d11 < 0.0) {
-            corners_out[id] = avg4_sign(d00, d10, d01, d11)
+        var ds = [0.0; 4]
+        for k in 0..4 {
+            if k < cnt {
+                let c = cs[k]
+                ds[k] = seam_even_corner(f, g, b.xyz, ab.live, corners_in, cbase, c.x, c.y, c.z)
+            }
+        }
+        if n_odd == 1 {
+            // Only override with coarse average when the coarse edge has NO sign change; when it
+            // DOES cross zero, preserving `raw` keeps exact topology (still exactly 1 fine crossing)
+            // with zero linear-interpolation shift on sharp creases and thin shells.
+            if (ds[0] < 0.0) == (ds[1] < 0.0) {
+                corners_out[id] = avg2_sign(ds[0], ds[1])
+            } else {
+                corners_out[id] = raw
+            }
         } else {
-            corners_out[id] = raw
+            let s00 = ds[0] < 0.0
+            if s00 == (ds[1] < 0.0) && s00 == (ds[2] < 0.0) && s00 == (ds[3] < 0.0) {
+                corners_out[id] = avg4_sign(ds[0], ds[1], ds[2], ds[3])
+            } else {
+                corners_out[id] = raw
+            }
         }
     } else {
         corners_out[id] = raw
@@ -504,6 +461,12 @@ pub(package) fn trilinear_qef(d: CellCorners) -> Qef {
     qef
 }
 
+/// Single shared `value_and_gradient` call site so all dual-contouring edge/cell solvers share one
+/// monomorphized adjoint derivation instead of duplicating a separate closure gradient per call.
+fn sample_dist<F: Copy + fn(vec3) -> f32>(dist: F, p: vec3) -> (f32, vec3) {
+    value_and_gradient(|q: vec3| dist(q), p)
+}
+
 /// A sharp crease cell's QEF from exact Hermite data: each crossing edge's zero crossing is
 /// bracketed by 4 bisection steps (immune to medial-axis kinks inside sharp 90° edges where linear
 /// interpolation lands on the wrong face's Voronoi region) then refined by one exact Newton step,
@@ -521,34 +484,41 @@ pub(package) fn hermite_qef<F: Copy + fn(vec3) -> f32>(dist: F, d: CellCorners, 
             let p0 = corner_uvw(i0)
             let t0 = clamp(v0 / (v0 - v1), 0.0, 1.0)
             var uvw = with_along(p0, axis, t0)
-            let (edv0, egv0) = value_and_gradient(|q: vec3| dist(q), cell_lo + uvw * h)
+            let (edv0, egv0) = sample_dist(dist, cell_lo + uvw * h)
             var edv = edv0
             var egv = egv0
             var edot = along(egv, axis) * h
             // On a sharp 90° edge, linear interpolation can land inside the orthogonal face's
             // Voronoi region where `edot ≈ 0` and `|edv|` stays large: bracket the true root with
-            // 4 bisection steps when the endpoints genuinely straddle zero.
+            // 4 bisection steps when the endpoints genuinely straddle zero. Endpoint checks and
+            // bisection share one `dist` call site so composite fields stay compact in MSL.
             if abs(edot) < 0.15 * h && abs(edv) > 0.02 * h {
-                let tv0 = dist(cell_lo + p0 * h)
-                let tv1 = dist(cell_lo + corner_uvw(i1) * h)
-                if (tv0 < 0.0) == (tv1 < 0.0) {
-                    continue
-                }
-                let neg0 = tv0 < 0.0
+                var neg0 = false
                 var lo = 0.0
                 var hi = 1.0
-                for _b in 0..4 {
-                    let mid = 0.5 * (lo + hi)
-                    let dm = dist(cell_lo + with_along(p0, axis, mid) * h)
-                    if (dm < 0.0) == neg0 {
-                        lo = mid
+                var straddles = true
+                for step in 0..6 {
+                    let s = if step == 0 { 0.0 } else if step == 1 { 1.0 } else { 0.5 * (lo + hi) }
+                    let ds = dist(cell_lo + with_along(p0, axis, s) * h)
+                    if step == 0 {
+                        neg0 = ds < 0.0
+                    } else if step == 1 {
+                        if (ds < 0.0) == neg0 {
+                            straddles = false
+                            break
+                        }
+                    } else if (ds < 0.0) == neg0 {
+                        lo = s
                     } else {
-                        hi = mid
+                        hi = s
                     }
+                }
+                if !straddles {
+                    continue
                 }
                 let tm = 0.5 * (lo + hi)
                 uvw = with_along(p0, axis, tm)
-                let (bdv, bgv) = value_and_gradient(|q: vec3| dist(q), cell_lo + uvw * h)
+                let (bdv, bgv) = sample_dist(dist, cell_lo + uvw * h)
                 edv = bdv
                 egv = bgv
                 edot = along(egv, axis) * h
@@ -608,15 +578,153 @@ pub(package) fn solve_cell<F: Copy + fn(vec3) -> f32>(
         let ext = clamp(raw, vec3(-0.85), vec3(1.85))
         if ext.x < 0.0 || ext.x > 1.0 || ext.y < 0.0 || ext.y > 1.0 || ext.z < 0.0 || ext.z > 1.0 {
             let ewp = cell_lo + ext * h
-            let (edv, egv) = value_and_gradient(|q: vec3| dist(q), ewp)
+            let (edv, egv) = sample_dist(dist, ewp)
             if abs(edv) <= 0.04 * h {
                 return (ewp, edv, egv)
             }
         }
     }
     let wp = cell_lo + clamp(raw, vec3(0.0), vec3(1.0)) * h
-    let (dv, gv) = value_and_gradient(|q: vec3| dist(q), wp)
+    let (dv, gv) = sample_dist(dist, wp)
     (newton_snap(wp, dv, gv, cell_lo, h), dv, gv)
+}
+
+/// Unified sharp-crease solver (`hermite_qef` + `solve_cell`) sharing ONE `value_and_gradient`
+/// call site across initial edge probes, sharp-corner bisection, knife-edge crest checks, and the
+/// final Newton snap so composite carved fields stay compact in MSL/SPIR-V (`<= 288 KiB`) while
+/// computing identical Hermite vertices and normals.
+pub(package) fn solve_crease_cell<F: Copy + fn(vec3) -> f32>(
+    dist: F,
+    d: CellCorners,
+    cell_lo: vec3,
+    h: f32,
+) -> (vec3, vec3, Qef) {
+    var qef = qef_empty()
+    var e: u32 = 0
+    // 0: initial edge probe, 1: bisection step, 2: post-bisection normal,
+    // 3: knife-edge crest check, 4: clamped dual-vertex snap.
+    var stage: u32 = 0
+    var axis: u32 = 0
+    var p0 = vec3(0.0)
+    var t0 = 0.0
+    var uvw = vec3(0.0)
+    var lo = 0.0
+    var hi = 1.0
+    var neg0 = false
+    var bi: u32 = 0
+    var wp_clamped = cell_lo + vec3(0.5 * h)
+    var ewp = cell_lo
+    for iter in 0..64 {
+        if iter >= 61 && stage < 3 {
+            e = 12
+            stage = 0
+        }
+        if stage == 0 {
+            for _skip in 0..12 {
+                if e >= 12 {
+                    break
+                }
+                let (i0, i1) = edge_ends(e)
+                let v0 = d.at(i0)
+                let v1 = d.at(i1)
+                if (v0 < 0.0) != (v1 < 0.0) {
+                    axis = e / 4
+                    p0 = corner_uvw(i0)
+                    t0 = clamp(v0 / (v0 - v1), 0.0, 1.0)
+                    uvw = with_along(p0, axis, t0)
+                    break
+                }
+                e += 1
+            }
+            if e >= 12 {
+                let tri = trilinear_qef(d)
+                if qef.count == 0 {
+                    qef = tri
+                }
+                let use_hermite = is_crease(tri) || qef.min_dot < 0.92
+                let final_qef = if use_hermite { qef } else { tri }
+                let reg = if use_hermite { REG_CREASE } else { REG_SMOOTH }
+                let raw = final_qef.solve_unclamped(reg)
+                wp_clamped = cell_lo + clamp(raw, vec3(0.0), vec3(1.0)) * h
+                let ext = clamp(raw, vec3(-0.85), vec3(1.85))
+                let out_of_cell = ext.x < 0.0 || ext.x > 1.0 || ext.y < 0.0 || ext.y > 1.0 ||
+                    ext.z < 0.0 || ext.z > 1.0
+                if use_hermite && final_qef.min_dot < -0.15 && out_of_cell {
+                    ewp = cell_lo + ext * h
+                    stage = 3
+                } else {
+                    stage = 4
+                }
+            }
+        }
+        let probe = if stage == 0 || stage == 2 {
+            cell_lo + uvw * h
+        } else if stage == 1 {
+            let s = if bi == 0 { 0.0 } else if bi == 1 { 1.0 } else { 0.5 * (lo + hi) }
+            cell_lo + with_along(p0, axis, s) * h
+        } else if stage == 3 {
+            ewp
+        } else {
+            wp_clamped
+        }
+        let (sv, sg) = sample_dist(dist, probe)
+        if stage == 0 {
+            let edot = along(sg, axis) * h
+            if abs(edot) < 0.15 * h && abs(sv) > 0.02 * h {
+                lo = 0.0
+                hi = 1.0
+                neg0 = false
+                bi = 0
+                stage = 1
+            } else {
+                if abs(edot) > 1.0e-6 {
+                    uvw = with_along(p0, axis, clamp(t0 - sv / edot, 0.0, 1.0))
+                }
+                qef.add(uvw, safe_norm(sg, safe_norm(d.grad(uvw), vec3(0.0, 1.0, 0.0))))
+                e += 1
+            }
+        } else if stage == 1 {
+            if bi == 0 {
+                neg0 = sv < 0.0
+                bi = 1
+            } else if bi == 1 {
+                if (sv < 0.0) == neg0 {
+                    e += 1
+                    stage = 0
+                } else {
+                    bi = 2
+                }
+            } else {
+                let mid = 0.5 * (lo + hi)
+                if (sv < 0.0) == neg0 {
+                    lo = mid
+                } else {
+                    hi = mid
+                }
+                bi += 1
+                if bi >= 6 {
+                    uvw = with_along(p0, axis, 0.5 * (lo + hi))
+                    stage = 2
+                }
+            }
+        } else if stage == 2 {
+            let edot = along(sg, axis) * h
+            if abs(edot) > 1.0e-6 {
+                uvw = with_along(p0, axis, clamp(0.5 * (lo + hi) - sv / edot, lo, hi))
+            }
+            qef.add(uvw, safe_norm(sg, safe_norm(d.grad(uvw), vec3(0.0, 1.0, 0.0))))
+            e += 1
+            stage = 0
+        } else if stage == 3 {
+            if abs(sv) <= 0.04 * h {
+                return (ewp, sg, qef)
+            }
+            stage = 4
+        } else {
+            return (newton_snap(wp_clamped, sv, sg, cell_lo, h), sg, qef)
+        }
+    }
+    (wp_clamped, safe_norm(d.grad(vec3(0.5)), vec3(0.0, 1.0, 0.0)), qef)
 }
 
 /// What every pass computes for a sign-changing cell with corners `d` at `cell_lo` (side `h`),
@@ -746,7 +854,7 @@ fn push_vertex<M: Field<Substance>>(
     cell_verts: mut Atomics<u32>,
 ) {
     let n_final = safe_norm(gv, safe_norm(qef.avg_n, vec3(0.0, 1.0, 0.0)))
-    let is_trans = f.field_facts().may_transmit && f.channels(wp).transmission > 0.02
+    let is_trans = !f.uses_kept() && f.field_facts().may_transmit && f.channels(wp).transmission > 0.02
     let smooth = qef.min_dot >= SMOOTH_DOT
     let vi = verts.push(
         MeshVertex {
@@ -923,17 +1031,41 @@ pub(package) fn filter_thin_cells<M: Field<Substance>>(
     }
     let lo = cell_lo + vec3(m)
     let w = h - 2.0 * m
-    let dist = |q: vec3| f.distance_live(q, live)
-    let af = affine_form(dist, Box3 { lo: lo, hi: lo + vec3(w) })
-    if af.lo() > 0.0 {
-        return
-    }
     var maybe = false
-    for k in 0..8 {
-        if !maybe && af.octant_range(k).lo <= 0.0 {
-            let o = lo + vec3(f32(k & 1), f32((k >> 1) & 1), f32((k >> 2) & 1)) * (0.5 * w)
-            if affine_form(dist, Box3 { lo: o, hi: o + vec3(0.5 * w) }).lo() <= 0.0 {
-                maybe = true
+    if fields[g.orig_id].field_facts().use_stepped_bounds {
+        var cur_live = live
+        for k in 0..9 {
+            if !maybe {
+                let bx = if k == 0 {
+                    Box3 { lo: lo, hi: lo + vec3(w) }
+                } else {
+                    let j = k - 1
+                    let o = lo + vec3(f32(j & 1), f32((j >> 1) & 1), f32((j >> 2) & 1)) * (0.5 * w)
+                    Box3 { lo: o, hi: o + vec3(0.5 * w) }
+                }
+                let pr = f.pruned(bx, |q: vec3| q, 1.0, cur_live, 0)
+                if k == 0 {
+                    if pr.range.lo > 0.0 {
+                        return
+                    }
+                    cur_live = pr.live
+                } else if pr.range.lo <= 0.0 {
+                    maybe = true
+                }
+            }
+        }
+    } else {
+        let dist = |q: vec3| f.distance_live(q, live)
+        let af = affine_form(dist, Box3 { lo: lo, hi: lo + vec3(w) })
+        if af.lo() > 0.0 {
+            return
+        }
+        for k in 0..8 {
+            if !maybe && af.octant_range(k).lo <= 0.0 {
+                let o = lo + vec3(f32(k & 1), f32((k >> 1) & 1), f32((k >> 2) & 1)) * (0.5 * w)
+                if affine_form(dist, Box3 { lo: o, hi: o + vec3(0.5 * w) }).lo() <= 0.0 {
+                    maybe = true
+                }
             }
         }
     }
@@ -956,6 +1088,7 @@ pub(package) fn solve_verts<M: Field<Substance>>(
     corners: [f32],
     surf: [u32],
     surf_count: [u32],
+    first: u32,
     cap_verts: u32,
     cell_verts: mut Atomics<u32>,
     verts: mut Append<MeshVertex>,
@@ -963,10 +1096,11 @@ pub(package) fn solve_verts<M: Field<Substance>>(
     id: GlobalId,
 ) {
     let n_surf = min(surf_count[0], CAP_SURF)
-    if id.x >= n_surf {
+    let i = first + id.x
+    if i >= n_surf {
         return
     }
-    let packed = surf[id.x]
+    let packed = surf[i]
     let local_bi = packed >> 9
     let cell = packed & 511
     let (cx, cy, cz) = decode_cell(cell)
@@ -1029,13 +1163,121 @@ pub fn prep_slices(
     args[id] = DispatchArgs { x: (m + 63) / 64, y: 1, z: 1 }
 }
 
-/// `prep_slices` for a chunk's crease list (`slices` of `CREASE_SLICE`), noting in `seen` the
+/// What one cell of `refine_creases` asks of a field at the cell from `lo` (side `h`), for the
+/// compiler's count of its work (`std::derive::work`).
+fn crease_cell_work<M: Field<Substance>>(f: M, lo: vec3, h: f32) -> vec3 {
+    let dist = |q: vec3| f.distance_live(q, ALL_LIVE)
+    let d = CellCorners {
+        d000: dist(lo),
+        d100: dist(lo + vec3(h, 0.0, 0.0)),
+        d010: dist(lo + vec3(0.0, h, 0.0)),
+        d110: dist(lo + vec3(h, h, 0.0)),
+        d001: dist(lo + vec3(0.0, 0.0, h)),
+        d101: dist(lo + vec3(h, 0.0, h)),
+        d011: dist(lo + vec3(0.0, h, h)),
+        d111: dist(lo + vec3(h, h, h)),
+    }
+    let (wp, gv, _qef) = solve_crease_cell(dist, d, lo, h)
+    wp + gv
+}
+
+/// The crease cells one `refine_creases` dispatch may solve for a field like `sample`: as many as
+/// keep it within the GPU's step (`limits().step_work`), clamped to `[CREASE_SLICE_LEAST, CREASE_SLICE]`.
+pub(package) fn crease_slice_of<M: Field<Substance>>(sample: M) -> u32 {
+    let cell = f32(max(std::derive::work(|lo: vec3| crease_cell_work(sample, lo, h: 0.01)), 1))
+    let step = f32(limits().step_work) * 1000.0
+    let n = u32(clamp(step / (cell * 1.2 + 2000.0), f32(CREASE_SLICE_LEAST), f32(CREASE_SLICE)))
+    max((n / 64) * 64, CREASE_SLICE_LEAST)
+}
+
+/// The surface cells one `solve_verts` dispatch may solve for a field like `sample`: up to
+/// `CAP_SURF` (one dispatch for light fields), cut into smaller slices for heavy carved fields.
+pub(package) fn surf_slice_of<M: Field<Substance>>(sample: M) -> u32 {
+    let cell = f32(max(std::derive::work(|lo: vec3| crease_cell_work(sample, lo, h: 0.01)), 1))
+    let step = f32(limits().step_work) * 1000.0
+    let n = u32(clamp(step / (cell * 1.2 + 2000.0), f32(CREASE_SLICE_LEAST), f32(CAP_SURF)))
+    max((n / 64) * 64, CREASE_SLICE_LEAST)
+}
+
+/// After a chunk's vertices are made (ONLY for fields with `uses_kept() == true`): stores each
+/// vertex's part (`part | trans`) and packed `kept` story in `vert_kept` so pixel-rate shading
+/// calls `channels_kept(wp, part, kept)` without re-evaluating the full shape tree.
+@compute(64)
+pub(package) fn keep_verts<M: Field<Substance>>(
+    fields: [M],
+    verts: [MeshVertex],
+    vert_count: [u32],
+    cap_verts: u32,
+    first: [u32],
+    from: u32,
+    vert_kept: mut Atomics<u32>,
+    id: GlobalId,
+) {
+    let vi = first[0] + from + id.x
+    if vi >= min(vert_count[0], cap_verts) {
+        return
+    }
+    let v = verts[vi]
+    let p = vec3(v.px, v.py, v.pz)
+    let f = fields[unpack_thing(v.packed)]
+    let (_, part, kept) = f.kept_at(p)
+    let trans = if f.field_facts().may_transmit && f.channels_kept(p, part, kept).transmission > 0.02 {
+        KEPT_TRANS
+    } else {
+        0
+    }
+    vert_kept.store(i: 2 * vi, value: part | trans)
+    vert_kept.store(i: 2 * vi + 1, value: pack_kept(kept))
+}
+
+/// What one vertex of `keep_verts` asks of a field, for the compiler's count of its work.
+fn keep_vert_work<M: Field<Substance>>(f: M, p: vec3) -> vec4 {
+    let (d, part, k) = f.kept_at(p)
+    k + vec4(d + f.channels_kept(p, part, k).transmission, f32(part), 0.0, 0.0)
+}
+
+/// Where the chunk about to be made starts in the batch's vertices (`keep_verts`).
+@compute(1)
+pub(package) fn mark_first(vert_count: [u32], cap_verts: u32, first: mut One<u32>, id: GlobalId) {
+    first.set(id, min(vert_count[0], cap_verts))
+}
+
+/// The vertices one `keep_verts` dispatch may take for a field like `sample`.
+pub(package) fn keep_slice_of<M: Field<Substance>>(sample: M) -> u32 {
+    let cell = f32(max(std::derive::work(|p: vec3| keep_vert_work(sample, p)), 1))
+    let step = f32(limits().step_work) * 1000.0
+    let n = u32(clamp(step / (cell * 1.2 + 2000.0), 1024.0, 1048576.0))
+    max((n / 64) * 64, 1024)
+}
+
+/// `prep_slices` from item `first[0]`: args for `slices` passes over items `first[0] + k·most` on.
+@compute(64)
+pub(package) fn prep_from(
+    count: [u32],
+    cap: u32,
+    first: [u32],
+    most: u32,
+    slices: u32,
+    args: mut Slots<DispatchArgs>,
+    id: GlobalId,
+) {
+    if id.x >= slices {
+        return
+    }
+    let n = min(count[0], cap)
+    let at = first[0] + id.x * most
+    let m = if n > at { min(n - at, most) } else { 0 }
+    args[id] = DispatchArgs { x: (m + 63) / 64, y: 1, z: 1 }
+}
+
+/// `prep_slices` for a chunk's crease list (`slices` of `slice`), noting in `seen` the
 /// most creases a chunk held (`[4]`) and whether one held more than its slices cover (`[5]`, then
 /// those were not solved: `took_counts` extracts again with slices for them).
 @compute(64)
 pub(package) fn prep_creases(
     count: [u32],
     slices: u32,
+    slice: u32,
     args: mut Slots<DispatchArgs>,
     seen: mut Atomics<u32>,
     id: GlobalId,
@@ -1044,12 +1286,12 @@ pub(package) fn prep_creases(
         return
     }
     let n = min(count[0], CAP_SURF)
-    let first = id.x * CREASE_SLICE
-    let m = if n > first { min(n - first, CREASE_SLICE) } else { 0 }
+    let first = id.x * slice
+    let m = if n > first { min(n - first, slice) } else { 0 }
     args[id] = DispatchArgs { x: (m + 63) / 64, y: 1, z: 1 }
     if id.x == 0 {
         let _ = seen.max(i: 4, value: n)
-        if n > slices * CREASE_SLICE {
+        if n > slices * slice {
             let _ = seen.add(i: 5, value: 1)
         }
     }
@@ -1089,11 +1331,7 @@ pub(package) fn refine_creases<M: Field<Substance>>(
     let f = fields[g.orig_id]
     let live = ab.live
     let dist = |q: vec3| f.distance_live(q, live)
-    let qef = hermite_qef(dist, d, cell_lo, h)
-    let tri = trilinear_qef(d)
-    let use_hermite = is_crease(tri) || qef.min_dot < 0.92
-    let final_qef = if use_hermite { qef } else { tri }
-    let (wp, _dv, gv) = solve_cell(dist, final_qef, crease: use_hermite, cell_lo: cell_lo, h: h)
+    let (wp, gv, qef) = solve_crease_cell(dist, d, cell_lo, h)
     push_vertex(
         f,
         g.orig_id,
@@ -1176,7 +1414,7 @@ fn push_skinned_vertex<M: Field<Substance>>(
     cell_verts: mut Atomics<u32>,
 ) {
     let n_final = safe_norm(gv, safe_norm(qef.avg_n, vec3(0.0, 1.0, 0.0)))
-    let is_trans = f.field_facts().may_transmit && f.rest_channels(wp).transmission > 0.02
+    let is_trans = !f.uses_kept() && f.field_facts().may_transmit && f.rest_channels(wp).transmission > 0.02
     let smooth = qef.min_dot >= SMOOTH_DOT
     let sw = f.rest_skin_weights(wp)
     let vi = verts.push(
@@ -1205,6 +1443,7 @@ pub(package) fn solve_verts_rest<M: Field<Substance>>(
     corners: [f32],
     surf: [u32],
     surf_count: [u32],
+    first: u32,
     cap_verts: u32,
     cell_verts: mut Atomics<u32>,
     verts: mut Append<MeshVertex>,
@@ -1213,10 +1452,11 @@ pub(package) fn solve_verts_rest<M: Field<Substance>>(
     id: GlobalId,
 ) {
     let n_surf = min(surf_count[0], CAP_SURF)
-    if id.x >= n_surf {
+    let i = first + id.x
+    if i >= n_surf {
         return
     }
-    let packed = surf[id.x]
+    let packed = surf[i]
     let local_bi = packed >> 9
     let cell = packed & 511
     let (cx, cy, cz) = decode_cell(cell)
@@ -1291,11 +1531,7 @@ pub(package) fn refine_creases_rest<M: Field<Substance>>(
     let f = fields[g.orig_id]
     let live = ab.live
     let dist = |q: vec3| f.rest_distance_live(q, live)
-    let qef = hermite_qef(dist, d, cell_lo, h)
-    let tri = trilinear_qef(d)
-    let use_hermite = is_crease(tri) || qef.min_dot < 0.92
-    let final_qef = if use_hermite { qef } else { tri }
-    let (wp, _dv, gv) = solve_cell(dist, final_qef, crease: use_hermite, cell_lo: cell_lo, h: h)
+    let (wp, gv, qef) = solve_crease_cell(dist, d, cell_lo, h)
     push_skinned_vertex(
         f,
         g.orig_id,
@@ -1319,7 +1555,7 @@ pub(package) fn refine_creases_rest<M: Field<Substance>>(
 pub fn project_posed<F: Copy + fn(vec3) -> f32>(dist: F, p: vec3, n_ref: vec3) -> (vec3, vec3) {
     var wp = p
     var nrm = n_ref
-    let (d0, g0) = value_and_gradient(|q: vec3| dist(q), wp)
+    let (d0, g0) = sample_dist(dist, wp)
     var d = d0
     var g = g0
     var gl2 = dot(g, g)
@@ -1338,7 +1574,7 @@ pub fn project_posed<F: Copy + fn(vec3) -> f32>(dist: F, p: vec3, n_ref: vec3) -
             s = s * (most / sl)
         }
         let cand = wp - s
-        let (dc, gc) = value_and_gradient(|q: vec3| dist(q), cand)
+        let (dc, gc) = sample_dist(dist, cand)
         let gc2 = dot(gc, gc)
         if !(abs(dc) < abs(d)) || gc2 <= 1.0e-10 || dot(gc, n_ref) <= 0.0 {
             break

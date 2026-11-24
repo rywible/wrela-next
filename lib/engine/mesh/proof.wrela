@@ -525,120 +525,157 @@ pub fn solve_cell_ray_lipschitz<M: Field<Substance>>(
         return CellRay::Empty(EmptyProof { seal: () })
     }
     let tol = max(0.02 * px, 1.0e-6)
-    let f0 = field.distance_live(o + d * t0, live)
-    if f0 <= tol {
-        return CellRay::Hit(t0)
-    }
     let inv_lip = if lip > 0.0 && lip < 1.0e12 { 1.0 / max(lip, 1.0) } else { 0.0 }
-    if inv_lip == 0.0 {
-        return CellRay::Hit(t0)
-    }
-    // Single-eval fast exit when entry distance already exceeds the cell segment's maximum drop.
-    let r0 = f0 * inv_lip
-    if t0 + r0 >= t1 {
-        let f_end = field.distance_live(o + d * t1, live)
-        if f_end <= tol {
-            return CellRay::Hit(refine_root_live(field, live, o, d, t0, f0, t1, f_end, tol))
-        }
-        return CellRay::Empty(EmptyProof { seal: () })
-    }
-    // Bidirectional over-relaxed MVT sphere tracing (Keinert et al. 2014, Theorem 1):
-    // `t_lo` advances forward keeping `f > 0` on `[t0, t_lo + r_lo)`, and `t_hi` retreats
-    // backward while `hi_clear` keeping `f > 0` on `(t_hi - r_hi, t1]`. Over-relaxation
-    // (`omega = 1.85`) is accepted ONLY when `r_prev + r_cand > step` (strict MVT ball overlap
-    // mathematically proving `f > 0` across the entire step), and falls back to `omega = 1.0`
-    // otherwise. Whenever `t_lo + r_lo + r_hi > t_hi` with `hi_clear`, the open MVT balls cover
-    // all of `[t0, t1]`, proving emptiness nearly 2× faster on grazing tangents without ever
-    // returning a back-face crossing before an earlier front crossing.
     var t_lo = t0
-    var f_lo = f0
-    var r_lo = r0
+    var f_lo = 0.0
+    var r_lo = 0.0
     var t_hi = t1
-    var f_hi = field.distance_live(o + d * t1, live)
-    var hi_clear = f_hi > tol
-    var r_hi = if hi_clear { f_hi * inv_lip } else { 0.0 }
-    var omega_lo = if hi_clear { 1.85 } else { 1.0 }
+    var f_hi = 0.0
+    var hi_clear = false
+    var r_hi = 0.0
+    var omega_lo = 1.0
     var omega_hi = 1.85
     var t_near = t0
-    var f_near = f0
-    if f_hi < f_near {
-        f_near = f_hi
-        t_near = t_hi
-    }
-    for _ in 0..16 {
-        if hi_clear && t_lo + r_lo + r_hi > t_hi {
-            return CellRay::Empty(EmptyProof { seal: () })
-        }
-        let max_step_lo = if hi_clear { max(t_hi - r_hi - t_lo, r_lo) } else { t_hi - t_lo }
-        if t_lo + r_lo >= t_hi {
-            if hi_clear {
+    var f_near = 1.0e30
+    var need_refine = false
+    var ref_t_out = t0
+    var ref_f_out = 0.0
+    var ref_t_in = t0
+    var ref_f_in = 0.0
+    // Single `field.distance_live` call site across endpoint checks and bidirectional over-relaxed
+    // MVT sphere tracing (Keinert et al. 2014, Theorem 1) so large composite fields keep one compact
+    // distance evaluation body in MSL/SPIR-V.
+    // Phases: 0 = entry `t0`, 1 = exit `t1`, >= 2 = alternating forward (even) / backward (odd).
+    for iter in 0..34 {
+        var probe_t = t0
+        var step_len = 0.0
+        if iter == 0 {
+            probe_t = t0
+        } else if iter == 1 {
+            probe_t = t1
+        } else if (iter & 1) == 0 {
+            if hi_clear && t_lo + r_lo + r_hi > t_hi {
                 return CellRay::Empty(EmptyProof { seal: () })
             }
-            return CellRay::Hit(refine_root_live(field, live, o, d, t_lo, f_lo, t_hi, f_hi, tol))
-        }
-        let step_lo = min(omega_lo * r_lo, max_step_lo)
-        let cand_lo = t_lo + step_lo
-        let f_cand = field.distance_live(o + d * cand_lo, live)
-        if f_cand <= tol {
-            if omega_lo <= 1.01 {
-                return CellRay::Hit(
-                    refine_root_live(field, live, o, d, t_lo, f_lo, cand_lo, f_cand, tol),
-                )
-            }
-            // Over-relaxed probe landed inside: narrow bracket to `[t_lo, cand_lo]` and finish
-            // with safe `omega_lo = 1.0` so we never skip an earlier front crossing.
-            t_hi = cand_lo
-            f_hi = f_cand
-            hi_clear = false
-            r_hi = 0.0
-            omega_lo = 1.0
-        } else {
-            let r_cand = f_cand * inv_lip
-            if omega_lo <= 1.01 || r_lo + r_cand > step_lo {
-                t_lo = cand_lo
-                f_lo = f_cand
-                r_lo = r_cand
+            if t_lo + r_lo >= t_hi {
                 if hi_clear {
-                    omega_lo = 1.85
+                    return CellRay::Empty(EmptyProof { seal: () })
                 }
-            } else {
-                omega_lo = 1.0
+                need_refine = true
+                ref_t_out = t_lo
+                ref_f_out = f_lo
+                ref_t_in = t_hi
+                ref_f_in = f_hi
+                break
             }
-            if f_cand < f_near {
-                f_near = f_cand
-                t_near = cand_lo
+            let max_step_lo = if hi_clear { max(t_hi - r_hi - t_lo, r_lo) } else { t_hi - t_lo }
+            step_len = min(omega_lo * r_lo, max_step_lo)
+            probe_t = t_lo + step_len
+        } else {
+            if !hi_clear {
+                continue
             }
-        }
-        if hi_clear {
             if t_lo + r_lo + r_hi > t_hi {
                 return CellRay::Empty(EmptyProof { seal: () })
             }
             let max_step_hi = max(t_hi - (t_lo + r_lo), r_hi)
-            let step_hi = min(omega_hi * r_hi, max_step_hi)
-            let cand_hi = t_hi - step_hi
-            let fh_cand = field.distance_live(o + d * cand_hi, live)
-            if fh_cand <= tol {
-                t_hi = cand_hi
-                f_hi = fh_cand
+            step_len = min(omega_hi * r_hi, max_step_hi)
+            probe_t = t_hi - step_len
+        }
+        let fv = field.distance_live(o + d * probe_t, live)
+        if iter == 0 {
+            if fv <= tol {
+                return CellRay::Hit(t0)
+            }
+            if inv_lip == 0.0 {
+                return CellRay::Hit(t0)
+            }
+            f_lo = fv
+            r_lo = fv * inv_lip
+            t_near = t0
+            f_near = fv
+        } else if iter == 1 {
+            if fv < f_near {
+                f_near = fv
+                t_near = t1
+            }
+            if t0 + r_lo >= t1 {
+                if fv <= tol {
+                    need_refine = true
+                    ref_t_out = t0
+                    ref_f_out = f_lo
+                    ref_t_in = t1
+                    ref_f_in = fv
+                    break
+                }
+                return CellRay::Empty(EmptyProof { seal: () })
+            }
+            f_hi = fv
+            hi_clear = fv > tol
+            r_hi = if hi_clear { fv * inv_lip } else { 0.0 }
+            omega_lo = if hi_clear { 1.85 } else { 1.0 }
+        } else if (iter & 1) == 0 {
+            if fv <= tol {
+                if omega_lo <= 1.01 {
+                    need_refine = true
+                    ref_t_out = t_lo
+                    ref_f_out = f_lo
+                    ref_t_in = probe_t
+                    ref_f_in = fv
+                    break
+                }
+                // Over-relaxed probe landed inside: narrow bracket to `[t_lo, probe_t]` and finish
+                // with safe `omega_lo = 1.0` so we never skip an earlier front crossing.
+                t_hi = probe_t
+                f_hi = fv
                 hi_clear = false
                 r_hi = 0.0
                 omega_lo = 1.0
             } else {
-                let rh_cand = fh_cand * inv_lip
-                if omega_hi <= 1.01 || r_hi + rh_cand > step_hi {
-                    t_hi = cand_hi
-                    f_hi = fh_cand
+                let r_cand = fv * inv_lip
+                if omega_lo <= 1.01 || r_lo + r_cand > step_len {
+                    t_lo = probe_t
+                    f_lo = fv
+                    r_lo = r_cand
+                    if hi_clear {
+                        omega_lo = 1.85
+                    }
+                } else {
+                    omega_lo = 1.0
+                }
+                if fv < f_near {
+                    f_near = fv
+                    t_near = probe_t
+                }
+            }
+        } else {
+            if fv <= tol {
+                t_hi = probe_t
+                f_hi = fv
+                hi_clear = false
+                r_hi = 0.0
+                omega_lo = 1.0
+            } else {
+                let rh_cand = fv * inv_lip
+                if omega_hi <= 1.01 || r_hi + rh_cand > step_len {
+                    t_hi = probe_t
+                    f_hi = fv
                     r_hi = rh_cand
                     omega_hi = 1.85
                 } else {
                     omega_hi = 1.0
                 }
-                if fh_cand < f_near {
-                    f_near = fh_cand
-                    t_near = cand_hi
+                if fv < f_near {
+                    f_near = fv
+                    t_near = probe_t
                 }
             }
         }
+    }
+    if need_refine {
+        return CellRay::Hit(
+            refine_root_live(field, live, o, d, ref_t_out, ref_f_out, ref_t_in, ref_f_in, tol),
+        )
     }
     // Grazing ray ran out of steps while still unproven: never discard into a hole.
     CellRay::Hit(t_near)
