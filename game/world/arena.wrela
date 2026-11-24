@@ -11,31 +11,40 @@ use engine::matter::medium::{Medium, MediumSample}
 use engine::matter::substance::{Substance, lambert}
 use engine::matter::swarm::{GrainSeed, Swarm}
 use engine::matter::height::{Height, HeightSample}
+use engine::matter::verify::prove_field_facts
 use sea::swells
 use kit::substances::pbr::{basalt, dielectric, emissive, glass, metal, sand, stone}
 use std::cmp::Eq
 use std::field::{
-    Bound, Field, Rotate, RoundCone, Scale, Surface, Translate, Union, With, hash_u32, round_cone,
+    Bound, Field, FieldFacts, Rotate, RoundCone, Scale, Surface, Translate, Union, With, hash_u32,
+    round_cone, smin,
 }
 use std::hash::{StateHash, state_hash}
 
-/// Smooth minimum helper for organic flame/crystal joins.
-fn smin(a: f32, b: f32, k: f32) -> f32 {
-    let h = max(k - abs(a - b), 0.0) / k
-    min(a, b) - h * h * k * 0.25
-}
-
 /// Exact SDF of an upright cylinder centred at `(cx, cz)` from `y_lo` to `y_hi` with radius `r`.
+/// Branching on `dr > 0 && dy > 0` avoids `sqrt(0)` straddling on the shaft and caps.
 fn sd_cyl(p: vec3, cx: f32, cz: f32, y_lo: f32, y_hi: f32, r: f32) -> f32 {
     let dr = length(vec2(p.x - cx, p.z - cz)) - r
     let dy = max(p.y - y_hi, y_lo - p.y)
-    length(max(vec2(dr, dy), vec2(0.0))) + min(max(dr, dy), 0.0)
+    if dr > 0.0 && dy > 0.0 {
+        length(vec2(dr, dy))
+    } else {
+        max(dr, dy)
+    }
 }
 
 /// Exact SDF of an axis-aligned box centred at `c` with half-extents `h`.
+/// Branching on the median (`second > 0`) avoids `sqrt(0)` straddling on all 6 faces.
 fn sd_box(p: vec3, c: vec3, h: vec3) -> f32 {
     let q = abs(p - c) - h
-    length(max(q, vec3(0.0))) + min(max(q.x, max(q.y, q.z)), 0.0)
+    let xy_hi = max(q.x, q.y)
+    let xy_lo = min(q.x, q.y)
+    let second = max(xy_lo, min(xy_hi, q.z))
+    if second > 0.0 {
+        length(max(q, vec3(0.0)))
+    } else {
+        max(xy_hi, q.z)
+    }
 }
 
 /// Exact SDF of a tapered capsule/spear segment from `a` to `b` with radii `ra` -> `rb`.
@@ -134,7 +143,13 @@ impl Field<Substance> for ArenaCourtyard {
         }
         floor.blend(gold, inlay)
     }
+
+    fn field_facts(self) -> FieldFacts {
+        ARENA_COURTYARD_FACTS
+    }
 }
+
+const ARENA_COURTYARD_FACTS: FieldFacts = prove_field_facts(ArenaCourtyard { spare: 0.0 })
 
 // =================================================================================================
 // 2. Broken Fluted Temple Pillars with Glowing Arcane Runes (still, extracted once on frame 0)
@@ -148,12 +163,11 @@ pub fn arena_pillars() -> ArenaPillars {
     ArenaPillars { spare: 0.0 }
 }
 
-/// How much of an `n`-fold ripple round the axis is kept `r` m out: all of it from `r0` out, and
-/// `(r / r0)^n` within, which makes the ripple `r^n cos(n θ)`, a polynomial of x and z, so its
-/// steepness stays at most `n / r0` times its height right up to the axis (`cos(n θ)` alone is
-/// as steep as `n / r` there, without bound).
-fn ripple(r: f32, r0: f32, n: f32) -> f32 {
-    pow(min(r / r0, 1.0), n)
+/// Complex multiplication `(a.x + i·a.y)(b.x + i·b.y)` for singularity-free angular harmonics:
+/// raising `(lx, lz) / max(r, r0)` to the `n`th power equals `min(r / r0, 1)^n · (cos nθ, sin nθ)`
+/// identically everywhere in `ℝ³`, with zero `atan2`/`pow` or `1/r` gradient blowup at `r = 0`.
+fn cmul(a: vec2, b: vec2) -> vec2 {
+    vec2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x)
 }
 
 /// Evaluates one fluted broken temple column at `(cx, cz)` reaching height `h_top` with tilted break.
@@ -161,17 +175,28 @@ fn sd_pillar(p: vec3, cx: f32, cz: f32, h_top: f32, tilt_x: f32, tilt_z: f32) ->
     let lx = p.x - cx
     let lz = p.z - cz
     let r = length(vec2(lx, lz))
-    let ang = atan2(lz, lx)
     let plinth = sd_box(vec3(lx, p.y, lz), vec3(0.0, 0.22, 0.0), vec3(0.68, 0.24, 0.68))
     let collar = sd_cyl(p, cx: cx, cz: cz, y_lo: 0.42, y_hi: 0.60, r: 0.56)
-    let flute = 0.028 * cos(ang * 10.0) * ripple(r, r0: 0.40, n: 10.0)
-    let cut_y = h_top +
-        lx * tilt_x +
-        lz * tilt_z +
-        0.08 * sin(ang * 3.0) * ripple(r, r0: 0.46, n: 3.0)
+    // 10-fold shaft flutes: `cos(10 θ) · min(r / 0.40, 1)^10` via complex power.
+    // Clamping to `[-1, 1]` is an exact identity (`|lx|, |lz| <= r <= max(r, 0.40)`) that keeps
+    // interval/Lipschitz bounds finite over arbitrarily large boxes.
+    let f1 = clamp(vec2(lx, lz) / max(r, 0.40), vec2(-1.0), vec2(1.0))
+    let f2 = cmul(f1, f1)
+    let f4 = cmul(f2, f2)
+    let f8 = cmul(f4, f4)
+    let f10 = cmul(f8, f2)
+    let flute = 0.028 * f10.x
+    // 3-fold broken-top ripple: `sin(3 θ) · min(r / 0.46, 1)^3` via complex power.
+    let c1 = clamp(vec2(lx, lz) / max(r, 0.46), vec2(-1.0), vec2(1.0))
+    let c3 = cmul(cmul(c1, c1), c1)
+    let cut_y = h_top + lx * tilt_x + lz * tilt_z + 0.08 * c3.y
     let shaft_r = r - (0.46 - flute)
     let shaft_y = max(p.y - cut_y, 0.40 - p.y)
-    let shaft = length(max(vec2(shaft_r, shaft_y), vec2(0.0))) + min(max(shaft_r, shaft_y), 0.0)
+    let shaft = if shaft_r > 0.0 && shaft_y > 0.0 {
+        length(vec2(shaft_r, shaft_y))
+    } else {
+        max(shaft_r, shaft_y)
+    }
     min(min(plinth, collar), shaft)
 }
 
@@ -229,7 +254,13 @@ impl Field<Substance> for ArenaPillars {
         let col = mix(vec3(0.14, 0.145, 0.15), vec3(0.24, 0.23, 0.215), vec3(wear))
         stone(col, roughness: 0.82, micro: 0.65)
     }
+
+    fn field_facts(self) -> FieldFacts {
+        ARENA_PILLARS_FACTS
+    }
 }
+
+const ARENA_PILLARS_FACTS: FieldFacts = prove_field_facts(ArenaPillars { spare: 0.0 })
 
 // =================================================================================================
 // 3. Wrought-Bronze Temple Braziers (still carved chalices + 4 tight `many` animated flames)
@@ -295,7 +326,13 @@ impl Field<Substance> for ArenaBrazierStands {
     fn channels(self, _p: vec3) -> Substance {
         metal(vec3(0.46, 0.31, 0.16), roughness: 0.34, micro: 0.28)
     }
+
+    fn field_facts(self) -> FieldFacts {
+        ARENA_BRAZIER_STANDS_FACTS
+    }
 }
+
+const ARENA_BRAZIER_STANDS_FACTS: FieldFacts = prove_field_facts(ArenaBrazierStands { spare: 0.0 })
 
 /// One compact animated brazier fire core (`many` extracts all 4 in < 0.1 ms/frame).
 pub struct ArenaFlame: Copy + GpuData + Eq + StateHash {
@@ -364,7 +401,15 @@ impl Field<Substance> for ArenaFlame {
         let emit = mix(vec3(22.0, 9.5, 1.8), vec3(13.0, 3.2, 0.45), vec3(h)) * flicker
         emissive(vec3(1.0, 0.72, 0.28), emit, roughness: 0.25)
     }
+
+    fn field_facts(self) -> FieldFacts {
+        ARENA_FLAME_FACTS
+    }
 }
+
+const ARENA_FLAME_FACTS: FieldFacts = prove_field_facts(
+    ArenaFlame { centre: vec3(0.0), time: 0.0, phase: 0.0, pad0: 0.0, pad1: 0.0, pad2: 0.0 },
+)
 
 // =================================================================================================
 // 4. Golden Arcane Parry Ward Arc + Rival Sapphire Casting Orb
@@ -468,7 +513,15 @@ impl Field<Substance> for ParryArc {
         let edge = vec3(1.5, 0.52, 0.06) * rim
         emissive(vec3(0.42, 0.25, 0.07), body + filament + hot + edge, roughness: 0.14)
     }
+
+    fn field_facts(self) -> FieldFacts {
+        PARRY_ARC_FACTS
+    }
 }
+
+const PARRY_ARC_FACTS: FieldFacts = prove_field_facts(
+    ParryArc { time: 0.0, pad0: 0.0, pad1: 0.0, pad2: 0.0 },
+)
 
 /// Rival caster's cold sapphire-cyan arcane focus orb conjuring the incoming glass shard barrage:
 /// local sphere + swirling veins composed via rigid `.scale().rotate().translate()`, so the engine
@@ -524,7 +577,13 @@ impl Field<Substance> for RivalOrbShape {
     fn has_local_channels(self) -> bool {
         true
     }
+
+    fn field_facts(self) -> FieldFacts {
+        RIVAL_ORB_FACTS
+    }
 }
+
+const RIVAL_ORB_FACTS: FieldFacts = prove_field_facts(RivalOrbShape {})
 
 // =================================================================================================
 // 5. Incoming Refractive Glass Shard Barrage (`[GlassShard; 14]`, 1 template mesh GPU-instanced)
@@ -769,4 +828,35 @@ fn arena_field_contracts_are_sound() {
     engine::matter::verify::verify_field_soundness(rival_orb(0.5), "rival_orb")
     let shards = glass_barrage(0.5)
     engine::matter::verify::verify_field_soundness(shards[0], "glass_shard")
+    // Verify build-time proven FieldFacts witnesses erase dead transmissive & micro paths.
+    let f_court = arena_courtyard().field_facts()
+    let f_pil = arena_pillars().field_facts()
+    let f_braz = arena_brazier_stands().field_facts()
+    let f_fl = flames[0].field_facts()
+    let f_arc = parry_arc(0.5).field_facts()
+    let f_orb = rival_orb(0.5).field_facts()
+    assert(
+        f_court.lip < 1.0e12 && !f_court.may_transmit && !f_court.may_emit,
+        f"courtyard facts: lip={f_court.lip} tx={f_court.may_transmit} em={f_court.may_emit}",
+    )
+    assert(
+        f_pil.lip < 1.0e12 && !f_pil.may_transmit && !f_pil.may_coat,
+        f"pillars facts: lip={f_pil.lip} tx={f_pil.may_transmit} coat={f_pil.may_coat}",
+    )
+    assert(
+        f_braz.lip < 1.0e12 && !f_braz.may_transmit && !f_braz.may_emit,
+        f"braziers facts: lip={f_braz.lip} tx={f_braz.may_transmit} em={f_braz.may_emit}",
+    )
+    assert(
+        f_fl.lip < 1.0e12 && !f_fl.may_transmit && !f_fl.may_micro && f_fl.may_emit,
+        f"flame facts: lip={f_fl.lip} tx={f_fl.may_transmit} micro={f_fl.may_micro} em={f_fl.may_emit}",
+    )
+    assert(
+        f_arc.lip < 1.0e12 && !f_arc.may_transmit && !f_arc.may_micro && f_arc.may_emit,
+        f"parry arc facts: lip={f_arc.lip} tx={f_arc.may_transmit} micro={f_arc.may_micro} em={f_arc.may_emit}",
+    )
+    assert(
+        f_orb.lip < 1.0e12 && !f_orb.may_transmit && !f_orb.may_micro && f_orb.may_emit,
+        f"rival orb facts: lip={f_orb.lip} tx={f_orb.may_transmit} micro={f_orb.may_micro} em={f_orb.may_emit}",
+    )
 }

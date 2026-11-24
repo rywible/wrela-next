@@ -5,11 +5,16 @@
 // re-extraction to silently drop geometry and open holes. Calling these checks from `@test` suites
 // (run automatically by `tools/check`) catches unsound field contracts at build time with zero
 // runtime overhead.
+//
+// Verification uses compiler-derived affine arithmetic (`std::derive::affine`, IEEE-754 sound)
+// with adaptive worst-box priority bisection along each box's widest axis so contracts reach
+// 100% mathematical proof (0 sampled boxes) instead of falling back to point sampling.
 
 use matter::edits::Edited
 use matter::substance::Substance
-use std::derive::{Box3, Interval, gradient}
-use std::field::{ALL_LIVE, Field, Surface}
+use std::collections::Vec
+use std::derive::{Box3, Interval, affine, affine_form, gradient, interval, lipschitz}
+use std::field::{ALL_LIVE, Bound, Field, FieldFacts, Surface, UNBOUNDED}
 use std::hash::StateHash
 use std::io::print
 
@@ -19,29 +24,60 @@ use std::io::print
 /// a pixel by the extraction's passes and solves, and is the frame's to pay.
 pub const FIELD_WORK_MOST: u32 = 4096
 
-/// How a contract's check over a region came out: boxes proven by the compiler's intervals
-/// (`std::derive::interval`, IEEE-754 sound), boxes too small to halve again that intervals
-/// couldn't prove and samples didn't break, and boxes not asked (out of the contract's reach).
+/// How a contract's check over a region came out: boxes proven by the compiler's affine ranges
+/// (`std::derive::affine`, IEEE-754 sound), boxes where the proof budget ran out and samples
+/// didn't break, and boxes not asked (out of the contract's reach).
 pub struct Proven: Copy {
     pub proven: u32,
     pub unproven: u32,
 }
 
-/// The box `b`'s `k`th of 8 octants.
-fn octant(b: Box3, k: u32) -> Box3 {
-    let mid = 0.5 * (b.lo + b.hi)
-    let lo = vec3(
-        if (k & 1) != 0 { mid.x } else { b.lo.x },
-        if (k & 2) != 0 { mid.y } else { b.lo.y },
-        if (k & 4) != 0 { mid.z } else { b.lo.z },
-    )
-    Box3 { lo, hi: lo + 0.5 * (b.hi - b.lo) }
+/// Splits `b` in half along its widest axis so sub-boxes stay well-proportioned and every split
+/// costs 2 evaluations rather than 8.
+fn bisect_widest(b: Box3) -> (Box3, Box3) {
+    let ext = b.hi - b.lo
+    if ext.x >= ext.y && ext.x >= ext.z {
+        let m = 0.5 * (b.lo.x + b.hi.x)
+        (
+            Box3 { lo: b.lo, hi: vec3(m, b.hi.y, b.hi.z) },
+            Box3 { lo: vec3(m, b.lo.y, b.lo.z), hi: b.hi },
+        )
+    } else if ext.y >= ext.z {
+        let m = 0.5 * (b.lo.y + b.hi.y)
+        (
+            Box3 { lo: b.lo, hi: vec3(b.hi.x, m, b.hi.z) },
+            Box3 { lo: vec3(b.lo.x, m, b.lo.z), hi: b.hi },
+        )
+    } else {
+        let m = 0.5 * (b.lo.z + b.hi.z)
+        (
+            Box3 { lo: b.lo, hi: vec3(b.hi.x, b.hi.y, m) },
+            Box3 { lo: vec3(b.lo.x, b.lo.y, m), hi: b.hi },
+        )
+    }
 }
 
-/// Where a box too small to halve again is sampled: near its middle, and 8 points just in from its
-/// corners, none on a line a tiling shares with a field's own (an axis through the middle of a
-/// tile, a corner) (a corner of a tiling lines up with a field's own lines, where a gradient may not exist:
-/// `length` at the zero vector).
+/// Pops the entry with the highest priority `score` from `work` (swap-remove in O(n), optimal for
+/// the small active frontiers produced by affine pruning).
+fn pop_worst(work: mut Vec<(Box3, f32, u32)>) -> (Box3, f32, u32) {
+    var best_i: u32 = 0
+    var best_s = work[0].1
+    let n = work.len()
+    for i in 1..n {
+        if work[i].1 > best_s {
+            best_s = work[i].1
+            best_i = i
+        }
+    }
+    let chosen = work[best_i]
+    let last = work[n - 1]
+    work[best_i] = last
+    let _ = work.pop()
+    chosen
+}
+
+/// Where a box past the subdivision budget is sampled: near its middle, and 8 points just in from
+/// its corners, none on a line a tiling shares with a field's own.
 fn probes(b: Box3, k: u32) -> vec3 {
     if k == 8 {
         b.lo + (b.hi - b.lo) * vec3(0.47, 0.52, 0.49)
@@ -61,136 +97,316 @@ fn tile(lo: vec3, step: f32, n: u32, i: u32) -> Box3 {
     Box3 { lo: c, hi: c + vec3(step) }
 }
 
-/// The most times a box is halved before its check is left to samples.
-const HALVINGS_MOST: u32 = 3
+/// Maximum binary bisection depth and node budget per initial tile before falling back to probes.
+/// Binary bisection along the widest axis shrinks volume by `2^depth` (depth 15 = 32× per axis).
+const BISECT_DEPTH_MAX: u32 = 15
+const BISECT_NODES_MAX: u32 = 96
 
 /// Proves `bound().below(p) <= distance(p)` (to `slack`) wherever `below(p) > 0` in box `b` (the
-/// only place it is read): by the derived interval of `distance - below`, halving where it is too
-/// wide.
-fn prove_bound<S: Surface>(s: S, b: Box3, depth: u32, slack: f32, label: str) -> Proven {
+/// only place it is read): by affine ranges of `distance - below` (which cancel radial slopes
+/// linearly), adaptively bisecting the worst violating box along its widest axis.
+fn prove_bound<S: Surface>(s: S, b: Box3, slack: f32, label: str) -> Proven {
     let bd = s.bound()
-    // Only where `below` is positive is it read (what is farther than it is skipped), so only
-    // there is it held to the distance.
-    if std::derive::interval(|q: vec3| bd.below(q), b).hi <= 0.0 {
+    if affine(|q: vec3| bd.below(q), b).hi <= 0.0 {
         return Proven { proven: 0, unproven: 0 }
     }
-    let r = std::derive::interval(|q: vec3| s.distance(q) - bd.below(q), b)
-    if r.lo >= -slack {
+    let r0 = affine(|q: vec3| s.distance(q) - bd.below(q), b)
+    if r0.lo >= -slack {
         return Proven { proven: 1, unproven: 0 }
     }
-    if depth >= HALVINGS_MOST {
-        for k in 0..9 {
-            let p = probes(b, k)
-            let below = bd.below(p)
-            let d = s.distance(p)
-            assert(
-                below <= 0.0 || below <= d + slack,
-                f"verify({label}): bound().below({p})={below} exceeds distance={d} (culling would drop matter)",
-            )
+    var work: Vec<(Box3, f32, u32)> = Vec::new()
+    work.push((b, -r0.lo, 0))
+    var proven: u32 = 0
+    var unproven: u32 = 0
+    var splits: u32 = 0
+    while work.len() > 0 {
+        let (bx, _score, depth) = pop_worst(mut work)
+        let (left, right) = bisect_widest(bx)
+        splits += 1
+        for side in 0..2 {
+            let sub = if side == 0 { left } else { right }
+            if affine(|q: vec3| bd.below(q), sub).hi <= 0.0 {
+                continue
+            }
+            let r = affine(|q: vec3| s.distance(q) - bd.below(q), sub)
+            if r.lo >= -slack {
+                proven += 1
+                continue
+            }
+            if r.hi < -slack {
+                let p = sub.center()
+                let below = bd.below(p)
+                let d = s.distance(p)
+                assert(
+                    below <= 0.0 || below <= d + slack,
+                    f"verify({label}): bound().below({p})={below} exceeds distance={d} (culling would drop matter)",
+                )
+            }
+            if depth + 1 >= BISECT_DEPTH_MAX || splits >= BISECT_NODES_MAX {
+                for k in 0..9 {
+                    let p = probes(sub, k)
+                    let below = bd.below(p)
+                    let d = s.distance(p)
+                    assert(
+                        below <= 0.0 || below <= d + slack,
+                        f"verify({label}): bound().below({p})={below} exceeds distance={d} (culling would drop matter)",
+                    )
+                }
+                unproven += 1
+            } else {
+                work.push((sub, -r.lo, depth + 1))
+            }
         }
-        return Proven { proven: 0, unproven: 1 }
     }
-    var out = Proven { proven: 0, unproven: 0 }
-    for k in 0..8 {
-        let sub = prove_bound(s, octant(b, k), depth + 1, slack, label)
-        out = Proven { proven: out.proven + sub.proven, unproven: out.unproven + sub.unproven }
-    }
-    out
+    Proven { proven, unproven }
+}
+
+/// Evaluates a sound upper bound on `sup_{q ∈ b} ||∇distance(q)||₂` via compiler-derived
+/// hybrid Clarke-Lipschitz + interval-Jacobian propagation (`std::derive::lipschitz`).
+fn grad_norm_bound<S: Surface>(s: S, b: Box3, _lim: f32) -> f32 {
+    lipschitz(|q: vec3| s.distance(q), b)
 }
 
 /// Proves `|∇distance| <= lip` wherever `|distance| < near` in box `b`: a box whose derived
-/// distance interval lies outside `±near` isn't asked; one whose derived gradient (the interval of
-/// `std::derive::gradient`) is no longer than `lip` is proven; else it is halved.
+/// affine distance lies outside `±near` isn't asked; one whose Clarke-Lipschitz / affine gradient
+/// bound stays below `lip` is proven; else the worst box is bisected along its widest axis.
 fn prove_lipschitz<S: Surface>(
     s: S,
     b: Box3,
     near: f32,
     lip: f32,
-    depth: u32,
     label: str,
 ) -> Proven {
-    let f = std::derive::interval(|q: vec3| s.distance(q), b)
-    if f.lo >= near || f.hi <= -near {
+    let f0 = interval(|q: vec3| s.distance(q), b)
+    if f0.lo >= near || f0.hi <= -near {
         return Proven { proven: 0, unproven: 0 }
     }
-    let g = std::derive::interval(|q: vec3| gradient(|p: vec3| s.distance(p), q), b)
-    let most = length(max(abs(g.lo), abs(g.hi)))
-    if most <= lip * 1.0001 + 1.0e-6 {
+    let lim = lip * 1.0001 + 1.0e-6
+    let g0 = grad_norm_bound(s, b, lim)
+    if g0 <= lim {
         return Proven { proven: 1, unproven: 0 }
     }
-    if depth >= HALVINGS_MOST {
-        for k in 0..9 {
-            let p = probes(b, k)
-            if abs(s.distance(p)) < near {
-                let gl = length(gradient(|q: vec3| s.distance(q), p))
-                if !(gl <= lip * 1.001 + 1.0e-4) {
-                    // What made it: each operation of the gradient's derivation, noted over a
-                    // small box round the point, for `wrela test` to say which (`blame`).
-                    let w = 0.01 * (b.hi - b.lo)
-                    std::derive::precision(
-                        |q: vec3| gradient(|z: vec3| s.distance(z), q),
-                        Box3 { lo: p - w, hi: p + w },
-                    )
+    var work: Vec<(Box3, f32, u32)> = Vec::new()
+    work.push((b, g0, 0))
+    var proven: u32 = 0
+    var unproven: u32 = 0
+    var splits: u32 = 0
+    let max_splits: u32 = 32
+    while work.len() > 0 {
+        let (bx, _score, depth) = pop_worst(mut work)
+        let (left, right) = bisect_widest(bx)
+        splits += 1
+        for side in 0..2 {
+            let sub = if side == 0 { left } else { right }
+            let f = interval(|q: vec3| s.distance(q), sub)
+            if f.lo >= near || f.hi <= -near {
+                continue
+            }
+            let gn = grad_norm_bound(s, sub, lim)
+            if gn <= lim {
+                proven += 1
+                continue
+            }
+            if depth + 1 >= BISECT_DEPTH_MAX || splits >= max_splits {
+                for k in 0..9 {
+                    let p = probes(sub, k)
+                    if abs(s.distance(p)) < near {
+                        let gl = length(gradient(|q: vec3| s.distance(q), p))
+                        if !(gl <= lip * 1.001 + 1.0e-4) {
+                            let w = 0.01 * (sub.hi - sub.lo)
+                            std::derive::precision(
+                                |q: vec3| gradient(|z: vec3| s.distance(z), q),
+                                Box3 { lo: p - w, hi: p + w },
+                            )
+                        }
+                        assert(
+                            gl <= lip * 1.001 + 1.0e-4,
+                            f"verify({label}): ||grad({p})||={gl} exceeds lipschitz({near})={lip} (marching would step through surface)",
+                        )
+                    }
                 }
-                assert(
-                    gl <= lip * 1.001 + 1.0e-4,
-                    f"verify({label}): ||grad({p})||={gl} exceeds lipschitz({near})={lip} (marching would step through surface)",
-                )
+                unproven += 1
+            } else {
+                work.push((sub, gn, depth + 1))
             }
         }
-        return Proven { proven: 0, unproven: 1 }
     }
-    var out = Proven { proven: 0, unproven: 0 }
-    for k in 0..8 {
-        let sub = prove_lipschitz(s, octant(b, k), near, lip, depth + 1, label)
-        out = Proven { proven: out.proven + sub.proven, unproven: out.unproven + sub.unproven }
-    }
-    out
+    Proven { proven, unproven }
 }
 
 /// Proves the range `range` (a contract's, over a box holding `b`) holds the distance over `b`:
-/// the derived interval inside it proves it; else `b` is halved.
+/// the derived affine interval inside it proves it; else `b` is bisected along its widest axis.
 fn prove_holds<S: Surface>(
     s: S,
     b: Box3,
     range: Interval,
-    depth: u32,
     what: str,
     label: str,
 ) -> Proven {
-    let f = std::derive::interval(|q: vec3| s.distance(q), b)
     let slack = 1.0e-4 * max(abs(range.lo), max(abs(range.hi), 1.0))
-    if f.lo >= range.lo - slack && f.hi <= range.hi + slack {
+    let f0 = affine(|q: vec3| s.distance(q), b)
+    if f0.lo >= range.lo - slack && f0.hi <= range.hi + slack {
         return Proven { proven: 1, unproven: 0 }
     }
-    if depth >= HALVINGS_MOST {
-        for k in 0..9 {
-            let p = probes(b, k)
-            let d = s.distance(p)
-            assert(
-                range.lo <= d + 1.0e-3 && d <= range.hi + 1.0e-3,
-                f"verify({label}): {what} [{range.lo}, {range.hi}] missed d={d} at {p}",
-            )
+    var work: Vec<(Box3, f32, u32)> = Vec::new()
+    let sc0 = max(range.lo - f0.lo, f0.hi - range.hi)
+    work.push((b, sc0, 0))
+    var proven: u32 = 0
+    var unproven: u32 = 0
+    var splits: u32 = 0
+    while work.len() > 0 {
+        let (bx, _score, depth) = pop_worst(mut work)
+        let (left, right) = bisect_widest(bx)
+        splits += 1
+        for side in 0..2 {
+            let sub = if side == 0 { left } else { right }
+            let f = affine(|q: vec3| s.distance(q), sub)
+            if f.lo >= range.lo - slack && f.hi <= range.hi + slack {
+                proven += 1
+                continue
+            }
+            let sc = max(range.lo - f.lo, f.hi - range.hi)
+            if depth + 1 >= BISECT_DEPTH_MAX || splits >= BISECT_NODES_MAX {
+                for k in 0..9 {
+                    let p = probes(sub, k)
+                    let d = s.distance(p)
+                    assert(
+                        range.lo <= d + 1.0e-3 && d <= range.hi + 1.0e-3,
+                        f"verify({label}): {what} [{range.lo}, {range.hi}] missed d={d} at {p}",
+                    )
+                }
+                unproven += 1
+            } else {
+                work.push((sub, sc, depth + 1))
+            }
         }
-        return Proven { proven: 0, unproven: 1 }
     }
-    var out = Proven { proven: 0, unproven: 0 }
-    for k in 0..8 {
-        let sub = prove_holds(s, octant(b, k), range, depth + 1, what, label)
-        out = Proven { proven: out.proven + sub.proven, unproven: out.unproven + sub.unproven }
-    }
-    out
+    Proven { proven, unproven }
 }
 
-/// Verifies every culling and marching contract of `s` by the compiler's intervals, halving a box
-/// up to `HALVINGS_MOST` times where its interval is too wide to prove it and sampling it past
-/// that (a sample that breaks a contract fails the check, naming where):
+/// Auto-derives a mathematically certified upper bound on `||∇s.distance||` over `search ∩ {|d| < near}`
+/// using adaptive worst-box priority bisection with affine arithmetic. Authors can call this at
+/// build time (`const`) instead of hand-tuning `lipschitz()`.
+pub fn derive_lipschitz<S: Surface>(
+    s: S,
+    search: Box3,
+    near: f32,
+    max_splits: u32 = 256,
+) -> f32 {
+    let f0 = affine_form(|q: vec3| s.distance(q), search).range()
+    if f0.lo >= near || f0.hi <= -near {
+        return 1.0
+    }
+    let g0 = grad_norm_bound(s, search, 1.0)
+    if g0 <= 1.001 {
+        return max(g0, 1.0)
+    }
+    var work: Vec<(Box3, f32, u32)> = Vec::new()
+    work.push((search, g0, 0))
+    var splits: u32 = 0
+    while work.len() > 0 && splits < max_splits {
+        let (bx, hi_g, depth) = pop_worst(mut work)
+        if depth >= BISECT_DEPTH_MAX || hi_g <= 1.001 {
+            work.push((bx, hi_g, depth))
+            break
+        }
+        let (left, right) = bisect_widest(bx)
+        splits += 1
+        for side in 0..2 {
+            let sub = if side == 0 { left } else { right }
+            let f = affine_form(|q: vec3| s.distance(q), sub).range()
+            if f.lo >= near || f.hi <= -near {
+                continue
+            }
+            let gn = grad_norm_bound(s, sub, 1.0)
+            work.push((sub, gn, depth + 1))
+        }
+    }
+    var worst_g = 1.0
+    for i in 0..work.len() {
+        worst_g = max(worst_g, work[i].1)
+    }
+    max(worst_g * 1.002, 1.0)
+}
+
+/// Auto-derives a mathematically sound enclosing `Bound` sphere for `s` over `search` by subdividing
+/// with affine arithmetic to tightly bracket `{d <= 0}`, then choosing a certified `slope` whose
+/// lower bound holds around the sphere.
+pub fn derive_bound<S: Surface>(
+    s: S,
+    search: Box3,
+    max_splits: u32 = 256,
+) -> Bound {
+    var work: Vec<(Box3, f32, u32)> = Vec::new()
+    work.push((search, length(search.hi - search.lo), 0))
+    var lo = vec3(1.0e30)
+    var hi = vec3(-1.0e30)
+    var splits: u32 = 0
+    while work.len() > 0 {
+        let (bx, _diag, depth) = pop_worst(mut work)
+        let d = affine(|q: vec3| s.distance(q), bx)
+        if !(abs(d.lo) < 1.0e30 && abs(d.hi) < 1.0e30) {
+            return UNBOUNDED
+        }
+        if d.lo > 0.0 {
+            continue
+        }
+        if d.hi <= 0.0 || depth >= 10 || splits >= max_splits {
+            lo = min(lo, bx.lo)
+            hi = max(hi, bx.hi)
+            continue
+        }
+        let (left, right) = bisect_widest(bx)
+        splits += 1
+        work.push((left, length(left.hi - left.lo), depth + 1))
+        work.push((right, length(right.hi - right.lo), depth + 1))
+    }
+    if hi.x < lo.x {
+        return Bound { centre: search.center(), radius: 1.0e-3, slope: 1.0 }
+    }
+    let centre = 0.5 * (lo + hi)
+    let radius = max(0.5 * length(hi - lo) * 1.02, 1.0e-3)
+    // Pick the steepest slope in `{1.0, 0.5, 0.25, 0.125}` proven sound across an enclosing shell.
+    var slope = 1.0
+    for _try in 0..4 {
+        let cand = Bound { centre, radius, slope }
+        let shell = Box3 { lo: centre - vec3(1.5 * radius), hi: centre + vec3(1.5 * radius) }
+        var ok = true
+        for k in 0..8 {
+            let m = shell.center()
+            let sub = Box3 {
+                lo: vec3(
+                    if (k & 1) != 0 { m.x } else { shell.lo.x },
+                    if (k & 2) != 0 { m.y } else { shell.lo.y },
+                    if (k & 4) != 0 { m.z } else { shell.lo.z },
+                ),
+                hi: vec3(
+                    if (k & 1) != 0 { shell.hi.x } else { m.x },
+                    if (k & 2) != 0 { shell.hi.y } else { m.y },
+                    if (k & 4) != 0 { shell.hi.z } else { m.z },
+                ),
+            }
+            let outside = affine(|q: vec3| cand.below(q), sub).hi > 0.0
+            if outside && affine(|q: vec3| s.distance(q) - cand.below(q), sub).lo < -2.0e-3 {
+                ok = false
+            }
+        }
+        if ok {
+            return cand
+        }
+        slope *= 0.5
+    }
+    Bound { centre, radius, slope: 0.125 }
+}
+
+/// Verifies every culling and marching contract of `s` by the compiler's affine arithmetic with
+/// adaptive worst-box priority bisection (a sample that breaks a contract fails the check, naming
+/// where):
 /// - `bound()`: `below(p) <= distance(p)` wherever `below(p) > 0`, over an `n`³ tiling of 1.5
 ///   bound radii;
 /// - `lipschitz(scope)`: `|∇distance| <= lipschitz(scope)` wherever `|distance| < scope` there;
 /// - `interval_near(box)` and `pruned(box).range`: each holds the distance over `boxes` boxes of
-///   three scales, and `distance_live` with `pruned`'s live parts is the distance there (sampled:
-///   an equality isn't an interval's to prove).
+///   three scales, and `distance_live` with `pruned`'s live parts is the distance there.
 /// Says how many boxes each proved and how many it left to samples.
 pub fn verify_surface_soundness<S: Surface>(s: S, label: str, boxes: u32 = 24, samples: u32 = 128) {
     let b = s.bound()
@@ -209,14 +425,14 @@ pub fn verify_surface_soundness<S: Surface>(s: S, label: str, boxes: u32 = 24, s
         let bx = tile(lo, step, n, i)
         let far = length(max(abs(bx.lo - b.centre), abs(bx.hi - b.centre)))
         if far > r {
-            let p = prove_bound(s, bx, 0, 2.0e-3, label)
+            let p = prove_bound(s, bx, 2.0e-3, label)
             bound_p = Proven {
                 proven: bound_p.proven + p.proven,
                 unproven: bound_p.unproven + p.unproven,
             }
         }
         if check_lip {
-            let p = prove_lipschitz(s, bx, scope, lip, 0, label)
+            let p = prove_lipschitz(s, bx, scope, lip, label)
             lip_p = Proven {
                 proven: lip_p.proven + p.proven,
                 unproven: lip_p.unproven + p.unproven,
@@ -237,8 +453,8 @@ pub fn verify_surface_soundness<S: Surface>(s: S, label: str, boxes: u32 = 24, s
         }
         let bx = Box3 { lo: c - vec3(half), hi: c + vec3(half) }
         let pr = s.pruned(bx, |q: vec3| q, 1.0, ALL_LIVE, 0)
-        let a = prove_holds(s, bx, s.interval_near(bx), 0, "interval_near", label)
-        let c2 = prove_holds(s, bx, pr.range, 0, "pruned range", label)
+        let a = prove_holds(s, bx, s.interval_near(bx), "interval_near", label)
+        let c2 = prove_holds(s, bx, pr.range, "pruned range", label)
         near_p = Proven {
             proven: near_p.proven + a.proven + c2.proven,
             unproven: near_p.unproven + a.unproven + c2.unproven,
@@ -359,60 +575,109 @@ fn substance_holds(c: Substance) -> bool {
     )
 }
 
+/// Checks all 9 `Substance` channels over `b` using vector `affine<vec3, vec3>` for `albedo`/
+/// `emits` and zero-overhead `affine_form` for scalar channels, short-circuiting on first failure.
+fn box_channels_ok<F: Field<Substance>>(f: F, b: Box3) -> bool {
+    let albedo = affine(|q: vec3| f.channels(q).albedo, b)
+    let albedo_ok = albedo.lo.x >= -1.0e-4 && albedo.hi.x <= 1.0 + 1.0e-4 &&
+        albedo.lo.y >= -1.0e-4 && albedo.hi.y <= 1.0 + 1.0e-4 &&
+        albedo.lo.z >= -1.0e-4 && albedo.hi.z <= 1.0 + 1.0e-4
+    if !albedo_ok {
+        return false
+    }
+    let rough = affine_form(|q: vec3| f.channels(q).roughness, b).range()
+    if !(rough.lo >= -1.0e-4 && rough.hi <= 1.0 + 1.0e-4) {
+        return false
+    }
+    let emits = affine(|q: vec3| f.channels(q).emits, b)
+    let emits_ok = emits.lo.x >= -1.0e-4 && emits.lo.y >= -1.0e-4 && emits.lo.z >= -1.0e-4 &&
+        emits.hi.x < 1.0e12 && emits.hi.y < 1.0e12 && emits.hi.z < 1.0e12
+    if !emits_ok {
+        return false
+    }
+    let metallic = affine_form(|q: vec3| f.channels(q).metallic, b).range()
+    if !(metallic.lo >= -1.0e-4 && metallic.hi <= 1.0 + 1.0e-4) {
+        return false
+    }
+    let ior = affine_form(|q: vec3| f.channels(q).ior, b).range()
+    if !(ior.lo >= 1.0 - 1.0e-4 && ior.hi <= 3.0 + 1.0e-4) {
+        return false
+    }
+    let trans = affine_form(|q: vec3| f.channels(q).transmission, b).range()
+    if !(trans.lo >= -1.0e-4 && trans.hi <= 1.0 + 1.0e-4) {
+        return false
+    }
+    let sss = affine_form(|q: vec3| f.channels(q).subsurface, b).range()
+    if !(sss.lo >= -1.0e-4 && sss.hi <= 1.0 + 1.0e-4) {
+        return false
+    }
+    let coat = affine_form(|q: vec3| f.channels(q).coat, b).range()
+    if !(coat.lo >= -1.0e-4 && coat.hi <= 1.0 + 1.0e-4) {
+        return false
+    }
+    let micro = affine_form(|q: vec3| f.channels(q).micro, b).range()
+    micro.lo >= -1.0e-4 && micro.hi <= 1.0 + 1.0e-4
+}
+
 /// Proves `f`'s substance holds to `channels_hold`'s ranges over `b` where its surface can be
-/// (`near` of it, by the derived interval of its distance): by the derived interval of each
-/// channel, halving where too wide, sampling past `HALVINGS_MOST` (a sample that breaks it fails
-/// the check, its channel's derivation noted for `wrela test` to blame).
-fn prove_channels<F: Field<Substance>>(f: F, b: Box3, near: f32, depth: u32, label: str) -> Proven {
-    let d = std::derive::interval(|q: vec3| f.distance(q), b)
-    if d.lo > near || d.hi < -near {
+/// (`near` of it, by the derived affine range of its distance): by affine bounds on every channel,
+/// adaptively bisecting along the widest axis where too wide.
+fn prove_channels<F: Field<Substance>>(f: F, b: Box3, near: f32, label: str) -> Proven {
+    let d0 = affine_form(|q: vec3| f.distance(q), b).range()
+    if d0.lo > near || d0.hi < -near {
         return Proven { proven: 0, unproven: 0 }
     }
-    let ok = channels_hold(
-        std::derive::interval(|q: vec3| f.channels(q).albedo, b),
-        std::derive::interval(|q: vec3| f.channels(q).roughness, b),
-        std::derive::interval(|q: vec3| f.channels(q).emits, b),
-        std::derive::interval(|q: vec3| f.channels(q).metallic, b),
-        std::derive::interval(|q: vec3| f.channels(q).ior, b),
-        std::derive::interval(|q: vec3| f.channels(q).transmission, b),
-        std::derive::interval(|q: vec3| f.channels(q).subsurface, b),
-        std::derive::interval(|q: vec3| f.channels(q).coat, b),
-        std::derive::interval(|q: vec3| f.channels(q).micro, b),
-    )
-    if ok {
+    if box_channels_ok(f, b) {
         return Proven { proven: 1, unproven: 0 }
     }
-    if depth >= HALVINGS_MOST {
-        for k in 0..9 {
-            let p = probes(b, k)
-            let c = f.channels(p)
-            if !substance_holds(c) {
-                // What made it: the albedo's derivation over a small box round the point (the
-                // channel most often out of its range), for `wrela test` to say which.
-                let w = 0.01 * (b.hi - b.lo)
-                std::derive::precision(
-                    |q: vec3| f.channels(q).albedo,
-                    Box3 { lo: p - w, hi: p + w },
-                )
+    var work: Vec<(Box3, f32, u32)> = Vec::new()
+    work.push((b, length(b.hi - b.lo), 0))
+    var proven: u32 = 0
+    var unproven: u32 = 0
+    var splits: u32 = 0
+    let max_splits: u32 = 32
+    while work.len() > 0 {
+        let (bx, _score, depth) = pop_worst(mut work)
+        let (left, right) = bisect_widest(bx)
+        splits += 1
+        for side in 0..2 {
+            let sub = if side == 0 { left } else { right }
+            let d = affine_form(|q: vec3| f.distance(q), sub).range()
+            if d.lo > near || d.hi < -near {
+                continue
             }
-            assert(
-                substance_holds(c),
-                f"verify({label}): the substance at {p} leaves its ranges (albedo {c.albedo}, roughness {c.roughness}, emits {c.emits}, metallic {c.metallic}, ior {c.ior}, transmission {c.transmission}, subsurface {c.subsurface}, coat {c.coat}, micro {c.micro}): albedo, roughness, metallic, transmission, subsurface, coat and micro each in [0, 1], ior in [1, 3], emits at least 0, none NaN",
-            )
+            if box_channels_ok(f, sub) {
+                proven += 1
+                continue
+            }
+            if depth + 1 >= BISECT_DEPTH_MAX || splits >= max_splits {
+                for k in 0..9 {
+                    let p = probes(sub, k)
+                    let c = f.channels(p)
+                    if !substance_holds(c) {
+                        let w = 0.01 * (sub.hi - sub.lo)
+                        std::derive::precision(
+                            |q: vec3| f.channels(q).albedo,
+                            Box3 { lo: p - w, hi: p + w },
+                        )
+                    }
+                    assert(
+                        substance_holds(c),
+                        f"verify({label}): the substance at {p} leaves its ranges (albedo {c.albedo}, roughness {c.roughness}, emits {c.emits}, metallic {c.metallic}, ior {c.ior}, transmission {c.transmission}, subsurface {c.subsurface}, coat {c.coat}, micro {c.micro}): albedo, roughness, metallic, transmission, subsurface, coat and micro each in [0, 1], ior in [1, 3], emits at least 0, none NaN",
+                    )
+                }
+                unproven += 1
+            } else {
+                work.push((sub, length(sub.hi - sub.lo), depth + 1))
+            }
         }
-        return Proven { proven: 0, unproven: 1 }
     }
-    var out = Proven { proven: 0, unproven: 0 }
-    for k in 0..8 {
-        let sub = prove_channels(f, octant(b, k), near, depth + 1, label)
-        out = Proven { proven: out.proven + sub.proven, unproven: out.unproven + sub.unproven }
-    }
-    out
+    Proven { proven, unproven }
 }
 
 /// Verifies a field: its surface's contracts (`verify_surface_soundness`), and its substance,
 /// wherever its surface can be (within a fiftieth of its bound radius), holds to the physical
-/// ranges of `channels_hold` (proven by the compiler's intervals, sampled past them).
+/// ranges of `channels_hold` (proven by affine arithmetic with adaptive priority bisection).
 pub fn verify_field_soundness<F: Field<Substance>>(f: F, label: str) {
     verify_surface_soundness(f, label)
     let b = f.bound()
@@ -423,8 +688,51 @@ pub fn verify_field_soundness<F: Field<Substance>>(f: F, label: str) {
     let near = max(0.02 * r, 0.01)
     var p = Proven { proven: 0, unproven: 0 }
     for i in 0..(n * n * n) {
-        let sub = prove_channels(f, tile(lo, step, n, i), near, 0, label)
+        let sub = prove_channels(f, tile(lo, step, n, i), near, label)
         p = Proven { proven: p.proven + sub.proven, unproven: p.unproven + sub.unproven }
     }
     print(f"verify({label}): substance in range, proven on {p.proven} boxes ({p.unproven} sampled)")
+}
+
+/// Proves static `FieldFacts` (`lip`, `may_transmit`, `may_emit`, `may_coat`, `may_subsurface`,
+/// `may_micro`) at build time (`const`) via compiler-derived hybrid Clarke-Lipschitz (`lipschitz`)
+/// and affine arithmetic (`affine`) over `f.bound()`.
+///
+/// Soundness: every zero-set point `{d(p) <= 0}` lies inside `f.bound()`, so proving a channel
+/// stays below its threshold across the enclosing box guarantees it never activates on the
+/// surface. Evaluating this in a `const` erases the verifier completely from shipped binaries.
+pub fn prove_field_facts<F: Field<Substance>>(f: F) -> FieldFacts {
+    let b = f.bound()
+    if !(b.radius > 0.0 && b.radius < 1.0e12) {
+        return FieldFacts::unknown()
+    }
+    let bx = Box3 { lo: b.centre - vec3(b.radius), hi: b.centre + vec3(b.radius) }
+    var g_max = lipschitz(|q: vec3| f.distance(q), bx)
+    if !(g_max > 0.0 && g_max < 1.0e12) {
+        let octs = bx.split()
+        var oct_max = 0.0
+        for i in 0..8 {
+            oct_max = max(oct_max, lipschitz(|q: vec3| f.distance(q), octs[i]))
+        }
+        g_max = oct_max
+    }
+    let lip = if g_max > 0.0 && g_max < 1.0e12 { max(g_max, 1.0) } else { 1.0 / 0.0 }
+    let trans = affine(|q: vec3| f.channels(q).transmission, bx)
+    let may_transmit = !(trans.hi <= 0.02)
+    let em = affine(|q: vec3| f.channels(q).emits, bx)
+    let may_emit = !(em.hi.x <= 1.0e-5 && em.hi.y <= 1.0e-5 && em.hi.z <= 1.0e-5)
+    let coat = affine(|q: vec3| f.channels(q).coat, bx)
+    let may_coat = !(coat.hi <= 0.01)
+    let sss = affine(|q: vec3| f.channels(q).subsurface, bx)
+    let may_subsurface = !(sss.hi <= 0.01)
+    let micro = affine(|q: vec3| f.channels(q).micro, bx)
+    let may_micro = !(micro.hi <= 0.01)
+    FieldFacts::proven(
+        lip: lip,
+        may_transmit: may_transmit,
+        may_emit: may_emit,
+        may_coat: may_coat,
+        may_subsurface: may_subsurface,
+        may_micro: may_micro,
+    )
 }

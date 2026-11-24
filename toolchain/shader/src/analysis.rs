@@ -97,6 +97,25 @@ pub(crate) fn const_int(consts: &HashMap<ir::ValueId, ir::Const>, v: ir::ValueId
     }
 }
 
+/// How a payload-less enum (`TypeDef::Enum` whose variants all carry `None`) is lowered to a
+/// scalar in code: a two-variant `[0, 1]` enum (such as `Option<EmptyProof>`) lowers to `bool`,
+/// and any other payload-less enum lowers to its `u32` tag directly (no struct wrapper).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UnitEnum {
+    Bool,
+    Tag,
+}
+
+/// Whether `t` is a payload-less enum and which scalar form it takes.
+pub(crate) fn unit_enum(types: &ir::Types, t: ir::TypeId) -> Option<UnitEnum> {
+    let ir::TypeDef::Enum { variants, tags, .. } = types.get(t) else { return None };
+    if !variants.iter().all(|(_, p)| p.is_none()) {
+        return None;
+    }
+    let bool_tags = variants.len() == 2 && (tags.is_empty() || tags.as_slice() == [0, 1]);
+    Some(if bool_tags { UnitEnum::Bool } else { UnitEnum::Tag })
+}
+
 /// What the compiler proves of `m`'s run-time checks (`wrela_ir::work`), where `checks` writes
 /// any in: the ones it makes unneeded are left out.
 pub(crate) fn proofs(m: &ir::Module, checks: Checks) -> ir::work::Proofs {

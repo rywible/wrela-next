@@ -393,6 +393,12 @@ impl<'m> Writer<'m> {
                 let stride = self.layouts.get(&self.m.types, e).0.stride();
                 self.type_id(TypeKey::RuntimeArray(elem, stride))
             }
+            ir::TypeDef::Enum { .. } if !laid && let Some(u) = analysis::unit_enum(types, t) => {
+                match u {
+                    analysis::UnitEnum::Bool => self.scalar_ty(ir::Scalar::Bool)?,
+                    analysis::UnitEnum::Tag => self.scalar_ty(ir::Scalar::U32)?,
+                }
+            }
             ir::TypeDef::Struct { ref name, .. } | ir::TypeDef::Enum { ref name, .. } => {
                 self.struct_ty(t, laid, name)?
             }
@@ -549,6 +555,15 @@ impl<'m> Writer<'m> {
                     ids.push(self.const_value(*ft, p)?);
                 }
                 Ok(self.constant(ConstKey::Composite(ty, ids)))
+            }
+            (ir::TypeDef::Enum { .. }, ir::ConstValue::Variant(k, None))
+                if let Some(u) = analysis::unit_enum(&m.types, t) =>
+            {
+                let tag = m.types.tag(t, *k);
+                Ok(match u {
+                    analysis::UnitEnum::Bool => self.const_bool(tag != 0),
+                    analysis::UnitEnum::Tag => self.const_u32(tag),
+                })
             }
             _ => Err("internal: a table's value doesn't fit its type".into()),
         }
@@ -819,6 +834,8 @@ struct Pointer {
     class: StorageClass,
     laid: bool,
     ty: ir::TypeId,
+    /// True when the pointer names a `bool`-lowered unit enum whose `u32` tag is being accessed.
+    bool_tag: bool,
 }
 
 /// An entry point's outputs: a vertex shader's varyings (each its variable) and its point size,
@@ -1492,6 +1509,14 @@ impl<'m> FunctionWriter<'_, 'm> {
         let mut id = value;
         let mut t = t;
         for &k in path {
+            if let Some(u) = analysis::unit_enum(&self.w.m.types, t) {
+                debug_assert_eq!(k, 0);
+                if u == analysis::UnitEnum::Bool {
+                    id = self.bool_to_u32(id);
+                }
+                t = self.w.m.types.part(t, k).ok_or("internal: a varying's path")?;
+                continue;
+            }
             let member = self.w.m.types.gpu_member(t, k);
             let next = self.w.m.types.part(t, k).ok_or("internal: a varying's path")?;
             let nt = self.w.ty(next, false)?;
@@ -1687,6 +1712,8 @@ impl FunctionWriter<'_, '_> {
         };
         let mut indices = Vec::new();
         let mut sized = sized;
+        let mut bool_tag = false;
+        let mut pointee_ir = None;
         for proj in &p.path {
             match (proj, t) {
                 (ir::Proj::Index(i), None) => {
@@ -1695,6 +1722,16 @@ impl FunctionWriter<'_, '_> {
                     indices.push(zero);
                     indices.push(self.index(*i, None, Some(var))?);
                     t = Some(elem);
+                }
+                (ir::Proj::Field(k), Some(pt))
+                    if !laid && let Some(u) = analysis::unit_enum(&m.types, pt) =>
+                {
+                    debug_assert_eq!(*k, 0);
+                    if u == analysis::UnitEnum::Bool {
+                        bool_tag = true;
+                        pointee_ir = Some(pt);
+                    }
+                    t = m.proj_ty(pt, proj);
                 }
                 (ir::Proj::Field(k), Some(pt)) => {
                     indices.push(self.w.const_u32(m.types.gpu_member(pt, *k)));
@@ -1714,21 +1751,27 @@ impl FunctionWriter<'_, '_> {
         }
         let t = t.ok_or("internal: a place's type")?;
         if indices.is_empty() {
-            return Ok(Pointer { id: base, class, laid, ty: t });
+            return Ok(Pointer { id: base, class, laid, ty: t, bool_tag });
         }
-        let pointee = self.w.ty(t, laid)?;
+        let pointee = self.w.ty(pointee_ir.unwrap_or(t), laid)?;
         let ptr_ty = self.w.pointer(class, pointee);
         let mut operands = vec![base];
         operands.extend(indices);
         let id = self.op(Op::AccessChain, ptr_ty, &operands);
-        Ok(Pointer { id, class, laid, ty: t })
+        Ok(Pointer { id, class, laid, ty: t, bool_tag })
+    }
+
+    fn bool_to_u32(&mut self, b: Word) -> Word {
+        let u = self.w.u32_ty();
+        let one = self.w.const_u32(1);
+        let zero = self.w.const_u32(0);
+        self.op(Op::Select, u, &[b, one, zero])
     }
 
     fn is_aggregate(&self, t: ir::TypeId) -> bool {
-        matches!(
-            self.w.m.types.get(t),
-            ir::TypeDef::Array(..) | ir::TypeDef::Struct { .. } | ir::TypeDef::Enum { .. }
-        )
+        matches!(self.w.m.types.get(t), ir::TypeDef::Array(..) | ir::TypeDef::Struct { .. })
+            || (matches!(self.w.m.types.get(t), ir::TypeDef::Enum { .. })
+                && analysis::unit_enum(&self.w.m.types, t).is_none())
     }
 
     /// The scope and memory semantics of an atomic in `class`: relaxed, with no storage class
@@ -1748,6 +1791,11 @@ impl FunctionWriter<'_, '_> {
             return self.param_part(i, &p.path);
         }
         let ptr = self.pointer(p)?;
+        if ptr.bool_tag {
+            let bt = self.w.bool_ty();
+            let b = self.op(Op::Load, bt, &[ptr.id]);
+            return Ok(self.bool_to_u32(b));
+        }
         let plain = self.w.ty(ptr.ty, false)?;
         if matches!(self.w.m.types.get(ptr.ty), ir::TypeDef::Atomic(_)) {
             let (scope, semantics) = self.atomic_scope(ptr.class);
@@ -1763,6 +1811,13 @@ impl FunctionWriter<'_, '_> {
 
     fn store(&mut self, p: &ir::Place, value: Word) -> R<()> {
         let ptr = self.pointer(p)?;
+        if ptr.bool_tag {
+            let bt = self.w.bool_ty();
+            let zero = self.w.const_u32(0);
+            let b = self.op(Op::INotEqual, bt, &[value, zero]);
+            self.emit(Op::Store, &[ptr.id, b]);
+            return Ok(());
+        }
         if matches!(self.w.m.types.get(ptr.ty), ir::TypeDef::Atomic(_)) {
             let (scope, semantics) = self.atomic_scope(ptr.class);
             self.emit(Op::AtomicStore, &[ptr.id, scope, semantics, value]);
@@ -1788,6 +1843,13 @@ impl FunctionWriter<'_, '_> {
             let next = m.proj_ty(t, proj).ok_or("internal: a parameter's part")?;
             let nt = self.w.ty(next, false)?;
             id = match proj {
+                ir::Proj::Field(k) if let Some(u) = analysis::unit_enum(&m.types, t) => {
+                    debug_assert_eq!(*k, 0);
+                    match u {
+                        analysis::UnitEnum::Bool => self.bool_to_u32(id),
+                        analysis::UnitEnum::Tag => id,
+                    }
+                }
                 ir::Proj::Field(k) => {
                     self.op(Op::CompositeExtract, nt, &[id, m.types.gpu_member(t, *k)])
                 }
@@ -1913,11 +1975,27 @@ impl FunctionWriter<'_, '_> {
             ir::Expr::Extract(x, i) => {
                 let xt = self.ty_of(*x);
                 let base = self.val(*x)?;
+                if let Some(u) = analysis::unit_enum(&m.types, xt) {
+                    debug_assert_eq!(*i, 0);
+                    let id = match u {
+                        analysis::UnitEnum::Bool => self.bool_to_u32(base),
+                        analysis::UnitEnum::Tag => base,
+                    };
+                    return Ok(computed(id));
+                }
                 let ty = self.w.ty(t, false)?;
                 let index = m.types.gpu_member(xt, *i);
                 computed(self.op(Op::CompositeExtract, ty, &[base, index]))
             }
             ir::Expr::Variant(et, k, payload) => {
+                if let Some(u) = analysis::unit_enum(&m.types, *et) {
+                    let tag = m.types.tag(*et, *k);
+                    let id = match u {
+                        analysis::UnitEnum::Bool => self.w.const_bool(tag != 0),
+                        analysis::UnitEnum::Tag => self.w.const_u32(tag),
+                    };
+                    return Ok(Value { id, constant: true });
+                }
                 let ir::TypeDef::Enum { variants, .. } = m.types.get(*et) else {
                     return Err("internal: a variant of a type that isn't an enum".into());
                 };

@@ -1459,6 +1459,8 @@ pub(crate) fn intrinsic(
             | Lang::ValueGradientWith
             | Lang::IntervalOf
             | Lang::AffineOf
+            | Lang::AffineForm
+            | Lang::Lipschitz
             | Lang::Precision
             | Lang::Filtered
             | Lang::TapeOf

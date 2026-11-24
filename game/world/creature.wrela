@@ -18,10 +18,15 @@ use skeleton::{
     THIGH_LEFT, THIGH_RIGHT, UPPER_ARM_LEFT, UPPER_ARM_RIGHT, posed,
 }
 use engine::matter::substance::Substance
+use engine::matter::verify::prove_field_facts
+use std::cmp::Eq
+use std::derive::{Box3, Interval}
 use std::field::{
-    DualQuat, MAX_SKIN_BONES, MAX_SKIN_PARTS, RoundCone, Skinned, SmoothUnion, SmoothUnionAll, With,
-    pack_part_bones, round_cone, skinned,
+    Bound, DualQuat, Field, FieldFacts, Live, MAX_SKIN_BONES, MAX_SKIN_PARTS, PartName, Pruned,
+    RoundCone, Skinned, SmoothUnion, SmoothUnionAll, Surface, With, pack_part_bones, round_cone,
+    skinned,
 }
+use std::hash::StateHash
 use std::transform::{rotate, rotate_z, translate}
 
 /// How large it is against the skeleton it rides (Hakuro's, a grown man's).
@@ -35,8 +40,85 @@ pub const THIN_JOIN: f32 = 0.004
 pub const FUR: vec3 = vec3(0.42, 0.28, 0.16)
 pub const WOOD: vec3 = vec3(0.22, 0.13, 0.07)
 
-/// The creature's underlying 17-part flesh + wand smooth-union field.
-pub type CreatureBody = SmoothUnion<With<SmoothUnionAll<RoundCone, 17>, Substance>, With<RoundCone, Substance>>
+type CreatureRaw = SmoothUnion<With<SmoothUnionAll<RoundCone, 17>, Substance>, With<RoundCone, Substance>>
+
+/// The creature's underlying 17-part flesh + wand smooth-union field, carrying build-time proven
+/// `FieldFacts` so all 256 skinned instances erase transmissive, emissive, coat, and micro paths.
+pub struct CreatureBody: Copy + GpuData + Eq + StateHash {
+    pub inner: CreatureRaw,
+}
+
+impl Surface for CreatureBody {
+    @budget(work: 2048)
+    fn distance(self, p: vec3) -> f32 {
+        self.inner.distance(p)
+    }
+
+    fn distance_within(self, p: vec3, most: f32) -> f32 {
+        self.inner.distance_within(p, most)
+    }
+
+    fn bound(self) -> Bound {
+        self.inner.bound()
+    }
+
+    fn lipschitz(self, near: f32) -> f32 {
+        self.inner.lipschitz(near)
+    }
+
+    fn interval_near(self, b: Box3) -> Interval {
+        self.inner.interval_near(b)
+    }
+
+    fn parts(self) -> u32 {
+        self.inner.parts()
+    }
+
+    fn part_at(self, p: vec3) -> (f32, u32) {
+        self.inner.part_at(p)
+    }
+
+    fn part_distance(self, p: vec3, i: u32) -> f32 {
+        self.inner.part_distance(p, i)
+    }
+
+    fn part_name(self, i: u32) -> PartName {
+        self.inner.part_name(i)
+    }
+
+    fn part_offset(self, p: vec3, i: u32, by: f32) -> f32 {
+        self.inner.part_offset(p, i, by)
+    }
+
+    fn masked(self, p: vec3, live: Live, first: u32) -> f32 {
+        self.inner.masked(p, live, first)
+    }
+
+    fn pruned<F: Copy + fn(vec3) -> vec3>(
+        self,
+        over: Box3,
+        at: F,
+        stretch: f32,
+        live: Live,
+        first: u32,
+    ) -> Pruned {
+        self.inner.pruned(over, at, stretch, live, first)
+    }
+}
+
+impl Field<Substance> for CreatureBody {
+    fn channels(self, p: vec3) -> Substance {
+        self.inner.channels(p)
+    }
+
+    fn distance_and_channels(self, p: vec3) -> (f32, Substance) {
+        self.inner.distance_and_channels(p)
+    }
+
+    fn field_facts(self) -> FieldFacts {
+        CREATURE_FACTS
+    }
+}
 
 /// The creature: exact posed field paired with its rest-pose template and bone palette so the
 /// engine extracts the rest-pose mesh once and deforms it every frame on the GPU via DQS.
@@ -260,10 +342,16 @@ fn rest_creature_body() -> CreatureBody {
         n += 7
     }
     let wand = part(j(HAND_RIGHT, vec3(0.0)), 0.0084, j(HAND_RIGHT, vec3(-0.12, 0.3, 0.5)), 0.0084)
-    parts.smooth_union(k: JOIN).with(matte(FUR)).smooth_union(wand.with(matte(WOOD)), k: THIN_JOIN)
+    CreatureBody {
+        inner: parts
+            .smooth_union(k: JOIN)
+            .with(matte(FUR))
+            .smooth_union(wand.with(matte(WOOD)), k: THIN_JOIN),
+    }
 }
 
 const REST_BODY: CreatureBody = rest_creature_body()
+const CREATURE_FACTS: FieldFacts = prove_field_facts(REST_BODY)
 const CREATURE_JOINTS: [vec4; MAX_SKIN_BONES] = creature_joints_rest()
 const CREATURE_INV_BINDS: [mat4; CREATURE_BONES] = creature_inv_binds()
 const PACKED_PART_START: [u32; 8] = pack_part_bones(PART_BONES_START)
@@ -329,10 +417,12 @@ pub fn creature(pose: [mat4; 64]) -> Creature {
     }
     // A wand in its right hand, 1 cm through and 36 cm long.
     let wand = part(j(HAND_RIGHT, vec3(0.0)), 0.0084, j(HAND_RIGHT, vec3(-0.12, 0.3, 0.5)), 0.0084)
-    let posed_body = parts
-        .smooth_union(k: JOIN)
-        .with(matte(FUR))
-        .smooth_union(wand.with(matte(WOOD)), k: THIN_JOIN)
+    let posed_body = CreatureBody {
+        inner: parts
+            .smooth_union(k: JOIN)
+            .with(matte(FUR))
+            .smooth_union(wand.with(matte(WOOD)), k: THIN_JOIN),
+    }
     var bones = [DualQuat::identity(); MAX_SKIN_BONES]
     for b in 0..CREATURE_BONES {
         bones[b] = DualQuat::from_mat4_scaled(
@@ -363,6 +453,12 @@ fn creature_field_contracts_are_sound() {
         bent[b] = rotate(normalize(vec3(sin(f * 1.7), cos(f * 0.9), 0.4)), 0.35 * sin(f * 2.3))
     }
     engine::matter::verify::verify_field_soundness(creature(bent), "creature_bent")
+    let f_cr = creature(pose).field_facts()
+    assert(
+        f_cr.lip < 1.0e12 && !f_cr.may_transmit && !f_cr.may_emit && !f_cr.may_coat &&
+            !f_cr.may_micro,
+        f"creature facts: lip={f_cr.lip} tx={f_cr.may_transmit} em={f_cr.may_emit} coat={f_cr.may_coat} micro={f_cr.may_micro}",
+    )
 }
 
 @test

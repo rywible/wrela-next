@@ -1080,7 +1080,11 @@ impl<'a> Builder<'a> {
     ) -> Option<Operand> {
         let av = self.value(a, Want::Read)?;
         let r = self.temp(e.ty, LocalKind::TempVar, "logic", e.span);
-        self.set(r, av.clone(), e.span);
+        // `a && b` is `false` when `!a`, and `a || b` is `true` when `a`. Seeding `r` with that
+        // short-circuit constant (rather than `av`) lets affine/interval/range analyses see the
+        // exact constant on the untouched branch even when `a` itself is uncertain.
+        let fallback = constant(Lit::Bool(op == BinOp::Or), e.ty, e.span);
+        self.set(r, fallback, e.span);
         // `a && b` evaluates `b` when `a`; `a || b` when not `a`.
         let cond = match op {
             BinOp::And => av,

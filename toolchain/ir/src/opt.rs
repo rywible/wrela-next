@@ -46,6 +46,7 @@ pub fn flatten_gpu(m: &mut Module) -> Result<()> {
         // A large struct local is a local per field, so a copy of a uniform with a field
         // changed (`form.only(mask)`) reads the fields it didn't change where they lie.
         split_locals(m, &mut f, Split::Gpu);
+        scalarize_unit_enums(m, &mut f);
         forward(m, &mut f);
         // A struct rebuilt from its split fields and taken apart again is those fields; what
         // they read, read where it lies too.
@@ -60,8 +61,22 @@ pub fn flatten_gpu(m: &mut Module) -> Result<()> {
         forward_extracts(m, &mut f);
         narrow_loads(m, &mut f);
         dce(&mut f);
-        // What's computed from constants is computed now, once (§18.13).
-        if crate::const_fold::fold_constants(m, &mut f) {
+        // What's computed from constants is computed now, once (§18.13), and branches settled by
+        // constants (e.g. build-time proven `FieldFacts`) are erased to fixpoint so cascading
+        // dead paths and unused verifier/fallback branches vanish completely.
+        for _ in 0..4 {
+            let mut changed = crate::const_fold::fold_constants(m, &mut f);
+            if range_simplify(m, &mut f) {
+                changed = true;
+            }
+            if fold_constant_branches(m, &mut f) {
+                forward_stores(m, &mut f);
+                forward_extracts(m, &mut f);
+                changed = true;
+            }
+            if !changed {
+                break;
+            }
             dce(&mut f);
         }
         // A table of constants read at a worked-out index is read where the module keeps it,
@@ -69,18 +84,13 @@ pub fn flatten_gpu(m: &mut Module) -> Result<()> {
         if crate::const_fold::keep_tables(m, &mut f) {
             dce(&mut f);
         }
-        // An inlined function given a constant `bool` keeps only the branch it takes (an
-        // `isolate: false` argument), as the CPU's inlining does. A local each side set (an
-        // `if` that yields a value) then has one store: its reads are that value, which
-        // hoisting can move (a load of a local, it can't).
-        if fold_constant_branches(&mut f) {
-            forward_stores(m, &mut f);
-            dce(&mut f);
-        }
         collapse_rebuilds(&mut f);
         cse(&mut f);
         dce(&mut f);
         if_convert(m, &mut f);
+        if simplify_select_cmp(&mut f) {
+            fold_constant_branches(m, &mut f);
+        }
         cse(&mut f);
         dce(&mut f);
         // Again, for what the passes since made of locals and copies (`narrow_loads`); a part
@@ -1563,8 +1573,10 @@ const CPU_SPREAD_LEAST: usize = 32;
 /// trace no longer shows the calls that were inlined. The functions nothing reaches any more
 /// are removed.
 pub fn inline_cpu(m: &mut Module) -> Result<()> {
-    for f in &mut m.functions {
-        fold_constant_branches(f);
+    for i in 0..m.functions.len() {
+        let mut func = std::mem::take(&mut m.functions[i]);
+        fold_constant_branches(m, &mut func);
+        m.functions[i] = func;
     }
     inline_by_size(m)?;
     // Inlined, a predicate whose body folded to a constant is that constant in its caller: the
@@ -1573,7 +1585,7 @@ pub fn inline_cpu(m: &mut Module) -> Result<()> {
     // function: each function folds until nothing does. Each fold removes a branch, so it ends.
     for i in 0..m.functions.len() {
         let mut func = std::mem::take(&mut m.functions[i]);
-        while fold_constant_branches(&mut func) {
+        while fold_constant_branches(m, &mut func) {
             tidy(m, &mut func);
         }
         m.functions[i] = func;
@@ -1625,8 +1637,10 @@ fn inline_by_size(m: &mut Module) -> Result<()> {
 /// that read what's known reused, and what nothing uses dropped.
 fn tidy(m: &Module, f: &mut Function) {
     split_locals(m, f, Split::Cpu);
+    scalarize_unit_enums(m, f);
     forward_extracts(m, f);
     reuse_loads(m, f);
+    simplify_select_cmp(f);
     // Merging is safe where a merged expression could trap: the first, which is kept, runs
     // before any of the others.
     cse(f);
@@ -1811,12 +1825,337 @@ fn split_block(f: &mut Function, b: &mut Block, parts: &[Vec<LocalId>]) {
     });
 }
 
+/// Whether `t` is a payload-less enum (`Option<EmptyProof>`, etc.): every variant carries `None`.
+fn is_unit_enum(types: &Types, t: TypeId) -> bool {
+    matches!(types.get(t), TypeDef::Enum { variants, .. } if variants.iter().all(|(_, p)| p.is_none()))
+}
+
+/// Scalarizes locals of payload-less enums (such as `Option<EmptyProof>`) to `u32` tag locals
+/// when their address is not taken and every whole load only reads the tag or copies to another
+/// scalarized local. Eliminates stack slots on WASM and unlocks `if_convert` + `select` erasure
+/// on the GPU.
+fn scalarize_unit_enums(m: &Module, f: &mut Function) {
+    let Some(u32_ty) = m.types.lookup(&TypeDef::Scalar(Scalar::U32)) else {
+        return;
+    };
+    let taken = address_taken(f);
+    let mut cand: Vec<bool> = f
+        .locals
+        .iter()
+        .enumerate()
+        .map(|(i, l)| !taken[i] && is_unit_enum(&m.types, l.ty))
+        .collect();
+    if !cand.iter().any(|&c| c) {
+        return;
+    }
+    let mut whole_load: Vec<Option<LocalId>> = vec![None; f.values.len()];
+    visit::walk(&f.body, &mut |s| match s {
+        Stmt::Let(v, Expr::Load(p)) => {
+            if let Some(l) = p.root_local()
+                && cand[l.index()]
+            {
+                if p.path.is_empty() {
+                    whole_load[v.index()] = Some(l);
+                } else if p.path.as_slice() != [Proj::Field(0)] {
+                    cand[l.index()] = false;
+                }
+            }
+        }
+        Stmt::Store(p, _) => {
+            if let Some(l) = p.root_local()
+                && cand[l.index()]
+                && !p.path.is_empty()
+            {
+                cand[l.index()] = false;
+            }
+        }
+        _ => {}
+    });
+    // Check every use of a whole load of a candidate local.
+    let mut deps: Vec<(LocalId, LocalId)> = Vec::new();
+    visit::walk(&f.body, &mut |s| match s {
+        Stmt::Let(_, Expr::Extract(x, 0)) if whole_load[x.index()].is_some() => {}
+        Stmt::Store(p, v) => {
+            p.for_each_value(&mut |x| {
+                if let Some(l) = whole_load[x.index()] {
+                    cand[l.index()] = false;
+                }
+            });
+            if let Some(src) = whole_load[v.index()] {
+                if p.path.is_empty()
+                    && let Some(dst) = p.root_local()
+                    && cand[dst.index()]
+                {
+                    deps.push((src, dst));
+                } else {
+                    cand[src.index()] = false;
+                }
+            }
+        }
+        _ => s.for_each_value(&mut |x| {
+            if let Some(l) = whole_load[x.index()] {
+                cand[l.index()] = false;
+            }
+        }),
+    });
+    // Propagate disqualifications: if `dst` isn't scalarized, `src` copied into it cannot be.
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &(src, dst) in &deps {
+            if cand[src.index()] && !cand[dst.index()] {
+                cand[src.index()] = false;
+                changed = true;
+            }
+        }
+    }
+    if !cand.iter().any(|&c| c) {
+        return;
+    }
+    let mut variant_tag: HashMap<ValueId, u32> = HashMap::new();
+    let mut zero_enum: HashSet<ValueId> = HashSet::new();
+    visit::walk(&f.body, &mut |s| match s {
+        Stmt::Let(v, Expr::Variant(et, k, None)) if is_unit_enum(&m.types, *et) => {
+            variant_tag.insert(*v, m.types.tag(*et, *k));
+        }
+        Stmt::Let(v, Expr::Zero(t)) if is_unit_enum(&m.types, *t) => {
+            zero_enum.insert(*v);
+        }
+        _ => {}
+    });
+    for (i, l) in f.locals.iter_mut().enumerate() {
+        if cand[i] {
+            l.ty = u32_ty;
+        }
+    }
+    let mut scalar_load = vec![false; f.values.len()];
+    for (vi, wl) in whole_load.iter().enumerate() {
+        if let Some(l) = *wl
+            && cand[l.index()]
+        {
+            f.values[vi] = u32_ty;
+            scalar_load[vi] = true;
+        }
+    }
+    let mut rename: Vec<Option<ValueId>> = vec![None; f.values.len()];
+    #[allow(clippy::too_many_arguments)]
+    fn rewrite(
+        f: &mut Function,
+        b: &mut Block,
+        cand: &[bool],
+        scalar_load: &[bool],
+        variant_tag: &HashMap<ValueId, u32>,
+        zero_enum: &HashSet<ValueId>,
+        u32_ty: TypeId,
+        rename: &mut Vec<Option<ValueId>>,
+    ) {
+        let old = std::mem::take(b);
+        for mut s in old {
+            s.for_each_value_mut(&mut |x| *x = resolve(rename, *x));
+            match s {
+                Stmt::Let(w, Expr::Extract(x, 0))
+                    if scalar_load.get(x.index()).copied().unwrap_or(false) =>
+                {
+                    if rename.len() < f.values.len() {
+                        rename.resize(f.values.len(), None);
+                    }
+                    rename[w.index()] = Some(x);
+                }
+                Stmt::Let(v, Expr::Load(p)) if p.root_local().is_some_and(|l| cand[l.index()]) => {
+                    let l = p.root_local().expect("local");
+                    b.push(Stmt::Let(v, Expr::Load(Place::local(l))));
+                }
+                Stmt::Store(p, v)
+                    if p.path.is_empty() && p.root_local().is_some_and(|l| cand[l.index()]) =>
+                {
+                    let l = p.root_local().expect("local");
+                    let val = if scalar_load.get(v.index()).copied().unwrap_or(false) {
+                        v
+                    } else if let Some(&tag) = variant_tag.get(&v) {
+                        f.let_(b, u32_ty, Expr::Const(Const::U32(tag)))
+                    } else if zero_enum.contains(&v) {
+                        f.let_(b, u32_ty, Expr::Const(Const::U32(0)))
+                    } else {
+                        f.let_(b, u32_ty, Expr::Extract(v, 0))
+                    };
+                    if rename.len() < f.values.len() {
+                        rename.resize(f.values.len(), None);
+                    }
+                    b.push(Stmt::Store(Place::local(l), val));
+                }
+                Stmt::If { cond, mut then, mut else_ } => {
+                    rewrite(
+                        f,
+                        &mut then,
+                        cand,
+                        scalar_load,
+                        variant_tag,
+                        zero_enum,
+                        u32_ty,
+                        rename,
+                    );
+                    rewrite(
+                        f,
+                        &mut else_,
+                        cand,
+                        scalar_load,
+                        variant_tag,
+                        zero_enum,
+                        u32_ty,
+                        rename,
+                    );
+                    b.push(Stmt::If { cond, then, else_ });
+                }
+                Stmt::Loop { mut body, mut continuing } => {
+                    rewrite(
+                        f,
+                        &mut body,
+                        cand,
+                        scalar_load,
+                        variant_tag,
+                        zero_enum,
+                        u32_ty,
+                        rename,
+                    );
+                    rewrite(
+                        f,
+                        &mut continuing,
+                        cand,
+                        scalar_load,
+                        variant_tag,
+                        zero_enum,
+                        u32_ty,
+                        rename,
+                    );
+                    b.push(Stmt::Loop { body, continuing });
+                }
+                other => b.push(other),
+            }
+        }
+    }
+    let mut body = std::mem::take(&mut f.body);
+    rewrite(f, &mut body, &cand, &scalar_load, &variant_tag, &zero_enum, u32_ty, &mut rename);
+    f.body = body;
+}
+
+/// Simplifies comparisons against `select(cond, c1, c2)` (such as `Option<EmptyProof>` tags
+/// after `scalarize_unit_enums` + `if_convert`: `select(cond, 1u, 0u) == 1u` -> `cond`),
+/// double negations `!!x` -> `x`, and redundant `select(c, x, x)` -> `x`.
+fn simplify_select_cmp(f: &mut Function) -> bool {
+    let mut consts: HashMap<ValueId, Const> = HashMap::new();
+    let mut selects: HashMap<ValueId, (ValueId, ValueId, ValueId)> = HashMap::new();
+    let mut nots: HashMap<ValueId, ValueId> = HashMap::new();
+    visit::walk(&f.body, &mut |s| {
+        if let Stmt::Let(v, e) = s {
+            match e {
+                Expr::Const(c) => {
+                    consts.insert(*v, c.clone());
+                }
+                Expr::Select { cond, if_true, if_false } => {
+                    selects.insert(*v, (*cond, *if_true, *if_false));
+                }
+                Expr::Unary(UnOp::Not, x) => {
+                    nots.insert(*v, *x);
+                }
+                _ => {}
+            }
+        }
+    });
+    let mut rename: Vec<Option<ValueId>> = vec![None; f.values.len()];
+    let mut changed = false;
+    fn go(
+        b: &mut Block,
+        consts: &HashMap<ValueId, Const>,
+        selects: &HashMap<ValueId, (ValueId, ValueId, ValueId)>,
+        nots: &HashMap<ValueId, ValueId>,
+        rename: &mut [Option<ValueId>],
+        changed: &mut bool,
+    ) {
+        b.retain_mut(|s| {
+            s.for_each_value_mut(&mut |x| *x = resolve(rename, *x));
+            match s {
+                Stmt::Let(v, Expr::Select { if_true, if_false, .. }) if if_true == if_false => {
+                    rename[v.index()] = Some(*if_true);
+                    *changed = true;
+                    return false;
+                }
+                Stmt::Let(v, Expr::Unary(UnOp::Not, x)) if let Some(&inner) = nots.get(x) => {
+                    rename[v.index()] = Some(resolve(rename, inner));
+                    *changed = true;
+                    return false;
+                }
+                Stmt::Let(v, e @ Expr::Binary(BinOp::Eq | BinOp::Ne, _, _)) => {
+                    let Expr::Binary(op, a, b_val) = *e else { unreachable!() };
+                    let eq = op == BinOp::Eq;
+                    // `x == true` -> `x`, `x == false` -> `!x`, and dual for `!=`.
+                    if let Some((other, Const::Bool(k))) = consts
+                        .get(&b_val)
+                        .map(|c| (a, c))
+                        .or_else(|| consts.get(&a).map(|c| (b_val, c)))
+                    {
+                        if eq == *k {
+                            rename[v.index()] = Some(other);
+                            *changed = true;
+                            return false;
+                        } else {
+                            *e = Expr::Unary(UnOp::Not, other);
+                            *changed = true;
+                            return true;
+                        }
+                    }
+                    // `select(cond, c1, c2) == k` -> `cond` / `!cond` / `const bool`.
+                    let pair = selects
+                        .get(&a)
+                        .zip(consts.get(&b_val))
+                        .or_else(|| selects.get(&b_val).zip(consts.get(&a)));
+                    if let Some((&(cond, t_v, f_v), k)) = pair
+                        && let (Some(ct), Some(cf)) = (consts.get(&t_v), consts.get(&f_v))
+                    {
+                        let t_eq = same_const(ct, k) == eq;
+                        let f_eq = same_const(cf, k) == eq;
+                        match (t_eq, f_eq) {
+                            (true, true) => {
+                                *e = Expr::Const(Const::Bool(true));
+                                *changed = true;
+                            }
+                            (false, false) => {
+                                *e = Expr::Const(Const::Bool(false));
+                                *changed = true;
+                            }
+                            (true, false) => {
+                                rename[v.index()] = Some(resolve(rename, cond));
+                                *changed = true;
+                                return false;
+                            }
+                            (false, true) => {
+                                *e = Expr::Unary(UnOp::Not, resolve(rename, cond));
+                                *changed = true;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            for inner in s.blocks_mut() {
+                go(inner, consts, selects, nots, rename, changed);
+            }
+            true
+        });
+    }
+    let mut body = std::mem::take(&mut f.body);
+    go(&mut body, &consts, &selects, &nots, &mut rename, &mut changed);
+    f.body = body;
+    changed
+}
+
 /// Reads a part of a value built from its parts as that part: `Extract(Construct(t, xs), i)` is
-/// `xs[i]`. (A part is defined before the value, so it's visible wherever the value is.)
+/// `xs[i]`, `Extract(Variant(et, k, _), 0)` is `Const::U32(tag)`, and `Extract(Variant(et, k,
+/// Some(p)), 1 + k)` is `p`.
 fn forward_extracts(m: &Module, f: &mut Function) {
     let mut built: HashMap<ValueId, Vec<ValueId>> = HashMap::new();
-    visit::walk(&f.body, &mut |s| {
-        if let Stmt::Let(v, Expr::Construct(t, xs)) = s {
+    let mut variants: HashMap<ValueId, (u32, u32, Option<ValueId>)> = HashMap::new();
+    visit::walk(&f.body, &mut |s| match s {
+        Stmt::Let(v, Expr::Construct(t, xs)) => {
             let whole = match m.types.get(*t) {
                 TypeDef::Struct { .. } => true,
                 TypeDef::Vector(_, n) | TypeDef::Matrix(n, _) => xs.len() == *n as usize,
@@ -1826,22 +2165,45 @@ fn forward_extracts(m: &Module, f: &mut Function) {
                 built.insert(*v, xs.clone());
             }
         }
+        Stmt::Let(v, Expr::Variant(et, k, payload)) => {
+            variants.insert(*v, (m.types.tag(*et, *k), *k, *payload));
+        }
+        _ => {}
     });
-    if built.is_empty() {
+    if built.is_empty() && variants.is_empty() {
         return;
     }
     let mut rename: Vec<Option<ValueId>> = vec![None; f.values.len()];
-    fn go(b: &mut Block, built: &HashMap<ValueId, Vec<ValueId>>, rename: &mut [Option<ValueId>]) {
+    fn go(
+        b: &mut Block,
+        built: &HashMap<ValueId, Vec<ValueId>>,
+        variants: &HashMap<ValueId, (u32, u32, Option<ValueId>)>,
+        rename: &mut [Option<ValueId>],
+    ) {
         b.retain_mut(|s| {
             s.for_each_value_mut(&mut |x| *x = resolve(rename, *x));
-            if let Stmt::Let(w, Expr::Extract(x, i)) = s
-                && let Some(xs) = built.get(x)
+            if let Stmt::Let(w, e) = s
+                && let Expr::Extract(x, i) = *e
             {
-                rename[w.index()] = Some(resolve(rename, xs[*i as usize]));
-                return false;
+                if let Some(xs) = built.get(&x) {
+                    rename[w.index()] = Some(resolve(rename, xs[i as usize]));
+                    return false;
+                }
+                if let Some(&(tag, k, payload)) = variants.get(&x) {
+                    if i == 0 {
+                        *e = Expr::Const(Const::U32(tag));
+                        return true;
+                    }
+                    if i == 1 + k
+                        && let Some(p) = payload
+                    {
+                        rename[w.index()] = Some(resolve(rename, p));
+                        return false;
+                    }
+                }
             }
             for inner in s.blocks_mut() {
-                go(inner, built, rename);
+                go(inner, built, variants, rename);
             }
             true
         });
@@ -1849,7 +2211,7 @@ fn forward_extracts(m: &Module, f: &mut Function) {
     // The parts a construct holds are renamed as they're reached: each is defined before it, so
     // its renaming is known by then.
     let mut body = std::mem::take(&mut f.body);
-    go(&mut body, &built, &mut rename);
+    go(&mut body, &built, &variants, &mut rename);
     f.body = body;
 }
 
@@ -2122,12 +2484,20 @@ fn sink_block(m: &Module, f: &Function, b: &mut Block) {
 /// Whether anything folded.
 ///
 /// `a && b` and `a || b` on values (both evaluated) fold where one side's value settles the
-/// result, and a comparison of two integer constants folds to its result (`len() == N` once the
-/// length is known). Nothing else is folded: wasm-opt folds the CPU's arithmetic.
-fn fold_constant_branches(f: &mut Function) -> bool {
+/// result, a comparison of two integer or finite float constants folds to its result
+/// (`len() == N`, `FACTS.lip < 1e12`), and reads of read-only constant data fields
+/// (`FACTS.may_transmit`) fold to their constant scalars. Nothing else is folded: wasm-opt folds
+/// the CPU's remaining arithmetic.
+fn fold_constant_branches(m: &Module, f: &mut Function) -> bool {
     let taken = address_taken(f);
     let body = std::mem::take(&mut f.body);
-    let mut fold = Fold { values: HashMap::new(), ints: HashMap::new(), changed: false };
+    let mut fold = Fold {
+        m,
+        values: HashMap::new(),
+        ints: HashMap::new(),
+        floats: HashMap::new(),
+        changed: false,
+    };
     f.body = fold.block(body, &mut HashMap::new(), &taken);
     fold.changed
 }
@@ -2144,15 +2514,103 @@ fn int_const(c: &Const) -> Option<(Scalar, i128)> {
     })
 }
 
-/// What [`fold_constant_branches`] knows: the `bool` values known, the integer constants (by
-/// value, as `i128`, with their scalar), and whether it folded anything.
-struct Fold {
+/// A finite float constant's value, widened, with its scalar.
+fn float_const(c: &Const) -> Option<(Scalar, f64)> {
+    match *c {
+        Const::F32(x) if x.is_finite() => Some((Scalar::F32, f64::from(x))),
+        Const::F64(x) if x.is_finite() => Some((Scalar::F64, x)),
+        Const::F16(x) if x.is_finite() => Some((Scalar::F16, f64::from(x))),
+        _ => None,
+    }
+}
+
+/// Reads a scalar constant out of read-only module data at `p`, if `p` reaches one statically.
+fn const_data_at(m: &Module, p: &Place, ints: &HashMap<ValueId, (Scalar, i128)>) -> Option<Const> {
+    let PlaceRoot::Data(d) = p.root else { return None };
+    if m.state == Some(d) || m.writable.contains(&d) {
+        return None;
+    }
+    let data = m.data.get(d.index())?;
+    let mut cur = &data.value;
+    let mut ty = data.ty;
+    for proj in &p.path {
+        match proj {
+            Proj::Field(k) => match (m.types.get(ty), cur) {
+                (TypeDef::Struct { fields, .. }, ConstValue::Parts(ps)) => {
+                    cur = ps.get(*k as usize)?;
+                    ty = fields.get(*k as usize)?.1;
+                }
+                (TypeDef::Enum { .. }, ConstValue::Variant(v, payload)) => {
+                    if *k == 0 {
+                        return Some(Const::U32(m.types.tag(ty, *v)));
+                    }
+                    if *k == 1 + *v {
+                        cur = payload.as_deref()?;
+                        ty = m.types.field(ty, *k)?;
+                    } else {
+                        return None;
+                    }
+                }
+                _ => return None,
+            },
+            Proj::Comp(c) => match (m.types.get(ty), cur) {
+                (TypeDef::Vector(..), ConstValue::Parts(ps)) => {
+                    cur = ps.get(usize::from(*c))?;
+                    ty = m.types.part(ty, u32::from(*c))?;
+                }
+                _ => return None,
+            },
+            Proj::Index(iv) => {
+                let &(_, idx) = ints.get(iv)?;
+                let idx = usize::try_from(idx).ok()?;
+                match (m.types.get(ty), cur) {
+                    (TypeDef::Array(e, _), ConstValue::Parts(ps)) => {
+                        cur = ps.get(idx)?;
+                        ty = *e;
+                    }
+                    (TypeDef::Array(e, _), ConstValue::Bytes(bs)) => {
+                        let &b = bs.get(idx)?;
+                        if matches!(m.types.get(*e), TypeDef::Scalar(Scalar::U8)) {
+                            return Some(Const::Small(Scalar::U8, i64::from(b)));
+                        }
+                        return None;
+                    }
+                    (TypeDef::Vector(..), ConstValue::Parts(ps)) => {
+                        cur = ps.get(idx)?;
+                        ty = m.types.part(ty, idx as u32)?;
+                    }
+                    _ => return None,
+                }
+            }
+        }
+    }
+    match cur {
+        ConstValue::Scalar(c) => Some(c.clone()),
+        _ => None,
+    }
+}
+
+/// What [`fold_constant_branches`] knows: the `bool` values known, the integer and finite float
+/// constants, and whether it folded anything.
+struct Fold<'m> {
+    m: &'m Module,
     values: HashMap<ValueId, bool>,
     ints: HashMap<ValueId, (Scalar, i128)>,
+    floats: HashMap<ValueId, (Scalar, f64)>,
     changed: bool,
 }
 
-impl Fold {
+impl Fold<'_> {
+    fn record_const(&mut self, v: ValueId, c: &Const) {
+        if let Const::Bool(b) = *c {
+            self.values.insert(v, b);
+        } else if let Some(k) = int_const(c) {
+            self.ints.insert(v, k);
+        } else if let Some(f) = float_const(c) {
+            self.floats.insert(v, f);
+        }
+    }
+
     /// The value of `op` on `a` and `b`, where they settle it.
     fn binary(&self, op: BinOp, a: ValueId, b: ValueId) -> Option<bool> {
         let (x, y) = (self.values.get(&a).copied(), self.values.get(&b).copied());
@@ -2161,21 +2619,37 @@ impl Fold {
             BinOp::And => return x.zip(y).map(|(x, y)| x && y),
             BinOp::Or if x == Some(true) || y == Some(true) => return Some(true),
             BinOp::Or => return x.zip(y).map(|(x, y)| x || y),
+            BinOp::Eq if x.is_some() && y.is_some() => return Some(x == y),
+            BinOp::Ne if x.is_some() && y.is_some() => return Some(x != y),
             _ => {}
         }
-        let ((sa, x), (sb, y)) = (*self.ints.get(&a)?, *self.ints.get(&b)?);
-        if sa != sb {
-            return None;
+        if let (Some(&(sa, x)), Some(&(sb, y))) = (self.ints.get(&a), self.ints.get(&b))
+            && sa == sb
+        {
+            return Some(match op {
+                BinOp::Eq => x == y,
+                BinOp::Ne => x != y,
+                BinOp::Lt => x < y,
+                BinOp::Le => x <= y,
+                BinOp::Gt => x > y,
+                BinOp::Ge => x >= y,
+                _ => return None,
+            });
         }
-        Some(match op {
-            BinOp::Eq => x == y,
-            BinOp::Ne => x != y,
-            BinOp::Lt => x < y,
-            BinOp::Le => x <= y,
-            BinOp::Gt => x > y,
-            BinOp::Ge => x >= y,
-            _ => return None,
-        })
+        if let (Some(&(sa, x)), Some(&(sb, y))) = (self.floats.get(&a), self.floats.get(&b))
+            && sa == sb
+        {
+            return Some(match op {
+                BinOp::Eq => x == y,
+                BinOp::Ne => x != y,
+                BinOp::Lt => x < y,
+                BinOp::Le => x <= y,
+                BinOp::Gt => x > y,
+                BinOp::Ge => x >= y,
+                _ => return None,
+            });
+        }
+        None
     }
 
     /// Folds `b`. `self.values` are the `bool` values known; `locals` the `bool` each local
@@ -2185,12 +2659,22 @@ impl Fold {
         let mut out = Vec::with_capacity(b.len());
         for s in b {
             match s {
-                Stmt::Let(v, Expr::Const(Const::Bool(c))) => {
-                    self.values.insert(v, c);
-                    out.push(Stmt::Let(v, Expr::Const(Const::Bool(c))));
+                Stmt::Let(v, Expr::Const(c)) => {
+                    self.record_const(v, &c);
+                    out.push(Stmt::Let(v, Expr::Const(c)));
                 }
-                Stmt::Let(v, Expr::Const(c)) if let Some(k) = int_const(&c) => {
-                    self.ints.insert(v, k);
+                Stmt::Let(v, Expr::Unary(UnOp::Neg, x))
+                    if let Some(&(s, f)) = self.floats.get(&x) =>
+                {
+                    let nf = -f;
+                    let c = match s {
+                        Scalar::F32 => Const::F32(nf as f32),
+                        Scalar::F64 => Const::F64(nf),
+                        Scalar::F16 => Const::F16(nf as f32),
+                        _ => unreachable!(),
+                    };
+                    self.floats.insert(v, (s, nf));
+                    self.changed = true;
                     out.push(Stmt::Let(v, Expr::Const(c)));
                 }
                 Stmt::Let(v, Expr::Binary(op, a, b)) if let Some(c) = self.binary(op, a, b) => {
@@ -2204,6 +2688,39 @@ impl Fold {
                     self.changed = true;
                     out.push(Stmt::Let(v, Expr::Const(Const::Bool(c))));
                 }
+                Stmt::Let(v, Expr::Select { cond, if_true, if_false })
+                    if let Some(&c) = self.values.get(&cond) =>
+                {
+                    let chosen = if c { if_true } else { if_false };
+                    if let Some(&bval) = self.values.get(&chosen) {
+                        self.values.insert(v, bval);
+                        self.changed = true;
+                        out.push(Stmt::Let(v, Expr::Const(Const::Bool(bval))));
+                    } else if let Some(&(sc, iv)) = self.ints.get(&chosen) {
+                        self.ints.insert(v, (sc, iv));
+                        let cval = match sc {
+                            Scalar::I32 => Const::I32(iv as i32),
+                            Scalar::U32 => Const::U32(iv as u32),
+                            Scalar::I64 => Const::I64(iv as i64),
+                            Scalar::U64 => Const::U64(iv as u64),
+                            s => Const::Small(s, iv as i64),
+                        };
+                        self.changed = true;
+                        out.push(Stmt::Let(v, Expr::Const(cval)));
+                    } else if let Some(&(sc, fv)) = self.floats.get(&chosen) {
+                        self.floats.insert(v, (sc, fv));
+                        let cval = match sc {
+                            Scalar::F32 => Const::F32(fv as f32),
+                            Scalar::F64 => Const::F64(fv),
+                            Scalar::F16 => Const::F16(fv as f32),
+                            _ => unreachable!(),
+                        };
+                        self.changed = true;
+                        out.push(Stmt::Let(v, Expr::Const(cval)));
+                    } else {
+                        out.push(Stmt::Let(v, Expr::Select { cond, if_true, if_false }));
+                    }
+                }
                 Stmt::Let(v, Expr::Load(p))
                     if p.path.is_empty()
                         && let Some(&c) = p.root_local().and_then(|l| locals.get(&l)) =>
@@ -2211,6 +2728,13 @@ impl Fold {
                     self.values.insert(v, c);
                     self.changed = true;
                     out.push(Stmt::Let(v, Expr::Const(Const::Bool(c))));
+                }
+                Stmt::Let(v, Expr::Load(ref p))
+                    if let Some(c) = const_data_at(self.m, p, &self.ints) =>
+                {
+                    self.record_const(v, &c);
+                    self.changed = true;
+                    out.push(Stmt::Let(v, Expr::Const(c)));
                 }
                 Stmt::Store(p, v) => {
                     if let Some(l) = p.root_local() {
@@ -2279,6 +2803,176 @@ impl Fold {
             }
         }
         out
+    }
+}
+
+// ---- range-based comparison folding and redundant-guard erasure -----------------------------
+
+/// Uses flow-sensitive static range analysis (`crate::ranges::FlowEnv`) to:
+/// - fold integer comparisons proven always true or always false to `Const::Bool`
+///   (e.g. `(k & 7) < 8` or loop/branch-narrowed guards),
+/// - erase redundant float guards (`abs(nonneg) -> x`, `saturate(x in [0,1]) -> x`,
+///   `clamp(x in [lo,hi], lo, hi) -> x`, and settled `min`/`max` on bounded finite floats).
+fn range_simplify(m: &Module, f: &mut Function) -> bool {
+    let body = std::mem::take(&mut f.body);
+    let rename = vec![None; f.values.len()];
+    let mut cx = RangeSimp { m, f, rename, has_renames: false, changed: false };
+    let mut env = crate::ranges::FlowEnv::new();
+    let mut body = cx.block(body, &mut env);
+    let rename = cx.rename;
+    let has_renames = cx.has_renames;
+    let changed = cx.changed;
+    if has_renames {
+        visit::walk_mut(&mut body, &mut |s| {
+            s.for_each_value_mut(&mut |x| *x = resolve(&rename, *x));
+        });
+    }
+    f.body = body;
+    changed
+}
+
+struct RangeSimp<'a> {
+    m: &'a Module,
+    f: &'a Function,
+    rename: Vec<Option<ValueId>>,
+    has_renames: bool,
+    changed: bool,
+}
+
+impl RangeSimp<'_> {
+    fn block(&mut self, body: Block, env: &mut crate::ranges::FlowEnv) -> Block {
+        let mut out = Vec::with_capacity(body.len());
+        for mut s in body {
+            if self.has_renames {
+                s.for_each_value_mut(&mut |x| *x = resolve(&self.rename, *x));
+            }
+            match s {
+                Stmt::If { cond, then, else_ } => {
+                    let then_exits = crate::ranges::always_exits(&then);
+                    let else_exits = crate::ranges::always_exits(&else_);
+                    let mut then_env = env.clone();
+                    then_env.narrow_cond(&self.m.types, self.f, cond, true);
+                    let then = self.block(then, &mut then_env);
+                    let mut else_env = env.clone();
+                    else_env.narrow_cond(&self.m.types, self.f, cond, false);
+                    let else_ = self.block(else_, &mut else_env);
+                    if then_exits && !else_exits {
+                        *env = else_env;
+                    } else if else_exits && !then_exits {
+                        *env = then_env;
+                    } else {
+                        env.havoc_written(self.m, &then);
+                        env.havoc_written(self.m, &else_);
+                    }
+                    out.push(Stmt::If { cond, then, else_ });
+                }
+                Stmt::Loop { body, continuing } => {
+                    let ind = env.detect_loop_induction(&self.m.types, self.f, &body, &continuing);
+                    env.havoc_written(self.m, &body);
+                    env.havoc_written(self.m, &continuing);
+                    let mut loop_env = env.clone();
+                    if let Some((local, range, _)) = ind {
+                        loop_env.local_ints.insert(local, range);
+                    }
+                    let body = self.block(body, &mut loop_env);
+                    let mut cont_env = env.clone();
+                    let continuing = self.block(continuing, &mut cont_env);
+                    out.push(Stmt::Loop { body, continuing });
+                }
+                Stmt::Let(v, e) => {
+                    if let Some(target) = self.redundant_guard(env, &e)
+                        && self.f.value_ty(v) == self.f.value_ty(target)
+                    {
+                        self.rename[v.index()] = Some(target);
+                        self.has_renames = true;
+                        self.changed = true;
+                        continue;
+                    }
+                    let e = if let Some(b) = self.settled_cmp(env, &e) {
+                        self.changed = true;
+                        Expr::Const(Const::Bool(b))
+                    } else {
+                        e
+                    };
+                    env.record_let(&self.m.types, self.f, v, &e);
+                    out.push(Stmt::Let(v, e));
+                }
+                Stmt::Store(p, v) => {
+                    env.record_store(&self.m.types, self.f, &p, v);
+                    out.push(Stmt::Store(p, v));
+                }
+                other => out.push(other),
+            }
+        }
+        out
+    }
+
+    fn settled_cmp(&self, env: &crate::ranges::FlowEnv, e: &Expr) -> Option<bool> {
+        let &Expr::Binary(op, a, b) = e else { return None };
+        if !op.is_comparison() {
+            return None;
+        }
+        let s = self.m.types.as_scalar(self.f.value_ty(a))?;
+        if s.is_int() {
+            let ra = env.int_of(&self.m.types, self.f, a)?;
+            let rb = env.int_of(&self.m.types, self.f, b)?;
+            return match op {
+                BinOp::Lt if ra.hi < rb.lo => Some(true),
+                BinOp::Lt if ra.lo >= rb.hi => Some(false),
+                BinOp::Le if ra.hi <= rb.lo => Some(true),
+                BinOp::Le if ra.lo > rb.hi => Some(false),
+                BinOp::Gt if ra.lo > rb.hi => Some(true),
+                BinOp::Gt if ra.hi <= rb.lo => Some(false),
+                BinOp::Ge if ra.lo >= rb.hi => Some(true),
+                BinOp::Ge if ra.hi < rb.lo => Some(false),
+                BinOp::Eq if ra.lo == ra.hi && rb.lo == rb.hi && ra.lo == rb.lo => Some(true),
+                BinOp::Eq if ra.hi < rb.lo || rb.hi < ra.lo => Some(false),
+                BinOp::Ne if ra.lo == ra.hi && rb.lo == rb.hi && ra.lo == rb.lo => Some(false),
+                BinOp::Ne if ra.hi < rb.lo || rb.hi < ra.lo => Some(true),
+                _ => None,
+            };
+        }
+        None
+    }
+
+    fn redundant_guard(&self, env: &crate::ranges::FlowEnv, e: &Expr) -> Option<ValueId> {
+        let Expr::Builtin(b, xs) = e else { return None };
+        match (b, xs.as_slice()) {
+            (Builtin::Abs, [x]) if env.is_nonneg_float(*x) => Some(*x),
+            (Builtin::Saturate, [x]) => {
+                let (lo, hi) = env.float_of(*x)?;
+                (lo >= 0.0 && hi <= 1.0).then_some(*x)
+            }
+            (Builtin::Clamp, [x, lo_v, hi_v]) => {
+                let (xlo, xhi) = env.float_of(*x)?;
+                let (llo, lhi) = env.float_of(*lo_v)?;
+                let (hlo, hhi) = env.float_of(*hi_v)?;
+                (lhi <= hlo && xlo >= lhi && xhi <= hlo && llo <= hhi).then_some(*x)
+            }
+            (Builtin::Max, [a, b]) => {
+                let (alo, ahi) = env.float_of(*a)?;
+                let (blo, bhi) = env.float_of(*b)?;
+                if alo >= bhi {
+                    Some(*a)
+                } else if blo >= ahi {
+                    Some(*b)
+                } else {
+                    None
+                }
+            }
+            (Builtin::Min, [a, b]) => {
+                let (alo, ahi) = env.float_of(*a)?;
+                let (blo, bhi) = env.float_of(*b)?;
+                if ahi <= blo {
+                    Some(*a)
+                } else if bhi <= alo {
+                    Some(*b)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
     }
 }
 
@@ -2902,8 +3596,13 @@ fn folded_fits(m: &Module) -> Result<bool> {
     for i in entries {
         let mut f = std::mem::take(&mut c.functions[i]);
         for _ in 0..4 {
+            scalarize_unit_enums(&c, &mut f);
+            forward_extracts(&c, &mut f);
             let mut changed = crate::const_fold::fold_constants(&mut c, &mut f);
-            if fold_constant_branches(&mut f) {
+            if range_simplify(&c, &mut f) {
+                changed = true;
+            }
+            if fold_constant_branches(&c, &mut f) {
                 forward_stores(&c, &mut f);
                 changed = true;
             }
@@ -3085,7 +3784,7 @@ mod tests {
             },
             Stmt::Return(None),
         ];
-        fold_constant_branches(&mut f);
+        fold_constant_branches(&m, &mut f);
         let Stmt::Loop { continuing, .. } = &f.body[4] else { panic!("{:?}", f.body) };
         assert_eq!(continuing[0], Stmt::Let(late, Expr::Load(Place::local(flag))));
         assert_eq!(continuing[1], Stmt::Let(same, Expr::Const(Const::Bool(false))));

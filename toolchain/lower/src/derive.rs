@@ -22,6 +22,8 @@ pub(crate) fn call(
     let kind = match lang {
         Lang::IntervalOf => DeriveKind::Interval,
         Lang::AffineOf => DeriveKind::Affine,
+        Lang::AffineForm => DeriveKind::AffineForm,
+        Lang::Lipschitz => DeriveKind::Lipschitz,
         Lang::Precision => DeriveKind::Precision,
         Lang::Filtered => DeriveKind::Filtered,
         Lang::LiftGradient | Lang::LiftJacobian => DeriveKind::Literals,
@@ -41,6 +43,7 @@ pub(crate) fn call(
         DeriveKind::Interval | DeriveKind::Affine | DeriveKind::Precision => {
             (substs[0], substs.get(1).copied())
         }
+        DeriveKind::AffineForm | DeriveKind::Lipschitz => (substs[0], None),
         DeriveKind::Filtered => (substs[0], None),
         // `gradient<const N>`: the literals' type and the result's are the call's.
         DeriveKind::Literals => {
@@ -190,6 +193,22 @@ pub(crate) fn signature(cx: &mut Cx, mb: &mut ModuleBuilder, key: &InstanceKey) 
             }
             ir::Function::new("interval", params, it)
         }
+        DeriveKind::AffineForm => {
+            let bt = box_type(cx, *input).and_then(|b| cx.lower_ty(mb, b, span));
+            let at = affine_type(cx, *input).and_then(|a| cx.lower_ty(mb, a, span));
+            if let Some(bt) = bt {
+                params.push(ir::Param::value("over", bt));
+            }
+            ir::Function::new("affine_form", params, at)
+        }
+        DeriveKind::Lipschitz => {
+            let bt = box_type(cx, *input).and_then(|b| cx.lower_ty(mb, b, span));
+            if let Some(bt) = bt {
+                params.push(ir::Param::value("over", bt));
+            }
+            let f32_ty = mb.m.types.f32();
+            ir::Function::new("lipschitz", params, Some(f32_ty))
+        }
     }
 }
 
@@ -217,10 +236,20 @@ fn box_types(
 
 /// `X::Box` for a domain type `X`.
 fn box_type(cx: &mut Cx, x: TyId) -> Option<TyId> {
+    domain_assoc_type(cx, x, "Box")
+}
+
+/// `X::Affine` for a domain type `X`.
+fn affine_type(cx: &mut Cx, x: TyId) -> Option<TyId> {
+    domain_assoc_type(cx, x, "Affine")
+}
+
+/// Associated type `name` of `Domain` for a domain type `X`.
+fn domain_assoc_type(cx: &mut Cx, x: TyId, name: &str) -> Option<TyId> {
     let domain = cx.checked.program.lang_trait(Lang::Domain)?;
     let r = wrela_sema::defs::TraitRef { trait_: domain, args: Vec::new() };
     let (i, subst) = wrela_sema::traits::find_impl(&cx.checked.program, x, &r)?;
-    let b = *cx.checked.program.impl_(i).assoc_types.get("Box")?;
+    let b = *cx.checked.program.impl_(i).assoc_types.get(name)?;
     Some(cx.checked.program.types.subst(b, &subst))
 }
 
@@ -282,7 +311,10 @@ pub(crate) fn build_next(cx: &mut Cx, mb: &mut ModuleBuilder) {
         let at = mb.callers.get(&p.id).map(|c| c.1);
         let what = match &p.key {
             InstanceKey::Derived { kind: DeriveKind::Interval, .. } => "its interval",
-            InstanceKey::Derived { kind: DeriveKind::Affine, .. } => "its affine form",
+            InstanceKey::Derived { kind: DeriveKind::Affine | DeriveKind::AffineForm, .. } => {
+                "its affine form"
+            }
+            InstanceKey::Derived { kind: DeriveKind::Lipschitz, .. } => "its Lipschitz bound",
             InstanceKey::Derived { kind: DeriveKind::Filtered, .. } => "its filtered value",
             InstanceKey::Derived { kind: DeriveKind::Tape, .. } => "its tape",
             _ => "its gradient",
@@ -480,6 +512,32 @@ fn build(
                     derive(&mut mb.m, &mut mb.derived, inner, ncap, target, box_ty, interval_ty)
                 }
                 _ => Err(ir::Error::internal("an interval's signature has no box or no result")),
+            }
+        }
+        DeriveKind::AffineForm => {
+            let sig = &mb.m.functions[id.index()];
+            let ncap = (sig.params.len() as u32).saturating_sub(1);
+            match (sig.params.last().map(|p| p.ty), sig.ret) {
+                (Some(box_ty), Some(affine_ty)) => ir::derive::affine_form(
+                    &mut mb.m,
+                    &mut mb.derived,
+                    inner,
+                    ncap,
+                    target,
+                    box_ty,
+                    affine_ty,
+                ),
+                _ => Err(ir::Error::internal("an affine form's signature has no box or no result")),
+            }
+        }
+        DeriveKind::Lipschitz => {
+            let sig = &mb.m.functions[id.index()];
+            let ncap = (sig.params.len() as u32).saturating_sub(1);
+            match sig.params.last().map(|p| p.ty) {
+                Some(box_ty) => {
+                    ir::derive::lipschitz(&mut mb.m, &mut mb.derived, inner, ncap, target, box_ty)
+                }
+                None => Err(ir::Error::internal("a Lipschitz bound's signature has no box")),
             }
         }
     };

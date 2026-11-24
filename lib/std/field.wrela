@@ -806,6 +806,10 @@ impl<C, S: Field<C>> Field<C> for Skinned<S> {
     fn rest_channels(self, p: vec3) -> C {
         self.rest.channels(p)
     }
+
+    fn field_facts(self) -> FieldFacts {
+        self.posed.field_facts()
+    }
 }
 
 /// A 3D rigid similarity transform (`world(p) = s * R * p + t`, `s > 0`, `R` orthonormal) stored
@@ -1875,13 +1879,13 @@ impl Surface for RoundCone {
             let z = y - l
             let xv = pa - u * y
             let x2 = dot(xv, xv)
-            let k = sign(q) * q * q * x2
-            if sign(z) * a2 * z * z > k {
-                sqrt(x2 + z * z) - self.r2
-            } else if sign(y) * a2 * y * y < k {
-                sqrt(x2 + y * y) - self.r1
+            let k = abs(q) * q * x2
+            if a2 * (abs(z) * z) > k {
+                length(p - self.b) - self.r2
+            } else if a2 * (abs(y) * y) < k {
+                length(p - self.a) - self.r1
             } else {
-                sqrt(x2 * a2) + y * q - self.r1
+                length(xv) * sqrt(a2) + y * q - self.r1
             }
         }
     }
@@ -1912,13 +1916,20 @@ pub fn cuboid(half: vec3) -> Cuboid {
 }
 
 impl Surface for Cuboid {
-    /// Outside, the distance to the nearest point of the box; inside, minus the distance to
-    /// the nearest face. One branch on which, so what's derived from it knows the side: on a
-    /// face, the interval of the gradient is the face's normal.
+    /// Outside an edge or corner (at least two components of `q` positive), the Euclidean distance
+    /// to it; on every face and throughout the interior (at most one component positive), simply the
+    /// largest component `m`. Branching on the median (`second > 0.0`) avoids `sqrt(0)` and sign
+    /// straddling on faces, keeping affine bounds and gradients exact there.
     fn distance(self, p: vec3) -> f32 {
         let q = abs(p) - self.half
-        let m = max(q.x, max(q.y, q.z))
-        if m > 0.0 { length(max(q, vec3(0.0))) } else { m }
+        let xy_hi = max(q.x, q.y)
+        let xy_lo = min(q.x, q.y)
+        let second = max(xy_lo, min(xy_hi, q.z))
+        if second > 0.0 {
+            length(max(q, vec3(0.0)))
+        } else {
+            max(xy_hi, q.z)
+        }
     }
 
     fn bound(self) -> Bound {
@@ -2029,8 +2040,9 @@ fn pair_part_name<A: Surface, B: Surface>(a: A, b: B, i: u32) -> PartName {
 }
 
 /// `masked` of `a` and `b` joined by `join`: an operand none of whose parts is live isn't
-/// asked and counts as `EMPTY`, which `join` must take as nothing. One exit, each operand
-/// written once.
+/// asked; when only one operand has live parts it is returned directly without invoking `join`
+/// against `EMPTY` (which exceeds affine arithmetic's finite cap). One exit, each operand written
+/// once.
 fn pair_masked<A: Surface, B: Surface, J: Copy + fn(f32, f32) -> f32>(
     a: A,
     b: B,
@@ -2040,9 +2052,19 @@ fn pair_masked<A: Surface, B: Surface, J: Copy + fn(f32, f32) -> f32>(
     join: J,
 ) -> f32 {
     let n = a.parts()
-    let da = if live.any(first, n) { a.masked(p, live, first) } else { EMPTY }
-    let db = if live.any(first + n, b.parts()) { b.masked(p, live, first + n) } else { EMPTY }
-    join(da, db)
+    let la = live.any(first, n)
+    let lb = live.any(first + n, b.parts())
+    let da = if la { a.masked(p, live, first) } else { 0.0 }
+    let db = if lb { b.masked(p, live, first + n) } else { 0.0 }
+    if la && lb {
+        join(da, db)
+    } else if la {
+        da
+    } else if lb {
+        db
+    } else {
+        EMPTY
+    }
 }
 
 /// `pruned` of `a` and `b` joined by `smin` of width `k` (`min` for 0): each operand's, then
@@ -2094,10 +2116,11 @@ fn array_part_name<S: Surface, const N: u32>(parts: [S; N], i: u32) -> PartName 
     if k < N { parts[k].part_name(j) } else { unnamed() }
 }
 
-/// `masked` of `parts` folded by `join` from `EMPTY`, over the parts with a live part (one left
-/// out counts as `EMPTY`, which `join` must take as nothing). Where each part is one part and
-/// all are in one word of the mask, over its set bits, lowest first (`leaf_bits`): the parts in
-/// the same order, so the same fold, in at most `N` passes, as many as the live parts.
+/// `masked` of `parts` folded by `join` over the parts with a live part, seeded from the first
+/// live part (never `EMPTY`, which exceeds affine arithmetic's finite cap); returns `EMPTY` only
+/// when no part is live. Where each part is one part and all are in one word of the mask, walks
+/// its set bits, lowest first (`leaf_bits`): the parts in the same order, so the same fold, in at
+/// most `N` passes, as many as the live parts.
 fn array_masked<S: Surface, const N: u32, J: Copy + fn(f32, f32) -> f32>(
     parts: [S; N],
     p: vec3,
@@ -2105,7 +2128,8 @@ fn array_masked<S: Surface, const N: u32, J: Copy + fn(f32, f32) -> f32>(
     first: u32,
     join: J,
 ) -> f32 {
-    var d = EMPTY
+    var has = false
+    var d = 0.0
     if array_parts(parts) == N && (first & 31) + N <= 32 && first < 128 {
         var bits = leaf_bits(live, first, N)
         for _ in 0..N {
@@ -2113,20 +2137,32 @@ fn array_masked<S: Surface, const N: u32, J: Copy + fn(f32, f32) -> f32>(
                 break
             }
             let i = bits.trailing_zeros()
-            d = join(d, parts[i].masked(p, live, first + i))
+            let v = parts[i].masked(p, live, first + i)
+            if has {
+                d = join(d, v)
+            } else {
+                d = v
+                has = true
+            }
             bits = bits & (bits - 1)
         }
-        return d
+        return if has { d } else { EMPTY }
     }
     var f = first
     for i in 0..N {
         let n = parts[i].parts()
         if live.any(f, n) {
-            d = join(d, parts[i].masked(p, live, f))
+            let v = parts[i].masked(p, live, f)
+            if has {
+                d = join(d, v)
+            } else {
+                d = v
+                has = true
+            }
         }
         f += n
     }
-    d
+    if has { d } else { EMPTY }
 }
 
 /// Two surfaces joined: `a.union(b)`.
@@ -2345,8 +2381,11 @@ impl<S: Surface, const N: u32> Surface for UnionAll<S, N> {
 
     /// The nearest part's distance; with no parts, nowhere near (`EMPTY`).
     fn distance(self, p: vec3) -> f32 {
-        var d = EMPTY
-        for i in 0..N {
+        if N == 0 {
+            return EMPTY
+        }
+        var d = self.parts[0].distance(p)
+        for i in 1..N {
             d = min(d, self.parts[i].distance(p))
         }
         d
@@ -2418,8 +2457,11 @@ impl<S: Surface, const N: u32> Surface for UnionAll<S, N> {
     }
 
     fn filtered(self, p: vec3, footprint: f32) -> f32 {
-        var d = EMPTY
-        for i in 0..N {
+        if N == 0 {
+            return EMPTY
+        }
+        var d = self.parts[0].filtered(p, footprint)
+        for i in 1..N {
             d = min(d, self.parts[i].filtered(p, footprint))
         }
         d
@@ -3692,6 +3734,18 @@ impl<C, S: Field<C>> Field<C> for ToBound<S> {
         let (d, c) = self.inner.distance_and_channels(p)
         (clamp(d, -self.near, self.near) * self.scale, c)
     }
+
+    fn field_facts(self) -> FieldFacts {
+        let f = self.inner.field_facts()
+        FieldFacts::proven(
+            1.0,
+            f.may_transmit,
+            f.may_emit,
+            f.may_coat,
+            f.may_subsurface,
+            f.may_micro,
+        )
+    }
 }
 
 /// A debug build's check of a stated bound (§14): over the boxes in [-16, 16]³ where the
@@ -3804,6 +3858,62 @@ fn least_abs(i: Interval) -> f32 {
 
 // ---- channels -----------------------------------------------------------------------------------
 
+/// Build-time proven static facts about a field's surface and material channels, returned by
+/// `Field::field_facts(self)` from a build-time `const` witness. Because `FieldFacts` is returned
+/// from a constant (never stored in a uniform buffer), the IR optimizer constant-folds its fields
+/// across every GPU shader and CPU pass — erasing dead solver fallbacks, transmissive discard
+/// checks on opaque fields, unused BRDF lobes, and the build-time verifier itself (`seal: ()`
+/// erases to 0 bytes).
+pub struct FieldFacts: Copy {
+    pub lip: f32,
+    pub may_transmit: bool,
+    pub may_emit: bool,
+    pub may_coat: bool,
+    pub may_subsurface: bool,
+    pub may_micro: bool,
+    seal: (),
+}
+
+impl FieldFacts {
+    /// Conservative unknown facts (unbounded Lipschitz, all material features potentially active).
+    pub fn unknown() -> FieldFacts {
+        FieldFacts {
+            lip: 1.0 / 0.0,
+            may_transmit: true,
+            may_emit: true,
+            may_coat: true,
+            may_subsurface: true,
+            may_micro: true,
+            seal: (),
+        }
+    }
+
+    /// Constructs a proven `FieldFacts` witness (intended for build-time verifiers).
+    pub fn proven(
+        lip: f32,
+        may_transmit: bool,
+        may_emit: bool,
+        may_coat: bool,
+        may_subsurface: bool,
+        may_micro: bool,
+    ) -> FieldFacts {
+        FieldFacts { lip, may_transmit, may_emit, may_coat, may_subsurface, may_micro, seal: () }
+    }
+
+    /// Conservative join of two fields' static facts (for `Union`, `SmoothUnion`, `Intersect`).
+    pub fn join(self, other: FieldFacts) -> FieldFacts {
+        FieldFacts {
+            lip: max(self.lip, other.lip),
+            may_transmit: self.may_transmit || other.may_transmit,
+            may_emit: self.may_emit || other.may_emit,
+            may_coat: self.may_coat || other.may_coat,
+            may_subsurface: self.may_subsurface || other.may_subsurface,
+            may_micro: self.may_micro || other.may_micro,
+            seal: (),
+        }
+    }
+}
+
 /// A surface whose points carry channels `C` besides their distance: what a point knows
 /// about itself, such as its colour or its density. `.with(...)` and `.with_at(...)` give a
 /// surface channels, and the combinators blend them where they blend the surfaces.
@@ -3834,6 +3944,13 @@ pub trait Field<C>: Surface {
     /// `channels(p)` for non-skinned fields).
     fn rest_channels(self, p: vec3) -> C {
         self.channels(p)
+    }
+
+    /// Build-time proven static facts about this field (Lipschitz bound, transmission, emission,
+    /// coat, subsurface, micro-detail). Override to return a `const` witness so the compiler
+    /// erases dead branches and verifiers at build time.
+    fn field_facts(self) -> FieldFacts {
+        FieldFacts::unknown()
     }
 }
 
@@ -4222,6 +4339,10 @@ impl<C: Blend, A: Field<C>, B: Field<C>> Field<C> for Union<A, B> {
         let (db, cb) = self.b.distance_and_channels(p)
         (min(da, db), if da <= db { ca } else { cb })
     }
+
+    fn field_facts(self) -> FieldFacts {
+        self.a.field_facts().join(self.b.field_facts())
+    }
 }
 
 impl<C: Blend, A: Field<C>, B: Field<C>> Field<C> for SmoothUnion<A, B> {
@@ -4236,6 +4357,10 @@ impl<C: Blend, A: Field<C>, B: Field<C>> Field<C> for SmoothUnion<A, B> {
         let (d, w) = smin_and_weight(da, db, self.k)
         (d, ca.blend(cb, w))
     }
+
+    fn field_facts(self) -> FieldFacts {
+        self.a.field_facts().join(self.b.field_facts())
+    }
 }
 
 impl<C: Blend, A: Field<C>, B: Field<C>> Field<C> for Intersect<A, B> {
@@ -4248,6 +4373,10 @@ impl<C: Blend, A: Field<C>, B: Field<C>> Field<C> for Intersect<A, B> {
         let (da, ca) = self.a.distance_and_channels(p)
         let (db, cb) = self.b.distance_and_channels(p)
         (max(da, db), if da >= db { ca } else { cb })
+    }
+
+    fn field_facts(self) -> FieldFacts {
+        self.a.field_facts().join(self.b.field_facts())
     }
 }
 
@@ -4272,6 +4401,10 @@ impl<C, S: Field<C>, M: PointMap> Field<C> for Warp<S, M> {
     fn rest_channels(self, p: vec3) -> C {
         self.inner.rest_channels(p)
     }
+
+    fn field_facts(self) -> FieldFacts {
+        self.inner.field_facts()
+    }
 }
 
 impl<C, S: Field<C>, N: Noise> Field<C> for Displace<S, N> {
@@ -4282,6 +4415,18 @@ impl<C, S: Field<C>, N: Noise> Field<C> for Displace<S, N> {
     fn distance_and_channels(self, p: vec3) -> (f32, C) {
         let (d, c) = self.inner.distance_and_channels(p)
         (d + self.amp * self.noise.value(p), c)
+    }
+
+    fn field_facts(self) -> FieldFacts {
+        let f = self.inner.field_facts()
+        FieldFacts::proven(
+            f.lip + abs(self.amp) * self.noise.lipschitz(),
+            f.may_transmit,
+            f.may_emit,
+            f.may_coat,
+            f.may_subsurface,
+            f.may_micro,
+        )
     }
 }
 
@@ -4295,7 +4440,7 @@ impl<C: Blend, S: Field<C>, const N: u32> Field<C> for UnionAll<S, N> {
     fn distance_and_channels(self, p: vec3) -> (f32, C) {
         let (d0, c0) = self.parts[0].distance_and_channels(p)
         // The same `min`s, in the same order, as `distance`.
-        var d = min(EMPTY, d0)
+        var d = d0
         var c = take c0
         for i in 1..N {
             let (di, ci) = self.parts[i].distance_and_channels(p)
@@ -4305,6 +4450,17 @@ impl<C: Blend, S: Field<C>, const N: u32> Field<C> for UnionAll<S, N> {
             d = min(d, di)
         }
         (d, c)
+    }
+
+    fn field_facts(self) -> FieldFacts {
+        if N == 0 {
+            return FieldFacts::unknown()
+        }
+        var f = self.parts[0].field_facts()
+        for i in 1..N {
+            f = f.join(self.parts[i].field_facts())
+        }
+        f
     }
 }
 
@@ -4328,6 +4484,17 @@ impl<C: Blend, S: Field<C>, const N: u32> Field<C> for SmoothUnionAll<S, N> {
         }
         (d, c)
     }
+
+    fn field_facts(self) -> FieldFacts {
+        if N == 0 {
+            return FieldFacts::unknown()
+        }
+        var f = self.parts[0].field_facts()
+        for i in 1..N {
+            f = f.join(self.parts[i].field_facts())
+        }
+        f
+    }
 }
 
 /// `a`'s channels: the cut takes away, and its face is `a`'s.
@@ -4339,6 +4506,18 @@ impl<C, A: Field<C>, B: Surface> Field<C> for SmoothSubtract<A, B> {
     fn distance_and_channels(self, p: vec3) -> (f32, C) {
         let (da, ca) = self.a.distance_and_channels(p)
         (smax(da, -self.b.distance(p), self.k), ca)
+    }
+
+    fn field_facts(self) -> FieldFacts {
+        let f = self.a.field_facts()
+        FieldFacts::proven(
+            max(f.lip, self.b.lipschitz(1.0e6)),
+            f.may_transmit,
+            f.may_emit,
+            f.may_coat,
+            f.may_subsurface,
+            f.may_micro,
+        )
     }
 }
 
@@ -4353,6 +4532,10 @@ impl<C: Blend, A: Field<C>, B: Field<C>> Field<C> for SmoothIntersect<A, B> {
         let (db, cb) = self.b.distance_and_channels(p)
         (smax(da, db, self.k), ca.blend(cb, smin_weight(-da, -db, self.k)))
     }
+
+    fn field_facts(self) -> FieldFacts {
+        self.a.field_facts().join(self.b.field_facts())
+    }
 }
 
 impl<C, S: Field<C>> Field<C> for Mirror<S> {
@@ -4363,6 +4546,10 @@ impl<C, S: Field<C>> Field<C> for Mirror<S> {
     fn distance_and_channels(self, p: vec3) -> (f32, C) {
         self.inner.distance_and_channels(mirrored(p))
     }
+
+    fn field_facts(self) -> FieldFacts {
+        self.inner.field_facts()
+    }
 }
 
 impl<C, S: Field<C>> Field<C> for Named<S> {
@@ -4372,6 +4559,10 @@ impl<C, S: Field<C>> Field<C> for Named<S> {
 
     fn distance_and_channels(self, p: vec3) -> (f32, C) {
         self.inner.distance_and_channels(p)
+    }
+
+    fn field_facts(self) -> FieldFacts {
+        self.inner.field_facts()
     }
 }
 

@@ -51,13 +51,35 @@ const NOISE_HESSIAN: f64 = 40.0;
 /// Value noise's own rounding inside a cell, absolute (its values are within 1), and its
 /// derived gradient's, relative to the gradient's reach.
 const NOISE_ROUNDING: f64 = 64.0 * EPS;
+/// Global upper bound on any partial derivative `|∂value_noise/∂x_k|`: quintic fade derivative
+/// `max 30 t²(1-t)² = 1.875` times max lattice difference `2.0` (`[-1, 1]`), equals `3.75`.
+const NOISE_GRAD_MAX: f64 = 3.75;
+/// Upper bound on diagonal second derivative `|∂²value_noise/∂x_k²|`: `2 × 10/√3 ≈ 11.547`.
+const NOISE_HESS_DIAG: f64 = 11.55;
+/// Upper bound on mixed second derivative `|∂²value_noise/(∂x_j ∂x_k)|`: `4 × 1.875² = 14.0625`.
+const NOISE_HESS_MIX: f64 = 14.07;
+/// Maximum shared nonlinear noise symbols tracked per function (AFk): `0` on GPU keeps
+/// `min`/`max`/`abs` register-lean in `certify_outline` and `filter_thin_cells`, while CPU/const
+/// verification uses `CPU_MAX_SYMS = 8` for exact face cancellation.
+const GPU_MAX_SYMS: usize = 0;
+const CPU_MAX_SYMS: usize = 8;
 
-/// An affine value in the derived code: its centre, its slope on each axis, its error.
+/// An affine value in the derived code: its centre, its slope on each input axis, optional shared
+/// nonlinear noise symbols (AFk: `(sym_id, coeff)` of the same IR type as `c`), its lumped error,
+/// and optional branch-narrowed bounds `(lo, hi)` applied when taking its range.
 #[derive(Clone, Debug)]
 struct A {
     c: ValueId,
     l: Vec<ValueId>,
+    s: Vec<(u32, ValueId)>,
     e: ValueId,
+    bounds: Option<(Option<ValueId>, Option<ValueId>)>,
+}
+
+impl A {
+    fn plain(c: ValueId, l: Vec<ValueId>, e: ValueId) -> A {
+        A { c, l, s: Vec::new(), e, bounds: None }
+    }
 }
 
 /// What a box makes an active bool: surely true, surely false (never both).
@@ -69,9 +91,67 @@ enum State {
     Bool(Sure),
 }
 
+/// Builds the input affine form `(c, l_0..l_{n-1}, e)` from `over: box_ty` (`{ lo, hi }`), where
+/// `x = c + Σ l_i u_i + δ` with `u ∈ [-1, 1]^n` and `|δ| ≤ e`. Using `2 * EPS` + `2 * tiny` in `e`
+/// guarantees that `0.5 * (lo + hi)` (used by `Box::split` / octant tests) also lies within `c ± e`.
+fn input_box(
+    g: &mut Function,
+    body: &mut Block,
+    f32: TypeId,
+    x_ty: TypeId,
+    n: usize,
+    over: ValueId,
+    target: Target,
+) -> (ValueId, Vec<ValueId>, ValueId) {
+    let tiny = tiny(target);
+    let lo = g.let_(body, x_ty, Expr::Extract(over, 0));
+    let hi = g.let_(body, x_ty, Expr::Extract(over, 1));
+    let k = |g: &mut Function, body: &mut Block, x: f64| -> ValueId {
+        let s = g.let_(body, f32, Expr::Const(Const::F32(x as f32)));
+        if n == 1 { s } else { g.let_(body, x_ty, Expr::Splat(s, n as u8)) }
+    };
+    let half = k(g, body, 0.5);
+    let hl = g.let_(body, x_ty, Expr::Binary(BinOp::Mul, lo, half));
+    let hh = g.let_(body, x_ty, Expr::Binary(BinOp::Mul, hi, half));
+    let c = g.let_(body, x_ty, Expr::Binary(BinOp::Add, hl, hh));
+    let h = g.let_(body, x_ty, Expr::Binary(BinOp::Sub, hh, hl));
+    let up = k(g, body, 1.0 + 2.0 * EPS);
+    let h = g.let_(body, x_ty, Expr::Binary(BinOp::Mul, h, up));
+    // The centre is within an ulp of the middle (and 2 ulps of `0.5 * (lo + hi)`): put that in e.
+    let ac = g.let_(body, x_ty, Expr::Builtin(Builtin::Abs, vec![c]));
+    let eps2 = k(g, body, 2.0 * EPS);
+    let tv = k(g, body, 2.0 * tiny);
+    let e = g.let_(body, x_ty, Expr::Binary(BinOp::Mul, ac, eps2));
+    let e = g.let_(body, x_ty, Expr::Binary(BinOp::Add, e, tv));
+    let zero = g.let_(body, f32, Expr::Const(Const::F32(0.0)));
+    let mut ls = Vec::with_capacity(n);
+    for i in 0..n {
+        let l = if n == 1 {
+            h
+        } else {
+            let hi_ = g.let_(body, f32, Expr::Extract(h, i as u32));
+            let comps = (0..n).map(|j| if j == i { hi_ } else { zero }).collect();
+            g.let_(body, x_ty, Expr::Construct(x_ty, comps))
+        };
+        ls.push(l);
+    }
+    (c, ls, e)
+}
+
+/// Passes `v` of type `ty` by value or through a fresh local when `by_ref` is true.
+fn pass_arg(g: &mut Function, body: &mut Block, v: ValueId, ty: TypeId, by_ref: bool) -> Arg {
+    if by_ref {
+        let l = g.new_local("x", ty);
+        body.push(Stmt::Store(Place::local(l), v));
+        Arg::Place(Place::local(l))
+    } else {
+        Arg::Value(v)
+    }
+}
+
 /// The affine form of `f` over a box, intersected with its plain interval: a function of `f`'s
-/// captures and the box (`box_ty`) returning `interval_ty`. A function the form can't be
-/// derived for gets the plain interval alone.
+/// captures and the box (`box_ty`) returning `interval_ty` (`Interval` for `f32`, `Box2`/`Box3`/
+/// `Box4` for float vectors). A function the form can't be derived for gets the plain interval alone.
 pub(super) fn affine(
     m: &mut Module,
     cache: &mut DeriveCache,
@@ -90,7 +170,15 @@ pub(super) fn affine(
         _ => return Ok(plain),
     };
     let f32 = m.types.f32();
-    if func.ret != Some(f32) || func.ret_ref {
+    let Some(y_ty) = func.ret else {
+        return Ok(plain);
+    };
+    let yn = match m.types.get(y_ty) {
+        TypeDef::Scalar(Scalar::F32) => None,
+        TypeDef::Vector(Scalar::F32, k) => Some(*k as u32),
+        _ => return Ok(plain),
+    };
+    if func.ret_ref {
         return Ok(plain);
     }
     let mut mask = vec![0; func.params.len()];
@@ -112,88 +200,218 @@ pub(super) fn affine(
     let mut body = Vec::new();
     let caps: Vec<Arg> = (0..xi as u32).map(|i| g.param_arg(i, &mut body)).collect();
     let over = g.let_(&mut body, box_ty, Expr::Param(xi as u32));
-    let lo = g.let_(&mut body, x_ty, Expr::Extract(over, 0));
-    let hi = g.let_(&mut body, x_ty, Expr::Extract(over, 1));
-    let k = |g: &mut Function, body: &mut Block, x: f64| -> ValueId {
-        let s = g.let_(body, f32, Expr::Const(Const::F32(x as f32)));
-        if n == 1 { s } else { g.let_(body, x_ty, Expr::Splat(s, n as u8)) }
-    };
-    let half = k(&mut g, &mut body, 0.5);
-    let hl = g.let_(&mut body, x_ty, Expr::Binary(BinOp::Mul, lo, half));
-    let hh = g.let_(&mut body, x_ty, Expr::Binary(BinOp::Mul, hi, half));
-    let c = g.let_(&mut body, x_ty, Expr::Binary(BinOp::Add, hl, hh));
-    let h = g.let_(&mut body, x_ty, Expr::Binary(BinOp::Sub, hh, hl));
-    let up = k(&mut g, &mut body, 1.0 + 2.0 * EPS);
-    let h = g.let_(&mut body, x_ty, Expr::Binary(BinOp::Mul, h, up));
-    // The centre is within an ulp of the middle: that ulp is its error.
-    let ac = g.let_(&mut body, x_ty, Expr::Builtin(Builtin::Abs, vec![c]));
-    let eps = k(&mut g, &mut body, EPS);
-    let tv = k(&mut g, &mut body, tiny);
-    let e = g.let_(&mut body, x_ty, Expr::Binary(BinOp::Mul, ac, eps));
-    let e = g.let_(&mut body, x_ty, Expr::Binary(BinOp::Add, e, tv));
-    let zero = g.let_(&mut body, f32, Expr::Const(Const::F32(0.0)));
+    let (c, ls, e) = input_box(&mut g, &mut body, f32, x_ty, n, over, target);
     let by_ref = func.params[xi].by_ref;
-    let pass = |g: &mut Function, body: &mut Block, v: ValueId| -> Arg {
-        if by_ref {
-            let l = g.new_local("x", x_ty);
-            body.push(Stmt::Store(Place::local(l), v));
-            Arg::Place(Place::local(l))
-        } else {
-            Arg::Value(v)
-        }
-    };
     let mut args = caps.clone();
-    args.push(pass(&mut g, &mut body, c));
-    for i in 0..n {
-        let l = if n == 1 {
-            h
-        } else {
-            let hi_ = g.let_(&mut body, f32, Expr::Extract(h, i as u32));
-            let comps = (0..n).map(|j| if j == i { hi_ } else { zero }).collect();
-            g.let_(&mut body, x_ty, Expr::Construct(x_ty, comps))
-        };
-        args.push(pass(&mut g, &mut body, l));
+    args.push(pass_arg(&mut g, &mut body, c, x_ty, by_ref));
+    for l in ls {
+        args.push(pass_arg(&mut g, &mut body, l, x_ty, by_ref));
     }
-    args.push(pass(&mut g, &mut body, e));
+    args.push(pass_arg(&mut g, &mut body, e, x_ty, by_ref));
     let rty = m.functions[d.index()].ret.ok_or_else(|| Error::internal("no affine result"))?;
     let r = g.let_(&mut body, rty, Expr::Call(d, args));
-    let rc = g.let_(&mut body, f32, Expr::Extract(r, 0));
-    let mut rad = g.let_(&mut body, f32, Expr::Extract(r, 1 + n as u32));
+    let rc = g.let_(&mut body, y_ty, Expr::Extract(r, 0));
+    let mut rad = g.let_(&mut body, y_ty, Expr::Extract(r, 1 + n as u32));
     for i in 0..n {
-        let li = g.let_(&mut body, f32, Expr::Extract(r, 1 + i as u32));
-        let a = g.let_(&mut body, f32, Expr::Builtin(Builtin::Abs, vec![li]));
-        rad = g.let_(&mut body, f32, Expr::Binary(BinOp::Add, rad, a));
+        let li = g.let_(&mut body, y_ty, Expr::Extract(r, 1 + i as u32));
+        let a = g.let_(&mut body, y_ty, Expr::Builtin(Builtin::Abs, vec![li]));
+        rad = g.let_(&mut body, y_ty, Expr::Binary(BinOp::Add, rad, a));
     }
+    let ky = |g: &mut Function, body: &mut Block, x: f64| -> ValueId {
+        let s = g.let_(body, f32, Expr::Const(Const::F32(x as f32)));
+        match yn {
+            Some(k) => g.let_(body, y_ty, Expr::Splat(s, k as u8)),
+            None => s,
+        }
+    };
     // The radius's own sum and the ends' subtraction, rounded: a few ulps more.
-    let arc = g.let_(&mut body, f32, Expr::Builtin(Builtin::Abs, vec![rc]));
-    let mg = g.let_(&mut body, f32, Expr::Binary(BinOp::Add, arc, rad));
-    let kk = g.let_(&mut body, f32, Expr::Const(Const::F32((2.0 * (n as f64 + 2.0) * EPS) as f32)));
-    let grow = g.let_(&mut body, f32, Expr::Binary(BinOp::Mul, mg, kk));
-    let rad = g.let_(&mut body, f32, Expr::Binary(BinOp::Add, rad, grow));
-    let t1 = g.let_(&mut body, f32, Expr::Const(Const::F32(tiny as f32)));
-    let rad = g.let_(&mut body, f32, Expr::Binary(BinOp::Add, rad, t1));
-    let alo = g.let_(&mut body, f32, Expr::Binary(BinOp::Sub, rc, rad));
-    let ahi = g.let_(&mut body, f32, Expr::Binary(BinOp::Add, rc, rad));
+    let arc = g.let_(&mut body, y_ty, Expr::Builtin(Builtin::Abs, vec![rc]));
+    let mg = g.let_(&mut body, y_ty, Expr::Binary(BinOp::Add, arc, rad));
+    let kk = ky(&mut g, &mut body, 2.0 * (n as f64 + 2.0) * EPS);
+    let grow = g.let_(&mut body, y_ty, Expr::Binary(BinOp::Mul, mg, kk));
+    let rad = g.let_(&mut body, y_ty, Expr::Binary(BinOp::Add, rad, grow));
+    let t1 = ky(&mut g, &mut body, tiny);
+    let rad = g.let_(&mut body, y_ty, Expr::Binary(BinOp::Add, rad, t1));
+    let alo = g.let_(&mut body, y_ty, Expr::Binary(BinOp::Sub, rc, rad));
+    let ahi = g.let_(&mut body, y_ty, Expr::Binary(BinOp::Add, rc, rad));
     let mut pargs = caps;
     pargs.push(Arg::Value(over));
     let p = g.let_(&mut body, interval_ty, Expr::Call(plain, pargs));
-    let plo = g.let_(&mut body, f32, Expr::Extract(p, 0));
-    let phi = g.let_(&mut body, f32, Expr::Extract(p, 1));
-    // The tighter end of the two; a NaN end of the form's leaves the plain one, and so does a
-    // form that reaches past `CAP`, which stands for no bound (`Af::within`).
+    let plo = g.let_(&mut body, y_ty, Expr::Extract(p, 0));
+    let phi = g.let_(&mut body, y_ty, Expr::Extract(p, 1));
+    // The tighter end of the two, per component; a NaN end or one past `CAP` leaves the plain one.
     let b = m.types.bool();
     let cap = g.let_(&mut body, f32, Expr::Const(Const::F32(CAP as f32)));
-    let fine = g.let_(&mut body, b, Expr::Binary(BinOp::Le, mg, cap));
-    let lo_ok = g.let_(&mut body, b, Expr::Binary(BinOp::Gt, alo, plo));
-    let lo_ok = g.let_(&mut body, b, Expr::Binary(BinOp::And, lo_ok, fine));
-    let hi_ok = g.let_(&mut body, b, Expr::Binary(BinOp::Lt, ahi, phi));
-    let hi_ok = g.let_(&mut body, b, Expr::Binary(BinOp::And, hi_ok, fine));
-    let rlo = g.let_(&mut body, f32, Expr::Select { cond: lo_ok, if_true: alo, if_false: plo });
-    let rhi = g.let_(&mut body, f32, Expr::Select { cond: hi_ok, if_true: ahi, if_false: phi });
+    let intersect_comp = |g: &mut Function,
+                          body: &mut Block,
+                          mg_c: ValueId,
+                          alo_c: ValueId,
+                          ahi_c: ValueId,
+                          plo_c: ValueId,
+                          phi_c: ValueId|
+     -> (ValueId, ValueId) {
+        let fine = g.let_(body, b, Expr::Binary(BinOp::Le, mg_c, cap));
+        let lo_ok = g.let_(body, b, Expr::Binary(BinOp::Gt, alo_c, plo_c));
+        let lo_ok = g.let_(body, b, Expr::Binary(BinOp::And, lo_ok, fine));
+        let hi_ok = g.let_(body, b, Expr::Binary(BinOp::Lt, ahi_c, phi_c));
+        let hi_ok = g.let_(body, b, Expr::Binary(BinOp::And, hi_ok, fine));
+        let rlo = g.let_(body, f32, Expr::Select { cond: lo_ok, if_true: alo_c, if_false: plo_c });
+        let rhi = g.let_(body, f32, Expr::Select { cond: hi_ok, if_true: ahi_c, if_false: phi_c });
+        (rlo, rhi)
+    };
+    let (rlo, rhi) = match yn {
+        None => intersect_comp(&mut g, &mut body, mg, alo, ahi, plo, phi),
+        Some(k) => {
+            let mut los = Vec::with_capacity(k as usize);
+            let mut his = Vec::with_capacity(k as usize);
+            for j in 0..k {
+                let mg_c = g.let_(&mut body, f32, Expr::Extract(mg, j));
+                let alo_c = g.let_(&mut body, f32, Expr::Extract(alo, j));
+                let ahi_c = g.let_(&mut body, f32, Expr::Extract(ahi, j));
+                let plo_c = g.let_(&mut body, f32, Expr::Extract(plo, j));
+                let phi_c = g.let_(&mut body, f32, Expr::Extract(phi, j));
+                let (l, h) = intersect_comp(&mut g, &mut body, mg_c, alo_c, ahi_c, plo_c, phi_c);
+                los.push(l);
+                his.push(h);
+            }
+            (
+                g.let_(&mut body, y_ty, Expr::Construct(y_ty, los)),
+                g.let_(&mut body, y_ty, Expr::Construct(y_ty, his)),
+            )
+        }
+    };
     let out = g.let_(&mut body, interval_ty, Expr::Construct(interval_ty, vec![rlo, rhi]));
     body.push(Stmt::Return(Some(out)));
     g.body = body;
     Ok(m.add_function(g))
+}
+
+/// The affine form `{ c, l, e }` of `f` over a box (`box_ty`), returning `affine_ty` directly
+/// WITHOUT generating or calling the plain interval derivation. Falls back to wrapping `interval`
+/// only if `f` cannot be affine-derived.
+pub(super) fn affine_form(
+    m: &mut Module,
+    cache: &mut DeriveCache,
+    f: FuncId,
+    ncap: u32,
+    target: Target,
+    (box_ty, affine_ty): (TypeId, TypeId),
+) -> R<FuncId> {
+    let func = m.functions[f.index()].derived_signature();
+    let xi = ncap as usize;
+    let x_ty = func.params.get(xi).ok_or_else(|| Error::internal("no input parameter"))?.ty;
+    let n = match m.types.get(x_ty) {
+        TypeDef::Scalar(Scalar::F32) => 1,
+        TypeDef::Vector(Scalar::F32, k) => *k as usize,
+        _ => {
+            return Err(Error::not_derivable(format!(
+                "an affine form needs an `f32` or a float vector input, not `{}`",
+                m.types.display(x_ty)
+            )));
+        }
+    };
+    let f32 = m.types.f32();
+    if func.ret != Some(f32) || func.ret_ref {
+        return Err(Error::not_derivable("an affine form needs a function that returns an `f32`"));
+    }
+    let mut mask = vec![0; func.params.len()];
+    mask[xi] = all_bits(&m.types, x_ty);
+    let mut params = func.params[..xi].to_vec();
+    params.push(Param::value("over", box_ty));
+    let mut g = Function::new(format!("{}_affine_form", func.name), params, Some(affine_ty));
+    let mut body = Vec::new();
+    let caps: Vec<Arg> = (0..xi as u32).map(|i| g.param_arg(i, &mut body)).collect();
+    let over = g.let_(&mut body, box_ty, Expr::Param(xi as u32));
+    let by_ref = func.params[xi].by_ref;
+
+    if returns_active(m, cache, f, mask.clone(), Mode::Interval) == 0 {
+        // Result does not depend on the input: evaluate once at the centre, slopes and error 0.
+        let (c, _, _) = input_box(&mut g, &mut body, f32, x_ty, n, over, target);
+        let mut args = caps;
+        args.push(pass_arg(&mut g, &mut body, c, x_ty, by_ref));
+        let val = g.let_(&mut body, f32, Expr::Call(f, args));
+        let zl = g.let_(&mut body, x_ty, Expr::Zero(x_ty));
+        let ze = g.let_(&mut body, f32, Expr::Const(Const::F32(0.0)));
+        let out = g.let_(&mut body, affine_ty, Expr::Construct(affine_ty, vec![val, zl, ze]));
+        body.push(Stmt::Return(Some(out)));
+        g.body = body;
+        return Ok(m.add_function(g));
+    }
+
+    match derive(m, cache, f, mask.clone(), n, target) {
+        Ok(d) => {
+            let (c, ls, e) = input_box(&mut g, &mut body, f32, x_ty, n, over, target);
+            let mut args = caps;
+            args.push(pass_arg(&mut g, &mut body, c, x_ty, by_ref));
+            for l in ls {
+                args.push(pass_arg(&mut g, &mut body, l, x_ty, by_ref));
+            }
+            args.push(pass_arg(&mut g, &mut body, e, x_ty, by_ref));
+            let rty =
+                m.functions[d.index()].ret.ok_or_else(|| Error::internal("no affine result"))?;
+            let r = g.let_(&mut body, rty, Expr::Call(d, args));
+            let rc = g.let_(&mut body, f32, Expr::Extract(r, 0));
+            let l_out = if n == 1 {
+                g.let_(&mut body, f32, Expr::Extract(r, 1))
+            } else {
+                let parts: Vec<ValueId> = (0..n)
+                    .map(|i| g.let_(&mut body, f32, Expr::Extract(r, 1 + i as u32)))
+                    .collect();
+                g.let_(&mut body, x_ty, Expr::Construct(x_ty, parts))
+            };
+            let re = g.let_(&mut body, f32, Expr::Extract(r, 1 + n as u32));
+            let out = g.let_(&mut body, affine_ty, Expr::Construct(affine_ty, vec![rc, l_out, re]));
+            body.push(Stmt::Return(Some(out)));
+            g.body = body;
+            Ok(m.add_function(g))
+        }
+        Err(Error::NotDerivable(..) | Error::ActiveLoopExit(..)) => {
+            // Fallback: wrap plain interval `[plo, phi]` into `{ c: mid, l: 0, e: rad }` (or BIG).
+            let di = super::interval::derive(m, cache, f, mask, target, false, None)?;
+            let lo = g.let_(&mut body, x_ty, Expr::Extract(over, 0));
+            let hi = g.let_(&mut body, x_ty, Expr::Extract(over, 1));
+            let mut args = caps;
+            args.push(pass_arg(&mut g, &mut body, lo, x_ty, by_ref));
+            args.push(pass_arg(&mut g, &mut body, hi, x_ty, by_ref));
+            let rty =
+                m.functions[di.index()].ret.ok_or_else(|| Error::internal("no interval result"))?;
+            let p = g.let_(&mut body, rty, Expr::Call(di, args));
+            let plo = g.let_(&mut body, f32, Expr::Extract(p, 0));
+            let phi = g.let_(&mut body, f32, Expr::Extract(p, 1));
+            let b = m.types.bool();
+            let cap = g.let_(&mut body, f32, Expr::Const(Const::F32(CAP as f32)));
+            let aplo = g.let_(&mut body, f32, Expr::Builtin(Builtin::Abs, vec![plo]));
+            let aphi = g.let_(&mut body, f32, Expr::Builtin(Builtin::Abs, vec![phi]));
+            let ord = g.let_(&mut body, b, Expr::Binary(BinOp::Le, plo, phi));
+            let ok1 = g.let_(&mut body, b, Expr::Binary(BinOp::Le, aplo, cap));
+            let ok2 = g.let_(&mut body, b, Expr::Binary(BinOp::Le, aphi, cap));
+            let ok = g.let_(&mut body, b, Expr::Binary(BinOp::And, ord, ok1));
+            let ok = g.let_(&mut body, b, Expr::Binary(BinOp::And, ok, ok2));
+            let half = g.let_(&mut body, f32, Expr::Const(Const::F32(0.5)));
+            let hl = g.let_(&mut body, f32, Expr::Binary(BinOp::Mul, plo, half));
+            let hh = g.let_(&mut body, f32, Expr::Binary(BinOp::Mul, phi, half));
+            let mid = g.let_(&mut body, f32, Expr::Binary(BinOp::Add, hl, hh));
+            let rad = g.let_(&mut body, f32, Expr::Binary(BinOp::Sub, hh, hl));
+            let amid = g.let_(&mut body, f32, Expr::Builtin(Builtin::Abs, vec![mid]));
+            let mag = g.let_(&mut body, f32, Expr::Binary(BinOp::Add, amid, rad));
+            let eps4 = g.let_(&mut body, f32, Expr::Const(Const::F32((4.0 * EPS) as f32)));
+            let grow = g.let_(&mut body, f32, Expr::Binary(BinOp::Mul, mag, eps4));
+            let t1 = g.let_(&mut body, f32, Expr::Const(Const::F32(tiny(target) as f32)));
+            let grow = g.let_(&mut body, f32, Expr::Binary(BinOp::Add, grow, t1));
+            let err = g.let_(&mut body, f32, Expr::Binary(BinOp::Add, rad, grow));
+            let zero = g.let_(&mut body, f32, Expr::Const(Const::F32(0.0)));
+            let big = g.let_(&mut body, f32, Expr::Const(Const::F32(BIG as f32)));
+            let rc =
+                g.let_(&mut body, f32, Expr::Select { cond: ok, if_true: mid, if_false: zero });
+            let re = g.let_(&mut body, f32, Expr::Select { cond: ok, if_true: err, if_false: big });
+            let zl = g.let_(&mut body, x_ty, Expr::Zero(x_ty));
+            let out = g.let_(&mut body, affine_ty, Expr::Construct(affine_ty, vec![rc, zl, re]));
+            body.push(Stmt::Return(Some(out)));
+            g.body = body;
+            Ok(m.add_function(g))
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// The affine version of `f` with active parameters `mask`, over `n` axes. Each active
@@ -294,6 +512,12 @@ fn derive(
         returns,
         speculative: 0,
         ptrs,
+        abs_syms: Vec::new(),
+        next_sym: 0,
+        cmp_defs: HashMap::new(),
+        bool_defs: HashMap::new(),
+        not_defs: HashMap::new(),
+        narrow: HashMap::new(),
     };
     let built = (|| -> R<Block> {
         let mut body = Vec::new();
@@ -357,6 +581,19 @@ struct Af<'a> {
     /// Where each pointer may point: a write through one into an active place would change its
     /// centre and leave its slopes and error behind.
     ptrs: Pointers,
+    /// Shared nonlinear noise symbols (AFk): each entry `(key, sym_id)` records the linear part
+    /// `[c, l_0, ..., l_{n-1}]` (scalar `f32` values) of an `abs`/`min`/`max` operand whose `|d_0|`
+    /// deviation `ε ∈ [-1, 1]` is tracked under `sym_id`.
+    abs_syms: Vec<(Vec<ValueId>, u32)>,
+    next_sym: u32,
+    /// Original IR float comparison definitions for branch narrowing.
+    cmp_defs: HashMap<ValueId, (BinOp, ValueId, ValueId)>,
+    /// Original IR `And`/`Or` definitions for branch narrowing.
+    bool_defs: HashMap<ValueId, (BinOp, ValueId, ValueId)>,
+    /// Original IR `Not` definitions for branch narrowing.
+    not_defs: HashMap<ValueId, ValueId>,
+    /// Branch-narrowed scalar bounds `(lo, hi)` active for original SSA float values.
+    narrow: HashMap<ValueId, (Option<ValueId>, Option<ValueId>)>,
 }
 
 impl Builder for Af<'_> {
@@ -390,11 +627,24 @@ impl Af<'_> {
         (if self.gpu() { gpu } else { cpu }) * EPS
     }
 
-    /// A float constant of type `ty` (splatted for a vector).
+    /// A float constant of type `ty` (splatted for a vector, or recursively built for a
+    /// float-only struct/array aggregate such as `dual3<f32>`).
     fn k(&mut self, out: &mut Block, ty: TypeId, x: f64) -> ValueId {
-        let f = self.m.types.f32();
-        let s = self.emit(out, f, Expr::Const(Const::F32(x as f32)));
-        self.coerce(out, s, ty)
+        match self.m.types.get(ty).clone() {
+            TypeDef::Struct { fields, .. } => {
+                let parts = fields.iter().map(|(_, ft)| self.k(out, *ft, x)).collect();
+                self.emit(out, ty, Expr::Construct(ty, parts))
+            }
+            TypeDef::Array(et, n) => {
+                let elem = self.k(out, et, x);
+                self.emit(out, ty, Expr::Construct(ty, vec![elem; n as usize]))
+            }
+            _ => {
+                let f = self.m.types.f32();
+                let s = self.emit(out, f, Expr::Const(Const::F32(x as f32)));
+                self.coerce(out, s, ty)
+            }
+        }
     }
 
     fn bconst(&mut self, out: &mut Block, b: bool) -> ValueId {
@@ -434,20 +684,43 @@ impl Af<'_> {
         }
     }
 
-    /// A vector form's components, each a scalar form.
+    /// Maximum shared nonlinear symbols tracked for this target.
+    fn max_syms(&self) -> usize {
+        if self.gpu() { GPU_MAX_SYMS } else { CPU_MAX_SYMS }
+    }
+
+    /// A vector form's components, each a scalar form (preserving per-component bounds and exactness).
     fn split(&mut self, out: &mut Block, a: &A, k: u8) -> Vec<A> {
         let f = self.m.types.f32();
+        if self.is_exact(a) {
+            return (0..k as u32)
+                .map(|j| {
+                    let c = self.emit(out, f, Expr::Extract(a.c, j));
+                    self.exact(out, c)
+                })
+                .collect();
+        }
         (0..k as u32)
             .map(|j| {
                 let c = self.emit(out, f, Expr::Extract(a.c, j));
                 let l = (0..self.n).map(|i| self.emit(out, f, Expr::Extract(a.l[i], j))).collect();
+                let s =
+                    a.s.iter()
+                        .map(|&(id, v)| (id, self.emit(out, f, Expr::Extract(v, j))))
+                        .collect();
                 let e = self.emit(out, f, Expr::Extract(a.e, j));
-                A { c, l, e }
+                let bounds = a.bounds.map(|(bl, bh)| {
+                    (
+                        bl.map(|v| self.emit(out, f, Expr::Extract(v, j))),
+                        bh.map(|v| self.emit(out, f, Expr::Extract(v, j))),
+                    )
+                });
+                A { c, l, s, e, bounds }
             })
             .collect()
     }
 
-    /// A vector form from its components'.
+    /// A vector form from its components' (preserving component-wise bounds when all parts carry them).
     fn gather(&mut self, out: &mut Block, parts: &[A], ty: TypeId) -> A {
         let c = self.emit(out, ty, Expr::Construct(ty, parts.iter().map(|a| a.c).collect()));
         let l = (0..self.n)
@@ -456,7 +729,46 @@ impl Af<'_> {
             })
             .collect();
         let e = self.emit(out, ty, Expr::Construct(ty, parts.iter().map(|a| a.e).collect()));
-        A { c, l, e }
+        let mut sym_ids: Vec<u32> = Vec::new();
+        for p in parts {
+            for &(id, _) in &p.s {
+                if !sym_ids.contains(&id) {
+                    sym_ids.push(id);
+                }
+            }
+        }
+        sym_ids.sort_unstable();
+        let f = self.m.types.f32();
+        let zf = if sym_ids.is_empty() { None } else { Some(self.zero(out, f)) };
+        let s = sym_ids
+            .into_iter()
+            .map(|id| {
+                let comps = parts
+                    .iter()
+                    .map(|p| {
+                        p.s.iter()
+                            .find(|&&(pid, _)| pid == id)
+                            .map(|&(_, v)| v)
+                            .unwrap_or_else(|| zf.expect("zero"))
+                    })
+                    .collect();
+                (id, self.emit(out, ty, Expr::Construct(ty, comps)))
+            })
+            .collect();
+        let bl = if parts.iter().all(|p| p.bounds.and_then(|b| b.0).is_some()) {
+            let cs = parts.iter().map(|p| p.bounds.unwrap().0.unwrap()).collect();
+            Some(self.emit(out, ty, Expr::Construct(ty, cs)))
+        } else {
+            None
+        };
+        let bh = if parts.iter().all(|p| p.bounds.and_then(|b| b.1).is_some()) {
+            let cs = parts.iter().map(|p| p.bounds.unwrap().1.unwrap()).collect();
+            Some(self.emit(out, ty, Expr::Construct(ty, cs)))
+        } else {
+            None
+        };
+        let bounds = if bl.is_some() || bh.is_some() { Some((bl, bh)) } else { None };
+        A { c, l, s, e, bounds }
     }
 
     /// A rule that chooses (a select takes one `bool`) applied to a vector component by
@@ -485,28 +797,70 @@ impl Af<'_> {
         let ty = self.ty(v);
         let z = self.zero(out, ty);
         self.zeros.insert(z);
-        A { c: v, l: vec![z; self.n], e: z }
+        A::plain(v, vec![z; self.n], z)
     }
 
     /// Whether `a` is exactly its centre (`exact`'s): a scaling or a shift by it, not a product
     /// or a sum of forms.
     fn is_exact(&self, a: &A) -> bool {
-        self.zeros.contains(&a.e) && a.l.iter().all(|x| *x == a.e)
+        a.s.is_empty()
+            && a.bounds.is_none()
+            && self.zeros.contains(&a.e)
+            && a.l.iter().all(|x| *x == a.e)
     }
 
     /// The empty form (its range runs from `BIG` down to `-BIG`): the hull's identity.
     fn empty(&mut self, out: &mut Block, ty: TypeId) -> A {
         let z = self.zero(out, ty);
         let e = self.k(out, ty, -BIG);
-        A { c: z, l: vec![z; self.n], e }
+        A::plain(z, vec![z; self.n], e)
     }
 
-    /// `v`'s form: an active value's, or an inactive one's, exactly.
+    /// Folds any shared nonlinear symbols `s` into the lumped error `e` (and clears branch bounds),
+    /// for storage, calls, returns, and nonlinear operations that do not preserve `s`.
+    fn compact(&mut self, out: &mut Block, a: &A, ty: TypeId) -> A {
+        if a.s.is_empty() {
+            return A::plain(a.c, a.l.clone(), a.e);
+        }
+        let mut e = a.e;
+        let mut s_sum = self.zero(out, ty);
+        for &(_, coeff) in &a.s {
+            let ac = self.builtin(out, Builtin::Abs, vec![coeff], ty);
+            s_sum = self.bin(out, BinOp::Add, s_sum, ac, ty);
+        }
+        e = self.bin(out, BinOp::Add, e, s_sum, ty);
+        // Rounding of summing `a.s.len()` magnitudes into `e`.
+        let k = self.k(out, ty, (a.s.len() as f64 + 1.0) * EPS);
+        let pad = self.bin(out, BinOp::Mul, e, k, ty);
+        let t = self.k(out, ty, self.tiny());
+        let pad = self.bin(out, BinOp::Add, pad, t, ty);
+        let e = self.bin(out, BinOp::Add, e, pad, ty);
+        let big = self.k(out, ty, BIG);
+        let e = self.builtin(out, Builtin::Min, vec![e, big], ty);
+        A::plain(a.c, a.l.clone(), e)
+    }
+
+    /// Sum of magnitudes of extra noise symbols `s`, plus `a.e`: the total non-box residual bound.
+    fn non_box_err(&mut self, out: &mut Block, a: &A, ty: TypeId) -> ValueId {
+        let mut r = a.e;
+        for &(_, coeff) in &a.s {
+            let ac = self.builtin(out, Builtin::Abs, vec![coeff], ty);
+            r = self.bin(out, BinOp::Add, r, ac, ty);
+        }
+        r
+    }
+
+    /// `v`'s form: an active value's (with any active branch-narrowed bounds attached), or an
+    /// inactive one's, exactly.
     fn of(&mut self, out: &mut Block, v: ValueId) -> A {
-        match self.forms.get(&v) {
+        let mut a = match self.forms.get(&v) {
             Some(a) => a.clone(),
             None => self.exact(out, v),
+        };
+        if let Some(&nb) = self.narrow.get(&v) {
+            a.bounds = Some(nb);
         }
+        a
     }
 
     /// `v`'s form as `ty` (a scalar splat to a vector, where an operation mixes them).
@@ -525,8 +879,12 @@ impl Af<'_> {
         }
         let c = self.coerce(out, a.c, ty);
         let l = (0..self.n).map(|i| self.coerce(out, a.l[i], ty)).collect();
+        let s = a.s.iter().map(|&(id, v)| (id, self.coerce(out, v, ty))).collect();
         let e = self.coerce(out, a.e, ty);
-        A { c, l, e }
+        let bounds = a.bounds.map(|(lo, hi)| {
+            (lo.map(|x| self.coerce(out, x, ty)), hi.map(|x| self.coerce(out, x, ty)))
+        });
+        A { c, l, s, e, bounds }
     }
 
     /// What a box makes `v`, a bool: an active one's certainty, an inactive one's value.
@@ -539,11 +897,15 @@ impl Af<'_> {
         (v, not)
     }
 
-    /// Σ|lᵢ| + err.
+    /// Σ|lᵢ| + Σ|sₖ| + err.
     fn rad(&mut self, out: &mut Block, a: &A, ty: TypeId) -> ValueId {
         let mut r = a.e;
         for i in 0..self.n {
             let x = self.builtin(out, Builtin::Abs, vec![a.l[i]], ty);
+            r = self.bin(out, BinOp::Add, r, x, ty);
+        }
+        for &(_, coeff) in &a.s {
+            let x = self.builtin(out, Builtin::Abs, vec![coeff], ty);
             r = self.bin(out, BinOp::Add, r, x, ty);
         }
         r
@@ -556,18 +918,32 @@ impl Af<'_> {
         self.bin(out, BinOp::Add, ac, r, ty)
     }
 
-    /// The least and the most its values can be, each rounded outward.
+    /// The least and the most its values can be, each rounded outward (intersected with any
+    /// active branch-narrowing bounds on `a`).
     fn ends(&mut self, out: &mut Block, a: &A, ty: TypeId) -> (ValueId, ValueId) {
+        if self.is_exact(a) {
+            return (a.c, a.c);
+        }
         let r = self.rad(out, a, ty);
         let ac = self.builtin(out, Builtin::Abs, vec![a.c], ty);
         let m = self.bin(out, BinOp::Add, ac, r, ty);
-        let k = self.k(out, ty, (self.n as f64 + 3.0) * EPS);
+        let k = self.k(out, ty, (self.n as f64 + a.s.len() as f64 + 3.0) * EPS);
         let g = self.bin(out, BinOp::Mul, m, k, ty);
         let t = self.k(out, ty, self.tiny());
         let g = self.bin(out, BinOp::Add, g, t, ty);
         let r = self.bin(out, BinOp::Add, r, g, ty);
-        let lo = self.bin(out, BinOp::Sub, a.c, r, ty);
-        let hi = self.bin(out, BinOp::Add, a.c, r, ty);
+        let mut lo = self.bin(out, BinOp::Sub, a.c, r, ty);
+        let mut hi = self.bin(out, BinOp::Add, a.c, r, ty);
+        if let Some((nlo, nhi)) = a.bounds {
+            if let Some(bl) = nlo {
+                lo = self.builtin(out, Builtin::Max, vec![lo, bl], ty);
+                hi = self.builtin(out, Builtin::Max, vec![hi, lo], ty);
+            }
+            if let Some(bh) = nhi {
+                hi = self.builtin(out, Builtin::Min, vec![hi, bh], ty);
+                lo = self.builtin(out, Builtin::Min, vec![lo, hi], ty);
+            }
+        }
         (lo, hi)
     }
 
@@ -581,18 +957,23 @@ impl Af<'_> {
         ulps: (f64, f64),
         extra: Option<ValueId>,
     ) -> A {
-        let m = self.magnitude(out, &a, ty);
-        let k = self.k(out, ty, self.ulps(ulps));
-        let g = self.bin(out, BinOp::Mul, m, k, ty);
+        let u = self.ulps(ulps);
         let t = self.k(out, ty, self.tiny());
-        let g = self.bin(out, BinOp::Add, g, t, ty);
+        let g = if u == 0.0 {
+            t
+        } else {
+            let m = self.magnitude(out, &a, ty);
+            let k = self.k(out, ty, u);
+            let g = self.bin(out, BinOp::Mul, m, k, ty);
+            self.bin(out, BinOp::Add, g, t, ty)
+        };
         let mut e = self.bin(out, BinOp::Add, a.e, g, ty);
         if let Some(x) = extra {
             e = self.bin(out, BinOp::Add, e, x, ty);
         }
         let big = self.k(out, ty, BIG);
         let e = self.builtin(out, Builtin::Min, vec![e, big], ty);
-        A { c: a.c, l: a.l, e }
+        A { c: a.c, l: a.l, s: a.s, e, bounds: None }
     }
 
     fn rounded(&mut self, out: &mut Block, a: A, ty: TypeId, ulps: (f64, f64)) -> A {
@@ -611,7 +992,30 @@ impl Af<'_> {
         let c = self.bin(out, BinOp::Add, hl, hh, ty);
         let e = self.bin(out, BinOp::Sub, hh, hl, ty);
         let z = self.zero(out, ty);
-        self.rounded(out, A { c, l: vec![z; self.n], e }, ty, (2.0, 2.0))
+        self.rounded(out, A::plain(c, vec![z; self.n], e), ty, (2.0, 2.0))
+    }
+
+    /// Exact-constant-when-equal form for monotone step/integer-valued functions (`floor`, `ceil`,
+    /// `round`, `trunc`, `sign`, `step`): when `fl == fh`, returns `{ c: fl, l: 0, e: 0 }` with
+    /// zero spurious rounding error; otherwise `of_ends(fl, fh)`.
+    fn of_monotone_ends(&mut self, out: &mut Block, fl: ValueId, fh: ValueId, ty: TypeId) -> A {
+        let range = self.of_ends(out, fl, fh, ty);
+        if self.width(ty).is_some() {
+            // Componentwise exact check so vector `floor`/`round` keeps exact components.
+            let k = self.width(ty).unwrap();
+            let f = self.m.types.f32();
+            let mut parts = Vec::with_capacity(k as usize);
+            for j in 0..k as u32 {
+                let flj = self.emit(out, f, Expr::Extract(fl, j));
+                let fhj = self.emit(out, f, Expr::Extract(fh, j));
+                parts.push(self.of_monotone_ends(out, flj, fhj, f));
+            }
+            return self.gather(out, &parts, ty);
+        }
+        let eq = self.cmp(out, BinOp::Eq, fl, fh);
+        let z = self.zero(out, ty);
+        let exact = A::plain(fl, vec![z; self.n], z);
+        self.pick(out, eq, &exact, &range)
     }
 
     fn add(&mut self, out: &mut Block, a: &A, b: &A, ty: TypeId, sub: bool) -> A {
@@ -620,50 +1024,218 @@ impl Af<'_> {
             // A shift: only the centre moves (and rounds, as the point code's sum does).
             let (x, k) = if self.is_exact(b) { (a, b.c) } else { (b, a.c) };
             let c = self.bin(out, op, x.c, k, ty);
-            let r = A { c, l: x.l.clone(), e: x.e };
-            return self.rounded(out, r, ty, (1.125, 1.125));
+            let r = A { c, l: x.l.clone(), s: x.s.clone(), e: x.e, bounds: None };
+            let mut r = self.rounded(out, r, ty, (1.125, 1.125));
+            if let Some((bl, bh)) = x.bounds {
+                let ak = self.builtin(out, Builtin::Abs, vec![k], ty);
+                let eps2 = self.k(out, ty, 2.0 * EPS);
+                let tv = self.k(out, ty, self.tiny());
+                let nlo = bl.map(|lo| {
+                    let s = self.bin(out, op, lo, k, ty);
+                    let alo = self.builtin(out, Builtin::Abs, vec![lo], ty);
+                    let mag = self.bin(out, BinOp::Add, alo, ak, ty);
+                    let m = self.bin(out, BinOp::Mul, mag, eps2, ty);
+                    let m = self.bin(out, BinOp::Add, m, tv, ty);
+                    self.bin(out, BinOp::Sub, s, m, ty)
+                });
+                let nhi = bh.map(|hi| {
+                    let s = self.bin(out, op, hi, k, ty);
+                    let ahi = self.builtin(out, Builtin::Abs, vec![hi], ty);
+                    let mag = self.bin(out, BinOp::Add, ahi, ak, ty);
+                    let m = self.bin(out, BinOp::Mul, mag, eps2, ty);
+                    let m = self.bin(out, BinOp::Add, m, tv, ty);
+                    self.bin(out, BinOp::Add, s, m, ty)
+                });
+                r.bounds = Some((nlo, nhi));
+            }
+            return r;
         }
         if self.is_exact(a) {
             // k - b: -b shifted.
             let nb = self.neg(out, b, ty);
             let c = self.bin(out, BinOp::Sub, a.c, b.c, ty);
-            let r = A { c, l: nb.l, e: b.e };
+            let r = A { c, l: nb.l, s: nb.s, e: b.e, bounds: None };
             return self.rounded(out, r, ty, (1.125, 1.125));
         }
         let c = self.bin(out, op, a.c, b.c, ty);
         let l = (0..self.n).map(|i| self.bin(out, op, a.l[i], b.l[i], ty)).collect();
+        let mut s = Vec::new();
+        let mut cancel_mag: Option<ValueId> = None;
+        let (mut ia, mut ib) = (0usize, 0usize);
+        while ia < a.s.len() || ib < b.s.len() {
+            match (a.s.get(ia), b.s.get(ib)) {
+                (Some(&(sa, va)), Some(&(sb, vb))) if sa == sb => {
+                    let sum = self.bin(out, op, va, vb, ty);
+                    s.push((sa, sum));
+                    // Rounding of cancelling terms is bounded by `EPS * (|va| + |vb|)`.
+                    let ava = self.builtin(out, Builtin::Abs, vec![va], ty);
+                    let avb = self.builtin(out, Builtin::Abs, vec![vb], ty);
+                    let cm = self.bin(out, BinOp::Add, ava, avb, ty);
+                    cancel_mag = Some(match cancel_mag {
+                        Some(prev) => self.bin(out, BinOp::Add, prev, cm, ty),
+                        None => cm,
+                    });
+                    ia += 1;
+                    ib += 1;
+                }
+                (Some(&(sa, va)), Some(&(sb, _))) if sa < sb => {
+                    s.push((sa, va));
+                    ia += 1;
+                }
+                (Some(&(sa, va)), None) => {
+                    s.push((sa, va));
+                    ia += 1;
+                }
+                (_, Some(&(sb, vb))) => {
+                    let v = if sub { self.emit(out, ty, Expr::Unary(UnOp::Neg, vb)) } else { vb };
+                    s.push((sb, v));
+                    ib += 1;
+                }
+                (None, None) => break,
+            }
+        }
         let e = self.bin(out, BinOp::Add, a.e, b.e, ty);
+        let extra = cancel_mag.map(|cm| {
+            let k = self.k(out, ty, EPS);
+            self.bin(out, BinOp::Mul, cm, k, ty)
+        });
         // Half an ulp each for the form's parts' sums, and half for the point code's sum, of the
         // result's magnitude (WGSL's sums are correctly rounded too), and an eighth for the
         // magnitude's own rounding.
-        self.rounded(out, A { c, l, e }, ty, (1.125, 1.125))
+        let mut r = self.grown(out, A { c, l, s, e, bounds: None }, ty, (1.125, 1.125), extra);
+        if !sub {
+            if let (Some((la, ha)), Some((lb, hb))) = (a.bounds, b.bounds) {
+                let eps2 = self.k(out, ty, 2.0 * EPS);
+                let tv = self.k(out, ty, self.tiny());
+                let nlo = match (la, lb) {
+                    (Some(u), Some(v)) => {
+                        let s = self.bin(out, BinOp::Add, u, v, ty);
+                        let au = self.builtin(out, Builtin::Abs, vec![u], ty);
+                        let av = self.builtin(out, Builtin::Abs, vec![v], ty);
+                        let mag = self.bin(out, BinOp::Add, au, av, ty);
+                        let m = self.bin(out, BinOp::Mul, mag, eps2, ty);
+                        let m = self.bin(out, BinOp::Add, m, tv, ty);
+                        Some(self.bin(out, BinOp::Sub, s, m, ty))
+                    }
+                    _ => None,
+                };
+                let nhi = match (ha, hb) {
+                    (Some(u), Some(v)) => {
+                        let s = self.bin(out, BinOp::Add, u, v, ty);
+                        let au = self.builtin(out, Builtin::Abs, vec![u], ty);
+                        let av = self.builtin(out, Builtin::Abs, vec![v], ty);
+                        let mag = self.bin(out, BinOp::Add, au, av, ty);
+                        let m = self.bin(out, BinOp::Mul, mag, eps2, ty);
+                        let m = self.bin(out, BinOp::Add, m, tv, ty);
+                        Some(self.bin(out, BinOp::Add, s, m, ty))
+                    }
+                    _ => None,
+                };
+                if nlo.is_some() || nhi.is_some() {
+                    r.bounds = Some((nlo, nhi));
+                }
+            }
+        }
+        r
     }
 
     fn neg(&mut self, out: &mut Block, a: &A, ty: TypeId) -> A {
         let c = self.emit(out, ty, Expr::Unary(UnOp::Neg, a.c));
         let l = (0..self.n).map(|i| self.emit(out, ty, Expr::Unary(UnOp::Neg, a.l[i]))).collect();
-        A { c, l, e: a.e }
+        let s =
+            a.s.iter()
+                .map(|&(id, v)| (id, self.emit(out, ty, Expr::Unary(UnOp::Neg, v))))
+                .collect();
+        A { c, l, s, e: a.e, bounds: None }
     }
 
     /// `a × k`, `k` inactive (of `ty`).
     fn scale(&mut self, out: &mut Block, a: &A, k: ValueId, ty: TypeId) -> A {
         let c = self.bin(out, BinOp::Mul, a.c, k, ty);
         let l = (0..self.n).map(|i| self.bin(out, BinOp::Mul, a.l[i], k, ty)).collect();
+        let s = a.s.iter().map(|&(id, v)| (id, self.bin(out, BinOp::Mul, v, k, ty))).collect();
         let ak = self.builtin(out, Builtin::Abs, vec![k], ty);
         let e = self.bin(out, BinOp::Mul, a.e, ak, ty);
         // As a sum: half an ulp for the parts' products, half for the point code's.
-        self.rounded(out, A { c, l, e }, ty, (1.125, 1.125))
+        self.rounded(out, A { c, l, s, e, bounds: None }, ty, (1.125, 1.125))
     }
 
     /// `a ÷ k`, `k` inactive.
     fn divide(&mut self, out: &mut Block, a: &A, k: ValueId, ty: TypeId) -> A {
         let c = self.bin(out, BinOp::Div, a.c, k, ty);
         let l = (0..self.n).map(|i| self.bin(out, BinOp::Div, a.l[i], k, ty)).collect();
+        let s = a.s.iter().map(|&(id, v)| (id, self.bin(out, BinOp::Div, v, k, ty))).collect();
         let ak = self.builtin(out, Builtin::Abs, vec![k], ty);
         let e = self.bin(out, BinOp::Div, a.e, ak, ty);
         // WASM's division is correctly rounded; WGSL's within 2.5 ulp, the parts' and the
         // point code's each.
-        self.rounded(out, A { c, l, e }, ty, (1.125, 5.25))
+        self.rounded(out, A { c, l, s, e, bounds: None }, ty, (1.125, 5.25))
+    }
+
+    /// `a²`: tighter than `mul(a, a)` because `δ² ∈ [0, rad²]` has midpoint `+0.5 rad²` and
+    /// half the nonlinear error (`0.5 rad²`), plus exact nonnegative `[sq_lo, sq_hi]` bounds.
+    fn sqr(&mut self, out: &mut Block, a: &A, ty: TypeId) -> A {
+        let a = self.compact(out, a, ty);
+        let (a, ok) = self.held(out, &a, ty);
+        let (alo, ahi) = self.ends(out, &a, ty);
+        let ra = self.rad(out, &a, ty);
+        let cap = self.k(out, ty, CAP);
+        let ra = self.builtin(out, Builtin::Min, vec![ra, cap], ty);
+        let ra2 = self.bin(out, BinOp::Mul, ra, ra, ty);
+        let half = self.k(out, ty, 0.5);
+        let half_ra2 = self.bin(out, BinOp::Mul, half, ra2, ty);
+        let c2 = self.bin(out, BinOp::Mul, a.c, a.c, ty);
+        let c = self.bin(out, BinOp::Add, c2, half_ra2, ty);
+        let two = self.k(out, ty, 2.0);
+        let two_c = self.bin(out, BinOp::Mul, two, a.c, ty);
+        let l: Vec<ValueId> =
+            (0..self.n).map(|i| self.bin(out, BinOp::Mul, two_c, a.l[i], ty)).collect();
+        let aca = self.builtin(out, Builtin::Abs, vec![a.c], ty);
+        let ae = self.builtin(out, Builtin::Min, vec![a.e, cap], ty);
+        let two_aca = self.bin(out, BinOp::Mul, two, aca, ty);
+        let e1 = self.bin(out, BinOp::Mul, two_aca, ae, ty);
+        let e = self.bin(out, BinOp::Add, e1, half_ra2, ty);
+        // Rounding margin matching `mul` plus 1 ulp for `c² + 0.5 rad²`.
+        let cc = self.bin(out, BinOp::Mul, aca, aca, ty);
+        let xy = self.bin(out, BinOp::Mul, two_aca, ra, ty);
+        let k3 = self.k(out, ty, 3.0 * U);
+        let k4 = self.k(out, ty, 4.0 * U);
+        let kn = self.k(out, ty, (self.n as f64 + 6.0) * U);
+        let m1 = self.bin(out, BinOp::Mul, cc, k3, ty);
+        let m2 = self.bin(out, BinOp::Mul, xy, k4, ty);
+        let m3 = self.bin(out, BinOp::Mul, ra2, kn, ty);
+        let m = self.bin(out, BinOp::Add, m1, m2, ty);
+        let m = self.bin(out, BinOp::Add, m, m3, ty);
+        let k = self.k(out, ty, 1.0 + 2.0 * EPS);
+        let m = self.bin(out, BinOp::Mul, m, k, ty);
+        let r = self.grown(out, A::plain(c, l, e), ty, (0.0, 0.0), Some(m));
+        let every = self.every(out, ty);
+        let mut r = self.pick(out, ok, &r, &every);
+        // Exact nonnegative interval `[sq_lo, sq_hi]` from `[alo, ahi]`:
+        // `min_abs = max(max(alo, -ahi), 0)` is 0 iff `0 ∈ [alo, ahi]`.
+        let zero = self.k(out, ty, 0.0);
+        let neg_hi = self.emit(out, ty, Expr::Unary(UnOp::Neg, ahi));
+        let ma0 = self.builtin(out, Builtin::Max, vec![alo, neg_hi], ty);
+        let min_abs = self.builtin(out, Builtin::Max, vec![ma0, zero], ty);
+        let a_lo = self.builtin(out, Builtin::Abs, vec![alo], ty);
+        let a_hi = self.builtin(out, Builtin::Abs, vec![ahi], ty);
+        let max_abs = self.builtin(out, Builtin::Max, vec![a_lo, a_hi], ty);
+        let dn = self.k(out, ty, 1.0 - 4.0 * EPS);
+        let up = self.k(out, ty, 1.0 + 4.0 * EPS);
+        let tv = self.k(out, ty, self.tiny());
+        let lo2 = self.bin(out, BinOp::Mul, min_abs, min_abs, ty);
+        let lo2 = self.bin(out, BinOp::Mul, lo2, dn, ty);
+        let lo2 = self.bin(out, BinOp::Sub, lo2, tv, ty);
+        let sq_lo = self.builtin(out, Builtin::Max, vec![lo2, zero], ty);
+        let hi2 = self.bin(out, BinOp::Mul, max_abs, max_abs, ty);
+        let hi2 = self.bin(out, BinOp::Mul, hi2, up, ty);
+        let sq_hi = self.bin(out, BinOp::Add, hi2, tv, ty);
+        let neg_big = self.k(out, ty, -BIG);
+        let pos_big = self.k(out, ty, BIG);
+        let bl = self.sel(out, ok, sq_lo, neg_big);
+        let bh = self.sel(out, ok, sq_hi, pos_big);
+        r.bounds = Some((Some(bl), Some(bh)));
+        r
     }
 
     /// `a × b`: `a.c b.c + a.c b.l + b.c a.l`, and in `err` each error through the other's
@@ -675,8 +1247,13 @@ impl Af<'_> {
         if self.is_exact(a) {
             return self.scale(out, b, a.c, ty);
         }
-        let (a, oka) = self.held(out, a, ty);
-        let (b, okb) = self.held(out, b, ty);
+        if a.c == b.c && a.l == b.l && a.s == b.s && a.e == b.e {
+            return self.sqr(out, a, ty);
+        }
+        let a = self.compact(out, a, ty);
+        let b = self.compact(out, b, ty);
+        let (a, oka) = self.held(out, &a, ty);
+        let (b, okb) = self.held(out, &b, ty);
         let (a, b) = (&a, &b);
         let c = self.bin(out, BinOp::Mul, a.c, b.c, ty);
         let mut l = Vec::new();
@@ -693,8 +1270,10 @@ impl Af<'_> {
         let cross = self.bin(out, BinOp::Mul, ra, rb, ty);
         let aca = self.builtin(out, Builtin::Abs, vec![a.c], ty);
         let acb = self.builtin(out, Builtin::Abs, vec![b.c], ty);
-        let ea = self.bin(out, BinOp::Mul, acb, a.e, ty);
-        let eb = self.bin(out, BinOp::Mul, aca, b.e, ty);
+        let ae = self.builtin(out, Builtin::Min, vec![a.e, cap], ty);
+        let be = self.builtin(out, Builtin::Min, vec![b.e, cap], ty);
+        let ea = self.bin(out, BinOp::Mul, acb, ae, ty);
+        let eb = self.bin(out, BinOp::Mul, aca, be, ty);
         let e = self.bin(out, BinOp::Add, ea, eb, ty);
         let e = self.bin(out, BinOp::Add, e, cross, ty);
         // Rounding, in units of u = 2⁻²⁴, by the operands' own parts rather than the result's
@@ -718,7 +1297,7 @@ impl Af<'_> {
         // And the margin's own rounding: an ulp of it.
         let k = self.k(out, ty, 1.0 + 2.0 * EPS);
         let m = self.bin(out, BinOp::Mul, m, k, ty);
-        let r = self.grown(out, A { c, l, e }, ty, (0.0, 0.0), Some(m));
+        let r = self.grown(out, A::plain(c, l, e), ty, (0.0, 0.0), Some(m));
         // An operand past `CAP` (every number) makes every number of the product: its radius
         // was held to `CAP` above only to keep the arithmetic finite, which bounds nothing.
         let bt = self.bool_ty;
@@ -773,14 +1352,22 @@ impl Af<'_> {
         }
         let Some(ok) = ok else { return r };
         let every = self.every(out, ty);
-        self.pick(out, ok, &r, &every)
+        let mut res = self.pick(out, ok, &r, &every);
+        if let Some((bl, bh)) = r.bounds {
+            let nbig = self.k(out, ty, -BIG);
+            let big = self.k(out, ty, BIG);
+            let nlo = bl.map(|v| self.sel(out, ok, v, nbig));
+            let nhi = bh.map(|v| self.sel(out, ok, v, big));
+            res.bounds = Some((nlo, nhi));
+        }
+        res
     }
 
     /// Every number: centre 0, error `BIG`.
     fn every(&mut self, out: &mut Block, ty: TypeId) -> A {
         let z = self.zero(out, ty);
         let big = self.k(out, ty, BIG);
-        A { c: z, l: vec![z; self.n], e: big }
+        A::plain(z, vec![z; self.n], big)
     }
 
     /// A function of `a` that is convex or concave on `a`'s range `[lo, hi]`, as the line
@@ -819,6 +1406,7 @@ impl Af<'_> {
         let ac = self.bin(out, BinOp::Mul, a.c, alpha, ty);
         let c = self.bin(out, BinOp::Add, ac, zeta, ty);
         let l = (0..self.n).map(|i| self.bin(out, BinOp::Mul, a.l[i], alpha, ty)).collect();
+        let s = a.s.iter().map(|&(id, v)| (id, self.bin(out, BinOp::Mul, v, alpha, ty))).collect();
         let aa = self.builtin(out, Builtin::Abs, vec![alpha], ty);
         let e = self.bin(out, BinOp::Mul, a.e, aa, ty);
         let e = self.bin(out, BinOp::Add, e, delta, ty);
@@ -835,7 +1423,13 @@ impl Af<'_> {
         // point code's (kf more, counted with them), the line's products `alpha x` and sums
         // (`kf + 3` ulps of `|alpha| max(|lo|, |hi|)`, above), and its centre, slopes and error
         // (2 more ulps of `M`, and half for the margin's own).
-        self.grown(out, A { c, l, e }, ty, (2.0 * cpu + 2.5, 2.0 * gpu + 2.5), Some(am))
+        self.grown(
+            out,
+            A { c, l, s, e, bounds: None },
+            ty,
+            (2.0 * cpu + 2.5, 2.0 * gpu + 2.5),
+            Some(am),
+        )
     }
 
     /// The slope between `(lo, f(lo))` and `(hi, f(hi))` (`hi > lo` always: the ends are
@@ -888,6 +1482,7 @@ impl Af<'_> {
         if let Some(r) = r {
             return r;
         }
+        let a = self.compact(out, a, ty);
         let (f, df) = if cos {
             let c = self.builtin(out, Builtin::Cos, vec![a.c], ty);
             let sn = self.builtin(out, Builtin::Sin, vec![a.c], ty);
@@ -901,7 +1496,7 @@ impl Af<'_> {
         let l = (0..self.n).map(|i| self.bin(out, BinOp::Mul, df, a.l[i], ty)).collect();
         let adf = self.builtin(out, Builtin::Abs, vec![df], ty);
         let e = self.bin(out, BinOp::Mul, adf, a.e, ty);
-        let r = self.rad(out, a, ty);
+        let r = self.rad(out, &a, ty);
         let r2 = self.bin(out, BinOp::Mul, r, r, ty);
         let half = self.k(out, ty, 0.5);
         let rem = self.bin(out, BinOp::Mul, r2, half, ty);
@@ -909,12 +1504,12 @@ impl Af<'_> {
         // range's.
         let abs_err = self.k(out, ty, if self.gpu() { (2f64).powi(-11) } else { 0.0 });
         let rem = self.bin(out, BinOp::Add, rem, abs_err, ty);
-        let form = self.grown(out, A { c: f, l, e }, ty, (4.0, 4.0), Some(rem));
+        let form = self.grown(out, A::plain(f, l, e), ty, (4.0, 4.0), Some(rem));
         let one = self.k(out, ty, 1.0);
         let none = self.k(out, ty, -1.0);
         let full = self.of_ends(out, none, one, ty);
         let bt = self.bool_ty;
-        let fine = self.within(out, a);
+        let fine = self.within(out, &a);
         let lim = self.k(out, ty, std::f64::consts::PI);
         let ac = self.builtin(out, Builtin::Abs, vec![a.c], ty);
         let reach = self.bin(out, BinOp::Add, ac, r, ty);
@@ -940,6 +1535,9 @@ impl Af<'_> {
         {
             return r;
         }
+        let y = self.compact(out, y, ty);
+        let x = self.compact(out, x, ty);
+        let (y, x) = (&y, &x);
         let ry = self.rad(out, y, ty);
         let rx = self.rad(out, x, ty);
         let z = self.k(out, ty, 0.0);
@@ -986,7 +1584,7 @@ impl Af<'_> {
         // The partials' own rounding, and WGSL's atan2 (within 4096 ulps of pi, and 2^-20).
         let abs_err = self.k(out, ty, if self.gpu() { (2f64).powi(-20) } else { 0.0 });
         let rem = self.bin(out, BinOp::Add, rem, abs_err, ty);
-        let form = self.grown(out, A { c, l, e }, ty, (8.0, 8192.0), Some(rem));
+        let form = self.grown(out, A::plain(c, l, e), ty, (8.0, 8192.0), Some(rem));
         // The cut: x reaching zero or below while y spans zero (which the origin also needs).
         let bt = self.bool_ty;
         let xlo = self.bin(out, BinOp::Sub, x.c, rx, ty);
@@ -1003,6 +1601,420 @@ impl Af<'_> {
         let not_cut = self.emit(out, bt, Expr::Unary(UnOp::Not, cut));
         let ok = self.emit(out, bt, Expr::Binary(BinOp::And, ok, not_cut));
         self.pick(out, ok, &form, &full)
+    }
+
+    /// `log(a)` (`base2 == false`) or `log2(a)` (`base2 == true`): strictly concave on `(0, ∞)`,
+    /// Chebyshev linearization with `f'(xs) = alpha`. Unbounded if `lo <= 1e-37`.
+    fn log(&mut self, out: &mut Block, a: &A, ty: TypeId, base2: bool) -> A {
+        let r = if base2 {
+            self.per_comp(out, &[a], ty, |s, out, x, t| s.log(out, &x[0], t, true))
+        } else {
+            self.per_comp(out, &[a], ty, |s, out, x, t| s.log(out, &x[0], t, false))
+        };
+        if let Some(r) = r {
+            return r;
+        }
+        let (lo0, hi0) = self.ends(out, a, ty);
+        let tiny_pos = self.k(out, ty, 1.0e-37);
+        let ok = self.cmp(out, BinOp::Gt, lo0, tiny_pos);
+        let one = self.k(out, ty, 1.0);
+        let two = self.k(out, ty, 2.0);
+        let lo = self.sel(out, ok, lo0, one);
+        let hi = self.sel(out, ok, hi0, two);
+        let hi = self.builtin(out, Builtin::Max, vec![hi, lo], ty);
+        let b_op = if base2 { Builtin::Log2 } else { Builtin::Log };
+        let fl = self.builtin(out, b_op, vec![lo], ty);
+        let fh = self.builtin(out, b_op, vec![hi], ty);
+        let alpha = self.slope(out, (lo, hi), (fl, fh), ty);
+        // Concave: `f'(xs) = 1 / (xs * scale) = alpha` => `xs = 1 / (alpha * scale)`.
+        let scale = self.k(out, ty, if base2 { std::f64::consts::LN_2 } else { 1.0 });
+        let den = self.bin(out, BinOp::Mul, alpha, scale, ty);
+        let t = self.k(out, ty, 1.0e-37);
+        let den = self.builtin(out, Builtin::Max, vec![den, t], ty);
+        let xs = self.bin(out, BinOp::Div, one, den, ty);
+        let mut f = |s: &mut Self, out: &mut Block, x: ValueId| s.builtin(out, b_op, vec![x], ty);
+        let r = self.chebyshev(out, a, (lo, hi), alpha, xs, &mut f, ty, (4.0, 6.0));
+        // WGSL: 2^-21 absolute on [0.5, 2.0], 3 ulp elsewhere.
+        let abs_err = self.k(out, ty, if self.gpu() { (2f64).powi(-20) } else { 0.0 });
+        let r = self.grown(out, r, ty, (0.0, 0.0), Some(abs_err));
+        let every = self.every(out, ty);
+        self.pick(out, ok, &r, &every)
+    }
+
+    /// `exp2(a)`: strictly convex, identical to `exp` with `ln(2)` scaling.
+    fn exp2(&mut self, out: &mut Block, a: &A, ty: TypeId) -> A {
+        if let Some(r) = self.per_comp(out, &[a], ty, |s, out, x, t| s.exp2(out, &x[0], t)) {
+            return r;
+        }
+        let (lo0, hi0) = self.ends(out, a, ty);
+        let floor = self.k(out, ty, -120.0);
+        let ceil = self.k(out, ty, 115.0);
+        let lo = self.builtin(out, Builtin::Clamp, vec![lo0, floor, ceil], ty);
+        let hi = self.builtin(out, Builtin::Clamp, vec![hi0, lo, ceil], ty);
+        let fl = self.builtin(out, Builtin::Exp2, vec![lo], ty);
+        let fh = self.builtin(out, Builtin::Exp2, vec![hi], ty);
+        let alpha = self.slope(out, (lo, hi), (fl, fh), ty);
+        let inv_ln2 = self.k(out, ty, 1.0 / std::f64::consts::LN_2);
+        let al = self.bin(out, BinOp::Mul, alpha, inv_ln2, ty);
+        let t = self.k(out, ty, 1.0e-37);
+        let al = self.builtin(out, Builtin::Max, vec![al, t], ty);
+        let xs = self.builtin(out, Builtin::Log2, vec![al], ty);
+        let mut f =
+            |s: &mut Self, out: &mut Block, x: ValueId| s.builtin(out, Builtin::Exp2, vec![x], ty);
+        let r = self.chebyshev(out, a, (lo, hi), alpha, xs, &mut f, ty, (4.0, 3.0));
+        let below = self.bin(out, BinOp::Sub, lo, lo0, ty);
+        let drop = self.bin(out, BinOp::Mul, below, alpha, ty);
+        let drop = self.bin(out, BinOp::Add, drop, fl, ty);
+        let held = self.cmp(out, BinOp::Lt, lo0, floor);
+        let z = self.zero(out, ty);
+        let drop = self.sel(out, held, drop, z);
+        let r = self.grown(out, r, ty, (0.0, 0.0), Some(drop));
+        let fits = self.cmp(out, BinOp::Le, hi0, ceil);
+        let every = self.every(out, ty);
+        let r = self.pick(out, fits, &r, &every);
+        if !self.gpu() {
+            return r;
+        }
+        let al = self.builtin(out, Builtin::Abs, vec![lo], ty);
+        let ah = self.builtin(out, Builtin::Abs, vec![hi], ty);
+        let ax = self.builtin(out, Builtin::Max, vec![al, ah], ty);
+        let lim = self.k(out, ty, 200.0);
+        let ax = self.builtin(out, Builtin::Min, vec![ax, lim], ty);
+        let four = self.k(out, ty, 4.0 * EPS);
+        let six = self.k(out, ty, 6.0 * EPS);
+        let kx = self.bin(out, BinOp::Mul, ax, four, ty);
+        let kx = self.bin(out, BinOp::Add, kx, six, ty);
+        let m = self.magnitude(out, &r, ty);
+        let extra = self.bin(out, BinOp::Mul, m, kx, ty);
+        self.grown(out, r, ty, (0.0, 0.0), Some(extra))
+    }
+
+    /// `pow(a, b)` for inactive `b`: Chebyshev linearization on `a >= 0` (`b > 0`, convex for
+    /// `b >= 1`, concave for `0 < b < 1`) or `a > 0` (`b <= 0`, convex). For active `b` with
+    /// `a > 0`, reduces to `exp2(b * log2(a))`.
+    fn pow_const_exp(&mut self, out: &mut Block, a: &A, b_val: ValueId, ty: TypeId) -> A {
+        if let Some(k) = self.width(ty) {
+            let f = self.m.types.f32();
+            let comps = self.split(out, a, k);
+            let parts: Vec<A> = (0..k as usize)
+                .map(|j| {
+                    let bj = self.emit(out, f, Expr::Extract(b_val, j as u32));
+                    self.pow_const_exp(out, &comps[j], bj, f)
+                })
+                .collect();
+            return self.gather(out, &parts, ty);
+        }
+        let (lo0, hi0) = self.ends(out, a, ty);
+        let zero = self.k(out, ty, 0.0);
+        let one = self.k(out, ty, 1.0);
+        let two = self.k(out, ty, 2.0);
+        let tiny_pos = self.k(out, ty, 1.0e-37);
+        let bt = self.bool_ty;
+        let b_pos = self.cmp(out, BinOp::Gt, b_val, zero);
+        let b_zero = self.cmp(out, BinOp::Eq, b_val, zero);
+        let b_one = self.cmp(out, BinOp::Eq, b_val, one);
+        let b_neg = self.cmp(out, BinOp::Lt, b_val, zero);
+        let lo_ge0 = self.cmp(out, BinOp::Ge, lo0, zero);
+        let lo_gt0 = self.cmp(out, BinOp::Gt, lo0, tiny_pos);
+        // Valid domain: `lo >= 0` when `b > 0`, `lo > 0` when `b < 0`, any finite when `b == 0`.
+        let ok_pos = self.emit(out, bt, Expr::Binary(BinOp::And, b_pos, lo_ge0));
+        let ok_neg = self.emit(out, bt, Expr::Binary(BinOp::And, b_neg, lo_gt0));
+        let ok_dom = self.emit(out, bt, Expr::Binary(BinOp::Or, ok_pos, ok_neg));
+        let cap_b = self.k(out, ty, 64.0);
+        let ab = self.builtin(out, Builtin::Abs, vec![b_val], ty);
+        let b_sane = self.cmp(out, BinOp::Le, ab, cap_b);
+        let ok = self.emit(out, bt, Expr::Binary(BinOp::And, ok_dom, b_sane));
+        let lo = self.sel(out, ok, lo0, one);
+        let hi = self.sel(out, ok, hi0, two);
+        let hi = self.builtin(out, Builtin::Max, vec![hi, lo], ty);
+        let fl = self.builtin(out, Builtin::Pow, vec![lo, b_val], ty);
+        let fh = self.builtin(out, Builtin::Pow, vec![hi, b_val], ty);
+        let alpha = self.slope(out, (lo, hi), (fl, fh), ty);
+        // `b * xs^(b - 1) = alpha` => `xs = (alpha / b)^(1 / (b - 1))`.
+        let bm1 = self.bin(out, BinOp::Sub, b_val, one, ty);
+        let abm1 = self.builtin(out, Builtin::Abs, vec![bm1], ty);
+        let eps_b = self.k(out, ty, 1.0e-6);
+        let safe_bm1 = self.cmp(out, BinOp::Gt, abm1, eps_b);
+        let bm1_use = self.sel(out, safe_bm1, bm1, one);
+        let inv_bm1 = self.bin(out, BinOp::Div, one, bm1_use, ty);
+        let b_use = self.sel(out, ok, b_val, two);
+        let ratio = self.bin(out, BinOp::Div, alpha, b_use, ty);
+        let ratio = self.builtin(out, Builtin::Max, vec![ratio, tiny_pos], ty);
+        let xs_raw = self.builtin(out, Builtin::Pow, vec![ratio, inv_bm1], ty);
+        let xs = self.sel(out, safe_bm1, xs_raw, lo);
+        let mut f = |s: &mut Self, out: &mut Block, x: ValueId| {
+            s.builtin(out, Builtin::Pow, vec![x, b_use], ty)
+        };
+        let r = self.chebyshev(out, a, (lo, hi), alpha, xs, &mut f, ty, (8.0, 32.0));
+        // Guard against overflow in `fl`/`fh`/`r`.
+        let r_ok = self.within(out, &r);
+        let ok = self.emit(out, bt, Expr::Binary(BinOp::And, ok, r_ok));
+        let every = self.every(out, ty);
+        let r = self.pick(out, ok, &r, &every);
+        let one_form = self.exact(out, one);
+        let r = self.pick(out, b_one, a, &r);
+        self.pick(out, b_zero, &one_form, &r)
+    }
+
+    /// `fract(a)`: exact linear `a - floor(lo)` whenever `floor(lo) == floor(hi)` (single period),
+    /// otherwise `[0, 1]`. Preserves full slopes inside every repetition cell!
+    fn fract(&mut self, out: &mut Block, a: &A, ty: TypeId) -> A {
+        if let Some(r) = self.per_comp(out, &[a], ty, |s, out, x, t| s.fract(out, &x[0], t)) {
+            return r;
+        }
+        let (lo, hi) = self.ends(out, a, ty);
+        let fl = self.builtin(out, Builtin::Floor, vec![lo], ty);
+        let fh = self.builtin(out, Builtin::Floor, vec![hi], ty);
+        let same = self.cmp(out, BinOp::Eq, fl, fh);
+        let fine = self.within(out, a);
+        let bt = self.bool_ty;
+        let ok = self.emit(out, bt, Expr::Binary(BinOp::And, same, fine));
+        let fl_exact = self.exact(out, fl);
+        let shifted = self.add(out, a, &fl_exact, ty, true);
+        let zero = self.k(out, ty, 0.0);
+        let one = self.k(out, ty, 1.0);
+        let unit = self.of_ends(out, zero, one, ty);
+        self.pick(out, ok, &shifted, &unit)
+    }
+
+    /// `a % k` (WGSL `a - k * trunc(a / k)`) for inactive `k`: exact linear shift when `trunc(a / k)`
+    /// is constant across the box, otherwise `[-|k|, |k|]`.
+    fn rem_const(&mut self, out: &mut Block, a: &A, k: ValueId, ty: TypeId) -> A {
+        if let Some(w) = self.width(ty) {
+            let f = self.m.types.f32();
+            let comps = self.split(out, a, w);
+            let parts: Vec<A> = (0..w as usize)
+                .map(|j| {
+                    let kj = self.emit(out, f, Expr::Extract(k, j as u32));
+                    self.rem_const(out, &comps[j], kj, f)
+                })
+                .collect();
+            return self.gather(out, &parts, ty);
+        }
+        let ak = self.builtin(out, Builtin::Abs, vec![k], ty);
+        let tiny_pos = self.k(out, ty, 1.0e-37);
+        let nz = self.cmp(out, BinOp::Gt, ak, tiny_pos);
+        let one = self.k(out, ty, 1.0);
+        let k_safe = self.sel(out, nz, k, one);
+        let q = self.divide(out, a, k_safe, ty);
+        let (qlo, qhi) = self.ends(out, &q, ty);
+        let tl = self.builtin(out, Builtin::Trunc, vec![qlo], ty);
+        let th = self.builtin(out, Builtin::Trunc, vec![qhi], ty);
+        let same = self.cmp(out, BinOp::Eq, tl, th);
+        let fine = self.within(out, a);
+        let bt = self.bool_ty;
+        let ok = self.emit(out, bt, Expr::Binary(BinOp::And, same, fine));
+        let ok = self.emit(out, bt, Expr::Binary(BinOp::And, ok, nz));
+        let shift = self.bin(out, BinOp::Mul, k_safe, tl, ty);
+        let shift_f = self.exact(out, shift);
+        let linear = self.add(out, a, &shift_f, ty, true);
+        let nak = self.emit(out, ty, Expr::Unary(UnOp::Neg, ak));
+        let bounded = self.of_ends(out, nak, ak, ty);
+        let every = self.every(out, ty);
+        let fallback = self.pick(out, nz, &bounded, &every);
+        self.pick(out, ok, &linear, &fallback)
+    }
+
+    /// `atan(a)`: tangent at `a.c` with global `|f''| <= 3√3 / 8 < 0.65`, intersected against
+    /// `[atan(lo), atan(hi)]` (whichever is narrower).
+    fn atan(&mut self, out: &mut Block, a: &A, ty: TypeId) -> A {
+        if let Some(r) = self.per_comp(out, &[a], ty, |s, out, x, t| s.atan(out, &x[0], t)) {
+            return r;
+        }
+        let a = self.compact(out, a, ty);
+        let c = self.builtin(out, Builtin::Atan, vec![a.c], ty);
+        let one = self.k(out, ty, 1.0);
+        let c2 = self.bin(out, BinOp::Mul, a.c, a.c, ty);
+        let den = self.bin(out, BinOp::Add, one, c2, ty);
+        let df = self.bin(out, BinOp::Div, one, den, ty);
+        let l = (0..self.n).map(|i| self.bin(out, BinOp::Mul, df, a.l[i], ty)).collect();
+        let e = self.bin(out, BinOp::Mul, df, a.e, ty);
+        let r = self.rad(out, &a, ty);
+        let r2 = self.bin(out, BinOp::Mul, r, r, ty);
+        let k = self.k(out, ty, 0.325);
+        let rem = self.bin(out, BinOp::Mul, r2, k, ty);
+        let form = self.grown(out, A::plain(c, l, e), ty, (8.0, 16.0), Some(rem));
+        let (lo, hi) = self.ends(out, &a, ty);
+        let flo = self.builtin(out, Builtin::Atan, vec![lo], ty);
+        let fhi = self.builtin(out, Builtin::Atan, vec![hi], ty);
+        let mono = self.of_ends(out, flo, fhi, ty);
+        let (alo, ahi) = self.ends(out, &form, ty);
+        let aw = self.bin(out, BinOp::Sub, ahi, alo, ty);
+        let mw = self.bin(out, BinOp::Sub, fhi, flo, ty);
+        let bt = self.bool_ty;
+        let fine = self.within(out, &a);
+        let tighter = self.cmp(out, BinOp::Lt, aw, mw);
+        let ok = self.emit(out, bt, Expr::Binary(BinOp::And, fine, tighter));
+        self.pick(out, ok, &form, &mono)
+    }
+
+    /// `tan(a)`: tangent at `a.c` when `[lo, hi]` stays strictly inside one `(-π/2, π/2)` period
+    /// (modulo `π`) away from the asymptotes, with `|f''(x)| <= 2 |tan x| / cos²x` bounded at the
+    /// endpoints.
+    fn tan(&mut self, out: &mut Block, a: &A, ty: TypeId) -> A {
+        if let Some(r) = self.per_comp(out, &[a], ty, |s, out, x, t| s.tan(out, &x[0], t)) {
+            return r;
+        }
+        let a = self.compact(out, a, ty);
+        let (lo, hi) = self.ends(out, &a, ty);
+        let pi = self.k(out, ty, std::f64::consts::PI);
+        let hpi = self.k(out, ty, std::f64::consts::FRAC_PI_2);
+        let slo = self.bin(out, BinOp::Add, lo, hpi, ty);
+        let shi = self.bin(out, BinOp::Add, hi, hpi, ty);
+        let qlo = self.bin(out, BinOp::Div, slo, pi, ty);
+        let qhi = self.bin(out, BinOp::Div, shi, pi, ty);
+        let plo = self.builtin(out, Builtin::Floor, vec![qlo], ty);
+        let phi = self.builtin(out, Builtin::Floor, vec![qhi], ty);
+        let same_period = self.cmp(out, BinOp::Eq, plo, phi);
+        let cc = self.builtin(out, Builtin::Cos, vec![a.c], ty);
+        let cl = self.builtin(out, Builtin::Cos, vec![lo], ty);
+        let ch = self.builtin(out, Builtin::Cos, vec![hi], ty);
+        let acl = self.builtin(out, Builtin::Abs, vec![cl], ty);
+        let ach = self.builtin(out, Builtin::Abs, vec![ch], ty);
+        let acc = self.builtin(out, Builtin::Abs, vec![cc], ty);
+        let cmin = self.builtin(out, Builtin::Min, vec![acl, ach], ty);
+        let cmin = self.builtin(out, Builtin::Min, vec![cmin, acc], ty);
+        let margin = self.k(out, ty, 1.0e-2);
+        let away = self.cmp(out, BinOp::Gt, cmin, margin);
+        let bt = self.bool_ty;
+        let fine = self.within(out, &a);
+        let ok = self.emit(out, bt, Expr::Binary(BinOp::And, same_period, away));
+        let ok = self.emit(out, bt, Expr::Binary(BinOp::And, ok, fine));
+        let cmin_safe = self.builtin(out, Builtin::Max, vec![cmin, margin], ty);
+        let cmin2 = self.bin(out, BinOp::Mul, cmin_safe, cmin_safe, ty);
+        let cmin3 = self.bin(out, BinOp::Mul, cmin_safe, cmin2, ty);
+        let one = self.k(out, ty, 1.0);
+        let cc_safe = self.sel(out, ok, cc, one);
+        let cc2 = self.bin(out, BinOp::Mul, cc_safe, cc_safe, ty);
+        let df = self.bin(out, BinOp::Div, one, cc2, ty);
+        let c = self.builtin(out, Builtin::Tan, vec![a.c], ty);
+        let l = (0..self.n).map(|i| self.bin(out, BinOp::Mul, df, a.l[i], ty)).collect();
+        let e = self.bin(out, BinOp::Mul, df, a.e, ty);
+        // `|f''(x)| = 2 |sin x| / |cos x|^3 <= 2 / cmin^3`, so Taylor remainder `<= r^2 / cmin^3`.
+        let r = self.rad(out, &a, ty);
+        let r2 = self.bin(out, BinOp::Mul, r, r, ty);
+        let rem = self.bin(out, BinOp::Div, r2, cmin3, ty);
+        let form = self.grown(out, A::plain(c, l, e), ty, (8.0, 32.0), Some(rem));
+        let every = self.every(out, ty);
+        self.pick(out, ok, &form, &every)
+    }
+
+    /// `asin(a)` or `acos(a)`: tangent at `a.c` when `max(|lo|, |hi|) < 1 - 1e-3`, with
+    /// `|f''(x)| = |x| / (1 - x²)^(3/2)` bounded at `m = max(|lo|, |hi|)`; monotone endpoint fallback.
+    fn asin_acos(&mut self, out: &mut Block, a: &A, ty: TypeId, acos: bool) -> A {
+        let r = if acos {
+            self.per_comp(out, &[a], ty, |s, out, x, t| s.asin_acos(out, &x[0], t, true))
+        } else {
+            self.per_comp(out, &[a], ty, |s, out, x, t| s.asin_acos(out, &x[0], t, false))
+        };
+        if let Some(r) = r {
+            return r;
+        }
+        let a = self.compact(out, a, ty);
+        let (lo0, hi0) = self.ends(out, &a, ty);
+        let one = self.k(out, ty, 1.0);
+        let none = self.k(out, ty, -1.0);
+        let lo = self.builtin(out, Builtin::Clamp, vec![lo0, none, one], ty);
+        let hi = self.builtin(out, Builtin::Clamp, vec![hi0, lo, one], ty);
+        let al = self.builtin(out, Builtin::Abs, vec![lo], ty);
+        let ah = self.builtin(out, Builtin::Abs, vec![hi], ty);
+        let m = self.builtin(out, Builtin::Max, vec![al, ah], ty);
+        let lim = self.k(out, ty, 0.999);
+        let safe = self.cmp(out, BinOp::Le, m, lim);
+        let ac_clamped = self.builtin(out, Builtin::Clamp, vec![a.c, none, one], ty);
+        let b_op = if acos { Builtin::Acos } else { Builtin::Asin };
+        let c = self.builtin(out, b_op, vec![ac_clamped], ty);
+        let c2 = self.bin(out, BinOp::Mul, ac_clamped, ac_clamped, ty);
+        let omc2 = self.bin(out, BinOp::Sub, one, c2, ty);
+        let floor = self.k(out, ty, 1.0e-4);
+        let omc2 = self.builtin(out, Builtin::Max, vec![omc2, floor], ty);
+        let denom = self.builtin(out, Builtin::Sqrt, vec![omc2], ty);
+        let df_pos = self.bin(out, BinOp::Div, one, denom, ty);
+        let df = if acos { self.emit(out, ty, Expr::Unary(UnOp::Neg, df_pos)) } else { df_pos };
+        let l = (0..self.n).map(|i| self.bin(out, BinOp::Mul, df, a.l[i], ty)).collect();
+        let e = self.bin(out, BinOp::Mul, df_pos, a.e, ty);
+        let m2 = self.bin(out, BinOp::Mul, m, m, ty);
+        let omm2_raw = self.bin(out, BinOp::Sub, one, m2, ty);
+        let omm2 = self.builtin(out, Builtin::Max, vec![omm2_raw, floor], ty);
+        let omm2_sqrt = self.builtin(out, Builtin::Sqrt, vec![omm2], ty);
+        let omm2_32 = self.bin(out, BinOp::Mul, omm2, omm2_sqrt, ty);
+        let r = self.rad(out, &a, ty);
+        let r2 = self.bin(out, BinOp::Mul, r, r, ty);
+        let half = self.k(out, ty, 0.5);
+        let hm = self.bin(out, BinOp::Mul, half, m, ty);
+        let hmr2 = self.bin(out, BinOp::Mul, hm, r2, ty);
+        let rem = self.bin(out, BinOp::Div, hmr2, omm2_32, ty);
+        let form = self.grown(out, A::plain(c, l, e), ty, (8.0, 64.0), Some(rem));
+        let fl = self.builtin(out, b_op, vec![lo], ty);
+        let fh = self.builtin(out, b_op, vec![hi], ty);
+        let (mlo, mhi) = if acos { (fh, fl) } else { (fl, fh) };
+        let mono = self.of_ends(out, mlo, mhi, ty);
+        let mono = self.rounded(out, mono, ty, (4.0, 64.0));
+        let bt = self.bool_ty;
+        let fine = self.within(out, &a);
+        let ok = self.emit(out, bt, Expr::Binary(BinOp::And, safe, fine));
+        self.pick(out, ok, &form, &mono)
+    }
+
+    /// `cross(a, b)` on `vec3`: exact bilinear expansion.
+    fn cross(&mut self, out: &mut Block, a: &A, b: &A, ty: TypeId) -> A {
+        let f = self.m.types.f32();
+        let sa = self.split(out, a, 3);
+        let sb = self.split(out, b, 3);
+        let mut comp = |i: usize, j: usize| -> A {
+            let p1 = self.mul(out, &sa[i], &sb[j], f);
+            let p2 = self.mul(out, &sa[j], &sb[i], f);
+            self.add(out, &p1, &p2, f, true)
+        };
+        let x = comp(1, 2);
+        let y = comp(2, 0);
+        let z = comp(0, 1);
+        self.gather(out, &[x, y, z], ty)
+    }
+
+    /// `length(a)` for a float vector: standard `sqrt(dot(a, a))`, PLUS an exact single-component
+    /// shortcut whenever all other components are provably zero (`lo == 0 && hi == 0`), where
+    /// `length(a) == |a_j|` identically! Preserves AFk noise symbols across `length(max(q, 0))`
+    /// on every face of `sd_box` and `sd_cyl`.
+    fn length_vec(&mut self, out: &mut Block, a: &A, at: TypeId, ty: TypeId) -> A {
+        let p = self.mul(out, a, a, at);
+        let s = self.sum(out, &p, at, ty);
+        let mut r = self.sqrt(out, &s, ty);
+        r = self.rounded(out, r, ty, (4.0, 16.0));
+        let Some(k) = self.width(at) else {
+            return r;
+        };
+        if k > 3 {
+            return r;
+        }
+        let comps = self.split(out, a, k);
+        let z = self.k(out, ty, 0.0);
+        let bt = self.bool_ty;
+        let mut is_zero = Vec::with_capacity(k as usize);
+        for c in &comps {
+            let rc = self.rad(out, c, ty);
+            let zc = self.cmp(out, BinOp::Eq, c.c, z);
+            let zr = self.cmp(out, BinOp::Eq, rc, z);
+            is_zero.push(self.emit(out, bt, Expr::Binary(BinOp::And, zc, zr)));
+        }
+        for j in 0..k as usize {
+            let mut others_zero: Option<ValueId> = None;
+            for (m, &zm) in is_zero.iter().enumerate() {
+                if m == j {
+                    continue;
+                }
+                others_zero = Some(match others_zero {
+                    Some(prev) => self.emit(out, bt, Expr::Binary(BinOp::And, prev, zm)),
+                    None => zm,
+                });
+            }
+            if let Some(cond) = others_zero {
+                let aj = self.abs(out, &comps[j], ty);
+                let aj = self.rounded(out, aj, ty, (4.0, 16.0));
+                r = self.pick(out, cond, &aj, &r);
+            }
+        }
+        r
     }
 
     fn exp(&mut self, out: &mut Block, a: &A, ty: TypeId) -> A {
@@ -1129,33 +2141,144 @@ impl Af<'_> {
         (alpha, g)
     }
 
-    /// `|a|`: `α a + γ/2 ± γ/2` (`abs_line`): itself or its negation, exactly, where its range has
-    /// one sign. The point code's `abs` is exact; the form's own arithmetic rounds within an ulp
-    /// of `|a.c| + rad + γ`.
+    /// Attaches a signed scalar deviation `dev * ε` of `|d_0(u)|` (where `d_0(u) = key_c + Σ key_l[i] u_i`)
+    /// to the shared AFk symbol table (`abs_syms`): if any existing symbol matches `(key_c, key_l)`
+    /// (or its negation), places `dev` on that symbol so downstream sums (`max(x,0) + min(x,0)`)
+    /// cancel identically; otherwise allocates a fresh symbol up to `max_syms()`, or folds `|dev|`
+    /// into `e_base`.
+    fn attach_abs_sym(
+        &mut self,
+        out: &mut Block,
+        key_c: ValueId,
+        key_l: &[ValueId],
+        dev: ValueId,
+        mut e_base: ValueId,
+        ty: TypeId,
+    ) -> (Vec<(u32, ValueId)>, ValueId) {
+        let bt = self.bool_ty;
+        let z = self.zero(out, ty);
+        let mut key = Vec::with_capacity(1 + key_l.len());
+        key.push(key_c);
+        key.extend_from_slice(key_l);
+        let existing = self.abs_syms.clone();
+        let mut matched_any = self.bconst(out, false);
+        let mut syms = Vec::new();
+        for (ekey, sym_id) in existing {
+            let mut pos = self.bconst(out, true);
+            let mut neg = self.bconst(out, true);
+            for (&kv, &ev) in key.iter().zip(&ekey) {
+                let eqp = self.cmp(out, BinOp::Eq, kv, ev);
+                pos = self.emit(out, bt, Expr::Binary(BinOp::And, pos, eqp));
+                let nev = self.emit(out, ty, Expr::Unary(UnOp::Neg, ev));
+                let eqn = self.cmp(out, BinOp::Eq, kv, nev);
+                neg = self.emit(out, bt, Expr::Binary(BinOp::And, neg, eqn));
+            }
+            let m = self.emit(out, bt, Expr::Binary(BinOp::Or, pos, neg));
+            let not_yet = self.emit(out, bt, Expr::Unary(UnOp::Not, matched_any));
+            let take = self.emit(out, bt, Expr::Binary(BinOp::And, m, not_yet));
+            matched_any = self.emit(out, bt, Expr::Binary(BinOp::Or, matched_any, m));
+            let coeff = self.sel(out, take, dev, z);
+            syms.push((sym_id, coeff));
+        }
+        let fresh_cond = self.emit(out, bt, Expr::Unary(UnOp::Not, matched_any));
+        if self.abs_syms.len() < self.max_syms() {
+            let sym_id = self.next_sym;
+            self.next_sym += 1;
+            self.abs_syms.push((key, sym_id));
+            let coeff = self.sel(out, fresh_cond, dev, z);
+            syms.push((sym_id, coeff));
+        } else {
+            let adev = self.builtin(out, Builtin::Abs, vec![dev], ty);
+            let add_e = self.sel(out, fresh_cond, adev, z);
+            e_base = self.bin(out, BinOp::Add, e_base, add_e, ty);
+        }
+        (syms, e_base)
+    }
+
+    /// `|a|`: exact `a` when `lo >= 0`, exact `-a` when `hi <= 0`, otherwise linearizes the box-linear
+    /// core `|a_0|` with a shared AFk noise symbol `ε` (`|a(u) - a_0(u)| <= res_a` is 1-Lipschitz).
     fn abs(&mut self, out: &mut Block, a: &A, ty: TypeId) -> A {
+        if let Some(r) = self.per_comp(out, &[a], ty, |s, out, x, t| s.abs(out, &x[0], t)) {
+            return r;
+        }
         let (lo, hi) = self.ends(out, a, ty);
-        let (alpha, g) = self.abs_line(out, (lo, hi), ty);
+        let z = self.k(out, ty, 0.0);
+        let nonneg = self.cmp(out, BinOp::Ge, lo, z);
+        let nonpos = self.cmp(out, BinOp::Le, hi, z);
+        if self.max_syms() == 0 {
+            let (alpha, g) = self.abs_line(out, (lo, hi), ty);
+            let half = self.k(out, ty, 0.5);
+            let g2 = self.bin(out, BinOp::Mul, g, half, ty);
+            let ac = self.bin(out, BinOp::Mul, alpha, a.c, ty);
+            let c = self.bin(out, BinOp::Add, ac, g2, ty);
+            let l = (0..self.n).map(|i| self.bin(out, BinOp::Mul, alpha, a.l[i], ty)).collect();
+            let aa = self.builtin(out, Builtin::Abs, vec![alpha], ty);
+            let ae = self.bin(out, BinOp::Mul, aa, a.e, ty);
+            let e = self.bin(out, BinOp::Add, ae, g2, ty);
+            let m = self.magnitude(out, a, ty);
+            let m = self.bin(out, BinOp::Add, m, g, ty);
+            let k = self.k(out, ty, EPS);
+            let m = self.bin(out, BinOp::Mul, m, k, ty);
+            let straddle = self.grown(out, A::plain(c, l, e), ty, (0.0, 0.0), Some(m));
+            let na = self.neg(out, a, ty);
+            let r = self.pick(out, nonpos, &na, &straddle);
+            return self.pick(out, nonneg, a, &r);
+        }
+        // Linearize `|a_0|` where `a_0 = a.c + Σ a.l[i] u_i`, then add `non_box_err(a)`.
+        let a0 = A::plain(a.c, a.l.clone(), z);
+        let (lo0, hi0) = self.ends(out, &a0, ty);
+        let (alpha, g0) = self.abs_line(out, (lo0, hi0), ty);
         let half = self.k(out, ty, 0.5);
-        let g2 = self.bin(out, BinOp::Mul, g, half, ty);
+        let g2 = self.bin(out, BinOp::Mul, g0, half, ty);
         let ac = self.bin(out, BinOp::Mul, alpha, a.c, ty);
         let c = self.bin(out, BinOp::Add, ac, g2, ty);
         let l = (0..self.n).map(|i| self.bin(out, BinOp::Mul, alpha, a.l[i], ty)).collect();
-        let aa = self.builtin(out, Builtin::Abs, vec![alpha], ty);
-        let e = self.bin(out, BinOp::Mul, aa, a.e, ty);
-        let e = self.bin(out, BinOp::Add, e, g2, ty);
+        let res_a = self.non_box_err(out, a, ty);
+        let (s, e) = self.attach_abs_sym(out, a.c, &a.l, g2, res_a, ty);
         let m = self.magnitude(out, a, ty);
-        let m = self.bin(out, BinOp::Add, m, g, ty);
+        let m = self.bin(out, BinOp::Add, m, g0, ty);
         let k = self.k(out, ty, EPS);
         let m = self.bin(out, BinOp::Mul, m, k, ty);
-        self.grown(out, A { c, l, e }, ty, (0.0, 0.0), Some(m))
+        let straddle = self.grown(out, A { c, l, s, e, bounds: None }, ty, (0.0, 0.0), Some(m));
+        let na = self.neg(out, a, ty);
+        let r = self.pick(out, nonpos, &na, &straddle);
+        self.pick(out, nonneg, a, &r)
     }
 
-    /// `t` where `cond`, else `f`, part by part.
+    /// `t` where `cond`, else `f`, part by part (including the sorted union of AFk symbols `s`).
     fn pick(&mut self, out: &mut Block, cond: ValueId, t: &A, f: &A) -> A {
+        let ty = self.ty(t.c);
         let c = self.sel(out, cond, t.c, f.c);
         let l = (0..self.n).map(|i| self.sel(out, cond, t.l[i], f.l[i])).collect();
         let e = self.sel(out, cond, t.e, f.e);
-        A { c, l, e }
+        let mut s = Vec::new();
+        if !t.s.is_empty() || !f.s.is_empty() {
+            let z = self.zero(out, ty);
+            let (mut it, mut if_) = (0usize, 0usize);
+            while it < t.s.len() || if_ < f.s.len() {
+                match (t.s.get(it), f.s.get(if_)) {
+                    (Some(&(st, vt)), Some(&(sf, vf))) if st == sf => {
+                        s.push((st, self.sel(out, cond, vt, vf)));
+                        it += 1;
+                        if_ += 1;
+                    }
+                    (Some(&(st, vt)), Some(&(sf, _))) if st < sf => {
+                        s.push((st, self.sel(out, cond, vt, z)));
+                        it += 1;
+                    }
+                    (Some(&(st, vt)), None) => {
+                        s.push((st, self.sel(out, cond, vt, z)));
+                        it += 1;
+                    }
+                    (_, Some(&(sf, vf))) => {
+                        s.push((sf, self.sel(out, cond, z, vf)));
+                        if_ += 1;
+                    }
+                    (None, None) => break,
+                }
+            }
+        }
+        A { c, l, s, e, bounds: None }
     }
 
     /// A form holding both `a`'s values and `b`'s: their mean slopes (or the other's, where one
@@ -1166,6 +2289,9 @@ impl Af<'_> {
         {
             return r;
         }
+        let a = self.compact(out, a, ty);
+        let b = self.compact(out, b, ty);
+        let (a, b) = (&a, &b);
         let z = self.k(out, ty, 0.0);
         let a_empty = self.cmp(out, BinOp::Lt, a.e, z);
         let b_empty = self.cmp(out, BinOp::Lt, b.e, z);
@@ -1197,7 +2323,7 @@ impl Af<'_> {
         // Each span's sums (n + 2 roundings, of `M`'s size), the mean slopes', the ends'
         // halves and the centre's and error's: within (n + 6) u of the magnitude.
         let k = 0.5 * self.n as f64 + 3.0;
-        let r = self.rounded(out, A { c, l, e }, ty, (k, k));
+        let r = self.rounded(out, A::plain(c, l, e), ty, (k, k));
         // Both empty: still empty.
         let bt = self.bool_of(ty);
         let both = self.emit(out, bt, Expr::Binary(BinOp::And, a_empty, b_empty));
@@ -1221,25 +2347,75 @@ impl Af<'_> {
         (self.sel(out, st, t.0, x), self.sel(out, st, t.1, y))
     }
 
-    /// `min(a, b)` or `max`: `(a + b ∓ |a - b|) / 2` with `|a - b|` as `abs_line` gives it,
-    /// so the weights `(1 ∓ α) / 2` and `(1 ± α) / 2` of `a` and `b`, and `γ / 4` about them:
-    /// `a` or `b` itself where a box surely orders them (`α = ±1`, `γ` only its rounding). The
-    /// point code's is exact; the form's arithmetic rounds within 4u of `|a| + |b|` (the
-    /// weights' own rounding included) and 2u of `γ`.
+    /// `min(a, b)` or `max(a, b)`:
+    /// 1. Short-circuits bit-for-bit to `a` or `b` when the box surely orders them (`d.lo >= 0`
+    ///    or `d.hi <= 0`), adding zero error and preserving exact linear parts for downstream matching.
+    /// 2. When straddling, linearizes the box-linear difference `d_0 = a_0 - b_0` via `abs_line`
+    ///    and tracks the signed deviation `±γ₀/4 · ε` in `abs_syms` keyed on `(d_0.c, d_0.l)`.
+    ///    By L∞ 1-Lipschitzness of `min`/`max`, `|max(a,b) - max(a_0,b_0)| <= max(res_a, res_b)`.
+    ///    Thus `max(x, 0) + min(x, 0)` and `length(max(q, 0)) + min(max(q), 0)` cancel identically!
     fn min_max(&mut self, out: &mut Block, a: &A, b: &A, ty: TypeId, max: bool) -> A {
+        let r = if max {
+            self.per_comp(out, &[a, b], ty, |s, out, x, t| s.min_max(out, &x[0], &x[1], t, true))
+        } else {
+            self.per_comp(out, &[a, b], ty, |s, out, x, t| s.min_max(out, &x[0], &x[1], t, false))
+        };
+        if let Some(r) = r {
+            return r;
+        }
+        let d_full = self.add(out, a, b, ty, true);
+        let (lo_full, hi_full) = self.ends(out, &d_full, ty);
+        let z = self.k(out, ty, 0.0);
+        let a_ge_b = self.cmp(out, BinOp::Ge, lo_full, z);
+        let a_le_b = self.cmp(out, BinOp::Le, hi_full, z);
+
+        if self.max_syms() == 0 {
+            let (alpha, g) = self.abs_line(out, (lo_full, hi_full), ty);
+            let half = self.k(out, ty, 0.5);
+            let ha = self.bin(out, BinOp::Mul, alpha, half, ty);
+            let lower = self.bin(out, BinOp::Sub, half, ha, ty);
+            let upper = self.bin(out, BinOp::Add, half, ha, ty);
+            let (wa, wb) = if max { (upper, lower) } else { (lower, upper) };
+            let quarter = self.k(out, ty, 0.25);
+            let g4 = self.bin(out, BinOp::Mul, g, quarter, ty);
+            let mix = |s: &mut Self, out: &mut Block, x: ValueId, y: ValueId| {
+                let p = s.bin(out, BinOp::Mul, wa, x, ty);
+                let q = s.bin(out, BinOp::Mul, wb, y, ty);
+                s.bin(out, BinOp::Add, p, q, ty)
+            };
+            let c = mix(self, out, a.c, b.c);
+            let c = self.bin(out, if max { BinOp::Add } else { BinOp::Sub }, c, g4, ty);
+            let l = (0..self.n).map(|i| mix(self, out, a.l[i], b.l[i])).collect();
+            let e0 = mix(self, out, a.e, b.e);
+            let e = self.bin(out, BinOp::Add, e0, g4, ty);
+            let ma = self.magnitude(out, a, ty);
+            let mb = self.magnitude(out, b, ty);
+            let m = self.bin(out, BinOp::Add, ma, mb, ty);
+            let k = self.k(out, ty, 2.0 * EPS);
+            let m = self.bin(out, BinOp::Mul, m, k, ty);
+            let kg = self.k(out, ty, EPS);
+            let mg = self.bin(out, BinOp::Mul, g, kg, ty);
+            let m = self.bin(out, BinOp::Add, m, mg, ty);
+            let straddle = self.grown(out, A::plain(c, l, e), ty, (0.0, 0.0), Some(m));
+            let (win_a, win_b) = if max { (a, b) } else { (b, a) };
+            let r = self.pick(out, a_le_b, win_b, &straddle);
+            return self.pick(out, a_ge_b, win_a, &r);
+        }
+
+        // Box-linear difference `d_0 = a_0 - b_0`.
         let dc = self.bin(out, BinOp::Sub, a.c, b.c, ty);
-        let dl = (0..self.n).map(|i| self.bin(out, BinOp::Sub, a.l[i], b.l[i], ty)).collect();
-        let de = self.bin(out, BinOp::Add, a.e, b.e, ty);
-        let d = A { c: dc, l: dl, e: de };
-        let (lo, hi) = self.ends(out, &d, ty);
-        let (alpha, g) = self.abs_line(out, (lo, hi), ty);
+        let dl: Vec<ValueId> =
+            (0..self.n).map(|i| self.bin(out, BinOp::Sub, a.l[i], b.l[i], ty)).collect();
+        let d0 = A::plain(dc, dl.clone(), z);
+        let (lo0, hi0) = self.ends(out, &d0, ty);
+        let (alpha, g0) = self.abs_line(out, (lo0, hi0), ty);
         let half = self.k(out, ty, 0.5);
         let ha = self.bin(out, BinOp::Mul, alpha, half, ty);
         let lower = self.bin(out, BinOp::Sub, half, ha, ty);
         let upper = self.bin(out, BinOp::Add, half, ha, ty);
         let (wa, wb) = if max { (upper, lower) } else { (lower, upper) };
         let quarter = self.k(out, ty, 0.25);
-        let g4 = self.bin(out, BinOp::Mul, g, quarter, ty);
+        let g4 = self.bin(out, BinOp::Mul, g0, quarter, ty);
         let mix = |s: &mut Self, out: &mut Block, x: ValueId, y: ValueId| {
             let p = s.bin(out, BinOp::Mul, wa, x, ty);
             let q = s.bin(out, BinOp::Mul, wb, y, ty);
@@ -1248,17 +2424,33 @@ impl Af<'_> {
         let c = mix(self, out, a.c, b.c);
         let c = self.bin(out, if max { BinOp::Add } else { BinOp::Sub }, c, g4, ty);
         let l = (0..self.n).map(|i| mix(self, out, a.l[i], b.l[i])).collect();
-        let e = mix(self, out, a.e, b.e);
-        let e = self.bin(out, BinOp::Add, e, g4, ty);
+        // L∞ residual bound `max(res_a, res_b)`.
+        let res_a = self.non_box_err(out, a, ty);
+        let res_b = self.non_box_err(out, b, ty);
+        let e_base = self.builtin(out, Builtin::Max, vec![res_a, res_b], ty);
+        let dev = if max { g4 } else { self.emit(out, ty, Expr::Unary(UnOp::Neg, g4)) };
+        let (s, e) = self.attach_abs_sym(out, dc, &dl, dev, e_base, ty);
         let ma = self.magnitude(out, a, ty);
         let mb = self.magnitude(out, b, ty);
         let m = self.bin(out, BinOp::Add, ma, mb, ty);
         let k = self.k(out, ty, 2.0 * EPS);
         let m = self.bin(out, BinOp::Mul, m, k, ty);
         let kg = self.k(out, ty, EPS);
-        let mg = self.bin(out, BinOp::Mul, g, kg, ty);
+        let mg = self.bin(out, BinOp::Mul, g0, kg, ty);
         let m = self.bin(out, BinOp::Add, m, mg, ty);
-        self.grown(out, A { c, l, e }, ty, (0.0, 0.0), Some(m))
+        let straddle = self.grown(out, A { c, l, s, e, bounds: None }, ty, (0.0, 0.0), Some(m));
+        let (win_a, win_b) = if max { (a, b) } else { (b, a) };
+        let r = self.pick(out, a_le_b, win_b, &straddle);
+        let mut r = self.pick(out, a_ge_b, win_a, &r);
+        // Attach exact interval bounds `max(alo, blo)..max(ahi, bhi)` (or `min`) so downstream
+        // `abs(max(q, 0))` / `length(max(q, 0))` proves non-negativity and preserves AFk symbols!
+        let (alo, ahi) = self.ends(out, a, ty);
+        let (blo, bhi) = self.ends(out, b, ty);
+        let op = if max { Builtin::Max } else { Builtin::Min };
+        let rlo = self.builtin(out, op, vec![alo, blo], ty);
+        let rhi = self.builtin(out, op, vec![ahi, bhi], ty);
+        r.bounds = Some((Some(rlo), Some(rhi)));
+        r
     }
 
     /// A comparison's certainty, from the range of `a - b` (a value against itself is sure).
@@ -1315,8 +2507,10 @@ impl Af<'_> {
     // ---- statements ------------------------------------------------------------------------
 
     fn block(&mut self, b: &Block) -> R<Block> {
+        let saved_syms = self.abs_syms.len();
         let mut out = Vec::new();
         self.block_into(b, &mut out)?;
+        self.abs_syms.truncate(saved_syms);
         Ok(out)
     }
 
@@ -1325,6 +2519,65 @@ impl Af<'_> {
             self.stmt(s, out)?;
         }
         Ok(())
+    }
+
+    /// Applies branch narrowing from active boolean `cond` taking value `truth`: tightens
+    /// `self.narrow` for scalar float values compared against inactive bounds (and recursively
+    /// through `&&`, `||`, `!`).
+    fn narrow_cond(&mut self, out: &mut Block, cond: ValueId, truth: bool) {
+        if let Some(&inner) = self.not_defs.get(&cond) {
+            self.narrow_cond(out, inner, !truth);
+            return;
+        }
+        if let Some(&(op, a, b)) = self.bool_defs.get(&cond) {
+            if (op == BinOp::And && truth) || (op == BinOp::Or && !truth) {
+                self.narrow_cond(out, a, truth);
+                self.narrow_cond(out, b, truth);
+            }
+            return;
+        }
+        let Some(&(op, a, b)) = self.cmp_defs.get(&cond) else {
+            return;
+        };
+        let eff = if truth {
+            op
+        } else {
+            match op {
+                BinOp::Lt => BinOp::Ge,
+                BinOp::Le => BinOp::Gt,
+                BinOp::Gt => BinOp::Le,
+                BinOp::Ge => BinOp::Lt,
+                BinOp::Eq => BinOp::Ne,
+                BinOp::Ne => BinOp::Eq,
+                _ => return,
+            }
+        };
+        let f32_ty = self.m.types.f32();
+        if self.f.value_ty(a) != f32_ty || self.f.value_ty(b) != f32_ty {
+            return;
+        }
+        let (target, bound, is_lo) = match (self.act.value(a), self.act.value(b), eff) {
+            (true, false, BinOp::Gt | BinOp::Ge) => (a, b, true),
+            (true, false, BinOp::Lt | BinOp::Le) => (a, b, false),
+            (false, true, BinOp::Lt | BinOp::Le) => (b, a, true),
+            (false, true, BinOp::Gt | BinOp::Ge) => (b, a, false),
+            _ => return,
+        };
+        let prev = self.narrow.get(&target).copied().unwrap_or((None, None));
+        let updated = if is_lo {
+            let next = match prev.0 {
+                Some(p) => self.builtin(out, Builtin::Max, vec![p, bound], f32_ty),
+                None => bound,
+            };
+            (Some(next), prev.1)
+        } else {
+            let next = match prev.1 {
+                Some(p) => self.builtin(out, Builtin::Min, vec![p, bound], f32_ty),
+                None => bound,
+            };
+            (prev.0, Some(next))
+        };
+        self.narrow.insert(target, updated);
     }
 
     fn active_root(&self, r: &PlaceRoot) -> bool {
@@ -1367,10 +2620,12 @@ impl Af<'_> {
             ps.push(self.emit(out, ty, Expr::Load(q)));
         }
         let e = ps.pop().ok_or_else(|| Error::internal("no error part"))?;
-        Ok(A { c, l: ps, e })
+        Ok(A::plain(c, ps, e))
     }
 
     fn store_form(&mut self, out: &mut Block, p: &Place, a: &A) -> R<()> {
+        let ty = self.ty(a.c);
+        let a = self.compact(out, a, ty);
         out.push(Stmt::Store(p.clone(), a.c));
         for (k, q) in self.place_parts(p)?.into_iter().enumerate() {
             out.push(Stmt::Store(q, if k < self.n { a.l[k] } else { a.e }));
@@ -1477,6 +2732,18 @@ impl Af<'_> {
                 self.call(None, *g, args, out)
             }
             Stmt::Let(v, e) if self.act.value(*v) => self.let_(*v, e, out),
+            // An inactive field/component extracted from a partly-active aggregate/vector lives
+            // in that value's centre (`forms[x].c`), since `x` itself isn't bound in `nf`.
+            Stmt::Let(v, Expr::Extract(x, k)) if self.forms.contains_key(x) => {
+                let c = self.forms[x].c;
+                out.push(Stmt::Let(*v, Expr::Extract(c, *k)));
+                Ok(())
+            }
+            Stmt::Let(v, Expr::Swizzle(x, sw)) if self.forms.contains_key(x) => {
+                let c = self.forms[x].c;
+                out.push(Stmt::Let(*v, Expr::Swizzle(c, sw.clone())));
+                Ok(())
+            }
             Stmt::Store(p, v) if self.active_root(&p.root) => {
                 if self.is_bool_root(&p.root) {
                     let s = self.sure_of(out, *v);
@@ -1512,13 +2779,18 @@ impl Af<'_> {
                     before.push(self.load_state(out, r)?);
                 }
                 self.speculative += 1;
+                let saved_narrow = self.narrow.clone();
+                self.narrow_cond(out, *cond, true);
                 self.block_into(then, out)?;
+                self.narrow = saved_narrow.clone();
                 let mut after = Vec::new();
                 for (r, b) in roots.iter().zip(&before) {
                     after.push(self.load_state(out, r)?);
                     self.store_state(out, r, b)?;
                 }
+                self.narrow_cond(out, *cond, false);
                 self.block_into(else_, out)?;
+                self.narrow = saved_narrow;
                 self.speculative -= 1;
                 for (r, t) in roots.iter().zip(after) {
                     let e = self.load_state(out, r)?;
@@ -1539,6 +2811,7 @@ impl Af<'_> {
             Stmt::Return(Some(v)) if self.returns => {
                 let ty = self.f.ret.ok_or_else(|| Error::internal("no result type"))?;
                 let a = self.of_as(out, *v, ty);
+                let a = self.compact(out, &a, ty);
                 let rt = self.nf.ret.ok_or_else(|| Error::internal("no affine type"))?;
                 let mut fields = vec![a.c];
                 fields.extend(a.l.iter().copied());
@@ -1559,7 +2832,7 @@ impl Af<'_> {
     fn let_(&mut self, v: ValueId, e: &Expr, out: &mut Block) -> R<()> {
         let ty = self.f.value_ty(v);
         if ty == self.bool_ty {
-            let s = self.let_bool(e, out)?;
+            let s = self.let_bool(v, e, out)?;
             self.sure.insert(v, s);
             return Ok(());
         }
@@ -1588,7 +2861,7 @@ impl Af<'_> {
                 let mut vs: Vec<ValueId> =
                     ps.iter().map(|k| self.emit(out, ty, Expr::Param(*k))).collect();
                 let e = vs.pop().ok_or_else(|| Error::internal("no error part"))?;
-                A { c, l: vs, e }
+                A::plain(c, vs, e)
             }
             Expr::Load(p) if self.active_root(&p.root) => self.load_form(out, p, ty)?,
             Expr::Unary(UnOp::Neg, x) => {
@@ -1613,6 +2886,11 @@ impl Af<'_> {
                     self.rounded(out, q, ty, (1.0, 3.0))
                 }
             }
+            Expr::Binary(BinOp::Rem, a, b) if !self.act.value(*b) => {
+                let aa = self.of_as(out, *a, ty);
+                let k = self.coerce(out, *b, ty);
+                self.rem_const(out, &aa, k, ty)
+            }
             Expr::Select { cond, if_true, if_false } => {
                 let (t, f) = (self.of_as(out, *if_true, ty), self.of_as(out, *if_false, ty));
                 if self.act.value(*cond) {
@@ -1627,8 +2905,12 @@ impl Af<'_> {
                 let c = self.emit(out, ty, Expr::Extract(a.c, *k));
                 let l =
                     (0..self.n).map(|i| self.emit(out, ty, Expr::Extract(a.l[i], *k))).collect();
+                let s =
+                    a.s.iter()
+                        .map(|&(id, v)| (id, self.emit(out, ty, Expr::Extract(v, *k))))
+                        .collect();
                 let e = self.emit(out, ty, Expr::Extract(a.e, *k));
-                A { c, l, e }
+                A { c, l, s, e, bounds: None }
             }
             Expr::Swizzle(x, sw) => {
                 let a = self.of(out, *x);
@@ -1636,26 +2918,51 @@ impl Af<'_> {
                 let l = (0..self.n)
                     .map(|i| self.emit(out, ty, Expr::Swizzle(a.l[i], sw.clone())))
                     .collect();
+                let s =
+                    a.s.iter()
+                        .map(|&(id, v)| (id, self.emit(out, ty, Expr::Swizzle(v, sw.clone()))))
+                        .collect();
                 let e = self.emit(out, ty, Expr::Swizzle(a.e, sw.clone()));
-                A { c, l, e }
+                A { c, l, s, e, bounds: None }
             }
             Expr::Construct(t, comps) if floaty(&self.m.types, *t) => {
                 let cs: Vec<A> = comps.iter().map(|x| self.of(out, *x)).collect();
-                let c = self.emit(out, ty, Expr::Construct(*t, cs.iter().map(|a| a.c).collect()));
-                let l = (0..self.n)
-                    .map(|i| {
-                        self.emit(out, ty, Expr::Construct(*t, cs.iter().map(|a| a.l[i]).collect()))
-                    })
-                    .collect();
-                let e = self.emit(out, ty, Expr::Construct(*t, cs.iter().map(|a| a.e).collect()));
-                A { c, l, e }
+                if matches!(self.m.types.get(*t), TypeDef::Vector(..)) {
+                    self.gather(out, &cs, ty)
+                } else {
+                    let cs: Vec<A> = cs
+                        .into_iter()
+                        .map(|a| {
+                            let at = self.ty(a.c);
+                            self.compact(out, &a, at)
+                        })
+                        .collect();
+                    let c =
+                        self.emit(out, ty, Expr::Construct(*t, cs.iter().map(|a| a.c).collect()));
+                    let l = (0..self.n)
+                        .map(|i| {
+                            self.emit(
+                                out,
+                                ty,
+                                Expr::Construct(*t, cs.iter().map(|a| a.l[i]).collect()),
+                            )
+                        })
+                        .collect();
+                    let e =
+                        self.emit(out, ty, Expr::Construct(*t, cs.iter().map(|a| a.e).collect()));
+                    A::plain(c, l, e)
+                }
             }
             Expr::Splat(x, k) => {
                 let a = self.of(out, *x);
                 let c = self.emit(out, ty, Expr::Splat(a.c, *k));
                 let l = (0..self.n).map(|i| self.emit(out, ty, Expr::Splat(a.l[i], *k))).collect();
+                let s =
+                    a.s.iter()
+                        .map(|&(id, v)| (id, self.emit(out, ty, Expr::Splat(v, *k))))
+                        .collect();
                 let e = self.emit(out, ty, Expr::Splat(a.e, *k));
-                A { c, l, e }
+                A { c, l, s, e, bounds: None }
             }
             Expr::Builtin(b, args) => match self.builtin_rule(out, *b, args, ty)? {
                 Some(a) => a,
@@ -1684,16 +2991,18 @@ impl Af<'_> {
         Ok(())
     }
 
-    fn let_bool(&mut self, e: &Expr, out: &mut Block) -> R<Sure> {
+    fn let_bool(&mut self, v: ValueId, e: &Expr, out: &mut Block) -> R<Sure> {
         Ok(match e {
             Expr::Binary(
                 op @ (BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne),
                 a,
                 b,
             ) if is_float(&self.m.types, self.f.value_ty(*a)) => {
+                self.cmp_defs.insert(v, (*op, *a, *b));
                 self.compare(out, *op, (*a, *b))?
             }
             Expr::Binary(op @ (BinOp::And | BinOp::Or), a, b) => {
+                self.bool_defs.insert(v, (*op, *a, *b));
                 let (x, y) = (self.sure_of(out, *a), self.sure_of(out, *b));
                 let bt = self.bool_ty;
                 let (p, q) = if *op == BinOp::And {
@@ -1707,6 +3016,7 @@ impl Af<'_> {
                 )
             }
             Expr::Unary(UnOp::Not, x) => {
+                self.not_defs.insert(v, *x);
                 let (t, f) = self.sure_of(out, *x);
                 (f, t)
             }
@@ -1770,6 +3080,7 @@ impl Af<'_> {
         let col_ty = self.m.types.intern(TypeDef::Vector(Scalar::F32, rows));
         let a = self.of(out, v);
         let vt = self.ty(a.c);
+        let a = self.compact(out, &a, vt);
         let mut abs_cols = Vec::new();
         for j in 0..cols {
             let col = self.emit(out, col_ty, Expr::Extract(mv, j as u32));
@@ -1790,7 +3101,7 @@ impl Af<'_> {
         // each of `|M| (|c| + rad)`.
         let k = self.k(out, ty, self.ulps((3.0, 3.0)));
         let extra = self.bin(out, BinOp::Mul, mag, k, ty);
-        self.grown(out, A { c, l, e }, ty, (0.0, 0.0), Some(extra))
+        self.grown(out, A::plain(c, l, e), ty, (0.0, 0.0), Some(extra))
     }
 
     /// A builtin's form, or `None` where it has no rule here.
@@ -1836,6 +3147,18 @@ impl Af<'_> {
                 let a = self.of_as(out, args[0], ty);
                 self.sin_cos(out, &a, ty, b == B::Cos)
             }
+            B::Tan => {
+                let a = self.of_as(out, args[0], ty);
+                self.tan(out, &a, ty)
+            }
+            B::Atan => {
+                let a = self.of_as(out, args[0], ty);
+                self.atan(out, &a, ty)
+            }
+            B::Asin | B::Acos => {
+                let a = self.of_as(out, args[0], ty);
+                self.asin_acos(out, &a, ty, b == B::Acos)
+            }
             B::Atan2 => {
                 let y = self.of_as(out, args[0], ty);
                 let x = self.of_as(out, args[1], ty);
@@ -1850,6 +3173,35 @@ impl Af<'_> {
             B::Exp => {
                 let a = self.of_as(out, args[0], ty);
                 self.exp(out, &a, ty)
+            }
+            B::Exp2 => {
+                let a = self.of_as(out, args[0], ty);
+                self.exp2(out, &a, ty)
+            }
+            B::Log | B::Log2 => {
+                let a = self.of_as(out, args[0], ty);
+                self.log(out, &a, ty, b == B::Log2)
+            }
+            B::Pow => {
+                let a = self.of_as(out, args[0], ty);
+                if !self.act.value(args[1]) {
+                    let bv = self.coerce(out, args[1], ty);
+                    self.pow_const_exp(out, &a, bv, ty)
+                } else {
+                    let bv = self.of_as(out, args[1], ty);
+                    let l2 = self.log(out, &a, ty, true);
+                    let prod = self.mul(out, &bv, &l2, ty);
+                    self.exp2(out, &prod, ty)
+                }
+            }
+            B::Fract => {
+                let a = self.of_as(out, args[0], ty);
+                self.fract(out, &a, ty)
+            }
+            B::Cross => {
+                let a = self.of_as(out, args[0], ty);
+                let c = self.of_as(out, args[1], ty);
+                self.cross(out, &a, &c, ty)
             }
             B::Dot => {
                 let at = self.f.value_ty(args[0]);
@@ -1869,11 +3221,7 @@ impl Af<'_> {
                 if !matches!(self.m.types.get(at), TypeDef::Vector(..)) {
                     return Ok(Some(self.abs(out, &a, ty)));
                 }
-                let p = self.mul(out, &a, &a, at);
-                let s = self.sum(out, &p, at, ty);
-                let r = self.sqrt(out, &s, ty);
-                // std's and WGSL's length: within a few ulps of the root of the sum.
-                self.rounded(out, r, ty, (4.0, 16.0))
+                self.length_vec(out, &a, at, ty)
             }
             B::Normalize => {
                 let a = self.of_as(out, args[0], ty);
@@ -1904,12 +3252,13 @@ impl Af<'_> {
                 self.grown(out, s, ty, (2.0, 2.0), Some(extra))
             }
             B::Sign | B::Floor | B::Ceil | B::Round | B::Trunc => {
-                // Monotone, and exact as each target computes it: its values at the ends.
+                // Monotone, and exact as each target computes it: its values at the ends
+                // (with zero error when `fl == fh`).
                 let a = self.of_as(out, args[0], ty);
                 let (lo, hi) = self.ends(out, &a, ty);
                 let fl = self.builtin(out, b, vec![lo], ty);
                 let fh = self.builtin(out, b, vec![hi], ty);
-                self.of_ends(out, fl, fh, ty)
+                self.of_monotone_ends(out, fl, fh, ty)
             }
             B::Step if !self.act.value(args[0]) => {
                 // 1 where the edge is at most x: rising in x.
@@ -1918,7 +3267,7 @@ impl Af<'_> {
                 let edge = self.coerce(out, args[0], ty);
                 let fl = self.builtin(out, b, vec![edge, lo], ty);
                 let fh = self.builtin(out, b, vec![edge, hi], ty);
-                self.of_ends(out, fl, fh, ty)
+                self.of_monotone_ends(out, fl, fh, ty)
             }
             B::Smoothstep if !self.act.value(args[0]) && !self.act.value(args[1]) => {
                 // WGSL's: t² (3 - 2t), t = clamp((x - e0) / (e1 - e0), 0, 1), edges inactive.
@@ -1961,8 +3310,16 @@ impl Af<'_> {
         let comp = |s: &mut Self, out: &mut Block, j: u32| -> A {
             let c = s.emit(out, to, Expr::Extract(a.c, j));
             let l = (0..s.n).map(|i| s.emit(out, to, Expr::Extract(a.l[i], j))).collect();
+            let sym =
+                a.s.iter().map(|&(id, v)| (id, s.emit(out, to, Expr::Extract(v, j)))).collect();
             let e = s.emit(out, to, Expr::Extract(a.e, j));
-            A { c, l, e }
+            let bounds = a.bounds.map(|(lo, hi)| {
+                (
+                    lo.map(|v| s.emit(out, to, Expr::Extract(v, j))),
+                    hi.map(|v| s.emit(out, to, Expr::Extract(v, j))),
+                )
+            });
+            A { c, l, s: sym, e, bounds }
         };
         let mut acc = comp(self, out, 0);
         for j in 1..k {
@@ -2071,14 +3428,19 @@ impl Af<'_> {
         Arg::Place(Place::local(l))
     }
 
-    /// An active argument's form: a value's, or a place's as loaded.
+    /// An argument's form: a value's, or a place's as loaded (an inactive place is loaded and
+    /// wrapped as an exact form).
     fn arg_form(&mut self, out: &mut Block, a: &Arg) -> R<A> {
         match a {
             Arg::Value(x) => Ok(self.of(out, *x)),
             Arg::Place(p) => {
                 let ty = place_type(self.m, self.f, p)?;
-                if !self.active_root(&p.root) || !floaty(&self.m.types, ty) {
+                if !floaty(&self.m.types, ty) {
                     return Err(Error::not_derivable("an active argument that isn't a float"));
+                }
+                if !self.active_root(&p.root) {
+                    let v = self.emit(out, ty, Expr::Load(p.clone()));
+                    return Ok(self.exact(out, v));
                 }
                 self.load_form(out, p, ty)
             }
@@ -2086,10 +3448,26 @@ impl Af<'_> {
     }
 
     fn call(&mut self, v: Option<ValueId>, g: FuncId, args: &[Arg], out: &mut Block) -> R<()> {
+        let ad_info = self.cache.ad_of.get(&g).cloned();
+        // A derivative's affine form is its twin's written for bounds (`ad::Variant::Bounded`).
+        let g = match ad_info.clone() {
+            Some((f, mask, n, ad::Variant::Point)) => {
+                ad::derive(self.m, self.cache, f, mask, n, self.target, ad::Variant::Bounded)?
+            }
+            _ => g,
+        };
         let mask: Vec<Bits> = args.iter().map(|a| arg_bits(self.m, self.f, &self.act, a)).collect();
         let known = self.m.functions[g.index()].known;
         let active_v = v.is_some_and(|v| self.act.value(v));
         if let Some(v) = v.filter(|_| active_v) {
+            if let Some((orig_f, _ad_mask, ad_n, _)) = ad_info
+                && self.m.functions[orig_f.index()].known == Some(Known::ValueNoise)
+                && args.len() == 1 + ad_n as usize
+            {
+                let a = self.noise_ad(out, orig_f, args, ad_n as usize, self.f.value_ty(v))?;
+                self.forms.insert(v, a);
+                return Ok(());
+            }
             if known == Some(Known::ValueNoise) {
                 let x = self.arg_form(out, &args[0])?;
                 let a = self.noise(out, g, x)?;
@@ -2140,6 +3518,8 @@ impl Af<'_> {
                 }
                 _ => {
                     let f = self.arg_form(out, a)?;
+                    let ft = self.ty(f.c);
+                    let f = self.compact(out, &f, ft);
                     new_args.push(Arg::Value(f.c));
                     for x in f.l.iter().chain(std::iter::once(&f.e)) {
                         let arg = self.pass(out, *x, p.by_ref);
@@ -2161,7 +3541,7 @@ impl Af<'_> {
                     .map(|i| self.emit(out, ty, Expr::Extract(r, 1 + i as u32)))
                     .collect();
                 let e = self.emit(out, ty, Expr::Extract(r, 1 + self.n as u32));
-                self.forms.insert(v, A { c, l, e });
+                self.forms.insert(v, A::plain(c, l, e));
             }
             (v, _) => out.push(let_or_eval(v, Expr::Call(dg, new_args))),
         }
@@ -2279,21 +3659,50 @@ impl Af<'_> {
     /// No wider than the noise's own [-1, 1].
     fn noise(&mut self, out: &mut Block, g: FuncId, x: A) -> R<A> {
         let vt = self.ty(x.c);
+        let x = self.compact(out, &x, vt);
+        let (val, grad) = self.noise_center(out, g, x.c, vt)?;
+        let a = self.noise_val_from_center(out, &x, val, grad, vt);
+        let f = self.m.types.f32();
+        Ok(self.unless_unbounded(out, &[x], a, f))
+    }
+
+    fn noise_center(
+        &mut self,
+        out: &mut Block,
+        g: FuncId,
+        xc: ValueId,
+        vt: TypeId,
+    ) -> R<(ValueId, ValueId)> {
         let f = self.m.types.f32();
         let vg = super::ad::value_and_gradient(self.m, self.cache, g, 0, self.target, false)?;
         let rt =
             self.m.functions[vg.index()].ret.ok_or_else(|| Error::internal("no gradient type"))?;
         let by_ref = self.m.functions[vg.index()].params[0].by_ref;
-        let xc = self.pass(out, x.c, by_ref);
-        let r = self.emit(out, rt, Expr::Call(vg, vec![xc]));
+        let arg = self.pass(out, xc, by_ref);
+        let r = self.emit(out, rt, Expr::Call(vg, vec![arg]));
         let val = self.emit(out, f, Expr::Extract(r, 0));
         let grad = self.emit(out, vt, Expr::Extract(r, 1));
+        Ok((val, grad))
+    }
+
+    fn noise_val_from_center(
+        &mut self,
+        out: &mut Block,
+        x: &A,
+        val: ValueId,
+        grad: ValueId,
+        vt: TypeId,
+    ) -> A {
+        let f = self.m.types.f32();
         let l = (0..self.n)
             .map(|i| self.emit(out, f, Expr::Builtin(Builtin::Dot, vec![grad, x.l[i]])))
             .collect();
         let ag = self.builtin(out, Builtin::Abs, vec![grad], vt);
-        let through = self.emit(out, f, Expr::Builtin(Builtin::Dot, vec![ag, x.e]));
-        let reach = self.rad(out, &x, vt);
+        let cap = self.k(out, vt, CAP);
+        let xe = self.builtin(out, Builtin::Min, vec![x.e, cap], vt);
+        let through = self.emit(out, f, Expr::Builtin(Builtin::Dot, vec![ag, xe]));
+        let reach = self.rad(out, x, vt);
+        let reach = self.builtin(out, Builtin::Min, vec![reach, cap], vt);
         let r2 = self.emit(out, f, Expr::Builtin(Builtin::Dot, vec![reach, reach]));
         let hk = self.k(out, f, 0.5 * NOISE_HESSIAN);
         let curv = self.bin(out, BinOp::Mul, r2, hk, f);
@@ -2303,13 +3712,86 @@ impl Af<'_> {
         let e = self.bin(out, BinOp::Add, through, curv, f);
         let e = self.bin(out, BinOp::Add, e, gr, f);
         let e = self.bin(out, BinOp::Add, e, kr, f);
-        let a = self.rounded(out, A { c: val, l, e }, f, (8.0, 16.0));
+        let a = self.rounded(out, A::plain(val, l, e), f, (8.0, 16.0));
         let wide = self.rad(out, &a, f);
         let one = self.k(out, f, 1.0 + NOISE_ROUNDING);
         let z = self.zero(out, f);
-        let whole = A { c: z, l: vec![z; self.n], e: one };
+        let whole = A::plain(z, vec![z; self.n], one);
         let tighter = self.cmp(out, BinOp::Lt, wide, one);
-        Ok(self.pick(out, tighter, &a, &whole))
+        self.pick(out, tighter, &a, &whole)
+    }
+
+    /// Analytical affine bound on the forward-mode AD of `value_noise(p)` (value + `ad_n`
+    /// directional derivatives `dot(∇value_noise(p), t_j)`). Because `value_noise` uses the
+    /// globally C² quintic fade `6f⁵ - 15f⁴ + 10f³`, each partial derivative stays within
+    /// `[-3.75, 3.75]` and its variation from `x.c` is bounded by the analytical Hessian bounds
+    /// `NOISE_HESS_DIAG` (11.55) and `NOISE_HESS_MIX` (14.07) — bypassing the integer lattice
+    /// hash fallback that otherwise loses all tightness across cell boundaries.
+    fn noise_ad(
+        &mut self,
+        out: &mut Block,
+        orig_f: FuncId,
+        args: &[Arg],
+        ad_n: usize,
+        ret_ty: TypeId,
+    ) -> R<A> {
+        let f = self.m.types.f32();
+        let x_raw = self.arg_form(out, &args[0])?;
+        let vt = self.ty(x_raw.c);
+        let x = self.compact(out, &x_raw, vt);
+        let (val, grad) = self.noise_center(out, orig_f, x.c, vt)?;
+        let val_a = self.noise_val_from_center(out, &x, val, grad, vt);
+        let val_a = self.unless_unbounded(out, &[x.clone()], val_a, f);
+        let val_a = self.compact(out, &val_a, f);
+
+        // Component-wise Hessian bound on `∇value_noise(p) - ∇value_noise(x.c)`:
+        // `err_k = NOISE_HESS_DIAG * r_k + NOISE_HESS_MIX * (r_{k+1} + r_{k+2}) + NOISE_ROUNDING`.
+        let reach = self.rad(out, &x, vt);
+        let r_yzx = self.emit(out, vt, Expr::Swizzle(reach, vec![1, 2, 0]));
+        let r_zxy = self.emit(out, vt, Expr::Swizzle(reach, vec![2, 0, 1]));
+        let other = self.bin(out, BinOp::Add, r_yzx, r_zxy, vt);
+        let k_diag = self.k(out, vt, NOISE_HESS_DIAG);
+        let k_mix = self.k(out, vt, NOISE_HESS_MIX);
+        let k_round = self.k(out, vt, NOISE_ROUNDING);
+        let t_diag = self.bin(out, BinOp::Mul, reach, k_diag, vt);
+        let t_mix = self.bin(out, BinOp::Mul, other, k_mix, vt);
+        let err = self.bin(out, BinOp::Add, t_diag, t_mix, vt);
+        let err = self.bin(out, BinOp::Add, err, k_round, vt);
+        // Clamp to the global analytical bound `[-3.75 - NOISE_ROUNDING, 3.75 + NOISE_ROUNDING]`.
+        let gmax = self.k(out, vt, NOISE_GRAD_MAX + NOISE_ROUNDING);
+        let gmin = self.k(out, vt, -(NOISE_GRAD_MAX + NOISE_ROUNDING));
+        let lo_raw = self.bin(out, BinOp::Sub, grad, err, vt);
+        let hi_raw = self.bin(out, BinOp::Add, grad, err, vt);
+        let g_lo = self.builtin(out, Builtin::Max, vec![lo_raw, gmin], vt);
+        let g_hi = self.builtin(out, Builtin::Min, vec![hi_raw, gmax], vt);
+        let g_lo = self.builtin(out, Builtin::Min, vec![g_lo, g_hi], vt);
+        let grad_a = self.of_ends(out, g_lo, g_hi, vt);
+        let grad_a = self.unless_unbounded(out, &[x.clone()], grad_a, vt);
+
+        let mut fields = Vec::with_capacity(1 + ad_n);
+        fields.push(val_a);
+        for j in 0..ad_n {
+            let tj = self.arg_form(out, &args[1 + j])?;
+            let prod = self.mul(out, &grad_a, &tj, vt);
+            let dj = self.sum(out, &prod, vt, f);
+            let dj = self.unless_unbounded(out, &[x.clone(), tj], dj, f);
+            let dj = self.compact(out, &dj, f);
+            fields.push(dj);
+        }
+        let c =
+            self.emit(out, ret_ty, Expr::Construct(ret_ty, fields.iter().map(|a| a.c).collect()));
+        let l = (0..self.n)
+            .map(|i| {
+                self.emit(
+                    out,
+                    ret_ty,
+                    Expr::Construct(ret_ty, fields.iter().map(|a| a.l[i]).collect()),
+                )
+            })
+            .collect();
+        let e =
+            self.emit(out, ret_ty, Expr::Construct(ret_ty, fields.iter().map(|a| a.e).collect()));
+        Ok(A::plain(c, l, e))
     }
 }
 
@@ -2512,5 +3994,40 @@ mod tests {
         affine(&mut m, &mut DeriveCache::default(), id, 0, Target::Cpu, (range, range))
             .expect("the plain interval answers");
         verify(&m).expect("no form of an aggregate is bounded as a float");
+    }
+
+    /// `affine_form` derives only the affine form and emits NO plain interval derivation or call.
+    #[test]
+    fn affine_form_emits_no_plain_interval() {
+        let mut m = Module::default();
+        let f32 = m.types.f32();
+        let box1 = m.types.intern(TypeDef::Struct {
+            name: "Interval".into(),
+            fields: vec![("lo".into(), f32), ("hi".into(), f32)],
+        });
+        let aff1 = m.types.intern(TypeDef::Struct {
+            name: "Affine1".into(),
+            fields: vec![("c".into(), f32), ("l".into(), f32), ("e".into(), f32)],
+        });
+        // fn f(x: f32) -> f32 { x * x + x }
+        let mut f = Function::new("sq_plus", vec![Param::value("x", f32)], Some(f32));
+        let mut body = Vec::new();
+        let x = f.let_(&mut body, f32, Expr::Param(0));
+        let xx = f.let_(&mut body, f32, Expr::Binary(BinOp::Mul, x, x));
+        let r = f.let_(&mut body, f32, Expr::Binary(BinOp::Add, xx, x));
+        body.push(Stmt::Return(Some(r)));
+        f.body = body;
+        let id = m.add_function(f);
+        verify(&m).expect("valid source");
+        let af_id =
+            affine_form(&mut m, &mut DeriveCache::default(), id, 0, Target::Cpu, (box1, aff1))
+                .expect("affine_form succeeds");
+        verify(&m).expect("valid affine_form IR");
+        let has_iv = m
+            .functions
+            .iter()
+            .any(|fn_| fn_.name.ends_with("_interval") || fn_.name.ends_with("_iv"));
+        assert!(!has_iv, "affine_form must not derive a plain interval function");
+        assert_eq!(m.functions[af_id.index()].ret, Some(aff1));
     }
 }

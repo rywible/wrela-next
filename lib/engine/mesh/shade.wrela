@@ -22,7 +22,7 @@ use mesh::tsr::project_uv_unjittered
 use picture::eye::View
 use picture::screen::luma
 use std::derive::value_and_gradient
-use std::field::{DualQuat, Field, Live, Rigid}
+use std::field::{DualQuat, Field, FieldFacts, Live, Rigid}
 use std::gpu::{
     ClipPosition, ComparisonSampler, DepthTexture, Flat, FragCoord, GlobalId, InstanceIndex,
     R16Float, R32Float, Rgba8, Rgba16Float, Rgba32Float, Sampler, Targets2, Targets4, Texels,
@@ -286,8 +286,10 @@ fn apply_micro_relief_deriv(
     n: vec3,
     sub: Substance,
     dist: f32,
+    may_micro: bool = true,
+    may_coat: bool = true,
 ) -> (vec3, Substance) {
-    if sub.micro <= 0.01 {
+    if !may_micro || sub.micro <= 0.01 {
         return (n, sub)
     }
     let fade = clamp(1.0 - (dist - 4.0) / 28.0, 0.0, 1.0)
@@ -308,14 +310,16 @@ fn apply_micro_relief_deriv(
     } else {
         mg.xyz - n * dot(mg.xyz, n)
     }
-    let bump_s = if sub.coat > 0.2 { 0.024 } else { 0.045 }
+    let bump_s = if may_coat && sub.coat > 0.2 { 0.024 } else { 0.045 }
     let n_bumped = normalize(n - g_tan * (amp * bump_s))
     let grain = clamp(mg.w, -1.0, 1.0)
     let albedo_mod = clamp(sub.albedo * (1.0 + grain * amp * 0.14), vec3(0.01), vec3(1.0))
     let rough_mod = clamp(sub.roughness + grain * amp * 0.12, 0.03, 1.0)
     // A coat's thickness follows the micro-grain, so any coated substance's (`coat > 0.1`)
     // clearcoat varies across its surface with the same relief.
-    let coat_mod = if sub.coat > 0.1 { clamp(sub.coat + grain * amp * 0.25, 0.0, 1.0) } else {
+    let coat_mod = if may_coat && sub.coat > 0.1 {
+        clamp(sub.coat + grain * amp * 0.25, 0.0, 1.0)
+    } else {
         sub.coat
     }
     (n_bumped, Substance {
@@ -336,8 +340,10 @@ fn apply_micro_relief_rigid(
     n: vec3,
     sub: Substance,
     dist: f32,
+    may_micro: bool = true,
+    may_coat: bool = true,
 ) -> (vec3, Substance) {
-    if sub.micro <= 0.01 {
+    if !may_micro || sub.micro <= 0.01 {
         return (n, sub)
     }
     let fade = clamp(1.0 - (dist - 4.0) / 28.0, 0.0, 1.0)
@@ -354,12 +360,14 @@ fn apply_micro_relief_rigid(
         dot(xf.row2.xyz, mg.xyz),
     ) * inv_s2
     let g_tan = g_w - n * dot(g_w, n)
-    let bump_s = if sub.coat > 0.2 { 0.024 } else { 0.045 }
+    let bump_s = if may_coat && sub.coat > 0.2 { 0.024 } else { 0.045 }
     let n_bumped = normalize(n - g_tan * (amp * bump_s))
     let grain = clamp(mg.w, -1.0, 1.0)
     let albedo_mod = clamp(sub.albedo * (1.0 + grain * amp * 0.14), vec3(0.01), vec3(1.0))
     let rough_mod = clamp(sub.roughness + grain * amp * 0.12, 0.03, 1.0)
-    let coat_mod = if sub.coat > 0.1 { clamp(sub.coat + grain * amp * 0.25, 0.0, 1.0) } else {
+    let coat_mod = if may_coat && sub.coat > 0.1 {
+        clamp(sub.coat + grain * amp * 0.25, 0.0, 1.0)
+    } else {
         sub.coat
     }
     (n_bumped, Substance {
@@ -371,13 +379,24 @@ fn apply_micro_relief_rigid(
 }
 
 /// Applies per-pixel 3D field-space microsurface relief using hardware quad screen derivatives.
-fn apply_micro_relief(wp: vec3, mp: vec3, n: vec3, sub: Substance, dist: f32) -> (vec3, Substance) {
+fn apply_micro_relief(
+    wp: vec3,
+    mp: vec3,
+    n: vec3,
+    sub: Substance,
+    dist: f32,
+    may_micro: bool = true,
+    may_coat: bool = true,
+) -> (vec3, Substance) {
+    if !may_micro {
+        return (n, sub)
+    }
     // Derivatives first, while every pixel of the quad still runs this code.
     let dwx = dpdx(wp)
     let dwy = dpdy(wp)
     let dmx = dpdx(mp)
     let dmy = dpdy(mp)
-    apply_micro_relief_deriv(dwx, dwy, dmx, dmy, mp, n, sub, dist)
+    apply_micro_relief_deriv(dwx, dwy, dmx, dmy, mp, n, sub, dist, may_micro, may_coat)
 }
 
 /// Resolves crease-preserving shading normal from interpolated analytic normal and explicit
@@ -421,17 +440,27 @@ pub(package) fn shade_gbuf_rigid(
     sub0: Substance,
     v: View,
     prev_v: View,
+    facts: FieldFacts = FieldFacts::unknown(),
 ) -> Targets4<vec4, vec4, vec4, vec2> {
     let to_eye = v.at - wp
     let dist = length(to_eye)
     let ray_back = if dist > 1.0e-6 { to_eye / dist } else { -v.forward }
     let n0 = resolve_normal_exact(face_n, normal, smooth, ray_back)
-    let (n, sub) = apply_micro_relief_rigid(xf, mp, n0, sub0, dist)
+    let (n, sub) = apply_micro_relief_rigid(
+        xf,
+        mp,
+        n0,
+        sub0,
+        dist,
+        facts.may_micro,
+        facts.may_coat,
+    )
     let motion = motion_of(wp, prev_wp, v, prev_v)
+    let emits = if facts.may_emit { max(sub.emits, vec3(0.0)) } else { vec3(0.0) }
     Targets4 {
         first: vec4(n * 0.5 + vec3(0.5), 1.0),
         second: vec4(clamp(sub.albedo, vec3(0.0), vec3(1.0)), clamp(sub.roughness, 0.02, 1.0)),
-        third: vec4(max(sub.emits, vec3(0.0)), encode_mat_signed(sub)),
+        third: vec4(emits, encode_mat_signed(sub)),
         fourth: motion,
     }
 }
@@ -453,17 +482,30 @@ pub(package) fn shade_gbuf_exact(
     sub0: Substance,
     v: View,
     prev_v: View,
+    facts: FieldFacts = FieldFacts::unknown(),
 ) -> Targets4<vec4, vec4, vec4, vec2> {
     let to_eye = v.at - wp
     let dist = length(to_eye)
     let ray_back = if dist > 1.0e-6 { to_eye / dist } else { -v.forward }
     let n0 = resolve_normal_exact(face_n, normal, smooth, ray_back)
-    let (n, sub) = apply_micro_relief_deriv(dwx, dwy, dmx, dmy, mp, n0, sub0, dist)
+    let (n, sub) = apply_micro_relief_deriv(
+        dwx,
+        dwy,
+        dmx,
+        dmy,
+        mp,
+        n0,
+        sub0,
+        dist,
+        facts.may_micro,
+        facts.may_coat,
+    )
     let motion = motion_of(wp, prev_wp, v, prev_v)
+    let emits = if facts.may_emit { max(sub.emits, vec3(0.0)) } else { vec3(0.0) }
     Targets4 {
         first: vec4(n * 0.5 + vec3(0.5), 1.0),
         second: vec4(clamp(sub.albedo, vec3(0.0), vec3(1.0)), clamp(sub.roughness, 0.02, 1.0)),
-        third: vec4(max(sub.emits, vec3(0.0)), encode_mat_signed(sub)),
+        third: vec4(emits, encode_mat_signed(sub)),
         fourth: motion,
     }
 }
@@ -479,17 +521,19 @@ fn shade_gbuf_core(
     sub0: Substance,
     v: View,
     prev_v: View,
+    facts: FieldFacts = FieldFacts::unknown(),
 ) -> Targets4<vec4, vec4, vec4, vec2> {
     let to_eye = v.at - wp
     let dist = length(to_eye)
     let ray_back = if dist > 1.0e-6 { to_eye / dist } else { -v.forward }
     let n0 = resolve_normal_from(wp, normal, smooth, ray_back)
-    let (n, sub) = apply_micro_relief(wp, mp, n0, sub0, dist)
+    let (n, sub) = apply_micro_relief(wp, mp, n0, sub0, dist, facts.may_micro, facts.may_coat)
     let motion = motion_of(wp, prev_wp, v, prev_v)
+    let emits = if facts.may_emit { max(sub.emits, vec3(0.0)) } else { vec3(0.0) }
     Targets4 {
         first: vec4(n * 0.5 + vec3(0.5), 1.0),
         second: vec4(clamp(sub.albedo, vec3(0.0), vec3(1.0)), clamp(sub.roughness, 0.02, 1.0)),
-        third: vec4(max(sub.emits, vec3(0.0)), encode_mat_signed(sub)),
+        third: vec4(emits, encode_mat_signed(sub)),
         fourth: motion,
     }
 }
@@ -505,8 +549,19 @@ pub(package) fn field_gbuf_many_fs<M: Field<Substance>>(
     prev_v: View,
 ) -> Targets4<vec4, vec4, vec4, vec2> {
     let tid = min(u32(max(vary.meta.y, 0.0)), n_fields - 1)
-    let sub0 = fields[tid].channels(vary.wp)
-    shade_gbuf_core(vary.wp, vary.prev_wp, vary.local_p, vary.normal, vary.meta.x, sub0, v, prev_v)
+    let f = fields[tid]
+    let sub0 = f.channels(vary.wp)
+    shade_gbuf_core(
+        vary.wp,
+        vary.prev_wp,
+        vary.local_p,
+        vary.normal,
+        vary.meta.x,
+        sub0,
+        v,
+        prev_v,
+        f.field_facts(),
+    )
 }
 
 /// Skin-locked pixel-rate G-buffer fragment shader for `Skinned` `Pool<M>` crowds.
@@ -520,8 +575,19 @@ pub(package) fn field_skin_gbuf_many_fs<M: Field<Substance>>(
     prev_v: View,
 ) -> Targets4<vec4, vec4, vec4, vec2> {
     let tid = min(u32(max(vary.meta.y, 0.0)), n_fields - 1)
-    let sub0 = fields[tid].rest_channels(vary.rest_p)
-    shade_gbuf_core(vary.wp, vary.prev_wp, vary.rest_p, vary.normal, vary.meta.x, sub0, v, prev_v)
+    let f = fields[tid]
+    let sub0 = f.rest_channels(vary.rest_p)
+    shade_gbuf_core(
+        vary.wp,
+        vary.prev_wp,
+        vary.rest_p,
+        vary.normal,
+        vary.meta.x,
+        sub0,
+        v,
+        prev_v,
+        f.field_facts(),
+    )
 }
 
 /// The opaque pixels of a `Skinned` `Pool<M>`'s transmissive quads into the G-buffer.
@@ -535,12 +601,26 @@ pub(package) fn field_skin_cut_gbuf_many_fs<M: Field<Substance>>(
     prev_v: View,
 ) -> Targets4<vec4, vec4, vec4, vec2> {
     let tid = min(u32(max(vary.meta.y, 0.0)), n_fields - 1)
-    let sub0 = fields[tid].rest_channels(vary.rest_p)
-    match prove_transmissive_only(sub0) {
-        Some(p) => discard_proven(p),
-        None => {},
+    let f = fields[tid]
+    let facts = f.field_facts()
+    let sub0 = f.rest_channels(vary.rest_p)
+    if facts.may_transmit {
+        match prove_transmissive_only(sub0) {
+            Some(p) => discard_proven(p),
+            None => {},
+        }
     }
-    shade_gbuf_core(vary.wp, vary.prev_wp, vary.rest_p, vary.normal, vary.meta.x, sub0, v, prev_v)
+    shade_gbuf_core(
+        vary.wp,
+        vary.prev_wp,
+        vary.rest_p,
+        vary.normal,
+        vary.meta.x,
+        sub0,
+        v,
+        prev_v,
+        facts,
+    )
 }
 
 /// Lean interpolator for Tier-2 `ExactCell` AABB shells (`exact_box_vs` -> `exact_box_one_fs`):
@@ -660,10 +740,17 @@ pub(package) fn exact_box_one_fs<M: Field<Substance>>(
     // Only what is in front of what the mesh drew here, less half a pixel: a surface nearer by
     // less shows as the mesh within the outline's error, and one past it is hidden.
     let (t0, t1) = seen_part(rb, bg_z, margin: HOLE_PX * px)
-    let lip = field.lipschitz(1.7320508 * h)
-    // A field that states no bound here (a closure, a warp) is solved by intervals over the ray
-    // (`solve_cell_ray`'s affine halving), never taken to fill the box.
-    let res = if lip > 0.0 && lip < 1.0e12 {
+    let facts = field.field_facts()
+    let lip = if facts.lip > 0.0 && facts.lip < 1.0e12 {
+        min(facts.lip, field.lipschitz(1.7320508 * h))
+    } else {
+        field.lipschitz(1.7320508 * h)
+    }
+    // When `facts.lip` is statically finite (build-time proven), the compiler constant-folds the
+    // branch and erases `solve_cell_ray`'s 1D affine fallback from the shipped shader completely.
+    let res = if facts.lip > 0.0 && facts.lip < 1.0e12 {
+        solve_cell_ray_lipschitz(field, live, v.at, d, t0, t1, px, lip)
+    } else if lip > 0.0 && lip < 1.0e12 {
         solve_cell_ray_lipschitz(field, live, v.at, d, t0, t1, px, lip)
     } else {
         solve_cell_ray(|q: vec3| field.distance_live(q, live), v.at, d, t0, t1, px, lip)
@@ -679,14 +766,16 @@ pub(package) fn exact_box_one_fs<M: Field<Substance>>(
     }
     let hit_p = v.at + d * t_hit
     let sub0 = field.channels(hit_p)
-    match prove_transmissive_only(sub0) {
-        Some(proof) => discard_proven(proof),
-        None => {},
+    if facts.may_transmit {
+        match prove_transmissive_only(sub0) {
+            Some(proof) => discard_proven(proof),
+            None => {},
+        }
     }
     let (_, gv) = value_and_gradient(|q: vec3| field.distance_live(q, live), hit_p)
     let gl = length(gv)
     let n = if gl > 1.0e-6 { gv / gl } else { -d }
-    let out = shade_gbuf_core(hit_p, hit_p, hit_p, n, 1.0, sub0, v, prev_v)
+    let out = shade_gbuf_core(hit_p, hit_p, hit_p, n, 1.0, sub0, v, prev_v, facts)
     WithDepthBehind { color: out, depth: depth_of(v, hit_p) }
 }
 

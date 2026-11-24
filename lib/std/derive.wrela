@@ -208,25 +208,296 @@ pub struct Box4: Copy + GpuData {
     pub hi: vec4,
 }
 
-/// What a derived function can take: `f32` and the float vectors, each with its box type.
+/// The largest magnitude an affine form may have and still represent a finite bound (`CAP` in
+/// `ir::derive::affine`); past this, `valid()` is false and `lo()`/`hi()` are unbounded.
+const AFFINE_CAP: f32 = 1.0e15
+/// One f32 ulp at 1 (`2^-23`).
+const AFFINE_EPS: f32 = 1.0 / 8388608.0
+/// Smallest positive normal f32 (`> 2^-126`), covering GPU flush-to-zero subnormals.
+const AFFINE_TINY: f32 = 1.2e-38
+
+/// A 1D affine form `c + l * u ± e` over `u ∈ [-1, 1]`, produced by `affine_form` over an
+/// `Interval`: for every `x` in the input interval, `f(x)` lies in `c + l * u ± e` for
+/// `x = c_in + h_in * u + δ` (`|δ| ≤ 2·2⁻²³·|c_in| + 2·tiny`, `h_in = 0.5·(hi - lo)·(1 + 2·2⁻²³)`).
+pub struct Affine1: Copy + GpuData {
+    pub c: f32,
+    pub l: f32,
+    pub e: f32,
+}
+
+impl Affine1 {
+    /// Whether this form holds a finite bound (`false` for NaN, infinite, or overflowed forms).
+    pub fn valid(self) -> bool {
+        let mag = abs(self.c) + abs(self.l) + self.e
+        mag <= AFFINE_CAP && self.e >= 0.0
+    }
+
+    /// Sound lower bound over `u ∈ [-1, 1]`, rounded outward; `-∞` when not `valid()`.
+    pub fn lo(self) -> f32 {
+        let rad = abs(self.l) + self.e
+        let mag = abs(self.c) + rad
+        if !(mag <= AFFINE_CAP && self.e >= 0.0) {
+            return -1.0 / 0.0
+        }
+        let margin = mag * (6.0 * AFFINE_EPS) + AFFINE_TINY
+        self.c - (rad + margin)
+    }
+
+    /// Sound upper bound over `u ∈ [-1, 1]`, rounded outward; `+∞` when not `valid()`.
+    pub fn hi(self) -> f32 {
+        let rad = abs(self.l) + self.e
+        let mag = abs(self.c) + rad
+        if !(mag <= AFFINE_CAP && self.e >= 0.0) {
+            return 1.0 / 0.0
+        }
+        let margin = mag * (6.0 * AFFINE_EPS) + AFFINE_TINY
+        self.c + (rad + margin)
+    }
+
+    /// Sound `[lo, hi]` interval over `u ∈ [-1, 1]`.
+    pub fn range(self) -> Interval {
+        Interval { lo: self.lo(), hi: self.hi() }
+    }
+
+    /// Sound `[lo, hi]` interval over the sub-range `u ∈ [u_lo, u_hi] ⊆ [-1, 1]`.
+    pub fn sub_range(self, u_lo: f32, u_hi: f32) -> Interval {
+        if !self.valid() {
+            return Interval { lo: -1.0 / 0.0, hi: 1.0 / 0.0 }
+        }
+        let a = self.l * u_lo
+        let b = self.l * u_hi
+        let lo0 = min(a, b)
+        let hi0 = max(a, b)
+        let mag = abs(self.c) + max(abs(a), abs(b)) + self.e
+        let margin = mag * (8.0 * AFFINE_EPS) + 3.0 * AFFINE_TINY
+        Interval { lo: (self.c + lo0) - (self.e + margin), hi: (self.c + hi0) + (self.e + margin) }
+    }
+}
+
+/// A 2D affine form `c + dot(l, u) ± e` over `u ∈ [-1, 1]²`, produced by `affine_form` over a `Box2`.
+pub struct Affine2: Copy + GpuData {
+    pub c: f32,
+    pub l: vec2,
+    pub e: f32,
+}
+
+impl Affine2 {
+    /// Whether this form holds a finite bound (`false` for NaN, infinite, or overflowed forms).
+    pub fn valid(self) -> bool {
+        let mag = abs(self.c) + abs(self.l.x) + abs(self.l.y) + self.e
+        mag <= AFFINE_CAP && self.e >= 0.0
+    }
+
+    /// Sound lower bound over `u ∈ [-1, 1]²`, rounded outward; `-∞` when not `valid()`.
+    pub fn lo(self) -> f32 {
+        let rad = abs(self.l.x) + abs(self.l.y) + self.e
+        let mag = abs(self.c) + rad
+        if !(mag <= AFFINE_CAP && self.e >= 0.0) {
+            return -1.0 / 0.0
+        }
+        let margin = mag * (8.0 * AFFINE_EPS) + AFFINE_TINY
+        self.c - (rad + margin)
+    }
+
+    /// Sound upper bound over `u ∈ [-1, 1]²`, rounded outward; `+∞` when not `valid()`.
+    pub fn hi(self) -> f32 {
+        let rad = abs(self.l.x) + abs(self.l.y) + self.e
+        let mag = abs(self.c) + rad
+        if !(mag <= AFFINE_CAP && self.e >= 0.0) {
+            return 1.0 / 0.0
+        }
+        let margin = mag * (8.0 * AFFINE_EPS) + AFFINE_TINY
+        self.c + (rad + margin)
+    }
+
+    /// Sound `[lo, hi]` interval over `u ∈ [-1, 1]²`.
+    pub fn range(self) -> Interval {
+        Interval { lo: self.lo(), hi: self.hi() }
+    }
+
+    /// Sound `[lo, hi]` interval over the sub-box `u ∈ [u_lo, u_hi] ⊆ [-1, 1]²`.
+    pub fn sub_range(self, u_lo: vec2, u_hi: vec2) -> Interval {
+        if !self.valid() {
+            return Interval { lo: -1.0 / 0.0, hi: 1.0 / 0.0 }
+        }
+        let a = self.l * u_lo
+        let b = self.l * u_hi
+        let mn = min(a, b)
+        let mx = max(a, b)
+        let am = max(abs(a), abs(b))
+        let mag = abs(self.c) + am.x + am.y + self.e
+        let margin = mag * (10.0 * AFFINE_EPS) + 4.0 * AFFINE_TINY
+        Interval {
+            lo: (self.c + mn.x + mn.y) - (self.e + margin),
+            hi: (self.c + mx.x + mx.y) + (self.e + margin),
+        }
+    }
+}
+
+/// A 3D affine form `c + dot(l, u) ± e` over `u ∈ [-1, 1]³`, produced by `affine_form` over a `Box3`.
+pub struct Affine3: Copy + GpuData {
+    pub c: f32,
+    pub l: vec3,
+    pub e: f32,
+}
+
+impl Affine3 {
+    /// Whether this form holds a finite bound (`false` for NaN, infinite, or overflowed forms).
+    pub fn valid(self) -> bool {
+        let mag = abs(self.c) + abs(self.l.x) + abs(self.l.y) + abs(self.l.z) + self.e
+        mag <= AFFINE_CAP && self.e >= 0.0
+    }
+
+    /// Sound lower bound over `u ∈ [-1, 1]³`, rounded outward; `-∞` when not `valid()`.
+    pub fn lo(self) -> f32 {
+        let rad = abs(self.l.x) + abs(self.l.y) + abs(self.l.z) + self.e
+        let mag = abs(self.c) + rad
+        if !(mag <= AFFINE_CAP && self.e >= 0.0) {
+            return -1.0 / 0.0
+        }
+        let margin = mag * (10.0 * AFFINE_EPS) + AFFINE_TINY
+        self.c - (rad + margin)
+    }
+
+    /// Sound upper bound over `u ∈ [-1, 1]³`, rounded outward; `+∞` when not `valid()`.
+    pub fn hi(self) -> f32 {
+        let rad = abs(self.l.x) + abs(self.l.y) + abs(self.l.z) + self.e
+        let mag = abs(self.c) + rad
+        if !(mag <= AFFINE_CAP && self.e >= 0.0) {
+            return 1.0 / 0.0
+        }
+        let margin = mag * (10.0 * AFFINE_EPS) + AFFINE_TINY
+        self.c + (rad + margin)
+    }
+
+    /// Sound `[lo, hi]` interval over `u ∈ [-1, 1]³`.
+    pub fn range(self) -> Interval {
+        Interval { lo: self.lo(), hi: self.hi() }
+    }
+
+    /// Sound `[lo, hi]` interval over the sub-box `u ∈ [u_lo, u_hi] ⊆ [-1, 1]³`.
+    pub fn sub_range(self, u_lo: vec3, u_hi: vec3) -> Interval {
+        if !self.valid() {
+            return Interval { lo: -1.0 / 0.0, hi: 1.0 / 0.0 }
+        }
+        let a = self.l * u_lo
+        let b = self.l * u_hi
+        let mn = min(a, b)
+        let mx = max(a, b)
+        let am = max(abs(a), abs(b))
+        let mag = abs(self.c) + am.x + am.y + am.z + self.e
+        let margin = mag * (12.0 * AFFINE_EPS) + 5.0 * AFFINE_TINY
+        Interval {
+            lo: (self.c + mn.x + mn.y + mn.z) - (self.e + margin),
+            hi: (self.c + mx.x + mx.y + mx.z) + (self.e + margin),
+        }
+    }
+
+    /// Sound `[lo, hi]` interval over octant `k` (`0..8`, matching `Box3::split`: bit 0 = +x,
+    /// bit 1 = +y, bit 2 = +z) without re-evaluating the field.
+    pub fn octant_range(self, k: u32) -> Interval {
+        if !self.valid() {
+            return Interval { lo: -1.0 / 0.0, hi: 1.0 / 0.0 }
+        }
+        let s = vec3(
+            if (k & 1) == 0 { -0.5 } else { 0.5 },
+            if (k & 2) == 0 { -0.5 } else { 0.5 },
+            if (k & 4) == 0 { -0.5 } else { 0.5 },
+        )
+        let c_oct = self.c + self.l.x * s.x + self.l.y * s.y + self.l.z * s.z
+        let half_l = 0.5 * (abs(self.l.x) + abs(self.l.y) + abs(self.l.z))
+        let rad = half_l + self.e
+        let mag = abs(self.c) + abs(self.l.x) + abs(self.l.y) + abs(self.l.z) + self.e
+        let margin = mag * (12.0 * AFFINE_EPS) + 5.0 * AFFINE_TINY
+        Interval { lo: c_oct - (rad + margin), hi: c_oct + (rad + margin) }
+    }
+}
+
+/// A 4D affine form `c + dot(l, u) ± e` over `u ∈ [-1, 1]⁴`, produced by `affine_form` over a `Box4`.
+pub struct Affine4: Copy + GpuData {
+    pub c: f32,
+    pub l: vec4,
+    pub e: f32,
+}
+
+impl Affine4 {
+    /// Whether this form holds a finite bound (`false` for NaN, infinite, or overflowed forms).
+    pub fn valid(self) -> bool {
+        let mag = abs(self.c) + abs(self.l.x) + abs(self.l.y) + abs(self.l.z) + abs(self.l.w) + self.e
+        mag <= AFFINE_CAP && self.e >= 0.0
+    }
+
+    /// Sound lower bound over `u ∈ [-1, 1]⁴`, rounded outward; `-∞` when not `valid()`.
+    pub fn lo(self) -> f32 {
+        let rad = abs(self.l.x) + abs(self.l.y) + abs(self.l.z) + abs(self.l.w) + self.e
+        let mag = abs(self.c) + rad
+        if !(mag <= AFFINE_CAP && self.e >= 0.0) {
+            return -1.0 / 0.0
+        }
+        let margin = mag * (12.0 * AFFINE_EPS) + AFFINE_TINY
+        self.c - (rad + margin)
+    }
+
+    /// Sound upper bound over `u ∈ [-1, 1]⁴`, rounded outward; `+∞` when not `valid()`.
+    pub fn hi(self) -> f32 {
+        let rad = abs(self.l.x) + abs(self.l.y) + abs(self.l.z) + abs(self.l.w) + self.e
+        let mag = abs(self.c) + rad
+        if !(mag <= AFFINE_CAP && self.e >= 0.0) {
+            return 1.0 / 0.0
+        }
+        let margin = mag * (12.0 * AFFINE_EPS) + AFFINE_TINY
+        self.c + (rad + margin)
+    }
+
+    /// Sound `[lo, hi]` interval over `u ∈ [-1, 1]⁴`.
+    pub fn range(self) -> Interval {
+        Interval { lo: self.lo(), hi: self.hi() }
+    }
+
+    /// Sound `[lo, hi]` interval over the sub-box `u ∈ [u_lo, u_hi] ⊆ [-1, 1]⁴`.
+    pub fn sub_range(self, u_lo: vec4, u_hi: vec4) -> Interval {
+        if !self.valid() {
+            return Interval { lo: -1.0 / 0.0, hi: 1.0 / 0.0 }
+        }
+        let a = self.l * u_lo
+        let b = self.l * u_hi
+        let mn = min(a, b)
+        let mx = max(a, b)
+        let am = max(abs(a), abs(b))
+        let mag = abs(self.c) + am.x + am.y + am.z + am.w + self.e
+        let margin = mag * (14.0 * AFFINE_EPS) + 6.0 * AFFINE_TINY
+        Interval {
+            lo: (self.c + mn.x + mn.y + mn.z + mn.w) - (self.e + margin),
+            hi: (self.c + mx.x + mx.y + mx.z + mx.w) + (self.e + margin),
+        }
+    }
+}
+
+/// What a derived function can take: `f32` and the float vectors, each with its box and affine
+/// form types.
 pub trait Domain {
     type Box
+    type Affine
 }
 
 impl Domain for f32 {
     type Box = Interval
+    type Affine = Affine1
 }
 
 impl Domain for vec2 {
     type Box = Box2
+    type Affine = Affine2
 }
 
 impl Domain for vec3 {
     type Box = Box3
+    type Affine = Affine3
 }
 
 impl Domain for vec4 {
     type Box = Box4
+    type Affine = Affine4
 }
 
 /// The gradient of `f` at `at`, by forward-mode differentiation of `f`'s body.
@@ -250,14 +521,26 @@ pub fn value_gradient_with<X: Domain, T>(f: fn(X) -> (f32, T), at: X) -> (f32, X
 pub fn interval<X: Domain, Y: Domain>(f: fn(X) -> Y, over: X::Box) -> Y::Box {}
 
 /// A range that contains `f(x)` for every `x` in `over`, from `f`'s affine form over the box
-/// (first order, one error term: Stolfi and de Figueiredo's affine arithmetic, reduced),
-/// intersected with `interval(f, over)`'s, so never looser than it. Where `f` is smooth over the
-/// box the form's range closes on the true one as the box shrinks, by its square, where an
-/// interval's stays a multiple of its width: `x - x` is 0 here. Sound as the target rounds, as the
-/// interval is. A function the form can't follow (one whose active values aren't floats) gets the
-/// interval; an operation with no affine rule takes the interval's for itself and goes on.
+/// (Stolfi and de Figueiredo's affine arithmetic), intersected with `interval(f, over)`'s, so
+/// never looser than it. Supports both scalar `f32` (`-> Interval`) and float vector (`-> Box2`/
+/// `Box3`/`Box4`) outputs. Where `f` is smooth over the box the form's range closes on the true
+/// one as the box shrinks, by its square, where an interval's stays a multiple of its width:
+/// `x - x` is 0 here. Sound as the target rounds, as the interval is.
 @intrinsic
-pub fn affine<X: Domain>(f: fn(X) -> f32, over: X::Box) -> Interval {}
+pub fn affine<X: Domain, Y: Domain>(f: fn(X) -> Y, over: X::Box) -> Y::Box {}
+
+/// The affine form `c + dot(l, u) ± e` of `f` over `over` (`u ∈ [-1, 1]^n`), returned directly
+/// without computing a redundant plain interval alongside it. Falls back to wrapping `interval`
+/// only when `f` cannot be affine-derived. Sound as the target rounds.
+@intrinsic
+pub fn affine_form<X: Domain>(f: fn(X) -> f32, over: X::Box) -> X::Affine {}
+
+/// A sound upper bound on `sup_{x ∈ over} ||∇f(x)||₂`, derived by hybrid Clarke-subdifferential
+/// and exact interval-Jacobian propagation: preserves exact `1.0` bounds across orthogonal
+/// rotations, `abs`, `min`, `max`, `clamp`, `smin`, `length`, and piecewise branches without
+/// crease blowup, and pads upward for target rounding.
+@intrinsic
+pub fn lipschitz<X: Domain>(f: fn(X) -> f32, over: X::Box) -> f32 {}
 
 /// For `wrela precision`: `interval(f, over)` twice, once widened as an `f32` rounds and once as
 /// a half float rounds, each noting every operation's range (`precision_note`). It returns
@@ -575,4 +858,80 @@ fn a_box_one_step_wide_splits_into_children_that_keep_its_ends() {
     let q = Box2 { lo: vec2(0.0, 1.0), hi: vec2(2.0, next) }
     let quarters = q.split()
     assert(quarters[3].hi == q.hi && quarters[2].hi.y == next && quarters[0].lo == q.lo)
+}
+
+@test
+fn affine_form_bounds_match_samples_and_octants() {
+    // 1D: f(t) = t * t - 2.0 * t + 0.5 over [0.5, 1.5]
+    let iv = Interval { lo: 0.5, hi: 1.5 }
+    let af1 = affine_form(|t: f32| t * t - 2.0 * t + 0.5, iv)
+    assert(af1.valid(), "1D affine form should be valid")
+    let r1 = af1.range()
+    for i in 0..64 {
+        let t = iv.sample(3, i)
+        let v = t * t - 2.0 * t + 0.5
+        assert(r1.contains(v), f"1D affine_form missed {v} outside [{r1.lo}, {r1.hi}]")
+    }
+    // Sub-range over left half u in [-1, 0] (t in [0.5, 1.0])
+    let sub1 = af1.sub_range(u_lo: -1.0, u_hi: 0.0)
+    for i in 0..32 {
+        let t = Interval { lo: 0.5, hi: 1.0 }.sample(5, i)
+        let v = t * t - 2.0 * t + 0.5
+        assert(sub1.contains(v), f"1D sub_range missed {v} outside [{sub1.lo}, {sub1.hi}]")
+    }
+
+    // 3D: smooth nonlinear field over Box3 + octant_range check
+    let b3 = Box3 { lo: vec3(0.4, -0.3, 0.2), hi: vec3(0.6, -0.1, 0.4) }
+    let f3 = |p: vec3| length(p) - 0.5 + 0.1 * sin(p.x * 2.0 + p.y)
+    let af3 = affine_form(f3, b3)
+    assert(af3.valid(), "3D affine form should be valid")
+    let r3 = af3.range()
+    for i in 0..64 {
+        let p = b3.sample(7, i)
+        let v = f3(p)
+        assert(r3.contains(v), f"3D affine_form missed {v} outside [{r3.lo}, {r3.hi}]")
+    }
+    let octs = b3.split()
+    for k in 0..8 {
+        let orng = af3.octant_range(k)
+        for i in 0..16 {
+            let p = octs[k].sample(9 + k, i)
+            let v = f3(p)
+            assert(orng.contains(v), f"octant {k} missed {v} outside [{orng.lo}, {orng.hi}]")
+        }
+    }
+
+    // Unbounded quotient marks valid() == false and lo()/hi() == ±inf
+    let bad = affine_form(|t: f32| 1.0 / t, Interval { lo: -1.0, hi: 1.0 })
+    assert(!bad.valid(), "division across zero should not be valid")
+    assert(bad.lo() == -1.0 / 0.0 && bad.hi() == 1.0 / 0.0)
+
+    // Constant function has zero slope and zero error
+    let cst = affine_form(|_p: vec3| 3.25, b3)
+    assert(cst.valid() && cst.c == 3.25 && cst.l == vec3(0.0) && cst.e == 0.0)
+}
+
+@test
+fn vector_affine_bounds_gradient_and_vectors() {
+    let b = Box3 { lo: vec3(0.5, 0.2, -0.4), hi: vec3(0.7, 0.4, -0.2) }
+    let g_fn = |q: vec3| gradient(|p: vec3| length(p) - 1.0, q)
+    let ga = affine(g_fn, b)
+    let gi = interval(g_fn, b)
+    for i in 0..64 {
+        let p = b.sample(13, i)
+        let g = g_fn(p)
+        assert(ga.contains(g), f"vector affine missed gradient {g} outside [{ga.lo}, {ga.hi}]")
+    }
+    // Affine bound is never looser than plain interval
+    assert(
+        ga.lo.x >= gi.lo.x && ga.lo.y >= gi.lo.y && ga.lo.z >= gi.lo.z &&
+        ga.hi.x <= gi.hi.x && ga.hi.y <= gi.hi.y && ga.hi.z <= gi.hi.z,
+        "vector affine should be at least as tight as plain interval",
+    )
+    // vec2 and vec4 outputs also work
+    let b2 = Box2 { lo: vec2(0.1, 0.2), hi: vec2(0.3, 0.5) }
+    let v2 = affine(|p: vec2| vec2(p.x - p.x + p.y, p.x * p.y), b2)
+    assert(v2.lo.x >= 0.199 && v2.hi.x <= 0.501, f"vec2 cancellation failed: [{v2.lo}, {v2.hi}]")
+    let v4 = affine(|t: f32| vec4(t, -t, t * t, 1.0 - t), Interval { lo: 0.25, hi: 0.75 })
+    assert(v4.lo.x <= 0.25 && v4.hi.x >= 0.75 && v4.lo.z >= 0.0 && v4.hi.z <= 0.6)
 }

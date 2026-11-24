@@ -4,7 +4,7 @@
 // 12 cm, 8 mm and 1 mm centred on each surface, on the CPU and in a kernel, on both hosts.
 use std::cmp::Eq
 use std::collections::Vec
-use std::derive::{Box3, affine, interval, value_and_gradient}
+use std::derive::{Box3, Interval, affine, affine_form, gradient, interval, lipschitz, value_and_gradient}
 use std::field::{
     Bound, Cuboid, RoundCone, SmoothUnion, SmoothUnionAll, Sphere, Surface, Translate, Union, With,
     cuboid, ellipsoid, fbm, half_space, hash_u32, round_cone, sphere, value_noise,
@@ -488,5 +488,98 @@ fn a_range_holds_mut_writes_unbounded_quotients_and_underflowing_components() {
     for j in 0..64 {
         let d = normalize(sample(tiny, 0, j)).x
         assert(n.contains(d), f"normalize: {d} outside [{n.lo}, {n.hi}]")
+    }
+}
+
+/// Unbranched textbook box SDF `length(max(q, 0)) + min(max(q.x, max(q.y, q.z)), 0)`:
+/// AFk shared nonlinear symbols + single-component `length` shortcut cancel the face `O(h)` error
+/// identically to zero!
+fn unbranched_sd_box(p: vec3, half: vec3) -> f32 {
+    let q = abs(p) - half
+    length(max(q, vec3(0.0))) + min(max(q.x, max(q.y, q.z)), 0.0)
+}
+
+/// Exercises every new affine arithmetic rule (`affine_form`, vector `affine<vec3, vec3>`,
+/// `lipschitz`, AFk face cancellation, branch narrowing, `pow`/`log`/`log2`/`exp2`/`fract`/`%`/
+/// `atan`/`tan`/`asin`/`acos`/`cross`, and analytical `value_noise` gradient bounds).
+@test
+fn new_affine_rules_afk_branch_narrowing_and_lipschitz_are_sound_and_tight() {
+    // 1. AFk exact face cancellation on unbranched `sd_box`: box straddling the +X face `x = 1.0`.
+    let face_box = Box3 { lo: vec3(0.95, -0.2, -0.2), hi: vec3(1.05, 0.2, 0.2) }
+    let af_box = affine_form(|p: vec3| unbranched_sd_box(p, vec3(1.0)), face_box)
+    assert(af_box.valid(), "face affine_form must be valid")
+    assert(af_box.e < 1.0e-4, f"AFk face cancellation failed: e={af_box.e} (expected ~0)")
+    for j in 0..64 {
+        let p = sample(face_box, 1, j)
+        let d = unbranched_sd_box(p, vec3(1.0))
+        assert(af_box.range().contains(d), f"unbranched_sd_box: {d} outside [{af_box.lo()}, {af_box.hi()}]")
+    }
+
+    // 2. Vector `affine<vec3, vec3>` and `cross`: sound over samples and tight on linear ops.
+    let vb = Box3 { lo: vec3(0.2, -0.4, 0.5), hi: vec3(0.5, 0.1, 0.9) }
+    let vr = affine(|p: vec3| cross(p, vec3(0.3, -0.7, 0.5)) + vec3(p.x - p.x, 0.0, 0.0), vb)
+    for j in 0..64 {
+        let p = sample(vb, 2, j)
+        let c = cross(p, vec3(0.3, -0.7, 0.5))
+        assert(
+            c.x >= vr.lo.x && c.x <= vr.hi.x &&
+            c.y >= vr.lo.y && c.y <= vr.hi.y &&
+            c.z >= vr.lo.z && c.z <= vr.hi.z,
+            f"vector affine cross missed {c}",
+        )
+    }
+
+    // 3. New transcendental/periodic rules: `pow`, `log`, `log2`, `exp2`, `fract`, `%`, `atan`, `tan`, `asin`, `acos`.
+    let iv_pos = Interval { lo: 0.35, hi: 0.75 }
+    let f_trans = |t: f32| {
+        pow(t, 2.5) + log(t + 1.0) + log2(t + 2.0) + exp2(t) + fract(t + 1.1) +
+            ((t + 2.1) % 1.0) + atan(t) + tan(t) + asin(t) + acos(t)
+    }
+    let af_t = affine_form(f_trans, iv_pos)
+    assert(af_t.valid(), "transcendental affine_form must be valid")
+    let rt = af_t.range()
+    for k in 0..65 {
+        let t = mix(iv_pos.lo, iv_pos.hi, f32(k) / 64.0)
+        let v = f_trans(t)
+        assert(rt.contains(v), f"transcendental: f({t})={v} outside [{rt.lo}, {rt.hi}]")
+    }
+
+    // 4. Branch narrowing: `if x > 0.0 { sqrt(x) } else { 0.0 }` over `[-0.5, 1.0]` stays bounded and sound.
+    let iv_b = Interval { lo: -0.5, hi: 1.0 }
+    let f_br = |x: f32| if x > 0.0 { sqrt(x) } else { 0.0 }
+    let rb = affine_form(f_br, iv_b).range()
+    for k in 0..65 {
+        let x = mix(iv_b.lo, iv_b.hi, f32(k) / 64.0)
+        let v = f_br(x)
+        assert(rb.contains(v), f"branch narrowing: f({x})={v} outside [{rb.lo}, {rb.hi}]")
+    }
+
+    // 5. Analytical `value_noise` gradient bound (`noise_ad`): tight and sound across cell boundaries.
+    let nb = Box3 { lo: vec3(0.92, 1.92, -0.08), hi: vec3(1.08, 2.08, 0.08) }
+    let ng = affine(|q: vec3| gradient(|p: vec3| value_noise(p), q), nb)
+    assert(ng.hi.x <= 3.76 && ng.lo.x >= -3.76, f"noise_ad bound not tight: [{ng.lo.x}, {ng.hi.x}]")
+    for j in 0..64 {
+        let p = sample(nb, 3, j)
+        let g = gradient(|z: vec3| value_noise(z), p)
+        assert(
+            g.x >= ng.lo.x && g.x <= ng.hi.x &&
+            g.y >= ng.lo.y && g.y <= ng.hi.y &&
+            g.z >= ng.lo.z && g.z <= ng.hi.z,
+            f"noise_ad missed grad {g} outside [{ng.lo}, {ng.hi}]",
+        )
+    }
+
+    // 6. Clarke-Lipschitz (`std::derive::lipschitz`): exact `1.0` across creases & rotations!
+    let big_b = Box3 { lo: vec3(-10.0), hi: vec3(10.0) }
+    let l_stage = lipschitz(|p: vec3| stage().distance(p), big_b)
+    assert(l_stage <= 1.001, f"stage lipschitz={l_stage} should be <= 1.001 across all creases")
+    let rot_box = cuboid(vec3(1.0, 2.0, 0.5)).rotate(turn())
+    let l_rot = lipschitz(|p: vec3| rot_box.distance(p), big_b)
+    assert(l_rot <= 1.001, f"rotated cuboid lipschitz={l_rot} should be <= 1.001")
+    let l_noise = lipschitz(|p: vec3| value_noise(p), nb)
+    for j in 0..64 {
+        let p = sample(nb, 4, j)
+        let gl = length(gradient(|z: vec3| value_noise(z), p))
+        assert(gl <= l_noise + 1.0e-5, f"lipschitz noise missed {gl} > {l_noise}")
     }
 }

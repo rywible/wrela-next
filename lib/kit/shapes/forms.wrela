@@ -1,0 +1,447 @@
+// Safe-by-construction field families (`lib/kit/shapes/forms`): expressive architectural,
+// organic, and arcane forms whose `bound()` and `lipschitz()` contracts hold mathematically by
+// construction, with zero axis singularities (`atan2` / `sqrt(0)`) and 100% build-time proof via
+// `engine::matter::verify::verify_surface_soundness`.
+//
+// Families provided:
+//   - `Lathe`: smooth solid of revolution with a cubic Bézier radius profile `R(y)` (chalices,
+//     urns, balusters, columns, spires); exact `slope = 1.0` bounding sphere and exact analytical
+//     Lipschitz bound from the Bernstein derivative convex hull.
+//   - `Twisted<S>`: domain twist around the Y axis over any bounded `Surface`; exact bounding
+//     sphere (swept around Y) and exact spectral-norm Jacobian Lipschitz bound `(√(4+u²) + u)/2`.
+//   - `PolarFold<S>`: N-fold kaleidoscopic dihedral symmetry (`N ∈ {2, 4, 6, 8, 12}`) built from
+//     exact 1-Lipschitz Coxeter reflections (zero `atan2` or `r = 0` singularity).
+//   - `SuperQuadric`: smooth C∞ L4 pillowed algebraic crystal (`((x/rx)^4+(y/ry)^4+(z/rz)^4+ε^4)^¼`)
+//     with exact `lipschitz = 1.0` everywhere (Hölder's inequality) and exact bounding sphere.
+
+use engine::matter::substance::lambert
+use engine::matter::verify::{verify_field_soundness, verify_surface_soundness}
+use std::cmp::Eq
+use std::derive::{Box3, gradient}
+use std::field::{Bound, Field, FieldFacts, Surface, cuboid, sphere}
+use std::hash::{StateHash, state_hash}
+
+// =================================================================================================
+// 1. `Lathe`: Cubic Bézier Solid of Revolution around the Y Axis
+// =================================================================================================
+
+/// A smooth solid of revolution spanning `y ∈ [y_lo, y_hi]` whose radius follows the cubic Bézier
+/// profile `B(t; r0, r1, r2, r3)` for `t = clamp((y - y_lo) / (y_hi - y_lo), 0, 1)`.
+///
+/// By the Bernstein convex-hull property:
+///   - `R(t) ≤ max(r0, r1, r2, r3)`, giving a 100% exact `slope = 1.0` bounding sphere;
+///   - `|R'(t)| ≤ 3 · max(|r1 - r0|, |r2 - r1|, |r3 - r2|)`, giving an exact analytical Lipschitz
+///     bound `√(1 + (max |dR/dy|)²)` everywhere without hand-tuning.
+pub struct Lathe: Copy + GpuData + Eq + StateHash {
+    pub y_lo: f32,
+    pub y_hi: f32,
+    pub r0: f32,
+    pub r1: f32,
+    pub r2: f32,
+    pub r3: f32,
+}
+
+/// Builds a smooth `Lathe` solid of revolution over `y ∈ [y_lo, y_hi]` with cubic Bézier radius
+/// control points `(r0, r1, r2, r3)` (all positive).
+pub fn lathe(y_lo: f32, y_hi: f32, r0: f32, r1: f32, r2: f32, r3: f32) -> Lathe {
+    let lo = min(y_lo, y_hi)
+    let hi = max(y_lo, y_hi)
+    Lathe {
+        y_lo: lo,
+        y_hi: max(hi, lo + 1.0e-3),
+        r0: max(r0, 1.0e-3),
+        r1: max(r1, 1.0e-3),
+        r2: max(r2, 1.0e-3),
+        r3: max(r3, 1.0e-3),
+    }
+}
+
+impl Lathe {
+    /// Evaluates the cubic Bézier radius profile at parameter `t ∈ [0, 1]`.
+    pub fn radius_at(self, t: f32) -> f32 {
+        let u = 1.0 - t
+        let u2 = u * u
+        let t2 = t * t
+        u2 * u * self.r0 + 3.0 * u2 * t * self.r1 + 3.0 * u * t2 * self.r2 + t2 * t * self.r3
+    }
+
+    /// Maximum profile radius `max(r0, r1, r2, r3)` (exact upper bound by Bernstein convex hull).
+    pub fn max_radius(self) -> f32 {
+        max(max(self.r0, self.r1), max(self.r2, self.r3))
+    }
+
+    /// Exact analytical upper bound on `|dR/dy|` over `y ∈ [y_lo, y_hi]`.
+    pub fn max_slope(self) -> f32 {
+        let h = max(self.y_hi - self.y_lo, 1.0e-3)
+        let d0 = abs(self.r1 - self.r0)
+        let d1 = abs(self.r2 - self.r1)
+        let d2 = abs(self.r3 - self.r2)
+        3.0 * max(d0, max(d1, d2)) / h
+    }
+}
+
+impl Surface for Lathe {
+    @budget(work: 96)
+    fn distance(self, p: vec3) -> f32 {
+        let h = max(self.y_hi - self.y_lo, 1.0e-3)
+        let t = clamp((p.y - self.y_lo) / h, 0.0, 1.0)
+        let dr = length(p.xz) - self.radius_at(t)
+        let dy = max(p.y - self.y_hi, self.y_lo - p.y)
+        if dr > 0.0 && dy > 0.0 {
+            length(vec2(dr, dy))
+        } else {
+            max(dr, dy)
+        }
+    }
+
+    fn bound(self) -> Bound {
+        let mid_y = 0.5 * (self.y_lo + self.y_hi)
+        let half_h = 0.5 * (self.y_hi - self.y_lo)
+        let rad = length(vec2(self.max_radius(), half_h))
+        Bound { centre: vec3(0.0, mid_y, 0.0), radius: rad, slope: 1.0 }
+    }
+
+    fn lipschitz(self, _near: f32) -> f32 {
+        let s = self.max_slope()
+        sqrt(1.0 + s * s) * 1.002
+    }
+
+    fn rigid_shape_hash(self) -> Option<u64> {
+        Some(state_hash(self))
+    }
+}
+
+// =================================================================================================
+// 2. `Twisted<S>`: Globally Lipschitz-Bounded Domain Twist around the Y Axis
+// =================================================================================================
+
+/// Twists any bounded `Surface` around the Y axis by angle `rate * y` (rad/m).
+///
+/// Rotating `(x, z)` preserves Euclidean distance from the Y axis, so the swept bounding sphere
+/// around `(0, c.y, 0)` with radius `inner.radius + length(c.xz)` holds everywhere with the same
+/// `slope`. Within `|distance| < near`, every point satisfies `r ≤ R_bound + near / slope`, and
+/// the twist map's Jacobian has exact spectral norm `(√(4 + (rate · r)²) + |rate| · r) / 2`.
+pub struct Twisted<S>: Copy + GpuData + Eq + StateHash {
+    pub inner: S,
+    pub rate: f32,
+}
+
+/// Wraps `inner` in a Y-axis twist of `rate` radians per metre.
+pub fn twisted<S: Surface>(inner: S, rate: f32) -> Twisted<S> {
+    Twisted { inner, rate }
+}
+
+impl<S: Surface> Surface for Twisted<S> {
+    @budget(work: 512)
+    fn distance(self, p: vec3) -> f32 {
+        let a = self.rate * p.y
+        let c = cos(a)
+        let s = sin(a)
+        let q = vec3(p.x * c - p.z * s, p.y, p.x * s + p.z * c)
+        self.inner.distance(q)
+    }
+
+    fn bound(self) -> Bound {
+        let b = self.inner.bound()
+        if b.radius >= 1.0e30 {
+            return b
+        }
+        Bound {
+            centre: vec3(0.0, b.centre.y, 0.0),
+            radius: b.radius + length(b.centre.xz),
+            slope: b.slope,
+        }
+    }
+
+    fn lipschitz(self, near: f32) -> f32 {
+        let b = self.bound()
+        let l_in = self.inner.lipschitz(near)
+        if b.radius >= 1.0e12 || b.slope <= 0.0 || l_in >= 1.0e12 {
+            return 1.0 / 0.0
+        }
+        let r_max = b.radius + max(near, 0.0) / b.slope
+        let u = abs(self.rate) * r_max
+        let stretch = 0.5 * (sqrt(4.0 + u * u) + u)
+        l_in * stretch * 1.002
+    }
+
+    fn rigid_shape_hash(self) -> Option<u64> {
+        match self.inner.rigid_shape_hash() {
+            Some(h) => Some(state_hash((h, self.rate))),
+            None => None,
+        }
+    }
+}
+
+impl<C, S: Field<C>> Field<C> for Twisted<S> {
+    fn channels(self, p: vec3) -> C {
+        let a = self.rate * p.y
+        let c = cos(a)
+        let s = sin(a)
+        self.inner.channels(vec3(p.x * c - p.z * s, p.y, p.x * s + p.z * c))
+    }
+
+    fn distance_and_channels(self, p: vec3) -> (f32, C) {
+        let a = self.rate * p.y
+        let c = cos(a)
+        let s = sin(a)
+        self.inner.distance_and_channels(vec3(p.x * c - p.z * s, p.y, p.x * s + p.z * c))
+    }
+
+    fn has_constant_channels(self) -> bool {
+        self.inner.has_constant_channels()
+    }
+
+    fn has_local_channels(self) -> bool {
+        self.inner.has_local_channels()
+    }
+
+    fn field_facts(self) -> FieldFacts {
+        let f = self.inner.field_facts()
+        let b = self.bound()
+        let lip = if b.radius < 1.0e12 && b.slope > 0.0 && f.lip < 1.0e12 {
+            let u = abs(self.rate) * b.radius
+            f.lip * 0.5 * (sqrt(4.0 + u * u) + u) * 1.002
+        } else {
+            1.0 / 0.0
+        }
+        FieldFacts::proven(
+            lip: lip,
+            may_transmit: f.may_transmit,
+            may_emit: f.may_emit,
+            may_coat: f.may_coat,
+            may_subsurface: f.may_subsurface,
+            may_micro: f.may_micro,
+        )
+    }
+}
+
+// =================================================================================================
+// 3. `PolarFold<S>`: Kaleidoscopic N-Fold Dihedral Symmetry (Zero `atan2` Singularity)
+// =================================================================================================
+
+/// Folds `(x, z)` into the fundamental wedge `[0, π / folds]` via exact 1-Lipschitz Coxeter
+/// mirror reflections (`v' = v - 2 · max(dot(v, n), 0) · n`) and evaluates `inner` there.
+/// Supported symmetry orders: `2`, `4`, `6`, `8`, `12` (any other value rounds down to the
+/// nearest supported order).
+///
+/// Every reflection is a linear isometry (`||∇v'|| = 1` everywhere, including through `r = 0`),
+/// so `PolarFold<S>` preserves `inner.lipschitz(near)` identically and has an exact swept bound.
+pub struct PolarFold<S>: Copy + GpuData + Eq + StateHash {
+    pub inner: S,
+    pub folds: u32,
+}
+
+/// Repeats `inner` symmetrically `folds` times around the Y axis (`folds ∈ {2, 4, 6, 8, 12}`).
+pub fn polar_fold<S: Surface>(inner: S, folds: u32) -> PolarFold<S> {
+    PolarFold { inner, folds }
+}
+
+/// Reflects 2D vector `v` across the line with unit outward normal `n` whenever `dot(v, n) > 0`.
+fn reflect_pos(v: vec2, n: vec2) -> vec2 {
+    v - n * (2.0 * max(dot(v, n), 0.0))
+}
+
+/// Exact 1-Lipschitz dihedral fold of `(x, z)` into the fundamental sector `[0, π / folds]`.
+fn fold_xz(xz: vec2, folds: u32) -> vec2 {
+    if folds <= 2 {
+        return vec2(abs(xz.x), xz.y)
+    }
+    var v = abs(xz)
+    if folds < 6 {
+        // 4-fold: `[0, π/2]`
+        return v
+    }
+    if folds < 8 {
+        // 6-fold: `[0, π/2]` -> reflect across `π/3` -> `[0, π/3]` -> reflect across `π/6` -> `[0, π/6]`.
+        v = reflect_pos(v, vec2(-0.8660254, 0.5))
+        return reflect_pos(v, vec2(-0.5, 0.8660254))
+    }
+    if folds < 12 {
+        // 8-fold: `[0, π/2]` -> swap across `π/4` (`x >= z`) -> `[0, π/4]`.
+        return vec2(max(v.x, v.y), min(v.x, v.y))
+    }
+    // 12-fold: `[0, π/2]` -> `π/3` -> `π/6` -> `π/12` (`sin(π/12) = 0.25881905`, `cos(π/12) = 0.9659258`).
+    v = reflect_pos(v, vec2(-0.8660254, 0.5))
+    v = reflect_pos(v, vec2(-0.5, 0.8660254))
+    reflect_pos(v, vec2(-0.25881905, 0.9659258))
+}
+
+impl<S: Surface> Surface for PolarFold<S> {
+    @budget(work: 512)
+    fn distance(self, p: vec3) -> f32 {
+        let q = fold_xz(p.xz, self.folds)
+        self.inner.distance(vec3(q.x, p.y, q.y))
+    }
+
+    fn bound(self) -> Bound {
+        let b = self.inner.bound()
+        if b.radius >= 1.0e30 {
+            return b
+        }
+        Bound {
+            centre: vec3(0.0, b.centre.y, 0.0),
+            radius: b.radius + length(b.centre.xz),
+            slope: b.slope,
+        }
+    }
+
+    fn lipschitz(self, near: f32) -> f32 {
+        self.inner.lipschitz(near)
+    }
+
+    fn rigid_shape_hash(self) -> Option<u64> {
+        match self.inner.rigid_shape_hash() {
+            Some(h) => Some(state_hash((h, self.folds))),
+            None => None,
+        }
+    }
+}
+
+impl<C, S: Field<C>> Field<C> for PolarFold<S> {
+    fn channels(self, p: vec3) -> C {
+        let q = fold_xz(p.xz, self.folds)
+        self.inner.channels(vec3(q.x, p.y, q.y))
+    }
+
+    fn distance_and_channels(self, p: vec3) -> (f32, C) {
+        let q = fold_xz(p.xz, self.folds)
+        self.inner.distance_and_channels(vec3(q.x, p.y, q.y))
+    }
+
+    fn has_constant_channels(self) -> bool {
+        self.inner.has_constant_channels()
+    }
+
+    fn has_local_channels(self) -> bool {
+        self.inner.has_local_channels()
+    }
+
+    fn field_facts(self) -> FieldFacts {
+        self.inner.field_facts()
+    }
+}
+
+// =================================================================================================
+// 4. `SuperQuadric`: Smooth C∞ L4 Pillowed Algebraic Surface
+// =================================================================================================
+
+/// Smooth degree-4 algebraic superellipsoid with half-axes `radii`:
+///   `d(p) = r_min · (((p.x/rx)^4 + (p.y/ry)^4 + (p.z/rz)^4 + ε^4)^(1/4) - (1 + ε^4)^(1/4))`
+///
+/// Evaluated with two `sqrt`s (zero `pow`, zero `sqrt(0)` singularity because `ε^4 > 0`).
+/// By Hölder's inequality, `||∇d(p)|| ≤ 1.0` at every point in `ℝ³`, and by Cauchy-Schwarz on
+/// `L4`/`L2` norms, `Bound` holds everywhere with `slope = r_min / (3^(1/4) · r_max)`.
+pub struct SuperQuadric: Copy + GpuData + Eq + StateHash {
+    pub radii: vec3,
+}
+
+/// Builds a smooth L4 pillowed `SuperQuadric` with half-axes `radii` (all positive).
+pub fn super_quadric(radii: vec3) -> SuperQuadric {
+    SuperQuadric { radii: max(radii, vec3(1.0e-3)) }
+}
+
+/// Regularisation floor `ε^4` (`ε = 0.02`) keeping `u4 + ε^4` strictly positive everywhere.
+const SQ_EPS4: f32 = 1.6e-7
+/// `(1 + ε^4)^(1/4)` so the surface passes through `(±rx, 0, 0)`, `(0, ±ry, 0)`, `(0, 0, ±rz)`.
+const SQ_UNIT: f32 = 1.00000004
+/// `3^(1/4)` (exact L2/L4 norm ratio in `ℝ³`).
+const FOURTH_ROOT_3: f32 = 1.31607401
+
+impl Surface for SuperQuadric {
+    @budget(work: 64)
+    fn distance(self, p: vec3) -> f32 {
+        let s = p / self.radii
+        let s2 = s * s
+        let s4 = s2 * s2
+        let m = sqrt(sqrt(s4.x + s4.y + s4.z + SQ_EPS4))
+        let r_min = min(self.radii.x, min(self.radii.y, self.radii.z))
+        r_min * (m - SQ_UNIT)
+    }
+
+    fn bound(self) -> Bound {
+        let r_min = min(self.radii.x, min(self.radii.y, self.radii.z))
+        let r_max = max(self.radii.x, max(self.radii.y, self.radii.z))
+        let radius = r_max * FOURTH_ROOT_3 * SQ_UNIT
+        let slope = r_min / (FOURTH_ROOT_3 * r_max)
+        Bound { centre: vec3(0.0), radius, slope }
+    }
+
+    fn lipschitz(self, _near: f32) -> f32 {
+        1.0
+    }
+
+    fn rigid_shape_hash(self) -> Option<u64> {
+        Some(state_hash(self))
+    }
+}
+
+// =================================================================================================
+// Build-time Soundness Proofs & CPU Reference Tests
+// =================================================================================================
+
+@test
+fn lathe_reference_and_soundness() {
+    let urn = lathe(y_lo: 0.0, y_hi: 1.4, r0: 0.34, r1: 0.16, r2: 0.48, r3: 0.28)
+    // Axis points inside the solid are negative; far points outside are positive.
+    assert(urn.distance(vec3(0.0, 0.7, 0.0)) < -0.1, "lathe interior must be negative")
+    assert(urn.distance(vec3(1.0, 0.7, 0.0)) > 0.4, "lathe exterior must be positive")
+    // Exact profile radius at midpoint `t = 0.5`: `0.125*r0 + 0.375*r1 + 0.375*r2 + 0.125*r3`.
+    let r_mid = 0.125 * 0.34 + 0.375 * 0.16 + 0.375 * 0.48 + 0.125 * 0.28
+    assert(abs(urn.distance(vec3(r_mid, 0.7, 0.0))) < 1.0e-5, "lathe zero set must match Bézier profile")
+    verify_surface_soundness(urn, "kit_lathe")
+}
+
+@test
+fn twisted_reference_and_soundness() {
+    let bar = twisted(cuboid(vec3(0.28, 0.9, 0.16)), rate: 2.2)
+    assert(bar.distance(vec3(0.0, 0.0, 0.0)) < -0.1, "twisted cuboid interior must be negative")
+    // At `y = π / (2 * rate) ≈ 0.714 < 0.9`, local X maps to world Z (90° twist).
+    let y90 = 1.5707963 / 2.2
+    assert(abs(bar.distance(vec3(0.0, y90, 0.28))) < 1.0e-4, "twisted surface must rotate by rate*y")
+    assert(abs(bar.distance(vec3(0.16, y90, 0.0))) < 1.0e-4, "twisted surface minor axis must rotate")
+    verify_surface_soundness(bar, "kit_twisted_cuboid")
+    verify_field_soundness(
+        twisted(cuboid(vec3(0.28, 0.9, 0.16)).with(lambert(vec3(0.5, 0.4, 0.3))), rate: 2.2),
+        "kit_twisted_field",
+    )
+}
+
+@test
+fn polar_fold_reference_and_soundness() {
+    let petal = sphere(0.16).translate(vec3(0.55, 0.0, 0.0))
+    let rosette6 = polar_fold(petal, folds: 6)
+    let rosette12 = polar_fold(petal, folds: 12)
+    // Verify 6-fold rotational invariance around Y.
+    let d0 = rosette6.distance(vec3(0.55, 0.0, 0.0))
+    let d60 = rosette6.distance(vec3(0.55 * 0.5, 0.0, 0.55 * 0.8660254))
+    let d120 = rosette6.distance(vec3(-0.55 * 0.5, 0.0, 0.55 * 0.8660254))
+    assert(abs(d0 + 0.16) < 1.0e-5, "polar_fold petal centre must hit -radius")
+    assert(abs(d60 - d0) < 1.0e-5 && abs(d120 - d0) < 1.0e-5, "polar_fold must be 6-fold symmetric")
+    // Gradient norm stays <= 1 right next to the axis (no atan2 blowup).
+    let g_axis = gradient(|q: vec3| rosette12.distance(q), vec3(1.0e-4, 0.0, 2.0e-4))
+    assert(length(g_axis) <= 1.01, f"polar_fold gradient near axis exploded: {length(g_axis)}")
+    verify_surface_soundness(rosette6, "kit_polar_fold_6")
+    verify_surface_soundness(rosette12, "kit_polar_fold_12")
+    verify_field_soundness(
+        polar_fold(petal.with(lambert(vec3(0.4, 0.5, 0.6))), folds: 6),
+        "kit_polar_fold_field",
+    )
+}
+
+@test
+fn super_quadric_reference_and_soundness() {
+    let gem = super_quadric(vec3(0.6, 0.85, 0.45))
+    assert(gem.distance(vec3(0.0, 0.0, 0.0)) < -0.4, "super_quadric origin must be inside")
+    assert(abs(gem.distance(vec3(0.6, 0.0, 0.0))) < 1.0e-5, "super_quadric must pass through +rx")
+    assert(abs(gem.distance(vec3(0.0, 0.85, 0.0))) < 1.0e-5, "super_quadric must pass through +ry")
+    assert(abs(gem.distance(vec3(0.0, 0.0, 0.45))) < 1.0e-5, "super_quadric must pass through +rz")
+    // Verify gradient norm <= 1 at 256 Sobol samples.
+    let bx = Box3 { lo: vec3(-1.2), hi: vec3(1.2) }
+    for i in 0..256 {
+        let p = bx.sample(17, i)
+        let gl = length(gradient(|q: vec3| gem.distance(q), p))
+        assert(gl <= 1.0001, f"super_quadric gradient exceeded 1 at {p}: {gl}")
+    }
+    verify_surface_soundness(gem, "kit_super_quadric")
+}

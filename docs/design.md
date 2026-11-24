@@ -1127,11 +1127,10 @@ body, and its outline has nothing to certify or solve it. Covering it needs exac
 instanced template (each body's outline cells, posed, solved against its own field), which isn't
 built.
 
-**Not done: affine rules for `max` and `min` that keep a box-built field's slopes where a box
-straddles its face.** The compiler's affine forms keep one error term (AF1): a nonlinear
-operation's error joins it, so `length(max(q, 0))` and `min(max(q), 0)`, whose straddles cancel
-exactly, can't be made to cancel there; it needs an error symbol for each such operation (full
-affine arithmetic), which the certificates' scoreboard would measure.
+**Closed (2026-11-24, below): affine rules for `max` and `min` that keep a box-built field's slopes
+where a box straddles its face.** `toolchain/ir/src/derive/affine.rs` now tracks up to 8 auxiliary
+error symbols (`AFk`, `CPU_MAX_SYMS = 8`) on CPU so `length(max(q, 0))` and `min(max(q), 0)` cancel
+across faces to `< 1e-4`, while keeping a lean 0-symbol (`AF1`) fast path on GPU for occupancy.
 
 ### Module split, Metal compute batching, and 64-bit Visibility Buffer (2026-11-23)
 
@@ -1192,6 +1191,58 @@ Vulkan `geometry_shader` enabled when supported) and `lib/engine/mesh/visbuf.wre
   - Because the pipeline still writes the 4-target G-buffer before `mesh_direct`, total frame time
     is near break-even today; the big bandwidth win lands when resolve fuses directly into shading
     (and unlocks Phase 2.3 analytical silhouette ray-snap directly on the winning `Field`).
+
+### Affine arithmetic (AFk), Clarke–Lipschitz derivation, safe fields, and build-time proof erasure (2026-11-24)
+
+Four coupled upgrades move range/Lipschitz proving, field-property specialization, and proof tokens to build time while tightening runtime affine forms across the compiler, engine, and content layers (measured against clean baseline `0430f1b`):
+
+1. **Compiler affine arithmetic (`AFk`) and Clarke–Lipschitz derivation (`toolchain/ir/src/derive/{affine,lipschitz}.rs`, `toolchain/sema/src/mir/build.rs`, `lib/std/derive.wrela`):**
+   - Added `std::derive::affine_form` (exposing `(centre, slope, error)` with `sub_range`/`octant_range`), vector-valued `std::derive::affine<X, Y>`, and `std::derive::lipschitz` (interval generalized-Jacobian bound on `sup ||∇f||₂` over a box).
+   - `affine.rs` tracks up to 8 auxiliary error symbols on CPU (`CPU_MAX_SYMS = 8`, exact `sd_box` face cancellation) and a lean 0-auxiliary-symbol fast path on GPU (`GPU_MAX_SYMS = 0`) for register occupancy; adds exact `sqr(a)` (half quadratic error `0.5·rad²` and nonnegative `[sq_lo, sq_hi]` propagated through `add`/`sum`), branch-condition narrowing (`narrow_cond`), missing math rules (`pow`, `log`/`log2`, `exp2`, `fract`, `rem`, `tan`/`atan`/`asin`/`acos`, `cross`, 1-component `length`), and analytical `value_noise` gradient bounds.
+   - Fixed a MIR short-circuit lowering bug in `toolchain/sema/src/mir/build.rs` (`short_circuit` previously seeded its result temp with `av` instead of `Lit::Bool(op == BinOp::Or)`, dropping `never = true` when the LHS straddled 0 and the RHS was provably false, which inflated `sd_cyl` affine error by `5×10⁶` on `MarbleColumn` and `ArenaPillars`).
+2. **Three-tier build-time proof erasure (`toolchain/ir/src/{ranges,bounds,opt}.rs`, `toolchain/shader/src/{analysis,metal,spirv}.rs`, `toolchain/lower/src/body.rs`):**
+   - Flow-sensitive integer range + `ArrayLength` analysis (`ranges.rs`) erases proven-safe GPU debug bounds checks (`bounds.rs`), folds unit enums and constant branches to fixpoint (`opt.rs`), lowers `Option<ZST>` to bare `bool` in both MSL and SPIR-V (`shader/`), and keeps `EmptyProof` at 0 B (`@test proof_tokens_erase_to_zero_bytes`) and `RayBox` at 16 B.
+   - `FieldFacts` (`lib/std/field.wrela`, proven at build time via `const *_FACTS = prove_field_facts(...)` in `lib/engine/matter/verify.wrela` across all 9 world fields and delegated across all combinators) erases dead shader paths at compile time: zero trace of `EmptyProof`, `FieldFacts`, or `prove_field_facts` in emitted shaders; `solve_cell_ray`'s 1D affine fallback and transmissive `discard` erased from `Citadel`'s `exact_box_one_fs` (`facts.lip` folds to `1.0`); `micro_field_grad` erased from skinned `field_skin_gbuf_many_fs` (256 creatures); `stage.rs` creature tape shrinks `1131 → 1077` ops.
+3. **Engine certification, exact cells, and safe-by-construction fields (`lib/engine/matter/certify.wrela`, `lib/engine/mesh/{dc,emit,proof,shade,visbuf,world_draw}.wrela`, `lib/kit/shapes/forms.wrela`):**
+   - `certify_sheet` evaluates ONE world-space `affine_form` per outline cell (eliminating rotated-frame 5.2× box inflation, redundant `plain` intervals, and `value_and_gradient` calls in `certify_outline`), with `sub_range` half-pruning and exact floating-point margin.
+   - `filter_thin_cells` uses `affine_form` + `octant_range` pre-filtering; `solve_cell_ray` combines Lipschitz sphere-tracing with 1D affine Krawczyk contraction for unbounded fields.
+   - Added 4 safe-by-construction `Surface` + `Field` families in `lib/kit/shapes/forms.wrela` (`Lathe`, `Twisted<S>`, `PolarFold<S>`, `SuperQuadric`), each verified against a CPU reference and `verify_surface_soundness` / `verify_field_soundness`.
+
+**Certificate scoreboard (`h/4 (h/10)` certified at `0.01 / 0.027 / 0.08 m`, `0430f1b` → now):**
+
+| Field (total cells) | `0430f1b` (`1 / 2.7 / 8 cm`) | Now (`1 / 2.7 / 8 cm`) |
+| --- | --- | --- |
+| `stage` (100) | `100(100) / 99(99) / 99(99)` | `100(100) / 99(100) / 98(98)` |
+| `stack` (100) | `100(100) / 77(98) / 3(15)` | **`100(100) / 99(99) / 63(96)`** |
+| `arena_courtyard` (100) | `97(98) / 97(98) / 97(98)` | **`100(100) / 100(100) / 100(100)`** |
+| `arena_pillars` (100) | `42(47) / 39(44) / 33(35)` | **`97(98) / 93(97) / 32(40)`** |
+| `arena_brazier_stands` (42) | `22(30) / 13(17) / 4(6)` | **`39(39) / 20(27) / 3(5)`** |
+| `arena_flame` (60) | `46(49) / 9(22) / 0(0)` | **`58(60) / 47(54) / 10(28)`** |
+| `parry_arc` (60) | `52(55) / 51(51) / 8(10)` | **`56(57) / 51(53) / 14(19)`** |
+| `rival_orb` (60) | `60(60) / 10(35) / 0(0)` | **`60(60) / 60(60) / 2(19)`** |
+| `glass_shard` (100) | `76(96) / 5(10) / 0(0)` | **`98(100) / 49(78) / 6(11)`** |
+| `citadel` (100) | `97(98) / 96(97) / 96(97)` | **`100(100) / 99(99) / 99(99)`** |
+| `marble_column` (100) | `22(33) / 18(29) / 15(17)` | **`99(99) / 98(98) / 40(72)`** |
+| `creature` (25) | `0(1) / 0(0) / 0(0)` | **`20(24) / 9(12) / 0(0)`** |
+
+**Build-time contract proofs (`verify_field_soundness`, `proven (sampled)`):**
+Every interval contract across all 13 world fields + 6 kit shapes is now 100% proven (`0 sampled`). Highlights (`0430f1b` → now): `rival_orb` bound `14408(81400) → 544(0)`, lip `0(108296) → 216(0)`, sub `958(227) → 88(0)`; `arena_courtyard` bound `3318(384) → 1160(0)`, lip `1928(9580) → 64(0)`; `stage` lip `1601(5749) → 36(0)`; `citadel` bound `1052(16) → 362(0)`, lip `2(9138) → 570(1039)`; `parry_arc` lip `906(5199) → 247(106)`; `creature_rest` bound `12143(2085) → 2642(14)`, lip `0(10919) → 218(1618)`, iv `1369(9) → 134(0)`; `creature_bent` bound `21154(4039) → 3412(98)`, lip `0(14361) → 409(2132)`, iv `2204(70) → 163(0)`.
+
+**Dual-machine 1080p measurements (`0430f1b` → now; guard largest `2304 B`, 0 Vulkan validation errors, bit-for-bit identical frame hashes across M4 Metal and Radeon Vulkan):**
+
+| Scene / Metric (1920×1080, ms) | Apple M4 Metal (`0430f1b` → now) | Linux Radeon Vulkan (`0430f1b` → now) |
+| --- | --- | --- |
+| `SCENE 10` cold `f0` span | `233.00 → 225.13` (`-3.4%`) | `234.53 → 230.47` (`-1.7%`) |
+| `SCENE 10` cold `f0` `mesh_extract` / `mesh_certify` (serial) | `44.79 → 43.27` / `3.59 → 2.64` (`-26.5%`) | `55.45` / `4.23` |
+| `SCENE 10` steady span med (`f5..11`) | `20.65 → 21.55 (f10)` | `50.36 → 46.97` (`-6.7%`) |
+| `SCENE 10` serial `f10` total | `16.40 → 16.94` | `41.97 → 39.77` (`-5.2%`) |
+| `SCENE 10` serial `f10` `exact_box` (`depth+exact`) | `1.71 (0.09+1.61) → 0.88 (0.09+0.79)` (`-48.5%`) | `4.00 (0.44+3.56) → 1.95 (0.44+1.51)` (`-51.3%`) |
+| `SCENE 10` serial `f10` `mesh_certify` / `mesh_eye` | `0.21 → 0.16` (`-24%`) / `1.27 → 1.14` (`-10%`) | `0.26 → 0.24` / `2.52 → 2.35` (`-6.7%`) |
+| `SCENE 11` steady span (`f10`) | `17.13 → 17.18` (med `17.31 → 17.52`) | `35.32 → 35.61` (med `35.07 → 35.75`) |
+| `SCENE 11` serial `f10` `exact_box` (`depth+exact`) | `1.48 (0.09+1.39) → 1.33 (0.10+1.23)` (`-10.1%`) | `4.73 (0.51+4.22) → 5.11 (0.51+4.60)` |
+| `SCENE 11` serial `f10` `mesh_vis_resolve` (256 creatures) | `4.23 → 4.02` (`-5.0%`) | `10.42 → 10.07` (`-3.4%`) |
+
+- **Verification:** `tools/check` passes (all 6 packages / 115 files `tools/layers`, `cargo fmt --check`, 28/28 `lib/engine`, 4/4 `lib/kit`, 18/18 `game/world`, full Rust workspace suite, GPU guard tests); `spirv-val` (`tools/shaders`) passes 126/126 on `SCENE 10` and `SCENE 11`; `WRELA_VULKAN_VALIDATION=1` reports **0 VVL errors**; `SCENE=6` 640×360 24-eye hole audit **PASSED** on **13/13 kinds** on both Apple M4 Metal and Linux Radeon Vulkan (`0` cracks, `0` overflows, `0` unsettled, outlines within budget).
 
 ## The layers
 

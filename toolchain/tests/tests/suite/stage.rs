@@ -113,7 +113,7 @@ fn tapes_match_their_compiled_fields_on_the_gpu() {
 #[test]
 fn a_creature_tapes_in_under_2048_operations() {
     let mut host = crate::cpu_host(&built("fields"));
-    assert_eq!(one_u32(&mut host, "grazer_tape_len", &[]), 1131);
+    assert_eq!(one_u32(&mut host, "grazer_tape_len", &[]), 1077);
 }
 
 /// Pruning the blob's tape (35 operations: three spheres of 11, and two smooth minimums) to a

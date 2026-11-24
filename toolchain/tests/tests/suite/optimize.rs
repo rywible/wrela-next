@@ -221,3 +221,121 @@ pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
     let entries: Vec<String> = listed.pipelines.iter().flat_map(|p| p.entries.clone()).collect();
     assert_eq!(entries, ["kept"]);
 }
+
+/// Three-tier proof erasure end to end:
+/// 1. Zero-sized proof tokens (`EmptyToken { seal: () }`, `Option<EmptyToken>`) leave zero struct
+///    storage in Metal/SPIR-V/WASM (`Option<ZST>` lowers to a bare `bool`).
+/// 2. Build-time `const` proof witnesses computed via `std::derive::lipschitz` + `affine_form`
+///    fold into GPU shaders and CPU code, erasing dead branches (`!FACTS.may_transmit`,
+///    `FACTS.lip < 1e12`), dead pipelines, and the entire build-time verifier from shipped binaries.
+/// 3. Flow-sensitive static range analysis erases proven-safe GPU debug bounds checks.
+#[test]
+fn proof_erasure_strips_zst_tokens_const_verifiers_and_dead_branches() {
+    let dir = crate::package(
+        "optimize/proof-erasure",
+        r#"
+use std::derive::{Box3, affine_form, lipschitz}
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+struct EmptyToken: Copy {
+    seal: (),
+}
+
+struct ProvenFacts: Copy {
+    lip: f32,
+    may_transmit: bool,
+    seal: (),
+}
+
+fn sphere_d(p: vec3) -> f32 {
+    length(p) - 1.0
+}
+
+fn prove_facts() -> ProvenFacts {
+    let bx = Box3 { lo: vec3(-2.0), hi: vec3(2.0) }
+    let lip = lipschitz(sphere_d, bx)
+    let r = affine_form(|p: vec3| sphere_d(p), bx)
+    let _ = r.valid()
+    ProvenFacts { lip, may_transmit: false, seal: () }
+}
+
+const FACTS: ProvenFacts = prove_facts()
+
+fn prove_skip(x: f32) -> Option<EmptyToken> {
+    if x > 0.0 {
+        Some(EmptyToken { seal: () })
+    } else {
+        None
+    }
+}
+
+pub struct State {
+    out: GpuBuffer<f32>,
+}
+
+@compute(64)
+fn erased_kernel(out: mut Slots<f32>, id: GlobalId) {
+    if id.x >= 64 {
+        return
+    }
+    let facts = FACTS
+    var acc = 0.0
+    if facts.lip < 1.0e12 {
+        acc += facts.lip
+    } else {
+        acc += 99999.0
+    }
+    if facts.may_transmit {
+        acc += 77777.0
+    }
+    match prove_skip(f32(id.x)) {
+        Some(_tok) => {
+            acc += 1.0
+        },
+        None => {},
+    }
+    // Proven-safe fixed-size array access via bitmask `id.x & 3`.
+    let lut: [f32; 4] = [1.0, 2.0, 3.0, 4.0]
+    acc += lut[id.x & 3]
+    out[id] = acc
+}
+
+@compute(64)
+fn dead_transmissive_pass(out: mut Slots<f32>, id: GlobalId) {
+    out[id] = 42.0
+}
+
+pub fn init() -> State {
+    State { out: buffer(64) }
+}
+
+pub fn frame(s: mut State, _time: f32, _width: u32, _height: u32) {
+    dispatch(erased_kernel.bind(out: mut s.out), groups: 1)
+    if FACTS.may_transmit {
+        dispatch(dead_transmissive_pass.bind(out: mut s.out), groups: 1)
+    }
+}
+"#,
+    );
+    let built = wrela_driver::build(&dir);
+    assert!(!built.has_errors(), "{:?}", built.diagnostics);
+    // Tier 2: dead transmissive pipeline under `FACTS.may_transmit` is completely erased.
+    let manifest = wrela_tests::built_manifest(&built);
+    let names: Vec<&str> = manifest.pipelines.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["erased_kernel"]);
+    // Inspect the emitted Metal shader source for `erased_kernel`.
+    let msl = built
+        .files
+        .iter()
+        .find(|(name, _)| name.ends_with(".metal"))
+        .map(|(_, bytes)| String::from_utf8_lossy(bytes).into_owned())
+        .expect("expected Metal shader output");
+    // Tier 1: zero trace of `EmptyToken` struct wrapper in Metal!
+    assert!(!msl.contains("EmptyToken"), "ZST EmptyToken leaked into Metal:\n{msl}");
+    assert!(!msl.contains("ProvenFacts"), "const ProvenFacts leaked into Metal:\n{msl}");
+    // Tier 2: dead branches (`99999` fallback, `77777` transmissive branch) and build-time
+    // verifier `prove_facts` are completely erased from shipped Metal!
+    assert!(!msl.contains("99999"), "dead lip fallback leaked into Metal:\n{msl}");
+    assert!(!msl.contains("77777"), "dead transmissive branch leaked into Metal:\n{msl}");
+    assert!(!msl.contains("prove_facts"), "build-time verifier leaked into Metal:\n{msl}");
+}

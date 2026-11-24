@@ -1232,6 +1232,12 @@ impl<'c, 'a> Fl<'c, 'a> {
         if let Some(v) = self.lifted_const(c) {
             return Repr::Value(v);
         }
+        // A computed constant whose value isn't ready yet must record its dependency even when its
+        // type erases to zero bytes (e.g. a build-time proof witness), so rounds stay ordered.
+        if crate::eval::is_computed(self.cx.checked, c) && !self.cx.data.values.contains_key(&c) {
+            self.cx.missing.insert(c);
+            return Repr::Erased;
+        }
         if !self.is_gpu() {
             return match self.cx.const_data(self.mb, c) {
                 Some(d) => Repr::Place(ir::Place::root(ir::PlaceRoot::Data(d))),
@@ -2096,8 +2102,8 @@ impl<'c, 'a> Fl<'c, 'a> {
             Rvalue::Binary(op, a, b) => self.binary(*op, a, b, ty?, span),
             Rvalue::Adt { variant, fields, .. } => self.adt(*variant, fields, ty?, span),
             Rvalue::Tuple(xs) | Rvalue::Array(xs) => {
-                let t = self.ty(ty?, span)?;
                 let vs: Vec<ir::ValueId> = xs.iter().filter_map(|x| self.operand(x)).collect();
+                let t = self.ty(ty?, span)?;
                 Some(self.value(t, ir::Expr::Construct(t, vs)))
             }
             Rvalue::ArrayRepeat(x, _) => {
@@ -2115,8 +2121,18 @@ impl<'c, 'a> Fl<'c, 'a> {
                 Some(self.value(t, ir::Expr::Convert(v, s)))
             }
             Rvalue::Discriminant(p) => {
-                let place = self.place(p)?;
                 let u = self.mb.m.types.u32();
+                if p.proj.is_empty()
+                    && let Repr::Value(v) = self.locals[p.local.index()]
+                    && matches!(
+                        self.mb.m.types.get(self.f.value_ty(v)),
+                        ir::TypeDef::Enum { variants, .. }
+                            if variants.iter().all(|(_, payload)| payload.is_none())
+                    )
+                {
+                    return Some(self.value(u, ir::Expr::Extract(v, 0)));
+                }
+                let place = self.place(p)?;
                 Some(self.load(place.with(ir::Proj::Field(0)), u))
             }
             Rvalue::Len(p) => self.len(p),
@@ -2375,7 +2391,10 @@ impl<'c, 'a> Fl<'c, 'a> {
         ty: TyId,
         span: Span,
     ) -> Option<ir::ValueId> {
-        let t = self.ty(ty, span)?;
+        let Some(t) = self.ty(ty, span) else {
+            let _ = self.operand(x);
+            return None;
+        };
         let zero = self.lifted_index(x).is_none()
             && match &x.kind {
                 OperandKind::Const(Lit::Int(0) | Lit::Bool(false)) => true,

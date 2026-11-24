@@ -11,7 +11,7 @@ use mesh::grid::{
     pack_vertex_meta, safe_norm, unpack_is_trans, unpack_oct_normal, unpack_smooth, unpack_thing,
     with_along,
 }
-use std::derive::{Box3, affine, value_and_gradient}
+use std::derive::{Box3, affine_form, value_and_gradient}
 use std::field::{ALL_LIVE, DualQuat, Field, Live}
 use std::gpu::{Append, Atomics, DispatchArgs, GlobalId, One, Slots}
 
@@ -746,7 +746,7 @@ fn push_vertex<M: Field<Substance>>(
     cell_verts: mut Atomics<u32>,
 ) {
     let n_final = safe_norm(gv, safe_norm(qef.avg_n, vec3(0.0, 1.0, 0.0)))
-    let is_trans = f.channels(wp).transmission > 0.02
+    let is_trans = f.field_facts().may_transmit && f.channels(wp).transmission > 0.02
     let smooth = qef.min_dot >= SMOOTH_DOT
     let vi = verts.push(
         MeshVertex {
@@ -906,16 +906,16 @@ pub(package) fn filter_thin_cells<M: Field<Substance>>(
     let g = grids[b.w]
     let h = g.cell
     let cell_lo = brick_corner(g, b.xyz, vec3u(cx, cy, cz))
-    let cell_hi = cell_lo + vec3(h)
     let f = fields[g.orig_id]
     let live = ab.live
-    // Exact cells for every cell whose core the compiler's interval can't prove empty, whole or
-    // by its eight octants: a surface can hide inside a cell all of whose corners are outside it
-    // (a wand, a tip, a crest), and Dual Contouring, which sees only sign changes on edges, meshes
-    // none of it. The core is the cell less a quarter pixel on every side (`HOLE_PX / 2`): what
-    // reaches no further in is thinner than a hole (a pixel's middle missed with the field on
-    // every side of it), and asking all of the cell would ask every cell that a neighbour's
-    // surface runs along, which no interval proves empty.
+    // Exact cells for every cell whose core the compiler's affine form can't prove empty, whole
+    // or by its eight octants (pre-filtered by `af.octant_range(k)` at zero extra field cost): a
+    // surface can hide inside a cell all of whose corners are outside it (a wand, a tip, a crest),
+    // and Dual Contouring, which sees only sign changes on edges, meshes none of it. The core is
+    // the cell less a quarter pixel on every side (`HOLE_PX / 2`): what reaches no further in is
+    // thinner than a hole (a pixel's middle missed with the field on every side of it), and asking
+    // all of the cell would ask every cell that a neighbour's surface runs along, which no
+    // interval proves empty.
     let px = length(exact_eye.xyz - (cell_lo + vec3(0.5 * h))) * exact_eye.w
     let m = 0.5 * HOLE_PX * px
     if 2.0 * m >= h {
@@ -924,14 +924,17 @@ pub(package) fn filter_thin_cells<M: Field<Substance>>(
     let lo = cell_lo + vec3(m)
     let w = h - 2.0 * m
     let dist = |q: vec3| f.distance_live(q, live)
-    if affine(dist, Box3 { lo: lo, hi: lo + vec3(w) }).lo > 0.0 {
+    let af = affine_form(dist, Box3 { lo: lo, hi: lo + vec3(w) })
+    if af.lo() > 0.0 {
         return
     }
     var maybe = false
     for k in 0..8 {
-        let o = lo + vec3(f32(k & 1), f32((k >> 1) & 1), f32((k >> 2) & 1)) * (0.5 * w)
-        if !maybe && affine(dist, Box3 { lo: o, hi: o + vec3(0.5 * w) }).lo <= 0.0 {
-            maybe = true
+        if !maybe && af.octant_range(k).lo <= 0.0 {
+            let o = lo + vec3(f32(k & 1), f32((k >> 1) & 1), f32((k >> 2) & 1)) * (0.5 * w)
+            if affine_form(dist, Box3 { lo: o, hi: o + vec3(0.5 * w) }).lo() <= 0.0 {
+                maybe = true
+            }
         }
     }
     if maybe && claim_exact_cell(mut exact_seen, local_bi, cell) {
@@ -1173,7 +1176,7 @@ fn push_skinned_vertex<M: Field<Substance>>(
     cell_verts: mut Atomics<u32>,
 ) {
     let n_final = safe_norm(gv, safe_norm(qef.avg_n, vec3(0.0, 1.0, 0.0)))
-    let is_trans = f.rest_channels(wp).transmission > 0.02
+    let is_trans = f.field_facts().may_transmit && f.rest_channels(wp).transmission > 0.02
     let smooth = qef.min_dot >= SMOOTH_DOT
     let sw = f.rest_skin_weights(wp)
     let vi = verts.push(

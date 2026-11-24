@@ -2897,7 +2897,7 @@ The compiler knows the language, a closed list of std items and its targets; the
   - `std::input`: `Script`
   - `std::tool::browser`: `Script`
   - `std::mem`: `take_answer`, `take_input`, `take_payload`, `keep_bytes`, `kept_bytes`, `read_clock`, `Drop`, `size_of`, `align_of`, `needs_drop`, `is_copy`, `read`, `zeroed`, `write`, `drop_at`, `at`, `at_mut`, `at_mut_pair`, `heap_base`, `memory_pages`, `memory_grow`, `load_u32`, `store_u32`, `load_u8`, `store_u8`, `copy`, `fill`, `compare_swap`, `atomic_add`, `atomic_load`, `atomic_store`, `wait`, `notify`, `run_task`, `task`, `thread_block`, `wait_for`, `abort`, `debug_build`, `test_build`, `tool_request`, `tool_wait`, `tool_any`, `tool_take`, `tool_idle`, `tool_active`, `tool_join`, `tool_done`
-  - `std::derive`: `Interval`, `Domain`, `gradient`, `value_and_gradient`, `value_gradient_with`, `interval`, `affine`, `precision`, `precision_note`, `filtered`, `tape`, `tape_with`, `tape_sized`, `work`, `reads_only_input`
+  - `std::derive`: `Interval`, `Domain`, `gradient`, `value_and_gradient`, `value_gradient_with`, `interval`, `affine`, `affine_form`, `lipschitz`, `precision`, `precision_note`, `filtered`, `tape`, `tape_with`, `tape_sized`, `work`, `reads_only_input`
   - `std::field`: `smin`, `value_noise`, `value_noise_box`, `lattice_coord`
   - `std::hash`: `pcg`
   - `std::stage`: `Building`, `push_one`, `push_two`, `push_new`, `finish`

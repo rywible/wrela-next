@@ -122,9 +122,9 @@ fn a_draw_behind_a_false_associated_constant_is_no_pipeline() {
     assert_eq!(v["pipelines"].as_array().map(Vec::len), Some(0), "{v}");
 }
 
-/// An associated constant of an `f64` comparison isn't folded (the folder takes floats as `f32`s,
-/// where `16777217.0` and `16777216.0` are one number): its branch stays a run-time one, and is
-/// the program's.
+/// An associated constant of an `f64` comparison is evaluated with full `f64` precision (not as
+/// `f32`, where `16777217.0` and `16777216.0` are one number): `16777217.0 == 16777216.0` is
+/// `false`, so its dead branch and pipeline are erased (never folded to `true`).
 #[test]
 fn an_f64_associated_constant_is_not_folded_as_an_f32() {
     let main = format!(
@@ -135,7 +135,7 @@ fn an_f64_associated_constant_is_not_folded_as_an_f32() {
         &[("wrela.toml", &common::manifest("p")), ("main.wrela", &main)],
     );
     let v = common::json(common::wrela().arg("pipelines").arg(&dir).arg("--json"));
-    assert_eq!(v["pipelines"][0]["conditional"], serde_json::json!([true]), "{v}");
+    assert_eq!(v["pipelines"].as_array().map(Vec::len), Some(0), "{v}");
 }
 
 /// A program's tier, an enum whose variants hold nothing, folds into the associated constants
@@ -171,9 +171,9 @@ fn a_tier_folds_into_its_switches() {
         assert_eq!(count(name, fog, None), 1, "{fog}: Epic draws");
         assert_eq!(count(name, fog, Some("TIER=Low")), 0, "{fog}: Low builds no fog");
     }
-    // A guard isn't folded: the branch stays, and its pipeline with it.
+    // A constant guard (`if true`) also folds at build time, erasing the disabled pipeline.
     let guarded = "match TIER {\n        Tier::Low if true => false,\n        _ => true,\n    }";
-    assert_eq!(count("tier-guard", guarded, Some("TIER=Low")), 1);
+    assert_eq!(count("tier-guard", guarded, Some("TIER=Low")), 0);
 }
 
 /// In a relaxed-SIMD build too (its presentation code is relaxable, and keeps strict code, such as

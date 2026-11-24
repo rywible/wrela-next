@@ -11,6 +11,7 @@ pub mod ad;
 mod affine;
 mod exits;
 pub mod interval;
+mod lipschitz;
 pub mod literal;
 pub mod tape;
 
@@ -57,6 +58,10 @@ pub struct DeriveCache {
     /// A function of one operation, made for an affine form to take the plain interval's rule
     /// for it, by the operation and its types.
     affine_ops: HashMap<AffineOpKey, FuncId>,
+    /// Clarke-Lipschitz derivations ([`lipschitz`]) by function, active parameters and input axes.
+    lipschitz: HashMap<(FuncId, Vec<Bits>, u8), FuncId>,
+    /// Clarke-Lipschitz functions being built, to refuse recursion.
+    lipschitz_open: Vec<(FuncId, Vec<Bits>, u8)>,
 }
 
 /// A function of `f`'s captures and `x` (its last parameter) returning `(f32, X)`: `f(x)` and
@@ -125,10 +130,10 @@ pub fn interval(
     interval::interval(m, cache, f, ncap, target, (box_ty, interval_ty), None)
 }
 
-/// As [`interval`], for an `f` that returns an `f32`: the range of `f`'s affine form over the
-/// box (first order, one error term), intersected with the interval's. Tighter where `f` is
-/// smooth over the box, by as much as the box is small; never looser. Sound as the target rounds,
-/// as the interval is. A function the form can't follow gets the interval.
+/// As [`interval`], for an `f` that returns an `f32` or a float vector: the range of `f`'s affine
+/// form over the box, intersected with the interval's. Tighter where `f` is smooth over the box,
+/// by as much as the box is small; never looser. Sound as the target rounds, as the interval is.
+/// A function the form can't follow gets the interval.
 pub fn affine(
     m: &mut Module,
     cache: &mut DeriveCache,
@@ -139,6 +144,34 @@ pub fn affine(
     interval_ty: TypeId,
 ) -> Result<FuncId> {
     affine::affine(m, cache, f, ncap, target, (box_ty, interval_ty))
+}
+
+/// The affine form `{ c, l, e }` of `f` over a box (`box_ty`), returned directly as `affine_ty`
+/// (`Affine1`..`Affine4`) without deriving or calling the plain interval alongside it. Falls back
+/// to wrapping the plain interval only when `f` cannot be affine-derived.
+pub fn affine_form(
+    m: &mut Module,
+    cache: &mut DeriveCache,
+    f: FuncId,
+    ncap: u32,
+    target: Target,
+    box_ty: TypeId,
+    affine_ty: TypeId,
+) -> Result<FuncId> {
+    affine::affine_form(m, cache, f, ncap, target, (box_ty, affine_ty))
+}
+
+/// A sound upper bound on `sup_{x ∈ over} ||∇f(x)||₂` (`f32`), derived by hybrid
+/// Clarke-subdifferential and interval-Jacobian propagation (`std::derive::lipschitz`).
+pub fn lipschitz(
+    m: &mut Module,
+    cache: &mut DeriveCache,
+    f: FuncId,
+    ncap: u32,
+    target: Target,
+    box_ty: TypeId,
+) -> Result<FuncId> {
+    lipschitz::lipschitz(m, cache, f, ncap, target, box_ty)
 }
 
 /// A function of `f`'s captures and a box (as [`interval`]'s) that returns nothing: it runs the

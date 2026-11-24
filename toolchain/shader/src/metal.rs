@@ -152,6 +152,12 @@ fn vector_name(s: ir::Scalar, n: u8) -> R<String> {
 /// A type's size in MSL as naga sized it to place the next member (a `vec3` 12 bytes: what
 /// follows a packed one starts there, and an unpacked one's own fourth component is added).
 fn msl_size(types: &ir::Types, layouts: &mut WgslLayouts, t: ir::TypeId) -> u32 {
+    if let Some(u) = analysis::unit_enum(types, t) {
+        return match u {
+            analysis::UnitEnum::Bool => 1,
+            analysis::UnitEnum::Tag => 4,
+        };
+    }
     match types.get(t) {
         ir::TypeDef::Scalar(ir::Scalar::Bool) => 1,
         ir::TypeDef::Scalar(s) | ir::TypeDef::Atomic(s) => s.bytes(),
@@ -390,6 +396,10 @@ impl<'m> Writer<'m> {
                 name
             }
             ir::TypeDef::RuntimeArray(e) => return self.ty(*e),
+            ir::TypeDef::Enum { .. } if let Some(u) = analysis::unit_enum(&m.types, t) => match u {
+                analysis::UnitEnum::Bool => "bool".to_string(),
+                analysis::UnitEnum::Tag => "uint".to_string(),
+            },
             ir::TypeDef::Struct { name, .. } | ir::TypeDef::Enum { name, .. } => {
                 let name = format!("S{}_{}", t.0, short(name));
                 self.struct_def(t, &name)?;
@@ -523,6 +533,15 @@ impl<'m> Writer<'m> {
                     values.push(v);
                 }
                 Ok(format!("{ty} {}", self.braced(t, &values)))
+            }
+            (ir::TypeDef::Enum { .. }, ir::ConstValue::Variant(k, None))
+                if let Some(u) = analysis::unit_enum(&m.types, t) =>
+            {
+                let tag = m.types.tag(t, *k);
+                Ok(match u {
+                    analysis::UnitEnum::Bool => if tag != 0 { "true" } else { "false" }.into(),
+                    analysis::UnitEnum::Tag => format!("{tag}u"),
+                })
             }
             _ => Err("internal: a table's value doesn't fit its type".into()),
         }
@@ -1447,13 +1466,15 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
                 _ => {}
             },
             ir::Stmt::Store(p, v) => {
-                let (place, atomic) = self.place(p)?;
+                let (place, atomic, bool_tag) = self.place(p)?;
                 let value = self.arg(*v)?;
                 if atomic {
                     let _ = writeln!(
                         out,
                         "metal::atomic_store_explicit(&{place}, {value}, metal::memory_order_relaxed);"
                     );
+                } else if bool_tag {
+                    let _ = writeln!(out, "{place} = ({value} != 0u);");
                 } else {
                     let _ = writeln!(out, "{place} = {value};");
                 }
@@ -1633,6 +1654,15 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
         let mut t = t;
         for &k in path {
             match self.w.m.types.get(t) {
+                ir::TypeDef::Enum { .. }
+                    if let Some(u) = analysis::unit_enum(&self.w.m.types, t) =>
+                {
+                    let next = self.w.m.types.part(t, k).ok_or("internal: a varying's path")?;
+                    if u == analysis::UnitEnum::Bool {
+                        text = format!("uint({text})");
+                    }
+                    t = next;
+                }
                 ir::TypeDef::Struct { .. } | ir::TypeDef::Enum { .. } => {
                     let member = self.w.m.types.gpu_member(t, k);
                     let (name, packed) = self.w.member_name(t, member)?;
@@ -1702,8 +1732,9 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
         analysis::const_int(&self.consts, v)
     }
 
-    /// A place's text, and whether it's an atomic.
-    fn place(&mut self, p: &ir::Place) -> R<(String, bool)> {
+    /// A place's text, whether it's an atomic, and whether it projects the tag of a `bool`-lowered
+    /// unit enum.
+    fn place(&mut self, p: &ir::Place) -> R<(String, bool, bool)> {
         let m = self.w.m;
         let (mut text, mut t, mut sized) = match &p.root {
             ir::PlaceRoot::Local(l) => {
@@ -1731,6 +1762,7 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
                 );
             }
         };
+        let mut bool_tag = false;
         for proj in &p.path {
             match (proj, t) {
                 // A sized buffer's element.
@@ -1741,10 +1773,16 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
                     t = Some(elem);
                 }
                 (ir::Proj::Field(k), Some(pt)) => {
-                    let member = m.types.gpu_member(pt, *k);
-                    let (name, _) = self.w.member_name(pt, member)?;
-                    text = format!("{text}.{name}");
-                    t = m.proj_ty(pt, proj);
+                    if let Some(u) = analysis::unit_enum(&m.types, pt) {
+                        debug_assert_eq!(*k, 0);
+                        bool_tag = u == analysis::UnitEnum::Bool;
+                        t = m.proj_ty(pt, proj);
+                    } else {
+                        let member = m.types.gpu_member(pt, *k);
+                        let (name, _) = self.w.member_name(pt, member)?;
+                        text = format!("{text}.{name}");
+                        t = m.proj_ty(pt, proj);
+                    }
                 }
                 (ir::Proj::Comp(c), Some(pt)) => {
                     text = format!("{text}.{}", ["x", "y", "z", "w"][*c as usize]);
@@ -1765,7 +1803,7 @@ impl<'a, 'm> FunctionWriter<'a, 'm> {
             }
         }
         let atomic = t.is_some_and(|t| matches!(m.types.get(t), ir::TypeDef::Atomic(_)));
-        Ok((text, atomic))
+        Ok((text, atomic, bool_tag))
     }
 }
 
@@ -1834,7 +1872,11 @@ impl FunctionWriter<'_, '_> {
                     atom(text)
                 }
             }
-            ir::Expr::Zero(t) => atom(format!("{} {{}}", self.w.ty(*t)?)),
+            ir::Expr::Zero(t) => match analysis::unit_enum(&m.types, *t) {
+                Some(analysis::UnitEnum::Bool) => atom("false".into()),
+                Some(analysis::UnitEnum::Tag) => atom("0u".into()),
+                None => atom(format!("{} {{}}", self.w.ty(*t)?)),
+            },
             ir::Expr::Param(i) => {
                 if let (
                     Some((map, vt)),
@@ -1873,11 +1915,13 @@ impl FunctionWriter<'_, '_> {
                 }
             }
             ir::Expr::Load(p) => {
-                let (place, atomic) = self.place(p)?;
+                let (place, atomic, bool_tag) = self.place(p)?;
                 if atomic {
                     atom(format!(
                         "metal::atomic_load_explicit(&{place}, metal::memory_order_relaxed)"
                     ))
+                } else if bool_tag {
+                    atom(format!("uint({place})"))
                 } else {
                     atom(place)
                 }
@@ -1927,6 +1971,13 @@ impl FunctionWriter<'_, '_> {
                 let xt = self.ty_of(*x);
                 let base = self.operand(*x)?;
                 match m.types.get(xt) {
+                    ir::TypeDef::Enum { .. } if let Some(u) = analysis::unit_enum(&m.types, xt) => {
+                        debug_assert_eq!(*i, 0);
+                        match u {
+                            analysis::UnitEnum::Bool => atom(format!("uint({base})")),
+                            analysis::UnitEnum::Tag => atom(base),
+                        }
+                    }
                     ir::TypeDef::Struct { .. } | ir::TypeDef::Enum { .. } => {
                         let member = m.types.gpu_member(xt, *i);
                         let (name, packed) = self.w.member_name(xt, member)?;
@@ -1945,6 +1996,13 @@ impl FunctionWriter<'_, '_> {
                 }
             }
             ir::Expr::Variant(et, k, payload) => {
+                if let Some(u) = analysis::unit_enum(&m.types, *et) {
+                    let tag = m.types.tag(*et, *k);
+                    return Ok(atom(match u {
+                        analysis::UnitEnum::Bool => if tag != 0 { "true" } else { "false" }.into(),
+                        analysis::UnitEnum::Tag => format!("{tag}u"),
+                    }));
+                }
                 let ir::TypeDef::Enum { variants, .. } = m.types.get(*et) else {
                     return Err("internal: a variant of a type that isn't an enum".into());
                 };
@@ -2309,7 +2367,7 @@ impl FunctionWriter<'_, '_> {
         let ir::TypeDef::Atomic(s) = *m.types.get(pt) else {
             return Err("internal: an atomic operation on something that isn't atomic".into());
         };
-        let (place, _) = self.place(p)?;
+        let (place, _, _) = self.place(p)?;
         if op == A::Load {
             return Ok(Some(format!(
                 "metal::atomic_load_explicit(&{place}, metal::memory_order_relaxed)"

@@ -10,9 +10,10 @@
 // 100% pure fields (zero GPU code, zero meshes, zero textures).
 
 use engine::matter::substance::Substance
+use engine::matter::verify::prove_field_facts
 use kit::substances::pbr::{basalt, glazed, metal, stone}
 use std::cmp::Eq
-use std::field::{Bound, Field, Surface}
+use std::field::{Bound, Field, FieldFacts, Surface}
 use std::hash::StateHash
 
 fn sd_box(p: vec3, c: vec3, h: vec3) -> f32 {
@@ -23,7 +24,11 @@ fn sd_box(p: vec3, c: vec3, h: vec3) -> f32 {
 fn sd_cyl(p: vec3, cx: f32, cz: f32, y_lo: f32, y_hi: f32, r: f32) -> f32 {
     let dr = length(vec2(p.x - cx, p.z - cz)) - r
     let dy = max(p.y - y_hi, y_lo - p.y)
-    length(max(vec2(dr, dy), vec2(0.0))) + min(max(dr, dy), 0.0)
+    if dr > 0.0 && dy > 0.0 {
+        length(vec2(dr, dy))
+    } else {
+        max(dr, dy)
+    }
 }
 
 /// Exact 1-Lipschitz SDF of a wide masonry bastion wall at `z = zc`, half-width `hw`, height `ht`,
@@ -149,7 +154,13 @@ impl Field<Substance> for Citadel {
         let warm = vec3(0.46, 0.43, 0.38) * tint * (1.0 - 0.28 * mortar)
         stone(warm, roughness: clamp(0.76 + 0.14 * mortar, 0.5, 0.96))
     }
+
+    fn field_facts(self) -> FieldFacts {
+        CITADEL_FACTS
+    }
 }
+
+const CITADEL_FACTS: FieldFacts = prove_field_facts(Citadel { spare: 0.0 })
 
 /// Fluted Carrara marble temple column with true 3D interior marble & gold-ochre mineral veining
 /// throughout its volume (`d < 0`), designed for live CSG destruction (`SCENE=12`).
@@ -162,11 +173,9 @@ pub fn marble_column(centre_x: f32 = 0.0, centre_z: f32 = 0.0) -> MarbleColumn {
     MarbleColumn { centre_x, centre_z }
 }
 
-/// `x` to the 12th, by products (`pow` has no derivative at 0, the column's axis).
-fn fade12(x: f32) -> f32 {
-    let x2 = x * x
-    let x4 = x2 * x2
-    x4 * x4 * x4
+/// Complex multiplication for singularity-free 12-fold flutes (`min(r/r0, 1)^12 · sin(12 θ)`).
+fn cmul(a: vec2, b: vec2) -> vec2 {
+    vec2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x)
 }
 
 impl Surface for MarbleColumn {
@@ -179,21 +188,26 @@ impl Surface for MarbleColumn {
         let d_plinth = sd_box(lp, vec3(0.0, 0.26, 0.0), vec3(0.95, 0.26, 0.95))
         // Square abacus capital (`y in [3.70, 4.16]`).
         let d_cap = sd_box(lp, vec3(0.0, 3.93, 0.0), vec3(0.92, 0.23, 0.92))
-        // Subtle 12-flute cylindrical shaft (`y in [0.46, 3.76]`, `r = 0.68 m`).
+        // Subtle 12-flute cylindrical shaft (`y in [0.46, 3.76]`, `r = 0.68 m`), evaluated via
+        // complex 12th power of `(lp.x, lp.z) / max(r, 0.62)` so there is no `atan2` `1/r`
+        // gradient singularity at the column axis.
         let r = length(lp.xz)
-        let ang = atan2(lp.z, lp.x)
-        // Faded to nothing within 0.62 m of the axis (as the arena's pillars' are, `ripple`): a
-        // flute cut by angle alone is as steep as `0.264 / r` there, without bound (1.137 at half
-        // a metre in broke the stated 1.12); faded so, at most `12 / 0.62 · 0.022`, and its
-        // surface (0.658 m out at its deepest) is as it was.
+        let z1 = clamp(lp.xz / max(r, 0.62), vec2(-1.0), vec2(1.0))
+        let z2 = cmul(z1, z1)
+        let z4 = cmul(z2, z2)
+        let z8 = cmul(z4, z4)
+        let z12 = cmul(z8, z4)
         let flute = 0.022 *
-            sin(ang * 12.0) *
-            fade12(min(r / 0.62, 1.0)) *
+            z12.y *
             smoothstep(0.55, 0.78, lp.y) *
             (1.0 - smoothstep(3.45, 3.68, lp.y))
         let dr = r - (0.68 - flute)
         let dy = max(lp.y - 3.76, 0.46 - lp.y)
-        let d_shaft = length(max(vec2(dr, dy), vec2(0.0))) + min(max(dr, dy), 0.0)
+        let d_shaft = if dr > 0.0 && dy > 0.0 {
+            length(vec2(dr, dy))
+        } else {
+            max(dr, dy)
+        }
         min(min(d_plinth, d_cap), d_shaft)
     }
 
@@ -229,20 +243,32 @@ impl Field<Substance> for MarbleColumn {
         }
         glazed(final_col, roughness: clamp(0.24 + 0.14 * dark_vein, 0.12, 0.55), coat: 0.35)
     }
+
+    fn field_facts(self) -> FieldFacts {
+        MARBLE_COLUMN_FACTS
+    }
 }
+
+const MARBLE_COLUMN_FACTS: FieldFacts = prove_field_facts(
+    MarbleColumn { centre_x: 0.0, centre_z: 0.0 },
+)
 
 @test
 fn citadel_and_marble_column_contracts_are_sound() {
-    engine::matter::verify::verify_field_soundness(citadel(), "citadel")
+    let cit = citadel()
+    engine::matter::verify::verify_field_soundness(cit, "citadel")
     let col = marble_column()
     engine::matter::verify::verify_field_soundness(col, "marble_column")
     var log = engine::matter::edits::world_edits()
     log.append(
         engine::matter::edits::edit_sphere_sub(vec3(0.42, 2.05, 0.48), radius: 0.44, k: 0.08),
     )
-    engine::matter::verify::verify_edits_soundness(
-        col,
-        engine::matter::edits::edited(col, log),
-        "marble_column_csg_blast",
-    )
+    let ed = engine::matter::edits::edited(col, log)
+    engine::matter::verify::verify_edits_soundness(col, ed, "marble_column_csg_blast")
+    let f_cit = cit.field_facts()
+    let f_col = col.field_facts()
+    let f_ed = ed.field_facts()
+    assert(f_cit.lip < 1.0e12 && !f_cit.may_transmit && !f_cit.may_emit, "citadel facts")
+    assert(f_col.lip < 1.0e12 && !f_col.may_transmit && !f_col.may_emit && f_col.may_coat, "column facts")
+    assert(f_ed.lip < 1.0e12 && !f_ed.may_transmit, "edited column stays provably opaque")
 }

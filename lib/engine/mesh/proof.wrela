@@ -16,18 +16,24 @@
 //     heuristic minimum step) or by compiler-derived IEEE-754-sound 1D `std::derive::affine`.
 
 use matter::substance::{Substance, lambert}
-use std::derive::{Interval, affine}
+use std::derive::{Interval, affine_form}
 use std::field::{ALL_LIVE, Field, Live, Surface, fbm, round_cone, sphere}
 use std::gpu::discard
+use std::mem::size_of
+
+const PROOF_EPS: f32 = 1.0 / 8388608.0
+const PROOF_TINY: f32 = 1.2e-38
 
 /// Transmission threshold partitioning opaque pixels (`<= TRANS_CUTOFF`) from transmissive pixels
 /// (`> TRANS_CUTOFF`) across all G-buffer cut passes and transmissive passes.
 pub const TRANS_CUTOFF: f32 = 0.02
 
-/// Unforgeable proof token witnessing that a fragment provably carries no surface for the current
-/// pass. The private field prevents any module outside `mesh::proof` from constructing one.
+/// Unforgeable zero-sized proof token witnessing that a fragment provably carries no surface for
+/// the current pass. The private unit field prevents any module outside `mesh::proof` from
+/// constructing one while erasing to 0 bytes across CPU, Metal, and SPIR-V (`Option<EmptyProof>`
+/// lowers to a bare `bool`).
 pub struct EmptyProof: Copy {
-    seal: u32,
+    seal: (),
 }
 
 /// Result of solving a ray against a field inside an exact cell box `[t_enter, t_exit]`.
@@ -47,7 +53,7 @@ pub fn is_transmissive_pixel(sub: Substance) -> bool {
 /// Witnesses that a pixel belongs to the transmissive pass (so the opaque cut pass may discard it).
 pub fn prove_transmissive_only(sub: Substance) -> Option<EmptyProof> {
     if is_transmissive_pixel(sub) {
-        Some(EmptyProof { seal: 1 })
+        Some(EmptyProof { seal: () })
     } else {
         None
     }
@@ -56,7 +62,7 @@ pub fn prove_transmissive_only(sub: Substance) -> Option<EmptyProof> {
 /// Witnesses that a pixel belongs to the opaque pass (so the transmissive pass may discard it).
 pub fn prove_opaque_only(sub: Substance) -> Option<EmptyProof> {
     if !is_transmissive_pixel(sub) {
-        Some(EmptyProof { seal: 2 })
+        Some(EmptyProof { seal: () })
     } else {
         None
     }
@@ -66,7 +72,7 @@ pub fn prove_opaque_only(sub: Substance) -> Option<EmptyProof> {
 /// opaque surface drawn there, `bg_dist` away (a half-res transmissive reflection's).
 pub fn prove_point_behind_opaque(dist: f32, bg_dist: f32, margin: f32) -> Option<EmptyProof> {
     if dist > bg_dist + margin {
-        Some(EmptyProof { seal: 3 })
+        Some(EmptyProof { seal: () })
     } else {
         None
     }
@@ -74,14 +80,14 @@ pub fn prove_point_behind_opaque(dist: f32, bg_dist: f32, margin: f32) -> Option
 
 /// A pixel's ray across a box: where it enters and leaves it (`t` along the ray, the entry no
 /// nearer than the eye) and how deep along the eye's forward axis its entry is. Only
-/// `ray_box_bracket` makes one.
+/// `ray_box_bracket` makes one (`seal: ()` erases to 0 bytes).
 pub struct RayBox: Copy {
     pub t_enter: f32,
     pub t_exit: f32,
     pub z_enter: f32,
     /// `dot(ray, forward)`: depth along the forward axis per unit along the ray.
     pub z_per_t: f32,
-    seal: u32,
+    seal: (),
 }
 
 /// The ray from `o` along `d` (unit) across the box `[lo, hi]`, for an eye looking along
@@ -95,7 +101,7 @@ pub fn ray_box_bracket(o: vec3, d: vec3, forward: vec3, lo: vec3, hi: vec3) -> R
         t_exit: if tx <= 0.0 { 0.0 } else { tx },
         z_enter: t0 * zpt,
         z_per_t: zpt,
-        seal: 0,
+        seal: (),
     }
 }
 
@@ -104,7 +110,7 @@ pub fn ray_box_bracket(o: vec3, d: vec3, forward: vec3, lo: vec3, hi: vec3) -> R
 /// along it is already behind that depth.
 pub fn prove_box_unseen(b: RayBox, bg_z: f32) -> Option<EmptyProof> {
     if b.t_enter > b.t_exit || b.z_enter > bg_z {
-        Some(EmptyProof { seal: 9 })
+        Some(EmptyProof { seal: () })
     } else {
         None
     }
@@ -121,7 +127,7 @@ pub fn seen_part(b: RayBox, bg_z: f32, margin: f32) -> (f32, f32) {
 /// Witnesses that a particle billboard fragment lies strictly outside its disc radius.
 pub fn prove_outside_disc(r2: f32, max_r2: f32) -> Option<EmptyProof> {
     if r2 > max_r2 {
-        Some(EmptyProof { seal: 4 })
+        Some(EmptyProof { seal: () })
     } else {
         None
     }
@@ -132,7 +138,7 @@ pub fn prove_outside_disc(r2: f32, max_r2: f32) -> Option<EmptyProof> {
 /// another batch won hardware depth testing and will be shaded by that batch's own resolve draw.
 pub fn prove_vis_not_batch(vis_header: u32, batch_id: u32) -> Option<EmptyProof> {
     if (vis_header & 2147483648) == 0 || ((vis_header >> 16) & 8191) != batch_id {
-        Some(EmptyProof { seal: 10 })
+        Some(EmptyProof { seal: () })
     } else {
         None
     }
@@ -216,7 +222,7 @@ fn refine_root<F: Copy + fn(vec3) -> f32>(
     b
 }
 
-/// Sound 1D affine-arithmetic emptiness proof over ray segment `[t0, t1]`.
+/// Sound 1D affine-form emptiness proof over ray segment `[t0, t1]`.
 pub fn prove_ray_segment_empty<F: Copy + fn(vec3) -> f32>(
     dist: F,
     o: vec3,
@@ -225,10 +231,10 @@ pub fn prove_ray_segment_empty<F: Copy + fn(vec3) -> f32>(
     t1: f32,
 ) -> Option<EmptyProof> {
     if t0 >= t1 {
-        return Some(EmptyProof { seal: 5 })
+        return Some(EmptyProof { seal: () })
     }
-    let iv = affine(|s: f32| dist(o + d * s), Interval { lo: t0, hi: t1 })
-    if iv.lo > 0.0 { Some(EmptyProof { seal: 5 }) } else { None }
+    let af = affine_form(|s: f32| dist(o + d * s), Interval { lo: t0, hi: t1 })
+    if af.lo() > 0.0 { Some(EmptyProof { seal: () }) } else { None }
 }
 
 /// Solves for the first surface crossing of `dist(o + t * d) == 0` inside the exact ray-cell
@@ -237,9 +243,10 @@ pub fn prove_ray_segment_empty<F: Copy + fn(vec3) -> f32>(
 ///
 /// Soundness invariant: returns `CellRay::Empty(proof)` ONLY when every sub-segment of
 /// `[max(t_enter, 0.0), t_exit]` is mathematically proved strictly positive (`f > 0`), either by
-/// pure Lipschitz steps `t += f / lip` (Mean Value Theorem) or by compiler-derived 1D `affine`
-/// intervals. If a grazing ray exhausts its step budget without proving emptiness, it returns a
-/// `Hit` at its closest approach rather than silently opening a hole.
+/// pure Lipschitz steps `t += f / lip` (Mean Value Theorem) or by compiler-derived 1D `affine_form`
+/// intervals with sound affine Krawczyk/Newton bracket contraction. If a grazing ray exhausts its
+/// step budget without proving emptiness, it returns a `Hit` at its closest approach rather than
+/// silently opening a hole.
 pub fn solve_cell_ray<F: Copy + fn(vec3) -> f32>(
     dist: F,
     o: vec3,
@@ -250,12 +257,12 @@ pub fn solve_cell_ray<F: Copy + fn(vec3) -> f32>(
     lip: f32,
 ) -> CellRay {
     if t_enter > t_exit || t_exit <= 0.0 {
-        return CellRay::Empty(EmptyProof { seal: 6 })
+        return CellRay::Empty(EmptyProof { seal: () })
     }
     let t0 = max(t_enter, 0.0)
     let t1 = t_exit
     if t0 >= t1 {
-        return CellRay::Empty(EmptyProof { seal: 6 })
+        return CellRay::Empty(EmptyProof { seal: () })
     }
     let tol = max(0.02 * px, 1.0e-6)
     let f0 = dist(o + d * t0)
@@ -268,7 +275,7 @@ pub fn solve_cell_ray<F: Copy + fn(vec3) -> f32>(
     var f_near = f0
 
     // Fast path (>95% of silhouette pixels): pure Lipschitz sphere-tracing with NO heuristic
-    // minimum step. Exiting `t1` proves `f > 0` across all of `[t0, t1]` with zero `affine` calls.
+    // minimum step. Exiting `t1` proves `f > 0` across all of `[t0, t1]` with zero `affine_form` calls.
     if lip > 0.0 && lip < 1.0e12 {
         let inv_lip = 1.0 / max(lip, 1.0)
         var t = t0
@@ -280,7 +287,7 @@ pub fn solve_cell_ray<F: Copy + fn(vec3) -> f32>(
                 if f_end <= tol {
                     return CellRay::Hit(refine_root(dist, o, d, t, f, t1, f_end, tol))
                 }
-                return CellRay::Empty(EmptyProof { seal: 7 })
+                return CellRay::Empty(EmptyProof { seal: () })
             }
             let prev_t = t
             let prev_f = f
@@ -297,9 +304,9 @@ pub fn solve_cell_ray<F: Copy + fn(vec3) -> f32>(
         rem_t = t
     }
 
-    // Sound grazing fallback: front-to-back 1D affine-interval subdivision on `[rem_t, t1]`.
-    // Stack holds at most 4 active sub-intervals (48 B/invocation), capped at 5 iterations so
-    // static shader work stays well below the GPU render-pass guard on complex fields.
+    // Sound grazing fallback: front-to-back 1D `affine_form` subdivision + affine Krawczyk/Newton
+    // bracket contraction on `[rem_t, t1]`. Stack holds at most 4 active sub-intervals (48 B),
+    // capped at 5 iterations so static shader work stays well below the GPU render-pass guard.
     var s_lo = [0.0; 4]
     var s_hi = [0.0; 4]
     var s_dep = [0; 4]
@@ -316,19 +323,50 @@ pub fn solve_cell_ray<F: Copy + fn(vec3) -> f32>(
             break
         }
         sp -= 1
-        let a = s_lo[sp]
+        var a = s_lo[sp]
         let b = s_hi[sp]
         let dep = s_dep[sp]
         if has_hit && a >= best_t {
             continue
         }
-        let b_eff = if has_hit { min(b, best_t) } else { b }
+        var b_eff = if has_hit { min(b, best_t) } else { b }
         if a >= b_eff {
             continue
         }
-        let iv = affine(|s: f32| dist(o + d * s), Interval { lo: a, hi: b_eff })
-        if iv.lo > 0.0 {
+        let af = affine_form(|s: f32| dist(o + d * s), Interval { lo: a, hi: b_eff })
+        if af.lo() > 0.0 {
             continue
+        }
+        // Sound 1D affine Krawczyk contraction: discard sub-intervals where `af.c + af.l * u - af.e > 0`
+        // strictly (keeping every `u` where `f(s) <= 0` is possible).
+        if af.valid() && abs(af.l) > 1.0e-6 {
+            let hl = 0.5 * a
+            let hh = 0.5 * b_eff
+            let c_in = hl + hh
+            let h_in = (hh - hl) * (1.0 + 2.0 * PROOF_EPS)
+            let mag = abs(af.c) + abs(af.l) + af.e
+            let margin_f = mag * (12.0 * PROOF_EPS) + 4.0 * PROOF_TINY
+            let s_margin = (abs(c_in) + h_in) * (8.0 * PROOF_EPS) + 4.0 * PROOF_TINY
+            if af.l < 0.0 {
+                let u_lo = (af.c - af.e - margin_f) / (-af.l)
+                if u_lo > 1.0 {
+                    continue
+                }
+                if u_lo > -1.0 {
+                    a = max(a, c_in + h_in * u_lo - s_margin)
+                }
+            } else {
+                let u_hi = (-af.c + af.e + margin_f) / af.l
+                if u_hi < -1.0 {
+                    continue
+                }
+                if u_hi < 1.0 {
+                    b_eff = min(b_eff, c_in + h_in * u_hi + s_margin)
+                }
+            }
+            if a >= b_eff {
+                continue
+            }
         }
         let m = 0.5 * (a + b_eff)
         let fm = dist(o + d * m)
@@ -381,7 +419,7 @@ pub fn solve_cell_ray<F: Copy + fn(vec3) -> f32>(
         return CellRay::Hit(refine_root(dist, o, d, best_a, fa, best_t, fb, tol))
     }
     if sp == 0 {
-        CellRay::Empty(EmptyProof { seal: 8 })
+        CellRay::Empty(EmptyProof { seal: () })
     } else {
         CellRay::Hit(t_near)
     }
@@ -445,12 +483,12 @@ pub fn solve_cell_ray_lipschitz<M: Field<Substance>>(
     lip: f32,
 ) -> CellRay {
     if t_enter > t_exit || t_exit <= 0.0 {
-        return CellRay::Empty(EmptyProof { seal: 6 })
+        return CellRay::Empty(EmptyProof { seal: () })
     }
     let t0 = max(t_enter, 0.0)
     let t1 = t_exit
     if t0 >= t1 {
-        return CellRay::Empty(EmptyProof { seal: 6 })
+        return CellRay::Empty(EmptyProof { seal: () })
     }
     let tol = max(0.02 * px, 1.0e-6)
     let f0 = field.distance_live(o + d * t0, live)
@@ -468,7 +506,7 @@ pub fn solve_cell_ray_lipschitz<M: Field<Substance>>(
         if f_end <= tol {
             return CellRay::Hit(refine_root_live(field, live, o, d, t0, f0, t1, f_end, tol))
         }
-        return CellRay::Empty(EmptyProof { seal: 7 })
+        return CellRay::Empty(EmptyProof { seal: () })
     }
     // Bidirectional over-relaxed MVT sphere tracing (Keinert et al. 2014, Theorem 1):
     // `t_lo` advances forward keeping `f > 0` on `[t0, t_lo + r_lo)`, and `t_hi` retreats
@@ -495,12 +533,12 @@ pub fn solve_cell_ray_lipschitz<M: Field<Substance>>(
     }
     for _ in 0..16 {
         if hi_clear && t_lo + r_lo + r_hi > t_hi {
-            return CellRay::Empty(EmptyProof { seal: 7 })
+            return CellRay::Empty(EmptyProof { seal: () })
         }
         let max_step_lo = if hi_clear { max(t_hi - r_hi - t_lo, r_lo) } else { t_hi - t_lo }
         if t_lo + r_lo >= t_hi {
             if hi_clear {
-                return CellRay::Empty(EmptyProof { seal: 7 })
+                return CellRay::Empty(EmptyProof { seal: () })
             }
             return CellRay::Hit(refine_root_live(field, live, o, d, t_lo, f_lo, t_hi, f_hi, tol))
         }
@@ -539,7 +577,7 @@ pub fn solve_cell_ray_lipschitz<M: Field<Substance>>(
         }
         if hi_clear {
             if t_lo + r_lo + r_hi > t_hi {
-                return CellRay::Empty(EmptyProof { seal: 7 })
+                return CellRay::Empty(EmptyProof { seal: () })
             }
             let max_step_hi = max(t_hi - (t_lo + r_lo), r_hi)
             let step_hi = min(omega_hi * r_hi, max_step_hi)
@@ -583,7 +621,7 @@ pub fn solve_field_cell_ray<M: Field<Substance>>(
 ) -> CellRay {
     let (te, tx) = ray_box_interval(o, d, lo, hi)
     if te > tx || tx <= 0.0 {
-        return CellRay::Empty(EmptyProof { seal: 6 })
+        return CellRay::Empty(EmptyProof { seal: () })
     }
     let diag = length(hi - lo)
     let lip = field.lipschitz(diag)
@@ -591,6 +629,12 @@ pub fn solve_field_cell_ray<M: Field<Substance>>(
 }
 
 // ---- CPU soundness tests (run at build time via `tools/check`) ----
+
+@test
+fn proof_tokens_erase_to_zero_bytes() {
+    assert(size_of::<EmptyProof>() == 0, f"EmptyProof must be 0 bytes, got {size_of::<EmptyProof>()}")
+    assert(size_of::<RayBox>() == 16, f"RayBox must be 16 bytes (one vec4), got {size_of::<RayBox>()}")
+}
 
 @test
 fn solve_cell_ray_has_zero_holes_and_zero_extras_on_grazing_sphere() {

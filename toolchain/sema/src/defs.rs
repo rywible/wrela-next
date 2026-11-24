@@ -656,6 +656,8 @@ lang_items! {
     ValueGradientWith = "std::derive::value_gradient_with",
     IntervalOf = "std::derive::interval",
     AffineOf = "std::derive::affine",
+    AffineForm = "std::derive::affine_form",
+    Lipschitz = "std::derive::lipschitz",
     Precision = "std::derive::precision",
     PrecisionNote = "std::derive::precision_note",
     Filtered = "std::derive::filtered",

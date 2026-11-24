@@ -38,6 +38,12 @@ pub enum DeriveKind {
     Interval,
     /// The affine form's range over a box, intersected with the interval (`std::derive::affine`).
     Affine,
+    /// The affine form `{ c, l, e }` directly over a box (`std::derive::affine_form`), without
+    /// computing a redundant plain interval.
+    AffineForm,
+    /// Sound upper bound on `sup ||∇f||₂` over a box (`std::derive::lipschitz`), using hybrid
+    /// Clarke-subdifferential and interval-Jacobian propagation.
+    Lipschitz,
     /// A precision report over a box (`std::derive::precision`, `wrela precision`): nothing.
     Precision,
     /// The value box-filtered over a footprint (`filtered`): `f32`.
