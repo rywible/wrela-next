@@ -105,7 +105,24 @@ pub fn run(args: &[String]) -> ExitCode {
             println!("FAILED {name}\n{why}");
         }
     }
-    println!("shaders: {} of {} pass", shaders.len() - failed, shaders.len());
+    let mut largest_bytes = 0usize;
+    let mut largest_name = "";
+    for (name, _) in &shaders {
+        if let Ok(meta) = std::fs::metadata(dir.join(name)) {
+            let sz = meta.len() as usize;
+            if sz > largest_bytes {
+                largest_bytes = sz;
+                largest_name = name.as_str();
+            }
+        }
+    }
+    println!(
+        "shaders: {} of {} pass (largest: {} KiB `{}`)",
+        shaders.len() - failed,
+        shaders.len(),
+        largest_bytes.div_ceil(1024),
+        largest_name,
+    );
     if failed > 0 { ExitCode::from(1) } else { ExitCode::SUCCESS }
 }
 

@@ -91,11 +91,45 @@ pub struct RayBox: Copy {
 }
 
 /// The ray from `o` along `d` (unit) across the box `[lo, hi]`, for an eye looking along
-/// `forward`: missed where `t_enter > t_exit`.
+/// `forward`: missed where `t_enter > t_exit`. Inflates `[lo, hi]` by exact IEEE-754 rounding
+/// margin so floating-point slab intersection cannot open a 0-width seam between touching cells.
 pub fn ray_box_bracket(o: vec3, d: vec3, forward: vec3, lo: vec3, hi: vec3) -> RayBox {
-    let (te, tx) = ray_box_interval(o, d, lo, hi)
+    let eps = max(max(abs(lo), abs(hi)) * (8.0 * PROOF_EPS), vec3(1.0e-6))
+    let (te, tx) = ray_box_interval(o, d, lo - eps, hi + eps)
     let t0 = max(te, 0.0)
     let zpt = dot(d, forward)
+    RayBox {
+        t_enter: if tx <= 0.0 { 1.0 } else { t0 },
+        t_exit: if tx <= 0.0 { 0.0 } else { tx },
+        z_enter: t0 * zpt,
+        z_per_t: zpt,
+        seal: (),
+    }
+}
+
+/// Exact analytical ray-sphere bracket for ray `(o, d)` (unit `d`) against bounding sphere
+/// `(centre, radius)` inflated by IEEE-754 rounding margin: rejects ~48% of empty bounding-cube
+/// corner pixels before any field evaluation (`t_enter > t_exit` on miss).
+pub fn ray_sphere_bracket(
+    o: vec3,
+    d: vec3,
+    forward: vec3,
+    centre: vec3,
+    radius: f32,
+) -> RayBox {
+    let r = radius + max(radius * (16.0 * PROOF_EPS), 1.0e-5)
+    let oc = o - centre
+    let b = dot(oc, d)
+    let c = dot(oc, oc) - r * r
+    let disc = b * b - c
+    let zpt = dot(d, forward)
+    if disc < 0.0 {
+        return RayBox { t_enter: 1.0, t_exit: 0.0, z_enter: 1.0e30, z_per_t: zpt, seal: () }
+    }
+    let sd = sqrt(disc)
+    let te = -b - sd
+    let tx = -b + sd
+    let t0 = max(te, 0.0)
     RayBox {
         t_enter: if tx <= 0.0 { 1.0 } else { t0 },
         t_exit: if tx <= 0.0 { 0.0 } else { tx },
@@ -777,4 +811,30 @@ fn solve_cell_ray_lipschitz_bidirectional_has_zero_holes_and_zero_extras() {
             },
         }
     }
+}
+
+@test
+fn ray_box_bracket_has_zero_seam_between_touching_cells() {
+    // Two touching cells sharing the plane x = 10.0; rays aimed right at the boundary must hit
+    // at least one cell (never slip through a floating-point slab seam).
+    let d = normalize(vec3(0.01, -0.02, 1.0))
+    let fwd = vec3(0.0, 0.0, 1.0)
+    for i in 0..9 {
+        let ox = 10.0 + f32(i - 4) * 1.0e-6
+        let o = vec3(ox, 0.0, -5.0)
+        let left = ray_box_bracket(o, d, fwd, vec3(9.0, -1.0, 0.0), vec3(10.0, 1.0, 1.0))
+        let right = ray_box_bracket(o, d, fwd, vec3(10.0, -1.0, 0.0), vec3(11.0, 1.0, 1.0))
+        let hit_any = left.t_enter <= left.t_exit || right.t_enter <= right.t_exit
+        assert(hit_any, f"ray at ox={ox} slipped through touching cell seam")
+    }
+}
+
+@test
+fn ray_sphere_bracket_matches_exact_sphere() {
+    let fwd = vec3(0.0, 0.0, 1.0)
+    let hit = ray_sphere_bracket(vec3(0.0, 0.0, -4.0), fwd, fwd, vec3(0.0), 1.0)
+    assert(hit.t_enter <= hit.t_exit, "center ray must hit sphere")
+    assert(abs(hit.t_enter - 3.0) < 1.0e-4 && abs(hit.t_exit - 5.0) < 1.0e-4, "wrong sphere bracket")
+    let miss = ray_sphere_bracket(vec3(1.1, 0.0, -4.0), fwd, fwd, vec3(0.0), 1.0)
+    assert(miss.t_enter > miss.t_exit, "outside ray must miss sphere")
 }

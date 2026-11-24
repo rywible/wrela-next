@@ -2,6 +2,7 @@
 // deferred direct lighting, half-res GI/SSR, and transmissive refraction.
 
 use matter::sky::Sky
+use matter::space::{LinearLight, UnitNormal, finite_clamp}
 use matter::substance::{ONE_OVER_PI, Substance, env_brdf_approx, fresnel_schlick_rough}
 use mesh::extract::{
     ExactCell, HOLE_PX, MeshVertex, eval_dqs, project_posed, unpack_oct_normal, unpack_smooth,
@@ -426,6 +427,43 @@ fn motion_of(wp: vec3, prev_wp: vec3, v: View, prev_v: View) -> vec2 {
     project_uv_unjittered(prev_v, prev_wp) - project_uv_unjittered(v, wp)
 }
 
+/// Selective zero-cost physical `Substance` sanitizer: when build-time zero-sample affine
+/// verification proved every channel finite and in physical PBR ranges (`facts.channels_proven`),
+/// this function folds away completely (0 GPU instructions); for arbitrary unproven fields, it
+/// enforces branchless NaN/Inf-safe bounds so NaN fireflies and HDR blowups are unconstructable.
+fn sanitize_substance(sub: Substance, facts: FieldFacts) -> Substance {
+    if facts.channels_proven {
+        return sub
+    }
+    let lit = LinearLight::sanitize(sub.emits)
+    Substance {
+        albedo: vec3(
+            finite_clamp(sub.albedo.x, lo: 0.0, hi: 1.0, fallback: 0.5),
+            finite_clamp(sub.albedo.y, lo: 0.0, hi: 1.0, fallback: 0.5),
+            finite_clamp(sub.albedo.z, lo: 0.0, hi: 1.0, fallback: 0.5),
+        ),
+        roughness: finite_clamp(sub.roughness, lo: 0.02, hi: 1.0, fallback: 0.5),
+        emits: lit.rgb,
+        metallic: finite_clamp(sub.metallic, lo: 0.0, hi: 1.0, fallback: 0.0),
+        ior: finite_clamp(sub.ior, lo: 1.0, hi: 3.0, fallback: 1.5),
+        transmission: finite_clamp(sub.transmission, lo: 0.0, hi: 1.0, fallback: 0.0),
+        subsurface: finite_clamp(sub.subsurface, lo: 0.0, hi: 1.0, fallback: 0.0),
+        coat: finite_clamp(sub.coat, lo: 0.0, hi: 1.0, fallback: 0.0),
+        micro: finite_clamp(sub.micro, lo: 0.0, hi: 1.0, fallback: 0.0),
+        pad0: 0.0,
+        pad1: 0.0,
+        pad2: 0.0,
+    }
+}
+
+/// Nyquist pixel-footprint band-limiting factor for procedural microsurface relief: smoothly rolls
+/// off high-frequency detail as pixel footprint `dist * pixel` approaches `1 / (2 * freq)`.
+fn nyquist_micro_atten(dist: f32, pixel: f32, max_freq: f32) -> f32 {
+    let freq = if max_freq > 0.0 && max_freq < 1.0e6 { max(max_freq, 16.0) } else { 24.0 }
+    let nyq = 2.0 * dist * pixel * freq
+    clamp(1.5 - nyq, 0.0, 1.0)
+}
+
 /// Lean Visibility-buffer 1× G-buffer writer for similarity-transformed (`Rigid`) meshlets:
 /// computes the exact tangent micro-relief gradient directly from `xf` with zero screen-space
 /// derivative math (halving live registers vs. `shade_gbuf_exact`).
@@ -442,21 +480,36 @@ pub(package) fn shade_gbuf_rigid(
     prev_v: View,
     facts: FieldFacts = FieldFacts::unknown(),
 ) -> Targets4<vec4, vec4, vec4, vec2> {
+    let sub_in = sanitize_substance(sub0, facts)
     let to_eye = v.at - wp
     let dist = length(to_eye)
-    let ray_back = if dist > 1.0e-6 { to_eye / dist } else { -v.forward }
+    let ray_back = UnitNormal::normalize_safe(to_eye, -v.forward).v
     let n0 = resolve_normal_exact(face_n, normal, smooth, ray_back)
+    let sub_nyq = if facts.may_micro {
+        let att = nyquist_micro_atten(dist, v.pixel(), facts.max_freq)
+        Substance { micro: sub_in.micro * att, ..sub_in }
+    } else {
+        sub_in
+    }
     let (n, sub) = apply_micro_relief_rigid(
         xf,
         mp,
         n0,
-        sub0,
+        sub_nyq,
         dist,
         facts.may_micro,
         facts.may_coat,
     )
     let motion = motion_of(wp, prev_wp, v, prev_v)
-    let emits = if facts.may_emit { max(sub.emits, vec3(0.0)) } else { vec3(0.0) }
+    let emits = if facts.may_emit {
+        if facts.channels_proven {
+            LinearLight::proven(max(sub.emits, vec3(0.0))).rgb
+        } else {
+            LinearLight::sanitize(sub.emits).rgb
+        }
+    } else {
+        vec3(0.0)
+    }
     Targets4 {
         first: vec4(n * 0.5 + vec3(0.5), 1.0),
         second: vec4(clamp(sub.albedo, vec3(0.0), vec3(1.0)), clamp(sub.roughness, 0.02, 1.0)),
@@ -484,10 +537,17 @@ pub(package) fn shade_gbuf_exact(
     prev_v: View,
     facts: FieldFacts = FieldFacts::unknown(),
 ) -> Targets4<vec4, vec4, vec4, vec2> {
+    let sub_in = sanitize_substance(sub0, facts)
     let to_eye = v.at - wp
     let dist = length(to_eye)
-    let ray_back = if dist > 1.0e-6 { to_eye / dist } else { -v.forward }
+    let ray_back = UnitNormal::normalize_safe(to_eye, -v.forward).v
     let n0 = resolve_normal_exact(face_n, normal, smooth, ray_back)
+    let sub_nyq = if facts.may_micro {
+        let att = nyquist_micro_atten(dist, v.pixel(), facts.max_freq)
+        Substance { micro: sub_in.micro * att, ..sub_in }
+    } else {
+        sub_in
+    }
     let (n, sub) = apply_micro_relief_deriv(
         dwx,
         dwy,
@@ -495,13 +555,21 @@ pub(package) fn shade_gbuf_exact(
         dmy,
         mp,
         n0,
-        sub0,
+        sub_nyq,
         dist,
         facts.may_micro,
         facts.may_coat,
     )
     let motion = motion_of(wp, prev_wp, v, prev_v)
-    let emits = if facts.may_emit { max(sub.emits, vec3(0.0)) } else { vec3(0.0) }
+    let emits = if facts.may_emit {
+        if facts.channels_proven {
+            LinearLight::proven(max(sub.emits, vec3(0.0))).rgb
+        } else {
+            LinearLight::sanitize(sub.emits).rgb
+        }
+    } else {
+        vec3(0.0)
+    }
     Targets4 {
         first: vec4(n * 0.5 + vec3(0.5), 1.0),
         second: vec4(clamp(sub.albedo, vec3(0.0), vec3(1.0)), clamp(sub.roughness, 0.02, 1.0)),
@@ -523,13 +591,28 @@ fn shade_gbuf_core(
     prev_v: View,
     facts: FieldFacts = FieldFacts::unknown(),
 ) -> Targets4<vec4, vec4, vec4, vec2> {
+    let sub_in = sanitize_substance(sub0, facts)
     let to_eye = v.at - wp
     let dist = length(to_eye)
-    let ray_back = if dist > 1.0e-6 { to_eye / dist } else { -v.forward }
+    let ray_back = UnitNormal::normalize_safe(to_eye, -v.forward).v
     let n0 = resolve_normal_from(wp, normal, smooth, ray_back)
-    let (n, sub) = apply_micro_relief(wp, mp, n0, sub0, dist, facts.may_micro, facts.may_coat)
+    let sub_nyq = if facts.may_micro {
+        let att = nyquist_micro_atten(dist, v.pixel(), facts.max_freq)
+        Substance { micro: sub_in.micro * att, ..sub_in }
+    } else {
+        sub_in
+    }
+    let (n, sub) = apply_micro_relief(wp, mp, n0, sub_nyq, dist, facts.may_micro, facts.may_coat)
     let motion = motion_of(wp, prev_wp, v, prev_v)
-    let emits = if facts.may_emit { max(sub.emits, vec3(0.0)) } else { vec3(0.0) }
+    let emits = if facts.may_emit {
+        if facts.channels_proven {
+            LinearLight::proven(max(sub.emits, vec3(0.0))).rgb
+        } else {
+            LinearLight::sanitize(sub.emits).rgb
+        }
+    } else {
+        vec3(0.0)
+    }
     Targets4 {
         first: vec4(n * 0.5 + vec3(0.5), 1.0),
         second: vec4(clamp(sub.albedo, vec3(0.0), vec3(1.0)), clamp(sub.roughness, 0.02, 1.0)),
@@ -662,11 +745,11 @@ pub(package) fn exact_box_vs(
     let wp = xf.apply_point(lp)
     let axis = face / 2
     let sign = if (face & 1) == 1 { 1.0 } else { -1.0 }
-    let n_local = vec3(if axis == 2 { sign } else { 0.0 }, if axis == 1 { sign } else {
-        0.0
-    }, if axis == 0 {
-        sign
-    } else { 0.0 })
+    let n_local = vec3(
+        if axis == 1 { sign } else { 0.0 },
+        if axis == 2 { sign } else { 0.0 },
+        if axis == 0 { sign } else { 0.0 },
+    )
     let centre = c.lo + vec3(0.5 * c.h)
     let eye_in = xf.apply_point(centre) - v.at
     let reach = 0.5 * c.h * xf.scale_factor() + 2.0 * NEAR
@@ -773,8 +856,7 @@ pub(package) fn exact_box_one_fs<M: Field<Substance>>(
         }
     }
     let (_, gv) = value_and_gradient(|q: vec3| field.distance_live(q, live), hit_p)
-    let gl = length(gv)
-    let n = if gl > 1.0e-6 { gv / gl } else { -d }
+    let n = UnitNormal::normalize_safe(gv, -d).v
     let out = shade_gbuf_core(hit_p, hit_p, hit_p, n, 1.0, sub0, v, prev_v, facts)
     WithDepthBehind { color: out, depth: depth_of(v, hit_p) }
 }

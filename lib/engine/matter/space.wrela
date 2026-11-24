@@ -1,0 +1,141 @@
+// Zero-cost phantom-typed coordinate spaces and physical color/distance wrappers.
+//
+// Each wrapper carries a private zero-sized unit `seal: ()` so distinct spaces (`WorldPoint` vs
+// `LocalPoint`, `UnitNormal` vs raw `vec3`, `LinearLight` vs raw RGB) cannot be mixed silently
+// across shaders or engine modules while erasing to the exact size and register layout of the
+// underlying `vec3` / `f32` across CPU, Metal, and SPIR-V.
+
+use std::field::Rigid
+use std::mem::size_of
+
+/// A 3D point in world space (metres).
+pub struct WorldPoint: Copy {
+    pub v: vec3,
+    seal: (),
+}
+
+/// A 3D point in an object's local (extraction or rest) space.
+pub struct LocalPoint: Copy {
+    pub v: vec3,
+    seal: (),
+}
+
+/// A guaranteed-finite unit-length direction/normal vector (`||v|| == 1`, never NaN or zero).
+pub struct UnitNormal: Copy {
+    pub v: vec3,
+    seal: (),
+}
+
+/// A guaranteed-finite nonnegative linear HDR radiance value (`r, g, b >= 0`, never NaN or Inf).
+pub struct LinearLight: Copy {
+    pub rgb: vec3,
+    seal: (),
+}
+
+/// A signed distance in metres (negative inside solid matter, positive outside).
+pub struct SignedDist: Copy {
+    pub d: f32,
+    seal: (),
+}
+
+impl WorldPoint {
+    pub fn new(v: vec3) -> WorldPoint {
+        WorldPoint { v, seal: () }
+    }
+
+    pub fn from_local(xf: Rigid, lp: LocalPoint) -> WorldPoint {
+        WorldPoint { v: xf.apply_point(lp.v), seal: () }
+    }
+}
+
+impl LocalPoint {
+    pub fn new(v: vec3) -> LocalPoint {
+        LocalPoint { v, seal: () }
+    }
+
+    pub fn from_world(xf: Rigid, wp: WorldPoint) -> LocalPoint {
+        let t = vec3(xf.row0.w, xf.row1.w, xf.row2.w)
+        let d = wp.v - t
+        let s2 = max(dot(xf.row0.xyz, xf.row0.xyz), 1.0e-12)
+        let inv_s2 = 1.0 / s2
+        let lx = xf.row0.x * d.x + xf.row1.x * d.y + xf.row2.x * d.z
+        let ly = xf.row0.y * d.x + xf.row1.y * d.y + xf.row2.y * d.z
+        let lz = xf.row0.z * d.x + xf.row1.z * d.y + xf.row2.z * d.z
+        LocalPoint { v: vec3(lx, ly, lz) * inv_s2, seal: () }
+    }
+}
+
+impl UnitNormal {
+    /// Normalizes `v` safely, falling back to `fallback` when `v` is near-zero or non-finite.
+    pub fn normalize_safe(v: vec3, fallback: vec3) -> UnitNormal {
+        let l2 = dot(v, v)
+        if l2 > 1.0e-12 && l2 < 1.0e30 {
+            UnitNormal { v: v * (1.0 / sqrt(l2)), seal: () }
+        } else {
+            let fl2 = dot(fallback, fallback)
+            let safe = if fl2 > 1.0e-12 && fl2 < 1.0e30 {
+                fallback * (1.0 / sqrt(fl2))
+            } else {
+                vec3(0.0, 1.0, 0.0)
+            }
+            UnitNormal { v: safe, seal: () }
+        }
+    }
+
+    pub fn apply_rigid(self, xf: Rigid) -> UnitNormal {
+        UnitNormal::normalize_safe(xf.apply_normal(self.v), vec3(0.0, 1.0, 0.0))
+    }
+}
+
+/// Branchless NaN- and Inf-safe finite clamp for scalar shader channels.
+pub fn finite_clamp(x: f32, lo: f32, hi: f32, fallback: f32) -> f32 {
+    if x == x && x >= -1.0e30 && x <= 1.0e30 {
+        clamp(x, lo, hi)
+    } else {
+        fallback
+    }
+}
+
+impl LinearLight {
+    /// Sanitizes an arbitrary RGB vector into finite nonnegative linear radiance (`[0, 1e6]`).
+    pub fn sanitize(rgb: vec3) -> LinearLight {
+        LinearLight {
+            rgb: vec3(
+                finite_clamp(rgb.x, lo: 0.0, hi: 1.0e6, fallback: 0.0),
+                finite_clamp(rgb.y, lo: 0.0, hi: 1.0e6, fallback: 0.0),
+                finite_clamp(rgb.z, lo: 0.0, hi: 1.0e6, fallback: 0.0),
+            ),
+            seal: (),
+        }
+    }
+
+    /// Constructs a `LinearLight` directly when the caller holds a build-time finiteness proof.
+    pub fn proven(rgb: vec3) -> LinearLight {
+        LinearLight { rgb, seal: () }
+    }
+}
+
+impl SignedDist {
+    pub fn new(d: f32) -> SignedDist {
+        SignedDist { d, seal: () }
+    }
+}
+
+@test
+fn phantom_space_types_have_zero_overhead() {
+    assert(size_of::<WorldPoint>() == size_of::<vec3>(), "WorldPoint must match vec3 size")
+    assert(size_of::<LocalPoint>() == size_of::<vec3>(), "LocalPoint must match vec3 size")
+    assert(size_of::<UnitNormal>() == size_of::<vec3>(), "UnitNormal must match vec3 size")
+    assert(size_of::<LinearLight>() == size_of::<vec3>(), "LinearLight must match vec3 size")
+    assert(size_of::<SignedDist>() == size_of::<f32>(), "SignedDist must match f32 size")
+
+    let n_zero = UnitNormal::normalize_safe(vec3(0.0), vec3(0.0, 0.0, 1.0))
+    assert(abs(length(n_zero.v) - 1.0) < 1.0e-5, "zero vector must normalize to fallback unit")
+    let n_huge = UnitNormal::normalize_safe(vec3(1.0e20, 0.0, 0.0), vec3(0.0, 1.0, 0.0))
+    assert(abs(length(n_huge.v) - 1.0) < 1.0e-5, "overflowing vector must normalize to fallback unit")
+
+    let lit = LinearLight::sanitize(vec3(-5.0, 1.0e35, 2.5))
+    assert(lit.rgb.x == 0.0 && lit.rgb.y == 0.0 && abs(lit.rgb.z - 2.5) < 1.0e-6, "out-of-range/negative radiance must sanitize cleanly")
+    let ok = LinearLight::sanitize(vec3(0.25, 2.5, 100.0))
+    assert(abs(ok.rgb.x - 0.25) < 1.0e-6 && abs(ok.rgb.y - 2.5) < 1.0e-6 && abs(ok.rgb.z - 100.0) < 1.0e-6, "finite nonnegative radiance preserved")
+}

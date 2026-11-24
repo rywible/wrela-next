@@ -324,6 +324,10 @@ pub struct MeshBatch {
     /// indirect-dispatch budget spent (`ExtractScratch::indirect_left`): it meshes the rest a
     /// frame later, and till then what it draws may have holes.
     pub budget_short: bool,
+    /// True only when this batch holds a complete, un-truncated extraction (`!budget_short`),
+    /// sealing `(Meshlets, ExactCover)` so a later tight-budget frame preserves the prior complete
+    /// mesh instead of publishing a partial holey extraction.
+    pub certified: bool,
     extract_total: u32,
     extract_limit: u32,
     poll_total: u32,
@@ -460,6 +464,7 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
         lod_view_fwd: vec3(0.0, 0.0, -1.0),
         lod_cut: false,
         budget_short: false,
+        certified: false,
         edit_grids: Vec::new(),
         edit_append_cursor: 0,
         xforms: buffer_of([Rigid::identity()]),
@@ -656,6 +661,7 @@ impl MeshBatch {
         self.has_opaque = false
         self.has_trans = false
         self.has_exact = false
+        self.certified = false
         self.inst_count = 0
         self.hash = 0
         self.shape_key = 0
@@ -1747,6 +1753,7 @@ impl MeshBatch {
                 total_bricks: total_bricks,
                 inst_count: vis_count,
             )
+            self.certified = true
             self.extracted_xform = Rigid::identity()
             self.shape_key = shared_skin_sk
             self.is_rigid_cached = false
@@ -2479,13 +2486,42 @@ impl MeshBatch {
         eye_reach: f32 = 0.0,
     ) {
         label("mesh_extract")
+        // Size this batch's output buffers for every candidate brick (active ones are a subset),
+        // plus optional CSG patch headroom when `extra_bricks > 0`.
+        let use_exact = exact_eye.w > 0.0
+        let est_cap = min(min(total_bricks + extra_bricks, self.max_bricks), scratch.max_bricks)
+        let wanted = self.chunk_limit(total_bricks, min(est_cap, total_bricks))
+        // A chunk's exact cells make `dilate_outline`'s and every `filter_thin_cells` slice's
+        // dispatch, and a batch's its `certify_outline` slices'; a batch's seams make each slice's emit (and its exact cells', if exact).
+        let exact_indirect: u32 = if use_exact { 1 + self.thin_slices() } else { 0 }
+        let per_chunk = CHUNK_INDIRECT + exact_indirect + self.crease_slices(CHUNK_BRICKS)
+        let seam_indirect: u32 = if !has_seams {
+            0
+        } else if use_exact {
+            3 * self.seam_slices()
+        } else {
+            2 * self.seam_slices()
+        }
+        let cert_indirect: u32 = if use_exact { self.cert_slices() } else { 0 }
+        let fixed_indirect = seam_indirect + cert_indirect
+        let avail_after_fixed = if scratch.indirect_left > fixed_indirect {
+            scratch.indirect_left - fixed_indirect
+        } else {
+            0
+        }
+        let fit = max(avail_after_fixed / per_chunk, 1)
+        let hard_cap = min(wanted, fit * CHUNK_BRICKS)
+        let would_short = hard_cap < wanted
+        // Sealed double-buffering invariant: never overwrite a previously completed certified mesh
+        // with a budget-truncated partial extraction; keep the intact prior mesh and retry next frame.
+        if would_short && self.built && self.certified {
+            self.budget_short = true
+            return
+        }
         self.exact_eye = exact_eye
         self.eye_reach = eye_reach
         self.exact_lip = lip
-        // Size this batch's output buffers for every candidate brick (active ones are a subset),
-        // plus optional CSG patch headroom when `extra_bricks > 0`.
         self.ensure_cap(min(total_bricks + extra_bricks, self.max_bricks))
-        let use_exact = exact_eye.w > 0.0
         if use_exact {
             self.ensure_exact_cap(max(self.cap_exact, 16384))
         }
@@ -2524,23 +2560,9 @@ impl MeshBatch {
 
         // Passes 1–3: Extract in bounded chunks of `CHUNK_BRICKS` active bricks using `chunk_limit`
         // (generous 1.5× + 1-chunk headroom; `took_counts` re-extracts automatically if exceeded).
-        let wanted = self.chunk_limit(total_bricks, min(effective_cap, total_bricks))
-        // A chunk's exact cells make `dilate_outline`'s and every `filter_thin_cells` slice's
-        // dispatch, and a batch's its `certify_outline` slices'; a batch's seams make each slice's emit (and its exact cells', if exact).
-        let exact_indirect: u32 = if use_exact { 1 + self.thin_slices() } else { 0 }
-        let per_chunk = CHUNK_INDIRECT + exact_indirect + self.crease_slices(CHUNK_BRICKS)
-        let seam_indirect: u32 = if !has_seams {
-            0
-        } else if use_exact {
-            3 * self.seam_slices()
-        } else {
-            2 * self.seam_slices()
-        }
-        let cert_indirect: u32 = if use_exact { self.cert_slices() } else { 0 }
-        scratch.indirect_left -= min(scratch.indirect_left, seam_indirect + cert_indirect)
-        let fit = max(scratch.indirect_left / per_chunk, 1)
-        let hard_cap = min(wanted, fit * CHUNK_BRICKS)
-        self.budget_short = hard_cap < wanted
+        scratch.indirect_left -= min(scratch.indirect_left, fixed_indirect)
+        self.budget_short = would_short
+        self.certified = !would_short
         let chunks = (hard_cap + CHUNK_BRICKS - 1) / CHUNK_BRICKS
         scratch.indirect_left -= min(scratch.indirect_left, chunks * per_chunk)
         self.ensure_brick_draws(hard_cap + extra_bricks)

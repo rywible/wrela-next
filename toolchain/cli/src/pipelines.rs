@@ -103,6 +103,17 @@ pub fn text(pipelines: &[PipelineSummary]) -> String {
             s.push_str(&few_text(p));
         }
     }
+    let wcet = wrela_driver::wcet::analyze(pipelines);
+    s.push_str(&format!(
+        "\nwcet: {} unbounded, {} spill-risk (>= {} B), largest local frame {} B (limit {} B), heaviest 1080p est {:.2} ms M4 / {:.2} ms Radeon\n",
+        wcet.unbounded_count,
+        wcet.spill_risk_count,
+        wrela_driver::wcet::SPILL_WARN_BYTES,
+        wcet.largest_kept_bytes,
+        wrela_driver::wcet::MAX_KEPT_BYTES,
+        wcet.max_single_1080p_ms_m4,
+        wcet.max_single_1080p_ms_radeon,
+    ));
     s
 }
 
@@ -149,7 +160,7 @@ pub fn json(pipelines: &[PipelineSummary]) -> String {
         .iter()
         .map(|p| {
             format!(
-                "{{\"kind\": {}, \"entries\": {}, \"sites\": {}, \"conditional\": [{}], \"tier\": {}{}, \"work\": [{}], \"weight\": {}{}{}}}",
+                "{{\"kind\": {}, \"entries\": {}, \"sites\": {}, \"conditional\": [{}], \"tier\": {}{}, \"work\": [{}], \"weight\": {}, \"kept\": {}{}{}}}",
                 q(p.kind),
                 list(&p.entries),
                 list(&p.sites),
@@ -162,6 +173,7 @@ pub fn json(pipelines: &[PipelineSummary]) -> String {
                     .collect::<Vec<_>>()
                     .join(", "),
                 p.weight,
+                p.kept,
                 match (p.standin, p.stands_in) {
                     (Some(j), _) => format!(", \"standin\": {j}"),
                     (None, true) => ", \"stands_in\": true".to_string(),
@@ -200,7 +212,23 @@ pub fn json(pipelines: &[PipelineSummary]) -> String {
         .into_iter()
         .map(|(n, ps)| format!("{{\"name\": {}, \"instantiations\": {}}}", q(n), ps.len()))
         .collect();
-    format!("{{\"pipelines\": [{}], \"entry_points\": [{}]}}\n", ps.join(", "), es.join(", "))
+    let wcet = wrela_driver::wcet::analyze(pipelines);
+    let wcet_json = format!(
+        "{{\"unbounded\": {}, \"spill_risk\": {}, \"over_kept_limit\": {}, \"largest_kept_bytes\": {}, \"max_kept_bytes\": {}, \"max_1080p_ms_m4\": {:.3}, \"max_1080p_ms_radeon\": {:.3}}}",
+        wcet.unbounded_count,
+        wcet.spill_risk_count,
+        wcet.over_kept_limit_count,
+        wcet.largest_kept_bytes,
+        wrela_driver::wcet::MAX_KEPT_BYTES,
+        wcet.max_single_1080p_ms_m4,
+        wcet.max_single_1080p_ms_radeon,
+    );
+    format!(
+        "{{\"pipelines\": [{}], \"entry_points\": [{}], \"wcet\": {}}}\n",
+        ps.join(", "),
+        es.join(", "),
+        wcet_json
+    )
 }
 
 #[cfg(test)]
@@ -218,6 +246,7 @@ mod tests {
             attachment_bytes: None,
             work: Vec::new(),
             weight: 0,
+            kept: 0,
             unbounded: Vec::new(),
             standin: None,
             stands_in: false,

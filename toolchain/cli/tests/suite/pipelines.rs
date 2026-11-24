@@ -371,3 +371,57 @@ fn a_mask_made_with_bitwise_operators_folds() {
     let v = common::json(common::wrela().arg("pipelines").arg(&dir).arg("--json"));
     assert_eq!(v["pipelines"].as_array().map(Vec::len), Some(1), "{v}");
 }
+
+/// Static WCET report surfaces `kept` local frame bytes and the compile-time 16 KiB spill guard
+/// rejects kernels whose per-thread local arrays exceed `MAX_KEPT_BYTES` at build time.
+#[test]
+fn wcet_report_and_compile_time_spill_guard() {
+    let main = format!(
+        "pub fn frame(time: f32, width: u32, height: u32) {{\n    let screen = std::gpu::begin_screen_pass(clear: vec4())\n    {DRAW}\n    screen.present()\n}}\n{SHADERS}"
+    );
+    let dir = common::package(
+        "pipelines-wcet-ok",
+        &[("wrela.toml", &common::manifest("p")), ("main.wrela", &main)],
+    );
+    let v = common::json(common::wrela().arg("pipelines").arg(&dir).arg("--json"));
+    assert_eq!(v["wcet"]["unbounded"], serde_json::json!(0), "{v}");
+    assert_eq!(v["wcet"]["over_kept_limit"], serde_json::json!(0), "{v}");
+    assert_eq!(v["wcet"]["max_kept_bytes"], serde_json::json!(16384), "{v}");
+
+    let spill_main = r#"
+@compute(64)
+fn spill(out: mut std::gpu::Slots<f32>, id: std::gpu::GlobalId) {
+    var big = [0.0; 4608]
+    big[id.x & 4095] = f32(id.x)
+    out[id] = big[id.x & 4095]
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var buf: std::gpu::GpuBuffer<f32> = std::gpu::buffer(64)
+    std::gpu::dispatch(spill.bind(out: mut buf), over: 64)
+    let screen = std::gpu::begin_screen_pass(clear: vec4())
+    screen.present()
+}
+"#;
+    let spill_dir = common::package(
+        "pipelines-spill-guard",
+        &[("wrela.toml", &common::manifest("p")), ("main.wrela", spill_main)],
+    );
+    let out_dir = spill_dir.join("out");
+    let out = common::wrela()
+        .arg("build")
+        .arg(&spill_dir)
+        .arg("-o")
+        .arg(&out_dir)
+        .output()
+        .expect("run wrela build");
+    assert!(
+        !out.status.success(),
+        "expected compile-time spill guard to reject >16 KiB local frame"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("E0707") && stderr.contains("spill guard"),
+        "expected E0707 spill guard diagnostic, got:\n{stderr}"
+    );
+}

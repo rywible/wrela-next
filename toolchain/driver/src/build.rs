@@ -25,6 +25,10 @@ pub const MAX_SHADER_BYTES: usize = 288 * 1024;
 /// weighed 270,830 and took three quarters of its cold compile, Nov 2026).
 pub const MAX_WEIGHT: u64 = 300_000;
 
+/// Maximum per-invocation local frame / scratch memory (`kept` bytes) permitted in a shipped build
+/// (compile-time register-spill guard matching the GPU host safety limit).
+pub const MAX_KEPT_BYTES: u32 = crate::wcet::MAX_KEPT_BYTES;
+
 /// How a build writes its pipelines' shaders: for which machine, and with which run-time checks.
 #[derive(Clone, Copy, Debug)]
 pub struct Shaders {
@@ -305,6 +309,20 @@ fn emit_in(
                 ),
                 "Metal compiles each pipeline's shader while the scene loads",
                 "move work that its own pass can do there, or keep a big function a call (`ir::opt`)",
+            ));
+        }
+        if budgets
+            && pipeline.kept > MAX_KEPT_BYTES
+            && let Some(&at) = p.sites.first()
+        {
+            diagnostics.push(over_budget(
+                at,
+                format!(
+                    "`{}` keeps {} B of local state per invocation, over the {} B compile-time spill guard",
+                    p.name, pipeline.kept, MAX_KEPT_BYTES
+                ),
+                "a kernel's local arrays and stack live in per-thread scratch memory; exceeding 16 KiB causes catastrophic register spills and GPU stalls",
+                "shrink local arrays, move persistent state to a storage buffer, or split the pass; `wrela pipelines` reports each pipeline's kept bytes",
             ));
         }
         if budgets

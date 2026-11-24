@@ -1244,6 +1244,25 @@ Every interval contract across all 13 world fields + 6 kit shapes is now 100% pr
 
 - **Verification:** `tools/check` passes (all 6 packages / 115 files `tools/layers`, `cargo fmt --check`, 28/28 `lib/engine`, 4/4 `lib/kit`, 18/18 `game/world`, full Rust workspace suite, GPU guard tests); `spirv-val` (`tools/shaders`) passes 126/126 on `SCENE 10` and `SCENE 11`; `WRELA_VULKAN_VALIDATION=1` reports **0 VVL errors**; `SCENE=6` 640×360 24-eye hole audit **PASSED** on **13/13 kinds** on both Apple M4 Metal and Linux Radeon Vulkan (`0` cracks, `0` overflows, `0` unsettled, outlines within budget).
 
+### Zero-sample proof tiers, erased NaN sanitization, phantom spaces, `BakedField`, and static WCET/spill gates (2026-11-24)
+
+Built the five-pillar compile-time safety and performance envelope without constraining field expressiveness:
+
+1. **Zero-sample proof tiers & selective erased NaN sanitization (`lib/std/field.wrela`, `lib/engine/matter/verify.wrela`, `lib/engine/mesh/shade.wrela`):**
+   - Extended `FieldFacts` with `channels_proven: bool` and `max_freq: f32`. `prove_field_facts` runs adaptive zero-sample bisection (`prove_lip_zero_sample`, `prove_channels_zero_sample`) that **never** falls back to point sampling: unproven Lipschitz returns `+inf` (routing to sound 1D `affine_form` Krawczyk), and unproven channels keep `channels_proven = false`.
+   - `sanitize_substance` in `shade.wrela` erases completely (**0 instructions** in emitted MSL on `Citadel` and `CreatureBody`) when `channels_proven == true`, and automatically retains branchless IEEE-754 NaN/Inf/range clamps on unproven procedural fields (verified: `finite_clamp=0` on `Citadel`, `finite_clamp=14` retained on `MarbleColumn`).
+   - Added `derive_bound_zero_sample` (6-face affine binary-search slab peeling) and Nyquist pixel-footprint auto-bandlimiting (`nyquist_micro_atten`).
+2. **Zero-cost phantom coordinate & color spaces (`lib/engine/matter/space.wrela`):**
+   - Added `WorldPoint`, `LocalPoint`, `UnitNormal`, `LinearLight`, and `SignedDist` (private `seal: ()`, verified 0-byte overhead by `@test phantom_space_types_have_zero_overhead`), wired into `shade.wrela`.
+3. **Exact slab seam closure, `exact_box_vs` face-normal fix, and sealed double-buffering (`lib/engine/mesh/{proof,shade,extract}.wrela`):**
+   - Inflated `ray_box_bracket` by exact IEEE-754 ULP margin (`@test ray_box_bracket_has_zero_seam_between_touching_cells`); fixed a pre-existing X/Y face-normal swap (`axis == 1` vs `axis == 2`) in `exact_box_vs` that dropped grazing X/Y exact-cell faces; sealed `MeshBatch::certified` so a budget-truncated extraction never overwrites a previously completed certified mesh.
+   - **Measured and rejected (kill line):** per-instance whole-bounding-sphere exact cover for `Pool<Skinned>` crowds eliminated 100% of `a crowd`'s 320×180 outline holes (`50 → 0`), but 240 overlapping 2.4 m spheres in `SCENE 11` inflated `mesh_exact` 23× (`0.10 → 2.36 ms` at 320×180). Reverted per kill-line policy; closing `Pool<Skinned>` silhouettes needs per-brick/silhouette-only exact cells, not full bounding spheres.
+4. **Universal `O(1)` `BakedField<M>` adapter (`lib/engine/mesh/baked.wrela`):**
+   - Bounded compute baker (`bake_sdf_volume`, capped at `<= 64³`) wrapping any arbitrarily expensive `Field<Substance>` into hardware-trilinear `Sampled3d` with unit Lipschitz (`1.02`) and preserved `FieldFacts`.
+5. **Static WCET & compile-time 16 KiB spill guard (`toolchain/driver/src/{wcet,build,lib}.rs`, `toolchain/cli/src/{pipelines,shaders}.rs`):**
+   - `wrela build` now rejects kernels exceeding `MAX_KEPT_BYTES = 16384` at compile time (`E0707`, verified by `wcet_report_and_compile_time_spill_guard`); `wrela pipelines` reports unbounded loops, spill-risk count, largest `kept` bytes (`2304 B` on `SCENE 11`), and calibrated M4/Radeon 1080p render estimates; `wrela shaders` reports largest compiled shader size (`179 KiB` MSL / `166 KiB` SPIR-V).
+   - **Dual-machine 1080p verification (vs `0430f1b`, 0 VVL errors, `spirv-val` 126/126, `xcrun metal` 305/305, identical 320×180 hash `a3ea1cf626d6513d`):** M4 `SCENE 10` cold `f0` `221.10 ms` (`-5.1%`), serial `f10` `16.17 ms`, `exact_box` `0.83 ms` (`-51.5%`); Radeon `SCENE 10` span med `47.43 ms` (`-5.8%`), serial `f10` `39.65 ms` (`-5.5%`), `exact_box` `1.98 ms` (`-50.5%`); Radeon `SCENE 11` `mesh_vis_resolve` `9.94 ms` (`-4.6%`).
+
 ## The layers
 
 Dependencies point down. Nothing below knows anything above.

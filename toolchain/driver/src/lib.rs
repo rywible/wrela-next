@@ -28,6 +28,7 @@ pub mod script;
 pub mod shipped;
 pub mod suite;
 pub mod tool_tests;
+pub mod wcet;
 pub mod workspace;
 
 /// std's modules: each one's path and source.
@@ -91,6 +92,8 @@ pub struct PipelineSummary {
     pub unbounded: Vec<String>,
     /// Its weight (§18.11): its statements with every call written out. 0 when not counted.
     pub weight: u64,
+    /// Per-invocation local frame bytes (`kept_bytes`, stack/array spill pressure).
+    pub kept: u32,
     /// The pipeline a host runs in its place until it's built (its entry point's `@standin`,
     /// §18.12), by its index among the pipelines.
     pub standin: Option<usize>,
@@ -1332,6 +1335,7 @@ fn summarize(
                 }),
                 work: out.work.clone(),
                 weight: out.weight,
+                kept: out.module.kept_bytes(),
                 standin: out.standin.map(|j| j as usize),
                 stands_in: out.stands_in,
                 unbounded: out
