@@ -28,7 +28,7 @@
 use matter::sky::Sun
 use matter::substance::Substance
 use mesh::dc::HOLE_PX
-use mesh::grid::{octa, unocta}
+use mesh::grid::{frustum_cull_view, octa, unocta}
 use mesh::light::{NEAR, SHADOW_SIDE, ShadowView}
 use mesh::proof::{
     SunVisibility, prove_sun_backfacing, prove_sun_dark, prove_sun_lit, sun_exact,
@@ -41,8 +41,9 @@ use std::collections::Vec
 use std::gpu::{
     Append, AppendBuffer, Atomics, DepthTexture, DispatchArgs, FragCoord, GlobalId, GpuBuffer,
     MipStep, Rg32Float, Rgba8, Rgba32Float, Slots, Texels, Texture, append_buffer, buffer_of,
-    dispatch, label, mip_levels, writable_texture, write,
+    dispatch, label, mip_levels, read_settled, writable_texture, write,
 }
+use std::io::Pending
 
 /// Side of the certificate pyramid's level 0 (texels): half the map's.
 pub const CERT_SIDE: u32 = SHADOW_SIDE / 2
@@ -551,13 +552,38 @@ pub struct SunExact {
     pub list: AppendBuffer<u32>,
     args: GpuBuffer<DispatchArgs>,
     pub near: GpuBuffer<u32>,
+    /// How many of the list's pixels this frame traces: twice what the last frame read back
+    /// listed (`known`) and a slice more, and no more than there are pixels. A frame that lists
+    /// more (a cut) leaves the rest their map's estimate, till the count is read back.
+    allowed: u32,
+    /// The slices `allowed` fills.
+    slices: u32,
+    /// The last count of listed pixels read back (the whole list's cap before any is).
+    known: u32,
+    poll: Option<Pending<u32>>,
+    /// The dispatches the frame's exact rays may still make (`EXACT_DISPATCHES` a frame).
+    left: u32,
+    /// The fields whose rays the last frame left untraced for want of dispatches: their near band
+    /// was taken as open (what the map says of the far casters stands).
+    pub untraced: u32,
 }
+
+/// The most dispatches a frame's exact rays make over all its fields. The host lets a frame make
+/// 16,384 that are checked on the GPU; the extraction may take 12,288 of them
+/// (`EXTRACT_INDIRECT`), and a judge's march some of the rest.
+pub const EXACT_DISPATCHES: u32 = 512
 
 pub fn sun_exact_list() -> SunExact {
     SunExact {
         list: append_buffer(EXACT_MOST),
         args: buffer_of(Vec::filled(EXACT_SLICES, DispatchArgs { x: 0, y: 1, z: 1 })),
         near: buffer_of(Vec::filled(1, 65535)),
+        allowed: EXACT_MOST,
+        slices: EXACT_SLICES,
+        known: EXACT_MOST,
+        poll: None,
+        left: EXACT_DISPATCHES,
+        untraced: 0,
     }
 }
 
@@ -583,12 +609,13 @@ fn sun_gather(
 
 /// The dispatch arguments of each slice of the list (`EXACT_CHUNK` pixels a slice).
 @compute(8)
-fn sun_slices(count: [u32], args: mut Slots<DispatchArgs>, id: GlobalId) {
+fn sun_slices(count: [u32], allowed: u32, args: mut Slots<DispatchArgs>, id: GlobalId) {
     if id.x >= EXACT_SLICES {
         return
     }
     let first = id.x * EXACT_CHUNK
-    let n = if count[0] > first { min(min(count[0], EXACT_MOST) - first, EXACT_CHUNK) } else { 0 }
+    let most = min(count[0], allowed)
+    let n = if most > first { min(most - first, EXACT_CHUNK) } else { 0 }
     args[id] = DispatchArgs { x: (n + 63) / 64, y: 1, z: 1 }
 }
 
@@ -599,12 +626,41 @@ impl SunExact {
         if self.near.len() != n {
             self.near = buffer_of(Vec::filled(n, 65535))
         }
+        let read = match mut self.poll {
+            Some(p) => p.poll(),
+            None => None,
+        }
+        match read {
+            Some(Ok(c)) => {
+                if c.len() >= 1 {
+                    self.known = c[0]
+                }
+                self.poll = None
+            },
+            Some(Err(_)) => {
+                self.poll = None
+            },
+            None => {},
+        }
+        self.allowed = min(min(EXACT_MOST, n), 2 * self.known + EXACT_CHUNK)
+        self.slices = (self.allowed + EXACT_CHUNK - 1) / EXACT_CHUNK
+        self.left = EXACT_DISPATCHES
+        self.untraced = 0
         self.list.clear()
         dispatch(
             sun_gather.bind(cls: cls, full_w: full_w, count: n, list: mut self.list, near: mut self.near),
             over: n,
         )
-        dispatch(sun_slices.bind(count: self.list.count(), args: mut self.args), over: EXACT_SLICES)
+        dispatch(
+            sun_slices.bind(count: self.list.count(), allowed: self.allowed, args: mut self.args),
+            over: EXACT_SLICES,
+        )
+        match self.poll {
+            None => {
+                self.poll = Some(read_settled(self.list.count()))
+            },
+            Some(_) => {},
+        }
     }
 
     /// One field's exact rays from every listed pixel, the least into `near`.
@@ -618,13 +674,30 @@ impl SunExact {
         sun: Sun,
         full_w: u32,
     ) {
-        for k in 0..EXACT_SLICES {
+        // A field can hide the sun from a pixel in view only from the view or sunward of it: its
+        // bound `b` is held to each of the view's planes the sun's way doesn't lead in through.
+        let fc = frustum_cull_view(v, margin: 1.0)
+        let c = b.xyz - fc.origin.xyz
+        let planes = [fc.p0, fc.p1, fc.p2, fc.p3, fc.p4]
+        for i in 0..5 {
+            let n = planes[i].xyz
+            if dot(n, sun.way) >= 0.0 && dot(n, c) + planes[i].w < -b.w * length(n) {
+                return
+            }
+        }
+        if self.left < self.slices {
+            self.untraced += 1
+            return
+        }
+        self.left -= self.slices
+        for k in 0..self.slices {
             dispatch(
                 sun_exact_one.bind(
                     field: field,
                     b: b,
                     list: self.list.items(),
                     count: self.list.count(),
+                    allowed: self.allowed,
                     first: k * EXACT_CHUNK,
                     cls: cls,
                     depth: depth,
@@ -649,6 +722,7 @@ fn sun_exact_one<M: Field<Substance>>(
     b: vec4,
     list: [u32],
     count: [u32],
+    allowed: u32,
     first: u32,
     cls: Texture<Rgba32Float>,
     depth: DepthTexture,
@@ -659,7 +733,7 @@ fn sun_exact_one<M: Field<Substance>>(
     id: GlobalId,
 ) {
     let i = first + id.x
-    if id.x >= EXACT_CHUNK || i >= min(count[0], EXACT_MOST) {
+    if id.x >= EXACT_CHUNK || i >= min(count[0], allowed) {
         return
     }
     let pix = list[i]

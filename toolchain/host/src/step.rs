@@ -325,8 +325,8 @@ pub(crate) struct Checked {
     pub(crate) at: u64,
 }
 
-/// The most indirect dispatches a frame may make.
-const MOST_INDIRECT: u32 = 4096;
+/// The most indirect dispatches a frame may make (each has 256 bytes of check numbers: 4 MiB).
+const MOST_INDIRECT: u32 = 16384;
 
 /// The bytes between two dispatches' check numbers (a uniform's dynamic offset's alignment).
 const CHECK_STRIDE: u64 = 256;

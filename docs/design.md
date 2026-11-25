@@ -1276,9 +1276,8 @@ it replaced: the world-fitted `2048²` map read with normal-offset PCF and a con
 mixed with the SDF clipmap's cone penumbra (`sun_shadow_hybrid`), and a screen-space contact
 shadow on half the pixels (`contact_shadow`, `sun_share`), all in git history.
 
-The hole audit (SCENE 6, `tools/audit`) fails on `d3e5e0b` and on this alike, kind for kind
-(the stage's 293 holes, the creature's 101 and 104, eyes held unsettled), and stops at frame
-5777 on the eye's `mesh_exact` over 50 ms on both: the streaming meshes' to mend, not this.
+(The hole audit failed on `d3e5e0b`, this section's starting commit, and that was wrongly set
+aside here as not this work's: the next section is its bisection and repair.)
 
 1. **The eye's own map** (`SunFit`): after the G-buffer, a reduction of the eye's depth (on the
    GPU) fits a second map across to the receivers the eye sees (sample-distribution shadow maps),
@@ -1393,25 +1392,85 @@ VIEW 0/1/2 2,192/6,511/2,212 to 166/1,414/111 (VIEW 1 11.8% to 2.6% of its pixel
 against 24.2). (The mended plane, not filtered geometry, met the line proposed for filtered geometry:
 under 5% of VIEW 1 exact, its error no worse.)
 
-Where the plan for unconstructable errors stands after this (2026-11-24), and what comes next,
-in order:
-- Phase 4 (certified sun) is built and measured above; its cost line is missed, its leak line is
-  missed only where relief a pixel wide self-shadows (the judge's picture says where).
-- Next: the exact rays' fixed costs (the list's gather, slices that run empty), and a field cheap
-  to step for the exact rays (a baked proxy, phase 2's, never built) — the table's rays are most
-  of what is left.
-- Then the plan's phases 5 (sheet-sealed radiance), 6 (temporal reuse of the indirect light
-  alone), 7 (exact silhouette cells for skinned crowds) and the rest of 8 (regional Lipschitz
-  bounds, the stress-point gate); the sweep is built (`kit::shapes::sweep`).
-- After phase 4, the predictive frame governor: each pass's cost predicted from counts the
-  engine reads back, one footprint scale a share as the knob, never the clock (the mended plane
-  above is the first evidence that the footprint, not a pass's cleverness, decides the exact
-  rays' cost).
-
 Gaps: a `Pool`'s far things, meshed together, have no exact rays (their near band is taken as
 open); glass, the froxels and the radiance volume read the world's map alone; the exact rays may
-step over a feature thinner than `max(e, reach / 32)`. SCENE 13 VIEW 1 and VIEW 2 at 1080p stop
-on their cold first frame in `mesh_exact` (270 to 290 ms, before and after this change).
+step over a feature thinner than `max(e, reach / 32)`.
+
+### The streaming octree taken out, and what the hole audit had been hiding (2026-11-25)
+
+**The audit was red and nobody had run it.** Bisected with the small audit (`tools/audit --size
+160x90 --eyes 12`, every kind): `ffe1cbc` passes; `d6a9616` (the persistent brick octree and
+streaming level of detail that replaced whole-ring extraction, 4,600 lines) fails with 84 holes
+and 813 extras settled, 75 of the holes and 597 of the extras more than 4 px from the outline,
+and up to 12 of 12 eyes never settled; `d3e5e0b` on top of it, 33 and 667. Neither commit's
+message carries an audit. A rule the mesher keeps by convention (what it can't show covered gets
+an exact cell) has no type holding it, so a rewrite dropped it unseen.
+
+**What was unsound in the octree**, each found by taking it out and running the audit:
+- *A brick was called flat on eight samples* of the field (`probe_brick`) and then left with
+  cells up to 160 px wide; what lay between the samples was drawn wrong or not at all.
+- *A brick out of view was left as coarse as its root* by a test of its own box against the view,
+  while its mesh reaches a cell past its box and stands up to `2√3` cells off the field: coarse
+  triangles came in at the picture's edge.
+- *Refinement and the refresh of a brick's exact cells for a moved eye were held to a budget*
+  (160 to 384 bricks a frame), so a cut was drawn from the bricks of the eye before, for as
+  many frames as the budget took; and the commit after it turned the thin-cell test and the
+  certificate of coarse cells off except on bricks flagged as waiting.
+- *The octree depended on where the eye had been* (merges with hysteresis, kept views): the
+  states a walk reached were not the states the audit's cuts tested.
+On the branch `octree-sound-wip` all four are mended (the tree a function of the field and the
+eye alone, held so by a test; a brick out of view only where its box grown by its mesh's reach
+is; no flatness by sample; no budget; index writes only on a proof that a triangle is local):
+its small audit has no holes past the baseline's 2 and no eye unsettled, and still 292 pixels of
+ghost matter on four kinds, which go when the persistent pool is emptied on every change (so
+its appending is unsound in a way not found), and it extracts every brick in view again whenever
+the eye moves past a brick's reach, which the budget had been hiding. So it is taken out
+(`d6a9616` and `d3e5e0b` reverted), not mended: whole-ring extraction is back, with its cost
+when the eye crosses a step. A streaming mesher comes back when it passes the audit, small and
+full, and a moving eye's frame is measured, not a still one's.
+
+**The full audit (640x360, 24 eyes) was red before the octree too**, for two reasons that were
+one: a frame may make only so many dispatches whose size the GPU decides (the host checks each),
+and the extraction, counting its own against that, *kept the mesh it had and said nothing* when
+a batch's chunks would not fit (`run_extract`: `would_short && built && certified`). The carved
+table after its first eye wanted 65,536 bricks' chunks (its candidates changing by more than a
+quarter between eyes) against 38 chunks' allowance, so every later eye was drawn from the first
+eye's mesh: 141,975 holes at `ffe1cbc` and after, the batch calling itself settled; the glass
+barrage's sixteen near shards the same (51,451 holes, 75,945 extras). The 1080p frame times of
+SCENES 13 and 14 quoted since the forge's merge may have been of such meshes. Mended: the host
+lets a frame make 16,384 such dispatches (it was 4,096; 256 bytes of check numbers each), the
+extraction may take 12,288 (`EXTRACT_INDIRECT`), and a batch whose extraction was cut short is
+not settled (`MeshBatch::settled`), so the audit holds its eye unsettled, which fails it. The
+sun's exact rays, which had made 16 dispatches a field whatever the list's length and so
+overran the same count on the barrage, trace only as many slices as twice the last count read
+back fills, only fields whose bound can hide the sun from the view (the view swept sunward,
+plane by plane), and at most 512 dispatches a frame (`SunExact::untraced` counts the fields left
+out: their near band is taken as open, an estimate).
+
+Measured on the M4 after both:
+- Small audit: passes, every kind (holes 2 at the crowd's outline, extras 0, no eye unsettled,
+  5 frames to settle).
+- Full audit: every kind passes but one: *a crowd* has 1 pixel 3 px inside its outline on both
+  the cut's frame and settled (the skinned pool's crack, the plan's phase 7). Holes at an
+  outline, within budget: pillars 55, braziers 23, crowd 58, the table 21 (and 23 extras), the
+  grimoire 4, the stack 4, the gate 5, the creature 2. The glass barrage and the table: 0 cracks.
+- 1080p, `--serial`, frame 11, the sum of the frame's timed passes, octree to rings: SCENE 13
+  VIEW 0 22.3 to 17.6 ms (`mesh_exact` 12.0 to 8.0), SCENE 14 22.8 to 20.4 ms, SCENE 10 29.0 to
+  18.9 ms, SCENE 11 18.8 to 17.1 ms. SCENE 13 VIEW 1 and VIEW 2, which stopped on their first
+  frame in `mesh_exact` (270 to 290 ms), run: 42.4 and 28.0 ms, their first frame's longest
+  pass 48.2 and 47.0 ms (under the line of 50, barely; SCENE 14's 44.8).
+- The sun's judge, 320x180, SCENE 13 VIEW 0/1/2, octree to rings: hard leaks 708/907/364 to
+  754/1,344/316, hard acne 21/137/24 to 17/85/5, mean error 3.35/5.45/1.80 to 3.53/7.01/1.49
+  of 255 (VIEW 1's rings hold less of the carving than the octree's finer floor did).
+
+Where this leaves the plan: phases 1 to 4 were each called landed with their kill lines unmet
+or unmeasured (phase 2's `mesh_exact` at most 1.5 ms: 8.0; phase 3's streaming: taken out;
+phase 4's no leak and +0.3 ms: 316 to 1,344 hard leaks and about +2 ms). From here a phase is
+landed when its line is met or the line is rewritten here with the measurement that forced it.
+In order: one gate that runs the audit, the judges and the frame times against a baseline in the
+repository; the coverage rule behind a proof token; a cheap certified proxy of a heavy field
+(phase 2's, never built) for `mesh_exact` and the sun's rays; the sun's routes counted and its
+proven pixels held to no leak; then the crowd's crack, the indirect light, the temporal pass.
 
 ## What the forge's assets asked of the engine (2026-11-22)
 
