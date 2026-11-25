@@ -1,7 +1,7 @@
 # Plan: one body declaration and one movement solver
 
 Status: approved by the owner on 2026-11-25, with a limit of 300 compute units. Phase 0 is in
-work.
+work. Section 5 has a table that shows what is done.
 
 This plan contains no new measurement. Each fact about the repository comes from the code at
 `342c2e6`. Each fact about an outside source comes from the page in section 15. Where a fact is
@@ -99,19 +99,23 @@ Do not merge that branch. Do not copy its files.
 
 ### Rules for Colab
 
-An agent starts each run from this machine with the `colab` command. No person starts a run.
+An agent starts each run with the `colab` command. No person starts a run. Section 5 (0.4 and
+0.5) gives the GPU type, the faults of Colab and the run tool.
 
-1. Do the first run of new work at a small size. Read the times before a larger run.
-2. Write a checkpoint not less than one time each 10 minutes. A run must continue from its last
+1. Use the L4 GPU with MuJoCo Warp. Start each run with the run tool of 0.5, not with
+   `colab run`.
+
+2. Do the first run of new work at a small size. Read the times before a larger run.
+3. Write a checkpoint not less than one time each 10 minutes. A run must continue from its last
    checkpoint after the session stops.
-3. Set the seed of each run and write it in the provenance record.
-4. Put no secret in a script.
-5. Keep each script in git. Keep the output out of git, but not the weights.
-6. Read `colab usage` before and after each run. Put the compute units that the run used in the
+4. Set the seed of each run and write it in the provenance record.
+5. Put no secret in a script.
+6. Keep each script in git. Keep the output out of git, but not the weights.
+7. Read `colab usage` before and after each run. Put the compute units that the run used in the
    commit message.
-7. Do not use more compute units than the limit that the owner gave. Stop each session when its
-   run is done.
-8. Before a run, estimate its compute units from the measured rate. If the estimate is more than
+8. Do not use more compute units than the limit that the owner gave: 300 for this plan. Write
+   each run in the table of units in 0.5. Stop each session when its run is done.
+9. Before a run, estimate its compute units from the measured rate. If the estimate is more than
    the units that remain in the limit, do not start the run. Tell the owner.
 
 ## 4. Order of the phases
@@ -203,33 +207,139 @@ Result: the number of bodies at the full rate for a CPU budget of 1 ms for each 
 
 ### 0.4 The speed of the simulator on Colab
 
-Question: is Colab sufficient for phase 4?
+Question: is Colab sufficient for phase 4, and which accelerator is best?
 
-1. Use the humanoid model that comes with the simulator. Do not use our body.
-2. Measure the steps in one second for 256 bodies. Then measure for 1024 and for 4096.
-3. Do this for each type of GPU that Colab gives.
-4. Read `colab usage` in each run. It gives the compute units that each GPU type uses in one
-   hour.
-5. Measure how long a session stays alive.
-6. Stop a run. Start it again from its checkpoint. Make sure that it continues.
+Done on 2026-11-25, but the two lines of "Not measured" below.
 
-The account had 413 compute units on 2026-11-25. This phase shows how many hours of each GPU
-type that is.
+Each run stepped the humanoid that comes with the benchmarks of MuJoCo Warp (27 degrees of
+freedom, a step of 0.005 s, the Newton solver with 100 iterations) for 1000 steps, with no net.
+The GPUs ran MuJoCo Warp 4.0.1. The TPU ran MJX with JAX 0.11.2, because MuJoCo Warp runs on
+NVIDIA GPUs only. The scripts are `tools/movement/sim_speed.py` and
+`tools/movement/sim_speed_jax.py`.
 
-The simulator is MuJoCo. It has two versions that use a GPU. MJX uses JAX and runs on GPUs and
-TPUs. MuJoCo Warp runs on NVIDIA GPUs only, and its documentation says that it is faster for
-large scenes. Use the version that this measurement shows to be faster. Read its licence at the
-source and add its row to `docs/citations.md`.
+Steps in one second, for each number of bodies:
+
+| Accelerator | Units in one hour | 256 | 1,024 | 4,096 | 16,384 | Steps for one unit |
+| --- | --- | --- | --- | --- | --- | --- |
+| L4 | 2.33 | 560,146 | 1,650,991 | 2,514,086 | 2,111,676 | 3.9 billion |
+| T4 | 1.24 | 297,491 | 762,114 | 1,077,946 | 1,121,625 | 3.3 billion |
+| A100 | 8.16 | 367,642 | 1,234,368 | 2,829,722 | 4,211,051 | 1.9 billion |
+| TPU v5e | 3.26 | Not measured | 306,412 | 254,734 | 204,152 | 0.34 billion |
+
+**Decision of the owner on 2026-11-25: use the L4, with MuJoCo Warp.**
+
+- The L4 gives the most steps for one unit. It is 2.2 times as fast as the T4.
+- Use approximately 4,096 bodies. The L4 was slower with 16,384.
+- The T4 is the second selection, if Colab has no L4.
+- The A100 is 1.7 times as fast as the L4 and uses 3.5 times the units. Use it only if a run
+  must end in one session.
+- Do not use a TPU. With the same model, the v5e was 8 times slower than the L4 and used more
+  units. It did not have sufficient memory for 65,536 bodies.
+
+The licence of MuJoCo Warp 4.0.1 and of Warp 1.19.0 is Apache 2.0 (read in the data of each
+package). Add their rows to `docs/citations.md` in the change that first uses them.
+
+What the limit gives: 300 units are approximately 129 hours of an L4, or 1.2 million million
+steps with no net.
+
+Estimate for the later phases. It is not a measurement. The numbers of samples come from memory
+of published work, and a net in the loop makes each step slower.
+
+| Phase | Assumption | Hours of an L4 | Units |
+| --- | --- | --- | --- |
+| 4 | 5 to 20 thousand million control steps, at 250,000 in one second | 6 to 22 | 13 to 52 |
+| 5 | Learning from the filtered capture, with no simulator in the loop | 4 to 9 | 10 to 20 |
+| 6 | Two bodies and ground that is not flat, each as phase 4 | 21 to 43 | 50 to 100 |
+
+The first small run of phase 4 measures the control steps in one second with the net. Calculate
+this table again from that measurement before a large run.
+
+Not measured:
+
+- How long a session stays alive.
+- A run that stops and continues from its checkpoint. The run tool of 0.5 must show this.
+
+Not measured, and not necessary: the TPU v6e (the run did not start before it was stopped), and
+JAX on the L4. The v5e ran a different, light model at 1.7 million steps in one second, but that
+model sets the solver to 1 iteration, so the number does not compare with the table.
+
+### 0.5 The faults of Colab, and the run tool
+
+The measurements of 0.4 were short, and they found these faults. A long training run will find
+them again. The log of the `colab` command is `~/.config/colab-cli/colab.log`.
+
+| Fault | What occurred on 2026-11-25 | What the run tool must do |
+| --- | --- | --- |
+| The connection is lost | An A100 session became ready. Then `colab run` gave "Connection was lost" and stopped the session. The second try was good | Try again, with a longer wait each time. Count the tries |
+| A session does not start | `colab run --tpu V6E1` showed "Creating session" and then gave no more output for minutes | Stop a start that takes more than a set time. Try again |
+| Colab refuses a session | With three sessions in work, the fourth got "Allocation refused (precondition failed)": HTTP 412. The cause is not known: the number of sessions, or the capacity | Use one session at a time. Wait and try again |
+| A session stays alive with no owner | The local command was stopped. One TPU session stayed alive and used 3.26 units in one hour until `colab stop` | Read `colab sessions` when the tool starts and when it ends. Stop each session that is not in use. Stop the session if the tool gets a signal |
+| The run depends on this machine | `colab run` holds the connection. If the laptop sleeps or the network drops, the run is lost | Start the work in the session so that it continues with no connection. Connect again to read its state |
+| No output looks like a failure | `colab run` stops a run after 30 s with no output. The first step of MuJoCo Warp compiles for 60 s, and an install can be silent | Print a line not less than one time each 20 s. Set `--timeout` for the longest silent step |
+| Each new session starts cold | Each new VM installs the packages (15 s) and compiles the kernels (60 s) | Count this time in the estimate. Do not use many short sessions |
+| The balance is late | `colab usage` showed the same balance after a run. It shows the rate only while a session is alive | Read the rate while the session is alive. Calculate the units of a run from the rate and the time |
+| A run gives no result and no error | `sim_speed.py mjx` on an L4 printed the model and then no speed. The cause was not examined | Examine the full output of a run. A run with no result line is a failure |
+
+The length of a session is not known. Thus a run must not depend on it.
+
+#### Steps
+
+1. **Write the run tool** `tools/movement/colab-run`. It is the only method that starts a
+   training run. It does what the table says.
+2. **Keep the checkpoints out of the VM.** Mount Google Drive in the session, or download each
+   checkpoint to this machine. A checkpoint in the VM only is lost when the session ends.
+3. **Make the run continue.** The tool starts a new session and gives it the last checkpoint.
+   The training script starts from that checkpoint.
+4. **Keep the table of units below.** The tool adds a row for each run.
+5. **Examine the tool with a small run** on an L4: 10 minutes of steps with a checkpoint each
+   minute.
+
+#### Done when
+
+- The local tool is stopped in the middle of the small run. The run continues in the session,
+  and the tool connects to it again.
+- The session is stopped in the middle of the small run. The tool starts a new session, and the
+  run continues from its last checkpoint to the same end result.
+- After each of these tests, `colab sessions` shows no session.
+- The tool stops a start that hangs, and tries again.
+- The length of a session is measured, or the tool shows that a run does not depend on it.
+
+#### The table of units
+
+The limit is 300 units for this plan. The balance was 413.09 on 2026-11-25, before the first
+run. Other work can use the same account, so use this table, not the balance, to know what this
+plan used.
+
+| Date | Run | Units |
+| --- | --- | --- |
+| 2026-11-25 | The measurements of 0.4: T4, L4, A100 and TPU v5e | 0.13 |
+
+#### A new machine
+
+- Install the command: `uv tool install google-colab-cli`. The version of 2026-11-25 is 0.8.0.
+- The owner signs in to Colab one time. Then `colab usage` shows the balance.
+- Before work, `colab sessions` must show no session.
+
+### What is done in phase 0
+
+| Part | State on 2026-11-25 |
+| --- | --- |
+| 0.1 The decisions of the owner | Done. Not yet written in `docs/citations.md` |
+| 0.2 The rights of each source | Done: the register |
+| 0.3 The cost of a net on the CPU | Not started |
+| 0.4 The speed of the simulator | Done, but the length of a session |
+| 0.5 The run tool | Not started. Do it before the first run of phase 4 |
 
 ### Done when
 
 - `docs/citations.md` contains the two decisions. The register contains the verified rights of
   each source. (The register is done.)
 - The commit message gives the time of each net size on the two machines.
-- The commit message gives the simulator speed and the compute units in one hour for each GPU
-  type, and the length of a session.
-- This plan gives the estimated hours and compute units for phases 4, 5 and 6, calculated from
-  the measured speed.
+- The plan gives the simulator speed and the compute units in one hour for each accelerator.
+  (Done: 0.4.)
+- This plan gives the estimated hours and compute units for phases 4, 5 and 6. (Done as an
+  estimate: 0.4. The first run of phase 4 replaces it.)
+- Each line of "Done when" of 0.5 is true.
 - The owner gave a limit of compute units for the plan. (Done: 300.)
 
 ## 6. Phase 1: one declaration for each body
@@ -389,7 +499,8 @@ removes the faults of the retarget: slide, penetration and forces that cannot oc
    agree with the engine.
 3. **Compare the judge with the simulator.** Calculate inverse dynamics for three clips with
    each. This makes the simulator the slow reference for the judge.
-4. **Write the training script.** It obeys the rules for Colab in section 3.
+4. **Write the training script.** It obeys the rules for Colab in section 3. The run tool of
+   0.5 starts it, on an L4.
 5. **Do the first run at a small size:** one clip, the walk, with 256 bodies. Read the times.
 6. **Train the tracker.** The tracker reads the state of the body and the next poses of the
    capture. It gives a target for each degree of freedom. The reward is how near the body stays
@@ -525,10 +636,10 @@ the answer. The rest is question 6.
 | --- | --- | --- |
 | No capture has a cast, a parry, a sword or a staff | The solver does these badly | The register has strikes, signs of the hands and gestures. Phase 2 step 6 shows the gap. Question 5 |
 | Movement with no capture looks wrong | Phase 6 takes a long time | Phases 1 to 5 do not depend on it |
-| A Colab session stops | A long run is lost | The rules for Colab, and 0.4 step 6 |
+| A Colab session stops, or its connection is lost | A long run is lost, or a session uses units with no work | The run tool of 0.5, before the first run of phase 4 |
 | A net is too slow for many bodies | Bodies far from the eye move at a low rate | 0.3 measures this before the design of the net |
 | The judge does not agree with the eye | A training run gets a good number and a bad picture | The calibration of phase 3, then the one review by the owner in phase 5 |
-| The compute units are not sufficient | A training run cannot end | 0.4 gives the estimate before a large run. Rule 8 for Colab |
+| The compute units are not sufficient | A training run cannot end | The estimate of 0.4 is 73 to 172 of the 300 units. Rule 9 for Colab |
 | A licence field in a repository is wrong | The game ships weights with rights that are not clean | Read the licence file in each download. Use the sets with the mark 2 first |
 
 ## 13. Work that is not in this plan
