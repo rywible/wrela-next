@@ -34,6 +34,7 @@ Today they are fully true only for an `--exact` build.
 | Cook | The data that the engine calculates one time for a kind and then keeps |
 | Change class | The fastest rate at which one part of a field can change |
 | Target | A measured result that a phase must get before the phase is done |
+| Proof debt | The work that a pass does only because a certificate is missing |
 
 ## 3. Rules for all phases
 
@@ -62,13 +63,16 @@ Today they are fully true only for an `--exact` build.
 | 2 | The compiler gives the change class of each part of a field | Nothing |
 | 3 | The build makes the cook on the GPU and keeps it | Phases 1 and 2 |
 | 4 | The engine makes its decisions and the frame schedule at build | Phases 2 and 3 |
+| 5 | Proofs remove work, and the frame is in its bar | Phases 1 and 4 |
 
 Reasons for this order:
 
 - Phase 1 is first because a certificate is only as true as the math below it. Phase 3 keeps
   certificates.
 - Phase 2 is before phase 3 because the cook contains only the parts that do not change.
-- Phase 4 is last because it changes the most code. It also gets the most from the other phases.
+- Phase 4 is after phase 3 because it changes the most code. It also gets the most from the
+  phases before it.
+- Phase 5 is last because it uses the cost of each pass, which phase 4 gives.
 
 Phases 1 and 2 are independent. Do phase 1 first.
 
@@ -294,18 +298,99 @@ Until the calculated cost is that accurate, show it as a report and make the cos
 Make it a build error when it is accurate. Measure the pipeline count, the load time and the
 build time before and after each step.
 
-## 10. Work that is not in this plan
+## 10. Phase 5: make the frame faster with proofs
+
+Purpose: find the work that the engine does only because a proof is missing, and remove it. Then
+decrease the cost that no proof can remove.
+
+This phase is a loop. It has no fixed list of steps.
+
+Known numbers:
+
+- A proof made single passes two times faster (`exact_box`, the exact rays of the sun).
+- Those passes are approximately 2 ms of a 17 ms frame (design notes, 2026-11-24, SCENE 10, serial).
+- SCENE 10 is 24.8 ms on the M4 today (`tools/gate`, commit `298e357`). The bar is 16.6 ms.
+- Many cells have no certificate. The creature had 20 of 25 at 1 cm and 0 of 25 at 8 cm.
+
+Thus a faster small pass is not sufficient. The large results come from proofs that remove a full
+class of work.
+
+### The loop
+
+1. **Count the proof debt.** For each pass, count the pixels, cells, rays or bricks that use the
+   slow path because a certificate is missing.
+2. **Record the cause.** For each count, record the kind and the operation that the compiler was
+   not able to bound.
+3. **Show the proof debt in the build report.** Use the cost model of phase 4 to change each
+   count into milliseconds for each machine.
+4. **Repair the largest item.** Make the bound tighter, or add a new type of certificate.
+5. **Measure again on the two machines.** Then do step 1 again.
+
+### First items for speed
+
+- **Detail by distance.** A certificate shows that a coarse mesh is in one pixel of the field at
+  a given distance. Then the engine draws a far thing with the coarse mesh.
+- **A mesh that stays correct for some frames.** A proof gives the maximum rate at which a field
+  changes. Then the engine keeps the mesh of a thing that moves for more than one frame.
+- **Rewrites that the compiler proves equal.** The compiler finds a form of a field that costs
+  less. It proves that the two forms are equal in a tolerance. Then the same shape, written by
+  two different methods, has the same cost.
+- **Small items.** Remove an index clamp or a NaN guard that a proof makes unnecessary. Use half
+  floats where a proof shows that they are safe. Do these only when the work is small.
+
+### First items for expression
+
+- **Spell pairs.** A parry makes one field from two fields while the game runs. At build, prove
+  the bound, the steepness and the cost of that field for all values of its parameters.
+- **New operators.** Add a warp, a twist or a displacement to the kit when the compiler can
+  bound its steepness. A field with a loose bound is correct but slow. A tighter proof makes it
+  fast.
+- **The time of a parry.** Calculate from the fields the time interval in which one spell
+  touches the other. The client and the server must get the same interval.
+
+### Rules for proofs
+
+1. A proof search in the build must have a limit in steps, not in seconds. It must give the same
+   result on each machine and on each run.
+2. If the search finds no proof in its limit, the build uses the slow path, which is always
+   correct. The build reports the item as proof debt.
+3. A long search is permitted out of the build. An agent or a tool does the search and writes a
+   certificate. The build only does a check of the certificate. The check must be fast and must
+   give the same result each time.
+4. Do not add a general solver to the build. Its time changes much with a small change of its
+   input, and its limit is a time.
+5. Do not write a proof about a driver or about the rasteriser. We do not control them.
+6. The judges and the reference must continue to find a wrong proof (rule 3 of section 3).
+
+### The cost that no proof removes
+
+The cost of a shade pass is for each pixel. A proof does not decrease it.
+
+1. Find the passes with the largest cost in the report of phase 4.
+2. If a pass has no proof debt, make the pass faster by a change to its method.
+3. Measure before and after on the two machines.
+
+### Done when
+
+- The proof debt is less than 5% of the frame time, for each scene in the gate, on the two
+  machines.
+- Each scene in the gate is in 16.6 ms at 1080p on the M4.
+- No scene in the gate is slower on the Radeon than before phase 5.
+- The judges and the hole audit give results that are not worse.
+
+## 11. Work that is not in this plan
 
 | Idea | Why it is not here | Look again when |
 | --- | --- | --- |
 | Move the engine code into the Rust toolchain | The engine changes the most, and a toolchain build is the slowest edit. The engine also loses the checks that wrela gives it | Do not look again |
 | A compiler on the server for spells that players write | It is necessary only if players write new fields. The design of spells is not decided | Phase 4 is done and 0.3 gives a build time |
 | A compiler in the client | It adds an attack surface and many pipelines | A cost table for the GPU of the player is necessary |
+| A general solver in the build | Its time is not stable, so two machines can get different builds. A search with a limit in steps, and a certificate that the build only examines, do the same job (phase 5) | Do not look again |
 | A search that finds the frame schedule | The result is difficult to explain, and a time measurement is not stable | Phase 4 step 4 is accurate |
 | A server target and a wire format from the same fields | It is a second back end | The rules of the game need the field of a spell on the server |
 | Cost proofs for each pair of spells | The spells do not exist | The first two spells that answer each other exist |
 
-## 11. Questions that are open
+## 12. Questions that are open
 
 Each question has the phase that must answer it.
 
@@ -316,7 +401,7 @@ Each question has the phase that must answer it.
 5. What error limit does WGSL give to `sin` and `cos`? The value 2⁻¹¹ is from memory. Read the
    specification before step 7 of phase 1.
 
-## 12. How to keep this plan
+## 13. How to keep this plan
 
 This file is the plan. Keep it in `docs/plans/`.
 
