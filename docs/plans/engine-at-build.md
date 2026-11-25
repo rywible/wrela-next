@@ -3,13 +3,6 @@
 Status: proposal. No phase is started. The plan agrees with the code at commit `1c78609`
 (2026-11-25).
 
-The plan gives the source of each number: a commit, a tool, `docs/spec/language.md`, a comment in
-the code or the design notes.
-
-The design notes are not in the repository now. To read them, use
-`git show ca13c8e:docs/design.md`. A number from the design notes is older than the code. Measure
-it again before you use it.
-
 ## 1. Purpose
 
 Today the engine makes many decisions while the game runs. This plan moves those decisions to the
@@ -21,340 +14,549 @@ build.
 - At build, the engine uses the facts to write the code and the data for each kind.
 - The released game contains only that code and that data.
 
-The plan has one more aim. The proofs about GPU code must be true for the build that we release.
-Today they are fully true only for an `--exact` build.
+The plan has a second aim. The proofs about GPU code must be true for the released build. Today
+they are fully true only for a build with `--exact`.
 
-## 2. Terms
+## 2. Read this first
+
+1. Read `AGENTS.md`. Its rules apply to all work in this plan.
+2. Read sections 3 to 6 of this plan. They give the terms, the places in the code, the commands
+   and the rules.
+3. Do the phases in the order of section 7.
+4. In a phase, do the steps in their order. Each step is one change or a small number of changes.
+5. A phase is done only when each line of its "Done when" list is true.
+6. When you learn something that makes a step wrong, correct the step in this file in the same
+   change.
+
+The plan gives the source of each number: a commit, a tool, a file or the design notes. The
+design notes are not in the repository now. To read them, use
+`git show ca13c8e:docs/design.md`. A number from the design notes is older than the code.
+Measure it again before you use it.
+
+## 3. Terms
+
+Each term has one meaning in this plan.
 
 | Term | Meaning |
 | --- | --- |
-| Kind | One type of thing in the world, for example a pillar or a creature |
+| Kind | One type of thing in the world, for example a pillar or a creature. A kind is one field |
+| Part | One member of a field that is a union of fields |
+| Eye | The camera |
 | Kernel | One program that the GPU runs |
-| Strict kernel | A kernel that the back end compiles with no contraction and with no fast math |
-| Geometry kernel | A kernel that finds where matter is: extraction, the certificate pass, the exact rays |
+| Pass | One draw or one dispatch that has a label. A frame is a list of passes |
+| Extraction | The work that makes a mesh from a field |
+| Batch | The mesh of one kind and its buffers (`MeshBatch`) |
+| Settled | A batch is settled when its mesh is complete and the engine knows that it is complete (`MeshBatch::settled`) |
+| Exact cell | A cell where the mesh is not sufficient. The engine draws the box of the cell and finds the surface of the field for each pixel |
 | Certificate | The data that shows that a mesh agrees with its field |
-| Cook | The data that the engine calculates one time for a kind and then keeps |
+| Bound | A limit that the compiler proves for a value, for all inputs in a box |
+| Steepness | The maximum rate at which the distance of a field changes for each metre (the Lipschitz constant) |
+| Facts | The properties of a kind that the build proves (`FieldFacts`): its steepness, the channels that it can use, the work of its functions |
+| Tape | The list of the operations of a field, which `std::derive::tape` gives |
+| Work count | The maximum work of one invocation of a kernel, which the compiler counts. It is not a time |
+| Span | The cost of one frame: the time on the clock of the GPU from the start of the first pass to the end of the last pass |
+| Strict kernel | A kernel that the back end compiles with no contraction and with no fast math |
+| Geometry kernel | A kernel whose output is a mesh, a certificate or a decision about where matter is. A kernel whose output is only a colour is not a geometry kernel |
+| Cook | The data that the engine calculates one time for a kind at build and then keeps |
 | Change class | The fastest rate at which one part of a field can change |
+| Proof debt | The work that a pass does only because a certificate or a fact is missing |
 | Target | A measured result that a phase must get before the phase is done |
-| Proof debt | The work that a pass does only because a certificate is missing |
+| Gate | `tools/gate`: the layers, the tests, the hole audit, the judge of the sun and the span of four scenes |
+| Hole audit | `tools/audit`: it compares the picture of each kind with its field and counts holes |
+| Judge, reference | `lib/engine/judge` and `lib/engine/reference`: slow code that finds the correct result from the field |
 
-## 3. Rules for all phases
+## 4. Where the code is
+
+| Subject | Place |
+| --- | --- |
+| Shader back end, exact mode | `toolchain/shader/src/lib.rs`, `metal.rs`, `spirv.rs` |
+| Bounds for GPU code | `toolchain/ir/src/derive/interval.rs`, `affine.rs` |
+| Work count | `toolchain/ir/src/work.rs` |
+| Dispatch guard (the 50 ms rule) | `toolchain/host/src/step.rs` |
+| What a program can ask about a field | `lib/std/derive.wrela` |
+| `FieldFacts` | `lib/std/field.wrela` |
+| The build proves the facts | `lib/engine/matter/verify.wrela` (`prove_field_facts`) |
+| Certificates of cells | `lib/engine/matter/certify.wrela` |
+| Extraction: control, batches | `lib/engine/mesh/extract.wrela` |
+| Extraction: grids for the eye | `lib/engine/mesh/grid.wrela` |
+| Extraction: kernels | `lib/engine/mesh/dc.wrela`, `emit.wrela` |
+| Exact cells, proofs for a discard | `lib/engine/mesh/proof.wrela`, `shade.wrela` |
+| Exact rays of the sun | `lib/engine/mesh/sunlight.wrela` |
+| The passes of a frame | `lib/engine/mesh/draw.wrela`, `world_draw.wrela` |
+| Certificate report, facts report | `game/world/certificates.wrela` |
+| The scenes | `game/scenes/main.wrela` (`SCENE`, `VIEW`) |
+| The gate and its lines | `tools/gate`, `tools/gate.json` |
+
+Parts of the specification (`docs/spec/language.md`) to read:
+
+| Section | Subject | Read before |
+| --- | --- | --- |
+| §11.3 | What each target does with floats, exact mode | Phases 0 and 1 |
+| §12 | `@deterministic` | Phase 1 |
+| §13.1, §13.3 | Constants at build, fuel, `embed` | Phases 3 and 4 |
+| §14 | Bounds, steepness, known limits of the intervals | Phases 2 and 5 |
+| §18.9, §18.11 | Pipelines, work and weight | Phase 4 |
+
+## 5. How to measure
+
+Use these commands. Do not use a different measure of a frame.
+
+| To get | Command |
+| --- | --- |
+| A build of one scene | `tools/wrela build game/scenes -o DIR --set SCENE=10` |
+| A first run of new GPU work | `tools/gpu DIR --size 320x180 --frames 2 --timestamps --serial` |
+| The span of a scene, and the time of each pass | `tools/bench DIR --size 1920x1080 --frames 30-89` |
+| Two builds compared | `tools/bench DIR --size 1920x1080 --frames 30-89 --against DIR2` |
+| The spans of the gate only | `tools/gate --only frames` |
+| The full gate | `tools/gate` (add `--full` for a change to extraction or to the passes of the eye) |
+| The hole audit, small | `tools/audit --size 160x90 --eyes 12` |
+| The certificate report and the facts report | `tools/wrela test game/world` |
+| Each kernel and the code that dispatches it | `tools/wrela pipelines game/scenes --set SCENE=10` |
+| Each constant that the build calculated | `tools/wrela build game/scenes --report consts` |
+| The same command on the Radeon | `tools/radeon COMMAND` (commit and push first) |
+
+- The span is the median of frames 30 to 89 at 1920x1080. The gate uses the same numbers.
+- `tools/bench` also runs each pass alone and prints a table. The times in the table do not add
+  up to the span. Use the table to compare one pass before and after a change.
+- Put each measurement in the commit message: before and after, same machine, same run.
+
+## 6. Rules for all phases
 
 1. Keep the engine in `lib/engine`. Do not move engine code into `toolchain/`.
 2. Add only general mechanisms to the toolchain. A mechanism is general if it knows fields, but
-   knows no engine pass and no thing of the game.
-3. Keep `lib/engine/reference` and `lib/engine/judge` independent. They must ask the field of the
-   author directly. They must not read the cook. They must not use a decision of the build.
+   knows no pass of the engine and no thing of the game.
+3. Keep the judges and the reference independent. They must ask the field of the author
+   directly. They must not read the cook. They must not use a decision of the build.
 4. Make each build decision from a count or from a proof. Do not make a decision from a measured
    time. A decision from a time changed with the state of the GPU (design notes, "What is
    measured, and what is not").
 5. When a new method replaces an old method, remove the old method in the same change.
 6. Work on each phase until each line of its "Done when" list is true. If a result is not good,
    find the cause and use a different method. Do not stop, and do not leave the problem open.
-   Put each measurement in the commit message.
-7. Obey the rules in `AGENTS.md`. Start each GPU run with `tools/gpu`. Keep each dispatch below
-   approximately 50 ms. Measure on the two machines. Pass `tools/gate` on the two machines before
-   you call a phase done.
+7. Measure on the two machines. Pass the gate on the two machines before you call a phase done.
 
-## 4. Order of the phases
+## 7. Order of the phases
 
 | Phase | Result | Uses the result of |
 | --- | --- | --- |
-| 0 | Three measurements that tell us where the time is | Nothing |
+| 0 | Three measurements that show where the time is | Nothing |
 | 1 | Strict math in the geometry kernels | Phase 0 |
 | 2 | The compiler gives the change class of each part of a field | Nothing |
-| 3 | The build makes the cook on the GPU and keeps it | Phases 1 and 2 |
+| 3 | The build makes the cook on the GPU and keeps it | Phases 0, 1 and 2 |
 | 4 | The engine makes its decisions and the frame schedule at build | Phases 2 and 3 |
-| 5 | Proofs remove work, and the frame is in its bar | Phases 1 and 4 |
+| 5 | Proofs remove work, and each frame is in the bar | Phases 1 and 4 |
 
 Reasons for this order:
 
-- Phase 1 is first because a certificate is only as true as the math below it. Phase 3 keeps
-  certificates.
+- Phase 1 is before phase 3 because the cook keeps certificates. A certificate is only as true
+  as the math below it.
 - Phase 2 is before phase 3 because the cook contains only the parts that do not change.
-- Phase 4 is after phase 3 because it changes the most code. It also gets the most from the
-  phases before it.
+- Phase 4 is after phase 3 because it changes the most code. It also uses the results of all
+  the phases before it.
 - Phase 5 is last because it uses the cost of each pass, which phase 4 gives.
 
 Phases 1 and 2 are independent. Do phase 1 first.
 
-## 5. Phase 0: three measurements
+## 8. Phase 0: three measurements
 
-Write no new engine code in this phase. Each measurement answers one question.
+Purpose: get three numbers that the other phases use.
+
+Do not change what the engine draws in this phase. A temporary option in the toolchain is
+permitted for 0.1.
 
 ### 0.1 The cost of strict math
 
-Question: how much time does the frame lose when only the geometry kernels are strict?
+Question: how much slower is a frame when only the geometry kernels are strict?
 
-Known numbers:
+What is known:
 
-- With no contraction, the crowd lost a maximum of 4.3% of a frame on the M4
-  (`toolchain/shader/src/lib.rs`).
-- With safe math, an older frame lost 91% on the M4 (`toolchain/shader/src/metal.rs`).
-- No person measured strict math on the engine as it is today. The specification says that an
-  exact build is not for a time measurement.
 - Strictness is a property of the full build today (`Checks::exact` in
   `toolchain/shader/src/lib.rs`, which `wrela build --exact` sets). No kernel can be strict
   alone.
+- With no contraction, the crowd lost a maximum of 4.3% of a frame on the M4
+  (`toolchain/shader/src/lib.rs`).
+- With safe math, an older frame lost 91% on the M4 (`toolchain/shader/src/metal.rs`).
+- No person measured strict math on the engine as it is today.
 
 Steps:
 
-1. Let the shader back end make one kernel strict while the other kernels stay relaxed.
-2. Make the geometry kernels strict.
-3. Build SCENE 10 and SCENE 11.
-4. Do a first run with `--frames 2 --timestamps --serial` at a small size. Read the times.
-5. Measure frame 11 at 1080p on the M4 and on the Radeon. Measure the same commit with relaxed
-   kernels.
+1. Add a temporary build option that takes a list of kernel names. The back end compiles those
+   kernels strict and the other kernels relaxed.
+2. Make the list of the geometry kernels. Use `tools/wrela pipelines` to find the names. Include
+   the compute kernels of extraction, of the certificates and of the exact rays of the sun. Put
+   the list in this file.
+3. Build SCENE 10 and SCENE 11 two times from the same commit: one time relaxed, one time with
+   the list strict.
+4. Do the first run of each strict build at a small size (section 5). Read the times.
+5. Compare the two builds of each scene with `tools/bench ... --against` on the M4 and on the
+   Radeon.
+6. Record the difference of the span in percent, and the difference of each pass.
+7. If a span is more than 5% slower, find the cause. Build with only no contraction, then with
+   only safe math. Record which one costs the time, and in which kernels.
+8. Do steps 3 to 6 again with the fragment kernels of the exact cells in the list. They also
+   find where matter is. Record this result separately.
 
-Target: the frame is not more than 5% slower on the two machines.
+Result: the cost of strict geometry kernels in percent, for each machine, and its cause. Phase 1
+has the target (5%) and removes the temporary option.
 
-If the frame is slower than the target, find the part of safe math that costs the time. Then
-write the geometry kernels so that relaxed math can change nothing in them, and measure again.
-Continue until the result is in the target.
+### 0.2 The part of extraction that the cook can save
 
-### 0.2 The parts of the first frame
+Question: how much of the extraction time is work that needs only the field, and not the eye?
 
-Question: how much of the first frame is extraction of matter that does not change?
+What is known:
 
-Known numbers: the first frame of SCENE 10 is 225 ms on the M4. A frame after that is
-approximately 21 ms. In the serial run, extraction is 43 ms (design notes, 2026-11-24).
-
-These numbers are older than commits `233fd5d` and `5a6dfd6`. Those commits changed what the
-engine does when a frame cuts an extraction short: the engine now continues the extraction in the
-next frame. Thus the extraction of one kind can use more than one frame.
+- The mesh of a batch depends on the eye. The engine makes a set of grids for each view
+  (`build_lod_grids_view` in `lib/engine/mesh/grid.wrela`). It extracts again when the eye moves
+  one step or turns. The key of an extraction contains the position and the direction of the
+  eye (`lib/engine/mesh/extract.wrela`).
+- Thus a cook cannot contain "the mesh of a kind". It can contain only the results that are the
+  same for each eye.
+- The first frame of SCENE 10 was 225 ms on the M4. A frame after that was approximately 21 ms.
+  In the serial run, extraction was 43 ms (design notes, 2026-11-24). These numbers are older
+  than commits `233fd5d` and `5a6dfd6`. After those commits, an extraction that a frame cuts
+  short continues in the next frame.
 
 Steps:
 
-1. Measure the extraction time of each kind in SCENE 10 and SCENE 13, from the first frame to
-   the frame in which each batch is settled (`MeshBatch::settled` in
-   `lib/engine/mesh/extract.wrela`). Record the number of that frame.
-2. Record which kinds have a field that reads no time and no state.
-3. Calculate the part of the extraction time that those kinds use.
+1. Measure the extraction time of each kind in SCENE 10 and SCENE 13. Start at the first frame.
+   Stop at the frame in which each batch is settled. Record the number of that frame.
+2. Record which kinds have a field that reads no time and no state
+   (`std::derive::reads_only_input`).
+3. For those kinds, divide the extraction time into two parts:
+   - Work that needs only the field and a cell: the values at the corners of a cell, the vertex
+     of a cell, the certificate of a cell.
+   - Work that needs the eye: the selection of the grids, the cull, the seams between grids, the
+     exact cells.
+4. Move the eye through SCENE 13 (`VIEW` 0, 1 and 2). Count how many times extraction runs again
+   and how many cells it calculates again that it calculated before.
 
-This number tells us how much time the cook can save in the first frame.
+Result: two times. The first is the time that a cook can save in the first frames. The second
+is the time that it can save when the eye moves. Phase 3 step 1 uses this result.
 
 ### 0.3 The time to build one kind
 
 Question: how long is the build from a changed field to a kind that the engine can draw?
 
-Known numbers:
+What is known:
 
 - The build of one scene takes 13 to 19 s on the M4. It uses one thread. Each scene build
   compiles `lib/std` and the engine again (`tools/gate` prints the time of its builds, commit
   `298e357`).
 - The tests of `game/world`, which contain the certificate report, take 9 s on the M4 (commit
   `1c78609`).
+- `wrela build` does not print the time of its parts.
 
 Steps:
 
-1. Change one field in `game/world`.
-2. Measure the time of the build. Record the time of the proofs and the time of the shaders
-   separately.
+1. Make `wrela build` print the time of each of its parts: the front end, the constants and
+   proofs, the shaders. This is a general mechanism, so it stays.
+2. Change one field in `game/world`.
+3. Build SCENE 10. Record the time of each part.
 
-This number tells us how many kinds a build can cook before the build is too
-slow for an agent.
-
-## 6. Phase 1: strict math in the geometry kernels
-
-Purpose: make the proofs true for the released build, and make the geometry kernels give the same
-bits on each GPU.
-
-The problem today:
-
-- The proofs make each GPU result wider by two times the error limit of WGSL
-  (`toolchain/ir/src/derive/interval.rs`).
-- The default Metal build uses relaxed math. Relaxed math can change the order of the arithmetic.
-  The error limit of one operation does not include that change.
-- The code assumes that `sin` and `cos` have the same error outside [-π, π] as inside. No
-  specification says this.
-
-### Steps
-
-1. **Add strictness as a property of a function.** Model it on `@deterministic`. The compiler must
-   refuse a strict function that calls a function that is not strict.
-2. **Compile a kernel strict if its entry function is strict.** Use no contraction on the two
-   targets. Use safe math on Metal.
-3. **Make the geometry kernels strict.** The shade kernels stay relaxed. Their results are only
-   for the picture.
-4. **Do a test of the hardware operations on each machine.**
-   - Square root: all 2³² inputs.
-   - Reciprocal: all 2³² inputs.
-   - Division: a set of difficult inputs and a large random set.
-   - Divide each test into dispatches of 50 ms or less.
-   - Compare each result with the CPU result.
-5. **If a GPU gives a different result, correct the operation in software for strict kernels.**
-   Record the cost.
-6. **Write `sin`, `cos`, `exp`, `log`, `pow` and `atan` one time in `lib/std`, in `f32` only.**
-   - Use only add, subtract, multiply and the operations that step 4 showed correct.
-   - Compile the same source for the CPU and for the GPU.
-   - Give each function a proven error limit.
-   - Strict functions must use these functions. They must not use the functions of the driver.
-7. **Change the proof code to use the new error limits.** Remove the assumption about `sin` and
-   `cos` outside [-π, π].
-8. **Remove operations that the driver defines from strict kernels.**
-   - Do not use the hardware texture filter. Read the texels and calculate the blend in the kernel.
-   - Do not use derivatives.
-   - Calculate the attributes of a pixel from the number of its triangle.
-9. **Add a bit comparison to the judge.** For a strict kernel, the judge compares the hash of the
-   GPU output with the hash of the CPU output.
-10. **Add a self-test that the host runs at start.** It runs a small set of inputs with known
-    results. This step is necessary before a release, not before phase 3.
+Result: the time of a build after a change to one kind, in its parts. It shows how many kinds a
+build can cook before the build is too slow for an agent.
 
 ### Done when
 
-- Each strict kernel gives the same bits on the M4, on the Radeon and on the CPU.
-- No proof uses an error limit that the build does not obey.
-- The certificate report (`game/world/certificates.wrela`, which `tools/check` shows) gives no
-  kind fewer certified cells than before phase 1. Section 10 gives the counts at `1c78609`.
-- The frame is not more than 5% slower on the two machines (the same target as 0.1).
+- The three results are in the commit messages and in the "What is known" lists of this file.
+- The list of geometry kernels is in this file.
+- The gate passes on the two machines with the temporary option not used.
 
-If a function from step 6 makes a kernel too slow, make the function faster. Do not go back to
+## 9. Phase 1: strict math in the geometry kernels
+
+Purpose: make the proofs true for the released build. Make each geometry kernel give the same
+bits on each GPU and on the CPU.
+
+### What is wrong today
+
+- The proofs make each GPU result wider by two times the error limit that WGSL gives for the
+  operation (`toolchain/ir/src/derive/interval.rs`).
+- The default Metal build uses relaxed math. Relaxed math can change the order of the
+  arithmetic. The error limit of one operation does not include that change.
+- WGSL gives an error limit for `sin` and `cos` only in [-π, π]. The proofs assume the same
+  limit outside that range. No specification says this.
+- Vulkan permits an error of 2.5 ulp in a division (`docs/spec/language.md`, §11.3). Thus two
+  GPUs can give different bits for the same division.
+
+### The idea
+
+Some operations give the same bits on each GPU when the kernel is strict: a float add, subtract
+and multiply, a comparison, a conversion, and the other operations that §11.3 lists. These are
+the safe operations. If a function uses only safe operations, the same source gives the same
+bits on the CPU and on each GPU. Then a test of the function on the CPU is also true for each
+GPU.
+
+### Steps
+
+1. **Add strictness as a property of a function.** Make it an attribute of the same type as
+   `@deterministic`. The compiler must refuse a strict function that calls a function that is
+   not strict.
+2. **Compile a kernel strict if its entry function is strict.** Use no contraction on the two
+   targets. Use safe math on Metal. Remove the temporary option of phase 0.1.
+3. **Make the geometry kernels strict.** Use the list from phase 0.1. The shade kernels stay
+   relaxed. Their results are only for the picture.
+4. **Do a test of the hardware operations on each machine.** Put the test with the GPU tests of
+   `toolchain/host`, which `tools/check` runs.
+   - Square root: all 2³² inputs.
+   - Reciprocal: all 2³² inputs.
+   - Division: a set of difficult inputs and a large random set with a fixed seed.
+   - Divide each test into dispatches of 50 ms or less.
+   - Compare each result with the result of the CPU. The CPU rounds each of these correctly.
+5. **If a GPU gives a different result, write that operation in software for strict
+   functions.** Use only safe operations. Record the cost in the frame. An operation that
+   passed step 4 on the two machines is also a safe operation.
+6. **Write each math function that a strict function calls one time in `lib/std`, in `f32`
+   only.** The compiler error of step 1 gives the list. It contains at least `sin`, `cos`,
+   `exp`, `log`, `pow` and `atan`.
+   - Use only safe operations.
+   - Compile the same source for the CPU and for the GPU.
+   - Strict functions must call these functions. They must not call the functions of the driver.
+7. **Find the error limit of each function of step 6.**
+   - For a function of one argument, run it on the CPU for all 2³² inputs. Compare each result
+     with a result that has more precision. Record the maximum error in ulp.
+   - For a function of two arguments, calculate the limit from the limits of the functions
+     that it calls.
+   - Keep the test in the toolchain tests. If it is too slow for each run, give it a build
+     option and record the last result in the code.
+8. **Change the proof code to use the limits of step 7 for strict functions.** A proof about a
+   strict function widens a result by the limit of step 7, one time. Remove the assumption about
+   `sin` and `cos` outside [-π, π].
+9. **Refuse operations that the driver defines in a strict function.** The compiler must give
+   an error for a texture read that uses the hardware filter, and for a derivative. To blend
+   texels in a strict function, read each texel and calculate the blend in the function.
+10. **Add a bit comparison to the judge.** For each strict kernel, the judge runs the entry
+    function on the CPU with the same inputs. It compares the hash of the CPU output with the
+    hash of the GPU output. A difference is a failure of the gate.
+11. **Add a self-test that the host runs at start.** It runs each strict math function on the
+    GPU with a small set of inputs and compares the results with constants. The host stops if
+    one is different. This step is necessary before a release. It is not necessary before phase
+    3.
+
+### Done when
+
+- Each strict kernel gives the same bits on the M4, on the Radeon and on the CPU (step 10).
+- `interval.rs` uses no error limit of WGSL for an operation in a strict function.
+- The certificate report gives no kind fewer certified cells than before phase 1. The table in
+  section 13 gives the counts at `1c78609`.
+- No span of the gate is more than 5% slower, on the two machines.
+
+If a function of step 6 makes a kernel too slow, make the function faster. Do not go back to
 the function of the driver.
 
-### What we cannot make the same
+### What cannot be the same
 
 The rasteriser selects the triangle that covers a pixel. Each driver does this with its own
 precision. Thus two GPUs can give different pictures at the edge of a triangle. The judges must
 continue to use a tolerance for pictures. The bit comparison is only for the data that the
 geometry kernels write.
 
-## 7. Phase 2: the change class of each part of a field
+## 10. Phase 2: the change class of each part of a field
 
-Purpose: the compiler tells the engine when each part of a field can change.
+Purpose: the compiler tells the engine how fast each part of a field can change.
 
-Today `std::derive::reads_only_input` answers one question for a full field: does the field read
-only its input? Phase 2 answers the question for each part.
+### What exists today
+
+- `std::derive::reads_only_input` answers one question for a full field: does the field read
+  only its input?
+- The engine compares one hash of the full field (`field.state_hash` in
+  `lib/engine/mesh/extract.wrela`). If one part of a kind changes, the engine extracts all parts
+  of that batch again.
+- An edit is the exception. The engine extracts again only the bricks that the edit touches
+  (`Edited<M>`, `try_patch_dirty`).
+
+### The classes
+
+Start with these four classes. The list is in order, from slow to fast.
+
+| Class | A part has this class when |
+| --- | --- |
+| Never | It reads only its input point and constants |
+| State | It reads a value of the game that changes at a tick or less frequently |
+| Frame | It reads the time, or a value that changes each frame |
+| Eye | It reads the position or the direction of the eye |
+
+A part that reads values of more than one class gets the fastest of those classes.
 
 ### Steps
 
-1. **Define the change classes.** Start with four: never, when state changes, each frame, with
-   the eye.
-2. **Calculate the class of each member of a union and of each operation on the tape.** A part
-   gets the fastest class of the values that it reads.
-3. **Give the classes to programs through `std::derive`.** Build-time code must be able to read
-   them.
-4. **Add a report to `wrela`.** For each kind, it lists the parts and their classes.
-5. **Use the classes in the engine.** Extract a part of class "never" one time only.
-6. **Remove the run-time check that the class replaces.** Today the engine finds a field that did
-   not change from its `StateHash` (`One<M>` and `Pool<M>` in
-   `lib/engine/mesh/world_draw.wrela`). If the class makes that check unnecessary for a kind,
-   remove the check for that kind in the same change.
+1. **Calculate the class of each operation on the tape of a field.** An operation gets the
+   fastest class of the values that it reads.
+2. **Calculate the class of each part of a field** from the classes of its operations.
+3. **Give the classes to programs through `std::derive`.** Code that runs at build must be able
+   to read them.
+4. **Add a report to `wrela`.** Make it a command of the same type as `wrela pipelines`. For
+   each kind, it lists the parts and the class of each part.
+5. **Add a test.** One field has a part that reads the time and a part that does not. The test
+   makes sure that the first part is "Frame" and the second part is "Never".
+6. **Use the classes in extraction.** When a part of class "State" or "Frame" changes, extract
+   again only the bricks that the bound of that part touches. Use the method that an edit uses
+   today.
+7. **Remove the run-time check that a class replaces.** If each part of a kind is "Never",
+   remove the comparison of the hash for that kind in the same change.
 
 ### Done when
 
-- The report is correct for each kind in SCENE 10, SCENE 11 and SCENE 13. Do a test with a field
-  that changes and make sure that the class is not "never".
-- No frame time is slower.
+- The report is correct for each kind in SCENE 10, SCENE 11 and SCENE 13. The test of step 5
+  passes.
+- In a scene with one part that moves, extraction calculates only the bricks that the part
+  touches. Show the count of bricks before and after.
+- No span of the gate is slower, on the two machines.
 
-## 8. Phase 3: the cook
+## 11. Phase 3: the cook
 
-Purpose: the engine calculates the mesh and the certificate of matter that does not change one
-time, at build, and keeps them.
+Purpose: the build calculates, one time, the results of extraction that do not depend on the
+eye. The game loads them and does not calculate them again.
 
-The cook is not a second engine. It is the work that the engine does in the first frames, done
-before the game runs. The same GPU kernels make it. Thus a cooked mesh and a live mesh join with
-no crack between them.
+### What exists today
 
-The engine had a second method to keep a field, as a volume (`BakedField`). Commit `00225aa`
-removed it because nothing used it. Do not add it again. The cook keeps the meshes that the
-engine draws, not a second form of the field.
+- The mesh of a batch depends on the eye (phase 0.2). Thus the cook cannot be "one mesh for each
+  kind".
+- The grids of one batch share one origin, and each grid uses whole numbers of cells from that
+  origin (`lib/engine/mesh/grid.wrela`). Thus a cell can have the same position for two eyes.
+- The build keeps the constants that it calculated in a cache on the machine
+  (`wrela build --report consts`). A build can also put a file of its package into the program
+  (`embed`, `docs/spec/language.md` §13.3).
+- `tools/gate` keeps each result under a key that it makes from the contents of files
+  (`~/.wrela/gate/`).
+- Two earlier methods were removed. Read their commits before you start.
+  - A pool of bricks that the engine kept between frames (added in `d6a9616`, removed in
+    `b7edd49`). It kept a mesh that was cut short and called it settled.
+  - `BakedField`, which kept a field as a volume (removed in `00225aa`). Nothing used it.
+
+### What the cook contains
+
+The cook contains the results for one cell that are the same for each eye:
+
+- the values of the field at the corners of the cell;
+- the vertex of the cell;
+- the certificate of the cell.
+
+It contains them for each brick of a kind, at a fixed set of cell sizes. While the game runs,
+the engine selects the bricks and the cell size for the eye, as it does today. It makes only the
+seams and the exact cells live.
+
+The cook is not a second engine. The same GPU kernels make it. Thus a cooked cell and a live
+cell have the same bits, and they join with no crack.
 
 ### Steps
 
-1. **Add a cook run.** It is a run through `tools/gpu` with no window. It runs until each batch
-   is settled (`MeshBatch::settled` in `lib/engine/mesh/extract.wrela`). Then it writes the
-   meshes and the certificates to a file. If a batch does not become settled, the cook run fails
-   and names the batch, as the hole audit does.
-2. **Give each cook a key.** The key is the hash of the field, the hash of the engine and the
+1. **Make sure that the list above is correct.** Use the result of phase 0.2. For each item,
+   show with a test that two different eyes get the same bits for the same cell. If the grids
+   of two eyes do not put a cell in the same position, change the grids first. That change must
+   pass the gate alone.
+2. **Divide extraction into two stages** in the engine: a stage that needs only the field and a
+   brick, and a stage that needs the eye. The picture must not change. Pass the gate.
+3. **Add a cook run.** It is a run through `tools/gpu` with no window. It cooks each kind whose
+   parts are all of class "Never". For such a kind, it runs the first stage for each brick at
+   each cell size. It writes the results to a file. Obey the 50 ms rule: divide the work into
+   dispatches.
+4. **Give each cook a key.** The key is the hash of the field, the hash of the engine and the
    name of the machine. Make the hash of the engine from the contents of its files, as
-   `tools/gate` makes the key of a result. Do not use the commit.
-3. **Keep the cook between builds.** A build makes a cook again only when its key changes.
-4. **Load the cook when the game starts.** The engine does no extraction for a kind that has a
-   cook.
-5. **Do a check of each certificate on the CPU when the cook loads.** Use code that the cook run
-   does not use. Refuse a cook that does not pass. Then extract the kind live.
-6. **Cook each kind at a fixed set of cell sizes.** The eye is not known at build. The engine
-   selects the size for the eye while the game runs, as it does today.
-7. **Remove the name of the machine from the key** after phase 1 shows the same bits on the two
+   `tools/gate` does. Do not use the commit.
+5. **Keep the cook between builds,** out of the repository, in the same manner as the results
+   of the gate. A build makes a cook again only when its key changes.
+6. **Load the cook when the game starts.** For each cell that the cook holds, the engine skips
+   the first stage.
+7. **Do a check of each certificate on the CPU when the cook loads.** The check must share no
+   code with the extraction kernels, apart from the field. If a cook does not pass, refuse it,
+   say which kind failed, and extract that kind live.
+8. **Remove the name of the machine from the key** after phase 1 shows the same bits on the two
    machines.
-8. **Before a release, make the cook on the machine of the player** at the first start. Do not
-   make it while the player plays.
+9. **Before a release, decide where the cook is made.** If phase 1 gives the same bits on the
+   GPU of each player, the cook comes with the game. If it does not, make the cook on the
+   machine of the player at the first start. Do not make it while the player plays.
 
 ### Done when
 
 - A cooked scene passes the hole audit with the same counts as the live scene, on the same
   machine.
-- The first stable frame comes sooner than with live extraction, on the two machines.
+- The first frame in which each batch is settled has a smaller number than with live
+  extraction, on the two machines. The sum of the spans to that frame is also smaller.
+- When the eye moves through SCENE 13, the engine calculates no cell again that the cook holds.
 - The cook of one changed kind adds not more than 5 seconds to the build.
+- No span of the gate is slower, on the two machines.
 
-## 9. Phase 4: decisions and the frame schedule at build
+## 12. Phase 4: decisions and the frame schedule at build
 
 Purpose: the engine becomes a program that the build runs. It writes the kernels, the tables and
 the frame schedule for this game.
 
-Much of this exists:
+### What exists today
 
-- Constants run at build in wasmtime with a fuel limit.
-- `prove_field_facts` (`lib/engine/matter/verify.wrela`) runs at build and gives the
-  `FieldFacts` of a kind. The facts remove code paths that the kind does not use. That change
-  made `exact_box` two times faster: 1.71 to 0.88 ms on the M4, 4.00 to 1.95 ms on the Radeon
-  (commit `40512f2`).
-- The compiler counts the maximum work of one invocation of each kernel
-  (`docs/spec/language.md`, §18.11). The manifest of a build contains the count.
-- The host knows the time of one unit of work on each machine (`toolchain/host/src/step.rs`).
-  Before a dispatch runs, the host multiplies the count, the number of invocations and that
-  time. It refuses a dispatch that can be longer than 50 ms.
+- Constants run at build in wasmtime with a fuel limit (`docs/spec/language.md`, §13.1).
+- `prove_field_facts` runs at build and gives the facts of a kind. The facts remove code paths
+  that the kind does not use. That change made the pass `exact_box` two times faster: 1.71 to
+  0.88 ms on the M4, 4.00 to 1.95 ms on the Radeon (commit `40512f2`).
+- The compiler gives the work count of each kernel. The manifest of a build contains it.
+- The host knows the maximum time of one unit of work on each machine
+  (`toolchain/host/src/step.rs`). Before a dispatch runs, the host multiplies the work count,
+  the number of invocations and that time. It refuses a dispatch that can be longer than 50 ms.
 - `wrela pipelines` lists each kernel, its type arguments and the code that dispatches it.
+- A batch finds some properties of its kind while the game runs: if the kind has a skin and if
+  its mesh changes shape (`is_skinned` and `is_deformed` in `lib/engine/mesh/extract.wrela`). A
+  pool finds while the game runs if its things share one mesh
+  (`lib/engine/mesh/world_draw.wrela`).
+- The frame is code that tests conditions each frame and then runs or skips a pass
+  (`lib/engine/mesh/draw.wrela`).
 
 One thing was removed. The toolchain had a model of the cost of a frame
 (`toolchain/driver/src/wcet.rs`). Commit `00225aa` removed it because no person compared it with
-a measured pass. The cost model of step 4 must not have the same fault.
+a measured pass. The cost model of step 5 must not have the same fault.
 
 ### Steps
 
-1. **Move one decision at a time from run time to build.** For each decision:
+1. **Make a list of the decisions that the engine makes while the game runs.** Read
+   `extract.wrela`, `world_draw.wrela` and `draw.wrela`. For each decision, record what it
+   depends on: the kind, the state of the game, or the eye. Put the list in this file.
+2. **Move each decision that depends only on the kind to the build.** Do one decision in one
+   change:
    - Write engine code that runs at build and makes the decision from facts and counts.
    - Keep the result as a constant of the kind.
-   - Remove the run-time code for that decision in the same change.
-2. **Start with the decisions that depend only on the kind.** Today a batch finds while the game
-   runs if its kind has a skin and if its mesh changes shape (`is_skinned` and `is_deformed` in
-   `lib/engine/mesh/extract.wrela`). A pool finds while the game runs if its things share one
-   mesh (`lib/engine/mesh/world_draw.wrela`). A decision that depends on the eye stays at run
-   time, for example `has_exact` and `has_seams`.
-3. **Write the frame schedule at build.** The schedule is the list of passes that a scene uses,
-   in order. A pass that no kind uses is not in the schedule.
-4. **Calculate the cost of the full frame at build.** Use the work count of each kernel and the
-   time of one unit of work on each machine. Show the cost of each pass for each machine line
-   in `tools/gate.json`. In the same change, add a check that compares each calculated cost
-   with the measured time of that pass.
-5. **Make the 50 ms rule a build error where the build knows the number of invocations.** If
-   the calculated time of one dispatch is above the limit, the build fails. The message names
-   the kernel. The host continues to refuse a dispatch whose size is known only at run time.
-6. **Show the source of each kernel.** `wrela pipelines` must name the engine function and the
-   field that made the kernel.
+   - Remove the run-time code for that decision.
+   - Pass the gate.
+3. **Leave a decision that depends on the eye at run time.** Examples are `has_exact` and
+   `has_seams`.
+4. **Write the frame schedule at build.** The schedule is the list of the passes that a scene
+   uses, in order. A pass that no kind of the scene uses is not in the schedule and has no
+   pipeline.
+5. **Calculate the cost of each pass at build,** for the M4 and for the Radeon. Add a command
+   that prints the cost of each pass and the sum. In the same change, add a check that compares
+   each calculated cost with the time of that pass from `tools/bench`.
+   - Start with the work count multiplied by the number of invocations and by the time of one
+     unit of work.
+   - The work count is a maximum and the time of one unit is a maximum. Thus the first result
+     is much larger than the measured time. To get the target, count the work that a pass does
+     in a usual frame, not its maximum.
+6. **Make the 50 ms rule a build error where the build knows the number of invocations.** Use
+   the same arithmetic as the host, so that the build and the host agree. The message names the
+   kernel. The host continues to refuse a dispatch whose size is known only at run time.
+7. **Show the source of each kernel.** `wrela pipelines` must name the engine function and the
+   kind that made the kernel.
 
 ### Done when
 
-- No scene makes a draw decision while the game runs that the build was able to make.
-- The calculated frame cost is in 20% of the measured cost on the two machines, for each scene
-  in the gate.
-- The pipeline count and the load time are not larger than before phase 4.
-- A build after an engine change is not slower than the checks that the build replaces.
+- The list of step 1 has no decision that depends only on the kind and is made at run time.
+- The calculated cost of a frame differs from the measured span by not more than 20%. This is
+  true on the two machines, for each scene of the gate.
+- The pipeline count of each scene of the gate is not larger than before phase 4.
+- The time from the start of the host to the first frame is not longer than before phase 4.
+- The build of one scene is not more than 20% slower than before phase 4.
+- No span of the gate is slower, on the two machines.
 
-Until the calculated cost is that accurate, show it as a report and make the cost model better.
-Make it a build error when it is accurate. Measure the pipeline count, the load time and the
-build time before and after each step.
+The calculated cost of a frame is a report in this phase. It is not a build error. Measure the
+pipeline count, the time to the first frame and the build time before and after each step.
 
-## 10. Phase 5: make the frame faster with proofs
+## 13. Phase 5: make the frame faster with proofs
 
 Purpose: find the work that the engine does only because a proof is missing, and remove it. Then
 decrease the cost that no proof can remove.
 
 This phase is a loop. It has no fixed list of steps.
 
-Known numbers:
+### What is known
 
-- The frame time at 1080p, in ms (`tools/gate.json`, commit `1c78609`). The bar is 16.6 ms.
+- The spans of the gate at 1080p, in ms (`tools/gate.json`, commit `1c78609`). The bar is
+  16.6 ms.
 
   | Scene | M4 | Radeon |
   | --- | --- | --- |
@@ -363,9 +565,10 @@ Known numbers:
   | 13 | 18.2 | 26.9 |
   | 14 | 21.4 | 29.0 |
 
-- A proof made single passes two times faster (`exact_box`, the exact rays of the sun).
-- Those passes are approximately 2 ms of a 17 ms frame (design notes, 2026-11-24, SCENE 10,
-  serial).
+- A proof made single passes two times faster (`exact_box`, the exact rays of the sun). Those
+  passes are approximately 2 ms of a 17 ms frame (design notes, 2026-11-24, SCENE 10). Thus a
+  faster small pass is not sufficient. The large results come from proofs that remove a full
+  class of work.
 - Many cells have no certificate. The table gives the certified cells of each kind at three
   cell sizes (`tools/wrela test game/world`, commit `1c78609`).
 
@@ -384,48 +587,51 @@ Known numbers:
   | `stack` | 100 of 100 | 99 of 100 | 63 of 100 |
   | `stage` | 100 of 100 | 99 of 100 | 98 of 100 |
 
-- Some facts are not proven (the same report, `field_facts_report`).
+- Some facts are not proven (the same command, the lines of `field_facts_report`).
   - The compiler gives no steepness for the citadel. A kind with no steepness uses the slower
     solver in its exact cells (`lib/engine/mesh/shade.wrela`).
   - The steepness of `arena_pillars` is 12,039 and that of `marble_column` is 5,720. The other
     kinds are below 2.
   - The channels of 4 of 9 kinds are not proven: `arena_courtyard`, `creature`, `marble_column`
     and `parry_arc`. Their shaders keep the NaN guards and the range guards.
-- Some counts of proof debt exist now. None is shown as a time.
+- Some counts of proof debt exist. None is shown as a time.
   - The judge of the sun counts the fields whose exact rays a frame did not trace (`untraced`
-    in `tools/gate`, 0 on the two machines at commits `605e1ad` and `1c78609`).
+    in `tools/gate`). The count is 0 on the two machines at commits `605e1ad` and `1c78609`.
   - The hole audit counts the eyes that are not settled.
   - Each batch counts its exact cells (`exact_cells` in `lib/engine/mesh/extract.wrela`).
 
-Thus a faster small pass is not sufficient. The large results come from proofs that remove a full
-class of work.
-
 ### The loop
 
-1. **Count the proof debt.** For each pass, count the pixels, cells, rays or bricks that use the
-   slow path because a certificate is missing. Start from the counts that exist.
-2. **Record the cause.** For each count, record the kind and the operation that the compiler was
-   not able to bound.
-3. **Show the proof debt in the build report.** Use the cost model of phase 4 to change each
-   count into milliseconds for each machine.
+1. **Count the proof debt.** For each pass, count the items that use a slow path because a
+   certificate or a fact is missing. An item is a pixel, a cell, a ray or a brick. Start from
+   the counts that exist.
+2. **Record the cause.** For each count, record the kind and the operation that the compiler
+   was not able to bound.
+3. **Show the proof debt as a time.** Add it to the cost command of phase 4 step 5. For each
+   machine, the command gives the milliseconds of each item.
 4. **Repair the largest item.** Make the bound tighter, or add a new type of certificate.
-5. **Measure again on the two machines.** Then do step 1 again.
+5. **Measure again on the two machines.** Pass the gate. Then do step 1 again.
+
+Do the loop until each line of "Done when" is true.
 
 ### First items for speed
 
-- **Facts that are not proven.** Find the operation that gives the citadel no steepness, and the
-  operations that give `arena_pillars` and `marble_column` a large steepness. Find the channel
-  that is not proven in each of the 4 kinds. Find the cost of each in the frame before you
-  repair it.
+Do the first two items first. Their causes are in the code today. The order of the other items
+comes from step 3 of the loop.
+
+- **Facts that are not proven.** Find the operation that gives the citadel no steepness. Find
+  the operations that give `arena_pillars` and `marble_column` a large steepness. Find the
+  channel that is not proven in each of the 4 kinds. Find the cost of each in the frame before
+  you repair it.
 - **Certificates at 8 cm.** The things of the parry and the creature have the fewest:
   `glass_shard` 6 of 100, `rival_orb` 2 of 60, `parry_arc` 14 of 60, `creature` 0 of 25.
-- **Detail by distance.** A certificate shows that a coarse mesh is in one pixel of the field at
-  a given distance. Then the engine draws a far thing with the coarse mesh.
+- **Detail by distance.** A certificate shows that a coarse mesh is not more than one pixel
+  from the field at a given distance. Then the engine draws a far thing with the coarse mesh.
 - **A mesh that stays correct for some frames.** A proof gives the maximum rate at which a field
   changes. Then the engine keeps the mesh of a thing that moves for more than one frame.
 - **Rewrites that the compiler proves equal.** The compiler finds a form of a field that costs
-  less. It proves that the two forms are equal in a tolerance. Then the same shape, written by
-  two different methods, has the same cost.
+  less. It proves that the two forms are equal in a tolerance. Then one shape, written by two
+  different methods, has one cost.
 - **Small items.** Remove an index clamp or a NaN guard that a proof makes unnecessary. Use half
   floats where a proof shows that they are safe. Do these only when the work is small.
 
@@ -451,53 +657,59 @@ class of work.
    give the same result each time.
 4. Do not add a general solver to the build. Its time changes much with a small change of its
    input, and its limit is a time.
-5. Do not write a proof about a driver or about the rasteriser. We do not control them.
-6. The judges and the reference must continue to find a wrong proof (rule 3 of section 3).
+5. Do not write a proof about a driver or about the rasteriser. The project does not control
+   them.
+6. The judges and the reference must continue to find a wrong proof (rule 3 of section 6).
 
 ### The cost that no proof removes
 
-The cost of a shade pass is for each pixel. A proof does not decrease it.
+The cost of a shade pass is a cost for each pixel. A proof does not decrease it.
 
-1. Find the passes with the largest cost in the report of phase 4.
+1. Find the passes with the largest cost in the cost command of phase 4 step 5.
 2. If a pass has no proof debt, make the pass faster by a change to its method.
 3. Measure before and after on the two machines.
 
 ### Done when
 
-- The proof debt is less than 5% of the frame time, for each scene in the gate, on the two
-  machines.
-- Each scene in the gate is in 16.6 ms at 1080p on the M4.
-- No scene in the gate is slower on the Radeon than before phase 5.
-- The judges and the hole audit give results that are not worse.
+- The proof debt is less than 5% of the span, for each scene of the gate, on the two machines.
+- The span of each scene of the gate is not more than 16.6 ms on the M4.
+- No span of the gate is larger on the Radeon than before phase 5.
+- The judge of the sun and the hole audit give results that are not worse.
 
-## 11. Work that is not in this plan
+## 14. Work that is not in this plan
 
 | Idea | Why it is not here | Look again when |
 | --- | --- | --- |
 | Move the engine code into the Rust toolchain | The engine changes the most, and a toolchain build is the slowest edit. The engine also loses the checks that wrela gives it | Do not look again |
-| A compiler on the server for spells that players write | It is necessary only if players write new fields. The design of spells is not decided | Phase 4 is done and 0.3 gives a build time |
+| A compiler on the server for spells that players write | It is necessary only if players write new fields. The design of spells is not decided | Phase 4 is done and phase 0.3 gives a build time |
 | A compiler in the client | It adds an attack surface and many pipelines | A cost table for the GPU of the player is necessary |
 | A general solver in the build | Its time is not stable, so two machines can get different builds. A search with a limit in steps, and a certificate that the build only examines, do the same job (phase 5) | Do not look again |
-| A search that finds the frame schedule | The result is difficult to explain, and a time measurement is not stable | Phase 4 step 4 is accurate |
+| A search that finds the frame schedule | The result is difficult to explain, and a time measurement is not stable | The cost of phase 4 step 5 is in its target |
 | A server target and a wire format from the same fields | It is a second back end | The rules of the game need the field of a spell on the server |
 | Cost proofs for each pair of spells | The spells do not exist | The first two spells that answer each other exist |
 
-## 12. Questions that are open
+## 15. Questions that are open
 
-Each question has the phase that must answer it.
+Each question has the step that must answer it. Write the answer here when you have it.
 
-1. Can a build-time constant hold some megabytes of cook data? (phase 3, step 1)
-2. Can the capture or the hand-over of the host carry mesh buffers? (phase 3, step 1)
-3. Which part of safe math on Metal caused the loss of 91%? (phase 0.1)
-4. Does the Radeon round division and square root correctly for all inputs? (phase 1, step 4)
-5. What error limit does WGSL give to `sin` and `cos`? The value 2⁻¹¹ is from memory. Read the
-   specification before step 7 of phase 1.
+1. Which part of safe math on Metal caused the loss of 91%? (phase 0.1, step 7)
+2. Are the fragment kernels of the exact cells geometry kernels? They find where matter is, but
+   the rasteriser selects their pixels. (phase 0.1, step 8)
+3. Does each GPU round division and square root correctly for all inputs? (phase 1, step 4)
+4. What error limit does WGSL give to `sin` and `cos`? The code uses 2⁻¹¹. Read the
+   specification of WGSL before phase 1 step 8.
+5. Do the grids of two eyes put a cell in the same position? The grids of one batch share one
+   origin. It is not known if the origin is the same for each eye. (phase 3, step 1)
+6. How does the game get the cook: from a file that the host loads, or from `embed`? `embed`
+   needs the file in the package, and GPU code cannot hold its bytes. (phase 3, step 6)
+7. How large is the cook of one scene? (phase 3, step 3)
 
-## 13. How to keep this plan
+## 16. How to keep this plan
 
 This file is the plan. Keep it in `docs/plans/`.
 
-- When a phase is done, write "Done" and the date at its heading. Put the measurements in the
-  commit message.
+- When a phase is done, write "Done", the date and the commit at its heading.
+- When a measurement of this plan has a result, write the result in the "What is known" list of
+  its phase.
 - If a step or a target changes, change it here in the same change.
 - When all phases are done, remove this file.
