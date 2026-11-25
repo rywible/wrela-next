@@ -104,7 +104,6 @@ An agent starts each run with the `colab` command. No person starts a run. Secti
 
 1. Use the L4 GPU with MuJoCo Warp. Start each run with the run tool of 0.5, not with
    `colab run`.
-
 2. Do the first run of new work at a small size. Read the times before a larger run.
 3. Write a checkpoint not less than one time each 10 minutes. A run must continue from its last
    checkpoint after the session stops.
