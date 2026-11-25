@@ -1,0 +1,264 @@
+// A section swept along a curve: an `Outline`'s closed section carried along a cubic Bézier path,
+// its frame turning about the path as little as the path lets it (a rotation-minimizing frame, by
+// Wang, Jüttler, Zheng and Liu's double reflection, 2008), its ends square. An arched strap, a
+// tendril, a ribbon, a curved handle.
+//
+// The path is cut into `SWEEP_PIECES` straight pieces between points on the curve. Each piece is a
+// prism of the section (`extrusion`: exact), lengthened at each inner end by the section's reach
+// times the tangent of half the turn there (its miter), so a bend leaves no gap on its outside;
+// the sweep is their union, the least of their distances: never more than the true distance to
+// the union, and of steepness 1. The section is turned at each piece as the frame stands at its
+// start, held square to the piece. Its bound is the control polygon's (a Bézier curve lies in its
+// control points' convex hull, by the Bernstein basis's partition of unity) widened by the
+// section's reach. How near the pieces follow the curve: a 16th of its length a piece, so a strap
+// of a 60 cm arc bowing 15 cm departs from the true curve by under half a millimetre (the chord's
+// sagitta: L² κ / 8 a piece).
+
+use engine::matter::verify::verify_surface_soundness
+use shapes::made::{Shaped, Story, exposure_of, stepped, stepped_near, story}
+use shapes::outline::{Outline, outline}
+use std::cmp::Eq
+use std::derive::{Box3, Interval}
+use std::field::{Bound, Live, Pruned, Surface, check_lipschitz}
+use std::hash::{StateHash, state_hash}
+
+/// How many straight pieces a sweep's path is cut into.
+pub const SWEEP_PIECES: u32 = 24
+
+/// A closed section (`Outline`, its (u, v) the frame's) swept along a path through `at` (the
+/// curve's points, `SWEEP_PIECES + 1` of them), its frame at each (`u`, `v`), each inner point's
+/// miter (`miter`, m), and how far the section reaches from its origin (`reach`).
+pub struct Sweep<const N: u32>: Copy + GpuData + Eq + StateHash {
+    pub section: Outline<N>,
+    pub at: [vec3; 25],
+    pub u: [vec3; 25],
+    pub v: [vec3; 25],
+    pub miter: [f32; 25],
+    pub reach: f32,
+    pub hull_lo: vec3,
+    pub hull_hi: vec3,
+}
+
+/// The cubic Bézier through control points `c` at `t`, and its tangent (not unit).
+fn bezier(c: [vec3; 4], t: f32) -> (vec3, vec3) {
+    let s = 1.0 - t
+    let p = c[0] * (s * s * s) + c[1] * (3.0 * s * s * t) + c[2] * (3.0 * s * t * t) + c[3] * (t * t * t)
+    let d = (c[1] - c[0]) * (3.0 * s * s) + (c[2] - c[1]) * (6.0 * s * t) + (c[3] - c[2]) * (3.0 * t * t)
+    (p, d)
+}
+
+/// A section (its points (u, v) and bulges, as an `Outline`) swept along the cubic Bézier path
+/// through control points `path`, its `u` turned at the start as near `up` as the path lets it.
+pub fn sweep<const N: u32>(points: [vec2; N], bulges: [f32; N], path: [vec3; 4], up: vec3) -> Sweep<N> {
+    let section = outline(points, bulges)
+    let reach = section.reach(vec2(0.0))
+    var at = [vec3(0.0); 25]
+    var tang = [vec3(0.0); 25]
+    for i in 0..(SWEEP_PIECES + 1) {
+        let (p, d) = bezier(path, f32(i) / f32(SWEEP_PIECES))
+        at[i] = p
+        tang[i] = normalize(d)
+    }
+    // Rotation-minimizing frames by double reflection: reflect the frame across the plane
+    // bisecting the step, then across the one taking the reflected tangent to the next.
+    var u = [vec3(0.0); 25]
+    var v = [vec3(0.0); 25]
+    let u0 = up - tang[0] * dot(up, tang[0])
+    u[0] = normalize(if dot(u0, u0) > 1.0e-12 { u0 } else { cross(tang[0], vec3(1.0, 0.0, 0.0)) })
+    v[0] = cross(tang[0], u[0])
+    for i in 0..SWEEP_PIECES {
+        let v1 = at[i + 1] - at[i]
+        let c1 = dot(v1, v1)
+        let r_l = u[i] - v1 * (2.0 / c1 * dot(v1, u[i]))
+        let t_l = tang[i] - v1 * (2.0 / c1 * dot(v1, tang[i]))
+        let v2 = tang[i + 1] - t_l
+        let c2 = dot(v2, v2)
+        let r = if c2 > 1.0e-14 { r_l - v2 * (2.0 / c2 * dot(v2, r_l)) } else { r_l }
+        u[i + 1] = normalize(r)
+        v[i + 1] = cross(tang[i + 1], u[i + 1])
+    }
+    // Each inner point's miter: the section's reach times the tangent of half the pieces' turn.
+    var miter = [0.0; 25]
+    for i in 1..SWEEP_PIECES {
+        let a = normalize(at[i] - at[i - 1])
+        let b = normalize(at[i + 1] - at[i])
+        let c = clamp(dot(a, b), -1.0, 1.0)
+        let half = 0.5 * acos(c)
+        miter[i] = reach * tan(min(half, 1.4)) + 1.0e-5
+    }
+    var lo = path[0]
+    var hi = path[0]
+    for k in 1..4 {
+        lo = min(lo, path[k])
+        hi = max(hi, path[k])
+    }
+    Sweep {
+        section,
+        at,
+        u,
+        v,
+        miter,
+        reach,
+        hull_lo: lo - vec3(reach),
+        hull_hi: hi + vec3(reach),
+    }
+}
+
+/// The distance of a prism from its section's distance and how far past its end: exact.
+fn extrusion(w: vec2) -> f32 {
+    min(max(w.x, w.y), 0.0) + length(max(w, vec2(0.0)))
+}
+
+impl<const N: u32> Sweep<N> {
+    /// Piece `i`'s section distance and how far past its ends `p` is, and the section's sum there.
+    fn piece(self, p: vec3, i: u32) -> (vec2, f32) {
+        let a = self.at[i]
+        let d = self.at[i + 1] - a
+        let len = length(d)
+        let t = d / max(len, 1.0e-9)
+        let fu = self.u[i] - t * dot(self.u[i], t)
+        let uu = fu / max(length(fu), 1.0e-9)
+        let vv = cross(t, uu)
+        let q = p - a
+        let along = dot(q, t)
+        let s = self.section.at(vec2(dot(q, uu), dot(q, vv)))
+        let past = max(-(along + self.miter[i]), along - (len + self.miter[i + 1]))
+        (vec2(s.distance(), past), s.bend)
+    }
+
+    /// How far `p` is from piece `i`'s axis (lengthened by its miters), less the section's reach:
+    /// no point of the piece's prism is nearer.
+    fn axis_least(self, p: vec3, i: u32) -> f32 {
+        let a = self.at[i]
+        let d = self.at[i + 1] - a
+        let len2 = max(dot(d, d), 1.0e-18)
+        let h = clamp(dot(p - a, d) / len2, 0.0, 1.0)
+        length(p - a - d * h) - self.reach - max(self.miter[i], self.miter[i + 1])
+    }
+
+    /// The nearest piece's prism distance and the section's sum there: the piece whose axis is
+    /// nearest asked first, then only those whose axis could hold a nearer point (exact: the
+    /// least of every prism's distance).
+    fn nearest(self, p: vec3) -> (f32, f32) {
+        var first: u32 = 0
+        var first_d = 1.0e30
+        for i in 0..SWEEP_PIECES {
+            let d = self.axis_least(p, i)
+            if d < first_d {
+                first_d = d
+                first = i
+            }
+        }
+        let (w0, b0) = self.piece(p, first)
+        var best = extrusion(w0)
+        var bend = b0
+        for i in 0..SWEEP_PIECES {
+            if i != first && self.axis_least(p, i) < best {
+                let (w, b) = self.piece(p, i)
+                let dd = extrusion(w)
+                if dd < best {
+                    best = dd
+                    bend = b
+                }
+            }
+        }
+        (best, bend)
+    }
+}
+
+impl<const N: u32> Surface for Sweep<N> {
+    fn interval_near(self, b: Box3) -> Interval {
+        stepped_near(self, b)
+    }
+
+    fn pruned<F: Copy + fn(vec3) -> vec3>(
+        self,
+        over: Box3,
+        at: F,
+        stretch: f32,
+        live: Live,
+        first: u32,
+    ) -> Pruned {
+        stepped(self, over, at, stretch, live)
+    }
+
+    @budget(work: 4096)
+    fn distance(self, p: vec3) -> f32 {
+        self.nearest(p).0
+    }
+
+    fn bound(self) -> Bound {
+        let c = 0.5 * (self.hull_lo + self.hull_hi)
+        Bound { centre: c, radius: length(self.hull_hi - c), slope: 1.0 }
+    }
+
+    fn lipschitz(self, near: f32) -> f32 {
+        1.0
+    }
+
+    fn rigid_shape_hash(self) -> Option<u64> {
+        Some(state_hash(self))
+    }
+}
+
+impl<const N: u32> Shaped for Sweep<N> {
+    fn shaped(self, p: vec3) -> (f32, Story) {
+        let (d, bend) = self.nearest(p)
+        (d, story(exposure_of(bend)))
+    }
+}
+
+/// A strap 2 cm wide and 4 mm thick, its edges eased, arched over 60 cm, bowing 15 cm.
+fn strap() -> Sweep<4> {
+    sweep(
+        [vec2(-0.002, -0.01), vec2(0.002, -0.01), vec2(0.002, 0.01), vec2(-0.002, 0.01)],
+        [0.0, 0.0008, 0.0, 0.0008],
+        [vec3(-0.3, 0.0, 0.0), vec3(-0.15, 0.2, 0.0), vec3(0.15, 0.2, 0.0), vec3(0.3, 0.0, 0.0)],
+        up: vec3(0.0, 1.0, 0.0),
+    )
+}
+
+@test
+fn a_sweep_follows_its_curve_and_is_sound() {
+    let s = strap()
+    let path = [vec3(-0.3, 0.0, 0.0), vec3(-0.15, 0.2, 0.0), vec3(0.15, 0.2, 0.0), vec3(0.3, 0.0, 0.0)]
+    // Every point of the curve is inside the strap, and a point 2 cm off it, square to the
+    // strap's face, is about 1 cm out (its half width), wherever along it.
+    for k in 0..9 {
+        let t = (f32(k) + 0.5) / 9.0
+        let (c, d) = bezier(path, t)
+        assert(s.distance(c) < 0.0, f"the curve's point at {t} is inside the strap")
+        let side = vec3(0.0, 0.0, 1.0)
+        let off = s.distance(c + side * 0.02)
+        assert(abs(off - 0.01) < 0.0015, f"2 cm off the curve at {t}, the strap's face is {off} away, not 1 cm")
+        // Square to the face the frame's `u` (the arch's own normal, in its plane): 2 mm half
+        // thick.
+        let n = normalize(cross(vec3(0.0, 0.0, 1.0), normalize(d)))
+        let above = s.distance(c + n * 0.006)
+        assert(abs(above - 0.004) < 0.001, f"6 mm off the curve across its thickness at {t}: {above}, not 4 mm")
+    }
+    // Its ends are square: 5 mm past the start, along the curve's tangent, 5 mm out.
+    let (c0, d0) = bezier(path, 0.0)
+    let past = s.distance(c0 - normalize(d0) * 0.005)
+    assert(abs(past - 0.005) < 0.0005, f"5 mm past the strap's end: {past}")
+    // The bound holds it all (the hull widened by its reach).
+    let b = s.bound()
+    for k in 0..9 {
+        let (c, _) = bezier(path, f32(k) / 8.0)
+        assert(length(c - b.centre) <= b.radius, "the bound holds the curve")
+    }
+}
+
+/// (Its intervals take every piece over a box: more work than a test's usual fuel.)
+@test
+@fuel(2 ** 41)
+fn a_sweep_is_as_steep_as_it_says() {
+    let s = strap()
+    check_lipschitz(s, near: 0.05, l: s.lipschitz(0.05))
+}
+
+@test
+@fuel(2 ** 41)
+fn a_sweep_is_sound() {
+    verify_surface_soundness(strap(), "kit_sweep")
+}

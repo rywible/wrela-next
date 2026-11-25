@@ -39,7 +39,10 @@ first and a model comes last and has to earn its place. The ladder, and what of 
    moulding), `banded` (a section run round a plan: an apron, a frame), `extruded` (a rail),
    `board` (eased edges), `joined` (two parts with their seam showing), `folded` (one part at the
    corners of a symmetric whole), `placed`, `grown` (leather over a board), `sheathed` (a sheet of
-   brass over a corner). Profiles and sections are **outlines** (`kit::shapes::outline`): points
+   brass over a corner), `sweep` (`kit::shapes::sweep`: a section carried along a cubic Bézier,
+   its frame turning as little as the path lets it: an arched strap, a tendril, a curved handle;
+   24 mitered prisms of the section, their union exact as a bound and of steepness 1, held to the
+   curve by a test, a strap of a 60 cm arc within half a millimetre). Profiles and sections are **outlines** (`kit::shapes::outline`): points
    joined by segments, each straight or bowed into an arc by its bulge, so a bead is one number,
    a cove one, an ogee two, and a turned leg is fourteen points where a polygon would need a
    hundred.
@@ -158,12 +161,9 @@ Gaps filed (an author needed this, for that):
 - **A thing still has one uniform cell size.** `size_floor = r / 180` keeps all existing scenes
   within the 8,192-brick batch budget; view-adaptive per-brick LOD (bricks nearer the eye finer,
   with seams kept closed) remains the general engine fix for even finer hero-distance carving.
-- **A scene's kinds of thing share one shader.** The SDF clipmap's splat (`sdf_splat_boxes`)
-  holds every kind of thing's distance code in one pipeline: SCENE 13 (the stage, the table, the
-  grimoire) reached 290 KiB of MSL, over Metal's 288, when outlines kept a record of each segment
-  worked out (8 floats); with the record cut to 5 the whole gold set fits, near the line. A scene's
-  variety of things is bounded by one shader's size, which a world of many authored assets will
-  pass.
+- ~~A scene's kinds of thing share one shader~~: closed 2026-11-24 by taking away the shader
+  size budget (Metal's 288 KiB of MSL): a pipeline is held to its weight and kept bytes alone, so
+  the SDF clipmap's one splat may hold as many kinds of thing as a world has.
 - **Work a segment needs once is asked at every pixel.** An outline's arcs (their centres and
   radii) depend only on the asset's numbers, yet the shading pass computed them at every pixel:
   the compiler refused the candlestick's 22 of them (E0712, 304 work). Outlines now work each
