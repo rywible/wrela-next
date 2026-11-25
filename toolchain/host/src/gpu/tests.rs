@@ -1160,8 +1160,8 @@ mod target_tests {
 
 /// A serial run times a dispatch that launches no groups as itself: an indirect one whose
 /// arguments a kernel just wrote as zero groups (an extraction chunk past the last brick), and a
-/// direct one of zero groups (`ComputePass::anchor` in `wrela_gpu`'s Metal backend; docs/design.md,
-/// "Serial timestamps of empty passes"). The direct one fails on the M4 without the anchor; the
+/// direct one of zero groups (`ComputePass::anchor` in `wrela_gpu`'s Metal backend). The direct
+/// one fails on the M4 without the anchor; the
 /// indirect ones cover the path SCENE 10 takes, which this small case sampled correctly even
 /// before.
 #[test]

@@ -1663,8 +1663,7 @@ pub struct ComputePass<'a> {
     ///
     /// An Apple GPU samples an encoder's start as its first threadgroup launches, so an encoder
     /// that launches none keeps a stale start; before a dispatch that may launch none, a timed
-    /// pass launches the anchor's one thread (docs/design.md, "Serial timestamps of empty
-    /// passes").
+    /// pass launches the anchor's one thread.
     anchor: Option<Id<dyn MTLComputePipelineState>>,
     keep: &'a mut Vec<Arc<Group>>,
     table: Arc<Table>,

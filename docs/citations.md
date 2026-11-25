@@ -7,13 +7,13 @@ is in `rywible/wrela`'s `docs/process.md`.
 
 Claude and Codex agents write almost all of the code, tests and docs; Ryan decides the goals and
 the architecture, and merges every change. No generative image, sound, music, voice or video
-model makes anything that ships here. The forge (docs/forge.md) may use an image model and an
+model makes anything that ships here. The forge (`tools/forge`) may use an image model and an
 image-to-3D model to make reference material for an agent to fit a program to; that material
 stays in the git-ignored `.forge/`, nothing in `game/` or `lib/` reads it, and each asset's
 provenance record names the models, versions, prompts and seeds. None has been run yet.
 
-The engine was begun again on a clean slate on 2026-11-18 (branch `engine`, merged into `backend`;
-docs/design.md), and replaced its per-pixel raymarcher (`Sight`, `lib/engine/picture/pixels.wrela`,
+The engine was begun again on a clean slate on 2026-11-18 (branch `engine`, merged into `backend`),
+and replaced its per-pixel raymarcher (`Sight`, `lib/engine/picture/pixels.wrela`,
 `lib/engine/matter/{cells,asked,cost}.wrela`, `lib/engine/light/{moving,store}.wrela`,
 `lib/engine/ray/ray.wrela`, each now in git history) with universal GPU surface meshlets
 (`lib/engine/mesh/`) on 2026-11-20. A row below that names a removed legacy file says so, and
@@ -233,7 +233,7 @@ zlib fixtures in `toolchain/tests/png` are generated patterns that Claude made w
 
 ## The forge
 
-The authoring pipeline from a brief to a gold asset (docs/forge.md, `tools/forge`). No code was
+The authoring pipeline from a brief to a gold asset (`tools/forge`). No code was
 copied from any of these.
 
 | Source | Rights | How and why we use it |
@@ -253,11 +253,11 @@ copied from any of these.
 
 | Source | Rights | How and why we use it |
 |---|---|---|
-| Valve's [Steam Hardware & Software Survey](https://store.steampowered.com/hwsurvey/), October 2026, as reported by [Windows Report](https://windowsreport.com/?p=1514336), [Guru3D](https://www.guru3d.com/story/steam-hardware-survey-october-2026-16-gb-ram-regains-lead-over-32-gb/) and [DLCompare](https://www.dlcompare.com/gaming-news/rtx-5070-loses-its-lead-as-rtx-3060-makes-a-stunning-steam-survey-comeback-87806): the RTX 3060 at or tied for the most common card (3.6 to 3.8% of systems), 16 GB the most common memory (41%), 1080p the most common screen (about half, by the August figure) | Published figures, read second-hand; Valve's own page was not read | `docs/design.md`, "What it must run on": the bar is the most common Steam hardware. The ratio of that card to the M4 Air there is our own estimate, not from these |
+| Valve's [Steam Hardware & Software Survey](https://store.steampowered.com/hwsurvey/), October 2026, as reported by [Windows Report](https://windowsreport.com/?p=1514336), [Guru3D](https://www.guru3d.com/story/steam-hardware-survey-october-2026-16-gb-ram-regains-lead-over-32-gb/) and [DLCompare](https://www.dlcompare.com/gaming-news/rtx-5070-loses-its-lead-as-rtx-3060-makes-a-stunning-steam-survey-comeback-87806): the RTX 3060 at or tied for the most common card (3.6 to 3.8% of systems), 16 GB the most common memory (41%), 1080p the most common screen (about half, by the August figure) | Published figures, read second-hand; Valve's own page was not read | What the game must run on: the bar is the most common Steam hardware. The ratio of that card to the M4 Air there is our own estimate, not from these |
 
 ## Directions the engine's design names
 
-Read as methods (`docs/design.md`, "Directions, not yet measured"); where one is built, its row
+Read as methods; where one is built, its row
 says where. No code was copied.
 
 | Source | Rights | How and why we use it |
@@ -271,10 +271,10 @@ says where. No code was copied.
 | J. F. Blinn, "Simulation of Wrinkled Surfaces" (*SIGGRAPH* 1978); M. Mikkelsen (2010, cited above), the surface gradient | Published methods | `lib/engine/mesh/shade.wrela` (`apply_micro_relief`, `micro_field_grad`): a `Substance`'s `micro` relief tilts the shading normal by a solid 3D wave field's gradient projected onto the tangent plane, with no texture coordinates, faded out with distance, and erased at build time when `FieldFacts::has_micro` is false |
 | L. Latta, "Building a Million Particle System" (*Game Developers Conference* 2004) | Published talk | `lib/engine/mesh/swarm.wrela` (`SwarmSim`): grain state kept in two GPU buffers swapped each step (ping-pong), advanced by a kernel under the swarm's force field, and collided against the scene; our collision asks the world's exact signed distance (and its gradient on contact) instead of a depth buffer |
 | W. T. Reeves, D. H. Salesin and R. L. Cook, "Rendering Antialiased Shadows with Depth Maps" (*SIGGRAPH* 1987); L. Williams (1978, cited above) | Published methods | `lib/engine/mesh/shade.wrela` (`shadow_vs`, which reads its view from a buffer) and `lib/engine/mesh/sunlight.wrela`: orthographic sun shadow maps (the world's, its still casters cached, and the eye's, fitted each frame) drawn with no depth bias and read only at a receiver plane's exact depth (`sun_map_vis`, `sun_classify_fs`); the 4-tap PCF with normal-offset bias (`sun_shadow`) is in git history |
-| A. F. T. Martins and R. F. Astudillo, "From Softmax to Sparsemax: A Sparse Model of Attention and Multi-Label Classification" (*ICML* 2016) | Published method | The crowd's direction in `docs/design.md`: a least over weights on the simplex with a quadratic penalty has a closed form on its active set and weights that are exactly zero away from the least; read as the form for a smooth union of many parts that does not depend on their order. Not built. |
+| A. F. T. Martins and R. F. Astudillo, "From Softmax to Sparsemax: A Sparse Model of Attention and Multi-Label Classification" (*ICML* 2016) | Published method | The crowd's direction: a least over weights on the simplex with a quadratic penalty has a closed form on its active set and weights that are exactly zero away from the least; read as the form for a smooth union of many parts that does not depend on their order. Not built. |
 | E. Persson, "Geometric Antialiasing Methods" (*GPU Pro 3*, 2012), the method known as geometry buffer anti-aliasing | Published method | "The frame costs by the pixel": a pixel keeps how far its nearest outline is and which way it runs, and one pass blends it with the neighbour across that outline. Ours takes the distance from the field's least along the ray, not from a triangle's edge. Not built |
 | C. Burns and W. Hunt, "The Visibility Buffer: A Cache-Friendly Approach to Deferred Shading" (*Journal of Computer Graphics Techniques* 2(2), 2013); T. Möller and B. Trumbore, "Fast, Minimum Storage Ray-Triangle Intersection" (*Journal of Graphics Tools* 2(1), 1997) | Published methods | Built in `lib/engine/mesh/visbuf.wrela` (`vis_mesh_vs`, `vis_fs`, `vis_classify`, `vis_tile_vs`, `vis_resolve_*_fs`, `vis_bary`): `mesh_eye` writes only a 64-bit `Rg32Uint` `(batch_inst_kind, prim_id)` visibility ID and reversed-Z depth with zero material work during rasterisation; a 16×16 screen-tile compute classifier builds dense per-batch tile lists; and tile-quad resolve draws compute exact perspective-correct barycentrics and exact analytical screen-space partial derivatives via world-space ray-triangle intersection (exact even on near-plane-straddling triangles, with zero overdraw and zero 2×2 helper-lane overshading) |
-| B. Karis, R. Stubbe and G. Wihlidal, "Nanite: A Deep Dive" (*SIGGRAPH* 2021, Advances in Real-Time Rendering in Games) | Published talk | The same section, as the worked example of a frame whose cost follows pixels and not what is in the world: small pieces rasterised in compute, large ones by hardware, into one visibility buffer; detail chosen by size on screen. Read as a method; ours has no triangles and nothing made before the game runs. Its two-pass occlusion culling (draw what last frame's depth pyramid says is visible, build a pyramid from that, re-test what was culled) is built for crowds in `lib/engine/mesh/cull.wrela` (a `Pool`'s instances), with N. Greene, M. Kass and G. Miller, "Hierarchical Z-Buffer Visibility" (*SIGGRAPH* 1993) and G. Wihlidal, "Optimizing the Graphics Pipeline with Compute" (*GDC* 2016) for the min-depth pyramid and a box's test against it. Per-brick culling was built, measured and taken out (docs/design.md, 2026-11-22). The visibility buffer and compute rasterisation are not built |
+| B. Karis, R. Stubbe and G. Wihlidal, "Nanite: A Deep Dive" (*SIGGRAPH* 2021, Advances in Real-Time Rendering in Games) | Published talk | The same section, as the worked example of a frame whose cost follows pixels and not what is in the world: small pieces rasterised in compute, large ones by hardware, into one visibility buffer; detail chosen by size on screen. Read as a method; ours has no triangles and nothing made before the game runs. Its two-pass occlusion culling (draw what last frame's depth pyramid says is visible, build a pyramid from that, re-test what was culled) is built for crowds in `lib/engine/mesh/cull.wrela` (a `Pool`'s instances), with N. Greene, M. Kass and G. Miller, "Hierarchical Z-Buffer Visibility" (*SIGGRAPH* 1993) and G. Wihlidal, "Optimizing the Graphics Pipeline with Compute" (*GDC* 2016) for the min-depth pyramid and a box's test against it. Per-brick culling was built, measured and taken out (2026-11-22). The visibility buffer and compute rasterisation are not built |
 | The Vello renderer (Linebender; https://github.com/linebender/vello) | Apache-2.0 or MIT. No code copied | The same section: shapes listed by screen tile, a coarse pass and a fine kernel that computes a pixel's exact cover from the shapes its tile lists. Read as the shape of the eye's kernel. Not built |
 | O. Olsson, M. Billeter and U. Assarsson, "Clustered Deferred and Forward Shading" (*High Performance Graphics* 2012) | Published method | The same section: what can matter to a pixel is found through lists a cell of space holds, filled once a frame. The shape of light's index. Not built |
 | C. Crassin, F. Neyret, M. Sainz, S. Green and E. Eisemann, "Interactive Indirect Illumination Using Voxel Cone Tracing" (*Computer Graphics Forum* 30(7), 2011) | Published method | Built in `lib/engine/mesh/light.wrela` (cited above): a 3-level world-space radiance volume injected from all still and moving meshlets with 4-cone hemisphere tracing (`cone_indirect`) and volumetric sampling (`volume_indirect`) |

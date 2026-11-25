@@ -1,4 +1,4 @@
-//! The compiler's bar (docs/design.md; docs/rates.md): what the compiler moves to an earlier rate
+//! The compiler's bar: what the compiler moves to an earlier rate
 //! by itself, on the fixtures that put the hand's moves back as first written
 //! (toolchain/tests/rates), and what it says where it can't (W0014, language.md §18.13).
 
