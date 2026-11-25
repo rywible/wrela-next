@@ -11,7 +11,7 @@ use mesh::grid::{
     eval_dqs, is_heavy_field, owner_of, pack_kept, pack_vertex_meta, safe_norm, unpack_is_trans,
     unpack_oct_normal, unpack_smooth, unpack_thing, with_along,
 }
-use mesh::octree::{corner_on_coarser_seam, nbr_has_coarser}
+use mesh::octree::{NBR_FLAG_UNREFINED, corner_on_coarser_seam, nbr_has_coarser}
 use std::derive::{Box3, affine_form, value_and_gradient}
 use std::field::{ALL_LIVE, DualQuat, Field, Live}
 use std::gpu::{Append, Atomics, DispatchArgs, GlobalId, One, Slots, limits}
@@ -934,6 +934,32 @@ pub(package) fn claim_exact_cell(
     (exact_seen.or(i: word, value: bit) & bit) == 0
 }
 
+/// Whether a face neighbour of the all-outside cell `(cx, cy, cz)` in the brick (its corners from
+/// `base`) has a corner inside: a surface beside it, meshed there, whose outline's exact cells cover
+/// what of it reaches into this cell. (A neighbour past the brick's corners counts as not.)
+fn surface_beside(corners: [f32], base: u32, cx: u32, cy: u32, cz: u32) -> bool {
+    var inside = false
+    for a in 0..3 {
+        for side in 0..2 {
+            let at = if a == 0 { cx } else if a == 1 { cy } else { cz }
+            if (side == 0 && at >= 1) || (side == 1 && at + 2 <= 7) {
+                let far = if side == 0 { at - 1 } else { at + 2 }
+                for k in 0..4 {
+                    let u = k & 1
+                    let w = k >> 1
+                    let x = if a == 0 { far } else { cx + u }
+                    let y = if a == 1 { far } else if a == 0 { cy + u } else { cy + w }
+                    let z = if a == 2 { far } else { cz + w }
+                    if cdist(corners, base, x, y, z) < 0.0 {
+                        inside = true
+                    }
+                }
+            }
+        }
+    }
+    inside
+}
+
 /// Pass 2a: Classifies every cell of a chunk (`7×7×7 = 343` per brick) from its 8 corner signs,
 /// clears its vertex slot and deduplication bit, appends sign-changing cells to `surf`, and appends
 /// all-positive owned cells whose minimum corner distance falls within `lip * half_diag` to
@@ -986,9 +1012,12 @@ pub(package) fn classify_cells(
         let g = grids[ab.coord.w]
         let thresh = max(lip, 1.0) * 0.8660254 * g.cell
         // By Mean Value Theorem, any point `p` in the cell with `f(p) <= 0` lies within
-        // `0.5 * sqrt(3) * h = 0.8660254 * h` of its nearest corner, so `min_d <= lip * 0.866 * h`
-        // is a 100% sound filter that never drops protruding thin features next to a meshed face.
-        if min_d <= thresh {
+        // `0.5 * sqrt(3) * h = 0.8660254 * h` of its nearest corner. On temporarily unrefined coarse
+        // bricks (`NBR_FLAG_UNREFINED`), test all `min_d <= thresh` cells so protruding sub-cell
+        // features never slip past on cold frame 0; on refined bricks, skip cells beside a meshed
+        // surface whose outline cells already cover the boundary.
+        let unrefined = (ab.nbr_hi & NBR_FLAG_UNREFINED) != 0
+        if min_d <= thresh && (unrefined || !surface_beside(corners, cbase, cx, cy, cz)) {
             let cell_lo = brick_corner(g, ab.coord.xyz, vec3u(cx, cy, cz))
             if !finer_than_a_hole(cell_lo, g.cell, exact_eye) {
                 let _ = thin_cands.push((brick_in_chunk << 9) | cell)

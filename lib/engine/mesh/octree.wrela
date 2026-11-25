@@ -28,6 +28,12 @@ pub const NODE_INTERNAL: u32 = 2
 pub const NBR_SAME: u32 = 0
 pub const NBR_FINER: u32 = 1
 pub const NBR_COARSER: u32 = 2
+/// Bitmask covering the 22 neighbor bits in `ActiveBrick::nbr_hi` (`slots 16..26`).
+pub const NBR_HI_MASK: u32 = 4194303
+/// Flag bit in `ActiveBrick::nbr_hi` marking a non-planar brick that is still awaiting streaming
+/// refinement (`cell_px > 2 * fine_px`), so front-facing cells also certify against protruding
+/// sub-cell features until the brick refines; converged and planar `flat_px` bricks leave this 0.
+pub const NBR_FLAG_UNREFINED: u32 = 2147483648
 
 /// Flat index (`0..26`) of neighbor offset `(dx, dy, dz)` in `{-1, 0, +1}^3`.
 pub fn nbr_index(dx: i32, dy: i32, dz: i32) -> u32 {
@@ -61,7 +67,7 @@ pub fn nbr_has_coarser(nbr_lo: u32, nbr_hi: u32) -> bool {
 
 /// True iff any neighbor in `(nbr_lo, nbr_hi)` differs in level (`NBR_FINER` or `NBR_COARSER`).
 pub fn nbr_has_any_seam(nbr_lo: u32, nbr_hi: u32) -> bool {
-    nbr_lo != 0 || nbr_hi != 0
+    nbr_lo != 0 || (nbr_hi & NBR_HI_MASK) != 0
 }
 
 /// Neighbor state (`NBR_SAME`, `NBR_FINER`, `NBR_COARSER`) for a brick-local cell shifted by `+1`
@@ -439,7 +445,7 @@ impl BrickOctree {
         if iv.lo > 0.0 || iv.hi < 0.0 {
             return (true, 0.0)
         }
-        if work(|q: vec3| field.distance_live(q, ALL_LIVE)) > 1200 {
+        if work(|q: vec3| field.distance_live(q, ALL_LIVE)) > 5000 {
             return (false, h)
         }
         let bspan = h * f32(BRICK)
@@ -1160,16 +1166,23 @@ impl BrickOctree {
             let (lo, hi) = self.brick_box(n.level, n.bx, n.by, n.bz)
             let dist = max(length(v.at - clamp(v.at, lo, hi)), 0.004)
             let reach = 1.7320508 * eye_step(dist)
+            let h = self.cell_at(n.level)
+            let cell_px = h / (dist * px_rad)
+            let is_unrefined = n.geom_err > 0.002 * h &&
+                cell_px > fine_px * 2.0 &&
+                h * 0.5 >= eff_min_cell &&
+                n.level + 1 < MAX_OCTREE_LEVELS
+            let nhi_packed = if is_unrefined { nhi | NBR_FLAG_UNREFINED } else { nhi }
             let must_extract = n.pool_slot == NONE ||
                 n.cached_nbr_lo != nlo ||
-                n.cached_nbr_hi != nhi
+                n.cached_nbr_hi != nhi_packed
             if must_extract {
                 if n.pool_slot == NONE {
                     self.nodes[ni].pool_slot = self.next_pool_slot
                     self.next_pool_slot += 1
                 }
                 self.nodes[ni].cached_nbr_lo = nlo
-                self.nodes[ni].cached_nbr_hi = nhi
+                self.nodes[ni].cached_nbr_hi = nhi_packed
                 self.nodes[ni].cached_eye = exact_eye
                 self.nodes[ni].cached_reach = reach
                 dirty_bricks.push(
@@ -1177,7 +1190,7 @@ impl BrickOctree {
                         coord: vec4u(n.bx, n.by, n.bz, n.level),
                         live: ALL_LIVE,
                         nbr_lo: nlo,
-                        nbr_hi: nhi,
+                        nbr_hi: nhi_packed,
                     },
                 )
                 dirty_nodes.push(ni)
@@ -1191,7 +1204,7 @@ impl BrickOctree {
                 if moved {
                     eye_stale_nodes.push(ni)
                     eye_stale_lo.push(nlo)
-                    eye_stale_hi.push(nhi)
+                    eye_stale_hi.push(nhi_packed)
                     eye_stale_reach.push(reach)
                 }
             }
