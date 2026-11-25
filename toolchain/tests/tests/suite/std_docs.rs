@@ -15,7 +15,7 @@ fn documented(text: &str, comments: &[wrela_syntax::Comment], start: u32) -> boo
 #[test]
 fn every_public_std_item_has_a_doc_comment() {
     let mut missing = Vec::new();
-    for (module, text) in wrela_driver::STD_SOURCES {
+    for (module, text) in wrela_driver::STD_SOURCES.iter() {
         let parsed = wrela_syntax::parse(FileId(0), text);
         let at = |offset: u32| 1 + text[..offset as usize].matches('\n').count();
         let mut check = |name: &str, start: u32| {

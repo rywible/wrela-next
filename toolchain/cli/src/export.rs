@@ -14,14 +14,27 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::LazyLock;
 
 use serde_json::{Value, json};
 
 use crate::doc::{self, Entry, Index};
 
-pub(crate) const LANGUAGE: &str = include_str!("../../../docs/spec/language.md");
-const LEXICAL: &str = include_str!("../../../docs/spec/lexical.md");
-const GRAMMAR: &str = include_str!("../../../docs/spec/grammar.ebnf");
+/// The spec's files. A `wrela` that runs from a checkout reads each from the checkout's
+/// `docs/spec` when it is first asked for ([`wrela_diag::checkout`]), so an edit to the spec
+/// needs no build of the compiler; any other has the text it was built with.
+pub(crate) static LANGUAGE: LazyLock<&'static str> =
+    LazyLock::new(|| spec("language.md", include_str!("../../../docs/spec/language.md")));
+static LEXICAL: LazyLock<&'static str> =
+    LazyLock::new(|| spec("lexical.md", include_str!("../../../docs/spec/lexical.md")));
+static GRAMMAR: LazyLock<&'static str> =
+    LazyLock::new(|| spec("grammar.ebnf", include_str!("../../../docs/spec/grammar.ebnf")));
+
+fn spec(file: &str, built_in: &'static str) -> &'static str {
+    wrela_diag::checkout()
+        .and_then(|root| std::fs::read_to_string(root.join("docs/spec").join(file)).ok())
+        .map_or(built_in, |read| Box::leak(read.into_boxed_str()))
+}
 const REPOSITORY: &str = "https://github.com/rywible/wrela";
 
 /// A page: where it goes, its title, its one-line summary, what it is and its Markdown.

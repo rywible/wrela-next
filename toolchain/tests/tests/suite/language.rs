@@ -414,7 +414,7 @@ fn markdown_blocks(file: &str, text: &str) -> Vec<Block> {
 /// The ```wrela blocks in std's doc comments.
 fn std_blocks() -> Vec<Block> {
     let mut out = Vec::new();
-    for (module, text) in wrela_driver::STD_SOURCES {
+    for (module, text) in wrela_driver::STD_SOURCES.iter() {
         // A doc comment's text, line for line (other lines empty), is markdown.
         let docs: String = text
             .lines()

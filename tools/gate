@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""The gate a change to how anything is drawn passes before it is committed. Usage:
+"""The gate a change to how anything is drawn passes before it is called done. Usage:
 
     tools/gate [--quick] [--full] [--only layers,tests,audit,sun,frames] [--update]
                [--machine NAME] [--keep DIR]
+    tools/gate --seen [REV | REV..REV] [--machine NAME]
 
 Runs, in turn, each through the tools that already hold the machine's rules (tools/wrela,
 tools/audit, tools/bench, tools/gpu: one GPU job at a time, every dispatch under its line):
@@ -25,9 +26,27 @@ writes what was measured as the machine's new baseline, to be committed with the
 moved it and named in its message. A run with --only or --quick checks what it ran and leaves
 the rest of the baseline as it was.
 
+The builds. Every build the steps need (one a sun view, one a timed scene, one an audit) is made
+before any step runs: the first alone (it proves the content's contracts and fills the machine's
+cache of constants), the rest `WRELA_GATE_JOBS` at a time (3 unless set; a build is one thread
+and under 1 GB). No build runs while the GPU is timed.
+
+The times. The gate says how long the builds and each step took, and the whole.
+
+What was seen. A run's result is kept on this machine by what was measured, not by when: a key
+of every file under lib/, game/, toolchain/ and tools/ (tools/gate.json aside), so a commit
+whose files are those has that result whether the gate ran before or after it was committed.
+`--seen REV` prints what this machine's gate saw of a commit (HEAD unless given), and
+`--seen A..B` a line a commit in that range: look there before a failure is bisected by running.
+Results are under `~/.wrela/gate/<machine>/` (`WRELA_GATE_SEEN` names another directory). A run
+whose files changed while it ran is not kept.
+
 Exit status: 0 when everything run held its line; 1 when something didn't; 2 for a usage error.
+`--seen REV`: 0 when the commit was seen to pass, 1 seen to fail, 3 not seen.
 """
 
+import concurrent.futures
+import hashlib
 import json
 import os
 import platform
@@ -35,6 +54,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 TOOLS = os.path.join(ROOT, "tools")
@@ -47,6 +67,8 @@ FRAME_SIZE = "1920x1080"
 FRAME_RANGE = "30-89"
 SUN_SIZE = "320x180"
 SUN_FRAMES = 120
+# The hole audit's two sizes: its eyes, the size, and the seconds it may take.
+AUDITS = {"small": (12, "160x90", 1500), "full": (24, "640x360", 3000)}
 
 # How far past its baseline a number may be before the gate fails: a count of pixels (the judge's
 # rays are fixed, so a count moves only with the picture), and a time or a mean (the GPU's
@@ -57,6 +79,11 @@ ABS_SLACK = {"ms": 0.25, "err": 0.1}
 
 STEPS = ["layers", "tests", "audit", "sun", "frames"]
 
+# What a result depends on, for its key: every file under these, but for the baseline itself
+# (which says whether a number passes, never what it is).
+KEY_PATHS = ["lib", "game", "toolchain", "tools"]
+KEY_SKIP = {"tools/gate.json"}
+
 
 def run(cmd, **kw):
     return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, **kw)
@@ -66,14 +93,79 @@ def say(msg):
     print(f"gate: {msg}", file=sys.stderr, flush=True)
 
 
-def build(scene_dir, settings):
-    cmd = [os.path.join(TOOLS, "wrela"), "build", os.path.join(ROOT, "game", "scenes"), "-o", scene_dir]
-    for k, v in settings.items():
-        cmd += ["--set", f"{k}={v}"]
-    p = run(cmd)
-    if p.returncode != 0:
-        tail = "\n".join(l for l in p.stdout.splitlines() if l.startswith("error"))
-        raise RuntimeError(f"the build of {settings} failed:\n{tail or p.stdout[-2000:]}")
+# The builds: each a directory, the settings it is built with, and how its build went.
+
+
+class Builds:
+    def __init__(self):
+        self.want = []  # (out, settings), in the order the steps use them
+        self.failed = {}  # out -> why
+        self.seconds = 0.0
+
+    def add(self, out, settings):
+        self.want.append((out, settings))
+
+    def one(self, out, settings):
+        cmd = [os.path.join(TOOLS, "wrela"), "build", os.path.join(ROOT, "game", "scenes"), "-o", out]
+        for k, v in settings.items():
+            cmd += ["--set", f"{k}={v}"]
+        began = time.monotonic()
+        p = run(cmd)
+        took = time.monotonic() - began
+        if p.returncode != 0:
+            tail = "\n".join(l for l in p.stdout.splitlines() if l.startswith("error"))
+            self.failed[out] = f"the build of {settings} failed:\n{tail or p.stdout[-2000:]}"
+        say(f"built {os.path.basename(out)} in {took:.0f} s" + (" (FAILED)" if out in self.failed else ""))
+
+    def make(self, jobs):
+        if not self.want:
+            return
+        began = time.monotonic()
+        say(f"{len(self.want)} builds, the first alone and then {jobs} at a time")
+        # The toolchain first, once: a build is `tools/wrela`, which builds it when it is stale.
+        p = run([os.path.join(TOOLS, "built"), "wrela"])
+        if p.returncode != 0:
+            for out, _ in self.want:
+                self.failed[out] = "the toolchain didn't build:\n" + p.stdout[-2000:]
+            return
+        self.one(*self.want[0])
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
+            list(pool.map(lambda w: self.one(*w), self.want[1:]))
+        self.seconds = time.monotonic() - began
+
+    def need(self, out):
+        """Raises why, if `out` didn't build."""
+        if out in self.failed:
+            raise RuntimeError(self.failed[out])
+
+
+def audit_dir(tmp, what):
+    return os.path.join(tmp, f"audit_{what}")
+
+
+def sun_dir(tmp, scene, view):
+    return os.path.join(tmp, f"sun_{scene}_{view}")
+
+
+def frame_dir(tmp, scene):
+    return os.path.join(tmp, f"frame_{scene}")
+
+
+def audits(opts):
+    return ["small", "full"] if opts["full"] else ["small"]
+
+
+def plan(builds, steps, opts, tmp):
+    """Every build `steps` will run, in the steps' order."""
+    if "audit" in steps:
+        for what in audits(opts):
+            builds.add(audit_dir(tmp, what), {"SCENE": 6, "AUDIT_EYES": AUDITS[what][0]})
+    if "sun" in steps:
+        for scene, view in SUN_VIEWS:
+            builds.add(sun_dir(tmp, scene, view), {"SCENE": scene, "VIEW": view, "SUNJUDGE": "true"})
+    if "frames" in steps:
+        for scene in FRAME_SCENES:
+            builds.add(frame_dir(tmp, scene), {"SCENE": scene})
 
 
 class Result:
@@ -110,13 +202,13 @@ def fmt(x, kind):
     return f"{x:.2f}"
 
 
-def step_layers(res, base, opts, tmp):
+def step_layers(res, base, opts, tmp, builds):
     p = run([sys.executable, os.path.join(TOOLS, "layers")])
     res.row("layers", "ok", "ok" if p.returncode == 0 else "broken", p.returncode == 0,
             "" if p.returncode == 0 else p.stdout.strip().splitlines()[-1][:120])
 
 
-def step_tests(res, base, opts, tmp):
+def step_tests(res, base, opts, tmp, builds):
     pkgs = ["lib/engine"] if opts["quick"] else ["lib/engine", "lib/kit", "game/world"]
     for pkg in pkgs:
         p = run([os.path.join(TOOLS, "wrela"), "test", os.path.join(ROOT, pkg)])
@@ -133,9 +225,13 @@ def step_tests(res, base, opts, tmp):
 AUDIT_FAIL = re.compile(r"^\s+- (?P<kind>.+?)(?:,|:) ")
 
 
-def audit(res, base, what, args):
+def audit(res, base, what, tmp, builds):
+    eyes, size, timeout = AUDITS[what]
+    out = audit_dir(tmp, what)
+    builds.need(out)
     say(f"hole audit, {what}")
-    p = run([os.path.join(TOOLS, "audit")] + args)
+    p = run([os.path.join(TOOLS, "audit"), "--built", out, "--size", size, "--eyes", str(eyes),
+             "--timeout", str(timeout)])
     kinds = sorted({m.group("kind") for l in p.stdout.splitlines() if (m := AUDIT_FAIL.match(l))})
     host_died = "host exited" in p.stdout or "error: GPU error" in p.stdout
     known = sorted((base or {}).get("failing", []))
@@ -157,11 +253,13 @@ def audit(res, base, what, args):
     res.row(f"audit {what}", was, now, not new, note)
 
 
-def step_audit(res, base, opts, tmp):
+def step_audit(res, base, opts, tmp, builds):
     b = base.get("audit", {})
-    audit(res, b.get("small"), "small", ["--size", "160x90", "--eyes", "12", "--timeout", "1500"])
-    if opts["full"]:
-        audit(res, b.get("full"), "full", ["--timeout", "3000"])
+    for what in audits(opts):
+        try:
+            audit(res, b.get(what), what, tmp, builds)
+        except RuntimeError as e:
+            res.row(f"audit {what}", "passes", "did not run", False, str(e).splitlines()[-1][:140])
 
 
 SUN_LINE = re.compile(
@@ -170,13 +268,15 @@ SUN_LINE = re.compile(
 )
 
 
-def step_sun(res, base, opts, tmp):
+def step_sun(res, base, opts, tmp, builds):
     b = base.get("sun", {})
     for scene, view in SUN_VIEWS:
         key = f"{scene}/{view}"
+        out = sun_dir(tmp, scene, view)
+        if out in builds.failed:
+            res.row(f"sun {key}", "judged", "did not run", False, builds.failed[out].splitlines()[-1][:140])
+            continue
         say(f"sun judge, SCENE {scene} VIEW {view}")
-        out = os.path.join(tmp, f"sun_{scene}_{view}")
-        build(out, {"SCENE": scene, "VIEW": view, "SUNJUDGE": "true"})
         p = run([os.path.join(TOOLS, "gpu"), "--timeout", "600", out, "--size", SUN_SIZE,
                  "--frames", str(SUN_FRAMES)])
         m = SUN_LINE.search(p.stdout)
@@ -190,12 +290,14 @@ def step_sun(res, base, opts, tmp):
         res.hold(f"sun.{key}.mean_err", f"sun {key} mean error (/255)", float(m.group(6)), was.get("mean_err"), "err")
 
 
-def step_frames(res, base, opts, tmp):
+def step_frames(res, base, opts, tmp, builds):
     b = base.get("frames", {})
     for scene in FRAME_SCENES:
+        out = frame_dir(tmp, scene)
+        if out in builds.failed:
+            res.row(f"frame SCENE {scene}", "runs", "did not run", False, builds.failed[out].splitlines()[-1][:140])
+            continue
         say(f"frame's span, SCENE {scene} at {FRAME_SIZE}")
-        out = os.path.join(tmp, f"frame_{scene}")
-        build(out, {"SCENE": scene})
         js = os.path.join(tmp, f"bench_{scene}.json")
         p = run([os.path.join(TOOLS, "bench"), out, "--size", FRAME_SIZE, "--frames", FRAME_RANGE,
                  "--runs", "1", "--no-passes", "--no-cpu", "--json", js, "--timeout", "600"])
@@ -229,8 +331,136 @@ def merge(into, new):
             into[k] = v
 
 
+# What was seen: a result kept by a key of the files it measured.
+
+
+def git(*args, stdin=None):
+    p = subprocess.run(["git", "-C", ROOT, *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                       text=True, input=stdin)
+    if p.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args[:2])}: {p.stderr.strip()[:200]}")
+    return p.stdout
+
+
+def key_of(pairs):
+    """The key of files as (path, the id git gives its bytes)."""
+    h = hashlib.sha256()
+    for path, blob in sorted(pairs):
+        if path not in KEY_SKIP:
+            h.update(f"{path}\0{blob}\n".encode())
+    return h.hexdigest()[:32]
+
+
+def commit_key(rev):
+    """The key of the commit `rev`'s files."""
+    pairs = []
+    for rec in git("ls-tree", "-r", "-z", rev, "--", *KEY_PATHS).split("\0"):
+        if rec:
+            meta, path = rec.split("\t", 1)
+            _, kind, blob = meta.split()
+            if kind == "blob":
+                pairs.append((path, blob))
+    return key_of(pairs)
+
+
+def tree_key():
+    """The key of the files as they are on disk now: a commit's, when they are that commit's.
+    Nothing is written to the repository."""
+    listed = git("ls-files", "-c", "-o", "--exclude-standard", "-z", "--", *KEY_PATHS).split("\0")
+    files = sorted({f for f in listed if f and os.path.isfile(os.path.join(ROOT, f))})
+    blobs = git("hash-object", "--stdin-paths", stdin="".join(f + "\n" for f in files)).split()
+    return key_of(zip(files, blobs))
+
+
+def seen_dir(machine):
+    base = os.environ.get("WRELA_GATE_SEEN") or os.path.expanduser("~/.wrela/gate")
+    return os.path.join(base, machine)
+
+
+def seen_read(machine, key):
+    try:
+        with open(os.path.join(seen_dir(machine), key + ".json")) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def seen_write(machine, key, res, steps, opts, times):
+    """Keeps this run's result under `key`, over what an earlier run of the same files saw of
+    the same things (a run of some steps adds to a run of the others)."""
+    rec = seen_read(machine, key) or {"key": key, "machine": machine, "rows": [], "steps": [],
+                                      "measured": {}, "times": {}}
+    now = {r[0] for r in res.rows}
+    rec["rows"] = [r for r in rec["rows"] if r[0] not in now] + [list(r) for r in res.rows]
+    rec["steps"] = [s for s in STEPS if s in steps or s in rec["steps"]]
+    rec["full"] = bool(opts["full"] or rec.get("full"))
+    merge(rec["measured"], nest(res.measured))
+    rec["times"].update({k: round(v, 1) for k, v in times.items() if k != "whole"})
+    rec["passed"] = all(r[3] for r in rec["rows"])
+    rec["when"] = time.strftime("%Y-%m-%d %H:%M")
+    try:
+        rec["commit"] = git("rev-parse", "--short", "HEAD").strip()
+    except RuntimeError:
+        rec["commit"] = "?"
+    d = seen_dir(machine)
+    os.makedirs(d, exist_ok=True)
+    part = os.path.join(d, f".{key}.{os.getpid()}")
+    with open(part, "w") as f:
+        json.dump(rec, f, indent=1, sort_keys=True)
+        f.write("\n")
+    os.replace(part, os.path.join(d, key + ".json"))
+
+
+def verdict(rec):
+    if rec is None:
+        return "not seen"
+    what = "passed" if rec["passed"] else "FAILED"
+    steps = "every step" if rec["steps"] == STEPS else "only " + ", ".join(rec["steps"])
+    return f"{what} ({steps}{', full audit' if rec.get('full') else ''}; {rec['when']})"
+
+
+def seen(machine, rev):
+    """Prints what this machine's gate saw of `rev`, or of each commit in `A..B`."""
+    try:
+        if ".." in rev:
+            code = 0
+            for line in git("log", "--format=%h %s", rev).splitlines():
+                short, subject = line.split(" ", 1)
+                rec = seen_read(machine, commit_key(short))
+                print(f"{short}  {verdict(rec):<58}  {subject[:60]}")
+                if rec is None:
+                    code = max(code, 3) if code != 1 else 1
+                elif not rec["passed"]:
+                    code = 1
+            return code
+        short = git("rev-parse", "--short", rev).strip()
+        rec = seen_read(machine, commit_key(short))
+    except RuntimeError as e:
+        print(f"gate: {e}", file=sys.stderr)
+        return 2
+    print(f"gate on {machine}, {short}: {verdict(rec)}")
+    if rec is None:
+        return 3
+    table(rec["rows"])
+    print("gate: times: " + times_line({**rec["times"], "whole": sum(rec["times"].values())}))
+    return 0 if rec["passed"] else 1
+
+
+def table(rows):
+    w = max(len(r[0]) for r in rows) if rows else 10
+    for what, was, now, ok, note in rows:
+        mark = "ok  " if ok else "FAIL"
+        print(f"  {mark} {what:<{w}}  {str(was):>12} -> {str(now):<12} {note}")
+
+
+def times_line(times):
+    order = ["builds"] + STEPS + ["whole"]
+    return ", ".join(f"{k} {times[k]:.0f} s" for k in order if k in times)
+
+
 def main():
-    opts = {"quick": False, "full": False, "update": False, "only": None, "machine": None, "keep": None}
+    opts = {"quick": False, "full": False, "update": False, "only": None, "machine": None,
+            "keep": None, "seen": None}
     argv = sys.argv[1:]
     i = 0
     while i < len(argv):
@@ -243,10 +473,18 @@ def main():
         elif a in ("--only", "--machine", "--keep") and i + 1 < len(argv):
             i += 1
             opts[a[2:]] = argv[i]
+        elif a == "--seen":
+            opts["seen"] = "HEAD"
+            if i + 1 < len(argv) and not argv[i + 1].startswith("--"):
+                i += 1
+                opts["seen"] = argv[i]
         else:
             print(f"gate: unknown argument `{a}`\n{__doc__}", file=sys.stderr)
             return 2
         i += 1
+    machine = opts["machine"] or ("m4" if platform.system() == "Darwin" else "radeon")
+    if opts["seen"] is not None:
+        return seen(machine, opts["seen"])
     steps = STEPS if opts["only"] is None else opts["only"].split(",")
     for s in steps:
         if s not in STEPS:
@@ -254,7 +492,6 @@ def main():
             return 2
     if opts["quick"] and opts["only"] is None:
         steps = ["layers", "tests", "audit"]
-    machine = opts["machine"] or ("m4" if platform.system() == "Darwin" else "radeon")
     try:
         with open(BASELINE) as f:
             baselines = json.load(f)
@@ -262,23 +499,50 @@ def main():
         baselines = {}
     base = baselines.get(machine, {})
 
+    began = time.monotonic()
+    try:
+        key = tree_key()
+    except RuntimeError as e:
+        say(f"this run won't be kept: {e}")
+        key = None
     res = Result()
     fns = {"layers": step_layers, "tests": step_tests, "audit": step_audit, "sun": step_sun,
            "frames": step_frames}
     tmp = opts["keep"] or tempfile.mkdtemp(prefix="wrela-gate-")
     os.makedirs(tmp, exist_ok=True)
+    times = {}
+    builds = Builds()
+    plan(builds, steps, opts, tmp)
+    try:
+        jobs = int(os.environ.get("WRELA_GATE_JOBS", "3"))
+    except ValueError:
+        jobs = 3
+    builds.make(jobs)
+    if builds.want:
+        times["builds"] = builds.seconds
     for s in STEPS:
         if s in steps:
+            step_began = time.monotonic()
             try:
-                fns[s](res, base, opts, tmp)
+                fns[s](res, base, opts, tmp, builds)
             except RuntimeError as e:
                 res.row(s, "runs", "did not run", False, str(e).splitlines()[-1][:140])
+            times[s] = time.monotonic() - step_began
+            say(f"{s}: {times[s]:.0f} s")
+    times["whole"] = time.monotonic() - began
 
-    w = max(len(r[0]) for r in res.rows) if res.rows else 10
     print(f"gate on {machine}:")
-    for what, was, now, ok, note in res.rows:
-        mark = "ok  " if ok else "FAIL"
-        print(f"  {mark} {what:<{w}}  {str(was):>12} -> {str(now):<12} {note}")
+    table(res.rows)
+    print("gate: times: " + times_line(times))
+    if key is not None:
+        try:
+            still = tree_key() == key
+        except RuntimeError:
+            still = False
+        if still:
+            seen_write(machine, key, res, steps, opts, times)
+        else:
+            say("files under lib/, game/, toolchain/ or tools/ changed while the gate ran: this run is not kept")
     if opts["update"]:
         if res.failed and any(not ok and "did not run" in str(now) for _, _, now, ok, _ in res.rows):
             print("gate: not updating the baseline: something didn't run", file=sys.stderr)

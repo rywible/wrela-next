@@ -1,108 +1,101 @@
 # wrela-next agent instructions
 
-The goal is an amazing MMO. Agents write all of it: the toolchain, the engine, the content, the
-whole game. No person hand-authors code or assets here, so the quality of the game is bounded by
-the quality of the tools agents have and the loops that tell them whether their work is right.
+Agents write all of this MMO: the toolchain, the engine and the game. No person writes code or
+makes assets. Thus the game is only as good as the tools and the checks that agents have.
 
 ## The game
 
-We are still finding what the game looks and feels like. The working idea is a **parry-based
-spellcraft game**: timed, reactive defence, where reading an attack and answering it is the
-skill, in an open world of magic seen over the caster's shoulder. The defining image is a duel in
-which one caster hurls a bolt of lightning and the other throws a veil of sand into its path: the
-bolt fuses the sand into a branching sculpture of glass that hangs in the air, glowing, and then
-shatters. A parry is not only a block on a timing window but a spell that answers the incoming
-spell, transforming it. Build toward that feeling, and treat everything else about the design as
-open.
+The design is open. The idea today is a spellcraft game about the parry: a spell that answers a
+spell at the correct time and changes it. The world is open. The camera is behind the shoulder of
+the caster.
 
-The game is its own. Code, docs, commit messages and image prompts never name or borrow from
-other games, films or books.
+Build toward this image. One caster throws lightning. The other throws sand into its path. The
+lightning melts the sand into a branch of glass that hangs in the air, glows, and then breaks.
 
-**Visual style:** realistic first. Get light, materials and motion physically right, then
-specialize: add style on top of a believable base, rather than starting stylized and faking
-realism later.
-
-**Lore** lives in `docs/lore.md` (not written yet). Lore is flexible. The first job is a great
-game; lore can shape the game, but it bends to the game, not the other way round.
+- Do not name or copy other games, films or books in code, documents, commit messages or image
+  prompts.
+- Make light, materials and motion physically correct first. Then add style.
+- Lore goes in `docs/lore.md` (not written). Lore changes to fit the game.
 
 ## Three layers
 
-| Layer     | Where        | Its job                                                                                            |
-| --------- | ------------ | -------------------------------------------------------------------------------------------------- |
-| Game      | `game/`      | What exists in the world and what it does: fields, looks, rigs, moves, rules, spells               |
-| Engine    | `lib/`       | How things are drawn, moved, lit and simulated, solved once for the whole game                     |
-| Toolchain | `toolchain/` | The compiler and everything before the frame: types, effects, constants, cooks, costs, diagnostics |
+| Layer     | Where        | Its job                                                         |
+| --------- | ------------ | --------------------------------------------------------------- |
+| Game      | `game/`      | What is in the world and what it does                           |
+| Engine    | `lib/`       | How to draw, move, light and simulate things                    |
+| Toolchain | `toolchain/` | The compiler and all work before the frame: types, costs, cooks |
 
-Dependencies point down. The game never knows how anything is drawn; a game file that imports
-`std::gpu` is a bug in the engine. The toolchain never knows this game's own things.
+Dependencies point down. A game file that imports `std::gpu` is an engine bug. The toolchain does
+not know the things of this game.
 
-## The engine is where things get solved once
+## How to work
 
-The engine is for this MMO, not for some other game that might exist later. But inside that
-scope it is where we solve a problem once so that nobody has to think about it again.
+**Solve each problem one time, in the engine.** The engine is for this MMO only.
 
-- Build deep, reusable systems, not per-scene fixes. If a scene needs a tweak, ask what the
-  engine got wrong that every scene would hit, and fix that.
-- Do not accumulate one-off tuning: no magic constants for a single scene, no special cases
-  keyed on a scene's name, no flags that one caller sets. If a knob is needed, it belongs to a
-  general system with a physical meaning, and every scene gets the same behaviour from it.
-- When a new way to do a job lands, the old one leaves in the same change. One way to do each
-  job.
-- An author's obvious code should be correct and fast because it calls the engine.
+- If a scene needs a correction, repair the engine fault that all scenes have.
+- Do not add a constant, a special case or a flag for one scene or one caller. A control must
+  have a physical meaning in a general system.
+- When a new method lands, remove the old method in the same change.
+- The obvious code of an author must be correct and fast.
 
-## All content is fields
+**All content is a field:** a function over a domain, such as a distance, a density or a height.
 
-Every piece of content is a field: a function over a domain (a distance from a point, a density
-in space, a height over a plane, a colour in a direction). The game says _what_ a thing is as a
-field; the engine decides how to draw it. Nobody authors meshes, textures or vertices; the
-engine makes whatever it needs from the fields. A new kind of thing is a new field, or a new kind of field in the engine, not a
-special asset path.
+- The game says what a thing is. The engine selects how to draw it.
+- Do not write meshes, textures or vertices. The engine makes them from the fields.
+- A new type of thing is a new field or a new type of field, not a special asset path.
 
-## Agents need great tools and great verification
+**Build the check with the system.**
 
-Because agents author the whole game, tooling and verification are product work, not overhead.
+- Change a judgement by eye into a number.
+- Give each system the means to examine it: diagnostics, queries, screenshots to compare, and a
+  slow reference for the fast path.
+- If you made a guess that something works, build the missing check next.
+- Put measurements in the commit message: before and after, same machine, same run.
 
-- Turn what a person would judge by eye into a number wherever possible: a measurement, a
-  comparison against a reference, a test that fails when it looks wrong.
-- Every system ships with the means to check it: diagnostics, queries, screenshots that can be
-  compared, references computed another way (on the CPU, by brute force) to check the fast path
-  against.
-- If you had to guess whether something works, the missing check is the next thing to build.
-- Claims carry measurements: before and after, same machine, same run, in the commit message.
-  Write down what would kill an idea before you measure it.
+**Work until it is good.**
+
+- Work is done when the picture is correct, the measurement is in its target and the gate
+  passes. It is not done before that.
+- If a result is not good, find the cause and use a different method. Do not stop. Do not revert
+  and leave the problem open.
+- A difficult target is still the target. Say how far the work is from it. Then continue.
 
 ## Rules
 
-1. **Cite your sources** in `docs/citations.md`: every outside paper, talk, codebase, crate or
-   technique, with what it is, its rights, and how and why we use it. Fix a line there in the
-   same change that makes it wrong.
-2. **Every GPU launch goes through `tools/gpu`.** Never run the host any other way. One runs at
-   a time. **No dispatch or pass may hold the GPU for long:** a compute dispatch that runs for
-   seconds cannot be stopped, and twice that has taken the whole machine down. Heavy work is cut
-   into parts of at most about 50 ms each, or drawn as a render pass. Run anything new first with
-   `--frames 2 --timestamps --serial` at a small size and read its times before a long or large
-   run. Don't raise `WRELA_GPU_BEHIND` to get a heavy kernel through.
-   **Never take the display:** no full-screen or borderless-fullscreen window on either machine.
-   A full-screen run with the GPU busy hung the Mac's GPU driver and WindowServer, and the
-   machine had to be restarted. Windows stay ordinary windows, and on the Mac a window's frames
-   always wait for the display (display sync on): a windowed run with it off was followed by
-   WindowServer hanging a second time. A window on the Mac opens only when the user has said yes to
-   that run; measure windows on the Linux machine's headless Weston first.
-3. **One Rust build at a time.** The machine has 16 GB. Every cargo command uses the one target
-   directory, `toolchain/target`, and waits for any other cargo to finish.
-4. **Two machines, two targets.** Metal on this Mac (the M4) and Vulkan with SPIR-V on the Linux
-   machine (`ssh wrela-popos`). A change to how anything is drawn is measured on both before it
-   is called done. On the Linux machine this repository is a full checkout in
-   `~/projects/wrela-next`, and agents work and commit there just as on the Mac; the two
-   machines share work through GitHub. To measure a change on the Linux machine, commit and push
-   it, then `git pull` in that checkout and run it there; never copy files across another way.
-   The same rules hold there. Touch nothing else on it.
-5. **A change to how anything is drawn passes `tools/gate` before it is committed** (the hole
-   audit, the sun's judge, a frame's span at 1080p, each held to the machine's line in
-   `tools/gate.json`; `--full` before a change to the mesher or the eye's passes). Its commit
-   message carries what the gate measured. A phase of a plan is landed when its kill line is
-   met, or the line is rewritten in `docs/design.md` with the measurement that forced it. A
-   failure found on the commit a piece of work starts from is bisected, not set aside.
-6. **Commit and push freely; open no pull requests.** The repository is
-   `github.com/rywible/wrela-next`; push your branches to `origin` whenever you like. A commit
-   message is one sentence saying what is now true, with no trailing period.
+1. **Cite each outside source in `docs/citations.md`:** what it is, its rights, and how and why
+   we use it. If a change makes a line there wrong, correct the line in the same change.
+2. **Start each GPU run with `tools/gpu`.** Do not run the host by a different method. Only one
+   run can use the GPU at a time.
+   - Keep each dispatch below approximately 50 ms, or draw the work as a render pass. You cannot
+     stop a long dispatch, and two of them made the machine fail.
+   - Do the first run of new work at a small size with `--frames 2 --timestamps --serial`. Read
+     the times before a larger run.
+   - Do not increase `WRELA_GPU_BEHIND`.
+   - Do not open a full-screen or borderless window. One hung the Mac.
+   - On the Mac, keep display sync on. Open a window only after the user says yes to that run.
+     Measure windows first on the headless Weston of the Linux machine.
+3. **Run one Rust build at a time.** The machine has 16 GB. Each cargo command uses
+   `toolchain/target` and waits for other cargo commands.
+4. **Use the two machines.** This Mac (the M4) uses Metal. The Linux machine
+   (`ssh wrela-popos`) uses Vulkan with SPIR-V.
+   - Measure a change to how the engine draws on the two machines before you call it done.
+   - The Linux machine is a second place to work. If the GPU of the Mac is busy, do the run
+     there.
+   - `tools/radeon COMMAND` runs a command in the Linux checkout (`~/projects/wrela-next`) at
+     the pushed head of your branch.
+   - Move work only through GitHub: commit, push, then `git pull` there. Do not copy files.
+   - The same rules apply there. Touch nothing else on that machine.
+5. **Pass `tools/gate` on the two machines before you call a change to how the engine draws
+   done.** It holds the hole audit, the judge of the sun and the 1080p frame time to
+   `tools/gate.json`.
+   - You can commit and push work in progress before the gate passes. Do not merge it to `main`.
+   - Use `--only` or `--quick` while you work. Use the full gate before you call the work done.
+     Add `--full` for a change to the mesher or to the passes of the eye.
+   - Put the results of the gate in the message of the commit that completes the change.
+   - A phase of a plan is done only when the work is in its target.
+   - If the commit that you start from has a failure, find the commit that caused it. Read
+     `tools/gate --seen A..B` first: it shows the results that the gate kept. Bisect only the
+     commits that it did not see.
+6. **Commit and push freely to `origin` (`github.com/rywible/wrela-next`). Do not open pull
+   requests.** A commit message is one sentence that says what is now true, with no period at
+   the end.

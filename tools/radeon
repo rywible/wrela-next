@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""Runs a command on the Linux machine (the Radeon), in its checkout, at this branch's pushed
+head: the second machine as a second place to work, in one step. Usage:
+
+    tools/radeon [--no-pull] <command> [arguments...]
+    tools/radeon tools/gate --only frames
+    tools/radeon tools/gate --seen HEAD~5..HEAD
+
+What it does, and what it won't:
+
+1. It measures what is committed and pushed, never this machine's uncommitted files: work moves
+   between the machines through GitHub only (AGENTS.md, rule 4). It stops if this branch's head
+   isn't on `origin`, and says so if there are uncommitted changes that the run won't see.
+2. On the Linux machine, in `~/projects/wrela-next`, it stops if the checkout is on another
+   branch (somebody's work is there: it changes no branch), then `git pull --ff-only`. With
+   `--no-pull` it pulls nothing and runs the command on whatever is checked out there.
+3. It runs the command there from the checkout's root, with a login shell's environment, and
+   gives back its output and its exit status. The same rules hold there: a GPU job waits its turn
+   on that machine's lock, and a cargo command for any other cargo.
+
+`WRELA_RADEON` names the machine (`wrela-popos` unless set), `WRELA_RADEON_DIR` the checkout.
+Exit status: the command's; 2 for a usage error or a refusal here; 255 if ssh failed.
+"""
+
+import os
+import platform
+import shlex
+import subprocess
+import sys
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+HOST = os.environ.get("WRELA_RADEON", "wrela-popos")
+DIR = os.environ.get("WRELA_RADEON_DIR", "~/projects/wrela-next")
+
+
+def git(*args):
+    p = subprocess.run(["git", "-C", ROOT, *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    return p.returncode, p.stdout.strip(), p.stderr.strip()
+
+
+def refuse(msg):
+    print(f"radeon: {msg}", file=sys.stderr)
+    return 2
+
+
+def main():
+    argv = sys.argv[1:]
+    pull = True
+    while argv and argv[0].startswith("-"):
+        a = argv.pop(0)
+        if a in ("-h", "--help"):
+            print(__doc__)
+            return 0
+        if a == "--no-pull":
+            pull = False
+        else:
+            return refuse(f"unknown argument `{a}`\n{__doc__}")
+    if not argv:
+        return refuse(f"no command\n{__doc__}")
+    if platform.system() != "Darwin":
+        return refuse("this is for the Mac: on the Linux machine, run the command itself")
+
+    steps = [f"cd {DIR}"]
+    if pull:
+        _, branch, _ = git("branch", "--show-current")
+        if not branch:
+            return refuse("this checkout is on no branch")
+        _, head, _ = git("rev-parse", "HEAD")
+        code, _, err = git("fetch", "--quiet", "origin", branch)
+        if code != 0:
+            return refuse(f"`git fetch origin {branch}` failed: {err}")
+        _, pushed, _ = git("rev-parse", f"origin/{branch}")
+        if pushed != head:
+            return refuse(f"{branch}'s head {head[:7]} isn't on origin (origin has {pushed[:7]}): "
+                          "commit and push first, or pass --no-pull to run what is there")
+        _, dirty, _ = git("status", "--porcelain", "--untracked-files=no")
+        if dirty:
+            print(f"radeon: {len(dirty.splitlines())} uncommitted files here are not in this run",
+                  file=sys.stderr)
+        b = shlex.quote(branch)
+        steps += [
+            f'there="$(git branch --show-current)"',
+            f'if [ "$there" != {b} ]; then echo "radeon: the Linux checkout is on $there, not {branch}: '
+            f'it changes no branch" >&2; exit 2; fi',
+            f"git pull --quiet --ff-only origin {b} || {{ echo 'radeon: the pull there failed' >&2; exit 2; }}",
+            'echo "radeon: at $(git rev-parse --short HEAD) on the Linux machine" >&2',
+        ]
+    steps.append(" ".join(shlex.quote(a) for a in argv))
+    remote = "bash -lc " + shlex.quote(" && ".join(steps[:1]) + " && { " + "; ".join(steps[1:]) + "; }")
+    return subprocess.call(["ssh", "-o", "ConnectTimeout=10", HOST, remote])
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -29,8 +29,46 @@ use wrela_diag::Diagnostic;
 pub use collect::SourceUnit;
 pub use program::Program;
 
-/// The std library's sources, embedded in the compiler: (module path, text).
-pub const STD_SOURCES: &[(&str, &str)] = &[
+/// The std library's sources: (module path, text). A compiler that runs from a checkout
+/// ([`wrela_diag::checkout`]) reads each from the checkout's `lib/std` when it starts, so an edit
+/// to std needs no build of the compiler; any other has the text it was built with
+/// ([`STD_EMBEDDED`]), as a module has whose file the checkout doesn't hold.
+pub static STD_SOURCES: std::sync::LazyLock<Vec<(&'static str, &'static str)>> =
+    std::sync::LazyLock::new(|| {
+        let dir = wrela_diag::checkout().map(|root| root.join("lib/std"));
+        STD_EMBEDDED
+            .iter()
+            .map(|&(module, text)| {
+                let read = dir
+                    .as_ref()
+                    .and_then(|dir| std::fs::read_to_string(dir.join(std_file(module))).ok());
+                (module, read.map_or(text, |read| &*Box::leak(read.into_boxed_str())))
+            })
+            .collect()
+    });
+
+/// A std module's file under `lib/std`: `std::tool::files` is `tool/files.wrela`.
+fn std_file(module: &str) -> String {
+    format!("{}.wrela", module.strip_prefix("std::").unwrap_or(module).replace("::", "/"))
+}
+
+#[cfg(test)]
+#[test]
+fn every_std_module_is_read_from_its_file_in_a_checkout() {
+    let root = wrela_diag::checkout().expect("the tests run from a checkout's toolchain/target");
+    assert_eq!(STD_SOURCES.len(), STD_EMBEDDED.len());
+    for (&(module, read), &(_, built_in)) in STD_SOURCES.iter().zip(STD_EMBEDDED) {
+        let file = root.join("lib/std").join(std_file(module));
+        let on_disk = std::fs::read_to_string(&file)
+            .unwrap_or_else(|e| panic!("{module}: no {}: {e}", file.display()));
+        assert_eq!(read, on_disk, "{module} is not its file's text");
+        // Cargo builds the compiler again when a file it embeds changes, so here they agree.
+        assert_eq!(built_in, on_disk, "{module}'s built-in text is stale");
+    }
+}
+
+/// The std library's sources as this compiler was built with them.
+const STD_EMBEDDED: &[(&str, &str)] = &[
     ("std::prelude", include_str!("../../../lib/std/prelude.wrela")),
     ("std::mem", include_str!("../../../lib/std/mem.wrela")),
     ("std::alloc", include_str!("../../../lib/std/alloc.wrela")),

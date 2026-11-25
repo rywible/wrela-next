@@ -61,7 +61,7 @@ fn unsafe_is_only_in_the_listed_core() {
         .map(String::from)
         .collect();
     let mut using = BTreeSet::new();
-    for (path, text) in wrela_driver::STD_SOURCES {
+    for (path, text) in wrela_driver::STD_SOURCES.iter() {
         let module = path.strip_prefix("std::").expect("std::");
         let code: String =
             text.lines().map(|l| l.split("//").next().unwrap_or("")).collect::<Vec<_>>().join("\n");
@@ -83,7 +83,7 @@ fn unsafe_is_only_in_the_listed_core() {
 fn only_the_core_states_effects_and_thread_entries() {
     let core = wrela_sema::defs::UNSAFE_CORE;
     let mut entries = 0;
-    for (path, text) in wrela_driver::STD_SOURCES {
+    for (path, text) in wrela_driver::STD_SOURCES.iter() {
         let module = path.strip_prefix("std::").expect("std::");
         let uses = text.lines().any(|l| {
             let l = l.trim_start();

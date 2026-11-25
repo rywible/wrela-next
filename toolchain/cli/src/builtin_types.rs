@@ -138,7 +138,7 @@ fn methods_of(ty: Option<&str>) -> Vec<String> {
 
 /// The text of the spec's section under `heading`, up to the next heading of any level.
 fn section(heading: &str) -> (String, usize) {
-    let spec = crate::export::LANGUAGE;
+    let spec: &str = *crate::export::LANGUAGE;
     let Some(at) = spec.find(&format!("\n{heading}\n")) else { return (String::new(), 0) };
     let line = 2 + spec[..at].matches('\n').count();
     let body = &spec[at + heading.len() + 2..];
