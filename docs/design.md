@@ -1379,6 +1379,18 @@ fell (VIEW 0/1/2 709/1,351/359 to 606/1,183/333) and hard acne rose (31/172/33 t
 with the quarter, the judge reads as before (688/1,286/356 and 45/250/41; mean error 3.39, 8.15,
 1.96/255).
 
+**The receiver's plane was tilted by the eye's map's fit** (found after the above): its depth's
+rise a texel was taken as `1 / SHADOW_SIDE`, right only for a map as wide as it is deep (the
+world's); the eye's map is fitted across to what the eye sees while as deep as the world, so
+every plane read `radius / half` times too steep, and the receiver's own surface read as a near
+caster wherever it leaned. With the rise `texel / 2 radius`: exact pixels at 320x180 SCENE 13
+VIEW 0/1/2 2,192/6,511/2,212 to 166/1,414/111 (VIEW 1 11.8% to 2.6% of its pixels); hard acne
+45/250/41 to 24/136/27; mean error 3.39/8.15/1.96 to 3.31/5.30/1.76/255 (VIEW 1's hard leaks
+1,286 to 892); M4 1080p frame 11, the exact rays SCENE 13 3.98 to 1.96 ms (its frame 23.4 to
+21.9 ms), SCENE 14 6.14 to 3.84 ms (24.7 to 22.8 ms), SCENE 10 1.21 to 0.86 ms, SCENE 11 0.50 to
+0.38 ms. (The mended plane, not filtered geometry, met the line proposed for filtered geometry:
+under 5% of VIEW 1 exact, its error no worse.)
+
 Gaps: a `Pool`'s far things, meshed together, have no exact rays (their near band is taken as
 open); glass, the froxels and the radiance volume read the world's map alone; the exact rays may
 step over a feature thinner than `max(e, reach / 32)`. SCENE 13 VIEW 1 and VIEW 2 at 1080p stop
