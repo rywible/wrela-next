@@ -6,12 +6,13 @@
 use matter::substance::Substance
 use mesh::dc::eye_step
 use mesh::grid::{
-    ActiveBrick, BRICK, CELL_PX, GridSpec, NONE, box_in_frustum, frustum_cull_view, steep,
+    ActiveBrick, BRICK, CELL_PX, FrustumCull, GridSpec, NONE, box_in_frustum, frustum_cull_view,
+    steep,
     tight_aabb,
 }
 use picture::eye::{Eye, View, view}
 use std::collections::Vec
-use std::derive::{Box3, value_and_gradient, work}
+use std::derive::{Box3, work}
 use std::field::{ALL_LIVE, Field}
 use std::hash::{Hasher, StateHash}
 
@@ -30,10 +31,36 @@ pub const NBR_FINER: u32 = 1
 pub const NBR_COARSER: u32 = 2
 /// Bitmask covering the 22 neighbor bits in `ActiveBrick::nbr_hi` (`slots 16..26`).
 pub const NBR_HI_MASK: u32 = 4194303
-/// Flag bit in `ActiveBrick::nbr_hi` marking a non-planar brick that is still awaiting streaming
-/// refinement (`cell_px > 2 * fine_px`), so front-facing cells also certify against protruding
-/// sub-cell features until the brick refines; converged and planar `flat_px` bricks leave this 0.
-pub const NBR_FLAG_UNREFINED: u32 = 2147483648
+
+/// How far past its own box, in its cells, a brick's mesh can lie: a cell for the dual cells it
+/// owns past its high faces, and `2·√3` cells for how far a mesh stands off the field (a vertex in
+/// its cell, a triangle across two: `dc::finer_than_a_hole`). A brick whose box grown by this is
+/// out of view puts no triangle in view, however coarse its cells.
+pub const MESH_REACH: f32 = 4.4641016
+/// How much wider than the view (as the tangent of its half angles) bricks are refined to their
+/// due, so that a small turn of the eye meets them refined already.
+const VIEW_AHEAD: f32 = 1.18
+
+/// The view, and the view widened by `VIEW_AHEAD`, holding it: a box is in the wider if it is in
+/// the narrower (a frustum widened about the eye's axis loses what is beside and behind the eye,
+/// so its planes alone don't hold the narrower one).
+struct Views: Copy {
+    seen: FrustumCull,
+    ahead: FrustumCull,
+}
+
+fn views(v: View) -> Views {
+    Views {
+        seen: frustum_cull_view(v, margin: 1.0),
+        ahead: frustum_cull_view(v, margin: VIEW_AHEAD),
+    }
+}
+
+impl Views {
+    fn in_ahead(self, lo: vec3, hi: vec3) -> bool {
+        box_in_frustum(lo, hi, self.seen) || box_in_frustum(lo, hi, self.ahead)
+    }
+}
 
 /// Flat index (`0..26`) of neighbor offset `(dx, dy, dz)` in `{-1, 0, +1}^3`.
 pub fn nbr_index(dx: i32, dy: i32, dz: i32) -> u32 {
@@ -171,20 +198,6 @@ pub fn octree_parent_cell_p(qp: vec3u) -> vec3u {
     vec3u(((qp.x + 1) >> 1) - 1, ((qp.y + 1) >> 1) - 1, ((qp.z + 1) >> 1) - 1)
 }
 
-/// Compile-time work-adaptive streaming brick budget per frame (`<= 1.5 ms` M4 / `<= 3.0 ms` Radeon).
-pub fn stream_budget_of<M: Field<Substance>>(field: M) -> u32 {
-    let w = work(|q: vec3| field.distance_live(q, ALL_LIVE))
-    if w <= 300 {
-        384
-    } else if w <= 1200 {
-        256
-    } else if w <= 3000 {
-        192
-    } else {
-        160
-    }
-}
-
 /// Packs `(level, bx, by, bz)` into a non-zero 64-bit lookup key.
 fn oct_key(level: u32, bx: u32, by: u32, bz: u32) -> u64 {
     ((u64(level) + 1) << 48) |
@@ -286,10 +299,6 @@ pub struct OctNode: Copy {
     /// `NODE_INACTIVE (0)` = merged child, `NODE_LEAF (1)` = active leaf, `NODE_INTERNAL (2)` = split.
     pub state: u32,
     pub empty: bool,
-    /// Conservative world-space geometric deviation (m) of the surface from a trilinear cell inside
-    /// this brick (measured ONCE on creation via 8 corners + center + 6 face centers: `0.0` on flat
-    /// planes, `~h^2/(8R)` on curved shells, large on carvings/creases).
-    pub geom_err: f32,
     /// Resident GPU pool slot index (`NONE` when not yet extracted or invalidated).
     pub pool_slot: u32,
     /// Cached 54-bit neighbor mask with which `pool_slot` was extracted.
@@ -338,10 +347,12 @@ pub struct BrickOctree {
     pub map: OctreeMap,
     pub roots: Vec<u32>,
     pub active_leaves: Vec<u32>,
-    pub pending_splits: bool,
     pub next_pool_slot: u32,
-    pub last_eye: vec4,
-    pub last_forward: vec3,
+    /// Whether the last `refine` left leaves past their due for want of room (`max_leaves`): the
+    /// coarsest are split first, so what is left is evenly coarser than its due, and whole (a
+    /// cell too coarse to trust is certified or solved: `emit::process_lod_edge`), at the exact
+    /// pass's cost.
+    pub full: bool,
 }
 
 pub fn brick_octree() -> BrickOctree {
@@ -361,10 +372,8 @@ pub fn brick_octree() -> BrickOctree {
         map: octree_map(),
         roots: Vec::new(),
         active_leaves: Vec::new(),
-        pending_splits: false,
         next_pool_slot: 0,
-        last_eye: vec4(0.0),
-        last_forward: vec3(0.0, 0.0, -1.0),
+        full: false,
     }
 }
 
@@ -419,122 +428,16 @@ impl BrickOctree {
         out
     }
 
-    /// Tests whether brick `(level, bx, by, bz)` plus its 2-cell halo is provably empty, and when
-    /// non-empty estimates its world-space surface deviation (`geom_err` in meters).
-    /// - For heavy hero fields (`work > 1200`), skips CPU point evaluation (`geom_err = h`) so
-    ///   CPU `octree.update` stays `< 0.1 ms` with zero per-split stalls.
-    /// - For light world/architectural fields (`work <= 1200`), projects the brick center and 6 face
-    ///   centers onto the local zero set via 1 Newton step and measures normal + tangent-plane
-    ///   agreement: strictly planar walls and floor slabs get `geom_err = 0.0` even when a coarse
-    ///   brick straddles a thin slab's interior medial axis, while corners, skirting, and curved
-    ///   surfaces get accurate non-zero `geom_err`.
-    fn probe_brick<M: Field<Substance>>(
-        self,
-        field: M,
-        level: u32,
-        bx: u32,
-        by: u32,
-        bz: u32,
-    ) -> (bool, f32) {
+    /// Whether brick `(level, bx, by, bz)` with its 2-cell halo is proven empty: the field's
+    /// interval over it holds no zero. (Nothing here is decided by asking the field at points: a
+    /// brick's surface is taken as flat, and its cells left coarse, on no sample.)
+    fn brick_empty<M: Field<Substance>>(self, field: M, level: u32, bx: u32, by: u32, bz: u32) -> bool {
         let h = self.cell_at(level)
-        let (lo, hi_core) = self.brick_box(level, bx, by, bz)
+        let (lo, _) = self.brick_box(level, bx, by, bz)
         // Include `+2` cell halo (`8 = BRICK + 2` cells) so seam-corner inheritance and `+1` dual
         // cells never miss a brick whose halo touches the surface.
-        let hi_halo = lo + vec3(h * f32(BRICK + 2))
-        let iv = field.interval_near(Box3 { lo, hi: hi_halo })
-        if iv.lo > 0.0 || iv.hi < 0.0 {
-            return (true, 0.0)
-        }
-        if work(|q: vec3| field.distance_live(q, ALL_LIVE)) > 5000 {
-            return (false, h)
-        }
-        let bspan = h * f32(BRICK)
-        // Sample 8 asymmetric interior points (0.22 / 0.78) so probes never land on power-of-two
-        // slab centerlines (e.g. y = -0.25 or z = 0) where the gradient vanishes on a medial axis.
-        let p0 = lo + vec3(0.22 * bspan)
-        let p1 = lo + vec3(0.78 * bspan)
-        let probes = [
-            vec3(p0.x, p0.y, p0.z),
-            vec3(p1.x, p0.y, p0.z),
-            vec3(p0.x, p1.y, p0.z),
-            vec3(p1.x, p1.y, p0.z),
-            vec3(p0.x, p0.y, p1.z),
-            vec3(p1.x, p0.y, p1.z),
-            vec3(p0.x, p1.y, p1.z),
-            vec3(p1.x, p1.y, p1.z),
-        ]
-        var ref_ok = false
-        var ref_p = vec3(0.0)
-        var ref_n = vec3(0.0, 1.0, 0.0)
-        var opp_ok = false
-        var opp_p = vec3(0.0)
-        var max_plane_err = 0.0
-        var min_ndot = 1.0
-        for k in 0..8 {
-            let q = probes[k]
-            let (d0, g0) = value_and_gradient(|p: vec3| field.distance(p), q)
-            let gl0 = length(g0)
-            if gl0 <= 1.0e-5 {
-                // Medial axis inside a symmetric slab is not surface curvature.
-                continue
-            }
-            let n0 = g0 / gl0
-            // One Newton step toward the surface, clamped inside the brick + 1 cell halo.
-            let step = clamp(d0 / max(gl0, 1.0), -bspan, bspan)
-            let ps = q - n0 * step
-            let in_brick = ps.x >= lo.x - h &&
-                ps.x <= hi_core.x + h &&
-                ps.y >= lo.y - h &&
-                ps.y <= hi_core.y + h &&
-                ps.z >= lo.z - h &&
-                ps.z <= hi_core.z + h
-            if !in_brick {
-                continue
-            }
-            let (ds, gs) = value_and_gradient(|p: vec3| field.distance(p), ps)
-            let gls = length(gs)
-            if abs(ds) > 0.25 * bspan || gls <= 1.0e-5 {
-                continue
-            }
-            let ns = gs / gls
-            let p_on = ps - ns * (ds / max(gls, 1.0))
-            if !ref_ok {
-                ref_ok = true
-                ref_p = p_on
-                ref_n = ns
-            } else {
-                let nd = dot(ref_n, ns)
-                if nd < -0.995 {
-                    // Antiparallel face of a flat slab (e.g. floor or wall underside): exact in DC
-                    // once the two faces are separated by at least `1.5 * h`.
-                    if !opp_ok {
-                        opp_ok = true
-                        opp_p = p_on
-                    } else {
-                        max_plane_err = max(max_plane_err, abs(dot(p_on - opp_p, ref_n)))
-                    }
-                    min_ndot = min(min_ndot, -nd)
-                } else {
-                    min_ndot = min(min_ndot, nd)
-                    max_plane_err = max(max_plane_err, abs(dot(p_on - ref_p, ref_n)))
-                }
-            }
-        }
-        if !ref_ok {
-            // Surface missed all 7 projected probes (e.g. small detail tucked in one corner):
-            // conservatively treat as non-planar so it refines down to `fine_px`.
-            return (false, 0.25 * h)
-        }
-        if opp_ok {
-            let slab_thick = abs(dot(opp_p - ref_p, ref_n))
-            if slab_thick < 1.5 * h {
-                // Slab is thinner than 1.5 cells: keep splitting until DC resolves both faces.
-                return (false, 0.25 * h)
-            }
-        }
-        let ang_err = bspan * 0.125 * sqrt(max(1.0 - min_ndot, 0.0))
-        let geom_err = max(max_plane_err, ang_err)
-        (false, geom_err)
+        let iv = field.interval_near(Box3 { lo, hi: lo + vec3(h * f32(BRICK + 2)) })
+        iv.lo > 0.0 || iv.hi < 0.0
     }
 
     /// Initializes the octree anchored to `field`'s immutable tight AABB.
@@ -574,15 +477,13 @@ impl BrickOctree {
         self.map.reset()
         self.roots = Vec::new()
         self.active_leaves = Vec::new()
-        self.pending_splits = false
         self.next_pool_slot = 0
-        self.last_eye = vec4(0.0)
-        self.last_forward = vec3(0.0, 0.0, -1.0)
+        self.full = false
 
         for bz in 0..nz {
             for by in 0..ny {
                 for bx in 0..nx {
-                    let (empty, geom_err) = self.probe_brick(field, 0, bx, by, bz)
+                    let empty = self.brick_empty(field, 0, bx, by, bz)
                     let idx = self.nodes.len()
                     self.nodes.push(
                         OctNode {
@@ -594,7 +495,6 @@ impl BrickOctree {
                             child_base: NONE,
                             state: NODE_LEAF,
                             empty,
-                            geom_err,
                             pool_slot: NONE,
                             cached_nbr_lo: 0,
                             cached_nbr_hi: 0,
@@ -646,9 +546,8 @@ impl BrickOctree {
                 lo.z <= dirty_box.hi.z
             if overlaps {
                 let was_empty = n.empty
-                let (now_empty, now_err) = self.probe_brick(field, n.level, n.bx, n.by, n.bz)
+                let now_empty = self.brick_empty(field, n.level, n.bx, n.by, n.bz)
                 self.nodes[i].empty = now_empty
-                self.nodes[i].geom_err = now_err
                 self.nodes[i].pool_slot = NONE
                 invalidated += 1
                 if was_empty != now_empty {
@@ -735,9 +634,7 @@ impl BrickOctree {
             let cbx = n.bx * 2 + ox
             let cby = n.by * 2 + oy
             let cbz = n.bz * 2 + oz
-            let (empty, geom_err) = if n.empty { (true, 0.0) } else {
-                self.probe_brick(field, clvl, cbx, cby, cbz)
-            }
+            let empty = n.empty || self.brick_empty(field, clvl, cbx, cby, cbz)
             let cidx = self.nodes.len()
             self.nodes.push(
                 OctNode {
@@ -749,7 +646,6 @@ impl BrickOctree {
                     child_base: NONE,
                     state: NODE_LEAF,
                     empty,
-                    geom_err,
                     pool_slot: NONE,
                     cached_nbr_lo: 0,
                     cached_nbr_hi: 0,
@@ -914,232 +810,147 @@ impl BrickOctree {
         self.active_leaves = take out
     }
 
-    /// Performs one continual per-brick streaming LOD step for camera `v`:
-    /// 1. Merges over-refined sibling groups (`parent_cell_px < 0.72 * split_px` or off-frustum).
-    /// 2. Splits highest-error in-frustum bricks (`cell_px > split_px`) with strict 2:1 balance,
-    ///    strictly capped to `budget` GPU bricks per frame (`<= 1.5 ms` M4 / `<= 3.0 ms` Radeon).
-    /// 3. Computes 54-bit neighbor masks and collects all dirty bricks (newly split, seam-changed,
-    ///    CSG-dirtied, or `exact_eye`-stale beyond per-brick `eye_reach`) up to budget.
-    pub fn update<M: Field<Substance>>(
+    /// A cell's due width in pixels at its brick's nearest to the eye: `CELL_PX`, less for a
+    /// steep field (its cells' corners say less of it), times the batch's `cell_scale`.
+    fn fine_px(self, cell_scale: f32) -> f32 {
+        let eff_cpx = if self.lip > 2.5 { min(CELL_PX, 2.0) } else { CELL_PX }
+        eff_cpx * max(cell_scale, 1.0) * (if self.is_steep { 0.80 } else { 1.0 })
+    }
+
+    /// The most any leaf is over its due for the eye `v` (`coarseness`): 0 after a `refine` unless
+    /// the octree is `full`.
+    pub fn coarsest(self, v: View, cell_scale: f32, min_cell: f32) -> f32 {
+        let fine_px = self.fine_px(cell_scale)
+        let vs = views(v)
+        var most = 0.0
+        for i in 0..self.active_leaves.len() {
+            let n = self.nodes[self.active_leaves[i]]
+            most = max(most, self.coarseness(n, v, vs, fine_px: fine_px, min_cell: max(min_cell, 0.0004)))
+        }
+        most
+    }
+
+    /// How many times its due the cells of brick `n` are for the eye `v`: over 1 where it should be
+    /// split (its cell over `fine_px` pixels at its nearest to the eye), 0 where it needn't be or
+    /// can't (empty, at the finest level or the least cell `min_cell`, or none of its mesh can
+    /// lie within the view and the turn ahead of it, `vs`: `MESH_REACH`).
+    fn coarseness(self, n: OctNode, v: View, vs: Views, fine_px: f32, min_cell: f32) -> f32 {
+        if n.empty || n.level + 1 >= MAX_OCTREE_LEVELS {
+            return 0.0
+        }
+        let h = self.cell_at(n.level)
+        if h * 0.5 < min_cell {
+            return 0.0
+        }
+        let (lo, hi) = self.brick_box(n.level, n.bx, n.by, n.bz)
+        let reach = vec3(MESH_REACH * h)
+        if !vs.in_ahead(lo - reach, hi + reach) {
+            return 0.0
+        }
+        let dist = max(length(v.at - clamp(v.at, lo, hi)), 0.004)
+        let cell_px = h / (dist * max(v.pixel(), 1.0e-5))
+        if cell_px > fine_px { cell_px / fine_px } else { 0.0 }
+    }
+
+    /// Which bricks there are for the eye `v`: a function of the field and the eye alone, and of
+    /// nothing drawn before. A brick is split where its cells are past their due (`coarseness`),
+    /// or where a finer neighbour needs it split (2:1), and nowhere else: first every parent not
+    /// wanted split is merged, pass after pass (a merge can free its neighbours to merge), then
+    /// every leaf wanted split is, the coarsest first, pass after pass. So the mesh an eye is
+    /// shown doesn't depend on where the eye was before, and the states the hole audit holds
+    /// (each eye, cut to) are the states there are: a walk meets no tree a cut wouldn't make.
+    /// The eye moving smoothly asks a few bricks a frame; a cut asks many, in the one frame (in
+    /// dispatches of `CHUNK_BRICKS` at the most). Returns whether any brick was split or merged.
+    pub fn refine<M: Field<Substance>>(
         mut self,
         field: M,
         v: View,
-        budget: u32,
         max_leaves: u32,
-        exact_eye: vec4,
         cell_scale: f32,
         min_cell: f32,
-        is_cold: bool,
-    ) -> OctreeUpdate {
-        self.frame += 1
-        let fc = frustum_cull_view(v, margin: 1.18)
-        let px_rad = max(v.pixel(), 1.0e-5)
-        let obj_rad = max(0.5 * length(self.aabb.hi - self.aabb.lo), 0.1)
-        let is_cut = is_cold ||
-            self.last_eye.w <= 0.0 ||
-            length(exact_eye.xyz - self.last_eye.xyz) > 0.35 * obj_rad ||
-            dot(v.forward, self.last_forward) < 0.75 ||
-            abs(exact_eye.w - self.last_eye.w) > 0.25 * max(self.last_eye.w, 1.0e-5)
-        self.last_eye = exact_eye
-        self.last_forward = v.forward
-        let eff_cpx = if self.lip > 2.5 { min(CELL_PX, 2.0) } else { CELL_PX }
-        let fine_px = eff_cpx * max(cell_scale, 1.0) * (if self.is_steep { 0.80 } else { 1.0 })
-        // Strictly planar bricks (`geom_err <= 0.002 * h`) are exact at any cell size and stay
-        // coarse (`flat_px = 160 px`), keeping flat rooms/floors/walls to ~100 bricks total; any
-        // non-planar brick (curved, creased, carved, or thin) refines smoothly down to `fine_px`.
-        let flat_px = (if self.is_steep { 24.0 } else { 160.0 }) * max(cell_scale, 1.0)
-        let err_px_limit = 0.25 * max(cell_scale, 1.0)
-        let merge_scale = 0.55
+    ) -> bool {
+        let fine_px = self.fine_px(cell_scale)
+        let least = max(min_cell, 0.0004)
+        let vs = views(v)
+        var changed = false
 
-        var topo_changed = false
-
-        // 1. Collect candidate parent merges (children that are all leaves and parent satisfies both
-        //    sub-pixel geometric error and coarse flat cell bound with hysteresis, or off-frustum).
-        var merge_cands: Vec<u32> = Vec::new()
-        for i in 0..self.active_leaves.len() {
-            let ni = self.active_leaves[i]
-            let p = self.nodes[ni].parent
-            if p == NONE {
-                continue
+        for _pass in 0..MAX_OCTREE_LEVELS {
+            var merged = false
+            // (Every split brick is asked, not only those with a leaf to draw: one whose children
+            // are all proven empty would otherwise stay split, and hold its neighbours split.)
+            for p in 0..self.nodes.len() {
+                if self.nodes[p].state != NODE_INTERNAL {
+                    continue
+                }
+                if self.coarseness(self.nodes[p], v, vs, fine_px: fine_px, min_cell: least) == 0.0 &&
+                    self.merge_node(p) {
+                    merged = true
+                }
             }
-            let pn = self.nodes[p]
-            let ph = self.cell_at(pn.level)
-            let (plo, phi) = self.brick_box(pn.level, pn.bx, pn.by, pn.bz)
-            let p_in = box_in_frustum(plo, phi, fc)
-            let p_closest = clamp(v.at, plo, phi)
-            let p_dist = max(length(v.at - p_closest), 0.004)
-            let inv_px = 1.0 / (p_dist * px_rad)
-            let p_cell_px = ph * inv_px
-            let p_err_px = pn.geom_err * inv_px
-            let p_planar = pn.geom_err <= 0.002 * ph
-            let p_ok = p_cell_px < fine_px * merge_scale ||
-                (p_planar &&
-                    p_cell_px < flat_px * merge_scale &&
-                    p_err_px < err_px_limit * merge_scale)
-            if !p_in || p_ok {
-                merge_cands.push(p)
-            }
-        }
-        // Apply valid merges (up to `budget / 4` merged parents per frame so neighbor seam refreshes stay bounded).
-        var merged_count: u32 = 0
-        let merge_cap = max(budget / 4, 8)
-        for i in 0..merge_cands.len() {
-            if merged_count >= merge_cap {
+            if !merged {
                 break
             }
-            let pi = merge_cands[i]
-            if self.merge_node(pi) {
-                merged_count += 1
-                topo_changed = true
-            }
-        }
-        if topo_changed {
+            changed = true
             self.rebuild_active_leaves()
         }
 
-        // 2. Prioritize refreshing `exact_eye`-stale visible bricks BEFORE spending budget on new
-        //    splits so camera cuts and turns never leave stale silhouette `ExactCell`s (zero holes
-        //    even on Frame 0 of a cut). On cold starts / camera cuts, run up to 3 top-down split
-        //    passes within a bounded cut budget (`<= 512` bricks) so newly viewed objects start
-        //    near target LOD and settle within a few frames.
-        let eff_min_cell = max(min_cell, 0.0004)
-        var unextracted_now: u32 = 0
-        var eye_stale_count: u32 = 0
-        for i in 0..self.active_leaves.len() {
-            let n = self.nodes[self.active_leaves[i]]
-            if n.pool_slot == NONE {
-                unextracted_now += 1
-            } else if exact_eye.w > 0.0 {
-                let (lo, hi) = self.brick_box(n.level, n.bx, n.by, n.bz)
-                if box_in_frustum(lo, hi, fc) {
-                    let moved = length(exact_eye.xyz - n.cached_eye.xyz) > n.cached_reach ||
-                        abs(exact_eye.w - n.cached_eye.w) > 0.15 * max(n.cached_eye.w, 1.0e-5)
-                    if moved {
-                        eye_stale_count += 1
-                    }
-                }
-            }
-        }
-        let split_passes: u32 = if is_cold { 4 } else if is_cut { 2 } else { 1 }
-        let frame_budget = if is_cold || is_cut { max(budget * 3, 512) } else { budget }
-        let mandatory_now = unextracted_now + (if is_cut { 0 } else { eye_stale_count })
-        let avail_budget = if frame_budget > mandatory_now { frame_budget - mandatory_now } else {
-            0
-        }
-        let split_brick_budget = if is_cold || is_cut {
-            avail_budget
-        } else {
-            max((avail_budget * 3) / 4, 0)
-        }
         var cur_leaves = self.active_leaves.len()
-        var splits_budget_used: u32 = 0
-        for _pass in 0..split_passes {
-            if splits_budget_used >= split_brick_budget || cur_leaves + 8 > max_leaves {
-                break
-            }
-            var b0: Vec<u32> = Vec::new() // >= 16x error
-            var b1: Vec<u32> = Vec::new() // >= 8x
-            var b2: Vec<u32> = Vec::new() // >= 4x
-            var b3: Vec<u32> = Vec::new() // >= 2x
-            var b4: Vec<u32> = Vec::new() // >= 1.5x
-            var b5: Vec<u32> = Vec::new() // >= 1.25x
-            var b6: Vec<u32> = Vec::new() // > 1.0x
+        var full = false
+        for _pass in 0..MAX_OCTREE_LEVELS {
+            // The leaves past their due, by how far: 16 times and over, 8, 4, 2, the rest.
+            var wanting: Vec<u32> = Vec::new()
+            var rank: Vec<u32> = Vec::new()
             for i in 0..self.active_leaves.len() {
                 let ni = self.active_leaves[i]
-                let n = self.nodes[ni]
-                if n.empty || n.level + 1 >= MAX_OCTREE_LEVELS {
-                    continue
-                }
-                let h = self.cell_at(n.level)
-                if h * 0.5 < eff_min_cell {
-                    continue
-                }
-                let (lo, hi) = self.brick_box(n.level, n.bx, n.by, n.bz)
-                if !box_in_frustum(lo, hi, fc) {
-                    continue
-                }
-                let closest = clamp(v.at, lo, hi)
-                let dist = max(length(v.at - closest), 0.004)
-                let inv_px = 1.0 / (dist * px_rad)
-                let cell_px = h * inv_px
-                let err_px = n.geom_err * inv_px
-                let non_planar = n.geom_err > 0.002 * h
-                let want = cell_px > flat_px ||
-                    (cell_px > fine_px && (err_px > err_px_limit || non_planar))
-                if want {
-                    let ratio = max(cell_px / fine_px, err_px / err_px_limit)
-                    if ratio >= 16.0 {
-                        b0.push(ni)
-                    } else if ratio >= 8.0 {
-                        b1.push(ni)
-                    } else if ratio >= 4.0 {
-                        b2.push(ni)
-                    } else if ratio >= 2.0 {
-                        b3.push(ni)
-                    } else if ratio >= 1.5 {
-                        b4.push(ni)
-                    } else if ratio >= 1.25 {
-                        b5.push(ni)
+                let c = self.coarseness(self.nodes[ni], v, vs, fine_px: fine_px, min_cell: least)
+                if c > 0.0 {
+                    wanting.push(ni)
+                    rank.push(if c >= 16.0 { 0 } else if c >= 8.0 { 1 } else if c >= 4.0 { 2 } else if c >= 2.0 {
+                        3
                     } else {
-                        b6.push(ni)
-                    }
+                        4
+                    })
                 }
             }
             var did_split = false
-            for bucket_id in 0..7 {
-                let blen = if bucket_id == 0 {
-                    b0.len()
-                } else if bucket_id == 1 {
-                    b1.len()
-                } else if bucket_id == 2 {
-                    b2.len()
-                } else if bucket_id == 3 {
-                    b3.len()
-                } else if bucket_id == 4 {
-                    b4.len()
-                } else if bucket_id == 5 {
-                    b5.len()
-                } else {
-                    b6.len()
-                }
-                for i in 0..blen {
-                    if splits_budget_used >= split_brick_budget || cur_leaves + 8 > max_leaves {
+            for r in 0..5 {
+                for i in 0..wanting.len() {
+                    if rank[i] != r {
+                        continue
+                    }
+                    if cur_leaves + 512 > max_leaves {
+                        full = true
                         break
                     }
-                    let ni = if bucket_id == 0 {
-                        b0[i]
-                    } else if bucket_id == 1 {
-                        b1[i]
-                    } else if bucket_id == 2 {
-                        b2[i]
-                    } else if bucket_id == 3 {
-                        b3[i]
-                    } else if bucket_id == 4 {
-                        b4[i]
-                    } else if bucket_id == 5 {
-                        b5[i]
-                    } else {
-                        b6[i]
-                    }
+                    let ni = wanting[i]
                     if self.nodes[ni].state != NODE_LEAF {
                         continue
                     }
+                    // (A brick whose children are all proven empty is split to nothing.)
                     let added = self.split_balanced(field, ni)
-                    if added > 0 {
-                        splits_budget_used += added
-                        cur_leaves += added - 1
+                    if self.nodes[ni].state != NODE_LEAF {
+                        cur_leaves = cur_leaves + added - 1
                         did_split = true
-                        topo_changed = true
                     }
                 }
             }
-            if did_split {
-                self.rebuild_active_leaves()
-            } else {
+            if !did_split {
                 break
             }
+            changed = true
+            self.rebuild_active_leaves()
         }
+        self.full = full
+        changed
+    }
 
+    /// What must be extracted this frame for the bricks there are (`refine`'s): every leaf never
+    /// extracted, every leaf whose neighbours' levels changed (its seams), and every leaf in view
+    /// whose eye `exact_eye` has left the reach its exact cells were found for (an outline is
+    /// never drawn from where the eye was); and the slots of every leaf to draw.
+    pub fn gather(mut self, v: View, exact_eye: vec4, topo_changed: bool) -> OctreeUpdate {
+        self.frame += 1
+        let fc = frustum_cull_view(v, margin: 1.18)
         // 3. Recompute 54-bit neighbor masks for all active leaves and gather dirty bricks.
         //    Priority 1 (mandatory for watertightness): never-extracted bricks (`pool_slot == NONE`)
         //    and bricks whose 2:1 `nbr_mask` changed due to a neighbor split/merge.
@@ -1166,13 +977,7 @@ impl BrickOctree {
             let (lo, hi) = self.brick_box(n.level, n.bx, n.by, n.bz)
             let dist = max(length(v.at - clamp(v.at, lo, hi)), 0.004)
             let reach = 1.7320508 * eye_step(dist)
-            let h = self.cell_at(n.level)
-            let cell_px = h / (dist * px_rad)
-            let is_unrefined = n.geom_err > 0.002 * h &&
-                cell_px > fine_px * 2.0 &&
-                h * 0.5 >= eff_min_cell &&
-                n.level + 1 < MAX_OCTREE_LEVELS
-            let nhi_packed = if is_unrefined { nhi | NBR_FLAG_UNREFINED } else { nhi }
+            let nhi_packed = nhi
             let must_extract = n.pool_slot == NONE ||
                 n.cached_nbr_lo != nlo ||
                 n.cached_nbr_hi != nhi_packed
@@ -1210,14 +1015,9 @@ impl BrickOctree {
             }
         }
 
-        // Refresh `exact_eye`-stale bricks: on a camera cut refresh ALL visible stale bricks
-        // immediately so Frame 0 of a cut has zero stale-eye holes; on smooth motion cap to budget.
-        var eye_stale_left = false
+        // Every leaf in view whose eye has left the reach its exact cells were found for is found
+        // them again now: an outline is never drawn from where the eye was.
         for i in 0..eye_stale_nodes.len() {
-            if !is_cut && dirty_bricks.len() >= budget {
-                eye_stale_left = true
-                break
-            }
             let ni = eye_stale_nodes[i]
             let n = self.nodes[ni]
             let nlo = eye_stale_lo[i]
@@ -1240,37 +1040,6 @@ impl BrickOctree {
             }
         }
 
-        // Check if any in-frustum leaf still wants to split next frame.
-        var still_want_split = false
-        if cur_leaves + 8 <= max_leaves {
-            for i in 0..self.active_leaves.len() {
-                let ni = self.active_leaves[i]
-                let n = self.nodes[ni]
-                if n.empty || n.level + 1 >= MAX_OCTREE_LEVELS {
-                    continue
-                }
-                let h = self.cell_at(n.level)
-                if h * 0.5 < eff_min_cell {
-                    continue
-                }
-                let (lo, hi) = self.brick_box(n.level, n.bx, n.by, n.bz)
-                if !box_in_frustum(lo, hi, fc) {
-                    continue
-                }
-                let dist = max(length(v.at - clamp(v.at, lo, hi)), 0.004)
-                let inv_px = 1.0 / (dist * px_rad)
-                let cell_px = h * inv_px
-                let err_px = n.geom_err * inv_px
-                let non_planar = n.geom_err > 0.002 * h
-                if cell_px > flat_px ||
-                    (cell_px > fine_px && (err_px > err_px_limit || non_planar)) {
-                    still_want_split = true
-                    break
-                }
-            }
-        }
-        self.pending_splits = still_want_split || eye_stale_left
-
         var active_slots: Vec<u32> = Vec::new()
         for i in 0..self.active_leaves.len() {
             let slot = self.nodes[self.active_leaves[i]].pool_slot
@@ -1287,7 +1056,7 @@ impl BrickOctree {
             changed,
             dirty_has_seams,
             any_seams,
-            converged: !self.pending_splits,
+            converged: !self.full,
         }
     }
 
@@ -1436,106 +1205,79 @@ fn octree_edge_ownership_is_exact_across_all_15_subsets() {
     }
 }
 
+/// One frame of the octree for the eye `v`, as `MeshBatch::sync_one_octree` runs it.
+fn frame_of<M: Field<Substance>>(oct: mut BrickOctree, f: M, v: View) -> OctreeUpdate {
+    let changed = oct.refine(f, v, max_leaves: 16384, cell_scale: 1.0, min_cell: 0.004)
+    assert(!oct.full, "the octree has room")
+    let most = oct.coarsest(v, cell_scale: 1.0, min_cell: 0.004)
+    assert(most == 0.0, f"no leaf is drawn past its due (one is at {most} times it)")
+    oct.gather(v, vec4(v.at, v.pixel()), changed)
+}
+
+/// Which leaves an octree has, whatever order they were made in: how many, and their keys folded.
+fn leaves_of(oct: BrickOctree) -> (u32, u64) {
+    var fold: u64 = 0
+    for i in 0..oct.active_leaves.len() {
+        let n = oct.nodes[oct.active_leaves[i]]
+        fold = fold ^ oct_key(n.level, n.bx, n.by, n.bz)
+    }
+    (oct.active_leaves.len(), fold)
+}
+
 @test
-fn octree_flyin_splits_incrementally_keeps_2to1_balance_and_merges_cleanly() {
+fn an_octree_is_the_same_for_an_eye_however_the_eye_came_there() {
     let f = std::field::sphere(radius: 1.5).with(matter::substance::lambert(vec3(0.5)))
     var oct = brick_octree()
     oct.init(f, field_hash: 1, edit_base_hash: 0, edit_base_bound: vec4(0.0))
     assert(oct.is_2to1_balanced(), "initial root octree is 2:1 balanced")
-    // Simulate a 30-frame fly-in from 10 m -> 2.8 m using `stream_budget_of(f)`.
-    let b = stream_budget_of(f)
-    var max_dirty: u32 = 0
+    // A fly-in over 30 frames from 10 m to 2.8 m: each frame refines a little.
     for step in 0..30 {
         let z = 10.0 - f32(step) * (7.2 / 29.0)
         let v = view(
             Eye { at: vec3(0.0, 0.2, z), toward: vec3(0.0, 0.0, 0.0), wide: 0.6 },
-            width: 1920,
-            height: 1080,
+            width: 640,
+            height: 360,
         )
-        let u = oct.update(
-            f,
-            v,
-            budget: b,
-            max_leaves: 4096,
-            exact_eye: vec4(v.at, v.pixel()),
-            cell_scale: 1.0,
-            min_cell: 0.0004,
-            is_cold: step == 0,
-        )
+        let _ = frame_of(mut oct, f, v)
         assert(oct.is_2to1_balanced(), f"2:1 balance broken on fly-in frame {step}")
-        if step > 0 {
-            max_dirty = max(max_dirty, u.dirty_bricks.len())
-        }
     }
-    let peak_leaves = oct.active_leaves.len()
-    assert(peak_leaves > oct.roots.len(), f"fly-in refined bricks (got {peak_leaves} leaves)")
-    // Steady hold must settle to 0 dirty bricks/frame (zero oscillation!).
+    assert(oct.active_leaves.len() > oct.roots.len(), "the fly-in refined bricks")
     let v_near = view(
         Eye { at: vec3(0.0, 0.2, 2.8), toward: vec3(0.0, 0.0, 0.0), wide: 0.6 },
-        width: 1920,
-        height: 1080,
+        width: 640,
+        height: 360,
     )
-    var settled = false
-    var last_dirty: u32 = 0
-    for _k in 0..20 {
-        let u = oct.update(
-            f,
-            v_near,
-            budget: b,
-            max_leaves: 4096,
-            exact_eye: vec4(v_near.at, v_near.pixel()),
-            cell_scale: 1.0,
-            min_cell: 0.0004,
-            is_cold: false,
-        )
-        assert(oct.is_2to1_balanced(), "2:1 balance holds while settling")
-        last_dirty = u.dirty_bricks.len()
-        if u.converged && last_dirty == 0 {
-            settled = true
-            break
-        }
-    }
-    assert(
-        settled,
-        f"octree must converge cleanly at steady close camera (leaves={oct.active_leaves.len()} last_dirty={last_dirty} pending={oct.pending_splits})",
-    )
-    // Verify 3 additional steady frames stay at 0 dirty bricks (zero split/merge oscillation).
+    // The eye held still asks nothing more.
     for _s in 0..3 {
-        let u = oct.update(
-            f,
-            v_near,
-            budget: b,
-            max_leaves: 4096,
-            exact_eye: vec4(v_near.at, v_near.pixel()),
-            cell_scale: 1.0,
-            min_cell: 0.0004,
-            is_cold: false,
-        )
-        assert(u.converged && u.dirty_bricks.len() == 0, "zero oscillation once settled")
+        let u = frame_of(mut oct, f, v_near)
+        assert(u.converged && u.dirty_bricks.len() == 0, "an eye held still extracts nothing")
     }
-    let settled_leaves = oct.active_leaves.len()
-    // Pull back to 25 m: bricks must merge back smoothly without violating 2:1 balance.
+    let flown = leaves_of(oct)
+    // Pulled back to 25 m the bricks merge, and a cut straight back to 2.8 m splits them again
+    // in the one frame.
     let v_far = view(
         Eye { at: vec3(0.0, 0.2, 25.0), toward: vec3(0.0, 0.0, 0.0), wide: 0.6 },
-        width: 1920,
-        height: 1080,
+        width: 640,
+        height: 360,
     )
-    for _k in 0..15 {
-        let _ = oct.update(
-            f,
-            v_far,
-            budget: b,
-            max_leaves: 4096,
-            exact_eye: vec4(v_far.at, v_far.pixel()),
-            cell_scale: 1.0,
-            min_cell: 0.0004,
-            is_cold: false,
-        )
-        assert(oct.is_2to1_balanced(), "2:1 balance holds during merge pull-back")
-    }
+    let _ = frame_of(mut oct, f, v_far)
+    assert(oct.is_2to1_balanced(), "2:1 balance holds across the cut away")
+    assert(oct.active_leaves.len() < flown.0, f"the cut away merged leaves ({oct.active_leaves.len()} < {flown.0})")
+    let _ = frame_of(mut oct, f, v_near)
+    assert(oct.is_2to1_balanced(), "2:1 balance holds across the cut back")
+    let cut = leaves_of(oct)
+    // And an octree that never saw another eye has the same leaves.
+    var fresh = brick_octree()
+    fresh.init(f, field_hash: 1, edit_base_hash: 0, edit_base_bound: vec4(0.0))
+    let _ = frame_of(mut fresh, f, v_near)
+    let made = leaves_of(fresh)
     assert(
-        oct.active_leaves.len() < settled_leaves,
-        f"pull-back merged leaves ({oct.active_leaves.len()} < {settled_leaves})",
+        flown.0 == made.0 && flown.1 == made.1,
+        f"flown in to, the eye has the leaves a first sight gives it ({flown.0} against {made.0})",
+    )
+    assert(
+        cut.0 == made.0 && cut.1 == made.1,
+        f"cut to, the eye has the leaves a first sight gives it ({cut.0} against {made.0})",
     )
     // Verify merged nodes' inactive children are never misclassified as NBR_FINER in neighbor_mask.
     for i in 0..oct.active_leaves.len() {

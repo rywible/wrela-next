@@ -25,7 +25,7 @@ use mesh::grid::{
     SeamCell, SeamQuad, THIN_SLICE, THIN_SLICES, VERTS_BRICK, VERTS_STRIDE, frustum_cull_none,
     grid_for, tight_aabb_rest,
 }
-use mesh::octree::{BrickOctree, MAX_OCTREE_LEVELS, brick_octree, stream_budget_of}
+use mesh::octree::{BrickOctree, MAX_OCTREE_LEVELS, brick_octree}
 use mesh::pool::{
     BrickPool, CAP_BATCH_EXACT, POOL_MAX_ACTIVE, brick_pool, compact_pool_exact,
     compact_pool_indices, count_exact_per_brick, count_seam_tris_per_brick, finish_pool_draw,
@@ -349,6 +349,8 @@ pub struct MeshBatch {
     pub instanced: bool,
     pub max_bricks: u32,
     pub cap_bricks: u32,
+    /// Bricks extracted into the persistent pool since it was last emptied (`sync_one_octree`).
+    pool_bricks: u32,
     pub cap_verts: u32,
     pub cap_indices: u32,
     pub cap_trans: u32,
@@ -571,6 +573,7 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
         instanced: false,
         max_bricks,
         cap_bricks: 0,
+        pool_bricks: 0,
         cap_verts: 0,
         cap_indices: 0,
         cap_trans: 0,
@@ -750,9 +753,6 @@ impl MeshBatch {
     /// runs, so the frame that extracts is never settled; one whose budgets overflowed is not
     /// settled until the extraction made again for it is read back.
     pub fn settled(self) -> bool {
-        if self.is_octree && self.octree.pending_splits {
-            return false
-        }
         if !self.gen_real {
             return true
         }
@@ -1516,21 +1516,37 @@ impl MeshBatch {
         }
 
         let may_transmit = field.field_facts().may_transmit
-        let base_budget = stream_budget_of(field)
-        let budget = min(max(base_budget, csg_dirtied), CHUNK_BRICKS)
         let exact_eye = vec4(v.at, v.pixel())
         let max_leaves = min(self.max_bricks, POOL_MAX_ACTIVE)
 
-        // Ensure output & persistent brick pool capacities; if any arena grows, or if a previous
-        // readback flagged overflow/high-water, reset the GPU arena cleanly while keeping the
-        // refined octree topology intact.
+        // Which bricks there are for this eye, first: the buffers below are sized for them, so a
+        // frame that refines much (a cut, a first sight) overruns nothing.
+        let obj_rad = max(0.5 * length(self.octree.aabb.hi - self.octree.aabb.lo), 0.1)
+        let min_cell = max(h_near * 0.95, max(size_floor(obj_rad) * 0.25, 0.0004))
+        let topo_changed = self.octree.refine(
+            field,
+            v,
+            max_leaves: max_leaves,
+            cell_scale: self.cell_scale,
+            min_cell: min_cell,
+        ) ||
+            is_cold ||
+            csg_dirtied > 0
+        var upd = self.octree.gather(v, exact_eye, topo_changed)
+
+        // The mesh's buffers and the persistent brick pool hold twice the leaves there are. A
+        // brick extracted again is appended (its old part left where it was), so the pool is
+        // emptied and every leaf extracted afresh when what this frame appends might not fit
+        // (counted here, in bricks, never waited on from a readback), when a buffer grew, or
+        // when a readback says the vertices are most of the way to their cap.
         if self.verts_per_brick < 80 {
             self.verts_per_brick = 80
         }
         if self.indices_per_brick < 480 {
             self.indices_per_brick = 480
         }
-        let want_bricks = max(self.octree.active_leaves.len() * 2, 2048)
+        let leaves = self.octree.active_leaves.len()
+        let want_bricks = max(leaves * 2, 2048)
         let prev_cap_v = self.cap_verts
         let prev_cap_i = self.cap_indices
         let prev_cap_t = self.cap_trans
@@ -1542,7 +1558,7 @@ impl MeshBatch {
         let out_grew = self.cap_verts > prev_cap_v ||
             self.cap_indices > prev_cap_i ||
             self.cap_trans > prev_cap_t
-        let want_slots = max(self.octree.next_pool_slot + budget * 2, max(max_leaves, 4096))
+        let want_slots = max(self.octree.next_pool_slot + leaves, max(max_leaves, 4096))
         let want_pool_idx = max(self.cap_indices * 3, 2097152)
         let want_pool_trans = if may_transmit { max(self.cap_trans * 3, 262144) } else { 0 }
         let want_pool_exact = max(self.cap_exact * 2, 65536)
@@ -1553,27 +1569,18 @@ impl MeshBatch {
             want_pool_exact,
         )
         let arena_high = self.verts_known * 10 > self.cap_verts * 8 ||
-            self.octree.next_pool_slot + budget > self.pool.cap_slots
+            self.pool_bricks + upd.dirty_bricks.len() > self.cap_bricks
         let need_arena_reset = is_cold || !self.built || out_grew || pool_reset || arena_high
         if need_arena_reset {
             self.verts.clear()
             write(mut self.pool.cursors, 0, [0, 0, 0, 0])
             self.octree.reset_gpu_slots()
             self.verts_known = 0
+            self.pool_bricks = 0
+            upd = self.octree.gather(v, exact_eye, true)
         }
+        self.pool_bricks += upd.dirty_bricks.len()
 
-        let obj_rad = max(0.5 * length(self.octree.aabb.hi - self.octree.aabb.lo), 0.1)
-        let min_cell = max(h_near * 0.95, max(size_floor(obj_rad) * 0.25, 0.0004))
-        let upd = self.octree.update(
-            field,
-            v,
-            budget: budget,
-            max_leaves: max_leaves,
-            exact_eye: exact_eye,
-            cell_scale: self.cell_scale,
-            min_cell: min_cell,
-            is_cold: is_cold,
-        )
         if !upd.changed && self.built && !need_arena_reset {
             if self.prev_xforms_dirty {
                 copy(from: self.xforms.items(), to: self.prev_xforms.items_mut())
