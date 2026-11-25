@@ -1330,7 +1330,11 @@ SCENE 10 26.0 → 29.4 ms, SCENE 11 16.7 → 18.8 ms, SCENE 13 VIEW 0 19.6 → 2
 19.0 → 24.7 ms. Of SCENE 13 VIEW 0's: the classification 0.75 ms, the exact rays 3.35 ms (the
 table's 2.4 ms of it), the deferred pass 1.46 → 0.60 ms and the indirect 0.73 → 0.64 ms (no SDF
 penumbra, no contact shadow), the fit, map and pyramid 0.87 ms while the eye moves or a mesh is
-unsettled (and none once the eye and every batch are still: keyed by each batch's extraction). The plan's line was +0.3 ms: not met, by 3 to 5 ms in the carved showcases. The exact rays
+unsettled (and none once the eye and every batch are still: keyed by each batch's extraction). On the Radeon (Vulkan, validation silent on SCENES 10, 11, 13 and 14 at 320x180 and 1080p),
+the same frame: SCENE 10 85.2 → 92.9 ms (not yet settled at frame 11), SCENE 11 47.5 → 54.3 ms,
+SCENE 13 26.4 → 37.1 ms (the exact rays 7.9 ms, the classification 2.0 ms), SCENE 14 24.2 → 42.2 ms
+(the exact rays 14.0 ms). The plan's line was +0.3 ms on the M4 and +0.7 ms on the Radeon: not
+met, by 3 to 5 ms on the M4 and 7 to 18 ms on the Radeon in the carved showcases. The exact rays
 cost what the fields cost: `table()`'s distance is 10,597 work, and a ray asks it 10 to 30 times.
 What would bring them down is a field cheap to step (the baked proxy phase 2 meant, never built),
 not a cleverer pass.
