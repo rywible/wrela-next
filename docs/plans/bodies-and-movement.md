@@ -204,6 +204,26 @@ Question: how many bodies can the solver move in one tick?
 
 Result: the number of bodies at the full rate for a CPU budget of 1 ms for each tick.
 
+Done on the Linux machine on 2026-11-25 (`tools/movement/netcost`, run with
+`tools/wrela tool tools/movement/netcost`). The net has 256 inputs, three layers of n units with
+ELU, and 64 outputs. Its weights are in rows of four (`vec4`), and four rows are summed at a time.
+The median of 21 rounds of 20 evaluations, three runs, AMD Ryzen 5 5500U, one thread:
+
+| n | Weights | One evaluation | Bodies in 1 ms |
+| --- | --- | --- | --- |
+| 128 | 73,728 | 31 µs | 31 |
+| 256 | 212,992 | 86 µs | 11.6 |
+| 512 | 688,128 | 254 µs | 3.9 |
+| 1024 | 2,424,832 | 1,110 µs | 0.9 |
+
+The simplest loop (one row at a time) took twice as long: 171, 520 and 1,829 µs for 256, 512
+and 1024. The M4 is not measured: the owner gave this work to the Linux machine alone. Measure it
+there before phase 5 sets the rates.
+
+What it means for phase 5: one thread moves approximately 11 bodies at the full rate with a net
+of 256, and 31 with a net of 128. Bodies far from the eye must get a pose at a lower rate (step
+10), or the solver must use the workers (`std::par`).
+
 ### 0.4 The speed of the simulator on Colab
 
 Question: is Colab sufficient for phase 4, and which accelerator is best?
@@ -323,9 +343,9 @@ plan used.
 
 | Part | State on 2026-11-25 |
 | --- | --- |
-| 0.1 The decisions of the owner | Done. Not yet written in `docs/citations.md` |
+| 0.1 The decisions of the owner | Done, and written in `docs/citations.md` |
 | 0.2 The rights of each source | Done: the register |
-| 0.3 The cost of a net on the CPU | Not started |
+| 0.3 The cost of a net on the CPU | Done on the Linux machine. The M4 is not measured |
 | 0.4 The speed of the simulator | Done, but the length of a session |
 | 0.5 The run tool | Not started. Do it before the first run of phase 4 |
 
@@ -661,7 +681,8 @@ Each question has the phase or the person that must answer it.
 1. Answered on 2026-11-25: weights from our training runs can ship.
 2. Answered on 2026-11-25: the game must be sold, and each source must agree with the MIT
    licence.
-3. What size of net is in the CPU budget? (0.3)
+3. What size of net is in the CPU budget? (0.3) Partly answered on 2026-11-25: on the Linux
+   machine, 11 bodies a millisecond with three layers of 256, 31 with 128.
 4. Can the length of an array come from a body constant, so that no fixed limit of bones is
    necessary? (phase 1, step 8)
 5. Where does the movement of a cast and of a parry come from? The register has strikes, hand

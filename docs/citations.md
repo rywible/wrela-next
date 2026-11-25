@@ -12,6 +12,21 @@ image-to-3D model to make reference material for an agent to fit a program to; t
 stays in the git-ignored `.forge/`, nothing in `game/` or `lib/` reads it, and each asset's
 provenance record names the models, versions, prompts and seeds. None has been run yet.
 
+Two decisions of the owner, on 2026-11-25 (`docs/plans/bodies-and-movement.md`, phase 0.1):
+
+- **What ships.** Weights that our own training runs find (a net's numbers, with the provenance
+  record kept beside each file of them) can ship. They are not the output of a generative model:
+  they are a function that our code fitted to data whose rights are in this file.
+- **A commercial release.** The game must be sold. The repository has the MIT licence, and the
+  rights of each outside source must agree with it: its terms must permit commercial use and
+  changed copies. A duty to give credit is permitted (the public domain, CC0, MIT, BSD, Apache
+  2.0, CC BY, ODC-By). Terms that say "non-commercial", "no derivatives", "share-alike" or
+  "research only", and the terms of an owner that limit what a person can do with the data, are
+  not. So the CMU motion capture database is not used: its terms do not permit a person to sell
+  the data again, "even in converted form". The register of movement sources,
+  `docs/plans/movement-sources.md`, holds each source's terms as read; a source gets its row
+  below when a phase first uses it.
+
 The engine was begun again on a clean slate on 2026-11-18 (branch `engine`, merged into `backend`),
 and replaced its per-pixel raymarcher (`Sight`, `lib/engine/picture/pixels.wrela`,
 `lib/engine/matter/{cells,asked,cost}.wrela`, `lib/engine/light/{moving,store}.wrela`,
