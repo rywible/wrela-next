@@ -372,10 +372,10 @@ fn a_mask_made_with_bitwise_operators_folds() {
     assert_eq!(v["pipelines"].as_array().map(Vec::len), Some(1), "{v}");
 }
 
-/// Static WCET report surfaces `kept` local frame bytes and the compile-time 16 KiB spill guard
-/// rejects kernels whose per-thread local arrays exceed `MAX_KEPT_BYTES` at build time.
+/// `wrela pipelines` says the most an invocation keeps (`kept`), and a shipped build refuses a
+/// kernel that keeps more than `MAX_KEPT_BYTES` (16 KiB) an invocation (E0707).
 #[test]
-fn wcet_report_and_compile_time_spill_guard() {
+fn the_most_kept_is_reported_and_a_build_over_it_refused() {
     let main = format!(
         "pub fn frame(time: f32, width: u32, height: u32) {{\n    let screen = std::gpu::begin_screen_pass(clear: vec4())\n    {DRAW}\n    screen.present()\n}}\n{SHADERS}"
     );
@@ -384,9 +384,8 @@ fn wcet_report_and_compile_time_spill_guard() {
         &[("wrela.toml", &common::manifest("p")), ("main.wrela", &main)],
     );
     let v = common::json(common::wrela().arg("pipelines").arg(&dir).arg("--json"));
-    assert_eq!(v["wcet"]["unbounded"], serde_json::json!(0), "{v}");
-    assert_eq!(v["wcet"]["over_kept_limit"], serde_json::json!(0), "{v}");
-    assert_eq!(v["wcet"]["max_kept_bytes"], serde_json::json!(16384), "{v}");
+    assert_eq!(v["kept"]["over"], serde_json::json!(0), "{v}");
+    assert_eq!(v["kept"]["limit_bytes"], serde_json::json!(16384), "{v}");
 
     let spill_main = r#"
 @compute(64)
@@ -417,11 +416,11 @@ pub fn frame(time: f32, width: u32, height: u32) {
         .expect("run wrela build");
     assert!(
         !out.status.success(),
-        "expected compile-time spill guard to reject >16 KiB local frame"
+        "expected E0707 to refuse a kernel keeping over 16 KiB an invocation"
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("E0707") && stderr.contains("spill guard"),
+        stderr.contains("E0707") && stderr.contains("keeps"),
         "expected E0707 spill guard diagnostic, got:\n{stderr}"
     );
 }

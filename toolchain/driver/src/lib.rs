@@ -28,7 +28,6 @@ pub mod script;
 pub mod shipped;
 pub mod suite;
 pub mod tool_tests;
-pub mod wcet;
 pub mod workspace;
 
 /// std's modules: each one's path and source.

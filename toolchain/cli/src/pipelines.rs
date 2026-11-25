@@ -103,18 +103,20 @@ pub fn text(pipelines: &[PipelineSummary]) -> String {
             s.push_str(&few_text(p));
         }
     }
-    let wcet = wrela_driver::wcet::analyze(pipelines);
+    let (most, over) = kept_most(pipelines);
     s.push_str(&format!(
-        "\nwcet: {} unbounded, {} spill-risk (>= {} B), largest local frame {} B (limit {} B), heaviest 1080p est {:.2} ms M4 / {:.2} ms Radeon\n",
-        wcet.unbounded_count,
-        wcet.spill_risk_count,
-        wrela_driver::wcet::SPILL_WARN_BYTES,
-        wcet.largest_kept_bytes,
-        wrela_driver::wcet::MAX_KEPT_BYTES,
-        wcet.max_single_1080p_ms_m4,
-        wcet.max_single_1080p_ms_radeon,
+        "\nkept: an invocation keeps at most {most} B; {over} pipelines over a shipped build's {} B\n",
+        wrela_driver::build::MAX_KEPT_BYTES,
     ));
     s
+}
+
+/// The most bytes an invocation of any pipeline keeps (`kept`, §18.11), and how many pipelines
+/// keep more than a shipped build may (`MAX_KEPT_BYTES`, E0707).
+fn kept_most(pipelines: &[PipelineSummary]) -> (u32, usize) {
+    let most = pipelines.iter().map(|p| p.kept).max().unwrap_or(0);
+    let over = pipelines.iter().filter(|p| p.kept > wrela_driver::build::MAX_KEPT_BYTES).count();
+    (most, over)
 }
 
 /// Each entry point's calls with few numbers that vary (§18.13), one line each, under the
@@ -212,22 +214,16 @@ pub fn json(pipelines: &[PipelineSummary]) -> String {
         .into_iter()
         .map(|(n, ps)| format!("{{\"name\": {}, \"instantiations\": {}}}", q(n), ps.len()))
         .collect();
-    let wcet = wrela_driver::wcet::analyze(pipelines);
-    let wcet_json = format!(
-        "{{\"unbounded\": {}, \"spill_risk\": {}, \"over_kept_limit\": {}, \"largest_kept_bytes\": {}, \"max_kept_bytes\": {}, \"max_1080p_ms_m4\": {:.3}, \"max_1080p_ms_radeon\": {:.3}}}",
-        wcet.unbounded_count,
-        wcet.spill_risk_count,
-        wcet.over_kept_limit_count,
-        wcet.largest_kept_bytes,
-        wrela_driver::wcet::MAX_KEPT_BYTES,
-        wcet.max_single_1080p_ms_m4,
-        wcet.max_single_1080p_ms_radeon,
+    let (most, over) = kept_most(pipelines);
+    let kept_json = format!(
+        "{{\"most_bytes\": {most}, \"over\": {over}, \"limit_bytes\": {}}}",
+        wrela_driver::build::MAX_KEPT_BYTES,
     );
     format!(
-        "{{\"pipelines\": [{}], \"entry_points\": [{}], \"wcet\": {}}}\n",
+        "{{\"pipelines\": [{}], \"entry_points\": [{}], \"kept\": {}}}\n",
         ps.join(", "),
         es.join(", "),
-        wcet_json
+        kept_json
     )
 }
 
