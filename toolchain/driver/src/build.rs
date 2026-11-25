@@ -13,13 +13,6 @@ pub struct BuildOutput {
     pub lines: Vec<(u32, Option<wrela_diag::Span>)>,
 }
 
-/// A pipeline's MSL at most, in bytes: what Metal's compiler takes while the scene loads. It was
-/// the browser's budget for WGSL (256 KiB, spike 13), and Metal's compiler crashed on kernels
-/// near it (the atoms spike's cook, 160-200 KiB of WGSL). A shader's MSL is larger than its WGSL:
-/// the fighters' placing kernel, which fitted as WGSL and compiles and runs, is 262 KiB of MSL,
-/// so the budget as MSL is 288 KiB. Not yet measured against Metal's compile time.
-pub const MAX_SHADER_BYTES: usize = 288 * 1024;
-
 /// A pipeline's weight at most (§18.11): its entry points' statements with every call written
 /// out, what predicts how long a browser's shader compiler takes over it (the opening's far pass
 /// weighed 270,830 and took three quarters of its cold compile, Nov 2026).
@@ -43,8 +36,9 @@ impl Shaders {
 }
 
 /// Runs the back ends over a lowered program. `sources` names the locations a trap reports.
-/// With `budgets`, a shipped build's, it's E0707 to have a pipeline whose MSL is over
-/// `MAX_SHADER_BYTES`. `conditional[i]` says pipeline `i` is reached only under runtime
+/// With `budgets`, a shipped build's, it's E0707 to have a pipeline over `MAX_WEIGHT` or
+/// `MAX_KEPT_BYTES` (a shader's size in bytes is no budget: a pipeline's weight is what predicts
+/// how long the driver takes over it). `conditional[i]` says pipeline `i` is reached only under runtime
 /// conditions (every site of it is): the manifest puts it in tier 1, which a host builds second
 /// (§18.9); a pipeline past the slice's end is tier 0.
 #[allow(clippy::too_many_arguments)]
@@ -292,24 +286,6 @@ fn emit_in(
                     continue;
                 }
             }
-        }
-        if budgets
-            && target == wrela_abi::Target::Metal
-            && let Some(written) = &shader
-            && written.bytes.len() > MAX_SHADER_BYTES
-            && let Some(&at) = p.sites.first()
-        {
-            diagnostics.push(over_budget(
-                at,
-                format!(
-                    "`{}`'s MSL is {} KiB, over the {} KiB a pipeline's shader may be",
-                    p.name,
-                    written.bytes.len().div_ceil(1024),
-                    MAX_SHADER_BYTES / 1024
-                ),
-                "Metal compiles each pipeline's shader while the scene loads",
-                "move work that its own pass can do there, or keep a big function a call (`ir::opt`)",
-            ));
         }
         if budgets
             && pipeline.kept > MAX_KEPT_BYTES

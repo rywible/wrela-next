@@ -37,7 +37,7 @@ fn diagnose(
         all.extend(out.results.into_iter().filter_map(|r| r.failure));
         (out.sources, all)
     } else if FROM_BUILDS.contains(&code) {
-        // Built for Metal on every machine, whose shader budget E0707's program is past.
+        // Built for Metal on every machine, as a shipped build (E0707's program weighs past its budget).
         let out = wrela_tests::shipped_for(dir, wrela_abi::Target::Metal);
         (out.sources, out.diagnostics)
     } else if let Some(&(_, name, value)) = FROM_SETS.iter().find(|s| s.0 == code) {

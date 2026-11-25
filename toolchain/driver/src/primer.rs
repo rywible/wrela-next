@@ -353,7 +353,7 @@ pub const RULES: &[(&str, &str)] = &[
     ),
     (
         "build.budget",
-        "a shipped build's pipelines weigh at most 300,000 each, and have at most 288 KiB of MSL each on Metal",
+        "a shipped build's pipelines weigh at most 300,000 each and keep at most 16 KiB an invocation",
     ),
 ];
 

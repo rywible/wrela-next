@@ -66,19 +66,14 @@ impl Default for OncePerKey {
 /// Builds the package in `pkg` as `wrela build --testing` does (with its `@testing` exports),
 /// without writing its files: the output, or the errors rendered.
 pub fn build(pkg: &Path) -> Result<wrela_driver::Output, String> {
-    checked(wrela_driver::build_for_tests(pkg, false), true)
+    checked(wrela_driver::build_for_tests(pkg, false))
 }
 
-/// `built`, if it has no errors and its shaders pass [`offline_check`] (and, with `budget`, each
-/// Metal shader is within 288 KiB); else what's wrong, rendered.
-fn checked(built: wrela_driver::Output, budget: bool) -> Result<wrela_driver::Output, String> {
+/// `built`, if it has no errors and its shaders pass [`offline_check`]; else what's wrong,
+/// rendered.
+fn checked(built: wrela_driver::Output) -> Result<wrela_driver::Output, String> {
     if built.has_errors() {
         return Err(wrela_diag::render::render_all(&built.sources, &built.diagnostics));
-    }
-    let over =
-        |(name, bytes): &&(String, Vec<u8>)| name.ends_with(".metal") && bytes.len() > 288 * 1024;
-    if budget && let Some((name, bytes)) = built.files.iter().find(over) {
-        return Err(format!("{name}: {} bytes, over the 288 KiB shader budget", bytes.len()));
     }
     offline_check(&built)?;
     Ok(built)
@@ -94,7 +89,7 @@ pub fn offline_check(built: &wrela_driver::Output) -> Result<(), String> {
 /// machine's: for a test that reads a shader's text, or one of the limits of the machine its
 /// cases were written for.
 pub fn build_for(pkg: &Path, target: wrela_abi::Target) -> Result<wrela_driver::Output, String> {
-    checked(wrela_driver::build_for(pkg, &testing_for(target)), false)
+    checked(wrela_driver::build_for(pkg, &testing_for(target)))
 }
 
 /// How [`build_for`] builds: a test build (`wrela build --testing --target`) for `target`.
@@ -337,8 +332,7 @@ fn built_once(pkg: &str, kind: &str, build: fn(&Path) -> wrela_driver::Output) -
     BUILDS.run(&base.display().to_string(), || {
         let _ = std::fs::remove_dir_all(&base);
         let dir = repo_root().join(pkg);
-        let built =
-            checked(build(&dir), false).unwrap_or_else(|e| panic!("{pkg} doesn't build:\n{e}"));
+        let built = checked(build(&dir)).unwrap_or_else(|e| panic!("{pkg} doesn't build:\n{e}"));
         built.write_to(&base).expect("write the build");
     });
     base
