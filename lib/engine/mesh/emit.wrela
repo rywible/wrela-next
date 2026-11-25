@@ -1,7 +1,7 @@
 // GPU triangle emission, prefix-scan compaction, brick metadata, outline certification and
 // dilation, multi-LOD seam stitching, and indirect draw-argument finalisation.
 
-use matter::certify::certify_sheet
+use matter::certify::{certify_sheet, certify_sheet_pruned}
 use matter::substance::Substance
 use mesh::dc::{
     CERT_MARKS, CellCorners, HOLE_PX, OUTLINE_MARKS, QUAD_FOLDED, QUAD_INSIDE, Qef, cdist,
@@ -12,14 +12,12 @@ use mesh::grid::{
     ActiveBrick, BRICK, BrickBound, CAP_SEAM, CAP_SURF, CERT_SLICE, CORNERS_BRICK, EDGES_BRICK,
     ExactCell, GridSpec, MOST_INDICES_PER_BRICK, MeshVertex, NONE, OVERFLOW_CREASES, OVERFLOW_CUT,
     OVERFLOW_EXACT, OVERFLOW_INDICES, OVERFLOW_SEAMS, OVERFLOW_THIN, OVERFLOW_TRANS, SEAM_SLICE,
-    SMOOTH_DOT, SeamCell, SeamQuad, VERTS_BRICK, VERTS_STRIDE, brick_corner, lattice,
-    pack_vertex_meta, safe_norm, unpack_is_trans, unpack_oct_normal,
+    SMOOTH_DOT, SeamCell, SeamQuad, VERTS_BRICK, VERTS_STRIDE, brick_corner, is_heavy_field,
+    lattice, pack_vertex_meta, safe_norm, unpack_is_trans, unpack_oct_normal,
 }
 use std::derive::{Box3, value_and_gradient}
 use std::field::{ALL_LIVE, Field, Live, Rigid}
-use std::gpu::{
-    Append, Atomics, DrawIndexedArgs, GlobalId, GpuBuffer, GpuSpan, One, Slots, dispatch,
-}
+use std::gpu::{Append, Atomics, DrawIndexedArgs, GlobalId, GpuBuffer, GpuSpan, One, Slots, dispatch}
 
 fn cv(cell_verts: [u32], base: u32, x: u32, y: u32, z: u32) -> u32 {
     cell_verts[base + x + y * 7 + z * 49]
@@ -634,7 +632,12 @@ pub(package) fn box_outline(
 /// Notes in `tri_count[12]` a batch's seam cells (`seam_slices`), and counts in `tri_count[9]` those
 /// past what its seam slices take (`OVERFLOW_THIN`: they were neither solved nor boxed).
 @compute(1)
-pub(package) fn note_seams(seam_count: [u32], slices: u32, tri_count: mut Atomics<u32>, id: GlobalId) {
+pub(package) fn note_seams(
+    seam_count: [u32],
+    slices: u32,
+    tri_count: mut Atomics<u32>,
+    id: GlobalId,
+) {
     if id.x == 0 {
         let _ = tri_count.max(i: 12, value: seam_count[0])
         if seam_count[0] > slices * SEAM_SLICE {
@@ -646,7 +649,12 @@ pub(package) fn note_seams(seam_count: [u32], slices: u32, tri_count: mut Atomic
 /// Counts in `tri_count[9]` a batch's outline cells past what its `certify_outline` slices
 /// certify (`OVERFLOW_THIN`: those cells have neither a certificate nor an exact cell).
 @compute(1)
-pub(package) fn note_uncertified(cert_count: [u32], slices: u32, tri_count: mut Atomics<u32>, id: GlobalId) {
+pub(package) fn note_uncertified(
+    cert_count: [u32],
+    slices: u32,
+    tri_count: mut Atomics<u32>,
+    id: GlobalId,
+) {
     if id.x == 0 {
         let _ = tri_count.max(i: 11, value: cert_count[0])
         if cert_count[0] > slices * CERT_SLICE {
@@ -687,11 +695,16 @@ pub(package) fn certify_outline<M: Field<Substance>>(
     let cell_lo = brick_corner(g, ab.coord.xyz, vec3u(cx, cy, cz))
     let live = ab.live
     let px = length(exact_eye.xyz - (cell_lo + vec3(0.5 * h))) * exact_eye.w
-    if vi != NONE && !fields[g.orig_id].field_facts().use_stepped_bounds {
+    if vi != NONE {
         let v = verts[vi]
         let at = vec3(v.px, v.py, v.pz)
         let n = unpack_oct_normal(v.packed)
-        if certify_sheet(fields, g.orig_id, live, cell_lo, h, at, n, 2.0 * HOLE_PX * px) {
+        let ok = if is_heavy_field(fields[g.orig_id]) {
+            certify_sheet_pruned(fields, g.orig_id, live, cell_lo, h, at, n, 2.0 * HOLE_PX * px)
+        } else {
+            certify_sheet(fields, g.orig_id, live, cell_lo, h, at, n, 2.0 * HOLE_PX * px)
+        }
+        if ok {
             return
         }
     }
@@ -1359,10 +1372,16 @@ pub(package) fn emit_tris_lod(
 /// Evaluates the 8 coarse corners of cell `nc` in parent grid `pg` directly from `f.distance`,
 /// bit-for-bit identical to level `pg`'s own `eval_corners` (2:1 balance keeps `nc` away from
 /// `pg`'s own outer seam).
-pub(package) fn coarse_cell_corners<M: Field<Substance>>(f: M, pg: GridSpec, nc: vec3u) -> CellCorners {
+pub(package) fn coarse_cell_corners<M: Field<Substance>>(
+    f: M,
+    pg: GridSpec,
+    nc: vec3u,
+) -> CellCorners {
     var ds = [0.0; 8]
     for k in 0..8 {
-        ds[k] = f.distance(lattice(pg, vec3u(nc.x + (k & 1), nc.y + ((k >> 1) & 1), nc.z + (k >> 2))))
+        ds[k] = f.distance(
+            lattice(pg, vec3u(nc.x + (k & 1), nc.y + ((k >> 1) & 1), nc.z + (k >> 2))),
+        )
     }
     CellCorners {
         d000: ds[0],
@@ -1390,7 +1409,9 @@ fn store_seam_vertex<M: Field<Substance>>(
     seam_verts: mut Atomics<u32>,
 ) {
     let n_final = safe_norm(gv, safe_norm(qef.avg_n, vec3(0.0, 1.0, 0.0)))
-    let is_trans = !f.uses_kept() && f.field_facts().may_transmit && f.channels(wp).transmission > 0.02
+    let is_trans = !f.uses_kept() &&
+        f.field_facts().may_transmit &&
+        f.channels(wp).transmission > 0.02
     let smooth = qef.min_dot >= SMOOTH_DOT
     let vi = verts.push(
         MeshVertex {
@@ -1822,6 +1843,5 @@ pub(package) fn set_instances(
         first_instance: 0,
     })
 }
-
 /// Factors `field` into `(rigid_frame, Some(local_shape_key))` when `field` is an outer rigid
 /// warp of a local shape whose channels are constant (`With<S, C>`) or purely local-space,

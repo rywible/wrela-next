@@ -360,6 +360,56 @@ pub fn filter_rest_channels<M: Field<Substance>>(
     FilteredSubstance { sub, proof: FilteredProof { seal: () } }
 }
 
+/// Unforgeable zero-sized proof token witnessing that a `Substance`'s GGX roughness and clearcoat
+/// have been variance-filtered against the surface's screen-space normal curvature (Tokuyoshi &
+/// Kaplanyan 2021, *JCGT* 10(1)), making sub-pixel bevel specular fireflies structurally
+/// unconstructable. Erases to 0 bytes across CPU, Metal, and SPIR-V.
+pub struct SpecAAProof: Copy {
+    seal: (),
+}
+
+/// A `Substance` carrying both `FilteredProof` (Nyquist material prefiltering) and `SpecAAProof`
+/// (geometric specular normal-variance filtering). The sole G-buffer packer (`encode_gbuf_targets`)
+/// requires `SpecAASubstance`, enforcing specular anti-aliasing at the type level.
+pub struct SpecAASubstance: Copy {
+    pub sub: Substance,
+    pub proof: SpecAAProof,
+}
+
+/// Folds screen-space normal derivatives `(dnx, dny)` and optional micro/bump normal-tilt variance
+/// `extra_var` into effective GGX perceptual roughness via Tokuyoshi & Kaplanyan (2021)'s
+/// isotropic geometric specular AA filter (`sigma2 = 0.25`, `kappa = 0.18`), preserving flat
+/// surfaces (`dnx = dny = 0`, `extra_var = 0`) bit-identically.
+pub fn prove_specular_aa(
+    sub_f: FilteredSubstance,
+    dnx: vec3,
+    dny: vec3,
+    extra_var: f32 = 0.0,
+) -> SpecAASubstance {
+    let var_raw = dot(dnx, dnx) + dot(dny, dny)
+    // Reject quad-derivative depth jumps across silhouettes (> 2.0 rad²/px²) while keeping all
+    // real bevel/edge curvature.
+    let var_n = if var_raw > 2.0 { 0.0 } else { var_raw }
+    let total_var = var_n + max(extra_var, 0.0)
+    if total_var <= 1.0e-7 {
+        return SpecAASubstance { sub: sub_f.sub, proof: SpecAAProof { seal: () } }
+    }
+    let kernel_r2 = min(0.25 * total_var, 0.18)
+    let r0 = clamp(sub_f.sub.roughness, 0.02, 1.0)
+    let a0 = r0 * r0
+    let a_eff2 = clamp(a0 * a0 + kernel_r2, 1.6e-7, 1.0)
+    let r_eff = sqrt(sqrt(a_eff2))
+    let coat_eff = if sub_f.sub.coat > 1.0e-4 {
+        sub_f.sub.coat / (1.0 + 18.0 * kernel_r2)
+    } else {
+        sub_f.sub.coat
+    }
+    SpecAASubstance {
+        sub: Substance { roughness: r_eff, coat: coat_eff, ..sub_f.sub },
+        proof: SpecAAProof { seal: () },
+    }
+}
+
 /// Exact slab intersection of ray `(o, d)` with axis-aligned box `[lo, hi]`.
 /// Returns `(t_enter, t_exit)`. The ray misses the box iff `t_enter > t_exit || t_exit < 0.0`.
 pub fn ray_box_interval(o: vec3, d: vec3, lo: vec3, hi: vec3) -> (f32, f32) {
@@ -1179,5 +1229,66 @@ fn filtered_proof_is_zero_sized_and_cuts_nyquist_shimmer() {
     assert(
         err_flt <= 0.35 * err_raw,
         f"Nyquist error did not drop >=65%: filtered={err_flt}, raw={err_raw}",
+    )
+}
+
+@test
+fn spec_aa_proof_is_zero_sized_and_suppresses_bevel_fireflies() {
+    assert(size_of::<SpecAAProof>() == 0, "SpecAAProof must erase to 0 bytes")
+    let glossy = Substance {
+        albedo: vec3(0.85, 0.68, 0.32),
+        roughness: 0.15,
+        emits: vec3(0.0),
+        metallic: 1.0,
+        ior: 1.5,
+        transmission: 0.0,
+        subsurface: 0.0,
+        coat: 0.0,
+        micro: 0.0,
+        bump: 0.0,
+        pad1: 0.0,
+        pad2: 0.0,
+    }
+    let flat_in = prove_vertex_filtered(glossy)
+    let flat_out = prove_specular_aa(flat_in, vec3(0.0), vec3(0.0))
+    assert(
+        flat_out.sub.roughness == glossy.roughness && flat_out.sub.coat == glossy.coat,
+        "flat surface must keep exact roughness and coat",
+    )
+    // A 1-pixel curved brass finial/knob (2D curvature `dtheta = 0.45 rad/px` in x and y) swept
+    // across 25 sub-pixel phases crossing `h = (0, 1, 0)`: compare GGX specular firefly error vs.
+    // 16×16 = 256-sample 2D ground-truth normal patch integral.
+    let from = normalize(vec3(0.25, 0.96, 0.0))
+    let to = normalize(vec3(-0.25, 0.96, 0.0))
+    let dtheta = 0.45
+    var err_raw = 0.0
+    var err_aa = 0.0
+    for px_i in 0..5 {
+        for py_i in 0..5 {
+            let cx = -0.24 + (f32(px_i) / 4.0) * 0.48
+            let cy = -0.24 + (f32(py_i) / 4.0) * 0.48
+            var ref_s = 0.0
+            for kx in 0..16 {
+                for ky in 0..16 {
+                    let ax = cx + ((f32(kx) + 0.5) / 16.0 - 0.5) * dtheta
+                    let ay = cy + ((f32(ky) + 0.5) / 16.0 - 0.5) * dtheta
+                    let nk = normalize(vec3(ax, 1.0, ay))
+                    ref_s += glossy.scatters(nk, from, to).x
+                }
+            }
+            ref_s = ref_s / 256.0
+            let nc = normalize(vec3(cx, 1.0, cy))
+            let dnx = vec3(dtheta, 0.0, 0.0)
+            let dny = vec3(0.0, 0.0, dtheta)
+            let raw_s = glossy.scatters(nc, from, to).x
+            let aa_sub = prove_specular_aa(flat_in, dnx, dny).sub
+            let aa_s = aa_sub.scatters(nc, from, to).x
+            err_raw += abs(raw_s - ref_s)
+            err_aa += abs(aa_s - ref_s)
+        }
+    }
+    assert(
+        err_aa <= 0.30 * err_raw,
+        f"SpecAAProof did not cut curved specular firefly error >=70%: aa={err_aa}, raw={err_raw}",
     )
 }

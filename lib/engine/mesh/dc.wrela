@@ -6,10 +6,10 @@ use matter::substance::Substance
 use mesh::grid::{
     ActiveBrick, BRICK, CAP_SURF, CHUNK_BRICKS, CORNERS_BRICK, CREASE_DOT, CREASE_SLICE,
     CREASE_SLICE_LEAST, ExactCell, FrustumCull, GridSpec, KEPT_TRANS, MeshVertex, NONE,
-    OVERFLOW_THIN, REG_CREASE, REG_SMOOTH, SMOOTH_DOT, THIN_SLICE, VERTS_BRICK, VERTS_STRIDE,
-    along, avg2_sign, avg4_sign, box_in_frustum, brick_corner, brick_in_hole, brick_of, cull_brick,
-    eval_dqs, owner_of, pack_kept, pack_vertex_meta, safe_norm, unpack_is_trans, unpack_oct_normal,
-    unpack_smooth, unpack_thing, with_along,
+    OVERFLOW_THIN, REG_CREASE, REG_SMOOTH, SMOOTH_DOT, THIN_SLICE, VERTS_BRICK, VERTS_STRIDE, along,
+    avg2_sign, avg4_sign, box_in_frustum, brick_corner, brick_in_hole, brick_of, cull_brick,
+    eval_dqs, is_heavy_field, owner_of, pack_kept, pack_vertex_meta, safe_norm, unpack_is_trans,
+    unpack_oct_normal, unpack_smooth, unpack_thing, with_along,
 }
 use std::derive::{Box3, affine_form, value_and_gradient}
 use std::field::{ALL_LIVE, DualQuat, Field, Live}
@@ -473,7 +473,12 @@ fn sample_dist<F: Copy + fn(vec3) -> f32>(dist: F, p: vec3) -> (f32, vec3) {
 /// using `dist`'s exact gradient at the true root as its normal. Edges whose endpoints only differ
 /// in sign due to 2:1 seam inheritance (while `dist` itself does not cross zero along the edge)
 /// are skipped when genuine crossings exist so sharp edges stay crisp across LOD seams.
-pub(package) fn hermite_qef<F: Copy + fn(vec3) -> f32>(dist: F, d: CellCorners, cell_lo: vec3, h: f32) -> Qef {
+pub(package) fn hermite_qef<F: Copy + fn(vec3) -> f32>(
+    dist: F,
+    d: CellCorners,
+    cell_lo: vec3,
+    h: f32,
+) -> Qef {
     var qef = qef_empty()
     for e in 0..12 {
         let (i0, i1) = edge_ends(e)
@@ -647,8 +652,12 @@ pub(package) fn solve_crease_cell<F: Copy + fn(vec3) -> f32>(
                 let raw = final_qef.solve_unclamped(reg)
                 wp_clamped = cell_lo + clamp(raw, vec3(0.0), vec3(1.0)) * h
                 let ext = clamp(raw, vec3(-0.85), vec3(1.85))
-                let out_of_cell = ext.x < 0.0 || ext.x > 1.0 || ext.y < 0.0 || ext.y > 1.0 ||
-                    ext.z < 0.0 || ext.z > 1.0
+                let out_of_cell = ext.x < 0.0 ||
+                    ext.x > 1.0 ||
+                    ext.y < 0.0 ||
+                    ext.y > 1.0 ||
+                    ext.z < 0.0 ||
+                    ext.z > 1.0
                 if use_hermite && final_qef.min_dot < -0.15 && out_of_cell {
                     ewp = cell_lo + ext * h
                     stage = 3
@@ -854,7 +863,9 @@ fn push_vertex<M: Field<Substance>>(
     cell_verts: mut Atomics<u32>,
 ) {
     let n_final = safe_norm(gv, safe_norm(qef.avg_n, vec3(0.0, 1.0, 0.0)))
-    let is_trans = !f.uses_kept() && f.field_facts().may_transmit && f.channels(wp).transmission > 0.02
+    let is_trans = !f.uses_kept() &&
+        f.field_facts().may_transmit &&
+        f.channels(wp).transmission > 0.02
     let smooth = qef.min_dot >= SMOOTH_DOT
     let vi = verts.push(
         MeshVertex {
@@ -880,7 +891,11 @@ pub(package) const CERT_MARKS: u32 = CHUNK_BRICKS * 24
 /// Atomically claims `(brick_in_chunk, cell)` in the 48 KB chunk-local deduplication bitset so
 /// every cell emits at most ONE Tier-2 `ExactCell` across `solve_verts`, `refine_creases`, and
 /// the outline's quads in `emit_tris`/`emit_tris_lod` (no cell drawn twice by one brick).
-pub(package) fn claim_exact_cell(exact_seen: mut Atomics<u32>, brick_in_chunk: u32, cell: u32) -> bool {
+pub(package) fn claim_exact_cell(
+    exact_seen: mut Atomics<u32>,
+    brick_in_chunk: u32,
+    cell: u32,
+) -> bool {
     let word = brick_in_chunk * 12 + (cell >> 5)
     let bit = 1 << (cell & 31)
     (exact_seen.or(i: word, value: bit) & bit) == 0
@@ -975,7 +990,12 @@ pub(package) fn classify_cells(
 /// Counts in `tri_count[9]` a chunk's candidates past what its `filter_thin_cells` slices test
 /// (`OVERFLOW_THIN`, raised by `finish_draw`).
 @compute(64)
-pub(package) fn note_untested(thin_count: [u32], slices: u32, tri_count: mut Atomics<u32>, id: GlobalId) {
+pub(package) fn note_untested(
+    thin_count: [u32],
+    slices: u32,
+    tri_count: mut Atomics<u32>,
+    id: GlobalId,
+) {
     if id.x == 0 {
         let _ = tri_count.max(i: 10, value: thin_count[0])
         if thin_count[0] > slices * THIN_SLICE {
@@ -1032,7 +1052,7 @@ pub(package) fn filter_thin_cells<M: Field<Substance>>(
     let lo = cell_lo + vec3(m)
     let w = h - 2.0 * m
     var maybe = false
-    if fields[g.orig_id].field_facts().use_stepped_bounds {
+    if is_heavy_field(fields[g.orig_id]) {
         var cur_live = live
         for k in 0..9 {
             if !maybe {
@@ -1221,7 +1241,8 @@ pub(package) fn keep_verts<M: Field<Substance>>(
     let p = vec3(v.px, v.py, v.pz)
     let f = fields[unpack_thing(v.packed)]
     let (_, part, kept) = f.kept_at(p)
-    let trans = if f.field_facts().may_transmit && f.channels_kept(p, part, kept).transmission > 0.02 {
+    let trans = if f.field_facts().may_transmit &&
+        f.channels_kept(p, part, kept).transmission > 0.02 {
         KEPT_TRANS
     } else {
         0
@@ -1414,7 +1435,9 @@ fn push_skinned_vertex<M: Field<Substance>>(
     cell_verts: mut Atomics<u32>,
 ) {
     let n_final = safe_norm(gv, safe_norm(qef.avg_n, vec3(0.0, 1.0, 0.0)))
-    let is_trans = !f.uses_kept() && f.field_facts().may_transmit && f.rest_channels(wp).transmission > 0.02
+    let is_trans = !f.uses_kept() &&
+        f.field_facts().may_transmit &&
+        f.rest_channels(wp).transmission > 0.02
     let smooth = qef.min_dot >= SMOOTH_DOT
     let sw = f.rest_skin_weights(wp)
     let vi = verts.push(
@@ -1626,5 +1649,4 @@ pub(package) fn deform_skinned_verts<M: Field<Substance>>(
         packed: pack_vertex_meta(nrm, tid, smooth: smooth, is_trans: is_trans),
     }
 }
-
 /// Dual vertex index of local cell `(x, y, z)` in `0..7` inside brick `bi`.

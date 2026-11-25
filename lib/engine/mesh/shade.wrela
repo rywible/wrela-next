@@ -15,11 +15,11 @@ use mesh::light::{
     sun_shadow_hybrid, sun_vis_point, trace_ssr,
 }
 use mesh::proof::{
-    CellRay, CellRayGrad, FilteredSubstance, clamp_footprint_vec, discard_proven, filter_channels,
-    filter_channels_1d, filter_channels_kept_1d, filter_rest_channels, pixel_tangent_footprint,
-    prove_box_unseen, prove_opaque_only, prove_point_behind_opaque, prove_transmissive_only,
-    prove_vertex_filtered, ray_box_bracket, seen_part, solve_cell_ray,
-    solve_cell_ray_lipschitz_grad,
+    CellRay, CellRayGrad, FilteredSubstance, SpecAASubstance, clamp_footprint_vec, discard_proven,
+    filter_channels, filter_channels_1d, filter_channels_kept_1d, filter_rest_channels,
+    pixel_tangent_footprint, prove_box_unseen, prove_opaque_only, prove_point_behind_opaque,
+    prove_specular_aa, prove_transmissive_only, prove_vertex_filtered, ray_box_bracket, seen_part,
+    solve_cell_ray, solve_cell_ray_lipschitz_grad,
 }
 use mesh::sdf::{SdfGrid, multi_bounce_ao, sdf_bent_ao, sdf_curvature, sdf_thickness}
 use mesh::tsr::project_uv_unjittered
@@ -518,9 +518,36 @@ fn nyquist_micro_atten(dist: f32, pixel: f32, max_freq: f32) -> f32 {
     clamp(1.5 - nyq, 0.0, 1.0)
 }
 
+/// Sole G-buffer packer: requires a `SpecAASubstance` witness (carrying both `FilteredProof` and
+/// `SpecAAProof`) so neither unfiltered procedural shading nor un-filtered sharp-bevel specular
+/// roughness can ever reach deferred lighting.
+fn encode_gbuf_targets(
+    n: vec3,
+    sub_aa: SpecAASubstance,
+    motion: vec2,
+    facts: FieldFacts,
+) -> Targets4<vec4, vec4, vec4, vec2> {
+    let sub = sub_aa.sub
+    let emits = if facts.may_emit {
+        if facts.channels_proven {
+            LinearLight::proven(max(sub.emits, vec3(0.0))).rgb
+        } else {
+            LinearLight::sanitize(sub.emits).rgb
+        }
+    } else {
+        vec3(0.0)
+    }
+    Targets4 {
+        first: vec4(n * 0.5 + vec3(0.5), 1.0),
+        second: vec4(clamp(sub.albedo, vec3(0.0), vec3(1.0)), clamp(sub.roughness, 0.02, 1.0)),
+        third: vec4(emits, encode_mat_signed(sub)),
+        fourth: motion,
+    }
+}
+
 /// Lean Visibility-buffer 1× G-buffer writer for similarity-transformed (`Rigid`) meshlets:
-/// computes the exact tangent micro-relief gradient directly from `xf` with zero screen-space
-/// derivative math (halving live registers vs. `shade_gbuf_exact`).
+/// computes the exact tangent micro-relief gradient directly from `xf` and enforces geometric
+/// specular AA (`SpecAAProof`) via exact analytical normal derivatives `(dnx, dny)`.
 pub(package) fn shade_gbuf_rigid(
     wp: vec3,
     prev_wp: vec3,
@@ -538,6 +565,8 @@ pub(package) fn shade_gbuf_rigid(
     dwy: vec3 = vec3(0.0),
     dbx: f32 = 0.0,
     dby: f32 = 0.0,
+    dnx: vec3 = vec3(0.0),
+    dny: vec3 = vec3(0.0),
 ) -> Targets4<vec4, vec4, vec4, vec2> {
     let sub_in = sanitize_substance(sub_f.sub, facts)
     let to_eye = v.at - wp
@@ -564,27 +593,20 @@ pub(package) fn shade_gbuf_rigid(
         facts.may_micro,
         facts.may_coat,
     )
+    let tilt = n - n0
+    let sub_aa = prove_specular_aa(
+        FilteredSubstance { sub, proof: sub_f.proof },
+        dnx,
+        dny,
+        extra_var: 0.25 * dot(tilt, tilt),
+    )
     let motion = motion_of(wp, prev_wp, v, prev_v)
-    let emits = if facts.may_emit {
-        if facts.channels_proven {
-            LinearLight::proven(max(sub.emits, vec3(0.0))).rgb
-        } else {
-            LinearLight::sanitize(sub.emits).rgb
-        }
-    } else {
-        vec3(0.0)
-    }
-    Targets4 {
-        first: vec4(n * 0.5 + vec3(0.5), 1.0),
-        second: vec4(clamp(sub.albedo, vec3(0.0), vec3(1.0)), clamp(sub.roughness, 0.02, 1.0)),
-        third: vec4(emits, encode_mat_signed(sub)),
-        fourth: motion,
-    }
+    encode_gbuf_targets(n, sub_aa, motion, facts)
 }
 
 /// Visibility-buffer 1× G-buffer writer using exact analytical screen-space derivatives
-/// `(dwx, dwy, dmx, dmy)` and exact triangle face normal `face_n` (zero 2×2 helper-lane quad
-/// overshading and safe after per-pixel `discard_proven`).
+/// `(dwx, dwy, dmx, dmy, dnx, dny)` and exact triangle face normal `face_n` (zero 2×2 helper-lane
+/// quad overshading and safe after per-pixel `discard_proven`).
 pub(package) fn shade_gbuf_exact(
     wp: vec3,
     prev_wp: vec3,
@@ -600,6 +622,8 @@ pub(package) fn shade_gbuf_exact(
     v: View,
     prev_v: View,
     facts: FieldFacts = FieldFacts::unknown(),
+    dnx: vec3 = vec3(0.0),
+    dny: vec3 = vec3(0.0),
 ) -> Targets4<vec4, vec4, vec4, vec2> {
     let sub_in = sanitize_substance(sub_f.sub, facts)
     let to_eye = v.at - wp
@@ -624,22 +648,15 @@ pub(package) fn shade_gbuf_exact(
         facts.may_micro,
         facts.may_coat,
     )
+    let tilt = n - n0
+    let sub_aa = prove_specular_aa(
+        FilteredSubstance { sub, proof: sub_f.proof },
+        dnx,
+        dny,
+        extra_var: 0.25 * dot(tilt, tilt),
+    )
     let motion = motion_of(wp, prev_wp, v, prev_v)
-    let emits = if facts.may_emit {
-        if facts.channels_proven {
-            LinearLight::proven(max(sub.emits, vec3(0.0))).rgb
-        } else {
-            LinearLight::sanitize(sub.emits).rgb
-        }
-    } else {
-        vec3(0.0)
-    }
-    Targets4 {
-        first: vec4(n * 0.5 + vec3(0.5), 1.0),
-        second: vec4(clamp(sub.albedo, vec3(0.0), vec3(1.0)), clamp(sub.roughness, 0.02, 1.0)),
-        third: vec4(emits, encode_mat_signed(sub)),
-        fourth: motion,
-    }
+    encode_gbuf_targets(n, sub_aa, motion, facts)
 }
 
 /// Shared 1× G-buffer + analytical motion-vector writer used by heightfields, exact cells, and
@@ -682,22 +699,17 @@ fn shade_gbuf_core(
         facts.may_bump && !exact_normal,
         ray_back,
     )
+    let dnx = if exact_normal { vec3(0.0) } else { dpdx(n) }
+    let dny = if exact_normal { vec3(0.0) } else { dpdy(n) }
+    let tilt = n - n0
+    let sub_aa = prove_specular_aa(
+        FilteredSubstance { sub, proof: sub_f.proof },
+        dnx,
+        dny,
+        extra_var: 0.25 * dot(tilt, tilt),
+    )
     let motion = motion_of(wp, prev_wp, v, prev_v)
-    let emits = if facts.may_emit {
-        if facts.channels_proven {
-            LinearLight::proven(max(sub.emits, vec3(0.0))).rgb
-        } else {
-            LinearLight::sanitize(sub.emits).rgb
-        }
-    } else {
-        vec3(0.0)
-    }
-    Targets4 {
-        first: vec4(n * 0.5 + vec3(0.5), 1.0),
-        second: vec4(clamp(sub.albedo, vec3(0.0), vec3(1.0)), clamp(sub.roughness, 0.02, 1.0)),
-        third: vec4(emits, encode_mat_signed(sub)),
-        fourth: motion,
-    }
+    encode_gbuf_targets(n, sub_aa, motion, facts)
 }
 
 /// Pixel-rate analytical G-buffer fragment shader for Pass-2 Hi-Z disoccluded `Pool<M>` meshlets.
