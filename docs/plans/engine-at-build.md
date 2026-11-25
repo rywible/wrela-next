@@ -1,12 +1,14 @@
 # Plan: the engine makes its decisions at build
 
-Status: proposal, 2026-11-25. No phase is started.
+Status: proposal. No phase is started. The plan agrees with the code at commit `1c78609`
+(2026-11-25).
 
-This plan contains no new measurement. Each number comes from the design notes, from
-`docs/spec/language.md` or from a comment in the code. The plan gives the source of each number.
+The plan gives the source of each number: a commit, a tool, `docs/spec/language.md`, a comment in
+the code or the design notes.
 
 The design notes are not in the repository now. To read them, use
-`git show ca13c8e:docs/design.md`.
+`git show ca13c8e:docs/design.md`. A number from the design notes is older than the code. Measure
+it again before you use it.
 
 ## 1. Purpose
 
@@ -91,6 +93,9 @@ Known numbers:
 - With safe math, an older frame lost 91% on the M4 (`toolchain/shader/src/metal.rs`).
 - No person measured strict math on the engine as it is today. The specification says that an
   exact build is not for a time measurement.
+- Strictness is a property of the full build today (`Checks::exact` in
+  `toolchain/shader/src/lib.rs`, which `wrela build --exact` sets). No kernel can be strict
+  alone.
 
 Steps:
 
@@ -114,9 +119,15 @@ Question: how much of the first frame is extraction of matter that does not chan
 Known numbers: the first frame of SCENE 10 is 225 ms on the M4. A frame after that is
 approximately 21 ms. In the serial run, extraction is 43 ms (design notes, 2026-11-24).
 
+These numbers are older than commits `233fd5d` and `5a6dfd6`. Those commits changed what the
+engine does when a frame cuts an extraction short: the engine now continues the extraction in the
+next frame. Thus the extraction of one kind can use more than one frame.
+
 Steps:
 
-1. Measure the extraction time of each kind in the first frame of SCENE 10 and SCENE 13.
+1. Measure the extraction time of each kind in SCENE 10 and SCENE 13, from the first frame to
+   the frame in which each batch is settled (`MeshBatch::settled` in
+   `lib/engine/mesh/extract.wrela`). Record the number of that frame.
 2. Record which kinds have a field that reads no time and no state.
 3. Calculate the part of the extraction time that those kinds use.
 
@@ -125,6 +136,14 @@ This number tells us how much time the cook can save in the first frame.
 ### 0.3 The time to build one kind
 
 Question: how long is the build from a changed field to a kind that the engine can draw?
+
+Known numbers:
+
+- The build of one scene takes 13 to 19 s on the M4. It uses one thread. Each scene build
+  compiles `lib/std` and the engine again (`tools/gate` prints the time of its builds, commit
+  `298e357`).
+- The tests of `game/world`, which contain the certificate report, take 9 s on the M4 (commit
+  `1c78609`).
 
 Steps:
 
@@ -186,7 +205,7 @@ The problem today:
 - Each strict kernel gives the same bits on the M4, on the Radeon and on the CPU.
 - No proof uses an error limit that the build does not obey.
 - The certificate report (`game/world/certificates.wrela`, which `tools/check` shows) gives no
-  kind fewer certified cells than before phase 1.
+  kind fewer certified cells than before phase 1. Section 10 gives the counts at `1c78609`.
 - The frame is not more than 5% slower on the two machines (the same target as 0.1).
 
 If a function from step 6 makes a kernel too slow, make the function faster. Do not go back to
@@ -217,8 +236,9 @@ only its input? Phase 2 answers the question for each part.
 4. **Add a report to `wrela`.** For each kind, it lists the parts and their classes.
 5. **Use the classes in the engine.** Extract a part of class "never" one time only.
 6. **Remove the run-time check that the class replaces.** Today the engine finds a field that did
-   not change from its `StateHash`. If the class makes that check unnecessary for a kind, remove
-   the check for that kind in the same change.
+   not change from its `StateHash` (`One<M>` and `Pool<M>` in
+   `lib/engine/mesh/world_draw.wrela`). If the class makes that check unnecessary for a kind,
+   remove the check for that kind in the same change.
 
 ### Done when
 
@@ -235,12 +255,19 @@ The cook is not a second engine. It is the work that the engine does in the firs
 before the game runs. The same GPU kernels make it. Thus a cooked mesh and a live mesh join with
 no crack between them.
 
+The engine had a second method to keep a field, as a volume (`BakedField`). Commit `00225aa`
+removed it because nothing used it. Do not add it again. The cook keeps the meshes that the
+engine draws, not a second form of the field.
+
 ### Steps
 
-1. **Add a cook run.** It is a run through `tools/gpu` with no window. It lets extraction become
-   stable and then writes the meshes and the certificates to a file.
+1. **Add a cook run.** It is a run through `tools/gpu` with no window. It runs until each batch
+   is settled (`MeshBatch::settled` in `lib/engine/mesh/extract.wrela`). Then it writes the
+   meshes and the certificates to a file. If a batch does not become settled, the cook run fails
+   and names the batch, as the hole audit does.
 2. **Give each cook a key.** The key is the hash of the field, the hash of the engine and the
-   name of the machine.
+   name of the machine. Make the hash of the engine from the contents of its files, as
+   `tools/gate` makes the key of a result. Do not use the commit.
 3. **Keep the cook between builds.** A build makes a cook again only when its key changes.
 4. **Load the cook when the game starts.** The engine does no extraction for a kind that has a
    cook.
@@ -265,9 +292,23 @@ no crack between them.
 Purpose: the engine becomes a program that the build runs. It writes the kernels, the tables and
 the frame schedule for this game.
 
-Much of this exists. Constants run at build in wasmtime with a fuel limit. `FieldFacts` already
-removes code paths that a kind does not use. That change made `exact_box` two times faster: 1.71
-to 0.88 ms on the M4, 4.00 to 1.95 ms on the Radeon (design notes, 2026-11-24).
+Much of this exists:
+
+- Constants run at build in wasmtime with a fuel limit.
+- `prove_field_facts` (`lib/engine/matter/verify.wrela`) runs at build and gives the
+  `FieldFacts` of a kind. The facts remove code paths that the kind does not use. That change
+  made `exact_box` two times faster: 1.71 to 0.88 ms on the M4, 4.00 to 1.95 ms on the Radeon
+  (commit `40512f2`).
+- The compiler counts the maximum work of one invocation of each kernel
+  (`docs/spec/language.md`, §18.11). The manifest of a build contains the count.
+- The host knows the time of one unit of work on each machine (`toolchain/host/src/step.rs`).
+  Before a dispatch runs, the host multiplies the count, the number of invocations and that
+  time. It refuses a dispatch that can be longer than 50 ms.
+- `wrela pipelines` lists each kernel, its type arguments and the code that dispatches it.
+
+One thing was removed. The toolchain had a model of the cost of a frame
+(`toolchain/driver/src/wcet.rs`). Commit `00225aa` removed it because no person compared it with
+a measured pass. The cost model of step 4 must not have the same fault.
 
 ### Steps
 
@@ -275,15 +316,21 @@ to 0.88 ms on the M4, 4.00 to 1.95 ms on the Radeon (design notes, 2026-11-24).
    - Write engine code that runs at build and makes the decision from facts and counts.
    - Keep the result as a constant of the kind.
    - Remove the run-time code for that decision in the same change.
-2. **Start with the decision of how to draw each kind:** closed form, the full field, the live
-   parts, or cells of one size.
+2. **Start with the decisions that depend only on the kind.** Today a batch finds while the game
+   runs if its kind has a skin and if its mesh changes shape (`is_skinned` and `is_deformed` in
+   `lib/engine/mesh/extract.wrela`). A pool finds while the game runs if its things share one
+   mesh (`lib/engine/mesh/world_draw.wrela`). A decision that depends on the eye stays at run
+   time, for example `has_exact` and `has_seams`.
 3. **Write the frame schedule at build.** The schedule is the list of passes that a scene uses,
    in order. A pass that no kind uses is not in the schedule.
-4. **Calculate the cost of the full frame at build** from the work counts of the compiler. Show
-   it for each machine line in `tools/gate.json`.
-5. **Make the 50 ms rule a build error.** If the calculated time of one dispatch is above the
-   limit, the build fails. The message names the kernel.
-6. **Show the source of each kernel.** `wrela explain` must name the engine function and the
+4. **Calculate the cost of the full frame at build.** Use the work count of each kernel and the
+   time of one unit of work on each machine. Show the cost of each pass for each machine line
+   in `tools/gate.json`. In the same change, add a check that compares each calculated cost
+   with the measured time of that pass.
+5. **Make the 50 ms rule a build error where the build knows the number of invocations.** If
+   the calculated time of one dispatch is above the limit, the build fails. The message names
+   the kernel. The host continues to refuse a dispatch whose size is known only at run time.
+6. **Show the source of each kernel.** `wrela pipelines` must name the engine function and the
    field that made the kernel.
 
 ### Done when
@@ -307,10 +354,48 @@ This phase is a loop. It has no fixed list of steps.
 
 Known numbers:
 
+- The frame time at 1080p, in ms (`tools/gate.json`, commit `1c78609`). The bar is 16.6 ms.
+
+  | Scene | M4 | Radeon |
+  | --- | --- | --- |
+  | 10 | 24.4 | 56.6 |
+  | 11 | 16.7 | 46.2 |
+  | 13 | 18.2 | 26.9 |
+  | 14 | 21.4 | 29.0 |
+
 - A proof made single passes two times faster (`exact_box`, the exact rays of the sun).
-- Those passes are approximately 2 ms of a 17 ms frame (design notes, 2026-11-24, SCENE 10, serial).
-- SCENE 10 is 24.8 ms on the M4 today (`tools/gate`, commit `298e357`). The bar is 16.6 ms.
-- Many cells have no certificate. The creature had 20 of 25 at 1 cm and 0 of 25 at 8 cm.
+- Those passes are approximately 2 ms of a 17 ms frame (design notes, 2026-11-24, SCENE 10,
+  serial).
+- Many cells have no certificate. The table gives the certified cells of each kind at three
+  cell sizes (`tools/wrela test game/world`, commit `1c78609`).
+
+  | Kind | 1 cm | 2.7 cm | 8 cm |
+  | --- | --- | --- | --- |
+  | `arena_brazier_stands` | 39 of 42 | 20 of 42 | 3 of 42 |
+  | `arena_courtyard` | 100 of 100 | 100 of 100 | 100 of 100 |
+  | `arena_flame` | 58 of 60 | 47 of 60 | 10 of 60 |
+  | `arena_pillars` | 97 of 100 | 93 of 100 | 32 of 100 |
+  | `citadel` | 100 of 100 | 99 of 100 | 99 of 100 |
+  | `creature` | 20 of 25 | 9 of 25 | 0 of 25 |
+  | `glass_shard` | 98 of 100 | 49 of 100 | 6 of 100 |
+  | `marble_column` | 99 of 100 | 98 of 100 | 40 of 100 |
+  | `parry_arc` | 56 of 60 | 51 of 60 | 14 of 60 |
+  | `rival_orb` | 60 of 60 | 60 of 60 | 2 of 60 |
+  | `stack` | 100 of 100 | 99 of 100 | 63 of 100 |
+  | `stage` | 100 of 100 | 99 of 100 | 98 of 100 |
+
+- Some facts are not proven (the same report, `field_facts_report`).
+  - The compiler gives no steepness for the citadel. A kind with no steepness uses the slower
+    solver in its exact cells (`lib/engine/mesh/shade.wrela`).
+  - The steepness of `arena_pillars` is 12,039 and that of `marble_column` is 5,720. The other
+    kinds are below 2.
+  - The channels of 4 of 9 kinds are not proven: `arena_courtyard`, `creature`, `marble_column`
+    and `parry_arc`. Their shaders keep the NaN guards and the range guards.
+- Some counts of proof debt exist now. None is shown as a time.
+  - The judge of the sun counts the fields whose exact rays a frame did not trace (`untraced`
+    in `tools/gate`, 0 on the two machines at commits `605e1ad` and `1c78609`).
+  - The hole audit counts the eyes that are not settled.
+  - Each batch counts its exact cells (`exact_cells` in `lib/engine/mesh/extract.wrela`).
 
 Thus a faster small pass is not sufficient. The large results come from proofs that remove a full
 class of work.
@@ -318,7 +403,7 @@ class of work.
 ### The loop
 
 1. **Count the proof debt.** For each pass, count the pixels, cells, rays or bricks that use the
-   slow path because a certificate is missing.
+   slow path because a certificate is missing. Start from the counts that exist.
 2. **Record the cause.** For each count, record the kind and the operation that the compiler was
    not able to bound.
 3. **Show the proof debt in the build report.** Use the cost model of phase 4 to change each
@@ -328,6 +413,12 @@ class of work.
 
 ### First items for speed
 
+- **Facts that are not proven.** Find the operation that gives the citadel no steepness, and the
+  operations that give `arena_pillars` and `marble_column` a large steepness. Find the channel
+  that is not proven in each of the 4 kinds. Find the cost of each in the frame before you
+  repair it.
+- **Certificates at 8 cm.** The things of the parry and the creature have the fewest:
+  `glass_shard` 6 of 100, `rival_orb` 2 of 60, `parry_arc` 14 of 60, `creature` 0 of 25.
 - **Detail by distance.** A certificate shows that a coarse mesh is in one pixel of the field at
   a given distance. Then the engine draws a far thing with the coarse mesh.
 - **A mesh that stays correct for some frames.** A proof gives the maximum rate at which a field
@@ -344,7 +435,8 @@ class of work.
   the bound, the steepness and the cost of that field for all values of its parameters.
 - **New operators.** Add a warp, a twist or a displacement to the kit when the compiler can
   bound its steepness. A field with a loose bound is correct but slow. A tighter proof makes it
-  fast.
+  fast. Add an operator only in the change in which a field of the game uses it. Commit
+  `00225aa` removed four forms of the kit that nothing used. `Twisted` was one of them.
 - **The time of a parry.** Calculate from the fields the time interval in which one spell
   touches the other. The client and the server must get the same interval.
 
