@@ -895,7 +895,7 @@ fn a_sixth_target_keeps_the_least_each_fragment_offers() {
 #[ignore = "needs a GPU"]
 fn an_affine_range_holds_every_sample_in_gpu_code() {
     let dir = wrela_tests::repo_root().join("toolchain/tests/affine");
-    assert_eq!(crate::tests_pass(&dir), 3);
+    assert_eq!(crate::tests_pass(&dir), 5);
 }
 
 /// A kind's things in GPU code (toolchain/tests/kinds, gap 29): a group built in a kernel from a

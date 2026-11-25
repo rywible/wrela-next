@@ -389,6 +389,15 @@ impl<'m> Writer<'m> {
             ir::TypeDef::Atomic(s) => format!("metal::atomic_{}", scalar_name(*s)?),
             ir::TypeDef::Vector(s, n) => vector_name(*s, *n)?,
             ir::TypeDef::Matrix(c, r) => format!("metal::float{c}x{r}"),
+            ir::TypeDef::Array(e, _) | ir::TypeDef::RuntimeArray(e)
+                if analysis::unit_enum(&m.types, *e) == Some(analysis::UnitEnum::Bool) =>
+            {
+                // MSL would hold each as a 1-byte `bool`, where the layout (and SPIR-V) holds
+                // its 4-byte tag: refused rather than laid out differently on Metal.
+                return Err("an array of a two-variant enum without payloads isn't written for \
+                     Metal yet (each would be a 1-byte bool where its layout holds a 4-byte tag)"
+                    .into());
+            }
             ir::TypeDef::Array(e, n) => {
                 let elem = self.ty(*e)?;
                 let name = format!("A{}", t.0);

@@ -672,6 +672,7 @@ lang_items! {
     PushNew = "std::stage::push_new",
     TapeFinish = "std::stage::finish",
     Smin = "std::field::smin",
+    Meet = "std::field::meets",
     ValueNoise = "std::field::value_noise",
     ValueNoiseBox = "std::field::value_noise_box",
     LatticeCoord = "std::field::lattice_coord",

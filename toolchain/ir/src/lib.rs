@@ -789,6 +789,10 @@ pub struct Budget {
 pub enum Known {
     /// `std::field::smin(a, b, k)`: `SMIN`.
     Smin,
+    /// `std::field::meets(at)`: `at > 0`, the condition of a branch whose two sides agree where
+    /// `at` is 0. A tape and the other derivations take its body; only `std::derive::lipschitz`
+    /// trusts it, taking the steeper side across the switch.
+    Meet,
     /// `std::field::value_noise(p)`: `NOISE3`.
     ValueNoise,
     /// `std::field::value_noise_box(p, half)`: `BOXNOISE3`.

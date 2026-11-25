@@ -8,6 +8,14 @@
 //!   `0 <= i < len` for fixed arrays (`Len::Const`) or storage buffers (`Len::Of`).
 //! - IR optimizer (`opt.rs`): fold statically settled comparisons, erase dead branches, and
 //!   eliminate redundant `abs`/`clamp`/`saturate`/`min`/`max` guards on proven-finite ranges.
+//!
+//! A NaN: a float range here is a fact about finite values. An operation whose result is bounded
+//! whatever its argument (`sin`, `cos`, `atan`, `sign`, `fract`, `smoothstep`) is bounded only
+//! when its arguments are, since a NaN or an infinity in gives a NaN out (`sin(inf)`,
+//! `fract(inf)`), and erasing a guard on it would let the NaN through. A clamp's bound holds as
+//! much as the clamp does (`clamp(NaN, lo, hi)` is whatever the target's `clamp` makes of it, and
+//! a guard erased after it is the same clamp again); `step` compares, so it is 0 or 1 whatever
+//! comes in.
 
 use crate::*;
 use std::collections::{HashMap, HashSet};
@@ -165,13 +173,25 @@ fn eval_float_expr(
                 let hi = b.sqrt();
                 ((lo * (1.0 - 1.0e-6)).max(0.0), hi * (1.0 + 1.0e-6) + 1.0e-30)
             }
-            (Builtin::Sin | Builtin::Cos, [_]) => (-1.0, 1.0),
-            (Builtin::Atan, [_]) => {
+            (Builtin::Sin | Builtin::Cos, [x]) => {
+                go(*x)?;
+                (-1.0, 1.0)
+            }
+            (Builtin::Atan, [x]) => {
+                go(*x)?;
                 (-std::f64::consts::FRAC_PI_2 - 1.0e-5, std::f64::consts::FRAC_PI_2 + 1.0e-5)
             }
-            (Builtin::Smoothstep, [_, _, _]) => (0.0, 1.0),
+            (Builtin::Smoothstep, [e0, e1, x]) => {
+                go(*e0)?;
+                go(*e1)?;
+                go(*x)?;
+                (0.0, 1.0)
+            }
             (Builtin::Step, [_, _]) => (0.0, 1.0),
-            (Builtin::Sign, [_]) => (-1.0, 1.0),
+            (Builtin::Sign, [x]) => {
+                go(*x)?;
+                (-1.0, 1.0)
+            }
             (Builtin::Floor, [x]) => {
                 let (a, b) = go(*x)?;
                 (a.floor(), b.floor())
@@ -188,7 +208,10 @@ fn eval_float_expr(
                 let (a, b) = go(*x)?;
                 (a.round(), b.round())
             }
-            (Builtin::Fract, [_]) => (0.0, 1.0),
+            (Builtin::Fract, [x]) => {
+                go(*x)?;
+                (0.0, 1.0)
+            }
             (Builtin::Mix, [a, b, t]) => {
                 let (a, b, t) = (go(*a)?, go(*b)?, go(*t)?);
                 if t.0 >= 0.0 && t.1 <= 1.0 {
@@ -886,6 +909,39 @@ mod tests {
         assert!(!r.within(v(4), 0.0, 6.0));
         assert!(r.within(v(5), -0.001, 56.0));
         assert!(!r.within(v(5), -0.001, 55.0));
+    }
+
+    #[test]
+    fn a_bounded_function_of_an_unbounded_float_has_no_range() {
+        // `sin`, `cos`, `atan`, `sign`, `fract` and `smoothstep` of a load (which may be a NaN or an
+        // infinity) have no range, so no guard after them is erased; of a clamp, they do.
+        let mut f = Function::new("f", Vec::new(), None);
+        let v = ValueId;
+        let l = LocalId(0);
+        let mut body = vec![
+            Stmt::Let(v(0), Expr::Load(Place::local(l))),
+            Stmt::Let(v(1), Expr::Const(Const::F32(-4.0))),
+            Stmt::Let(v(2), Expr::Const(Const::F32(4.0))),
+            Stmt::Let(v(3), Expr::Builtin(Builtin::Clamp, vec![v(0), v(1), v(2)])),
+        ];
+        let ops = [Builtin::Sin, Builtin::Cos, Builtin::Atan, Builtin::Sign, Builtin::Fract];
+        for (k, b) in ops.iter().enumerate() {
+            let k = k as u32;
+            body.push(Stmt::Let(v(10 + k), Expr::Builtin(*b, vec![v(0)])));
+            body.push(Stmt::Let(v(20 + k), Expr::Builtin(*b, vec![v(3)])));
+        }
+        body.push(Stmt::Let(v(30), Expr::Builtin(Builtin::Smoothstep, vec![v(1), v(2), v(0)])));
+        body.push(Stmt::Let(v(31), Expr::Builtin(Builtin::Smoothstep, vec![v(1), v(2), v(3)])));
+        body.push(Stmt::Let(v(32), Expr::Builtin(Builtin::Step, vec![v(1), v(0)])));
+        f.body = body;
+        let mut r = Ranges::new(&f);
+        for k in 0..ops.len() as u32 {
+            assert!(r.of(v(10 + k)).is_none(), "{:?} of a load has a range", ops[k as usize]);
+            assert!(r.within(v(20 + k), -1.58, 1.58), "{:?} of a clamp has none", ops[k as usize]);
+        }
+        assert!(r.of(v(30)).is_none());
+        assert!(r.within(v(31), 0.0, 1.0));
+        assert!(r.within(v(32), 0.0, 1.0));
     }
 
     #[test]

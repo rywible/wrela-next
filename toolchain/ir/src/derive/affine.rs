@@ -3468,6 +3468,25 @@ impl Af<'_> {
                 self.forms.insert(v, a);
                 return Ok(());
             }
+            // `std::field::meets(at)` is `at > 0`, decided where the box decides it, as the
+            // comparison written out would be (its body, derived as a call, returns no sureness).
+            if known == Some(Known::Meet)
+                && let Arg::Value(at) = &args[0]
+            {
+                let f32_ty = self.m.types.f32();
+                let a = self.of_as(out, *at, f32_ty);
+                let (lo, hi) = self.ends(out, &a, f32_ty);
+                let z = self.k(out, f32_ty, 0.0);
+                let mut sure = (self.cmp(out, BinOp::Gt, lo, z), self.cmp(out, BinOp::Le, hi, z));
+                if let Some(form) = self.forms.get(at).cloned() {
+                    let ok = self.within(out, &form);
+                    let bt = self.bool_ty;
+                    sure.0 = self.emit(out, bt, Expr::Binary(BinOp::And, sure.0, ok));
+                    sure.1 = self.emit(out, bt, Expr::Binary(BinOp::And, sure.1, ok));
+                }
+                self.sure.insert(v, sure);
+                return Ok(());
+            }
             if known == Some(Known::ValueNoise) {
                 let x = self.arg_form(out, &args[0])?;
                 let a = self.noise(out, g, x)?;

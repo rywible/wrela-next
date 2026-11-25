@@ -109,11 +109,12 @@ fn tapes_match_their_compiled_fields_on_the_gpu() {
     report("tape values on the GPU", measured, TOLERANCE);
 }
 
-/// A creature's tape, the herd's grazer's, holds under 2,048 operations.
+/// A creature's tape, the herd's grazer's, holds under 2,048 operations (1,115: its round cones'
+/// regions `meet`, each a subtraction more than the branch's comparison was).
 #[test]
 fn a_creature_tapes_in_under_2048_operations() {
     let mut host = crate::cpu_host(&built("fields"));
-    assert_eq!(one_u32(&mut host, "grazer_tape_len", &[]), 1077);
+    assert_eq!(one_u32(&mut host, "grazer_tape_len", &[]), 1115);
 }
 
 /// Pruning the blob's tape (35 operations: three spheres of 11, and two smooth minimums) to a

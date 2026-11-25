@@ -726,6 +726,7 @@ impl<'a> Cx<'a> {
         if let InstanceKey::Fn { func, .. } = &key {
             f.known = match self.checked.program.func(*func).lang {
                 Some(Lang::Smin) => Some(ir::Known::Smin),
+                Some(Lang::Meet) => Some(ir::Known::Meet),
                 Some(Lang::ValueNoise) => Some(ir::Known::ValueNoise),
                 Some(Lang::ValueNoiseBox) => Some(ir::Known::ValueNoiseBox),
                 Some(Lang::LatticeCoord) => Some(ir::Known::LatticeCoord),

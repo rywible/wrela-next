@@ -16,36 +16,10 @@ use sea::swells
 use kit::substances::pbr::{basalt, dielectric, emissive, glass, metal, sand, stone}
 use std::cmp::Eq
 use std::field::{
-    Bound, Field, FieldFacts, Rotate, RoundCone, Scale, Surface, Translate, Union, With, hash_u32,
-    round_cone, smin,
+    Bound, Field, FieldFacts, Rotate, RoundCone, Scale, Surface, Translate, Union, With,
+    box_distance, cylinder_distance, hash_u32, meets, round_cone, smin,
 }
 use std::hash::{StateHash, state_hash}
-
-/// Exact SDF of an upright cylinder centred at `(cx, cz)` from `y_lo` to `y_hi` with radius `r`.
-/// Branching on `dr > 0 && dy > 0` avoids `sqrt(0)` straddling on the shaft and caps.
-fn sd_cyl(p: vec3, cx: f32, cz: f32, y_lo: f32, y_hi: f32, r: f32) -> f32 {
-    let dr = length(vec2(p.x - cx, p.z - cz)) - r
-    let dy = max(p.y - y_hi, y_lo - p.y)
-    if dr > 0.0 && dy > 0.0 {
-        length(vec2(dr, dy))
-    } else {
-        max(dr, dy)
-    }
-}
-
-/// Exact SDF of an axis-aligned box centred at `c` with half-extents `h`.
-/// Branching on the median (`second > 0`) avoids `sqrt(0)` straddling on all 6 faces.
-fn sd_box(p: vec3, c: vec3, h: vec3) -> f32 {
-    let q = abs(p - c) - h
-    let xy_hi = max(q.x, q.y)
-    let xy_lo = min(q.x, q.y)
-    let second = max(xy_lo, min(xy_hi, q.z))
-    if second > 0.0 {
-        length(max(q, vec3(0.0)))
-    } else {
-        max(xy_hi, q.z)
-    }
-}
 
 /// Exact SDF of a tapered capsule/spear segment from `a` to `b` with radii `ra` -> `rb`.
 fn sd_spear(p: vec3, a: vec3, b: vec3, ra: f32, rb: f32) -> f32 {
@@ -77,9 +51,9 @@ impl Surface for ArenaCourtyard {
     /// most `FIELD_WORK_MOST`).
     @budget(work: 128)
     fn distance(self, p: vec3) -> f32 {
-        let d_top = sd_cyl(p, cx: 0.0, cz: 0.0, y_lo: -0.30, y_hi: 0.0, r: 6.2)
-        let d_mid = sd_cyl(p, cx: 0.0, cz: 0.0, y_lo: -0.62, y_hi: -0.24, r: 7.1)
-        let d_base = sd_cyl(p, cx: 0.0, cz: 0.0, y_lo: -2.0, y_hi: -0.58, r: 8.1)
+        let d_top = cylinder_distance(p, vec2(0.0, 0.0), y_lo: -0.30, y_hi: 0.0, r: 6.2)
+        let d_mid = cylinder_distance(p, vec2(0.0, 0.0), y_lo: -0.62, y_hi: -0.24, r: 7.1)
+        let d_base = cylinder_distance(p, vec2(0.0, 0.0), y_lo: -2.0, y_hi: -0.58, r: 8.1)
         let r = length(p.xz)
         let d_curb_r = abs(r - 6.02) - 0.18
         let d_curb_y = max(p.y - 0.14, -0.10 - p.y)
@@ -175,8 +149,8 @@ fn sd_pillar(p: vec3, cx: f32, cz: f32, h_top: f32, tilt_x: f32, tilt_z: f32) ->
     let lx = p.x - cx
     let lz = p.z - cz
     let r = length(vec2(lx, lz))
-    let plinth = sd_box(vec3(lx, p.y, lz), vec3(0.0, 0.22, 0.0), vec3(0.68, 0.24, 0.68))
-    let collar = sd_cyl(p, cx: cx, cz: cz, y_lo: 0.42, y_hi: 0.60, r: 0.56)
+    let plinth = box_distance(vec3(lx, p.y, lz), vec3(0.0, 0.22, 0.0), vec3(0.68, 0.24, 0.68))
+    let collar = cylinder_distance(p, vec2(cx, cz), y_lo: 0.42, y_hi: 0.60, r: 0.56)
     // 10-fold shaft flutes: `cos(10 θ) · min(r / 0.40, 1)^10` via complex power.
     // Clamping to `[-1, 1]` is an exact identity (`|lx|, |lz| <= r <= max(r, 0.40)`) that keeps
     // interval/Lipschitz bounds finite over arbitrarily large boxes.
@@ -192,7 +166,9 @@ fn sd_pillar(p: vec3, cx: f32, cz: f32, h_top: f32, tilt_x: f32, tilt_z: f32) ->
     let cut_y = h_top + lx * tilt_x + lz * tilt_z + 0.08 * c3.y
     let shaft_r = r - (0.46 - flute)
     let shaft_y = max(p.y - cut_y, 0.40 - p.y)
-    let shaft = if shaft_r > 0.0 && shaft_y > 0.0 {
+    // Past the side and the broken top at once, the rim; else the nearer: they meet where the
+    // lesser is 0 (as `std::field::cylinder_distance`).
+    let shaft = if meets(min(shaft_r, shaft_y)) {
         length(vec2(shaft_r, shaft_y))
     } else {
         max(shaft_r, shaft_y)
@@ -209,7 +185,7 @@ impl Surface for ArenaPillars {
         let p1 = sd_pillar(p, cx: -2.0, cz: -4.9, h_top: 5.6, tilt_x: -0.20, tilt_z: 0.30)
         let p2 = sd_pillar(p, cx: 2.2, cz: -4.9, h_top: 5.2, tilt_x: 0.35, tilt_z: -0.22)
         let p3 = sd_pillar(p, cx: 4.9, cz: -3.0, h_top: 3.8, tilt_x: -0.55, tilt_z: 0.18)
-        let lintel = sd_box(p, vec3(0.1, 5.25, -4.9), vec3(2.55, 0.34, 0.46))
+        let lintel = box_distance(p, vec3(0.1, 5.25, -4.9), vec3(2.55, 0.34, 0.46))
         let fallen = sd_spear(p, vec3(4.1, 0.36, -1.6), vec3(5.3, 0.34, -0.9), ra: 0.36, rb: 0.35)
         min(min(min(min(min(p0, p1), p2), p3), lintel), fallen)
     }
@@ -276,9 +252,9 @@ pub fn arena_brazier_stands() -> ArenaBrazierStands {
 
 /// Sculpted flared open bronze temple chalice resting on a stepped plinth and fluted column stem.
 fn sd_brazier_stand(p: vec3, cx: f32, cz: f32) -> f32 {
-    let base = sd_cyl(p, cx: cx, cz: cz, y_lo: 0.0, y_hi: 0.16, r: 0.40)
-    let foot = sd_cyl(p, cx: cx, cz: cz, y_lo: 0.14, y_hi: 0.30, r: 0.26)
-    let stem = sd_cyl(p, cx: cx, cz: cz, y_lo: 0.26, y_hi: 0.94, r: 0.11)
+    let base = cylinder_distance(p, vec2(cx, cz), y_lo: 0.0, y_hi: 0.16, r: 0.40)
+    let foot = cylinder_distance(p, vec2(cx, cz), y_lo: 0.14, y_hi: 0.30, r: 0.26)
+    let stem = cylinder_distance(p, vec2(cx, cz), y_lo: 0.26, y_hi: 0.94, r: 0.11)
     // Flared chalice cup (wider at top `y = 1.18`), hollowed out on top so flames sit inside.
     let lr = length(vec2(p.x - cx, p.z - cz))
     let cup_t = clamp((p.y - 0.88) / 0.32, 0.0, 1.0)

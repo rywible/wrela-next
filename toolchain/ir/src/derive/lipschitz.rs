@@ -11,12 +11,22 @@
 //! Why both `J` and `lip`:
 //! - Tracking `J` preserves exact linear cancellation (`pa - u * dot(pa, u)`, `x - x`, orthogonal
 //!   rotations `R * p` where Gershgorin on `J Jᵀ = I` gives exact `1.0`).
-//! - Tracking scalar `lip` eliminates crease blowup across piecewise operations (`abs`, `min`,
-//!   `max`, `clamp`, `smin`, `length`, `if`): `max(lip_a, lip_b)` stays `1.0` across 90° box edges
-//!   and union creases where component-wise `||hull(∇a, ∇b)||₂` jumps to `√2` or `√3`.
+//! - Tracking scalar `lip` eliminates crease blowup across the continuous piecewise builtins
+//!   (`abs`, `min`, `max`, `clamp`, `length`): `max(lip_a, lip_b)` stays `1.0` across 90° box
+//!   edges and union creases where component-wise `||hull(∇a, ∇b)||₂` jumps to `√2` or `√3`.
+//!
+//! What jumps has no bound. A branch on the input (`if`, a select) whose condition the box
+//! doesn't settle may switch between values that differ on the switching surface, and a step
+//! function (`floor`, `ceil`, `round`, `trunc`, `sign`, `step`, `fract`) whose box holds a step
+//! jumps there: either is `BIG`, its Jacobian unbounded too (so no `tighten` takes it back). A box
+//! that settles the condition, or holds no step, keeps the bound of what it takes. (`max(t, f)`
+//! across a switch holds only for a function continuous there, which nothing here can check:
+//! `if x > 0 { x } else { x + 1 }` is 1 each side and unbounded across.) A branch on a condition
+//! `std::field::meets(at)` made is where the author states the two sides agree (an exact
+//! distance's regions): across it the bound is the steeper side's.
 
 use super::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 type R<T> = Result<T>;
 
@@ -301,6 +311,7 @@ fn derive(
         lparts,
         vals: HashMap::new(),
         sure: HashMap::new(),
+        meeting: HashSet::new(),
         returns,
         speculative: 0,
         ptrs,
@@ -339,6 +350,8 @@ struct Lip<'a> {
     lparts: Vec<Vec<LocalId>>,
     vals: HashMap<ValueId, LVal>,
     sure: HashMap<ValueId, Sure>,
+    /// The conditions made by `std::field::meets`: a branch on one is trusted to meet itself.
+    meeting: HashSet<ValueId>,
     returns: bool,
     speculative: u32,
     ptrs: Pointers,
@@ -784,6 +797,38 @@ impl Lip<'_> {
         self.builtin(out, Builtin::Min, vec![lip, j_nrm], self.f32_ty)
     }
 
+    /// Whether every component of `c`, a comparison of two values of type `ty`, holds.
+    fn all_of(&mut self, out: &mut Block, c: ValueId, ty: TypeId) -> ValueId {
+        let Some(k) = self.width(ty) else {
+            return c;
+        };
+        let bt = self.bool_ty;
+        let mut acc = self.emit(out, bt, Expr::Extract(c, 0));
+        for j in 1..k as u32 {
+            let cj = self.emit(out, bt, Expr::Extract(c, j));
+            acc = self.emit(out, bt, Expr::Binary(BinOp::And, acc, cj));
+        }
+        acc
+    }
+
+    /// A step function that never falls (`floor`, `ceil`, `round`, `trunc`, `sign`, `step` past
+    /// an edge the input doesn't move), `fl` and `fh` at the box's two ends: constant over the
+    /// box where they agree (no slope), and where they don't, a step lies inside it, where no
+    /// Lipschitz bound holds (`BIG`, its Jacobian unbounded too).
+    fn stepwise(&mut self, out: &mut Block, fl: ValueId, fh: ValueId, ty: TypeId) -> LVal {
+        let same = self.cmp(out, BinOp::Eq, fl, fh);
+        let flat = self.all_of(out, same, ty);
+        let z = self.zero(out, ty);
+        let big = self.k(out, ty, BIG);
+        let nbig = self.k(out, ty, -BIG);
+        let jl = self.sel(out, same, z, nbig);
+        let jh = self.sel(out, same, z, big);
+        let zf = self.kf(out, 0.0);
+        let bigf = self.kf(out, BIG);
+        let lip = self.sel(out, flat, zf, bigf);
+        LVal { lo: fl, hi: fh, j_lo: vec![jl; self.n], j_hi: vec![jh; self.n], lip }
+    }
+
     fn exact(&mut self, out: &mut Block, v: ValueId) -> LVal {
         let ty = self.ty(v);
         let z = self.zero(out, ty);
@@ -839,19 +884,37 @@ impl Lip<'_> {
         LVal { lo, hi, j_lo, j_hi, lip }
     }
 
-    fn join(&mut self, out: &mut Block, (st, sf): Sure, t: &LVal, f: &LVal, ty: TypeId) -> LVal {
+    /// `t` where the box surely has the condition, `f` where it surely hasn't, and across the
+    /// switch their values' hull: unbounded (the result may jump there: the module's doc) but
+    /// for a condition `std::field::meets` made (`meets`), whose two sides the author states
+    /// agree at the switch, where the bound is the steeper side's and the Jacobian their hull.
+    fn join(
+        &mut self,
+        out: &mut Block,
+        (st, sf): Sure,
+        meets: bool,
+        t: &LVal,
+        f: &LVal,
+        ty: TypeId,
+    ) -> LVal {
         let (lo, hi) = self.iv_hull(out, (t.lo, t.hi), (f.lo, f.hi), ty);
-        let mut j_lo = Vec::with_capacity(self.n);
-        let mut j_hi = Vec::with_capacity(self.n);
-        for i in 0..self.n {
-            let (jl, jh) = self.iv_hull(out, (t.j_lo[i], t.j_hi[i]), (f.j_lo[i], f.j_hi[i]), ty);
-            j_lo.push(jl);
-            j_hi.push(jh);
-        }
-        // Key Clarke-Lipschitz property: at every point either `then` or `else` executes, so
-        // `||∇f||₂ <= max(t.lip, f.lip)` with ZERO crease blowup!
-        let lip = self.builtin(out, Builtin::Max, vec![t.lip, f.lip], self.f32_ty);
-        let h = LVal { lo, hi, j_lo, j_hi, lip };
+        let h = if meets {
+            let mut j_lo = Vec::with_capacity(self.n);
+            let mut j_hi = Vec::with_capacity(self.n);
+            for i in 0..self.n {
+                let (jl, jh) =
+                    self.iv_hull(out, (t.j_lo[i], t.j_hi[i]), (f.j_lo[i], f.j_hi[i]), ty);
+                j_lo.push(jl);
+                j_hi.push(jh);
+            }
+            let lip = self.builtin(out, Builtin::Max, vec![t.lip, f.lip], self.f32_ty);
+            LVal { lo, hi, j_lo, j_hi, lip }
+        } else {
+            let big = self.k(out, ty, BIG);
+            let nbig = self.k(out, ty, -BIG);
+            let lip = self.kf(out, BIG);
+            LVal { lo, hi, j_lo: vec![nbig; self.n], j_hi: vec![big; self.n], lip }
+        };
         let r = self.pick(out, sf, f, &h);
         self.pick(out, st, t, &r)
     }
@@ -1080,6 +1143,7 @@ impl Lip<'_> {
             )),
             Stmt::If { cond, then, else_ } if self.act.value(*cond) => {
                 let sure = self.sure_of(out, *cond);
+                let meets = self.meeting.contains(cond);
                 let mut roots = Vec::new();
                 self.written(then, &mut roots);
                 self.written(else_, &mut roots);
@@ -1109,7 +1173,7 @@ impl Lip<'_> {
                     let j = match (t, e) {
                         (LState::Float(t), LState::Float(e)) => {
                             let ty = self.root_ty(r)?;
-                            LState::Float(self.join(out, sure, &t, &e, ty))
+                            LState::Float(self.join(out, sure, meets, &t, &e, ty))
                         }
                         (LState::Bool(t), LState::Bool(e)) => {
                             LState::Bool(self.join_bool(out, sure, t, e))
@@ -1205,7 +1269,8 @@ impl Lip<'_> {
                 let (t, f) = (self.of_as(out, *if_true, ty), self.of_as(out, *if_false, ty));
                 if self.act.value(*cond) {
                     let sure = self.sure_of(out, *cond);
-                    self.join(out, sure, &t, &f, ty)
+                    let meets = self.meeting.contains(cond);
+                    self.join(out, sure, meets, &t, &f, ty)
                 } else {
                     self.pick(out, *cond, &t, &f)
                 }
@@ -1995,18 +2060,14 @@ impl Lip<'_> {
                 let a = self.of_as(out, args[0], ty);
                 let fl = self.builtin(out, b, vec![a.lo], ty);
                 let fh = self.builtin(out, b, vec![a.hi], ty);
-                let z = self.zero(out, ty);
-                let zf = self.kf(out, 0.0);
-                LVal { lo: fl, hi: fh, j_lo: vec![z; self.n], j_hi: vec![z; self.n], lip: zf }
+                self.stepwise(out, fl, fh, ty)
             }
             B::Step if !self.act.value(args[0]) => {
                 let a = self.of_as(out, args[1], ty);
                 let edge = self.coerce(out, args[0], ty);
                 let fl = self.builtin(out, b, vec![edge, a.lo], ty);
                 let fh = self.builtin(out, b, vec![edge, a.hi], ty);
-                let z = self.zero(out, ty);
-                let zf = self.kf(out, 0.0);
-                LVal { lo: fl, hi: fh, j_lo: vec![z; self.n], j_hi: vec![z; self.n], lip: zf }
+                self.stepwise(out, fl, fh, ty)
             }
             B::Fract => {
                 let a = self.of_as(out, args[0], ty);
@@ -2019,8 +2080,16 @@ impl Lip<'_> {
                 let rhi = self.bin(out, BinOp::Sub, a.hi, fl, ty);
                 let lo = self.sel(out, same, rlo, z);
                 let hi = self.sel(out, same, rhi, one);
-                // `d/dx fract(x) = 1` almost everywhere!
-                LVal { lo, hi, j_lo: a.j_lo, j_hi: a.j_hi, lip: a.lip }
+                // `fract(x) = x - floor(x)`: its argument's slope where the box holds no integer;
+                // where it holds one, a jump of 1, and no bound.
+                let flat = self.all_of(out, same, ty);
+                let big = self.k(out, ty, BIG);
+                let nbig = self.k(out, ty, -BIG);
+                let j_lo = a.j_lo.iter().map(|&j| self.sel(out, same, j, nbig)).collect();
+                let j_hi = a.j_hi.iter().map(|&j| self.sel(out, same, j, big)).collect();
+                let bigf = self.kf(out, BIG);
+                let lip = self.sel(out, flat, a.lip, bigf);
+                LVal { lo, hi, j_lo, j_hi, lip }
             }
             B::Pow if !self.act.value(args[1]) => {
                 let a = self.of_as(out, args[0], ty);
@@ -2183,6 +2252,15 @@ impl Lip<'_> {
                 let x = self.arg_lval(out, &args[0])?;
                 let a = self.noise(out, g, x)?;
                 self.vals.insert(v, a);
+                return Ok(());
+            }
+            if known == Some(Known::Meet) {
+                let at = self.arg_lval(out, &args[0])?;
+                let z = self.kf(out, 0.0);
+                let st = self.cmp(out, BinOp::Gt, at.lo, z);
+                let sf = self.cmp(out, BinOp::Le, at.hi, z);
+                self.sure.insert(v, (st, sf));
+                self.meeting.insert(v);
                 return Ok(());
             }
             if known == Some(Known::Smin)

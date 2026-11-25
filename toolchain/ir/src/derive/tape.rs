@@ -1117,7 +1117,9 @@ impl Tp<'_> {
         // std's own functions that are one operation of the tape. (`lattice` isn't: its
         // coordinates are integers, which `HASH`'s floats hold exactly only to 2²⁴, so its body
         // is taped, hashing the pairs as compiled code does.)
-        if let (Some(v), Some(known)) = (v, self.m.functions[g.index()].known) {
+        if let (Some(v), Some(known)) =
+            (v, self.m.functions[g.index()].known.filter(|k| *k != Known::Meet))
+        {
             let ty = self.f.value_ty(v);
             out.push(Stmt::Let(v, Expr::Zero(ty)));
             // Each argument's value, and its registers.
@@ -1153,6 +1155,7 @@ impl Tp<'_> {
                 // range, 0 for an infinity or NaN.
                 Known::LatticeCoord => self.int_op(out, F2I, &[regs[0], regs[0]])?,
                 Known::Pcg => self.int_op(out, PCG, &[regs[0], regs[0]])?,
+                Known::Meet => unreachable!("a meet is taken as its body"),
             };
             self.rv.insert(v, r);
             return Ok(());
