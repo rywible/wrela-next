@@ -179,20 +179,20 @@ pub fn discard_proven(_proof: EmptyProof) {
     discard()
 }
 
-/// Unforgeable zero-sized proof token witnessing that a `Substance` was evaluated through
-/// compiler-derived Nyquist filtering (`std::derive::filtered` over the pixel's screen-space
-/// tangent footprint), proven spatially constant (`has_constant_channels()`), or pre-bandlimited
-/// by vertex interpolation. Erases to 0 bytes across CPU, Metal, and SPIR-V.
-pub struct FilteredProof: Copy {
-    seal: (),
+/// A `Substance` the G-buffer's shading takes: filtered over the pixel's footprint
+/// (`filter_channels` and its kin, through `std::derive::filtered`), a field's whose channels
+/// never change, or interpolated between a mesh's vertices (`prove_vertex_filtered`). Its field is
+/// private, so it is made only here, each way by name, and a shading entry point can't be handed
+/// a substance asked at a pixel's centre.
+pub struct FilteredSubstance: Copy {
+    sub: Substance,
 }
 
-/// A `Substance` paired with its zero-byte `FilteredProof` witness. All G-buffer shading entry
-/// points accept `FilteredSubstance` rather than raw `Substance`, making unfiltered procedural
-/// channel shading structurally unconstructable.
-pub struct FilteredSubstance: Copy {
-    pub sub: Substance,
-    pub proof: FilteredProof,
+impl FilteredSubstance {
+    /// The filtered substance.
+    pub fn substance(self) -> Substance {
+        self.sub
+    }
 }
 
 /// Placeholder `FilteredSubstance` for inactive visibility-buffer quad lanes that are discarded
@@ -213,14 +213,13 @@ pub fn unshaded_filtered_placeholder() -> FilteredSubstance {
             pad1: 0.0,
             pad2: 0.0,
         },
-        proof: FilteredProof { seal: () },
     }
 }
 
 /// Witnesses a vertex-interpolated `Substance` (e.g. terrain `MeshVary`) already band-limited by
 /// mesh vertex spacing rather than high-frequency per-fragment procedural evaluation.
 pub fn prove_vertex_filtered(sub: Substance) -> FilteredSubstance {
-    FilteredSubstance { sub, proof: FilteredProof { seal: () } }
+    FilteredSubstance { sub }
 }
 
 /// Analytic world-space pixel tangent-plane footprint `(dwx, dwy)` at surface hit `wp` with
@@ -279,7 +278,7 @@ pub fn filter_channels<M: Field<Substance>>(
     } else {
         filtered(|uv: vec2| field.channels(wp + dwx * uv.x + dwy * uv.y), vec2(0.0), vec2(1.0))
     }
-    FilteredSubstance { sub, proof: FilteredProof { seal: () } }
+    FilteredSubstance { sub }
 }
 
 /// Evaluates `field.channels_kept` through compiler-derived anisotropic 2D Nyquist filtering over
@@ -301,12 +300,12 @@ pub fn filter_channels_kept<M: Field<Substance>>(
             vec2(1.0),
         )
     }
-    FilteredSubstance { sub, proof: FilteredProof { seal: () } }
+    FilteredSubstance { sub }
 }
 
 /// Lean 1-direction Nyquist filter for exact-cell silhouette shaders (where the grazing footprint
 /// is dominated by one major axis, cutting shader code size in half vs. 2-direction `_f2` while
-/// still evaluating through compiler-derived `std::derive::filtered` and minting `FilteredProof`).
+/// still evaluating through compiler-derived `std::derive::filtered`).
 pub fn filter_channels_1d<M: Field<Substance>>(
     field: M,
     wp: vec3,
@@ -319,7 +318,7 @@ pub fn filter_channels_1d<M: Field<Substance>>(
         let dir = if dot(dwx, dwy) >= 0.0 { dwx + dwy } else { dwx - dwy }
         filtered(|s: f32| field.channels(wp + dir * s), at: 0.0, width: 1.0)
     }
-    FilteredSubstance { sub, proof: FilteredProof { seal: () } }
+    FilteredSubstance { sub }
 }
 
 /// Lean 1-direction Nyquist filter for `channels_kept_exact` in exact-cell silhouette shaders
@@ -338,7 +337,7 @@ pub fn filter_channels_kept_1d<M: Field<Substance>>(
         let dir = if dot(dwx, dwy) >= 0.0 { dwx + dwy } else { dwx - dwy }
         filtered(|s: f32| field.channels_kept_exact(wp + dir * s, part, kept), at: 0.0, width: 1.0)
     }
-    FilteredSubstance { sub, proof: FilteredProof { seal: () } }
+    FilteredSubstance { sub }
 }
 
 /// Evaluates `field.rest_channels` through compiler-derived anisotropic 2D Nyquist filtering over
@@ -358,57 +357,7 @@ pub fn filter_rest_channels<M: Field<Substance>>(
             vec2(1.0),
         )
     }
-    FilteredSubstance { sub, proof: FilteredProof { seal: () } }
-}
-
-/// Unforgeable zero-sized proof token witnessing that a `Substance`'s GGX roughness and clearcoat
-/// have been variance-filtered against the surface's screen-space normal curvature (Tokuyoshi &
-/// Kaplanyan 2021, *JCGT* 10(1)), making sub-pixel bevel specular fireflies structurally
-/// unconstructable. Erases to 0 bytes across CPU, Metal, and SPIR-V.
-pub struct SpecAAProof: Copy {
-    seal: (),
-}
-
-/// A `Substance` carrying both `FilteredProof` (Nyquist material prefiltering) and `SpecAAProof`
-/// (geometric specular normal-variance filtering). The sole G-buffer packer (`encode_gbuf_targets`)
-/// requires `SpecAASubstance`, enforcing specular anti-aliasing at the type level.
-pub struct SpecAASubstance: Copy {
-    pub sub: Substance,
-    pub proof: SpecAAProof,
-}
-
-/// Folds screen-space normal derivatives `(dnx, dny)` and optional micro/bump normal-tilt variance
-/// `extra_var` into effective GGX perceptual roughness via Tokuyoshi & Kaplanyan (2021)'s
-/// isotropic geometric specular AA filter (`sigma2 = 0.25`, `kappa = 0.18`), preserving flat
-/// surfaces (`dnx = dny = 0`, `extra_var = 0`) bit-identically.
-pub fn prove_specular_aa(
-    sub_f: FilteredSubstance,
-    dnx: vec3,
-    dny: vec3,
-    extra_var: f32 = 0.0,
-) -> SpecAASubstance {
-    let var_raw = dot(dnx, dnx) + dot(dny, dny)
-    // Reject quad-derivative depth jumps across silhouettes (> 2.0 rad²/px²) while keeping all
-    // real bevel/edge curvature.
-    let var_n = if var_raw > 2.0 { 0.0 } else { var_raw }
-    let total_var = var_n + max(extra_var, 0.0)
-    if total_var <= 1.0e-7 {
-        return SpecAASubstance { sub: sub_f.sub, proof: SpecAAProof { seal: () } }
-    }
-    let kernel_r2 = min(0.25 * total_var, 0.18)
-    let r0 = clamp(sub_f.sub.roughness, 0.02, 1.0)
-    let a0 = r0 * r0
-    let a_eff2 = clamp(a0 * a0 + kernel_r2, 1.6e-7, 1.0)
-    let r_eff = sqrt(sqrt(a_eff2))
-    let coat_eff = if sub_f.sub.coat > 1.0e-4 {
-        sub_f.sub.coat / (1.0 + 18.0 * kernel_r2)
-    } else {
-        sub_f.sub.coat
-    }
-    SpecAASubstance {
-        sub: Substance { roughness: r_eff, coat: coat_eff, ..sub_f.sub },
-        proof: SpecAAProof { seal: () },
-    }
+    FilteredSubstance { sub }
 }
 
 /// Exact slab intersection of ray `(o, d)` with axis-aligned box `[lo, hi]`.
@@ -1008,7 +957,7 @@ pub fn solve_field_cell_ray<M: Field<Substance>>(
     solve_cell_ray(|q: vec3| field.distance(q), o, d, te, tx, px, lip)
 }
 
-// ---- The sun's visibility (`VisProof`, `SunVisibility`) ----
+// ---- The sun's visibility (`SunVisibility`) ----
 //
 // The sun lights a surface only through a `SunVisibility`, and one is made only here, by one of
 // these routes:
@@ -1032,23 +981,26 @@ pub fn solve_field_cell_ray<M: Field<Substance>>(
 // No comparison sampler, no depth bias and no normal offset is left: a shadow map's raw depth
 // is compared only here, to a receiver plane's exact depth at the texel's own centre.
 
-/// Unforgeable zero-sized witness that a sun visibility was found by one of this module's
-/// certified routes. Erases to 0 bytes across CPU, Metal and SPIR-V.
-pub struct VisProof: Copy {
-    seal: (),
+/// How much of the sun's disc a surface point sees (0..1). Its field is private, so it is made
+/// only here, by one of the routes below, each named for what decided it: proven lit or dark by
+/// the map's certificate, backfacing, the map's taps where no caster is near, the exact rays, or
+/// (`sun_map_taps`, where no exact pass follows) the map's taps alone, an estimate.
+pub struct SunVisibility: Copy {
+    vis: f32,
 }
 
-/// How much of the sun's disc a surface point sees (0..1), with its witness.
-pub struct SunVisibility: Copy {
-    pub vis: f32,
-    pub proof: VisProof,
+impl SunVisibility {
+    /// How much of the sun's disc the point sees.
+    pub fn vis(self) -> f32 {
+        self.vis
+    }
 }
 
 /// The surface's geometric normal faces away from the sun (`ndl`, its cosine to the sun's way,
 /// at most 0): it hides the whole disc from itself.
 pub fn prove_sun_backfacing(ndl: f32) -> Option<SunVisibility> {
     if ndl <= 0.0 {
-        Some(SunVisibility { vis: 0.0, proof: VisProof { seal: () } })
+        Some(SunVisibility { vis: 0.0 })
     } else {
         None
     }
@@ -1067,7 +1019,7 @@ pub fn prove_sun_lit(
     eps: f32,
 ) -> Option<SunVisibility> {
     if zmin_fine >= plane_lo_fine - eps && zmin_cone >= plane_lo_cone - eps {
-        Some(SunVisibility { vis: 1.0, proof: VisProof { seal: () } })
+        Some(SunVisibility { vis: 1.0 })
     } else {
         None
     }
@@ -1078,7 +1030,7 @@ pub fn prove_sun_lit(
 /// hidden.
 pub fn prove_sun_dark(zmax_cone: f32, plane_lo_cone: f32, band: f32) -> Option<SunVisibility> {
     if zmax_cone < plane_lo_cone - band {
-        Some(SunVisibility { vis: 0.0, proof: VisProof { seal: () } })
+        Some(SunVisibility { vis: 0.0 })
     } else {
         None
     }
@@ -1091,7 +1043,6 @@ pub fn sun_map_penumbra(blocked: f32, taps: f32, near: u32) -> Option<SunVisibil
     if near == 0 && taps > 0.0 {
         Some(SunVisibility {
             vis: clamp(1.0 - blocked / taps, 0.0, 1.0),
-            proof: VisProof { seal: () },
         })
     } else {
         None
@@ -1099,11 +1050,12 @@ pub fn sun_map_penumbra(blocked: f32, taps: f32, near: u32) -> Option<SunVisibil
 }
 
 /// The map's taps where no exact pass follows (glass, the radiance volume, the froxels):
-/// `open` of `taps` with no caster above the receiver's plane beyond the meshes' error.
+/// `open` of `taps` with no caster above the receiver's plane beyond the meshes' error. An
+/// estimate, not proven: a caster nearer than the map can place is taken as not there, and no
+/// judge holds these to a reference yet.
 pub fn sun_map_taps(open: f32, taps: f32) -> SunVisibility {
     SunVisibility {
         vis: if taps > 0.0 { clamp(open / taps, 0.0, 1.0) } else { 1.0 },
-        proof: VisProof { seal: () },
     }
 }
 
@@ -1112,7 +1064,6 @@ pub fn sun_map_taps(open: f32, taps: f32) -> SunVisibility {
 pub fn sun_exact(vis_far: f32, vis_near: f32) -> SunVisibility {
     SunVisibility {
         vis: clamp(vis_far, 0.0, 1.0) * clamp(vis_near, 0.0, 1.0),
-        proof: VisProof { seal: () },
     }
 }
 
@@ -1296,8 +1247,7 @@ pub fn trace_sun_near<M: Field<Substance>>(
 // ---- CPU soundness tests (run at build time via `tools/check`) ----
 
 @test
-fn vis_proof_is_zero_sized_and_exact_rays_see_contact_and_self() {
-    assert(size_of::<VisProof>() == 0, "VisProof must erase to 0 bytes")
+fn exact_rays_see_contact_and_self() {
     assert(size_of::<SunVisibility>() == 4, "SunVisibility must be one f32")
     let tan_sun = tan(0.0046)
     let up = vec3(0.0, 1.0, 0.0)
@@ -1593,8 +1543,7 @@ fn ray_sphere_bracket_matches_exact_sphere() {
 }
 
 @test
-fn filtered_proof_is_zero_sized_and_cuts_nyquist_shimmer() {
-    assert(size_of::<FilteredProof>() == 0, "FilteredProof must erase to 0 bytes")
+fn filtering_over_the_footprint_cuts_nyquist_shimmer() {
     // High-frequency procedural gilded-lettering + oak-ring field evaluated across 32 distant
     // pixels: compare unfiltered point samples vs. `filter_channels` against 64-sample brute-force
     // box average over each pixel's tangent footprint.
@@ -1621,7 +1570,7 @@ fn filtered_proof_is_zero_sized_and_cuts_nyquist_shimmer() {
         }
         ref_col = ref_col * (1.0 / 64.0)
         let raw_col = Field::<Substance>::channels(f, wp).albedo
-        let flt_col = filter_channels(f, wp, dwx, dwy).sub.albedo
+        let flt_col = filter_channels(f, wp, dwx, dwy).substance().albedo
         err_raw += length(raw_col - ref_col)
         err_flt += length(flt_col - ref_col)
     }
@@ -1631,63 +1580,3 @@ fn filtered_proof_is_zero_sized_and_cuts_nyquist_shimmer() {
     )
 }
 
-@test
-fn spec_aa_proof_is_zero_sized_and_suppresses_bevel_fireflies() {
-    assert(size_of::<SpecAAProof>() == 0, "SpecAAProof must erase to 0 bytes")
-    let glossy = Substance {
-        albedo: vec3(0.85, 0.68, 0.32),
-        roughness: 0.15,
-        emits: vec3(0.0),
-        metallic: 1.0,
-        ior: 1.5,
-        transmission: 0.0,
-        subsurface: 0.0,
-        coat: 0.0,
-        micro: 0.0,
-        bump: 0.0,
-        pad1: 0.0,
-        pad2: 0.0,
-    }
-    let flat_in = prove_vertex_filtered(glossy)
-    let flat_out = prove_specular_aa(flat_in, vec3(0.0), vec3(0.0))
-    assert(
-        flat_out.sub.roughness == glossy.roughness && flat_out.sub.coat == glossy.coat,
-        "flat surface must keep exact roughness and coat",
-    )
-    // A 1-pixel curved brass finial/knob (2D curvature `dtheta = 0.45 rad/px` in x and y) swept
-    // across 25 sub-pixel phases crossing `h = (0, 1, 0)`: compare GGX specular firefly error vs.
-    // 16×16 = 256-sample 2D ground-truth normal patch integral.
-    let from = normalize(vec3(0.25, 0.96, 0.0))
-    let to = normalize(vec3(-0.25, 0.96, 0.0))
-    let dtheta = 0.45
-    var err_raw = 0.0
-    var err_aa = 0.0
-    for px_i in 0..5 {
-        for py_i in 0..5 {
-            let cx = -0.24 + (f32(px_i) / 4.0) * 0.48
-            let cy = -0.24 + (f32(py_i) / 4.0) * 0.48
-            var ref_s = 0.0
-            for kx in 0..16 {
-                for ky in 0..16 {
-                    let ax = cx + ((f32(kx) + 0.5) / 16.0 - 0.5) * dtheta
-                    let ay = cy + ((f32(ky) + 0.5) / 16.0 - 0.5) * dtheta
-                    let nk = normalize(vec3(ax, 1.0, ay))
-                    ref_s += glossy.scatters(nk, from, to).x
-                }
-            }
-            ref_s = ref_s / 256.0
-            let nc = normalize(vec3(cx, 1.0, cy))
-            let dnx = vec3(dtheta, 0.0, 0.0)
-            let dny = vec3(0.0, 0.0, dtheta)
-            let raw_s = glossy.scatters(nc, from, to).x
-            let aa_sub = prove_specular_aa(flat_in, dnx, dny).sub
-            let aa_s = aa_sub.scatters(nc, from, to).x
-            err_raw += abs(raw_s - ref_s)
-            err_aa += abs(aa_s - ref_s)
-        }
-    }
-    assert(
-        err_aa <= 0.30 * err_raw,
-        f"SpecAAProof did not cut curved specular firefly error >=70%: aa={err_aa}, raw={err_raw}",
-    )
-}

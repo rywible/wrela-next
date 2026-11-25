@@ -15,10 +15,10 @@ use mesh::light::{
 }
 use mesh::sunlight::{sun_map_vis, sun_of_pixel}
 use mesh::proof::{
-    CellRay, CellRayGrad, FilteredSubstance, SpecAASubstance, clamp_footprint_vec, discard_proven,
+    CellRay, CellRayGrad, FilteredSubstance, clamp_footprint_vec, discard_proven,
     filter_channels, filter_channels_1d, filter_channels_kept_1d, filter_rest_channels,
     pixel_tangent_footprint, prove_box_unseen, prove_opaque_only, prove_point_behind_opaque,
-    prove_specular_aa, prove_transmissive_only, prove_vertex_filtered, ray_box_bracket, seen_part,
+    prove_transmissive_only, prove_vertex_filtered, ray_box_bracket, seen_part,
     solve_cell_ray, solve_cell_ray_lipschitz_grad,
 }
 use mesh::sdf::{SdfGrid, multi_bounce_ao, sdf_bent_ao, sdf_curvature, sdf_thickness}
@@ -512,24 +512,26 @@ fn sanitize_substance(sub: Substance, facts: FieldFacts) -> Substance {
     }
 }
 
-/// Nyquist pixel-footprint band-limiting factor for procedural microsurface relief: smoothly rolls
-/// off high-frequency detail as pixel footprint `dist * pixel` approaches `1 / (2 * freq)`.
-fn nyquist_micro_atten(dist: f32, pixel: f32, max_freq: f32) -> f32 {
-    let freq = if max_freq > 0.0 && max_freq < 1.0e6 { max(max_freq, 16.0) } else { 24.0 }
-    let nyq = 2.0 * dist * pixel * freq
-    clamp(1.5 - nyq, 0.0, 1.0)
+/// The finest the micro relief (`micro_field_grad`) varies, in cycles a metre: its third octave's
+/// three waves' wave numbers summed (36.4 + 33.6 + 36.2 a radian a metre) over 2π.
+const MICRO_FINEST: f32 = 16.9
+
+/// How much of the micro relief a pixel whose footprint is `dist * pixel` wide can hold: all of it
+/// while the footprint is under a quarter of the finest wave (two samples a half-wave), none once
+/// it is three quarters of it, linearly between.
+fn nyquist_micro_atten(dist: f32, pixel: f32) -> f32 {
+    let waves = dist * pixel * MICRO_FINEST
+    clamp(1.5 - 2.0 * waves, 0.0, 1.0)
 }
 
-/// Sole G-buffer packer: requires a `SpecAASubstance` witness (carrying both `FilteredProof` and
-/// `SpecAAProof`) so neither unfiltered procedural shading nor un-filtered sharp-bevel specular
-/// roughness can ever reach deferred lighting.
+/// The one G-buffer packer: a shaded point's normal `n` and substance `sub` (from a
+/// `FilteredSubstance`), its motion, and its field's facts.
 fn encode_gbuf_targets(
     n: vec3,
-    sub_aa: SpecAASubstance,
+    sub: Substance,
     motion: vec2,
     facts: FieldFacts,
 ) -> Targets4<vec4, vec4, vec4, vec2> {
-    let sub = sub_aa.sub
     let emits = if facts.may_emit {
         if facts.channels_proven {
             max(sub.emits, vec3(0.0))
@@ -548,8 +550,7 @@ fn encode_gbuf_targets(
 }
 
 /// Lean Visibility-buffer 1× G-buffer writer for similarity-transformed (`Rigid`) meshlets:
-/// computes the exact tangent micro-relief gradient directly from `xf` and enforces geometric
-/// specular AA (`SpecAAProof`) via exact analytical normal derivatives `(dnx, dny)`.
+/// computes the exact tangent micro-relief gradient directly from `xf`.
 pub(package) fn shade_gbuf_rigid(
     wp: vec3,
     prev_wp: vec3,
@@ -567,10 +568,8 @@ pub(package) fn shade_gbuf_rigid(
     dwy: vec3 = vec3(0.0),
     dbx: f32 = 0.0,
     dby: f32 = 0.0,
-    dnx: vec3 = vec3(0.0),
-    dny: vec3 = vec3(0.0),
 ) -> Targets4<vec4, vec4, vec4, vec2> {
-    let sub_in = sanitize_substance(sub_f.sub, facts)
+    let sub_in = sanitize_substance(sub_f.substance(), facts)
     let to_eye = v.at - wp
     let dist = length(to_eye)
     let ray_back = normalize_safe(to_eye, -v.forward)
@@ -581,7 +580,7 @@ pub(package) fn shade_gbuf_rigid(
         n0
     }
     let sub_nyq = if facts.may_micro {
-        let att = nyquist_micro_atten(dist, v.pixel(), facts.max_freq)
+        let att = nyquist_micro_atten(dist, v.pixel())
         Substance { micro: sub_in.micro * att, ..sub_in }
     } else {
         sub_in
@@ -595,19 +594,12 @@ pub(package) fn shade_gbuf_rigid(
         facts.may_micro,
         facts.may_coat,
     )
-    let tilt = n - n0
-    let sub_aa = prove_specular_aa(
-        FilteredSubstance { sub, proof: sub_f.proof },
-        dnx,
-        dny,
-        extra_var: 0.25 * dot(tilt, tilt),
-    )
     let motion = motion_of(wp, prev_wp, v, prev_v)
-    encode_gbuf_targets(n, sub_aa, motion, facts)
+    encode_gbuf_targets(n, sub, motion, facts)
 }
 
 /// Visibility-buffer 1× G-buffer writer using exact analytical screen-space derivatives
-/// `(dwx, dwy, dmx, dmy, dnx, dny)` and exact triangle face normal `face_n` (zero 2×2 helper-lane
+/// `(dwx, dwy, dmx, dmy)` and exact triangle face normal `face_n` (zero 2×2 helper-lane
 /// quad overshading and safe after per-pixel `discard_proven`).
 pub(package) fn shade_gbuf_exact(
     wp: vec3,
@@ -624,16 +616,14 @@ pub(package) fn shade_gbuf_exact(
     v: View,
     prev_v: View,
     facts: FieldFacts = FieldFacts::unknown(),
-    dnx: vec3 = vec3(0.0),
-    dny: vec3 = vec3(0.0),
 ) -> Targets4<vec4, vec4, vec4, vec2> {
-    let sub_in = sanitize_substance(sub_f.sub, facts)
+    let sub_in = sanitize_substance(sub_f.substance(), facts)
     let to_eye = v.at - wp
     let dist = length(to_eye)
     let ray_back = normalize_safe(to_eye, -v.forward)
     let n0 = resolve_normal_exact(face_n, normal, smooth, ray_back)
     let sub_nyq = if facts.may_micro {
-        let att = nyquist_micro_atten(dist, v.pixel(), facts.max_freq)
+        let att = nyquist_micro_atten(dist, v.pixel())
         Substance { micro: sub_in.micro * att, ..sub_in }
     } else {
         sub_in
@@ -650,15 +640,8 @@ pub(package) fn shade_gbuf_exact(
         facts.may_micro,
         facts.may_coat,
     )
-    let tilt = n - n0
-    let sub_aa = prove_specular_aa(
-        FilteredSubstance { sub, proof: sub_f.proof },
-        dnx,
-        dny,
-        extra_var: 0.25 * dot(tilt, tilt),
-    )
     let motion = motion_of(wp, prev_wp, v, prev_v)
-    encode_gbuf_targets(n, sub_aa, motion, facts)
+    encode_gbuf_targets(n, sub, motion, facts)
 }
 
 /// Shared 1× G-buffer + analytical motion-vector writer used by heightfields, exact cells, and
@@ -675,7 +658,7 @@ fn shade_gbuf_core(
     facts: FieldFacts = FieldFacts::unknown(),
     exact_normal: bool = false,
 ) -> Targets4<vec4, vec4, vec4, vec2> {
-    let sub_in = sanitize_substance(sub_f.sub, facts)
+    let sub_in = sanitize_substance(sub_f.substance(), facts)
     let to_eye = v.at - wp
     let dist = length(to_eye)
     let ray_back = normalize_safe(to_eye, -v.forward)
@@ -685,7 +668,7 @@ fn shade_gbuf_core(
         resolve_normal_from(wp, normal, smooth, ray_back)
     }
     let sub_nyq = if facts.may_micro {
-        let att = nyquist_micro_atten(dist, v.pixel(), facts.max_freq)
+        let att = nyquist_micro_atten(dist, v.pixel())
         Substance { micro: sub_in.micro * att, ..sub_in }
     } else {
         sub_in
@@ -701,17 +684,8 @@ fn shade_gbuf_core(
         facts.may_bump && !exact_normal,
         ray_back,
     )
-    let dnx = if exact_normal { vec3(0.0) } else { dpdx(n) }
-    let dny = if exact_normal { vec3(0.0) } else { dpdy(n) }
-    let tilt = n - n0
-    let sub_aa = prove_specular_aa(
-        FilteredSubstance { sub, proof: sub_f.proof },
-        dnx,
-        dny,
-        extra_var: 0.25 * dot(tilt, tilt),
-    )
     let motion = motion_of(wp, prev_wp, v, prev_v)
-    encode_gbuf_targets(n, sub_aa, motion, facts)
+    encode_gbuf_targets(n, sub, motion, facts)
 }
 
 /// Pixel-rate analytical G-buffer fragment shader for Pass-2 Hi-Z disoccluded `Pool<M>` meshlets.
@@ -790,7 +764,7 @@ pub(package) fn field_skin_cut_gbuf_many_fs<M: Field<Substance>>(
     let dmy = clamp_footprint_vec(dpdy(vary.rest_p), max_fp)
     let sub0 = filter_rest_channels(f, vary.rest_p, dmx, dmy)
     if facts.may_transmit {
-        match prove_transmissive_only(sub0.sub) {
+        match prove_transmissive_only(sub0.substance()) {
             Some(p) => discard_proven(p),
             None => {},
         }
@@ -1008,7 +982,7 @@ pub(package) fn exact_box_one_fs<M: Field<Substance>>(
         filter_channels_1d(field, hit_p, fp_x, fp_y)
     }
     if facts.may_transmit {
-        match prove_transmissive_only(sub0.sub) {
+        match prove_transmissive_only(sub0.substance()) {
             Some(proof) => discard_proven(proof),
             None => {},
         }
@@ -1160,7 +1134,7 @@ fn shade_direct_pixel<S: Sky>(
 
     let sun = sky.sun()
     let ndl = max(dot(n, sun.way), 0.0)
-    let vis = if ndl > 0.0 { sun_of_pixel(sun_cls, sun_near, px, py, full_w).vis } else { 0.0 }
+    let vis = if ndl > 0.0 { sun_of_pixel(sun_cls, sun_near, px, py, full_w).vis() } else { 0.0 }
     var direct_sun = sub.shade_direct(n, sun.way, ray_back, sun.light * vis)
     // Exact interior thickness backlit Subsurface Scattering (SSS) via 2-tap 3D SDF thickness.
     if sub.subsurface > 0.01 && sdf_grid.enabled != 0 {
@@ -2049,7 +2023,7 @@ fn shade_trans_core<S: Sky>(
     let ndl = max(dot(n, sun.way), 0.0)
     // Glass casts nothing into the map: its point's sun is the map's taps at its own depth.
     let vis = if ndl > 0.0 {
-        sun_map_vis(shadow_map, static_shadow_map, has_static_shadow, sv, sun, wp, vec3(0.0), sv.texel).vis
+        sun_map_vis(shadow_map, static_shadow_map, has_static_shadow, sv, sun, wp, vec3(0.0), sv.texel).vis()
     } else { 0.0 }
     let sky_amb = sky_irradiance(sky_diff, sky_s, n)
     let deep_scatter = sub.albedo *
