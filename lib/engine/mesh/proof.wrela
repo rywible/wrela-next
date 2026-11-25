@@ -111,13 +111,7 @@ pub fn ray_box_bracket(o: vec3, d: vec3, forward: vec3, lo: vec3, hi: vec3) -> R
 /// Exact analytical ray-sphere bracket for ray `(o, d)` (unit `d`) against bounding sphere
 /// `(centre, radius)` inflated by IEEE-754 rounding margin: rejects ~48% of empty bounding-cube
 /// corner pixels before any field evaluation (`t_enter > t_exit` on miss).
-pub fn ray_sphere_bracket(
-    o: vec3,
-    d: vec3,
-    forward: vec3,
-    centre: vec3,
-    radius: f32,
-) -> RayBox {
+pub fn ray_sphere_bracket(o: vec3, d: vec3, forward: vec3, centre: vec3, radius: f32) -> RayBox {
     let r = radius + max(radius * (16.0 * PROOF_EPS), 1.0e-5)
     let oc = o - centre
     let b = dot(oc, d)
@@ -305,6 +299,43 @@ pub fn filter_channels_kept<M: Field<Substance>>(
             vec2(0.0),
             vec2(1.0),
         )
+    }
+    FilteredSubstance { sub, proof: FilteredProof { seal: () } }
+}
+
+/// Lean 1-direction Nyquist filter for exact-cell silhouette shaders (where the grazing footprint
+/// is dominated by one major axis, cutting shader code size in half vs. 2-direction `_f2` while
+/// still evaluating through compiler-derived `std::derive::filtered` and minting `FilteredProof`).
+pub fn filter_channels_1d<M: Field<Substance>>(
+    field: M,
+    wp: vec3,
+    dwx: vec3,
+    dwy: vec3,
+) -> FilteredSubstance {
+    let sub = if field.has_constant_channels() {
+        field.channels(wp)
+    } else {
+        let dir = if dot(dwx, dwy) >= 0.0 { dwx + dwy } else { dwx - dwy }
+        filtered(|s: f32| field.channels(wp + dir * s), at: 0.0, width: 1.0)
+    }
+    FilteredSubstance { sub, proof: FilteredProof { seal: () } }
+}
+
+/// Lean 1-direction Nyquist filter for `channels_kept_exact` in exact-cell silhouette shaders
+/// (where `kept` was already evaluated at exact hit `wp` via `kept_at(wp)`).
+pub fn filter_channels_kept_1d<M: Field<Substance>>(
+    field: M,
+    wp: vec3,
+    part: u32,
+    kept: vec4,
+    dwx: vec3,
+    dwy: vec3,
+) -> FilteredSubstance {
+    let sub = if field.has_constant_channels() {
+        field.channels_kept_exact(wp, part, kept)
+    } else {
+        let dir = if dot(dwx, dwy) >= 0.0 { dwx + dwy } else { dwx - dwy }
+        filtered(|s: f32| field.channels_kept_exact(wp + dir * s, part, kept), at: 0.0, width: 1.0)
     }
     FilteredSubstance { sub, proof: FilteredProof { seal: () } }
 }
@@ -605,54 +636,20 @@ pub fn solve_cell_ray<F: Copy + fn(vec3) -> f32>(
     }
 }
 
-/// Bracketed root refinement calling `field.distance_live(p, live)` directly (no closure capture,
-/// so GPU shaders never copy large `Field` structs out of uniform memory).
-fn refine_root_live<M: Field<Substance>>(
-    field: M,
-    live: Live,
-    o: vec3,
-    d: vec3,
-    t_out: f32,
-    f_out: f32,
-    t_in: f32,
-    f_in: f32,
-    tol: f32,
-) -> f32 {
-    if f_in >= -tol {
-        return t_in
-    }
-    var a = t_out
-    var fa = f_out
-    var b = t_in
-    var fb = f_in
-    for k in 0..4 {
-        let denom = fa - fb
-        let m = if (k & 1) == 0 && denom > 1.0e-12 {
-            clamp(a + (b - a) * (fa / denom), a + 0.1 * (b - a), b - 0.1 * (b - a))
-        } else {
-            0.5 * (a + b)
-        }
-        let fm = field.distance_live(o + d * m, live)
-        if fm > 0.0 {
-            a = m
-            fa = fm
-        } else {
-            b = m
-            fb = fm
-        }
-    }
-    b
+/// Result of solving a ray against a field inside an exact cell box `[t_enter, t_exit]` together
+/// with the surface gradient at the hit (computed through the same single `distance_live` call
+/// site to keep GPU shaders compact).
+pub enum CellRayGrad: Copy {
+    Hit(f32, vec3),
+    Empty(EmptyProof),
 }
 
-/// GPU-lean, zero-copy exact-bracket cell ray solver for fields with a build-time-verified
-/// Lipschitz bound (`verify_surface_soundness`): takes `field` and `live` directly (no closure
-/// copy, no per-pixel `affine()` explosion).
-///
-/// Soundness invariant: returns `CellRay::Empty(proof)` ONLY when pure Mean-Value-Theorem
-/// Lipschitz steps `t += f / lip` reach `t_exit` with `f(t_exit) > tol`, mathematically proving
-/// `f > 0` across all of `[t0, t1]`. Any ultra-grazing ray that exhausts its step budget before
-/// reaching `t_exit` returns `CellRay::Hit(t_near)` rather than discarding into a hole.
-pub fn solve_cell_ray_lipschitz<M: Field<Substance>>(
+/// GPU-lean, single-call-site exact-bracket cell ray solver + tetrahedron gradient for fields
+/// with a build-time-verified Lipschitz bound (`verify_surface_soundness`): runs bidirectional
+/// over-relaxed MVT sphere tracing (Keinert et al. 2014, Theorem 1), bracketed secant/bisection
+/// refinement, and (when `want_grad` is true) 4-tap tetrahedron normal estimation through ONE
+/// `field.distance_live` call site.
+pub fn solve_cell_ray_lipschitz_grad<M: Field<Substance>>(
     field: M,
     live: Live,
     o: vec3,
@@ -661,16 +658,18 @@ pub fn solve_cell_ray_lipschitz<M: Field<Substance>>(
     t_exit: f32,
     px: f32,
     lip: f32,
-) -> CellRay {
+    want_grad: bool,
+) -> CellRayGrad {
     if t_enter > t_exit || t_exit <= 0.0 {
-        return CellRay::Empty(EmptyProof { seal: () })
+        return CellRayGrad::Empty(EmptyProof { seal: () })
     }
     let t0 = max(t_enter, 0.0)
     let t1 = t_exit
     if t0 >= t1 {
-        return CellRay::Empty(EmptyProof { seal: () })
+        return CellRayGrad::Empty(EmptyProof { seal: () })
     }
     let tol = max(0.02 * px, 1.0e-6)
+    let ne = max(0.25 * px, 1.0e-5)
     let inv_lip = if lip > 0.0 && lip < 1.0e12 { 1.0 / max(lip, 1.0) } else { 0.0 }
     var t_lo = t0
     var f_lo = 0.0
@@ -683,148 +682,261 @@ pub fn solve_cell_ray_lipschitz<M: Field<Substance>>(
     var omega_hi = 1.85
     var t_near = t0
     var f_near = 1.0e30
-    var need_refine = false
-    var ref_t_out = t0
-    var ref_f_out = 0.0
-    var ref_t_in = t0
-    var ref_f_in = 0.0
-    // Single `field.distance_live` call site across endpoint checks and bidirectional over-relaxed
-    // MVT sphere tracing (Keinert et al. 2014, Theorem 1) so large composite fields keep one compact
-    // distance evaluation body in MSL/SPIR-V.
-    // Phases: 0 = entry `t0`, 1 = exit `t1`, >= 2 = alternating forward (even) / backward (odd).
-    for iter in 0..34 {
+    var ref_a = t0
+    var ref_fa = 0.0
+    var ref_b = t0
+    var ref_fb = 0.0
+    var t_hit = t0
+    var gv = vec3(0.0)
+    // phase 0: bidirectional march (iter 0..34), phase 1: refine (sub_k 0..4), phase 2: grad (0..4).
+    var phase: u32 = 0
+    var march_i: u32 = 0
+    var sub_k: u32 = 0
+    for _step in 0..44 {
+        var probe_p = o + d * t0
         var probe_t = t0
         var step_len = 0.0
-        if iter == 0 {
-            probe_t = t0
-        } else if iter == 1 {
-            probe_t = t1
-        } else if (iter & 1) == 0 {
-            if hi_clear && t_lo + r_lo + r_hi > t_hi {
-                return CellRay::Empty(EmptyProof { seal: () })
-            }
-            if t_lo + r_lo >= t_hi {
-                if hi_clear {
-                    return CellRay::Empty(EmptyProof { seal: () })
+        var kv = vec3(0.0)
+        var cur_march: u32 = 0
+        if phase == 0 {
+            if march_i >= 34 {
+                t_hit = max(t_near, t0)
+                if !want_grad {
+                    return CellRayGrad::Hit(t_hit, vec3(0.0))
                 }
-                need_refine = true
-                ref_t_out = t_lo
-                ref_f_out = f_lo
-                ref_t_in = t_hi
-                ref_f_in = f_hi
-                break
-            }
-            let max_step_lo = if hi_clear { max(t_hi - r_hi - t_lo, r_lo) } else { t_hi - t_lo }
-            step_len = min(omega_lo * r_lo, max_step_lo)
-            probe_t = t_lo + step_len
-        } else {
-            if !hi_clear {
+                phase = 2
+                sub_k = 0
                 continue
             }
-            if t_lo + r_lo + r_hi > t_hi {
-                return CellRay::Empty(EmptyProof { seal: () })
-            }
-            let max_step_hi = max(t_hi - (t_lo + r_lo), r_hi)
-            step_len = min(omega_hi * r_hi, max_step_hi)
-            probe_t = t_hi - step_len
-        }
-        let fv = field.distance_live(o + d * probe_t, live)
-        if iter == 0 {
-            if fv <= tol {
-                return CellRay::Hit(t0)
-            }
-            if inv_lip == 0.0 {
-                return CellRay::Hit(t0)
-            }
-            f_lo = fv
-            r_lo = fv * inv_lip
-            t_near = t0
-            f_near = fv
-        } else if iter == 1 {
-            if fv < f_near {
-                f_near = fv
-                t_near = t1
-            }
-            if t0 + r_lo >= t1 {
-                if fv <= tol {
-                    need_refine = true
-                    ref_t_out = t0
-                    ref_f_out = f_lo
-                    ref_t_in = t1
-                    ref_f_in = fv
-                    break
+            cur_march = march_i
+            march_i += 1
+            if cur_march == 0 {
+                probe_t = t0
+            } else if cur_march == 1 {
+                probe_t = t1
+            } else if (cur_march & 1) == 0 {
+                if hi_clear && t_lo + r_lo + r_hi > t_hi {
+                    return CellRayGrad::Empty(EmptyProof { seal: () })
                 }
-                return CellRay::Empty(EmptyProof { seal: () })
-            }
-            f_hi = fv
-            hi_clear = fv > tol
-            r_hi = if hi_clear { fv * inv_lip } else { 0.0 }
-            omega_lo = if hi_clear { 1.85 } else { 1.0 }
-        } else if (iter & 1) == 0 {
-            if fv <= tol {
-                if omega_lo <= 1.01 {
-                    need_refine = true
-                    ref_t_out = t_lo
-                    ref_f_out = f_lo
-                    ref_t_in = probe_t
-                    ref_f_in = fv
-                    break
-                }
-                // Over-relaxed probe landed inside: narrow bracket to `[t_lo, probe_t]` and finish
-                // with safe `omega_lo = 1.0` so we never skip an earlier front crossing.
-                t_hi = probe_t
-                f_hi = fv
-                hi_clear = false
-                r_hi = 0.0
-                omega_lo = 1.0
-            } else {
-                let r_cand = fv * inv_lip
-                if omega_lo <= 1.01 || r_lo + r_cand > step_len {
-                    t_lo = probe_t
-                    f_lo = fv
-                    r_lo = r_cand
+                if t_lo + r_lo >= t_hi {
                     if hi_clear {
-                        omega_lo = 1.85
+                        return CellRayGrad::Empty(EmptyProof { seal: () })
+                    }
+                    ref_a = t_lo
+                    ref_fa = f_lo
+                    ref_b = t_hi
+                    ref_fb = f_hi
+                    if ref_fb >= -tol {
+                        t_hit = max(ref_b, t0)
+                        if !want_grad {
+                            return CellRayGrad::Hit(t_hit, vec3(0.0))
+                        }
+                        phase = 2
+                    } else {
+                        phase = 1
+                    }
+                    sub_k = 0
+                    continue
+                }
+                let max_step_lo = if hi_clear { max(t_hi - r_hi - t_lo, r_lo) } else { t_hi - t_lo }
+                step_len = min(omega_lo * r_lo, max_step_lo)
+                probe_t = t_lo + step_len
+            } else {
+                if !hi_clear {
+                    continue
+                }
+                if t_lo + r_lo + r_hi > t_hi {
+                    return CellRayGrad::Empty(EmptyProof { seal: () })
+                }
+                let max_step_hi = max(t_hi - (t_lo + r_lo), r_hi)
+                step_len = min(omega_hi * r_hi, max_step_hi)
+                probe_t = t_hi - step_len
+            }
+            probe_p = o + d * probe_t
+        } else if phase == 1 {
+            let denom = ref_fa - ref_fb
+            probe_t = if (sub_k & 1) == 0 && denom > 1.0e-12 {
+                clamp(
+                    ref_a + (ref_b - ref_a) * (ref_fa / denom),
+                    ref_a + 0.1 * (ref_b - ref_a),
+                    ref_b - 0.1 * (ref_b - ref_a),
+                )
+            } else {
+                0.5 * (ref_a + ref_b)
+            }
+            probe_p = o + d * probe_t
+        } else {
+            let kx = if sub_k == 0 || sub_k == 3 { 1.0 } else { -1.0 }
+            let ky = if sub_k >= 2 { 1.0 } else { -1.0 }
+            let kz = if sub_k == 1 || sub_k == 3 { 1.0 } else { -1.0 }
+            kv = vec3(kx, ky, kz)
+            probe_p = o + d * t_hit + kv * ne
+        }
+        let fv = field.distance_live(probe_p, live)
+        if phase == 0 {
+            if cur_march == 0 {
+                if fv <= tol || inv_lip == 0.0 {
+                    t_hit = t0
+                    if !want_grad {
+                        return CellRayGrad::Hit(t_hit, vec3(0.0))
+                    }
+                    phase = 2
+                    sub_k = 0
+                } else {
+                    f_lo = fv
+                    r_lo = fv * inv_lip
+                    t_near = t0
+                    f_near = fv
+                }
+            } else if cur_march == 1 {
+                if fv < f_near {
+                    f_near = fv
+                    t_near = t1
+                }
+                if t0 + r_lo >= t1 {
+                    if fv <= tol {
+                        ref_a = t0
+                        ref_fa = f_lo
+                        ref_b = t1
+                        ref_fb = fv
+                        if ref_fb >= -tol {
+                            t_hit = max(ref_b, t0)
+                            if !want_grad {
+                                return CellRayGrad::Hit(t_hit, vec3(0.0))
+                            }
+                            phase = 2
+                        } else {
+                            phase = 1
+                        }
+                        sub_k = 0
+                    } else {
+                        return CellRayGrad::Empty(EmptyProof { seal: () })
                     }
                 } else {
-                    omega_lo = 1.0
+                    f_hi = fv
+                    hi_clear = fv > tol
+                    r_hi = if hi_clear { fv * inv_lip } else { 0.0 }
+                    omega_lo = if hi_clear { 1.85 } else { 1.0 }
                 }
-                if fv < f_near {
-                    f_near = fv
-                    t_near = probe_t
+            } else if (cur_march & 1) == 0 {
+                if fv <= tol {
+                    if omega_lo <= 1.01 {
+                        ref_a = t_lo
+                        ref_fa = f_lo
+                        ref_b = probe_t
+                        ref_fb = fv
+                        if ref_fb >= -tol {
+                            t_hit = max(ref_b, t0)
+                            if !want_grad {
+                                return CellRayGrad::Hit(t_hit, vec3(0.0))
+                            }
+                            phase = 2
+                        } else {
+                            phase = 1
+                        }
+                        sub_k = 0
+                    } else {
+                        t_hi = probe_t
+                        f_hi = fv
+                        hi_clear = false
+                        r_hi = 0.0
+                        omega_lo = 1.0
+                    }
+                } else {
+                    let r_cand = fv * inv_lip
+                    if omega_lo <= 1.01 || r_lo + r_cand > step_len {
+                        t_lo = probe_t
+                        f_lo = fv
+                        r_lo = r_cand
+                        if hi_clear {
+                            omega_lo = 1.85
+                        }
+                    } else {
+                        omega_lo = 1.0
+                    }
+                    if fv < f_near {
+                        f_near = fv
+                        t_near = probe_t
+                    }
                 }
-            }
-        } else {
-            if fv <= tol {
-                t_hi = probe_t
-                f_hi = fv
-                hi_clear = false
-                r_hi = 0.0
-                omega_lo = 1.0
             } else {
-                let rh_cand = fv * inv_lip
-                if omega_hi <= 1.01 || r_hi + rh_cand > step_len {
+                if fv <= tol {
                     t_hi = probe_t
                     f_hi = fv
-                    r_hi = rh_cand
-                    omega_hi = 1.85
+                    hi_clear = false
+                    r_hi = 0.0
+                    omega_lo = 1.0
                 } else {
-                    omega_hi = 1.0
+                    let rh_cand = fv * inv_lip
+                    if omega_hi <= 1.01 || r_hi + rh_cand > step_len {
+                        t_hi = probe_t
+                        f_hi = fv
+                        r_hi = rh_cand
+                        omega_hi = 1.85
+                    } else {
+                        omega_hi = 1.0
+                    }
+                    if fv < f_near {
+                        f_near = fv
+                        t_near = probe_t
+                    }
                 }
-                if fv < f_near {
-                    f_near = fv
-                    t_near = probe_t
+            }
+        } else if phase == 1 {
+            if fv > 0.0 {
+                ref_a = probe_t
+                ref_fa = fv
+            } else {
+                ref_b = probe_t
+                ref_fb = fv
+            }
+            sub_k += 1
+            if sub_k >= 4 {
+                t_hit = max(ref_b, t0)
+                if !want_grad {
+                    return CellRayGrad::Hit(t_hit, vec3(0.0))
                 }
+                phase = 2
+                sub_k = 0
+            }
+        } else {
+            gv = gv + kv * fv
+            sub_k += 1
+            if sub_k >= 4 {
+                return CellRayGrad::Hit(t_hit, gv)
             }
         }
     }
-    if need_refine {
-        return CellRay::Hit(
-            refine_root_live(field, live, o, d, ref_t_out, ref_f_out, ref_t_in, ref_f_in, tol),
-        )
+    CellRayGrad::Hit(max(t_hit, t0), gv)
+}
+
+/// GPU-lean, zero-copy exact-bracket cell ray solver for fields with a build-time-verified
+/// Lipschitz bound (`verify_surface_soundness`): takes `field` and `live` directly (no closure
+/// copy, no per-pixel `affine()` explosion).
+pub fn solve_cell_ray_lipschitz<M: Field<Substance>>(
+    field: M,
+    live: Live,
+    o: vec3,
+    d: vec3,
+    t_enter: f32,
+    t_exit: f32,
+    px: f32,
+    lip: f32,
+) -> CellRay {
+    match solve_cell_ray_lipschitz_grad(
+        field,
+        live,
+        o,
+        d,
+        t_enter,
+        t_exit,
+        px,
+        lip,
+        want_grad: false,
+    ) {
+        CellRayGrad::Hit(t, _) => CellRay::Hit(t),
+        CellRayGrad::Empty(proof) => CellRay::Empty(proof),
     }
-    // Grazing ray ran out of steps while still unproven: never discard into a hole.
-    CellRay::Hit(t_near)
 }
 
 /// Convenience wrapper for `Field<Substance>` using its stated Lipschitz bound over the cell.
@@ -849,8 +961,14 @@ pub fn solve_field_cell_ray<M: Field<Substance>>(
 
 @test
 fn proof_tokens_erase_to_zero_bytes() {
-    assert(size_of::<EmptyProof>() == 0, f"EmptyProof must be 0 bytes, got {size_of::<EmptyProof>()}")
-    assert(size_of::<RayBox>() == 16, f"RayBox must be 16 bytes (one vec4), got {size_of::<RayBox>()}")
+    assert(
+        size_of::<EmptyProof>() == 0,
+        f"EmptyProof must be 0 bytes, got {size_of::<EmptyProof>()}",
+    )
+    assert(
+        size_of::<RayBox>() == 16,
+        f"RayBox must be 16 bytes (one vec4), got {size_of::<RayBox>()}",
+    )
 }
 
 @test
@@ -1017,7 +1135,10 @@ fn ray_sphere_bracket_matches_exact_sphere() {
     let fwd = vec3(0.0, 0.0, 1.0)
     let hit = ray_sphere_bracket(vec3(0.0, 0.0, -4.0), fwd, fwd, vec3(0.0), 1.0)
     assert(hit.t_enter <= hit.t_exit, "center ray must hit sphere")
-    assert(abs(hit.t_enter - 3.0) < 1.0e-4 && abs(hit.t_exit - 5.0) < 1.0e-4, "wrong sphere bracket")
+    assert(
+        abs(hit.t_enter - 3.0) < 1.0e-4 && abs(hit.t_exit - 5.0) < 1.0e-4,
+        "wrong sphere bracket",
+    )
     let miss = ray_sphere_bracket(vec3(1.1, 0.0, -4.0), fwd, fwd, vec3(0.0), 1.0)
     assert(miss.t_enter > miss.t_exit, "outside ray must miss sphere")
 }

@@ -1195,7 +1195,7 @@ fn outlined_with(
                             has_math = true;
                         }
                     }
-                    Expr::Binary(op, _, _)
+                    Expr::Binary(op, a, _)
                         if !matches!(
                             op,
                             BinOp::And
@@ -1206,7 +1206,8 @@ fn outlined_with(
                                 | BinOp::Le
                                 | BinOp::Gt
                                 | BinOp::Ge
-                        ) =>
+                        ) && !(matches!(op, BinOp::Add | BinOp::Sub)
+                            && !m.types.has_float(func.value_ty(*a))) =>
                     {
                         has_math = true;
                     }

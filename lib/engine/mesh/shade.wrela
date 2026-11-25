@@ -11,14 +11,15 @@ use mesh::extract::{
 use mesh::height::MeshVary
 use mesh::light::{
     Emitter, NEAR, RadGrid, ShadowView, clip_of, cone_indirect, contact_shadow, decode_substance,
-    encode_mat_signed, eval_emitters_tiled, sky_background, sky_irradiance, sky_specular,
-    spec_cone, sun_shadow_hybrid, sun_vis_point, trace_ssr,
+    encode_mat_signed, eval_emitters_tiled, sky_background, sky_irradiance, sky_specular, spec_cone,
+    sun_shadow_hybrid, sun_vis_point, trace_ssr,
 }
 use mesh::proof::{
-    CellRay, FilteredSubstance, clamp_footprint_vec, discard_proven, filter_channels,
-    filter_channels_kept, filter_rest_channels, pixel_tangent_footprint, prove_box_unseen,
-    prove_opaque_only, prove_point_behind_opaque, prove_transmissive_only, prove_vertex_filtered,
-    ray_box_bracket, seen_part, solve_cell_ray, solve_cell_ray_lipschitz,
+    CellRay, CellRayGrad, FilteredSubstance, clamp_footprint_vec, discard_proven, filter_channels,
+    filter_channels_1d, filter_channels_kept_1d, filter_rest_channels, pixel_tangent_footprint,
+    prove_box_unseen, prove_opaque_only, prove_point_behind_opaque, prove_transmissive_only,
+    prove_vertex_filtered, ray_box_bracket, seen_part, solve_cell_ray,
+    solve_cell_ray_lipschitz_grad,
 }
 use mesh::sdf::{SdfGrid, multi_bounce_ao, sdf_bent_ao, sdf_curvature, sdf_thickness}
 use mesh::tsr::project_uv_unjittered
@@ -361,7 +362,8 @@ fn apply_micro_relief_rigid(
         dot(xf.row0.xyz, mg.xyz),
         dot(xf.row1.xyz, mg.xyz),
         dot(xf.row2.xyz, mg.xyz),
-    ) * inv_s2
+    ) *
+        inv_s2
     let g_tan = g_w - n * dot(g_w, n)
     let bump_s = if may_coat && sub.coat > 0.2 { 0.024 } else { 0.045 }
     let n_bumped = normalize(n - g_tan * (amp * bump_s))
@@ -867,7 +869,13 @@ fn depth_of(v: View, p: vec3) -> f32 {
 /// (~0.07 ms at 1080p) so Tier-2 `exact_box_one_fs` rejects the ~95% of box pixels already covered
 /// by DC on Line 1 via `prove_behind_opaque` before running a single field evaluation.
 @compute(8, 8)
-pub(package) fn copy_dc_depth(depth: DepthTexture, w: u32, h: u32, out: mut Texels<R32Float>, id: GlobalId) {
+pub(package) fn copy_dc_depth(
+    depth: DepthTexture,
+    w: u32,
+    h: u32,
+    out: mut Texels<R32Float>,
+    id: GlobalId,
+) {
     if id.x >= w || id.y >= h {
         return
     }
@@ -916,33 +924,74 @@ pub(package) fn exact_box_one_fs<M: Field<Substance>>(
         field.lipschitz(1.7320508 * h)
     }
     // When `facts.lip` is statically finite (build-time proven), the compiler constant-folds the
-    // branch and erases `solve_cell_ray`'s 1D affine fallback from the shipped shader completely.
-    let res = if facts.lip > 0.0 && facts.lip < 1.0e12 {
-        solve_cell_ray_lipschitz(field, live, v.at, d, t0, t1, px, lip)
-    } else if lip > 0.0 && lip < 1.0e12 {
-        solve_cell_ray_lipschitz(field, live, v.at, d, t0, t1, px, lip)
-    } else {
-        solve_cell_ray(|q: vec3| field.distance_live(q, live), v.at, d, t0, t1, px, lip)
-    }
+    // branch and erases `solve_cell_ray`'s 1D affine fallback from the shipped shader completely;
+    // `solve_cell_ray_lipschitz_grad` shares ONE `field.distance_live` call site for march, root
+    // refinement, and tetrahedron normal estimation.
     var t_hit = t0
-    match res {
-        CellRay::Hit(t) => {
-            t_hit = max(t, t0)
-        },
-        CellRay::Empty(proof) => {
-            discard_proven(proof)
-        },
+    var gv = -d
+    if facts.lip > 0.0 && facts.lip < 1.0e12 {
+        match solve_cell_ray_lipschitz_grad(
+            field,
+            live,
+            v.at,
+            d,
+            t0,
+            t1,
+            px,
+            lip,
+            want_grad: true,
+        ) {
+            CellRayGrad::Hit(t, g) => {
+                t_hit = max(t, t0)
+                gv = g
+            },
+            CellRayGrad::Empty(proof) => {
+                discard_proven(proof)
+            },
+        }
+    } else if lip > 0.0 && lip < 1.0e12 {
+        match solve_cell_ray_lipschitz_grad(
+            field,
+            live,
+            v.at,
+            d,
+            t0,
+            t1,
+            px,
+            lip,
+            want_grad: true,
+        ) {
+            CellRayGrad::Hit(t, g) => {
+                t_hit = max(t, t0)
+                gv = g
+            },
+            CellRayGrad::Empty(proof) => {
+                discard_proven(proof)
+            },
+        }
+    } else {
+        match solve_cell_ray(|q: vec3| field.distance_live(q, live), v.at, d, t0, t1, px, lip) {
+            CellRay::Hit(t) => {
+                t_hit = max(t, t0)
+                let (_, g) = value_and_gradient(
+                    |q: vec3| field.distance_live(q, live),
+                    v.at + d * t_hit,
+                )
+                gv = g
+            },
+            CellRay::Empty(proof) => {
+                discard_proven(proof)
+            },
+        }
     }
     let hit_p = v.at + d * t_hit
-    let (_, gv) = value_and_gradient(|q: vec3| field.distance_live(q, live), hit_p)
     let n = UnitNormal::normalize_safe(gv, -d).v
     let (fp_x, fp_y) = pixel_tangent_footprint(v, frag.position.xy, hit_p, n)
     let sub0 = if field.uses_kept() {
-        let (_, part) = field.part_at(hit_p)
-        let kept = field.kept(hit_p, part)
-        filter_channels_kept(field, hit_p, part, kept, fp_x, fp_y)
+        let (_, part, kept) = field.kept_at(hit_p)
+        filter_channels_kept_1d(field, hit_p, part, kept, fp_x, fp_y)
     } else {
-        filter_channels(field, hit_p, fp_x, fp_y)
+        filter_channels_1d(field, hit_p, fp_x, fp_y)
     }
     if facts.may_transmit {
         match prove_transmissive_only(sub0.sub) {
@@ -950,13 +999,28 @@ pub(package) fn exact_box_one_fs<M: Field<Substance>>(
             None => {},
         }
     }
-    let out = shade_gbuf_core(hit_p, hit_p, hit_p, n, 1.0, sub0, v, prev_v, facts, exact_normal: true)
+    let out = shade_gbuf_core(
+        hit_p,
+        hit_p,
+        hit_p,
+        n,
+        1.0,
+        sub0,
+        v,
+        prev_v,
+        facts,
+        exact_normal: true,
+    )
     WithDepthBehind { color: out, depth: depth_of(v, hit_p) }
 }
 
 /// Lean 1× G-buffer + motion-vector fragment shader for opaque terrain heightfields (`height_vs`).
 @fragment
-pub(package) fn mesh_gbuf_fs(vary: MeshVary, v: View, prev_v: View) -> Targets4<vec4, vec4, vec4, vec2> {
+pub(package) fn mesh_gbuf_fs(
+    vary: MeshVary,
+    v: View,
+    prev_v: View,
+) -> Targets4<vec4, vec4, vec4, vec2> {
     shade_gbuf_core(
         vary.wp,
         vary.prev_wp,
@@ -2466,7 +2530,6 @@ pub(package) fn mesh_trans_fs<S: Sky>(
     )
     Targets2 { first: c, second: motion_of(vary.wp, vary.prev_wp, v, prev_v) }
 }
-
 /// Computes a curvature- and budget-aware cell spacing for a single thing with bounding sphere
 /// `(c, r)`. Targets a bounded screen-space sagitta error (`c ≈ sqrt(8 * e * R_feat * px)`),
 /// keeping tight `~1.45 px` cells when an object is small on screen (or `1.1 px` for `steep`
