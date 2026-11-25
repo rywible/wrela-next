@@ -1388,8 +1388,25 @@ VIEW 0/1/2 2,192/6,511/2,212 to 166/1,414/111 (VIEW 1 11.8% to 2.6% of its pixel
 45/250/41 to 24/136/27; mean error 3.39/8.15/1.96 to 3.31/5.30/1.76/255 (VIEW 1's hard leaks
 1,286 to 892); M4 1080p frame 11, the exact rays SCENE 13 3.98 to 1.96 ms (its frame 23.4 to
 21.9 ms), SCENE 14 6.14 to 3.84 ms (24.7 to 22.8 ms), SCENE 10 1.21 to 0.86 ms, SCENE 11 0.50 to
-0.38 ms. (The mended plane, not filtered geometry, met the line proposed for filtered geometry:
+0.38 ms; on the Radeon (validation silent), SCENE 13's exact rays 7.9 to 1.9 ms (its frame
+37.1 to 31.0 ms, against 26.4 before phase 4), SCENE 14's 14.0 to 4.6 ms (42.2 to 33.3 ms,
+against 24.2). (The mended plane, not filtered geometry, met the line proposed for filtered geometry:
 under 5% of VIEW 1 exact, its error no worse.)
+
+Where the plan for unconstructable errors stands after this (2026-11-24), and what comes next,
+in order:
+- Phase 4 (certified sun) is built and measured above; its cost line is missed, its leak line is
+  missed only where relief a pixel wide self-shadows (the judge's picture says where).
+- Next: the exact rays' fixed costs (the list's gather, slices that run empty), and a field cheap
+  to step for the exact rays (a baked proxy, phase 2's, never built) — the table's rays are most
+  of what is left.
+- Then the plan's phases 5 (sheet-sealed radiance), 6 (temporal reuse of the indirect light
+  alone), 7 (exact silhouette cells for skinned crowds) and the rest of 8 (regional Lipschitz
+  bounds, the stress-point gate); the sweep is built (`kit::shapes::sweep`).
+- After phase 4, the predictive frame governor: each pass's cost predicted from counts the
+  engine reads back, one footprint scale a share as the knob, never the clock (the mended plane
+  above is the first evidence that the footprint, not a pass's cleverness, decides the exact
+  rays' cost).
 
 Gaps: a `Pool`'s far things, meshed together, have no exact rays (their near band is taken as
 open); glass, the froxels and the radiance volume read the world's map alone; the exact rays may
