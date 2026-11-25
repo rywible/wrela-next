@@ -11,7 +11,7 @@
 // surface faces away from part of the sun's disc (the terminator: the light there is the lean's,
 // not the shadow's) are counted apart and not judged.
 
-use matter::matter::{Matter, matter}
+use matter::matter::{Matter, SCOPE, matter}
 use matter::sky::Sky
 use matter::substance::Substance
 use matter::world::World
@@ -19,6 +19,7 @@ use picture::eye::{Eye, View, view}
 use picture::picture::Picture
 use reference::traced::{LEAST, LEAST_DOUBLES, LEAST_FAR, LEAVE, die, ends, sun_way}
 use std::collections::Vec
+use std::derive::filtered
 use std::field::{Field, hash_u32}
 use std::gpu::{
     Atomics, GlobalId, GpuBuffer, R8, Rg32Float, Rgba16Float, Rgba32Float, Slots, Texels, Texture, buffer_of, copy,
@@ -48,15 +49,34 @@ pub const SUN_RAYS: u32 = 64
 ///     mesh rounds: where the picture's point and the field's are not one surface): left out
 pub const SUN_COUNTS: u32 = 17
 
-/// The field's gradient at `p` by central differences of its value (`h` m apart): the reference
-/// asks the field's value alone, so its shader is the size of one distance.
-fn slope_at<M: Field<Substance>>(m: Matter<M>, p: vec3, h: f32) -> vec3 {
+/// The field's value at `p`, with its detail finer than a footprint `foot` m wide averaged away
+/// (`std::derive::filtered`: a groove narrower than it fades to its mean depth); the field itself
+/// where `foot` is 0. The filtered reference judges a picture as right for its pixels' footprint
+/// and the sun's cone, not for detail no pixel can hold.
+fn dist_at<M: Field<Substance>, const FILT: u32>(m: Matter<M>, p: vec3, foot: f32) -> f32 {
+    if FILT != 0 {
+        filtered(|q: vec3| m.field.distance(q), p, vec3(foot))
+    } else {
+        m.field.distance(p)
+    }
+}
+
+/// `Matter::far` of the field filtered to `foot` (`dist_at`).
+fn far_at<M: Field<Substance>>(m: Matter<M>, p: vec3, foot: f32) -> f32 {
+    let v = clamp(dist_at::<M, 1>(m, p, foot), -SCOPE, SCOPE) / m.steep
+    max(v, m.slope * (length(p - m.held.xyz) - m.held.w))
+}
+
+/// The field's gradient at `p` by central differences of its value (`h` m apart), filtered to
+/// `foot` (`dist_at`): the reference asks the field's value alone, so its shader is the size of
+/// one distance.
+fn slope_at<M: Field<Substance>, const FILT: u32>(m: Matter<M>, p: vec3, h: f32, foot: f32) -> vec3 {
     var g = vec3(0.0)
     for a in 0..3 {
         let e = vec3(if a == 0 { h } else { 0.0 }, if a == 1 { h } else { 0.0 }, if a == 2 { h } else {
             0.0
         })
-        let dd = m.field.distance(p + e) - m.field.distance(p - e)
+        let dd = dist_at::<M, FILT>(m, p + e, foot) - dist_at::<M, FILT>(m, p - e, foot)
         g = g + e * (dd / (2.0 * h * h))
     }
     g
@@ -64,28 +84,28 @@ fn slope_at<M: Field<Substance>>(m: Matter<M>, p: vec3, h: f32) -> vec3 {
 
 /// `p` taken to the field's surface: up to four of Newton's steps along its gradient, each its
 /// value over its gradient's length squared; whether it got within `tol` (m) of it.
-fn onto_surface<M: Field<Substance>>(m: Matter<M>, p: vec3, tol: f32) -> (vec3, bool) {
+fn onto_surface<M: Field<Substance>, const FILT: u32>(m: Matter<M>, p: vec3, tol: f32, foot: f32) -> (vec3, bool) {
     var q = p
     for _i in 0..4 {
-        let d = m.field.distance(q)
+        let d = dist_at::<M, FILT>(m, q, foot)
         if abs(d) <= tol * 0.01 {
             return (q, true)
         }
-        let g = slope_at(m, q, max(tol * 0.05, 1.0e-5))
+        let g = slope_at::<M, FILT>(m, q, max(tol * 0.05, 1.0e-5), foot)
         let gg = dot(g, g)
         if !(gg > 1.0e-8) {
             return (q, false)
         }
         q = q - g * (d / gg)
     }
-    (q, abs(m.field.distance(q)) <= tol)
+    (q, abs(dist_at::<M, FILT>(m, q, foot)) <= tol)
 }
 
 /// How far a judging ray marches a pass (steps), and in how many passes: a ray still going after
 /// the last is counted lost (taken as getting out). A pass's lane holds the GPU for at most
 /// `SUN_PASS_STEPS` asks of the world, which keeps a dispatch under its line.
-pub const SUN_PASS_STEPS: u32 = 96
-pub const SUN_PASSES: u32 = 3
+pub const SUN_PASS_STEPS: u32 = 32
+pub const SUN_PASSES: u32 = 9
 
 /// Pixels a placing dispatch takes, and rays a marching dispatch takes.
 pub const SUN_PIXELS: u32 = 512
@@ -107,6 +127,7 @@ pub fn sun_placed<M: Field<Substance>, S: Sky>(
     place: Texture<Rgba32Float>,
     v: View,
     first: u32,
+    footprint: const bool,
     at: mut Slots<vec4>,
     facing: mut Slots<vec4>,
     id: GlobalId,
@@ -127,15 +148,24 @@ pub fn sun_placed<M: Field<Substance>, S: Sky>(
     let p0 = v.at + d * cp.w
     // The mesh's certified error is under half a pixel; four pixels' width is the most it is
     // allowed to be taken.
-    let (p, met) = onto_surface(m, p0, 4.0 * cp.w * v.pixel())
-    let g = slope_at(m, p, max(cp.w * v.pixel() * 0.1, 1.0e-5))
+    let foot = if footprint { cp.w * v.pixel() } else { -1.0 }
+    let (p, met) = if footprint {
+        onto_surface::<M, 1>(m, p0, 4.0 * cp.w * v.pixel(), foot)
+    } else {
+        onto_surface::<M, 0>(m, p0, 4.0 * cp.w * v.pixel(), foot)
+    }
+    let g = if footprint {
+        slope_at::<M, 1>(m, p, max(cp.w * v.pixel() * 0.1, 1.0e-5), foot)
+    } else {
+        slope_at::<M, 0>(m, p, max(cp.w * v.pixel() * 0.1, 1.0e-5), foot)
+    }
     if !met || !(dot(g, g) > 1.0e-8) {
         at[id] = vec4(p, 3.0)
         return
     }
     let n = normalize(g)
     let s = sky.sun()
-    facing[id] = vec4(n, 0.0)
+    facing[id] = vec4(n, foot)
     if dot(n, cp.xyz) < 0.5 {
         at[id] = vec4(p, 4.0)
         return
@@ -156,6 +186,7 @@ pub fn sun_rays<M: Field<Substance>, S: Sky>(
     first: u32,
     count: u32,
     pass: u32,
+    footprint: const bool,
     next: mut Slots<f32>,
     id: GlobalId,
 ) {
@@ -176,7 +207,9 @@ pub fn sun_rays<M: Field<Substance>, S: Sky>(
         return
     }
     let n = facing[i].xyz
+    let foot0 = facing[i].w
     let s = sky.sun()
+    let tan_sun = tan(max(s.size, 1.0e-4))
     let h = hash_u32(i * 7919 + 17)
     let u = (f32(k % 8) + die(h, 2 * k)) * 0.125
     let w2 = (f32(k / 8) + die(h, 2 * k + 1)) * 0.125
@@ -190,7 +223,8 @@ pub fn sun_rays<M: Field<Substance>, S: Sky>(
             return
         }
         steps += 1
-        let f = m.far(o + w * t)
+        // (Filtered: to the pixel's footprint at the surface, widening with the sun's cone.)
+        let f = if footprint { far_at(m, o + w * t, max(foot0, t * tan_sun)) } else { m.far(o + w * t) }
         if f < 0.0 {
             next[id] = RAY_MET
             return
@@ -350,6 +384,7 @@ impl SunJudge {
         eye: Eye,
         what: str,
         dispatches: u32,
+        footprint: bool,
     ) {
         if self.said {
             return
@@ -365,7 +400,7 @@ impl SunJudge {
             self.out = buffer_of(Vec::filled(SUN_COUNTS, 0))
             self.marks = writable_texture(width: w, height: h, levels: 1)
             print(
-                f"sun judge: {what}: {w}x{h}, {SUN_RAYS} rays to the sun's disc a pixel, at most {SUN_PASS_STEPS * SUN_PASSES} steps a ray",
+                f"sun judge: {what}: {w}x{h}, {SUN_RAYS} rays to the sun's disc a pixel, at most {SUN_PASS_STEPS * SUN_PASSES} steps a ray, {if footprint { "the field filtered to each pixel's footprint and the sun's cone" } else { "the field itself" }}",
             )
         }
         let m = matter(world.field())
@@ -373,18 +408,35 @@ impl SunJudge {
         var k: u32 = 0
         label("sun_judge")
         while k < dispatches && self.placed < n {
-            dispatch(
-                sun_placed.bind(
-                    m: m,
-                    sky: sky,
-                    place: picture.place,
-                    v: v,
-                    first: self.placed,
-                    at: mut self.at_part,
-                    facing: mut self.facing_part,
-                ),
-                over: SUN_PIXELS * 8,
-            )
+            if footprint {
+                dispatch(
+                    sun_placed.bind(
+                        m: m,
+                        sky: sky,
+                        place: picture.place,
+                        v: v,
+                        first: self.placed,
+                        footprint: true,
+                        at: mut self.at_part,
+                        facing: mut self.facing_part,
+                    ),
+                    over: SUN_PIXELS * 8,
+                )
+            } else {
+                dispatch(
+                    sun_placed.bind(
+                        m: m,
+                        sky: sky,
+                        place: picture.place,
+                        v: v,
+                        first: self.placed,
+                        footprint: false,
+                        at: mut self.at_part,
+                        facing: mut self.facing_part,
+                    ),
+                    over: SUN_PIXELS * 8,
+                )
+            }
             let len = min(SUN_PIXELS * 8, n - self.placed)
             copy(from: self.at_part.span(0, len), to: self.at.span_mut(self.placed, len))
             copy(from: self.facing_part.span(0, len), to: self.facing.span_mut(self.placed, len))
@@ -393,20 +445,39 @@ impl SunJudge {
         }
         let rays = n * SUN_RAYS
         while k < dispatches && self.placed >= n && self.pass < SUN_PASSES {
-            dispatch(
-                sun_rays.bind(
-                    m: m,
-                    sky: sky,
-                    at: self.at.items(),
-                    facing: self.facing.items(),
-                    state: self.state.items(),
-                    first: self.rayed,
-                    count: rays,
-                    pass: self.pass,
-                    next: mut self.state_part,
-                ),
-                over: SUN_SPAN,
-            )
+            if footprint {
+                dispatch(
+                    sun_rays.bind(
+                        m: m,
+                        sky: sky,
+                        at: self.at.items(),
+                        facing: self.facing.items(),
+                        state: self.state.items(),
+                        first: self.rayed,
+                        count: rays,
+                        pass: self.pass,
+                        footprint: true,
+                        next: mut self.state_part,
+                    ),
+                    over: SUN_SPAN,
+                )
+            } else {
+                dispatch(
+                    sun_rays.bind(
+                        m: m,
+                        sky: sky,
+                        at: self.at.items(),
+                        facing: self.facing.items(),
+                        state: self.state.items(),
+                        first: self.rayed,
+                        count: rays,
+                        pass: self.pass,
+                        footprint: false,
+                        next: mut self.state_part,
+                    ),
+                    over: SUN_SPAN,
+                )
+            }
             let len = min(SUN_SPAN, rays - self.rayed)
             copy(from: self.state_part.span(0, len), to: self.state.span_mut(self.rayed, len))
             self.rayed += SUN_SPAN

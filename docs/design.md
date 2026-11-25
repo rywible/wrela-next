@@ -1357,6 +1357,28 @@ Measured and not kept:
   table and the grimoire; stepping by it made every ray darken near a surface. The ray takes the
   least of it and `lipschitz(reach)`.
 
+**Filtered geometry, tried first in the judge** (`SUN_FILTERED=true`: every distance the
+reference reads is the field box-filtered by `std::derive::filtered`, to the pixel's footprint at
+the surface and the sun's cone along the ray, so that a groove narrower than a pixel fades to its
+mean depth: on a 1 mm groove 2 mm deep, a point 0.5 mm over it reads 0.50 mm raw and 0.85 mm
+filtered at 4 mm, and a flat point is unchanged). Held to it, the engine agreed *less* (SCENE 13
+VIEW 1 hard leaks 1,357 against the point reference to 1,620, hard acne 172 to 145, mean error
+8.10 to 10.16/255): the first-order filtered distance rounds a thin caster's edges rather than
+averaging how much of a footprint it covers, so it moved shadow edges (an acne band along the
+table top's shadow on the floor) and made the skirting leak. Both references agree where the
+leaks are: the turned legs' and the frieze's relief, shadows a pixel wide or more. So the leaks
+left are not detail finer than a pixel, and a coverage (`Part`) estimate built on a filtered
+distance would need to average inside-ness, not distance, before it could be a reference.
+
+**The exact ray's start on its own surface:** first asked where the surface had risen out of
+twice the mesh's error (`2 e / lean` along the ray, about 4 mm at a lean of 0.3), it stepped over
+a groove's wall closer than that. Now the point is taken onto the field along the receiver's
+geometric normal (one more ask of the field) and leaves from there, a quarter of the mesh's error
+out (a groove's floor with the sun across it is dark, a test). With no margin at all, hard leaks
+fell (VIEW 0/1/2 709/1,351/359 to 606/1,183/333) and hard acne rose (31/172/33 to 99/388/104);
+with the quarter, the judge reads as before (688/1,286/356 and 45/250/41; mean error 3.39, 8.15,
+1.96/255).
+
 Gaps: a `Pool`'s far things, meshed together, have no exact rays (their near band is taken as
 open); glass, the froxels and the radiance volume read the world's map alone; the exact rays may
 step over a feature thinner than `max(e, reach / 32)`. SCENE 13 VIEW 1 and VIEW 2 at 1080p stop
