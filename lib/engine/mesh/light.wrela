@@ -1,5 +1,5 @@
 // Unified One Light for meshlet, heightfield, and volumetric rendering:
-//   - Unified sun shadow map (`ShadowView`, `SHADOW_SIDE = 2048`)
+//   - Unified sun shadow map (`ShadowView`, `SHADOW_SIDE = 2048`), read only by `mesh::sunlight`
 //   - On-demand GPU Sky Cache (`SkyCache`): octahedral diffuse irradiance (`32×32`) + 3-level
 //     roughness-prefiltered specular PMREM (`64×64`, `32×32`, `16×16`) built for ANY `S: Sky` only
 //     when the sky changes (0 ms/frame when static)
@@ -12,12 +12,13 @@
 use matter::sky::{Sky, seen}
 use matter::substance::{ONE_OVER_PI, Substance}
 use mesh::extract::{MeshVertex, eval_dqs, octa, unocta, unpack_oct_normal, unpack_thing}
-use mesh::sdf::{SdfGrid, sdf_local_shadow, sdf_soft_shadow, sdf_spec_hit}
+use mesh::sdf::{SdfGrid, sdf_local_shadow, sdf_spec_hit}
+use mesh::sunlight::sun_map_vis
 use picture::eye::View
 use picture::screen::luma
 use std::field::{DualQuat, Field, Rigid}
 use std::gpu::{
-    Address, Append, AppendBuffer, Atomics, ClipPosition, ComparisonSampler, DepthTexture,
+    Address, Append, AppendBuffer, Atomics, ClipPosition, DepthTexture,
     DispatchArgs, Filter, GlobalId, GpuBuffer, GpuSpan, One, R16Float, Rgba16Float, Sampler, Slots,
     Texels, Texels3d, Texture, Texture3d, append_buffer, buffer, buffer_of, copy, dispatch, label,
     sampler, texture3d, writable_texture,
@@ -357,14 +358,17 @@ pub fn sky_specular(
     mix(a, b, vec3(t))
 }
 
-/// Orthographic projection for the unified sun shadow map covering the world's bounding sphere.
+/// Orthographic projection for a sun shadow map: across it (`u`, `v`) `half` m each side of
+/// `centre`, along the sun's way (`w`) `radius` m each side, so a map can be fitted across to what
+/// the eye sees (`mesh::sunlight`'s eye map) while it holds every caster in the world along the
+/// sun; `texel` its texel's width (m).
 pub struct ShadowView: Copy + GpuData {
     pub centre: vec3,
     pub radius: f32,
     pub u: vec3,
     pub texel: f32,
     pub v: vec3,
-    pub spare: f32,
+    pub half: f32,
     pub w: vec3,
     pub spare2: f32,
 }
@@ -374,8 +378,8 @@ impl ShadowView {
     /// in `[0, 1]`.
     pub fn project(self, p: vec3) -> vec3 {
         let d = p - self.centre
-        let sx = dot(d, self.u) / self.radius
-        let sy = dot(d, self.v) / self.radius
+        let sx = dot(d, self.u) / self.half
+        let sy = dot(d, self.v) / self.half
         let sz = (self.radius - dot(d, self.w)) / (2.0 * self.radius)
         vec3(sx, sy, sz)
     }
@@ -400,169 +404,10 @@ pub fn shadow_view(centre: vec3, radius: f32, sun_way: vec3) -> ShadowView {
         u,
         texel,
         v,
-        spare: 0.0,
+        half: r,
         w,
         spare2: 0.0,
     }
-}
-
-/// Interleaved Gradient Noise (J. Jimenez 2014) in `[0, 1]` for per-pixel PCF rotation.
-pub fn ign(px: vec2) -> f32 {
-    fract(52.9829189 * fract(dot(px, vec2(0.06711056, 0.00583715))))
-}
-
-/// 8-tap rotated Vogel-disk PCF lookup against one shadow cascade with normal-offset bias.
-pub fn sun_shadow_soft(
-    shadow_map: DepthTexture,
-    cmp: ComparisonSampler,
-    sv: ShadowView,
-    wp: vec3,
-    n: vec3,
-    px: vec2,
-    filter_texels: f32,
-) -> f32 {
-    let ndl = dot(n, sv.w)
-    if ndl <= 0.0 {
-        return 0.0
-    }
-    let slope = sqrt(max(1.0 - ndl * ndl, 0.0))
-    let s = sv.project(wp + n * (sv.texel * (1.2 + 1.5 * slope)))
-    if abs(s.x) >= 0.995 || abs(s.y) >= 0.995 || s.z <= 0.0 || s.z >= 1.0 {
-        return 1.0
-    }
-    let uv = vec2(s.x * 0.5 + 0.5, 0.5 - s.y * 0.5)
-    let rad_uv = filter_texels / f32(SHADOW_SIDE)
-    let ref_z = clamp(s.z - 0.00025, 0.0, 1.0)
-    let ang0 = ign(px) * TAU
-    var sum = 0.0
-    for i in 0..8 {
-        let r = sqrt((f32(i) + 0.5) * 0.125) * rad_uv
-        let a = f32(i) * 2.3999632 + ang0
-        let off = vec2(cos(a) * r, sin(a) * r)
-        sum += shadow_map.sample_compare_level(cmp, uv + off, ref_z)
-    }
-    sum * 0.125
-}
-
-/// 4-tap rotated Vogel-disk PCF lookup with variable filter radius (driven by exact SDF blocker distance).
-fn sun_shadow_pcss4(
-    shadow_map: DepthTexture,
-    cmp: ComparisonSampler,
-    sv: ShadowView,
-    wp: vec3,
-    n: vec3,
-    px: vec2,
-    filter_texels: f32,
-) -> f32 {
-    let ndl = dot(n, sv.w)
-    if ndl <= 0.0 {
-        return 0.0
-    }
-    let slope = sqrt(max(1.0 - ndl * ndl, 0.0))
-    let s = sv.project(wp + n * (sv.texel * (1.2 + 1.5 * slope)))
-    if abs(s.x) >= 0.995 || abs(s.y) >= 0.995 || s.z <= 0.0 || s.z >= 1.0 {
-        return 1.0
-    }
-    let uv = vec2(s.x * 0.5 + 0.5, 0.5 - s.y * 0.5)
-    let rad_uv = filter_texels / f32(SHADOW_SIDE)
-    let ref_z = clamp(s.z - 0.00025, 0.0, 1.0)
-    let ang0 = ign(px) * TAU
-    var sum = 0.0
-    for i in 0..4 {
-        let r = sqrt((f32(i) + 0.5) * 0.25) * rad_uv
-        let a = f32(i) * 2.3999632 + ang0
-        let off = vec2(cos(a) * r, sin(a) * r)
-        sum += shadow_map.sample_compare_level(cmp, uv + off, ref_z)
-    }
-    sum * 0.25
-}
-
-/// Unified variable-width soft sun shadow: combines exact 3D SDF cone penumbra (sharp contact
-/// shadows that widen physically with blocker distance) with blocker-distance-scaled 4-tap PCF on
-/// the single `2048²` shadow map (for sub-voxel wands & sand grains). Falls back to 8-tap rotated
-/// PCF when `sdf_grid.enabled == 0` (`SIMPLE` reference judge).
-pub fn sun_shadow_hybrid(
-    shadow_map: DepthTexture,
-    static_shadow_map: DepthTexture,
-    has_static_shadow: u32,
-    cmp: ComparisonSampler,
-    sv: ShadowView,
-    sdf_grid: SdfGrid,
-    sdf0: Texture3d<R16Float>,
-    sdf1: Texture3d<R16Float>,
-    sdf_s: Sampler,
-    wp: vec3,
-    n: vec3,
-    px: vec2,
-) -> f32 {
-    let ndl = dot(n, sv.w)
-    if ndl <= 0.0 {
-        return 0.0
-    }
-    if sdf_grid.enabled == 0 {
-        let d_vis = sun_shadow_soft(shadow_map, cmp, sv, wp, n, px, 2.0)
-        return if has_static_shadow != 0 {
-            min(d_vis, sun_shadow_soft(static_shadow_map, cmp, sv, wp, n, px, 2.0))
-        } else {
-            d_vis
-        }
-    }
-    let sdf_sb = sdf_soft_shadow(sdf_grid, sdf0, sdf1, sdf_s, wp, n, sv.w, max_dist: 16.0, k: 12.0)
-    let sdf_vis = sdf_sb.x
-    let blocker_t = sdf_sb.y
-    // Exact blocker distance from the SDF sets the shadow-map PCSS filter width (tight on contact,
-    // silky wide penumbra meters behind tall columns) with zero noisy blocker-search taps.
-    let filter_tx = if blocker_t > 0.01 { clamp(1.15 + blocker_t * 1.45, 1.15, 6.0) } else { 1.35 }
-    let sm_dyn = sun_shadow_pcss4(shadow_map, cmp, sv, wp, n, px, filter_tx)
-    let sm_vis = if has_static_shadow != 0 {
-        min(sm_dyn, sun_shadow_pcss4(static_shadow_map, cmp, sv, wp, n, px, filter_tx))
-    } else {
-        sm_dyn
-    }
-    // Where the SDF reports a wide distant penumbra, let the smooth analytical penumbra dominate
-    // while keeping shadow-map coverage for thin sub-voxel features (wands, sand grains).
-    if blocker_t > 0.65 && sdf_vis < 0.99 {
-        return min(sdf_vis, mix(sm_vis, sdf_vis, 0.55))
-    }
-    min(sm_vis, sdf_vis)
-}
-
-/// Short screen-space micro-contact shadow along `sun_way` against resolved reversed-Z depth
-/// (grounds boots, wands, and small props in the final 1..16 cm where shadow maps bias away).
-pub fn contact_shadow(v: View, depth: DepthTexture, wp: vec3, n: vec3, sun_way: vec3) -> f32 {
-    let ndl = dot(n, sun_way)
-    if ndl <= 0.05 {
-        return 1.0
-    }
-    let aspect = v.size.y / max(v.size.x, 1.0)
-    let w_px = v.size.x
-    let h_px = v.size.y
-    let p0 = wp + n * 0.015
-    for step in 1..6 {
-        let t = f32(step) * 0.035
-        let p = p0 + sun_way * t
-        let rel = p - v.at
-        let z = dot(rel, v.forward)
-        if z <= NEAR {
-            break
-        }
-        let x_ndc = (dot(rel, v.right) * v.focal * aspect) / z
-        let y_ndc = (dot(rel, v.up) * v.focal) / z
-        if abs(x_ndc) >= 0.995 || abs(y_ndc) >= 0.995 {
-            break
-        }
-        let sx = u32(clamp((x_ndc * 0.5 + 0.5) * w_px, 0.0, w_px - 1.0))
-        let sy = u32(clamp((0.5 - y_ndc * 0.5) * h_px, 0.0, h_px - 1.0))
-        let dz = depth.load(sx, sy)
-        if dz > 1.0e-6 {
-            let scene_z = NEAR / dz
-            let diff = z - scene_z
-            if diff > 0.012 && diff < 0.22 {
-                return 0.35
-            }
-        }
-    }
-    1.0
 }
 
 /// Screen-Space Specular Reflections (SSR): marches a reflection ray from `wp` along `refl` against
@@ -653,49 +498,6 @@ pub fn trace_ssr(
     let back_fade = clamp(1.0 + dot(refl, v.forward) * 0.65, 0.2, 1.0)
     let conf = edge_fade * rough_fade * back_fade
     vec4(clamped_rgb, conf)
-}
-
-/// 4-tap PCF lookup against the unified sun shadow map with normal-offset bias.
-pub fn sun_shadow(
-    shadow_map: DepthTexture,
-    cmp: ComparisonSampler,
-    sv: ShadowView,
-    wp: vec3,
-    n: vec3,
-) -> f32 {
-    let ndl = dot(n, sv.w)
-    if ndl <= 0.0 {
-        return 0.0
-    }
-    let slope = sqrt(max(1.0 - ndl * ndl, 0.0))
-    let s = sv.project(wp + n * (sv.texel * (1.5 + 1.8 * slope)))
-    if abs(s.x) >= 0.999 || abs(s.y) >= 0.999 || s.z <= 0.0 || s.z >= 1.0 {
-        return 1.0
-    }
-    let uv = vec2(s.x * 0.5 + 0.5, 0.5 - s.y * 0.5)
-    let o = 0.5 / f32(SHADOW_SIDE)
-    let ref_z = clamp(s.z - 0.0003, 0.0, 1.0)
-    var sum = 0.0
-    sum += shadow_map.sample_compare_level(cmp, uv + vec2(-o, -o), ref_z)
-    sum += shadow_map.sample_compare_level(cmp, uv + vec2(o, -o), ref_z)
-    sum += shadow_map.sample_compare_level(cmp, uv + vec2(-o, o), ref_z)
-    sum += shadow_map.sample_compare_level(cmp, uv + vec2(o, o), ref_z)
-    sum * 0.25
-}
-
-/// Single-tap sun visibility lookup for volumetrics and voxel injection (no normal offset).
-pub fn sun_vis_point(
-    shadow_map: DepthTexture,
-    cmp: ComparisonSampler,
-    sv: ShadowView,
-    wp: vec3,
-) -> f32 {
-    let s = sv.project(wp)
-    if abs(s.x) >= 0.999 || abs(s.y) >= 0.999 || s.z <= 0.0 || s.z >= 1.0 {
-        return 1.0
-    }
-    let uv = vec2(s.x * 0.5 + 0.5, 0.5 - s.y * 0.5)
-    shadow_map.sample_compare_level(cmp, uv, clamp(s.z - 0.0006, 0.0, 1.0))
 }
 
 /// Spatial mapping of the world-space radiance volume (`RAD_SIDE³`).
@@ -809,7 +611,6 @@ fn rad_inject_sample<S: Sky>(
     sky_table: Texture<Rgba16Float>,
     sky_s: Sampler,
     shadow_map: DepthTexture,
-    cmp: ComparisonSampler,
     prev_rad1: Texture3d<Rgba16Float>,
     prev_grid: RadGrid,
     rad_s: Sampler,
@@ -824,7 +625,9 @@ fn rad_inject_sample<S: Sky>(
     let normal = if nl2 > 1.0e-12 { nrm * (1.0 / sqrt(nl2)) } else { vec3(0.0, 1.0, 0.0) }
     let sun = sky.sun()
     let ndl = max(dot(normal, sun.way), 0.0)
-    let vis = if ndl > 0.0 { sun_shadow(shadow_map, cmp, sv, wp, normal) } else { 0.0 }
+    // The map's taps at the vertex's exact plane depth (no exact pass follows injection): its
+    // mesh is good to a texel of the map (`sv.texel`).
+    let vis = sun_map_vis(shadow_map, shadow_map, 0, sv, sun, wp, normal, sv.texel).vis
     let direct = sun.light * (ndl * vis)
 
     // Last build's volume, read where it was laid out (`prev_grid`): the grid follows the eye, and
@@ -873,7 +676,6 @@ fn rad_inject_one<M: Field<Substance>, S: Sky>(
     sky_table: Texture<Rgba16Float>,
     sky_s: Sampler,
     shadow_map: DepthTexture,
-    cmp: ComparisonSampler,
     prev_rad1: Texture3d<Rgba16Float>,
     prev_grid: RadGrid,
     rad_s: Sampler,
@@ -911,7 +713,6 @@ fn rad_inject_one<M: Field<Substance>, S: Sky>(
         sky_table,
         sky_s,
         shadow_map,
-        cmp,
         prev_rad1,
         prev_grid,
         rad_s,
@@ -939,7 +740,6 @@ fn rad_inject_many<M: Field<Substance>, S: Sky>(
     sky_table: Texture<Rgba16Float>,
     sky_s: Sampler,
     shadow_map: DepthTexture,
-    cmp: ComparisonSampler,
     prev_rad1: Texture3d<Rgba16Float>,
     prev_grid: RadGrid,
     rad_s: Sampler,
@@ -979,7 +779,6 @@ fn rad_inject_many<M: Field<Substance>, S: Sky>(
         sky_table,
         sky_s,
         shadow_map,
-        cmp,
         prev_rad1,
         prev_grid,
         rad_s,
@@ -1009,7 +808,6 @@ fn rad_inject_skin_many<M: Field<Substance>, S: Sky>(
     sky_table: Texture<Rgba16Float>,
     sky_s: Sampler,
     shadow_map: DepthTexture,
-    cmp: ComparisonSampler,
     prev_rad1: Texture3d<Rgba16Float>,
     prev_grid: RadGrid,
     rad_s: Sampler,
@@ -1050,7 +848,6 @@ fn rad_inject_skin_many<M: Field<Substance>, S: Sky>(
         sky_table,
         sky_s,
         shadow_map,
-        cmp,
         prev_rad1,
         prev_grid,
         rad_s,
@@ -1725,7 +1522,6 @@ impl RadianceCache {
         sky_table: Texture<Rgba16Float>,
         sky_s: Sampler,
         shadow_map: DepthTexture,
-        cmp: ComparisonSampler,
         to_static: bool,
     ) {
         if self.grid.enabled == 0 || cap_verts == 0 || inst_count == 0 {
@@ -1759,7 +1555,6 @@ impl RadianceCache {
                     sky_table: sky_table,
                     sky_s: sky_s,
                     shadow_map: shadow_map,
-                    cmp: cmp,
                     prev_rad1: self.rad1,
                     prev_grid: self.rad1_grid,
                     rad_s: self.s,
@@ -1785,7 +1580,6 @@ impl RadianceCache {
                     sky_table: sky_table,
                     sky_s: sky_s,
                     shadow_map: shadow_map,
-                    cmp: cmp,
                     prev_rad1: self.rad1,
                     prev_grid: self.rad1_grid,
                     rad_s: self.s,
@@ -1815,7 +1609,6 @@ impl RadianceCache {
         sky_table: Texture<Rgba16Float>,
         sky_s: Sampler,
         shadow_map: DepthTexture,
-        cmp: ComparisonSampler,
         to_static: bool,
     ) {
         if self.grid.enabled == 0 || cap_verts == 0 || inst_count == 0 || n_fields == 0 {
@@ -1852,7 +1645,6 @@ impl RadianceCache {
                     sky_table: sky_table,
                     sky_s: sky_s,
                     shadow_map: shadow_map,
-                    cmp: cmp,
                     prev_rad1: self.rad1,
                     prev_grid: self.rad1_grid,
                     rad_s: self.s,
@@ -1881,7 +1673,6 @@ impl RadianceCache {
                     sky_table: sky_table,
                     sky_s: sky_s,
                     shadow_map: shadow_map,
-                    cmp: cmp,
                     prev_rad1: self.rad1,
                     prev_grid: self.rad1_grid,
                     rad_s: self.s,
@@ -1913,7 +1704,6 @@ impl RadianceCache {
         sky_table: Texture<Rgba16Float>,
         sky_s: Sampler,
         shadow_map: DepthTexture,
-        cmp: ComparisonSampler,
         to_static: bool,
     ) {
         if self.grid.enabled == 0 || cap_verts == 0 || inst_count == 0 || n_fields == 0 {
@@ -1952,7 +1742,6 @@ impl RadianceCache {
                     sky_table: sky_table,
                     sky_s: sky_s,
                     shadow_map: shadow_map,
-                    cmp: cmp,
                     prev_rad1: self.rad1,
                     prev_grid: self.rad1_grid,
                     rad_s: self.s,
@@ -1983,7 +1772,6 @@ impl RadianceCache {
                     sky_table: sky_table,
                     sky_s: sky_s,
                     shadow_map: shadow_map,
-                    cmp: cmp,
                     prev_rad1: self.rad1,
                     prev_grid: self.rad1_grid,
                     rad_s: self.s,

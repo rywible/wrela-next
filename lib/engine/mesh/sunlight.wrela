@@ -1,0 +1,759 @@
+// The sun's visibility, certified (docs/design.md, "Certified sun shadows"): what reads the sun's
+// shadow maps, and the only code that does.
+//
+// 0. `SunFit`: the eye's own map of the sun (sample-distribution shadow maps: Lauritzen, Salvi
+//    and Lefohn 2011), fitted across to the receivers the eye sees this frame (a reduction of the
+//    eye's depth, on the GPU, into a `ShadowView` in a buffer the casters' vertex shaders read),
+//    along the sun's way as deep as the world, so every caster is in it; drawn every frame, with
+//    no depth bias. The world's map (fitted to the world's bound, its still casters cached) is
+//    kept for what has no eye of its own: the radiance volume, the froxels, glass.
+// 1. `SunCert`: a min/max pyramid of the eye's map, level 0 a half-size texel each 2 × 2 of the
+//    map's texels' nearest and farthest caster, each level after a 2 × 2 of the one before.
+//    Nothing here compares a depth to anything but a receiver plane's exact depth at the
+//    texel's own centre.
+// 2. `sun_classify_fs`: each pixel's receiver (its point from the eye's depth, its geometric
+//    normal from the depth of its neighbours, so a bump in the shading normal never tilts the
+//    plane) is proven lit or dark by two pyramid windows (its footprint's, and the cone the
+//    highest caster could throw on it), or decided by taps over the sun disc's footprint at the
+//    plane's exact depth, or, where a tap finds a caster in the near band (a contact, a crease,
+//    a terminator: within a few of the eye's map's texels of depth of the receiver's plane,
+//    where the map's raster can't say which is in front), left for the exact pass through the
+//    band's depth, with what the map says of the casters beyond it.
+// 3. `SunExact`: each such pixel gathered into a list, and each field's exact short ray toward
+//    the sun from each listed pixel whose ray comes within its bound (`trace_sun_near`), the
+//    least over every field kept by an atomic least.
+// 4. `sun_map_vis`: the map's taps alone where no exact pass follows (forward-shaded glass, the
+//    radiance volume's injection, the froxels).
+
+use matter::sky::Sun
+use matter::substance::Substance
+use mesh::dc::HOLE_PX
+use mesh::grid::{octa, unocta}
+use mesh::light::{NEAR, SHADOW_SIDE, ShadowView}
+use mesh::proof::{
+    SunVisibility, prove_sun_backfacing, prove_sun_dark, prove_sun_lit, sun_exact,
+    sun_map_penumbra, sun_map_taps, trace_sun_near,
+}
+use picture::eye::View
+use std::derive::Box3
+use std::field::{Field, Surface}
+use std::collections::Vec
+use std::gpu::{
+    Append, AppendBuffer, Atomics, DepthTexture, DispatchArgs, FragCoord, GlobalId, GpuBuffer,
+    MipStep, Rg32Float, Rgba8, Rgba32Float, Slots, Texels, Texture, append_buffer, buffer_of,
+    dispatch, label, mip_levels, writable_texture, write,
+}
+
+/// Side of the certificate pyramid's level 0 (texels): half the map's.
+pub const CERT_SIDE: u32 = SHADOW_SIDE / 2
+
+/// The near band, in the eye's map's texels of depth: a caster within this many texels' worth
+/// of the receiver's plane (and the meshes' error) is one the map's raster can misplace in depth
+/// by a whole texel's slide across a caster leaning 76° from the sun (tan 76° ≈ 4): a contact,
+/// a crease, never decided by the map, only by an exact ray as long as the band. (8 texels, a
+/// caster at 83°, cost 5.3 ms of exact rays at 1080p on the M4 in SCENE 13 for no change the
+/// sun's judge could see: docs/design.md, "Certified sun shadows".)
+pub const BAND_TEXELS: f32 = 4.0
+
+/// Taps over the disc's footprint where the pyramid proves nothing (a Vogel disc), and taps of
+/// the blocker search that sizes it.
+pub const SUN_TAPS: u32 = 12
+pub const SUN_SEARCH: u32 = 8
+
+/// The certificate pyramid: `tex`'s texels `(nearest, farthest)` caster depth over a block of
+/// the merged map, `levels` of them.
+pub struct SunCert {
+    pub tex: Texture<Rg32Float>,
+    pub levels: u32,
+}
+
+pub fn sun_cert() -> SunCert {
+    let levels = mip_levels(CERT_SIDE, CERT_SIDE)
+    SunCert { tex: writable_texture(width: CERT_SIDE, height: CERT_SIDE, levels: levels), levels }
+}
+
+/// The merged map's depth at texel (`x`, `y`): the nearer of the moving batches' map and, where
+/// there is one, the still batches'.
+fn map_depth(shadow_map: DepthTexture, static_map: DepthTexture, has_static: u32, x: u32, y: u32) -> f32 {
+    let a = shadow_map.load(x, y)
+    if has_static != 0 { min(a, static_map.load(x, y)) } else { a }
+}
+
+@compute(8, 8)
+fn sun_cert_level0(map: DepthTexture, out: mut Texels<Rg32Float>, id: GlobalId) {
+    if id.x >= CERT_SIDE || id.y >= CERT_SIDE {
+        return
+    }
+    let x = id.x * 2
+    let y = id.y * 2
+    let a = map.load(x, y)
+    let b = map.load(x + 1, y)
+    let c = map.load(x, y + 1)
+    let d = map.load(x + 1, y + 1)
+    out.store(id, vec2(min(min(a, b), min(c, d)), max(max(a, b), max(c, d))))
+}
+
+@compute(8, 8)
+fn sun_cert_reduce(step: mut MipStep<Rg32Float>, side: u32, id: GlobalId) {
+    if id.x >= side || id.y >= side {
+        return
+    }
+    let src = step.source_size()
+    let x0 = min(id.x * 2, src.x - 1)
+    let y0 = min(id.y * 2, src.y - 1)
+    let x1 = min(x0 + 1, src.x - 1)
+    let y1 = min(y0 + 1, src.y - 1)
+    let a = step.load(x0, y0)
+    let b = step.load(x1, y0)
+    let c = step.load(x0, y1)
+    let d = step.load(x1, y1)
+    step.store(id, vec2(min(min(a.x, b.x), min(c.x, d.x)), max(max(a.y, b.y), max(c.y, d.y))))
+}
+
+impl SunCert {
+    /// The pyramid of the map just drawn.
+    pub fn build(mut self, map: DepthTexture) {
+        label("mesh_sun_cert")
+        dispatch(
+            sun_cert_level0.bind(map: map, out: self.tex.level_mut(0)),
+            groups: ((CERT_SIDE + 7) / 8, (CERT_SIDE + 7) / 8, 1),
+        )
+        for lvl in 1..self.levels {
+            let side = max(CERT_SIDE >> lvl, 1)
+            dispatch(
+                sun_cert_reduce.bind(step: self.tex.mip_step(lvl), side: side),
+                groups: ((side + 7) / 8, (side + 7) / 8, 1),
+            )
+        }
+    }
+}
+
+/// A receiver as the map sees it: where in the map (`f`: the map's texel coordinates, a texel's
+/// centre at `x + 0.5`), its depth there (`z`), and its tangent plane's depth's rise a texel
+/// along the map's `x` and `y` (`g`).
+struct Receiver: Copy {
+    f: vec2,
+    z: f32,
+    g: vec2,
+}
+
+fn receiver_of(sv: ShadowView, wp: vec3, n: vec3) -> Receiver {
+    let s = sv.project(wp)
+    let ndw = max(dot(n, sv.w), 1.0e-4)
+    // A step of one texel along `u` (the map's `x`) moves the plane `n·u / n·w` texels toward the
+    // light's far side; along the map's `y` (down the map: `-v`) as much of `-n·v`. In depth's
+    // units (the map's depth spans `2 r`), a texel is `texel / 2r` = `1 / SHADOW_SIDE`.
+    let k = 1.0 / f32(SHADOW_SIDE)
+    Receiver {
+        f: vec2(s.x * 0.5 + 0.5, 0.5 - s.y * 0.5) * f32(SHADOW_SIDE),
+        z: s.z,
+        g: vec2(dot(n, sv.u) / ndw * k, -dot(n, sv.v) / ndw * k),
+    }
+}
+
+impl Receiver {
+    /// The plane's depth at texel (`x`, `y`)'s centre.
+    fn at(self, x: f32, y: f32) -> f32 {
+        self.z + self.g.x * (x + 0.5 - self.f.x) + self.g.y * (y + 0.5 - self.f.y)
+    }
+
+    /// The least the plane's depth reaches over the map's texels `[x0, x1] × [y0, y1]` (their
+    /// centres).
+    fn lowest(self, x0: f32, y0: f32, x1: f32, y1: f32) -> f32 {
+        min(min(self.at(x0, y0), self.at(x1, y0)), min(self.at(x0, y1), self.at(x1, y1)))
+    }
+}
+
+/// The pyramid's `(nearest, farthest)` over every map texel within `radius` texels of `f`, read
+/// as at most 2 × 2 texels of the level whose texels are at least `2 radius` wide; and the map
+/// texels that read covers (`x0, y0, x1, y1`).
+fn window(cert: Texture<Rg32Float>, levels: u32, f: vec2, radius: f32) -> (vec2, vec4) {
+    let want = max(2.0 * radius, 2.0)
+    let lvl = min(u32(max(ceil(log2(want)) - 1.0, 0.0)), levels - 1)
+    let span = f32(u32(1) << (lvl + 1))
+    let side = max(CERT_SIDE >> lvl, 1)
+    let lo = clamp(floor((f - vec2(radius)) / span), vec2(0.0), vec2(f32(side - 1)))
+    let hi = clamp(floor((f + vec2(radius)) / span), vec2(0.0), vec2(f32(side - 1)))
+    let a = cert.load(u32(lo.x), u32(lo.y), level: lvl)
+    let b = cert.load(u32(hi.x), u32(lo.y), level: lvl)
+    let c = cert.load(u32(lo.x), u32(hi.y), level: lvl)
+    let d = cert.load(u32(hi.x), u32(hi.y), level: lvl)
+    (
+        vec2(min(min(a.x, b.x), min(c.x, d.x)), max(max(a.y, b.y), max(c.y, d.y))),
+        vec4(lo * span, (hi + vec2(1.0)) * span - vec2(1.0)),
+    )
+}
+
+/// Each pixel's sun, as far as the map can certify it: `(vis, reach, n)`, `reach` 0 where
+/// decided (`vis` the sun it sees), or where a tap finds a caster in the near band, the band's
+/// depth (m along the sun's way) for the exact rays to look through (`vis` then what the map
+/// says of the casters beyond it), and the receiver's geometric normal (octahedral), which tells
+/// the exact rays its own surface from others.
+@fragment
+pub(package) fn sun_classify_fs(
+    pixel: FragCoord,
+    v: View,
+    svs: [ShadowView],
+    sun: Sun,
+    depth: DepthTexture,
+    g_normal: Texture<Rgba8>,
+    eye_map: DepthTexture,
+    cert: Texture<Rg32Float>,
+    cert_levels: u32,
+    full_w: u32,
+    full_h: u32,
+) -> vec4 {
+    let sv = svs[0]
+    let px = min(u32(pixel.position.x), full_w - 1)
+    let py = min(u32(pixel.position.y), full_h - 1)
+    let gn = g_normal.load(px, py)
+    let ndc_z = depth.load(px, py)
+    if gn.w <= 0.5 || ndc_z <= 1.0e-6 {
+        return vec4(1.0, 0.0, 0.0, 0.0)
+    }
+    let ray = v.ray(vec2(f32(px) + 0.5, f32(py) + 0.5))
+    let dist = eye_dist(v, ray, ndc_z)
+    let wp = v.at + ray * dist
+    let shade_n = normalize(gn.xyz * 2.0 - vec3(1.0))
+    let (geo_n, sure) = depth_normal(v, depth, px, py, full_w, full_h, wp, ray, shade_n)
+    match prove_sun_backfacing(dot(geo_n, sun.way)) {
+        Some(sv0) => {
+            return vec4(sv0.vis, 0.0, 0.0, 0.0)
+        },
+        None => {},
+    }
+    let rc = receiver_of(sv, wp, geo_n)
+    let side = f32(SHADOW_SIDE)
+    if rc.f.x < 1.0 || rc.f.y < 1.0 || rc.f.x > side - 1.0 || rc.f.y > side - 1.0 || rc.z >= 1.0 {
+        // Outside the map: nothing that casts on the world is there.
+        return vec4(1.0, 0.0, 0.0, 0.0)
+    }
+    // The meshes' certified error (half a pixel where the eye sees them: `HOLE_PX`), twice (the
+    // receiver's and the caster's), in the map's depth.
+    let e_mesh = HOLE_PX * dist * v.pixel()
+    let depth_m = 2.0 * sv.radius
+    let eps = (2.0 * e_mesh) / depth_m + 2.0e-7
+    let band_m = BAND_TEXELS * sv.texel + 2.0 * e_mesh
+    let band = band_m / depth_m
+    let tan_sun = tan(max(sun.size, 1.0e-4))
+    // The footprint's window (a texel round the receiver), and the cone's: as wide as a caster
+    // at the map's nearest to the sun could throw its penumbra.
+    let (fine, fr) = window(cert, cert_levels, rc.f, 1.0)
+    let top = cert.load(x: 0, y: 0, level: cert_levels - 1)
+    let rise_most = max(rc.z - top.x, 0.0) * depth_m
+    let cone_r = rise_most * tan_sun / sv.texel + 1.0
+    let (cone, cr) = window(cert, cert_levels, rc.f, cone_r)
+    let plane_fine = rc.lowest(fr.x, fr.y, fr.z, fr.w)
+    let plane_cone = rc.lowest(cr.x, cr.y, cr.z, cr.w)
+    // (Where the receiver's plane is unsure, from the shading normal: the taps and the exact rays
+    // still decide it, but nothing is proven over a window from a plane that may tilt.)
+    if sure {
+        match prove_sun_lit(fine.x, plane_fine, cone.x, plane_cone, eps) {
+            Some(s) => {
+                return vec4(s.vis, 0.0, 0.0, 0.0)
+            },
+            None => {},
+        }
+        match prove_sun_dark(cone.y, plane_cone, band) {
+            Some(s) => {
+                return vec4(s.vis, 0.0, 0.0, 0.0)
+            },
+            None => {},
+        }
+    }
+    // Taps, each a texel's caster against the receiver's plane at that texel's centre: far where
+    // the caster is above the plane by more than the near band (`band`), near within it, open
+    // under the meshes' error. The blocker search over the cone's window sizes the disc's
+    // footprint (`foot`, texels) by how far above the plane the far casters it finds are.
+    let ang0 = fract(52.9829189 * fract(dot(pixel.position.xy, vec2(0.06711056, 0.00583715)))) *
+        6.2831853
+    var rise_sum = 0.0
+    var rise_n = 0.0
+    var near: u32 = 0
+    for i in 0..SUN_SEARCH {
+        let r = sqrt((f32(i) + 0.5) / f32(SUN_SEARCH)) * cone_r
+        let a = f32(i) * 2.3999632 + ang0
+        let q = clamp(floor(rc.f + vec2(cos(a), sin(a)) * r), vec2(0.0), vec2(side - 1.0))
+        let rise = rc.at(q.x, q.y) - eye_map.load(u32(q.x), u32(q.y))
+        if rise > band {
+            rise_sum += rise
+            rise_n += 1.0
+        }
+    }
+    let foot = if rise_n > 0.0 {
+        clamp((rise_sum / rise_n) * depth_m * tan_sun / sv.texel, 0.5, cone_r)
+    } else { 0.5 }
+    var blocked = 0.0
+    var taps = 0.0
+    var far_hi = 0.0
+    for i in 0..SUN_TAPS {
+        let r = sqrt((f32(i) + 0.5) / f32(SUN_TAPS)) * foot
+        let a = f32(i) * 2.3999632 + ang0
+        let q = clamp(floor(rc.f + vec2(cos(a), sin(a)) * r), vec2(0.0), vec2(side - 1.0))
+        let rise = rc.at(q.x, q.y) - eye_map.load(u32(q.x), u32(q.y))
+        taps += 1.0
+        if rise > band {
+            blocked += 1.0
+            far_hi = max(far_hi, rise)
+        } else if rise > eps {
+            near += 1
+        }
+    }
+    // The texels the receiver's own footprint falls in, each at the plane's exact depth: a caster
+    // in the near band there is a contact, or a crease of the receiver's own.
+    let b0 = floor(rc.f - vec2(0.5))
+    var foot_far = 0
+    for k in 0..4 {
+        let q = clamp(b0 + vec2(f32(k & 1), f32(k >> 1)), vec2(0.0), vec2(side - 1.0))
+        let rise = rc.at(q.x, q.y) - eye_map.load(u32(q.x), u32(q.y))
+        if rise > eps && rise <= band {
+            near += 1
+        }
+        if rise > band {
+            foot_far += 1
+            far_hi = max(far_hi, rise)
+        }
+    }
+    // Where the far taps disagree and the disc's footprint is under a texel (a caster this near
+    // throws a penumbra the map can't place within a texel), the shadow's edge runs through the
+    // receiver's texel at a place the map doesn't know: the exact rays decide it all, as far as
+    // the highest of those casters, a quarter over.
+    let edge = foot < 1.0 &&
+        ((blocked > 0.0 && blocked < taps) || (foot_far > 0 && foot_far < 4) ||
+            ((blocked > 0.0) != (foot_far > 0)))
+    if near == 0 && edge {
+        return vec4(1.0, far_hi * depth_m * 1.25 + sv.texel + 2.0 * e_mesh, octa(geo_n))
+    }
+    match sun_map_penumbra(blocked, taps, near) {
+        Some(s) => vec4(s.vis, 0.0, 0.0, 0.0),
+        // The far casters as the map says; the near band by the exact rays, as far as it reaches.
+        None => vec4(clamp(1.0 - blocked / taps, 0.0, 1.0), band_m, octa(geo_n)),
+    }
+}
+
+/// How fine the fit's reduction reads the eye's depth: each lane a block of `FIT_SIDE` ×
+/// `FIT_SIDE` pixels, so few lanes meet at the reduction's four words.
+pub const FIT_SIDE: u32 = 8
+
+/// Where across the world's map (`sv`'s `u` and `v`, a tenth of a millimetre a unit, from its
+/// centre) the receivers the eye sees lie: `bounds` `(least u, least v, -most u, -most v)`.
+@compute(8, 8)
+fn sun_fit_reduce(
+    depth: DepthTexture,
+    v: View,
+    sv: ShadowView,
+    full_w: u32,
+    full_h: u32,
+    bounds: mut Atomics<i32>,
+    id: GlobalId,
+) {
+    let x0 = id.x * FIT_SIDE
+    let y0 = id.y * FIT_SIDE
+    if x0 >= full_w || y0 >= full_h {
+        return
+    }
+    var lo = vec2(3.0e38)
+    var hi = vec2(-3.0e38)
+    for k in 0..(FIT_SIDE * FIT_SIDE) {
+        let x = x0 + k % FIT_SIDE
+        let y = y0 + k / FIT_SIDE
+        if x < full_w && y < full_h {
+            let z = depth.load(x, y)
+            if z > 1.0e-6 {
+                let r = v.ray(vec2(f32(x) + 0.5, f32(y) + 0.5))
+                let d = v.at + r * eye_dist(v, r, z) - sv.centre
+                let q = vec2(dot(d, sv.u), dot(d, sv.v))
+                lo = min(lo, q)
+                hi = max(hi, q)
+            }
+        }
+    }
+    if lo.x <= hi.x {
+        let lim = vec2(2.0e5)
+        let a = clamp(floor(lo * 10000.0), -lim * 10000.0, lim * 10000.0)
+        let b = clamp(ceil(hi * 10000.0), -lim * 10000.0, lim * 10000.0)
+        let _ = bounds.min(i: 0, value: i32(a.x))
+        let _ = bounds.min(i: 1, value: i32(a.y))
+        let _ = bounds.min(i: 2, value: -i32(b.x))
+        let _ = bounds.min(i: 3, value: -i32(b.y))
+    }
+}
+
+/// The eye's map's view from `bounds`: `world`'s, moved across to the middle of the receivers
+/// and as wide as they are (and the penumbra a caster at the world's height could throw past
+/// them, and a texel), its half-width on a ladder of eighth-octaves and its middle on its own
+/// texels' grid, so a still eye's map stands still; `world`'s where the eye sees nothing.
+@compute(1)
+fn sun_fit_set(bounds: [i32], world: ShadowView, tan_sun: f32, out: mut Slots<ShadowView>, id: GlobalId) {
+    let lo = vec2(f32(bounds[0]), f32(bounds[1])) * 0.0001
+    let hi = -vec2(f32(bounds[2]), f32(bounds[3])) * 0.0001
+    if !(lo.x <= hi.x && lo.y <= hi.y) {
+        out[id] = world
+        return
+    }
+    let mid = 0.5 * (lo + hi)
+    let raw = 0.5 * max(hi.x - lo.x, hi.y - lo.y) + 2.0 * world.radius * tan_sun
+    let half = min(exp2(ceil(log2(max(raw, 0.01)) * 8.0) / 8.0) * (1.0 + 4.0 / f32(SHADOW_SIDE)), world.half)
+    let texel = 2.0 * half / f32(SHADOW_SIDE)
+    let cu = dot(world.centre, world.u)
+    let cv = dot(world.centre, world.v)
+    let su = floor((cu + mid.x) / texel) * texel - cu
+    let sv2 = floor((cv + mid.y) / texel) * texel - cv
+    out[id] = ShadowView {
+        centre: world.centre + world.u * su + world.v * sv2,
+        radius: world.radius,
+        u: world.u,
+        texel: texel,
+        v: world.v,
+        half: half,
+        w: world.w,
+        spare2: 0.0,
+    }
+}
+
+/// The eye's map's fit: the reduction's four words and the view it makes, in a buffer the
+/// casters' vertex shaders, the certificate and the classification read.
+pub struct SunFit {
+    bounds: GpuBuffer<i32>,
+    pub svs: GpuBuffer<ShadowView>,
+}
+
+pub fn sun_fit() -> SunFit {
+    SunFit {
+        bounds: buffer_of(Vec::filled(4, 0)),
+        svs: buffer_of(
+            Vec::filled(
+                1,
+                ShadowView {
+                    centre: vec3(0.0),
+                    radius: 1.0,
+                    u: vec3(1.0, 0.0, 0.0),
+                    texel: 1.0,
+                    v: vec3(0.0, 1.0, 0.0),
+                    half: 1.0,
+                    w: vec3(0.0, 0.0, 1.0),
+                    spare2: 0.0,
+                },
+            ),
+        ),
+    }
+}
+
+impl SunFit {
+    /// The eye's map's view for the receivers in `depth` (seen through `v`), within `world`'s.
+    pub fn fit(mut self, depth: DepthTexture, v: View, world: ShadowView, sun: Sun, full_w: u32, full_h: u32) {
+        label("mesh_sun_fit")
+        let big: i32 = 2147483647
+        write(mut self.bounds, 0, [big, big, big, big])
+        let bx = (full_w + FIT_SIDE - 1) / FIT_SIDE
+        let by = (full_h + FIT_SIDE - 1) / FIT_SIDE
+        dispatch(
+            sun_fit_reduce.bind(
+                depth: depth,
+                v: v,
+                sv: world,
+                full_w: full_w,
+                full_h: full_h,
+                bounds: mut self.bounds,
+            ),
+            groups: ((bx + 7) / 8, (by + 7) / 8, 1),
+        )
+        dispatch(
+            sun_fit_set.bind(
+                bounds: self.bounds.items(),
+                world: world,
+                tan_sun: tan(max(sun.size, 1.0e-4)),
+                out: mut self.svs,
+            ),
+            over: 1,
+        )
+    }
+}
+
+/// A pixel's distance along its ray from the eye's reversed-Z depth.
+fn eye_dist(v: View, ray: vec3, ndc_z: f32) -> f32 {
+    (NEAR / ndc_z) / max(dot(ray, v.forward), 0.05)
+}
+
+/// The receiver's geometric normal from the eye's depth at its neighbours (each axis's nearer
+/// side in depth, so an outline's far side is never taken), facing the eye; and whether it is
+/// sure: where both sides of an axis are off the receiver's plane (a thin feature, an outline)
+/// or it disagrees with the shading normal by more than a bump can, the shading normal is taken
+/// and the pixel is left to the exact pass.
+fn depth_normal(
+    v: View,
+    depth: DepthTexture,
+    px: u32,
+    py: u32,
+    full_w: u32,
+    full_h: u32,
+    wp: vec3,
+    ray: vec3,
+    shade_n: vec3,
+) -> (vec3, bool) {
+    let xl = if px > 0 { px - 1 } else { px }
+    let xr = min(px + 1, full_w - 1)
+    let yu = if py > 0 { py - 1 } else { py }
+    let yd = min(py + 1, full_h - 1)
+    let pl = point_at(v, depth, xl, py, wp)
+    let pr = point_at(v, depth, xr, py, wp)
+    let pu = point_at(v, depth, px, yu, wp)
+    let pd = point_at(v, depth, px, yd, wp)
+    let dl = wp - pl
+    let dr = pr - wp
+    let du = wp - pu
+    let dd = pd - wp
+    let dx = if abs(dot(dl, ray)) < abs(dot(dr, ray)) { dl } else { dr }
+    let dy = if abs(dot(du, ray)) < abs(dot(dd, ray)) { du } else { dd }
+    let c = cross(dx, dy)
+    let cl = length(c)
+    if !(cl > 1.0e-20) {
+        return (shade_n, false)
+    }
+    var n = c / cl
+    if dot(n, ray) > 0.0 {
+        n = -n
+    }
+    // Both sides of an axis bending away from the plane by more than the pixel's own step: not
+    // one plane here.
+    let step = length(dx) + length(dy)
+    let off_x = abs(dot(dl - dr, n))
+    let off_y = abs(dot(du - dd, n))
+    let flat = off_x <= 0.5 * step && off_y <= 0.5 * step
+    (n, flat && dot(n, shade_n) > 0.5)
+}
+
+fn point_at(v: View, depth: DepthTexture, x: u32, y: u32, fallback: vec3) -> vec3 {
+    let z = depth.load(x, y)
+    if z <= 1.0e-6 {
+        return fallback
+    }
+    let r = v.ray(vec2(f32(x) + 0.5, f32(y) + 0.5))
+    v.at + r * eye_dist(v, r, z)
+}
+
+/// Exact rays a frame at the most, and how many of them a dispatch takes: the pixels left to them
+/// gathered into one list (`SunExact`), so every lane of a dispatch traces (scattered over the
+/// screen, a fragment pass ran a lane in thirty, at 86 ns an exact pixel at 1080p on the M4).
+/// Past `EXACT_MOST` a pixel keeps what the map says of its far casters and its near band open
+/// (counted in `SunExact::list`'s count).
+pub const EXACT_SLICES: u32 = 8
+pub const EXACT_CHUNK: u32 = 32768
+pub const EXACT_MOST: u32 = EXACT_SLICES * EXACT_CHUNK
+
+/// A frame's exact rays: the pixels left to them (`list`), its slices' dispatch arguments, and
+/// each pixel's least sun the rays found (`near`: 0..65535 of it; 65535 where none ran).
+pub struct SunExact {
+    pub list: AppendBuffer<u32>,
+    args: GpuBuffer<DispatchArgs>,
+    pub near: GpuBuffer<u32>,
+}
+
+pub fn sun_exact_list() -> SunExact {
+    SunExact {
+        list: append_buffer(EXACT_MOST),
+        args: buffer_of(Vec::filled(EXACT_SLICES, DispatchArgs { x: 0, y: 1, z: 1 })),
+        near: buffer_of(Vec::filled(1, 65535)),
+    }
+}
+
+/// Each pixel's `near` made 65535, and the pixel listed where the classification left it to the
+/// exact rays (`cls`'s reach over 0).
+@compute(64)
+fn sun_gather(
+    cls: Texture<Rgba32Float>,
+    full_w: u32,
+    count: u32,
+    list: mut Append<u32>,
+    near: mut Slots<u32>,
+    id: GlobalId,
+) {
+    if id.x >= count {
+        return
+    }
+    near[id] = 65535
+    if cls.load(id.x % full_w, id.x / full_w).y > 0.0 {
+        let _ = list.push(id.x)
+    }
+}
+
+/// The dispatch arguments of each slice of the list (`EXACT_CHUNK` pixels a slice).
+@compute(8)
+fn sun_slices(count: [u32], args: mut Slots<DispatchArgs>, id: GlobalId) {
+    if id.x >= EXACT_SLICES {
+        return
+    }
+    let first = id.x * EXACT_CHUNK
+    let n = if count[0] > first { min(min(count[0], EXACT_MOST) - first, EXACT_CHUNK) } else { 0 }
+    args[id] = DispatchArgs { x: (n + 63) / 64, y: 1, z: 1 }
+}
+
+impl SunExact {
+    /// The list of this frame's exact pixels from the classification (`cls`), `near` reset.
+    pub fn gather(mut self, cls: Texture<Rgba32Float>, full_w: u32, full_h: u32) {
+        let n = full_w * full_h
+        if self.near.len() != n {
+            self.near = buffer_of(Vec::filled(n, 65535))
+        }
+        self.list.clear()
+        dispatch(
+            sun_gather.bind(cls: cls, full_w: full_w, count: n, list: mut self.list, near: mut self.near),
+            over: n,
+        )
+        dispatch(sun_slices.bind(count: self.list.count(), args: mut self.args), over: EXACT_SLICES)
+    }
+
+    /// One field's exact rays from every listed pixel, the least into `near`.
+    pub fn trace<M: Field<Substance>>(
+        mut self,
+        field: M,
+        b: vec4,
+        cls: Texture<Rgba32Float>,
+        depth: DepthTexture,
+        v: View,
+        sun: Sun,
+        full_w: u32,
+    ) {
+        for k in 0..EXACT_SLICES {
+            dispatch(
+                sun_exact_one.bind(
+                    field: field,
+                    b: b,
+                    list: self.list.items(),
+                    count: self.list.count(),
+                    first: k * EXACT_CHUNK,
+                    cls: cls,
+                    depth: depth,
+                    v: v,
+                    sun: sun,
+                    full_w: full_w,
+                    near: mut self.near,
+                ),
+                groups: self.args.at(k),
+                most: EXACT_CHUNK / 64,
+            )
+        }
+    }
+}
+
+/// One field's exact short ray toward the sun from listed pixel `first + id` (its sun share, the
+/// least over every field kept by `near`'s atomic least, in 65535ths). A pixel whose ray's span
+/// misses the field's bound (`b`) is left as it is.
+@compute(64)
+fn sun_exact_one<M: Field<Substance>>(
+    field: M,
+    b: vec4,
+    list: [u32],
+    count: [u32],
+    first: u32,
+    cls: Texture<Rgba32Float>,
+    depth: DepthTexture,
+    v: View,
+    sun: Sun,
+    full_w: u32,
+    near: mut Atomics<u32>,
+    id: GlobalId,
+) {
+    let i = first + id.x
+    if id.x >= EXACT_CHUNK || i >= min(count[0], EXACT_MOST) {
+        return
+    }
+    let pix = list[i]
+    let px = pix % full_w
+    let py = pix / full_w
+    let cl = cls.load(px, py)
+    let ndc_z = depth.load(px, py)
+    let ray = v.ray(vec2(f32(px) + 0.5, f32(py) + 0.5))
+    let dist = eye_dist(v, ray, ndc_z)
+    let wp = v.at + ray * dist
+    // Whether the ray's span `[0, reach]` comes within the field's bound at all.
+    let oc = wp - b.xyz
+    let tb = clamp(-dot(oc, sun.way), 0.0, cl.y)
+    if length(oc + sun.way * tb) > b.w {
+        return
+    }
+    // The field's steepness within the ray's reach (its stated, where tighter).
+    let facts = field.field_facts()
+    let lip = if facts.lip > 0.0 && facts.lip < 1.0e12 {
+        min(facts.lip, field.lipschitz(cl.y))
+    } else {
+        field.lipschitz(cl.y)
+    }
+    // Only the parts that can matter along the ray: a box round it, a mesh error and the
+    // contact probe's reach over.
+    let e = HOLE_PX * dist * v.pixel()
+    let far_end = wp + sun.way * cl.y
+    let pad = vec3(3.0 * e + 1.0e-5)
+    let live = field.live(Box3 { lo: min(wp, far_end) - pad, hi: max(wp, far_end) + pad })
+    let vis = trace_sun_near(
+        field,
+        live,
+        wp,
+        dot(unocta(cl.zw), sun.way),
+        sun.way,
+        t_end: cl.y,
+        tan_sun: tan(max(sun.size, 1.0e-4)),
+        e: e,
+        lip: lip,
+    )
+    let _ = near.min(i: pix, value: u32(clamp(vis, 0.0, 1.0) * 65535.0 + 0.5))
+}
+
+/// A pixel's sun from the certified buffers: the classification's `(vis, reach)` and, where it
+/// left the pixel to them, the least the exact rays found.
+pub(package) fn sun_of_pixel(cls: Texture<Rgba32Float>, near: [u32], px: u32, py: u32, full_w: u32) -> SunVisibility {
+    let cl = cls.load(px, py)
+    sun_exact(cl.x, if cl.y > 0.0 { f32(near[py * full_w + px]) * (1.0 / 65535.0) } else { 1.0 })
+}
+
+/// The map's taps alone, where no exact pass follows: at `wp`, facing `n` (zero for a point in a
+/// medium: no plane), whose meshes are good to `e` m. Each of the 2 × 2 texels round it, weighed
+/// as a bilinear filter weighs them, open where no caster is above the receiver's plane there
+/// by more than the meshes' error.
+pub(package) fn sun_map_vis(
+    shadow_map: DepthTexture,
+    static_map: DepthTexture,
+    has_static: u32,
+    sv: ShadowView,
+    sun: Sun,
+    wp: vec3,
+    n: vec3,
+    e: f32,
+) -> SunVisibility {
+    let facing = dot(n, n) > 0.5
+    if facing {
+        match prove_sun_backfacing(dot(n, sun.way)) {
+            Some(s) => {
+                return s
+            },
+            None => {},
+        }
+    }
+    let rc = if facing { receiver_of(sv, wp, n) } else {
+        let s = sv.project(wp)
+        Receiver {
+            f: vec2(s.x * 0.5 + 0.5, 0.5 - s.y * 0.5) * f32(SHADOW_SIDE),
+            z: s.z,
+            g: vec2(0.0),
+        }
+    }
+    let side = f32(SHADOW_SIDE)
+    if rc.f.x < 1.0 || rc.f.y < 1.0 || rc.f.x > side - 1.0 || rc.f.y > side - 1.0 || rc.z >= 1.0 ||
+        rc.z <= 0.0 {
+        return sun_map_taps(open: 1.0, taps: 1.0)
+    }
+    let eps = (2.0 * e) / (2.0 * sv.radius) + 2.0e-7
+    let b0 = floor(rc.f - vec2(0.5))
+    let t = rc.f - vec2(0.5) - b0
+    var open = 0.0
+    for k in 0..4 {
+        let o = vec2(f32(k & 1), f32(k >> 1))
+        let q = b0 + o
+        let zc = map_depth(shadow_map, static_map, has_static, u32(q.x), u32(q.y))
+        let wgt = (if o.x > 0.5 { t.x } else { 1.0 - t.x }) * (if o.y > 0.5 { t.y } else { 1.0 - t.y })
+        if zc >= rc.at(q.x, q.y) - eps {
+            open += wgt
+        }
+    }
+    sun_map_taps(open, 1.0)
+}

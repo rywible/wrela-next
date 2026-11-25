@@ -1,0 +1,451 @@
+// The sun's judge: how much of the sun the engine says each surface it drew sees, held to how much
+// the reference's own shadow rays find it sees (`SUN_RAYS` rays toward even points of the sun's
+// disc, each marched by `traced::entered`, nothing clever). A pixel whose engine sun is brighter
+// than the reference's leaks light; darker, it is acne (or a shadow that isn't there). Only the
+// sun's visibility is judged, never the light it makes, so a shadow is judged apart from the
+// materials, the sky and the bounce.
+//
+// The engine's surface (its mesh, within its certified error) is first taken to the field's own
+// surface by Newton's steps along the field's gradient, so the reference's rays leave from the
+// surface the field says is there and the mesh's error is not judged as shadow. Pixels whose
+// surface faces away from part of the sun's disc (the terminator: the light there is the lean's,
+// not the shadow's) are counted apart and not judged.
+
+use matter::matter::{Matter, matter}
+use matter::sky::Sky
+use matter::substance::Substance
+use matter::world::World
+use picture::eye::{Eye, View, view}
+use picture::picture::Picture
+use reference::traced::{LEAST, LEAST_DOUBLES, LEAST_FAR, LEAVE, die, ends, sun_way}
+use std::collections::Vec
+use std::field::{Field, hash_u32}
+use std::gpu::{
+    Atomics, GlobalId, GpuBuffer, R8, Rg32Float, Rgba16Float, Rgba32Float, Slots, Texels, Texture, buffer_of, copy,
+    dispatch, label, read, writable_texture,
+}
+use std::io::{Pending, print}
+
+/// Rays toward the sun's disc a judged pixel (an 8 × 8 stratified square of the disc).
+pub const SUN_RAYS: u32 = 64
+
+/// The counts a judging keeps:
+///   0 pixels judged (covered, the whole sun disc in front of the surface)
+///   1 pixels left out at the terminator (part of the disc behind the surface)
+///   2 pixels where the engine's sun is over the reference's by more than an eighth (a leak)
+///   3 pixels where it is under it by more than an eighth (acne, or a shadow not there)
+///   4 hard leaks: the reference sees under a sixteenth of the sun, the engine over half
+///   5 hard acne: the reference sees over fifteen sixteenths, the engine under half
+///   6 |engine - reference| summed (255ths)
+///   7 (engine - reference) where over, summed (255ths): the light leaked
+///   8 the reference's rays that ran out of steps (taken as getting out)
+///   9 (reference - engine) where over, summed (255ths): the light taken away
+///  10 pixels whose surface the Newton steps could not bring to the field (left out)
+///  11 pixels the engine's classification left to its exact rays (`MeshSight::sun_cls`'s reach
+///     over 0), of all covered; 12 their reach summed (mm)
+///  13 judged pixels left to the exact rays; 14 of them, leaks; 15 of them, acne
+///  16 pixels whose field's facing is over 60° from the picture's (an outline, or a crease the
+///     mesh rounds: where the picture's point and the field's are not one surface): left out
+pub const SUN_COUNTS: u32 = 17
+
+/// The field's gradient at `p` by central differences of its value (`h` m apart): the reference
+/// asks the field's value alone, so its shader is the size of one distance.
+fn slope_at<M: Field<Substance>>(m: Matter<M>, p: vec3, h: f32) -> vec3 {
+    var g = vec3(0.0)
+    for a in 0..3 {
+        let e = vec3(if a == 0 { h } else { 0.0 }, if a == 1 { h } else { 0.0 }, if a == 2 { h } else {
+            0.0
+        })
+        let dd = m.field.distance(p + e) - m.field.distance(p - e)
+        g = g + e * (dd / (2.0 * h * h))
+    }
+    g
+}
+
+/// `p` taken to the field's surface: up to four of Newton's steps along its gradient, each its
+/// value over its gradient's length squared; whether it got within `tol` (m) of it.
+fn onto_surface<M: Field<Substance>>(m: Matter<M>, p: vec3, tol: f32) -> (vec3, bool) {
+    var q = p
+    for _i in 0..4 {
+        let d = m.field.distance(q)
+        if abs(d) <= tol * 0.01 {
+            return (q, true)
+        }
+        let g = slope_at(m, q, max(tol * 0.05, 1.0e-5))
+        let gg = dot(g, g)
+        if !(gg > 1.0e-8) {
+            return (q, false)
+        }
+        q = q - g * (d / gg)
+    }
+    (q, abs(m.field.distance(q)) <= tol)
+}
+
+/// How far a judging ray marches a pass (steps), and in how many passes: a ray still going after
+/// the last is counted lost (taken as getting out). A pass's lane holds the GPU for at most
+/// `SUN_PASS_STEPS` asks of the world, which keeps a dispatch under its line.
+pub const SUN_PASS_STEPS: u32 = 96
+pub const SUN_PASSES: u32 = 3
+
+/// Pixels a placing dispatch takes, and rays a marching dispatch takes.
+pub const SUN_PIXELS: u32 = 512
+pub const SUN_SPAN: u32 = 4096
+
+/// A ray's state between passes: how far along it is (m, 0 or more), or how it ended.
+const RAY_OUT: f32 = -1.0
+const RAY_MET: f32 = -2.0
+const RAY_LOST: f32 = -3.0
+const RAY_NONE: f32 = -4.0
+
+/// Each pixel's surface, taken to the field's own (`onto_surface`), and the way it faces: `at`
+/// `(p, 1)` and `facing` `(n, 0)` where judged; `at.w` 0 where not covered, 2 at the terminator,
+/// 3 off the field, 4 at an outline (the field's facing over 60° from the picture's).
+@compute(64)
+pub fn sun_placed<M: Field<Substance>, S: Sky>(
+    m: Matter<M>,
+    sky: S,
+    place: Texture<Rgba32Float>,
+    v: View,
+    first: u32,
+    at: mut Slots<vec4>,
+    facing: mut Slots<vec4>,
+    id: GlobalId,
+) {
+    let w = place.width()
+    let i = first + id.x
+    if id.x >= SUN_PIXELS * 8 || i >= w * place.height() {
+        return
+    }
+    let x = i % w
+    let y = i / w
+    at[id] = vec4(0.0)
+    let cp = place.load(x, y)
+    if cp.w <= 0.0 {
+        return
+    }
+    let d = v.ray(vec2(f32(x) + 0.5, f32(y) + 0.5))
+    let p0 = v.at + d * cp.w
+    // The mesh's certified error is under half a pixel; four pixels' width is the most it is
+    // allowed to be taken.
+    let (p, met) = onto_surface(m, p0, 4.0 * cp.w * v.pixel())
+    let g = slope_at(m, p, max(cp.w * v.pixel() * 0.1, 1.0e-5))
+    if !met || !(dot(g, g) > 1.0e-8) {
+        at[id] = vec4(p, 3.0)
+        return
+    }
+    let n = normalize(g)
+    let s = sky.sun()
+    facing[id] = vec4(n, 0.0)
+    if dot(n, cp.xyz) < 0.5 {
+        at[id] = vec4(p, 4.0)
+        return
+    }
+    at[id] = vec4(p, if dot(n, s.way) <= sin(s.size) + 0.002 { 2.0 } else { 1.0 })
+}
+
+/// The ray `first + id` of `SUN_RAYS` a pixel toward the sun's disc (an 8 × 8 stratified square),
+/// marched `SUN_PASS_STEPS` more steps from where `state` left it (pass `pass` of `SUN_PASSES`),
+/// stepped as `traced::entered` steps; its state after into `next`.
+@compute(64)
+pub fn sun_rays<M: Field<Substance>, S: Sky>(
+    m: Matter<M>,
+    sky: S,
+    at: [vec4],
+    facing: [vec4],
+    state: [f32],
+    first: u32,
+    count: u32,
+    pass: u32,
+    next: mut Slots<f32>,
+    id: GlobalId,
+) {
+    if id.x >= SUN_SPAN {
+        return
+    }
+    let r = first + id.x
+    if r >= count {
+        next[id] = RAY_NONE
+        return
+    }
+    let i = r / SUN_RAYS
+    let k = r % SUN_RAYS
+    let a = at[i]
+    var t = if pass == 0 { if a.w > 0.5 && a.w < 1.5 { 0.0 } else { RAY_NONE } } else { state[r] }
+    if t < 0.0 {
+        next[id] = t
+        return
+    }
+    let n = facing[i].xyz
+    let s = sky.sun()
+    let h = hash_u32(i * 7919 + 17)
+    let u = (f32(k % 8) + die(h, 2 * k)) * 0.125
+    let w2 = (f32(k / 8) + die(h, 2 * k + 1)) * 0.125
+    let w = sun_way(s, u, w2)
+    let o = a.xyz + n * LEAVE
+    let to = ends(m, o, w)
+    var steps = pass * SUN_PASS_STEPS
+    for _j in 0..SUN_PASS_STEPS {
+        if t >= to {
+            next[id] = RAY_OUT
+            return
+        }
+        steps += 1
+        let f = m.far(o + w * t)
+        if f < 0.0 {
+            next[id] = RAY_MET
+            return
+        }
+        t += max(f, (LEAST + LEAST_FAR * t) * (1.0 + f32(steps) / LEAST_DOUBLES))
+    }
+    next[id] = if t >= to { RAY_OUT } else if pass + 1 >= SUN_PASSES { RAY_LOST } else { t }
+}
+
+/// Each pixel's engine sun against the reference's, counted (`SUN_COUNTS`).
+@compute(8, 8)
+pub fn sun_judged(
+    at: [vec4],
+    state: [f32],
+    sun: Texture<R8>,
+    cls: Texture<Rgba32Float>,
+    out: mut Atomics<u32>,
+    marks: mut Texels<Rgba16Float>,
+    id: GlobalId,
+) {
+    let w = sun.width()
+    if id.x >= w || id.y >= sun.height() {
+        return
+    }
+    let i = id.y * w + id.x
+    let a = at[i]
+    let e0: f32 = sun.load(id.x, id.y)
+    var mark = vec4(vec3(e0 * 0.35), 1.0)
+    if a.w < 0.5 {
+        marks.store(id, vec4(0.0, 0.0, 0.0, 1.0))
+        return
+    }
+    let exact = cls.width() == w && cls.height() == sun.height() && cls.load(id.x, id.y).y > 0.0
+    if exact {
+        let _ = out.add(i: 11, value: 1)
+        let _ = out.add(i: 12, value: u32(cls.load(id.x, id.y).y * 1000.0 + 0.5))
+    }
+    if a.w > 3.5 {
+        let _ = out.add(i: 16, value: 1)
+        marks.store(id, vec4(1.0, 1.0, 0.0, 1.0))
+        return
+    }
+    if a.w > 2.5 {
+        let _ = out.add(i: 10, value: 1)
+        marks.store(id, vec4(1.0, 0.0, 1.0, 1.0))
+        return
+    }
+    if a.w > 1.5 {
+        let _ = out.add(i: 1, value: 1)
+        marks.store(id, mark)
+        return
+    }
+    var got = 0.0
+    for k in 0..SUN_RAYS {
+        let st = state[i * SUN_RAYS + k]
+        if st == RAY_OUT || st == RAY_LOST {
+            got += 1.0
+        }
+        if st == RAY_LOST {
+            let _ = out.add(i: 8, value: 1)
+        }
+    }
+    let r = got / f32(SUN_RAYS)
+    let e: f32 = sun.load(id.x, id.y)
+    let _ = out.add(i: 0, value: 1)
+    let diff = e - r
+    if exact {
+        mark = vec4(0.1, 0.45, 0.1, 1.0)
+    }
+    if diff > 0.125 {
+        mark = vec4(1.0, 0.1, 0.1, 1.0)
+    }
+    if diff < -0.125 {
+        mark = vec4(0.2, 0.4, 1.0, 1.0)
+    }
+    marks.store(id, mark)
+    if diff > 0.125 {
+        let _ = out.add(i: 2, value: 1)
+    }
+    if diff < -0.125 {
+        let _ = out.add(i: 3, value: 1)
+    }
+    if exact {
+        let _ = out.add(i: 13, value: 1)
+        if diff > 0.125 {
+            let _ = out.add(i: 14, value: 1)
+        }
+        if diff < -0.125 {
+            let _ = out.add(i: 15, value: 1)
+        }
+    }
+    if r <= 0.0625 && e >= 0.5 {
+        let _ = out.add(i: 4, value: 1)
+    }
+    if r >= 0.9375 && e <= 0.5 {
+        let _ = out.add(i: 5, value: 1)
+    }
+    let _ = out.add(i: 6, value: u32(abs(diff) * 255.0 + 0.5))
+    let _ = out.add(i: 7, value: u32(max(diff, 0.0) * 255.0 + 0.5))
+    let _ = out.add(i: 9, value: u32(max(-diff, 0.0) * 255.0 + 0.5))
+}
+
+/// A sun judging under way: the surfaces placed, the rays seen, the counts, how far along.
+pub struct SunJudge {
+    /// Where the judging found leaks (red), acne (blue), exact pixels (green), off the field
+    /// (magenta), over the engine's sun (grey).
+    pub marks: Texture<Rgba16Float>,
+    at_part: GpuBuffer<vec4>,
+    facing_part: GpuBuffer<vec4>,
+    at: GpuBuffer<vec4>,
+    facing: GpuBuffer<vec4>,
+    state: GpuBuffer<f32>,
+    state_part: GpuBuffer<f32>,
+    out: GpuBuffer<u32>,
+    placed: u32,
+    rayed: u32,
+    pass: u32,
+    begun: bool,
+    asked: Vec<Pending<u32>>,
+    said: bool,
+}
+
+pub fn sun_judge() -> SunJudge {
+    SunJudge {
+        marks: writable_texture(width: 1, height: 1, levels: 1),
+        at_part: buffer_of(Vec::filled(SUN_PIXELS * 8, vec4(0.0))),
+        facing_part: buffer_of(Vec::filled(SUN_PIXELS * 8, vec4(0.0))),
+        at: buffer_of(Vec::filled(1, vec4(0.0))),
+        facing: buffer_of(Vec::filled(1, vec4(0.0))),
+        state: buffer_of(Vec::filled(1, 0.0)),
+        state_part: buffer_of(Vec::filled(SUN_SPAN, 0.0)),
+        out: buffer_of(Vec::filled(SUN_COUNTS, 0)),
+        placed: 0,
+        rayed: 0,
+        pass: 0,
+        begun: false,
+        asked: Vec::new(),
+        said: false,
+    }
+}
+
+impl SunJudge {
+    /// Whether every pixel is judged and the counts said.
+    pub fn done(self) -> bool {
+        self.said
+    }
+
+    /// Up to `dispatches` more dispatches of judging `picture` (drawn of `world` under `sky`
+    /// through `eye`): its surfaces placed, then their rays, then the counts, read back and said
+    /// as `what`.
+    pub fn work<W: World, S: Sky>(
+        mut self,
+        picture: Picture,
+        cls: Texture<Rgba32Float>,
+        world: W,
+        sky: S,
+        eye: Eye,
+        what: str,
+        dispatches: u32,
+    ) {
+        if self.said {
+            return
+        }
+        let w = picture.width()
+        let h = picture.height()
+        let n = w * h
+        if !self.begun {
+            self.begun = true
+            self.at = buffer_of(Vec::filled(n, vec4(0.0)))
+            self.facing = buffer_of(Vec::filled(n, vec4(0.0)))
+            self.state = buffer_of(Vec::filled(n * SUN_RAYS, 0.0))
+            self.out = buffer_of(Vec::filled(SUN_COUNTS, 0))
+            self.marks = writable_texture(width: w, height: h, levels: 1)
+            print(
+                f"sun judge: {what}: {w}x{h}, {SUN_RAYS} rays to the sun's disc a pixel, at most {SUN_PASS_STEPS * SUN_PASSES} steps a ray",
+            )
+        }
+        let m = matter(world.field())
+        let v = view(eye, w, h)
+        var k: u32 = 0
+        label("sun_judge")
+        while k < dispatches && self.placed < n {
+            dispatch(
+                sun_placed.bind(
+                    m: m,
+                    sky: sky,
+                    place: picture.place,
+                    v: v,
+                    first: self.placed,
+                    at: mut self.at_part,
+                    facing: mut self.facing_part,
+                ),
+                over: SUN_PIXELS * 8,
+            )
+            let len = min(SUN_PIXELS * 8, n - self.placed)
+            copy(from: self.at_part.span(0, len), to: self.at.span_mut(self.placed, len))
+            copy(from: self.facing_part.span(0, len), to: self.facing.span_mut(self.placed, len))
+            self.placed += SUN_PIXELS * 8
+            k += 1
+        }
+        let rays = n * SUN_RAYS
+        while k < dispatches && self.placed >= n && self.pass < SUN_PASSES {
+            dispatch(
+                sun_rays.bind(
+                    m: m,
+                    sky: sky,
+                    at: self.at.items(),
+                    facing: self.facing.items(),
+                    state: self.state.items(),
+                    first: self.rayed,
+                    count: rays,
+                    pass: self.pass,
+                    next: mut self.state_part,
+                ),
+                over: SUN_SPAN,
+            )
+            let len = min(SUN_SPAN, rays - self.rayed)
+            copy(from: self.state_part.span(0, len), to: self.state.span_mut(self.rayed, len))
+            self.rayed += SUN_SPAN
+            if self.rayed >= rays {
+                self.rayed = 0
+                self.pass += 1
+            }
+            k += 1
+        }
+        if self.pass >= SUN_PASSES && self.asked.len() == 0 {
+            dispatch(
+                sun_judged.bind(
+                    at: self.at.items(),
+                    state: self.state.items(),
+                    sun: picture.sun,
+                    cls: cls,
+                    out: mut self.out,
+                    marks: self.marks.level_mut(0),
+                ),
+                groups: ((w + 7) / 8, (h + 7) / 8, 1),
+            )
+            self.asked.push(read(self.out.items()))
+            return
+        }
+        if self.asked.len() > 0 {
+            match self.asked[0].poll() {
+                Some(Ok(c)) => {
+                    let nj = max(f32(c[0]), 1.0)
+                    print(
+                        f"SUN {what}: judged {c[0]} px (terminator {c[1]}, off the field {c[10]}, outlines {c[16]}); leak px {c[2]} ({100.0 * f32(c[2]) / nj}%), hard leaks {c[4]}; acne px {c[3]} ({100.0 * f32(c[3]) / nj}%), hard acne {c[5]}; mean |err| {f32(c[6]) / nj}/255, leaked {f32(c[7]) / nj}/255, taken {f32(c[9]) / nj}/255; reference rays lost {c[8]}; exact px {c[11]} (mean reach {f32(c[12]) / max(f32(c[11]), 1.0)} mm), judged {c[13]}: leaks {c[14]}, acne {c[15]}",
+                    )
+                    self.said = true
+                },
+                Some(Err(e)) => {
+                    print(f"SUN {what}: NOT SAID: {e.message()}")
+                    self.said = true
+                },
+                None => {},
+            }
+        }
+    }
+}

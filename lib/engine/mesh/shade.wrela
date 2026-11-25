@@ -10,10 +10,10 @@ use mesh::extract::{
 }
 use mesh::height::MeshVary
 use mesh::light::{
-    Emitter, NEAR, RadGrid, ShadowView, clip_of, cone_indirect, contact_shadow, decode_substance,
-    encode_mat_signed, eval_emitters_tiled, sky_background, sky_irradiance, sky_specular, spec_cone,
-    sun_shadow_hybrid, sun_vis_point, trace_ssr,
+    Emitter, NEAR, RadGrid, ShadowView, clip_of, cone_indirect, decode_substance, encode_mat_signed,
+    eval_emitters_tiled, sky_background, sky_irradiance, sky_specular, spec_cone, trace_ssr,
 }
+use mesh::sunlight::{sun_map_vis, sun_of_pixel}
 use mesh::proof::{
     CellRay, CellRayGrad, FilteredSubstance, SpecAASubstance, clamp_footprint_vec, discard_proven,
     filter_channels, filter_channels_1d, filter_channels_kept_1d, filter_rest_channels,
@@ -28,8 +28,9 @@ use picture::screen::luma
 use std::derive::value_and_gradient
 use std::field::{DualQuat, Field, FieldFacts, Live, Rigid}
 use std::gpu::{
-    ClipPosition, ComparisonSampler, DepthTexture, Flat, FragCoord, GlobalId, InstanceIndex,
-    R16Float, R32Float, Rgba8, Rgba16Float, Rgba32Float, Sampler, Targets2, Targets4, Texels,
+    ClipPosition, DepthTexture, Flat, FragCoord, GlobalId, InstanceIndex,
+    R16Float, R32Float, Rg32Float, Rgba8, Rgba16Float, Rgba32Float, Sampler, Targets2, Targets3,
+    Targets4, Texels,
     Texture, Texture3d, VertexIndex, WithDepthBehind,
 }
 
@@ -72,10 +73,11 @@ struct SkinVary: Copy {
 pub(package) fn shadow_vs(
     verts: [MeshVertex],
     xforms: [Rigid],
-    sv: ShadowView,
+    svs: [ShadowView],
     vi: VertexIndex,
     ii: InstanceIndex,
 ) -> ClipPosition {
+    let sv = svs[0]
     let vert = verts[vi.index]
     let wp = xforms[ii.index].apply_point(vec3(vert.px, vert.py, vert.pz))
     ClipPosition { position: vec4(sv.project(wp), 1.0) }
@@ -90,10 +92,11 @@ pub(package) fn skin_shadow_vs(
     xforms: [Rigid],
     bones: [DualQuat],
     bone_stride: u32,
-    sv: ShadowView,
+    svs: [ShadowView],
     vi: VertexIndex,
     ii: InstanceIndex,
 ) -> ClipPosition {
+    let sv = svs[0]
     let vert = verts[vi.index]
     let dq = eval_dqs(bones, ii.index * bone_stride, skin[vi.index * 2], skin[vi.index * 2 + 1])
     let sp = dq.apply_point(vec3(vert.px, vert.py, vert.pz))
@@ -1085,12 +1088,11 @@ fn decode_gbuf_normal(gn: vec4, fallback: vec3) -> vec3 {
 }
 
 /// Shared pixel-rate direct lighting core used identically by both `draw_scene` (`deferred_direct_fs`)
-/// and `drawn_only` (`deferred_direct_judge_fs`): evaluates exact SDF variable-width soft shadows +
-/// analytical curvature weathering + thickness-modulated backlit SSS + tiled SDF-shadowed local
-/// emitters ONCE per screen pixel (zero micro-triangle quad overshading). Returns the direct HDR
-/// `(light, dist)`, the judges' `(n, dist)` place, the sun visibility, and the sun's share of the
-/// direct light (`0..1` by luma), so the half-res micro-contact shadow (cast toward the sun) darkens
-/// only the sun's part and never emission or local emitters.
+/// and `drawn_only` (`deferred_direct_judge_fs`): the sun as `mesh::sunlight` certified it
+/// (`sun_of_pixel`: a `SunVisibility`, the map's certificate and the exact rays) + analytical
+/// curvature weathering + thickness-modulated backlit SSS + tiled SDF-shadowed local emitters ONCE
+/// per screen pixel (zero micro-triangle quad overshading). Returns the direct HDR `(light, dist)`,
+/// the judges' `(n, dist)` place, and the sun visibility.
 @budget(work: 48000)
 fn shade_direct_pixel<S: Sky>(
     px: u32,
@@ -1107,10 +1109,8 @@ fn shade_direct_pixel<S: Sky>(
     depth: DepthTexture,
     sky_spec0: Texture<Rgba16Float>,
     sky_s: Sampler,
-    shadow_map: DepthTexture,
-    static_shadow_map: DepthTexture,
-    has_static_shadow: u32,
-    cmp: ComparisonSampler,
+    sun_cls: Texture<Rgba32Float>,
+    sun_near: [u32],
     rad0: Texture3d<Rgba16Float>,
     rad1: Texture3d<Rgba16Float>,
     rad_s: Sampler,
@@ -1122,15 +1122,15 @@ fn shade_direct_pixel<S: Sky>(
     tiles_x: u32,
     full_w: u32,
     full_h: u32,
-) -> (vec4, vec4, f32, f32) {
+) -> (vec4, vec4, f32) {
     let gn = g_normal.load(px, py)
     let ray = v.ray(pixel_xy)
     if gn.w <= 0.5 {
-        return (vec4(sky_background(sky, sky_spec0, sky_s, ray), 65000.0), vec4(0.0), 1.0, 0.0)
+        return (vec4(sky_background(sky, sky_spec0, sky_s, ray), 65000.0), vec4(0.0), 1.0)
     }
     let ndc_z = depth.load(px, py)
     if ndc_z <= 1.0e-6 {
-        return (vec4(sky_background(sky, sky_spec0, sky_s, ray), 65000.0), vec4(0.0), 1.0, 0.0)
+        return (vec4(sky_background(sky, sky_spec0, sky_s, ray), 65000.0), vec4(0.0), 1.0)
     }
     let n = decode_gbuf_normal(gn, -ray)
     let ga = g_albedo.load(px, py)
@@ -1161,24 +1161,7 @@ fn shade_direct_pixel<S: Sky>(
 
     let sun = sky.sun()
     let ndl = max(dot(n, sun.way), 0.0)
-    let vis = if ndl > 0.0 {
-        sun_shadow_hybrid(
-            shadow_map,
-            static_shadow_map,
-            has_static_shadow,
-            cmp,
-            sv,
-            sdf_grid,
-            sdf0,
-            sdf1,
-            sdf_s,
-            wp,
-            n,
-            pixel_xy,
-        )
-    } else {
-        0.0
-    }
+    let vis = if ndl > 0.0 { sun_of_pixel(sun_cls, sun_near, px, py, full_w).vis } else { 0.0 }
     var direct_sun = sub.shade_direct(n, sun.way, ray_back, sun.light * vis)
     // Exact interior thickness backlit Subsurface Scattering (SSS) via 2-tap 3D SDF thickness.
     if sub.subsurface > 0.01 && sdf_grid.enabled != 0 {
@@ -1210,12 +1193,7 @@ fn shade_direct_pixel<S: Sky>(
         py,
     )
     let direct = sub.emits + direct_sun + local_light
-    let sun_share = clamp(
-        luma(max(direct_sun, vec3(0.0))) / max(luma(max(direct, vec3(0.0))), 1.0e-6),
-        0.0,
-        1.0,
-    )
-    (vec4(direct, min(dist, 65000.0)), vec4(n, dist), vis, sun_share)
+    (vec4(direct, min(dist, 65000.0)), vec4(n, dist), vis)
 }
 
 /// Full-resolution 1× pixel-rate deferred direct lighting pass (`draw_scene`).
@@ -1234,10 +1212,8 @@ pub(package) fn deferred_direct_fs<S: Sky>(
     depth: DepthTexture,
     sky_spec0: Texture<Rgba16Float>,
     sky_s: Sampler,
-    shadow_map: DepthTexture,
-    static_shadow_map: DepthTexture,
-    has_static_shadow: u32,
-    cmp: ComparisonSampler,
+    sun_cls: Texture<Rgba32Float>,
+    sun_near: [u32],
     rad0: Texture3d<Rgba16Float>,
     rad1: Texture3d<Rgba16Float>,
     rad_s: Sampler,
@@ -1249,10 +1225,10 @@ pub(package) fn deferred_direct_fs<S: Sky>(
     tiles_x: u32,
     full_w: u32,
     full_h: u32,
-) -> Targets2<vec4, f32> {
+) -> vec4 {
     let px = min(u32(pixel.position.x), full_w - 1)
     let py = min(u32(pixel.position.y), full_h - 1)
-    let (hdr_d, _place, _vis, sun_share) = shade_direct_pixel(
+    let (hdr_d, _place, _vis) = shade_direct_pixel(
         px,
         py,
         pixel.position.xy,
@@ -1267,10 +1243,8 @@ pub(package) fn deferred_direct_fs<S: Sky>(
         depth,
         sky_spec0,
         sky_s,
-        shadow_map,
-        static_shadow_map,
-        has_static_shadow,
-        cmp,
+        sun_cls,
+        sun_near,
         rad0,
         rad1,
         rad_s,
@@ -1283,7 +1257,7 @@ pub(package) fn deferred_direct_fs<S: Sky>(
         full_w,
         full_h,
     )
-    Targets2 { first: hdr_d, second: sun_share }
+    hdr_d
 }
 
 /// Identical pixel-rate deferred direct pass with `(place, sun)` diagnostic outputs for `drawn_only`
@@ -1303,10 +1277,8 @@ pub(package) fn deferred_direct_judge_fs<S: Sky>(
     depth: DepthTexture,
     sky_spec0: Texture<Rgba16Float>,
     sky_s: Sampler,
-    shadow_map: DepthTexture,
-    static_shadow_map: DepthTexture,
-    has_static_shadow: u32,
-    cmp: ComparisonSampler,
+    sun_cls: Texture<Rgba32Float>,
+    sun_near: [u32],
     rad0: Texture3d<Rgba16Float>,
     rad1: Texture3d<Rgba16Float>,
     rad_s: Sampler,
@@ -1318,10 +1290,10 @@ pub(package) fn deferred_direct_judge_fs<S: Sky>(
     tiles_x: u32,
     full_w: u32,
     full_h: u32,
-) -> Targets4<vec4, vec4, f32, f32> {
+) -> Targets3<vec4, vec4, f32> {
     let px = min(u32(pixel.position.x), full_w - 1)
     let py = min(u32(pixel.position.y), full_h - 1)
-    let (hdr_d, place, vis, sun_share) = shade_direct_pixel(
+    let (hdr_d, place, vis) = shade_direct_pixel(
         px,
         py,
         pixel.position.xy,
@@ -1336,10 +1308,8 @@ pub(package) fn deferred_direct_judge_fs<S: Sky>(
         depth,
         sky_spec0,
         sky_s,
-        shadow_map,
-        static_shadow_map,
-        has_static_shadow,
-        cmp,
+        sun_cls,
+        sun_near,
         rad0,
         rad1,
         rad_s,
@@ -1352,13 +1322,13 @@ pub(package) fn deferred_direct_judge_fs<S: Sky>(
         full_w,
         full_h,
     )
-    Targets4 { first: hdr_d, second: place, third: vis, fourth: sun_share }
+    Targets3 { first: hdr_d, second: place, third: vis }
 }
 
 /// Half-resolution (`W/2 × H/2`) indirect lighting pass: computes 4-cone hemisphere diffuse GI +
 /// multi-scale 3D SDF bent-normal AO (`first = vec4(bounce + bent_sky_shift, ao)`), Screen-Space
 /// Specular Reflections (SSR) seamlessly falling back to SDF-accelerated `spec_cone` + `sky_specular`
-/// PMREM (`second.rgb`), and screen-space micro-contact shadow visibility (`second.w`).
+/// PMREM (`second.rgb`).
 @fragment
 @budget(work: 12000)
 pub(package) fn indirect_half_fs<S: Sky>(
@@ -1425,10 +1395,6 @@ pub(package) fn indirect_half_fs<S: Sky>(
         let bent_shift = (sky_bent - sky_n) * (ao * 0.75)
         ind = vec4(max(ind0.xyz + bent_shift, vec3(0.0)), ao)
     }
-    let cshad = if rad_grid.enabled != 0 { contact_shadow(v, depth, wp, n, sky.sun().way) } else {
-        1.0
-    }
-
     // Skip specular SSR & voxel/SDF reflection cone completely on pure matte surfaces (`abs(mat_code) < 0.01`).
     var env_spec = vec3(0.0)
     if abs(mat_code) >= 0.01 {
@@ -1459,20 +1425,18 @@ pub(package) fn indirect_half_fs<S: Sky>(
 
     Targets2 {
         first: ind,
-        second: vec4(env_spec, cshad),
+        second: vec4(env_spec, 1.0),
     }
 }
 
 /// Full-resolution depth+normal bilateral upsample of phase-cycled half-res GI, bent-normal AO,
-/// SSR, and micro-contact shadows combined with the pixel-rate direct HDR buffer into `hdr_colour`.
-/// The contact shadow darkens only the sun's share of the direct light (`sun_share`).
+/// and SSR combined with the pixel-rate direct HDR buffer into `hdr_colour`.
 @fragment
 pub(package) fn combine_indirect_fs<S: Sky>(
     pixel: FragCoord,
     v: View,
     sky: S,
     hdr_direct: Texture<Rgba16Float>,
-    sun_share: Texture<R16Float>,
     g_normal: Texture<Rgba8>,
     g_albedo: Texture<Rgba8>,
     g_emits: Texture<Rgba16Float>,
@@ -1539,8 +1503,7 @@ pub(package) fn combine_indirect_fs<S: Sky>(
     let ind = if w_sum > 1.0e-4 { diff_acc / w_sum } else { gi_diff.load(hx0, hy0) }
     let spec_c = if w_sum > 1.0e-4 { spec_acc / w_sum } else { gi_spec.load(hx0, hy0) }
 
-    let cshad = if dot(n, sky.sun().way) > 0.05 { spec_c.w } else { 1.0 }
-    var rad = direct_d.xyz * (1.0 - sun_share.load(px, py) * (1.0 - cshad))
+    var rad = direct_d.xyz
 
     let sky_amb = sky_irradiance(sky_diff, sky_s, n) * multi_bounce_ao(ind.w, albedo) + ind.xyz
     if abs(mat_code) < 0.01 {
@@ -2003,7 +1966,6 @@ fn shade_trans_core<S: Sky>(
     shadow_map: DepthTexture,
     static_shadow_map: DepthTexture,
     has_static_shadow: u32,
-    cmp: ComparisonSampler,
     rad0: Texture3d<Rgba16Float>,
     rad1: Texture3d<Rgba16Float>,
     rad2: Texture3d<Rgba16Float>,
@@ -2086,12 +2048,10 @@ fn shade_trans_core<S: Sky>(
 
     let sun = sky.sun()
     let ndl = max(dot(n, sun.way), 0.0)
-    let vis_dyn = if ndl > 0.0 { sun_vis_point(shadow_map, cmp, sv, wp) } else { 0.0 }
-    let vis = if ndl > 0.0 && has_static_shadow != 0 {
-        min(vis_dyn, sun_vis_point(static_shadow_map, cmp, sv, wp))
-    } else {
-        vis_dyn
-    }
+    // Glass casts nothing into the map: its point's sun is the map's taps at its own depth.
+    let vis = if ndl > 0.0 {
+        sun_map_vis(shadow_map, static_shadow_map, has_static_shadow, sv, sun, wp, vec3(0.0), sv.texel).vis
+    } else { 0.0 }
     let sky_amb = sky_irradiance(sky_diff, sky_s, n)
     let deep_scatter = sub.albedo *
         (vec3(1.0) - beer) *
@@ -2175,7 +2135,6 @@ pub(package) fn field_trans_one_fs<M: Field<Substance>, S: Sky>(
     shadow_map: DepthTexture,
     static_shadow_map: DepthTexture,
     has_static_shadow: u32,
-    cmp: ComparisonSampler,
     rad0: Texture3d<Rgba16Float>,
     rad1: Texture3d<Rgba16Float>,
     rad2: Texture3d<Rgba16Float>,
@@ -2213,7 +2172,6 @@ pub(package) fn field_trans_one_fs<M: Field<Substance>, S: Sky>(
         shadow_map,
         static_shadow_map,
         has_static_shadow,
-        cmp,
         rad0,
         rad1,
         rad2,
@@ -2253,7 +2211,6 @@ pub(package) fn field_trans_many_fs<M: Field<Substance>, S: Sky>(
     shadow_map: DepthTexture,
     static_shadow_map: DepthTexture,
     has_static_shadow: u32,
-    cmp: ComparisonSampler,
     rad0: Texture3d<Rgba16Float>,
     rad1: Texture3d<Rgba16Float>,
     rad2: Texture3d<Rgba16Float>,
@@ -2292,7 +2249,6 @@ pub(package) fn field_trans_many_fs<M: Field<Substance>, S: Sky>(
         shadow_map,
         static_shadow_map,
         has_static_shadow,
-        cmp,
         rad0,
         rad1,
         rad2,
@@ -2331,7 +2287,6 @@ pub(package) fn field_skin_trans_one_fs<M: Field<Substance>, S: Sky>(
     shadow_map: DepthTexture,
     static_shadow_map: DepthTexture,
     has_static_shadow: u32,
-    cmp: ComparisonSampler,
     rad0: Texture3d<Rgba16Float>,
     rad1: Texture3d<Rgba16Float>,
     rad2: Texture3d<Rgba16Float>,
@@ -2369,7 +2324,6 @@ pub(package) fn field_skin_trans_one_fs<M: Field<Substance>, S: Sky>(
         shadow_map,
         static_shadow_map,
         has_static_shadow,
-        cmp,
         rad0,
         rad1,
         rad2,
@@ -2409,7 +2363,6 @@ pub(package) fn field_skin_trans_many_fs<M: Field<Substance>, S: Sky>(
     shadow_map: DepthTexture,
     static_shadow_map: DepthTexture,
     has_static_shadow: u32,
-    cmp: ComparisonSampler,
     rad0: Texture3d<Rgba16Float>,
     rad1: Texture3d<Rgba16Float>,
     rad2: Texture3d<Rgba16Float>,
@@ -2448,7 +2401,6 @@ pub(package) fn field_skin_trans_many_fs<M: Field<Substance>, S: Sky>(
         shadow_map,
         static_shadow_map,
         has_static_shadow,
-        cmp,
         rad0,
         rad1,
         rad2,
@@ -2487,7 +2439,6 @@ pub(package) fn mesh_trans_fs<S: Sky>(
     shadow_map: DepthTexture,
     static_shadow_map: DepthTexture,
     has_static_shadow: u32,
-    cmp: ComparisonSampler,
     rad0: Texture3d<Rgba16Float>,
     rad1: Texture3d<Rgba16Float>,
     rad2: Texture3d<Rgba16Float>,
@@ -2525,7 +2476,6 @@ pub(package) fn mesh_trans_fs<S: Sky>(
         shadow_map,
         static_shadow_map,
         has_static_shadow,
-        cmp,
         rad0,
         rad1,
         rad2,

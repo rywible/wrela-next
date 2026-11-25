@@ -1,15 +1,16 @@
 // `MeshWorld` trait and implementations for `One<M>`, `Pool<M>`, and `And<A, B>`, plus shared
 // shadow-caster drawing.
 
-use matter::sky::Sky
+use matter::sky::{Sky, Sun}
 use matter::substance::Substance
 use matter::world::{And, One, Pool, one}
 use mesh::cull::HiZCuller
 use mesh::extract::{
-    CELL_PX, ExtractScratch, MeshBatch, NO_THING, probe_visible_near, size_floor, steep,
+    CELL_PX, ExtractScratch, HOLE_PX, MeshBatch, NO_THING, probe_visible_near, size_floor, steep,
 }
 use mesh::light::{Emitter, NEAR, RadGrid, RadianceCache, ShadowView}
 use mesh::sdf::{SdfClipmap, SdfGrid}
+use mesh::sunlight::SunExact
 use mesh::shade::{
     FAR_TIER_DIST, deformed_mesh_vs, exact_box_one_fs, exact_box_vs, field_gbuf_many_fs,
     field_refract_refl_many_fs, field_refract_refl_one_fs, field_skin_cut_gbuf_many_fs,
@@ -27,8 +28,8 @@ use picture::eye::View
 use std::collections::Vec
 use std::field::{Bound, Field, Rigid}
 use std::gpu::{
-    Compare, ComparisonSampler, Cull, Depth, DepthBias, DepthOnlyPass, DepthPass, DepthPass2,
-    DepthPass4, DepthTexture, GpuBuffer, GpuSpan, R16Float, R32Float, Rg16Float, Rg32Uint, Rgba8,
+    Compare, Cull, Depth, DepthOnlyPass, DepthPass, DepthPass2,
+    DepthPass4, DepthTexture, GpuBuffer, GpuSpan, R16Float, R32Float, Rg16Float, Rg32Uint, Rgba8, Rgba32Float,
     Rgba16Float, Sampler, Texture, Texture3d, buffer, buffer_of, draw, draw_multi,
 }
 use std::hash::StateHash
@@ -96,7 +97,6 @@ pub trait MeshWorld {
         sky_diff: Texture<Rgba16Float>,
         sky_s: Sampler,
         shadow_map: DepthTexture,
-        cmp: ComparisonSampler,
         static_only: bool,
         all_batches: bool,
     )
@@ -118,6 +118,19 @@ pub trait MeshWorld {
         first: u32,
         v: View,
         prev_v: View,
+    )
+    /// Each field's exact short rays toward the sun from the pixels the sun's classification left
+    /// to them (`mesh::sunlight::SunExact`), the least kept.
+    fn trace_sun_exact(
+        self,
+        exact: mut SunExact,
+        batches: mut Vec<MeshBatch>,
+        first: u32,
+        cls: Texture<Rgba32Float>,
+        depth: DepthTexture,
+        v: View,
+        sun: Sun,
+        full_w: u32,
     )
     fn draw_eye(
         self,
@@ -177,7 +190,6 @@ pub trait MeshWorld {
         shadow_map: DepthTexture,
         static_shadow_map: DepthTexture,
         has_static_shadow: u32,
-        cmp: ComparisonSampler,
         rad0: Texture3d<Rgba16Float>,
         rad1: Texture3d<Rgba16Float>,
         rad2: Texture3d<Rgba16Float>,
@@ -264,7 +276,6 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for One<M> {
         sky_diff: Texture<Rgba16Float>,
         sky_s: Sampler,
         shadow_map: DepthTexture,
-        cmp: ComparisonSampler,
         static_only: bool,
         all_batches: bool,
     ) {
@@ -285,7 +296,6 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for One<M> {
                 sky_diff,
                 sky_s,
                 shadow_map,
-                cmp,
                 to_static: !all_batches && static_only,
             )
             return
@@ -302,7 +312,6 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for One<M> {
             sky_diff,
             sky_s,
             shadow_map,
-            cmp,
             to_static: !all_batches && static_only,
         )
     }
@@ -456,6 +465,24 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for One<M> {
             cull: Cull::None,
             depth: Depth { compare: Compare::Always, write: false },
         )
+    }
+
+    fn trace_sun_exact(
+        self,
+        exact: mut SunExact,
+        batches: mut Vec<MeshBatch>,
+        first: u32,
+        cls: Texture<Rgba32Float>,
+        depth: DepthTexture,
+        v: View,
+        sun: Sun,
+        full_w: u32,
+    ) {
+        let b = batches[first].bound
+        if !batches[first].has_opaque || !(b.w > 0.0) {
+            return
+        }
+        exact.trace(self.field, b, cls, depth, v, sun, full_w)
     }
 
     fn draw_eye(
@@ -618,7 +645,6 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for One<M> {
         shadow_map: DepthTexture,
         static_shadow_map: DepthTexture,
         has_static_shadow: u32,
-        cmp: ComparisonSampler,
         rad0: Texture3d<Rgba16Float>,
         rad1: Texture3d<Rgba16Float>,
         rad2: Texture3d<Rgba16Float>,
@@ -663,7 +689,6 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for One<M> {
                     shadow_map: shadow_map,
                     static_shadow_map: static_shadow_map,
                     has_static_shadow: has_static_shadow,
-                    cmp: cmp,
                     rad0: rad0,
                     rad1: rad1,
                     rad2: rad2,
@@ -711,7 +736,6 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for One<M> {
                 shadow_map: shadow_map,
                 static_shadow_map: static_shadow_map,
                 has_static_shadow: has_static_shadow,
-                cmp: cmp,
                 rad0: rad0,
                 rad1: rad1,
                 rad2: rad2,
@@ -1059,7 +1083,6 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for Pool<M> {
         sky_diff: Texture<Rgba16Float>,
         sky_s: Sampler,
         shadow_map: DepthTexture,
-        cmp: ComparisonSampler,
         static_only: bool,
         all_batches: bool,
     ) {
@@ -1077,7 +1100,6 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for Pool<M> {
                     sky_diff,
                     sky_s,
                     shadow_map,
-                    cmp,
                     static_only: static_only,
                     all_batches: all_batches,
                 )
@@ -1110,7 +1132,6 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for Pool<M> {
                         sky_diff,
                         sky_s,
                         shadow_map,
-                        cmp,
                         to_static: !all_batches && static_only,
                     )
                 } else {
@@ -1130,7 +1151,6 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for Pool<M> {
                         sky_diff,
                         sky_s,
                         shadow_map,
-                        cmp,
                         to_static: !all_batches && static_only,
                     )
                 }
@@ -1277,6 +1297,37 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for Pool<M> {
                 cull: Cull::None,
                 depth: Depth { compare: Compare::Always, write: false },
             )
+        }
+    }
+
+    fn trace_sun_exact(
+        self,
+        exact: mut SunExact,
+        batches: mut Vec<MeshBatch>,
+        first: u32,
+        cls: Texture<Rgba32Float>,
+        depth: DepthTexture,
+        v: View,
+        sun: Sun,
+        full_w: u32,
+    ) {
+        // The things near the eye, each meshed as a `One`, trace as one; the shared mesh's far
+        // things are left to the map (docs/design.md, "Certified sun shadows": a gap).
+        for s in 0..NEAR_SLOTS {
+            let bi = first + POOL_SHARED + s
+            let id = batches[bi].near_id
+            if id < self.fields.len() {
+                one(self.fields[id]).trace_sun_exact(
+                    mut exact,
+                    mut batches,
+                    bi,
+                    cls,
+                    depth,
+                    v,
+                    sun,
+                    full_w,
+                )
+            }
         }
     }
 
@@ -1608,7 +1659,6 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for Pool<M> {
         shadow_map: DepthTexture,
         static_shadow_map: DepthTexture,
         has_static_shadow: u32,
-        cmp: ComparisonSampler,
         rad0: Texture3d<Rgba16Float>,
         rad1: Texture3d<Rgba16Float>,
         rad2: Texture3d<Rgba16Float>,
@@ -1646,7 +1696,6 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for Pool<M> {
                     shadow_map,
                     static_shadow_map,
                     has_static_shadow,
-                    cmp,
                     rad0,
                     rad1,
                     rad2,
@@ -1706,7 +1755,6 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for Pool<M> {
                             shadow_map: shadow_map,
                             static_shadow_map: static_shadow_map,
                             has_static_shadow: has_static_shadow,
-                            cmp: cmp,
                             rad0: rad0,
                             rad1: rad1,
                             rad2: rad2,
@@ -1754,7 +1802,6 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for Pool<M> {
                             shadow_map: shadow_map,
                             static_shadow_map: static_shadow_map,
                             has_static_shadow: has_static_shadow,
-                            cmp: cmp,
                             rad0: rad0,
                             rad1: rad1,
                             rad2: rad2,
@@ -1838,7 +1885,6 @@ impl<A: MeshWorld, B: MeshWorld> MeshWorld for And<A, B> {
         sky_diff: Texture<Rgba16Float>,
         sky_s: Sampler,
         shadow_map: DepthTexture,
-        cmp: ComparisonSampler,
         static_only: bool,
         all_batches: bool,
     ) {
@@ -1853,7 +1899,6 @@ impl<A: MeshWorld, B: MeshWorld> MeshWorld for And<A, B> {
             sky_diff,
             sky_s,
             shadow_map,
-            cmp,
             static_only: static_only,
             all_batches: all_batches,
         )
@@ -1867,7 +1912,6 @@ impl<A: MeshWorld, B: MeshWorld> MeshWorld for And<A, B> {
             sky_diff,
             sky_s,
             shadow_map,
-            cmp,
             static_only: static_only,
             all_batches: all_batches,
         )
@@ -1900,6 +1944,22 @@ impl<A: MeshWorld, B: MeshWorld> MeshWorld for And<A, B> {
         let na = self.a.batch_count()
         self.a.draw_vis_resolve(fbufs.0, ep, vis, mut batches, first, v, prev_v)
         self.b.draw_vis_resolve(fbufs.1, ep, vis, mut batches, first + na, v, prev_v)
+    }
+
+    fn trace_sun_exact(
+        self,
+        exact: mut SunExact,
+        batches: mut Vec<MeshBatch>,
+        first: u32,
+        cls: Texture<Rgba32Float>,
+        depth: DepthTexture,
+        v: View,
+        sun: Sun,
+        full_w: u32,
+    ) {
+        let na = self.a.batch_count()
+        self.a.trace_sun_exact(mut exact, mut batches, first, cls, depth, v, sun, full_w)
+        self.b.trace_sun_exact(mut exact, mut batches, first + na, cls, depth, v, sun, full_w)
     }
 
     fn draw_eye(
@@ -2038,7 +2098,6 @@ impl<A: MeshWorld, B: MeshWorld> MeshWorld for And<A, B> {
         shadow_map: DepthTexture,
         static_shadow_map: DepthTexture,
         has_static_shadow: u32,
-        cmp: ComparisonSampler,
         rad0: Texture3d<Rgba16Float>,
         rad1: Texture3d<Rgba16Float>,
         rad2: Texture3d<Rgba16Float>,
@@ -2073,7 +2132,6 @@ impl<A: MeshWorld, B: MeshWorld> MeshWorld for And<A, B> {
             shadow_map,
             static_shadow_map,
             has_static_shadow,
-            cmp,
             rad0,
             rad1,
             rad2,
@@ -2107,7 +2165,6 @@ impl<A: MeshWorld, B: MeshWorld> MeshWorld for And<A, B> {
             shadow_map,
             static_shadow_map,
             has_static_shadow,
-            cmp,
             rad0,
             rad1,
             rad2,
@@ -2132,7 +2189,7 @@ pub(package) fn draw_shadow_casters(
     sp: DepthOnlyPass,
     batches: mut Vec<MeshBatch>,
     nb: u32,
-    sv: ShadowView,
+    svs: GpuSpan<ShadowView>,
     mode: u32,
 ) {
     for i in 0..nb {
@@ -2145,13 +2202,12 @@ pub(package) fn draw_shadow_casters(
                     shadow_vs.bind(
                         verts: batches[i].deformed_verts.items(),
                         xforms: batches[i].xforms.items(),
-                        sv: sv,
+                        svs: svs,
                     ),
                     shadow_fs,
                     indices: batches[i].indices,
                     indirect: batches[i].draw_args,
                     cull: Cull::Back,
-                    depth_bias: DepthBias { constant: 2, slope: 1.5, clamp: 0.0 },
                     depth: Depth { compare: Compare::Less, write: true },
                 )
             } else if batches[i].is_skinned {
@@ -2163,13 +2219,12 @@ pub(package) fn draw_shadow_casters(
                         xforms: batches[i].xforms.items(),
                         bones: batches[i].bones.items(),
                         bone_stride: batches[i].bone_stride,
-                        sv: sv,
+                        svs: svs,
                     ),
                     shadow_fs,
                     indices: batches[i].indices,
                     indirect: batches[i].draw_args,
                     cull: Cull::Back,
-                    depth_bias: DepthBias { constant: 2, slope: 1.5, clamp: 0.0 },
                     depth: Depth { compare: Compare::Less, write: true },
                 )
             } else {
@@ -2178,13 +2233,12 @@ pub(package) fn draw_shadow_casters(
                     shadow_vs.bind(
                         verts: batches[i].verts.items(),
                         xforms: batches[i].xforms.items(),
-                        sv: sv,
+                        svs: svs,
                     ),
                     shadow_fs,
                     indices: batches[i].indices,
                     indirect: batches[i].draw_args,
                     cull: Cull::Back,
-                    depth_bias: DepthBias { constant: 2, slope: 1.5, clamp: 0.0 },
                     depth: Depth { compare: Compare::Less, write: true },
                 )
             }

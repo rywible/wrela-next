@@ -1266,6 +1266,98 @@ Built the five-pillar compile-time safety and performance envelope without const
    - `wrela build` now rejects kernels exceeding `MAX_KEPT_BYTES = 16384` at compile time (`E0707`, verified by `wcet_report_and_compile_time_spill_guard`); `wrela pipelines` reports unbounded loops, spill-risk count, largest `kept` bytes (`2304 B` on `SCENE 11`), and calibrated M4/Radeon 1080p render estimates; `wrela shaders` reports largest compiled shader size (`179 KiB` MSL / `166 KiB` SPIR-V).
    - **Dual-machine 1080p verification (vs `0430f1b`, 0 VVL errors, `spirv-val` 126/126, `xcrun metal` 305/305, identical 320×180 hash `a3ea1cf626d6513d`):** M4 `SCENE 10` cold `f0` `221.10 ms` (`-5.1%`), serial `f10` `16.17 ms`, `exact_box` `0.83 ms` (`-51.5%`); Radeon `SCENE 10` span med `47.43 ms` (`-5.8%`), serial `f10` `39.65 ms` (`-5.5%`), `exact_box` `1.98 ms` (`-50.5%`); Radeon `SCENE 11` `mesh_vis_resolve` `9.94 ms` (`-4.6%`).
 
+### Certified sun shadows (2026-11-24)
+
+The sun lights a surface only through a `SunVisibility` (`lib/engine/mesh/proof.wrela`), whose
+zero-byte `VisProof` is made only there, by one of its routes; `tools/layers` (rule 8) refuses a
+comparison sampler or a raster depth bias anywhere in the engine, a read of a shadow map's depth
+outside `lib/engine/mesh/sunlight.wrela`, and a `SunVisibility` made outside `mesh::proof`. What
+it replaced: the world-fitted `2048²` map read with normal-offset PCF and a constant depth bias,
+mixed with the SDF clipmap's cone penumbra (`sun_shadow_hybrid`), and a screen-space contact
+shadow on half the pixels (`contact_shadow`, `sun_share`), all in git history.
+
+The hole audit (SCENE 6, `tools/audit`) fails on `d3e5e0b` and on this alike, kind for kind
+(the stage's 293 holes, the creature's 101 and 104, eyes held unsettled), and stops at frame
+5777 on the eye's `mesh_exact` over 50 ms on both: the streaming meshes' to mend, not this.
+
+1. **The eye's own map** (`SunFit`): after the G-buffer, a reduction of the eye's depth (on the
+   GPU) fits a second map across to the receivers the eye sees (sample-distribution shadow maps),
+   as deep as the world along the sun so every caster is in it, its view in a buffer the casters'
+   vertex shaders read; drawn with no depth bias; kept, with its pyramid, while the eye (less its
+   jitter), the sun and every batch stay as they were. The world's map stays, for the radiance
+   volume, the froxels and glass (`sun_map_vis`: taps at the exact plane depth, no exact pass).
+2. **The certificate** (`SunCert`): a min/max pyramid of the eye's map.
+3. **The classification** (`sun_classify_fs`): each pixel's receiver from the eye's depth, its
+   geometric normal from its neighbours' depth (never the bumped shading normal), compared only
+   with its tangent plane's exact depth at each texel's centre. Two pyramid windows (its footprint,
+   and the cone a caster at the map's highest could throw on it) prove it lit or dark in two
+   reads; otherwise PCSS-sized taps decide it, each far (above the plane past the near band, 4 of
+   the map's texels of depth and the meshes' error), near, or open; a pixel with a near tap, or
+   whose taps disagree under a penumbra narrower than a texel (an edge the map can't place), is
+   left to the exact rays, with how far they must look and what the map says of the far casters.
+4. **The exact rays** (`SunExact`, `trace_sun_near`): those pixels gathered into one list, and each
+   field near them traced in compute (sliced and indirect): a short ray toward the sun stepped by
+   the field's value over its Lipschitz bound, only the parts `Surface::live` names over the ray's
+   box, its penumbra its least distance over the distance times the sun's radius. A point on a
+   field (its own surface, or another's in contact) is asked first where its own surface has
+   risen out of the mesh's error along the ray; inside the field there, the sun is hidden.
+
+**The sun's judge** (`lib/engine/judge/sunlight.wrela`, `SUNJUDGE=true` in `game/scenes`): each
+pixel's engine sun against the fraction of 64 rays toward stratified points of the sun's disc
+that the reference's own march finds getting out, from the field's surface (the engine's point
+taken onto it by Newton's steps); outlines (the field's facing over 60° from the picture's) and
+the terminator left out; leaks (engine over the reference by an eighth), acne (under), hard
+leaks (reference under a sixteenth, engine over half), hard acne, the mean error; and a picture
+of where (`SunJudge::marks`). Paced like the reference (96 steps a pass, three passes), each
+dispatch under the GPU's line.
+
+Measured on the M4, 320x180, the same judge on `d3e5e0b` and on this:
+
+| SCENE 13 | hard leaks | hard acne | leak px | acne px | mean error (/255) |
+| -------- | ---------- | --------- | ------- | ------- | ----------------- |
+| VIEW 0 (the room) | 1278 → 709 | 816 → 31 | 2138 → 752 | 1437 → 85 | 10.03 → 3.42 |
+| VIEW 1 (the carving) | 8086 → 1351 | 3695 → 172 | 12795 → 1670 | 5823 → 593 | 54.29 → 8.08 |
+| VIEW 2 (the book) | 649 → 359 | 13 → 33 | 728 → 366 | 50 → 161 | 3.15 → 1.94 |
+
+What is left: VIEW 0's and VIEW 2's hard leaks are, by the judge's picture, single pixels on the
+carved frieze, the legs' turning and the book cover's tooling, where the reference's rays leave
+from the bottom of relief the mesh at 320x180 doesn't hold (sub-pixel self-shadowing, not a
+shadow the map or the rays let through). The plan's line for this phase was no leak at all on
+VIEW 2: not met as the judge counts it.
+
+**What it costs** (M4, 1080p, `--serial`, frame 11; the sum of the frame's timed passes):
+SCENE 10 26.0 → 29.4 ms, SCENE 11 16.7 → 18.8 ms, SCENE 13 VIEW 0 19.6 → 22.5 ms, SCENE 14
+19.0 → 24.7 ms. Of SCENE 13 VIEW 0's: the classification 0.75 ms, the exact rays 3.35 ms (the
+table's 2.4 ms of it), the deferred pass 1.46 → 0.60 ms and the indirect 0.73 → 0.64 ms (no SDF
+penumbra, no contact shadow), the fit, map and pyramid 0.87 ms while the eye moves or a mesh is
+unsettled (and none once the eye and every batch are still: keyed by each batch's extraction). The plan's line was +0.3 ms: not met, by 3 to 5 ms in the carved showcases. The exact rays
+cost what the fields cost: `table()`'s distance is 10,597 work, and a ray asks it 10 to 30 times.
+What would bring them down is a field cheap to step (the baked proxy phase 2 meant, never built),
+not a cleverer pass.
+
+Measured and not kept:
+- **One map fitted to the world** (`2048²` over SCENE 13's 20 m floor: 1.4 cm texels), with a
+  near band of 8 texels: the band was thicker than the book, and 9% of the pixels went to exact
+  rays a mean 5 m long (VIEW 2: 7.5 to 10.7 ms at 320x180).
+- **Exact rays as a fragment pass** over each field's swept bound: scattered pixels left most
+  lanes idle; 86 ns an exact pixel, 4.7 to 10.8 ms at 1080p. Gathered into a list and traced in
+  compute: 2.35 ms, then 1.62 ms once a point on a surface was asked once along its ray instead
+  of by Newton's steps and a gradient.
+- **Three cascades** (parallel-split, fitted per span of distance): the exact pixels stayed as
+  many (2,120 against 2,151 at 320x180: they are contacts and creases, not texel size) and the
+  fixed cost tripled (2.6 ms).
+- **A near band from the map's own slide** (a tap near when its rise is within the 2 × 2 texels'
+  depth change round it): flat casters' edges went to the map, acne came back (VIEW 2 hard acne
+  35 → 505).
+- **Field facts' Lipschitz** as the ray's step: `FieldFacts::lip` is `1e6` (unproven) for the
+  table and the grimoire; stepping by it made every ray darken near a surface. The ray takes the
+  least of it and `lipschitz(reach)`.
+
+Gaps: a `Pool`'s far things, meshed together, have no exact rays (their near band is taken as
+open); glass, the froxels and the radiance volume read the world's map alone; the exact rays may
+step over a feature thinner than `max(e, reach / 32)`. SCENE 13 VIEW 1 and VIEW 2 at 1080p stop
+on their cold first frame in `mesh_exact` (270 to 290 ms, before and after this change).
+
 ## What the forge's assets asked of the engine (2026-11-22)
 
 The forge (docs/forge.md) wrote the first assets made the way an author is meant to make them:

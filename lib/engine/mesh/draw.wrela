@@ -13,6 +13,7 @@ use mesh::light::{
     RadianceCache, SHADOW_SIDE, ShadowView, SkyCache, radiance_cache, shadow_view, sky_cache,
 }
 use mesh::sdf::{SdfClipmap, sdf_clipmap, sdf_grid}
+use mesh::sunlight::{SunCert, SunExact, SunFit, sun_cert, sun_classify_fs, sun_exact_list, sun_fit}
 use mesh::shade::{
     BATCH_BRICKS, FOCUS_RAD, combine_indirect_fs, copy_dc_depth, deferred_direct_fs,
     deferred_direct_judge_fs, indirect_half_fs, mesh_gbuf_fs, mesh_trans_fs, place_with_trans_fs,
@@ -29,12 +30,12 @@ use picture::picture::{Picture, picture}
 use picture::screen::{cover, luma, show}
 use std::collections::Vec
 use std::gpu::{
-    Address, Compare, ComparisonSampler, Cull, Depth, DepthBias, DepthOnlyPass, DepthPass,
+    Address, Compare, Cull, Depth, DepthOnlyPass, DepthPass,
     DepthPass2, DepthPass4, DepthTexture, Filter, GpuBuffer, R16Float, R32Float, Rg16Float,
-    Rg32Uint, Rgba8, Rgba16Float, Rgba32Float, Sampler, Texture, begin_depth_pass, begin_pass,
-    begin_pass2, begin_pass2_with_depth, begin_pass4, begin_pass4_with_depth,
-    begin_pass_with_depth, buffer_of, comparison_sampler, copy_texture, depth_texture, dispatch,
-    draw, label, sampler, texture, writable_texture,
+    Rg32Float, Rg32Uint, Rgba8, Rgba16Float, Rgba32Float, Sampler, Texture, begin_depth_pass, begin_pass,
+    begin_pass2, begin_pass2_with_depth, begin_pass3, begin_pass4, begin_pass4_with_depth,
+    begin_pass_with_depth, buffer_of, copy_texture, depth_texture, dispatch, draw, label, sampler,
+    texture, writable_texture, write,
 }
 use std::hash::Hasher
 
@@ -45,8 +46,19 @@ pub struct MeshSight {
     /// `drawn.place` with transmissive surfaces in it (`place_with_trans_fs`), copied back.
     place_all: Texture<Rgba32Float>,
     pub hdr_direct: Texture<Rgba16Float>,
-    /// The sun's share of `hdr_direct` per pixel (`0..1` by luma): what the contact shadow darkens.
-    pub sun_share: Texture<R16Float>,
+    /// Each pixel's sun as the map certifies it (`sun_classify_fs`: `(vis, band)`), and the least
+    /// the exact rays found where it left a pixel to them (as depth: kept by the depth test).
+    pub sun_cls: Texture<Rgba32Float>,
+    sun_exact: SunExact,
+    /// The eye's own map of the sun, fitted to what the eye sees (`mesh::sunlight::SunFit`), and
+    /// its certificate pyramid (`mesh::sunlight::SunCert`).
+    eye_map: DepthTexture,
+    sun_fit: SunFit,
+    sun_cert: SunCert,
+    eye_map_key: u64,
+    eye_map_valid: bool,
+    /// The world's map's view, in a buffer, as the casters' vertex shaders read a view.
+    world_svs: GpuBuffer<ShadowView>,
     pub g_normal: Texture<Rgba8>,
     pub g_albedo: Texture<Rgba8>,
     pub g_emits: Texture<Rgba16Float>,
@@ -76,7 +88,6 @@ pub struct MeshSight {
     /// The sun shadow map of the still batches alone (same `ShadowView`), drawn only when the
     /// static radiance cache rebuilds, so moving things' shadows are never baked into it.
     static_shadow_map: DepthTexture,
-    cmp: ComparisonSampler,
     bg_s: Sampler,
     rad_key: u64,
     rad_built: bool,
@@ -96,7 +107,14 @@ pub fn mesh_sight(gi: bool = true) -> MeshSight {
         drawn: picture(width: 1, height: 1),
         place_all: texture(width: 1, height: 1),
         hdr_direct: texture(width: 1, height: 1),
-        sun_share: texture(width: 1, height: 1),
+        sun_cls: texture(width: 1, height: 1),
+        sun_exact: sun_exact_list(),
+        eye_map: depth_texture(width: SHADOW_SIDE, height: SHADOW_SIDE),
+        sun_fit: sun_fit(),
+        sun_cert: sun_cert(),
+        eye_map_key: 0,
+        eye_map_valid: false,
+        world_svs: sun_fit().svs,
         g_normal: texture(width: 1, height: 1),
         g_albedo: texture(width: 1, height: 1),
         g_emits: texture(width: 1, height: 1),
@@ -125,7 +143,6 @@ pub fn mesh_sight(gi: bool = true) -> MeshSight {
         batches: Vec::new(),
         shadow_map: depth_texture(width: SHADOW_SIDE, height: SHADOW_SIDE),
         static_shadow_map: depth_texture(width: SHADOW_SIDE, height: SHADOW_SIDE),
-        cmp: comparison_sampler(compare: Compare::LessEqual),
         bg_s: sampler(filter: Filter::Linear, address: Address::Clamp),
         rad_key: 0,
         rad_built: false,
@@ -146,7 +163,8 @@ impl MeshSight {
             self.drawn.placed = true
             self.place_all = texture(width: width, height: height)
             self.hdr_direct = texture(width: width, height: height)
-            self.sun_share = texture(width: width, height: height)
+            self.sun_cls = texture(width: width, height: height)
+            self.eye_map_valid = false
             self.g_normal = texture(width: width, height: height)
             self.g_albedo = texture(width: width, height: height)
             self.g_emits = texture(width: width, height: height)
@@ -317,6 +335,7 @@ impl MeshSight {
             }
         }
         let sh_key = static_sh_key.finish()
+        write(mut self.world_svs, 0, [sv])
         if static_opaque_count > 0 {
             if !self.static_shadow_valid || self.static_shadow_key != sh_key {
                 label("mesh_shadow_static")
@@ -325,7 +344,7 @@ impl MeshSight {
                     clear_depth: 1.0,
                     keep_depth: false,
                 )
-                draw_shadow_casters(ssp, mut self.batches, nb, sv, mode: 1)
+                draw_shadow_casters(ssp, mut self.batches, nb, self.world_svs.items(), mode: 1)
                 ssp.end()
                 self.static_shadow_key = sh_key
                 self.static_shadow_valid = true
@@ -336,11 +355,11 @@ impl MeshSight {
                 clear_depth: 1.0,
                 keep_depth: false,
             )
-            draw_shadow_casters(sp, mut self.batches, nb, sv, mode: 2)
+            draw_shadow_casters(sp, mut self.batches, nb, self.world_svs.items(), mode: 2)
             if self.swarm.count > 0 {
                 draw(
                     sp,
-                    swarm_shadow_vs.bind(grains: self.swarm.front(), sv: sv),
+                    swarm_shadow_vs.bind(grains: self.swarm.front(), svs: self.world_svs.items()),
                     shadow_fs,
                     vertices: 6,
                     instances: self.swarm.count,
@@ -356,11 +375,11 @@ impl MeshSight {
                 clear_depth: 1.0,
                 keep_depth: false,
             )
-            draw_shadow_casters(sp, mut self.batches, nb, sv, mode: 0)
+            draw_shadow_casters(sp, mut self.batches, nb, self.world_svs.items(), mode: 0)
             if self.swarm.count > 0 {
                 draw(
                     sp,
-                    swarm_shadow_vs.bind(grains: self.swarm.front(), sv: sv),
+                    swarm_shadow_vs.bind(grains: self.swarm.front(), svs: self.world_svs.items()),
                     shadow_fs,
                     vertices: 6,
                     instances: self.swarm.count,
@@ -425,7 +444,7 @@ impl MeshSight {
                             clear_depth: 1.0,
                             keep_depth: false,
                         )
-                        draw_shadow_casters(ssp, mut self.batches, nb, sv, mode: 1)
+                        draw_shadow_casters(ssp, mut self.batches, nb, self.world_svs.items(), mode: 1)
                         ssp.end()
                     }
                     self.rad.begin_static(rad_centre, rad_rad, enabled: true)
@@ -439,7 +458,6 @@ impl MeshSight {
                         self.sky.diff,
                         self.sky.s,
                         self.static_shadow_map,
-                        self.cmp,
                         static_only: true,
                         all_batches: false,
                     )
@@ -458,7 +476,6 @@ impl MeshSight {
                         self.sky.diff,
                         self.sky.s,
                         self.static_shadow_map,
-                        self.cmp,
                         static_only: false,
                         all_batches: false,
                     )
@@ -473,7 +490,6 @@ impl MeshSight {
                         self.sky.diff,
                         self.sky.s,
                         self.shadow_map,
-                        self.cmp,
                         static_only: false,
                         all_batches: false,
                     )
@@ -490,7 +506,6 @@ impl MeshSight {
                     self.sky.diff,
                     self.sky.s,
                     self.shadow_map,
-                    self.cmp,
                     static_only: false,
                     all_batches: true,
                 )
@@ -693,14 +708,80 @@ impl MeshSight {
             epx.end()
         }
 
-        // Pass 2b: Full-res 1× pixel-rate deferred direct lighting (SDF soft shadows + curvature + SSS + tiled emitters).
+        // Pass 2a-sun: each pixel's sun certified by the map's pyramid and taps at the receiver's
+        // exact plane depth (`sun_classify_fs`), and the pixels it can't decide (a caster in the
+        // near band) by each field's exact short ray toward the sun, the least kept by depth.
+        // (Kept while nothing it is made from changes: the eye as it stands, less its subpixel
+        // jitter, which the fit's margin of eight texels holds; the sun; every batch, settled,
+        // and its mesh's extraction; the swarm, which moves every frame.)
+        let sun = sky.sun()
+        var ek = Hasher::new()
+        v.at.state_hash(mut ek)
+        v.forward.state_hash(mut ek)
+        v.right.state_hash(mut ek)
+        v.focal.state_hash(mut ek)
+        v.size.state_hash(mut ek)
+        sun.way.state_hash(mut ek)
+        sun.size.state_hash(mut ek)
+        sv.centre.state_hash(mut ek)
+        sv.radius.state_hash(mut ek)
+        var all_settled = true
+        for i in 0..nb {
+            self.batches[i].hash.state_hash(mut ek)
+            self.batches[i].mesh_generation().state_hash(mut ek)
+            if !self.batches[i].settled() {
+                all_settled = false
+            }
+        }
+        let eye_key = ek.finish()
+        if !self.eye_map_valid || self.eye_map_key != eye_key || !all_settled || self.swarm.count > 0 {
+            self.sun_fit.fit(self.depth, v, sv, sun, width, height_px)
+            label("mesh_sun_map")
+            self.draw_eye_map(nb)
+            self.sun_cert.build(self.eye_map)
+            self.eye_map_key = eye_key
+            self.eye_map_valid = true
+        }
+        label("mesh_sun")
+        let scp = begin_pass(mut self.sun_cls, keep: false)
+        draw(
+            scp,
+            cover,
+            sun_classify_fs.bind(
+                v: v,
+                svs: self.sun_fit.svs.items(),
+                sun: sun,
+                depth: self.depth,
+                g_normal: self.g_normal,
+                eye_map: self.eye_map,
+                cert: self.sun_cert.tex,
+                cert_levels: self.sun_cert.levels,
+                full_w: width,
+                full_h: height_px,
+            ),
+            vertices: 3,
+        )
+        scp.end()
+        label("mesh_sun_exact")
+        self.sun_exact.gather(self.sun_cls, width, height_px)
+        world.trace_sun_exact(
+            mut self.sun_exact,
+            mut self.batches,
+            first: 0,
+            cls: self.sun_cls,
+            depth: self.depth,
+            v: v,
+            sun: sun,
+            full_w: width,
+        )
+
+        // Pass 2b: Full-res 1× pixel-rate deferred direct lighting (certified sun + curvature + SSS + tiled emitters).
         label("mesh_direct")
         if write_judge {
-            let dp = begin_pass4(
+            let dp = begin_pass3(
                 mut self.hdr_direct,
                 mut self.drawn.place,
                 mut self.drawn.sun,
-                mut self.sun_share,
                 keep: false,
             )
             draw(
@@ -718,10 +799,8 @@ impl MeshSight {
                     depth: self.depth,
                     sky_spec0: self.sky.spec0,
                     sky_s: self.sky.s,
-                    shadow_map: self.shadow_map,
-                    static_shadow_map: self.static_shadow_map,
-                    has_static_shadow: if self.has_static_shadow { 1 } else { 0 },
-                    cmp: self.cmp,
+                    sun_cls: self.sun_cls,
+                    sun_near: self.sun_exact.near.items(),
                     rad0: self.rad.rad0,
                     rad1: self.rad.rad1,
                     rad_s: self.rad.s,
@@ -738,7 +817,7 @@ impl MeshSight {
             )
             dp.end()
         } else {
-            let dp = begin_pass2(mut self.hdr_direct, mut self.sun_share, keep: false)
+            let dp = begin_pass(mut self.hdr_direct, keep: false)
             draw(
                 dp,
                 cover,
@@ -754,10 +833,8 @@ impl MeshSight {
                     depth: self.depth,
                     sky_spec0: self.sky.spec0,
                     sky_s: self.sky.s,
-                    shadow_map: self.shadow_map,
-                    static_shadow_map: self.static_shadow_map,
-                    has_static_shadow: if self.has_static_shadow { 1 } else { 0 },
-                    cmp: self.cmp,
+                    sun_cls: self.sun_cls,
+                    sun_near: self.sun_exact.near.items(),
                     rad0: self.rad.rad0,
                     rad1: self.rad.rad1,
                     rad_s: self.rad.s,
@@ -823,7 +900,6 @@ impl MeshSight {
                 v: v,
                 sky: sky,
                 hdr_direct: self.hdr_direct,
-                sun_share: self.sun_share,
                 g_normal: self.g_normal,
                 g_albedo: self.g_albedo,
                 g_emits: self.g_emits,
@@ -839,6 +915,25 @@ impl MeshSight {
             vertices: 3,
         )
         cp.end()
+    }
+
+    /// The eye's map of the sun (`mesh::sunlight::SunFit`): every opaque caster and the swarm
+    /// through the fitted view, no depth bias.
+    fn draw_eye_map(mut self, nb: u32) {
+        let emp: DepthOnlyPass = begin_depth_pass(mut self.eye_map, clear_depth: 1.0, keep_depth: false)
+        let svs = self.sun_fit.svs.items()
+        draw_shadow_casters(emp, mut self.batches, nb, svs, mode: 0)
+        if self.swarm.count > 0 {
+            draw(
+                emp,
+                swarm_shadow_vs.bind(grains: self.swarm.front(), svs: svs),
+                shadow_fs,
+                vertices: 6,
+                instances: self.swarm.count,
+                depth: Depth { compare: Compare::Less, write: true },
+            )
+        }
+        emp.end()
     }
 
     /// Unified refractive / transmissive pass (half-res SSR pre-pass + full-res 3-channel chromatic
@@ -990,7 +1085,6 @@ impl MeshSight {
                 self.shadow_map,
                 self.static_shadow_map,
                 if self.has_static_shadow { 1 } else { 0 },
-                self.cmp,
                 self.rad.rad0,
                 self.rad.rad1,
                 self.rad.rad2,
@@ -1024,7 +1118,6 @@ impl MeshSight {
                         shadow_map: self.shadow_map,
                         static_shadow_map: self.static_shadow_map,
                         has_static_shadow: if self.has_static_shadow { 1 } else { 0 },
-                        cmp: self.cmp,
                         rad0: self.rad.rad0,
                         rad1: self.rad.rad1,
                         rad2: self.rad.rad2,
@@ -1063,7 +1156,6 @@ impl MeshSight {
                         shadow_map: self.shadow_map,
                         static_shadow_map: self.static_shadow_map,
                         has_static_shadow: if self.has_static_shadow { 1 } else { 0 },
-                        cmp: self.cmp,
                         rad0: self.rad.rad0,
                         rad1: self.rad.rad1,
                         rad2: self.rad.rad2,
@@ -1312,7 +1404,6 @@ impl MeshSight {
                 self.shadow_map,
                 self.static_shadow_map,
                 if self.has_static_shadow { 1 } else { 0 },
-                self.cmp,
                 self.rad.rad1,
                 self.rad.rad2,
                 self.rad.s,
