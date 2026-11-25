@@ -11,6 +11,7 @@ use mesh::grid::{
     eval_dqs, is_heavy_field, owner_of, pack_kept, pack_vertex_meta, safe_norm, unpack_is_trans,
     unpack_oct_normal, unpack_smooth, unpack_thing, with_along,
 }
+use mesh::octree::{corner_on_coarser_seam, nbr_has_coarser}
 use std::derive::{Box3, affine_form, value_and_gradient}
 use std::field::{ALL_LIVE, DualQuat, Field, Live}
 use std::gpu::{Append, Atomics, DispatchArgs, GlobalId, One, Slots, limits}
@@ -55,8 +56,34 @@ pub(package) fn cull_bricks<M: Field<Substance>>(
     }
     let (hit, live) = cull_brick(fields[g.orig_id], g, b)
     if hit {
-        let _ = active.push(ActiveBrick { coord: vec4u(b.x, b.y, b.z, ti), live })
+        let _ = active.push(
+            ActiveBrick { coord: vec4u(b.x, b.y, b.z, ti), live, nbr_lo: 0, nbr_hi: 0 },
+        )
     }
+}
+
+/// Pass 0 (Octree streaming): Computes exact per-brick `Live` part masks and 8-octant pruned
+/// culling for the `dirty_count` CPU-queued octree bricks in `dirty_in`, preserving each brick's
+/// 54-bit neighbor mask (`nbr_lo`, `nbr_hi`) and writing its live status to `dirty_out`.
+@compute(64)
+pub(package) fn cull_octree_bricks<M: Field<Substance>>(
+    fields: [M],
+    grids: [GridSpec],
+    dirty_in: [ActiveBrick],
+    dirty_count: u32,
+    dirty_out: mut Slots<ActiveBrick>,
+    brick_nonempty: mut Slots<u32>,
+    id: GlobalId,
+) {
+    if id.x >= dirty_count {
+        return
+    }
+    let ab = dirty_in[id.x]
+    let g = grids[ab.coord.w]
+    let has_c = nbr_has_coarser(ab.nbr_lo, ab.nbr_hi)
+    let (hit, live) = cull_brick(fields[g.orig_id], g, ab.coord.xyz, seam_halo: has_c)
+    dirty_out[id] = ActiveBrick { coord: ab.coord, live, nbr_lo: ab.nbr_lo, nbr_hi: ab.nbr_hi }
+    brick_nonempty[id] = if hit { 1 } else { 0 }
 }
 
 /// Writes indirect dispatch counts for chunk `chunk_idx` (covering `CHUNK_BRICKS` bricks) and
@@ -156,24 +183,30 @@ pub(package) fn inherit_seam_corners<M: Field<Substance>>(
     let b = ab.coord
     let g = grids[b.w]
     let raw = corners_in[local_id]
-    if g.seam_mask == 0 {
+    let use_octree = nbr_has_coarser(ab.nbr_lo, ab.nbr_hi)
+    if g.seam_mask == 0 && !use_octree {
         corners_out[id] = raw
         return
     }
     let cx = ci & 7
     let cy = (ci >> 3) & 7
     let cz = ci >> 6
-    let nx = g.dims.x * BRICK
-    let ny = g.dims.y * BRICK
-    let nz = g.dims.z * BRICK
-    let gx = b.x * BRICK + cx
-    let gy = b.y * BRICK + cy
-    let gz = b.z * BRICK + cz
-    let in_box = gx <= nx && gy <= ny && gz <= nz
-    let on_x = (gx == 0 && (g.seam_mask & 1) != 0) || (gx == nx && (g.seam_mask & 2) != 0)
-    let on_y = (gy == 0 && (g.seam_mask & 4) != 0) || (gy == ny && (g.seam_mask & 8) != 0)
-    let on_z = (gz == 0 && (g.seam_mask & 16) != 0) || (gz == nz && (g.seam_mask & 32) != 0)
-    if !in_box || !(on_x || on_y || on_z) {
+    let on_seam = if use_octree {
+        corner_on_coarser_seam(ab.nbr_lo, ab.nbr_hi, cx, cy, cz)
+    } else {
+        let nx = g.dims.x * BRICK
+        let ny = g.dims.y * BRICK
+        let nz = g.dims.z * BRICK
+        let gx = b.x * BRICK + cx
+        let gy = b.y * BRICK + cy
+        let gz = b.z * BRICK + cz
+        let in_box = gx <= nx && gy <= ny && gz <= nz
+        let on_x = (gx == 0 && (g.seam_mask & 1) != 0) || (gx == nx && (g.seam_mask & 2) != 0)
+        let on_y = (gy == 0 && (g.seam_mask & 4) != 0) || (gy == ny && (g.seam_mask & 8) != 0)
+        let on_z = (gz == 0 && (g.seam_mask & 16) != 0) || (gz == nz && (g.seam_mask & 32) != 0)
+        in_box && (on_x || on_y || on_z)
+    }
+    if !on_seam {
         corners_out[id] = raw
         return
     }
@@ -769,7 +802,7 @@ pub(package) fn cell_dual_vertex<F: Copy + fn(vec3) -> f32>(
 /// the next extraction for it (`eye_step`), and this is as far as it can turn a plane's facing.
 pub const EYE_ANGLE: f32 = 0.015625
 
-/// The step `sync_one_lod` holds the eye to between extractions for it, with the nearest surface
+/// The step `sync_one_octree` holds the eye to between extractions for it, with the nearest surface
 /// `z_near` m away: a power of two no more than `EYE_ANGLE · z_near / √3` m (and 0.1 mm), so that
 /// moving within a step on each axis turns no plane at or beyond `z_near` by more than
 /// `EYE_ANGLE` (as a cosine).
@@ -901,32 +934,6 @@ pub(package) fn claim_exact_cell(
     (exact_seen.or(i: word, value: bit) & bit) == 0
 }
 
-/// Whether a face neighbour of the all-outside cell `(cx, cy, cz)` in the brick (its corners from
-/// `base`) has a corner inside: a surface beside it, meshed there, whose outline's exact cells cover
-/// what of it reaches into this cell. (A neighbour past the brick's corners counts as not.)
-fn surface_beside(corners: [f32], base: u32, cx: u32, cy: u32, cz: u32) -> bool {
-    var inside = false
-    for a in 0..3 {
-        for side in 0..2 {
-            let at = if a == 0 { cx } else if a == 1 { cy } else { cz }
-            if (side == 0 && at >= 1) || (side == 1 && at + 2 <= 7) {
-                let far = if side == 0 { at - 1 } else { at + 2 }
-                for k in 0..4 {
-                    let u = k & 1
-                    let w = k >> 1
-                    let x = if a == 0 { far } else { cx + u }
-                    let y = if a == 1 { far } else if a == 0 { cy + u } else { cy + w }
-                    let z = if a == 2 { far } else { cz + w }
-                    if cdist(corners, base, x, y, z) < 0.0 {
-                        inside = true
-                    }
-                }
-            }
-        }
-    }
-    inside
-}
-
 /// Pass 2a: Classifies every cell of a chunk (`7×7×7 = 343` per brick) from its 8 corner signs,
 /// clears its vertex slot and deduplication bit, appends sign-changing cells to `surf`, and appends
 /// all-positive owned cells whose minimum corner distance falls within `lip * half_diag` to
@@ -978,7 +985,10 @@ pub(package) fn classify_cells(
         let ab = active[bi]
         let g = grids[ab.coord.w]
         let thresh = max(lip, 1.0) * 0.8660254 * g.cell
-        if min_d <= thresh && !surface_beside(corners, cbase, cx, cy, cz) {
+        // By Mean Value Theorem, any point `p` in the cell with `f(p) <= 0` lies within
+        // `0.5 * sqrt(3) * h = 0.8660254 * h` of its nearest corner, so `min_d <= lip * 0.866 * h`
+        // is a 100% sound filter that never drops protruding thin features next to a meshed face.
+        if min_d <= thresh {
             let cell_lo = brick_corner(g, ab.coord.xyz, vec3u(cx, cy, cz))
             if !finer_than_a_hole(cell_lo, g.cell, exact_eye) {
                 let _ = thin_cands.push((brick_in_chunk << 9) | cell)
@@ -1019,6 +1029,8 @@ pub(package) fn filter_thin_cells<M: Field<Substance>>(
     exact_eye: vec4,
     exact_seen: mut Atomics<u32>,
     exact_cells: mut Append<ExactCell>,
+    exact_owner: mut Atomics<u32>,
+    cap_exact_owner: u32,
     id: GlobalId,
 ) {
     let i = first + id.x
@@ -1090,7 +1102,10 @@ pub(package) fn filter_thin_cells<M: Field<Substance>>(
         }
     }
     if maybe && claim_exact_cell(mut exact_seen, local_bi, cell) {
-        let _ = exact_cells.push(ExactCell { lo: cell_lo, h, live })
+        let ei = exact_cells.push(ExactCell { lo: cell_lo, h, live })
+        if ei < cap_exact_owner {
+            exact_owner.store(i: ei, value: chunk_start + local_bi)
+        }
     }
 }
 
@@ -1388,7 +1403,9 @@ pub(package) fn cull_bricks_rest<M: Field<Substance>>(
     let hi = brick_corner(g, b, vec3u(BRICK + 1, BRICK + 1, BRICK + 1))
     let pr = fields[g.orig_id].rest_pruned(Box3 { lo, hi }, |q: vec3| q, 1.0, ALL_LIVE, 0)
     if pr.range.lo <= 0.0 && pr.range.hi >= 0.0 {
-        let _ = active.push(ActiveBrick { coord: vec4u(b.x, b.y, b.z, ti), live: pr.live })
+        let _ = active.push(
+            ActiveBrick { coord: vec4u(b.x, b.y, b.z, ti), live: pr.live, nbr_lo: 0, nbr_hi: 0 },
+        )
     }
 }
 
