@@ -97,6 +97,12 @@ Because agents author the whole game, tooling and verification are product work,
    machines share work through GitHub. To measure a change on the Linux machine, commit and push
    it, then `git pull` in that checkout and run it there; never copy files across another way.
    The same rules hold there. Touch nothing else on it.
-5. **Commit and push freely; open no pull requests.** The repository is
+5. **A change to how anything is drawn passes `tools/gate` before it is committed** (the hole
+   audit, the sun's judge, a frame's span at 1080p, each held to the machine's line in
+   `tools/gate.json`; `--full` before a change to the mesher or the eye's passes). Its commit
+   message carries what the gate measured. A phase of a plan is landed when its kill line is
+   met, or the line is rewritten in `docs/design.md` with the measurement that forced it. A
+   failure found on the commit a piece of work starts from is bisected, not set aside.
+6. **Commit and push freely; open no pull requests.** The repository is
    `github.com/rywible/wrela-next`; push your branches to `origin` whenever you like. A commit
    message is one sentence saying what is now true, with no trailing period.

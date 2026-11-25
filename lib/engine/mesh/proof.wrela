@@ -15,6 +15,7 @@
 //     either by pure Lipschitz steps `t += f(p) / L` (Mean Value Theorem, never clamped up by a
 //     heuristic minimum step) or by compiler-derived IEEE-754-sound 1D `std::derive::affine`.
 
+use mesh::dc::{QUAD_FOLDED, QUAD_INSIDE, finer_than_a_hole, on_outline}
 use matter::substance::{Substance, lambert}
 use picture::eye::View
 use std::derive::{Interval, affine_form, filtered}
@@ -1115,6 +1116,112 @@ pub fn sun_exact(vis_far: f32, vis_near: f32) -> SunVisibility {
     }
 }
 
+/// A triangle or a quad of the mesh shown to be local: no two of its corners further apart than
+/// `span`, the most the cells they were solved in allow (a vertex lies within 0.85 of a cell of
+/// its own cell, and the four cells round an edge lie in a block 2 by 2 by 1 of them: `QUAD_SPAN`
+/// cells from corner to corner; twice that where a level's seam takes the coarser level's cells).
+/// Only such are stored for drawing (`mesh::emit`: `store_quad`, `store_tri`), so an index gone
+/// astray (a slot never solved, a brick's base mistaken, a buffer run out) can put no triangle
+/// across the picture: what is refused is drawn as nothing and counted (`OVERFLOW_UNLOCAL`, which
+/// the hole audit fails on); a brick's quad refused also has its cells solved exactly, while a
+/// level's seam, which has no cells of its own to solve, is left to the audit.
+pub struct LocalProof: Copy {
+    seal: (),
+}
+
+/// The quad `(p0, p1, p2, p3)` is local to `span` (and none of it is not a number).
+pub fn prove_quad_local(p0: vec3, p1: vec3, p2: vec3, p3: vec3, span: f32) -> Option<LocalProof> {
+    let s2 = span * span
+    let d = |a: vec3, b: vec3| dot(a - b, a - b)
+    if d(p0, p1) <= s2 &&
+        d(p1, p2) <= s2 &&
+        d(p2, p3) <= s2 &&
+        d(p3, p0) <= s2 &&
+        d(p0, p2) <= s2 &&
+        d(p1, p3) <= s2 {
+        Some(LocalProof { seal: () })
+    } else {
+        None
+    }
+}
+
+/// The triangle `(p0, p1, p2)` is local to `span` (and none of it is not a number).
+pub fn prove_tri_local(p0: vec3, p1: vec3, p2: vec3, span: f32) -> Option<LocalProof> {
+    let s2 = span * span
+    let d = |a: vec3, b: vec3| dot(a - b, a - b)
+    if d(p0, p1) <= s2 && d(p1, p2) <= s2 && d(p2, p0) <= s2 {
+        Some(LocalProof { seal: () })
+    } else {
+        None
+    }
+}
+
+/// A quad of the mesh shown to need no exact cell: it was stored for drawing (a `LocalProof`),
+/// and every eye within reach of the one it was meshed for sees all of it from the one side
+/// (`dc::on_outline`), or its cells are too fine to stand off the field by a hole
+/// (`dc::finer_than_a_hole`). Made only by `quad_cover`.
+pub struct CoverProof: Copy {
+    seal: (),
+}
+
+/// What a quad of the mesh is to the picture's cover: the one answer `mesh::emit` gets for each
+/// quad, and must take each case of (a `match`), so that no quad the mesh can't be shown to cover
+/// with goes without an exact cell because a rewrite forgot to ask.
+pub enum QuadCover: Copy {
+    /// Drawn, and shown to need nothing more.
+    Covered(CoverProof),
+    /// Drawn in a mesh the exact pass doesn't hold: one meshed for no eye (a pool's shared
+    /// mesh, a mesh drawn only to the sun's map), or a transmissive quad (glass has its own pass).
+    Unheld,
+    /// Drawn, on the mesh's outline for some eye within reach: its cells are certified
+    /// (`certify_outline`) or solved exactly.
+    Outline,
+    /// Drawn, but wound against its normals (folded, so culled): its cells are solved exactly.
+    Folded,
+    /// Not drawn (a vertex of its four never solved, not local, or no room left for its indices):
+    /// its cells are solved exactly, whatever their size.
+    Unsound,
+}
+
+/// The cover of an opaque quad just stored for drawing (`local`), with corners `p0..p3` and unit
+/// normals `n0..n3`, split along `p1-p3` when `split13`, in a cell at `cell_lo` of width `h`,
+/// held to the eye `eye` (`xyz` its place, `w` its pixel's width a metre out; `w` 0 for no eye)
+/// and every eye within `reach` of it.
+pub fn quad_cover(
+    local: LocalProof,
+    p0: vec3,
+    p1: vec3,
+    p2: vec3,
+    p3: vec3,
+    n0: vec3,
+    n1: vec3,
+    n2: vec3,
+    n3: vec3,
+    split13: bool,
+    cell_lo: vec3,
+    h: f32,
+    eye: vec4,
+    reach: f32,
+) -> QuadCover {
+    let _ = local
+    if eye.w <= 0.0 {
+        return QuadCover::Unheld
+    }
+    let kind = on_outline(p0, p1, p2, p3, n0, n1, n2, n3, split13: split13, e: eye.xyz, reach: reach)
+    if kind == QUAD_INSIDE || finer_than_a_hole(cell_lo, h, eye) {
+        return QuadCover::Covered(CoverProof { seal: () })
+    }
+    if kind == QUAD_FOLDED { QuadCover::Folded } else { QuadCover::Outline }
+}
+
+/// The cover of a transmissive quad shown local (`local`), whether or not its buffer had room:
+/// glass is drawn by its own pass, behind what is opaque, and the exact pass (which solves what is
+/// opaque) doesn't hold it, so it is `Unheld` either way (a full buffer is `OVERFLOW_TRANS`).
+pub fn transmissive_cover(local: LocalProof) -> QuadCover {
+    let _ = local
+    QuadCover::Unheld
+}
+
 /// Steps an exact sun ray takes at the most (`trace_sun_near`).
 pub const SUN_RAY_STEPS: u32 = 32
 
@@ -1241,10 +1348,76 @@ fn proof_tokens_erase_to_zero_bytes() {
         size_of::<EmptyProof>() == 0,
         f"EmptyProof must be 0 bytes, got {size_of::<EmptyProof>()}",
     )
+    assert(size_of::<LocalProof>() == 0, "LocalProof must be 0 bytes")
+    assert(size_of::<CoverProof>() == 0, "CoverProof must be 0 bytes")
     assert(
         size_of::<RayBox>() == 16,
         f"RayBox must be 16 bytes (one vec4), got {size_of::<RayBox>()}",
     )
+}
+
+@test
+fn a_triangle_is_stored_only_where_it_is_local_and_a_quad_says_what_covers_it() {
+    // A quad of 10 cm cells, a metre before an eye whose pixel is a millimetre a metre out.
+    let h = 0.1
+    let z = vec3(0.0, 0.0, 1.0)
+    let p0 = vec3(0.0, 0.0, 0.0)
+    let p1 = vec3(h, 0.0, 0.0)
+    let p2 = vec3(h, h, 0.0)
+    let p3 = vec3(0.0, h, 0.0)
+    let span = 6.0 * h
+    let local = match prove_quad_local(p0, p1, p2, p3, span) {
+        Some(proof) => proof,
+        None => panic("a quad within its cells is local"),
+    }
+    // One corner astray (an index to another brick's vertex, the origin, a slot never written)
+    // is refused: it is drawn as nothing.
+    let astray = vec3(40.0, 3.0, -7.0)
+    assert(prove_quad_local(p0, p1, astray, p3, span).is_none(), "a corner astray is refused")
+    assert(prove_tri_local(p0, p1, astray, span).is_none(), "a triangle's corner astray is refused")
+    let far = vec3(1.0e30, 0.0, 0.0)
+    assert(prove_quad_local(p0, far, p2, p3, span).is_none(), "a corner out of all bounds is refused")
+    assert(prove_tri_local(p0, p1, p2, span).is_some(), "a triangle within its cells is local")
+    let facing = vec4(0.05, 0.05, 1.0, 0.001)
+    let cover = |eye: vec4, n: vec3| quad_cover(
+        local,
+        p0,
+        p1,
+        p2,
+        p3,
+        n,
+        n,
+        n,
+        n,
+        split13: false,
+        cell_lo: p0,
+        h: h,
+        eye: eye,
+        reach: 0.01,
+    )
+    // Faced by the eye, it needs no exact cell; with no eye, it isn't held to one.
+    match cover(facing, z) {
+        QuadCover::Covered(_) => {},
+        QuadCover::Unheld => panic("a quad an eye faces is held to it"),
+        QuadCover::Outline => panic("a quad an eye faces is not on its outline"),
+        QuadCover::Folded => panic("a quad an eye faces is not folded"),
+        QuadCover::Unsound => panic("a stored quad is sound"),
+    }
+    match cover(vec4(0.05, 0.05, 1.0, 0.0), z) {
+        QuadCover::Unheld => {},
+        QuadCover::Covered(_) => panic("with no eye nothing is shown covered"),
+        QuadCover::Outline => panic("with no eye there is no outline"),
+        QuadCover::Folded => panic("with no eye nothing is folded"),
+        QuadCover::Unsound => panic("a stored quad is sound"),
+    }
+    // Seen edge on (the eye in its plane), it is on the outline: certified or solved.
+    match cover(vec4(1.0, 0.05, 0.0, 0.001), z) {
+        QuadCover::Outline => {},
+        QuadCover::Folded => {},
+        QuadCover::Covered(_) => panic("a quad seen edge on can't be shown covered"),
+        QuadCover::Unheld => panic("a quad seen edge on is held to its eye"),
+        QuadCover::Unsound => panic("a stored quad is sound"),
+    }
 }
 
 @test

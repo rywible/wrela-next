@@ -1,0 +1,298 @@
+#!/usr/bin/env python3
+"""The gate a change to how anything is drawn passes before it is committed. Usage:
+
+    tools/gate [--quick] [--full] [--only layers,tests,audit,sun,frames] [--update]
+               [--machine NAME] [--keep DIR]
+
+Runs, in turn, each through the tools that already hold the machine's rules (tools/wrela,
+tools/audit, tools/bench, tools/gpu: one GPU job at a time, every dispatch under its line):
+
+  layers   tools/layers: the layers' rules.
+  tests    `wrela test` of lib/engine (and of lib/kit and game/world unless --quick).
+  audit    The hole audit: small (160x90, 12 eyes, every kind) always; with --full the full one
+           too (640x360, 24 eyes). A kind may fail only if the baseline names it as failing
+           already (a debt, written down with what it is), and then no worse than it did.
+  sun      The sun's judge (SUNJUDGE) on each of `SUN_VIEWS` at 320x180: hard leaks, hard acne
+           and the mean error against 64 rays a pixel to the sun's disc.
+  frames   A frame's cost at 1920x1080 on each of `FRAME_SCENES`: tools/bench's span (the GPU's
+           clock from a frame's first pass to its last, passes overlapped, frames back to back:
+           the one measure of a frame used anywhere), the median of frames 30 to 89.
+
+Each number is held to this machine's line in tools/gate.json (`--machine`: `m4` on macOS,
+`radeon` on Linux, unless given): a count may not grow by more than `COUNT_SLACK`, an error or
+a span by more than `REL_SLACK` and `ABS_SLACK`. A number that got better is said so; --update
+writes what was measured as the machine's new baseline, to be committed with the change that
+moved it and named in its message. A run with --only or --quick checks what it ran and leaves
+the rest of the baseline as it was.
+
+Exit status: 0 when everything run held its line; 1 when something didn't; 2 for a usage error.
+"""
+
+import json
+import os
+import platform
+import re
+import subprocess
+import sys
+import tempfile
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+TOOLS = os.path.join(ROOT, "tools")
+BASELINE = os.path.join(TOOLS, "gate.json")
+
+# (scene, view) the sun's judge holds, and the scenes whose frame is timed.
+SUN_VIEWS = [(13, 0), (13, 1), (13, 2)]
+FRAME_SCENES = [10, 11, 13, 14]
+FRAME_SIZE = "1920x1080"
+FRAME_RANGE = "30-89"
+SUN_SIZE = "320x180"
+SUN_FRAMES = 120
+
+# How far past its baseline a number may be before the gate fails: a count of pixels (the judge's
+# rays are fixed, so a count moves only with the picture), and a time or a mean (the GPU's
+# clock is not still).
+COUNT_SLACK = (0.03, 8)
+REL_SLACK = 0.04
+ABS_SLACK = {"ms": 0.25, "err": 0.1}
+
+STEPS = ["layers", "tests", "audit", "sun", "frames"]
+
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, **kw)
+
+
+def say(msg):
+    print(f"gate: {msg}", file=sys.stderr, flush=True)
+
+
+def build(scene_dir, settings):
+    cmd = [os.path.join(TOOLS, "wrela"), "build", os.path.join(ROOT, "game", "scenes"), "-o", scene_dir]
+    for k, v in settings.items():
+        cmd += ["--set", f"{k}={v}"]
+    p = run(cmd)
+    if p.returncode != 0:
+        tail = "\n".join(l for l in p.stdout.splitlines() if l.startswith("error"))
+        raise RuntimeError(f"the build of {settings} failed:\n{tail or p.stdout[-2000:]}")
+
+
+class Result:
+    def __init__(self):
+        self.rows = []
+        self.failed = False
+        self.measured = {}
+
+    def row(self, what, base, now, ok, note=""):
+        self.rows.append((what, base, now, ok, note))
+        if not ok:
+            self.failed = True
+
+    def hold(self, key, what, now, base, kind):
+        """Holds the number `now` (lower is better) to `base` (None: no baseline yet)."""
+        self.measured[key] = now if kind == "count" else round(now, 3)
+        if base is None:
+            self.row(what, "-", fmt(now, kind), True, "no baseline: --update writes one")
+            return
+        if kind == "count":
+            limit = base + max(COUNT_SLACK[1], COUNT_SLACK[0] * base)
+        else:
+            limit = base + max(ABS_SLACK[kind], REL_SLACK * base)
+        ok = now <= limit
+        note = "" if ok else f"over its line of {fmt(limit, kind)}"
+        if ok and now < base - (limit - base):
+            note = "better: --update the baseline"
+        self.row(what, fmt(base, kind), fmt(now, kind), ok, note)
+
+
+def fmt(x, kind):
+    if kind == "count":
+        return f"{int(x)}"
+    return f"{x:.2f}"
+
+
+def step_layers(res, base, opts, tmp):
+    p = run([sys.executable, os.path.join(TOOLS, "layers")])
+    res.row("layers", "ok", "ok" if p.returncode == 0 else "broken", p.returncode == 0,
+            "" if p.returncode == 0 else p.stdout.strip().splitlines()[-1][:120])
+
+
+def step_tests(res, base, opts, tmp):
+    pkgs = ["lib/engine"] if opts["quick"] else ["lib/engine", "lib/kit", "game/world"]
+    for pkg in pkgs:
+        p = run([os.path.join(TOOLS, "wrela"), "test", os.path.join(ROOT, pkg)])
+        m = re.findall(r"(\d+) passed, (\d+) failed", p.stdout)
+        passed, failed = (int(m[-1][0]), int(m[-1][1])) if m else (0, 1)
+        ok = p.returncode == 0 and failed == 0 and passed > 0
+        note = ""
+        if not ok:
+            bad = [l for l in p.stdout.splitlines() if l.startswith("FAILED") or l.startswith("error")]
+            note = (bad[0] if bad else "the tests didn't run")[:120]
+        res.row(f"tests {pkg}", "all pass", f"{passed} passed, {failed} failed", ok, note)
+
+
+AUDIT_FAIL = re.compile(r"^\s+- (?P<kind>.+?)(?:,|:) ")
+
+
+def audit(res, base, what, args):
+    say(f"hole audit, {what}")
+    p = run([os.path.join(TOOLS, "audit")] + args)
+    kinds = sorted({m.group("kind") for l in p.stdout.splitlines() if (m := AUDIT_FAIL.match(l))})
+    host_died = "host exited" in p.stdout or "error: GPU error" in p.stdout
+    known = sorted((base or {}).get("failing", []))
+    res.measured[f"audit.{what}"] = {"failing": kinds}
+    if host_died or (p.returncode != 0 and not kinds):
+        err = [l for l in p.stdout.splitlines() if l.startswith("error")]
+        res.row(f"audit {what}", "passes", "did not run", False, (err[0] if err else p.stdout[-200:])[:140])
+        return
+    new = [k for k in kinds if k not in known]
+    now = "passes" if not kinds else "fails: " + ", ".join(kinds)
+    was = "passes" if not known else "fails: " + ", ".join(known)
+    note = ""
+    if new:
+        note = "newly failing: " + ", ".join(new)
+    elif kinds != known:
+        note = "better: --update the baseline"
+    elif kinds:
+        note = "a debt the baseline names"
+    res.row(f"audit {what}", was, now, not new, note)
+
+
+def step_audit(res, base, opts, tmp):
+    b = base.get("audit", {})
+    audit(res, b.get("small"), "small", ["--size", "160x90", "--eyes", "12", "--timeout", "1500"])
+    if opts["full"]:
+        audit(res, b.get("full"), "full", ["--timeout", "3000"])
+
+
+SUN_LINE = re.compile(
+    r"SUN SCENE (\d+) VIEW (\d+): judged (\d+) px.*?hard leaks (\d+); acne px \d+ \([^)]*\), "
+    r"hard acne (\d+); mean \|err\| ([\d.]+)/255"
+)
+
+
+def step_sun(res, base, opts, tmp):
+    b = base.get("sun", {})
+    for scene, view in SUN_VIEWS:
+        key = f"{scene}/{view}"
+        say(f"sun judge, SCENE {scene} VIEW {view}")
+        out = os.path.join(tmp, f"sun_{scene}_{view}")
+        build(out, {"SCENE": scene, "VIEW": view, "SUNJUDGE": "true"})
+        p = run([os.path.join(TOOLS, "gpu"), "--timeout", "600", out, "--size", SUN_SIZE,
+                 "--frames", str(SUN_FRAMES)])
+        m = SUN_LINE.search(p.stdout)
+        if not m:
+            err = [l for l in p.stdout.splitlines() if "error" in l]
+            res.row(f"sun {key}", "judged", "no verdict", False, (err[0] if err else "the judge said nothing")[:140])
+            continue
+        was = b.get(key, {})
+        res.hold(f"sun.{key}.hard_leaks", f"sun {key} hard leaks (px)", int(m.group(4)), was.get("hard_leaks"), "count")
+        res.hold(f"sun.{key}.hard_acne", f"sun {key} hard acne (px)", int(m.group(5)), was.get("hard_acne"), "count")
+        res.hold(f"sun.{key}.mean_err", f"sun {key} mean error (/255)", float(m.group(6)), was.get("mean_err"), "err")
+
+
+def step_frames(res, base, opts, tmp):
+    b = base.get("frames", {})
+    for scene in FRAME_SCENES:
+        say(f"frame's span, SCENE {scene} at {FRAME_SIZE}")
+        out = os.path.join(tmp, f"frame_{scene}")
+        build(out, {"SCENE": scene})
+        js = os.path.join(tmp, f"bench_{scene}.json")
+        p = run([os.path.join(TOOLS, "bench"), out, "--size", FRAME_SIZE, "--frames", FRAME_RANGE,
+                 "--runs", "1", "--no-passes", "--no-cpu", "--json", js, "--timeout", "600"])
+        try:
+            with open(js) as f:
+                span = json.load(f)["span_runs"][0]["span"]["median"]
+        except (OSError, KeyError, IndexError, ValueError):
+            err = [l for l in p.stdout.splitlines() if "error" in l]
+            res.row(f"frame SCENE {scene}", "runs", "did not run", False, (err[0] if err else p.stdout[-200:])[:140])
+            continue
+        res.hold(f"frames.{scene}", f"frame SCENE {scene} span (ms)", span, b.get(str(scene)), "ms")
+
+
+def nest(flat):
+    """`a.b.c: v` keys as nested dicts (the baseline's shape)."""
+    out = {}
+    for key, v in flat.items():
+        at = out
+        parts = key.split(".")
+        for part in parts[:-1]:
+            at = at.setdefault(part, {})
+        at[parts[-1]] = v
+    return out
+
+
+def merge(into, new):
+    for k, v in new.items():
+        if isinstance(v, dict) and isinstance(into.get(k), dict) and "failing" not in v:
+            merge(into[k], v)
+        else:
+            into[k] = v
+
+
+def main():
+    opts = {"quick": False, "full": False, "update": False, "only": None, "machine": None, "keep": None}
+    argv = sys.argv[1:]
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-h", "--help"):
+            print(__doc__)
+            return 0
+        if a in ("--quick", "--full", "--update"):
+            opts[a[2:]] = True
+        elif a in ("--only", "--machine", "--keep") and i + 1 < len(argv):
+            i += 1
+            opts[a[2:]] = argv[i]
+        else:
+            print(f"gate: unknown argument `{a}`\n{__doc__}", file=sys.stderr)
+            return 2
+        i += 1
+    steps = STEPS if opts["only"] is None else opts["only"].split(",")
+    for s in steps:
+        if s not in STEPS:
+            print(f"gate: no step `{s}` (the steps: {', '.join(STEPS)})", file=sys.stderr)
+            return 2
+    if opts["quick"] and opts["only"] is None:
+        steps = ["layers", "tests", "audit"]
+    machine = opts["machine"] or ("m4" if platform.system() == "Darwin" else "radeon")
+    try:
+        with open(BASELINE) as f:
+            baselines = json.load(f)
+    except OSError:
+        baselines = {}
+    base = baselines.get(machine, {})
+
+    res = Result()
+    fns = {"layers": step_layers, "tests": step_tests, "audit": step_audit, "sun": step_sun,
+           "frames": step_frames}
+    tmp = opts["keep"] or tempfile.mkdtemp(prefix="wrela-gate-")
+    os.makedirs(tmp, exist_ok=True)
+    for s in STEPS:
+        if s in steps:
+            try:
+                fns[s](res, base, opts, tmp)
+            except RuntimeError as e:
+                res.row(s, "runs", "did not run", False, str(e).splitlines()[-1][:140])
+
+    w = max(len(r[0]) for r in res.rows) if res.rows else 10
+    print(f"gate on {machine}:")
+    for what, was, now, ok, note in res.rows:
+        mark = "ok  " if ok else "FAIL"
+        print(f"  {mark} {what:<{w}}  {str(was):>12} -> {str(now):<12} {note}")
+    if opts["update"]:
+        if res.failed and any(not ok and "did not run" in str(now) for _, _, now, ok, _ in res.rows):
+            print("gate: not updating the baseline: something didn't run", file=sys.stderr)
+            return 1
+        merge(base, nest(res.measured))
+        baselines[machine] = base
+        with open(BASELINE, "w") as f:
+            json.dump(baselines, f, indent=2, sort_keys=True)
+            f.write("\n")
+        print(f"gate: wrote {machine}'s baseline to tools/gate.json")
+        return 0
+    print("gate: " + ("FAILED" if res.failed else "passed"))
+    return 1 if res.failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

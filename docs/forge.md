@@ -1,7 +1,7 @@
 # The forge: from a brief to a gold asset
 
-Agents write the whole game, and the forge is how they write assets that look AAA straight from
-fields, without breaking the rule that nothing is prebaked (AGENTS.md):
+Agents write the whole game, and the forge is how they write assets that hold up close straight
+from fields, without breaking the rule that nothing is prebaked (AGENTS.md):
 
 ```text
  brief ──▶ concept views ──▶ reference ──▶ outline ──▶ fit ──▶ judge ──▶ gold asset
@@ -170,9 +170,9 @@ Gaps filed (an author needed this, for that):
   segment out where they are built (`outline::arc_of`), which the fitter still differentiates.
 - ~~The engine's micro relief (`Substance::micro`) has one fixed world scale~~: closed for
   material-authored scale via `Substance::bump` (above).
-- Channels are evaluated at a pixel's centre with no footprint, and `lib/kit` may not ask for one
-  (tools/layers rule 3): oak's 2 mm rings shimmer at room distance until TSR settles them. The
-  engine should filter channels by the pixel's footprint, as it does distances.
+- ~~Channels are evaluated at a pixel's centre with no footprint~~: closed, the engine filters a
+  thing's channels over the pixel's footprint (`mesh::proof::filter_channels`, `e86f5c0`), so
+  `lib/kit` still need not ask for one (tools/layers rule 3).
 - ~~Union's channels ask every part's material~~: closed, a pixel asks only its part's
   (`Field::channels_kept`, above). The assets still put one oak over all a table's pieces
   (`Story::piece` picks each piece's log), as a joiner works one stock.

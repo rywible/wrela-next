@@ -1463,6 +1463,35 @@ Measured on the M4 after both:
   754/1,344/316, hard acne 21/137/24 to 17/85/5, mean error 3.35/5.45/1.80 to 3.53/7.01/1.49
   of 255 (VIEW 1's rings hold less of the carving than the octree's finer floor did).
 
+**The gate** (`tools/gate`, and from `tools/check`): the layers' rules, the packages' tests, the
+hole audit (small always, the full one with `--full`), the sun's judge on SCENE 13's three views
+at 320x180, and a frame's span at 1080p on SCENES 10, 11, 13 and 14, each number held to the
+machine's line in `tools/gate.json` (a count may grow 3% or 8 px, a span or a mean 4% or
+0.25 ms or 0.1 of 255) and `--update` writing a new line, to be committed with the change that
+moved it. A kind of the audit may fail only if the baseline names it (the crowd, at full size).
+A frame's cost is `tools/bench`'s span and nothing else: the GPU's clock from a frame's first
+pass to its last, passes overlapped, frames 30 to 89. (The sums of serially timed passes quoted
+through this plan's commits, this section's above among them, are not a frame: SCENE 10 sums
+to 18.9 ms and spans 24.4.) The M4's first lines: spans 24.44, 16.67, 18.20 and 21.40 ms for
+SCENES 10, 11, 13 and 14. Not in it yet: a moving eye's span, and the Radeon's lines.
+
+**The cover rule in types** (`mesh::proof`, `tools/layers` rule 9). What the mesher kept by
+convention is now what its code can't be written without:
+- An index buffer is written only by `store_quad`, `store_tri` and `store_nothing` of
+  `mesh::emit`, and the first two take a `LocalProof`: no two corners further apart than the
+  cells they were solved in allow (`QUAD_SPAN`, 6 cells). An index gone astray draws nothing.
+- Storing a quad answers a `QuadCover` (`quad_cover`: covered, not held, on the outline, folded,
+  or not drawn), and `emit::cover_quad` takes each case in a `match`: a new case, or an old one
+  forgotten, doesn't compile. A quad not drawn (a vertex never solved, not local, no room for
+  its indices: each was a silent `QUAD_INSIDE` before) has its cells solved exactly.
+- `tools/layers` refuses a `LocalProof`, a `CoverProof` or a `QuadCover` (but `Unsound`, which
+  only asks for an exact cell) made outside `mesh::proof`, an index store outside the three
+  writers, and an emitter's answer thrown away.
+What the types don't hold, and the audit still does: that the readings behind a proof are right
+(`on_outline`'s facing within reach, a certificate's slab), that a cell with no corner inside is
+tested (`classify_cells`: its skip beside a meshed face is an argument, not a proof), and a
+level's seams.
+
 Where this leaves the plan: phases 1 to 4 were each called landed with their kill lines unmet
 or unmeasured (phase 2's `mesh_exact` at most 1.5 ms: 8.0; phase 3's streaming: taken out;
 phase 4's no leak and +0.3 ms: 316 to 1,344 hard leaks and about +2 ms). From here a phase is

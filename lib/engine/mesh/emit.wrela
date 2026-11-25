@@ -4,14 +4,18 @@
 use matter::certify::{certify_sheet, certify_sheet_pruned}
 use matter::substance::Substance
 use mesh::dc::{
-    CERT_MARKS, CellCorners, HOLE_PX, OUTLINE_MARKS, QUAD_FOLDED, QUAD_INSIDE, Qef, cdist,
+    CERT_MARKS, CellCorners, HOLE_PX, OUTLINE_MARKS, QUAD_FOLDED, QUAD_OUTLINE, QUAD_SPAN, Qef, cdist,
     claim_exact_cell, decode_cell, finer_than_a_hole, hidden_crease, is_crease, on_outline,
     solve_cell, solve_crease_cell, trilinear_qef,
+}
+use mesh::proof::{
+    LocalProof, QuadCover, prove_quad_local, prove_tri_local, quad_cover, transmissive_cover,
 }
 use mesh::grid::{
     ActiveBrick, BRICK, BrickBound, CAP_SEAM, CAP_SURF, CERT_SLICE, CORNERS_BRICK, EDGES_BRICK,
     ExactCell, GridSpec, MOST_INDICES_PER_BRICK, MeshVertex, NONE, OVERFLOW_CREASES, OVERFLOW_CUT,
-    OVERFLOW_EXACT, OVERFLOW_INDICES, OVERFLOW_SEAMS, OVERFLOW_THIN, OVERFLOW_TRANS, SEAM_SLICE,
+    OVERFLOW_EXACT, OVERFLOW_INDICES, OVERFLOW_SEAMS, OVERFLOW_THIN, OVERFLOW_TRANS, OVERFLOW_UNLOCAL,
+    SEAM_SLICE,
     SMOOTH_DOT, SeamCell, SeamQuad, VERTS_BRICK, VERTS_STRIDE, brick_corner, is_heavy_field,
     lattice, pack_vertex_meta, safe_norm, unpack_is_trans, unpack_oct_normal,
 }
@@ -49,7 +53,7 @@ pub(package) fn quad_order(v0: u32, v1: u32, v2: u32, v3: u32, flip: bool) -> (u
 }
 
 /// Stores the wound quad `(q0, q1, q2, q3)` as 2 triangles (6 indices) at `at`, split along
-/// `q1–q3` when `split13`, else along `q0–q2`.
+/// `q1–q3` when `split13`, else along `q0–q2`: only a quad shown local (`local`).
 fn store_quad(
     indices: mut Atomics<u32>,
     at: u32,
@@ -58,7 +62,9 @@ fn store_quad(
     q2: u32,
     q3: u32,
     split13: bool,
+    local: LocalProof,
 ) {
+    let _ = local
     let (a, b, c, d) = if split13 { (q1, q2, q3, q0) } else { (q0, q1, q2, q3) }
     indices.store(i: at, value: a)
     indices.store(i: at + 1, value: b)
@@ -66,6 +72,14 @@ fn store_quad(
     indices.store(i: at + 3, value: a)
     indices.store(i: at + 4, value: c)
     indices.store(i: at + 5, value: d)
+}
+
+/// Fills `count` indices at `at` with the one vertex `v`: triangles of no area, drawn as nothing,
+/// where a quad's place in its brick's slice was counted and the quad then refused.
+fn store_nothing(indices: mut Atomics<u32>, at: u32, v: u32, count: u32) {
+    for k in 0..count {
+        indices.store(i: at + k, value: v)
+    }
 }
 
 /// One owned edge of a brick along `axis` and the 4 cells around it, in the order that winds
@@ -132,8 +146,8 @@ fn quad_opaque_count(v0: u32, v1: u32, v2: u32, v3: u32, verts: [MeshVertex]) ->
 
 /// Emits one quad into its brick's contiguous opaque index slice (`brick_idx_offsets[brick] +
 /// atomic brick_idx_counts[brick]`), routing transmissive/cut quads to `trans_indices`/`cut_indices`.
-/// Returns, seen from `exact_eye` (`w > 0`), what the opaque quad is to the mesh's outline
-/// (`on_outline`): the caller boxes its 4 cells (`box_outline`).
+/// Returns what the quad is to the picture's cover (`mesh::proof::QuadCover`), held to
+/// `exact_eye`: the caller takes each case (`cover_quad`).
 fn emit_quad_brick(
     v0: u32,
     v1: u32,
@@ -143,6 +157,8 @@ fn emit_quad_brick(
     brick_in_chunk: u32,
     exact_eye: vec4,
     eye_reach: f32,
+    cell_lo: vec3,
+    h: f32,
     verts: [MeshVertex],
     cap_indices: u32,
     cap_trans: u32,
@@ -152,9 +168,9 @@ fn emit_quad_brick(
     indices: mut Atomics<u32>,
     trans_indices: mut Atomics<u32>,
     cut_indices: mut Atomics<u32>,
-) -> u32 {
+) -> QuadCover {
     if v0 == NONE || v1 == NONE || v2 == NONE || v3 == NONE {
-        return QUAD_INSIDE
+        return QuadCover::Unsound
     }
     let t0 = unpack_is_trans(verts[v0].packed)
     let t1 = unpack_is_trans(verts[v1].packed)
@@ -171,42 +187,65 @@ fn emit_quad_brick(
     let n2 = unpack_oct_normal(verts[q2].packed)
     let n3 = unpack_oct_normal(verts[q3].packed)
     let split13 = split_seam_13(p0, p1, p2, p3, n0, n1, n2, n3)
+    let proven = prove_quad_local(p0, p1, p2, p3, QUAD_SPAN * h)
     if !is_trans {
-        let local = brick_idx_counts.add(i: brick_in_chunk, value: 6)
-        let at = brick_idx_offsets[brick_in_chunk] + local
+        let used = brick_idx_counts.add(i: brick_in_chunk, value: 6)
+        let at = brick_idx_offsets[brick_in_chunk] + used
         if at + 6 > cap_indices {
-            return QUAD_INSIDE
+            return QuadCover::Unsound
         }
-        store_quad(mut indices, at, q0, q1, q2, q3, split13: split13)
-        if exact_eye.w <= 0.0 {
-            return QUAD_INSIDE
-        }
-        return on_outline(
-            p0,
-            p1,
-            p2,
-            p3,
-            n0,
-            n1,
-            n2,
-            n3,
-            split13: split13,
-            e: exact_eye.xyz,
-            reach: eye_reach,
-        )
-    } else {
-        let at = tri_count.add(i: 1, value: 6)
-        if at + 6 <= cap_trans {
-            store_quad(mut trans_indices, at, q0, q1, q2, q3, split13: split13)
-        }
-        if !(t0 && t1 && t2 && t3) {
-            let ac = tri_count.add(i: 6, value: 6)
-            if ac + 6 <= cap_trans {
-                store_quad(mut cut_indices, ac, q0, q1, q2, q3, split13: split13)
-            }
+        match proven {
+            Some(local) => {
+                store_quad(mut indices, at, q0, q1, q2, q3, split13: split13, local: local)
+                return quad_cover(
+                    local,
+                    p0,
+                    p1,
+                    p2,
+                    p3,
+                    n0,
+                    n1,
+                    n2,
+                    n3,
+                    split13: split13,
+                    cell_lo: cell_lo,
+                    h: h,
+                    eye: exact_eye,
+                    reach: eye_reach,
+                )
+            },
+            None => {
+                store_nothing(mut indices, at, q0, count: 6)
+                refuse_unlocal(mut tri_count)
+                return QuadCover::Unsound
+            },
         }
     }
-    QUAD_INSIDE
+    match proven {
+        Some(local) => {
+            let at = tri_count.add(i: 1, value: 6)
+            if at + 6 <= cap_trans {
+                store_quad(mut trans_indices, at, q0, q1, q2, q3, split13: split13, local: local)
+            }
+            if !(t0 && t1 && t2 && t3) {
+                let ac = tri_count.add(i: 6, value: 6)
+                if ac + 6 <= cap_trans {
+                    store_quad(mut cut_indices, ac, q0, q1, q2, q3, split13: split13, local: local)
+                }
+            }
+            transmissive_cover(local)
+        },
+        None => {
+            refuse_unlocal(mut tri_count)
+            QuadCover::Unsound
+        },
+    }
+}
+
+/// Counts in `tri_count[13]` a quad or triangle refused for not being local (`LocalProof`), for
+/// `OVERFLOW_UNLOCAL`: an index gone astray, drawn as nothing, which the audit fails on.
+fn refuse_unlocal(tri_count: mut Atomics<u32>) {
+    let _ = tri_count.add(i: 13, value: 1)
 }
 
 /// Zeroes per-brick opaque index counts and scatter cursors for the current chunk.
@@ -486,9 +525,12 @@ pub(package) fn reset_dirty_bricks(
         let d = brick_draws[id]
         if d.indices > 0 {
             let v0 = indices.load(i: d.first_index)
-            for k in 1..min(d.indices, MOST_INDICES_PER_BRICK) {
-                indices.store(i: d.first_index + k, value: v0)
-            }
+            store_nothing(
+                mut indices,
+                d.first_index + 1,
+                v0,
+                count: min(d.indices, MOST_INDICES_PER_BRICK) - 1,
+            )
         }
         brick_draws[id] = DrawIndexedArgs {
             indices: 0,
@@ -553,7 +595,9 @@ pub(package) fn emit_tris(
                 cv(cell_verts, vbase, e.c2.x, e.c2.y, e.c2.z),
                 cv(cell_verts, vbase, e.c3.x, e.c3.y, e.c3.z),
             ]
-            let outline = emit_quad_brick(
+            let ab = active[bi]
+            let g = grids[ab.coord.w]
+            let cover = emit_quad_brick(
                 vs[0],
                 vs[1],
                 vs[2],
@@ -562,6 +606,8 @@ pub(package) fn emit_tris(
                 brick_in_chunk: brick_in_chunk,
                 exact_eye: exact_eye,
                 eye_reach: eye_reach,
+                cell_lo: brick_corner(g, ab.coord.xyz, min(min(e.c0, e.c1), min(e.c2, e.c3))),
+                h: g.cell,
                 verts: verts,
                 cap_indices: cap_indices,
                 cap_trans: cap_trans,
@@ -572,27 +618,91 @@ pub(package) fn emit_tris(
                 trans_indices: mut trans_indices,
                 cut_indices: mut cut_indices,
             )
-            if outline != QUAD_INSIDE {
-                let ab = active[bi]
-                let g = grids[ab.coord.w]
-                let cmin = min(min(e.c0, e.c1), min(e.c2, e.c3))
-                if !finer_than_a_hole(brick_corner(g, ab.coord.xyz, cmin), g.cell, exact_eye) {
-                    box_outline(
-                        [e.c0, e.c1, e.c2, e.c3],
-                        vs,
-                        outline,
-                        bi,
-                        g,
-                        ab.coord.xyz,
-                        ab.live,
-                        brick_in_chunk,
-                        mut exact_seen,
-                        mut exact_cells,
-                        mut cert_cands,
-                    )
-                }
-            }
+            cover_quad(
+                cover,
+                [e.c0, e.c1, e.c2, e.c3],
+                vs,
+                bi,
+                g,
+                ab.coord.xyz,
+                ab.live,
+                brick_in_chunk,
+                exact_eye,
+                mut exact_seen,
+                mut exact_cells,
+                mut cert_cands,
+            )
         }
+    }
+}
+
+/// Takes each case of a quad's cover (`QuadCover`) for its 4 cells `cs`: nothing more for one
+/// covered or not held; a certificate or an exact cell for one on the outline; an exact cell for
+/// one folded or not drawn (where there is an eye to solve it for).
+fn cover_quad(
+    cover: QuadCover,
+    cs: [vec3u; 4],
+    vs: [u32; 4],
+    active_at: u32,
+    g: GridSpec,
+    b: vec3u,
+    live: Live,
+    brick_in_chunk: u32,
+    exact_eye: vec4,
+    exact_seen: mut Atomics<u32>,
+    exact_cells: mut Append<ExactCell>,
+    cert_cands: mut Append<vec2u>,
+) {
+    match cover {
+        QuadCover::Covered(_) => {},
+        QuadCover::Unheld => {},
+        QuadCover::Outline => {
+            box_outline(
+                cs,
+                vs,
+                QUAD_OUTLINE,
+                active_at,
+                g,
+                b,
+                live,
+                brick_in_chunk,
+                mut exact_seen,
+                mut exact_cells,
+                mut cert_cands,
+            )
+        },
+        QuadCover::Folded => {
+            box_outline(
+                cs,
+                vs,
+                QUAD_FOLDED,
+                active_at,
+                g,
+                b,
+                live,
+                brick_in_chunk,
+                mut exact_seen,
+                mut exact_cells,
+                mut cert_cands,
+            )
+        },
+        QuadCover::Unsound => {
+            if exact_eye.w > 0.0 {
+                box_outline(
+                    cs,
+                    vs,
+                    QUAD_FOLDED,
+                    active_at,
+                    g,
+                    b,
+                    live,
+                    brick_in_chunk,
+                    mut exact_seen,
+                    mut exact_cells,
+                    mut cert_cands,
+                )
+            }
+        },
     }
 }
 
@@ -764,7 +874,8 @@ pub(package) fn dilate_outline(
 }
 
 /// Stores one single triangle `(a, b, c)` at `at`.
-fn store_tri(indices: mut Atomics<u32>, at: u32, a: u32, b: u32, c: u32) {
+fn store_tri(indices: mut Atomics<u32>, at: u32, a: u32, b: u32, c: u32, local: LocalProof) {
+    let _ = local
     indices.store(i: at, value: a)
     indices.store(i: at + 1, value: b)
     indices.store(i: at + 2, value: c)
@@ -775,6 +886,7 @@ fn emit_single_tri(
     a: u32,
     b: u32,
     c: u32,
+    span: f32,
     verts: [MeshVertex],
     cap_indices: u32,
     cap_trans: u32,
@@ -786,6 +898,14 @@ fn emit_single_tri(
     if a == b || b == c || c == a {
         return
     }
+    let p = |v: u32| vec3(verts[v].px, verts[v].py, verts[v].pz)
+    let local = match prove_tri_local(p(a), p(b), p(c), span) {
+        Some(proof) => proof,
+        None => {
+            refuse_unlocal(mut tri_count)
+            return
+        },
+    }
     let ta = unpack_is_trans(verts[a].packed)
     let tb = unpack_is_trans(verts[b].packed)
     let tc = unpack_is_trans(verts[c].packed)
@@ -795,16 +915,16 @@ fn emit_single_tri(
         if at + 3 > cap_indices {
             return
         }
-        store_tri(mut indices, at, a, b, c)
+        store_tri(mut indices, at, a, b, c, local: local)
     } else {
         let at = tri_count.add(i: 1, value: 3)
         if at + 3 <= cap_trans {
-            store_tri(mut trans_indices, at, a, b, c)
+            store_tri(mut trans_indices, at, a, b, c, local: local)
         }
         if !(ta && tb && tc) {
             let ac = tri_count.add(i: 6, value: 3)
             if ac + 3 <= cap_trans {
-                store_tri(mut cut_indices, ac, a, b, c)
+                store_tri(mut cut_indices, ac, a, b, c, local: local)
             }
         }
     }
@@ -848,6 +968,7 @@ fn emit_seam_quad(
     v2: u32,
     v3: u32,
     flip: bool,
+    span: f32,
     verts: [MeshVertex],
     cap_indices: u32,
     cap_trans: u32,
@@ -869,20 +990,27 @@ fn emit_seam_quad(
         let p = |v: u32| vec3(verts[v].px, verts[v].py, verts[v].pz)
         let n = |v: u32| unpack_oct_normal(verts[v].packed)
         let s13 = split_seam_13(p(q0), p(q1), p(q2), p(q3), n(q0), n(q1), n(q2), n(q3))
+        let local = match prove_quad_local(p(q0), p(q1), p(q2), p(q3), span) {
+            Some(proof) => proof,
+            None => {
+                refuse_unlocal(mut tri_count)
+                return
+            },
+        }
         if !is_trans {
             let at = tri_count.add(i: 0, value: 6)
             if at + 6 <= cap_indices {
-                store_quad(mut indices, at, q0, q1, q2, q3, split13: s13)
+                store_quad(mut indices, at, q0, q1, q2, q3, split13: s13, local: local)
             }
         } else {
             let at = tri_count.add(i: 1, value: 6)
             if at + 6 <= cap_trans {
-                store_quad(mut trans_indices, at, q0, q1, q2, q3, split13: s13)
+                store_quad(mut trans_indices, at, q0, q1, q2, q3, split13: s13, local: local)
             }
             if !(t0 && t1 && t2 && t3) {
                 let ac = tri_count.add(i: 6, value: 6)
                 if ac + 6 <= cap_trans {
-                    store_quad(mut cut_indices, ac, q0, q1, q2, q3, split13: s13)
+                    store_quad(mut cut_indices, ac, q0, q1, q2, q3, split13: s13, local: local)
                 }
             }
         }
@@ -893,6 +1021,7 @@ fn emit_seam_quad(
         q0,
         q1,
         q2,
+        span: span,
         verts: verts,
         cap_indices: cap_indices,
         cap_trans: cap_trans,
@@ -905,6 +1034,7 @@ fn emit_seam_quad(
         q0,
         q2,
         q3,
+        span: span,
         verts: verts,
         cap_indices: cap_indices,
         cap_trans: cap_trans,
@@ -1155,7 +1285,7 @@ fn process_lod_edge(
             cv(cell_verts, vbase, l2.x, l2.y, l2.z),
             cv(cell_verts, vbase, l3.x, l3.y, l3.z),
         ]
-        let outline = emit_quad_brick(
+        let cover = emit_quad_brick(
             vs[0],
             vs[1],
             vs[2],
@@ -1164,6 +1294,8 @@ fn process_lod_edge(
             brick_in_chunk: brick_in_chunk,
             exact_eye: exact_eye,
             eye_reach: eye_reach,
+            cell_lo: brick_corner(g, b, l0),
+            h: g.cell,
             verts: verts,
             cap_indices: cap_indices,
             cap_trans: cap_trans,
@@ -1174,27 +1306,29 @@ fn process_lod_edge(
             trans_indices: mut trans_indices,
             cut_indices: mut cut_indices,
         )
-        if outline != QUAD_INSIDE {
-            if !finer_than_a_hole(brick_corner(g, b, l0), g.cell, exact_eye) {
-                box_outline(
-                    [l0, l1, l2, l3],
-                    vs,
-                    outline,
-                    active_at,
-                    g,
-                    b,
-                    live,
-                    brick_in_chunk,
-                    mut exact_seen,
-                    mut exact_cells,
-                    mut cert_cands,
-                )
-            }
-        }
+        cover_quad(
+            cover,
+            [l0, l1, l2, l3],
+            vs,
+            active_at,
+            g,
+            b,
+            live,
+            brick_in_chunk,
+            exact_eye,
+            mut exact_seen,
+            mut exact_cells,
+            mut cert_cands,
+        )
         return
     }
     let qi = seam_quads.push(
-        SeamQuad { flags: if flip { 1 } else { 0 }, pad0: 0, pad1: 0, pad2: 0 },
+        SeamQuad {
+            flags: if flip { 1 } else { 0 },
+            pad0: 0,
+            span: 2.0 * QUAD_SPAN * g.cell,
+            pad2: 0,
+        },
     )
     if qi >= CAP_SEAM {
         return
@@ -1621,6 +1755,7 @@ pub(package) fn finish_seam_tris(
         seam_verts[base + 2],
         seam_verts[base + 3],
         flip: (sq.flags & 1) != 0,
+        span: sq.span,
         verts: verts,
         cap_indices: cap_indices,
         cap_trans: cap_trans,
@@ -1730,6 +1865,9 @@ pub(package) fn finish_draw(
     }
     if tri_count.load(i: 9) > 0 {
         ovf |= OVERFLOW_THIN
+    }
+    if tri_count.load(i: 13) > 0 {
+        ovf |= OVERFLOW_UNLOCAL
     }
     tri_count.store(i: 2, value: active_count[0])
     tri_count.store(i: 3, value: vert_count[0])
