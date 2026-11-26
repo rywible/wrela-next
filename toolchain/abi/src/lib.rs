@@ -165,6 +165,12 @@ pub const HOST_FUNCTIONS: [HostFunction; 13] = [
     HostFunction { name: IMPORT_PHASE, params: 2, results: 0 },
 ];
 
+/// The debug flag buffer's words each pipeline's tally takes in a counting build (`wrela build
+/// --tally`, `wrela_ir::tally`): the work its invocations did this frame, the invocations, and
+/// its subgroups' streams (what each subgroup ran, each stretch once for its lanes), each as its
+/// low word and the carries out of it.
+pub const TALLY_WORDS: u32 = 6;
+
 /// The export the host calls each frame.
 pub const EXPORT_FRAME: &str = "frame";
 /// The export a program with state has (language.md §15): the host calls it once, after

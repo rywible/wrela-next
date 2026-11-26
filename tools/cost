@@ -1,62 +1,234 @@
 #!/usr/bin/env python3
-"""What a frame's passes cost by the compiler's count, beside what they take. Usage:
+"""What a frame's passes cost by the compiler's counts, beside what they take. Usage:
 
-    tools/cost <build> [--tally <counting build>] [--size WxH] [--frame N] [--timeout S]
+    tools/cost <build> --tally <counting build> [--size WxH] [--frame N] [--timeout S]
                [--json FILE]
+    tools/cost --fit A.json B.json ... [--machine m4|radeon]
 
-The model (docs/plans/engine-at-build.md phase 4 step 5): a pass's cost is the sum over its
-commands of their work at the host's own arithmetic (`wrela-host`'s `step::ms_of`): a dispatch's
-kernel bound (the manifest's `work`) times its invocations, never fewer than the GPU's width,
-times the target's time a unit (`wrela_abi`'s `step_femtoseconds`); a draw of a covering
-triangle (`vertices 3 x 1`), its fragment entry point's bound times the screen's pixels (a draw
-of a mesh is not modelled yet: its fragments aren't known before it runs). An indirect dispatch
-is booked at its stated most, as the host books it.
+The model (docs/plans/engine-at-build.md phase 4 step 5): a pass costs what it did in the frame,
+counted, times this machine's time for each kind of thing done:
 
-With `--tally`, the same program built with `wrela build --tally` (every invocation adds up the
-work it does, as the compiler counts it, and the host prints each pipeline's sum a frame): a
-pass is priced by the work its pipelines did in that frame, times the target's time a unit, not
-by their bounds. A pipeline that runs in several passes has its sum shared among them as their
-bounds times invocations are.
+  - compute work: the work its dispatches' invocations did (a counting build, `wrela build
+    --tally`, has each invocation add up the work it does as the compiler counts it), and their
+    subgroups' streams: what each subgroup ran, each stretch once for its lanes, as many times
+    as any of them ran it (where lanes diverge, one marching far while the rest are done or each
+    taking another branch, that's what the pass costs, not its lanes' sum);
+  - fragment work, stream and fragments: the same of its draws' fragment shaders, and how many
+    invocations they had (a fragment's own cost: the raster, the targets' writes);
+  - vertices: how many its draws drew (an indexed draw's indices), times their instances: a
+    direct draw's from its command, an indirect draw's read back from its arguments;
+  - commands: each dispatch and draw's own cost, however little it does.
 
-The measure: the same run with `--timestamps --serial` (each pass and dispatch alone, timed by
-its own stamps), frame N (after its warm-up), each label's commands summed. A command the model
-doesn't price is left out of both sums and counted. Bounds are maxima, so the model is an upper
-bound before it is an estimate: the table says by how much, label by label, which is what the
-next step of the model works from.
+So a pass's model is `units . (those seven counts)`, and
+a frame's is its passes' sum. The units are this machine's, in tools/cost.json, fitted (`--fit`)
+by least squares, none negative, to the passes of the scenes given (each a `--json` of a run):
+fitted on some scenes, the model is held to the others. A pipeline that runs in several passes
+has its counts shared among them as its commands' bounds times invocations are (a draw's, as its
+vertices are).
+
+The measure: the build (not counting: a counting build is slower) run with `--timestamps
+--serial` (each pass and dispatch alone, timed by its own stamps), frame N after its warm-up,
+each label's commands summed; and the frame's span, the gate's for this machine
+(tools/gate.json), which is what the model is held to: within 20%.
 
 Runs through tools/gpu (the guard, the lock, the timeout)."""
 
 import json
 import os
+import platform
 import re
 import subprocess
 import sys
+from itertools import combinations
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 GPU = os.path.join(ROOT, "tools", "gpu")
+UNITS = os.path.join(ROOT, "tools", "cost.json")
+GATE = os.path.join(ROOT, "tools", "gate.json")
 
-# The host's arithmetic (toolchain/abi/src/lib.rs `TargetLimits`): both targets alike today.
-UNIT_FS = 2500
-WIDTH = 8192
+FEATURES = ["compute_work", "compute_stream", "fragment_work", "fragment_stream", "fragments",
+            "vertices", "commands"]
 
-TALLY = re.compile(r"^tally frame (\d+) (\S+) (\d+)$")
+TALLY = re.compile(r"^tally frame (\d+) (\S+) (\d+) (\d+) (\d+)$")
+DRAWN = re.compile(r"^drawn frame (\d+) (\S+) (\S+) (\d+) (\d+)$")
 STEP = re.compile(r"^step frame (\d+) (dispatch|draw) (\S+) \| (\S+) \| (.*)$")
 TIMED = re.compile(r"^frame\s+(\d+)\s+(\S+)\s+([\d.]+) us$")
 
 
-def ms_of(work, invocations):
-    return work * max(invocations, WIDTH) * UNIT_FS * 1e-12
+def machine():
+    return "m4" if platform.system() == "Darwin" else "radeon"
+
+
+def run(build, size, frames, timeout, extra):
+    cmd = [GPU, "--timeout", str(timeout), build, "--size", size, "--frames", str(frames)] + extra
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    if p.returncode != 0:
+        sys.stderr.write(p.stdout[-2000:])
+        sys.exit(1)
+    return p.stdout.splitlines()
+
+
+def counts(lines, frame):
+    """Each label's counts in `frame` of a counting run."""
+    did = {}  # pipeline -> (work, invocations)
+    kind = {}  # pipeline -> dispatch or draw
+    weight = {}  # pipeline -> {label: weight}
+    verts = {}  # label -> vertices drawn
+    cmds = {}  # label -> commands
+    order = []
+    drawn = {}  # (label, pipeline) -> vertices of its indirect draws
+    for line in lines:
+        m = TALLY.match(line)
+        if m and int(m.group(1)) == frame:
+            w, n, st = did.get(m.group(2), (0, 0, 0))
+            did[m.group(2)] = (w + int(m.group(3)), n + int(m.group(4)), st + int(m.group(5)))
+            continue
+        m = DRAWN.match(line)
+        if m and int(m.group(1)) == frame:
+            v = int(m.group(4)) * int(m.group(5))
+            key = (m.group(2), m.group(3))
+            drawn[key] = drawn.get(key, 0) + v
+            verts[m.group(2)] = verts.get(m.group(2), 0) + v
+            continue
+        m = STEP.match(line)
+        if m and int(m.group(1)) == frame:
+            k, label, name, rest = m.group(2), m.group(3), m.group(4), m.group(5)
+            if label not in order:
+                order.append(label)
+            kind[name] = k
+            cmds[label] = cmds.get(label, 0) + 1
+            wgt = 1
+            if k == "dispatch":
+                inv = re.search(r"invocations (\d+)", rest)
+                bound = re.search(r"bound (\d+)", rest)
+                if inv and bound:
+                    wgt = max(int(inv.group(1)) * int(bound.group(1)), 1)
+            else:
+                d = re.search(r"vertices (\d+) x (\d+)", rest)
+                if d:
+                    v = int(d.group(1)) * int(d.group(2))
+                    verts[label] = verts.get(label, 0) + v
+                    wgt = max(v, 1)
+            weight.setdefault(name, {})
+            weight[name][label] = weight[name].get(label, 0) + wgt
+    # An indirect draw's weight is its vertices, read back.
+    for (label, name), v in drawn.items():
+        if name in weight and label in weight[name]:
+            weight[name][label] += v
+    rows = {label: dict.fromkeys(FEATURES, 0.0) for label in order}
+    for label in order:
+        rows[label]["vertices"] = float(verts.get(label, 0))
+        rows[label]["commands"] = float(cmds.get(label, 0))
+    for name, (work, n, stream) in did.items():
+        labels = weight.get(name)
+        if not labels:
+            continue
+        total = sum(labels.values())
+        for label, wgt in labels.items():
+            share = wgt / total
+            if kind.get(name) == "dispatch":
+                rows[label]["compute_work"] += work * share
+                rows[label]["compute_stream"] += stream * share
+            else:
+                rows[label]["fragment_work"] += work * share
+                rows[label]["fragment_stream"] += stream * share
+                rows[label]["fragments"] += n * share
+    return order, rows
+
+
+def measured(lines, frame):
+    out = {}
+    for line in lines:
+        m = TIMED.match(line)
+        if m and int(m.group(1)) == frame:
+            out[m.group(2)] = out.get(m.group(2), 0.0) + float(m.group(3)) / 1000.0
+    return out
+
+
+def solve(a, b):
+    """Least squares `a x = b` by the normal equations (a few unknowns); None if singular."""
+    n = len(a[0])
+    m = [[sum(r[i] * r[j] for r in a) for j in range(n)] + [sum(r[i] * y for r, y in zip(a, b))]
+         for i in range(n)]
+    for c in range(n):
+        p = max(range(c, n), key=lambda r: abs(m[r][c]))
+        if abs(m[p][c]) < 1e-30:
+            return None
+        m[c], m[p] = m[p], m[c]
+        for r in range(n):
+            if r != c:
+                f = m[r][c] / m[c][c]
+                m[r] = [x - f * y for x, y in zip(m[r], m[c])]
+    return [m[i][n] / m[i][i] for i in range(n)]
+
+
+def fit(rows):
+    """Units, none negative, that fit each pass's time best (least squares, each pass's error
+    relative to its time and a floor of 50 us, so a long pass and a short one count alike):
+    every subset of the features solved, the best that has no negative unit kept."""
+    scale = [max(max(r[0][f] for r in rows), 1e-30) for f in FEATURES]
+    best = None
+    for k in range(1, len(FEATURES) + 1):
+        for keep in combinations(range(len(FEATURES)), k):
+            a, b = [], []
+            for x, t in rows:
+                w = 1.0 / max(t, 0.05)
+                a.append([x[FEATURES[i]] / scale[i] * w for i in keep])
+                b.append(t * w)
+            u = solve(a, b)
+            if u is None or any(v < 0 for v in u):
+                continue
+            err = sum((sum(ai * ui for ai, ui in zip(r, u)) - y) ** 2 for r, y in zip(a, b))
+            if best is None or err < best[0]:
+                full = [0.0] * len(FEATURES)
+                for i, v in zip(keep, u):
+                    full[i] = v / scale[i]
+                best = (err, full)
+    return dict(zip(FEATURES, best[1]))
+
+
+def price(units, x):
+    return sum(units.get(f, 0.0) * x[f] for f in FEATURES)
+
+
+def gate_span(scene):
+    try:
+        with open(GATE) as f:
+            return json.load(f)[machine()]["frames"].get(str(scene))
+    except (OSError, KeyError, ValueError):
+        return None
 
 
 def main(argv):
     if not argv or argv[0] in ("-h", "--help"):
         print(__doc__)
         return 0 if argv else 2
-    build, size, frame, timeout, js, tally = argv[0], "1920x1080", 40, 600, None, None
+    if argv[0] == "--fit":
+        files = [a for a in argv[1:] if not a.startswith("--")]
+        rows = []
+        for path in files:
+            with open(path) as f:
+                d = json.load(f)
+            rows += [(r["counts"], r["measured_ms"]) for r in d["rows"] if r["measured_ms"] > 0]
+        units = fit(rows)
+        try:
+            with open(UNITS) as f:
+                table = json.load(f)
+        except OSError:
+            table = {}
+        table[machine()] = {"units_ms": units, "fitted_on": [os.path.basename(p) for p in files]}
+        with open(UNITS, "w") as f:
+            json.dump(table, f, indent=1)
+            f.write("\n")
+        print(f"cost: {machine()}'s units, fitted on {len(rows)} passes:")
+        for k, v in units.items():
+            print(f"  {k:<14} {v:.4g} ms each")
+        return 0
+    build, size, frame, timeout, js, tally, scene = argv[0], "1920x1080", 40, 600, None, None, None
     i = 1
     while i < len(argv):
         a = argv[i]
-        if a in ("--size", "--frame", "--timeout", "--json", "--tally") and i + 1 < len(argv):
+        if a in ("--size", "--frame", "--timeout", "--json", "--tally", "--scene") and i + 1 < len(argv):
             v = argv[i + 1]
             if a == "--tally":
                 tally = v
@@ -66,103 +238,55 @@ def main(argv):
                 frame = int(v)
             elif a == "--timeout":
                 timeout = int(v)
+            elif a == "--scene":
+                scene = v
             else:
                 js = v
             i += 2
             continue
         print(f"cost: unknown option {a}", file=sys.stderr)
         return 2
-    w, h = (int(x) for x in size.split("x"))
-    with open(os.path.join(build, "manifest.json")) as f:
-        manifest = json.load(f)
-    work = {p["name"]: p.get("work") or [] for p in manifest["pipelines"]}
-    cmd = [GPU, "--timeout", str(timeout), build, "--size", size, "--frames", str(frame + 1),
-           "--timestamps", "--serial", "--steps"]
-    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    if p.returncode != 0:
-        print(p.stdout[-2000:], file=sys.stderr)
-        return 1
-    model, measured, unpriced, order = {}, {}, {}, []
-    priced = []  # per command of the frame, in order: whether the model priced it
-    for line in p.stdout.splitlines():
-        m = STEP.match(line)
-        if m and int(m.group(1)) == frame:
-            kind, label, name, rest = m.group(2), m.group(3), m.group(4), m.group(5)
-            if label not in order:
-                order.append(label)
-            cost = None
-            if kind == "dispatch":
-                inv = re.search(r"invocations (\d+)", rest)
-                bound = re.search(r"bound (\d+)", rest)
-                if inv and bound:
-                    cost = ms_of(int(bound.group(1)), int(inv.group(1)))
-            elif "vertices 3 x 1" in rest:
-                ws = work.get(name, [])
-                if len(ws) == 2 and ws[1] is not None:
-                    cost = ms_of(ws[1], w * h)
-            if cost is None:
-                unpriced[label] = unpriced.get(label, 0) + 1
-            else:
-                model[label] = model.get(label, 0.0) + cost
-            priced.append((label, cost is not None, kind))
-    # A counting build's work a pipeline this frame, shared among its labels by their bounds.
-    if tally:
-        tp = subprocess.run([GPU, "--timeout", str(timeout), tally, "--size", size, "--frames",
-                             str(frame + 1), "--steps"],
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        if tp.returncode != 0:
-            print(tp.stdout[-2000:], file=sys.stderr)
-            return 1
-        did = {}
-        share = {}  # pipeline -> {label: bound weight}
-        for line in tp.stdout.splitlines():
-            m = TALLY.match(line)
-            if m and int(m.group(1)) == frame:
-                did[m.group(2)] = did.get(m.group(2), 0) + int(m.group(3))
-            m = STEP.match(line)
-            if m and int(m.group(1)) == frame:
-                label, name, rest = m.group(3), m.group(4), m.group(5)
-                inv = re.search(r"invocations (\d+)", rest)
-                bound = re.search(r"bound (\d+)", rest)
-                weight = int(inv.group(1)) * int(bound.group(1)) if inv and bound else 1
-                share.setdefault(name, {})
-                share[name][label] = share[name].get(label, 0) + max(weight, 1)
-        model, unpriced = {}, {}
-        for name, work in did.items():
-            labels = share.get(name)
-            if not labels:
-                unpriced["(no label)"] = unpriced.get("(no label)", 0) + 1
-                continue
-            total = sum(labels.values())
-            for label, wgt in labels.items():
-                model[label] = model.get(label, 0.0) + work * wgt / total * UNIT_FS * 1e-12
-        for label in model:
-            if label not in order:
-                order.append(label)
-    # The serial run times each pass (a draw's pass, once) and each dispatch alone, in order.
-    times = [(m.group(2), float(m.group(3)) / 1000.0) for line in p.stdout.splitlines()
-             if (m := TIMED.match(line)) and int(m.group(1)) == frame]
-    for label, ms in times:
-        measured[label] = measured.get(label, 0.0) + ms
-    rows = []
+    if tally is None:
+        print("cost: a counting build (`--tally`) is needed", file=sys.stderr)
+        return 2
+    if scene is None:
+        try:
+            with open(os.path.join(build, "manifest.json")) as f:
+                scene = json.load(f).get("set", {}).get("SCENE")
+        except (OSError, ValueError):
+            scene = None
+    order, rows = counts(run(tally, size, frame + 1, timeout, ["--steps"]), frame)
+    times = measured(run(build, size, frame + 1, timeout, ["--timestamps", "--serial"]), frame)
+    for label in times:
+        if label not in rows:
+            order.append(label)
+            rows[label] = dict.fromkeys(FEATURES, 0.0)
+    try:
+        with open(UNITS) as f:
+            units = json.load(f)[machine()]["units_ms"]
+    except (OSError, KeyError, ValueError):
+        units = None
+    out = []
     tot_m = tot_t = 0.0
+    print(f"cost of frame {frame} at {size} ({build}), {machine()}: the model against the serial run")
+    print(f"  {'pass':<22} {'model ms':>10} {'measured':>10} {'model/measured':>15}")
     for label in order:
-        mo, me = model.get(label, 0.0), measured.get(label, 0.0)
-        rows.append({"label": label, "model_ms": round(mo, 3), "measured_ms": round(me, 3),
-                     "unpriced": unpriced.get(label, 0)})
-        if mo > 0:
-            tot_m += mo
-            tot_t += me
-    print(f"cost of frame {frame} at {size} ({build}): the model against the serial run")
-    print(f"  {'pass':<22} {'model ms':>10} {'measured':>10} {'model/measured':>15}  unpriced")
-    for r in rows:
-        ratio = f"{r['model_ms'] / r['measured_ms']:.1f}x" if r["measured_ms"] > 0 and r["model_ms"] > 0 else "-"
-        print(f"  {r['label']:<22} {r['model_ms']:>10.3f} {r['measured_ms']:>10.3f} {ratio:>15}  {r['unpriced'] or ''}")
-    print(f"  {'priced passes':<22} {tot_m:>10.3f} {tot_t:>10.3f} {(tot_m / tot_t if tot_t else 0):>14.1f}x")
+        me = times.get(label, 0.0)
+        mo = price(units, rows[label]) if units else 0.0
+        tot_m += mo
+        tot_t += me
+        ratio = f"{mo / me:.2f}x" if me > 0 and mo > 0 else "-"
+        print(f"  {label:<22} {mo:>10.3f} {me:>10.3f} {ratio:>15}")
+        out.append({"label": label, "counts": rows[label], "model_ms": mo, "measured_ms": me})
+    span = gate_span(scene) if scene is not None else None
+    print(f"  {'frame':<22} {tot_m:>10.3f} {tot_t:>10.3f} {(tot_m / tot_t if tot_t else 0):>14.2f}x")
+    if span:
+        print(f"  the gate's span of SCENE {scene}: {span:.2f} ms; the model's frame is "
+              f"{100.0 * (tot_m / span - 1.0):+.1f}% of it")
     if js:
         with open(js, "w") as f:
-            json.dump({"frame": frame, "size": size, "rows": rows,
-                       "model_ms": tot_m, "measured_ms": tot_t}, f, indent=1)
+            json.dump({"frame": frame, "size": size, "scene": scene, "rows": out,
+                       "model_ms": tot_m, "measured_ms": tot_t, "span_ms": span}, f, indent=1)
     return 0
 
 

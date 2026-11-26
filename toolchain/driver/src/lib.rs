@@ -299,8 +299,11 @@ pub struct BuildFor {
     /// for shipping or timing (the M4's crowd 4.3% slower). Off unless asked for.
     pub exact: bool,
     /// A counting build (`wrela build --tally`): each pipeline's invocations add up the work
-    /// they do, which the host prints each frame (`tally frame N <pipeline> <work>`): what a
-    /// pass does in a usual frame, for `tools/cost`. Not for timing or shipping.
+    /// they do and count themselves, which the host prints each frame (`tally frame N <pipeline>
+    /// <work> <invocations> <stream>`, the last what its subgroups ran, each stretch once for
+    /// its lanes, and each indirect draw's vertices and instances, `drawn frame N
+    /// <label> <pipeline> <vertices> <instances>`): what a pass does in a usual frame, for
+    /// `tools/cost`. Not for timing or shipping.
     pub tally: bool,
 }
 

@@ -776,9 +776,24 @@ pass does in a usual frame: `wrela build --tally` makes every invocation add up 
 times); the dispatched passes within 0.3 to 2.5 times (extraction 1.6, the certificates 0.6, the
 sun's exact rays 0.9), the full-screen fragment passes 4 to 9 times over (direct light 6.0, the
 refraction 8.6, the tone 5.8): the time a unit was measured on a dependent chain of sines, and a
-fragment's work runs its independent operations side by side. Next: a unit for fragment work,
-measured as the compute unit is, and the mesh draws' rasterising. The target is 20% of each
-gate scene's span, on the two machines. Step 2's scene types are done: whether a scene has a swarm, a heightfield (opaque,
+fragment's work runs its independent operations side by side. Then the model became counts times
+units: a counting build also counts each pipeline's invocations and its subgroups' streams (what
+each subgroup ran, each stretch once for its lanes: a pass whose lanes diverge costs that, not
+its lanes' sum), and its run reads back each indirect draw's vertices and instances; `tools/cost`
+prices a pass as units times (compute work, compute stream, fragment work, fragment stream,
+fragments, vertices, commands), the units this machine's, fitted (`--fit`, least squares, none
+negative) on some scenes and held to the others' gate spans. M4, frame 40 at 1080p, fitted on
+all four: SCENE 10 -0.9%, 11 -15.0%, 13 -52.9%, 14 -56.2%; fitted on SCENE 10 alone, 10 -3.2%,
+11 -15.1%. What it can't price is SCENE 13's and 14's exact pass: SCENE 14's candlestick's exact
+cells (2,873 boxes, 525,603 fragments, a stream of 4.1e6 at about 190 work a fragment, so about
+0.1 ms of arithmetic) take 10.3 ms of its 22, while the table's (25,223 fragments, a stream
+eleven times its lanes' sum) take 0.19. Not the code after a discard (a fragment shader that
+returns right after it is slower, 15.8 ms: the M4 doesn't run a discarded fragment on), nor the
+arithmetic the counts see: the draw writes depth (a `WithDepthBehind`) and discards, over boxes
+many deep, so its fragments wait on each other at each pixel. That is phase 5's largest item
+(it is most of the proof debt counted below), and the model's next term: what a draw whose
+fragments write depth and may discard costs a fragment, which these counts can't see. The
+target is 20% of each gate scene's span, on the two machines. Step 2's scene types are done: whether a scene has a swarm, a heightfield (opaque,
 transmissive) or a medium, whether its look blooms and how many batches its world draws are
 constants of their types, so SCENE 14 (no swarm, a look without bloom) has 159 pipelines where it
 had 165. Step 2 has its first decision: whether a kind can be

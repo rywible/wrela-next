@@ -1010,11 +1010,12 @@ struct DebugFlag {
     /// done, so no frame waits for the GPU to read it.
     ring: wrela_gpu::Buffer,
     next: u64,
-    /// The copy recorded in the frame being submitted: its slot.
-    queued: Option<u64>,
-    /// The copies submitted and not yet read: the submission that holds each, its slot and its
-    /// frame.
-    pending: std::collections::VecDeque<(wrela_gpu::SubmissionIndex, u64, usize)>,
+    /// The copy recorded in the frame being submitted: its slot, and the draws whose arguments
+    /// it holds.
+    queued: Option<(u64, Vec<Drawn>)>,
+    /// The copies submitted and not yet read: the submission that holds each, its slot, its
+    /// frame and the draws whose arguments it holds.
+    pending: std::collections::VecDeque<(wrela_gpu::SubmissionIndex, u64, usize, Vec<Drawn>)>,
     /// The name each pipeline's last pass or dispatch had (a fault names it).
     labels: HashMap<u32, Arc<str>>,
     /// The buffer's words: 1, the flag; in a counting build, then each pipeline's tally
@@ -1022,7 +1023,22 @@ struct DebugFlag {
     /// from `zeros`, so each frame's copy holds its own.
     words: u64,
     zeros: Option<wrela_gpu::Buffer>,
+    /// The words of the flag and the tallies: in a counting build, the rest of the buffer
+    /// holds, after them, the arguments of each indirect draw of the frame
+    /// ([`DRAWN_WORDS`] each, at most [`DRAWN_MOST`]), copied after its pass.
+    tally: u64,
+    /// This frame's indirect draws whose arguments are copied, in order.
+    drawn: Vec<Drawn>,
 }
+
+/// An indirect draw whose arguments a counting run reads back: its pipeline, its pass's label
+/// and whether it's indexed (five words of arguments, else four).
+type Drawn = (u32, Arc<str>, bool);
+
+/// The most indirect draws a frame of a counting run reads the arguments of, and the words each
+/// takes (an indexed draw's five).
+const DRAWN_MOST: u64 = 4096;
+const DRAWN_WORDS: u64 = 5;
 
 /// How many frames' copies of the flag are kept ([`DebugFlag::ring`]): more than are ever in
 /// flight.
@@ -1267,7 +1283,8 @@ impl Gpu {
     /// and WGSL are the same.
     fn take_pipelines(&mut self, manifest: &Manifest, shaders: &[Vec<u8>]) -> Result<()> {
         if self.debug_flag.is_none() && manifest.pipelines.iter().any(|p| p.debug_flag.is_some()) {
-            let words = u64::from(manifest.tally_words.max(1));
+            let tally = u64::from(manifest.tally_words.max(1));
+            let words = if tally > 1 { tally + DRAWN_MOST * DRAWN_WORDS } else { tally };
             self.debug_flag = Some(DebugFlag {
                 buffer: self.device.create_buffer(&wrela_gpu::BufferDesc {
                     label: "debug flag",
@@ -1287,6 +1304,8 @@ impl Gpu {
                         mappable: false,
                     })
                 }),
+                tally,
+                drawn: Vec::new(),
             });
         }
         let old_keys = std::mem::take(&mut self.pipeline_keys);
@@ -3293,6 +3312,42 @@ impl Gpu {
             }
         }
         drop(rp);
+        // A counting run's indirect draws: each one's arguments copied, after its pass, into the
+        // flag's buffer, read back with the tallies (`drawn frame` lines): how many vertices and
+        // instances each drew, which tools/cost prices.
+        let copies: Vec<(u32, u32, u64, u64)> = match &mut self.debug_flag {
+            Some(f) if f.words > f.tally => {
+                let mut out = Vec::new();
+                for item in &items {
+                    let PassItem::Draw(d) = item else { continue };
+                    let (buffer, offset, indexed) = match d.how {
+                        DrawHow::Indirect { buffer, offset } => (buffer, offset, false),
+                        DrawHow::IndexedIndirect { buffer, offset, .. } => (buffer, offset, true),
+                        _ => continue,
+                    };
+                    let slot = f.drawn.len() as u64;
+                    if slot >= DRAWN_MOST {
+                        break;
+                    }
+                    f.drawn.push((d.pipeline, Arc::from(label), indexed));
+                    let bytes = if indexed { 20 } else { 16 };
+                    out.push((buffer, offset, bytes, 4 * (f.tally + DRAWN_WORDS * slot)));
+                }
+                out
+            }
+            _ => Vec::new(),
+        };
+        if let Some(f) = &self.debug_flag {
+            for (buffer, offset, bytes, at) in copies {
+                encoder.copy_buffer_to_buffer(
+                    self.buffer(buffer),
+                    u64::from(offset),
+                    &f.buffer,
+                    at,
+                    bytes,
+                );
+            }
+        }
         self.counters.add(&counters);
         self.encoder = Some(encoder);
         Ok(())
@@ -3490,7 +3545,7 @@ impl Gpu {
             if let Some(z) = &f.zeros {
                 encoder.copy_buffer_to_buffer(z, 0, &f.buffer, 4, bytes - 4);
             }
-            f.queued = Some(slot);
+            f.queued = Some((slot, std::mem::take(&mut f.drawn)));
         }
     }
 
@@ -3498,9 +3553,9 @@ impl Gpu {
     fn flag_submitted(&mut self) {
         let (frame, last) = (self.frame, self.device.submitted());
         if let Some(f) = &mut self.debug_flag
-            && let Some(slot) = f.queued.take()
+            && let Some((slot, drawn)) = f.queued.take()
         {
-            f.pending.push_back((last, slot, frame));
+            f.pending.push_back((last, slot, frame, drawn));
         }
     }
 
@@ -3525,11 +3580,11 @@ impl Gpu {
         let done = self.device.completed();
         let Some(f) = &mut self.debug_flag else { return Ok(()) };
         let mut found = None;
-        while let Some(&(at, slot, frame)) = f.pending.front() {
+        while let Some(&(at, slot, frame, _)) = f.pending.front() {
             if at > done {
                 break;
             }
-            f.pending.pop_front();
+            let Some((_, _, _, drawn)) = f.pending.pop_front() else { break };
             let b = f.ring.read(slot * 4 * f.words, 4 * f.words).map_err(|e| Error::Gpu(e.0))?;
             let code = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
             // A counting build's tallies: each pipeline's work this frame, its low word and the
@@ -3543,15 +3598,24 @@ impl Gpu {
                         b[4 * i + 3],
                     ]))
                 };
+                let per = wrela_abi::TALLY_WORDS as usize;
                 for (k, p) in self.pipelines.iter().enumerate() {
-                    let lo = 1 + 2 * k;
-                    if lo + 1 >= f.words as usize {
+                    let lo = 1 + per * k;
+                    if lo + per > f.tally as usize {
                         break;
                     }
                     let work = (word(lo + 1) << 32) | word(lo);
-                    if work > 0 {
-                        eprintln!("tally frame {frame} {} {work}", p.name);
+                    let invocations = (word(lo + 3) << 32) | word(lo + 2);
+                    let stream = (word(lo + 5) << 32) | word(lo + 4);
+                    if work > 0 || invocations > 0 {
+                        eprintln!("tally frame {frame} {} {work} {invocations} {stream}", p.name);
                     }
+                }
+                // Each indirect draw's vertices (an indexed draw's indices) and instances.
+                for (k, (pipeline, label, _)) in drawn.iter().enumerate() {
+                    let at = f.tally as usize + DRAWN_WORDS as usize * k;
+                    let name = self.pipelines.get(*pipeline as usize).map_or("?", |p| &p.name);
+                    eprintln!("drawn frame {frame} {label} {name} {} {}", word(at), word(at + 1));
                 }
             }
             if code != 0 && found.is_none() {
