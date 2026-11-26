@@ -1,0 +1,135 @@
+// The strict corner kernel held to the CPU's bits (docs/plans/engine-at-build.md phase 1 step 10):
+// the GPU runs `eval_corners` (a `@strict` kernel) over bricks spread through a kind's bound,
+// every part of the field live, and the CPU computes each corner from the same inputs by the same
+// code (`brick_corner`, `distance_live`). The results' hashes are said, and a corner whose bits
+// differ stops the run, naming the kind, the corner and both values: a mesh the GPU made would not
+// be the one the build (or a cook) makes. The hole audit asks it of each kind it audits.
+
+use matter::substance::Substance
+use mesh::dc::eval_corners
+use mesh::grid::{ActiveBrick, CORNERS_BRICK, GridSpec, brick_corner, brick_of, grid_for}
+use std::collections::Vec
+use std::derive::Box3
+use std::field::{Field, Live}
+use std::gpu::{GpuBuffer, buffer, buffer_of, dispatch, label, read}
+use std::hash::{Hasher, StateHash}
+use std::io::{Pending, print}
+
+/// The bricks a kind's corners are compared at: 64 of 512 corners, spread through its bound.
+pub const BITS_BRICKS: u32 = 64
+
+/// The cells a kind's bound is cut into along its diameter for the comparison.
+const BITS_CELLS: f32 = 48.0
+
+/// A comparison under way: the grid and bricks the GPU was given, and its corners asked for.
+pub struct CornerBits {
+    grid: GridSpec,
+    bricks: Vec<ActiveBrick>,
+    back: Pending<f32>,
+}
+
+/// Dispatches the strict corner kernel for `field` over `BITS_BRICKS` bricks of a grid of its
+/// bound; its corners are read back and held to the CPU's on a later call (`CornerBits::held`).
+pub fn corner_bits<M: Field<Substance> + GpuData>(field: M) -> CornerBits {
+    let b = field.bound()
+    let r = min(b.radius, 1.0e4)
+    let cell = 2.0 * r / BITS_CELLS
+    let g = grid_for(
+        Box3 { lo: b.centre - vec3(r), hi: b.centre + vec3(r) },
+        cell: cell,
+        base_brick: 0,
+        orig_id: 0,
+        shift: vec3(0.0),
+    )
+    let total = g.dims.x * g.dims.y * g.dims.z
+    let n = min(total, BITS_BRICKS)
+    var bricks = Vec::new()
+    for k in 0..n {
+        // Spread through the grid's bricks, not its first corner.
+        let local = u32(u64(k) * u64(total) / u64(n))
+        let c = brick_of(g, local)
+        bricks.push(ActiveBrick { coord: vec4u(c.x, c.y, c.z, 0), live: Live::from_word(4294967295) })
+    }
+    var corners: GpuBuffer<f32> = buffer(n * CORNERS_BRICK)
+    let fields = buffer_of([field])
+    let grids = buffer_of([g])
+    let active = buffer_of(bricks.clone())
+    let count = buffer_of([n])
+    label("judge_bits")
+    dispatch(
+        eval_corners.bind(
+            fields: fields.items(),
+            grids: grids.items(),
+            active: active.items(),
+            active_count: count.items(),
+            cap_bricks: n,
+            chunk_start: 0,
+            corners: corners.span_mut(start: 0, count: n * CORNERS_BRICK),
+        ),
+        over: n * CORNERS_BRICK,
+    )
+    CornerBits { grid: g, bricks, back: read(corners.span(start: 0, count: n * CORNERS_BRICK)) }
+}
+
+/// Whether the GPU's `got` is the CPU's `want`: the same bits, both NaN, or `want` a subnormal the
+/// GPU flushed to a zero of its sign (every GPU's strict model, language.md §11.3).
+fn same_bits(got: f32, want: f32) -> bool {
+    let g = bitcast_u32(got)
+    let w = bitcast_u32(want)
+    if g == w || (got != got && want != want) {
+        return true
+    }
+    (w & 0x7f800000) == 0 && g == (w & 0x80000000)
+}
+
+impl CornerBits {
+    /// Once the GPU's corners are in: each held to the CPU's for `field` (named `what`), the
+    /// hash of the CPU's said, and the run stopped at the first corner whose bits differ. False
+    /// until they arrive.
+    pub fn held<M: Field<Substance>>(mut self, field: M, what: str) -> bool {
+        match self.back.poll() {
+            Some(Ok(got)) => {
+                var h = Hasher::new()
+                var differ: u32 = 0
+                var first = 0
+                var first_p = vec3(0.0)
+                var first_got = 0.0
+                var first_want = 0.0
+                let n = min(self.bricks.len(), got.len() / CORNERS_BRICK)
+                for k in 0..n {
+                    let b = self.bricks[k]
+                    for ci in 0..CORNERS_BRICK {
+                        let p = brick_corner(
+                            self.grid,
+                            b.coord.xyz,
+                            vec3u(ci & 7, (ci >> 3) & 7, ci >> 6),
+                        )
+                        let want = field.distance_live(p, b.live)
+                        bitcast_u32(want).state_hash(mut h)
+                        let at = k * CORNERS_BRICK + ci
+                        if !same_bits(got[at], want) {
+                            if differ == 0 {
+                                first = at
+                                first_p = p
+                                first_got = got[at]
+                                first_want = want
+                            }
+                            differ += 1
+                        }
+                    }
+                }
+                if differ > 0 {
+                    panic(
+                        f"judge bits: {what}: {differ} of {n * CORNERS_BRICK} strict corners differ from the CPU's, the first {first} at {first_p}: the GPU's {first_got}, the CPU's {first_want}",
+                    )
+                }
+                print(f"judge bits: {what}: {n * CORNERS_BRICK} strict corners the CPU's bits, hash {h.finish()}")
+                true
+            },
+            Some(Err(_)) => {
+                panic(f"judge bits: {what}: the GPU's strict corners couldn't be read back")
+            },
+            None => false,
+        }
+    }
+}

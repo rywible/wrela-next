@@ -366,9 +366,17 @@ use by another project; they are to be run with the rest of the plan's Radeon wo
 
 ## 9. Phase 1: strict math in the geometry kernels
 
-State (2026-11-26): steps 1 to 9, 11 and 12 are done and measured on the M4; step 10 is done for
-std's strict functions (toolchain/tests/strict_bits) and open for the engine's kernels; the Radeon
-is not measured. Step 11 is `std::strict`: a strict kernel computes std's strict functions, a
+State (2026-11-26): steps 1 to 12 are done and measured on the M4; the Radeon is not measured.
+Step 10 for the engine's kernels is `judge::bits`: the hole audit, for each thing it audits, runs
+the strict corner kernel (`eval_corners`) over 64 bricks spread through the thing's bound, every
+part live, and computes each of the 32,768 corners on the CPU from the same inputs; it says the
+hash, and a corner a bit off stops the run, naming it and both values (so the gate's audit
+fails). Its first run found one: the CSG-cut column, 10 corners an ulp off. `smax` was
+`-smin(-a, -b, k)`, and the M4's shader compiler folds those negations into a sum and fuses it
+into one rounding in a strict kernel, `fp contract(off)` or not (a probe: 6,192 of 262,144;
+`smin` itself, and a sum or difference of a product written as such, none). `smax` is now written
+as that sum, the same bits on the CPU (negation is exact, rounding to nearest symmetric), and
+every thing the small audit reaches (15) has the CPU's bits at every corner. Step 11 is `std::strict`: a strict kernel computes std's strict functions, a
 division, a root and a remainder at 64 fixed hard arguments (132 µs once, on the M4), held to the
 bits the CPU computed from the same code at build (a constant); the engine's sight asks at its
 start, and a GPU that differs stops the program, naming the first result (with the kernel's
