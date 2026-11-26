@@ -29,6 +29,9 @@ pub enum PipelineKey {
         /// Dispatched with an origin (`origin:`): its uniform block holds it, and each
         /// invocation's `GlobalId` is it added to the invocation's place in the dispatch.
         origin: bool,
+        /// Dispatched `transient: true`: a `@strict` kernel written exact with the driver's
+        /// math (its work is made again every frame, §11.3).
+        transient: bool,
         /// Its `const` parameters' values (§18.1), as `(entry, parameter, value)`: one pipeline
         /// each set.
         consts: Vec<(usize, usize, ConstArg)>,
@@ -474,6 +477,8 @@ pub(crate) struct Interface {
     /// A kernel dispatched with an origin (`origin:`): its uniform block ends with the origin
     /// (`ORIGIN`), which its `GlobalId` adds.
     pub origin: bool,
+    /// Dispatched `transient: true`: its `@strict` entry is written exact with the driver's math.
+    pub transient: bool,
 }
 
 impl Interface {
@@ -546,9 +551,10 @@ impl Interface {
 /// A pipeline's interface.
 fn interface(cx: &mut Cx, key: &PipelineKey) -> Interface {
     match key {
-        PipelineKey::Compute { kernel, substs, over, origin, .. } => Interface {
+        PipelineKey::Compute { kernel, substs, over, origin, transient, .. } => Interface {
             over: *over,
             origin: *origin,
+            transient: *transient,
             ..Interface::of(cx, &[(*kernel, substs.as_slice())], None, None)
         },
         PipelineKey::Render { vertex, fragment, .. } => {
@@ -727,12 +733,13 @@ pub(crate) fn add_standins(cx: &mut Cx) -> Vec<(u32, u32)> {
             continue;
         }
         let swapped = match &key {
-            PipelineKey::Compute { kernel: _, substs, over, origin, consts } => {
+            PipelineKey::Compute { kernel: _, substs, over, origin, transient, consts } => {
                 PipelineKey::Compute {
                     kernel: cheap,
                     substs: substs.clone(),
                     over: *over,
                     origin: *origin,
+                    transient: *transient,
                     consts: consts.clone(),
                 }
             }
@@ -1026,6 +1033,7 @@ fn record_dispatch(fl: &mut Fl, d: &mir::Dispatch, span: Span) -> Option<()> {
         substs: kernel.substs.clone(),
         over: d.over,
         origin: d.origin.is_some(),
+        transient: d.transient,
         consts,
     };
     let (pindex, iface) = pipeline(fl.cx, key, span);
@@ -1642,7 +1650,7 @@ pub(crate) fn intrinsic(
                 return None;
             };
             let substs: Vec<TyId> = args.iter().map(|&x| fl.concrete(x)).collect();
-            let key = PipelineKey::Compute { kernel: func, substs, over: false, origin: false, consts: Vec::new() };
+            let key = PipelineKey::Compute { kernel: func, substs, over: false, origin: false, transient: false, consts: Vec::new() };
             let (pindex, _) = pipeline(fl.cx, key, span);
             let u = fl.mb.m.types.u32();
             Some(fl.value(u, ir::Expr::Host(ir::HostOp::KernelWork { pipeline: pindex }, Vec::new())))
@@ -2667,7 +2675,12 @@ fn entry_module(
     gpu.consts = consts;
     let mut mb = ModuleBuilder::gpu(gpu);
     // A pipeline any of whose entry points is `@strict` computes as the CPU does (§11.3).
-    mb.m.strict = iface.entries.iter().any(|e| program.func(e.func).attrs.strict.is_some());
+    let strict_entry = iface.entries.iter().any(|e| program.func(e.func).attrs.strict.is_some());
+    mb.m.strict = strict_entry && !iface.transient;
+    // A transient dispatch of a strict kernel: exact (no contraction, safe math, folding only
+    // what every GPU rounds alike), with the driver's built-ins and the GPU's proofs.
+    mb.m.exact = strict_entry && iface.transient;
+    mb.m.transient = mb.m.exact;
     // What each parameter is bound to: a group's fields as they're bound below.
     let mut resources: Vec<Vec<Option<Bound>>> = Vec::new();
     for entry in &iface.entries {
@@ -3235,6 +3248,7 @@ fn lower_compute(cx: &mut Cx, iface: Rc<Interface>, consts: Vec<ir::Const>) -> O
             substs: Vec::new(),
             over: false,
             origin: false,
+            transient: false,
             consts: Vec::new(),
         },
         sites: Vec::new(),
@@ -3352,6 +3366,7 @@ fn lower_render(
             substs: Vec::new(),
             over: false,
             origin: false,
+            transient: false,
             consts: Vec::new(),
         },
         sites: Vec::new(),
@@ -3951,7 +3966,7 @@ fn verify(cx: &mut Cx, mb: &mut ModuleBuilder, name: &str) -> Option<Counts> {
     if cx.emit {
         // A strict module folds from constants only what every GPU rounds as the CPU does, as an
         // exact build's does.
-        mb.m.exact = cx.data.exact || mb.m.strict;
+        mb.m.exact = cx.data.exact || mb.m.strict || mb.m.exact;
         let mut folded_branch = false;
         checked = checked
             .and_then(|()| {

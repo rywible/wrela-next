@@ -53,7 +53,7 @@ pub fn hoist(m: &mut Module, uniform: ResourceId, least: u64) -> Vec<Hoisted> {
     // what moves onto the CPU is rounded as the CPU does, and whether a value moves depends on
     // the work beside it. Its same work stays where it is. A strict module's arithmetic is the
     // CPU's already, so its same work moves.
-    if m.exact && !m.strict {
+    if m.exact && !m.strict && !m.transient {
         return Vec::new();
     }
     let TypeDef::Struct { fields, .. } = m.types.get(m.resources[uniform.index()].ty).clone()

@@ -353,6 +353,9 @@ pub struct Dispatch {
     /// texture, whose size it is. The workgroup counts cover it, and invocations past it do
     /// nothing (§18).
     pub over: bool,
+    /// `transient: true`: the kernel's work is made again every frame, so a `@strict` kernel is
+    /// written exact with the driver's math, a pipeline of its own (§11.3).
+    pub transient: bool,
     /// One per kernel parameter that isn't a builtin, as (parameter index, argument), in the
     /// order written; none for a bound kernel's value.
     pub args: Vec<(usize, Expr)>,

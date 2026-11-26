@@ -31,7 +31,7 @@ use std::derive::Box3
 use std::field::{DualQuat, Field, Rigid}
 use std::gpu::{
     AppendBuffer, DispatchArgs, DrawIndexedArgs, GpuBuffer, GpuSpan, append_buffer, buffer,
-    buffer_of, copy, dispatch, kernel_work, label, read_settled, write,
+    GpuField, Kernel, buffer_of, copy, dispatch, kernel_work, label, read_settled, write,
 }
 use std::hash::{Hasher, StateHash, state_hash}
 use std::io::Pending
@@ -273,6 +273,11 @@ pub struct MeshBatch {
     /// could say: a later field whose hash moved in some parts only is patched in their bricks.
     part_hashes: Vec<u64>,
     part_boxes: Vec<Box3>,
+    /// Whether this extraction follows one the frame before (the field moves every frame): its
+    /// dispatches are then transient (`dispatch_over`, `dispatch_indirect`), its mesh living a
+    /// frame and leaving no machine, so its `@strict` kernels are written exact with the
+    /// driver's math (docs/plans/engine-at-build.md, phase 1).
+    transient: bool,
     edit_append_cursor: u32,
     pub xforms: GpuBuffer<Rigid>,
     pub prev_xforms: GpuBuffer<Rigid>,
@@ -508,6 +513,7 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
         edit_grids: Vec::new(),
         part_hashes: Vec::new(),
         part_boxes: Vec::new(),
+        transient: false,
         edit_append_cursor: 0,
         xforms: buffer_of([Rigid::identity()]),
         prev_xforms: buffer_of([Rigid::identity()]),
@@ -974,7 +980,7 @@ impl MeshBatch {
         for k in 0..slices {
             let first = k * DEFORM_SLICE
             let n = min(self.cap_verts - first, DEFORM_SLICE)
-            dispatch(
+            dispatch_indirect(
                 deform_skinned_verts.bind(
                     field: field,
                     rest_verts: self.verts.items(),
@@ -985,8 +991,10 @@ impl MeshBatch {
                     bones: self.bones.items(),
                     out: self.deformed_verts.span_mut(start: first, count: n),
                 ),
-                groups: scratch.crease_args.at(k),
-                most: (n + 63) / 64,
+                scratch.crease_args.at(k),
+                (n + 63) / 64,
+                // A pose is skinned every frame it moves: transient.
+                true,
             )
         }
     }
@@ -1749,7 +1757,7 @@ impl MeshBatch {
             write(mut self.tri_count, 0, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
             scratch.active.clear()
             self.exact_cells.clear()
-            dispatch(
+            dispatch_over(
                 finish_draw.bind(
                     active_count: scratch.active.count(),
                     vert_count: scratch.active.count(),
@@ -1769,7 +1777,8 @@ impl MeshBatch {
                     seam_args: mut self.seam_draw_args,
                     exact_args: mut self.exact_draw_args,
                 ),
-                over: 1,
+                1,
+                self.transient,
             )
             self.has_exact = false
             self.has_brick_draws = false
@@ -1827,7 +1836,7 @@ impl MeshBatch {
                 self.cpu_bones = take all_bones
                 if vis_count != self.inst_count {
                     label("mesh_extract")
-                    dispatch(
+                    dispatch_over(
                         set_instances.bind(
                             tri_count: self.tri_count.items(),
                             cap_indices: self.cap_indices,
@@ -1837,7 +1846,8 @@ impl MeshBatch {
                             trans_args: mut self.trans_draw_args,
                             cut_args: mut self.cut_draw_args,
                         ),
-                        over: 1,
+                        1,
+                        self.transient,
                     )
                     self.inst_count = vis_count
                 }
@@ -1919,7 +1929,7 @@ impl MeshBatch {
                 self.cpu_xforms = take deltas
                 if vis_count != self.inst_count {
                     label("mesh_extract")
-                    dispatch(
+                    dispatch_over(
                         set_instances.bind(
                             tri_count: self.tri_count.items(),
                             cap_indices: self.cap_indices,
@@ -1929,7 +1939,8 @@ impl MeshBatch {
                             trans_args: mut self.trans_draw_args,
                             cut_args: mut self.cut_draw_args,
                         ),
-                        over: 1,
+                        1,
+                        self.transient,
                     )
                     self.inst_count = vis_count
                 }
@@ -2267,7 +2278,7 @@ impl MeshBatch {
         // 1. Invalidate existing bricks inside the exact dirty brick box (`< 5 µs`).
         if self.cpu_brick_slots > 0 {
             for ci in 0..clear_targets.len() {
-                dispatch(
+                dispatch_over(
                     reset_dirty_bricks.bind(
                         brick_bounds: self.brick_bounds.items(),
                         clear_lo: clear_los[ci],
@@ -2281,7 +2292,8 @@ impl MeshBatch {
                         brick_alive: mut self.brick_alive,
                         indices: mut self.indices,
                     ),
-                    over: self.cpu_brick_slots,
+                    self.cpu_brick_slots,
+                    self.transient,
                 )
             }
         }
@@ -2291,7 +2303,7 @@ impl MeshBatch {
         var c_first: u32 = 0
         while c_first < patch_total {
             let cn = min(patch_total - c_first, CULL_CHUNK)
-            dispatch(
+            dispatch_over(
                 cull_bricks.bind(
                     fields: fbuf.items(),
                     grids: grids,
@@ -2301,7 +2313,8 @@ impl MeshBatch {
                     fc: frustum_cull_none(),
                     active: mut scratch.active,
                 ),
-                over: cn,
+                cn,
+                self.transient,
             )
             c_first += cn
         }
@@ -2309,7 +2322,7 @@ impl MeshBatch {
         scratch.cert_cands.clear()
         while chunk_start < patch_cap {
             let chunk_n = min(patch_cap - chunk_start, CHUNK_BRICKS)
-            dispatch(
+            dispatch_over(
                 prep_chunk.bind(
                     active_count: scratch.active.count(),
                     cap_bricks: patch_cap,
@@ -2318,9 +2331,10 @@ impl MeshBatch {
                     vert_args: mut scratch.vert_args,
                     quad_args: mut scratch.quad_args,
                 ),
-                over: 1,
+                1,
+                self.transient,
             )
-            dispatch(
+            dispatch_indirect(
                 eval_corners.bind(
                     fields: fbuf.items(),
                     grids: grids,
@@ -2330,13 +2344,14 @@ impl MeshBatch {
                     chunk_start: chunk_start,
                     corners: scratch.corners.span_mut(start: 0, count: chunk_n * CORNERS_BRICK),
                 ),
-                groups: scratch.eval_args.at(0),
-                most: chunk_n * 8,
+                scratch.eval_args.at(0),
+                chunk_n * 8,
+                self.transient,
             )
             scratch.creases.clear()
             scratch.surf.clear()
             scratch.thin_cands.clear()
-            dispatch(
+            dispatch_indirect(
                 classify_cells.bind(
                     grids: grids,
                     active: scratch.active.items(),
@@ -2354,8 +2369,9 @@ impl MeshBatch {
                     surf: mut scratch.surf,
                     thin_cands: mut scratch.thin_cands,
                 ),
-                groups: scratch.vert_args.at(0),
-                most: chunk_n * 6,
+                scratch.vert_args.at(0),
+                chunk_n * 6,
+                self.transient,
             )
             let surf_slice = self.surf_slice
             let surf_slices = min((chunk_n * VERTS_BRICK + surf_slice - 1) / surf_slice, SLICES_MOST)
@@ -2370,7 +2386,7 @@ impl MeshBatch {
                 over: surf_slices,
             )
             for k in 0..surf_slices {
-                dispatch(
+                dispatch_indirect(
                     solve_verts.bind(
                         fields: fbuf.items(),
                         grids: grids,
@@ -2385,8 +2401,9 @@ impl MeshBatch {
                         verts: mut self.verts,
                         creases: mut scratch.creases,
                     ),
-                    groups: scratch.surf_args.at(k),
-                    most: surf_slice / 64,
+                    scratch.surf_args.at(k),
+                    surf_slice / 64,
+                    self.transient,
                 )
             }
             let c_slice = self.crease_slice
@@ -2395,7 +2412,7 @@ impl MeshBatch {
                 1,
                 min(max(4, (65536 + c_slice - 1) / c_slice), SLICES_MOST),
             )
-            dispatch(
+            dispatch_over(
                 prep_creases.bind(
                     count: scratch.creases.count(),
                     slices: crease_slices,
@@ -2403,11 +2420,12 @@ impl MeshBatch {
                     args: scratch.crease_args.span_mut(start: 0, count: crease_slices),
                     seen: mut self.tri_count,
                 ),
-                over: crease_slices,
+                crease_slices,
+                self.transient,
             )
             for k in 0..crease_slices {
                 for pass in 0..self.crease_passes {
-                    dispatch(
+                    dispatch_indirect(
                         refine_creases.bind(
                             fields: fbuf.items(),
                             grids: grids,
@@ -2423,19 +2441,21 @@ impl MeshBatch {
                             cell_verts: mut scratch.cell_verts,
                             verts: mut self.verts,
                         ),
-                        groups: scratch.crease_args.at(k),
-                        most: c_slice / 64,
+                        scratch.crease_args.at(k),
+                        c_slice / 64,
+                        self.transient,
                     )
                 }
             }
-            dispatch(
+            dispatch_over(
                 zero_chunk_counts.bind(
                     counts: scratch.brick_idx_counts.span_mut(start: 0, count: chunk_n),
                     cursors: scratch.brick_idx_cursor.span_mut(start: 0, count: chunk_n),
                 ),
-                over: chunk_n,
+                chunk_n,
+                self.transient,
             )
-            dispatch(
+            dispatch_indirect(
                 count_brick_tris.bind(
                     active_count: scratch.active.count(),
                     cap_bricks: patch_cap,
@@ -2445,8 +2465,9 @@ impl MeshBatch {
                     verts: self.verts.items(),
                     brick_idx_counts: mut scratch.brick_idx_counts,
                 ),
-                groups: scratch.quad_args.at(0),
-                most: chunk_n * 4,
+                scratch.quad_args.at(0),
+                chunk_n * 4,
+                self.transient,
             )
             scan_chunk_offsets(
                 scratch.active.count(),
@@ -2460,7 +2481,7 @@ impl MeshBatch {
                 chunk_n: chunk_n,
             )
             let meta_dst = dst_base + chunk_start
-            dispatch(
+            dispatch_over(
                 write_brick_meta.bind(
                     grids: grids,
                     active: scratch.active.items(),
@@ -2476,9 +2497,10 @@ impl MeshBatch {
                     brick_draws: self.brick_draws.span_mut(start: meta_dst, count: chunk_n),
                     brick_alive: self.brick_alive.span_mut(start: meta_dst, count: chunk_n),
                 ),
-                over: chunk_n,
+                chunk_n,
+                self.transient,
             )
-            dispatch(
+            dispatch_indirect(
                 emit_tris.bind(
                     grids: grids,
                     active: scratch.active.items(),
@@ -2502,14 +2524,15 @@ impl MeshBatch {
                     exact_cells: mut self.exact_cells,
                     cert_cands: mut scratch.cert_cands,
                 ),
-                groups: scratch.quad_args.at(0),
-                most: chunk_n * 4,
+                scratch.quad_args.at(0),
+                chunk_n * 4,
+                self.transient,
             )
             if self.exact_eye.w > 0.0 {
                 // The patched bricks' exact cells, as a full extraction finds them (`run_extract`):
                 // the outline's neighbours, filtered with the thin cells.
                 let exact_eye = self.exact_eye
-                dispatch(
+                dispatch_indirect(
                     dilate_outline.bind(
                         active_count: scratch.active.count(),
                         cap_bricks: patch_cap,
@@ -2518,8 +2541,9 @@ impl MeshBatch {
                         exact_seen: mut scratch.exact_seen,
                         thin_cands: mut scratch.thin_cands,
                     ),
-                    groups: scratch.vert_args.at(0),
-                    most: chunk_n * 6,
+                    scratch.vert_args.at(0),
+                    chunk_n * 6,
+                    self.transient,
                 )
                 let thin_slices = self.thin_slices()
                 dispatch(
@@ -2533,7 +2557,7 @@ impl MeshBatch {
                     over: 1,
                 )
                 for ts in 0..thin_slices {
-                    dispatch(
+                    dispatch_indirect(
                         filter_thin_cells.bind(
                             fields: fbuf.items(),
                             grids: grids,
@@ -2546,17 +2570,19 @@ impl MeshBatch {
                             exact_seen: mut scratch.exact_seen,
                             exact_cells: mut self.exact_cells,
                         ),
-                        groups: scratch.crease_args.at(ts),
-                        most: THIN_SLICE / 64,
+                        scratch.crease_args.at(ts),
+                        THIN_SLICE / 64,
+                        self.transient,
                     )
                 }
-                dispatch(
+                dispatch_over(
                     note_untested.bind(
                         thin_count: scratch.thin_cands.count(),
                         slices: thin_slices,
                         tri_count: mut self.tri_count,
                     ),
-                    over: 1,
+                    1,
+                    self.transient,
                 )
             }
             chunk_start += chunk_n
@@ -2577,7 +2603,7 @@ impl MeshBatch {
                 over: 1,
             )
             for cs in 0..cert_slices {
-                dispatch(
+                dispatch_indirect(
                     certify_outline.bind(
                         fields: fbuf.items(),
                         grids: grids,
@@ -2589,20 +2615,22 @@ impl MeshBatch {
                         exact_eye: exact_eye,
                         exact_cells: mut self.exact_cells,
                     ),
-                    groups: scratch.crease_args.at(cs),
-                    most: CERT_SLICE / 64,
+                    scratch.crease_args.at(cs),
+                    CERT_SLICE / 64,
+                    self.transient,
                 )
             }
-            dispatch(
+            dispatch_over(
                 note_uncertified.bind(
                     cert_count: scratch.cert_cands.count(),
                     slices: cert_slices,
                     tri_count: mut self.tri_count,
                 ),
-                over: 1,
+                1,
+                self.transient,
             )
         }
-        dispatch(
+        dispatch_over(
             finish_draw_patch.bind(
                 dst_base: dst_base,
                 patch_active_count: scratch.active.count(),
@@ -2615,17 +2643,19 @@ impl MeshBatch {
                 trans_args: mut self.trans_draw_args,
                 cut_args: mut self.cut_draw_args,
             ),
-            over: 1,
+            1,
+            self.transient,
         )
         if self.exact_eye.w > 0.0 {
-            dispatch(
+            dispatch_over(
                 set_exact_args.bind(
                     exact_count: self.exact_cells.count(),
                     cap_exact: self.cap_exact,
                     tri_count: mut self.tri_count,
                     exact_args: mut self.exact_draw_args,
                 ),
-                over: 1,
+                1,
+                self.transient,
             )
         }
         self.edit_patched = true
@@ -2655,6 +2685,7 @@ impl MeshBatch {
         eye_reach: f32 = 0.0,
     ) {
         label("mesh_extract")
+        self.transient = self.built && self.still_frames == 0
         let step = crease_step_cost_of(sample)
         // A crease slice is as many cells as the kernel's own bound (`kernel_work`) lets a
         // dispatch hold: this batch's kernels, bound as they're dispatched.
@@ -2792,7 +2823,7 @@ impl MeshBatch {
         var first: u32 = 0
         while first < total_bricks {
             let n = min(total_bricks - first, CULL_CHUNK)
-            dispatch(
+            dispatch_over(
                 cull_bricks.bind(
                     fields: fields,
                     grids: grids,
@@ -2802,7 +2833,8 @@ impl MeshBatch {
                     fc: fc,
                     active: mut scratch.active,
                 ),
-                over: n,
+                n,
+                self.transient,
             )
             first += n
         }
@@ -2821,7 +2853,7 @@ impl MeshBatch {
         scratch.cert_cands.clear()
         while chunk_start < hard_cap {
             let chunk_n = min(hard_cap - chunk_start, CHUNK_BRICKS)
-            dispatch(
+            dispatch_over(
                 prep_chunk.bind(
                     active_count: scratch.active.count(),
                     cap_bricks: effective_cap,
@@ -2830,10 +2862,11 @@ impl MeshBatch {
                     vert_args: mut scratch.vert_args,
                     quad_args: mut scratch.quad_args,
                 ),
-                over: 1,
+                1,
+                self.transient,
             )
             if has_seams {
-                dispatch(
+                dispatch_indirect(
                     eval_corners.bind(
                         fields: fields,
                         grids: grids,
@@ -2846,13 +2879,14 @@ impl MeshBatch {
                             count: chunk_n * CORNERS_BRICK,
                         ),
                     ),
-                    groups: scratch.eval_args.at(0),
-                    most: chunk_n * 8,
+                    scratch.eval_args.at(0),
+                    chunk_n * 8,
+                    self.transient,
                 )
                 var inh_off: u32 = 0
                 while inh_off < chunk_n {
                     let band = min(chunk_n - inh_off, 64)
-                    dispatch(
+                    dispatch_over(
                         inherit_seam_corners.bind(
                             fields: fields,
                             grids: grids,
@@ -2867,12 +2901,13 @@ impl MeshBatch {
                                 count: band * CORNERS_BRICK,
                             ),
                         ),
-                        over: band * CORNERS_BRICK,
+                        band * CORNERS_BRICK,
+                        self.transient,
                     )
                     inh_off += band
                 }
             } else {
-                dispatch(
+                dispatch_indirect(
                     eval_corners.bind(
                         fields: fields,
                         grids: grids,
@@ -2885,14 +2920,15 @@ impl MeshBatch {
                             count: chunk_n * CORNERS_BRICK,
                         ),
                     ),
-                    groups: scratch.eval_args.at(0),
-                    most: chunk_n * 8,
+                    scratch.eval_args.at(0),
+                    chunk_n * 8,
+                    self.transient,
                 )
             }
             scratch.creases.clear()
             scratch.surf.clear()
             scratch.thin_cands.clear()
-            dispatch(
+            dispatch_indirect(
                 classify_cells.bind(
                     grids: grids,
                     active: scratch.active.items(),
@@ -2910,17 +2946,19 @@ impl MeshBatch {
                     surf: mut scratch.surf,
                     thin_cands: mut scratch.thin_cands,
                 ),
-                groups: scratch.vert_args.at(0),
-                most: chunk_n * 6,
+                scratch.vert_args.at(0),
+                chunk_n * 6,
+                self.transient,
             )
             if uses_kept {
-                dispatch(
+                dispatch_over(
                     mark_first.bind(
                         vert_count: self.verts.count(),
                         cap_verts: self.cap_verts,
                         first: mut self.keep_first,
                     ),
-                    over: 1,
+                    1,
+                    self.transient,
                 )
             }
             let surf_slices = min(
@@ -2938,7 +2976,7 @@ impl MeshBatch {
                 over: surf_slices,
             )
             for k in 0..surf_slices {
-                dispatch(
+                dispatch_indirect(
                     solve_verts.bind(
                         fields: fields,
                         grids: grids,
@@ -2953,14 +2991,15 @@ impl MeshBatch {
                         verts: mut self.verts,
                         creases: mut scratch.creases,
                     ),
-                    groups: scratch.surf_args.at(k),
-                    most: self.surf_slice / 64,
+                    scratch.surf_args.at(k),
+                    self.surf_slice / 64,
+                    self.transient,
                 )
             }
             // The chunk's creases, in dispatches of at most `self.crease_slice` cells, their counts
             // prepared in one dispatch (a slice past the list's end dispatches no groups).
             let crease_slices = self.crease_slices(chunk_n)
-            dispatch(
+            dispatch_over(
                 prep_creases.bind(
                     count: scratch.creases.count(),
                     slices: crease_slices,
@@ -2968,11 +3007,12 @@ impl MeshBatch {
                     args: scratch.crease_args.span_mut(start: 0, count: crease_slices),
                     seen: mut self.tri_count,
                 ),
-                over: crease_slices,
+                crease_slices,
+                self.transient,
             )
             for k in 0..crease_slices {
                 for pass in 0..self.crease_passes {
-                    dispatch(
+                    dispatch_indirect(
                         refine_creases.bind(
                             fields: fields,
                             grids: grids,
@@ -2988,8 +3028,9 @@ impl MeshBatch {
                             cell_verts: mut scratch.cell_verts,
                             verts: mut self.verts,
                         ),
-                        groups: scratch.crease_args.at(k),
-                        most: self.crease_slice / 64,
+                        scratch.crease_args.at(k),
+                        self.crease_slice / 64,
+                        self.transient,
                     )
                 }
             }
@@ -3010,7 +3051,7 @@ impl MeshBatch {
                     over: keep_slices,
                 )
                 for k in 0..keep_slices {
-                    dispatch(
+                    dispatch_indirect(
                         keep_verts.bind(
                             fields: fields,
                             verts: self.verts.items(),
@@ -3020,20 +3061,22 @@ impl MeshBatch {
                             from: k * self.keep_slice,
                             vert_kept: mut self.vert_kept,
                         ),
-                        groups: self.keep_args.at(k),
-                        most: self.keep_slice / 64,
+                        self.keep_args.at(k),
+                        self.keep_slice / 64,
+                        self.transient,
                     )
                 }
             }
-            dispatch(
+            dispatch_over(
                 zero_chunk_counts.bind(
                     counts: scratch.brick_idx_counts.span_mut(start: 0, count: chunk_n),
                     cursors: scratch.brick_idx_cursor.span_mut(start: 0, count: chunk_n),
                 ),
-                over: chunk_n,
+                chunk_n,
+                self.transient,
             )
             if has_seams {
-                dispatch(
+                dispatch_indirect(
                     count_brick_tris_lod.bind(
                         grids: grids,
                         active: scratch.active.items(),
@@ -3045,11 +3088,12 @@ impl MeshBatch {
                         verts: self.verts.items(),
                         brick_idx_counts: mut scratch.brick_idx_counts,
                     ),
-                    groups: scratch.quad_args.at(0),
-                    most: chunk_n * 4,
+                    scratch.quad_args.at(0),
+                    chunk_n * 4,
+                    self.transient,
                 )
             } else {
-                dispatch(
+                dispatch_indirect(
                     count_brick_tris.bind(
                         active_count: scratch.active.count(),
                         cap_bricks: effective_cap,
@@ -3059,8 +3103,9 @@ impl MeshBatch {
                         verts: self.verts.items(),
                         brick_idx_counts: mut scratch.brick_idx_counts,
                     ),
-                    groups: scratch.quad_args.at(0),
-                    most: chunk_n * 4,
+                    scratch.quad_args.at(0),
+                    chunk_n * 4,
+                    self.transient,
                 )
             }
             scan_chunk_offsets(
@@ -3074,7 +3119,7 @@ impl MeshBatch {
                 chunk_start: chunk_start,
                 chunk_n: chunk_n,
             )
-            dispatch(
+            dispatch_over(
                 write_brick_meta.bind(
                     grids: grids,
                     active: scratch.active.items(),
@@ -3090,10 +3135,11 @@ impl MeshBatch {
                     brick_draws: self.brick_draws.span_mut(start: chunk_start, count: chunk_n),
                     brick_alive: self.brick_alive.span_mut(start: chunk_start, count: chunk_n),
                 ),
-                over: chunk_n,
+                chunk_n,
+                self.transient,
             )
             if has_seams {
-                dispatch(
+                dispatch_indirect(
                     emit_tris_lod.bind(
                         grids: grids,
                         active: scratch.active.items(),
@@ -3120,11 +3166,12 @@ impl MeshBatch {
                         exact_cells: mut self.exact_cells,
                         cert_cands: mut scratch.cert_cands,
                     ),
-                    groups: scratch.quad_args.at(0),
-                    most: chunk_n * 4,
+                    scratch.quad_args.at(0),
+                    chunk_n * 4,
+                    self.transient,
                 )
             } else {
-                dispatch(
+                dispatch_indirect(
                     emit_tris.bind(
                         grids: grids,
                         active: scratch.active.items(),
@@ -3148,13 +3195,14 @@ impl MeshBatch {
                         exact_cells: mut self.exact_cells,
                         cert_cands: mut scratch.cert_cands,
                     ),
-                    groups: scratch.quad_args.at(0),
-                    most: chunk_n * 4,
+                    scratch.quad_args.at(0),
+                    chunk_n * 4,
+                    self.transient,
                 )
             }
             if use_exact {
                 // Thin cells (`classify_cells`) and the outline's neighbours, filtered together.
-                dispatch(
+                dispatch_indirect(
                     dilate_outline.bind(
                         active_count: scratch.active.count(),
                         cap_bricks: effective_cap,
@@ -3163,8 +3211,9 @@ impl MeshBatch {
                         exact_seen: mut scratch.exact_seen,
                         thin_cands: mut scratch.thin_cands,
                     ),
-                    groups: scratch.vert_args.at(0),
-                    most: chunk_n * 6,
+                    scratch.vert_args.at(0),
+                    chunk_n * 6,
+                    self.transient,
                 )
                 let thin_slices = self.thin_slices()
                 dispatch(
@@ -3178,7 +3227,7 @@ impl MeshBatch {
                     over: 1,
                 )
                 for ts in 0..thin_slices {
-                    dispatch(
+                    dispatch_indirect(
                         filter_thin_cells.bind(
                             fields: fields,
                             grids: grids,
@@ -3191,17 +3240,19 @@ impl MeshBatch {
                             exact_seen: mut scratch.exact_seen,
                             exact_cells: mut self.exact_cells,
                         ),
-                        groups: scratch.crease_args.at(ts),
-                        most: THIN_SLICE / 64,
+                        scratch.crease_args.at(ts),
+                        THIN_SLICE / 64,
+                        self.transient,
                     )
                 }
-                dispatch(
+                dispatch_over(
                     note_untested.bind(
                         thin_count: scratch.thin_cands.count(),
                         slices: thin_slices,
                         tri_count: mut self.tri_count,
                     ),
-                    over: 1,
+                    1,
+                    self.transient,
                 )
             }
             chunk_start += chunk_n
@@ -3221,7 +3272,7 @@ impl MeshBatch {
                 over: 1,
             )
             for cs in 0..cert_slices {
-                dispatch(
+                dispatch_indirect(
                     certify_outline.bind(
                         fields: fields,
                         grids: grids,
@@ -3233,38 +3284,42 @@ impl MeshBatch {
                         exact_eye: exact_eye,
                         exact_cells: mut self.exact_cells,
                     ),
-                    groups: scratch.crease_args.at(cs),
-                    most: CERT_SLICE / 64,
+                    scratch.crease_args.at(cs),
+                    CERT_SLICE / 64,
+                    self.transient,
                 )
             }
-            dispatch(
+            dispatch_over(
                 note_uncertified.bind(
                     cert_count: scratch.cert_cands.count(),
                     slices: cert_slices,
                     tri_count: mut self.tri_count,
                 ),
-                over: 1,
+                1,
+                self.transient,
             )
         }
 
         // Passes 3b–3d (Multi-LOD only): Solve enclosing coarse cells on 2:1 seam faces on the fly
         // (bit-for-bit identical to the parent level) and emit watertight seam triangles/quads.
         if has_seams {
-            dispatch(
+            dispatch_over(
                 record_seam_start.bind(
                     tri_count: self.tri_count.items(),
                     seam_start: mut self.seam_start,
                 ),
-                over: 1,
+                1,
+                self.transient,
             )
             let seam_slices = self.seam_slices()
-            dispatch(
+            dispatch_over(
                 note_seams.bind(
                     seam_count: scratch.seam_cells.count(),
                     slices: seam_slices,
                     tri_count: mut self.tri_count,
                 ),
-                over: 1,
+                1,
+                self.transient,
             )
             dispatch(
                 prep_slices.bind(
@@ -3277,14 +3332,15 @@ impl MeshBatch {
                 over: seam_slices,
             )
             if use_exact {
-                dispatch(
+                dispatch_over(
                     reset_seam_seen.bind(
                         seam_seen: scratch.seam_seen.span_mut(start: 0, count: SEAM_SEEN),
                     ),
-                    over: SEAM_SEEN,
+                    SEAM_SEEN,
+                    self.transient,
                 )
                 for k in 0..seam_slices {
-                    dispatch(
+                    dispatch_indirect(
                         box_seam_cells.bind(
                             fields: fields,
                             grids: grids,
@@ -3294,23 +3350,25 @@ impl MeshBatch {
                             seam_seen: mut scratch.seam_seen,
                             exact_cells: mut self.exact_cells,
                         ),
-                        groups: scratch.seam_args.at(k),
-                        most: SEAM_SLICE / 64,
+                        scratch.seam_args.at(k),
+                        SEAM_SLICE / 64,
+                        self.transient,
                     )
                 }
             }
             if uses_kept {
-                dispatch(
+                dispatch_over(
                     mark_first.bind(
                         vert_count: self.verts.count(),
                         cap_verts: self.cap_verts,
                         first: mut self.keep_first,
                     ),
-                    over: 1,
+                    1,
+                    self.transient,
                 )
             }
             for k in 0..seam_slices {
-                dispatch(
+                dispatch_indirect(
                     solve_seam_smooth.bind(
                         fields: fields,
                         grids: grids,
@@ -3322,8 +3380,9 @@ impl MeshBatch {
                         seam_verts: mut scratch.seam_verts,
                         seam_creases: mut scratch.seam_creases,
                     ),
-                    groups: scratch.seam_args.at(k),
-                    most: SEAM_SLICE / 64,
+                    scratch.seam_args.at(k),
+                    SEAM_SLICE / 64,
+                    self.transient,
                 )
             }
             dispatch(
@@ -3338,7 +3397,7 @@ impl MeshBatch {
             )
             for k in 0..seam_c_slices {
                 for pass in 0..self.crease_passes {
-                    dispatch(
+                    dispatch_indirect(
                         refine_seam_creases.bind(
                             fields: fields,
                             grids: grids,
@@ -3352,8 +3411,9 @@ impl MeshBatch {
                             verts: mut self.verts,
                             seam_verts: mut scratch.seam_verts,
                         ),
-                        groups: scratch.crease_args.at(k),
-                        most: seam_c_slice / 64,
+                        scratch.crease_args.at(k),
+                        seam_c_slice / 64,
+                        self.transient,
                     )
                 }
             }
@@ -3370,7 +3430,7 @@ impl MeshBatch {
                     over: seam_keep_slices,
                 )
                 for k in 0..seam_keep_slices {
-                    dispatch(
+                    dispatch_indirect(
                         keep_verts.bind(
                             fields: fields,
                             verts: self.verts.items(),
@@ -3380,8 +3440,9 @@ impl MeshBatch {
                             from: k * self.keep_slice,
                             vert_kept: mut self.vert_kept,
                         ),
-                        groups: self.keep_args.at(k),
-                        most: self.keep_slice / 64,
+                        self.keep_args.at(k),
+                        self.keep_slice / 64,
+                        self.transient,
                     )
                 }
             }
@@ -3395,7 +3456,7 @@ impl MeshBatch {
                 ),
                 over: 1,
             )
-            dispatch(
+            dispatch_indirect(
                 finish_seam_tris.bind(
                     seam_quads: scratch.seam_quads.items(),
                     seam_quad_count: scratch.seam_quads.count(),
@@ -3408,12 +3469,13 @@ impl MeshBatch {
                     trans_indices: mut self.trans_indices,
                     cut_indices: mut self.cut_indices,
                 ),
-                groups: scratch.surf_args.at(0),
-                most: CAP_SEAM / 64,
+                scratch.surf_args.at(0),
+                CAP_SEAM / 64,
+                self.transient,
             )
         }
 
-        dispatch(
+        dispatch_over(
             finish_draw.bind(
                 active_count: scratch.active.count(),
                 vert_count: self.verts.count(),
@@ -3433,7 +3495,8 @@ impl MeshBatch {
                 seam_args: mut self.seam_draw_args,
                 exact_args: mut self.exact_draw_args,
             ),
-            over: 1,
+            1,
+            self.transient,
         )
         self.has_exact = use_exact
         self.has_brick_draws = true
@@ -3458,6 +3521,7 @@ impl MeshBatch {
         inst_count: u32,
     ) {
         label("mesh_extract")
+        self.transient = self.built && self.still_frames == 0
         let step = crease_step_cost_rest_of(sample)
         let crease_kernel = refine_creases_rest.bind(
             fields: fields,
@@ -3491,7 +3555,7 @@ impl MeshBatch {
         var first: u32 = 0
         while first < total_bricks {
             let n = min(total_bricks - first, CULL_CHUNK)
-            dispatch(
+            dispatch_over(
                 cull_bricks_rest.bind(
                     fields: fields,
                     grids: grids,
@@ -3500,7 +3564,8 @@ impl MeshBatch {
                     total_bricks: total_bricks,
                     active: mut scratch.active,
                 ),
-                over: n,
+                n,
+                self.transient,
             )
             first += n
         }
@@ -3511,7 +3576,7 @@ impl MeshBatch {
         var chunk_start: u32 = 0
         while chunk_start < hard_cap {
             let chunk_n = min(hard_cap - chunk_start, CHUNK_BRICKS)
-            dispatch(
+            dispatch_over(
                 prep_chunk.bind(
                     active_count: scratch.active.count(),
                     cap_bricks: effective_cap,
@@ -3520,9 +3585,10 @@ impl MeshBatch {
                     vert_args: mut scratch.vert_args,
                     quad_args: mut scratch.quad_args,
                 ),
-                over: 1,
+                1,
+                self.transient,
             )
-            dispatch(
+            dispatch_indirect(
                 eval_corners_rest.bind(
                     fields: fields,
                     grids: grids,
@@ -3532,13 +3598,14 @@ impl MeshBatch {
                     chunk_start: chunk_start,
                     corners: scratch.corners.span_mut(start: 0, count: chunk_n * CORNERS_BRICK),
                 ),
-                groups: scratch.eval_args.at(0),
-                most: chunk_n * 8,
+                scratch.eval_args.at(0),
+                chunk_n * 8,
+                self.transient,
             )
             scratch.creases.clear()
             scratch.surf.clear()
             scratch.thin_cands.clear()
-            dispatch(
+            dispatch_indirect(
                 classify_cells.bind(
                     grids: grids,
                     active: scratch.active.items(),
@@ -3556,8 +3623,9 @@ impl MeshBatch {
                     surf: mut scratch.surf,
                     thin_cands: mut scratch.thin_cands,
                 ),
-                groups: scratch.vert_args.at(0),
-                most: chunk_n * 6,
+                scratch.vert_args.at(0),
+                chunk_n * 6,
+                self.transient,
             )
             let surf_slices = min(
                 (chunk_n * VERTS_BRICK + self.surf_slice - 1) / self.surf_slice,
@@ -3574,7 +3642,7 @@ impl MeshBatch {
                 over: surf_slices,
             )
             for k in 0..surf_slices {
-                dispatch(
+                dispatch_indirect(
                     solve_verts_rest.bind(
                         fields: fields,
                         grids: grids,
@@ -3590,14 +3658,15 @@ impl MeshBatch {
                         skin_verts: mut self.skin_verts,
                         creases: mut scratch.creases,
                     ),
-                    groups: scratch.surf_args.at(k),
-                    most: self.surf_slice / 64,
+                    scratch.surf_args.at(k),
+                    self.surf_slice / 64,
+                    self.transient,
                 )
             }
             // The chunk's creases, in dispatches of at most `self.crease_slice` cells, their counts
             // prepared in one dispatch (a slice past the list's end dispatches no groups).
             let crease_slices = self.crease_slices(chunk_n)
-            dispatch(
+            dispatch_over(
                 prep_creases.bind(
                     count: scratch.creases.count(),
                     slices: crease_slices,
@@ -3605,11 +3674,12 @@ impl MeshBatch {
                     args: scratch.crease_args.span_mut(start: 0, count: crease_slices),
                     seen: mut self.tri_count,
                 ),
-                over: crease_slices,
+                crease_slices,
+                self.transient,
             )
             for k in 0..crease_slices {
                 for pass in 0..self.crease_passes {
-                    dispatch(
+                    dispatch_indirect(
                         refine_creases_rest.bind(
                             fields: fields,
                             grids: grids,
@@ -3626,19 +3696,21 @@ impl MeshBatch {
                             verts: mut self.verts,
                             skin_verts: mut self.skin_verts,
                         ),
-                        groups: scratch.crease_args.at(k),
-                        most: self.crease_slice / 64,
+                        scratch.crease_args.at(k),
+                        self.crease_slice / 64,
+                        self.transient,
                     )
                 }
             }
-            dispatch(
+            dispatch_over(
                 zero_chunk_counts.bind(
                     counts: scratch.brick_idx_counts.span_mut(start: 0, count: chunk_n),
                     cursors: scratch.brick_idx_cursor.span_mut(start: 0, count: chunk_n),
                 ),
-                over: chunk_n,
+                chunk_n,
+                self.transient,
             )
-            dispatch(
+            dispatch_indirect(
                 count_brick_tris.bind(
                     active_count: scratch.active.count(),
                     cap_bricks: effective_cap,
@@ -3648,8 +3720,9 @@ impl MeshBatch {
                     verts: self.verts.items(),
                     brick_idx_counts: mut scratch.brick_idx_counts,
                 ),
-                groups: scratch.quad_args.at(0),
-                most: chunk_n * 4,
+                scratch.quad_args.at(0),
+                chunk_n * 4,
+                self.transient,
             )
             scan_chunk_offsets(
                 scratch.active.count(),
@@ -3662,7 +3735,7 @@ impl MeshBatch {
                 chunk_start: chunk_start,
                 chunk_n: chunk_n,
             )
-            dispatch(
+            dispatch_indirect(
                 emit_tris.bind(
                     grids: grids,
                     active: scratch.active.items(),
@@ -3686,13 +3759,14 @@ impl MeshBatch {
                     exact_cells: mut self.exact_cells,
                     cert_cands: mut scratch.cert_cands,
                 ),
-                groups: scratch.quad_args.at(0),
-                most: chunk_n * 4,
+                scratch.quad_args.at(0),
+                chunk_n * 4,
+                self.transient,
             )
             chunk_start += chunk_n
         }
 
-        dispatch(
+        dispatch_over(
             finish_draw.bind(
                 active_count: scratch.active.count(),
                 vert_count: self.verts.count(),
@@ -3712,7 +3786,8 @@ impl MeshBatch {
                 seam_args: mut self.seam_draw_args,
                 exact_args: mut self.exact_draw_args,
             ),
-            over: 1,
+            1,
+            self.transient,
         )
         self.has_exact = false
         self.has_brick_draws = false
@@ -3776,4 +3851,24 @@ pub fn part_classes<M: Field<Substance> + StateHash>(then: M, now: M) -> Vec<u32
         },
     }
     out
+}
+
+/// `kernel` dispatched over `n` invocations: transient (its `@strict` written exact with the
+/// driver's math) where `transient`.
+fn dispatch_over<K: Kernel>(kernel: K, n: u32, transient: bool) {
+    if transient {
+        dispatch(kernel, over: n, transient: true)
+    } else {
+        dispatch(kernel, over: n)
+    }
+}
+
+/// `kernel` dispatched indirect, its groups in `groups`, at most `most`: transient where
+/// `transient`.
+fn dispatch_indirect<K: Kernel>(kernel: K, groups: GpuField<DispatchArgs, DispatchArgs>, most: u32, transient: bool) {
+    if transient {
+        dispatch(kernel, groups: groups, most: most, transient: true)
+    } else {
+        dispatch(kernel, groups: groups, most: most)
+    }
 }

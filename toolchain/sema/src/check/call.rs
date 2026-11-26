@@ -3486,12 +3486,13 @@ impl<'p> Checker<'p> {
         };
         let is_origin = |a: &ast::Arg| a.name.as_ref().is_some_and(|n| n.name == "origin");
         let is_most = |a: &ast::Arg| a.name.as_ref().is_some_and(|n| n.name == "most");
+        let is_transient = |a: &ast::Arg| a.name.as_ref().is_some_and(|n| n.name == "transient");
         // The form before binding: the kernel's arguments among `dispatch`'s own.
         let extra: Vec<&ast::Arg> = args
             .iter()
             .enumerate()
             .skip(1)
-            .filter(|(i, a)| !is_groups(*i, a) && !is_origin(a) && !is_most(a))
+            .filter(|(i, a)| !is_groups(*i, a) && !is_origin(a) && !is_most(a) && !is_transient(a))
             .map(|(_, a)| a)
             .collect();
         if !extra.is_empty()
@@ -3536,7 +3537,22 @@ impl<'p> Checker<'p> {
         let mut over = false;
         let mut origin: Option<Expr> = None;
         let mut most: Option<Expr> = None;
+        let mut transient = false;
         for (i, a) in args.iter().enumerate().skip(1) {
+            if is_transient(a) {
+                // A literal: which pipeline the dispatch records is the build's to choose.
+                let bool_ty = self.p.types.bool;
+                let e = self.check_expr(&a.value, Some(bool_ty));
+                self.expect(e.ty, bool_ty, e.span);
+                match &a.value.kind {
+                    ast::ExprKind::Lit(ast::Lit { kind: ast::LitKind::Bool(b), .. }) => transient = *b,
+                    _ => self.err(
+                        Diagnostic::new(codes::E0603, a.span, "`transient:` is `true` or `false` as written")
+                            .with_help("dispatch each way where it's chosen at run time: `if t { dispatch(k, groups: n, transient: true) } else { dispatch(k, groups: n) }`"),
+                    ),
+                }
+                continue;
+            }
             if is_most(a) {
                 let e = self.check_expr(&a.value, Some(u32_ty));
                 self.expect(e.ty, u32_ty, e.span);
@@ -3667,6 +3683,7 @@ impl<'p> Checker<'p> {
             groups: Box::new(groups),
             indirect,
             over,
+            transient,
             args: kernel_args,
             groups_at,
             origin: origin.map(Box::new),

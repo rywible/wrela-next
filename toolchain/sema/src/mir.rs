@@ -353,6 +353,8 @@ pub struct Dispatch {
     /// The workgroup counts; or, `over` a domain, its size (lowering covers it with groups).
     pub groups: [Operand; 3],
     pub over: bool,
+    /// `transient: true` (thir's): a `@strict` kernel written exact with the driver's math.
+    pub transient: bool,
     /// Where its invocations start (`origin:`), added to each one's `GlobalId`.
     pub origin: Option<[Operand; 3]>,
     /// An indirect dispatch's most groups (`most:`), what it's weighed and booked as.
