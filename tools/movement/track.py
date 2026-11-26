@@ -450,6 +450,8 @@ def main():
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--eval-every", type=int, default=200)
     p.add_argument("--filtered", action="store_true", help="play every clip to its end at the end")
+    p.add_argument("--weights", default="",
+                   help="a trained tracker (tracker.pt): train nothing, play every clip of the refs to its end")
     a = p.parse_args(run.args)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     wp.init()
@@ -471,6 +473,19 @@ def main():
         norm = Normal(n_obs, dev)
         step, samples = 0, 0
         state = run.resume()
+        if a.weights:
+            # Phase 5 step 12: the tracker as the slow reference of the solver's movements.
+            w = torch.load(a.weights, map_location=dev, weights_only=False)
+            agent.load_state_dict(w["agent"])
+            norm.load(w["norm"], dev)
+            results = play(sim, agent, norm, list(range(sim.starts.shape[0])))
+            for r in results:
+                print(f"played {head['names'][r['clip']]}: followed {r['followed']}, frames {r['frames']} "
+                      f"of {int(sim.lengths[r['clip']])}, mean {1000.0 * r['mean_m']:.1f} mm", flush=True)
+            full = summary(results)
+            print(f"played every clip: {json.dumps(full)}", flush=True)
+            run.finish({"played": full, "seconds": time.time() - t0})
+            return
         if state is not None:
             agent.load_state_dict(state["agent"])
             opt.load_state_dict(state["opt"])
