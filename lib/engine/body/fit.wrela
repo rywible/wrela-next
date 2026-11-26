@@ -1,0 +1,284 @@
+// Fitting a pose of a body to where its segments should be (docs/plans/bodies-and-movement.md,
+// phase 1 step 11 and phase 2 step 2): the numbers of its joints and its root that put each aimed
+// segment nearest its aim, in the range of each joint. It is how movement written for another
+// skeleton (a capture, an old rig) becomes poses of our bodies: each joint can only make the turns
+// its kind allows, so what a hinge can't do is carried by the joints around it, as near the aims
+// as they can come.
+//
+// A damped Gauss-Newton search (Levenberg and Marquardt) over the root's place and turn and every
+// number, from a start (the last frame's pose, for a clip). Each residual is weighed: an aim's
+// place (m) by `place`, its turn (rad) by `turn`; a joint out of its range by `RANGE` times how
+// far out (its range field); and each number's change from the start by `STILL`, so a number no
+// aim depends on stays where it was.
+
+use body::body::{Body, Pose}
+use body::joint::{Frame, turn_of_vector, vector_of_turn}
+use std::quat::Quat
+use std::collections::Vec
+
+/// Where a point of segment `segment` should be and how the segment should be turned: its point
+/// `point` (in its own frame) at `at` (the body's space), weighed by `place` (per m), and its
+/// turn `turn`, weighed by `turned` (per rad; 0 where only the point is aimed).
+pub struct Aim: Copy {
+    pub segment: u32,
+    pub point: vec3,
+    pub at: vec3,
+    pub place: f32,
+    pub turn: Quat,
+    pub turned: f32,
+}
+
+/// An aim at a whole frame: the segment's origin at `f.t`, turned as `f.q`.
+pub fn aim_frame(segment: u32, f: Frame, place: f32, turned: f32) -> Aim {
+    Aim { segment, point: vec3(0.0), at: f.t, place, turn: f.q, turned }
+}
+
+/// An aim at one point of a segment.
+pub fn aim_point(segment: u32, point: vec3, at: vec3, place: f32) -> Aim {
+    Aim { segment, point, at, place, turn: Quat::identity(), turned: 0.0 }
+}
+
+/// How much a joint out of its range weighs, per radian out.
+const RANGE: f32 = 10.0
+
+/// How much a number's change from the start weighs, per radian or metre.
+const STILL: f32 = 0.001
+
+/// How far each number is moved to see what it changes.
+const NUDGE: f32 = 0.0005
+
+/// What a fit came to: the pose, its residual's length at the start and at the end, and the
+/// worst aim's distance (m) and turn (rad) from where it should be.
+pub struct Fitted<const D: u32>: Copy {
+    pub pose: Pose<D>,
+    pub before: f32,
+    pub after: f32,
+    pub worst_place: f32,
+    pub worst_turn: f32,
+}
+
+/// `pose` with its root moved by `x[0..3]` and turned by the rotation vector `x[3..6]`, and its
+/// numbers moved by `x[6..]`.
+fn moved<const D: u32>(pose: Pose<D>, x: Vec<f64>) -> Pose<D> {
+    var p = pose
+    p.root.t = p.root.t + vec3(f32(x[0]), f32(x[1]), f32(x[2]))
+    p.root.q = turn_of_vector(vec3(f32(x[3]), f32(x[4]), f32(x[5]))).mul(p.root.q)
+    for k in 0..D {
+        p.q[k] = p.q[k] + f32(x[6 + k])
+    }
+    p
+}
+
+/// Each residual of `pose`: each aim's place and turn, each joint's range, each number's change
+/// from `start`.
+fn residuals<const S: u32, const D: u32>(
+    body: Body<S>,
+    aims: [Aim],
+    pose: Pose<D>,
+    start: Pose<D>,
+    out: mut Vec<f64>,
+) {
+    out.clear()
+    let at = body.places(pose)
+    for a in aims {
+        let f = at[a.segment]
+        let dp = (f.apply(a.point) - a.at) * a.place
+        out.push(f64(dp.x))
+        out.push(f64(dp.y))
+        out.push(f64(dp.z))
+        if a.turned > 0.0 {
+            let dq = vector_of_turn(a.turn.inverse().mul(f.q)) * a.turned
+            out.push(f64(dq.x))
+            out.push(f64(dq.y))
+            out.push(f64(dq.z))
+        }
+    }
+    for s in 1..S {
+        let j = body.segments[s].joint
+        if j.freedom() > 0 {
+            out.push(f64(RANGE * max(j.range(body.numbers(pose, s)), 0.0)))
+        }
+    }
+    for k in 0..D {
+        out.push(f64(STILL * (pose.q[k] - start.q[k])))
+    }
+}
+
+fn norm(r: Vec<f64>) -> f64 {
+    var s = 0.0
+    for v in r {
+        s += v * v
+    }
+    sqrt(s)
+}
+
+/// Solves `a x = b` for symmetric positive definite `a` (n × n, by rows) by Cholesky; `false`
+/// when `a` isn't.
+fn solve(a: mut Vec<f64>, b: mut Vec<f64>, n: u32) -> bool {
+    for j in 0..n {
+        var d = a[j * n + j]
+        for k in 0..j {
+            d -= a[j * n + k] * a[j * n + k]
+        }
+        if d <= 0.0 {
+            return false
+        }
+        let l = sqrt(d)
+        a[j * n + j] = l
+        for i in j + 1..n {
+            var s = a[i * n + j]
+            for k in 0..j {
+                s -= a[i * n + k] * a[j * n + k]
+            }
+            a[i * n + j] = s / l
+        }
+    }
+    for i in 0..n {
+        var s = b[i]
+        for k in 0..i {
+            s -= a[i * n + k] * b[k]
+        }
+        b[i] = s / a[i * n + i]
+    }
+    var i = n
+    while i > 0 {
+        i -= 1
+        var s = b[i]
+        for k in i + 1..n {
+            s -= a[k * n + i] * b[k]
+        }
+        b[i] = s / a[i * n + i]
+    }
+    true
+}
+
+/// The pose of `body` nearest `aims`, from `start`, in at most `steps` steps.
+pub fn fit<const S: u32, const D: u32>(
+    body: Body<S>,
+    aims: [Aim],
+    start: Pose<D>,
+    steps: u32,
+) -> Fitted<D> {
+    let n = 6 + D
+    var pose = start
+    var r: Vec<f64> = Vec::new()
+    residuals(body, aims, pose, start, mut r)
+    let before = norm(r)
+    var cost = before
+    var mu = 1.0e-3
+    var rp: Vec<f64> = Vec::new()
+    var x: Vec<f64> = Vec::filled(n, 0.0)
+    var jac: Vec<f64> = Vec::new()
+    for _ in 0..steps {
+        let m = r.len()
+        // The Jacobian, a column a number: what nudging each number does.
+        jac.clear()
+        for k in 0..n {
+            for i in 0..n {
+                x[i] = if i == k { f64(NUDGE) } else { 0.0 }
+            }
+            residuals(body, aims, moved(pose, x), start, mut rp)
+            for i in 0..m {
+                jac.push((rp[i] - r[i]) / f64(NUDGE))
+            }
+        }
+        // The normal equations: (Jᵀ J + mu diag) dx = -Jᵀ r.
+        var a: Vec<f64> = Vec::filled(n * n, 0.0)
+        var g: Vec<f64> = Vec::filled(n, 0.0)
+        for p in 0..n {
+            for q in 0..p + 1 {
+                var s = 0.0
+                for i in 0..m {
+                    s += jac[p * m + i] * jac[q * m + i]
+                }
+                a[p * n + q] = s
+                a[q * n + p] = s
+            }
+            var s = 0.0
+            for i in 0..m {
+                s += jac[p * m + i] * r[i]
+            }
+            g[p] = -s
+        }
+        var improved = false
+        for _ in 0..8 {
+            var aa = a.clone()
+            var dx = g.clone()
+            for p in 0..n {
+                aa[p * n + p] = a[p * n + p] * (1.0 + mu) + 1.0e-9
+            }
+            if solve(mut aa, mut dx, n) {
+                let trial = moved(pose, dx)
+                residuals(body, aims, trial, start, mut rp)
+                let c = norm(rp)
+                if c < cost {
+                    pose = trial
+                    cost = c
+                    r = rp.clone()
+                    mu = max(mu * 0.3, 1.0e-7)
+                    improved = true
+                    break
+                }
+            }
+            mu *= 10.0
+        }
+        if !improved || cost < 1.0e-7 {
+            break
+        }
+    }
+    let at = body.places(pose)
+    var wp = 0.0
+    var wt = 0.0
+    for a in aims {
+        let f = at[a.segment]
+        if a.place > 0.0 {
+            wp = max(wp, length(f.apply(a.point) - a.at))
+        }
+        if a.turned > 0.0 {
+            wt = max(wt, length(vector_of_turn(a.turn.inverse().mul(f.q))))
+        }
+    }
+    Fitted { pose, before: f32(before), after: f32(cost), worst_place: wp, worst_turn: wt }
+}
+
+// ---- tests ------------------------------------------------------------------------------------
+
+use body::body::{Segment, body}
+use body::joint::{Joint, Kind, NONE}
+
+@test
+fn a_fit_finds_the_pose_that_made_its_aims() {
+    let j = |kind: Kind, parent: u32, t: vec3| Joint {
+        kind,
+        parent,
+        at: Frame { q: Quat::identity(), t },
+        lo: vec3(-2.0),
+        hi: vec3(2.0),
+        strength: vec3(50.0),
+    }
+    let b = body(
+        [
+            Segment { joint: j(Kind::Fixed, NONE, vec3(0.0, 1.0, 0.0)), tip: vec3(0.0, 0.3, 0.0) },
+            Segment { joint: j(Kind::Ball, 0, vec3(0.0, 0.3, 0.0)), tip: vec3(0.0, 0.3, 0.0) },
+            Segment { joint: j(Kind::Hinge, 1, vec3(0.0, 0.3, 0.0)), tip: vec3(0.0, 0.25, 0.0) },
+            Segment {
+                joint: j(Kind::Universal, 2, vec3(0.0, 0.25, 0.0)),
+                tip: vec3(0.0, 0.1, 0.0),
+            },
+        ],
+    )
+    var truth: Pose<6> = b.rest()
+    truth.root.t = vec3(0.1, 0.9, -0.2)
+    truth.root.q = Quat::axis_angle(vec3(0.0, 1.0, 0.0), 0.4)
+    for k in 0..6 {
+        truth.q[k] = 0.5 * sin(f32(k) * 1.9 + 0.3)
+    }
+    let at = b.places(truth)
+    var aims: Vec<Aim> = Vec::new()
+    for s in 0..4 {
+        aims.push(aim_frame(s, at[s], 1.0, 0.3))
+    }
+    let start: Pose<6> = b.rest()
+    let f = fit(b, aims, start, 60)
+    assert(f.worst_place < 1.0e-3 && f.worst_turn < 2.0e-3, f"place {f.worst_place} turn {f.worst_turn} ({f.before} to {f.after})")
+}

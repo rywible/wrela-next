@@ -1,0 +1,240 @@
+// A body: a tree of segments, each joined to its parent (docs/plans/bodies-and-movement.md,
+// phase 1). The game says what a body is, once: its segments, their joints and their freedom
+// (`body`), and which segments each part of its field belongs to (`Span`). The engine works out
+// all else from that: where each segment is in a pose (`Body::places`, the one function every
+// part of the engine poses a body with), its mass (`mass::masses`) and its skin (`skin`).
+//
+// A pose is one number for each degree of freedom of the body's joints, in the order of the
+// segments, and the frame of its root (`Pose`). The build knows how many numbers a body has, so a
+// knee with one number can't be given a second.
+
+use body::joint::{Frame, Joint, Kind, NONE}
+use std::quat::Quat
+
+/// A segment of a body: its joint to its parent, and the far end of its bone in its own frame
+/// (where its child's joint is, or the end of the last part it carries). A segment's bone runs
+/// from its joint (its frame's origin) to its tip.
+pub struct Segment: Copy + Eq {
+    pub joint: Joint,
+    pub tip: vec3,
+}
+
+/// A body of `S` segments, the root first and each parent before its children, and where each
+/// segment's numbers start in a pose (`first`) and how many there are in all (`freedom`).
+pub struct Body<const S: u32>: Copy {
+    pub segments: [Segment; S],
+    pub first: [u32; S],
+    pub freedom: u32,
+}
+
+/// The body that `segments` make: checked (the root first, with no parent and a fixed joint, its
+/// frame the root's at rest; each parent before its children), and its numbers counted.
+pub fn body<const S: u32>(segments: [Segment; S]) -> Body<S> {
+    var first = [0; S]
+    var n: u32 = 0
+    for s in 0..S {
+        let j = segments[s].joint
+        if s == 0 {
+            assert(j.parent == NONE && j.kind == Kind::Fixed, "a body's first segment is its root")
+        } else {
+            assert(j.parent < s, f"segment {s}'s parent {j.parent} is not before it")
+        }
+        first[s] = n
+        n += j.freedom()
+    }
+    Body { segments, first, freedom: n }
+}
+
+/// A pose of a body with `D` numbers: the root's frame in the body's space, and each joint's
+/// numbers in the order of the segments.
+pub struct Pose<const D: u32>: Copy {
+    pub root: Frame,
+    pub q: [f32; D],
+}
+
+/// A part of a body's field and the segments it is on: from segment `from` along the tree to
+/// segment `to` (`to` is `from` or below it). Most parts are on one segment; a part that spans a
+/// chain of joints (a trunk from the pelvis to the chest) is on each segment of the chain, the
+/// nearest bone's at each point of it.
+pub struct Span: Copy + Eq {
+    pub from: u32,
+    pub to: u32,
+}
+
+/// A part on one segment.
+pub fn on(s: u32) -> Span {
+    Span { from: s, to: s }
+}
+
+impl<const S: u32> Body<S> {
+    /// How many numbers segment `s`'s joint has.
+    pub fn freedom_of(self, s: u32) -> u32 {
+        self.segments[s].joint.freedom()
+    }
+
+    /// Segment `s`'s numbers in `pose` (those past its count 0).
+    pub fn numbers<const D: u32>(self, pose: Pose<D>, s: u32) -> vec3 {
+        let (a, n) = (self.first[s], self.freedom_of(s))
+        vec3(
+            if n > 0 { pose.q[a] } else { 0.0 },
+            if n > 1 { pose.q[a + 1] } else { 0.0 },
+            if n > 2 { pose.q[a + 2] } else { 0.0 },
+        )
+    }
+
+    /// Sets segment `s`'s numbers in `pose` to `q` (those past its count are dropped).
+    pub fn set_numbers<const D: u32>(self, pose: mut Pose<D>, s: u32, q: vec3) {
+        let (a, n) = (self.first[s], self.freedom_of(s))
+        if n > 0 {
+            pose.q[a] = q.x
+        }
+        if n > 1 {
+            pose.q[a + 1] = q.y
+        }
+        if n > 2 {
+            pose.q[a + 2] = q.z
+        }
+    }
+
+    /// The body at rest: its root where its declaration puts it and each number 0.
+    pub fn rest<const D: u32>(self) -> Pose<D> {
+        assert(D == self.freedom, f"a pose of {D} numbers for a body of {self.freedom}")
+        Pose { root: self.segments[0].joint.at, q: [0.0; D] }
+    }
+
+    /// Where each segment is in `pose`, in the body's space: the root at the pose's root, each
+    /// other segment at its parent's frame, then its joint's frame, then its joint's turn.
+    pub fn places<const D: u32>(self, pose: Pose<D>) -> [Frame; S] {
+        var out = [Frame::identity(); S]
+        out[0] = pose.root
+        for s in 1..S {
+            let j = self.segments[s].joint
+            out[s] = out[j.parent].then(j.placed(self.numbers(pose, s)))
+        }
+        out
+    }
+
+    /// The pose whose segments turn, each in its parent, as `turns` say (each a segment's turn
+    /// in its parent's frame, its joint's frame included: as a rig's bones are written), the
+    /// root at `root`: each joint's numbers nearest to its turn (`joint::numbers_of`).
+    pub fn pose_of_turns<const D: u32>(self, root: Frame, turns: [Quat; S]) -> Pose<D> {
+        var p = self.rest()
+        p.root = root
+        for s in 1..S {
+            let j = self.segments[s].joint
+            let own = j.at.q.inverse().mul(turns[s])
+            self.set_numbers(mut p, s, body::joint::numbers_of(j.kind, own))
+        }
+        p
+    }
+
+    /// Whether segment `a` is `b` or above it.
+    pub fn above(self, a: u32, b: u32) -> bool {
+        var s = b
+        loop {
+            if s == a {
+                return true
+            }
+            if s == NONE || s == 0 {
+                return false
+            }
+            s = self.segments[s].joint.parent
+        }
+    }
+
+    /// Whether `a` and `b` are joined (one the other's parent) or are the same.
+    pub fn neighbours(self, a: u32, b: u32) -> bool {
+        a == b || self.segments[a].joint.parent == b || self.segments[b].joint.parent == a
+    }
+
+    /// The bone of segment `s` in frames `at` (`places`): from its joint to its tip.
+    pub fn bone(self, at: [Frame; S], s: u32) -> (vec3, vec3) {
+        (at[s].t, at[s].apply(self.segments[s].tip))
+    }
+
+    /// Of the segments of `span`'s chain, the one whose bone is nearest `p`, the body in
+    /// frames `at`.
+    pub fn nearest_on(self, at: [Frame; S], span: Span, p: vec3) -> u32 {
+        if span.from == span.to {
+            return span.from
+        }
+        var best = span.to
+        var d_best = 1.0e30
+        var s = span.to
+        loop {
+            let (a, b) = self.bone(at, s)
+            let d = segment_distance(p, a, b)
+            if d < d_best {
+                d_best = d
+                best = s
+            }
+            if s == span.from || s == 0 {
+                break
+            }
+            s = self.segments[s].joint.parent
+        }
+        best
+    }
+}
+
+/// The distance from `p` to the segment from `a` to `b`.
+pub fn segment_distance(p: vec3, a: vec3, b: vec3) -> f32 {
+    let ab = b - a
+    let l2 = dot(ab, ab)
+    let t = if l2 > 1.0e-12 { clamp(dot(p - a, ab) / l2, 0.0, 1.0) } else { 0.0 }
+    length(p - (a + ab * t))
+}
+
+// ---- tests ------------------------------------------------------------------------------------
+
+/// A small test body: a root, a ball joint, a hinge, a universal joint.
+fn test_body() -> Body<4> {
+    let j = |kind: Kind, parent: u32, t: vec3| Joint {
+        kind,
+        parent,
+        at: Frame { q: Quat::identity(), t },
+        lo: vec3(-1.0),
+        hi: vec3(1.0),
+        strength: vec3(50.0),
+    }
+    body(
+        [
+            Segment { joint: j(Kind::Fixed, NONE, vec3(0.0, 1.0, 0.0)), tip: vec3(0.0, 0.3, 0.0) },
+            Segment { joint: j(Kind::Ball, 0, vec3(0.0, 0.3, 0.0)), tip: vec3(0.0, 0.3, 0.0) },
+            Segment { joint: j(Kind::Hinge, 1, vec3(0.0, 0.3, 0.0)), tip: vec3(0.0, 0.25, 0.0) },
+            Segment {
+                joint: j(Kind::Universal, 2, vec3(0.0, 0.25, 0.0)),
+                tip: vec3(0.0, 0.1, 0.0),
+            },
+        ],
+    )
+}
+
+@test
+fn a_body_counts_its_numbers_and_places_its_segments() {
+    let b = test_body()
+    assert(b.freedom == 6 && b.first[3] == 4)
+    let rest: Pose<6> = b.rest()
+    let at = b.places(rest)
+    assert(length(at[3].t - vec3(0.0, 1.85, 0.0)) < 1.0e-6, f"tip {at[3].t}")
+    // The hinge bent a quarter turn about x: the last segment lies along +z.
+    var p: Pose<6> = b.rest()
+    b.set_numbers(mut p, 2, vec3(1.5707964, 0.0, 0.0))
+    let bent = b.places(p)
+    let (a, e) = b.bone(bent, 3)
+    assert(length(normalize(e - a) - vec3(0.0, 0.0, 1.0)) < 1.0e-5, f"bone {a} to {e}")
+    // A pose read back from its segments' turns is the same pose.
+    var q: Pose<6> = b.rest()
+    for k in 0..6 {
+        q.q[k] = 0.3 * sin(f32(k) * 1.7 + 0.4)
+    }
+    let placed = b.places(q)
+    var turns = [Quat::identity(); 4]
+    for s in 1..4 {
+        turns[s] = placed[b.segments[s].joint.parent].q.inverse().mul(placed[s].q)
+    }
+    let back: Pose<6> = b.pose_of_turns(q.root, turns)
+    for k in 0..6 {
+        assert(abs(back.q[k] - q.q[k]) < 2.0e-5, f"number {k}: {back.q[k]} for {q.q[k]}")
+    }
+}

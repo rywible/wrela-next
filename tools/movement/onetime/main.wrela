@@ -1,0 +1,624 @@
+// Run once (docs/plans/bodies-and-movement.md, phase 1 steps 10 and 11), with the old code still
+// in the tree: reads the rig the walk was captured on (`rules::rig`, Quaternius's Superhero Male),
+// the walk on it (`rules::gaits::walk`, ACCAD's) and the creature's parts (`world::creature`, on
+// Hakuro's skeleton, `world::skeleton`), and prints
+//
+// - `@@body ` lines: game/world/creature_segments.wrela, the creature's segments (the rig's bones
+//   but its fingers, at the creature's scale), their joints, ranges and strengths, its bind pose
+//   and its parts, each end a point of a segment;
+// - `@@walk ` lines: game/rules/walk.wrela, the walk as a cycle of the numbers of those joints,
+//   each frame of the old walk fitted by `engine::body::fit` (a knee is a hinge, so what the old
+//   walk's knee did to the side is carried by the hip and the ankle), then a Fourier series for
+//   each number;
+// - a report: how far the new pose puts each part's ends from where the old palette put them.
+//
+//     tools/wrela tool tools/movement/onetime > out.txt
+//
+// Its outputs are in git; the old code it reads is removed in the same change, so this tool
+// builds only at that change's parent.
+
+use engine::body::body::{Body, Pose, Segment, Span, body}
+use engine::body::fit::{Aim, aim_frame, aim_point, fit}
+use engine::body::joint::{Frame, Joint, Kind, NONE, numbers_of, turn_of_vector, vector_of_turn}
+use kit::motion::humanoid::{BONES, Rig, Rigid}
+use rules::gaits::walk
+use rules::rig::rig
+use std::collections::Vec
+use std::io::print
+use std::math::{PI, TAU}
+use std::quat::Quat
+use world::skeleton::{HAKURO_BONE, REST}
+
+/// The rig's bones the creature rides: all but the fingers.
+const N: u32 = 22
+
+/// The creature's scale against the rig (`world::creature::SCALE`).
+const SCALE: f32 = 0.6
+
+/// The bind pose's arms: dropped this far about the body's z from the T-pose
+/// (`world::creature`'s `A_POSE_ARM`).
+const A_POSE_ARM: f32 = 0.96
+
+/// How many harmonics each number of the walk keeps, and the least amplitude kept (rad or m).
+const HARMONICS: u32 = 14
+const LEAST: f32 = 0.00005
+
+/// The segments' names, in the rig's order.
+const NAMES: [Text; N] = [
+    "PELVIS", "SPINE", "CHEST", "UPPER_CHEST", "NECK", "HEAD", "THIGH_LEFT", "SHIN_LEFT",
+    "FOOT_LEFT", "TOES_LEFT", "THIGH_RIGHT", "SHIN_RIGHT", "FOOT_RIGHT", "TOES_RIGHT",
+    "COLLAR_LEFT", "UPPER_ARM_LEFT", "FOREARM_LEFT", "HAND_LEFT", "COLLAR_RIGHT",
+    "UPPER_ARM_RIGHT", "FOREARM_RIGHT", "HAND_RIGHT",
+]
+
+/// Each segment's joint: its kind, its range (`lo`, `hi`: rad, as `engine::body::joint` reads
+/// them) and the strength of each number (N m, for a grown man: scaled to the creature below).
+/// The ranges are a person's, after the AAOS's and Soucie et al.'s (2011) tables of normal
+/// motion, read about the rig's axes (x across the joint, y along the segment): a flex, a lean
+/// across it and a twist; each is widened where the old walk or the bind pose goes past it (the
+/// report says where). The strengths are of the size of a grown man's greatest torques
+/// (NASA-STD-3000, vol. I, 4.9.3; not read at its source).
+struct Spec: Copy {
+    kind: Kind,
+    lo: vec3,
+    hi: vec3,
+    strength: vec3,
+}
+
+fn spec(s: u32) -> Spec {
+    let ball = |lo: vec3, hi: vec3, st: vec3| Spec { kind: Kind::Ball, lo, hi, strength: st }
+    let deg = PI / 180.0
+    match s {
+        0 => Spec { kind: Kind::Fixed, lo: vec3(0.0), hi: vec3(0.0), strength: vec3(0.0) },
+        // The spine in three, the lumbar and the thoracic: a third of each motion each.
+        1 | 2 | 3 => ball(vec3(-25.0, -12.0, -12.0) * deg, vec3(25.0, 12.0, 12.0) * deg, vec3(150.0)),
+        4 => ball(vec3(-35.0, -25.0, -40.0) * deg, vec3(35.0, 25.0, 40.0) * deg, vec3(40.0)),
+        5 => ball(vec3(-30.0, -20.0, -40.0) * deg, vec3(30.0, 20.0, 40.0) * deg, vec3(25.0)),
+        // A hip: flexion 120 and extension 30, abduction 45 and adduction 30, rotation 45.
+        6 | 10 => ball(vec3(-120.0, -45.0, -45.0) * deg, vec3(120.0, 45.0, 45.0) * deg, vec3(200.0)),
+        // A knee: flexion 0 to 140 (its sign the walk's), then the shin's turn about its length,
+        // 35 each way: a knee can't bend to the side.
+        7 | 11 => Spec {
+            kind: Kind::Universal,
+            lo: vec3(-5.0 * deg, -35.0 * deg, 0.0),
+            hi: vec3(140.0 * deg, 35.0 * deg, 0.0),
+            strength: vec3(200.0, 30.0, 0.0),
+        },
+        // An ankle and the joints of the foot below it: dorsiflexion 20 and plantarflexion 50,
+        // the foot turned in and out 30, inversion 35 and eversion 15.
+        8 | 12 => ball(vec3(-50.0, -30.0, -35.0) * deg, vec3(50.0, 30.0, 35.0) * deg, vec3(150.0, 40.0, 40.0)),
+        // Toes: flexion 40, extension 70.
+        9 | 13 => Spec {
+            kind: Kind::Hinge,
+            lo: vec3(-70.0 * deg, 0.0, 0.0),
+            hi: vec3(70.0 * deg, 0.0, 0.0),
+            strength: vec3(30.0, 0.0, 0.0),
+        },
+        // A collarbone: elevation and protraction of some 20 each way.
+        14 | 18 => ball(vec3(-20.0, -20.0, -15.0) * deg, vec3(20.0, 20.0, 15.0) * deg, vec3(80.0)),
+        // A shoulder from the T-pose: the arm down by its side to up by the head, forward and
+        // back; rotation 90 each way.
+        15 | 19 => ball(vec3(-120.0, -120.0, -90.0) * deg, vec3(120.0, 120.0, 90.0) * deg, vec3(80.0)),
+        // An elbow: flexion 0 to 145, then pronation and supination 80 each way.
+        16 | 20 => Spec {
+            kind: Kind::Universal,
+            lo: vec3(-145.0 * deg, -80.0 * deg, 0.0),
+            hi: vec3(145.0 * deg, 80.0 * deg, 0.0),
+            strength: vec3(70.0, 12.0, 0.0),
+        },
+        // A wrist: flexion 70 and extension 70, radial and ulnar deviation 30; little twist.
+        _ => ball(vec3(-70.0, -30.0, -10.0) * deg, vec3(70.0, 30.0, 10.0) * deg, vec3(15.0)),
+    }
+}
+
+/// The rig's bone each Hakuro bone rides on (the inverse of `HAKURO_BONE`), or `NONE`.
+fn rig_bone_of(h: u32) -> u32 {
+    if h == 14 || h == 15 {
+        return rig_bone_of(h - 2)
+    }
+    for b in 0..52 {
+        if HAKURO_BONE[b] == h {
+            return b
+        }
+    }
+    NONE
+}
+
+fn frame_of(r: Rigid) -> Frame {
+    Frame { q: r.q, t: r.t }
+}
+
+fn scaled(f: Frame) -> Frame {
+    Frame { q: f.q, t: f.t * SCALE }
+}
+
+/// Each rig bone's frame in the body's space for one frame of the clip (`palette`'s `world`).
+fn world_of(r: Rig, turns: Vec<Quat>, at: u32, nb: u32, hips: vec3) -> [Frame; N] {
+    var out = [Frame::identity(); N]
+    for b in 0..N {
+        let rb = r.bones[b]
+        let q = turns[at * nb + b]
+        out[b] = if rb.parent == NONE {
+            frame_of(r.base).then(Frame { q, t: hips })
+        } else {
+            out[rb.parent].then(Frame { q, t: rb.rest.t })
+        }
+    }
+    out
+}
+
+/// A float as wrela writes one: with a point or an exponent.
+fn lit(x: f32) -> String {
+    let s = f"{x}"
+    let t = s.as_str()
+    if t.find(".").is_some() || t.find("e").is_some() || t.find("inf").is_some() || t.find("NaN").is_some() {
+        s
+    } else {
+        f"{s}.0"
+    }
+}
+
+fn v3(v: vec3) -> String {
+    f"vec3({lit(v.x)}, {lit(v.y)}, {lit(v.z)})"
+}
+
+fn quat(q: Quat) -> String {
+    f"Quat {{ v: vec4({lit(q.v.x)}, {lit(q.v.y)}, {lit(q.v.z)}, {lit(q.v.w)}) }}"
+}
+
+fn frame_lit(f: Frame) -> String {
+    f"Frame {{ q: {quat(f.q)}, t: {v3(f.t)} }}"
+}
+
+fn kind_lit(k: Kind) -> Text {
+    match k {
+        Kind::Fixed => "Kind::Fixed",
+        Kind::Hinge => "Kind::Hinge",
+        Kind::Universal => "Kind::Universal",
+        Kind::Ball => "Kind::Ball",
+    }
+}
+
+/// The turn that takes x to `a` and keeps y as near as it can: a joint frame whose x is a flex
+/// axis found in the walk.
+fn aligned(a: vec3, y: vec3) -> Quat {
+    let x = normalize(a - y * dot(a, y))
+    let yy = normalize(y - x * dot(y, x))
+    let z = cross(x, yy)
+    Quat::from_mat3(mat3(x, yy, z))
+}
+
+/// A part of the creature as the old code wrote it: from Hakuro bone `a` (plus `oa`, at rest) to
+/// bone `b` (plus `ob`), `ra` and `rb` thick (at the skeleton's scale), on the segments of `span`.
+struct OldPart: Copy {
+    a: u32,
+    oa: vec3,
+    ra: f32,
+    b: u32,
+    ob: vec3,
+    rb: f32,
+    from: u32,
+    to: u32,
+}
+
+fn old_parts() -> Vec<OldPart> {
+    let p = |a: u32, oa: vec3, ra: f32, b: u32, ob: vec3, rb: f32, from: u32, to: u32| OldPart {
+        a,
+        oa,
+        ra,
+        b,
+        ob,
+        rb,
+        from,
+        to,
+    }
+    let z = vec3(0.0)
+    var out: Vec<OldPart> = Vec::new()
+    out.push(p(0, z, 0.17, 3, z, 0.16, 0, 3))
+    out.push(p(3, z, 0.16, 4, z, 0.1, 3, 4))
+    out.push(p(5, vec3(0.0, 0.1, 0.02), 0.25, 5, vec3(0.0, 0.16, 0.03), 0.23, 5, 5))
+    for side in 0..2 {
+        let (ua, fa, hand, th, shin, foot, toes) = if side == 0 {
+            (15, 16, 17, 6, 7, 8, 9)
+        } else { (19, 20, 21, 10, 11, 12, 13) }
+        out.push(p(8 + side, z, 0.065, 10 + side, z, 0.058, ua, ua))
+        out.push(p(10 + side, z, 0.058, 12 + side, z, 0.05, fa, fa))
+        out.push(p(12 + side, z, 0.05, 14 + side, z, 0.045, hand, hand))
+        out.push(p(18 + side, z, 0.09, 20 + side, z, 0.072, th, th))
+        out.push(p(20 + side, z, 0.072, 22 + side, z, 0.056, shin, shin))
+        out.push(p(22 + side, z, 0.056, 24 + side, z, 0.046, foot, toes))
+        let out_x = if side == 0 { 1.0 } else { -1.0 }
+        out.push(
+            p(5, vec3(0.13 * out_x, 0.3, 0.02), 0.05, 5, vec3(0.2 * out_x, 0.52, 0.0), 0.0125, 5, 5),
+        )
+    }
+    out.push(p(13, z, 0.0084, 13, vec3(-0.12, 0.3, 0.5), 0.0084, 21, 21))
+    out
+}
+
+/// Where the old code put the point `off` from Hakuro bone `h`'s joint: the rig's palette
+/// matrix (`W ibm`) on the T-pose point, at the creature's scale.
+fn old_point(r: Rig, w: [Frame; N], h: u32, off: vec3) -> vec3 {
+    let b = rig_bone_of(h)
+    let m = w[b].matrix() * r.bones[b].ibm
+    (m * vec4(REST[h] + off, 1.0)).xyz * SCALE
+}
+
+/// The same point as a point of its segment: `ibm` on the T-pose point, at the creature's scale.
+fn local_point(r: Rig, h: u32, off: vec3, seg: [Frame; N], rest_w: [Frame; N]) -> vec3 {
+    let b = rig_bone_of(h)
+    // In the rig bone's own frame, then in the segment's (whose frame may be turned from the
+    // bone's by its joint's alignment).
+    let bone_local = (r.bones[b].ibm * vec4(REST[h] + off, 1.0)).xyz * SCALE
+    let in_body = scaled(rest_w[b]).apply(bone_local)
+    seg[b].inverse().apply(in_body)
+}
+
+pub fn tool() -> u32 {
+    let r = rig()
+    let m = walk()
+    let c = m.clip.clone()
+    let nb = c.bones
+    let frames = c.frames - 1
+    print(f"the walk: {frames} frames a cycle at {c.fps} fps")
+    // ---- the frames of the old walk, and the rest -------------------------------------------
+    var rest_turns: Vec<Quat> = Vec::new()
+    for b in 0..nb {
+        rest_turns.push(r.bones[b].rest.q)
+    }
+    let rest_w = world_of(r.clone(), rest_turns, 0, nb, r.bones[0].rest.t)
+    var old: Vec<[Frame; N]> = Vec::new()
+    for f in 0..frames {
+        old.push(world_of(r.clone(), c.turns.clone(), f, nb, c.hips[f]))
+    }
+    // ---- each joint's frame: the rig bone's, its x along the flex the walk makes ---------------
+    var segs = [Segment {
+        joint: Joint {
+            kind: Kind::Fixed,
+            parent: NONE,
+            at: Frame::identity(),
+            lo: vec3(0.0),
+            hi: vec3(0.0),
+            strength: vec3(0.0),
+        },
+        tip: vec3(0.0),
+    }; N]
+    for b in 0..N {
+        let rb = r.bones[b]
+        let sp = spec(b)
+        var align = Quat::identity()
+        if sp.kind == Kind::Hinge || sp.kind == Kind::Universal {
+            // The walk's main axis of turn about its mean, in the bone's rest frame.
+            var mean = vec3(0.0)
+            for f in 0..frames {
+                mean += vector_of_turn(rb.rest.q.inverse().mul(c.turns[f * nb + b]))
+            }
+            mean = mean / f32(frames)
+            var cov = mat3(vec3(0.0), vec3(0.0), vec3(0.0))
+            for f in 0..frames {
+                let w = vector_of_turn(rb.rest.q.inverse().mul(c.turns[f * nb + b]))
+                cov = cov + mat3(w * w.x, w * w.y, w * w.z)
+            }
+            var axis = vec3(0.9, 0.1, 0.1)
+            for _ in 0..60 {
+                axis = normalize(cov * axis)
+            }
+            // Its sign: the walk's mean turn about it positive (a knee bends to positive numbers).
+            if dot(mean, axis) < 0.0 {
+                axis = -axis
+            }
+            align = aligned(axis, vec3(0.0, 1.0, 0.0))
+        }
+        let at = if b == 0 {
+            scaled(rest_w[0])
+        } else { Frame { q: rb.rest.q.mul(align), t: rb.rest.t * SCALE } }
+        segs[b].joint = Joint {
+            kind: sp.kind,
+            parent: rb.parent,
+            at,
+            lo: sp.lo,
+            hi: sp.hi,
+            strength: sp.strength * (SCALE * SCALE * SCALE),
+        }
+    }
+    // Each segment's frame at rest (the T-pose), with its alignment.
+    var seg_rest = [Frame::identity(); N]
+    for b in 0..N {
+        let j = segs[b].joint
+        seg_rest[b] = if b == 0 { j.at } else { seg_rest[j.parent].then(j.at) }
+    }
+    // Tips: the child's joint (the first child in the rig), else a point ahead along its bone.
+    for b in 0..N {
+        var tip = vec3(0.0)
+        var found = false
+        for k in b + 1..N {
+            if r.bones[k].parent == b && !found {
+                tip = seg_rest[b].inverse().apply(seg_rest[k].t)
+                found = true
+            }
+        }
+        if !found {
+            // Hand: its fingers' joint; toes: 5 cm on; head: its crown.
+            let h = HAKURO_BONE[b]
+            let off = if b == 17 || b == 21 { REST[h + 2] - REST[h] } else if b == 5 {
+                vec3(0.0, 0.4, 0.0)
+            } else { vec3(0.0, 0.0, 0.08) }
+            tip = local_point(r.clone(), h, off, seg_rest, rest_w)
+        }
+        segs[b].tip = tip
+    }
+    let bod: Body<N> = body(segs)
+    let parts = old_parts()
+    print(f"the creature: {N} segments, {bod.freedom} numbers")
+    // ---- the walk, fitted a frame at a time ---------------------------------------------------
+    var fitted: Vec<Pose<55>> = Vec::new()
+    var prev: Pose<55> = bod.rest()
+    var worst_place = 0.0
+    var worst_turn = 0.0
+    // Round the cycle once and a third: its first frames fitted again from its last, as a frame
+    // after a frame (the first, from its turns alone, can settle short of the best).
+    for g in 0..frames + frames / 3 {
+        let f = g % frames
+        let w = old[f]
+        var turns = [Quat::identity(); N]
+        for b in 1..N {
+            turns[b] = w[r.bones[b].parent].q.inverse().mul(w[b].q)
+        }
+        let target_root = scaled(w[0])
+        let start: Pose<55> = if g == 0 { bod.pose_of_turns(target_root, turns) } else { prev }
+        var aims: Vec<Aim> = Vec::new()
+        for b in 0..N {
+            // Each segment's joint where the old rig had it, its turn weighed a little (what
+            // carries no part's end, and the twist of a round cone, which can't be seen).
+            let sf = scaled(w[b]).then(Frame { q: if b == 0 {
+                Quat::identity()
+            } else { r.bones[b].rest.q.inverse().mul(segs[b].joint.at.q) }, t: vec3(0.0) })
+            aims.push(aim_frame(b, sf, 1.0, 0.02))
+        }
+        // Each end of each part where the old palette put it: what is seen.
+        for pt in parts {
+            for e in 0..2 {
+                let (h, off) = if e == 0 { (pt.a, pt.oa) } else { (pt.b, pt.ob) }
+                let s = rig_bone_of(h)
+                aims.push(
+                    aim_point(s, local_point(r.clone(), h, off, seg_rest, rest_w), old_point(r.clone(), w, h, off), 3.0),
+                )
+            }
+        }
+        let fr = fit(bod, aims, start, if g == 0 { 400 } else { 60 })
+        prev = fr.pose
+        if g < frames {
+            fitted.push(fr.pose)
+        } else {
+            fitted[f] = fr.pose
+        }
+    }
+    print(f"the fit: each segment's joint against the old rig's:")
+    // Each segment's worst, over the frames.
+    for b in 0..N {
+        var wp = 0.0
+        var wt = 0.0
+        for f in 0..frames {
+            let at = bod.places(fitted[f])
+            let sf = scaled(old[f][b]).then(Frame { q: if b == 0 {
+                Quat::identity()
+            } else { r.bones[b].rest.q.inverse().mul(segs[b].joint.at.q) }, t: vec3(0.0) })
+            wp = max(wp, length(at[b].t - sf.t))
+            wt = max(wt, length(vector_of_turn(sf.q.inverse().mul(at[b].q))))
+        }
+        print(f"   {NAMES[b]}: {wp * 1000.0} mm, {wt} rad")
+    }
+    // ---- each part's ends against the old palette's ---------------------------------------------
+    var worst_end = 0.0
+    var worst_at = 0
+    for f in 0..frames {
+        let at = bod.places(fitted[f])
+        for i in 0..parts.len() {
+            let pt = parts[i]
+            for e in 0..2 {
+                let (h, off) = if e == 0 { (pt.a, pt.oa) } else { (pt.b, pt.ob) }
+                let s = rig_bone_of(h)
+                let new_p = at[s].apply(local_point(r.clone(), h, off, seg_rest, rest_w))
+                let old_p = old_point(r.clone(), old[f], h, off)
+                let d = length(new_p - old_p)
+                if d > worst_end {
+                    worst_end = d
+                    worst_at = i
+                }
+            }
+        }
+    }
+    print(f"each part's ends against the old palette's: the worst {worst_end * 1000.0} mm (part {worst_at})")
+    // ---- the ranges against the walk and the bind pose ----------------------------------------
+    var lo = [vec3(1.0e9); N]
+    var hi = [vec3(-1.0e9); N]
+    for f in 0..frames {
+        for b in 1..N {
+            let q = bod.numbers(fitted[f], b)
+            lo[b] = min(lo[b], q)
+            hi[b] = max(hi[b], q)
+        }
+    }
+    // The bind pose: the T-pose with its arms dropped about the body's z at the shoulder.
+    var bind_turns = [Quat::identity(); N]
+    var bind_w = rest_w
+    for side in 0..2 {
+        let ua = if side == 0 { 15 } else { 19 }
+        let s = if side == 0 { -1.0 } else { 1.0 }
+        let drop = Quat::axis_angle(vec3(0.0, 0.0, 1.0), s * A_POSE_ARM)
+        let piv = rest_w[ua].t
+        for b in ua..ua + 3 {
+            bind_w[b] = Frame { q: drop.mul(rest_w[b].q), t: piv + drop.rotate(rest_w[b].t - piv) }
+        }
+    }
+    for b in 1..N {
+        bind_turns[b] = bind_w[r.bones[b].parent].q.inverse().mul(bind_w[b].q)
+    }
+    let bind: Pose<55> = bod.pose_of_turns(scaled(rest_w[0]), bind_turns)
+    for b in 1..N {
+        let q = bod.numbers(bind, b)
+        lo[b] = min(lo[b], q)
+        hi[b] = max(hi[b], q)
+    }
+    let margin = 0.05
+    var final_segs = segs
+    for b in 1..N {
+        var j = segs[b].joint
+        let n = j.freedom()
+        for k in 0..n {
+            if lo[b][k] - margin < j.lo[k] {
+                print(f"widened: {NAMES[b]} number {k} down from {j.lo[k]} to {lo[b][k] - margin}")
+                j.lo[k] = lo[b][k] - margin
+            }
+            if hi[b][k] + margin > j.hi[k] {
+                print(f"widened: {NAMES[b]} number {k} up from {j.hi[k]} to {hi[b][k] + margin}")
+                j.hi[k] = hi[b][k] + margin
+            }
+        }
+        final_segs[b].joint = j
+    }
+    // ---- the body's file ----------------------------------------------------------------------
+    print("@@body // Written by tools/movement/onetime (docs/plans/bodies-and-movement.md, phase 1 step 10):")
+    print("@@body // don't edit it by hand. The creature's segments: the bones of the rig its walk was captured")
+    print("@@body // on (Quaternius's Superhero Male, CC0: docs/citations.md) but its fingers, at the creature's")
+    print("@@body // scale (0.6), each joint's x axis along the flex the old walk made about it; their ranges")
+    print("@@body // and strengths (tools/movement/onetime's `spec`); the bind pose its skin is made in (the")
+    print("@@body // T-pose, its arms dropped 0.96 rad); and each part, its ends points of segments.")
+    print("@@body")
+    print("@@body use engine::body::body::{Segment, Span}")
+    print("@@body use engine::body::skin::{Cone, End}")
+    print("@@body use engine::body::joint::{Frame, Joint, Kind, NONE}")
+    print("@@body use std::quat::Quat")
+    print("@@body")
+    print(f"@@body /// How many segments it has, and how many numbers a pose of it holds.")
+    print(f"@@body pub const SEGMENTS: u32 = {N}")
+    print(f"@@body pub const FREEDOM: u32 = {bod.freedom}")
+    print("@@body")
+    for b in 0..N {
+        print(f"@@body pub const {NAMES[b]}: u32 = {b}")
+    }
+    print("@@body")
+    print("@@body /// Its segments, each parent before its children.")
+    print(f"@@body pub const SEGMENT_LIST: [Segment; SEGMENTS] = [")
+    for b in 0..N {
+        let j = final_segs[b].joint
+        let parent = if j.parent == NONE { String::from("NONE") } else { String::from(NAMES[j.parent]) }
+        print(f"@@body     Segment {{")
+        print(f"@@body         joint: Joint {{")
+        print(f"@@body             kind: {kind_lit(j.kind)},")
+        print(f"@@body             parent: {parent},")
+        print(f"@@body             at: {frame_lit(j.at)},")
+        print(f"@@body             lo: {v3(j.lo)},")
+        print(f"@@body             hi: {v3(j.hi)},")
+        print(f"@@body             strength: {v3(j.strength)},")
+        print(f"@@body         }},")
+        print(f"@@body         tip: {v3(final_segs[b].tip)},")
+        print(f"@@body     }},")
+    }
+    print("@@body ]")
+    print("@@body")
+    print("@@body /// The bind pose's root and numbers: the pose its skin is made in.")
+    print(f"@@body pub const BIND_ROOT: Frame = {frame_lit(bind.root)}")
+    var bl = String::from("@@body pub const BIND_NUMBERS: [f32; FREEDOM] = [")
+    for k in 0..55 {
+        bl.push_str(f"{lit(bind.q[k])}, ")
+    }
+    print(f"{bl}]")
+    print("@@body")
+    print(f"@@body /// Its parts, each a round cone between points of its segments: its trunk, its neck, its head, then each side's arm (three), leg (three) and")
+    print(f"@@body /// ear, and the wand in its right hand.")
+    print(f"@@body pub const PARTS: [Cone; {parts.len()}] = [")
+    for pt in parts {
+        let (sa, sb) = (rig_bone_of(pt.a), rig_bone_of(pt.b))
+        let la = local_point(r.clone(), pt.a, pt.oa, seg_rest, rest_w)
+        let lb = local_point(r.clone(), pt.b, pt.ob, seg_rest, rest_w)
+        print(f"@@body     Cone {{")
+        print(f"@@body         a: End {{ on: {NAMES[sa]}, at: {v3(la)} }},")
+        print(f"@@body         ra: {lit(pt.ra * SCALE)},")
+        print(f"@@body         b: End {{ on: {NAMES[sb]}, at: {v3(lb)} }},")
+        print(f"@@body         rb: {lit(pt.rb * SCALE)},")
+        print(f"@@body         span: Span {{ from: {NAMES[pt.from]}, to: {NAMES[pt.to]} }},")
+        print(f"@@body     }},")
+    }
+    print("@@body ]")
+    // ---- the walk's file: a Fourier series of each number ------------------------------------
+    // The root: its place, and its turn about its mean as a rotation vector, then each number.
+    var mean_q = vec4(0.0)
+    for f in 0..frames {
+        var v = fitted[f].root.q.v
+        if dot(v, fitted[0].root.q.v) < 0.0 {
+            v = -v
+        }
+        mean_q += v
+    }
+    let root_q = Quat { v: normalize(mean_q) }
+    let channels = 6 + 55
+    var means: Vec<f32> = Vec::filled(channels, 0.0)
+    var waves: Vec<String> = Vec::new()
+    var kept = 0
+    for ch in 0..channels {
+        var xs: Vec<f32> = Vec::with_capacity(frames)
+        for f in 0..frames {
+            let p = fitted[f]
+            let x = if ch < 3 { p.root.t[ch] } else if ch < 6 {
+                vector_of_turn(root_q.inverse().mul(p.root.q))[ch - 3]
+            } else { p.q[ch - 6] }
+            xs.push(x)
+        }
+        var mean = 0.0
+        for x in xs {
+            mean += x
+        }
+        mean = mean / f32(frames)
+        means[ch] = mean
+        for k in 1..HARMONICS + 1 {
+            var a = 0.0
+            var bsum = 0.0
+            for f in 0..frames {
+                let ph = TAU * f32(k) * f32(f) / f32(frames)
+                a += (xs[f] - mean) * cos(ph)
+                bsum += (xs[f] - mean) * sin(ph)
+            }
+            a = a * 2.0 / f32(frames)
+            bsum = bsum * 2.0 / f32(frames)
+            if abs(a) > LEAST || abs(bsum) > LEAST {
+                waves.push(f"        wave({ch}, {k}, {lit(a)}, {lit(bsum)}),")
+                kept += 1
+            }
+        }
+    }
+    print(f"the walk: {kept} harmonics kept")
+    print("@@walk // Written by tools/movement/onetime (docs/plans/bodies-and-movement.md, phase 1 step 11):")
+    print("@@walk // don't edit it by hand. The walk: ACCAD's Male 2 walking (Open Motion Project by ACCAD/The")
+    print("@@walk // Ohio State University, CC BY 3.0), as it was retargeted to Quaternius's rig and fitted as a")
+    print("@@walk // cycle of each bone's turn (this file before, in git), each of its frames fitted to the")
+    print("@@walk // creature's joints (`engine::body::fit`) and then fitted as a Fourier series of each number,")
+    print("@@walk // in place.")
+    print("@@walk")
+    print("@@walk use engine::body::joint::Frame")
+    print("@@walk use kit::motion::cycle::{Cycle, wave}")
+    print("@@walk use std::collections::Vec")
+    print("@@walk use std::quat::Quat")
+    print("@@walk use world::creature_segments::FREEDOM")
+    print("@@walk")
+    print("@@walk /// The walk: one cycle of the creature's root (its place, and its turn about `root` as a")
+    print("@@walk /// rotation vector: series 0 to 5) and of each of its numbers (series 6 on).")
+    print("@@walk pub fn walk() -> Cycle<FREEDOM> {")
+    print("@@walk     Cycle {")
+    print(f"@@walk         period: {lit(c.length())},")
+    print(f"@@walk         travel: {v3(m.root[c.frames - 1] * SCALE)},")
+    print(f"@@walk         root: {quat(root_q)},")
+    var ml = String::from("@@walk         means: Vec::from([")
+    for ch in 0..channels {
+        ml.push_str(f"{lit(means[ch])}, ")
+    }
+    print(f"{ml}]),")
+    print("@@walk         waves: Vec::from([")
+    for w in waves {
+        print(f"@@walk {w}")
+    }
+    print("@@walk         ]),")
+    print("@@walk     }")
+    print("@@walk }")
+    0
+}

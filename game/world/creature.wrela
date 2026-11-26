@@ -1,35 +1,35 @@
 // A small two-legged creature of rounded parts, the volume spike's walking stand-in
 // (spike/volume, spikes/volume/body.wrela), written as a plain author would write it: a round
-// cone between two joints of a skeleton as a move has posed them, the parts joined smoothly as
-// flesh is, and a wand in its hand joined almost sharply so it stays thin. It rides Hakuro's
-// skeleton (`skeleton`) scaled to about 1.2 m to its ears' tips. Two kinds of part are thin on
-// purpose: its ears' tips (1.5 cm through) and the wand (1 cm), so a picture that loses thin
+// cone between two points of its segments as a pose has placed them, the parts joined smoothly as
+// flesh is, and a wand in its hand joined almost sharply so it stays thin. Its body is declared
+// once (`creature_segments`, written by a tool from the rig its walk was captured on, at about
+// 1.2 m to its ears' tips): the engine poses it (`engine::body`), weighs it and skins it from
+// that. Two kinds of part are thin on purpose: its ears' tips (1.5 cm through) and the wand (1 cm), so a picture that loses thin
 // things is seen to.
 //
 // The spike's body worked out each part's constants on the CPU, chose which parts mattered near a
 // place and wrote its own gradient, because its engine needed it to. None of that is here: this
 // is std::field's round cones, one smooth union, and a substance.
 
-use kit::substances::matte::matte
-use skeleton::{
-    BALL_LEFT, CALF_LEFT, CALF_RIGHT, FINGERS_LEFT, FINGERS_RIGHT, FOOT_LEFT, FOOT_RIGHT,
-    FOREARM_LEFT, FOREARM_RIGHT, HAND_LEFT, HAND_RIGHT, HEAD, NECK, PELVIS, REST, SPINE_3,
-    THIGH_LEFT, THIGH_RIGHT, UPPER_ARM_LEFT, UPPER_ARM_RIGHT, posed,
-}
+use creature_segments::{BIND_NUMBERS, BIND_ROOT, FREEDOM, PARTS, SEGMENTS, SEGMENT_LIST}
+use engine::body::body::{Body, Pose, Span, body}
+use engine::body::joint::Frame
+use engine::body::mass::{Mass, masses, masses_by_grid}
+use engine::body::skin::{Skin, bones, skin, spans_of}
+use engine::body::sweep::{cleared, sweep}
+use engine::matter::density::Density
 use engine::matter::substance::Substance
 use engine::matter::verify::prove_field_facts
+use kit::substances::densities::TISSUE
+use kit::substances::matte::matte
 use std::cmp::Eq
 use std::derive::{Box3, Interval}
 use std::field::{
-    Bound, DualQuat, Field, FieldFacts, Live, MAX_SKIN_BONES, MAX_SKIN_PARTS, PartName, Pruned,
-    RoundCone, Skinned, SmoothUnion, SmoothUnionAll, Surface, With, pack_part_bones, round_cone,
-    skinned,
+    Bound, Field, FieldFacts, Live, PartName, Pruned, RoundCone, Skinned, SmoothUnion,
+    SmoothUnionAll, Surface, With, round_cone, skinned,
 }
 use std::hash::StateHash
-use std::transform::{rotate, rotate_z, translate}
-
-/// How large it is against the skeleton it rides (Hakuro's, a grown man's).
-pub const SCALE: f32 = 0.6
+use std::io::print
 
 /// How wide the join between two of its parts is (m), and the wand's join to its hand.
 pub const JOIN: f32 = 0.03
@@ -43,11 +43,11 @@ type CreatureRaw = SmoothUnion<With<SmoothUnionAll<RoundCone, 17>, Substance>, W
 
 /// The creature's underlying 17-part flesh + wand smooth-union field, carrying build-time proven
 /// `FieldFacts` so all 256 skinned instances erase transmissive, emissive, coat, and micro paths.
-pub struct CreatureBody: Copy + GpuData + Eq + StateHash {
+pub struct CreatureFlesh: Copy + GpuData + Eq + StateHash {
     pub inner: CreatureRaw,
 }
 
-impl Surface for CreatureBody {
+impl Surface for CreatureFlesh {
     @budget(work: 2048)
     fn distance(self, p: vec3) -> f32 {
         self.inner.distance(p)
@@ -105,7 +105,7 @@ impl Surface for CreatureBody {
     }
 }
 
-impl Field<Substance> for CreatureBody {
+impl Field<Substance> for CreatureFlesh {
     fn channels(self, p: vec3) -> Substance {
         self.inner.channels(p)
     }
@@ -119,340 +119,98 @@ impl Field<Substance> for CreatureBody {
     }
 }
 
-/// The creature: exact posed field paired with its rest-pose template and bone palette so the
-/// engine extracts the rest-pose mesh once and deforms it every frame on the GPU via DQS.
-pub type Creature = Skinned<CreatureBody>
+/// The creature's body: its segments and joints (`creature_segments`), each joint's range cut
+/// where its own flesh stops it (`engine::body::sweep::cleared`: 1 mm, from the bind pose).
+@fuel(2 ** 38)
+pub const BODY: Body<SEGMENTS> = cleared(body(SEGMENT_LIST), PARTS, BIND, 0.001, 64)
 
-/// Compact 16-bone subset of Hakuro's skeleton driving the creature's 18 parts.
-const CREATURE_BONES: u32 = 16
-const CREATURE_RIG_BONES: [u32; CREATURE_BONES] = [
-    PELVIS, // 0
-    SPINE_3, // 1
-    NECK, // 2
-    HEAD, // 3
-    UPPER_ARM_LEFT, // 4
-    FOREARM_LEFT, // 5
-    HAND_LEFT, // 6
-    THIGH_LEFT, // 7
-    CALF_LEFT, // 8
-    FOOT_LEFT, // 9
-    UPPER_ARM_RIGHT, // 10
-    FOREARM_RIGHT, // 11
-    HAND_RIGHT, // 12
-    THIGH_RIGHT, // 13
-    CALF_RIGHT, // 14
-    FOOT_RIGHT, // 15
-]
+/// The pose its skin is made in: the T-pose, its arms dropped.
+pub const BIND: Pose<FREEDOM> = Pose { root: BIND_ROOT, q: BIND_NUMBERS }
 
-/// Primary (start) bone for each of the 18 leaf parts (`0..17` body parts, `17` wand).
-const PART_BONES_START: [u32; MAX_SKIN_PARTS] = [
-    0, // 0: trunk (pelvis -> spine_3)
-    1, // 1: neck (spine_3 -> neck)
-    3, // 2: head
-    4, // 3: upper arm L
-    5, // 4: forearm L
-    6, // 5: hand L
-    7, // 6: thigh L
-    8, // 7: calf L
-    9, // 8: foot L
-    3, // 9: ear L (head)
-    10, // 10: upper arm R
-    11, // 11: forearm R
-    12, // 12: hand R
-    13, // 13: thigh R
-    14, // 14: calf R
-    15, // 15: foot R
-    3, // 16: ear R (head)
-    12, // 17: wand (hand R)
-    0,
-    0,
-    0,
-    0,
-    0,
-    0,
-    0,
-    0,
-    0,
-    0,
-    0,
-    0,
-    0,
-    0,
-]
+/// How many parts its field has (its flesh's 17 and the wand), and how many bones its skin
+/// moves with (`engine::body::skin`: a segment each, and a second for each forearm and shin,
+/// whose roll spreads along them).
+pub const PART_COUNT: u32 = 18
+pub const BONES: u32 = 26
 
-/// Secondary (end) bone for each part (blends start -> end along multi-bone trunk & neck segments).
-const PART_BONES_END: [u32; MAX_SKIN_PARTS] = [
-    1, // 0: trunk blends pelvis (0) -> spine_3 (1)
-    2, // 1: neck blends spine_3 (1) -> neck (2)
-    3, // 2: head
-    4, // 3: upper arm L
-    5, // 4: forearm L
-    6, // 5: hand L
-    7, // 6: thigh L
-    8, // 7: calf L
-    9, // 8: foot L
-    3, // 9: ear L
-    10, // 10: upper arm R
-    11, // 11: forearm R
-    12, // 12: hand R
-    13, // 13: thigh R
-    14, // 14: calf R
-    15, // 15: foot R
-    3, // 16: ear R
-    12, // 17: wand
-    0,
-    0,
-    0,
-    0,
-    0,
-    0,
-    0,
-    0,
-    0,
-    0,
-    0,
-    0,
-    0,
-    0,
-]
+/// The creature: its exact posed field and its bind-pose template, which the engine extracts once
+/// and deforms each frame on the GPU by its bones (`std::field::Skinned`).
+pub type Creature = Skinned<CreatureFlesh, BONES, PART_COUNT>
 
-/// Relaxed A-pose shoulder drop angle (rad, ~55° down from T-pose) so walking/casting arm swings
-/// stay within ±25° of the bind pose instead of bending 85° at the armpit.
-const A_POSE_ARM: f32 = 0.96
+pub const SPANS: [Span; PART_COUNT] = spans_of(PARTS)
+const SKIN: Skin<PART_COUNT> = skin(BODY, BIND, PARTS)
 
-/// Rigid bind matrix mapping a T-pose point on Hakuro bone `bone` into the creature's relaxed
-/// A-pose rest space (arms dropped by `A_POSE_ARM`, all other bones identity).
-fn bind_mat(bone: u32) -> mat4 {
-    if bone == UPPER_ARM_LEFT || bone == FOREARM_LEFT || bone == HAND_LEFT || bone == FINGERS_LEFT {
-        let p = REST[UPPER_ARM_LEFT]
-        return translate(p) * rotate_z(-A_POSE_ARM) * translate(-p)
-    }
-    if bone == UPPER_ARM_RIGHT ||
-        bone == FOREARM_RIGHT ||
-        bone == HAND_RIGHT ||
-        bone == FINGERS_RIGHT {
-        let p = REST[UPPER_ARM_RIGHT]
-        return translate(p) * rotate_z(A_POSE_ARM) * translate(-p)
-    }
-    translate(vec3(0.0))
+/// Part `i` (of its flesh, or the wand) with its segments at `at`.
+fn part(at: [Frame; SEGMENTS], i: u32) -> RoundCone {
+    let (a, b) = PARTS[i].placed(at)
+    round_cone(a, b, r_top: PARTS[i].ra, r_bottom: PARTS[i].rb)
 }
 
-/// Inverse of `bind_mat(bone)`, mapping a relaxed A-pose rest point back to T-pose space so
-/// `pose[bone] * inv_bind_mat(bone)` transforms directly from A-pose rest space to posed space.
-fn inv_bind_mat(bone: u32) -> mat4 {
-    if bone == UPPER_ARM_LEFT || bone == FOREARM_LEFT || bone == HAND_LEFT || bone == FINGERS_LEFT {
-        let p = REST[UPPER_ARM_LEFT]
-        return translate(p) * rotate_z(A_POSE_ARM) * translate(-p)
-    }
-    if bone == UPPER_ARM_RIGHT ||
-        bone == FOREARM_RIGHT ||
-        bone == HAND_RIGHT ||
-        bone == FINGERS_RIGHT {
-        let p = REST[UPPER_ARM_RIGHT]
-        return translate(p) * rotate_z(-A_POSE_ARM) * translate(-p)
-    }
-    translate(vec3(0.0))
-}
-
-fn rest_joint_apose(bone: u32, off: vec3) -> vec3 {
-    let p = REST[bone] + off
-    (bind_mat(bone) * vec4(p, 1.0)).xyz * SCALE
-}
-
-fn creature_joints_rest() -> [vec4; MAX_SKIN_BONES] {
-    var out = [vec4(0.0); MAX_SKIN_BONES]
-    for b in 0..CREATURE_BONES {
-        out[b] = vec4(rest_joint_apose(CREATURE_RIG_BONES[b], vec3(0.0)), 1.0)
-    }
-    out
-}
-
-fn creature_inv_binds() -> [mat4; CREATURE_BONES] {
-    var out = [translate(vec3(0.0)); CREATURE_BONES]
-    for b in 0..CREATURE_BONES {
-        out[b] = inv_bind_mat(CREATURE_RIG_BONES[b])
-    }
-    out
-}
-
-/// Where the point `off` m from `bone`'s joint at rest is, posed by `pose` (the skeleton's), in
-/// the creature's scale.
-fn joint(pose: [mat4; 64], bone: u32, off: vec3) -> vec3 {
-    posed(pose, bone, REST[bone] + off) * SCALE
-}
-
-/// A part from `a` to `b`, `ra` and `rb` thick there (m, at the skeleton's scale).
-fn part(a: vec3, ra: f32, b: vec3, rb: f32) -> RoundCone {
-    round_cone(a, b, r_top: ra * SCALE, r_bottom: rb * SCALE)
-}
-
-/// The creature's rest-pose body (relaxed A-pose), built once at compile time.
-fn rest_creature_body() -> CreatureBody {
-    let j = |bone: u32, off: vec3| rest_joint_apose(bone, off)
+/// Its flesh's 17 parts, with its segments at `at`.
+fn flesh_parts(at: [Frame; SEGMENTS]) -> [RoundCone; 17] {
     var parts = [round_cone(vec3(0.0), vec3(0.0), r_top: 0.0, r_bottom: 0.0); 17]
-    parts[0] = part(j(PELVIS, vec3(0.0)), 0.17, j(SPINE_3, vec3(0.0)), 0.16)
-    parts[1] = part(j(SPINE_3, vec3(0.0)), 0.16, j(NECK, vec3(0.0)), 0.1)
-    parts[2] = part(j(HEAD, vec3(0.0, 0.1, 0.02)), 0.25, j(HEAD, vec3(0.0, 0.16, 0.03)), 0.23)
-    var n: u32 = 3
-    for side in 0..2 {
-        parts[n] = part(
-            j(UPPER_ARM_LEFT + side, vec3(0.0)),
-            0.065,
-            j(FOREARM_LEFT + side, vec3(0.0)),
-            0.058,
-        )
-        parts[n + 1] = part(
-            j(FOREARM_LEFT + side, vec3(0.0)),
-            0.058,
-            j(HAND_LEFT + side, vec3(0.0)),
-            0.05,
-        )
-        parts[n + 2] = part(
-            j(HAND_LEFT + side, vec3(0.0)),
-            0.05,
-            j(FINGERS_LEFT + side, vec3(0.0)),
-            0.045,
-        )
-        parts[n + 3] = part(
-            j(THIGH_LEFT + side, vec3(0.0)),
-            0.09,
-            j(CALF_LEFT + side, vec3(0.0)),
-            0.072,
-        )
-        parts[n + 4] = part(
-            j(CALF_LEFT + side, vec3(0.0)),
-            0.072,
-            j(FOOT_LEFT + side, vec3(0.0)),
-            0.056,
-        )
-        parts[n + 5] = part(
-            j(FOOT_LEFT + side, vec3(0.0)),
-            0.056,
-            j(BALL_LEFT + side, vec3(0.0)),
-            0.046,
-        )
-        let out = if side == 0 { 1.0 } else { -1.0 }
-        parts[n + 6] = part(
-            j(HEAD, vec3(0.13 * out, 0.3, 0.02)),
-            0.05,
-            j(HEAD, vec3(0.2 * out, 0.52, 0.0)),
-            0.0125,
-        )
-        n += 7
+    for i in 0..17 {
+        parts[i] = part(at, i)
     }
-    let wand = part(j(HAND_RIGHT, vec3(0.0)), 0.0084, j(HAND_RIGHT, vec3(-0.12, 0.3, 0.5)), 0.0084)
-    CreatureBody {
-        inner: parts
+    parts
+}
+
+/// Its flesh and its wand, as they are seen, with its segments at `at`.
+fn flesh(at: [Frame; SEGMENTS]) -> CreatureFlesh {
+    CreatureFlesh {
+        inner: flesh_parts(at)
             .smooth_union(k: JOIN)
             .with(matte(FUR))
-            .smooth_union(wand.with(matte(WOOD)), k: THIN_JOIN),
+            .smooth_union(part(at, 17).with(matte(WOOD)), k: THIN_JOIN),
     }
 }
 
-const REST_BODY: CreatureBody = rest_creature_body()
-const CREATURE_FACTS: FieldFacts = prove_field_facts(REST_BODY)
-const CREATURE_JOINTS: [vec4; MAX_SKIN_BONES] = creature_joints_rest()
-const CREATURE_INV_BINDS: [mat4; CREATURE_BONES] = creature_inv_binds()
-const PACKED_PART_START: [u32; 8] = pack_part_bones(PART_BONES_START)
-const PACKED_PART_END: [u32; 8] = pack_part_bones(PART_BONES_END)
+/// Its flesh and its wand as they are weighed, with its segments at `at`: the same shapes, with
+/// their densities.
+pub fn matter(at: [Frame; SEGMENTS]) -> SmoothUnion<With<SmoothUnionAll<RoundCone, 17>, Density>, With<RoundCone, Density>> {
+    flesh_parts(at)
+        .smooth_union(k: JOIN)
+        .with(TISSUE)
+        .smooth_union(part(at, 17).with(kit::substances::densities::WOOD), k: THIN_JOIN)
+}
 
-/// The creature as `pose` (its skeleton's palette) stands it: in place, its feet near y = 0,
-/// facing +z.
-pub fn creature(pose: [mat4; 64]) -> Creature {
-    let j = |bone: u32, off: vec3| joint(pose, bone, off)
-    var parts = [round_cone(vec3(0.0), vec3(0.0), r_top: 0.0, r_bottom: 0.0); 17]
-    // Its trunk, and a big head.
-    parts[0] = part(j(PELVIS, vec3(0.0)), 0.17, j(SPINE_3, vec3(0.0)), 0.16)
-    parts[1] = part(j(SPINE_3, vec3(0.0)), 0.16, j(NECK, vec3(0.0)), 0.1)
-    parts[2] = part(j(HEAD, vec3(0.0, 0.1, 0.02)), 0.25, j(HEAD, vec3(0.0, 0.16, 0.03)), 0.23)
-    // Its limbs and ears: a left one and its right (the next bone).
-    var n: u32 = 3
-    for side in 0..2 {
-        parts[n] = part(
-            j(UPPER_ARM_LEFT + side, vec3(0.0)),
-            0.065,
-            j(FOREARM_LEFT + side, vec3(0.0)),
-            0.058,
-        )
-        parts[n + 1] = part(
-            j(FOREARM_LEFT + side, vec3(0.0)),
-            0.058,
-            j(HAND_LEFT + side, vec3(0.0)),
-            0.05,
-        )
-        parts[n + 2] = part(
-            j(HAND_LEFT + side, vec3(0.0)),
-            0.05,
-            j(FINGERS_LEFT + side, vec3(0.0)),
-            0.045,
-        )
-        parts[n + 3] = part(
-            j(THIGH_LEFT + side, vec3(0.0)),
-            0.09,
-            j(CALF_LEFT + side, vec3(0.0)),
-            0.072,
-        )
-        parts[n + 4] = part(
-            j(CALF_LEFT + side, vec3(0.0)),
-            0.072,
-            j(FOOT_LEFT + side, vec3(0.0)),
-            0.056,
-        )
-        parts[n + 5] = part(
-            j(FOOT_LEFT + side, vec3(0.0)),
-            0.056,
-            j(BALL_LEFT + side, vec3(0.0)),
-            0.046,
-        )
-        // An ear, from the head's side to a tip 1.5 cm through.
-        let out = if side == 0 { 1.0 } else { -1.0 }
-        parts[n + 6] = part(
-            j(HEAD, vec3(0.13 * out, 0.3, 0.02)),
-            0.05,
-            j(HEAD, vec3(0.2 * out, 0.52, 0.0)),
-            0.0125,
-        )
-        n += 7
-    }
-    // A wand in its right hand, 1 cm through and 36 cm long.
-    let wand = part(j(HAND_RIGHT, vec3(0.0)), 0.0084, j(HAND_RIGHT, vec3(-0.12, 0.3, 0.5)), 0.0084)
-    let posed_body = CreatureBody {
-        inner: parts
-            .smooth_union(k: JOIN)
-            .with(matte(FUR))
-            .smooth_union(wand.with(matte(WOOD)), k: THIN_JOIN),
-    }
-    var bones = [DualQuat::identity(); MAX_SKIN_BONES]
-    for b in 0..CREATURE_BONES {
-        bones[b] = DualQuat::from_mat4_scaled(
-            pose[CREATURE_RIG_BONES[b]] * CREATURE_INV_BINDS[b],
-            SCALE,
-        )
-    }
+const REST_FLESH: CreatureFlesh = flesh(BODY.places(BIND))
+const CREATURE_FACTS: FieldFacts = prove_field_facts(REST_FLESH)
+
+/// What each segment weighs (`engine::body::mass`), in the bind pose.
+@fuel(2 ** 40)
+pub const MASSES: [Mass; SEGMENTS] = masses(BODY, BIND, matter(BODY.places(BIND)), SPANS, 0.006)
+
+/// The creature as `pose` stands it: in place, its feet near y = 0, facing +z.
+pub fn creature(pose: Pose<FREEDOM>) -> Creature {
     skinned(
-        posed_body,
-        REST_BODY,
-        bones,
-        CREATURE_JOINTS,
-        CREATURE_BONES,
-        PACKED_PART_START,
-        PACKED_PART_END,
+        flesh(BODY.places(pose)),
+        REST_FLESH,
+        bones(BODY, SPANS, pose, BIND),
+        SKIN.a,
+        SKIN.b,
+        SKIN.from,
+        SKIN.to,
         JOIN,
     )
 }
 
+/// A pose with each number turned a different way (and its root where `BIND` has it): parts
+/// brought near parts they don't touch at rest.
+fn bent() -> Pose<FREEDOM> {
+    var p = BIND
+    for k in 0..FREEDOM {
+        let f = f32(k)
+        p.q[k] = 0.35 * sin(f * 2.3)
+    }
+    p
+}
+
 @test
 fn creature_field_contracts_are_sound() {
-    let pose = [translate(vec3(0.0)); 64]
-    engine::matter::verify::verify_field_soundness(creature(pose), "creature_rest")
-    // Every bone turned a different way: parts brought near parts they don't touch at rest.
-    var bent = [translate(vec3(0.0)); 64]
-    for b in 0..64 {
-        let f = f32(b)
-        bent[b] = rotate(normalize(vec3(sin(f * 1.7), cos(f * 0.9), 0.4)), 0.35 * sin(f * 2.3))
-    }
-    engine::matter::verify::verify_field_soundness(creature(bent), "creature_bent")
-    let f_cr = creature(pose).field_facts()
+    engine::matter::verify::verify_field_soundness(creature(BIND), "creature_rest")
+    engine::matter::verify::verify_field_soundness(creature(bent()), "creature_bent")
+    let f_cr = creature(BIND).field_facts()
     assert(
         f_cr.lip < 1.0e12 && !f_cr.may_transmit && !f_cr.may_emit && !f_cr.may_coat &&
             !f_cr.may_micro,
@@ -462,13 +220,7 @@ fn creature_field_contracts_are_sound() {
 
 @test
 fn a_bent_bodys_posed_distance_asks_only_near_parts_and_is_the_same() {
-    // Every bone turned a different way, so parts come near parts they don't touch at rest.
-    var pose = [translate(vec3(0.0)); 64]
-    for b in 0..64 {
-        let f = f32(b)
-        pose[b] = rotate(normalize(vec3(sin(f * 1.7), cos(f * 0.9), 0.4)), 0.35 * sin(f * 2.3))
-    }
-    let body = creature(pose)
+    let body = creature(bent())
     let bound = body.posed.bound()
     var checked: u32 = 0
     for i in 0..4096 {
@@ -487,4 +239,68 @@ fn a_bent_bodys_posed_distance_asks_only_near_parts_and_is_the_same() {
         }
     }
     assert(checked > 16, f"only {checked} points near the surface")
+}
+
+@test
+@fuel(2 ** 45)
+fn each_segment_weighs_what_the_slow_sum_says() {
+    let m = MASSES
+    let at = BODY.places(BIND)
+    // The box its parts fill, and a centimetre more.
+    var lo = vec3(1.0e9)
+    var hi = vec3(-1.0e9)
+    for i in 0..PART_COUNT {
+        let p = PARTS[i]
+        let (a, b) = p.placed(at)
+        lo = min(lo, min(a - vec3(p.ra), b - vec3(p.rb)))
+        hi = max(hi, max(a + vec3(p.ra), b + vec3(p.rb)))
+    }
+    let slow = masses_by_grid(BODY, BIND, matter(at), SPANS, lo - vec3(0.01), hi + vec3(0.01), 0.002)
+    var total = 0.0
+    for s in 0..SEGMENTS {
+        total += m[s].mass
+    }
+    for s in 0..SEGMENTS {
+        let f = m[s].mass
+        var w = slow[s].mass
+        // A segment of less than 1% of the body is a sliver the 2 mm grid can't weigh to 1%:
+        // weighed again at 1 mm, over the box of its bone and 8 cm about it.
+        if w > 0.0 && w < 0.01 * total {
+            let (a, b) = BODY.bone(at, s)
+            let near = masses_by_grid(
+                BODY,
+                BIND,
+                matter(at),
+                SPANS,
+                min(a, b) - vec3(0.08),
+                max(a, b) + vec3(0.08),
+                0.001,
+            )
+            w = near[s].mass
+        }
+        print(f"creature segment {s}: {f} kg, the slow sum {w} kg, centre {m[s].centre}")
+        // To 1% of itself, and 0.05% of the body: the neck is a wedge of 7 g between the head's
+        // part and the chest's bone, which grids of 3, 2 and 1 mm weigh at 7.2, 8.0 and 7.4 g.
+        assert(
+            abs(f - w) <= 0.01 * w + 0.0005 * total,
+            f"segment {s}: {f} kg fast, {w} kg slow",
+        )
+    }
+    print(f"creature: {total} kg")
+}
+
+/// Each joint swept through its range from the bind pose (`engine::body::sweep`): no two parts
+/// on segments that are not neighbours go more than 2 mm further into each other.
+@test
+@fuel(2 ** 40)
+fn no_joint_in_its_range_puts_a_part_into_another() {
+    let w = sweep(BODY, PARTS, BIND)
+    var worst = 0.0
+    for s in 1..SEGMENTS {
+        if w[s].deeper > 0.0 {
+            print(f"sweep: segment {s} number {w[s].number} at {w[s].value}: cones {w[s].cones.x} and {w[s].cones.y} {w[s].deeper * 1000.0} mm deeper")
+        }
+        worst = max(worst, w[s].deeper)
+    }
+    assert(worst <= 0.002, f"a part goes {worst * 1000.0} mm into another")
 }

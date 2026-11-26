@@ -1,0 +1,368 @@
+// A hound: a body with four legs and a tail (docs/plans/bodies-and-movement.md, phase 1 step 12),
+// declared with the same types as the creature (`engine::body`), to show they are not a
+// humanoid's alone. Of the size of a large dog: some 0.6 m at its shoulders, its legs straight
+// under it at rest. No movement of it exists yet (phase 6); it stands at rest.
+//
+// Its segments, each frame's y along the segment and x across it (its flex axis): a pelvis, two
+// of spine (the loin and the chest), a neck and a head; a tail of three; each foreleg an upper
+// arm, a forearm (an elbow: a hinge) and a forepaw (a wrist and its roll: universal); each
+// hindleg a thigh, a shank (a stifle: a hinge), a hock (a hinge) and a hindpaw (a hinge). The
+// ranges are a dog's after published goniometry of the joints (D. Jaegger, D. J.
+// Marcellin-Little and D. Levine, Am. J. Vet. Res. 63(7), 2002; not read at its source), each
+// cut where its own flesh stops it (`engine::body::sweep::cleared`).
+
+use engine::body::body::{Body, Pose, Segment, Span, body, on}
+use engine::body::joint::{Frame, Joint, Kind, NONE}
+use engine::body::mass::{Mass, masses}
+use engine::body::skin::{Cone, End, Skin, bones, skin, spans_of}
+use engine::body::sweep::{cleared, sweep}
+use engine::matter::density::Density
+use engine::matter::substance::Substance
+use engine::matter::verify::prove_field_facts
+use kit::substances::densities::TISSUE
+use kit::substances::matte::matte
+use std::cmp::Eq
+use std::derive::{Box3, Interval}
+use std::field::{
+    Bound, Field, FieldFacts, Live, PartName, Pruned, RoundCone, Skinned, SmoothUnionAll,
+    Surface, With, round_cone, skinned,
+}
+use std::hash::StateHash
+use std::io::print
+use std::math::PI
+use std::quat::Quat
+
+/// How wide the join between two of its parts is (m).
+pub const JOIN: f32 = 0.025
+
+/// Its coat: a grey-brown pelt (albedo).
+pub const COAT: vec3 = vec3(0.34, 0.29, 0.22)
+
+pub const PELVIS: u32 = 0
+pub const LOIN: u32 = 1
+pub const CHEST: u32 = 2
+pub const NECK: u32 = 3
+pub const HEAD: u32 = 4
+pub const TAIL: u32 = 5
+pub const UPPER_ARM_LEFT: u32 = 8
+pub const UPPER_ARM_RIGHT: u32 = 11
+pub const THIGH_LEFT: u32 = 14
+pub const THIGH_RIGHT: u32 = 18
+
+/// How many segments it has, how many numbers a pose of it holds, how many parts its field has
+/// and how many bones its skin moves with (a segment each, and a second for each forepaw).
+pub const SEGMENTS: u32 = 22
+pub const FREEDOM: u32 = 45
+pub const PART_COUNT: u32 = 25
+pub const BONES: u32 = 24
+
+const DEG: f32 = PI / 180.0
+
+/// A turn about x.
+fn about_x(a: f32) -> Quat {
+    Quat::axis_angle(vec3(1.0, 0.0, 0.0), a)
+}
+
+/// A joint of `kind` on `parent` at `t` (the parent's frame), its frame turned `turn` about x
+/// from the parent's, its range `lo` to `hi` (degrees) and strengths (N m).
+fn joint(kind: Kind, parent: u32, t: vec3, turn: f32, lo: vec3, hi: vec3, strength: vec3) -> Joint {
+    Joint { kind, parent, at: Frame { q: about_x(turn), t }, lo: lo * DEG, hi: hi * DEG, strength }
+}
+
+fn segment(j: Joint, length: f32) -> Segment {
+    Segment { joint: j, tip: vec3(0.0, length, 0.0) }
+}
+
+/// Its segments. Its spine's frames have y forward and z down (a turn of a quarter about x from
+/// the body's), its legs' y down (another quarter), its tail's back and down.
+fn segment_list() -> [Segment; SEGMENTS] {
+    let ball = Kind::Ball
+    let spine = vec3(-20.0, -15.0, -15.0)
+    let spine_hi = vec3(20.0, 15.0, 15.0)
+    var s = [segment(joint(Kind::Fixed, NONE, vec3(0.0), 0.0, vec3(0.0), vec3(0.0), vec3(0.0)), 0.12); SEGMENTS]
+    // The root: its pelvis, 0.63 m up and 0.24 m behind the body's middle.
+    s[0] = segment(
+        Joint {
+            kind: Kind::Fixed,
+            parent: NONE,
+            at: Frame { q: about_x(0.5 * PI), t: vec3(0.0, 0.629, -0.24) },
+            lo: vec3(0.0),
+            hi: vec3(0.0),
+            strength: vec3(0.0),
+        },
+        0.14,
+    )
+    s[1] = segment(joint(ball, 0, vec3(0.0, 0.14, 0.0), 0.0, spine, spine_hi, vec3(120.0)), 0.18)
+    s[2] = segment(joint(ball, 1, vec3(0.0, 0.18, 0.0), 0.0, spine, spine_hi, vec3(120.0)), 0.18)
+    // The neck up and ahead, the head ahead and a little down.
+    s[3] = segment(
+        joint(ball, 2, vec3(0.0, 0.18, -0.02), -0.95, vec3(-45.0, -40.0, -30.0), vec3(45.0, 40.0, 30.0), vec3(60.0)),
+        0.2,
+    )
+    s[4] = segment(
+        joint(ball, 3, vec3(0.0, 0.2, 0.0), 1.25, vec3(-40.0, -30.0, -30.0), vec3(40.0, 30.0, 30.0), vec3(30.0)),
+        0.2,
+    )
+    // The tail: back and down from the pelvis, then on.
+    let tail_lo = vec3(-40.0, -40.0, -20.0)
+    let tail_hi = vec3(40.0, 40.0, 20.0)
+    s[5] = segment(joint(ball, 0, vec3(0.0, -0.02, -0.02), 2.6, tail_lo, tail_hi, vec3(8.0)), 0.13)
+    s[6] = segment(joint(ball, 5, vec3(0.0, 0.13, 0.0), -0.2, tail_lo, tail_hi, vec3(4.0)), 0.12)
+    s[7] = segment(joint(ball, 6, vec3(0.0, 0.12, 0.0), -0.2, tail_lo, tail_hi, vec3(2.0)), 0.11)
+    for side in 0..2 {
+        let x = if side == 0 { 0.085 } else { -0.085 }
+        // A foreleg: from the chest's low front, straight down.
+        let f = 8 + 3 * side
+        s[f] = segment(
+            joint(ball, 2, vec3(x, 0.1, 0.1), 0.5 * PI, vec3(-60.0, -30.0, -30.0), vec3(60.0, 30.0, 30.0), vec3(90.0)),
+            0.18,
+        )
+        s[f + 1] = segment(
+            joint(Kind::Hinge, f, vec3(0.0, 0.18, 0.0), 0.0, vec3(-110.0, 0.0, 0.0), vec3(10.0, 0.0, 0.0), vec3(70.0, 0.0, 0.0)),
+            0.17,
+        )
+        s[f + 2] = segment(
+            joint(Kind::Universal, f + 1, vec3(0.0, 0.17, 0.0), 0.0, vec3(-15.0, -15.0, 0.0), vec3(140.0, 15.0, 0.0), vec3(40.0, 10.0, 0.0)),
+            0.07,
+        )
+        // A hindleg: from the pelvis's low side, down.
+        let h = 14 + 4 * side
+        s[h] = segment(
+            joint(ball, 0, vec3(x, 0.02, 0.07), 0.5 * PI, vec3(-70.0, -30.0, -30.0), vec3(50.0, 30.0, 30.0), vec3(120.0)),
+            0.2,
+        )
+        s[h + 1] = segment(
+            joint(Kind::Hinge, h, vec3(0.0, 0.2, 0.0), 0.0, vec3(-10.0, 0.0, 0.0), vec3(110.0, 0.0, 0.0), vec3(100.0, 0.0, 0.0)),
+            0.2,
+        )
+        s[h + 2] = segment(
+            joint(Kind::Hinge, h + 1, vec3(0.0, 0.2, 0.0), 0.0, vec3(-110.0, 0.0, 0.0), vec3(15.0, 0.0, 0.0), vec3(80.0, 0.0, 0.0)),
+            0.11,
+        )
+        s[h + 3] = segment(
+            joint(Kind::Hinge, h + 2, vec3(0.0, 0.11, 0.0), 0.0, vec3(-30.0, 0.0, 0.0), vec3(60.0, 0.0, 0.0), vec3(20.0, 0.0, 0.0)),
+            0.06,
+        )
+    }
+    s
+}
+
+/// A round cone from point `a` of segment `on_a` to point `b` of segment `on_b`, on segment `on`.
+fn cone(on_a: u32, a: vec3, ra: f32, on_b: u32, b: vec3, rb: f32, at: u32) -> Cone {
+    Cone { a: End { on: on_a, at: a }, ra, b: End { on: on_b, at: b }, rb, span: on(at) }
+}
+
+/// Its parts: its trunk (three), neck, skull and muzzle, ears, tail (three), each foreleg's
+/// three and each hindleg's four. A paw reaches forward of its joint (the leg's -z).
+fn part_list() -> [Cone; PART_COUNT] {
+    let z = vec3(0.0)
+    var p = [cone(0, z, 0.0, 0, z, 0.0, 0); PART_COUNT]
+    p[0] = cone(0, vec3(0.0, -0.02, 0.0), 0.085, 0, vec3(0.0, 0.14, 0.0), 0.09, 0)
+    p[1] = cone(1, z, 0.09, 1, vec3(0.0, 0.18, 0.0), 0.1, 1)
+    p[2] = cone(2, z, 0.1, 2, vec3(0.0, 0.2, 0.01), 0.105, 2)
+    p[3] = cone(3, z, 0.06, 3, vec3(0.0, 0.2, 0.0), 0.05, 3)
+    p[4] = cone(4, vec3(0.0, 0.02, 0.0), 0.065, 4, vec3(0.0, 0.1, 0.0), 0.06, 4)
+    p[5] = cone(4, vec3(0.0, 0.1, 0.0), 0.045, 4, vec3(0.0, 0.2, 0.02), 0.028, 4)
+    for side in 0..2 {
+        let x = if side == 0 { 1.0 } else { -1.0 }
+        p[6 + side] = cone(4, vec3(0.04 * x, 0.03, -0.05), 0.022, 4, vec3(0.055 * x, 0.06, -0.11), 0.006, 4)
+    }
+    p[8] = cone(5, z, 0.03, 5, vec3(0.0, 0.13, 0.0), 0.024, 5)
+    p[9] = cone(6, z, 0.024, 6, vec3(0.0, 0.12, 0.0), 0.017, 6)
+    p[10] = cone(7, z, 0.017, 7, vec3(0.0, 0.11, 0.0), 0.008, 7)
+    for side in 0..2 {
+        let f = 8 + 3 * side
+        let i = 11 + 3 * side
+        p[i] = cone(f, z, 0.05, f, vec3(0.0, 0.18, 0.0), 0.035, f)
+        p[i + 1] = cone(f + 1, z, 0.03, f + 1, vec3(0.0, 0.17, 0.0), 0.022, f + 1)
+        p[i + 2] = cone(f + 2, z, 0.024, f + 2, vec3(0.0, 0.035, -0.05), 0.02, f + 2)
+        let h = 14 + 4 * side
+        let k = 17 + 4 * side
+        p[k] = cone(h, vec3(0.0, -0.01, 0.0), 0.065, h, vec3(0.0, 0.2, 0.0), 0.04, h)
+        p[k + 1] = cone(h + 1, z, 0.038, h + 1, vec3(0.0, 0.2, 0.0), 0.024, h + 1)
+        p[k + 2] = cone(h + 2, z, 0.024, h + 2, vec3(0.0, 0.11, 0.0), 0.02, h + 2)
+        p[k + 3] = cone(h + 3, z, 0.022, h + 3, vec3(0.0, 0.03, -0.05), 0.019, h + 3)
+    }
+    p
+}
+
+pub const PARTS: [Cone; PART_COUNT] = part_list()
+
+/// It at rest: its legs straight under it, its paws on y = 0.
+fn at_rest(b: Body<SEGMENTS>) -> Pose<FREEDOM> {
+    b.rest()
+}
+
+/// Its body, each joint's range cut where its own flesh stops it.
+@fuel(2 ** 38)
+pub const BODY: Body<SEGMENTS> = cleared(body(segment_list()), PARTS, at_rest(body(segment_list())), 0.001, 64)
+
+pub const REST: Pose<FREEDOM> = at_rest(BODY)
+
+pub const SPANS: [Span; PART_COUNT] = spans_of(PARTS)
+const SKIN: Skin<PART_COUNT> = skin(BODY, REST, PARTS)
+
+type HoundRaw = With<SmoothUnionAll<RoundCone, PART_COUNT>, Substance>
+
+/// The hound's flesh: its parts in one smooth union, with its coat.
+pub struct HoundFlesh: Copy + GpuData + Eq + StateHash {
+    pub inner: HoundRaw,
+}
+
+impl Surface for HoundFlesh {
+    @budget(work: 2560)
+    fn distance(self, p: vec3) -> f32 {
+        self.inner.distance(p)
+    }
+
+    fn distance_within(self, p: vec3, most: f32) -> f32 {
+        self.inner.distance_within(p, most)
+    }
+
+    fn bound(self) -> Bound {
+        self.inner.bound()
+    }
+
+    fn lipschitz(self, near: f32) -> f32 {
+        self.inner.lipschitz(near)
+    }
+
+    fn interval_near(self, b: Box3) -> Interval {
+        self.inner.interval_near(b)
+    }
+
+    fn parts(self) -> u32 {
+        self.inner.parts()
+    }
+
+    fn part_at(self, p: vec3) -> (f32, u32) {
+        self.inner.part_at(p)
+    }
+
+    fn part_distance(self, p: vec3, i: u32) -> f32 {
+        self.inner.part_distance(p, i)
+    }
+
+    fn part_name(self, i: u32) -> PartName {
+        self.inner.part_name(i)
+    }
+
+    fn part_offset(self, p: vec3, i: u32, by: f32) -> f32 {
+        self.inner.part_offset(p, i, by)
+    }
+
+    fn masked(self, p: vec3, live: Live, first: u32) -> f32 {
+        self.inner.masked(p, live, first)
+    }
+
+    fn pruned<F: Copy + fn(vec3) -> vec3>(
+        self,
+        over: Box3,
+        at: F,
+        stretch: f32,
+        live: Live,
+        first: u32,
+    ) -> Pruned {
+        self.inner.pruned(over, at, stretch, live, first)
+    }
+}
+
+impl Field<Substance> for HoundFlesh {
+    fn channels(self, p: vec3) -> Substance {
+        self.inner.channels(p)
+    }
+
+    fn distance_and_channels(self, p: vec3) -> (f32, Substance) {
+        self.inner.distance_and_channels(p)
+    }
+
+    fn field_facts(self) -> FieldFacts {
+        HOUND_FACTS
+    }
+}
+
+/// The hound: its exact posed field and its rest template, deformed by its bones on the GPU.
+pub type Hound = Skinned<HoundFlesh, BONES, PART_COUNT>
+
+fn cones_at(at: [Frame; SEGMENTS]) -> [RoundCone; PART_COUNT] {
+    var out = [round_cone(vec3(0.0), vec3(0.0), r_top: 0.0, r_bottom: 0.0); PART_COUNT]
+    for i in 0..PART_COUNT {
+        let (a, b) = PARTS[i].placed(at)
+        out[i] = round_cone(a, b, r_top: PARTS[i].ra, r_bottom: PARTS[i].rb)
+    }
+    out
+}
+
+fn flesh(at: [Frame; SEGMENTS]) -> HoundFlesh {
+    HoundFlesh { inner: cones_at(at).smooth_union(k: JOIN).with(matte(COAT)) }
+}
+
+/// Its flesh as it is weighed: the same shapes, with their density.
+pub fn matter(at: [Frame; SEGMENTS]) -> With<SmoothUnionAll<RoundCone, PART_COUNT>, Density> {
+    cones_at(at).smooth_union(k: JOIN).with(TISSUE)
+}
+
+const REST_FLESH: HoundFlesh = flesh(BODY.places(REST))
+const HOUND_FACTS: FieldFacts = prove_field_facts(REST_FLESH)
+
+/// What each segment weighs, at rest.
+@fuel(2 ** 40)
+pub const MASSES: [Mass; SEGMENTS] = masses(BODY, REST, matter(BODY.places(REST)), SPANS, 0.006)
+
+/// The hound as `pose` stands it.
+pub fn hound(pose: Pose<FREEDOM>) -> Hound {
+    skinned(
+        flesh(BODY.places(pose)),
+        REST_FLESH,
+        bones(BODY, SPANS, pose, REST),
+        SKIN.a,
+        SKIN.b,
+        SKIN.from,
+        SKIN.to,
+        JOIN,
+    )
+}
+
+@test
+fn hound_field_contracts_are_sound() {
+    engine::matter::verify::verify_field_soundness(hound(REST), "hound_rest")
+    var bent = REST
+    for k in 0..FREEDOM {
+        bent.q[k] = 0.3 * sin(f32(k) * 1.9)
+    }
+    engine::matter::verify::verify_field_soundness(hound(bent), "hound_bent")
+}
+
+/// It stands: its lowest point on y = 0 (to 5 mm), its shoulders some 0.6 m up, and what it
+/// weighs said.
+@test
+fn the_hound_stands_on_its_paws() {
+    let at = BODY.places(REST)
+    var low = 1.0e9
+    var high = -1.0e9
+    for c in PARTS {
+        let (a, b) = c.placed(at)
+        low = min(low, min(a.y - c.ra, b.y - c.rb))
+        high = max(high, max(a.y + c.ra, b.y + c.rb))
+    }
+    var total = 0.0
+    for m in MASSES {
+        total += m.mass
+    }
+    print(f"hound: from {low} m to {high} m, {total} kg, {BODY.freedom} numbers")
+    assert(BODY.freedom == FREEDOM)
+    assert(abs(low) < 0.005, f"its paws are at {low} m")
+}
+
+/// Each joint swept through its range from rest: no part goes more than 2 mm into the segments it
+/// hangs from.
+@test
+@fuel(2 ** 40)
+fn no_joint_of_the_hound_puts_a_part_into_another() {
+    let w = sweep(BODY, PARTS, REST)
+    var worst = 0.0
+    for s in 1..SEGMENTS {
+        worst = max(worst, w[s].deeper)
+    }
+    assert(worst <= 0.002, f"a part goes {worst * 1000.0} mm into another")
+}

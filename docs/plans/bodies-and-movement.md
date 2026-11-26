@@ -122,7 +122,7 @@ An agent starts each run with the `colab` command. No person starts a run. Secti
 | Phase | Result | Uses the result of | Uses Colab |
 | --- | --- | --- | --- |
 | 0 | Two decisions, the rights of each source and two measurements | Nothing | A small run |
-| 1 | One declaration for each body, with its freedom | Nothing | No |
+| 1 | One declaration for each body, with its freedom (done on the Linux machine, 2026-11-25) | Nothing | No |
 | 2 | Capture with clean rights, on our bodies | Phases 0 and 1 | No |
 | 3 | A judge that gives numbers for movement | Phases 1 and 2 | No |
 | 4 | A tracker, and filtered capture | Phases 2 and 3 | Yes |
@@ -388,6 +388,9 @@ than the balance fell (1.59 written, 1.12 fallen for the tests of 0.5).
 
 ## 6. Phase 1: one declaration for each body
 
+Done on the Linux machine on 2026-11-25, but for the M4 and one target ("What is done in phase 1",
+below).
+
 Purpose: the game states each body one time. The engine calculates all other data about the body.
 
 ### Steps
@@ -419,6 +422,44 @@ Purpose: the game states each body one time. The engine calculates all other dat
     old `Pose` in the kit, `HAKURO_BONE`, `on_rig`, `CREATURE_RIG_BONES`, `PART_BONES_START`,
     `PART_BONES_END`, `SPREAD` and `TWIST_STEPS`.
 
+### Where it is
+
+- `lib/engine/matter/density.wrela`: `Density`, a channel apart from `Substance`.
+  `lib/kit/substances/densities.wrela`: tissue and wood, each with its source.
+- `lib/engine/body/`: `joint` (the four kinds, the range field and its gradient, a kind's turn
+  and its inverse), `body` (`Body`, `Pose`, `Span`, and `Body::places`, the one function from a
+  pose to each segment's frame), `mass` (the fast integration and the slow grid), `skin` (the
+  skin from the declaration, `Cone`), `sweep` (the sweep of each joint, and `cleared`, which cuts
+  a range where the body's own flesh stops it), `fit` (a damped least-squares fit of a pose to
+  aims, for phase 2's retarget).
+- `std::field::Skinned<S, B, P>` takes its numbers of bones and parts from the body: no
+  `MAX_SKIN_BONES` or `MAX_SKIN_PARTS` (question 4: yes, an array's length can be a body's
+  constant).
+- The creature: `game/world/creature_segments.wrela` (written once by `tools/movement/onetime`
+  from the old rig), `game/world/creature.wrela`. Its walk: `game/rules/walk.wrela`, a Fourier
+  series of each of its 55 numbers, played by `lib/kit/motion/cycle.wrela`.
+- The hound: `game/world/hound.wrela`, four legs and a tail of three, drawn at rest in the hole
+  audit (its 16th kind).
+
+Decisions that the steps did not give:
+
+- The body types are in the engine (`lib/engine/body`), not the kit: the judge is in the engine
+  and reads them, and the kit depends on the engine.
+- A universal joint is a flex about x and then a twist about y, the segment's length: an elbow's
+  bend and its forearm's roll, a knee's bend and its shin's turn. A knee is universal, not a
+  hinge: the old walk turns the shin about its length up to 0.6 rad, which a hinge can't do. It
+  still can't bend to the side. An ankle is a ball joint (the ankle and the joints of the foot
+  below it).
+- The twist of a universal joint spreads along the skin of each part on its segment alone (a
+  second bone: the segment's frame with the bind pose's twist). The twist of a ball joint turns
+  its segment whole.
+- A range is a person's (or a dog's) from a published table, then cut where the body's own flesh
+  stops it: each number moved alone from the bind pose until a part that moves with it goes 1 mm
+  into a part of the segments it hangs from. One limb against another (the thighs as a leg
+  crosses) is a collision, which the judge measures; it does not cut a range.
+- A segment with no part of its own (each collarbone) has no mass. Phase 4 must give such a
+  segment to the simulator in a form it takes.
+
 ### Checks to build in this phase
 
 - The fast mass calculation against the slow sum of samples.
@@ -430,15 +471,40 @@ Purpose: the game states each body one time. The engine calculates all other dat
 
 ### Done when
 
-- Each body has one declaration. A search for each removed name finds nothing.
-- Frames 0 and 1 of SCENE 0 and SCENE 2 are the same as before, by `tools/same`, on the two
-  machines.
-- The mass of each segment agrees with the slow reference to 1%.
-- No two segments that are not neighbours go more than 2 mm into each other in the range (first
-  value).
-- The time of the skin pass is not more than before, on the two machines.
-- The body with four legs builds and passes the hole audit at rest.
-- `tools/gate` passes on the two machines.
+- Done: each body has one declaration. A search for each removed name finds nothing (the bone
+  names, `Rig`, `RigBone`, the old `Pose`, `HAKURO_BONE`, `on_rig`, `CREATURE_RIG_BONES`,
+  `PART_BONES_START`, `PART_BONES_END`, `SPREAD`, `TWIST_STEPS`, and `MAX_SKIN_BONES`,
+  `MAX_SKIN_PARTS`, `pack_part_bones`; `humanoid.wrela`, `playback.wrela`, `gaits.wrela`,
+  `rig.wrela` and `skeleton.wrela` are removed).
+- Not met, by the decision above: frames 0 and 1 of SCENE 0 and SCENE 2 are the same as before
+  but at the creature's outline. The old walk bends each knee to the side, which a knee of the new
+  body can't: each part's ends are where the old palette put them to 5.2 mm at most (the left
+  knee; 2 mm or less elsewhere but the feet and knees). By `tools/same` against a second run of
+  the old build, at 1920x1080 on the Linux machine: SCENE 0 frame 0 has 185 pixels over 8/255
+  (0.009%; the noise 3), frame 1 has 480 (0.023%; the noise 0); SCENE 2 frame 0 has 574 (0.028%;
+  the noise 0), frame 1 1,502 (0.072%; the noise 3); each on the outline of the legs, the ears and
+  the wand. The two pictures are otherwise the same. Not measured on the M4.
+- Done: the mass of each segment agrees with the slow reference to 1%, but for a segment of less
+  than 1% of the body, to 1% and 0.05% of the body (`creature.wrela`'s test). The creature's neck
+  is a wedge of 7.6 g between the head's part and the chest's bone; grids of 3, 2 and 1 mm weigh it
+  at 7.2, 8.0 and 7.4 g. Each other segment agrees to 0.5% or better (the toes at 1 mm to 0.04%).
+  The creature weighs 39.6 kg (its head 16.2 kg), the hound 35.8 kg.
+- Done: no two segments that are not neighbours go more than 2 mm into each other in the range
+  (1 mm at most, both bodies), as `sweep` measures them (above).
+- Done on the Linux machine: the time of the skin pass is not more than before (`mesh_skin`,
+  SCENE 0 at 1920x1080, frames 30 to 89, the median of two runs each: 709 and 711 µs before, 709
+  and 713 after). Not measured on the M4.
+- Done on the Linux machine: the body with four legs builds and passes the hole audit at rest (12
+  eyes at 320x180: no holes, no extras, 4 pixels off by more than a pixel).
+- `tools/gate` on the Linux machine: in the commit message of this phase. Not run on the M4.
+
+Checks that the steps asked for, and where they are: the fast mass against the slow sum
+(`each_segment_weighs_what_the_slow_sum_says`); the sweep (`no_joint_in_its_range_puts_a_part_into_another`,
+`no_joint_of_the_hound_puts_a_part_into_another`); the pose function against the old palette,
+part end by part end, over the 119 frames of the walk (`tools/movement/onetime`'s report, run at
+the change's parent: 5.2 mm at most); the mass against de Leva's table for a body of human form
+(`a_human_shaped_body_turns_as_the_table_says`); and the walk in its ranges
+(`the_walk_stays_in_each_joints_range`).
 
 ## 7. Phase 2: capture with clean rights
 
@@ -708,8 +774,8 @@ Each question has the phase or the person that must answer it.
    licence.
 3. What size of net is in the CPU budget? (0.3) Partly answered on 2026-11-25: on the Linux
    machine, 11 bodies a millisecond with three layers of 256, 31 with 128.
-4. Can the length of an array come from a body constant, so that no fixed limit of bones is
-   necessary? (phase 1, step 8)
+4. Answered on 2026-11-25: yes. `Skinned<S, B, P>` takes its lengths from the body (phase 1,
+   step 8).
 5. Where does the movement of a cast and of a parry come from? The register has strikes, hand
    signs and gestures, but no cast. The possible sources are those sets with goals, clips made
    by hand as goals for the tracker, and a new capture. (owner and phase 2, step 6)

@@ -374,12 +374,6 @@ pub trait Surface: Copy + GpuData {
     }
 }
 
-/// Maximum bones supported in a single `Skinned` field's GPU Dual Quaternion palette.
-pub const MAX_SKIN_BONES: u32 = 24
-
-/// Maximum leaf parts mapped in `Skinned::part_bones` (packed 4 × u8 per `u32`).
-pub const MAX_SKIN_PARTS: u32 = 32
-
 /// Unit Dual Quaternion representing a 3D rigid transform `(q: Quat, t: vec3)` in 32 bytes
 /// (Kavan et al., I3D 2007 / ACM TOG 2008): `real` is unit rotation quaternion `(qx, qy, qz, qw)`
 /// and `dual = 0.5 * (tx, ty, tz, 0) * real`.
@@ -442,26 +436,6 @@ impl DualQuat {
         let l2 = dot(out, out)
         if l2 > 1.0e-12 { out * (1.0 / sqrt(l2)) } else { n }
     }
-}
-
-/// Packs up to 32 per-part bone indices (`0..23`) into 8 `u32` words (4 × u8 per word).
-pub fn pack_part_bones(bones: [u32; MAX_SKIN_PARTS]) -> [u32; 8] {
-    var out = [0; 8]
-    for w in 0..8 {
-        let i = w * 4
-        out[w] = (bones[i] & 255) |
-            ((bones[i + 1] & 255) << 8) |
-            ((bones[i + 2] & 255) << 16) |
-            ((bones[i + 3] & 255) << 24)
-    }
-    out
-}
-
-/// Unpacks part `i`'s bone index from `packed`.
-fn unpack_part_bone(packed: [u32; 8], i: u32) -> u32 {
-    let idx = min(i, MAX_SKIN_PARTS - 1)
-    let word = packed[idx >> 2]
-    (word >> ((idx & 3) * 8)) & 255
 }
 
 /// Accumulates weight `w` for bone `bone` into a register-allocated top-4 `(b0..b3, w0..w3)` set.
@@ -589,63 +563,67 @@ impl Top4Weights {
 }
 
 /// A skeletal/articulated pure field: `posed` gives the exact analytical distance and channels for
-/// reference raymarching, probes, and SDF splatting, while `rest` + `bones` (`[DualQuat; 24]`) let
-/// the engine extract the rest-pose meshlet ONCE with auto-computed per-vertex skin weights from
+/// reference raymarching, probes, and SDF splatting, while `rest` and `bones` (`B` of them) let the
+/// engine extract the rest-pose meshlet ONCE with auto-computed per-vertex skin weights from
 /// `rest.part_distance` and deform it every frame on the GPU via Dual Quaternion Skinning.
-pub struct Skinned<S>: Copy + GpuData + Eq + StateHash {
+///
+/// Its lengths are its body's: `B` bones and `P` parts (`engine::body::skin` makes one from a
+/// body's declaration). Part `i` moves with bone `from[i]` at its end `a[i]` and with bone `to[i]`
+/// at its end `b[i]` (rest positions), its weight blended along the line between them: a part on
+/// one bone has `from[i] == to[i]`.
+pub struct Skinned<S, const B: u32, const P: u32>: Copy + GpuData + Eq + StateHash {
     pub posed: S,
     pub rest: S,
-    pub bones: [DualQuat; MAX_SKIN_BONES],
-    pub joints: [vec4; MAX_SKIN_BONES],
-    pub bone_count: u32,
-    pub part_bones: [u32; 8],
-    pub part_end_bones: [u32; 8],
+    pub bones: [DualQuat; B],
+    pub a: [vec4; P],
+    pub b: [vec4; P],
+    pub from: [u32; P],
+    pub to: [u32; P],
     pub blend_k: f32,
     pub rest_key_lo: u32,
     pub rest_key_hi: u32,
     pub pad0: u32,
-    pub pad1: u32,
 }
 
 /// Wraps an articulated pure field `posed` with its rest-pose template `rest`, per-bone Dual
-/// Quaternions `bones`, rest-pose joint positions `joints`, per-part start/end bone mappings, and
-/// smooth-union blend width `blend_k` for automatic GPU Dual Quaternion Skinning.
-pub fn skinned<S: Surface + StateHash>(
+/// Quaternions `bones`, each part's bones and rest-pose ends (`Skinned`), and the smooth-union
+/// blend width `blend_k`, for automatic GPU Dual Quaternion Skinning.
+pub fn skinned<S: Surface + StateHash, const B: u32, const P: u32>(
     posed: S,
     rest: S,
-    bones: [DualQuat; MAX_SKIN_BONES],
-    joints: [vec4; MAX_SKIN_BONES],
-    bone_count: u32,
-    part_bones: [u32; 8],
-    part_end_bones: [u32; 8],
+    bones: [DualQuat; B],
+    a: [vec4; P],
+    b: [vec4; P],
+    from: [u32; P],
+    to: [u32; P],
     blend_k: f32,
-) -> Skinned<S> {
+) -> Skinned<S, B, P> {
     var h = Hasher::new()
     StateHash::state_hash(rest, mut h)
-    StateHash::state_hash(bone_count, mut h)
-    StateHash::state_hash(part_bones, mut h)
-    StateHash::state_hash(part_end_bones, mut h)
+    StateHash::state_hash(B, mut h)
+    StateHash::state_hash(from, mut h)
+    StateHash::state_hash(to, mut h)
     StateHash::state_hash(blend_k, mut h)
-    // The joints split a two-bone part's weights (`rest_skin_weights`), which the template keeps.
-    StateHash::state_hash(joints, mut h)
+    // The ends split a two-bone part's weights (`rest_skin_weights`), which the template keeps.
+    StateHash::state_hash(a, mut h)
+    StateHash::state_hash(b, mut h)
     let key = h.finish()
     Skinned {
         posed,
         rest,
         bones,
-        joints,
-        bone_count: min(bone_count, MAX_SKIN_BONES),
-        part_bones,
-        part_end_bones,
+        a,
+        b,
+        from,
+        to,
         blend_k,
         rest_key_lo: u32(key),
         rest_key_hi: u32(key >> 32),
         pad0: 0,
-        pad1: 0,
     }
 }
 
-impl<S: Surface> Surface for Skinned<S> {
+impl<S: Surface, const B: u32, const P: u32> Surface for Skinned<S, B, P> {
     fn distance(self, p: vec3) -> f32 {
         self.posed.distance(p)
     }
@@ -729,8 +707,8 @@ impl<S: Surface> Surface for Skinned<S> {
     }
 
     fn rest_skin_weights(self, p: vec3) -> vec2u {
-        let n_parts = min(self.rest.parts(), MAX_SKIN_PARTS)
-        if n_parts == 0 || self.bone_count == 0 {
+        let n_parts = min(self.rest.parts(), P)
+        if n_parts == 0 || B == 0 {
             return vec2u(0, 255)
         }
         var d_min = 1.0e20
@@ -750,13 +728,13 @@ impl<S: Surface> Surface for Skinned<S> {
             if gap < blend_w {
                 let u = 1.0 - gap / blend_w
                 let pw = u * u
-                let ba = min(unpack_part_bone(self.part_bones, i), self.bone_count - 1)
-                let bb = min(unpack_part_bone(self.part_end_bones, i), self.bone_count - 1)
+                let ba = min(self.from[i], B - 1)
+                let bb = min(self.to[i], B - 1)
                 if ba == bb {
                     top.add(ba, pw)
                 } else {
-                    let ja = self.joints[ba].xyz
-                    let jb = self.joints[bb].xyz
+                    let ja = self.a[i].xyz
+                    let jb = self.b[i].xyz
                     let seg = jb - ja
                     let l2 = max(dot(seg, seg), 1.0e-8)
                     let frac = clamp(dot(p - ja, seg) / l2, 0.0, 1.0)
@@ -766,18 +744,18 @@ impl<S: Surface> Surface for Skinned<S> {
             }
         }
         if top.w0 <= 1.0e-6 {
-            let ba = min(unpack_part_bone(self.part_bones, best_part), self.bone_count - 1)
+            let ba = min(self.from[best_part], B - 1)
             return vec2u(ba & 255, 255)
         }
         top.pack()
     }
 
     fn skin_bone_count(self) -> u32 {
-        self.bone_count
+        B
     }
 
     fn skin_bone(self, i: u32) -> DualQuat {
-        self.bones[min(i, MAX_SKIN_BONES - 1)]
+        self.bones[min(i, B - 1)]
     }
 
     /// Its posed body's distance, each part asked only where it can matter (`distance_within`
@@ -787,7 +765,7 @@ impl<S: Surface> Surface for Skinned<S> {
     }
 }
 
-impl<C, S: Field<C>> Field<C> for Skinned<S> {
+impl<C, S: Field<C>, const B: u32, const P: u32> Field<C> for Skinned<S, B, P> {
     fn channels(self, p: vec3) -> C {
         self.posed.channels(p)
     }

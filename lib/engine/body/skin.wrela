@@ -1,0 +1,158 @@
+// A body's skin, from its declaration (docs/plans/bodies-and-movement.md, phase 1 steps 8 and 9):
+// which bones each part of its field moves with, and where each bone is in a pose. The engine
+// extracts the body's field once, in its bind pose, and moves that mesh with these bones on the
+// GPU (`std::field::Skinned`); how many bones and parts there are is the body's, not a constant.
+//
+// Each segment is a bone. A part on one segment moves with it; a part that spans a chain of
+// segments moves with the first at its `a` end and the last at its `b` end, blended between.
+//
+// The twist of a universal joint (its second number: a turn along the segment, as a forearm
+// rolls from its elbow to its wrist and a shin turns from its knee to its ankle) is the roll of
+// the segment's flesh along its length, not a turn of the segment as one piece: one rule spreads
+// it along the skin of each part on that segment alone, none of it at the part's `a` end and all
+// of it at its `b` end. Such a segment has a second bone, its frame with its twist as the bind
+// pose has it (`twistless`), after the segments' bones. A ball joint's twist turns its segment
+// whole (an upper arm about its length), as a hinge does.
+
+use body::body::{Body, Pose, Span}
+use body::joint::{Frame, Kind, turn}
+use std::field::DualQuat
+
+/// A point of a segment: segment `on`'s point `at`, in its own frame.
+pub struct End: Copy {
+    pub on: u32,
+    pub at: vec3,
+}
+
+/// A part of a body that is a round cone: from end `a` to end `b`, `ra` and `rb` thick there (m),
+/// on the segments of `span`. Its place in a pose follows from its ends (`Cone::placed`).
+pub struct Cone: Copy {
+    pub a: End,
+    pub ra: f32,
+    pub b: End,
+    pub rb: f32,
+    pub span: Span,
+}
+
+impl Cone {
+    /// Its ends in the body's space, its segments at `at`.
+    pub fn placed<const S: u32>(self, at: [Frame; S]) -> (vec3, vec3) {
+        (at[self.a.on].apply(self.a.at), at[self.b.on].apply(self.b.at))
+    }
+}
+
+/// What a body's skin is in its bind pose: for each of its `P` parts, the bone it moves with at
+/// its `a` end and at its `b` end, and where those ends are in the bind pose.
+pub struct Skin<const P: u32>: Copy {
+    pub from: [u32; P],
+    pub to: [u32; P],
+    pub a: [vec4; P],
+    pub b: [vec4; P],
+}
+
+/// Whether segment `s`'s skin twists along it: its joint is universal and some part is on it
+/// alone.
+fn twists<const S: u32, const P: u32>(body: Body<S>, spans: [Span; P], s: u32) -> bool {
+    if body.segments[s].joint.kind != Kind::Universal {
+        return false
+    }
+    for i in 0..P {
+        if spans[i].from == s && spans[i].to == s {
+            return true
+        }
+    }
+    false
+}
+
+/// How many bones a body's skin has: a segment each, and a second for each that twists.
+pub fn bone_count<const S: u32, const P: u32>(body: Body<S>, spans: [Span; P]) -> u32 {
+    var n = S
+    for s in 0..S {
+        if twists(body, spans, s) {
+            n += 1
+        }
+    }
+    n
+}
+
+/// The bone of segment `s` without its twist (`twists`), or `s` itself.
+fn twistless<const S: u32, const P: u32>(body: Body<S>, spans: [Span; P], s: u32) -> u32 {
+    var k = S
+    for t in 0..S {
+        if twists(body, spans, t) {
+            if t == s {
+                return k
+            }
+            k += 1
+        }
+    }
+    s
+}
+
+/// The spans of `cones`.
+pub fn spans_of<const P: u32>(cones: [Cone; P]) -> [Span; P] {
+    var out = [Span { from: 0, to: 0 }; P]
+    for i in 0..P {
+        out[i] = cones[i].span
+    }
+    out
+}
+
+/// The skin of `body` in its bind pose `bind`, its parts `cones`.
+pub fn skin<const S: u32, const D: u32, const P: u32>(
+    body: Body<S>,
+    bind: Pose<D>,
+    cones: [Cone; P],
+) -> Skin<P> {
+    let at = body.places(bind)
+    let spans = spans_of(cones)
+    var out = Skin { from: [0; P], to: [0; P], a: [vec4(0.0); P], b: [vec4(0.0); P] }
+    for i in 0..P {
+        let sp = spans[i]
+        let (a, b) = cones[i].placed(at)
+        out.a[i] = vec4(a, 1.0)
+        out.b[i] = vec4(b, 1.0)
+        if sp.from == sp.to {
+            out.from[i] = twistless(body, spans, sp.from)
+            out.to[i] = sp.from
+        } else {
+            out.from[i] = sp.from
+            out.to[i] = sp.to
+        }
+    }
+    out
+}
+
+/// `f` as a dual quaternion.
+fn dual(f: Frame) -> DualQuat {
+    DualQuat::from_qt(f.q, f.t)
+}
+
+/// The skin's `B` bones in `pose`: each carries a point of the body in `bind` to where `pose`
+/// puts it. Segment `s`'s bone is its frame in `pose` after its frame in `bind` undone; a
+/// twisting segment's second bone is the same with its twist as in `bind`.
+pub fn bones<const S: u32, const D: u32, const P: u32, const B: u32>(
+    body: Body<S>,
+    spans: [Span; P],
+    pose: Pose<D>,
+    bind: Pose<D>,
+) -> [DualQuat; B] {
+    assert(B == bone_count(body, spans), f"a skin of {B} bones for a body of {bone_count(body, spans)}")
+    let now = body.places(pose)
+    let was = body.places(bind)
+    var out = [DualQuat::identity(); B]
+    for s in 0..S {
+        out[s] = dual(now[s].then(was[s].inverse()))
+        let k = twistless(body, spans, s)
+        if k != s {
+            let j = body.segments[s].joint
+            let q = body.numbers(pose, s)
+            let q_bind = body.numbers(bind, s)
+            let held = now[j.parent].then(j.at).then(
+                Frame { q: turn(j.kind, vec3(q.x, q_bind.y, 0.0)), t: vec3(0.0) },
+            )
+            out[k] = dual(held.then(was[s].inverse()))
+        }
+    }
+    out
+}

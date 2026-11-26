@@ -1,0 +1,262 @@
+// How a segment of a body is joined to its parent (docs/plans/bodies-and-movement.md, phase 1):
+// where the joint is, how its axes lie, which turns it allows and how strongly it can turn.
+//
+// A joint's degrees of freedom are numbers in radians, about the axes of the joint's own frame
+// (`Joint::at`, placed in the parent segment's frame):
+//
+// - `Fixed`: none.
+// - `Hinge`: one, a turn about x.
+// - `Universal`: two, a turn about x and then about y (the second in the frame the first left):
+//   a flex and then a twist along the segment (an elbow's bend and its forearm's roll).
+// - `Ball`: three, a swing and then a twist: the swing a rotation vector `(q.x, 0, q.y)` (it
+//   tilts the joint's y axis, which is the length of the segment), the twist `q.z` about y. A
+//   ball joint's swing and twist are each a degree of freedom of their own, so a twist along a
+//   segment (a forearm's roll) has a number and a range of its own.
+//
+// The range is a field over the degrees of freedom (`Joint::range`): negative in the range of the
+// joint, positive out of it, about its distance from the range's edge in radians, and its gradient
+// is the compiler's (`range_gradient`). For a hinge it is an interval, for a universal joint a
+// box, for a ball joint a cone of the swing (an ellipse in each quarter, from `lo` and `hi`) and
+// an interval of the twist.
+
+use std::derive::gradient
+use std::quat::Quat
+
+/// No segment: the parent of the root.
+pub const NONE: u32 = 4294967295
+
+/// How many degrees of freedom the root of a body has, beyond its joints': a place and a turn.
+pub const ROOT_FREEDOM: u32 = 6
+
+/// What a joint allows.
+pub enum Kind: Copy + Eq {
+    Fixed,
+    Hinge,
+    Universal,
+    Ball,
+}
+
+/// How many numbers a joint of `kind` has.
+pub fn freedom(kind: Kind) -> u32 {
+    match kind {
+        Kind::Fixed => 0,
+        Kind::Hinge => 1,
+        Kind::Universal => 2,
+        Kind::Ball => 3,
+    }
+}
+
+/// A turn and then a place: where a frame sits in another.
+pub struct Frame: Copy + Eq {
+    pub q: Quat,
+    pub t: vec3,
+}
+
+impl Frame {
+    pub fn identity() -> Frame {
+        Frame { q: Quat::identity(), t: vec3(0.0) }
+    }
+
+    /// `b`'s frame placed in this one.
+    pub fn then(self, b: Frame) -> Frame {
+        Frame { q: self.q.mul(b.q), t: self.t + self.q.rotate(b.t) }
+    }
+
+    /// The opposite frame.
+    pub fn inverse(self) -> Frame {
+        let qi = self.q.inverse()
+        Frame { q: qi, t: -qi.rotate(self.t) }
+    }
+
+    /// Point `p` of this frame, in the frame this one sits in.
+    pub fn apply(self, p: vec3) -> vec3 {
+        self.t + self.q.rotate(p)
+    }
+
+    pub fn matrix(self) -> mat4 {
+        let m = self.q.to_mat3()
+        mat4(vec4(m[0], 0.0), vec4(m[1], 0.0), vec4(m[2], 0.0), vec4(self.t, 1.0))
+    }
+}
+
+/// A joint: what it allows, its parent segment (`NONE` for the root), its frame in the parent's
+/// frame at rest (all its numbers 0), the range of its numbers (`lo` to `hi`, rad, a number past
+/// its kind's count unused), and the largest torque each number's turn can give (N m).
+pub struct Joint: Copy + Eq {
+    pub kind: Kind,
+    pub parent: u32,
+    pub at: Frame,
+    pub lo: vec3,
+    pub hi: vec3,
+    pub strength: vec3,
+}
+
+/// The turn about `axis` (a unit vector) by `angle`, without `axis_angle`'s normalising: the
+/// joint's own axes are exact, so its turn and its inverse (`numbers_of`) agree to the bit.
+fn about(axis: vec3, angle: f32) -> Quat {
+    let h = 0.5 * angle
+    Quat { v: vec4(axis * sin(h), cos(h)) }
+}
+
+/// The turn a rotation vector `r` makes.
+pub fn turn_of_vector(r: vec3) -> Quat {
+    let a = length(r)
+    if a < 1.0e-8 {
+        return Quat { v: normalize(vec4(r * 0.5, 1.0)) }
+    }
+    Quat { v: vec4(r * (sin(a * 0.5) / a), cos(a * 0.5)) }
+}
+
+/// The rotation vector of turn `q` (the shorter way round).
+pub fn vector_of_turn(q: Quat) -> vec3 {
+    var v = q.v
+    if v.w < 0.0 {
+        v = -v
+    }
+    let s = length(v.xyz)
+    if s < 1.0e-8 {
+        return 2.0 * v.xyz
+    }
+    v.xyz * (2.0 * atan2(s, v.w) / s)
+}
+
+/// The turn that a joint of `kind` makes with numbers `q`, in the joint's frame.
+pub fn turn(kind: Kind, q: vec3) -> Quat {
+    match kind {
+        Kind::Fixed => Quat::identity(),
+        Kind::Hinge => about(vec3(1.0, 0.0, 0.0), q.x),
+        Kind::Universal => about(vec3(1.0, 0.0, 0.0), q.x).mul(about(vec3(0.0, 1.0, 0.0), q.y)),
+        Kind::Ball => turn_of_vector(vec3(q.x, 0.0, q.y)).mul(about(vec3(0.0, 1.0, 0.0), q.z)),
+    }
+}
+
+/// The numbers of a joint of `kind` nearest to making turn `r` (in the joint's frame): exact
+/// for a ball joint, and for the others the part of `r` they can make.
+pub fn numbers_of(kind: Kind, r: Quat) -> vec3 {
+    var v = r.v
+    if v.w < 0.0 {
+        v = -v
+    }
+    match kind {
+        Kind::Fixed => vec3(0.0),
+        Kind::Hinge => vec3(2.0 * atan2(v.x, v.w), 0.0, 0.0),
+        Kind::Universal => {
+            // r = Rx(a) Ry(b) turns y to Rx(a) y = (0, cos a, sin a): a from there, b from what
+            // is left.
+            let m = Quat { v }.to_mat3()
+            let a = atan2(m[1].z, m[1].y)
+            let rest = about(vec3(1.0, 0.0, 0.0), a).inverse().mul(Quat { v })
+            vec3(a, 2.0 * atan2(rest.v.y, rest.v.w), 0.0)
+        },
+        Kind::Ball => {
+            // The twist about y, then the swing that is left.
+            let tw = vec4(0.0, v.y, 0.0, v.w)
+            let l = length(tw)
+            let twist = if l < 1.0e-12 { Quat::identity() } else { Quat { v: tw / l } }
+            let angle = 2.0 * atan2(twist.v.y, twist.v.w)
+            let swing = Quat { v }.mul(twist.inverse())
+            let s = vector_of_turn(swing)
+            vec3(s.x, s.z, angle)
+        },
+    }
+}
+
+/// An ellipse's field: about the distance of `p` from the ellipse of half axes `a` (each > 0)
+/// about the origin, negative in it (the implicit `|p / a| - 1`, scaled by the smaller half
+/// axis, which keeps its sign and its zero set).
+fn ellipse(p: vec2, a: vec2) -> f32 {
+    (length(p / a) - 1.0) * min(a.x, a.y)
+}
+
+impl Joint {
+    /// How many numbers it has.
+    pub fn freedom(self) -> u32 {
+        freedom(self.kind)
+    }
+
+    /// The range field at numbers `q`: negative in the joint's range.
+    pub fn range(self, q: vec3) -> f32 {
+        match self.kind {
+            Kind::Fixed => -1.0,
+            Kind::Hinge => max(self.lo.x - q.x, q.x - self.hi.x),
+            Kind::Universal => {
+                let c = 0.5 * (self.lo.xy + self.hi.xy)
+                let h = 0.5 * (self.hi.xy - self.lo.xy)
+                let d = abs(q.xy - c) - h
+                length(max(d, vec2(0.0))) + min(max(d.x, d.y), 0.0)
+            },
+            Kind::Ball => {
+                // The swing's half axis on the side it leans to: `hi` for a positive number,
+                // `-lo` for a negative one.
+                let ax = if q.x >= 0.0 { self.hi.x } else { -self.lo.x }
+                let ay = if q.y >= 0.0 { self.hi.y } else { -self.lo.y }
+                let swing = ellipse(q.xy, vec2(max(ax, 1.0e-4), max(ay, 1.0e-4)))
+                let twist = max(self.lo.z - q.z, q.z - self.hi.z)
+                max(swing, twist)
+            },
+        }
+    }
+
+    /// The range field's gradient at `q`, which the compiler derives from `range`.
+    pub fn range_gradient(self, q: vec3) -> vec3 {
+        let j = self
+        gradient(|x: vec3| j.range(x), q)
+    }
+
+    /// Its turn with numbers `q`, in the parent's frame: its frame, then its kind's turn.
+    pub fn placed(self, q: vec3) -> Frame {
+        self.at.then(Frame { q: turn(self.kind, q), t: vec3(0.0) })
+    }
+}
+
+@test
+fn a_turn_and_its_numbers_agree() {
+    let kinds = [Kind::Hinge, Kind::Universal, Kind::Ball]
+    for k in kinds {
+        for i in 0..200 {
+            let f = f32(i)
+            var q = vec3(sin(f * 1.3) * 1.2, cos(f * 0.7) * 0.9, sin(f * 2.1) * 1.4)
+            if k == Kind::Hinge {
+                q = vec3(q.x, 0.0, 0.0)
+            }
+            if k == Kind::Universal {
+                q = vec3(q.x, q.y * 0.9, 0.0)
+            }
+            let back = numbers_of(k, turn(k, q))
+            assert(
+                length(back - q) < 2.0e-5,
+                f"kind {freedom(k)}: numbers {q} turn back to {back}",
+            )
+        }
+    }
+}
+
+@test
+fn a_range_field_is_negative_in_its_range_and_its_gradient_points_out() {
+    let ball = Joint {
+        kind: Kind::Ball,
+        parent: 0,
+        at: Frame::identity(),
+        lo: vec3(-0.5, -1.0, -0.3),
+        hi: vec3(1.5, 0.8, 0.6),
+        strength: vec3(10.0),
+    }
+    assert(ball.range(vec3(0.0)) < 0.0)
+    assert(ball.range(vec3(1.4, 0.0, 0.0)) < 0.0)
+    assert(ball.range(vec3(1.6, 0.0, 0.0)) > 0.0)
+    assert(ball.range(vec3(-0.6, 0.0, 0.0)) > 0.0)
+    assert(ball.range(vec3(0.0, 0.0, 0.7)) > 0.0)
+    assert(abs(ball.range(vec3(1.5, 0.0, 0.0))) < 1.0e-6)
+    let g = ball.range_gradient(vec3(1.6, 0.0, 0.0))
+    assert(g.x > 0.5, f"gradient {g}")
+    let hinge = Joint {
+        kind: Kind::Hinge,
+        parent: 0,
+        at: Frame::identity(),
+        lo: vec3(-0.1, 0.0, 0.0),
+        hi: vec3(2.4, 0.0, 0.0),
+        strength: vec3(10.0),
+    }
+    assert(hinge.range(vec3(1.0, 0.0, 0.0)) == -1.1)
+    assert(hinge.range_gradient(vec3(3.0, 0.0, 0.0)).x == 1.0)
+}

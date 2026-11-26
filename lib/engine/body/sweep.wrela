@@ -1,0 +1,262 @@
+// A sweep of each joint through its range (docs/plans/bodies-and-movement.md, phase 1): where two
+// segments that are not neighbours go into each other. Each number of each joint is moved alone
+// through its range (`STEPS` values from its `lo` to its `hi`, the rest of the body in a start
+// pose), and at each value each part that moves with it is measured against each part of the
+// segments it hangs from (its parent, its parent's parent, to the root) that is not a neighbour:
+// how deep they go into each other, beyond how deep they already are in the start pose (flesh
+// that touches at rest, as a shoulder's on a chest, is the body's shape, not a fault of its
+// ranges). A part of another limb is not measured: one limb against another is a collision of
+// two things that each move, which the judge measures in a movement, not a range.
+//
+// Neighbours: a segment and its parent, where a segment with no part on it (a collarbone carried
+// by the flesh around it) joins its children to its parent. Two parts are on neighbours if any
+// segment of one's span is a neighbour of any of the other's.
+//
+// The depth of two round cones is their axes' nearest points' distance against the sum of their
+// radii there: exact for capsules, and for a round cone within the change of its radius over the
+// nearest points' shift.
+
+use body::body::{Body, Pose, Span}
+use body::joint::{Frame, NONE}
+use body::skin::Cone
+
+/// How many values of each number a sweep tries.
+pub const STEPS: u32 = 13
+
+/// The nearest points of segments `p0 p1` and `q0 q1`: their parameters along each (0 to 1).
+fn nearest(p0: vec3, p1: vec3, q0: vec3, q1: vec3) -> vec2 {
+    let d1 = p1 - p0
+    let d2 = q1 - q0
+    let r = p0 - q0
+    let a = dot(d1, d1)
+    let e = dot(d2, d2)
+    let f = dot(d2, r)
+    if a <= 1.0e-12 && e <= 1.0e-12 {
+        return vec2(0.0)
+    }
+    if a <= 1.0e-12 {
+        return vec2(0.0, clamp(f / e, 0.0, 1.0))
+    }
+    let c = dot(d1, r)
+    if e <= 1.0e-12 {
+        return vec2(clamp(-c / a, 0.0, 1.0), 0.0)
+    }
+    let b = dot(d1, d2)
+    let denom = a * e - b * b
+    var s = if denom > 1.0e-12 { clamp((b * f - c * e) / denom, 0.0, 1.0) } else { 0.0 }
+    var t = (b * s + f) / e
+    if t < 0.0 {
+        t = 0.0
+        s = clamp(-c / a, 0.0, 1.0)
+    } else if t > 1.0 {
+        t = 1.0
+        s = clamp((b - c) / a, 0.0, 1.0)
+    }
+    vec2(s, t)
+}
+
+/// How deep two round cones go into each other (m; negative: the gap between them).
+pub fn depth(a0: vec3, a1: vec3, ra0: f32, ra1: f32, b0: vec3, b1: vec3, rb0: f32, rb1: f32) -> f32 {
+    let st = nearest(a0, a1, b0, b1)
+    let pa = mix(a0, a1, vec3(st.x))
+    let pb = mix(b0, b1, vec3(st.y))
+    mix(ra0, ra1, st.x) + mix(rb0, rb1, st.y) - length(pa - pb)
+}
+
+/// Whether segment `s` carries none of `cones`.
+fn bare<const P: u32>(cones: [Cone; P], s: u32) -> bool {
+    for c in cones {
+        if c.a.on == s || c.b.on == s || c.span.from == s || c.span.to == s {
+            return false
+        }
+    }
+    true
+}
+
+/// The parent that carries `s`: its parent, or past a bare parent, that one's.
+fn carrier<const S: u32, const P: u32>(body: Body<S>, cones: [Cone; P], s: u32) -> u32 {
+    var p = body.segments[s].joint.parent
+    while p != NONE && p != 0 && bare(cones, p) {
+        p = body.segments[p].joint.parent
+    }
+    p
+}
+
+/// Whether two segments are neighbours (above).
+fn joined<const S: u32, const P: u32>(body: Body<S>, cones: [Cone; P], a: u32, b: u32) -> bool {
+    a == b || carrier(body, cones, a) == b || carrier(body, cones, b) == a
+}
+
+/// Whether any segment of span `x` is a neighbour of any of span `y`.
+fn spans_joined<const S: u32, const P: u32>(body: Body<S>, cones: [Cone; P], x: Span, y: Span) -> bool {
+    var a = x.to
+    loop {
+        var b = y.to
+        loop {
+            if joined(body, cones, a, b) {
+                return true
+            }
+            if b == y.from || b == 0 {
+                break
+            }
+            b = body.segments[b].joint.parent
+        }
+        if a == x.from || a == 0 {
+            break
+        }
+        a = body.segments[a].joint.parent
+    }
+    false
+}
+
+/// Whether segment `a` is `s` or below it.
+fn under<const S: u32>(body: Body<S>, s: u32, a: u32) -> bool {
+    body.above(s, a)
+}
+
+/// Whether cone `c` moves with segment `s` (its span is wholly under `s`) or hangs above it (its
+/// span is wholly on `s`'s parent chain): the two sides a sweep of `s` measures.
+fn moves<const S: u32>(body: Body<S>, s: u32, c: Span) -> bool {
+    under(body, s, c.from)
+}
+
+fn holds<const S: u32>(body: Body<S>, s: u32, c: Span) -> bool {
+    let p = body.segments[s].joint.parent
+    p != NONE && body.above(c.to, p)
+}
+
+/// Each pair of cones' depth into each other with the body's segments at `at` (P × P, by rows).
+fn depths<const S: u32, const P: u32>(cones: [Cone; P], at: [Frame; S], out: mut [f32; 1024]) {
+    for i in 0..P {
+        let (a0, a1) = cones[i].placed(at)
+        for j in i + 1..P {
+            let (b0, b1) = cones[j].placed(at)
+            out[i * P + j] = depth(a0, a1, cones[i].ra, cones[i].rb, b0, b1, cones[j].ra, cones[j].rb)
+        }
+    }
+}
+
+/// The worst of a sweep: how deep (m) beyond the start pose, which joint's number moved, at what
+/// value, and which two cones.
+pub struct Worst: Copy {
+    pub deeper: f32,
+    pub segment: u32,
+    pub number: u32,
+    pub value: f32,
+    pub cones: vec2u,
+}
+
+/// Sweeps each number of each joint of `body` (its parts `cones`) through its range from `start`:
+/// the worst for each segment, at its index (`deeper` 0 where nothing goes deeper).
+pub fn sweep<const S: u32, const D: u32, const P: u32>(
+    body: Body<S>,
+    cones: [Cone; P],
+    start: Pose<D>,
+) -> [Worst; S] {
+    assert(P * P <= 1024, "a sweep holds at most 32 cones")
+    var base = [0.0; 1024]
+    depths(cones, body.places(start), mut base)
+    var now = [0.0; 1024]
+    var out = [Worst { deeper: 0.0, segment: 0, number: 0, value: 0.0, cones: vec2u(0) }; S]
+    for s in 1..S {
+        out[s].segment = s
+        let j = body.segments[s].joint
+        for k in 0..j.freedom() {
+            for step in 0..STEPS {
+                let v = mix(j.lo[k], j.hi[k], f32(step) / f32(STEPS - 1))
+                var p = start
+                var q = body.numbers(start, s)
+                q[k] = v
+                body.set_numbers(mut p, s, q)
+                depths(cones, body.places(p), mut now)
+                for a in 0..P {
+                    for b in a + 1..P {
+                        if !measured(body, cones, s, a, b) {
+                            continue
+                        }
+                        let deeper = now[a * P + b] - max(base[a * P + b], 0.0)
+                        if deeper > out[s].deeper {
+                            out[s] = Worst { deeper, segment: s, number: k, value: v, cones: vec2u(a, b) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Whether a sweep of segment `s` measures cones `a` and `b`: one moves with `s`, the other is on
+/// the segments it hangs from, and they are not on neighbours.
+fn measured<const S: u32, const P: u32>(body: Body<S>, cones: [Cone; P], s: u32, a: u32, b: u32) -> bool {
+    let (x, y) = (cones[a].span, cones[b].span)
+    let sides = (moves(body, s, x) && holds(body, s, y)) || (moves(body, s, y) && holds(body, s, x))
+    sides && !spans_joined(body, cones, x, y)
+}
+
+/// How deep any two parts that a sweep of `s` measures go, beyond `base`, with the body's
+/// segments at `at`.
+fn deepest<const S: u32, const P: u32>(
+    body: Body<S>,
+    cones: [Cone; P],
+    s: u32,
+    at: [Frame; S],
+    base: [f32; 1024],
+    now: mut [f32; 1024],
+) -> f32 {
+    depths(cones, at, mut now)
+    var worst = 0.0
+    for a in 0..P {
+        for b in a + 1..P {
+            if measured(body, cones, s, a, b) {
+                worst = max(worst, now[a * P + b] - max(base[a * P + b], 0.0))
+            }
+        }
+    }
+    worst
+}
+
+/// `body` with each number's range cut where the body's own flesh stops it: from its value in
+/// `start`, each number is moved alone toward each end of its range, in `fine` steps, and its range
+/// ends at the last value at which no part that moves with it goes more than `most` metres further
+/// into a part of the segments it hangs from (as `sweep` measures). A joint's range is how far it turns; this is how far it
+/// can turn in this body.
+pub fn cleared<const S: u32, const D: u32, const P: u32>(
+    body: Body<S>,
+    cones: [Cone; P],
+    start: Pose<D>,
+    most: f32,
+    fine: u32,
+) -> Body<S> {
+    var base = [0.0; 1024]
+    depths(cones, body.places(start), mut base)
+    var now = [0.0; 1024]
+    var out = body
+    for s in 1..S {
+        let j = body.segments[s].joint
+        for k in 0..j.freedom() {
+            let q0 = body.numbers(start, s)
+            for side in 0..2 {
+                let end = if side == 0 { j.hi[k] } else { j.lo[k] }
+                var last = q0[k]
+                for i in 1..fine + 1 {
+                    let v = mix(q0[k], end, f32(i) / f32(fine))
+                    var p = start
+                    var q = q0
+                    q[k] = v
+                    body.set_numbers(mut p, s, q)
+                    if deepest(body, cones, s, body.places(p), base, mut now) > most {
+                        break
+                    }
+                    last = v
+                }
+                if side == 0 {
+                    out.segments[s].joint.hi[k] = last
+                } else {
+                    out.segments[s].joint.lo[k] = last
+                }
+            }
+        }
+    }
+    out
+}

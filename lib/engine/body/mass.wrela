@@ -1,0 +1,400 @@
+// The mass of each segment of a body, its centre of mass and its inertia (docs/plans/
+// bodies-and-movement.md, phase 1 step 7), from the density of the body's matter integrated over
+// its field, worked out when the game is built.
+//
+// The body's matter is a field with a density (`matter::density::Density`) in a pose, most often
+// the one it is declared in. Each point inside it is on its nearest part (by `part_distance`), and
+// on the segment of that part's span whose bone is nearest (`Body::nearest_on`). So a part on one
+// segment weighs on it alone, and a part that spans a chain is shared along the chain as its
+// bones divide it.
+//
+// `masses` is the fast way: a tree of boxes from the field's bound, each box that the field's
+// interval puts wholly outside dropped, each box down to `cell` wide summed at its centre when
+// it is wholly inside and on one part and one segment (`uniform`), else at 4³ points. `masses_by_grid` is the slow
+// reference: every point of a grid summed, nothing dropped. The two agree to 1% for each segment
+// of each body the game declares (that body's test).
+
+use body::body::{Body, Pose, Span}
+use body::joint::Frame
+use matter::density::Density
+use std::collections::Vec
+use std::derive::Box3
+use std::field::Field
+
+/// What a segment weighs: its mass (kg), its centre of mass and its inertia about that centre
+/// (kg m²), both in the segment's own frame.
+pub struct Mass: Copy + Eq {
+    pub mass: f32,
+    pub centre: vec3,
+    pub inertia: mat3,
+}
+
+/// The sums a mass is made of, in the body's space: the mass, its first moment and its second
+/// moments (xx, yy, zz and xy, xz, yz), in f64 so a million small samples add up.
+struct Moments: Copy {
+    m: f64,
+    c: vec3d,
+    sq: vec3d,
+    cross: vec3d,
+}
+
+impl Moments {
+    fn zero() -> Moments {
+        Moments { m: 0.0, c: vec3d(0.0), sq: vec3d(0.0), cross: vec3d(0.0) }
+    }
+
+    fn add(mut self, p: vec3, w: f32) {
+        let (x, k) = (vec3d(p), f64(w))
+        self.m += k
+        self.c += x * k
+        self.sq += x * x * k
+        self.cross += vec3d(x.x * x.y, x.x * x.z, x.y * x.z) * k
+    }
+}
+
+/// The masses of the sums `acc`, each in its segment's frame (`at`).
+fn finished<const S: u32>(acc: [Moments; S], at: [Frame; S]) -> [Mass; S] {
+    var out = [Mass { mass: 0.0, centre: vec3(0.0), inertia: mat3(vec3(0.0), vec3(0.0), vec3(0.0)) }; S]
+    for s in 0..S {
+        let a = acc[s]
+        if a.m <= 0.0 {
+            out[s].centre = vec3(0.0)
+            continue
+        }
+        let c = a.c / a.m
+        // Second moments about the centre: S - m c cᵀ.
+        let sq = a.sq - c * c * a.m
+        let cr = a.cross - vec3d(c.x * c.y, c.x * c.z, c.y * c.z) * a.m
+        let tr = sq.x + sq.y + sq.z
+        // Inertia: tr(S) I - S.
+        let i_body = mat3(
+            vec3(f32(tr - sq.x), f32(-cr.x), f32(-cr.y)),
+            vec3(f32(-cr.x), f32(tr - sq.y), f32(-cr.z)),
+            vec3(f32(-cr.y), f32(-cr.z), f32(tr - sq.z)),
+        )
+        out[s] = Mass {
+            mass: f32(a.m),
+            centre: at[s].inverse().apply(vec3(c)),
+            inertia: turned_in(i_body, at[s].q.to_mat3()),
+        }
+    }
+    out
+}
+
+/// `i` (in the body's space) in the frame whose axes are `r`'s columns: rᵀ i r.
+fn turned_in(i: mat3, r: mat3) -> mat3 {
+    let (a, b, c) = (i * r[0], i * r[1], i * r[2])
+    mat3(
+        vec3(dot(r[0], a), dot(r[1], a), dot(r[2], a)),
+        vec3(dot(r[0], b), dot(r[1], b), dot(r[2], b)),
+        vec3(dot(r[0], c), dot(r[1], c), dot(r[2], c)),
+    )
+}
+
+/// The part of `matter` nearest `p` (of its first `most`).
+fn nearest_part<F: Field<Density>>(matter: F, p: vec3, most: u32) -> u32 {
+    let n = min(matter.parts(), most)
+    var best = 0
+    var d_best = 1.0e30
+    for i in 0..n {
+        let d = matter.part_distance(p, i)
+        if d < d_best {
+            d_best = d
+            best = i
+        }
+    }
+    best
+}
+
+/// Weighs one point `p` of `matter` with volume `dv`, if it's inside.
+fn weigh<const S: u32, const P: u32, F: Field<Density>>(
+    body: Body<S>,
+    at: [Frame; S],
+    matter: F,
+    spans: [Span; P],
+    p: vec3,
+    dv: f32,
+    inside: bool,
+    acc: mut [Moments; S],
+) {
+    let (d, rho) = matter.distance_and_channels(p)
+    if !inside && d >= 0.0 {
+        return
+    }
+    let s = body.nearest_on(at, spans[nearest_part(matter, p, P)], p)
+    acc[s].add(p, rho.kg_m3 * dv)
+}
+
+/// Whether every point within `r` of `o` is on the same part and the same segment as `o`: the
+/// nearest part's distance is less than the next one's by more than `2 r` (each part's distance
+/// changes by at most the distance moved), and so is the nearest bone's of that part's span.
+fn uniform<const S: u32, const P: u32, F: Field<Density>>(
+    body: Body<S>,
+    at: [Frame; S],
+    matter: F,
+    spans: [Span; P],
+    o: vec3,
+    r: f32,
+) -> bool {
+    let n = min(matter.parts(), P)
+    var d1 = 1.0e30
+    var d2 = 1.0e30
+    var best = 0
+    for i in 0..n {
+        let d = matter.part_distance(o, i)
+        if d < d1 {
+            d2 = d1
+            d1 = d
+            best = i
+        } else if d < d2 {
+            d2 = d
+        }
+    }
+    if n > 1 && d2 - d1 <= 2.0 * r {
+        return false
+    }
+    let span = spans[best]
+    if span.from == span.to {
+        return true
+    }
+    var b1 = 1.0e30
+    var b2 = 1.0e30
+    var s = span.to
+    loop {
+        let (a, b) = body.bone(at, s)
+        let d = body::body::segment_distance(o, a, b)
+        if d < b1 {
+            b2 = b1
+            b1 = d
+        } else if d < b2 {
+            b2 = d
+        }
+        if s == span.from || s == 0 {
+            break
+        }
+        s = body.segments[s].joint.parent
+    }
+    b2 - b1 > 2.0 * r
+}
+
+/// Weighs a leaf box at `o`, `h` from its centre to each side, at 4³ points.
+fn weigh_finely<const S: u32, const P: u32, F: Field<Density>>(
+    body: Body<S>,
+    at: [Frame; S],
+    matter: F,
+    spans: [Span; P],
+    o: vec3,
+    h: f32,
+    acc: mut [Moments; S],
+) {
+    let s = 2.0 * h / 4.0
+    let dv = s * s * s
+    for i in 0..64 {
+        let k = vec3(f32(i % 4), f32((i / 4) % 4), f32(i / 16)) - vec3(1.5)
+        weigh(body, at, matter, spans, o + k * s, dv, false, mut acc)
+    }
+}
+
+/// Each segment's mass, the body's matter `matter` in `pose`, each of its parts on the segments
+/// of its span: the fast way (above), boxes down to `cell` metres.
+pub fn masses<const S: u32, const D: u32, const P: u32, F: Field<Density>>(
+    body: Body<S>,
+    pose: Pose<D>,
+    matter: F,
+    spans: [Span; P],
+    cell: f32,
+) -> [Mass; S] {
+    let at = body.places(pose)
+    var acc = [Moments::zero(); S]
+    let b = matter.bound()
+    var boxes: Vec<vec4> = Vec::new()
+    boxes.push(vec4(b.centre, b.radius))
+    while let Some(c) = boxes.pop() {
+        let (o, h) = (c.xyz, c.w)
+        let iv = matter.interval_near(Box3 { lo: o - vec3(h), hi: o + vec3(h) })
+        if iv.lo > 0.0 {
+            continue
+        }
+        if 2.0 * h <= cell {
+            if iv.hi < 0.0 && uniform(body, at, matter, spans, o, h * 1.7320508) {
+                weigh(body, at, matter, spans, o, 8.0 * h * h * h, true, mut acc)
+            } else {
+                weigh_finely(body, at, matter, spans, o, h, mut acc)
+            }
+            continue
+        }
+        let q = 0.5 * h
+        for i in 0..8 {
+            let k = vec3(f32(i & 1), f32((i >> 1) & 1), f32(i >> 2)) * 2.0 - vec3(1.0)
+            boxes.push(vec4(o + k * q, q))
+        }
+    }
+    finished(acc, at)
+}
+
+/// Each segment's mass the slow way: every point of a grid of spacing `step` over the box `lo`
+/// to `hi`, weighed with nothing dropped. The reference that `masses` is held to.
+pub fn masses_by_grid<const S: u32, const D: u32, const P: u32, F: Field<Density>>(
+    body: Body<S>,
+    pose: Pose<D>,
+    matter: F,
+    spans: [Span; P],
+    lo: vec3,
+    hi: vec3,
+    step: f32,
+) -> [Mass; S] {
+    let at = body.places(pose)
+    var acc = [Moments::zero(); S]
+    let n = vec3u(ceil((hi - lo) / step))
+    let dv = step * step * step
+    for z in 0..n.z {
+        for y in 0..n.y {
+            for x in 0..n.x {
+                let p = lo + (vec3(f32(x), f32(y), f32(z)) + vec3(0.5)) * step
+                weigh(body, at, matter, spans, p, dv, false, mut acc)
+            }
+        }
+    }
+    finished(acc, at)
+}
+
+/// The whole body's mass and its centre of mass in the body's space, the segments at `at`.
+pub fn total<const S: u32>(masses: [Mass; S], at: [Frame; S]) -> vec4 {
+    var m = 0.0
+    var c = vec3(0.0)
+    for s in 0..S {
+        m += masses[s].mass
+        c += at[s].apply(masses[s].centre) * masses[s].mass
+    }
+    vec4(if m > 0.0 { c / m } else { c }, m)
+}
+
+// ---- tests ------------------------------------------------------------------------------------
+
+use body::body::{Segment, body, on}
+use body::joint::{Joint, Kind, NONE}
+use matter::density::density
+use std::field::{Surface, round_cone}
+use std::io::print
+use std::math::PI
+use std::quat::Quat
+
+/// A body of one segment, a capsule along y from 0 to `l`, `r` thick, of water.
+@test
+fn a_capsule_weighs_what_its_volume_says() {
+    let (r, l) = (0.05, 0.4)
+    let one = body(
+        [
+            Segment {
+                joint: Joint {
+                    kind: Kind::Fixed,
+                    parent: NONE,
+                    at: Frame::identity(),
+                    lo: vec3(0.0),
+                    hi: vec3(0.0),
+                    strength: vec3(0.0),
+                },
+                tip: vec3(0.0, l, 0.0),
+            },
+        ],
+    )
+    let shape = round_cone(vec3(0.0), vec3(0.0, l, 0.0), r_top: r, r_bottom: r)
+        .with(density(1000.0))
+    let rest: Pose<0> = one.rest()
+    let m = masses(one, rest, shape, [on(0)], 0.004)
+    let want = 1000.0 * (PI * r * r * l + 4.0 / 3.0 * PI * r * r * r)
+    assert(abs(m[0].mass / want - 1.0) < 0.005, f"mass {m[0].mass} kg, by its volume {want}")
+    assert(length(m[0].centre - vec3(0.0, 0.5 * l, 0.0)) < 1.0e-3, f"centre {m[0].centre}")
+    // About its own axis: a cylinder's m r² / 2 and two half balls' 2/5 m r² each.
+    let mc = 1000.0 * PI * r * r * l
+    let ms = 1000.0 * 4.0 / 3.0 * PI * r * r * r
+    let iy = 0.5 * mc * r * r + 0.4 * ms * r * r
+    assert(abs(m[0].inertia[1].y / iy - 1.0) < 0.02, f"inertia about y {m[0].inertia[1].y}, {iy}")
+    let slow = masses_by_grid(one, rest, shape, [on(0)], vec3(-0.06, -0.06, -0.06), vec3(0.06, 0.46, 0.06), 0.002)
+    assert(abs(m[0].mass / slow[0].mass - 1.0) < 0.01, f"fast {m[0].mass}, slow {slow[0].mass}")
+}
+
+/// A part that spans two segments is shared by their bones.
+@test
+fn a_part_on_a_chain_is_shared_by_its_bones() {
+    let fixed = |parent: u32, t: vec3, kind: Kind| Joint {
+        kind,
+        parent,
+        at: Frame { q: Quat::identity(), t },
+        lo: vec3(-1.0),
+        hi: vec3(1.0),
+        strength: vec3(1.0),
+    }
+    let two = body(
+        [
+            Segment { joint: fixed(NONE, vec3(0.0), Kind::Fixed), tip: vec3(0.0, 0.2, 0.0) },
+            Segment { joint: fixed(0, vec3(0.0, 0.2, 0.0), Kind::Ball), tip: vec3(0.0, 0.2, 0.0) },
+        ],
+    )
+    let shape = round_cone(vec3(0.0), vec3(0.0, 0.4, 0.0), r_top: 0.05, r_bottom: 0.05)
+        .with(density(1000.0))
+    let rest: Pose<3> = two.rest()
+    let m = masses(two, rest, shape, [body::body::Span { from: 0, to: 1 }], 0.004)
+    assert(abs(m[0].mass / m[1].mass - 1.0) < 0.01, f"{m[0].mass} and {m[1].mass}")
+    // Its cylinder (0.2 m) and its half ball at the end, in its own frame.
+    let (cyl, cap) = (0.2 * 0.05 * 0.05, 2.0 / 3.0 * 0.05 * 0.05 * 0.05)
+    let want = (cyl * 0.1 + cap * (0.2 + 3.0 / 8.0 * 0.05)) / (cyl + cap)
+    assert(abs(m[1].centre.y - want) < 0.002, f"the upper half's centre {m[1].centre}, {want}")
+}
+
+/// A body of human form held to a published table: each of de Leva's segments of a man (P. de
+/// Leva, "Adjustments to Zatsiorsky-Seluyanov's segment inertia parameters", J. Biomech. 29(9),
+/// 1996, table 4, males: their lengths, their shares of 73.0 kg and their radii of gyration, as
+/// BMClab/BMC's data/BSPmale_ZdeLeva.txt holds them, CC BY 4.0) is a round cone as long as the
+/// segment, as thick as weighs its share at 1,050 kg/m³. Its inertia across its length is then the
+/// engine's own sum, held to the table's radius of gyration: a capsule is not a limb, so to 20% (a thigh, wide at the hip, is 17% off).
+/// The head and the trunk are left out: their mass lies wide of their length's axis, as a
+/// capsule's doesn't (a capsule gives 0.29 and 0.27 of their lengths, the table 0.36 and 0.37).
+@test
+@fuel(2 ** 40)
+fn a_human_shaped_body_turns_as_the_table_says() {
+    // Length (m), share of the mass, radius of gyration across (sagittal) / length.
+    let rows = [
+        vec3(0.2817, 0.0271, 0.285), // upper arm
+        vec3(0.2689, 0.0162, 0.276), // forearm
+        vec3(0.4222, 0.1416, 0.329), // thigh
+        vec3(0.4340, 0.0433, 0.251), // shank
+    ]
+    let rho = 1050.0
+    for i in 0..4 {
+        let (l, share, rg) = (rows[i].x, rows[i].y, rows[i].z)
+        let m_want = share * 73.0
+        // The radius whose capsule (its ends inside the segment) weighs `m_want`, by halving.
+        var lo = 0.001
+        var hi = 0.5 * l
+        for _ in 0..60 {
+            let r = 0.5 * (lo + hi)
+            let m = rho * (PI * r * r * l - 2.0 / 3.0 * PI * r * r * r)
+            if m < m_want { lo = r } else { hi = r }
+        }
+        let r = 0.5 * (lo + hi)
+        let one = body(
+            [
+                Segment {
+                    joint: Joint {
+                        kind: Kind::Fixed,
+                        parent: NONE,
+                        at: Frame::identity(),
+                        lo: vec3(0.0),
+                        hi: vec3(0.0),
+                        strength: vec3(0.0),
+                    },
+                    tip: vec3(0.0, l, 0.0),
+                },
+            ],
+        )
+        let shape = round_cone(vec3(0.0, r, 0.0), vec3(0.0, l - r, 0.0), r_top: r, r_bottom: r)
+            .with(density(rho))
+        let rest: Pose<0> = one.rest()
+        let m = masses(one, rest, shape, [on(0)], min(0.006, r / 4.0))
+        let rg_got = sqrt(m[0].inertia[0].x / m[0].mass) / l
+        print(f"de Leva segment {i}: {m[0].mass} kg ({m_want}), radius {r} m, radius of gyration across {rg_got} of its length ({rg} in the table)")
+        assert(abs(m[0].mass / m_want - 1.0) < 0.01, f"segment {i}: {m[0].mass} kg, {m_want} kg")
+        assert(abs(rg_got / rg - 1.0) < 0.2, f"segment {i}: radius of gyration {rg_got}, {rg}")
+    }
+}
