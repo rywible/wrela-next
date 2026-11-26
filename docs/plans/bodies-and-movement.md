@@ -703,8 +703,26 @@ against 984); the body that does not move fails the distance from capture on 78 
 clips and the goal error on 71 (it can't be told from standing capture, which is right); the
 judge's time, done (5.4 ms for a second of movement; the M4 not measured); the targets of phases
 4 to 6: the judge's limits are the calibration's targets above, and phase 4's are kept (95% of
-clips, 50 mm), which the first run of one walk met (43.8 mm, no fall). The laws of movement are
-measured and checked but not yet in the calibration's score.
+clips, 50 mm), which the first run of one walk met (43.8 mm, no fall).
+
+The laws of movement, calibrated (`tools/movement/judge -- laws-calibrate`, the 117 calibration
+clips, each with seven damaged copies; 14.3 s for 5,760 s of clean movement and its copies). Each
+law's band is the clean clips' 5th to 95th percentile; a movement outside a band breaks that law
+as capture does not:
+
+| Law | Clean clips | Band | Noisy 0.02 / 0.05 / 0.1 rad outside | Faster 1.25 / 1.5 / 2 outside | Still outside |
+| --- | --- | --- | --- | --- | --- |
+| The hands' paths: \|power-law exponent + 1/3\| | 102 | 0.017 to 0.188 | 27 / 32 / 84 of 117 | 16 / 18 / 14 of about 100 | (no path) |
+| Turns: share not head, trunk, pelvis | 78 | 0.27 to 0.72 | 7 / 39 / 73 of 78 | 12 / 5 / 11 of 78 | (no turn) |
+| Standing: sway (mm RMS) | 39 | 2.9 to 20.9 | 3 / 13 / 39 of 39 | 4 / 3 / 3 of 39 | 39 of 39 |
+| Standing: chest power outside breath | 39 | 0.12 to 0.79 | 4 / 8 / 14 of 39 | 8 / 9 / 16 of 39 | 39 of 39 |
+
+Noise breaks each law more with more of it, and a body that does not move breaks standing every
+time. A faster clip keeps the power law, as it must: the exponent does not change when time is
+scaled. In this capture the order of a turn is weak (a median of 54% of turns are not head, then
+trunk, then pelvis, by onsets of 0.1 rad), so its band is wide; the responses, reaches and the
+shift of weight before a raised arm have no capture to calibrate on and wait for the solver's
+movements (step 10).
 
 ## 9. Phase 4: the tracker
 
