@@ -334,6 +334,10 @@ pub struct GridSpec: Copy + GpuData {
     pub pad2: u32,
     pub parent_hole_min: vec3u,
     pub pad3: u32,
+    /// Where the world's lattice of cells stands off the grid's own points (m, `lattice`): one for
+    /// every grid of a world (`ExtractScratch::lattice`, `placement`).
+    pub shift: vec3,
+    pub pad4: u32,
 }
 
 /// Coordinate `axis` (`0..3`) of `p`.
@@ -430,7 +434,7 @@ pub(package) fn tight_aabb_rest<M: Field<Substance>>(field: M) -> Box3 {
 
 /// Builds a single-LOD `GridSpec` covering `aabb` with cell spacing `cell`, padded by 2 cells so
 /// the surface never touches the grid boundary.
-pub(package) fn grid_for(aabb: Box3, cell: f32, base_brick: u32, orig_id: u32) -> GridSpec {
+pub(package) fn grid_for(aabb: Box3, cell: f32, base_brick: u32, orig_id: u32, shift: vec3) -> GridSpec {
     let pad = vec3(cell * 2.0)
     let origin = aabb.lo - pad
     let span = max(aabb.hi + pad - origin, vec3(cell))
@@ -455,6 +459,8 @@ pub(package) fn grid_for(aabb: Box3, cell: f32, base_brick: u32, orig_id: u32) -
         pad2: 0,
         parent_hole_min: vec3u(0, 0, 0),
         pad3: 0,
+        shift,
+        pad4: 0,
     }
 }
 
@@ -470,9 +476,10 @@ pub fn build_lod_grids(
     h_top: f32,
     orig_id: u32,
     half_parent_bricks: u32,
+    shift: vec3,
 ) -> (Vec<GridSpec>, u32, bool) {
     if h_top <= h_near * 1.45 {
-        let g = grid_for(aabb, h_near, base_brick: 0, orig_id: orig_id)
+        let g = grid_for(aabb, h_near, base_brick: 0, orig_id: orig_id, shift: shift)
         let tb = g.dims.x * g.dims.y * g.dims.z
         var out: Vec<GridSpec> = Vec::new()
         out.push(g)
@@ -491,7 +498,7 @@ pub fn build_lod_grids(
     // phase mismatch.
     let h_root = clamp(h_near * scale, 0.60 * h_top, h_top)
     var grids: Vec<GridSpec> = Vec::new()
-    grids.push(grid_for(aabb, h_root, base_brick: 0, orig_id: orig_id))
+    grids.push(grid_for(aabb, h_root, base_brick: 0, orig_id: orig_id, shift: shift))
     let fclamped = clamp(focus, aabb.lo, aabb.hi)
     let hb = max(half_parent_bricks, 2)
     for _lvl in 1..levels {
@@ -582,6 +589,8 @@ pub fn build_lod_grids(
                 pad2: 0,
                 parent_hole_min: vec3u(0, 0, 0),
                 pad3: 0,
+                shift: prev.shift,
+                pad4: 0,
             }
         } else {
             grids[pi] = GridSpec { has_hole: 1, hole_min, hole_max, ..prev }
@@ -603,6 +612,8 @@ pub fn build_lod_grids(
                     pad2: 0,
                     parent_hole_min: hole_min,
                     pad3: 0,
+                    shift: prev.shift,
+                    pad4: 0,
                 },
             )
         }
@@ -675,9 +686,10 @@ pub fn build_lod_grids_view(
     max_parent_span: u32,
     area_budget: u32,
     root_min_ratio: f32,
+    shift: vec3,
 ) -> (Vec<GridSpec>, u32, bool) {
     if h_top <= h_near * 1.45 {
-        let g = grid_for(aabb, h_near, base_brick: 0, orig_id: orig_id)
+        let g = grid_for(aabb, h_near, base_brick: 0, orig_id: orig_id, shift: shift)
         let tb = g.dims.x * g.dims.y * g.dims.z
         var out: Vec<GridSpec> = Vec::new()
         out.push(g)
@@ -694,7 +706,7 @@ pub fn build_lod_grids_view(
     // 1.6× phase mismatch.
     let h_root = clamp(h_near * scale, root_min_ratio * h_top, h_top)
     var grids: Vec<GridSpec> = Vec::new()
-    grids.push(grid_for(aabb, h_root, base_brick: 0, orig_id: orig_id))
+    grids.push(grid_for(aabb, h_root, base_brick: 0, orig_id: orig_id, shift: shift))
     let tan_y = 1.12 / max(v.focal, 1.0e-4)
     let tan_x = (v.size.x / max(v.size.y, 1.0)) * tan_y
     let px_rad = max(v.pixel(), 1.0e-5)
@@ -868,6 +880,8 @@ pub fn build_lod_grids_view(
                 pad2: 0,
                 parent_hole_min: vec3u(0, 0, 0),
                 pad3: 0,
+                shift: prev.shift,
+                pad4: 0,
             }
         } else {
             grids[pi] = GridSpec { has_hole: 1, hole_min, hole_max, ..prev }
@@ -889,6 +903,8 @@ pub fn build_lod_grids_view(
                     pad2: 0,
                     parent_hole_min: hole_min,
                     pad3: 0,
+                    shift: prev.shift,
+                    pad4: 0,
                 },
             )
         }
@@ -911,7 +927,15 @@ pub fn build_lod_grids_view(
 /// neighbours across bricks and across 2:1 LOD boundaries get the exact same `f32` bits.
 pub(package) fn lattice(g: GridSpec, n: vec3u) -> vec3 {
     let gidx = n + g.cell_offset
-    g.origin + vec3(f32(gidx.x), f32(gidx.y), f32(gidx.z)) * g.cell
+    g.origin + vec3(f32(gidx.x), f32(gidx.y), f32(gidx.z)) * g.cell + g.shift
+}
+
+/// The `k`th placement of the world's lattice (`GridSpec::shift`): 0 the world's own, and others
+/// a judge averages its numbers over (`tools/gate`), each a few cm off along each axis by steps
+/// that are no simple fraction of one another or of a cell, so a count that moves with where the
+/// cells fall is measured as a mean, not as one placement's draw.
+pub fn placement(k: u32) -> vec3 {
+    f32(k) * vec3(0.01731, 0.02917, 0.01193)
 }
 
 /// Whether brick `b` of grid `g` lies strictly inside `g`'s refined child hole `[hole_min, hole_max)`.

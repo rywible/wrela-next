@@ -116,7 +116,14 @@ Use these commands. Do not use a different measure of a frame.
 | Each constant that the build calculated | `tools/wrela build game/scenes --report consts` |
 | The same command on the Radeon | `tools/radeon COMMAND` (commit and push first) |
 
-- The span is the median of frames 30 to 89 at 1920x1080. The gate uses the same numbers.
+- The span is the median of frames 30 to 89 at 1920x1080. The gate uses the same numbers, as
+  their mean over three placements of the world's lattice of cells (`PLACE`), and the sun's
+  judge over four: where the cells fall moves a span or a count past its slack on its own (cells
+  1% larger: SCENE 13 VIEW 0's hard leaks 754 to 882, SCENE 13's span 18.20 to 19.30 ms; the
+  lattice moved a few mm: 677 to 816, 19.2 to 20.5 ms), so a change to the mesh is held to a mean
+  of that draw, not to one draw of it.
+- A paired `tools/bench --against` of two builds of one placement measures a change that keeps
+  the mesh (a pass, the host); a change that moves the mesh is measured over placements.
 - `tools/bench` also runs each pass alone and prints a table. The times in the table do not add
   up to the span. Use the table to compare one pass before and after a change.
 - Put each measurement in the commit message: before and after, same machine, same run.
