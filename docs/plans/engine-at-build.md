@@ -757,7 +757,10 @@ cell have the same bits, and they join with no crack.
 
 State (2026-11-26): step 1's list is below; step 7 is done: `wrela pipelines` names each kernel's
 kind by its type arguments (`eval_corners::<ParryArc>`) and the engine function at each of its
-sites (`extract.wrela:2873:17 in `MeshBatch::run_extract``). Steps 2 to 6 are open.
+sites (`extract.wrela:2873:17 in `MeshBatch::run_extract``). Step 6 is done: a dispatch whose
+size the build knows (its group counts constants, or arithmetic of them) and whose bound times
+its invocations is past 50 ms on either target, at the host's arithmetic, is E0714 (no engine
+scene has one). Steps 2 to 5 are open.
 
 ### The decisions made at run time (step 1)
 

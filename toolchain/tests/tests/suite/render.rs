@@ -167,7 +167,7 @@ fn shaders_get_the_values_the_program_means() {
 }
 
 /// The pipeline-count query (§18.9): each pipeline's entry points with their type arguments, and
-/// where CPU code dispatches or draws it. Without a GPU.
+/// where CPU code dispatches or draws it, and in which function. Without a GPU.
 #[test]
 fn the_pipeline_count_query_reports_each_instantiation() {
     let out = wrela_driver::check(&wrela_tests::repo_root().join("toolchain/tests/shaders"));
@@ -175,10 +175,10 @@ fn the_pipeline_count_query_reports_each_instantiation() {
     let shown: Vec<(String, Vec<String>)> =
         out.pipelines.iter().map(|p| (p.entries.join(" + "), p.sites.clone())).collect();
     let want = [
-        ("step", "main.wrela:183:5"),
-        ("cover + blue", "main.wrela:188:5"),
-        ("half::<f32> + shade::<f32>", "main.wrela:189:5"),
-        ("half::<vec4> + shade::<vec4>", "main.wrela:195:5"),
+        ("step", "main.wrela:183:5 in `frame`"),
+        ("cover + blue", "main.wrela:188:5 in `frame`"),
+        ("half::<f32> + shade::<f32>", "main.wrela:189:5 in `frame`"),
+        ("half::<vec4> + shade::<vec4>", "main.wrela:195:5 in `frame`"),
     ];
     let want: Vec<(String, Vec<String>)> =
         want.iter().map(|(e, s)| (e.to_string(), vec![s.to_string()])).collect();

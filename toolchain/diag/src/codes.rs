@@ -266,6 +266,7 @@ codes! {
     E0711 = "E0711", "a `@standin` that can't stand in for its entry point";
     E0712 = "E0712", "GPU code that computes a value the same for every invocation, each invocation again";
     E0713 = "E0713", "GPU code that copies a large struct or array of read-only data into each invocation";
+    E0714 = "E0714", "a dispatch whose size the build knows, past the work one dispatch may do";
 
     // ---- E09xx: not in tier 0 --------------------------------------------------------------
 

@@ -584,6 +584,9 @@ fn lower_in(
         i += 1;
     }
     gpu::name_uncounted(&mut cx);
+    if emit && !wrela_diag::has_errors(&cx.diags) {
+        known_dispatches_within_the_line(&mut cx, &cpu.m, &pipelines);
+    }
     if pipelines.len() == cx.pipelines.len() {
         for &(i, j) in &standins {
             gpu::match_standin(&mut cx, &mut pipelines, i as usize, j as usize);
@@ -683,6 +686,96 @@ fn recorded_pipelines_only(cx: &mut Cx, cpu: &mut ir::Module) {
     retain_used(&mut cx.pipelines, &used);
     retain_used(&mut cx.pipeline_sites, &used);
     retain_used(&mut cx.pipeline_targets, &used);
+}
+
+/// E0714 at each dispatch whose size the build knows (every group count a constant of the CPU
+/// code) and whose work, its kernel's bound times its invocations, is past the most one dispatch
+/// may do on a target: the host's own arithmetic (`wrela-host`'s `step::ms_of`, never fewer
+/// invocations than the target's `step_width`, at its `step_femtoseconds` a unit), against the
+/// line of 50 ms, for both targets. The host refuses such a dispatch when it comes; the build
+/// knows it first. A size known only as the program runs is the host's alone to refuse.
+fn known_dispatches_within_the_line(cx: &mut Cx, cpu: &ir::Module, pipelines: &[gpu::PipelineOut]) {
+    const LINE_MS: f64 = 50.0;
+    let mut over: Vec<(u32, u64, u64, wrela_abi::Target, f64)> = Vec::new();
+    for f in &cpu.functions {
+        // The `u32`s the code knows as constants: literals, and the integer arithmetic of them
+        // a dispatch's group counts are made of (`n / 64 + min(n % 64, 1)`), in code order.
+        let mut consts: std::collections::HashMap<ir::ValueId, u32> = Default::default();
+        ir::visit::walk(&f.body, &mut |s| {
+            let ir::Stmt::Let(v, e) = s else { return };
+            let known = |x: &ir::ValueId| consts.get(x).copied();
+            let n = match e {
+                ir::Expr::Const(ir::Const::U32(n)) => Some(*n),
+                ir::Expr::Binary(op, a, b) => match (known(a), known(b)) {
+                    (Some(a), Some(b)) => match op {
+                        ir::BinOp::Add => a.checked_add(b),
+                        ir::BinOp::Sub => a.checked_sub(b),
+                        ir::BinOp::Mul => a.checked_mul(b),
+                        ir::BinOp::Div => a.checked_div(b),
+                        ir::BinOp::Rem => a.checked_rem(b),
+                        _ => None,
+                    },
+                    _ => None,
+                },
+                ir::Expr::Builtin(ir::Builtin::Min, xs) if xs.len() == 2 => {
+                    known(&xs[0]).zip(known(&xs[1])).map(|(a, b)| a.min(b))
+                }
+                ir::Expr::Builtin(ir::Builtin::Max, xs) if xs.len() == 2 => {
+                    known(&xs[0]).zip(known(&xs[1])).map(|(a, b)| a.max(b))
+                }
+                _ => None,
+            };
+            if let Some(n) = n {
+                consts.insert(*v, n);
+            }
+        });
+        ir::visit::walk(&f.body, &mut |s| {
+            let Some(ir::Expr::Host(ir::HostOp::Dispatch { pipeline, indirect: false, .. }, args)) =
+                s.expr()
+            else {
+                return;
+            };
+            let Some(p) = pipelines.get(*pipeline as usize) else { return };
+            let gpu::PipelineKind::Compute { workgroup_size } = p.kind else { return };
+            let Some(Some(work)) = p.work.first() else { return };
+            let groups: Option<Vec<u64>> =
+                args.iter().take(3).map(|a| consts.get(a).map(|&n| u64::from(n))).collect();
+            let Some(groups) = groups.filter(|g| g.len() == 3) else { return };
+            let per_group: u64 = workgroup_size.iter().map(|&w| u64::from(w)).product();
+            let invocations = groups.iter().product::<u64>() * per_group;
+            for t in wrela_abi::Target::ALL {
+                let l = t.limits();
+                let ms = *work as f64
+                    * invocations.max(u64::from(l.step_width)) as f64
+                    * f64::from(l.step_femtoseconds)
+                    * 1e-12;
+                if ms > LINE_MS {
+                    over.push((*pipeline, *work, invocations, t, ms));
+                    break;
+                }
+            }
+        });
+    }
+    over.sort_by_key(|o| (o.0, o.2));
+    over.dedup_by_key(|o| (o.0, o.2));
+    for (pipeline, work, invocations, t, ms) in over {
+        let p = &pipelines[pipeline as usize];
+        let Some(&at) = p.sites.first() else { continue };
+        cx.err(
+            Diagnostic::new(
+                wrela_diag::codes::E0714,
+                at,
+                format!(
+                    "a dispatch of `{}` over {invocations} invocations can hold the GPU {ms:.0} ms on {t:?}, past the 50 ms one dispatch may",
+                    p.name
+                ),
+            )
+            .with_note(format!(
+                "its kernel's bound is {work} work an invocation; the host would refuse the dispatch when it came (§18.11)"
+            ))
+            .with_help("dispatch it in parts, each over fewer invocations (`std::gpu::kernel_work(kernel.bind(...))` gives its bound to size them by)"),
+        );
+    }
 }
 
 /// Keeps the items of `v` whose entry in `used` is true.

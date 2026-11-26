@@ -409,3 +409,34 @@ fn strict_builtins_cost_what_std_s_code_does() {
     }
     assert!(wrong.is_empty(), "the table is not std's code (the kernel of none: {none}):\n{}", wrong.join("\n"));
 }
+
+/// A dispatch whose size the build knows is held to the host's line at build (E0714, phase 4
+/// step 6 of docs/plans/engine-at-build.md): a kernel of 8,000 sines' work an invocation over a
+/// constant 1,048,576 invocations is past it on both targets, and names the kernel; over 64 it
+/// is under it, and a size the build doesn't know is the host's to refuse.
+#[test]
+fn a_dispatch_the_build_sizes_past_the_line_is_e0714() {
+    let kernel = "@compute(64)\nfn heavy(out: mut Slots<f32>, id: GlobalId) {\n    var a = f32(id.x)\n    for _i in 0..2000 {\n        a = sin(a) + cos(a)\n    }\n    out[id] = a\n}\n";
+    let src = |n: &str| {
+        format!(
+            "use std::gpu::{{GlobalId, GpuBuffer, Slots, buffer, dispatch}}\n\n{kernel}\npub fn frame(time: f32, width: u32, height: u32) {{\n    var out: GpuBuffer<f32> = buffer(1048576)\n    dispatch(heavy.bind(mut out), over: {n})\n}}\n"
+        )
+    };
+    let codes = |name: &str, n: &str| {
+        let dir = scratch(name);
+        write_package(&dir, name, &src(n));
+        let out = wrela_driver::build(&dir);
+        let msgs: Vec<String> = (out.diagnostics.iter())
+            .filter(|d| d.code == wrela_diag::codes::E0714)
+            .map(|d| d.message.clone())
+            .collect();
+        (msgs, out.has_errors())
+    };
+    let (past, errs) = codes("e0714_past", "1048576");
+    assert!(errs && past.len() == 1, "{past:?}");
+    assert!(past[0].contains("`heavy`") && past[0].contains("1048576 invocations"), "{past:?}");
+    let (under, errs) = codes("e0714_under", "64");
+    assert!(!errs && under.is_empty(), "{under:?}");
+    let (unknown, errs) = codes("e0714_unknown", "width * height");
+    assert!(!errs && unknown.is_empty(), "{unknown:?}");
+}
