@@ -791,8 +791,21 @@ eleven times its lanes' sum) take 0.19. Not the code after a discard (a fragment
 returns right after it is slower, 15.8 ms: the M4 doesn't run a discarded fragment on), nor the
 arithmetic the counts see: the draw writes depth (a `WithDepthBehind`) and discards, over boxes
 many deep, so its fragments wait on each other at each pixel. That is phase 5's largest item
-(it is most of the proof debt counted below), and the model's next term: what a draw whose
-fragments write depth and may discard costs a fragment, which these counts can't see. The
+(it is most of the proof debt counted below), and the model's next term. What is measured of it
+(SCENE 14, frame 40, 1080p, M4): the candlestick's draw has the same counts with its march
+compiled in or cut out of the shader (work 9.8e7 / 1.1e8, fragments 525,732 / 510,777, stream
+4.1e6 / 3.9e6), and takes 10.3 ms or 1.4: almost none of its fragments runs the march, yet each
+pays for the march being in the shader, about seven times over. Not its depth write (10.4 ms
+with none), not the code after its discards (returning there: 15.8 ms), not a lost early depth
+test (with no discard in the shader, every empty fragment dropped by writing the farthest depth,
+518,499 fragments still run, 11.8 ms; with a floor at the shader's discard margin drawn under
+it first, 519,479, 9.9 ms): those fragments are in front of the mesh, and they leave at the
+shader's first tests. So the fix is to keep the march out of the shader most of them run: a
+small shader for every box fragment that keeps only those whose ray can meet the surface, and
+the march for those alone. Found on the way: a rigid thing's exact cells are tested in the
+frame it was meshed in (`exact_box_one_fs` brackets the world ray by the cell's box as meshed,
+where `exact_box_vs` draws it moved by `xforms[0]`), right while it is still, wrong once it
+moves without being meshed again. The
 target is 20% of each gate scene's span, on the two machines. Step 2's scene types are done: whether a scene has a swarm, a heightfield (opaque,
 transmissive) or a medium, whether its look blooms and how many batches its world draws are
 constants of their types, so SCENE 14 (no swarm, a look without bloom) has 159 pipelines where it
