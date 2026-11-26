@@ -34,7 +34,9 @@
 use clips::clips::{load, pose_bytes, read_all, write_all}
 use engine::body::body::Pose
 use engine::body::joint::Kind
-use engine::body::motion::{GOAL, Wish, goal, heading, on_floor, solved, state, step, yaw}
+use engine::body::motion::{
+    GOAL, Reach, Wish, goal, heading, looking, on_floor, reaching, solved, state, step, yaw,
+}
 use engine::learned::net
 use std::collections::Vec
 use std::string::String
@@ -199,7 +201,15 @@ fn play<const S: u32, const D: u32, const P: u32>(
 
 /// The goal tests: each one's name, and at second `t` the speed ahead and to the left (m/s, in
 /// the frame of the heading the test asks for) and that heading's turn from the start (rad).
-const GOAL_TESTS: [Text; 6] = ["start", "stop", "walk", "run", "turn", "side"]
+const GOAL_TESTS: [Text; 8] = ["start", "stop", "walk", "run", "turn", "side", "reach", "look"]
+
+/// The timed goals of the test. `reach`: walking, at 2 s the right hand's palm is given a point
+/// 0.45 m ahead of where the body will be at 3 s, 0.2 m to its right and 1.15 m up, for the tick
+/// of 3 s. `look`: standing, from 1 s the head turns toward a point 2 m ahead and 1 m to the
+/// left at 1.6 m (a fifth of the way left each tick).
+const REACH_SET: f32 = 2.0
+const REACH_AT: f32 = 3.0
+const LOOK_FROM: f32 = 1.0
 
 /// The tests' speeds (m/s): each gait's 90th percentile in the human's training clips (2026-11-26:
 /// 100STYLE's walks move 0.56 m/s at the median and 0.90 at the 90th percentile, its runs 1.04 and
@@ -226,6 +236,12 @@ fn asked(test: u32, t: f32) -> vec3 {
     if test == 4 {
         return vec3(WALK, 0.0, quarter * clamp((t - 1.0) / 2.0, 0.0, 1.0))
     }
+    if test == 6 {
+        return vec3(WALK, 0.0, 0.0)
+    }
+    if test == 7 {
+        return vec3(0.0)
+    }
     vec3(0.0, SIDE, 0.0)
 }
 
@@ -246,7 +262,16 @@ fn goaltest<const S: u32, const D: u32, const P: u32>(
     let seconds = 6.0
     let ticks = u32(seconds * rate)
     var failed = 0
-    for k in 0..6 {
+    let palm = vec3(0.0, 0.5 * def.body.segments[def.hand_right].tip.y, 0.0)
+    for k in 0..8 {
+        var reach = Reach {
+            segment: def.hand_right,
+            point: palm,
+            at: vec3(0.0),
+            tick: u32(REACH_AT * rate),
+        }
+        let look_at = yaw(h0).rotate(vec3(1.0, 0.0, 2.0)) +
+            vec3(clip[1].root.t.x, 1.6, clip[1].root.t.z)
         var poses: Vec<Pose<D>> = Vec::new()
         var vel: Vec<u8> = Vec::new()
         poses.push(clip[0])
@@ -265,14 +290,39 @@ fn goaltest<const S: u32, const D: u32, const P: u32>(
                 speed: true,
                 heading: true,
             }
-            poses.push(
-                on_floor(
-                    def.body,
-                    def.parts,
-                    solved(def.body, it, poses[t - 1], now, rate, wish, seed, t),
-                    0.0,
-                ),
+            var next = on_floor(
+                def.body,
+                def.parts,
+                solved(def.body, it, poses[t - 1], now, rate, wish, seed, t),
+                0.0,
             )
+            let tick = t + 1
+            if k == 6 && tick == u32(REACH_SET * rate) {
+                // The point, from where the body is and the speed it is asked for.
+                let ahead = yaw(h).rotate(vec3(-0.2, 0.0, 0.45 + WALK * (REACH_AT - REACH_SET)))
+                reach.at = vec3(next.root.t.x + ahead.x, 1.15, next.root.t.z + ahead.z)
+            }
+            if k == 6 && tick >= u32(REACH_SET * rate) && tick <= reach.tick {
+                next = reaching(def.body, next, reach, tick)
+                if tick == reach.tick {
+                    let hand = def.body.places(next)[def.hand_right].apply(palm)
+                    print(
+                        f"solver: reach: the palm at tick {tick} is {1000.0 * length(hand - reach.at)} mm from its point",
+                    )
+                }
+            }
+            if k == 7 && tick >= u32(LOOK_FROM * rate) {
+                next = looking(def.body, next, def.head, look_at, 0.2)
+                if tick == ticks {
+                    let f = def.body.places(next)[def.head]
+                    let ahead = f.q.rotate(vec3(0.0, 0.0, 1.0))
+                    let angle = acos(clamp(dot(ahead, normalize(look_at - f.t)), -1.0, 1.0))
+                    print(
+                        f"solver: look: at the end the head faces {angle * 57.29578} degrees from its point",
+                    )
+                }
+            }
+            poses.push(next)
             if t == 1 {
                 push_f32(mut vel, world.x)
                 push_f32(mut vel, world.z)
@@ -292,7 +342,7 @@ fn goaltest<const S: u32, const D: u32, const P: u32>(
             failed += 1
         }
     }
-    print(f"solver: 6 goal tests, {failed} failed")
+    print(f"solver: 8 goal tests, {failed} failed")
     if failed > 0 { 1 } else { 0 }
 }
 

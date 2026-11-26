@@ -1006,8 +1006,14 @@ through the world with no cycle and no clip.
   clips' seconds come as near as 0.588 to each other (0.936 at their 1st percentile, 1.853 at the
   median; the solver's median 1.647): no second of the solver's is nearer to the training set than
   the training set is to itself.
-- Not yet: the timed goals (a hand at a point at a tick, a point to look at), the solver trained
-  on the filtered capture (phase 4's tracker on the human is in work), the tracker following the
+- The timed goals (step 1): `engine::body::motion::reaching` (a part's point at a point at a
+  tick: each tick before it the part covers its share of the way left, one over the ticks left
+  and one, by the joints between the root and the part, the root held: `fit`) and `looking` (a
+  head turned a share of the way toward a point each tick). In the goal test the right palm is
+  1.1 mm from its point at its tick (0 ticks late; the target 20 mm) while walking, and the head
+  ends 0.67 degrees from its point; both movements pass every target of the judge, as 7 of the
+  test's 8 do (the run all but its slide).
+- Not yet: the solver trained on the filtered capture (phase 4's tracker on the human is in work), the tracker following the
   solver's output, the bits on the two machines (the M4 is not measured), the prior of style and
   the skills.
 
