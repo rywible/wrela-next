@@ -1,8 +1,8 @@
 // Build-time mathematical soundness verification for `Surface`, `Field<Substance>`, and `Edited<M>`.
 //
-// Any under-approximated `bound()`, `lipschitz()`, `pruned()`, `interval_near()`, or
-// `dirty_region()` causes brick culling, tight AABBs, Lipschitz ray marching, or incremental CSG
-// re-extraction to silently drop geometry and open holes. Calling these checks from `@test` suites
+// Any under-approximated `bound()`, `lipschitz()`, `pruned()`, `interval_near()`, `slope_box()`,
+// or `dirty_region()` causes brick culling, tight AABBs, Lipschitz ray marching, sheet
+// certificates, or incremental CSG re-extraction to silently drop geometry and open holes. Calling these checks from `@test` suites
 // (run automatically by `tools/check`) catches unsound field contracts at build time with zero
 // runtime overhead.
 //
@@ -14,7 +14,7 @@ use matter::edits::Edited
 use matter::substance::Substance
 use std::collections::Vec
 use std::derive::{Box3, Interval, affine, affine_form, gradient, interval, lipschitz, work}
-use std::field::{ALL_LIVE, Bound, Field, FieldFacts, Surface, UNBOUNDED}
+use std::field::{ALL_LIVE, Bound, Field, FieldFacts, Live, Surface, UNBOUNDED, form_box, hash_u32}
 use std::hash::StateHash
 use std::io::print
 
@@ -272,16 +272,164 @@ fn prove_holds<S: Surface>(s: S, b: Box3, range: Interval, what: str, label: str
     Proven { proven, unproven }
 }
 
-/// Verifies every culling and marching contract of `s` by the compiler's affine arithmetic with
-/// adaptive worst-box priority bisection (a sample that breaks a contract fails the check, naming
-/// where):
+/// The most splits one claim of an enclosure is given before its boxes left are sampled, and how
+/// deep: each split is two of the compiler's forms of the whole field, and a claim over a cell
+/// is proven at once or after a few where the compiler's form keeps the field's slopes.
+const SLOPE_SPLITS_MAX: u32 = 12
+const SLOPE_DEPTH_MAX: u32 = 6
+
+/// The points a claim over a box is sampled at, beside `probes`, where nothing can be derived.
+const UNDERIVED_SAMPLES: u32 = 55
+
+/// Proves `lo <= f(q) <= hi` over `b`, as the target computes `f`: by the compiler's affine range
+/// of `f` over `b` (`std::derive::affine`, sound as the target rounds), bisecting along the
+/// widest axis where the range is too wide; a box past the budget is sampled (`probes`). No
+/// slack: a caller whose claim has a tolerance widens `lo` and `hi` by it, and says what it is.
+/// With `derive` false nothing is derived and the box is sampled alone (`probes`, and
+/// `UNDERIVED_SAMPLES` points spread through it): for a function the compiler's derivation
+/// can't be run on.
+fn prove_between<F: Copy + fn(vec3) -> f32>(
+    f: F,
+    b: Box3,
+    lo: f32,
+    hi: f32,
+    what: str,
+    label: str,
+    derive: bool,
+) -> Proven {
+    if !derive {
+        for k in 0..(9 + UNDERIVED_SAMPLES) {
+            let p = if k < 9 { probes(b, k) } else { b.sample(211, k) }
+            let v = f(p)
+            assert(
+                lo <= v && v <= hi,
+                f"verify({label}): {what}: {v} at {p} is outside [{lo}, {hi}] (box {b.lo} to {b.hi})",
+            )
+        }
+        return Proven { proven: 0, unproven: 1 }
+    }
+    let f0 = affine(|q: vec3| f(q), b)
+    if f0.lo >= lo && f0.hi <= hi {
+        return Proven { proven: 1, unproven: 0 }
+    }
+    var work: Vec<(Box3, f32, u32)> = Vec::new()
+    work.push((b, max(lo - f0.lo, f0.hi - hi), 0))
+    var proven: u32 = 0
+    var unproven: u32 = 0
+    var splits: u32 = 0
+    while work.len() > 0 {
+        let (bx, _score, depth) = pop_worst(mut work)
+        let (left, right) = bisect_widest(bx)
+        splits += 1
+        for side in 0..2 {
+            let sub = if side == 0 { left } else { right }
+            let r = affine(|q: vec3| f(q), sub)
+            if r.lo >= lo && r.hi <= hi {
+                proven += 1
+                continue
+            }
+            if depth + 1 >= SLOPE_DEPTH_MAX || splits >= SLOPE_SPLITS_MAX {
+                for k in 0..9 {
+                    let p = probes(sub, k)
+                    let v = f(p)
+                    assert(
+                        lo <= v && v <= hi,
+                        f"verify({label}): {what}: {v} at {p} is outside [{lo}, {hi}] (box {b.lo} to {b.hi})",
+                    )
+                }
+                unproven += 1
+            } else {
+                work.push((sub, max(lo - r.lo, r.hi - hi), depth + 1))
+            }
+        }
+    }
+    Proven { proven, unproven }
+}
+
+/// Proves what `s.slope_affine(bx, live)` claims of `distance_live(q, live)` over `bx`
+/// (`std::field::SlopeBox`, as the form the engine's certificates read): that its range holds the
+/// distance, and that the distance is within `e` of its plane, `|distance(q) - (c + dot(l,
+/// u(q)))| <= e` with `u(q) = (q - c_b) / h_in` (`form_box`). Each by the compiler's own
+/// derivation (`prove_between`): the plane's by the affine range of that residual, in which the
+/// field's own slopes cancel against the plane's where the compiler's form keeps them, so a
+/// tight claim is proven and not only sampled.
+///
+/// The plane's tolerance is the claim's own and the check's rounding, nothing more: a form holds
+/// for `q = c_b + h_in u + d` with `|d| <= delta` (`form_box`), so `u(q)` as computed here may be
+/// `delta / h_in` off the form's (`dot(|l| / h_in, delta)`), and the residual's own sums round
+/// by a few ulps of their terms. The range has none. A claim with no bound (`!af.valid()`) says
+/// nothing and isn't asked.
+fn prove_slope<S: Surface>(s: S, bx: Box3, live: Live, label: str, derive: bool) -> Proven {
+    let af = s.slope_affine(bx, live)
+    if !af.valid() {
+        return Proven { proven: 0, unproven: 0 }
+    }
+    let range = af.range()
+    let dist = |q: vec3| s.distance_live(q, live)
+    let a = prove_between(dist, bx, range.lo, range.hi, "slope_affine's range", label, derive)
+    let (c_b, h_in, delta) = form_box(bx)
+    let per = vec3(
+        if h_in.x > 0.0 { af.l.x / h_in.x } else { 0.0 },
+        if h_in.y > 0.0 { af.l.y / h_in.y } else { 0.0 },
+        if h_in.z > 0.0 { af.l.z / h_in.z } else { 0.0 },
+    )
+    let size = abs(af.c) + abs(af.l.x) + abs(af.l.y) + abs(af.l.z) + max(abs(range.lo), abs(range.hi))
+    let tol = dot(abs(per), delta) + size * (8.0 / 8388608.0) + 1.0e-37
+    let c = af.c
+    let residual = |q: vec3| s.distance_live(q, live) - (c + dot(per, q - c_b))
+    let most = af.e + tol
+    let b = prove_between(
+        residual,
+        bx,
+        -most,
+        most,
+        "slope_affine's plane (the distance less it)",
+        label,
+        derive,
+    )
+    Proven { proven: a.proven + b.proven, unproven: a.unproven + b.unproven }
+}
+
+/// `prove_slope` over `bx` with every part asked and, where the surface prunes any there, with
+/// the parts live in `bx` grown by half its width (as the engine prunes a cell's:
+/// `mesh::grid::cell_live`).
+fn prove_slopes<S: Surface>(s: S, bx: Box3, label: str, derive: bool) -> Proven {
+    let a = prove_slope(s, bx, ALL_LIVE, label, derive)
+    let pad = 0.5 * (bx.hi - bx.lo)
+    let live = s.pruned(Box3 { lo: bx.lo - pad, hi: bx.hi + pad }, |q: vec3| q, 1.0, ALL_LIVE, 0).live
+    if live == ALL_LIVE {
+        return a
+    }
+    let b = prove_slope(s, bx, live, label, derive)
+    Proven { proven: a.proven + b.proven, unproven: a.unproven + b.unproven }
+}
+
+fn unit(k: u32) -> f32 {
+    f32(hash_u32(k) >> 8) * (1.0 / 16777216.0)
+}
+
+/// The cell sizes `Surface::slope_box` is held at near the surface (m): what the engine
+/// certifies at, from the cells of a thing a metre off to those of one across a room.
+const SLOPE_CELLS: [f32; 3] = [0.004, 0.012, 0.04]
+
+/// Verifies every culling, marching and certificate contract of `s` by the compiler's affine
+/// arithmetic with adaptive worst-box priority bisection (a sample that breaks a contract fails
+/// the check, naming where):
 /// - `bound()`: `below(p) <= distance(p)` wherever `below(p) > 0`, over an `n`³ tiling of 1.5
 ///   bound radii;
 /// - `lipschitz(scope)`: `|∇distance| <= lipschitz(scope)` wherever `|distance| < scope` there;
 /// - `interval_near(box)` and `pruned(box).range`: each holds the distance over `boxes` boxes of
-///   three scales, and `distance_live` with `pruned`'s live parts is the distance there.
+///   three scales, and `distance_live` with `pruned`'s live parts is the distance there;
+/// - `slope_box`: `verify_slope_soundness`, over those boxes and cells round `cells` points of
+///   its surface.
 /// Says how many boxes each proved and how many it left to samples.
-pub fn verify_surface_soundness<S: Surface>(s: S, label: str, boxes: u32 = 24, samples: u32 = 128) {
+pub fn verify_surface_soundness<S: Surface>(
+    s: S,
+    label: str,
+    boxes: u32 = 24,
+    samples: u32 = 128,
+    cells: u32 = 8,
+) {
     let b = s.bound()
     let bounded = b.radius > 0.0 && b.radius < 1.0e12
     assert(bounded, f"verify({label}): surface bound radius {b.radius} is not finite positive")
@@ -347,6 +495,104 @@ pub fn verify_surface_soundness<S: Surface>(s: S, label: str, boxes: u32 = 24, s
     let _ = samples
     print(
         f"verify({label}): bound proven on {bound_p.proven} boxes ({bound_p.unproven} sampled), lipschitz on {lip_p.proven} ({lip_p.unproven} sampled), intervals on {near_p.proven} ({near_p.unproven} sampled)",
+    )
+    verify_slope_soundness(s, label, boxes, cells)
+}
+
+/// Verifies `s`'s enclosure (`Surface::slope_box`, as `slope_affine`; `prove_slope`): its range
+/// and its plane hold over `boxes` boxes of three scales anywhere in its bound (those
+/// `verify_surface_soundness` holds its other ranges over), and over cells of `SLOPE_CELLS`'
+/// sizes (and a half of one, as a certificate halves them) round `cells` points of its surface,
+/// each with every part asked and with the parts live there. Says how many boxes it proved and
+/// how many it left to samples, and how many of its enclosures had slopes. A part of every
+/// surface's contract (`verify_surface_soundness`); alone, the contract of a kind too heavy for
+/// the rest (a carved thing's bound and steepness are held part by part, by its kit's own).
+///
+/// `derive` false holds it by samples alone, each claim at 64 points with no slack: for a kind
+/// whose distance the compiler's affine derivation can't be run on in a test (it makes a NaN,
+/// which a debug build stops at). Such a kind's enclosures are not proven, and the line says so.
+pub fn verify_slope_soundness<S: Surface>(
+    s: S,
+    label: str,
+    boxes: u32 = 24,
+    cells: u32 = 8,
+    derive: bool = true,
+) {
+    let b = s.bound()
+    let r = b.radius
+    assert(r > 0.0 && r < 1.0e12, f"verify({label}): surface bound radius {r} is not finite positive")
+    let inner = Box3 { lo: b.centre - vec3(r), hi: b.centre + vec3(r) }
+    var slope_p = Proven { proven: 0, unproven: 0 }
+    for bi in 0..boxes {
+        let c = inner.sample(31, bi)
+        let tier = bi % 3
+        let half = if tier == 0 {
+            max(0.20 * r, 0.05)
+        } else if tier == 1 {
+            max(0.05 * r, 0.02)
+        } else {
+            max(0.01 * r, 0.005)
+        }
+        let sp = prove_slopes(s, Box3 { lo: c - vec3(half), hi: c + vec3(half) }, label, derive)
+        slope_p = Proven {
+            proven: slope_p.proven + sp.proven,
+            unproven: slope_p.unproven + sp.unproven,
+        }
+    }
+    // Cells round points of its surface: where rays from inside its bound meet it.
+    var found: u32 = 0
+    var k: u32 = 0
+    let reach = min(r, 1.0e4)
+    while found < cells && k < 40 * cells {
+        let o = b.centre + (vec3(unit(k * 11 + 1), unit(k * 11 + 2), unit(k * 11 + 3)) - vec3(0.5)) * reach
+        let dv = vec3(unit(k * 11 + 4), unit(k * 11 + 5), unit(k * 11 + 6)) - vec3(0.5)
+        k += 1
+        if length(dv) < 0.05 {
+            continue
+        }
+        let dir = normalize(dv)
+        var t = 0.0
+        var hit = false
+        for _ in 0..256 {
+            let f = s.distance(o + dir * t)
+            if abs(f) < 1.0e-5 {
+                hit = true
+                break
+            }
+            t += abs(f) / max(s.lipschitz(abs(f)), 1.0)
+            if !(t <= 2.0 * reach) {
+                break
+            }
+        }
+        if !hit {
+            continue
+        }
+        let p = o + dir * t
+        for ci in 0..4 {
+            // Each size's cell with the point somewhere in it, then a half of one across an axis.
+            let h = SLOPE_CELLS[if ci < 3 { ci } else { found % 3 }]
+            let off = vec3(unit(k * 11 + 7 + ci), unit(k * 11 + 8 + ci), unit(k * 11 + 9 + ci)) * h
+            let c_lo = p - off
+            var ext = vec3(h)
+            if ci == 3 {
+                let axis = found % 3
+                ext = vec3(
+                    if axis == 0 { 0.5 * h } else { h },
+                    if axis == 1 { 0.5 * h } else { h },
+                    if axis == 2 { 0.5 * h } else { h },
+                )
+            }
+            let sp = prove_slopes(s, Box3 { lo: c_lo, hi: c_lo + ext }, label, derive)
+            slope_p = Proven {
+                proven: slope_p.proven + sp.proven,
+                unproven: slope_p.unproven + sp.unproven,
+            }
+        }
+        found += 1
+    }
+    let how = if derive { "" } else { " (nothing derived: its distance's affine form can't be run in a test)" }
+    print(
+        f"verify({label}): enclosures proven on {slope_p.proven} boxes ({slope_p.unproven} sampled), {boxes} boxes in its bound and cells round {found} points of its surface{how}",
     )
 }
 

@@ -4,7 +4,7 @@
 use matter::substance::Substance
 use picture::eye::View
 use std::collections::Vec
-use std::derive::{Box3, affine, affine_form, work}
+use std::derive::Box3
 use std::field::{ALL_LIVE, DualQuat, Field, Live}
 use std::quat::Quat
 
@@ -87,6 +87,10 @@ pub(package) const MOST_INDICES_PER_BRICK: u32 = 3888
 /// Lipschitz bound at unit scale above which a field counts as steep (noise-displaced rock,
 /// fluted columns, clipped shells): its bricks get 8-octant culling and its cells a finer spacing.
 pub(package) const STEEP_LIPSCHITZ: f32 = 1.15
+/// Lipschitz bound at unit scale above which a steep field's bricks are culled by its enclosure
+/// over each octant (`Surface::slope_affine`) and not by its bound about the octant's centre: the
+/// bound's ball is that many times the octant wide, and keeps bricks the enclosure clears.
+pub(package) const ENCLOSED_LIPSCHITZ: f32 = 2.5
 /// Every cell of a full chunk (`(bi << 9) | cell`, 1.4 MB): the compacted list of sign-changing
 /// cells can never overflow, so no surface cell is ever dropped.
 pub(package) const CAP_SURF: u32 = CHUNK_BRICKS * VERTS_BRICK
@@ -1006,20 +1010,6 @@ pub(package) fn brick_of(g: GridSpec, local: u32) -> vec3u {
     vec3u(rem - by * g.dims.x, by, bz)
 }
 
-/// Compiler-measured work thresholds (`std::derive::work`) above which a field's distance or 3D
-/// `affine_form` expansion exceeds per-cell shader budgets: the engine automatically routes such
-/// fields to sound `Surface::pruned` sheet certification and sparse brick caching without any
-/// per-asset hint flag.
-pub(package) const AUTO_BAKE_WORK: u32 = 3000
-pub(package) const AFFINE_WORK_MOST: u32 = 16000
-
-/// Compile-time constant predicate: true when either `distance_live` or its 3D `affine_form`
-/// derivation exceeds budget (constant-folds dead branches out of emitted GPU shaders completely).
-pub(package) fn is_heavy_field<M: Field<Substance>>(f: M) -> bool {
-    work(|q: vec3| f.distance_live(q, ALL_LIVE)) > AUTO_BAKE_WORK ||
-        work(|b: Box3| affine_form(|q: vec3| f.distance_live(q, ALL_LIVE), b)) > AFFINE_WORK_MOST
-}
-
 /// Whether a `4×4×4` super-brick `sb` (clamped to `g.dims`, halo included) may hold `f`'s surface,
 /// together with the parts still live anywhere inside it.
 pub(package) fn cull_super_brick<M: Field<Substance>>(f: M, g: GridSpec, sb: vec3u) -> (bool, Live) {
@@ -1044,18 +1034,19 @@ pub(package) fn cull_brick_with_live<M: Field<Substance>>(
     let hi_c: u32 = if g.seam_mask != 0 { BRICK + 2 } else { BRICK + 1 }
     let hi = brick_corner(g, b, vec3u(hi_c, hi_c, hi_c))
     let pr0 = f.pruned(Box3 { lo, hi }, |q: vec3| q, 1.0, init_live, 0)
-    if !steep(f) {
-        return (pr0.range.lo <= 0.0 && pr0.range.hi >= 0.0, pr0.live)
+    let may = pr0.range.lo <= 0.0 && pr0.range.hi >= 0.0
+    if !may || !steep(f) {
+        return (may, if may { pr0.live } else { init_live })
     }
-    let heavy = is_heavy_field(f)
-    let use_affine = !heavy && f.lipschitz(1.0) > 2.5
-    if !heavy && use_affine {
-        let iv_all = affine(|q: vec3| f.distance(q), Box3 { lo, hi })
-        if !(iv_all.lo <= 0.0 && iv_all.hi >= 0.0) {
+    // A steep field's range by its bound is that many times wider than the box: one of the box's
+    // octants must straddle 0 too, by its pruned range, or past `ENCLOSED_LIPSCHITZ` by its
+    // enclosure (`Surface::slope_affine`, whose range a ball of the bound does not widen).
+    let enclosed = f.lipschitz(1.0) > ENCLOSED_LIPSCHITZ
+    if enclosed {
+        let af = f.slope_affine(Box3 { lo, hi }, pr0.live)
+        if !(af.lo() <= 0.0 && af.hi() >= 0.0) {
             return (false, init_live)
         }
-    } else if !(pr0.range.lo <= 0.0 && pr0.range.hi >= 0.0) {
-        return (false, init_live)
     }
     let mid = 0.5 * (lo + hi)
     for oct in 0..8 {
@@ -1069,14 +1060,13 @@ pub(package) fn cull_brick_with_live<M: Field<Substance>>(
             if (oct & 2) != 0 { hi.y } else { mid.y },
             if (oct & 4) != 0 { hi.z } else { mid.z },
         )
-        let iv = if !heavy && use_affine {
-            affine(|q: vec3| f.distance(q), Box3 { lo: olo, hi: ohi })
+        let iv = if enclosed {
+            f.slope_affine(Box3 { lo: olo, hi: ohi }, pr0.live).range()
         } else {
             f.pruned(Box3 { lo: olo, hi: ohi }, |q: vec3| q, 1.0, pr0.live, 0).range
         }
         if iv.lo <= 0.0 && iv.hi >= 0.0 {
-            let live = if pr0.range.lo <= 0.0 && pr0.range.hi >= 0.0 { pr0.live } else { init_live }
-            return (true, live)
+            return (true, pr0.live)
         }
     }
     (false, init_live)
