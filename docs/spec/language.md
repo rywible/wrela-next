@@ -1232,7 +1232,7 @@ GPU code follows WGSL's semantics, and its results are for presentation only: GP
 The built-in functions are in scope everywhere, on the CPU and the GPU alike; `wrela doc builtins` lists them.
 
 - **Math**, which applies per component to vectors: `sin cos tan asin acos atan atan2 sinh cosh tanh exp exp2 log log2 pow sqrt inverse_sqrt floor ceil round trunc fract abs sign min max clamp saturate mix step smoothstep`.
-- **Vectors:** `length distance dot cross normalize`. They can also be called as methods: `v.length()`, `v.normalize()`.
+- **Vectors:** `length distance dot cross normalize`. They can also be called as methods: `v.length()`, `v.normalize()`. `normalize(x)` is `x * (1.0 / length(x))`: one division, then a product a component, on the CPU and in a strict kernel alike.
 - **`select(if_false: a, if_true: b, cond: c)`** takes a `bool` condition. The two values may be of any one type, except a closure's or a function's type, which is E0702 (as choosing one with `if` is). It evaluates both values. Its arguments are the only named arguments of a built-in function.
 - **Bit casts:** `bitcast_u32 bitcast_i32 bitcast_f32`, and `bitcast_u64`, `bitcast_f64` on the CPU.
 - **Derivatives:** `dpdx`, `dpdy` and `fwidth` are for fragment shaders, in uniform control flow (WGSL's rule). They can't be inside a branch on a value that differs between pixels, or after an early `return` or `break` in one (E0608).

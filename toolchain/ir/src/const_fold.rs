@@ -987,7 +987,8 @@ fn builtin(b: Builtin, args: &[K]) -> Option<K> {
             if l == 0.0 || v.len() < 2 {
                 return None;
             }
-            v.iter().map(|x| float(x / l).map(K::S)).collect::<Option<Vec<_>>>().map(K::P)
+            let r = 1.0 / l;
+            v.iter().map(|x| float(x * r).map(K::S)).collect::<Option<Vec<_>>>().map(K::P)
         }
         _ => None,
     }

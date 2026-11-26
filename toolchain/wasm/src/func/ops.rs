@@ -1116,8 +1116,12 @@ pub(super) fn builtin(fe: &mut Fe, v: ir::ValueId, b: ir::Builtin, args: &[ir::V
                 sum_lanes(fe, n);
                 fe.ins.push(I::F32Sqrt);
                 if b == B::Normalize {
+                    // x · (1 / |x|): one division (language.md §11.3), as a strict kernel's.
+                    let r = fe.new_local(ValType::F32);
+                    fe.ins.push(I::LocalSet(r));
+                    fe.ins.extend([I::F32Const(1.0f32.into()), I::LocalGet(r), I::F32Div]);
                     fe.ins.extend([I::F32x4Splat, I::LocalSet(d)]);
-                    fe.ins.extend([I::LocalGet(fe.v(args[0])), I::LocalGet(d), I::F32x4Div]);
+                    fe.ins.extend([I::LocalGet(fe.v(args[0])), I::LocalGet(d), I::F32x4Mul]);
                 }
                 fe.ins.push(I::LocalSet(fe.v(v)));
                 return Ok(());
@@ -1222,12 +1226,14 @@ pub(super) fn builtin(fe: &mut Fe, v: ir::ValueId, b: ir::Builtin, args: &[ir::V
             B::Normalize => {
                 let len = fe.new_local(ValType::F32);
                 sum_of_squares(fe, args[0], None, n);
-                fe.ins.extend([I::F32Sqrt, I::LocalSet(len)]);
+                // x · (1 / |x|): one division, as a strict kernel's.
+                fe.ins.push(I::LocalSet(len));
+                fe.ins.extend([I::F32Const(1.0f32.into()), I::LocalGet(len), I::F32Sqrt, I::F32Div, I::LocalSet(len)]);
                 let out = fe.fresh_slot(v, false)?;
                 for c in 0..n {
                     fe.ins.push(I::LocalGet(out));
                     load_f32(fe, args[0], 4 * c);
-                    fe.ins.extend([I::LocalGet(len), I::F32Div, I::F32Store(mem(4 * c, 2))]);
+                    fe.ins.extend([I::LocalGet(len), I::F32Mul, I::F32Store(mem(4 * c, 2))]);
                 }
                 return Ok(());
             }

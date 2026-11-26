@@ -254,10 +254,13 @@ impl Emit<'_> {
                         let f = self.m.types.f32();
                         let len = self.let_(f, Expr::Builtin(B::Sqrt, vec![ss]));
                         if *b == B::Normalize {
+                            // x · (1 / |x|): one division, as the CPU's.
+                            let one = self.f32c(1.0);
+                            let r = self.bin(BinOp::Div, one, len);
                             let parts: Vec<ValueId> = (0..u32::from(n))
                                 .map(|k| {
                                     let c = self.comp(a, k);
-                                    self.bin(BinOp::Div, c, len)
+                                    self.bin(BinOp::Mul, c, r)
                                 })
                                 .collect();
                             self.let_(vt, Expr::Construct(vt, parts))
