@@ -658,6 +658,9 @@ struct Frame<'f> {
     /// `if` that returns ends its way there, so the code after the `if` is counted only on the
     /// sides that go on, and the call's work is the most of every way.
     left: u64,
+    /// The most work at a `break` of the loop being followed, on a way that leaves it from a
+    /// branch whose other side goes on: charged once, where the loop ends, not on each pass.
+    broke: u64,
 }
 
 impl<'f> Frame<'f> {
@@ -679,6 +682,7 @@ impl<'f> Frame<'f> {
             sites: None,
             exits: Vec::new(),
             left: 0,
+            broke: 0,
         }
     }
 }
@@ -898,6 +902,20 @@ impl<'a> Counter<'a> {
                 *st = b;
                 Flow::Normal
             }
+            // One side leaves the loop: its way ends the loop with its own work (charged once,
+            // where the loop ends), and only the other's goes on to the next pass.
+            (Flow::Normal, Flow::Break) => {
+                fr.broke = fr.broke.max(start.saturating_add(wb));
+                fr.work = start.saturating_add(wa);
+                *st = a;
+                Flow::Normal
+            }
+            (Flow::Break, Flow::Normal) => {
+                fr.broke = fr.broke.max(start.saturating_add(wa));
+                fr.work = start.saturating_add(wb);
+                *st = b;
+                Flow::Normal
+            }
             (x, y) if x == y => {
                 a.join(&b);
                 *st = a;
@@ -935,6 +953,7 @@ impl<'a> Counter<'a> {
         // The ways that return inside the loop, apart from those before it: a pass that returns
         // through costlier code than the passes that go on is part of the loop's total.
         let left_at = std::mem::take(&mut fr.left);
+        let broke_at = std::mem::take(&mut fr.broke);
         // (Each pass is followed knowing what's sure on every way into it, so its work is the
         // most any of them does; the loop ends when no way goes on to another pass, and what's
         // known after it is what every `break` that left it knew, from every pass.)
@@ -973,6 +992,8 @@ impl<'a> Counter<'a> {
                 }
                 st.keep_unchanged(&entry);
                 fr.left = fr.left.max(left_at);
+                fr.work = fr.work.max(fr.broke);
+                fr.broke = broke_at;
                 return Flow::Normal;
             }
             passes += 1;
@@ -997,7 +1018,10 @@ impl<'a> Counter<'a> {
             };
             let on = on && self.block(fr, st, continuing) == Flow::Normal;
             if !on {
-                // No way goes on to another pass: after the loop is what each `break` knew.
+                // No way goes on to another pass: after the loop is what each `break` knew,
+                // and its work the most of its passes' and of any way that left it by `break`.
+                fr.work = fr.work.max(fr.broke);
+                fr.broke = broke_at;
                 let exits = fr.exits.pop().expect("this loop's exits");
                 if let Some(t) = self.totals.as_mut() {
                     let total = fr.work.max(fr.left).saturating_sub(work_at);

@@ -474,3 +474,23 @@ fn a_counting_build_tallies_every_pipeline_into_the_flags_buffer() {
     assert_eq!(m.tally_words, 0);
     assert!(m.pipelines.iter().all(|p| p.debug_flag.is_none()));
 }
+
+/// A way out of a loop by `break` is charged once, where the loop ends, not on every pass: a
+/// loop of 64 passes whose costly side breaks (a chain of square roots, then `break`) costs its
+/// passes' light work and the chain once. Before, the chain was charged to each pass (the
+/// engine's `emit_compact` merges an emitter and leaves its search: its bound halved, 1,883,753
+/// to 943,823).
+#[test]
+fn a_way_out_of_a_loop_by_break_is_charged_once() {
+    let heavy = "        a = sqrt(a + 1.0)\n".repeat(32);
+    let body = format!(
+        "    var a = x\n    for i in 0..64 {{\n        if a > 1000.0 + f32(i) {{\n{heavy}            break\n        }}\n        a = a + 1.0\n    }}\n    out[id] = a"
+    );
+    let dir = kernels("work_break_once", "", &[("leave", &body)]);
+    let w = work(&dir);
+    let bound = w[0].1.expect("bounded");
+    let pass = 64 * 12;
+    let chain = 32 * 5;
+    assert!(bound < pass + 4 * chain, "the chain is charged once, not on every pass: {bound}");
+    assert!(bound >= chain, "the chain is charged: {bound}");
+}
