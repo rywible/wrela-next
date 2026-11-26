@@ -783,7 +783,7 @@ impl<'a> Counter<'a> {
             }
             Stmt::Store(p, v) => {
                 self.prove_place(fr, p);
-                fr.work = fr.work.saturating_add(self.place_cost(p, true));
+                fr.work = fr.work.saturating_add(self.place_cost(fr, p, true));
                 match (p.root.clone(), p.path.is_empty()) {
                     (PlaceRoot::Local(l), true) => {
                         match fr.vals.get(v) {
@@ -1055,7 +1055,7 @@ impl<'a> Counter<'a> {
                     }
                     _ => None,
                 };
-                (self.place_cost(p, false), v)
+                (self.place_cost(fr, p, false), v)
             }
             Expr::Unary(op, x) => {
                 let v = match (op, known(x)) {
@@ -1220,19 +1220,33 @@ impl<'a> Counter<'a> {
     }
 
     /// A read (or a write) of `p`: free for a local or a parameter, which are registers.
-    fn place_cost(&self, p: &Place, write: bool) -> u64 {
+    /// A place's read or write: a storage buffer's a memory access, a workgroup's less, a
+    /// uniform's an operation, a local's or a private's nothing (registers); and where the place
+    /// is an element of an array, an operation for the index and a memory access more where
+    /// the array is a uniform's (read through the constant cache, whatever the index) or a local's
+    /// or a private's at an index the count can't settle (a GPU keeps an array it indexes at run
+    /// time in thread memory). M4: a loop reading a local array at a run-time index ran 3.03 ms
+    /// where the same counted work of arithmetic ran 0.61; one reading a uniform's array at the
+    /// loop's index (unrolled: constant indices) 2.53 ms where more counted arithmetic ran 1.64.
+    /// Without it a bound, which the host's step guard and E0714 take as the most a dispatch can
+    /// take, was short of what such a loop takes.
+    fn place_cost(&self, fr: &Frame, p: &Place, write: bool) -> u64 {
+        let runtime_index =
+            p.path.iter().any(|x| matches!(x, Proj::Index(i) if !fr.vals.contains_key(i)));
         let index = p.path.iter().any(|x| matches!(x, Proj::Index(_)));
-        let base = match &p.root {
+        let (base, memory) = match &p.root {
             PlaceRoot::Resource(r) => match self.m.resources[r.0 as usize].kind {
-                ResourceKind::Uniform { .. } if !write => OP,
-                ResourceKind::Workgroup => SHARED,
-                ResourceKind::Private => 0,
-                _ => MEMORY,
+                ResourceKind::Uniform { .. } if !write => (OP, index),
+                ResourceKind::Workgroup => (SHARED, false),
+                ResourceKind::Private => (0, runtime_index),
+                _ => (MEMORY, false),
             },
-            _ => 0,
+            PlaceRoot::Local(_) => (0, runtime_index),
+            _ => (0, false),
         };
-        base + if index { OP } else { 0 }
+        base + if index { OP } else { 0 } + if memory { MEMORY } else { 0 }
     }
+
 }
 
 /// How many components a value of type `t` has: what elementwise arithmetic on it costs.
