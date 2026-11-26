@@ -751,6 +751,44 @@ cell have the same bits, and they join with no crack.
 
 ## 12. Phase 4: decisions and the frame schedule at build
 
+State (2026-11-26): step 1's list is below; steps 2 to 7 are open.
+
+### The decisions made at run time (step 1)
+
+Read from `extract.wrela`, `world_draw.wrela` and `draw.wrela` at `f2b0742`: about 220 places
+that choose a path, a pass, a capacity, a cell or a skip. By what each depends on:
+
+- The eye (about 90): the cells (`cell_for_one`, `h_near`, `h_top`, `force_direct`), the rings
+  and whether they have seams (`build_lod_grids_view`, `has_seams`, frustum culling), the exact
+  cells (`use_exact`, `has_exact`, `eye_reach`), a cut (`lod_cut`), the near slots of a pool, the
+  Hi-Z passes, the screen's size. These stay at run time (step 3).
+- The state of the game (about 50): a field's hash moved (steady skips, rigid deltas, patches of
+  edits and of parts), what is still (`still_frames`: the static SDF, shadow map and radiance),
+  the swarm, a pool's size and visible things. These stay.
+- What the GPU read back (about 45): every capacity's growth and its overflow, the hints that
+  size chunks and slices (`chunk_limit`, `crease_slices`, `thin_slices`, `cert_slices`,
+  `seam_slices`), `has_opaque` / `has_trans` / `has_exact`, `settled`, the budget's shortness,
+  `cell_scale`. These stay: they are counts of this run.
+- The kind alone, made at run time (step 2's list):
+  1. Which path a field takes, asked of it on the CPU each frame: skinned
+     (`skin_shape_hash`, and the `is_skinned` / `is_deformed` latches every draw, shadow and
+     refraction then branches on), rigid (`rigid_shape_hash`, `has_constant_channels`,
+     `has_local_channels`: `rigid_key`), edited (`edit_base_hash().is_some()`: the patch
+     headroom), parts (`parts()`, `part_state`: per-part patching), a pool's first thing skinned.
+  2. The tuning of its cells from its stated steepness: `steep()` (`lipschitz(1) > 1.15`) and
+     `lipschitz(1) > 2.5`, which set pixels a cell, the LOD's `k_px`, its area budget and
+     `root_min_ratio`, and `cell_for_one`'s multiplier; `size_floor(r)` from its bound;
+     `skin_bone_count`.
+  3. Its kernels' slices, from counts the build already has, worked out each extraction:
+     `crease_step_cost_of` / `_rest_of`, `crease_part`, `crease_passes`, `crease_slice`,
+     `seam_crease_slice` and `surf_slice` (from `kernel_work`), `keep_slice_of`, `uses_kept`,
+     and the dispatches a chunk makes. (They read the machine too: `limits().step_work`.)
+  4. Its facts, asked again at each draw: `field_facts().may_transmit`, which the shaders fold,
+     in more than ten CPU branches of the draws and the patch.
+  5. The scene's types, asked each frame: `batch_count()`, `height.active()`,
+     `medium.active()`, the look's bloom strength, and `finish_poll`'s readback length (always
+     14).
+
 Purpose: the engine becomes a program that the build runs. It writes the kernels, the tables and
 the frame schedule for this game.
 
