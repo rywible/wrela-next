@@ -146,12 +146,14 @@ fn same(got: u32, want: f32) -> bool {
 }
 
 /// What one operation gave: how many inputs, how many differ from IEEE 754's result, and how
-/// many from the strict model's, with the first few of those.
+/// many from the strict model's, with the first few of those and the farthest any is from the
+/// model's (in floats between them: `u32::MAX` where one is not a number of the model's sign).
 #[derive(Default, Debug)]
 struct Tally {
     inputs: u64,
     ieee: u64,
     model: u64,
+    worst: u32,
     first: Vec<String>,
 }
 
@@ -165,6 +167,14 @@ impl Tally {
             return;
         }
         self.model += 1;
+        let m = model.to_bits();
+        let apart = if f32::from_bits(got).is_finite() && model.is_finite() && (got ^ m) >> 31 == 0
+        {
+            got.abs_diff(m)
+        } else {
+            u32::MAX
+        };
+        self.worst = self.worst.max(apart);
         if self.first.len() < 6 {
             let ops: Vec<String> =
                 operands.iter().map(|x| format!("{x:e} ({:#010x})", x.to_bits())).collect();
@@ -179,8 +189,8 @@ impl Tally {
 
     fn say(&self, name: &str) {
         eprintln!(
-            "strict {name}: {} inputs, {} differ from IEEE 754 (subnormals kept), {} from the strict model",
-            self.inputs, self.ieee, self.model
+            "strict {name}: {} inputs, {} differ from IEEE 754 (subnormals kept), {} from the strict model (the farthest by {} floats)",
+            self.inputs, self.ieee, self.model, self.worst
         );
         for f in &self.first {
             eprintln!("  {f}");
@@ -309,6 +319,15 @@ fn the_gpu_rounds_the_safe_operations_as_the_cpu_does() {
     }
     let mut t: [Tally; 4] = Default::default();
     run_binary(&mut gpu, &a, &b, &mut t);
+    // Pairs of significands, each in [1, 2): what std's division asks a GPU that doesn't round
+    // its own (`std::math::div_rounded`).
+    let (mut sa, mut sb) = (Vec::new(), Vec::new());
+    for _ in 0..(1u32 << 22) {
+        sa.push((rng.next() & 0x007f_ffff) | 0x3f80_0000);
+        sb.push((rng.next() & 0x007f_ffff) | 0x3f80_0000);
+    }
+    let mut sig: [Tally; 4] = Default::default();
+    run_binary(&mut gpu, &sa, &sb, &mut sig);
     gpu.check_errors().unwrap();
     sq.say("sqrt");
     rc.say("1 / x");
@@ -323,16 +342,31 @@ fn the_gpu_rounds_the_safe_operations_as_the_cpu_does() {
         ("sub", &t[2]),
         ("mul", &t[3]),
     ];
+    sig[0].say("a / b of significands");
+    let here = wrela_abi::Target::HERE;
     for (name, tally) in tallies {
-        if SAFE.contains(&name) {
+        let safe = SAFE.contains(&name) || (here.rounds_div() && DIVIDES.contains(&name));
+        if safe {
             assert_eq!(
                 tally.model, 0,
                 "`{name}` is held safe, and this GPU differs from the strict model"
             );
         }
     }
+    // A target whose division isn't rounded divides by std's code, which sets right a quotient
+    // of two significands that is within four floats of the rounded one (`std::math::div_from`).
+    assert!(
+        sig[0].worst <= 2,
+        "a quotient of two significands is {} floats from the rounded one: `std::math::div_from` \
+         sets right one within four, and Vulkan allows two and a half",
+        sig[0].worst
+    );
 }
 
-/// The operations held to be the CPU's to the bit in a strict kernel on each machine (the
-/// test above), so a strict function may use the GPU's own.
-const SAFE: &[&str] = &["recip", "div", "add", "sub", "mul"];
+/// The operations held to be the CPU's to the bit in a strict kernel on every machine (the test
+/// above), so a strict function may use the GPU's own.
+const SAFE: &[&str] = &["add", "sub", "mul"];
+
+/// Those held so only on a target whose GPU rounds its division (`Target::rounds_div`): on
+/// another a strict kernel divides by std's code.
+const DIVIDES: &[&str] = &["recip", "div"];

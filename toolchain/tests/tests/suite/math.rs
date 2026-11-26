@@ -295,6 +295,45 @@ fn every_root_is_set_right_from_a_neighbour() {
     assert!(bad.is_empty(), "sqrt_from is wrong: {bad:x?}");
 }
 
+/// `div_from` for sixteen million pairs (hard ones, subnormal operands, quotients about the
+/// least normal and random ones), from the quotient of their significands and each float
+/// within three ulps of it: the strict model's quotient every time.
+#[test]
+fn every_quotient_is_set_right_from_an_estimate() {
+    let dir = built("math");
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+    const CHUNK: u64 = 1 << 18;
+    const PAIRS: u64 = 1 << 24;
+    let next = std::sync::atomic::AtomicU64::new(0);
+    let bad = std::sync::Mutex::new(Vec::new());
+    std::thread::scope(|s| {
+        for _ in 0..threads {
+            s.spawn(|| {
+                let mut host = CpuHost::load(&dir).expect("load");
+                loop {
+                    let start = next.fetch_add(CHUNK, std::sync::atomic::Ordering::Relaxed);
+                    if start >= PAIRS {
+                        break;
+                    }
+                    let args = [Value::I32(start as u32 as i32), Value::I32(CHUNK as u32 as i32)];
+                    match wrela_tests::Exports::call(&mut host, "div_from_differences", &args)
+                        .expect("div_from")
+                        .as_slice()
+                    {
+                        [Value::I32(0), _] => {}
+                        [Value::I32(n), Value::I32(f)] => {
+                            bad.lock().unwrap().push((start, *n as u32, *f as u32))
+                        }
+                        other => panic!("{other:?}"),
+                    }
+                }
+            });
+        }
+    });
+    let bad = bad.into_inner().unwrap();
+    assert!(bad.is_empty(), "div_from is wrong (chunk start, how many, first): {bad:?}");
+}
+
 /// The same bits, or both NaN.
 fn same(got: f32, want: f32) -> bool {
     got.to_bits() == want.to_bits() || (got.is_nan() && want.is_nan())

@@ -1629,7 +1629,9 @@ pub(crate) fn make_strict(cx: &mut Cx, mb: &mut ModuleBuilder) {
             let mut f = std::mem::take(&mut mb.m.functions[i]);
             let mut body = std::mem::take(&mut f.body);
             let this = ir::FuncId(i as u32);
-            ir::visit::expand(&mut body, &mut |s, out| strict_math(cx, mb, this, &mut f, s, out));
+            ir::visit::expand(&mut body, &mut |s, out| {
+                strict_math(cx, mb, this, &mut f, s, out, false)
+            });
             f.body = body;
             mb.m.functions[i] = f;
             i += 1;
@@ -1640,11 +1642,30 @@ pub(crate) fn make_strict(cx: &mut Cx, mb: &mut ModuleBuilder) {
     }
     // std's functions' own built-ins, as the CPU computes them.
     ir::strict::lower_strict(&mut mb.m);
+    // A target whose GPU doesn't round its division: every `/` of f32s, those the built-ins
+    // were just written with too, is std's (`std::math::div_rounded`, which asks the GPU's
+    // own only for the quotient of two significands).
+    if !cx.data.target.rounds_div() {
+        for i in 0..mb.m.functions.len() {
+            let mut f = std::mem::take(&mut mb.m.functions[i]);
+            let mut body = std::mem::take(&mut f.body);
+            let this = ir::FuncId(i as u32);
+            ir::visit::expand(&mut body, &mut |s, out| {
+                strict_math(cx, mb, this, &mut f, s, out, true)
+            });
+            f.body = body;
+            mb.m.functions[i] = f;
+        }
+        cx.drain(mb);
+        ir::strict::lower_strict(&mut mb.m);
+    }
 }
 
 /// `s` into `out` in a strict module's function `this`: a transcendental built-in of f32s, a
 /// square root or a float remainder becomes a call to std's (a call per component, for a
-/// vector), but in std's function itself (`sqrt_rounded` starts from the GPU's own root).
+/// vector), but in std's function itself (`sqrt_rounded` starts from the GPU's own root). With
+/// `divisions`, a division of f32s alone, to std's `div_rounded` (which starts from the GPU's
+/// own quotient of two significands).
 fn strict_math(
     cx: &mut Cx,
     mb: &mut ModuleBuilder,
@@ -1652,8 +1673,14 @@ fn strict_math(
     f: &mut ir::Function,
     s: ir::Stmt,
     out: &mut ir::Block,
+    divisions: bool,
 ) {
     let lang = match &s {
+        ir::Stmt::Let(_, ir::Expr::Binary(ir::BinOp::Div, a, _)) if divisions => {
+            (mb.m.types.element_scalar(f.value_ty(*a)) == Some(ir::Scalar::F32))
+                .then_some(Lang::StrictDiv)
+        }
+        _ if divisions => None,
         ir::Stmt::Let(_, ir::Expr::Builtin(ir::Builtin::Sqrt, _)) if mb.m.rounded_sqrt => None,
         ir::Stmt::Let(_, ir::Expr::Builtin(ir::Builtin::Sqrt, _)) => Some(Lang::StrictSqrt),
         ir::Stmt::Let(_, ir::Expr::Builtin(op, _)) => cpu_math_lang(*op),

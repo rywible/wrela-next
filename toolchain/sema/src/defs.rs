@@ -741,6 +741,7 @@ lang_items! {
     CpuPow = "std::math::pow",
     StrictSqrt = "std::math::sqrt_rounded",
     StrictRem = "std::math::rem_exact",
+    StrictDiv = "std::math::div_rounded",
     Drop = "std::mem::Drop",
     MemSizeOf = "std::mem::size_of",
     MemAlignOf = "std::mem::align_of",

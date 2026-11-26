@@ -312,6 +312,17 @@ impl Target {
         matches!(self, Target::Metal)
     }
 
+    /// Whether this target's GPU divides as IEEE 754 rounds it, in a strict kernel, as the strict
+    /// model has it: then a strict kernel's `/` of f32s is the GPU's, else std's
+    /// (`std::math::div_rounded`). The M4's does for every pair tested (`wrela-host`'s
+    /// `the_gpu_rounds_the_safe_operations_as_the_cpu_does`: 16,781,060 pairs, and 1 / x for all
+    /// 2³² arguments). Vulkan allows a division two and a half ulps, and the Radeon's driver
+    /// multiplies by a reciprocal: 1,813,385 of those pairs differed and 452,428,200 of the
+    /// reciprocals (2026-11-26).
+    pub const fn rounds_div(self) -> bool {
+        matches!(self, Target::Metal)
+    }
+
     pub const fn limits(self) -> &'static TargetLimits {
         match self {
             Target::Metal => &TargetLimits::METAL,

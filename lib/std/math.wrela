@@ -739,6 +739,94 @@ pub fn sqrt_from(x: f32, r: f32) -> f32 {
     bitcast_f32((rb + if above { 1 } else { 0 }) - if below { 1 } else { 0 })
 }
 
+/// `a / b` as the strict model has it (`toolchain/host`'s `strict_model`): IEEE 754's correctly
+/// rounded quotient, with a subnormal operand a zero of its sign and a zero of the quotient's
+/// sign where the exact quotient is below the least normal f32. What `/` of f32s is in a strict
+/// kernel on a target whose GPU doesn't round its division (`wrela_abi::Target::rounds_div`: the
+/// Radeon's driver multiplies by a reciprocal, and 1,813,385 of 16,781,060 quotients differed by
+/// an ulp, 2026-11-26). The GPU's own division is asked only for the quotient of the two
+/// significands, each in [1, 2), where no GPU overflows or flushes; `div_from` sets it right.
+pub fn div_rounded(a: f32, b: f32) -> f32 {
+    let sa = bitcast_f32((bitcast_u32(a) & 0x7fffff) | 0x3f800000)
+    let sb = bitcast_f32((bitcast_u32(b) & 0x7fffff) | 0x3f800000)
+    div_from(a, b, sa / sb)
+}
+
+/// `a / b` as the strict model has it (`div_rounded`), from `r`: the quotient of `a`'s
+/// significand by `b`'s (each in [1, 2)) to within four ulps of the quotient, where Vulkan
+/// allows a division two and a half.
+///
+/// With A and B the 24 bits of the significands and n = A, or 2A where A < B, n / B is in
+/// [1, 2) and the quotient's significand is F = floor(n · 2²³ / B), 24 bits, with a remainder
+/// R = n · 2²³ - F · B in [0, B). `r` scaled to an integer is F to within 4, so the remainder
+/// taken from it is within 5B of R: less than 2²⁷, so its low 32 bits, a wrapping subtraction of
+/// a wrapping product, are the whole of it, and comparing it with B's multiples says how far
+/// the estimate is from F. Then F is rounded to nearest, a tie to even, by twice R against B;
+/// a carry out of its 24 bits runs into the exponent as the bits are added. Every special case
+/// (a NaN, an infinity, a zero, a subnormal operand, overflow, a quotient below the least
+/// normal) is decided from the bits. `toolchain/tests`'
+/// `every_quotient_is_set_right_from_an_estimate` holds it to the CPU's division.
+pub fn div_from(a: f32, b: f32, r: f32) -> f32 {
+    let ab = bitcast_u32(a)
+    let bb = bitcast_u32(b)
+    let sign = (ab ^ bb) & 0x80000000
+    let ea = (ab >> 23) & 0xff
+    let eb = (bb >> 23) & 0xff
+    // A zero or a subnormal (a zero to the strict model), and an infinity or a NaN.
+    let a_none = ea == 0
+    let b_none = eb == 0
+    let a_big = ea == 0xff
+    let b_big = eb == 0xff
+    if a_none || b_none || a_big || b_big {
+        let a_nan = a_big && (ab & 0x7fffff) != 0
+        let b_nan = b_big && (bb & 0x7fffff) != 0
+        if a_nan || b_nan || (a_big && b_big) || (a_none && b_none) {
+            return bitcast_f32(0x7fc00000)
+        }
+        if a_big || b_none {
+            return bitcast_f32(sign | 0x7f800000)
+        }
+        return bitcast_f32(sign)
+    }
+    let big_a = (ab & 0x7fffff) | 0x800000
+    let big_b = (bb & 0x7fffff) | 0x800000
+    let low: u32 = if big_a < big_b { 1 } else { 0 }
+    let n = big_a << low
+    // The quotient's biased exponent before rounding: it is (n / B) · 2^(e - 127).
+    let e = i32(ea) - i32(eb) - i32(low) + 127
+    // `r` is n / B halved where A < B: either way an integer once scaled, about F.
+    let est = u32(r * (if low == 1 { 16777216.0 } else { 8388608.0 }))
+    // The remainder from the estimate: its low 32 bits, read as a signed number (the high bit
+    // its sign).
+    let rem = (n << 23).wrapping_sub(est.wrapping_mul(big_b))
+    let under = rem >= 0x80000000
+    // How many B the remainder is from [0, B): the estimate's distance from F.
+    let up: u32 = (if !under && rem >= big_b { 1 } else { 0 }) +
+        (if !under && rem >= 2 * big_b { 1 } else { 0 }) +
+        (if !under && rem >= 3 * big_b { 1 } else { 0 }) +
+        (if !under && rem >= 4 * big_b { 1 } else { 0 })
+    let down: u32 = (if under { 1 } else { 0 }) +
+        (if under && rem < (0).wrapping_sub(big_b) { 1 } else { 0 }) +
+        (if under && rem < (0).wrapping_sub(2 * big_b) { 1 } else { 0 }) +
+        (if under && rem < (0).wrapping_sub(3 * big_b) { 1 } else { 0 })
+    let step = up.wrapping_sub(down)
+    let f = est.wrapping_add(step)
+    let left = rem.wrapping_sub(step.wrapping_mul(big_b))
+    // To nearest, a tie to even.
+    let twice = 2 * left
+    let more: u32 = if twice > big_b || (twice == big_b && (f & 1) == 1) { 1 } else { 0 }
+    let m = f + more
+    if e <= 0 {
+        // Below the least normal before rounding: a zero.
+        return bitcast_f32(sign)
+    }
+    if e + i32(m >> 24) >= 255 {
+        return bitcast_f32(sign | 0x7f800000)
+    }
+    // A significand of 2²⁴ carries into the exponent.
+    bitcast_f32(sign | ((u32(e) << 23) + (m - 0x800000)))
+}
+
 /// `a % b` of f32s as the CPU computes it, exactly: `a - b·trunc(a/b)` with no rounding, `a`'s
 /// sign (C's `fmod`), a NaN where `a` is infinite or `b` is 0 or either is a NaN. What a strict
 /// kernel's `%` of floats is: a GPU's rounds at each step. From the bits, by shifts and integer
