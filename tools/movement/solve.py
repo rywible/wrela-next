@@ -203,7 +203,8 @@ def fk_check(clips):
     worst_t, worst_r = 0.0, 0.0
     for c in clips:
         _, x = read_pose(f"{POSES}/{c}.pose")
-        b = open(os.path.join(ROOT, f".movement/sim/refs/{c}.ref"), "rb").read()
+        sim = ".movement/sim" if BODY == "creature" else f".movement/sim-{BODY}"
+        b = open(os.path.join(ROOT, f"{sim}/refs/{c}.ref"), "rb").read()
         _, nq, segs, n = struct.unpack_from("<4I", b, 4)
         row = nq + 7 * segs
         ref = np.frombuffer(b, "<f4", n * row, 24).reshape(n, row)[:, nq:].reshape(n, segs, 7)
@@ -224,8 +225,11 @@ def pack(argv):
     sets = [a for a in argv[:argv.index("-o")]]
     names, which, starts, lengths, chunks = [], [], [], [], []
     rate, d, total = None, None, 0
-    for st in sets:
-        for line in open(os.path.join(ROOT, "tools/movement/split", f"{st}.txt")):
+    for given in sets:
+        # A set's name (tools/movement/split), or the path of a list of clips named for its set.
+        path = given if given.endswith(".txt") else os.path.join(ROOT, "tools/movement/split", f"{given}.txt")
+        st = os.path.basename(path)[:-4]
+        for line in open(path):
             name = line.strip()
             if not name or name.startswith("#"):
                 continue
