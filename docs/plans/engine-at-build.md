@@ -799,10 +799,14 @@ pays for the march being in the shader, about seven times over. Not its depth wr
 with none), not the code after its discards (returning there: 15.8 ms), not a lost early depth
 test (with no discard in the shader, every empty fragment dropped by writing the farthest depth,
 518,499 fragments still run, 11.8 ms; with a floor at the shader's discard margin drawn under
-it first, 519,479, 9.9 ms): those fragments are in front of the mesh, and they leave at the
-shader's first tests. So the fix is to keep the march out of the shader most of them run: a
-small shader for every box fragment that keeps only those whose ray can meet the surface, and
-the march for those alone. Found on the way: a rigid thing's exact cells are tested in the
+it first, 519,479, 9.9 ms): those fragments are in front of the mesh, and they march: a
+candidates' pass (a shader with no field that keeps only the fragments whose ray can still meet
+a surface in front of the mesh, the rest turned away by the early depth test) kept 525,147 of
+them, 10.8 ms. Each marches cheaply (about 190 work: a cell's live mask prunes the field to a
+part or two), so the time is the shader holding the whole field while a fragment runs a part of
+it, some 20 ns a fragment, and no count of work or stream sees it. Next, measured before it is
+built: a march shader made for a cell's few live parts (cells drawn by their parts, each part's
+pipeline holding that part alone), against this one at the same fragments. Found on the way: a rigid thing's exact cells are tested in the
 frame it was meshed in (`exact_box_one_fs` brackets the world ray by the cell's box as meshed,
 where `exact_box_vs` draws it moved by `xforms[0]`), right while it is still, wrong once it
 moves without being meshed again. The
