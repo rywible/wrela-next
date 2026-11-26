@@ -989,9 +989,13 @@ through the world with no cycle and no clip.
   windows of 16 frames, 70 minutes.
 - On held-out test clips it follows its speed goals to 0.12 m/s (without the goal's loss 0.60).
   The goal test (`tools/movement/solver -- human goaltest`, `tools/movement/judge -- human
-  goals`, the human's targets): start, stop, turn and the step to the side pass every target; the
-  walk all but its slide (1,237 mm/s against 1,220); the run fails four (its residual 0.53, slide
-  2,532 mm/s, float 44 mm and goal error 0.52 m/s at 3 m/s asked).
+  goals`, the human's targets), each at its gait's 90th-percentile speed in the training clips
+  (a walk 0.9 m/s, a run 1.5, a step to the side 0.58): start, stop, walk, turn and the step to
+  the side pass every target, the run all but its slide (1,415 mm/s against 1,220). 100STYLE is
+  slow (its walks 0.56 m/s at the median, its runs 1.04; their 99th percentiles 1.23 and 1.92): at
+  a person's usual walk (1.3 m/s) the walk's slide is 1,237 mm/s and at a run of 3 m/s the run
+  fails four targets. Faster gaits need capture that holds them (CeTI's and the other sources of
+  the register not yet imported).
 - Not yet: the timed goals (a hand at a point at a tick, a point to look at), the solver trained
   on the filtered capture (phase 4's tracker on the human is in work), the tracker following the
   solver's output, the bits on the two machines (the M4 is not measured), the CPU time a body,
