@@ -372,3 +372,53 @@ fn slopes_survive() {
     assert!(!wrela_diag::has_errors(&out.diagnostics), "{}", wrela_diag::render::render_all(&out.sources, &out.diagnostics));
     assert!(out.results.iter().all(|r| r.failure.is_none()), "{:?}", out.results);
 }
+
+/// An affine form keeps its slopes where the function carries a struct of a float and a condition
+/// round a loop, from a sentinel far away, through calls that return it (a kit outline's
+/// `Signed2`, `none()`, `and`): its flattened copy, the calls written in, the loop written out and
+/// the struct split, is derived where the function itself can't be (before, its interval: no
+/// slopes, and with the loop's sentinel in every pass, no bound at all).
+#[test]
+fn an_affine_form_keeps_its_slopes_through_a_struct_carried_round_a_loop() {
+    let dir = crate::package(
+        "optimize/affine-flattened",
+        r#"
+use std::derive::{Box3, affine_form}
+
+struct Near: Copy {
+    d: f32,
+    hit: bool,
+}
+
+fn none() -> Near {
+    Near { d: 1.0e30, hit: false }
+}
+
+fn nearer(a: Near, b: Near) -> Near {
+    let closer = b.d < a.d
+    Near { d: min(a.d, b.d), hit: if closer { b.hit } else { a.hit } }
+}
+
+fn plane(p: vec3, k: f32) -> Near {
+    Near { d: p.y - k, hit: p.x > 0.5 }
+}
+
+@test
+fn slopes_survive() {
+    let b = Box3 { lo: vec3(0.0, 0.0, 0.0), hi: vec3(1.0, 1.0, 1.0) }
+    let ks = [5.0, 2.0, 0.25, 9.0]
+    let af = affine_form(|q: vec3| {
+        var n = none()
+        for i in 0..4 {
+            n = nearer(n, plane(q, ks[i]))
+        }
+        n.d
+    }, b)
+    assert(af.valid() && af.e < 1.0e-4 && abs(af.l.y - 0.5) < 1.0e-5, f"{af.c} {af.l} {af.e}")
+}
+"#,
+    );
+    let out = wrela_driver::test(&dir, None);
+    assert!(!wrela_diag::has_errors(&out.diagnostics), "{}", wrela_diag::render::render_all(&out.sources, &out.diagnostics));
+    assert!(out.results.iter().all(|r| r.failure.is_none()), "{:?}", out.results);
+}

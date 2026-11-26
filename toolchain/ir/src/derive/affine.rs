@@ -338,7 +338,27 @@ pub(super) fn affine_form(
         return Ok(m.add_function(g));
     }
 
-    match derive(m, cache, f, mask.clone(), n, target) {
+    // Where the function passes what isn't floats or a condition through a call or a local (a
+    // struct of both), its flattened copy, the calls written in and the structs split, may be
+    // derived where it couldn't.
+    let derived = match derive(m, cache, f, mask.clone(), n, target) {
+        Err(Error::NotDerivable(..)) => match crate::opt::flattened_copy(m, f) {
+            Some(ff) => {
+                let r = derive(m, cache, ff, mask.clone(), n, target);
+                // For the compiler's own debugging: `WRELA_DUMP_IR=affine` says why a field's
+                // affine form falls to its interval, as its flattened copy saw it.
+                if let Err(e) = &r
+                    && std::env::var("WRELA_DUMP_IR").as_deref() == Ok("affine")
+                {
+                    eprintln!("affine form of `{}`: {e:?}", m.functions[f.index()].name);
+                }
+                r
+            }
+            None => derive(m, cache, f, mask.clone(), n, target),
+        },
+        other => other,
+    };
+    match derived {
         Ok(d) => {
             let (c, ls, e) = input_box(&mut g, &mut body, f32, x_ty, n, over, target);
             let mut args = caps;
@@ -3542,8 +3562,19 @@ impl Af<'_> {
         let dg = match derive(self.m, self.cache, g, mask.clone(), self.n, self.target) {
             Ok(dg) => dg,
             Err(Error::NotDerivable(..) | Error::ActiveLoopExit(..)) if active_v => {
-                let v = v.expect("a value");
-                return self.call_by_interval(out, v, g, args, &mask, &params);
+                // Its flattened copy (the calls in it written in, its structs split), before its
+                // plain interval: a kit outline's distance passes a struct of floats and
+                // conditions through its loop, and as an interval its slopes were lost.
+                let flat = crate::opt::flattened_copy(self.m, g).and_then(|gg| {
+                    derive(self.m, self.cache, gg, mask.clone(), self.n, self.target).ok()
+                });
+                match flat {
+                    Some(dg) => dg,
+                    None => {
+                        let v = v.expect("a value");
+                        return self.call_by_interval(out, v, g, args, &mask, &params);
+                    }
+                }
             }
             Err(e) => return Err(e),
         };

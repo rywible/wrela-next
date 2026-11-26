@@ -1286,6 +1286,105 @@ fn inline_all(m: &mut Module, keep: &[bool]) -> Result<()> {
     Ok(())
 }
 
+/// A copy of function `f` with every call it makes written in, callees first, its counted loops
+/// written out (`unroll`), and its small struct locals split into a local a field (`split_locals`, the CPU's sizes), the parts of a struct it
+/// builds read where they're built (`forward_extracts`): what a derivation that reads floats and
+/// conditions alone can follow where `f` itself passes a struct of both through a call (a kit
+/// outline's `Signed2` and `Near2`). The functions `f` reaches are copied, the copies calling
+/// copies, so nothing else changes; the copies are left unreached. `None` where `f` reaches a
+/// recursive call.
+pub fn flattened_copy(m: &mut Module, f: FuncId) -> Option<FuncId> {
+    let reach = visit::reachable(m, f, &[]);
+    // A copy of each, by the function it copies.
+    let mut copy: HashMap<FuncId, FuncId> = HashMap::new();
+    for &g in &reach {
+        let mut c = m.functions[g.index()].clone();
+        c.name = format!("{}_flat", c.name);
+        let id = m.add_function(c);
+        copy.insert(g, id);
+    }
+    for &g in &reach {
+        let id = copy[&g];
+        let mut body = std::mem::take(&mut m.functions[id.index()].body);
+        visit::walk_mut(&mut body, &mut |s| {
+            if let Stmt::Let(_, Expr::Call(h, _)) | Stmt::Eval(Expr::Call(h, _)) = s
+                && let Some(&c) = copy.get(h)
+            {
+                *h = c;
+            }
+        });
+        m.functions[id.index()].body = body;
+    }
+    // Callees first; a cycle among them is a recursion, which stays as it is.
+    let copies: Vec<usize> = reach.iter().map(|g| copy[g].index()).collect();
+    let mut order = Vec::new();
+    let mut state: HashMap<usize, u8> = HashMap::new();
+    fn visit_copy(
+        m: &Module,
+        f: usize,
+        state: &mut HashMap<usize, u8>,
+        order: &mut Vec<usize>,
+    ) -> bool {
+        match state.get(&f) {
+            Some(2) => return true,
+            Some(1) => return false,
+            _ => {}
+        }
+        state.insert(f, 1);
+        for g in visit::calls(&m.functions[f].body) {
+            if !visit_copy(m, g.index(), state, order) {
+                return false;
+            }
+        }
+        state.insert(f, 2);
+        order.push(f);
+        true
+    }
+    for &c in &copies {
+        if !visit_copy(m, c, &mut state, &mut order) {
+            return None;
+        }
+    }
+    let n = m.functions.len();
+    let keep = vec![false; n];
+    let mut exits: Vec<Option<Function>> = vec![None; n];
+    for c in order {
+        inline_into(m, c, &mut exits, &keep, &[], None).ok()?;
+        exits[c] = exit_form(m, c);
+    }
+    let fc = copy[&f];
+    let mut func = std::mem::take(&mut m.functions[fc.index()]);
+    // A counted loop written out, as a GPU module's is: a form carried round a loop is the hull
+    // of its passes, so a sentinel it starts from (an outline's `none()`, 1e30 apart) was in
+    // every pass's.
+    crate::unroll::unroll(m, &mut func);
+    split_locals(m, &mut func, Split::Cpu);
+    scalarize_unit_enums(m, &mut func);
+    forward(m, &mut func);
+    forward_extracts(m, &mut func);
+    forward(m, &mut func);
+    promote(m, &mut func);
+    forward_stores(m, &mut func);
+    dce(&mut func);
+    forward_extracts(m, &mut func);
+    for _ in 0..4 {
+        let mut changed = crate::const_fold::fold_constants(m, &mut func);
+        if fold_constant_branches(m, &mut func) {
+            forward_stores(m, &mut func);
+            forward_extracts(m, &mut func);
+            changed = true;
+        }
+        if !changed {
+            break;
+        }
+        dce(&mut func);
+    }
+    cse(&mut func);
+    dce(&mut func);
+    m.functions[fc.index()] = func;
+    Some(fc)
+}
+
 /// `f`'s single-exit form, for inlining: `None` when its body has one exit already.
 fn exit_form(m: &mut Module, f: usize) -> Option<Function> {
     let func = std::mem::take(&mut m.functions[f]);

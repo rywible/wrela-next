@@ -905,7 +905,16 @@ segment's offset alone kept its slopes; the profile's code lost them where it:
 2. calls a function that returns a condition (`crosses` itself, any predicate): a derived call
    returned only forms of floats; it now returns a condition's sureness;
 3. carries a struct of floats and conditions through its loop (`Signed2`, `Near2`): an active
-   local or result must be floats alone, or a `bool`. Open: next.
+   local or result must be floats alone, or a `bool`. Now a function (or a callee) that can't be
+   derived is derived as its flattened copy (`ir::opt::flattened_copy`: its calls written in, its
+   counted loops written out, its small structs split, tidied as a GPU module is) before its
+   interval is taken. The loop's sentinel (`none()`, 1e30) had been in every pass's form, so
+   with the loop kept the form had no bound. A turned profile of four straight segments: slopes
+   (2.4, -0.55) mm a half cell and an error of 0.74 mm at a 4.8 mm cell, where it had none.
+4. The candlestick's own profile (bowed segments, as arcs) and its carved gadroons still give a
+   form with no bound: next.
+
+`WRELA_DUMP_IR=affine` says why a field's affine form falls to its interval.
 
 Purpose: find the work that the engine does only because a proof is missing, and remove it. Then
 decrease the cost that no proof can remove.
