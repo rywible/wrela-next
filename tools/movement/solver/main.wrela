@@ -1,0 +1,220 @@
+// The solver's data and its checks (docs/plans/bodies-and-movement.md, phase 5 steps 3 to 5).
+//
+//     tools/wrela tool tools/movement/solver --read poses=.movement/poses --write out=.movement/solver \
+//         -- COMMAND
+//
+// Commands:
+//
+// - `body`: the creature as the training scripts need it, in `out/creature.body.json`: its
+//   freedom, its root's turn at rest, and each segment's joint (its kind, where its numbers start,
+//   their range). The scripts read no `.wrela` file (rule 7 of the plan).
+// - `features SOURCE/CLIP...`: for each clip, `engine::body::motion`'s numbers at each frame f
+//   from 1 to n - 2: the state (frames f - 1 and f), the step (f to f + 1) and the goal a second
+//   ahead (or the last frame), in `out/features/SOURCE/CLIP.bin` ("WFEA", u32 rows, u32 state,
+//   u32 step, u32 goal, then each row's f32 numbers). `tools/movement/solve.py --check` holds its
+//   own numbers to these.
+
+use engine::body::body::Pose
+use engine::body::joint::{Frame, Kind}
+use engine::body::motion::{GOAL, goal, state, step}
+use std::collections::Vec
+use std::string::String
+use std::io::print
+use std::serialize::Reader
+use std::tool::{ToolError, args}
+use std::tool::blob
+use std::tool::files
+use world::creature::BODY
+use world::creature_segments::{FREEDOM, SEGMENTS}
+
+type P = Pose<FREEDOM>
+
+fn read_all(path: str) -> Result<Vec<u8>, ToolError> {
+    let b = files::read_blob(path).wait()?
+    let n = blob::len(b).wait()?
+    var out: Vec<u8> = Vec::with_capacity(u32(n))
+    var at: u64 = 0
+    while at < n {
+        let part = blob::read(b, at, 524288).wait()?
+        at += u64(part.len())
+        for x in part {
+            out.push(x)
+        }
+    }
+    let _ = blob::release(b).wait()
+    Ok(out)
+}
+
+fn write_all(path: str, bytes: Vec<u8>) -> Result<(), ToolError> {
+    if bytes.len() <= 524288 {
+        let _ = files::write(path, bytes).wait()?
+        return Ok(())
+    }
+    let b = blob::new().wait()?
+    var at = 0
+    while at < bytes.len() {
+        let end = min(at + 524288, bytes.len())
+        var part: Vec<u8> = Vec::with_capacity(end - at)
+        for i in at..end {
+            part.push(bytes[i])
+        }
+        let _ = blob::append(b, part).wait()?
+        at = end
+    }
+    let _ = files::write_blob(path, b).wait()?
+    let _ = blob::release(b).wait()
+    Ok(())
+}
+
+fn next(r: mut Reader) -> u32 {
+    match r.read_u32() {
+        Ok(x) => x,
+        Err(_) => 0,
+    }
+}
+
+fn load(name: str) -> Result<(f32, Vec<P>), ToolError> {
+    let bytes = read_all(f"poses/creature/{name}.pose")?
+    var r = Reader::new(take bytes)
+    for _ in 0..4 {
+        let _ = r.read_u8()
+    }
+    let _v = next(mut r)
+    let d = next(mut r)
+    let n = next(mut r)
+    let rate = bitcast_f32(next(mut r))
+    if d != FREEDOM {
+        return Err(ToolError::new("not the creature's poses"))
+    }
+    var poses: Vec<P> = Vec::with_capacity(n)
+    for _ in 0..n {
+        var x = [0.0; 7]
+        for k in 0..7 {
+            x[k] = bitcast_f32(next(mut r))
+        }
+        var p: P = Pose {
+            root: Frame { q: Quat { v: vec4(x[3], x[4], x[5], x[6]) }, t: vec3(x[0], x[1], x[2]) },
+            q: [0.0; FREEDOM],
+        }
+        for k in 0..FREEDOM {
+            p.q[k] = bitcast_f32(next(mut r))
+        }
+        poses.push(p)
+    }
+    Ok((rate, poses))
+}
+
+fn push_u32(out: mut Vec<u8>, x: u32) {
+    for k in 0..4 {
+        out.push(u8((x >> (8 * k)) & 255))
+    }
+}
+
+fn push_f32(out: mut Vec<u8>, x: f32) {
+    push_u32(mut out, bitcast_u32(x))
+}
+
+fn v3(v: vec3) -> String {
+    f"[{v.x}, {v.y}, {v.z}]"
+}
+
+fn body_json() -> u32 {
+    let rest = BODY.segments[0].joint.at.q.v
+    var s = String::new()
+    s.push_str(
+        f"{{\"freedom\": {FREEDOM}, \"rest\": [{rest.x}, {rest.y}, {rest.z}, {rest.w}], \"joints\": [",
+    )
+    for seg in 0..SEGMENTS {
+        let j = BODY.segments[seg].joint
+        let kind = match j.kind {
+            Kind::Fixed => "fixed",
+            Kind::Hinge => "hinge",
+            Kind::Universal => "universal",
+            Kind::Ball => "ball",
+        }
+        let comma = if seg > 0 { ", " } else { "" }
+        s.push_str(
+            f"{comma}{{\"kind\": \"{kind}\", \"first\": {BODY.first[seg]}, \"lo\": {v3(j.lo)}, \"hi\": {v3(j.hi)}}}",
+        )
+    }
+    s.push_str("]}\n")
+    match write_all("out/creature.body.json", Vec::from(s.as_bytes())) {
+        Ok(_) => {
+            print("solver: out/creature.body.json")
+            0
+        },
+        Err(e) => {
+            print(f"solver: {e.message()}")
+            1
+        },
+    }
+}
+
+fn features(name: str) -> u32 {
+    let Ok((rate, poses)) = load(name) else {
+        print(f"solver: no poses of {name}")
+        return 1
+    }
+    let n = poses.len()
+    if n < 4 {
+        return 0
+    }
+    let ahead = u32(rate)
+    var out: Vec<u8> = Vec::new()
+    var a: Vec<f32> = Vec::new()
+    var b: Vec<f32> = Vec::new()
+    for c in [87, 70, 69, 65] {
+        out.push(u8(c))
+    }
+    push_u32(mut out, n - 2)
+    state(BODY, poses[0], poses[1], rate, mut a)
+    step(BODY, poses[1], poses[2], mut b)
+    push_u32(mut out, a.len())
+    push_u32(mut out, b.len())
+    push_u32(mut out, GOAL)
+    for f in 1..(n - 1) {
+        state(BODY, poses[f - 1], poses[f], rate, mut a)
+        step(BODY, poses[f], poses[f + 1], mut b)
+        let g_at = min(f + ahead, n - 1)
+        let seconds = max(f32(g_at - f) / rate, 1.0 / rate)
+        let g = goal(BODY, poses[f], poses[g_at], seconds)
+        for x in a {
+            push_f32(mut out, x)
+        }
+        for x in b {
+            push_f32(mut out, x)
+        }
+        for x in g {
+            push_f32(mut out, x)
+        }
+    }
+    match write_all(f"out/features/{name}.bin", out) {
+        Ok(_) => 0,
+        Err(e) => {
+            print(f"solver: {e.message()}")
+            1
+        },
+    }
+}
+
+pub fn tool() -> u32 {
+    let a = args()
+    if a.len() < 1 {
+        print("usage: solver body | features SOURCE/CLIP...")
+        return 2
+    }
+    let command = a[0].as_str()
+    if command == "body" {
+        return body_json()
+    }
+    if command == "features" {
+        var failed = 0
+        for i in 1..a.len() {
+            failed += features(a[i].as_str())
+        }
+        print(f"solver: features of {a.len() - 1} clips, {failed} failed")
+        return if failed > 0 { 1 } else { 0 }
+    }
+    print(f"solver: no command {command}")
+    2
+}

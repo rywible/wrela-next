@@ -1,0 +1,262 @@
+// A movement as the solver reads and writes it (docs/plans/bodies-and-movement.md, phase 5 steps
+// 3 and 4): the state of a body at a frame (`state`), the step from one frame to the next
+// (`step`), the pose a step makes (`after`) and the goals a later frame sets (`goal`). Each is in
+// the body's heading frame (the turn about +y that its root has made from rest), so a movement
+// means the same thing wherever the body stands and whichever way it faces, and each number has a
+// physical meaning for any body: heights and speeds in metres, turns in radians.
+//
+// The training scripts compute the same numbers from the same poses (`tools/movement/solve.py`),
+// and a test of the tool that writes the data holds the two to each other.
+
+use body::body::{Body, Pose}
+use body::joint::{Frame, vector_of_turn}
+use std::collections::Vec
+
+/// The numbers of `state` past the pose's own (2 D of them): the root's height, the two axes of
+/// its tilt (6), its speed (3), its turn rate about +y (1) and its turn's rate (3).
+pub const STATE_ROOT: u32 = 14
+
+/// The numbers of `step` past the pose's own (D): the root's move along the ground (2), its next
+/// height (1), its turn about +y (1) and its next tilt's two axes (6).
+pub const STEP_ROOT: u32 = 10
+
+/// The numbers of `goal`: the root's mean speed along the ground in the heading frame (2), the
+/// heading's change (its sine and cosine, 2).
+pub const GOAL: u32 = 4
+
+/// The turn by `a` radians about +y.
+pub fn yaw(a: f32) -> Quat {
+    Quat::axis_angle(vec3(0.0, 1.0, 0.0), a)
+}
+
+/// Where a root turned by `q` faces, about +y, in radians: its rest's +z (`rest` the root's turn
+/// at rest) turned as the root turned from rest, measured from +z toward +x.
+pub fn heading(rest: Quat, q: Quat) -> f32 {
+    let f = q.mul(rest.inverse()).rotate(vec3(0.0, 0.0, 1.0))
+    atan2(f.x, f.z)
+}
+
+/// `a` brought into (-pi, pi].
+pub fn wrapped(a: f32) -> f32 {
+    var x = a
+    while x > 3.14159265 {
+        x -= 6.2831853
+    }
+    while x <= -3.14159265 {
+        x += 6.2831853
+    }
+    x
+}
+
+/// The root's turn with its heading taken off: what is left is its tilt (and its turn about
+/// itself) from rest. Written as the two axes it turns +x and +y to.
+fn tilt(rest: Quat, q: Quat) -> (vec3, vec3) {
+    let t = yaw(-heading(rest, q)).mul(q).mul(rest.inverse())
+    (t.rotate(vec3(1.0, 0.0, 0.0)), t.rotate(vec3(0.0, 1.0, 0.0)))
+}
+
+/// The state at `now`, which came after `before` (`rate` frames a second), in `out`: the root's
+/// height, tilt, speed in the heading frame, turn rate about +y and turn's rate; then the pose's
+/// numbers and their rates.
+pub fn state<const S: u32, const D: u32>(
+    body: Body<S>,
+    before: Pose<D>,
+    now: Pose<D>,
+    rate: f32,
+    out: mut Vec<f32>,
+) {
+    let rest = body.segments[0].joint.at.q
+    let h = heading(rest, now.root.q)
+    let into = yaw(-h)
+    out.clear()
+    out.push(now.root.t.y)
+    let (ax, ay) = tilt(rest, now.root.q)
+    for v in [ax, ay] {
+        out.push(v.x)
+        out.push(v.y)
+        out.push(v.z)
+    }
+    let v = into.rotate(now.root.t - before.root.t) * rate
+    out.push(v.x)
+    out.push(v.y)
+    out.push(v.z)
+    out.push(wrapped(h - heading(rest, before.root.q)) * rate)
+    let w = into.rotate(vector_of_turn(now.root.q.mul(before.root.q.inverse()))) * rate
+    out.push(w.x)
+    out.push(w.y)
+    out.push(w.z)
+    for k in 0..D {
+        out.push(now.q[k])
+    }
+    for k in 0..D {
+        out.push((now.q[k] - before.q[k]) * rate)
+    }
+}
+
+/// The step from `now` to `next`, in `out`: the root's move along the ground in `now`'s heading
+/// frame, its height at `next`, its heading's change and its tilt at `next`; then the change of
+/// each number.
+pub fn step<const S: u32, const D: u32>(
+    body: Body<S>,
+    now: Pose<D>,
+    next: Pose<D>,
+    out: mut Vec<f32>,
+) {
+    let rest = body.segments[0].joint.at.q
+    let h = heading(rest, now.root.q)
+    let d = yaw(-h).rotate(next.root.t - now.root.t)
+    out.clear()
+    out.push(d.x)
+    out.push(d.z)
+    out.push(next.root.t.y)
+    out.push(wrapped(heading(rest, next.root.q) - h))
+    let (ax, ay) = tilt(rest, next.root.q)
+    for v in [ax, ay] {
+        out.push(v.x)
+        out.push(v.y)
+        out.push(v.z)
+    }
+    for k in 0..D {
+        out.push(next.q[k] - now.q[k])
+    }
+}
+
+/// The pose that step `s` (as `step` writes it) makes from `now`, each joint's numbers put into
+/// its range. The tilt's two axes are made a frame first (Gram and Schmidt), so a step that a
+/// net gives, whose axes are not quite square, still makes a turn.
+pub fn after<const S: u32, const D: u32>(body: Body<S>, now: Pose<D>, s: [f32]) -> Pose<D> {
+    let rest = body.segments[0].joint.at.q
+    let h = heading(rest, now.root.q)
+    var p = now
+    let d = yaw(h).rotate(vec3(s[0], 0.0, s[1]))
+    p.root.t = vec3(now.root.t.x + d.x, s[2], now.root.t.z + d.z)
+    let a = normalize(vec3(s[4], s[5], s[6]))
+    let b0 = vec3(s[7], s[8], s[9])
+    let b = normalize(b0 - a * dot(a, b0))
+    let t = Quat::from_mat3(mat3(a, b, cross(a, b)))
+    p.root.q = yaw(h + s[3]).mul(t).mul(rest)
+    for k in 0..D {
+        p.q[k] = now.q[k] + s[STEP_ROOT + k]
+    }
+    for seg in 1..S {
+        let n = body.freedom_of(seg)
+        if n > 0 {
+            body.set_numbers(mut p, seg, body.segments[seg].joint.clamped(body.numbers(p, seg)))
+        }
+    }
+    p
+}
+
+/// The goal that `ahead` (`seconds` after `now`) sets: the root's mean speed along the ground
+/// to it, in `now`'s heading frame, and the heading's change to it (its sine and cosine).
+pub fn goal<const S: u32, const D: u32>(
+    body: Body<S>,
+    now: Pose<D>,
+    ahead: Pose<D>,
+    seconds: f32,
+) -> [f32; GOAL] {
+    let rest = body.segments[0].joint.at.q
+    let h = heading(rest, now.root.q)
+    let d = yaw(-h).rotate(ahead.root.t - now.root.t) / seconds
+    let turn = heading(rest, ahead.root.q) - h
+    [d.x, d.z, sin(turn), cos(turn)]
+}
+
+// ---- tests -------------------------------------------------------------------------------------
+
+use body::body::{Segment, body}
+use body::joint::{Joint, Kind}
+
+fn test_body() -> Body<3> {
+    let wide = vec3(3.0)
+    let free = Joint {
+        kind: Kind::Fixed,
+        parent: body::joint::NONE,
+        at: Frame { q: Quat::axis_angle(vec3(1.0, 0.0, 0.0), 0.3), t: vec3(0.0, 1.0, 0.0) },
+        lo: -wide,
+        hi: wide,
+        strength: vec3(100.0),
+    }
+    var hinge = free
+    hinge.parent = 0
+    hinge.kind = Kind::Hinge
+    hinge.at = Frame { q: Quat::identity(), t: vec3(0.0, -0.4, 0.0) }
+    hinge.lo = vec3(-1.0)
+    hinge.hi = vec3(1.0)
+    var ball = free
+    ball.parent = 1
+    ball.kind = Kind::Ball
+    ball.at = Frame { q: Quat::identity(), t: vec3(0.0, -0.4, 0.0) }
+    body(
+        [
+            Segment { joint: free, tip: vec3(0.0, -0.4, 0.0) },
+            Segment { joint: hinge, tip: vec3(0.0, -0.4, 0.0) },
+            Segment { joint: ball, tip: vec3(0.0, -0.4, 0.0) },
+        ],
+    )
+}
+
+fn moved(p: Pose<4>, t: f32) -> Pose<4> {
+    var q = p
+    q.root.t = p.root.t + vec3(0.3 * t, 0.02 * sin(4.0 * t), 1.1 * t)
+    q.root.q = yaw(0.8 * t)
+        .mul(Quat::axis_angle(vec3(1.0, 0.2, 0.0), 0.1 * sin(3.0 * t)))
+        .mul(p.root.q)
+    q.q = [0.5 * sin(2.0 * t), 0.2 * t, -0.1, 0.3 * cos(t)]
+    q
+}
+
+@test
+fn a_step_makes_the_next_pose_back() {
+    let b = test_body()
+    let rest: Pose<4> = b.rest()
+    var s: Vec<f32> = Vec::new()
+    var worst = 0.0
+    for i in 0..40 {
+        let now = moved(rest, f32(i) / 30.0)
+        let next = moved(rest, f32(i + 1) / 30.0)
+        step(b, now, next, mut s)
+        assert(s.len() == STEP_ROOT + 4)
+        let p = after(b, now, s)
+        worst = max(worst, length(p.root.t - next.root.t))
+        worst = max(worst, length(vector_of_turn(p.root.q.mul(next.root.q.inverse()))))
+        for k in 0..4 {
+            worst = max(worst, abs(p.q[k] - next.q[k]))
+        }
+    }
+    assert(worst < 1.0e-5, f"the pose a step makes is {worst} from the next one")
+}
+
+@test
+fn the_state_does_not_change_where_the_body_stands_or_faces() {
+    let b = test_body()
+    let rest: Pose<4> = b.rest()
+    var a: Vec<f32> = Vec::new()
+    var c: Vec<f32> = Vec::new()
+    let turn = yaw(2.0)
+    let shift = vec3(5.0, 0.0, -3.0)
+    for i in 1..20 {
+        let (p0, p1) = (moved(rest, f32(i - 1) / 30.0), moved(rest, f32(i) / 30.0))
+        state(b, p0, p1, 30.0, mut a)
+        var q0 = p0
+        var q1 = p1
+        q0.root = Frame { q: turn.mul(p0.root.q), t: turn.rotate(p0.root.t) + shift }
+        q1.root = Frame { q: turn.mul(p1.root.q), t: turn.rotate(p1.root.t) + shift }
+        state(b, q0, q1, 30.0, mut c)
+        assert(a.len() == STATE_ROOT + 8 && c.len() == a.len())
+        for k in 0..a.len() {
+            assert(abs(a[k] - c[k]) < 1.0e-4, f"number {k}: {a[k]} and {c[k]}")
+        }
+    }
+}
+
+@test
+fn a_step_out_of_range_is_put_into_it() {
+    let b = test_body()
+    let now: Pose<4> = b.rest()
+    var s: Vec<f32> = Vec::new()
+    step(b, now, now, mut s)
+    s[STEP_ROOT] = 3.0
+    let p = after(b, now, s)
+    assert(abs(p.q[0] - 1.0) < 1.0e-5)
+}
