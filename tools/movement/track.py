@@ -122,9 +122,16 @@ class Sim:
         mjd = mujoco.MjData(self.mjm)
         mujoco.mj_forward(self.mjm, mjd)
         self.m = mjw.put_model(self.mjm)
-        # Per world: contacts (each capsule on the floor, twice over) and constraint rows (four a
-        # contact, and the joints at their limits).
-        self.d = mjw.put_data(self.mjm, mjd, nworld=worlds, nconmax=32, njmax=160)
+        # Per world, from the model: contacts (each colliding capsule on the floor, twice over) and
+        # constraint rows (four a contact, and each joint at its limit), and the rows' non-zeros
+        # (each row a dof's worth). Fixed at 32 and 160 for the creature's 18 parts, they
+        # overflowed with the human's (2026-11-26: the simulator dropped contacts and the training
+        # fell apart at update 990).
+        colliding = int(sum(1 for g in range(self.mjm.ngeom) if self.mjm.geom_contype[g] != 0))
+        nconmax = 2 * colliding
+        njmax = 4 * nconmax + self.mjm.njnt
+        self.d = mjw.put_data(self.mjm, mjd, nworld=worlds, nconmax=nconmax, njmax=njmax,
+                              njmax_nnz=njmax * self.mjm.nv)
         self.n = worlds
         self.dev = device
         self.substeps = substeps
@@ -469,7 +476,8 @@ def main():
             opt.load_state_dict(state["opt"])
             norm.load(state["norm"], dev)
             step, samples = state["step"], state["samples"]
-            gen.set_state(state["gen"].to(gen.device) if dev == "cuda" else state["gen"])
+            # A generator's state is a CPU byte tensor on any device.
+            gen.set_state(state["gen"].cpu())
             torch.set_rng_state(state["torch_rng"])
             if "weights" in state:
                 sim.weights = state["weights"].to(dev)
