@@ -1,0 +1,578 @@
+// The import of capture (docs/plans/bodies-and-movement.md, phase 2): reads capture files and
+// writes poses of one of our bodies. The names of a capture format's bones stay in this tool
+// (`maps`); the kit and the engine never see them.
+//
+//     tools/wrela tool tools/movement/capture --read capture=.movement/capture \
+//         --write out=.movement/poses -- SOURCE [FIRST COUNT [STEPS]]
+//
+// For each clip of SOURCE (a source of the register, docs/plans/movement-sources.md, whose row
+// is in docs/citations.md), it:
+//
+// 1. reads the capture (BVH: its skeleton, its channels and its frames) and works out each bone's
+//    place and turn in each frame;
+// 2. scales the capture to the body: lengths by the ratio of the body's leg (hip to ankle) to the
+//    capture's, and time by that ratio's square root, which keeps the Froude number (a body with
+//    shorter legs moves with a shorter period);
+// 3. fits a pose of the body to each frame at `RATE` frames a second (`engine::body::fit`): each
+//    mapped segment turned from its rest as the capture's bone turned from its own, its root, its
+//    hands and its feet where the scaled capture puts them, each joint kept in its range field;
+// 4. writes the poses (`out/creature/SOURCE/CLIP.pose`) and the clip's record (`CLIP.json`: the
+//    source, the file and its SHA-256, the credit, how the fit went), and prints a line a clip.
+//
+// A pose file: "WPOS", then u32s version (1), numbers a pose (D), frames, then f32 frames a
+// second, then each frame's root place (3), root turn (4: a quaternion's x, y, z, w) and numbers
+// (D), all little-endian.
+
+use engine::body::body::{Body, Pose}
+use engine::body::fit::{Aim, aim_frame, aim_point, fit}
+use engine::body::joint::{Frame, vector_of_turn}
+use std::collections::Vec
+use std::hash::sha256::{hex, sha256}
+use std::io::print
+use std::quat::Quat
+use std::serialize::Writer
+use std::tool::{ToolError, all, args}
+use std::tool::blob
+use std::tool::files
+use world::creature::BODY
+use world::creature_segments::{
+    CHEST, COLLAR_LEFT, COLLAR_RIGHT, FOOT_LEFT, FOOT_RIGHT, FOREARM_LEFT, FOREARM_RIGHT, FREEDOM,
+    HAND_LEFT, HAND_RIGHT, HEAD, NECK, PELVIS, SEGMENTS, SHIN_LEFT, SHIN_RIGHT, SPINE, THIGH_LEFT,
+    THIGH_RIGHT, TOES_LEFT, TOES_RIGHT, UPPER_ARM_LEFT, UPPER_ARM_RIGHT, UPPER_CHEST,
+}
+
+/// The poses' rate (frames a second, in the body's time).
+const RATE: f32 = 30.0
+
+/// How much a number's change from the frame before weighs in the fit (per rad): a number no aim
+/// fixes (a straight arm's twist) holds still rather than wander. With the fit's own default
+/// (0.001), the judge's force against force plates was 25% of the weight off on average, with
+/// spikes of ten weights where an arm's twist spun; with this, 6% (tools/movement/forces).
+const STILL: f32 = 0.05
+
+/// How many steps the fit takes for a frame (from the frame before, unless the command line
+/// gives another number), and for a clip's first.
+const STEPS: u32 = 4
+const FIRST_STEPS: u32 = 200
+
+// ---- a BVH file ---------------------------------------------------------------------------------
+
+/// A bone of a BVH skeleton: its name, its parent (`NONE`), its offset in its parent at rest,
+/// its channels (0 to 2 a place's x, y, z; 3 to 5 a turn about x, y, z, in the order written),
+/// where its channels start in a frame's numbers, and its end site's offset (if it has one).
+struct Bone: Clone {
+    name: String,
+    parent: u32,
+    offset: vec3,
+    channels: Vec<u32>,
+    first: u32,
+    end: vec3,
+    has_end: bool,
+}
+
+const NONE: u32 = 4294967295
+
+struct Bvh: Clone {
+    bones: Vec<Bone>,
+    frames: u32,
+    frame_time: f32,
+    stride: u32,
+    values: Vec<f32>,
+}
+
+/// The words of `text`, as (start, end) byte ranges.
+fn words(text: [u8]) -> Vec<vec2u> {
+    var out: Vec<vec2u> = Vec::new()
+    var i = 0
+    let n = text.len()
+    while i < n {
+        while i < n && (text[i] == 32 || text[i] == 9 || text[i] == 10 || text[i] == 13) {
+            i += 1
+        }
+        let s = i
+        while i < n && !(text[i] == 32 || text[i] == 9 || text[i] == 10 || text[i] == 13) {
+            i += 1
+        }
+        if i > s {
+            out.push(vec2u(s, i))
+        }
+    }
+    out
+}
+
+fn word(text: str, w: vec2u) -> borrow str {
+    text.slice(w.x, w.y)
+}
+
+fn number(text: str, w: vec2u) -> Result<f32, ToolError> {
+    match word(text, w).parse_f32() {
+        Some(x) => Ok(x),
+        None => Err(ToolError::new(f"not a number: {word(text, w)}")),
+    }
+}
+
+fn parse(whole: String) -> Result<Bvh, ToolError> {
+    let ws = words(whole.as_bytes())
+    let text = whole.as_str()
+    var bones: Vec<Bone> = Vec::new()
+    var stack: Vec<u32> = Vec::new()
+    var i = 0
+    var channels_seen = 0
+    var in_end = false
+    while i < ws.len() {
+        let w = word(text, ws[i])
+        if w == "ROOT" || w == "JOINT" {
+            let parent = if stack.len() > 0 { stack[stack.len() - 1] } else { NONE }
+            bones.push(
+                Bone {
+                    name: word(text, ws[i + 1]).to_string(),
+                    parent,
+                    offset: vec3(0.0),
+                    channels: Vec::new(),
+                    first: 0,
+                    end: vec3(0.0),
+                    has_end: false,
+                },
+            )
+            i += 2
+        } else if w == "End" {
+            in_end = true
+            i += 2
+        } else if w == "{" {
+            if !in_end {
+                stack.push(bones.len() - 1)
+            }
+            i += 1
+        } else if w == "}" {
+            if in_end {
+                in_end = false
+            } else {
+                let _ = stack.pop()
+            }
+            i += 1
+        } else if w == "OFFSET" {
+            let v = vec3(
+                number(text, ws[i + 1])?,
+                number(text, ws[i + 2])?,
+                number(text, ws[i + 3])?,
+            )
+            let b = bones.len() - 1
+            if in_end {
+                bones[b].end = v
+                bones[b].has_end = true
+            } else {
+                bones[b].offset = v
+            }
+            i += 4
+        } else if w == "CHANNELS" {
+            let n = word(text, ws[i + 1]).parse_u32().unwrap_or(0)
+            let b = bones.len() - 1
+            bones[b].first = channels_seen
+            for k in 0..n {
+                let c = word(text, ws[i + 2 + k])
+                let code = if c == "Xposition" { 0 } else if c == "Yposition" { 1 } else if c ==
+                    "Zposition" {
+                    2
+                } else if c == "Xrotation" { 3 } else if c == "Yrotation" { 4 } else { 5 }
+                bones[b].channels.push(code)
+            }
+            channels_seen += n
+            i += 2 + n
+        } else if w == "MOTION" {
+            i += 1
+            break
+        } else {
+            i += 1
+        }
+    }
+    // "Frames:" n "Frame" "Time:" t, then the numbers.
+    let frames = word(text, ws[i + 1]).parse_u32().unwrap_or(0)
+    let frame_time = number(text, ws[i + 4])?
+    i += 5
+    var values: Vec<f32> = Vec::with_capacity(frames * channels_seen)
+    while i < ws.len() && values.len() < frames * channels_seen {
+        values.push(number(text, ws[i])?)
+        i += 1
+    }
+    let got = values.len() / max(channels_seen, 1)
+    Ok(Bvh { bones, frames: min(frames, got), frame_time, stride: channels_seen, values })
+}
+
+/// Each bone's place and turn in the capture's space in frame `f` (`world`), the capture's
+/// units.
+fn posed(b: Bvh, f: u32, places: mut Vec<vec3>, turns: mut Vec<Quat>) {
+    places.clear()
+    turns.clear()
+    let deg = 3.14159265 / 180.0
+    for k in 0..b.bones.len() {
+        borrow bone = b.bones[k]
+        var t = bone.offset
+        var q = Quat::identity()
+        for c in 0..bone.channels.len() {
+            let v = b.values[f * b.stride + bone.first + c]
+            let code = bone.channels[c]
+            if code < 3 {
+                t[code] = v
+            } else {
+                let axis = if code == 3 { vec3(1.0, 0.0, 0.0) } else if code == 4 {
+                    vec3(0.0, 1.0, 0.0)
+                } else { vec3(0.0, 0.0, 1.0) }
+                q = q.mul(Quat::axis_angle(axis, v * deg))
+            }
+        }
+        if bone.parent == NONE {
+            places.push(t)
+            turns.push(q)
+        } else {
+            let (pp, pq) = (places[bone.parent], turns[bone.parent])
+            places.push(pp + pq.rotate(t))
+            turns.push(pq.mul(q))
+        }
+    }
+}
+
+// ---- the map from a capture's bones to the body's segments ---------------------------------------
+
+/// A capture bone that a segment follows: the bone's name, the segment, and whether its place is
+/// aimed (a hand, a foot, the root) as well as its turn.
+struct Map: Copy {
+    bone: Text,
+    segment: u32,
+    placed: bool,
+}
+
+/// What each capture format's bones are, for the creature. 100STYLE's skeleton (a spine of four
+/// and a collar each side).
+fn maps(source: str) -> Vec<Map> {
+    let m = |bone: Text, segment: u32, placed: bool| Map { bone, segment, placed }
+    var out: Vec<Map> = Vec::new()
+    if source == "100style" {
+        out.push(m("Hips", PELVIS, true))
+        out.push(m("Chest", SPINE, false))
+        out.push(m("Chest2", CHEST, false))
+        out.push(m("Chest4", UPPER_CHEST, false))
+        out.push(m("Neck", NECK, false))
+        out.push(m("Head", HEAD, false))
+        out.push(m("LeftCollar", COLLAR_LEFT, false))
+        out.push(m("LeftShoulder", UPPER_ARM_LEFT, false))
+        out.push(m("LeftElbow", FOREARM_LEFT, false))
+        out.push(m("LeftWrist", HAND_LEFT, true))
+        out.push(m("RightCollar", COLLAR_RIGHT, false))
+        out.push(m("RightShoulder", UPPER_ARM_RIGHT, false))
+        out.push(m("RightElbow", FOREARM_RIGHT, false))
+        out.push(m("RightWrist", HAND_RIGHT, true))
+        out.push(m("LeftHip", THIGH_LEFT, false))
+        out.push(m("LeftKnee", SHIN_LEFT, false))
+        out.push(m("LeftAnkle", FOOT_LEFT, true))
+        out.push(m("LeftToe", TOES_LEFT, true))
+        out.push(m("RightHip", THIGH_RIGHT, false))
+        out.push(m("RightKnee", SHIN_RIGHT, false))
+        out.push(m("RightAnkle", FOOT_RIGHT, true))
+        out.push(m("RightToe", TOES_RIGHT, true))
+    }
+    out
+}
+
+/// The units of a source's capture, in metres.
+fn unit(source: str) -> f32 {
+    if source == "100style" { 0.01 } else { 1.0 }
+}
+
+/// The credit a source asks for (docs/citations.md).
+fn credit(source: str) -> Text {
+    if source == "100style" { "The 100STYLE Dataset - Ian Mason (CC BY 4.0)" } else { "" }
+}
+
+fn bone_index(b: Bvh, name: str) -> u32 {
+    for i in 0..b.bones.len() {
+        if b.bones[i].name.as_str() == name {
+            return i
+        }
+    }
+    NONE
+}
+
+// ---- one clip ---------------------------------------------------------------------------------
+
+/// What a clip came to.
+struct Done: Clone {
+    clip: String,
+    frames: u32,
+    seconds: f32,
+    joint_mm: f32,
+    out_of_range: u32,
+    worst_range: f32,
+    failed: String,
+}
+
+/// A clip to import: the source, the file (under the capture root), the clip's name, and its
+/// first and last frames (the capture's clean part), or all of it.
+struct Clip: Clone {
+    steps: u32,
+    source: String,
+    file: String,
+    name: String,
+    first: u32,
+    last: u32,
+}
+
+fn read_all(path: str) -> Result<Vec<u8>, ToolError> {
+    let b = files::read_blob(path).wait()?
+    let n = blob::len(b).wait()?
+    var out: Vec<u8> = Vec::with_capacity(u32(n))
+    var at: u64 = 0
+    while at < n {
+        let part = blob::read(b, at, 524288).wait()?
+        at += u64(part.len())
+        for x in part {
+            out.push(x)
+        }
+    }
+    let _ = blob::release(b).wait()
+    Ok(out)
+}
+
+fn write_all(path: str, bytes: Vec<u8>) -> Result<(), ToolError> {
+    if bytes.len() <= 524288 {
+        let _ = files::write(path, bytes).wait()?
+        return Ok(())
+    }
+    let b = blob::new().wait()?
+    var at = 0
+    while at < bytes.len() {
+        let end = min(at + 524288, bytes.len())
+        var part: Vec<u8> = Vec::with_capacity(end - at)
+        for i in at..end {
+            part.push(bytes[i])
+        }
+        let _ = blob::append(b, part).wait()?
+        at = end
+    }
+    let _ = files::write_blob(path, b).wait()?
+    let _ = blob::release(b).wait()
+    Ok(())
+}
+
+fn import(c: take Clip) -> Done {
+    match import_or(c.clone()) {
+        Ok(d) => d,
+        Err(e) => Done {
+            clip: c.name.clone(),
+            frames: 0,
+            seconds: 0.0,
+            joint_mm: 0.0,
+            out_of_range: 0,
+            worst_range: 0.0,
+            failed: e.message().to_string(),
+        },
+    }
+}
+
+fn import_or(c: Clip) -> Result<Done, ToolError> {
+    let bytes = read_all(f"capture/{c.file}")?
+    let digest = hex(sha256(bytes))
+    let Some(text) = String::from_utf8(take bytes) else { return Err(ToolError::new("not UTF-8")) }
+    let bvh = parse(take text)?
+    let body = BODY
+    let ms = maps(c.source.as_str())
+    var idx: Vec<u32> = Vec::new()
+    for m in ms {
+        let i = bone_index(bvh, m.bone)
+        if i == NONE {
+            return Err(ToolError::new(f"no bone {m.bone}"))
+        }
+        idx.push(i)
+    }
+    // The body at rest (its numbers 0): each segment's turn and place there.
+    let rest: Pose<FREEDOM> = body.rest()
+    let at0 = body.places(rest)
+    // The scale: the body's leg (hip to knee to ankle) against the capture's, at rest.
+    let u = unit(c.source.as_str())
+    let (hip, knee, ankle) = (
+        bone_index(bvh, ms[14].bone),
+        bone_index(bvh, ms[15].bone),
+        bone_index(bvh, ms[16].bone),
+    )
+    let leg_cap = (length(bvh.bones[knee].offset) + length(bvh.bones[ankle].offset)) * u
+    let leg_ours = length(at0[SHIN_LEFT].t - at0[THIGH_LEFT].t) +
+        length(at0[FOOT_LEFT].t - at0[SHIN_LEFT].t)
+    let s = leg_ours / leg_cap
+    let k = sqrt(s)
+    // The frames: the clean part, at `RATE` a second of the body's time.
+    let first = min(c.first, bvh.frames - 1)
+    let last = min(c.last, bvh.frames - 1)
+    let span_cap = f32(last - first) * bvh.frame_time
+    let n = u32(floor(span_cap * k * RATE)) + 1
+    var w = Writer::new()
+    w.write_u8(87)
+    w.write_u8(80)
+    w.write_u8(79)
+    w.write_u8(83)
+    w.write_u32(1)
+    w.write_u32(FREEDOM)
+    w.write_u32(n)
+    w.write_u32(bitcast_u32(RATE))
+    var places: Vec<vec3> = Vec::new()
+    var turns: Vec<Quat> = Vec::new()
+    var prev: Pose<FREEDOM> = rest
+    var dist_sum = 0.0
+    var dist_n = 0.0
+    var out_of_range = 0
+    var worst_range = -1.0e9
+    for j in 0..n {
+        // The capture's frame at this moment of the body's time.
+        let t_cap = f32(j) / RATE / k
+        let f = min(first + u32(round(t_cap / bvh.frame_time)), last)
+        posed(bvh, f, mut places, mut turns)
+        var aims: Vec<Aim> = Vec::new()
+        for i in 0..ms.len() {
+            let m = ms[i]
+            let b = idx[i]
+            // Turned from its rest as the capture's bone turned from its own (both at rest in
+            // a T-pose, facing +z, +x their left).
+            let q = turns[b].mul(at0[m.segment].q)
+            let p = places[b] * (u * s)
+            if m.placed {
+                aims.push(aim_frame(m.segment, Frame { q, t: p }, if m.segment == PELVIS {
+                    2.0
+                } else { 1.0 }, 0.3))
+            } else {
+                aims.push(
+                    Aim {
+                        segment: m.segment,
+                        point: vec3(0.0),
+                        at: p,
+                        place: 0.0,
+                        turn: q,
+                        turned: 0.3,
+                    },
+                )
+            }
+        }
+        if j == 0 {
+            prev.root = Frame { q: turns[idx[0]].mul(at0[PELVIS].q), t: places[idx[0]] * (u * s) }
+        }
+        let fr = fit(body, aims, prev, if j == 0 { FIRST_STEPS } else {
+            c.steps
+        }, still: if j == 0 { 0.001 } else { STILL })
+        prev = fr.pose
+        // How far each mapped joint is from the scaled capture's.
+        let at = body.places(prev)
+        for i in 0..ms.len() {
+            dist_sum += length(at[ms[i].segment].t - places[idx[i]] * (u * s))
+            dist_n += 1.0
+        }
+        var worst = -1.0e9
+        for sg in 1..SEGMENTS {
+            worst = max(worst, body.segments[sg].joint.range(body.numbers(prev, sg)))
+        }
+        if worst > 0.01 {
+            out_of_range += 1
+        }
+        worst_range = max(worst_range, worst)
+        let r = prev.root
+        for x in [r.t.x, r.t.y, r.t.z, r.q.v.x, r.q.v.y, r.q.v.z, r.q.v.w] {
+            w.write_u32(bitcast_u32(x))
+        }
+        for x in prev.q {
+            w.write_u32(bitcast_u32(x))
+        }
+    }
+    let dir = f"out/creature/{c.source}"
+    write_all(f"{dir}/{c.name}.pose", take w.into_bytes())?
+    let mm = 1000.0 * dist_sum / max(dist_n, 1.0)
+    let record = f"{{\"source\": \"{c.source}\", \"file\": \"{c.file}\", \"sha256\": \"{digest}\", \"credit\": \"{credit(c.source.as_str())}\", \"body\": \"creature\", \"capture_frames\": [{first}, {last}], \"frames\": {n}, \"rate\": {RATE}, \"seconds\": {f32(n) / RATE}, \"length_scale\": {s}, \"time_scale\": {k}, \"mean_joint_mm\": {mm}, \"frames_out_of_range\": {out_of_range}, \"worst_range\": {worst_range}}}\n"
+    write_all(f"{dir}/{c.name}.json", Vec::from(record.as_bytes()))?
+    Ok(
+        Done {
+            clip: c.name.clone(),
+            frames: n,
+            seconds: f32(n) / RATE,
+            joint_mm: mm,
+            out_of_range,
+            worst_range,
+            failed: String::new(),
+        },
+    )
+}
+
+// ---- the sources ------------------------------------------------------------------------------
+
+/// 100STYLE's clips: each style's takes, each cut to its clean frames (`Frame_Cuts.csv`).
+fn clips_100style() -> Result<Vec<Clip>, ToolError> {
+    let cuts_bytes = read_all("capture/100style/100STYLE/Frame_Cuts.csv")?
+    let Some(cuts) = String::from_utf8(take cuts_bytes) else { return Err(ToolError::new("cuts")) }
+    let text = cuts.as_str()
+    let takes = ["BR", "BW", "FR", "FW", "ID", "SR", "SW", "TR1", "TR2", "TR3"]
+    var out: Vec<Clip> = Vec::new()
+    let lines = text.lines()
+    for li in 1..lines.len() {
+        let (l0, l1) = lines[li]
+        let line = text.slice(l0, l1)
+        let cells = line.split(",")
+        if cells.len() < 21 {
+            continue
+        }
+        let (c0, c1) = cells[0]
+        let style = line.slice(c0, c1).to_string()
+        for t in 0..10 {
+            let (a0, a1) = cells[1 + 2 * t]
+            let (b0, b1) = cells[2 + 2 * t]
+            let a = line.slice(a0, a1)
+            let b = line.slice(b0, b1).trim()
+            let (Some(first), Some(last)) = (a.parse_u32(), b.parse_u32()) else { continue }
+            out.push(
+                Clip {
+                    steps: STEPS,
+                    source: String::from("100style"),
+                    file: f"100style/100STYLE/{style}/{style}_{takes[t]}.bvh",
+                    name: f"{style}_{takes[t]}",
+                    first,
+                    last,
+                },
+            )
+        }
+    }
+    Ok(out)
+}
+
+pub fn tool() -> u32 {
+    let a = args()
+    if a.len() < 1 {
+        print("usage: capture SOURCE [FIRST COUNT [STEPS]]")
+        return 2
+    }
+    let source = a[0].as_str()
+    let Ok(all_clips) = (if source == "100style" { clips_100style() } else {
+        Err(ToolError::new("unknown source"))
+    }) else {
+        print(f"capture: no clips of {source}")
+        return 1
+    }
+    let from = if a.len() > 1 { a[1].as_str().parse_u32().unwrap_or(0) } else { 0 }
+    let count = if a.len() > 2 { a[2].as_str().parse_u32().unwrap_or(100000) } else { 100000 }
+    let steps = if a.len() > 3 { a[3].as_str().parse_u32().unwrap_or(STEPS) } else { STEPS }
+    var chosen: Vec<Clip> = Vec::new()
+    for i in from..min(from + count, all_clips.len()) {
+        var c = all_clips[i].clone()
+        c.steps = steps
+        chosen.push(take c)
+    }
+    print(f"capture: {source}: {chosen.len()} of {all_clips.len()} clips")
+    let done = all(take chosen, import)
+    var secs = 0.0
+    var failed = 0
+    for d in done {
+        if d.failed.len() > 0 {
+            failed += 1
+            print(f"capture: {d.clip}: FAILED {d.failed}")
+        } else {
+            secs += d.seconds
+            print(
+                f"capture: {d.clip}: {d.frames} frames ({d.seconds} s), joints {d.joint_mm} mm from the capture's, {d.out_of_range} frames out of range (worst {d.worst_range} rad)",
+            )
+        }
+    }
+    print(f"capture: {source}: {secs / 3600.0} h imported, {failed} failed")
+    if failed > 0 { 1 } else { 0 }
+}

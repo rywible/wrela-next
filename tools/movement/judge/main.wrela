@@ -1,0 +1,513 @@
+// The judge's calibration (docs/plans/bodies-and-movement.md, phase 3 steps 5 to 7): each clip
+// of the calibration set judged (`engine::judge::movement`) beside damaged copies of it (a faster
+// time, a slide of the root, noise on the joints, a root too high, a body that does not move), the
+// distance of each from the statistics of the training clips, and how often and how surely the
+// judge prefers the capture.
+//
+//     tools/wrela tool tools/movement/judge --read poses=.movement/poses --read split=tools/movement/split \
+//         -- calibrate [CLIPS]          the calibration set (at most CLIPS of it)
+//     ... -- one SOURCE/CLIP            one clip's measures
+//
+// Reads the pose files that tools/movement/capture writes.
+
+use engine::body::body::Pose
+use engine::body::joint::{Frame, turn_of_vector, vector_of_turn}
+use engine::judge::movement::{
+    Measures, Stats, add_stats, judge, judge_into, no_stats, stats_distance, velocity_error,
+    velocity_goals,
+}
+use std::serialize::Writer
+use std::collections::Vec
+use std::field::half_space
+use std::hash::pcg
+use std::io::print
+use std::quat::Quat
+use std::serialize::Reader
+use std::time::now
+use std::tool::{ToolError, args}
+use std::tool::blob
+use std::tool::files
+use world::creature::{BODY, MASSES}
+use world::creature_segments::{FREEDOM, PARTS}
+
+type P = Pose<FREEDOM>
+
+fn read_all(path: str) -> Result<Vec<u8>, ToolError> {
+    let b = files::read_blob(path).wait()?
+    let n = blob::len(b).wait()?
+    var out: Vec<u8> = Vec::with_capacity(u32(n))
+    var at: u64 = 0
+    while at < n {
+        let part = blob::read(b, at, 524288).wait()?
+        at += u64(part.len())
+        for x in part {
+            out.push(x)
+        }
+    }
+    let _ = blob::release(b).wait()
+    Ok(out)
+}
+
+fn next(r: mut Reader) -> u32 {
+    match r.read_u32() {
+        Ok(x) => x,
+        Err(_) => 0,
+    }
+}
+
+/// A clip's poses and their rate.
+struct Clip: Clone {
+    name: String,
+    rate: f32,
+    poses: Vec<P>,
+}
+
+fn load(name: str) -> Result<Clip, ToolError> {
+    let bytes = read_all(f"poses/creature/{name}.pose")?
+    var r = Reader::new(take bytes)
+    for _ in 0..4 {
+        let _ = r.read_u8()
+    }
+    let _version = r.read_u32()
+    let d = next(mut r)
+    let n = next(mut r)
+    let rate = bitcast_f32(next(mut r))
+    if d != FREEDOM {
+        return Err(ToolError::new(f"{name}: {d} numbers, not {FREEDOM}"))
+    }
+    var poses: Vec<P> = Vec::with_capacity(n)
+    for _ in 0..n {
+        var x = [0.0; 7]
+        for k in 0..7 {
+            x[k] = bitcast_f32(next(mut r))
+        }
+        var p: P = Pose {
+            root: Frame { q: Quat { v: vec4(x[3], x[4], x[5], x[6]) }, t: vec3(x[0], x[1], x[2]) },
+            q: [0.0; FREEDOM],
+        }
+        for k in 0..FREEDOM {
+            p.q[k] = bitcast_f32(next(mut r))
+        }
+        poses.push(p)
+    }
+    Ok(Clip { name: name.to_string(), rate, poses })
+}
+
+/// The names of the clips of a set (`split/SET.txt`).
+fn set(name: str) -> Result<Vec<String>, ToolError> {
+    let bytes = files::read(f"split/{name}.txt").wait()?
+    let Some(text) = String::from_utf8(take bytes) else { return Err(ToolError::new("not UTF-8")) }
+    var out: Vec<String> = Vec::new()
+    let t = text.as_str()
+    for (a, b) in t.lines() {
+        let line = t.slice(a, b).trim()
+        if line.len() > 0 && !line.starts_with("#") {
+            out.push(line.to_string())
+        }
+    }
+    Ok(out)
+}
+
+// ---- damage ---------------------------------------------------------------------------------------
+
+/// The pose between `a` and `b` (`u` of the way).
+fn between(a: P, b: P, u: f32) -> P {
+    var p = a
+    p.root = Frame { q: a.root.q.nlerp(b.root.q, u), t: mix(a.root.t, b.root.t, vec3(u)) }
+    for k in 0..FREEDOM {
+        p.q[k] = mix(a.q[k], b.q[k], u)
+    }
+    p
+}
+
+/// The clip played `by` times as fast.
+fn faster(poses: Vec<P>, by: f32) -> Vec<P> {
+    var out: Vec<P> = Vec::new()
+    let n = poses.len()
+    var t = 0.0
+    while t <= f32(n - 1) {
+        let i = min(u32(floor(t)), n - 2)
+        out.push(between(poses[i], poses[i + 1], t - f32(i)))
+        t += by
+    }
+    out
+}
+
+/// The root slid along x at `speed` (m/s).
+fn slid(poses: Vec<P>, rate: f32, speed: f32) -> Vec<P> {
+    var out = poses.clone()
+    for f in 0..out.len() {
+        out[f].root.t.x += speed * f32(f) / rate
+    }
+    out
+}
+
+/// A normal random number from `seed` (Box and Muller).
+fn normal(seed: u32) -> f32 {
+    let a = (f32(pcg(seed.wrapping_mul(2654435761).wrapping_add(1)) >> 8) + 0.5) / 16777216.0
+    let b = (f32(pcg(seed.wrapping_mul(2246822519).wrapping_add(7)) >> 8) + 0.5) / 16777216.0
+    sqrt(-2.0 * log(a)) * cos(6.2831853 * b)
+}
+
+/// Each number moved by noise of `sigma` rad, frame by frame.
+fn noisy(poses: Vec<P>, sigma: f32) -> Vec<P> {
+    var out = poses.clone()
+    for f in 0..out.len() {
+        for k in 0..FREEDOM {
+            out[f].q[k] += sigma * normal(f * 131 + k * 7919 + 17)
+        }
+    }
+    out
+}
+
+/// The root `by` m higher.
+fn raised(poses: Vec<P>, by: f32) -> Vec<P> {
+    var out = poses.clone()
+    for f in 0..out.len() {
+        out[f].root.t.y += by
+    }
+    out
+}
+
+/// The first pose held for the clip's length.
+fn still(poses: Vec<P>) -> Vec<P> {
+    var out: Vec<P> = Vec::new()
+    for _ in 0..poses.len() {
+        out.push(poses[0])
+    }
+    out
+}
+
+// ---- scores -----------------------------------------------------------------------------------
+
+/// What one movement scored: its measures, its distance from the training clips' statistics, and
+/// its goal error (the root's speed against the clean clip's mean speed and way).
+struct Scored: Copy {
+    m: Measures,
+    distance: f32,
+    goal: f32,
+}
+
+fn scored(
+    poses: Vec<P>,
+    rate: f32,
+    reference: Stats<FREEDOM>,
+    goals: Vec<vec2>,
+    stride: f32,
+) -> Scored {
+    let m = judge(BODY, MASSES, PARTS, half_space(vec3(0.0, 1.0, 0.0), 0.0), poses.clone(), rate)
+    var st = no_stats()
+    add_stats(mut st, poses.clone(), rate)
+    Scored {
+        m,
+        distance: stats_distance(st, reference),
+        goal: velocity_error(poses, rate, goals, stride),
+    }
+}
+
+/// The measures a score is made of, each over its target (the calibration's), summed: 0 is a
+/// movement with nothing wrong, 1 a measure at its target.
+const MEASURES: u32 = 8
+
+fn values(s: Scored) -> [f32; MEASURES] {
+    [
+        s.m.residual,
+        s.m.torque_over,
+        s.m.slide,
+        s.m.penetration,
+        s.m.float,
+        max(s.m.range_most, 0.0),
+        s.distance,
+        s.goal,
+    ]
+}
+
+const NAMES: [Text; MEASURES] = [
+    "root residual (share of weight)",
+    "torque over strength (share)",
+    "slide in contact (mm/s)",
+    "penetration (mm)",
+    "float (mm)",
+    "out of range (rad)",
+    "distance from capture",
+    "goal error (m/s: the root's velocity against the clip's own over 1 s)",
+]
+
+fn score(v: [f32; MEASURES], target: [f32; MEASURES]) -> f32 {
+    var s = 0.0
+    for i in 0..MEASURES {
+        s += v[i] / max(target[i], 1.0e-6)
+    }
+    s
+}
+
+fn print_measures(name: str, s: Scored) {
+    let v = values(s)
+    print(
+        f"{name}: residual {v[0]} torque {v[1]} slide {v[2]} pen {v[3]} float {v[4]} range {v[5]} dist {v[6]} goal {v[7]} | speed {s.m.speed} energy {s.m.energy} duty {s.m.duty} flight {s.m.flight}",
+    )
+}
+
+/// The training clips' statistics (at most `most` of them).
+fn reference(most: u32) -> Result<Stats<FREEDOM>, ToolError> {
+    let names = set("training")?
+    var st = no_stats()
+    let step = max(names.len() / most, 1)
+    var i = 0
+    while i < names.len() {
+        let c = load(names[i].as_str())?
+        add_stats(mut st, c.poses, c.rate)
+        i += step
+    }
+    Ok(st)
+}
+
+fn calibrate(most: u32) -> Result<u32, ToolError> {
+    let names = set("calibration")?
+    let refs = reference(120)?
+    print(f"judge: the training clips' statistics over {refs.count} frames")
+    // Each clip and its damaged copies: the kinds, each at three amounts (the body that does not
+    // move at one).
+    let kinds = ["faster", "slid", "noisy", "raised", "still"]
+    let amounts = [
+        vec3(1.25, 1.5, 2.0),
+        vec3(0.2, 0.5, 1.0),
+        vec3(0.02, 0.05, 0.1),
+        vec3(0.02, 0.05, 0.1),
+        vec3(1.0, 1.0, 1.0),
+    ]
+    var clean: Vec<[f32; MEASURES]> = Vec::new()
+    var damaged: Vec<[f32; MEASURES]> = Vec::new()
+    var timing = 0.0
+    var seconds = 0.0
+    let count = min(most, names.len())
+    for ci in 0..count {
+        let c = load(names[ci].as_str())?
+        let goals = velocity_goals(c.poses.clone(), c.rate, 1.0)
+        let t0 = now()
+        let s0 = scored(c.poses.clone(), c.rate, refs, goals.clone(), 1.0)
+        timing += f32(now() - t0)
+        seconds += f32(c.poses.len()) / c.rate
+        print_measures(f"{c.name} clean", s0)
+        clean.push(values(s0))
+        for k in 0..5 {
+            for a in 0..3 {
+                if k == 4 && a > 0 {
+                    continue
+                }
+                let amount = amounts[k][a]
+                let poses = if k == 0 { faster(c.poses.clone(), amount) } else if k == 1 {
+                    slid(c.poses.clone(), c.rate, amount)
+                } else if k == 2 { noisy(c.poses.clone(), amount) } else if k == 3 {
+                    raised(c.poses.clone(), amount)
+                } else { still(c.poses.clone()) }
+                let stride = if k == 0 { amount } else { 1.0 }
+                let s = scored(poses, c.rate, refs, goals.clone(), stride)
+                print_measures(f"{c.name} {kinds[k]} {amount}", s)
+                damaged.push(values(s))
+            }
+        }
+    }
+    print(f"judge: {timing * 1000.0 / max(seconds, 1.0e-6)} ms a second of movement")
+    // The targets: the 95th percentile of each measure over the clean clips (a clean clip passes),
+    // or a floor where that is 0.
+    let floors = [0.02, 0.02, 20.0, 2.0, 2.0, 0.01, 0.2, 0.05]
+    var target = [0.0; MEASURES]
+    for i in 0..MEASURES {
+        var xs: Vec<f32> = Vec::new()
+        for v in clean {
+            xs.push(v[i])
+        }
+        xs.sort_by(|a, b| a < b)
+        let p95 = xs[min(u32(f32(xs.len()) * 0.95), xs.len() - 1)]
+        target[i] = max(p95, floors[i])
+        print(f"judge: target {NAMES[i]}: {target[i]} (the clean clips' 95th percentile {p95})")
+    }
+    // The pairs: each clean clip against each of its damaged copies.
+    let per = 13
+    var better = 0
+    var pairs = 0
+    var by_kind = [vec2(0.0); 5]
+    var monotone = [0; 5]
+    var monotone_of = [0; 5]
+    for ci in 0..clean.len() {
+        let s_clean = score(clean[ci], target)
+        var idx = ci * per
+        for k in 0..5 {
+            let n = if k == 4 { 1 } else { 3 }
+            var last = s_clean
+            var rising = true
+            for _ in 0..n {
+                let s = score(damaged[idx], target)
+                pairs += 1
+                by_kind[k] += vec2(if s > s_clean { 1.0 } else { 0.0 }, 1.0)
+                if s > s_clean {
+                    better += 1
+                }
+                if s <= last {
+                    rising = false
+                }
+                last = s
+                idx += 1
+            }
+            if n > 1 {
+                monotone_of[k] += 1
+                if rising {
+                    monotone[k] += 1
+                }
+            }
+        }
+    }
+    print(
+        f"judge: the capture scored better in {better} of {pairs} pairs ({100.0 * f32(better) / f32(max(pairs, 1))}%)",
+    )
+    for k in 0..5 {
+        print(
+            f"judge:   {kinds[k]}: {by_kind[k].x} of {by_kind[k].y} better; worse with more damage in {monotone[k]} of {monotone_of[k]} clips",
+        )
+    }
+    Ok(0)
+}
+
+pub fn tool() -> u32 {
+    let a = args()
+    if a.len() < 1 {
+        print("usage: judge calibrate [CLIPS] | one SOURCE/CLIP")
+        return 2
+    }
+    let what = a[0].as_str()
+    if what == "calibrate" {
+        let most = if a.len() > 1 { a[1].as_str().parse_u32().unwrap_or(1000) } else { 1000 }
+        match calibrate(most) {
+            Ok(_) => 0,
+            Err(e) => {
+                print(f"judge: {e.message()}")
+                1
+            },
+        }
+    } else if what == "feet" && a.len() > 1 {
+        let Ok(c) = load(a[1].as_str()) else { return 1 }
+        // Each foot part's lowest sample point: its height and how fast it moves along the ground
+        // in the frames it is within 2 cm of it.
+        for part in [8, 15] {
+            var speeds: Vec<f32> = Vec::new()
+            var low = 0
+            for f in 1..c.poses.len() - 1 {
+                let (fa, fb, fc) = (
+                    BODY.places(c.poses[f - 1]),
+                    BODY.places(c.poses[f]),
+                    BODY.places(c.poses[f + 1]),
+                )
+                let cone = PARTS[part]
+                var best = 1.0e9
+                var v = 0.0
+                for k in 0..3 {
+                    let u = f32(k) * 0.5
+                    let seg = if u < 0.5 { cone.a.on } else { cone.b.on }
+                    let (a0, b0) = cone.placed(fb)
+                    let centre = mix(a0, b0, vec3(u))
+                    let r = mix(cone.ra, cone.rb, u)
+                    let h = centre.y - r
+                    if h < best {
+                        best = h
+                        let local = fb[seg].inverse().apply(centre - vec3(0.0, r, 0.0))
+                        let d = fc[seg].apply(local) - fa[seg].apply(local)
+                        v = length(vec2(d.x, d.z)) * c.rate * 0.5
+                    }
+                }
+                if best < 0.02 {
+                    speeds.push(v)
+                    low += 1
+                }
+            }
+            speeds.sort_by(|x, y| x < y)
+            let m = speeds.len()
+            if m > 0 {
+                print(
+                    f"feet: part {part}: {low} low frames, speed (mm/s) median {1000.0 * speeds[m / 2]} p25 {1000.0 * speeds[m / 4]} p75 {1000.0 * speeds[3 * m / 4]}",
+                )
+            }
+        }
+        0
+    } else if what == "dump" && a.len() > 1 {
+        // Each inner frame's joint moments and contact forces (`judge_into`'s detail), for the
+        // simulator's inverse dynamics to be held to (tools/movement/check_dynamics.py):
+        // `out/CLIP.dyn`: u32 frames, u32 segments, then each frame's 3 S vectors (f32 x, y, z).
+        let Ok(c) = load(a[1].as_str()) else { return 1 }
+        var forces: Vec<vec3> = Vec::new()
+        var detail: Vec<vec3> = Vec::new()
+        let _ = judge_into(
+            BODY,
+            MASSES,
+            PARTS,
+            half_space(vec3(0.0, 1.0, 0.0), 0.0),
+            c.poses.clone(),
+            c.rate,
+            mut forces,
+            mut detail,
+            true,
+        )
+        var w = Writer::new()
+        w.write_u32(forces.len())
+        w.write_u32(world::creature_segments::SEGMENTS)
+        for v in detail {
+            w.write_u32(bitcast_u32(v.x))
+            w.write_u32(bitcast_u32(v.y))
+            w.write_u32(bitcast_u32(v.z))
+        }
+        let bytes = take w.into_bytes()
+        let b = match blob::new().wait() {
+            Ok(b) => b,
+            Err(_) => return 1,
+        }
+        var at = 0
+        while at < bytes.len() {
+            let end = min(at + 524288, bytes.len())
+            var part: Vec<u8> = Vec::new()
+            for i in at..end {
+                part.push(bytes[i])
+            }
+            let _ = blob::append(b, part).wait()
+            at = end
+        }
+        let _ = files::write_blob(f"out/{a[1]}.dyn", b).wait()
+        print(f"dump: {forces.len()} frames")
+        0
+    } else if what == "walk" {
+        // Today's walk cycle (rules::walk), 4 s at 30 frames a second: in place, as the scenes
+        // play it, and with its root carried along by its travel.
+        let w = rules::walk::walk()
+        for moving in [false, true] {
+            var poses: Vec<P> = Vec::new()
+            for i in 0..120 {
+                let t = f32(i) / 30.0
+                var p = w.pose(t)
+                if moving {
+                    p.root.t += w.travel * (t / w.period)
+                }
+                poses.push(p)
+            }
+            let goals = velocity_goals(poses.clone(), 30.0, 1.0)
+            let s = scored(poses, 30.0, no_stats(), goals, 1.0)
+            print_measures(if moving { "the walk, carried by its travel" } else {
+                "the walk, in place"
+            }, s)
+        }
+        0
+    } else if what == "one" && a.len() > 1 {
+        match load(a[1].as_str()) {
+            Ok(c) => {
+                let goals = velocity_goals(c.poses.clone(), c.rate, 1.0)
+                let s = scored(c.poses.clone(), c.rate, no_stats(), goals, 1.0)
+                print_measures(c.name.as_str(), s)
+                0
+            },
+            Err(e) => {
+                print(f"judge: {e.message()}")
+                1
+            },
+        }
+    } else {
+        2
+    }
+}

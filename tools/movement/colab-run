@@ -376,7 +376,22 @@ def remote_launch(run, sname, resume_name):
         f"open('{REMOTE}/job.pid', 'w').write(str(p.pid))\n"
         "print('LAUNCHED', p.pid)\n"
     )
-    out = colab(["exec", "-s", sname, "--timeout", "60"], timeout=120, input_text=code)
+    # The exec that starts the job can hang (twice on 2026-11-25, a fresh session's first
+    # minutes): tried again on the same session, unless the job's pid file says it started.
+    out = ""
+    for attempt in range(3):
+        try:
+            out = colab(["exec", "-s", sname, "--timeout", "60"], timeout=120, input_text=code)
+            break
+        except ColabError as e:
+            if e.gone:
+                raise
+            say(f"the launch's exec failed (try {attempt + 1}): {str(e).splitlines()[-1] if str(e) else e}")
+            check = colab(["exec", "-s", sname, "--timeout", "30"], timeout=60,
+                          input_text=f"import os; print('PIDFILE', os.path.exists('{REMOTE}/job.pid'))\n")
+            if "PIDFILE True" in check:
+                out = "LAUNCHED 0"
+                break
     m = re.search(r"LAUNCHED (\d+)", out)
     if not m:
         raise ColabError("the job did not start: " + out[-400:])
@@ -456,6 +471,15 @@ def close_session(run, reason):
     save(run)
 
 
+def write_row(run, state):
+    """Adds the run's row to the plan's table of units, or updates nothing if it has one."""
+    if run.get("row_written"):
+        return
+    what = f"`{run['name']}` ({run['gpu']}): {run.get('note') or run['script']}, {state}"
+    plan_add_row(datetime.date.today().isoformat(), what, units(run))
+    run["row_written"] = True
+
+
 def finish(run, state, args):
     run["state"] = state
     run["units"] = units(run)
@@ -465,11 +489,8 @@ def finish(run, state, args):
         say(f"sessions left after the run: {left}")
     else:
         say("`colab sessions` shows no session of ours")
-    if not run.get("row_written"):
-        what = f"`{run['name']}` ({run['gpu']}): {run.get('note') or run['script']}, {state}"
-        plan_add_row(datetime.date.today().isoformat(), what, run["units"])
-        run["row_written"] = True
-        save(run)
+    write_row(run, state)
+    save(run)
     say(f"run {run['name']}: {state}, {run['units']:.3f} units, "
         f"{len(run['sessions'])} session(s), {run.get('start_tries', 0)} start tries, "
         f"{run.get('poll_failures', 0)} failed polls")
@@ -500,6 +521,7 @@ def follow(run, args):
             close_session(run, "signal")
             run["state"] = "stopped"
             run["units"] = units(run)
+            write_row(run, "stopped by a signal")
             save(run)
             return
         sname = run.get("session")
@@ -643,6 +665,7 @@ def cmd_stop(args):
     close_session(run, "stopped by `colab-run stop`")
     run["state"] = "stopped"
     run["units"] = units(run)
+    write_row(run, "stopped")
     save(run)
     say(f"run {args.run} stopped at checkpoint {run.get('ckpt')}; {run['units']:.3f} units")
 

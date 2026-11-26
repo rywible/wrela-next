@@ -1,0 +1,664 @@
+// The judge of movement (docs/plans/bodies-and-movement.md, phase 3): numbers that say whether a
+// movement of a body is physically possible and whether it looks alive, so that no agent decides
+// it by eye. It reads only a sequence of poses, the body's declaration (its joints, its masses, its
+// round-cone parts) and the field of the world; never the solver, the tracker or their weights.
+//
+// Inverse dynamics. Each segment's centre of mass and turn come from the poses
+// (`Body::places`); their velocities and accelerations from central differences. What the body's
+// movement needs from outside, as a force and a moment about its centre of mass, is the sum over
+// its segments of `m (a - g)` and of the change of each segment's angular momentum.
+//
+// Contacts. A part touches the world where the world's field is within `TOUCH` of it (each
+// round-cone part's two ends and middle, on its side toward the world). Each contact can only
+// push, inside a cone of friction `FRICTION` (a pyramid of four edges). The contact forces are the
+// ones that leave the least of the needed force and moment unexplained, found by a few sweeps of
+// projected coordinate descent (`SWEEPS`, a fixed number), first with each point's force weighed
+// against how fast it slides along the world (`SLIDING`), then, from there, with none: a point
+// that slides holds weight only where no standing point can, so a swing foot that skims the ground
+// is not taken for the one that bears the weight, and a body dragged along the ground slides. What
+// the forces leave is the root residual: a force (and a moment) that only a hand at the root could
+// give.
+//
+// Joint torques. With the contact forces, each joint's force and moment come from the leaves to the
+// root (recursive Newton-Euler), and each number's torque is the moment about its axis, held to
+// its strength.
+
+use body::body::{Body, Pose}
+use body::joint::{Frame, Kind, vector_of_turn}
+use body::mass::Mass
+use body::skin::Cone
+use std::collections::Vec
+use std::field::Surface
+
+/// Gravity (m/s²).
+pub const GRAVITY: vec3 = vec3(0.0, -9.81, 0.0)
+
+/// How near the world a part touches it (m), and the slope of the cone of friction.
+pub const TOUCH: f32 = 0.02
+pub const FRICTION: f32 = 0.8
+
+/// How many sweeps the search for the contact forces makes, each over every edge of every contact.
+pub const SWEEPS: u32 = 40
+
+/// The speed (m/s) along the world at which a contact point's force costs as much as the weight
+/// it would leave unexplained: the cost of force f at a point sliding at v is (v / SLIDING)² f².
+pub const SLIDING: f32 = 0.1
+
+/// A frame's force on a contact point carries weight when it is more than this share of the
+/// body's weight.
+const CARRIES: f32 = 0.05
+
+/// What the judge says of a movement. Each mean is over the movement's inner frames (its first
+/// and last have no central difference).
+pub struct Measures: Copy {
+    /// The root residual: the force no contact can give, as a share of the body's weight (its mean
+    /// and its most), and its moment as a share of the weight times the body's height.
+    pub residual: f32,
+    pub residual_most: f32,
+    pub residual_moment: f32,
+    /// A joint's torque past its strength, as a share of the strength: the mean over frames of the
+    /// worst number's share past 1 (0 when none is past), and the most of any.
+    pub torque_over: f32,
+    pub torque_over_most: f32,
+    /// How fast a part slides along the world where it carries weight (mm/s), weighed by the
+    /// force on it.
+    pub slide: f32,
+    /// How deep a part goes into the world (mm): the mean of each frame's deepest, and the most.
+    pub penetration: f32,
+    pub penetration_most: f32,
+    /// How far above the world the body is while it needs the world to hold it up (mm): the mean
+    /// over frames that need it of the nearest part's height, and the most.
+    pub float: f32,
+    pub float_most: f32,
+    /// The most any joint goes past its range (its range field, rad; negative: inside).
+    pub range_most: f32,
+    /// The root's mean speed along the ground (m/s), how far it went (m), and the energy each
+    /// metre: the joints' positive and negative work over the distance and the body's weight.
+    pub speed: f32,
+    pub distance: f32,
+    pub energy: f32,
+    /// The share of frames the part most often in contact touches, and the share in which no
+    /// part touches (flight).
+    pub duty: f32,
+    pub flight: f32,
+    /// The body's mass (kg).
+    pub mass: f32,
+    /// How many inner frames were judged.
+    pub frames: u32,
+}
+
+/// The candidate contact points of a frame: each cone's two ends and middle, on its side toward
+/// the world, as a segment's point (`seg`, `local`), with its distance from the world (negative:
+/// in it) and the world's normal there.
+struct Touch: Copy {
+    seg: u32,
+    local: vec3,
+    world: vec3,
+    distance: f32,
+    normal: vec3,
+}
+
+fn touches<const S: u32, const P: u32, W: Surface>(
+    at: [Frame; S],
+    cones: [Cone; P],
+    world: W,
+    out: mut Vec<Touch>,
+) {
+    out.clear()
+    for c in cones {
+        let (a, b) = c.placed(at)
+        for k in 0..3 {
+            let u = f32(k) * 0.5
+            let centre = mix(a, b, vec3(u))
+            let r = mix(c.ra, c.rb, u)
+            let d = world.distance(centre)
+            let g = world.gradient(centre)
+            let n = if length(g) > 1.0e-6 { normalize(g) } else { vec3(0.0, 1.0, 0.0) }
+            let p = centre - n * r
+            // The point as a point of the segment it is on (the nearer end's).
+            let seg = if u < 0.5 { c.a.on } else { c.b.on }
+            out.push(
+                Touch {
+                    seg,
+                    local: at[seg].inverse().apply(p),
+                    world: p,
+                    distance: d - r,
+                    normal: n,
+                },
+            )
+        }
+    }
+}
+
+/// Four unit edges of the cone of friction about `n`.
+fn edges(n: vec3) -> [vec3; 4] {
+    let t0 = normalize(if abs(n.x) < 0.9 { cross(n, vec3(1.0, 0.0, 0.0)) } else {
+        cross(n, vec3(0.0, 0.0, 1.0))
+    })
+    let t1 = cross(n, t0)
+    [
+        normalize(n + t0 * FRICTION),
+        normalize(n - t0 * FRICTION),
+        normalize(n + t1 * FRICTION),
+        normalize(n - t1 * FRICTION),
+    ]
+}
+
+/// Each segment's angular velocity between frames `a` and `b`, `dt` apart.
+fn spin(a: Frame, b: Frame, dt: f32) -> vec3 {
+    vector_of_turn(b.q.mul(a.q.inverse())) / dt
+}
+
+/// Inertia `i` (in a segment's frame) about the world's axes, the segment turned by `q`.
+fn in_world(i: mat3, q: std::quat::Quat) -> mat3 {
+    let r = q.to_mat3()
+    // r i rᵀ: its columns r (i (rᵀ e_k)).
+    let rt0 = vec3(r[0].x, r[1].x, r[2].x)
+    let rt1 = vec3(r[0].y, r[1].y, r[2].y)
+    let rt2 = vec3(r[0].z, r[1].z, r[2].z)
+    mat3(r * (i * rt0), r * (i * rt1), r * (i * rt2))
+}
+
+/// Judges `poses` of `body` (`rate` a second; its masses `masses`, its parts `cones`) in `world`.
+pub fn judge<const S: u32, const D: u32, const P: u32, W: Surface>(
+    body: Body<S>,
+    masses: [Mass; S],
+    cones: [Cone; P],
+    world: W,
+    poses: Vec<Pose<D>>,
+    rate: f32,
+) -> Measures {
+    var forces: Vec<vec3> = Vec::new()
+    var detail: Vec<vec3> = Vec::new()
+    judge_into(body, masses, cones, world, poses, rate, mut forces, mut detail, false)
+}
+
+/// `judge`, and the world's force on the body (the sum of its contacts' forces, N) at each inner
+/// frame, into `forces`: what a force plate under it would measure. With `detailed`, each inner
+/// frame's `3 S` vectors into `detail`: each joint's moment (N m, about the joint, the world's
+/// axes: what the parent's side gives the child's), then each segment's contact force and the
+/// contact force's moment about the segment's origin; what the simulator's inverse dynamics is
+/// held to (tools/movement/check_dynamics.py).
+pub fn judge_into<const S: u32, const D: u32, const P: u32, W: Surface>(
+    body: Body<S>,
+    masses: [Mass; S],
+    cones: [Cone; P],
+    world: W,
+    poses: Vec<Pose<D>>,
+    rate: f32,
+    forces: mut Vec<vec3>,
+    detail: mut Vec<vec3>,
+    detailed: bool,
+) -> Measures {
+    forces.clear()
+    detail.clear()
+    let n = poses.len()
+    let dt = 1.0 / rate
+    var total = 0.0
+    for m in masses {
+        total += m.mass
+    }
+    let weight = total * length(GRAVITY)
+    var out = Measures {
+        residual: 0.0,
+        residual_most: 0.0,
+        residual_moment: 0.0,
+        torque_over: 0.0,
+        torque_over_most: 0.0,
+        slide: 0.0,
+        penetration: 0.0,
+        penetration_most: 0.0,
+        float: 0.0,
+        float_most: 0.0,
+        range_most: -1.0e9,
+        speed: 0.0,
+        distance: 0.0,
+        energy: 0.0,
+        duty: 0.0,
+        flight: 0.0,
+        mass: total,
+        frames: 0,
+    }
+    if n < 3 {
+        return out
+    }
+    // Each frame's segments, once.
+    var frames: Vec<[Frame; S]> = Vec::with_capacity(n)
+    for p in poses {
+        frames.push(body.places(p))
+    }
+    // The body's height at rest-ish: its first frame's span of segment origins, for the moment's
+    // share.
+    var lo_y = 1.0e9
+    var hi_y = -1.0e9
+    for s in 0..S {
+        lo_y = min(lo_y, frames[0][s].t.y)
+        hi_y = max(hi_y, frames[0][s].t.y)
+    }
+    let height = max(hi_y - lo_y, 0.1)
+    var t_prev: Vec<Touch> = Vec::new()
+    var t_now: Vec<Touch> = Vec::new()
+    var t_next: Vec<Touch> = Vec::new()
+    var lambda: Vec<f32> = Vec::new()
+    var cost: Vec<f32> = Vec::new()
+    var cols_f: Vec<vec3> = Vec::new()
+    var cols_m: Vec<vec3> = Vec::new()
+    var touching = [0.0; 64]
+    var slide_sum = 0.0
+    var slide_w = 0.0
+    var float_frames = 0.0
+    var flight = 0.0
+    var energy = 0.0
+    for f in 1..n - 1 {
+        let (a, b, c) = (frames[f - 1], frames[f], frames[f + 1])
+        // Each segment: its centre's acceleration, its spin and its spin's change.
+        var acc = [vec3(0.0); S]
+        var centre = [vec3(0.0); S]
+        var torque_c = [vec3(0.0); S]
+        var w_now = [vec3(0.0); S]
+        var need_f = vec3(0.0)
+        var com = vec3(0.0)
+        for s in 0..S {
+            let m = masses[s]
+            let (ca, cb, cc) = (a[s].apply(m.centre), b[s].apply(m.centre), c[s].apply(m.centre))
+            centre[s] = cb
+            acc[s] = (ca - 2.0 * cb + cc) / (dt * dt)
+            let w0 = spin(a[s], b[s], dt)
+            let w1 = spin(b[s], c[s], dt)
+            let w = 0.5 * (w0 + w1)
+            w_now[s] = w
+            let alpha = (w1 - w0) / dt
+            let iw = in_world(m.inertia, b[s].q)
+            torque_c[s] = iw * alpha + cross(w, iw * w)
+            need_f += (acc[s] - GRAVITY) * m.mass
+            com += cb * m.mass
+        }
+        com = com / max(total, 1.0e-6)
+        // What the movement needs from outside: a force, and a moment about the centre of mass.
+        var need_m = vec3(0.0)
+        for s in 0..S {
+            need_m += torque_c[s] + cross(centre[s] - com, (acc[s] - GRAVITY) * masses[s].mass)
+        }
+        // The contacts and their forces.
+        touches(b, cones, world, mut t_now)
+        touches(a, cones, world, mut t_prev)
+        touches(c, cones, world, mut t_next)
+        cols_f.clear()
+        cols_m.clear()
+        lambda.clear()
+        cost.clear()
+        var deepest = 0.0
+        var nearest = 1.0e9
+        for k in 0..t_now.len() {
+            let t = t_now[k]
+            deepest = max(deepest, -t.distance)
+            nearest = min(nearest, t.distance)
+            if t.distance < TOUCH {
+                let s = t.seg
+                let v = (c[s].apply(t.local) - a[s].apply(t.local)) / (2.0 * dt)
+                let along = v - t.normal * dot(v, t.normal)
+                let slide = length(along) / SLIDING
+                for e in edges(t.normal) {
+                    cols_f.push(e)
+                    cols_m.push(cross(t.world - com, e))
+                    lambda.push(0.0)
+                    cost.push(slide * slide)
+                }
+            } else {
+                for _ in 0..4 {
+                    cols_f.push(vec3(0.0))
+                    cols_m.push(vec3(0.0))
+                    lambda.push(0.0)
+                    cost.push(0.0)
+                }
+            }
+        }
+        // Projected coordinate descent on |A λ - need|², λ >= 0; the moment's rows weighed by
+        // 1 / height so a newton and a newton-metre over the body's height count alike.
+        let wm = 1.0 / height
+        var rf = -need_f
+        var rm = -need_m * wm
+        for sweep in 0..2 * SWEEPS {
+            let weighed = if sweep < SWEEPS { 1.0 } else { 0.0 }
+            for j in 0..lambda.len() {
+                let (cf, cm) = (cols_f[j], cols_m[j] * wm)
+                let cj = cost[j] * weighed
+                let nn = dot(cf, cf) + dot(cm, cm) + cj
+                if nn <= 0.0 || dot(cf, cf) <= 0.0 {
+                    continue
+                }
+                let g = dot(cf, rf) + dot(cm, rm) + cj * lambda[j]
+                let next = max(0.0, lambda[j] - g / nn)
+                let d = next - lambda[j]
+                if d != 0.0 {
+                    rf += cf * d
+                    rm += cm * d
+                    lambda[j] = next
+                }
+            }
+        }
+        let res_f = length(rf) / weight
+        let res_m = length(rm / wm) / (weight * height)
+        out.residual += res_f
+        out.residual_most = max(out.residual_most, res_f)
+        out.residual_moment += res_m
+        out.penetration += deepest
+        out.penetration_most = max(out.penetration_most, deepest)
+        // Floating: the movement needs the world to hold it up (more than a fifth of its weight
+        // upward), and no part is within `TOUCH`.
+        if dot(need_f, vec3(0.0, 1.0, 0.0)) > 0.2 * weight && nearest > TOUCH {
+            out.float += nearest
+            out.float_most = max(out.float_most, nearest)
+            float_frames += 1.0
+        }
+        // Each contact's force, and its slide where it carries weight.
+        var any = false
+        var contact_f = [vec3(0.0); S]
+        var contact_m = [vec3(0.0); S]
+        var on_cone = [0.0; 64]
+        for k in 0..t_now.len() {
+            var fk = vec3(0.0)
+            for e in 0..4 {
+                fk += cols_f[4 * k + e] * lambda[4 * k + e]
+            }
+            if length(fk) > CARRIES * weight {
+                any = true
+                on_cone[min(k / 3, 63)] = 1.0
+                // The material point's velocity along the world.
+                let s = t_now[k].seg
+                let v = (c[s].apply(t_now[k].local) - a[s].apply(t_now[k].local)) / (2.0 * dt)
+                let nrm = t_now[k].normal
+                let along = v - nrm * dot(v, nrm)
+                slide_sum += length(along) * length(fk)
+                slide_w += length(fk)
+            }
+            let s = t_now[k].seg
+            contact_f[s] += fk
+            contact_m[s] += cross(t_now[k].world - b[s].t, fk)
+        }
+        var total_f = vec3(0.0)
+        for s in 0..S {
+            total_f += contact_f[s]
+        }
+        forces.push(total_f)
+        for i in 0..min(P, 64) {
+            touching[i] += on_cone[i]
+        }
+        if !any {
+            flight += 1.0
+        }
+        // Each joint's force and moment, from the leaves to the root.
+        var jf = [vec3(0.0); S]
+        var jm = [vec3(0.0); S]
+        var s = S
+        while s > 0 {
+            s -= 1
+            let m = masses[s]
+            var force = (acc[s] - GRAVITY) * m.mass - contact_f[s]
+            var moment = torque_c[s] +
+                cross(centre[s] - b[s].t, (acc[s] - GRAVITY) * m.mass) -
+                contact_m[s]
+            for k in s + 1..S {
+                if body.segments[k].joint.parent == s {
+                    force += jf[k]
+                    moment += jm[k] + cross(b[k].t - b[s].t, jf[k])
+                }
+            }
+            jf[s] = force
+            jm[s] = moment
+        }
+        if detailed {
+            for k in 0..S {
+                detail.push(jm[k])
+            }
+            for k in 0..S {
+                detail.push(contact_f[k])
+            }
+            for k in 0..S {
+                detail.push(contact_m[k])
+            }
+        }
+        // Each number's torque against its strength, and the work it does.
+        var worst = 0.0
+        for k in 1..S {
+            let j = body.segments[k].joint
+            let q = body.numbers(poses[f], k)
+            out.range_most = max(out.range_most, j.range(q))
+            let nf = j.freedom()
+            if nf == 0 {
+                continue
+            }
+            // The joint's axes in the world: its parent's frame then its own.
+            let axes_q = b[j.parent].q.mul(j.at.q)
+            let rel = w_now[k] - w_now[j.parent]
+            for d in 0..nf {
+                let axis_local = if j.kind == Kind::Hinge ||
+                    (j.kind == Kind::Universal && d == 0) ||
+                    (j.kind == Kind::Ball && d == 0) {
+                    vec3(1.0, 0.0, 0.0)
+                } else if (j.kind == Kind::Universal && d == 1) ||
+                    (j.kind == Kind::Ball && d == 2) {
+                    vec3(0.0, 1.0, 0.0)
+                } else { vec3(0.0, 0.0, 1.0) }
+                let axis = axes_q.rotate(axis_local)
+                let tq = dot(jm[k], axis)
+                let st = max(j.strength[d], 1.0e-6)
+                worst = max(worst, abs(tq) / st - 1.0)
+                energy += abs(tq * dot(rel, axis)) * dt
+            }
+        }
+        let over = max(worst, 0.0)
+        out.torque_over += over
+        out.torque_over_most = max(out.torque_over_most, over)
+        out.frames += 1
+    }
+    let k = f32(max(out.frames, 1))
+    out.residual = out.residual / k
+    out.residual_moment = out.residual_moment / k
+    out.torque_over = out.torque_over / k
+    out.penetration = 1000.0 * out.penetration / k
+    out.penetration_most = 1000.0 * out.penetration_most
+    out.float = if float_frames > 0.0 { 1000.0 * out.float / float_frames } else { 0.0 }
+    out.float_most = 1000.0 * out.float_most
+    out.slide = if slide_w > 0.0 { 1000.0 * slide_sum / slide_w } else { 0.0 }
+    var most_touch = 0.0
+    for i in 0..min(P, 64) {
+        most_touch = max(most_touch, touching[i])
+    }
+    out.duty = most_touch / k
+    out.flight = flight / k
+    // The root's travel along the ground.
+    var dist = 0.0
+    for f in 1..n {
+        let d = frames[f][0].t - frames[f - 1][0].t
+        dist += length(vec2(d.x, d.z))
+    }
+    out.distance = dist
+    out.speed = dist / (f32(n - 1) * dt)
+    out.energy = if dist > 0.01 { energy / (dist * weight) } else { energy / (0.01 * weight) }
+    out
+}
+
+// ---- tests ------------------------------------------------------------------------------------
+
+use body::body::{Segment, body, on}
+use body::joint::{Joint, NONE}
+use body::mass::masses
+use body::skin::End
+use matter::density::density
+use std::field::{half_space, round_cone}
+use std::quat::Quat
+
+/// A body of one segment: a capsule along x, 0.4 m long and 5 cm thick, of water (`lying` the
+/// height of its axis over the ground, `speed` along x, m/s), judged for one second.
+fn lying(height: f32, speed: f32) -> Measures {
+    let one = body(
+        [
+            Segment {
+                joint: Joint {
+                    kind: Kind::Fixed,
+                    parent: NONE,
+                    at: Frame::identity(),
+                    lo: vec3(0.0),
+                    hi: vec3(0.0),
+                    strength: vec3(0.0),
+                },
+                tip: vec3(0.4, 0.0, 0.0),
+            },
+        ],
+    )
+    let cone = Cone {
+        a: End { on: 0, at: vec3(-0.2, 0.0, 0.0) },
+        ra: 0.05,
+        b: End { on: 0, at: vec3(0.2, 0.0, 0.0) },
+        rb: 0.05,
+        span: on(0),
+    }
+    let shape = round_cone(vec3(-0.2, 0.0, 0.0), vec3(0.2, 0.0, 0.0), r_top: 0.05, r_bottom: 0.05)
+        .with(density(1000.0))
+    let rest: Pose<0> = one.rest()
+    let m = masses(one, rest, shape, [on(0)], 0.004)
+    var poses: Vec<Pose<0>> = Vec::new()
+    for i in 0..31 {
+        var p: Pose<0> = one.rest()
+        p.root = Frame { q: Quat::identity(), t: vec3(speed * f32(i) / 30.0, height, 0.0) }
+        poses.push(p)
+    }
+    judge(one, m, [cone], half_space(vec3(0.0, 1.0, 0.0), 0.0), poses, 30.0)
+}
+
+@test
+fn a_body_at_rest_on_the_ground_needs_nothing_more() {
+    let j = lying(0.05, 0.0)
+    assert(j.residual < 0.01, f"residual {j.residual}")
+    assert(
+        j.penetration_most < 0.1 && j.float_most == 0.0 && j.slide < 1.0,
+        f"{j.penetration_most} {j.float_most} {j.slide}",
+    )
+    assert(j.duty > 0.99 && j.flight == 0.0)
+}
+
+@test
+fn a_body_held_up_in_the_air_floats_and_needs_a_hand() {
+    let j = lying(0.15, 0.0)
+    assert(abs(j.float - 100.0) < 1.0, f"float {j.float} mm")
+    assert(abs(j.residual - 1.0) < 0.01, f"residual {j.residual}")
+}
+
+@test
+fn a_body_dragged_along_the_ground_slides() {
+    let j = lying(0.05, 1.0)
+    assert(abs(j.slide - 1000.0) < 10.0, f"slide {j.slide} mm/s")
+    assert(abs(j.speed - 1.0) < 0.01, f"speed {j.speed}")
+}
+
+@test
+fn a_body_pushed_into_the_ground_goes_into_it() {
+    let j = lying(0.03, 0.0)
+    assert(abs(j.penetration - 20.0) < 0.5, f"penetration {j.penetration} mm")
+}
+
+// ---- how far a movement's statistics are from capture's ------------------------------------------
+
+/// The statistics of a movement that capture is held to: for each of its numbers and for the
+/// root's speed along the ground and up, the mean and the spread (standard deviation) of how fast
+/// it changes, summed over frames (`count`, `sum`, `square`), so that the statistics of many clips
+/// add up.
+pub struct Stats<const D: u32>: Copy {
+    pub count: f32,
+    pub sum: [f32; D],
+    pub square: [f32; D],
+    pub root_sum: vec2,
+    pub root_square: vec2,
+}
+
+pub fn no_stats<const D: u32>() -> Stats<D> {
+    Stats {
+        count: 0.0,
+        sum: [0.0; D],
+        square: [0.0; D],
+        root_sum: vec2(0.0),
+        root_square: vec2(0.0),
+    }
+}
+
+/// `poses` (`rate` a second) added to `into`.
+pub fn add_stats<const D: u32>(into: mut Stats<D>, poses: Vec<Pose<D>>, rate: f32) {
+    for f in 1..poses.len() {
+        let (a, b) = (poses[f - 1], poses[f])
+        for k in 0..D {
+            let v = (b.q[k] - a.q[k]) * rate
+            into.sum[k] += v
+            into.square[k] += v * v
+        }
+        let d = (b.root.t - a.root.t) * rate
+        let r = vec2(length(vec2(d.x, d.z)), d.y)
+        into.root_sum += r
+        into.root_square += r * r
+        into.count += 1.0
+    }
+}
+
+fn spread(sum: f32, square: f32, n: f32) -> (f32, f32) {
+    let m = sum / max(n, 1.0)
+    (m, sqrt(max(square / max(n, 1.0) - m * m, 0.0)))
+}
+
+/// How far `a`'s statistics are from `reference`'s: the mean over the numbers and the root's two
+/// of the squared difference of their means over the reference's spread, and of the log of their
+/// spreads' ratio. 0 for the same statistics; a body that does not move is far (its spreads 0).
+pub fn stats_distance<const D: u32>(a: Stats<D>, reference: Stats<D>) -> f32 {
+    let floor = 0.05
+    var d = 0.0
+    for k in 0..D {
+        let (ma, sa) = spread(a.sum[k], a.square[k], a.count)
+        let (mr, sr) = spread(reference.sum[k], reference.square[k], reference.count)
+        let dm = (ma - mr) / (sr + floor)
+        let ds = log((sa + floor) / (sr + floor))
+        d += dm * dm + ds * ds
+    }
+    for k in 0..2 {
+        let (ma, sa) = spread(a.root_sum[k], a.root_square[k], a.count)
+        let (mr, sr) = spread(reference.root_sum[k], reference.root_square[k], reference.count)
+        let dm = (ma - mr) / (sr + floor)
+        let ds = log((sa + floor) / (sr + floor))
+        d += dm * dm + ds * ds
+    }
+    d / f32(D + 2)
+}
+
+/// The goal error of a root velocity: the mean, over the frames, of how far the root's velocity
+/// along the ground (its central difference) is from the goal's at that moment (m/s). `goals[g]`
+/// is the goal at frame `g` of the goals' own clock, and frame `f` of the movement is at
+/// `f * stride` of it.
+pub fn velocity_error<const D: u32>(
+    poses: Vec<Pose<D>>,
+    rate: f32,
+    goals: Vec<vec2>,
+    stride: f32,
+) -> f32 {
+    var e = 0.0
+    let n = poses.len()
+    for f in 1..n - 1 {
+        let d = (poses[f + 1].root.t - poses[f - 1].root.t) * (0.5 * rate)
+        let g = goals[min(u32(round(f32(f) * stride)), goals.len() - 1)]
+        e += length(vec2(d.x, d.z) - g)
+    }
+    e / f32(max(n, 3) - 2)
+}
+
+/// A movement's root velocity along the ground at each frame, averaged over `window` s about it:
+/// the goal that a clip of capture was following.
+pub fn velocity_goals<const D: u32>(poses: Vec<Pose<D>>, rate: f32, window: f32) -> Vec<vec2> {
+    let n = poses.len()
+    let h = max(u32(window * rate * 0.5), 1)
+    var out: Vec<vec2> = Vec::with_capacity(n)
+    for f in 0..n {
+        let a = if f > h { f - h } else { 0 }
+        let b = min(f + h, n - 1)
+        let d = poses[b].root.t - poses[a].root.t
+        let t = max(f32(b - a) / rate, 1.0e-6)
+        out.push(vec2(d.x, d.z) / t)
+    }
+    out
+}

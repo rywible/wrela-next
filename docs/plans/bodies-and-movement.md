@@ -356,6 +356,9 @@ than the balance fell (1.59 written, 1.12 fallen for the tests of 0.5).
 | 2026-11-25 | `l4-a` (L4): the run tool's test: 600 steps of 1 s, no stop (the reference), done | 0.46 |
 | 2026-11-25 | `l4-b` (L4, then T4): the run tool's test; a start cut at 3 s left an L4 and a T4 with no session name, which held the account's one of each, so the run lost its session and found none (the balance's fall, the two orphans included), failed | 0.43 |
 | 2026-11-25 | `l4-c` (L4): the run tool's test: the tool killed, the session stopped, a start cut at 3 s, done | 0.69 |
+| 2026-11-25 | `p4-walk-256` (L4): phase 4 first small run: the neutral walk, 256 bodies, 60 updates, stopped at update 30 of 60: put_data's limits, meant per world, were given for all worlds (1,700 samples a second) | 0.13 |
+| 2026-11-25 | `p4-walk-256b` (L4): phase 4 first small run: the neutral walk, 256 bodies, 60 updates, done | 0.34 |
+| 2026-11-25 | `simspeed-body` (L4): phase 4: the body's step by solver settings and worlds, done | 0.22 |
 
 #### A new machine
 

@@ -1,0 +1,726 @@
+// The judge against measured forces (docs/plans/bodies-and-movement.md, phase 3 step 4): the
+// world's force on a walking person as the judge works it out from the person's movement alone
+// (`engine::judge::movement::judge_into`), against what two force plates under the person measured.
+//
+//     tools/wrela tool tools/movement/forces --read capture=.movement/capture -- TRIAL FROM SECONDS
+//
+// The capture: J. K. Moore, S. K. Hnat and A. van den Bogert, "An elaborate data set on human gait
+// and the effect of mechanical perturbations" (PeerJ 2015; Zenodo 13030, CC0), a trial of walking
+// on an instrumented treadmill with markers on the whole body (`moore2015/TXXX/mocap-XXX.txt`,
+// 100 frames a second, m; its subject's mass and height from `meta-XXX.yml`, given here). The
+// person:
+//
+// - a body of 13 segments (pelvis, trunk, head, each arm in two with the hand on the forearm,
+//   each leg in three), as long as the person's joint centres are apart (their medians over the
+//   window), each segment a capsule as thick as its share of the mass weighs at 1,050 kg/m³ (P. de
+//   Leva 1996's shares, BMClab's copy, as `engine::body::mass`'s test reads them);
+// - its markers low-passed (`smoothed`), and its joint centres from them: each hip by Bell's regression from the pelvis's four
+//   markers (A. L. Bell, R. A. Brand and D. R. Pedersen, Hum. Mov. Sci. 8, 1989: 36% of the
+//   distance between the front of the hips across, 19% back and 30% down), each knee and ankle
+//   half a joint's width in from its outer marker, each elbow and wrist between its two markers,
+//   each shoulder 5 cm below its marker;
+// - each frame's pose fitted to those centres, the heel and toe markers and the head's
+//   (`engine::body::fit`), in the frame of the belt (the belt's speed carries it forward);
+// - the ground: a plane under the feet, at the height the soles stand at (each foot capsule's
+//   lowest point's 5th percentile over the window).
+//
+// It prints the mean and most difference of the judge's force and the plates' (vertical and
+// along the ground), each as a share of the person's weight, and the judge's own measures.
+
+use engine::body::body::{Body, Pose, Segment, body, on}
+use engine::body::fit::{Aim, aim_frame, aim_point, fit}
+use engine::body::joint::{Frame, Joint, Kind, NONE}
+use engine::body::mass::{Mass, masses}
+use engine::body::skin::{Cone, End}
+use engine::judge::movement::{GRAVITY, judge_into}
+use engine::matter::density::density
+use std::collections::Vec
+use std::field::{SmoothUnionAll, half_space, round_cone}
+use std::io::print
+use std::math::PI
+use std::quat::Quat
+use std::tool::{ToolError, args}
+use std::tool::blob
+use std::tool::files
+
+const SEGMENTS: u32 = 13
+const PELVIS: u32 = 0
+const TRUNK: u32 = 1
+const HEAD: u32 = 2
+const UPPER_ARM_L: u32 = 3
+const FOREARM_L: u32 = 4
+const UPPER_ARM_R: u32 = 5
+const FOREARM_R: u32 = 6
+const THIGH_L: u32 = 7
+const SHANK_L: u32 = 8
+const FOOT_L: u32 = 9
+const THIGH_R: u32 = 10
+const SHANK_R: u32 = 11
+const FOOT_R: u32 = 12
+const FREEDOM: u32 = 32
+const PARTS: u32 = 13
+
+/// De Leva's shares of a man's mass: pelvis (lower trunk), the trunk above it, the head, an upper
+/// arm, a forearm and hand, a thigh, a shank, a foot.
+const SHARES: [f32; 8] = [0.1117, 0.3229, 0.0694, 0.0271, 0.0223, 0.1416, 0.0433, 0.0137]
+
+fn read_all(path: str) -> Result<Vec<u8>, ToolError> {
+    let b = files::read_blob(path).wait()?
+    let n = blob::len(b).wait()?
+    var out: Vec<u8> = Vec::with_capacity(u32(n))
+    var at: u64 = 0
+    while at < n {
+        let part = blob::read(b, at, 524288).wait()?
+        at += u64(part.len())
+        for x in part {
+            out.push(x)
+        }
+    }
+    let _ = blob::release(b).wait()
+    Ok(out)
+}
+
+/// The markers this tool reads, in the file's names.
+const MARKERS: [Text; 32] = [
+    "LASIS",
+    "RASIS",
+    "LPSIS",
+    "RPSIS",
+    "LLEK",
+    "RLEK",
+    "LLM",
+    "RLM",
+    "LHEE",
+    "RHEE",
+    "LTOE",
+    "RTOE",
+    "LSHO",
+    "RSHO",
+    "LLEE",
+    "LMEE",
+    "RLEE",
+    "RMEE",
+    "LMW",
+    "LLW",
+    "RMW",
+    "RLW",
+    "C7",
+    "STRN",
+    "T10",
+    "LHEAD",
+    "RHEAD",
+    "FHEAD",
+    "THEAD",
+    "SACR",
+    "LMT5",
+    "RMT5",
+]
+
+/// The window's frames: each marker's place (ours: +x the person's left, +y up, +z the way they
+/// walk; the file's is +x right and +z back, a half turn about y), and the plates' summed force.
+struct Window: Clone {
+    frames: u32,
+    rate: f32,
+    places: Vec<vec3>,
+    force: Vec<vec3>,
+}
+
+fn ours(v: vec3) -> vec3 {
+    vec3(-v.x, v.y, -v.z)
+}
+
+/// Reads the mocap file's frames from `from` s after its first, for `seconds`.
+fn window(path: str, from: f32, seconds: f32) -> Result<Window, ToolError> {
+    let bytes = read_all(path)?
+    let n = bytes.len()
+    // The header: the columns' names.
+    var i = 0
+    while i < n && bytes[i] != 10 {
+        i += 1
+    }
+    let head_end = i
+    var names: Vec<String> = Vec::new()
+    var s = 0
+    for k in 0..head_end + 1 {
+        if k == head_end || bytes[k] == 9 {
+            var w: Vec<u8> = Vec::new()
+            for c in s..k {
+                if bytes[c] != 32 && bytes[c] != 13 {
+                    w.push(bytes[c])
+                }
+            }
+            names.push(String::from_utf8(take w).unwrap_or(String::new()))
+            s = k + 1
+        }
+    }
+    let col = |name: str| -> u32 {
+        for k in 0..names.len() {
+            if names[k].as_str() == name {
+                return k
+            }
+        }
+        4294967295
+    }
+    var want: Vec<u32> = Vec::new()
+    for m in MARKERS {
+        want.push(col(f"{m}.PosX".as_str()))
+    }
+    let fp = [col("FP1.ForX"), col("FP2.ForX")]
+    for c in want {
+        if c == 4294967295 {
+            return Err(ToolError::new("a marker is missing"))
+        }
+    }
+    let rate = 100.0
+    let first = u32(from * rate)
+    let count = u32(seconds * rate)
+    var places: Vec<vec3> = Vec::new()
+    var force: Vec<vec3> = Vec::new()
+    var row = 0
+    var start = head_end + 1
+    var cells: Vec<f32> = Vec::new()
+    while start < n && row < first + count {
+        var end = start
+        while end < n && bytes[end] != 10 {
+            end += 1
+        }
+        if row >= first {
+            // The row's cells as numbers.
+            cells.clear()
+            var a = start
+            for k in start..end + 1 {
+                if k == end || bytes[k] == 9 {
+                    var x = 0.0
+                    var neg = false
+                    var seen_dot = false
+                    var scale = 1.0
+                    for c in a..k {
+                        let b = bytes[c]
+                        if b == 45 {
+                            neg = true
+                        } else if b == 46 {
+                            seen_dot = true
+                        } else if b >= 48 && b <= 57 {
+                            let d = f32(b - 48)
+                            if seen_dot {
+                                scale *= 0.1
+                                x += d * scale
+                            } else {
+                                x = x * 10.0 + d
+                            }
+                        }
+                    }
+                    cells.push(if neg { -x } else { x })
+                    a = k + 1
+                }
+            }
+            for c in want {
+                places.push(ours(vec3(cells[c], cells[c + 1], cells[c + 2])))
+            }
+            var f = vec3(0.0)
+            for c in fp {
+                f += vec3(cells[c], cells[c + 1], cells[c + 2])
+            }
+            force.push(ours(f))
+        }
+        row += 1
+        start = end + 1
+    }
+    let frames = places.len() / MARKERS.len()
+    Ok(Window { frames, rate, places: smoothed(places, frames, MARKERS.len()), force })
+}
+
+/// Each marker's path low-passed: a Gaussian of `SMOOTH` frames' spread over time, both ways
+/// (no lag), as inverse dynamics in the laboratory filters markers at some 6 Hz before it
+/// differentiates them twice (D. A. Winter, *Biomechanics and Motor Control of Human Movement*).
+const SMOOTH: f32 = 2.5
+
+fn smoothed(p: Vec<vec3>, frames: u32, markers: u32) -> Vec<vec3> {
+    var out = p.clone()
+    let h = u32(3.0 * SMOOTH)
+    for f in 0..frames {
+        let a = if f > h { f - h } else { 0 }
+        let b = min(f + h, frames - 1)
+        for m in 0..markers {
+            var sum = vec3(0.0)
+            var w = 0.0
+            for g in a..b + 1 {
+                let d = (f32(g) - f32(f)) / SMOOTH
+                let k = exp(-0.5 * d * d)
+                sum += p[g * markers + m] * k
+                w += k
+            }
+            out[f * markers + m] = sum / w
+        }
+    }
+    out
+}
+
+fn marker(w: Window, f: u32, m: u32) -> vec3 {
+    w.places[f * MARKERS.len() + m]
+}
+
+/// The joint centres of frame `f`: hips (left, right), knees, ankles, shoulders, elbows, wrists,
+/// the neck (C7), the head's centre, the pelvis's frame (its origin between the hips).
+struct Centres: Copy {
+    hip: [vec3; 2],
+    knee: [vec3; 2],
+    ankle: [vec3; 2],
+    shoulder: [vec3; 2],
+    elbow: [vec3; 2],
+    wrist: [vec3; 2],
+    neck: vec3,
+    head: vec3,
+    pelvis: Frame,
+    trunk: Quat,
+}
+
+/// A turn whose x, y, z are `x`, the part of `y` across `x`, and their cross.
+fn frame_of(x: vec3, y: vec3) -> Quat {
+    let xx = normalize(x)
+    let yy = normalize(y - xx * dot(y, xx))
+    Quat::from_mat3(mat3(xx, yy, cross(xx, yy)))
+}
+
+fn centres(w: Window, f: u32, height: f32) -> Centres {
+    let m = |i: u32| marker(w, f, i)
+    let (la, ra, lp, rp) = (m(0), m(1), m(2), m(3))
+    let mid_a = 0.5 * (la + ra)
+    let mid_p = 0.5 * (lp + rp)
+    let left = normalize(la - ra)
+    let fwd0 = mid_a - mid_p
+    let up = normalize(cross(fwd0, left))
+    let fwd = cross(left, up)
+    let wid = length(la - ra)
+    let s = height / 1.75
+    var hip = [vec3(0.0); 2]
+    hip[0] = mid_a + left * (0.36 * wid) - fwd * (0.19 * wid) - up * (0.30 * wid)
+    hip[1] = mid_a - left * (0.36 * wid) - fwd * (0.19 * wid) - up * (0.30 * wid)
+    let knee = [m(4) - left * (0.05 * s), m(5) + left * (0.05 * s)]
+    let ankle = [m(6) - left * (0.035 * s), m(7) + left * (0.035 * s)]
+    let trunk_up = normalize(m(22) - 0.5 * (hip[0] + hip[1]))
+    let shoulder = [m(12) - trunk_up * (0.05 * s), m(13) - trunk_up * (0.05 * s)]
+    let elbow = [0.5 * (m(14) + m(15)), 0.5 * (m(16) + m(17))]
+    let wrist = [0.5 * (m(18) + m(19)), 0.5 * (m(20) + m(21))]
+    let head = 0.25 * (m(25) + m(26) + m(27) + m(28))
+    let pq = Quat::from_mat3(mat3(left, up, fwd))
+    // The trunk: up from the pelvis to C7, its left the shoulders'.
+    let tq = Quat::from_mat3({
+        let y = trunk_up
+        let x0 = normalize(m(12) - m(13))
+        let x = normalize(x0 - y * dot(x0, y))
+        mat3(x, y, cross(x, y))
+    })
+    Centres {
+        hip,
+        knee,
+        ankle,
+        shoulder,
+        elbow,
+        wrist,
+        neck: m(22),
+        head,
+        pelvis: Frame { q: pq, t: 0.5 * (hip[0] + hip[1]) },
+        trunk: tq,
+    }
+}
+
+fn median(xs: mut Vec<f32>) -> f32 {
+    xs.sort_by(|a, b| a < b)
+    xs[xs.len() / 2]
+}
+
+/// The person's lengths (m), medians over the window: hip to knee, knee to ankle, ankle to the
+/// heel and toe markers along the foot, shoulder to elbow, elbow to wrist, pelvis to neck, neck
+/// to head, the hips apart, the shoulders apart.
+struct Lengths: Copy {
+    thigh: f32,
+    shank: f32,
+    upper_arm: f32,
+    forearm: f32,
+    trunk: f32,
+    neck: f32,
+    hips: f32,
+    shoulders: f32,
+    heel: vec3,
+    toe: vec3,
+}
+
+fn lengths(w: Window, height: f32) -> Lengths {
+    var v: [Vec<f32>; 8] = [
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    ]
+    var heel = vec3(0.0)
+    var toe = vec3(0.0)
+    for f in 0..w.frames {
+        let c = centres(w, f, height)
+        for k in 0..2 {
+            v[0].push(length(c.knee[k] - c.hip[k]))
+            v[1].push(length(c.ankle[k] - c.knee[k]))
+            v[2].push(length(c.elbow[k] - c.shoulder[k]))
+            v[3].push(length(c.wrist[k] - c.elbow[k]))
+        }
+        v[4].push(length(c.neck - c.pelvis.t))
+        v[5].push(length(c.head - c.neck))
+        v[6].push(length(c.hip[0] - c.hip[1]))
+        v[7].push(length(c.shoulder[0] - c.shoulder[1]))
+        // The heel and toe markers from the left ankle, in the pelvis's turn (a foot at the
+        // pelvis's heading): their mean.
+        let inv = c.pelvis.q.inverse()
+        heel += inv.rotate(marker(w, f, 8) - c.ankle[0])
+        toe += inv.rotate(marker(w, f, 10) - c.ankle[0])
+    }
+    let n = f32(w.frames)
+    Lengths {
+        thigh: median(mut v[0]),
+        shank: median(mut v[1]),
+        upper_arm: median(mut v[2]),
+        forearm: median(mut v[3]),
+        trunk: median(mut v[4]),
+        neck: median(mut v[5]),
+        hips: median(mut v[6]),
+        shoulders: median(mut v[7]),
+        heel: heel / n,
+        toe: toe / n,
+    }
+}
+
+/// The radius of a capsule whose axis is `l` long (its round ends past it) that weighs `m` at
+/// 1,050 kg/m³.
+fn radius(m: f32, l: f32) -> f32 {
+    var lo = 0.001
+    var hi = 0.5
+    for _ in 0..60 {
+        let r = 0.5 * (lo + hi)
+        let w = 1050.0 * (PI * r * r * l + 4.0 / 3.0 * PI * r * r * r)
+        if w < m { lo = r } else { hi = r }
+    }
+    0.5 * (lo + hi)
+}
+
+fn joint(kind: Kind, parent: u32, t: vec3, lo: vec3, hi: vec3) -> Joint {
+    Joint { kind, parent, at: Frame { q: Quat::identity(), t }, lo, hi, strength: vec3(500.0) }
+}
+
+/// A person's ranges (rad) about this body's axes (+x left, a limb hanging along -y): a turn
+/// about x of a hanging limb takes it back for a positive number and forward for a negative one.
+fn range_of(s: u32) -> (vec3, vec3) {
+    if s == TRUNK { (vec3(-0.6, -0.5, -0.6), vec3(0.6, 0.5, 0.6)) } else if s == HEAD {
+        (vec3(-0.8, -0.6, -1.2), vec3(0.8, 0.6, 1.2))
+    } else if s == UPPER_ARM_L || s == UPPER_ARM_R {
+        (vec3(-2.6, -2.6, -1.6), vec3(2.6, 2.6, 1.6))
+    } else if s == FOREARM_L || s == FOREARM_R {
+        (vec3(-2.6, -1.5, 0.0), vec3(0.1, 1.5, 0.0))
+    } else if s == THIGH_L || s == THIGH_R {
+        (vec3(-2.0, -0.8, -0.8), vec3(0.6, 0.8, 0.8))
+    } else if s == SHANK_L || s == SHANK_R {
+        (vec3(-0.1, -0.6, 0.0), vec3(2.5, 0.6, 0.0))
+    } else { (vec3(-0.9, -0.6, -0.6), vec3(0.9, 0.6, 0.6)) }
+}
+
+/// The person's body (its frames' axes the world's at rest: +x left, +y up, +z ahead) and its
+/// parts.
+fn person(l: Lengths, mass: f32) -> (Body<SEGMENTS>, [Cone; PARTS]) {
+    let seg = |kind: Kind, parent: u32, t: vec3, tip: vec3, s: u32| {
+        let (lo, hi) = range_of(s)
+        Segment { joint: joint(kind, parent, t, lo, hi), tip }
+    }
+    let down = vec3(0.0, -1.0, 0.0)
+    let hx = 0.5 * l.hips
+    let sx = 0.5 * l.shoulders
+    let b = body(
+        [
+            Segment {
+                joint: Joint {
+                    kind: Kind::Fixed,
+                    parent: NONE,
+                    at: Frame { q: Quat::identity(), t: vec3(0.0, 1.0, 0.0) },
+                    lo: vec3(0.0),
+                    hi: vec3(0.0),
+                    strength: vec3(0.0),
+                },
+                tip: vec3(0.0, 0.1, 0.0),
+            },
+            seg(Kind::Ball, PELVIS, vec3(0.0, 0.1, 0.0), vec3(0.0, l.trunk - 0.1, 0.0), 1),
+            seg(Kind::Ball, TRUNK, vec3(0.0, l.trunk - 0.1, 0.0), vec3(0.0, l.neck, 0.0), 2),
+            seg(Kind::Ball, TRUNK, vec3(sx, l.trunk - 0.15, 0.0), down * l.upper_arm, 3),
+            seg(Kind::Universal, UPPER_ARM_L, down * l.upper_arm, down * l.forearm, 4),
+            seg(Kind::Ball, TRUNK, vec3(-sx, l.trunk - 0.15, 0.0), down * l.upper_arm, 5),
+            seg(Kind::Universal, UPPER_ARM_R, down * l.upper_arm, down * l.forearm, 6),
+            seg(Kind::Ball, PELVIS, vec3(hx, 0.0, 0.0), down * l.thigh, 7),
+            seg(Kind::Universal, THIGH_L, down * l.thigh, down * l.shank, 8),
+            seg(Kind::Ball, SHANK_L, down * l.shank, l.toe, 9),
+            seg(Kind::Ball, PELVIS, vec3(-hx, 0.0, 0.0), down * l.thigh, 10),
+            seg(Kind::Universal, THIGH_R, down * l.thigh, down * l.shank, 11),
+            seg(Kind::Ball, SHANK_R, down * l.shank, vec3(-l.toe.x, l.toe.y, l.toe.z), 12),
+        ],
+    )
+    let cone = |s: u32, a: vec3, bb: vec3, share: f32| {
+        let r = radius(share * mass, max(length(bb - a), 0.01))
+        Cone { a: End { on: s, at: a }, ra: r, b: End { on: s, at: bb }, rb: r, span: on(s) }
+    }
+    // A foot's capsule runs from its heel to its toe, its axis a radius above where the markers
+    // are (on the skin of the sole's edge).
+    let foot = |s: u32, heel: vec3, toe: vec3| {
+        let r = radius(SHARES[7] * mass, length(toe - heel))
+        Cone {
+            a: End { on: s, at: heel + vec3(0.0, 0.0, r) },
+            ra: r,
+            b: End { on: s, at: toe - vec3(0.0, 0.0, r) },
+            rb: r,
+            span: on(s),
+        }
+    }
+    let mirror = |v: vec3| vec3(-v.x, v.y, v.z)
+    let parts = [
+        cone(PELVIS, vec3(hx, 0.05, 0.0), vec3(-hx, 0.05, 0.0), SHARES[0]),
+        cone(TRUNK, vec3(0.0, 0.0, 0.0), vec3(0.0, l.trunk - 0.1, 0.0), SHARES[1]),
+        cone(HEAD, vec3(0.0, 0.5 * l.neck, 0.0), vec3(0.0, l.neck + 0.05, 0.0), SHARES[2]),
+        cone(UPPER_ARM_L, vec3(0.0), down * l.upper_arm, SHARES[3]),
+        cone(FOREARM_L, vec3(0.0), down * (l.forearm + 0.08), SHARES[4]),
+        cone(UPPER_ARM_R, vec3(0.0), down * l.upper_arm, SHARES[3]),
+        cone(FOREARM_R, vec3(0.0), down * (l.forearm + 0.08), SHARES[4]),
+        cone(THIGH_L, vec3(0.0), down * l.thigh, SHARES[5]),
+        cone(SHANK_L, vec3(0.0), down * l.shank, SHARES[6]),
+        foot(FOOT_L, l.heel, l.toe),
+        cone(THIGH_R, vec3(0.0), down * l.thigh, SHARES[5]),
+        cone(SHANK_R, vec3(0.0), down * l.shank, SHARES[6]),
+        foot(FOOT_R, mirror(l.heel), mirror(l.toe)),
+    ]
+    (b, parts)
+}
+
+/// Each segment's mass: its one capsule weighed alone (where two capsules meet, each keeps its
+/// share: the shares are of the whole person).
+fn weigh(b: Body<SEGMENTS>, parts: [Cone; PARTS]) -> [Mass; SEGMENTS] {
+    let rest: Pose<FREEDOM> = b.rest()
+    let at = b.places(rest)
+    var out = masses(
+        b,
+        rest,
+        round_cone(vec3(0.0), vec3(0.001, 0.0, 0.0), r_top: 0.0001, r_bottom: 0.0001).with(
+            density(1.0),
+        ),
+        [on(0)],
+        0.01,
+    )
+    for i in 0..PARTS {
+        let (a, bb) = parts[i].placed(at)
+        let one = round_cone(a, bb, r_top: parts[i].ra, r_bottom: parts[i].rb).with(density(1050.0))
+        let m = masses(b, rest, one, [parts[i].span], 0.008)
+        let s = parts[i].span.from
+        out[s] = m[s]
+    }
+    out
+}
+
+/// The belts' mean speed (m/s) over the window, from the trial's record file (its first column
+/// the time, its second and third the left and right belts' speeds).
+fn belt_speed(path: str, from: f32, seconds: f32) -> f32 {
+    let Ok(bytes) = read_all(path) else { return 0.0 }
+    let Some(text) = String::from_utf8(take bytes) else { return 0.0 }
+    let t = text.as_str()
+    var first = -1.0
+    var sum = 0.0
+    var n = 0.0
+    for (a, b) in t.lines() {
+        let line = t.slice(a, b)
+        let cells = line.split("\t")
+        if cells.len() < 3 {
+            continue
+        }
+        let (c0, c1) = cells[0]
+        let Some(time) = line.slice(c0, c1).trim().parse_f32() else { continue }
+        if first < 0.0 {
+            first = time
+        }
+        let rel = time - first
+        if rel >= from && rel < from + seconds {
+            let (l0, l1) = cells[1]
+            let (r0, r1) = cells[2]
+            let l = line.slice(l0, l1).trim().parse_f32().unwrap_or(0.0)
+            let r = line.slice(r0, r1).trim().parse_f32().unwrap_or(0.0)
+            sum += 0.5 * (l + r)
+            n += 1.0
+        }
+    }
+    if n > 0.0 { sum / n } else { 0.0 }
+}
+
+pub fn tool() -> u32 {
+    let a = args()
+    if a.len() < 5 {
+        print("usage: forces TRIAL FROM SECONDS MASS HEIGHT")
+        return 2
+    }
+    let trial = a[0].as_str()
+    let from = a[1].as_str().parse_f32().unwrap_or(50.0)
+    let seconds = a[2].as_str().parse_f32().unwrap_or(20.0)
+    let mass = a[3].as_str().parse_f32().unwrap_or(70.0)
+    let height = a[4].as_str().parse_f32().unwrap_or(1.75)
+    let belt = belt_speed(f"capture/moore2015/T{trial}/record-{trial}.txt", from, seconds)
+    print(f"forces: the belt's mean speed over the window {belt} m/s")
+    let Ok(w) = window(f"capture/moore2015/T{trial}/mocap-{trial}.txt", from, seconds) else {
+        print("forces: the trial could not be read")
+        return 1
+    }
+    print(f"forces: {w.frames} frames of trial {trial}")
+    let l = lengths(w.clone(), height)
+    print(
+        f"forces: thigh {l.thigh} shank {l.shank} upper arm {l.upper_arm} forearm {l.forearm} trunk {l.trunk} neck {l.neck} hips {l.hips} shoulders {l.shoulders} heel {l.heel} toe {l.toe}",
+    )
+    let (b, parts) = person(l, mass)
+    let ms = weigh(b, parts)
+    var total = 0.0
+    for m in ms {
+        total += m.mass
+    }
+    print(f"forces: the body weighs {total} kg (the person {mass} kg)")
+    // Each frame's pose, in the belt's frame (carried forward by the belt).
+    var poses: Vec<Pose<FREEDOM>> = Vec::new()
+    var prev: Pose<FREEDOM> = b.rest()
+    var worst = 0.0
+    for f in 0..w.frames {
+        let c = centres(w.clone(), f, height)
+        let carry = vec3(0.0, 0.0, belt * f32(f) / w.rate)
+        var aims: Vec<Aim> = Vec::new()
+        aims.push(aim_frame(PELVIS, Frame { q: c.pelvis.q, t: c.pelvis.t + carry }, 2.0, 0.3))
+        aims.push(
+            Aim {
+                segment: TRUNK,
+                point: vec3(0.0),
+                at: vec3(0.0),
+                place: 0.0,
+                turn: c.trunk,
+                turned: 0.3,
+            },
+        )
+        aims.push(aim_point(HEAD, vec3(0.0, l.neck, 0.0), c.head + carry, 1.0))
+        aims.push(aim_point(HEAD, vec3(0.0), c.neck + carry, 1.0))
+        for k in 0..2 {
+            let (ua, fa, th, sh, ft) = if k == 0 {
+                (UPPER_ARM_L, FOREARM_L, THIGH_L, SHANK_L, FOOT_L)
+            } else {
+                (UPPER_ARM_R, FOREARM_R, THIGH_R, SHANK_R, FOOT_R)
+            }
+            aims.push(aim_point(ua, vec3(0.0), c.shoulder[k] + carry, 1.0))
+            aims.push(aim_point(fa, vec3(0.0), c.elbow[k] + carry, 1.0))
+            aims.push(aim_point(fa, vec3(0.0, -l.forearm, 0.0), c.wrist[k] + carry, 1.0))
+            aims.push(aim_point(th, vec3(0.0), c.hip[k] + carry, 1.0))
+            aims.push(aim_point(sh, vec3(0.0), c.knee[k] + carry, 1.0))
+            aims.push(aim_point(ft, vec3(0.0), c.ankle[k] + carry, 1.0))
+            let mx = if k == 0 { 1.0 } else { -1.0 }
+            aims.push(
+                aim_point(
+                    ft,
+                    vec3(l.heel.x * mx, l.heel.y, l.heel.z),
+                    marker(w, f, 8 + k) + carry,
+                    1.0,
+                ),
+            )
+            aims.push(
+                aim_point(
+                    ft,
+                    vec3(l.toe.x * mx, l.toe.y, l.toe.z),
+                    marker(w, f, 10 + k) + carry,
+                    1.0,
+                ),
+            )
+        }
+        let fr = fit(b, aims, prev, if f == 0 { 300 } else { 12 }, still: if f == 0 { 0.001 } else {
+            0.05
+        })
+        worst = max(worst, fr.worst_place)
+        prev = fr.pose
+        poses.push(fr.pose)
+    }
+    print(f"forces: the fit's worst aim {worst * 1000.0} mm")
+    // Jumps: a segment's centre's acceleration over 100 m/s² between frames.
+    for f in 1..poses.len() - 1 {
+        let (pa, pb, pc) = (b.places(poses[f - 1]), b.places(poses[f]), b.places(poses[f + 1]))
+        for sg in 0..SEGMENTS {
+            let acc = (pa[sg].t - 2.0 * pb[sg].t + pc[sg].t) * (w.rate * w.rate)
+            if length(acc) > 100.0 {
+                print(
+                    f"jump: frame {f} segment {sg} {length(acc)} m/s² numbers {b.numbers(poses[f], sg)} before {b.numbers(poses[f - 1], sg)}",
+                )
+            }
+        }
+    }
+    // The ground: under the soles, at their lowest points' 5th percentile.
+    var lows: Vec<f32> = Vec::new()
+    for p in poses {
+        let at = b.places(p)
+        for i in [9, 12] {
+            let (x, y) = parts[i].placed(at)
+            lows.push(min(x.y, y.y) - parts[i].ra)
+        }
+    }
+    lows.sort_by(|x, y| x < y)
+    let ground = lows[lows.len() / 20]
+    print(f"forces: the ground at {ground} m")
+    // How fast the heels move along the ground where they are low (the belt's frame: near 0).
+    var hs = 0.0
+    var hn = 0.0
+    for f in 1..w.frames - 1 {
+        for k in 0..2 {
+            let p0 = marker(w.clone(), f - 1, 8 + k)
+            let p1 = marker(w.clone(), f + 1, 8 + k)
+            if p0.y < ground + 0.08 {
+                let v = (p1 - p0) * (0.5 * w.rate) + vec3(0.0, 0.0, belt)
+                hs += length(vec2(v.x, v.z))
+                hn += 1.0
+            }
+        }
+    }
+    print(
+        f"forces: the low heels move {hs / max(hn, 1.0)} m/s along the ground in the belt's frame",
+    )
+    var judged: Vec<vec3> = Vec::new()
+    var detail: Vec<vec3> = Vec::new()
+    let m = judge_into(
+        b,
+        ms,
+        parts,
+        half_space(vec3(0.0, 1.0, 0.0), ground),
+        poses,
+        w.rate,
+        mut judged,
+        mut detail,
+        false,
+    )
+    let weight = mass * length(GRAVITY)
+    var e_v = 0.0
+    var e_h = 0.0
+    var most = 0.0
+    var mean_meas = vec3(0.0)
+    for k in 0..judged.len() {
+        let meas = w.force[k + 1]
+        let d = judged[k] - meas
+        e_v += abs(d.y)
+        e_h += length(vec2(d.x, d.z))
+        most = max(most, abs(d.y))
+        mean_meas += meas
+    }
+    for k in 0..judged.len() {
+        if k % 10 == 0 || abs(judged[k].y - w.force[k + 1].y) > 2.0 * weight {
+            print(f"row {k} judged {judged[k].y} measured {w.force[k + 1].y}")
+        }
+    }
+    let n = f32(max(judged.len(), 1))
+    print(f"forces: the plates' mean force {mean_meas / n} N (the weight {weight} N)")
+    print(
+        f"forces: the judge against the plates: vertical {e_v / n / weight} of the weight on average ({most / weight} at most), along the ground {e_h / n / weight}",
+    )
+    print(
+        f"forces: the judge's residual {m.residual}, slide {m.slide} mm/s, penetration {m.penetration} mm, float {m.float} mm, duty {m.duty}",
+    )
+    0
+}

@@ -1,0 +1,293 @@
+// A film of a movement (docs/plans/bodies-and-movement.md, phase 3 step 9): a body seen from the
+// side and from the front, side by side, each frame a PNG, with the judge's contacts (red: a point
+// that carries weight) and its root residual (a blue line from the centre of mass, a metre for the
+// body's weight) drawn. It opens no window: each picture is marched on the CPU through the body's
+// own field (`world::creature`), lit by one light and the sky.
+//
+//     tools/wrela tool tools/movement/film --read poses=.movement/poses --write out=.movement/film \
+//         -- SOURCE/CLIP [FROM SECONDS EVERY]
+//
+// The pictures: `out/SOURCE/CLIP/NNNN.png`, 512 by 256, every EVERY-th frame (default 2) of
+// SECONDS (default 4) from FROM (default 0).
+
+use engine::body::body::Pose
+use engine::body::joint::Frame
+use engine::judge::movement::{GRAVITY, TOUCH, judge_into}
+use std::collections::Vec
+use std::field::{Field, Surface, half_space}
+use std::io::print
+use std::quat::Quat
+use std::serialize::Reader
+use std::tool::{ToolError, args}
+use std::tool::blob
+use std::tool::blob::Data
+use std::tool::files
+use std::tool::image
+use world::creature::{BODY, MASSES, creature}
+use world::creature_segments::{FREEDOM, PARTS}
+
+type P = Pose<FREEDOM>
+
+/// Each panel's size (pixels) and how many metres it shows across.
+const SIZE: u32 = 256
+const SPAN: f32 = 1.6
+
+fn read_all(path: str) -> Result<Vec<u8>, ToolError> {
+    let b = files::read_blob(path).wait()?
+    let n = blob::len(b).wait()?
+    var out: Vec<u8> = Vec::with_capacity(u32(n))
+    var at: u64 = 0
+    while at < n {
+        let part = blob::read(b, at, 524288).wait()?
+        at += u64(part.len())
+        for x in part {
+            out.push(x)
+        }
+    }
+    let _ = blob::release(b).wait()
+    Ok(out)
+}
+
+fn next(r: mut Reader) -> u32 {
+    match r.read_u32() {
+        Ok(x) => x,
+        Err(_) => 0,
+    }
+}
+
+fn load(name: str) -> Result<(f32, Vec<P>), ToolError> {
+    let bytes = read_all(f"poses/creature/{name}.pose")?
+    var r = Reader::new(take bytes)
+    for _ in 0..4 {
+        let _ = r.read_u8()
+    }
+    let _v = next(mut r)
+    let d = next(mut r)
+    let n = next(mut r)
+    let rate = bitcast_f32(next(mut r))
+    if d != FREEDOM {
+        return Err(ToolError::new("not the creature's poses"))
+    }
+    var poses: Vec<P> = Vec::with_capacity(n)
+    for _ in 0..n {
+        var x = [0.0; 7]
+        for k in 0..7 {
+            x[k] = bitcast_f32(next(mut r))
+        }
+        var p: P = Pose {
+            root: Frame { q: Quat { v: vec4(x[3], x[4], x[5], x[6]) }, t: vec3(x[0], x[1], x[2]) },
+            q: [0.0; FREEDOM],
+        }
+        for k in 0..FREEDOM {
+            p.q[k] = bitcast_f32(next(mut r))
+        }
+        poses.push(p)
+    }
+    Ok((rate, poses))
+}
+
+/// One panel: the field from `from` (a direction) toward `centre`, orthographic.
+fn panel<S: Field<engine::matter::substance::Substance>>(
+    field: S,
+    centre: vec3,
+    from: vec3,
+    rgba: mut Vec<u8>,
+    x0: u32,
+    width: u32,
+    marks: [vec3],
+    mark_colour: [vec3],
+    lines: [vec3],
+) {
+    let w = normalize(from)
+    let r = normalize(cross(vec3(0.0, 1.0, 0.0), w))
+    let u = cross(w, r)
+    let light = normalize(vec3(0.4, 0.8, 0.45))
+    let step = max(field.lipschitz(1.0e30), 1.0)
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let px = ((f32(x) + 0.5) / f32(SIZE) - 0.5) * SPAN
+            let py = (0.5 - (f32(y) + 0.5) / f32(SIZE)) * SPAN
+            let o = centre + r * px + u * py + w * (2.0 * SPAN)
+            var p = o
+            var colour = vec3(0.86, 0.9, 0.95) - vec3(0.25) * (py / SPAN)
+            // The ground under the body: a darker floor below y = 0.
+            var hit = false
+            var t = 0.0
+            for _ in 0..300 {
+                let d = field.distance(p)
+                if d < 2.0e-4 {
+                    hit = true
+                    break
+                }
+                p = p - w * (d / step)
+                t += d / step
+                if t > 4.0 * SPAN {
+                    break
+                }
+            }
+            if hit {
+                let n = field.gradient(p)
+                let nn = if length(n) > 1.0e-6 { normalize(n) } else { w }
+                let albedo = field.channels(p).albedo
+                colour = albedo * (0.25 + 0.75 * max(dot(nn, light), 0.0)) +
+                    albedo * 0.2 * max(nn.y, 0.0)
+            } else if centre.y + py < 0.0 {
+                colour = vec3(0.45, 0.43, 0.4)
+            }
+            let i = 4 * (x0 + x + width * y)
+            rgba[i] = u8(clamp(sqrt(colour.x), 0.0, 1.0) * 255.0)
+            rgba[i + 1] = u8(clamp(sqrt(colour.y), 0.0, 1.0) * 255.0)
+            rgba[i + 2] = u8(clamp(sqrt(colour.z), 0.0, 1.0) * 255.0)
+            rgba[i + 3] = 255
+        }
+    }
+    // The marks, each a dot of 5 pixels.
+    let to_px = |q: vec3| -> vec2 {
+        let d = q - centre
+        vec2((dot(d, r) / SPAN + 0.5) * f32(SIZE), (0.5 - dot(d, u) / SPAN) * f32(SIZE))
+    }
+    for k in 0..marks.len() {
+        let c = to_px(marks[k])
+        for dy in 0..5 {
+            for dx in 0..5 {
+                let (xx, yy) = (i32(c.x) + i32(dx) - 2, i32(c.y) + i32(dy) - 2)
+                if xx >= 0 && yy >= 0 && xx < i32(SIZE) && yy < i32(SIZE) {
+                    let i = 4 * (x0 + u32(xx) + width * u32(yy))
+                    rgba[i] = u8(mark_colour[k].x * 255.0)
+                    rgba[i + 1] = u8(mark_colour[k].y * 255.0)
+                    rgba[i + 2] = u8(mark_colour[k].z * 255.0)
+                }
+            }
+        }
+    }
+    // The lines, in pairs of ends: 200 dots along each.
+    var k = 0
+    while k + 1 < lines.len() {
+        let (a, b) = (to_px(lines[k]), to_px(lines[k + 1]))
+        for s in 0..200 {
+            let c = mix(a, b, vec2(f32(s) / 199.0))
+            let (xx, yy) = (i32(c.x), i32(c.y))
+            if xx >= 0 && yy >= 0 && xx < i32(SIZE) && yy < i32(SIZE) {
+                let i = 4 * (x0 + u32(xx) + width * u32(yy))
+                rgba[i] = 30
+                rgba[i + 1] = 60
+                rgba[i + 2] = 230
+            }
+        }
+        k += 2
+    }
+}
+
+pub fn tool() -> u32 {
+    let a = args()
+    if a.len() < 1 {
+        print("usage: film SOURCE/CLIP [FROM SECONDS EVERY]")
+        return 2
+    }
+    let name = a[0].as_str()
+    let from = if a.len() > 1 { a[1].as_str().parse_f32().unwrap_or(0.0) } else { 0.0 }
+    let seconds = if a.len() > 2 { a[2].as_str().parse_f32().unwrap_or(4.0) } else { 4.0 }
+    let every = if a.len() > 3 { a[3].as_str().parse_u32().unwrap_or(2) } else { 2 }
+    let Ok((rate, all)) = load(name) else {
+        print(f"film: no poses of {name}")
+        return 1
+    }
+    let first = min(u32(from * rate), all.len() - 1)
+    let last = min(first + u32(seconds * rate) + 2, all.len())
+    var poses: Vec<P> = Vec::new()
+    for f in first..last {
+        poses.push(all[f])
+    }
+    // The judge's contacts and forces, a frame at a time (its detail: each segment's contact
+    // force), and the residual: what the movement needs less what the contacts give.
+    var forces: Vec<vec3> = Vec::new()
+    var detail: Vec<vec3> = Vec::new()
+    let ground = half_space(vec3(0.0, 1.0, 0.0), 0.0)
+    let _ = judge_into(
+        BODY,
+        MASSES,
+        PARTS,
+        ground,
+        poses.clone(),
+        rate,
+        mut forces,
+        mut detail,
+        true,
+    )
+    var mass = 0.0
+    for m in MASSES {
+        mass += m.mass
+    }
+    let weight = mass * length(GRAVITY)
+    let width = 2 * SIZE
+    var written = 0
+    var f = 1
+    while f + 1 < poses.len() {
+        let at = BODY.places(poses[f])
+        let body = creature(poses[f])
+        // The centre of mass and its acceleration (the residual: m (a - g) less the contacts).
+        var com = vec3(0.0)
+        var acc = vec3(0.0)
+        let (pa, pc) = (BODY.places(poses[f - 1]), BODY.places(poses[f + 1]))
+        for s in 0..world::creature_segments::SEGMENTS {
+            let m = MASSES[s]
+            com += at[s].apply(m.centre) * m.mass
+            acc += (pa[s].apply(m.centre) - 2.0 * at[s].apply(m.centre) + pc[s].apply(m.centre)) *
+                (rate * rate * m.mass)
+        }
+        com = com / mass
+        let need = acc - GRAVITY * mass
+        let residual = need - forces[f - 1]
+        // The contact points within reach of the ground, red where their segment carries weight.
+        var marks: Vec<vec3> = Vec::new()
+        var colours: Vec<vec3> = Vec::new()
+        let n_seg = world::creature_segments::SEGMENTS
+        for c in PARTS {
+            let (x, y) = c.placed(at)
+            for k in 0..3 {
+                let u = f32(k) * 0.5
+                let centre = mix(x, y, vec3(u))
+                let rr = mix(c.ra, c.rb, u)
+                if centre.y - rr < TOUCH {
+                    let seg = if u < 0.5 { c.a.on } else { c.b.on }
+                    let carried = length(detail[(f - 1) * 3 * n_seg + n_seg + seg]) > 0.05 * weight
+                    marks.push(centre - vec3(0.0, rr, 0.0))
+                    colours.push(if carried { vec3(0.9, 0.1, 0.1) } else { vec3(0.95, 0.8, 0.1) })
+                }
+            }
+        }
+        let lines = [com, com + residual / weight]
+        var rgba: Vec<u8> = Vec::filled(width * SIZE * 4, 0)
+        let centre = vec3(com.x, 0.55, com.z)
+        panel(body, centre, vec3(1.0, 0.0, 0.0), mut rgba, 0, width, marks, colours, lines)
+        panel(body, centre, vec3(0.0, 0.0, 1.0), mut rgba, SIZE, width, marks, colours, lines)
+        if f % every == 0 {
+            let Ok(b) = blob::new().wait() else { return 1 }
+            var at_b = 0
+            while at_b < rgba.len() {
+                let end = min(at_b + 524288, rgba.len())
+                var part: Vec<u8> = Vec::new()
+                for i in at_b..end {
+                    part.push(rgba[i])
+                }
+                let _ = blob::append(b, part).wait()
+                at_b = end
+            }
+            let img = image::Image { width, height: SIZE, rgba: Data::Blob(b) }
+            match image::encode_png(img).wait() {
+                Ok(Data::Bytes(bytes)) => {
+                    let _ = files::write(f"out/{name}/{written:04}.png", bytes).wait()
+                },
+                Ok(Data::Blob(pb)) => {
+                    let _ = files::write_blob(f"out/{name}/{written:04}.png", pb).wait()
+                },
+                Err(e) => print(f"film: {e.message()}"),
+            }
+            let _ = blob::release(b).wait()
+            written += 1
+        }
+        f += 1
+    }
+    print(f"film: {written} pictures of {name}")
+    0
+}
