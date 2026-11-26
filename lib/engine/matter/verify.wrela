@@ -14,7 +14,11 @@ use matter::edits::Edited
 use matter::substance::Substance
 use std::collections::Vec
 use std::derive::{Box3, Interval, affine, affine_form, gradient, interval, lipschitz, work}
-use std::field::{ALL_LIVE, Bound, Field, FieldFacts, Live, Surface, UNBOUNDED, form_box, hash_u32}
+use std::field::{
+    ALL_LIVE, Bound, Field, FieldFacts, Live, Surface, Translate, UNBOUNDED, cuboid, fbm, form_box,
+    hash_u32, round_cone, sphere,
+}
+use std::quat::Quat
 use std::hash::StateHash
 use std::io::print
 
@@ -373,7 +377,11 @@ fn prove_slope<S: Surface>(s: S, bx: Box3, live: Live, label: str, derive: bool)
         if h_in.y > 0.0 { af.l.y / h_in.y } else { 0.0 },
         if h_in.z > 0.0 { af.l.z / h_in.z } else { 0.0 },
     )
-    let size = abs(af.c) + abs(af.l.x) + abs(af.l.y) + abs(af.l.z) + max(abs(range.lo), abs(range.hi))
+    let size = abs(af.c) +
+        abs(af.l.x) +
+        abs(af.l.y) +
+        abs(af.l.z) +
+        max(abs(range.lo), abs(range.hi))
     let tol = dot(abs(per), delta) + size * (8.0 / 8388608.0) + 1.0e-37
     let c = af.c
     let residual = |q: vec3| s.distance_live(q, live) - (c + dot(per, q - c_b))
@@ -396,7 +404,13 @@ fn prove_slope<S: Surface>(s: S, bx: Box3, live: Live, label: str, derive: bool)
 fn prove_slopes<S: Surface>(s: S, bx: Box3, label: str, derive: bool) -> Proven {
     let a = prove_slope(s, bx, ALL_LIVE, label, derive)
     let pad = 0.5 * (bx.hi - bx.lo)
-    let live = s.pruned(Box3 { lo: bx.lo - pad, hi: bx.hi + pad }, |q: vec3| q, 1.0, ALL_LIVE, 0).live
+    let live = s.pruned(
+        Box3 { lo: bx.lo - pad, hi: bx.hi + pad },
+        |q: vec3| q,
+        1.0,
+        ALL_LIVE,
+        0,
+    ).live
     if live == ALL_LIVE {
         return a
     }
@@ -520,7 +534,10 @@ pub fn verify_slope_soundness<S: Surface>(
 ) {
     let b = s.bound()
     let r = b.radius
-    assert(r > 0.0 && r < 1.0e12, f"verify({label}): surface bound radius {r} is not finite positive")
+    assert(
+        r > 0.0 && r < 1.0e12,
+        f"verify({label}): surface bound radius {r} is not finite positive",
+    )
     let inner = Box3 { lo: b.centre - vec3(r), hi: b.centre + vec3(r) }
     var slope_p = Proven { proven: 0, unproven: 0 }
     for bi in 0..boxes {
@@ -544,7 +561,8 @@ pub fn verify_slope_soundness<S: Surface>(
     var k: u32 = 0
     let reach = min(r, 1.0e4)
     while found < cells && k < 40 * cells {
-        let o = b.centre + (vec3(unit(k * 11 + 1), unit(k * 11 + 2), unit(k * 11 + 3)) - vec3(0.5)) * reach
+        let o = b.centre +
+            (vec3(unit(k * 11 + 1), unit(k * 11 + 2), unit(k * 11 + 3)) - vec3(0.5)) * reach
         let dv = vec3(unit(k * 11 + 4), unit(k * 11 + 5), unit(k * 11 + 6)) - vec3(0.5)
         k += 1
         if length(dv) < 0.05 {
@@ -590,7 +608,9 @@ pub fn verify_slope_soundness<S: Surface>(
         }
         found += 1
     }
-    let how = if derive { "" } else { " (nothing derived: its distance's affine form can't be run in a test)" }
+    let how = if derive { "" } else {
+        " (nothing derived: its distance's affine form can't be run in a test)"
+    }
     print(
         f"verify({label}): enclosures proven on {slope_p.proven} boxes ({slope_p.unproven} sampled), {boxes} boxes in its bound and cells round {found} points of its surface{how}",
     )
@@ -928,5 +948,51 @@ pub fn prove_field_facts<F: Field<Substance>>(f: F) -> FieldFacts {
         channels_proven: channels_proven,
         distance_work: work(|q: vec3| f.distance(q)),
         channels_work: work(|q: vec3| f.channels(q)),
+    )
+}
+
+// ---- std's combinators' enclosures (`std::field`): each composes its operands' (a join by
+// `slope_smin`, a map by its `MapBox`), and none of the game's kinds asks some of them. Held here
+// as any kind's are (`verify_slope_soundness`): the compiler's form of the whole proves the
+// composed one.
+
+/// A ball with a block beside it, the block a metre a side at most: operands for the joins.
+fn two_parts() -> (std::field::Sphere, Translate<std::field::Cuboid>) {
+    (sphere(0.5), cuboid(vec3(0.3, 0.2, 0.25)).translate(vec3(0.45, 0.1, -0.05)))
+}
+
+@test
+fn std_joins_enclosures_are_sound() {
+    let (ball, block) = two_parts()
+    verify_slope_soundness(ball.union(block), "std union")
+    verify_slope_soundness(ball.smooth_union(block, k: 0.08), "std smooth_union")
+    verify_slope_soundness(ball.intersect(block), "std intersect")
+    verify_slope_soundness(ball.smooth_intersect(block, k: 0.05), "std smooth_intersect")
+    verify_slope_soundness(ball.smooth_subtract(block, k: 0.04), "std smooth_subtract")
+    let limbs = [
+        round_cone(vec3(0.0), vec3(0.0, 0.6, 0.0), r_top: 0.08, r_bottom: 0.12),
+        round_cone(vec3(0.0, 0.5, 0.0), vec3(0.3, 0.8, 0.1), r_top: 0.05, r_bottom: 0.08),
+        round_cone(vec3(0.0, 0.5, 0.0), vec3(-0.3, 0.7, -0.1), r_top: 0.05, r_bottom: 0.08),
+        round_cone(vec3(0.0, 0.1, 0.0), vec3(0.25, -0.2, 0.15), r_top: 0.06, r_bottom: 0.09),
+    ]
+    verify_slope_soundness(limbs.union(), "std union of an array")
+    verify_slope_soundness(limbs.smooth_union(k: 0.06), "std smooth_union of an array")
+}
+
+@test
+fn std_maps_enclosures_are_sound() {
+    let (ball, block) = two_parts()
+    let turn = Quat::axis_angle(normalize(vec3(0.3, 1.0, -0.2)), 0.7)
+    verify_slope_soundness(block.rotate(turn), "std rotate")
+    verify_slope_soundness(
+        block.scale(1.7).rotate(turn).translate(vec3(2.0, -1.0, 0.5)),
+        "std scale",
+    )
+    verify_slope_soundness(block.scale(-0.6), "std scale by a negative")
+    verify_slope_soundness(block.mirror_x(), "std mirror_x")
+    verify_slope_soundness(ball.smooth_union(block, k: 0.08).named("both"), "std named")
+    verify_slope_soundness(
+        ball.union(block).displace(fbm(freq: 5.0, octaves: 2), amp: 0.01),
+        "std displace",
     )
 }

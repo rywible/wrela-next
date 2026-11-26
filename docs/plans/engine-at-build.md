@@ -1020,7 +1020,7 @@ in the exact cells (`mesh_exact`) and 3.5 ms in the sun's exact rays, of about 2
 batch (3.7 mm cells) gives 4,959 outline cells a certificate's test and 4,638 exact cells, 1,397 of
 them thin cells; the candlestick's (4.8 mm) 2,508 and 2,873, 365 thin. So 65% and 99% of their
 outline cells fail the sheet certificate. Not for want of a stronger certificate: the affine one in
-place of the pruned one (`is_heavy_field`) failed as many. On the CPU, at a surface point with the
+place of the pruned one (a heavy kind's, then) failed as many. On the CPU, at a surface point with the
 field's own normal, it certifies 6 of 300 cells of each (41 at a slab a cell wide). The cause: the
 affine derivation falls back to the plain interval (no slopes) for the kit's turned and moulded
 shapes (`kit::shapes::outline::Profile`), so a certificate sees a box, never a sheet. A straight
@@ -1038,13 +1038,90 @@ segment's offset alone kept its slopes; the profile's code lost them where it:
    with the loop kept the form had no bound. A turned profile of four straight segments: slopes
    (2.4, -0.55) mm a half cell and an error of 0.74 mm at a 4.8 mm cell, where it had none.
 4. A profile of bowed segments derives with a bound, a loose one: four points, two bowed, an
-   error of 15 mm at a 4.8 mm cell. A bowed segment alone is tight (its arc's offset 0.34 mm),
-   but with the rest the profile's nearest segment is unsure: a neighbouring arc's test of
-   whether the box is within its span (`on_arc`) is unsure, and its distance to its whole circle,
-   which may pass near the box, joins the choice. Next.
-5. And the forge's kinds are heavy (`is_heavy_field`: the table's distance 10,750 work, its form
-   240,820), so their kernels certify by pruning alone, which can't certify a sheet: the affine
-   certificate for a heavy kind is the other half of SCENE 14's exact cells.
+   error of 15 mm at a 4.8 mm cell (a neighbouring arc's test of whether the box is within its
+   span, `on_arc`, is unsure, and its whole circle joins the choice). Done another way (commit
+   `7ee3b75`): the kit's shapes state their own enclosure, each in its own space
+   (`std::field::Slope3`): a profile's and an outline's in the plane (`kit::shapes::outline`), a
+   turned, a moulded, a banded and an extruded shape from those, a board in closed form.
+5. The forge's kinds were heavy (the table's distance 10,750 work, the compiler's form of the
+   whole of it 400,535), so their kernels certified by pruning alone, which can't certify a
+   sheet. Done: every surface has a slope enclosure, as it has `pruned`
+   (`Surface::slope_box`), and the engine asks it on one path.
+
+What is true of the slope enclosure now (2026-11-26):
+
+- **What it is.** A plane the distance stays near over a box, how near, and the distance's range
+  there (`std::field::SlopeBox`). It is in the box's own coordinates, as the compiler's affine
+  form is, so that form is one bit for bit.
+- **The default.** The compiler's form of the surface alone, through the maps above it, its
+  range within its interval's. A kind that states no enclosure has the form the engine read
+  before, and no weaker one.
+- **Composition.** Each combinator of std composes its operands' enclosures: the joins
+  (`Union`, `SmoothUnion`, `UnionAll`, `SmoothUnionAll`, `Intersect`, `SmoothIntersect`,
+  `SmoothSubtract`, by `slope_smin`), `Displace` (its surface's plus the form of its noise),
+  `ToBound`, and the wrappers. A map (`Warp`, `Mirror`, the kit's `Placed`, `Folded`, `Cupped`)
+  hands its own first-order enclosure down (`MapBox`). A leaf that states its own enclosure is
+  asked over the box that the maps take it to. A leaf that states none gets the compiler's form
+  through the maps, so a turn does not widen its box.
+- **The cost.** A tree's enclosure costs the sum of its leaves'. The table's is 21,837 work
+  where the form of the whole is 400,535. The grimoire's is 25,709 (139,236), the chair's 25,910
+  (275,093), the shelf's 7,647 (112,308), the candlestick's 3,755 (140,136).
+- **One path.** `certify_sheet` and `filter_thin_cells` ask `Surface::slope_affine` for every
+  kind. The flag `HAS_SLOPE_BOX`, the work threshold `is_heavy_field` and the pruned
+  certificate are removed. The bricks of a steep field are culled by `pruned` alone: the affine
+  range kept the same bricks (the stack's octants: 4,674 of 13,824 at 2 m and 1,127 at 0.48 m by
+  each; the test rocks: 148 of 288, 1,371 of 5,355, 342 of 729 and 3,117 of 13,824 by each).
+- **The contract.** `verify_surface_soundness` holds the enclosure with the other facts
+  (`verify_slope_soundness`): over 24 boxes in the bound and over cells of 4 mm, 12 mm and
+  40 mm round 8 points of the surface, with all parts and with the live parts. The proof is the
+  compiler's affine range of the distance less the plane, in which the slopes cancel. A box the
+  proof can't close is sampled. No slack is allowed past the form's own `delta` and the
+  rounding of the check. Proven and sampled boxes: `arena_courtyard` 112 and 0, `arena_pillars`
+  118 and 0, `arena_brazier_stands` 64 and 0, `arena_flame` 118 and 0, `parry_arc` 118 and 0,
+  `rival_orb` 112 and 0, `glass_shard` 160 and 0, `citadel` 112 and 0, `marble_column` 113 and
+  0, its cut 102 and 0, `tall_stack` 111 and 0, `stage` 229 and 0, the creature at rest 1,226
+  and 176, bent 1,010 and 142, `candlestick` 544 and 1,578, `shelf` 428 and 1,454, `chair` 285
+  and 3,354. No hand-written enclosure of the kit needed a wider margin.
+- **Certified cells** (`tools/wrela test game/world`, of 100 unless said; within a quarter and
+  within four tenths of a cell; before to after). No count fell.
+
+  | Kind | 1 cm | 2.7 cm | 8 cm |
+  | --- | --- | --- | --- |
+  | `arena_brazier_stands` (of 42) | 39, 39 to 39, 40 | 20, 27 to 23, 30 | 3, 5 to 5, 9 |
+  | `arena_pillars` | 97, 98 to 98, 98 | 93, 97 to 94, 97 | 32, 39 to 36, 42 |
+  | `creature` (of 25) | 20, 24 to 23, 25 | 9, 12 to 12, 17 | 0, 0 |
+  | `glass_shard` | 98, 100 | 49, 78 to 50, 79 | 6, 11 |
+  | `grimoire` | 18, 22 to 19, 26 | 2, 8 to 2, 12 | 0, 0 |
+  | `marble_column` | 99, 99 | 98, 98 | 40, 72 to 41, 73 |
+  | `rival_orb` (of 60) | 60, 60 | 60, 60 | 2, 19 to 2, 20 |
+  | `stage` | 100, 100 | 99, 100 | 98, 98 to 99, 99 |
+  | `table` | 44, 45 to 45, 45 | 11, 15 | 0, 0 |
+
+  The other kinds are as before. As a room places them, at their cells there: the grimoire
+  (4.83 mm cells, a slab of 0.83 mm) 36 to 38, the chair (4.8 mm) 69 to 70, the table (3.7 mm)
+  63, the candlestick (4.8 mm) 12.
+- **Spans** (M4, 1080p, the gate's placements, the commit before and this one in one run):
+  SCENE 10 16.45 to 15.98 ms, SCENE 11 16.93 to 16.59, SCENE 13 16.61 to 15.97, SCENE 14 17.38 to
+  17.31 (`tools/bench --against`, frames 30 to 89, each the mean of three placements). The arena
+  and the citadel gain because their heavy kinds (the pillars, the brazier stands, the citadel,
+  the creature) certified by pruning before, which certifies no sheet.
+
+What is left of it:
+
+- The table's and the grimoire's enclosures are held by samples alone (198 and 178 boxes, 64
+  points a box, no slack). The compiler's affine form of their carved boards' distance makes a
+  NaN, which a test's debug build stops at. The whole contract of a made thing is past a test's
+  fuel, so its bound and its steepness are held part by part by the kit's own contracts.
+- The candlestick certifies 12 of 100 cells at its 4.8 mm cells and 1 of 100 at 1 cm: 88 of 100
+  of its enclosures have no slopes. They are balls of its bound (a carving's enclosure where the
+  carving can reach the box, `Carved`, or a profile's where its nearest segment is unsure). Which
+  of the two is not measured yet.
+- A sweep's form has no bound (`kit::shapes::sweep`), so its enclosure says nothing.
+- std's primitives state no enclosure of their own. The creature's costs 90,197 work (its 18
+  round cones' forms), about the form of the whole (77,599).
+- The stack's enclosure costs 83,724 work, 73,457 of it the interval of its noise that its
+  range is held within. Its form alone is 10,117.
+- `ToBound`'s enclosure has no contract: a `ToBound` states no bound to tile.
 
 `WRELA_DUMP_IR=affine` says why a field's affine form falls to its interval.
 

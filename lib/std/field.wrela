@@ -1124,6 +1124,25 @@ impl Live {
         Live { words: self.words & (vec4u(4294967295) ^ spans(first, count)) }
     }
 
+    /// The same, with the `count` parts from `first` on, all in one word of the mask (`(first &
+    /// 31) + count <= 32`, `first < 128`), asked as `bits` says: its bit `i` for part `first +
+    /// i`, as `leaf_bits` gives them. What a join of single parts writes its pruning back with:
+    /// it clears a bit a part in its own loop, and builds the word's mask once.
+    fn with_leaf_bits(self, first: u32, count: u32, bits: u32) -> Live {
+        let ones = if count >= 32 { 4294967295 } else { (u32(1) << count) - 1 }
+        let at = first & 31
+        let keep = 4294967295 ^ (ones << at)
+        let put = (bits & ones) << at
+        let w = first >> 5
+        let v = self.words
+        Live { words: vec4u(
+            if w == 0 { (v.x & keep) | put } else { v.x },
+            if w == 1 { (v.y & keep) | put } else { v.y },
+            if w == 2 { (v.z & keep) | put } else { v.z },
+            if w == 3 { (v.w & keep) | put } else { v.w },
+        ) }
+    }
+
     /// How many of the first `parts` parts are asked.
     pub fn count(self, parts: u32) -> u32 {
         let w = self.words & spans(0, min(parts, 128))
@@ -2857,6 +2876,12 @@ fn array_part_name<S: Surface, const N: u32>(parts: [S; N], i: u32) -> PartName 
     if k < N { parts[k].part_name(j) } else { unnamed() }
 }
 
+/// Whether each of `parts` is one part and all of them, numbered from `first`, are in one word
+/// of a `Live`: then part `i`'s bit is `leaf_bits`' bit `i`.
+fn leaves_in_a_word<S: Surface, const N: u32>(parts: [S; N], first: u32) -> bool {
+    array_parts(parts) == N && (first & 31) + N <= 32 && first < 128
+}
+
 /// `masked` of `parts` folded by `join` over the parts with a live part, seeded from the first
 /// live part (never `EMPTY`, which exceeds affine arithmetic's finite cap); returns `EMPTY` only
 /// when no part is live. Where each part is one part and all are in one word of the mask, walks
@@ -2871,7 +2896,7 @@ fn array_masked<S: Surface, const N: u32, J: Copy + fn(f32, f32) -> f32>(
 ) -> f32 {
     var has = false
     var d = 0.0
-    if array_parts(parts) == N && (first & 31) + N <= 32 && first < 128 {
+    if leaves_in_a_word(parts, first) {
         var bits = leaf_bits(live, first, N)
         for _ in 0..N {
             if bits == 0 {
@@ -3252,6 +3277,23 @@ impl<S: Surface, const N: u32> Surface for UnionAll<S, N> {
             }
         }
         var range = Interval { lo: EMPTY, hi: EMPTY }
+        if leaves_in_a_word(self.parts, first) {
+            // Each part one part, all in one word of the mask: a bit a part, cleared by a shift
+            // of the loop's counter (a mask of spans a pass is work every invocation would do
+            // alike, which a shader can't hold: §18.13).
+            var bits = leaf_bits(out, first, N)
+            for i in 0..N {
+                if i != best && apart(ranges[i].lo, ranges[best].hi, 0.0) {
+                    bits = bits & (4294967295 ^ (u32(1) << i))
+                } else {
+                    range = Interval {
+                        lo: min(range.lo, ranges[i].lo),
+                        hi: min(range.hi, ranges[i].hi),
+                    }
+                }
+            }
+            return Pruned { live: out.with_leaf_bits(first, N, bits), range }
+        }
         for i in 0..N {
             if i != best && apart(ranges[i].lo, ranges[best].hi, 0.0) {
                 out = out.without(firsts[i], self.parts[i].parts())
@@ -3457,6 +3499,23 @@ impl<S: Surface, const N: u32> Surface for SmoothUnionAll<S, N> {
             f += self.parts[i].parts()
         }
         var acc = ranges[0]
+        if leaves_in_a_word(self.parts, first) {
+            // As `UnionAll::pruned`'s: a bit a part; a part that starts the fold afresh clears
+            // every bit below its own.
+            var bits = leaf_bits(out, first, N)
+            for j in 1..N {
+                let r = ranges[j]
+                if apart(r.lo, acc.hi, k) {
+                    bits = bits & (4294967295 ^ (u32(1) << j))
+                } else if apart(acc.lo, r.hi, k) {
+                    bits = bits & (4294967295 ^ ((u32(1) << j) - 1))
+                    acc = r
+                } else {
+                    acc = smin_range(acc, r, k)
+                }
+            }
+            return Pruned { live: out.with_leaf_bits(first, N, bits), range: acc }
+        }
         for j in 1..N {
             let r = ranges[j]
             if apart(r.lo, acc.hi, k) {
