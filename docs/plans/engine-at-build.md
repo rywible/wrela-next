@@ -395,28 +395,20 @@ transcendentals with their WGSL limits in the proofs), and a kind that settles b
 Which is which is phase 2's class (a part of class `Frame`), so phase 2 comes before this phase's
 span target; until then the measurement above stands as the distance from the target.
 
-### Transient kernels (2026-11-25)
+### Transient kernels: measured and removed (2026-11-26)
 
-The decision above is in: `dispatch(..., transient: true)` writes a `@strict` kernel exact with the
-driver's built-ins and the GPU's proofs, a pipeline of its own, and a batch whose field changed the
-frame before dispatches its extraction and skinning so (`MeshBatch::transient`). Paired on the M4,
-SCENE 10 strict is +3.0% over the same tree relaxed (inside the noise; it was +12.4%), SCENE 14
--1.3%. SCENE 10's strict GPU time over frames 30 to 33: extraction 14.7 ms (12.8 relaxed),
-skinning 0.89 (0.79), certificates 0.93 (0.67). The twins cost SCENE 10 133 pipelines (319 to
-452) and 1.4 s of its lowering (13.1 to 14.5 s); the host builds all 452 at load in 19 ms (Metal's
-cache), and no span moved.
+`dispatch(..., transient: true)` wrote a `@strict` kernel exact with the driver's built-ins, and a
+batch whose field changed the frame before dispatched so. Each pass got faster (SCENE 10, passes
+alone: extraction 4.87 to 3.45 ms, certificates 0.53 to 0.23, exact cells 0.97 to 1.36), but the
+frame got slower: paired against phase 0 on one host, SCENE 10 was 31.0 ms with it and 26.3
+without (phase 0 24.5 to 24.6, steady), the GPU idle longer after the sun's certificates (1.0 to
+2.2 ms), and its runs varied by up to 8 ms. A paired run is the only measure here: the same build
+read 24.7 to 28.6 ms in single runs. The mechanism, its pipelines (452 against 319) and the
+suggestion to make it a specialization constant are gone with it.
 
-A suggestion to make the twin a specialization of one lowering (a Metal function constant, a
-SPIR-V specialization constant, chosen at pipeline creation) is not taken now: it saves the 1.4 s
-of lowering and the manifest's 133 entries but not the runtime pipelines, the two forms' derived
-intervals differ (a strict module's widen by std's limits and guard NaN bounds), so one shader
-would carry both, and pipeline count and build time are phase 4's to bring under its targets,
-where it is to be weighed again with phase 4's own measurements.
-
-Against phase 0 the measurement is open: one run of SCENE 10 reads 24.81 ms (phase 0: 24.4 to
-24.7), but this tree's runs range 24.7 to 28.6 ms, slowing within a run by about a fifth in every
-pass alike (not its dispatches, 269 a frame against phase 0's 309, nor its memory), with other
-programs taking more than a CPU on the machine.
+Where the rest is: phase 0's wrela code built with today's toolchain is phase 0's span to 0.1%,
+and today's std with phase 0's engine too; today's engine is SCENE 10's +7.1% (26.30 against
+24.55 ms, paired, noise 0.34), which is the strict kernels'. The target, 5%, is 25.78 ms.
 
 ### What is wrong today
 

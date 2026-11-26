@@ -1073,10 +1073,6 @@ pub struct Module {
     /// GPU only: whether a strict module's square root is the GPU's own, which rounds as
     /// IEEE 754 does on this target (`wrela_abi::Target::rounds_sqrt`), not std's code.
     pub rounded_sqrt: bool,
-    /// GPU only: a strict kernel dispatched `transient: true`: written exact with the driver's
-    /// math, its bits this machine's, so what's the same for every invocation moves onto the CPU
-    /// as a relaxed module's does.
-    pub transient: bool,
     /// CPU only: whether the program starts a voice (`std::audio`), so the module imports
     /// `wrela.audio`.
     pub audio: bool,

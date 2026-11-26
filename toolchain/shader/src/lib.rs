@@ -87,7 +87,7 @@ pub fn emit_shader(
 ) -> R<Shader> {
     // A strict pipeline (`@strict`, §11.3) is written as exact mode writes every one: no
     // contraction, and safe math on Metal.
-    let checks = Checks { exact: checks.exact || m.strict || m.exact, ..checks };
+    let checks = Checks { exact: checks.exact || m.strict, ..checks };
     let out = match target {
         wrela_abi::Target::Metal => {
             p.sizes = metal::buffer_sizes(m, p);
