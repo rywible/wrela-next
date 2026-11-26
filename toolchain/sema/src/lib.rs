@@ -87,6 +87,7 @@ const STD_EMBEDDED: &[(&str, &str)] = &[
     ("std::pack", include_str!("../../../lib/std/pack.wrela")),
     ("std::net", include_str!("../../../lib/std/net.wrela")),
     ("std::store", include_str!("../../../lib/std/store.wrela")),
+    ("std::strict", include_str!("../../../lib/std/strict.wrela")),
     ("std::crypto", include_str!("../../../lib/std/crypto.wrela")),
     ("std::http", include_str!("../../../lib/std/http.wrela")),
     ("std::webauthn", include_str!("../../../lib/std/webauthn.wrela")),

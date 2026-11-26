@@ -1,0 +1,173 @@
+// A start-up check that this machine's GPU computes strict math as the CPU does (language.md
+// §11.3; docs/plans/engine-at-build.md phase 1 step 11): a strict kernel runs std's strict
+// functions, a division, a root and a remainder over `CHECK_N` fixed hard arguments, and the
+// results are held to the bits the CPU computed from the same code at build (`WANT`, a constant).
+// A GPU that differs in any bit would give a cooked or certified mesh other bits than the build's:
+// the program that asks stops (`StrictCheck::held`). `toolchain/tests/strict_bits` is the long
+// form, over 4,096 arguments, that `tools/check` runs.
+
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch, read}
+use std::io::Pending
+
+/// The arguments the check computes at.
+pub const CHECK_N: u32 = 64
+
+/// Each function's result for one argument `x` (and `z`, a second, for the functions of two).
+pub struct Results: Copy + GpuData + Plain {
+    sin: f32,
+    cos: f32,
+    tan: f32,
+    exp: f32,
+    exp2: f32,
+    log: f32,
+    log2: f32,
+    sinh: f32,
+    cosh: f32,
+    tanh: f32,
+    atan: f32,
+    asin: f32,
+    acos: f32,
+    atan2: f32,
+    pow: f32,
+    sqrt: f32,
+    div: f32,
+    rem: f32,
+}
+
+/// The results for `x` and `z`, as a strict kernel and the CPU compute them.
+fn results(x: f32, z: f32) -> Results {
+    let a = abs(x)
+    let unit = x / (1.0 + a)
+    Results {
+        sin: sin(x),
+        cos: cos(x),
+        tan: tan(x),
+        exp: exp(x),
+        exp2: exp2(x),
+        log: log(a),
+        log2: log2(a),
+        sinh: sinh(x),
+        cosh: cosh(x),
+        tanh: tanh(x),
+        atan: atan(x),
+        asin: asin(unit),
+        acos: acos(unit),
+        atan2: atan2(x, z),
+        pow: pow(a, z),
+        sqrt: sqrt(a),
+        div: x / z,
+        rem: x % z,
+    }
+}
+
+/// The `i`th pair of arguments: the hard ones first (round π's multiples, the ends of the
+/// functions' ranges, large arguments that need the long reduction), then arguments by a fixed
+/// step through the exponents.
+fn argument(i: u32) -> (f32, f32) {
+    let hard = [
+        0.5, 1.0, 2.0, 3.14159265, 1.57079633, 0.785398163, 6.28318531, 5999.0, 6000.0, 6001.0,
+        1.0e5, 1.0e10, 1.0e20, 1.0e30, 88.7228394, 89.0, -87.3365447, 127.9, 1.0e-20,
+        0.99999994, 1.00000012, 9.0, 0.6931472, -0.5, -1.0, -3.14159265, -1.0e30, 22.0, 1.0e-4,
+        0.3, -2.75, 44.0,
+    ]
+    let x = if i < 32 {
+        hard[i]
+    } else {
+        // Exponents from 2^-12 to 2^19 with a mantissa that walks: no subnormal anywhere.
+        let k = i - 32
+        bitcast_f32((((k * 7) % 32 + 115) << 23) | (k.wrapping_mul(2654435761) & 0x7fffff))
+    }
+    let z = bitcast_f32(((((i * 5) % 16) + 120) << 23) | (i.wrapping_mul(40503) & 0x7fffff))
+    (x, z)
+}
+
+@strict
+@compute(64)
+fn check_kernel(out: mut Slots<Results>, id: GlobalId) {
+    if id.x >= CHECK_N {
+        return
+    }
+    let (x, z) = argument(id.x)
+    out[id] = results(x: x, z: z)
+}
+
+/// The CPU's results at every argument, made at build.
+fn wanted() -> [Results; 64] {
+    var out = [results(x: 0.0, z: 1.0); 64]
+    for i in 0..CHECK_N {
+        let (x, z) = argument(i)
+        out[i] = results(x: x, z: z)
+    }
+    out
+}
+
+const WANT: [Results; 64] = wanted()
+
+/// The check under way: the GPU's results asked for, and what they were held to once in.
+pub struct StrictCheck {
+    back: Pending<Results>,
+    seen: bool,
+    differ: u32,
+    first: u32,
+}
+
+/// Dispatches the check: its results are read back on a later call (`held`).
+pub fn strict_check() -> StrictCheck {
+    var out: GpuBuffer<Results> = buffer(CHECK_N)
+    dispatch(check_kernel.bind(out: mut out), over: CHECK_N)
+    StrictCheck { back: read(out.span(start: 0, count: CHECK_N)), seen: false, differ: 0, first: 0 }
+}
+
+/// Whether the GPU's `got` is the CPU's `want`: the same bits, both NaN, or `want` a subnormal the
+/// GPU flushed to a zero of its sign (every GPU's strict model, §11.3).
+fn same(got: f32, want: f32) -> bool {
+    let g = bitcast_u32(got)
+    let w = bitcast_u32(want)
+    if g == w || (got != got && want != want) {
+        return true
+    }
+    (w & 0x7f800000) == 0 && g == (w & 0x80000000)
+}
+
+impl StrictCheck {
+    /// Whether the results are in and every one has the CPU's bits; panics, naming the first that
+    /// doesn't, where one differs. False until they arrive.
+    pub fn held(mut self) -> bool {
+        if !self.seen {
+            if let Some(Ok(rs)) = self.back.poll() {
+                self.seen = true
+                for i in 0..min(rs.len(), CHECK_N) {
+                    let g = rs[i]
+                    let w = WANT[i]
+                    let pairs = [
+                        (g.sin, w.sin), (g.cos, w.cos), (g.tan, w.tan), (g.exp, w.exp),
+                        (g.exp2, w.exp2), (g.log, w.log), (g.log2, w.log2), (g.sinh, w.sinh),
+                        (g.cosh, w.cosh), (g.tanh, w.tanh), (g.atan, w.atan), (g.asin, w.asin),
+                        (g.acos, w.acos), (g.atan2, w.atan2), (g.pow, w.pow), (g.sqrt, w.sqrt),
+                        (g.div, w.div), (g.rem, w.rem),
+                    ]
+                    for k in 0..18 {
+                        let (a, b) = pairs[k]
+                        if !same(a, b) {
+                            if self.differ == 0 {
+                                self.first = i * 18 + k
+                            }
+                            self.differ += 1
+                        }
+                    }
+                }
+                if self.differ > 0 {
+                    let names = [
+                        "sin", "cos", "tan", "exp", "exp2", "log", "log2", "sinh", "cosh", "tanh",
+                        "atan", "asin", "acos", "atan2", "pow", "sqrt", "a division", "a remainder",
+                    ]
+                    let (x, z) = argument(self.first / 18)
+                    panic(
+                        f"this GPU's strict math is not the CPU's: {self.differ} of {CHECK_N * 18} results differ, the first {names[self.first % 18]} at {x} (and {z}); a mesh it made would not be the build's",
+                    )
+                }
+            }
+        }
+        self.seen
+    }
+}

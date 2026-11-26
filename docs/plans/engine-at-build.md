@@ -362,9 +362,13 @@ use by another project; they are to be run with the rest of the plan's Radeon wo
 
 ## 9. Phase 1: strict math in the geometry kernels
 
-State (2026-11-26): steps 1 to 9 and 12 are done and measured on the M4; step 10 is done for
-std's strict functions (toolchain/tests/strict_bits) and open for the engine's kernels; step 11 is
-open; the Radeon is not measured. SCENE 10 is +3.3% over phase 0, paired (below), inside the
+State (2026-11-26): steps 1 to 9, 11 and 12 are done and measured on the M4; step 10 is done for
+std's strict functions (toolchain/tests/strict_bits) and open for the engine's kernels; the Radeon
+is not measured. Step 11 is `std::strict`: a strict kernel computes std's strict functions, a
+division, a root and a remainder at 64 fixed hard arguments (132 µs once, on the M4), held to the
+bits the CPU computed from the same code at build (a constant); the engine's sight asks at its
+start, and a GPU that differs stops the program, naming the first result (with the kernel's
+argument moved by an ulp: "654 of 1152 results differ, the first sin at 0.5"). SCENE 10 is +3.3% over phase 0, paired (below), inside the
 target of 5%. The gate on the M4: the audit and the sun's judge pass unchanged; spans SCENE
 10/11/13/14 24.87/17.02/18.43/22.02 ms against lines 25.41/17.34/18.93/22.25.
 
