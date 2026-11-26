@@ -1642,23 +1642,32 @@ pub(crate) fn make_strict(cx: &mut Cx, mb: &mut ModuleBuilder) {
     }
     // std's functions' own built-ins, as the CPU computes them.
     ir::strict::lower_strict(&mut mb.m);
-    // A target whose GPU doesn't round its division: every `/` of f32s, those the built-ins
-    // were just written with too, is std's (`std::math::div_rounded`, which asks the GPU's
-    // own only for the quotient of two significands).
-    if !cx.data.target.rounds_div() {
-        for i in 0..mb.m.functions.len() {
-            let mut f = std::mem::take(&mut mb.m.functions[i]);
-            let mut body = std::mem::take(&mut f.body);
-            let this = ir::FuncId(i as u32);
-            ir::visit::expand(&mut body, &mut |s, out| {
-                strict_math(cx, mb, this, &mut f, s, out, true)
-            });
-            f.body = body;
-            mb.m.functions[i] = f;
-        }
-        cx.drain(mb);
-        ir::strict::lower_strict(&mut mb.m);
+}
+
+/// Whether a strict module for this target has its divisions still to write
+/// (`strict_divisions`): its GPU doesn't round a division as IEEE 754 does.
+pub(crate) fn divides_by_std(cx: &Cx) -> bool {
+    !cx.data.target.rounds_div()
+}
+
+/// A strict module's every `/` of f32s made a call to std's `div_rounded` (which asks the GPU's
+/// own division only for the quotient of two significands), those `make_strict` wrote the
+/// built-ins with too: for a target whose GPU doesn't round its division (`divides_by_std`).
+/// After `make_strict`, and after the module's same work is counted (`MOST_SAME_WORK`): that
+/// line is drawn by the work of the code as it is written, a division a division, so what a
+/// program may do is the same for every target. (`div_rounded` and `div_from` are integer
+/// arithmetic, a conversion each way and the one division: no built-in is left in them to write
+/// as the CPU computes it.)
+pub(crate) fn strict_divisions(cx: &mut Cx, mb: &mut ModuleBuilder) {
+    for i in 0..mb.m.functions.len() {
+        let mut f = std::mem::take(&mut mb.m.functions[i]);
+        let mut body = std::mem::take(&mut f.body);
+        let this = ir::FuncId(i as u32);
+        ir::visit::expand(&mut body, &mut |s, out| strict_math(cx, mb, this, &mut f, s, out, true));
+        f.body = body;
+        mb.m.functions[i] = f;
     }
+    cx.drain(mb);
 }
 
 /// `s` into `out` in a strict module's function `this`: a transcendental built-in of f32s, a

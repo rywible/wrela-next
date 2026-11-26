@@ -4010,9 +4010,18 @@ fn verify(cx: &mut Cx, mb: &mut ModuleBuilder, name: &str) -> Option<Counts> {
         // A strict module's transcendentals, square roots and float remainders become calls to
         // std's code once its same work has moved onto the CPU, which computes them with the
         // same code; then the module is flattened again (§11.3).
+        // Then, on a target whose GPU doesn't round its division, its divisions become std's
+        // too: after its same work is counted, which is of the code as written (a division a
+        // division on every target), and it is flattened once more.
+        let mut same_as_written = None;
         if checked.is_ok() && mb.m.strict {
             crate::make_strict(cx, mb);
             checked = ir::opt::flatten_gpu(&mut mb.m);
+            if checked.is_ok() && crate::divides_by_std(cx) {
+                same_as_written = Some(ir::same::same_work(&mb.m, MOST_SAME_WORK + 1));
+                crate::strict_divisions(cx, mb);
+                checked = ir::opt::flatten_gpu(&mut mb.m);
+            }
         }
         checked = checked
             .and_then(|()| ir::gpu_memory::lay_out_gpu_memory(&mut mb.m))
@@ -4063,7 +4072,10 @@ fn verify(cx: &mut Cx, mb: &mut ModuleBuilder, name: &str) -> Option<Counts> {
         }
         if checked.is_ok() {
             weight = written_weight(&mb.m);
-            same = ir::same::same_work(&mb.m, MOST_SAME_WORK + 1);
+            same = match same_as_written.take() {
+                Some(same) => same,
+                None => ir::same::same_work(&mb.m, MOST_SAME_WORK + 1),
+            };
             copies = ir::opt::read_only_copies(&mb.m, ir::opt::MOST_COPIED_BYTES);
             costly = ir::rates::costly_loops(&mb.m, &quiet, &heavy);
         }
@@ -4644,6 +4656,9 @@ fn count_work(
         mb.m.strict = true;
         ir::strict::lower_strict(&mut mb.m);
         crate::make_strict(cx, &mut mb);
+        if crate::divides_by_std(cx) {
+            crate::strict_divisions(cx, &mut mb);
+        }
     }
     let mut w = ir::work::entry_work(&mb.m, id).work;
     if strict {
