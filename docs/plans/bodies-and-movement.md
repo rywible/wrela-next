@@ -371,6 +371,7 @@ than the balance fell (1.59 written, 1.12 fallen for the tests of 0.5).
 | 2026-11-25 | `p4-walk-256b` (L4): phase 4 first small run: the neutral walk, 256 bodies, 60 updates, done | 0.34 |
 | 2026-11-25 | `simspeed-body` (L4): phase 4: the body's step by solver settings and worlds, done | 0.22 |
 | 2026-11-25 | `p4-walk-4096` (L4): phase 4: does the tracker learn one walk, 4,096 bodies, 700 updates, done | 1.37 |
+| 2026-11-25 | `p4-all-1` (L4): phase 4: all 858 training clips, 123 test clips held out, 9000 updates; stopped at update 530 (69 million samples, 48,000 a second) by the owner's change of direction: the creature is not a human body (the balance fell 0.99) | 1.36 |
 
 #### A new machine
 

@@ -166,6 +166,7 @@ def main(load_packed):
         prior_rows = (torch.rand(B, 1, device=dev, generator=gen) < a.prior)
         code_prior = smooth_codes(B, w, gen)
         rec, kl, phys = 0.0, 0.0, 0.0
+        ends0 = None
         for t in range(w):
             row = starts + t
             true_next = data.x[row + 1]
@@ -189,11 +190,21 @@ def main(load_packed):
             pred = n_step.mean + n_step.std * out
             if a.physics > 0 and train_mode:
                 nxt = body.after(cur, pred)
-                phys = phys + physics(cur, nxt)
+                if ends0 is None:
+                    with torch.no_grad():
+                        ends0 = body.part_ends(cur)
+                ends1 = body.part_ends(nxt)
+                phys = phys + physics_of(ends0, ends1)
                 nxt = nxt.detach()
             else:
                 nxt = body.after(cur, pred.detach())
             use = (torch.rand(B, 1, device=dev, generator=gen) < fed_back).float()
+            if a.physics > 0 and train_mode:
+                # The next step's parts: these where the step was fed back, else the capture's.
+                if fed_back >= 1.0:
+                    ends0 = (ends1[0].detach(), ends1[1].detach())
+                else:
+                    ends0 = None
             prev, cur = cur, use * nxt + (1.0 - use) * true_next
             # The root's turn mixed so: renormalise.
             cur = torch.cat([cur[:, :3], cur[:, 3:7] / cur[:, 3:7].norm(dim=-1, keepdim=True),
@@ -201,12 +212,15 @@ def main(load_packed):
         return rec / w, kl / w, phys / w
 
     def physics(cur, nxt):
-        """What the judge would see wrong in the step from `cur` to `nxt`, on flat ground at
-        y = 0, each over its target: each part's depth under the ground (mm over 2), and the
-        speed along the ground of each part's lowest end while it is within 2 cm of the ground
-        in both frames (mm/s over 984)."""
-        a0, b0 = body.part_ends(cur)
-        a1, b1 = body.part_ends(nxt)
+        return physics_of(body.part_ends(cur), body.part_ends(nxt))
+
+    def physics_of(ends0, ends1):
+        """What the judge would see wrong in the step from one frame's parts (`ends0`, each
+        part's two ends) to the next's, on flat ground at y = 0, each over its target: each part's
+        depth under the ground (mm over 2), and the speed along the ground of each part's lowest
+        end while it is within 2 cm of the ground in both frames (mm/s over 984)."""
+        a0, b0 = ends0
+        a1, b1 = ends1
         ra, rb = body.part_ra, body.part_rb
         low0 = torch.stack([a0[..., 1] - ra, b0[..., 1] - rb], -1)
         low1 = torch.stack([a1[..., 1] - ra, b1[..., 1] - rb], -1)
