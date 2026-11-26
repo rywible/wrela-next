@@ -576,11 +576,19 @@ types; the import onto the human repeats it with the human's maps.
 
 Onto the human (2026-11-26, `tools/movement/capture -- human SOURCE`, then its smoothing and
 ground passes): 100STYLE's 810 clips (18.28 h at the human's time, whose legs are the capture's
-length) and MPI EMBM's 288 (0.37 h), no frame out of range (the worst 2.2e-7 rad), the mapped
-joints 54 and 59 mm from the scaled capture's (the human's joints are anatomical centres: the
-hips' by Bell's rule, the spine's discs, the shoulder 34.5 mm under the acromion; the capture's
-skeleton puts its own elsewhere, and only the root, the hands and the feet are aimed at their
-places). Each spine bone of the capture sets one level of the human's spine; its scapulae and
+length) and MPI EMBM's 288 (0.37 h), no frame out of range (the worst 2.2e-7 rad). The first
+import put the 5th percentile of each frame's lowest point on the floor, as the creature's did;
+on the human that left a walk's stance foot 25 mm over the floor (the human's foot is longer from
+its ankle to its ball than the capture's, 153 against 124 mm, so its toes dipped at push-off and
+set the floor), and the judge found the walk in flight in 69% of its frames. The import now
+measures every height from the capture's own floor (the height its ankles keep most, mapped to
+where the body's ankle stands) and holds each sole above the floor with a one-sided aim of the
+fit (`engine::body::fit::aim_floor`): the walk's lowest point is within 1.5 mm of the floor at the
+median and 6.3 mm at the 5th percentile, standing within 0.7 mm; the ground pass then stands a
+clip on the height its soles keep most (the densest 10 mm), a shift near 0. The mapped joints are
+35 to 42 mm from the scaled capture's (the human's joints are anatomical centres: the hips' by
+Bell's rule, the spine's discs, the shoulder 34.5 mm under the acromion; the capture's skeleton
+puts its own elsewhere, and only the root, the hands and the feet are aimed at their places). Each spine bone of the capture sets one level of the human's spine; its scapulae and
 fingers follow no bone (the fit moves a scapula as its arm's aims ask; the fingers hold their
 rest, as no source has them). The import is 2.5 times as fast as at first: the fit searches only
 the numbers an aim depends on (68 of the 112).
@@ -672,6 +680,38 @@ The owner's change of 2026-11-25: the calibration is done again on the human's c
 old and the new targets are reported side by side. The creature's targets were wide because
 capture on the creature is not physical (a 16 kg head on short legs); the human's must be much
 tighter.
+
+Done on 2026-11-26 (`tools/movement/judge -- human calibrate`, the Linux machine): 89 calibration
+clips of 100STYLE judged with their 13 damaged copies each; MPI EMBM's 28 calibration clips all
+sit (left out: `bodies::seated`). Its own statistics are the human's training clips' (100STYLE's
+alone: MPI EMBM's training clips sit too). The capture is preferred in 1,107 of 1,157 pairs
+(95.7%; on the creature 95.4%). The targets, the clean clips' 95th percentile or a floor:
+
+| Measure | Creature (2026-11-25) | Human (2026-11-26) | Change |
+| --- | --- | --- | --- |
+| Root residual (share of the weight) | 0.923 | 0.434 | -53% |
+| Torque past strength (share) | 1.735 | 0.895 | -48% |
+| Slide in contact (mm/s) | 984 | 1,220 | +24% |
+| Penetration (mm) | 2 (floor) | 2.58 | +29% |
+| Float (mm) | 40.9 | 32.2 | -21% |
+| Out of range (rad) | 0.01 (floor) | 0.01 (floor) | 0 |
+| Distance from capture | 4.79 | 2.32 | -51% |
+| Goal error (m/s) | 0.320 | 0.412 | +29% |
+
+The residual, the torque, the distance and the float are much tighter. The slide and the goal
+error are wider: the import holds each sole above the floor but lets it slide along it where the
+capture's foot (another skeleton's) slides, and a run's landings slide most (100STYLE's
+`Neutral_FR`: 1,089 mm/s, its walk 207). Holding a sole where it was in the frame before (a
+friction of the fit) made both worse (the walk's slide 408 mm/s, its mapped joints 79 mm from the
+capture's instead of 42): not kept. The tracker of phase 4 makes the slide physical. Per kind:
+slid 267 of 267, noisy 267 of 267, raised 267 of 267, faster 232 of 267, still 74 of 89; worse
+with more damage in 89 of 89 clips for slid and noisy, 76 for faster, 70 for raised.
+
+The laws of movement on the human (`laws-calibrate`, 27 s for 7,178 s of clean movement): noise
+of 0.02, 0.05 and 0.1 rad puts 30, 78 and 102 of 117 clips outside the power law's band (0.019
+to 0.219) and 30, 74 and 77 of 78 outside the turn order's (0.34 to 0.73); the standing laws' bands
+are 3.4 to 25.8 mm of sway and 0.05 to 0.79 of the chest's power outside breath, a body that
+does not move outside both in 39 of 39.
 
 Purpose: a number says if a movement is correct and if it looks alive. No agent decides this by
 eye.
