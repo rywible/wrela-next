@@ -760,7 +760,14 @@ kind by its type arguments (`eval_corners::<ParryArc>`) and the engine function 
 sites (`extract.wrela:2873:17 in `MeshBatch::run_extract``). Step 6 is done: a dispatch whose
 size the build knows (its group counts constants, or arithmetic of them) and whose bound times
 its invocations is past 50 ms on either target, at the host's arithmetic, is E0714 (no engine
-scene has one). Steps 2 to 5 are open.
+scene has one). Step 5 has its first model: `tools/cost <build>` prices each pass of a frame by
+the compiler's bounds at the host's arithmetic (a dispatch's bound times its invocations, a
+covering draw's fragment bound times the pixels) beside the serial run's time of each. SCENE 10,
+frame 40, 1080p, M4: 628.5 ms modelled against 13.8 ms measured over the priced passes (45.6
+times), extraction 67.6 times (its indirect dispatches booked at their stated most), direct light
+85.6, the sun's certificates 0.8; mesh draws are not priced yet. The target is 20%: the model
+must count what a pass does in a usual frame (the invocations an indirect dispatch really ran,
+and the work an invocation really did), not its bounds. Steps 2 to 4 are open.
 
 ### The decisions made at run time (step 1)
 

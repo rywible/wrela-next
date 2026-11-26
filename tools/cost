@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+"""What a frame's passes cost by the compiler's count, beside what they take. Usage:
+
+    tools/cost <build> [--size WxH] [--frame N] [--timeout S] [--json FILE]
+
+The model (docs/plans/engine-at-build.md phase 4 step 5): a pass's cost is the sum over its
+commands of their work at the host's own arithmetic (`wrela-host`'s `step::ms_of`): a dispatch's
+kernel bound (the manifest's `work`) times its invocations, never fewer than the GPU's width,
+times the target's time a unit (`wrela_abi`'s `step_femtoseconds`); a draw of a covering
+triangle (`vertices 3 x 1`), its fragment entry point's bound times the screen's pixels (a draw
+of a mesh is not modelled yet: its fragments aren't known before it runs). An indirect dispatch
+is booked at its stated most, as the host books it.
+
+The measure: the same run with `--timestamps --serial` (each pass and dispatch alone, timed by
+its own stamps), frame N (after its warm-up), each label's commands summed. A command the model
+doesn't price is left out of both sums and counted. Bounds are maxima, so the model is an upper
+bound before it is an estimate: the table says by how much, label by label, which is what the
+next step of the model works from.
+
+Runs through tools/gpu (the guard, the lock, the timeout)."""
+
+import json
+import os
+import re
+import subprocess
+import sys
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+GPU = os.path.join(ROOT, "tools", "gpu")
+
+# The host's arithmetic (toolchain/abi/src/lib.rs `TargetLimits`): both targets alike today.
+UNIT_FS = 2500
+WIDTH = 8192
+
+STEP = re.compile(r"^step frame (\d+) (dispatch|draw) (\S+) \| (\S+) \| (.*)$")
+TIMED = re.compile(r"^frame\s+(\d+)\s+(\S+)\s+([\d.]+) us$")
+
+
+def ms_of(work, invocations):
+    return work * max(invocations, WIDTH) * UNIT_FS * 1e-12
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0 if argv else 2
+    build, size, frame, timeout, js = argv[0], "1920x1080", 40, 600, None
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a in ("--size", "--frame", "--timeout", "--json") and i + 1 < len(argv):
+            v = argv[i + 1]
+            if a == "--size":
+                size = v
+            elif a == "--frame":
+                frame = int(v)
+            elif a == "--timeout":
+                timeout = int(v)
+            else:
+                js = v
+            i += 2
+            continue
+        print(f"cost: unknown option {a}", file=sys.stderr)
+        return 2
+    w, h = (int(x) for x in size.split("x"))
+    with open(os.path.join(build, "manifest.json")) as f:
+        manifest = json.load(f)
+    work = {p["name"]: p.get("work") or [] for p in manifest["pipelines"]}
+    cmd = [GPU, "--timeout", str(timeout), build, "--size", size, "--frames", str(frame + 1),
+           "--timestamps", "--serial", "--steps"]
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    if p.returncode != 0:
+        print(p.stdout[-2000:], file=sys.stderr)
+        return 1
+    model, measured, unpriced, order = {}, {}, {}, []
+    priced = []  # per command of the frame, in order: whether the model priced it
+    for line in p.stdout.splitlines():
+        m = STEP.match(line)
+        if m and int(m.group(1)) == frame:
+            kind, label, name, rest = m.group(2), m.group(3), m.group(4), m.group(5)
+            if label not in order:
+                order.append(label)
+            cost = None
+            if kind == "dispatch":
+                inv = re.search(r"invocations (\d+)", rest)
+                bound = re.search(r"bound (\d+)", rest)
+                if inv and bound:
+                    cost = ms_of(int(bound.group(1)), int(inv.group(1)))
+            elif "vertices 3 x 1" in rest:
+                ws = work.get(name, [])
+                if len(ws) == 2 and ws[1] is not None:
+                    cost = ms_of(ws[1], w * h)
+            if cost is None:
+                unpriced[label] = unpriced.get(label, 0) + 1
+            else:
+                model[label] = model.get(label, 0.0) + cost
+            priced.append((label, cost is not None, kind))
+    # The serial run times each pass (a draw's pass, once) and each dispatch alone, in order.
+    times = [(m.group(2), float(m.group(3)) / 1000.0) for line in p.stdout.splitlines()
+             if (m := TIMED.match(line)) and int(m.group(1)) == frame]
+    for label, ms in times:
+        measured[label] = measured.get(label, 0.0) + ms
+    rows = []
+    tot_m = tot_t = 0.0
+    for label in order:
+        mo, me = model.get(label, 0.0), measured.get(label, 0.0)
+        rows.append({"label": label, "model_ms": round(mo, 3), "measured_ms": round(me, 3),
+                     "unpriced": unpriced.get(label, 0)})
+        if mo > 0:
+            tot_m += mo
+            tot_t += me
+    print(f"cost of frame {frame} at {size} ({build}): the model against the serial run")
+    print(f"  {'pass':<22} {'model ms':>10} {'measured':>10} {'model/measured':>15}  unpriced")
+    for r in rows:
+        ratio = f"{r['model_ms'] / r['measured_ms']:.1f}x" if r["measured_ms"] > 0 and r["model_ms"] > 0 else "-"
+        print(f"  {r['label']:<22} {r['model_ms']:>10.3f} {r['measured_ms']:>10.3f} {ratio:>15}  {r['unpriced'] or ''}")
+    print(f"  {'priced passes':<22} {tot_m:>10.3f} {tot_t:>10.3f} {(tot_m / tot_t if tot_t else 0):>14.1f}x")
+    if js:
+        with open(js, "w") as f:
+            json.dump({"frame": frame, "size": size, "rows": rows,
+                       "model_ms": tot_m, "measured_ms": tot_t}, f, indent=1)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
