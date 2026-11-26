@@ -886,6 +886,27 @@ pipeline count, the time to the first frame and the build time before and after 
 
 ## 13. Phase 5: make the frame faster with proofs
 
+State (2026-11-26): the loop has begun on the M4. The gate's spans now (timed as the game's frame
+is, §5): SCENE 10/11/13/14 20.87/16.52/18.97/21.95 ms; SCENE 11 is within the bar.
+
+The largest proof debt, counted: SCENE 14's frame (1080p, frame 60, each pass alone) spends 10.7 ms
+in the exact cells (`mesh_exact`) and 3.5 ms in the sun's exact rays, of about 22. Its table's
+batch (3.7 mm cells) gives 4,959 outline cells a certificate's test and 4,638 exact cells, 1,397 of
+them thin cells; the candlestick's (4.8 mm) 2,508 and 2,873, 365 thin. So 65% and 99% of their
+outline cells fail the sheet certificate. Not for want of a stronger certificate: the affine one in
+place of the pruned one (`is_heavy_field`) failed as many. On the CPU, at a surface point with the
+field's own normal, it certifies 6 of 300 cells of each (41 at a slab a cell wide). The cause: the
+affine derivation falls back to the plain interval (no slopes) for the kit's turned and moulded
+shapes (`kit::shapes::outline::Profile`), so a certificate sees a box, never a sheet. A straight
+segment's offset alone kept its slopes; the profile's code lost them where it:
+
+1. compares two conditions (`crosses`' `(a.y > p.y) != (b.y > p.y)`): no rule for `==` and `!=`
+   of `bool`s; one now (sure where each side is);
+2. calls a function that returns a condition (`crosses` itself, any predicate): a derived call
+   returned only forms of floats; it now returns a condition's sureness;
+3. carries a struct of floats and conditions through its loop (`Signed2`, `Near2`): an active
+   local or result must be floats alone, or a `bool`. Open: next.
+
 Purpose: find the work that the engine does only because a proof is missing, and remove it. Then
 decrease the cost that no proof can remove.
 

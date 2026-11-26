@@ -477,7 +477,16 @@ fn derive(
             return Err(Error::not_derivable("an active local that isn't a float or a bool"));
         }
     }
-    if returns {
+    if returns && func.ret == Some(bool_ty) && !func.ret_ref {
+        // A condition's: whether the box makes it surely true, and surely false (a call of an
+        // outline's crossing test, `crosses`: with no form here, the field's whole form fell to
+        // its interval).
+        nf.ret_ref = false;
+        nf.ret = Some(m.types.intern(TypeDef::Struct {
+            name: "sure<bool>".to_string(),
+            fields: vec![("sure".to_string(), bool_ty), ("never".to_string(), bool_ty)],
+        }));
+    } else if returns {
         let r = func.ret.ok_or_else(|| Error::internal("a missing result type"))?;
         if !floaty(&m.types, r) || func.ret_ref {
             return Err(Error::not_derivable("an active result that isn't made of floats"));
@@ -2808,6 +2817,13 @@ impl Af<'_> {
                 }
                 Ok(())
             }
+            Stmt::Return(Some(v)) if self.returns && self.f.ret == Some(self.bool_ty) => {
+                let (st, sf) = self.sure_of(out, *v);
+                let rt = self.nf.ret.ok_or_else(|| Error::internal("no sureness type"))?;
+                let r = self.emit(out, rt, Expr::Construct(rt, vec![st, sf]));
+                out.push(Stmt::Return(Some(r)));
+                Ok(())
+            }
             Stmt::Return(Some(v)) if self.returns => {
                 let ty = self.f.ret.ok_or_else(|| Error::internal("no result type"))?;
                 let a = self.of_as(out, *v, ty);
@@ -3014,6 +3030,21 @@ impl Af<'_> {
                     self.emit(out, bt, Expr::Binary(p, x.0, y.0)),
                     self.emit(out, bt, Expr::Binary(q, x.1, y.1)),
                 )
+            }
+            // Two conditions alike, or not: sure where each is (an outline's crossing test,
+            // `(a.y > p.y) != (b.y > p.y)`, in every kit profile's segment; with no rule here
+            // the whole field's form fell to its interval, and no outline cell of a turned or
+            // moulded thing was certified).
+            Expr::Binary(op @ (BinOp::Eq | BinOp::Ne), a, b) => {
+                let (x, y) = (self.sure_of(out, *a), self.sure_of(out, *b));
+                let bt = self.bool_ty;
+                let tt = self.emit(out, bt, Expr::Binary(BinOp::And, x.0, y.0));
+                let ff = self.emit(out, bt, Expr::Binary(BinOp::And, x.1, y.1));
+                let tf = self.emit(out, bt, Expr::Binary(BinOp::And, x.0, y.1));
+                let ft = self.emit(out, bt, Expr::Binary(BinOp::And, x.1, y.0));
+                let same = self.emit(out, bt, Expr::Binary(BinOp::Or, tt, ff));
+                let apart = self.emit(out, bt, Expr::Binary(BinOp::Or, tf, ft));
+                if *op == BinOp::Eq { (same, apart) } else { (apart, same) }
             }
             Expr::Unary(UnOp::Not, x) => {
                 self.not_defs.insert(v, *x);
@@ -3549,6 +3580,16 @@ impl Af<'_> {
         }
         new_args.extend(extra);
         match (v, returns) {
+            (Some(v), true) if self.f.value_ty(v) == self.bool_ty => {
+                let rt = self.m.functions[dg.index()]
+                    .ret
+                    .ok_or_else(|| Error::internal("no sureness type"))?;
+                let r = self.emit(out, rt, Expr::Call(dg, new_args));
+                let bt = self.bool_ty;
+                let st = self.emit(out, bt, Expr::Extract(r, 0));
+                let sf = self.emit(out, bt, Expr::Extract(r, 1));
+                self.sure.insert(v, (st, sf));
+            }
             (Some(v), true) => {
                 let ty = self.f.value_ty(v);
                 let rt = self.m.functions[dg.index()]

@@ -339,3 +339,36 @@ pub fn frame(s: mut State, _time: f32, _width: u32, _height: u32) {
     assert!(!msl.contains("77777"), "dead transmissive branch leaked into Metal:\n{msl}");
     assert!(!msl.contains("prove_facts"), "build-time verifier leaked into Metal:\n{msl}");
 }
+
+/// An affine form keeps its slopes through a condition that compares two conditions (`!=` of two
+/// `bool`s) and through a call that returns a condition: each is unsure over a box that straddles
+/// it, and the form is the sides' hull, its slope along `y` kept (before either had a rule, the
+/// whole field's form fell to its interval: a kit outline's crossing test, `crosses`, cost every
+/// turned and moulded thing its outline certificates, docs/plans/engine-at-build.md phase 5).
+#[test]
+fn an_affine_form_keeps_its_slopes_through_conditions_of_conditions_and_calls() {
+    let dir = crate::package(
+        "optimize/affine-conditions",
+        r#"
+use std::derive::{Box3, affine_form}
+
+fn over(x: f32, k: f32) -> bool {
+    x > k
+}
+
+@test
+fn slopes_survive() {
+    let b = Box3 { lo: vec3(0.0, 0.0, 0.0), hi: vec3(1.0, 1.0, 1.0) }
+    let ne = affine_form(|q: vec3| (if (q.x > 0.3) != (q.z > 0.6) { 1.0 } else { 0.0 }) + q.y, b)
+    assert(ne.valid() && abs(ne.l.y - 0.5) < 1.0e-5, f"!= of conditions: {ne.l}")
+    let called = affine_form(|q: vec3| (if over(q.x, 0.4) { 1.0 } else { 0.0 }) + q.y, b)
+    assert(called.valid() && abs(called.l.y - 0.5) < 1.0e-5, f"a call's condition: {called.l}")
+    let sure = affine_form(|q: vec3| (if over(q.x, 2.0) { 1.0 } else { 0.0 }) + q.y, b)
+    assert(sure.e < 1.0e-5 && abs(sure.c - 0.5) < 1.0e-5, f"a sure call: {sure.c} {sure.e}")
+}
+"#,
+    );
+    let out = wrela_driver::test(&dir, None);
+    assert!(!wrela_diag::has_errors(&out.diagnostics), "{}", wrela_diag::render::render_all(&out.sources, &out.diagnostics));
+    assert!(out.results.iter().all(|r| r.failure.is_none()), "{:?}", out.results);
+}
