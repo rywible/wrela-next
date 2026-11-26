@@ -90,6 +90,10 @@ def main(load_packed):
                    help="the weight of the parts' depth and slide on the ground (each over its target)")
     p.add_argument("--prior", type=float, default=0.3,
                    help="the share of windows whose code is drawn from the prior, not the encoder")
+    p.add_argument("--goal", type=float, default=0.0,
+                   help="the weight of the window's mean velocity against its goal's (per (m/s)^2)")
+    p.add_argument("--ground", type=float, default=0.0,
+                   help="the weight of each foot's height over the floor against the capture's (per m^2)")
     p.add_argument("--hide", type=float, default=0.3, help="the chance that each goal is hidden")
     p.add_argument("--eval-every", type=int, default=2000)
     p.add_argument("--threads", type=int, default=0)
@@ -165,8 +169,12 @@ def main(load_packed):
         mask = (torch.rand(B, 2, device=dev, generator=gen) > a.hide).float()
         prior_rows = (torch.rand(B, 1, device=dev, generator=gen) < a.prior)
         code_prior = smooth_codes(B, w, gen)
-        rec, kl, phys = 0.0, 0.0, 0.0
+        rec, kl, phys, ground = 0.0, 0.0, 0.0, 0.0
         ends0 = None
+        # The window's mean velocity along the ground (its steps, in each frame's heading frame)
+        # and its goals' mean, for the goal's loss.
+        v_sum = torch.zeros(B, 2, device=dev)
+        g_sum = torch.zeros(B, 2, device=dev)
         for t in range(w):
             row = starts + t
             true_next = data.x[row + 1]
@@ -188,18 +196,26 @@ def main(load_packed):
             # the numbers, so the code's KL weighs against the whole step.
             rec = rec + 0.5 * ((out - n_step(tgt)) ** 2).sum(-1).mean()
             pred = n_step.mean + n_step.std * out
-            if a.physics > 0 and train_mode:
+            v_sum = v_sum + pred[:, 0:2] * rate
+            g_sum = g_sum + g[:, 0:2]
+            if (a.physics > 0 or a.ground > 0) and train_mode:
                 nxt = body.after(cur, pred)
                 if ends0 is None:
                     with torch.no_grad():
-                        ends0 = body.part_ends(cur)
-                ends1 = body.part_ends(nxt)
-                phys = phys + physics_of(ends0, ends1)
+                        ends0 = feet_ends(cur)
+                ends1 = feet_ends(nxt)
+                if a.physics > 0:
+                    phys = phys + physics_of(ends0, ends1)
+                if a.ground > 0:
+                    # Each foot's height over the floor, against the capture's same foot's.
+                    with torch.no_grad():
+                        h_true = foot_heights(feet_ends(true_next))
+                    ground = ground + ((foot_heights(ends1) - h_true) ** 2).sum(-1).mean()
                 nxt = nxt.detach()
             else:
                 nxt = body.after(cur, pred.detach())
             use = (torch.rand(B, 1, device=dev, generator=gen) < fed_back).float()
-            if a.physics > 0 and train_mode:
+            if (a.physics > 0 or a.ground > 0) and train_mode:
                 # The next step's parts: these where the step was fed back, else the capture's.
                 if fed_back >= 1.0:
                     ends0 = (ends1[0].detach(), ends1[1].detach())
@@ -209,10 +225,37 @@ def main(load_packed):
             # The root's turn mixed so: renormalise.
             cur = torch.cat([cur[:, :3], cur[:, 3:7] / cur[:, 3:7].norm(dim=-1, keepdim=True),
                              cur[:, 7:]], -1)
-        return rec / w, kl / w, phys / w
+        # Only the windows whose speed goal was shown are held to it.
+        shown = mask[:, 0:1]
+        goal_err = (shown * (v_sum / w - g_sum / w) ** 2).sum(-1).mean()
+        return rec / w, kl / w, phys / w, goal_err, ground / w
+
+    # The parts the physics measures: those that stand on the floor at rest (the soles), whose
+    # kinematics alone are worked out, as the judge's slide and depth are the feet's in walking.
+    feet = body.low_parts()
+
+    def feet_ends(pose):
+        a_, b_, ra_, rb_ = body.ends_of(pose, feet)
+        return a_, b_
+
+    # Each foot's parts (the soles left of the body's middle at rest, and right of it).
+    rest_pose = torch.zeros(7 + body.freedom, device=dev)
+    rest_pose[3:7] = body.rest
+    ra0, rb0 = body.part_ends(rest_pose)
+    side_left = torch.tensor([bool(ra0[i, 0] > 0) for i in feet], device=dev)
+
+    def foot_heights(ends):
+        """Each foot's lowest point above the floor [B, 2] (left, right)."""
+        a_, b_ = ends
+        idx = torch.tensor(feet, device=dev)
+        low = torch.minimum(a_[..., 1] - body.part_ra[idx], b_[..., 1] - body.part_rb[idx])
+        big = torch.full_like(low, 1e3)
+        left = torch.where(side_left, low, big).min(-1).values
+        right = torch.where(~side_left, low, big).min(-1).values
+        return torch.stack([left, right], -1)
 
     def physics(cur, nxt):
-        return physics_of(body.part_ends(cur), body.part_ends(nxt))
+        return physics_of(feet_ends(cur), feet_ends(nxt))
 
     def physics_of(ends0, ends1):
         """What the judge would see wrong in the step from one frame's parts (`ends0`, each
@@ -221,7 +264,8 @@ def main(load_packed):
         end while it is within 2 cm of the ground in both frames (mm/s over 984)."""
         a0, b0 = ends0
         a1, b1 = ends1
-        ra, rb = body.part_ra, body.part_rb
+        idx = torch.tensor(feet, device=dev)
+        ra, rb = body.part_ra[idx], body.part_rb[idx]
         low0 = torch.stack([a0[..., 1] - ra, b0[..., 1] - rb], -1)
         low1 = torch.stack([a1[..., 1] - ra, b1[..., 1] - rb], -1)
         pen = torch.relu(-low1).sum(-1).mean(-1) * 1000.0 / 2.0
@@ -270,17 +314,17 @@ def main(load_packed):
         # Scheduled sampling: none fed back for the first fifth, then more to all by three fifths.
         fed = min(max((step / a.steps - 0.2) / 0.4, 0.0), 1.0)
         starts, ends = train.sample(a.batch, gen)
-        rec, kl, phys = rollout(train, starts, ends, a.window, fed, True)
-        loss = rec + a.beta * kl + a.physics * phys
+        rec, kl, phys, goal_err, ground = rollout(train, starts, ends, a.window, fed, True)
+        loss = rec + a.beta * kl + a.physics * phys + a.goal * goal_err + a.ground * ground
         opt.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(list(enc.parameters()) + list(dec.parameters()), 1.0)
         opt.step()
         step += 1
         ph = float(phys.detach()) if not isinstance(phys, float) else phys
-        run.progress(step, a.steps, f"rec {rec.item():.4f} kl {kl.item():.2f} phys {ph:.3f} fed {fed:.2f}")
+        run.progress(step, a.steps, f"rec {rec.item():.4f} kl {kl.item():.2f} phys {ph:.3f} goal {goal_err.item():.3f} fed {fed:.2f}")
         if step % 100 == 0:
-            print(f"update {step}: rec {rec.item():.4f} kl {kl.item():.2f} physics {ph:.3f} fed back {fed:.2f} "
+            print(f"update {step}: rec {rec.item():.4f} kl {kl.item():.2f} physics {ph:.3f} goal {goal_err.item():.3f} fed back {fed:.2f} "
                   f"({time.time() - t0:.0f} s)", flush=True)
         if a.eval_every and step % a.eval_every == 0:
             last_eval = {"test": evaluate(test), "training": evaluate(train)}

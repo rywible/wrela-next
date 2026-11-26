@@ -151,6 +151,48 @@ class Body:
             qs.append(qmul(qs[p], fq))
         return torch.stack(ts, -2), torch.stack(qs, -2)
 
+    def places_of(self, pose, segments):
+        """The frames of `segments` and of each segment they hang from (dict: segment -> (place,
+        turn)): the kinematics of a part of the body only."""
+        need = set()
+        for s in segments:
+            while s >= 0 and s not in need:
+                need.add(s)
+                s = self.parent[s]
+        q = pose[..., 7:]
+        out = {0: (pose[..., :3], pose[..., 3:7])}
+        for s in sorted(need):
+            if s == 0:
+                continue
+            p = self.parent[s]
+            pt, pq = out[p]
+            at_q = self.at_q[s].expand(q.shape[:-1] + (4,))
+            fq = qmul(at_q, self.turn(s, q))
+            out[s] = (pt + qrot(pq, self.at_t[s].expand(q.shape[:-1] + (3,))), qmul(pq, fq))
+        return out
+
+    def ends_of(self, pose, parts):
+        """The two ends in the world of each of `parts` (indices) [..., len, 3], and their radii."""
+        segs = set(int(self.part_a_on[i]) for i in parts) | set(int(self.part_b_on[i]) for i in parts)
+        fr = self.places_of(pose, segs)
+        a, b = [], []
+        for i in parts:
+            ta, qa = fr[int(self.part_a_on[i])]
+            tb, qb = fr[int(self.part_b_on[i])]
+            a.append(ta + qrot(qa, self.part_a[i].expand(ta.shape)))
+            b.append(tb + qrot(qb, self.part_b[i].expand(tb.shape)))
+        idx = torch.tensor(parts, device=self.part_ra.device)
+        return torch.stack(a, -2), torch.stack(b, -2), self.part_ra[idx], self.part_rb[idx]
+
+    def low_parts(self, below=0.006):
+        """The parts that touch the floor at rest (their lowest point within `below` of the
+        body's): the feet's, which stand on it."""
+        rest = torch.zeros(7 + self.freedom, device=self.part_ra.device)
+        rest[3:7] = self.rest
+        a, b = self.part_ends(rest)
+        low = torch.minimum(a[..., 1] - self.part_ra, b[..., 1] - self.part_rb)
+        return [i for i in range(len(self.parts)) if low[i] < low.min() + below]
+
     def part_ends(self, pose):
         """Each part's two ends in the world [..., P, 3] each, and their radii [P]."""
         t, q = self.places(pose)
