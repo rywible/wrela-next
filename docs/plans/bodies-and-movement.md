@@ -383,6 +383,7 @@ than the balance fell (1.59 written, 1.12 fallen for the tests of 0.5).
 | 2026-11-25 | `p4-walk-4096` (L4): phase 4: does the tracker learn one walk, 4,096 bodies, 700 updates, done | 1.37 |
 | 2026-11-25 | `p4-all-1` (L4): phase 4: all 858 training clips, 123 test clips held out, 9000 updates; stopped at update 530 (69 million samples, 48,000 a second) by the owner's change of direction: the creature is not a human body (the balance fell 0.99) | 1.36 |
 | 2026-11-26 | `p4h-small` (L4): phase 4 on the human: the speed of the tracker's training, 20 updates at 4096 worlds, done | 0.22 |
+| 2026-11-26 | `p4h-1` (L4): phase 4 on the human: 629 training clips, 91 test clips held out, 8500 updates, failed | 2.87 |
 
 #### A new machine
 
@@ -887,6 +888,24 @@ removes the faults of the retarget: slide, penetration and forces that cannot oc
   More than the limit allows at its high end: rule 9 for Colab. The first long run is held to 20
   units and its curve decides the next.
 
+### On the human (2026-11-26)
+
+- The export of the human (`tools/movement/export -- human training test`, `.movement/sim-human`):
+  720 clips of the training and test sets (16.3 h; the seated left out), 30 segments that no clip
+  moves (the fingers) welded to their parents and their parts kept from colliding: qpos 69. The
+  model agrees with the engine: every mass and inertia exactly, the segments' places to 0.002 mm
+  and turns to 0.74 mrad; the judge's joint moments against MuJoCo's inverse dynamics to 0.06,
+  0.22 and 0.04% at the median on a walk, a run and a turn (1.41, 3.72 and 1.42% at the 95th
+  percentile).
+- The tracker's speed on the L4 for the human: about 35,000 samples a second at 4,096 bodies
+  (`p4h-small`, 0.22 units).
+- The first long run (`p4h-1`) learned to update 980 (reward 0.77, falls 0.4% a step) and then
+  fell apart: each world held 32 contacts and 160 constraint rows, sized for the creature's 18
+  parts, and with the human's 81 the simulator dropped contacts. Its job ended there, and its
+  resume from the checkpoint failed on a generator's state put on the GPU (2.87 units). The
+  budgets now come from the model (two contacts a colliding part, four rows a contact and a row
+  a joint) and a welded segment's parts do not collide; `p4h-2` runs the same training again.
+
 ### Done when
 
 - The tracker follows not less than 95% of the clips, test clips included, to the end with no
@@ -954,6 +973,29 @@ through the world with no cycle and no clip.
 17. **Move the creature with the solver in each scene.** Remove `lib/kit/motion/cycle.wrela` and
     `game/rules/walk.wrela` in the same change (`playback.wrela` and `gaits.wrela` went in
     phase 1). Correct the rows of `docs/citations.md`.
+
+### Where it is on the human (2026-11-26)
+
+- The engine's solver (`engine::body::motion`): the state, the step and the goals in the
+  heading frame; `solved` (a net's step from the state, a wish and a code drawn from a seed, the
+  code changing over 8 ticks); `on_floor` (step 9: the root raised by its deepest part's depth
+  under the floor). The net is evaluated in the engine (`engine::learned::net`, step 2: PyTorch's
+  outputs to 3.4e-6 for 1,000 inputs) and its rollout is PyTorch's to 4.4e-6 over 10 s.
+- The training (`tools/movement/solve.py`, on the CPU here): a conditional VAE of the step fed its
+  own steps (scheduled sampling), 30% of its windows with codes drawn from the prior, and three
+  losses beside the step's: each window's mean speed against its goal, the soles' depth and slide
+  (the judge's, on the feet's kinematics alone), and each foot's height over the floor against
+  the capture's same foot's. A decoder of 128, 128, 128 (84,218 weights), 6,000 updates of 512
+  windows of 16 frames, 70 minutes.
+- On held-out test clips it follows its speed goals to 0.12 m/s (without the goal's loss 0.60).
+  The goal test (`tools/movement/solver -- human goaltest`, `tools/movement/judge -- human
+  goals`, the human's targets): start, stop, turn and the step to the side pass every target; the
+  walk all but its slide (1,237 mm/s against 1,220); the run fails four (its residual 0.53, slide
+  2,532 mm/s, float 44 mm and goal error 0.52 m/s at 3 m/s asked).
+- Not yet: the timed goals (a hand at a point at a tick, a point to look at), the solver trained
+  on the filtered capture (phase 4's tracker on the human is in work), the tracker following the
+  solver's output, the bits on the two machines (the M4 is not measured), the CPU time a body,
+  the search for clips given back, the prior of style and the skills.
 
 ### The goal test
 
