@@ -256,6 +256,20 @@ class Body:
             q = self.clamped(q)
         return torch.cat([t, rq, q], -1)
 
+    def stretched(self, now, s, k):
+        """Step `s` (of one frame from `now`) taken `k` times over, as
+        `engine::body::motion::stretched`: each change (the move along the ground, the heading's
+        turn, each number's change, and the height's and the tilt's from `now`'s) times `k`."""
+        was = self.tilt(now[..., 3:7])
+        return torch.cat([s[..., 0:2] * k, now[..., 1:2] + k * (s[..., 2:3] - now[..., 1:2]), s[..., 3:4] * k,
+                          was + k * (s[..., 4:10] - was), s[..., STEP_ROOT:] * k], -1)
+
+    def unstretched(self, now, s, k):
+        """The step of one frame that `stretched` takes `k` times over to make step `s`."""
+        was = self.tilt(now[..., 3:7])
+        return torch.cat([s[..., 0:2] / k, now[..., 1:2] + (s[..., 2:3] - now[..., 1:2]) / k, s[..., 3:4] / k,
+                          was + (s[..., 4:10] - was) / k, s[..., STEP_ROOT:] / k], -1)
+
     def goal(self, now, ahead, seconds):
         h = self.heading(now[..., 3:7])
         d = qrot(yaw(-h), ahead[..., :3] - now[..., :3]) / seconds[..., None]

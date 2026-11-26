@@ -386,6 +386,7 @@ than the balance fell (1.59 written, 1.12 fallen for the tests of 0.5).
 | 2026-11-26 | `p4h-1` (L4): phase 4 on the human: 629 training clips, 91 test clips held out, 8500 updates, failed | 2.87 |
 | 2026-11-26 | `p4h-2` (L4): phase 4 on the human: 629 training clips, 91 test held out, 8500 updates; contacts sized from the model, stopped by a signal | 3.72 |
 | 2026-11-26 | `p4h-3` (L4, and a T4 for 10 min): phase 4 on the human: 629 training clips, 91 test held out, 8500 updates; blown-up worlds reset (none blew up). A poll's 404 was taken for a lost session while the L4 ran on: a T4 was started and billed beside it, then stopped. Fell apart at update 980 as the two runs before; stopped at update 1033 | 2.97 |
+| 2026-11-26 | `p4h-4` (L4): phase 4 on the human: 629 training clips, 91 test held out, 4000 updates; PPO's step held (KL 0.02) and collapses rolled back; past update 1,000 with no collapse, but its reward flat at 0.645 from update 600 (one epoch an update, its KL 0.034 to 0.049): stopped at update 1,110 for the rate that follows the KL | 2.25 |
 
 #### A new machine
 
@@ -1006,33 +1007,50 @@ through the world with no cycle and no clip.
   own steps (scheduled sampling), 30% of its windows with codes drawn from the prior, and three
   losses beside the step's: each window's mean speed against its goal, the soles' depth and slide
   (the judge's, on the feet's kinematics alone), and each foot's height over the floor against
-  the capture's same foot's. A decoder of 128, 128, 128 (84,218 weights), 6,000 updates of 512
-  windows of 16 frames, 70 minutes.
-- On held-out test clips it follows its speed goals to 0.12 m/s (without the goal's loss 0.60).
+  the capture's same foot's. A decoder of 128, 128, 128 (84,346 weights), 6,000 updates of 512
+  windows of 16 steps, 93 minutes. Each update's windows take steps of 1, 2 or 4 frames (1 half
+  the time): the net reads the state of two poses that far apart and the period's log2, and gives
+  a step of one frame that the period takes over again (`stretched`), for step 10.
+- On held-out test clips (`human5`) it follows its speed goals to 0.075 m/s (0.076 solved each 2
+  frames, 0.084 each 4; without the strides `human3` 0.12, without the goal's loss 0.60), its
+  physics measure 0.89 (`human3` 1.27).
   The goal test (`tools/movement/solver -- human goaltest`, `tools/movement/judge -- human
   goals`, the human's targets), each at its gait's 90th-percentile speed in the training clips
   (a walk 0.9 m/s, a run 1.5, a step to the side 0.58): start, stop, walk, turn and the step to
-  the side pass every target, the run all but its slide (1,415 mm/s against 1,220). 100STYLE is
+  the side pass every target, the run all but its slide (1,366 mm/s against 1,220; `human3`
+  1,415). 100STYLE is
   slow (its walks 0.56 m/s at the median, its runs 1.04; their 99th percentiles 1.23 and 1.92): at
   a person's usual walk (1.3 m/s) the walk's slide is 1,237 mm/s and at a run of 3 m/s the run
   fails four targets. Faster gaits need capture that holds them (CeTI's and the other sources of
   the register not yet imported).
 - The CPU time of one tick of one body (`tools/movement/solver -- human time`, WASM, strict
-  floats, the Linux machine): 56 to 72 microseconds (`solved` and `on_floor`, a net of 84,218
-  weights), so one thread moves 14 to 18 bodies at the full rate in 1 ms (0.3's budget); far
-  bodies take a lower rate (step 10).
-- No clip given back (`tools/movement/solve.py copies`, step 13): each second of the goal test's
-  movements after its first (its start is a training clip's frames) is at least 0.762 from its
+  floats, the Linux machine): 46.6 microseconds for `human5` (56 to 72 for `human3` with another
+  load on the machine; `solved` and `on_floor`, a net of 84,346 weights), so one thread moves 21
+  bodies at the full rate in 1 ms (0.3's budget).
+- The rate by distance (step 10): `engine::body::motion::periods` gives each body a period of 1,
+  2 or 4 frames (a power of two, at most the most trained), the nearest each frame, as the
+  budget allows (each body's cost over its period, summed; tested: 200 bodies from 1 to 200 m at
+  64 microseconds in 1 ms a frame), and `due` spreads the bodies of a period over its frames;
+  `between` gives the frames between two solves (a cubic of Hermite, its rates continuous where
+  two periods meet). The goal test solved each 2 and each 4 frames (`goaltest NET SEED PERIOD`)
+  keeps 7 of 8 movements in every target (the run's slide 1,376 and 1,410 mm/s); each 8 frames,
+  a stride the net did not learn, none (they float 35 to 54 mm). Before the strides, a step of one
+  frame stretched over 4 kept 2 of 8 (torque past strength, the root's residual), and the cubic
+  between did not change that. So a body far from the eye costs a quarter: one thread moves 85
+  bodies at the least rate in 1 ms.
+- No clip given back (`tools/movement/solve.py copies`, step 13; `human5`): each second of the
+  goal test's movements after its first (its start is a training clip's frames) is at least
+  0.762 from its
   nearest training second (the joints' numbers at 6 of its frames), and two different training
   clips' seconds come as near as 0.588 to each other (0.936 at their 1st percentile, 1.853 at the
-  median; the solver's median 1.647): no second of the solver's is nearer to the training set than
+  median; the solver's median 1.531): no second of the solver's is nearer to the training set than
   the training set is to itself.
 - The timed goals (step 1): `engine::body::motion::reaching` (a part's point at a point at a
   tick: each tick before it the part covers its share of the way left, one over the ticks left
   and one, by the joints between the root and the part, the root held: `fit`) and `looking` (a
   head turned a share of the way toward a point each tick). In the goal test the right palm is
-  1.1 mm from its point at its tick (0 ticks late; the target 20 mm) while walking, and the head
-  ends 0.67 degrees from its point; both movements pass every target of the judge, as 7 of the
+  6.4 mm from its point at its tick (0 ticks late; the target 20 mm; `human3` 1.1) while walking,
+  and the head ends 0.56 degrees from its point; both movements pass every target of the judge, as 7 of the
   test's 8 do (the run all but its slide).
 - A heavier loss on the feet (3 times, `human4`) lowered the test's physics measure (0.94
   against 1.27) and kept the timed goals' tests (the palm 16.5 mm from its point), but its

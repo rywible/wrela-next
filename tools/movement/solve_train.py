@@ -34,14 +34,15 @@ def mlp(n_in, n_out, hidden):
 class Data:
     """The clips of a set on the device, and where a window of `w` frames can start."""
 
-    def __init__(self, head, x, which, w, ahead, device):
+    def __init__(self, head, x, which, w, ahead, device, stride=1):
         self.x = torch.tensor(np.array(x), device=device)
         starts, lengths = head["starts"], head["lengths"]
         firsts, ends, clips = [], [], []
+        # Each window has room for the largest stride: a frame that far before it, and its frames.
         for i, s in enumerate(head["sets"]):
-            if s != which or lengths[i] < w + 3:
+            if s != which or lengths[i] < stride * (w + 1) + 3:
                 continue
-            f = np.arange(starts[i] + 1, starts[i] + lengths[i] - w - 1)
+            f = np.arange(starts[i] + stride, starts[i] + lengths[i] - stride * (w + 1) - 1)
             firsts.append(f)
             ends.append(np.full(f.shape, starts[i] + lengths[i] - 1))
             clips.append(i)
@@ -95,6 +96,9 @@ def main(load_packed):
     p.add_argument("--ground", type=float, default=0.0,
                    help="the weight of each foot's height over the floor against the capture's (per m^2)")
     p.add_argument("--hide", type=float, default=0.3, help="the chance that each goal is hidden")
+    p.add_argument("--strides", default="1,2,4",
+                   help="the periods (frames) a window's steps may take, each update one, 1 half the time: "
+                        "a body far from the eye is solved each few frames (phase 5 step 10)")
     p.add_argument("--eval-every", type=int, default=2000)
     p.add_argument("--threads", type=int, default=0)
     a = p.parse_args(run.args)
@@ -107,8 +111,9 @@ def main(load_packed):
     head, x = load_packed(a.poses)
     rate = head["rate"]
     body = motion.Body(a.body, dev)
-    train = Data(head, x, "training", a.window, int(rate), dev)
-    test = Data(head, x, "test", a.window, int(rate), dev)
+    strides = [int(k) for k in a.strides.split(",")]
+    train = Data(head, x, "training", a.window, int(rate), dev, max(strides))
+    test = Data(head, x, "test", a.window, int(rate), dev, max(strides))
     D = head["d"]
     ns, nt, ng = motion.STATE_ROOT + 2 * D, motion.STEP_ROOT + D, motion.GOAL
     # The normalisation, from 100,000 training frames as the capture has them.
@@ -122,7 +127,8 @@ def main(load_packed):
     n_goal.std = g0.abs().mean(0).clamp(min=1e-3) * 1.5
     hidden = [int(h) for h in a.hidden.split(",")]
     enc = mlp(ns + nt + ng, 2 * a.z, [int(h) for h in a.encoder.split(",")]).to(dev)
-    dec = mlp(ns + ng + 2 + a.z, nt, hidden).to(dev)
+    # The decoder reads the state, the goal, its two flags, the period's log2 and the code.
+    dec = mlp(ns + ng + 3 + a.z, nt, hidden).to(dev)
     opt = torch.optim.Adam(list(enc.parameters()) + list(dec.parameters()), lr=a.lr)
     print(f"solve: {len(train.clips)} training clips, {len(test.clips)} test clips, "
           f"{train.first.shape[0]} windows; state {ns}, step {nt}, goal {ng}, z {a.z}; "
@@ -140,16 +146,17 @@ def main(load_packed):
         for nm, nn_ in [("n_state", n_state), ("n_step", n_step), ("n_goal", n_goal)]:
             nn_.mean, nn_.std = state[nm]["mean"].to(dev), state[nm]["std"].to(dev)
 
-    def decode(s, g, mask, z):
+    def decode(s, g, mask, z, k=1):
         gm = n_goal(g) * mask.repeat_interleave(2, -1)
-        return dec(torch.cat([n_state(s), gm, mask, z], -1))
+        period = torch.full_like(mask[:, :1], math.log2(k))
+        return dec(torch.cat([n_state(s), gm, mask, period, z], -1))
 
     def smooth_codes(B, w, g):
         """Codes for `w` ticks as the engine draws them (`engine::body::motion::code`): standard
         normal draws every `CODE_TICKS` ticks, each tick's between its two knots, from a random
         phase."""
         T = 8
-        knots = torch.randn(B, w // T + 2, a.z, device=dev, generator=g)
+        knots = torch.randn(B, (w + T - 1) // T + 2, a.z, device=dev, generator=g)
         phase = torch.randint(0, T, (B,), device=dev, generator=g)
         out = []
         for t in range(w):
@@ -161,14 +168,16 @@ def main(load_packed):
             out.append(((1 - u) * ka + u * kb) / torch.sqrt((1 - u) ** 2 + u ** 2))
         return out
 
-    def rollout(data, starts, ends, w, fed_back, train_mode):
-        """A window of `w` frames from each start: the losses, and how far the rollout's root
-        went from the capture's."""
+    def rollout(data, starts, ends, w, fed_back, train_mode, k=1):
+        """A window of `w` steps of `k` frames each from each start: the losses. The net gives a
+        step of one frame that `k` frames take `k` times over (`Body.stretched`), from the state
+        of poses `k` frames apart."""
         B = starts.shape[0]
-        prev, cur = data.x[starts - 1], data.x[starts]
+        prev, cur = data.x[starts - k], data.x[starts]
         mask = (torch.rand(B, 2, device=dev, generator=gen) > a.hide).float()
         prior_rows = (torch.rand(B, 1, device=dev, generator=gen) < a.prior)
-        code_prior = smooth_codes(B, w, gen)
+        # The codes at the frames the steps start at, as the engine draws them (a tick a frame).
+        code_prior = smooth_codes(B, w * k, gen)[::k]
         rec, kl, phys, ground = 0.0, 0.0, 0.0, 0.0
         ends0 = None
         # The window's mean velocity along the ground (its steps, in each frame's heading frame)
@@ -176,10 +185,10 @@ def main(load_packed):
         v_sum = torch.zeros(B, 2, device=dev)
         g_sum = torch.zeros(B, 2, device=dev)
         for t in range(w):
-            row = starts + t
-            true_next = data.x[row + 1]
-            s = body.state(prev, cur, rate)
-            tgt = body.step(cur, true_next)
+            row = starts + k * t
+            true_next = data.x[row + k]
+            s = body.state(prev, cur, rate / k)
+            tgt = body.unstretched(cur, body.step(cur, true_next), k)
             g = goals(body, data, cur, row, ends, rate)
             if train_mode:
                 h = enc(torch.cat([n_state(s), n_step(tgt), n_goal(g)], -1))
@@ -191,12 +200,14 @@ def main(load_packed):
                 z = torch.where(prior_rows, code_prior[t], z)
             else:
                 z = torch.randn(B, a.z, device=dev, generator=gen)
-            out = decode(s, g, mask, z)
+            out = decode(s, g, mask, z, k)
             # A Gaussian likelihood of the step (spread 1 in its normalised numbers): summed over
             # the numbers, so the code's KL weighs against the whole step.
             rec = rec + 0.5 * ((out - n_step(tgt)) ** 2).sum(-1).mean()
             pred = n_step.mean + n_step.std * out
             v_sum = v_sum + pred[:, 0:2] * rate
+            if k > 1:
+                pred = body.stretched(cur, pred, k)
             g_sum = g_sum + g[:, 0:2]
             if (a.physics > 0 or a.ground > 0) and train_mode:
                 nxt = body.after(cur, pred)
@@ -205,7 +216,7 @@ def main(load_packed):
                         ends0 = feet_ends(cur)
                 ends1 = feet_ends(nxt)
                 if a.physics > 0:
-                    phys = phys + physics_of(ends0, ends1)
+                    phys = phys + physics_of(ends0, ends1, k)
                 if a.ground > 0:
                     # Each foot's height over the floor, against the capture's same foot's.
                     with torch.no_grad():
@@ -257,7 +268,7 @@ def main(load_packed):
     def physics(cur, nxt):
         return physics_of(feet_ends(cur), feet_ends(nxt))
 
-    def physics_of(ends0, ends1):
+    def physics_of(ends0, ends1, k=1):
         """What the judge would see wrong in the step from one frame's parts (`ends0`, each
         part's two ends) to the next's, on flat ground at y = 0, each over its target: each part's
         depth under the ground (mm over 2), and the speed along the ground of each part's lowest
@@ -271,41 +282,41 @@ def main(load_packed):
         pen = torch.relu(-low1).sum(-1).mean(-1) * 1000.0 / 2.0
         near = ((low0 < 0.02) & (low1 < 0.02)).float()
         d = torch.stack([(a1 - a0)[..., [0, 2]].norm(dim=-1), (b1 - b0)[..., [0, 2]].norm(dim=-1)], -1)
-        slide = (near * d).sum((-1, -2)) / near.sum((-1, -2)).clamp(min=1.0) * rate * 1000.0 / 984.0
+        slide = (near * d).sum((-1, -2)) / near.sum((-1, -2)).clamp(min=1.0) * rate / k * 1000.0 / 984.0
         return (pen + slide).mean()
 
-    def evaluate(data, n=512, seconds=4.0):
+    def evaluate(data, n=512, seconds=4.0, k=1):
         """Rollouts from test windows with z drawn, all goals shown, for `seconds`: the mean error
         of the root's speed along the ground from its goal (m/s), the mean of the joints' error
         from the capture's after 1 s (rad), and the share whose root fell below half its height."""
-        w = int(seconds * rate)
+        w = int(seconds * rate) // k
         g2 = torch.Generator(device=dev).manual_seed(12345)
         i = torch.randint(0, data.first.shape[0], (n,), device=dev, generator=g2)
         starts, ends = data.first[i], data.end[i]
-        ok = (ends - starts) > w + 2
+        ok = (ends - starts) > k * w + 2
         starts, ends = starts[ok], ends[ok]
         B = starts.shape[0]
-        prev, cur = data.x[starts - 1], data.x[starts]
+        prev, cur = data.x[starts - k], data.x[starts]
         h0 = cur[:, 1].clone()
         mask = torch.ones(B, 2, device=dev)
-        codes = smooth_codes(B, w, g2)
+        codes = smooth_codes(B, w * k, g2)[::k]
         verr, fell, qerr = 0.0, torch.zeros(B, dtype=torch.bool, device=dev), 0.0
         phys_e = 0.0
         with torch.no_grad():
             for t in range(w):
-                row = starts + t
-                s = body.state(prev, cur, rate)
+                row = starts + k * t
+                s = body.state(prev, cur, rate / k)
                 g = goals(body, data, cur, row, ends, rate)
                 z = codes[t]
-                pred = n_step.mean + n_step.std * decode(s, g, mask, z)
-                nxt = body.after(cur, pred)
-                phys_e += physics(cur, nxt).item()
-                v = motion.qrot(motion.yaw(-body.heading(cur[:, 3:7])), nxt[:, :3] - cur[:, :3]) * rate
+                pred = n_step.mean + n_step.std * decode(s, g, mask, z, k)
+                nxt = body.after(cur, body.stretched(cur, pred, k) if k > 1 else pred)
+                phys_e += physics_of(feet_ends(cur), feet_ends(nxt), k).item()
+                v = motion.qrot(motion.yaw(-body.heading(cur[:, 3:7])), nxt[:, :3] - cur[:, :3]) * rate / k
                 verr += (torch.stack([v[:, 0], v[:, 2]], -1) - g[:, :2]).norm(dim=-1).mean().item()
                 fell |= nxt[:, 1] < 0.5 * h0
                 prev, cur = cur, nxt
-                if t == int(rate) - 1:
-                    qerr = (cur[:, 7:] - data.x[row + 1, 7:]).abs().mean().item()
+                if t == int(rate) // k - 1:
+                    qerr = (cur[:, 7:] - data.x[row + k, 7:]).abs().mean().item()
         return {"speed_error": verr / w, "joint_error_1s": qerr, "fell": fell.float().mean().item(),
                 "physics": phys_e / w, "rollouts": B}
 
@@ -314,7 +325,10 @@ def main(load_packed):
         # Scheduled sampling: none fed back for the first fifth, then more to all by three fifths.
         fed = min(max((step / a.steps - 0.2) / 0.4, 0.0), 1.0)
         starts, ends = train.sample(a.batch, gen)
-        rec, kl, phys, goal_err, ground = rollout(train, starts, ends, a.window, fed, True)
+        # Each update one stride: 1 half the time, the others the rest alike.
+        u = float(torch.rand(1, device=dev, generator=gen))
+        k = strides[0] if (u < 0.5 or len(strides) == 1) else strides[1 + int((u - 0.5) * 2 * (len(strides) - 1))]
+        rec, kl, phys, goal_err, ground = rollout(train, starts, ends, a.window, fed, True, k)
         loss = rec + a.beta * kl + a.physics * phys + a.goal * goal_err + a.ground * ground
         opt.zero_grad()
         loss.backward()
@@ -328,6 +342,8 @@ def main(load_packed):
                   f"({time.time() - t0:.0f} s)", flush=True)
         if a.eval_every and step % a.eval_every == 0:
             last_eval = {"test": evaluate(test), "training": evaluate(train)}
+            for k in strides[1:]:
+                last_eval[f"test_period_{k}"] = evaluate(test, k=k)
             print(f"evaluate at {step}: {json.dumps(last_eval)}", flush=True)
         if run.due() or step == a.steps:
             run.checkpoint(step, {"enc": enc.state_dict(), "dec": dec.state_dict(),
@@ -338,6 +354,8 @@ def main(load_packed):
             run.abandon()
             return
     final = {"test": evaluate(test), "training": evaluate(train)}
+    for k in strides[1:]:
+        final[f"test_period_{k}"] = evaluate(test, k=k)
     print(f"evaluate at the end: {json.dumps(final)}", flush=True)
     # The decoder as the engine reads it: the inputs' normalisation (state, goal, the goals'
     # flags, z) and the outputs' scale folded into the last layer.
@@ -347,11 +365,11 @@ def main(load_packed):
         last.weight.copy_(lin[-1].weight * n_step.std[:, None])
         last.bias.copy_(lin[-1].bias * n_step.std + n_step.mean)
     lin = lin[:-1] + [last]
-    mean = torch.cat([n_state.mean, n_goal.mean, torch.zeros(2 + a.z, device=dev)])
-    scale = torch.cat([1.0 / n_state.std, 1.0 / n_goal.std, torch.ones(2 + a.z, device=dev)])
+    mean = torch.cat([n_state.mean, n_goal.mean, torch.zeros(3 + a.z, device=dev)])
+    scale = torch.cat([1.0 / n_state.std, 1.0 / n_goal.std, torch.ones(3 + a.z, device=dev)])
     acts = ["elu"] * (len(lin) - 1) + ["none"]
     run.output("solver.wnet", wnet.encode(lin, acts, mean, scale, CLIP))
-    record = {"inputs": {"state": ns, "goal": ng, "goal_flags": 2, "z": a.z}, "outputs": nt,
+    record = {"inputs": {"state": ns, "goal": ng, "goal_flags": 2, "period_log2": 1, "z": a.z}, "outputs": nt,
               "hidden": hidden, "seed": run.seed, "args": vars(a), "steps": step,
               "evaluation": final, "poses": a.poses, "rate": rate,
               "note": "a hidden goal's numbers are 0 and its flag 0 (flag 0: the speed, 1: the heading)"}

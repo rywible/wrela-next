@@ -198,35 +198,154 @@ pub fn code(seed: u32, tick: u32, k: u32) -> f32 {
     ((1.0 - u) * a + u * b) / sqrt((1.0 - u) * (1.0 - u) + u * u)
 }
 
-/// The pose the solver `net` gives after `now` (which came after `before`, `rate` frames a
-/// second) for `wish` at `tick`, its code drawn from `seed` (the same seed and tick give the same
-/// pose on each machine). The net reads the state, the goal (a part not held to is 0), the two
-/// flags and the code; it gives the step (`after` puts each joint into its range).
+/// The pose the solver `net` gives `period` frames after `now` (which came `period` frames after
+/// `before`; the net's frames are `rate` a second) for `wish` at `tick`, its code drawn from
+/// `seed` (the same seed and tick give the same pose on each machine). The net reads the state,
+/// the goal (a part not held to is 0), the two flags, the period's log2 and the code; it gives the
+/// step of one frame, which a body solved each `period` frames (`periods`: a body far from the eye)
+/// takes `period` times over (`stretched`), as it was trained to (`tools/movement/solve_train.py`,
+/// strides of 1, 2 and 4 frames). `after` puts each joint into its range.
 pub fn solved<const S: u32, const D: u32>(
     body: Body<S>,
     net: Net,
     before: Pose<D>,
     now: Pose<D>,
     rate: f32,
+    period: u32,
     wish: Wish,
     seed: u32,
     tick: u32,
 ) -> Pose<D> {
     var x: Vec<f32> = Vec::with_capacity(net.ins)
-    state(body, before, now, rate, mut x)
+    state(body, before, now, rate / f32(period), mut x)
     let flags = [if wish.speed { 1.0 } else { 0.0 }, if wish.heading { 1.0 } else { 0.0 }]
     for k in 0..GOAL {
         x.push(wish.goal[k] * flags[k / 2])
     }
     x.push(flags[0])
     x.push(flags[1])
+    x.push(log2(f32(period)))
     let n = net.ins - x.len()
     for k in 0..n {
         x.push(code(seed, tick, k))
     }
     var s: Vec<f32> = Vec::new()
     net.apply(x, mut s)
+    if period > 1 {
+        stretched(body, now, mut s, f32(period))
+    }
     after(body, now, s)
+}
+
+/// Step `s` (of one frame from `now`) taken `k` times over: each change (the move along the
+/// ground, the heading's turn, each number's change, and the height's and the tilt's from
+/// `now`'s) times `k`.
+pub fn stretched<const S: u32, const D: u32>(body: Body<S>, now: Pose<D>, s: mut Vec<f32>, k: f32) {
+    let rest = body.segments[0].joint.at.q
+    let (ax, ay) = tilt(rest, now.root.q)
+    s[0] *= k
+    s[1] *= k
+    s[2] = now.root.t.y + k * (s[2] - now.root.t.y)
+    s[3] *= k
+    let was = [ax.x, ax.y, ax.z, ay.x, ay.y, ay.z]
+    for i in 0..6 {
+        s[4 + i] = was[i] + k * (s[4 + i] - was[i])
+    }
+    for i in STEP_ROOT..s.len() {
+        s[i] *= k
+    }
+}
+
+/// The pose a share `u` of the way from `now` to `next`, two solved poses a period apart that
+/// came after `before` (a period before `now`): a cubic of each number, the root's place and its
+/// turn's four numbers (normalised), whose rate at `now` is the mean of the two periods' and at
+/// `next` the last period's (a cubic of Hermite). So the rates of a body that the solver moves each
+/// few frames do not jump where two periods meet, as a straight line's do. What it shows at the
+/// frames between.
+pub fn between<const D: u32>(before: Pose<D>, now: Pose<D>, next: Pose<D>, u: f32) -> Pose<D> {
+    let (u2, u3) = (u * u, u * u * u)
+    let h00 = 2.0 * u3 - 3.0 * u2 + 1.0
+    let h10 = u3 - 2.0 * u2 + u
+    let h01 = -2.0 * u3 + 3.0 * u2
+    let h11 = u3 - u2
+    let cubic = |b: f32, a: f32, c: f32| h00 * a + h10 * 0.5 * (c - b) + h01 * c + h11 * (c - a)
+    var p = now
+    p.root.t = vec3(
+        cubic(before.root.t.x, now.root.t.x, next.root.t.x),
+        cubic(before.root.t.y, now.root.t.y, next.root.t.y),
+        cubic(before.root.t.z, now.root.t.z, next.root.t.z),
+    )
+    // The turns on the same side as `now`'s.
+    let qa = now.root.q.v
+    let qb = if dot(qa, before.root.q.v) < 0.0 { -before.root.q.v } else { before.root.q.v }
+    let qc = if dot(qa, next.root.q.v) < 0.0 { -next.root.q.v } else { next.root.q.v }
+    p.root.q = Quat {
+        v: normalize(
+            vec4(
+                cubic(qb.x, qa.x, qc.x),
+                cubic(qb.y, qa.y, qc.y),
+                cubic(qb.z, qa.z, qc.z),
+                cubic(qb.w, qa.w, qc.w),
+            ),
+        ),
+    }
+    for k in 0..D {
+        p.q[k] = cubic(before.q[k], now.q[k], next.q[k])
+    }
+    p
+}
+
+/// How often each body gets a pose from the solver (phase 5 step 10): a period in frames for each
+/// body at `distance` (m) from the eye, each a power of two, at most `most`, so that the bodies'
+/// mean cost a frame (each `cost`, over its period) is within `budget`. A body nearer than the
+/// distance `d` of the first period of two gets a pose each frame, one at 2 d to 4 d each 2, and
+/// so on: `d` is the largest that keeps the cost in the budget. If each body at `most` is over the
+/// budget, each is at `most`.
+pub fn periods(distance: [f32], cost: f32, budget: f32, most: u32) -> Vec<u32> {
+    var lo = 1.0e-3
+    var hi = 1.0e6
+    if load(distance, cost, lo, most) > budget {
+        return period_at(distance, lo, most)
+    }
+    if load(distance, cost, hi, most) <= budget {
+        return period_at(distance, hi, most)
+    }
+    // The cost rises with `d`: the largest `d` in the budget, halving its ratio of `hi` to `lo`.
+    for _ in 0..60 {
+        let mid = sqrt(lo * hi)
+        if load(distance, cost, mid, most) <= budget { lo = mid } else { hi = mid }
+    }
+    period_at(distance, lo, most)
+}
+
+fn period_of(distance: f32, d: f32, most: u32) -> u32 {
+    var p = 1
+    while p < most && distance > d * f32(p) {
+        p *= 2
+    }
+    p
+}
+
+fn period_at(distance: [f32], d: f32, most: u32) -> Vec<u32> {
+    var out: Vec<u32> = Vec::with_capacity(distance.len())
+    for x in distance {
+        out.push(period_of(x, d, most))
+    }
+    out
+}
+
+fn load(distance: [f32], cost: f32, d: f32, most: u32) -> f32 {
+    var sum = 0.0
+    for x in distance {
+        sum += cost / f32(period_of(x, d, most))
+    }
+    sum
+}
+
+/// Whether body `index`, solved each `period` frames, is solved at `frame`: bodies of the same
+/// period take their turns on different frames, so each frame's cost is near the mean.
+pub fn due(period: u32, index: u32, frame: u32) -> bool {
+    (frame + index) % period == 0
 }
 
 /// A timed goal of a part: point `point` of segment `segment` (in its frame) at `at` (the body's
@@ -423,4 +542,76 @@ fn a_step_out_of_range_is_put_into_it() {
     s[STEP_ROOT] = 3.0
     let p = after(b, now, s)
     assert(abs(p.q[0] - 1.0) < 1.0e-5)
+}
+
+@test
+fn a_stretched_step_is_the_steps_it_stands_for() {
+    // Two frames of a smooth movement taken as one step of one frame stretched twice over: the
+    // pose two frames on, to the second order of the movement's change.
+    let b = test_body()
+    let rest: Pose<4> = b.rest()
+    var s: Vec<f32> = Vec::new()
+    var worst = 0.0
+    for i in 0..40 {
+        let now = moved(rest, f32(i) / 60.0)
+        let next = moved(rest, f32(i + 1) / 60.0)
+        let far = moved(rest, f32(i + 2) / 60.0)
+        step(b, now, next, mut s)
+        stretched(b, now, mut s, 2.0)
+        let p = after(b, now, s)
+        worst = max(worst, length(p.root.t - far.root.t))
+        for k in 0..4 {
+            worst = max(worst, abs(p.q[k] - far.q[k]))
+        }
+    }
+    assert(worst < 2.0e-3, f"a stretched step is {worst} from the pose it stands for")
+}
+
+@test
+fn the_periods_keep_the_cost_in_the_budget() {
+    var near: Vec<f32> = Vec::new()
+    for i in 0..200 {
+        near.push(1.0 + f32(i))
+    }
+    // 200 bodies from 1 m to 200 m at 64 microseconds each, in 1 ms a frame (12.8 ms each frame).
+    let p = periods(near, 64.0, 1000.0, 16)
+    var sum = 0.0
+    for i in 0..200 {
+        sum += 64.0 / f32(p[i])
+        if i > 0 {
+            assert(p[i] >= p[i - 1], f"body {i} is farther and solved more often")
+        }
+    }
+    assert(sum <= 1000.0, f"{sum} microseconds a frame")
+    assert(p[0] == 1, "the nearest body is solved each frame")
+    assert(p[199] >= 8, f"the farthest body is solved each {p[199]} frames")
+    // A few bodies: each frame.
+    let few = periods([3.0, 30.0, 300.0], 64.0, 1000.0, 16)
+    assert(few[0] == 1 && few[1] == 1 && few[2] == 1)
+    // More than the budget at the least rate: each at the least rate.
+    let many = periods(near, 64.0, 1.0, 16)
+    assert(many[0] == 16 && many[199] == 16)
+    // Turns taken on different frames.
+    var on = 0
+    for i in 0..16 {
+        if due(16, i, 5) {
+            on += 1
+        }
+    }
+    assert(on == 1)
+}
+
+@test
+fn between_ends_at_its_two_poses() {
+    let b = test_body()
+    let rest: Pose<4> = b.rest()
+    let (w, x, y) = (moved(rest, 0.0), moved(rest, 0.1), moved(rest, 0.2))
+    let (p0, p1) = (between(w, x, y, 0.0), between(w, x, y, 1.0))
+    assert(length(p0.root.t - x.root.t) < 1.0e-6 && length(p1.root.t - y.root.t) < 1.0e-6)
+    assert(abs(abs(dot(p1.root.q.v, y.root.q.v)) - 1.0) < 1.0e-6)
+    // A smooth movement's frame between: near the movement's own there.
+    let half = between(w, x, y, 0.5)
+    let truth = moved(rest, 0.15)
+    assert(length(half.root.t - truth.root.t) < 2.0e-3, f"{length(half.root.t - truth.root.t)}")
+    assert(abs(half.q[0] - truth.q[0]) < 2.0e-3, f"{abs(half.q[0] - truth.q[0])}")
 }

@@ -173,7 +173,7 @@ def play_check(argv):
     n = ref.shape[0]
     ahead = int(rate)
     poses = [ref[0], ref[1]]
-    n_code = net[0].shape[0] - (motion.STATE_ROOT + 2 * body.freedom + motion.GOAL + 2)
+    n_code = net[0].shape[0] - (motion.STATE_ROOT + 2 * body.freedom + motion.GOAL + 3)
     first, whole = 0.0, 0.0
     for t in range(1, eng.shape[0] - 1):
         now = poses[t]
@@ -182,7 +182,7 @@ def play_check(argv):
         g = body.goal(now[None], ref[at][None], torch.tensor([secs]))[0]
         s = body.state(poses[t - 1][None], now[None], rate)[0]
         z = torch.tensor([code(seed, t, k) for k in range(n_code)])
-        inp = torch.cat([s, g, torch.ones(2), z])
+        inp = torch.cat([s, g, torch.ones(2), torch.zeros(1), z])
         step = apply_wnet(net, inp[None])
         nxt = body.after(now[None], step)[0]
         poses.append(nxt)
