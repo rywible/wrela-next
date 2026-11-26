@@ -804,9 +804,18 @@ candidates' pass (a shader with no field that keeps only the fragments whose ray
 a surface in front of the mesh, the rest turned away by the early depth test) kept 525,147 of
 them, 10.8 ms. Each marches cheaply (about 190 work: a cell's live mask prunes the field to a
 part or two), so the time is the shader holding the whole field while a fragment runs a part of
-it, some 20 ns a fragment, and no count of work or stream sees it. Next, measured before it is
-built: a march shader made for a cell's few live parts (cells drawn by their parts, each part's
-pipeline holding that part alone), against this one at the same fragments. Found on the way: a rigid thing's exact cells are tested in the
+it, some 20 ns a fragment, and no count of work or stream sees it. Corrected by two more measures: the
+counting build itself spends 19.3 ms there (so the march runs), and a variant that never
+discards (every lane counted, none a helper) tallies 5.9e8 work for 11.8 ms, with no divergence
+(its stream times 32 is its work), where `mesh_vis_resolve` does 5.0e9 in 2.3: the exact shader's
+operations cost some forty times the screen passes' a counted unit, and a lane a discard makes a
+helper (kept running for the shading's derivatives) runs the march uncounted. The counts are
+right on a probe (a loop of a call, 10 and 100 passes: 406 work an invocation where 400 is
+meant), its kept bytes (524) and its text (15% smaller) don't change without the march, and
+neither its depth write nor an early depth test is the cause. Next: tally work by kind of
+operation (arithmetic, transcendental, a uniform's or storage's read, a texture's), so the
+model fits a unit to each and shows which the kit's profile code (`segment_of`, `crosses`,
+`arc_of`: 60% of the candlestick shader's bound) spends on. Found on the way: a rigid thing's exact cells are tested in the
 frame it was meshed in (`exact_box_one_fs` brackets the world ray by the cell's box as meshed,
 where `exact_box_vs` draws it moved by `xforms[0]`), right while it is still, wrong once it
 moves without being meshed again. The
