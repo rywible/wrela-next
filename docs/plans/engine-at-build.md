@@ -354,6 +354,10 @@ use by another project; they are to be run with the rest of the plan's Radeon wo
 
 ## 9. Phase 1: strict math in the geometry kernels
 
+State (2026-11-25): steps 1 to 9 and 12 are done on the M4's build and its CPU tests; step 10 and
+11 are open, and nothing of this phase has run on a GPU since the stall (its measurements and
+gates are open on both machines).
+
 Purpose: make the proofs true for the released build. Make each geometry kernel give the same
 bits on each GPU and on the CPU.
 
@@ -379,8 +383,10 @@ GPU.
 ### Steps
 
 1. **Add strictness as a property of a function.** Make it an attribute of the same type as
-   `@deterministic`. The compiler must refuse a strict function that calls a function that is
-   not strict.
+   `@deterministic`. The compiler must refuse a strict function that uses, itself or through a
+   function it calls, an operation whose result a driver defines (the `driver` effect, step 9).
+   (A function a strict function calls is compiled strict inside it, so it need not be marked:
+   the effect, not a mark, is what the compiler checks. `toolchain/sema/src/effects.rs`.)
 2. **Compile a kernel strict if its entry function is strict.** Use no contraction on the two
    targets. Use safe math on Metal. Remove the temporary option of phase 0.1.
 3. **Make the geometry kernels strict.** Use the list from phase 0.1. The shade kernels stay
@@ -421,6 +427,34 @@ GPU.
     GPU with a small set of inputs and compares the results with constants. The host stops if
     one is different. This step is necessary before a release. It is not necessary before phase
     3.
+
+12. **Keep each strict kernel within the 50 ms rule.** std's code for a transcendental or a root
+    costs far more work than the driver's (`toolchain/tests`' `strict_builtins_cost_what_std_s_code_does`:
+    a root 70, a sine 302, against 4), so a heavy field's crease kernel came to 4.06M work an
+    invocation (SCENE 13's desk), past the most one invocation may do on the M4 (2.44M:
+    `std::gpu::limits().lane_work`, `LANE_WORK_LEAST`). A crease cell's solve is now resumable
+    (`crease_steps`), and each kind takes as many of its 64 steps a dispatch as its strict count
+    of a step allows (`crease_part`), a constant of the build: the heaviest crease kernels are
+    1.21M (SCENE 13) and 1.37M (SCENE 14).
+
+### What was learned
+
+- On 2026-11-25 a SCENE 13 run held the M4's GPU until the window server's watchdog fired. A
+  pass (`range_simplify`) took a loop counter's range past the loop's exit test for its range at
+  the test, so it erased the test. Only a strict module runs that pass after its calls are
+  merged into loops, so 14 strict kernels had loops with no exit, and the strict recount dropped
+  the "no bound" result. All three are repaired: the range, the recount (a strict kernel's work
+  is that of the code that runs), and a check (a pass that erases a bounded loop's exit is an
+  internal error). A dispatch that runs cannot be stopped, and a host the timeout kills leaves it
+  on the GPU until a restart: `tools/gpu` now refuses to start on a busy GPU.
+- The M4's root differs from the correctly rounded one by an ulp; std's correction
+  (`std::math::sqrt_from`) is one wrapping square and a subtraction, checked for every positive
+  normal argument from its root and both neighbours on the CPU.
+- `glass_shard` has no steepness (`lip inf` in the facts report). It entered the report at
+  `22446ef`, and the `std::field` of that commit gives it none too: this is not a loss of
+  phase 1. Phase 5 finds its cause.
+- A scene build lowers in more time: SCENE 10's lowering is 13.1 s (8.5 s at phase 0): std's code
+  in each strict kernel.
 
 ### Done when
 
