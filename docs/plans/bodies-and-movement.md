@@ -6,6 +6,16 @@ from the capture we have, muscles, spells that act on bodies, duels, and a learn
 Phase 0 is done. Phase 1 is done on the Linux machine. Phases 2 to 4 are in work. Each phase says
 what is done.
 
+The same evening the owner changed the body the work learns on. The creature (1.2 m to its ears'
+tips, 39.6 kg with a head of 16.2 kg) is the volume spike's stand-in, and phase 2 retargeted human
+capture onto it: so the judge's calibration, the tracker and the solver all learned the creature's
+physics, and phase 3's own notes say that capture on the creature is not physical. The work now
+learns on a real human body (phase 1 step 14): its capture goes onto the human (phase 2), the
+judge is calibrated again on it (phase 3), and the tracker and the solver train on it. The
+creature and the hound stay as test bodies that show the types are general; the four-legged body
+of phase 6 becomes an anatomical one. No more Colab runs go on the creature (`p4-all-1` was
+stopped: section 0.5's table).
+
 This plan contains no new measurement. Each fact about the repository comes from the code at
 `342c2e6`. Each fact about an outside source comes from the page in section 15. Where a fact is
 not verified at its source, the plan says so.
@@ -437,9 +447,45 @@ Purpose: the game states each body one time. The engine calculates all other dat
 13. **Remove the old descriptions in the same change:** the bone names, `Rig`, `RigBone` and the
     old `Pose` in the kit, `HAKURO_BONE`, `on_rig`, `CREATURE_RIG_BONES`, `PART_BONES_START`,
     `PART_BONES_END`, `SPREAD` and `TWIST_STEPS`.
+14. **Declare the human body** (the owner's change of 2026-11-25): an adult man, anatomically
+    sound, its skeleton, masses and ranges right before its skin looks right. A spine of several
+    segments (ball joints with each level's ranges, until the chain joint of phase 6 step 1); a
+    shoulder girdle of a clavicle and a scapula, so the shoulder can rise and protract; a neck of
+    its own and the head; the forearm's twist; five fingers on each hand; a foot with its toes.
+    Lengths and masses from published anthropometry (de Leva 1996, ANSUR II), ranges from
+    published goniometry and then cut where the body's own flesh stops them, strengths from
+    published maximum torques, each source in `docs/citations.md`. Checks: each group of segments
+    weighs de Leva's share to 5% and the whole 73 kg to 2%; the fast mass sum agrees with the slow
+    grid; each limb's centre of mass lies between de Leva's and Dempster's and its radii of
+    gyration are de Leva's; each joint's numbers bend the anatomical way on each side; no joint
+    in its range puts a part into another.
 
 ### Where it is
 
+- The human (step 14, 2026-11-25): `game/world/human.wrela`. 55 segments, 112 numbers: the
+  pelvis; the lumbar spine (L5 to L3, L2 to L1) and the thoracic (T12 to T7, T6 to T1); the neck
+  (C7 to C1) and the head; each arm's clavicle, scapula, upper arm, forearm (the elbow's flexion
+  and the forearm's twist) and hand; each hand's thumb (its metacarpal and two phalanges) and four
+  fingers (three phalanges each); each leg's thigh, shank, foot (the ankle with the foot's turn and
+  its inversion) and toes. Its joints are placed from ANSUR II's landmarks scaled to de Leva's
+  man (1.741 m, 73.0 kg), each segment's frame from its bone and the direction of its first
+  number, so every range keeps its anatomical sign (tested on each side). Its flesh is 81 round
+  cones with Dempster's densities in three groups, each blended at its own width (the trunk's
+  tissue 35 mm, the head and limbs 15, the fingers 6); the trunk, the neck, each shoulder girdle,
+  each pectoral (sternum to humerus) and each buttock (pelvis to femur) is one tissue over its
+  chain of joints (`Span`), so it bends with them and no joint of the chain counts it as a
+  collision. It stands with its arms held out 30 degrees, so the flesh cuts a range only where
+  the body runs into itself: 3 ranges are cut (the chin on the chest stops the neck's own flexion
+  at 27.5 degrees of its 55; the arm against the trunk stops the shoulder's adduction at 32 on each
+  side). Each group of segments weighs de Leva's share to 4.2% (73.1 kg in all); the fast sum and
+  a slow grid of 3 mm agree to 0.3%; each limb's centre of mass lies between de Leva's and
+  Dempster's (or within 4% of its length of them) and its radii of gyration across are de Leva's
+  to 25% (about its own axis to 35%: a round cone is not an oval limb; the upper arm's is 14%
+  under). Its skin's look is not done: the limbs' cones show their seams. Two engine faults that
+  any body with many parts meets were repaired on the way: the sweep held at most 32 parts
+  (`[f32; 1024]`), and the mass sum split every box inside the body down to its finest cell (now a
+  box wholly inside one part, one segment and one density is weighed whole, with its own inertia:
+  the creature's masses still within 1% of its slow sum).
 - `lib/engine/matter/density.wrela`: `Density`, a channel apart from `Substance`.
   `lib/kit/substances/densities.wrela`: tissue and wood, each with its source.
 - `lib/engine/body/`: `joint` (the four kinds, the range field and its gradient, a kind's turn
@@ -524,6 +570,10 @@ the change's parent: 5.2 mm at most); the mass against de Leva's table for a bod
 
 ## 7. Phase 2: capture with clean rights
 
+The owner's change of 2026-11-25: the capture goes onto the human (phase 1 step 14), not the
+creature. "What is done" below is the import onto the creature, which stays as a test of the
+types; the import onto the human repeats it with the human's maps.
+
 Purpose: each source that phase 0 permits becomes poses of our bodies.
 
 ### Steps
@@ -599,6 +649,11 @@ The lines as they were written:
   for each source.
 
 ## 8. Phase 3: the judge of movement
+
+The owner's change of 2026-11-25: the calibration is done again on the human's capture, and the
+old and the new targets are reported side by side. The creature's targets were wide because
+capture on the creature is not physical (a 16 kg head on short legs); the human's must be much
+tighter.
 
 Purpose: a number says if a movement is correct and if it looks alive. No agent decides this by
 eye.
@@ -951,6 +1006,16 @@ wrong. Expect more than one method before the targets are met.
 
 ### Steps
 
+0. **Declare the four-legged body as an anatomical skeleton** (the owner's change of
+   2026-11-25), as phase 1 step 14 declares the human: a spine of several segments (the chain
+   joint of step 1), a scapula that slides on the thorax (it has no clavicle: a joint that
+   translates as well as turns, a new kind of joint of the engine, with a range field of its
+   own), digitigrade legs (the paw's digits on the ground and the wrist and the hock above it),
+   and proportions, masses and ranges from published measurements of the animal's anatomy, each
+   cited. The hound of phase 1 step 12 stays as the test of the types until this body replaces
+   it. Checks as the human's: each segment's mass against the published share, the fast sum
+   against the slow grid, each joint's numbers the anatomical way, no joint in its range puts a
+   part into another.
 1. **Add the chain joint:** a spine or a tail with a limit on its curvature.
 2. **Calculate the strength of each degree of freedom** from the cross-section of its segment.
    Cite the source of the muscle stress.
@@ -1085,3 +1150,4 @@ run.
 | Spells that act on bodies, and duels | Phase 5b | Momentum conserved to 1%; a parry's tick error; the judge's measures | One cast on the CPU; 256 bodies casting; 128 duelling pairs | 50 to 100 |
 | The owner's preference, learned | Phase 5's review | A reward model predicts held-out choices (65% at 300) | On the first 100 choices, on the CPU | 0 (CPU) |
 | Questions for the owner: video turned into poses, and video models | Section 14, questions 12 and 13 | The owner's decision, in the register | None | 0 |
+| A real human body, and the work learns on it (the capture on the creature was not physical) | Phase 1 step 14; phases 2 and 3 again on the human; phase 6 step 0 | Its masses against de Leva's, its slow sum, its limbs' centres and radii, its joints' signs, its sweep; then the judge's targets old and new | The human declared and tested on the CPU (2026-11-25) | 0 for the body; the tracker's runs as phase 4's |

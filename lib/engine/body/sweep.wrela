@@ -19,6 +19,7 @@
 use body::body::{Body, Pose, Span}
 use body::joint::{Frame, NONE}
 use body::skin::Cone
+use std::collections::Vec
 
 /// How many values of each number a sweep tries.
 pub const STEPS: u32 = 13
@@ -140,23 +141,46 @@ fn holds<const S: u32>(body: Body<S>, s: u32, c: Span) -> bool {
 }
 
 /// Each pair of cones' depth into each other with the body's segments at `at` (P × P, by rows).
-fn depths<const S: u32, const P: u32>(cones: [Cone; P], at: [Frame; S], out: mut [f32; 1024]) {
+fn depths<const S: u32, const P: u32>(cones: [Cone; P], at: [Frame; S]) -> Vec<f32> {
+    var out: Vec<f32> = Vec::filled(P * P, 0.0)
     for i in 0..P {
-        let (a0, a1) = cones[i].placed(at)
         for j in i + 1..P {
-            let (b0, b1) = cones[j].placed(at)
-            out[i * P + j] = depth(
-                a0,
-                a1,
-                cones[i].ra,
-                cones[i].rb,
-                b0,
-                b1,
-                cones[j].ra,
-                cones[j].rb,
-            )
+            out[i * P + j] = pair_depth(cones, at, i, j)
         }
     }
+    out
+}
+
+/// Cones `i` and `j`'s depth into each other with the body's segments at `at`.
+fn pair_depth<const S: u32, const P: u32>(cones: [Cone; P], at: [Frame; S], i: u32, j: u32) -> f32 {
+    let (a0, a1) = cones[i].placed(at)
+    let (b0, b1) = cones[j].placed(at)
+    depth(a0, a1, cones[i].ra, cones[i].rb, b0, b1, cones[j].ra, cones[j].rb)
+}
+
+/// The pairs of cones a sweep of each segment measures (`measured`), segment by segment: the
+/// pairs of segment `s` are `pairs[first[s]..first[s + 1]]`, each a × P + b.
+fn measured_pairs<const S: u32, const P: u32>(
+    body: Body<S>,
+    cones: [Cone; P],
+) -> (Vec<u32>, Vec<u32>) {
+    var first: Vec<u32> = Vec::with_capacity(S + 1)
+    var pairs: Vec<u32> = Vec::new()
+    for s in 0..S {
+        first.push(pairs.len())
+        if s == 0 {
+            continue
+        }
+        for a in 0..P {
+            for b in a + 1..P {
+                if measured(body, cones, s, a, b) {
+                    pairs.push(a * P + b)
+                }
+            }
+        }
+    }
+    first.push(pairs.len())
+    (first, pairs)
 }
 
 /// The worst of a sweep: how deep (m) beyond the start pose, which joint's number moved, at what
@@ -176,10 +200,8 @@ pub fn sweep<const S: u32, const D: u32, const P: u32>(
     cones: [Cone; P],
     start: Pose<D>,
 ) -> [Worst; S] {
-    assert(P * P <= 1024, "a sweep holds at most 32 cones")
-    var base = [0.0; 1024]
-    depths(cones, body.places(start), mut base)
-    var now = [0.0; 1024]
+    let base = depths(cones, body.places(start))
+    let (first, pairs) = measured_pairs(body, cones)
     var out = [Worst { deeper: 0.0, segment: 0, number: 0, value: 0.0, cones: vec2u(0) }; S]
     for s in 1..S {
         out[s].segment = s
@@ -191,21 +213,17 @@ pub fn sweep<const S: u32, const D: u32, const P: u32>(
                 var q = body.numbers(start, s)
                 q[k] = v
                 body.set_numbers(mut p, s, q)
-                depths(cones, body.places(p), mut now)
-                for a in 0..P {
-                    for b in a + 1..P {
-                        if !measured(body, cones, s, a, b) {
-                            continue
-                        }
-                        let deeper = now[a * P + b] - max(base[a * P + b], 0.0)
-                        if deeper > out[s].deeper {
-                            out[s] = Worst {
-                                deeper,
-                                segment: s,
-                                number: k,
-                                value: v,
-                                cones: vec2u(a, b),
-                            }
+                let at = body.places(p)
+                for i in first[s]..first[s + 1] {
+                    let (a, b) = (pairs[i] / P, pairs[i] % P)
+                    let deeper = pair_depth(cones, at, a, b) - max(base[pairs[i]], 0.0)
+                    if deeper > out[s].deeper {
+                        out[s] = Worst {
+                            deeper,
+                            segment: s,
+                            number: k,
+                            value: v,
+                            cones: vec2u(a, b),
                         }
                     }
                 }
@@ -229,24 +247,20 @@ fn measured<const S: u32, const P: u32>(
     sides && !spans_joined(body, cones, x, y)
 }
 
-/// How deep any two parts that a sweep of `s` measures go, beyond `base`, with the body's
-/// segments at `at`.
+/// How deep any two parts that a sweep of `s` measures (`pairs[from..to]`) go, beyond `base`,
+/// with the body's segments at `at`.
 fn deepest<const S: u32, const P: u32>(
-    body: Body<S>,
     cones: [Cone; P],
-    s: u32,
     at: [Frame; S],
-    base: [f32; 1024],
-    now: mut [f32; 1024],
+    base: [f32],
+    pairs: [u32],
+    from: u32,
+    to: u32,
 ) -> f32 {
-    depths(cones, at, mut now)
     var worst = 0.0
-    for a in 0..P {
-        for b in a + 1..P {
-            if measured(body, cones, s, a, b) {
-                worst = max(worst, now[a * P + b] - max(base[a * P + b], 0.0))
-            }
-        }
+    for i in from..to {
+        let (a, b) = (pairs[i] / P, pairs[i] % P)
+        worst = max(worst, pair_depth(cones, at, a, b) - max(base[pairs[i]], 0.0))
     }
     worst
 }
@@ -263,9 +277,8 @@ pub fn cleared<const S: u32, const D: u32, const P: u32>(
     most: f32,
     fine: u32,
 ) -> Body<S> {
-    var base = [0.0; 1024]
-    depths(cones, body.places(start), mut base)
-    var now = [0.0; 1024]
+    let base = depths(cones, body.places(start))
+    let (first, pairs) = measured_pairs(body, cones)
     var out = body
     for s in 1..S {
         let j = body.segments[s].joint
@@ -280,7 +293,7 @@ pub fn cleared<const S: u32, const D: u32, const P: u32>(
                     var q = q0
                     q[k] = v
                     body.set_numbers(mut p, s, q)
-                    if deepest(body, cones, s, body.places(p), base, mut now) > most {
+                    if deepest(cones, body.places(p), base, pairs, first[s], first[s + 1]) > most {
                         break
                     }
                     last = v

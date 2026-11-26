@@ -1,13 +1,14 @@
 // The export of a body to the simulator (docs/plans/bodies-and-movement.md, phase 4 step 1): a
-// MuJoCo model of the creature written from its declaration, and each imported clip as the
-// simulator's states. No person and no script writes the model by hand.
+// MuJoCo model of a body written from its declaration, and each imported clip as the simulator's
+// states. No person and no script writes the model by hand.
 //
 //     tools/wrela tool tools/movement/export --read poses=.movement/poses \
-//         --read split=tools/movement/split --write out=.movement/sim -- [SET ...]
+//         --read split=tools/movement/split --write out=.movement/sim -- [BODY] [SET ...]
 //
-// The model (`out/creature.xml`):
+// BODY is `human` or `creature` (the default: `tools/movement/bodies`). The model
+// (`out/BODY.xml`):
 // - each segment a body whose frame is the segment's at rest (its numbers 0), its mass, centre
-//   of mass and inertia the engine's (`world::creature::MASSES`), written as they are: no
+//   of mass and inertia the engine's (the body's `MASSES`), written as they are: no
 //   inertia from shapes. A segment the engine weighs at 0 (a collarbone, which carries no part)
 //   gets `LEAST` kg, as the simulator can't move a body with no mass;
 // - each joint's numbers as the simulator's joints, in the segment's body: a hinge about x; a
@@ -36,8 +37,7 @@ use std::serialize::{Reader, Writer}
 use std::tool::{ToolError, args}
 use std::tool::blob
 use std::tool::files
-use world::creature::{BODY, MASSES}
-use world::creature_segments::{FREEDOM, PARTS, SEGMENTS}
+use bodies::bodies::Def
 
 /// The least mass a body of the simulator can move with (kg), and its inertia's (kg m²).
 const LEAST: f32 = 0.001
@@ -125,7 +125,7 @@ fn hinge(j: Joint, h: u32) -> (vec3, u32) {
 }
 
 /// The angles of segment `s`'s hinges in `pose`.
-fn angles(b: Body<SEGMENTS>, pose: Pose<FREEDOM>, s: u32) -> vec3 {
+fn angles<const S: u32, const D: u32>(b: Body<S>, pose: Pose<D>, s: u32) -> vec3 {
     let j = b.segments[s].joint
     let q = b.numbers(pose, s)
     if j.kind == Kind::Ball { euler(turn(Kind::Ball, q), ball_order(j)) } else { q }
@@ -133,14 +133,13 @@ fn angles(b: Body<SEGMENTS>, pose: Pose<FREEDOM>, s: u32) -> vec3 {
 
 /// The segments depth first (a segment's children each after the one before's whole subtree):
 /// the order of the model's bodies, and so of its qpos.
-fn depth_first() -> Vec<u32> {
-    let b = BODY
+fn depth_first<const S: u32>(b: Body<S>) -> Vec<u32> {
     var order: Vec<u32> = Vec::new()
     var todo: Vec<u32> = Vec::new()
     todo.push(0)
     while let Some(s) = todo.pop() {
         order.push(s)
-        var k = SEGMENTS
+        var k = S
         while k > 1 {
             k -= 1
             if b.segments[k].joint.parent == s {
@@ -151,14 +150,13 @@ fn depth_first() -> Vec<u32> {
     order
 }
 
-fn model() -> String {
-    let b = BODY
-    let rest: Pose<FREEDOM> = b.rest()
-    let at = b.places(rest)
+fn model<const S: u32, const D: u32, const P: u32>(def: Def<S, D, P>) -> String {
+    let b = def.body
+    let at = b.places(def.rest)
     var x = String::new()
-    x.push_str("<mujoco model=\"creature\">\n")
+    x.push_str(f"<mujoco model=\"{def.name}\">\n")
     x.push_str(
-        "  <!-- Written by tools/movement/export from game/world/creature.wrela: do not edit. -->\n",
+        f"  <!-- Written by tools/movement/export from game/world/{def.name}.wrela: do not edit. -->\n",
     )
     x.push_str("  <compiler angle=\"radian\" autolimits=\"true\"/>\n")
     x.push_str(
@@ -173,7 +171,7 @@ fn model() -> String {
         "    <geom name=\"floor\" type=\"plane\" size=\"0 0 1\" zaxis=\"0 1 0\" contype=\"0\" conaffinity=\"1\"/>\n",
     )
     // Each segment's body, nested under its parent's.
-    let order = depth_first()
+    let order = depth_first(b)
     var open: Vec<u32> = Vec::new()
     var actuators = String::new()
     for s in order {
@@ -189,7 +187,7 @@ fn model() -> String {
         if s == 0 {
             x.push_str(f"{ind}  <freejoint name=\"root\"/>\n")
         }
-        let m = MASSES[s]
+        let m = def.masses[s]
         let i = m.inertia
         if m.mass > 0.0 {
             x.push_str(
@@ -212,7 +210,7 @@ fn model() -> String {
             )
         }
         // The parts whose first end is on this segment, as capsules in its frame.
-        for c in PARTS {
+        for c in def.parts {
             if c.a.on == s {
                 let a = c.a.at
                 let bb = at[s].inverse().apply(at[c.b.on].apply(c.b.at))
@@ -249,26 +247,29 @@ fn next(r: mut Reader) -> u32 {
 }
 
 /// How many numbers the model's qpos holds: the root's 7 and each hinge.
-fn qpos_size() -> u32 {
+fn qpos_size<const S: u32>(b: Body<S>) -> u32 {
     var n = 7
-    for s in 1..SEGMENTS {
-        n += hinges(BODY.segments[s].joint.kind)
+    for s in 1..S {
+        n += hinges(b.segments[s].joint.kind)
     }
     n
 }
 
 /// One clip's states.
-fn refs(name: str) -> Result<u32, ToolError> {
-    let c = load::<FREEDOM>("poses", name)?
+fn refs<const S: u32, const D: u32, const P: u32>(
+    def: Def<S, D, P>,
+    name: str,
+) -> Result<u32, ToolError> {
+    let c = load::<D>("poses", def.name, name)?
     let (n, rate) = (c.poses.len(), c.rate)
-    let b = BODY
+    let b = def.body
     var w = Writer::new()
     for c in [87, 82, 69, 70] {
         w.write_u8(c)
     }
     w.write_u32(1)
-    w.write_u32(qpos_size())
-    w.write_u32(SEGMENTS)
+    w.write_u32(qpos_size(b))
+    w.write_u32(S)
     w.write_u32(n)
     w.write_u32(bitcast_u32(rate))
     for p in c.poses {
@@ -277,7 +278,7 @@ fn refs(name: str) -> Result<u32, ToolError> {
         for v in [t.x, t.y, t.z, q.w, q.x, q.y, q.z] {
             w.write_u32(bitcast_u32(v))
         }
-        for s in depth_first() {
+        for s in depth_first(b) {
             if s == 0 {
                 continue
             }
@@ -287,7 +288,7 @@ fn refs(name: str) -> Result<u32, ToolError> {
             }
         }
         let at = b.places(p)
-        for s in 0..SEGMENTS {
+        for s in 0..S {
             let f = at[s]
             for v in [f.t.x, f.t.y, f.t.z, f.q.v.w, f.q.v.x, f.q.v.y, f.q.v.z] {
                 w.write_u32(bitcast_u32(v))
@@ -299,9 +300,17 @@ fn refs(name: str) -> Result<u32, ToolError> {
 }
 
 pub fn tool() -> u32 {
-    let xml = model()
-    match write_all("out/creature.xml", Vec::from(xml.as_bytes())) {
-        Ok(_) => print(f"export: out/creature.xml, qpos {qpos_size()}"),
+    let a = args()
+    if a.len() > 0 && a[0].as_str() == "human" {
+        return export(bodies::bodies::human(), a)
+    }
+    export(bodies::bodies::creature(), a)
+}
+
+fn export<const S: u32, const D: u32, const P: u32>(def: Def<S, D, P>, a: Vec<String>) -> u32 {
+    let xml = model(def)
+    match write_all(f"out/{def.name}.xml", Vec::from(xml.as_bytes())) {
+        Ok(_) => print(f"export: out/{def.name}.xml, qpos {qpos_size(def.body)}"),
         Err(e) => {
             print(f"export: {e.message()}")
             return 1
@@ -309,17 +318,20 @@ pub fn tool() -> u32 {
     }
     // The engine's masses beside the model's, for the comparison (phase 4 step 2).
     var masses = String::from("segment mass cx cy cz ixx iyy izz ixy ixz iyz\n")
-    for s in 0..SEGMENTS {
-        let m: Mass = MASSES[s]
+    for s in 0..S {
+        let m: Mass = def.masses[s]
         let i = m.inertia
         masses.push_str(
             f"{s} {m.mass} {m.centre.x} {m.centre.y} {m.centre.z} {i[0].x} {i[1].y} {i[2].z} {i[1].x} {i[2].x} {i[2].y}\n",
         )
     }
-    let _ = write_all("out/creature_masses.txt", Vec::from(masses.as_bytes()))
+    let _ = write_all(f"out/{def.name}_masses.txt", Vec::from(masses.as_bytes()))
     var clips = 0
     var frames = 0
-    for set_name in args() {
+    for set_name in a {
+        if set_name.as_str() == "human" || set_name.as_str() == "creature" {
+            continue
+        }
         let Ok(bytes) = files::read(f"split/{set_name}.txt").wait() else { continue }
         let Some(text) = String::from_utf8(take bytes) else { continue }
         let t = text.as_str()
@@ -328,7 +340,7 @@ pub fn tool() -> u32 {
             if line.len() == 0 || line.starts_with("#") {
                 continue
             }
-            match refs(line) {
+            match refs(def, line) {
                 Ok(n) => {
                     clips += 1
                     frames += n

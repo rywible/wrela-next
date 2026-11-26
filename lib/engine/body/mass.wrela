@@ -9,8 +9,9 @@
 // bones divide it.
 //
 // `masses` is the fast way: a tree of boxes from the field's bound, each box that the field's
-// interval puts wholly outside dropped, each box down to `cell` wide summed at its centre when
-// it is wholly inside and on one part and one segment (`uniform`), else at 4³ points. `masses_by_grid` is the slow
+// interval puts wholly outside dropped, each box wholly inside and on one part, one segment and
+// one density (`uniform`, `one_density`) weighed whole at any size, and each other box split down
+// to `cell` wide and summed at 4³ points. `masses_by_grid` is the slow
 // reference: every point of a grid summed, nothing dropped. The two agree to 1% for each segment
 // of each body the game declares (that body's test).
 
@@ -49,6 +50,13 @@ impl Moments {
         self.c += x * k
         self.sq += x * x * k
         self.cross += vec3d(x.x * x.y, x.x * x.z, x.y * x.z) * k
+    }
+
+    /// A box of uniform density at `o`, `h` from its centre to each side, of mass `w`: its centre's
+    /// moments and its own (h²/3 along each axis).
+    fn add_box(mut self, o: vec3, h: f32, w: f32) {
+        self.add(o, w)
+        self.sq += vec3d(f64(h) * f64(h) / 3.0 * f64(w))
     }
 }
 
@@ -181,6 +189,36 @@ fn uniform<const S: u32, const P: u32, F: Field<Density>>(
     b2 - b1 > 2.0 * r
 }
 
+/// Whether the density is the same at the corners of the box at `o` (`h` to each side) as at its
+/// centre: no blend of two parts' matter reaches into it.
+fn one_density<F: Field<Density>>(matter: F, o: vec3, h: f32) -> bool {
+    let (_, c) = matter.distance_and_channels(o)
+    for i in 0..8 {
+        let k = vec3(f32(i & 1), f32((i >> 1) & 1), f32(i >> 2)) * 2.0 - vec3(1.0)
+        let (_, r) = matter.distance_and_channels(o + k * h)
+        if r.kg_m3 != c.kg_m3 {
+            return false
+        }
+    }
+    true
+}
+
+/// Weighs a box at `o` (`h` to each side) wholly inside one part, one segment and one density,
+/// whole: its mass and its own inertia on that segment.
+fn weigh_box<const S: u32, const P: u32, F: Field<Density>>(
+    body: Body<S>,
+    at: [Frame; S],
+    matter: F,
+    spans: [Span; P],
+    o: vec3,
+    h: f32,
+    acc: mut [Moments; S],
+) {
+    let (_, rho) = matter.distance_and_channels(o)
+    let s = body.nearest_on(at, spans[nearest_part(matter, o, P)], o)
+    acc[s].add_box(o, h, rho.kg_m3 * 8.0 * h * h * h)
+}
+
 /// Weighs a leaf box at `o`, `h` from its centre to each side, at 4³ points.
 fn weigh_finely<const S: u32, const P: u32, F: Field<Density>>(
     body: Body<S>,
@@ -219,12 +257,16 @@ pub fn masses<const S: u32, const D: u32, const P: u32, F: Field<Density>>(
         if iv.lo > 0.0 {
             continue
         }
+        // A box wholly inside, on one part and one segment, of one density, is weighed whole,
+        // however large: a body's inside costs boxes in proportion to its parts' surfaces.
+        if iv.hi < 0.0 &&
+            uniform(body, at, matter, spans, o, h * 1.7320508) &&
+            one_density(matter, o, h) {
+            weigh_box(body, at, matter, spans, o, h, mut acc)
+            continue
+        }
         if 2.0 * h <= cell {
-            if iv.hi < 0.0 && uniform(body, at, matter, spans, o, h * 1.7320508) {
-                weigh(body, at, matter, spans, o, 8.0 * h * h * h, true, mut acc)
-            } else {
-                weigh_finely(body, at, matter, spans, o, h, mut acc)
-            }
+            weigh_finely(body, at, matter, spans, o, h, mut acc)
             continue
         }
         let q = 0.5 * h

@@ -1,0 +1,1547 @@
+// A grown man's body (docs/plans/bodies-and-movement.md, phase 1 step 14): the body that the
+// movement work learns on. It is declared with the engine's types (`engine::body`) as the creature
+// and the hound are, and is the first of them that is a real skeleton: a spine of four segments
+// and a neck, a shoulder girdle of a clavicle and a scapula on each side, a forearm that twists,
+// five fingers on each hand and a foot with its toes.
+//
+// The numbers are a man of de Leva's reference size (1.741 m, 73.0 kg; P. de Leva, J. Biomech.
+// 29(9), 1996): his segments' lengths and masses. Where de Leva gives no number (the spine's
+// levels, the shoulder girdle, the fingers, breadths and depths) the numbers are from published
+// anthropometry, each scaled to his stature; ranges are from published goniometry, each then cut
+// where the body's own flesh stops it (`engine::body::sweep::cleared`); strengths are published
+// maximum isometric torques. `docs/citations.md` lists each source and what it gave.
+//
+// The skeleton is written as landmarks: where each joint's centre is at rest, in the body's space
+// (y up, z the way it faces, x its left; the floor at y = 0 and the body over x = z = 0), where
+// each bone ends, and which way the joint's first number moves that end. The engine's frames come
+// from those (`frame`): each segment's y runs along its bone and its x is the axis of its first
+// number, so a joint's first number is its flexion (or, at the shoulder girdle, its rise) and a
+// positive number is the anatomical positive direction. A ball joint's second number turns about
+// the segment's z (abduction, lateral bending, deviation), its third about its own y (rotation,
+// twist). The left side's ranges are written; the right side's second and third numbers are the
+// left's mirrored.
+//
+// Its flesh is simple for now: round cones, two side by side where the trunk is wide. The flesh
+// weighs each segment (`engine::body::mass`) with each part's density, and its masses are held to
+// de Leva's by a test.
+
+use engine::body::body::{Body, Pose, Segment, Span, body, on}
+use engine::body::joint::{Frame, Joint, Kind, NONE}
+use engine::body::mass::{Mass, masses, masses_by_grid}
+use engine::body::skin::{Cone, End, Skin, bone_count, bones, skin, spans_of}
+use engine::body::sweep::{cleared, sweep}
+use engine::matter::density::{Density, density}
+use engine::matter::substance::Substance
+use engine::matter::verify::prove_field_facts
+use kit::substances::matte::matte
+use std::cmp::Eq
+use std::derive::{Box3, Interval}
+use std::field::{
+    Bound, Field, FieldFacts, Live, PartName, Pruned, RoundCone, Skinned, SmoothUnion,
+    SmoothUnionAll, Surface, With, round_cone, skinned,
+}
+use std::hash::StateHash
+use std::io::print
+use std::math::PI
+use std::quat::Quat
+
+const DEG: f32 = PI / 180.0
+
+/// How wide a seam of its flesh can be at most (m): the core's (`CORE_JOIN`), which the skin's
+/// template is made with.
+pub const JOIN: f32 = 0.035
+
+/// Its skin (albedo): a mid skin tone, as a matte surface until skin is its own material.
+pub const SKIN_ALBEDO: vec3 = vec3(0.52, 0.38, 0.30)
+
+// ---- its segments --------------------------------------------------------------------------------
+
+pub const PELVIS: u32 = 0
+pub const LUMBAR_LOW: u32 = 1
+pub const LUMBAR_HIGH: u32 = 2
+pub const THORAX_LOW: u32 = 3
+pub const THORAX_HIGH: u32 = 4
+pub const NECK: u32 = 5
+pub const HEAD: u32 = 6
+/// Each leg's first segment (the left's; the right's is 4 on): thigh, shank, foot, toes.
+pub const THIGH_LEFT: u32 = 7
+pub const SHANK_LEFT: u32 = 8
+pub const FOOT_LEFT: u32 = 9
+pub const TOES_LEFT: u32 = 10
+pub const THIGH_RIGHT: u32 = 11
+pub const SHANK_RIGHT: u32 = 12
+pub const FOOT_RIGHT: u32 = 13
+pub const TOES_RIGHT: u32 = 14
+/// Each arm's first segment (the left's; the right's is 5 on): clavicle, scapula, upper arm,
+/// forearm, hand.
+pub const CLAVICLE_LEFT: u32 = 15
+pub const SCAPULA_LEFT: u32 = 16
+pub const UPPER_ARM_LEFT: u32 = 17
+pub const FOREARM_LEFT: u32 = 18
+pub const HAND_LEFT: u32 = 19
+pub const CLAVICLE_RIGHT: u32 = 20
+pub const SCAPULA_RIGHT: u32 = 21
+pub const UPPER_ARM_RIGHT: u32 = 22
+pub const FOREARM_RIGHT: u32 = 23
+pub const HAND_RIGHT: u32 = 24
+/// Each hand's fingers (the left's; the right's is 15 on): the thumb's metacarpal, proximal and
+/// distal phalanx, then each finger's proximal, middle and distal phalanx, index to little.
+pub const FINGERS_LEFT: u32 = 25
+pub const FINGERS_RIGHT: u32 = 40
+
+/// How many segments it has, how many numbers a pose of it holds, how many parts its flesh has
+/// and how many bones its skin moves with (a segment each, and a second for each forearm, whose
+/// twist spreads along it).
+pub const SEGMENTS: u32 = 55
+pub const FREEDOM: u32 = 112
+pub const PART_COUNT: u32 = 81
+pub const BONES: u32 = 57
+
+// ---- the landmarks at rest (m) --------------------------------------------------------------------
+//
+// x is to the left; the left side's are written. Heights are ANSUR II's male means (C. C. Gordon et
+// al., 2014: the US Army's survey of 2012, its public data) scaled to de Leva's stature (1.741 m
+// of 1.756 m: by 0.9913); joint centres from landmarks as de Leva's table 2 places them; the
+// spine's levels along the column as vertebral and disc heights space them (I. Busscher et al.,
+// Eur. Spine J. 19, 2010); the clavicle and the scapula's link as Dempster (1955) measured them;
+// the hand's segments as fractions of its length (B. Buchholz, T. J. Armstrong and S. A.
+// Goldstein, Ergonomics 35(3), 1992; not read at its source); the foot's ball of ANSUR II.
+
+const STATURE: f32 = 1.741
+/// What he weighs (kg), whose shares de Leva's table gives.
+pub const MASS: f32 = 73.0
+
+/// The legs: the ankle's centre (the lateral malleolus's height, 72 mm), the knee's (the tibiale's
+/// height, 464 mm, and 33.5 mm), the hip's (the trochanterion's, 893 mm, and 3.2 mm; 92 mm from the
+/// middle, 14% of the spines' breadth of 256 mm in from them, by Bell's rule, 1990), the back of
+/// the heel, the toes' joint (the first metatarsal's head: the ball of the foot, 0.741 of the
+/// foot's 269 mm), and the tip of the longest toe. The heel's place behind the ankle (55 mm) is
+/// not a published mean: no source of it was found.
+const ANKLE: vec3 = vec3(0.09, 0.072, 0.0)
+const KNEE: vec3 = vec3(0.09, 0.498, 0.0)
+const HIP: vec3 = vec3(0.092, 0.896, 0.0)
+const HEEL: vec3 = vec3(0.09, 0.036, -0.019)
+const TOE_JOINT: vec3 = vec3(0.1, 0.022, 0.144)
+const TOE_TIP: vec3 = vec3(0.103, 0.014, 0.205)
+
+/// The spine's joints, each the disc (or the joint) between two levels: the sacrum and L5 (0.097
+/// m above the hips' centres and 0.023 m behind, a pelvic tilt of 13 degrees), L2 and L3, T12 and
+/// L1, T6 and T7 (at 0.24, 0.381 and 0.725 of the column from S1 to C7-T1), C7 and T1 (below the
+/// cervicale, 1.504 m), the skull on the atlas (C0-C1: below the tragion, 1.611 m); and the top
+/// of the head. Their depths (z) make the lumbar spine's lordosis and the thoracic kyphosis; they
+/// are not published means.
+const L5_S1: vec3 = vec3(0.0, 0.993, -0.023)
+const L2_L3: vec3 = vec3(0.0, 1.112, -0.01)
+const T12_L1: vec3 = vec3(0.0, 1.182, -0.025)
+const T6_T7: vec3 = vec3(0.0, 1.353, -0.06)
+const C7_T1: vec3 = vec3(0.0, 1.49, -0.045)
+const C0_C1: vec3 = vec3(0.0, 1.586, -0.015)
+const VERTEX: vec3 = vec3(0.0, 1.741, -0.01)
+
+/// The shoulder girdle: the sternoclavicular joint (at the suprasternale's height, 1.426 m, 26 mm
+/// from the middle: Dempster), the acromioclavicular joint (the clavicle's link, 145 mm: 86.4% of
+/// a clavicle 40.7% of the biacromial breadth of 412 mm), the shoulder (glenohumeral) joint's
+/// centre (34.5 mm below the acromion, 1.428 m: de Leva; 39 mm from the acromioclavicular joint,
+/// Dempster's scapular link), and the scapula's inferior angle (at T7).
+const STERNOCLAVICULAR: vec3 = vec3(0.026, 1.426, 0.045)
+const ACROMIOCLAVICULAR: vec3 = vec3(0.16, 1.425, -0.01)
+const SHOULDER: vec3 = vec3(0.188, 1.398, -0.01)
+const INFERIOR_ANGLE: vec3 = vec3(0.1, 1.3, -0.115)
+
+/// The arm hanging (it is held out at rest: `ARM_OUT`), its palm to the thigh: the elbow's centre (de Leva's upper arm, 0.2817 m), the
+/// wrist's (his forearm, 0.2689 m) and the third metacarpal's head (his hand, 0.0862 m).
+const ELBOW: vec3 = vec3(0.2, 1.116, -0.015)
+const WRIST: vec3 = vec3(0.215, 0.847, 0.0)
+const KNUCKLE: vec3 = vec3(0.215, 0.761, 0.005)
+
+/// The fingers (thumb, index, middle, ring, little): each one's first joint as an offset from the
+/// third metacarpal's head (the thumb's carpometacarpal joint from the wrist), its three segments'
+/// lengths (Buchholz's fractions of a hand of 192 mm, ANSUR II's), and its radius at its base.
+/// The thumb's ray points down, forward and in toward the palm.
+const THUMB_BASE: vec3 = vec3(-0.008, -0.018, 0.014)
+const FINGER_BASES: [vec3; 5] = [
+    vec3(0.0),
+    vec3(0.0, -0.003, 0.019),
+    vec3(0.0, 0.0, 0.0),
+    vec3(0.0, 0.005, -0.018),
+    vec3(0.0, 0.006, -0.035),
+]
+const FINGER_LENGTHS: [vec3; 5] = [
+    vec3(0.0481, 0.0376, 0.0303),
+    vec3(0.0469, 0.0274, 0.0186),
+    vec3(0.051, 0.0326, 0.0207),
+    vec3(0.0467, 0.0316, 0.0205),
+    vec3(0.0391, 0.0224, 0.0178),
+]
+const FINGER_RADII: [f32; 5] = [0.0113, 0.0098, 0.0101, 0.0095, 0.0085]
+const THUMB_RAY: vec3 = vec3(-0.25, -0.65, 0.72)
+
+/// How far the arms are held out from the body's sides at rest (degrees, at the shoulder): clear
+/// of the trunk and the hips, so the flesh cuts no range for a contact of this one pose (a hand
+/// that rests against the hip), and the skin is made where the armpit is open.
+const ARM_OUT: f32 = 30.0
+
+/// A point of the hanging arm (the landmarks above), and a direction, as the arm is held at rest.
+fn arm_point(p: vec3) -> vec3 {
+    SHOULDER + Quat::axis_angle(vec3(0.0, 0.0, 1.0), ARM_OUT * DEG).rotate(p - SHOULDER)
+}
+
+fn arm_dir(v: vec3) -> vec3 {
+    Quat::axis_angle(vec3(0.0, 0.0, 1.0), ARM_OUT * DEG).rotate(v)
+}
+
+// ---- its frames -----------------------------------------------------------------------------------
+
+/// The frame whose y is `bone` and whose first number moves the bone's end toward `toward`:
+/// x = y × toward, z = x × y.
+fn frame_turn(bone: vec3, toward: vec3) -> Quat {
+    let y = normalize(bone)
+    let x = normalize(cross(y, toward))
+    let z = cross(x, y)
+    Quat::from_mat3(mat3(x, y, z))
+}
+
+/// The left side's point `p` on the side `side` (0 left, 1 right).
+fn sided(p: vec3, side: u32) -> vec3 {
+    if side == 0 { p } else { vec3(-p.x, p.y, p.z) }
+}
+
+/// A segment as its landmarks say: its joint of `kind` on `parent` at `centre` (the body's space,
+/// at rest), its bone to `end`, its first number toward `toward`; its range (degrees, the left
+/// side's; mirrored on the right) and strengths (N m, each number's).
+struct Bone: Copy {
+    kind: Kind,
+    parent: u32,
+    centre: vec3,
+    end: vec3,
+    toward: vec3,
+    lo: vec3,
+    hi: vec3,
+    strength: vec3,
+}
+
+fn bone(
+    kind: Kind,
+    parent: u32,
+    centre: vec3,
+    end: vec3,
+    toward: vec3,
+    lo: vec3,
+    hi: vec3,
+    strength: vec3,
+) -> Bone {
+    Bone { kind, parent, centre, end, toward, lo, hi, strength }
+}
+
+/// The right side's bone of the left side's `b`: its landmarks mirrored, its second and third
+/// numbers' ranges mirrored (their axes are mirrored by the frame, so the same anatomical motion
+/// is the opposite sign).
+fn mirrored(b: Bone, parent: u32) -> Bone {
+    Bone {
+        kind: b.kind,
+        parent,
+        centre: sided(b.centre, 1),
+        end: sided(b.end, 1),
+        toward: sided(b.toward, 1),
+        lo: vec3(b.lo.x, -b.hi.y, -b.hi.z),
+        hi: vec3(b.hi.x, -b.lo.y, -b.lo.z),
+        strength: b.strength,
+    }
+}
+
+/// The landmarks of each segment, the left side's and their mirrors.
+///
+/// The ranges (degrees, from rest) are published means of healthy adults: the spine's the sums of
+/// White and Panjabi's representative values (1990; as Rothman-Simeone's table 7-1 holds them)
+/// of the levels each joint carries, flexion and extension split by Pearcy (1984, the lumbar
+/// levels; not read at its source), by Wilke et al. (2017, the thoracic: about equal) and by
+/// Panjabi et al. (1988, C0-C2); the hip's, the knee's and the ankle's of Roaas and Andersson
+/// (1982) and Soucie et al. (2011); the shoulder's, the elbow's, the forearm's and the wrist's of
+/// Soucie, the NASA handbook (HIDH, appendix B) and Boone and Azen (1979; not read at its source);
+/// the clavicle's and the scapula's of Ludewig et al. (2009); the fingers' of Ibrahim et al.
+/// (2024) and the thumb's of Skvarilova and Plevkova (1996; not read at its source). Where no
+/// source was found the comment says so.
+///
+/// The strengths (N m, each number's: the mean of its two directions' maximum isometric torques,
+/// a man's) are of Anderson, Madigan and Nussbaum (2007: the hip, knee and ankle), Harbo,
+/// Brincks and Andersen (2012), Holzbaur et al. (2007: the shoulder and elbow), Roy et al. (2009:
+/// the shoulder's rotation), Koykka et al. (2025: the forearm), Decostre et al. (2015: the
+/// wrist), Vasavada, Li and Delp (2001: the neck), McNeill et al. (1980) and Kienbacher et al.
+/// (2014: the trunk), Endo et al. (2002: the toes) and Astin (1999: the fingers).
+fn bones_at_rest() -> [Bone; SEGMENTS] {
+    let fixed = Kind::Fixed
+    let ball = Kind::Ball
+    let hinge = Kind::Hinge
+    let up = vec3(0.0, 1.0, 0.0)
+    let ahead = vec3(0.0, 0.0, 1.0)
+    let back = vec3(0.0, 0.0, -1.0)
+    let none = vec3(0.0)
+    var b = [bone(fixed, NONE, none, up, ahead, none, none, none); SEGMENTS]
+    let pelvis_centre = vec3(0.0, HIP.y, 0.0)
+    b[PELVIS] = bone(fixed, NONE, pelvis_centre, L5_S1, ahead, none, none, none)
+    // The spine: flexion (forward) and extension; lateral bending; axial rotation. The trunk's
+    // strengths (about L5-S1: flexion 149 and extension 210, lateral bending 147, rotation 137)
+    // are held at each of its levels; the neck's (about C7-T1: 30 and 52, 36, 15) at the neck's
+    // and the head's. No per-level strengths were found.
+    let trunk = vec3(180.0, 147.0, 137.0)
+    let neck = vec3(41.0, 36.0, 15.0)
+    // L5-S1, L4-L5, L3-L4: flexion 9 + 13 + 12, extension 5 + 2 + 1, bending 3 + 6 + 8,
+    // rotation 1 + 2 + 2.
+    b[LUMBAR_LOW] = bone(
+        ball,
+        PELVIS,
+        L5_S1,
+        L2_L3,
+        ahead,
+        vec3(-8.0, -17.0, -5.0),
+        vec3(34.0, 17.0, 5.0),
+        trunk,
+    )
+    // L2-L3, L1-L2: flexion 10 + 8, extension 3 + 5, bending 6 + 6, rotation 2 + 2.
+    b[LUMBAR_HIGH] = bone(
+        ball,
+        LUMBAR_LOW,
+        L2_L3,
+        T12_L1,
+        ahead,
+        vec3(-8.0, -12.0, -4.0),
+        vec3(18.0, 12.0, 4.0),
+        trunk,
+    )
+    // T7-T8 to T12-L1: flexion and extension 51 (half each), bending 42, rotation 23.
+    b[THORAX_LOW] = bone(
+        ball,
+        LUMBAR_HIGH,
+        T12_L1,
+        T6_T7,
+        ahead,
+        vec3(-25.0, -42.0, -23.0),
+        vec3(26.0, 42.0, 23.0),
+        trunk,
+    )
+    // T1-T2 to T6-T7: flexion and extension 25, bending 34, rotation 48.
+    b[THORAX_HIGH] = bone(
+        ball,
+        THORAX_LOW,
+        T6_T7,
+        C7_T1,
+        ahead,
+        vec3(-12.0, -34.0, -48.0),
+        vec3(13.0, 34.0, 48.0),
+        trunk,
+    )
+    // C2-C3 to C7-T1: flexion and extension 91 (55 and 36: the NASA handbook's 65 and 34 for the
+    // whole neck, less C0-C2's), bending 51, rotation 32.
+    b[NECK] = bone(
+        ball,
+        THORAX_HIGH,
+        C7_T1,
+        C0_C1,
+        ahead,
+        vec3(-36.0, -51.0, -32.0),
+        vec3(55.0, 51.0, 32.0),
+        neck,
+    )
+    // C0-C1 and C1-C2: flexion 3.5 + 11.5, extension 21 + 11, bending 10, rotation 45.
+    b[HEAD] = bone(
+        ball,
+        NECK,
+        C0_C1,
+        VERTEX,
+        ahead,
+        vec3(-32.0, -10.0, -45.0),
+        vec3(15.0, 10.0, 45.0),
+        neck,
+    )
+    // The hip: flexion 125, extension 15; abduction 39, adduction 30; internal rotation 33,
+    // external 34. The knee: flexion 140, its extension 1 past straight. The ankle: plantar
+    // flexion 47 and dorsiflexion 15 (the first number, toward the shin); the foot's turn out and
+    // in about the leg (20 each way: no published mean found); its eversion and inversion about
+    // its length (28 each). The toes: extension 70, flexion 45 (Norkin and White, 1988; not read
+    // at its source).
+    let thigh = bone(
+        ball,
+        PELVIS,
+        HIP,
+        KNEE,
+        ahead,
+        vec3(-15.0, -30.0, -34.0),
+        vec3(125.0, 39.0, 33.0),
+        vec3(176.0, 104.0, 42.0),
+    )
+    let shank = bone(
+        hinge,
+        THIGH_LEFT,
+        KNEE,
+        ANKLE,
+        back,
+        vec3(-1.0, 0.0, 0.0),
+        vec3(140.0, 0.0, 0.0),
+        vec3(157.0, 0.0, 0.0),
+    )
+    let foot = bone(
+        ball,
+        SHANK_LEFT,
+        ANKLE,
+        TOE_JOINT,
+        up,
+        vec3(-47.0, -20.0, -28.0),
+        vec3(15.0, 20.0, 28.0),
+        vec3(80.0, 30.0, 30.0),
+    )
+    let toes = bone(
+        hinge,
+        FOOT_LEFT,
+        TOE_JOINT,
+        TOE_TIP,
+        up,
+        vec3(-45.0, 0.0, 0.0),
+        vec3(70.0, 0.0, 0.0),
+        vec3(20.0, 0.0, 0.0),
+    )
+    b[THIGH_LEFT] = thigh
+    b[SHANK_LEFT] = shank
+    b[FOOT_LEFT] = foot
+    b[TOES_LEFT] = toes
+    b[THIGH_RIGHT] = mirrored(thigh, PELVIS)
+    b[SHANK_RIGHT] = mirrored(shank, THIGH_RIGHT)
+    b[FOOT_RIGHT] = mirrored(foot, SHANK_RIGHT)
+    b[TOES_RIGHT] = mirrored(toes, FOOT_RIGHT)
+    // The clavicle on the sternum: its rise (6 at rest to 17 as the arm rises: 10 down and 30 up
+    // allowed), its retraction (19 to 39: 25 back and 15 forward, the forward limit not found) and
+    // its posterior axial rotation (0 to 31). The scapula on the clavicle (the acromioclavicular
+    // joint: about 20 of tilt, 11 of upward rotation, 8 of internal rotation as the arm rises). No
+    // published strengths of the girdle were found: 60 N m (the shoulder's own order) is held.
+    let clavicle = bone(
+        ball,
+        THORAX_HIGH,
+        STERNOCLAVICULAR,
+        ACROMIOCLAVICULAR,
+        up,
+        vec3(-10.0, -15.0, -35.0),
+        vec3(30.0, 25.0, 10.0),
+        vec3(60.0, 60.0, 30.0),
+    )
+    let scapula = bone(
+        ball,
+        CLAVICLE_LEFT,
+        ACROMIOCLAVICULAR,
+        INFERIOR_ANGLE,
+        back,
+        vec3(-20.0, -15.0, -12.0),
+        vec3(10.0, 15.0, 12.0),
+        vec3(60.0, 60.0, 40.0),
+    )
+    // The shoulder (the glenohumeral joint alone, about two thirds of the arm's whole rise: the
+    // scapula gives the rest): flexion 120, extension 55; abduction 105, adduction 45; internal
+    // rotation 80, external 60. Strengths: flexion 63 and extension 77, abduction 74 and
+    // adduction 94, internal rotation 47 and external 34.
+    let upper = bone(
+        ball,
+        SCAPULA_LEFT,
+        SHOULDER,
+        arm_point(ELBOW),
+        ahead,
+        vec3(-55.0, -45.0, -60.0),
+        vec3(120.0, 105.0, 80.0),
+        vec3(70.0, 84.0, 40.0),
+    )
+    // The elbow: flexion 145, 1 past straight; the forearm's pronation 77 and supination 85.
+    // Strengths: flexion 80 and extension 61; pronation 11 and supination 12.
+    let forearm = bone(
+        Kind::Universal,
+        UPPER_ARM_LEFT,
+        arm_point(ELBOW),
+        arm_point(WRIST),
+        ahead,
+        vec3(-1.0, -85.0, 0.0),
+        vec3(145.0, 77.0, 0.0),
+        vec3(70.0, 11.6, 0.0),
+    )
+    // The wrist: flexion (toward the palm, the body's middle from the left hand) 75, extension
+    // 70; radial deviation 20, ulnar 35; it does not twist (1 each way). Strengths: flexion 14.5
+    // and extension 11.4, radial 11 and ulnar 9.5.
+    let palm = arm_dir(vec3(-1.0, 0.0, 0.0))
+    let hand = bone(
+        ball,
+        FOREARM_LEFT,
+        arm_point(WRIST),
+        arm_point(KNUCKLE),
+        palm,
+        vec3(-70.0, -35.0, -1.0),
+        vec3(75.0, 20.0, 1.0),
+        vec3(13.0, 10.0, 1.0),
+    )
+    b[CLAVICLE_LEFT] = clavicle
+    b[SCAPULA_LEFT] = scapula
+    b[UPPER_ARM_LEFT] = upper
+    b[FOREARM_LEFT] = forearm
+    b[HAND_LEFT] = hand
+    b[CLAVICLE_RIGHT] = mirrored(clavicle, THORAX_HIGH)
+    b[SCAPULA_RIGHT] = mirrored(scapula, CLAVICLE_RIGHT)
+    b[UPPER_ARM_RIGHT] = mirrored(upper, SCAPULA_RIGHT)
+    b[FOREARM_RIGHT] = mirrored(forearm, UPPER_ARM_RIGHT)
+    b[HAND_RIGHT] = mirrored(hand, FOREARM_RIGHT)
+    // The fingers. The thumb's carpometacarpal joint (toward the palm 15 and back 15, abduction 70,
+    // a turn of 15 each way for opposition: no published mean of that turn found), its knuckle
+    // (flexion 57, extension 14) and its last joint (79 and 23). Each finger's knuckle (flexion
+    // 86, extension 25; a spread of 20 each way: no published mean found; no twist), its middle
+    // joint (flexion 96) and its last (flexion 83, extension 7). Strengths: a finger's pull of 71
+    // N at its middle joint (Astin) is some 3 N m at the knuckle; the thumb's are taken alike.
+    for f in 0..5 {
+        let first = FINGERS_LEFT + 3 * f
+        let base = arm_point(if f == 0 { WRIST + THUMB_BASE } else { KNUCKLE + FINGER_BASES[f] })
+        let len = FINGER_LENGTHS[f]
+        let ray = arm_dir(if f == 0 { normalize(THUMB_RAY) } else { vec3(0.0, -1.0, 0.0) })
+        let toward = palm
+        let j1 = base + ray * len.x
+        let j2 = j1 + ray * len.y
+        let tip = j2 + ray * len.z
+        let k1 = if f == 0 {
+            bone(
+                ball,
+                HAND_LEFT,
+                base,
+                j1,
+                toward,
+                vec3(-15.0, -5.0, -15.0),
+                vec3(15.0, 70.0, 15.0),
+                vec3(3.0, 3.0, 1.0),
+            )
+        } else {
+            bone(
+                ball,
+                HAND_LEFT,
+                base,
+                j1,
+                toward,
+                vec3(-25.0, -20.0, -1.0),
+                vec3(86.0, 20.0, 1.0),
+                vec3(3.0, 1.0, 0.2),
+            )
+        }
+        let k2 = if f == 0 {
+            bone(
+                hinge,
+                first,
+                j1,
+                j2,
+                toward,
+                vec3(-14.0, 0.0, 0.0),
+                vec3(57.0, 0.0, 0.0),
+                vec3(2.0, 0.0, 0.0),
+            )
+        } else {
+            bone(
+                hinge,
+                first,
+                j1,
+                j2,
+                toward,
+                vec3(-2.0, 0.0, 0.0),
+                vec3(96.0, 0.0, 0.0),
+                vec3(1.5, 0.0, 0.0),
+            )
+        }
+        let k3 = if f == 0 {
+            bone(
+                hinge,
+                first + 1,
+                j2,
+                tip,
+                toward,
+                vec3(-23.0, 0.0, 0.0),
+                vec3(79.0, 0.0, 0.0),
+                vec3(1.0, 0.0, 0.0),
+            )
+        } else {
+            bone(
+                hinge,
+                first + 1,
+                j2,
+                tip,
+                toward,
+                vec3(-7.0, 0.0, 0.0),
+                vec3(83.0, 0.0, 0.0),
+                vec3(0.8, 0.0, 0.0),
+            )
+        }
+        b[first] = k1
+        b[first + 1] = k2
+        b[first + 2] = k3
+        let r = FINGERS_RIGHT + 3 * f
+        b[r] = mirrored(k1, HAND_RIGHT)
+        b[r + 1] = mirrored(k2, r)
+        b[r + 2] = mirrored(k3, r + 1)
+    }
+    b
+}
+
+/// The bones as rest has them.
+const BONES_AT_REST: [Bone; SEGMENTS] = bones_at_rest()
+
+/// Each segment's frame at rest, in the body's space.
+fn rest_frames() -> [Frame; SEGMENTS] {
+    var out = [Frame::identity(); SEGMENTS]
+    for s in 0..SEGMENTS {
+        let b = BONES_AT_REST[s]
+        out[s] = Frame { q: frame_turn(b.end - b.centre, b.toward), t: b.centre }
+    }
+    out
+}
+
+/// Its segments: each joint's frame in its parent's, from the frames at rest.
+fn segment_list() -> [Segment; SEGMENTS] {
+    let rest = rest_frames()
+    var out = [Segment {
+        joint: Joint {
+            kind: Kind::Fixed,
+            parent: NONE,
+            at: Frame::identity(),
+            lo: vec3(0.0),
+            hi: vec3(0.0),
+            strength: vec3(0.0),
+        },
+        tip: vec3(0.0),
+    }; SEGMENTS]
+    for s in 0..SEGMENTS {
+        let b = BONES_AT_REST[s]
+        let at = if s == 0 { rest[0] } else { rest[b.parent].inverse().then(rest[s]) }
+        out[s] = Segment {
+            joint: Joint {
+                kind: b.kind,
+                parent: b.parent,
+                at,
+                lo: b.lo * DEG,
+                hi: b.hi * DEG,
+                strength: b.strength,
+            },
+            tip: vec3(0.0, length(b.end - b.centre), 0.0),
+        }
+    }
+    out
+}
+
+// ---- its flesh --------------------------------------------------------------------------------
+
+/// The density of each kind of segment (kg/m³): Dempster's (1955) specific gravities of
+/// cadavers' segments (each the mean of the right and left).
+const DENSITY_HEAD: f32 = 1110.0
+const DENSITY_THORAX: f32 = 920.0
+const DENSITY_ABDOMEN: f32 = 1010.0
+const DENSITY_SHOULDER: f32 = 1040.0
+const DENSITY_UPPER_ARM: f32 = 1070.0
+const DENSITY_FOREARM: f32 = 1125.0
+const DENSITY_HAND: f32 = 1155.0
+const DENSITY_THIGH: f32 = 1050.0
+const DENSITY_SHANK: f32 = 1090.0
+const DENSITY_FOOT: f32 = 1095.0
+
+/// A part: a round cone between points `a` and `b` of the body's space at rest (each moved with
+/// segment `on`), its radii, its density.
+struct Flesh: Copy {
+    on: u32,
+    a: vec3,
+    ra: f32,
+    b: vec3,
+    rb: f32,
+    rho: f32,
+    /// The segment that end `a` moves with (most parts: `on`), and the chain of segments the part
+    /// is on (most parts: `on` alone).
+    a_on: u32,
+    span: Span,
+}
+
+fn flesh_of(on: u32, a: vec3, ra: f32, b: vec3, rb: f32, rho: f32) -> Flesh {
+    Flesh { on, a, ra, b, rb, rho, a_on: on, span: Span { from: on, to: on } }
+}
+
+/// A part of a chain of segments (`span`), its end `a` on segment `a_on` and `b` on `on`: flesh
+/// that is one tissue over several joints (the trunk over the spine's), which bends with each of
+/// them and which no joint of the chain counts as a collision.
+fn chain_flesh(
+    span: Span,
+    a_on: u32,
+    a: vec3,
+    ra: f32,
+    on: u32,
+    b: vec3,
+    rb: f32,
+    rho: f32,
+) -> Flesh {
+    Flesh { on, a, ra, b, rb, rho, a_on, span }
+}
+
+/// The trunk's cross-sections, from ANSUR II (scaled to 1.741 m): at the hips a breadth of 343 mm
+/// and a buttock depth of 244; at the waist 324 by 236; at the chest 287 by 252. Each level of the
+/// trunk is two round cones side by side, each as deep as the trunk, so the two are as broad as
+/// it; their centres are in front of the spine.
+struct Level: Copy {
+    on: u32,
+    a: vec3,
+    b: vec3,
+    ra: f32,
+    rb: f32,
+    half: f32,
+    rho: f32,
+}
+
+/// Its parts at rest, each a round cone placed from the landmarks, the muscles and fat that
+/// shape the body: the trunk's levels (two cones side by side, as broad as it and as deep, their
+/// centres in front of the spine), the buttocks and the pectorals; the neck, the skull and the
+/// jaw; the shoulder girdle (the clavicle, the slope of the trapezius, the scapula); the deltoid,
+/// the upper arm and the forearm (each two cones, thickest where its muscles' bellies are), the
+/// palm (two cones) and the fingers' segments; the thigh and the calf (two cones each), the heel,
+/// the forefoot (a cone across the metatarsals' heads) and the toes. Their sizes are ANSUR II's
+/// breadths, depths and circumferences (scaled to 1.741 m; a circumference over 2 pi as a
+/// radius): the hips 343 mm broad and the buttocks 244 deep, the waist 324 by 236, the chest 287 by
+/// 252, the shoulders 506 across the deltoids; the thigh 0.098 m at its top and 0.064 above the
+/// knee, the calf 0.062 and the ankle 0.036, the upper arm 0.050, the forearm 0.049 and the wrist
+/// 0.028, the neck 0.062; the head 199 mm long and 153 broad; the heel 72 broad and the foot 101.
+fn flesh_at_rest() -> [Flesh; PART_COUNT] {
+    var p = [flesh_of(0, vec3(0.0), 0.0, vec3(0.0), 0.0, 1000.0); PART_COUNT]
+    var n = 0
+    let levels = [
+        Level {
+            on: PELVIS,
+            a: vec3(0.0, 0.965, -0.03),
+            b: vec3(0.0, L5_S1.y + 0.01, 0.0),
+            ra: 0.0955,
+            rb: 0.0955,
+            half: 0.058,
+            rho: DENSITY_ABDOMEN,
+        },
+        Level {
+            on: LUMBAR_LOW,
+            a: vec3(0.0, L5_S1.y + 0.01, 0.0),
+            b: vec3(0.0, L2_L3.y, 0.025),
+            ra: 0.0955,
+            rb: 0.0993,
+            half: 0.05,
+            rho: DENSITY_ABDOMEN,
+        },
+        Level {
+            on: LUMBAR_HIGH,
+            a: vec3(0.0, L2_L3.y, 0.025),
+            b: vec3(0.0, T12_L1.y, 0.025),
+            ra: 0.0993,
+            rb: 0.1031,
+            half: 0.044,
+            rho: DENSITY_ABDOMEN,
+        },
+        Level {
+            on: THORAX_LOW,
+            a: vec3(0.0, T12_L1.y, 0.025),
+            b: vec3(0.0, T6_T7.y, 0.02),
+            ra: 0.1031,
+            rb: 0.1098,
+            half: 0.03,
+            rho: DENSITY_THORAX,
+        },
+        Level {
+            on: THORAX_HIGH,
+            a: vec3(0.0, T6_T7.y, 0.02),
+            b: vec3(0.0, C7_T1.y - 0.095, -0.015),
+            ra: 0.1098,
+            rb: 0.078,
+            half: 0.045,
+            rho: DENSITY_THORAX,
+        },
+    ]
+    // The trunk is one tissue over the spine: each level's cones from its joint (on the level
+    // below) to its top (on its own segment), all on the chain from the pelvis to the thorax.
+    let trunk = Span { from: PELVIS, to: THORAX_HIGH }
+    for l in levels {
+        let below = if l.on == PELVIS { PELVIS } else { BONES_AT_REST[l.on].parent }
+        for side in 0..2 {
+            let dx = if side == 0 { l.half } else { -l.half }
+            p[n] = chain_flesh(
+                trunk,
+                below,
+                l.a + vec3(dx, 0.0, 0.0),
+                l.ra,
+                l.on,
+                l.b + vec3(dx, 0.0, 0.0),
+                l.rb,
+                l.rho,
+            )
+            n += 1
+        }
+    }
+    // The pectorals: each one tissue from the sternum to the humerus, where the muscle inserts
+    // (the chain from the upper thorax through the clavicle and the scapula to the upper arm), so
+    // it moves with the arm and the shoulder's flexion is not stopped by it.
+    for side in 0..2 {
+        let upper = UPPER_ARM_LEFT + 5 * side
+        p[n] = chain_flesh(
+            Span { from: THORAX_HIGH, to: upper },
+            THORAX_HIGH,
+            sided(vec3(0.05, 1.33, 0.07), side),
+            0.04,
+            upper,
+            sided(arm_point(SHOULDER + vec3(-0.02, -0.05, 0.03)), side),
+            0.035,
+            DENSITY_THORAX,
+        )
+        n += 1
+    }
+    // The neck, one tissue from the thorax to the skull; the skull (its length front to back);
+    // the face, from the forehead and the cheeks down to the chin (the menton 0.24 m under the
+    // vertex: ANSUR II's head).
+    p[n] = chain_flesh(
+        Span { from: THORAX_HIGH, to: NECK },
+        THORAX_HIGH,
+        C7_T1 + vec3(0.0, 0.0, 0.035),
+        0.06,
+        NECK,
+        C0_C1 + vec3(0.0, 0.0, 0.02),
+        0.055,
+        DENSITY_HEAD,
+    )
+    p[n + 1] = flesh_of(
+        HEAD,
+        C0_C1 + vec3(0.0, 0.075, -0.035),
+        0.085,
+        C0_C1 + vec3(0.0, 0.075, 0.01),
+        0.085,
+        DENSITY_HEAD,
+    )
+    p[n + 2] = flesh_of(
+        HEAD,
+        C0_C1 + vec3(0.0, 0.065, 0.035),
+        0.058,
+        C0_C1 + vec3(0.0, -0.055, 0.058),
+        0.03,
+        DENSITY_HEAD,
+    )
+    n += 3
+    // The legs: the buttock (one tissue from the pelvis to the thigh), the thigh (two cones: its
+    // top, thick with the hip's muscles, and its lower half), the calf (two: the muscles' bellies
+    // high and behind, then the tendon to the ankle), the heel to the ball, the forefoot across
+    // the metatarsals' heads, the toes.
+    for side in 0..2 {
+        let t = THIGH_LEFT + 4 * side
+        p[n] = chain_flesh(
+            Span { from: PELVIS, to: t },
+            PELVIS,
+            sided(vec3(0.06, 0.93, -0.065), side),
+            0.076,
+            t,
+            sided(vec3(0.08, 0.84, -0.055), side),
+            0.07,
+            DENSITY_THIGH,
+        )
+        p[n + 1] = flesh_of(
+            t,
+            sided(HIP + vec3(-0.016, -0.045, -0.004), side),
+            0.097,
+            sided(vec3(0.09, 0.7, 0.008), side),
+            0.086,
+            DENSITY_THIGH,
+        )
+        p[n + 2] = flesh_of(
+            t,
+            sided(vec3(0.09, 0.7, 0.008), side),
+            0.086,
+            sided(KNEE + vec3(0.0, 0.025, 0.0), side),
+            0.061,
+            DENSITY_THIGH,
+        )
+        p[n + 3] = flesh_of(
+            t + 1,
+            sided(KNEE + vec3(0.0, -0.02, -0.008), side),
+            0.05,
+            sided(vec3(0.09, 0.36, -0.02), side),
+            0.055,
+            DENSITY_SHANK,
+        )
+        p[n + 4] = flesh_of(
+            t + 1,
+            sided(vec3(0.09, 0.36, -0.02), side),
+            0.055,
+            sided(ANKLE + vec3(0.0, 0.035, -0.008), side),
+            0.033,
+            DENSITY_SHANK,
+        )
+        p[n + 5] = flesh_of(
+            t + 2,
+            sided(HEEL + vec3(0.0, 0.004, 0.0), side),
+            0.041,
+            sided(TOE_JOINT + vec3(-0.012, 0.012, -0.025), side),
+            0.03,
+            DENSITY_FOOT,
+        )
+        p[n + 6] = flesh_of(
+            t + 2,
+            sided(TOE_JOINT + vec3(0.022, 0.002, -0.008), side),
+            0.025,
+            sided(TOE_JOINT + vec3(-0.038, 0.0, -0.022), side),
+            0.021,
+            DENSITY_FOOT,
+        )
+        p[n + 7] = flesh_of(
+            t + 3,
+            sided(TOE_JOINT + vec3(0.0, 0.0, 0.01), side),
+            0.02,
+            sided(TOE_TIP + vec3(-0.01, 0.0, -0.012), side),
+            0.013,
+            DENSITY_FOOT,
+        )
+        n += 8
+    }
+    // The arms: the shoulder girdle (one tissue over the thorax, the clavicle and the scapula:
+    // the clavicle, the trapezius's slope from the neck's base to the acromion, the scapula on the
+    // back), the deltoid (on the upper arm, over the shoulder's joint), the upper arm (two cones:
+    // to the biceps's belly, then to the elbow), the forearm (two: to its muscles' bellies near
+    // the elbow, then to the wrist), the palm (two cones, the index's side and the little
+    // finger's).
+    for side in 0..2 {
+        let c = CLAVICLE_LEFT + 5 * side
+        let girdle = Span { from: THORAX_HIGH, to: c + 1 }
+        p[n] = chain_flesh(
+            girdle,
+            c,
+            sided(STERNOCLAVICULAR + vec3(0.02, 0.0, -0.02), side),
+            0.025,
+            c,
+            sided(ACROMIOCLAVICULAR + vec3(0.0, -0.005, 0.005), side),
+            0.028,
+            DENSITY_SHOULDER,
+        )
+        p[n + 1] = chain_flesh(
+            girdle,
+            THORAX_HIGH,
+            sided(C7_T1 + vec3(0.035, 0.015, 0.0), side),
+            0.045,
+            c + 1,
+            sided(ACROMIOCLAVICULAR + vec3(-0.01, 0.0, -0.02), side),
+            0.03,
+            DENSITY_SHOULDER,
+        )
+        p[n + 2] = chain_flesh(
+            girdle,
+            c + 1,
+            sided(ACROMIOCLAVICULAR + vec3(-0.04, -0.035, -0.045), side),
+            0.03,
+            c + 1,
+            sided(INFERIOR_ANGLE + vec3(0.0, 0.02, 0.02), side),
+            0.02,
+            DENSITY_SHOULDER,
+        )
+        let dl = arm_point(SHOULDER + vec3(0.022, -0.016, 0.0))
+        let dm = arm_point(SHOULDER + vec3(0.012, -0.12, 0.0))
+        p[n + 3] = flesh_of(
+            c + 2,
+            sided(dl, side),
+            0.038,
+            sided(dm, side),
+            0.032,
+            DENSITY_UPPER_ARM,
+        )
+        let mid = mix(SHOULDER, ELBOW, vec3(0.62))
+        p[n + 4] = flesh_of(
+            c + 2,
+            sided(arm_point(SHOULDER + vec3(0.0, -0.035, 0.0)), side),
+            0.036,
+            sided(arm_point(mid + vec3(0.0, 0.0, 0.004)), side),
+            0.0445,
+            DENSITY_UPPER_ARM,
+        )
+        p[n + 5] = flesh_of(
+            c + 2,
+            sided(arm_point(mid + vec3(0.0, 0.0, 0.004)), side),
+            0.0445,
+            sided(arm_point(ELBOW + vec3(0.0, 0.02, 0.0)), side),
+            0.038,
+            DENSITY_UPPER_ARM,
+        )
+        let belly = mix(ELBOW, WRIST, vec3(0.28))
+        p[n + 6] = flesh_of(
+            c + 3,
+            sided(arm_point(ELBOW + vec3(0.0, -0.01, 0.0)), side),
+            0.038,
+            sided(arm_point(belly), side),
+            0.04,
+            DENSITY_FOREARM,
+        )
+        p[n + 7] = flesh_of(
+            c + 3,
+            sided(arm_point(belly), side),
+            0.04,
+            sided(arm_point(WRIST + vec3(0.0, 0.015, 0.0)), side),
+            0.026,
+            DENSITY_FOREARM,
+        )
+        p[n + 8] = flesh_of(
+            c + 4,
+            sided(arm_point(WRIST + vec3(0.0, -0.01, 0.009)), side),
+            0.025,
+            sided(arm_point(KNUCKLE + FINGER_BASES[1] + vec3(0.0, 0.006, 0.0)), side),
+            0.018,
+            DENSITY_HAND,
+        )
+        p[n + 9] = flesh_of(
+            c + 4,
+            sided(arm_point(WRIST + vec3(0.0, -0.01, -0.012)), side),
+            0.025,
+            sided(arm_point(KNUCKLE + FINGER_BASES[4] + vec3(0.0, 0.006, 0.0)), side),
+            0.017,
+            DENSITY_HAND,
+        )
+        n += 10
+    }
+    // The fingers: each segment a cone from its joint to the next, thinning to the tip.
+    for side in 0..2 {
+        let first = if side == 0 { FINGERS_LEFT } else { FINGERS_RIGHT }
+        for f in 0..5 {
+            let r = FINGER_RADII[f]
+            for k in 0..3 {
+                let s = first + 3 * f + k
+                let bb = BONES_AT_REST[s]
+                let r0 = r * (1.0 - 0.12 * f32(k))
+                // The thumb's metacarpal lies in the palm's flesh from the wrist: its own cone
+                // starts a third along it, clear of the forearm.
+                let a = if f == 0 && k == 0 { mix(bb.centre, bb.end, vec3(0.35)) } else {
+                    bb.centre
+                }
+                p[n] = flesh_of(s, a, r0, bb.end, r0 * 0.88, DENSITY_HAND)
+                n += 1
+            }
+        }
+    }
+    assert(n == PART_COUNT, f"{n} parts, not {PART_COUNT}")
+    // In the order of their groups (`group_of_part`): each group is blended at its own width.
+    var out = p
+    var k = 0
+    for g in 0..3 {
+        for i in 0..PART_COUNT {
+            if group_of_part(p[i]) == g {
+                out[k] = p[i]
+                k += 1
+            }
+        }
+    }
+    out
+}
+
+/// How many parts each group of the flesh holds: the core (the trunk, the neck, the buttocks, the
+/// shoulder girdles: the parts that are one tissue over a chain of joints, blended wide), the
+/// head and the limbs, the fingers.
+pub const CORE_PARTS: u32 = 21
+pub const LIMB_PARTS: u32 = 30
+pub const DIGIT_PARTS: u32 = 30
+
+/// How wide each group's seams are rounded (m), and the seams between groups.
+const CORE_JOIN: f32 = 0.035
+const LIMB_JOIN: f32 = 0.015
+const DIGIT_JOIN: f32 = 0.006
+
+fn group_of_part(f: Flesh) -> u32 {
+    if f.on >= FINGERS_LEFT {
+        2
+    } else if f.span.from != f.span.to || f.on <= THORAX_HIGH {
+        0
+    } else {
+        1
+    }
+}
+
+const FLESH_AT_REST: [Flesh; PART_COUNT] = flesh_at_rest()
+
+/// Its parts as the engine holds them: each end a point of its segment.
+fn part_list() -> [Cone; PART_COUNT] {
+    let rest = rest_frames()
+    var out = [Cone {
+        a: End { on: 0, at: vec3(0.0) },
+        ra: 0.0,
+        b: End { on: 0, at: vec3(0.0) },
+        rb: 0.0,
+        span: on(0),
+    }; PART_COUNT]
+    for i in 0..PART_COUNT {
+        let f = FLESH_AT_REST[i]
+        out[i] = Cone {
+            a: End { on: f.a_on, at: rest[f.a_on].inverse().apply(f.a) },
+            ra: f.ra,
+            b: End { on: f.on, at: rest[f.on].inverse().apply(f.b) },
+            rb: f.rb,
+            span: f.span,
+        }
+    }
+    out
+}
+
+pub const PARTS: [Cone; PART_COUNT] = part_list()
+
+/// It at rest: standing, its arms held out 30 degrees.
+fn at_rest(b: Body<SEGMENTS>) -> Pose<FREEDOM> {
+    b.rest()
+}
+
+/// Its body, each joint's range cut where its own flesh stops it (1 mm, from rest).
+@fuel(2 ** 42)
+pub const BODY: Body<SEGMENTS> = cleared(
+    body(segment_list()),
+    PARTS,
+    at_rest(body(segment_list())),
+    0.001,
+    64,
+)
+
+/// It at rest, which is the pose its skin is made in.
+pub const REST: Pose<FREEDOM> = at_rest(BODY)
+
+pub const SPANS: [Span; PART_COUNT] = spans_of(PARTS)
+const SKIN: Skin<PART_COUNT> = skin(BODY, REST, PARTS)
+
+type Groups<S> = SmoothUnion<SmoothUnion<SmoothUnionAll<S, CORE_PARTS>, SmoothUnionAll<S, LIMB_PARTS>>, SmoothUnionAll<S, DIGIT_PARTS>>
+
+type HumanRaw = With<Groups<RoundCone>, Substance>
+
+/// The man's flesh: its parts in one smooth union, with its skin.
+pub struct HumanFlesh: Copy + GpuData + Eq + StateHash {
+    pub inner: HumanRaw,
+}
+
+impl Surface for HumanFlesh {
+    @budget(work: 4096)
+    fn distance(self, p: vec3) -> f32 {
+        self.inner.distance(p)
+    }
+
+    fn distance_within(self, p: vec3, most: f32) -> f32 {
+        self.inner.distance_within(p, most)
+    }
+
+    fn bound(self) -> Bound {
+        self.inner.bound()
+    }
+
+    fn lipschitz(self, near: f32) -> f32 {
+        self.inner.lipschitz(near)
+    }
+
+    fn interval_near(self, b: Box3) -> Interval {
+        self.inner.interval_near(b)
+    }
+
+    fn parts(self) -> u32 {
+        self.inner.parts()
+    }
+
+    fn part_at(self, p: vec3) -> (f32, u32) {
+        self.inner.part_at(p)
+    }
+
+    fn part_distance(self, p: vec3, i: u32) -> f32 {
+        self.inner.part_distance(p, i)
+    }
+
+    fn part_name(self, i: u32) -> PartName {
+        self.inner.part_name(i)
+    }
+
+    fn part_offset(self, p: vec3, i: u32, by: f32) -> f32 {
+        self.inner.part_offset(p, i, by)
+    }
+
+    fn masked(self, p: vec3, live: Live, first: u32) -> f32 {
+        self.inner.masked(p, live, first)
+    }
+
+    fn pruned<F: Copy + fn(vec3) -> vec3>(
+        self,
+        over: Box3,
+        at: F,
+        stretch: f32,
+        live: Live,
+        first: u32,
+    ) -> Pruned {
+        self.inner.pruned(over, at, stretch, live, first)
+    }
+}
+
+impl Field<Substance> for HumanFlesh {
+    fn channels(self, p: vec3) -> Substance {
+        self.inner.channels(p)
+    }
+
+    fn distance_and_channels(self, p: vec3) -> (f32, Substance) {
+        self.inner.distance_and_channels(p)
+    }
+
+    fn field_facts(self) -> FieldFacts {
+        HUMAN_FACTS
+    }
+}
+
+/// The man: his exact posed field and his rest template, deformed by his bones on the GPU.
+pub type Human = Skinned<HumanFlesh, BONES, PART_COUNT>
+
+fn cones_at(at: [Frame; SEGMENTS]) -> [RoundCone; PART_COUNT] {
+    var out = [round_cone(vec3(0.0), vec3(0.0), r_top: 0.0, r_bottom: 0.0); PART_COUNT]
+    for i in 0..PART_COUNT {
+        let (a, b) = PARTS[i].placed(at)
+        out[i] = round_cone(a, b, r_top: PARTS[i].ra, r_bottom: PARTS[i].rb)
+    }
+    out
+}
+
+/// The parts of the three groups, blended each at its width and then together.
+fn grouped<S: Copy + Surface>(parts: [S; PART_COUNT]) -> Groups<S> {
+    var core = [parts[0]; CORE_PARTS]
+    var limbs = [parts[0]; LIMB_PARTS]
+    var digits = [parts[0]; DIGIT_PARTS]
+    for i in 0..CORE_PARTS {
+        core[i] = parts[i]
+    }
+    for i in 0..LIMB_PARTS {
+        limbs[i] = parts[CORE_PARTS + i]
+    }
+    for i in 0..DIGIT_PARTS {
+        digits[i] = parts[CORE_PARTS + LIMB_PARTS + i]
+    }
+    core.smooth_union(k: CORE_JOIN)
+        .smooth_union(limbs.smooth_union(k: LIMB_JOIN), k: LIMB_JOIN)
+        .smooth_union(digits.smooth_union(k: DIGIT_JOIN), k: DIGIT_JOIN)
+}
+
+fn flesh(at: [Frame; SEGMENTS]) -> HumanFlesh {
+    HumanFlesh { inner: grouped(cones_at(at)).with(matte(SKIN_ALBEDO)) }
+}
+
+/// His flesh as it is weighed: the same shapes, each with its segment's density.
+pub fn matter(at: [Frame; SEGMENTS]) -> Groups<With<RoundCone, Density>> {
+    let cones = cones_at(at)
+    var out = [cones[0].with(density(1000.0)); PART_COUNT]
+    for i in 0..PART_COUNT {
+        out[i] = cones[i].with(density(FLESH_AT_REST[i].rho))
+    }
+    grouped(out)
+}
+
+const REST_FLESH: HumanFlesh = flesh(BODY.places(REST))
+const HUMAN_FACTS: FieldFacts = prove_field_facts(REST_FLESH)
+
+/// What each segment weighs, at rest.
+@fuel(2 ** 45)
+pub const MASSES: [Mass; SEGMENTS] = masses(BODY, REST, matter(BODY.places(REST)), SPANS, 0.008)
+
+/// The man as `pose` stands him.
+pub fn human(pose: Pose<FREEDOM>) -> Human {
+    skinned(
+        flesh(BODY.places(pose)),
+        REST_FLESH,
+        bones(BODY, SPANS, pose, REST),
+        SKIN.a,
+        SKIN.b,
+        SKIN.from,
+        SKIN.to,
+        JOIN,
+    )
+}
+
+// ---- tests ------------------------------------------------------------------------------------
+
+@test
+fn the_human_is_declared_as_its_counts_say() {
+    assert(BODY.freedom == FREEDOM, f"{BODY.freedom} numbers, not {FREEDOM}")
+    assert(bone_count(BODY, SPANS) == BONES, f"{bone_count(BODY, SPANS)} bones, not {BONES}")
+}
+
+/// Each segment's frame at rest is where its landmarks put it: its origin at its joint's centre
+/// and its bone's end at its tip (to 0.01 mm).
+@test
+fn each_segment_is_where_its_landmarks_are() {
+    let at = BODY.places(REST)
+    for s in 0..SEGMENTS {
+        let b = BONES_AT_REST[s]
+        let o = at[s].t
+        let tip = at[s].apply(BODY.segments[s].tip)
+        assert(length(o - b.centre) < 1.0e-5, f"segment {s} at {o}, not {b.centre}")
+        assert(length(tip - b.end) < 1.0e-5, f"segment {s}'s tip at {tip}, not {b.end}")
+    }
+}
+
+/// Each joint's first number, made positive, moves its bone's end the way its landmarks say:
+/// flexion forward at the hip, the shoulder, the spine and the neck, backward at the knee, the
+/// foot and the toes up, the clavicle up, the wrist and the fingers toward the palm.
+@test
+fn each_first_number_bends_its_joint_the_anatomical_way() {
+    let at = BODY.places(REST)
+    for s in 1..SEGMENTS {
+        if BODY.freedom_of(s) == 0 {
+            continue
+        }
+        var p = REST
+        var q = BODY.numbers(p, s)
+        q.x = 0.2
+        BODY.set_numbers(mut p, s, q)
+        let moved = BODY.places(p)
+        let tip0 = at[s].apply(BODY.segments[s].tip)
+        let tip1 = moved[s].apply(BODY.segments[s].tip)
+        let b = BONES_AT_REST[s]
+        let d = dot(
+            normalize(tip1 - tip0),
+            normalize(
+                b.toward - normalize(b.end - b.centre) * dot(b.toward, normalize(b.end - b.centre)),
+            ),
+        )
+        assert(
+            d > 0.95,
+            f"segment {s}'s first number moves its tip {tip1 - tip0}, not toward {b.toward}",
+        )
+    }
+}
+
+/// The hip's and the shoulder's second number abducts (the limb's end moves out from the body's
+/// middle on its own side) and their third rotates internally (the foot's toes, the forearm's
+/// end, turn in), on each side: the left side's ranges' positive numbers, the right's negative.
+@test
+fn abduction_and_rotation_turn_the_anatomical_way_on_each_side() {
+    let at = BODY.places(REST)
+    for limb in [THIGH_LEFT, UPPER_ARM_LEFT, THIGH_RIGHT, UPPER_ARM_RIGHT] {
+        let left = limb == THIGH_LEFT || limb == UPPER_ARM_LEFT
+        let sign = if left { 1.0 } else { -1.0 }
+        // Abduction: the limb's end out (x away from the middle).
+        var p = REST
+        var q = BODY.numbers(p, limb)
+        q.y = 0.3 * sign
+        BODY.set_numbers(mut p, limb, q)
+        let tip0 = at[limb].apply(BODY.segments[limb].tip)
+        let tip1 = BODY.places(p)[limb].apply(BODY.segments[limb].tip)
+        assert(
+            (tip1.x - tip0.x) * sign > 0.05,
+            f"segment {limb}'s abduction moves its end {tip1 - tip0}",
+        )
+        assert(
+            BODY.segments[limb].joint.hi.y * sign > 0.0 ||
+                BODY.segments[limb].joint.lo.y * sign > 0.0,
+        )
+        // Internal rotation: a point in front of the limb's axis turns in (the leg's toes, the
+        // knee straight; the hand, the elbow bent forward).
+        var r = REST
+        let leg = limb == THIGH_LEFT || limb == THIGH_RIGHT
+        let child = if leg { limb + 2 } else { limb + 1 }
+        if !leg {
+            var c = BODY.numbers(r, child)
+            c.x = 1.2
+            BODY.set_numbers(mut r, child, c)
+        }
+        let a0 = BODY.places(r)[child].apply(BODY.segments[child].tip)
+        var q2 = BODY.numbers(r, limb)
+        q2.z = 0.3 * sign
+        BODY.set_numbers(mut r, limb, q2)
+        let a1 = BODY.places(r)[child].apply(BODY.segments[child].tip)
+        assert(
+            (a1.x - a0.x) * sign < -0.02,
+            f"segment {limb}'s internal rotation moves {child}'s end {a1 - a0}",
+        )
+    }
+}
+
+/// Where the body's own flesh cut a published range (`cleared`), by more than a degree.
+@test
+fn the_flesh_cuts_these_ranges() {
+    let declared = segment_list()
+    var cut = 0
+    for s in 1..SEGMENTS {
+        let (a, b) = (declared[s].joint, BODY.segments[s].joint)
+        for k in 0..b.freedom() {
+            if abs(a.lo[k] - b.lo[k]) > DEG || abs(a.hi[k] - b.hi[k]) > DEG {
+                print(
+                    f"human: segment {s} number {k}: {a.lo[k] / DEG} to {a.hi[k] / DEG} cut to {b.lo[k] / DEG} to {b.hi[k] / DEG}",
+                )
+                cut += 1
+            }
+        }
+    }
+    print(f"human: {cut} ranges cut by the flesh")
+}
+
+/// It stands: its lowest point on the floor (to 1 cm), its highest at its stature (to 1 cm), and
+/// what it weighs said.
+@test
+fn the_human_stands_on_the_floor_at_his_height() {
+    let at = BODY.places(REST)
+    var low = 1.0e9
+    var high = -1.0e9
+    for c in PARTS {
+        let (a, b) = c.placed(at)
+        low = min(low, min(a.y - c.ra, b.y - c.rb))
+        high = max(high, max(a.y + c.ra, b.y + c.rb))
+    }
+    print(f"human: from {low} m to {high} m, {BODY.freedom} numbers")
+    assert(abs(low) < 0.01, f"his feet are at {low} m")
+    assert(abs(high - STATURE) < 0.01, f"his head's top is at {high} m")
+}
+
+/// De Leva's (1996) male shares of the mass (%), as this body's segments hold them: the head with
+/// the neck, the trunk (pelvis to thorax, with the shoulder girdle), the upper arm, the forearm,
+/// the hand with its fingers, the thigh, the shank, the foot with its toes.
+const DE_LEVA_SHARES: [f32; 8] = [6.94, 43.46, 2.71, 1.62, 0.61, 14.16, 4.33, 1.37]
+
+/// Which group of `DE_LEVA_SHARES` segment `s` is in (8: a right limb's, in none).
+fn group_of(s: u32) -> u32 {
+    if s == NECK || s == HEAD {
+        0
+    } else if s < NECK ||
+        (s >= CLAVICLE_LEFT && s <= SCAPULA_LEFT) ||
+        (s >= CLAVICLE_RIGHT && s <= SCAPULA_RIGHT) {
+        1
+    } else if s == UPPER_ARM_LEFT {
+        2
+    } else if s == FOREARM_LEFT {
+        3
+    } else if s == HAND_LEFT || (s >= FINGERS_LEFT && s < FINGERS_RIGHT) {
+        4
+    } else if s == THIGH_LEFT {
+        5
+    } else if s == SHANK_LEFT {
+        6
+    } else if s == FOOT_LEFT || s == TOES_LEFT {
+        7
+    } else {
+        8
+    }
+}
+
+/// The masses of the groups `DE_LEVA_SHARES` names, the left side's limbs.
+fn group_masses() -> [f32; 8] {
+    var g = [0.0; 8]
+    for s in 0..SEGMENTS {
+        let m = MASSES[s].mass
+        let k = group_of(s)
+        if k < 8 {
+            g[k] += m
+        }
+    }
+    g
+}
+
+/// Each group of segments weighs de Leva's share of 73 kg to 5%, and the whole body 73 kg to 2%.
+@test
+fn the_human_weighs_what_de_leva_says() {
+    let g = group_masses()
+    var total = 0.0
+    for m in MASSES {
+        total += m.mass
+    }
+    let names = ["head and neck", "trunk", "upper arm", "forearm", "hand", "thigh", "shank", "foot"]
+    var worst = 0.0
+    for k in 0..8 {
+        let want = DE_LEVA_SHARES[k] * 0.01 * MASS
+        print(f"human: {names[k]}: {g[k]} kg, de Leva {want} kg ({100.0 * (g[k] / want - 1.0)}%)")
+        worst = max(worst, abs(g[k] / want - 1.0))
+    }
+    print(f"human: {total} kg in all")
+    assert(abs(total / MASS - 1.0) < 0.02, f"{total} kg, not {MASS}")
+    assert(worst < 0.05, f"a group is {100.0 * worst}% from de Leva's share")
+}
+
+/// The fast sum of each group's mass (`masses`, boxes down to 8 mm) agrees with the slow one (a
+/// grid of 3 mm over the whole body, nothing dropped) to 1.5%, and the whole body to 0.5%.
+@test
+@fuel(2 ** 44)
+fn the_humans_masses_agree_with_the_slow_sum() {
+    let at = BODY.places(REST)
+    var lo = vec3(1.0e9)
+    var hi = vec3(-1.0e9)
+    for c in PARTS {
+        let (a, b) = c.placed(at)
+        lo = min(lo, min(a - vec3(c.ra), b - vec3(c.rb)))
+        hi = max(hi, max(a + vec3(c.ra), b + vec3(c.rb)))
+    }
+    let slow = masses_by_grid(
+        BODY,
+        REST,
+        matter(at),
+        SPANS,
+        lo - vec3(0.01),
+        hi + vec3(0.01),
+        0.003,
+    )
+    var fast_total = 0.0
+    var slow_total = 0.0
+    for s in 0..SEGMENTS {
+        fast_total += MASSES[s].mass
+        slow_total += slow[s].mass
+    }
+    let fast = group_masses()
+    var g = [0.0; 8]
+    for s in 0..SEGMENTS {
+        let k = group_of(s)
+        if k < 8 {
+            g[k] += slow[s].mass
+        }
+    }
+    for k in 0..8 {
+        print(f"human: group {k}: {fast[k]} kg fast, {g[k]} kg slow")
+        assert(abs(fast[k] / g[k] - 1.0) < 0.015, f"group {k}: {fast[k]} kg fast, {g[k]} kg slow")
+    }
+    print(f"human: {fast_total} kg fast, {slow_total} kg slow")
+    assert(abs(fast_total / slow_total - 1.0) < 0.005)
+}
+
+/// Each limb segment's centre of mass lies along its bone where the published tables put it,
+/// and its radii of gyration across and along are de Leva's: across to 25% (a cone is not a
+/// limb), along (about its own axis) to 35% (a round cone holds its mass nearer its axis than a
+/// limb, whose section is oval and whose muscles lie about a bone off its centre: the upper arm's
+/// is 29% under de Leva's, an inertia about its axis of 0.002 kg m² for his 0.004). The
+/// tables differ by where each cut the limb from the trunk: de Leva's (1996: Zatsiorsky's
+/// segments, the upper arm's mass from the axilla down) and Dempster's (1955, the shares as
+/// Winter's text holds them: not read at its source) are each a share of the length from the
+/// proximal joint; the centre must lie between them, or within 4% of the length of the nearer.
+@test
+fn the_humans_limbs_turn_as_de_leva_says() {
+    let rows = [
+        (UPPER_ARM_LEFT, vec3(0.5772, 0.285, 0.158), 0.436),
+        (FOREARM_LEFT, vec3(0.4574, 0.276, 0.121), 0.430),
+        (THIGH_LEFT, vec3(0.4095, 0.329, 0.149), 0.433),
+        (SHANK_LEFT, vec3(0.4459, 0.255, 0.103), 0.433),
+    ]
+    var failures = 0
+    for (s, row, dempster) in rows {
+        let l = BODY.segments[s].tip.y
+        let m = MASSES[s]
+        let along = m.centre.y / l
+        let across = sqrt(m.inertia[0].x / m.mass) / l
+        let length_r = sqrt(m.inertia[1].y / m.mass) / l
+        let lo = min(row.x, dempster) - 0.04
+        let hi = max(row.x, dempster) + 0.04
+        print(
+            f"human: segment {s}: centre at {along} of its length (de Leva {row.x}, Dempster {dempster}), radius across {across} ({row.y}), along {length_r} ({row.z})",
+        )
+        if along < lo ||
+            along > hi ||
+            abs(across / row.y - 1.0) > 0.25 ||
+            abs(length_r / row.z - 1.0) > 0.35 {
+            failures += 1
+        }
+    }
+    assert(failures == 0, f"{failures} limbs off the tables")
+}
+
+@test
+@fuel(2 ** 40)
+fn human_field_contracts_are_sound() {
+    engine::matter::verify::verify_field_soundness(human(REST), "human_rest")
+    var bent = REST
+    for k in 0..FREEDOM {
+        bent.q[k] = 0.3 * sin(f32(k) * 1.9)
+    }
+    engine::matter::verify::verify_field_soundness(human(bent), "human_bent")
+}
+
+/// Each joint swept through its range from rest: no part goes more than 2 mm into the segments it
+/// hangs from.
+@test
+@fuel(2 ** 42)
+fn no_joint_of_the_human_puts_a_part_into_another() {
+    let w = sweep(BODY, PARTS, REST)
+    var worst = 0.0
+    for s in 1..SEGMENTS {
+        worst = max(worst, w[s].deeper)
+    }
+    assert(worst <= 0.002, f"a part goes {worst * 1000.0} mm into another")
+}
