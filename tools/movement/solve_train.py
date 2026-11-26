@@ -1,0 +1,248 @@
+"""The solver's training run (see solve.py's head). A job of tools/movement/runlib.py.
+
+Writes `solver.wnet` (the decoder, as `engine::learned::net` reads it, its inputs' normalisation
+and its outputs' scale folded in) and `solver.json` (its inputs' layout and the run's numbers).
+"""
+import argparse
+import io
+import json
+import math
+import os
+import sys
+import time
+
+import numpy as np
+import torch
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import motion  # noqa: E402
+import runlib  # noqa: E402
+import wnet  # noqa: E402
+
+CLIP = 8.0
+
+
+def mlp(n_in, n_out, hidden):
+    layers, last = [], n_in
+    for h in hidden:
+        layers += [torch.nn.Linear(last, h), torch.nn.ELU()]
+        last = h
+    layers.append(torch.nn.Linear(last, n_out))
+    return torch.nn.Sequential(*layers)
+
+
+class Data:
+    """The clips of a set on the device, and where a window of `w` frames can start."""
+
+    def __init__(self, head, x, which, w, ahead, device):
+        self.x = torch.tensor(np.array(x), device=device)
+        starts, lengths = head["starts"], head["lengths"]
+        firsts, ends, clips = [], [], []
+        for i, s in enumerate(head["sets"]):
+            if s != which or lengths[i] < w + 3:
+                continue
+            f = np.arange(starts[i] + 1, starts[i] + lengths[i] - w - 1)
+            firsts.append(f)
+            ends.append(np.full(f.shape, starts[i] + lengths[i] - 1))
+            clips.append(i)
+        self.first = torch.tensor(np.concatenate(firsts), device=device)
+        self.end = torch.tensor(np.concatenate(ends), device=device)
+        self.clips = clips
+        self.ahead = ahead
+
+    def sample(self, n, gen):
+        i = torch.randint(0, self.first.shape[0], (n,), device=self.first.device, generator=gen)
+        return self.first[i], self.end[i]
+
+
+class Norm:
+    def __init__(self, x):
+        self.mean = x.mean(0)
+        self.std = x.std(0).clamp(min=1e-3)
+
+    def __call__(self, x):
+        return ((x - self.mean) / self.std).clamp(-CLIP, CLIP)
+
+    def state(self):
+        return {"mean": self.mean.cpu(), "std": self.std.cpu()}
+
+
+def goals(body, data, cur, row, end, rate):
+    g_at = torch.minimum(row + data.ahead, end)
+    seconds = ((g_at - row).float() / rate).clamp(min=1.0 / rate)
+    return body.goal(cur, data.x[g_at], seconds)
+
+
+def main(load_packed):
+    run = runlib.Run()
+    p = argparse.ArgumentParser()
+    p.add_argument("--poses", default="poses.bin")
+    p.add_argument("--body", default="creature.body.json")
+    p.add_argument("--steps", type=int, default=20000)
+    p.add_argument("--batch", type=int, default=512)
+    p.add_argument("--window", type=int, default=16)
+    p.add_argument("--hidden", default="128,128,128")
+    p.add_argument("--encoder", default="256,256")
+    p.add_argument("--z", type=int, default=32)
+    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--beta", type=float, default=0.05)
+    p.add_argument("--hide", type=float, default=0.3, help="the chance that each goal is hidden")
+    p.add_argument("--eval-every", type=int, default=2000)
+    p.add_argument("--threads", type=int, default=0)
+    a = p.parse_args(run.args)
+    if a.threads:
+        torch.set_num_threads(a.threads)
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    torch.manual_seed(run.seed)
+    gen = torch.Generator(device=dev).manual_seed(run.seed)
+    t0 = time.time()
+    head, x = load_packed(a.poses)
+    rate = head["rate"]
+    body = motion.Body(a.body, dev)
+    train = Data(head, x, "training", a.window, int(rate), dev)
+    test = Data(head, x, "test", a.window, int(rate), dev)
+    D = head["d"]
+    ns, nt, ng = motion.STATE_ROOT + 2 * D, motion.STEP_ROOT + D, motion.GOAL
+    # The normalisation, from 100,000 training frames as the capture has them.
+    with torch.no_grad():
+        r, e = train.sample(100000, gen)
+        s0 = body.state(train.x[r - 1], train.x[r], rate)
+        t0_ = body.step(train.x[r], train.x[r + 1])
+        g0 = goals(body, train, train.x[r], r, e, rate)
+    n_state, n_step, n_goal = Norm(s0), Norm(t0_), Norm(g0)
+    n_goal.mean = torch.zeros_like(n_goal.mean)  # a hidden goal is 0, before and after
+    n_goal.std = g0.abs().mean(0).clamp(min=1e-3) * 1.5
+    hidden = [int(h) for h in a.hidden.split(",")]
+    enc = mlp(ns + nt + ng, 2 * a.z, [int(h) for h in a.encoder.split(",")]).to(dev)
+    dec = mlp(ns + ng + 2 + a.z, nt, hidden).to(dev)
+    opt = torch.optim.Adam(list(enc.parameters()) + list(dec.parameters()), lr=a.lr)
+    print(f"solve: {len(train.clips)} training clips, {len(test.clips)} test clips, "
+          f"{train.first.shape[0]} windows; state {ns}, step {nt}, goal {ng}, z {a.z}; "
+          f"decoder {hidden} ({sum(q.numel() for q in dec.parameters())} weights); set up in "
+          f"{time.time() - t0:.0f} s", flush=True)
+    step = 0
+    state = run.resume()
+    if state is not None:
+        enc.load_state_dict(state["enc"])
+        dec.load_state_dict(state["dec"])
+        opt.load_state_dict(state["opt"])
+        step = state["step"]
+        gen.set_state(state["gen"].to(gen.device) if dev == "cuda" else state["gen"])
+        torch.set_rng_state(state["torch_rng"])
+        for nm, nn_ in [("n_state", n_state), ("n_step", n_step), ("n_goal", n_goal)]:
+            nn_.mean, nn_.std = state[nm]["mean"].to(dev), state[nm]["std"].to(dev)
+
+    def decode(s, g, mask, z):
+        gm = n_goal(g) * mask.repeat_interleave(2, -1)
+        return dec(torch.cat([n_state(s), gm, mask, z], -1))
+
+    def rollout(data, starts, ends, w, fed_back, train_mode):
+        """A window of `w` frames from each start: the losses, and how far the rollout's root
+        went from the capture's."""
+        B = starts.shape[0]
+        prev, cur = data.x[starts - 1], data.x[starts]
+        mask = (torch.rand(B, 2, device=dev, generator=gen) > a.hide).float()
+        rec, kl = 0.0, 0.0
+        for t in range(w):
+            row = starts + t
+            true_next = data.x[row + 1]
+            s = body.state(prev, cur, rate)
+            tgt = body.step(cur, true_next)
+            g = goals(body, data, cur, row, ends, rate)
+            if train_mode:
+                h = enc(torch.cat([n_state(s), n_step(tgt), n_goal(g)], -1))
+                mu, logvar = h[:, :a.z], h[:, a.z:].clamp(-8, 4)
+                z = mu + torch.randn(mu.shape, device=dev, generator=gen) * torch.exp(0.5 * logvar)
+                kl = kl + (0.5 * (mu * mu + logvar.exp() - 1.0 - logvar).sum(-1)).mean()
+            else:
+                z = torch.randn(B, a.z, device=dev, generator=gen)
+            out = decode(s, g, mask, z)
+            rec = rec + ((out - n_step(tgt)) ** 2).mean()
+            pred = n_step.mean + n_step.std * out
+            nxt = body.after(cur, pred.detach())
+            use = (torch.rand(B, 1, device=dev, generator=gen) < fed_back).float()
+            prev, cur = cur, use * nxt + (1.0 - use) * true_next
+            # The root's turn mixed so: renormalise.
+            cur = torch.cat([cur[:, :3], cur[:, 3:7] / cur[:, 3:7].norm(dim=-1, keepdim=True),
+                             cur[:, 7:]], -1)
+        return rec / w, kl / w
+
+    def evaluate(data, n=512, seconds=4.0):
+        """Rollouts from test windows with z drawn, all goals shown, for `seconds`: the mean error
+        of the root's speed along the ground from its goal (m/s), the mean of the joints' error
+        from the capture's after 1 s (rad), and the share whose root fell below half its height."""
+        w = int(seconds * rate)
+        g2 = torch.Generator(device=dev).manual_seed(12345)
+        i = torch.randint(0, data.first.shape[0], (n,), device=dev, generator=g2)
+        starts, ends = data.first[i], data.end[i]
+        ok = (ends - starts) > w + 2
+        starts, ends = starts[ok], ends[ok]
+        B = starts.shape[0]
+        prev, cur = data.x[starts - 1], data.x[starts]
+        h0 = cur[:, 1].clone()
+        mask = torch.ones(B, 2, device=dev)
+        verr, fell, qerr = 0.0, torch.zeros(B, dtype=torch.bool, device=dev), 0.0
+        with torch.no_grad():
+            for t in range(w):
+                row = starts + t
+                s = body.state(prev, cur, rate)
+                g = goals(body, data, cur, row, ends, rate)
+                z = torch.randn(B, a.z, device=dev, generator=g2)
+                pred = n_step.mean + n_step.std * decode(s, g, mask, z)
+                nxt = body.after(cur, pred)
+                v = motion.qrot(motion.yaw(-body.heading(cur[:, 3:7])), nxt[:, :3] - cur[:, :3]) * rate
+                verr += (torch.stack([v[:, 0], v[:, 2]], -1) - g[:, :2]).norm(dim=-1).mean().item()
+                fell |= nxt[:, 1] < 0.5 * h0
+                prev, cur = cur, nxt
+                if t == int(rate) - 1:
+                    qerr = (cur[:, 7:] - data.x[row + 1, 7:]).abs().mean().item()
+        return {"speed_error": verr / w, "joint_error_1s": qerr, "fell": fell.float().mean().item(),
+                "rollouts": B}
+
+    last_eval = None
+    while step < a.steps:
+        # Scheduled sampling: none fed back for the first fifth, then more to all by three fifths.
+        fed = min(max((step / a.steps - 0.2) / 0.4, 0.0), 1.0)
+        starts, ends = train.sample(a.batch, gen)
+        rec, kl = rollout(train, starts, ends, a.window, fed, True)
+        loss = rec + a.beta * kl
+        opt.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(list(enc.parameters()) + list(dec.parameters()), 1.0)
+        opt.step()
+        step += 1
+        run.progress(step, a.steps, f"rec {rec.item():.4f} kl {kl.item():.2f} fed {fed:.2f}")
+        if step % 100 == 0:
+            print(f"update {step}: rec {rec.item():.4f} kl {kl.item():.2f} fed back {fed:.2f} "
+                  f"({time.time() - t0:.0f} s)", flush=True)
+        if a.eval_every and step % a.eval_every == 0:
+            last_eval = {"test": evaluate(test), "training": evaluate(train)}
+            print(f"evaluate at {step}: {json.dumps(last_eval)}", flush=True)
+        if run.due() or step == a.steps:
+            run.checkpoint(step, {"enc": enc.state_dict(), "dec": dec.state_dict(),
+                                  "opt": opt.state_dict(), "step": step, "gen": gen.get_state().cpu(),
+                                  "torch_rng": torch.get_rng_state(), "n_state": n_state.state(),
+                                  "n_step": n_step.state(), "n_goal": n_goal.state()})
+        if run.should_stop():
+            run.abandon()
+            return
+    final = {"test": evaluate(test), "training": evaluate(train)}
+    print(f"evaluate at the end: {json.dumps(final)}", flush=True)
+    # The decoder as the engine reads it: the inputs' normalisation (state, goal, the goals'
+    # flags, z) and the outputs' scale folded into the last layer.
+    lin = [m for m in dec if isinstance(m, torch.nn.Linear)]
+    last = torch.nn.Linear(lin[-1].in_features, lin[-1].out_features)
+    with torch.no_grad():
+        last.weight.copy_(lin[-1].weight * n_step.std[:, None])
+        last.bias.copy_(lin[-1].bias * n_step.std + n_step.mean)
+    lin = lin[:-1] + [last]
+    mean = torch.cat([n_state.mean, n_goal.mean, torch.zeros(2 + a.z, device=dev)])
+    scale = torch.cat([1.0 / n_state.std, 1.0 / n_goal.std, torch.ones(2 + a.z, device=dev)])
+    acts = ["elu"] * (len(lin) - 1) + ["none"]
+    run.output("solver.wnet", wnet.encode(lin, acts, mean, scale, CLIP))
+    record = {"inputs": {"state": ns, "goal": ng, "goal_flags": 2, "z": a.z}, "outputs": nt,
+              "hidden": hidden, "seed": run.seed, "args": vars(a), "steps": step,
+              "evaluation": final, "poses": a.poses, "rate": rate,
+              "note": "a hidden goal's numbers are 0 and its flag 0 (flag 0: the speed, 1: the heading)"}
+    run.output("solver.json", json.dumps(record, indent=1).encode())
+    run.finish({"step": step, "evaluation": final, "seconds": time.time() - t0})

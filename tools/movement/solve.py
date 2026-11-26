@@ -2,6 +2,18 @@
 
     .movement/venv/bin/python tools/movement/solve.py check SOURCE/CLIP...
         holds `motion.py`'s numbers to the engine's (`tools/movement/solver -- features`)
+    .movement/venv/bin/python tools/movement/solve.py pack SET... -o .movement/solver/poses.bin
+        the poses of the sets' clips in one file (WPSE: a u32 length, a JSON head of the clips'
+        names, sets, first rows and lengths, the rate and D, then zlib of the f32 rows)
+    python3 solve.py --out DIR --seed N [--resume CKPT] --poses poses.bin --body creature.body.json ...
+        a training run (a job of tools/movement/runlib.py, here or by tools/movement/colab-run)
+
+The net (steps 5 to 8): a conditional variational autoencoder of the step (the method of motion
+VAEs, H. Y. Ling et al. 2020, with goals as its condition). The encoder reads the state, the
+goal and the true step and gives a code z; the decoder reads the state, the goal (each part
+hidden at random, its flag beside it) and z, and gives the step. The game runs the decoder alone,
+z drawn from a seed. Training rolls the decoder out over windows of frames and feeds its own
+steps back (scheduled sampling: the share fed back rises to all), so its small errors don't grow.
 
 The poses are `.movement/poses/creature/SOURCE/CLIP.pose` (tools/movement/capture writes them;
 the filtered capture of phase 4 is written the same way); the body is
@@ -72,11 +84,147 @@ def check(clips):
     return 0 if max(worst.values()) < 1e-3 else 1
 
 
+def read_wnet(path):
+    """A WNET file as numpy arrays: (mean, scale, clip, [(W, b, activation)])."""
+    b = open(path, "rb").read()
+    assert b[:4] == b"WNET"
+    _, n_in, count = struct.unpack_from("<3I", b, 4)
+    at = 16
+    mean = np.frombuffer(b, "<f4", n_in, at)
+    scale = np.frombuffer(b, "<f4", n_in, at + 4 * n_in)
+    at += 8 * n_in
+    clip = struct.unpack_from("<f", b, at)[0]
+    at += 4
+    layers = []
+    for _ in range(count):
+        i, o, act = struct.unpack_from("<3I", b, at)
+        at += 12
+        w = np.frombuffer(b, "<f4", i * o, at).reshape(o, i)
+        at += 4 * i * o
+        bias = np.frombuffer(b, "<f4", o, at)
+        at += 4 * o
+        layers.append((torch.tensor(np.array(w)), torch.tensor(np.array(bias)), act))
+    return torch.tensor(np.array(mean)), torch.tensor(np.array(scale)), clip, layers
+
+
+def apply_wnet(net, x):
+    mean, scale, clip, layers = net
+    h = ((x - mean) * scale).clamp(-clip, clip)
+    for w, b, act in layers:
+        h = h @ w.T + b
+        if act == 1:
+            h = torch.nn.functional.elu(h)
+        elif act == 2:
+            h = torch.tanh(h)
+    return h
+
+
+def pcg(h):
+    h = np.uint32(h)
+    x = np.uint32((np.uint64((h >> np.uint32((h >> np.uint32(28)) + np.uint32(4))) ^ h) * np.uint64(277803737)) & np.uint64(0xFFFFFFFF))
+    return np.uint32(x >> np.uint32(22)) ^ x
+
+
+def normal(h):
+    """`engine::body::motion`'s number of the standard normal distribution from `h`."""
+    h = np.uint32(h)
+    a = np.uint32((np.uint64(h) * 2 + 1) & 0xFFFFFFFF)
+    b = np.uint32((np.uint64(h) * 2 + 2) & 0xFFFFFFFF)
+    u = (np.float32(pcg(a) >> np.uint32(8)) + np.float32(0.5)) / np.float32(16777216.0)
+    v = np.float32(pcg(b) >> np.uint32(8)) / np.float32(16777216.0)
+    return float(np.sqrt(-2.0 * np.log(u)) * np.cos(6.2831853 * v))
+
+
+def play_check(argv):
+    """The engine's play (`tools/movement/solver -- play NET SEED SECONDS CLIP`) against the same
+    rollout here: the WNET read and run by this script, the code drawn as the engine draws it.
+    Prints the largest difference of the root and of a joint over the first second and over all."""
+    net_name, seed, clip = argv[0], int(argv[1]), argv[2]
+    body = motion.Body(f"{SOLVER}/creature.body.json")
+    net = read_wnet(f"{SOLVER}/{net_name}.wnet")
+    rate, x = read_pose(f"{POSES}/{clip}.pose")
+    _, eng = read_pose(f"{SOLVER}/play/creature/{clip}.pose")
+    ref = torch.tensor(np.array(x))
+    eng = torch.tensor(np.array(eng))
+    n = ref.shape[0]
+    ahead = int(rate)
+    poses = [ref[0], ref[1]]
+    code = net[0].shape[0] - (motion.STATE_ROOT + 2 * body.freedom + motion.GOAL + 2)
+    first, whole = 0.0, 0.0
+    for t in range(1, eng.shape[0] - 1):
+        now = poses[t]
+        at = min(t + ahead, n - 1)
+        secs = max((at - min(t, n - 1)) / rate, 1.0)
+        g = body.goal(now[None], ref[at][None], torch.tensor([secs]))[0]
+        s = body.state(poses[t - 1][None], now[None], rate)[0]
+        h0 = pcg(np.uint32((seed * 100003 + t) & 0xFFFFFFFF))
+        z = torch.tensor([normal(np.uint32((int(h0) + k * 7919) & 0xFFFFFFFF)) for k in range(code)])
+        inp = torch.cat([s, g, torch.ones(2), z])
+        step = apply_wnet(net, inp[None])
+        nxt = body.after(now[None], step)[0]
+        poses.append(nxt)
+        d = (nxt - eng[t + 1]).abs().max().item()
+        whole = max(whole, d)
+        if t < rate:
+            first = max(first, d)
+    print(f"play-check {clip}: {len(poses)} frames; the largest difference from the engine's "
+          f"poses over the first second {first:.2e}, over all {whole:.2e}")
+    return 0 if first < 1e-3 else 1
+
+
+def pack(argv):
+    import json
+    import zlib
+    out = argv[argv.index("-o") + 1]
+    sets = [a for a in argv[:argv.index("-o")]]
+    names, which, starts, lengths, chunks = [], [], [], [], []
+    rate, d, total = None, None, 0
+    for st in sets:
+        for line in open(os.path.join(ROOT, "tools/movement/split", f"{st}.txt")):
+            name = line.strip()
+            if not name or name.startswith("#"):
+                continue
+            path = f"{POSES}/{name}.pose"
+            if not os.path.exists(path):
+                continue
+            r, x = read_pose(path)
+            assert rate in (None, r)
+            rate, d = r, x.shape[1] - 7
+            names.append(name)
+            which.append(st)
+            starts.append(total)
+            lengths.append(x.shape[0])
+            total += x.shape[0]
+            chunks.append(np.ascontiguousarray(x))
+    body = zlib.compress(np.concatenate(chunks).astype("<f4").tobytes(), 6)
+    head = json.dumps({"names": names, "sets": which, "starts": starts, "lengths": lengths,
+                       "rate": rate, "d": d}).encode()
+    with open(out, "wb") as f:
+        f.write(b"WPSE" + struct.pack("<I", len(head)) + head + body)
+    print(f"pack: {len(names)} clips, {total} frames, {os.path.getsize(out) / 1e6:.1f} MB")
+    return 0
+
+
+def load_packed(path):
+    import json
+    import zlib
+    b = open(path, "rb").read()
+    assert b[:4] == b"WPSE"
+    n = struct.unpack_from("<I", b, 4)[0]
+    head = json.loads(b[8:8 + n])
+    x = np.frombuffer(zlib.decompress(b[8 + n:]), dtype="<f4").reshape(-1, 7 + head["d"])
+    return head, x
+
+
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "check":
         sys.exit(check(sys.argv[2:]))
-    print(__doc__)
-    sys.exit(2)
+    if len(sys.argv) > 1 and sys.argv[1] == "play-check":
+        sys.exit(play_check(sys.argv[2:]))
+    if len(sys.argv) > 1 and sys.argv[1] == "pack":
+        sys.exit(pack(sys.argv[2:]))
+    import solve_train
+    solve_train.main(load_packed)
 
 
 main()
