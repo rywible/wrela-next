@@ -1,0 +1,736 @@
+#!/usr/bin/env python3
+"""The only way to start a training run on Colab (docs/plans/bodies-and-movement.md, 0.5).
+
+    tools/movement/colab-run start RUN --script PATH [--gpu L4] [--fallback T4] [--file PATH]...
+                             [--seed N] [--every S] [--hours H] [--note TEXT] [-- ARGS...]
+    tools/movement/colab-run follow RUN       connect to the run again, or continue it
+    tools/movement/colab-run stop RUN         stop its session; `follow` continues it later
+    tools/movement/colab-run status [RUN]     the runs, their sessions and Colab's sessions
+    tools/movement/colab-run sweep            stop each session of ours that no run uses
+    tools/movement/colab-run kill-session RUN stop the run's session and leave the run as it
+                                              is (to test that `follow` continues it)
+
+A run is a job script that uses `tools/movement/runlib.py`. Its record is
+`.movement/runs/RUN/` (git ignores it): `run.json`, `log.txt` (all that the job printed), `ckpt/`
+(the newest checkpoint, downloaded at each poll) and `result.json`.
+
+What it does about each fault of Colab (the table of 0.5):
+
+- The job runs in the VM in a process of its own (`colab exec` starts it and returns), so it
+  goes on with no connection. `follow` reads its state each `--poll` seconds (default 20) and
+  prints a line each time.
+- A lost connection or a failed command is tried again, with a longer wait each time (5 s
+  doubled, up to 5 min), and the tries are counted. When a session is not in `colab sessions`
+  any more, it is gone: `follow` starts a new one and gives the job its last checkpoint.
+- A start (`colab new`) that takes more than `--start-timeout` (240 s) is stopped and tried
+  again, with twice the time (to 15 min). "Allocation refused" (HTTP 412) waits and tries again; after `--refusals` (3) the
+  `--fallback` GPU is asked.
+- One session at a time: `start` and `follow` stop each session of ours (`mv-*`) that no live
+  run uses, before and after, and `colab sessions` must show none of ours at the end. A start
+  that was cut can still be given a VM with no session name: after each failed start the tool
+  releases each new assignment that has no local record (`sweep --orphans` releases all such).
+- SIGINT or SIGTERM stops the session (the run stays "stopped", and `follow` continues it from
+  its checkpoint). SIGHUP leaves it running for a later `follow`. SIGKILL can't be caught: the
+  job goes on until the owner's lease (`--lease`, 30 min with no poll) runs out, then it
+  checkpoints and ends; `sweep` stops the session.
+- The rate of units is read while the session is alive (`colab usage`), and a run's units are
+  the rate times each session's time. At its end a run adds its row to the table of units in
+  the plan, and `start` refuses a run whose estimate (`--hours` times the rate of its GPU) is
+  more than what is left of the plan's limit.
+- A job that ends with no `RESULT` line (status `done` with a result) failed. It is started
+  again from its checkpoint once; a second failure with no new checkpoint stops the run.
+"""
+
+import argparse
+import datetime
+import json
+import os
+import re
+import shlex
+import signal
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
+RUNS = os.path.join(ROOT, ".movement", "runs")
+PLAN = os.path.join(ROOT, "docs", "plans", "bodies-and-movement.md")
+LIMIT = 300.0
+PREFIX = "mv-"
+REMOTE = "/content/mvrun"
+# Units an hour of each accelerator, measured in 0.4 (2026-11-25): for the estimate only.
+RATES = {"L4": 2.33, "T4": 1.24, "A100": 8.16, "CPU": 0.08}
+
+os.environ.setdefault("PYTHON_KEYRING_BACKEND", "keyrings.alt.file.PlaintextKeyring")
+
+
+def now():
+    return time.time()
+
+
+def stamp(t=None):
+    return datetime.datetime.fromtimestamp(t or now()).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def say(msg):
+    print(f"[{stamp()}] {msg}", flush=True)
+
+
+# ---- the colab command ------------------------------------------------------------------------
+
+
+class ColabError(Exception):
+    def __init__(self, msg, gone=False, refused=False):
+        super().__init__(msg)
+        self.gone = gone
+        self.refused = refused
+
+
+def colab(args, timeout=120, input_text=None):
+    """Runs `colab ARGS`; gives its output, or raises ColabError (gone: the session is not
+    there any more; refused: Colab refused an allocation)."""
+    try:
+        p = subprocess.run(["colab"] + args, input=input_text, capture_output=True, text=True,
+                           timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise ColabError(f"`colab {' '.join(args[:2])}` gave nothing for {timeout} s")
+    out = p.stdout + p.stderr
+    if p.returncode != 0:
+        low = out.lower()
+        gone = ("not found" in low and "session" in low) or "404" in low or \
+            "no such session" in low
+        refused = "412" in low or "allocation refused" in low or "precondition" in low
+        raise ColabError(out.strip()[-800:] or f"exit {p.returncode}", gone=gone, refused=refused)
+    return out
+
+
+def sessions():
+    """The names of the sessions Colab has, or None if it could not be read."""
+    try:
+        out = colab(["sessions"], timeout=60)
+    except ColabError:
+        return None
+    if "no active sessions" in out.lower():
+        return []
+    names = []
+    for line in out.splitlines():
+        m = re.search(r"\b(" + re.escape(PREFIX) + r"[A-Za-z0-9_.-]+)", line)
+        if m:
+            names.append(m.group(1))
+        elif line.strip().startswith("[?]") or "[?]" in line:
+            names.append("?" + line.strip())
+    return names
+
+
+# The colab command's own Python, to read Colab's assignments and release one that has no local
+# record (a start that the tool cut at its time limit can still be given a VM: on 2026-11-25 one
+# such L4 ran for 6 minutes with no session name, and held the account's one L4).
+COLAB_PY = os.path.expanduser("~/.local/share/uv/tools/google-colab-cli/bin/python")
+
+
+def assignments():
+    """The endpoints of Colab's assignments and whether this machine's colab has a record of each,
+    or None if they could not be read."""
+    code = ("import json\n"
+            "from colab_cli.common import state\n"
+            "known = set()\n"
+            "try:\n"
+            "    known = {s.endpoint for s in state.store.list().values()}\n"
+            "except Exception:\n"
+            "    pass\n"
+            "print(json.dumps([[a.endpoint, a.endpoint in known] for a in state.client.list_assignments()]))\n")
+    try:
+        p = subprocess.run([COLAB_PY, "-c", code], capture_output=True, text=True, timeout=60)
+        return {e: k for e, k in json.loads(p.stdout.strip().splitlines()[-1])}
+    except Exception:
+        return None
+
+
+def unassign(endpoint):
+    code = ("import sys\nfrom colab_cli.common import state\n"
+            "state.client.unassign(sys.argv[1])\nprint('ok')\n")
+    p = subprocess.run([COLAB_PY, "-c", code, endpoint], capture_output=True, text=True,
+                       timeout=120)
+    return "ok" in p.stdout
+
+
+def release_orphans(before, why):
+    """Releases each assignment that is new since `before` and has no local record: one that a
+    start the tool gave up on made after all. Gives how many."""
+    after = assignments()
+    if after is None or before is None:
+        return 0
+    n = 0
+    for e, known in after.items():
+        if e not in before and not known:
+            ok = unassign(e)
+            say(f"released {e}, which the start that {why} made with no record: "
+                f"{'done' if ok else 'FAILED'}")
+            n += 1
+    return n
+
+
+def rate_now():
+    try:
+        out = colab(["usage"], timeout=60)
+    except ColabError:
+        return None
+    m = re.search(r"Usage rate:\s*([0-9.]+)", out)
+    return float(m.group(1)) if m else None
+
+
+def balance():
+    try:
+        out = colab(["usage"], timeout=60)
+    except ColabError:
+        return None
+    m = re.search(r"balance:\s*([0-9.]+)", out)
+    return float(m.group(1)) if m else None
+
+
+# ---- a run's record ---------------------------------------------------------------------------
+
+
+def run_dir(name):
+    return os.path.join(RUNS, name)
+
+
+def load(name):
+    with open(os.path.join(run_dir(name), "run.json")) as f:
+        return json.load(f)
+
+
+def save(run):
+    d = run_dir(run["name"])
+    tmp = os.path.join(d, "run.json.part")
+    with open(tmp, "w") as f:
+        json.dump(run, f, indent=1, sort_keys=True)
+    os.replace(tmp, os.path.join(d, "run.json"))
+
+
+def units(run, upto=None):
+    """The units a run used: each session's rate times its time."""
+    total = 0.0
+    for s in run["sessions"]:
+        end = s.get("ended") or upto or now()
+        total += (s.get("rate") or RATES.get(s["gpu"], 0.0)) * (end - s["started"]) / 3600.0
+    return total
+
+
+def plan_used():
+    """The units the table of units in the plan holds."""
+    used = 0.0
+    with open(PLAN) as f:
+        text = f.read()
+    m = re.search(r"\| Date \| Run \| Units \|\n\| --- \| --- \| --- \|\n((?:\|.*\|\n)*)", text)
+    for line in (m.group(1) if m else "").splitlines():
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        try:
+            used += float(cells[-1])
+        except ValueError:
+            pass
+    return used
+
+
+def plan_add_row(date, what, u):
+    with open(PLAN) as f:
+        text = f.read()
+    m = re.search(r"\| Date \| Run \| Units \|\n\| --- \| --- \| --- \|\n((?:\|.*\|\n)*)", text)
+    if not m:
+        say("the plan has no table of units: the row is not written")
+        return
+    row = f"| {date} | {what} | {u:.2f} |\n"
+    text = text[:m.end()] + row + text[m.end():]
+    with open(PLAN, "w") as f:
+        f.write(text)
+    say(f"the plan's table of units: {row.strip()}")
+
+
+def follower_alive(name):
+    try:
+        with open(os.path.join(run_dir(name), "follow.pid")) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 0)
+        return pid != os.getpid()
+    except (OSError, ValueError):
+        return False
+
+
+# ---- sessions ---------------------------------------------------------------------------------
+
+
+def stop_session(sname, why):
+    for attempt in range(4):
+        try:
+            colab(["stop", "-s", sname], timeout=120)
+            say(f"stopped session {sname} ({why})")
+            return True
+        except ColabError as e:
+            if e.gone or "not found" in str(e).lower():
+                return True
+            say(f"stop {sname}: {e} (try {attempt + 1})")
+            time.sleep(5 * 2 ** attempt)
+    return False
+
+
+def sweep(keep=()):
+    """Stops each session of ours that no live run uses. Gives the sessions left."""
+    names = sessions()
+    if names is None:
+        say("sweep: `colab sessions` could not be read")
+        return None
+    live = set(keep)
+    if os.path.isdir(RUNS):
+        for r in os.listdir(RUNS):
+            try:
+                run = load(r)
+            except (OSError, ValueError):
+                continue
+            if run.get("state") == "running" and run.get("session") and follower_alive(r):
+                live.add(run["session"])
+    left = []
+    for n in names:
+        if n.startswith("?"):
+            say(f"sweep: a session with no local record on this machine: {n[1:]} (another "
+                f"machine's, or one a cut start made: `colab-run sweep --orphans` releases it)")
+            left.append(n)
+        elif n in live:
+            left.append(n)
+        else:
+            stop_session(n, "no live run uses it")
+    return left
+
+
+def new_session(run, args):
+    """Starts a session for `run`, trying again as the table says. Gives its record."""
+    gpu = run["gpu"]
+    refusals = 0
+    wait = 5.0
+    limit = args.start_timeout
+    for attempt in range(1, args.tries + 1):
+        sname = f"{PREFIX}{run['name']}-{len(run['sessions']) + 1}-{attempt}"
+        say(f"starting session {sname} ({gpu}), try {attempt}")
+        t0 = now()
+        cmd = ["new", "-s", sname] + ([] if gpu == "CPU" else ["--gpu", gpu])
+        before = assignments()
+        try:
+            colab(cmd, timeout=limit)
+            ok = sname in (sessions() or [sname])
+            if ok:
+                rec = {"name": sname, "gpu": gpu, "started": now(), "ended": None,
+                       "start_seconds": now() - t0, "tries": attempt, "rate": None,
+                       "end_reason": None}
+                r = rate_now()
+                rec["rate"] = r if r else RATES.get(gpu)
+                say(f"session {sname} ready in {now() - t0:.0f} s, rate {rec['rate']} units/h")
+                run["start_tries"] = run.get("start_tries", 0) + attempt
+                return rec
+            say(f"session {sname} said ready but is not in `colab sessions`")
+        except ColabError as e:
+            say(f"start failed: {str(e).splitlines()[-1] if str(e) else e}")
+            if e.refused:
+                refusals += 1
+                if refusals >= args.refusals and args.fallback and gpu != args.fallback:
+                    say(f"{refusals} refusals of {gpu}: asking for {args.fallback}")
+                    gpu = run["gpu"] = args.fallback
+        stop_session(sname, "its start failed")
+        # A start cut at its time limit may still get a VM after the cut.
+        time.sleep(10)
+        run["orphans"] = run.get("orphans", 0) + release_orphans(before, "failed")
+        limit = min(limit * 2, 900.0)
+        time.sleep(wait)
+        wait = min(wait * 2, 300.0)
+    raise SystemExit(f"colab-run: no session after {args.tries} tries")
+
+
+# ---- the job in the session -------------------------------------------------------------------
+
+
+def remote_launch(run, sname, resume_name):
+    """Uploads the job and starts it in a process of its own."""
+    files = [os.path.join(HERE, "runlib.py"), os.path.join(ROOT, run["script"])]
+    files += [os.path.join(ROOT, f) for f in run["files"]]
+    colab(["exec", "-s", sname, "--timeout", "60"], timeout=120,
+          input_text=f"import os; os.makedirs('{REMOTE}/out/ckpt', exist_ok=True)\n")
+    for f in files:
+        retry(lambda: colab(["upload", "-s", sname, f, f"{REMOTE}/{os.path.basename(f)}"],
+                            timeout=600), "upload")
+    resume_arg = []
+    if resume_name:
+        local = os.path.join(run_dir(run["name"]), "ckpt", resume_name)
+        retry(lambda: colab(["upload", "-s", sname, local, f"{REMOTE}/out/ckpt/{resume_name}"],
+                            timeout=900), "upload of the checkpoint")
+        resume_arg = ["--resume", f"{REMOTE}/out/ckpt/{resume_name}"]
+    argv = ["python3", "-u", f"{REMOTE}/{os.path.basename(run['script'])}",
+            "--out", f"{REMOTE}/out", "--seed", str(run["seed"]), "--every", str(run["every"]),
+            "--lease", str(run["lease"])] + resume_arg + run["args"]
+    code = (
+        "import subprocess, os, time\n"
+        f"os.chdir('{REMOTE}')\n"
+        f"open('{REMOTE}/out/lease', 'w').write(str(time.time()))\n"
+        f"log = open('{REMOTE}/log.txt', 'a')\n"
+        f"p = subprocess.Popen({argv!r}, stdout=log, stderr=subprocess.STDOUT,\n"
+        f"                     start_new_session=True, cwd='{REMOTE}',\n"
+        f"                     env=dict(os.environ, PYTHONPATH='{REMOTE}'))\n"
+        f"open('{REMOTE}/job.pid', 'w').write(str(p.pid))\n"
+        "print('LAUNCHED', p.pid)\n"
+    )
+    out = colab(["exec", "-s", sname, "--timeout", "60"], timeout=120, input_text=code)
+    m = re.search(r"LAUNCHED (\d+)", out)
+    if not m:
+        raise ColabError("the job did not start: " + out[-400:])
+    say(f"job started in {sname}, pid {m.group(1)}"
+        + (f", from checkpoint {resume_name}" if resume_name else ""))
+
+
+POLL = r'''
+import json, os, time
+R = "%s"
+os.utime(R + "/out/lease") if os.path.exists(R + "/out/lease") else open(R + "/out/lease", "w").close()
+st = None
+try:
+    st = json.load(open(R + "/out/status.json"))
+except Exception:
+    pass
+alive = False
+try:
+    pid = int(open(R + "/job.pid").read())
+    os.kill(pid, 0)
+    alive = not open("/proc/%%d/stat" %% pid).read().split()[2] == "Z"
+except Exception:
+    pass
+log = ""
+try:
+    with open(R + "/log.txt", "rb") as f:
+        f.seek(%d)
+        log = f.read(200000).decode("utf-8", "replace")
+except Exception:
+    pass
+ck = sorted(x for x in os.listdir(R + "/out/ckpt") if x.endswith(".ckpt")) if os.path.isdir(R + "/out/ckpt") else []
+print("POLL " + json.dumps({"status": st, "alive": alive, "log": log, "ckpts": ck}))
+'''
+
+
+def poll(run, sname):
+    # A poll answers in about 3 s; an exec that hangs (one in five on 2026-11-25) is cut at 60 s
+    # and tried again.
+    out = colab(["exec", "-s", sname, "--timeout", "30"], timeout=60,
+                input_text=POLL % (REMOTE, run.get("log_offset", 0)))
+    i = out.rfind("POLL ")
+    if i < 0:
+        raise ColabError("the poll gave no answer: " + out[-300:])
+    return json.loads(out[i + 5:].splitlines()[0])
+
+
+def retry(f, what, tries=8):
+    wait = 5.0
+    for k in range(1, tries + 1):
+        try:
+            return f()
+        except ColabError as e:
+            if e.gone or k == tries:
+                raise
+            say(f"{what} failed (try {k}): {str(e).splitlines()[-1] if str(e) else e}; "
+                f"again in {wait:.0f} s")
+            time.sleep(wait)
+            wait = min(wait * 2, 300.0)
+
+
+# ---- following a run --------------------------------------------------------------------------
+
+STOP = {"signal": None}
+
+
+def on_signal(sig, _frame):
+    STOP["signal"] = sig
+
+
+def close_session(run, reason):
+    s = run["sessions"][-1] if run["sessions"] else None
+    if s and not s.get("ended"):
+        stop_session(s["name"], reason)
+        s["ended"] = now()
+        s["end_reason"] = reason
+    run["session"] = None
+    save(run)
+
+
+def finish(run, state, args):
+    run["state"] = state
+    run["units"] = units(run)
+    save(run)
+    left = sweep()
+    if left:
+        say(f"sessions left after the run: {left}")
+    else:
+        say("`colab sessions` shows no session of ours")
+    if not run.get("row_written"):
+        what = f"`{run['name']}` ({run['gpu']}): {run.get('note') or run['script']}, {state}"
+        plan_add_row(datetime.date.today().isoformat(), what, run["units"])
+        run["row_written"] = True
+        save(run)
+    say(f"run {run['name']}: {state}, {run['units']:.3f} units, "
+        f"{len(run['sessions'])} session(s), {run.get('start_tries', 0)} start tries, "
+        f"{run.get('poll_failures', 0)} failed polls")
+
+
+def follow(run, args):
+    d = run_dir(run["name"])
+    if follower_alive(run["name"]):
+        raise SystemExit(f"colab-run: another follower holds {run['name']}")
+    with open(os.path.join(d, "follow.pid"), "w") as f:
+        f.write(str(os.getpid()))
+    signal.signal(signal.SIGINT, on_signal)
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGHUP, on_signal)
+    run["state"] = "running"
+    save(run)
+    sweep(keep=[run["session"]] if run.get("session") else [])
+    failures_without_progress = 0
+    last_beat_seen = now()
+    while True:
+        if STOP["signal"]:
+            if STOP["signal"] == signal.SIGHUP:
+                say("SIGHUP: the run goes on in its session; `follow` connects again")
+                save(run)
+                return
+            say("stopped by a signal: the session is stopped; `follow` continues from the "
+                "checkpoint")
+            close_session(run, "signal")
+            run["state"] = "stopped"
+            run["units"] = units(run)
+            save(run)
+            return
+        sname = run.get("session")
+        if not sname:
+            if run.get("units_cap") and units(run) >= run["units_cap"]:
+                say(f"the run's cap of {run['units_cap']} units is reached")
+                finish(run, "stopped at its cap", args)
+                return
+            rec = new_session(run, args)
+            run["sessions"].append(rec)
+            run["session"] = sname = rec["name"]
+            run["log_offset"] = 0
+            save(run)
+            try:
+                remote_launch(run, rec["name"], run.get("ckpt"))
+            except ColabError as e:
+                say(f"the launch failed: {e}")
+                close_session(run, "launch failed")
+                failures_without_progress += 1
+                if failures_without_progress >= 3:
+                    finish(run, "failed", args)
+                    return
+                continue
+            last_beat_seen = now()
+        try:
+            p = retry(lambda: poll(run, sname), "poll", tries=args.poll_tries)
+        except ColabError as e:
+            run["poll_failures"] = run.get("poll_failures", 0) + 1
+            listed = sessions()
+            if e.gone or (listed is not None and sname not in listed):
+                say(f"session {sname} is gone: a new session continues from "
+                    f"{run.get('ckpt') or 'the start'}")
+                s = run["sessions"][-1]
+                s["ended"] = now()
+                s["end_reason"] = "lost"
+                run["session"] = None
+                save(run)
+                continue
+            say(f"poll failed and the session is still listed: {e}")
+            time.sleep(args.poll)
+            continue
+        if p["log"]:
+            with open(os.path.join(d, "log.txt"), "a") as f:
+                f.write(p["log"])
+            run["log_offset"] = run.get("log_offset", 0) + len(p["log"].encode("utf-8"))
+        st = p["status"] or {}
+        newest = p["ckpts"][-1] if p["ckpts"] else None
+        if newest and newest != run.get("ckpt"):
+            os.makedirs(os.path.join(d, "ckpt"), exist_ok=True)
+            local = os.path.join(d, "ckpt", newest)
+            try:
+                retry(lambda: colab(["download", "-s", sname, f"{REMOTE}/out/ckpt/{newest}",
+                                     local + ".part"], timeout=900), "download")
+                os.replace(local + ".part", local)
+                for old in os.listdir(os.path.join(d, "ckpt")):
+                    if old.endswith(".ckpt") and old != newest:
+                        os.remove(os.path.join(d, "ckpt", old))
+                run["ckpt"] = newest
+                failures_without_progress = 0
+            except ColabError as e:
+                say(f"the checkpoint {newest} was not downloaded: {e}")
+        save(run)
+        tail = p["log"].strip().splitlines()[-1] if p["log"].strip() else ""
+        say(f"{sname}: {st.get('state', 'starting')} step {st.get('step', 0)}/"
+            f"{st.get('total', 0)} ckpt {run.get('ckpt')} alive {p['alive']}"
+            + (f" | {tail[:120]}" if tail else ""))
+        if st.get("beat"):
+            last_beat_seen = now()
+        if st.get("state") == "done" and st.get("result") is not None:
+            with open(os.path.join(d, "result.json"), "w") as f:
+                json.dump(st["result"], f, indent=1, sort_keys=True)
+            say(f"RESULT {json.dumps(st['result'], sort_keys=True)}")
+            run["result"] = st["result"]
+            close_session(run, "done")
+            finish(run, "done", args)
+            return
+        if not p["alive"]:
+            if now() - last_beat_seen < 5 and not st:
+                time.sleep(args.poll)
+                continue
+            failures_without_progress += 1
+            say(f"the job ended with no result (state {st.get('state')}): "
+                f"failure {failures_without_progress}")
+            close_session(run, "job ended with no result")
+            if failures_without_progress >= 2:
+                finish(run, "failed", args)
+                return
+            continue
+        for _ in range(int(args.poll)):
+            if STOP["signal"]:
+                break
+            time.sleep(1)
+
+
+# ---- commands ---------------------------------------------------------------------------------
+
+
+def cmd_start(args):
+    d = run_dir(args.run)
+    if os.path.exists(os.path.join(d, "run.json")):
+        raise SystemExit(f"colab-run: run {args.run} exists; use `follow`")
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,30}", args.run):
+        raise SystemExit("colab-run: a run's name is lower case letters, digits and -")
+    if not os.path.exists(os.path.join(ROOT, args.script)):
+        raise SystemExit(f"colab-run: no script {args.script}")
+    used = plan_used()
+    estimate = args.hours * RATES.get(args.gpu, 8.16)
+    left = LIMIT - used
+    say(f"the plan's limit {LIMIT:.0f} units, used {used:.2f}, left {left:.2f}; "
+        f"this run's estimate {estimate:.2f} ({args.hours} h of {args.gpu})")
+    if estimate > left:
+        raise SystemExit("colab-run: the estimate is more than what is left of the limit; "
+                         "tell the owner (rule 9 for Colab)")
+    b = balance()
+    say(f"`colab usage` before the run: balance {b}")
+    os.makedirs(os.path.join(d, "ckpt"), exist_ok=True)
+    run = {
+        "name": args.run, "script": os.path.relpath(os.path.join(ROOT, args.script), ROOT),
+        "files": [os.path.relpath(os.path.join(ROOT, f), ROOT) for f in args.file],
+        "args": args.rest, "gpu": args.gpu, "seed": args.seed, "every": args.every,
+        "lease": args.lease, "note": args.note, "created": now(), "state": "new",
+        "sessions": [], "session": None, "ckpt": None, "balance_before": b,
+        "units_cap": estimate * 1.5 if args.cap else None,
+        "commit": subprocess.run(["git", "-C", ROOT, "rev-parse", "HEAD"], capture_output=True,
+                                 text=True).stdout.strip(),
+    }
+    save(run)
+    follow(run, args)
+    say(f"`colab usage` after the run: balance {balance()}")
+
+
+def cmd_follow(args):
+    run = load(args.run)
+    if run["state"] in ("done", "failed"):
+        raise SystemExit(f"colab-run: run {args.run} is {run['state']}")
+    follow(run, args)
+
+
+def cmd_stop(args):
+    run = load(args.run)
+    close_session(run, "stopped by `colab-run stop`")
+    run["state"] = "stopped"
+    run["units"] = units(run)
+    save(run)
+    say(f"run {args.run} stopped at checkpoint {run.get('ckpt')}; {run['units']:.3f} units")
+
+
+def cmd_kill_session(args):
+    run = load(args.run)
+    if not run.get("session"):
+        raise SystemExit("colab-run: the run has no session")
+    stop_session(run["session"], "kill-session (a test of `follow`)")
+
+
+def cmd_status(args):
+    names = [args.run] if args.run else (sorted(os.listdir(RUNS)) if os.path.isdir(RUNS) else [])
+    for n in names:
+        try:
+            run = load(n)
+        except (OSError, ValueError):
+            continue
+        longest = max([((s.get("ended") or now()) - s["started"]) for s in run["sessions"]] or [0])
+        print(f"{n}: {run['state']} gpu {run['gpu']} seed {run['seed']} ckpt {run.get('ckpt')} "
+              f"sessions {len(run['sessions'])} (longest {longest / 60:.1f} min) "
+              f"units {units(run):.3f} follower {'yes' if follower_alive(n) else 'no'}")
+        for s in run["sessions"]:
+            print(f"   {s['name']}: {stamp(s['started'])} for "
+                  f"{((s.get('ended') or now()) - s['started']) / 60:.1f} min, "
+                  f"{s.get('end_reason') or 'open'}")
+    print(f"colab sessions: {sessions()}")
+    print(f"the plan's table of units: {plan_used():.2f} of {LIMIT:.0f}")
+
+
+def cmd_sweep(args):
+    if args.orphans:
+        a = assignments() or {}
+        for e, known in a.items():
+            if not known:
+                say(f"releasing {e}: {'done' if unassign(e) else 'FAILED'}")
+    left = sweep()
+    print(f"sessions left: {left}")
+
+
+def main():
+    p = argparse.ArgumentParser(prog="colab-run", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def common(q):
+        q.add_argument("--poll", type=float, default=20.0)
+        q.add_argument("--poll-tries", type=int, default=6)
+        q.add_argument("--start-timeout", type=float, default=240.0)
+        q.add_argument("--tries", type=int, default=8)
+        q.add_argument("--refusals", type=int, default=3)
+        q.add_argument("--fallback", default="T4")
+
+    q = sub.add_parser("start")
+    q.add_argument("run")
+    q.add_argument("--script", required=True)
+    q.add_argument("--gpu", default="L4", choices=sorted(RATES))
+    q.add_argument("--file", action="append", default=[])
+    q.add_argument("--seed", type=int, default=1)
+    q.add_argument("--every", type=float, default=60.0)
+    q.add_argument("--lease", type=float, default=1800.0)
+    q.add_argument("--hours", type=float, required=True)
+    q.add_argument("--cap", action="store_true",
+                   help="stop the run at 1.5 times its estimate of units")
+    q.add_argument("--note", default="")
+    common(q)
+    q.set_defaults(f=cmd_start)
+    for name, f in [("follow", cmd_follow), ("stop", cmd_stop), ("kill-session", cmd_kill_session)]:
+        q = sub.add_parser(name)
+        q.add_argument("run")
+        common(q)
+        q.set_defaults(f=f)
+    q = sub.add_parser("status")
+    q.add_argument("run", nargs="?")
+    q.set_defaults(f=cmd_status)
+    q = sub.add_parser("sweep")
+    q.add_argument("--orphans", action="store_true",
+                   help="also release each assignment that has no record on this machine")
+    q.set_defaults(f=cmd_sweep)
+    argv = sys.argv[1:]
+    rest = []
+    if "--" in argv:
+        i = argv.index("--")
+        argv, rest = argv[:i], argv[i + 1:]
+    args = p.parse_args(argv)
+    args.rest = rest
+    args.f(args)
+
+
+if __name__ == "__main__":
+    main()

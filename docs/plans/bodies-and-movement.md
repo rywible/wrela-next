@@ -301,6 +301,14 @@ them again. The log of the `colab` command is `~/.config/colab-cli/colab.log`.
 
 The length of a session is not known. Thus a run must not depend on it.
 
+The tests of the run tool on 2026-11-25 found three more:
+
+| Fault | What occurred on 2026-11-25 | What the run tool does |
+| --- | --- | --- |
+| A start that was cut still gets a VM | A `colab new` cut at 3 s left an L4, then a T4, with no session name ("[?]" in `colab sessions`). `colab stop` cannot name it | After each failed start, wait 10 s, read Colab's assignments, and release each new one with no local record. `sweep --orphans` releases all such |
+| One session of each accelerator | While an L4 with no name was alive, each start of an L4 got HTTP 412. The tool asked for a T4, then a second orphan held the T4 the same way | The release above. A run on the T4 does not give the same bits as one on the L4 |
+| A command hangs | One `colab exec` in five hung for more than 60 s, and one launch hung for 120 s | Cut each poll at 60 s and try again. A launch that hangs stops the session and starts a new one |
+
 #### Steps
 
 1. **Write the run tool** `tools/movement/colab-run`. It is the only method that starts a
@@ -315,23 +323,39 @@ The length of a session is not known. Thus a run must not depend on it.
 
 #### Done when
 
-- The local tool is stopped in the middle of the small run. The run continues in the session,
-  and the tool connects to it again.
-- The session is stopped in the middle of the small run. The tool starts a new session, and the
-  run continues from its last checkpoint to the same end result.
-- After each of these tests, `colab sessions` shows no session.
-- The tool stops a start that hangs, and tries again.
-- The length of a session is measured, or the tool shows that a run does not depend on it.
+Done on 2026-11-25. The tool is `tools/movement/colab-run`, with `tools/movement/runlib.py` in the
+VM. Its test job is `tools/movement/run_test.py`: a deterministic training of a small net, 600
+steps of 1 s, a checkpoint each minute, after an install of MuJoCo Warp and its first steps (the
+cold start: 70 s).
+
+- Done: the local tool is stopped in the middle of the small run (`kill -9` at 4 minutes). The
+  run continues in the session, and `colab-run follow` connects to it again.
+- Done: the session is stopped in the middle of the small run. The tool starts a new session,
+  and the run continues from its last checkpoint (step 184) to the same end result: the SHA-256 of
+  the weights of run `l4-c` is the same as that of run `l4-a`, which did not stop
+  (`89a7ca28...`).
+- Done: after each of these tests, `colab sessions` shows no session.
+- Done: the tool stops a start that hangs, and tries again (each start cut at 3 s, then 6 s; the
+  VM that a cut start gets is released).
+- Done: a run does not depend on the length of a session: it continues in a new one. The longest
+  session of the tests was 10 minutes, so the length itself is not measured.
 
 #### The table of units
 
 The limit is 300 units for this plan. The balance was 413.09 on 2026-11-25, before the first
 run. Other work can use the same account, so use this table, not the balance, to know what this
-plan used.
+plan used. The tool writes a row as the rate of the account times the time of each session: more
+than the balance fell (1.59 written, 1.12 fallen for the tests of 0.5).
 
 | Date | Run | Units |
 | --- | --- | --- |
 | 2026-11-25 | The measurements of 0.4: T4, L4, A100 and TPU v5e | 0.13 |
+| 2026-11-25 | `smoke1` (CPU): smoke test of the run tool, done | 0.00 |
+| 2026-11-25 | `smoke3` (CPU): smoke test: the same run with no stop, done | 0.00 |
+| 2026-11-25 | `smoke2` (CPU): smoke test: a session stopped in the run, done | 0.01 |
+| 2026-11-25 | `l4-a` (L4): the run tool's test: 600 steps of 1 s, no stop (the reference), done | 0.46 |
+| 2026-11-25 | `l4-b` (L4, then T4): the run tool's test; a start cut at 3 s left an L4 and a T4 with no session name, which held the account's one of each, so the run lost its session and found none (the balance's fall, the two orphans included), failed | 0.43 |
+| 2026-11-25 | `l4-c` (L4): the run tool's test: the tool killed, the session stopped, a start cut at 3 s, done | 0.69 |
 
 #### A new machine
 
@@ -346,19 +370,20 @@ plan used.
 | 0.1 The decisions of the owner | Done, and written in `docs/citations.md` |
 | 0.2 The rights of each source | Done: the register |
 | 0.3 The cost of a net on the CPU | Done on the Linux machine. The M4 is not measured |
-| 0.4 The speed of the simulator | Done, but the length of a session |
-| 0.5 The run tool | Not started. Do it before the first run of phase 4 |
+| 0.4 The speed of the simulator | Done. The length of a session is not measured; 0.5 shows that a run does not depend on it |
+| 0.5 The run tool | Done on 2026-11-25 |
 
 ### Done when
 
 - `docs/citations.md` contains the two decisions. The register contains the verified rights of
   each source. (The register is done.)
-- The commit message gives the time of each net size on the two machines.
+- The commit message gives the time of each net size on the two machines. (Done on the Linux
+  machine. The M4 is not measured.)
 - The plan gives the simulator speed and the compute units in one hour for each accelerator.
   (Done: 0.4.)
 - This plan gives the estimated hours and compute units for phases 4, 5 and 6. (Done as an
   estimate: 0.4. The first run of phase 4 replaces it.)
-- Each line of "Done when" of 0.5 is true.
+- Each line of "Done when" of 0.5 is true. (Done.)
 - The owner gave a limit of compute units for the plan. (Done: 300.)
 
 ## 6. Phase 1: one declaration for each body
