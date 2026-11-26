@@ -150,6 +150,9 @@ class Sim:
                                   list(range(len(sets))), device=device, dtype=torch.long)
         self.test = torch.tensor([i for i, s in enumerate(sets) if s == "test"], device=device,
                                  dtype=torch.long)
+        # How often each training clip starts a world: by its length (each frame alike), and
+        # more for a clip the last evaluation saw the net fail (`weigh`).
+        self.weights = self.lengths[self.train].float()
         # Each world's clip and frame.
         self.clip = torch.zeros(worlds, dtype=torch.long, device=device)
         self.frame = torch.zeros(worlds, dtype=torch.long, device=device)
@@ -189,8 +192,8 @@ class Sim:
         idx = which.nonzero().flatten()
         if idx.numel() == 0:
             return
-        c = self.train[torch.randint(0, self.train.shape[0], (idx.numel(),), device=self.dev,
-                                     generator=self.gen)]
+        c = self.train[torch.multinomial(self.weights, idx.numel(), replacement=True,
+                                         generator=self.gen)]
         span = (self.lengths[c] - 2).clamp(min=1)
         f = (torch.rand(idx.numel(), device=self.dev, generator=self.gen) * span).long()
         self.clip[idx] = c
@@ -199,6 +202,14 @@ class Sim:
         self.qpos[idx] = self.ref_q[g]
         self.qvel[idx] = self.ref_vel(g)
         self.warm[idx] = 0.0
+
+    def weigh(self, results):
+        """Gives each training clip that `results` (of `play`) shows was not followed four times
+        its weight by length."""
+        failed = {r["clip"] for r in results if not r["followed"]}
+        extra = torch.tensor([4.0 if int(c) in failed else 1.0 for c in self.train.tolist()],
+                             device=self.dev)
+        self.weights = self.lengths[self.train].float() * extra
 
     def global_frame(self, ahead=0):
         f = torch.minimum(self.frame + ahead, self.lengths[self.clip] - 1)
@@ -393,8 +404,11 @@ def summary(results):
 
 
 def evaluate(sim, agent, norm, most_frames=600):
-    """The training clips and the test clips, each played from its start (`play`)."""
-    return {"training": summary(play(sim, agent, norm, sim.train.tolist(), most_frames)),
+    """The training clips and the test clips, each played from its start (`play`); the training
+    clips' results weigh how often each starts a world after."""
+    training = play(sim, agent, norm, sim.train.tolist(), most_frames)
+    sim.weigh(training)
+    return {"training": summary(training),
             "test": summary(play(sim, agent, norm, sim.test.tolist(), most_frames))}
 
 
@@ -457,6 +471,8 @@ def main():
             step, samples = state["step"], state["samples"]
             gen.set_state(state["gen"].to(gen.device) if dev == "cuda" else state["gen"])
             torch.set_rng_state(state["torch_rng"])
+            if "weights" in state:
+                sim.weights = state["weights"].to(dev)
             sim.reset(torch.ones(a.worlds, dtype=torch.bool, device=dev))
         H, N = a.horizon, a.worlds
         obs_buf = torch.zeros(H, N, n_obs, device=dev)
@@ -539,7 +555,8 @@ def main():
                     "agent": {k: v.cpu() for k, v in agent.state_dict().items()},
                     "opt": opt.state_dict(), "norm": norm.state(), "step": step,
                     "samples": samples, "gen": gen.get_state().cpu(),
-                    "torch_rng": torch.get_rng_state(), "n_obs": n_obs, "n_act": n_act,
+                    "torch_rng": torch.get_rng_state(), "weights": sim.weights.cpu(),
+                    "n_obs": n_obs, "n_act": n_act,
                     "hidden": hidden, "args": vars(a),
                 })
             if run.should_stop():
