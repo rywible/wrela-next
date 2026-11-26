@@ -384,6 +384,7 @@ than the balance fell (1.59 written, 1.12 fallen for the tests of 0.5).
 | 2026-11-25 | `p4-all-1` (L4): phase 4: all 858 training clips, 123 test clips held out, 9000 updates; stopped at update 530 (69 million samples, 48,000 a second) by the owner's change of direction: the creature is not a human body (the balance fell 0.99) | 1.36 |
 | 2026-11-26 | `p4h-small` (L4): phase 4 on the human: the speed of the tracker's training, 20 updates at 4096 worlds, done | 0.22 |
 | 2026-11-26 | `p4h-1` (L4): phase 4 on the human: 629 training clips, 91 test clips held out, 8500 updates, failed | 2.87 |
+| 2026-11-26 | `p4h-2` (L4): phase 4 on the human: 629 training clips, 91 test held out, 8500 updates; contacts sized from the model, stopped by a signal | 3.72 |
 
 #### A new machine
 

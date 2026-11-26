@@ -276,13 +276,25 @@ def errors(sim):
     return dx.mean(-1), dr.mean(-1), dx[:, 0], dx.max(-1).values
 
 
+def exploded(sim):
+    """The worlds whose simulation blew up: a state not finite, or moving faster than 200 (m/s or
+    rad/s). On 2026-11-26 two runs on the human collapsed in 20 updates at update 990 (reward 0.77
+    to 0.42), as one such world can poison the observations' running mean and spread."""
+    ok = torch.isfinite(sim.qpos).all(-1) & torch.isfinite(sim.qvel).all(-1)
+    ok &= sim.qvel.abs().amax(-1) < 200.0
+    return ~ok
+
+
 def reward(sim):
     ex, er, eroot, emax = errors(sim)
     g = sim.global_frame(0)
     dv = sim.qvel[:, 6:] - sim.ref_vel(g)[:, 6:]
     r = 0.45 * torch.exp(-100.0 * ex * ex) + 0.25 * torch.exp(-2.0 * er * er) + \
         0.1 * torch.exp(-0.005 * (dv * dv).sum(-1)) + 0.2 * torch.exp(-20.0 * eroot * eroot)
-    fell = (emax > 0.5) | (ex > 0.25)
+    bad = exploded(sim)
+    fell = (emax > 0.5) | (ex > 0.25) | bad
+    r = torch.where(bad | ~torch.isfinite(r), torch.zeros_like(r), r)
+    ex = torch.where(torch.isfinite(ex), ex, torch.zeros_like(ex))
     return r, fell, ex
 
 
@@ -298,7 +310,12 @@ class Normal:
         self.count = 1e-4
 
     def update(self, x):
+        # Only finite rows of sane size teach the mean and the spread.
+        keep = torch.isfinite(x).all(-1) & (x.abs().amax(-1) < 1.0e3)
+        x = x[keep]
         b = x.shape[0]
+        if b == 0:
+            return
         m = x.mean(0)
         v = x.var(0, unbiased=False)
         d = m - self.mean
@@ -308,7 +325,8 @@ class Normal:
         self.count = tot
 
     def __call__(self, x):
-        return ((x - self.mean) / torch.sqrt(self.var + 1e-6)).clamp(-5, 5)
+        y = ((x - self.mean) / torch.sqrt(self.var + 1e-6)).clamp(-5, 5)
+        return torch.nan_to_num(y, nan=0.0, posinf=5.0, neginf=-5.0)
 
     def state(self):
         return {"mean": self.mean.cpu(), "var": self.var.cpu(), "count": self.count}
@@ -508,7 +526,7 @@ def main():
         last_eval = None
         rate_t, rate_s = time.time(), samples
         while step < a.steps:
-            ep_r, ep_fall = 0.0, 0.0
+            ep_r, ep_fall, blown, skipped = 0.0, 0.0, 0, 0
             with torch.no_grad():
                 for h in range(H):
                     o_raw = observe(sim)
@@ -521,6 +539,7 @@ def main():
                     val_buf[h] = agent.v(o).squeeze(-1)
                     sim.step(sim.ref_q[sim.global_frame(1)][:, 7:] + 0.5 * act.clamp(-1, 1))
                     r, fell, _ = reward(sim)
+                    blown += int(exploded(sim).sum())
                     ended = sim.frame >= (sim.lengths[sim.clip] - 2)
                     # At a clip's end the return goes on (its value); at a fall it stops.
                     trunc_val[h] = 0.0
@@ -556,6 +575,9 @@ def main():
                     pg = -torch.min(ratio * b_adv[j], ratio.clamp(0.8, 1.2) * b_adv[j]).mean()
                     vl = 0.5 * ((agent.v(b_obs[j]).squeeze(-1) - b_ret[j]) ** 2).mean()
                     loss = pg + vl
+                    if not torch.isfinite(loss):
+                        skipped += 1
+                        continue
                     opt.zero_grad()
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(agent.parameters(), 1.0)
@@ -568,7 +590,8 @@ def main():
                                         f"samples {samples} at {sps:.0f}/s")
             if step % 10 == 0:
                 print(f"update {step}: reward {ep_r / H:.3f} falls/step {ep_fall / H:.4f} "
-                      f"samples {samples} ({sps:.0f} a second)", flush=True)
+                      f"samples {samples} ({sps:.0f} a second); worlds blown up {blown}, "
+                      f"minibatches skipped {skipped}", flush=True)
             if a.eval_every and step % a.eval_every == 0:
                 last_eval = evaluate(sim, agent, norm)
                 print(f"evaluate at {step}: {json.dumps(last_eval)}", flush=True)
