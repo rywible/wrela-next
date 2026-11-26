@@ -1,7 +1,8 @@
 # Plan: the engine makes its decisions at build
 
-Status: proposal. No phase is started. The plan agrees with the code at commit `1c78609`
-(2026-11-25).
+Status: in progress. Phase 0 is done on the M4 (its Radeon half is open). The plan agreed with
+the code at commit `1c78609` (2026-11-25) when it was written; each phase's state is at its
+"Done when".
 
 ## 1. Purpose
 
@@ -177,6 +178,23 @@ What is known:
   (`toolchain/shader/src/lib.rs`).
 - With safe math, an older frame lost 91% on the M4 (`toolchain/shader/src/metal.rs`).
 - No person measured strict math on the engine as it is today.
+- Measured (phase 0, M4, commit after `587dc54`; `tools/bench --against`, 1080p, frames 30 to 89,
+  three pairs). The geometry kernels strict:
+  - SCENE 10: span 24.633 to 25.339 ms (+2.9%, noise 0.284 ms). Passes alone: `mesh_extract`
+    3.044 to 3.521 ms (+15.7%), `mesh_certify` +33.5%, `mesh_skin` +23.0%, `mesh_sun_exact`
+    +18.9%; every other pass within 2%.
+  - SCENE 11: span 16.646 to 16.594 ms (-0.3%, inside the noise). `mesh_sun_exact` +8.4%.
+  - Safe math alone (contraction left on), SCENE 10: span +1.0%, inside the noise;
+    `mesh_extract` +13.1%, `mesh_certify` +28.1%, `mesh_sun_exact` +16.4%. No contraction alone
+    (relaxed math): span -1.1%, inside the noise; `mesh_extract` +3.7%, `mesh_certify` +11.7%,
+    `mesh_sun_exact` +2.8%. Most of the cost of a strict pass is safe math, not the loss of
+    contraction.
+  - With the fragment kernels of the exact cells strict too (step 8: `exact_box_vs`,
+    `exact_box_one_fs`, `vis_cut_vs`, `vis_cut_one_fs`, `vis_cut_many_fs`,
+    `vis_deformed_cut_vs`, `vis_deformed_cut_one_fs`): SCENE 10 span 24.791 to 25.550 ms
+    (+3.1%, noise 0.550), `mesh_exact` +27.8%; SCENE 11 16.614 to 16.768 ms (+0.9%, inside the
+    noise), `mesh_exact` +22.7%.
+  - The Radeon is not measured yet: it was in use by another project for the whole of phase 0.
 
 Steps:
 
@@ -184,7 +202,23 @@ Steps:
    kernels strict and the other kernels relaxed.
 2. Make the list of the geometry kernels. Use `tools/wrela pipelines` to find the names. Include
    the compute kernels of extraction, of the certificates and of the exact rays of the sun. Put
-   the list in this file.
+   the list in this file. The list (SCENES 10, 11, 13 and 14):
+   - Extraction (`lib/engine/mesh/extract.wrela`, `dc.wrela`, `emit.wrela`): `prep_slices`,
+     `prep_chunk`, `zero_chunk_counts`, `reset_dirty_bricks`, `cull_bricks`,
+     `cull_bricks_rest`, `eval_corners`, `eval_corners_rest`, `classify_cells`, `solve_verts`,
+     `solve_verts_rest`, `prep_creases`, `refine_creases`, `refine_creases_rest`,
+     `count_brick_tris`, `count_brick_tris_lod`, `write_brick_meta`, `emit_tris`,
+     `emit_tris_lod`, `scan_brick_groups`, `scan_brick_local`, `scan_group_sums`,
+     `record_seam_start`, `note_seams`, `reset_seam_seen`, `box_seam_cells`,
+     `solve_seam_smooth`, `refine_seam_creases`, `inherit_seam_corners`, `finish_seam_tris`,
+     `finish_draw`, `finish_draw_patch`, `set_instances`, `deform_skinned_verts`, `keep_verts`,
+     `mark_first`, `prep_from`.
+   - Certificates and exact cells: `dilate_outline`, `filter_thin_cells`, `note_untested`,
+     `certify_outline`, `note_uncertified`, `set_exact_args`.
+   - The sun (`lib/engine/mesh/sunlight.wrela`): `sun_cert_level0`, `sun_cert_reduce`,
+     `sun_exact_one`, `sun_fit_reduce`, `sun_fit_set`, `sun_gather`, `sun_slices`.
+   - Not geometry kernels: the swarm's (`swarm_*`: a simulation of grains, for the picture), the
+     radiance, sky and shading kernels, the culls of instances and the Hi-Z.
 3. Build SCENE 10 and SCENE 11 two times from the same commit: one time relaxed, one time with
    the list strict.
 4. Do the first run of each strict build at a small size (section 5). Read the times.
@@ -198,6 +232,10 @@ Steps:
 
 Result: the cost of strict geometry kernels in percent, for each machine, and its cause. Phase 1
 has the target (5%) and removes the temporary option.
+
+The temporary option is the environment of `wrela build`: `WRELA_STRICT_KERNELS` (a comma list
+of entry functions; a pipeline any of whose entries it names is written strict) and
+`WRELA_STRICT_PARTS` (`contract` or `safe` for half of strict mode, on Metal).
 
 ### 0.2 The part of extraction that the cook can save
 
@@ -215,6 +253,35 @@ What is known:
   In the serial run, extraction was 43 ms (design notes, 2026-11-24). These numbers are older
   than commits `233fd5d` and `5a6dfd6`. After those commits, an extraction that a frame cuts
   short continues in the next frame.
+- Measured (phase 0, M4, 1080p, `--timestamps --serial`, so each dispatch alone; each batch's
+  passes labelled with its index for the run, an instrumentation not kept):
+  - SCENE 10. Settled at frame 2: the pillars (9.8 ms of extraction), the brazier stands
+    (4.8 ms), the rival orb (0.18 ms: a rigid mesh moved), the glass barrage (0.25 ms) and the
+    two creatures (2.5 and 2.2 ms, then 0.1 ms of skinning a frame). The courtyard settled at
+    frame 4 (30.2 ms). The flames and the parry arc never settle: their fields read the time,
+    so they are extracted again each frame (2.8 and 4.3 ms a frame).
+  - SCENE 13. The room (9.0 ms), the desk (17.4 ms) and the book (4.6 ms) settled at frame 2.
+  - `std::derive::reads_only_input` is false for the distance of every kind of the scenes: each
+    distance reads the values of its own struct, which the derivation counts as captures. So the
+    question "does it read the time" has no answer today; phase 2 gives it one. By the code, the
+    kinds that read no time and no state are the courtyard, the pillars, the brazier stands, the
+    rival orb's shape (its placement moves), the citadel, the marble column (until it is
+    edited), the stack, the stage, and the room, the desk and the book.
+  - The parts of the extraction of the kinds that read no time, to the frame each settles, by
+    kernel. Work that needs only the field and a cell (`eval_corners*`, `classify_cells`,
+    `solve_verts*`, `prep_creases`, `refine_creases*`, `certify_outline`, `dilate_outline`,
+    `keep_verts`): SCENE 10 15.8 ms of 42.3, SCENE 13 21.2 ms of 31.1. Work that needs the eye
+    (`cull_bricks*`, the seams' kernels, the selection of exact cells): SCENE 10 12.6 ms,
+    SCENE 13 4.7 ms. The rest (counting and writing triangles, scans, preparation): SCENE 10
+    13.9 ms, SCENE 13 5.2 ms. Triangles are written per brick, so the triangles of a brick
+    whose cells the cook holds are field-only work too, except at seams.
+  - SCENE 13 `VIEW 3` (`game/scenes/main.wrela`: the eye moves from the room's eye to the
+    carving's and the book's, 120 frames each way, 240 frames): the room was extracted again 74
+    times, the desk 52 times, the book 70 times. Of the bricks they asked for after their first
+    extraction (before the GPU culls them: 15.1 million, 24.7 million and 3.9 million), the
+    room had asked for 51.7% before at the same cell size and place, the desk 40.8%, the book
+    0%: its one grid's cell changes with the eye's distance at every step, and the origin of a
+    grid is `aabb.lo - 2h`.
 
 Steps:
 
@@ -233,6 +300,12 @@ Steps:
 Result: two times. The first is the time that a cook can save in the first frames. The second
 is the time that it can save when the eye moves. Phase 3 step 1 uses this result.
 
+The result (M4, serial times): in the first frames, the field-only work of the kinds that read no
+time, 15.8 ms of SCENE 10's 42.3 ms of their extraction and 21.2 ms of SCENE 13's 31.1 ms, and the
+triangles of the bricks away from seams beside it. When the eye moves, nothing today: a cell is in
+the same place for two eyes only where they chose the same root cell (the book: never), so a cook
+of the eye's cells needs grids whose cells are the same for every eye first (phase 3 step 1).
+
 ### 0.3 The time to build one kind
 
 Question: how long is the build from a changed field to a kind that the engine can draw?
@@ -244,7 +317,15 @@ What is known:
   `298e357`).
 - The tests of `game/world`, which contain the certificate report, take 9 s on the M4 (commit
   `1c78609`).
-- `wrela build` does not print the time of its parts.
+- `wrela build` prints the time of its parts (`took:`, phase 0): reading the sources, checking,
+  the constants and proofs, lowering, the CPU's modules, the shaders. `tools/wrela` prints the
+  time of the field contracts that it proves before a build of a package under `game/`.
+- Measured (phase 0, M4): SCENE 10 after a change to one field of `game/world` (the courtyard's
+  curb radius) took 18.9 s. The field contracts (`wrela test game/world are_sound`, five tests on
+  several threads) took 9 s. The build took 10.4 s: reading 0.1 s, checking 0.2 s, constants and
+  proofs 0.2 s (one constant computed again), lowering 8.5 s, the CPU's module 0.2 s, the
+  shaders (319 pipelines) 1.0 s. The same build with nothing changed takes 10.4 s. Lowering is
+  the build's time: it instantiates, inlines and counts the work of every pipeline.
 
 Steps:
 
@@ -256,11 +337,20 @@ Steps:
 Result: the time of a build after a change to one kind, in its parts. It shows how many kinds a
 build can cook before the build is too slow for an agent.
 
+The result: 18.9 s, of which 9 s are the contracts and 8.5 s lowering. Nothing in it grows with
+the kinds that a cook would cover but the contracts. A cook that adds at most 5 s (phase 3's
+target) keeps a changed kind under 25 s.
+
 ### Done when
 
 - The three results are in the commit messages and in the "What is known" lists of this file.
 - The list of geometry kernels is in this file.
 - The gate passes on the two machines with the temporary option not used.
+
+State (2026-11-25): done on the M4 (the full gate passed: audit small passes, full fails only on
+the crowd's named debt, sun 13/0/1/2 hard leaks 754/1343/316, spans SCENE 10/11/13/14
+24.46/16.55/18.32/21.58 ms). The Radeon's measurements of 0.1 and its gate are open: it was in
+use by another project; they are to be run with the rest of the plan's Radeon work.
 
 ## 9. Phase 1: strict math in the geometry kernels
 
@@ -692,10 +782,26 @@ The cost of a shade pass is a cost for each pixel. A proof does not decrease it.
 
 Each question has the step that must answer it. Write the answer here when you have it.
 
-1. Which part of safe math on Metal caused the loss of 91%? (phase 0.1, step 7)
+1. Which part of safe math on Metal caused the loss of 91%? (phase 0.1, step 7) Answer, for the
+   geometry kernels of today's SCENE 10 on the M4: safe math is most of the cost of strict
+   kernels (`mesh_extract` +13.1% with safe math alone, +3.7% with no contraction alone, +15.7%
+   with both), and the frame pays 1 to 3% of its span for it. The old frame's 91% was not
+   measured again: that frame is gone.
 2. Are the fragment kernels of the exact cells geometry kernels? They find where matter is, but
-   the rasteriser selects their pixels. (phase 0.1, step 8)
+   the rasteriser selects their pixels. (phase 0.1, step 8) Answer: their cost strict is small
+   (SCENE 10 +3.1% against +2.9% without them; `mesh_exact` +27.8%), so they can be. What they
+   decide is a discard and a depth, and the rasteriser's choice of pixels is not the same on
+   two GPUs, so the bit comparison of phase 1 step 10 cannot hold them. Phase 1 makes them
+   strict, so their arithmetic is the CPU's, and leaves them out of the bit comparison.
 3. Does each GPU round division and square root correctly for all inputs? (phase 1, step 4)
+   Answer for the M4: no GPU computes subnormals in a strict kernel; the M4 takes a subnormal
+   operand as a zero and gives a zero for any result whose exact value is below 2⁻¹²⁶ (before
+   rounding). With that model (`strict_model` in `toolchain/host/src/gpu/strict_ops.rs`), its
+   division, reciprocal, add, subtract and multiply give the CPU's bits for every input tested
+   (1 / x for all 2³² inputs; the others for 16,781,060 pairs). Its square root does not: it
+   differs from the correctly rounded root in 605,737,168 of the 2³² inputs, by one ulp, so a
+   strict kernel's square root is software (`std::math::sqrt_rounded`). The Radeon is not
+   tested yet.
 4. What error limit does WGSL give to `sin` and `cos`? The code uses 2⁻¹¹. Read the
    specification of WGSL before phase 1 step 8.
 5. Do the grids of two eyes put a cell in the same position? The grids of one batch share one

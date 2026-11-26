@@ -111,6 +111,7 @@ pub fn run(args: &[String]) -> ExitCode {
                     format!("; constants: {} computed, {} from the cache", c.computed, c.cached)
                 };
                 eprintln!("built {} ({} files{consts})", out.display(), output.files.len());
+                eprintln!("  took: {}", output.times.line());
             }
             ExitCode::SUCCESS
         }

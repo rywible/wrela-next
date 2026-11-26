@@ -11,6 +11,9 @@ pub struct BuildOutput {
     pub diagnostics: Vec<Diagnostic>,
     /// Where each WASM offset is in the source: for a frame test's failure (`frames`).
     pub lines: Vec<(u32, Option<wrela_diag::Span>)>,
+    /// How long its WASM module took, and its shaders (`wrela build`'s times).
+    pub wasm_time: std::time::Duration,
+    pub shader_time: std::time::Duration,
 }
 
 /// A pipeline's weight at most (§18.11): its entry points' statements with every call written
@@ -152,6 +155,7 @@ fn emit_in(
     let mut code_lines = Vec::new();
     let mut wasm_abi = None;
     let mut relaxed = None;
+    let wasm_began = std::time::Instant::now();
     if options.relaxed {
         // The presentation code with relaxed SIMD, beside the standard module.
         match module(l, sources, options) {
@@ -167,6 +171,8 @@ fn emit_in(
         }
         Err(e) => diagnostics.push(Diagnostic::internal(e)),
     }
+    let wasm_time = wasm_began.elapsed();
+    let shaders_began = std::time::Instant::now();
     let mut manifest = wrela_abi::Manifest::new("game.wasm");
     let target = shaders.map_or(wrela_abi::Target::HERE, |s| s.target);
     manifest.target = target;
@@ -255,7 +261,14 @@ fn emit_in(
                 .collect(),
         };
         let shader = if let Some(s) = shaders {
-            match wrela_shader::emit_shader(&p.module, &mut pipeline, s.target, s.checks) {
+            // TEMPORARY (docs/plans/engine-at-build.md, phase 0.1; phase 1 removes it): the
+            // pipelines an entry of which `WRELA_STRICT_KERNELS` names (a comma list) are
+            // written strict, the others as the build says.
+            let strict = std::env::var("WRELA_STRICT_KERNELS").is_ok_and(|names| {
+                p.name.split('+').any(|e| names.split(',').any(|n| n.trim() == e))
+            });
+            let checks = wrela_shader::Checks { exact: s.checks.exact || strict, ..s.checks };
+            match wrela_shader::emit_shader(&p.module, &mut pipeline, s.target, checks) {
                 Ok(m) => Some(m),
                 Err(e) => {
                     diagnostics.push(Diagnostic::internal(format!(
@@ -345,7 +358,8 @@ fn emit_in(
         diagnostics.push(Diagnostic::internal(e.to_string()));
     }
     files.push(("manifest.json".to_string(), manifest.to_json().into_bytes()));
-    BuildOutput { files, diagnostics, lines: code_lines }
+    let shader_time = shaders_began.elapsed();
+    BuildOutput { files, diagnostics, lines: code_lines, wasm_time, shader_time }
 }
 
 /// Where each part of the code came from, as `file:line:column`, for trap messages: the lines

@@ -63,6 +63,31 @@ pub struct Output {
     /// What the client build's constant data holds (`wrela build --report data`), when it was
     /// built.
     pub data: Option<wrela_wasm::DataReport>,
+    /// How long each part of the compile took, in order (`wrela build` says them).
+    pub times: Times,
+}
+
+/// How long each part of a compile took, in the order they ran: reading and parsing the
+/// sources, checking them, the constants and proofs computed at build, lowering, the CPU's
+/// module and the shaders. A part that ran more than once (lowering, once a role) is summed.
+#[derive(Clone, Debug, Default)]
+pub struct Times(pub Vec<(&'static str, std::time::Duration)>);
+
+impl Times {
+    /// Adds `d` to part `name`.
+    pub fn add(&mut self, name: &'static str, d: std::time::Duration) {
+        match self.0.iter_mut().find(|(n, _)| *n == name) {
+            Some((_, t)) => *t += d,
+            None => self.0.push((name, d)),
+        }
+    }
+
+    /// `front end 1.2 s, constants and proofs 3.4 s, ...`.
+    pub fn line(&self) -> String {
+        let parts: Vec<String> =
+            self.0.iter().map(|(n, d)| format!("{n} {:.1} s", d.as_secs_f64())).collect();
+        parts.join(", ")
+    }
 }
 
 /// One pipeline: an instantiation of its entry points, and why it exists.
@@ -992,9 +1017,13 @@ fn compile_scoped(
     overlay: &Overlay,
     scope: &Scope,
 ) -> Output {
+    let began = std::time::Instant::now();
     let loaded = load_with(root, overlay);
-    compile_loaded_in(root, mode, roots, lift, loaded, scope)
-        .expect("a compile with no cancel isn't cancelled")
+    let read = began.elapsed();
+    let mut out = compile_loaded_in(root, mode, roots, lift, loaded, scope)
+        .expect("a compile with no cancel isn't cancelled");
+    out.times.0.insert(0, ("reading", read));
+    out
 }
 
 /// A compile of the program [`load_scoped`] read, within `scope`, which may cancel it between
@@ -1019,6 +1048,7 @@ fn compile_loaded_in(
             program_files: Vec::new(),
             consts: consts::ConstStats::default(),
             data: None,
+            times: Times::default(),
         });
     };
     // The program package's own files: package 1's (std is 0).
@@ -1039,7 +1069,11 @@ fn compile_loaded_in(
         })
         .map(|(f, _, path)| (*f, lift::relative(path, root)))
         .collect();
+    let mut times = Times::default();
+    let mut began = std::time::Instant::now();
+    let mut lap = || std::mem::replace(&mut began, std::time::Instant::now()).elapsed();
     let checked = wrela_sema::check_packages_set(units, &packages, &scope.set, &mut diagnostics);
+    times.add("checking", lap());
     scope.stop()?;
     let mut files = Vec::new();
     let mut pipelines = Vec::new();
@@ -1056,6 +1090,7 @@ fn compile_loaded_in(
     };
     let cache = scope.cache_of(root);
     let stats = prepare(&checked, &sources, &dirs, &mut data, &mut diagnostics, &cache, scope);
+    times.add("constants and proofs", lap());
     scope.stop()?;
     if !lift.is_empty() && !has_errors(&diagnostics) {
         data.lift = Some(lift::table(&checked, &sources, &lifted_files));
@@ -1079,6 +1114,7 @@ fn compile_loaded_in(
             // skipped.
             let (lowered, d) =
                 wrela_lower::lower(&checked, &roots, &data, mode.emit || mode.conditions);
+            times.add("lowering", lap());
             scope.stop()?;
             let ok = !has_errors(&d);
             diagnostics.extend(d);
@@ -1093,6 +1129,8 @@ fn compile_loaded_in(
             }
             if role != wrela_sema::defs::Role::Client {
                 let out = build::emit_headless(&lowered, &sources, !data.no_simd, role);
+                times.add("the CPU's modules", out.wasm_time);
+                times.add("the rest", lap().saturating_sub(out.wasm_time));
                 diagnostics.extend(out.diagnostics);
                 files.extend(out.files);
                 continue;
@@ -1119,6 +1157,9 @@ fn compile_loaded_in(
                 &scope.set,
                 shaders,
             );
+            times.add("the CPU's modules", out.wasm_time);
+            times.add("shaders", out.shader_time);
+            times.add("the rest", lap().saturating_sub(out.wasm_time + out.shader_time));
             diagnostics.extend(out.diagnostics);
             files.extend(out.files);
             files.append(&mut shipped_files);
@@ -1155,6 +1196,7 @@ fn compile_loaded_in(
         program_files,
         consts: stats,
         data: data_report,
+        times,
     })
 }
 

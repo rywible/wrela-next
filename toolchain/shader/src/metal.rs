@@ -343,7 +343,14 @@ impl<'m> Writer<'m> {
         // Exact mode: safe math too, so the compiler can't reassociate or approximate
         // differently around the same arithmetic as the code around it changes (a change of
         // inlining moved 48 pixels of the engine's SCENE 8 by 1/255 under relaxed math).
-        out.push_str(if self.checks.exact {
+        // TEMPORARY (docs/plans/engine-at-build.md, phase 0.1): `WRELA_STRICT_PARTS` of
+        // `contract` or `safe` writes only that half of exact mode.
+        let parts = std::env::var("WRELA_STRICT_PARTS").unwrap_or_default();
+        out.push_str(if self.checks.exact && parts == "contract" {
+            "#pragma METAL fp math_mode(relaxed)\n#pragma METAL fp contract(off)\n"
+        } else if self.checks.exact && parts == "safe" {
+            "#pragma METAL fp math_mode(safe)\n#pragma METAL fp contract(fast)\n"
+        } else if self.checks.exact {
             "#pragma METAL fp math_mode(safe)\n#pragma METAL fp contract(off)\n"
         } else {
             "#pragma METAL fp math_mode(relaxed)\n#pragma METAL fp contract(fast)\n"
