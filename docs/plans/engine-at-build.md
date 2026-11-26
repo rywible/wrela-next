@@ -778,7 +778,10 @@ sun's exact rays 0.9), the full-screen fragment passes 4 to 9 times over (direct
 refraction 8.6, the tone 5.8): the time a unit was measured on a dependent chain of sines, and a
 fragment's work runs its independent operations side by side. Next: a unit for fragment work,
 measured as the compute unit is, and the mesh draws' rasterising. The target is 20% of each
-gate scene's span, on the two machines. Step 2 has its first decision: whether a kind can be
+gate scene's span, on the two machines. Step 2's scene types are done: whether a scene has a swarm, a heightfield (opaque,
+transmissive) or a medium, whether its look blooms and how many batches its world draws are
+constants of their types, so SCENE 14 (no swarm, a look without bloom) has 159 pipelines where it
+had 165. Step 2 has its first decision: whether a kind can be
 skinned is `Surface::MAY_SKIN`, an associated constant (true for `Skinned` and the wrappers that
 forward its hash, false otherwise), and the extraction's, the pool's and every draw's skinned or
 deformed branch is `M::MAY_SKIN && …` (the world's, `MeshWorld::MAY_SKIN`, for the shadows), so
@@ -825,7 +828,11 @@ that choose a path, a pass, a capacity, a cell or a skip. By what each depends o
      in more than ten CPU branches of the draws and the patch.
   5. The scene's types, asked each frame: `batch_count()`, `height.active()`,
      `medium.active()`, the look's bloom strength, and `finish_poll`'s readback length (always
-     14).
+     14). Done: `MeshWorld::BATCHES`, `Height::ACTIVE` / `HAS_OPAQUE` / `HAS_TRANSMISSIVE`,
+     `Medium::ACTIVE`, `Swarm::ACTIVE` and `Look::BLOOMS` are constants of the types (the
+     methods are gone), the swarm's simulation, shadows, radiance and draw are built only for a
+     swarm, and the readback is read as its 14 words; the bloom's strength stays the look's
+     value.
 
 Purpose: the engine becomes a program that the build runs. It writes the kernels, the tables and
 the frame schedule for this game.
