@@ -102,3 +102,16 @@ fn tiers_are_marked_and_reported() {
         .collect();
     assert_eq!(tiers, [("fill", false), ("mark", true)]);
 }
+
+/// `std::gpu::LANE_WORK_LEAST` is the least of the targets' `lane_work`: what an engine that
+/// chooses at build how much one invocation does divides by.
+#[test]
+fn the_least_lane_work_is_the_targets() {
+    let std_gpu = include_str!("../../../../lib/std/gpu.wrela");
+    let line = std_gpu
+        .lines()
+        .find_map(|l| l.strip_prefix("pub const LANE_WORK_LEAST: u32 = "))
+        .expect("std::gpu::LANE_WORK_LEAST");
+    let least = wrela_abi::Target::ALL.iter().map(|t| t.limits().device.lane_work).min();
+    assert_eq!(line.trim().parse::<u32>().ok(), least);
+}

@@ -4525,17 +4525,15 @@ pub(crate) fn check_standalone(cx: &mut Cx, f: FnId, entry: Option<Entry>, subst
 pub(crate) fn work_call(fl: &mut Fl, c: &mir::Call, strict: bool) -> Option<ir::ValueId> {
     let key = callable_key(fl, c, "`work` counts")?;
     // In GPU code, what it reaches may be the module's own resources (a buffer it captures):
-    // it's counted beside them, once for each call.
-    let n = if fl.mb.gpu.is_some() {
-        count_work(fl.cx, &key, c.span, Some(&*fl.mb), strict)
-    } else {
-        match fl.cx.works.get(&(key.clone(), strict)) {
-            Some(n) => *n,
-            None => {
-                let n = count_work(fl.cx, &key, c.span, None, strict);
-                fl.cx.works.insert((key, strict), n);
-                n
-            }
+    // it's counted beside them. A count is of code, and reading one buffer costs what reading
+    // another does, so an instance's count is the same in every module: counted once.
+    let n = match fl.cx.works.get(&(key.clone(), strict)) {
+        Some(n) => *n,
+        None => {
+            let beside = fl.mb.gpu.is_some().then_some(&*fl.mb);
+            let n = count_work(fl.cx, &key, c.span, beside, strict);
+            fl.cx.works.insert((key, strict), n);
+            n
         }
     }?;
     let u = fl.mb.m.types.u32();

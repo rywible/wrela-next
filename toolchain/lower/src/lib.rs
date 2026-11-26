@@ -563,7 +563,14 @@ fn lower_in(
         let sites = cx.pipeline_sites[i].clone();
         let targets = cx.pipeline_targets[i].clone();
         cx.hoist = !standins.iter().any(|&(a, b)| a as usize == i || b as usize == i);
+        let began = std::time::Instant::now();
         let out = gpu::lower_pipeline(&mut cx, &key, iface, sites, targets);
+        // For the compiler's own measuring: `WRELA_TIME=pipelines` prints each pipeline's
+        // lowering time.
+        if std::env::var("WRELA_TIME").as_deref() == Ok("pipelines") {
+            let name = out.as_ref().map_or("?", |o| o.name.as_str());
+            eprintln!("lowered {name} in {:.0} ms", began.elapsed().as_secs_f64() * 1e3);
+        }
         cx.hoist = false;
         if let Some(mut out) = out {
             if cx.emit {

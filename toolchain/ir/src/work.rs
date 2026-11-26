@@ -1101,7 +1101,19 @@ impl<'a> Counter<'a> {
                 } else {
                     builtin_cost(*b, n)
                 };
-                (w, None)
+                // `min`, `max` and `clamp` of known integers are known: a count (`0..min(n, 64)`)
+                // or a choice made of them is followed as the code takes it.
+                let known: Option<Vec<i64>> =
+                    args.iter().map(|a| fr.vals.get(a).and_then(int_of)).collect();
+                let v = match (b, known.as_deref(), args.first().and_then(|a| fr.vals.get(a))) {
+                    (Builtin::Min, Some([x, y]), Some(c)) => same_int(c, (*x).min(*y)),
+                    (Builtin::Max, Some([x, y]), Some(c)) => same_int(c, (*x).max(*y)),
+                    (Builtin::Clamp, Some([x, lo, hi]), Some(c)) if lo <= hi => {
+                        same_int(c, (*x).max(*lo).min(*hi))
+                    }
+                    _ => None,
+                };
+                (w, v)
             }
             Expr::ArrayLength(_) => (OP, None),
             Expr::Convert(x, _) => (OP * comps(x), None),
@@ -1373,6 +1385,15 @@ fn fold(op: BinOp, a: Const, b: Const) -> Option<Const> {
 }
 
 /// A 32-bit integer constant's value.
+/// `x` as a constant of `like`'s integer type.
+fn same_int(like: &Const, x: i64) -> Option<Const> {
+    match like {
+        Const::U32(_) => u32::try_from(x).ok().map(Const::U32),
+        Const::I32(_) => i32::try_from(x).ok().map(Const::I32),
+        _ => None,
+    }
+}
+
 fn int_of(c: &Const) -> Option<i64> {
     match c {
         Const::I32(i) => Some(i64::from(*i)),

@@ -13,7 +13,7 @@ use mesh::grid::{
 }
 use std::derive::{Box3, affine_form, value_and_gradient}
 use std::field::{ALL_LIVE, DualQuat, Field, Live}
-use std::gpu::{Append, Atomics, DispatchArgs, GlobalId, One, Slots, limits}
+use std::gpu::{Append, Atomics, DispatchArgs, GlobalId, LANE_WORK_LEAST, One, Slots, limits}
 
 @strict
 @compute(64)
@@ -250,7 +250,7 @@ pub(package) fn decode_cell(cell: u32) -> (u32, u32, u32) {
 }
 
 /// The 8 corner distances of one cell (`dXYZ` at local corner `(X, Y, Z)`).
-pub(package) struct CellCorners: Copy {
+pub(package) struct CellCorners: Copy + GpuData {
     pub(package) d000: f32,
     pub(package) d100: f32,
     pub(package) d010: f32,
@@ -320,9 +320,12 @@ pub(package) fn corner_uvw(k: u32) -> vec3 {
 /// A cell's Dual Contouring QEF: the symmetric 3×3 normal equations `A x = b` of its Hermite
 /// samples in local cell coordinates relative to the cell centre `(0.5, 0.5, 0.5)`, their mass
 /// point and summed normal, and how far their normals spread (`min_dot`, to find sharp creases).
-pub(package) struct Qef: Copy {
+pub(package) struct Qef: Copy + GpuData {
+    pub(package) mass: vec3,
     pub(package) a00: f32,
+    pub(package) avg_n: vec3,
     pub(package) a01: f32,
+    pub(package) first_n: vec3,
     pub(package) a02: f32,
     pub(package) a11: f32,
     pub(package) a12: f32,
@@ -330,10 +333,7 @@ pub(package) struct Qef: Copy {
     pub(package) bx: f32,
     pub(package) by: f32,
     pub(package) bz: f32,
-    pub(package) mass: vec3,
-    pub(package) avg_n: vec3,
     pub(package) count: u32,
-    pub(package) first_n: vec3,
     pub(package) min_dot: f32,
 }
 
@@ -598,63 +598,127 @@ pub(package) fn solve_cell<F: Copy + fn(vec3) -> f32>(
     (newton_snap(wp, dv, gv, cell_lo, h), dv, gv)
 }
 
+/// The most steps a crease cell's solve takes (`crease_steps`): past them its clamped dual vertex
+/// is its answer.
+pub(package) const CREASE_STEPS: u32 = 64
+
+/// A crease cell's solve (`crease_steps`): its corners, and the state of the machine between
+/// steps, which a dispatch that takes only some of them keeps for the next; once `done`, its
+/// answer (`wp`, `gv` and `qef`).
+pub(package) struct CreaseSolve: Copy + GpuData {
+    pub(package) qef: Qef,
+    pub(package) p0: vec3,
+    pub(package) t0: f32,
+    pub(package) uvw: vec3,
+    pub(package) lo: f32,
+    pub(package) wp_clamped: vec3,
+    pub(package) hi: f32,
+    pub(package) ewp: vec3,
+    pub(package) e: u32,
+    /// The answer once `done`: the vertex, and `dist`'s gradient there.
+    pub(package) wp: vec3,
+    /// 0: initial edge probe, 1: bisection step, 2: post-bisection normal, 3: knife-edge crest
+    /// check, 4: clamped dual-vertex snap.
+    pub(package) stage: u32,
+    pub(package) gv: vec3,
+    pub(package) d: CellCorners,
+    pub(package) axis: u32,
+    pub(package) bi: u32,
+    pub(package) neg0: u32,
+    /// The steps taken.
+    pub(package) taken: u32,
+    pub(package) done: u32,
+}
+
+/// A crease cell's solve before its first step: the cell from `cell_lo` (side `h`), corners `d`.
+pub(package) fn crease_start(d: CellCorners, cell_lo: vec3, h: f32) -> CreaseSolve {
+    let z = vec3(0.0)
+    CreaseSolve {
+        d: d,
+        qef: qef_empty(),
+        p0: z,
+        uvw: z,
+        wp_clamped: cell_lo + vec3(0.5 * h),
+        ewp: cell_lo,
+        wp: z,
+        gv: z,
+        t0: 0.0,
+        lo: 0.0,
+        hi: 1.0,
+        e: 0,
+        stage: 0,
+        axis: 0,
+        bi: 0,
+        neg0: 0,
+        taken: 0,
+        done: 0,
+    }
+}
+
 /// Unified sharp-crease solver (`hermite_qef` + `solve_cell`) sharing ONE `value_and_gradient`
 /// call site across initial edge probes, sharp-corner bisection, knife-edge crest checks, and the
 /// final Newton snap so composite carved fields stay compact in MSL/SPIR-V (`<= 288 KiB`) while
-/// computing identical Hermite vertices and normals.
+/// computing identical Hermite vertices and normals. Whole: `crease_steps` of all its steps.
 pub(package) fn solve_crease_cell<F: Copy + fn(vec3) -> f32>(
     dist: F,
     d: CellCorners,
     cell_lo: vec3,
     h: f32,
 ) -> (vec3, vec3, Qef) {
-    var qef = qef_empty()
-    var e: u32 = 0
-    // 0: initial edge probe, 1: bisection step, 2: post-bisection normal,
-    // 3: knife-edge crest check, 4: clamped dual-vertex snap.
-    var stage: u32 = 0
-    var axis: u32 = 0
-    var p0 = vec3(0.0)
-    var t0 = 0.0
-    var uvw = vec3(0.0)
-    var lo = 0.0
-    var hi = 1.0
-    var neg0 = false
-    var bi: u32 = 0
-    var wp_clamped = cell_lo + vec3(0.5 * h)
-    var ewp = cell_lo
-    for iter in 0..64 {
-        if iter >= 61 && stage < 3 {
-            e = 12
-            stage = 0
+    let s = crease_steps(dist, crease_start(d, cell_lo, h), cell_lo, h, CREASE_STEPS)
+    (s.wp, s.gv, s.qef)
+}
+
+/// `solve`, the crease cell from `cell_lo` (side `h`), after `steps` more of its steps, or done
+/// before them: each step samples `dist` once. A dispatch whose invocation can't do all of a
+/// heavy field's steps does some (`crease_part`), and the next goes on from what it kept; the
+/// steps and their answer are the whole solve's.
+pub(package) fn crease_steps<F: Copy + fn(vec3) -> f32>(
+    dist: F,
+    solve: CreaseSolve,
+    cell_lo: vec3,
+    h: f32,
+    steps: u32,
+) -> CreaseSolve {
+    var s = solve
+    let d = s.d
+    for _step in 0..steps {
+        if s.done != 0 {
+            break
         }
-        if stage == 0 {
+        let iter = s.taken
+        s.taken += 1
+        if iter >= CREASE_STEPS - 3 && s.stage < 3 {
+            s.e = 12
+            s.stage = 0
+        }
+        if s.stage == 0 {
             for _skip in 0..12 {
-                if e >= 12 {
+                if s.e >= 12 {
                     break
                 }
-                let (i0, i1) = edge_ends(e)
+                let (i0, i1) = edge_ends(s.e)
                 let v0 = d.at(i0)
                 let v1 = d.at(i1)
                 if (v0 < 0.0) != (v1 < 0.0) {
-                    axis = e / 4
-                    p0 = corner_uvw(i0)
-                    t0 = clamp(v0 / (v0 - v1), 0.0, 1.0)
-                    uvw = with_along(p0, axis, t0)
+                    s.axis = s.e / 4
+                    s.p0 = corner_uvw(i0)
+                    s.t0 = clamp(v0 / (v0 - v1), 0.0, 1.0)
+                    s.uvw = with_along(s.p0, s.axis, s.t0)
                     break
                 }
-                e += 1
+                s.e += 1
             }
-            if e >= 12 {
+            if s.e >= 12 {
                 let tri = trilinear_qef(d)
-                if qef.count == 0 {
-                    qef = tri
+                if s.qef.count == 0 {
+                    s.qef = tri
                 }
-                let use_hermite = is_crease(tri) || qef.min_dot < 0.92
-                let final_qef = if use_hermite { qef } else { tri }
+                let use_hermite = is_crease(tri) || s.qef.min_dot < 0.92
+                let final_qef = if use_hermite { s.qef } else { tri }
                 let reg = if use_hermite { REG_CREASE } else { REG_SMOOTH }
                 let raw = final_qef.solve_unclamped(reg)
-                wp_clamped = cell_lo + clamp(raw, vec3(0.0), vec3(1.0)) * h
+                s.wp_clamped = cell_lo + clamp(raw, vec3(0.0), vec3(1.0)) * h
                 let ext = clamp(raw, vec3(-0.85), vec3(1.85))
                 let out_of_cell = ext.x < 0.0 ||
                     ext.x > 1.0 ||
@@ -663,81 +727,92 @@ pub(package) fn solve_crease_cell<F: Copy + fn(vec3) -> f32>(
                     ext.z < 0.0 ||
                     ext.z > 1.0
                 if use_hermite && final_qef.min_dot < -0.15 && out_of_cell {
-                    ewp = cell_lo + ext * h
-                    stage = 3
+                    s.ewp = cell_lo + ext * h
+                    s.stage = 3
                 } else {
-                    stage = 4
+                    s.stage = 4
                 }
             }
         }
-        let probe = if stage == 0 || stage == 2 {
-            cell_lo + uvw * h
-        } else if stage == 1 {
-            let s = if bi == 0 { 0.0 } else if bi == 1 { 1.0 } else { 0.5 * (lo + hi) }
-            cell_lo + with_along(p0, axis, s) * h
-        } else if stage == 3 {
-            ewp
+        let probe = if s.stage == 0 || s.stage == 2 {
+            cell_lo + s.uvw * h
+        } else if s.stage == 1 {
+            let t = if s.bi == 0 { 0.0 } else if s.bi == 1 { 1.0 } else { 0.5 * (s.lo + s.hi) }
+            cell_lo + with_along(s.p0, s.axis, t) * h
+        } else if s.stage == 3 {
+            s.ewp
         } else {
-            wp_clamped
+            s.wp_clamped
         }
         let (sv, sg) = sample_dist(dist, probe)
-        if stage == 0 {
-            let edot = along(sg, axis) * h
+        if s.stage == 0 {
+            let edot = along(sg, s.axis) * h
             if abs(edot) < 0.15 * h && abs(sv) > 0.02 * h {
-                lo = 0.0
-                hi = 1.0
-                neg0 = false
-                bi = 0
-                stage = 1
+                s.lo = 0.0
+                s.hi = 1.0
+                s.neg0 = 0
+                s.bi = 0
+                s.stage = 1
             } else {
                 if abs(edot) > 1.0e-6 {
-                    uvw = with_along(p0, axis, clamp(t0 - sv / edot, 0.0, 1.0))
+                    s.uvw = with_along(s.p0, s.axis, clamp(s.t0 - sv / edot, 0.0, 1.0))
                 }
-                qef.add(uvw, safe_norm(sg, safe_norm(d.grad(uvw), vec3(0.0, 1.0, 0.0))))
-                e += 1
+                s.qef.add(s.uvw, safe_norm(sg, safe_norm(d.grad(s.uvw), vec3(0.0, 1.0, 0.0))))
+                s.e += 1
             }
-        } else if stage == 1 {
-            if bi == 0 {
-                neg0 = sv < 0.0
-                bi = 1
-            } else if bi == 1 {
-                if (sv < 0.0) == neg0 {
-                    e += 1
-                    stage = 0
+        } else if s.stage == 1 {
+            let neg = if sv < 0.0 { 1 } else { 0 }
+            if s.bi == 0 {
+                s.neg0 = neg
+                s.bi = 1
+            } else if s.bi == 1 {
+                if neg == s.neg0 {
+                    s.e += 1
+                    s.stage = 0
                 } else {
-                    bi = 2
+                    s.bi = 2
                 }
             } else {
-                let mid = 0.5 * (lo + hi)
-                if (sv < 0.0) == neg0 {
-                    lo = mid
+                let mid = 0.5 * (s.lo + s.hi)
+                if neg == s.neg0 {
+                    s.lo = mid
                 } else {
-                    hi = mid
+                    s.hi = mid
                 }
-                bi += 1
-                if bi >= 6 {
-                    uvw = with_along(p0, axis, 0.5 * (lo + hi))
-                    stage = 2
+                s.bi += 1
+                if s.bi >= 6 {
+                    s.uvw = with_along(s.p0, s.axis, 0.5 * (s.lo + s.hi))
+                    s.stage = 2
                 }
             }
-        } else if stage == 2 {
-            let edot = along(sg, axis) * h
+        } else if s.stage == 2 {
+            let edot = along(sg, s.axis) * h
             if abs(edot) > 1.0e-6 {
-                uvw = with_along(p0, axis, clamp(0.5 * (lo + hi) - sv / edot, lo, hi))
+                s.uvw = with_along(s.p0, s.axis, clamp(0.5 * (s.lo + s.hi) - sv / edot, s.lo, s.hi))
             }
-            qef.add(uvw, safe_norm(sg, safe_norm(d.grad(uvw), vec3(0.0, 1.0, 0.0))))
-            e += 1
-            stage = 0
-        } else if stage == 3 {
+            s.qef.add(s.uvw, safe_norm(sg, safe_norm(d.grad(s.uvw), vec3(0.0, 1.0, 0.0))))
+            s.e += 1
+            s.stage = 0
+        } else if s.stage == 3 {
             if abs(sv) <= 0.04 * h {
-                return (ewp, sg, qef)
+                s.wp = s.ewp
+                s.gv = sg
+                s.done = 1
+            } else {
+                s.stage = 4
             }
-            stage = 4
         } else {
-            return (newton_snap(wp_clamped, sv, sg, cell_lo, h), sg, qef)
+            s.wp = newton_snap(s.wp_clamped, sv, sg, cell_lo, h)
+            s.gv = sg
+            s.done = 1
+        }
+        if s.done == 0 && s.taken >= CREASE_STEPS {
+            s.wp = s.wp_clamped
+            s.gv = safe_norm(d.grad(vec3(0.5)), vec3(0.0, 1.0, 0.0))
+            s.done = 1
         }
     }
-    (wp_clamped, safe_norm(d.grad(vec3(0.5)), vec3(0.0, 1.0, 0.0)), qef)
+    s
 }
 
 /// What every pass computes for a sign-changing cell with corners `d` at `cell_lo` (side `h`),
@@ -1196,40 +1271,75 @@ pub fn prep_slices(
     args[id] = DispatchArgs { x: (m + 63) / 64, y: 1, z: 1 }
 }
 
-/// What one cell of `refine_creases` asks of a field at the cell from `lo` (side `h`), for the
-/// compiler's count of its work (`std::derive::work`).
-fn crease_cell_work<M: Field<Substance>>(f: M, lo: vec3, h: f32) -> vec3 {
-    let dist = |q: vec3| f.distance_live(q, ALL_LIVE)
+/// What one step of a crease cell's solve (`crease_steps`) asks of `dist` from a cell at `lo`
+/// (side `h`), for the compiler's count of its work: corners that depend on the cell, so no side
+/// of a branch is settled by them.
+fn crease_step_work<F: Copy + fn(vec3) -> f32>(dist: F, lo: vec3, h: f32) -> vec3 {
     let d = CellCorners {
-        d000: dist(lo),
-        d100: dist(lo + vec3(h, 0.0, 0.0)),
-        d010: dist(lo + vec3(0.0, h, 0.0)),
-        d110: dist(lo + vec3(h, h, 0.0)),
-        d001: dist(lo + vec3(0.0, 0.0, h)),
-        d101: dist(lo + vec3(h, 0.0, h)),
-        d011: dist(lo + vec3(0.0, h, h)),
-        d111: dist(lo + vec3(h, h, h)),
+        d000: lo.x,
+        d100: -lo.x,
+        d010: lo.y,
+        d110: -lo.y,
+        d001: lo.z,
+        d101: -lo.z,
+        d011: lo.x - lo.y,
+        d111: lo.y - lo.z,
     }
-    let (wp, gv, _qef) = solve_crease_cell(dist, d, lo, h)
-    wp + gv
+    let s = crease_steps(dist, crease_start(d, lo, h), lo, h, 1)
+    s.wp + s.gv + s.uvw
 }
 
-/// The crease cells one `refine_creases` dispatch may solve for a field like `sample`: as many as
-/// keep it within the GPU's step (`limits().step_work`), clamped to `[CREASE_SLICE_LEAST, CREASE_SLICE]`,
-/// a cell's work counted as the strict kernel computes it (`std::derive::strict_work`).
-pub(package) fn crease_slice_of<M: Field<Substance>>(sample: M) -> u32 {
-    let cell = f32(max(std::derive::strict_work(|lo: vec3| crease_cell_work(sample, lo, h: 0.01)), 1))
-    let step = f32(limits().step_work) * 1000.0
-    let n = u32(clamp(step / (cell * 1.2 + 2000.0), f32(CREASE_SLICE_LEAST), f32(CREASE_SLICE)))
+/// The work of one step of a crease cell's solve of a field like `sample`'s distance
+/// (`crease_steps`), as the strict kernel computes it (`std::derive::strict_work`). Every choice
+/// of how a field's crease and surface cells are dispatched starts from this one count, so a
+/// kind is counted once.
+pub(package) fn crease_step_cost_of<M: Field<Substance>>(sample: M) -> u32 {
+    let dist = |q: vec3| sample.distance_live(q, ALL_LIVE)
+    max(std::derive::strict_work(|lo: vec3| crease_step_work(dist, lo, h: 0.01)), 1)
+}
+
+/// `crease_step_cost_of` of a field like `sample`'s rest-pose distance (`refine_creases_rest`).
+pub(package) fn crease_step_cost_rest_of<M: Field<Substance>>(sample: M) -> u32 {
+    let dist = |q: vec3| sample.rest_distance_live(q, ALL_LIVE)
+    max(std::derive::strict_work(|lo: vec3| crease_step_work(dist, lo, h: 0.01)), 1)
+}
+
+/// The steps of a crease cell's solve one dispatch takes, a step costing `step`: all of them
+/// (`CREASE_STEPS`) where an invocation's work for them, with a fifth more, is within half the
+/// most one may do on the slowest target (`LANE_WORK_LEAST`: half, for a device slower than its
+/// target's), else the most power of two that is. A constant of the build for each kind, worked
+/// in integers, which the compiler's count follows, so a kernel's bound counts only these steps.
+/// (SCENE 13's desk: 4.06M work an invocation for all 64, past the M4's 2.44M.)
+pub(package) fn crease_part(step: u32) -> u32 {
+    let most = LANE_WORK_LEAST / 2
+    let s = min(step, most)
+    let w = s + s / 5
+    if w <= most / 64 { 64 } else if w <= most / 32 { 32 } else if w <= most / 16 { 16 } else if
+        w <= most / 8 { 8 } else if w <= most / 4 { 4 } else if w <= most / 2 { 2 } else { 1 }
+}
+
+/// The dispatches of a crease cell's solve that take `part` steps each.
+pub(package) fn crease_passes(part: u32) -> u32 {
+    (CREASE_STEPS + part - 1) / part
+}
+
+/// The crease cells one dispatch may solve, a step costing `step`: as many as keep it within the
+/// GPU's step (`limits().step_work`), clamped to `[CREASE_SLICE_LEAST, CREASE_SLICE]`, a cell's
+/// work the steps a dispatch takes of it (`crease_part`).
+pub(package) fn crease_slice(step: u32) -> u32 {
+    let cell = f32(crease_part(step)) * f32(step)
+    let work = f32(limits().step_work) * 1000.0
+    let n = u32(clamp(work / (cell * 1.2 + 2000.0), f32(CREASE_SLICE_LEAST), f32(CREASE_SLICE)))
     max((n / 64) * 64, CREASE_SLICE_LEAST)
 }
 
-/// The surface cells one `solve_verts` dispatch may solve for a field like `sample`: up to
-/// `CAP_SURF` (one dispatch for light fields), cut into smaller slices for heavy carved fields.
-pub(package) fn surf_slice_of<M: Field<Substance>>(sample: M) -> u32 {
-    let cell = f32(max(std::derive::strict_work(|lo: vec3| crease_cell_work(sample, lo, h: 0.01)), 1))
-    let step = f32(limits().step_work) * 1000.0
-    let n = u32(clamp(step / (cell * 1.2 + 2000.0), f32(CREASE_SLICE_LEAST), f32(CAP_SURF)))
+/// The surface cells one `solve_verts` dispatch may solve for a field whose crease step costs
+/// `step`: up to `CAP_SURF` (one dispatch for light fields), cut into smaller slices for heavy
+/// carved fields, a cell's work at most a whole crease solve's (`CREASE_STEPS` steps).
+pub(package) fn surf_slice(step: u32) -> u32 {
+    let cell = f32(CREASE_STEPS) * f32(step)
+    let work = f32(limits().step_work) * 1000.0
+    let n = u32(clamp(work / (cell * 1.2 + 2000.0), f32(CREASE_SLICE_LEAST), f32(CAP_SURF)))
     max((n / 64) * 64, CREASE_SLICE_LEAST)
 }
 
@@ -1349,6 +1459,8 @@ pub(package) fn refine_creases<M: Field<Substance>>(
     creases: [u32],
     crease_count: [u32],
     first: u32,
+    pass: u32,
+    solves: mut Slots<CreaseSolve>,
     cap_verts: u32,
     cell_verts: mut Atomics<u32>,
     verts: mut Append<MeshVertex>,
@@ -1362,7 +1474,6 @@ pub(package) fn refine_creases<M: Field<Substance>>(
     let local_bi = packed >> 9
     let cell = packed & 511
     let (cx, cy, cz) = decode_cell(cell)
-    let d = load_corners(corners, local_bi * CORNERS_BRICK, cx, cy, cz)
     let ab = active[chunk_start + local_bi]
     let b = ab.coord
     let g = grids[b.w]
@@ -1371,18 +1482,33 @@ pub(package) fn refine_creases<M: Field<Substance>>(
     let f = fields[g.orig_id]
     let live = ab.live
     let dist = |q: vec3| f.distance_live(q, live)
-    let (wp, gv, qef) = solve_crease_cell(dist, d, cell_lo, h)
-    push_vertex(
-        f,
-        g.orig_id,
-        wp,
-        gv,
-        qef,
-        local_bi * VERTS_STRIDE + cell,
-        cap_verts,
-        mut verts,
-        mut cell_verts,
-    )
+    // This pass's steps of the cell's solve, from where the last kept it (`crease_part`).
+    let part = crease_part(crease_step_cost_of(f))
+    let from = if pass == 0 {
+        crease_start(load_corners(corners, local_bi * CORNERS_BRICK, cx, cy, cz), cell_lo, h)
+    } else {
+        solves[id]
+    }
+    if from.done != 0 {
+        return
+    }
+    let s = crease_steps(dist, from, cell_lo, h, part)
+    if part < CREASE_STEPS {
+        solves[id] = s
+    }
+    if s.done != 0 {
+        push_vertex(
+            f,
+            g.orig_id,
+            s.wp,
+            s.gv,
+            s.qef,
+            local_bi * VERTS_STRIDE + cell,
+            cap_verts,
+            mut verts,
+            mut cell_verts,
+        )
+    }
 }
 
 /// Rest-pose Pass 0 for `Skinned` fields: interval-culls bricks against `rest_pruned`.
@@ -1554,6 +1680,8 @@ pub(package) fn refine_creases_rest<M: Field<Substance>>(
     creases: [u32],
     crease_count: [u32],
     first: u32,
+    pass: u32,
+    solves: mut Slots<CreaseSolve>,
     cap_verts: u32,
     cell_verts: mut Atomics<u32>,
     verts: mut Append<MeshVertex>,
@@ -1568,7 +1696,6 @@ pub(package) fn refine_creases_rest<M: Field<Substance>>(
     let local_bi = packed >> 9
     let cell = packed & 511
     let (cx, cy, cz) = decode_cell(cell)
-    let d = load_corners(corners, local_bi * CORNERS_BRICK, cx, cy, cz)
     let ab = active[chunk_start + local_bi]
     let b = ab.coord
     let g = grids[b.w]
@@ -1577,19 +1704,34 @@ pub(package) fn refine_creases_rest<M: Field<Substance>>(
     let f = fields[g.orig_id]
     let live = ab.live
     let dist = |q: vec3| f.rest_distance_live(q, live)
-    let (wp, gv, qef) = solve_crease_cell(dist, d, cell_lo, h)
-    push_skinned_vertex(
-        f,
-        g.orig_id,
-        wp,
-        gv,
-        qef,
-        local_bi * VERTS_STRIDE + cell,
-        cap_verts,
-        mut verts,
-        mut skin_verts,
-        mut cell_verts,
-    )
+    // This pass's steps of the cell's solve, from where the last kept it.
+    let part = crease_part(crease_step_cost_rest_of(f))
+    let from = if pass == 0 {
+        crease_start(load_corners(corners, local_bi * CORNERS_BRICK, cx, cy, cz), cell_lo, h)
+    } else {
+        solves[id]
+    }
+    if from.done != 0 {
+        return
+    }
+    let s = crease_steps(dist, from, cell_lo, h, part)
+    if part < CREASE_STEPS {
+        solves[id] = s
+    }
+    if s.done != 0 {
+        push_skinned_vertex(
+            f,
+            g.orig_id,
+            s.wp,
+            s.gv,
+            s.qef,
+            local_bi * VERTS_STRIDE + cell,
+            cap_verts,
+            mut verts,
+            mut skin_verts,
+            mut cell_verts,
+        )
+    }
 }
 
 /// Projects a skinned vertex at `p` (skinned normal `n_ref`) onto `dist`'s zero set by up to 3
