@@ -26,13 +26,111 @@
 // recessed, a seam's recessed. A profile's points and bulges are in metres (`outline`).
 
 use engine::matter::verify::verify_surface_soundness
-use shapes::made::{Shaped, Story, exposure_of, plain, story}
-use shapes::outline::{Outline, Profile, outline, profile}
+use shapes::made::{Shaped, Story, exposure_of, plain, story, stepped, stepped_near}
+use shapes::outline::{Outline, Profile, Slope2, norm2_enclose, outline, profile}
 use std::cmp::Eq
-use shapes::made::{stepped, stepped_near}
 use std::derive::{Box3, Interval}
-use std::field::{Bound, Live, PartName, Pruned, Surface, pair_masked, pair_pruned}
+use std::field::{
+    Bound, Live, PartName, Pruned, SLOPE_EPS, SLOPE_TINY, SlopeBox, Surface, pair_masked,
+    pair_pruned, slope_abs, slope_from_g, slope_lip, slope_max, slope_min, slope_neg, slope_shift,
+    slope_sub_half,
+}
 use std::hash::{StateHash, state_hash}
+
+/// Sound 2D `Slope2` of `plan_distance(q, half, corner)` over `[at - rad, at + rad]`.
+fn plan_slope_2d(at: vec2, rad: vec2, half: vec2, corner: f32) -> Slope2 {
+    let c = min(corner, min(half.x, half.y))
+    let inner = half - vec2(c)
+    let d_at = plan_distance(at, half, corner)
+    let r_box = length(rad) * (1.0 + 4.0 * SLOPE_EPS) + 1.0e-7
+    let lo = at - rad
+    let hi = at + rad
+    let min_ax = if lo.x <= 0.0 && hi.x >= 0.0 { 0.0 } else { min(abs(lo.x), abs(hi.x)) }
+    let max_ax = max(abs(lo.x), abs(hi.x))
+    let min_ay = if lo.y <= 0.0 && hi.y >= 0.0 { 0.0 } else { min(abs(lo.y), abs(hi.y)) }
+    let max_ay = max(abs(lo.y), abs(hi.y))
+    let qx_lo = min_ax - inner.x
+    let qx_hi = max_ax - inner.x
+    let qy_lo = min_ay - inner.y
+    let qy_hi = max_ay - inner.y
+    let sx = if lo.x >= 0.0 { 1.0 } else if hi.x <= 0.0 { -1.0 } else { 0.0 }
+    let sy = if lo.y >= 0.0 { 1.0 } else if hi.y <= 0.0 { -1.0 } else { 0.0 }
+    let margin = (abs(d_at) + r_box + half.x + half.y) * (16.0 * SLOPE_EPS) + 1.0e-6
+    if sx != 0.0 && qy_hi <= 0.0 && qx_lo > qy_hi {
+        let g_mid = vec2(sx, 0.0)
+        let g_rad = vec2(4.0 * SLOPE_EPS)
+        let span = dot(abs(g_mid) + g_rad, rad) + margin
+        return Slope2 {
+            d_at,
+            g_mid,
+            g_rad,
+            err: margin,
+            range: Interval { lo: d_at - span, hi: d_at + span },
+        }
+    }
+    if sy != 0.0 && qx_hi <= 0.0 && qy_lo > qx_hi {
+        let g_mid = vec2(0.0, sy)
+        let g_rad = vec2(4.0 * SLOPE_EPS)
+        let span = dot(abs(g_mid) + g_rad, rad) + margin
+        return Slope2 {
+            d_at,
+            g_mid,
+            g_rad,
+            err: margin,
+            range: Interval { lo: d_at - span, hi: d_at + span },
+        }
+    }
+    if sx != 0.0 && sy != 0.0 && qx_lo > 0.0 && qy_lo > 0.0 {
+        let q0 = abs(at) - inner
+        let (ok_n, r_mid, n_hat, r_err) = norm2_enclose(q0, rad)
+        if ok_n {
+            let d_mid = r_mid - c
+            let g_mid = n_hat * vec2(sx, sy)
+            let g_rad = vec2(8.0 * SLOPE_EPS)
+            let err = r_err + margin
+            let span = dot(abs(g_mid) + g_rad, rad) + err
+            return Slope2 {
+                g_mid,
+                g_rad,
+                d_at: d_mid,
+                err,
+                range: Interval { lo: d_mid - span, hi: d_mid + span },
+            }
+        }
+    }
+    let err = r_box + r_box * 1.0e-5 + abs(d_at) * 1.0e-6 + 1.0e-6
+    Slope2 {
+        d_at,
+        g_mid: vec2(0.0),
+        g_rad: vec2(0.0),
+        err,
+        range: Interval { lo: d_at - err, hi: d_at + err },
+    }
+}
+
+/// Chain rule lifting a 2D section `Slope2` `se(plan(p.xz), p.y)` through `plan_slope_2d` `sp`.
+fn lift_plan_section(sp: Slope2, se: Slope2, rad: vec3) -> SlopeBox {
+    let sp_abs = abs(sp.g_mid) + sp.g_rad
+    let g_mid = vec3(se.g_mid.x * sp.g_mid.x, se.g_mid.y, se.g_mid.x * sp.g_mid.y)
+    let g_rad = vec3(
+        abs(se.g_mid.x) * sp.g_rad.x + se.g_rad.x * sp_abs.x,
+        se.g_rad.y,
+        abs(se.g_mid.x) * sp.g_rad.y + se.g_rad.x * sp_abs.y,
+    ) +
+        vec3(16.0 * SLOPE_EPS)
+    let err = se.err +
+        (abs(se.g_mid.x) + se.g_rad.x) * sp.err +
+        (abs(se.d_at) + abs(sp.d_at)) * (16.0 * SLOPE_EPS) +
+        1.0e-6
+    let rng_a = slope_from_g(se.d_at, g_mid, g_rad, err, rad).range
+    SlopeBox {
+        d_at: se.d_at,
+        g_mid,
+        g_rad,
+        err,
+        range: Interval { lo: max(se.range.lo, rng_a.lo), hi: min(se.range.hi, rng_a.hi) },
+    }
+}
 
 // ---- turned -------------------------------------------------------------------------------------
 
@@ -58,6 +156,39 @@ pub fn radius_of(p: vec3) -> f32 {
 }
 
 impl<const N: u32> Surface for Turned<N> {
+    const HAS_SLOPE_BOX: bool = true
+
+    fn slope_box(self, over: Box3, at: vec3, rad: vec3, live: Live, first: u32) -> SlopeBox {
+        let (ok_n, r_mid, n_xz, r_err) = norm2_enclose(at.xz, rad.xz)
+        let r_at = if ok_n { r_mid } else { radius_of(at) }
+        let r_span = if ok_n {
+            abs(n_xz.x) * rad.x + abs(n_xz.y) * rad.z + r_err + 1.0e-7
+        } else {
+            length(vec2(rad.x, rad.z)) * (1.0 + 4.0 * SLOPE_EPS) + 1.0e-7
+        }
+        let s2 = self.profile.slope_box(vec2(r_at, at.y), vec2(r_span, rad.y))
+        let gr_mid = s2.g_mid.x
+        let gr_rad = s2.g_rad.x
+        let gr_max = abs(gr_mid) + gr_rad
+        var g_mid = vec3(0.0, s2.g_mid.y, 0.0)
+        var g_rad = vec3(gr_max, s2.g_rad.y, gr_max) + vec3(8.0 * SLOPE_EPS)
+        var err = s2.err + (abs(s2.d_at) + gr_max * r_span) * (16.0 * SLOPE_EPS) + 1.0e-6
+        if ok_n {
+            g_mid = vec3(gr_mid * n_xz.x, s2.g_mid.y, gr_mid * n_xz.y)
+            g_rad = vec3(gr_rad * abs(n_xz.x), s2.g_rad.y, gr_rad * abs(n_xz.y)) +
+                vec3(8.0 * SLOPE_EPS)
+            err += gr_max * (r_err + 1.0e-8)
+        }
+        let rng_a = slope_from_g(s2.d_at, g_mid, g_rad, err, rad).range
+        SlopeBox {
+            d_at: s2.d_at,
+            g_mid,
+            g_rad,
+            err,
+            range: Interval { lo: max(s2.range.lo, rng_a.lo), hi: min(s2.range.hi, rng_a.hi) },
+        }
+    }
+
     fn interval_near(self, b: Box3) -> Interval {
         stepped_near(self, b)
     }
@@ -143,6 +274,15 @@ impl<const N: u32> Moulded<N> {
 }
 
 impl<const N: u32> Surface for Moulded<N> {
+    const HAS_SLOPE_BOX: bool = true
+
+    fn slope_box(self, over: Box3, at: vec3, rad: vec3, live: Live, first: u32) -> SlopeBox {
+        let sp = plan_slope_2d(at.xz, rad.xz, self.half, self.corner)
+        let pr = max(sp.d_at - sp.range.lo, sp.range.hi - sp.d_at)
+        let se = self.edge.slope_box(vec2(sp.d_at, at.y), vec2(pr, rad.y))
+        lift_plan_section(sp, se, rad)
+    }
+
     fn interval_near(self, b: Box3) -> Interval {
         stepped_near(self, b)
     }
@@ -216,6 +356,15 @@ impl<const N: u32> Banded<N> {
 }
 
 impl<const N: u32> Surface for Banded<N> {
+    const HAS_SLOPE_BOX: bool = true
+
+    fn slope_box(self, over: Box3, at: vec3, rad: vec3, live: Live, first: u32) -> SlopeBox {
+        let sp = plan_slope_2d(at.xz, rad.xz, self.half, self.corner)
+        let pr = max(sp.d_at - sp.range.lo, sp.range.hi - sp.d_at)
+        let se = self.section.slope_box(vec2(sp.d_at, at.y), vec2(pr, rad.y))
+        lift_plan_section(sp, se, rad)
+    }
+
     fn interval_near(self, b: Box3) -> Interval {
         stepped_near(self, b)
     }
@@ -286,6 +435,42 @@ fn extrusion(w: vec2) -> f32 {
 }
 
 impl<const N: u32> Surface for Extruded<N> {
+    const HAS_SLOPE_BOX: bool = true
+
+    fn slope_box(self, over: Box3, at: vec3, rad: vec3, live: Live, first: u32) -> SlopeBox {
+        let s2 = self.section.slope_box(at.zy, rad.zy)
+        let s_sec = SlopeBox {
+            d_at: s2.d_at,
+            g_mid: vec3(0.0, s2.g_mid.y, s2.g_mid.x),
+            g_rad: vec3(0.0, s2.g_rad.y, s2.g_rad.x),
+            err: s2.err,
+            range: s2.range,
+        }
+        let half_l = 0.5 * self.length
+        let lo_x = over.lo.x
+        let hi_x = over.hi.x
+        let ax_at = abs(at.x) - half_l
+        let err_e = (abs(at.x) + half_l + rad.x) * (8.0 * SLOPE_EPS) + 1.0e-6
+        let s_end = if lo_x >= 0.0 {
+            slope_from_g(ax_at, vec3(1.0, 0.0, 0.0), vec3(0.0), err_e, rad)
+        } else if hi_x <= 0.0 {
+            slope_from_g(ax_at, vec3(-1.0, 0.0, 0.0), vec3(0.0), err_e, rad)
+        } else {
+            let max_ax = max(abs(lo_x), abs(hi_x))
+            SlopeBox {
+                d_at: ax_at,
+                g_mid: vec3(0.0),
+                g_rad: vec3(1.0, 0.0, 0.0),
+                err: err_e,
+                range: Interval { lo: -half_l - err_e, hi: max_ax - half_l + err_e },
+            }
+        }
+        if s_sec.range.hi <= 0.0 || s_end.range.hi <= 0.0 {
+            return slope_max(s_sec, s_end)
+        }
+        slope_lip(extrusion(vec2(s_sec.d_at, ax_at)), 1.0, rad)
+    }
+
     fn interval_near(self, b: Box3) -> Interval {
         stepped_near(self, b)
     }
@@ -348,6 +533,80 @@ pub fn board(half: vec3, round: f32) -> Board {
 }
 
 impl Surface for Board {
+    const HAS_SLOPE_BOX: bool = true
+
+    fn slope_box(self, over: Box3, at: vec3, rad: vec3, live: Live, first: u32) -> SlopeBox {
+        let inner = self.half - vec3(self.round)
+        let d_at = self.distance(at)
+        let r_box = length(rad) * (1.0 + 4.0 * SLOPE_EPS) + 1.0e-7
+        let lo = at - rad
+        let hi = at + rad
+        let min_ax = if lo.x <= 0.0 && hi.x >= 0.0 { 0.0 } else { min(abs(lo.x), abs(hi.x)) }
+        let max_ax = max(abs(lo.x), abs(hi.x))
+        let min_ay = if lo.y <= 0.0 && hi.y >= 0.0 { 0.0 } else { min(abs(lo.y), abs(hi.y)) }
+        let max_ay = max(abs(lo.y), abs(hi.y))
+        let min_az = if lo.z <= 0.0 && hi.z >= 0.0 { 0.0 } else { min(abs(lo.z), abs(hi.z)) }
+        let max_az = max(abs(lo.z), abs(hi.z))
+        let qx_lo = min_ax - inner.x
+        let qx_hi = max_ax - inner.x
+        let qy_lo = min_ay - inner.y
+        let qy_hi = max_ay - inner.y
+        let qz_lo = min_az - inner.z
+        let qz_hi = max_az - inner.z
+        let sx = if lo.x >= 0.0 { 1.0 } else if hi.x <= 0.0 { -1.0 } else { 0.0 }
+        let sy = if lo.y >= 0.0 { 1.0 } else if hi.y <= 0.0 { -1.0 } else { 0.0 }
+        let sz = if lo.z >= 0.0 { 1.0 } else if hi.z <= 0.0 { -1.0 } else { 0.0 }
+        let err = (abs(d_at) + r_box + self.half.x + self.half.y + self.half.z) * (16.0 * SLOPE_EPS) +
+            1.0e-6
+        if sx != 0.0 && qy_hi <= 0.0 && qz_hi <= 0.0 && qx_lo > max(qy_hi, qz_hi) {
+            return slope_from_g(d_at, vec3(sx, 0.0, 0.0), vec3(4.0 * SLOPE_EPS), err, rad)
+        }
+        if sy != 0.0 && qx_hi <= 0.0 && qz_hi <= 0.0 && qy_lo > max(qx_hi, qz_hi) {
+            return slope_from_g(d_at, vec3(0.0, sy, 0.0), vec3(4.0 * SLOPE_EPS), err, rad)
+        }
+        if sz != 0.0 && qx_hi <= 0.0 && qy_hi <= 0.0 && qz_lo > max(qx_hi, qy_hi) {
+            return slope_from_g(d_at, vec3(0.0, 0.0, sz), vec3(4.0 * SLOPE_EPS), err, rad)
+        }
+        // Strictly outside the inner box (`max(abs(p) - inner, 0)` never vanishes on the box):
+        // `f(p) = length(max(abs(p) - inner, 0)) - round` is C^1 everywhere on the box, even when
+        // one or two axes cross from a flat face onto a rounded edge or corner.
+        let ux_lo = max(qx_lo, 0.0)
+        let ux_hi = max(qx_hi, 0.0)
+        let uy_lo = max(qy_lo, 0.0)
+        let uy_hi = max(qy_hi, 0.0)
+        let uz_lo = max(qz_lo, 0.0)
+        let uz_hi = max(qz_hi, 0.0)
+        let r_lo = sqrt(ux_lo * ux_lo + uy_lo * uy_lo + uz_lo * uz_lo)
+        if r_lo > 1.0e-5 {
+            let r_hi = max(sqrt(ux_hi * ux_hi + uy_hi * uy_hi + uz_hi * uz_hi), r_lo)
+            let inv_lo = 1.0 / r_lo
+            let inv_hi = 1.0 / r_hi
+            let gx_lo = if sx > 0.0 { ux_lo * inv_hi } else if sx < 0.0 { -ux_hi * inv_lo } else {
+                -ux_hi * inv_lo
+            }
+            let gx_hi = if sx > 0.0 { ux_hi * inv_lo } else if sx < 0.0 { -ux_lo * inv_hi } else {
+                ux_hi * inv_lo
+            }
+            let gy_lo = if sy > 0.0 { uy_lo * inv_hi } else if sy < 0.0 { -uy_hi * inv_lo } else {
+                -uy_hi * inv_lo
+            }
+            let gy_hi = if sy > 0.0 { uy_hi * inv_lo } else if sy < 0.0 { -uy_lo * inv_hi } else {
+                uy_hi * inv_lo
+            }
+            let gz_lo = if sz > 0.0 { uz_lo * inv_hi } else if sz < 0.0 { -uz_hi * inv_lo } else {
+                -uz_hi * inv_lo
+            }
+            let gz_hi = if sz > 0.0 { uz_hi * inv_lo } else if sz < 0.0 { -uz_lo * inv_hi } else {
+                uz_hi * inv_lo
+            }
+            let g_mid = 0.5 * vec3(gx_lo + gx_hi, gy_lo + gy_hi, gz_lo + gz_hi)
+            let g_rad = 0.5 * vec3(gx_hi - gx_lo, gy_hi - gy_lo, gz_hi - gz_lo) +
+                vec3(16.0 * SLOPE_EPS + 1.0e-6)
+            return slope_from_g(d_at, g_mid, g_rad, err, rad)
+        }
+        slope_lip(d_at, 1.0, rad)
+    }
+
     fn interval_near(self, b: Box3) -> Interval {
         stepped_near(self, b)
     }
@@ -423,6 +682,39 @@ fn seamed(da: f32, db: f32, gap: f32, depth: f32) -> f32 {
 }
 
 impl<A: Shaped, B: Shaped> Surface for Joined<A, B> {
+    const HAS_SLOPE_BOX: bool = A::HAS_SLOPE_BOX || B::HAS_SLOPE_BOX
+
+    fn slope_box(self, over: Box3, at: vec3, rad: vec3, live: Live, first: u32) -> SlopeBox {
+        let na = self.a.parts()
+        let nb = self.b.parts()
+        let la = live.any(first, na)
+        let lb = live.any(first + na, nb)
+        var sa = slope_lip(d_at: 1.0e30, l: 0.0, rad: vec3(0.0))
+        if la {
+            sa = self.a.slope_box(over, at, rad, live, first)
+        }
+        if !lb {
+            return sa
+        }
+        let sb = self.b.slope_box(over, at, rad, live, first + na)
+        if !la {
+            return sb
+        }
+        let gap = max(self.gap, 0.0)
+        if sa.range.lo + sb.range.lo > gap {
+            if sb.range.lo > sa.range.hi + gap {
+                return sa
+            }
+            if sa.range.lo > sb.range.hi + gap {
+                return sb
+            }
+        }
+        let u = slope_min(sa, sb)
+        let s = slope_abs(slope_sub_half(sa, sb))
+        let cut = slope_min(slope_shift(slope_neg(s), 0.5 * self.gap), slope_shift(u, self.depth))
+        slope_max(u, cut)
+    }
+
     fn interval_near(self, b: Box3) -> Interval {
         stepped_near(self, b)
     }
@@ -598,6 +890,69 @@ impl<S: Shaped> Folded<S> {
 }
 
 impl<S: Shaped> Surface for Folded<S> {
+    const HAS_SLOPE_BOX: bool = S::HAS_SLOPE_BOX
+
+    fn slope_box(self, over: Box3, at: vec3, rad: vec3, live: Live, first: u32) -> SlopeBox {
+        let la = self.fold(at)
+        let fx = self.across.x > 0.5
+        let fy = self.across.y > 0.5
+        let fz = self.across.z > 0.5
+        let lo = at - rad
+        let hi = at + rad
+        let lox = if fx {
+            if lo.x <= 0.0 && hi.x >= 0.0 { 0.0 } else { min(abs(lo.x), abs(hi.x)) }
+        } else { lo.x }
+        let hix = if fx { max(abs(lo.x), abs(hi.x)) } else { hi.x }
+        let loy = if fy {
+            if lo.y <= 0.0 && hi.y >= 0.0 { 0.0 } else { min(abs(lo.y), abs(hi.y)) }
+        } else { lo.y }
+        let hiy = if fy { max(abs(lo.y), abs(hi.y)) } else { hi.y }
+        let loz = if fz {
+            if lo.z <= 0.0 && hi.z >= 0.0 { 0.0 } else { min(abs(lo.z), abs(hi.z)) }
+        } else { lo.z }
+        let hiz = if fz { max(abs(lo.z), abs(hi.z)) } else { hi.z }
+        let lover = Box3 { lo: vec3(lox, loy, loz), hi: vec3(hix, hiy, hiz) }
+        let lrad = max(abs(lover.lo - la), abs(lover.hi - la))
+        let sp = self.part.slope_box(lover, la, lrad, live, first)
+        let gx = if !fx || lo.x >= 0.0 {
+            sp.g_mid.x
+        } else if hi.x <= 0.0 {
+            -sp.g_mid.x
+        } else { 0.0 }
+        let rx = if !fx || lo.x >= 0.0 || hi.x <= 0.0 {
+            sp.g_rad.x
+        } else {
+            abs(sp.g_mid.x) + sp.g_rad.x
+        }
+        let gy = if !fy || lo.y >= 0.0 {
+            sp.g_mid.y
+        } else if hi.y <= 0.0 {
+            -sp.g_mid.y
+        } else { 0.0 }
+        let ry = if !fy || lo.y >= 0.0 || hi.y <= 0.0 {
+            sp.g_rad.y
+        } else {
+            abs(sp.g_mid.y) + sp.g_rad.y
+        }
+        let gz = if !fz || lo.z >= 0.0 {
+            sp.g_mid.z
+        } else if hi.z <= 0.0 {
+            -sp.g_mid.z
+        } else { 0.0 }
+        let rz = if !fz || lo.z >= 0.0 || hi.z <= 0.0 {
+            sp.g_rad.z
+        } else {
+            abs(sp.g_mid.z) + sp.g_rad.z
+        }
+        SlopeBox {
+            d_at: sp.d_at,
+            g_mid: vec3(gx, gy, gz),
+            g_rad: vec3(rx, ry, rz),
+            err: sp.err,
+            range: sp.range,
+        }
+    }
+
     fn interval_near(self, b: Box3) -> Interval {
         stepped_near(self, b)
     }
@@ -740,6 +1095,32 @@ impl<S: Shaped> Placed<S> {
 }
 
 impl<S: Shaped> Surface for Placed<S> {
+    const HAS_SLOPE_BOX: bool = S::HAS_SLOPE_BOX
+
+    fn slope_box(self, over: Box3, at: vec3, rad: vec3, live: Live, first: u32) -> SlopeBox {
+        let ax = self.axes
+        let la = self.local(at)
+        let w = vec3(dot(abs(ax.x), rad), dot(abs(ax.y), rad), dot(abs(ax.z), rad))
+        let reach = abs(at) + abs(self.at) + rad
+        let size = vec3(dot(abs(ax.x), reach), dot(abs(ax.y), reach), dot(abs(ax.z), reach))
+        let e = size * 2.0e-6 + vec3(1.0e-30)
+        let lr = w + e
+        let sp = self.part.slope_box(Box3 { lo: la - lr, hi: la + lr }, la, lr, live, first)
+        let gm = ax.x * sp.g_mid.x + ax.y * sp.g_mid.y + ax.z * sp.g_mid.z
+        let g_abs = abs(sp.g_mid) + sp.g_rad
+        let gr_base = abs(ax.x) * sp.g_rad.x + abs(ax.y) * sp.g_rad.y + abs(ax.z) * sp.g_rad.z
+        let gr_rnd = (abs(ax.x) * g_abs.x + abs(ax.y) * g_abs.y + abs(ax.z) * g_abs.z) *
+            (8.0 * SLOPE_EPS) +
+            vec3(4.0 * SLOPE_TINY)
+        SlopeBox {
+            d_at: sp.d_at,
+            g_mid: gm,
+            g_rad: gr_base + gr_rnd,
+            err: sp.err + dot(g_abs, e),
+            range: sp.range,
+        }
+    }
+
     fn interval_near(self, b: Box3) -> Interval {
         stepped_near(self, b)
     }
@@ -829,6 +1210,27 @@ pub fn both<A: Shaped, B: Shaped>(a: A, b: B) -> Both<A, B> {
 }
 
 impl<A: Shaped, B: Shaped> Surface for Both<A, B> {
+    const HAS_SLOPE_BOX: bool = A::HAS_SLOPE_BOX || B::HAS_SLOPE_BOX
+
+    fn slope_box(self, over: Box3, at: vec3, rad: vec3, live: Live, first: u32) -> SlopeBox {
+        let na = self.a.parts()
+        let nb = self.b.parts()
+        let la = live.any(first, na)
+        let lb = live.any(first + na, nb)
+        var sa = slope_lip(d_at: 1.0e30, l: 0.0, rad: vec3(0.0))
+        if la {
+            sa = self.a.slope_box(over, at, rad, live, first)
+        }
+        if !lb {
+            return sa
+        }
+        let sb = self.b.slope_box(over, at, rad, live, first + na)
+        if !la {
+            return sb
+        }
+        slope_min(sa, sb)
+    }
+
     fn interval_near(self, b: Box3) -> Interval {
         stepped_near(self, b)
     }
@@ -940,6 +1342,12 @@ pub fn grown<S: Shaped>(part: S, by: f32) -> Grown<S> {
 }
 
 impl<S: Shaped> Surface for Grown<S> {
+    const HAS_SLOPE_BOX: bool = S::HAS_SLOPE_BOX
+
+    fn slope_box(self, over: Box3, at: vec3, rad: vec3, live: Live, first: u32) -> SlopeBox {
+        slope_shift(self.part.slope_box(over, at, rad, live, first), -self.by)
+    }
+
     fn interval_near(self, b: Box3) -> Interval {
         stepped_near(self, b)
     }
@@ -1041,6 +1449,16 @@ impl<S: Shaped, R: Surface + StateHash + Eq> Sheathed<S, R> {
 }
 
 impl<S: Shaped, R: Surface + StateHash + Eq> Surface for Sheathed<S, R> {
+    const HAS_SLOPE_BOX: bool = S::HAS_SLOPE_BOX || R::HAS_SLOPE_BOX
+
+    fn slope_box(self, over: Box3, at: vec3, rad: vec3, live: Live, first: u32) -> SlopeBox {
+        let sd = self.part.slope_box(over, at, rad, live, first)
+        let sr = self.region.slope_box(over, at, rad, live, first)
+        let half_t = 0.5 * self.thick
+        let shell = slope_shift(slope_abs(slope_shift(sd, -half_t)), -half_t)
+        slope_max(shell, sr)
+    }
+
     fn interval_near(self, b: Box3) -> Interval {
         stepped_near(self, b)
     }

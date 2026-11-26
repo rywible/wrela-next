@@ -15,7 +15,130 @@
 // right of the way it is traced: out of the solid, a bead; a negative one into it, a cove.
 
 use std::cmp::Eq
+use std::derive::Interval
+use std::field::{SLOPE_EPS, SLOPE_TINY}
 use std::hash::StateHash
+
+/// Sound first-order Mean-Value enclosure of a 2D outline/profile distance over a 2D box around
+/// `at` with half-extents `rad`.
+pub struct Slope2: Copy + GpuData {
+    pub g_mid: vec2,
+    pub g_rad: vec2,
+    pub d_at: f32,
+    pub err: f32,
+    pub range: Interval,
+}
+
+/// Exact 2nd-order enclosure of `length(p - o)` in 2D over `[at - rad, at + rad]`, where
+/// `v0 = at - o`. Uses convexity (`length >= r0 + dot(n, d)`) and Pythagoras
+/// (`length <= r0 + s + t² / (2 * (r0 - s_max))`), centering the linear offset by `delta / 2`.
+pub fn norm2_enclose(v0: vec2, rad: vec2) -> (bool, f32, vec2, f32) {
+    let r0 = length(v0)
+    if !(r0 > 1.0e-5) {
+        return (false, r0, vec2(0.0), 0.0)
+    }
+    let n = v0 / r0
+    let s_max = abs(n.x) * rad.x + abs(n.y) * rad.y
+    if !(r0 > s_max + 1.0e-4) {
+        return (false, r0, vec2(0.0), 0.0)
+    }
+    let t_max = abs(n.y) * rad.x + abs(n.x) * rad.y
+    let delta = (t_max * t_max) / (2.0 * (r0 - s_max))
+    let rnd = (r0 + s_max + t_max + delta) * (16.0 * SLOPE_EPS) + 1.0e-6
+    (true, r0 + 0.5 * delta, n, 0.5 * delta + rnd)
+}
+
+fn slope2_lip(d_at: f32, l: f32, r_box: f32) -> Slope2 {
+    let r = l * r_box
+    let err = r + r * 1.0e-5 + abs(d_at) * 1.0e-6 + 1.0e-6
+    Slope2 {
+        g_mid: vec2(0.0),
+        g_rad: vec2(0.0),
+        d_at,
+        err,
+        range: Interval { lo: d_at - err, hi: d_at + err },
+    }
+}
+
+/// Exact first-order Mean-Value enclosure for a single uniquely nearest segment when every point of
+/// the box `[at - rad, at + rad]` projects strictly inside the segment (`inner == true`).
+fn segment_slope_box(
+    at: vec2,
+    rad: vec2,
+    r_box: f32,
+    d_at: f32,
+    a: vec2,
+    b: vec2,
+    bulge: f32,
+    arc: Arc,
+) -> (bool, Slope2) {
+    let c = b - a
+    let l = arc.length
+    if l <= 1.0e-12 {
+        return (false, slope2_lip(d_at, 1.01, r_box))
+    }
+    let right = vec2(c.y, -c.x) / l
+    if arc.radius <= 0.0 {
+        let c_hat = c / l
+        let u_at = dot(at - a, c) / (l * l)
+        let mag = abs(at.x) + abs(at.y) + abs(a.x) + abs(a.y) + l
+        let du = (abs(c_hat.x) * rad.x + abs(c_hat.y) * rad.y) / l +
+            mag * (8.0 * SLOPE_EPS) / l +
+            1.0e-5
+        if u_at - du > 0.0 && u_at + du < 1.0 {
+            var g_mid = right
+            var g_rad = vec2(4.0 * SLOPE_EPS)
+            if bulge != 0.0 {
+                let slope_u = 4.0 * bulge / l
+                let k_mid = slope_u * (1.0 - 2.0 * u_at)
+                let k_rad = abs(slope_u) * (2.0 * du)
+                g_mid = right - c_hat * k_mid
+                g_rad = abs(c_hat) * k_rad + vec2(8.0 * SLOPE_EPS)
+            }
+            let err = (abs(d_at) + r_box + l) * (16.0 * SLOPE_EPS) + 1.0e-6
+            let span = dot(abs(g_mid) + g_rad, rad) + err
+            let rng_m = (abs(d_at) + span) * (10.0 * SLOPE_EPS) + 4.0 * SLOPE_TINY
+            return (
+                true,
+                Slope2 {
+                    g_mid,
+                    g_rad,
+                    d_at,
+                    err,
+                    range: Interval { lo: d_at - (span + rng_m), hi: d_at + (span + rng_m) },
+                },
+            )
+        }
+        return (false, slope2_lip(d_at, 1.01, r_box))
+    }
+    let side = sign(bulge)
+    let v0 = at - arc.centre
+    let (ok_n, r_mid, n_hat, r_err) = norm2_enclose(v0, rad)
+    if ok_n {
+        let r0 = length(v0)
+        let dot_lo = dot(v0, right) * side - (abs(right.x) * rad.x + abs(right.y) * rad.y)
+        let rhs_hi = if arc.open >= 0.0 { (r0 + r_box) * arc.open } else { (r0 - r_box) * arc.open }
+        if dot_lo > rhs_hi + 2.0e-5 * (r0 + r_box + 1.0) {
+            let d_mid = side * (r_mid - arc.radius)
+            let g_mid = n_hat * side
+            let g_rad = vec2(8.0 * SLOPE_EPS)
+            let err = r_err + (abs(d_mid) + arc.radius) * (16.0 * SLOPE_EPS) + 1.0e-6
+            let span = dot(abs(g_mid) + g_rad, rad) + err
+            let rng_m = (abs(d_mid) + span) * (10.0 * SLOPE_EPS) + 4.0 * SLOPE_TINY
+            return (
+                true,
+                Slope2 {
+                    g_mid,
+                    g_rad,
+                    d_at: d_mid,
+                    err,
+                    range: Interval { lo: d_mid - (span + rng_m), hi: d_mid + (span + rng_m) },
+                },
+            )
+        }
+    }
+    (false, slope2_lip(d_at, 1.01, r_box))
+}
 
 /// Where `p` is against one segment of an outline: the square of its distance from the segment,
 /// whether `p` is in the cap between the segment's chord and its arc (which changes which side
@@ -202,6 +325,59 @@ impl<const N: u32> Outline<N> {
         }
         r
     }
+
+    /// Sound first-order Mean-Value enclosure over `[at - rad, at + rad]` in one segment pass.
+    pub fn slope_box(self, at: vec2, rad: vec2) -> Slope2 {
+        let r_box = length(rad) * (1.0 + 4.0 * SLOPE_EPS) + 1.0e-7
+        var s = none()
+        var best1_d = 1.0e30
+        var best2_d = 1.0e30
+        var best_a = self.points[0]
+        var best_b = self.points[0]
+        var best_bulge = 0.0
+        var best_arc = self.arcs[0]
+        for i in 0..N {
+            let j = if i + 1 == N { 0 } else { i + 1 }
+            let a = self.points[i]
+            let b = self.points[j]
+            let bulge = self.bulges[i]
+            let arc = self.arcs[i]
+            let n = segment_of(at, a, b, bulge, arc)
+            s = s.and(n)
+            let d = sqrt(max(n.d2, 0.0))
+            if d < best1_d {
+                best2_d = best1_d
+                best1_d = d
+                best_a = a
+                best_b = b
+                best_bulge = bulge
+                best_arc = arc
+            } else if d < best2_d {
+                best2_d = d
+            }
+        }
+        let d_at = s.distance()
+        let l_max = 1.01
+        if best1_d > l_max * r_box + 1.0e-5 {
+            return slope2_lip(d_at, l_max, r_box)
+        }
+        if best2_d > best1_d + 2.0 * l_max * r_box + 2.0e-5 {
+            let (ok, sb) = segment_slope_box(
+                at,
+                rad,
+                r_box,
+                d_at,
+                best_a,
+                best_b,
+                best_bulge,
+                best_arc,
+            )
+            if ok {
+                return sb
+            }
+        }
+        slope2_lip(d_at, l_max, r_box)
+    }
 }
 
 /// An open profile of `N` points, closed toward minus x: segment `i` runs from point `i` to point
@@ -265,6 +441,80 @@ impl<const N: u32> Profile<N> {
             e = vec3(max(e.x, q.x + bow), min(e.y, q.y - bow), max(e.z, q.y + bow))
         }
         e
+    }
+
+    /// Sound first-order Mean-Value enclosure over `[at - rad, at + rad]` in one segment pass.
+    pub fn slope_box(self, at: vec2, rad: vec2) -> Slope2 {
+        let r_box = length(rad) * (1.0 + 4.0 * SLOPE_EPS) + 1.0e-7
+        var s = none()
+        var best1_d = 1.0e30
+        var best2_d = 1.0e30
+        var best_a = self.points[0]
+        var best_b = self.points[0]
+        var best_bulge = 0.0
+        var best_arc = self.arcs[0]
+        for i in 1..N {
+            let a = self.points[i - 1]
+            let b = self.points[i]
+            let bulge = self.bulges[i - 1]
+            let arc = self.arcs[i - 1]
+            let n = segment_of(at, a, b, bulge, arc)
+            s = s.and(n)
+            let d = sqrt(max(n.d2, 0.0))
+            if d < best1_d {
+                best2_d = best1_d
+                best1_d = d
+                best_a = a
+                best_b = b
+                best_bulge = bulge
+                best_arc = arc
+            } else if d < best2_d {
+                best2_d = d
+            }
+        }
+        let first = self.points[0]
+        let last = self.points[N - 1]
+        let top = vec2(-self.far, last.y)
+        let bottom = vec2(-self.far, first.y)
+        for k in 0..3 {
+            let a = if k == 0 { last } else if k == 1 { top } else { bottom }
+            let b = if k == 0 { top } else if k == 1 { bottom } else { first }
+            let arc = arc_of(a, b, 0.0)
+            let n = segment_of(at, a, b, 0.0, arc)
+            s = s.and(n)
+            let d = sqrt(max(n.d2, 0.0))
+            if d < best1_d {
+                best2_d = best1_d
+                best1_d = d
+                best_a = a
+                best_b = b
+                best_bulge = 0.0
+                best_arc = arc
+            } else if d < best2_d {
+                best2_d = d
+            }
+        }
+        let d_at = s.distance()
+        let l_max = 1.01
+        if best1_d > l_max * r_box + 1.0e-5 {
+            return slope2_lip(d_at, l_max, r_box)
+        }
+        if best2_d > best1_d + 2.0 * l_max * r_box + 2.0e-5 {
+            let (ok, sb) = segment_slope_box(
+                at,
+                rad,
+                r_box,
+                d_at,
+                best_a,
+                best_b,
+                best_bulge,
+                best_arc,
+            )
+            if ok {
+                return sb
+            }
+        }
+        slope2_lip(d_at, l_max, r_box)
     }
 }
 

@@ -18,8 +18,8 @@ use mesh::proof::{
     CellRay, CellRayGrad, FilteredSubstance, clamp_footprint_vec, discard_proven,
     filter_channels, filter_channels_1d, filter_channels_kept_1d, filter_rest_channels,
     pixel_tangent_footprint, prove_box_unseen, prove_opaque_only, prove_point_behind_opaque,
-    prove_transmissive_only, prove_vertex_filtered, ray_box_bracket, seen_part,
-    solve_cell_ray, solve_cell_ray_lipschitz_grad,
+    prove_transmissive_only, prove_vertex_filtered, prove_vis_not_batch, ray_box_bracket,
+    ray_box_bracket_scaled, seen_part, solve_cell_ray, solve_cell_ray_lipschitz_grad,
 }
 use mesh::sdf::{SdfGrid, multi_bounce_ao, sdf_bent_ao, sdf_curvature, sdf_thickness}
 use mesh::tsr::project_uv_unjittered
@@ -29,8 +29,8 @@ use std::derive::value_and_gradient
 use std::field::{DualQuat, Field, FieldFacts, Live, Rigid}
 use std::gpu::{
     ClipPosition, DepthTexture, Flat, FragCoord, GlobalId, InstanceIndex,
-    R16Float, R32Float, Rg32Float, Rgba8, Rgba16Float, Rgba32Float, Sampler, Targets2, Targets3,
-    Targets4, Texels,
+    R16Float, R32Float, Rg32Float, Rg32Uint, Rgba8, Rgba16Float, Rgba32Float, Sampler, Targets2,
+    Targets3, Targets4, Texels,
     Texture, Texture3d, VertexIndex, WithDepthBehind,
 }
 
@@ -870,21 +870,68 @@ pub(package) fn copy_dc_depth(
     out.store(id, depth.load(id.x, id.y))
 }
 
-/// Tier-2 `ExactCell` AABB fragment shader for `One<M>`: checks the Pass-1 DC depth snapshot on
-/// Line 1 (`prove_behind_opaque` skips ~95% of box pixels already covered by DC with zero field
-/// evaluations), intersects the pixel's ray against the exact cell cube `[lo, lo + h]`, runs
-/// `mesh::proof::solve_cell_ray_lipschitz` (`EmptyProof`-gated discard — zero holes, zero extras),
-/// shades analytically at the exact surface hit, and writes conservative `WithDepthBehind` depth.
+/// Transforms a world-space point `wp` back into the extracted frame of similarity transform `xf`.
+fn rigid_inv_point(xf: Rigid, wp: vec3) -> vec3 {
+    if xf.meta.y == 0.0 {
+        return wp
+    }
+    let sc = max(xf.scale_factor(), 1.0e-6)
+    let inv_s2 = 1.0 / (sc * sc)
+    let d = wp - vec3(xf.row0.w, xf.row1.w, xf.row2.w)
+    (xf.row0.xyz * d.x + xf.row1.xyz * d.y + xf.row2.xyz * d.z) * inv_s2
+}
+
+/// Transforms a world-space unit direction `wd` back into the extracted frame of `xf` (unit length).
+fn rigid_inv_dir(xf: Rigid, wd: vec3) -> vec3 {
+    if xf.meta.y == 0.0 {
+        return wd
+    }
+    let inv_s = 1.0 / max(xf.scale_factor(), 1.0e-6)
+    (xf.row0.xyz * wd.x + xf.row1.xyz * wd.y + xf.row2.xyz * wd.z) * inv_s
+}
+
+/// Packs a unit normal into 32 bits as 16+16-bit octahedral coordinates (`< 5e-5` rad error).
+fn pack_oct16_normal(n: vec3) -> u32 {
+    let s = abs(n.x) + abs(n.y) + abs(n.z)
+    var e = if s > 1.0e-12 { n.xy / s } else { vec2(0.0) }
+    if n.z < 0.0 {
+        let sx = if e.x >= 0.0 { 1.0 } else { -1.0 }
+        let sy = if e.y >= 0.0 { 1.0 } else { -1.0 }
+        e = vec2((1.0 - abs(e.y)) * sx, (1.0 - abs(e.x)) * sy)
+    }
+    let qx = u32(clamp(round((e.x * 0.5 + 0.5) * 65535.0), 0.0, 65535.0))
+    let qy = u32(clamp(round((e.y * 0.5 + 0.5) * 65535.0), 0.0, 65535.0))
+    qx | (qy << 16)
+}
+
+/// Unpacks a unit normal encoded by `pack_oct16_normal`.
+fn unpack_oct16_normal(p: u32) -> vec3 {
+    let ex = f32(p & 65535) * (2.0 / 65535.0) - 1.0
+    let ey = f32(p >> 16) * (2.0 / 65535.0) - 1.0
+    var v = vec3(ex, ey, 1.0 - abs(ex) - abs(ey))
+    let t = max(-v.z, 0.0)
+    v.x += if v.x >= 0.0 { -t } else { t }
+    v.y += if v.y >= 0.0 { -t } else { t }
+    normalize_safe(v, vec3(0.0, 1.0, 0.0))
+}
+
+/// Tier-2 `ExactCell` AABB hit-only fragment shader for `One<M>`: checks the Pass-1 DC depth
+/// snapshot on Line 1 (`prove_box_unseen`), intersects the eye ray against `[lo, lo + h]` in the
+/// cell's extracted frame (`xforms[0]` inverse, so rigid movers stay aligned), solves the exact
+/// surface root via `solve_cell_ray_lipschitz_grad`, and writes ONLY 64-bit `(batch_header,
+/// oct16_normal)` + conservative `WithDepthBehind` depth. All material/story evaluation is deferred
+/// to `exact_resolve_one_fs` so overdrawn exact boxes never pay material or register-spill cost.
 @fragment
 @budget(work: 36000)
-pub(package) fn exact_box_one_fs<M: Field<Substance>>(
+pub(package) fn exact_box_hit_fs<M: Field<Substance>>(
     vary: ExactVary,
     field: M,
+    xforms: [Rigid],
     dc_depth: Texture<R32Float>,
+    batch_id: u32,
     v: View,
-    prev_v: View,
     frag: FragCoord,
-) -> WithDepthBehind<Targets4<vec4, vec4, vec4, vec2>> {
+) -> WithDepthBehind<vec2u> {
     let ch = vary.cell_lo_h.value
     let meta = vary.cell_meta.value
     let lo = ch.xyz
@@ -893,7 +940,17 @@ pub(package) fn exact_box_one_fs<M: Field<Substance>>(
     let rel = vary.wp - v.at
     let dist0 = length(rel)
     let d = rel / max(dist0, 1.0e-6)
-    let rb = ray_box_bracket(v.at, d, v.forward, lo, hi)
+    let xf = xforms[0]
+    let sc = if xf.meta.y == 0.0 { 1.0 } else { max(xf.scale_factor(), 1.0e-6) }
+    let rb = ray_box_bracket_scaled(
+        rigid_inv_point(xf, v.at),
+        rigid_inv_dir(xf, d),
+        d,
+        v.forward,
+        lo,
+        hi,
+        sc,
+    )
     let z_dc = dc_depth.load(u32(frag.position.x), u32(frag.position.y))
     let bg_z = if z_dc > 0.0 { NEAR / z_dc } else { 1.0e30 }
     match prove_box_unseen(rb, bg_z) {
@@ -902,19 +959,13 @@ pub(package) fn exact_box_one_fs<M: Field<Substance>>(
     }
     let live = Live { words: meta }
     let px = max(max(rb.t_enter, 0.004) * v.pixel(), 1.0e-6)
-    // Only what is in front of what the mesh drew here, less half a pixel: a surface nearer by
-    // less shows as the mesh within the outline's error, and one past it is hidden.
     let (t0, t1) = seen_part(rb, bg_z, margin: HOLE_PX * px)
     let facts = field.field_facts()
     let lip = if facts.lip > 0.0 && facts.lip < 1.0e12 {
-        min(facts.lip, field.lipschitz(1.7320508 * h))
+        min(facts.lip, field.lipschitz(1.7320508 * h * sc))
     } else {
-        field.lipschitz(1.7320508 * h)
+        field.lipschitz(1.7320508 * h * sc)
     }
-    // When `facts.lip` is statically finite (build-time proven), the compiler constant-folds the
-    // branch and erases `solve_cell_ray`'s 1D affine fallback from the shipped shader completely;
-    // `solve_cell_ray_lipschitz_grad` shares ONE `field.distance_live` call site for march, root
-    // refinement, and tetrahedron normal estimation.
     var t_hit = t0
     var gv = -d
     if facts.lip > 0.0 && facts.lip < 1.0e12 {
@@ -973,7 +1024,61 @@ pub(package) fn exact_box_one_fs<M: Field<Substance>>(
         }
     }
     let hit_p = v.at + d * t_hit
+    if facts.may_transmit {
+        match prove_transmissive_only(field.channels(hit_p)) {
+            Some(proof) => discard_proven(proof),
+            None => {},
+        }
+    }
     let n = normalize_safe(gv, -d)
+    let hdr = 2147483648 | (2 << 29) | ((batch_id & 8191) << 16)
+    WithDepthBehind { color: vec2u(hdr, pack_oct16_normal(n)), depth: depth_of(v, hit_p) }
+}
+
+/// 1× pixel-rate material resolve for winning Tier-2 exact hits written by `exact_box_hit_fs`:
+/// draws ONLY classified 16×16 tiles containing a hit for `batch_id`, reconstructs exact `hit_p`
+/// from reversed-Z `depth` and `n` from `vis.y`, and evaluates procedural materials once per pixel.
+@fragment
+@budget(work: 36000)
+pub(package) fn exact_resolve_one_fs<M: Field<Substance>>(
+    vis: Texture<Rg32Uint>,
+    depth: DepthTexture,
+    xforms: [Rigid],
+    prev_xforms: [Rigid],
+    field: M,
+    batch_id: u32,
+    v: View,
+    prev_v: View,
+    frag: FragCoord,
+) -> Targets4<vec4, vec4, vec4, vec2> {
+    let px = u32(frag.position.x)
+    let py = u32(frag.position.y)
+    let vid = vis.load(px, py)
+    match prove_vis_not_batch(vid.x, batch_id) {
+        Some(proof) => {
+            discard_proven(proof)
+            return Targets4 {
+                first: vec4(0.0),
+                second: vec4(0.0),
+                third: vec4(0.0),
+                fourth: vec2(0.0),
+            }
+        },
+        None => {},
+    }
+    let ndc_z = depth.load(px, py)
+    let ray = v.ray(frag.position.xy)
+    let dist = if ndc_z > 1.0e-6 { reconstruct_pixel_dist(v, ray, ndc_z) } else { 0.0 }
+    let hit_p = v.at + ray * dist
+    let xf = xforms[0]
+    let pxf = prev_xforms[0]
+    let prev_wp = if xf.meta.y == 0.0 && pxf.meta.y == 0.0 {
+        hit_p
+    } else {
+        pxf.apply_point(rigid_inv_point(xf, hit_p))
+    }
+    let n = unpack_oct16_normal(vid.y)
+    let facts = field.field_facts()
     let (fp_x, fp_y) = pixel_tangent_footprint(v, frag.position.xy, hit_p, n)
     let sub0 = if field.uses_kept() {
         let (_, part, kept) = field.kept_at(hit_p)
@@ -981,25 +1086,22 @@ pub(package) fn exact_box_one_fs<M: Field<Substance>>(
     } else {
         filter_channels_1d(field, hit_p, fp_x, fp_y)
     }
-    if facts.may_transmit {
-        match prove_transmissive_only(sub0.substance()) {
-            Some(proof) => discard_proven(proof),
-            None => {},
-        }
-    }
-    let out = shade_gbuf_core(
+    shade_gbuf_exact(
         hit_p,
+        prev_wp,
         hit_p,
-        hit_p,
+        fp_x,
+        fp_y,
+        fp_x,
+        fp_y,
+        n,
         n,
         1.0,
         sub0,
         v,
         prev_v,
         facts,
-        exact_normal: true,
     )
-    WithDepthBehind { color: out, depth: depth_of(v, hit_p) }
 }
 
 /// Lean 1× G-buffer + motion-vector fragment shader for opaque terrain heightfields (`height_vs`).

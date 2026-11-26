@@ -12,11 +12,12 @@ use mesh::light::{Emitter, NEAR, RadGrid, RadianceCache, ShadowView}
 use mesh::sdf::{SdfClipmap, SdfGrid}
 use mesh::sunlight::SunExact
 use mesh::shade::{
-    FAR_TIER_DIST, deformed_mesh_vs, exact_box_one_fs, exact_box_vs, field_gbuf_many_fs,
-    field_refract_refl_many_fs, field_refract_refl_one_fs, field_skin_cut_gbuf_many_fs,
-    field_skin_gbuf_many_fs, field_skin_refract_refl_many_fs, field_skin_refract_refl_one_fs,
-    field_skin_trans_many_fs, field_skin_trans_one_fs, field_trans_many_fs, field_trans_one_fs,
-    mesh_vs, shadow_fs, shadow_vs, skin_mesh_vs, skin_shadow_vs,
+    FAR_TIER_DIST, deformed_mesh_vs, exact_box_hit_fs, exact_box_vs, exact_resolve_one_fs,
+    field_gbuf_many_fs, field_refract_refl_many_fs, field_refract_refl_one_fs,
+    field_skin_cut_gbuf_many_fs, field_skin_gbuf_many_fs, field_skin_refract_refl_many_fs,
+    field_skin_refract_refl_one_fs, field_skin_trans_many_fs, field_skin_trans_one_fs,
+    field_trans_many_fs, field_trans_one_fs, mesh_vs, shadow_fs, shadow_vs, skin_mesh_vs,
+    skin_shadow_vs,
 }
 use mesh::swarm::SwarmSim
 use mesh::visbuf::{
@@ -29,8 +30,9 @@ use std::collections::Vec
 use std::field::{Bound, Field, Rigid}
 use std::gpu::{
     Compare, Cull, Depth, DepthOnlyPass, DepthPass, DepthPass2,
-    DepthPass4, DepthTexture, GpuBuffer, GpuSpan, R16Float, R32Float, Rg16Float, Rg32Uint, Rgba8, Rgba32Float,
-    Rgba16Float, Sampler, Texture, Texture3d, buffer, buffer_of, draw, draw_multi,
+    DepthPass4, DepthTexture, GpuBuffer, GpuSpan, Pass4, R16Float, R32Float, Rg16Float, Rg32Uint,
+    Rgba8, Rgba32Float, Rgba16Float, Sampler, Texture, Texture3d, buffer, buffer_of, draw,
+    draw_multi,
 }
 use std::hash::StateHash
 
@@ -146,6 +148,27 @@ pub trait MeshWorld {
         dc_depth: Texture<R32Float>,
         first: u32,
         pass_idx: u32,
+        v: View,
+        prev_v: View,
+    )
+    fn draw_exact_hit(
+        self,
+        fbufs: Self::FieldBufs,
+        vp: DepthPass<Rg32Uint>,
+        batches: mut Vec<MeshBatch>,
+        cube_indices: GpuBuffer<u32>,
+        dc_depth: Texture<R32Float>,
+        first: u32,
+        v: View,
+    )
+    fn draw_exact_resolve(
+        self,
+        fbufs: Self::FieldBufs,
+        ep: Pass4<Rgba8, Rgba8, Rgba16Float, Rg16Float>,
+        vis: VisState,
+        depth: DepthTexture,
+        batches: mut Vec<MeshBatch>,
+        first: u32,
         v: View,
         prev_v: View,
     )
@@ -490,34 +513,85 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for One<M> {
     fn draw_eye(
         self,
         _fbufs: u32,
-        ep: DepthPass4<Rgba8, Rgba8, Rgba16Float, Rg16Float>,
-        batches: mut Vec<MeshBatch>,
+        _ep: DepthPass4<Rgba8, Rgba8, Rgba16Float, Rg16Float>,
+        _batches: mut Vec<MeshBatch>,
         _cull: mut HiZCuller,
+        _cube_indices: GpuBuffer<u32>,
+        _dc_depth: Texture<R32Float>,
+        _first: u32,
+        _pass_idx: u32,
+        _v: View,
+        _prev_v: View,
+    ) {}
+
+    fn draw_exact_hit(
+        self,
+        _fbufs: u32,
+        vp: DepthPass<Rg32Uint>,
+        batches: mut Vec<MeshBatch>,
         cube_indices: GpuBuffer<u32>,
         dc_depth: Texture<R32Float>,
         first: u32,
-        pass_idx: u32,
         v: View,
-        prev_v: View,
     ) {
-        if pass_idx == 2 && !(Self::MAY_SKIN && batches[first].is_deformed) && batches[first].has_exact {
+        if !(Self::MAY_SKIN && batches[first].is_deformed) && batches[first].has_exact {
             draw(
-                ep,
+                vp,
                 exact_box_vs.bind(
                     cells: batches[first].exact_cells.items(),
                     xforms: batches[first].xforms.items(),
                     v: v,
                 ),
-                exact_box_one_fs.bind(
+                exact_box_hit_fs.bind(
                     field: self.field,
+                    xforms: batches[first].xforms.items(),
                     dc_depth: dc_depth,
+                    batch_id: first,
                     v: v,
-                    prev_v: prev_v,
                 ),
                 indices: cube_indices,
                 indirect: batches[first].exact_draw_args,
                 cull: Cull::None,
                 depth: Depth { compare: Compare::Greater, write: true },
+            )
+        }
+    }
+
+    fn draw_exact_resolve(
+        self,
+        _fbufs: u32,
+        ep: Pass4<Rgba8, Rgba8, Rgba16Float, Rg16Float>,
+        vis: VisState,
+        depth: DepthTexture,
+        batches: mut Vec<MeshBatch>,
+        first: u32,
+        v: View,
+        prev_v: View,
+    ) {
+        if first >= vis.cap_batches {
+            return
+        }
+        if !(Self::MAY_SKIN && batches[first].is_deformed) && batches[first].has_exact {
+            let inv_size = vec2(1.0 / max(v.size.x, 1.0), 1.0 / max(v.size.y, 1.0))
+            draw(
+                ep,
+                vis_tile_vs.bind(
+                    tile_lists: vis.tile_lists.items(),
+                    tile_base: first * vis.max_tiles,
+                    inv_size: inv_size,
+                ),
+                exact_resolve_one_fs.bind(
+                    vis: vis.tex,
+                    depth: depth,
+                    xforms: batches[first].xforms.items(),
+                    prev_xforms: batches[first].prev_xforms.items(),
+                    field: self.field,
+                    batch_id: first,
+                    v: v,
+                    prev_v: prev_v,
+                ),
+                indirect: vis.tile_draws.at(first),
+                cull: Cull::None,
             )
         }
     }
@@ -1327,6 +1401,62 @@ impl<M: Field<Substance> + StateHash + GpuData> MeshWorld for Pool<M> {
         }
     }
 
+    fn draw_exact_hit(
+        self,
+        _fbuf: GpuBuffer<M>,
+        vp: DepthPass<Rg32Uint>,
+        batches: mut Vec<MeshBatch>,
+        cube_indices: GpuBuffer<u32>,
+        dc_depth: Texture<R32Float>,
+        first: u32,
+        v: View,
+    ) {
+        for s in 0..NEAR_SLOTS {
+            let bi = first + POOL_SHARED + s
+            let id = batches[bi].near_id
+            if id < self.fields.len() {
+                one(self.fields[id]).draw_exact_hit(
+                    0,
+                    vp,
+                    mut batches,
+                    cube_indices,
+                    dc_depth,
+                    bi,
+                    v,
+                )
+            }
+        }
+    }
+
+    fn draw_exact_resolve(
+        self,
+        _fbuf: GpuBuffer<M>,
+        ep: Pass4<Rgba8, Rgba8, Rgba16Float, Rg16Float>,
+        vis: VisState,
+        depth: DepthTexture,
+        batches: mut Vec<MeshBatch>,
+        first: u32,
+        v: View,
+        prev_v: View,
+    ) {
+        for s in 0..NEAR_SLOTS {
+            let bi = first + POOL_SHARED + s
+            let id = batches[bi].near_id
+            if id < self.fields.len() {
+                one(self.fields[id]).draw_exact_resolve(
+                    0,
+                    ep,
+                    vis,
+                    depth,
+                    mut batches,
+                    bi,
+                    v,
+                    prev_v,
+                )
+            }
+        }
+    }
+
     fn draw_eye(
         self,
         fbuf: GpuBuffer<M>,
@@ -1949,6 +2079,37 @@ impl<A: MeshWorld, B: MeshWorld> MeshWorld for And<A, B> {
         let na = A::BATCHES
         self.a.trace_sun_exact(mut exact, mut batches, first, cls, depth, v, sun, full_w)
         self.b.trace_sun_exact(mut exact, mut batches, first + na, cls, depth, v, sun, full_w)
+    }
+
+    fn draw_exact_hit(
+        self,
+        fbufs: (A::FieldBufs, B::FieldBufs),
+        vp: DepthPass<Rg32Uint>,
+        batches: mut Vec<MeshBatch>,
+        cube_indices: GpuBuffer<u32>,
+        dc_depth: Texture<R32Float>,
+        first: u32,
+        v: View,
+    ) {
+        let na = A::BATCHES
+        self.a.draw_exact_hit(fbufs.0, vp, mut batches, cube_indices, dc_depth, first, v)
+        self.b.draw_exact_hit(fbufs.1, vp, mut batches, cube_indices, dc_depth, first + na, v)
+    }
+
+    fn draw_exact_resolve(
+        self,
+        fbufs: (A::FieldBufs, B::FieldBufs),
+        ep: Pass4<Rgba8, Rgba8, Rgba16Float, Rg16Float>,
+        vis: VisState,
+        depth: DepthTexture,
+        batches: mut Vec<MeshBatch>,
+        first: u32,
+        v: View,
+        prev_v: View,
+    ) {
+        let na = A::BATCHES
+        self.a.draw_exact_resolve(fbufs.0, ep, vis, depth, mut batches, first, v, prev_v)
+        self.b.draw_exact_resolve(fbufs.1, ep, vis, depth, mut batches, first + na, v, prev_v)
     }
 
     fn draw_eye(

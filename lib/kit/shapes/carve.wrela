@@ -24,7 +24,9 @@ use shapes::outline::along
 use std::cmp::Eq
 use shapes::made::{stepped, stepped_near}
 use std::derive::{Box3, Interval}
-use std::field::{Bound, Live, PartName, Pruned, Surface}
+use std::field::{
+    Bound, Live, PartName, Pruned, SLOPE_EPS, SlopeBox, Surface, slope_lip, slope_max, slope_scale,
+}
 use std::hash::{StateHash, state_hash}
 
 // ---- faces --------------------------------------------------------------------------------------
@@ -42,6 +44,16 @@ pub trait Face: Copy + GpuData + Eq + StateHash {
     /// Whether `p` lies near this face (not on the opposite side of the part), for pixel-rate
     /// detail refinement (`Carved::detail_at`).
     fn near_face(self, p: vec3, ground: f32) -> bool
+    /// Sound upper bound on `-region_distance(local(p).xy, region) / stretch()` over `over` around
+    /// `at` with half-extents `rad`. When `<= part.range.lo`, the carving cannot affect any point
+    /// in `over` and `Carved::slope_box` forwards directly to `self.part`.
+    fn inside_hi(self, over: Box3, at: vec3, rad: vec3, region: vec4) -> f32
+    /// Sound 2D `(s, t)` enclosure `(st_c, st_r)` of `local(p).xy` over `over`, together with
+    /// whether `local(p).z == d` (`DrapedFace`) and a sound lower bound `inside_lo` on
+    /// `-region_distance(local(p).xy, region) / stretch()`.
+    fn draped_st_box(self, at: vec3, rad: vec3, region: vec4) -> (bool, vec2, vec2, f32) {
+        (false, vec2(0.0), vec2(0.0), -1.0e30)
+    }
 }
 
 /// A flat face: its origin, and the directions of s and t across it (unit, square to each
@@ -75,6 +87,11 @@ impl Face for FlatFace {
         let w = dot(p - self.origin, cross(self.s, self.t))
         w <= 0.006 && w >= -(ground + 0.006)
     }
+
+    fn inside_hi(self, over: Box3, at: vec3, rad: vec3, region: vec4) -> f32 {
+        let l = self.local(at, 0.0)
+        -region_distance(l.xy, region) + length(rad) * (1.0 + 4.0 * SLOPE_EPS) + 1.0e-5
+    }
 }
 
 /// The face of a part turned about its y axis, unrolled: s round it (the angle from +z toward +x
@@ -106,6 +123,17 @@ impl Face for RoundFace {
 
     fn near_face(self, p: vec3, ground: f32) -> bool {
         true
+    }
+
+    fn inside_hi(self, over: Box3, at: vec3, rad: vec3, region: vec4) -> f32 {
+        let t_lo = over.lo.y - self.base
+        let t_hi = over.hi.y - self.base
+        let dy_out = max(max(region.y - t_hi, t_lo - region.w), 0.0)
+        if dy_out > 0.0 {
+            -dy_out / self.stretch() + 1.0e-5
+        } else {
+            1.0e30
+        }
     }
 }
 
@@ -141,6 +169,22 @@ impl Face for DrapedFace {
         let w = dot(p - self.origin, cross(self.s, self.t))
         abs(w) <= ground + 0.012
     }
+
+    fn inside_hi(self, over: Box3, at: vec3, rad: vec3, region: vec4) -> f32 {
+        let l = self.local(at, 0.0)
+        -region_distance(l.xy, region) + length(rad) * (1.0 + 4.0 * SLOPE_EPS) + 1.0e-5
+    }
+
+    fn draped_st_box(self, at: vec3, rad: vec3, region: vec4) -> (bool, vec2, vec2, f32) {
+        let v = at - self.origin
+        let st_c = vec2(dot(v, self.s), dot(v, self.t))
+        let st_r = vec2(dot(abs(self.s), rad), dot(abs(self.t), rad)) * (1.0 + 4.0 * SLOPE_EPS) +
+            vec2(1.0e-6)
+        let inside_lo = -region_distance(st_c, region) -
+            length(rad) * (1.0 + 4.0 * SLOPE_EPS) -
+            1.0e-5
+        (true, st_c, st_r, inside_lo)
+    }
 }
 
 // ---- motifs -------------------------------------------------------------------------------------
@@ -151,6 +195,10 @@ pub trait Motif: Copy + GpuData + Eq + StateHash {
     fn height(self, st: vec2) -> f32
     /// A bound on the length of `height`'s gradient, from its own numbers.
     fn slope(self) -> f32
+    /// Whether `self.height(st)` is provably identically `0.0` everywhere in `[st_c - st_r, st_c + st_r]`.
+    fn is_zero_in(self, st_c: vec2, st_r: vec2) -> bool {
+        false
+    }
 }
 
 /// A lens-shaped lobe along a spine from `a` to `b` bowed `bend` (m, to the right going from `a`
@@ -359,6 +407,21 @@ impl<const G: u32> Motif for Cuts<G> {
         }
         g
     }
+
+    fn is_zero_in(self, st_c: vec2, st_r: vec2) -> bool {
+        let r_box = length(st_r) * (1.0 + 4.0 * SLOPE_EPS) + 1.0e-5
+        for i in 0..G {
+            let gr = self.grooves[i]
+            let c = gr.b - gr.a
+            let l2 = max(dot(c, c), 1.0e-20)
+            let k = clamp(dot(st_c - gr.a, c) / l2, 0.0, 1.0)
+            let d_seg = length(st_c - gr.a - c * k)
+            if d_seg <= r_box + gr.tool + abs(gr.bend) + 1.0e-5 {
+                return false
+            }
+        }
+        true
+    }
 }
 
 // ---- carved -------------------------------------------------------------------------------------
@@ -439,6 +502,46 @@ impl<S: Shaped, F: Face, M: Motif> Carved<S, F, M> {
 }
 
 impl<S: Shaped, F: Face, M: Motif> Surface for Carved<S, F, M> {
+    const HAS_SLOPE_BOX: bool = S::HAS_SLOPE_BOX
+
+    fn slope_box(self, over: Box3, at: vec3, rad: vec3, live: Live, first: u32) -> SlopeBox {
+        let sp = self.part.slope_box(over, at, rad, live, first)
+        if self.face.inside_hi(over, at, rad, self.region) <= sp.range.lo {
+            return sp
+        }
+        if self.ground == 0.0 && self.tooling.y <= 0.0 {
+            let (is_draped, st_c, st_r, inside_lo) = self.face.draped_st_box(at, rad, self.region)
+            if is_draped && self.motif.is_zero_in(st_c, st_r) {
+                if sp.range.lo >= 0.0 {
+                    return sp
+                }
+                let sp_s = slope_scale(sp, 1.0 / self.steep)
+                if inside_lo >= sp_s.range.hi {
+                    if sp.range.hi <= 0.0 {
+                        return sp_s
+                    }
+                    return slope_max(sp, sp_s)
+                }
+            }
+        }
+        let l = self.face.local(at, sp.d_at)
+        let inside = -region_distance(l.xy, self.region) / self.face.stretch()
+        let d_est = if inside <= sp.d_at {
+            sp.d_at
+        } else {
+            max(sp.d_at, min(inside, (l.z - self.surface_at(l.xy)) / self.steep))
+        }
+        let sb = slope_lip(d_at: d_est, l: self.lipschitz(1.0e30), rad: rad)
+        let err = sb.err + sp.err
+        SlopeBox {
+            d_at: d_est,
+            g_mid: vec3(0.0),
+            g_rad: vec3(0.0),
+            err,
+            range: Interval { lo: max(d_est - err, sp.range.lo), hi: d_est + err },
+        }
+    }
+
     fn interval_near(self, b: Box3) -> Interval {
         stepped_near(self, b)
     }

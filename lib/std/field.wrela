@@ -16,8 +16,8 @@
 
 use std::collections::Vec
 use std::derive::{
-    Box3, Interval, affine, filtered, gradient, interval, plus_work, reads_only_input, tape,
-    value_and_gradient, work,
+    Affine3, Box3, Interval, affine, filtered, gradient, interval, plus_work, reads_only_input,
+    tape, value_and_gradient, work,
 }
 use std::stage::Tape
 use std::quat::Quat
@@ -45,6 +45,10 @@ pub trait Surface: Copy + GpuData {
     /// no skinned or deformed draw's pipeline. A kind that overrides `skin_shape_hash` says true;
     /// `engine::mesh` stops a skinned field whose kind says false.
     const MAY_SKIN: bool = false
+
+    /// Whether this surface provides a compositional first-order `slope_box` enclosure for sheet
+    /// certification and thin-cell filtering without expanding a monolithic `affine_form`.
+    const HAS_SLOPE_BOX: bool = false
 
     /// The signed distance from `p` to the surface.
     fn distance(self, p: vec3) -> f32
@@ -312,6 +316,37 @@ pub trait Surface: Copy + GpuData {
         let r = l * stretch * 0.5 * length(over.hi - over.lo)
         let e = r * 1.0e-5 + abs(d) * 1.0e-6 + 1.0e-6
         Pruned { live, range: Interval { lo: max(x.lo, d - r - e), hi: min(x.hi, d + r + e) } }
+    }
+
+    /// Sound first-order Mean-Value enclosure of `self.masked(p, live, first)` over `over` around
+    /// `at ∈ over` with half-extents `rad >= max(|over.lo - at|, |over.hi - at|)`. Defaults to the
+    /// 0th-order Lipschitz ball from `lipschitz(1e30)`.
+    fn slope_box(self, over: Box3, at: vec3, rad: vec3, live: Live, first: u32) -> SlopeBox {
+        let l = self.lipschitz(1.0e30)
+        let d = self.masked(at, live, first)
+        if l < 1.0e30 {
+            slope_lip(d, l, rad)
+        } else {
+            SlopeBox {
+                d_at: d,
+                g_mid: vec3(0.0),
+                g_rad: vec3(0.0),
+                err: 1.0e20,
+                range: Interval { lo: -1.0e20, hi: 1.0e20 },
+            }
+        }
+    }
+
+    /// Converts `slope_box` over `over` into a sound `Affine3` matching `std::derive::affine_form`.
+    fn slope_affine(self, over: Box3, live: Live) -> Affine3 {
+        let hl = 0.5 * over.lo
+        let hh = 0.5 * over.hi
+        let c_b = hl + hh
+        let h_in = (hh - hl) * (1.0 + 2.0 * SLOPE_EPS)
+        let delta_c = abs(c_b) * (2.0 * SLOPE_EPS) + vec3(2.0 * SLOPE_TINY)
+        let rad = h_in + delta_c
+        let sb = self.slope_box(over, c_b, rad, live, 0)
+        slope_to_affine(sb, over)
     }
     /// A rigid similarity transform `(R * s, t)` mapping this surface's local frame into world
     /// space when the surface is built from outer rigid `translate` / `rotate` / `scale` warps.
@@ -1118,6 +1153,192 @@ fn span_bits(first: u32, count: u32, w: u32) -> u32 {
 pub struct Pruned: Copy + GpuData {
     pub live: Live,
     pub range: Interval,
+}
+
+/// One f32 ulp at 1 (`2^-23`) and smallest positive normal f32 for outward rounding of `SlopeBox`.
+pub const SLOPE_EPS: f32 = 1.0 / 8388608.0
+pub const SLOPE_TINY: f32 = 1.2e-38
+
+/// Sound first-order Mean-Value enclosure of a surface over box `over` around `at ∈ over`:
+/// for every `p ∈ over`:
+///   1. `range.lo <= f(p) <= range.hi`
+///   2. `|f(p) - (d_at + dot(g_mid, p - at))| <= dot(g_rad, abs(p - at)) + err`
+pub struct SlopeBox: Copy + GpuData {
+    pub d_at: f32,
+    pub g_mid: vec3,
+    pub g_rad: vec3,
+    pub err: f32,
+    pub range: Interval,
+}
+
+/// 0th-order Lipschitz ball enclosure around `at` with half-extents `rad`.
+pub fn slope_lip(d_at: f32, l: f32, rad: vec3) -> SlopeBox {
+    let r = l * length(rad)
+    let e = r * 1.0e-5 + abs(d_at) * 1.0e-6 + 1.0e-6
+    let err = r + e
+    SlopeBox {
+        d_at,
+        g_mid: vec3(0.0),
+        g_rad: vec3(0.0),
+        err,
+        range: Interval { lo: d_at - err, hi: d_at + err },
+    }
+}
+
+/// Builds a `SlopeBox` from `(d_at, g_mid, g_rad, err)` and derives its sound `range` over `rad`.
+pub fn slope_from_g(d_at: f32, g_mid: vec3, g_rad: vec3, err: f32, rad: vec3) -> SlopeBox {
+    let g_max = abs(g_mid) + g_rad
+    let span = dot(g_max, rad) + err
+    let mag = abs(d_at) + span
+    let margin = mag * (10.0 * SLOPE_EPS) + 4.0 * SLOPE_TINY
+    SlopeBox {
+        d_at,
+        g_mid,
+        g_rad,
+        err,
+        range: Interval { lo: d_at - (span + margin), hi: d_at + (span + margin) },
+    }
+}
+
+/// Converts a `SlopeBox` (evaluated at `c_b = 0.5 * over.lo + 0.5 * over.hi`) into a sound `Affine3`
+/// over `over` matching `std::derive::affine_form`'s input box convention.
+pub fn slope_to_affine(sb: SlopeBox, over: Box3) -> Affine3 {
+    let hl = 0.5 * over.lo
+    let hh = 0.5 * over.hi
+    let c_b = hl + hh
+    let h_in = (hh - hl) * (1.0 + 2.0 * SLOPE_EPS)
+    let delta_c = abs(c_b) * (2.0 * SLOPE_EPS) + vec3(2.0 * SLOPE_TINY)
+    let g_max = abs(sb.g_mid) + sb.g_rad
+    let e_base = dot(sb.g_rad, h_in) + sb.err + dot(g_max, delta_c)
+    let mag = abs(sb.d_at) + dot(g_max, h_in) + e_base
+    let margin = mag * (16.0 * SLOPE_EPS) + 8.0 * SLOPE_TINY
+    let af = Affine3 { c: sb.d_at, l: sb.g_mid * h_in, e: e_base + margin }
+    if (sb.range.lo > 0.0 && af.lo() <= 0.0) || (sb.range.hi < 0.0 && af.hi() >= 0.0) {
+        let rmid = 0.5 * (sb.range.lo + sb.range.hi)
+        let rhalf = 0.5 * (sb.range.hi - sb.range.lo)
+        let rmag = abs(rmid) + rhalf
+        return Affine3 {
+            c: rmid,
+            l: vec3(0.0),
+            e: rhalf + rmag * (8.0 * SLOPE_EPS) + 4.0 * SLOPE_TINY,
+        }
+    }
+    af
+}
+
+/// Componentwise hull of two gradient boxes `[a.g_mid ± a.g_rad]` and `[b.g_mid ± b.g_rad]`.
+pub fn slope_hull_g(a: SlopeBox, b: SlopeBox) -> (vec3, vec3) {
+    let lo = min(a.g_mid - a.g_rad, b.g_mid - b.g_rad)
+    let hi = max(a.g_mid + a.g_rad, b.g_mid + b.g_rad)
+    let g_mid = 0.5 * (lo + hi)
+    let g_rad = 0.5 * (hi - lo) + (abs(lo) + abs(hi)) * (4.0 * SLOPE_EPS) + vec3(2.0 * SLOPE_TINY)
+    (g_mid, g_rad)
+}
+
+/// Sound `SlopeBox` of `min(a(p), b(p))` (prunes to the nearer operand when ranges separate).
+pub fn slope_min(a: SlopeBox, b: SlopeBox) -> SlopeBox {
+    if a.range.hi <= b.range.lo {
+        return a
+    }
+    if b.range.hi <= a.range.lo {
+        return b
+    }
+    let (g_mid, g_rad) = slope_hull_g(a, b)
+    let err = max(a.err, b.err) + (abs(a.d_at) + abs(b.d_at)) * (4.0 * SLOPE_EPS) + 2.0 * SLOPE_TINY
+    SlopeBox {
+        d_at: min(a.d_at, b.d_at),
+        g_mid,
+        g_rad,
+        err,
+        range: Interval { lo: min(a.range.lo, b.range.lo), hi: min(a.range.hi, b.range.hi) },
+    }
+}
+
+/// Sound `SlopeBox` of `max(a(p), b(p))` (prunes to the farther operand when ranges separate).
+pub fn slope_max(a: SlopeBox, b: SlopeBox) -> SlopeBox {
+    if a.range.lo >= b.range.hi {
+        return a
+    }
+    if b.range.lo >= a.range.hi {
+        return b
+    }
+    let (g_mid, g_rad) = slope_hull_g(a, b)
+    let err = max(a.err, b.err) + (abs(a.d_at) + abs(b.d_at)) * (4.0 * SLOPE_EPS) + 2.0 * SLOPE_TINY
+    SlopeBox {
+        d_at: max(a.d_at, b.d_at),
+        g_mid,
+        g_rad,
+        err,
+        range: Interval { lo: max(a.range.lo, b.range.lo), hi: max(a.range.hi, b.range.hi) },
+    }
+}
+
+/// Sound `SlopeBox` of `-a(p)`.
+pub fn slope_neg(a: SlopeBox) -> SlopeBox {
+    SlopeBox {
+        d_at: -a.d_at,
+        g_mid: -a.g_mid,
+        g_rad: a.g_rad,
+        err: a.err,
+        range: Interval { lo: -a.range.hi, hi: -a.range.lo },
+    }
+}
+
+/// Sound `SlopeBox` of `s * a(p)` for non-negative constant `s >= 0`.
+pub fn slope_scale(a: SlopeBox, s: f32) -> SlopeBox {
+    let k = max(s, 0.0)
+    let d_at = a.d_at * k
+    let g_mid = a.g_mid * k
+    let g_rad = a.g_rad * k + (abs(g_mid) + a.g_rad * k) * (4.0 * SLOPE_EPS) + vec3(2.0 * SLOPE_TINY)
+    let err = a.err * k + (abs(d_at) + a.err * k) * (4.0 * SLOPE_EPS) + 2.0 * SLOPE_TINY
+    let rl = a.range.lo * k
+    let rh = a.range.hi * k
+    let re = (abs(rl) + abs(rh)) * (4.0 * SLOPE_EPS) + 2.0 * SLOPE_TINY
+    SlopeBox { d_at, g_mid, g_rad, err, range: Interval { lo: rl - re, hi: rh + re } }
+}
+
+/// Sound `SlopeBox` of `a(p) + by`.
+pub fn slope_shift(a: SlopeBox, by: f32) -> SlopeBox {
+    let e = (abs(a.d_at) + abs(by)) * (2.0 * SLOPE_EPS) + SLOPE_TINY
+    let rl = a.range.lo + by
+    let rh = a.range.hi + by
+    let re = (abs(a.range.lo) + abs(a.range.hi) + abs(by)) * (2.0 * SLOPE_EPS) + SLOPE_TINY
+    SlopeBox {
+        d_at: a.d_at + by,
+        g_mid: a.g_mid,
+        g_rad: a.g_rad,
+        err: a.err + e,
+        range: Interval { lo: rl - re, hi: rh + re },
+    }
+}
+
+/// Sound `SlopeBox` of `abs(a(p))`.
+pub fn slope_abs(a: SlopeBox) -> SlopeBox {
+    if a.range.lo >= 0.0 {
+        return a
+    }
+    if a.range.hi <= 0.0 {
+        return slope_neg(a)
+    }
+    slope_max(a, slope_neg(a))
+}
+
+/// Sound `SlopeBox` of `0.5 * (a(p) - b(p))`.
+pub fn slope_sub_half(a: SlopeBox, b: SlopeBox) -> SlopeBox {
+    let d_at = 0.5 * (a.d_at - b.d_at)
+    let g_mid = 0.5 * (a.g_mid - b.g_mid)
+    let g_rad = 0.5 * (a.g_rad + b.g_rad) +
+        (abs(a.g_mid) + abs(b.g_mid) + a.g_rad + b.g_rad) * (4.0 * SLOPE_EPS) +
+        vec3(2.0 * SLOPE_TINY)
+    let err = 0.5 * (a.err + b.err) +
+        (abs(a.d_at) + abs(b.d_at) + a.err + b.err) * (4.0 * SLOPE_EPS) +
+        2.0 * SLOPE_TINY
+    let lo = 0.5 * (a.range.lo - b.range.hi)
+    let hi = 0.5 * (a.range.hi - b.range.lo)
+    let re = (abs(a.range.lo) + abs(a.range.hi) + abs(b.range.lo) + abs(b.range.hi)) *
+        (4.0 * SLOPE_EPS) +
+        2.0 * SLOPE_TINY
+    SlopeBox { d_at, g_mid, g_rad, err, range: Interval { lo: lo - re, hi: hi + re } }
 }
 
 /// Whether `a - b >= k` for every computed `a >= lo` and `b <= hi`, as the target subtracts
@@ -2287,6 +2508,27 @@ pub struct Union<A, B>: Copy + GpuData + Eq + StateHash {
 }
 
 impl<A: Surface, B: Surface> Surface for Union<A, B> {
+    const HAS_SLOPE_BOX: bool = A::HAS_SLOPE_BOX && B::HAS_SLOPE_BOX
+
+    fn slope_box(self, over: Box3, at: vec3, rad: vec3, live: Live, first: u32) -> SlopeBox {
+        let na = self.a.parts()
+        let nb = self.b.parts()
+        let la = live.any(first, na)
+        let lb = live.any(first + na, nb)
+        var sa = slope_lip(d_at: 1.0e30, l: 0.0, rad: vec3(0.0))
+        if la {
+            sa = self.a.slope_box(over, at, rad, live, first)
+        }
+        if !lb {
+            return sa
+        }
+        let sb = self.b.slope_box(over, at, rad, live, first + na)
+        if !la {
+            return sb
+        }
+        slope_min(sa, sb)
+    }
+
     fn part_state(self, i: u32, h: mut Hasher) -> bool {
         
         pair_part_state(self.a, self.b, i, mut h)
@@ -2992,6 +3234,19 @@ pub trait PointMap: Copy + GpuData {
     fn rigid(self) -> Option<Rigid> {
         None
     }
+
+    /// Maps `(over, at, rad)` into this map's local space for `Surface::slope_box`.
+    fn slope_in(self, over: Box3, at: vec3, rad: vec3) -> (Box3, vec3, vec3) {
+        let b = self.box_in(over)
+        let la = self.local(at)
+        let lr = max(abs(b.lo - la), abs(b.hi - la))
+        (b, la, lr)
+    }
+
+    /// Maps an inner surface's `SlopeBox` back into world space.
+    fn slope_out(self, sb: SlopeBox, at: vec3, rad: vec3) -> SlopeBox {
+        sb
+    }
 }
 
 /// A surface whose points are moved before it's asked about them: `s.translate(by)`,
@@ -3003,6 +3258,13 @@ pub struct Warp<S, M>: Copy + GpuData + Eq + StateHash {
 
 impl<S: Surface, M: PointMap> Surface for Warp<S, M> {
     const MAY_SKIN: bool = S::MAY_SKIN
+    const HAS_SLOPE_BOX: bool = S::HAS_SLOPE_BOX
+
+    fn slope_box(self, over: Box3, at: vec3, rad: vec3, live: Live, first: u32) -> SlopeBox {
+        let (lo_box, la, lr) = self.map.slope_in(over, at, rad)
+        let sb = self.inner.slope_box(lo_box, la, lr, live, first)
+        self.map.slope_out(sb, at, rad)
+    }
 
     fn part_state(self, i: u32, h: mut Hasher) -> bool {
         self.map.map_state(mut h) && self.inner.part_state(i, mut h)
@@ -3189,6 +3451,19 @@ impl PointMap for Shift {
     fn rigid(self) -> Option<Rigid> {
         Some(Rigid::translation(self.by))
     }
+
+    fn slope_in(self, over: Box3, at: vec3, rad: vec3) -> (Box3, vec3, vec3) {
+        let la = at - self.by
+        let e = (abs(at) + abs(self.by) + rad) * (4.0 * SLOPE_EPS) + vec3(2.0 * SLOPE_TINY)
+        let lr = rad + e
+        (Box3 { lo: la - lr, hi: la + lr }, la, lr)
+    }
+
+    fn slope_out(self, sb: SlopeBox, at: vec3, rad: vec3) -> SlopeBox {
+        let e = (abs(at) + abs(self.by) + rad) * (4.0 * SLOPE_EPS) + vec3(2.0 * SLOPE_TINY)
+        let g_abs = abs(sb.g_mid) + sb.g_rad
+        SlopeBox { err: sb.err + dot(g_abs, e), ..sb }
+    }
 }
 
 /// Turned about the origin: `to_local` takes a point into the surface's own space.
@@ -3232,6 +3507,33 @@ impl PointMap for Turn {
 
     fn rigid(self) -> Option<Rigid> {
         Some(Rigid::rotation(self.to_local))
+    }
+
+    fn slope_in(self, over: Box3, at: vec3, rad: vec3) -> (Box3, vec3, vec3) {
+        let m = self.to_local
+        let la = self.local(at)
+        let w = abs(m[0]) * rad.x + abs(m[1]) * rad.y + abs(m[2]) * rad.z
+        let size = abs(m[0]) * (abs(at.x) + rad.x) +
+            abs(m[1]) * (abs(at.y) + rad.y) +
+            abs(m[2]) * (abs(at.z) + rad.z)
+        let e = size * 2.0e-6 + vec3(1.0e-30)
+        let lr = w + e
+        (Box3 { lo: la - lr, hi: la + lr }, la, lr)
+    }
+
+    fn slope_out(self, sb: SlopeBox, at: vec3, rad: vec3) -> SlopeBox {
+        let m = self.to_local
+        let gm = vec3(dot(m[0], sb.g_mid), dot(m[1], sb.g_mid), dot(m[2], sb.g_mid))
+        let g_abs = abs(sb.g_mid) + sb.g_rad
+        let gr_base = vec3(dot(abs(m[0]), sb.g_rad), dot(abs(m[1]), sb.g_rad), dot(abs(m[2]), sb.g_rad))
+        let gr_rnd = vec3(dot(abs(m[0]), g_abs), dot(abs(m[1]), g_abs), dot(abs(m[2]), g_abs)) *
+            (8.0 * SLOPE_EPS) +
+            vec3(4.0 * SLOPE_TINY)
+        let size = abs(m[0]) * (abs(at.x) + rad.x) +
+            abs(m[1]) * (abs(at.y) + rad.y) +
+            abs(m[2]) * (abs(at.z) + rad.z)
+        let err = sb.err + dot(g_abs, size * 2.0e-6 + vec3(1.0e-30))
+        SlopeBox { d_at: sb.d_at, g_mid: gm, g_rad: gr_base + gr_rnd, err, range: sb.range }
     }
 }
 
@@ -3281,6 +3583,35 @@ impl PointMap for Size {
             Some(Rigid::uniform_scale(self.by))
         } else {
             None
+        }
+    }
+
+    fn slope_in(self, over: Box3, at: vec3, rad: vec3) -> (Box3, vec3, vec3) {
+        let s = abs(self.by)
+        let la = at / self.by
+        let e = (abs(la) + rad / s) * (4.0 * SLOPE_EPS) + vec3(2.0 * SLOPE_TINY)
+        let lr = rad / s + e
+        (Box3 { lo: la - lr, hi: la + lr }, la, lr)
+    }
+
+    fn slope_out(self, sb: SlopeBox, at: vec3, rad: vec3) -> SlopeBox {
+        let s = abs(self.by)
+        let sg = if self.by >= 0.0 { 1.0 } else { -1.0 }
+        let g_abs = abs(sb.g_mid) + sb.g_rad
+        let e = (abs(at / self.by) + rad / s) * (4.0 * SLOPE_EPS) + vec3(2.0 * SLOPE_TINY)
+        let err = sb.err * s +
+            dot(g_abs, e) * s +
+            (abs(sb.d_at) + sb.err) * s * (4.0 * SLOPE_EPS) +
+            2.0 * SLOPE_TINY
+        let rl = sb.range.lo * s
+        let rh = sb.range.hi * s
+        let re = (abs(rl) + abs(rh)) * (4.0 * SLOPE_EPS) + 2.0 * SLOPE_TINY
+        SlopeBox {
+            d_at: sb.d_at * s,
+            g_mid: sb.g_mid * sg,
+            g_rad: sb.g_rad + g_abs * (4.0 * SLOPE_EPS) + vec3(2.0 * SLOPE_TINY),
+            err,
+            range: Interval { lo: rl - re, hi: rh + re },
         }
     }
 }
@@ -3661,6 +3992,12 @@ pub struct Named<S>: Copy + GpuData + Eq + StateHash {
 }
 
 impl<S: Surface> Surface for Named<S> {
+    const HAS_SLOPE_BOX: bool = S::HAS_SLOPE_BOX
+
+    fn slope_box(self, over: Box3, at: vec3, rad: vec3, live: Live, first: u32) -> SlopeBox {
+        self.inner.slope_box(over, at, rad, live, first)
+    }
+
     fn part_state(self, i: u32, h: mut Hasher) -> bool {
         self.inner.part_state(i, mut h)
     }
@@ -4423,6 +4760,11 @@ pub struct With<S, C>: Copy + GpuData + Eq + StateHash {
 
 impl<S: Surface, C: Copy + GpuData> Surface for With<S, C> {
     const MAY_SKIN: bool = S::MAY_SKIN
+    const HAS_SLOPE_BOX: bool = S::HAS_SLOPE_BOX
+
+    fn slope_box(self, over: Box3, at: vec3, rad: vec3, live: Live, first: u32) -> SlopeBox {
+        self.inner.slope_box(over, at, rad, live, first)
+    }
 
     /// The material isn't hashed: where only it changes, every part's state is the same and
     /// the whole field's hash, which moved, rebuilds the batch.
@@ -4571,6 +4913,11 @@ pub struct WithAt<S, F>: Copy + GpuData + Eq + StateHash {
 
 impl<S: Surface, F: Copy + GpuData> Surface for WithAt<S, F> {
     const MAY_SKIN: bool = S::MAY_SKIN
+    const HAS_SLOPE_BOX: bool = S::HAS_SLOPE_BOX
+
+    fn slope_box(self, over: Box3, at: vec3, rad: vec3, live: Live, first: u32) -> SlopeBox {
+        self.inner.slope_box(over, at, rad, live, first)
+    }
 
     fn distance(self, p: vec3) -> f32 {
         self.inner.distance(p)
