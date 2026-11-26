@@ -347,6 +347,56 @@ def new_session(run, args):
 # ---- the job in the session -------------------------------------------------------------------
 
 
+# A file larger than this goes up in parts: one upload of 335 MB lost its connection each time
+# (2026-11-25, 20:45, SSL EOF), and parts of this size go up whole.
+PART = 32 * 1024 * 1024
+
+
+def upload(run, sname, local, remote):
+    """Uploads `local` to `remote`: in parts of `PART` bytes when larger, each tried again on its
+    own, then joined in the VM and checked against the file's size and SHA-256."""
+    size = os.path.getsize(local)
+    if size <= PART:
+        retry(lambda: colab(["upload", "-s", sname, local, remote], timeout=600), "upload")
+        return
+    import hashlib
+    digest = hashlib.sha256(open(local, "rb").read()).hexdigest()
+    parts_dir = os.path.join(run_dir(run["name"]), "parts")
+    os.makedirs(parts_dir, exist_ok=True)
+    names = []
+    with open(local, "rb") as src:
+        k = 0
+        while True:
+            chunk = src.read(PART)
+            if not chunk:
+                break
+            name = f"{os.path.basename(local)}.part{k:03d}"
+            open(os.path.join(parts_dir, name), "wb").write(chunk)
+            names.append(name)
+            k += 1
+    t0 = now()
+    for name in names:
+        retry(lambda: colab(["upload", "-s", sname, os.path.join(parts_dir, name),
+                             f"{os.path.dirname(remote)}/{name}"], timeout=600),
+              f"upload of {name}")
+        os.remove(os.path.join(parts_dir, name))
+    join = (
+        "import hashlib, os\n"
+        f"parts = {[os.path.dirname(remote) + '/' + n for n in names]!r}\n"
+        f"with open({remote!r}, 'wb') as out:\n"
+        "    for p in parts:\n"
+        "        out.write(open(p, 'rb').read())\n"
+        "        os.remove(p)\n"
+        f"print('JOINED', os.path.getsize({remote!r}), hashlib.sha256(open({remote!r}, 'rb').read()).hexdigest())\n"
+    )
+    out = retry(lambda: colab(["exec", "-s", sname, "--timeout", "120"], timeout=240,
+                              input_text=join), "the join")
+    if f"JOINED {size} {digest}" not in (out or ""):
+        raise ColabError(f"{os.path.basename(local)} joined wrong: {(out or '')[-200:]}")
+    say(f"uploaded {os.path.basename(local)} in {len(names)} parts ({size / 1e6:.0f} MB) in "
+        f"{now() - t0:.0f} s, its SHA-256 checked")
+
+
 def remote_launch(run, sname, resume_name):
     """Uploads the job and starts it in a process of its own."""
     files = [os.path.join(HERE, "runlib.py"), os.path.join(ROOT, run["script"])]
@@ -356,13 +406,11 @@ def remote_launch(run, sname, resume_name):
                         input_text=f"import os; os.makedirs('{REMOTE}/out/ckpt', exist_ok=True)\n"),
           "the first exec", tries=4)
     for f in files:
-        retry(lambda: colab(["upload", "-s", sname, f, f"{REMOTE}/{os.path.basename(f)}"],
-                            timeout=600), "upload")
+        upload(run, sname, f, f"{REMOTE}/{os.path.basename(f)}")
     resume_arg = []
     if resume_name:
         local = os.path.join(run_dir(run["name"]), "ckpt", resume_name)
-        retry(lambda: colab(["upload", "-s", sname, local, f"{REMOTE}/out/ckpt/{resume_name}"],
-                            timeout=900), "upload of the checkpoint")
+        upload(run, sname, local, f"{REMOTE}/out/ckpt/{resume_name}")
         resume_arg = ["--resume", f"{REMOTE}/out/ckpt/{resume_name}"]
     argv = ["python3", "-u", f"{REMOTE}/{os.path.basename(run['script'])}",
             "--out", f"{REMOTE}/out", "--seed", str(run["seed"]), "--every", str(run["every"]),
