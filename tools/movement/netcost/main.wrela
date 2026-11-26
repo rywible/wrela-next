@@ -1,12 +1,14 @@
-// The cost of a net on the CPU (docs/plans/bodies-and-movement.md, phase 0.3): a net of three
-// layers of `n` units each (n = 128, 256, 512, 1024), from `INPUTS` inputs to `OUTPUTS` outputs, with
-// random weights, evaluated as the CPU runs a game's code (WASM, strict floats). It prints the
-// median time of one evaluation of each size and how many bodies one millisecond of a tick moves.
+// The cost of a net on the CPU (docs/plans/bodies-and-movement.md, phase 0.3): the engine's net
+// (`engine::learned::net`) of three layers of `n` units each (n = 128, 256, 512, 1024), from
+// `INPUTS` inputs to `OUTPUTS` outputs, with random weights, evaluated as the CPU runs a game's
+// code (WASM, strict floats). It prints the median time of one evaluation of each size and how
+// many bodies one millisecond of a tick moves.
 //
 // The sizes of the input and the output are estimates of the solver's (phase 5 step 3): the
 // pose and its rate, the goals in the body's frame and samples of the world's field come to some
 // hundreds of numbers; the change of the pose and the contacts to some tens.
 
+use engine::learned::net::{Activation, Layer, layer, net}
 use std::collections::Vec
 use std::hash::pcg
 use std::io::print
@@ -20,99 +22,23 @@ const OUTPUTS: u32 = 64
 const ROUNDS: u32 = 21
 const REPEATS: u32 = 20
 
-/// One layer: `outs` rows of `ins` weights (a row's four neighbours packed in a vec4) and a bias.
-struct Layer {
-    ins: u32,
-    outs: u32,
-    w: Vec<vec4>,
-    b: Vec<f32>,
-}
-
 /// A number in [-1, 1) from `seed`.
 fn random(seed: u32) -> f32 {
     f32(pcg(seed.wrapping_mul(747796405).wrapping_add(2891336453)) >> 8) / 8388608.0 - 1.0
 }
 
 /// A layer of random weights, scaled as a net starts (1 / sqrt(ins)).
-fn layer(ins: u32, outs: u32, seed: u32) -> Layer {
+fn random_layer(ins: u32, outs: u32, seed: u32, activation: Activation) -> Layer {
     let s = 1.0 / sqrt(f32(ins))
-    var w: Vec<vec4> = Vec::with_capacity(ins * outs / 4)
-    for i in 0..(ins * outs / 4) {
-        let k = seed * 1000003 + i * 4
-        w.push(vec4(random(k), random(k + 1), random(k + 2), random(k + 3)) * s)
+    var w: Vec<f32> = Vec::with_capacity(ins * outs)
+    for i in 0..(ins * outs) {
+        w.push(random(seed * 1000003 + i) * s)
     }
     var b: Vec<f32> = Vec::with_capacity(outs)
     for j in 0..outs {
         b.push(random(seed * 7919 + j) * 0.1)
     }
-    Layer { ins, outs, w, b }
-}
-
-/// The exponential linear unit: the activation of the published nets of movement.
-fn elu(x: f32) -> f32 {
-    if x > 0.0 { x } else { exp(x) - 1.0 }
-}
-
-/// `out = act(W x + b)`; `x` packed four to a vec4. Four rows at a time, so each read of `x`
-/// serves four rows.
-fn apply(l: Layer, x: Vec<vec4>, out: mut Vec<f32>, act: bool) {
-    let q = l.ins / 4
-    var j = 0
-    while j < l.outs {
-        var a0 = vec4(0.0)
-        var a1 = vec4(0.0)
-        var a2 = vec4(0.0)
-        var a3 = vec4(0.0)
-        let (r0, r1, r2, r3) = (j * q, (j + 1) * q, (j + 2) * q, (j + 3) * q)
-        for i in 0..q {
-            let xi = x[i]
-            a0 += l.w[r0 + i] * xi
-            a1 += l.w[r1 + i] * xi
-            a2 += l.w[r2 + i] * xi
-            a3 += l.w[r3 + i] * xi
-        }
-        let v = vec4(
-            a0.x + a0.y + a0.z + a0.w,
-            a1.x + a1.y + a1.z + a1.w,
-            a2.x + a2.y + a2.z + a2.w,
-            a3.x + a3.y + a3.z + a3.w,
-        )
-        for k in 0..4 {
-            let y = v[k] + l.b[j + k]
-            out[j + k] = if act { elu(y) } else { y }
-        }
-        j += 4
-    }
-}
-
-/// `v` packed four to a vec4.
-fn packed(v: Vec<f32>, n: u32, into: mut Vec<vec4>) {
-    for i in 0..(n / 4) {
-        into[i] = vec4(v[4 * i], v[4 * i + 1], v[4 * i + 2], v[4 * i + 3])
-    }
-}
-
-struct Net {
-    layers: Vec<Layer>,
-}
-
-/// One evaluation: the outputs' sum (so the work is used).
-fn evaluate(net: Net, input: Vec<f32>, a: mut Vec<f32>, b: mut Vec<vec4>) -> f32 {
-    for k in 0..input.len() {
-        a[k] = input[k]
-    }
-    var n = input.len()
-    for li in 0..net.layers.len() {
-        borrow l = net.layers[li]
-        packed(a, n, mut b)
-        apply(l, b, mut a, li + 1 < net.layers.len())
-        n = l.outs
-    }
-    var s = 0.0
-    for k in 0..n {
-        s += a[k]
-    }
-    s
+    layer(ins, outs, w, take b, activation)
 }
 
 fn median(xs: mut Vec<f64>) -> f64 {
@@ -124,31 +50,30 @@ pub fn tool() -> u32 {
     print(f"netcost: {INPUTS} inputs, three layers of n units (ELU), {OUTPUTS} outputs")
     for n in [128, 256, 512, 1024] {
         var layers: Vec<Layer> = Vec::new()
-        layers.push(layer(INPUTS, n, 1))
-        layers.push(layer(n, n, 2))
-        layers.push(layer(n, n, 3))
-        layers.push(layer(n, OUTPUTS, 4))
-        let net = Net { layers }
+        layers.push(random_layer(INPUTS, n, 1, Activation::Elu))
+        layers.push(random_layer(n, n, 2, Activation::Elu))
+        layers.push(random_layer(n, n, 3, Activation::Elu))
+        layers.push(random_layer(n, OUTPUTS, 4, Activation::None))
+        let it = net(Vec::filled(INPUTS, 0.0), Vec::filled(INPUTS, 1.0), 5.0, take layers)
         var input: Vec<f32> = Vec::new()
         for k in 0..INPUTS {
             input.push(random(99991 + k))
         }
-        var a: Vec<f32> = Vec::filled(1024, 0.0)
-        var b: Vec<vec4> = Vec::filled(256, vec4(0.0))
+        var out: Vec<f32> = Vec::new()
         var times: Vec<f64> = Vec::new()
         var keep = 0.0
         for _ in 0..ROUNDS {
             let t = now()
             for _ in 0..REPEATS {
-                keep += evaluate(net, input, mut a, mut b)
+                it.apply(input, mut out)
+                keep += out[0]
             }
             times.push((now() - t) / f64(REPEATS))
         }
-        let macs = INPUTS * n + 2 * n * n + n * OUTPUTS
         let m = median(mut times)
         let us = f32(m * 1000000.0)
         let bodies = f32(0.001 / m)
-        print(f"n={n} weights={macs} median={us} us bodies_in_1ms={bodies} (check {keep})")
+        print(f"n={n} weights={it.size()} median={us} us bodies_in_1ms={bodies} (check {keep})")
     }
     0
 }

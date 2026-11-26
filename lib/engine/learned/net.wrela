@@ -1,0 +1,286 @@
+// A net trained outside the engine, evaluated on the CPU as the game's code runs
+// (docs/plans/bodies-and-movement.md, phase 5 step 2). The build embeds its file and a constant
+// reads it, so nothing parses weights while the game runs:
+//
+//     const SOLVER: Net = net::read(embed("solver.wnet")).unwrap()
+//
+// The file (WNET, written by `tools/movement/wnet.py`), little-endian: "WNET", u32 version (1),
+// u32 inputs, u32 layers; the inputs' normalisation (f32 mean and f32 scale for each input, and
+// f32 clip: an input becomes clamp((x - mean) * scale, -clip, clip)); then each layer: u32 ins,
+// u32 outs, u32 activation (0 none, 1 ELU, 2 tanh), its weights row after row (f32 [outs][ins])
+// and its bias (f32 [outs]).
+//
+// In memory each row is padded to a multiple of four and packed in `vec4`s, and four rows are
+// summed at a time (each read of the input serves four rows: twice as fast as one row at a time,
+// phase 0.3). The order of the sums is fixed, so each machine gives the same bits.
+
+use std::collections::Vec
+use std::io::print
+use std::string::Bytes
+
+/// What a layer does after its sum.
+pub enum Activation: Copy {
+    None,
+    /// The exponential linear unit: x above 0, exp(x) - 1 below.
+    Elu,
+    Tanh,
+}
+
+/// One dense layer: `outs` rows of `ins` weights and a bias each.
+pub struct Layer {
+    pub ins: u32,
+    pub outs: u32,
+    /// Each row's weights, `ins` padded with zeros to a multiple of four, four to a `vec4`.
+    w: Vec<vec4>,
+    b: Vec<f32>,
+    pub activation: Activation,
+}
+
+/// A net of dense layers, its inputs normalised first.
+pub struct Net {
+    pub ins: u32,
+    pub outs: u32,
+    mean: Vec<f32>,
+    scale: Vec<f32>,
+    clip: f32,
+    layers: Vec<Layer>,
+}
+
+/// The net that `bytes` hold (WNET, version 1), or `None` for a file that isn't one: a wrong
+/// head, a size that doesn't follow, an activation it doesn't know, or a layer whose inputs are
+/// not the last one's outputs.
+pub fn read(bytes: Bytes) -> Option<Net> {
+    if bytes.len() < 16 || bytes.u32_le(0) != 0x54454e57 || bytes.u32_le(4) != 1 {
+        return None
+    }
+    let ins = bytes.u32_le(8)
+    let count = bytes.u32_le(12)
+    var at = 16
+    if ins == 0 || count == 0 || bytes.len() < at + 8 * ins + 4 {
+        return None
+    }
+    var mean: Vec<f32> = Vec::with_capacity(ins)
+    var scale: Vec<f32> = Vec::with_capacity(ins)
+    for i in 0..ins {
+        mean.push(bytes.f32_le(at + 4 * i))
+        scale.push(bytes.f32_le(at + 4 * (ins + i)))
+    }
+    at += 8 * ins
+    let clip = bytes.f32_le(at)
+    at += 4
+    var layers: Vec<Layer> = Vec::with_capacity(count)
+    var last = ins
+    for _ in 0..count {
+        if bytes.len() < at + 12 {
+            return None
+        }
+        let (n_in, n_out, act) = (bytes.u32_le(at), bytes.u32_le(at + 4), bytes.u32_le(at + 8))
+        at += 12
+        if n_in != last || n_out == 0 || act > 2 || bytes.len() < at + 4 * n_out * (n_in + 1) {
+            return None
+        }
+        var w: Vec<f32> = Vec::with_capacity(n_out * n_in)
+        for i in 0..(n_out * n_in) {
+            w.push(bytes.f32_le(at + 4 * i))
+        }
+        at += 4 * n_out * n_in
+        var b: Vec<f32> = Vec::with_capacity(n_out)
+        for j in 0..n_out {
+            b.push(bytes.f32_le(at + 4 * j))
+        }
+        at += 4 * n_out
+        let activation = if act == 1 {
+            Activation::Elu
+        } else if act == 2 {
+            Activation::Tanh
+        } else {
+            Activation::None
+        }
+        layers.push(layer(n_in, n_out, w, take b, activation))
+        last = n_out
+    }
+    if at != bytes.len() {
+        return None
+    }
+    Some(net(take mean, take scale, clip, take layers))
+}
+
+/// A layer of `outs` rows of `ins` weights (`weights`, row after row) and `bias`.
+pub fn layer(
+    ins: u32,
+    outs: u32,
+    weights: [f32],
+    bias: take Vec<f32>,
+    activation: Activation,
+) -> Layer {
+    if weights.len() != ins * outs || bias.len() != outs {
+        panic("layer: the weights are not ins by outs, or the bias not outs")
+    }
+    let q = (ins + 3) / 4
+    var w: Vec<vec4> = Vec::with_capacity(outs * q)
+    for j in 0..outs {
+        for i in 0..q {
+            var v = vec4(0.0)
+            for k in 0..4 {
+                let c = 4 * i + k
+                if c < ins {
+                    v[k] = weights[j * ins + c]
+                }
+            }
+            w.push(v)
+        }
+    }
+    Layer { ins, outs, w, b: bias, activation }
+}
+
+/// A net of `layers`, each one's inputs the last one's outputs, its inputs normalised as
+/// clamp((x - mean) * scale, -clip, clip).
+pub fn net(mean: take Vec<f32>, scale: take Vec<f32>, clip: f32, layers: take Vec<Layer>) -> Net {
+    let ins = mean.len()
+    if scale.len() != ins || layers.is_empty() || layers[0].ins != ins {
+        panic("net: the normalisation is not the first layer's inputs")
+    }
+    for k in 1..layers.len() {
+        if layers[k].ins != layers[k - 1].outs {
+            panic("net: a layer's inputs are not the last one's outputs")
+        }
+    }
+    let outs = layers[layers.len() - 1].outs
+    Net { ins, outs, mean, scale, clip, layers }
+}
+
+fn activate(x: f32, a: Activation) -> f32 {
+    match a {
+        Activation::None => x,
+        Activation::Elu => if x > 0.0 { x } else { exp(x) - 1.0 },
+        Activation::Tanh => tanh(x),
+    }
+}
+
+impl Layer {
+    /// `out = act(W x + b)`, `x` packed four to a `vec4` (its padding zero).
+    fn apply(self, x: [vec4], out: mut Vec<vec4>) {
+        let q = (self.ins + 3) / 4
+        out.clear()
+        var y = vec4(0.0)
+        var j = 0
+        while j < self.outs {
+            // Four rows at a time (a row past the last reads row 0 and is not kept).
+            var a0 = vec4(0.0)
+            var a1 = vec4(0.0)
+            var a2 = vec4(0.0)
+            var a3 = vec4(0.0)
+            let r0 = j * q
+            let r1 = if j + 1 < self.outs { (j + 1) * q } else { 0 }
+            let r2 = if j + 2 < self.outs { (j + 2) * q } else { 0 }
+            let r3 = if j + 3 < self.outs { (j + 3) * q } else { 0 }
+            for i in 0..q {
+                let xi = x[i]
+                a0 += self.w[r0 + i] * xi
+                a1 += self.w[r1 + i] * xi
+                a2 += self.w[r2 + i] * xi
+                a3 += self.w[r3 + i] * xi
+            }
+            let s = vec4(
+                (a0.x + a0.y) + (a0.z + a0.w),
+                (a1.x + a1.y) + (a1.z + a1.w),
+                (a2.x + a2.y) + (a2.z + a2.w),
+                (a3.x + a3.y) + (a3.z + a3.w),
+            )
+            for k in 0..4 {
+                // `j` is a multiple of four, so output `j + k` is lane `k` of output vector j / 4.
+                y[k] = if j + k < self.outs {
+                    activate(s[k] + self.b[j + k], self.activation)
+                } else { 0.0 }
+            }
+            out.push(y)
+            j += 4
+        }
+    }
+}
+
+impl Net {
+    /// The outputs for the inputs `x` (`ins` of them), in `out` (`outs` of them).
+    pub fn apply(self, x: [f32], out: mut Vec<f32>) {
+        if x.len() != self.ins {
+            panic("Net::apply: the inputs are not the net's")
+        }
+        var a: Vec<vec4> = Vec::with_capacity((self.ins + 3) / 4)
+        var i = 0
+        while i < self.ins {
+            var v = vec4(0.0)
+            for k in 0..4 {
+                let c = i + k
+                if c < self.ins {
+                    v[k] = clamp((x[c] - self.mean[c]) * self.scale[c], -self.clip, self.clip)
+                }
+            }
+            a.push(v)
+            i += 4
+        }
+        var b: Vec<vec4> = Vec::new()
+        var n = 0
+        for layer in self.layers {
+            if n % 2 == 0 {
+                layer.apply(a, mut b)
+            } else {
+                layer.apply(b, mut a)
+            }
+            n += 1
+        }
+        let y = if n % 2 == 1 { take b } else { take a }
+        out.clear()
+        for j in 0..self.outs {
+            out.push(y[j / 4][j % 4])
+        }
+    }
+
+    /// How many weights and biases it has.
+    pub fn size(self) -> u32 {
+        var n = 0
+        for layer in self.layers {
+            n += layer.outs * (layer.ins + 1)
+        }
+        n
+    }
+}
+
+@test
+@fuel(2 ** 38)
+fn the_net_gives_what_pytorch_gave() {
+    // A net of random weights (37 inputs, 64 and 48 with ELU, 16 with tanh, 11 outputs) and
+    // 1000 inputs with PyTorch's outputs for them (`tools/movement/net_cases.py`).
+    let Some(net) = read(embed("learned/testdata/small.wnet")) else {
+        panic("the test's net does not read")
+    }
+    assert(net.ins == 37 && net.outs == 11 && net.size() == 6523)
+    let cases = embed("learned/testdata/small.cases")
+    let count = cases.u32_le(4)
+    assert(count == 1000 && cases.u32_le(8) == 37 && cases.u32_le(12) == 11)
+    var x: Vec<f32> = Vec::filled(37, 0.0)
+    var y: Vec<f32> = Vec::new()
+    var worst = 0.0
+    var at = 16
+    for _ in 0..count {
+        for i in 0..37 {
+            x[i] = cases.f32_le(at + 4 * i)
+        }
+        at += 4 * 37
+        net.apply(x, mut y)
+        for j in 0..11 {
+            let want = cases.f32_le(at + 4 * j)
+            worst = max(worst, abs(y[j] - want) / max(abs(want), 1.0))
+        }
+        at += 4 * 11
+    }
+    print(
+        f"the net against PyTorch: the worst difference {worst} (of an output, or of its size past 1)",
+    )
+    assert(worst < 1.0e-5)
+}
+
+@test
+fn a_file_that_is_not_a_net_is_none() {
+    let bytes = embed("learned/testdata/small.cases")
+    assert(read(bytes).is_none())
+}
