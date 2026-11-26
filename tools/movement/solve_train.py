@@ -88,6 +88,8 @@ def main(load_packed):
     p.add_argument("--beta", type=float, default=0.3)
     p.add_argument("--physics", type=float, default=0.0,
                    help="the weight of the parts' depth and slide on the ground (each over its target)")
+    p.add_argument("--prior", type=float, default=0.3,
+                   help="the share of windows whose code is drawn from the prior, not the encoder")
     p.add_argument("--hide", type=float, default=0.3, help="the chance that each goal is hidden")
     p.add_argument("--eval-every", type=int, default=2000)
     p.add_argument("--threads", type=int, default=0)
@@ -138,12 +140,31 @@ def main(load_packed):
         gm = n_goal(g) * mask.repeat_interleave(2, -1)
         return dec(torch.cat([n_state(s), gm, mask, z], -1))
 
+    def smooth_codes(B, w, g):
+        """Codes for `w` ticks as the engine draws them (`engine::body::motion::code`): standard
+        normal draws every `CODE_TICKS` ticks, each tick's between its two knots, from a random
+        phase."""
+        T = 8
+        knots = torch.randn(B, w // T + 2, a.z, device=dev, generator=g)
+        phase = torch.randint(0, T, (B,), device=dev, generator=g)
+        out = []
+        for t in range(w):
+            tt = phase + t
+            i = tt // T
+            u = ((tt % T).float() / T)[:, None]
+            ka = knots[torch.arange(B, device=dev), i]
+            kb = knots[torch.arange(B, device=dev), i + 1]
+            out.append(((1 - u) * ka + u * kb) / torch.sqrt((1 - u) ** 2 + u ** 2))
+        return out
+
     def rollout(data, starts, ends, w, fed_back, train_mode):
         """A window of `w` frames from each start: the losses, and how far the rollout's root
         went from the capture's."""
         B = starts.shape[0]
         prev, cur = data.x[starts - 1], data.x[starts]
         mask = (torch.rand(B, 2, device=dev, generator=gen) > a.hide).float()
+        prior_rows = (torch.rand(B, 1, device=dev, generator=gen) < a.prior)
+        code_prior = smooth_codes(B, w, gen)
         rec, kl, phys = 0.0, 0.0, 0.0
         for t in range(w):
             row = starts + t
@@ -156,6 +177,9 @@ def main(load_packed):
                 mu, logvar = h[:, :a.z], h[:, a.z:].clamp(-8, 4)
                 z = mu + torch.randn(mu.shape, device=dev, generator=gen) * torch.exp(0.5 * logvar)
                 kl = kl + (0.5 * (mu * mu + logvar.exp() - 1.0 - logvar).sum(-1)).mean()
+                # A share of the windows take their code from the prior, as the game draws it:
+                # then only the goal says where to go, so the decoder learns to follow it.
+                z = torch.where(prior_rows, code_prior[t], z)
             else:
                 z = torch.randn(B, a.z, device=dev, generator=gen)
             out = decode(s, g, mask, z)
@@ -206,6 +230,7 @@ def main(load_packed):
         prev, cur = data.x[starts - 1], data.x[starts]
         h0 = cur[:, 1].clone()
         mask = torch.ones(B, 2, device=dev)
+        codes = smooth_codes(B, w, g2)
         verr, fell, qerr = 0.0, torch.zeros(B, dtype=torch.bool, device=dev), 0.0
         phys_e = 0.0
         with torch.no_grad():
@@ -213,7 +238,7 @@ def main(load_packed):
                 row = starts + t
                 s = body.state(prev, cur, rate)
                 g = goals(body, data, cur, row, ends, rate)
-                z = torch.randn(B, a.z, device=dev, generator=g2)
+                z = codes[t]
                 pred = n_step.mean + n_step.std * decode(s, g, mask, z)
                 nxt = body.after(cur, pred)
                 phys_e += physics(cur, nxt).item()
@@ -238,7 +263,7 @@ def main(load_packed):
         torch.nn.utils.clip_grad_norm_(list(enc.parameters()) + list(dec.parameters()), 1.0)
         opt.step()
         step += 1
-        ph = float(phys) if not isinstance(phys, float) else phys
+        ph = float(phys.detach()) if not isinstance(phys, float) else phys
         run.progress(step, a.steps, f"rec {rec.item():.4f} kl {kl.item():.2f} phys {ph:.3f} fed {fed:.2f}")
         if step % 100 == 0:
             print(f"update {step}: rec {rec.item():.4f} kl {kl.item():.2f} physics {ph:.3f} fed back {fed:.2f} "

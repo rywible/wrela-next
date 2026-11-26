@@ -135,6 +135,20 @@ def normal(h):
     return float(np.sqrt(-2.0 * np.log(u)) * np.cos(6.2831853 * v))
 
 
+CODE_TICKS = 8
+
+
+def code(seed, tick, k):
+    """`engine::body::motion::code`."""
+    knot = tick // CODE_TICKS
+    u = np.float32(tick % CODE_TICKS) / np.float32(CODE_TICKS)
+    ha = pcg(np.uint32((seed + knot * 2654435761) & 0xFFFFFFFF))
+    hb = pcg(np.uint32((seed + (knot + 1) * 2654435761) & 0xFFFFFFFF))
+    a = normal(np.uint32((int(ha) + k * 7919) & 0xFFFFFFFF))
+    b = normal(np.uint32((int(hb) + k * 7919) & 0xFFFFFFFF))
+    return float(((1 - u) * a + u * b) / np.sqrt((1 - u) ** 2 + u ** 2))
+
+
 def play_check(argv):
     """The engine's play (`tools/movement/solver -- play NET SEED SECONDS CLIP`) against the same
     rollout here: the WNET read and run by this script, the code drawn as the engine draws it.
@@ -149,7 +163,7 @@ def play_check(argv):
     n = ref.shape[0]
     ahead = int(rate)
     poses = [ref[0], ref[1]]
-    code = net[0].shape[0] - (motion.STATE_ROOT + 2 * body.freedom + motion.GOAL + 2)
+    n_code = net[0].shape[0] - (motion.STATE_ROOT + 2 * body.freedom + motion.GOAL + 2)
     first, whole = 0.0, 0.0
     for t in range(1, eng.shape[0] - 1):
         now = poses[t]
@@ -157,8 +171,7 @@ def play_check(argv):
         secs = max((at - min(t, n - 1)) / rate, 1.0)
         g = body.goal(now[None], ref[at][None], torch.tensor([secs]))[0]
         s = body.state(poses[t - 1][None], now[None], rate)[0]
-        h0 = pcg(np.uint32((seed * 100003 + t) & 0xFFFFFFFF))
-        z = torch.tensor([normal(np.uint32((int(h0) + k * 7919) & 0xFFFFFFFF)) for k in range(code)])
+        z = torch.tensor([code(seed, t, k) for k in range(n_code)])
         inp = torch.cat([s, g, torch.ones(2), z])
         step = apply_wnet(net, inp[None])
         nxt = body.after(now[None], step)[0]
