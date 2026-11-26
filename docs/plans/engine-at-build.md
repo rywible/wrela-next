@@ -632,6 +632,51 @@ A part that reads values of more than one class gets the fastest of those classe
 
 ## 11. Phase 3: the cook
 
+State (2026-11-26): in progress. Step 1's grids are built and tested on branch
+`engine-plan-ladder`, and not merged: they fail the gate's sun line of SCENE 13 VIEW 0 (below).
+Every grid's cell is on one ladder, the largest of `2^k` times 1, 1.25, 1.5 or 1.75 m no larger
+than the cell asked (`ladder_cell`, at most 20% finer, never coarser), and its origin is a whole
+number of its bricks, so `origin + n · cell` is exact and a corner's bits are its cell's and
+place's whatever eye chose the grid. The world's own placement of the lattice stands 0.137 mm off
+the ladder's points, which hold every round coordinate: where two solids meet on such a plane
+(the stage's wall on its floor at `y = 0`) their union is 0 on the face they share, and corners
+there meshed a sheet of outside between them (448 edges of four triangles). Its test,
+`two_eyes_put_a_cell_at_the_same_bits`: three eyes' grids round a room share 4,689,500 corners,
+two single grids asked for different cells 1,828,265, and no corner's bits differ.
+
+What moving the cells showed, each a fault the old placement had hidden (the general ones are on
+this branch):
+
+- The gate's numbers move past their slack with where the cells fall (§5): it holds the sun's
+  judge and the spans as means over placements of the lattice.
+- A kind's first extraction was capped at 16,384 bricks (from when a frame held 4,096
+  dispatches), so a kind with more drew its first frame with holes (the cut column at cells 20%
+  finer: 8,981); a cold extraction takes what the frame's budget of dispatches affords.
+- A chunk's thin-cell candidates passed its 8 slices (the pillars at 3.7 mm: 68,917 in one chunk,
+  past 65,536), so the batch was meshed again every frame and never settled: 16 slices.
+- The audit's march took a fixed 65,536 rays a frame: the grimoire's frames 414 to 571 ms, and
+  with frames queued one was undone 1.5 s after its submission, which stops a run. A frame's
+  march is now what 4 dispatches' most work holds at its field's step cost.
+- The audit made each kind's sight again at the world's own placement: it keeps the scene's.
+- The crowd's outline at 160x90 fails its budget at three of four placements on the old grids (5,
+  4 and 5 holes against 2.9) and passed at placement 0 only: on the ladder 3, 4, 3 and 2.
+- A noise-weathered rock's mesh folds about 1 triangle in 10,000 at most placements where a
+  crease cell's solution lies past its cell (its clamped vertex 0.09 cells inside the solid); a
+  smooth sphere across a 2:1 seam, 5 in 220,018 triangles over twelve placements. Each test had
+  passed at its one placement; on the ladder's branch they hold several to a rate. Open.
+
+Why the ladder waits: the sun's judge moves with the mesh far past its slack, whatever moves it
+(cells 1% larger: SCENE 13 VIEW 0's hard leaks 754 to 882), and on the ladder VIEW 0 is worse at
+every placement (845 against 773 over four, cells 8% finer there), VIEW 1 better (1,037 against
+1,358). The cause is in the sun: `sun_classify_fs` proves a pixel lit or dark from the map taking
+the meshes' error as half a pixel (`HOLE_PX`), which only outline cells are certified to; inside
+the outline a mesh may stand off its field by much of a cell (at a crease more), so where the map
+proves light the field blocks, and which pixels those are moves with the tessellation. The sun's
+proofs need the mesh's own bound there (phase 5's proof debt), and then the ladder is judged
+again. Rounded to the nearest step instead, VIEW 1 was the worse (1,553 against 1,358) and
+SCENE 10's span the better (23.45 against 24.38 ms; rounded down 26.68: its flames and arc are
+meshed again every frame, at cells 9% finer).
+
 Purpose: the build calculates, one time, the results of extraction that do not depend on the
 eye. The game loads them and does not calculate them again.
 
@@ -944,10 +989,22 @@ Each question has the step that must answer it. Write the answer here when you h
 4. What error limit does WGSL give to `sin` and `cos`? The code uses 2⁻¹¹. Read the
    specification of WGSL before phase 1 step 8.
 5. Do the grids of two eyes put a cell in the same position? The grids of one batch share one
-   origin. It is not known if the origin is the same for each eye. (phase 3, step 1)
+   origin. It is not known if the origin is the same for each eye. (phase 3, step 1) Answer: no,
+   before phase 3: a root's cell followed the eye's distance and its origin was `aabb.lo - 2h`.
+   On branch `engine-plan-ladder`, yes: cells on a ladder, origins on whole bricks (phase 3's
+   state).
 6. How does the game get the cook: from a file that the host loads, or from `embed`? `embed`
    needs the file in the package, and GPU code cannot hold its bytes. (phase 3, step 6)
-7. How large is the cook of one scene? (phase 3, step 3)
+7. How large is the cook of one scene? (phase 3, step 3) Answer (2026-11-26, on branch
+   `engine-plan-ladder`: `game/world`'s `cook_census_report`, `engine::mesh::cook::cook_census`:
+   the bricks that may hold a kind's surface at each cell of the ladder, 512 corners and a flat surface's 72 vertices a brick,
+   3.2 KiB): a whole kind at every cell an eye asks for is far too large. The bricks grow about
+   four times a halving: the courtyard 5,065 bricks (15 MiB) at 62.5 mm, 23,649 (72 MiB) at
+   31 mm, 255,480 (779 MiB) at 7.8 mm; the pillars 406,199 (1.2 GiB) at 3.9 mm; the stage 281,783
+   (859 MiB) at 7.8 mm; the table 248,808 (759 MiB) at 1 mm; the citadel 274,010 (836 MiB) at
+   62.5 mm already; the grimoire 12,420 (37 MiB) at 1 mm. So a cook holds each kind's coarse
+   cells, to a budget of bytes, and the fine cells near an eye stay live: step 3 cooks "each brick
+   at each cell size" only down to the cell where its kind's bricks pass the budget.
 
 ## 16. How to keep this plan
 
