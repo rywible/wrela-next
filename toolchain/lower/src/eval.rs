@@ -70,6 +70,10 @@ pub struct BuildData {
     /// Exact mode (`wrela build --exact`): GPU modules fold only what every GPU rounds alike
     /// (`ir::Module::exact`).
     pub exact: bool,
+    /// A counting build (`wrela build --tally`): each pipeline's invocations add up the work they
+    /// do into its words of the debug flag's buffer (`ir::tally`), which the host reads each
+    /// frame. For measuring what a pass does in a usual frame; not for timing or shipping.
+    pub tally: bool,
 }
 
 /// The module the build runs to compute some constants.

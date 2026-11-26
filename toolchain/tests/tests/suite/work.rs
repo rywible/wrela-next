@@ -440,3 +440,29 @@ fn a_dispatch_the_build_sizes_past_the_line_is_e0714() {
     let (unknown, errs) = codes("e0714_unknown", "width * height");
     assert!(!errs && unknown.is_empty(), "{unknown:?}");
 }
+
+/// A counting build (`wrela build --tally`, phase 4 step 5 of docs/plans/engine-at-build.md):
+/// every pipeline that runs a compute or fragment stage keeps the debug flag's buffer, and the
+/// manifest says how many words that buffer holds, the flag and two a pipeline; a build without
+/// it has none of either.
+#[test]
+fn a_counting_build_tallies_every_pipeline_into_the_flags_buffer() {
+    let dir = kernels(
+        "work_tally",
+        "",
+        &[("loop8", "    var a = x\n    for _i in 0..8 {\n        a = a * 1.5 + 1.0\n    }\n    out[id] = a")],
+    );
+    let how = |tally: bool| wrela_driver::BuildFor {
+        tally,
+        ..wrela_driver::BuildFor::new(wrela_abi::Target::Metal)
+    };
+    let counted = wrela_driver::build_for(&dir, &how(true));
+    assert!(!counted.has_errors(), "{:?}", counted.diagnostics);
+    let m = wrela_tests::built_manifest(&counted);
+    assert_eq!(m.tally_words, 1 + 2 * m.pipelines.len() as u32);
+    assert!(m.pipelines.iter().all(|p| p.debug_flag.is_some()), "{:?}", m.pipelines);
+    let plain = wrela_driver::build_for(&dir, &how(false));
+    let m = wrela_tests::built_manifest(&plain);
+    assert_eq!(m.tally_words, 0);
+    assert!(m.pipelines.iter().all(|p| p.debug_flag.is_none()));
+}

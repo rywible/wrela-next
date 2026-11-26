@@ -348,6 +348,10 @@ fn emit_in(
         }
         manifest.pipelines.push(pipeline);
     }
+    if l.tally {
+        let n = manifest.pipelines.len() as u32;
+        manifest.tally_words = 1 + n * wrela_ir::tally::TALLY_WORDS;
+    }
     if let Err(e) = manifest.validate() {
         diagnostics.push(Diagnostic::internal(e.to_string()));
     }

@@ -3784,6 +3784,32 @@ pub(crate) fn fuel(cx: &mut Cx, out: &mut PipelineOut, code: u32) {
     }
 }
 
+/// A counting build's tally of the work each invocation of `out` does, into its words of the
+/// debug flag's buffer (`ir::tally`), for pipeline `code` (from 1).
+pub(crate) fn tally(cx: &mut Cx, out: &mut PipelineOut, code: u32) {
+    let Some(binding) = out.debug_flag.or_else(|| flag_binding(cx, out)) else {
+        cx.err(Diagnostic::internal(format!(
+            "`{}` binds the machine's limit of storage buffers, so a counting build has no binding \
+             left for its tally: bind one fewer buffer",
+            out.name
+        )));
+        return;
+    };
+    let mut module = out.module.clone();
+    if !ir::tally::add_tally(&mut module, binding, code) {
+        return;
+    }
+    match ir::verify(&module) {
+        Ok(()) => {
+            out.module = module;
+            out.debug_flag = Some(binding);
+        }
+        Err(e) => {
+            cx.err(Diagnostic::internal(format!("the tally of `{}` made malformed IR: {e}", out.name)))
+        }
+    }
+}
+
 /// W0016: the draws left as written whose lanes may do more than the line's work at the idle
 /// clock (`fuel`), one warning for each place that records some, naming each with its bound, so
 /// the list of draws to bring within it is in every build.

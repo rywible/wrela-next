@@ -1013,6 +1013,11 @@ struct DebugFlag {
     pending: std::collections::VecDeque<(wrela_gpu::SubmissionIndex, u64, usize)>,
     /// The name each pipeline's last pass or dispatch had (a fault names it).
     labels: HashMap<u32, Arc<str>>,
+    /// The buffer's words: 1, the flag; in a counting build, then each pipeline's tally
+    /// (`Manifest::tally_words`), copied with the flag each frame and zeroed after the copy
+    /// from `zeros`, so each frame's copy holds its own.
+    words: u64,
+    zeros: Option<wrela_gpu::Buffer>,
 }
 
 /// How many frames' copies of the flag are kept ([`DebugFlag::ring`]): more than are ever in
@@ -1255,17 +1260,26 @@ impl Gpu {
     /// and WGSL are the same.
     fn take_pipelines(&mut self, manifest: &Manifest, shaders: &[Vec<u8>]) -> Result<()> {
         if self.debug_flag.is_none() && manifest.pipelines.iter().any(|p| p.debug_flag.is_some()) {
+            let words = u64::from(manifest.tally_words.max(1));
             self.debug_flag = Some(DebugFlag {
                 buffer: self.device.create_buffer(&wrela_gpu::BufferDesc {
                     label: "debug flag",
-                    size: 4,
+                    size: 4 * words,
                     mappable: false,
                 }),
-                ring: readback_buffer(&self.device, 4 * FLAG_RING),
+                ring: readback_buffer(&self.device, 4 * FLAG_RING * words),
                 next: 0,
                 queued: None,
                 pending: std::collections::VecDeque::new(),
                 labels: HashMap::new(),
+                words,
+                zeros: (words > 1).then(|| {
+                    self.device.create_buffer(&wrela_gpu::BufferDesc {
+                        label: "tally zeros",
+                        size: 4 * (words - 1),
+                        mappable: false,
+                    })
+                }),
             });
         }
         let old_keys = std::mem::take(&mut self.pipeline_keys);
@@ -2075,10 +2089,12 @@ impl Gpu {
         // The bound size of each storage buffer the shader reads the length of
         // (`wrela_abi::metal`), in a uniform buffer of this bind group's own, which the bind
         // group keeps alive.
+        // The flag's buffer: its one word, or a counting build's tallies after it.
+        let flag_bytes = self.debug_flag.as_ref().map_or(4, |f| (4 * f.words) as u32);
         let sizes = p.sizes.as_ref().map(|s| {
             let words = s.buffers.iter().map(|&binding| {
                 if Some(binding) == p.debug_flag {
-                    return 4;
+                    return flag_bytes;
                 }
                 let at = p.bindings.iter().position(|b| b.binding == binding);
                 let (b, resource) = match at {
@@ -3451,7 +3467,11 @@ impl Gpu {
         if let Some(f) = &mut self.debug_flag {
             let slot = f.next % FLAG_RING;
             f.next += 1;
-            encoder.copy_buffer_to_buffer(&f.buffer, 0, &f.ring, slot * 4, 4);
+            let bytes = 4 * f.words;
+            encoder.copy_buffer_to_buffer(&f.buffer, 0, &f.ring, slot * bytes, bytes);
+            if let Some(z) = &f.zeros {
+                encoder.copy_buffer_to_buffer(z, 0, &f.buffer, 4, bytes - 4);
+            }
             f.queued = Some(slot);
         }
     }
@@ -3492,8 +3512,23 @@ impl Gpu {
                 break;
             }
             f.pending.pop_front();
-            let b = f.ring.read(slot * 4, 4).map_err(|e| Error::Gpu(e.0))?;
+            let b = f.ring.read(slot * 4 * f.words, 4 * f.words).map_err(|e| Error::Gpu(e.0))?;
             let code = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            // A counting build's tallies: each pipeline's work this frame, its low word and the
+            // carries out of it (`wrela_ir::tally`).
+            if f.words > 1 {
+                let word = |i: usize| u64::from(u32::from_le_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]));
+                for (k, p) in self.pipelines.iter().enumerate() {
+                    let lo = 1 + 2 * k;
+                    if lo + 1 >= f.words as usize {
+                        break;
+                    }
+                    let work = (word(lo + 1) << 32) | word(lo);
+                    if work > 0 {
+                        eprintln!("tally frame {frame} {} {work}", p.name);
+                    }
+                }
+            }
             if code != 0 && found.is_none() {
                 found = Some((code, frame));
             }

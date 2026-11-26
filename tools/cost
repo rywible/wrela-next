@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """What a frame's passes cost by the compiler's count, beside what they take. Usage:
 
-    tools/cost <build> [--size WxH] [--frame N] [--timeout S] [--json FILE]
+    tools/cost <build> [--tally <counting build>] [--size WxH] [--frame N] [--timeout S]
+               [--json FILE]
 
 The model (docs/plans/engine-at-build.md phase 4 step 5): a pass's cost is the sum over its
 commands of their work at the host's own arithmetic (`wrela-host`'s `step::ms_of`): a dispatch's
@@ -10,6 +11,12 @@ times the target's time a unit (`wrela_abi`'s `step_femtoseconds`); a draw of a 
 triangle (`vertices 3 x 1`), its fragment entry point's bound times the screen's pixels (a draw
 of a mesh is not modelled yet: its fragments aren't known before it runs). An indirect dispatch
 is booked at its stated most, as the host books it.
+
+With `--tally`, the same program built with `wrela build --tally` (every invocation adds up the
+work it does, as the compiler counts it, and the host prints each pipeline's sum a frame): a
+pass is priced by the work its pipelines did in that frame, times the target's time a unit, not
+by their bounds. A pipeline that runs in several passes has its sum shared among them as their
+bounds times invocations are.
 
 The measure: the same run with `--timestamps --serial` (each pass and dispatch alone, timed by
 its own stamps), frame N (after its warm-up), each label's commands summed. A command the model
@@ -32,6 +39,7 @@ GPU = os.path.join(ROOT, "tools", "gpu")
 UNIT_FS = 2500
 WIDTH = 8192
 
+TALLY = re.compile(r"^tally frame (\d+) (\S+) (\d+)$")
 STEP = re.compile(r"^step frame (\d+) (dispatch|draw) (\S+) \| (\S+) \| (.*)$")
 TIMED = re.compile(r"^frame\s+(\d+)\s+(\S+)\s+([\d.]+) us$")
 
@@ -44,13 +52,15 @@ def main(argv):
     if not argv or argv[0] in ("-h", "--help"):
         print(__doc__)
         return 0 if argv else 2
-    build, size, frame, timeout, js = argv[0], "1920x1080", 40, 600, None
+    build, size, frame, timeout, js, tally = argv[0], "1920x1080", 40, 600, None, None
     i = 1
     while i < len(argv):
         a = argv[i]
-        if a in ("--size", "--frame", "--timeout", "--json") and i + 1 < len(argv):
+        if a in ("--size", "--frame", "--timeout", "--json", "--tally") and i + 1 < len(argv):
             v = argv[i + 1]
-            if a == "--size":
+            if a == "--tally":
+                tally = v
+            elif a == "--size":
                 size = v
             elif a == "--frame":
                 frame = int(v)
@@ -95,6 +105,40 @@ def main(argv):
             else:
                 model[label] = model.get(label, 0.0) + cost
             priced.append((label, cost is not None, kind))
+    # A counting build's work a pipeline this frame, shared among its labels by their bounds.
+    if tally:
+        tp = subprocess.run([GPU, "--timeout", str(timeout), tally, "--size", size, "--frames",
+                             str(frame + 1), "--steps"],
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        if tp.returncode != 0:
+            print(tp.stdout[-2000:], file=sys.stderr)
+            return 1
+        did = {}
+        share = {}  # pipeline -> {label: bound weight}
+        for line in tp.stdout.splitlines():
+            m = TALLY.match(line)
+            if m and int(m.group(1)) == frame:
+                did[m.group(2)] = did.get(m.group(2), 0) + int(m.group(3))
+            m = STEP.match(line)
+            if m and int(m.group(1)) == frame:
+                label, name, rest = m.group(3), m.group(4), m.group(5)
+                inv = re.search(r"invocations (\d+)", rest)
+                bound = re.search(r"bound (\d+)", rest)
+                weight = int(inv.group(1)) * int(bound.group(1)) if inv and bound else 1
+                share.setdefault(name, {})
+                share[name][label] = share[name].get(label, 0) + max(weight, 1)
+        model, unpriced = {}, {}
+        for name, work in did.items():
+            labels = share.get(name)
+            if not labels:
+                unpriced["(no label)"] = unpriced.get("(no label)", 0) + 1
+                continue
+            total = sum(labels.values())
+            for label, wgt in labels.items():
+                model[label] = model.get(label, 0.0) + work * wgt / total * UNIT_FS * 1e-12
+        for label in model:
+            if label not in order:
+                order.append(label)
     # The serial run times each pass (a draw's pass, once) and each dispatch alone, in order.
     times = [(m.group(2), float(m.group(3)) / 1000.0) for line in p.stdout.splitlines()
              if (m := TIMED.match(line)) and int(m.group(1)) == frame]

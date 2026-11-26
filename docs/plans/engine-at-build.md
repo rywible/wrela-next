@@ -765,9 +765,16 @@ the compiler's bounds at the host's arithmetic (a dispatch's bound times its inv
 covering draw's fragment bound times the pixels) beside the serial run's time of each. SCENE 10,
 frame 40, 1080p, M4: 628.5 ms modelled against 13.8 ms measured over the priced passes (45.6
 times), extraction 67.6 times (its indirect dispatches booked at their stated most), direct light
-85.6, the sun's certificates 0.8; mesh draws are not priced yet. The target is 20%: the model
-must count what a pass does in a usual frame (the invocations an indirect dispatch really ran,
-and the work an invocation really did), not its bounds. Steps 2 to 4 are open.
+85.6, the sun's certificates 0.8; mesh draws are not priced yet. The model now counts what a
+pass does in a usual frame: `wrela build --tally` makes every invocation add up the work it does
+(`ir::tally`), and the host prints each pipeline's sum a frame; `tools/cost <build> --tally
+<counting build>` prices a pass by that. SCENE 10, the same frame: 63.6 ms against 17.9 (3.5
+times); the dispatched passes within 0.3 to 2.5 times (extraction 1.6, the certificates 0.6, the
+sun's exact rays 0.9), the full-screen fragment passes 4 to 9 times over (direct light 6.0, the
+refraction 8.6, the tone 5.8): the time a unit was measured on a dependent chain of sines, and a
+fragment's work runs its independent operations side by side. Next: a unit for fragment work,
+measured as the compute unit is, and the mesh draws' rasterising. The target is 20% of each
+gate scene's span, on the two machines. Steps 2 to 4 are open.
 
 ### The decisions made at run time (step 1)
 

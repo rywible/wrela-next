@@ -172,6 +172,15 @@ pub struct Manifest {
     /// sets are two builds.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub set: BTreeMap<String, String>,
+    /// A counting build's (`wrela build --tally`): the words of the debug flag's buffer, word 0
+    /// the flag and then each pipeline's tally of the work its invocations did, its low word and
+    /// the carries out of it (`wrela_ir::tally`). 0 in any other build: the flag alone.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub tally_words: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 /// A module's interface (language.md §15): its imported memory's limits, and the type of each
@@ -784,6 +793,7 @@ impl Manifest {
             wasm_relaxed: None,
             wasm_relaxed_abi: None,
             set: BTreeMap::new(),
+            tally_words: 0,
         }
     }
 
@@ -1504,6 +1514,10 @@ mod read {
                         None => fail(format!("the manifest's `set.{k}` isn't a string")),
                     })
                     .collect::<Result<_>>()?,
+            },
+            tally_words: match o.get("tally_words") {
+                None => 0,
+                Some(_) => u32(o, "tally_words", "the manifest")?,
             },
         })
     }

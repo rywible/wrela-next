@@ -629,7 +629,7 @@ fn the_evaluators_meaning_is_pinned() {
     let pinned = (wrela_driver::const_cache::MEANING, values, eval);
     assert_eq!(
         pinned,
-        (1, 8453487835416048776, 543907879435433305),
+        (1, 8453487835416048776, 9958751293040023767),
         "the evaluator's meaning moved: (MEANING, the corpus's values, lower/eval.rs): if a \
          constant's value could change for the same WASM, raise const_cache::MEANING; then \
          record these"

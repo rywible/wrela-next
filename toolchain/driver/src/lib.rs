@@ -282,6 +282,10 @@ pub struct BuildFor {
     /// it: what two builds are compared in, to show a change leaves a picture to the bit. Not
     /// for shipping or timing (the M4's crowd 4.3% slower). Off unless asked for.
     pub exact: bool,
+    /// A counting build (`wrela build --tally`): each pipeline's invocations add up the work
+    /// they do, which the host prints each frame (`tally frame N <pipeline> <work>`): what a
+    /// pass does in a usual frame, for `tools/cost`. Not for timing or shipping.
+    pub tally: bool,
 }
 
 impl BuildFor {
@@ -293,6 +297,7 @@ impl BuildFor {
             target,
             trusted_shaders: false,
             exact: false,
+            tally: false,
         }
     }
 }
@@ -305,6 +310,7 @@ pub fn build_for(root: &Path, how: &BuildFor) -> Output {
         target: how.target,
         trusted_shaders: how.trusted_shaders,
         exact: how.exact,
+        tally: how.tally,
         ..Mode::RELEASE
     };
     on_compiler_thread(|| compile_set(root, mode, &how.set))
@@ -958,6 +964,8 @@ struct Mode {
     trusted_shaders: bool,
     /// Exact mode ([`BuildFor::exact`]).
     exact: bool,
+    /// A counting build ([`BuildFor::tally`]).
+    tally: bool,
     /// The machine the shaders are for ([`BuildFor::target`]).
     target: wrela_abi::Target,
 }
@@ -972,6 +980,7 @@ impl Mode {
         relaxed_simd: false,
         trusted_shaders: false,
         exact: false,
+        tally: false,
         target: wrela_abi::Target::HERE,
     };
     const RELEASE: Mode = Mode { emit: true, ..Mode::CHECK };
@@ -1087,6 +1096,7 @@ fn compile_loaded_in(
         few: mode.conditions && !mode.emit,
         target: mode.target,
         exact: mode.exact,
+        tally: mode.tally,
         ..Default::default()
     };
     let cache = scope.cache_of(root);

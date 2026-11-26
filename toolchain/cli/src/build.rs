@@ -29,13 +29,14 @@ pub fn run(args: &[String]) -> ExitCode {
                 return ExitCode::from(2);
             }
         }
-    } else if args.trusted_shaders || args.exact || args.target.is_some() {
+    } else if args.trusted_shaders || args.exact || args.tally || args.target.is_some() {
         let how = wrela_driver::BuildFor {
             kind: wrela_driver::BuildKind { debug: args.debug, testing: args.testing },
             set: args.set.clone(),
             target: args.target.unwrap_or(wrela_abi::Target::HERE),
             trusted_shaders: args.trusted_shaders,
             exact: args.exact,
+            tally: args.tally,
         };
         wrela_driver::build_for(dir, &how)
     } else if !args.set.is_empty() {

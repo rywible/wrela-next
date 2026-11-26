@@ -53,6 +53,9 @@ pub struct Lowered {
     /// The functions the CPU module instantiates, each with its type arguments (its owner's,
     /// then its own): for tools (`wrela query`). A pipeline's are its own.
     pub instances: Vec<(FnId, Vec<TyId>)>,
+    /// A counting build's ([`BuildData::tally`]): the manifest says how many words its flag's
+    /// buffer holds.
+    pub tally: bool,
 }
 
 /// What to lower.
@@ -579,6 +582,9 @@ fn lower_in(
             if data.debug && cx.emit {
                 gpu::debug_checks(&mut cx, &mut out, pipelines.len() as u32 + 1);
             }
+            if data.tally && cx.emit {
+                gpu::tally(&mut cx, &mut out, pipelines.len() as u32 + 1);
+            }
             pipelines.push(out);
         }
         i += 1;
@@ -628,7 +634,7 @@ fn lower_in(
         }
     }
     let instances = cpu.fn_instances();
-    let lowered = Lowered { cpu: cpu.m, pipelines, instances };
+    let lowered = Lowered { cpu: cpu.m, pipelines, instances, tally: data.tally };
     let mut diags = cx.diags;
     wrela_diag::sort_and_dedup(&mut diags);
     (lowered, diags)

@@ -33,6 +33,7 @@ pub mod same;
 pub mod scalarize;
 mod single_exit;
 pub mod strict;
+pub mod tally;
 mod types;
 pub mod uniformity;
 mod unroll;
