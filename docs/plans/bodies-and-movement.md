@@ -818,9 +818,9 @@ through the world with no cycle and no clip.
     and other proportions (the clip retargeted to a body with longer or shorter limbs). Check:
     the share of variants followed with no fall, and each variant's measures by the judge. First
     run: 64 variants of one clip. Estimate: 5 to 10 units.
-17. **Move the creature with the solver in each scene.** Remove `lib/kit/motion/cycle.wrela`,
-    `lib/kit/motion/playback.wrela`, `game/rules/walk.wrela` and `game/rules/gaits.wrela` in the
-    same change. Correct the rows of `docs/citations.md`.
+17. **Move the creature with the solver in each scene.** Remove `lib/kit/motion/cycle.wrela` and
+    `game/rules/walk.wrela` in the same change (`playback.wrela` and `gaits.wrela` went in
+    phase 1). Correct the rows of `docs/citations.md`.
 
 ### The goal test
 
