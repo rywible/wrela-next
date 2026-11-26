@@ -32,6 +32,29 @@ pub fn verify(m: &Module) -> Result<()> {
     Ok(())
 }
 
+/// The name of a function of `m` with a loop that can't end: its body has no `break` of its
+/// own, no `return` and no trap. Source can write one (the work count then has no bound, and
+/// the host refuses its dispatch); where the source's count had a bound, a pass erased an exit.
+pub fn endless_loop(m: &Module) -> Option<&str> {
+    /// Whether `b` leaves the loop it's the body of: a `break` not inside an inner loop, or a
+    /// `return` or trap anywhere.
+    fn leaves(b: &[Stmt], nested: bool) -> bool {
+        b.iter().any(|s| match s {
+            Stmt::Break => !nested,
+            Stmt::Return(_) | Stmt::Trap => true,
+            Stmt::If { then, else_, .. } => leaves(then, nested) || leaves(else_, nested),
+            Stmt::Loop { body, .. } => leaves(body, true),
+            _ => false,
+        })
+    }
+    m.functions.iter().find_map(|f| {
+        crate::visit::any(&f.body, &mut |s| {
+            matches!(s, Stmt::Loop { body, .. } if !leaves(body, false))
+        })
+        .then_some(f.name.as_str())
+    })
+}
+
 struct Verifier<'a> {
     m: &'a Module,
     f: &'a Function,

@@ -744,7 +744,10 @@ impl FlowEnv {
     }
 
     /// Detects canonical ascending `for`-loop induction variables (`local = c0; loop { if !(local < bound) { break } ... continuing { local = local + 1 } }`)
-    /// and returns `(local, IntRange { lo: init.lo, hi: bound_hi - 1 })` when provably sound.
+    /// and returns `local`'s range at the top of the body, where the exit test reads it:
+    /// `IntRange { lo: init.lo, hi: bound_hi }` (or `init.hi`, if more), which holds the value
+    /// that ends the loop. Past the test, the test's own narrowing gives `bound_hi - 1`. (A range
+    /// of `bound_hi - 1` at the top settled the test itself and erased the loop's exit.)
     pub fn detect_loop_induction(
         &self,
         types: &Types,
@@ -797,7 +800,8 @@ impl FlowEnv {
                         }
                     }
                     if r.lo >= init.lo && r.hi < lim.hi {
-                        return Some((inc_local, r, lt_root));
+                        let top = IntRange { lo: init.lo, hi: (r.hi + 1).max(init.hi) };
+                        return Some((inc_local, top, lt_root));
                     }
                     return None;
                 }

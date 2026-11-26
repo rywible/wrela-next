@@ -25,10 +25,14 @@
 //! a field of its own, so the hull of two variants keeps both payloads (an enum's payloads
 //! share their memory on the CPU).
 //!
+//! - **A strict GPU kernel** (`@strict`, `Target::Strict`): the CPU's rules, its arithmetic
+//!   being IEEE 754's and its transcendentals std's, but with the GPU's subnormals flushed, so a
+//!   result is off by at most `2⁻¹²⁶` near zero.
+//!
 //! Known limits: NaN results (from `0 × ∞`, `∞ − ∞`, or a point outside a function's domain,
 //! like `sqrt` of a negative) can't be bounded, and on the CPU a NaN bound is replaced by an
 //! infinite one at the end; on the GPU, which may assume NaNs away, they aren't. WGSL bounds
-//! `sin` and `cos` only on `[-π, π]`; outside it we assume the same absolute error. A branch
+//! `sin` and `cos` only on `[-π, π]`, so outside it a GPU's are unbounded. A branch
 //! taken speculatively still runs its code: an integer overflow or out-of-range index there
 //! traps on the CPU even if no point in the box would have taken it (a `Trap` statement itself
 //! is skipped).
@@ -120,7 +124,7 @@ pub(super) fn interval(
         rlo = g.let_(&mut body, out_ty, Expr::Extract(r, 0));
         rhi = g.let_(&mut body, out_ty, Expr::Extract(r, 1));
     }
-    if target == Target::Cpu {
+    if target != Target::Gpu {
         // A NaN bound means "unknown": make it infinite, a component at a time.
         let b = m.types.bool();
         let n = match m.types.get(out_ty) {
@@ -508,7 +512,7 @@ impl<'a> Ivx<'a> {
     fn inf(&self) -> f64 {
         match self.target {
             Target::Gpu => f32::MAX as f64,
-            Target::Cpu => f64::INFINITY,
+            Target::Cpu | Target::Strict => f64::INFINITY,
         }
     }
 
@@ -531,7 +535,8 @@ impl<'a> Ivx<'a> {
             (_, Scalar::F64) => f64::from_bits(1),
             (_, _) if self.half() => F16_TINY,
             (Target::Cpu, _) => f32::from_bits(1) as f64,
-            (Target::Gpu, _) => f32::MIN_POSITIVE as f64,
+            // A strict kernel's GPU flushes a subnormal result to zero.
+            (Target::Gpu | Target::Strict, _) => f32::MIN_POSITIVE as f64,
         }
     }
 
@@ -2467,7 +2472,7 @@ impl<'a> Ivx<'a> {
                     let held = self.exp_held(out, r[0], ty);
                     self.exp_gpu_widen(out, x, held, ty)
                 } else {
-                    self.widen(out, x, ty, CPU_STD_ULPS, 0.0)
+                    self.widen(out, x, ty, std_widening(b), 0.0)
                 }
             }
             // Increasing: the ends. The GPU's are "inherited" from `exp` (WGSL): their error is
@@ -2477,12 +2482,12 @@ impl<'a> Ivx<'a> {
                 let x = self.monotone(out, b, &r, ty);
                 match gpu {
                     true => self.widen(out, x, ty, HYPERBOLIC_GPU_ULPS, HYPERBOLIC_GPU_ABS),
-                    false => self.widen(out, x, ty, CPU_STD_ULPS, 0.0),
+                    false => self.widen(out, x, ty, std_widening(b), 0.0),
                 }
             }
             B::Cosh => {
                 let x = self.per_comp(out, ty, &r, Self::cosh)?;
-                self.widen(out, x, ty, if gpu { HYPERBOLIC_GPU_ULPS } else { CPU_STD_ULPS }, 0.0)
+                self.widen(out, x, ty, if gpu { HYPERBOLIC_GPU_ULPS } else { std_widening(B::Cosh) }, 0.0)
             }
             B::Log | B::Log2 => {
                 self.per_comp(out, ty, &r, |s, out, ty, x| Ok(s.log_ends(out, b, x[0], ty)))?
@@ -2825,7 +2830,7 @@ impl<'a> Ivx<'a> {
             let e = self.corners(out, ty, held, b, |s, out, x, y| {
                 s.builtin(out, Builtin::Pow, vec![x, y], ty)
             });
-            self.widen(out, e, ty, CPU_STD_ULPS, 0.0)
+            self.widen(out, e, ty, std_widening(Builtin::Pow), 0.0)
         };
         let (fl, fh) = self.full(out, ty);
         let r = (self.select(out, pos, r.0, fl), self.select(out, pos, r.1, fh));
@@ -2852,7 +2857,7 @@ impl<'a> Ivx<'a> {
         let near0 = self.builtin(out, Builtin::Clamp, vec![z, a.0, a.1], ty);
         let p = [a.0, a.1, near0].map(|x| self.builtin(out, Builtin::Pow, vec![x, b.0], ty));
         let e = self.extremes(out, &p, ty);
-        let e = self.widen(out, e, ty, CPU_STD_ULPS, 0.0);
+        let e = self.widen(out, e, ty, std_widening(Builtin::Pow), 0.0);
         Ok((self.select(out, ok, e.0, r.0), self.select(out, ok, e.1, r.1)))
     }
 
@@ -2873,7 +2878,7 @@ impl<'a> Ivx<'a> {
             // WGSL: 3 ulp outside [0.5, 2], 2⁻²¹ absolute inside.
             self.widen(out, r, ty, 6.0, 2.0 * (2f64).powi(-21))
         } else {
-            self.widen(out, r, ty, CPU_STD_ULPS, 0.0)
+            self.widen(out, r, ty, std_widening(b), 0.0)
         }
     }
 
@@ -2964,10 +2969,16 @@ impl<'a> Ivx<'a> {
         let hi = self.select(out, peak_in, one, hi);
         let lo = self.select(out, trough_in, neg, lo);
         Ok(if self.gpu() {
-            // WGSL: 2⁻¹¹ absolute (on [-π, π]).
-            self.widen(out, (lo, hi), ty, 1.0, 2.0 * (2f64).powi(-11))
+            // WGSL bounds `sin` and `cos` by 2⁻¹¹ absolute on [-π, π] alone; outside it, nothing
+            // a specification states bounds a driver's value: unbounded there. (A strict
+            // kernel's are std's, `Target::Strict`.)
+            let w = self.widen(out, (lo, hi), ty, 1.0, 2.0 * (2f64).powi(-11));
+            let below_pi = self.fc(out, ty, f64::from(f32::from_bits(0x4049_0fda)));
+            let inside = self.cmp(out, BinOp::Le, m, below_pi);
+            let (fl, fh) = self.full(out, ty);
+            (self.select(out, inside, w.0, fl), self.select(out, inside, w.1, fh))
         } else {
-            self.widen(out, (lo, hi), ty, CPU_STD_ULPS, 0.0)
+            self.widen(out, (lo, hi), ty, std_widening(b), 0.0)
         })
     }
 
@@ -3012,7 +3023,7 @@ impl<'a> Ivx<'a> {
             self.builtin(out, Builtin::Tan, vec![x.0], ty),
             self.builtin(out, Builtin::Tan, vec![x.1], ty),
         );
-        let e = self.widen(out, e, ty, CPU_STD_ULPS, 0.0);
+        let e = self.widen(out, e, ty, std_widening(Builtin::Tan), 0.0);
         // A near miss counts as a pole (as in `periodic`); far out, everything.
         let (m, near) = self.with_slack(out, x, ty);
         let pole = self.lattice_hit(out, ty, near, pi / 2.0, pi);
@@ -3032,7 +3043,8 @@ impl<'a> Ivx<'a> {
         if self.gpu() {
             self.widen(out, x, ty, 8192.0, (2f64).powi(-20))
         } else {
-            self.widen(out, x, ty, CPU_STD_ULPS, 0.0)
+            // atan2's, the widest of the four.
+            self.widen(out, x, ty, std_widening(Builtin::Atan2), 0.0)
         }
     }
 
@@ -3134,9 +3146,37 @@ impl<'a> Ivx<'a> {
     }
 }
 
-/// std's CPU transcendentals compute in f64 and round once to f32: within an ulp. Twice that,
-/// for the point and the bound, and some margin.
-const CPU_STD_ULPS: f64 = 4.0;
+/// The most error of std's f32 function that a transcendental built-in is on the CPU and in a
+/// strict kernel (`std::math::STRICT_ULPS`, measured for every argument of each one-argument
+/// function: `toolchain/tests`' `every_argument_is_within_its_error`, which also holds this
+/// table to std's), in ulps of the true value rounded.
+pub fn strict_ulps(b: Builtin) -> f64 {
+    use Builtin as B;
+    match b {
+        B::Sin => 1.125,
+        B::Cos => 1.125,
+        B::Tan => 2.75,
+        B::Exp => 1.125,
+        B::Exp2 => 1.25,
+        B::Log => 0.875,
+        B::Log2 => 0.75,
+        B::Sinh => 2.5,
+        B::Cosh => 1.75,
+        B::Tanh => 2.75,
+        B::Atan => 1.0,
+        B::Asin => 2.75,
+        B::Acos => 2.5,
+        B::Atan2 => 2.0,
+        B::Pow => 2.0,
+        _ => 0.5,
+    }
+}
+
+/// The widening of an end of a range of std's transcendental `b`: its error at the point the
+/// range holds and its error at the end, each `strict_ulps(b)`, and the end's own rounding.
+fn std_widening(b: Builtin) -> f64 {
+    2.0 * strict_ulps(b) + 1.0
+}
 
 /// How far the GPU's `sinh`, `cosh` and `tanh` may be from the truth: ulps of the result's
 /// magnitude (WGSL inherits their accuracy from `exp`'s, 3 + 2|x| ulps), and, for `sinh` and

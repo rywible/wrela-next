@@ -3707,6 +3707,47 @@ mod tests {
         assert!(retain_by_index(&mut items, |_| true).is_empty());
     }
 
+    /// A counted loop's exit test stays: the counter's range past the test (`i < n`) is not its
+    /// range at the test, where it can be `n`. (A strict module is flattened again after its
+    /// calls were merged into such loops, and its merged loops lost their tests to this: on
+    /// 2026-11-25 a `solve_verts` kernel ran without end and stalled the M4's display.)
+    #[test]
+    fn a_counted_loop_keeps_its_exit_test() {
+        let mut m = Module::default();
+        let (u32t, boolt) = (m.types.u32(), m.types.bool());
+        let mut f = Function::new("f", Vec::new(), None);
+        let i = f.new_local("i", u32t);
+        let mut body = Vec::new();
+        let zero = f.let_(&mut body, u32t, Expr::Const(Const::U32(0)));
+        body.push(Stmt::Store(Place::local(i), zero));
+        let mut inner = Vec::new();
+        let now = f.let_(&mut inner, u32t, Expr::Load(Place::local(i)));
+        let n = f.let_(&mut inner, u32t, Expr::Const(Const::U32(2)));
+        let done = f.let_(&mut inner, boolt, Expr::Binary(BinOp::Ge, now, n));
+        inner.push(Stmt::If { cond: done, then: vec![Stmt::Break], else_: Vec::new() });
+        // After the test, `i < 2` holds: a test of it there is settled.
+        let after = f.let_(&mut inner, boolt, Expr::Binary(BinOp::Lt, now, n));
+        inner.push(Stmt::Eval(Expr::Unary(UnOp::Not, after)));
+        let mut continuing = Vec::new();
+        let was = f.let_(&mut continuing, u32t, Expr::Load(Place::local(i)));
+        let one = f.let_(&mut continuing, u32t, Expr::Const(Const::U32(1)));
+        let next = f.let_(&mut continuing, u32t, Expr::Binary(BinOp::Add, was, one));
+        continuing.push(Stmt::Store(Place::local(i), next));
+        body.push(Stmt::Loop { body: inner, continuing });
+        body.push(Stmt::Return(None));
+        f.body = body;
+        range_simplify(&m, &mut f);
+        let Some(Stmt::Loop { body, .. }) = f.body.iter().find(|s| matches!(s, Stmt::Loop { .. }))
+        else {
+            panic!("the loop is gone")
+        };
+        assert!(
+            body.contains(&Stmt::Let(done, Expr::Binary(BinOp::Ge, now, n))),
+            "the exit test was settled: {body:?}"
+        );
+        assert!(body.contains(&Stmt::Let(after, Expr::Const(Const::Bool(true)))), "{body:?}");
+    }
+
     /// A dead chain through locals, as a run of `let`s makes it, goes in one pass; what the
     /// result needs stays.
     #[test]

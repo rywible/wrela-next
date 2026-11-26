@@ -51,8 +51,9 @@ pub const MOST_PASSES: u32 = 64;
 pub fn hoist(m: &mut Module, uniform: ResourceId, least: u64) -> Vec<Hoisted> {
     // An exact build's bits don't depend on the code around a function (language.md §11.3):
     // what moves onto the CPU is rounded as the CPU does, and whether a value moves depends on
-    // the work beside it. Its same work stays where it is.
-    if m.exact {
+    // the work beside it. Its same work stays where it is. A strict module's arithmetic is the
+    // CPU's already, so its same work moves.
+    if m.exact && !m.strict {
         return Vec::new();
     }
     let TypeDef::Struct { fields, .. } = m.types.get(m.resources[uniform.index()].ty).clone()

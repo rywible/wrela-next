@@ -41,11 +41,11 @@ pub struct Checks {
     pub loops: bool,
     /// `/` and `%` of integers guarded against 0 and the most negative divided by -1.
     pub int_div: bool,
-    /// Exact mode (`wrela build --exact`): no multiply and add contracted into one rounding
-    /// (MSL `fp contract(off)`, SPIR-V `NoContraction` on float arithmetic), so a function's
-    /// bits don't depend on the code around it. For comparing two builds, not for shipping:
-    /// it costs the M4 up to 4.3% of a frame (the engine's crowd), and its bits may differ from
-    /// the default's in the last place.
+    /// Exact mode (`wrela build --exact`, and every strict pipeline's, `ir::Module::strict`): no
+    /// multiply and add contracted into one rounding (MSL `fp contract(off)`, SPIR-V
+    /// `NoContraction` on float arithmetic) and safe math on Metal, so a function's bits don't
+    /// depend on the code around it. Strict geometry kernels cost SCENE 10 2.9% of its span on
+    /// the M4 (docs/plans/engine-at-build.md, phase 0.1).
     pub exact: bool,
 }
 
@@ -85,6 +85,9 @@ pub fn emit_shader(
     target: wrela_abi::Target,
     checks: Checks,
 ) -> R<Shader> {
+    // A strict pipeline (`@strict`, §11.3) is written as exact mode writes every one: no
+    // contraction, and safe math on Metal.
+    let checks = Checks { exact: checks.exact || m.strict, ..checks };
     let out = match target {
         wrela_abi::Target::Metal => {
             p.sizes = metal::buffer_sizes(m, p);

@@ -346,3 +346,64 @@ fn checks_the_count_proves_unneeded_are_left_out() {
     assert!(count(&unproved, ", 15u)") > 0, "`i` isn't known:\n{unproved}");
     assert!(count(&unproved, "naga_div(") > 1, "by `id.y + 1`, which may wrap:\n{unproved}");
 }
+
+/// What a strict module weighs a built-in at (`wrela_ir::work::strict_builtin_cost`, which E0712
+/// and hoisting take) is the work of std's code that it becomes there: a strict kernel of one
+/// call, less a strict kernel that computes only its arguments.
+#[test]
+fn strict_builtins_cost_what_std_s_code_does() {
+    use wrela_ir::Builtin as B;
+    let calls = [
+        (B::Sqrt, "sqrt(x)"),
+        (B::Sin, "sin(x)"),
+        (B::Cos, "cos(x)"),
+        (B::Tan, "tan(x)"),
+        (B::Asin, "asin(x)"),
+        (B::Acos, "acos(x)"),
+        (B::Atan, "atan(x)"),
+        (B::Atan2, "atan2(x, x * 0.5 + 0.25)"),
+        (B::Exp, "exp(x)"),
+        (B::Exp2, "exp2(x)"),
+        (B::Log, "log(x)"),
+        (B::Log2, "log2(x)"),
+        (B::Sinh, "sinh(x)"),
+        (B::Cosh, "cosh(x)"),
+        (B::Tanh, "tanh(x)"),
+        (B::Pow, "pow(x, x * 0.5 + 0.25)"),
+    ];
+    let dir = scratch("work_strict_builtins");
+    let mut src = String::from("use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}\n");
+    let mut names = vec!["none".to_string()];
+    let body = |k: &str, e: &str| {
+        format!(
+            "\n@strict\n@compute(64)\nfn {k}(out: mut Slots<f32>, id: GlobalId) {{\n    let x = out[id]\n    out[id] = {e}\n}}\n"
+        )
+    };
+    src.push_str(&body("none", "x"));
+    src.push_str(&body("none2", "x * 0.5 + 0.25"));
+    names.push("none2".to_string());
+    for (i, (_, e)) in calls.iter().enumerate() {
+        let k = format!("k{i}");
+        src.push_str(&body(&k, e));
+        names.push(k);
+    }
+    src.push_str("\npub fn frame(time: f32, width: u32, height: u32) {\n    var out: GpuBuffer<f32> = buffer(64)\n");
+    for k in &names {
+        src.push_str(&format!("    dispatch({k}.bind(mut out), over: 64)\n"));
+    }
+    src.push_str("}\n");
+    write_package(&dir, "work_strict_builtins", &src);
+    let all = work(&dir);
+    let none = of(&all, "none").0.expect("bounded");
+    let none2 = of(&all, "none2").0.expect("bounded");
+    let mut wrong = Vec::new();
+    for (i, (b, e)) in calls.iter().enumerate() {
+        let base = if e.contains(',') { none2 } else { none };
+        let got = of(&all, &format!("k{i}")).0.expect("bounded") - base;
+        let table = wrela_ir::work::strict_builtin_cost(*b, 1);
+        if got != table {
+            wrong.push(format!("{e}: std's code {got}, the table {table}"));
+        }
+    }
+    assert!(wrong.is_empty(), "the table is not std's code (the kernel of none: {none}):\n{}", wrong.join("\n"));
+}

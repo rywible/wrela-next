@@ -1469,8 +1469,8 @@ pub(crate) fn intrinsic(
         ) => {
             return crate::derive::call(fl, l, substs, c, ty);
         }
-        Some(Lang::WorkOf) => {
-            return work_call(fl, c);
+        Some(l @ (Lang::WorkOf | Lang::StrictWorkOf)) => {
+            return work_call(fl, c, l == Lang::StrictWorkOf);
         }
         Some(Lang::ReadsOnlyInput) => {
             return reads_call(fl, c);
@@ -2642,6 +2642,8 @@ fn entry_module(
     let mut gpu = GpuCx::new(what.clone(), iface.clone(), Some(stage));
     gpu.consts = consts;
     let mut mb = ModuleBuilder::gpu(gpu);
+    // A pipeline any of whose entry points is `@strict` computes as the CPU does (§11.3).
+    mb.m.strict = iface.entries.iter().any(|e| program.func(e.func).attrs.strict.is_some());
     // What each parameter is bound to: a group's fields as they're bound below.
     let mut resources: Vec<Vec<Option<Bound>>> = Vec::new();
     for entry in &iface.entries {
@@ -3180,6 +3182,10 @@ fn lower_compute(cx: &mut Cx, iface: Rc<Interface>, consts: Vec<ir::Const>) -> O
         entry_module(cx, iface.clone(), Entry::Compute(wg), Some(consts));
     let entry = entry_function(&mut mb, &keys[0], name, None, None);
     cx.drain(&mut mb);
+    if mb.m.strict {
+        // The built-ins a driver computes its own way, as the CPU computes them (§11.3).
+        ir::strict::lower_strict(&mut mb.m);
+    }
     check_recursion(cx, &mb);
     let inputs = entry_inputs(&iface.entries[0], true, iface.over);
     check_workgroup(cx, &mb, entry, &inputs);
@@ -3273,6 +3279,10 @@ fn lower_render(
         if takes_varyings { Some(vret_ir) } else { None },
     );
     cx.drain(&mut mb);
+    if mb.m.strict {
+        // The built-ins a driver computes its own way, as the CPU computes them (§11.3).
+        ir::strict::lower_strict(&mut mb.m);
+    }
     check_recursion(cx, &mb);
     let finputs = entry_inputs(fragment, false, false);
     check_uniformity(cx, &mb, fentry, &finputs);
@@ -3915,30 +3925,68 @@ fn verify(cx: &mut Cx, mb: &mut ModuleBuilder, name: &str) -> Option<Counts> {
         heavy = ir::rates::heavy_calls(&mb.m, &work);
     }
     if cx.emit {
-        mb.m.exact = cx.data.exact;
+        // A strict module folds from constants only what every GPU rounds as the CPU does, as an
+        // exact build's does.
+        mb.m.exact = cx.data.exact || mb.m.strict;
         let mut folded_branch = false;
         checked = checked
             .and_then(|()| {
                 folded_branch = ir::opt::flatten_gpu_folded(&mut mb.m)?;
                 Ok(())
             })
-            .map(|()| hoisted = hoist_same(cx, &mut mb.m, uniform))
+            .map(|()| hoisted = hoist_same(cx, &mut mb.m, uniform));
+        // A strict module's transcendentals, square roots and float remainders become calls to
+        // std's code once its same work has moved onto the CPU, which computes them with the
+        // same code; then the module is flattened again (§11.3).
+        if checked.is_ok() && mb.m.strict {
+            crate::make_strict(cx, mb);
+            checked = ir::opt::flatten_gpu(&mut mb.m);
+        }
+        checked = checked
             .and_then(|()| ir::gpu_memory::lay_out_gpu_memory(&mut mb.m))
             .and_then(|()| ir::verify(&mb.m));
         if checked.is_ok() {
-            if folded_branch {
-                let (flat_each, _) = ir::work::module_work(&mb.m);
-                for (idx, fw) in flat_each.into_iter().enumerate() {
-                    if let Some(w) = fw.work {
-                        if let Some(slot) = work.get_mut(idx) {
-                            *slot = Some(slot.map_or(w, |pre| pre.min(w)));
+            // The work of the code that runs, counted again. A strict module's is of std's code
+            // in it (§18.11): the more of the two, and none where this count finds no bound (the
+            // host then refuses it). A module whose branches folded can be bounded where its
+            // source wasn't, and do less: the less of the two. Where the source's count had a
+            // bound and the code that runs has a loop with no way out, a pass erased the loop's
+            // exit: an internal error (on 2026-11-25 such a kernel held the M4's GPU until a
+            // restart).
+            let (flat_each, _) = ir::work::module_work(&mb.m);
+            let lost = flat_each.iter().zip(&work).any(|(fw, pre)| pre.is_some() && fw.work.is_none());
+            if lost && let Some(f) = ir::endless_loop(&mb.m) {
+                checked = Err(ir::Error::internal(format!(
+                    "a loop of `{f}` has no break, return or trap left, where its source's work \
+                     had a bound: a pass erased its exit"
+                )));
+            }
+            for (idx, fw) in flat_each.into_iter().enumerate() {
+                let Some(slot) = work.get_mut(idx) else { continue };
+                match (*slot, fw.work) {
+                    (_, None) if mb.m.strict => {
+                        *slot = None;
+                        if let Some(u) = unbounded.get_mut(idx) {
+                            *u = fw.unbounded;
                         }
+                    }
+                    (pre, Some(w)) if mb.m.strict => {
+                        *slot = Some(pre.map_or(w, |pre| pre.max(w)));
                         if let Some(u) = unbounded.get_mut(idx) {
                             *u = None;
                         }
                     }
+                    (pre, Some(w)) if folded_branch => {
+                        *slot = Some(pre.map_or(w, |pre| pre.min(w)));
+                        if let Some(u) = unbounded.get_mut(idx) {
+                            *u = None;
+                        }
+                    }
+                    _ => {}
                 }
             }
+        }
+        if checked.is_ok() {
             weight = written_weight(&mb.m);
             same = ir::same::same_work(&mb.m, MOST_SAME_WORK + 1);
             copies = ir::opt::read_only_copies(&mb.m, ir::opt::MOST_COPIED_BYTES);
@@ -3948,6 +3996,21 @@ fn verify(cx: &mut Cx, mb: &mut ModuleBuilder, name: &str) -> Option<Counts> {
         // as it's written.
         if std::env::var("WRELA_DUMP_IR").as_deref() == Ok("gpu") {
             eprintln!("// {name}\n{}", ir::print::print(&mb.m));
+        }
+        // `WRELA_DUMP_IR=work`: where each entry point's work goes, by function (its runs in an
+        // invocation, and its own statements' work in them), the most costly first.
+        if std::env::var("WRELA_DUMP_IR").as_deref() == Ok("work") {
+            for (k, e) in mb.m.entry_points.iter().enumerate() {
+                let all = ir::work::work_by_function(&mb.m, e.function);
+                let sum: u64 = all.iter().map(|r| r.2).sum();
+                let bound = work.get(k).copied().flatten();
+                eprintln!("work {name} `{}`: bound {bound:?}, by function {sum}", e.name);
+                for (f, times, w) in all.iter().take(25) {
+                    let pct = 100.0 * *w as f64 / sum.max(1) as f64;
+                    let n = &mb.m.functions[f.index()].name;
+                    eprintln!("  {w:>10} {pct:5.1}% {times:>8}x {n}");
+                }
+            }
         }
     } else if checked.is_ok() {
         // The pipeline's weight is its WGSL's, as flattening writes it (§18.11).
@@ -4459,18 +4522,18 @@ pub(crate) fn check_standalone(cx: &mut Cx, f: FnId, entry: Option<Entry>, subst
 /// manifest counts an entry point (`ir::work::entry_work`, before flattening), knowing nothing
 /// of what it captures or is given; unbounded is `u32::MAX`. The same number wherever it's
 /// asked, on the CPU or in GPU code: each callable is counted once a build ([`Cx::works`]).
-pub(crate) fn work_call(fl: &mut Fl, c: &mir::Call) -> Option<ir::ValueId> {
+pub(crate) fn work_call(fl: &mut Fl, c: &mir::Call, strict: bool) -> Option<ir::ValueId> {
     let key = callable_key(fl, c, "`work` counts")?;
     // In GPU code, what it reaches may be the module's own resources (a buffer it captures):
     // it's counted beside them, once for each call.
     let n = if fl.mb.gpu.is_some() {
-        count_work(fl.cx, &key, c.span, Some(&*fl.mb))
+        count_work(fl.cx, &key, c.span, Some(&*fl.mb), strict)
     } else {
-        match fl.cx.works.get(&key) {
+        match fl.cx.works.get(&(key.clone(), strict)) {
             Some(n) => *n,
             None => {
-                let n = count_work(fl.cx, &key, c.span, None);
-                fl.cx.works.insert(key, n);
+                let n = count_work(fl.cx, &key, c.span, None, strict);
+                fl.cx.works.insert((key, strict), n);
                 n
             }
         }
@@ -4500,8 +4563,15 @@ fn count_work(
     key: &InstanceKey,
     span: Span,
     beside: Option<&ModuleBuilder>,
+    strict: bool,
 ) -> Option<u32> {
-    let (mb, id) = as_gpu_code(cx, key, span, beside, "work")?;
+    let (mut mb, id) = as_gpu_code(cx, key, span, beside, "work")?;
+    if strict {
+        // As a strict kernel computes it (§11.3): its built-ins as the CPU's, std's code.
+        mb.m.strict = true;
+        ir::strict::lower_strict(&mut mb.m);
+        crate::make_strict(cx, &mut mb);
+    }
     let w = ir::work::entry_work(&mb.m, id).work;
     Some(w.map_or(u32::MAX, |w| u32::try_from(w).unwrap_or(u32::MAX)))
 }

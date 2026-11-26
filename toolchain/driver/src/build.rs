@@ -250,6 +250,7 @@ fn emit_in(
             debug_flag: p.debug_flag,
             requires: p.module.requires(),
             conditional: conditional.get(i).copied().unwrap_or(false),
+            strict: p.module.strict,
             standin: p.standin,
             sizes: None,
             kept: p.module.kept_bytes(),
@@ -261,14 +262,7 @@ fn emit_in(
                 .collect(),
         };
         let shader = if let Some(s) = shaders {
-            // TEMPORARY (docs/plans/engine-at-build.md, phase 0.1; phase 1 removes it): the
-            // pipelines an entry of which `WRELA_STRICT_KERNELS` names (a comma list) are
-            // written strict, the others as the build says.
-            let strict = std::env::var("WRELA_STRICT_KERNELS").is_ok_and(|names| {
-                p.name.split('+').any(|e| names.split(',').any(|n| n.trim() == e))
-            });
-            let checks = wrela_shader::Checks { exact: s.checks.exact || strict, ..s.checks };
-            match wrela_shader::emit_shader(&p.module, &mut pipeline, s.target, checks) {
+            match wrela_shader::emit_shader(&p.module, &mut pipeline, s.target, s.checks) {
                 Ok(m) => Some(m),
                 Err(e) => {
                     diagnostics.push(Diagnostic::internal(format!(

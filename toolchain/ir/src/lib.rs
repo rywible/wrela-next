@@ -32,6 +32,7 @@ pub mod rates;
 pub mod same;
 pub mod scalarize;
 mod single_exit;
+pub mod strict;
 mod types;
 pub mod uniformity;
 mod unroll;
@@ -42,7 +43,7 @@ pub mod workgroup;
 
 pub use error::{Error, Result};
 pub use types::*;
-pub use verify::verify;
+pub use verify::{endless_loop, verify};
 /// Texture formats and render targets are the ABI's: what the manifest and the stream carry.
 pub use wrela_abi::manifest::RenderTarget;
 pub use wrela_abi::stream::TextureFormat;
@@ -61,11 +62,15 @@ macro_rules! ids {
 
 ids!(FuncId, ValueId, LocalId, ResourceId, DataId, TypeId);
 
-/// Which processor a module's code runs on.
+/// Which processor a module's code runs on, as a derived interpretation widens for it: the CPU
+/// (IEEE 754, subnormals kept, std's transcendentals), the GPU (WGSL's error bounds), or a
+/// strict GPU kernel (`@strict`, language.md §11.3: the CPU's arithmetic and std's
+/// transcendentals, but a subnormal flushed to zero).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Target {
     Cpu,
     Gpu,
+    Strict,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1057,6 +1062,10 @@ pub struct Module {
     /// is only what every GPU rounds the same (`const_fold`), so a function's bits don't depend on
     /// whether its arguments are constants where it's inlined.
     pub exact: bool,
+    /// GPU only: a strict pipeline's (`@strict`, language.md §11.3): its arithmetic the CPU's
+    /// (`strict::lower_strict`, std's transcendentals and square root), written with no
+    /// contraction and with safe math, so its bits are the CPU's.
+    pub strict: bool,
     /// CPU only: whether the program starts a voice (`std::audio`), so the module imports
     /// `wrela.audio`.
     pub audio: bool,

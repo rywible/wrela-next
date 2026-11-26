@@ -50,6 +50,8 @@ use wrela_abi::stream::{
 mod calibrate;
 mod present;
 #[cfg(test)]
+mod strict_ops;
+#[cfg(test)]
 mod tests;
 
 pub use calibrate::keep_clocked;
@@ -1155,6 +1157,8 @@ impl Gpu {
         let mut program_limits = limits_of(&limits);
         program_limits.features = feature_bits(device.features(), kept);
         program_limits.step_work = crate::step::step_work(wrela_abi::Target::HERE);
+        program_limits.lane_work =
+            wrela_abi::lane_work(program_limits.step_work, crate::step::width(wrela_abi::Target::HERE) as u32);
         if program_limits.has("subgroups") {
             let info = device.info();
             program_limits.subgroup_min_size = info.subgroup_min_size;
@@ -2797,11 +2801,17 @@ impl Gpu {
     /// In the serial mode, submits what's recorded and waits for the GPU to finish it, so the
     /// next pass or dispatch starts alone. (Submissions alone aren't enough: on Apple GPUs a
     /// render pass overlaps the kernel submitted before it.) Its timestamps are read once a
-    /// frame, so only the wait comes between the submissions.
+    /// frame, so only the wait comes between the submissions. With `--steps`, the wait's wall
+    /// time is written after its step, so a run cut short by its timeout names the dispatch
+    /// that was slow before the frame's timestamps are read.
     fn alone(&mut self) -> Result<()> {
         if self.timer.as_ref().is_some_and(|t| t.serial) {
             self.flush()?;
+            let start = std::time::Instant::now();
             wait(&self.device);
+            if crate::step::logging() {
+                eprintln!("step waited {:.3} ms", start.elapsed().as_secs_f64() * 1e3);
+            }
         }
         Ok(())
     }

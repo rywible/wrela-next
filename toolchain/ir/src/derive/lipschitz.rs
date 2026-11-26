@@ -73,7 +73,7 @@ fn is_float(types: &Types, t: TypeId) -> bool {
 fn tiny(target: Target) -> f64 {
     match target {
         Target::Cpu => 1.5e-45,
-        Target::Gpu => 1.2e-38,
+        Target::Gpu | Target::Strict => 1.2e-38,
     }
 }
 

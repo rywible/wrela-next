@@ -392,6 +392,13 @@ impl TargetLimits {
 /// could take longer.
 pub const STEP_MS: u32 = 50;
 
+/// The most work (units of language.md §18.11's count) one invocation may do in a dispatch of
+/// at most `step_work` thousand units on a GPU that runs `width` invocations side by side.
+pub const fn lane_work(step_work: u32, width: u32) -> u32 {
+    let units = step_work as u64 * 1000 / if width == 0 { 1 } else { width as u64 };
+    if units > u32::MAX as u64 { u32::MAX } else { units as u32 }
+}
+
 /// The most work (thousands of units of language.md §18.11's count) one dispatch may do in
 /// `ms` milliseconds at `femtoseconds` a unit: its kernel's bound times its invocations.
 pub const fn step_work(ms: u64, femtoseconds: u32) -> u32 {
@@ -417,6 +424,7 @@ impl TargetLimits {
             subgroup_min_size: 0,
             subgroup_max_size: 0,
             step_work: step_work(STEP_MS as u64, METAL_FS),
+            lane_work: lane_work(step_work(STEP_MS as u64, METAL_FS), 8192),
             screen: 0,
             headroom: 1000,
             epoch: 0,
@@ -466,6 +474,7 @@ impl TargetLimits {
             subgroup_min_size: 0,
             subgroup_max_size: 0,
             step_work: step_work(STEP_MS as u64, VULKAN_FS),
+            lane_work: lane_work(step_work(STEP_MS as u64, VULKAN_FS), 4096),
             screen: 0,
             headroom: 1000,
             epoch: 0,
@@ -532,6 +541,12 @@ pub struct Limits {
     /// GPU's [`TargetLimits::step_width`]). The host refuses a dispatch past it before it runs;
     /// a program that dispatches heavy work cuts it into parts this size.
     pub step_work: u32,
+    /// The most work one invocation of a compute dispatch may do, in units of the compiler's
+    /// count: [`Limits::step_work`] over the invocations the GPU runs side by side
+    /// ([`TargetLimits::step_width`]), which a dispatch never counts fewer of. A kernel whose
+    /// bound is past it is refused however few its invocations; heavy work an invocation is cut
+    /// into steps this size.
+    pub lane_work: u32,
     /// How the host shows the screen ([`SCREEN_LIMIT`]): bit 0 HDR, bit 1 Display P3. Not the
     /// device's: what the host did of the last `ConfigureScreen` it could.
     pub screen: u32,
@@ -608,6 +623,7 @@ impl Limits {
             11 => self.subgroup_min_size,
             12 => self.subgroup_max_size,
             13 => self.step_work,
+            LANE_WORK_LIMIT => self.lane_work,
             SCREEN_LIMIT => self.screen,
             HEADROOM_LIMIT => self.headroom,
             EPOCH_LIMIT => self.epoch,
@@ -621,6 +637,10 @@ impl Limits {
 /// has done what a `ConfigureScreen` asked. (It was 13, which `step_work` took: `screen_is`
 /// read the step's work as the screen until toolchain 0.33.)
 pub const SCREEN_LIMIT: u32 = 14;
+
+/// `wrela.limit`'s index of the most work one invocation of a dispatch may do
+/// ([`Limits::lane_work`]).
+pub const LANE_WORK_LIMIT: u32 = 17;
 
 /// `wrela.limit`'s index of how many times the device has been lost and made again
 /// (`std::gpu::device_epoch`, [`Limits::epoch`]).
@@ -669,6 +689,15 @@ pub fn generated_files() -> [(PathBuf, String); 2] {
 
 #[cfg(test)]
 mod tests {
+    /// Each target's `lane_work` is its `step_work` over its `step_width`.
+    #[test]
+    fn a_lanes_work_is_the_steps_over_the_width() {
+        for t in super::Target::ALL {
+            let l = t.limits();
+            assert_eq!(l.device.lane_work, super::lane_work(l.device.step_work, l.step_width));
+        }
+    }
+
     /// A module's pair section reads back; one without, a cut one and not a module give none.
     #[test]
     fn a_pair_section_reads_back() {

@@ -15,15 +15,23 @@
 3. The timeout: the host is killed, with its whole process group, when the wall clock passes
    `--timeout S` seconds (else `WRELA_GPU_TIMEOUT`, else 120), counted from when it starts
    (after the lock is taken). It then exits 124.
-4. Everything else goes to `wrela-host` as given: this repository's own (tools/wrela-host, built
+4. The idle check (macOS): with the lock taken, the GPU must be idle. A dispatch can't be
+   stopped once it runs, so a host the timeout kills can leave its work on the GPU; on
+   2026-11-25 three killed runs each left a kernel that never ended (a loop the compiler had
+   lost the exit of), the GPU stayed at 100% with no host alive, and every time after was
+   wrong. If the GPU is busier than `BUSY` percent through `BUSY_SAMPLES` samples, the run is
+   refused (exit 5): only a restart clears such work. A kill by the timeout says if the GPU is
+   still busy after it.
+5. Everything else goes to `wrela-host` as given: this repository's own (tools/wrela-host, built
    first if stale), or `--host PATH`'s (a reference host, to compare against).
 
-Exit status: the host's; 3 if the guard refuses the build; 124 if the timeout killed it; 2 for a
-usage error.
+Exit status: the host's; 3 if the guard refuses the build; 5 if the GPU is busy before the run;
+124 if the timeout killed it; 2 for a usage error.
 """
 
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -34,6 +42,34 @@ sys.path.insert(0, TOOLS)
 import gpulock  # noqa: E402
 
 LIMIT = 8 * 1024
+BUSY = 90
+BUSY_SAMPLES = 3
+
+
+def gpu_busy():
+    """The GPU's device utilization in percent (macOS's IOAccelerator statistics), or None."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        out = subprocess.run(["ioreg", "-r", "-c", "IOAccelerator", "-d", "1", "-w", "0"],
+                             capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.search(r'"Device Utilization %"=(\d+)', out)
+    return int(m.group(1)) if m else None
+
+
+def busy_through_samples():
+    """The least utilization over `BUSY_SAMPLES` samples half a second apart, or None."""
+    least = None
+    for k in range(BUSY_SAMPLES):
+        if k:
+            time.sleep(0.5)
+        u = gpu_busy()
+        if u is None:
+            return None
+        least = u if least is None else min(least, u)
+    return least
 DEFAULT_TIMEOUT = 120.0
 
 # wrela-host's options that take values, and how many: everything else that starts with `--`
@@ -127,6 +163,14 @@ def main(argv):
     else:
         command = [host] + argv
     lock = gpulock.take(" ".join(command))
+    busy = busy_through_samples()
+    if busy is not None and busy > BUSY:
+        lock.close()
+        print(f"gpu: REFUSED: the GPU is {busy}% busy with no GPU job of ours running: work a killed "
+              "host left on it (a dispatch can't be stopped) or another program's. Its times "
+              "would be wrong and its load adds to the work; restart the machine to clear a "
+              "killed host's work.", file=sys.stderr)
+        return 5
     # Copied once the lock is taken, so the host carries its mark (WRELA_GPU_LOCK_HELD).
     env = dict(os.environ)
     if host is None:
@@ -149,6 +193,12 @@ def main(argv):
         child.wait()
         print(f"gpu: killed the host after {time.monotonic() - began:.0f} s (timeout {timeout:g} s)",
               file=sys.stderr)
+        time.sleep(1)
+        after = busy_through_samples()
+        if after is not None and after > BUSY:
+            print(f"gpu: the GPU is still {after}% busy after the kill: a dispatch of the host's "
+                  "is running on, and nothing stops it; GPU runs are refused until a restart",
+                  file=sys.stderr)
         return 124
     finally:
         lock.close()

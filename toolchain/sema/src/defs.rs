@@ -188,6 +188,39 @@ macro_rules! lang_items {
         }
 
         impl Lang {
+    /// A GPU operation whose result its driver defines, which a `@strict` function can't reach
+    /// (the `driver` effect, §11.3): a read of a texture through a sampler (filtered, compared or
+    /// gathered at coordinates the driver rounds). A texel's `load` is exact.
+    pub fn driver_defined(self) -> bool {
+        use Lang as L;
+        matches!(
+            self,
+            L::TextureSample
+                | L::TextureSampleLevel
+                | L::TextureSampleGrad
+                | L::TextureSampleBias
+                | L::ArraySample
+                | L::ArraySampleLevel
+                | L::ArraySampleGrad
+                | L::CubeSample
+                | L::CubeSampleLevel
+                | L::DepthArrayCompare
+                | L::DepthArrayCompareLevel
+                | L::MipStepSample
+                | L::TextureSampleCompare
+                | L::TextureSampleCompareLevel
+                | L::TextureGather
+                | L::ArrayGather
+                | L::DepthGather
+                | L::DepthGatherCompare
+                | L::DepthArrayGather
+                | L::DepthArrayGatherCompare
+                | L::Texture3dSampleLevel
+        )
+    }
+}
+
+impl Lang {
             /// Whether calling it records GPU work: the `host` effect (language.md §8).
             pub fn records_gpu_work(self) -> bool {
                 matches!(
@@ -665,6 +698,7 @@ lang_items! {
     TapeWith = "std::derive::tape_with",
     TapeSized = "std::derive::tape_sized",
     WorkOf = "std::derive::work",
+    StrictWorkOf = "std::derive::strict_work",
     ReadsOnlyInput = "std::derive::reads_only_input",
     Building = "std::stage::Building",
     PushOne = "std::stage::push_one",
@@ -703,6 +737,8 @@ lang_items! {
     CpuCosh = "std::math::cosh",
     CpuTanh = "std::math::tanh",
     CpuPow = "std::math::pow",
+    StrictSqrt = "std::math::sqrt_rounded",
+    StrictRem = "std::math::rem_exact",
     Drop = "std::mem::Drop",
     MemSizeOf = "std::mem::size_of",
     MemAlignOf = "std::mem::align_of",
@@ -1021,6 +1057,10 @@ pub struct FnAttrs {
     pub unsafe_call: bool,
     /// `@deterministic`: checked to have no nondeterministic effects (§12).
     pub deterministic: Option<Span>,
+    /// `@strict`: its arithmetic is the CPU's on every GPU (§11.3): checked to reach no
+    /// operation a driver defines (the `driver` effect), and a kernel whose entry is strict is
+    /// written strict.
+    pub strict: Option<Span>,
     /// `@audio`: an audio-worklet entry point (§8).
     pub audio: Option<Span>,
     /// `@test`: a test `wrela test` runs, as the build runs constants (§13).

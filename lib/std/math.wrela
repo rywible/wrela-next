@@ -1,58 +1,825 @@
 // Trigonometric, hyperbolic, exponential and logarithmic functions, their inverses and powers,
-// for CPU code, with the constants π and 2π. They are compiled to WASM with the program, never
-// taken from the host, so every host computes the same bits (language.md §11). GPU code uses
-// WGSL's own.
+// with the constants π and 2π: the built-in transcendentals' code on the CPU, and in a strict GPU
+// kernel (`@strict`, language.md §11.3), from this one source. They are compiled with the
+// program, never taken from the host or the driver, so every host and every GPU that passes the
+// hardware test of the safe operations computes the same bits.
 //
-// Each function widens its f32 argument to f64, works there, and rounds once to f32. Sine,
-// cosine and tangent of |x| >= 2^20 use an integer range reduction with 192 bits of 4/π.
-// Accuracy (an estimate, not proved): within 1 ulp of the true f32 result.
-
-// Credit (MIT licence): the algorithms and coefficients follow musl's libm (FreeBSD msun before
-// it): __sindf, __cosdf and __tandf for sin, cos and tan; atan's table and polynomial; and
-// textbook series for exp and log. The range reduction for |x| >= 2^20 is ARM's
-// optimized-routines'.
-
-const INV_PIO2: f64 = 0.636619772367581382433
-// pi/2 split in two: the first 33 bits, then the rest.
-const PIO2_HI: f64 = 1.57079631090164184570
-const PIO2_LO: f64 = 0.0000000158932547735281966916
+// Each f32 function computes in f32 alone, with only what IEEE 754 rounds correctly or computes
+// exactly: `+`, `-`, `*`, `/` and `sqrt` of f32s, comparisons, `floor`, `round`, `abs`,
+// conversions between integers and floats, integer arithmetic and a float's bits. Nothing is
+// contracted into a fused multiply-add. So the same arguments give the same bits on the CPU
+// (WASM), in a strict Metal kernel (safe math, no contraction) and in a strict SPIR-V kernel
+// (`NoContraction`), and a test of the function on the CPU is a test of it on every such GPU.
+// Their errors, against an f64 reference for every f32 argument, are `STRICT_ULPS`.
+//
+// The polynomials' coefficients are the project's own fits (weighted least squares iterated
+// toward the least greatest relative error, over each kernel's interval). The range reduction
+// of a large sine's argument is Payne and Hanek's, with 2/π's bits.
 
 /// π, to f32's precision.
 pub const PI: f32 = 3.14159265
 
 /// 2π, to f32's precision.
 pub const TAU: f32 = 6.28318531
-const LN2: f64 = 0.693147180559945286227
-const LOG2E: f64 = 1.44269504088896338700
-const HALF_LN2: f64 = 0.346573590279972643113
-const SQRT2: f64 = 1.41421356237309514547
 
-const S1: f64 = -0.166666666416265235595
-const S2: f64 = 0.0083333293858894631756
-const S3: f64 = -0.000198393348360966317347
-const S4: f64 = 0.0000027183114939898219064
-const C0: f64 = -0.499999997251031003120
-const C1: f64 = 0.0416666233237390631894
-const C2: f64 = -0.00138867637746099294692
-const C3: f64 = 0.0000243904487962774090654
-// 4/π's bits, each entry the 32 after the previous one's first 8 (optimized-routines'
-// `__inv_pio4`).
-const INV_PIO4: [u32; 24] = [
-    0xa2, 0xa2f9, 0xa2f983, 0xa2f9836e, 0xf9836e4e, 0x836e4e44, 0x6e4e4415, 0x4e441529, 0x441529fc,
-    0x1529fc27, 0x29fc2757, 0xfc2757d1, 0x2757d1f5, 0x57d1f534, 0xd1f534dd, 0xf534ddc0, 0x34ddc0db,
-    0xddc0db62, 0xc0db6295, 0xdb629599, 0x6295993c, 0x95993c43, 0x993c4390, 0x3c439041,
-]
-// π/2 · 2^-62.
-const PIO2_2N62: f64 = 3.4061215800865545e-19
+const F32_MAX: f32 = 340282346638528859811704183484516925440.0
 
-const T: [f64; 6] = [
-    0.333331395030791399758,
-    0.133392002712976742718,
-    0.0533812378445670393523,
-    0.0245283181166547278873,
-    0.00297435743359967304927,
-    0.00946564784943673166728,
+fn is_nan(x: f32) -> bool {
+    x != x
+}
+
+fn is_inf(x: f32) -> bool {
+    abs(x) > F32_MAX
+}
+
+/// Whether `x` is a number and not an infinity.
+pub fn is_finite(x: f32) -> bool {
+    abs(x) <= F32_MAX
+}
+
+/// The most error, in units in the last place of the true value rounded to f32, of each f32
+/// function here for any argument: `sin`, `cos`, `tan`, `exp`, `exp2`, `log`, `log2`, `sinh`,
+/// `cosh`, `tanh`, `atan`, `asin`, `acos`, `atan2` and `pow`, in that order. Each one-argument
+/// function's was measured on the CPU for every one of its 2³² arguments against the f64
+/// functions below (`toolchain/tests`' `every_argument_is_within_its_error`, 2026-11-25: 1.072,
+/// 1.072, 2.702, 1.101, 1.227, 0.860, 0.501, 2.376, 1.533, 2.668, 0.967, 2.537, 2.283), and is
+/// stated here rounded up. `atan2`'s is bounded by its parts (a division's half ulp through
+/// atan, whose slope is at most 1, atan's 0.967, and the sum with π's half ulp: under 2) and
+/// measured at most 1.498 over 2³² pairs; `pow`'s by its parts (its log in two floats, within
+/// 2⁻⁴⁰ relatively, times y, and exp2's 1.227) and measured at most 1.332 over 2³² pairs.
+pub const STRICT_ULPS: [f32; 15] = [
+    1.125, 1.125, 2.75, 1.125, 1.25, 0.875, 0.75, 2.5, 1.75, 2.75, 1.0, 2.75, 2.5, 2.0, 2.0,
 ]
+
+/// A float from its bits.
+fn f(bits: u32) -> f32 {
+    bitcast_f32(bits)
+}
+
+/// `a + b` and its rounding error, exactly (Knuth's two-sum).
+fn two_sum(a: f32, b: f32) -> (f32, f32) {
+    let s = a + b
+    let bb = s - a
+    (s, (a - (s - bb)) + (b - bb))
+}
+
+/// `a`'s high and low halves of 12 significant bits each (Veltkamp's split).
+fn split12(a: f32) -> (f32, f32) {
+    let c = 4097.0 * a
+    let hi = c - (c - a)
+    (hi, a - hi)
+}
+
+/// `a * b` and its rounding error, exactly (Dekker's product), for a product far from
+/// overflow.
+fn two_product(a: f32, b: f32) -> (f32, f32) {
+    let p = a * b
+    let (ah, al) = split12(a)
+    let (bh, bl) = split12(b)
+    (p, ((ah * bh - p) + ah * bl + al * bh) + al * bl)
+}
+
+/// 2ⁿ for -126 <= n <= 127.
+fn pow2i(n: i32) -> f32 {
+    bitcast_f32(u32(n + 127) << 23)
+}
+
+/// `p * 2ⁿ` for -152 <= n <= 128, in two exact steps and one rounding.
+fn scaled(p: f32, n: i32) -> f32 {
+    let n1 = clamp(n, -126, 127)
+    let n2 = clamp(n - n1, -126, 127)
+    (p * pow2i(n1)) * pow2i(n2)
+}
+
+/// `r`, a magnitude, with the sign of `x`.
+fn with_sign_of(r: f32, x: f32) -> f32 {
+    if (bitcast_u32(x) >> 31) == 1 { -r } else { r }
+}
+
+// ---- sine and cosine ---------------------------------------------------------------------------
+
+/// 2/π's first 256 bits, from the point, a word at a time.
+const TWO_OVER_PI_BITS: [u32; 8] = [
+    0xa2f9836e, 0x4e441529, 0xfc2757d1, 0xf534ddc0, 0xdb629599, 0x3c439041, 0xfe5163ab, 0xdebbc561,
+]
+
+/// The high and low words of the 64-bit product of two words.
+fn mul_wide(a: u32, b: u32) -> (u32, u32) {
+    let (al, ah) = (a & 0xffff, a >> 16)
+    let (bl, bh) = (b & 0xffff, b >> 16)
+    let ll = al * bl
+    let lh = al * bh
+    let hl = ah * bl
+    let hh = ah * bh
+    let mid = (ll >> 16) + (lh & 0xffff) + (hl & 0xffff)
+    (hh + (lh >> 16) + (hl >> 16) + (mid >> 16), (ll & 0xffff) | ((mid & 0xffff) << 16))
+}
+
+/// 32 bits of 2/π from bit `s` after the point (1 the first), `s` from 1 to 160.
+fn two_over_pi_at(s: u32) -> u32 {
+    let k = (s - 1) / 32
+    let o = (s - 1) % 32
+    let a = TWO_OVER_PI_BITS[k]
+    if o == 0 { a } else { (a << o) | (TWO_OVER_PI_BITS[k + 1] >> (32 - o)) }
+}
+
+/// `x` reduced by π/2 for |x| >= 6000 (Payne and Hanek): `y` as two floats, `y_hi + y_lo` within
+/// 2⁻⁴⁰ of `x - qπ/2` relatively, |y| <= π/4, and `q`'s last two bits. `x` times the 96 bits of
+/// 2/π that matter at its exponent (the bits before them give multiples of 4, those after less
+/// than 2⁻⁷⁰), in integer arithmetic.
+fn reduce_large(x: f32) -> (f32, f32, u32) {
+    let xi = bitcast_u32(x) & 0x7fffffff
+    let e = i32(xi >> 23) - 127
+    let m = (xi & 0x7fffff) | 0x800000
+    // The window starts at bit e - 25; below bit 1, zeros lead it.
+    let s = max(e - 25, 1)
+    var w0 = two_over_pi_at(u32(s))
+    var w1 = two_over_pi_at(u32(s + 32))
+    var w2 = two_over_pi_at(u32(s + 64))
+    let lead = u32(max(26 - e, 0))
+    if lead > 0 {
+        w2 = (w2 >> lead) | (w1 << (32 - lead))
+        w1 = (w1 >> lead) | (w0 << (32 - lead))
+        w0 = w0 >> lead
+    }
+    let (h2, l2) = mul_wide(m, w2)
+    let (h1, l1) = mul_wide(m, w1)
+    let l0 = m.wrapping_mul(w0)
+    let word1 = h2.wrapping_add(l1)
+    let carry = if word1 < h2 { 1 } else { 0 }
+    let word2 = h1.wrapping_add(l0).wrapping_add(carry)
+    // The quadrant is bits 93 and 94 of the product; below them, the fraction, rounded to the
+    // nearest quadrant: a fraction of a half or more is a negative one of the next.
+    var q = (word2 >> 29) & 3
+    var a = (word2 << 3) | (word1 >> 29)
+    var b = (word1 << 3) | (l2 >> 29)
+    var c = l2 << 3
+    let neg = (a >> 31) == 1
+    if neg {
+        q = (q + 1) & 3
+        // The magnitude: the 96 bits negated.
+        let c0 = c
+        c = (c ^ 0xffffffff).wrapping_add(1)
+        let cb = if c0 == 0 { 1 } else { 0 }
+        let b0 = b
+        b = (b ^ 0xffffffff).wrapping_add(cb)
+        let ca = if c0 == 0 && b0 == 0 { 1 } else { 0 }
+        a = (a ^ 0xffffffff).wrapping_add(ca)
+    }
+    // Three exact pieces of 24 bits, in quadrants, summed into two floats.
+    let a1 = f32(a >> 8)
+    let a2 = f32(((a & 0xff) << 16) | (b >> 16))
+    let a3 = f32(((b & 0xffff) << 8) | (c >> 24))
+    var vh = a1 * f(0x33800000)
+    var vl = a2 * f(0x27800000) + a3 * f(0x1b800000)
+    let t = vh + vl
+    vl = vl - (t - vh)
+    vh = t
+    if neg {
+        vh = -vh
+        vl = -vl
+    }
+    // Times π/2, in two floats.
+    let (p, pe) = two_product(vh, f(0x3fc90fdb))
+    let lo = pe + (vh * f(0xb33bbd2e) + vl * f(0x3fc90fdb))
+    let yh = p + lo
+    let yl = lo - (yh - p)
+    if (bitcast_u32(x) >> 31) == 1 { (-yh, -yl, (4 - q) & 3) } else { (yh, yl, q) }
+}
+
+/// `x` reduced by π/2: `y_hi + y_lo`, |y| <= π/4 (and a rounding), within an f32's rounding
+/// of `x - qπ/2` relatively, and `q`'s last two bits. For |x| < 6000 (q < 4096) by π/2 in four
+/// parts of 12 bits, each times q exact, and the rest; beyond it, `reduce_large`.
+fn reduce(x: f32) -> (f32, f32, u32) {
+    if abs(x) >= 6000.0 {
+        return reduce_large(x)
+    }
+    let n = round(x * f(0x3f22f983))
+    let r = x - n * f(0x3fc90000)
+    let (s1, e1) = two_sum(r, -(n * f(0x39fda000)))
+    let (s2, e2) = two_sum(s1, -(n * f(0x33a22000)))
+    let (s3, e3) = two_sum(s2, -(n * f(0x2c346000)))
+    let t = ((e1 + e2) + e3) - n * f(0x248d3132)
+    let yh = s3 + t
+    (yh, t - (yh - s3), u32(i32(n)) & 3)
+}
+
+/// sin(y + y_lo) for |y| <= π/4.
+fn sin_kernel(y: f32, y_lo: f32) -> f32 {
+    let z = y * y
+    let p = (f(0xb94ca219) * z + f(0x3c08839e)) * z + f(0xbe2aaaa3)
+    y + (y_lo + (y * z) * p)
+}
+
+/// cos(y + y_lo) for |y| <= π/4.
+fn cos_kernel(y: f32, y_lo: f32) -> f32 {
+    let z = y * y
+    let hz = 0.5 * z
+    let w = 1.0 - hz
+    let q = (f(0x37ccf5e5) * z + f(0xbab6061a)) * z + f(0x3d2aaaa5)
+    w + ((((1.0 - w) - hz) - y * y_lo) + (z * z) * q)
+}
+
+/// sin of a reduced argument in quadrant `q`.
+fn sin_quadrant(y: f32, y_lo: f32, q: u32) -> f32 {
+    if q == 0 {
+        sin_kernel(y, y_lo)
+    } else if q == 1 {
+        cos_kernel(y, y_lo)
+    } else if q == 2 {
+        -sin_kernel(y, y_lo)
+    } else {
+        -cos_kernel(y, y_lo)
+    }
+}
+
+/// The sine of `x`, in radians.
+pub fn sin(x: f32) -> f32 {
+    if is_nan(x) || is_inf(x) {
+        return x - x
+    }
+    // sin(x) rounds to x, keeping -0's sign.
+    if abs(x) < f(0x39800000) {
+        return x
+    }
+    if abs(x) <= f(0x3f490fdb) {
+        return sin_kernel(x, 0.0)
+    }
+    let (y, y_lo, q) = reduce(x)
+    sin_quadrant(y, y_lo, q)
+}
+
+/// The cosine of `x`, in radians.
+pub fn cos(x: f32) -> f32 {
+    if is_nan(x) || is_inf(x) {
+        return x - x
+    }
+    if abs(x) <= f(0x3f490fdb) {
+        return cos_kernel(x, 0.0)
+    }
+    let (y, y_lo, q) = reduce(x)
+    sin_quadrant(y, y_lo, (q + 1) & 3)
+}
+
+/// The tangent of `x`, in radians: the sine over the cosine of the reduced argument.
+pub fn tan(x: f32) -> f32 {
+    if is_nan(x) || is_inf(x) {
+        return x - x
+    }
+    if abs(x) < f(0x39800000) {
+        return x
+    }
+    let (y, y_lo, q) = if abs(x) <= f(0x3f490fdb) { (x, 0.0, 0) } else { reduce(x) }
+    let s = sin_kernel(y, y_lo)
+    let c = cos_kernel(y, y_lo)
+    if (q & 1) == 1 { -c / s } else { s / c }
+}
+
+// ---- exponentials and logarithms ----------------------------------------------------------------
+
+/// (e^r - 1 - r) / r² for |r| <= ln(2)/2.
+fn exp_tail(r: f32) -> f32 {
+    var p = f(0x3ab51204)
+    p = p * r + f(0x3c091ce3)
+    p = p * r + f(0x3d2aac79)
+    p = p * r + f(0x3e2aaa49)
+    p * r + f(0x3efffffe)
+}
+
+/// e^r - 1 for |r| <= ln(2)/2.
+fn expm1_kernel(r: f32) -> f32 {
+    r + (r * r) * exp_tail(r)
+}
+
+/// `x` as `n ln 2 + r`, |r| <= ln(2)/2 and a rounding: ln 2 in three parts, the first two of
+/// which times n are exact for |n| < 512.
+fn reduce_ln2(x: f32) -> (f32, f32) {
+    let n = round(x * f(0x3fb8aa3b))
+    ((x - n * f(0x3f317000)) - n * f(0x3805fc00) - n * f(0x30fa39ef), n)
+}
+
+/// e to the power `x`.
+pub fn exp(x: f32) -> f32 {
+    if is_nan(x) {
+        return x
+    }
+    if x > f(0x42b17218) {
+        return 1.0 / 0.0
+    }
+    if x < -104.0 {
+        return 0.0
+    }
+    let (r, n) = reduce_ln2(x)
+    scaled(1.0 + expm1_kernel(r), i32(n))
+}
+
+/// e^x - 1, without the cancellation of `exp(x) - 1` near 0: 2ⁿ(e^r - 1) + (2ⁿ - 1).
+fn expm1(x: f32) -> f32 {
+    if abs(x) <= f(0x3eb17218) {
+        return expm1_kernel(x)
+    }
+    if x > f(0x42b17218) {
+        return 1.0 / 0.0
+    }
+    if x < -30.0 {
+        return -1.0
+    }
+    let (r, n) = reduce_ln2(x)
+    let ni = i32(n)
+    let two_n = pow2i(ni)
+    two_n * expm1_kernel(r) + (two_n - 1.0)
+}
+
+/// 2 to the power `x`.
+pub fn exp2(x: f32) -> f32 {
+    if is_nan(x) {
+        return x
+    }
+    if x >= 128.0 {
+        return 1.0 / 0.0
+    }
+    if x < -150.0 {
+        return 0.0
+    }
+    let n = round(x)
+    exp2_parts(x - n, 0.0, i32(n))
+}
+
+/// 2^(r + r_lo) · 2ⁿ for |r| <= 1/2.
+fn exp2_parts(r: f32, r_lo: f32, n: i32) -> f32 {
+    var q = f(0x3920fdc2)
+    q = q * r + f(0x3aaf9f21)
+    q = q * r + f(0x3c1d96a7)
+    q = q * r + f(0x3d635774)
+    q = q * r + f(0x3e75fdee)
+    q = q * r + f(0x3f317218)
+    // 2^r_lo = 1 + r_lo ln 2, to first order: r_lo is under an f32's rounding of r.
+    scaled(1.0 + (r * q + r_lo * f(0x3f317218)), n)
+}
+
+/// A positive, finite `x` as `2^e · (1 + f)`, √½ <= 1 + f < √2: `f` (exact) and `e`.
+fn log_parts(x: f32) -> (f32, i32) {
+    var xs = x
+    var e: i32 = 0
+    if bitcast_u32(x) < 0x800000 {
+        // A subnormal: made normal first.
+        xs = x * 8388608.0
+        e = -23
+    }
+    let bits = bitcast_u32(xs)
+    e += i32(bits >> 23) - 127
+    var m = bitcast_f32((bits & 0x7fffff) | 0x3f800000)
+    if m > f(0x3fb504f3) {
+        m = m * 0.5
+        e += 1
+    }
+    (m - 1.0, e)
+}
+
+/// (log(1 + f) - f + f²/2) / f³ for √½ - 1 <= f <= √2 - 1.
+fn log_tail(x: f32) -> f32 {
+    var p = f(0xbd9c59d3)
+    p = p * x + f(0x3e02ad0f)
+    p = p * x + f(0xbe06c27f)
+    p = p * x + f(0x3e116d23)
+    p = p * x + f(0xbe2a3928)
+    p = p * x + f(0x3e4cd003)
+    p = p * x + f(0xbe800113)
+    p * x + f(0x3eaaaaaa)
+}
+
+/// What `log` and `log2` give at an argument that isn't positive and finite, or `None`.
+fn log_edge(x: f32) -> Option<f32> {
+    if is_nan(x) || x < 0.0 {
+        return Some((x - x) / (x - x))
+    }
+    if x == 0.0 {
+        return Some(-1.0 / 0.0)
+    }
+    if is_inf(x) {
+        return Some(x)
+    }
+    None
+}
+
+/// The natural logarithm of `x`: minus infinity at 0, and NaN below 0.
+pub fn log(x: f32) -> f32 {
+    match log_edge(x) {
+        Some(v) => return v,
+        None => {},
+    }
+    let (fr, e) = log_parts(x)
+    let z = fr * fr
+    let y = (fr * z) * log_tail(fr)
+    let ef = f32(e)
+    let hz = 0.5 * z
+    ef * f(0x3f317000) + (fr - (hz - (y + ef * (f(0x3805fc00) + f(0x30fa39ef)))))
+}
+
+/// `(a_hi + a_lo) · b` in two floats.
+fn times(a_hi: f32, a_lo: f32, b: f32) -> (f32, f32) {
+    let (p, pe) = two_product(a_hi, b)
+    let lo = pe + a_lo * b
+    let hi = p + lo
+    (hi, lo - (hi - p))
+}
+
+/// `(a_hi + a_lo) + (b_hi + b_lo)` in two floats.
+fn plus(a_hi: f32, a_lo: f32, b_hi: f32, b_lo: f32) -> (f32, f32) {
+    let (s, e) = two_sum(a_hi, b_hi)
+    let lo = e + (a_lo + b_lo)
+    let hi = s + lo
+    (hi, lo - (hi - s))
+}
+
+/// log2(x) as two floats, `hi + lo`, within about 2⁻⁴⁰ of it relatively, for a positive, finite
+/// `x`: e + 2 atanh(s) log2(e), s = f / (2 + f), its first two terms and the products carried in
+/// two floats (what `pow` needs: its error is y times this).
+fn log2_parts(x: f32) -> (f32, f32) {
+    let (fr, e) = log_parts(x)
+    // s = f / (2 + f) in two floats: 2 + f's rounding, then the quotient's.
+    let d = 2.0 + fr
+    let d_lo = (2.0 - d) + fr
+    let s = fr / d
+    let (p, pe) = two_product(s, d)
+    let s_lo = (((fr - p) - pe) - s * d_lo) / d
+    // 2 atanh(s) = 2s + (2/3) s³ + 2 s⁵ (1/5 + s²/7 + s⁴/9 + s⁶/11 + s⁸/13).
+    let (s2, s2_lo) = two_product(s, s)
+    let (s3, s3_l) = times(s2, s2_lo + 2.0 * s * s_lo, s)
+    let s3_lo = s3_l + s2 * s_lo
+    let (t3, t3_lo) = times(s3, s3_lo, f(0x3f2aaaab))
+    let z = s2
+    var q = f(0x3d9d89d9)
+    q = q * z + f(0x3dba2e8c)
+    q = q * z + f(0x3de38e39)
+    q = q * z + f(0x3e124925)
+    q = q * z + f(0x3e4ccccd)
+    let t5 = 2.0 * ((s3 * s2) * q)
+    let (a, a_lo) = plus(2.0 * s, 2.0 * s_lo, t3, t3_lo + f(0xb2aaaaab) * s3)
+    let (ln, ln_lo) = plus(a, a_lo, t5, 0.0)
+    // Times log2(e), in two floats.
+    let (p2, p2_lo) = two_product(ln, f(0x3fb8aa3b))
+    let lo = p2_lo + (ln * f(0x32a57060) + ln_lo * f(0x3fb8aa3b))
+    // Plus e.
+    plus(f32(e), 0.0, p2, lo)
+}
+
+/// The base-2 logarithm of `x`: minus infinity at 0, and NaN below 0.
+pub fn log2(x: f32) -> f32 {
+    match log_edge(x) {
+        Some(v) => return v,
+        None => {},
+    }
+    let (hi, lo) = log2_parts(x)
+    hi + lo
+}
+
+/// Whether `y` is an odd integer (every f32 of magnitude 2^24 or more is even).
+fn is_odd(y: f32) -> bool {
+    abs(y) < 16777216.0 && floor(y) == y && (i32(y) & 1) == 1
+}
+
+/// `x` to the power `y`, with the values C and IEEE 754 give at zeros, infinities and NaNs:
+/// 2^(y log2 |x|), the logarithm and the product carried in two floats.
+pub fn pow(x: f32, y: f32) -> f32 {
+    if y == 0.0 || x == 1.0 {
+        return 1.0
+    }
+    if is_nan(x) || is_nan(y) {
+        return x + y
+    }
+    let inf = 1.0 / 0.0
+    if is_inf(y) {
+        if x == -1.0 {
+            return 1.0
+        }
+        // |x| < 1 goes to 0 as y goes to +inf, and |x| > 1 to inf; the other way for -inf.
+        return if (abs(x) < 1.0) == (y > 0.0) { 0.0 } else { inf }
+    }
+    // A negative base (-0 too) gives an odd power its sign.
+    let neg = (bitcast_u32(x) >> 31) == 1 && is_odd(y)
+    if x == 0.0 || is_inf(x) {
+        let r = if (x == 0.0) == (y > 0.0) { 0.0 } else { inf }
+        return if neg { -r } else { r }
+    }
+    if x < 0.0 && floor(y) != y {
+        return (x - x) / (x - x)
+    }
+    if abs(x) == 1.0 {
+        // -1 to a finite power: ±1 (and y's split below could overflow).
+        return if neg { -1.0 } else { 1.0 }
+    }
+    let (lh, ll) = log2_parts(abs(x))
+    // y · log2|x| in two floats; its size alone decides an overflow or an underflow (|log2|x||
+    // is at least 2⁻²³ here, so a |y| past 2⁶⁴, whose split would overflow, is decided by it).
+    let ph = y * lh
+    var r: f32 = 0.0
+    if ph >= 129.0 {
+        r = inf
+    } else if ph < -151.0 {
+        r = 0.0
+    } else {
+        let (p, p_lo) = two_product(y, lh)
+        let lo = p_lo + y * ll
+        let n = round(p)
+        let (fr, fr_lo) = two_sum(p - n, lo)
+        r = exp2_parts(fr, fr_lo, i32(n))
+    }
+    if neg { -r } else { r }
+}
+
+// ---- hyperbolic functions -----------------------------------------------------------------------
+
+/// e^a / 2 for 88 < a <= 89.5, where e^a alone would overflow: 2ⁿ⁻¹ e^r.
+fn half_exp(a: f32) -> f32 {
+    let (r, n) = reduce_ln2(a)
+    scaled(1.0 + expm1_kernel(r), i32(n) - 1)
+}
+
+/// The hyperbolic sine of `x`, (e^x - e^-x) / 2.
+pub fn sinh(x: f32) -> f32 {
+    if is_nan(x) {
+        return x
+    }
+    // Odd: from |x|, then x's sign (by its bit, so -0 stays -0).
+    let a = abs(x)
+    if a > 89.5 {
+        return with_sign_of(1.0 / 0.0, x)
+    }
+    if a > 88.0 {
+        // e^a / 2 would overflow before the half: 2ⁿ⁻¹ e^r.
+        return with_sign_of(half_exp(a), x)
+    }
+    // With E = e^a - 1, e^a - e^-a = E + E / (E + 1): no cancellation near 0.
+    let e = expm1(a)
+    with_sign_of(0.5 * (e + e / (e + 1.0)), x)
+}
+
+/// The hyperbolic cosine of `x`, (e^x + e^-x) / 2.
+pub fn cosh(x: f32) -> f32 {
+    if is_nan(x) {
+        return abs(x)
+    }
+    let a = abs(x)
+    if a > 89.5 {
+        return 1.0 / 0.0
+    }
+    if a > 88.0 {
+        return half_exp(a)
+    }
+    let e = exp(a)
+    0.5 * e + 0.5 / e
+}
+
+/// The hyperbolic tangent of `x`, sinh(x) / cosh(x), in [-1, 1].
+pub fn tanh(x: f32) -> f32 {
+    if is_nan(x) {
+        return x
+    }
+    // Odd: from |x|, then x's sign. Past 9.1 it's 1 to within f32's precision.
+    let a = abs(x)
+    if a > 9.1 {
+        return with_sign_of(1.0, x)
+    }
+    // With E = e^(2a) - 1, (e^(2a) - 1) / (e^(2a) + 1) = E / (E + 2).
+    let e = expm1(2.0 * a)
+    with_sign_of(e / (e + 2.0), x)
+}
+
+// ---- inverse trigonometric functions ------------------------------------------------------------
+
+/// atan of a non-negative `a`, by a reduction to |t| < 7/16 (fdlibm's) and an odd polynomial.
+fn atan_positive(a: f32) -> f32 {
+    if a > 67108864.0 {
+        return f(0x3fc90fdb) + f(0xb33bbd2e)
+    }
+    // The table: atan of 0.5, 1, 1.5 and ∞, each in two floats.
+    var hi: f32 = 0.0
+    var lo: f32 = 0.0
+    var t = a
+    var reduced = true
+    if a < 0.4375 {
+        reduced = false
+    } else if a < 0.6875 {
+        hi = f(0x3eed6338)
+        lo = f(0x31ac376a)
+        t = (2.0 * a - 1.0) / (2.0 + a)
+    } else if a < 1.1875 {
+        hi = f(0x3f490fdb)
+        lo = f(0xb2bbbd2e)
+        t = (a - 1.0) / (a + 1.0)
+    } else if a < 2.4375 {
+        hi = f(0x3f7b985f)
+        lo = f(0xb2d7e096)
+        t = (a - 1.5) / (1.0 + 1.5 * a)
+    } else {
+        hi = f(0x3fc90fdb)
+        lo = f(0xb33bbd2e)
+        t = -1.0 / a
+    }
+    let z = t * t
+    var p = f(0x3d6e5a68)
+    p = p * z + f(0xbdd6da32)
+    p = p * z + f(0x3e11b602)
+    p = p * z + f(0xbe4cc6df)
+    p = p * z + f(0x3eaaaaa1)
+    let tail = (t * z) * p
+    if reduced { hi + ((t - tail) + lo) } else { t - tail }
+}
+
+/// The angle whose tangent is `x`, in [-π/2, π/2].
+pub fn atan(x: f32) -> f32 {
+    if is_nan(x) {
+        return x
+    }
+    with_sign_of(atan_positive(abs(x)), x)
+}
+
+/// The angle from the positive x axis to the point `(x, y)`, in [-π, π].
+pub fn atan2(y: f32, x: f32) -> f32 {
+    if is_nan(x) || is_nan(y) {
+        return x + y
+    }
+    let x_neg = (bitcast_u32(x) >> 31) == 1
+    if y == 0.0 {
+        return if x_neg { with_sign_of(f(0x40490fdb), y) } else { y }
+    }
+    if x == 0.0 {
+        return with_sign_of(f(0x3fc90fdb), y)
+    }
+    var t: f32 = 0.0
+    if is_inf(x) && is_inf(y) {
+        t = f(0x3f490fdb)
+    } else if is_inf(x) {
+        t = 0.0
+    } else if is_inf(y) {
+        t = f(0x3fc90fdb)
+    } else {
+        // |y / x| without an overflow or an underflow that the angle would show.
+        let ay = abs(y)
+        let ax = abs(x)
+        if ay > ax * 67108864.0 {
+            t = f(0x3fc90fdb)
+        } else {
+            t = atan_positive(ay / ax)
+        }
+    }
+    let r = if x_neg { (f(0x40490fdb) - t) + f(0xb3bbbd2e) } else { t }
+    with_sign_of(r, y)
+}
+
+/// The angle whose sine is `x`, in [-π/2, π/2]; NaN outside [-1, 1].
+pub fn asin(x: f32) -> f32 {
+    if is_nan(x) || abs(x) > 1.0 {
+        return (x - x) / (x - x)
+    }
+    atan2(x, sqrt((1.0 - x) * (1.0 + x)))
+}
+
+/// The angle whose cosine is `x`, in [0, π]; NaN outside [-1, 1].
+pub fn acos(x: f32) -> f32 {
+    if is_nan(x) || abs(x) > 1.0 {
+        return (x - x) / (x - x)
+    }
+    atan2(sqrt((1.0 - x) * (1.0 + x)), x)
+}
+
+// ---- the square root and the remainder of a strict kernel ---------------------------------------
+
+/// The correctly rounded square root of `x`: what `sqrt` is in a strict kernel, whose GPU's own
+/// isn't correctly rounded (the M4's differs in 605,737,168 of the 2³² arguments by an ulp,
+/// `toolchain/host`'s `the_gpu_rounds_the_safe_operations_as_the_cpu_does`, which holds each
+/// machine's to within one ulp): the GPU's root, set right by `sqrt_from`. A subnormal is a zero
+/// of its sign, as the strict model takes it. The CPU's `sqrt` gives the same bits for every
+/// other argument.
+pub fn sqrt_rounded(x: f32) -> f32 {
+    let bits = bitcast_u32(x)
+    let mag = bits & 0x7fffffff
+    if mag < 0x800000 {
+        // A zero or a subnormal: a zero of its sign.
+        return bitcast_f32(bits & 0x80000000)
+    }
+    if (bits >> 31) == 1 || mag >= 0x7f800000 {
+        // Below zero (a NaN), an infinity or a NaN: the root's own.
+        return sqrt(x)
+    }
+    sqrt_from(x, sqrt(x))
+}
+
+/// The correctly rounded square root of `x`, a positive normal f32, from `r`, a root of it
+/// within one ulp: `r`, or its neighbour where the root is past the midpoint between them.
+///
+/// With R the 24 bits of r's significand and u its ulp, 4x/u² is an integer and a midpoint's
+/// square times 4/u² is (2R ± 1)². They differ by less than 2²⁸ (the root is within 1.5 u of
+/// the midpoint), so their difference's low 32 bits, a wrapping subtraction of a wrapping
+/// square, are the whole of it, and its sign says on which side the root is; a root is never at
+/// a midpoint. Below a power of two the neighbour is u/2 away and the midpoint r - u/4: 4x/u²
+/// at most 4R² - 2R. Every x with each of its root's two neighbours as `r`:
+/// `toolchain/tests`' `every_root_is_set_right_from_a_neighbour`.
+pub fn sqrt_from(x: f32, r: f32) -> f32 {
+    let rb = bitcast_u32(r)
+    let er = i32(rb >> 23) - 127
+    let big_r = (rb & 0x7fffff) | 0x800000
+    let xb = bitcast_u32(x)
+    let ex = i32(xb >> 23) - 127
+    let big_x = (xb & 0x7fffff) | 0x800000
+    // 4x / u², u = 2^(er - 23): its low 32 bits.
+    let xl = big_x << u32(ex - 2 * er + 25)
+    // Past the midpoint above: r + u.
+    let c_up = 2 * big_r + 1
+    let up = xl.wrapping_sub(c_up.wrapping_mul(c_up))
+    if up != 0 && up < 0x80000000 {
+        return f32(big_r + 1) * pow2i(er - 23)
+    }
+    if big_r == 0x800000 {
+        // Below r - u/4: r - u/2.
+        let two_r = 2 * big_r
+        let d = xl.wrapping_sub(two_r.wrapping_mul(two_r).wrapping_sub(two_r))
+        if d == 0 || d >= 0x80000000 {
+            return f32(two_r - 1) * pow2i(er - 24)
+        }
+    } else {
+        // Below r - u/2: r - u.
+        let c_down = 2 * big_r - 1
+        let down = xl.wrapping_sub(c_down.wrapping_mul(c_down))
+        if down >= 0x80000000 {
+            return f32(big_r - 1) * pow2i(er - 23)
+        }
+    }
+    r
+}
+
+/// `a % b` of f32s as the CPU computes it, exactly: `a - b·trunc(a/b)` with no rounding, `a`'s
+/// sign (C's `fmod`), a NaN where `a` is infinite or `b` is 0 or either is a NaN. What a strict
+/// kernel's `%` of floats is: a GPU's rounds at each step. From the bits, by shifts and integer
+/// subtraction (musl's `fmodf`, MIT licence).
+pub fn rem_exact(a: f32, b: f32) -> f32 {
+    var ux = bitcast_u32(a)
+    var uy = bitcast_u32(b)
+    var ex = i32((ux >> 23) & 0xff)
+    var ey = i32((uy >> 23) & 0xff)
+    let sx = ux & 0x80000000
+    if (uy << 1) == 0 || is_nan(b) || ex == 0xff {
+        return (a * b) / (a * b)
+    }
+    if (ux << 1) <= (uy << 1) {
+        if (ux << 1) == (uy << 1) {
+            return 0.0 * a
+        }
+        return a
+    }
+    // Each mantissa with its leading one, normalized where subnormal (its leading zeros counted).
+    if ex == 0 {
+        let lead = i32((ux << 9).leading_zeros())
+        ex -= lead
+        ux = ux << u32(1 - ex)
+    } else {
+        ux = (ux & 0x7fffff) | 0x800000
+    }
+    if ey == 0 {
+        let lead = i32((uy << 9).leading_zeros())
+        ey -= lead
+        uy = uy << u32(1 - ey)
+    } else {
+        uy = (uy & 0x7fffff) | 0x800000
+    }
+    // x mod y, a bit at a time: at most 277 steps (the exponents' widest difference), a bound the
+    // work count sees.
+    for _ in 0..277 {
+        if ex <= ey {
+            break
+        }
+        let i = ux.wrapping_sub(uy)
+        if (i >> 31) == 0 {
+            if i == 0 {
+                return 0.0 * a
+            }
+            ux = i
+        }
+        ux = ux << 1
+        ex -= 1
+    }
+    let i = ux.wrapping_sub(uy)
+    if (i >> 31) == 0 {
+        if i == 0 {
+            return 0.0 * a
+        }
+        ux = i
+    }
+    // Normalized again: shifted up past its leading zeros.
+    let lead = ux.leading_zeros() - 8
+    ux = ux << lead
+    ex -= i32(lead)
+    // The result, its exponent restored (a subnormal shifted down).
+    if ex > 0 {
+        ux = (ux - 0x800000) | (u32(ex) << 23)
+    } else {
+        ux = ux >> u32(1 - ex)
+    }
+    bitcast_f32(ux | sx)
+}
+
+// ---- f64 helpers ------------------------------------------------------------------------------
 
 // atan's table (atan of 0.5, 1, 1.5 and ∞, each in two parts) and polynomial, for f32's and
 // f64's.
@@ -81,335 +848,6 @@ const AT: [f64; 11] = [
     -0.0365315727442169155270,
     0.0162858201153657823623,
 ]
-
-const F32_MAX: f32 = 340282346638528859811704183484516925440.0
-
-fn is_nan(x: f32) -> bool {
-    x != x
-}
-
-fn is_inf(x: f32) -> bool {
-    abs(x) > F32_MAX
-}
-
-/// Whether `x` is a number: not a NaN, not an infinity.
-pub fn is_finite(x: f32) -> bool {
-    abs(x) <= F32_MAX
-}
-
-/// A finite `x` reduced to `y = x - n * pi/2` with |y| <= pi/4, and `n`: exact for |x| < 2^20,
-/// and beyond that only its last two bits (the quadrant), since `n` can be far beyond an i32.
-fn reduce(x: f32) -> (f64, i32) {
-    if abs(x) >= 1048576.0 {
-        let (y, q) = reduce_large(x)
-        return if x < 0.0 { (-y, -q) } else { (y, q) }
-    }
-    // |n| < 2^20, so `n * PIO2_HI` is exact.
-    let xd = f64(x)
-    let n = round(xd * INV_PIO2)
-    ((xd - n * PIO2_HI) - n * PIO2_LO, i32(n))
-}
-
-/// `reduce` of |x| for |x| >= 2: |x| * 2/π modulo 4, in fixed point with 62 bits after the
-/// point, from the 96 bits of 4/π that matter at x's exponent (the bits before them give
-/// multiples of 4, and the bits after them less than 2^-62). Accurate to 33 bits.
-fn reduce_large(x: f32) -> (f64, i32) {
-    let xi = bitcast_u32(x)
-    let k = (xi >> 26) & 15
-    let m = ((xi & 0x7fffff) | 0x800000) << ((xi >> 23) & 7)
-    var r = (u64(m.wrapping_mul(INV_PIO4[k])) << 32) | ((u64(m) * u64(INV_PIO4[k + 8])) >> 32)
-    r = r.wrapping_add(u64(m) * u64(INV_PIO4[k + 4]))
-    // The quadrant is the top two bits, rounded; the rest is y, signed.
-    let n = r.wrapping_add(0x2000000000000000) >> 62
-    r = r.wrapping_sub(n << 62)
-    (f64(i64(r)) * PIO2_2N62, i32(n))
-}
-
-fn sin_kernel(x: f64) -> f64 {
-    let z = x * x
-    let w = z * z
-    let r = S3 + z * S4
-    let s = z * x
-    (x + s * (S1 + z * S2)) + s * w * r
-}
-
-fn cos_kernel(x: f64) -> f64 {
-    let z = x * x
-    let w = z * z
-    let r = C2 + z * C3
-    ((1.0 + z * C0) + w * C1) + (w * z) * r
-}
-
-/// sin(y + q·π/2) for a reduced `y`, rounded to f32: `q & 3` picks the kernel and the sign.
-fn sin_quadrant(y: f64, q: i32) -> f32 {
-    let k = q & 3
-    let r = if k == 0 {
-        sin_kernel(y)
-    } else if k == 1 {
-        cos_kernel(y)
-    } else if k == 2 {
-        -sin_kernel(y)
-    } else {
-        -cos_kernel(y)
-    }
-    f32(r)
-}
-
-/// The sine of `x`, in radians.
-pub fn sin(x: f32) -> f32 {
-    if is_nan(x) || is_inf(x) {
-        return x - x
-    }
-    // sin(x) rounds to x, keeping -0's sign.
-    if abs(x) < 0.000244140625 {
-        return x
-    }
-    let (y, n) = reduce(x)
-    sin_quadrant(y, n)
-}
-
-/// The cosine of `x`, in radians: sin(x + π/2), one quadrant on.
-pub fn cos(x: f32) -> f32 {
-    if is_nan(x) || is_inf(x) {
-        return x - x
-    }
-    let (y, n) = reduce(x)
-    // `& 3` before `+ 1`, so the sum can't overflow.
-    sin_quadrant(y, (n & 3) + 1)
-}
-
-/// The tangent of `x`, in radians.
-pub fn tan(x: f32) -> f32 {
-    if is_nan(x) || is_inf(x) {
-        return x - x
-    }
-    // tan(x) rounds to x, keeping -0's sign.
-    if abs(x) < 0.000244140625 {
-        return x
-    }
-    let (y, n) = reduce(x)
-    let z = y * y
-    var r = T[4] + z * T[5]
-    let t = T[2] + z * T[3]
-    let w = z * z
-    let s = z * y
-    let u = T[0] + z * T[1]
-    r = (y + s * u) + (s * w) * (t + w * r)
-    if (n & 1) == 1 {
-        f32(-1.0 / r)
-    } else {
-        f32(r)
-    }
-}
-
-/// e^r for |r| <= ln(2)/2, by its Taylor series to degree 11.
-fn exp_poly(r: f64) -> f64 {
-    1.0 + r * exp_tail(r)
-}
-
-/// (e^r - 1) / r for |r| <= ln(2)/2: `exp_poly`'s series after its 1, divided by r.
-fn exp_tail(r: f64) -> f64 {
-    // Horner's rule, from the highest degree down.
-    var p = 0.0000000250521083854417188
-    p = 0.000000275573192239858907 + r * p
-    p = 0.00000275573192239858907 + r * p
-    p = 0.0000248015873015873016 + r * p
-    p = 0.000198412698412698413 + r * p
-    p = 0.00138888888888888889 + r * p
-    p = 0.00833333333333333333 + r * p
-    p = 0.0416666666666666667 + r * p
-    p = 0.166666666666666667 + r * p
-    p = 0.5 + r * p
-    1.0 + r * p
-}
-
-/// e^x for an f64 `x`, |x| <= 700.
-fn wide_exp(x: f64) -> f64 {
-    let n = round(x * LOG2E)
-    exp_poly(x - n * LN2) * pow2(i32(n))
-}
-
-/// e^x - 1 for an f64 `x`, |x| <= 700: near 0, without the cancellation of `e^x - 1`.
-fn wide_expm1(x: f64) -> f64 {
-    if abs(x) <= HALF_LN2 {
-        x * exp_tail(x)
-    } else {
-        wide_exp(x) - 1.0
-    }
-}
-
-/// 2^n as an f64, for -1022 <= n <= 1023.
-fn pow2(n: i32) -> f64 {
-    bitcast_f64(u64(n + 1023) << 52)
-}
-
-/// 2^x for an f64 `x`; overflows to infinity and underflows to 0 at f32's limits.
-fn wide_exp2(x: f64) -> f64 {
-    if x > 129.0 {
-        return 1.0 / 0.0
-    }
-    if x < -151.0 {
-        return 0.0
-    }
-    let n = round(x)
-    exp_poly((x - n) * LN2) * pow2(i32(n))
-}
-
-/// e to the power `x`.
-pub fn exp(x: f32) -> f32 {
-    if is_nan(x) {
-        return x
-    }
-    let xd = f64(x)
-    if xd > 89.0 {
-        return f32(1.0 / 0.0)
-    }
-    if xd < -104.0 {
-        return 0.0
-    }
-    f32(wide_exp(xd))
-}
-
-/// The hyperbolic sine of `x`, (e^x - e^-x) / 2.
-pub fn sinh(x: f32) -> f32 {
-    if is_nan(x) {
-        return x
-    }
-    // Odd: from |x|, then x's sign (by its bit, so -0 stays -0).
-    let a = abs(f64(x))
-    if a > 90.0 {
-        return with_sign_of(1.0 / 0.0, x)
-    }
-    // With E = e^a - 1, e^a - e^-a = E + E / (E + 1): no cancellation near 0.
-    let e = wide_expm1(a)
-    with_sign_of(f32(0.5 * (e + e / (e + 1.0))), x)
-}
-
-/// The hyperbolic cosine of `x`, (e^x + e^-x) / 2.
-pub fn cosh(x: f32) -> f32 {
-    if is_nan(x) {
-        return x
-    }
-    let a = abs(f64(x))
-    if a > 90.0 {
-        return f32(1.0 / 0.0)
-    }
-    let e = wide_exp(a)
-    f32(0.5 * (e + 1.0 / e))
-}
-
-/// The hyperbolic tangent of `x`, sinh(x) / cosh(x), in [-1, 1].
-pub fn tanh(x: f32) -> f32 {
-    if is_nan(x) {
-        return x
-    }
-    // Odd: from |x|, then x's sign. Past 20 it's 1 to within f64's precision.
-    let a = abs(f64(x))
-    if a > 20.0 {
-        return with_sign_of(1.0, x)
-    }
-    // With E = e^(2a) - 1, (e^(2a) - 1) / (e^(2a) + 1) = E / (E + 2).
-    let e = wide_expm1(2.0 * a)
-    with_sign_of(f32(e / (e + 2.0)), x)
-}
-
-/// `r`, a magnitude, with the sign of `x`.
-fn with_sign_of(r: f32, x: f32) -> f32 {
-    if (bitcast_u32(x) >> 31) == 1 { -r } else { r }
-}
-
-/// 2 to the power `x`.
-pub fn exp2(x: f32) -> f32 {
-    if is_nan(x) {
-        return x
-    }
-    f32(wide_exp2(f64(x)))
-}
-
-/// log2 of a positive, finite f64: the exponent plus log2 of the mantissa.
-fn wide_log2(x: f64) -> f64 {
-    let bits = bitcast_u64(x)
-    var e = i32((bits >> 52) & 2047) - 1023
-    var m = bitcast_f64((bits & 4503599627370495) | 4607182418800017408)
-    if m > SQRT2 {
-        m = m * 0.5
-        e = e + 1
-    }
-    // log(1 + f) = 2 atanh(s) with s = f / (2 + f): |s| <= 0.172.
-    let f = m - 1.0
-    let s = f / (2.0 + f)
-    let z = s * s
-    var q = 0.0769230769230769231
-    q = 0.0909090909090909091 + z * q
-    q = 0.111111111111111111 + z * q
-    q = 0.142857142857142857 + z * q
-    q = 0.2 + z * q
-    q = 0.333333333333333333 + z * q
-    let ln = 2.0 * s * (1.0 + z * q)
-    f64(e) + ln * LOG2E
-}
-
-/// log2(x) times `scale`, rounded once to f32.
-fn log2_scaled(x: f32, scale: f64) -> f32 {
-    if is_nan(x) || x < 0.0 {
-        return (x - x) / (x - x)
-    }
-    if x == 0.0 {
-        return -1.0 / 0.0
-    }
-    if is_inf(x) {
-        return x
-    }
-    f32(wide_log2(f64(x)) * scale)
-}
-
-/// The base-2 logarithm of `x`: minus infinity at 0, and NaN below 0.
-pub fn log2(x: f32) -> f32 {
-    log2_scaled(x, 1.0)
-}
-
-/// The natural logarithm of `x`: minus infinity at 0, and NaN below 0.
-pub fn log(x: f32) -> f32 {
-    log2_scaled(x, LN2)
-}
-
-/// Whether `y` is an odd integer (every f32 of magnitude 2^24 or more is even).
-fn is_odd(y: f32) -> bool {
-    abs(y) < 16777216.0 && floor(y) == y && (i32(y) & 1) == 1
-}
-
-/// `x` to the power `y`, with the values C and IEEE 754 give at zeros, infinities and NaNs.
-pub fn pow(x: f32, y: f32) -> f32 {
-    if y == 0.0 || x == 1.0 {
-        return 1.0
-    }
-    if is_nan(x) || is_nan(y) {
-        return x + y
-    }
-    let inf = 1.0 / 0.0
-    if is_inf(y) {
-        if x == -1.0 {
-            return 1.0
-        }
-        // |x| < 1 goes to 0 as y goes to +inf, and |x| > 1 to inf; the other way for -inf.
-        return if (abs(x) < 1.0) == (y > 0.0) { 0.0 } else { inf }
-    }
-    // A negative base (-0 too) gives an odd power its sign.
-    let neg = sign_bit(f64(x)) && is_odd(y)
-    if x == 0.0 || is_inf(x) {
-        let r = if (x == 0.0) == (y > 0.0) { 0.0 } else { inf }
-        return if neg { -r } else { r }
-    }
-    if x < 0.0 && floor(y) != y {
-        return (x - x) / (x - x)
-    }
-    let r = f32(wide_exp2(f64(y) * wide_log2(abs(f64(x)))))
-    if neg {
-        -r
-    } else {
-        r
-    }
-}
 
 /// atan of an f64, by a reduction to |a| < 7/16 and an odd polynomial.
 fn wide_atan(x: f64) -> f64 {
@@ -456,59 +894,6 @@ fn wide_atan(x: f64) -> f64 {
 /// Whether an f64's sign bit is set (true for -0.0).
 fn sign_bit(x: f64) -> bool {
     (bitcast_u64(x) >> 63) == 1
-}
-
-fn wide_atan2(y: f64, x: f64) -> f64 {
-    if x != x || y != y {
-        return x + y
-    }
-    let big = 1.0e300
-    if y == 0.0 {
-        if sign_bit(x) {
-            return if sign_bit(y) { -PI_F64 } else { PI_F64 }
-        }
-        return y
-    }
-    if x == 0.0 {
-        return if y > 0.0 { PI_F64 * 0.5 } else { -PI_F64 * 0.5 }
-    }
-    if abs(x) > big && abs(y) > big {
-        let q = if x > 0.0 { PI_F64 * 0.25 } else { PI_F64 * 0.75 }
-        return if y > 0.0 { q } else { -q }
-    }
-    let t = wide_atan(abs(y / x))
-    let r = if x > 0.0 {
-        t
-    } else {
-        PI_F64 - t
-    }
-    if y < 0.0 {
-        -r
-    } else {
-        r
-    }
-}
-
-/// The angle whose tangent is `x`, in [-π/2, π/2].
-pub fn atan(x: f32) -> f32 {
-    f32(atan_f64(f64(x)))
-}
-
-/// The angle from the positive x axis to the point `(x, y)`, in [-π, π].
-pub fn atan2(y: f32, x: f32) -> f32 {
-    f32(wide_atan2(f64(y), f64(x)))
-}
-
-/// The angle whose sine is `x`, in [-π/2, π/2]; NaN outside [-1, 1].
-pub fn asin(x: f32) -> f32 {
-    let xd = f64(x)
-    f32(wide_atan2(xd, sqrt((1.0 - xd) * (1.0 + xd))))
-}
-
-/// The angle whose cosine is `x`, in [0, π]; NaN outside [-1, 1].
-pub fn acos(x: f32) -> f32 {
-    let xd = f64(x)
-    f32(wide_atan2(sqrt((1.0 - xd) * (1.0 + xd)), xd))
 }
 
 // ---- f64 ----------------------------------------------------------------------------------
@@ -1040,6 +1425,179 @@ fn the_f64_functions_are_within_an_ulp_of_their_values() {
             pow_f64(2.0, y: -3.0) == 0.125 &&
             pow_f64(2.0, y: 10.0) == 1024.0,
     )
+}
+
+/// How far `got` is from `want`, in units in the last place of an f32 at `want` (below the least
+/// normal f32, the subnormals' step): 0 where both are the same infinity, or both NaNs. What
+/// `STRICT_ULPS` measures.
+pub fn f32_ulps(got: f32, want: f64) -> f64 {
+    if got != got && want != want {
+        return 0.0
+    }
+    let g = f64(got)
+    if g == want {
+        return 0.0
+    }
+    let w = abs(want)
+    // At or past the largest f32 and half its ulp, the value rounds to an infinity.
+    if w >= 340282356779733661637539395458142568448.0 {
+        // Past the largest f32 by more than its rounding: an infinity, or off by everything.
+        return if abs(g) > 340282346638528859811704183484516925440.0 && (g > 0.0) == (want > 0.0) {
+            0.0
+        } else {
+            1.0 / 0.0
+        }
+    }
+    // The ulp: 2^(e - 23) for want's exponent e, at least 2^-149.
+    var ulp = 0.00000000000000000000000000000000000000000000140129846432481707092
+    var p = 1.0
+    if w >= 0.0000000000000000000000000000000000000117549435082228750797 {
+        let e = i32((bitcast_u64(w) >> 52) & 2047) - 1023
+        ulp = bitcast_f64(u64(e - 23 + 1023) << 52)
+        p = 0.0
+    }
+    let _ = p
+    abs(g - want) / ulp
+}
+
+/// sin and cos of an f32 in f64, for a test: by `sin_f64` and `cos_f64` where they hold, and
+/// beyond by 2/π's bits (an integer reduction, to 62 bits).
+fn sin_cos_reference(x: f32) -> (f64, f64) {
+    if !is_finite(x) {
+        let nan = f64(x - x)
+        return (nan, nan)
+    }
+    if abs(x) < 1000000.0 {
+        return (sin_f64(f64(x)), cos_f64(f64(x)))
+    }
+    let xi = bitcast_u32(x)
+    let k = (xi >> 26) & 15
+    let m = ((xi & 0x7fffff) | 0x800000) << ((xi >> 23) & 7)
+    var r = (u64(m.wrapping_mul(REF_INV_PIO4[k])) << 32) |
+        ((u64(m) * u64(REF_INV_PIO4[k + 8])) >> 32)
+    r = r.wrapping_add(u64(m) * u64(REF_INV_PIO4[k + 4]))
+    let n = r.wrapping_add(0x2000000000000000) >> 62
+    r = r.wrapping_sub(n << 62)
+    let y = f64(i64(r)) * 0.00000000000000000034061215800865545
+    let q = if x < 0.0 { (4 - u32(n)) & 3 } else { u32(n) }
+    let yy = if x < 0.0 { -y } else { y }
+    let (s, c) = (sin_f64(yy), cos_f64(yy))
+    if q == 0 {
+        (s, c)
+    } else if q == 1 {
+        (c, -s)
+    } else if q == 2 {
+        (-s, -c)
+    } else {
+        (-c, s)
+    }
+}
+
+// 4/π's bits for `sin_cos_reference`, each entry the 32 after the previous one's first 8
+// (ARM's optimized-routines' `__inv_pio4`, MIT licence).
+const REF_INV_PIO4: [u32; 24] = [
+    0xa2, 0xa2f9, 0xa2f983, 0xa2f9836e, 0xf9836e4e, 0x836e4e44, 0x6e4e4415, 0x4e441529, 0x441529fc,
+    0x1529fc27, 0x29fc2757, 0xfc2757d1, 0x2757d1f5, 0x57d1f534, 0xd1f534dd, 0xf534ddc0, 0x34ddc0db,
+    0xddc0db62, 0xc0db6295, 0xdb629599, 0x6295993c, 0x95993c43, 0x993c4390, 0x3c439041,
+]
+
+/// Function `k` of `STRICT_ULPS`'s list at `x` (`y` the second argument of `atan2` and `pow`),
+/// and its value in f64 by the f64 functions: what the errors are measured against.
+pub fn strict_and_reference(k: u32, x: f32, y: f32) -> (f32, f64) {
+    let xd = f64(x)
+    if k == 0 {
+        (sin(x), sin_cos_reference(x).0)
+    } else if k == 1 {
+        (cos(x), sin_cos_reference(x).1)
+    } else if k == 2 {
+        let (s, c) = sin_cos_reference(x)
+        (tan(x), s / c)
+    } else if k == 3 {
+        (exp(x), exp_f64(xd))
+    } else if k == 4 {
+        (exp2(x), pow_f64(2.0, xd))
+    } else if k == 5 {
+        (log(x), if x > 0.0 { log_f64(xd) } else if x == 0.0 { -1.0 / 0.0 } else {
+            (xd - xd) / (xd - xd)
+        })
+    } else if k == 6 {
+        (log2(x), if x > 0.0 { log2_f64(xd) } else if x == 0.0 { -1.0 / 0.0 } else {
+            (xd - xd) / (xd - xd)
+        })
+    } else if k == 7 {
+        let e = exp_f64(abs(xd))
+        let v = if abs(xd) < 0.001 { xd * (1.0 + xd * xd / 6.0) } else { 0.5 * (e - 1.0 / e) }
+        (sinh(x), if x < 0.0 && abs(xd) >= 0.001 { -v } else { v })
+    } else if k == 8 {
+        let e = exp_f64(abs(xd))
+        (cosh(x), 0.5 * (e + 1.0 / e))
+    } else if k == 9 {
+        let e = exp_f64(2.0 * min(abs(xd), 40.0))
+        let v = if abs(xd) < 0.001 { xd * (1.0 - xd * xd / 3.0) } else { (e - 1.0) / (e + 1.0) }
+        (tanh(x), if x < 0.0 && abs(xd) >= 0.001 { -v } else { v })
+    } else if k == 10 {
+        (atan(x), atan_f64(xd))
+    } else if k == 11 {
+        (asin(x), atan2_f64(xd, sqrt((1.0 - xd) * (1.0 + xd))))
+    } else if k == 12 {
+        (acos(x), atan2_f64(sqrt((1.0 - xd) * (1.0 + xd)), xd))
+    } else if k == 13 {
+        (atan2(x, y), atan2_f64(xd, f64(y)))
+    } else {
+        // pow_f64 takes a positive, finite base: a negative one's whole powers by its
+        // magnitude's, signed; zeros, infinities and NaNs are exact values (`pow`'s own,
+        // which `std_math_edges_match_c` holds to C's).
+        let yd = f64(y)
+        let r = if is_finite(x) && is_finite(y) && x > 0.0 {
+            pow_f64(xd, yd)
+        } else if is_finite(x) && is_finite(y) && x < 0.0 && floor(y) == y {
+            let m = pow_f64(-xd, yd)
+            if is_odd(y) { -m } else { m }
+        } else {
+            f64(pow(x, y))
+        }
+        (pow(x, y), r)
+    }
+}
+
+@test
+fn the_f32_functions_are_within_their_errors_where_sampled() {
+    // 4096 arguments of each, spread over every exponent (a fixed sequence of bits), and the
+    // arguments where each is hardest near: small, near π/4's multiples, near overflow.
+    var s: u32 = 12345
+    for k in 0..15 {
+        var worst = 0.0
+        for i in 0..4096 {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223)
+            var x = bitcast_f32(s)
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223)
+            var y = bitcast_f32((s & 0x807fffff) | 0x3f000000) * 8.0
+            // A debug build traps where a NaN is made from numbers: each within its domain.
+            if !is_finite(x) {
+                x = 0.5
+            }
+            if k == 5 || k == 6 {
+                x = abs(x)
+            }
+            if k == 14 {
+                // pow of a positive base, to powers whose results stay finite.
+                x = abs(x) % 4.0 + 0.001
+            }
+            if k == 11 || k == 12 {
+                x = x % 1.0
+            }
+            let (got, want) = strict_and_reference(k, x, y)
+            let u = f32_ulps(got, want)
+            assert(
+                u <= f64(STRICT_ULPS[k]),
+                f"function {k} at {x} ({y}): {got} against {want}, {u} ulps",
+            )
+            worst = max(worst, u)
+        }
+        assert(worst >= 0.0)
+    }
+    assert(sin(0.0) == 0.0 && cos(0.0) == 1.0 && exp(0.0) == 1.0 && log(1.0) == 0.0)
+    assert(exp2(10.0) == 1024.0 && log2(1024.0) == 10.0 && pow(x: 2.0, y: 0.5) == sqrt(2.0))
 }
 
 /// Sampled inputs of each f64 function, and what macOS's libm gives for them (bits): the

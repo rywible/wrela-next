@@ -303,7 +303,7 @@ pub(crate) struct Cx<'a> {
     pub hoist: bool,
     /// `std::derive::work`'s count of each callable it was asked of (`None`: it can't be GPU
     /// code), once a build.
-    pub works: HashMap<InstanceKey, Option<u32>>,
+    pub works: HashMap<(InstanceKey, bool), Option<u32>>,
 }
 
 /// One target module being built: the CPU module by default.
@@ -353,6 +353,16 @@ impl ModuleBuilder {
 
     pub fn target(&self) -> ir::Target {
         if self.gpu.is_some() { ir::Target::Gpu } else { ir::Target::Cpu }
+    }
+
+    /// What a derived interpretation widens for here: a strict pipeline's module computes as
+    /// the CPU does, its subnormals flushed (`ir::Target::Strict`).
+    pub fn derive_target(&self) -> ir::Target {
+        match &self.gpu {
+            Some(_) if self.m.strict => ir::Target::Strict,
+            Some(_) => ir::Target::Gpu,
+            None => ir::Target::Cpu,
+        }
     }
 
     /// The functions this module instantiates, each with its type arguments, in order.
@@ -1488,6 +1498,103 @@ pub(crate) fn cpu_math_lang(b: ir::Builtin) -> Option<Lang> {
         body::BuiltinIr::Math(m) if m == b => f.cpu_impl(),
         _ => None,
     })
+}
+
+/// A strict pipeline's module's transcendentals, square roots and float remainders made calls
+/// to std's code, as the CPU computes them (language.md §11.3): the CPU's transcendentals,
+/// `std::math::sqrt_rounded` and `std::math::rem_exact`, which are then lowered into the module
+/// and made strict in turn (`ir::strict::lower_strict` wrote its other built-ins as the CPU
+/// computes them when it was lowered). After the module is flattened and its same work moved
+/// onto the CPU, which computes the built-ins with the same code.
+pub(crate) fn make_strict(cx: &mut Cx, mb: &mut ModuleBuilder) {
+    let mut done = 0;
+    while done < mb.m.functions.len() {
+        let end = mb.m.functions.len();
+        let mut i = done;
+        while i < end {
+            let mut f = std::mem::take(&mut mb.m.functions[i]);
+            let mut body = std::mem::take(&mut f.body);
+            let this = ir::FuncId(i as u32);
+            ir::visit::expand(&mut body, &mut |s, out| strict_math(cx, mb, this, &mut f, s, out));
+            f.body = body;
+            mb.m.functions[i] = f;
+            i += 1;
+        }
+        // The std functions the calls instantiated, lowered; then each new one made strict.
+        cx.drain(mb);
+        done = end;
+    }
+    // std's functions' own built-ins, as the CPU computes them.
+    ir::strict::lower_strict(&mut mb.m);
+}
+
+/// `s` into `out` in a strict module's function `this`: a transcendental built-in of f32s, a
+/// square root or a float remainder becomes a call to std's (a call per component, for a
+/// vector), but in std's function itself (`sqrt_rounded` starts from the GPU's own root).
+fn strict_math(
+    cx: &mut Cx,
+    mb: &mut ModuleBuilder,
+    this: ir::FuncId,
+    f: &mut ir::Function,
+    s: ir::Stmt,
+    out: &mut ir::Block,
+) {
+    let lang = match &s {
+        ir::Stmt::Let(_, ir::Expr::Builtin(ir::Builtin::Sqrt, _)) => Some(Lang::StrictSqrt),
+        ir::Stmt::Let(_, ir::Expr::Builtin(op, _)) => cpu_math_lang(*op),
+        ir::Stmt::Let(_, ir::Expr::Binary(ir::BinOp::Rem, a, _))
+            if mb.m.types.element_scalar(f.value_ty(*a)) == Some(ir::Scalar::F32) =>
+        {
+            Some(Lang::StrictRem)
+        }
+        _ => None,
+    };
+    let (Some(l), ir::Stmt::Let(v, e)) = (lang, &s) else {
+        out.push(s);
+        return;
+    };
+    let args: Vec<ir::ValueId> = match e {
+        ir::Expr::Builtin(_, args) => args.clone(),
+        ir::Expr::Binary(_, a, b) => vec![*a, *b],
+        _ => unreachable!(),
+    };
+    // Only f32s: an f64's is the CPU's alone, and nothing else has one.
+    if mb.m.types.element_scalar(f.value_ty(args[0])) != Some(ir::Scalar::F32) {
+        out.push(s);
+        return;
+    }
+    let Some(func) = cx.checked.program.lang_fn(l) else {
+        out.push(s);
+        return;
+    };
+    let callee = cx.instance(mb, InstanceKey::plain(func, Vec::new()), None);
+    if callee == this {
+        out.push(s);
+        return;
+    }
+    let ty = f.value_ty(*v);
+    let f32 = mb.m.types.f32();
+    let e = if let &ir::TypeDef::Vector(ir::Scalar::F32, n) = mb.m.types.get(ty) {
+        let comps = (0..u32::from(n))
+            .map(|c| {
+                let parts = args
+                    .iter()
+                    .map(|&a| {
+                        let arg = match mb.m.types.get(f.value_ty(a)) {
+                            ir::TypeDef::Vector(..) => f.let_(out, f32, ir::Expr::Extract(a, c)),
+                            _ => a,
+                        };
+                        ir::Arg::Value(arg)
+                    })
+                    .collect();
+                f.let_(out, f32, ir::Expr::Call(callee, parts))
+            })
+            .collect();
+        ir::Expr::Construct(ty, comps)
+    } else {
+        ir::Expr::Call(callee, args.iter().map(|&a| ir::Arg::Value(a)).collect())
+    };
+    out.push(ir::Stmt::Let(*v, e));
 }
 
 /// Replaces the CPU module's transcendental builtins by calls to std's wrela implementations,

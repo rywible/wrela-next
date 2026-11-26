@@ -1,10 +1,12 @@
 //! Effects (language.md §8): what a function may do besides compute its result. There are
-//! seven: `alloc` (the heap), `io`, `trace` (an output the program never reads back: a line
+//! eight: `alloc` (the heap), `io`, `trace` (an output the program never reads back: a line
 //! printed, a phase timed), `nondet` (anything whose result isn't a function of the inputs),
-//! `recursion` (a cycle in the call graph), `host` (recording GPU work), and `panic`. They're
-//! inferred from each body and everything it calls, never written, and checked against the
-//! contexts that forbid some: GPU entry points and `@gpu` functions, `@audio`, `@deterministic`,
-//! the functions a derived interpretation derives, and build-time constants.
+//! `recursion` (a cycle in the call graph), `host` (recording GPU work), `panic`, and `driver`
+//! (a GPU operation whose result its driver defines: a derivative, a filtered texture read).
+//! They're inferred from each body and everything it calls, never written, and checked against
+//! the contexts that forbid some: GPU entry points and `@gpu` functions, `@audio`,
+//! `@deterministic`, `@strict`, the functions a derived interpretation derives, and build-time
+//! constants.
 //!
 //! The analysis runs on every body the checker built, whether or not anything calls it, so
 //! effect errors come with the other errors. A call through a trait method on a generic
@@ -33,10 +35,11 @@ pub enum Effect {
     Recursion,
     Host,
     Panic,
+    Driver,
 }
 
 impl Effect {
-    pub const ALL: [Effect; 7] = [
+    pub const ALL: [Effect; 8] = [
         Effect::Alloc,
         Effect::Io,
         Effect::Trace,
@@ -44,6 +47,7 @@ impl Effect {
         Effect::Recursion,
         Effect::Host,
         Effect::Panic,
+        Effect::Driver,
     ];
 
     /// The effect `@effects(...)` names `name`.
@@ -60,6 +64,7 @@ impl Effect {
             Effect::Recursion => "recursion",
             Effect::Host => "host",
             Effect::Panic => "panic",
+            Effect::Driver => "driver",
         }
     }
 
@@ -73,6 +78,7 @@ impl Effect {
             Effect::Recursion => "recurses",
             Effect::Host => "records GPU work",
             Effect::Panic => "can panic",
+            Effect::Driver => "uses an operation its GPU's driver defines",
         }
     }
 }
@@ -157,6 +163,9 @@ pub fn check(p: &Program, mir: &BTreeMap<FnId, Body>) -> (Vec<Diagnostic>, Direc
         }
         if def.attrs.deterministic.is_some() {
             contexts.push((DETERMINISTIC, format!("`{}` is `@deterministic`", def.name)));
+        }
+        if def.attrs.strict.is_some() {
+            contexts.push((STRICT, format!("`{}` is `@strict`", def.name)));
         }
         if let FnOwner::Const(_) = def.owner {
             contexts.push((
@@ -525,6 +534,9 @@ pub fn effect_help(e: Effect) -> &'static str {
         Effect::Recursion => "write the recursion as a loop",
         Effect::Host => "record the GPU work outside it, in `frame`",
         Effect::Panic => "check the condition and return a value instead of panicking",
+        Effect::Driver => {
+            "read each texel (`load`) and blend them in the function, and take a difference of neighbouring values for a derivative"
+        }
     }
 }
 
@@ -545,6 +557,9 @@ const AUDIO: &[Effect] =
 /// `@deterministic` code, a constant, and what runs on several workers at once. A replayed tick
 /// mustn't touch storage either: requests are `io` (§17.1).
 pub const DETERMINISTIC: &[Effect] = &[Effect::Io, Effect::Nondet, Effect::Host];
+/// A `@strict` function's arithmetic is the CPU's on every GPU (§11.3): nothing whose result a
+/// driver defines.
+pub const STRICT: &[Effect] = &[Effect::Driver];
 /// An associated constant (§3.4), read wherever it's used rather than computed by the build:
 /// what a constant can't do, nor print or time a phase, nor recurse (a cycle of constants)
 /// nor panic (which a constant's build would report).
@@ -575,6 +590,7 @@ fn derived_callables(p: &Program, f: FnId, body: &Body) -> Vec<(BodyId, Span)> {
                     | Lang::TapeWith
                     | Lang::TapeSized
                     | Lang::WorkOf
+                    | Lang::StrictWorkOf
                     | Lang::ReadsOnlyInput
                     | Lang::LiftGradient
                     | Lang::LiftJacobian,
@@ -801,6 +817,7 @@ impl<'p> Effects<'p> {
                     Effect::Recursion => "a cycle of calls",
                     Effect::Host => "recording GPU work",
                     Effect::Panic => "a panic, a failed `assert`, or a `Vec` index past its end",
+                    Effect::Driver => "a derivative, or a texture read through a sampler (computed as each GPU's driver chooses)",
                 },
                 e.name()
             ));
@@ -957,6 +974,11 @@ fn node(
             n.direct.push((Effect::Host, span, format!("`{}` records GPU work", def.name)));
             return;
         }
+        if def.lang.is_some_and(Lang::driver_defined) {
+            let why = format!("`{}` filters texels as the driver does", def.name);
+            n.direct.push((Effect::Driver, span, why));
+            return;
+        }
         if def.lang.is_some_and(Lang::is_nondet) {
             return;
         }
@@ -1076,6 +1098,10 @@ fn node(
                         }
                     }
                     Callee::Local(_) | Callee::Value(_) => n.open = true,
+                    Callee::Builtin(b @ (BuiltinFn::Dpdx | BuiltinFn::Dpdy | BuiltinFn::Fwidth)) => {
+                        let why = format!("`{}` is a derivative, which the driver computes", b.name());
+                        n.direct.push((Effect::Driver, c.span, why));
+                    }
                     Callee::Builtin(_) => {}
                 },
                 Rvalue::Dispatch(_) => {

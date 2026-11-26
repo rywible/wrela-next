@@ -88,8 +88,6 @@ float_ops! {
     trunc => F32Trunc, F64Trunc;
     nearest => F32Nearest, F64Nearest;
     abs => F32Abs, F64Abs;
-    min => F32Min, F64Min;
-    max => F32Max, F64Max;
     neg => F32Neg, F64Neg;
     copysign => F32Copysign, F64Copysign;
 }
@@ -501,6 +499,32 @@ fn sum_lanes_from_zero(fe: &mut Fe, n: u8) {
     }
 }
 
+/// Pushes `min(a, b)` (`max`) of the f32 vectors in locals `a` and `b` (§11.4): each lane `b`'s
+/// where it's less (more) than `a`'s, else `a`'s.
+fn vec_min_max(fe: &mut Fe, max: bool, a: u32, b: u32) {
+    fe.ins.extend([
+        I::LocalGet(b),
+        I::LocalGet(a),
+        I::LocalGet(b),
+        I::LocalGet(a),
+        if max { I::F32x4Gt } else { I::F32x4Lt },
+        I::V128Bitselect,
+    ]);
+}
+
+/// Pushes `min(a, b)` (`max`) of the floats in locals `a` and `b` (§11.4): `b` where it's less
+/// (more) than `a`, else `a`.
+fn scalar_min_max(fe: &mut Fe, f: Fw, max: bool, a: u32, b: u32) {
+    fe.ins.extend([
+        I::LocalGet(b),
+        I::LocalGet(a),
+        I::LocalGet(b),
+        I::LocalGet(a),
+        if max { f.gt() } else { f.lt() },
+        I::Select,
+    ]);
+}
+
 /// A binary operator whose result is a `v128` vector of `n` components.
 fn vec_binary(
     fe: &mut Fe,
@@ -643,30 +667,43 @@ pub(super) fn lanes_builtin(
             fe.ins.extend(splat(0.0));
             fe.ins.extend([I::F32x4Gt, I::V128Bitselect]);
         }
-        B::Min | B::Max => {
+        // Relaxed: a NaN or a signed zero may come out either way.
+        B::Min | B::Max if fe.relaxed => {
             arg(fe, 0);
             arg(fe, 1);
-            fe.ins.push(match (b == B::Min, fe.relaxed) {
-                (true, false) => I::F32x4Min,
-                (false, false) => I::F32x4Max,
-                // Relaxed: a NaN or a signed zero may come out either way.
-                (true, true) => I::F32x4RelaxedMin,
-                (false, true) => I::F32x4RelaxedMax,
-            });
+            fe.ins.push(if b == B::Min { I::F32x4RelaxedMin } else { I::F32x4RelaxedMax });
+        }
+        // `b` where it's less (more), else `a` (§11.4): a compare and a select, as every GPU
+        // computes it too.
+        B::Min | B::Max => {
+            let (a, c) = (fe.new_local(ValType::V128), fe.new_local(ValType::V128));
+            arg(fe, 0);
+            fe.ins.push(I::LocalSet(a));
+            arg(fe, 1);
+            fe.ins.push(I::LocalSet(c));
+            vec_min_max(fe, b == B::Max, a, c);
         }
         B::Clamp => {
-            arg(fe, 0);
-            arg(fe, 1);
-            fe.ins.push(I::F32x4Max);
-            arg(fe, 2);
-            fe.ins.push(I::F32x4Min);
+            let (x, lo, hi) = (fe.new_local(ValType::V128), fe.new_local(ValType::V128), fe.new_local(ValType::V128));
+            for (k, l) in [(0, x), (1, lo), (2, hi)] {
+                arg(fe, k);
+                fe.ins.push(I::LocalSet(l));
+            }
+            vec_min_max(fe, true, x, lo);
+            fe.ins.push(I::LocalSet(x));
+            vec_min_max(fe, false, x, hi);
         }
         B::Saturate => {
+            let (x, lo, hi) = (fe.new_local(ValType::V128), fe.new_local(ValType::V128), fe.new_local(ValType::V128));
             arg(fe, 0);
+            fe.ins.push(I::LocalSet(x));
             fe.ins.extend(splat(0.0));
-            fe.ins.push(I::F32x4Max);
+            fe.ins.push(I::LocalSet(lo));
             fe.ins.extend(splat(1.0));
-            fe.ins.push(I::F32x4Min);
+            fe.ins.push(I::LocalSet(hi));
+            vec_min_max(fe, true, x, lo);
+            fe.ins.push(I::LocalSet(x));
+            vec_min_max(fe, false, x, hi);
         }
         B::Mix => {
             // WGSL: e1 * (1 - e3) + e2 * e3.
@@ -694,11 +731,16 @@ pub(super) fn lanes_builtin(
             fe.ins.push(I::F32x4Sub);
             arg(fe, 1);
             arg(fe, 0);
-            fe.ins.extend([I::F32x4Sub, I::F32x4Div]);
+            fe.ins.extend([I::F32x4Sub, I::F32x4Div, I::LocalSet(t)]);
+            let (lo, hi) = (fe.new_local(ValType::V128), fe.new_local(ValType::V128));
             fe.ins.extend(splat(0.0));
-            fe.ins.push(I::F32x4Max);
+            fe.ins.push(I::LocalSet(lo));
             fe.ins.extend(splat(1.0));
-            fe.ins.extend([I::F32x4Min, I::LocalTee(t), I::LocalGet(t), I::F32x4Mul]);
+            fe.ins.push(I::LocalSet(hi));
+            vec_min_max(fe, true, t, lo);
+            fe.ins.push(I::LocalSet(t));
+            vec_min_max(fe, false, t, hi);
+            fe.ins.extend([I::LocalTee(t), I::LocalGet(t), I::F32x4Mul]);
             fe.ins.extend(splat(3.0));
             fe.ins.extend(splat(2.0));
             fe.ins.extend([I::LocalGet(t), I::F32x4Mul, I::F32x4Sub, I::F32x4Mul]);
@@ -969,10 +1011,21 @@ fn scalar_builtin(fe: &mut Fe, b: ir::Builtin, s: ir::Scalar, xs: &[u32]) -> R<(
                 I::Select,
             ]);
         }
-        B::Min => fe.ins.extend([g(0), g(1), f.min()]),
-        B::Max => fe.ins.extend([g(0), g(1), f.max()]),
-        B::Clamp => fe.ins.extend([g(0), g(1), f.max(), g(2), f.min()]),
-        B::Saturate => fe.ins.extend([g(0), f.konst(0.0), f.max(), f.konst(1.0), f.min()]),
+        B::Min | B::Max => scalar_min_max(fe, f, b == B::Max, xs[0], xs[1]),
+        B::Clamp => {
+            let lo = fe.new_local(f.valtype());
+            scalar_min_max(fe, f, true, xs[0], xs[1]);
+            fe.ins.push(I::LocalSet(lo));
+            scalar_min_max(fe, f, false, lo, xs[2]);
+        }
+        B::Saturate => {
+            let (lo, zero, one) =
+                (fe.new_local(f.valtype()), fe.new_local(f.valtype()), fe.new_local(f.valtype()));
+            fe.ins.extend([f.konst(0.0), I::LocalSet(zero), f.konst(1.0), I::LocalSet(one)]);
+            scalar_min_max(fe, f, true, xs[0], zero);
+            fe.ins.push(I::LocalSet(lo));
+            scalar_min_max(fe, f, false, lo, one);
+        }
         B::Mix => {
             // WGSL: e1 * (1 - e3) + e2 * e3.
             fe.ins.extend([
@@ -994,6 +1047,7 @@ fn scalar_builtin(fe: &mut Fe, b: ir::Builtin, s: ir::Scalar, xs: &[u32]) -> R<(
         B::Smoothstep => {
             // t = clamp((x - e0) / (e1 - e0), 0, 1); t * t * (3 - 2t)
             let t = fe.new_local(f.valtype());
+            let (zero, one) = (fe.new_local(f.valtype()), fe.new_local(f.valtype()));
             fe.ins.extend([
                 g(2),
                 g(0),
@@ -1002,12 +1056,16 @@ fn scalar_builtin(fe: &mut Fe, b: ir::Builtin, s: ir::Scalar, xs: &[u32]) -> R<(
                 g(0),
                 f.sub(),
                 f.div(),
-                f.konst(0.0),
-                f.max(),
-                f.konst(1.0),
-                f.min(),
                 I::LocalSet(t),
+                f.konst(0.0),
+                I::LocalSet(zero),
+                f.konst(1.0),
+                I::LocalSet(one),
             ]);
+            scalar_min_max(fe, f, true, t, zero);
+            fe.ins.push(I::LocalSet(t));
+            scalar_min_max(fe, f, false, t, one);
+            fe.ins.push(I::LocalSet(t));
             fe.ins.extend([
                 I::LocalGet(t),
                 I::LocalGet(t),

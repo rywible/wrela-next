@@ -42,6 +42,7 @@ fn pipeline() -> Pipeline {
         debug_flag: None,
         requires: Vec::new(),
         conditional: false,
+        strict: false,
         standin: None,
         sizes: None,
         kept: 0,

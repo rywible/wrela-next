@@ -420,7 +420,7 @@ fn build(
     inner: ir::FuncId,
 ) {
     let InstanceKey::Derived { of, kind, input, output } = key else { return };
-    let target = mb.target();
+    let target = mb.derive_target();
     let result = match kind {
         DeriveKind::Reads => return build_reads(mb, id, inner),
         DeriveKind::Literals => {

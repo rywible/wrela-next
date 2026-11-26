@@ -259,6 +259,54 @@ struct Called {
     ret: Option<Const>,
 }
 
+/// Where the work of one invocation of `entry` goes, by function: each function's runs and the
+/// work of its own statements in all of them (its runs' work less its calls'), most first. For
+/// reading a kernel's cost (`WRELA_DUMP_IR=work`): the count is [`CallRuns`]', which follows
+/// each call once for each set of known arguments; a loop it can't bound counts one pass.
+pub fn work_by_function(m: &Module, entry: FuncId) -> Vec<(FuncId, u64, u64)> {
+    let mut runs = CallRuns::new(m);
+    let mut own: HashMap<FuncId, (u64, u64)> = HashMap::new();
+    let mut seen: HashMap<CallKey, (u64, Vec<(FuncId, Known, u64, u64)>)> = HashMap::new();
+    let mut stack: Vec<(FuncId, Known, u64)> = vec![(entry, Known::new(), 1)];
+    while let Some((f, known, times)) = stack.pop() {
+        let key = (f.0, known.clone());
+        if !seen.contains_key(&key) {
+            let total = runs.work_of(f, &known).unwrap_or(0);
+            let (sites, _) = runs.of(f, &known);
+            let mut callee_of: HashMap<usize, FuncId> = HashMap::new();
+            crate::visit::walk(&m.functions[f.index()].body, &mut |st| {
+                if let Some(e) = st.expr()
+                    && let Some(g) = e.callee()
+                {
+                    callee_of.insert(e as *const Expr as usize, g);
+                }
+            });
+            let mut calls = Vec::new();
+            let mut called = 0u64;
+            for (at, r) in sites {
+                let Some(&g) = callee_of.get(&at) else { continue };
+                called = called.saturating_add(r.work);
+                for (k, n) in r.known {
+                    if n > 0 {
+                        calls.push((g, k, n, 0));
+                    }
+                }
+            }
+            seen.insert(key.clone(), (total.saturating_sub(called), calls));
+        }
+        let (self_work, calls) = seen[&key].clone();
+        let e = own.entry(f).or_default();
+        e.0 = e.0.saturating_add(times);
+        e.1 = e.1.saturating_add(self_work.saturating_mul(times));
+        for (g, k, n, _) in calls {
+            stack.push((g, k, n.saturating_mul(times)));
+        }
+    }
+    let mut out: Vec<(FuncId, u64, u64)> = own.into_iter().map(|(f, (t, w))| (f, t, w)).collect();
+    out.sort_by(|a, b| b.2.cmp(&a.2));
+    out
+}
+
 /// A call, by its function and what's known of its arguments.
 type CallKey = (u32, Known);
 
@@ -1044,7 +1092,17 @@ impl<'a> Counter<'a> {
                 };
                 (n, v)
             }
-            Expr::Builtin(b, args) => (builtin_cost(*b, args.first().map_or(1, comps)), None),
+            Expr::Builtin(b, args) => {
+                let n = args.first().map_or(1, comps);
+                // What E0712 and hoisting weigh, in a strict module, is what the built-in
+                // becomes there: std's code (`strict_builtin_cost`).
+                let w = if !self.bounds && self.m.strict {
+                    strict_builtin_cost(*b, n)
+                } else {
+                    builtin_cost(*b, n)
+                };
+                (w, None)
+            }
             Expr::ArrayLength(_) => (OP, None),
             Expr::Convert(x, _) => (OP * comps(x), None),
             Expr::Select { cond, if_true, if_false } => {
@@ -1222,6 +1280,38 @@ pub fn builtin_cost(b: Builtin, n: u64) -> u64 {
         B::Cross => 6 * OP,
         _ => OP * n,
     }
+}
+
+/// A built-in's work in a strict module (`Module::strict`), given its first argument's
+/// components: a transcendental, a square root or a float remainder is std's code there
+/// (`std::math`), whose work a strict kernel of one call counts, less the kernel's without it
+/// (`toolchain/tests`' `strict_builtins_cost_what_std_s_code_does` holds the table to the
+/// counts); the rest is `builtin_cost`.
+pub fn strict_builtin_cost(b: Builtin, n: u64) -> u64 {
+    use Builtin as B;
+    let one = match b {
+        B::Sqrt => 70,
+        B::InverseSqrt => 70 + SLOW_OP,
+        B::Sin => 302,
+        B::Cos => 306,
+        B::Tan => 300,
+        B::Asin => 166,
+        B::Acos => 165,
+        B::Atan => 45,
+        B::Atan2 => 82,
+        B::Exp => 50,
+        B::Exp2 => 46,
+        B::Log => 72,
+        B::Log2 => 202,
+        B::Sinh => 114,
+        B::Cosh => 103,
+        B::Tanh => 73,
+        B::Pow => 305,
+        B::Length | B::Distance => return OP * n + 70,
+        B::Normalize => return 2 * OP * n + 70,
+        _ => return builtin_cost(b, n),
+    };
+    one * n
 }
 
 fn texture_cost(op: TextureOp) -> u64 {

@@ -219,6 +219,10 @@ pub struct Pipeline {
     /// (or at once, when a command needs it first).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub conditional: bool,
+    /// Strict (`@strict`, language.md §11.3): its arithmetic is the CPU's, so its results are the
+    /// same bits on every GPU that holds the strict model.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub strict: bool,
     /// The pipeline a host may run in its place until it's built (§18.12): its entry point's
     /// `@standin`, with the same bindings and uniform block. Its index in the manifest.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -262,6 +266,7 @@ impl Pipeline {
             debug_flag: None,
             requires: Vec::new(),
             conditional: false,
+            strict: false,
             standin: None,
             sizes: None,
             kept: 0,
@@ -1403,6 +1408,7 @@ mod read {
         })?;
         // A missing `conditional` is tier 0.
         let conditional = flag(o, "conditional", &place, false)?;
+        let strict = flag(o, "strict", &place, false)?;
         // A missing `standin` is none.
         let standin = match o.get("standin").unwrap_or(&Value::Null) {
             Value::Null => None,
@@ -1448,6 +1454,7 @@ mod read {
             debug_flag,
             requires,
             conditional,
+            strict,
             standin,
             sizes,
             kept,

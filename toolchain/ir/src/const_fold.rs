@@ -915,7 +915,10 @@ fn builtin(b: Builtin, args: &[K]) -> Option<K> {
         B::Min | B::Max => each2(args[0].clone(), args[1].clone(), &|x, y| {
             let max = b == B::Max;
             match (x, y) {
-                (Const::F32(x), Const::F32(y)) => float(if max { x.max(*y) } else { x.min(*y) }),
+                // `y` where it's more (less), else `x` (§11.4).
+                (Const::F32(x), Const::F32(y)) => {
+                    float(if (max && y > x) || (!max && y < x) { *y } else { *x })
+                }
                 (Const::I32(x), Const::I32(y)) => {
                     Some(Const::I32(if max { *x.max(y) } else { *x.min(y) }))
                 }
@@ -929,7 +932,8 @@ fn builtin(b: Builtin, args: &[K]) -> Option<K> {
             each3(args[0].clone(), args[1].clone(), args[2].clone(), &|x, lo, hi| match (x, lo, hi)
             {
                 (Const::F32(x), Const::F32(lo), Const::F32(hi)) if lo <= hi => {
-                    float(x.max(*lo).min(*hi))
+                    let m = if lo > x { *lo } else { *x };
+                    float(if *hi < m { *hi } else { m })
                 }
                 (Const::I32(x), Const::I32(lo), Const::I32(hi)) if lo <= hi => {
                     Some(Const::I32(*x.max(lo).min(hi)))

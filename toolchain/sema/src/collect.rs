@@ -894,10 +894,12 @@ impl<'d, 'u> Collector<'d, 'u> {
                     }
                     out.role = Some((role, a.span));
                 }
-                "deterministic" | "audio" => {
+                "deterministic" | "audio" | "strict" => {
                     self.no_args(a, codes::E0204);
                     if name == "deterministic" {
                         out.deterministic = Some(a.span);
+                    } else if name == "strict" {
+                        out.strict = Some(a.span);
                     } else {
                         out.audio = Some(a.span);
                     }
@@ -1002,6 +1004,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                         "fragment",
                         "gpu",
                         "deterministic",
+                        "strict",
                         "audio",
                         "test",
                         "testing",
