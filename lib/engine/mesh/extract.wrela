@@ -269,6 +269,10 @@ pub struct MeshBatch {
     edit_view_at: vec3,
     edit_view_fwd: vec3,
     edit_grids: Vec<GridSpec>,
+    /// Each part's state hash and box at the last extraction (`part_states`), where every part
+    /// could say: a later field whose hash moved in some parts only is patched in their bricks.
+    part_hashes: Vec<u64>,
+    part_boxes: Vec<Box3>,
     edit_append_cursor: u32,
     pub xforms: GpuBuffer<Rigid>,
     pub prev_xforms: GpuBuffer<Rigid>,
@@ -502,6 +506,8 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
         last_per_chunk: 0,
         certified: false,
         edit_grids: Vec::new(),
+        part_hashes: Vec::new(),
+        part_boxes: Vec::new(),
         edit_append_cursor: 0,
         xforms: buffer_of([Rigid::identity()]),
         prev_xforms: buffer_of([Rigid::identity()]),
@@ -1343,6 +1349,23 @@ impl MeshBatch {
                 self.edit_base_hash = 0
                 self.edit_field_hash = 0
                 self.edit_grids = Vec::new()
+                // A field whose parts say what they're made of is patched in the bricks of the
+                // parts that move (`parts_dirty`).
+                match part_states(field) {
+                    Some((hs, bs)) => {
+                        var eg: Vec<GridSpec> = Vec::new()
+                        eg.push(g)
+                        self.edit_grids = take eg
+                        let fb = field.bound()
+                        self.edit_base_bound = vec4(fb.centre, min(fb.radius, 1.0e4))
+                        self.part_hashes = take hs
+                        self.part_boxes = take bs
+                    },
+                    None => {
+                        self.part_hashes = Vec::new()
+                        self.part_boxes = Vec::new()
+                    },
+                }
             },
         }
         match maybe_sk {
@@ -1591,6 +1614,23 @@ impl MeshBatch {
                 self.edit_base_hash = 0
                 self.edit_field_hash = 0
                 self.edit_grids = Vec::new()
+                // A field whose parts say what they're made of is patched in the bricks of the
+                // parts that move (`parts_dirty`).
+                match part_states(field) {
+                    Some((hs, bs)) => {
+                        let fb = field.bound()
+                        self.edit_base_bound = vec4(fb.centre, min(fb.radius, 1.0e4))
+                        self.edit_view_at = v.at
+                        self.edit_view_fwd = v.forward
+                        self.edit_grids = take grids
+                        self.part_hashes = take hs
+                        self.part_boxes = take bs
+                    },
+                    None => {
+                        self.part_hashes = Vec::new()
+                        self.part_boxes = Vec::new()
+                    },
+                }
             },
         }
     }
@@ -2017,6 +2057,36 @@ impl MeshBatch {
         self.still_frames = 0
     }
 
+    /// The box of the parts of `field` whose state moved since the last extraction, each part's
+    /// old box and new, or none where the batch kept no part states, every part moved, none did,
+    /// or a part can't say what it's made of. Keeps the new states on an answer.
+    fn parts_dirty<M: Field<Substance>>(mut self, field: M) -> Option<Box3> {
+        let n = self.part_hashes.len()
+        if n == 0 {
+            return None
+        }
+        let (hs, bs) = part_states(field)?
+        if hs.len() != n {
+            return None
+        }
+        var moved: u32 = 0
+        var lo = vec3(1.0e30)
+        var hi = vec3(-1.0e30)
+        for i in 0..n {
+            if hs[i] != self.part_hashes[i] {
+                moved += 1
+                lo = min(lo, min(bs[i].lo, self.part_boxes[i].lo))
+                hi = max(hi, max(bs[i].hi, self.part_boxes[i].hi))
+            }
+        }
+        if moved == 0 || moved == n {
+            return None
+        }
+        self.part_hashes = take hs
+        self.part_boxes = take bs
+        Some(Box3 { lo, hi })
+    }
+
     /// Attempts an in-place dirty-region CSG patch for an `Edited<M>` field whose base solid
     /// matches `self.edit_base_hash`: invalidates only the existing bricks inside the exact
     /// integer brick range overlapping the padded `dirty_region()`, extracts only those dirty
@@ -2036,26 +2106,31 @@ impl MeshBatch {
             self.instanced ||
             self.is_skinned ||
             self.has_trans ||
-            self.edit_base_hash == 0 ||
             self.edit_grids.len() == 0 {
-            return false
-        }
-        let bh = match field.edit_base_hash() {
-            Some(v) => v,
-            None => {
-                return false
-            },
-        }
-        if bh != self.edit_base_hash {
             return false
         }
         if abs(self.cell - check_cell) > 0.10 * max(self.cell, 1.0e-4) {
             return false
         }
-        let dirty_box = match field.dirty_region() {
-            Some(bx) => bx,
-            None => {
-                return false
+        // An edit's dirty region on an unchanged base, or the boxes, old and new, of the parts
+        // whose state moved (the others' cells are the same).
+        let dirty_box = match field.edit_base_hash() {
+            Some(bh) => {
+                if bh != self.edit_base_hash {
+                    return false
+                }
+                match field.dirty_region() {
+                    Some(bx) => bx,
+                    None => {
+                        return false
+                    },
+                }
+            },
+            None => match self.parts_dirty(field) {
+                Some(bx) => bx,
+                None => {
+                    return false
+                },
             },
         }
         let g0 = self.edit_grids[0]
@@ -3648,3 +3723,28 @@ impl MeshBatch {
     }
 }
 
+/// The most parts whose states a batch keeps (`part_states`): past it, the whole field's hash.
+const MOST_PARTS: u32 = 256
+
+/// Each part of `field`'s state hash and box (`Surface::part_state`, `part_bound`), or none
+/// where it has one part, more than `MOST_PARTS`, or a part that can't say what it's made of
+/// (then the whole field's hash decides, as before).
+fn part_states<M: Field<Substance>>(field: M) -> Option<(Vec<u64>, Vec<Box3>)> {
+    let n = field.parts()
+    if n < 2 || n > MOST_PARTS {
+        return None
+    }
+    var hs: Vec<u64> = Vec::new()
+    var bs: Vec<Box3> = Vec::new()
+    for i in 0..n {
+        var h = Hasher::new()
+        if !field.part_state(i, mut h) {
+            return None
+        }
+        hs.push(h.finish())
+        let b = field.part_bound(i)
+        let r = vec3(min(b.radius, 1.0e4))
+        bs.push(Box3 { lo: b.centre - r, hi: b.centre + r })
+    }
+    Some((hs, bs))
+}
