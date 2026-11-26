@@ -80,3 +80,44 @@ pub fn frame(time: f32, width: u32, height: u32) {}
     assert!(text.contains("`filtered` is `@strict`"), "{text}");
     assert!(!text.contains("`own`"), "{text}");
 }
+
+/// A strict kernel gives the CPU's bits (docs/plans/engine-at-build.md, phase 1 step 10):
+/// toolchain/tests/strict_bits runs std's strict functions, a division, a root and a remainder for
+/// 4,096 arguments (the hard ones and random normals of every exponent) in a `@strict` kernel, and
+/// the CPU computes the same; no result differs but a subnormal the GPU flushes (the strict model).
+#[test]
+#[ignore = "needs a GPU"]
+fn a_strict_kernel_gives_the_cpus_bits() {
+    let pkg = wrela_tests::repo_root().join("toolchain/tests/strict_bits");
+    let built = wrela_driver::build_for(&pkg, &wrela_tests::testing_for(wrela_abi::Target::HERE));
+    assert!(
+        !built.has_errors(),
+        "{}",
+        wrela_diag::render::render_all(&built.sources, &built.diagnostics)
+    );
+    let dir = wrela_tests::page_scratch_root().join("strict-bits");
+    let _ = std::fs::remove_dir_all(&dir);
+    built.write_to(&dir).expect("write the build");
+    let mut host = Host::load(&dir).expect("load");
+    const FUNCTIONS: [&str; 19] = [
+        "sin", "cos", "tan", "exp", "exp2", "log", "log2", "sinh", "cosh", "tanh", "atan", "asin",
+        "acos", "atan2", "pow", "sqrt", "/", "%", "x / (1 + |x|)",
+    ];
+    for _ in 0..20 {
+        host.run_frames(&crate::frame_times(1), 16, 16).expect("a frame");
+        match host.call_export("differ", &[]).expect("differ").as_slice() {
+            [Value::I32(-1), _] => {}
+            [Value::I32(n), Value::I32(at)] => {
+                let (arg, f) = (*at as u32 / 19, *at as u32 % 19);
+                assert_eq!(
+                    *n, 0,
+                    "{n} results differ from the CPU's, first `{}` of argument {arg}",
+                    FUNCTIONS[f as usize]
+                );
+                return;
+            }
+            other => panic!("differ returned {other:?}"),
+        }
+    }
+    panic!("the results never arrived")
+}

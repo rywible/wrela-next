@@ -1,0 +1,189 @@
+// A strict kernel computes as the CPU does (language.md §11.3, docs/plans/engine-at-build.md
+// phase 1 step 10): `strict` runs std's strict functions, a division, a root and a remainder of
+// floats for 4,096 arguments on the GPU, and `differ` computes the same on the CPU and counts the
+// results whose bits differ, a subnormal the GPU flushes to a zero of its sign not counted (the
+// strict model). tests/suite/exact.rs holds the count to 0.
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, buffer_of, dispatch, read}
+use std::hash::pcg
+use std::io::Pending
+
+pub const N: u32 = 4096
+
+/// What `differ` says until the GPU's results have arrived.
+pub const NOT_IN: u32 = 4294967295
+
+/// Each function's result for one argument `x` (and `z`, a second, for the functions of two).
+pub struct R: Copy + GpuData + Plain {
+    sin: f32,
+    cos: f32,
+    tan: f32,
+    exp: f32,
+    exp2: f32,
+    log: f32,
+    log2: f32,
+    sinh: f32,
+    cosh: f32,
+    tanh: f32,
+    atan: f32,
+    asin: f32,
+    acos: f32,
+    atan2: f32,
+    pow: f32,
+    sqrt: f32,
+    div: f32,
+    rem: f32,
+    unit: f32,
+}
+
+/// The results for `x` and `z`, as a strict kernel and the CPU compute them.
+fn all(x: f32, z: f32) -> R {
+    let a = abs(x)
+    // In (-1, 1), for asin and acos.
+    let unit = x / (1.0 + a)
+    R {
+        sin: sin(x),
+        cos: cos(x),
+        tan: tan(x),
+        exp: exp(x),
+        exp2: exp2(x),
+        log: log(a),
+        log2: log2(a),
+        sinh: sinh(x),
+        cosh: cosh(x),
+        tanh: tanh(x),
+        atan: atan(x),
+        asin: asin(unit),
+        acos: acos(unit),
+        atan2: atan2(x, z),
+        pow: pow(a, z),
+        sqrt: sqrt(a),
+        div: x / z,
+        rem: x % z,
+        unit: unit,
+    }
+}
+
+@strict
+@compute(64)
+fn strict(xs: [f32], zs: [f32], out: mut Slots<R>, id: GlobalId) {
+    out[id] = all(xs[id.x], zs[id.x])
+}
+
+/// A normal float from `h`'s bits: its exponent kept from the zeros, the infinities and NaNs.
+fn normal(h: u32) -> f32 {
+    let e = (h >> 23) & 255
+    let bits = if e == 0 || e == 255 { (h & 0x807fffff) | 0x3f800000 } else { h }
+    bitcast_f32(bits)
+}
+
+/// The arguments: the hard ones first (round π's multiples, the ends of each function's ranges,
+/// large ones that need the long reduction, the least and greatest normals), then random normals
+/// of every exponent, and some about 1 and π.
+fn arguments() -> (Vec<f32>, Vec<f32>) {
+    let hard = [
+        0.5, 1.0, 2.0, 3.14159265, 1.57079633, 0.785398163, 6.28318531, 5999.0, 6000.0, 6001.0,
+        1.0e5, 1.0e10, 1.0e20, 1.0e30, 3.0e38, 1.17549435e-38, 88.7228394, 89.0, -87.3365447,
+        -103.0, 127.9, 128.0, -149.5, 1.0e-20, 0.99999994, 1.00000012, 710.0, 9.0, 0.6931472,
+        -0.5, -1.0, -3.14159265, -1.0e30, 22.0, 1.0e-4,
+    ]
+    var xs = Vec::new()
+    var zs = Vec::new()
+    for i in 0..N {
+        let h = pcg(i * 2654435761 + 12345)
+        let g = pcg(h + 777)
+        let x = if i < 35 {
+            hard[i]
+        } else if i % 4 == 0 {
+            // About 1: a narrow window of exponents.
+            normal((h & 0x807fffff) | (((h >> 23) % 8 + 123) << 23))
+        } else if i % 4 == 1 {
+            // Up to π · 2²⁴.
+            f32(h % 16777216) * 3.14159265 / f32(1 + g % 4096)
+        } else {
+            normal(h)
+        }
+        xs.push(x)
+        zs.push(normal((g & 0x807fffff) | (((g >> 23) % 32 + 112) << 23)))
+    }
+    (xs, zs)
+}
+
+pub struct S {
+    back: Pending<R>,
+    got: Vec<R>,
+}
+
+pub fn init() -> S {
+    let (xs, zs) = arguments()
+    var out: GpuBuffer<R> = buffer(N)
+    dispatch(strict.bind(xs: buffer_of(xs), zs: buffer_of(zs), out: mut out), over: N)
+    S { back: read(out.span(start: 0, count: N)), got: Vec::new() }
+}
+
+pub fn frame(s: mut S, time: f32, width: u32, height: u32) {
+    if s.got.len() == 0 {
+        if let Some(Ok(rs)) = s.back.poll() {
+            for r in rs {
+                s.got.push(r)
+            }
+        }
+    }
+}
+
+/// Whether the GPU's `got` is the CPU's `want`: the same bits, both NaN, or `want` a subnormal
+/// the GPU flushed to a zero of its sign.
+fn same(got: f32, want: f32) -> bool {
+    let g = bitcast_u32(got)
+    let w = bitcast_u32(want)
+    if g == w || (got != got && want != want) {
+        return true
+    }
+    (w & 0x7f800000) == 0 && g == (w & 0x80000000)
+}
+
+/// How many results differ in any bit (of the 19 for each of the 4,096 arguments), and which
+/// function and argument first: (count, 19 × argument + function), or `NOT_IN` until the
+/// results arrive.
+pub fn differ(s: S) -> (u32, u32) {
+    if s.got.len() < N {
+        return (NOT_IN, 0)
+    }
+    let (xs, zs) = arguments()
+    var n: u32 = 0
+    var first: u32 = 0
+    for i in 0..N {
+        let g = s.got[i]
+        let w = all(xs[i], zs[i])
+        let pairs = [
+            (g.sin, w.sin),
+            (g.cos, w.cos),
+            (g.tan, w.tan),
+            (g.exp, w.exp),
+            (g.exp2, w.exp2),
+            (g.log, w.log),
+            (g.log2, w.log2),
+            (g.sinh, w.sinh),
+            (g.cosh, w.cosh),
+            (g.tanh, w.tanh),
+            (g.atan, w.atan),
+            (g.asin, w.asin),
+            (g.acos, w.acos),
+            (g.atan2, w.atan2),
+            (g.pow, w.pow),
+            (g.sqrt, w.sqrt),
+            (g.div, w.div),
+            (g.rem, w.rem),
+            (g.unit, w.unit),
+        ]
+        for k in 0..19 {
+            let (a, b) = pairs[k]
+            if !same(a, b) {
+                if n == 0 {
+                    first = i * 19 + k
+                }
+                n += 1
+            }
+        }
+    }
+    (n, first)
+}
