@@ -28,9 +28,11 @@
 // segment's place (3) and
 // turn (w, x, y, z) in the world, from `Body::places`: what the tracker is rewarded to follow.
 
-use clips::clips::{load, write_all}
+use clips::clips::{load, pose_bytes, read_all, write_all}
+use std::json::{TOP, parse}
+use std::zlib::inflate
 use engine::body::body::{Body, Pose}
-use engine::body::joint::{Frame, Joint, Kind, turn}
+use engine::body::joint::{Frame, Joint, Kind, numbers_of, turn}
 use engine::body::mass::Mass
 use std::collections::Vec
 use std::io::print
@@ -47,6 +49,9 @@ const LEAST_INERTIA: f32 = 0.000001
 
 /// A servo's stiffness: this many times the joint's strength per radian.
 const STIFF: f32 = 4.0
+
+/// The fewest frames of a filtered clip kept (1 s at 30 a second): the solver's windows are 16.
+const LEAST_FRAMES: u32 = 30
 
 /// The model's step (s): 4 to a frame of the poses at 30 a second. On the L4 on 2026-11-25 the body
 /// stepped 95,000 frames a second at 4,096 worlds so (Newton, 10 iterations), 51,000 at steps of
@@ -131,6 +136,60 @@ fn angles<const S: u32, const D: u32>(b: Body<S>, pose: Pose<D>, s: u32) -> vec3
     let j = b.segments[s].joint
     let q = b.numbers(pose, s)
     if j.kind == Kind::Ball { euler(turn(Kind::Ball, q), ball_order(j)) } else { q }
+}
+
+/// The simulator's qpos of `pose`: the root's place, its turn as w, x, y, z, then each hinge's
+/// angle in the model's order (the segments depth first).
+fn qpos_of<const S: u32, const D: u32>(b: Body<S>, moves: [bool; S], p: Pose<D>) -> Vec<f32> {
+    let (q, t) = (p.root.q.v, p.root.t)
+    var out: Vec<f32> = Vec::new()
+    for v in [t.x, t.y, t.z, q.w, q.x, q.y, q.z] {
+        out.push(v)
+    }
+    for s in depth_first(b) {
+        if s == 0 {
+            continue
+        }
+        let a = angles(b, p, s)
+        for h in 0..(if moves[s] { hinges(b.segments[s].joint.kind) } else { 0 }) {
+            out.push(a[h])
+        }
+    }
+    out
+}
+
+/// The pose whose qpos is `x` (the inverse of `qpos_of`): a welded segment at its rest.
+fn pose_of_qpos<const S: u32, const D: u32>(
+    b: Body<S>,
+    rest: Pose<D>,
+    moves: [bool; S],
+    x: [f32],
+) -> Pose<D> {
+    var p = rest
+    p.root = Frame { q: Quat { v: vec4(x[4], x[5], x[6], x[3]) }, t: vec3(x[0], x[1], x[2]) }
+    var at = 7
+    for s in depth_first(b) {
+        if s == 0 || !moves[s] {
+            continue
+        }
+        let j = b.segments[s].joint
+        let n = hinges(j.kind)
+        var a = vec3(0.0)
+        for h in 0..n {
+            a[h] = x[at + h]
+        }
+        at += n
+        if j.kind == Kind::Ball {
+            let o = ball_order(j)
+            let r = Quat::axis_angle(axis(o.x), a.x)
+                .mul(Quat::axis_angle(axis(o.y), a.y))
+                .mul(Quat::axis_angle(axis(o.z), a.z))
+            b.set_numbers(mut p, s, numbers_of(Kind::Ball, r))
+        } else {
+            b.set_numbers(mut p, s, a)
+        }
+    }
+    p
 }
 
 /// The segments depth first (a segment's children each after the one before's whole subtree):
@@ -310,19 +369,8 @@ fn refs<const S: u32, const D: u32, const P: u32>(
     w.write_u32(n)
     w.write_u32(bitcast_u32(rate))
     for p in c.poses {
-        let q = p.root.q.v
-        let t = p.root.t
-        for v in [t.x, t.y, t.z, q.w, q.x, q.y, q.z] {
+        for v in qpos_of(b, moves, p) {
             w.write_u32(bitcast_u32(v))
-        }
-        for s in depth_first(b) {
-            if s == 0 {
-                continue
-            }
-            let a = angles(b, p, s)
-            for h in 0..(if moves[s] { hinges(b.segments[s].joint.kind) } else { 0 }) {
-                w.write_u32(bitcast_u32(a[h]))
-            }
         }
         let at = b.places(p)
         for s in 0..S {
@@ -345,6 +393,20 @@ pub fn tool() -> u32 {
 }
 
 fn export<const S: u32, const D: u32, const P: u32>(def: Def<S, D, P>, a: Vec<String>) -> u32 {
+    for x in a.clone() {
+        if x.as_str() == "unfilter" {
+            return match unfilter(def) {
+                Ok(_) => 0,
+                Err(e) => {
+                    print(f"export: unfilter: {e.message()}")
+                    1
+                },
+            }
+        }
+        if x.as_str() == "inverse" {
+            return inverse(def, a)
+        }
+    }
     // The clips of the sets named.
     var names: Vec<String> = Vec::new()
     var keep = false
@@ -423,4 +485,126 @@ fn export<const S: u32, const D: u32, const P: u32>(def: Def<S, D, P>, a: Vec<St
     }
     print(f"export: {clips} clips, {frames} frames")
     0
+}
+
+/// The segments the last export moved (`out/BODY_moves.txt`, under the root `sim` for the
+/// commands that write elsewhere).
+fn moved<const S: u32, const D: u32, const P: u32>(def: Def<S, D, P>, root: str) -> [bool; S] {
+    var moves = [true; S]
+    if let Ok(bytes) = files::read(f"{root}/{def.name}_moves.txt").wait() {
+        for s in 1..S {
+            if s < bytes.len() {
+                moves[s] = bytes[s] == 49
+            }
+        }
+    }
+    moves
+}
+
+/// The check of `pose_of_qpos` (`-- BODY inverse SET ...`, `--read sim=`, the export's folder):
+/// each frame of the sets' clips written as qpos and read back, the segments' places of the two
+/// poses compared. A segment the model welds is compared at its rest in both.
+fn inverse<const S: u32, const D: u32, const P: u32>(def: Def<S, D, P>, a: Vec<String>) -> u32 {
+    let b = def.body
+    let moves = moved(def, "sim")
+    var worst = 0.0
+    var worst_turn = 0.0
+    var frames = 0
+    for set_name in a {
+        let Ok(names) = clips::clips::set(set_name.as_str()) else { continue }
+        for name in names {
+            let Ok(c) = load::<D>("poses", def.name, name.as_str()) else { continue }
+            for p in c.poses {
+                var q = p
+                for s in 1..S {
+                    if !moves[s] {
+                        b.set_numbers(mut q, s, b.numbers(def.rest, s))
+                    }
+                }
+                let x = qpos_of(b, moves, q)
+                let back: Pose<D> = pose_of_qpos(b, def.rest, moves, x)
+                let (u, v) = (b.places(q), b.places(back))
+                for s in 0..S {
+                    worst = max(worst, length(u[s].t - v[s].t))
+                    // The turn between the two: twice the asin of its vector part's length.
+                    let r = u[s].q.inverse().mul(v[s].q)
+                    worst_turn = max(worst_turn, 2.0 * asin(min(length(r.v.xyz), 1.0)))
+                }
+                frames += 1
+            }
+        }
+    }
+    print(f"export: inverse: {frames} frames, the segments' places within {worst * 1000.0} mm and {worst_turn * 1000.0} mrad")
+    if frames > 0 && worst < 0.0001 && worst_turn < 0.001 { 0 } else { 1 }
+}
+
+/// The filtered capture (phase 4 step 8: `filtered/filtered.bin`, which tools/movement/track.py
+/// writes: "WFLT", a u32 length, a JSON head of each clip's name, set, whether it was followed and
+/// its frames, then zlib's compression of each frame's qpos, f32, clip after clip) as pose files
+/// under a root of poses (`out/BODY/CLIP.pose`, `--write out=.movement/poses-filtered`), each
+/// clip's frames up to its fall (a clip of fewer than `LEAST_FRAMES` left out); a segment the
+/// model welded is at its rest. Its `--read sim=` is the export whose model the tracker moved.
+fn unfilter<const S: u32, const D: u32, const P: u32>(def: Def<S, D, P>) -> Result<u32, ToolError> {
+    let moves = moved(def, "sim")
+    let bytes = read_all("filtered/filtered.bin")?
+    if bytes.len() < 8 || bytes[0] != 87 || bytes[1] != 70 || bytes[2] != 76 || bytes[3] != 84 {
+        return Err(ToolError::new("not a filtered capture"))
+    }
+    let n = u32(bytes[4]) | (u32(bytes[5]) << 8) | (u32(bytes[6]) << 16) | (u32(bytes[7]) << 24)
+    var head: Vec<u8> = Vec::with_capacity(n)
+    for i in 8..(8 + n) {
+        head.push(bytes[i])
+    }
+    let Some(text) = String::from_utf8(take head) else { return Err(ToolError::new("head not UTF-8")) }
+    let Some(doc) = parse(text.as_str()) else { return Err(ToolError::new("head not JSON")) }
+    let nq = u32(doc.num(doc.get(TOP, "nq").unwrap()).unwrap())
+    let rate = f32(doc.num(doc.get(TOP, "rate").unwrap()).unwrap())
+    if nq != qpos_size(def.body, moves) {
+        return Err(ToolError::new(f"qpos {nq}, the model's {qpos_size(def.body, moves)}"))
+    }
+    var packed: Vec<u8> = Vec::with_capacity(bytes.len() - 8 - n)
+    for i in (8 + n)..bytes.len() {
+        packed.push(bytes[i])
+    }
+    let Some(raw) = inflate(packed) else { return Err(ToolError::new("not zlib")) }
+    let list = doc.get(TOP, "clips").unwrap()
+    var at = 0
+    var written = 0
+    var kept = 0
+    var total = 0
+    var cut = 0
+    var x: Vec<f32> = Vec::with_capacity(nq)
+    for i in 0..doc.count(list) {
+        let c = doc.at(list, i).unwrap()
+        let name = doc.text(doc.get(c, "name").unwrap()).unwrap()
+        let frames = u32(doc.num(doc.get(c, "frames").unwrap()).unwrap())
+        let length = u32(doc.num(doc.get(c, "length").unwrap()).unwrap())
+        let followed = doc.is_true(doc.get(c, "followed").unwrap())
+        var poses: Vec<Pose<D>> = Vec::with_capacity(frames)
+        for _ in 0..frames {
+            x.clear()
+            for k in 0..nq {
+                let o = 4 * at + 4 * k
+                x.push(bitcast_f32(
+                    u32(raw[o]) | (u32(raw[o + 1]) << 8) | (u32(raw[o + 2]) << 16) | (u32(raw[o + 3]) << 24),
+                ))
+            }
+            at += nq
+            poses.push(pose_of_qpos(def.body, def.rest, moves, x))
+        }
+        total += length
+        if !followed {
+            cut += 1
+        }
+        if frames < LEAST_FRAMES {
+            continue
+        }
+        write_all(f"out/{def.name}/{name}.pose", pose_bytes(poses, rate))?
+        let meta = f"{{\"source\": \"filtered\", \"body\": \"{def.name}\", \"followed\": {followed}, \"frames\": {frames}, \"length\": {length}, \"rate\": {rate}}}"
+        write_all(f"out/{def.name}/{name}.json", Vec::from(meta.as_bytes()))?
+        written += 1
+        kept += frames
+    }
+    print(f"export: unfilter: {written} clips of {doc.count(list)} written ({cut} cut at a fall), {kept} frames of {total}")
+    Ok(written)
 }

@@ -906,6 +906,16 @@ removes the faults of the retarget: slide, penetration and forces that cannot oc
   resume from the checkpoint failed on a generator's state put on the GPU (2.87 units). The
   budgets now come from the model (two contacts a colliding part, four rows a contact and a row
   a joint) and a welded segment's parts do not collide; `p4h-2` runs the same training again.
+- `p4h-2` fell apart at the same update (990, reward 0.77 to 0.42; 3.59 units). A world whose
+  simulation blows up (a number not finite, or a speed past 200) now starts again with no reward
+  and stays out of the observations' running mean and spread, and an update whose loss is not
+  finite is skipped; `p4h-3` (8,500 updates) counts both in its log.
+- The filtered capture back as poses (`tools/movement/export -- human unfilter`, `--read
+  filtered=` the run's outputs, `--read sim=` its export, `--write out=.movement/poses-filtered`):
+  each clip's qpos up to its fall as the body's numbers (a welded segment at rest), so the solver
+  and the judge read it as they read the capture. The inverse of the export's qpos is exact
+  (`-- human inverse test`: 234,187 frames, each segment's place to 0.0015 mm and its turn to
+  0.0017 mrad).
 
 ### Done when
 
@@ -1014,6 +1024,11 @@ through the world with no cycle and no clip.
   1.1 mm from its point at its tick (0 ticks late; the target 20 mm) while walking, and the head
   ends 0.67 degrees from its point; both movements pass every target of the judge, as 7 of the
   test's 8 do (the run all but its slide).
+- A heavier loss on the feet (3 times, `human4`) lowered the test's physics measure (0.94
+  against 1.27) and kept the timed goals' tests (the palm 16.5 mm from its point), but its
+  movements float (37 to 53 mm against 32) and their roots' residual rises (0.60 to 0.76 of the
+  weight against 0.43): 1 of 8 in every target. Not kept: the feet's loss alone, on kinematics,
+  lifts the root; the filtered capture is the means for the run's slide.
 - Not yet: the solver trained on the filtered capture (phase 4's tracker on the human is in work), the tracker following the
   solver's output, the bits on the two machines (the M4 is not measured), the prior of style and
   the skills.
