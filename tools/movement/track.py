@@ -366,6 +366,95 @@ def make_agent(n_obs, n_act, hidden):
 
 # ---- training ------------------------------------------------------------------------------------
 
+# The least spread of the actions (a log): below it a step of the net changes the action's
+# likelihood too much.
+LEAST_LOG_STD = -3.0
+
+
+def ppo(agent, opt, b_obs, b_act, b_logp, b_adv, b_ret, gen, target_kl):
+    """PPO's epochs over the rollout (clipped at 0.2, four minibatches an epoch), the actor's and
+    the critic's gradients each clipped to 1 apart, and no epoch after one whose mean KL passed
+    `target_kl`. Gives (the last epoch's mean KL, minibatches skipped), the share clipped, the
+    value loss and the epochs run."""
+    dev = b_obs.device
+    n = b_obs.shape[0]
+    mb = max(n // 4, 1)
+    actor = list(agent.pi.parameters()) + [agent.log_std]
+    critic = list(agent.v.parameters())
+    skipped, kl, clipped, vloss, epochs = 0, 0.0, 0.0, 0.0, 0
+    for _ in range(5):
+        perm = torch.randperm(n, device=dev, generator=gen)
+        kls, clips, vls = [], [], []
+        for i in range(0, n, mb):
+            j = perm[i:i + mb]
+            dist = agent.dist(b_obs[j])
+            lp = dist.log_prob(b_act[j]).sum(-1)
+            log_ratio = lp - b_logp[j]
+            ratio = torch.exp(log_ratio)
+            pg = -torch.min(ratio * b_adv[j], ratio.clamp(0.8, 1.2) * b_adv[j]).mean()
+            vl = 0.5 * ((agent.v(b_obs[j]).squeeze(-1) - b_ret[j]) ** 2).mean()
+            loss = pg + vl
+            if not torch.isfinite(loss):
+                skipped += 1
+                continue
+            opt.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(actor, 1.0)
+            torch.nn.utils.clip_grad_norm_(critic, 1.0)
+            opt.step()
+            with torch.no_grad():
+                agent.log_std.clamp_(min=LEAST_LOG_STD)
+                kls.append(float(((ratio - 1.0) - log_ratio).mean()))
+                clips.append(float(((ratio - 1.0).abs() > 0.2).float().mean()))
+                vls.append(float(vl))
+        epochs += 1
+        if kls:
+            kl, clipped, vloss = sum(kls) / len(kls), sum(clips) / len(clips), sum(vls) / len(vls)
+        if kl > target_kl:
+            break
+    return (kl, skipped), clipped, vloss, epochs
+
+
+class Guard:
+    """The weights of the last good update, and the test of a collapse: the mean reward of the last
+    5 updates below 85% of the best such mean."""
+
+    def __init__(self):
+        self.rewards, self.best, self.good, self.rollbacks = [], 0.0, None, 0
+
+    def add(self, r):
+        self.rewards = (self.rewards + [r])[-5:]
+
+    def recent(self):
+        return sum(self.rewards) / max(len(self.rewards), 1)
+
+    def keep(self, step, agent, opt, norm):
+        if len(self.rewards) < 5:
+            return
+        r = self.recent()
+        if r >= 0.95 * self.best:
+            self.best = max(self.best, r)
+            self.good = {"step": step, "agent": {k: v.detach().clone() for k, v in agent.state_dict().items()},
+                         "opt": __import__("copy").deepcopy(opt.state_dict()), "norm": norm.state()}
+
+    def rebase(self):
+        self.rewards, self.best = [], 0.0
+
+    def collapsed(self):
+        return self.good is not None and len(self.rewards) == 5 and self.recent() < 0.85 * self.best \
+            and self.rollbacks < 6
+
+    def restore(self, agent, opt, norm):
+        agent.load_state_dict(self.good["agent"])
+        lr = opt.param_groups[0]["lr"] * 0.5
+        opt.load_state_dict(self.good["opt"])
+        for g in opt.param_groups:
+            g["lr"] = lr
+        norm.load(self.good["norm"], agent.log_std.device)
+        self.rewards = []
+        self.rollbacks += 1
+
+
 
 def play(sim, agent, norm, clips, most_frames=None, record=False):
     """The clips `clips` (indices) played by the net from their first frames (its mean action),
@@ -394,7 +483,7 @@ def play(sim, agent, norm, clips, most_frames=None, record=False):
             steps = min(steps, most_frames)
         frames = [] if record else None
         if record:
-            frames.append(sim.qpos[:k].half().cpu())
+            frames.append(sim.qpos[:k].float().cpu().clone())
         for t in range(steps):
             with torch.no_grad():
                 a = agent.pi(norm(observe(sim)))
@@ -408,7 +497,7 @@ def play(sim, agent, norm, clips, most_frames=None, record=False):
             dist += ex * m
             count += m
             if record:
-                frames.append(sim.qpos[:k].half().cpu())
+                frames.append(sim.qpos[:k].float().cpu().clone())
         for j in range(k):
             entry = {"clip": batch[j], "followed": bool(alive[j]), "frames": int(fell_at[j]),
                      "mean_m": float(dist[j] / max(float(count[j]), 1.0))}
@@ -467,6 +556,8 @@ def main():
     p.add_argument("--hidden", default="1024,512")
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--eval-every", type=int, default=200)
+    p.add_argument("--target-kl", type=float, default=0.02,
+                   help="the epochs of an update stop when the mean KL of the last passes this")
     p.add_argument("--filtered", action="store_true", help="play every clip to its end at the end")
     p.add_argument("--weights", default="",
                    help="a trained tracker (tracker.pt): train nothing, play every clip of the refs to its end")
@@ -490,6 +581,7 @@ def main():
         opt = torch.optim.Adam(agent.parameters(), lr=a.lr)
         norm = Normal(n_obs, dev)
         step, samples = 0, 0
+        best = None
         state = run.resume()
         if a.weights:
             # Phase 5 step 12: the tracker as the slow reference of the solver's movements.
@@ -524,6 +616,9 @@ def main():
         val_buf = torch.zeros(H + 1, N, device=dev)
         trunc_val = torch.zeros(H, N, device=dev)
         last_eval = None
+        guard = Guard()
+        if state is not None and state.get("best") is not None:
+            best = state["best"]
         rate_t, rate_s = time.time(), samples
         while step < a.steps:
             ep_r, ep_fall, blown, skipped = 0.0, 0.0, 0, 0
@@ -564,24 +659,8 @@ def main():
             b_obs, b_act = obs_buf.reshape(H * N, -1), act_buf.reshape(H * N, -1)
             b_logp, b_adv, b_ret = logp_buf.reshape(-1), adv.reshape(-1), ret.reshape(-1)
             b_adv = (b_adv - b_adv.mean()) / (b_adv.std() + 1e-8)
-            mb = max((H * N) // 4, 1)
-            for _ in range(5):
-                perm = torch.randperm(H * N, device=dev, generator=gen)
-                for i in range(0, H * N, mb):
-                    j = perm[i:i + mb]
-                    dist = agent.dist(b_obs[j])
-                    lp = dist.log_prob(b_act[j]).sum(-1)
-                    ratio = torch.exp(lp - b_logp[j])
-                    pg = -torch.min(ratio * b_adv[j], ratio.clamp(0.8, 1.2) * b_adv[j]).mean()
-                    vl = 0.5 * ((agent.v(b_obs[j]).squeeze(-1) - b_ret[j]) ** 2).mean()
-                    loss = pg + vl
-                    if not torch.isfinite(loss):
-                        skipped += 1
-                        continue
-                    opt.zero_grad()
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(agent.parameters(), 1.0)
-                    opt.step()
+            kl, clipped, vloss, epochs = ppo(agent, opt, b_obs, b_act, b_logp, b_adv, b_ret, gen, a.target_kl)
+            skipped += kl[1]
             step += 1
             samples += H * N
             now = time.time()
@@ -591,17 +670,37 @@ def main():
             if step % 10 == 0:
                 print(f"update {step}: reward {ep_r / H:.3f} falls/step {ep_fall / H:.4f} "
                       f"samples {samples} ({sps:.0f} a second); worlds blown up {blown}, "
-                      f"minibatches skipped {skipped}", flush=True)
+                      f"minibatches skipped {skipped}; kl {kl[0]:.4f} clipped {clipped:.3f} "
+                      f"value loss {vloss:.3f} epochs {epochs} log std {float(agent.log_std.mean()):.3f} "
+                      f"lr {opt.param_groups[0]['lr']:.2e}", flush=True)
+            # A collapse (on 2026-11-26 three runs on the human fell from a reward of 0.77 to 0.42
+            # in 30 updates at update 990, with no world blown up): the weights of the last good
+            # update come back with half the rate of learning.
+            guard.add(ep_r / H)
+            if guard.collapsed():
+                print(f"update {step}: collapse (reward {guard.recent():.3f} against {guard.best:.3f}): "
+                      f"back to update {guard.good['step']}, rate of learning halved", flush=True)
+                guard.restore(agent, opt, norm)
+                step = guard.good["step"]
+            elif step % 25 == 0:
+                guard.keep(step, agent, opt, norm)
             if a.eval_every and step % a.eval_every == 0:
                 last_eval = evaluate(sim, agent, norm)
                 print(f"evaluate at {step}: {json.dumps(last_eval)}", flush=True)
+                followed = last_eval["training"].get("followed", 0.0)
+                if best is None or followed > best["followed"]:
+                    best = {"followed": followed, "step": step, "evaluation": last_eval,
+                            "agent": {k: v.detach().cpu().clone() for k, v in agent.state_dict().items()},
+                            "norm": {k: (v.cpu().clone() if hasattr(v, "cpu") else v) for k, v in norm.state().items()}}
                 sim.reset(torch.ones(a.worlds, dtype=torch.bool, device=dev))
+                # The clips' weights changed, and with them the reward a good net gets.
+                guard.rebase()
             if run.due() or step == a.steps:
                 run.checkpoint(step, {
                     "agent": {k: v.cpu() for k, v in agent.state_dict().items()},
                     "opt": opt.state_dict(), "norm": norm.state(), "step": step,
                     "samples": samples, "gen": gen.get_state().cpu(),
-                    "torch_rng": torch.get_rng_state(), "weights": sim.weights.cpu(),
+                    "torch_rng": torch.get_rng_state(), "weights": sim.weights.cpu(), "best": best,
                     "n_obs": n_obs, "n_act": n_act,
                     "hidden": hidden, "args": vars(a),
                 })
@@ -610,6 +709,12 @@ def main():
                 return
         final = evaluate(sim, agent, norm)
         print(f"evaluate at the end: {json.dumps(final)}", flush=True)
+        if best is not None and best["followed"] > final["training"].get("followed", 0.0):
+            # The best tracker an evaluation saw writes the filtered capture.
+            print(f"the best tracker is update {best['step']}'s: followed {best['followed']:.3f}", flush=True)
+            agent.load_state_dict({k: v.to(dev) for k, v in best["agent"].items()})
+            norm.load(best["norm"], dev)
+            final = best["evaluation"]
         import io
         buf = io.BytesIO()
         torch.save({"agent": {k: v.cpu() for k, v in agent.state_dict().items()},

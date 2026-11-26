@@ -385,6 +385,7 @@ than the balance fell (1.59 written, 1.12 fallen for the tests of 0.5).
 | 2026-11-26 | `p4h-small` (L4): phase 4 on the human: the speed of the tracker's training, 20 updates at 4096 worlds, done | 0.22 |
 | 2026-11-26 | `p4h-1` (L4): phase 4 on the human: 629 training clips, 91 test clips held out, 8500 updates, failed | 2.87 |
 | 2026-11-26 | `p4h-2` (L4): phase 4 on the human: 629 training clips, 91 test held out, 8500 updates; contacts sized from the model, stopped by a signal | 3.72 |
+| 2026-11-26 | `p4h-3` (L4, and a T4 for 10 min): phase 4 on the human: 629 training clips, 91 test held out, 8500 updates; blown-up worlds reset (none blew up). A poll's 404 was taken for a lost session while the L4 ran on: a T4 was started and billed beside it, then stopped. Fell apart at update 980 as the two runs before; stopped at update 1033 | 2.97 |
 
 #### A new machine
 
@@ -910,6 +911,15 @@ removes the faults of the retarget: slide, penetration and forces that cannot oc
   simulation blows up (a number not finite, or a speed past 200) now starts again with no reward
   and stays out of the observations' running mean and spread, and an update whose loss is not
   finite is skipped; `p4h-3` (8,500 updates) counts both in its log.
+- `p4h-3` fell apart at the same place with no world blown up (reward 0.78 at update 960, 0.68 at
+  980, 0.42 at 1,020; falls a step from 0.4% to 24%): the cause is the training's own step, not
+  the simulator. The tracker now keeps PPO's step small and recovers from a collapse: no epoch
+  after one whose mean KL passed 0.02, the actor's and the critic's gradients clipped apart, the
+  actions' spread not below e^-3, the weights of the last good update (each 25 updates) brought
+  back with half the rate of learning when the mean reward of 5 updates falls under 85% of the
+  best, and the best tracker by evaluation kept and used for the filtered capture; its log gives
+  the KL, the share clipped, the value loss, the epochs and the spread. The filtered capture was
+  recorded at half precision (16 mm steps of a root 30 m out): now at full.
 - The filtered capture back as poses (`tools/movement/export -- human unfilter`, `--read
   filtered=` the run's outputs, `--read sim=` its export, `--write out=.movement/poses-filtered`):
   each clip's qpos up to its fall as the body's numbers (a welded segment at rest), so the solver
@@ -1029,6 +1039,17 @@ through the world with no cycle and no clip.
   movements float (37 to 53 mm against 32) and their roots' residual rises (0.60 to 0.76 of the
   weight against 0.43): 1 of 8 in every target. Not kept: the feet's loss alone, on kinematics,
   lifts the root; the filtered capture is the means for the run's slide.
+- The prior of style (step 14, `tools/movement/amp.py`): a least-squares discriminator of
+  stretches of 10 frames (a third of a second: one pair of frames cannot tell a held pose from a
+  body that stands) read the same way from the capture, its damaged copies and the simulator
+  (the root's height and tilt, the joints' numbers, each segment's place from the root, their
+  rates, the root's speed and turn, in the heading frame), with the penalty on its gradient at the
+  capture. Its input checked alone against damaged training clips (`--offline`, 1,500 updates on
+  the CPU here, 60 training and 60 test clips of 100STYLE, EMBM and CeTI): the test clips score
+  above their damaged copies in 97.1% of 780 pairs (the target 95%); a faster time is the hardest
+  (83 to 92%), the slide, the noise, the raised root and the still body 98 to 100%. The run that
+  trains a net under it, with the solver's wish of a speed and a direction as its task, is next on
+  the L4.
 - Not yet: the solver trained on the filtered capture (phase 4's tracker on the human is in work), the tracker following the
   solver's output, the bits on the two machines (the M4 is not measured), the prior of style and
   the skills.
