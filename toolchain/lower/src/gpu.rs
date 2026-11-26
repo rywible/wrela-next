@@ -4005,13 +4005,13 @@ fn verify(cx: &mut Cx, mb: &mut ModuleBuilder, name: &str) -> Option<Counts> {
             for (idx, fw) in flat_each.into_iter().enumerate() {
                 let Some(slot) = work.get_mut(idx) else { continue };
                 match (*slot, fw.work) {
-                    (_, None) if mb.m.strict => {
+                    (_, None) if mb.m.strict || mb.m.transient => {
                         *slot = None;
                         if let Some(u) = unbounded.get_mut(idx) {
                             *u = fw.unbounded;
                         }
                     }
-                    (pre, Some(w)) if mb.m.strict => {
+                    (pre, Some(w)) if mb.m.strict || mb.m.transient => {
                         *slot = Some(pre.map_or(w, |pre| pre.max(w)));
                         if let Some(u) = unbounded.get_mut(idx) {
                             *u = None;
