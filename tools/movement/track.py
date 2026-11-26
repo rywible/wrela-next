@@ -145,6 +145,11 @@ class Sim:
         self.starts = torch.tensor(head["starts"], device=device, dtype=torch.long)
         self.lengths = torch.tensor(head["lengths"], device=device, dtype=torch.long)
         self.ref_x, self.ref_r = self.frames_of(self.ref_q)
+        sets = head.get("sets") or ["training"] * len(head["names"])
+        self.train = torch.tensor([i for i, s in enumerate(sets) if s == "training"] or
+                                  list(range(len(sets))), device=device, dtype=torch.long)
+        self.test = torch.tensor([i for i, s in enumerate(sets) if s == "test"], device=device,
+                                 dtype=torch.long)
         # Each world's clip and frame.
         self.clip = torch.zeros(worlds, dtype=torch.long, device=device)
         self.frame = torch.zeros(worlds, dtype=torch.long, device=device)
@@ -184,7 +189,8 @@ class Sim:
         idx = which.nonzero().flatten()
         if idx.numel() == 0:
             return
-        c = torch.randint(0, self.starts.shape[0], (idx.numel(),), device=self.dev, generator=self.gen)
+        c = self.train[torch.randint(0, self.train.shape[0], (idx.numel(),), device=self.dev,
+                                     generator=self.gen)]
         span = (self.lengths[c] - 2).clamp(min=1)
         f = (torch.rand(idx.numel(), device=self.dev, generator=self.gen) * span).long()
         self.clip[idx] = c
@@ -325,15 +331,17 @@ def make_agent(n_obs, n_act, hidden):
 # ---- training ------------------------------------------------------------------------------------
 
 
-def evaluate(sim, agent, norm, most_frames=600):
-    """Each clip played by the net from its first frame (its mean action), in turn, a world a
-    clip: the share followed to the end (or `most_frames`) with no fall, and the mean distance of
-    a segment from its place."""
-    n_clips = sim.starts.shape[0]
-    done_ok, dist_sum, dist_n = 0, 0.0, 0
-    for i in range(0, n_clips, sim.n):
-        k = min(sim.n, n_clips - i)
-        c = torch.arange(i, i + sim.n, device=sim.dev) % n_clips
+def play(sim, agent, norm, clips, most_frames=None, record=False):
+    """The clips `clips` (indices) played by the net from their first frames (its mean action),
+    `sim.n` at a time, to their ends (or `most_frames`): for each, whether it was followed to its
+    end with no fall, the frame it fell at (or its length), the mean distance of a segment from
+    its place while it was followed (m), and with `record`, each frame's qpos up to its fall."""
+    out = []
+    clips = [int(c) for c in clips]
+    for i in range(0, len(clips), sim.n):
+        batch = clips[i:i + sim.n]
+        k = len(batch)
+        c = torch.tensor(batch + [batch[0]] * (sim.n - k), device=sim.dev, dtype=torch.long)
         sim.clip[:] = c
         sim.frame[:] = 0
         g = sim.starts[c]
@@ -342,20 +350,69 @@ def evaluate(sim, agent, norm, most_frames=600):
         sim.warm[:] = 0.0
         mjw.kinematics(sim.m, sim.d)
         alive = torch.ones(sim.n, dtype=torch.bool, device=sim.dev)
-        steps = int(min(int(sim.lengths[c[:k]].max().item()) - 2, most_frames))
-        for _ in range(steps):
+        fell_at = sim.lengths[c].clone()
+        dist = torch.zeros(sim.n, device=sim.dev)
+        count = torch.zeros(sim.n, device=sim.dev)
+        steps = int(sim.lengths[c[:k]].max().item()) - 2
+        if most_frames:
+            steps = min(steps, most_frames)
+        frames = [] if record else None
+        if record:
+            frames.append(sim.qpos[:k].half().cpu())
+        for t in range(steps):
             with torch.no_grad():
                 a = agent.pi(norm(observe(sim)))
             sim.step(sim.ref_q[sim.global_frame(1)][:, 7:] + 0.5 * a.clamp(-1, 1))
             _, fell, ex = reward(sim)
             live_clip = sim.frame < (sim.lengths[sim.clip] - 1)
+            newly = alive & fell & live_clip
+            fell_at = torch.where(newly, sim.frame, fell_at)
             alive &= ~(fell & live_clip)
-            m = alive & live_clip
-            dist_sum += float(ex[m][:k].sum()) if m[:k].any() else 0.0
-            dist_n += int(m[:k].sum())
-        done_ok += int(alive[:k].sum())
-    return {"followed": done_ok / max(n_clips, 1), "mean_segment_mm": 1000.0 * dist_sum / max(dist_n, 1),
-            "clips": n_clips}
+            m = (alive & live_clip).float()
+            dist += ex * m
+            count += m
+            if record:
+                frames.append(sim.qpos[:k].half().cpu())
+        for j in range(k):
+            entry = {"clip": batch[j], "followed": bool(alive[j]), "frames": int(fell_at[j]),
+                     "mean_m": float(dist[j] / max(float(count[j]), 1.0))}
+            if record:
+                n = min(int(fell_at[j]), len(frames))
+                entry["qpos"] = torch.stack([f[j] for f in frames[:n]]).float().numpy()
+            out.append(entry)
+    return out
+
+
+def summary(results):
+    if not results:
+        return {"clips": 0}
+    followed = sum(r["followed"] for r in results)
+    frames = sum(r["frames"] for r in results)
+    mean_mm = 1000.0 * sum(r["mean_m"] * r["frames"] for r in results) / max(frames, 1)
+    return {"clips": len(results), "followed": followed / len(results), "mean_segment_mm": mean_mm}
+
+
+def evaluate(sim, agent, norm, most_frames=600):
+    """The training clips and the test clips, each played from its start (`play`)."""
+    return {"training": summary(play(sim, agent, norm, sim.train.tolist(), most_frames)),
+            "test": summary(play(sim, agent, norm, sim.test.tolist(), most_frames))}
+
+
+def filtered(sim, agent, norm, head):
+    """Every clip played to its end by the net, as the simulator moved the body (each frame's
+    qpos, up to a fall): the filtered capture (`WFLT`: a u32 length and a JSON head of each clip's
+    name, set, whether it was followed and its frames; then zlib of the float32 qpos, clip after
+    clip)."""
+    results = play(sim, agent, norm, list(range(sim.starts.shape[0])), record=True)
+    clips, chunks = [], []
+    for r in results:
+        clips.append({"name": head["names"][r["clip"]], "set": (head.get("sets") or ["training"] * 99999)[r["clip"]],
+                      "followed": r["followed"], "frames": int(r["qpos"].shape[0]),
+                      "length": int(sim.lengths[r["clip"]]), "mean_segment_mm": 1000.0 * r["mean_m"]})
+        chunks.append(r["qpos"].astype("<f4"))
+    body = zlib.compress(np.concatenate(chunks).tobytes(), 6)
+    h = json.dumps({"clips": clips, "nq": head["nq"], "rate": head["rate"]}).encode()
+    return b"WFLT" + struct.pack("<I", len(h)) + h + body, results
 
 
 def main():
@@ -371,6 +428,7 @@ def main():
     p.add_argument("--hidden", default="1024,512")
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--eval-every", type=int, default=200)
+    p.add_argument("--filtered", action="store_true", help="play every clip to its end at the end")
     a = p.parse_args(run.args)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     wp.init()
@@ -488,10 +546,21 @@ def main():
                 run.abandon()
                 return
         final = evaluate(sim, agent, norm)
+        print(f"evaluate at the end: {json.dumps(final)}", flush=True)
+        import io
+        buf = io.BytesIO()
         torch.save({"agent": {k: v.cpu() for k, v in agent.state_dict().items()},
-                    "norm": norm.state(), "n_obs": n_obs, "n_act": n_act, "hidden": hidden},
-                   os.path.join(run.out, "tracker.pt"))
-        run.finish({"step": step, "samples": samples, "evaluation": final,
+                    "norm": norm.state(), "n_obs": n_obs, "n_act": n_act, "hidden": hidden,
+                    "seed": run.seed, "args": vars(a), "samples": samples}, buf)
+        run.output("tracker.pt", buf.getvalue())
+        full = {}
+        if a.filtered:
+            data, results = filtered(sim, agent, norm, head)
+            run.output("filtered.bin", data)
+            full = {"training": summary([r for r in results if r["clip"] in set(sim.train.tolist())]),
+                    "test": summary([r for r in results if r["clip"] in set(sim.test.tolist())])}
+            print(f"the filtered capture, every clip to its end: {json.dumps(full)}", flush=True)
+        run.finish({"step": step, "samples": samples, "evaluation": final, "full": full,
                     "seconds": time.time() - t0})
 
 

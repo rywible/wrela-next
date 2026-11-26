@@ -1,7 +1,10 @@
 # Plan: one body declaration and one movement solver
 
-Status: approved by the owner on 2026-11-25, with a limit of 300 compute units. Phase 0 is in
-work. Section 5 has a table that shows what is done.
+Status: approved by the owner on 2026-11-25, with a limit of 300 compute units. Later that day
+the owner added the changes that section 17 lists: laws of movement as measures, a prior of style
+from the capture we have, muscles, spells that act on bodies, duels, and a learned preference.
+Phase 0 is done. Phase 1 is done on the Linux machine. Phases 2 to 4 are in work. Each phase says
+what is done.
 
 This plan contains no new measurement. Each fact about the repository comes from the code at
 `342c2e6`. Each fact about an outside source comes from the page in section 15. Where a fact is
@@ -126,8 +129,9 @@ An agent starts each run with the `colab` command. No person starts a run. Secti
 | 2 | Capture with clean rights, on our bodies | Phases 0 and 1 | No |
 | 3 | A judge that gives numbers for movement | Phases 1 and 2 | No |
 | 4 | A tracker, and filtered capture | Phases 2 and 3 | Yes |
-| 5 | The solver in the engine | Phases 3 and 4 | Yes |
-| 6 | Bodies and ground that have no capture | Phase 5 | Yes |
+| 5 | The solver in the engine, with a prior of style | Phases 3 and 4 | Yes |
+| 5b | Spells that act on bodies, and duels between trained bodies | Phases 4 and 5 | Yes |
+| 6 | Bodies and ground that have no capture, after muscles are measured | Phase 5 | Yes |
 
 Reasons for this order:
 
@@ -141,6 +145,13 @@ Reasons for this order:
   it make.
 
 Phases 1 to 3 are useful if the owner stops the plan after them.
+
+The owner's order of 2026-11-25 for the changes of section 17: the laws of movement now (phase 3),
+the prior of style and the variants in phases 4 and 5, spells and duels as phase 5b, and muscles
+measured before phase 6 commits to a method.
+
+The rights rule leaves mostly 100STYLE: one performer, mostly walking. So the movement must come
+from physics, from biology and from the goals of the game, not only from copying capture.
 
 ## 5. Phase 0: decisions, rights and two measurements
 
@@ -560,6 +571,10 @@ body declaration and the field of the world.
 | Gait numbers | No unit | The duty factor and the stride length against the speed, and the energy for each metre |
 | Distance from capture | No unit | How far the statistics of the movement are from those of the capture |
 | Response | ms | The time from a change of goal to the change of movement |
+| Laws of movement | Each its own | How far a movement is from what published movement science says of people: a reach's speed against the minimum-jerk profile, the two-thirds power law of curved paths, Fitts' law of movement time, the order of a turn (head, then trunk, then pelvis), a response of 150 to 250 ms, the shift of weight before an arm is raised, and the sway and the breath of standing |
+
+Where an action has no capture (a cast, a parry, a dodge), its distance from capture is replaced by
+its distance from the laws of movement. They need no capture and carry no licence.
 
 ### Steps
 
@@ -582,6 +597,12 @@ body declaration and the field of the world.
 9. **Write a film of a movement to a file.** It shows one body from the side and from the front,
    with its contacts and its root residual drawn. Open no window. Phase 5 uses this for the one
    review by the owner.
+
+10. **Measure the laws of movement** (`lib/engine/judge/laws.wrela`), each with a check that
+    gives a number: a movement made to keep the law and one made to break it. Calibrate them as
+    the other measures: on the calibration clips where an action has them (standing, turns,
+    curved paths of the hands), and on movements made by the solver where capture has none
+    (reaches, the shift of weight before a raised arm, responses).
 
 The calibration needs no person. Thus the judge can be wrong in a way that only an eye finds. The
 review in phase 5 is the check of that.
@@ -672,7 +693,22 @@ through the world with no cycle and no clip.
     the output of the solver in the simulator. Write the result in the provenance record.
 13. **Show that the solver does not only play clips.** Search the output of the solver for each
     clip of the training set. The test fails if the solver gives a clip back.
-14. **Move the creature with the solver in each scene.** Remove `lib/kit/motion/cycle.wrela`,
+14. **Learn a prior of style from the capture we have** (the adversarial motion priors of X. B.
+    Peng et al. 2021): a discriminator trained on the filtered capture says how much a short
+    stretch of movement looks like it. Check: it scores held-out test clips above the same clips
+    damaged as in phase 3 in not less than 95% of pairs. First run: one discriminator with the
+    tracker's samples, 30 minutes of an L4 (about 1.2 units).
+15. **Learn skills that have no capture under that prior:** a cast, a parry and a dodge, each from a
+    task reward (a part at a point at a tick, a direction to face, a hit avoided) and the prior's
+    reward together. Check: the goal error of each skill's goal test, and the laws of movement in
+    their calibrated limits. First run: one skill, 256 bodies, 20 minutes. Estimate: 12 to 21
+    units for each skill, 35 to 65 for three.
+16. **Make the filtered capture a generator, not a fixed set.** The tracker follows each clip
+    under changes that physics permits: a push, a slope, another speed (the clip's time scaled),
+    and other proportions (the clip retargeted to a body with longer or shorter limbs). Check:
+    the share of variants followed with no fall, and each variant's measures by the judge. First
+    run: 64 variants of one clip. Estimate: 5 to 10 units.
+17. **Move the creature with the solver in each scene.** Remove `lib/kit/motion/cycle.wrela`,
     `lib/kit/motion/playback.wrela`, `game/rules/walk.wrela` and `game/rules/gaits.wrela` in the
     same change. Correct the rows of `docs/citations.md`.
 
@@ -687,21 +723,93 @@ to the side, put a hand at a point at a tick, and look at a point. The judge mea
 - The error of a timed goal is 0 ticks and not more than 20 mm (first value).
 - The tracker follows the output of the solver with no fall in not less than 95% of the goal
   tests (first value).
+- The prior of style scores held-out capture above its damaged copies in not less than 95% of
+  pairs, and each skill with no capture is in the calibrated limits of the laws of movement.
 - The poses have the same bits on the two machines.
 - The CPU time for each body is in the budget of 0.3.
 - The solver gives back no clip of the training set.
 - `tools/gate` passes on the two machines, with the frame times in their limits.
 
-### The one review by the owner
+### The owner's preference, learned
 
-All lines above need no person. When they are true, make 20 pairs of films with the tool of
-phase 3 step 9. One film of each pair is capture and one is the solver. The owner selects the
-film that looks more alive.
+All lines above need no person. To bring the owner's eye in early and often:
 
-- The phase is done if the owner selects the capture in not more than 14 of the 20 pairs (first
-  value).
+1. **A tool that shows the owner two films a day,** a few minutes each, made with the tool of
+   phase 3 step 9: two movements of the same goal (capture and the solver, or two solvers). The
+   owner selects the one that looks more alive. Each choice is kept in git with the two films'
+   records.
+2. **A reward model** trained on the choices (a few hundred: the method of preference learning
+   from pairs of P. F. Christiano et al. 2017): a net that scores a stretch of movement as the
+   owner would. Check: it predicts held-out choices of the owner better than chance by a margin
+   that its error says is not luck (at 300 choices, 65% or more). First run: on the first 100
+   choices, on the CPU.
+3. **Use it as a term of training** in phases 5 and 5b, beside the judge.
+
+### The final review by the owner
+
+When the lines above are true, make 20 pairs of films. One film of each pair is capture and one is
+the solver. The owner selects the film that looks more alive. Chance is 10 of 20.
+
+- The goal: the owner selects the capture in not more than 12 of the 20 pairs (first value).
+- The phase is not done if the owner selects the capture in more than 14 of the 20 pairs: 14 stays
+  the minimum.
 - If not, the judge has a fault. Find what the eye saw and the judge did not. Add it to the
   judge as a measure, calibrate again and train again.
+
+## 10b. Phase 5b: spells that act on bodies, and duels
+
+Purpose: a cast and a parry are physics, not clips. A cast pushes back with real momentum, sand
+has mass, and a parry must stop something with mass. Then bracing, recoil and the plant of the
+feet come from physics, and anticipation and recovery from training against another body. No
+capture set has them. This is where the plan can lead, not only match.
+
+### Steps
+
+1. **Give spells mass and momentum in the engine's spell and matter systems,** not as a special
+   case for one move: what a spell throws is matter (`Density`), a cast's reaction pushes the
+   caster, and a parry's impact pushes the parrier. The training simulator takes the same
+   numbers from the same declarations. Check: momentum is conserved across a cast and a parry
+   to 1% in the simulator; a cast with twice the mass gives twice the impulse. First run: one
+   cast against a fixed body, on the CPU.
+2. **Train bodies to cast and to parry under the prior of style** (phase 5 step 14), with the
+   reaction forces of their own spells. Check: the root residual of the judge stays in its
+   limit through a cast (the feet, not a hidden hand, take the recoil). First run: one body
+   casting, 256 bodies, 20 minutes.
+3. **Duels between trained bodies:** one casts, the other must parry at the exact tick. The
+   reward is the goal and its tick, the energy, and the measures of the judge; the judge is the
+   guard against exploits (a reward gained by a movement that the judge fails is not a reward).
+   Check: the parry's tick error (0 ticks, first value), the share of parries that stop the
+   spell, and each measure of the judge in its limit. First run: 128 pairs, 30 minutes.
+
+### Done when
+
+- A parry stops a spell with mass at the correct tick in not less than 90% of duels (first value),
+  with each measure of the judge in its limit.
+- The bodies plant their feet and brace before a cast and recover after a parry, by the judge's
+  measures (the shift of weight before the cast, the root residual and the contacts), with no
+  capture of either.
+- `tools/gate` passes on the two machines.
+
+Estimate: 50 to 100 units.
+
+## 10c. Muscles, measured before phase 6
+
+Bodies driven by muscles with a metabolic cost and a delay of the nerves walk naturally with
+little capture (S. Lee et al. 2019; S. Park et al. 2022). Phase 6 already takes each strength from
+the cross-section of its segment, so muscles are the next step of the same idea.
+
+1. **Add muscles as a field of the body declaration:** each muscle's attachments (points of
+   segments), its path, its greatest force from its cross-section and a published muscle stress,
+   a Hill-type relation of force to length and speed, its metabolic cost, and the delay of its
+   nerve. Check: each muscle's moment arm about its joints against the derivative of its length
+   (the same number two ways), and its greatest torque against the joint's strength of phase 6.
+2. **Measure the simulator's speed with muscles on the L4** before a decision: bodies a second at
+   4,096 worlds, as 0.4 measured without them. Estimate: 0.5 units. Record the result here
+   either way.
+3. **Decide:** if the simulator with muscles is within a factor of three of the speed without them,
+   phase 6 trains muscle-driven bodies; if not, phase 6 trains with torques from the
+   cross-section and muscles wait. Estimate of a muscle-driven phase 6: 40 to 80 units more than
+   with torques.
 
 ## 11. Phase 6: bodies and ground that have no capture
 
@@ -752,7 +860,7 @@ the answer. The rest is question 6.
 | A Colab session stops, or its connection is lost | A long run is lost, or a session uses units with no work | The run tool of 0.5, before the first run of phase 4 |
 | A net is too slow for many bodies | Bodies far from the eye move at a low rate | 0.3 measures this before the design of the net |
 | The judge does not agree with the eye | A training run gets a good number and a bad picture | The calibration of phase 3, then the one review by the owner in phase 5 |
-| The compute units are not sufficient | A training run cannot end | The estimate of 0.4 is 73 to 172 of the 300 units. Rule 9 for Colab |
+| The compute units are not sufficient | A training run cannot end | The estimate of 0.4 is 73 to 172 of the 300 units. With section 17's changes, 168 to 418 at their high ends: more than the limit. Rule 9 for Colab: each first run measures its rate, and the owner decides what is cut when the estimates are measured |
 | A licence field in a repository is wrong | The game ships weights with rights that are not clean | Read the licence file in each download. Use the sets with the mark 2 first |
 
 ## 13. Work that is not in this plan
@@ -761,7 +869,6 @@ the answer. The rest is question 6.
 | --- | --- | --- |
 | Physics of bodies while the game runs | The engine has no solver for bodies with joints. It costs much for each body | Phase 5 is done and a hit must push a body |
 | One file of weights for all bodies | It is research, and its results are poor today | Phase 6 is done for three bodies |
-| Muscles | A strength for each degree of freedom is sufficient to start | The gaits of phase 6 are not in their ranges |
 | Faces | It is a different system | The eye is near a face |
 | Cloth and hair on a body | It is a different system | Phase 5 is done |
 | A capture that the owner records | The rule is that no person makes assets | The owner answers question 5 |
@@ -788,6 +895,10 @@ Each question has the phase or the person that must answer it.
 9. Does the server run the solver, or only the rules and the root? (phase 5, step 11)
 10. How large can a file of weights be in git? (phase 5, step 2)
 11. Answered on 2026-11-25: the limit is 300 compute units for the plan.
+12. May poses made from video, by a method that turns footage into poses, be used where the
+    footage has commercial rights? (owner, for the register)
+13. May the output of video models be used as capture? Their rights are not clear. (owner, for
+    the register)
 
 ## 15. Sources
 
@@ -808,6 +919,19 @@ Published methods that the phases will cite when they use them:
   Using Motion VAEs" (2020).
 - Gaits and the Froude number: R. McN. Alexander and A. S. Jayes, "A dynamic similarity
   hypothesis for the gaits of quadrupedal mammals" (1983).
+- A prior of style: X. B. Peng, Z. Ma, P. Abbeel, S. Levine and A. Kanazawa, "AMP: Adversarial
+  Motion Priors for Stylized Physics-Based Character Control" (2021).
+- Muscles: S. Lee, M. Park, K. Lee and J. Lee, "Scalable Muscle-Actuated Human Simulation and
+  Control" (2019); S. Park, H. Ryu, S. Lee, S. Lee and J. Lee, "Generative GaitNet" (2022).
+- A learned preference: P. F. Christiano et al., "Deep Reinforcement Learning from Human
+  Preferences" (2017).
+- The laws of movement: T. Flash and N. Hogan, "The coordination of arm movements" (1985);
+  F. Lacquaniti, C. Terzuolo and P. Viviani, "The law relating the kinematic and figural aspects
+  of drawing movements" (1983); P. M. Fitts, "The information capacity of the human motor system
+  in controlling the amplitude of movement" (1954); E. G. Freedman, "Coordination of the eyes and
+  head during visual orienting" (2008); R. D. Luce, *Response Times* (1986); S. Bouisset and
+  M. Zattara, "A sequence of postural movements precedes voluntary movement" (1981); J. J. Collins
+  and C. J. De Luca, "Open-loop and closed-loop control of posture" (1993).
 
 ## 16. How to keep this plan
 
@@ -817,3 +941,18 @@ This file is the plan. Keep it in `docs/plans/`.
   commit message.
 - If a step or a target changes, change it here in the same change.
 - When all phases are done, remove this file.
+
+## 17. The changes of 2026-11-25
+
+The owner added these on 2026-11-25. Each has a check that gives a number and a small timed first
+run.
+
+| Change | Where | Its check | Its first run | Units (estimate until measured) |
+| --- | --- | --- | --- | --- |
+| Laws of movement as measures of the judge | Phase 3, now | Each law on a movement made to keep it and one made to break it (`laws.wrela`'s tests) | Done on 2026-11-25: 100STYLE clips on the CPU, 9 to 150 ms a clip | 0 (CPU) |
+| A prior of style from 100STYLE, and skills with no capture under it | Phase 5, steps 14 and 15 | Held-out capture above its damaged copies in 95% of pairs; each skill's goal test and laws | One discriminator, 30 minutes; one skill, 20 minutes | 35 to 65 for three skills |
+| The filtered capture as a generator (pushes, slopes, speeds, proportions) | Phase 5, step 16 | The share of variants followed with no fall, and their measures | 64 variants of one clip | 5 to 10 |
+| Muscles instead of torque motors | Section 10c, before phase 6 | Moment arms two ways; greatest torques against strength | The simulator's speed with muscles on the L4 | 0.5 to measure; 40 to 80 more if phase 6 uses them |
+| Spells that act on bodies, and duels | Phase 5b | Momentum conserved to 1%; a parry's tick error; the judge's measures | One cast on the CPU; 256 bodies casting; 128 duelling pairs | 50 to 100 |
+| The owner's preference, learned | Phase 5's review | A reward model predicts held-out choices (65% at 300) | On the first 100 choices, on the CPU | 0 (CPU) |
+| Questions for the owner: video turned into poses, and video models | Section 14, questions 12 and 13 | The owner's decision, in the register | None | 0 |

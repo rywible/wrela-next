@@ -1,0 +1,476 @@
+// Laws of movement as measures of the judge (docs/plans/bodies-and-movement.md, phase 3): what
+// published movement science says of how people move, measured on a body's poses with no capture
+// to compare against. Where an action has no capture, a movement's distance from these laws takes
+// the place of its distance from capture.
+//
+// - A reach's speed: from rest to rest, a hand's speed over time is the minimum-jerk profile
+//   (T. Flash and N. Hogan, J. Neurosci. 5(7), 1985): `reach_jerk` is how far the measured profile
+//   is from it.
+// - A curved path's speed: the hand slows where its path bends, its speed the curvature to the
+//   power -1/3 (the two-thirds power law: F. Lacquaniti, C. Terzuolo and P. Viviani, Acta Psychol.
+//   54, 1983): `power_law` fits the exponent.
+// - A reach's time: a + b log2(2 D / W) for a target D away and W wide (P. M. Fitts, J. Exp.
+//   Psychol. 47(6), 1954): `fitts` fits a and b and how well the line holds.
+// - A turn of gaze: the head starts to turn before the trunk, and the trunk before the pelvis
+//   (E. G. Freedman, Exp. Brain Res. 190, 2008, for the eyes and the head; the trunk after);
+//   `turn_order` measures the order and the lags.
+// - A response: some 150 to 250 ms from a stimulus to the first movement (R. D. Luce, *Response
+//   Times*, 1986): `response` measures it from a goal's tick.
+// - The shift of weight before an arm is raised: the centre of mass starts to move before the
+//   arm does (anticipatory postural adjustments: S. Bouisset and M. Zattara, Neurosci. Lett. 22,
+//   1981): `anticipation` measures how long before.
+// - Standing: the centre of mass sways by a few millimetres, most of its power below 1 Hz (J. J.
+//   Collins and C. J. De Luca, Exp. Brain Res. 95, 1993), and the chest rises and falls with the
+//   breath, 12 to 20 times a minute at rest: `standing` measures the sway and the breath.
+//
+// Each takes a body's poses (`Body::places`) and works on a point of a segment, the centre of mass,
+// or a segment's heading.
+
+use body::body::{Body, Pose}
+use body::joint::Frame
+use body::mass::Mass
+use std::collections::Vec
+use std::math::{PI, TAU}
+
+/// The path of point `local` of segment `s` (the body's space), each frame.
+pub fn path<const S: u32, const D: u32>(
+    body: Body<S>,
+    poses: Vec<Pose<D>>,
+    s: u32,
+    local: vec3,
+) -> Vec<vec3> {
+    var out: Vec<vec3> = Vec::with_capacity(poses.len())
+    for p in poses {
+        out.push(body.places(p)[s].apply(local))
+    }
+    out
+}
+
+/// The body's centre of mass, each frame.
+pub fn centre_path<const S: u32, const D: u32>(
+    body: Body<S>,
+    masses: [Mass; S],
+    poses: Vec<Pose<D>>,
+) -> Vec<vec3> {
+    var total = 0.0
+    for m in masses {
+        total += m.mass
+    }
+    var out: Vec<vec3> = Vec::with_capacity(poses.len())
+    for p in poses {
+        let at = body.places(p)
+        var c = vec3(0.0)
+        for s in 0..S {
+            c += at[s].apply(masses[s].centre) * masses[s].mass
+        }
+        out.push(c / max(total, 1.0e-6))
+    }
+    out
+}
+
+/// Speeds along a path (central differences; the ends one-sided).
+fn speeds(path: Vec<vec3>, rate: f32) -> Vec<f32> {
+    let n = path.len()
+    var out: Vec<f32> = Vec::filled(n, 0.0)
+    for f in 0..n {
+        let a = if f > 0 { f - 1 } else { 0 }
+        let b = min(f + 1, n - 1)
+        out[f] = length(path[b] - path[a]) * rate / max(f32(b - a), 1.0)
+    }
+    out
+}
+
+/// The minimum-jerk speed profile, as a share of its peak, at `u` (0 to 1) of the movement's time.
+pub fn minimum_jerk_speed(u: f32) -> f32 {
+    let t = clamp(u, 0.0, 1.0)
+    // 30 t² - 60 t³ + 30 t⁴, whose peak (at 1/2) is 15/8.
+    (30.0 * t * t - 60.0 * t * t * t + 30.0 * t * t * t * t) / 1.875
+}
+
+/// The reaches of a path: each stretch whose speed rises from under `rest` to over `moving` and
+/// falls back under `rest` (m/s), as (first frame, last frame).
+pub fn reaches(path: Vec<vec3>, rate: f32, rest: f32, moving: f32) -> Vec<vec2u> {
+    let v = speeds(path, rate)
+    var out: Vec<vec2u> = Vec::new()
+    var start = 0
+    var going = false
+    var fast = false
+    for f in 0..v.len() {
+        if !going && v[f] > rest {
+            going = true
+            fast = false
+            start = if f > 0 { f - 1 } else { 0 }
+        }
+        if going && v[f] > moving {
+            fast = true
+        }
+        if going && v[f] <= rest {
+            if fast && f > start + 3 {
+                out.push(vec2u(start, f))
+            }
+            going = false
+        }
+    }
+    out
+}
+
+/// How far a reach's speed profile (frames `r.x` to `r.y` of `path`) is from the minimum-jerk
+/// profile of its time and its peak: the root mean square of their difference, as a share of the
+/// peak. 0 for a minimum-jerk reach; about 0.3 for one at a steady speed.
+pub fn reach_jerk(path: Vec<vec3>, rate: f32, r: vec2u) -> f32 {
+    let v = speeds(path, rate)
+    var peak = 0.0
+    for f in r.x..r.y + 1 {
+        peak = max(peak, v[f])
+    }
+    if peak <= 0.0 {
+        return 1.0
+    }
+    var e = 0.0
+    let n = r.y - r.x
+    for f in r.x..r.y + 1 {
+        let u = f32(f - r.x) / f32(max(n, 1))
+        let d = v[f] / peak - minimum_jerk_speed(u)
+        e += d * d
+    }
+    sqrt(e / f32(n + 1))
+}
+
+/// The two-thirds power law on a path's frames `from` to `to`: the exponent β of its speed against
+/// its curvature (v ∝ κ^β, fitted in logs where the path bends and moves), and how many frames it
+/// was fitted on. The law: β = -1/3.
+pub fn power_law(path: Vec<vec3>, rate: f32, from: u32, to: u32) -> vec2 {
+    var xs: Vec<f32> = Vec::new()
+    var ys: Vec<f32> = Vec::new()
+    let dt = 1.0 / rate
+    for f in max(from, 1)..min(to, path.len() - 1) {
+        let v = (path[f + 1] - path[f - 1]) / (2.0 * dt)
+        let a = (path[f + 1] - 2.0 * path[f] + path[f - 1]) / (dt * dt)
+        let s = length(v)
+        if s < 0.05 {
+            continue
+        }
+        let k = length(cross(v, a)) / (s * s * s)
+        if k < 0.5 || k > 500.0 {
+            continue
+        }
+        xs.push(log(k))
+        ys.push(log(s))
+    }
+    let n = xs.len()
+    if n < 8 {
+        return vec2(0.0, f32(n))
+    }
+    var mx = 0.0
+    var my = 0.0
+    for i in 0..n {
+        mx += xs[i]
+        my += ys[i]
+    }
+    mx = mx / f32(n)
+    my = my / f32(n)
+    var sxy = 0.0
+    var sxx = 0.0
+    for i in 0..n {
+        sxy += (xs[i] - mx) * (ys[i] - my)
+        sxx += (xs[i] - mx) * (xs[i] - mx)
+    }
+    vec2(sxy / max(sxx, 1.0e-9), f32(n))
+}
+
+/// Fitts' law over reaches: each reach's time (s) and its index of difficulty log2(2 D / W) give
+/// the line a + b ID; the fit's (a, b, r²).
+pub fn fitts(times: Vec<f32>, ids: Vec<f32>) -> vec3 {
+    let n = min(times.len(), ids.len())
+    if n < 3 {
+        return vec3(0.0)
+    }
+    var mx = 0.0
+    var my = 0.0
+    for i in 0..n {
+        mx += ids[i]
+        my += times[i]
+    }
+    mx = mx / f32(n)
+    my = my / f32(n)
+    var sxy = 0.0
+    var sxx = 0.0
+    var syy = 0.0
+    for i in 0..n {
+        sxy += (ids[i] - mx) * (times[i] - my)
+        sxx += (ids[i] - mx) * (ids[i] - mx)
+        syy += (times[i] - my) * (times[i] - my)
+    }
+    let b = sxy / max(sxx, 1.0e-9)
+    let r2 = sxy * sxy / max(sxx * syy, 1.0e-12)
+    vec3(my - b * mx, b, r2)
+}
+
+/// A segment's heading (rad, about up, unwrapped), each frame: where its frame's `ahead` points
+/// on the ground.
+pub fn headings<const S: u32, const D: u32>(
+    body: Body<S>,
+    poses: Vec<Pose<D>>,
+    s: u32,
+    ahead: vec3,
+) -> Vec<f32> {
+    var out: Vec<f32> = Vec::new()
+    var last = 0.0
+    for i in 0..poses.len() {
+        let d = body.places(poses[i])[s].q.rotate(ahead)
+        let y = atan2(d.x, d.z)
+        let u = if i == 0 { y } else { last + (y - last) - TAU * floor((y - last + PI) / TAU) }
+        out.push(u)
+        last = u
+    }
+    out
+}
+
+/// The frame at which a heading has first turned `by` (rad) from its value at frame `from`, or
+/// `NONE_FRAME`.
+pub const NONE_FRAME: u32 = 4294967295
+
+pub fn onset(h: Vec<f32>, from: u32, by: f32) -> u32 {
+    for f in from..h.len() {
+        if abs(h[f] - h[from]) > by {
+            return f
+        }
+    }
+    NONE_FRAME
+}
+
+/// A turn's order: the onsets (frames) of the head's, the trunk's and the pelvis's headings after
+/// `from`, each by `by` rad; the law: head before trunk before pelvis.
+pub fn turn_order(head: Vec<f32>, trunk: Vec<f32>, pelvis: Vec<f32>, from: u32, by: f32) -> vec3u {
+    vec3u(onset(head, from, by), onset(trunk, from, by), onset(pelvis, from, by))
+}
+
+/// The response to a goal set at frame `tick`: the time (s) until a path first moves `by` (m) from
+/// where it was then, or a negative number if it never does.
+pub fn response(path: Vec<vec3>, rate: f32, tick: u32, by: f32) -> f32 {
+    for f in tick..path.len() {
+        if length(path[f] - path[tick]) > by {
+            return f32(f - tick) / rate
+        }
+    }
+    -1.0
+}
+
+/// The shift of weight before an arm is raised: the time (s) by which the centre of mass's move of
+/// `com_by` (m, along the ground) starts before the hand's move of `hand_by` (m), from frame
+/// `from`. Positive: the weight moves first, as the law says.
+pub fn anticipation(
+    centre: Vec<vec3>,
+    hand: Vec<vec3>,
+    rate: f32,
+    from: u32,
+    com_by: f32,
+    hand_by: f32,
+) -> f32 {
+    var c_on = NONE_FRAME
+    var h_on = NONE_FRAME
+    for f in from..min(centre.len(), hand.len()) {
+        let dc = centre[f] - centre[from]
+        if c_on == NONE_FRAME && length(vec2(dc.x, dc.z)) > com_by {
+            c_on = f
+        }
+        if h_on == NONE_FRAME && length(hand[f] - hand[from]) > hand_by {
+            h_on = f
+        }
+    }
+    if c_on == NONE_FRAME || h_on == NONE_FRAME {
+        return 0.0
+    }
+    (f32(h_on) - f32(c_on)) / rate
+}
+
+/// What standing does: the centre of mass's sway along the ground (its RMS about its mean, m), the
+/// share of the sway's power below 1 Hz, and the breath: the frequency (Hz) of the strongest
+/// rise and fall of the chest (`chest`, a height each frame) between 0.1 and 0.6 Hz, and that
+/// band's share of the chest's power.
+pub struct Standing: Copy {
+    pub sway: f32,
+    pub sway_below_1hz: f32,
+    pub breath_hz: f32,
+    pub breath_share: f32,
+}
+
+/// The power of `x` (its mean taken off) at frequency `hz`, by its discrete Fourier sum.
+fn power(x: Vec<f32>, rate: f32, hz: f32) -> f32 {
+    var mean = 0.0
+    for v in x {
+        mean += v
+    }
+    mean = mean / f32(max(x.len(), 1))
+    var c = 0.0
+    var s = 0.0
+    for i in 0..x.len() {
+        let a = TAU * hz * f32(i) / rate
+        c += (x[i] - mean) * cos(a)
+        s += (x[i] - mean) * sin(a)
+    }
+    (c * c + s * s) / f32(max(x.len(), 1))
+}
+
+pub fn standing(centre: Vec<vec3>, chest: Vec<f32>, rate: f32) -> Standing {
+    let n = centre.len()
+    var m = vec3(0.0)
+    for c in centre {
+        m += c
+    }
+    m = m / f32(max(n, 1))
+    var sway = 0.0
+    var xs: Vec<f32> = Vec::new()
+    var zs: Vec<f32> = Vec::new()
+    for c in centre {
+        let d = c - m
+        sway += d.x * d.x + d.z * d.z
+        xs.push(c.x)
+        zs.push(c.z)
+    }
+    sway = sqrt(sway / f32(max(n, 1)))
+    // The spectrum at steps of one over the record's length, to 5 Hz.
+    let step = rate / f32(max(n, 2))
+    var low = 0.0
+    var all = 0.0
+    var f = step
+    while f <= 5.0 {
+        let p = power(xs, rate, f) + power(zs, rate, f)
+        all += p
+        if f < 1.0 {
+            low += p
+        }
+        f += step
+    }
+    var best = 0.0
+    var best_hz = 0.0
+    var band = 0.0
+    var chest_all = 0.0
+    f = step
+    while f <= 5.0 {
+        let p = power(chest, rate, f)
+        chest_all += p
+        if f >= 0.1 && f <= 0.6 {
+            band += p
+            if p > best {
+                best = p
+                best_hz = f
+            }
+        }
+        f += step
+    }
+    Standing {
+        sway,
+        sway_below_1hz: if all > 0.0 { low / all } else { 0.0 },
+        breath_hz: best_hz,
+        breath_share: if chest_all > 0.0 { band / chest_all } else { 0.0 },
+    }
+}
+
+// ---- tests: each law on a movement made to keep it, and on one made to break it -----------------
+
+fn line(n: u32, profile: fn(f32) -> f32) -> Vec<vec3> {
+    var out: Vec<vec3> = Vec::new()
+    for i in 0..n {
+        out.push(vec3(0.3 * profile(f32(i) / f32(n - 1)), 1.0, 0.0))
+    }
+    out
+}
+
+@test
+fn a_minimum_jerk_reach_keeps_the_law_and_a_steady_one_does_not() {
+    // 0.3 m in 0.8 s at 60 frames a second, with a still second before and after.
+    var smooth: Vec<vec3> = Vec::new()
+    var steady: Vec<vec3> = Vec::new()
+    for i in 0..60 + 48 + 60 {
+        let u = clamp((f32(i) - 60.0) / 48.0, 0.0, 1.0)
+        let mj = 10.0 * u * u * u - 15.0 * u * u * u * u + 6.0 * u * u * u * u * u
+        smooth.push(vec3(0.3 * mj, 1.0, 0.0))
+        steady.push(vec3(0.3 * u, 1.0, 0.0))
+    }
+    let r1 = reaches(smooth, 60.0, 0.01, 0.1)
+    let r2 = reaches(steady, 60.0, 0.01, 0.1)
+    assert(r1.len() == 1 && r2.len() == 1, f"reaches {r1.len()} {r2.len()}")
+    let e1 = reach_jerk(smooth, 60.0, r1[0])
+    let e2 = reach_jerk(steady, 60.0, r2[0])
+    assert(e1 < 0.05 && e2 > 0.25, f"minimum jerk {e1}, steady {e2}")
+}
+
+@test
+fn an_ellipse_drawn_by_the_law_has_its_exponent() {
+    // An ellipse drawn as a harmonic oscillation (x = a cos t, y = b sin t) keeps the two-thirds
+    // power law exactly; one drawn at a steady speed has an exponent of 0.
+    var lawful: Vec<vec3> = Vec::new()
+    var steady: Vec<vec3> = Vec::new()
+    let (a, b) = (0.2, 0.08)
+    // A steady speed: the ellipse's points at equal lengths along it.
+    var arc: Vec<vec3> = Vec::new()
+    for i in 0..4000 {
+        let t = TAU * f32(i) / 4000.0
+        arc.push(vec3(a * cos(t), b * sin(t), 0.0))
+    }
+    var total = 0.0
+    for i in 1..arc.len() {
+        total += length(arc[i] - arc[i - 1])
+    }
+    for i in 0..240 {
+        let t = TAU * f32(i) / 120.0
+        lawful.push(vec3(a * cos(t), b * sin(t), 0.0))
+        // The point a share i / 120 of the way round (twice).
+        let want = fract(f32(i) / 120.0) * total
+        var acc = 0.0
+        var k = 1
+        while k < arc.len() && acc + length(arc[k] - arc[k - 1]) < want {
+            acc += length(arc[k] - arc[k - 1])
+            k += 1
+        }
+        steady.push(arc[k - 1])
+    }
+    let l = power_law(lawful, 60.0, 2, 238)
+    let s = power_law(steady, 60.0, 2, 238)
+    assert(abs(l.x + 1.0 / 3.0) < 0.02, f"the lawful ellipse's exponent {l.x}")
+    assert(abs(s.x) < 0.05, f"the steady ellipse's exponent {s.x}")
+}
+
+@test
+fn fitts_law_finds_its_line() {
+    let ids = Vec::from([1.0, 2.0, 3.0, 4.0, 5.0])
+    let times = Vec::from([0.25, 0.37, 0.49, 0.61, 0.73])
+    let f = fitts(times, ids)
+    assert(abs(f.y - 0.12) < 1.0e-4 && abs(f.x - 0.13) < 1.0e-4 && f.z > 0.999, f"fit {f}")
+}
+
+@test
+fn standing_finds_the_sway_and_the_breath() {
+    // 60 s at 30 frames a second: a sway of 0.2 Hz and 4 mm, and a breath of 0.25 Hz.
+    var centre: Vec<vec3> = Vec::new()
+    var chest: Vec<f32> = Vec::new()
+    for i in 0..1800 {
+        let t = f32(i) / 30.0
+        centre.push(vec3(0.004 * sin(TAU * 0.2 * t), 0.9, 0.003 * cos(TAU * 0.13 * t)))
+        chest.push(1.3 + 0.004 * sin(TAU * 0.25 * t))
+    }
+    let s = standing(centre, chest, 30.0)
+    assert(s.sway > 0.002 && s.sway < 0.005, f"sway {s.sway}")
+    assert(s.sway_below_1hz > 0.95, f"below 1 Hz {s.sway_below_1hz}")
+    assert(
+        abs(s.breath_hz - 0.25) < 0.02 && s.breath_share > 0.9,
+        f"breath {s.breath_hz} {s.breath_share}",
+    )
+}
+
+@test
+fn a_response_and_an_anticipation_are_timed() {
+    var hand: Vec<vec3> = Vec::new()
+    var centre: Vec<vec3> = Vec::new()
+    for i in 0..120 {
+        let t = f32(i) / 60.0
+        // The goal at frame 30 (0.5 s); the hand moves from 0.7 s, the weight from 0.6 s.
+        hand.push(vec3(0.0, 1.0 + max(t - 0.7, 0.0) * 0.5, 0.0))
+        centre.push(vec3(0.0, 0.9, -max(t - 0.6, 0.0) * 0.1))
+    }
+    let r = response(hand, 60.0, 30, 0.01)
+    assert(abs(r - 0.2333) < 0.02, f"response {r}")
+    let a = anticipation(centre, hand, 60.0, 30, 0.002, 0.01)
+    assert(a > 0.05 && a < 0.2, f"anticipation {a}")
+}

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The gate a change to how anything is drawn passes before it is called done. Usage:
 
-    tools/gate [--quick] [--full] [--only layers,tests,audit,sun,frames] [--update]
+    tools/gate [--quick] [--full] [--only layers,tests,audit,sun,frames,movement] [--update]
                [--machine NAME] [--keep DIR]
     tools/gate --seen [REV | REV..REV] [--machine NAME]
 
@@ -15,6 +15,11 @@ tools/audit, tools/bench, tools/gpu: one GPU job at a time, every dispatch under
            already (a debt, written down with what it is), and then no worse than it did.
   sun      The sun's judge (SUNJUDGE) on each of `SUN_VIEWS` at 320x180: hard leaks, hard acne
            and the mean error against 64 rays a pixel to the sun's disc.
+  movement The judge of movement (lib/engine/judge/movement.wrela) on the game's walk
+           (tools/movement/judge's `walk`): carried by its travel, its root residual, its torque
+           past strength, its slide and its penetration held to the baseline; played in place
+           (as the scenes play it), its slide must stay over `MOVEMENT_SLIDE_IN_PLACE` mm/s, so a
+           judge that stops seeing a slide fails.
   frames   A frame's cost at 1920x1080 on each of `FRAME_SCENES`: tools/bench's span (the GPU's
            clock from a frame's first pass to its last, passes overlapped, frames back to back:
            the one measure of a frame used anywhere), the median of frames 30 to 89.
@@ -77,7 +82,10 @@ COUNT_SLACK = (0.03, 8)
 REL_SLACK = 0.04
 ABS_SLACK = {"ms": 0.25, "err": 0.1}
 
-STEPS = ["layers", "tests", "audit", "sun", "frames"]
+STEPS = ["layers", "tests", "audit", "sun", "movement", "frames"]
+
+# The least slide (mm/s) the judge must find in the walk played in place (1,168 on 2026-11-25).
+MOVEMENT_SLIDE_IN_PLACE = 500.0
 
 # What a result depends on, for its key: every file under these, but for the baseline itself
 # (which says whether a number passes, never what it is).
@@ -298,6 +306,30 @@ def step_sun(res, base, opts, tmp, builds):
                     "" if n <= most else "the exact rays left fields untraced")
 
 
+def step_movement(res, base, opts, tmp, builds):
+    p = run([os.path.join(TOOLS, "wrela"), "tool", os.path.join(TOOLS, "movement", "judge"),
+             "--", "walk"])
+    lines = {}
+    for l in p.stdout.splitlines():
+        m = re.match(r"the walk, (in place|carried by its travel): residual (\S+) torque (\S+) "
+                     r"slide (\S+) pen (\S+)", l)
+        if m:
+            lines[m.group(1)] = [float(m.group(i)) for i in range(2, 6)]
+    if "in place" not in lines or "carried by its travel" not in lines:
+        res.row("movement", "judged", "not judged", False, (p.stdout.strip().splitlines() or [""])[-1][:120])
+        return
+    slide = lines["in place"][2]
+    res.row("movement: the walk in place slides (mm/s)", f">= {MOVEMENT_SLIDE_IN_PLACE:.0f}",
+            f"{slide:.0f}", slide >= MOVEMENT_SLIDE_IN_PLACE,
+            "" if slide >= MOVEMENT_SLIDE_IN_PLACE else "the judge no longer finds its slide")
+    b = base.get("movement", {})
+    names = ["residual (of the weight)", "torque past strength", "slide (mm/s)", "penetration (mm)"]
+    keys = ["residual", "torque", "slide", "penetration"]
+    for i, k in enumerate(keys):
+        res.hold(f"movement.{k}", f"movement: the walk carried, {names[i]}", lines["carried by its travel"][i],
+                 b.get(k), "err")
+
+
 def step_frames(res, base, opts, tmp, builds):
     b = base.get("frames", {})
     for scene in FRAME_SCENES:
@@ -515,6 +547,7 @@ def main():
         key = None
     res = Result()
     fns = {"layers": step_layers, "tests": step_tests, "audit": step_audit, "sun": step_sun,
+           "movement": step_movement,
            "frames": step_frames}
     tmp = opts["keep"] or tempfile.mkdtemp(prefix="wrela-gate-")
     os.makedirs(tmp, exist_ok=True)

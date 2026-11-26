@@ -7,7 +7,8 @@ works out each segment's place with the simulator's own kinematics), compressed.
 (a SET is a name of tools/movement/split, or the path of a list of clips ending in .txt)
 
 The file: "WRFS", a u32 length, a JSON head (the clips' names, each one's first frame and length,
-the qpos size and the rate), then zlib's compression of every frame's qpos (float32), clip after
+the qpos size, the rate, and each clip's set: a training run starts its worlds on training clips
+alone, and evaluates the others apart), then zlib's compression of every frame's qpos (float32), clip after
 clip.
 """
 import argparse
@@ -27,7 +28,7 @@ def main():
     p.add_argument("--most", type=int, default=0, help="at most this many clips of each set")
     p.add_argument("-o", required=True)
     a = p.parse_args()
-    names, starts, lengths, chunks = [], [], [], []
+    names, starts, lengths, chunks, which = [], [], [], [], []
     nq, rate, total, missing = None, None, 0, 0
     for s in a.sets:
         path = s if s.endswith(".txt") else os.path.join(ROOT, "tools/movement/split", f"{s}.txt")
@@ -47,13 +48,14 @@ def main():
             assert nq in (None, q) and rate in (None, r)
             nq, rate = q, r
             names.append(name)
+            which.append(os.path.basename(s)[:-4] if s.endswith(".txt") else s)
             starts.append(total)
             lengths.append(n)
             total += n
             chunks.append(np.ascontiguousarray(data))
     body = zlib.compress(np.concatenate(chunks).astype("<f4").tobytes(), 6)
     head = json.dumps({"names": names, "starts": starts, "lengths": lengths, "nq": nq,
-                       "rate": rate}).encode()
+                       "rate": rate, "sets": which}).encode()
     with open(a.o, "wb") as f:
         f.write(b"WRFS" + struct.pack("<I", len(head)) + head + body)
     print(f"pack: {len(names)} clips ({missing} not exported), {total} frames ({total / rate / 3600:.2f} h), "

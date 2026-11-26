@@ -110,6 +110,16 @@ class Run:
             age = time.time() - self.started
         return age > self.opts.lease
 
+    def output(self, name, data):
+        """Writes `data` (bytes) as one of the run's outputs (`out/outputs/NAME`), which the run
+        tool brings home when the run is done (`.movement/runs/RUN/outputs/`)."""
+        d = os.path.join(self.out, "outputs")
+        os.makedirs(d, exist_ok=True)
+        tmp = os.path.join(d, name + ".part")
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, os.path.join(d, name))
+
     def finish(self, result):
         """The run's result: one line `RESULT {json}` and status `done`."""
         with self.lock:

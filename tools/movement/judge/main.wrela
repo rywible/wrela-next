@@ -24,11 +24,11 @@ use std::io::print
 use std::quat::Quat
 use std::serialize::Reader
 use std::time::now
-use std::tool::{ToolError, args}
+use std::tool::{ToolError, all, args}
 use std::tool::blob
 use std::tool::files
 use world::creature::{BODY, MASSES}
-use world::creature_segments::{FREEDOM, PARTS}
+use world::creature_segments::{FREEDOM, HAND_LEFT, HAND_RIGHT, HEAD, PARTS, PELVIS, UPPER_CHEST}
 
 type P = Pose<FREEDOM>
 
@@ -241,11 +241,13 @@ fn score(v: [f32; MEASURES], target: [f32; MEASURES]) -> f32 {
     s
 }
 
-fn print_measures(name: str, s: Scored) {
+fn measures_line(name: str, s: Scored) -> String {
     let v = values(s)
-    print(
-        f"{name}: residual {v[0]} torque {v[1]} slide {v[2]} pen {v[3]} float {v[4]} range {v[5]} dist {v[6]} goal {v[7]} | speed {s.m.speed} energy {s.m.energy} duty {s.m.duty} flight {s.m.flight}",
-    )
+    f"{name}: residual {v[0]} torque {v[1]} slide {v[2]} pen {v[3]} float {v[4]} range {v[5]} dist {v[6]} goal {v[7]} | speed {s.m.speed} energy {s.m.energy} duty {s.m.duty} flight {s.m.flight}"
+}
+
+fn print_measures(name: str, s: Scored) {
+    print(measures_line(name, s).as_str())
 }
 
 /// The training clips' statistics (at most `most` of them).
@@ -260,6 +262,73 @@ fn reference(most: u32) -> Result<Stats<FREEDOM>, ToolError> {
         i += step
     }
     Ok(st)
+}
+
+/// One clip of the calibration set to judge, with the training clips' statistics.
+struct Job: Clone {
+    name: String,
+    refs: Stats<FREEDOM>,
+}
+
+/// A clip judged with its damaged copies (the kinds in turn, each at its amounts): what it scored
+/// and how long the judge took for the clean one.
+struct Judged: Clone {
+    failed: bool,
+    clean: [f32; MEASURES],
+    damaged: Vec<[f32; MEASURES]>,
+    timing: f32,
+    seconds: f32,
+    lines: Vec<String>,
+}
+
+const KINDS: [Text; 5] = ["faster", "slid", "noisy", "raised", "still"]
+
+/// Each kind's three amounts: times as fast, m/s of slide, rad of noise, m higher (the body that
+/// does not move at one).
+const AMOUNTS: [vec3; 5] = [
+    vec3(1.25, 1.5, 2.0),
+    vec3(0.2, 0.5, 1.0),
+    vec3(0.02, 0.05, 0.1),
+    vec3(0.02, 0.05, 0.1),
+    vec3(1.0, 1.0, 1.0),
+]
+
+fn judged_clip(j: take Job) -> Judged {
+    var out = Judged {
+        failed: true,
+        clean: [0.0; MEASURES],
+        damaged: Vec::new(),
+        timing: 0.0,
+        seconds: 0.0,
+        lines: Vec::new(),
+    }
+    let Ok(c) = load(j.name.as_str()) else { return out }
+    let goals = velocity_goals(c.poses.clone(), c.rate, 1.0)
+    let t0 = now()
+    let s0 = scored(c.poses.clone(), c.rate, j.refs, goals.clone(), 1.0)
+    out.timing = f32(now() - t0)
+    out.seconds = f32(c.poses.len()) / c.rate
+    out.clean = values(s0)
+    out.lines.push(measures_line(f"{c.name} clean", s0))
+    for k in 0..5 {
+        for a in 0..3 {
+            if k == 4 && a > 0 {
+                continue
+            }
+            let amount = AMOUNTS[k][a]
+            let poses = if k == 0 { faster(c.poses.clone(), amount) } else if k == 1 {
+                slid(c.poses.clone(), c.rate, amount)
+            } else if k == 2 { noisy(c.poses.clone(), amount) } else if k == 3 {
+                raised(c.poses.clone(), amount)
+            } else { still(c.poses.clone()) }
+            let stride = if k == 0 { amount } else { 1.0 }
+            let s = scored(poses, c.rate, j.refs, goals.clone(), stride)
+            out.lines.push(measures_line(f"{c.name} {KINDS[k]} {amount}", s))
+            out.damaged.push(values(s))
+        }
+    }
+    out.failed = false
+    out
 }
 
 fn calibrate(most: u32) -> Result<u32, ToolError> {
@@ -281,31 +350,23 @@ fn calibrate(most: u32) -> Result<u32, ToolError> {
     var timing = 0.0
     var seconds = 0.0
     let count = min(most, names.len())
+    var jobs: Vec<Job> = Vec::new()
     for ci in 0..count {
-        let c = load(names[ci].as_str())?
-        let goals = velocity_goals(c.poses.clone(), c.rate, 1.0)
-        let t0 = now()
-        let s0 = scored(c.poses.clone(), c.rate, refs, goals.clone(), 1.0)
-        timing += f32(now() - t0)
-        seconds += f32(c.poses.len()) / c.rate
-        print_measures(f"{c.name} clean", s0)
-        clean.push(values(s0))
-        for k in 0..5 {
-            for a in 0..3 {
-                if k == 4 && a > 0 {
-                    continue
-                }
-                let amount = amounts[k][a]
-                let poses = if k == 0 { faster(c.poses.clone(), amount) } else if k == 1 {
-                    slid(c.poses.clone(), c.rate, amount)
-                } else if k == 2 { noisy(c.poses.clone(), amount) } else if k == 3 {
-                    raised(c.poses.clone(), amount)
-                } else { still(c.poses.clone()) }
-                let stride = if k == 0 { amount } else { 1.0 }
-                let s = scored(poses, c.rate, refs, goals.clone(), stride)
-                print_measures(f"{c.name} {kinds[k]} {amount}", s)
-                damaged.push(values(s))
-            }
+        jobs.push(Job { name: names[ci].clone(), refs })
+    }
+    let results = all(take jobs, judged_clip)
+    for r in results {
+        if r.failed {
+            continue
+        }
+        timing += r.timing
+        seconds += r.seconds
+        clean.push(r.clean)
+        for v in r.damaged {
+            damaged.push(v)
+        }
+        for line in r.lines {
+            print(line.as_str())
         }
     }
     print(f"judge: {timing * 1000.0 / max(seconds, 1.0e-6)} ms a second of movement")
@@ -472,6 +533,95 @@ pub fn tool() -> u32 {
         }
         let _ = files::write_blob(f"out/{a[1]}.dyn", b).wait()
         print(f"dump: {forces.len()} frames")
+        0
+    } else if what == "ranges" && a.len() > 1 {
+        // Each segment's share of frames out of its range by more than 0.01 rad, and its worst.
+        let Ok(c) = load(a[1].as_str()) else { return 1 }
+        for sg in 1..world::creature_segments::SEGMENTS {
+            var out = 0
+            var worst = -1.0e9
+            for p in c.poses {
+                let r = BODY.segments[sg].joint.range(BODY.numbers(p, sg))
+                worst = max(worst, r)
+                if r > 0.01 {
+                    out += 1
+                }
+            }
+            if out > 0 {
+                print(
+                    f"ranges: segment {sg}: {out} of {c.poses.len()} frames out, the worst {worst} rad, numbers range lo {BODY.segments[sg].joint.lo} hi {BODY.segments[sg].joint.hi}",
+                )
+            }
+        }
+        0
+    } else if what == "laws" && a.len() > 1 {
+        // The laws of movement (engine::judge::laws) on a clip: the hands' paths (their reaches'
+        // distance from minimum jerk, and the two-thirds power law's exponent), the turns' order
+        // (head, trunk, pelvis), and standing (sway and breath).
+        let Ok(c) = load(a[1].as_str()) else { return 1 }
+        let t0 = now()
+        for (side, hs) in [("left", HAND_LEFT), ("right", HAND_RIGHT)] {
+            let p = engine::judge::laws::path(BODY, c.poses.clone(), hs, vec3(0.0))
+            let rs = engine::judge::laws::reaches(p.clone(), c.rate, 0.05, 0.3)
+            var jerk = 0.0
+            for r in rs {
+                jerk += engine::judge::laws::reach_jerk(p.clone(), c.rate, r)
+            }
+            let pl = engine::judge::laws::power_law(p.clone(), c.rate, 0, c.poses.len())
+            print(
+                f"laws: {side} hand: {rs.len()} reaches, their mean distance from minimum jerk {jerk / max(f32(rs.len()), 1.0)}; the power law's exponent {pl.x} over {pl.y} frames (the law: -0.333)",
+            )
+        }
+        let head = engine::judge::laws::headings(BODY, c.poses.clone(), HEAD, vec3(0.0, 0.0, 1.0))
+        let trunk = engine::judge::laws::headings(
+            BODY,
+            c.poses.clone(),
+            UPPER_CHEST,
+            vec3(0.0, 0.0, 1.0),
+        )
+        let pelvis = engine::judge::laws::headings(
+            BODY,
+            c.poses.clone(),
+            PELVIS,
+            vec3(0.0, 0.0, 1.0),
+        )
+        // Turns: from each frame where the pelvis is about to turn 0.5 rad within a second.
+        var turns = 0
+        var in_order = 0
+        var lag_ht = 0.0
+        var f = 0
+        while f + u32(c.rate) < c.poses.len() {
+            let ahead = f + u32(c.rate)
+            if abs(pelvis[ahead] - pelvis[f]) > 0.5 {
+                let o = engine::judge::laws::turn_order(head, trunk, pelvis, f, 0.1)
+                if o.x != engine::judge::laws::NONE_FRAME &&
+                    o.z != engine::judge::laws::NONE_FRAME {
+                    turns += 1
+                    if o.x <= o.y && o.y <= o.z {
+                        in_order += 1
+                    }
+                    lag_ht += (f32(o.z) - f32(o.x)) / c.rate
+                }
+                f = ahead
+            } else {
+                f += 1
+            }
+        }
+        print(
+            f"laws: {turns} turns, {in_order} with the head before the trunk before the pelvis, the head {lag_ht / max(f32(turns), 1.0) * 1000.0} ms before the pelvis on average",
+        )
+        let centre = engine::judge::laws::centre_path(BODY, MASSES, c.poses.clone())
+        var chest: Vec<f32> = Vec::new()
+        for p in c.poses {
+            chest.push(BODY.places(p)[UPPER_CHEST].t.y)
+        }
+        let st = engine::judge::laws::standing(centre, chest, c.rate)
+        print(
+            f"laws: standing: sway {st.sway * 1000.0} mm, {st.sway_below_1hz} of its power below 1 Hz; the chest's strongest rise and fall at {st.breath_hz} Hz ({st.breath_hz * 60.0} a minute), {st.breath_share} of its power between 0.1 and 0.6 Hz",
+        )
+        print(
+            f"laws: {f32(now() - t0) * 1000.0} ms for {f32(c.poses.len()) / c.rate} s of movement",
+        )
         0
     } else if what == "walk" {
         // Today's walk cycle (rules::walk), 4 s at 30 frames a second: in place, as the scenes
