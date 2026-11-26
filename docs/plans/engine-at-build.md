@@ -820,10 +820,15 @@ operations cost some forty times the screen passes' a counted unit, and a lane a
 helper (kept running for the shading's derivatives) runs the march uncounted. The counts are
 right on a probe (a loop of a call, 10 and 100 passes: 406 work an invocation where 400 is
 meant), its kept bytes (524) and its text (15% smaller) don't change without the march, and
-neither its depth write nor an early depth test is the cause. Next: tally work by kind of
-operation (arithmetic, transcendental, a uniform's or storage's read, a texture's), so the
-model fits a unit to each and shows which the kit's profile code (`segment_of`, `crosses`,
-`arc_of`: 60% of the candlestick shader's bound) spends on. Found on the way: a rigid thing's exact cells are tested in the
+neither its depth write nor an early depth test is the cause. What then was found: a read of an
+array the GPU keeps in thread memory or reads through its constant cache had been counted as an
+operation, and such loops ran past their bounds (now a memory access: the bounds hold again, the
+gate unchanged); and the exact pass's time is in its field's parts: with each cell's live mask
+cut to one part the candlestick's draw takes 2.1 ms, not 10.6, while its tally hardly moves (9.2e7
+against 9.8e7). So the tally misses the work a live part does there, and on a probe of the
+candlestick's `distance_live` it is over the static bound (5,964 a lane against 3,063), so one of
+the two counts is wrong on that code. Next: reconcile them on that probe, statement by statement;
+then the model prices the exact pass, and the pass is made cheaper where its parts are. Found on the way: a rigid thing's exact cells are tested in the
 frame it was meshed in (`exact_box_one_fs` brackets the world ray by the cell's box as meshed,
 where `exact_box_vs` draws it moved by `xforms[0]`), right while it is still, wrong once it
 moves without being meshed again. The

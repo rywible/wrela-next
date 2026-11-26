@@ -134,9 +134,16 @@ impl<'a> ExprWork<'a> {
         ExprWork { c: Counter::new(m, false) }
     }
 
-    /// The most work `e`, in `f`, can do: `None` when unbounded.
+    /// The most work `e`, in `f`, can do: `None` when unbounded. It knows `f`'s constants (each
+    /// value a `let` of a constant gives), as the count of a call does where it meets them, so an
+    /// element read at a constant index is priced alike both ways.
     pub fn of(&mut self, f: &Function, e: &Expr) -> Option<u64> {
         let mut fr = Frame::new(f, Vec::new());
+        visit::walk(&f.body, &mut |s| {
+            if let Stmt::Let(v, Expr::Const(c)) = s {
+                fr.vals.insert(*v, c.clone());
+            }
+        });
         (self.c.steps, self.c.gave_up) = (0, false);
         self.c.expr(&mut fr, &mut State::default(), e);
         (!fr.unbounded && !self.c.gave_up).then_some(fr.work)
@@ -1246,7 +1253,6 @@ impl<'a> Counter<'a> {
         };
         base + if index { OP } else { 0 } + if memory { MEMORY } else { 0 }
     }
-
 }
 
 /// How many components a value of type `t` has: what elementwise arithmetic on it costs.
