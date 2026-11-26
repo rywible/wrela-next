@@ -755,7 +755,9 @@ cell have the same bits, and they join with no crack.
 
 ## 12. Phase 4: decisions and the frame schedule at build
 
-State (2026-11-26): step 1's list is below; steps 2 to 7 are open.
+State (2026-11-26): step 1's list is below; step 7 is done: `wrela pipelines` names each kernel's
+kind by its type arguments (`eval_corners::<ParryArc>`) and the engine function at each of its
+sites (`extract.wrela:2873:17 in `MeshBatch::run_extract``). Steps 2 to 6 are open.
 
 ### The decisions made at run time (step 1)
 

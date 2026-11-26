@@ -99,7 +99,8 @@ pub struct PipelineSummary {
     pub entries: Vec<String>,
     /// The entry points' names alone, to group instantiations by.
     pub names: Vec<String>,
-    /// Where CPU code dispatches or draws it, as `file:line:column`.
+    /// Where CPU code dispatches or draws it, as `file:line:column in `function``: the code
+    /// that made the command (`Type::method`, or a closure in one).
     pub sites: Vec<String>,
     /// For each site, whether it runs only under a runtime condition of its function
     /// (`wrela_sema::mir::control`): its pipeline is in the build however rarely it holds.
@@ -1301,6 +1302,37 @@ fn conditional_commands(
     out
 }
 
+/// The function each dispatch and draw that holds one of `sites` is in, by its statement's span
+/// (`Type::method`, or a closure of one): the code that made the command, which the
+/// pipeline-count query names at each site (docs/plans/engine-at-build.md phase 4 step 7).
+fn command_fns(
+    checked: &wrela_sema::Checked,
+    sites: &[Span],
+) -> std::collections::HashMap<Span, String> {
+    use wrela_sema::mir::{Rvalue, StatementKind};
+    let command = |k: &StatementKind| {
+        matches!(
+            k,
+            StatementKind::Assign(_, Rvalue::Dispatch(_) | Rvalue::Draw(_))
+                | StatementKind::Eval(Rvalue::Dispatch(_) | Rvalue::Draw(_))
+        )
+    };
+    let holds = |k: Span| sites.iter().any(|s| holds_site(k, s));
+    let mut out = std::collections::HashMap::new();
+    for (&id, body) in &checked.mir {
+        let name = checked.program.fn_display_name(id);
+        for (i, f) in body.fns.iter().enumerate() {
+            for b in &f.blocks {
+                for st in b.stmts.iter().filter(|st| command(&st.kind) && holds(st.span)) {
+                    let at = if i == 0 { name.clone() } else { format!("a closure in {name}") };
+                    out.insert(st.span, at);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Whether the command whose statement is at `command` holds the site `site`.
 fn holds_site(command: Span, site: &Span) -> bool {
     command.file == site.file && command.start <= site.start && site.end <= command.end
@@ -1337,6 +1369,14 @@ fn summarize(
             lowered.pipelines.iter().flat_map(|p| p.sites.iter().copied()).collect();
         conditional_commands(checked, &sites)
     });
+    let fns = {
+        let sites: Vec<Span> =
+            lowered.pipelines.iter().flat_map(|p| p.sites.iter().copied()).collect();
+        command_fns(checked, &sites)
+    };
+    let in_fn = |s: &Span| -> Option<&String> {
+        fns.get(s).or_else(|| fns.iter().find(|&(&k, _)| holds_site(k, s)).map(|(_, n)| n))
+    };
     let conditional = |c: &std::collections::HashMap<Span, bool>, s: &Span| {
         c.get(s)
             .copied()
@@ -1358,7 +1398,15 @@ fn summarize(
                     ],
                 ),
             };
-            let sites = out.sites.iter().map(|s| sources.file(s.file).location(s.start)).collect();
+            let sites = (out.sites.iter())
+                .map(|s| {
+                    let at = sources.file(s.file).location(s.start);
+                    match in_fn(s) {
+                        Some(f) => format!("{at} in `{f}`"),
+                        None => at,
+                    }
+                })
+                .collect();
             PipelineSummary {
                 kind,
                 entries: parts.iter().map(|(e, _)| e.clone()).collect(),
