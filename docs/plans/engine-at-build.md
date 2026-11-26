@@ -373,6 +373,28 @@ remove most of the extraction of the rest. Next: a `normalize` of one division (
 in a strict kernel alike, so their bits still agree), cheaper std transcendentals for |x| < 6000
 (their error limits measured again), then measure again.
 
+### Where the strict cost is, and the decision it leads to (2026-11-25)
+
+Paired on the M4 (`tools/bench --against`, same machine state), SCENE 10 strict is 29.86 ms
+against the same build relaxed 26.56 ms (+12.4%, noise 1.66 ms; the machine's load moved every
+span by up to 2.4 ms during the day, so only a paired run measures this). SCENES 11, 13 and 14 are
+within their lines. SCENE 10's strict GPU time over frames 30 to 33, each dispatch alone:
+extraction 20.2 ms (12.8 relaxed), skinning 1.24 (0.79), certificates 2.08 (0.67). Taken off one
+at a time: std's transcendentals 3.1 ms of the extraction; the strict target's derived intervals
+1.2 (and 0.95 of the certificates: a NaN guard on each widened bound); `lower_strict`'s built-ins
+1.2. Not the cost: safe math itself (relaxed math with reassociation and contraction off and
+precise divisions measured the same and passed every bit test), the long reduction of a large
+sine's argument (0.5), constant folding, the size limit of turning branches into selects.
+
+The cost falls on the kinds extracted again every frame (the flames and the parry arc read the
+time; the bodies are skinned): their meshes live one frame, are never cooked and never leave the
+machine. What needs a strict kernel's portable bits is a mesh that persists: a cooked cell
+(phase 3) and a settled kind's cells beside it. So step 3 becomes: a kind that changes every frame
+is extracted by the same kernels written exact (no contraction, safe math, the driver's
+transcendentals with their WGSL limits in the proofs), and a kind that settles by the strict ones.
+Which is which is phase 2's class (a part of class `Frame`), so phase 2 comes before this phase's
+span target; until then the measurement above stands as the distance from the target.
+
 ### What is wrong today
 
 - The proofs make each GPU result wider by two times the error limit that WGSL gives for the
