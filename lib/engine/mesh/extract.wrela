@@ -4,13 +4,13 @@
 
 use matter::substance::Substance
 use mesh::dc::{
-    CREASE_STEPS, CreaseSolve, classify_cells, commit_flow_exact, commit_flow_verts, crease_part,
+    CREASE_STEPS, CreaseSolve, classify_cells, crease_part,
     crease_passes, crease_slice, crease_step_cost_of, crease_step_cost_rest_of, cull_bricks,
     cull_bricks_rest, cull_bricks_sub, deform_skinned_verts, eval_corners, eval_corners_rest,
-    eye_step, filter_thin_cells, flow_exact_cells, flow_verts, inherit_seam_corners, keep_slice_of,
+    eye_step, filter_thin_cells, inherit_seam_corners, keep_slice_of,
     keep_verts, mark_first, note_untested, prep_chunk, prep_creases, prep_from, prep_slices,
-    prep_super_sub, prep_tri_slices, refine_creases, refine_creases_rest, solve_verts,
-    solve_verts_rest, super_cull_bricks, surf_slice, verify_flow_tris,
+    prep_super_sub, refine_creases, refine_creases_rest, solve_verts,
+    solve_verts_rest, super_cull_bricks, surf_slice,
 }
 use mesh::emit::{
     SEAM_SEEN, box_seam_cells, certify_outline, reset_dirty_bricks, reset_seam_seen,
@@ -420,22 +420,7 @@ pub struct MeshBatch {
     seam_read: u32,
     /// The rest mesh's vertex count as a readback of extraction `verts_gen` gave it (`deform`).
     verts_known: u32,
-    indices_known: u32,
-    exact_known: u32,
     verts_gen: u32,
-    /// Staged vertices, exact cells, and certificate counter for Lagrangian guarded Newton flow.
-    flow_verts: GpuBuffer<MeshVertex>,
-    flow_verts_cap: u32,
-    flow_exact: GpuBuffer<ExactCell>,
-    flow_exact_cap: u32,
-    flow_fail: GpuBuffer<u32>,
-    flow_poll: Option<Pending<u32>>,
-    flow_failed: bool,
-    flow_view_at: vec3,
-    flow_view_fwd: vec3,
-    flow_bound: vec4,
-    flow_cell_step: f32,
-    flow_n_things: u32,
     /// Every requested cell is multiplied by this (at least 1): raised when a readback finds more
     /// active bricks than `max_bricks` (a brick count goes as `1 / cell²`), lowered as the need goes.
     cell_scale: f32,
@@ -624,21 +609,7 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
         cert_read: 0,
         seam_read: 0,
         verts_known: 0,
-        indices_known: 0,
-        exact_known: 0,
         verts_gen: 0,
-        flow_verts: buffer(1),
-        flow_verts_cap: 1,
-        flow_exact: buffer(1),
-        flow_exact_cap: 1,
-        flow_fail: buffer_of([0, 0, 0, 0, 0, 0, 0, 0]),
-        flow_poll: None,
-        flow_failed: false,
-        flow_view_at: vec3(0.0),
-        flow_view_fwd: vec3(0.0, 0.0, -1.0),
-        flow_bound: vec4(0.0),
-        flow_cell_step: 0.0,
-        flow_n_things: 0,
         verts_per_brick: START_VERTS_PER_BRICK,
         indices_per_brick: START_INDICES_PER_BRICK,
         trans_per_brick: START_TRANS_PER_BRICK,
@@ -760,256 +731,6 @@ impl MeshBatch {
         }
     }
 
-    /// Ensures the double-buffered vertex staging buffer for temporal vertex flow holds `want` items.
-    fn ensure_flow_verts(mut self, want: u32) {
-        if want > self.flow_verts_cap {
-            var cap = max(self.flow_verts_cap, 1024)
-            while cap < want {
-                cap *= 2
-            }
-            self.flow_verts = buffer(cap)
-            self.flow_verts_cap = cap
-        }
-    }
-
-    /// Ensures the double-buffered exact-cell staging buffer for temporal flow holds `want` items.
-    fn ensure_flow_exact(mut self, want: u32) {
-        if want > self.flow_exact_cap {
-            var cap = max(self.flow_exact_cap, 256)
-            while cap < want {
-                cap *= 2
-            }
-            self.flow_exact = buffer(cap)
-            self.flow_exact_cap = cap
-        }
-    }
-
-    /// Attempts GPU-indirect Lagrangian guarded 2-plane Secant-Newton vertex flow + Temporal
-    /// Persistence Certificate on a non-seam, non-skinned, non-transmissive mesh. Runs immediately
-    /// after extraction without stalling for CPU readbacks, committing only when `flow_fail[0] == 0`.
-    fn try_flow_fields<M: Field<Substance> + GpuData>(
-        mut self,
-        scratch: mut ExtractScratch,
-        fields: GpuSpan<M>,
-        n_fields: u32,
-        sample: M,
-        cell: f32,
-        key: u64,
-        bound: vec4,
-    ) -> bool {
-        self.finish_poll()
-        if !self.built ||
-            self.budget_short ||
-            self.is_skinned ||
-            self.is_rigid_cached ||
-            self.has_seams ||
-            self.instanced ||
-            self.flow_failed ||
-            self.overflowed() != 0 ||
-            self.cap_verts == 0 ||
-            self.cap_indices < 3 ||
-            (self.has_trans && (self.trans_ever || !self.trans_read) && sample.field_facts().may_transmit) ||
-            sample.uses_kept() ||
-            !(cell > 0.0) {
-            return false
-        }
-        let known = self.verts_gen == self.gen && self.verts_known > 0
-        if known && (self.verts_known > self.cap_verts || self.indices_known < 3 || self.indices_known > self.cap_indices) {
-            return false
-        }
-        let v_cap = if known { min(self.verts_known, self.cap_verts) } else { self.cap_verts }
-        let t_cap = if known { min(self.indices_known, self.cap_indices) / 3 } else { self.cap_indices / 3 }
-        let e_cap = if self.has_exact {
-            if known { min(self.exact_known, self.cap_exact) } else { self.cap_exact }
-        } else {
-            0
-        }
-        self.ensure_flow_verts(v_cap)
-        if e_cap > 0 {
-            self.ensure_flow_exact(e_cap)
-        }
-        label("mesh_flow")
-        write(mut self.flow_fail, 0, [0, 0, 0, 0, 0, 0, 0, 0])
-        let flow_k = flow_verts.bind(
-            fields: fields,
-            n_fields: n_fields,
-            verts_in: self.verts.items(),
-            vert_count: self.verts.count(),
-            cap_verts: self.cap_verts,
-            first: 0,
-            cell: cell,
-            verts_out: self.flow_verts.span_mut(start: 0, count: min(v_cap, 64)),
-            flow_fail: mut self.flow_fail,
-        )
-        let flow_step = max((u32(clamp(f32(limits().step_work) * 1000.0 / (f32(kernel_work(flow_k)) + 2000.0), 4096.0, 262144.0)) / 64) * 64, 4096)
-        let v_slices = min((v_cap + flow_step - 1) / flow_step, SLICES_MOST)
-        if v_slices * flow_step < v_cap {
-            return false
-        }
-        dispatch(
-            prep_slices.bind(
-                count: self.verts.count(),
-                cap: self.cap_verts,
-                most: flow_step,
-                slices: v_slices,
-                args: scratch.surf_args.span_mut(start: 0, count: v_slices),
-            ),
-            over: v_slices,
-        )
-        for k in 0..v_slices {
-            let first = k * flow_step
-            let chunk = min(v_cap - first, flow_step)
-            dispatch(
-                flow_verts.bind(
-                    fields: fields,
-                    n_fields: n_fields,
-                    verts_in: self.verts.items(),
-                    vert_count: self.verts.count(),
-                    cap_verts: self.cap_verts,
-                    first: first,
-                    cell: cell,
-                    verts_out: self.flow_verts.span_mut(start: first, count: chunk),
-                    flow_fail: mut self.flow_fail,
-                ),
-                groups: scratch.surf_args.at(k),
-                most: (chunk + 63) / 64,
-            )
-        }
-        let tri_k = verify_flow_tris.bind(
-            fields: fields,
-            n_fields: n_fields,
-            verts_prev: self.verts.items(),
-            verts: self.flow_verts.items(),
-            indices: self.indices.items(),
-            tri_count: self.tri_count.items(),
-            cap_indices: self.cap_indices,
-            first: 0,
-            cell: cell,
-            flow_fail: mut self.flow_fail,
-        )
-        let tri_step = max((u32(clamp(f32(limits().step_work) * 1000.0 / (f32(kernel_work(tri_k)) + 2000.0), 8192.0, 524288.0)) / 64) * 64, 8192)
-        let t_slices = min((t_cap + tri_step - 1) / tri_step, SLICES_MOST)
-        if t_slices * tri_step < t_cap {
-            return false
-        }
-        dispatch(
-            prep_tri_slices.bind(
-                tri_count: self.tri_count.items(),
-                cap_indices: self.cap_indices,
-                most: tri_step,
-                slices: t_slices,
-                args: scratch.crease_args.span_mut(start: 0, count: t_slices),
-            ),
-            over: t_slices,
-        )
-        for k in 0..t_slices {
-            let first = k * tri_step
-            let chunk = min(t_cap - first, tri_step)
-            dispatch(
-                verify_flow_tris.bind(
-                    fields: fields,
-                    n_fields: n_fields,
-                    verts_prev: self.verts.items(),
-                    verts: self.flow_verts.items(),
-                    indices: self.indices.items(),
-                    tri_count: self.tri_count.items(),
-                    cap_indices: self.cap_indices,
-                    first: first,
-                    cell: cell,
-                    flow_fail: mut self.flow_fail,
-                ),
-                groups: scratch.crease_args.at(k),
-                most: (chunk + 63) / 64,
-            )
-        }
-        if e_cap > 0 {
-            let ex_step: u32 = 32768
-            let e_slices = min((e_cap + ex_step - 1) / ex_step, SLICES_MOST)
-            dispatch(
-                prep_slices.bind(
-                    count: self.exact_cells.count(),
-                    cap: self.cap_exact,
-                    most: ex_step,
-                    slices: e_slices,
-                    args: scratch.seam_args.span_mut(start: 0, count: e_slices),
-                ),
-                over: e_slices,
-            )
-            for k in 0..e_slices {
-                let first = k * ex_step
-                let chunk = min(e_cap - first, ex_step)
-                dispatch(
-                    flow_exact_cells.bind(
-                        field: sample,
-                        exact_in: self.exact_cells.items(),
-                        exact_count: self.exact_cells.count(),
-                        cap_exact: self.cap_exact,
-                        first: first,
-                        exact_out: self.flow_exact.span_mut(start: first, count: chunk),
-                        flow_fail: mut self.flow_fail,
-                    ),
-                    groups: scratch.seam_args.at(k),
-                    most: (chunk + 63) / 64,
-                )
-            }
-        }
-        dispatch(
-            prep_slices.bind(
-                count: self.verts.count(),
-                cap: self.cap_verts,
-                most: v_cap,
-                slices: 1,
-                args: scratch.surf_args.span_mut(start: 0, count: 1),
-            ),
-            over: 1,
-        )
-        dispatch(
-            commit_flow_verts.bind(
-                verts_src: self.flow_verts.items(),
-                tri_count: self.tri_count.items(),
-                cap_verts: self.cap_verts,
-                flow_fail: self.flow_fail.items(),
-                verts_dst: self.verts.items_mut(),
-            ),
-            groups: scratch.surf_args.at(0),
-            most: (v_cap + 63) / 64,
-        )
-        if e_cap > 0 {
-            dispatch(
-                prep_slices.bind(
-                    count: self.exact_cells.count(),
-                    cap: self.cap_exact,
-                    most: e_cap,
-                    slices: 1,
-                    args: scratch.seam_args.span_mut(start: 0, count: 1),
-                ),
-                over: 1,
-            )
-            dispatch(
-                commit_flow_exact.bind(
-                    exact_src: self.flow_exact.items(),
-                    tri_count: self.tri_count.items(),
-                    cap_exact: self.cap_exact,
-                    flow_fail: self.flow_fail.items(),
-                    exact_dst: self.exact_cells.items_mut(),
-                ),
-                groups: scratch.seam_args.at(0),
-                most: (e_cap + 63) / 64,
-            )
-        }
-        match self.flow_poll {
-            None => {
-                self.flow_poll = Some(read_settled(self.flow_fail.items()))
-            },
-            Some(_) => {},
-        }
-        self.has_brick_draws = false
-        self.hash = key
-        self.bound = bound
-        self.still_frames = 0
-        true
-    }
-
     /// Whether this instanced batch (`Pool<M>` crowd of `>= 16` instances) should use 2-pass
     /// per-instance Reversed-Z Hi-Z occlusion culling via `draw_multi()`.
     pub fn use_inst_cull(self) -> bool {
@@ -1078,21 +799,6 @@ impl MeshBatch {
 
     /// Non-blocking check of any pending `(opaque, trans, active_bricks, vertices, ...)` readback.
     pub fn finish_poll(mut self) {
-        match mut self.flow_poll {
-            Some(fp) => match fp.poll() {
-                Some(Ok(fc)) => {
-                    if fc[0] > 0 {
-                        self.flow_failed = true
-                    }
-                    self.flow_poll = None
-                },
-                Some(Err(_)) => {
-                    self.flow_poll = None
-                },
-                None => {},
-            },
-            None => {},
-        }
         var counts = vec4u(0, 0, 0, 0)
         var creases: u32 = 0
         var uncovered: u32 = 0
@@ -1192,8 +898,6 @@ impl MeshBatch {
         if self.poll_gen == self.gen {
             self.overflow_flags = ovf
             self.verts_known = c.w
-            self.indices_known = c.x
-            self.exact_known = exact_count
             self.verts_gen = self.gen
             if self.has_brick_draws {
                 self.cpu_brick_slots = min(c.z, self.cap_brick_draws)
@@ -1889,30 +1593,6 @@ impl MeshBatch {
             Some(_) => true,
             None => false,
         }
-        if !has_seams &&
-            !is_edited &&
-            !field.uses_kept() &&
-            self.flow_n_things == 1 &&
-            length(v.at - self.flow_view_at) < eye_step(z_near) &&
-            dot(v.forward, self.flow_view_fwd) > 0.999 &&
-            abs(self.cell - eff_near) <= 0.05 * max(self.cell, 1.0e-4) {
-            let mid_f = 0.5 * (aabb.lo + aabb.hi)
-            let rad_f = length(aabb.hi - mid_f)
-            if length(mid_f - self.flow_bound.xyz) + abs(rad_f - self.flow_bound.w) <= 0.25 {
-                let fbuf_f = buffer_of([field])
-                if self.try_flow_fields(
-                    mut scratch,
-                    fbuf_f.items(),
-                    n_fields: 1,
-                    sample: field,
-                    cell: self.flow_cell_step,
-                    key: key,
-                    bound: vec4(mid_f, rad_f),
-                ) {
-                    return
-                }
-            }
-        }
         let count = grids.len()
         // A cut: the eye moved half its distance to the surface or more, or turned 20 degrees or
         // more, since the last view-dependent extraction (the first is cold, not a cut).
@@ -1923,16 +1603,9 @@ impl MeshBatch {
         self.lod_view_at = v.at
         self.lod_view_fwd = v.forward
         let fbuf = buffer_of([field])
-        let flow_cell = grids[0].cell
         scratch.set_grids(grids)
         let mid = 0.5 * (aabb.lo + aabb.hi)
         self.bound = vec4(mid, length(aabb.hi - mid))
-        self.flow_view_at = v.at
-        self.flow_view_fwd = v.forward
-        self.flow_bound = self.bound
-        self.flow_cell_step = flow_cell
-        self.flow_n_things = if has_seams || is_edited { 0 } else { 1 }
-        self.flow_failed = false
         write(mut self.xforms, 0, [Rigid::identity()])
         write(mut self.prev_xforms, 0, [Rigid::identity()])
         write(mut self.inst_ids, 0, [0])
@@ -2366,27 +2039,6 @@ impl MeshBatch {
             n <= THING_IDS,
             "engine::mesh: a batch of more than THING_IDS things that aren't one shape can't tell its things apart",
         )
-        let mid_p = 0.5 * (wlo + whi)
-        let rad_p = length(whi - mid_p)
-        if vis_count == n &&
-            n > 0 &&
-            !fields[0].uses_kept() &&
-            self.flow_n_things == n &&
-            abs(self.cell - first_cell) <= 0.05 * max(self.cell, 1.0e-4) &&
-            length(mid_p - self.flow_bound.xyz) + abs(rad_p - self.flow_bound.w) <= 0.25 {
-            let fbuf_p = buffer_of(fields)
-            if self.try_flow_fields(
-                mut scratch,
-                fbuf_p.items(),
-                n_fields: n,
-                sample: fields[0],
-                cell: self.flow_cell_step,
-                key: key,
-                bound: vec4(mid_p, rad_p),
-            ) {
-                return
-            }
-        }
         var grids: Vec<GridSpec> = Vec::new()
         var total_bricks: u32 = 0
         var tlo = vec3(1.0e20)
@@ -2411,14 +2063,9 @@ impl MeshBatch {
         }
         let count = grids.len()
         let fbuf = buffer_of(fields)
-        let pool_cell = grids[0].cell
         scratch.set_grids(grids)
         let mid = 0.5 * (tlo + thi)
         self.bound = vec4(mid, length(thi - mid))
-        self.flow_bound = vec4(mid_p, rad_p)
-        self.flow_cell_step = pool_cell
-        self.flow_n_things = if vis_count == n { n } else { 0 }
-        self.flow_failed = false
         write(mut self.xforms, 0, [Rigid::identity()])
         write(mut self.prev_xforms, 0, [Rigid::identity()])
         write(mut self.inst_ids, 0, [0])
