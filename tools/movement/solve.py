@@ -218,6 +218,59 @@ def fk_check(clips):
     return 0 if worst_t < 1e-4 and worst_r < 1e-3 else 1
 
 
+def copies(argv):
+    """Whether the solver gives back clips of its training set (phase 5 step 13): each second of
+    its movements (`.movement/solver/goals/BODY/goal/*.pose`) after its first (the training frames
+    it starts from), as the joints' numbers at 6 of its frames, against its nearest second of every
+    training clip; and, for a sample of the training
+    seconds, each one's nearest second in another training clip, which says how near two different
+    clips come (standing is alike in every style). A second of the solver's nearer to a training
+    second than any two different clips' seconds come (the sample's least) is a clip given back:
+    nearer than the 1st percentile is only near, as standing is near every standing."""
+    import glob
+    train = [l.strip() for l in open(argv[0]) if l.strip()]
+    def windows(x, rate, stride):
+        q = x[:, 7:]
+        n = q.shape[0]
+        w = int(rate)
+        idx = [i for i in range(0, n - w, stride)]
+        return np.stack([q[i:i + w:5].reshape(-1) for i in idx]) if idx else np.zeros((0, 6 * q.shape[1]))
+    tw, owner = [], []
+    for k, c in enumerate(train):
+        rate, x = read_pose(f"{POSES}/{c}.pose")
+        w = windows(x, rate, 15)
+        tw.append(w)
+        owner.extend([k] * len(w))
+    tw = torch.tensor(np.concatenate(tw).astype(np.float32))
+    owner = torch.tensor(owner)
+    tn = (tw * tw).sum(-1)
+    def nearest(w, exclude=None):
+        w = torch.tensor(w.astype(np.float32)) if not torch.is_tensor(w) else w
+        d2 = (w * w).sum(-1)[:, None] + tn[None] - 2 * w @ tw.T
+        if exclude is not None:
+            d2 = torch.where(owner[None] == exclude[:, None], torch.full_like(d2, 1e9), d2)
+        return torch.sqrt(d2.clamp(min=0).min(-1).values).numpy()
+    sample = torch.arange(0, tw.shape[0], 20)
+    between = np.concatenate([nearest(tw[sample[i:i + 512]], owner[sample[i:i + 512]])
+                              for i in range(0, len(sample), 512)])
+    floor = np.percentile(between, 1)
+    print(f"copies: two different training clips' seconds: the least {between.min():.3f}, the 0.1st "
+          f"percentile {np.percentile(between, 0.1):.3f}, the 1st {floor:.3f}")
+    mine = []
+    for f in sorted(glob.glob(os.path.join(SOLVER, "goals", BODY, "goal", "*.pose"))):
+        rate, x = read_pose(f)
+        # Its first second is the training frames it starts from: not what the solver made.
+        d = nearest(windows(x[int(rate):], rate, 5))
+        mine.append(d)
+        print(f"copies: {os.path.basename(f)[:-5]}: its nearest training second {d.min():.3f} at the least, "
+              f"{np.median(d):.3f} at the median")
+    mine = np.concatenate(mine)
+    print(f"copies: {tw.shape[0]} training seconds; two different training clips' seconds come "
+          f"{floor:.3f} near at the 1st percentile ({np.median(between):.3f} at the median); the "
+          f"solver's {mine.min():.3f} at the least ({np.median(mine):.3f} at the median)")
+    return 0 if mine.min() >= between.min() else 1
+
+
 def pack(argv):
     import json
     import zlib
@@ -276,6 +329,8 @@ def main():
         sys.exit(play_check(sys.argv[2:]))
     if len(sys.argv) > 1 and sys.argv[1] == "fk-check":
         sys.exit(fk_check(sys.argv[2:]))
+    if len(sys.argv) > 1 and sys.argv[1] == "copies":
+        sys.exit(copies(sys.argv[2:]))
     if len(sys.argv) > 1 and sys.argv[1] == "pack":
         sys.exit(pack(sys.argv[2:]))
     import solve_train

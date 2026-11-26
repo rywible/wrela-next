@@ -996,10 +996,20 @@ through the world with no cycle and no clip.
   a person's usual walk (1.3 m/s) the walk's slide is 1,237 mm/s and at a run of 3 m/s the run
   fails four targets. Faster gaits need capture that holds them (CeTI's and the other sources of
   the register not yet imported).
+- The CPU time of one tick of one body (`tools/movement/solver -- human time`, WASM, strict
+  floats, the Linux machine): 56 to 72 microseconds (`solved` and `on_floor`, a net of 84,218
+  weights), so one thread moves 14 to 18 bodies at the full rate in 1 ms (0.3's budget); far
+  bodies take a lower rate (step 10).
+- No clip given back (`tools/movement/solve.py copies`, step 13): each second of the goal test's
+  movements after its first (its start is a training clip's frames) is at least 0.762 from its
+  nearest training second (the joints' numbers at 6 of its frames), and two different training
+  clips' seconds come as near as 0.588 to each other (0.936 at their 1st percentile, 1.853 at the
+  median; the solver's median 1.647): no second of the solver's is nearer to the training set than
+  the training set is to itself.
 - Not yet: the timed goals (a hand at a point at a tick, a point to look at), the solver trained
   on the filtered capture (phase 4's tracker on the human is in work), the tracker following the
-  solver's output, the bits on the two machines (the M4 is not measured), the CPU time a body,
-  the search for clips given back, the prior of style and the skills.
+  solver's output, the bits on the two machines (the M4 is not measured), the prior of style and
+  the skills.
 
 ### The goal test
 
