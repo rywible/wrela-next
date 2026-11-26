@@ -2,12 +2,19 @@
 //! GPU entry point, how many pipelines instantiate it, the type arguments of each, and where
 //! CPU code dispatches or draws it: what to look at when a program makes more shaders than it
 //! means to (D-044, D-070).
+//!
+//! With `--schedule`, the frame's schedule instead (docs/plans/engine-at-build.md phase 4 step 4):
+//! each pass the client's `frame` records, in order (its label), and the pipelines it records,
+//! as the build leaves them after folding constant branches: a pass no kind of the scene uses
+//! isn't there.
 
 use std::process::ExitCode;
 use wrela_driver::PipelineSummary;
 
 pub fn run(args: &[String]) -> ExitCode {
-    let args = match crate::package_args(args, false) {
+    let want_schedule = args.iter().any(|a| a == "--schedule");
+    let args: Vec<String> = args.iter().filter(|a| *a != "--schedule").cloned().collect();
+    let args = match crate::package_args(&args, false) {
         Ok(a) => a,
         Err(status) => return status,
     };
@@ -20,12 +27,39 @@ pub fn run(args: &[String]) -> ExitCode {
         crate::report(&out, args.json);
         return ExitCode::from(1);
     }
-    if args.json {
+    if want_schedule {
+        print!("{}", schedule(&out.schedule, &out.pipelines));
+    } else if args.json {
         print!("{}", json(&out.pipelines));
     } else {
         print!("{}", text(&out.pipelines));
     }
     ExitCode::SUCCESS
+}
+
+/// The frame's schedule for people: each pass, then each pipeline it records, marked where the
+/// build couldn't settle whether it runs (`?`) and where it's recorded in a loop (`*`).
+pub fn schedule(passes: &[wrela_driver::SchedulePass], pipelines: &[PipelineSummary]) -> String {
+    let n: usize = passes.iter().map(|p| p.commands.len()).sum();
+    let mut s = format!(
+        "the frame's schedule: {}, {} recorded in them ({} built)\n",
+        crate::count(passes.len(), "pass", "passes"),
+        crate::count(n, "pipeline", "pipelines"),
+        pipelines.len(),
+    );
+    for p in passes {
+        let label = if p.label.is_empty() { "(before the first label)" } else { &p.label };
+        s.push_str(&format!("\n{label}{}\n", if p.conditional { " ?" } else { "" }));
+        for &(i, cond, lp) in &p.commands {
+            let name = pipelines.get(i).map_or("(unknown)".to_string(), |q| q.entries.join(" + "));
+            s.push_str(&format!(
+                "  {}{}{name}\n",
+                if cond { "? " } else { "  " },
+                if lp { "* " } else { "  " }
+            ));
+        }
+    }
+    s
 }
 
 /// Each entry point's name, in the order pipelines first name them, with the pipelines that

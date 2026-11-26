@@ -2487,7 +2487,13 @@ impl<'a> Ivx<'a> {
             }
             B::Cosh => {
                 let x = self.per_comp(out, ty, &r, Self::cosh)?;
-                self.widen(out, x, ty, if gpu { HYPERBOLIC_GPU_ULPS } else { std_widening(B::Cosh) }, 0.0)
+                self.widen(
+                    out,
+                    x,
+                    ty,
+                    if gpu { HYPERBOLIC_GPU_ULPS } else { std_widening(B::Cosh) },
+                    0.0,
+                )
             }
             B::Log | B::Log2 => {
                 self.per_comp(out, ty, &r, |s, out, ty, x| Ok(s.log_ends(out, b, x[0], ty)))?

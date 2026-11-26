@@ -1634,18 +1634,39 @@ pub(crate) fn intrinsic(
             };
             let program = &fl.cx.checked.program;
             let TyKind::Adt(a, args) = program.types.kind(t).clone() else {
-                fl.cx.err(Diagnostic::new(codes::E0600, span, "`kernel_work` takes a kernel bound to its arguments (`kernel.bind(...)`)".to_string()));
+                fl.cx.err(Diagnostic::new(
+                    codes::E0600,
+                    span,
+                    "`kernel_work` takes a kernel bound to its arguments (`kernel.bind(...)`)"
+                        .to_string(),
+                ));
                 return None;
             };
             let Some(func) = program.adt(a).entry else {
-                fl.cx.err(Diagnostic::new(codes::E0600, span, "`kernel_work` takes a kernel bound to its arguments (`kernel.bind(...)`)".to_string()));
+                fl.cx.err(Diagnostic::new(
+                    codes::E0600,
+                    span,
+                    "`kernel_work` takes a kernel bound to its arguments (`kernel.bind(...)`)"
+                        .to_string(),
+                ));
                 return None;
             };
             let substs: Vec<TyId> = args.iter().map(|&x| fl.concrete(x)).collect();
-            let key = PipelineKey::Compute { kernel: func, substs, over: false, origin: false, consts: Vec::new() };
+            let key = PipelineKey::Compute {
+                kernel: func,
+                substs,
+                over: false,
+                origin: false,
+                consts: Vec::new(),
+            };
             let (pindex, _) = pipeline(fl.cx, key, span);
             let u = fl.mb.m.types.u32();
-            Some(fl.value(u, ir::Expr::Host(ir::HostOp::KernelWork { pipeline: pindex }, Vec::new())))
+            Some(
+                fl.value(
+                    u,
+                    ir::Expr::Host(ir::HostOp::KernelWork { pipeline: pindex }, Vec::new()),
+                ),
+            )
         }
         Some(Lang::Limit) if !fl.is_gpu() => {
             let i = fl.arg_value(&c.args[0])?;
@@ -3804,9 +3825,10 @@ pub(crate) fn tally(cx: &mut Cx, out: &mut PipelineOut, code: u32) {
             out.module = module;
             out.debug_flag = Some(binding);
         }
-        Err(e) => {
-            cx.err(Diagnostic::internal(format!("the tally of `{}` made malformed IR: {e}", out.name)))
-        }
+        Err(e) => cx.err(Diagnostic::internal(format!(
+            "the tally of `{}` made malformed IR: {e}",
+            out.name
+        ))),
     }
 }
 
@@ -4006,7 +4028,8 @@ fn verify(cx: &mut Cx, mb: &mut ModuleBuilder, name: &str) -> Option<Counts> {
             // exit: an internal error (on 2026-11-25 such a kernel held the M4's GPU until a
             // restart).
             let (flat_each, _) = ir::work::module_work(&mb.m);
-            let lost = flat_each.iter().zip(&work).any(|(fw, pre)| pre.is_some() && fw.work.is_none());
+            let lost =
+                flat_each.iter().zip(&work).any(|(fw, pre)| pre.is_some() && fw.work.is_none());
             if lost && let Some(f) = ir::endless_loop(&mb.m) {
                 checked = Err(ir::Error::internal(format!(
                     "a loop of `{f}` has no break, return or trap left, where its source's work \
@@ -4642,7 +4665,11 @@ fn count_work(
             let (each, _) = ir::work::module_work(&mb.m);
             if std::env::var("WRELA_DUMP_IR").as_deref() == Ok("work") {
                 let all = ir::work::work_by_function(&mb.m, mb.m.entry_points[0].function);
-                eprintln!("work strict_work `{}`: bound {:?}", cx.source_name(key).unwrap_or_default(), each.first().map(|e| e.work));
+                eprintln!(
+                    "work strict_work `{}`: bound {:?}",
+                    cx.source_name(key).unwrap_or_default(),
+                    each.first().map(|e| e.work)
+                );
                 for (f, times, w) in all.iter().take(12) {
                     eprintln!("  {w:>10} {times:>8}x {}", mb.m.functions[f.index()].name);
                 }

@@ -1301,7 +1301,9 @@ pub fn builtin_cost(b: Builtin, n: u64) -> u64 {
 /// counts); the rest is `builtin_cost`.
 pub fn strict_builtin_cost(b: Builtin, n: u64, rounded_sqrt: bool) -> u64 {
     use Builtin as B;
-    if rounded_sqrt && matches!(b, B::Sqrt | B::InverseSqrt | B::Length | B::Distance | B::Normalize) {
+    if rounded_sqrt
+        && matches!(b, B::Sqrt | B::InverseSqrt | B::Length | B::Distance | B::Normalize)
+    {
         return builtin_cost(b, n);
     }
     let one = match b {

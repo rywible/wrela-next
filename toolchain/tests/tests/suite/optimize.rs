@@ -369,7 +369,11 @@ fn slopes_survive() {
 "#,
     );
     let out = wrela_driver::test(&dir, None);
-    assert!(!wrela_diag::has_errors(&out.diagnostics), "{}", wrela_diag::render::render_all(&out.sources, &out.diagnostics));
+    assert!(
+        !wrela_diag::has_errors(&out.diagnostics),
+        "{}",
+        wrela_diag::render::render_all(&out.sources, &out.diagnostics)
+    );
     assert!(out.results.iter().all(|r| r.failure.is_none()), "{:?}", out.results);
 }
 
@@ -419,6 +423,10 @@ fn slopes_survive() {
 "#,
     );
     let out = wrela_driver::test(&dir, None);
-    assert!(!wrela_diag::has_errors(&out.diagnostics), "{}", wrela_diag::render::render_all(&out.sources, &out.diagnostics));
+    assert!(
+        !wrela_diag::has_errors(&out.diagnostics),
+        "{}",
+        wrela_diag::render::render_all(&out.sources, &out.diagnostics)
+    );
     assert!(out.results.iter().all(|r| r.failure.is_none()), "{:?}", out.results);
 }

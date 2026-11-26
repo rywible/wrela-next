@@ -180,7 +180,8 @@ impl Tally<'_> {
         let u = self.u32_ty;
         let at = Place::root(PlaceRoot::Resource(self.sum));
         let was = self.f.let_(b, u, Expr::Load(at.clone()));
-        let add = self.f.let_(b, u, Expr::Const(Const::U32((*run).min(u64::from(u32::MAX)) as u32)));
+        let add =
+            self.f.let_(b, u, Expr::Const(Const::U32((*run).min(u64::from(u32::MAX)) as u32)));
         let now = self.f.let_(b, u, Expr::Binary(BinOp::Add, was, add));
         b.push(Stmt::Store(at, now));
         *run = 0;

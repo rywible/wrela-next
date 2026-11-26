@@ -684,7 +684,11 @@ pub(super) fn lanes_builtin(
             vec_min_max(fe, b == B::Max, a, c);
         }
         B::Clamp => {
-            let (x, lo, hi) = (fe.new_local(ValType::V128), fe.new_local(ValType::V128), fe.new_local(ValType::V128));
+            let (x, lo, hi) = (
+                fe.new_local(ValType::V128),
+                fe.new_local(ValType::V128),
+                fe.new_local(ValType::V128),
+            );
             for (k, l) in [(0, x), (1, lo), (2, hi)] {
                 arg(fe, k);
                 fe.ins.push(I::LocalSet(l));
@@ -694,7 +698,11 @@ pub(super) fn lanes_builtin(
             vec_min_max(fe, false, x, hi);
         }
         B::Saturate => {
-            let (x, lo, hi) = (fe.new_local(ValType::V128), fe.new_local(ValType::V128), fe.new_local(ValType::V128));
+            let (x, lo, hi) = (
+                fe.new_local(ValType::V128),
+                fe.new_local(ValType::V128),
+                fe.new_local(ValType::V128),
+            );
             arg(fe, 0);
             fe.ins.push(I::LocalSet(x));
             fe.ins.extend(splat(0.0));
@@ -1228,7 +1236,13 @@ pub(super) fn builtin(fe: &mut Fe, v: ir::ValueId, b: ir::Builtin, args: &[ir::V
                 sum_of_squares(fe, args[0], None, n);
                 // x · (1 / |x|): one division, as a strict kernel's.
                 fe.ins.push(I::LocalSet(len));
-                fe.ins.extend([I::F32Const(1.0f32.into()), I::LocalGet(len), I::F32Sqrt, I::F32Div, I::LocalSet(len)]);
+                fe.ins.extend([
+                    I::F32Const(1.0f32.into()),
+                    I::LocalGet(len),
+                    I::F32Sqrt,
+                    I::F32Div,
+                    I::LocalSet(len),
+                ]);
                 let out = fe.fresh_slot(v, false)?;
                 for c in 0..n {
                     fe.ins.push(I::LocalGet(out));

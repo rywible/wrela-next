@@ -407,7 +407,11 @@ fn strict_builtins_cost_what_std_s_code_does() {
             wrong.push(format!("{e}: std's code {got}, the table {table}"));
         }
     }
-    assert!(wrong.is_empty(), "the table is not std's code (the kernel of none: {none}):\n{}", wrong.join("\n"));
+    assert!(
+        wrong.is_empty(),
+        "the table is not std's code (the kernel of none: {none}):\n{}",
+        wrong.join("\n")
+    );
 }
 
 /// A dispatch whose size the build knows is held to the host's line at build (E0714, phase 4
@@ -450,7 +454,10 @@ fn a_counting_build_tallies_every_pipeline_into_the_flags_buffer() {
     let dir = kernels(
         "work_tally",
         "",
-        &[("loop8", "    var a = x\n    for _i in 0..8 {\n        a = a * 1.5 + 1.0\n    }\n    out[id] = a")],
+        &[(
+            "loop8",
+            "    var a = x\n    for _i in 0..8 {\n        a = a * 1.5 + 1.0\n    }\n    out[id] = a",
+        )],
     );
     let how = |tally: bool| wrela_driver::BuildFor {
         tally,

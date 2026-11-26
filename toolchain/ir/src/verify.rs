@@ -48,9 +48,10 @@ pub fn endless_loop(m: &Module) -> Option<&str> {
         })
     }
     m.functions.iter().find_map(|f| {
-        crate::visit::any(&f.body, &mut |s| {
-            matches!(s, Stmt::Loop { body, .. } if !leaves(body, false))
-        })
+        crate::visit::any(
+            &f.body,
+            &mut |s| matches!(s, Stmt::Loop { body, .. } if !leaves(body, false)),
+        )
         .then_some(f.name.as_str())
     })
 }

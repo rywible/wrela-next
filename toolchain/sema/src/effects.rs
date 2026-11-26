@@ -1098,8 +1098,11 @@ fn node(
                         }
                     }
                     Callee::Local(_) | Callee::Value(_) => n.open = true,
-                    Callee::Builtin(b @ (BuiltinFn::Dpdx | BuiltinFn::Dpdy | BuiltinFn::Fwidth)) => {
-                        let why = format!("`{}` is a derivative, which the driver computes", b.name());
+                    Callee::Builtin(
+                        b @ (BuiltinFn::Dpdx | BuiltinFn::Dpdy | BuiltinFn::Fwidth),
+                    ) => {
+                        let why =
+                            format!("`{}` is a derivative, which the driver computes", b.name());
                         n.direct.push((Effect::Driver, c.span, why));
                     }
                     Callee::Builtin(_) => {}

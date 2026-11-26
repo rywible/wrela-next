@@ -372,7 +372,8 @@ pub(crate) fn package_args(args: &[String], takes_out: bool) -> Result<PackageAr
         );
         return Err(ExitCode::from(2));
     }
-    if (trusted_shaders || exact || tally || target.is_some()) && (relaxed_simd || !lift.is_empty()) {
+    if (trusted_shaders || exact || tally || target.is_some()) && (relaxed_simd || !lift.is_empty())
+    {
         eprintln!(
             "error: `--trusted-shaders`, `--exact` and `--target` aren't for a relaxed-SIMD or a lifted build"
         );

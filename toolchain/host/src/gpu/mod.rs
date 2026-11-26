@@ -1171,8 +1171,10 @@ impl Gpu {
         let mut program_limits = limits_of(&limits);
         program_limits.features = feature_bits(device.features(), kept);
         program_limits.step_work = crate::step::step_work(wrela_abi::Target::HERE);
-        program_limits.lane_work =
-            wrela_abi::lane_work(program_limits.step_work, crate::step::width(wrela_abi::Target::HERE) as u32);
+        program_limits.lane_work = wrela_abi::lane_work(
+            program_limits.step_work,
+            crate::step::width(wrela_abi::Target::HERE) as u32,
+        );
         if program_limits.has("subgroups") {
             let info = device.info();
             program_limits.subgroup_min_size = info.subgroup_min_size;
@@ -3533,7 +3535,14 @@ impl Gpu {
             // A counting build's tallies: each pipeline's work this frame, its low word and the
             // carries out of it (`wrela_ir::tally`).
             if f.words > 1 {
-                let word = |i: usize| u64::from(u32::from_le_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]));
+                let word = |i: usize| {
+                    u64::from(u32::from_le_bytes([
+                        b[4 * i],
+                        b[4 * i + 1],
+                        b[4 * i + 2],
+                        b[4 * i + 3],
+                    ]))
+                };
                 for (k, p) in self.pipelines.iter().enumerate() {
                     let lo = 1 + 2 * k;
                     if lo + 1 >= f.words as usize {

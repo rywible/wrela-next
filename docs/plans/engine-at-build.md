@@ -792,7 +792,19 @@ load (a second run) 5.1 to 5.2 s and 2.1 to 0.8 s, the first frame's CPU the sam
 20.87/16.52/18.97/21.95 to 20.88/16.36/18.86/21.74 ms. A kind's `FieldFacts` was the first carrier and didn't fold
 on the CPU for every kind (a `Dressed` thing's facts are a call the inliner leaves), so the
 constant is the kind's own. A skinned field whose kind says it can't be stops where it's meshed
-(`held_unskinned`). Steps 3 and 4 and the rest of step 2 are open.
+(`held_unskinned`). Step 4: `wrela pipelines <package> --schedule` writes the frame's schedule from the build's CPU
+code after inlining and folding (`ir::schedule`): each pass in order, the pipelines it records,
+which the build couldn't settle (`?`) and which a loop records (`*`). SCENE 14's is 95 passes
+(`mesh_sky`, then a `mesh_extract` and a `mesh_certify` for each of its kinds and rings, the
+sdf, shadows, radiance, the eye's passes, the sun's, the light's, refraction, TSR, the tone),
+recording 159 pipelines; a pass of a type the scene hasn't (the swarm's, the bloom's, a skinned
+draw) is in neither. The rest of step 2's list, from the build's CPU code (`WRELA_DUMP_IR=cpu`,
+SCENE 14): `edit_base_hash`, `field_facts`, `skin_shape_hash`, `lipschitz` and `steep` leave no
+function behind, so the kind settles them at build; `rigid_key` and `part_states` stay, one of each
+a kind, because they hash the value (a rigid thing's shape, each part's state) to see what moved,
+which is the game's state; the cells' tuning (group 2) reads the value's stated steepness and
+bound, and the slices (group 3) read the machine (`limits().step_work`) beside the build's counts,
+so both stay at run time. Step 3 needs no change: the eye's decisions are the eye's.
 
 ### The decisions made at run time (step 1)
 

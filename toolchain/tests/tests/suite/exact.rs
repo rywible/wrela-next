@@ -100,8 +100,25 @@ fn a_strict_kernel_gives_the_cpus_bits() {
     built.write_to(&dir).expect("write the build");
     let mut host = Host::load(&dir).expect("load");
     const FUNCTIONS: [&str; 19] = [
-        "sin", "cos", "tan", "exp", "exp2", "log", "log2", "sinh", "cosh", "tanh", "atan", "asin",
-        "acos", "atan2", "pow", "sqrt", "/", "%", "x / (1 + |x|)",
+        "sin",
+        "cos",
+        "tan",
+        "exp",
+        "exp2",
+        "log",
+        "log2",
+        "sinh",
+        "cosh",
+        "tanh",
+        "atan",
+        "asin",
+        "acos",
+        "atan2",
+        "pow",
+        "sqrt",
+        "/",
+        "%",
+        "x / (1 + |x|)",
     ];
     for _ in 0..20 {
         host.run_frames(&crate::frame_times(1), 16, 16).expect("a frame");

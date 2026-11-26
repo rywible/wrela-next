@@ -205,7 +205,12 @@ impl Emit<'_> {
     }
 
     /// The sum of the products of `n` pairs, in order, from the first (`from_zero`: from 0).
-    fn sum_of_products(&mut self, n: u32, from_zero: bool, mut pair: impl FnMut(&mut Self, u32) -> (ValueId, ValueId)) -> ValueId {
+    fn sum_of_products(
+        &mut self,
+        n: u32,
+        from_zero: bool,
+        mut pair: impl FnMut(&mut Self, u32) -> (ValueId, ValueId),
+    ) -> ValueId {
         let mut acc = if from_zero { Some(self.f32c(0.0)) } else { None };
         for k in 0..n {
             let (x, y) = pair(self, k);
@@ -237,7 +242,9 @@ impl Emit<'_> {
                 let r = match b {
                     B::Dot => {
                         let (a, c) = (args[0], args[1]);
-                        self.sum_of_products(u32::from(n), false, |em, k| (em.comp(a, k), em.comp(c, k)))
+                        self.sum_of_products(u32::from(n), false, |em, k| {
+                            (em.comp(a, k), em.comp(c, k))
+                        })
                     }
                     B::Length | B::Distance | B::Normalize if n > 1 => {
                         let a = args[0];
@@ -279,8 +286,12 @@ impl Emit<'_> {
                         let parts: Vec<ValueId> = [(1u32, 2u32), (2, 0), (0, 1)]
                             .into_iter()
                             .map(|(j, k)| {
-                                let (aj, ck, ak, cj) =
-                                    (self.comp(a, j), self.comp(c, k), self.comp(a, k), self.comp(c, j));
+                                let (aj, ck, ak, cj) = (
+                                    self.comp(a, j),
+                                    self.comp(c, k),
+                                    self.comp(a, k),
+                                    self.comp(c, j),
+                                );
                                 let p = self.bin(BinOp::Mul, aj, ck);
                                 let q = self.bin(BinOp::Mul, ak, cj);
                                 self.bin(BinOp::Sub, p, q)

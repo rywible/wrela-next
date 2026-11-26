@@ -65,6 +65,22 @@ pub struct Output {
     pub data: Option<wrela_wasm::DataReport>,
     /// How long each part of the compile took, in order (`wrela build` says them).
     pub times: Times,
+    /// The client's frame's schedule (`wrela pipelines --schedule`): each pass it records, in
+    /// order, with the pipelines it records (indices into `pipelines`); empty when checking found
+    /// errors before lowering or the program has no frame.
+    pub schedule: Vec<SchedulePass>,
+}
+
+/// A pass of the frame's schedule (`ir::schedule`, docs/plans/engine-at-build.md phase 4 step
+/// 4): its label and the pipelines it records.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SchedulePass {
+    pub label: String,
+    /// Whether the label is under a branch the build couldn't settle.
+    pub conditional: bool,
+    /// Each pipeline the pass records (an index into [`Output::pipelines`]), whether every place
+    /// that records it is under a branch the build couldn't settle, and whether any is in a loop.
+    pub commands: Vec<(usize, bool, bool)>,
 }
 
 /// How long each part of a compile took, in the order they ran: reading and parsing the
@@ -1059,6 +1075,7 @@ fn compile_loaded_in(
             consts: consts::ConstStats::default(),
             data: None,
             times: Times::default(),
+            schedule: Vec::new(),
         });
     };
     // The program package's own files: package 1's (std is 0).
@@ -1087,6 +1104,7 @@ fn compile_loaded_in(
     scope.stop()?;
     let mut files = Vec::new();
     let mut pipelines = Vec::new();
+    let mut schedule = Vec::new();
     let mut data_report = None;
     let mut data = wrela_lower::BuildData {
         debug: mode.debug,
@@ -1133,6 +1151,22 @@ fn compile_loaded_in(
                 // A build works out which pipelines are reached only under a condition: the
                 // manifest's tiers (§18.9).
                 pipelines = summarize(&checked, &sources, &lowered, mode.conditions || mode.emit);
+                if let Some(&(_, frame)) =
+                    lowered.cpu.exports.iter().find(|(n, _)| n == wrela_abi::EXPORT_FRAME)
+                {
+                    schedule = wrela_ir::schedule::schedule(&lowered.cpu, frame)
+                        .into_iter()
+                        .map(|p| SchedulePass {
+                            label: p.label,
+                            conditional: p.conditional,
+                            commands: p
+                                .commands
+                                .iter()
+                                .map(|c| (c.pipeline as usize, c.conditional, c.in_loop))
+                                .collect(),
+                        })
+                        .collect();
+                }
                 data_report = wrela_wasm::data_report(&lowered.cpu).ok();
             }
             if !ok || !mode.emit {
@@ -1208,6 +1242,7 @@ fn compile_loaded_in(
         consts: stats,
         data: data_report,
         times,
+        schedule,
     })
 }
 

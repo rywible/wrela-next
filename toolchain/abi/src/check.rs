@@ -245,9 +245,12 @@ impl Checker {
                     targets,
                     blends,
                     requires: p.requires.clone(),
-                    work: p.work.first().copied().flatten().map_or(u32::MAX, |w| {
-                        u32::try_from(w).unwrap_or(u32::MAX)
-                    }),
+                    work: p
+                        .work
+                        .first()
+                        .copied()
+                        .flatten()
+                        .map_or(u32::MAX, |w| u32::try_from(w).unwrap_or(u32::MAX)),
                 }
             })
             .collect();

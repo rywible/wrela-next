@@ -635,3 +635,91 @@ fn the_evaluators_meaning_is_pinned() {
          record these"
     );
 }
+
+/// A frame of three labelled passes, the middle one behind a constant that's off, the last's
+/// second dispatch behind the frame's time.
+const SCHEDULED: &str = r#"
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch, label}
+
+pub const FOG: bool = false
+
+@compute(64)
+fn first(out: mut Slots<u32>, id: GlobalId) {
+    out[id] = 1
+}
+
+@compute(64)
+fn fog(out: mut Slots<u32>, id: GlobalId) {
+    out[id] = 2
+}
+
+@compute(64)
+fn last(out: mut Slots<u32>, id: GlobalId) {
+    out[id] = 3
+}
+
+@compute(64)
+fn late(out: mut Slots<u32>, id: GlobalId) {
+    out[id] = 4
+}
+
+pub struct State {
+    out: GpuBuffer<u32>,
+}
+
+pub fn init() -> State {
+    State { out: buffer(64) }
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    label("opening")
+    dispatch(first.bind(mut s.out), groups: 1)
+    if FOG {
+        label("fog")
+        dispatch(fog.bind(mut s.out), groups: 1)
+    }
+    label("closing")
+    for _i in 0..2 {
+        dispatch(last.bind(mut s.out), groups: 1)
+    }
+    if time > 1.0 {
+        dispatch(late.bind(mut s.out), groups: 1)
+    }
+}
+"#;
+
+/// The frame's schedule (`wrela pipelines --schedule`, docs/plans/engine-at-build.md phase 4
+/// step 4) is the passes the build leaves, in the order the frame records them: a pass behind a
+/// constant that's off isn't in it (nor its pipeline in the build), a dispatch in a loop is
+/// marked so, and one behind the frame's own test is conditional.
+#[test]
+fn the_frames_schedule_is_the_passes_the_build_leaves() {
+    let dir = scratch("consts/scheduled");
+    std::fs::write(dir.join("main.wrela"), SCHEDULED).expect("write");
+    let out = wrela_driver::check_pipelines(&dir);
+    assert!(
+        out.diagnostics.is_empty(),
+        "{}",
+        wrela_diag::render::render_all(&out.sources, &out.diagnostics)
+    );
+    let name = |i: usize| out.pipelines[i].names.join(" + ");
+    let passes: Vec<(String, Vec<(String, bool, bool)>)> = out
+        .schedule
+        .iter()
+        .map(|p| (p.label.clone(), p.commands.iter().map(|&(i, c, l)| (name(i), c, l)).collect()))
+        .collect();
+    assert_eq!(
+        passes,
+        [
+            ("opening".to_string(), vec![("first".to_string(), false, false)]),
+            (
+                "closing".to_string(),
+                vec![("last".to_string(), false, true), ("late".to_string(), true, false)]
+            ),
+        ]
+    );
+    let fog = [("FOG".to_string(), "true".to_string())];
+    let on = wrela_driver::check_pipelines_set(&dir, &fog);
+    let labels: Vec<&str> = on.schedule.iter().map(|p| p.label.as_str()).collect();
+    assert_eq!(labels, ["opening", "fog", "closing"]);
+}
