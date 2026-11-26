@@ -5,6 +5,7 @@
 use matter::substance::Substance
 use mesh::dc::{
     CREASE_STEPS, CreaseSolve, brick_slice, classify_cells, crease_part,
+    lane_slice,
     crease_passes, crease_slice, crease_step_cost_of, crease_step_cost_rest_of, cull_bricks,
     cull_bricks_rest, cull_bricks_sub, deform_skinned_verts, eval_corners, eval_corners_rest,
     eye_step, filter_thin_cells, inherit_seam_corners, keep_slice_of,
@@ -991,26 +992,41 @@ impl MeshBatch {
     }
 
     /// Skins and projects this batch's rest-pose vertices into `deformed_verts`
-    /// (`deform_skinned_verts`), in dispatches of at most `DEFORM_SLICE` vertices.
+    /// (`deform_skinned_verts`), in dispatches of as many vertices as its bound lets one hold
+    /// (`lane_slice`), at most `DEFORM_SLICE`.
     fn deform<M: Field<Substance> + GpuData>(mut self, scratch: mut ExtractScratch, field: M) {
         // As many slices as the rest mesh has vertices, once a readback of this extraction says
         // how many (the rest mesh changes only when extracted again); every slot's until then.
         let known = self.verts_gen == self.gen && self.verts_known > 0
         let n_verts = if known { min(self.verts_known, self.cap_verts) } else { self.cap_verts }
-        let slices = max((n_verts + DEFORM_SLICE - 1) / DEFORM_SLICE, 1)
+        // A slice is as many vertices as the kernel's own bound lets a dispatch hold.
+        let slice = lane_slice(
+            kernel_work(deform_skinned_verts.bind(
+                field: field,
+                rest_verts: self.verts.items(),
+                skin: self.skin_verts.items(),
+                vert_count: self.verts.count(),
+                cap_verts: self.cap_verts,
+                first: 0,
+                bones: self.bones.items(),
+                out: self.deformed_verts.span_mut(start: 0, count: 64),
+            )),
+            most: DEFORM_SLICE,
+        )
+        let slices = max((n_verts + slice - 1) / slice, 1)
         dispatch(
             prep_slices.bind(
                 count: self.verts.count(),
                 cap: self.cap_verts,
-                most: DEFORM_SLICE,
+                most: slice,
                 slices: slices,
                 args: scratch.crease_args.span_mut(start: 0, count: slices),
             ),
             over: slices,
         )
         for k in 0..slices {
-            let first = k * DEFORM_SLICE
-            let n = min(self.cap_verts - first, DEFORM_SLICE)
+            let first = k * slice
+            let n = min(self.cap_verts - first, slice)
             dispatch(
                 deform_skinned_verts.bind(
                     field: field,
@@ -2340,9 +2356,21 @@ impl MeshBatch {
 
         // 2. Cull & extract ONLY the dirty sub-grid bricks in bounded chunks and append at `dst_base`.
         scratch.active.clear()
+        let cull_most = lane_slice(
+            kernel_work(cull_bricks.bind(
+                fields: fbuf.items(),
+                grids: grids,
+                things: n_sub,
+                first_brick: 0,
+                total_bricks: patch_total,
+                fc: frustum_cull_none(),
+                active: mut scratch.active,
+            )),
+            most: CULL_CHUNK,
+        )
         var c_first: u32 = 0
         while c_first < patch_total {
-            let cn = min(patch_total - c_first, CULL_CHUNK)
+            let cn = min(patch_total - c_first, cull_most)
             dispatch(
                 cull_bricks.bind(
                     fields: fbuf.items(),
@@ -2904,10 +2932,10 @@ impl MeshBatch {
         let super_sub_slice = max(
             u32(clamp(
                 f32(limits().step_work) * 1000.0 / (64.0 * (f32(kernel_work(super_sub_k)) + 2000.0)),
-                64.0,
+                1.0,
                 4096.0,
             )),
-            64,
+            1,
         )
         let super_slices = if scratch.total_super > 0 {
             min((scratch.total_super + super_sub_slice - 1) / super_sub_slice, SLICES_MOST)
@@ -2975,9 +3003,22 @@ impl MeshBatch {
         // Pass 0: Interval-cull bricks (2-level 4×4×4 super-bricks on large grids, else flat).
         if use_super {
             scratch.super_active.clear()
+            let super_most = lane_slice(
+                kernel_work(super_cull_bricks.bind(
+                    fields: fields,
+                    grids: grids,
+                    super_grids: scratch.super_grids.items(),
+                    things: things,
+                    first_super: 0,
+                    total_super: scratch.total_super,
+                    fc: fc,
+                    super_active: mut scratch.super_active,
+                )),
+                most: CULL_CHUNK,
+            )
             var s_first: u32 = 0
             while s_first < scratch.total_super {
-                let sn = min(scratch.total_super - s_first, CULL_CHUNK)
+                let sn = min(scratch.total_super - s_first, super_most)
                 dispatch(
                     super_cull_bricks.bind(
                         fields: fields,
@@ -3020,9 +3061,21 @@ impl MeshBatch {
                 )
             }
         } else {
+            let cull_most = lane_slice(
+                kernel_work(cull_bricks.bind(
+                    fields: fields,
+                    grids: grids,
+                    things: things,
+                    first_brick: 0,
+                    total_bricks: total_bricks,
+                    fc: fc,
+                    active: mut scratch.active,
+                )),
+                most: CULL_CHUNK,
+            )
             var first: u32 = 0
             while first < total_bricks {
-                let n = min(total_bricks - first, CULL_CHUNK)
+                let n = min(total_bricks - first, cull_most)
                 dispatch(
                     cull_bricks.bind(
                         fields: fields,
@@ -3795,9 +3848,20 @@ impl MeshBatch {
         write(mut self.tri_count, 0, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
 
         let grids = scratch.grids.items()
+        let cull_most = lane_slice(
+            kernel_work(cull_bricks_rest.bind(
+                fields: fields,
+                grids: grids,
+                things: things,
+                first_brick: 0,
+                total_bricks: total_bricks,
+                active: mut scratch.active,
+            )),
+            most: CULL_CHUNK,
+        )
         var first: u32 = 0
         while first < total_bricks {
-            let n = min(total_bricks - first, CULL_CHUNK)
+            let n = min(total_bricks - first, cull_most)
             dispatch(
                 cull_bricks_rest.bind(
                     fields: fields,
