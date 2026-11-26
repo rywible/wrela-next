@@ -922,6 +922,15 @@ segment's offset alone kept its slopes; the profile's code lost them where it:
 
 `WRELA_DUMP_IR=affine` says why a field's affine form falls to its interval.
 
+A form a field gets now where it fell to its interval can be wider than that interval (a clamp's,
+a mix's), and the facts' proofs read some ranges from the form alone: the pillars' and the
+citadel's channels went unproven (their shaders kept the range guards) until each range the facts
+read is the form's intersected with the interval (`std::derive::affine`), never wider than
+before. The Lipschitz derivation given the flattened copy too moved no kind's steepness (the
+citadel and the glass shard have none, the pillars 12,039, the marble column 5,720) and ran the
+kit's soundness test out of fuel, so it keeps its own fallback: their causes are elsewhere, next
+on this list.
+
 Purpose: find the work that the engine does only because a proof is missing, and remove it. Then
 decrease the cost that no proof can remove.
 
