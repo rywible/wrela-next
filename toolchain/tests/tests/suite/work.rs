@@ -349,7 +349,10 @@ fn checks_the_count_proves_unneeded_are_left_out() {
 
 /// What a strict module weighs a built-in at (`wrela_ir::work::strict_builtin_cost`, which E0712
 /// and hoisting take) is the work of std's code that it becomes there: a strict kernel of one
-/// call, less a strict kernel that computes only its arguments.
+/// call, less a strict kernel that computes only its arguments. The weight is of the code as
+/// written, a division a division: so it is held to a build for Metal (whose GPU rounds a
+/// division), and to one for Vulkan (where a strict kernel divides by std's code,
+/// `Target::rounds_div`) for the root alone, whose code there (`sqrt_rounded`) divides nothing.
 #[test]
 fn strict_builtins_cost_what_std_s_code_does() {
     use wrela_ir::Builtin as B;
@@ -393,25 +396,34 @@ fn strict_builtins_cost_what_std_s_code_does() {
     }
     src.push_str("}\n");
     write_package(&dir, "work_strict_builtins", &src);
-    let all = work(&dir);
-    let none = of(&all, "none").0.expect("bounded");
-    let none2 = of(&all, "none2").0.expect("bounded");
     let mut wrong = Vec::new();
-    for (i, (b, e)) in calls.iter().enumerate() {
-        let base = if e.contains(',') { none2 } else { none };
-        let got = of(&all, &format!("k{i}")).0.expect("bounded") - base;
-        // A target that rounds its root keeps the GPU's (`Target::rounds_sqrt`).
-        let table =
-            wrela_ir::work::strict_builtin_cost(*b, 1, wrela_abi::Target::HERE.rounds_sqrt());
-        if got != table {
-            wrong.push(format!("{e}: std's code {got}, the table {table}"));
+    for target in wrela_abi::Target::ALL {
+        let built = wrela_driver::build_for(&dir, &wrela_tests::testing_for(target));
+        assert!(!built.has_errors(), "{:?}", built.diagnostics);
+        let all: Vec<(String, Option<u64>, u64)> = built
+            .pipelines
+            .iter()
+            .map(|p| (p.names[0].clone(), p.work.first().copied().flatten(), p.weight))
+            .collect();
+        let none = of(&all, "none").0.expect("bounded");
+        let none2 = of(&all, "none2").0.expect("bounded");
+        for (i, (b, e)) in calls.iter().enumerate() {
+            if !target.rounds_div() && *b != B::Sqrt {
+                continue;
+            }
+            let base = if e.contains(',') { none2 } else { none };
+            let got = of(&all, &format!("k{i}")).0.expect("bounded") - base;
+            // A target that rounds its root keeps the GPU's (`Target::rounds_sqrt`).
+            let table = wrela_ir::work::strict_builtin_cost(*b, 1, target.rounds_sqrt());
+            if got != table {
+                wrong.push(format!(
+                    "{e} for {}: std's code {got}, the table {table}",
+                    target.name()
+                ));
+            }
         }
     }
-    assert!(
-        wrong.is_empty(),
-        "the table is not std's code (the kernel of none: {none}):\n{}",
-        wrong.join("\n")
-    );
+    assert!(wrong.is_empty(), "the table is not std's code:\n{}", wrong.join("\n"));
 }
 
 /// A dispatch whose size the build knows is held to the host's line at build (E0714, phase 4

@@ -317,7 +317,8 @@ pub fn frame(s: mut State, _time: f32, _width: u32, _height: u32) {
 }
 "#,
     );
-    let built = wrela_driver::build(&dir);
+    // (For Metal on every machine: the shader's text is read below.)
+    let built = wrela_driver::build_for(&dir, &wrela_tests::testing_for(wrela_abi::Target::Metal));
     assert!(!built.has_errors(), "{:?}", built.diagnostics);
     // Tier 2: dead transmissive pipeline under `FACTS.may_transmit` is completely erased.
     let manifest = wrela_tests::built_manifest(&built);
