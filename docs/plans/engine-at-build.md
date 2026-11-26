@@ -216,7 +216,8 @@ Steps:
    - Certificates and exact cells: `dilate_outline`, `filter_thin_cells`, `note_untested`,
      `certify_outline`, `note_uncertified`, `set_exact_args`.
    - The sun (`lib/engine/mesh/sunlight.wrela`): `sun_cert_level0`, `sun_cert_reduce`,
-     `sun_exact_one`, `sun_fit_reduce`, `sun_fit_set`, `sun_gather`, `sun_slices`.
+     `sun_fit_reduce`, `sun_fit_set`, `sun_gather`, `sun_slices`. (`sun_exact_one` was in this
+     list; phase 1 found that its output is a pixel's light and made it relaxed.)
    - Not geometry kernels: the swarm's (`swarm_*`: a simulation of grains, for the picture), the
      radiance, sky and shading kernels, the culls of instances and the Hi-Z.
 3. Build SCENE 10 and SCENE 11 two times from the same commit: one time relaxed, one time with
@@ -354,12 +355,23 @@ use by another project; they are to be run with the rest of the plan's Radeon wo
 
 ## 9. Phase 1: strict math in the geometry kernels
 
-State (2026-11-25): steps 1 to 9 and 12 are done on the M4's build and its CPU tests; step 10 and
-11 are open, and nothing of this phase has run on a GPU since the stall (its measurements and
-gates are open on both machines).
+State (2026-11-25, after the restart): steps 1 to 9 and 12 are done and measured on the M4; step
+10 is done for std's strict functions (toolchain/tests/strict_bits) and open for the engine's
+kernels; step 11 is open; the Radeon is not measured. The gate on the M4: the audit and the sun's
+judge pass unchanged; spans SCENE 10/11/13/14 28.42/16.92/18.30/21.77 ms against lines
+25.41/17.34/18.93/22.25: SCENE 10 is 16.3% over its baseline of 24.44 ms, the target 5%.
 
-Purpose: make the proofs true for the released build. Make each geometry kernel give the same
-bits on each GPU and on the CPU.
+Where SCENE 10's strict cost is (M4, frames 30 to 33 at 1080p, each dispatch alone, GPU time
+summed over the four frames; the same build relaxed beside it): extraction 21.4 ms strict, 12.8
+relaxed. Of the 8.6 ms: std's transcendentals 3.0 ms (strict with the driver's: 18.4 ms);
+`lower_strict`'s writing of the driver's built-ins as the CPU computes them 2.5 ms (strict without
+it: 18.9 ms; a vector's `normalize` is a division a component, as the CPU's is, and a safe-math
+division is costly), and safe math the rest. Skinning 1.84 ms strict, 0.79 relaxed, 0.91 without
+`lower_strict`. The certificates 2.11 ms strict, 0.67 relaxed. These are the kinds re-extracted
+every frame (the flames and the parry arc read the time): phase 2's classes and phase 3's cook
+remove most of the extraction of the rest. Next: a `normalize` of one division (on the CPU and
+in a strict kernel alike, so their bits still agree), cheaper std transcendentals for |x| < 6000
+(their error limits measured again), then measure again.
 
 ### What is wrong today
 
@@ -447,9 +459,20 @@ GPU.
   is that of the code that runs), and a check (a pass that erases a bounded loop's exit is an
   internal error). A dispatch that runs cannot be stopped, and a host the timeout kills leaves it
   on the GPU until a restart: `tools/gpu` now refuses to start on a busy GPU.
-- The M4's root differs from the correctly rounded one by an ulp; std's correction
-  (`std::math::sqrt_from`) is one wrapping square and a subtraction, checked for every positive
-  normal argument from its root and both neighbours on the CPU.
+- The M4's plain root differs from the correctly rounded one by an ulp, its `precise::sqrt`
+  doesn't (all 2³² arguments): a strict root on Metal is the GPU's. std's correction for a target
+  whose root isn't rounded (`std::math::sqrt_from`) is the root's bits plus or minus one, from one
+  wrapping square, with no branch, checked for every positive normal argument from its root and
+  both neighbours on the CPU.
+- A count of a kernel's code in a module of its own is not the kernel's: the kernel inlines it
+  and turns small branches into selects differently, and reads its data from buffers (35% to 55%
+  under some SCENE 14 kernels' bounds). A program reads a kernel's own bound with
+  `std::gpu::kernel_work(kernel.bind(...))`, and crease dispatches are sliced by it.
+- `sun_exact_one` is not strict: what it decides is a pixel's light, not where matter is (step
+  3's list corrected), and a strict march at every listed pixel cost SCENE 13 2.3 ms.
+- A strict kernel's bound is the greater of its source's count and its flattened code's: the
+  flattened count of `cull_bricks` came to 2,755 against 164,544 as written, and the kernel
+  takes 4.4 ms for 8,192 invocations. Why the flattened count loses that work is open.
 - `glass_shard` has no steepness (`lip inf` in the facts report). It entered the report at
   `22446ef`, and the `std::field` of that commit gives it none too: this is not a loss of
   phase 1. Phase 5 finds its cause.
@@ -832,10 +855,11 @@ Each question has the step that must answer it. Write the answer here when you h
    operand as a zero and gives a zero for any result whose exact value is below 2⁻¹²⁶ (before
    rounding). With that model (`strict_model` in `toolchain/host/src/gpu/strict_ops.rs`), its
    division, reciprocal, add, subtract and multiply give the CPU's bits for every input tested
-   (1 / x for all 2³² inputs; the others for 16,781,060 pairs). Its square root does not: it
-   differs from the correctly rounded root in 605,737,168 of the 2³² inputs, by one ulp, so a
-   strict kernel's square root is software (`std::math::sqrt_rounded`). The Radeon is not
-   tested yet.
+   (1 / x for all 2³² inputs; the others for 16,781,060 pairs). Its square root does too, as
+   `metal::precise::sqrt`, which the Metal writer uses in an exact module, for all 2³² inputs
+   (2026-11-25); the plain `metal::sqrt` differs in 605,737,168 by an ulp. So on Metal a strict
+   root is the GPU's (`wrela_abi::Target::rounds_sqrt`); where a target's isn't, std's correction
+   (`std::math::sqrt_rounded`, `sqrt_from`) sets it right. The Radeon is not tested yet.
 4. What error limit does WGSL give to `sin` and `cos`? The code uses 2⁻¹¹. Read the
    specification of WGSL before phase 1 step 8.
 5. Do the grids of two eyes put a cell in the same position? The grids of one batch share one

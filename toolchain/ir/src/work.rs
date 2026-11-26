@@ -1097,7 +1097,7 @@ impl<'a> Counter<'a> {
                 // What E0712 and hoisting weigh, in a strict module, is what the built-in
                 // becomes there: std's code (`strict_builtin_cost`).
                 let w = if !self.bounds && self.m.strict {
-                    strict_builtin_cost(*b, n)
+                    strict_builtin_cost(*b, n, self.m.rounded_sqrt)
                 } else {
                     builtin_cost(*b, n)
                 };
@@ -1299,15 +1299,20 @@ pub fn builtin_cost(b: Builtin, n: u64) -> u64 {
 /// (`std::math`), whose work a strict kernel of one call counts, less the kernel's without it
 /// (`toolchain/tests`' `strict_builtins_cost_what_std_s_code_does` holds the table to the
 /// counts); the rest is `builtin_cost`.
-pub fn strict_builtin_cost(b: Builtin, n: u64) -> u64 {
+pub fn strict_builtin_cost(b: Builtin, n: u64, rounded_sqrt: bool) -> u64 {
     use Builtin as B;
+    if rounded_sqrt && matches!(b, B::Sqrt | B::InverseSqrt | B::Length | B::Distance | B::Normalize) {
+        return builtin_cost(b, n);
+    }
     let one = match b {
         B::Sqrt => 48,
         B::InverseSqrt => 48 + SLOW_OP,
         B::Sin => 302,
         B::Cos => 306,
         B::Tan => 300,
+        B::Asin if rounded_sqrt => 99,
         B::Asin => 144,
+        B::Acos if rounded_sqrt => 98,
         B::Acos => 143,
         B::Atan => 45,
         B::Atan2 => 82,

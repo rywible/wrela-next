@@ -400,7 +400,9 @@ fn strict_builtins_cost_what_std_s_code_does() {
     for (i, (b, e)) in calls.iter().enumerate() {
         let base = if e.contains(',') { none2 } else { none };
         let got = of(&all, &format!("k{i}")).0.expect("bounded") - base;
-        let table = wrela_ir::work::strict_builtin_cost(*b, 1);
+        // A target that rounds its root keeps the GPU's (`Target::rounds_sqrt`).
+        let table =
+            wrela_ir::work::strict_builtin_cost(*b, 1, wrela_abi::Target::HERE.rounds_sqrt());
         if got != table {
             wrong.push(format!("{e}: std's code {got}, the table {table}"));
         }

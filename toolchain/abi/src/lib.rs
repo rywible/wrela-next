@@ -296,6 +296,16 @@ impl Target {
     }
 
     /// The limits a pipeline for it is compiled for, which its host requires of a device.
+    /// Whether this target's GPU computes a square root as IEEE 754 rounds it, in a strict
+    /// kernel, as the strict model has it (a subnormal a zero): then a strict kernel's root is the
+    /// GPU's, else std's (`std::math::sqrt_rounded`). Metal's `precise::sqrt`, which the writer
+    /// uses in exact mode, does on the M4 for all 2³² arguments (`wrela-host`'s
+    /// `the_gpu_rounds_the_safe_operations_as_the_cpu_does`, 2026-11-25; its plain `sqrt` differs
+    /// in 605,737,168). The Radeon's is not tested yet.
+    pub const fn rounds_sqrt(self) -> bool {
+        matches!(self, Target::Metal)
+    }
+
     pub const fn limits(self) -> &'static TargetLimits {
         match self {
             Target::Metal => &TargetLimits::METAL,

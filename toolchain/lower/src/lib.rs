@@ -1520,6 +1520,8 @@ pub(crate) fn cpu_math_lang(b: ir::Builtin) -> Option<Lang> {
 /// computes them when it was lowered). After the module is flattened and its same work moved
 /// onto the CPU, which computes the built-ins with the same code.
 pub(crate) fn make_strict(cx: &mut Cx, mb: &mut ModuleBuilder) {
+    // A target whose GPU rounds its root as IEEE 754 does keeps it.
+    mb.m.rounded_sqrt = cx.data.target.rounds_sqrt();
     let mut done = 0;
     while done < mb.m.functions.len() {
         let end = mb.m.functions.len();
@@ -1553,6 +1555,7 @@ fn strict_math(
     out: &mut ir::Block,
 ) {
     let lang = match &s {
+        ir::Stmt::Let(_, ir::Expr::Builtin(ir::Builtin::Sqrt, _)) if mb.m.rounded_sqrt => None,
         ir::Stmt::Let(_, ir::Expr::Builtin(ir::Builtin::Sqrt, _)) => Some(Lang::StrictSqrt),
         ir::Stmt::Let(_, ir::Expr::Builtin(op, _)) => cpu_math_lang(*op),
         ir::Stmt::Let(_, ir::Expr::Binary(ir::BinOp::Rem, a, _))

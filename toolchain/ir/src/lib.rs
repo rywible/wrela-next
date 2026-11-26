@@ -1070,6 +1070,9 @@ pub struct Module {
     /// (`strict::lower_strict`, std's transcendentals and square root), written with no
     /// contraction and with safe math, so its bits are the CPU's.
     pub strict: bool,
+    /// GPU only: whether a strict module's square root is the GPU's own, which rounds as
+    /// IEEE 754 does on this target (`wrela_abi::Target::rounds_sqrt`), not std's code.
+    pub rounded_sqrt: bool,
     /// CPU only: whether the program starts a voice (`std::audio`), so the module imports
     /// `wrela.audio`.
     pub audio: bool,

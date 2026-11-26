@@ -2310,6 +2310,7 @@ impl FunctionWriter<'_, '_> {
             }
             _ => {
                 let name = match b {
+                    B::Sqrt if self.w.checks.exact => "precise::sqrt",
                     B::Sqrt => "sqrt",
                     B::InverseSqrt => "rsqrt",
                     B::Sin => "sin",
