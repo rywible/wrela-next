@@ -4,7 +4,7 @@
 use matter::substance::Substance
 use picture::eye::View
 use std::collections::Vec
-use std::derive::{Box3, affine, affine_form, work}
+use std::derive::Box3
 use std::field::{ALL_LIVE, DualQuat, Field, Live}
 use std::gpu::LANE_WORK_LEAST
 use std::quat::Quat
@@ -1007,20 +1007,6 @@ pub(package) fn brick_of(g: GridSpec, local: u32) -> vec3u {
     vec3u(rem - by * g.dims.x, by, bz)
 }
 
-/// Compiler-measured work thresholds (`std::derive::work`) above which a field's distance or 3D
-/// `affine_form` expansion exceeds per-cell shader budgets: the engine automatically routes such
-/// fields to sound `Surface::pruned` sheet certification and sparse brick caching without any
-/// per-asset hint flag.
-pub(package) const AUTO_BAKE_WORK: u32 = 3000
-pub(package) const AFFINE_WORK_MOST: u32 = 16000
-
-/// Compile-time constant predicate: true when either `distance_live` or its 3D `affine_form`
-/// derivation exceeds budget (constant-folds dead branches out of emitted GPU shaders completely).
-pub(package) fn is_heavy_field<M: Field<Substance>>(f: M) -> bool {
-    work(|q: vec3| f.distance_live(q, ALL_LIVE)) > AUTO_BAKE_WORK ||
-        work(|b: Box3| affine_form(|q: vec3| f.distance_live(q, ALL_LIVE), b)) > AFFINE_WORK_MOST
-}
-
 /// Whether a `4×4×4` super-brick `sb` (clamped to `g.dims`, halo included) may hold `f`'s surface,
 /// together with the parts still live anywhere inside it.
 pub(package) fn cull_super_brick<M: Field<Substance>>(f: M, g: GridSpec, sb: vec3u) -> (bool, Live) {
@@ -1045,24 +1031,16 @@ pub(package) fn cull_brick_with_live<M: Field<Substance>>(
     let hi_c: u32 = if g.seam_mask != 0 { BRICK + 2 } else { BRICK + 1 }
     let hi = brick_corner(g, b, vec3u(hi_c, hi_c, hi_c))
     let pr0 = f.pruned(Box3 { lo, hi }, |q: vec3| q, 1.0, init_live, 0)
-    if !steep(f) {
-        return (pr0.range.lo <= 0.0 && pr0.range.hi >= 0.0, pr0.live)
+    let may = pr0.range.lo <= 0.0 && pr0.range.hi >= 0.0
+    if !may || !steep(f) {
+        return (may, if may { pr0.live } else { init_live })
     }
-    let heavy = is_heavy_field(f)
-    let use_affine = !heavy && f.lipschitz(1.0) > 2.5
-    if !heavy && use_affine {
-        let iv_all = affine(|q: vec3| f.distance(q), Box3 { lo, hi })
-        if !(iv_all.lo <= 0.0 && iv_all.hi >= 0.0) {
-            return (false, init_live)
-        }
-    } else if !(pr0.range.lo <= 0.0 && pr0.range.hi >= 0.0) {
-        return (false, init_live)
-    }
-    // The box in pieces (`cull_pieces`: its octants, or its quarters or halves where an
-    // invocation can't hold eight tests, or the box alone): the brick is kept where one straddles.
+    // A steep field's range by its bound is that many times wider than the box: one of the box's
+    // pieces must straddle 0 too, by its own pruned range (`cull_pieces`: its octants, or its
+    // quarters or halves where an invocation can't hold eight tests, or the box alone).
     let pieces = cull_pieces(f)
     if pieces == 1 {
-        return (true, if pr0.range.lo <= 0.0 && pr0.range.hi >= 0.0 { pr0.live } else { init_live })
+        return (true, pr0.live)
     }
     let mid = 0.5 * (lo + hi)
     for oct in 0..pieces {
@@ -1076,14 +1054,9 @@ pub(package) fn cull_brick_with_live<M: Field<Substance>>(
             if pieces >= 4 && (oct & 2) == 0 { mid.y } else { hi.y },
             if pieces >= 8 && (oct & 4) == 0 { mid.z } else { hi.z },
         )
-        let iv = if !heavy && use_affine {
-            affine(|q: vec3| f.distance(q), Box3 { lo: olo, hi: ohi })
-        } else {
-            f.pruned(Box3 { lo: olo, hi: ohi }, |q: vec3| q, 1.0, pr0.live, 0).range
-        }
+        let iv = f.pruned(Box3 { lo: olo, hi: ohi }, |q: vec3| q, 1.0, pr0.live, 0).range
         if iv.lo <= 0.0 && iv.hi >= 0.0 {
-            let live = if pr0.range.lo <= 0.0 && pr0.range.hi >= 0.0 { pr0.live } else { init_live }
-            return (true, live)
+            return (true, pr0.live)
         }
     }
     (false, init_live)
@@ -1099,10 +1072,10 @@ pub(package) fn cull_brick_with_live<M: Field<Substance>>(
 /// there), and nine tests an invocation (3,041,177 work) were refused on the Radeon. Fewer
 /// pieces keep more bricks that hold no surface, which mesh to nothing.
 pub(package) fn cull_pieces<M: Field<Substance>>(f: M) -> u32 {
-    let pruned = std::derive::strict_work(|b: Box3| f.pruned(b, |q: vec3| q, 1.0, ALL_LIVE, 0).range.lo)
-    let whole = std::derive::strict_work(|b: Box3| affine(|q: vec3| f.distance(q), b).lo)
-    let heavy = is_heavy_field(f)
-    let one = max(if !heavy && f.lipschitz(1.0) > 2.5 { max(pruned, whole) } else { pruned }, 1)
+    let one = max(
+        std::derive::strict_work(|b: Box3| f.pruned(b, |q: vec3| q, 1.0, ALL_LIVE, 0).range.lo),
+        1,
+    )
     let w = one + one / 5
     let most = LANE_WORK_LEAST / 2
     if w <= most / 9 { 8 } else if w <= most / 5 { 4 } else if w <= most / 3 { 2 } else { 1 }

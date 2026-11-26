@@ -16,8 +16,8 @@
 
 use std::collections::Vec
 use std::derive::{
-    Affine3, Box3, Interval, affine, filtered, gradient, interval, plus_work, reads_only_input,
-    tape, value_and_gradient, work,
+    Affine3, Box3, Interval, affine, affine_form, filtered, gradient, interval, plus_work,
+    reads_only_input, tape, value_and_gradient, work,
 }
 use std::stage::Tape
 use std::quat::Quat
@@ -45,10 +45,6 @@ pub trait Surface: Copy + GpuData {
     /// no skinned or deformed draw's pipeline. A kind that overrides `skin_shape_hash` says true;
     /// `engine::mesh` stops a skinned field whose kind says false.
     const MAY_SKIN: bool = false
-
-    /// Whether this surface provides a compositional first-order `slope_box` enclosure for sheet
-    /// certification and thin-cell filtering without expanding a monolithic `affine_form`.
-    const HAS_SLOPE_BOX: bool = false
 
     /// The signed distance from `p` to the surface.
     fn distance(self, p: vec3) -> f32
@@ -318,36 +314,43 @@ pub trait Surface: Copy + GpuData {
         Pruned { live, range: Interval { lo: max(x.lo, d - r - e), hi: min(x.hi, d + r + e) } }
     }
 
-    /// Sound first-order Mean-Value enclosure of `self.masked(p, live, first)` over `over` around
-    /// `at ∈ over` with half-extents `rad >= max(|over.lo - at|, |over.hi - at|)`. Defaults to the
-    /// 0th-order Lipschitz ball from `lipschitz(1e30)`.
-    fn slope_box(self, over: Box3, at: vec3, rad: vec3, live: Live, first: u32) -> SlopeBox {
-        let l = self.lipschitz(1.0e30)
-        let d = self.masked(at, live, first)
-        if l < 1.0e30 {
-            slope_lip(d, l, rad)
-        } else {
-            SlopeBox {
-                d_at: d,
-                g_mid: vec3(0.0),
-                g_rad: vec3(0.0),
-                err: 1.0e20,
-                range: Interval { lo: -1.0e20, hi: 1.0e20 },
-            }
-        }
+    /// A first-order enclosure of its distance over a box (`SlopeBox`): a plane the distance
+    /// stays near, how near, and its range. A fact every surface has, as `pruned` is: what a
+    /// certificate that the surface in a cell is a sheet reads (`slope_affine`).
+    ///
+    /// As `pruned` is asked: for a surface whose first part is numbered `first`, of
+    /// `self.masked(at(q), live, first)` for each `q` of `over`, `at` the maps of the combinators
+    /// above it. The enclosure is in the asker's box's own coordinates (`SlopeBox`). `to` says to
+    /// first order where `at` takes the box (`MapBox`): what a surface that states its own
+    /// enclosure, in its own space (`Slope3`), is asked over and turns its slopes back by
+    /// (`MapBox::out`).
+    ///
+    /// The default is the compiler's own derivation for this surface alone: the affine form of
+    /// its distance through the maps above it, over the box (`std::derive::affine_form`), its
+    /// range the form's within the derived interval's. A combinator composes its operands'
+    /// enclosures instead (a join by `slope_smin`; a map hands its own on in `at` and `to`), so
+    /// a tree's enclosure costs the sum of its leaves' and not one form of the whole tree, and a
+    /// leaf that knows its own shape states a tighter or cheaper one.
+    fn slope_box<F: Copy + fn(vec3) -> vec3>(
+        self,
+        over: Box3,
+        at: F,
+        to: MapBox,
+        live: Live,
+        first: u32,
+    ) -> SlopeBox {
+        slope_of_form(
+            affine_form(|q: vec3| self.masked(at(q), live, first), over),
+            interval(|q: vec3| self.masked(at(q), live, first), over),
+        )
     }
 
-    /// Converts `slope_box` over `over` into a sound `Affine3` matching `std::derive::affine_form`.
+    /// `slope_box` of `distance_live(p, live)` over `over`, as an affine form over the box
+    /// (`slope_to_affine`): what the engine's certificates read, for every kind.
     fn slope_affine(self, over: Box3, live: Live) -> Affine3 {
-        let hl = 0.5 * over.lo
-        let hh = 0.5 * over.hi
-        let c_b = hl + hh
-        let h_in = (hh - hl) * (1.0 + 2.0 * SLOPE_EPS)
-        let delta_c = abs(c_b) * (2.0 * SLOPE_EPS) + vec3(2.0 * SLOPE_TINY)
-        let rad = h_in + delta_c
-        let sb = self.slope_box(over, c_b, rad, live, 0)
-        slope_to_affine(sb, over)
+        slope_to_affine(self.slope_box(over, |q: vec3| q, MapBox::of(over), live, 0))
     }
+
     /// A rigid similarity transform `(R * s, t)` mapping this surface's local frame into world
     /// space when the surface is built from outer rigid `translate` / `rotate` / `scale` warps.
     /// Defaults to the identity transform.
@@ -710,6 +713,18 @@ impl<S: Surface> Surface for Skinned<S> {
 
     fn masked(self, p: vec3, live: Live, first: u32) -> f32 {
         self.posed.masked(p, live, first)
+    }
+
+    /// Its posed body's.
+    fn slope_box<F: Copy + fn(vec3) -> vec3>(
+        self,
+        over: Box3,
+        at: F,
+        to: MapBox,
+        live: Live,
+        first: u32,
+    ) -> SlopeBox {
+        self.posed.slope_box(over, at, to, live, first)
     }
 
     fn pruned<F: Copy + fn(vec3) -> vec3>(
@@ -1109,6 +1124,25 @@ impl Live {
         Live { words: self.words & (vec4u(4294967295) ^ spans(first, count)) }
     }
 
+    /// The same, with the `count` parts from `first` on, all in one word of the mask (`(first &
+    /// 31) + count <= 32`, `first < 128`), asked as `bits` says: its bit `i` for part `first +
+    /// i`, as `leaf_bits` gives them. What a join of single parts writes its pruning back with:
+    /// it clears a bit a part in its own loop, and builds the word's mask once.
+    fn with_leaf_bits(self, first: u32, count: u32, bits: u32) -> Live {
+        let ones = if count >= 32 { 4294967295 } else { (u32(1) << count) - 1 }
+        let at = first & 31
+        let keep = 4294967295 ^ (ones << at)
+        let put = (bits & ones) << at
+        let w = first >> 5
+        let v = self.words
+        Live { words: vec4u(
+            if w == 0 { (v.x & keep) | put } else { v.x },
+            if w == 1 { (v.y & keep) | put } else { v.y },
+            if w == 2 { (v.z & keep) | put } else { v.z },
+            if w == 3 { (v.w & keep) | put } else { v.w },
+        ) }
+    }
+
     /// How many of the first `parts` parts are asked.
     pub fn count(self, parts: u32) -> u32 {
         let w = self.words & spans(0, min(parts, 128))
@@ -1162,11 +1196,36 @@ pub const SLOPE_EPS: f32 = 1.0 / 8388608.0
 /// they are near nothing.
 pub const SLOPE_TINY: f32 = 1.2e-38
 
-/// Sound first-order Mean-Value enclosure of a surface over box `over` around `at ∈ over`:
-/// for every `p ∈ over`:
-///   1. `range.lo <= f(p) <= range.hi`
-///   2. `|f(p) - (d_at + dot(g_mid, p - at))| <= dot(g_rad, abs(p - at)) + err`
+/// A `SlopeBox`'s `e` where there is no bound: past what an affine form may hold
+/// (`Affine3::valid`), so the form made of it says so.
+pub const SLOPE_UNBOUNDED: f32 = 1.0e20
+
+/// A first-order enclosure of a function `f` over a box `over`, in the box's own coordinates, as
+/// `std::derive::affine_form` gives one, with a radius on each slope beside: with `(c_b, h, d) =
+/// form_box(over)`, for every `q` of `over` and every `u` in `[-1, 1]^3` with `|q - (c_b + h u)|
+/// <= d`, as the target computes `f(q)`,
+///   1. `range.lo <= f(q) <= range.hi`
+///   2. `|f(q) - (c + dot(l, u))| <= dot(r, abs(u)) + e`
+/// With `r` 0 it is an affine form (`slope_to_affine`), and the compiler's own form of `f` is one
+/// bit for bit (`slope_of_form`). It states an enclosure, nothing of `f`'s derivative: `c` need
+/// not be `f` at the centre (it is within `e` of it), and `l` need not be a gradient. So what
+/// composes two of them may use only that `f` lies between the two planes of (2), as
+/// `slope_smin` does.
 pub struct SlopeBox: Copy + GpuData {
+    pub c: f32,
+    pub l: vec3,
+    pub r: vec3,
+    pub e: f32,
+    pub range: Interval,
+}
+
+/// An enclosure of a function stated in a surface's own space, a metre a unit: about a point
+/// `at`, for every `x` within `rad` of it on each axis (the caller's `at` and `rad`),
+///   1. `range.lo <= f(x) <= range.hi`
+///   2. `|f(x) - (d_at + dot(g_mid, x - at))| <= dot(g_rad, abs(x - at)) + err`
+/// What a surface that knows its own shape states; `MapBox::out` makes it the asker's
+/// (`SlopeBox`).
+pub struct Slope3: Copy + GpuData {
     pub d_at: f32,
     pub g_mid: vec3,
     pub g_rad: vec3,
@@ -1174,12 +1233,210 @@ pub struct SlopeBox: Copy + GpuData {
     pub range: Interval,
 }
 
-/// 0th-order Lipschitz ball enclosure around `at` with half-extents `rad`.
-pub fn slope_lip(d_at: f32, l: f32, rad: vec3) -> SlopeBox {
+/// The box an affine form over `over` is taken over (`ir::derive::affine`'s `input_box`): its
+/// centre `c`, its half-widths `h` and `delta`, with every `p` of `over` at `c + h * u + d` for
+/// some `u` in `[-1, 1]^3` and `|d| <= delta`.
+pub fn form_box(over: Box3) -> (vec3, vec3, vec3) {
+    let hl = 0.5 * over.lo
+    let hh = 0.5 * over.hi
+    let c = hl + hh
+    let h = (hh - hl) * (1.0 + 2.0 * SLOPE_EPS)
+    let delta = abs(c) * (2.0 * SLOPE_EPS) + vec3(2.0 * SLOPE_TINY)
+    (c, h, delta)
+}
+
+/// The enclosure of a function over a box that its affine form `af` there
+/// (`std::derive::affine_form`) and its interval `x` there (`std::derive::interval`) are: the
+/// form, bit for bit, its range the form's within the interval's. A form with no bound
+/// (`!af.valid()`) leaves the interval alone.
+pub fn slope_of_form(af: Affine3, x: Interval) -> SlopeBox {
+    if !af.valid() {
+        return SlopeBox { c: 0.0, l: vec3(0.0), r: vec3(0.0), e: SLOPE_UNBOUNDED, range: x }
+    }
+    SlopeBox {
+        c: af.c,
+        l: af.l,
+        r: vec3(0.0),
+        e: af.e,
+        range: Interval { lo: max(af.lo(), x.lo), hi: min(af.hi(), x.hi) },
+    }
+}
+
+/// How the points of a box reach a surface's own space through the maps of the combinators above
+/// it (a move, a turn, a scale, a fold), to first order, in the box's own coordinates: what
+/// `Surface::slope_box` hands down beside the maps themselves (`at`), so a leaf that states its
+/// own enclosure knows the box it is asked over in its own space (`rad`) and how its slopes
+/// there are the asker's (`out`).
+///
+/// With `(c_b, h, d) = form_box(over)`: for every `q` of the asker's box and every `u` in `[-1,
+/// 1]^3` with `|q - (c_b + h u)| <= d`, the own-space point `x` the maps take `q` to, as the
+/// target computes it, has on each axis `i`
+///   `|x_i - at_i - dot(j_i, u)| <= dot(r_i, abs(u)) + e_i`
+/// (`j_i` and `r_i` the rows `jx`, `jy`, `jz` and `rx`, `ry`, `rz`). `at` is the centre's own
+/// image as the maps compute it.
+pub struct MapBox: Copy + GpuData {
+    pub at: vec3,
+    pub jx: vec3,
+    pub jy: vec3,
+    pub jz: vec3,
+    pub rx: vec3,
+    pub ry: vec3,
+    pub rz: vec3,
+    pub e: vec3,
+}
+
+/// `|v.x| + |v.y| + |v.z|`.
+fn sum_abs(v: vec3) -> f32 {
+    abs(v.x) + abs(v.y) + abs(v.z)
+}
+
+impl MapBox {
+    /// A box asked in the asker's own space (no map above): `q = c_b + h u`, give or take `d`.
+    pub fn of(over: Box3) -> MapBox {
+        let (c, h, delta) = form_box(over)
+        MapBox {
+            at: c,
+            jx: vec3(h.x, 0.0, 0.0),
+            jy: vec3(0.0, h.y, 0.0),
+            jz: vec3(0.0, 0.0, h.z),
+            rx: vec3(0.0),
+            ry: vec3(0.0),
+            rz: vec3(0.0),
+            e: delta,
+        }
+    }
+
+    /// Half-widths about `at` that hold every own-space point of the box, rounded outward.
+    pub fn rad(self) -> vec3 {
+        let r = vec3(
+            sum_abs(self.jx) + sum_abs(self.rx),
+            sum_abs(self.jy) + sum_abs(self.ry),
+            sum_abs(self.jz) + sum_abs(self.rz),
+        ) +
+            self.e
+        r * (1.0 + 8.0 * SLOPE_EPS) + vec3(4.0 * SLOPE_TINY)
+    }
+
+    /// The own-space box `at ± rad()`.
+    pub fn own(self) -> Box3 {
+        let r = self.rad()
+        Box3 { lo: self.at - r, hi: self.at + r }
+    }
+
+    /// An enclosure stated in own space (about `at`, over `own()`), as the asker's: with `x - at
+    /// = J u + p`, `|p| <= R |u| + e`, its plane's slopes are `J^T g`, and what `p` and the
+    /// radii allow is radius (`R^T |g| + (|J| + R)^T g_rad`) and error (`dot(|g| + g_rad, e)`).
+    pub fn out(self, s: Slope3) -> SlopeBox {
+        let ga = abs(s.g_mid)
+        let l = self.jx * s.g_mid.x + self.jy * s.g_mid.y + self.jz * s.g_mid.z
+        let (ax, ay, az) = (abs(self.jx), abs(self.jy), abs(self.jz))
+        let turned = ax * ga.x + ay * ga.y + az * ga.z
+        let r = self.rx * ga.x +
+            self.ry * ga.y +
+            self.rz * ga.z +
+            (ax + self.rx) * s.g_rad.x +
+            (ay + self.ry) * s.g_rad.y +
+            (az + self.rz) * s.g_rad.z
+        SlopeBox {
+            c: s.d_at,
+            l,
+            r: r + (turned + r) * (8.0 * SLOPE_EPS) + vec3(4.0 * SLOPE_TINY),
+            e: s.err + dot(ga + s.g_rad, self.e) * (1.0 + 8.0 * SLOPE_EPS) + 4.0 * SLOPE_TINY,
+            range: s.range,
+        }
+    }
+
+    /// Through a move: `x - by`, which is `at` at the centre (the map's own image of it).
+    pub fn moved(self, by: vec3, at: vec3) -> MapBox {
+        let size = abs(self.at) + abs(by) + self.rad()
+        MapBox { at, e: self.e + size * (4.0 * SLOPE_EPS) + vec3(4.0 * SLOPE_TINY), ..self }
+    }
+
+    /// Through a linear map whose rows are `x`, `y` and `z` (`x'_i = dot(row_i, x)`: a turn),
+    /// whose image of the centre is `at`.
+    pub fn turned(self, x: vec3, y: vec3, z: vec3, at: vec3) -> MapBox {
+        let own = abs(self.at) + self.rad()
+        let (jx, rx, ex) = self.row(x, own)
+        let (jy, ry, ey) = self.row(y, own)
+        let (jz, rz, ez) = self.row(z, own)
+        MapBox { at, jx, jy, jz, rx, ry, rz, e: vec3(ex, ey, ez) }
+    }
+
+    /// One row of `turned`: the slopes, the radii and the error of `dot(m, x)`.
+    fn row(self, m: vec3, own: vec3) -> (vec3, vec3, f32) {
+        let a = abs(m)
+        let j = self.jx * m.x + self.jy * m.y + self.jz * m.z
+        let big = abs(self.jx) * a.x + abs(self.jy) * a.y + abs(self.jz) * a.z
+        let r = self.rx * a.x + self.ry * a.y + self.rz * a.z
+        (
+            j,
+            r + (big + r) * (8.0 * SLOPE_EPS) + vec3(4.0 * SLOPE_TINY),
+            dot(a, self.e) + dot(a, own) * (8.0 * SLOPE_EPS) + 4.0 * SLOPE_TINY,
+        )
+    }
+
+    /// Through a division by `by` (a scale), whose image of the centre is `at`.
+    pub fn scaled(self, by: f32, at: vec3) -> MapBox {
+        let s = 1.0 / by
+        let m = abs(s)
+        let own = abs(self.at) + self.rad()
+        let wide = 1.0 + 8.0 * SLOPE_EPS
+        let tiny = vec3(4.0 * SLOPE_TINY)
+        MapBox {
+            at,
+            jx: self.jx * s,
+            jy: self.jy * s,
+            jz: self.jz * s,
+            rx: (self.rx * m + abs(self.jx) * (m * 8.0 * SLOPE_EPS)) * wide + tiny,
+            ry: (self.ry * m + abs(self.jy) * (m * 8.0 * SLOPE_EPS)) * wide + tiny,
+            rz: (self.rz * m + abs(self.jz) * (m * 8.0 * SLOPE_EPS)) * wide + tiny,
+            e: (self.e * m + own * (m * 8.0 * SLOPE_EPS)) * wide + tiny,
+        }
+    }
+
+    /// Through a fold across the planes `across` names (1 for each of x, y and z folded, else
+    /// 0): `|x_i|` on a folded axis. Where the box is on the far side of the plane the axis's
+    /// row is turned over; where it crosses, `| |x| - |at| | <= |x - at|`, so the row's whole
+    /// size is radius.
+    pub fn folded(self, across: vec3) -> MapBox {
+        let rad = self.rad()
+        let (jx, rx, ax) = fold_row(self.jx, self.rx, self.at.x, rad.x, across.x > 0.5)
+        let (jy, ry, ay) = fold_row(self.jy, self.ry, self.at.y, rad.y, across.y > 0.5)
+        let (jz, rz, az) = fold_row(self.jz, self.rz, self.at.z, rad.z, across.z > 0.5)
+        MapBox { at: vec3(ax, ay, az), jx, jy, jz, rx, ry, rz, e: self.e }
+    }
+}
+
+/// One axis of `MapBox::folded`: its row, its radii and its centre's image.
+fn fold_row(j: vec3, r: vec3, at: f32, rad: f32, folded: bool) -> (vec3, vec3, f32) {
+    if !folded {
+        (j, r, at)
+    } else if at - rad >= 0.0 {
+        (j, r, abs(at))
+    } else if at + rad <= 0.0 {
+        (-j, r, abs(at))
+    } else {
+        (vec3(0.0), abs(j) + r, abs(at))
+    }
+}
+
+/// The enclosure of a constant `c`.
+pub fn slope_const(c: f32) -> SlopeBox {
+    SlopeBox { c, l: vec3(0.0), r: vec3(0.0), e: 0.0, range: Interval { lo: c, hi: c } }
+}
+
+/// The enclosure of a surface no part of which is asked: `EMPTY`, a constant.
+pub fn slope_empty() -> SlopeBox {
+    slope_const(EMPTY)
+}
+
+/// A ball of a bound `l` on the gradient's length about `d_at`, the distance at `at`: no slopes,
+/// and as error `l` times the half-diagonal of `rad` (own space, `Slope3`).
+pub fn slope_lip(d_at: f32, l: f32, rad: vec3) -> Slope3 {
     let r = l * length(rad)
     let e = r * 1.0e-5 + abs(d_at) * 1.0e-6 + 1.0e-6
     let err = r + e
-    SlopeBox {
+    Slope3 {
         d_at,
         g_mid: vec3(0.0),
         g_rad: vec3(0.0),
@@ -1188,13 +1445,12 @@ pub fn slope_lip(d_at: f32, l: f32, rad: vec3) -> SlopeBox {
     }
 }
 
-/// Builds a `SlopeBox` from `(d_at, g_mid, g_rad, err)` and derives its sound `range` over `rad`.
-pub fn slope_from_g(d_at: f32, g_mid: vec3, g_rad: vec3, err: f32, rad: vec3) -> SlopeBox {
-    let g_max = abs(g_mid) + g_rad
-    let span = dot(g_max, rad) + err
-    let mag = abs(d_at) + span
-    let margin = mag * (10.0 * SLOPE_EPS) + 4.0 * SLOPE_TINY
-    SlopeBox {
+/// A `Slope3` from its plane, radii and error, its range what they allow within `rad`, rounded
+/// outward.
+pub fn slope_from_g(d_at: f32, g_mid: vec3, g_rad: vec3, err: f32, rad: vec3) -> Slope3 {
+    let span = dot(abs(g_mid) + g_rad, rad) + err
+    let margin = (abs(d_at) + span) * (10.0 * SLOPE_EPS) + 4.0 * SLOPE_TINY
+    Slope3 {
         d_at,
         g_mid,
         g_rad,
@@ -1203,23 +1459,44 @@ pub fn slope_from_g(d_at: f32, g_mid: vec3, g_rad: vec3, err: f32, rad: vec3) ->
     }
 }
 
-/// Converts a `SlopeBox` (evaluated at `c_b = 0.5 * over.lo + 0.5 * over.hi`) into a sound `Affine3`
-/// over `over` matching `std::derive::affine_form`'s input box convention.
-pub fn slope_to_affine(sb: SlopeBox, over: Box3) -> Affine3 {
-    let hl = 0.5 * over.lo
-    let hh = 0.5 * over.hi
-    let c_b = hl + hh
-    let h_in = (hh - hl) * (1.0 + 2.0 * SLOPE_EPS)
-    let delta_c = abs(c_b) * (2.0 * SLOPE_EPS) + vec3(2.0 * SLOPE_TINY)
-    let g_max = abs(sb.g_mid) + sb.g_rad
-    let e_base = dot(sb.g_rad, h_in) + sb.err + dot(g_max, delta_c)
-    let mag = abs(sb.d_at) + dot(g_max, h_in) + e_base
-    let margin = mag * (16.0 * SLOPE_EPS) + 8.0 * SLOPE_TINY
-    let af = Affine3 { c: sb.d_at, l: sb.g_mid * h_in, e: e_base + margin }
+/// The most the plane of an enclosure and its width about it come to over the box: what a
+/// rounding margin of a sum of its terms is a few ulps of.
+fn slope_reach(a: SlopeBox) -> f32 {
+    abs(a.c) + sum_abs(a.l) + sum_abs(a.r) + a.e
+}
+
+/// How thick the slab about an enclosure's own plane that holds the function's zeros is, in the
+/// box's coordinates: its width over the length of its slopes (no slopes: no slab).
+fn slope_thick(a: SlopeBox) -> f32 {
+    (sum_abs(a.r) + a.e) / max(length(a.l), SLOPE_TINY)
+}
+
+/// The range (2) of an enclosure gives over the box, rounded outward.
+fn slope_span(a: SlopeBox) -> Interval {
+    let span = sum_abs(a.l) + sum_abs(a.r) + a.e
+    let margin = (abs(a.c) + span) * (10.0 * SLOPE_EPS) + 4.0 * SLOPE_TINY
+    Interval { lo: a.c - (span + margin), hi: a.c + (span + margin) }
+}
+
+/// An enclosure as the affine form the engine's certificates read (`c + dot(l, u) ± e` over `u`
+/// in `[-1, 1]^3`, as `std::derive::affine_form` gives one): the same plane, its radii at the
+/// box's corners as error (none: the same form, bit for bit). Where the enclosure's range shows
+/// the box clear of 0 and the form doesn't, the form is the range (a constant), so nothing the
+/// range proves is lost.
+pub fn slope_to_affine(sb: SlopeBox) -> Affine3 {
+    let rr = sum_abs(sb.r)
+    let e = if rr > 0.0 { (sb.e + rr) * (1.0 + 4.0 * SLOPE_EPS) + SLOPE_TINY } else { sb.e }
+    let af = Affine3 { c: sb.c, l: sb.l, e }
     if (sb.range.lo > 0.0 && af.lo() <= 0.0) || (sb.range.hi < 0.0 && af.hi() >= 0.0) {
         let rmid = 0.5 * (sb.range.lo + sb.range.hi)
         let rhalf = 0.5 * (sb.range.hi - sb.range.lo)
         let rmag = abs(rmid) + rhalf
+        // A range with an end past what a form may hold (a part nowhere near, `EMPTY`) is clear
+        // of 0 all the same: its near end, and nothing wider.
+        if !(rmag <= 1.0e15) {
+            let near = if sb.range.lo > 0.0 { sb.range.lo } else { sb.range.hi }
+            return Affine3 { c: clamp(near, -1.0e12, 1.0e12), l: vec3(0.0), e: 0.0 }
+        }
         return Affine3 {
             c: rmid,
             l: vec3(0.0),
@@ -1229,93 +1506,176 @@ pub fn slope_to_affine(sb: SlopeBox, over: Box3) -> Affine3 {
     af
 }
 
-/// Componentwise hull of two gradient boxes `[a.g_mid ± a.g_rad]` and `[b.g_mid ± b.g_rad]`.
-pub fn slope_hull_g(a: SlopeBox, b: SlopeBox) -> (vec3, vec3) {
-    let lo = min(a.g_mid - a.g_rad, b.g_mid - b.g_rad)
-    let hi = max(a.g_mid + a.g_rad, b.g_mid + b.g_rad)
-    let g_mid = 0.5 * (lo + hi)
-    let g_rad = 0.5 * (hi - lo) + (abs(lo) + abs(hi)) * (4.0 * SLOPE_EPS) + vec3(2.0 * SLOPE_TINY)
-    (g_mid, g_rad)
+/// What `smin(a, b, k)` takes from the mean of `a` and `b`, twice over, as a function of `d = a
+/// - b`: `smin(a, b, k) = (a + b) / 2 - seam(a - b, k) / 2`, with `seam(d, k) = |d| + max(k -
+/// |d|, 0)^2 / 2k`, which is `(d^2 + k^2) / 2k` within `k` of 0 and `|d|` past it (`|d|` for `k
+/// = 0`: `min`). It is convex, and its slope `clamp(d / k, -1, 1)` never past ±1.
+fn seam(d: f32, k: f32) -> f32 {
+    let x = abs(d)
+    if x >= k { x } else { (x * x + k * k) * (0.5 / k) }
 }
 
-/// Sound `SlopeBox` of `min(a(p), b(p))` (prunes to the nearer operand when ranges separate).
+/// `seam(d, k)` over `d` in `[lo, hi]`, between two lines of one slope `t`: `(t, m, q)` with
+/// `seam(d) = t d + s` and `s` within `q` of `m`, each halved twice (`smin` takes half of
+/// `seam`, and `m` is the middle of two intercepts). The seam is convex, so over `[lo, hi]` it
+/// lies under its chord and over any tangent: `t` is the chord's slope (`|t| <= 1`), the
+/// tangent of that slope touches at `d = t k` and is `t d + k (1 - t^2) / 2`, and the chord is
+/// at most `t d + max(seam(lo) - t lo, seam(hi) - t hi)`. Any `t` in `[-1, 1]` is sound (the
+/// intercepts are taken for the `t` used), so its rounding costs tightness alone.
+fn seam_lines(lo: f32, hi: f32, k: f32) -> (f32, f32, f32) {
+    let f_lo = seam(lo, k)
+    let f_hi = seam(hi, k)
+    let t = if hi > lo {
+        clamp((f_hi - f_lo) / (hi - lo), -1.0, 1.0)
+    } else {
+        clamp(lo / max(k, SLOPE_TINY), -1.0, 1.0)
+    }
+    let s_lo = 0.5 * k * (1.0 - t * t)
+    let s_hi = max(f_lo - t * lo, f_hi - t * hi)
+    (t, 0.25 * (s_lo + s_hi), 0.25 * max(s_hi - s_lo, 0.0))
+}
+
+/// The enclosure of `smin(a(q), b(q), k)` (`min` for `k <= 0`) from its operands' enclosures.
+///
+/// An operand surely `k` above the other over the box changes nothing (`smin` is then the other,
+/// bit for bit): by their ranges, or by the range `[lo, hi]` of `d = a - b` that the difference
+/// of their planes gives, which cancels what slope they share. Else `seam` above is between two
+/// lines of slope `t` over `d`'s range (`seam_lines`), `seam(d) = t d + s`, and
+///   `smin = (a + b) / 2 - (t (a - b) + s) / 2 = wa a + wb b - s / 2`,
+/// `wa = (1 - t) / 2` and `wb = (1 + t) / 2`: two weights that are at least 0 and sum to 1 (the
+/// join's partials are such a pair everywhere, and these are the pair at the chord). `s / 2` is
+/// its middle, moved into `c`, give or take a quarter of the gap between the lines, which is
+/// error: 0 where the box is on one side of the seam and at most `(hi - lo) / 8`. Two ways to
+/// carry the operands' own radii and errors, each sound; the one whose slab about its own plane
+/// is the thinner is taken (`slope_thick`), and the range is what both allow:
+///  - weighed as the planes are (`wa a.e + wb b.e`), `d`'s range being that of the whole
+///    enclosures (planes, radii and errors): `wa a + wb b` holds for the functions themselves;
+///  - the larger of the two (`max(a.e, b.e)`), `d`'s range being that of the planes alone: `smin`
+///    never falls as an operand rises and changes by at most the larger change of the two, so
+///    `smin(a, b)` is within the larger of the operands' widths of `smin` of their planes.
+/// The first is narrower where one operand is much the wider (a ball beside a plane), the second
+/// where both are as wide. The weights' rounding and the sums' are in the margin.
+pub fn slope_smin(a: SlopeBox, b: SlopeBox, k: f32) -> SlopeBox {
+    let kk = max(k, 0.0)
+    if apart(b.range.lo, a.range.hi, kk) {
+        return a
+    }
+    if apart(a.range.lo, b.range.hi, kk) {
+        return b
+    }
+    let reach = slope_reach(a) + slope_reach(b)
+    let d0 = a.c - b.c
+    let w0 = sum_abs(a.l - b.l)
+    let w = w0 + sum_abs(a.r) + sum_abs(b.r) + a.e + b.e
+    let dm = (reach + w) * (8.0 * SLOPE_EPS) + 4.0 * SLOPE_TINY
+    let rm = (abs(a.range.lo) + abs(a.range.hi) + abs(b.range.lo) + abs(b.range.hi)) *
+        (2.0 * SLOPE_EPS) +
+        SLOPE_TINY
+    let lo = max(d0 - (w + dm), (a.range.lo - b.range.hi) - rm)
+    let hi = min(d0 + (w + dm), (a.range.hi - b.range.lo) + rm)
+    if apart(lo, 0.0, kk) {
+        return b
+    }
+    if apart(0.0, hi, kk) {
+        return a
+    }
+    let range = smin_range(a.range, b.range, kk)
+    let margin = (reach + abs(lo) + abs(hi) + kk) * (16.0 * SLOPE_EPS) + 8.0 * SLOPE_TINY
+    let lr = (abs(a.l) + abs(b.l) + a.r + b.r) * (4.0 * SLOPE_EPS) + vec3(2.0 * SLOPE_TINY)
+    // Weighed: the whole enclosures' difference.
+    let (t, m, q) = seam_lines(lo, hi, kk)
+    let (wa, wb) = (0.5 * (1.0 - t), 0.5 * (1.0 + t))
+    let weighed = SlopeBox {
+        c: a.c * wa + b.c * wb - m,
+        l: a.l * wa + b.l * wb,
+        r: a.r * wa + b.r * wb + lr,
+        e: a.e * wa + b.e * wb + q + margin,
+        range,
+    }
+    // The larger: the planes' difference.
+    let (t0, m0, q0) = seam_lines(d0 - (w0 + dm), d0 + (w0 + dm), kk)
+    let (ua, ub) = (0.5 * (1.0 - t0), 0.5 * (1.0 + t0))
+    let larger = SlopeBox {
+        c: a.c * ua + b.c * ub - m0,
+        l: a.l * ua + b.l * ub,
+        r: max(a.r, b.r) + lr,
+        e: max(a.e, b.e) + q0 + margin,
+        range,
+    }
+    // The narrower about its own plane: its width over its slopes' length is how thick a slab
+    // about that plane holds the surface, in the box's widths. The range keeps what either shows.
+    let out = if slope_thick(larger) < slope_thick(weighed) { larger } else { weighed }
+    SlopeBox { range: both(range, both(slope_span(larger), slope_span(weighed))), ..out }
+}
+
+/// The enclosure of `smax(a(q), b(q), k)` (`max` for `k <= 0`): `-smin(-a, -b, k)`, exactly.
+pub fn slope_smax(a: SlopeBox, b: SlopeBox, k: f32) -> SlopeBox {
+    slope_neg(slope_smin(slope_neg(a), slope_neg(b), k))
+}
+
+/// The enclosure of `min(a(q), b(q))` (`slope_smin` with no seam).
 pub fn slope_min(a: SlopeBox, b: SlopeBox) -> SlopeBox {
-    if a.range.hi <= b.range.lo {
-        return a
-    }
-    if b.range.hi <= a.range.lo {
-        return b
-    }
-    let (g_mid, g_rad) = slope_hull_g(a, b)
-    let err = max(a.err, b.err) + (abs(a.d_at) + abs(b.d_at)) * (4.0 * SLOPE_EPS) + 2.0 * SLOPE_TINY
-    SlopeBox {
-        d_at: min(a.d_at, b.d_at),
-        g_mid,
-        g_rad,
-        err,
-        range: Interval { lo: min(a.range.lo, b.range.lo), hi: min(a.range.hi, b.range.hi) },
-    }
+    slope_smin(a, b, 0.0)
 }
 
-/// Sound `SlopeBox` of `max(a(p), b(p))` (prunes to the farther operand when ranges separate).
+/// The enclosure of `max(a(q), b(q))`.
 pub fn slope_max(a: SlopeBox, b: SlopeBox) -> SlopeBox {
-    if a.range.lo >= b.range.hi {
-        return a
-    }
-    if b.range.lo >= a.range.hi {
-        return b
-    }
-    let (g_mid, g_rad) = slope_hull_g(a, b)
-    let err = max(a.err, b.err) + (abs(a.d_at) + abs(b.d_at)) * (4.0 * SLOPE_EPS) + 2.0 * SLOPE_TINY
-    SlopeBox {
-        d_at: max(a.d_at, b.d_at),
-        g_mid,
-        g_rad,
-        err,
-        range: Interval { lo: max(a.range.lo, b.range.lo), hi: max(a.range.hi, b.range.hi) },
-    }
+    slope_smax(a, b, 0.0)
 }
 
-/// Sound `SlopeBox` of `-a(p)`.
+/// The enclosure of `-a(q)`.
 pub fn slope_neg(a: SlopeBox) -> SlopeBox {
+    SlopeBox { c: -a.c, l: -a.l, r: a.r, e: a.e, range: Interval { lo: -a.range.hi, hi: -a.range.lo } }
+}
+
+/// The enclosure of `s * a(q)` for a constant `s`.
+pub fn slope_scale(a: SlopeBox, s: f32) -> SlopeBox {
+    let m = abs(s)
+    let rl = a.range.lo * s
+    let rh = a.range.hi * s
+    let size = max(abs(rl), abs(rh))
+    let re = size * (4.0 * SLOPE_EPS) + 2.0 * SLOPE_TINY
     SlopeBox {
-        d_at: -a.d_at,
-        g_mid: -a.g_mid,
-        g_rad: a.g_rad,
-        err: a.err,
-        range: Interval { lo: -a.range.hi, hi: -a.range.lo },
+        c: a.c * s,
+        l: a.l * s,
+        r: a.r * m + (abs(a.l) + a.r) * (m * 4.0 * SLOPE_EPS) + vec3(2.0 * SLOPE_TINY),
+        // The products' rounding, and that of the product the function computes at each point.
+        e: a.e * m + (abs(a.c) * m + a.e * m + size) * (4.0 * SLOPE_EPS) + 2.0 * SLOPE_TINY,
+        range: Interval { lo: min(rl, rh) - re, hi: max(rl, rh) + re },
     }
 }
 
-/// Sound `SlopeBox` of `s * a(p)` for non-negative constant `s >= 0`.
-pub fn slope_scale(a: SlopeBox, s: f32) -> SlopeBox {
-    let k = max(s, 0.0)
-    let d_at = a.d_at * k
-    let g_mid = a.g_mid * k
-    let g_rad = a.g_rad * k + (abs(g_mid) + a.g_rad * k) * (4.0 * SLOPE_EPS) + vec3(2.0 * SLOPE_TINY)
-    let err = a.err * k + (abs(d_at) + a.err * k) * (4.0 * SLOPE_EPS) + 2.0 * SLOPE_TINY
-    let rl = a.range.lo * k
-    let rh = a.range.hi * k
-    let re = (abs(rl) + abs(rh)) * (4.0 * SLOPE_EPS) + 2.0 * SLOPE_TINY
-    SlopeBox { d_at, g_mid, g_rad, err, range: Interval { lo: rl - re, hi: rh + re } }
-}
-
-/// Sound `SlopeBox` of `a(p) + by`.
+/// The enclosure of `a(q) + by`.
 pub fn slope_shift(a: SlopeBox, by: f32) -> SlopeBox {
-    let e = (abs(a.d_at) + abs(by)) * (2.0 * SLOPE_EPS) + SLOPE_TINY
     let rl = a.range.lo + by
     let rh = a.range.hi + by
     let re = (abs(a.range.lo) + abs(a.range.hi) + abs(by)) * (2.0 * SLOPE_EPS) + SLOPE_TINY
+    // The rounding of `c`'s sum, and of the sum the function itself computes at each point
+    // (its operand's size there is within its range).
+    let size = abs(a.c) + abs(by) + max(abs(a.range.lo), abs(a.range.hi))
     SlopeBox {
-        d_at: a.d_at + by,
-        g_mid: a.g_mid,
-        g_rad: a.g_rad,
-        err: a.err + e,
+        c: a.c + by,
+        e: a.e + size * (2.0 * SLOPE_EPS) + 2.0 * SLOPE_TINY,
         range: Interval { lo: rl - re, hi: rh + re },
+        ..a,
     }
 }
 
-/// Sound `SlopeBox` of `abs(a(p))`.
+/// The enclosure of `a(q) + b(q)`: the planes' sum, the radii's and the errors'.
+pub fn slope_add(a: SlopeBox, b: SlopeBox) -> SlopeBox {
+    let reach = slope_reach(a) + slope_reach(b)
+    let out = SlopeBox {
+        c: a.c + b.c,
+        l: a.l + b.l,
+        r: a.r + b.r + (abs(a.l) + abs(b.l) + a.r + b.r) * (4.0 * SLOPE_EPS) + vec3(2.0 * SLOPE_TINY),
+        e: a.e + b.e + reach * (8.0 * SLOPE_EPS) + 4.0 * SLOPE_TINY,
+        range: Interval { lo: 0.0, hi: 0.0 },
+    }
+    let sum = outward(Interval { lo: a.range.lo + b.range.lo, hi: a.range.hi + b.range.hi })
+    SlopeBox { range: both(sum, slope_span(out)), ..out }
+}
+
+/// The enclosure of `abs(a(q))`: `max(a, -a)`.
 pub fn slope_abs(a: SlopeBox) -> SlopeBox {
     if a.range.lo >= 0.0 {
         return a
@@ -1326,22 +1686,86 @@ pub fn slope_abs(a: SlopeBox) -> SlopeBox {
     slope_max(a, slope_neg(a))
 }
 
-/// Sound `SlopeBox` of `0.5 * (a(p) - b(p))`.
+/// The enclosure of `0.5 * (a(q) - b(q))`.
 pub fn slope_sub_half(a: SlopeBox, b: SlopeBox) -> SlopeBox {
-    let d_at = 0.5 * (a.d_at - b.d_at)
-    let g_mid = 0.5 * (a.g_mid - b.g_mid)
-    let g_rad = 0.5 * (a.g_rad + b.g_rad) +
-        (abs(a.g_mid) + abs(b.g_mid) + a.g_rad + b.g_rad) * (4.0 * SLOPE_EPS) +
-        vec3(2.0 * SLOPE_TINY)
-    let err = 0.5 * (a.err + b.err) +
-        (abs(a.d_at) + abs(b.d_at) + a.err + b.err) * (4.0 * SLOPE_EPS) +
-        2.0 * SLOPE_TINY
+    let size = max(abs(a.range.lo), abs(a.range.hi)) + max(abs(b.range.lo), abs(b.range.hi))
     let lo = 0.5 * (a.range.lo - b.range.hi)
     let hi = 0.5 * (a.range.hi - b.range.lo)
     let re = (abs(a.range.lo) + abs(a.range.hi) + abs(b.range.lo) + abs(b.range.hi)) *
         (4.0 * SLOPE_EPS) +
         2.0 * SLOPE_TINY
-    SlopeBox { d_at, g_mid, g_rad, err, range: Interval { lo: lo - re, hi: hi + re } }
+    SlopeBox {
+        c: 0.5 * (a.c - b.c),
+        l: 0.5 * (a.l - b.l),
+        r: 0.5 * (a.r + b.r) + (abs(a.l) + abs(b.l) + a.r + b.r) * (4.0 * SLOPE_EPS) + vec3(2.0 * SLOPE_TINY),
+        e: 0.5 * (a.e + b.e) +
+            (abs(a.c) + abs(b.c) + a.e + b.e + size) * (4.0 * SLOPE_EPS) +
+            2.0 * SLOPE_TINY,
+        range: Interval { lo: lo - re, hi: hi + re },
+    }
+}
+
+/// `slope_box` of `a` and `b` joined by `smin` of width `k` (`min` for 0) as `pair_masked` joins
+/// their distances: an operand none of whose parts is live isn't asked, and the other's is the
+/// whole. Each operand written once.
+pub fn pair_slope<A: Surface, B: Surface, F: Copy + fn(vec3) -> vec3>(
+    a: A,
+    b: B,
+    over: Box3,
+    at: F,
+    to: MapBox,
+    live: Live,
+    first: u32,
+    k: f32,
+) -> SlopeBox {
+    let n = a.parts()
+    let la = live.any(first, n)
+    let lb = live.any(first + n, b.parts())
+    var sa = slope_empty()
+    if la {
+        sa = a.slope_box(over, at, to, live, first)
+    }
+    var sb = slope_empty()
+    if lb {
+        sb = b.slope_box(over, at, to, live, first + n)
+    }
+    if la && lb {
+        slope_smin(sa, sb, k)
+    } else if la {
+        sa
+    } else {
+        sb
+    }
+}
+
+/// `slope_box` of `parts` folded by `smin` of width `k` (`min` for 0) over the parts with a live
+/// part, in order, as `array_masked` folds their distances.
+fn array_slope<S: Surface, const N: u32, F: Copy + fn(vec3) -> vec3>(
+    parts: [S; N],
+    over: Box3,
+    at: F,
+    to: MapBox,
+    live: Live,
+    first: u32,
+    k: f32,
+) -> SlopeBox {
+    var has = false
+    var acc = slope_empty()
+    var f = first
+    for i in 0..N {
+        let n = parts[i].parts()
+        if live.any(f, n) {
+            let v = parts[i].slope_box(over, at, to, live, f)
+            if has {
+                acc = slope_smin(acc, v, k)
+            } else {
+                acc = v
+                has = true
+            }
+        }
+        f += n
+    }
+    acc
 }
 
 /// Whether `a - b >= k` for every computed `a >= lo` and `b <= hi`, as the target subtracts
@@ -2455,6 +2879,12 @@ fn array_part_name<S: Surface, const N: u32>(parts: [S; N], i: u32) -> PartName 
     if k < N { parts[k].part_name(j) } else { unnamed() }
 }
 
+/// Whether each of `parts` is one part and all of them, numbered from `first`, are in one word
+/// of a `Live`: then part `i`'s bit is `leaf_bits`' bit `i`.
+fn leaves_in_a_word<S: Surface, const N: u32>(parts: [S; N], first: u32) -> bool {
+    array_parts(parts) == N && (first & 31) + N <= 32 && first < 128
+}
+
 /// `masked` of `parts` folded by `join` over the parts with a live part, seeded from the first
 /// live part (never `EMPTY`, which exceeds affine arithmetic's finite cap); returns `EMPTY` only
 /// when no part is live. Where each part is one part and all are in one word of the mask, walks
@@ -2469,7 +2899,7 @@ fn array_masked<S: Surface, const N: u32, J: Copy + fn(f32, f32) -> f32>(
 ) -> f32 {
     var has = false
     var d = 0.0
-    if array_parts(parts) == N && (first & 31) + N <= 32 && first < 128 {
+    if leaves_in_a_word(parts, first) {
         var bits = leaf_bits(live, first, N)
         for _ in 0..N {
             if bits == 0 {
@@ -2511,25 +2941,16 @@ pub struct Union<A, B>: Copy + GpuData + Eq + StateHash {
 }
 
 impl<A: Surface, B: Surface> Surface for Union<A, B> {
-    const HAS_SLOPE_BOX: bool = A::HAS_SLOPE_BOX && B::HAS_SLOPE_BOX
-
-    fn slope_box(self, over: Box3, at: vec3, rad: vec3, live: Live, first: u32) -> SlopeBox {
-        let na = self.a.parts()
-        let nb = self.b.parts()
-        let la = live.any(first, na)
-        let lb = live.any(first + na, nb)
-        var sa = slope_lip(d_at: 1.0e30, l: 0.0, rad: vec3(0.0))
-        if la {
-            sa = self.a.slope_box(over, at, rad, live, first)
-        }
-        if !lb {
-            return sa
-        }
-        let sb = self.b.slope_box(over, at, rad, live, first + na)
-        if !la {
-            return sb
-        }
-        slope_min(sa, sb)
+    /// Its operands' enclosures, joined by `min` (`slope_smin`).
+    fn slope_box<F: Copy + fn(vec3) -> vec3>(
+        self,
+        over: Box3,
+        at: F,
+        to: MapBox,
+        live: Live,
+        first: u32,
+    ) -> SlopeBox {
+        pair_slope(self.a, self.b, over, at, to, live, first, 0.0)
     }
 
     fn part_state(self, i: u32, h: mut Hasher) -> bool {
@@ -2630,6 +3051,19 @@ pub struct SmoothUnion<A, B>: Copy + GpuData + Eq + StateHash {
 }
 
 impl<A: Surface, B: Surface> Surface for SmoothUnion<A, B> {
+    /// Its operands' enclosures, joined by `smin` (`slope_smin`): their planes weighed as the
+    /// seam weighs its operands across the box, lowered by the seam's depth there.
+    fn slope_box<F: Copy + fn(vec3) -> vec3>(
+        self,
+        over: Box3,
+        at: F,
+        to: MapBox,
+        live: Live,
+        first: u32,
+    ) -> SlopeBox {
+        pair_slope(self.a, self.b, over, at, to, live, first, self.k)
+    }
+
     fn part_state(self, i: u32, h: mut Hasher) -> bool {
         h.write_u32(canonical_bits(self.k))
         pair_part_state(self.a, self.b, i, mut h)
@@ -2747,6 +3181,18 @@ pub struct UnionAll<S, const N: u32>: Copy + GpuData + Eq + StateHash {
 }
 
 impl<S: Surface, const N: u32> Surface for UnionAll<S, N> {
+    /// Its live parts' enclosures, folded by `min` in order (`slope_smin`).
+    fn slope_box<F: Copy + fn(vec3) -> vec3>(
+        self,
+        over: Box3,
+        at: F,
+        to: MapBox,
+        live: Live,
+        first: u32,
+    ) -> SlopeBox {
+        array_slope(self.parts, over, at, to, live, first, 0.0)
+    }
+
     fn part_state(self, i: u32, h: mut Hasher) -> bool {
         
         var first: u32 = 0
@@ -2834,6 +3280,23 @@ impl<S: Surface, const N: u32> Surface for UnionAll<S, N> {
             }
         }
         var range = Interval { lo: EMPTY, hi: EMPTY }
+        if leaves_in_a_word(self.parts, first) {
+            // Each part one part, all in one word of the mask: a bit a part, cleared by a shift
+            // of the loop's counter (a mask of spans a pass is work every invocation would do
+            // alike, which a shader can't hold: §18.13).
+            var bits = leaf_bits(out, first, N)
+            for i in 0..N {
+                if i != best && apart(ranges[i].lo, ranges[best].hi, 0.0) {
+                    bits = bits & (4294967295 ^ (u32(1) << i))
+                } else {
+                    range = Interval {
+                        lo: min(range.lo, ranges[i].lo),
+                        hi: min(range.hi, ranges[i].hi),
+                    }
+                }
+            }
+            return Pruned { live: out.with_leaf_bits(first, N, bits), range }
+        }
         for i in 0..N {
             if i != best && apart(ranges[i].lo, ranges[best].hi, 0.0) {
                 out = out.without(firsts[i], self.parts[i].parts())
@@ -2926,6 +3389,20 @@ pub struct SmoothUnionAll<S, const N: u32>: Copy + GpuData + Eq + StateHash {
 }
 
 impl<S: Surface, const N: u32> Surface for SmoothUnionAll<S, N> {
+    /// Its live parts' enclosures, folded by `smin` in the order its distance folds them
+    /// (`slope_smin`): each fold's error is its own seam's, so a fold of `N` parts is lowered at
+    /// most as `fold_lowering` says, never `N - 1` quarters of `k`.
+    fn slope_box<F: Copy + fn(vec3) -> vec3>(
+        self,
+        over: Box3,
+        at: F,
+        to: MapBox,
+        live: Live,
+        first: u32,
+    ) -> SlopeBox {
+        array_slope(self.parts, over, at, to, live, first, self.k)
+    }
+
     fn part_state(self, i: u32, h: mut Hasher) -> bool {
         h.write_u32(canonical_bits(self.k))
         var first: u32 = 0
@@ -3025,6 +3502,23 @@ impl<S: Surface, const N: u32> Surface for SmoothUnionAll<S, N> {
             f += self.parts[i].parts()
         }
         var acc = ranges[0]
+        if leaves_in_a_word(self.parts, first) {
+            // As `UnionAll::pruned`'s: a bit a part; a part that starts the fold afresh clears
+            // every bit below its own.
+            var bits = leaf_bits(out, first, N)
+            for j in 1..N {
+                let r = ranges[j]
+                if apart(r.lo, acc.hi, k) {
+                    bits = bits & (4294967295 ^ (u32(1) << j))
+                } else if apart(acc.lo, r.hi, k) {
+                    bits = bits & (4294967295 ^ ((u32(1) << j) - 1))
+                    acc = r
+                } else {
+                    acc = smin_range(acc, r, k)
+                }
+            }
+            return Pruned { live: out.with_leaf_bits(first, N, bits), range: acc }
+        }
         for j in 1..N {
             let r = ranges[j]
             if apart(r.lo, acc.hi, k) {
@@ -3131,6 +3625,23 @@ pub struct Intersect<A, B>: Copy + GpuData + Eq + StateHash {
 }
 
 impl<A: Surface, B: Surface> Surface for Intersect<A, B> {
+    /// Its operands' enclosures, joined by `max` (`slope_smax`). It asks all of both (its
+    /// `masked` is its distance), so each operand's is of all its parts.
+    fn slope_box<F: Copy + fn(vec3) -> vec3>(
+        self,
+        over: Box3,
+        at: F,
+        to: MapBox,
+        live: Live,
+        first: u32,
+    ) -> SlopeBox {
+        slope_smax(
+            self.a.slope_box(over, at, to, ALL_LIVE, 0),
+            self.b.slope_box(over, at, to, ALL_LIVE, 0),
+            0.0,
+        )
+    }
+
     fn part_state(self, i: u32, h: mut Hasher) -> bool {
         
         pair_part_state(self.a, self.b, i, mut h)
@@ -3238,16 +3749,13 @@ pub trait PointMap: Copy + GpuData {
         None
     }
 
-    /// Maps `(over, at, rad)` into this map's local space for `Surface::slope_box`.
-    fn slope_in(self, over: Box3, at: vec3, rad: vec3) -> (Box3, vec3, vec3) {
-        let b = self.box_in(over)
-        let la = self.local(at)
-        let lr = max(abs(b.lo - la), abs(b.hi - la))
-        (b, la, lr)
-    }
+    /// Where the maps above take a box, to first order (`MapBox`), with this map after them:
+    /// what `Surface::slope_box` hands the surface. Every map states it.
+    fn through(self, to: MapBox) -> MapBox
 
-    /// Maps an inner surface's `SlopeBox` back into world space.
-    fn slope_out(self, sb: SlopeBox, at: vec3, rad: vec3) -> SlopeBox {
+    /// An enclosure of the surface's distance, as one of `distance_out` of it. A map whose
+    /// `distance_out` is not the distance itself states it.
+    fn slope_out(self, sb: SlopeBox) -> SlopeBox {
         sb
     }
 }
@@ -3261,12 +3769,21 @@ pub struct Warp<S, M>: Copy + GpuData + Eq + StateHash {
 
 impl<S: Surface, M: PointMap> Surface for Warp<S, M> {
     const MAY_SKIN: bool = S::MAY_SKIN
-    const HAS_SLOPE_BOX: bool = S::HAS_SLOPE_BOX
 
-    fn slope_box(self, over: Box3, at: vec3, rad: vec3, live: Live, first: u32) -> SlopeBox {
-        let (lo_box, la, lr) = self.map.slope_in(over, at, rad)
-        let sb = self.inner.slope_box(lo_box, la, lr, live, first)
-        self.map.slope_out(sb, at, rad)
+    /// Its surface's enclosure through its map too (`PointMap::through`), as a distance in
+    /// this space (`PointMap::slope_out`).
+    fn slope_box<F: Copy + fn(vec3) -> vec3>(
+        self,
+        over: Box3,
+        at: F,
+        to: MapBox,
+        live: Live,
+        first: u32,
+    ) -> SlopeBox {
+        let map = self.map
+        map.slope_out(
+            self.inner.slope_box(over, |q: vec3| map.local(at(q)), map.through(to), live, first),
+        )
     }
 
     fn part_state(self, i: u32, h: mut Hasher) -> bool {
@@ -3455,17 +3972,8 @@ impl PointMap for Shift {
         Some(Rigid::translation(self.by))
     }
 
-    fn slope_in(self, over: Box3, at: vec3, rad: vec3) -> (Box3, vec3, vec3) {
-        let la = at - self.by
-        let e = (abs(at) + abs(self.by) + rad) * (4.0 * SLOPE_EPS) + vec3(2.0 * SLOPE_TINY)
-        let lr = rad + e
-        (Box3 { lo: la - lr, hi: la + lr }, la, lr)
-    }
-
-    fn slope_out(self, sb: SlopeBox, at: vec3, rad: vec3) -> SlopeBox {
-        let e = (abs(at) + abs(self.by) + rad) * (4.0 * SLOPE_EPS) + vec3(2.0 * SLOPE_TINY)
-        let g_abs = abs(sb.g_mid) + sb.g_rad
-        SlopeBox { err: sb.err + dot(g_abs, e), ..sb }
+    fn through(self, to: MapBox) -> MapBox {
+        to.moved(self.by, self.local(to.at))
     }
 }
 
@@ -3512,31 +4020,15 @@ impl PointMap for Turn {
         Some(Rigid::rotation(self.to_local))
     }
 
-    fn slope_in(self, over: Box3, at: vec3, rad: vec3) -> (Box3, vec3, vec3) {
+    /// `local`'s rows: its columns' components.
+    fn through(self, to: MapBox) -> MapBox {
         let m = self.to_local
-        let la = self.local(at)
-        let w = abs(m[0]) * rad.x + abs(m[1]) * rad.y + abs(m[2]) * rad.z
-        let size = abs(m[0]) * (abs(at.x) + rad.x) +
-            abs(m[1]) * (abs(at.y) + rad.y) +
-            abs(m[2]) * (abs(at.z) + rad.z)
-        let e = size * 2.0e-6 + vec3(1.0e-30)
-        let lr = w + e
-        (Box3 { lo: la - lr, hi: la + lr }, la, lr)
-    }
-
-    fn slope_out(self, sb: SlopeBox, at: vec3, rad: vec3) -> SlopeBox {
-        let m = self.to_local
-        let gm = vec3(dot(m[0], sb.g_mid), dot(m[1], sb.g_mid), dot(m[2], sb.g_mid))
-        let g_abs = abs(sb.g_mid) + sb.g_rad
-        let gr_base = vec3(dot(abs(m[0]), sb.g_rad), dot(abs(m[1]), sb.g_rad), dot(abs(m[2]), sb.g_rad))
-        let gr_rnd = vec3(dot(abs(m[0]), g_abs), dot(abs(m[1]), g_abs), dot(abs(m[2]), g_abs)) *
-            (8.0 * SLOPE_EPS) +
-            vec3(4.0 * SLOPE_TINY)
-        let size = abs(m[0]) * (abs(at.x) + rad.x) +
-            abs(m[1]) * (abs(at.y) + rad.y) +
-            abs(m[2]) * (abs(at.z) + rad.z)
-        let err = sb.err + dot(g_abs, size * 2.0e-6 + vec3(1.0e-30))
-        SlopeBox { d_at: sb.d_at, g_mid: gm, g_rad: gr_base + gr_rnd, err, range: sb.range }
+        to.turned(
+            vec3(m[0].x, m[1].x, m[2].x),
+            vec3(m[0].y, m[1].y, m[2].y),
+            vec3(m[0].z, m[1].z, m[2].z),
+            self.local(to.at),
+        )
     }
 }
 
@@ -3589,33 +4081,12 @@ impl PointMap for Size {
         }
     }
 
-    fn slope_in(self, over: Box3, at: vec3, rad: vec3) -> (Box3, vec3, vec3) {
-        let s = abs(self.by)
-        let la = at / self.by
-        let e = (abs(la) + rad / s) * (4.0 * SLOPE_EPS) + vec3(2.0 * SLOPE_TINY)
-        let lr = rad / s + e
-        (Box3 { lo: la - lr, hi: la + lr }, la, lr)
+    fn through(self, to: MapBox) -> MapBox {
+        to.scaled(self.by, self.local(to.at))
     }
 
-    fn slope_out(self, sb: SlopeBox, at: vec3, rad: vec3) -> SlopeBox {
-        let s = abs(self.by)
-        let sg = if self.by >= 0.0 { 1.0 } else { -1.0 }
-        let g_abs = abs(sb.g_mid) + sb.g_rad
-        let e = (abs(at / self.by) + rad / s) * (4.0 * SLOPE_EPS) + vec3(2.0 * SLOPE_TINY)
-        let err = sb.err * s +
-            dot(g_abs, e) * s +
-            (abs(sb.d_at) + sb.err) * s * (4.0 * SLOPE_EPS) +
-            2.0 * SLOPE_TINY
-        let rl = sb.range.lo * s
-        let rh = sb.range.hi * s
-        let re = (abs(rl) + abs(rh)) * (4.0 * SLOPE_EPS) + 2.0 * SLOPE_TINY
-        SlopeBox {
-            d_at: sb.d_at * s,
-            g_mid: sb.g_mid * sg,
-            g_rad: sb.g_rad + g_abs * (4.0 * SLOPE_EPS) + vec3(2.0 * SLOPE_TINY),
-            err,
-            range: Interval { lo: rl - re, hi: rh + re },
-        }
+    fn slope_out(self, sb: SlopeBox) -> SlopeBox {
+        slope_scale(sb, abs(self.by))
     }
 }
 
@@ -3650,6 +4121,27 @@ impl<S: Surface, N: Noise> Surface for Displace<S, N> {
 
     fn masked(self, p: vec3, live: Live, first: u32) -> f32 {
         self.inner.masked(p, live, first) + self.amp * self.noise.value(p)
+    }
+
+    /// Its surface's enclosure plus its displacement's: the compiler's form of `amp` times the
+    /// noise over the box (`slope_of_form`), which keeps the noise's slopes where its range and
+    /// its steepness alone would be a ball about its value (no tighter than its interval, which
+    /// the form's range is held within).
+    fn slope_box<F: Copy + fn(vec3) -> vec3>(
+        self,
+        over: Box3,
+        at: F,
+        to: MapBox,
+        live: Live,
+        first: u32,
+    ) -> SlopeBox {
+        let s = self.inner.slope_box(over, at, to, live, first)
+        let (noise, amp) = (self.noise, self.amp)
+        let n = slope_of_form(
+            affine_form(|q: vec3| amp * noise.value(at(q)), over),
+            interval(|q: vec3| amp * noise.value(at(q)), over),
+        )
+        slope_add(s, n)
     }
 
     /// The inner surface's (a displacement moves every operand of a union inside it alike),
@@ -3750,6 +4242,23 @@ pub struct SmoothSubtract<A, B>: Copy + GpuData + Eq + StateHash {
 }
 
 impl<A: Surface, B: Surface> Surface for SmoothSubtract<A, B> {
+    /// `a`'s enclosure joined by `smax` with `b`'s negated (`slope_smax`, which is `slope_smin`
+    /// of the negated operands, negated). It asks all of both.
+    fn slope_box<F: Copy + fn(vec3) -> vec3>(
+        self,
+        over: Box3,
+        at: F,
+        to: MapBox,
+        live: Live,
+        first: u32,
+    ) -> SlopeBox {
+        slope_smax(
+            self.a.slope_box(over, at, to, ALL_LIVE, 0),
+            slope_neg(self.b.slope_box(over, at, to, ALL_LIVE, 0)),
+            self.k,
+        )
+    }
+
     fn part_state(self, i: u32, h: mut Hasher) -> bool {
         h.write_u32(canonical_bits(self.k))
         pair_part_state(self.a, self.b, i, mut h)
@@ -3826,6 +4335,22 @@ pub struct SmoothIntersect<A, B>: Copy + GpuData + Eq + StateHash {
 }
 
 impl<A: Surface, B: Surface> Surface for SmoothIntersect<A, B> {
+    /// Its operands' enclosures, joined by `smax` (`slope_smax`). It asks all of both.
+    fn slope_box<F: Copy + fn(vec3) -> vec3>(
+        self,
+        over: Box3,
+        at: F,
+        to: MapBox,
+        live: Live,
+        first: u32,
+    ) -> SlopeBox {
+        slope_smax(
+            self.a.slope_box(over, at, to, ALL_LIVE, 0),
+            self.b.slope_box(over, at, to, ALL_LIVE, 0),
+            self.k,
+        )
+    }
+
     fn part_state(self, i: u32, h: mut Hasher) -> bool {
         h.write_u32(canonical_bits(self.k))
         pair_part_state(self.a, self.b, i, mut h)
@@ -3908,6 +4433,25 @@ fn mirrored_centre(c: vec3) -> vec3 {
 }
 
 impl<S: Surface> Surface for Mirror<S> {
+    /// Its surface's enclosure through the fold into x >= 0 too (`MapBox::folded`). It asks all
+    /// of its surface.
+    fn slope_box<F: Copy + fn(vec3) -> vec3>(
+        self,
+        over: Box3,
+        at: F,
+        to: MapBox,
+        live: Live,
+        first: u32,
+    ) -> SlopeBox {
+        self.inner.slope_box(
+            over,
+            |q: vec3| mirrored(at(q)),
+            to.folded(vec3(1.0, 0.0, 0.0)),
+            ALL_LIVE,
+            0,
+        )
+    }
+
     fn part_state(self, i: u32, h: mut Hasher) -> bool {
         self.inner.part_state(i, mut h)
     }
@@ -3995,10 +4539,16 @@ pub struct Named<S>: Copy + GpuData + Eq + StateHash {
 }
 
 impl<S: Surface> Surface for Named<S> {
-    const HAS_SLOPE_BOX: bool = S::HAS_SLOPE_BOX
-
-    fn slope_box(self, over: Box3, at: vec3, rad: vec3, live: Live, first: u32) -> SlopeBox {
-        self.inner.slope_box(over, at, rad, live, first)
+    /// Its surface's. It is one part and asks all of its surface.
+    fn slope_box<F: Copy + fn(vec3) -> vec3>(
+        self,
+        over: Box3,
+        at: F,
+        to: MapBox,
+        live: Live,
+        first: u32,
+    ) -> SlopeBox {
+        self.inner.slope_box(over, at, to, ALL_LIVE, 0)
     }
 
     fn part_state(self, i: u32, h: mut Hasher) -> bool {
@@ -4307,6 +4857,21 @@ impl<S: Surface> Surface for ToBound<S> {
 
     fn masked(self, p: vec3, live: Live, first: u32) -> f32 {
         clamp(self.inner.masked(p, live, first), -self.near, self.near) * self.scale
+    }
+
+    /// Its surface's enclosure held within ±`near` (a `min` and a `max` with constants,
+    /// `slope_smin`), times its scale.
+    fn slope_box<F: Copy + fn(vec3) -> vec3>(
+        self,
+        over: Box3,
+        at: F,
+        to: MapBox,
+        live: Live,
+        first: u32,
+    ) -> SlopeBox {
+        let s = self.inner.slope_box(over, at, to, live, first)
+        let held = slope_max(slope_min(s, slope_const(self.near)), slope_const(-self.near))
+        slope_scale(held, self.scale)
     }
 
     fn pruned<F: Copy + fn(vec3) -> vec3>(
@@ -4763,10 +5328,16 @@ pub struct With<S, C>: Copy + GpuData + Eq + StateHash {
 
 impl<S: Surface, C: Copy + GpuData> Surface for With<S, C> {
     const MAY_SKIN: bool = S::MAY_SKIN
-    const HAS_SLOPE_BOX: bool = S::HAS_SLOPE_BOX
 
-    fn slope_box(self, over: Box3, at: vec3, rad: vec3, live: Live, first: u32) -> SlopeBox {
-        self.inner.slope_box(over, at, rad, live, first)
+    fn slope_box<F: Copy + fn(vec3) -> vec3>(
+        self,
+        over: Box3,
+        at: F,
+        to: MapBox,
+        live: Live,
+        first: u32,
+    ) -> SlopeBox {
+        self.inner.slope_box(over, at, to, live, first)
     }
 
     /// The material isn't hashed: where only it changes, every part's state is the same and
@@ -4916,10 +5487,16 @@ pub struct WithAt<S, F>: Copy + GpuData + Eq + StateHash {
 
 impl<S: Surface, F: Copy + GpuData> Surface for WithAt<S, F> {
     const MAY_SKIN: bool = S::MAY_SKIN
-    const HAS_SLOPE_BOX: bool = S::HAS_SLOPE_BOX
 
-    fn slope_box(self, over: Box3, at: vec3, rad: vec3, live: Live, first: u32) -> SlopeBox {
-        self.inner.slope_box(over, at, rad, live, first)
+    fn slope_box<G: Copy + fn(vec3) -> vec3>(
+        self,
+        over: Box3,
+        at: G,
+        to: MapBox,
+        live: Live,
+        first: u32,
+    ) -> SlopeBox {
+        self.inner.slope_box(over, at, to, live, first)
     }
 
     fn distance(self, p: vec3) -> f32 {

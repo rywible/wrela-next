@@ -9,11 +9,11 @@ use mesh::grid::{
     OVERFLOW_THIN, REG_CREASE, REG_SMOOTH, SLICES_MOST, SMOOTH_DOT, THIN_SLICE, VERTS_BRICK,
     VERTS_STRIDE, along,
     avg2_sign, avg4_sign, box_in_frustum, brick_corner, brick_in_hole, brick_of, cull_brick,
-    cull_brick_with_live, cull_super_brick, eval_dqs, is_heavy_field, owner_of, pack_kept,
+    cull_brick_with_live, cull_super_brick, eval_dqs, owner_of, pack_kept,
     pack_vertex_meta, safe_norm, unpack_is_trans, unpack_oct_normal, unpack_smooth, unpack_thing,
     with_along,
 }
-use std::derive::{Box3, affine_form, value_and_gradient}
+use std::derive::{Box3, value_and_gradient}
 use std::field::{ALL_LIVE, DualQuat, Field, Live}
 use std::gpu::{
     Append, Atomics, DispatchArgs, GlobalId, LANE_WORK_LEAST, LocalId, One, Slots, WorkgroupId,
@@ -1281,8 +1281,7 @@ pub(package) fn note_untested(
 }
 
 /// Compacted pass over all-positive thin-feature candidates (`classify_cells`): an exact cell for
-/// each the compiler's sound interval (`std::derive::affine`) can't prove empty, whole or by
-/// octants.
+/// each the field's enclosure (`Surface::slope_affine`) can't prove empty, whole or by octants.
 @strict
 @compute(64)
 pub(package) fn filter_thin_cells<M: Field<Substance>>(
@@ -1313,8 +1312,9 @@ pub(package) fn filter_thin_cells<M: Field<Substance>>(
     let cell_lo = brick_corner(g, b.xyz, vec3u(cx, cy, cz))
     let f = fields[g.orig_id]
     let live = ab.live
-    // Exact cells for every cell whose core the compiler's affine form can't prove empty, whole
-    // or by its eight octants (pre-filtered by `af.octant_range(k)` at zero extra field cost): a
+    // Exact cells for every cell whose core the field's enclosure (`Surface::slope_affine`, one
+    // path for every kind) can't prove empty, whole or by its eight octants (those the whole's
+    // form already clears, `af.octant_range(k)`, not asked): a
     // surface can hide inside a cell all of whose corners are outside it (a wand, a tip, a crest),
     // and Dual Contouring, which sees only sign changes on edges, meshes none of it. The core is
     // the cell less a quarter pixel on every side (`HOLE_PX / 2`): what reaches no further in is
@@ -1329,67 +1329,29 @@ pub(package) fn filter_thin_cells<M: Field<Substance>>(
     let lo = cell_lo + vec3(m)
     let w = h - 2.0 * m
     var maybe = false
-    if M::HAS_SLOPE_BOX {
-        var oct_mask: u32 = 255
-        for k in 0..9 {
-            if !maybe && (k == 0 || ((oct_mask >> (k - 1)) & 1) != 0) {
-                let bx = if k == 0 {
-                    Box3 { lo: lo, hi: lo + vec3(w) }
-                } else {
-                    let j = k - 1
-                    let o = lo + vec3(f32(j & 1), f32((j >> 1) & 1), f32((j >> 2) & 1)) * (0.5 * w)
-                    Box3 { lo: o, hi: o + vec3(0.5 * w) }
-                }
-                let af = f.slope_affine(bx, live)
-                if k == 0 {
-                    if af.lo() > 0.0 {
-                        return
-                    }
-                    oct_mask = 0
-                    for j in 0..8 {
-                        if af.octant_range(j).lo <= 0.0 {
-                            oct_mask = oct_mask | (u32(1) << j)
-                        }
-                    }
-                } else if af.lo() <= 0.0 {
-                    maybe = true
-                }
+    var oct_mask: u32 = 255
+    for k in 0..9 {
+        if !maybe && (k == 0 || ((oct_mask >> (k - 1)) & 1) != 0) {
+            let bx = if k == 0 {
+                Box3 { lo: lo, hi: lo + vec3(w) }
+            } else {
+                let j = k - 1
+                let o = lo + vec3(f32(j & 1), f32((j >> 1) & 1), f32((j >> 2) & 1)) * (0.5 * w)
+                Box3 { lo: o, hi: o + vec3(0.5 * w) }
             }
-        }
-    } else if is_heavy_field(fields[g.orig_id]) {
-        var cur_live = live
-        for k in 0..9 {
-            if !maybe {
-                let bx = if k == 0 {
-                    Box3 { lo: lo, hi: lo + vec3(w) }
-                } else {
-                    let j = k - 1
-                    let o = lo + vec3(f32(j & 1), f32((j >> 1) & 1), f32((j >> 2) & 1)) * (0.5 * w)
-                    Box3 { lo: o, hi: o + vec3(0.5 * w) }
+            let af = f.slope_affine(bx, live)
+            if k == 0 {
+                if af.lo() > 0.0 {
+                    return
                 }
-                let pr = f.pruned(bx, |q: vec3| q, 1.0, cur_live, 0)
-                if k == 0 {
-                    if pr.range.lo > 0.0 {
-                        return
+                oct_mask = 0
+                for j in 0..8 {
+                    if af.octant_range(j).lo <= 0.0 {
+                        oct_mask = oct_mask | (u32(1) << j)
                     }
-                    cur_live = pr.live
-                } else if pr.range.lo <= 0.0 {
-                    maybe = true
                 }
-            }
-        }
-    } else {
-        let dist = |q: vec3| f.distance_live(q, live)
-        let af = affine_form(dist, Box3 { lo: lo, hi: lo + vec3(w) })
-        if af.lo() > 0.0 {
-            return
-        }
-        for k in 0..8 {
-            if !maybe && af.octant_range(k).lo <= 0.0 {
-                let o = lo + vec3(f32(k & 1), f32((k >> 1) & 1), f32((k >> 2) & 1)) * (0.5 * w)
-                if affine_form(dist, Box3 { lo: o, hi: o + vec3(0.5 * w) }).lo() <= 0.0 {
-                    maybe = true
-                }
+            } else if af.lo() <= 0.0 {
+                maybe = true
             }
         }
     }

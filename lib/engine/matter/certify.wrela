@@ -1,10 +1,11 @@
-// Certificates: what the compiler's affine forms prove about the surface inside a cell, so a mesh
-// there can be trusted to cover what the field covers without solving its pixels.
+// Certificates: what a field's enclosures prove about the surface inside a cell, so a mesh there
+// can be trusted to cover what the field covers without solving its pixels.
 //
 // A sheet certificate says the surface inside a cell lies in a slab no wider than `width`
 // parallel to a plane (the plane of the cell's mesh vertex, where the extraction asks it). It is
-// proven directly in world space from ONE `affine_form` evaluation per sub-box (no rotated frame
-// AABB inflation, no separate `value_and_gradient` call, no redundant plain interval):
+// proven directly in world space from one enclosure of the field per sub-box
+// (`Surface::slope_affine`: the field's own, composed through its combinators, the compiler's
+// affine form of a leaf that states none; one path for every kind):
 //   `f(p) = c + dot(l, u) + η`, `|η| ≤ e` over `u ∈ [-1, 1]³`, `p = c_b + h_in * u + δ`.
 // Projecting the linear part onto `w(p) = dot(p - at, n)` (`w_l = h_in * n`) with optimal slope
 // `α = dot(l / h_in, n)` splits `dot(l, u) = α (w(p) - w_mid) + dot(r, u)` (`r = l - α w_l`),
@@ -16,7 +17,7 @@
 // `certify_sheet` runs on the CPU (the scoreboard, `certify_report`) and in the extraction's
 // kernels alike: no recursion, a fixed stack, the field read where it lies (`fields[which]`).
 
-use std::derive::{Box3, affine_form, gradient}
+use std::derive::{Box3, gradient}
 use std::field::{ALL_LIVE, Live, Surface, hash_u32}
 use std::io::print
 
@@ -61,11 +62,7 @@ pub fn certify_sheet<S: Surface>(
         let b_lo = blo[top]
         let b_hi = bhi[top]
         let bx = Box3 { lo: b_lo, hi: b_hi }
-        let af = if S::HAS_SLOPE_BOX {
-            fields[which].slope_affine(bx, live)
-        } else {
-            affine_form(|q: vec3| fields[which].distance_live(q, live), bx)
-        }
+        let af = fields[which].slope_affine(bx, live)
         if af.lo() > 0.0 || af.hi() < 0.0 {
             continue
         }
@@ -166,103 +163,6 @@ pub fn certify_sheet<S: Surface>(
     top == 0
 }
 
-/// Sound sheet certificate for heavy composite fields (`is_heavy_field`) that uses `Surface::pruned`
-/// sub-box emptiness proofs instead of compiling a full 3D `affine_form` tree into the shader.
-///
-/// Soundness: every point of `[lo, lo + h]` belongs either to a sub-box whose `Surface::pruned`
-/// range strictly excludes `0.0` (so no zero crossing exists there) or to a sub-box whose full
-/// projection `[box_lo, box_hi]` along unit normal `n` lies inside `[w_lo, w_hi]` with
-/// `w_hi - w_lo <= width`. Therefore every surface point in the cell provably lies inside a slab
-/// no wider than `width` parallel to `(at, n)`.
-pub fn certify_sheet_pruned<S: Surface>(
-    fields: [S],
-    which: u32,
-    live: Live,
-    lo: vec3,
-    h: f32,
-    at: vec3,
-    normal: vec3,
-    width: f32,
-) -> bool {
-    let n_len = length(normal)
-    if !(h > 0.0) || !(width > 0.0) || !(n_len > 1.0e-6) {
-        return false
-    }
-    let n = normal / n_len
-    var w_lo = 1.0e30
-    var w_hi = -1.0e30
-    var blo: [vec3; 8] = [vec3(0.0); 8]
-    var bhi: [vec3; 8] = [vec3(0.0); 8]
-    var blv: [Live; 8] = [live; 8]
-    blo[0] = lo
-    bhi[0] = lo + vec3(h)
-    blv[0] = live
-    var top: u32 = 1
-    for _visit in 0..9 {
-        if top == 0 {
-            return true
-        }
-        top -= 1
-        let b_lo = blo[top]
-        let b_hi = bhi[top]
-        let cur_live = blv[top]
-        let pr = fields[which].pruned(Box3 { lo: b_lo, hi: b_hi }, |q: vec3| q, 1.0, cur_live, 0)
-        if pr.range.lo > 0.0 || pr.range.hi < 0.0 {
-            continue
-        }
-        let hl = 0.5 * b_lo
-        let hh = 0.5 * b_hi
-        let c_b = hl + hh
-        let h_in = (hh - hl) * (1.0 + 2.0 * CERT_EPS)
-        let w_mid = dot(c_b - at, n)
-        let w_l = h_in * n
-        let margin_w = (abs(c_b.x) + abs(c_b.y) + abs(c_b.z) + abs(at.x) + abs(at.y) + abs(at.z)) *
-            (6.0 * CERT_EPS) +
-            (h_in.x + h_in.y + h_in.z) * (12.0 * CERT_EPS) +
-            8.0 * CERT_TINY
-        let span = abs(w_l.x) + abs(w_l.y) + abs(w_l.z) + margin_w
-        let box_lo = w_mid - span
-        let box_hi = w_mid + span
-        if box_hi - box_lo <= width && max(w_hi, box_hi) - min(w_lo, box_lo) <= width {
-            w_lo = min(w_lo, box_lo)
-            w_hi = max(w_hi, box_hi)
-            continue
-        }
-        if top + 2 > 8 {
-            return false
-        }
-        // Split along the axis contributing the largest normal-projected extent so `span` shrinks
-        // by up to 2× per split (flat/gently-curved faces certify in 3–5 visits).
-        var best_axis: u32 = 0
-        let sx = abs(w_l.x)
-        let sy = abs(w_l.y)
-        let sz = abs(w_l.z)
-        if sy >= sx && sy >= sz {
-            best_axis = 1
-        } else if sz >= sx && sz >= sy {
-            best_axis = 2
-        }
-        let m = 0.5 * (b_lo + b_hi)
-        blo[top] = b_lo
-        bhi[top] = vec3(
-            if best_axis == 0 { m.x } else { b_hi.x },
-            if best_axis == 1 { m.y } else { b_hi.y },
-            if best_axis == 2 { m.z } else { b_hi.z },
-        )
-        blv[top] = pr.live
-        top += 1
-        blo[top] = vec3(
-            if best_axis == 0 { m.x } else { b_lo.x },
-            if best_axis == 1 { m.y } else { b_lo.y },
-            if best_axis == 2 { m.z } else { b_lo.z },
-        )
-        bhi[top] = b_hi
-        blv[top] = pr.live
-        top += 1
-    }
-    top == 0
-}
-
 fn u01(k: u32) -> f32 {
     f32(hash_u32(k) >> 8) * (1.0 / 16777216.0)
 }
@@ -325,41 +225,4 @@ pub fn certify_report<S: Surface>(s: S, label: str, boxes: u32 = 200) {
             f"certify({label}): cells {h} m: {n} cells; certified within h/4 {quarter}, within h/10 {tenth}",
         )
     }
-}
-
-@test
-fn certify_sheet_pruned_certifies_flat_faces_and_rejects_sharp_corners() {
-    let box_s = std::field::cuboid(vec3(0.5, 0.25, 0.5))
-    let one = [box_s]
-    // Cell straddling the flat top face (y = 0.25) with slab width 0.5 * h: must certify!
-    let h = 0.04
-    let flat_lo = vec3(0.0, 0.23, 0.0)
-    assert(
-        certify_sheet_pruned(
-            one,
-            0,
-            ALL_LIVE,
-            flat_lo,
-            h,
-            vec3(0.02, 0.25, 0.02),
-            vec3(0.0, 1.0, 0.0),
-            0.5 * h,
-        ),
-        "flat cuboid face must be certified by certify_sheet_pruned",
-    )
-    // Cell containing a sharp 90-degree corner (0.5, 0.25, 0.0) with tight slab 0.2 * h: must NOT certify.
-    let corner_lo = vec3(0.48, 0.23, 0.0)
-    assert(
-        !certify_sheet_pruned(
-            one,
-            0,
-            ALL_LIVE,
-            corner_lo,
-            h,
-            vec3(0.5, 0.25, 0.02),
-            normalize(vec3(1.0, 1.0, 0.0)),
-            0.2 * h,
-        ),
-        "sharp 90-degree corner must not falsely certify",
-    )
 }
