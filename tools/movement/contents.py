@@ -33,7 +33,8 @@ def main():
         r = json.load(open(path))
         src = r["source"]
         name = f"{src}/{os.path.basename(path)[:-5]}"
-        kind = KINDS.get(name.rsplit("_", 1)[-1], "other")
+        kind = KINDS.get(name.rsplit("_", 1)[-1], "other") if src == "100style" else \
+            "gestures while standing (stories told)" if src == "embm" else "other"
         h = r["seconds"] / 3600.0
         which = sets.get(name, "none")
         rows.setdefault(kind, {}).setdefault(which, 0.0)
@@ -42,6 +43,7 @@ def main():
         s["clips"] += 1
         s["hours"] += h
         s["mm"] += r["mean_joint_mm"] * r["frames"]
+        s["frames"] = s.get("frames", 0) + r["frames"]
         frames += r["frames"]
         out_frames += r["frames_out_of_range"]
         worst = max(worst, r["worst_range"])
@@ -57,7 +59,7 @@ def main():
     print()
     for src, s in by_source.items():
         print(f"{src}: {s['clips']} clips, {s['hours']:.2f} h, the mean distance of a mapped joint from "
-              f"the scaled capture's {s['mm'] / max(frames, 1):.1f} mm")
+              f"the scaled capture's {s['mm'] / max(s['frames'], 1):.1f} mm")
     print(f"frames out of range by more than 0.01 rad: {out_frames} of {frames} "
           f"({100 * out_frames / max(frames, 1):.3f}%), the worst {worst:.4f} rad")
 

@@ -62,7 +62,8 @@ def main():
             for s in range(frames.shape[1]):
                 b = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, f"s{s}")
                 wp = max(wp, np.linalg.norm(d.xpos[b] - frames[f, s, :3]))
-                dq = abs(np.dot(d.xquat[b], frames[f, s, 3:]))
+                qa, qb = d.xquat[b], frames[f, s, 3:]
+                dq = abs(np.dot(qa / np.linalg.norm(qa), qb / np.linalg.norm(qb)))
                 wq = max(wq, 2 * np.arccos(min(1.0, dq)))
         print(f"kinematics of {sys.argv[1]}: worst place {1000 * wp:.4f} mm, worst turn {1000 * wq:.4f} mrad")
         # A ball joint is three hinges in the model: its angles from its turn in f32, which near

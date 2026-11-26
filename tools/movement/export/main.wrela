@@ -12,8 +12,8 @@
 //   gets `LEAST` kg, as the simulator can't move a body with no mass;
 // - each joint's numbers as the simulator's joints, in the segment's body: a hinge about x; a
 //   universal joint a hinge about x then one about y, as the engine turns it; a ball joint three
-//   hinges, about x, then z, then y (a ball joint's turn written as those three turns, exactly,
-//   away from a quarter turn about z); the root a free joint;
+//   hinges, its turn written as three turns exactly, the middle one about the axis of its
+//   narrowest range (`ball_order`); the root a free joint;
 // - each part a capsule (its two radii's mean) on the segment of its first end, colliding with
 //   the floor alone;
 // - each hinge driven by a position servo whose force is held to the joint's strength
@@ -26,7 +26,7 @@
 // turn (w, x, y, z) in the world, from `Body::places`: what the tracker is rewarded to follow.
 
 use engine::body::body::{Body, Pose}
-use engine::body::joint::{Frame, Kind, turn}
+use engine::body::joint::{Frame, Joint, Kind, turn}
 use engine::body::mass::Mass
 use std::collections::Vec
 use std::io::print
@@ -96,18 +96,52 @@ fn wxyz(q: Quat) -> String {
     f"{q.v.w} {q.v.x} {q.v.y} {q.v.z}"
 }
 
-/// A ball joint's turn `r` as three turns about x, then z, then y (each in the frame the one
-/// before left): r = Rx(a) Rz(b) Ry(c).
-pub fn xzy(r: Quat) -> vec3 {
+/// The order of a ball joint's three hinges: the axes (0 x, 1 y, 2 z) of its first, middle and
+/// last. Three turns written so have one turn they can't tell apart, where the middle one is a
+/// quarter turn: the middle is the axis of the joint's narrowest range (most often its twist), so
+/// that turn is outside what the joint can do.
+fn ball_order(j: Joint) -> vec3u {
+    // A ball joint's numbers: the swing about x (`q.x`), about z (`q.y`), the twist about y (`q.z`).
+    let wide = vec3(
+        max(abs(j.lo.x), abs(j.hi.x)),
+        max(abs(j.lo.z), abs(j.hi.z)),
+        max(abs(j.lo.y), abs(j.hi.y)),
+    )
+    let middle = if wide.y <= wide.x && wide.y <= wide.z { 1 } else if wide.x <= wide.z { 0 } else {
+        2
+    }
+    let (first, last) = if middle == 0 { (2, 1) } else if middle == 1 { (0, 2) } else { (0, 1) }
+    vec3u(first, middle, last)
+}
+
+/// Turn `r` as three turns about axes `o.x`, then `o.y`, then `o.z` (each in the frame the one
+/// before left): r = R_i(a) R_j(b) R_k(c).
+pub fn euler(r: Quat, o: vec3u) -> vec3 {
     let m = r.to_mat3()
     // Row r, column c of the matrix is m[c][r].
-    let b = asin(clamp(-m[1].x, -1.0, 1.0))
-    let a = atan2(m[1].z, m[1].y)
-    let c = atan2(m[2].x, m[0].x)
+    let at = |row: u32, col: u32| m[col][row]
+    let (i, j, k) = (o.x, o.y, o.z)
+    let even = (i == 0 && j == 1) || (i == 1 && j == 2) || (i == 2 && j == 0)
+    let sgn = if even { 1.0 } else { -1.0 }
+    let b = asin(clamp(sgn * at(i, k), -1.0, 1.0))
+    let a = atan2(-sgn * at(j, k), at(k, k))
+    let c = atan2(-sgn * at(i, j), at(i, i))
     vec3(a, b, c)
 }
 
-/// The simulator's hinges for segment `s`'s joint: how many, and each one's axis and range.
+fn axis(i: u32) -> vec3 {
+    if i == 0 { vec3(1.0, 0.0, 0.0) } else if i == 1 { vec3(0.0, 1.0, 0.0) } else {
+        vec3(0.0, 0.0, 1.0)
+    }
+}
+
+/// Which of a ball joint's numbers' ranges an axis's hinge takes: x the swing's `x`, z its `y`,
+/// y the twist `z`.
+fn number_of_axis(i: u32) -> u32 {
+    if i == 0 { 0 } else if i == 2 { 1 } else { 2 }
+}
+
+/// The simulator's hinges for segment `s`'s joint: how many.
 fn hinges(kind: Kind) -> u32 {
     match kind {
         Kind::Fixed => 0,
@@ -117,12 +151,12 @@ fn hinges(kind: Kind) -> u32 {
     }
 }
 
-/// Hinge `h` of a joint of `kind`: its axis, and which of the joint's numbers its range is.
-fn hinge(kind: Kind, h: u32) -> (vec3, u32) {
-    if kind == Kind::Ball {
-        if h == 0 { (vec3(1.0, 0.0, 0.0), 0) } else if h == 1 {
-            (vec3(0.0, 0.0, 1.0), 1)
-        } else { (vec3(0.0, 1.0, 0.0), 2) }
+/// Hinge `h` of joint `j`: its axis, and which of the joint's numbers its range is.
+fn hinge(j: Joint, h: u32) -> (vec3, u32) {
+    if j.kind == Kind::Ball {
+        let o = ball_order(j)
+        let i = if h == 0 { o.x } else if h == 1 { o.y } else { o.z }
+        (axis(i), number_of_axis(i))
     } else if h == 0 { (vec3(1.0, 0.0, 0.0), 0) } else { (vec3(0.0, 1.0, 0.0), 1) }
 }
 
@@ -130,7 +164,7 @@ fn hinge(kind: Kind, h: u32) -> (vec3, u32) {
 fn angles(b: Body<SEGMENTS>, pose: Pose<FREEDOM>, s: u32) -> vec3 {
     let j = b.segments[s].joint
     let q = b.numbers(pose, s)
-    if j.kind == Kind::Ball { xzy(turn(Kind::Ball, q)) } else { q }
+    if j.kind == Kind::Ball { euler(turn(Kind::Ball, q), ball_order(j)) } else { q }
 }
 
 /// The segments depth first (a segment's children each after the one before's whole subtree):
@@ -203,10 +237,10 @@ fn model() -> String {
             )
         }
         for h in 0..hinges(j.kind) {
-            let (axis, k) = hinge(j.kind, h)
+            let (ax, k) = hinge(j, h)
             let (lo, hi) = (j.lo[k], j.hi[k])
             x.push_str(
-                f"{ind}  <joint name=\"s{s}h{h}\" type=\"hinge\" axis=\"{v3(axis)}\" range=\"{lo - 0.05} {hi + 0.05}\"/>\n",
+                f"{ind}  <joint name=\"s{s}h{h}\" type=\"hinge\" axis=\"{v3(ax)}\" range=\"{lo - 0.05} {hi + 0.05}\"/>\n",
             )
             let st = max(j.strength[k], 0.1)
             actuators.push_str(

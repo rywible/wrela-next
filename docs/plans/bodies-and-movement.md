@@ -126,8 +126,8 @@ An agent starts each run with the `colab` command. No person starts a run. Secti
 | --- | --- | --- | --- |
 | 0 | Two decisions, the rights of each source and two measurements | Nothing | A small run |
 | 1 | One declaration for each body, with its freedom (done on the Linux machine, 2026-11-25) | Nothing | No |
-| 2 | Capture with clean rights, on our bodies | Phases 0 and 1 | No |
-| 3 | A judge that gives numbers for movement | Phases 1 and 2 | No |
+| 2 | Capture with clean rights, on our bodies (100STYLE and MPI EMBM on the creature, 2026-11-25) | Phases 0 and 1 | No |
+| 3 | A judge that gives numbers for movement (calibrated on the Linux machine, 2026-11-25) | Phases 1 and 2 | No |
 | 4 | A tracker, and filtered capture | Phases 2 and 3 | Yes |
 | 5 | The solver in the engine, with a prior of style | Phases 3 and 4 | Yes |
 | 5b | Spells that act on bodies, and duels between trained bodies | Phases 4 and 5 | Yes |
@@ -370,6 +370,7 @@ than the balance fell (1.59 written, 1.12 fallen for the tests of 0.5).
 | 2026-11-25 | `p4-walk-256` (L4): phase 4 first small run: the neutral walk, 256 bodies, 60 updates, stopped at update 30 of 60: put_data's limits, meant per world, were given for all worlds (1,700 samples a second) | 0.13 |
 | 2026-11-25 | `p4-walk-256b` (L4): phase 4 first small run: the neutral walk, 256 bodies, 60 updates, done | 0.34 |
 | 2026-11-25 | `simspeed-body` (L4): phase 4: the body's step by solver settings and worlds, done | 0.22 |
+| 2026-11-25 | `p4-walk-4096` (L4): phase 4: does the tracker learn one walk, 4,096 bodies, 700 updates, done | 1.37 |
 
 #### A new machine
 
@@ -542,7 +543,53 @@ Purpose: each source that phase 0 permits becomes poses of our bodies.
 6. **Write a table of what the data contains:** the hours of each type of movement. This table
    shows what the solver can learn and what it cannot.
 
+### What is done (2026-11-25)
+
+- The import tool is `tools/movement/capture` (wrela): BVH, each source's bone names in its
+  `maps`. The retarget fits each frame by `engine::body::fit` (each mapped segment turned as its
+  bone turned from rest; the root, the hands and the feet at their scaled places; a number that no
+  aim fixes held still; each joint put into its range at the end), scales lengths by the leg and
+  time by the square root of that ratio, low-passes the result (a Gaussian of 0.8 frames at 30
+  frames a second, as inverse dynamics needs: the fit's jitter from frame to frame made a clip
+  played faster look *better* to the judge), and stands each clip on the ground (the 5th
+  percentile of its lowest points at 0). A capture that rests in another pose than our body (its
+  arms by its sides) has each such bone's rest turned to ours.
+- Sources imported, onto the creature: 100STYLE (810 clips, 14.67 h, its clean frames by its
+  `Frame_Cuts.csv`) and MPI EMBM (288 clips, 0.29 h: the archive figshare serves has lost its
+  directory, and its local entries give 288 of its more than 1,440 clips).
+- The division: `tools/movement/split` (a style of 100STYLE, or a clip of EMBM, in one set by the
+  SHA-256 of its name): training 858 clips, test 123, calibration 117.
+- The table of contents (`tools/movement/contents.py`), hours:
+
+| Movement | Training | Test | Calibration | All |
+| --- | --- | --- | --- | --- |
+| Walk forward | 2.21 | 0.31 | 0.30 | 2.81 |
+| Walk backward | 2.18 | 0.31 | 0.29 | 2.78 |
+| Walk sideways | 1.54 | 0.21 | 0.20 | 1.96 |
+| Run forward | 1.17 | 0.17 | 0.16 | 1.50 |
+| Run backward | 1.22 | 0.18 | 0.17 | 1.57 |
+| Run sideways | 0.70 | 0.10 | 0.11 | 0.91 |
+| Turns | 2.21 | 0.34 | 0.30 | 2.85 |
+| Stand (idle) | 0.23 | 0.03 | 0.03 | 0.29 |
+| Gestures while standing (stories told) | 0.23 | 0.03 | 0.03 | 0.29 |
+| All | | | | 14.96 |
+
+  What the data can teach: walking and running in many styles, turning and standing. What it
+  can't: reaching, casting, striking, crouching, falling, any movement with an object, and any
+  body but a person's. Section 17's prior of style and skills is the answer to the gap.
+
 ### Done when
+
+- Not met: each permitted source is imported. Imported: 100STYLE and MPI EMBM. Downloaded and not
+  imported: CeTI-Age-Kinematics (BVH of reaches and daily tasks, 3.1 GB, in `.movement/capture`).
+  Not imported, as each needs a reader this tool doesn't have yet: the FBX sets (Rocketbox, the
+  sign archive, the Lanna dances), the C3D marker sets (karate, MHAD) and the CSV and Xsens sets.
+- Done: each frame of each clip is in the range fields (0 of 1,616,010 frames more than 0.01 rad
+  out).
+- Done: the mean distance between the mapped joints of the capture (scaled) and of our body:
+  100STYLE 42.3 mm, MPI EMBM 38.5 mm.
+
+The lines as they were written:
 
 - Each permitted source is imported. The table of contents is in the commit message.
 - Each frame of each clip is in the range fields. If a frame is not, find the cause: the range,
@@ -607,6 +654,35 @@ its distance from the laws of movement. They need no capture and carry no licenc
 The calibration needs no person. Thus the judge can be wrong in a way that only an eye finds. The
 review in phase 5 is the check of that.
 
+### What is done (2026-11-25)
+
+- The judge: `lib/engine/judge/movement.wrela` (inverse dynamics, the contact forces by projected
+  coordinate descent in a fixed number of sweeps, a sliding point's force weighed down, the
+  measures of the table), `lib/engine/judge/laws.wrela` (the laws of movement), and its tool
+  `tools/movement/judge` (`calibrate`, `one`, `laws`, `walk`, `ranges`, `contacts`, `dump`).
+- Against force plates (`tools/movement/forces`, Moore et al. 2015, a body sized from each
+  person's markers and de Leva's shares, markers low-passed): the judge's vertical force is off by
+  3.1, 3.9, 6.3 and 7.9% of the weight on average (four trials of three people; along the ground
+  4.2 to 8.7%).
+- Against the simulator (phase 4 step 3, here because the judge is its subject): joint moments
+  agree with MuJoCo's inverse dynamics to 0.08% (median) and 2.9% (95th percentile).
+- The calibration (`tools/movement/judge -- calibrate`): 117 calibration clips (89 of 100STYLE,
+  28 of MPI EMBM), each with 13 damaged copies. Each movement's distance from capture is from the
+  training clips of its own source. The judge prefers the capture in 1,451 of 1,521 pairs
+  (95.4%): slid 351 of 351, noisy 351 of 351, raised 350 of 351, faster 291 of 351, still 108 of
+  117. The mean score (each measure over its target, summed) rises with each kind's damage:
+  clean 2.14; faster 2.62, 3.36, 5.21; slid 2.63, 3.74, 5.73; noisy 15.1, 37.3, 73.8; raised 3.70,
+  4.07, 4.99; still 4.31.
+- The targets (the clean clips' 95th percentile, or a floor): root residual 0.92 of the weight,
+  torque past strength 1.74 (a share of the strength), slide 984 mm/s, penetration 2 mm (floor),
+  float 41 mm, out of range 0.01 rad (floor), distance from capture 4.79, goal error 0.32 m/s.
+  They are wide: retargeted capture on the creature is not physical (a 16 kg head on short
+  legs). The filtered capture of phase 4 is physical by construction; calibrate again on it.
+- The film: `tools/movement/film` (side and front, contacts and the root residual drawn, on the
+  CPU, no window).
+- The gate: `tools/gate`'s step `movement` (the walk carried: its residual, torque, slide and
+  penetration held to `tools/gate.json`; played in place, its slide must stay over 500 mm/s).
+
 ### Done when
 
 - The ground force that the judge calculates agrees with the measured force. The mean error is
@@ -619,6 +695,16 @@ review in phase 5 is the check of that.
 - The judge measures one body for one second of movement in less than 50 ms on the two machines
   (first value).
 - Each target in phases 4 to 6 has its final value.
+
+State on 2026-11-25, on the Linux machine: the ground force, done (3.1 to 7.9%); the pairs, done
+(95.4%); worse with more damage, done (on the mean score of each kind; per clip, 79% of clips
+for faster and raised, 100% for slid and noisy); the walk in place fails slide, done (1,174 mm/s
+against 984); the body that does not move fails the distance from capture on 78 of 78 moving
+clips and the goal error on 71 (it can't be told from standing capture, which is right); the
+judge's time, done (5.4 ms for a second of movement; the M4 not measured); the targets of phases
+4 to 6: the judge's limits are the calibration's targets above, and phase 4's are kept (95% of
+clips, 50 mm), which the first run of one walk met (43.8 mm, no fall). The laws of movement are
+measured and checked but not yet in the calibration's score.
 
 ## 9. Phase 4: the tracker
 
@@ -645,14 +731,38 @@ removes the faults of the retarget: slide, penetration and forces that cannot oc
    simulator, with the contacts.
 9. **Add the rows to `docs/citations.md`:** the simulator, the training library and the methods.
 
+### What is done (2026-11-25)
+
+- The export: `tools/movement/export` (wrela) writes the model of the creature from its
+  declaration (each segment's inertial as the engine weighs it, a collarbone's 0 kg as 1 g, each
+  ball joint three hinges with its narrowest range's axis in the middle, servos held to each
+  joint's strength) and each clip's states.
+- The two models agree (`tools/movement/check_model.py`): each mass and inertia to 0.00000%;
+  each segment's place to 0.02 mm and turn to 0.74 mrad from its clip's states.
+- The training script: `tools/movement/track.py` (PPO with reference state initialisation, early
+  termination and a reward on all segments' places), started by the run tool; it ends by playing
+  every clip to its end and writes the filtered capture (`filtered.bin`) and the weights.
+- The simulator's speed for this body on the L4 (`tools/movement/sim_speed_body.py`): with steps
+  of 1/120 s, 4 a frame, Newton with 10 iterations, about 95,000 frames a second at 4,096 worlds
+  (51,000 with steps of 1/240 s; 50 iterations no faster than 10).
+- The first small run (step 5): the walk, 256 bodies, 4,800 samples a second. With 4,096 bodies:
+  45,000 samples a second, and in 92 million samples (34 minutes, 1.37 units) the tracker followed
+  the walk for its whole evaluation (20 s) with no fall, its segments 43.8 mm from the clip on
+  average.
+- The estimate of 0.4 again, from the measured rate: 45,000 samples a second is 162 million an
+  hour of an L4; phase 4's 5 to 20 thousand million samples are 31 to 123 hours, 72 to 287 units.
+  More than the limit allows at its high end: rule 9 for Colab. The first long run is held to 20
+  units and its curve decides the next.
+
 ### Done when
 
 - The tracker follows not less than 95% of the clips, test clips included, to the end with no
   fall (first value).
 - The mean distance of a segment from its place in the capture is not more than 50 mm (first
   value).
-- The simulator and the engine agree on each mass to 0.1%.
-- The judge and the simulator agree on the torques of the three clips to 5% (first value).
+- The simulator and the engine agree on each mass to 0.1%. (Done: 0.00000%.)
+- The judge and the simulator agree on the torques of the three clips to 5% (first value). (Done
+  for one clip: 0.08% median, 2.9% at the 95th percentile.)
 - The filtered capture has less slide and a smaller root residual than the retargeted capture,
   by the judge.
 - A stopped run continues from its checkpoint and gets the same result.

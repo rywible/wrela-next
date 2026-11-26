@@ -35,6 +35,7 @@ use std::tool::{ToolError, all, args}
 use std::tool::blob
 use std::tool::files
 use world::creature::BODY
+use world::creature_segments::PARTS
 use world::creature_segments::{
     CHEST, COLLAR_LEFT, COLLAR_RIGHT, FOOT_LEFT, FOOT_RIGHT, FOREARM_LEFT, FOREARM_RIGHT, FREEDOM,
     HAND_LEFT, HAND_RIGHT, HEAD, NECK, PELVIS, SEGMENTS, SHIN_LEFT, SHIN_RIGHT, SPINE, THIGH_LEFT,
@@ -253,7 +254,7 @@ fn maps(source: str) -> Vec<Map> {
     var out: Vec<Map> = Vec::new()
     // A forearm is aimed by its place alone: its roll is its elbow's in our bodies, where the
     // capture turns it at the wrist, so the hand's turn sets it.
-    if source == "100style" {
+    if source == "100style" || source == "embm" {
         out.push(m("Hips", PELVIS, BOTH))
         out.push(m("Chest", SPINE, TURN))
         out.push(m("Chest2", CHEST, TURN))
@@ -282,12 +283,15 @@ fn maps(source: str) -> Vec<Map> {
 
 /// The units of a source's capture, in metres.
 fn unit(source: str) -> f32 {
-    if source == "100style" { 0.01 } else { 1.0 }
+    if source == "100style" || source == "embm" { 0.01 } else { 1.0 }
 }
 
 /// The credit a source asks for (docs/citations.md).
 fn credit(source: str) -> Text {
-    if source == "100style" { "The 100STYLE Dataset - Ian Mason (CC BY 4.0)" } else { "" }
+    if source == "100style" { "The 100STYLE Dataset - Ian Mason (CC BY 4.0)" } else if source ==
+        "embm" {
+        "MPI Emotional Body Motion Database, E. Volkova et al. 2014 (CC BY 4.0)"
+    } else { "" }
 }
 
 fn bone_index(b: Bvh, name: str) -> u32 {
@@ -297,6 +301,19 @@ fn bone_index(b: Bvh, name: str) -> u32 {
         }
     }
     NONE
+}
+
+/// The shortest turn that takes unit direction `a` to `b`.
+fn shortest_arc(a: vec3, b: vec3) -> Quat {
+    let d = dot(a, b)
+    if d > 0.999999 {
+        return Quat::identity()
+    }
+    if d < -0.999999 {
+        let side = if abs(a.x) < 0.9 { vec3(1.0, 0.0, 0.0) } else { vec3(0.0, 1.0, 0.0) }
+        return Quat::axis_angle(cross(a, side), 3.14159265)
+    }
+    Quat { v: normalize(vec4(cross(a, b), 1.0 + d)) }
 }
 
 // ---- one clip ---------------------------------------------------------------------------------
@@ -407,6 +424,36 @@ fn import_or(c: Clip) -> Result<Done, ToolError> {
     // The body at rest (its numbers 0): each segment's turn and place there.
     let rest: Pose<FREEDOM> = body.rest()
     let at0 = body.places(rest)
+    // Each mapped bone's rest against the segment's: the turn that takes the segment's direction
+    // at rest (its joint to its tip) to the bone's (its joint to its first child's, the capture's
+    // rotations all 0), where they rest in different poses. A capture at rest in a T-pose
+    // (100STYLE) needs none; one with its arms by its sides (MPI EMBM) turns each arm down.
+    var rest_turn: Vec<Quat> = Vec::new()
+    for i in 0..ms.len() {
+        let b = idx[i]
+        var cap = vec3(0.0)
+        for k in b + 1..bvh.bones.len() {
+            if bvh.bones[k].parent == b && length(cap) == 0.0 {
+                cap = bvh.bones[k].offset
+            }
+        }
+        if length(cap) == 0.0 && bvh.bones[b].has_end {
+            cap = bvh.bones[b].end
+        }
+        let seg = ms[i].segment
+        let ours = at0[seg].q.rotate(body.segments[seg].tip)
+        // Only a bone that rests in another pose than its segment (more than 45 degrees apart, as
+        // an arm by the side against an arm out): a smaller difference is one of proportions,
+        // which the places of the hands and the feet carry (turning by it took 100STYLE's mapped
+        // joints from 30 to 37 mm off).
+        let apart = if length(cap) < 1.0e-6 || length(ours) < 1.0e-6 { 0.0 } else {
+            acos(clamp(dot(normalize(ours), normalize(cap)), -1.0, 1.0))
+        }
+        let turn = if seg == PELVIS || apart < 0.785398 {
+            Quat::identity()
+        } else { shortest_arc(normalize(ours), normalize(cap)) }
+        rest_turn.push(turn)
+    }
     // The scale: the body's leg (hip to knee to ankle) against the capture's, at rest.
     let u = unit(c.source.as_str())
     let (hip, knee, ankle) = (
@@ -451,7 +498,7 @@ fn import_or(c: Clip) -> Result<Done, ToolError> {
             let b = idx[i]
             // Turned from its rest as the capture's bone turned from its own (both at rest in
             // a T-pose, facing +z, +x their left).
-            let q = turns[b].mul(at0[m.segment].q)
+            let q = turns[b].mul(rest_turn[i]).mul(at0[m.segment].q)
             let p = places[b] * (u * s)
             if m.aim == BOTH {
                 let place = if m.segment == PELVIS { 2.0 } else { 1.0 }
@@ -558,14 +605,213 @@ fn clips_100style() -> Result<Vec<Clip>, ToolError> {
     Ok(out)
 }
 
+/// MPI EMBM's clips: each BVH file of `embm/bvh` but its first frames (the archive as figshare serves it has no
+/// directory at its end; its local entries were read in order: 288 of its clips).
+fn clips_embm() -> Result<Vec<Clip>, ToolError> {
+    var out: Vec<Clip> = Vec::new()
+    var names: Vec<String> = Vec::new()
+    for e in files::list("capture/embm/bvh").wait()? {
+        if e.name.as_str().ends_with(".bvh") {
+            names.push(e.name.clone())
+        }
+    }
+    names.sort_by(|a, b| a.as_str() < b.as_str())
+    for n in names {
+        let base = n.as_str().slice(0, n.len() - 4).to_string()
+        out.push(
+            Clip {
+                steps: STEPS,
+                source: String::from("embm"),
+                file: f"embm/bvh/{n}",
+                name: base,
+                // Each file's first frame is a rest pose at the origin, not the movement.
+                first: 3,
+                last: 4294967295,
+            },
+        )
+    }
+    Ok(out)
+}
+
+/// Low-passes a clip in time: each number, the root's place and its turn (averaged on the sphere)
+/// by a Gaussian of `SMOOTH` frames' spread, both ways, so no lag. The fit of each frame leaves a
+/// jitter from frame to frame that inverse dynamics differentiates twice (playing a clip faster,
+/// which resamples it, lowered its root residual); the laboratory filters markers at some 6 Hz
+/// before it does the same (D. A. Winter). Each joint stays in its range: a mean of numbers in a
+/// convex range is in it. Rewrites the clip's poses.
+const SMOOTH: f32 = 0.8
+
+fn smoothed_clip(c: take Clip) -> Done {
+    var done = Done {
+        clip: c.name.clone(),
+        frames: 0,
+        seconds: 0.0,
+        joint_mm: 0.0,
+        out_of_range: 0,
+        worst_range: 0.0,
+        failed: String::new(),
+    }
+    let path = f"out/creature/{c.source}/{c.name}"
+    let Ok(bytes) = read_all(f"{path}.pose") else {
+        done.failed = String::from("no poses")
+        return done
+    }
+    let head = 20
+    let row = 4 * (7 + FREEDOM)
+    let n = (bytes.len() - head) / row
+    var vals: Vec<f32> = Vec::with_capacity(n * (7 + FREEDOM))
+    for f in 0..n {
+        for k in 0..7 + FREEDOM {
+            vals.push(bitcast_f32(le_word(bytes, head + f * row + 4 * k)))
+        }
+    }
+    let w = 7 + FREEDOM
+    var out = bytes.clone()
+    let h = u32(3.0 * SMOOTH) + 1
+    for f in 0..n {
+        let a = if f > h { f - h } else { 0 }
+        let b = min(f + h, n - 1)
+        var sum = [0.0; 62]
+        var wsum = 0.0
+        // The root's turns, each made to agree in sign with this frame's.
+        let q0 = vec4(vals[f * w + 3], vals[f * w + 4], vals[f * w + 5], vals[f * w + 6])
+        var qsum = vec4(0.0)
+        for g in a..b + 1 {
+            let d = (f32(g) - f32(f)) / SMOOTH
+            let k = exp(-0.5 * d * d)
+            wsum += k
+            for i in 0..w {
+                sum[i] += vals[g * w + i] * k
+            }
+            var q = vec4(vals[g * w + 3], vals[g * w + 4], vals[g * w + 5], vals[g * w + 6])
+            if dot(q, q0) < 0.0 {
+                q = -q
+            }
+            qsum += q * k
+        }
+        let qn = normalize(qsum)
+        for i in 0..w {
+            var v = sum[i] / wsum
+            if i >= 3 && i < 7 {
+                v = qn[i - 3]
+            }
+            let u = bitcast_u32(v)
+            let o = head + f * row + 4 * i
+            out[o] = u8(u & 255)
+            out[o + 1] = u8((u >> 8) & 255)
+            out[o + 2] = u8((u >> 16) & 255)
+            out[o + 3] = u8(u >> 24)
+        }
+    }
+    match write_all(f"{path}.pose", out) {
+        Ok(_) => {},
+        Err(e) => done.failed = e.message().to_string(),
+    }
+    done.frames = n
+    done
+}
+
+/// The little-endian u32 at byte `i` of `b`.
+fn le_word(b: [u8], i: u32) -> u32 {
+    u32(b[i]) | (u32(b[i + 1]) << 8) | (u32(b[i + 2]) << 16) | (u32(b[i + 3]) << 24)
+}
+
+/// Stands a clip on the ground (again: the shift it finds on a grounded clip is 0): its lowest
+/// point each frame (each part's ends less their radii),
+/// whose 5th percentile over the clip is put at y = 0 by moving the root. A capture's foot joints
+/// stand some centimetres over its floor, and scaled to a body whose feet are thicker or thinner
+/// they leave the body over the ground or in it (on 2026-11-25, 100STYLE on the creature floated
+/// 22 mm on average where it needed holding up). Rewrites the clip's poses, and its record with
+/// the shift.
+fn grounded(c: take Clip) -> Done {
+    var done = Done {
+        clip: c.name.clone(),
+        frames: 0,
+        seconds: 0.0,
+        joint_mm: 0.0,
+        out_of_range: 0,
+        worst_range: 0.0,
+        failed: String::new(),
+    }
+    let path = f"out/creature/{c.source}/{c.name}"
+    let Ok(bytes) = read_all(f"{path}.pose") else {
+        done.failed = String::from("no poses")
+        return done
+    }
+    // The header: "WPOS", then u32s version, numbers, frames, then f32 rate: 20 bytes.
+    let head = 20
+    let n = (bytes.len() - head) / (4 * (7 + FREEDOM))
+    var lows: Vec<f32> = Vec::with_capacity(n)
+    let row = 4 * (7 + FREEDOM)
+    for f in 0..n {
+        let o = head + f * row
+        var x = [0.0; 7]
+        for k in 0..7 {
+            x[k] = bitcast_f32(le_word(bytes, o + 4 * k))
+        }
+        var p: Pose<FREEDOM> = Pose {
+            root: Frame { q: Quat { v: vec4(x[3], x[4], x[5], x[6]) }, t: vec3(x[0], x[1], x[2]) },
+            q: [0.0; FREEDOM],
+        }
+        for k in 0..FREEDOM {
+            p.q[k] = bitcast_f32(le_word(bytes, o + 28 + 4 * k))
+        }
+        let at = BODY.places(p)
+        var low = 1.0e9
+        for cone in PARTS {
+            let (a, b) = cone.placed(at)
+            low = min(low, min(a.y - cone.ra, b.y - cone.rb))
+        }
+        lows.push(low)
+    }
+    var sorted = lows.clone()
+    sorted.sort_by(|a, b| a < b)
+    let shift = sorted[min(n / 20, n - 1)]
+    var out = bytes.clone()
+    for f in 0..n {
+        let o = head + f * row + 4
+        let y = bitcast_f32(le_word(bytes, o)) - shift
+        let u = bitcast_u32(y)
+        out[o] = u8(u & 255)
+        out[o + 1] = u8((u >> 8) & 255)
+        out[o + 2] = u8((u >> 16) & 255)
+        out[o + 3] = u8(u >> 24)
+    }
+    match write_all(f"{path}.pose", out) {
+        Ok(_) => {},
+        Err(e) => {
+            done.failed = e.message().to_string()
+            return done
+        },
+    }
+    // The record: its last line, with the shift.
+    if let Ok(rb) = read_all(f"{path}.json") {
+        if let Some(text) = String::from_utf8(take rb) {
+            let t = text.as_str().trim()
+            // An earlier shift's field (and what follows it) is replaced.
+            let cut = match t.find(", \"ground_shift\"") {
+                Some(i) => i,
+                None => t.len() - 1,
+            }
+            let rec = f"{t.slice(0, cut)}, \"ground_shift\": {shift}}}\n"
+            let _ = write_all(f"{path}.json", Vec::from(rec.as_bytes()))
+        }
+    }
+    done.frames = n
+    done.joint_mm = shift * 1000.0
+    done
+}
+
 pub fn tool() -> u32 {
     let a = args()
     if a.len() < 1 {
-        print("usage: capture SOURCE [FIRST COUNT [STEPS]]")
+        print("usage: capture SOURCE [FIRST COUNT [STEPS [ground | smooth]]]")
         return 2
     }
     let source = a[0].as_str()
-    let Ok(all_clips) = (if source == "100style" { clips_100style() } else {
+    let Ok(all_clips) = (if source == "100style" { clips_100style() } else if source == "embm" {
+        clips_embm()
+    } else {
         Err(ToolError::new("unknown source"))
     }) else {
         print(f"capture: no clips of {source}")
@@ -581,6 +827,35 @@ pub fn tool() -> u32 {
         chosen.push(take c)
     }
     print(f"capture: {source}: {chosen.len()} of {all_clips.len()} clips")
+    if a.len() > 4 && a[4].as_str() == "smooth" {
+        let done = all(take chosen, smoothed_clip)
+        var failed = 0
+        for d in done {
+            if d.failed.len() > 0 {
+                failed += 1
+                print(f"capture: {d.clip}: FAILED {d.failed}")
+            }
+        }
+        print(f"capture: smoothed, {failed} failed")
+        return 0
+    }
+    if a.len() > 4 && a[4].as_str() == "ground" {
+        let count = chosen.len()
+        let done = all(take chosen, grounded)
+        var most = 0.0
+        var sum = 0.0
+        for d in done {
+            if d.failed.len() > 0 {
+                print(f"capture: {d.clip}: FAILED {d.failed}")
+            }
+            most = max(most, abs(d.joint_mm))
+            sum += d.joint_mm
+        }
+        print(
+            f"capture: grounded, the mean shift {sum / f32(max(count, 1))} mm down, the most {most} mm",
+        )
+        return 0
+    }
     let done = all(take chosen, import)
     var secs = 0.0
     var failed = 0
