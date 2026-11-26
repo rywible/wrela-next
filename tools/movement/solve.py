@@ -172,6 +172,28 @@ def play_check(argv):
     return 0 if first < 1e-3 else 1
 
 
+def fk_check(clips):
+    """`motion.Body.places` against the engine's (`Body::places`, which tools/movement/export
+    writes in each clip's states, `.movement/sim/refs/CLIP.ref`): the largest distance of a
+    segment's origin and of its turn."""
+    body = motion.Body(f"{SOLVER}/creature.body.json")
+    worst_t, worst_r = 0.0, 0.0
+    for c in clips:
+        _, x = read_pose(f"{POSES}/{c}.pose")
+        b = open(os.path.join(ROOT, f".movement/sim/refs/{c}.ref"), "rb").read()
+        _, nq, segs, n = struct.unpack_from("<4I", b, 4)
+        row = nq + 7 * segs
+        ref = np.frombuffer(b, "<f4", n * row, 24).reshape(n, row)[:, nq:].reshape(n, segs, 7)
+        t, q = body.places(torch.tensor(np.array(x)))
+        rt = torch.tensor(np.array(ref[:, :, :3]))
+        rq = torch.tensor(np.array(ref[:, :, [4, 5, 6, 3]]))
+        worst_t = max(worst_t, (t - rt).norm(dim=-1).max().item())
+        worst_r = max(worst_r, motion.vector_of_turn(motion.qmul(q, motion.qinv(rq))).norm(dim=-1).max().item())
+    print(f"fk-check: the largest distance of a segment from the engine's {worst_t * 1000:.4f} mm, "
+          f"of its turn {worst_r * 1000:.4f} mrad")
+    return 0 if worst_t < 1e-4 and worst_r < 1e-3 else 1
+
+
 def pack(argv):
     import json
     import zlib
@@ -221,10 +243,13 @@ def main():
         sys.exit(check(sys.argv[2:]))
     if len(sys.argv) > 1 and sys.argv[1] == "play-check":
         sys.exit(play_check(sys.argv[2:]))
+    if len(sys.argv) > 1 and sys.argv[1] == "fk-check":
+        sys.exit(fk_check(sys.argv[2:]))
     if len(sys.argv) > 1 and sys.argv[1] == "pack":
         sys.exit(pack(sys.argv[2:]))
     import solve_train
     solve_train.main(load_packed)
 
 
-main()
+if __name__ == "__main__":
+    main()

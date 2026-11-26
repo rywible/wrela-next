@@ -50,6 +50,22 @@ def vector_of_turn(q):
     return q[..., :3] * k
 
 
+def _about(k, angle):
+    h = 0.5 * angle
+    z = torch.zeros_like(angle)
+    parts = [z, z, z, torch.cos(h)]
+    parts[k] = torch.sin(h)
+    return torch.stack(parts, -1)
+
+
+def turn_of_vector(r):
+    a = r.norm(dim=-1, keepdim=True)
+    small = a < 1e-8
+    k = torch.where(small, torch.full_like(a, 0.5), torch.sin(0.5 * a) / a.clamp(min=1e-12))
+    q = torch.cat([r * k, torch.cos(0.5 * a)], -1)
+    return torch.where(small, q / q.norm(dim=-1, keepdim=True), q)
+
+
 def from_mat3(x, y, z):
     """The quaternion of the frame whose columns are x, y, z (Shepperd's method, as std::quat)."""
     trace = x[..., 0] + y[..., 1] + z[..., 2]
@@ -94,6 +110,53 @@ class Body:
                 self.balls.append(j["first"])
         self.lo, self.hi = lo, hi
         self.balls = torch.tensor(self.balls, dtype=torch.long, device=device)
+        self.parent = [j.get("parent", -1) for j in self.joints]
+        if "at_q" in self.joints[0]:
+            self.at_q = torch.tensor([j["at_q"] for j in self.joints], dtype=torch.float32, device=device)
+            self.at_t = torch.tensor([j["at_t"] for j in self.joints], dtype=torch.float32, device=device)
+        self.parts = b.get("parts", [])
+        if self.parts:
+            self.part_a_on = torch.tensor([c["a_on"] for c in self.parts], device=device)
+            self.part_b_on = torch.tensor([c["b_on"] for c in self.parts], device=device)
+            self.part_a = torch.tensor([c["a"] for c in self.parts], dtype=torch.float32, device=device)
+            self.part_b = torch.tensor([c["b"] for c in self.parts], dtype=torch.float32, device=device)
+            self.part_ra = torch.tensor([c["ra"] for c in self.parts], dtype=torch.float32, device=device)
+            self.part_rb = torch.tensor([c["rb"] for c in self.parts], dtype=torch.float32, device=device)
+
+    def turn(self, s, q):
+        """Segment `s`'s joint's turn for the pose numbers `q` (`joint::turn`)."""
+        j = self.joints[s]
+        f = j["first"]
+        if j["kind"] == "hinge":
+            return _about(0, q[..., f])
+        if j["kind"] == "universal":
+            return qmul(_about(0, q[..., f]), _about(1, q[..., f + 1]))
+        if j["kind"] == "ball":
+            r = torch.stack([q[..., f], torch.zeros_like(q[..., f]), q[..., f + 1]], -1)
+            return qmul(turn_of_vector(r), _about(1, q[..., f + 2]))
+        shape = q.shape[:-1] + (4,)
+        out = torch.zeros(shape, dtype=q.dtype, device=q.device)
+        out[..., 3] = 1.0
+        return out
+
+    def places(self, pose):
+        """Each segment's frame (`Body::places`): its place [..., S, 3] and turn [..., S, 4]."""
+        q = pose[..., 7:]
+        ts, qs = [pose[..., :3]], [pose[..., 3:7]]
+        for s in range(1, len(self.joints)):
+            p = self.parent[s]
+            at_q = self.at_q[s].expand(q.shape[:-1] + (4,))
+            fq = qmul(at_q, self.turn(s, q))
+            ts.append(ts[p] + qrot(qs[p], self.at_t[s].expand(q.shape[:-1] + (3,))))
+            qs.append(qmul(qs[p], fq))
+        return torch.stack(ts, -2), torch.stack(qs, -2)
+
+    def part_ends(self, pose):
+        """Each part's two ends in the world [..., P, 3] each, and their radii [P]."""
+        t, q = self.places(pose)
+        a = t[..., self.part_a_on, :] + qrot(q[..., self.part_a_on, :], self.part_a.expand(t.shape[:-2] + self.part_a.shape))
+        b = t[..., self.part_b_on, :] + qrot(q[..., self.part_b_on, :], self.part_b.expand(t.shape[:-2] + self.part_b.shape))
+        return a, b
 
     def heading(self, q):
         f = qrot(qmul(q, qinv(self.rest).expand_as(q)), _z(q))
