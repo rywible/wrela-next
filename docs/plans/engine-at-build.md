@@ -693,6 +693,25 @@ again. Rounded to the nearest step instead, VIEW 1 was the worse (1,553 against 
 SCENE 10's span the better (23.45 against 24.38 ms; rounded down 26.68: its flames and arc are
 meshed again every frame, at cells 9% finer).
 
+Tried on 2026-11-26 and not kept: a bound of each pixel's triangle error, taken in the eye's
+resolve from its triangle (the sagitta `edge · sin(θ/2) / 4` of its vertex normals' widest
+angle θ, a crease's third of an edge), written to `g_normal.w`. Where it was wider than the
+map's texel, the classification proved nothing from the map and sent the pixel to the exact
+rays. SCENE 13 VIEW 0, placement 0, 320x180, the M4, against `009c4a1`: hard leaks 754 to 696,
+hard acne 18 to 130, exact pixels 24 to 2,434. The acne is the exact rays': they leave from the
+mesh's point. Where a cell has no certificate, that point can be inside the solid by more than
+the pixel's error, and `trace_sun_near` then calls the pixel dark. Three steps along the normal
+onto the field's surface, whatever the offset, took the acne to 55 and the leaks to 703. The
+exact pixels' leaks stayed (343 of 2,264). Their rays step at least `e` (half a pixel at
+320x180), so a bead on the table's turned legs that is thinner than that is not seen, and the
+judge's unfiltered rays see it. The map's leaks on those legs come from the same place: at
+320x180 no mesh holds a bead below its cells. Thus the leaks are casters smaller than the eye's
+cells, and no mesh's error bound brings them back. Next: a bound for each cell from extraction
+(the cell's certificate, or its cell where it has none), carried with the vertex, so that the
+classification and the exact rays use the same error. And then a decision: either the sun's
+rays see detail below the eye's pixel (a cost), or the judge filters to the pixel's footprint
+(`SUN_FILTERED`, which is there and off).
+
 Purpose: the build calculates, one time, the results of extraction that do not depend on the
 eye. The game loads them and does not calculate them again.
 
