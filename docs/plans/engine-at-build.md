@@ -778,7 +778,18 @@ sun's exact rays 0.9), the full-screen fragment passes 4 to 9 times over (direct
 refraction 8.6, the tone 5.8): the time a unit was measured on a dependent chain of sines, and a
 fragment's work runs its independent operations side by side. Next: a unit for fragment work,
 measured as the compute unit is, and the mesh draws' rasterising. The target is 20% of each
-gate scene's span, on the two machines. Steps 2 to 4 are open.
+gate scene's span, on the two machines. Step 2 has its first decision: whether a kind can be
+skinned is `Surface::MAY_SKIN`, an associated constant (true for `Skinned` and the wrappers that
+forward its hash, false otherwise), and the extraction's, the pool's and every draw's skinned or
+deformed branch is `M::MAY_SKIN && …` (the world's, `MeshWorld::MAY_SKIN`, for the shadows), so
+it folds: SCENE 14's build has 165 pipelines where it had 206 (its 17 skinned and deformed draws
+and the 24 rest-pose extraction kernels of its six unskinned kinds gone), SCENE 10's 247 where it
+had 320 (the creatures keep theirs); a build alone 38.6 to 23.6 s and 13.0 to 10.8 s, the host's
+load (a second run) 5.1 to 5.2 s and 2.1 to 0.8 s, the first frame's CPU the same, the spans
+20.87/16.52/18.97/21.95 to 20.88/16.36/18.86/21.74 ms. A kind's `FieldFacts` was the first carrier and didn't fold
+on the CPU for every kind (a `Dressed` thing's facts are a call the inliner leaves), so the
+constant is the kind's own. A skinned field whose kind says it can't be stops where it's meshed
+(`held_unskinned`). Steps 3 and 4 and the rest of step 2 are open.
 
 ### The decisions made at run time (step 1)
 
@@ -799,7 +810,7 @@ that choose a path, a pass, a capacity, a cell or a skip. By what each depends o
 - The kind alone, made at run time (step 2's list):
   1. Which path a field takes, asked of it on the CPU each frame: skinned
      (`skin_shape_hash`, and the `is_skinned` / `is_deformed` latches every draw, shadow and
-     refraction then branches on), rigid (`rigid_shape_hash`, `has_constant_channels`,
+     refraction then branches on; done: `Surface::MAY_SKIN`), rigid (`rigid_shape_hash`, `has_constant_channels`,
      `has_local_channels`: `rigid_key`), edited (`edit_base_hash().is_some()`: the patch
      headroom), parts (`parts()`, `part_state`: per-part patching), a pool's first thing skinned.
   2. The tuning of its cells from its stated steepness: `steep()` (`lipschitz(1) > 1.15`) and

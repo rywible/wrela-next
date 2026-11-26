@@ -1161,115 +1161,119 @@ impl MeshBatch {
         field.state_hash(mut h)
         let key = h.finish()
 
-        match field.skin_shape_hash() {
-            Some(sk) => {
-                let rf = field.rigid_frame()
-                // Extract the reusable rest-pose template slightly finer (0.75×) so edges bridging
-                // bent joints (shoulders, hips, knees) stay sub-pixel accurate after DQS.
-                let eff_cell = (cell * 0.75) / max(rf.scale_factor(), 1.0e-4)
-                let bc = max(field.skin_bone_count(), 1)
-                if self.built &&
-                    self.is_skinned &&
-                    self.is_deformed &&
-                    self.hash == key &&
-                    !self.budget_short &&
-                    abs(self.cell - eff_cell) <= 0.05 * max(self.cell, 1.0e-4) {
-                    if self.prev_xforms_dirty {
+        if M::MAY_SKIN {
+            match field.skin_shape_hash() {
+                Some(sk) => {
+                    let rf = field.rigid_frame()
+                    // Extract the reusable rest-pose template slightly finer (0.75×) so edges bridging
+                    // bent joints (shoulders, hips, knees) stay sub-pixel accurate after DQS.
+                    let eff_cell = (cell * 0.75) / max(rf.scale_factor(), 1.0e-4)
+                    let bc = max(field.skin_bone_count(), 1)
+                    if self.built &&
+                        self.is_skinned &&
+                        self.is_deformed &&
+                        self.hash == key &&
+                        !self.budget_short &&
+                        abs(self.cell - eff_cell) <= 0.05 * max(self.cell, 1.0e-4) {
+                        if self.prev_xforms_dirty {
+                            copy(from: self.xforms.items(), to: self.prev_xforms.items_mut())
+                            self.prev_xforms_dirty = false
+                        }
+                        if self.prev_bones_dirty {
+                            copy(from: self.bones.items(), to: self.prev_bones.items_mut())
+                            self.prev_bones_dirty = false
+                        }
+                        if self.prev_deformed_dirty {
+                            copy(
+                                from: self.deformed_verts.items(),
+                                to: self.prev_deformed_verts.items_mut(),
+                            )
+                            self.prev_deformed_dirty = false
+                        }
+                        self.still_frames += 1
+                        return
+                    }
+                    var pose_dq: Vec<DualQuat> = Vec::new()
+                    for b in 0..bc {
+                        pose_dq.push(field.skin_bone(b))
+                    }
+                    let wb = field.bound()
+                    self.bound = vec4(wb.centre, min(wb.radius, 1.0e4))
+                    if self.built &&
+                        self.is_skinned &&
+                        self.is_deformed &&
+                        !self.instanced &&
+                        self.shape_key == sk &&
+                        self.bone_stride == bc &&
+                        abs(self.cell - eff_cell) <= 0.05 * max(self.cell, 1.0e-4) {
                         copy(from: self.xforms.items(), to: self.prev_xforms.items_mut())
-                        self.prev_xforms_dirty = false
-                    }
-                    if self.prev_bones_dirty {
-                        copy(from: self.bones.items(), to: self.prev_bones.items_mut())
-                        self.prev_bones_dirty = false
-                    }
-                    if self.prev_deformed_dirty {
+                        write(mut self.xforms, 0, [rf])
+                        self.prev_xforms_dirty = true
+                        let grew_b = self.ensure_bones(bc)
+                        if !grew_b {
+                            copy(from: self.bones.items(), to: self.prev_bones.items_mut())
+                            self.prev_bones_dirty = true
+                        } else {
+                            write(mut self.prev_bones, 0, pose_dq)
+                            self.prev_bones_dirty = false
+                        }
+                        write(mut self.bones, 0, pose_dq)
+                        label("mesh_skin")
                         copy(
                             from: self.deformed_verts.items(),
                             to: self.prev_deformed_verts.items_mut(),
                         )
-                        self.prev_deformed_dirty = false
+                        self.deform(mut scratch, field)
+                        self.prev_deformed_dirty = true
+                        self.hash = key
+                        self.still_frames = 0
+                        return
                     }
-                    self.still_frames += 1
-                    return
-                }
-                var pose_dq: Vec<DualQuat> = Vec::new()
-                for b in 0..bc {
-                    pose_dq.push(field.skin_bone(b))
-                }
-                let wb = field.bound()
-                self.bound = vec4(wb.centre, min(wb.radius, 1.0e4))
-                if self.built &&
-                    self.is_skinned &&
-                    self.is_deformed &&
-                    !self.instanced &&
-                    self.shape_key == sk &&
-                    self.bone_stride == bc &&
-                    abs(self.cell - eff_cell) <= 0.05 * max(self.cell, 1.0e-4) {
-                    copy(from: self.xforms.items(), to: self.prev_xforms.items_mut())
+                    let aabb = tight_aabb_rest(field)
+                    let g = grid_for(aabb, eff_cell, base_brick: 0, orig_id: 0, shift: scratch.lattice)
+                    let total_bricks = g.dims.x * g.dims.y * g.dims.z
+                    let fbuf = buffer_of([field])
+                    scratch.ensure_grids(1)
+                    write(mut scratch.grids, 0, [g])
                     write(mut self.xforms, 0, [rf])
-                    self.prev_xforms_dirty = true
-                    let grew_b = self.ensure_bones(bc)
-                    if !grew_b {
-                        copy(from: self.bones.items(), to: self.prev_bones.items_mut())
-                        self.prev_bones_dirty = true
-                    } else {
-                        write(mut self.prev_bones, 0, pose_dq)
-                        self.prev_bones_dirty = false
-                    }
+                    write(mut self.prev_xforms, 0, [rf])
+                    write(mut self.inst_ids, 0, [0])
+                    self.prev_xforms_dirty = false
+                    let _ = self.ensure_bones(bc)
                     write(mut self.bones, 0, pose_dq)
-                    label("mesh_skin")
-                    copy(
-                        from: self.deformed_verts.items(),
-                        to: self.prev_deformed_verts.items_mut(),
+                    write(mut self.prev_bones, 0, pose_dq)
+                    self.prev_bones_dirty = false
+                    self.inst_count = 1
+                    self.run_extract_skinned(
+                        mut scratch,
+                        fbuf.items(),
+                        sample: field,
+                        things: 1,
+                        total_bricks: total_bricks,
+                        inst_count: 1,
                     )
+                    self.ensure_deformed_verts(self.cap_verts)
+                    label("mesh_skin")
                     self.deform(mut scratch, field)
-                    self.prev_deformed_dirty = true
+                    copy(from: self.deformed_verts.items(), to: self.prev_deformed_verts.items_mut())
+                    self.prev_deformed_dirty = false
+                    self.extracted_xform = Rigid::identity()
+                    self.shape_key = sk
+                    self.is_rigid_cached = false
+                    self.is_skinned = true
+                    self.is_deformed = true
+                    self.bone_stride = bc
+                    self.instanced = false
                     self.hash = key
+                    self.cell = eff_cell
+                    self.built = true
                     self.still_frames = 0
                     return
-                }
-                let aabb = tight_aabb_rest(field)
-                let g = grid_for(aabb, eff_cell, base_brick: 0, orig_id: 0, shift: scratch.lattice)
-                let total_bricks = g.dims.x * g.dims.y * g.dims.z
-                let fbuf = buffer_of([field])
-                scratch.ensure_grids(1)
-                write(mut scratch.grids, 0, [g])
-                write(mut self.xforms, 0, [rf])
-                write(mut self.prev_xforms, 0, [rf])
-                write(mut self.inst_ids, 0, [0])
-                self.prev_xforms_dirty = false
-                let _ = self.ensure_bones(bc)
-                write(mut self.bones, 0, pose_dq)
-                write(mut self.prev_bones, 0, pose_dq)
-                self.prev_bones_dirty = false
-                self.inst_count = 1
-                self.run_extract_skinned(
-                    mut scratch,
-                    fbuf.items(),
-                    sample: field,
-                    things: 1,
-                    total_bricks: total_bricks,
-                    inst_count: 1,
-                )
-                self.ensure_deformed_verts(self.cap_verts)
-                label("mesh_skin")
-                self.deform(mut scratch, field)
-                copy(from: self.deformed_verts.items(), to: self.prev_deformed_verts.items_mut())
-                self.prev_deformed_dirty = false
-                self.extracted_xform = Rigid::identity()
-                self.shape_key = sk
-                self.is_rigid_cached = false
-                self.is_skinned = true
-                self.is_deformed = true
-                self.bone_stride = bc
-                self.instanced = false
-                self.hash = key
-                self.cell = eff_cell
-                self.built = true
-                self.still_frames = 0
-                return
-            },
-            None => {},
+                },
+                None => {},
+            }
+        } else {
+            held_unskinned(field)
         }
 
         let (rf, maybe_sk) = rigid_key(field)
@@ -1416,12 +1420,16 @@ impl MeshBatch {
         force_direct: bool,
     ) {
         if !force_direct {
-            match field.skin_shape_hash() {
-                Some(_) => {
-                    self.sync_one(mut scratch, field, h_top)
-                    return
-                },
-                None => {},
+            if M::MAY_SKIN {
+                match field.skin_shape_hash() {
+                    Some(_) => {
+                        self.sync_one(mut scratch, field, h_top)
+                        return
+                    },
+                    None => {},
+                }
+            } else {
+                held_unskinned(field)
             }
             if h_top <= h_near * 1.45 {
                 let (_, rkey) = rigid_key(field)
@@ -1674,7 +1682,7 @@ impl MeshBatch {
         var shared_sk: u64 = 0
         var best_i: u32 = 0
         var best_local_cell: f32 = 1.0e20
-        var all_same_skin = true
+        var all_same_skin = M::MAY_SKIN
         var shared_skin_sk: u64 = 0
         var shared_bc: u32 = 0
         var best_skin_i: u32 = 0
@@ -1694,7 +1702,7 @@ impl MeshBatch {
                 let r = min(b.radius, 1.0e4)
                 wlo = min(wlo, b.centre - vec3(r))
                 whi = max(whi, b.centre + vec3(r))
-                if all_same_skin {
+                if M::MAY_SKIN && all_same_skin {
                     match fields[i].skin_shape_hash() {
                         Some(sk) => {
                             let bc = max(fields[i].skin_bone_count(), 1)
@@ -1740,7 +1748,7 @@ impl MeshBatch {
             }
         }
         let key = h.finish()
-        let check_cell = if all_same_skin && vis_count > 0 {
+        let check_cell = if M::MAY_SKIN && all_same_skin && vis_count > 0 {
             best_skin_cell
         } else if all_same_rigid && vis_count > 0 {
             best_local_cell
@@ -1807,7 +1815,7 @@ impl MeshBatch {
 
         // Fast path A: all visible items share one `Skinned` rest-pose template -> extract 1
         // rest-pose meshlet once and GPU-instance all `vis_count` articulated characters with DQS!
-        if all_same_skin {
+        if M::MAY_SKIN && all_same_skin {
             let mid = 0.5 * (wlo + whi)
             self.bound = vec4(mid, length(whi - mid))
             var deltas: Vec<Rigid> = Vec::new()
@@ -3830,3 +3838,12 @@ pub fn part_classes<M: Field<Substance> + StateHash>(then: M, now: M) -> Vec<u32
     out
 }
 
+/// Stops where `field`, of a kind that says it can't be skinned (`Surface::MAY_SKIN` false: its
+/// extraction and draws have no skinned path, built so), is skinned all the same: those draws
+/// would draw it at rest.
+pub(package) fn held_unskinned<M: Field<Substance>>(field: M) {
+    assert(
+        field.skin_shape_hash().is_none(),
+        "a skinned field's kind says it can't be skinned (`Surface::MAY_SKIN`): its draws have no skinned path",
+    )
+}
