@@ -934,6 +934,27 @@ pub(package) fn finer_than_a_hole(cell_lo: vec3, h: f32, exact_eye: vec4) -> boo
 
 /// Pushes the cell's compact 16-byte dual vertex at `wp` (octahedral normal + thing index +
 /// smooth/transmissive flags; full procedural `channels(wp)` runs at 1× pixel rate in `mesh_eye`).
+/// A solved cell's vertex at `wp` of thing `thing_id`, its packed normal and flags
+/// (`pack_vertex_meta`): the normal `dist`'s gradient `gv` (else the QEF's mean normal), smooth
+/// where the QEF's normals agree, transmissive where the field's channels there let light
+/// through.
+pub(package) fn vertex_meta<M: Field<Substance>>(f: M, thing_id: u32, wp: vec3, gv: vec3, qef: Qef) -> u32 {
+    let n_final = safe_norm(gv, safe_norm(qef.avg_n, vec3(0.0, 1.0, 0.0)))
+    let is_trans = !f.uses_kept() &&
+        f.field_facts().may_transmit &&
+        f.channels(wp).transmission > 0.02
+    pack_vertex_meta(n_final, thing_id, smooth: qef.min_dot >= SMOOTH_DOT, is_trans: is_trans)
+}
+
+/// `vertex_meta` at the rest pose (`rest_channels`).
+fn rest_vertex_meta<M: Field<Substance>>(f: M, thing_id: u32, wp: vec3, gv: vec3, qef: Qef) -> u32 {
+    let n_final = safe_norm(gv, safe_norm(qef.avg_n, vec3(0.0, 1.0, 0.0)))
+    let is_trans = !f.uses_kept() &&
+        f.field_facts().may_transmit &&
+        f.rest_channels(wp).transmission > 0.02
+    pack_vertex_meta(n_final, thing_id, smooth: qef.min_dot >= SMOOTH_DOT, is_trans: is_trans)
+}
+
 fn push_vertex<M: Field<Substance>>(
     f: M,
     thing_id: u32,
@@ -945,18 +966,8 @@ fn push_vertex<M: Field<Substance>>(
     verts: mut Append<MeshVertex>,
     cell_verts: mut Atomics<u32>,
 ) {
-    let n_final = safe_norm(gv, safe_norm(qef.avg_n, vec3(0.0, 1.0, 0.0)))
-    let is_trans = !f.uses_kept() &&
-        f.field_facts().may_transmit &&
-        f.channels(wp).transmission > 0.02
-    let smooth = qef.min_dot >= SMOOTH_DOT
     let vi = verts.push(
-        MeshVertex {
-            px: wp.x,
-            py: wp.y,
-            pz: wp.z,
-            packed: pack_vertex_meta(n_final, thing_id, smooth: smooth, is_trans: is_trans),
-        },
+        MeshVertex { px: wp.x, py: wp.y, pz: wp.z, packed: vertex_meta(f, thing_id, wp, gv, qef) },
     )
     if vi < cap_verts {
         cell_verts.store(i: slot, value: vi)
@@ -1271,37 +1282,53 @@ pub fn prep_slices(
     args[id] = DispatchArgs { x: (m + 63) / 64, y: 1, z: 1 }
 }
 
-/// What one step of a crease cell's solve (`crease_steps`) asks of `dist` from a cell at `lo`
-/// (side `h`), for the compiler's count of its work: corners that depend on the cell, so no side
-/// of a branch is settled by them.
-fn crease_step_work<F: Copy + fn(vec3) -> f32>(dist: F, lo: vec3, h: f32) -> vec3 {
-    let d = CellCorners {
-        d000: lo.x,
-        d100: -lo.x,
-        d010: lo.y,
-        d110: -lo.y,
-        d001: lo.z,
-        d101: -lo.z,
-        d011: lo.x - lo.y,
-        d111: lo.y - lo.z,
-    }
-    let s = crease_steps(dist, crease_start(d, lo, h), lo, h, 1)
-    s.wp + s.gv + s.uvw
+/// What one step of a crease cell's solve is given in a kernel, all of it unknown to the count:
+/// the solve's state and the parts live in its brick.
+struct CreaseStepIn: Copy {
+    solve: CreaseSolve,
+    live: Live,
+    d: CellCorners,
+    pass: u32,
 }
 
 /// The work of one step of a crease cell's solve of a field like `sample`'s distance
-/// (`crease_steps`), as the strict kernel computes it (`std::derive::strict_work`). Every choice
+/// (`crease_steps`) from any state and with any parts live (all unknown, so the count takes the
+/// costliest step, as the kernel's own count does), as the strict kernel computes it (`std::derive::strict_work`). Every choice
 /// of how a field's crease and surface cells are dispatched starts from this one count, so a
 /// kind is counted once.
 pub(package) fn crease_step_cost_of<M: Field<Substance>>(sample: M) -> u32 {
-    let dist = |q: vec3| sample.distance_live(q, ALL_LIVE)
-    max(std::derive::strict_work(|lo: vec3| crease_step_work(dist, lo, h: 0.01)), 1)
+    max(std::derive::strict_work(|s: CreaseStepIn| crease_steps(|q: vec3| sample.distance_live(q, s.live), s.solve, s.solve.ewp, s.solve.hi, 1)), 1)
 }
 
 /// `crease_step_cost_of` of a field like `sample`'s rest-pose distance (`refine_creases_rest`).
 pub(package) fn crease_step_cost_rest_of<M: Field<Substance>>(sample: M) -> u32 {
-    let dist = |q: vec3| sample.rest_distance_live(q, ALL_LIVE)
-    max(std::derive::strict_work(|lo: vec3| crease_step_work(dist, lo, h: 0.01)), 1)
+    max(std::derive::strict_work(|s: CreaseStepIn| crease_steps(|q: vec3| sample.rest_distance_live(q, s.live), s.solve, s.solve.ewp, s.solve.hi, 1)), 1)
+}
+
+/// The work of one invocation of `refine_creases` for a field like `sample` (`crease_steps` of
+/// the steps a dispatch takes, `crease_part`, from any state and with any parts live, and the
+/// vertex it ends in, `vertex_meta`), as the
+/// strict kernel computes it: what its dispatches are sliced by (`crease_slice`). Counted whole,
+/// not as a step times the steps: a run of steps counts more than one step's count times them.
+pub(package) fn crease_invocation_cost_of<M: Field<Substance>>(sample: M) -> u32 {
+    std::derive::strict_work(|s: CreaseStepIn| {
+        let lo = s.solve.ewp
+        let h = s.solve.hi
+        let from = if s.pass == 0 { crease_start(s.d, lo, h) } else { s.solve }
+        let r = crease_steps(|q: vec3| sample.distance_live(q, s.live), from, lo, h, crease_part(crease_step_cost_of(sample)))
+        vertex_meta(sample, s.live.words.x, r.wp, r.gv, r.qef)
+    })
+}
+
+/// `crease_invocation_cost_of` at the rest pose (`refine_creases_rest`).
+pub(package) fn crease_invocation_cost_rest_of<M: Field<Substance>>(sample: M) -> u32 {
+    std::derive::strict_work(|s: CreaseStepIn| {
+        let lo = s.solve.ewp
+        let h = s.solve.hi
+        let from = if s.pass == 0 { crease_start(s.d, lo, h) } else { s.solve }
+        let r = crease_steps(|q: vec3| sample.rest_distance_live(q, s.live), from, lo, h, crease_part(crease_step_cost_rest_of(sample)))
+        rest_vertex_meta(sample, s.live.words.x, r.wp, r.gv, r.qef)
+    })
 }
 
 /// The steps of a crease cell's solve one dispatch takes, a step costing `step`: all of them
@@ -1323,13 +1350,12 @@ pub(package) fn crease_passes(part: u32) -> u32 {
     (CREASE_STEPS + part - 1) / part
 }
 
-/// The crease cells one dispatch may solve, a step costing `step`: as many as keep it within the
-/// GPU's step (`limits().step_work`), clamped to `[CREASE_SLICE_LEAST, CREASE_SLICE]`, a cell's
-/// work the steps a dispatch takes of it (`crease_part`).
-pub(package) fn crease_slice(step: u32) -> u32 {
-    let cell = f32(crease_part(step)) * f32(step)
+/// The crease cells one dispatch may solve, an invocation costing `invocation`
+/// (`crease_invocation_cost_of`): as many as keep it within the GPU's step (`limits().step_work`),
+/// clamped to `[CREASE_SLICE_LEAST, CREASE_SLICE]`.
+pub(package) fn crease_slice(invocation: u32) -> u32 {
     let work = f32(limits().step_work) * 1000.0
-    let n = u32(clamp(work / (cell * 1.2 + 2000.0), f32(CREASE_SLICE_LEAST), f32(CREASE_SLICE)))
+    let n = u32(clamp(work / (f32(invocation) * 1.2 + 2000.0), f32(CREASE_SLICE_LEAST), f32(CREASE_SLICE)))
     max((n / 64) * 64, CREASE_SLICE_LEAST)
 }
 
@@ -1581,18 +1607,13 @@ fn push_skinned_vertex<M: Field<Substance>>(
     skin_verts: mut Atomics<u32>,
     cell_verts: mut Atomics<u32>,
 ) {
-    let n_final = safe_norm(gv, safe_norm(qef.avg_n, vec3(0.0, 1.0, 0.0)))
-    let is_trans = !f.uses_kept() &&
-        f.field_facts().may_transmit &&
-        f.rest_channels(wp).transmission > 0.02
-    let smooth = qef.min_dot >= SMOOTH_DOT
     let sw = f.rest_skin_weights(wp)
     let vi = verts.push(
         MeshVertex {
             px: wp.x,
             py: wp.y,
             pz: wp.z,
-            packed: pack_vertex_meta(n_final, thing_id, smooth: smooth, is_trans: is_trans),
+            packed: rest_vertex_meta(f, thing_id, wp, gv, qef),
         },
     )
     if vi < cap_verts {

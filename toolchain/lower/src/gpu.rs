@@ -3947,8 +3947,10 @@ fn verify(cx: &mut Cx, mb: &mut ModuleBuilder, name: &str) -> Option<Counts> {
             .and_then(|()| ir::verify(&mb.m));
         if checked.is_ok() {
             // The work of the code that runs, counted again. A strict module's is of std's code
-            // in it (§18.11): the more of the two, and none where this count finds no bound (the
-            // host then refuses it). A module whose branches folded can be bounded where its
+            // in it (§18.11): the more of the two (the flattened count can miss what the
+            // source's sees: `cull_bricks` came to 2,755 flattened, 164,544 as written, and takes
+            // 4.4 ms on the M4 for 8,192 invocations), and none where this count finds no bound
+            // (the host then refuses it). A module whose branches folded can be bounded where its
             // source wasn't, and do less: the less of the two. Where the source's count had a
             // bound and the code that runs has a loop with no way out, a pass erased the loop's
             // exit: an internal error (on 2026-11-25 such a kernel held the M4's GPU until a
@@ -4570,8 +4572,88 @@ fn count_work(
         ir::strict::lower_strict(&mut mb.m);
         crate::make_strict(cx, &mut mb);
     }
-    let w = ir::work::entry_work(&mb.m, id).work;
+    let mut w = ir::work::entry_work(&mb.m, id).work;
+    if strict {
+        // A kernel reads what it's given from its buffers, part by part where it's used (the
+        // optimizer's `narrow_loads`), and a read of memory costs more than a register's: a
+        // capture of a struct or an array is read from a storage buffer here too, so its reads
+        // are counted as a kernel's are. (Its input, the last parameter, stays a value.)
+        reads_captures_from_memory(&mut mb.m, id);
+        // And as a kernel's count has it, of its code flattened: a small branch made selects
+        // computes both its sides (`ir::opt::if_convert`), so the code a kernel runs can do more
+        // than its source's count says. The more of the two.
+        mb.m.entry_points.push(ir::EntryPoint {
+            name: "counted".into(),
+            stage: ir::Stage::Compute { workgroup_size: [1, 1, 1] },
+            function: id,
+            inputs: Vec::new(),
+        });
+        if ir::opt::flatten_gpu(&mut mb.m).is_ok() {
+            let (each, _) = ir::work::module_work(&mb.m);
+            w = match (w, each.first().map(|e| e.work)) {
+                (Some(a), Some(Some(b))) => Some(a.max(b)),
+                (_, Some(None)) => None,
+                (a, _) => a,
+            };
+        }
+    }
     Some(w.map_or(u32::MAX, |w| u32::try_from(w).unwrap_or(u32::MAX)))
+}
+
+/// Function `id`'s captures (its parameters but the last) of a struct or an array type, each
+/// read from a read-only storage buffer of its own in place of the parameter: what a kernel
+/// given them reads ([`count_work`]).
+fn reads_captures_from_memory(m: &mut ir::Module, id: ir::FuncId) {
+    let params = m.functions[id.index()].params.clone();
+    let mut swaps: std::collections::HashMap<u32, ir::ResourceId> = Default::default();
+    for (i, p) in params.iter().enumerate().take(params.len().saturating_sub(1)) {
+        let aggregate =
+            matches!(m.types.get(p.ty), ir::TypeDef::Struct { .. } | ir::TypeDef::Array(..));
+        if aggregate {
+            let r = m.add_resource(ir::Resource {
+                name: format!("capture{i}"),
+                binding: 1000 + i as u32,
+                kind: ir::ResourceKind::StorageRead,
+                ty: p.ty,
+            });
+            swaps.insert(i as u32, r);
+        }
+    }
+    if swaps.is_empty() {
+        return;
+    }
+    let u = m.types.u32();
+    let mut f = std::mem::take(&mut m.functions[id.index()]);
+    let mut body = std::mem::take(&mut f.body);
+    // A capture passed by reference is read through its place: the buffer's element.
+    let mut head = Vec::new();
+    let first = f.let_(&mut head, u, ir::Expr::Const(ir::Const::U32(0)));
+    ir::visit::walk_mut(&mut body, &mut |s| {
+        s.for_each_place_mut(&mut |p| {
+            if let ir::PlaceRoot::Param(i) = p.root
+                && let Some(&r) = swaps.get(&i)
+                && params[i as usize].by_ref
+            {
+                p.root = ir::PlaceRoot::Resource(r);
+                p.path.insert(0, ir::Proj::Index(first));
+            }
+        })
+    });
+    head.append(&mut body);
+    body = head;
+    ir::visit::expand(&mut body, &mut |s, out| match s {
+        ir::Stmt::Let(v, ir::Expr::Param(i)) if swaps.contains_key(&i) => {
+            let zero = f.let_(out, u, ir::Expr::Const(ir::Const::U32(0)));
+            let at = ir::Place {
+                root: ir::PlaceRoot::Resource(swaps[&i]),
+                path: vec![ir::Proj::Index(zero)],
+            };
+            out.push(ir::Stmt::Let(v, ir::Expr::Load(at)));
+        }
+        s => out.push(s),
+    });
+    f.body = body;
+    m.functions[id.index()] = f;
 }
 
 /// The callable `key` lowered as GPU code in a module of its own, for a derivation that reads its
