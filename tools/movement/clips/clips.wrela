@@ -1,0 +1,144 @@
+// The movement tools' files, written once for all of them.
+//
+// A pose file (tools/movement/capture writes them from capture; the solver's tool from the
+// solver): "WPOS", u32 version (1), u32 numbers a pose (D), u32 frames, f32 frames a second; then
+// each frame's root (its place x, y, z and its turn x, y, z, w) and its D numbers, all f32,
+// little-endian. A tool reads them under a root it was given (`--read poses=.movement/poses`), as
+// `ROOT/creature/SOURCE/CLIP.pose`.
+
+use engine::body::body::Pose
+use engine::body::joint::Frame
+use std::collections::Vec
+use std::serialize::{Reader, Writer}
+use std::string::String
+use std::tool::ToolError
+use std::tool::blob
+use std::tool::files
+
+/// The largest piece `files` reads or writes in one call.
+const PIECE: u32 = 524288
+
+/// The file at `path`, whole, of any size.
+pub fn read_all(path: str) -> Result<Vec<u8>, ToolError> {
+    let b = files::read_blob(path).wait()?
+    let n = blob::len(b).wait()?
+    var out: Vec<u8> = Vec::with_capacity(u32(n))
+    var at: u64 = 0
+    while at < n {
+        let part = blob::read(b, at, PIECE).wait()?
+        at += u64(part.len())
+        for x in part {
+            out.push(x)
+        }
+    }
+    let _ = blob::release(b).wait()
+    Ok(out)
+}
+
+/// Writes `bytes` to `path`, whole, of any size.
+pub fn write_all(path: str, bytes: Vec<u8>) -> Result<(), ToolError> {
+    if bytes.len() <= PIECE {
+        let _ = files::write(path, bytes).wait()?
+        return Ok(())
+    }
+    let b = blob::new().wait()?
+    var at = 0
+    while at < bytes.len() {
+        let end = min(at + PIECE, bytes.len())
+        var part: Vec<u8> = Vec::with_capacity(end - at)
+        for i in at..end {
+            part.push(bytes[i])
+        }
+        let _ = blob::append(b, part).wait()?
+        at = end
+    }
+    let _ = files::write_blob(path, b).wait()?
+    let _ = blob::release(b).wait()
+    Ok(())
+}
+
+/// A clip's name, its frames a second and its poses.
+pub struct Clip<const D: u32>: Clone {
+    pub name: String,
+    pub rate: f32,
+    pub poses: Vec<Pose<D>>,
+}
+
+fn word(r: mut Reader) -> u32 {
+    match r.read_u32() {
+        Ok(x) => x,
+        Err(_) => 0,
+    }
+}
+
+/// The clip `name` (SOURCE/CLIP) under the root `root`: `root/creature/name.pose`.
+pub fn load<const D: u32>(root: str, name: str) -> Result<Clip<D>, ToolError> {
+    let bytes = read_all(f"{root}/creature/{name}.pose")?
+    if bytes.len() < 20 {
+        return Err(ToolError::new(f"{name}: not a pose file"))
+    }
+    var r = Reader::new(take bytes)
+    let magic = word(mut r)
+    if magic != 0x534f5057 {
+        return Err(ToolError::new(f"{name}: not a pose file"))
+    }
+    let _version = word(mut r)
+    let d = word(mut r)
+    let n = word(mut r)
+    let rate = bitcast_f32(word(mut r))
+    if d != D {
+        return Err(ToolError::new(f"{name}: {d} numbers a pose, not {D}"))
+    }
+    var poses: Vec<Pose<D>> = Vec::with_capacity(n)
+    for _ in 0..n {
+        var x = [0.0; 7]
+        for k in 0..7 {
+            x[k] = bitcast_f32(word(mut r))
+        }
+        var p: Pose<D> = Pose {
+            root: Frame { q: Quat { v: vec4(x[3], x[4], x[5], x[6]) }, t: vec3(x[0], x[1], x[2]) },
+            q: [0.0; D],
+        }
+        for k in 0..D {
+            p.q[k] = bitcast_f32(word(mut r))
+        }
+        poses.push(p)
+    }
+    Ok(Clip { name: name.to_string(), rate, poses })
+}
+
+/// `poses` (at `rate` frames a second) as a pose file's bytes.
+pub fn pose_bytes<const D: u32>(poses: [Pose<D>], rate: f32) -> Vec<u8> {
+    var w = Writer::new()
+    w.write_u32(0x534f5057)
+    w.write_u32(1)
+    w.write_u32(D)
+    w.write_u32(poses.len())
+    w.write_u32(bitcast_u32(rate))
+    for p in poses {
+        let r = p.root
+        for x in [r.t.x, r.t.y, r.t.z, r.q.v.x, r.q.v.y, r.q.v.z, r.q.v.w] {
+            w.write_u32(bitcast_u32(x))
+        }
+        for x in p.q {
+            w.write_u32(bitcast_u32(x))
+        }
+    }
+    take w.into_bytes()
+}
+
+/// The names of the clips of set `name` (`split/NAME.txt` under the root `split`: a clip a
+/// line, `#` a remark).
+pub fn set(name: str) -> Result<Vec<String>, ToolError> {
+    let bytes = files::read(f"split/{name}.txt").wait()?
+    let Some(text) = String::from_utf8(take bytes) else { return Err(ToolError::new("not UTF-8")) }
+    var out: Vec<String> = Vec::new()
+    let t = text.as_str()
+    for (a, b) in t.lines() {
+        let line = t.slice(a, b).trim()
+        if line.len() > 0 && !line.starts_with("#") {
+            out.push(line.to_string())
+        }
+    }
+    Ok(out)
+}
