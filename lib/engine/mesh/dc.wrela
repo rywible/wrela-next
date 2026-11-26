@@ -230,28 +230,32 @@ pub(package) fn cull_bricks<M: Field<Substance>>(
 }
 
 /// A chunk's indirect dispatch sizes, from its active bricks (`n`, at most `CHUNK_BRICKS` from
-/// `chunk_start`): `eval_args` 512 corners a brick, `vert_args` its cells, and `quad_args` its
-/// 256 edge lanes a brick in slices of `quad_slice` bricks (`quad_slice`: the triangle kernels'
-/// own bounds decide how many a dispatch may hold), one slice an invocation.
+/// `chunk_start`): `vert_args` its cells, and in slices, one an invocation, `eval_args` its 512
+/// corners a brick (`eval_slice` bricks a slice) and `quad_args` its 256 edge lanes a brick
+/// (`quad_slice` bricks a slice): the corner and the triangle kernels' own bounds decide how
+/// many bricks a dispatch may hold (`brick_slice`).
 @strict
 @compute(1)
 pub(package) fn prep_chunk(
     active_count: [u32],
     cap_bricks: u32,
     chunk_start: u32,
+    eval_slice: u32,
     quad_slice: u32,
-    eval_args: mut One<DispatchArgs>,
     vert_args: mut One<DispatchArgs>,
+    eval_args: mut Slots<DispatchArgs>,
     quad_args: mut Slots<DispatchArgs>,
     id: GlobalId,
 ) {
     let total = min(active_count[0], cap_bricks)
     let n = if total > chunk_start { min(total - chunk_start, CHUNK_BRICKS) } else { 0 }
-    eval_args.set(id, DispatchArgs { x: n * 8, y: 1, z: 1 })
     vert_args.set(id, DispatchArgs { x: n * 6, y: 1, z: 1 })
-    let first = id.x * quad_slice
-    let m = if n > first { min(n - first, quad_slice) } else { 0 }
-    quad_args[id] = DispatchArgs { x: m * 4, y: 1, z: 1 }
+    let e_first = id.x * eval_slice
+    let e = if n > e_first { min(n - e_first, eval_slice) } else { 0 }
+    eval_args[id] = DispatchArgs { x: e * 8, y: 1, z: 1 }
+    let q_first = id.x * quad_slice
+    let q = if n > q_first { min(n - q_first, quad_slice) } else { 0 }
+    quad_args[id] = DispatchArgs { x: q * 4, y: 1, z: 1 }
 }
 
 /// Pass 1: Evaluates `field.distance_live` at all 512 (`8×8×8`) corners of each active brick in a
@@ -265,16 +269,18 @@ pub(package) fn eval_corners<M: Field<Substance>>(
     active_count: [u32],
     cap_bricks: u32,
     chunk_start: u32,
+    brick_off: u32,
     corners: mut Slots<f32>,
     id: GlobalId,
 ) {
-    let brick_in_chunk = id.x / CORNERS_BRICK
+    let brick_in_slice = id.x / CORNERS_BRICK
+    let brick_in_chunk = brick_off + brick_in_slice
     let bi = chunk_start + brick_in_chunk
     let total = min(active_count[0], cap_bricks)
     if bi >= total {
         return
     }
-    let ci = id.x - brick_in_chunk * CORNERS_BRICK
+    let ci = id.x - brick_in_slice * CORNERS_BRICK
     let ab = active[bi]
     let b = ab.coord
     let g = grids[b.w]
@@ -1536,15 +1542,17 @@ pub(package) fn crease_slice(invocation: u32) -> u32 {
     max((n / 64) * 64, CREASE_SLICE_LEAST)
 }
 
-/// The bricks one dispatch of a chunk's triangle kernels (`count_brick_tris`, `emit_tris` and
-/// their seam forms: 256 invocations a brick) may take, an invocation costing `invocation` (the
-/// kernel's own bound, `std::gpu::kernel_work`): as many as keep it within the GPU's step
-/// (`limits().step_work`), a whole chunk where that fits. The Radeon's step holds 519 bricks of
-/// `emit_tris_lod` (73,186 work an invocation), where a chunk's 1,024 in one dispatch were
-/// refused (96 ms); the M4's holds the chunk. No fewer than a chunk's bricks over `SLICES_MOST`.
-pub(package) fn quad_slice(invocation: u32) -> u32 {
+/// The bricks one dispatch of a chunk's kernel that runs `lanes` invocations a brick may take
+/// (`eval_corners`: 512; `count_brick_tris`, `emit_tris` and their seam forms: 256), an
+/// invocation costing `invocation` (the kernel's own bound, `std::gpu::kernel_work`): as many as
+/// keep it within the GPU's step (`limits().step_work`), a whole chunk where that fits. The
+/// Radeon's step holds 519 bricks of `emit_tris_lod` (73,186 work an invocation) and 201 of the
+/// carved table's `eval_corners` (96,960), where a chunk's 1,024 in one dispatch were refused
+/// (96 and 254 ms); the M4's holds the chunk of each. No fewer than a chunk's bricks over
+/// `SLICES_MOST`.
+pub(package) fn brick_slice(invocation: u32, lanes: u32) -> u32 {
     let work = f32(limits().step_work) * 1000.0
-    let n = u32(clamp(work / (256.0 * (f32(invocation) + 2000.0)), 1.0, f32(CHUNK_BRICKS)))
+    let n = u32(clamp(work / (f32(lanes) * (f32(invocation) + 2000.0)), 1.0, f32(CHUNK_BRICKS)))
     max(n, (CHUNK_BRICKS + SLICES_MOST - 1) / SLICES_MOST)
 }
 
@@ -1764,16 +1772,18 @@ pub(package) fn eval_corners_rest<M: Field<Substance>>(
     active_count: [u32],
     cap_bricks: u32,
     chunk_start: u32,
+    brick_off: u32,
     corners: mut Slots<f32>,
     id: GlobalId,
 ) {
-    let brick_in_chunk = id.x / CORNERS_BRICK
+    let brick_in_slice = id.x / CORNERS_BRICK
+    let brick_in_chunk = brick_off + brick_in_slice
     let bi = chunk_start + brick_in_chunk
     let total = min(active_count[0], cap_bricks)
     if bi >= total {
         return
     }
-    let ci = id.x - brick_in_chunk * CORNERS_BRICK
+    let ci = id.x - brick_in_slice * CORNERS_BRICK
     let ab = active[bi]
     let b = ab.coord
     let g = grids[b.w]

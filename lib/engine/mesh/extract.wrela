@@ -4,12 +4,12 @@
 
 use matter::substance::Substance
 use mesh::dc::{
-    CREASE_STEPS, CreaseSolve, classify_cells, crease_part,
+    CREASE_STEPS, CreaseSolve, brick_slice, classify_cells, crease_part,
     crease_passes, crease_slice, crease_step_cost_of, crease_step_cost_rest_of, cull_bricks,
     cull_bricks_rest, cull_bricks_sub, deform_skinned_verts, eval_corners, eval_corners_rest,
     eye_step, filter_thin_cells, inherit_seam_corners, keep_slice_of,
     keep_verts, mark_first, note_untested, prep_chunk, prep_creases, prep_from, prep_slices,
-    prep_super_sub, quad_slice, refine_creases, refine_creases_rest, solve_verts,
+    prep_super_sub, refine_creases, refine_creases_rest, solve_verts,
     solve_verts_rest, super_cull_bricks, surf_slice,
 }
 use mesh::emit::{
@@ -164,7 +164,7 @@ pub fn extract_scratch(max_bricks: u32, lattice: vec3) -> ExtractScratch {
         seam_cells: append_buffer(CAP_SEAM * 2),
         seam_creases: append_buffer(CAP_SEAM * 2),
         seam_verts: buffer(CAP_SEAM * 4),
-        eval_args: buffer_of([DispatchArgs { x: 0, y: 1, z: 1 }]),
+        eval_args: buffer_of(Vec::filled(SLICES_MOST, DispatchArgs { x: 0, y: 1, z: 1 })),
         vert_args: buffer_of([DispatchArgs { x: 0, y: 1, z: 1 }]),
         crease_args: buffer_of(Vec::filled(SLICES_MOST, DispatchArgs { x: 0, y: 1, z: 1 })),
         crease_solves: buffer(CREASE_SLICE),
@@ -405,7 +405,9 @@ pub struct MeshBatch {
     /// `refine_seam_creases`' cells a dispatch, by its own bound (`kernel_work`).
     seam_crease_slice: u32,
     surf_slice: u32,
-    /// The bricks a dispatch of a chunk's triangle kernels takes (`dc::quad_slice`).
+    /// The bricks a dispatch of a chunk's corner kernel takes, and of its triangle kernels
+    /// (`dc::brick_slice`).
+    eval_slice: u32,
     quad_slice: u32,
     /// The dispatches a crease slice's solves take for the field extracted now (`crease_passes`
     /// of `crease_part` of `crease_step_cost_of`, or of `crease_step_cost_rest_of` at rest).
@@ -603,6 +605,7 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
         crease_slice: CREASE_SLICE_LEAST,
         seam_crease_slice: CREASE_SLICE_LEAST,
         surf_slice: CAP_SURF,
+        eval_slice: CHUNK_BRICKS,
         quad_slice: CHUNK_BRICKS,
         crease_passes: CREASE_STEPS,
         thin_hint: 0,
@@ -2358,32 +2361,41 @@ impl MeshBatch {
         scratch.cert_cands.clear()
         while chunk_start < patch_cap {
             let chunk_n = min(patch_cap - chunk_start, CHUNK_BRICKS)
+            let eval_slices = (chunk_n + self.eval_slice - 1) / self.eval_slice
             let quad_slices = (chunk_n + self.quad_slice - 1) / self.quad_slice
+            let chunk_slices = max(eval_slices, quad_slices)
             dispatch(
                 prep_chunk.bind(
                     active_count: scratch.active.count(),
                     cap_bricks: patch_cap,
                     chunk_start: chunk_start,
+                    eval_slice: self.eval_slice,
                     quad_slice: self.quad_slice,
-                    eval_args: mut scratch.eval_args,
                     vert_args: mut scratch.vert_args,
-                    quad_args: scratch.quad_args.span_mut(start: 0, count: quad_slices),
+                    eval_args: scratch.eval_args.span_mut(start: 0, count: chunk_slices),
+                    quad_args: scratch.quad_args.span_mut(start: 0, count: chunk_slices),
                 ),
-                over: quad_slices,
+                over: chunk_slices,
             )
-            dispatch(
-                eval_corners.bind(
-                    fields: fbuf.items(),
-                    grids: grids,
-                    active: scratch.active.items(),
-                    active_count: scratch.active.count(),
-                    cap_bricks: patch_cap,
-                    chunk_start: chunk_start,
-                    corners: scratch.corners.span_mut(start: 0, count: chunk_n * CORNERS_BRICK),
-                ),
-                groups: scratch.eval_args.at(0),
-                most: chunk_n * 8,
-            )
+            for e in 0..eval_slices {
+                dispatch(
+                    eval_corners.bind(
+                        fields: fbuf.items(),
+                        grids: grids,
+                        active: scratch.active.items(),
+                        active_count: scratch.active.count(),
+                        cap_bricks: patch_cap,
+                        chunk_start: chunk_start,
+                        brick_off: e * self.eval_slice,
+                        corners: scratch.corners.span_mut(
+                            start: e * self.eval_slice * CORNERS_BRICK,
+                            count: min(chunk_n - e * self.eval_slice, self.eval_slice) * CORNERS_BRICK,
+                        ),
+                    ),
+                    groups: scratch.eval_args.at(e),
+                    most: min(chunk_n - e * self.eval_slice, self.eval_slice) * 8,
+                )
+            }
             scratch.creases.clear()
             scratch.surf.clear()
             scratch.thin_cands.clear()
@@ -2761,10 +2773,23 @@ impl MeshBatch {
             creases: mut scratch.creases,
         )
         self.surf_slice = surf_slice(kernel_work(surf_kernel))
-        // A chunk's triangle dispatches take as many bricks as their kernel's own bound lets
-        // a dispatch hold (`quad_slice`).
+        // A chunk's corner and triangle dispatches take as many bricks as their kernel's own
+        // bound lets a dispatch hold (`brick_slice`).
+        self.eval_slice = brick_slice(
+            lanes: 512,
+            invocation: kernel_work(eval_corners.bind(
+                fields: fields,
+                grids: scratch.grids.items(),
+                active: scratch.active.items(),
+                active_count: scratch.active.count(),
+                cap_bricks: self.max_bricks,
+                chunk_start: 0,
+                brick_off: 0,
+                corners: scratch.corners.span_mut(start: 0, count: CORNERS_BRICK),
+            )),
+        )
         self.quad_slice = if has_seams {
-            quad_slice(kernel_work(emit_tris_lod.bind(
+            brick_slice(lanes: 256, invocation: kernel_work(emit_tris_lod.bind(
                 grids: scratch.grids.items(),
                 active: scratch.active.items(),
                 active_count: scratch.active.count(),
@@ -2792,7 +2817,7 @@ impl MeshBatch {
                 cert_cands: mut scratch.cert_cands,
             )))
         } else {
-            quad_slice(kernel_work(emit_tris.bind(
+            brick_slice(lanes: 256, invocation: kernel_work(emit_tris.bind(
                 grids: scratch.grids.items(),
                 active: scratch.active.items(),
                 active_count: scratch.active.count(),
@@ -2838,9 +2863,11 @@ impl MeshBatch {
         } else {
             0
         }
+        let eval_per_chunk = (CHUNK_BRICKS + self.eval_slice - 1) / self.eval_slice
         let quad_per_chunk = (CHUNK_BRICKS + self.quad_slice - 1) / self.quad_slice
         let per_chunk = CHUNK_INDIRECT +
             (surf_per_chunk - 1) +
+            (eval_per_chunk - 1) +
             2 * (quad_per_chunk - 1) +
             keep_per_chunk +
             exact_indirect +
@@ -3026,36 +3053,42 @@ impl MeshBatch {
         scratch.cert_cands.clear()
         while chunk_start < hard_cap {
             let chunk_n = min(hard_cap - chunk_start, CHUNK_BRICKS)
+            let eval_slices = (chunk_n + self.eval_slice - 1) / self.eval_slice
             let quad_slices = (chunk_n + self.quad_slice - 1) / self.quad_slice
+            let chunk_slices = max(eval_slices, quad_slices)
             dispatch(
                 prep_chunk.bind(
                     active_count: scratch.active.count(),
                     cap_bricks: effective_cap,
                     chunk_start: chunk_start,
+                    eval_slice: self.eval_slice,
                     quad_slice: self.quad_slice,
-                    eval_args: mut scratch.eval_args,
                     vert_args: mut scratch.vert_args,
-                    quad_args: scratch.quad_args.span_mut(start: 0, count: quad_slices),
+                    eval_args: scratch.eval_args.span_mut(start: 0, count: chunk_slices),
+                    quad_args: scratch.quad_args.span_mut(start: 0, count: chunk_slices),
                 ),
-                over: quad_slices,
+                over: chunk_slices,
             )
             if has_seams {
-                dispatch(
-                    eval_corners.bind(
-                        fields: fields,
-                        grids: grids,
-                        active: scratch.active.items(),
-                        active_count: scratch.active.count(),
-                        cap_bricks: effective_cap,
-                        chunk_start: chunk_start,
-                        corners: scratch.corners_raw.span_mut(
-                            start: 0,
-                            count: chunk_n * CORNERS_BRICK,
+                for e in 0..eval_slices {
+                    dispatch(
+                        eval_corners.bind(
+                            fields: fields,
+                            grids: grids,
+                            active: scratch.active.items(),
+                            active_count: scratch.active.count(),
+                            cap_bricks: effective_cap,
+                            chunk_start: chunk_start,
+                            brick_off: e * self.eval_slice,
+                            corners: scratch.corners_raw.span_mut(
+                                start: e * self.eval_slice * CORNERS_BRICK,
+                                count: min(chunk_n - e * self.eval_slice, self.eval_slice) * CORNERS_BRICK,
+                            ),
                         ),
-                    ),
-                    groups: scratch.eval_args.at(0),
-                    most: chunk_n * 8,
-                )
+                        groups: scratch.eval_args.at(e),
+                        most: min(chunk_n - e * self.eval_slice, self.eval_slice) * 8,
+                    )
+                }
                 var inh_off: u32 = 0
                 while inh_off < chunk_n {
                     let band = min(chunk_n - inh_off, 64)
@@ -3079,22 +3112,25 @@ impl MeshBatch {
                     inh_off += band
                 }
             } else {
-                dispatch(
-                    eval_corners.bind(
-                        fields: fields,
-                        grids: grids,
-                        active: scratch.active.items(),
-                        active_count: scratch.active.count(),
-                        cap_bricks: effective_cap,
-                        chunk_start: chunk_start,
-                        corners: scratch.corners.span_mut(
-                            start: 0,
-                            count: chunk_n * CORNERS_BRICK,
+                for e in 0..eval_slices {
+                    dispatch(
+                        eval_corners.bind(
+                            fields: fields,
+                            grids: grids,
+                            active: scratch.active.items(),
+                            active_count: scratch.active.count(),
+                            cap_bricks: effective_cap,
+                            chunk_start: chunk_start,
+                            brick_off: e * self.eval_slice,
+                            corners: scratch.corners.span_mut(
+                                start: e * self.eval_slice * CORNERS_BRICK,
+                                count: min(chunk_n - e * self.eval_slice, self.eval_slice) * CORNERS_BRICK,
+                            ),
                         ),
-                    ),
-                    groups: scratch.eval_args.at(0),
-                    most: chunk_n * 8,
-                )
+                        groups: scratch.eval_args.at(e),
+                        most: min(chunk_n - e * self.eval_slice, self.eval_slice) * 8,
+                    )
+                }
             }
             scratch.creases.clear()
             scratch.surf.clear()
@@ -3712,7 +3748,20 @@ impl MeshBatch {
             creases: mut scratch.creases,
         )
         self.surf_slice = surf_slice(kernel_work(surf_kernel))
-        self.quad_slice = quad_slice(kernel_work(emit_tris.bind(
+        self.eval_slice = brick_slice(
+            lanes: 512,
+            invocation: kernel_work(eval_corners_rest.bind(
+                fields: fields,
+                grids: scratch.grids.items(),
+                active: scratch.active.items(),
+                active_count: scratch.active.count(),
+                cap_bricks: self.max_bricks,
+                chunk_start: 0,
+                brick_off: 0,
+                corners: scratch.corners.span_mut(start: 0, count: CORNERS_BRICK),
+            )),
+        )
+        self.quad_slice = brick_slice(lanes: 256, invocation: kernel_work(emit_tris.bind(
             grids: scratch.grids.items(),
             active: scratch.active.items(),
             active_count: scratch.active.count(),
@@ -3769,32 +3818,41 @@ impl MeshBatch {
         var chunk_start: u32 = 0
         while chunk_start < hard_cap {
             let chunk_n = min(hard_cap - chunk_start, CHUNK_BRICKS)
+            let eval_slices = (chunk_n + self.eval_slice - 1) / self.eval_slice
             let quad_slices = (chunk_n + self.quad_slice - 1) / self.quad_slice
+            let chunk_slices = max(eval_slices, quad_slices)
             dispatch(
                 prep_chunk.bind(
                     active_count: scratch.active.count(),
                     cap_bricks: effective_cap,
                     chunk_start: chunk_start,
+                    eval_slice: self.eval_slice,
                     quad_slice: self.quad_slice,
-                    eval_args: mut scratch.eval_args,
                     vert_args: mut scratch.vert_args,
-                    quad_args: scratch.quad_args.span_mut(start: 0, count: quad_slices),
+                    eval_args: scratch.eval_args.span_mut(start: 0, count: chunk_slices),
+                    quad_args: scratch.quad_args.span_mut(start: 0, count: chunk_slices),
                 ),
-                over: quad_slices,
+                over: chunk_slices,
             )
-            dispatch(
-                eval_corners_rest.bind(
-                    fields: fields,
-                    grids: grids,
-                    active: scratch.active.items(),
-                    active_count: scratch.active.count(),
-                    cap_bricks: effective_cap,
-                    chunk_start: chunk_start,
-                    corners: scratch.corners.span_mut(start: 0, count: chunk_n * CORNERS_BRICK),
-                ),
-                groups: scratch.eval_args.at(0),
-                most: chunk_n * 8,
-            )
+            for e in 0..eval_slices {
+                dispatch(
+                    eval_corners_rest.bind(
+                        fields: fields,
+                        grids: grids,
+                        active: scratch.active.items(),
+                        active_count: scratch.active.count(),
+                        cap_bricks: effective_cap,
+                        chunk_start: chunk_start,
+                        brick_off: e * self.eval_slice,
+                        corners: scratch.corners.span_mut(
+                            start: e * self.eval_slice * CORNERS_BRICK,
+                            count: min(chunk_n - e * self.eval_slice, self.eval_slice) * CORNERS_BRICK,
+                        ),
+                    ),
+                    groups: scratch.eval_args.at(e),
+                    most: min(chunk_n - e * self.eval_slice, self.eval_slice) * 8,
+                )
+            }
             scratch.creases.clear()
             scratch.surf.clear()
             scratch.thin_cands.clear()
