@@ -574,6 +574,24 @@ The owner's change of 2026-11-25: the capture goes onto the human (phase 1 step 
 creature. "What is done" below is the import onto the creature, which stays as a test of the
 types; the import onto the human repeats it with the human's maps.
 
+Onto the human (2026-11-26, `tools/movement/capture -- human SOURCE`, then its smoothing and
+ground passes): 100STYLE's 810 clips (18.28 h at the human's time, whose legs are the capture's
+length) and MPI EMBM's 288 (0.37 h), no frame out of range (the worst 2.2e-7 rad), the mapped
+joints 54 and 59 mm from the scaled capture's (the human's joints are anatomical centres: the
+hips' by Bell's rule, the spine's discs, the shoulder 34.5 mm under the acromion; the capture's
+skeleton puts its own elsewhere, and only the root, the hands and the feet are aimed at their
+places). Each spine bone of the capture sets one level of the human's spine; its scapulae and
+fingers follow no bone (the fit moves a scapula as its arm's aims ask; the fingers hold their
+rest, as no source has them). The import is 2.5 times as fast as at first: the fit searches only
+the numbers an aim depends on (68 of the 112).
+
+MPI EMBM's narrators sit: 239 of its 288 clips have their pelvis at 0.62 to 0.79 m (the human
+stands at 0.90) and their knees bent 43 to 100 degrees, on a chair the capture does not hold.
+On flat ground with no seat such a clip is not physical (on the creature too: a part of its wide
+targets). The tools leave a clip out when its root's median height is under 0.9 of the body's
+standing height (`bodies::seated`; no 100STYLE clip is: their lowest is 0.85 m), until a seat is
+a field of the world that the judge and the simulator both have.
+
 Purpose: each source that phase 0 permits becomes poses of our bodies.
 
 ### Steps

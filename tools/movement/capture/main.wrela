@@ -28,7 +28,7 @@
 
 use clips::clips::{read_all, write_all}
 use engine::body::body::{Body, Pose}
-use engine::body::fit::{Aim, aim_frame, aim_point, fit}
+use engine::body::fit::{Aim, aim_floor, aim_frame, aim_point, fit}
 use engine::body::joint::{Frame, vector_of_turn}
 use std::collections::Vec
 use std::hash::sha256::{hex, sha256}
@@ -255,6 +255,7 @@ struct Target: Copy {
     thigh: u32,
     shank: u32,
     foot: u32,
+    foot_right: u32,
 }
 
 fn target(body: str) -> Target {
@@ -265,6 +266,7 @@ fn target(body: str) -> Target {
             thigh: hs::THIGH_LEFT,
             shank: hs::SHANK_LEFT,
             foot: hs::FOOT_LEFT,
+            foot_right: hs::FOOT_RIGHT,
         }
     } else {
         Target {
@@ -273,6 +275,7 @@ fn target(body: str) -> Target {
             thigh: cs::THIGH_LEFT,
             shank: cs::SHIN_LEFT,
             foot: cs::FOOT_LEFT,
+            foot_right: cs::FOOT_RIGHT,
         }
     }
 }
@@ -432,15 +435,49 @@ fn import(c: take Clip) -> Done {
 
 fn import_or(c: Clip) -> Result<Done, ToolError> {
     if c.body.as_str() == "human" {
-        import_into(hs::BODY, hs::REST, target("human"), c)
+        import_into(hs::BODY, hs::REST, hs::PARTS, target("human"), c)
     } else {
-        import_into(world::creature::BODY, creature_rest(), target("creature"), c)
+        import_into(world::creature::BODY, creature_rest(), cs::PARTS, target("creature"), c)
     }
 }
 
-fn import_into<const S: u32, const D: u32>(
+/// A point of a sole: its segment and where it is in the segment's frame.
+struct Sole: Copy {
+    segment: u32,
+    point: vec3,
+}
+
+/// The middle of the densest `width` of `xs`: the value they keep most (a foot's height in its
+/// stance).
+fn densest(xs: Vec<f32>, width: f32) -> f32 {
+    if xs.is_empty() {
+        return 0.0
+    }
+    var v = xs.clone()
+    v.sort_by(|a, b| a < b)
+    var best = 0
+    var count = 0
+    var j = 0
+    for i in 0..v.len() {
+        while v[i] - v[j] > width {
+            j += 1
+        }
+        if i + 1 - j > count {
+            count = i + 1 - j
+            best = j
+        }
+    }
+    v[best + count / 2]
+}
+
+/// How much a sole below the floor weighs (per m): against a foot's turn aimed at 0.3 per rad, a
+/// millimetre under weighs as a third of a degree, so the floor wins.
+const SOLE: f32 = 10.0
+
+fn import_into<const S: u32, const D: u32, const P: u32>(
     body: Body<S>,
     rest: Pose<D>,
+    parts: [Cone; P],
     t: Target,
     c: Clip,
 ) -> Result<Done, ToolError> {
@@ -520,6 +557,48 @@ fn import_into<const S: u32, const D: u32>(
     let last = min(c.last, bvh.frames - 1)
     let span_cap = f32(last - first) * bvh.frame_time
     let n = u32(floor(span_cap * k * RATE)) + 1
+    // The capture's floor: the height its ankles keep most (in stance), frame by frame of the
+    // scaled capture.
+    let (ankle_l, ankle_r) = (bone_index(bvh, "LeftAnkle"), bone_index(bvh, "RightAnkle"))
+    var heights: Vec<f32> = Vec::with_capacity(2 * n)
+    var pl: Vec<vec3> = Vec::new()
+    var tu: Vec<Quat> = Vec::new()
+    for j in 0..n {
+        let t_cap = f32(j) / RATE / k
+        let f = min(first + u32(round(t_cap / bvh.frame_time)), last)
+        posed(bvh, f, mut pl, mut tu)
+        heights.push(pl[ankle_l].y * (u * s))
+        heights.push(pl[ankle_r].y * (u * s))
+    }
+    let stance_a = densest(heights, 0.01)
+    // Every height of the capture moves by `lift`, so its ankle in stance stands where the body's
+    // ankle stands on the floor. The body's soles: each part's lowest points at rest within 6 mm
+    // of its lowest, on a foot or its toes.
+    let lift = at0[t.foot].t.y - stance_a
+    let up = vec3(0.0, 1.0, 0.0)
+    var lowest = 1.0e9
+    for cone in parts {
+        let (a, b) = cone.placed(at0)
+        lowest = min(lowest, min(a.y - cone.ra, b.y - cone.rb))
+    }
+    var soles: Vec<Sole> = Vec::new()
+    let feet = [t.foot, t.foot_right]
+    for cone in parts {
+        for e in 0..2 {
+            let end = if e == 0 { cone.a } else { cone.b }
+            let r = if e == 0 { cone.ra } else { cone.rb }
+            let at = at0[end.on].apply(end.at) - up * r
+            if at.y > lowest + 0.006 {
+                continue
+            }
+            for side in 0..2 {
+                let foot = feet[side]
+                if end.on == foot || body.segments[end.on].joint.parent == foot {
+                    soles.push(Sole { segment: end.on, point: at0[end.on].inverse().apply(at) })
+                }
+            }
+        }
+    }
     var w = Writer::new()
     w.write_u8(87)
     w.write_u8(80)
@@ -548,7 +627,7 @@ fn import_into<const S: u32, const D: u32>(
             // Turned from its rest as the capture's bone turned from its own (both at rest in
             // a T-pose, facing +z, +x their left).
             let q = turns[b].mul(rest_turn[i]).mul(at0[m.segment].q)
-            let p = places[b] * (u * s)
+            let p = places[b] * (u * s) + vec3(0.0, lift, 0.0)
             if m.aim == BOTH {
                 let place = if m.segment == t.pelvis { 2.0 } else { 1.0 }
                 aims.push(aim_frame(m.segment, Frame { q, t: p }, place, 0.3))
@@ -563,12 +642,23 @@ fn import_into<const S: u32, const D: u32>(
                         place: 0.0,
                         turn: q,
                         turned: 0.3,
+                        axes: vec3(1.0),
+                        floor: false,
                     },
                 )
             }
         }
+        // Each sole held above the floor (the ground holds a foot up, never down): where the
+        // body's foot is longer than the capture's, its toes would dip under the floor at
+        // push-off.
+        for sole in soles {
+            aims.push(aim_floor(sole.segment, sole.point, 0.0, SOLE))
+        }
         if j == 0 {
-            prev.root = Frame { q: turns[idx[0]].mul(at0[t.pelvis].q), t: places[idx[0]] * (u * s) }
+            prev.root = Frame {
+                q: turns[idx[0]].mul(at0[t.pelvis].q),
+                t: places[idx[0]] * (u * s) + vec3(0.0, lift, 0.0),
+            }
         }
         let fr = fit(body, aims, prev, if j == 0 { FIRST_STEPS } else {
             c.steps
@@ -577,7 +667,9 @@ fn import_into<const S: u32, const D: u32>(
         // How far each mapped joint is from the scaled capture's.
         let at = body.places(prev)
         for i in 0..ms.len() {
-            dist_sum += length(at[ms[i].segment].t - places[idx[i]] * (u * s))
+            dist_sum += length(
+                at[ms[i].segment].t - places[idx[i]] * (u * s) - vec3(0.0, lift, 0.0),
+            )
             dist_n += 1.0
         }
         var worst = -1.0e9
@@ -774,12 +866,14 @@ fn le_word(b: [u8], i: u32) -> u32 {
 }
 
 /// Stands a clip on the ground (again: the shift it finds on a grounded clip is 0): its lowest
-/// point each frame (each part's ends less their radii),
-/// whose 5th percentile over the clip is put at y = 0 by moving the root. A capture's foot joints
-/// stand some centimetres over its floor, and scaled to a body whose feet are thicker or thinner
-/// they leave the body over the ground or in it (on 2026-11-25, 100STYLE on the creature floated
-/// 22 mm on average where it needed holding up). Rewrites the clip's poses, and its record with
-/// the shift.
+/// point each frame (each part's ends less their radii) is found, and the height those points keep
+/// most (the middle of the densest 10 mm of them: a foot flat in its stance) is put at y = 0 by
+/// moving the root. A capture's foot joints stand some centimetres over its floor, and scaled to a
+/// body whose feet are thicker or thinner they leave the body over the ground or in it. The 5th
+/// percentile, used first, put the brief dips of a toe at push-off on the floor: on 2026-11-26 the
+/// human's stance foot then hovered 35 to 40 mm in 100STYLE's walk (the creature's 22 mm on average,
+/// 2026-11-25), and the judge found the walk in flight 69% of its frames. Rewrites the clip's
+/// poses, and its record with the shift.
 fn grounded(c: take Clip) -> Done {
     if c.body.as_str() == "human" {
         grounded_into(hs::BODY, hs::REST, hs::PARTS, c)
@@ -834,7 +928,20 @@ fn grounded_into<const S: u32, const D: u32, const P: u32>(
     }
     var sorted = lows.clone()
     sorted.sort_by(|a, b| a < b)
-    let shift = sorted[min(n / 20, n - 1)]
+    // The densest 10 mm: the window of sorted lows that holds the most frames.
+    var best = 0
+    var best_count = 0
+    var j = 0
+    for i in 0..n {
+        while sorted[i] - sorted[j] > 0.01 {
+            j += 1
+        }
+        if i + 1 - j > best_count {
+            best_count = i + 1 - j
+            best = j
+        }
+    }
+    let shift = sorted[best + best_count / 2]
     var out = bytes.clone()
     for f in 0..n {
         let o = head + f * row + 4
