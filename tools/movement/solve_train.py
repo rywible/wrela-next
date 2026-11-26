@@ -86,6 +86,8 @@ def main(load_packed):
     p.add_argument("--z", type=int, default=32)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--beta", type=float, default=0.3)
+    p.add_argument("--physics", type=float, default=0.0,
+                   help="the weight of the parts' depth and slide on the ground (each over its target)")
     p.add_argument("--hide", type=float, default=0.3, help="the chance that each goal is hidden")
     p.add_argument("--eval-every", type=int, default=2000)
     p.add_argument("--threads", type=int, default=0)
@@ -142,7 +144,7 @@ def main(load_packed):
         B = starts.shape[0]
         prev, cur = data.x[starts - 1], data.x[starts]
         mask = (torch.rand(B, 2, device=dev, generator=gen) > a.hide).float()
-        rec, kl = 0.0, 0.0
+        rec, kl, phys = 0.0, 0.0, 0.0
         for t in range(w):
             row = starts + t
             true_next = data.x[row + 1]
@@ -161,13 +163,34 @@ def main(load_packed):
             # the numbers, so the code's KL weighs against the whole step.
             rec = rec + 0.5 * ((out - n_step(tgt)) ** 2).sum(-1).mean()
             pred = n_step.mean + n_step.std * out
-            nxt = body.after(cur, pred.detach())
+            if a.physics > 0 and train_mode:
+                nxt = body.after(cur, pred)
+                phys = phys + physics(cur, nxt)
+                nxt = nxt.detach()
+            else:
+                nxt = body.after(cur, pred.detach())
             use = (torch.rand(B, 1, device=dev, generator=gen) < fed_back).float()
             prev, cur = cur, use * nxt + (1.0 - use) * true_next
             # The root's turn mixed so: renormalise.
             cur = torch.cat([cur[:, :3], cur[:, 3:7] / cur[:, 3:7].norm(dim=-1, keepdim=True),
                              cur[:, 7:]], -1)
-        return rec / w, kl / w
+        return rec / w, kl / w, phys / w
+
+    def physics(cur, nxt):
+        """What the judge would see wrong in the step from `cur` to `nxt`, on flat ground at
+        y = 0, each over its target: each part's depth under the ground (mm over 2), and the
+        speed along the ground of each part's lowest end while it is within 2 cm of the ground
+        in both frames (mm/s over 984)."""
+        a0, b0 = body.part_ends(cur)
+        a1, b1 = body.part_ends(nxt)
+        ra, rb = body.part_ra, body.part_rb
+        low0 = torch.stack([a0[..., 1] - ra, b0[..., 1] - rb], -1)
+        low1 = torch.stack([a1[..., 1] - ra, b1[..., 1] - rb], -1)
+        pen = torch.relu(-low1).sum(-1).mean(-1) * 1000.0 / 2.0
+        near = ((low0 < 0.02) & (low1 < 0.02)).float()
+        d = torch.stack([(a1 - a0)[..., [0, 2]].norm(dim=-1), (b1 - b0)[..., [0, 2]].norm(dim=-1)], -1)
+        slide = (near * d).sum((-1, -2)) / near.sum((-1, -2)).clamp(min=1.0) * rate * 1000.0 / 984.0
+        return (pen + slide).mean()
 
     def evaluate(data, n=512, seconds=4.0):
         """Rollouts from test windows with z drawn, all goals shown, for `seconds`: the mean error
@@ -184,6 +207,7 @@ def main(load_packed):
         h0 = cur[:, 1].clone()
         mask = torch.ones(B, 2, device=dev)
         verr, fell, qerr = 0.0, torch.zeros(B, dtype=torch.bool, device=dev), 0.0
+        phys_e = 0.0
         with torch.no_grad():
             for t in range(w):
                 row = starts + t
@@ -192,6 +216,7 @@ def main(load_packed):
                 z = torch.randn(B, a.z, device=dev, generator=g2)
                 pred = n_step.mean + n_step.std * decode(s, g, mask, z)
                 nxt = body.after(cur, pred)
+                phys_e += physics(cur, nxt).item()
                 v = motion.qrot(motion.yaw(-body.heading(cur[:, 3:7])), nxt[:, :3] - cur[:, :3]) * rate
                 verr += (torch.stack([v[:, 0], v[:, 2]], -1) - g[:, :2]).norm(dim=-1).mean().item()
                 fell |= nxt[:, 1] < 0.5 * h0
@@ -199,23 +224,24 @@ def main(load_packed):
                 if t == int(rate) - 1:
                     qerr = (cur[:, 7:] - data.x[row + 1, 7:]).abs().mean().item()
         return {"speed_error": verr / w, "joint_error_1s": qerr, "fell": fell.float().mean().item(),
-                "rollouts": B}
+                "physics": phys_e / w, "rollouts": B}
 
     last_eval = None
     while step < a.steps:
         # Scheduled sampling: none fed back for the first fifth, then more to all by three fifths.
         fed = min(max((step / a.steps - 0.2) / 0.4, 0.0), 1.0)
         starts, ends = train.sample(a.batch, gen)
-        rec, kl = rollout(train, starts, ends, a.window, fed, True)
-        loss = rec + a.beta * kl
+        rec, kl, phys = rollout(train, starts, ends, a.window, fed, True)
+        loss = rec + a.beta * kl + a.physics * phys
         opt.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(list(enc.parameters()) + list(dec.parameters()), 1.0)
         opt.step()
         step += 1
-        run.progress(step, a.steps, f"rec {rec.item():.4f} kl {kl.item():.2f} fed {fed:.2f}")
+        ph = float(phys) if not isinstance(phys, float) else phys
+        run.progress(step, a.steps, f"rec {rec.item():.4f} kl {kl.item():.2f} phys {ph:.3f} fed {fed:.2f}")
         if step % 100 == 0:
-            print(f"update {step}: rec {rec.item():.4f} kl {kl.item():.2f} fed back {fed:.2f} "
+            print(f"update {step}: rec {rec.item():.4f} kl {kl.item():.2f} physics {ph:.3f} fed back {fed:.2f} "
                   f"({time.time() - t0:.0f} s)", flush=True)
         if a.eval_every and step % a.eval_every == 0:
             last_eval = {"test": evaluate(test), "training": evaluate(train)}
