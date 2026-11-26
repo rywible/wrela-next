@@ -905,6 +905,29 @@ fn timestamp_collections_reuse_buffers_and_return_only_current_passes() {
     }
 }
 
+/// A frame that times more passes than the timer's queries hold reads them all, and the timer
+/// grows so the next such frame isn't cut by a wait for the GPU in its middle.
+#[test]
+#[ignore = "needs a GPU"]
+fn a_timer_a_frame_fills_grows_to_hold_the_frame() {
+    let (manifest, shaders) = increment();
+    let mut gpu = Gpu::new(&manifest, &shaders, Timing::Span, false).unwrap();
+    gpu.create_buffer(1, 4);
+    let passes = (TIMESTAMP_QUERIES / 2 + 44) as usize;
+    for frame in 0..2 {
+        gpu.set_frame(frame);
+        for _ in 0..passes {
+            gpu.dispatch(0, Ok([1, 1, 1]), &[Binding::range(1, 0, 4)], &[]).unwrap();
+        }
+        let timings = gpu.take_timings().unwrap();
+        assert_eq!(timings.len(), passes, "frame {frame}");
+        assert!(timings.iter().all(|t| t.frame == frame && t.end >= t.start));
+    }
+    assert_eq!(gpu.timer.as_ref().unwrap().capacity, 2 * TIMESTAMP_QUERIES);
+    assert_eq!(gpu.read_buffer(1).unwrap(), (2 * passes as u32).to_le_bytes());
+    gpu.check_errors().unwrap();
+}
+
 /// A program's ask for a label's time (`std::gpu::timed`) is answered once, after a call
 /// that ran the label's work, with its microseconds, and times no other label's work (outside
 /// a run timed from its start); a build that retires drops its asks, so

@@ -355,11 +355,11 @@ use by another project; they are to be run with the rest of the plan's Radeon wo
 
 ## 9. Phase 1: strict math in the geometry kernels
 
-State (2026-11-25, after the restart): steps 1 to 9 and 12 are done and measured on the M4; step
-10 is done for std's strict functions (toolchain/tests/strict_bits) and open for the engine's
-kernels; step 11 is open; the Radeon is not measured. The gate on the M4: the audit and the sun's
-judge pass unchanged; spans SCENE 10/11/13/14 28.42/16.92/18.30/21.77 ms against lines
-25.41/17.34/18.93/22.25: SCENE 10 is 16.3% over its baseline of 24.44 ms, the target 5%.
+State (2026-11-26): steps 1 to 9 and 12 are done and measured on the M4; step 10 is done for
+std's strict functions (toolchain/tests/strict_bits) and open for the engine's kernels; step 11 is
+open; the Radeon is not measured. SCENE 10 is +3.3% over phase 0, paired (below), inside the
+target of 5%. The gate on the M4: the audit and the sun's judge pass unchanged; spans SCENE
+10/11/13/14 24.87/17.02/18.43/22.02 ms against lines 25.41/17.34/18.93/22.25.
 
 Where SCENE 10's strict cost is (M4, frames 30 to 33 at 1080p, each dispatch alone, GPU time
 summed over the four frames; the same build relaxed beside it): extraction 21.4 ms strict, 12.8
@@ -406,9 +406,18 @@ without (phase 0 24.5 to 24.6, steady), the GPU idle longer after the sun's cert
 read 24.7 to 28.6 ms in single runs. The mechanism, its pipelines (452 against 319) and the
 suggestion to make it a specialization constant are gone with it.
 
-Where the rest is: phase 0's wrela code built with today's toolchain is phase 0's span to 0.1%,
-and today's std with phase 0's engine too; today's engine is SCENE 10's +7.1% (26.30 against
-24.55 ms, paired, noise 0.34), which is the strict kernels'. The target, 5%, is 25.78 ms.
+Where the rest was (2026-11-26): not the strict kernels. With every `@strict` taken off the
+engine, SCENE 10 still read 25.65 ms against phase 0's 24.56, its runs 24.2 to 29.5; with the
+sun's alone off, 26.51 against 24.53; with the driver's transcendentals, or the GPU target's
+derived intervals, no nearer. It was the timer of a timed run: its 512 queries held 256 timed
+passes, and a frame of more waited for the GPU in its middle to read them, the GPU then idle while
+the CPU recorded what followed, inside the span. Phase 0's frame has 309 timed passes and waited
+after the eye's shadow map, where the next piece is short; today's 269 waited after the sun's
+classification, before the exact sun rays and the shading (1.7 to 2.8 ms idle a frame). The timer
+now grows when a frame fills it, as the uniform ring does (`a_timer_a_frame_fills_grows_to_hold_the_frame`).
+Paired with it, five runs: SCENE 10 24.72 ms [24.65, 24.82] against phase 0's 23.92 [23.77, 23.99],
++3.3% (noise 0.23), inside the target of 5%. The spans of the gate's lines were measured with
+the old timer, so each scene's line holds more slack than it says.
 
 ### What is wrong today
 

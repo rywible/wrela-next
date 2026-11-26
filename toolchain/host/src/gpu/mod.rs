@@ -69,8 +69,11 @@ fn align_to(x: u64, alignment: u64) -> u64 {
 }
 /// The uniform ring's starting size.
 const RING_START: u64 = 64 * 1024;
-/// Timestamp queries per submission (two per timed pass).
+/// Timestamp queries the timer starts with (two per timed pass).
 const TIMESTAMP_QUERIES: u32 = 512;
+/// The most the timer grows to: 2,048 timed passes between two readings (32 KB of samples, the
+/// least a Metal counter sample buffer is held to).
+const TIMESTAMP_QUERIES_MOST: u32 = 4096;
 
 /// One timed piece of GPU work, from timestamp queries.
 #[derive(Clone, Debug, PartialEq)]
@@ -487,6 +490,8 @@ impl Ring {
 
 struct Timer {
     queries: wrela_gpu::QuerySet,
+    /// How many queries `queries` holds.
+    capacity: u32,
     /// Reused after each collection has finished reading its result.
     resolved: wrela_gpu::Buffer,
     readback: wrela_gpu::Buffer,
@@ -2407,9 +2412,17 @@ impl Gpu {
     /// Makes room for one timed pass's queries in this submission, flushing first if they're
     /// used up. Call before recording the pass (a flush submits what's recorded).
     fn reserve_timestamps(&mut self) -> Result<()> {
-        if self.timer.as_ref().is_some_and(|t| t.pending.len() as u32 * 2 >= TIMESTAMP_QUERIES) {
+        if self.timer.as_ref().is_some_and(|t| t.pending.len() as u32 * 2 >= t.capacity) {
             self.flush()?;
             self.collect()?;
+            // Grown whenever it runs out, as the uniform ring is: a frame that used every query
+            // waited for the GPU in its middle, the GPU then idle while the CPU recorded the rest
+            // (SCENE 10's 269 timed passes a frame: 1.7 to 2.8 ms of idle after the sun's
+            // certificates, inside its span, where 309 had put the wait where little followed).
+            let device = &self.device;
+            if let Some(t) = &mut self.timer {
+                t.grow(device);
+            }
         }
         Ok(())
     }
@@ -4083,11 +4096,26 @@ impl Timer {
             queries: device
                 .create_query_set(TIMESTAMP_QUERIES)
                 .expect("a device with timestamp queries makes a query set"),
+            capacity: TIMESTAMP_QUERIES,
             resolved,
             readback,
             pending: Vec::new(),
             results: Vec::new(),
             submissions: 0,
+        }
+    }
+
+    /// Twice the queries, up to `TIMESTAMP_QUERIES_MOST`, once every query is read (`pending`
+    /// empty); as it was where the device makes no larger set.
+    fn grow(&mut self, device: &wrela_gpu::Device) {
+        let want = (self.capacity * 2).min(TIMESTAMP_QUERIES_MOST);
+        if want <= self.capacity || !self.pending.is_empty() {
+            return;
+        }
+        if let Ok(queries) = device.create_query_set(want) {
+            (self.resolved, self.readback) = query_buffers(device, want);
+            self.queries = queries;
+            self.capacity = want;
         }
     }
 
