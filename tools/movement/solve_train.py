@@ -85,7 +85,7 @@ def main(load_packed):
     p.add_argument("--encoder", default="256,256")
     p.add_argument("--z", type=int, default=32)
     p.add_argument("--lr", type=float, default=3e-4)
-    p.add_argument("--beta", type=float, default=0.05)
+    p.add_argument("--beta", type=float, default=0.3)
     p.add_argument("--hide", type=float, default=0.3, help="the chance that each goal is hidden")
     p.add_argument("--eval-every", type=int, default=2000)
     p.add_argument("--threads", type=int, default=0)
@@ -157,7 +157,9 @@ def main(load_packed):
             else:
                 z = torch.randn(B, a.z, device=dev, generator=gen)
             out = decode(s, g, mask, z)
-            rec = rec + ((out - n_step(tgt)) ** 2).mean()
+            # A Gaussian likelihood of the step (spread 1 in its normalised numbers): summed over
+            # the numbers, so the code's KL weighs against the whole step.
+            rec = rec + 0.5 * ((out - n_step(tgt)) ** 2).sum(-1).mean()
             pred = n_step.mean + n_step.std * out
             nxt = body.after(cur, pred.detach())
             use = (torch.rand(B, 1, device=dev, generator=gen) < fed_back).float()

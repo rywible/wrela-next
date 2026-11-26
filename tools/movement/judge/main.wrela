@@ -7,6 +7,8 @@
 //     tools/wrela tool tools/movement/judge --read poses=.movement/poses --read split=tools/movement/split \
 //         -- calibrate [CLIPS]          the calibration set (at most CLIPS of it)
 //     ... -- one SOURCE/CLIP            one clip's measures
+//     ... --read play=.movement/solver/play -- play SET | SOURCE/CLIP...
+//                                       the solver's rollouts of those clips, held to the targets
 //
 // Reads the pose files that tools/movement/capture writes.
 
@@ -63,7 +65,12 @@ struct Clip: Clone {
 }
 
 fn load(name: str) -> Result<Clip, ToolError> {
-    let bytes = read_all(f"poses/creature/{name}.pose")?
+    load_from("poses", name)
+}
+
+/// A clip of the poses under the root `root` (`--read ROOT=DIR`).
+fn load_from(root: str, name: str) -> Result<Clip, ToolError> {
+    let bytes = read_all(f"{root}/creature/{name}.pose")?
     var r = Reader::new(take bytes)
     for _ in 0..4 {
         let _ = r.read_u8()
@@ -232,6 +239,58 @@ const NAMES: [Text; MEASURES] = [
     "distance from capture",
     "goal error (m/s: the root's velocity against the clip's own over 1 s)",
 ]
+
+/// The calibration's targets (`calibrate` on 2026-11-25: 117 calibration clips, each the clean
+/// clips' 95th percentile or its floor), which `play` holds the solver to.
+const TARGET: [f32; MEASURES] = [
+    0.92266834, 1.7351655, 984.02716, 2.0, 40.864124, 0.01, 4.7855315, 0.3195029,
+]
+
+/// The solver's rollouts (`tools/movement/solver -- play`, read as `play`) of the clips `names`:
+/// each judged with its source's statistics and the goals of the clip it followed over the same
+/// frames; how many pass each measure, and the mean of each.
+fn judge_play(names: Vec<String>) -> Result<u32, ToolError> {
+    let refs_100 = reference(120, "100style/")?
+    let refs_embm = reference(120, "embm/")?
+    var means = [0.0; MEASURES]
+    var passed = [0; MEASURES]
+    var all_passed = 0
+    var n = 0
+    for name in names {
+        let Ok(p) = load_from("play", name.as_str()) else { continue }
+        let c = load(name.as_str())?
+        var goals = velocity_goals(c.poses.clone(), c.rate, 1.0)
+        goals.truncate(p.poses.len())
+        let refs = if name.as_str().starts_with("embm/") { refs_embm.clone() } else {
+            refs_100.clone()
+        }
+        let s = scored(p.poses.clone(), p.rate, refs, goals, 1.0)
+        let v = values(s)
+        var ok = true
+        for i in 0..MEASURES {
+            means[i] += v[i]
+            if v[i] <= TARGET[i] {
+                passed[i] += 1
+            } else {
+                ok = false
+            }
+        }
+        if ok {
+            all_passed += 1
+        }
+        n += 1
+        print(
+            f"{measures_line(name.as_str(), s)} | score {score(v, TARGET)}{if ok { "" } else { " FAILS" }}",
+        )
+    }
+    for i in 0..MEASURES {
+        print(
+            f"judge: {NAMES[i]}: mean {means[i] / f32(max(n, 1))}, {passed[i]} of {n} in the target {TARGET[i]}",
+        )
+    }
+    print(f"judge: {all_passed} of {n} rollouts in every target")
+    Ok(n)
+}
 
 fn score(v: [f32; MEASURES], target: [f32; MEASURES]) -> f32 {
     var s = 0.0
@@ -691,6 +750,24 @@ pub fn tool() -> u32 {
             }, s)
         }
         0
+    } else if what == "play" && a.len() > 1 {
+        // A set's name, or clip names.
+        var names: Vec<String> = Vec::new()
+        if a.len() == 2 && (a[1].as_str() == "training" || a[1].as_str() == "test") {
+            let Ok(s) = set(a[1].as_str()) else { return 1 }
+            names = take s
+        } else {
+            for i in 1..a.len() {
+                names.push(a[i].clone())
+            }
+        }
+        match judge_play(names) {
+            Ok(_) => 0,
+            Err(e) => {
+                print(f"judge: {e.message()}")
+                1
+            },
+        }
     } else if what == "one" && a.len() > 1 {
         match load(a[1].as_str()) {
             Ok(c) => {
