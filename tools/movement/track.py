@@ -344,15 +344,17 @@ def mlp(n_in, n_out, hidden):
     return torch.nn.Sequential(*layers)
 
 
-def make_agent(n_obs, n_act, hidden):
-    """The actor (a Gaussian about its mean, a learned spread) and the critic, two nets."""
+def make_agent(n_obs, n_act, hidden, log_std=None):
+    """The actor (a Gaussian about its mean; its spread learned, or fixed at e^`log_std`) and the
+    critic, two nets."""
 
     class Agent(torch.nn.Module):
         def __init__(self):
             super().__init__()
             self.pi = mlp(n_obs, n_act, hidden)
             self.v = mlp(n_obs, 1, hidden)
-            self.log_std = torch.nn.Parameter(torch.full((n_act,), -1.6))
+            self.log_std = torch.nn.Parameter(torch.full((n_act,), -1.6 if log_std is None else log_std),
+                                              requires_grad=log_std is None)
             with torch.no_grad():
                 self.pi[-1].weight.mul_(0.01)
                 self.pi[-1].bias.zero_()
@@ -380,7 +382,7 @@ def ppo(agent, opt, b_obs, b_act, b_logp, b_adv, b_ret, gen, target_kl):
     dev = b_obs.device
     n = b_obs.shape[0]
     mb = max(n // 4, 1)
-    actor = list(agent.pi.parameters()) + [agent.log_std]
+    actor = list(agent.pi.parameters()) + ([agent.log_std] if agent.log_std.requires_grad else [])
     critic = list(agent.v.parameters())
     skipped, kl, clipped, vloss, epochs = 0, 0.0, 0.0, 0.0, 0
     for _ in range(5):
@@ -564,6 +566,9 @@ def main():
     p.add_argument("--hidden", default="1024,512")
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--eval-every", type=int, default=200)
+    p.add_argument("--log-std", type=float, default=None,
+                   help="the actions' spread fixed at e^this (a learned spread shrinks, and with it "
+                        "the step PPO can take: p4h-3 fell apart at a mean of -2.1)")
     p.add_argument("--target-kl", type=float, default=0.02,
                    help="the epochs of an update stop when the mean KL of the last passes this")
     p.add_argument("--filtered", action="store_true", help="play every clip to its end at the end")
@@ -585,7 +590,7 @@ def main():
         n_obs = observe(sim).shape[1]
         n_act = sim.mjm.nu
         hidden = [int(x) for x in a.hidden.split(",")]
-        agent = make_agent(n_obs, n_act, hidden).to(dev)
+        agent = make_agent(n_obs, n_act, hidden, a.log_std).to(dev)
         opt = torch.optim.Adam(agent.parameters(), lr=a.lr)
         norm = Normal(n_obs, dev)
         step, samples = 0, 0
