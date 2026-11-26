@@ -631,7 +631,8 @@ fn lower_in(
     (lowered, diags)
 }
 
-/// Drops the pipelines no dispatch or draw in `cpu` records, and numbers the rest in order.
+/// Drops the pipelines no dispatch, draw or `kernel_work` in `cpu` names, and numbers the rest in
+/// order.
 fn recorded_pipelines_only(cx: &mut Cx, cpu: &mut ir::Module) {
     let mut used = vec![false; cx.pipelines.len()];
     // Each render pipeline's targets, from the draws left: one a draw that's gone drew into
@@ -639,7 +640,10 @@ fn recorded_pipelines_only(cx: &mut Cx, cpu: &mut ir::Module) {
     let mut targets: Vec<Vec<ir::RenderTarget>> = vec![Vec::new(); cx.pipelines.len()];
     for f in &cpu.functions {
         ir::visit::walk(&f.body, &mut |s| match s.expr() {
-            Some(ir::Expr::Host(ir::HostOp::Dispatch { pipeline, .. }, _)) => {
+            Some(ir::Expr::Host(
+                ir::HostOp::Dispatch { pipeline, .. } | ir::HostOp::KernelWork { pipeline },
+                _,
+            )) => {
                 used[*pipeline as usize] = true;
             }
             Some(ir::Expr::Host(ir::HostOp::Draw { pipeline, target, .. }, _)) => {
@@ -666,7 +670,9 @@ fn recorded_pipelines_only(cx: &mut Cx, cpu: &mut ir::Module) {
         ir::visit::walk_mut(&mut f.body, &mut |s| {
             if let ir::Stmt::Let(_, e) | ir::Stmt::Eval(e) = s
                 && let ir::Expr::Host(
-                    ir::HostOp::Dispatch { pipeline, .. } | ir::HostOp::Draw { pipeline, .. },
+                    ir::HostOp::Dispatch { pipeline, .. }
+                    | ir::HostOp::Draw { pipeline, .. }
+                    | ir::HostOp::KernelWork { pipeline },
                     _,
                 ) = e
             {

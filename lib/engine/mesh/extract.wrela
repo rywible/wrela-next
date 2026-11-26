@@ -5,7 +5,7 @@
 use matter::substance::Substance
 use mesh::dc::{
     CREASE_STEPS, CreaseSolve, classify_cells, crease_part, crease_passes, crease_slice,
-    crease_step_cost_of, crease_step_cost_rest_of, crease_invocation_cost_of, crease_invocation_cost_rest_of, cull_bricks, cull_bricks_rest, deform_skinned_verts,
+    crease_step_cost_of, crease_step_cost_rest_of,  cull_bricks, cull_bricks_rest, deform_skinned_verts,
     eval_corners, eval_corners_rest, eye_step, filter_thin_cells, inherit_seam_corners,
     keep_slice_of, keep_verts, mark_first, note_untested, prep_chunk, prep_creases, prep_from,
     prep_slices, refine_creases, refine_creases_rest, solve_verts, solve_verts_rest, surf_slice,
@@ -19,7 +19,7 @@ use mesh::emit::{
 }
 use mesh::grid::{
     ActiveBrick, BrickBound, CAP_EXACT_MAX, CAP_SEAM, CAP_SURF, CERT_SLICE, CERT_SLICES,
-    CHUNK_BRICKS, COLD_CREASE_SLICES, CORNERS_BRICK, CREASE_SLICE, CULL_CHUNK, CUT_BRICKS,
+    CHUNK_BRICKS, COLD_CREASE_SLICES, CORNERS_BRICK, CREASE_SLICE, CREASE_SLICE_LEAST, CULL_CHUNK, CUT_BRICKS,
     DEFORM_SLICE, FrustumCull, GridSpec, MAX_LOD_LEVELS, MOST_INDICES_PER_BRICK, NONE, PATCH_MOST,
     SEAM_SLICE, SEAM_SLICES, SLICES_MOST, START_INDICES_PER_BRICK, START_TRANS_PER_BRICK,
     START_VERTS_PER_BRICK, SeamCell, SeamQuad, THIN_SLICE, THIN_SLICES, VERTS_BRICK, VERTS_STRIDE,
@@ -31,7 +31,7 @@ use std::derive::Box3
 use std::field::{DualQuat, Field, Rigid}
 use std::gpu::{
     AppendBuffer, DispatchArgs, DrawIndexedArgs, GpuBuffer, GpuSpan, append_buffer, buffer,
-    buffer_of, copy, dispatch, label, read_settled, write,
+    buffer_of, copy, dispatch, kernel_work, label, read_settled, write,
 }
 use std::hash::{Hasher, StateHash}
 use std::io::Pending
@@ -356,6 +356,8 @@ pub struct MeshBatch {
     /// Work-sized crease and surface slice sizes for the field extracted now (`crease_slice`,
     /// `surf_slice`).
     crease_slice: u32,
+    /// `refine_seam_creases`' cells a dispatch, by its own bound (`kernel_work`).
+    seam_crease_slice: u32,
     surf_slice: u32,
     /// The dispatches a crease slice's solves take for the field extracted now (`crease_passes`
     /// of `crease_part` of `crease_step_cost_of`, or of `crease_step_cost_rest_of` at rest).
@@ -546,7 +548,8 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
         poll_total: 0,
         poll_limit: 0,
         crease_hint: 0,
-        crease_slice: CREASE_SLICE,
+        crease_slice: CREASE_SLICE_LEAST,
+        seam_crease_slice: CREASE_SLICE_LEAST,
         surf_slice: CAP_SURF,
         crease_passes: CREASE_STEPS,
         thin_hint: 0,
@@ -2578,7 +2581,38 @@ impl MeshBatch {
     ) {
         label("mesh_extract")
         let step = crease_step_cost_of(sample)
-        self.crease_slice = crease_slice(crease_invocation_cost_of(sample))
+        // A crease slice is as many cells as the kernel's own bound (`kernel_work`) lets a
+        // dispatch hold: this batch's kernels, bound as they're dispatched.
+        let crease_kernel = refine_creases.bind(
+            fields: fields,
+            grids: scratch.grids.items(),
+            active: scratch.active.items(),
+            chunk_start: 0,
+            corners: scratch.corners.items(),
+            creases: scratch.creases.items(),
+            crease_count: scratch.creases.count(),
+            first: 0,
+            pass: 0,
+            solves: mut scratch.crease_solves,
+            cap_verts: self.cap_verts,
+            cell_verts: mut scratch.cell_verts,
+            verts: mut self.verts,
+        )
+        self.crease_slice = crease_slice(kernel_work(crease_kernel))
+        let seam_kernel = refine_seam_creases.bind(
+            fields: fields,
+            grids: scratch.grids.items(),
+            seam_cells: scratch.seam_cells.items(),
+            seam_creases: scratch.seam_creases.items(),
+            seam_crease_count: scratch.seam_creases.count(),
+            first: 0,
+            pass: 0,
+            solves: mut scratch.crease_solves,
+            cap_verts: self.cap_verts,
+            verts: mut self.verts,
+            seam_verts: mut scratch.seam_verts,
+        )
+        self.seam_crease_slice = crease_slice(kernel_work(seam_kernel))
         self.crease_passes = crease_passes(crease_part(step))
         self.surf_slice = surf_slice(step)
         let uses_kept = sample.uses_kept()
@@ -2607,7 +2641,7 @@ impl MeshBatch {
             keep_per_chunk +
             exact_indirect +
             self.crease_slices(CHUNK_BRICKS) * self.crease_passes
-        let seam_c_slice = min(SEAM_SLICE, self.crease_slice)
+        let seam_c_slice = min(SEAM_SLICE, self.seam_crease_slice)
         let seam_c_slices = if has_seams {
             min((self.seam_slices() * SEAM_SLICE + seam_c_slice - 1) / seam_c_slice, SLICES_MOST)
         } else {
@@ -3350,7 +3384,23 @@ impl MeshBatch {
     ) {
         label("mesh_extract")
         let step = crease_step_cost_rest_of(sample)
-        self.crease_slice = crease_slice(crease_invocation_cost_rest_of(sample))
+        let crease_kernel = refine_creases_rest.bind(
+            fields: fields,
+            grids: scratch.grids.items(),
+            active: scratch.active.items(),
+            chunk_start: 0,
+            corners: scratch.corners.items(),
+            creases: scratch.creases.items(),
+            crease_count: scratch.creases.count(),
+            first: 0,
+            pass: 0,
+            solves: mut scratch.crease_solves,
+            cap_verts: self.cap_verts,
+            cell_verts: mut scratch.cell_verts,
+            verts: mut self.verts,
+            skin_verts: mut self.skin_verts,
+        )
+        self.crease_slice = crease_slice(kernel_work(crease_kernel))
         self.crease_passes = crease_passes(crease_part(step))
         self.surf_slice = surf_slice(step)
         self.ensure_cap(min(total_bricks, self.max_bricks))

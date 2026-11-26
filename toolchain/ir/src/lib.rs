@@ -336,6 +336,10 @@ pub enum HostOp {
     RequestTake,
     /// `wrela.limit(index)`: one of the GPU's limits, a `u32`.
     Limit,
+    /// `wrela.limit(KERNEL_WORK_LIMIT + pipeline)`: a compute pipeline's work an invocation, as
+    /// its manifest states it (`std::gpu::kernel_work`). No arguments: the pipeline is the
+    /// manifest's, numbered as dispatches are.
+    KernelWork { pipeline: u32 },
     /// `wrela.audio(task, context)`: starts the program's voice.
     Audio,
     /// `wrela.tick(task, context, hz)`: starts the program's ticker.

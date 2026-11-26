@@ -295,6 +295,7 @@ impl Lang {
                         | Lang::ReadSettledCommand
                         | Lang::TimedCommand
                         | Lang::Limit
+                        | Lang::KernelWork
                         | Lang::InputTake
                         | Lang::PayloadTake
                         | Lang::Kept
@@ -624,6 +625,7 @@ lang_items! {
     UnprepareCommand = "std::reload::unprepare_command",
     HandOverCommand = "std::reload::hand_over_command",
     Limit = "std::gpu::limit",
+    KernelWork = "std::gpu::kernel_work",
     Shared = "std::gpu::Shared",
     SharedAtomics = "std::gpu::SharedAtomics",
     SharedAtomicsI = "std::gpu::SharedAtomicsI",

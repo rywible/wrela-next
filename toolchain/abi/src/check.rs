@@ -102,6 +102,9 @@ struct Shape {
     blends: Vec<Blend>,
     /// The device features its shader needs.
     requires: Vec<String>,
+    /// The most work one invocation of its (first) entry point does (the manifest's `work`),
+    /// `u32::MAX` where it has none: what `std::gpu::kernel_work` reads ([`Checker::kernel_work`]).
+    work: u32,
 }
 
 /// A live texture.
@@ -218,6 +221,13 @@ impl Checker {
     }
 
     /// A checker for a device with these limits.
+    /// The most work one invocation of pipeline `pipeline` does, as its manifest states it
+    /// (`u32::MAX` where it states none, or for no such pipeline): `std::gpu::kernel_work`, which
+    /// a program sizes its dispatches of the kernel by.
+    pub fn kernel_work(&self, pipeline: u32) -> u32 {
+        self.pipelines.get(pipeline as usize).map_or(u32::MAX, |p| p.work)
+    }
+
     pub fn with_limits(manifest: &Manifest, limits: crate::Limits) -> Checker {
         let pipelines = manifest
             .pipelines
@@ -235,6 +245,9 @@ impl Checker {
                     targets,
                     blends,
                     requires: p.requires.clone(),
+                    work: p.work.first().copied().flatten().map_or(u32::MAX, |w| {
+                        u32::try_from(w).unwrap_or(u32::MAX)
+                    }),
                 }
             })
             .collect();

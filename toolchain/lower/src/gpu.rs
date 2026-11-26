@@ -1608,6 +1608,7 @@ pub(crate) fn intrinsic(
             | Lang::FlushCommands
             | Lang::RequestTake
             | Lang::Limit
+            | Lang::KernelWork
             | Lang::InputTake
             | Lang::PayloadTake
             | Lang::Keep
@@ -1622,6 +1623,29 @@ pub(crate) fn intrinsic(
                 format!("`{name}` asks the host, and GPU code can't ({l:?})"),
             ));
             None
+        }
+        Some(Lang::KernelWork) if !fl.is_gpu() => {
+            // The kernel a bound value names, as `dispatch` records it with `groups:` (no `over:`,
+            // no origin): its pipeline's work an invocation, which the host reads from the
+            // manifest (`wrela_abi::KERNEL_WORK_LIMIT`).
+            let t = match &c.args[0] {
+                mir::Arg::Borrow(p, _) | mir::Arg::Mut(p, _) => fl.place_src_ty(p),
+                mir::Arg::Take(o) => fl.concrete(o.ty),
+            };
+            let program = &fl.cx.checked.program;
+            let TyKind::Adt(a, args) = program.types.kind(t).clone() else {
+                fl.cx.err(Diagnostic::new(codes::E0600, span, "`kernel_work` takes a kernel bound to its arguments (`kernel.bind(...)`)".to_string()));
+                return None;
+            };
+            let Some(func) = program.adt(a).entry else {
+                fl.cx.err(Diagnostic::new(codes::E0600, span, "`kernel_work` takes a kernel bound to its arguments (`kernel.bind(...)`)".to_string()));
+                return None;
+            };
+            let substs: Vec<TyId> = args.iter().map(|&x| fl.concrete(x)).collect();
+            let key = PipelineKey::Compute { kernel: func, substs, over: false, origin: false, consts: Vec::new() };
+            let (pindex, _) = pipeline(fl.cx, key, span);
+            let u = fl.mb.m.types.u32();
+            Some(fl.value(u, ir::Expr::Host(ir::HostOp::KernelWork { pipeline: pindex }, Vec::new())))
         }
         Some(Lang::Limit) if !fl.is_gpu() => {
             let i = fl.arg_value(&c.args[0])?;
@@ -4590,6 +4614,13 @@ fn count_work(
         });
         if ir::opt::flatten_gpu(&mut mb.m).is_ok() {
             let (each, _) = ir::work::module_work(&mb.m);
+            if std::env::var("WRELA_DUMP_IR").as_deref() == Ok("work") {
+                let all = ir::work::work_by_function(&mb.m, mb.m.entry_points[0].function);
+                eprintln!("work strict_work `{}`: bound {:?}", cx.source_name(key).unwrap_or_default(), each.first().map(|e| e.work));
+                for (f, times, w) in all.iter().take(12) {
+                    eprintln!("  {w:>10} {times:>8}x {}", mb.m.functions[f.index()].name);
+                }
+            }
             w = match (w, each.first().map(|e| e.work)) {
                 (Some(a), Some(Some(b))) => Some(a.max(b)),
                 (_, Some(None)) => None,

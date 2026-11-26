@@ -1302,13 +1302,13 @@ pub fn builtin_cost(b: Builtin, n: u64) -> u64 {
 pub fn strict_builtin_cost(b: Builtin, n: u64) -> u64 {
     use Builtin as B;
     let one = match b {
-        B::Sqrt => 70,
-        B::InverseSqrt => 70 + SLOW_OP,
+        B::Sqrt => 48,
+        B::InverseSqrt => 48 + SLOW_OP,
         B::Sin => 302,
         B::Cos => 306,
         B::Tan => 300,
-        B::Asin => 166,
-        B::Acos => 165,
+        B::Asin => 144,
+        B::Acos => 143,
         B::Atan => 45,
         B::Atan2 => 82,
         B::Exp => 50,
@@ -1319,8 +1319,8 @@ pub fn strict_builtin_cost(b: Builtin, n: u64) -> u64 {
         B::Cosh => 103,
         B::Tanh => 73,
         B::Pow => 305,
-        B::Length | B::Distance => return OP * n + 70,
-        B::Normalize => return 2 * OP * n + 70,
+        B::Length | B::Distance => return OP * n + 48,
+        B::Normalize => return 2 * OP * n + 48,
         _ => return builtin_cost(b, n),
     };
     one * n

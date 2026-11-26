@@ -2715,13 +2715,17 @@ fn clock<E: Executor>(
 }
 
 /// `wrela.limit(index) -> i32`: one of the device's limits ([`wrela_abi::Limits`]), as a `u32`'s
-/// bits; 0 past the last.
+/// bits; 0 past the last; from [`wrela_abi::KERNEL_WORK_LIMIT`] on, a pipeline's work an
+/// invocation (`std::gpu::kernel_work`).
 fn limit<E: Executor>(
     mut caller: wasmtime::Caller<'_, State<E>>,
     index: u32,
 ) -> wasmtime::Result<i32> {
     let state = caller.data_mut();
     check_started(state)?;
+    if index >= wrela_abi::KERNEL_WORK_LIMIT {
+        return Ok(state.checker.kernel_work(index - wrela_abi::KERNEL_WORK_LIMIT) as i32);
+    }
     Ok(state.executor.limits().get(index) as i32)
 }
 

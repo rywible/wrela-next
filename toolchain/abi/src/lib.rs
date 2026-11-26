@@ -638,6 +638,10 @@ impl Limits {
 /// read the step's work as the screen until toolchain 0.33.)
 pub const SCREEN_LIMIT: u32 = 14;
 
+/// The first of `wrela.limit`'s indices that give a kernel's work (`std::gpu::kernel_work`):
+/// `KERNEL_WORK_LIMIT + p` is pipeline `p`'s most work an invocation, as its manifest states it.
+pub const KERNEL_WORK_LIMIT: u32 = 1 << 20;
+
 /// `wrela.limit`'s index of the most work one invocation of a dispatch may do
 /// ([`Limits::lane_work`]).
 pub const LANE_WORK_LIMIT: u32 = 17;

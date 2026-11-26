@@ -1479,6 +1479,13 @@ pub(super) fn host(
             ]);
         }
         ir::HostOp::Flush => fe.ins.push(I::Call(fe.at.helpers.flush)),
+        ir::HostOp::KernelWork { pipeline } => {
+            // The limit import, at the pipeline's index past the device's limits.
+            let index = wrela_abi::KERNEL_WORK_LIMIT + pipeline;
+            fe.ins.push(I::I32Const(index as i32));
+            fe.ins.push(I::Call(fe.at.helpers.limit));
+            set_or_drop(fe, result);
+        }
         ir::HostOp::RequestStatus
         | ir::HostOp::Limit
         | ir::HostOp::Payload
