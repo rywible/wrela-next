@@ -374,8 +374,9 @@ LEAST_LOG_STD = -3.0
 def ppo(agent, opt, b_obs, b_act, b_logp, b_adv, b_ret, gen, target_kl):
     """PPO's epochs over the rollout (clipped at 0.2, four minibatches an epoch), the actor's and
     the critic's gradients each clipped to 1 apart, and no epoch after one whose mean KL passed
-    `target_kl`. Gives (the last epoch's mean KL, minibatches skipped), the share clipped, the
-    value loss and the epochs run."""
+    `target_kl`, the rate of learning lowered after an update that passed it and raised after one
+    under a quarter of it. Gives (the last epoch's mean KL, minibatches skipped), the share
+    clipped, the value loss and the epochs run."""
     dev = b_obs.device
     n = b_obs.shape[0]
     mb = max(n // 4, 1)
@@ -412,6 +413,13 @@ def ppo(agent, opt, b_obs, b_act, b_logp, b_adv, b_ret, gen, target_kl):
             kl, clipped, vloss = sum(kls) / len(kls), sum(clips) / len(clips), sum(vls) / len(vls)
         if kl > target_kl:
             break
+    # The rate of learning follows the KL (the adaptive rate of rl_games, used by AMP and its
+    # successors): down when a step moved the policy more than the target, up when much less.
+    for g in opt.param_groups:
+        if kl > target_kl:
+            g["lr"] = max(g["lr"] / 1.5, 1e-6)
+        elif kl < 0.25 * target_kl:
+            g["lr"] = min(g["lr"] * 1.5, 1e-3)
     return (kl, skipped), clipped, vloss, epochs
 
 

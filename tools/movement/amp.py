@@ -357,6 +357,7 @@ def main():
     p.add_argument("--fastest", type=float, default=2.0, help="the fastest wish (m/s)")
     p.add_argument("--episode", type=int, default=300, help="the most frames of a world before it starts again")
     p.add_argument("--eval-every", type=int, default=200)
+    p.add_argument("--target-kl", type=float, default=0.02)
     p.add_argument("--offline", action="store_true", help="the discriminator alone against damaged capture")
     a = p.parse_args(run.args)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
@@ -439,7 +440,7 @@ def train(a, run, dev, gen, head, refs, mjm):
                 hist_q = torch.cat([hist_q[:, 1:], sim.qpos[:, None]], 1)
                 hist_x = torch.cat([hist_x[:, 1:], sim.xpos[:, None]], 1)
                 feat_buf[h] = torch.nan_to_num(features(hist_q, hist_x, clips.rate), 0.0, 0.0, 0.0)
-                v = (sim.qpos[:, [0, 2]] - q0[:, [0, 2]]) * clips.rate
+                v = (hist_q[:, -1, [0, 2]] - hist_q[:, -2, [0, 2]]) * clips.rate
                 task = torch.exp(-2.5 * ((v - wish) ** 2).sum(-1))
                 fell = bad | (sim.qpos[:, 1] < fall_height) | ~torch.isfinite(task)
                 task = torch.where(fell, torch.zeros_like(task), task)
@@ -488,25 +489,8 @@ def train(a, run, dev, gen, head, refs, mjm):
         b_obs, b_act = obs_buf.reshape(H * N, -1), act_buf.reshape(H * N, -1)
         b_logp, b_adv, b_ret = logp_buf.reshape(-1), adv.reshape(-1), ret.reshape(-1)
         b_adv = (b_adv - b_adv.mean()) / (b_adv.std() + 1e-8)
-        mb = max((H * N) // 4, 1)
-        skipped = 0
-        for _ in range(5):
-            perm = torch.randperm(H * N, device=dev, generator=gen)
-            for i in range(0, H * N, mb):
-                j = perm[i:i + mb]
-                dist = agent.dist(b_obs[j])
-                lp = dist.log_prob(b_act[j]).sum(-1)
-                ratio = torch.exp(lp - b_logp[j])
-                pg = -torch.min(ratio * b_adv[j], ratio.clamp(0.8, 1.2) * b_adv[j]).mean()
-                vl = 0.5 * ((agent.v(b_obs[j]).squeeze(-1) - b_ret[j]) ** 2).mean()
-                loss = pg + vl
-                if not torch.isfinite(loss):
-                    skipped += 1
-                    continue
-                opt.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(agent.parameters(), 1.0)
-                opt.step()
+        kl, clipped, vloss, epochs = T.ppo(agent, opt, b_obs, b_act, b_logp, b_adv, b_ret, gen, a.target_kl)
+        skipped = kl[1]
         step += 1
         samples += H * N
         now = time.time()
@@ -517,7 +501,9 @@ def train(a, run, dev, gen, head, refs, mjm):
             print(f"update {step}: task {ep_task / H:.3f} style {float(style.mean()):.3f} "
                   f"falls/step {ep_fall / H:.4f}; discriminator loss {d_loss:.3f} capture {d_pos:.3f} "
                   f"other {d_neg:.3f}; samples {samples} ({sps:.0f} a second); blown up {blown}, "
-                  f"skipped {skipped}", flush=True)
+                  f"skipped {skipped}; kl {kl[0]:.4f} clipped {clipped:.3f} value loss {vloss:.3f} "
+                  f"epochs {epochs} log std {float(agent.log_std.mean()):.3f} "
+                  f"lr {opt.param_groups[0]['lr']:.2e}", flush=True)
         if a.eval_every and step % a.eval_every == 0:
             last_check = check(disc, clips)
             print(f"check at {step}: {json.dumps(last_check)}", flush=True)
