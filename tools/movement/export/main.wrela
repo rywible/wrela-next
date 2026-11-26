@@ -11,6 +11,8 @@
 //   of mass and inertia the engine's (the body's `MASSES`), written as they are: no
 //   inertia from shapes. A segment the engine weighs at 0 (a collarbone, which carries no part)
 //   gets `LEAST` kg, as the simulator can't move a body with no mass;
+// - a segment that no exported clip moves (`moving`: a finger, where no capture has fingers) welded
+//   to its parent: no joint;
 // - each joint's numbers as the simulator's joints, in the segment's body: a hinge about x; a
 //   universal joint a hinge about x then one about y, as the engine turns it; a ball joint three
 //   hinges, its turn written as three turns exactly, the middle one about the axis of its
@@ -150,7 +152,7 @@ fn depth_first<const S: u32>(b: Body<S>) -> Vec<u32> {
     order
 }
 
-fn model<const S: u32, const D: u32, const P: u32>(def: Def<S, D, P>) -> String {
+fn model<const S: u32, const D: u32, const P: u32>(def: Def<S, D, P>, moves: [bool; S]) -> String {
     let b = def.body
     let at = b.places(def.rest)
     var x = String::new()
@@ -198,7 +200,7 @@ fn model<const S: u32, const D: u32, const P: u32>(def: Def<S, D, P>) -> String 
                 f"{ind}  <inertial pos=\"0 0 0\" mass=\"{LEAST}\" diaginertia=\"{LEAST_INERTIA} {LEAST_INERTIA} {LEAST_INERTIA}\"/>\n",
             )
         }
-        for h in 0..hinges(j.kind) {
+        for h in 0..(if moves[s] { hinges(j.kind) } else { 0 }) {
             let (ax, k) = hinge(j, h)
             let (lo, hi) = (j.lo[k], j.hi[k])
             x.push_str(
@@ -246,18 +248,48 @@ fn next(r: mut Reader) -> u32 {
     }
 }
 
-/// How many numbers the model's qpos holds: the root's 7 and each hinge.
-fn qpos_size<const S: u32>(b: Body<S>) -> u32 {
+/// How many numbers the model's qpos holds: the root's 7 and each hinge of a segment that moves.
+fn qpos_size<const S: u32>(b: Body<S>, moves: [bool; S]) -> u32 {
     var n = 7
     for s in 1..S {
-        n += hinges(b.segments[s].joint.kind)
+        if moves[s] {
+            n += hinges(b.segments[s].joint.kind)
+        }
     }
     n
+}
+
+/// Which segments the clips `names` move: a segment none of whose numbers any frame takes more
+/// than a milliradian from rest (a finger, where no capture has fingers) is welded to its parent
+/// in the model, as the simulator need not step a joint nothing moves. With no clips, all move.
+fn moving<const S: u32, const D: u32, const P: u32>(
+    def: Def<S, D, P>,
+    names: Vec<String>,
+) -> [bool; S] {
+    var out = [names.is_empty(); S]
+    out[0] = true
+    for name in names {
+        let Ok(c) = load::<D>("poses", def.name, name.as_str()) else { continue }
+        for p in c.poses {
+            for s in 1..S {
+                if out[s] {
+                    continue
+                }
+                let q = def.body.numbers(p, s)
+                let r = def.body.numbers(def.rest, s)
+                if max(abs(q.x - r.x), max(abs(q.y - r.y), abs(q.z - r.z))) > 0.001 {
+                    out[s] = true
+                }
+            }
+        }
+    }
+    out
 }
 
 /// One clip's states.
 fn refs<const S: u32, const D: u32, const P: u32>(
     def: Def<S, D, P>,
+    moves: [bool; S],
     name: str,
 ) -> Result<u32, ToolError> {
     let c = load::<D>("poses", def.name, name)?
@@ -268,7 +300,7 @@ fn refs<const S: u32, const D: u32, const P: u32>(
         w.write_u8(c)
     }
     w.write_u32(1)
-    w.write_u32(qpos_size(b))
+    w.write_u32(qpos_size(b, moves))
     w.write_u32(S)
     w.write_u32(n)
     w.write_u32(bitcast_u32(rate))
@@ -283,7 +315,7 @@ fn refs<const S: u32, const D: u32, const P: u32>(
                 continue
             }
             let a = angles(b, p, s)
-            for h in 0..hinges(b.segments[s].joint.kind) {
+            for h in 0..(if moves[s] { hinges(b.segments[s].joint.kind) } else { 0 }) {
                 w.write_u32(bitcast_u32(a[h]))
             }
         }
@@ -308,9 +340,34 @@ pub fn tool() -> u32 {
 }
 
 fn export<const S: u32, const D: u32, const P: u32>(def: Def<S, D, P>, a: Vec<String>) -> u32 {
-    let xml = model(def)
+    // The clips of the sets named.
+    var names: Vec<String> = Vec::new()
+    for set_name in a {
+        if set_name.as_str() == "human" || set_name.as_str() == "creature" {
+            continue
+        }
+        let Ok(bytes) = files::read(f"split/{set_name}.txt").wait() else { continue }
+        let Some(text) = String::from_utf8(take bytes) else { continue }
+        let t = text.as_str()
+        for (x, y) in t.lines() {
+            let line = t.slice(x, y).trim()
+            if line.len() > 0 && !line.starts_with("#") {
+                names.push(line.to_string())
+            }
+        }
+    }
+    let moves = moving(def, names.clone())
+    var welded = 0
+    for s in 1..S {
+        if !moves[s] {
+            welded += 1
+        }
+    }
+    let xml = model(def, moves)
     match write_all(f"out/{def.name}.xml", Vec::from(xml.as_bytes())) {
-        Ok(_) => print(f"export: out/{def.name}.xml, qpos {qpos_size(def.body)}"),
+        Ok(_) => print(
+            f"export: out/{def.name}.xml, qpos {qpos_size(def.body, moves)}, {welded} segments that no clip moves welded",
+        ),
         Err(e) => {
             print(f"export: {e.message()}")
             return 1
@@ -328,25 +385,13 @@ fn export<const S: u32, const D: u32, const P: u32>(def: Def<S, D, P>, a: Vec<St
     let _ = write_all(f"out/{def.name}_masses.txt", Vec::from(masses.as_bytes()))
     var clips = 0
     var frames = 0
-    for set_name in a {
-        if set_name.as_str() == "human" || set_name.as_str() == "creature" {
-            continue
-        }
-        let Ok(bytes) = files::read(f"split/{set_name}.txt").wait() else { continue }
-        let Some(text) = String::from_utf8(take bytes) else { continue }
-        let t = text.as_str()
-        for (a, b) in t.lines() {
-            let line = t.slice(a, b).trim()
-            if line.len() == 0 || line.starts_with("#") {
-                continue
-            }
-            match refs(def, line) {
-                Ok(n) => {
-                    clips += 1
-                    frames += n
-                },
-                Err(e) => print(f"export: {line}: {e.message()}"),
-            }
+    for line in names {
+        match refs(def, moves, line.as_str()) {
+            Ok(n) => {
+                clips += 1
+                frames += n
+            },
+            Err(e) => print(f"export: {line}: {e.message()}"),
         }
     }
     print(f"export: {clips} clips, {frames} frames")

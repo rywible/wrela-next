@@ -16,6 +16,21 @@ import mujoco
 import numpy as np
 
 SIM = ".movement/sim"
+BODY = "creature"
+
+
+def take_options():
+    """`--sim DIR` (the export's folder) and `--body NAME` (its model, NAME.xml), taken from the
+    command line: the human's are `--sim .movement/sim-human --body human`."""
+    global SIM, BODY
+    for flag in ("--sim", "--body"):
+        if flag in sys.argv:
+            i = sys.argv.index(flag)
+            if flag == "--sim":
+                SIM = sys.argv[i + 1]
+            else:
+                BODY = sys.argv[i + 1]
+            del sys.argv[i:i + 2]
 
 
 def read_ref(path):
@@ -29,9 +44,10 @@ def read_ref(path):
 
 
 def main():
-    m = mujoco.MjModel.from_xml_path(f"{SIM}/creature.xml")
+    take_options()
+    m = mujoco.MjModel.from_xml_path(f"{SIM}/{BODY}.xml")
     d = mujoco.MjData(m)
-    rows = [l.split() for l in open(f"{SIM}/creature_masses.txt").read().splitlines()[1:]]
+    rows = [l.split() for l in open(f"{SIM}/{BODY}_masses.txt").read().splitlines()[1:]]
     worst_mass = 0.0
     worst_inertia = 0.0
     for r in rows:

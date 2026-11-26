@@ -5,6 +5,8 @@
     .movement/venv/bin/python tools/movement/solve.py pack SET... -o .movement/solver/poses.bin
         the poses of the sets' clips in one file (WPSE: a u32 length, a JSON head of the clips'
         names, sets, first rows and lengths, the rate and D, then zlib of the f32 rows)
+    .movement/venv/bin/python tools/movement/solve.py --body human pack SET... -o FILE
+        (each command but the run takes `--body NAME` first: human or creature, the default)
     python3 solve.py --out DIR --seed N [--resume CKPT] --poses poses.bin --body creature.body.json ...
         a training run (a job of tools/movement/runlib.py, here or by tools/movement/colab-run)
 
@@ -15,9 +17,9 @@ hidden at random, its flag beside it) and z, and gives the step. The game runs t
 z drawn from a seed. Training rolls the decoder out over windows of frames and feeds its own
 steps back (scheduled sampling: the share fed back rises to all), so its small errors don't grow.
 
-The poses are `.movement/poses/creature/SOURCE/CLIP.pose` (tools/movement/capture writes them;
+The poses are `.movement/poses/BODY/SOURCE/CLIP.pose` (tools/movement/capture writes them;
 the filtered capture of phase 4 is written the same way); the body is
-`.movement/solver/creature.body.json` (`tools/movement/solver -- body`).
+`.movement/solver/BODY.body.json` (`tools/movement/solver -- BODY body`).
 """
 import os
 import struct
@@ -30,8 +32,16 @@ sys.path.insert(0, os.path.dirname(__file__))
 import motion  # noqa: E402
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-POSES = os.path.join(ROOT, ".movement/poses/creature")
 SOLVER = os.path.join(ROOT, ".movement/solver")
+# The body (`--body NAME`: human or creature, the default), as tools/movement/bodies names it.
+BODY = "creature"
+POSES = os.path.join(ROOT, ".movement/poses", BODY)
+
+
+def set_body(name):
+    global BODY, POSES
+    BODY = name
+    POSES = os.path.join(ROOT, ".movement/poses", name)
 
 
 def read_pose(path):
@@ -50,12 +60,12 @@ def read_features(path):
 
 
 def check(clips):
-    body = motion.Body(f"{SOLVER}/creature.body.json")
+    body = motion.Body(f"{SOLVER}/{BODY}.body.json")
     worst = {"state": 0.0, "step": 0.0, "goal": 0.0, "after": 0.0}
     for c in clips:
         rate, x = read_pose(f"{POSES}/{c}.pose")
         p = torch.tensor(np.array(x), dtype=torch.float32)
-        es, et, eg = (torch.tensor(np.array(a)) for a in read_features(f"{SOLVER}/features/{c}.bin"))
+        es, et, eg = (torch.tensor(np.array(a)) for a in read_features(f"{SOLVER}/features/{BODY}/{c}.bin"))
         n = p.shape[0]
         f = torch.arange(1, n - 1)
         s = body.state(p[f - 1], p[f], rate)
@@ -154,10 +164,10 @@ def play_check(argv):
     rollout here: the WNET read and run by this script, the code drawn as the engine draws it.
     Prints the largest difference of the root and of a joint over the first second and over all."""
     net_name, seed, clip = argv[0], int(argv[1]), argv[2]
-    body = motion.Body(f"{SOLVER}/creature.body.json")
+    body = motion.Body(f"{SOLVER}/{BODY}.body.json")
     net = read_wnet(f"{SOLVER}/{net_name}.wnet")
     rate, x = read_pose(f"{POSES}/{clip}.pose")
-    _, eng = read_pose(f"{SOLVER}/play/creature/{clip}.pose")
+    _, eng = read_pose(f"{SOLVER}/play/{BODY}/{clip}.pose")
     ref = torch.tensor(np.array(x))
     eng = torch.tensor(np.array(eng))
     n = ref.shape[0]
@@ -189,7 +199,7 @@ def fk_check(clips):
     """`motion.Body.places` against the engine's (`Body::places`, which tools/movement/export
     writes in each clip's states, `.movement/sim/refs/CLIP.ref`): the largest distance of a
     segment's origin and of its turn."""
-    body = motion.Body(f"{SOLVER}/creature.body.json")
+    body = motion.Body(f"{SOLVER}/{BODY}.body.json")
     worst_t, worst_r = 0.0, 0.0
     for c in clips:
         _, x = read_pose(f"{POSES}/{c}.pose")
@@ -252,6 +262,10 @@ def load_packed(path):
 
 
 def main():
+    if "--body" in sys.argv[1:3] and sys.argv[1] != "--out":
+        i = sys.argv.index("--body")
+        set_body(sys.argv[i + 1])
+        del sys.argv[i:i + 2]
     if len(sys.argv) > 1 and sys.argv[1] == "check":
         sys.exit(check(sys.argv[2:]))
     if len(sys.argv) > 1 and sys.argv[1] == "play-check":

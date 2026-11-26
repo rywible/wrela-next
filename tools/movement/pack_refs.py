@@ -27,6 +27,7 @@ def main():
     p.add_argument("sets", nargs="+")
     p.add_argument("--most", type=int, default=0, help="at most this many clips of each set")
     p.add_argument("-o", required=True)
+    p.add_argument("--sim", default=".movement/sim", help="the export's folder (its refs/)")
     a = p.parse_args()
     names, starts, lengths, chunks, which = [], [], [], [], []
     nq, rate, total, missing = None, None, 0, 0
@@ -36,7 +37,7 @@ def main():
         if a.most:
             lines = lines[:a.most]
         for name in lines:
-            path = os.path.join(ROOT, ".movement/sim/refs", f"{name}.ref")
+            path = os.path.join(ROOT, a.sim, "refs", f"{name}.ref")
             if not os.path.exists(path):
                 missing += 1
                 continue
