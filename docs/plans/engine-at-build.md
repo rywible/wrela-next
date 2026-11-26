@@ -825,10 +825,18 @@ array the GPU keeps in thread memory or reads through its constant cache had bee
 operation, and such loops ran past their bounds (now a memory access: the bounds hold again, the
 gate unchanged); and the exact pass's time is in its field's parts: with each cell's live mask
 cut to one part the candlestick's draw takes 2.1 ms, not 10.6, while its tally hardly moves (9.2e7
-against 9.8e7). So the tally misses the work a live part does there, and on a probe of the
-candlestick's `distance_live` it is over the static bound (5,964 a lane against 3,063), so one of
-the two counts is wrong on that code. Next: reconcile them on that probe, statement by statement;
-then the model prices the exact pass, and the pass is made cheaper where its parts are. Found on the way: a rigid thing's exact cells are tested in the
+against 9.8e7). So the tally misses the work a live part does there. And on a probe of the
+candlestick's `distance_live` the tally is over the static bound (6,120 a lane at rows where the
+bound is 3,066): the bound follows a loop's counter pass by pass and takes an array read at it as
+one at a constant index, where the GPU runs the loop rolled (the writer keeps loops rolled) and
+reads the array from thread memory, as the tally prices it. Counting such reads as memory in the
+bound too (3,754 there) made `emit_compact`'s bound 114 ms and E0714, though it takes 0.08 ms: the
+count charges every pass of its merge loop with the path that merges and leaves, a pessimism
+about ways out of a loop that memory prices multiply. Left as it is: the bound's time stays above
+every measure taken (the probe's million lanes 1.42 ms against 8.0). Next: the count charges a
+way that leaves a loop once, not each pass; then the bound prices such reads as the GPU runs
+them, and the tally and the bound agree; then the model prices the exact pass, and the pass is
+made cheaper where its parts are. Found on the way: a rigid thing's exact cells are tested in the
 frame it was meshed in (`exact_box_one_fs` brackets the world ray by the cell's box as meshed,
 where `exact_box_vs` draws it moved by `xforms[0]`), right while it is still, wrong once it
 moves without being meshed again. The
