@@ -911,8 +911,14 @@ segment's offset alone kept its slopes; the profile's code lost them where it:
    interval is taken. The loop's sentinel (`none()`, 1e30) had been in every pass's form, so
    with the loop kept the form had no bound. A turned profile of four straight segments: slopes
    (2.4, -0.55) mm a half cell and an error of 0.74 mm at a 4.8 mm cell, where it had none.
-4. The candlestick's own profile (bowed segments, as arcs) and its carved gadroons still give a
-   form with no bound: next.
+4. A profile of bowed segments derives with a bound, a loose one: four points, two bowed, an
+   error of 15 mm at a 4.8 mm cell. A bowed segment alone is tight (its arc's offset 0.34 mm),
+   but with the rest the profile's nearest segment is unsure: a neighbouring arc's test of
+   whether the box is within its span (`on_arc`) is unsure, and its distance to its whole circle,
+   which may pass near the box, joins the choice. Next.
+5. And the forge's kinds are heavy (`is_heavy_field`: the table's distance 10,750 work, its form
+   240,820), so their kernels certify by pruning alone, which can't certify a sheet: the affine
+   certificate for a heavy kind is the other half of SCENE 14's exact cells.
 
 `WRELA_DUMP_IR=affine` says why a field's affine form falls to its interval.
 
