@@ -833,10 +833,16 @@ reads the array from thread memory, as the tally prices it. Counting such reads 
 bound too (3,754 there) made `emit_compact`'s bound 114 ms and E0714, though it takes 0.08 ms: the
 count charges every pass of its merge loop with the path that merges and leaves, a pessimism
 about ways out of a loop that memory prices multiply. Left as it is: the bound's time stays above
-every measure taken (the probe's million lanes 1.42 ms against 8.0). Next: the count charges a
-way that leaves a loop once, not each pass; then the bound prices such reads as the GPU runs
-them, and the tally and the bound agree; then the model prices the exact pass, and the pass is
-made cheaper where its parts are. Found on the way: a rigid thing's exact cells are tested in the
+every measure taken (the probe's million lanes 1.42 ms against 8.0). Done since: the count charges a
+way that leaves a loop by `break` once, not each pass (SCENE 10's and 14's summed bounds 14% and
+16% lower, `emit_compact`'s halved); and each exact cell's live parts are pruned to its own box
+(grown half a cell for the normal's taps, where `distance_live` is `distance` bit for bit), not
+its brick's, so its march evaluates fewer parts a step: the candlestick's draw 10.3 to 8.2 ms,
+SCENE 14's span 21.70 to 19.37 ms and 13's 18.95 to 18.01, nothing drawn changed. Next: the bound
+prices an array read at a loop's counter as the GPU runs it (with breaks charged once,
+`emit_compact`'s would still pass the line: its search is to be cut), so the tally and the bound
+agree; then the model prices the exact pass; and the exact pass is cut further where its parts
+are (8.2 ms of which the one-part trial says some 6 are the parts a cell still keeps). Found on the way: a rigid thing's exact cells are tested in the
 frame it was meshed in (`exact_box_one_fs` brackets the world ray by the cell's box as meshed,
 where `exact_box_vs` draws it moved by `xforms[0]`), right while it is still, wrong once it
 moves without being meshed again. The
