@@ -842,7 +842,16 @@ SCENE 14's span 21.70 to 19.37 ms and 13's 18.95 to 18.01, nothing drawn changed
 prices an array read at a loop's counter as the GPU runs it (with breaks charged once,
 `emit_compact`'s would still pass the line: its search is to be cut), so the tally and the bound
 agree; then the model prices the exact pass; and the exact pass is cut further where its parts
-are (8.2 ms of which the one-part trial says some 6 are the parts a cell still keeps). Found on the way: a rigid thing's exact cells are tested in the
+are (8.2 ms of which the one-part trial says some 6 are the parts a cell still keeps). Tried and
+not it: pruning a cell to its bare box (7.97 ms against 7.22), pruning by affine ranges (7.19
+against 7.48: the kit profiles' forms fall to their intervals, the debt below), the shading's
+derivatives gone, so no helper lane need run on (8.10 against 7.88). SCENE 10's own largest pass:
+the ward (`ParryArc`, a shell that waves and breathes) and the flames are meshed again every frame,
+5.3 ms at frame 40 of its 20.9, the ward about 100,000 candidate bricks in 13 chunks; not its
+steepness (1.2, past `STEEP_LIPSCHITZ`: as not steep, 5.34 ms against 5.43). A field whose shape
+moves a little a frame could keep its mesh and move its vertices onto the new surface, meshing
+again only where they can't follow: the next measure is how far the ward moves a frame against
+its cells. Found on the way: a rigid thing's exact cells are tested in the
 frame it was meshed in (`exact_box_one_fs` brackets the world ray by the cell's box as meshed,
 where `exact_box_vs` draws it moved by `xforms[0]`), right while it is still, wrong once it
 moves without being meshed again. The
