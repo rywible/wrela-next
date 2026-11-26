@@ -521,6 +521,34 @@ geometry kernels write.
 
 ## 10. Phase 2: the change class of each part of a field
 
+State (2026-11-25): done on the M4 (the Radeon is open, as for every phase). What was learned
+corrects steps 1 to 3 and 7:
+
+- A part's class is not in its field's code. Phase 0 found that every kind's distance reads its
+  own data (`reads_only_input` false for all), and whether that data moves is decided where the
+  game builds the value (`arena_pillars()` against `arena_flames(t)`), which the engine receives
+  as a value; the language has no channel from a caller's expression to the callee (a parameter's
+  default is a constant of the build). So what the toolchain gives is the parts' structure, and
+  the class is measured: `std::field::Surface::part_state` writes what part `i` is made of (std's
+  leaves themselves, its unions the operand holding it, its warps, displacements, mirrors and
+  materials their own data), `part_bound` its bound, and `engine::mesh::extract::part_classes`
+  compares two moments. A surface std can't see into says so, and its whole hash decides.
+- The report is `game/world`'s `part_classes_report` (`tools/wrela test game/world`): the flames,
+  the parry arc, the rival orb, the glass shards and a posed body are `frame`; the courtyard,
+  pillars, brazier stands, citadel, marble column, stack, stage, table (4 parts) and grimoire (6)
+  are `never`. Step 5's test is `lib/engine`'s
+  `a_part_that_reads_the_time_is_frame_and_the_rest_never`.
+- Step 6: a batch keeps each part's state and box (`part_states`); a field whose state moved in
+  some parts only is patched, as an edit is, in the bricks of those parts' old and new boxes.
+  SCENE 15 (a slab, three blocks and a ball circling them): 128 bricks culled and 47,104 corners
+  evaluated a frame, against 9,856 and 2,621,440 for the whole field; extraction's GPU time over
+  frames 30 to 39 1.9 ms against 23.8; the picture as the whole field's.
+- Step 7: no kind's parts are `never` by proof (each reads its data), so the hash stays: it is how
+  the class is measured, a hash a part a frame on the CPU.
+- No span is slower (M4 gate: SCENE 10/11/13/14 29.13/16.87/18.39/21.72 ms, as before; SCENE 10's
+  excess is phase 1's).
+
+
 Purpose: the compiler tells the engine how fast each part of a field can change.
 
 ### What exists today
