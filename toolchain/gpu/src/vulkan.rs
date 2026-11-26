@@ -2905,6 +2905,13 @@ impl CommandEncoder {
         }
     }
 
+    /// Whether a timed compute pass is open for an untimed one to join: never here. A timed pass
+    /// writes its own stamps around its dispatch, with no encoder to switch, so each is timed
+    /// alone (Metal's joins them: an encoder each cost its frames).
+    pub fn timed_compute_open(&self) -> bool {
+        false
+    }
+
     pub fn begin_compute_pass(
         &mut self,
         label: &str,

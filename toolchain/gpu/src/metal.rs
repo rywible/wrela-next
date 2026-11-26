@@ -1307,6 +1307,9 @@ struct OpenCompute {
     table_set: bool,
     dispatched: bool,
     wrote_texture: bool,
+    /// Its encoder samples the GPU's clock as it begins and ends (a timed pass): the passes
+    /// recorded into it after the first are timed with it, as one run.
+    timed: bool,
 }
 
 /// A command buffer being recorded.
@@ -1490,6 +1493,12 @@ impl CommandEncoder {
         }
     }
 
+    /// Whether a timed compute pass is open, which an untimed one begun now joins
+    /// ([`CommandEncoder::begin_compute_pass`]): nothing else recorded since it began.
+    pub fn timed_compute_open(&self) -> bool {
+        self.compute.as_ref().is_some_and(|c| c.timed)
+    }
+
     pub fn begin_compute_pass(
         &mut self,
         label: &str,
@@ -1519,8 +1528,13 @@ impl CommandEncoder {
                     table_set: false,
                     dispatched: false,
                     wrote_texture: false,
+                    timed: true,
                 }),
-                return_to: None,
+                // Kept open as the encoder's compute run: an untimed pass after it joins it, so a
+                // run of dispatches is timed as one, with no encoder between them (a stamped
+                // encoder a dispatch cost SCENE 10 4 ms of a 24.5 ms frame on the M4); the next
+                // timed pass, or anything else recorded, ends it and writes its end.
+                return_to: Some(&mut self.compute),
                 pipeline: None,
                 anchor,
                 keep: &mut self.keep,
@@ -1538,7 +1552,13 @@ impl CommandEncoder {
                         .expect("Metal made no compute encoder")
                 });
                 encoder.setLabel(Some(&ns("compute")));
-                OpenCompute { encoder, table_set: false, dispatched: false, wrote_texture: false }
+                OpenCompute {
+                    encoder,
+                    table_set: false,
+                    dispatched: false,
+                    wrote_texture: false,
+                    timed: false,
+                }
             }
         };
         ComputePass {

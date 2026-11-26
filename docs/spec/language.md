@@ -2580,6 +2580,7 @@ The hosts can time each pass and dispatch on the GPU, they open the GPU with its
 
 - A frame's GPU time is its span, from its first pass's start to its last pass's end.
 - On Apple GPUs passes overlap, so one pass's start-to-end span holds other passes' work.
+- In the native host on Metal, dispatches of one label in a row are timed as one run: the first opens a timed compute encoder, the rest join it, and anything else recorded ends it. An Apple GPU samples its clock only where an encoder begins and ends, and an encoder a dispatch cost a frame what the program's own frame doesn't pay (SCENE 10 at 1080p on the M4: a span of 24.5 ms, 3.9 of it idle between 297 timed items, against 21.0 ms and 1.2 idle with 64 runs, and 20.5 ms a frame untimed). Vulkan writes its stamps with no encoder to switch, and times each dispatch alone; the serial mode times each alone on both.
 - The serial mode (`timestamps=2`, `Options::serial`) runs each pass and dispatch alone and waits for the GPU between them, so each time is its own. In the native host, a serial time is within 1% of the same pass drawn alone in the same mode. In Chrome, the wait goes through the GPU process and lets the GPU's clock fall, so serial times run slow by an amount that changes from run to run.
 - A frame's passes run in order after the frame, while the host records the next frame.
 - A GPU sets its clocks by its load, so a light frame paced at 60 Hz times slower than the same frame run back to back.

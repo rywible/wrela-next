@@ -124,6 +124,10 @@ Use these commands. Do not use a different measure of a frame.
   of that draw, not to one draw of it.
 - A paired `tools/bench --against` of two builds of one placement measures a change that keeps
   the mesh (a pass, the host); a change that moves the mesh is measured over placements.
+- On Metal a timed span times a label's dispatches in a row as one run (2026-11-26): an encoder
+  stamped for each dispatch had cost the frame what the game's frame doesn't pay. SCENE 10's span
+  24.5 to 21.0 ms against 20.5 ms a frame untimed (steady throughput, 600 frames less 200); the
+  gate's lines were written again: SCENE 10/11/13/14 20.87/16.52/18.97/21.95 ms.
 - `tools/bench` also runs each pass alone and prints a table. The times in the table do not add
   up to the span. Use the table to compare one pass before and after a change.
 - Put each measurement in the commit message: before and after, same machine, same run.

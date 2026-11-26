@@ -977,6 +977,10 @@ pub(crate) struct Gpu {
     /// and else ends it (named `screen pass`), so its time is never summed into the label of
     /// the work before it.
     label_fresh: bool,
+    /// The label of the timed compute run the encoder has open (`CommandEncoder::
+    /// timed_compute_open`): a timed span's dispatches of one label in a row are timed as one
+    /// run, with no encoder of their own each.
+    timed_run: Option<Arc<str>>,
     frame: usize,
     /// A debug build's: the flag its pipelines' bounds checks set (the manifest's
     /// `debug_flag`), read after each frame.
@@ -1242,6 +1246,7 @@ impl Gpu {
             timer,
             label: None,
             label_fresh: false,
+            timed_run: None,
             frame: 0,
             debug_flag: None,
             program_limits,
@@ -2743,8 +2748,19 @@ impl Gpu {
         }
         let p = &self.pipelines[pipeline as usize];
         let label = self.label.as_deref().unwrap_or(&p.name);
-        let timestamps =
-            self.timer.as_mut().and_then(|t| t.next_if(&self.asked, self.frame, self.calls, label));
+        // In a timed span, a dispatch of the label whose timed run is open joins it (a backend
+        // that can: Metal's), timed with it; in a serial run each is alone.
+        let joins = self.timer.as_ref().is_some_and(|t| !t.serial && t.keep)
+            && self.timed_run.as_deref() == Some(label)
+            && encoder.timed_compute_open();
+        let timestamps = if joins {
+            None
+        } else {
+            self.timer.as_mut().and_then(|t| t.next_if(&self.asked, self.frame, self.calls, label))
+        };
+        if timestamps.is_some() {
+            self.timed_run = Some(Arc::from(label));
+        }
         let Kind::Compute(compute) = &p.kind else {
             unreachable!("the checker checked the kind");
         };
