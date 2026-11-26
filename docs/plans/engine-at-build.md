@@ -395,6 +395,29 @@ transcendentals with their WGSL limits in the proofs), and a kind that settles b
 Which is which is phase 2's class (a part of class `Frame`), so phase 2 comes before this phase's
 span target; until then the measurement above stands as the distance from the target.
 
+### Transient kernels (2026-11-25)
+
+The decision above is in: `dispatch(..., transient: true)` writes a `@strict` kernel exact with the
+driver's built-ins and the GPU's proofs, a pipeline of its own, and a batch whose field changed the
+frame before dispatches its extraction and skinning so (`MeshBatch::transient`). Paired on the M4,
+SCENE 10 strict is +3.0% over the same tree relaxed (inside the noise; it was +12.4%), SCENE 14
+-1.3%. SCENE 10's strict GPU time over frames 30 to 33: extraction 14.7 ms (12.8 relaxed),
+skinning 0.89 (0.79), certificates 0.93 (0.67). The twins cost SCENE 10 133 pipelines (319 to
+452) and 1.4 s of its lowering (13.1 to 14.5 s); the host builds all 452 at load in 19 ms (Metal's
+cache), and no span moved.
+
+A suggestion to make the twin a specialization of one lowering (a Metal function constant, a
+SPIR-V specialization constant, chosen at pipeline creation) is not taken now: it saves the 1.4 s
+of lowering and the manifest's 133 entries but not the runtime pipelines, the two forms' derived
+intervals differ (a strict module's widen by std's limits and guard NaN bounds), so one shader
+would carry both, and pipeline count and build time are phase 4's to bring under its targets,
+where it is to be weighed again with phase 4's own measurements.
+
+Against phase 0 the measurement is open: one run of SCENE 10 reads 24.81 ms (phase 0: 24.4 to
+24.7), but this tree's runs range 24.7 to 28.6 ms, slowing within a run by about a fifth in every
+pass alike (not its dispatches, 269 a frame against phase 0's 309, nor its memory), with other
+programs taking more than a CPU on the machine.
+
 ### What is wrong today
 
 - The proofs make each GPU result wider by two times the error limit that WGSL gives for the
