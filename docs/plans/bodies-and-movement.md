@@ -388,6 +388,7 @@ than the balance fell (1.59 written, 1.12 fallen for the tests of 0.5).
 | 2026-11-26 | `p4h-3` (L4, and a T4 for 10 min): phase 4 on the human: 629 training clips, 91 test held out, 8500 updates; blown-up worlds reset (none blew up). A poll's 404 was taken for a lost session while the L4 ran on: a T4 was started and billed beside it, then stopped. Fell apart at update 980 as the two runs before; stopped at update 1033 | 2.97 |
 | 2026-11-26 | `p4h-4` (L4): phase 4 on the human: 629 training clips, 91 test held out, 4000 updates; PPO's step held (KL 0.02) and collapses rolled back; past update 1,000 with no collapse, but its reward flat at 0.645 from update 600 (one epoch an update, its KL 0.034 to 0.049): stopped at update 1,110 for the rate that follows the KL | 2.25 |
 | 2026-11-26 | `p4h-5` (L4): phase 4 on the human: 629 training clips, 91 test held out, 4000 updates; the rate of learning follows PPO's KL, collapses rolled back; the rate fell to 2.6e-5 and the reward stayed at 0.66 to update 1,000 (0.3% of clips followed at 500): stopped for a fixed spread of the actions | 2.80 |
+| 2026-11-26 | `p4h-6` (L4): phase 4 on the human: 629 training clips, 91 test held out, 4000 updates; the actions' spread fixed at e^-2.3, the KL held to 0.05, collapses rolled back; stable, but the rate fell to 5.9e-5 and its falls a step at update 600 were 2.5% against p4h-3's 1.5%: stopped at update 690 for the bounds loss | 2.00 |
 
 #### A new machine
 
@@ -928,7 +929,14 @@ removes the faults of the retarget: slide, penetration and forces that cannot oc
   was at 0.78. What changes over a run is the learned spread of the actions (a log of -1.6 at the
   start, -2.1 at `p4h-3`'s collapse): a KL grows as the square of the spread's inverse, so the
   same rate makes a larger step late in the run. `p4h-6` fixes the spread (a log of -2.3, as the
-  trackers of this family do) and holds the KL to 0.05.
+  trackers of this family do) and holds the KL to 0.05: stable, but slower than `p4h-3` (falls a
+  step at update 600 2.5% against 1.5%).
+- The cause of the collapse: the actions' means. `p4h-3`'s net after its collapse had 23.5% of
+  its means past 1 (the servos take the actions clamped to 1) and 12.6% past 2, the most 6.05;
+  `p4h-6`'s at update 611 at most 0.99. A mean past the clamp changes nothing the simulator does,
+  while the likelihood's gradient can push it on, and the net loses its control. A bounds loss
+  now holds each mean within 1.1 (weight 0.01, as rl_games does), and the log gives the share of
+  means past 1; `p4h-7` runs `p4h-3`'s rate (2e-4, five epochs, no KL target) with it.
 - The filtered capture back as poses (`tools/movement/export -- human unfilter`, `--read
   filtered=` the run's outputs, `--read sim=` its export, `--write out=.movement/poses-filtered`):
   each clip's qpos up to its fall as the body's numbers (a welded segment at rest), so the solver

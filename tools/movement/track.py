@@ -373,9 +373,17 @@ def make_agent(n_obs, n_act, hidden, log_std=None):
 LEAST_LOG_STD = -3.0
 
 
-def ppo(agent, opt, b_obs, b_act, b_logp, b_adv, b_ret, gen, target_kl):
+# The actions' bound: a mean past it is held back (the bounds loss of rl_games). The servos'
+# targets take the actions clamped to 1; a mean past that changes nothing the simulator does,
+# while the likelihood's gradient can push it on: p4h-3's net after its collapse had 23.5% of its
+# means past 1 and 12.6% past 2 (the most 6.05), a healthy net's at most 0.99.
+BOUND = 1.1
+
+
+def ppo(agent, opt, b_obs, b_act, b_logp, b_adv, b_ret, gen, target_kl, bounds=0.01):
     """PPO's epochs over the rollout (clipped at 0.2, four minibatches an epoch), the actor's and
-    the critic's gradients each clipped to 1 apart, and no epoch after one whose mean KL passed
+    the critic's gradients each clipped to 1 apart, the actions' means held within `BOUND`
+    (weight `bounds`), and no epoch after one whose mean KL passed
     `target_kl`, the rate of learning lowered after an update that passed it and raised after one
     under a quarter of it. Gives (the last epoch's mean KL, minibatches skipped), the share
     clipped, the value loss and the epochs run."""
@@ -396,7 +404,9 @@ def ppo(agent, opt, b_obs, b_act, b_logp, b_adv, b_ret, gen, target_kl):
             ratio = torch.exp(log_ratio)
             pg = -torch.min(ratio * b_adv[j], ratio.clamp(0.8, 1.2) * b_adv[j]).mean()
             vl = 0.5 * ((agent.v(b_obs[j]).squeeze(-1) - b_ret[j]) ** 2).mean()
-            loss = pg + vl
+            mu = dist.mean
+            bl = (torch.relu(mu - BOUND) ** 2 + torch.relu(-BOUND - mu) ** 2).sum(-1).mean()
+            loss = pg + vl + bounds * bl
             if not torch.isfinite(loss):
                 skipped += 1
                 continue
@@ -413,8 +423,11 @@ def ppo(agent, opt, b_obs, b_act, b_logp, b_adv, b_ret, gen, target_kl):
         epochs += 1
         if kls:
             kl, clipped, vloss = sum(kls) / len(kls), sum(clips) / len(clips), sum(vls) / len(vls)
-        if kl > target_kl:
+        if 0 < target_kl < kl:
             break
+    if target_kl <= 0:
+        # No target: the rate fixed, every epoch run.
+        return (kl, skipped), clipped, vloss, epochs
     # The rate of learning follows the KL (the adaptive rate of rl_games, used by AMP and its
     # successors): down when a step moved the policy more than the target, up when much less.
     for g in opt.param_groups:
@@ -566,11 +579,13 @@ def main():
     p.add_argument("--hidden", default="1024,512")
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--eval-every", type=int, default=200)
+    p.add_argument("--bounds", type=float, default=0.01, help="the weight of the bounds loss on the actions' means")
     p.add_argument("--log-std", type=float, default=None,
                    help="the actions' spread fixed at e^this (a learned spread shrinks, and with it "
                         "the step PPO can take: p4h-3 fell apart at a mean of -2.1)")
     p.add_argument("--target-kl", type=float, default=0.02,
-                   help="the epochs of an update stop when the mean KL of the last passes this")
+                   help="the epochs of an update stop when the mean KL of the last passes this, and the rate "
+                        "follows it; 0: no target, the rate fixed")
     p.add_argument("--filtered", action="store_true", help="play every clip to its end at the end")
     p.add_argument("--weights", default="",
                    help="a trained tracker (tracker.pt): train nothing, play every clip of the refs to its end")
@@ -672,7 +687,10 @@ def main():
             b_obs, b_act = obs_buf.reshape(H * N, -1), act_buf.reshape(H * N, -1)
             b_logp, b_adv, b_ret = logp_buf.reshape(-1), adv.reshape(-1), ret.reshape(-1)
             b_adv = (b_adv - b_adv.mean()) / (b_adv.std() + 1e-8)
-            kl, clipped, vloss, epochs = ppo(agent, opt, b_obs, b_act, b_logp, b_adv, b_ret, gen, a.target_kl)
+            with torch.no_grad():
+                past = float((agent.pi(b_obs[:4096]).abs() > 1.0).float().mean())
+            kl, clipped, vloss, epochs = ppo(agent, opt, b_obs, b_act, b_logp, b_adv, b_ret, gen, a.target_kl,
+                                             a.bounds)
             skipped += kl[1]
             step += 1
             samples += H * N
@@ -685,7 +703,7 @@ def main():
                       f"samples {samples} ({sps:.0f} a second); worlds blown up {blown}, "
                       f"minibatches skipped {skipped}; kl {kl[0]:.4f} clipped {clipped:.3f} "
                       f"value loss {vloss:.3f} epochs {epochs} log std {float(agent.log_std.mean()):.3f} "
-                      f"lr {opt.param_groups[0]['lr']:.2e}", flush=True)
+                      f"lr {opt.param_groups[0]['lr']:.2e} means past 1 {past:.4f}", flush=True)
             # A collapse (on 2026-11-26 three runs on the human fell from a reward of 0.77 to 0.42
             # in 30 updates at update 990, with no world blown up): the weights of the last good
             # update come back with half the rate of learning.
