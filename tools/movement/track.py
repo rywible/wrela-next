@@ -169,6 +169,7 @@ class Sim:
         self.frame = torch.zeros(worlds, dtype=torch.long, device=device)
         self.graph = None
         self.start_share = 0.0
+        self.fall_mean = 0.5
 
     def tilt(self, g):
         """Each world's own gravity (`g`, worlds by 3): a floor tilted under the body is a slope.
@@ -308,7 +309,12 @@ def reward(sim):
     r = 0.45 * torch.exp(-100.0 * ex * ex) + 0.25 * torch.exp(-2.0 * er * er) + \
         0.1 * torch.exp(-0.005 * (dv * dv).sum(-1)) + 0.2 * torch.exp(-20.0 * eroot * eroot)
     bad = exploded(sim)
-    fell = (emax > 0.5) | (ex > 0.25) | bad
+    # A fall: the segments half a metre from their places on average (Luo et al. 2023's limit, for
+    # training and for success alike). Until 2026-11-26 it was 0.25 m on average or any one segment
+    # 0.5 m away: the bodies `p4h-7` lost that way still stood (their roots 0.86 m up against the
+    # clips' 0.88 at the median, none under 0.6 of it) and had drifted (the root 0.185 m from the
+    # clip's, the pose about it 0.153 m).
+    fell = (ex > sim.fall_mean) | bad
     r = torch.where(bad | ~torch.isfinite(r), torch.zeros_like(r), r)
     ex = torch.where(torch.isfinite(ex), ex, torch.zeros_like(ex))
     return r, fell, ex
@@ -695,6 +701,11 @@ def main():
     p.add_argument("--start-share", type=float, default=0.25,
                    help="the share of worlds started at their clip's first frame (the evaluation plays each "
                         "clip from there)")
+    p.add_argument("--fall-mean", type=float, default=0.5,
+                   help="a fall: the segments this far from their places on average (m)")
+    p.add_argument("--init", default="",
+                   help="start from these weights (a run's checkpoint or a tracker.pt): the net and the "
+                        "observations' scale, with a new optimiser")
     p.add_argument("--filtered", action="store_true", help="play every clip to its end at the end")
     p.add_argument("--variants", type=int, default=0,
                    help="with --weights: play this many variants of --clip (pushed, on a slope, at another "
@@ -716,6 +727,7 @@ def main():
     with wp.ScopedDevice("cuda:0" if dev == "cuda" else "cpu"):
         sim = Sim(a.model, head, refs, a.worlds, dev, a.substeps, gen)
         sim.start_share = a.start_share
+        sim.fall_mean = a.fall_mean
         print(f"sim: {a.worlds} worlds, {len(head['names'])} clips, {refs.shape[0]} frames, "
               f"set up in {time.time() - t0:.0f} s", flush=True)
         sim.reset(torch.ones(a.worlds, dtype=torch.bool, device=dev))
@@ -744,6 +756,25 @@ def main():
             print(f"played every clip: {json.dumps(full)}", flush=True)
             run.finish({"played": full, "seconds": time.time() - t0})
             return
+        if state is None and a.init:
+            try:
+                w = torch.load(a.init, map_location=dev, weights_only=False)
+            except Exception:
+                # A run's checkpoint is a pickle (runlib) whose tensors may be the GPU's: each
+                # storage is read onto this device.
+                import io
+                import pickle
+                import torch.storage as ts
+                was = ts._load_from_bytes
+                ts._load_from_bytes = lambda b: torch.load(io.BytesIO(b), map_location=dev, weights_only=False)
+                try:
+                    with open(a.init, "rb") as fh:
+                        w = pickle.load(fh)
+                finally:
+                    ts._load_from_bytes = was
+            agent.load_state_dict({k: v.to(dev) for k, v in w["agent"].items()})
+            norm.load(w["norm"], dev)
+            print(f"init: the net and the observations' scale of {a.init} (its update {w.get('step')})", flush=True)
         if state is not None:
             agent.load_state_dict(state["agent"])
             opt.load_state_dict(state["opt"])

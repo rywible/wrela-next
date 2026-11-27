@@ -390,6 +390,7 @@ than the balance fell (1.59 written, 1.12 fallen for the tests of 0.5).
 | 2026-11-26 | `p4h-5` (L4): phase 4 on the human: 629 training clips, 91 test held out, 4000 updates; the rate of learning follows PPO's KL, collapses rolled back; the rate fell to 2.6e-5 and the reward stayed at 0.66 to update 1,000 (0.3% of clips followed at 500): stopped for a fixed spread of the actions | 2.80 |
 | 2026-11-26 | `p4h-6` (L4): phase 4 on the human: 629 training clips, 91 test held out, 4000 updates; the actions' spread fixed at e^-2.3, the KL held to 0.05, collapses rolled back; stable, but the rate fell to 5.9e-5 and its falls a step at update 600 were 2.5% against p4h-3's 1.5%: stopped at update 690 for the bounds loss | 2.00 |
 | 2026-11-26 | `p4h-7` (L4): phase 4 on the human: 629 training clips, 91 test held out, 4000 updates; p4h-3's rate (2e-4, five epochs) with the actions' means held within 1.1 and collapses rolled back; no collapse, its best at update 2,000 (32.8% of training clips and 25.3% of test clips followed for 20 s, 54 mm), flat after, done | 10.71 |
+| 2026-11-26 | `p4h-8` (L4): phase 4 on the human with CeTI: 2038 clips of 100STYLE and CeTI (the fingers moved), 5000 updates; a quarter of the worlds started at their clip's first frame, the rate held to a KL of 0.1; 18.6, 22.4 and 24.6% of training clips followed for 20 s at updates 500, 1,000 and 1,500 (p4h-7 5.9, 20.3 and 28.6% of fewer clips), 47 mm: stopped at update 1,527 for the limit of a fall, its weights the start of `p4h-9` | 7.69 |
 
 #### A new machine
 
@@ -961,6 +962,17 @@ removes the faults of the retarget: slide, penetration and forces that cannot oc
   set off. `p4h-8` starts a quarter of its worlds at their clip's first frame, holds its rate to
   a KL of 0.1, and trains on CeTI's clips too (2,038 clips, 25.9 h; CeTI moves the fingers, so
   its model moves 35 segments, not 25).
+- `p4h-8` followed 18.6% of its 1,898 training clips for 20 s at update 500 (`p4h-7` 5.9% of
+  629), 22.4% at 1,000 and 24.6% at 1,500, its segments 47 mm from their places; its falls a step
+  0.42% (one in 240 frames, where 95% of clips followed for 600 frames needs one in about 12,000).
+  What ends a clip is not a fall: at the frame before each of `p4h-7`'s 558 (its filtered capture
+  against the clips, the simulator's kinematics here) the body stood (its root 0.86 m up against
+  the clip's 0.88 at the median, none under 0.6 of it) and had drifted, its root 0.185 m from the
+  clip's (the larger part in 68% of them) and its pose about the root 0.153 m from the clip's, to
+  the limit of 0.25 m on average (or any segment 0.5 m away). Luo et al. 2023 end a body, and
+  count a failure, at 0.5 m on average; the tracker now does the same (`--fall-mean`, the plan's
+  50 mm on average holds it near the clip), and `p4h-9` goes on from `p4h-8`'s weights at update
+  1,527 (`--init`).
 - The filtered capture back as poses (`tools/movement/export -- human unfilter`, `--read
   filtered=` the run's outputs, `--read sim=` its export, `--write out=.movement/poses-filtered`):
   each clip's qpos up to its fall as the body's numbers (a welded segment at rest), so the solver
