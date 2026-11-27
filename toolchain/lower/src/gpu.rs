@@ -5,7 +5,7 @@
 use crate::body::{Fl, Repr};
 use crate::instance::{Bound, InstanceKey};
 use crate::{Cx, ModuleBuilder};
-use std::rc::Rc;
+use std::sync::Arc;
 use wrela_abi::manifest::{BindingKind, BindingStage, ResourceBinding};
 use wrela_abi::stream::Opcode;
 use wrela_diag::{Diagnostic, Span, codes};
@@ -75,6 +75,64 @@ pub struct UniformOut {
     pub storage: bool,
 }
 
+/// A pipeline's shader already emitted (and its manifest-level metadata computed from the
+/// flattened IR module), either restored from the persistent pipeline cache or emitted in
+/// parallel during pipeline lowering.
+#[derive(Clone, Debug)]
+pub struct PreEmittedShader {
+    pub bytes: Vec<u8>,
+    pub entry_points: Vec<String>,
+    pub requires: Vec<String>,
+    pub kept: u32,
+    pub sizes: Option<wrela_abi::manifest::BufferSizes>,
+}
+
+/// Everything needed to restore a lowered, verified, analyzed and emitted pipeline from disk
+/// without running the GPU optimizer or shader writer.
+#[derive(Clone, Debug)]
+pub struct CachedPipeline {
+    pub uniform: Option<UniformOut>,
+    pub bindings: Vec<ResourceBinding>,
+    pub work: Vec<Option<u64>>,
+    pub unbounded: Vec<Option<Span>>,
+    pub weight: u64,
+    pub same: Vec<ir::same::SameWork>,
+    pub costly: Vec<ir::rates::Costly>,
+    pub copies: Vec<ir::opt::Copied>,
+    pub hoisted: Vec<ir::hoist::Hoisted>,
+    pub hoisted_types: Option<ir::Types>,
+    pub uncounted_most: Option<u64>,
+    pub shader: PreEmittedShader,
+}
+
+/// All inputs that determine a pipeline's optimized IR, diagnostics/analyses and emitted shader
+/// (besides compiler binary identity, shader check flags, and std sources for `@strict`).
+pub struct PipelineCacheKeyInput<'a> {
+    pub module: &'a ir::Module,
+    pub kind: &'a PipelineKind,
+    pub uniform: &'a Option<UniformOut>,
+    pub bindings: &'a [ResourceBinding],
+    pub target: wrela_abi::Target,
+    pub exact: bool,
+    pub hoist: bool,
+}
+
+/// Persistent cache of optimized GPU pipelines and their emitted shaders, provided by the driver.
+pub trait PipelineCache: Sync {
+    /// Returns the content-addressed key for `input`, or `None` if caching is disabled.
+    fn key(&self, input: &PipelineCacheKeyInput<'_>) -> Option<String>;
+    /// Looks up a cached pipeline and its emitted shader by `key`.
+    fn get(&self, key: &str) -> Option<CachedPipeline>;
+    /// Emits the shader for a freshly optimized pipeline, stores the result under `key`, and
+    /// returns the emitted shader (or an error message if emission failed).
+    fn emit_and_put(
+        &self,
+        key: &str,
+        out: &PipelineOut,
+        uncounted_most: Option<u64>,
+    ) -> Option<Result<PreEmittedShader, String>>;
+}
+
 /// A lowered pipeline: its module and what the manifest says about it.
 #[derive(Clone, Debug)]
 pub struct PipelineOut {
@@ -122,6 +180,32 @@ pub struct PipelineOut {
     /// The values its same work moved onto the CPU (`ir::hoist`, §18.13): its uniform block's
     /// last fields, which the CPU computes where it records each command.
     pub hoisted: Vec<ir::hoist::Hoisted>,
+    /// Already-emitted shader and manifest metadata when served from or populated into the
+    /// persistent pipeline cache.
+    pub pre_emitted: Option<PreEmittedShader>,
+}
+
+impl PipelineOut {
+    pub fn kept_bytes(&self) -> u32 {
+        match &self.pre_emitted {
+            Some(pre) => pre.kept,
+            None => self.module.kept_bytes(),
+        }
+    }
+
+    pub fn requires(&self) -> Vec<String> {
+        match &self.pre_emitted {
+            Some(pre) => pre.requires.clone(),
+            None => self.module.requires(),
+        }
+    }
+
+    pub fn entry_point_names(&self) -> Vec<String> {
+        match &self.pre_emitted {
+            Some(pre) => pre.entry_points.clone(),
+            None => self.module.entry_points.iter().map(|e| e.name.clone()).collect(),
+        }
+    }
 }
 
 /// What a GPU module is for, while it's lowered.
@@ -129,7 +213,7 @@ pub struct PipelineOut {
 pub(crate) struct GpuCx {
     pub what: String,
     /// How the module's entry points receive their parameters (none for a `@gpu` function).
-    pub iface: Rc<Interface>,
+    pub iface: Arc<Interface>,
     /// The stage being lowered now (a render pipeline lowers its vertex shader first).
     pub stage: Option<Entry>,
     pub workgroup_size: [u32; 3],
@@ -154,7 +238,7 @@ pub(crate) struct GpuCx {
 impl GpuCx {
     /// A module for `what` (`the @compute kernel k`), lowered from the entry points of `iface`,
     /// starting with `stage`'s.
-    pub fn new(what: String, iface: Rc<Interface>, stage: Option<Entry>) -> GpuCx {
+    pub fn new(what: String, iface: Arc<Interface>, stage: Option<Entry>) -> GpuCx {
         let workgroup_size = match stage {
             Some(Entry::Compute(wg)) => wg,
             _ => [1, 1, 1],
@@ -749,7 +833,7 @@ pub(crate) fn add_standins(cx: &mut Cx) -> Vec<(u32, u32)> {
                 let mut same = (*iface).clone();
                 let e = same.entries.len() - 1;
                 same.entries[e].func = cheap;
-                cx.pipelines.push((swapped, Rc::new(same)));
+                cx.pipelines.push((swapped, Arc::new(same)));
                 cx.pipeline_sites.push(Vec::new());
                 cx.pipeline_targets.push(Vec::new());
                 cx.pipelines.len() - 1
@@ -820,14 +904,14 @@ pub(crate) fn match_standin(cx: &mut Cx, pipelines: &mut [PipelineOut], i: usize
 // ---- CPU side: recording ------------------------------------------------------------------------
 
 /// A pipeline CPU code records: its index, and its interface (worked out the first time).
-fn pipeline(cx: &mut Cx, key: PipelineKey, site: Span) -> (u32, Rc<Interface>) {
+fn pipeline(cx: &mut Cx, key: PipelineKey, site: Span) -> (u32, Arc<Interface>) {
     if let Some(i) = cx.pipelines.iter().position(|(k, _)| *k == key) {
         if !cx.pipeline_sites[i].contains(&site) {
             cx.pipeline_sites[i].push(site);
         }
         return (i as u32, cx.pipelines[i].1.clone());
     }
-    let iface = Rc::new(interface(cx, &key));
+    let iface = Arc::new(interface(cx, &key));
     cx.pipelines.push((key, iface.clone()));
     cx.pipeline_sites.push(vec![site]);
     cx.pipeline_targets.push(Vec::new());
@@ -2619,24 +2703,368 @@ pub(crate) fn slot_index(fl: &mut Fl, idv: ir::ValueId) -> Option<ir::ValueId> {
 
 // ---- GPU side: pipelines ------------------------------------------------------------------------
 
-pub(crate) fn lower_pipeline(
+/// One pipeline progressing through the parallel lowering stages: prepared on the frontend
+/// thread (using `&Checked`), then flattened, verified, analyzed and instrumented in parallel
+/// across cores. Strict pipelines briefly re-enter the frontend thread between parallel flatten
+/// passes only to instantiate `std::math` replacements.
+pub(crate) struct PipelineState {
+    pub name: String,
+    pub label: String,
+    pub mb: ModuleBuilder,
+    pub uniform_res: Option<ir::ResourceId>,
+    pub kind: PipelineKind,
+    pub uniform: Option<UniformOut>,
+    pub bindings: Vec<ResourceBinding>,
+    pub key: PipelineKey,
+    pub sites: Vec<Span>,
+    pub targets: Vec<ir::RenderTarget>,
+    pub target: wrela_abi::Target,
+    pub emit: bool,
+    pub debug: bool,
+    pub exact: bool,
+    pub tally: bool,
+    pub few: bool,
+    pub hoist: bool,
+    pub code: u32,
+    pub checked: ir::Result<()>,
+    pub folded_branch: bool,
+    pub work: Vec<Option<u64>>,
+    pub unbounded: Vec<Option<Span>>,
+    pub weight: u64,
+    pub same: Vec<ir::same::SameWork>,
+    pub same_as_written: Option<Vec<ir::same::SameWork>>,
+    pub few_calls: Vec<Vec<ir::same::FewInputs>>,
+    pub costly: Vec<ir::rates::Costly>,
+    pub copies: Vec<ir::opt::Copied>,
+    pub hoisted: Vec<ir::hoist::Hoisted>,
+    pub quiet: std::collections::HashSet<Span>,
+    pub heavy: Vec<ir::rates::HeavyCall>,
+    pub diags: Vec<Diagnostic>,
+    pub uncounted: Vec<(Span, String, u64)>,
+    pub cache_key: Option<String>,
+}
+
+/// Restores a pipeline from a persistent cache hit, bypassing all GPU optimization and shader
+/// emission stages.
+pub(crate) fn from_cached(
+    st: PipelineState,
+    cached: CachedPipeline,
+) -> (PipelineOut, Vec<(Span, String, u64)>) {
+    let instances = st.mb.fn_instances();
+    let strict = st.mb.m.strict;
+    let mut module = ir::Module::default();
+    module.strict = strict;
+    if let Some(types) = cached.hoisted_types {
+        module.types = types;
+    }
+    let mut uncounted = Vec::new();
+    if let Some(most) = cached.uncounted_most
+        && let Some(&at) = st.sites.first()
+    {
+        uncounted.push((at, st.name.clone(), most));
+    }
+    let out = PipelineOut {
+        name: st.name,
+        module,
+        kind: st.kind,
+        uniform: cached.uniform,
+        bindings: cached.bindings,
+        key: st.key,
+        sites: st.sites,
+        debug_flag: None,
+        targets: st.targets,
+        instances,
+        work: cached.work,
+        unbounded: cached.unbounded,
+        weight: cached.weight,
+        same: cached.same,
+        few: Vec::new(),
+        costly: cached.costly,
+        copies: cached.copies,
+        standin: None,
+        stands_in: false,
+        hoisted: cached.hoisted,
+        pre_emitted: Some(cached.shader),
+    };
+    (out, uncounted)
+}
+
+/// Whether `st` is eligible to read from or populate the persistent pipeline cache.
+pub(crate) fn cache_eligible(st: &PipelineState) -> bool {
+    st.emit && !st.debug && !st.tally && !st.few && st.hoist
+}
+
+/// Prepares one pipeline on the frontend thread: lowers its entry points and reachable MIR to IR
+/// and checks recursion, workgroup rules and uniformity.
+pub(crate) fn prepare_pipeline(
     cx: &mut Cx,
     key: &PipelineKey,
-    iface: Rc<Interface>,
+    iface: Arc<Interface>,
     sites: Vec<Span>,
     targets: Vec<ir::RenderTarget>,
-) -> Option<PipelineOut> {
+    code: u32,
+) -> Option<PipelineState> {
     let consts = iface_consts(&iface, key);
-    let mut out = match key {
-        PipelineKey::Compute { .. } => lower_compute(cx, iface.clone(), consts),
+    let prepared = match key {
+        PipelineKey::Compute { .. } => prepare_compute(cx, iface.clone(), consts),
         PipelineKey::Render { state, .. } => {
-            lower_render(cx, iface.clone(), consts, state.depth.compare)
+            prepare_render(cx, iface.clone(), consts, state.depth.compare)
         }
     }?;
-    out.key = key.clone();
-    out.sites = sites;
-    out.targets = targets;
-    Some(out)
+    if wrela_diag::has_errors(&cx.diags) {
+        return None;
+    }
+    let (mb, name, label, kind, uniform, bindings) = prepared;
+    let uniform_res = mb.gpu.as_ref().and_then(|g| g.uniform);
+    Some(PipelineState {
+        name,
+        label,
+        mb,
+        uniform_res,
+        kind,
+        uniform,
+        bindings,
+        key: key.clone(),
+        sites,
+        targets,
+        target: cx.data.target,
+        emit: cx.emit,
+        debug: cx.data.debug,
+        exact: cx.data.exact,
+        tally: cx.data.tally,
+        few: cx.data.few,
+        hoist: cx.hoist,
+        code,
+        checked: Ok(()),
+        folded_branch: false,
+        work: Vec::new(),
+        unbounded: Vec::new(),
+        weight: 0,
+        same: Vec::new(),
+        same_as_written: None,
+        few_calls: Vec::new(),
+        costly: Vec::new(),
+        copies: Vec::new(),
+        hoisted: Vec::new(),
+        quiet: std::collections::HashSet::new(),
+        heavy: Vec::new(),
+        diags: Vec::new(),
+        uncounted: Vec::new(),
+        cache_key: None,
+    })
+}
+
+/// Parallel stage 1: pre-flatten verification, weight/work/budget checks, first GPU flatten and
+/// uniform-work hoisting (and check-only analysis when `!emit`).
+pub(crate) fn pipeline_stage1(st: &mut PipelineState) {
+    st.checked = ir::verify(&st.mb.m);
+    st.quiet = ir::rates::budgeted(&st.mb.m);
+    if st.checked.is_ok() {
+        for e in &st.mb.m.entry_points {
+            st.weight = st.weight.saturating_add(ir::work::weight(&st.mb.m, e.function));
+        }
+        for (i, f) in st.mb.m.functions.iter().enumerate() {
+            if let Some(ir::Budget { weight: Some(most), at, .. }) = f.budget {
+                let w = ir::work::weight(&st.mb.m, ir::FuncId(i as u32));
+                if w > most {
+                    over_weight_budget_in(&mut st.diags, &f.name, w, most, at);
+                }
+            }
+        }
+        if st.few {
+            let name = |id: ir::FuncId| match st.mb.source_names.get(&id) {
+                Some(n) => n.clone(),
+                None => untagged(&st.mb.m.functions[id.index()].name),
+            };
+            st.few_calls = ir::same::few_input_calls(&st.mb.m, FEW_INPUTS_LEAST, &name);
+        }
+        let (each, breaches) = ir::work::module_work(&st.mb.m);
+        for b in &breaches {
+            over_work_budget_in(&mut st.diags, b);
+        }
+        st.unbounded =
+            each.iter().map(|w| if w.work.is_none() { w.unbounded } else { None }).collect();
+        st.work = each.into_iter().map(|w| w.work).collect();
+        st.heavy = ir::rates::heavy_calls(&st.mb.m, &st.work);
+    }
+    if st.emit {
+        st.mb.m.exact = st.exact || st.mb.m.strict;
+        let mut folded_branch = false;
+        let hoist = st.hoist;
+        let debug = st.debug;
+        let uniform = st.uniform_res;
+        let mut hoisted = Vec::new();
+        st.checked = st
+            .checked
+            .clone()
+            .and_then(|()| {
+                folded_branch = ir::opt::flatten_gpu_folded(&mut st.mb.m)?;
+                Ok(())
+            })
+            .map(|()| hoisted = hoist_same_for(hoist, debug, &mut st.mb.m, uniform));
+        st.folded_branch = folded_branch;
+        st.hoisted = hoisted;
+    } else if st.checked.is_ok() {
+        let mut flat = st.mb.m.clone();
+        if ir::opt::flatten_gpu(&mut flat)
+            .map(|()| {
+                hoist_same_for(st.hoist, st.debug, &mut flat, st.uniform_res);
+            })
+            .and_then(|()| ir::gpu_memory::lay_out_gpu_memory(&mut flat))
+            .is_ok()
+        {
+            st.weight = written_weight(&flat);
+            st.same = ir::same::same_work(&flat, MOST_SAME_WORK + 1);
+            st.copies = ir::opt::read_only_copies(&flat, ir::opt::MOST_COPIED_BYTES);
+            st.costly = ir::rates::costly_loops(&flat, &st.quiet, &st.heavy);
+        }
+    }
+}
+
+/// Parallel stage 3 (strict pipelines only): flatten after `make_strict`, and record
+/// `same_as_written` before `strict_divisions` when the target divides via std.
+pub(crate) fn pipeline_stage3_strict(st: &mut PipelineState, divides_by_std: bool) {
+    if !st.emit || !st.mb.m.strict || st.checked.is_err() {
+        return;
+    }
+    st.checked = ir::opt::flatten_gpu(&mut st.mb.m);
+    if st.checked.is_ok() && divides_by_std {
+        st.same_as_written = Some(ir::same::same_work(&st.mb.m, MOST_SAME_WORK + 1));
+    }
+}
+
+/// Parallel stage 5: optional third flatten after `strict_divisions`, GPU memory layout,
+/// post-flatten verification and work/same/copy/costly analysis, plus fuel/debug/tally
+/// instrumentation and optional parallel shader emission + cache store.
+pub(crate) fn pipeline_stage5_finish(
+    mut st: PipelineState,
+    divides_by_std: bool,
+    cache: Option<&dyn PipelineCache>,
+) -> (Option<PipelineOut>, Vec<Diagnostic>, Vec<(Span, String, u64)>) {
+    if st.emit && st.mb.m.strict && divides_by_std && st.checked.is_ok() {
+        st.checked = ir::opt::flatten_gpu(&mut st.mb.m);
+    }
+    if st.emit {
+        st.checked = st
+            .checked
+            .and_then(|()| ir::gpu_memory::lay_out_gpu_memory(&mut st.mb.m))
+            .and_then(|()| ir::verify(&st.mb.m));
+        if st.checked.is_ok() {
+            let (flat_each, _) = ir::work::module_work(&st.mb.m);
+            let lost =
+                flat_each.iter().zip(&st.work).any(|(fw, pre)| pre.is_some() && fw.work.is_none());
+            if lost && let Some(f) = ir::endless_loop(&st.mb.m) {
+                st.checked = Err(ir::Error::internal(format!(
+                    "a loop of `{f}` has no break, return or trap left, where its source's work \
+                     had a bound: a pass erased its exit"
+                )));
+            }
+            for (idx, fw) in flat_each.into_iter().enumerate() {
+                let Some(slot) = st.work.get_mut(idx) else { continue };
+                match (*slot, fw.work) {
+                    (_, None) if st.mb.m.strict => {
+                        *slot = None;
+                        if let Some(u) = st.unbounded.get_mut(idx) {
+                            *u = fw.unbounded;
+                        }
+                    }
+                    (pre, Some(w)) if st.mb.m.strict => {
+                        *slot = Some(pre.map_or(w, |pre| pre.max(w)));
+                        if let Some(u) = st.unbounded.get_mut(idx) {
+                            *u = None;
+                        }
+                    }
+                    (pre, Some(w)) if st.folded_branch => {
+                        *slot = Some(pre.map_or(w, |pre| pre.min(w)));
+                        if let Some(u) = st.unbounded.get_mut(idx) {
+                            *u = None;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if st.checked.is_ok() {
+            st.weight = written_weight(&st.mb.m);
+            st.same = match st.same_as_written.take() {
+                Some(same) => same,
+                None => ir::same::same_work(&st.mb.m, MOST_SAME_WORK + 1),
+            };
+            st.copies = ir::opt::read_only_copies(&st.mb.m, ir::opt::MOST_COPIED_BYTES);
+            st.costly = ir::rates::costly_loops(&st.mb.m, &st.quiet, &st.heavy);
+        }
+        if std::env::var("WRELA_DUMP_IR").as_deref() == Ok("gpu") {
+            eprintln!("// {}\n{}", st.label, ir::print::print(&st.mb.m));
+        }
+        if std::env::var("WRELA_DUMP_IR").as_deref() == Ok("work") {
+            for (k, e) in st.mb.m.entry_points.iter().enumerate() {
+                let all = ir::work::work_by_function(&st.mb.m, e.function);
+                let sum: u64 = all.iter().map(|r| r.2).sum();
+                let bound = st.work.get(k).copied().flatten();
+                eprintln!("work {} `{}`: bound {bound:?}, by function {sum}", st.label, e.name);
+                for (f, times, w) in all.iter().take(25) {
+                    let pct = 100.0 * *w as f64 / sum.max(1) as f64;
+                    let n = &st.mb.m.functions[f.index()].name;
+                    eprintln!("  {w:>10} {pct:5.1}% {times:>8}x {n}");
+                }
+            }
+        }
+    }
+    if let Err(e) = st.checked {
+        st.diags.push(Diagnostic::internal(format!("the IR for `{}` is malformed: {e}", st.label)));
+        return (None, st.diags, st.uncounted);
+    }
+    if wrela_diag::has_errors(&st.diags) {
+        return (None, st.diags, st.uncounted);
+    }
+    let instances = st.mb.fn_instances();
+    let uniform =
+        hoisted_block_for(st.target, &mut st.mb.m, st.uniform_res, st.uniform, &st.hoisted);
+    non_filtering(&st.mb.m, &mut st.bindings);
+    let mut out = PipelineOut {
+        name: st.name,
+        module: st.mb.m,
+        kind: st.kind,
+        uniform,
+        bindings: st.bindings,
+        key: st.key,
+        sites: st.sites,
+        debug_flag: None,
+        targets: st.targets,
+        instances,
+        work: st.work,
+        unbounded: st.unbounded,
+        weight: st.weight,
+        same: st.same,
+        few: st.few_calls,
+        costly: st.costly,
+        copies: st.copies,
+        standin: None,
+        stands_in: false,
+        hoisted: st.hoisted,
+        pre_emitted: None,
+    };
+    if st.emit {
+        fuel_in(st.target, &mut st.diags, &mut st.uncounted, &mut out, st.code);
+    }
+    if st.debug && st.emit {
+        debug_checks_in(st.target, &mut st.diags, &mut out, st.code);
+    }
+    if st.tally && st.emit {
+        tally_in(st.target, &mut st.diags, &mut out, st.code);
+    }
+    if let (Some(cache), Some(key)) = (cache, st.cache_key.as_deref())
+        && st.diags.is_empty()
+        && out.debug_flag.is_none()
+    {
+        let uncounted_most = st.uncounted.first().map(|x| x.2);
+        match cache.emit_and_put(key, &out, uncounted_most) {
+            Some(Ok(pre)) => out.pre_emitted = Some(pre),
+            Some(Err(msg)) => st.diags.push(Diagnostic::internal(msg)),
+            None => {}
+        }
+    }
+    (Some(out), st.diags, st.uncounted)
 }
 
 /// The value of each of `iface`'s `const` parameters, in its order, from `key`'s `const`
@@ -2677,7 +3105,7 @@ struct EntryModule {
 /// kernel, `num_workgroups`.
 fn entry_module(
     cx: &mut Cx,
-    iface: Rc<Interface>,
+    iface: Arc<Interface>,
     stage: Entry,
     consts: Option<Vec<ir::Const>>,
 ) -> EntryModule {
@@ -3006,12 +3434,15 @@ fn bind_uniform(cx: &mut Cx, mb: &mut ModuleBuilder, iface: &Interface) -> Optio
 /// On Vulkan, a block holding a two-row matrix is storage too: its columns are 8 bytes apart
 /// (WGSL's layout, the CPU's), and Vulkan's standard layout for a uniform block puts a
 /// matrix's columns 16 apart (std140's extended alignment); a storage block takes 8.
-fn block_space(cx: &Cx, types: &ir::Types, ty: ir::TypeId) -> (u32, bool) {
+fn block_space_for(target: wrela_abi::Target, types: &ir::Types, ty: ir::TypeId) -> (u32, bool) {
     let size = ir::layout::round_up(16, ir::layout::layout(types, ty).size);
-    let two_row_matrix =
-        cx.data.target == wrela_abi::Target::Vulkan && holds_two_row_matrix(types, ty);
+    let two_row_matrix = target == wrela_abi::Target::Vulkan && holds_two_row_matrix(types, ty);
     let storage = !ir::layout::uniform_compatible(types, ty) || size > 65_536 || two_row_matrix;
     (size, storage)
+}
+
+fn block_space(cx: &Cx, types: &ir::Types, ty: ir::TypeId) -> (u32, bool) {
+    block_space_for(cx.data.target, types, ty)
 }
 
 /// Whether `t` is or holds a matrix of two rows.
@@ -3030,13 +3461,17 @@ fn holds_two_row_matrix(types: &ir::Types, t: ir::TypeId) -> bool {
 /// buffer slots of a Metal stage that reach the device's table (`wrela_abi::table::METAL_SLOTS`)
 /// where the pipeline is a kernel that takes a texture or a sampler (`tabled`). What
 /// [`check_storage_buffers`] holds a pipeline to and [`flag_binding`] leaves a flag room within.
-fn storage_buffers_per_stage(cx: &Cx, tabled: bool) -> usize {
-    let limits = cx.data.target.limits();
+fn storage_buffers_per_stage_for(target: wrela_abi::Target, tabled: bool) -> usize {
+    let limits = target.limits();
     if tabled && limits.buffer_slots_per_stage.is_some() {
         limits.storage_buffers_per_stage - wrela_abi::table::METAL_SLOTS
     } else {
         limits.storage_buffers_per_stage
     }
+}
+
+fn storage_buffers_per_stage(cx: &Cx, tabled: bool) -> usize {
+    storage_buffers_per_stage_for(cx.data.target, tabled)
 }
 
 /// E0602 when a shader of a pipeline binds more storage buffers than a stage may on the
@@ -3218,14 +3653,21 @@ fn non_filtering(m: &ir::Module, bindings: &mut [ResourceBinding]) {
     }
 }
 
-fn lower_compute(cx: &mut Cx, iface: Rc<Interface>, consts: Vec<ir::Const>) -> Option<PipelineOut> {
+type PreparedParts =
+    (ModuleBuilder, String, String, PipelineKind, Option<UniformOut>, Vec<ResourceBinding>);
+
+fn prepare_compute(
+    cx: &mut Cx,
+    iface: Arc<Interface>,
+    consts: Vec<ir::Const>,
+) -> Option<PreparedParts> {
     let kernel = iface.entries[0].func;
     let Some(Entry::Compute(wg)) = cx.entry_of(kernel) else { return None };
     let checked = cx.checked;
-    let name = &checked.program.func(kernel).name;
-    let EntryModule { mut mb, keys, mut bindings, uniform } =
+    let name = checked.program.func(kernel).name.clone();
+    let EntryModule { mut mb, keys, bindings, uniform } =
         entry_module(cx, iface.clone(), Entry::Compute(wg), Some(consts));
-    let entry = entry_function(&mut mb, &keys[0], name, None, None);
+    let entry = entry_function(&mut mb, &keys[0], &name, None, None);
     cx.drain(&mut mb);
     if mb.m.strict {
         // The built-ins a driver computes its own way, as the CPU computes them (§11.3).
@@ -3236,43 +3678,12 @@ fn lower_compute(cx: &mut Cx, iface: Rc<Interface>, consts: Vec<ir::Const>) -> O
     check_workgroup(cx, &mb, entry, &inputs);
     check_subgroup_invocation(cx, &iface, wg);
     mb.m.entry_points.push(ir::EntryPoint {
-        name: ir::ident(name),
+        name: ir::ident(&name),
         stage: ir::Stage::Compute { workgroup_size: wg },
         function: entry,
         inputs,
     });
-    let counts = verify(cx, &mut mb, name)?;
-    let uniform = hoisted_block(cx, &mut mb, uniform, &counts.hoisted);
-    non_filtering(&mb.m, &mut bindings);
-    let instances = mb.fn_instances();
-    Some(PipelineOut {
-        name: name.clone(),
-        module: mb.m,
-        kind: PipelineKind::Compute { workgroup_size: wg },
-        uniform,
-        bindings,
-        key: PipelineKey::Compute {
-            kernel: FnId(0),
-            substs: Vec::new(),
-            over: false,
-            origin: false,
-            consts: Vec::new(),
-        },
-        sites: Vec::new(),
-        debug_flag: None,
-        targets: Vec::new(),
-        instances,
-        work: counts.work,
-        unbounded: counts.unbounded,
-        weight: counts.weight,
-        same: counts.same,
-        few: counts.few,
-        costly: counts.costly,
-        copies: counts.copies,
-        standin: None,
-        stands_in: false,
-        hoisted: counts.hoisted,
-    })
+    Some((mb, name.clone(), name, PipelineKind::Compute { workgroup_size: wg }, uniform, bindings))
 }
 
 /// What a fragment depth never nearer than its triangle's (`WithDepthBehind`) promises under the
@@ -3287,18 +3698,18 @@ fn depth_promise(compare: wrela_abi::stream::Compare) -> Option<ir::DepthPromise
     }
 }
 
-fn lower_render(
+fn prepare_render(
     cx: &mut Cx,
-    iface: Rc<Interface>,
+    iface: Arc<Interface>,
     consts: Vec<ir::Const>,
     compare: wrela_abi::stream::Compare,
-) -> Option<PipelineOut> {
+) -> Option<PreparedParts> {
     let checked = cx.checked;
     let [vertex, fragment] = &iface.entries[..] else { return None };
     let vret = iface.vertex_ret?;
     let vdef = checked.program.func(vertex.func);
     let fdef = checked.program.func(fragment.func);
-    let EntryModule { mut mb, keys, mut bindings, uniform } =
+    let EntryModule { mut mb, keys, bindings, uniform } =
         entry_module(cx, iface.clone(), Entry::Vertex, Some(consts));
     let vret_ir = cx.lower_ty(&mut mb, vret, vdef.sig_span)?;
     let ventry = entry_function(&mut mb, &keys[0], &vdef.name, Some(vret_ir), None);
@@ -3357,39 +3768,9 @@ fn lower_render(
         function: fentry,
         inputs: finputs,
     });
-    let name = format!("{}_{}", ir::ident(&vdef.name), ir::ident(&fdef.name));
-    let counts = verify(cx, &mut mb, &name)?;
-    let uniform = hoisted_block(cx, &mut mb, uniform, &counts.hoisted);
-    non_filtering(&mb.m, &mut bindings);
-    let instances = mb.fn_instances();
-    Some(PipelineOut {
-        name: format!("{}+{}", vdef.name, fdef.name),
-        module: mb.m,
-        kind: PipelineKind::Render { output },
-        uniform,
-        bindings,
-        key: PipelineKey::Compute {
-            kernel: FnId(0),
-            substs: Vec::new(),
-            over: false,
-            origin: false,
-            consts: Vec::new(),
-        },
-        sites: Vec::new(),
-        debug_flag: None,
-        targets: Vec::new(),
-        instances,
-        work: counts.work,
-        unbounded: counts.unbounded,
-        weight: counts.weight,
-        same: counts.same,
-        few: counts.few,
-        costly: counts.costly,
-        copies: counts.copies,
-        standin: None,
-        stands_in: false,
-        hoisted: counts.hoisted,
-    })
+    let label = format!("{}_{}", ir::ident(&vdef.name), ir::ident(&fdef.name));
+    let name = format!("{}+{}", vdef.name, fdef.name);
+    Some((mb, name, label, PipelineKind::Render { output }, uniform, bindings))
 }
 
 fn is_clip_position(cx: &Cx, t: TyId) -> bool {
@@ -3750,11 +4131,17 @@ fn check_recursion(cx: &mut Cx, mb: &ModuleBuilder) {
 /// left as written: the host weighs each dispatch by its kernel's bound before it runs, and
 /// refuses one with none. One with the machine's limit of storage buffers has no binding left
 /// for the flag: an error.
-pub(crate) fn fuel(cx: &mut Cx, out: &mut PipelineOut, code: u32) {
+fn fuel_in(
+    target: wrela_abi::Target,
+    diags: &mut Vec<Diagnostic>,
+    uncounted: &mut Vec<(Span, String, u64)>,
+    out: &mut PipelineOut,
+    code: u32,
+) {
     if let PipelineKind::Compute { .. } = out.kind {
         return;
     }
-    let limits = cx.data.target.limits();
+    let limits = target.limits();
     let (fuel, line, idle_work) =
         (limits.lane_fuel(), limits.lane_line_work(), limits.lane_idle_work());
     // The least of two bounds of the same work: counted as the program reads (`out.work`), and
@@ -3775,18 +4162,18 @@ pub(crate) fn fuel(cx: &mut Cx, out: &mut PipelineOut, code: u32) {
         if most > idle_work
             && let Some(&at) = out.sites.first()
         {
-            cx.uncounted.push((at, out.name.clone(), most));
+            uncounted.push((at, out.name.clone(), most));
         }
         return;
     }
-    let binding = flag_binding(cx, out);
+    let binding = flag_binding_for(target, out);
     let mut module = out.module.clone();
     // Whether fuel is added doesn't depend on the flag's binding: with none left, the error.
     if ir::fuel::add_fuel(&mut module, fuel, binding.unwrap_or(0), code).is_none() {
         return;
     }
     let Some(binding) = binding else {
-        cx.err(Diagnostic::internal(format!(
+        diags.push(Diagnostic::internal(format!(
             "`{}`'s work a lane isn't bounded within its fuel ({fuel}), and it binds the machine's \
              limit of storage buffers, so there's no binding left for the flag its loops set when \
              a lane runs out: bind one fewer buffer",
@@ -3799,17 +4186,21 @@ pub(crate) fn fuel(cx: &mut Cx, out: &mut PipelineOut, code: u32) {
             out.module = module;
             out.debug_flag = Some(binding);
         }
-        Err(e) => {
-            cx.err(Diagnostic::internal(format!("fuel for `{}` made malformed IR: {e}", out.name)))
-        }
+        Err(e) => diags
+            .push(Diagnostic::internal(format!("fuel for `{}` made malformed IR: {e}", out.name))),
     }
 }
 
 /// A counting build's tally of the work each invocation of `out` does, into its words of the
 /// debug flag's buffer (`ir::tally`), for pipeline `code` (from 1).
-pub(crate) fn tally(cx: &mut Cx, out: &mut PipelineOut, code: u32) {
-    let Some(binding) = out.debug_flag.or_else(|| flag_binding(cx, out)) else {
-        cx.err(Diagnostic::internal(format!(
+fn tally_in(
+    target: wrela_abi::Target,
+    diags: &mut Vec<Diagnostic>,
+    out: &mut PipelineOut,
+    code: u32,
+) {
+    let Some(binding) = out.debug_flag.or_else(|| flag_binding_for(target, out)) else {
+        diags.push(Diagnostic::internal(format!(
             "`{}` binds the machine's limit of storage buffers, so a counting build has no binding \
              left for its tally: bind one fewer buffer",
             out.name
@@ -3825,7 +4216,7 @@ pub(crate) fn tally(cx: &mut Cx, out: &mut PipelineOut, code: u32) {
             out.module = module;
             out.debug_flag = Some(binding);
         }
-        Err(e) => cx.err(Diagnostic::internal(format!(
+        Err(e) => diags.push(Diagnostic::internal(format!(
             "the tally of `{}` made malformed IR: {e}",
             out.name
         ))),
@@ -3886,14 +4277,19 @@ pub(crate) fn name_uncounted(cx: &mut Cx) {
 
 /// A debug build's bounds checks (`ir::bounds`), whose flag is pipeline number `code` (from
 /// 1). A pipeline that already has the machine's limit of storage buffers isn't checked.
-pub(crate) fn debug_checks(cx: &mut Cx, out: &mut PipelineOut, code: u32) {
-    let Some(binding) = flag_binding(cx, out) else { return };
+fn debug_checks_in(
+    target: wrela_abi::Target,
+    diags: &mut Vec<Diagnostic>,
+    out: &mut PipelineOut,
+    code: u32,
+) {
+    let Some(binding) = flag_binding_for(target, out) else { return };
     if ir::bounds::add_checks(&mut out.module, binding, code).is_none() {
         return;
     }
     match ir::verify(&out.module) {
         Ok(()) => out.debug_flag = Some(binding),
-        Err(e) => cx.err(Diagnostic::internal(format!(
+        Err(e) => diags.push(Diagnostic::internal(format!(
             "the bounds checks for `{}` made malformed IR: {e}",
             out.name
         ))),
@@ -3902,34 +4298,18 @@ pub(crate) fn debug_checks(cx: &mut Cx, out: &mut PipelineOut, code: u32) {
 
 /// The binding a pipeline's flag (`fuel`'s, `debug_checks`') takes, the one after its last;
 /// `None` when it already binds the machine's limit of storage buffers, leaving none for it.
-fn flag_binding(cx: &Cx, out: &PipelineOut) -> Option<u32> {
+fn flag_binding_for(target: wrela_abi::Target, out: &PipelineOut) -> Option<u32> {
     let storage = out.bindings.iter().filter(|b| b.kind.is_buffer()).count()
         + usize::from(out.uniform.as_ref().is_some_and(|u| u.storage));
     // A kernel that takes a texture or a sampler reaches them through the device's table.
     let tabled = matches!(out.kind, PipelineKind::Compute { .. })
         && out.bindings.iter().any(|b| wrela_abi::table::in_table(b.kind));
-    if storage >= storage_buffers_per_stage(cx, tabled) {
+    if storage >= storage_buffers_per_stage_for(target, tabled) {
         return None;
     }
     let used =
         out.bindings.iter().map(|b| b.binding).chain(out.uniform.as_ref().map(|u| u.binding));
     Some(used.max().map_or(0, |b| b + 1))
-}
-
-/// A pipeline's counts (§18.11), each as [`PipelineOut`]'s field of the same name: each entry
-/// point's work and the loop that leaves it unbounded, its weight, the work its invocations do
-/// alike (§18.13), the calls they make with few numbers that vary, the costly loops flattening
-/// couldn't move (§18.13), the read-only data they copy, and the values its same work moved
-/// onto the CPU (`ir::hoist`).
-struct Counts {
-    work: Vec<Option<u64>>,
-    unbounded: Vec<Option<Span>>,
-    weight: u64,
-    same: Vec<ir::same::SameWork>,
-    few: Vec<Vec<ir::same::FewInputs>>,
-    costly: Vec<ir::rates::Costly>,
-    copies: Vec<ir::opt::Copied>,
-    hoisted: Vec<ir::hoist::Hoisted>,
 }
 
 /// A function's IR name without the `_<n>` and `_d<n>` tags lowering gives each instance and
@@ -3944,185 +4324,6 @@ fn untagged(name: &str) -> String {
         n = head;
     }
     n.to_string()
-}
-
-/// Checks a pipeline's module and, if it'll be emitted, flattens it (`ir::opt::flatten_gpu`)
-/// and lays out its memory as the CPU's (`ir::gpu_memory`).
-fn verify(cx: &mut Cx, mb: &mut ModuleBuilder, name: &str) -> Option<Counts> {
-    if wrela_diag::has_errors(&cx.diags) {
-        return None;
-    }
-    let mut checked = ir::verify(&mb.m);
-    // Work is counted before flattening, while each function is still its own (§18.11).
-    let (mut work, mut unbounded) = (Vec::new(), Vec::new());
-    let mut weight = 0u64;
-    let mut same = Vec::new();
-    let mut few = Vec::new();
-    let mut costly = Vec::new();
-    let mut copies = Vec::new();
-    let mut hoisted = Vec::new();
-    let uniform = mb.gpu.as_ref().and_then(|g| g.uniform);
-    // What a `@budget(work: n)` holds, taken while each function is its own: a costly loop in
-    // it isn't reported (§18.13).
-    let quiet = ir::rates::budgeted(&mb.m);
-    let mut heavy = Vec::new();
-    if checked.is_ok() {
-        for e in &mb.m.entry_points {
-            weight = weight.saturating_add(ir::work::weight(&mb.m, e.function));
-        }
-        for (i, f) in mb.m.functions.iter().enumerate() {
-            if let Some(ir::Budget { weight: Some(most), at, .. }) = f.budget {
-                let w = ir::work::weight(&mb.m, ir::FuncId(i as u32));
-                if w > most {
-                    over_weight_budget(cx, &f.name, w, most, at);
-                }
-            }
-        }
-        if cx.data.few {
-            // (A derived function has no source name: its IR name, less the numbers lowering gives
-            // each instance and derivation.)
-            let name = |id: ir::FuncId| match mb.source_names.get(&id) {
-                Some(n) => n.clone(),
-                None => untagged(&mb.m.functions[id.index()].name),
-            };
-            few = ir::same::few_input_calls(&mb.m, FEW_INPUTS_LEAST, &name);
-        }
-        let (each, breaches) = ir::work::module_work(&mb.m);
-        for b in &breaches {
-            over_work_budget(cx, b);
-        }
-        unbounded =
-            each.iter().map(|w| if w.work.is_none() { w.unbounded } else { None }).collect();
-        work = each.into_iter().map(|w| w.work).collect();
-        heavy = ir::rates::heavy_calls(&mb.m, &work);
-    }
-    if cx.emit {
-        // A strict module folds from constants only what every GPU rounds as the CPU does, as an
-        // exact build's does.
-        mb.m.exact = cx.data.exact || mb.m.strict;
-        let mut folded_branch = false;
-        checked = checked
-            .and_then(|()| {
-                folded_branch = ir::opt::flatten_gpu_folded(&mut mb.m)?;
-                Ok(())
-            })
-            .map(|()| hoisted = hoist_same(cx, &mut mb.m, uniform));
-        // A strict module's transcendentals, square roots and float remainders become calls to
-        // std's code once its same work has moved onto the CPU, which computes them with the
-        // same code; then the module is flattened again (§11.3).
-        // Then, on a target whose GPU doesn't round its division, its divisions become std's
-        // too: after its same work is counted, which is of the code as written (a division a
-        // division on every target), and it is flattened once more.
-        let mut same_as_written = None;
-        if checked.is_ok() && mb.m.strict {
-            crate::make_strict(cx, mb);
-            checked = ir::opt::flatten_gpu(&mut mb.m);
-            if checked.is_ok() && crate::divides_by_std(cx) {
-                same_as_written = Some(ir::same::same_work(&mb.m, MOST_SAME_WORK + 1));
-                crate::strict_divisions(cx, mb);
-                checked = ir::opt::flatten_gpu(&mut mb.m);
-            }
-        }
-        checked = checked
-            .and_then(|()| ir::gpu_memory::lay_out_gpu_memory(&mut mb.m))
-            .and_then(|()| ir::verify(&mb.m));
-        if checked.is_ok() {
-            // The work of the code that runs, counted again. A strict module's is of std's code
-            // in it (§18.11): the more of the two (the flattened count can miss what the
-            // source's sees: `cull_bricks` came to 2,755 flattened, 164,544 as written, and takes
-            // 4.4 ms on the M4 for 8,192 invocations), and none where this count finds no bound
-            // (the host then refuses it). A module whose branches folded can be bounded where its
-            // source wasn't, and do less: the less of the two. Where the source's count had a
-            // bound and the code that runs has a loop with no way out, a pass erased the loop's
-            // exit: an internal error (on 2026-11-25 such a kernel held the M4's GPU until a
-            // restart).
-            let (flat_each, _) = ir::work::module_work(&mb.m);
-            let lost =
-                flat_each.iter().zip(&work).any(|(fw, pre)| pre.is_some() && fw.work.is_none());
-            if lost && let Some(f) = ir::endless_loop(&mb.m) {
-                checked = Err(ir::Error::internal(format!(
-                    "a loop of `{f}` has no break, return or trap left, where its source's work \
-                     had a bound: a pass erased its exit"
-                )));
-            }
-            for (idx, fw) in flat_each.into_iter().enumerate() {
-                let Some(slot) = work.get_mut(idx) else { continue };
-                match (*slot, fw.work) {
-                    (_, None) if mb.m.strict => {
-                        *slot = None;
-                        if let Some(u) = unbounded.get_mut(idx) {
-                            *u = fw.unbounded;
-                        }
-                    }
-                    (pre, Some(w)) if mb.m.strict => {
-                        *slot = Some(pre.map_or(w, |pre| pre.max(w)));
-                        if let Some(u) = unbounded.get_mut(idx) {
-                            *u = None;
-                        }
-                    }
-                    (pre, Some(w)) if folded_branch => {
-                        *slot = Some(pre.map_or(w, |pre| pre.min(w)));
-                        if let Some(u) = unbounded.get_mut(idx) {
-                            *u = None;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        if checked.is_ok() {
-            weight = written_weight(&mb.m);
-            same = match same_as_written.take() {
-                Some(same) => same,
-                None => ir::same::same_work(&mb.m, MOST_SAME_WORK + 1),
-            };
-            copies = ir::opt::read_only_copies(&mb.m, ir::opt::MOST_COPIED_BYTES);
-            costly = ir::rates::costly_loops(&mb.m, &quiet, &heavy);
-        }
-        // For the compiler's own debugging: `WRELA_DUMP_IR=gpu` prints each pipeline's module
-        // as it's written.
-        if std::env::var("WRELA_DUMP_IR").as_deref() == Ok("gpu") {
-            eprintln!("// {name}\n{}", ir::print::print(&mb.m));
-        }
-        // `WRELA_DUMP_IR=work`: where each entry point's work goes, by function (its runs in an
-        // invocation, and its own statements' work in them), the most costly first.
-        if std::env::var("WRELA_DUMP_IR").as_deref() == Ok("work") {
-            for (k, e) in mb.m.entry_points.iter().enumerate() {
-                let all = ir::work::work_by_function(&mb.m, e.function);
-                let sum: u64 = all.iter().map(|r| r.2).sum();
-                let bound = work.get(k).copied().flatten();
-                eprintln!("work {name} `{}`: bound {bound:?}, by function {sum}", e.name);
-                for (f, times, w) in all.iter().take(25) {
-                    let pct = 100.0 * *w as f64 / sum.max(1) as f64;
-                    let n = &mb.m.functions[f.index()].name;
-                    eprintln!("  {w:>10} {pct:5.1}% {times:>8}x {n}");
-                }
-            }
-        }
-    } else if checked.is_ok() {
-        // The pipeline's weight is its WGSL's, as flattening writes it (§18.11).
-        let mut flat = mb.m.clone();
-        if ir::opt::flatten_gpu(&mut flat)
-            .map(|()| {
-                hoist_same(cx, &mut flat, uniform);
-            })
-            .and_then(|()| ir::gpu_memory::lay_out_gpu_memory(&mut flat))
-            .is_ok()
-        {
-            weight = written_weight(&flat);
-            same = ir::same::same_work(&flat, MOST_SAME_WORK + 1);
-            copies = ir::opt::read_only_copies(&flat, ir::opt::MOST_COPIED_BYTES);
-            costly = ir::rates::costly_loops(&flat, &quiet, &heavy);
-        }
-    }
-    if let Err(e) = checked {
-        cx.err(Diagnostic::internal(format!("the IR for `{name}` is malformed: {e}")));
-        return None;
-    }
-    if wrela_diag::has_errors(&cx.diags) {
-        return None;
-    }
-    Some(Counts { work, unbounded, weight, same, few, costly, copies, hoisted })
 }
 
 /// A flattened module's weight (§18.11): its entry points' statements with each call to a
@@ -4140,50 +4341,53 @@ pub const MOST_SAME_WORK: u64 = 256;
 /// [`MOST_SAME_WORK`], reading the uniform block `uniform`: the values it moves onto the CPU.
 /// Not in a debug build, whose CPU code traps where a float operation makes a NaN that the GPU's
 /// would have given as a value (language.md §11).
-fn hoist_same(
-    cx: &Cx,
+fn hoist_same_for(
+    hoist: bool,
+    debug: bool,
     m: &mut ir::Module,
     uniform: Option<ir::ResourceId>,
 ) -> Vec<ir::hoist::Hoisted> {
     match uniform {
-        Some(u) if cx.hoist && !cx.data.debug => ir::hoist::hoist(m, u, MOST_SAME_WORK + 1),
+        Some(u) if hoist && !debug => ir::hoist::hoist(m, u, MOST_SAME_WORK + 1),
         _ => Vec::new(),
     }
 }
 
-/// A pipeline's uniform block once its module is laid out, with what `hoist_same` added
-/// (`hoisted`): its size and space as `entry_module` says, from the block's type as the module
-/// holds it now.
-fn hoisted_block(
-    cx: &Cx,
-    mb: &mut ModuleBuilder,
+fn hoisted_block_for(
+    target: wrela_abi::Target,
+    m: &mut ir::Module,
+    uniform_res: Option<ir::ResourceId>,
     uniform: Option<UniformOut>,
     hoisted: &[ir::hoist::Hoisted],
 ) -> Option<UniformOut> {
     let mut out = uniform?;
-    let Some(u) = mb.gpu.as_ref().and_then(|g| g.uniform).filter(|_| !hoisted.is_empty()) else {
+    let Some(u) = uniform_res.filter(|_| !hoisted.is_empty()) else {
         return Some(out);
     };
-    let ty = mb.m.resources[u.index()].ty;
-    (out.size, out.storage) = block_space(cx, &mb.m.types, ty);
-    mb.m.resources[u.index()].kind = ir::ResourceKind::Uniform { storage: out.storage };
+    let ty = m.resources[u.index()].ty;
+    (out.size, out.storage) = block_space_for(target, &m.types, ty);
+    m.resources[u.index()].kind = ir::ResourceKind::Uniform { storage: out.storage };
     Some(out)
 }
 
-/// Where CPU code records a command of pipeline `pipeline` (a dispatch or a draw), the values
-/// its same work moved onto the CPU (`hoisted`, in the GPU module's types `gpu`): each computed
-/// from the uniform block's values as the shader would, and the block made with them last.
-pub(crate) fn record_hoisted(
-    cx: &mut Cx,
-    cpu: &mut ir::Module,
-    pipeline: u32,
-    gpu: &ir::Types,
-    hoisted: &[ir::hoist::Hoisted],
-) {
+/// Where CPU code records a command of any pipeline with hoisted values (a dispatch or a draw),
+/// computes the values its same work moved onto the CPU from the uniform block's values as the
+/// shader would, and appends them to the block in a single pass over the CPU module.
+pub(crate) fn record_hoisted_all(cx: &mut Cx, cpu: &mut ir::Module, pipelines: &[PipelineOut]) {
+    let by_pipeline: std::collections::HashMap<u32, (&ir::Types, &[ir::hoist::Hoisted])> =
+        pipelines
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| !p.hoisted.is_empty())
+            .map(|(i, p)| (i as u32, (&p.module.types, p.hoisted.as_slice())))
+            .collect();
+    if by_pipeline.is_empty() {
+        return;
+    }
+    let mut failed: Vec<(u32, &'static str)> = Vec::new();
     for i in 0..cpu.functions.len() {
         let mut f = std::mem::take(&mut cpu.functions[i]);
         let mut body = std::mem::take(&mut f.body);
-        let mut failed = None;
         ir::visit::expand(&mut body, &mut |s, out| {
             let ir::Stmt::Eval(ir::Expr::Host(
                 ir::HostOp::Dispatch { pipeline: p, uniform: Some(t), .. }
@@ -4194,18 +4398,19 @@ pub(crate) fn record_hoisted(
                 out.push(s);
                 return;
             };
-            if *p != pipeline {
+            let pipeline = *p;
+            let Some(&(gpu, hoisted)) = by_pipeline.get(&pipeline) else {
                 out.push(s);
                 return;
-            }
+            };
             let (t, block) = (*t, *args.last().expect("a block"));
             let ir::TypeDef::Struct { name, fields } = cpu.types.get(t).clone() else {
-                failed = Some("its uniform block isn't a struct");
+                failed.push((pipeline, "its uniform block isn't a struct"));
                 out.push(s);
                 return;
             };
             if hoisted.first().is_some_and(|h| h.field as usize != fields.len()) {
-                failed = Some("its uniform block's fields aren't the shader's");
+                failed.push((pipeline, "its uniform block's fields aren't the shader's"));
                 out.push(s);
                 return;
             }
@@ -4261,7 +4466,7 @@ pub(crate) fn record_hoisted(
                     })(),
                 };
                 let Some(v) = v else {
-                    failed = Some("a hoisted value's recipe doesn't read as CPU code");
+                    failed.push((pipeline, "a hoisted value's recipe doesn't read as CPU code"));
                     return;
                 };
                 all.push((format!("hoisted{}", all.len() - fields.len()), f.value_ty(v)));
@@ -4282,10 +4487,11 @@ pub(crate) fn record_hoisted(
         });
         f.body = body;
         cpu.functions[i] = f;
-        if let Some(why) = failed {
-            cx.err(Diagnostic::internal(format!("pipeline {pipeline}'s hoisted values: {why}")));
-            return;
-        }
+    }
+    failed.sort_by_key(|&(p, _)| p);
+    failed.dedup_by_key(|x| x.0);
+    for (pipeline, why) in failed {
+        cx.err(Diagnostic::internal(format!("pipeline {pipeline}'s hoisted values: {why}")));
     }
 }
 
@@ -4399,15 +4605,15 @@ fn cpu_type(cpu: &mut ir::Module, gpu: &ir::Types, t: ir::TypeId) -> Option<ir::
 pub const FEW_INPUTS_LEAST: u64 = 100;
 
 /// E0710 for a function's weight over its `@budget(weight: n)` (§18.11), once.
-fn over_weight_budget(cx: &mut Cx, name: &str, w: u64, most: u64, at: Span) {
-    if cx.diags.iter().any(|d| d.code == codes::E0710 && d.span() == Some(at)) {
+fn over_weight_budget_in(diags: &mut Vec<Diagnostic>, name: &str, w: u64, most: u64, at: Span) {
+    if diags.iter().any(|d| d.code == codes::E0710 && d.span() == Some(at)) {
         return;
     }
     let name = match name.rsplit_once('_') {
         Some((head, tail)) if !head.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) => head,
         _ => name,
     };
-    cx.err(
+    diags.push(
         Diagnostic::new(
             codes::E0710,
             at,
@@ -4420,8 +4626,8 @@ fn over_weight_budget(cx: &mut Cx, name: &str, w: u64, most: u64, at: Span) {
 
 /// E0710: a function over its `@budget` (§18.11), once for each `@budget` however many
 /// pipelines reach it.
-fn over_work_budget(cx: &mut Cx, b: &ir::work::Breach) {
-    if cx.diags.iter().any(|d| d.code == codes::E0710 && d.span() == Some(b.at)) {
+fn over_work_budget_in(diags: &mut Vec<Diagnostic>, b: &ir::work::Breach) {
+    if diags.iter().any(|d| d.code == codes::E0710 && d.span() == Some(b.at)) {
         return;
     }
     let plain = |n: &str| match n.rsplit_once('_') {
@@ -4459,7 +4665,7 @@ fn over_work_budget(cx: &mut Cx, b: &ir::work::Breach) {
         Some(_) => "skip the costly calls where they can't matter (a test of a bound round them), or raise the budget",
         None => "give the loop a constant most passes: `for i in 0..64 { if done { break } ... }`",
     });
-    cx.err(d);
+    diags.push(d);
 }
 
 /// What a `@gpu` function's parameter of type `t` is bound to for its check: a resource of its
@@ -4548,7 +4754,7 @@ pub(crate) fn check_standalone(cx: &mut Cx, f: FnId, entry: Option<Entry>, subst
                 .map(|p| p.ty)
                 .find(|&t| wrela_sema::gpu::is_vertex_output(&checked.program, t))
                 .filter(|_| stage == Entry::Fragment);
-            let iface = Rc::new(Interface::of(cx, &[(f, &[])], None, varyings));
+            let iface = Arc::new(Interface::of(cx, &[(f, &[])], None, varyings));
             if let Entry::Compute(wg) = stage {
                 check_subgroup_invocation(cx, &iface, wg);
             }
@@ -4572,7 +4778,7 @@ pub(crate) fn check_standalone(cx: &mut Cx, f: FnId, entry: Option<Entry>, subst
             // `@gpu`: an ordinary function, lowered for the GPU, its buffers, textures,
             // samplers and groups bound to resources of their own, as a shader's would be.
             let what = format!("the `@gpu` function `{}`", def.name);
-            let mut mb = ModuleBuilder::gpu(GpuCx::new(what, Rc::default(), None));
+            let mut mb = ModuleBuilder::gpu(GpuCx::new(what, Arc::default(), None));
             let mut next = 1;
             let generics = checked.program.fn_all_generics(f);
             let subst = Subst::from_pairs(&generics, substs);
@@ -4768,7 +4974,7 @@ fn as_gpu_code(
 ) -> Option<(ModuleBuilder, ir::FuncId)> {
     let name = cx.source_name(key).unwrap_or_else(|| "the function".to_string());
     let label = format!("`{name}`, as `std::derive::{what}` reads it");
-    let mut mb = ModuleBuilder::gpu(GpuCx::new(label, Rc::default(), None));
+    let mut mb = ModuleBuilder::gpu(GpuCx::new(label, Arc::default(), None));
     if let Some(b) = beside {
         mb.m.types = b.m.types.clone();
         mb.m.resources = b.m.resources.clone();

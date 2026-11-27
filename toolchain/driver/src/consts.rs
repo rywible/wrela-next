@@ -10,7 +10,6 @@
 
 use crate::const_cache;
 use std::collections::BTreeSet;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use wrela_diag::{Diagnostic, SourceMap, Span, codes};
@@ -280,7 +279,7 @@ pub fn compute(
             }
             match result {
                 Ok(v) => {
-                    data.values.insert(c, Rc::new(v));
+                    data.values.insert(c, Arc::new(v));
                 }
                 Err(d) => {
                     diags.push(d);
@@ -434,8 +433,8 @@ impl Compiled {
     /// `out`'s WASM, compiled for wasmtime: the costly step, which a constant read from the
     /// cache skips.
     fn of(engine: &wasmtime::Engine, out: wrela_wasm::Emitted) -> Result<Compiled, String> {
-        let module = wasmtime::Module::new(engine, &out.wasm)
-            .map_err(|e| format!("wasmtime refused the build's code: {e:#}"))?;
+        let module = wrela_host::code::module(engine, &out.wasm)
+            .map_err(|e| format!("wasmtime refused the build's code: {e}"))?;
         Ok(Compiled { module, lines: out.lines })
     }
 
@@ -687,8 +686,9 @@ pub fn run_tests(
         return (Vec::new(), diags);
     };
     // Its own memory, unshared: each test runs on one thread.
+    let test_engine = wrela_host::test_metered_engine();
     let compiled = match emit(&module.module, !data.no_simd, false)
-        .and_then(|out| Compiled::of(engine(false), out))
+        .and_then(|out| Compiled::of(test_engine, out))
     {
         Ok(c) => c,
         Err(msg) => return (Vec::new(), vec![Diagnostic::internal(msg)]),
@@ -704,7 +704,7 @@ pub fn run_tests(
     let ran = each_at_once(&exports, |(export, test, fuel)| {
         let trace = wrela_host::Trace::new(Some(format!("{test}: ")));
         let ran =
-            compiled.start(engine(false), false, &trace, None).map(|mut r| r.call(export, *fuel));
+            compiled.start(test_engine, false, &trace, None).map(|mut r| r.call(export, *fuel));
         (ran, trace.take())
     });
     let results = module

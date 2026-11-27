@@ -96,7 +96,7 @@ pub fn load(engine: &Engine, bytes: &[u8]) -> Result<Module, String> {
 /// build's files are untrusted, so executable code is kept only in the host's private cache,
 /// never read from beside the build's WASM (a build may hold any files there). If the cache
 /// can't be used, compiling the WASM directly is safe and still lets the build run.
-pub(crate) fn module(engine: &Engine, wasm: &[u8]) -> crate::error::Result<Module> {
+pub fn module(engine: &Engine, wasm: &[u8]) -> crate::error::Result<Module> {
     use crate::error::Error;
     if let Ok(Some(cache)) = cache_dir().and_then(|dir| dir.map(Cache::open).transpose()) {
         return cache.module(engine, wasm).map_err(Error::Program);

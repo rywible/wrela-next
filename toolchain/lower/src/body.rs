@@ -12,7 +12,7 @@
 use crate::instance::{Bound, Callable, InstanceKey};
 use crate::{Cx, ModuleBuilder};
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::Arc;
 use wrela_diag::{Diagnostic, Span, codes};
 use wrela_ir as ir;
 use wrela_sema::builtins::BuiltinFn;
@@ -1304,7 +1304,7 @@ impl<'c, 'a> Fl<'c, 'a> {
                         });
                     }
                 }
-                Some((Callable::Closure { owner: Rc::new(owner), id: c.id }, srcs))
+                Some((Callable::Closure { owner: Arc::new(owner), id: c.id }, srcs))
             }
             _ => None,
         }
@@ -1329,7 +1329,7 @@ impl<'c, 'a> Fl<'c, 'a> {
             Rvalue::Closure(id) => {
                 let owner = self.owner_key();
                 let srcs = self.capture_sources(&owner, *id);
-                Some(Repr::Callable(Callable::Closure { owner: Rc::new(owner), id: *id }, srcs))
+                Some(Repr::Callable(Callable::Closure { owner: Arc::new(owner), id: *id }, srcs))
             }
             Rvalue::FnRef(f, args) => {
                 let substs = args.iter().map(|&a| self.concrete(a)).collect();

@@ -2539,39 +2539,54 @@ fn sink_values(m: &Module, f: &mut Function) {
 type Arm = (HashSet<ValueId>, Vec<Stmt>);
 
 fn sink_block(m: &Module, f: &Function, b: &mut Block) {
-    // The values statements and the blocks nested in them use.
-    let uses = |b: &[Stmt]| {
-        let mut out = HashSet::new();
-        visit::walk(b, &mut |s| {
-            s.for_each_value(&mut |v| {
-                out.insert(v);
-            })
-        });
-        out
-    };
-    let n = b.len();
-    // Each value's users among the block's statements (counting what's nested in them).
-    let mut users: HashMap<ValueId, Vec<usize>> = HashMap::new();
-    for (j, s) in b.iter().enumerate() {
-        for v in uses(std::slice::from_ref(s)) {
-            users.entry(v).or_default().push(j);
+    // Fast path: if this block has no `If`, nothing in `b` can sink into one.
+    if !b.iter().any(|s| matches!(s, Stmt::If { .. })) {
+        for s in b.iter_mut() {
+            for inner in s.blocks_mut() {
+                sink_block(m, f, inner);
+            }
+        }
+        return;
+    }
+    // Only inert `Stmt::Let(v, e)` defined directly in `b` can ever be sunk into an `If` in `b`.
+    let mut candidates: HashSet<ValueId> = HashSet::new();
+    for s in b.iter() {
+        if let Stmt::Let(v, e) = s
+            && inert(m, f, e)
+        {
+            candidates.insert(*v);
         }
     }
-    // For each `if`: what each branch uses, and the values moved into it (last first).
-    let mut branch: Vec<Option<[Arm; 2]>> = b
-        .iter()
-        .map(|s| match s {
-            Stmt::If { then, else_, .. } => {
-                Some([(uses(then), Vec::new()), (uses(else_), Vec::new())])
+    if candidates.is_empty() {
+        for s in b.iter_mut() {
+            for inner in s.blocks_mut() {
+                sink_block(m, f, inner);
             }
-            _ => None,
-        })
-        .collect();
+        }
+        return;
+    }
+    let n = b.len();
+    // Each candidate value's users among the block's statements (counting what's nested in them).
+    let mut users: HashMap<ValueId, Vec<usize>> = HashMap::with_capacity(candidates.len());
+    for (j, s) in b.iter().enumerate() {
+        visit::walk(std::slice::from_ref(s), &mut |st| {
+            st.for_each_value(&mut |v| {
+                if candidates.contains(&v) {
+                    let list = users.entry(v).or_default();
+                    if list.last() != Some(&j) {
+                        list.push(j);
+                    }
+                }
+            });
+        });
+    }
+    // For each `if`: computed lazily only when a candidate's sole non-moved user is that `if`.
+    let mut branch: Vec<Option<[Arm; 2]>> = vec![None; n];
     let mut moved = vec![false; n];
     // From the last, so a value's parts follow it into the branch it went to.
     for i in (0..n).rev() {
-        let Stmt::Let(v, e) = &b[i] else { continue };
-        if !inert(m, f, e) {
+        let Stmt::Let(v, _) = &b[i] else { continue };
+        if !candidates.contains(v) {
             continue;
         }
         let v = *v;
@@ -2581,11 +2596,29 @@ fn sink_block(m: &Module, f: &Function, b: &mut Block) {
         if later.any(|k| k != j) {
             continue;
         }
-        let Stmt::If { cond, .. } = &b[j] else { continue };
+        let Stmt::If { cond, then, else_ } = &b[j] else { continue };
         if *cond == v {
             continue;
         }
-        let Some(arms) = branch[j].as_mut() else { continue };
+        let arms = branch[j].get_or_insert_with(|| {
+            let mut u0 = HashSet::new();
+            visit::walk(then, &mut |st| {
+                st.for_each_value(&mut |x| {
+                    if candidates.contains(&x) {
+                        u0.insert(x);
+                    }
+                });
+            });
+            let mut u1 = HashSet::new();
+            visit::walk(else_, &mut |st| {
+                st.for_each_value(&mut |x| {
+                    if candidates.contains(&x) {
+                        u1.insert(x);
+                    }
+                });
+            });
+            [(u0, Vec::new()), (u1, Vec::new())]
+        });
         let k = match (arms[0].0.contains(&v), arms[1].0.contains(&v)) {
             (true, false) => 0,
             (false, true) => 1,
@@ -2593,8 +2626,10 @@ fn sink_block(m: &Module, f: &Function, b: &mut Block) {
         };
         let s = b[i].clone();
         s.for_each_value(&mut |x| {
-            arms[k].0.insert(x);
-            users.entry(x).or_default().push(j);
+            if candidates.contains(&x) {
+                arms[k].0.insert(x);
+                users.entry(x).or_default().push(j);
+            }
         });
         arms[k].1.push(s);
         moved[i] = true;
@@ -3134,10 +3169,10 @@ impl RangeSimp<'_> {
 /// run; a call; a host or memory operation) may change every other load.
 fn reuse_loads(m: &Module, f: &mut Function) {
     let taken = address_taken(f);
-    let mut cx = Reuse { m, f, taken, rename: Vec::new() };
+    let mut cx = Reuse { m, f, taken, rename: Vec::new(), known: Loaded::default() };
     cx.rename = vec![None; cx.f.values.len()];
     let mut body = std::mem::take(&mut cx.f.body);
-    cx.block(&mut body, &mut HashMap::new());
+    cx.block(&mut body);
     cx.f.body = body;
     drop_dead_stores(m, f);
 }
@@ -3160,9 +3195,122 @@ pub(crate) fn address_taken(f: &Function) -> Vec<bool> {
     taken
 }
 
-/// A load whose value is known: its value, and whether its place is in a local's own storage
-/// (and which local), rather than in memory that other writes can reach.
-type Loaded = HashMap<Place, (ValueId, Option<LocalId>)>;
+/// Scoped map of known loads with O(1) per-local / non-own invalidation and undo-log rollback
+/// across `If` and `Loop` branches (avoids cloning the whole map at every branch).
+#[derive(Default)]
+struct Loaded {
+    map: HashMap<Place, (ValueId, Option<LocalId>)>,
+    /// Places currently in `map` rooted at a given local (keyed by `root_local()`).
+    by_root: HashMap<LocalId, Vec<Place>>,
+    /// Places currently in `map` whose `own` is `None`.
+    non_own: Vec<Place>,
+    /// Undo log: `(place, previous_entry)` for rolling back to a saved checkpoint.
+    undo: Vec<(Place, Option<(ValueId, Option<LocalId>)>)>,
+}
+
+impl Loaded {
+    fn get(&self, p: &Place) -> Option<(ValueId, Option<LocalId>)> {
+        self.map.get(p).copied()
+    }
+
+    fn checkpoint(&self) -> usize {
+        self.undo.len()
+    }
+
+    fn insert(&mut self, p: Place, val: (ValueId, Option<LocalId>)) {
+        let prev = self.map.insert(p.clone(), val);
+        if prev.is_none() {
+            if let Some(l) = p.root_local() {
+                self.by_root.entry(l).or_default().push(p.clone());
+            }
+            if val.1.is_none() {
+                self.non_own.push(p.clone());
+            }
+        } else if prev.unwrap().1 != val.1 && val.1.is_none() {
+            self.non_own.push(p.clone());
+        }
+        self.undo.push((p, prev));
+    }
+
+    fn remove(&mut self, p: &Place) {
+        if let Some(prev) = self.map.remove(p) {
+            self.undo.push((p.clone(), Some(prev)));
+        }
+    }
+
+    fn remove_root_local(&mut self, l: LocalId) {
+        if let Some(places) = self.by_root.remove(&l) {
+            for p in places {
+                if let Some(prev) = self.map.remove(&p) {
+                    self.undo.push((p, Some(prev)));
+                }
+            }
+        }
+    }
+
+    fn remove_non_own(&mut self) {
+        let places = std::mem::take(&mut self.non_own);
+        for p in places {
+            if let Some(prev) = self.map.get(&p).copied()
+                && prev.1.is_none()
+            {
+                self.map.remove(&p);
+                self.undo.push((p, Some(prev)));
+            }
+        }
+    }
+
+    /// Reverts all mutations back to `mark`, returning the places that were touched since `mark`
+    /// along with their final value right before rollback (`None` if removed).
+    fn rollback(&mut self, mark: usize) -> HashMap<Place, Option<(ValueId, Option<LocalId>)>> {
+        let mut final_vals: HashMap<Place, Option<(ValueId, Option<LocalId>)>> = HashMap::new();
+        for (p, _) in &self.undo[mark..] {
+            final_vals.entry(p.clone()).or_insert_with(|| self.map.get(p).copied());
+        }
+        while self.undo.len() > mark {
+            let (p, prev) = self.undo.pop().unwrap();
+            match prev {
+                Some(v) => {
+                    let existed = self.map.insert(p.clone(), v).is_some();
+                    if !existed {
+                        if let Some(l) = p.root_local() {
+                            self.by_root.entry(l).or_default().push(p.clone());
+                        }
+                        if v.1.is_none() {
+                            self.non_own.push(p);
+                        }
+                    }
+                }
+                None => {
+                    self.map.remove(&p);
+                }
+            }
+        }
+        final_vals
+    }
+
+    fn rollback_discard(&mut self, mark: usize) {
+        while self.undo.len() > mark {
+            let (p, prev) = self.undo.pop().unwrap();
+            match prev {
+                Some(v) => {
+                    let existed = self.map.insert(p.clone(), v).is_some();
+                    if !existed {
+                        if let Some(l) = p.root_local() {
+                            self.by_root.entry(l).or_default().push(p.clone());
+                        }
+                        if v.1.is_none() {
+                            self.non_own.push(p);
+                        }
+                    }
+                }
+                None => {
+                    self.map.remove(&p);
+                }
+            }
+        }
+    }
+}
 
 struct Reuse<'a> {
     m: &'a Module,
@@ -3170,6 +3318,7 @@ struct Reuse<'a> {
     /// The locals whose address is taken: their storage is memory that other writes can reach.
     taken: Vec<bool>,
     rename: Vec<Option<ValueId>>,
+    known: Loaded,
 }
 
 impl Reuse<'_> {
@@ -3180,12 +3329,11 @@ impl Reuse<'_> {
     }
 
     /// What a statement's writes make unknown (not counting the blocks in it).
-    fn forget(&self, s: &Stmt, known: &mut Loaded) {
-        let everything_else = |known: &mut Loaded| known.retain(|_, (_, own)| own.is_some());
+    fn forget(&mut self, s: &Stmt) {
         match s {
             Stmt::Store(p, _) => match self.own(p) {
-                Some(l) => known.retain(|q, _| q.root_local() != Some(l)),
-                None => everything_else(known),
+                Some(l) => self.known.remove_root_local(l),
+                None => self.known.remove_non_own(),
             },
             Stmt::Let(_, e) | Stmt::Eval(e) => {
                 // A memory operation that only reads writes nothing.
@@ -3202,7 +3350,7 @@ impl Reuse<'_> {
                     )
                 );
                 if e.has_effect() && !reads {
-                    everything_else(known);
+                    self.known.remove_non_own();
                 }
             }
             _ => {}
@@ -3210,51 +3358,76 @@ impl Reuse<'_> {
     }
 
     /// What `b` and the blocks in it make unknown, wherever it ends.
-    fn forget_all(&self, b: &Block, known: &mut Loaded) {
-        visit::walk(b, &mut |s| self.forget(s, known));
+    fn forget_all(&mut self, b: &Block) {
+        visit::walk(b, &mut |s| self.forget(s));
     }
 
-    fn block(&mut self, b: &mut Block, known: &mut Loaded) {
+    fn block(&mut self, b: &mut Block) {
         let old = std::mem::take(b);
         for mut s in old {
             let rename = &self.rename;
             s.for_each_value_mut(&mut |x| *x = rename[x.index()].unwrap_or(*x));
             match s {
                 Stmt::Let(v, Expr::Load(p)) => {
-                    if let Some(&(was, _)) = known.get(&p) {
+                    if let Some((was, _)) = self.known.get(&p) {
                         self.rename[v.index()] = Some(was);
                         continue;
                     }
                     let own = self.own(&p);
-                    known.insert(p.clone(), (v, own));
+                    self.known.insert(p.clone(), (v, own));
                     b.push(Stmt::Let(v, Expr::Load(p)));
                 }
                 Stmt::If { cond, mut then, mut else_ } => {
-                    let (mut a, mut c) = (known.clone(), known.clone());
-                    self.block(&mut then, &mut a);
-                    self.block(&mut else_, &mut c);
-                    known.retain(|p, x| a.get(p) == Some(&*x) && c.get(p) == Some(&*x));
+                    let mark = self.known.checkpoint();
+                    self.block(&mut then);
+                    let a_diff = self.known.rollback(mark);
+                    self.block(&mut else_);
+                    let c_diff = self.known.rollback(mark);
+                    // Only keys touched in at least one arm could possibly differ from `known`
+                    // after the `if`; remove any key whose value after `then` or `else_` doesn't
+                    // still match its pre-`if` value.
+                    let mut to_remove = Vec::new();
+                    for (p, after_a) in &a_diff {
+                        if let Some(before) = self.known.get(p)
+                            && *after_a != Some(before)
+                        {
+                            to_remove.push(p.clone());
+                        }
+                    }
+                    for (p, after_c) in &c_diff {
+                        if let Some(before) = self.known.get(p)
+                            && *after_c != Some(before)
+                        {
+                            to_remove.push(p.clone());
+                        }
+                    }
+                    for p in to_remove {
+                        self.known.remove(&p);
+                    }
                     b.push(Stmt::If { cond, then, else_ });
                 }
                 Stmt::Loop { mut body, mut continuing } => {
                     // What's known at the top of every iteration: what the loop never changes.
-                    self.forget_all(&body, known);
-                    self.forget_all(&continuing, known);
-                    self.block(&mut body, &mut known.clone());
-                    self.block(&mut continuing, &mut known.clone());
+                    self.forget_all(&body);
+                    self.forget_all(&continuing);
+                    let mark = self.known.checkpoint();
+                    self.block(&mut body);
+                    self.known.rollback_discard(mark);
+                    self.block(&mut continuing);
+                    self.known.rollback_discard(mark);
                     b.push(Stmt::Loop { body, continuing });
                 }
                 Stmt::Store(p, x) => {
                     // What's stored in a local's own storage is what a load of it reads next.
                     let s = Stmt::Store(p.clone(), x);
-                    self.forget(&s, known);
+                    self.forget(&s);
                     if let Some(l) = self.own(&p) {
-                        known.insert(p, (x, Some(l)));
+                        self.known.insert(p, (x, Some(l)));
                     }
                     b.push(s);
                 }
                 s => {
-                    self.forget(&s, known);
+                    self.forget(&s);
                     b.push(s);
                 }
             }

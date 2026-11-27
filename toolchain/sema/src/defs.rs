@@ -3,7 +3,7 @@
 use crate::builtins::{BuiltinFn, BuiltinTy};
 use crate::ty::*;
 use std::collections::{BTreeMap, BTreeSet};
-use std::rc::Rc;
+use std::sync::Arc;
 use wrela_diag::Span;
 use wrela_syntax::ast;
 
@@ -1194,7 +1194,7 @@ pub struct FnDef {
     /// For a return type that names traits: the traits. `ret` is then `Opaque(self, ...)`.
     pub opaque: Option<Vec<TraitRef>>,
     pub attrs: FnAttrs,
-    pub body: Option<Rc<ast::Block>>,
+    pub body: Option<Arc<ast::Block>>,
     pub public: bool,
     /// `pub(package)`: callable only inside its package.
     pub package_only: bool,

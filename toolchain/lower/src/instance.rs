@@ -1,6 +1,6 @@
 //! Instance keys: what makes two lowerings of the same source function different.
 
-use std::rc::Rc;
+use std::sync::Arc;
 use wrela_ir as ir;
 use wrela_sema::ty::{ClosureId, FnId, TyId};
 
@@ -18,7 +18,7 @@ pub enum InstanceKey {
         resources: Vec<Option<Bound>>,
     },
     /// A closure in `owner`'s body, lifted to a function of its captures and parameters.
-    Closure { owner: Rc<InstanceKey>, id: ClosureId },
+    Closure { owner: Arc<InstanceKey>, id: ClosureId },
     /// A derived interpretation of a callable (language.md §14).
     /// `output`: an interval's result type (its range is that type's box), or what a value and
     /// gradient carries beside them (`value_gradient_with`'s `T`).
@@ -83,7 +83,7 @@ impl Bound {
 /// What's passed for a parameter of function type.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Callable {
-    Closure { owner: Rc<InstanceKey>, id: ClosureId },
+    Closure { owner: Arc<InstanceKey>, id: ClosureId },
     Func { func: FnId, substs: Vec<TyId> },
 }
 

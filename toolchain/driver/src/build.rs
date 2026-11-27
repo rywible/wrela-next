@@ -183,94 +183,119 @@ fn emit_in(
         manifest.wasm_relaxed = Some(RELAXED_WASM.to_string());
         manifest.wasm_relaxed_abi = Some(abi);
     }
-    for (i, p) in l.pipelines.iter().enumerate() {
-        let shader = format!("pipeline_{i}.{}", wrela_shader::extension(target));
-        // The CPU host checks stages and bindings without looking up shader entry points: its
-        // build names them as the IR does, and a full build as the MSL writer does, which may
-        // rename them.
-        let names: Vec<String> = p.module.entry_points.iter().map(|e| e.name.clone()).collect();
-        let stage = match (&p.kind, &p.key, names.as_slice()) {
-            (PipelineKind::Compute { workgroup_size }, _, [entry]) => {
-                wrela_abi::manifest::Stage::Compute {
-                    entry: entry.clone(),
-                    workgroup_size: *workgroup_size,
+    let prepared: Vec<(usize, Result<wrela_abi::manifest::Pipeline, Diagnostic>)> = l
+        .pipelines
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let shader = format!("pipeline_{i}.{}", wrela_shader::extension(target));
+            // The CPU host checks stages and bindings without looking up shader entry points: its
+            // build names them as the IR does, and a full build as the MSL writer does, which may
+            // rename them.
+            let names: Vec<String> = p.entry_point_names();
+            let stage = match (&p.kind, &p.key, names.as_slice()) {
+                (PipelineKind::Compute { workgroup_size }, _, [entry]) => {
+                    wrela_abi::manifest::Stage::Compute {
+                        entry: entry.clone(),
+                        workgroup_size: *workgroup_size,
+                    }
                 }
-            }
-            (
-                PipelineKind::Render { output },
-                PipelineKey::Render { state, .. },
-                [vertex, fragment],
-            ) => wrela_abi::manifest::Stage::Render {
-                vertex_entry: vertex.clone(),
-                fragment_entry: fragment.clone(),
-                blends: wrela_lower::blends_of(state, output),
-                cull: state.cull,
-                depth_bias: wrela_abi::manifest::DepthBias {
-                    constant: state.bias_constant,
-                    slope_scale: f32::from_bits(state.bias_slope),
-                    clamp: f32::from_bits(state.bias_clamp),
+                (
+                    PipelineKind::Render { output },
+                    PipelineKey::Render { state, .. },
+                    [vertex, fragment],
+                ) => wrela_abi::manifest::Stage::Render {
+                    vertex_entry: vertex.clone(),
+                    fragment_entry: fragment.clone(),
+                    blends: wrela_lower::blends_of(state, output),
+                    cull: state.cull,
+                    depth_bias: wrela_abi::manifest::DepthBias {
+                        constant: state.bias_constant,
+                        slope_scale: f32::from_bits(state.bias_slope),
+                        clamp: f32::from_bits(state.bias_clamp),
+                    },
+                    depth: state.depth,
+                    writes_depth: output.writes_depth(),
+                    outputs: output
+                        .colours
+                        .iter()
+                        .map(|(c, _)| {
+                            if c.uint {
+                                wrela_abi::manifest::Output::Uint
+                            } else {
+                                wrela_abi::manifest::Output::Float
+                            }
+                        })
+                        .collect(),
+                    targets: p.targets.clone(),
                 },
-                depth: state.depth,
-                writes_depth: output.writes_depth(),
-                outputs: output
-                    .colours
+                _ => {
+                    return (
+                        i,
+                        Err(Diagnostic::internal(format!(
+                            "the shader for `{}` has the wrong entry points",
+                            p.name
+                        ))),
+                    );
+                }
+            };
+            let pipeline = wrela_abi::manifest::Pipeline {
+                name: p.name.clone(),
+                shader,
+                stage,
+                uniform: p.uniform.as_ref().map(|u| wrela_abi::manifest::UniformBlock {
+                    binding: u.binding,
+                    size: u.size,
+                    space: if u.storage {
+                        wrela_abi::manifest::UniformSpace::Storage
+                    } else {
+                        wrela_abi::manifest::UniformSpace::Uniform
+                    },
+                }),
+                bindings: p.bindings.clone(),
+                debug_flag: p.debug_flag,
+                requires: p.requires(),
+                conditional: conditional.get(i).copied().unwrap_or(false),
+                strict: p.module.strict,
+                standin: p.standin,
+                sizes: None,
+                kept: p.kept_bytes(),
+                work: p.work.clone(),
+                unbounded: p
+                    .unbounded
                     .iter()
-                    .map(|(c, _)| {
-                        if c.uint {
-                            wrela_abi::manifest::Output::Uint
-                        } else {
-                            wrela_abi::manifest::Output::Float
-                        }
-                    })
+                    .map(|s| s.map(|s| sources.file(s.file).location(s.start)))
                     .collect(),
-                targets: p.targets.clone(),
-            },
-            _ => {
-                diagnostics.push(Diagnostic::internal(format!(
-                    "the shader for `{}` has the wrong entry points",
-                    p.name
-                )));
-                continue;
-            }
-        };
-        let mut pipeline = wrela_abi::manifest::Pipeline {
-            name: p.name.clone(),
-            shader,
-            stage,
-            uniform: p.uniform.as_ref().map(|u| wrela_abi::manifest::UniformBlock {
-                binding: u.binding,
-                size: u.size,
-                space: if u.storage {
-                    wrela_abi::manifest::UniformSpace::Storage
-                } else {
-                    wrela_abi::manifest::UniformSpace::Uniform
-                },
-            }),
-            bindings: p.bindings.clone(),
-            debug_flag: p.debug_flag,
-            requires: p.module.requires(),
-            conditional: conditional.get(i).copied().unwrap_or(false),
-            strict: p.module.strict,
-            standin: p.standin,
-            sizes: None,
-            kept: p.module.kept_bytes(),
-            work: p.work.clone(),
-            unbounded: p
-                .unbounded
-                .iter()
-                .map(|s| s.map(|s| sources.file(s.file).location(s.start)))
-                .collect(),
+            };
+            (i, Ok(pipeline))
+        })
+        .collect();
+    let emitted = crate::consts::each_at_once(&prepared, |(i, res)| {
+        let p = &l.pipelines[*i];
+        let mut pipeline = match res {
+            Ok(pl) => pl.clone(),
+            Err(d) => return (*i, Err(d.clone())),
         };
         let shader = if let Some(s) = shaders {
-            match wrela_shader::emit_shader(&p.module, &mut pipeline, s.target, s.checks) {
-                Ok(m) => Some(m),
-                Err(e) => {
-                    diagnostics.push(Diagnostic::internal(format!(
-                        "the {} back end failed for `{}`: {e}",
-                        target.name(),
-                        p.name
-                    )));
-                    continue;
+            if let Some(pre) = &p.pre_emitted {
+                pipeline.sizes = pre.sizes.clone();
+                Some(wrela_shader::Shader {
+                    bytes: pre.bytes.clone(),
+                    entry_points: pre.entry_points.clone(),
+                })
+            } else {
+                match wrela_shader::emit_shader(&p.module, &mut pipeline, s.target, s.checks) {
+                    Ok(m) => Some(m),
+                    Err(e) => {
+                        return (
+                            *i,
+                            Err(Diagnostic::internal(format!(
+                                "the {} back end failed for `{}`: {e}",
+                                target.name(),
+                                p.name
+                            ))),
+                        );
+                    }
                 }
             }
         } else {
@@ -287,14 +312,27 @@ fn emit_in(
                     *fragment_entry = f.clone();
                 }
                 _ => {
-                    diagnostics.push(Diagnostic::internal(format!(
-                        "the shader for `{}` has the wrong entry points",
-                        p.name
-                    )));
-                    continue;
+                    return (
+                        *i,
+                        Err(Diagnostic::internal(format!(
+                            "the shader for `{}` has the wrong entry points",
+                            p.name
+                        ))),
+                    );
                 }
             }
         }
+        (*i, Ok((pipeline, shader)))
+    });
+    for (i, res) in emitted {
+        let p = &l.pipelines[i];
+        let (pipeline, shader) = match res {
+            Ok(ok) => ok,
+            Err(d) => {
+                diagnostics.push(d);
+                continue;
+            }
+        };
         if budgets
             && pipeline.kept > MAX_KEPT_BYTES
             && let Some(&at) = p.sites.first()

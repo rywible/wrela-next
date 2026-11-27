@@ -49,6 +49,20 @@ pub fn metered_engine() -> &'static Engine {
     &METERED
 }
 
+/// A metered engine with Cranelift `OptLevel::SpeedAndSize` for `wrela test`: faster cold
+/// compile than `Speed` while matching its warm runtime speed.
+static TEST_METERED: LazyLock<Engine> = LazyLock::new(|| {
+    let mut config = wasmtime::Config::new();
+    config.wasm_threads(true).shared_memory(true).consume_fuel(true);
+    config.native_unwind_info(false);
+    config.cranelift_opt_level(wasmtime::OptLevel::SpeedAndSize);
+    Engine::new(&config).expect("wasmtime's configuration is valid")
+});
+
+pub fn test_metered_engine() -> &'static Engine {
+    &TEST_METERED
+}
+
 /// [`ENGINE`] with epoch interruption, for a program the tool host drives (language.md §15.5's
 /// `drive`): the tool host compiles a driven build's code for it, and the build's own process
 /// runs that code on it. Nothing moves its epoch and each store's deadline is far past reach

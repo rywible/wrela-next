@@ -68,6 +68,10 @@ struct Shared {
     errors: Arc<Mutex<Vec<String>>>,
     /// Pipelines and layouts made for each bind group layout, freed with the device.
     descriptor_pools: Mutex<Vec<vk::DescriptorPool>>,
+    /// Persistent Vulkan pipeline cache (`~/.cache/wrela/gpu/vk-*.bin`).
+    pipeline_cache: vk::PipelineCache,
+    pipeline_cache_path: Option<std::path::PathBuf>,
+    pipeline_cache_initial_len: usize,
     /// The table of views and samplers.
     table: Table,
     /// Host-visible buffers staged writes are copied into, reused once their submission is done.
@@ -617,6 +621,18 @@ impl Device {
                 .min(indexing.max_per_stage_update_after_bind_resources / 3);
             let table = Table::new(&raw, table_len)
                 .map_err(|e| Error(format!("Vulkan made no table: {e}")))?;
+            let pipeline_cache_path = pipeline_cache_path(&props);
+            let initial_cache = pipeline_cache_path
+                .as_ref()
+                .and_then(|p| std::fs::read(p).ok())
+                .unwrap_or_default();
+            let pipeline_cache_initial_len = initial_cache.len();
+            let pipeline_cache = raw
+                .create_pipeline_cache(
+                    &vk::PipelineCacheCreateInfo::default().initial_data(&initial_cache),
+                    None,
+                )
+                .unwrap_or(vk::PipelineCache::null());
             let storage_max = u64::from(l.max_storage_buffer_range).min(u64::from(u32::MAX)) & !3;
             let limits = Limits {
                 max_texture_dimension_2d: l.max_image_dimension2_d,
@@ -666,6 +682,9 @@ impl Device {
                 in_flight: Mutex::new(Vec::new()),
                 errors,
                 descriptor_pools: Mutex::new(Vec::new()),
+                pipeline_cache,
+                pipeline_cache_path,
+                pipeline_cache_initial_len,
                 table,
                 belt: Mutex::new(Belt::default()),
                 heap: Mutex::new(Heap::default()),
@@ -1256,7 +1275,7 @@ impl Device {
             vk::ComputePipelineCreateInfo::default().stage(stage).layout(desc.layout.0.pipeline);
         // SAFETY: a pipeline from a live module and layout.
         let raw = unsafe {
-            self.raw().create_compute_pipelines(vk::PipelineCache::null(), &[info], None).map_err(
+            self.raw().create_compute_pipelines(self.0.pipeline_cache, &[info], None).map_err(
                 |(_, e)| Error(format!("{}: Vulkan made no compute pipeline: {e}", desc.label)),
             )?[0]
         };
@@ -1337,7 +1356,7 @@ impl Device {
             .push_next(&mut rendering);
         // SAFETY: a pipeline from a live module and layout, its state built above.
         let raw = unsafe {
-            self.raw().create_graphics_pipelines(vk::PipelineCache::null(), &[info], None).map_err(
+            self.raw().create_graphics_pipelines(self.0.pipeline_cache, &[info], None).map_err(
                 |(_, e)| Error(format!("{}: Vulkan made no render pipeline: {e}", desc.label)),
             )?[0]
         };
@@ -1644,6 +1663,29 @@ impl Device {
     }
 }
 
+/// Path to the persistent Vulkan pipeline cache for this device and driver UUID, or `None`
+/// when `WRELA_GPU_CACHE=off` or no home directory is set.
+fn pipeline_cache_path(props: &vk::PhysicalDeviceProperties) -> Option<std::path::PathBuf> {
+    let dir = match std::env::var_os("WRELA_GPU_CACHE") {
+        Some(v) if v == "off" => return None,
+        Some(v) if !v.is_empty() => std::path::PathBuf::from(v),
+        _ => std::path::PathBuf::from(std::env::var_os("HOME")?).join(".cache/wrela/gpu"),
+    };
+    let uuid: String = props.pipeline_cache_uuid.iter().map(|b| format!("{b:02x}")).collect();
+    Some(dir.join(format!("vk-{:04x}-{:04x}-{uuid}.bin", props.vendor_id, props.device_id)))
+}
+
+fn save_pipeline_cache(path: &std::path::Path, data: &[u8]) {
+    let Some(parent) = path.parent() else { return };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let tmp = path.with_extension(format!("bin.{}.tmp", std::process::id()));
+    if std::fs::write(&tmp, data).is_ok() && std::fs::rename(&tmp, path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
 /// Submission `index`'s first and last timed command buffers, while `clock_of` has it.
 fn span(
     clock_of: &std::collections::VecDeque<(SubmissionIndex, u64, u64)>,
@@ -1675,6 +1717,16 @@ impl Drop for Shared {
                 for b in blocks.drain(..) {
                     self.raw.free_memory(b.memory, None);
                 }
+            }
+            if self.pipeline_cache != vk::PipelineCache::null() {
+                if let Some(path) = &self.pipeline_cache_path
+                    && let Ok(data) = self.raw.get_pipeline_cache_data(self.pipeline_cache)
+                    && !data.is_empty()
+                    && (data.len() > self.pipeline_cache_initial_len || !path.exists())
+                {
+                    save_pipeline_cache(path, &data);
+                }
+                self.raw.destroy_pipeline_cache(self.pipeline_cache, None);
             }
             self.raw.destroy_descriptor_pool(self.table.pool, None);
             self.raw.destroy_descriptor_set_layout(self.table.set_layout, None);

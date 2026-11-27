@@ -121,6 +121,58 @@ pub struct Types {
 }
 
 impl Types {
+    /// Reconstructs an intern table from its ordered type definitions, preserving every
+    /// [`TypeId`] index exactly. Returns `None` if any type references an out-of-range id.
+    pub fn from_defs(defs: Vec<TypeDef>) -> Option<Types> {
+        let n = defs.len();
+        let mut out = Types {
+            defs: Vec::with_capacity(n),
+            map: HashMap::with_capacity(n),
+            layouts: Vec::with_capacity(n),
+            offsets: Vec::with_capacity(n),
+            floats: Vec::with_capacity(n),
+        };
+        for d in defs {
+            let valid = |t: TypeId| t.index() < out.defs.len();
+            let ok = match &d {
+                TypeDef::Scalar(_)
+                | TypeDef::Vector(..)
+                | TypeDef::Matrix(..)
+                | TypeDef::Atomic(_) => true,
+                TypeDef::Struct { fields, .. } => fields.iter().all(|(_, t)| valid(*t)),
+                TypeDef::Enum { variants, .. } => variants.iter().all(|(_, t)| t.is_none_or(valid)),
+                TypeDef::Array(t, _)
+                | TypeDef::RuntimeArray(t)
+                | TypeDef::Run(t)
+                | TypeDef::Ptr(t) => valid(*t),
+            };
+            if !ok {
+                return None;
+            }
+            let t = TypeId(out.defs.len() as u32);
+            let (layout, offsets) = crate::layout::compute(&out, &d);
+            let floats = match &d {
+                TypeDef::Scalar(s) | TypeDef::Vector(s, _) => s.is_float(),
+                TypeDef::Atomic(_) => false,
+                TypeDef::Matrix(..) => true,
+                TypeDef::Struct { fields, .. } => fields.iter().any(|(_, t)| out.has_float(*t)),
+                TypeDef::Enum { variants, .. } => {
+                    variants.iter().any(|(_, t)| t.is_some_and(|t| out.has_float(t)))
+                }
+                TypeDef::Array(t, _)
+                | TypeDef::RuntimeArray(t)
+                | TypeDef::Run(t)
+                | TypeDef::Ptr(t) => out.has_float(*t),
+            };
+            out.layouts.push(layout);
+            out.offsets.push(offsets);
+            out.floats.push(floats);
+            out.defs.push(d.clone());
+            out.map.insert(d, t);
+        }
+        Some(out)
+    }
+
     pub fn intern(&mut self, d: TypeDef) -> TypeId {
         if let Some(&t) = self.map.get(&d) {
             return t;

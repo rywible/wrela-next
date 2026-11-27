@@ -31,12 +31,15 @@ pub use eval::{
     BuildData, ConstLowering, ConstModule, Embeds, MAX_CONST_VALUE_DEPTH, Memory, ReadError,
     TestModule, Value, Values, is_computed, lower_consts, lower_tests, read_value,
 };
-pub use gpu::{PipelineKey, PipelineKind, PipelineOut};
+pub use gpu::{
+    CachedPipeline, PipelineCache, PipelineCacheKeyInput, PipelineKey, PipelineKind, PipelineOut,
+    PreEmittedShader, UniformOut,
+};
 pub use instance::{Callable, InstanceKey};
 pub use lift::{LiftTable, LiftedFile, LiftedLiteral, candidates};
 
 use std::collections::{HashMap, VecDeque};
-use std::rc::Rc;
+use std::sync::Arc;
 use wrela_diag::{Diagnostic, Span};
 use wrela_ir as ir;
 use wrela_sema::Checked;
@@ -289,7 +292,7 @@ pub(crate) struct Cx<'a> {
     pub diags: Vec<Diagnostic>,
     /// Pipelines discovered by CPU code, deduplicated, in discovery order, with their
     /// interfaces.
-    pub pipelines: Vec<(gpu::PipelineKey, Rc<gpu::Interface>)>,
+    pub pipelines: Vec<(gpu::PipelineKey, Arc<gpu::Interface>)>,
     /// Where CPU code dispatches or draws each of `pipelines`.
     pub pipeline_sites: Vec<Vec<Span>>,
     /// What each render pipeline of `pipelines` is drawn into, first drawn first (the
@@ -401,7 +404,19 @@ pub fn lower(
     data: &BuildData,
     emit: bool,
 ) -> (Lowered, Vec<Diagnostic>) {
-    lower_in(checked, roots, data, emit, emit)
+    lower_in(checked, roots, data, emit, emit, None)
+}
+
+/// [`lower`], with an optional persistent pipeline cache that skips GPU optimization and shader
+/// emission for pipelines whose pre-optimization IR and build flags match a cached entry.
+pub fn lower_with_cache(
+    checked: &Checked,
+    roots: &Roots,
+    data: &BuildData,
+    emit: bool,
+    cache: Option<&dyn PipelineCache>,
+) -> (Lowered, Vec<Diagnostic>) {
+    lower_in(checked, roots, data, emit, emit, cache)
 }
 
 /// Lowers a program for the CPU host's frame and tick tests. GPU code is still checked, and
@@ -413,7 +428,7 @@ pub fn lower_for_cpu(
     roots: &Roots,
     data: &BuildData,
 ) -> (Lowered, Vec<Diagnostic>) {
-    lower_in(checked, roots, data, true, false)
+    lower_in(checked, roots, data, true, false, None)
 }
 
 fn lower_in(
@@ -422,6 +437,7 @@ fn lower_in(
     data: &BuildData,
     emit: bool,
     emit_gpu: bool,
+    cache: Option<&dyn PipelineCache>,
 ) -> (Lowered, Vec<Diagnostic>) {
     let mut cx = Cx::new(checked, data, emit_gpu);
     cx.lift = data.lift.as_ref().filter(|t| !t.literals.is_empty());
@@ -516,6 +532,8 @@ fn lower_in(
     if !has_entry && role == wrela_sema::defs::Role::Client {
         cx.no_frame();
     }
+    let time_lower = std::env::var("WRELA_TIME").as_deref() == Ok("pipelines");
+    let t_lower_start = std::time::Instant::now();
     cx.drain(&mut cpu);
     rewrite_cpu_math(&mut cx, &mut cpu);
     cx.drain(&mut cpu);
@@ -530,6 +548,8 @@ fn lower_in(
         cpu.m.nan_message = Some(cx.text_data(&mut cpu, NAN_MESSAGE));
     }
     cpu.m.command_message = Some(cx.text_data(&mut cpu, COMMAND_MESSAGE));
+    let t_cpu_drain = t_lower_start.elapsed();
+    let t_inline_start = std::time::Instant::now();
     // Inlining finds no mistakes in the program, only makes its code faster, so a check (no
     // code emitted) skips it.
     if emit
@@ -538,12 +558,14 @@ fn lower_in(
     {
         cx.err(Diagnostic::internal(format!("inlining the CPU module: {e}")));
     }
+    let t_inline = t_inline_start.elapsed();
     // For the compiler's own debugging: `WRELA_DUMP_IR=cpu` prints the CPU module (`gpu`, each
     // pipeline's: `gpu::verify`); set to anything else, it's printed when it's malformed.
     let dump = std::env::var("WRELA_DUMP_IR").ok();
     if dump.as_deref() == Some("cpu") {
         eprintln!("{}", ir::print::print(&cpu.m));
     }
+    let t_verify_start = std::time::Instant::now();
     if !wrela_diag::has_errors(&cx.diags)
         && let Err(e) = ir::verify(&cpu.m)
     {
@@ -557,38 +579,11 @@ fn lower_in(
     if emit && !wrela_diag::has_errors(&cx.diags) {
         recorded_pipelines_only(&mut cx, &mut cpu.m);
     }
+    let t_verify_cpu = t_verify_start.elapsed();
     // Pipelines: those CPU code records and their stand-ins, then the standalone GPU checks.
+    let t_pipes_start = std::time::Instant::now();
     let standins = gpu::add_standins(&mut cx);
-    let mut pipelines = Vec::new();
-    let mut i = 0;
-    while i < cx.pipelines.len() {
-        let (key, iface) = cx.pipelines[i].clone();
-        let sites = cx.pipeline_sites[i].clone();
-        let targets = cx.pipeline_targets[i].clone();
-        cx.hoist = !standins.iter().any(|&(a, b)| a as usize == i || b as usize == i);
-        let began = std::time::Instant::now();
-        let out = gpu::lower_pipeline(&mut cx, &key, iface, sites, targets);
-        // For the compiler's own measuring: `WRELA_TIME=pipelines` prints each pipeline's
-        // lowering time.
-        if std::env::var("WRELA_TIME").as_deref() == Ok("pipelines") {
-            let name = out.as_ref().map_or("?", |o| o.name.as_str());
-            eprintln!("lowered {name} in {:.0} ms", began.elapsed().as_secs_f64() * 1e3);
-        }
-        cx.hoist = false;
-        if let Some(mut out) = out {
-            if cx.emit {
-                gpu::fuel(&mut cx, &mut out, pipelines.len() as u32 + 1);
-            }
-            if data.debug && cx.emit {
-                gpu::debug_checks(&mut cx, &mut out, pipelines.len() as u32 + 1);
-            }
-            if data.tally && cx.emit {
-                gpu::tally(&mut cx, &mut out, pipelines.len() as u32 + 1);
-            }
-            pipelines.push(out);
-        }
-        i += 1;
-    }
+    let mut pipelines = lower_pipelines_parallel(&mut cx, &standins, cache);
     gpu::name_uncounted(&mut cx);
     if emit && !wrela_diag::has_errors(&cx.diags) {
         known_dispatches_within_the_line(&mut cx, &cpu.m, &pipelines);
@@ -598,15 +593,13 @@ fn lower_in(
             gpu::match_standin(&mut cx, &mut pipelines, i as usize, j as usize);
         }
     }
+    let t_pipes = t_pipes_start.elapsed();
+    let t_hoist_start = std::time::Instant::now();
     // What a pipeline moved onto the CPU (`ir::hoist`), computed where its commands are
     // recorded; then std's math for it, as for the rest of the CPU code.
     if emit && !wrela_diag::has_errors(&cx.diags) && pipelines.iter().any(|p| !p.hoisted.is_empty())
     {
-        for (i, p) in pipelines.iter().enumerate() {
-            if !p.hoisted.is_empty() {
-                gpu::record_hoisted(&mut cx, &mut cpu.m, i as u32, &p.module.types, &p.hoisted);
-            }
-        }
+        gpu::record_hoisted_all(&mut cx, &mut cpu.m, &pipelines);
         // Inlining renumbered the module's functions, so the instances it knew are stale: std's
         // math for this code is instantiated afresh, and the map put back for what reads it.
         let known = std::mem::take(&mut cpu.instances);
@@ -617,6 +610,8 @@ fn lower_in(
             cx.err(Diagnostic::internal(format!("the CPU module's IR is malformed: {e}")));
         }
     }
+    let t_hoist = t_hoist_start.elapsed();
+    let t_checks_start = std::time::Instant::now();
     for (f, substs) in &roots.gpu_checks {
         let already = cx.pipelines.iter().any(|(k, _)| k.mentions(*f));
         if already {
@@ -633,11 +628,247 @@ fn lower_in(
             cx.diags.extend(found.into_iter().filter(|d| d.span().is_some_and(inside)));
         }
     }
+    let t_checks = t_checks_start.elapsed();
+    if time_lower {
+        eprintln!(
+            "lower_in: cpu_drain {:.0} ms, inline_cpu {:.0} ms, verify_cpu {:.0} ms, pipelines {:.0} ms, hoist {:.0} ms, gpu_checks {:.0} ms",
+            t_cpu_drain.as_secs_f64() * 1e3,
+            t_inline.as_secs_f64() * 1e3,
+            t_verify_cpu.as_secs_f64() * 1e3,
+            t_pipes.as_secs_f64() * 1e3,
+            t_hoist.as_secs_f64() * 1e3,
+            t_checks.as_secs_f64() * 1e3,
+        );
+    }
     let instances = cpu.fn_instances();
     let lowered = Lowered { cpu: cpu.m, pipelines, instances, tally: data.tally };
     let mut diags = cx.diags;
     wrela_diag::sort_and_dedup(&mut diags);
     (lowered, diags)
+}
+
+/// Runs `f` over every item of `items` in parallel across up to `threads` worker threads (with
+/// 64 MiB stacks), returning results in the original order.
+fn par_map<T: Send, R: Send>(items: Vec<T>, threads: usize, f: impl Fn(T) -> R + Sync) -> Vec<R> {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let n = items.len();
+    let threads = threads.max(1).min(n.max(1));
+    if threads <= 1 || n <= 1 {
+        return items.into_iter().map(f).collect();
+    }
+    let mut inputs: Vec<Option<T>> = items.into_iter().map(Some).collect();
+    let queue = Mutex::new(&mut inputs);
+    let next = AtomicUsize::new(0);
+    let mut outputs: Vec<Option<R>> = (0..n).map(|_| None).collect();
+    let results = Mutex::new(&mut outputs);
+    std::thread::scope(|s| {
+        let mut workers = Vec::with_capacity(threads);
+        for _ in 0..threads {
+            let worker = std::thread::Builder::new()
+                .name("wrela-pipe".into())
+                .stack_size(64 << 20)
+                .spawn_scoped(s, || {
+                    loop {
+                        let k = next.fetch_add(1, Ordering::Relaxed);
+                        if k >= n {
+                            break;
+                        }
+                        let item = queue.lock().unwrap_or_else(|p| p.into_inner())[k]
+                            .take()
+                            .expect("item taken once");
+                        let r = f(item);
+                        results.lock().unwrap_or_else(|p| p.into_inner())[k] = Some(r);
+                    }
+                })
+                .expect("can't start pipeline worker thread");
+            workers.push(worker);
+        }
+        for w in workers {
+            w.join().unwrap_or_else(|p| std::panic::resume_unwind(p));
+        }
+    });
+    outputs.into_iter().map(|r| r.expect("every item ran")).collect()
+}
+
+/// Lowers each recorded pipeline and its stand-ins across cores in five stages:
+/// 1. Prepare MIR -> IR sequentially on `&Checked`.
+/// 2. Parallel stage 1: verify, weight/work/budget, first GPU flatten and hoisting (all pipelines).
+/// 3. Sequential `make_strict` on `@strict` pipelines (instantiates `std::math` calls only).
+/// 4. Parallel stage 3: second GPU flatten on `@strict` pipelines (plus `same_work` on Vulkan).
+/// 5. Sequential `strict_divisions` on Vulkan `@strict` pipelines, then parallel stage 5:
+///    optional third flatten, GPU memory layout, verification, analysis and fuel/debug/tally.
+fn lower_pipelines_parallel(
+    cx: &mut Cx,
+    standins: &[(u32, u32)],
+    cache: Option<&dyn PipelineCache>,
+) -> Vec<gpu::PipelineOut> {
+    let n = cx.pipelines.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let time_pipelines = std::env::var("WRELA_TIME").as_deref() == Ok("pipelines");
+    let threads = std::env::var("WRELA_BUILD_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |k| k.get()))
+        .max(1);
+    let active_cache = cache.filter(|_| std::env::var_os("WRELA_DUMP_IR").is_none());
+
+    let t0 = std::time::Instant::now();
+    let mut states: Vec<(usize, gpu::PipelineState)> = Vec::with_capacity(n);
+    let mut i = 0;
+    while i < cx.pipelines.len() {
+        let (key, iface) = cx.pipelines[i].clone();
+        let sites = cx.pipeline_sites[i].clone();
+        let targets = cx.pipeline_targets[i].clone();
+        cx.hoist = !standins.iter().any(|&(a, b)| a as usize == i || b as usize == i);
+        if let Some(st) = gpu::prepare_pipeline(cx, &key, iface, sites, targets, i as u32 + 1) {
+            states.push((i, st));
+        }
+        cx.hoist = false;
+        i += 1;
+    }
+    let t_prep = t0.elapsed();
+
+    let mut done: Vec<Option<gpu::PipelineOut>> = vec![None; cx.pipelines.len()];
+    let mut cache_hits = 0usize;
+    let mut cache_misses = 0usize;
+    let mut hit_uncounted: Vec<(usize, Vec<(Span, String, u64)>)> = Vec::new();
+    let t_lookup_start = std::time::Instant::now();
+    if let Some(c) = active_cache {
+        let probed = par_map(states, threads, |(idx, mut st)| {
+            if gpu::cache_eligible(&st) {
+                let input = gpu::PipelineCacheKeyInput {
+                    module: &st.mb.m,
+                    kind: &st.kind,
+                    uniform: &st.uniform,
+                    bindings: &st.bindings,
+                    target: st.target,
+                    exact: st.exact,
+                    hoist: st.hoist,
+                };
+                if let Some(key) = c.key(&input) {
+                    if let Some(cached) = c.get(&key) {
+                        let (out, uncounted) = gpu::from_cached(st, cached);
+                        return (idx, Ok((out, uncounted)));
+                    }
+                    st.cache_key = Some(key);
+                }
+            }
+            (idx, Err(st))
+        });
+        let mut misses = Vec::new();
+        for (idx, res) in probed {
+            match res {
+                Ok((out, uncounted)) => {
+                    cache_hits += 1;
+                    done[idx] = Some(out);
+                    if !uncounted.is_empty() {
+                        hit_uncounted.push((idx, uncounted));
+                    }
+                }
+                Err(st) => {
+                    cache_misses += 1;
+                    misses.push((idx, st));
+                }
+            }
+        }
+        states = misses;
+    }
+    let t_lookup = t_lookup_start.elapsed();
+
+    // Schedule largest pipelines first (LPT) so stragglers start at t=0; final results are
+    // placed back at their original index `idx` so output order is completely unchanged.
+    states.sort_by(|a, b| {
+        let sz = |st: &gpu::PipelineState| -> usize {
+            st.mb.m.functions.iter().map(|f| f.values.len() + f.body.len()).sum()
+        };
+        sz(&b.1).cmp(&sz(&a.1)).then(a.0.cmp(&b.0))
+    });
+
+    let t1 = std::time::Instant::now();
+    let mut states = par_map(states, threads, |(idx, mut st)| {
+        gpu::pipeline_stage1(&mut st);
+        (idx, st)
+    });
+    let t_s1 = t1.elapsed();
+
+    let t2 = std::time::Instant::now();
+    let mut any_strict = false;
+    for (_, st) in &mut states {
+        if st.emit && st.mb.m.strict && st.checked.is_ok() {
+            any_strict = true;
+            make_strict(cx, &mut st.mb);
+        }
+    }
+    let t_ms = t2.elapsed();
+
+    let div_by_std = divides_by_std(cx);
+    let t3 = std::time::Instant::now();
+    if any_strict {
+        states = par_map(states, threads, |(idx, mut st)| {
+            gpu::pipeline_stage3_strict(&mut st, div_by_std);
+            (idx, st)
+        });
+    }
+    let t_s3 = t3.elapsed();
+
+    let t4 = std::time::Instant::now();
+    if any_strict && div_by_std {
+        for (_, st) in &mut states {
+            if st.emit && st.mb.m.strict && st.checked.is_ok() {
+                strict_divisions(cx, &mut st.mb);
+            }
+        }
+    }
+    let t_sd = t4.elapsed();
+
+    let t5 = std::time::Instant::now();
+    let mut finished = par_map(states, threads, |(idx, st)| {
+        let (out, diags, uncounted) = gpu::pipeline_stage5_finish(st, div_by_std, active_cache);
+        (idx, out, diags, uncounted)
+    });
+    finished.sort_by_key(|(idx, _, _, _)| *idx);
+    let t_s5 = t5.elapsed();
+
+    if time_pipelines {
+        eprintln!(
+            "pipelines ({} total, {} hits, {} misses, {} threads): prep {:.0} ms, lookup {:.0} ms, s1 {:.0} ms, make_strict {:.0} ms, s3 {:.0} ms, strict_div {:.0} ms, s5 {:.0} ms",
+            cache_hits + finished.len(),
+            cache_hits,
+            cache_misses,
+            threads,
+            t_prep.as_secs_f64() * 1e3,
+            t_lookup.as_secs_f64() * 1e3,
+            t_s1.as_secs_f64() * 1e3,
+            t_ms.as_secs_f64() * 1e3,
+            t_s3.as_secs_f64() * 1e3,
+            t_sd.as_secs_f64() * 1e3,
+            t_s5.as_secs_f64() * 1e3,
+        );
+    }
+
+    for (_, uncounted) in hit_uncounted {
+        cx.uncounted.extend(uncounted);
+    }
+    for (idx, out, diags, uncounted) in finished {
+        for d in diags {
+            if d.code == wrela_diag::codes::E0710
+                && cx
+                    .diags
+                    .iter()
+                    .any(|e| e.code == wrela_diag::codes::E0710 && e.span() == d.span())
+            {
+                continue;
+            }
+            cx.diags.push(d);
+        }
+        cx.uncounted.extend(uncounted);
+        done[idx] = out;
+    }
+    done.into_iter().flatten().collect()
 }
 
 /// Drops the pipelines no dispatch, draw or `kernel_work` in `cpu` names, and numbers the rest in

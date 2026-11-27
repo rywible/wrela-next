@@ -20,6 +20,7 @@ pub mod lift;
 pub mod manifest;
 pub mod optimize;
 pub mod package;
+pub mod pipeline_cache;
 pub mod primer;
 pub mod query;
 pub mod reach;
@@ -1141,11 +1142,26 @@ fn compile_loaded_in(
         for role in roles(&checked) {
             scope.stop()?;
             data.role = role;
+            let checks = if mode.trusted_shaders {
+                wrela_shader::Checks::UNCHECKED
+            } else {
+                wrela_shader::Checks::CHECKED
+            };
+            let checks = wrela_shader::Checks { exact: mode.exact, ..checks };
+            let pipe_cache =
+                (mode.emit && role == wrela_sema::defs::Role::Client && !mode.debug && !mode.tally)
+                    .then(|| pipeline_cache::DiskPipelineCache::open(&sources, mode.target, checks))
+                    .flatten();
             // The pipeline-count query lowers as a build does, inlining and all, so it lists the
             // pipelines a build makes (a constant branch's are gone): only the back ends are
             // skipped.
-            let (lowered, d) =
-                wrela_lower::lower(&checked, &roots, &data, mode.emit || mode.conditions);
+            let (lowered, d) = wrela_lower::lower_with_cache(
+                &checked,
+                &roots,
+                &data,
+                mode.emit || mode.conditions,
+                pipe_cache.as_ref().map(|c| c as &dyn wrela_lower::PipelineCache),
+            );
             times.add("lowering", lap());
             scope.stop()?;
             let ok = !has_errors(&d);
@@ -1472,7 +1488,7 @@ fn summarize(
                 }),
                 work: out.work.clone(),
                 weight: out.weight,
-                kept: out.module.kept_bytes(),
+                kept: out.kept_bytes(),
                 standin: out.standin.map(|j| j as usize),
                 stands_in: out.stands_in,
                 unbounded: out

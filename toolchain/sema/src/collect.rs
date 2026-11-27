@@ -7,7 +7,7 @@ use crate::program::{LangRes, Program};
 use crate::resolve::{self, Scope, TyPos};
 use crate::ty::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::rc::Rc;
+use std::sync::Arc;
 use wrela_diag::{Diagnostic, Span, codes};
 use wrela_syntax::ast;
 
@@ -352,7 +352,7 @@ impl<'d, 'u> Collector<'d, 'u> {
             ret_mode: RetMode::Owned,
             opaque: None,
             attrs,
-            body: f.body.clone().map(Rc::new),
+            body: f.body.clone().map(Arc::new),
             public,
             package_only,
             span: f.sig_span.to(f.body.as_ref().map_or(f.sig_span, |b| b.span)),

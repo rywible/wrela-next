@@ -15,7 +15,7 @@
 use crate::instance::InstanceKey;
 use crate::{Cx, ModuleBuilder};
 use std::collections::{BTreeMap, BTreeSet};
-use std::rc::Rc;
+use std::sync::Arc;
 use wrela_diag::{Diagnostic, Span};
 use wrela_ir as ir;
 use wrela_sema::Checked;
@@ -37,7 +37,7 @@ pub enum Value {
 }
 
 /// The values of the constants the build has computed.
-pub type Values = BTreeMap<ConstId, Rc<Value>>;
+pub type Values = BTreeMap<ConstId, Arc<Value>>;
 
 /// The files `embed` reads, by path.
 pub type Embeds = BTreeMap<std::sync::Arc<str>, std::sync::Arc<[u8]>>;

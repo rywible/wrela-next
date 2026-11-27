@@ -49,7 +49,7 @@ fn empty_vec() -> Value {
 pub fn take(checked: &Checked, data: &mut BuildData) -> (Vec<(String, Vec<u8>)>, Vec<Diagnostic>) {
     let (files, diags, stripped) = read(checked, data);
     for (c, v) in stripped {
-        data.values.insert(c, std::rc::Rc::new(v));
+        data.values.insert(c, std::sync::Arc::new(v));
     }
     (files, diags)
 }
