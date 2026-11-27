@@ -282,6 +282,18 @@ cells, 651 have no slab within the brick's width (`flat_census`), at its min joi
 So Stage 3A as written (uniform rings by distance alone) is not built, and Stage 3C waits on
 phase 5's enclosures; phase 3 keeps the view-fitted rings, with slack (see phase 3).
 
+**7. The sun's judge across placements.** SCENE 13 at 320x180 on the M4, 8 placements of the
+lattice (at `3e9eead`): one point a pixel, hard leaks VIEW 0 673 to 853 (mean error 3.21 to 3.97
+/255), VIEW 1 1,310 to 1,422 (6.94 to 7.46), VIEW 2 251 to 332 (1.20 to 1.59); p99 255, 255, 0.
+Four points of the footprint for the reference against one point of the engine: hard leaks 28 to
+54, 36 to 62, 1 to 21, but mean error 7.28 to 7.61, 9.95 to 10.32, 1.38 to 1.58 and p99 128, 128,
+64: each half-lit footprint at an edge counted as half the sun wrong. Most of the "leaks" were the
+reference's: Newton's steps place a receiver within their tolerance of a carved or turned field's
+surface, its rays left 0.1 mm out along the normal, and on those fields a ray often started inside
+and met the thing it left at its first step. With the engine's sun the mean of the same four drawn
+pixels (the picture drawn at 640x360) and rays that start outside (`judge::sunlight::outside`), at
+`f04b923`: placement 0 mean error 0.33, 0.91, 0.13 /255, hard leaks 5, 9, 0, p99 4, 21, 0.
+
 ### Done when
 
 - All seven measurement tables are recorded in this file and in the commit message.
@@ -354,6 +366,18 @@ gate baselines.
 ---
 
 ## 9. Phase 2: Footprint-integrated sun judge and conservative sun maps
+
+**Done** for steps 1 and 3 (2026-11-27). The judge draws at twice the judged size and holds each
+judged pixel's mean engine sun over its four drawn pixels to the mean of 64 rays from the same
+four points, from rays that start outside the field (`judge::sunlight`). `tools/gate` holds it
+over 8 placements and cells 2.25 and 2.75 px wide (`CELL_PX`, a setting of `mesh_sight`), with a
+row for how far the mean error moves among them. M4: SCENE 13 VIEW 0, 1, 2 mean error 0.27, 0.91,
+0.11 /255 (was 3.66, 7.07, 1.46), its move 0.12, 0.16, 0.08, p99 2, 21, 0; hard leaks 2.5, 11.2,
+1.1 (was 773, 1,359, 307). Step 2 (dual conservative maps) is not built: the measured error is
+already under one display step on average, the engine's map with its near band and exact rays
+(`mesh::sunlight`) holding it; VIEW 1's p99 of 21 is a few lines along a moulding seen edge-on,
+in the exact pass's pixels (acne 75 hard), named for phase 5. The plan's display-step `eps` is
+not used: the gate holds the error's mean, p99 and move in 255ths of the sun.
 
 Purpose: unblock every mesh change by making the sun judge measure physical pixel-footprint
 radiance error rather than point-sampled sub-cell tessellation noise.
