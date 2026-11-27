@@ -394,6 +394,7 @@ than the balance fell (1.59 written, 1.12 fallen for the tests of 0.5).
 | 2026-11-26 | `p4h-9` (L4): phase 4 on the human with CeTI: 2038 clips, 3500 updates from p4h-8's weights at update 1527; a fall at 0.5 m on average (Luo et al. 2023), a quarter of the worlds started at their clip's first frame, the rate held to a KL of 0.1 from 5e-5, stopped after full-pipeline audit found 48% joint-limit violations, stale reset kinematics, finger hijacking and 42 m/s reference spikes | 1.42 |
 | 2026-11-27 | `p4h-10-small` (L4): phase 4 on human3: 100-update L4 validation of audited physics/obs/PPO fixes, done | 0.80 |
 | 2026-11-27 | `p4h-10` (L4): phase 4 on human3: 2038 sanitized clips, 25 active bodies, stable armature, 0% limit violations, multi-scale reward and value norm, 4000 updates, stopped | 2.26 |
+| 2026-11-27 | `p4h-11` (L4): phase 4 on human3: critically damped STIFF=2.5 kv=0.04, per-dim target_kl=0.002, annealed log_std -1.6..-2.5, 12-frame lookahead + ref_vel, 4000 updates, done | 11.55 |
 
 #### A new machine
 

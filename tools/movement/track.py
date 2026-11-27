@@ -257,10 +257,13 @@ class Sim:
         mjw.kinematics(self.m, self.d)
 
     def weigh(self, results):
-        """Gives each training clip that `results` (of `play`) shows was not followed four times
-        its weight by length."""
+        """Gives each training clip that `results` (of `play`) shows was not followed extra weight
+        by length (4x normally, 8x once fewer than 15% of clips fail so hard-example mining stays
+        focused on the remaining tail)."""
         failed = {r["clip"] for r in results if not r["followed"]}
-        extra = torch.tensor([4.0 if int(c) in failed else 1.0 for c in self.train.tolist()],
+        fail_rate = len(failed) / max(len(results), 1)
+        boost = 8.0 if fail_rate < 0.15 else 4.0
+        extra = torch.tensor([boost if int(c) in failed else 1.0 for c in self.train.tolist()],
                              device=self.dev)
         self.weights = self.lengths[self.train].float() * extra
 
@@ -898,6 +901,12 @@ def main():
             if "vnorm" in w:
                 vnorm.load(w["vnorm"], dev)
             print(f"init: the net and the observations' scale of {a.init} (its update {w.get('step')})", flush=True)
+            init_eval = evaluate(sim, agent, norm)
+            print(f"evaluate at 0 (init): {json.dumps(init_eval)}", flush=True)
+            best = {"followed": init_eval["training"].get("followed", 0.0), "step": 0, "evaluation": init_eval,
+                    "agent": {k: v.detach().cpu().clone() for k, v in agent.state_dict().items()},
+                    "norm": {k: (v.cpu().clone() if hasattr(v, "cpu") else v) for k, v in norm.state().items()}}
+            sim.reset(torch.ones(a.worlds, dtype=torch.bool, device=dev))
         if state is not None:
             agent.load_state_dict(state["agent"])
             opt.load_state_dict(state["opt"])
@@ -1030,8 +1039,8 @@ def main():
         import io
         buf = io.BytesIO()
         torch.save({"agent": {k: v.cpu() for k, v in agent.state_dict().items()},
-                    "norm": norm.state(), "n_obs": n_obs, "n_act": n_act, "hidden": hidden,
-                    "seed": run.seed, "args": vars(a), "samples": samples}, buf)
+                    "norm": norm.state(), "vnorm": vnorm.state(), "n_obs": n_obs, "n_act": n_act,
+                    "hidden": hidden, "seed": run.seed, "args": vars(a), "samples": samples}, buf)
         run.output("tracker.pt", buf.getvalue())
         full = {}
         if a.filtered:
