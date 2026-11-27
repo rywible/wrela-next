@@ -1164,6 +1164,14 @@ All lines above need no person. To bring the owner's eye in early and often:
    choices, on the CPU.
 3. **Use it as a term of training** in phases 5 and 5b, beside the judge.
 
+Where it is (2026-11-26): the film draws any body of `tools/movement/bodies` (`film human
+SOURCE/CLIP`, the panel framed by the body's height), and `tools/movement/prefer.py make NAME human
+A=ROOT:CLIP B=ROOT:CLIP` puts two films of one goal one above the other in an order kept from the
+owner (`.movement/prefer/NAME/pair.mp4` and a page to watch it; 5.5 minutes on the CPU for two
+films of 4 s); `prefer.py choose NAME left|right` keeps the choice and both films' records in
+`tools/movement/preferences.jsonl`, and `prefer.py count` tallies them. No choice of the owner's
+yet.
+
 ### The final review by the owner
 
 When the lines above are true, make 20 pairs of films. One film of each pair is capture and one is
