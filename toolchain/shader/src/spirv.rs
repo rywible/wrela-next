@@ -1592,6 +1592,13 @@ impl<'m> FunctionWriter<'_, 'm> {
         operands.extend(string(&name));
         operands.extend(self.interface.iter().copied());
         self.w.entry_points.extend(inst(Op::EntryPoint, &operands));
+        if self.w.checks.exact {
+            self.w.capability(Capability::SignedZeroInfNanPreserve);
+            self.w.execution_modes.extend(inst(
+                Op::ExecutionMode,
+                &[fid, ExecutionMode::SignedZeroInfNanPreserve as u32, 32],
+            ));
+        }
         match &e.stage {
             ir::Stage::Compute { workgroup_size: [x, y, z] } => {
                 self.w.execution_modes.extend(inst(

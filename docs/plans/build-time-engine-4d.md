@@ -306,6 +306,35 @@ pixels (the picture drawn at 640x360) and rays that start outside (`judge::sunli
 Purpose: repair all known soundness, compiler, and mesh faults, and establish true two-machine
 gate baselines.
 
+**State (2026-11-27).** Steps 2 to 6 are done on the M4:
+
+- Step 2: `smooth_reach` widens each smooth join's parts (`20179be`; the moving-part test holds
+  the blend zone), and `parts_dirty` commits only after a patch succeeds.
+- Step 3: a mesh is keyed by what its extraction reads (`std::derive::kept_deps` over
+  `ir::field_deps`, `mesh::extract::mesh_key`); a cooling branch keeps its mesh.
+- Step 4: the source's work count overcounted, not the flattened one: it followed branches the
+  flattening folds away (`steep(f)`, a float comparison it didn't fold) and work nothing reads (a
+  one-part field's `pruned` ranges). The count folds float comparisons, and a strict kernel's
+  bound is its flattened count (`f04b923`). The carved boards' NaN was a derived local joined
+  before it was written (`l.xy` past an early return, holding whatever its frame held): every
+  active local starts as its join's identity, and the table and the grimoire derive (`2462b03`).
+- Step 5: every grid covers its thing at every placement (`e0b4bef`: it was cut off past two
+  cells of shift); every fold is drawn by exact rays (`every_mesh_fold_is_drawn_by_exact_rays`,
+  12 placements, but one sliver a sixtieth of a cell high and one triangle within 2° of
+  edge-on); a falling piece of the branch is audited as a rigid mover (audit kind 19); an absent
+  field is culled whole (`grid::may_cross`); the ward's cull keeps 1.17 bricks for each its
+  surface crosses (phase 0's table 4: the premise was wrong).
+- Step 6: the landings are computed once, at the break, and kept (`ParryLoop`); the branch's
+  steepness is finite (`std::field::smax`).
+- Step 7: `exact_box_hit_fs` stays relaxed: written strict it cost SCENE 14's exact pass 5.23 to
+  12.09 ms on the M4; phase 5's specialization is to make room for it.
+
+Step 1 on the Radeon: its audit failed every kind with thousands of cracks from `be12bfd` on. A
+chunk's triangle kernels took a lane's edge as `id.x` less its brick in the chunk times 256, where
+that brick counts the slices before it, so every slice past a chunk's first meshed nothing: the
+M4 at its own step makes one slice a chunk and never saw it; at the Radeon's step
+(`WRELA_GPU_UNIT_FS=5000`) it did, and the gate now audits the M4 again at that step (`beaae9c`).
+
 ### Steps
 
 1. **Update `tools/gate.json` on both the M4 and the Radeon.**
@@ -422,6 +451,34 @@ radiance error rather than point-sampled sub-cell tessellation noise.
 
 Purpose: make moving and turning frames cost nearly the same as still frames, and deliver
 pop-free, crack-free continual LOD.
+
+**State (2026-11-27): not done.** Built so far: a held mesh is extracted for no eye, and its
+outline's exact cells are found each frame from what the extraction kept (`mesh::outline`, its
+certificates cached per vertex and its beside cells' proofs per slot); the view-fitted rings are
+made with slack and kept while they hold what the eye needs (`grids_hold`); every grid's corners
+are on the world's lattice (`grid_for`). M4, 1080p, gate medians: SCENE 10 VIEW 3 31.3 ms, VIEW 4
+(running) 68.3, VIEW 5 (turning) 54.7; SCENE 13 VIEW 3 83.8, VIEW 4 26.9, VIEW 5 19.4 (still: 20.8
+and 15.8). Against the 16.6 ms line the moving frames are 2 to 5 times over.
+
+Where the time goes (serial passes, frames 30 to 129): SCENE 10 VIEW 4, extraction 21.7 ms and
+the outline's certificates 15.9 (beside and kept cells 9.9); SCENE 13 VIEW 3, the exact pass 29.5,
+extraction 23.2, the sun's exact rays 6.7. A moving eye extracts a batch again every time its fit
+changes, all of it: running, the courtyard 135 times in 240 frames, about 19,800 bricks each; on
+the tour the table 116 times at 10,300. Most of those bricks are the same bricks as the last
+extraction's, and each extraction also empties the certificates' cache.
+
+What is next, in order:
+1. **Bricks kept across a fit's change.** The root grid's origin on the lattice of its bricks
+   (`BRICK` cells, not one), so a brick of a level is the same brick in every fit that has that
+   level's cell; a new fit re-extracts only the bricks whose level or seam neighbourhood changed,
+   as an edit's patch does now (`try_patch_dirty`: kill the old bricks' slots, append the new
+   ones), with the 2:1 seam bricks (those within a brick of a ring's face) always among them.
+   What the patch path lacks is the seam: a patched brick on a ring's face needs its coarse
+   neighbour's corners (`inherit_seam_corners`) and its seam cells (`box_seam_cells`). The slots'
+   outline records (`QuadRec`, `SlotBrick`) and the certificate cache stay with their slots.
+2. **The certificate cache by place, not by vertex**, so a re-extracted brick's vertices keep
+   their certificates (they are the same vertices, at the same bits, on the world's lattice).
+3. The exact pass's cost close up is phase 5's (the table's 37,303 exact cells on the tour).
 
 Build this phase in three independently gated stages.
 
@@ -610,6 +667,29 @@ Purpose: remove the remaining exact-cell proof debt on heavy showcase assets (`S
 ---
 
 ## 13. Phase 6: The parry — moving sand, contact enclosure, and instantaneous glass
+
+**State (2026-11-27).** Steps 1 to 4 are built:
+
+- Step 1: the thrown sand is `world::parry::SandVeil`, flung from the caster's other hand and
+  spreading to its reach across the bolt's way, then falling out. Its grains are far finer than a
+  pixel, so it is a medium (`engine::matter::medium::Medium`): its extinction is its mass in the
+  air over what a kilogram of quartz grains 0.15 mm across takes from a beam, `(m / V) 3 Q / (4 ρ
+  r)`, spread as `(1 - |q|²)²` (1.98 m⁻¹ at its middle once spread; `the_sands_cloud_holds_its_mass`
+  holds its mass to 0.005%). Meshed as thousands of 12 mm clumps it took SCENE 16 to 234 ms a
+  frame on the M4; as a medium 8.6 ms.
+- Step 2: `engine::matter::contact` finds the earliest moment two moving surfaces share a point
+  from the compiler's ranges over space and time (earliest-first boxes, a step bound, never
+  samples alone): the bolt's leader meets the sand's region (`SandHull`) at 1.0000088 s, sure, in
+  277 steps, the same bits every run (`the_bolt_meets_the_sand_when_the_contact_says_and_never_
+  before`, which also holds that no point of the bolt's path is in the region before it).
+- Step 3: the branch of glass is the bolt's path at `PARRY_HIT` kept to the sand's region then;
+  its six pieces' landings are computed once at the break and kept (`ParryLoop`).
+- Step 4: over a cast's moments the bolt, the branch and the sand's region are held to their
+  contracts by `verify_moving_soundness` (bound and steepness over boxes of space and time, and
+  how fast each changes), and every distance's work by its `@budget` at build.
+
+SCENE 16 draws the bolt lighting the sand, the branch hanging and cooling over it, and the pieces
+fallen on the court. Its gate on the Radeon waits on phase 1's Radeon gate.
 
 Purpose: complete the target game scene (`SCENE 16`) with a real moving sand veil and derive the
 fused glass branch from the instant the bolt meets the sand.
