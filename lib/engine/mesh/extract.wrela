@@ -21,7 +21,7 @@ use mesh::emit::{
     write_brick_meta, zero_chunk_counts,
 }
 use mesh::outline::{
-    SLOT_LINE, SLOT_WORDS, SlotBrick, certify_watched, clear_watch, clear_words, keep_slots, outline_quads,
+    SLOT_LINE, SLOT_WORDS, SlotBrick, certify_watched, uncertified, clear_watch, clear_words, keep_slots, outline_quads,
     thin_due, thin_watched, thin_watched_octants,
 }
 use mesh::grid::{
@@ -30,7 +30,8 @@ use mesh::grid::{
     DEFORM_SLICE, FrustumCull, GridSpec, MAX_LOD_LEVELS, MOST_INDICES_PER_BRICK, NONE, PATCH_MOST,
     SEAM_SLICE, SEAM_SLICES, SLICES_MOST, START_INDICES_PER_BRICK, START_TRANS_PER_BRICK,
     START_VERTS_PER_BRICK, SeamCell, SeamQuad, THIN_SLICE, THIN_SLICES, VERTS_BRICK, VERTS_STRIDE,
-    build_lod_grids_view, frustum_cull_none, frustum_cull_view, grid_for, may_cross, tight_aabb_rest,
+    build_lod_grids_view, frustum_cull_none, frustum_cull_view, grid_for, grids_hold, may_cross,
+    tight_aabb_rest,
 }
 use picture::eye::View
 use std::collections::Vec
@@ -178,6 +179,32 @@ pub struct ExtractScratch {
 /// The slices of `slice` cells that hold `cells`, no more than a prepared list's (`SLICES_MOST`).
 fn thin_most(slice: u32, cells: u32) -> u32 {
     clamp((cells + slice - 1) / max(slice, 1), 1, SLICES_MOST)
+}
+
+/// How far past a cell asked for (in levels) the level kept for it may be before it moves to
+/// the asked one's nearest (`snapped_level`).
+pub const LEVEL_SLACK: f32 = 0.75
+
+/// The power of two (its exponent) a cell `h` wide is meshed at, `prev` the last (0 for none):
+/// kept while `h` is within `LEVEL_SLACK` levels of it.
+fn snapped_level(h: f32, prev: f32) -> f32 {
+    let k = log2(max(h, 1.0e-6))
+    if prev != 0.0 && abs(k - prev) < LEVEL_SLACK { prev } else { round(k) }
+}
+
+/// A view-fitted mesh's slack (`MeshBatch::sync_one_lod`): its rings reach `FIT_REACH` times as
+/// far as the eye's need, its frustum is `FIT_WIDEN` times as wide, and it is kept while the eye
+/// stays within `FIT_STEP` of its nearest surface's distance of where the fit was made and turns
+/// less than the widening holds (`fit_cos`).
+pub const FIT_REACH: f32 = 1.3
+pub const FIT_WIDEN: f32 = 1.5
+pub const FIT_STEP: f32 = 0.15
+
+/// The cosine of the turn of the eye `v` a frustum `FIT_WIDEN` times as wide as its own holds:
+/// the difference of the two half angles, on the narrower (vertical) side.
+fn fit_cos(v: View) -> f32 {
+    let t = 1.18 / max(v.focal, 1.0e-4)
+    cos(atan(t * FIT_WIDEN) - atan(t))
 }
 
 /// The indirect dispatches extraction may make in a frame, of the host's 16,384: the rest are left
@@ -445,6 +472,17 @@ pub struct MeshBatch {
     lod_view_at: vec3,
     lod_view_fwd: vec3,
     lod_cut: bool,
+    /// The levels its cells are meshed at (`snapped_level`'s exponents), and its last fit (its
+    /// grids, their bricks, and the eye and the turn it was made for).
+    lod_kn: f32,
+    lod_kt: f32,
+    lod_fit: Vec<GridSpec>,
+    lod_fit_total: u32,
+    lod_fit_at: vec3,
+    lod_fit_fwd: vec3,
+    lod_fit_right: vec3,
+    lod_fit_up: vec3,
+    lod_fit_cos: f32,
     /// Whether the latest extraction meshed fewer chunks than it wanted, the frame's
     /// indirect-dispatch budget spent (`ExtractScratch::indirect_left`): it is extracted again
     /// each frame, though nothing it meshes has changed, until one is whole, and till then what
@@ -664,6 +702,15 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
         lod_view_at: vec3(0.0),
         lod_view_fwd: vec3(0.0, 0.0, -1.0),
         lod_cut: false,
+        lod_kn: 0.0,
+        lod_kt: 0.0,
+        lod_fit: Vec::new(),
+        lod_fit_total: 0,
+        lod_fit_at: vec3(0.0),
+        lod_fit_fwd: vec3(0.0, 0.0, 1.0),
+        lod_fit_right: vec3(1.0, 0.0, 0.0),
+        lod_fit_up: vec3(0.0, 1.0, 0.0),
+        lod_fit_cos: 2.0,
         budget_short: false,
         last_wanted: 0,
         last_alone: 0,
@@ -1086,8 +1133,38 @@ impl MeshBatch {
             bits: mut self.watch_bits,
             exact_cells: mut self.exact_cells,
         )
-        let cert_slice = lane_slice(kernel_work(cert_k), most: CERT_SLICE)
-        let cert_slices = self.watch_slices(self.watch_hint.x, cert_slice, CAP_SURF)
+        let cert_w = kernel_work(cert_k)
+        let certifies = cert_w <= limits().lane_work
+        let cert_slice = lane_slice(cert_w, most: CERT_SLICE)
+        let cert_slices = if certifies { self.watch_slices(self.watch_hint.x, cert_slice, CAP_SURF) } else { 0 }
+        if !certifies {
+            // Its certificate is past what an invocation may do here: its outline cells are solved.
+            dispatch(
+                prep_slices.bind(
+                    count: scratch.cert_cands.count(),
+                    cap: CAP_SURF,
+                    most: CAP_SURF,
+                    slices: 1,
+                    args: scratch.surf_args.span_mut(start: 0, count: 1),
+                ),
+                over: 1,
+            )
+            dispatch(
+                uncertified.bind(
+                    fields: fields,
+                    slots: self.slot_bricks.items(),
+                    cert_cands: scratch.cert_cands.items(),
+                    cert_count: scratch.cert_cands.count(),
+                    cap: CAP_SURF,
+                    origin: self.watch_origin,
+                    shift: self.watch_shift,
+                    bits: mut self.watch_bits,
+                    exact_cells: mut self.exact_cells,
+                ),
+                groups: scratch.surf_args.at(0),
+                most: (CAP_SURF + 63) / 64,
+            )
+        }
         dispatch(
             prep_slices.bind(
                 count: scratch.cert_cands.count(),
@@ -1138,7 +1215,7 @@ impl MeshBatch {
         copy(from: scratch.thin_cands.count().sub(start: 0, count: 1), to: self.watch_counts.span_mut(start: 1, count: 1))
         copy(from: self.thin_due.count().sub(start: 0, count: 1), to: self.watch_counts.span_mut(start: 2, count: 1))
         copy(from: self.exact_cells.count().sub(start: 0, count: 1), to: self.watch_counts.span_mut(start: 3, count: 1))
-        self.watch_taken = vec3u(cert_slices * cert_slice, dilated, kept)
+        self.watch_taken = vec3u(if certifies { cert_slices * cert_slice } else { CAP_SURF }, dilated, kept)
         self.has_exact = true
     }
 
@@ -2021,10 +2098,17 @@ impl MeshBatch {
         field: M,
         v: View,
         d_surf: f32,
-        h_near: f32,
-        h_top: f32,
+        h_near_asked: f32,
+        h_top_asked: f32,
         force_direct: bool,
     ) {
+        // The cells asked for, as powers of two, each kept while what is asked stays within
+        // `LEVEL_SLACK` of it: an eye moving or turning moves them by a level at a time, and only
+        // at its edges, so the grids (and every brick on them) stay as they were between.
+        self.lod_kn = snapped_level(h_near_asked, self.lod_kn)
+        self.lod_kt = max(snapped_level(h_top_asked, self.lod_kt), self.lod_kn)
+        let h_near = exp2(self.lod_kn)
+        let h_top = exp2(self.lod_kt)
         if !force_direct {
             if M::MAY_SKIN {
                 match field.skin_shape_hash() {
@@ -2114,7 +2198,7 @@ impl MeshBatch {
         }
         let area_budget = u32(base_budget * res_scale / (eff_cpx * eff_cpx))
         let root_min_ratio = if lip > 2.5 { 0.72 } else if is_st { 0.60 } else { 0.78 }
-        let (grids, total_bricks, has_seams) = build_lod_grids_view(
+        let (need, need_total, need_seams) = build_lod_grids_view(
             aabb,
             v,
             eff_near,
@@ -2127,17 +2211,61 @@ impl MeshBatch {
             root_min_ratio: root_min_ratio,
             shift: scratch.lattice,
         )
-        let fc = if has_seams { frustum_cull_view(v, margin: 1.18) } else { frustum_cull_none() }
+        // The last fit holds what this eye needs (its rings, and its frustum within the one its
+        // cull was made for): it is kept, and nothing is meshed again. Else a fit with slack
+        // (`FIT_REACH` farther, `FIT_WIDEN` wider), which the eyes near this one fit within.
+        let turn_ok = dot(v.forward, self.lod_fit_fwd) >= self.lod_fit_cos &&
+            length(v.at - self.lod_fit_at) <= FIT_STEP * max(z_near, 0.01)
+        let kept_fit = self.lod_fit.len() > 0 && (!need_seams || turn_ok) && grids_hold(self.lod_fit.clone(), need.clone())
+        var grids = take need
+        var total_bricks = need_total
+        var has_seams = need_seams
+        if kept_fit {
+            grids = self.lod_fit.clone()
+            total_bricks = self.lod_fit_total
+        } else if need_seams {
+            let (wide, wide_total, wide_seams) = build_lod_grids_view(
+                aabb,
+                v,
+                eff_near,
+                eff_top,
+                z_near: z_near,
+                orig_id: 0,
+                k_px: k_px / FIT_REACH,
+                max_parent_span: 128,
+                area_budget: area_budget,
+                root_min_ratio: root_min_ratio,
+                shift: scratch.lattice,
+                widen: FIT_WIDEN,
+            )
+            if grids_hold(wide.clone(), grids.clone()) {
+                grids = take wide
+                total_bricks = wide_total
+                has_seams = wide_seams
+            }
+            self.lod_fit_at = v.at
+            self.lod_fit_fwd = v.forward
+            self.lod_fit_right = v.right
+            self.lod_fit_up = v.up
+            self.lod_fit_cos = fit_cos(v)
+        }
+        if !kept_fit {
+            self.lod_fit = grids.clone()
+            self.lod_fit_total = total_bricks
+        }
+        // The cull's frustum is the fit's, widened as it was.
+        let fit_view = View { forward: self.lod_fit_fwd, right: self.lod_fit_right, up: self.lod_fit_up, at: self.lod_fit_at, ..v }
+        let fc = if has_seams { frustum_cull_view(fit_view, margin: 1.18 * FIT_WIDEN) } else { frustum_cull_none() }
         var h = Hasher::new()
         mesh_key(field, mut h)
         grids.len().state_hash(mut h)
         if has_seams {
-            i32(round(v.forward.x * 50.0)).state_hash(mut h)
-            i32(round(v.forward.y * 50.0)).state_hash(mut h)
-            i32(round(v.forward.z * 50.0)).state_hash(mut h)
-            i32(round(v.right.x * 50.0)).state_hash(mut h)
-            i32(round(v.right.y * 50.0)).state_hash(mut h)
-            i32(round(v.right.z * 50.0)).state_hash(mut h)
+            i32(round(self.lod_fit_fwd.x * 1000.0)).state_hash(mut h)
+            i32(round(self.lod_fit_fwd.y * 1000.0)).state_hash(mut h)
+            i32(round(self.lod_fit_fwd.z * 1000.0)).state_hash(mut h)
+            i32(round(self.lod_fit_at.x * 1000.0)).state_hash(mut h)
+            i32(round(self.lod_fit_at.y * 1000.0)).state_hash(mut h)
+            i32(round(self.lod_fit_at.z * 1000.0)).state_hash(mut h)
         }
         for i in 0..grids.len() {
             let g = grids[i]
