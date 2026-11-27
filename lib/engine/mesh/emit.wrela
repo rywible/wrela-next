@@ -785,6 +785,7 @@ fn emit_single_tri(
     a: u32,
     b: u32,
     c: u32,
+    dst: u32,
     span: f32,
     verts: [MeshVertex],
     cap_indices: u32,
@@ -810,11 +811,9 @@ fn emit_single_tri(
     let tc = unpack_is_trans(verts[c].packed)
     let is_trans = ta || tb || tc
     if !is_trans {
-        let at = tri_count.add(i: 0, value: 3)
-        if at + 3 > cap_indices {
-            return
+        if dst != NONE && dst + 3 <= cap_indices {
+            store_tri(mut indices, dst, a, b, c, local: local)
         }
-        store_tri(mut indices, at, a, b, c, local: local)
     } else {
         let at = tri_count.add(i: 1, value: 3)
         if at + 3 <= cap_trans {
@@ -860,12 +859,14 @@ pub(package) fn split_seam_13(
 
 /// Emits a 2:1 seam polygon `(v0, v1, v2, v3)` (3 distinct vertices -> 1 triangle; 4 distinct ->
 /// 1 quad split via `split_seam_13`), skipping degenerate edges where two adjacent quadrants share
-/// the same enclosing coarse cell.
+/// the same enclosing coarse cell. Opaque, it is written into the six indices its fine brick keeps
+/// for it at `dst` (what it draws less of left as triangles of no area); transmissive, appended.
 fn emit_seam_quad(
     v0: u32,
     v1: u32,
     v2: u32,
     v3: u32,
+    dst: u32,
     flip: bool,
     span: f32,
     verts: [MeshVertex],
@@ -897,9 +898,8 @@ fn emit_seam_quad(
             },
         }
         if !is_trans {
-            let at = tri_count.add(i: 0, value: 6)
-            if at + 6 <= cap_indices {
-                store_quad(mut indices, at, q0, q1, q2, q3, split13: s13, local: local)
+            if dst != NONE && dst + 6 <= cap_indices {
+                store_quad(mut indices, dst, q0, q1, q2, q3, split13: s13, local: local)
             }
         } else {
             let at = tri_count.add(i: 1, value: 6)
@@ -920,6 +920,7 @@ fn emit_seam_quad(
         q0,
         q1,
         q2,
+        dst: dst,
         span: span,
         verts: verts,
         cap_indices: cap_indices,
@@ -933,6 +934,7 @@ fn emit_seam_quad(
         q0,
         q2,
         q3,
+        dst: if dst == NONE { NONE } else { dst + 3 },
         span: span,
         verts: verts,
         cap_indices: cap_indices,
@@ -982,6 +984,48 @@ pub(package) fn parent_cell_of_p(g: GridSpec, qp: vec3u) -> vec3u {
 }
 
 /// Counts interior opaque indices (`0` or `6`) for one Multi-LOD owned edge along `axis`.
+/// Whether lane `(ex, ey, ez)` of brick `b` walks its edge along `axis` at `slot`: slot 0 its
+/// own edge, and slots 1 to 3, on a low 2:1 seam face of `g`, the edges a lattice line below it
+/// across that face (`- ub`, `- uc`, both), which no brick of `g` owns and whose quads cross the
+/// seam.
+pub(package) fn lod_edge_runs(g: GridSpec, b: vec3u, axis: u32, ex: u32, ey: u32, ez: u32, slot: u32) -> bool {
+    let eb = if axis == 0 { ey } else if axis == 1 { ez } else { ex }
+    let ec = if axis == 0 { ez } else if axis == 1 { ex } else { ey }
+    let bb = if axis == 0 { b.y } else if axis == 1 { b.z } else { b.x }
+    let bc = if axis == 0 { b.z } else if axis == 1 { b.x } else { b.y }
+    let mb: u32 = if axis == 0 { 4 } else if axis == 1 { 16 } else { 1 }
+    let mc: u32 = if axis == 0 { 16 } else if axis == 1 { 1 } else { 4 }
+    if slot == 0 {
+        true
+    } else if slot == 1 {
+        eb == 0 && bb == 0 && (g.seam_mask & mb) != 0
+    } else if slot == 2 {
+        ec == 0 && bc == 0 && (g.seam_mask & mc) != 0
+    } else {
+        eb == 0 && ec == 0 && bb == 0 && bc == 0 &&
+            ((g.seam_mask & mb) != 0 || (g.seam_mask & mc) != 0)
+    }
+}
+
+/// The first corner of the edge `lod_edge_runs` walks at `slot` from its own (`lp0`).
+pub(package) fn lod_edge_at(axis: u32, lp0: vec3u, slot: u32) -> vec3u {
+    let ub = if axis == 0 { vec3u(0, 1, 0) } else if axis == 1 { vec3u(0, 0, 1) } else {
+        vec3u(1, 0, 0)
+    }
+    let uc = if axis == 0 { vec3u(0, 0, 1) } else if axis == 1 { vec3u(1, 0, 0) } else {
+        vec3u(0, 1, 0)
+    }
+    if slot == 0 {
+        lp0
+    } else if slot == 1 {
+        lp0 - ub
+    } else if slot == 2 {
+        lp0 - uc
+    } else {
+        lp0 - ub - uc
+    }
+}
+
 fn count_lod_edge(
     g: GridSpec,
     b: vec3u,
@@ -1020,11 +1064,13 @@ fn count_lod_edge(
         cell_in_hole_p(g, q3p) {
         return 0
     }
+    // A quad across a 2:1 seam face: its fine brick keeps six indices for it (`finish_seam_tris`
+    // writes them, a triangle of no area where it draws less).
     if cell_outside_seam_p(g, q0p) ||
         cell_outside_seam_p(g, q1p) ||
         cell_outside_seam_p(g, q2p) ||
         cell_outside_seam_p(g, q3p) {
-        return 0
+        return 6
     }
     let l0 = q0p - vec3u(1, 1, 1) - bbase
     let l1 = q1p - vec3u(1, 1, 1) - bbase
@@ -1075,40 +1121,33 @@ pub(package) fn count_brick_tris_lod(
     let g = grids[ab.coord.w]
     let cbase = brick_in_chunk * CORNERS_BRICK
     let vbase = brick_in_chunk * VERTS_STRIDE
+    // The edges `emit_tris_lod` walks, the same ones (`lod_edge_runs`): its own, and on a low
+    // seam face the edges below it, whose quads cross the seam.
     var cnt: u32 = 0
-    cnt += count_lod_edge(
-        g,
-        b,
-        axis: 0,
-        lp: vec3u(ex, ey + 1, ez + 1),
-        cbase: cbase,
-        vbase: vbase,
-        corners: corners,
-        cell_verts: cell_verts,
-        verts: verts,
-    )
-    cnt += count_lod_edge(
-        g,
-        b,
-        axis: 1,
-        lp: vec3u(ex + 1, ey, ez + 1),
-        cbase: cbase,
-        vbase: vbase,
-        corners: corners,
-        cell_verts: cell_verts,
-        verts: verts,
-    )
-    cnt += count_lod_edge(
-        g,
-        b,
-        axis: 2,
-        lp: vec3u(ex + 1, ey + 1, ez),
-        cbase: cbase,
-        vbase: vbase,
-        corners: corners,
-        cell_verts: cell_verts,
-        verts: verts,
-    )
+    for axis in 0..3 {
+        let lp0 = if axis == 0 {
+            vec3u(ex, ey + 1, ez + 1)
+        } else if axis == 1 {
+            vec3u(ex + 1, ey, ez + 1)
+        } else {
+            vec3u(ex + 1, ey + 1, ez)
+        }
+        for slot in 0..4 {
+            if lod_edge_runs(g, b, axis, ex, ey, ez, slot) {
+                cnt += count_lod_edge(
+                    g,
+                    b,
+                    axis: axis,
+                    lp: lod_edge_at(axis, lp0, slot),
+                    cbase: cbase,
+                    vbase: vbase,
+                    corners: corners,
+                    cell_verts: cell_verts,
+                    verts: verts,
+                )
+            }
+        }
+    }
     if cnt > 0 {
         let _ = brick_idx_counts.add(i: brick_in_chunk, value: cnt)
     }
@@ -1230,12 +1269,23 @@ fn process_lod_edge(
         )
         return
     }
+    // Its six indices in its brick's slice, drawn as nothing until `finish_seam_tris` writes the
+    // quad (and left so where the seam's lists are full).
+    let used = brick_idx_counts.add(i: brick_in_chunk, value: 6)
+    let at = brick_idx_offsets[brick_in_chunk] + used
+    let dst = if at + 6 <= cap_indices { at } else { NONE }
+    let fine = if !o0 { q0p } else if !o1 { q1p } else if !o2 { q2p } else { q3p }
+    let fl = fine - vec3u(1, 1, 1) - bbase
+    let fv = cv(cell_verts, vbase, fl.x, fl.y, fl.z)
+    if dst != NONE {
+        store_nothing(mut indices, dst, if fv == NONE { 0 } else { fv }, count: 6)
+    }
     let qi = seam_quads.push(
         SeamQuad {
             flags: if flip { 1 } else { 0 },
-            pad0: 0,
+            dst,
             span: 2.0 * QUAD_SPAN * g.cell,
-            pad2: 0,
+            slot,
         },
     )
     if qi >= CAP_SEAM {
@@ -1343,18 +1393,6 @@ pub(package) fn emit_tris_lod(
     let brick_slot = slot_base[0] + bi
 
     for axis in 0..3 {
-        let eb = if axis == 0 { ey } else if axis == 1 { ez } else { ex }
-        let ec = if axis == 0 { ez } else if axis == 1 { ex } else { ey }
-        let bb = if axis == 0 { b.y } else if axis == 1 { b.z } else { b.x }
-        let bc = if axis == 0 { b.z } else if axis == 1 { b.x } else { b.y }
-        let mb: u32 = if axis == 0 { 4 } else if axis == 1 { 16 } else { 1 }
-        let mc: u32 = if axis == 0 { 16 } else if axis == 1 { 1 } else { 4 }
-        let ub = if axis == 0 { vec3u(0, 1, 0) } else if axis == 1 { vec3u(0, 0, 1) } else {
-            vec3u(1, 0, 0)
-        }
-        let uc = if axis == 0 { vec3u(0, 0, 1) } else if axis == 1 { vec3u(1, 0, 0) } else {
-            vec3u(0, 1, 0)
-        }
         let lp0 = if axis == 0 {
             vec3u(ex, ey + 1, ez + 1)
         } else if axis == 1 {
@@ -1363,29 +1401,8 @@ pub(package) fn emit_tris_lod(
             vec3u(ex + 1, ey + 1, ez)
         }
         for slot in 0..4 {
-            let run = if slot == 0 {
-                true
-            } else if slot == 1 {
-                eb == 0 && bb == 0 && (g.seam_mask & mb) != 0
-            } else if slot == 2 {
-                ec == 0 && bc == 0 && (g.seam_mask & mc) != 0
-            } else {
-                eb == 0 &&
-                    ec == 0 &&
-                    bb == 0 &&
-                    bc == 0 &&
-                    ((g.seam_mask & mb) != 0 || (g.seam_mask & mc) != 0)
-            }
-            if run {
-                let lp = if slot == 0 {
-                    lp0
-                } else if slot == 1 {
-                    lp0 - ub
-                } else if slot == 2 {
-                    lp0 - uc
-                } else {
-                    lp0 - ub - uc
-                }
+            if lod_edge_runs(g, b, axis, ex, ey, ez, slot) {
+                let lp = lod_edge_at(axis, lp0, slot)
                 process_lod_edge(
                     g,
                     b,
@@ -1574,9 +1591,12 @@ pub(package) fn box_seam_cells<M: Field<Substance>>(
     grids: [GridSpec],
     seam_cells: [SeamCell],
     seam_cell_count: [u32],
+    seam_quads: [SeamQuad],
     first: u32,
+    cap_exact_slots: u32,
     seam_seen: mut Atomics<u32>,
     exact_cells: mut Append<ExactCell>,
+    exact_slots: mut Atomics<u32>,
     id: GlobalId,
 ) {
     let idx = first + id.x
@@ -1596,7 +1616,10 @@ pub(package) fn box_seam_cells<M: Field<Substance>>(
         ALL_LIVE,
         0,
     )
-    let _ = exact_cells.push(ExactCell { lo, h: pg.cell, live: pr.live })
+    let ei = exact_cells.push(ExactCell { lo, h: pg.cell, live: pr.live })
+    if ei < cap_exact_slots {
+        exact_slots.store(i: ei, value: seam_quads[sc.quad_idx].slot)
+    }
 }
 
 /// Pass 3c (Multi-LOD): Exact Hermite QEF + Newton snap for sharp-crease coarse parent cells on
@@ -1685,6 +1708,7 @@ pub(package) fn finish_seam_tris(
         seam_verts[base + 1],
         seam_verts[base + 2],
         seam_verts[base + 3],
+        dst: sq.dst,
         flip: (sq.flags & 1) != 0,
         span: sq.span,
         verts: verts,
@@ -1697,16 +1721,8 @@ pub(package) fn finish_seam_tris(
     )
 }
 
-/// Records the opaque index count before Multi-LOD seam triangles are appended so `finish_draw`
-/// can emit a dedicated `seam_draw_args` for the seam strip alongside per-brick `brick_draws`.
-@strict
-@compute(1)
-pub(package) fn record_seam_start(tri_count: [u32], seam_start: mut One<u32>, id: GlobalId) {
-    seam_start.set(id, tri_count[0])
-}
-
-/// Pass 4: Writes the final `DrawIndexedArgs` for opaque (`tri_count[0]`), transmissive
-/// (`tri_count[1]`), cut-out (`tri_count[6]`), and Multi-LOD seam strip (`seam_start[0]..n`),
+/// Pass 4: Writes the final `DrawIndexedArgs` for opaque (`tri_count[0]`: every brick's slice,
+/// a 2:1 seam's stitch among them), transmissive (`tri_count[1]`), cut-out (`tri_count[6]`),
 /// and records the active bricks, vertices pushed (`tri_count[2]`, `[3]`, counted past capacity
 /// too), and sticky `OVERFLOW_*` bitflags (`tri_count[7]`) so one deferred readback
 /// (`MeshBatch::finish_poll`) learns what was drawn and which capacity overflowed.
@@ -1718,7 +1734,6 @@ pub(package) fn finish_draw(
     seam_quad_count: [u32],
     seam_cell_count: [u32],
     exact_count: [u32],
-    seam_start: [u32],
     has_seams: u32,
     cap_indices: u32,
     cap_trans: u32,
@@ -1728,7 +1743,6 @@ pub(package) fn finish_draw(
     args: mut One<DrawIndexedArgs>,
     trans_args: mut One<DrawIndexedArgs>,
     cut_args: mut One<DrawIndexedArgs>,
-    seam_args: mut One<DrawIndexedArgs>,
     exact_args: mut One<DrawIndexedArgs>,
     id: GlobalId,
 ) {
@@ -1738,15 +1752,6 @@ pub(package) fn finish_draw(
         indices: n,
         instances: if n > 0 { inst_count } else { 0 },
         first_index: 0,
-        base_vertex: 0,
-        first_instance: 0,
-    })
-    let ss = if has_seams != 0 { min(seam_start[0], n) } else { n }
-    let sn = n - ss
-    seam_args.set(id, DrawIndexedArgs {
-        indices: sn,
-        instances: if sn > 0 { inst_count } else { 0 },
-        first_index: ss,
         base_vertex: 0,
         first_instance: 0,
     })

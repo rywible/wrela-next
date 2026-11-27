@@ -16,7 +16,7 @@ use mesh::dc::{
 use mesh::emit::{
     SEAM_SEEN, box_seam_cells, reset_dirty_bricks, reset_seam_seen,
     count_brick_tris, count_brick_tris_lod, emit_tris, emit_tris_lod, finish_draw,
-    finish_draw_patch, finish_seam_tris, note_seams, record_seam_start,
+    finish_draw_patch, finish_seam_tris, note_seams,
     refine_seam_creases, scan_chunk_offsets, set_exact_args, set_instances, solve_seam_smooth,
     write_brick_meta, zero_chunk_counts,
 }
@@ -26,14 +26,7 @@ use mesh::outline::{
     place_cert_append, place_cert_link, reset_place_cert, stale_beside, thin_due, thin_watched,
     thin_watched_octants, uncertified, zero_words,
 }
-use mesh::pool::{
-    COMPACT_GROUPS, COMPACT_PER_GROUP, GATE_EXACT, GATE_MISSES, GATE_NONE, GATE_POOL_EXACT, GATE_QUADS,
-    GATE_SEAMS, GATE_THIN, GATE_VERTS, GATE_WORDS, POOL_MARK_WORDS, POOL_META_WORDS, SEAM_SLOTS_CAP,
-    compact_append_seam_strip, compact_copy_indices, compact_count_groups, compact_local_offsets,
-    compact_pool_exact, compact_scan_groups, compact_seam_exact, cut_bounds, finish_pool_draw, pool_clear_alive,
-    pool_decide, pool_insert, pool_mark_alive, pool_probe, pool_write_meta, prep_compact_args,
-    prep_zero_seam_certs, reset_pool_hash, save_pool_marks, zero_seam_certs,
-}
+use mesh::pool::{BrickPool, COMPACT_GROUPS, COMPACT_PER_GROUP, GATE_WORDS, brick_pool}
 use mesh::grid::{
     ActiveBrick, BrickBound, CAP_EXACT_MAX, CAP_SEAM, CAP_SURF, CERT_SLICE,
     CHUNK_BRICKS, COLD_CREASE_SLICES, CORNERS_BRICK, CREASE_SLICE, CREASE_SLICE_LEAST, CULL_CHUNK, CUT_BRICKS,
@@ -182,23 +175,18 @@ pub struct ExtractScratch {
     pub place_cert_new_slots: GpuBuffer<u32>,
     /// Transient GPU workspace for `BrickPool` probing, seam extraction, and active-cut compaction.
     pub miss_interior: AppendBuffer<ActiveBrick>,
-    pub active_seam: AppendBuffer<ActiveBrick>,
     pub draw_slots: AppendBuffer<u32>,
     pub draw_slot_dst: GpuBuffer<u32>,
     pub compact_group_sums: GpuBuffer<u32>,
     pub compact_group_offsets: GpuBuffer<u32>,
     pub compact_copy_args: GpuBuffer<DispatchArgs>,
-    pub compact_seam_args: GpuBuffer<DispatchArgs>,
     pub compact_exact_args: GpuBuffer<DispatchArgs>,
-    pub compact_seam_exact_args: GpuBuffer<DispatchArgs>,
-    pub zero_seam_args: GpuBuffer<DispatchArgs>,
-    pub seam_strip_indices: GpuBuffer<u32>,
-    pub seam_tri_count: GpuBuffer<u32>,
-    pub seam_exact_cells: AppendBuffer<ExactCell>,
     pub pool_stats: GpuBuffer<u32>,
     /// What a pool update's `pool_decide` said (`mesh::pool::GATE_*`), and `pool_mark_alive`'s
     /// dispatch.
     pub pool_gate: GpuBuffer<u32>,
+    /// The slots a pool's commit draws (none when it draws nothing new).
+    pub pool_drawn_slots: GpuBuffer<u32>,
     pub alive_args: GpuBuffer<DispatchArgs>,
     pub max_bricks: u32,
     pub grids_cap: u32,
@@ -217,7 +205,7 @@ pub struct ExtractScratch {
 
 /// Zeroes `count` words of `buf` in chunks of at most `2097152` elements (`32768` workgroups,
 /// well below Metal/Vulkan's `65535` per-dimension dispatch limit).
-fn zero_u32_buf(buf: mut GpuBuffer<u32>, count: u32) {
+pub(package) fn zero_u32_buf(buf: mut GpuBuffer<u32>, count: u32) {
     let chunk: u32 = 2097152
     var off: u32 = 0
     while off < count {
@@ -254,13 +242,27 @@ pub const FIT_REACH: f32 = 1.3
 /// to the swarm, skinning and the passes that follow.
 pub const EXTRACT_INDIRECT: u32 = 12288
 
-/// The pool updates whose cuts are kept for their readbacks (`MeshBatch::pool_pending`): more than
-/// the frames a readback takes.
-const POOL_PENDING: u32 = 6
+/// How one chunk of bricks is meshed (`MeshBatch::mesh_chunk_cells`, `mesh_chunk_quads`): its
+/// first brick in the list and how many, the list's cap, whether its grids are nested
+/// (`lod`: the LOD kernels) with 2:1 seams (`inherit`: a seam face's corners the coarser
+/// level's), the extraction's `held` and steepness, whether its vertices keep parts, the slots
+/// its bricks may take, and its crease slices.
+pub(package) struct ChunkMesh: Copy {
+    pub(package) chunk_start: u32,
+    pub(package) chunk_n: u32,
+    pub(package) cap_bricks: u32,
+    pub(package) lod: bool,
+    pub(package) inherit: bool,
+    pub(package) held: u32,
+    pub(package) lip: f32,
+    pub(package) uses_kept: bool,
+    pub(package) max_slots: u32,
+    pub(package) crease_slices: u32,
+}
 
 /// The words of a batch's `tri_count` (`mesh::pool::finish_pool_draw` says what each is), all read
 /// back.
-const TRI_WORDS: u32 = 20
+pub(package) const TRI_WORDS: u32 = 20
 
 /// The indirect dispatches a chunk of `run_extract` makes besides its crease slices.
 const CHUNK_INDIRECT: u32 = 7
@@ -317,21 +319,15 @@ pub fn extract_scratch(max_bricks: u32, lattice: vec3, cell_px: f32 = CELL_PX) -
         place_cert_new: append_buffer(CAP_SURF),
         place_cert_new_slots: buffer(CAP_SURF),
         miss_interior: append_buffer(max_bricks),
-        active_seam: append_buffer(SEAM_SLOTS_CAP),
         draw_slots: append_buffer(compact_cap),
         draw_slot_dst: buffer(compact_cap),
         compact_group_sums: buffer(COMPACT_GROUPS),
         compact_group_offsets: buffer(COMPACT_GROUPS),
         compact_copy_args: buffer_of([DispatchArgs { x: 0, y: 1, z: 1 }]),
-        compact_seam_args: buffer_of([DispatchArgs { x: 0, y: 1, z: 1 }]),
         compact_exact_args: buffer_of([DispatchArgs { x: 0, y: 1, z: 1 }]),
-        compact_seam_exact_args: buffer_of([DispatchArgs { x: 0, y: 1, z: 1 }]),
-        zero_seam_args: buffer_of([DispatchArgs { x: 0, y: 1, z: 1 }]),
-        seam_strip_indices: buffer(CAP_SEAM * 6),
-        seam_tri_count: buffer(16),
-        seam_exact_cells: append_buffer(CAP_SEAM * 2),
         pool_stats: buffer(8),
         pool_gate: buffer(GATE_WORDS),
+        pool_drawn_slots: buffer_of([0]),
         alive_args: buffer_of([DispatchArgs { x: 0, y: 1, z: 1 }]),
         max_bricks,
         grids_cap,
@@ -413,20 +409,20 @@ pub struct MeshBatch {
     /// Per-vertex kept part (`part | trans`) and packed story (`pack_kept`), allocated and filled
     /// ONLY when `field.uses_kept()` is true (dummy 2-u32 buffer otherwise).
     pub vert_kept: GpuBuffer<u32>,
-    vert_kept_cap: u32,
-    keep_slice: u32,
-    keep_args: GpuBuffer<DispatchArgs>,
-    keep_first: GpuBuffer<u32>,
+    pub(package) vert_kept_cap: u32,
+    pub(package) keep_slice: u32,
+    pub(package) keep_args: GpuBuffer<DispatchArgs>,
+    pub(package) keep_first: GpuBuffer<u32>,
     /// Packed 8-byte per-vertex skin weights (`[bones_u32, weights_u32]` per vertex); allocated
     /// ONLY when `is_skinned` is true (dummy 2-u32 buffer otherwise).
     pub skin_verts: GpuBuffer<u32>,
-    skin_cap: u32,
+    pub(package) skin_cap: u32,
     /// Exact deformed local vertices (`One<Skinned>` DQS + Newton projection) and previous-frame
     /// deformed vertices for exact TSR motion vectors (dummy 1-vertex buffers when not deformed).
     pub deformed_verts: GpuBuffer<MeshVertex>,
     pub prev_deformed_verts: GpuBuffer<MeshVertex>,
-    deformed_cap: u32,
-    prev_deformed_dirty: bool,
+    pub(package) deformed_cap: u32,
+    pub(package) prev_deformed_dirty: bool,
     pub is_deformed: bool,
     pub indices: GpuBuffer<u32>,
     pub trans_indices: GpuBuffer<u32>,
@@ -437,9 +433,6 @@ pub struct MeshBatch {
     pub draw_args: GpuBuffer<DrawIndexedArgs>,
     pub trans_draw_args: GpuBuffer<DrawIndexedArgs>,
     pub cut_draw_args: GpuBuffer<DrawIndexedArgs>,
-    /// Multi-LOD seam strip draw args (`first_index = seam_start[0]`, `indices = n - seam_start[0]`).
-    pub seam_draw_args: GpuBuffer<DrawIndexedArgs>,
-    pub seam_start: GpuBuffer<u32>,
     /// Tier-2 Exact-Bracket cell AABBs (silhouette, grazing, budget-capped, and sub-cell thin features).
     pub exact_cells: AppendBuffer<ExactCell>,
     pub exact_draw_args: GpuBuffer<DrawIndexedArgs>,
@@ -448,11 +441,11 @@ pub struct MeshBatch {
     /// The eye its last full extraction found exact cells for (`w`: its pixel's width a metre
     /// out; 0 for none), and the field's bound there: what a patch (`try_patch_dirty`) finds the
     /// patched bricks' exact cells for.
-    exact_eye: vec4,
+    pub(package) exact_eye: vec4,
     /// The most the eye moves before the next extraction for it (`eye_step`'s cube): how near
     /// grazing a facing test counts a plane as both (`facing`).
-    eye_reach: f32,
-    exact_lip: f32,
+    pub(package) eye_reach: f32,
+    pub(package) exact_lip: f32,
     /// Per-brick world-space AABBs (`32 B`), alive flags (`4 B`), and packed `DrawIndexedArgs`
     /// (`20 B`) powering both 2-pass Reversed-Z Hi-Z occlusion culling (`draw_multi()`) and
     /// `< 0.15 ms` in-place dirty-region CSG re-extraction (`Edited<M>`).
@@ -466,34 +459,34 @@ pub struct MeshBatch {
     pub cpu_brick_slots: u32,
     pub template_lo: vec3,
     pub template_hi: vec3,
-    edit_base_hash: u64,
-    edit_field_hash: u64,
-    edit_base_bound: vec4,
-    edit_view_at: vec3,
-    edit_view_fwd: vec3,
-    edit_grids: Vec<GridSpec>,
+    pub(package) edit_base_hash: u64,
+    pub(package) edit_field_hash: u64,
+    pub(package) edit_base_bound: vec4,
+    pub(package) edit_view_at: vec3,
+    pub(package) edit_view_fwd: vec3,
+    pub(package) edit_grids: Vec<GridSpec>,
     /// Each part's state hash and box at the last extraction (`part_states`), where every part
     /// could say: a later field whose hash moved in some parts only is patched in their bricks.
-    part_hashes: Vec<u64>,
-    part_boxes: Vec<Box3>,
-    edit_append_cursor: u32,
+    pub(package) part_hashes: Vec<u64>,
+    pub(package) part_boxes: Vec<Box3>,
+    pub(package) edit_append_cursor: u32,
     pub xforms: GpuBuffer<Rigid>,
     pub prev_xforms: GpuBuffer<Rigid>,
     pub inst_ids: GpuBuffer<u32>,
-    xforms_cap: u32,
-    prev_xforms_dirty: bool,
+    pub(package) xforms_cap: u32,
+    pub(package) prev_xforms_dirty: bool,
     /// Per-instance Dual Quaternion bone palettes (`inst_count * bone_stride`); dummy 1-element
     /// buffers when non-skinned.
     pub bones: GpuBuffer<DualQuat>,
     pub prev_bones: GpuBuffer<DualQuat>,
-    bones_cap: u32,
-    prev_bones_dirty: bool,
+    pub(package) bones_cap: u32,
+    pub(package) prev_bones_dirty: bool,
     pub is_skinned: bool,
     pub bone_stride: u32,
     pub inst_count: u32,
-    extracted_xform: Rigid,
-    shape_key: u64,
-    is_rigid_cached: bool,
+    pub(package) extracted_xform: Rigid,
+    pub(package) shape_key: u64,
+    pub(package) is_rigid_cached: bool,
     pub instanced: bool,
     pub max_bricks: u32,
     pub cap_bricks: u32,
@@ -514,50 +507,50 @@ pub struct MeshBatch {
     /// transmissive triangles: a batch whose read counts never did is patched in place (its
     /// transmissive triangles are made by its materials, which a patch doesn't change), whatever
     /// extraction the counts were of.
-    trans_read: bool,
-    trans_ever: bool,
-    trans_field_key: u64,
-    stats_poll: Option<Pending<u32>>,
+    pub(package) trans_read: bool,
+    pub(package) trans_ever: bool,
+    pub(package) trans_field_key: u64,
+    pub(package) stats_poll: Option<Pending<u32>>,
     /// The extraction last read back. Every real extraction is read, as a settled read
     /// (`std::gpu::read_settled`): answered once the GPU has done it, a frame or two later, and
     /// never by stalling a frame; one at a time, so a thing that extracts every frame has its
     /// limits from an extraction at most a few frames old, which their headroom covers (and past
     /// it `took_counts` extracts again).
-    polled_gen: u32,
+    pub(package) polled_gen: u32,
     /// How many times `tri_count` has been rewritten (extractions and emptyings), whether the
     /// latest was a real extraction, and the cell scale it ran at.
-    gen: u32,
-    gen_real: bool,
-    extract_scale: f32,
+    pub(package) gen: u32,
+    pub(package) gen_real: bool,
+    pub(package) extract_scale: f32,
     /// The same for the extraction the pending readback reads, with the capacities it ran under
     /// (`cap_verts`, `cap_indices`, `cap_trans`, `max_bricks`).
-    poll_gen: u32,
-    poll_real: bool,
-    poll_scale: f32,
-    poll_caps: vec4u,
+    pub(package) poll_gen: u32,
+    pub(package) poll_real: bool,
+    pub(package) poll_scale: f32,
+    pub(package) poll_caps: vec4u,
     /// The bricks each extraction meshes chunks for (`chunk_limit`): what the latest readback's
     /// active bricks (`active_hint`, of `hint_total` candidates) say with headroom, or every one
     /// that can be active. The latest extraction's candidates and limit, and the pending
     /// readback's.
-    active_hint: u32,
-    hint_total: u32,
+    pub(package) active_hint: u32,
+    pub(package) hint_total: u32,
     /// The eye the latest view-dependent extraction was made for, and whether the one being made
     /// now follows a cut (`is_cut`): the latest readback's active bricks then say little of this
     /// view's, so `chunk_limit` meshes chunks for up to `CUT_BRICKS`.
-    lod_view_at: vec3,
-    lod_view_fwd: vec3,
-    lod_cut: bool,
+    pub(package) lod_view_at: vec3,
+    pub(package) lod_view_fwd: vec3,
+    pub(package) lod_cut: bool,
     /// The levels its cells are meshed at (`snapped_level`'s exponents), and its last fit (its
     /// grids, their bricks, and the eye and the turn it was made for).
-    lod_kn: f32,
-    lod_kt: f32,
-    lod_fit: Vec<GridSpec>,
-    lod_fit_total: u32,
-    lod_fit_at: vec3,
-    lod_fit_fwd: vec3,
-    lod_fit_right: vec3,
-    lod_fit_up: vec3,
-    lod_fit_cos: f32,
+    pub(package) lod_kn: f32,
+    pub(package) lod_kt: f32,
+    pub(package) lod_fit: Vec<GridSpec>,
+    pub(package) lod_fit_total: u32,
+    pub(package) lod_fit_at: vec3,
+    pub(package) lod_fit_fwd: vec3,
+    pub(package) lod_fit_right: vec3,
+    pub(package) lod_fit_up: vec3,
+    pub(package) lod_fit_cos: f32,
     /// Whether the latest extraction meshed fewer chunks than it wanted, the frame's
     /// indirect-dispatch budget spent (`ExtractScratch::indirect_left`): it is extracted again
     /// each frame, though nothing it meshes has changed, until one is whole, and till then what
@@ -565,53 +558,53 @@ pub struct MeshBatch {
     pub budget_short: bool,
     /// The last extraction's sizes, for the audit's word on an unsettled eye: the bricks it
     /// wanted, what a frame's whole budget meshes, and the indirect dispatches a chunk makes.
-    last_wanted: u32,
-    last_alone: u32,
-    last_per_chunk: u32,
+    pub(package) last_wanted: u32,
+    pub(package) last_alone: u32,
+    pub(package) last_per_chunk: u32,
     /// True only when this batch holds a complete, un-truncated extraction (`!budget_short`),
     /// sealing `(Meshlets, ExactCover)` so a later tight-budget frame preserves the prior complete
     /// mesh instead of publishing a partial holey extraction.
     pub certified: bool,
-    extract_total: u32,
-    extract_limit: u32,
-    poll_total: u32,
-    poll_limit: u32,
+    pub(package) extract_total: u32,
+    pub(package) extract_limit: u32,
+    pub(package) poll_total: u32,
+    pub(package) poll_limit: u32,
     /// The most creases a chunk of the latest read extraction held (`crease_slices`).
-    crease_hint: u32,
+    pub(package) crease_hint: u32,
     /// Work-sized crease and surface slice sizes for the field extracted now (`crease_slice`,
     /// `surf_slice`).
-    crease_slice: u32,
+    pub(package) crease_slice: u32,
     /// `refine_seam_creases`' cells a dispatch, by its own bound (`kernel_work`).
-    seam_crease_slice: u32,
-    surf_slice: u32,
+    pub(package) seam_crease_slice: u32,
+    pub(package) surf_slice: u32,
     /// The bricks one `inherit_seam_corners` dispatch takes (512 invocations a brick), and the
     /// seam cells one `solve_seam_smooth` or `box_seam_cells` dispatch takes (at most
     /// `SEAM_SLICE`; the Radeon refused 16,384 of the study's, 932,186 work an invocation).
-    inherit_slice: u32,
-    seam_slice: u32,
+    pub(package) inherit_slice: u32,
+    pub(package) seam_slice: u32,
     /// The bricks a dispatch of a chunk's corner kernel takes, and of its triangle kernels
     /// (`dc::brick_slice`).
-    eval_slice: u32,
-    quad_slice: u32,
+    pub(package) eval_slice: u32,
+    pub(package) quad_slice: u32,
     /// The dispatches a crease slice's solves take for the field extracted now (`crease_passes`
     /// of `crease_part` of `crease_step_cost_of`, or of `crease_step_cost_rest_of` at rest).
-    crease_passes: u32,
+    pub(package) crease_passes: u32,
     /// The seam cells of the latest read extraction (`seam_slices`).
-    seam_hint: u32,
+    pub(package) seam_hint: u32,
     /// The latest readback's, for `took_counts`.
-    seam_read: u32,
+    pub(package) seam_read: u32,
     /// The rest mesh's vertex count as a readback of extraction `verts_gen` gave it (`deform`).
-    verts_known: u32,
-    verts_gen: u32,
+    pub(package) verts_known: u32,
+    pub(package) verts_gen: u32,
     /// Every requested cell is multiplied by this (at least 1): raised when a readback finds more
     /// active bricks than `max_bricks` (a brick count goes as `1 / cell²`), lowered as the need goes.
-    cell_scale: f32,
+    pub(package) cell_scale: f32,
     /// Output budgets per brick, doubled when a readback finds them overflowed.
-    verts_per_brick: u32,
-    indices_per_brick: u32,
-    trans_per_brick: u32,
+    pub(package) verts_per_brick: u32,
+    pub(package) indices_per_brick: u32,
+    pub(package) trans_per_brick: u32,
     /// Sticky `OVERFLOW_*` bitmask reported by the latest settled extraction readback (`0` = clean).
-    overflow_flags: u32,
+    pub(package) overflow_flags: u32,
     /// The thing of its `Pool` this batch meshes as a `One` (it came near the eye), or `NONE`.
     pub near_id: u32,
     /// Whether more of its `Pool`'s things came near than the pool has such batches
@@ -619,9 +612,9 @@ pub struct MeshBatch {
     pub near_over: bool,
     /// The instanced paths' last instance slots on the CPU (thing per slot, its transform and
     /// bones), so each thing's previous-frame transform follows the thing, not the slot.
-    cpu_ids: Vec<u32>,
-    cpu_xforms: Vec<Rigid>,
-    cpu_bones: Vec<DualQuat>,
+    pub(package) cpu_ids: Vec<u32>,
+    pub(package) cpu_xforms: Vec<Rigid>,
+    pub(package) cpu_bones: Vec<DualQuat>,
     /// What this batch has done since its counts were last asked (`extraction_counts`): real
     /// extractions (whole or patched), readbacks of them, and the active bricks those read.
     /// Whether the exact pass holds this mesh, its outline found each frame for that frame's eye
@@ -629,89 +622,222 @@ pub struct MeshBatch {
     /// bits, its opaque quads, its thin cells and their proofs, its vertices' certificates, the
     /// exact cells it gave for every eye (`exact_base`: how many), and the lattice's origin and
     /// placement. The eye and the extraction its outline was last found for.
-    watched: bool,
-    watch_bits: GpuBuffer<u32>,
-    slot_bricks: GpuBuffer<u32>,
-    patch_slot_base: GpuBuffer<u32>,
-    quad_recs: AppendBuffer<vec4u>,
-    thin_keep: AppendBuffer<u32>,
-    thin_proof: GpuBuffer<u32>,
-    thin_due: AppendBuffer<u32>,
-    cert_due: AppendBuffer<u32>,
-    vert_cert: GpuBuffer<u32>,
-    exact_base: GpuBuffer<u32>,
-    place_cert_hash: GpuBuffer<u32>,
-    place_cert_entries: AppendBuffer<PlaceCert>,
-    place_cert_vals: GpuBuffer<u32>,
-    place_cert_ready: bool,
-    place_cert_field_key: u64,
+    pub(package) watched: bool,
+    pub(package) watch_bits: GpuBuffer<u32>,
+    pub(package) slot_bricks: GpuBuffer<u32>,
+    pub(package) patch_slot_base: GpuBuffer<u32>,
+    pub(package) quad_recs: AppendBuffer<vec4u>,
+    pub(package) thin_keep: AppendBuffer<u32>,
+    pub(package) thin_proof: GpuBuffer<u32>,
+    pub(package) thin_due: AppendBuffer<u32>,
+    pub(package) cert_due: AppendBuffer<u32>,
+    pub(package) vert_cert: GpuBuffer<u32>,
+    pub(package) exact_base: GpuBuffer<u32>,
+    pub(package) place_cert_hash: GpuBuffer<u32>,
+    pub(package) place_cert_entries: AppendBuffer<PlaceCert>,
+    pub(package) place_cert_vals: GpuBuffer<u32>,
+    pub(package) place_cert_ready: bool,
+    pub(package) place_cert_field_key: u64,
     /// Persistent world-anchored `BrickPool` storage for static Multi-LOD batches.
     pub pooled: bool,
-    pool_field_key: u64,
-    pool_origin: vec3,
-    pool_shift: vec3,
-    pub pool_cap: u32,
-    pool_hash_cap: u32,
-    pool_idx_cap: u32,
-    pool_exact_cap: u32,
-    pub pool_used_slots: u32,
-    pool_used_idx: u32,
-    pool_used_exact: u32,
-    pool_miss_hint: u32,
-    pool_seam_hint: u32,
-    /// The cut the pool holds every brick of (`cut_bounds`' `have`), and the last updates' cuts
-    /// (their grids one after another, each update's generation, first grid and count), each
-    /// held once its readback says it committed whole.
-    pool_grids: Vec<GridSpec>,
-    pool_pending: Vec<GridSpec>,
-    pool_pending_at: Vec<vec3u>,
-    pool_hash_slots: GpuBuffer<u32>,
-    pool_keys: GpuBuffer<u32>,
-    pool_slot_meta: GpuBuffer<u32>,
-    pool_indices: GpuBuffer<u32>,
-    pool_tri_count: GpuBuffer<u32>,
-    pool_marks: GpuBuffer<u32>,
-    pool_slot_base: GpuBuffer<u32>,
-    pool_seam_base: GpuBuffer<u32>,
-    pool_exact_cells: AppendBuffer<ExactCell>,
-    pool_exact_slots: GpuBuffer<u32>,
-    watch_slots_cap: u32,
-    watch_quads_cap: u32,
-    watch_verts_cap: u32,
-    watch_origin: vec3,
-    watch_shift: vec3,
-    watch_eye: vec4,
-    watch_fwd: vec3,
-    watch_gen: u32,
+    /// The pool of a pooled mesh (`mesh::pool`).
+    pub(package) pool: BrickPool,
+    pub(package) watch_slots_cap: u32,
+    pub(package) watch_quads_cap: u32,
+    pub(package) watch_verts_cap: u32,
+    pub(package) watch_origin: vec3,
+    pub(package) watch_shift: vec3,
+    pub(package) watch_eye: vec4,
+    pub(package) watch_fwd: vec3,
+    pub(package) watch_gen: u32,
     /// The counts the last watched frame put up (outline cells for a certificate, thin cells
     /// beside the outline, kept thin cells), read back settled (`watch_poll`), what the next
     /// watch's slices are sized by; whether a watch had more than its slices took (its exact
     /// cells not all found: the mesh isn't settled until one has all).
-    watch_counts: GpuBuffer<u32>,
-    watch_poll: Option<Pending<u32>>,
+    pub(package) watch_counts: GpuBuffer<u32>,
+    pub(package) watch_poll: Option<Pending<u32>>,
     pub watch_hint: vec3u,
-    watch_hint_cands: u32,
+    pub(package) watch_hint_cands: u32,
     /// The exact cells the last watch read back had, the extraction's and its own.
     pub watch_exact: u32,
     pub watch_split: vec3u,
-    watch_known: bool,
-    watch_taken: vec3u,
-    watch_taken_cands: u32,
-    watch_short: bool,
-    stat_extractions: u32,
-    stat_reads: u32,
-    stat_bricks: u32,
-    pub stat_pool_hits: u32,
-    pub stat_pool_misses: u32,
+    pub(package) watch_known: bool,
+    pub(package) watch_taken: vec3u,
+    pub(package) watch_taken_cands: u32,
+    pub(package) watch_short: bool,
+    pub(package) stat_extractions: u32,
+    pub(package) stat_reads: u32,
+    pub(package) stat_bricks: u32,
     pub late_streak: u32,
     pub max_late_streak: u32,
     pub late_frames: u32,
-    last_field_key: u64,
-    static_key_streak: u32,
-    aabb_key: u64,
-    aabb_valid: bool,
-    aabb_empty: bool,
-    cached_aabb: Box3,
+    pub(package) last_field_key: u64,
+    pub(package) static_key_streak: u32,
+    pub(package) aabb_key: u64,
+    pub(package) aabb_valid: bool,
+    pub(package) aabb_empty: bool,
+    pub(package) cached_aabb: Box3,
+}
+
+/// How the cull of a cut of `total_bricks` candidates is dispatched (`cull_cut`): through 4×4×4
+/// super-bricks first where the grids are large and their super-bricks fit a list, in
+/// `super_slices` dispatches of `super_sub_slice` each, else brick by brick; and the indirect
+/// dispatches it takes of the frame's.
+pub(package) struct CullPlan: Copy {
+    pub(package) use_super: bool,
+    pub(package) super_slices: u32,
+    pub(package) super_sub_slice: u32,
+    pub(package) indirect: u32,
+}
+
+/// The cull's plan for `total_bricks` candidates on the grids `scratch` holds (`CullPlan`).
+pub(package) fn cull_plan<M: Field<Substance>>(
+    scratch: mut ExtractScratch,
+    fields: GpuSpan<M>,
+    total_bricks: u32,
+    fc: FrustumCull,
+) -> CullPlan {
+    let super_sub_k = cull_bricks_sub.bind(
+        fields: fields,
+        grids: scratch.grids.items(),
+        super_active: scratch.super_active.items(),
+        super_count: scratch.super_active.count(),
+        cap_super: 65536,
+        first: 0,
+        fc: fc,
+        active: mut scratch.active,
+    )
+    let super_sub_slice = max(
+        u32(clamp(
+            f32(limits().step_work) * 1000.0 / (64.0 * (f32(kernel_work(super_sub_k)) + 2000.0)),
+            1.0,
+            4096.0,
+        )),
+        1,
+    )
+    let super_slices = if scratch.total_super > 0 {
+        min((scratch.total_super + super_sub_slice - 1) / super_sub_slice, SLICES_MOST)
+    } else {
+        0
+    }
+    let use_super = total_bricks >= 512 &&
+        scratch.total_super > 0 &&
+        scratch.total_super <= 65536 &&
+        super_slices * super_sub_slice >= scratch.total_super
+    CullPlan {
+        use_super,
+        super_slices,
+        super_sub_slice,
+        indirect: if use_super { super_slices } else { 0 },
+    }
+}
+
+/// The cull of the cut `scratch`'s grids hold (`plan`, `cull_plan`'s): every candidate brick's
+/// interval held to the surface, those that may hold it listed in `scratch.active` (emptied
+/// first), with the parts live in each.
+pub(package) fn cull_cut<M: Field<Substance>>(
+    scratch: mut ExtractScratch,
+    fields: GpuSpan<M>,
+    things: u32,
+    total_bricks: u32,
+    fc: FrustumCull,
+    plan: CullPlan,
+) {
+    scratch.active.clear()
+    let grids = scratch.grids.items()
+    let use_super = plan.use_super
+    let super_slices = plan.super_slices
+    let super_sub_slice = plan.super_sub_slice
+    if use_super {
+        scratch.super_active.clear()
+        let super_most = lane_slice(
+            kernel_work(super_cull_bricks.bind(
+                fields: fields,
+                grids: grids,
+                super_grids: scratch.super_grids.items(),
+                things: things,
+                first_super: 0,
+                total_super: scratch.total_super,
+                fc: fc,
+                super_active: mut scratch.super_active,
+            )),
+            most: CULL_CHUNK,
+        )
+        var s_first: u32 = 0
+        while s_first < scratch.total_super {
+            let sn = min(scratch.total_super - s_first, super_most)
+            dispatch(
+                super_cull_bricks.bind(
+                    fields: fields,
+                    grids: grids,
+                    super_grids: scratch.super_grids.items(),
+                    things: things,
+                    first_super: s_first,
+                    total_super: scratch.total_super,
+                    fc: fc,
+                    super_active: mut scratch.super_active,
+                ),
+                over: sn,
+            )
+            s_first += sn
+        }
+        dispatch(
+            prep_super_sub.bind(
+                super_count: scratch.super_active.count(),
+                cap_super: 65536,
+                most: super_sub_slice,
+                slices: super_slices,
+                args: scratch.super_args.span_mut(start: 0, count: super_slices),
+            ),
+            over: super_slices,
+        )
+        for sk in 0..super_slices {
+            dispatch(
+                cull_bricks_sub.bind(
+                    fields: fields,
+                    grids: grids,
+                    super_active: scratch.super_active.items(),
+                    super_count: scratch.super_active.count(),
+                    cap_super: 65536,
+                    first: sk * super_sub_slice,
+                    fc: fc,
+                    active: mut scratch.active,
+                ),
+                groups: scratch.super_args.at(sk),
+                most: super_sub_slice,
+            )
+        }
+    } else {
+        let cull_most = lane_slice(
+            kernel_work(cull_bricks.bind(
+                fields: fields,
+                grids: grids,
+                things: things,
+                first_brick: 0,
+                total_bricks: total_bricks,
+                fc: fc,
+                active: mut scratch.active,
+            )),
+            most: CULL_CHUNK,
+        )
+        var first: u32 = 0
+        while first < total_bricks {
+            let n = min(total_bricks - first, cull_most)
+            dispatch(
+                cull_bricks.bind(
+                    fields: fields,
+                    grids: grids,
+                    things: things,
+                    first_brick: first,
+                    total_bricks: total_bricks,
+                    fc: fc,
+                    active: mut scratch.active,
+                ),
+                over: n,
+            )
+            first += n
+        }
+    }
 }
 
 /// What a judge reads back of a batch's mesh (`MeshBatch::read_drawn`), each answered later.
@@ -781,18 +907,6 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
                 },
             ],
         ),
-        seam_draw_args: buffer_of(
-            [
-                DrawIndexedArgs {
-                    indices: 0,
-                    instances: 0,
-                    first_index: 0,
-                    base_vertex: 0,
-                    first_instance: 0,
-                },
-            ],
-        ),
-        seam_start: buffer_of([0]),
         exact_cells: append_buffer(1),
         exact_draw_args: buffer_of(
             [
@@ -932,31 +1046,7 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
         place_cert_ready: false,
         place_cert_field_key: 0,
         pooled: false,
-        pool_field_key: 0,
-        pool_origin: vec3(0.0),
-        pool_shift: vec3(0.0),
-        pool_cap: 0,
-        pool_hash_cap: 0,
-        pool_idx_cap: 0,
-        pool_exact_cap: 0,
-        pool_used_slots: 0,
-        pool_used_idx: 0,
-        pool_used_exact: 0,
-        pool_miss_hint: 0,
-        pool_seam_hint: 0,
-        pool_grids: Vec::new(),
-        pool_pending: Vec::new(),
-        pool_pending_at: Vec::new(),
-        pool_hash_slots: buffer(1),
-        pool_keys: buffer(4),
-        pool_slot_meta: buffer(POOL_META_WORDS),
-        pool_indices: buffer(6),
-        pool_tri_count: buffer(16),
-        pool_marks: buffer(POOL_MARK_WORDS),
-        pool_slot_base: buffer_of([0]),
-        pool_seam_base: buffer_of([0]),
-        pool_exact_cells: append_buffer(1),
-        pool_exact_slots: buffer(1),
+        pool: brick_pool(),
         watch_slots_cap: 1,
         watch_quads_cap: 1,
         watch_verts_cap: 1,
@@ -978,8 +1068,6 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
         stat_extractions: 0,
         stat_reads: 0,
         stat_bricks: 0,
-        stat_pool_hits: 0,
-        stat_pool_misses: 0,
         late_streak: 0,
         max_late_streak: 0,
         late_frames: 0,
@@ -1035,7 +1123,7 @@ impl MeshBatch {
     }
 
     /// Ensures `self.vert_kept` holds at least `2 * vert_cap` u32s (ONLY when `uses_kept()`).
-    fn ensure_vert_kept(mut self, vert_cap: u32) {
+    pub(package) fn ensure_vert_kept(mut self, vert_cap: u32) {
         if vert_cap > self.vert_kept_cap {
             self.vert_kept = buffer(2 * vert_cap)
             self.vert_kept_cap = vert_cap
@@ -1054,7 +1142,7 @@ impl MeshBatch {
 
     /// Grows output vertex/index buffers on demand to fit `want_bricks` active bricks at the
     /// batch's per-brick budgets (never shrinking).
-    fn ensure_cap(mut self, want_bricks: u32) {
+    pub(package) fn ensure_cap(mut self, want_bricks: u32) {
         let cap = max(bucket_bricks(want_bricks, self.max_bricks), self.cap_bricks)
         let cap_verts = cap * self.verts_per_brick
         let cap_indices = cap * self.indices_per_brick
@@ -1078,7 +1166,7 @@ impl MeshBatch {
     /// Ensures per-brick metadata buffers (`brick_bounds`, `brick_alive`, `brick_draws`) hold at
     /// least `want_slots` entries, rounded up to a multiple of `64` (`lcm(20, 256) / 20 = 64`) so
     /// every 64-slot `span_mut` offset is 256-byte aligned on both Metal and Vulkan.
-    fn ensure_brick_draws(mut self, want_slots: u32) {
+    pub(package) fn ensure_brick_draws(mut self, want_slots: u32) {
         let aligned = max(((want_slots + 63) / 64) * 64, 64)
         if aligned > self.cap_brick_draws {
             self.brick_bounds = buffer(aligned)
@@ -1092,7 +1180,7 @@ impl MeshBatch {
     /// vertices: a slot's bricks and bits for each brick slot, a record for each opaque quad its
     /// indices can hold, a certificate and a thin cell's proof for each vertex, and the place-keyed
     /// certificate cache. Returns `true` if any watch buffer was reallocated.
-    fn ensure_watch(mut self, need_slots: u32 = 0) -> bool {
+    pub(package) fn ensure_watch(mut self, need_slots: u32 = 0) -> bool {
         var grew = false
         let want_slots = max(self.cap_brick_draws, need_slots)
         if want_slots > self.watch_slots_cap {
@@ -1101,7 +1189,7 @@ impl MeshBatch {
             self.watch_bits = buffer(self.watch_slots_cap * SLOT_WORDS)
             grew = true
         }
-        let quads = max(self.cap_indices, self.pool_idx_cap) / 6 + 1
+        let quads = max(self.cap_indices, self.pool.idx_cap) / 6 + 1
         if quads > self.watch_quads_cap {
             self.watch_quads_cap = quads
             self.quad_recs = append_buffer(quads)
@@ -1129,58 +1217,8 @@ impl MeshBatch {
         grew
     }
 
-    /// Ensures persistent `BrickPool` storage holds at least `want_slots` interior bricks (capped
-    /// at `COMPACT_GROUPS * COMPACT_PER_GROUP - SEAM_SLOTS_CAP = 57344`) and matching `pool_indices`
-    /// and `pool_exact_cells`. Returns `true` if any pool buffer was reallocated.
-    fn ensure_pool(mut self, want_slots: u32, want_exact: u32) -> bool {
-        var grew = false
-        let max_interior = COMPACT_GROUPS * COMPACT_PER_GROUP - SEAM_SLOTS_CAP
-        let target_slots = min(max(want_slots, 2048), max_interior)
-        var cap = max(self.pool_cap, 2048)
-        while cap < target_slots && cap < max_interior {
-            cap = min(cap * 2, max_interior)
-        }
-        if cap > self.pool_cap {
-            var hcap: u32 = 4096
-            while hcap < cap * 2 {
-                hcap *= 2
-            }
-            self.pool_cap = cap
-            self.pool_hash_cap = hcap
-            self.pool_hash_slots = buffer(hcap)
-            self.pool_keys = buffer(cap * 4)
-            let total_slots = cap + SEAM_SLOTS_CAP
-            self.pool_slot_meta = buffer(total_slots * POOL_META_WORDS)
-            if total_slots > self.cap_brick_draws {
-                self.brick_alive = buffer(total_slots)
-                self.cap_brick_draws = total_slots
-            }
-            write(mut self.pool_seam_base, 0, [cap])
-            grew = true
-        }
-        let target_idx = max(self.cap_indices * 2, cap * self.indices_per_brick)
-        let capped_idx = min(target_idx, 16777216)
-        if capped_idx > self.pool_idx_cap {
-            self.pool_indices = buffer(capped_idx)
-            self.pool_idx_cap = capped_idx
-            grew = true
-        }
-        let target_ex = clamp(max(want_exact, self.cap_exact), 4096, CAP_EXACT_MAX)
-        if target_ex > self.pool_exact_cap {
-            var ecap = max(self.pool_exact_cap, 4096)
-            while ecap < target_ex && ecap < CAP_EXACT_MAX {
-                ecap = min(ecap * 2, CAP_EXACT_MAX)
-            }
-            self.pool_exact_cells = append_buffer(ecap)
-            self.pool_exact_slots = buffer(ecap)
-            self.pool_exact_cap = ecap
-            grew = true
-        }
-        grew
-    }
-
     /// Lazily allocates/grows the Tier-2 `ExactCell` AABB shell buffer (`<= CAP_EXACT_MAX`).
-    fn ensure_exact_cap(mut self, want: u32) {
+    pub(package) fn ensure_exact_cap(mut self, want: u32) {
         let target = clamp(want, 4096, CAP_EXACT_MAX)
         if target > self.cap_exact {
             var cap = max(self.cap_exact, 4096)
@@ -1252,10 +1290,10 @@ impl MeshBatch {
         self.is_rigid_cached = false
         self.edit_base_hash = 0
         self.pooled = false
-        self.pool_field_key = 0
-        self.pool_grids = Vec::new()
-        self.pool_pending = Vec::new()
-        self.pool_pending_at = Vec::new()
+        self.pool.field_key = 0
+        self.pool.held = Vec::new()
+        self.pool.pending = Vec::new()
+        self.pool.pending_at = Vec::new()
         self.trans_read = false
         self.trans_ever = false
         self.trans_field_key = 0
@@ -1286,7 +1324,6 @@ impl MeshBatch {
                 seam_quad_count: scratch.seam_quads.count(),
                 seam_cell_count: scratch.seam_cells.count(),
                 exact_count: self.exact_cells.count(),
-                seam_start: self.seam_start.items(),
                 has_seams: 0,
                 cap_indices: self.cap_indices,
                 cap_trans: self.cap_trans,
@@ -1296,7 +1333,6 @@ impl MeshBatch {
                 args: mut self.draw_args,
                 trans_args: mut self.trans_draw_args,
                 cut_args: mut self.cut_draw_args,
-                seam_args: mut self.seam_draw_args,
                 exact_args: mut self.exact_draw_args,
             ),
             over: 1,
@@ -1360,7 +1396,7 @@ impl MeshBatch {
         )
         scratch.cert_cands.clear()
         scratch.thin_cands.clear()
-        let quad_indices = if self.pooled { self.pool_indices.items() } else { self.indices.items() }
+        let quad_indices = if self.pooled { self.pool.indices.items() } else { self.indices.items() }
         // The kept quads held to the eye, in slices as the kernel's bound lets a dispatch hold.
         let quads_k = outline_quads.bind(
             quads: self.quad_recs.items(),
@@ -1942,7 +1978,7 @@ impl MeshBatch {
             slots: read(self.slot_bricks.items()),
             alive: read(self.brick_alive.items()),
             quad_indices: if self.pooled {
-                read(self.pool_indices.items().sub(start: 0, count: self.pool_idx_cap))
+                read(self.pool.indices.items().sub(start: 0, count: self.pool.idx_cap))
             } else {
                 read(self.indices.items().sub(start: 0, count: self.cap_indices))
             },
@@ -1962,12 +1998,6 @@ impl MeshBatch {
         var cut_indices: u32 = 0
         var gpu_ovf: u32 = 0
         var exact_count: u32 = 0
-        var pool_hits: u32 = 0
-        var pool_misses: u32 = 0
-        var pool_slots: u32 = 0
-        var pool_idx: u32 = 0
-        var pool_seams: u32 = 0
-        var pool_commit: u32 = 0
         var have = false
         match mut self.stats_poll {
             Some(p) => match p.poll() {
@@ -1979,14 +2009,10 @@ impl MeshBatch {
                     cut_indices = c[6]
                     gpu_ovf = c[7]
                     exact_count = c[8]
-                    pool_hits = c[10]
-                    pool_misses = c[11]
                     self.seam_read = c[12]
-                    pool_slots = c[14]
-                    pool_idx = c[15]
-                    pool_seams = c[16]
-                    pool_commit = c[17]
-                    self.pool_used_exact = c[18]
+                    if self.pooled {
+                        self.took_pool_counts(c.clone(), c[7])
+                    }
                     have = true
                     self.stats_poll = None
                 },
@@ -2005,19 +2031,13 @@ impl MeshBatch {
                 cut_indices: cut_indices,
                 gpu_ovf: gpu_ovf,
                 exact_count: exact_count,
-                pool_hits: pool_hits,
-                pool_misses: pool_misses,
-                pool_slots: pool_slots,
-                pool_idx: pool_idx,
-                pool_seams: pool_seams,
-                pool_commit: pool_commit,
             )
         }
     }
 
     /// Acts on one readback of `tri_count`: `(opaque indices, transmissive indices, active
-    /// bricks, vertices)`, each counted past its capacity, plus `cut_indices`, `gpu_ovf`, `exact_count`,
-    /// and `BrickPool` counters.
+    /// bricks, vertices)`, each counted past its capacity, plus `cut_indices`, `gpu_ovf` and
+    /// `exact_count` (a pool's own counts are `took_pool_counts`').
     fn took_counts(
         mut self,
         c: vec4u,
@@ -2026,41 +2046,10 @@ impl MeshBatch {
         cut_indices: u32,
         gpu_ovf: u32,
         exact_count: u32,
-        pool_hits: u32,
-        pool_misses: u32,
-        pool_slots: u32,
-        pool_idx: u32,
-        pool_seams: u32,
-        pool_commit: u32,
     ) {
         if self.poll_real && (c.x > 0 || c.y > 0) {
             self.trans_read = true
             self.trans_ever = self.trans_ever || c.y > 0
-        }
-        if self.pooled {
-            self.stat_pool_hits += pool_hits
-            self.stat_pool_misses += pool_misses
-            self.pool_used_slots = pool_slots
-            self.pool_used_idx = pool_idx
-            self.pool_miss_hint = pool_misses
-            self.pool_seam_hint = pool_seams
-            if pool_commit == GATE_NONE {
-                // An update drew nothing new: what the pool holds is not known past the last
-                // cold one, and the next is counted against nothing held.
-                self.pool_grids = Vec::new()
-            } else if pool_commit != 0 && (gpu_ovf & OVERFLOW_BRICKS) == 0 {
-                // The update read committed its whole cut: the pool holds every brick of it.
-                for k in 0..self.pool_pending_at.len() {
-                    let at = self.pool_pending_at[k]
-                    if at.x == self.poll_gen {
-                        var held: Vec<GridSpec> = Vec::new()
-                        for j in 0..at.z {
-                            held.push(self.pool_pending[at.y + j])
-                        }
-                        self.pool_grids = take held
-                    }
-                }
-            }
         }
         // Narrow what may be drawn only from the extraction that is drawn now.
         if self.poll_gen == self.gen {
@@ -2251,7 +2240,7 @@ impl MeshBatch {
     /// thing); else all of them. A chunk dispatches its passes whether bricks reach it or not, so
     /// this keeps a thing's dispatches to the chunks it fills; a surface that outgrows the
     /// headroom is met by `took_counts`, which extracts again with chunks for it all.
-    fn chunk_limit(self, total: u32, hard_cap: u32) -> u32 {
+    pub(package) fn chunk_limit(self, total: u32, hard_cap: u32) -> u32 {
         if self.lod_cut {
             let want = max(2 * self.active_hint + CHUNK_BRICKS, CUT_BRICKS)
             return min(hard_cap, ((want + CHUNK_BRICKS - 1) / CHUNK_BRICKS) * CHUNK_BRICKS)
@@ -2275,7 +2264,7 @@ impl MeshBatch {
     /// chunks, the last readback's most creases a chunk held with a quarter and a sixteenth of a
     /// slice of headroom (or `COLD_CREASE_SLICES`, cold or after a cut); any
     /// chunk that outgrows them sets `uncovered > 0` and is met by `took_counts`.
-    fn crease_slices(self, chunk_n: u32) -> u32 {
+    pub(package) fn crease_slices(self, chunk_n: u32) -> u32 {
         let slice = self.crease_slice
         let most = min((chunk_n * VERTS_BRICK + slice - 1) / slice, SLICES_MOST)
         let cold = max(COLD_CREASE_SLICES, (65536 + slice - 1) / slice)
@@ -2291,7 +2280,7 @@ impl MeshBatch {
     /// The seam slices a batch dispatches (`SEAM_SLICE` seam cells each, for each seam pass): by
     /// the last readback's seam cells with a quarter and a sixteenth of a slice of headroom, all of
     /// them (`SEAM_SLICES`) cold or after a cut.
-    fn seam_slices(self) -> u32 {
+    pub(package) fn seam_slices(self) -> u32 {
         if self.active_hint == 0 ||
             self.lod_cut ||
             self.extract_total > self.hint_total + self.hint_total / 4 {
@@ -2306,7 +2295,7 @@ impl MeshBatch {
     }
 
     /// Notes that `tri_count` was rewritten by a real extraction (or emptied, `real == false`).
-    fn note_extracted(mut self, real: bool) {
+    pub(package) fn note_extracted(mut self, real: bool) {
         if real {
             self.stat_extractions += 1
         }
@@ -2792,7 +2781,9 @@ impl MeshBatch {
             self.lod_fit_total = total_bricks
         }
         let fc = frustum_cull_none()
-        if self.built && field_key == self.last_field_key {
+        // A field whose key holds from one sync to the next is still: whatever was built of it (an
+        // update read back late is extracted again, the same field).
+        if field_key == self.last_field_key && self.last_field_key != 0 {
             self.static_key_streak += 1
         } else {
             self.static_key_streak = 0
@@ -3931,23 +3922,659 @@ impl MeshBatch {
         }
     }
 
-    fn run_extract<M: Field<Substance>>(
+    /// The bricks a slice of a chunk's corners holds (`prep_chunk`'s `eval_slice`): the corner
+    /// kernel's, or with a seam's corners taken from the coarser level (`inherit`) the lesser of
+    /// it and that kernel's.
+    pub(package) fn corner_slice(self, inherit: bool) -> u32 {
+        if inherit { min(self.eval_slice, self.inherit_slice) } else { self.eval_slice }
+    }
+
+    /// The indirect dispatches a chunk of `CHUNK_BRICKS` takes of a frame's (`mesh_chunk_cells` and
+    /// `mesh_chunk_quads`): its fixed ones, its slices of vertices, corners and quads, of kept
+    /// parts, of exact cells' copies, and of creases.
+    pub(package) fn chunk_indirect(self, uses_kept: bool, use_exact: bool, inherit: bool) -> u32 {
+        let surf_per_chunk = min((CHUNK_BRICKS * VERTS_BRICK + self.surf_slice - 1) / self.surf_slice, SLICES_MOST)
+        let keep_per_chunk = if uses_kept {
+            min((CHUNK_BRICKS * VERTS_BRICK + self.keep_slice - 1) / self.keep_slice, SLICES_MOST)
+        } else {
+            0
+        }
+        let es = self.corner_slice(inherit)
+        let eval_per_chunk = (CHUNK_BRICKS + es - 1) / es
+        let quad_per_chunk = (CHUNK_BRICKS + self.quad_slice - 1) / self.quad_slice
+        CHUNK_INDIRECT + (surf_per_chunk - 1) + (if inherit { 2 * eval_per_chunk - 1 } else { eval_per_chunk - 1 }) +
+            2 * (quad_per_chunk - 1) +
+            keep_per_chunk + (if use_exact { 2 } else { 0 }) + self.crease_slices(CHUNK_BRICKS) * self.crease_passes
+    }
+
+    /// The indirect dispatches the 2:1 seams' stitch takes (`stitch_seams`).
+    pub(package) fn seam_indirect(self, use_exact: bool, uses_kept: bool) -> u32 {
+        let seam_c_slice = min(SEAM_SLICE, self.seam_crease_slice)
+        let seam_c_slices = min((self.seam_slices() * self.seam_slice + seam_c_slice - 1) / seam_c_slice, SLICES_MOST)
+        let seam_keep_slices = if uses_kept {
+            min((self.seam_slices() * self.seam_slice + self.keep_slice - 1) / self.keep_slice, SLICES_MOST)
+        } else {
+            0
+        }
+        (if use_exact { 2 } else { 1 }) * self.seam_slices() + seam_c_slices * self.crease_passes + seam_keep_slices + 1
+    }
+
+    /// The first half of meshing a chunk (`c`) of the bricks listed to mesh (the pool's misses when
+    /// `pooled`, else the cut's active bricks): its corners (a
+    /// seam face's from the coarser level's, `c.inherit`), its cells' classes, its vertices and
+    /// creases, its vertices' kept parts, and each brick's index count and place in its slice
+    /// (`scan_chunk_offsets`, into the pool's index arena when `pooled`, else this batch's
+    /// indices). `prep_chunk` has been dispatched for it. One way for every extraction of nested
+    /// grids or one, pooled or not: `run_extract`'s and the pool's (`mesh::pool`).
+    pub(package) fn mesh_chunk_cells<M: Field<Substance>>(
+        mut self,
+        scratch: mut ExtractScratch,
+        fields: GpuSpan<M>,
+        c: ChunkMesh,
+        pooled: bool,
+    ) {
+        let grids = scratch.grids.items()
+        let active = if pooled { scratch.miss_interior.items() } else { scratch.active.items() }
+        let active_count = if pooled { scratch.miss_interior.count() } else { scratch.active.count() }
+        let slot_base = if pooled { self.pool.slot_base.items() } else { scratch.zero_u32.items() }
+        let chunk_start = c.chunk_start
+        let chunk_n = c.chunk_n
+        let es = self.corner_slice(c.inherit)
+        let eval_slices = (chunk_n + es - 1) / es
+        let quad_slices = (chunk_n + self.quad_slice - 1) / self.quad_slice
+        if c.inherit {
+            for e in 0..eval_slices {
+                dispatch(
+                    eval_corners.bind(
+                        fields: fields,
+                        grids: grids,
+                        active: active,
+                        active_count: active_count,
+                        cap_bricks: c.cap_bricks,
+                        chunk_start: chunk_start,
+                        brick_off: e * es,
+                        corners: scratch.corners_raw.span_mut(
+                            start: e * es * CORNERS_BRICK,
+                            count: min(chunk_n - e * es, es) * CORNERS_BRICK,
+                        ),
+                    ),
+                    groups: scratch.eval_args.at(e),
+                    most: min(chunk_n - e * es, es) * 8,
+                )
+            }
+            // Lane for lane the corners' (`eval_args`: as many groups as the chunk has bricks to
+            // mesh, none past its list), in slices no larger than either kernel's.
+            for e in 0..eval_slices {
+                let band = min(chunk_n - e * es, es)
+                dispatch(
+                    inherit_seam_corners.bind(
+                        fields: fields,
+                        grids: grids,
+                        active: active,
+                        active_count: active_count,
+                        cap_bricks: c.cap_bricks,
+                        chunk_start: chunk_start,
+                        brick_off: e * es,
+                        corners_in: scratch.corners_raw.items(),
+                        corners_out: scratch.corners.span_mut(
+                            start: e * es * CORNERS_BRICK,
+                            count: band * CORNERS_BRICK,
+                        ),
+                    ),
+                    groups: scratch.eval_args.at(e),
+                    most: band * 8,
+                )
+            }
+        } else {
+            for e in 0..eval_slices {
+                dispatch(
+                    eval_corners.bind(
+                        fields: fields,
+                        grids: grids,
+                        active: active,
+                        active_count: active_count,
+                        cap_bricks: c.cap_bricks,
+                        chunk_start: chunk_start,
+                        brick_off: e * es,
+                        corners: scratch.corners.span_mut(
+                            start: e * es * CORNERS_BRICK,
+                            count: min(chunk_n - e * es, es) * CORNERS_BRICK,
+                        ),
+                    ),
+                    groups: scratch.eval_args.at(e),
+                    most: min(chunk_n - e * es, es) * 8,
+                )
+            }
+        }
+        scratch.creases.clear()
+        scratch.surf.clear()
+        if self.watched {
+            dispatch(
+                keep_slots.bind(
+                    grids: grids,
+                    active: active,
+                    active_count: active_count,
+                    cap_bricks: c.cap_bricks,
+                    chunk_start: chunk_start,
+                    slot_base: slot_base,
+                    max_slots: c.max_slots,
+                    slots: mut self.slot_bricks,
+                    bits: mut self.watch_bits,
+                ),
+                over: chunk_n,
+            )
+        }
+        dispatch(
+            classify_cells.bind(
+                grids: grids,
+                active: active,
+                active_count: active_count,
+                cap_bricks: c.cap_bricks,
+                chunk_start: chunk_start,
+                lip: c.lip,
+                held: c.held,
+                slot_base: slot_base,
+                max_slots: c.max_slots,
+                corners: scratch.corners.items(),
+                cell_verts: scratch.cell_verts.span_mut(start: 0, count: chunk_n * VERTS_STRIDE),
+                exact_seen: mut scratch.exact_seen,
+                surf: mut scratch.surf,
+                watch_bits: mut self.watch_bits,
+                thin_keep: mut self.thin_keep,
+            ),
+            groups: scratch.vert_args.at(0),
+            most: chunk_n * 6,
+        )
+        if c.uses_kept {
+            dispatch(
+                mark_first.bind(
+                    vert_count: self.verts.count(),
+                    cap_verts: self.cap_verts,
+                    first: mut self.keep_first,
+                ),
+                over: 1,
+            )
+        }
+        let surf_slices = min((chunk_n * VERTS_BRICK + self.surf_slice - 1) / self.surf_slice, SLICES_MOST)
+        dispatch(
+            prep_slices.bind(
+                count: scratch.surf.count(),
+                cap: CAP_SURF,
+                most: self.surf_slice,
+                slices: surf_slices,
+                args: scratch.surf_args.span_mut(start: 0, count: surf_slices),
+            ),
+            over: surf_slices,
+        )
+        for k in 0..surf_slices {
+            dispatch(
+                solve_verts.bind(
+                    fields: fields,
+                    grids: grids,
+                    active: active,
+                    chunk_start: chunk_start,
+                    corners: scratch.corners.items(),
+                    surf: scratch.surf.items(),
+                    surf_count: scratch.surf.count(),
+                    first: k * self.surf_slice,
+                    cap_verts: self.cap_verts,
+                    cell_verts: mut scratch.cell_verts,
+                    verts: mut self.verts,
+                    creases: mut scratch.creases,
+                ),
+                groups: scratch.surf_args.at(k),
+                most: self.surf_slice / 64,
+            )
+        }
+        // The chunk's creases, in dispatches of at most `self.crease_slice` cells, their counts
+        // prepared in one dispatch (a slice past the list's end dispatches no groups).
+        dispatch(
+            prep_creases.bind(
+                count: scratch.creases.count(),
+                slices: c.crease_slices,
+                slice: self.crease_slice,
+                args: scratch.crease_args.span_mut(start: 0, count: c.crease_slices),
+                seen: mut self.tri_count,
+            ),
+            over: c.crease_slices,
+        )
+        for k in 0..c.crease_slices {
+            for pass in 0..self.crease_passes {
+                dispatch(
+                    refine_creases.bind(
+                        fields: fields,
+                        grids: grids,
+                        active: active,
+                        chunk_start: chunk_start,
+                        corners: scratch.corners.items(),
+                        creases: scratch.creases.items(),
+                        crease_count: scratch.creases.count(),
+                        first: k * self.crease_slice,
+                        pass: pass,
+                        solves: mut scratch.crease_solves,
+                        cap_verts: self.cap_verts,
+                        cell_verts: mut scratch.cell_verts,
+                        verts: mut self.verts,
+                    ),
+                    groups: scratch.crease_args.at(k),
+                    most: self.crease_slice / 64,
+                )
+            }
+        }
+        if c.uses_kept {
+            self.keep_since_first(fields, min((chunk_n * VERTS_BRICK + self.keep_slice - 1) / self.keep_slice, SLICES_MOST))
+        }
+        dispatch(
+            zero_chunk_counts.bind(
+                counts: scratch.brick_idx_counts.span_mut(start: 0, count: chunk_n),
+                cursors: scratch.brick_idx_cursor.span_mut(start: 0, count: chunk_n),
+            ),
+            over: chunk_n,
+        )
+        for q in 0..quad_slices {
+            if c.lod {
+                dispatch(
+                    count_brick_tris_lod.bind(
+                        grids: grids,
+                        active: active,
+                        active_count: active_count,
+                        cap_bricks: c.cap_bricks,
+                        chunk_start: chunk_start,
+                        brick_off: q * self.quad_slice,
+                        corners: scratch.corners.items(),
+                        cell_verts: scratch.cell_verts.items(),
+                        verts: self.verts.items(),
+                        brick_idx_counts: mut scratch.brick_idx_counts,
+                    ),
+                    groups: scratch.quad_args.at(q),
+                    most: min(chunk_n - q * self.quad_slice, self.quad_slice) * 4,
+                )
+            } else {
+                dispatch(
+                    count_brick_tris.bind(
+                        active_count: active_count,
+                        cap_bricks: c.cap_bricks,
+                        chunk_start: chunk_start,
+                        brick_off: q * self.quad_slice,
+                        corners: scratch.corners.items(),
+                        cell_verts: scratch.cell_verts.items(),
+                        verts: self.verts.items(),
+                        brick_idx_counts: mut scratch.brick_idx_counts,
+                    ),
+                    groups: scratch.quad_args.at(q),
+                    most: min(chunk_n - q * self.quad_slice, self.quad_slice) * 4,
+                )
+            }
+        }
+        if pooled {
+            scan_chunk_offsets(
+                active_count,
+                scratch.brick_idx_counts.items(),
+                mut scratch.group_sums,
+                mut scratch.group_offsets,
+                mut scratch.brick_idx_offsets,
+                mut self.pool.tri_count,
+                cap_bricks: c.cap_bricks,
+                chunk_start: chunk_start,
+                chunk_n: chunk_n,
+            )
+        } else {
+            scan_chunk_offsets(
+                active_count,
+                scratch.brick_idx_counts.items(),
+                mut scratch.group_sums,
+                mut scratch.group_offsets,
+                mut scratch.brick_idx_offsets,
+                mut self.tri_count,
+                cap_bricks: c.cap_bricks,
+                chunk_start: chunk_start,
+                chunk_n: chunk_n,
+            )
+        }
+    }
+
+    /// The kept parts of the vertices pushed since `keep_first` was marked (`mark_first`), in
+    /// `slices` dispatches of `keep_slice`.
+    fn keep_since_first<M: Field<Substance>>(mut self, fields: GpuSpan<M>, slices: u32) {
+        dispatch(
+            prep_from.bind(
+                count: self.verts.count(),
+                cap: self.cap_verts,
+                first: self.keep_first.items(),
+                most: self.keep_slice,
+                slices: slices,
+                args: self.keep_args.span_mut(start: 0, count: slices),
+            ),
+            over: slices,
+        )
+        for k in 0..slices {
+            dispatch(
+                keep_verts.bind(
+                    fields: fields,
+                    verts: self.verts.items(),
+                    vert_count: self.verts.count(),
+                    cap_verts: self.cap_verts,
+                    first: self.keep_first.items(),
+                    from: k * self.keep_slice,
+                    vert_kept: mut self.vert_kept,
+                ),
+                groups: self.keep_args.at(k),
+                most: self.keep_slice / 64,
+            )
+        }
+    }
+
+    /// The second half of meshing a chunk (`mesh_chunk_cells` first, then the bricks' metadata):
+    /// each brick's quads into its slice of this batch's indices, or of the pool's index arena
+    /// with its exact cells in the pool's arena under its slot (`pooled`); a quad across a 2:1
+    /// seam face listed for `stitch_seams`, six indices of its brick's slice kept for it.
+    pub(package) fn mesh_chunk_quads(mut self, scratch: mut ExtractScratch, c: ChunkMesh, pooled: bool) {
+        let grids = scratch.grids.items()
+        let active = if pooled { scratch.miss_interior.items() } else { scratch.active.items() }
+        let active_count = if pooled { scratch.miss_interior.count() } else { scratch.active.count() }
+        let slot_base = if pooled { self.pool.slot_base.items() } else { scratch.zero_u32.items() }
+        let quad_slices = (c.chunk_n + self.quad_slice - 1) / self.quad_slice
+        for q in 0..quad_slices {
+            let most = min(c.chunk_n - q * self.quad_slice, self.quad_slice) * 4
+            if pooled {
+                dispatch(
+                    emit_tris_lod.bind(
+                        grids: grids,
+                        active: active,
+                        active_count: active_count,
+                        cap_bricks: c.cap_bricks,
+                        cap_indices: self.pool.idx_cap,
+                        cap_trans: self.cap_trans,
+                        chunk_start: c.chunk_start,
+                        brick_off: q * self.quad_slice,
+                        corners: scratch.corners.items(),
+                        cell_verts: scratch.cell_verts.items(),
+                        verts: self.verts.items(),
+                        brick_idx_offsets: scratch.brick_idx_offsets.items(),
+                        brick_idx_counts: mut scratch.brick_idx_cursor,
+                        tri_count: mut self.pool.tri_count,
+                        indices: mut self.pool.indices,
+                        trans_indices: mut self.trans_indices,
+                        cut_indices: mut self.cut_indices,
+                        seam_quads: mut scratch.seam_quads,
+                        seam_cells: mut scratch.seam_cells,
+                        seam_verts: mut scratch.seam_verts,
+                        held: c.held,
+                        slot_base: slot_base,
+                        max_slots: c.max_slots,
+                        cap_exact_slots: self.pool.exact_cap,
+                        exact_seen: mut scratch.exact_seen,
+                        exact_cells: mut self.pool.exact,
+                        exact_slots: mut self.pool.exact_slots,
+                        quad_recs: mut self.quad_recs,
+                    ),
+                    groups: scratch.quad_args.at(q),
+                    most: most,
+                )
+            } else if c.lod {
+                dispatch(
+                    emit_tris_lod.bind(
+                        grids: grids,
+                        active: active,
+                        active_count: active_count,
+                        cap_bricks: c.cap_bricks,
+                        cap_indices: self.cap_indices,
+                        cap_trans: self.cap_trans,
+                        chunk_start: c.chunk_start,
+                        brick_off: q * self.quad_slice,
+                        corners: scratch.corners.items(),
+                        cell_verts: scratch.cell_verts.items(),
+                        verts: self.verts.items(),
+                        brick_idx_offsets: scratch.brick_idx_offsets.items(),
+                        brick_idx_counts: mut scratch.brick_idx_cursor,
+                        tri_count: mut self.tri_count,
+                        indices: mut self.indices,
+                        trans_indices: mut self.trans_indices,
+                        cut_indices: mut self.cut_indices,
+                        seam_quads: mut scratch.seam_quads,
+                        seam_cells: mut scratch.seam_cells,
+                        seam_verts: mut scratch.seam_verts,
+                        held: c.held,
+                        slot_base: slot_base,
+                        max_slots: c.max_slots,
+                        cap_exact_slots: 0,
+                        exact_seen: mut scratch.exact_seen,
+                        exact_cells: mut self.exact_cells,
+                        exact_slots: mut scratch.dummy_exact_slots,
+                        quad_recs: mut self.quad_recs,
+                    ),
+                    groups: scratch.quad_args.at(q),
+                    most: most,
+                )
+            } else {
+                dispatch(
+                    emit_tris.bind(
+                        grids: grids,
+                        active: active,
+                        active_count: active_count,
+                        cap_bricks: c.cap_bricks,
+                        cap_indices: self.cap_indices,
+                        cap_trans: self.cap_trans,
+                        chunk_start: c.chunk_start,
+                        brick_off: q * self.quad_slice,
+                        held: c.held,
+                        slot_base: slot_base,
+                        max_slots: c.max_slots,
+                        cap_exact_slots: 0,
+                        corners: scratch.corners.items(),
+                        cell_verts: scratch.cell_verts.items(),
+                        verts: self.verts.items(),
+                        brick_idx_offsets: scratch.brick_idx_offsets.items(),
+                        brick_idx_counts: mut scratch.brick_idx_cursor,
+                        tri_count: mut self.tri_count,
+                        indices: mut self.indices,
+                        trans_indices: mut self.trans_indices,
+                        cut_indices: mut self.cut_indices,
+                        exact_seen: mut scratch.exact_seen,
+                        exact_cells: mut self.exact_cells,
+                        exact_slots: mut scratch.dummy_exact_slots,
+                        quad_recs: mut self.quad_recs,
+                    ),
+                    groups: scratch.quad_args.at(q),
+                    most: most,
+                )
+            }
+        }
+    }
+
+    /// The 2:1 seams' stitch, after every chunk (`mesh_chunk_quads` listed its quads): each
+    /// coarse cell a seam quad meets solved as the coarser level solves it, bit for bit (and
+    /// given an exact cell, `held`), and each quad written into the six indices its fine brick
+    /// keeps for it, in this batch's indices or the pool's arena (`pooled`, the exact cells its
+    /// brick's slot's).
+    pub(package) fn stitch_seams<M: Field<Substance>>(
+        mut self,
+        scratch: mut ExtractScratch,
+        fields: GpuSpan<M>,
+        held: bool,
+        uses_kept: bool,
+        pooled: bool,
+    ) {
+        let grids = scratch.grids.items()
+        let seam_slices = self.seam_slices()
+        let seam_c_slice = min(SEAM_SLICE, self.seam_crease_slice)
+        let seam_c_slices = min((seam_slices * self.seam_slice + seam_c_slice - 1) / seam_c_slice, SLICES_MOST)
+        dispatch(
+            note_seams.bind(
+                seam_count: scratch.seam_cells.count(),
+                tested: seam_slices * self.seam_slice,
+                tri_count: mut self.tri_count,
+            ),
+            over: 1,
+        )
+        dispatch(
+            prep_slices.bind(
+                count: scratch.seam_cells.count(),
+                cap: CAP_SEAM * 2,
+                most: self.seam_slice,
+                slices: seam_slices,
+                args: scratch.seam_args.span_mut(start: 0, count: seam_slices),
+            ),
+            over: seam_slices,
+        )
+        if held {
+            dispatch(
+                reset_seam_seen.bind(seam_seen: scratch.seam_seen.span_mut(start: 0, count: SEAM_SEEN)),
+                over: SEAM_SEEN,
+            )
+            for k in 0..seam_slices {
+                if pooled {
+                    dispatch(
+                        box_seam_cells.bind(
+                            fields: fields,
+                            grids: grids,
+                            seam_cells: scratch.seam_cells.items(),
+                            seam_cell_count: scratch.seam_cells.count(),
+                            seam_quads: scratch.seam_quads.items(),
+                            first: k * self.seam_slice,
+                            cap_exact_slots: self.pool.exact_cap,
+                            seam_seen: mut scratch.seam_seen,
+                            exact_cells: mut self.pool.exact,
+                            exact_slots: mut self.pool.exact_slots,
+                        ),
+                        groups: scratch.seam_args.at(k),
+                        most: self.seam_slice / 64,
+                    )
+                } else {
+                    dispatch(
+                        box_seam_cells.bind(
+                            fields: fields,
+                            grids: grids,
+                            seam_cells: scratch.seam_cells.items(),
+                            seam_cell_count: scratch.seam_cells.count(),
+                            seam_quads: scratch.seam_quads.items(),
+                            first: k * self.seam_slice,
+                            cap_exact_slots: 0,
+                            seam_seen: mut scratch.seam_seen,
+                            exact_cells: mut self.exact_cells,
+                            exact_slots: mut scratch.dummy_exact_slots,
+                        ),
+                        groups: scratch.seam_args.at(k),
+                        most: self.seam_slice / 64,
+                    )
+                }
+            }
+        }
+        if uses_kept {
+            dispatch(
+                mark_first.bind(vert_count: self.verts.count(), cap_verts: self.cap_verts, first: mut self.keep_first),
+                over: 1,
+            )
+        }
+        for k in 0..seam_slices {
+            dispatch(
+                solve_seam_smooth.bind(
+                    fields: fields,
+                    grids: grids,
+                    seam_cells: scratch.seam_cells.items(),
+                    seam_cell_count: scratch.seam_cells.count(),
+                    first: k * self.seam_slice,
+                    cap_verts: self.cap_verts,
+                    verts: mut self.verts,
+                    seam_verts: mut scratch.seam_verts,
+                    seam_creases: mut scratch.seam_creases,
+                ),
+                groups: scratch.seam_args.at(k),
+                most: self.seam_slice / 64,
+            )
+        }
+        dispatch(
+            prep_slices.bind(
+                count: scratch.seam_creases.count(),
+                cap: CAP_SEAM * 2,
+                most: seam_c_slice,
+                slices: seam_c_slices,
+                args: scratch.crease_args.span_mut(start: 0, count: seam_c_slices),
+            ),
+            over: seam_c_slices,
+        )
+        for k in 0..seam_c_slices {
+            for pass in 0..self.crease_passes {
+                dispatch(
+                    refine_seam_creases.bind(
+                        fields: fields,
+                        grids: grids,
+                        seam_cells: scratch.seam_cells.items(),
+                        seam_creases: scratch.seam_creases.items(),
+                        seam_crease_count: scratch.seam_creases.count(),
+                        first: k * seam_c_slice,
+                        pass: pass,
+                        solves: mut scratch.crease_solves,
+                        cap_verts: self.cap_verts,
+                        verts: mut self.verts,
+                        seam_verts: mut scratch.seam_verts,
+                    ),
+                    groups: scratch.crease_args.at(k),
+                    most: seam_c_slice / 64,
+                )
+            }
+        }
+        if uses_kept {
+            self.keep_since_first(fields, min((seam_slices * self.seam_slice + self.keep_slice - 1) / self.keep_slice, SLICES_MOST))
+        }
+        dispatch(
+            prep_slices.bind(
+                count: scratch.seam_quads.count(),
+                cap: CAP_SEAM,
+                most: CAP_SEAM,
+                slices: 1,
+                args: scratch.surf_args.span_mut(start: 0, count: 1),
+            ),
+            over: 1,
+        )
+        if pooled {
+            dispatch(
+                finish_seam_tris.bind(
+                    seam_quads: scratch.seam_quads.items(),
+                    seam_quad_count: scratch.seam_quads.count(),
+                    seam_verts: scratch.seam_verts.items(),
+                    verts: self.verts.items(),
+                    cap_indices: self.pool.idx_cap,
+                    cap_trans: self.cap_trans,
+                    tri_count: mut self.pool.tri_count,
+                    indices: mut self.pool.indices,
+                    trans_indices: mut self.trans_indices,
+                    cut_indices: mut self.cut_indices,
+                ),
+                groups: scratch.surf_args.at(0),
+                most: CAP_SEAM / 64,
+            )
+        } else {
+            dispatch(
+                finish_seam_tris.bind(
+                    seam_quads: scratch.seam_quads.items(),
+                    seam_quad_count: scratch.seam_quads.count(),
+                    seam_verts: scratch.seam_verts.items(),
+                    verts: self.verts.items(),
+                    cap_indices: self.cap_indices,
+                    cap_trans: self.cap_trans,
+                    tri_count: mut self.tri_count,
+                    indices: mut self.indices,
+                    trans_indices: mut self.trans_indices,
+                    cut_indices: mut self.cut_indices,
+                ),
+                groups: scratch.surf_args.at(0),
+                most: CAP_SEAM / 64,
+            )
+        }
+    }
+
+    /// The slices this batch's kernels are dispatched in, each as many as the kernel's own bound
+    /// (`kernel_work`) lets a dispatch hold, for `sample`'s kind: its creases', vertices',
+    /// corners', seams' and quads' (`lod`: the nested grids' kernels), and its kept parts'.
+    pub(package) fn size_slices<M: Field<Substance>>(
         mut self,
         scratch: mut ExtractScratch,
         fields: GpuSpan<M>,
         sample: M,
-        things: u32,
-        total_bricks: u32,
-        inst_count: u32,
-        has_seams: bool,
-        fc: FrustumCull,
-        extra_bricks: u32,
-        exact_eye: vec4,
-        lip: f32,
-        eye_reach: f32 = 0.0,
-        field_key: u64 = 0,
+        lod: bool,
+        held: u32,
     ) {
-        label("mesh_extract")
         let step = crease_step_cost_of(sample)
         // A crease slice is as many cells as the kernel's own bound (`kernel_work`) lets a
         // dispatch hold: this batch's kernels, bound as they're dispatched.
@@ -4019,9 +4646,12 @@ impl MeshBatch {
                     grids: scratch.grids.items(),
                     seam_cells: scratch.seam_cells.items(),
                     seam_cell_count: scratch.seam_cells.count(),
+                    seam_quads: scratch.seam_quads.items(),
                     first: 0,
+                    cap_exact_slots: 0,
                     seam_seen: mut scratch.seam_seen,
                     exact_cells: mut self.exact_cells,
+                    exact_slots: mut scratch.dummy_exact_slots,
                 )),
                 most: SEAM_SLICE,
             ),
@@ -4055,7 +4685,7 @@ impl MeshBatch {
                 corners: scratch.corners.span_mut(start: 0, count: CORNERS_BRICK),
             )),
         )
-        self.quad_slice = if has_seams {
+        self.quad_slice = if lod {
             brick_slice(lanes: 256, invocation: kernel_work(emit_tris_lod.bind(
                 grids: scratch.grids.items(),
                 active: scratch.active.items(),
@@ -4077,7 +4707,7 @@ impl MeshBatch {
                 seam_quads: mut scratch.seam_quads,
                 seam_cells: mut scratch.seam_cells,
                 seam_verts: mut scratch.seam_verts,
-                held: if (exact_eye).w > 0.0 { 1 } else { 0 },
+                held: held,
                 slot_base: scratch.zero_u32.items(),
                 max_slots: self.watch_slots_cap,
                 cap_exact_slots: 0,
@@ -4096,7 +4726,7 @@ impl MeshBatch {
                 cap_trans: self.cap_trans,
                 chunk_start: 0,
                 brick_off: 0,
-                held: if (exact_eye).w > 0.0 { 1 } else { 0 },
+                held: held,
                 slot_base: scratch.zero_u32.items(),
                 max_slots: self.watch_slots_cap,
                 cap_exact_slots: 0,
@@ -4115,10 +4745,30 @@ impl MeshBatch {
                 quad_recs: mut self.quad_recs,
             )))
         }
-        let uses_kept = sample.uses_kept()
-        if uses_kept {
+        if sample.uses_kept() {
             self.keep_slice = keep_slice_of(sample)
         }
+    }
+
+    fn run_extract<M: Field<Substance>>(
+        mut self,
+        scratch: mut ExtractScratch,
+        fields: GpuSpan<M>,
+        sample: M,
+        things: u32,
+        total_bricks: u32,
+        inst_count: u32,
+        has_seams: bool,
+        fc: FrustumCull,
+        extra_bricks: u32,
+        exact_eye: vec4,
+        lip: f32,
+        eye_reach: f32 = 0.0,
+        field_key: u64 = 0,
+    ) {
+        label("mesh_extract")
+        self.size_slices(mut scratch, fields, sample, lod: has_seams, held: if exact_eye.w > 0.0 { 1 } else { 0 })
+        let uses_kept = sample.uses_kept()
         // Size this batch's output buffers for every candidate brick (active ones are a subset),
         // plus optional CSG patch headroom when `extra_bricks > 0`.
         let use_exact = exact_eye.w > 0.0
@@ -4126,72 +4776,11 @@ impl MeshBatch {
         let wanted = self.chunk_limit(total_bricks, min(est_cap, total_bricks))
         // A chunk's slots are written (`keep_slots`, and its cells' bits cleared, `clear_slot_out`)
         // where the mesh is held; its outline is found each frame (`watch`).
-        let exact_indirect: u32 = if use_exact { 2 } else { 0 }
-        let surf_per_chunk = min(
-            (CHUNK_BRICKS * VERTS_BRICK + self.surf_slice - 1) / self.surf_slice,
-            SLICES_MOST,
-        )
-        let keep_per_chunk = if uses_kept {
-            min((CHUNK_BRICKS * VERTS_BRICK + self.keep_slice - 1) / self.keep_slice, SLICES_MOST)
-        } else {
-            0
-        }
-        let eval_per_chunk = (CHUNK_BRICKS + self.eval_slice - 1) / self.eval_slice
-        let quad_per_chunk = (CHUNK_BRICKS + self.quad_slice - 1) / self.quad_slice
-        let per_chunk = CHUNK_INDIRECT +
-            (surf_per_chunk - 1) +
-            (eval_per_chunk - 1) +
-            2 * (quad_per_chunk - 1) +
-            keep_per_chunk +
-            exact_indirect +
-            self.crease_slices(CHUNK_BRICKS) * self.crease_passes
-        let seam_c_slice = min(SEAM_SLICE, self.seam_crease_slice)
-        let seam_c_slices = if has_seams {
-            min((self.seam_slices() * self.seam_slice + seam_c_slice - 1) / seam_c_slice, SLICES_MOST)
-        } else {
-            0
-        }
-        let seam_keep_slices = if has_seams && uses_kept {
-            min((self.seam_slices() * self.seam_slice + self.keep_slice - 1) / self.keep_slice, SLICES_MOST)
-        } else {
-            0
-        }
-        let seam_indirect: u32 = if !has_seams {
-            0
-        } else if use_exact {
-            2 * self.seam_slices() + seam_c_slices * self.crease_passes + seam_keep_slices + 1
-        } else {
-            self.seam_slices() + seam_c_slices * self.crease_passes + seam_keep_slices + 1
-        }
+        let per_chunk = self.chunk_indirect(uses_kept: uses_kept, use_exact: use_exact, inherit: has_seams)
+        let seam_indirect = if has_seams { self.seam_indirect(use_exact: use_exact, uses_kept: uses_kept) } else { 0 }
         let cert_indirect: u32 = 0
-        let super_sub_k = cull_bricks_sub.bind(
-            fields: fields,
-            grids: scratch.grids.items(),
-            super_active: scratch.super_active.items(),
-            super_count: scratch.super_active.count(),
-            cap_super: 65536,
-            first: 0,
-            fc: fc,
-            active: mut scratch.active,
-        )
-        let super_sub_slice = max(
-            u32(clamp(
-                f32(limits().step_work) * 1000.0 / (64.0 * (f32(kernel_work(super_sub_k)) + 2000.0)),
-                1.0,
-                4096.0,
-            )),
-            1,
-        )
-        let super_slices = if scratch.total_super > 0 {
-            min((scratch.total_super + super_sub_slice - 1) / super_sub_slice, SLICES_MOST)
-        } else {
-            0
-        }
-        let use_super = total_bricks >= 512 &&
-            scratch.total_super > 0 &&
-            scratch.total_super <= 65536 &&
-            super_slices * super_sub_slice >= scratch.total_super
-        let super_indirect: u32 = if use_super { super_slices } else { 0 }
+        let cull = cull_plan(mut scratch, fields, total_bricks, fc)
+        let super_indirect = cull.indirect
         let fixed_indirect = seam_indirect + cert_indirect + super_indirect
         let avail_after_fixed = if scratch.indirect_left > fixed_indirect {
             scratch.indirect_left - fixed_indirect
@@ -4244,99 +4833,8 @@ impl MeshBatch {
             scratch.seam_creases.clear()
         }
 
-        let grids = scratch.grids.items()
-
         // Pass 0: Interval-cull bricks (2-level 4×4×4 super-bricks on large grids, else flat).
-        if use_super {
-            scratch.super_active.clear()
-            let super_most = lane_slice(
-                kernel_work(super_cull_bricks.bind(
-                    fields: fields,
-                    grids: grids,
-                    super_grids: scratch.super_grids.items(),
-                    things: things,
-                    first_super: 0,
-                    total_super: scratch.total_super,
-                    fc: fc,
-                    super_active: mut scratch.super_active,
-                )),
-                most: CULL_CHUNK,
-            )
-            var s_first: u32 = 0
-            while s_first < scratch.total_super {
-                let sn = min(scratch.total_super - s_first, super_most)
-                dispatch(
-                    super_cull_bricks.bind(
-                        fields: fields,
-                        grids: grids,
-                        super_grids: scratch.super_grids.items(),
-                        things: things,
-                        first_super: s_first,
-                        total_super: scratch.total_super,
-                        fc: fc,
-                        super_active: mut scratch.super_active,
-                    ),
-                    over: sn,
-                )
-                s_first += sn
-            }
-            dispatch(
-                prep_super_sub.bind(
-                    super_count: scratch.super_active.count(),
-                    cap_super: 65536,
-                    most: super_sub_slice,
-                    slices: super_slices,
-                    args: scratch.super_args.span_mut(start: 0, count: super_slices),
-                ),
-                over: super_slices,
-            )
-            for sk in 0..super_slices {
-                dispatch(
-                    cull_bricks_sub.bind(
-                        fields: fields,
-                        grids: grids,
-                        super_active: scratch.super_active.items(),
-                        super_count: scratch.super_active.count(),
-                        cap_super: 65536,
-                        first: sk * super_sub_slice,
-                        fc: fc,
-                        active: mut scratch.active,
-                    ),
-                    groups: scratch.super_args.at(sk),
-                    most: super_sub_slice,
-                )
-            }
-        } else {
-            let cull_most = lane_slice(
-                kernel_work(cull_bricks.bind(
-                    fields: fields,
-                    grids: grids,
-                    things: things,
-                    first_brick: 0,
-                    total_bricks: total_bricks,
-                    fc: fc,
-                    active: mut scratch.active,
-                )),
-                most: CULL_CHUNK,
-            )
-            var first: u32 = 0
-            while first < total_bricks {
-                let n = min(total_bricks - first, cull_most)
-                dispatch(
-                    cull_bricks.bind(
-                        fields: fields,
-                        grids: grids,
-                        things: things,
-                        first_brick: first,
-                        total_bricks: total_bricks,
-                        fc: fc,
-                        active: mut scratch.active,
-                    ),
-                    over: n,
-                )
-                first += n
-            }
-        }
+        cull_cut(mut scratch, fields, things: things, total_bricks: total_bricks, fc: fc, plan: cull)
 
         // Passes 1–3: Extract in bounded chunks of `CHUNK_BRICKS` active bricks using `chunk_limit`
         // (generous 1.5× + 1-chunk headroom; `took_counts` re-extracts automatically if exceeded).
@@ -4372,7 +4870,8 @@ impl MeshBatch {
         scratch.cert_cands.clear()
         while chunk_start < hard_cap {
             let chunk_n = min(hard_cap - chunk_start, CHUNK_BRICKS)
-            let eval_slices = (chunk_n + self.eval_slice - 1) / self.eval_slice
+            let es = self.corner_slice(has_seams)
+            let eval_slices = (chunk_n + es - 1) / es
             let quad_slices = (chunk_n + self.quad_slice - 1) / self.quad_slice
             let chunk_slices = max(eval_slices, quad_slices)
             dispatch(
@@ -4380,7 +4879,7 @@ impl MeshBatch {
                     active_count: scratch.active.count(),
                     cap_bricks: effective_cap,
                     chunk_start: chunk_start,
-                    eval_slice: self.eval_slice,
+                    eval_slice: es,
                     quad_slice: self.quad_slice,
                     vert_args: mut scratch.vert_args,
                     eval_args: scratch.eval_args.span_mut(start: 0, count: chunk_slices),
@@ -4388,281 +4887,22 @@ impl MeshBatch {
                 ),
                 over: chunk_slices,
             )
-            if has_seams {
-                for e in 0..eval_slices {
-                    dispatch(
-                        eval_corners.bind(
-                            fields: fields,
-                            grids: grids,
-                            active: scratch.active.items(),
-                            active_count: scratch.active.count(),
-                            cap_bricks: effective_cap,
-                            chunk_start: chunk_start,
-                            brick_off: e * self.eval_slice,
-                            corners: scratch.corners_raw.span_mut(
-                                start: e * self.eval_slice * CORNERS_BRICK,
-                                count: min(chunk_n - e * self.eval_slice, self.eval_slice) * CORNERS_BRICK,
-                            ),
-                        ),
-                        groups: scratch.eval_args.at(e),
-                        most: min(chunk_n - e * self.eval_slice, self.eval_slice) * 8,
-                    )
-                }
-                var inh_off: u32 = 0
-                while inh_off < chunk_n {
-                    let band = min(chunk_n - inh_off, self.inherit_slice)
-                    dispatch(
-                        inherit_seam_corners.bind(
-                            fields: fields,
-                            grids: grids,
-                            active: scratch.active.items(),
-                            active_count: scratch.active.count(),
-                            cap_bricks: effective_cap,
-                            chunk_start: chunk_start,
-                            brick_off: inh_off,
-                            corners_in: scratch.corners_raw.items(),
-                            corners_out: scratch.corners.span_mut(
-                                start: inh_off * CORNERS_BRICK,
-                                count: band * CORNERS_BRICK,
-                            ),
-                        ),
-                        over: band * CORNERS_BRICK,
-                    )
-                    inh_off += band
-                }
-            } else {
-                for e in 0..eval_slices {
-                    dispatch(
-                        eval_corners.bind(
-                            fields: fields,
-                            grids: grids,
-                            active: scratch.active.items(),
-                            active_count: scratch.active.count(),
-                            cap_bricks: effective_cap,
-                            chunk_start: chunk_start,
-                            brick_off: e * self.eval_slice,
-                            corners: scratch.corners.span_mut(
-                                start: e * self.eval_slice * CORNERS_BRICK,
-                                count: min(chunk_n - e * self.eval_slice, self.eval_slice) * CORNERS_BRICK,
-                            ),
-                        ),
-                        groups: scratch.eval_args.at(e),
-                        most: min(chunk_n - e * self.eval_slice, self.eval_slice) * 8,
-                    )
-                }
-            }
-            scratch.creases.clear()
-            scratch.surf.clear()
-            if self.watched {
-                dispatch(
-                    keep_slots.bind(
-                        grids: grids,
-                        active: scratch.active.items(),
-                        active_count: scratch.active.count(),
-                        cap_bricks: effective_cap,
-                        chunk_start: chunk_start,
-                        slot_base: scratch.zero_u32.items(),
-                        max_slots: self.watch_slots_cap,
-                        slots: mut self.slot_bricks,
-                        bits: mut self.watch_bits,
-                    ),
-                    over: chunk_n,
-                )
-            }
-            dispatch(
-                classify_cells.bind(
-                    grids: grids,
-                    active: scratch.active.items(),
-                    active_count: scratch.active.count(),
-                    cap_bricks: effective_cap,
-                    chunk_start: chunk_start,
-                    lip: lip,
-                    held: if (exact_eye).w > 0.0 { 1 } else { 0 },
-                    slot_base: scratch.zero_u32.items(),
-                    max_slots: self.watch_slots_cap,
-                    corners: scratch.corners.items(),
-                    cell_verts: scratch.cell_verts.span_mut(
-                        start: 0,
-                        count: chunk_n * VERTS_STRIDE,
-                    ),
-                    exact_seen: mut scratch.exact_seen,
-                    surf: mut scratch.surf,
-                    watch_bits: mut self.watch_bits,
-                    thin_keep: mut self.thin_keep,
-                ),
-                groups: scratch.vert_args.at(0),
-                most: chunk_n * 6,
-            )
-            if uses_kept {
-                dispatch(
-                    mark_first.bind(
-                        vert_count: self.verts.count(),
-                        cap_verts: self.cap_verts,
-                        first: mut self.keep_first,
-                    ),
-                    over: 1,
-                )
-            }
-            let surf_slices = min(
-                (chunk_n * VERTS_BRICK + self.surf_slice - 1) / self.surf_slice,
-                SLICES_MOST,
-            )
-            dispatch(
-                prep_slices.bind(
-                    count: scratch.surf.count(),
-                    cap: CAP_SURF,
-                    most: self.surf_slice,
-                    slices: surf_slices,
-                    args: scratch.surf_args.span_mut(start: 0, count: surf_slices),
-                ),
-                over: surf_slices,
-            )
-            for k in 0..surf_slices {
-                dispatch(
-                    solve_verts.bind(
-                        fields: fields,
-                        grids: grids,
-                        active: scratch.active.items(),
-                        chunk_start: chunk_start,
-                        corners: scratch.corners.items(),
-                        surf: scratch.surf.items(),
-                        surf_count: scratch.surf.count(),
-                        first: k * self.surf_slice,
-                        cap_verts: self.cap_verts,
-                        cell_verts: mut scratch.cell_verts,
-                        verts: mut self.verts,
-                        creases: mut scratch.creases,
-                    ),
-                    groups: scratch.surf_args.at(k),
-                    most: self.surf_slice / 64,
-                )
-            }
-            // The chunk's creases, in dispatches of at most `self.crease_slice` cells, their counts
-            // prepared in one dispatch (a slice past the list's end dispatches no groups).
-            let crease_slices = self.crease_slices(chunk_n)
-            dispatch(
-                prep_creases.bind(
-                    count: scratch.creases.count(),
-                    slices: crease_slices,
-                    slice: self.crease_slice,
-                    args: scratch.crease_args.span_mut(start: 0, count: crease_slices),
-                    seen: mut self.tri_count,
-                ),
-                over: crease_slices,
-            )
-            for k in 0..crease_slices {
-                for pass in 0..self.crease_passes {
-                    dispatch(
-                        refine_creases.bind(
-                            fields: fields,
-                            grids: grids,
-                            active: scratch.active.items(),
-                            chunk_start: chunk_start,
-                            corners: scratch.corners.items(),
-                            creases: scratch.creases.items(),
-                            crease_count: scratch.creases.count(),
-                            first: k * self.crease_slice,
-                            pass: pass,
-                            solves: mut scratch.crease_solves,
-                            cap_verts: self.cap_verts,
-                            cell_verts: mut scratch.cell_verts,
-                            verts: mut self.verts,
-                        ),
-                        groups: scratch.crease_args.at(k),
-                        most: self.crease_slice / 64,
-                    )
-                }
-            }
-            if uses_kept {
-                let keep_slices = min(
-                    (chunk_n * VERTS_BRICK + self.keep_slice - 1) / self.keep_slice,
-                    SLICES_MOST,
-                )
-                dispatch(
-                    prep_from.bind(
-                        count: self.verts.count(),
-                        cap: self.cap_verts,
-                        first: self.keep_first.items(),
-                        most: self.keep_slice,
-                        slices: keep_slices,
-                        args: self.keep_args.span_mut(start: 0, count: keep_slices),
-                    ),
-                    over: keep_slices,
-                )
-                for k in 0..keep_slices {
-                    dispatch(
-                        keep_verts.bind(
-                            fields: fields,
-                            verts: self.verts.items(),
-                            vert_count: self.verts.count(),
-                            cap_verts: self.cap_verts,
-                            first: self.keep_first.items(),
-                            from: k * self.keep_slice,
-                            vert_kept: mut self.vert_kept,
-                        ),
-                        groups: self.keep_args.at(k),
-                        most: self.keep_slice / 64,
-                    )
-                }
-            }
-            dispatch(
-                zero_chunk_counts.bind(
-                    counts: scratch.brick_idx_counts.span_mut(start: 0, count: chunk_n),
-                    cursors: scratch.brick_idx_cursor.span_mut(start: 0, count: chunk_n),
-                ),
-                over: chunk_n,
-            )
-            if has_seams {
-                for q in 0..quad_slices {
-                    dispatch(
-                        count_brick_tris_lod.bind(
-                            grids: grids,
-                            active: scratch.active.items(),
-                            active_count: scratch.active.count(),
-                            cap_bricks: effective_cap,
-                            chunk_start: chunk_start,
-                            brick_off: q * self.quad_slice,
-                            corners: scratch.corners.items(),
-                            cell_verts: scratch.cell_verts.items(),
-                            verts: self.verts.items(),
-                            brick_idx_counts: mut scratch.brick_idx_counts,
-                        ),
-                        groups: scratch.quad_args.at(q),
-                        most: min(chunk_n - q * self.quad_slice, self.quad_slice) * 4,
-                    )
-                }
-            } else {
-                for q in 0..quad_slices {
-                    dispatch(
-                        count_brick_tris.bind(
-                            active_count: scratch.active.count(),
-                            cap_bricks: effective_cap,
-                            chunk_start: chunk_start,
-                            brick_off: q * self.quad_slice,
-                            corners: scratch.corners.items(),
-                            cell_verts: scratch.cell_verts.items(),
-                            verts: self.verts.items(),
-                            brick_idx_counts: mut scratch.brick_idx_counts,
-                        ),
-                        groups: scratch.quad_args.at(q),
-                        most: min(chunk_n - q * self.quad_slice, self.quad_slice) * 4,
-                    )
-                }
-            }
-            scan_chunk_offsets(
-                scratch.active.count(),
-                scratch.brick_idx_counts.items(),
-                mut scratch.group_sums,
-                mut scratch.group_offsets,
-                mut scratch.brick_idx_offsets,
-                mut self.tri_count,
+            let c = ChunkMesh {
+                chunk_start,
+                chunk_n,
                 cap_bricks: effective_cap,
-                chunk_start: chunk_start,
-                chunk_n: chunk_n,
-            )
+                lod: has_seams,
+                inherit: has_seams,
+                held: if exact_eye.w > 0.0 { 1 } else { 0 },
+                lip,
+                uses_kept,
+                max_slots: self.watch_slots_cap,
+                crease_slices: self.crease_slices(chunk_n),
+            }
+            self.mesh_chunk_cells(mut scratch, fields, c: c, pooled: false)
             dispatch(
                 write_brick_meta.bind(
-                    grids: grids,
+                    grids: scratch.grids.items(),
                     active: scratch.active.items(),
                     active_count: scratch.active.count(),
                     cap_bricks: effective_cap,
@@ -4678,245 +4918,13 @@ impl MeshBatch {
                 ),
                 over: chunk_n,
             )
-            if has_seams {
-                for q in 0..quad_slices {
-                    dispatch(
-                        emit_tris_lod.bind(
-                            grids: grids,
-                            active: scratch.active.items(),
-                            active_count: scratch.active.count(),
-                            cap_bricks: effective_cap,
-                            cap_indices: self.cap_indices,
-                            cap_trans: self.cap_trans,
-                            chunk_start: chunk_start,
-                            brick_off: q * self.quad_slice,
-                            corners: scratch.corners.items(),
-                            cell_verts: scratch.cell_verts.items(),
-                            verts: self.verts.items(),
-                            brick_idx_offsets: scratch.brick_idx_offsets.items(),
-                            brick_idx_counts: mut scratch.brick_idx_cursor,
-                            tri_count: mut self.tri_count,
-                            indices: mut self.indices,
-                            trans_indices: mut self.trans_indices,
-                            cut_indices: mut self.cut_indices,
-                            seam_quads: mut scratch.seam_quads,
-                            seam_cells: mut scratch.seam_cells,
-                            seam_verts: mut scratch.seam_verts,
-                            held: if (exact_eye).w > 0.0 { 1 } else { 0 },
-                            slot_base: scratch.zero_u32.items(),
-                            max_slots: self.watch_slots_cap,
-                            cap_exact_slots: 0,
-                            exact_seen: mut scratch.exact_seen,
-                            exact_cells: mut self.exact_cells,
-                            exact_slots: mut scratch.dummy_exact_slots,
-                            quad_recs: mut self.quad_recs,
-                        ),
-                        groups: scratch.quad_args.at(q),
-                        most: min(chunk_n - q * self.quad_slice, self.quad_slice) * 4,
-                    )
-                }
-            } else {
-                for q in 0..quad_slices {
-                    dispatch(
-                        emit_tris.bind(
-                            grids: grids,
-                            active: scratch.active.items(),
-                            active_count: scratch.active.count(),
-                            cap_bricks: effective_cap,
-                            cap_indices: self.cap_indices,
-                            cap_trans: self.cap_trans,
-                            chunk_start: chunk_start,
-                            brick_off: q * self.quad_slice,
-                            held: if (exact_eye).w > 0.0 { 1 } else { 0 },
-                            slot_base: scratch.zero_u32.items(),
-                            max_slots: self.watch_slots_cap,
-                            cap_exact_slots: 0,
-                            corners: scratch.corners.items(),
-                            cell_verts: scratch.cell_verts.items(),
-                            verts: self.verts.items(),
-                            brick_idx_offsets: scratch.brick_idx_offsets.items(),
-                            brick_idx_counts: mut scratch.brick_idx_cursor,
-                            tri_count: mut self.tri_count,
-                            indices: mut self.indices,
-                            trans_indices: mut self.trans_indices,
-                            cut_indices: mut self.cut_indices,
-                            exact_seen: mut scratch.exact_seen,
-                            exact_cells: mut self.exact_cells,
-                            exact_slots: mut scratch.dummy_exact_slots,
-                            quad_recs: mut self.quad_recs,
-                        ),
-                        groups: scratch.quad_args.at(q),
-                        most: min(chunk_n - q * self.quad_slice, self.quad_slice) * 4,
-                    )
-                }
-            }
+            self.mesh_chunk_quads(mut scratch, c: c, pooled: false)
             chunk_start += chunk_n
         }
 
-        // Passes 3b–3d (Multi-LOD only): Solve enclosing coarse cells on 2:1 seam faces on the fly
-        // (bit-for-bit identical to the parent level) and emit watertight seam triangles/quads.
+        // The 2:1 seams' stitch, into the slices of their fine bricks.
         if has_seams {
-            dispatch(
-                record_seam_start.bind(
-                    tri_count: self.tri_count.items(),
-                    seam_start: mut self.seam_start,
-                ),
-                over: 1,
-            )
-            let seam_slices = self.seam_slices()
-            dispatch(
-                note_seams.bind(
-                    seam_count: scratch.seam_cells.count(),
-                    tested: seam_slices * self.seam_slice,
-                    tri_count: mut self.tri_count,
-                ),
-                over: 1,
-            )
-            dispatch(
-                prep_slices.bind(
-                    count: scratch.seam_cells.count(),
-                    cap: CAP_SEAM * 2,
-                    most: self.seam_slice,
-                    slices: seam_slices,
-                    args: scratch.seam_args.span_mut(start: 0, count: seam_slices),
-                ),
-                over: seam_slices,
-            )
-            if use_exact {
-                dispatch(
-                    reset_seam_seen.bind(
-                        seam_seen: scratch.seam_seen.span_mut(start: 0, count: SEAM_SEEN),
-                    ),
-                    over: SEAM_SEEN,
-                )
-                for k in 0..seam_slices {
-                    dispatch(
-                        box_seam_cells.bind(
-                            fields: fields,
-                            grids: grids,
-                            seam_cells: scratch.seam_cells.items(),
-                            seam_cell_count: scratch.seam_cells.count(),
-                            first: k * self.seam_slice,
-                            seam_seen: mut scratch.seam_seen,
-                            exact_cells: mut self.exact_cells,
-                        ),
-                        groups: scratch.seam_args.at(k),
-                        most: self.seam_slice / 64,
-                    )
-                }
-            }
-            if uses_kept {
-                dispatch(
-                    mark_first.bind(
-                        vert_count: self.verts.count(),
-                        cap_verts: self.cap_verts,
-                        first: mut self.keep_first,
-                    ),
-                    over: 1,
-                )
-            }
-            for k in 0..seam_slices {
-                dispatch(
-                    solve_seam_smooth.bind(
-                        fields: fields,
-                        grids: grids,
-                        seam_cells: scratch.seam_cells.items(),
-                        seam_cell_count: scratch.seam_cells.count(),
-                        first: k * self.seam_slice,
-                        cap_verts: self.cap_verts,
-                        verts: mut self.verts,
-                        seam_verts: mut scratch.seam_verts,
-                        seam_creases: mut scratch.seam_creases,
-                    ),
-                    groups: scratch.seam_args.at(k),
-                    most: self.seam_slice / 64,
-                )
-            }
-            dispatch(
-                prep_slices.bind(
-                    count: scratch.seam_creases.count(),
-                    cap: CAP_SEAM * 2,
-                    most: seam_c_slice,
-                    slices: seam_c_slices,
-                    args: scratch.crease_args.span_mut(start: 0, count: seam_c_slices),
-                ),
-                over: seam_c_slices,
-            )
-            for k in 0..seam_c_slices {
-                for pass in 0..self.crease_passes {
-                    dispatch(
-                        refine_seam_creases.bind(
-                            fields: fields,
-                            grids: grids,
-                            seam_cells: scratch.seam_cells.items(),
-                            seam_creases: scratch.seam_creases.items(),
-                            seam_crease_count: scratch.seam_creases.count(),
-                            first: k * seam_c_slice,
-                            pass: pass,
-                            solves: mut scratch.crease_solves,
-                            cap_verts: self.cap_verts,
-                            verts: mut self.verts,
-                            seam_verts: mut scratch.seam_verts,
-                        ),
-                        groups: scratch.crease_args.at(k),
-                        most: seam_c_slice / 64,
-                    )
-                }
-            }
-            if uses_kept {
-                dispatch(
-                    prep_from.bind(
-                        count: self.verts.count(),
-                        cap: self.cap_verts,
-                        first: self.keep_first.items(),
-                        most: self.keep_slice,
-                        slices: seam_keep_slices,
-                        args: self.keep_args.span_mut(start: 0, count: seam_keep_slices),
-                    ),
-                    over: seam_keep_slices,
-                )
-                for k in 0..seam_keep_slices {
-                    dispatch(
-                        keep_verts.bind(
-                            fields: fields,
-                            verts: self.verts.items(),
-                            vert_count: self.verts.count(),
-                            cap_verts: self.cap_verts,
-                            first: self.keep_first.items(),
-                            from: k * self.keep_slice,
-                            vert_kept: mut self.vert_kept,
-                        ),
-                        groups: self.keep_args.at(k),
-                        most: self.keep_slice / 64,
-                    )
-                }
-            }
-            dispatch(
-                prep_slices.bind(
-                    count: scratch.seam_quads.count(),
-                    cap: CAP_SEAM,
-                    most: CAP_SEAM,
-                    slices: 1,
-                    args: scratch.surf_args.span_mut(start: 0, count: 1),
-                ),
-                over: 1,
-            )
-            dispatch(
-                finish_seam_tris.bind(
-                    seam_quads: scratch.seam_quads.items(),
-                    seam_quad_count: scratch.seam_quads.count(),
-                    seam_verts: scratch.seam_verts.items(),
-                    verts: self.verts.items(),
-                    cap_indices: self.cap_indices,
-                    cap_trans: self.cap_trans,
-                    tri_count: mut self.tri_count,
-                    indices: mut self.indices,
-                    trans_indices: mut self.trans_indices,
-                    cut_indices: mut self.cut_indices,
-                ),
-                groups: scratch.surf_args.at(0),
-                most: CAP_SEAM / 64,
-            )
+            self.stitch_seams(mut scratch, fields, held: use_exact, uses_kept: uses_kept, pooled: false)
         }
 
         dispatch(
@@ -4926,7 +4934,6 @@ impl MeshBatch {
                 seam_quad_count: scratch.seam_quads.count(),
                 seam_cell_count: scratch.seam_cells.count(),
                 exact_count: self.exact_cells.count(),
-                seam_start: self.seam_start.items(),
                 has_seams: if has_seams { 1 } else { 0 },
                 cap_indices: self.cap_indices,
                 cap_trans: self.cap_trans,
@@ -4936,7 +4943,6 @@ impl MeshBatch {
                 args: mut self.draw_args,
                 trans_args: mut self.trans_draw_args,
                 cut_args: mut self.cut_draw_args,
-                seam_args: mut self.seam_draw_args,
                 exact_args: mut self.exact_draw_args,
             ),
             over: 1,
@@ -4955,1557 +4961,6 @@ impl MeshBatch {
         // Read back what was drawn (queued at frame end, never here, so mid-frame extraction
         // never flushes the GPU).
         self.note_extracted(true)
-    }
-
-    /// World-anchored persistent `BrickPool` update for static Multi-LOD fields:
-    /// - Reuses resident interior bricks (`brick_seam_mask == 0`) by 128-bit integer `BrickKey`
-    ///   with zero re-extraction across LOD ring moves and camera motion.
-    /// - Extracts only newly entered interior bricks (`miss_interior`) into persistent slots and
-    ///   re-extracts only the thin 1-brick 2:1 seam shell (`active_seam`) into a reclaimed tail.
-    /// - Compacts active brick indices + seam strip into contiguous `self.indices` on GPU (`< 0.1 ms`)
-    ///   so every downstream render pass draws one single indirect call.
-    fn run_pool_update<M: Field<Substance>>(
-        mut self,
-        scratch: mut ExtractScratch,
-        fields: GpuSpan<M>,
-        sample: M,
-        field_key: u64,
-        cut: Vec<GridSpec>,
-        things: u32,
-        total_bricks: u32,
-        has_seams: bool,
-        exact_eye: vec4,
-        lip: f32,
-        eye_reach: f32 = 0.0,
-    ) {
-        label("mesh_extract")
-        let use_exact = exact_eye.w > 0.0
-        let uses_kept = sample.uses_kept()
-        if uses_kept {
-            self.keep_slice = keep_slice_of(sample)
-        }
-        let step = crease_step_cost_of(sample)
-        let crease_kernel = refine_creases.bind(
-            fields: fields,
-            grids: scratch.grids.items(),
-            active: scratch.active.items(),
-            chunk_start: 0,
-            corners: scratch.corners.items(),
-            creases: scratch.creases.items(),
-            crease_count: scratch.creases.count(),
-            first: 0,
-            pass: 0,
-            solves: mut scratch.crease_solves,
-            cap_verts: self.cap_verts,
-            cell_verts: mut scratch.cell_verts,
-            verts: mut self.verts,
-        )
-        self.crease_slice = crease_slice(kernel_work(crease_kernel))
-        let seam_kernel = refine_seam_creases.bind(
-            fields: fields,
-            grids: scratch.grids.items(),
-            seam_cells: scratch.seam_cells.items(),
-            seam_creases: scratch.seam_creases.items(),
-            seam_crease_count: scratch.seam_creases.count(),
-            first: 0,
-            pass: 0,
-            solves: mut scratch.crease_solves,
-            cap_verts: self.cap_verts,
-            verts: mut self.verts,
-            seam_verts: mut scratch.seam_verts,
-        )
-        self.seam_crease_slice = crease_slice(kernel_work(seam_kernel))
-        self.crease_passes = crease_passes(crease_part(step))
-        let surf_kernel = solve_verts.bind(
-            fields: fields,
-            grids: scratch.grids.items(),
-            active: scratch.active.items(),
-            chunk_start: 0,
-            corners: scratch.corners.items(),
-            surf: scratch.surf.items(),
-            surf_count: scratch.surf.count(),
-            first: 0,
-            cap_verts: self.cap_verts,
-            cell_verts: mut scratch.cell_verts,
-            verts: mut self.verts,
-            creases: mut scratch.creases,
-        )
-        self.surf_slice = surf_slice(kernel_work(surf_kernel))
-        self.seam_slice = min(
-            lane_slice(
-                kernel_work(solve_seam_smooth.bind(
-                    fields: fields,
-                    grids: scratch.grids.items(),
-                    seam_cells: scratch.seam_cells.items(),
-                    seam_cell_count: scratch.seam_cells.count(),
-                    first: 0,
-                    cap_verts: self.cap_verts,
-                    verts: mut self.verts,
-                    seam_verts: mut scratch.seam_verts,
-                    seam_creases: mut scratch.seam_creases,
-                )),
-                most: SEAM_SLICE,
-            ),
-            lane_slice(
-                kernel_work(box_seam_cells.bind(
-                    fields: fields,
-                    grids: scratch.grids.items(),
-                    seam_cells: scratch.seam_cells.items(),
-                    seam_cell_count: scratch.seam_cells.count(),
-                    first: 0,
-                    seam_seen: mut scratch.seam_seen,
-                    exact_cells: mut scratch.seam_exact_cells,
-                )),
-                most: SEAM_SLICE,
-            ),
-        )
-        self.inherit_slice = min(
-            brick_slice(lanes: 512, invocation: kernel_work(inherit_seam_corners.bind(
-                fields: fields,
-                grids: scratch.grids.items(),
-                active: scratch.active.items(),
-                active_count: scratch.active.count(),
-                cap_bricks: self.max_bricks,
-                chunk_start: 0,
-                brick_off: 0,
-                corners_in: scratch.corners_raw.items(),
-                corners_out: scratch.corners.span_mut(start: 0, count: CORNERS_BRICK),
-            ))),
-            CHUNK_BRICKS,
-        )
-        self.eval_slice = brick_slice(
-            lanes: 512,
-            invocation: kernel_work(eval_corners.bind(
-                fields: fields,
-                grids: scratch.grids.items(),
-                active: scratch.active.items(),
-                active_count: scratch.active.count(),
-                cap_bricks: self.max_bricks,
-                chunk_start: 0,
-                brick_off: 0,
-                corners: scratch.corners.span_mut(start: 0, count: CORNERS_BRICK),
-            )),
-        )
-        self.quad_slice = brick_slice(lanes: 256, invocation: kernel_work(emit_tris_lod.bind(
-            grids: scratch.grids.items(),
-            active: scratch.active.items(),
-            active_count: scratch.active.count(),
-            cap_bricks: self.max_bricks,
-            cap_indices: self.cap_indices,
-            cap_trans: self.cap_trans,
-            chunk_start: 0,
-            brick_off: 0,
-            corners: scratch.corners.items(),
-            cell_verts: scratch.cell_verts.items(),
-            verts: self.verts.items(),
-            brick_idx_offsets: scratch.brick_idx_offsets.items(),
-            brick_idx_counts: mut scratch.brick_idx_cursor,
-            tri_count: mut self.pool_tri_count,
-            indices: mut self.pool_indices,
-            trans_indices: mut self.trans_indices,
-            cut_indices: mut self.cut_indices,
-            seam_quads: mut scratch.seam_quads,
-            seam_cells: mut scratch.seam_cells,
-            seam_verts: mut scratch.seam_verts,
-            held: if use_exact { 1 } else { 0 },
-            slot_base: self.pool_slot_base.items(),
-            max_slots: max(self.watch_slots_cap, 1),
-            cap_exact_slots: self.pool_exact_cap,
-            exact_seen: mut scratch.exact_seen,
-            exact_cells: mut self.pool_exact_cells,
-            exact_slots: mut self.pool_exact_slots,
-            quad_recs: mut self.quad_recs,
-        )))
-
-        // Ensure output, pool, and watch storage; any buffer reallocation forces a clean cold populate.
-        let old_verts = self.cap_verts
-        let old_kept = self.vert_kept_cap
-        let active_est = if self.active_hint > 0 { self.active_hint } else { min(total_bricks, 8192) }
-        let pool_target_bricks = min(max(active_est * 3, 4096), min(self.max_bricks, 49152))
-        self.ensure_cap(pool_target_bricks)
-        if uses_kept {
-            self.ensure_vert_kept(self.cap_verts)
-        }
-        // The drawn exact cells are the live slots' of the arena's and the seam tail's (and the
-        // outline's of a frame): the drawn list holds the most there are, so a commit never drops
-        // one.
-        if use_exact {
-            self.ensure_exact_cap(CAP_EXACT_MAX)
-        }
-        let grew_pool = self.ensure_pool(pool_target_bricks, CAP_EXACT_MAX)
-        let total_slots = self.pool_cap + SEAM_SLOTS_CAP
-        let grew_watch = if use_exact { self.ensure_watch(need_slots: total_slots) } else { false }
-        let reallocated = grew_pool || grew_watch || self.cap_verts != old_verts || self.vert_kept_cap != old_kept
-
-        let same_space = self.pooled &&
-            !reallocated &&
-            self.pool_field_key == field_key &&
-            self.pool_origin == scratch.origin0 &&
-            self.pool_shift == scratch.lattice
-        let room_ok = self.pool_cap > 0 &&
-            self.pool_used_exact < self.pool_exact_cap / 2 &&
-            self.pool_used_slots < (self.pool_cap * 4) / 5 &&
-            self.pool_used_idx < (self.pool_idx_cap * 4) / 5 &&
-            self.verts_known < (self.cap_verts * 4) / 5
-        let warm = same_space && room_ok
-
-        // Compute indirect-dispatch budget for misses, seam bricks, seam strip, and compaction.
-        let exact_indirect: u32 = if use_exact { 2 } else { 0 }
-        let surf_per_chunk = min(
-            (CHUNK_BRICKS * VERTS_BRICK + self.surf_slice - 1) / self.surf_slice,
-            SLICES_MOST,
-        )
-        let keep_per_chunk = if uses_kept {
-            min((CHUNK_BRICKS * VERTS_BRICK + self.keep_slice - 1) / self.keep_slice, SLICES_MOST)
-        } else {
-            0
-        }
-        let eval_per_chunk = (CHUNK_BRICKS + self.eval_slice - 1) / self.eval_slice
-        let quad_per_chunk = (CHUNK_BRICKS + self.quad_slice - 1) / self.quad_slice
-        let per_chunk = CHUNK_INDIRECT +
-            (surf_per_chunk - 1) +
-            (eval_per_chunk - 1) +
-            2 * (quad_per_chunk - 1) +
-            keep_per_chunk +
-            exact_indirect +
-            self.crease_slices(CHUNK_BRICKS) * self.crease_passes
-        let seam_c_slice = min(SEAM_SLICE, self.seam_crease_slice)
-        let seam_c_slices = if has_seams {
-            min((self.seam_slices() * self.seam_slice + seam_c_slice - 1) / seam_c_slice, SLICES_MOST)
-        } else {
-            0
-        }
-        let seam_keep_slices = if has_seams && uses_kept {
-            min((self.seam_slices() * self.seam_slice + self.keep_slice - 1) / self.keep_slice, SLICES_MOST)
-        } else {
-            0
-        }
-        let seam_strip_indirect: u32 = if !has_seams {
-            0
-        } else if use_exact {
-            2 * self.seam_slices() + seam_c_slices * self.crease_passes + seam_keep_slices + 1
-        } else {
-            self.seam_slices() + seam_c_slices * self.crease_passes + seam_keep_slices + 1
-        }
-        let super_sub_k = cull_bricks_sub.bind(
-            fields: fields,
-            grids: scratch.grids.items(),
-            super_active: scratch.super_active.items(),
-            super_count: scratch.super_active.count(),
-            cap_super: 65536,
-            first: 0,
-            fc: frustum_cull_none(),
-            active: mut scratch.active,
-        )
-        let super_sub_slice = max(
-            u32(clamp(
-                f32(limits().step_work) * 1000.0 / (64.0 * (f32(kernel_work(super_sub_k)) + 2000.0)),
-                1.0,
-                4096.0,
-            )),
-            1,
-        )
-        let super_slices = if scratch.total_super > 0 {
-            min((scratch.total_super + super_sub_slice - 1) / super_sub_slice, SLICES_MOST)
-        } else {
-            0
-        }
-        let use_super = total_bricks >= 512 &&
-            scratch.total_super > 0 &&
-            scratch.total_super <= 65536 &&
-            super_slices * super_sub_slice >= scratch.total_super
-        let super_indirect: u32 = if use_super { super_slices } else { 0 }
-        let pool_fixed_indirect: u32 = 8 + seam_strip_indirect + super_indirect
-        let avail = if scratch.indirect_left > pool_fixed_indirect {
-            scratch.indirect_left - pool_fixed_indirect
-        } else {
-            0
-        }
-        let fit_chunks = max(avail / per_chunk, 1)
-        // The most this cut can miss of what the pool holds (the last cut whose misses all fit
-        // what was dispatched for them), and the most seam bricks it has: counts from the boxes
-        // (`cut_bounds`), so an update dispatched for them commits.
-        let held_cut = if warm { self.pool_grids.clone() } else { Vec::new() }
-        let (miss_bound, seam_bound) = cut_bounds(held_cut, cut.clone())
-        let seam_chunks_want: u32 = if !has_seams {
-            0
-        } else {
-            (min(seam_bound, SEAM_SLOTS_CAP) + CHUNK_BRICKS - 1) / CHUNK_BRICKS
-        }
-        let miss_cap_max = min(total_bricks, self.pool_cap)
-        let miss_want = min(miss_bound, miss_cap_max)
-        let miss_chunks_want = max((miss_want + CHUNK_BRICKS - 1) / CHUNK_BRICKS, 1)
-        let total_chunks_want = miss_chunks_want + seam_chunks_want
-        let seam_chunks = if has_seams {
-            min(seam_chunks_want, max(fit_chunks / 3, 1))
-        } else {
-            0
-        }
-        let miss_chunks = max(if fit_chunks > seam_chunks { min(miss_chunks_want, fit_chunks - seam_chunks) } else { 1 }, 1)
-        let miss_limit = min(miss_chunks * CHUNK_BRICKS, self.pool_cap)
-        let seam_limit = if has_seams { min(seam_chunks * CHUNK_BRICKS, SEAM_SLOTS_CAP) } else { 0 }
-        let would_short = total_chunks_want > fit_chunks
-        let alone_chunks = if EXTRACT_INDIRECT > pool_fixed_indirect {
-            max((EXTRACT_INDIRECT - pool_fixed_indirect) / per_chunk, 1)
-        } else {
-            1
-        }
-        self.last_wanted = total_chunks_want * CHUNK_BRICKS
-        self.last_alone = alone_chunks * CHUNK_BRICKS
-        self.last_per_chunk = per_chunk
-        if would_short && self.built && self.certified && total_chunks_want <= alone_chunks {
-            self.budget_short = true
-            return
-        }
-
-        scratch.indirect_left -= min(scratch.indirect_left, pool_fixed_indirect + (miss_chunks + seam_chunks) * per_chunk)
-        // What the pool holds once this update commits: its cut, when every miss it can have is
-        // dispatched for (else the last such cut, still held, or nothing after a cold one).
-        if miss_limit >= miss_bound {
-            self.pool_grids = cut.clone()
-        } else if !warm {
-            self.pool_grids = Vec::new()
-        }
-        self.budget_short = would_short
-        self.certified = !would_short
-        self.exact_eye = exact_eye
-        self.eye_reach = eye_reach
-        self.exact_lip = lip
-        self.watched = use_exact
-        self.extract_total = total_bricks
-        self.extract_limit = min(total_bricks, self.pool_cap)
-
-        // Cold reset vs warm watermark restore.
-        if !warm {
-            dispatch(
-                reset_pool_hash.bind(hash_slots: self.pool_hash_slots.items_mut()),
-                over: self.pool_hash_cap,
-            )
-            write(mut self.pool_marks, 0, Vec::filled(POOL_MARK_WORDS, 0))
-            write(mut self.pool_tri_count, 0, Vec::filled(16, 0))
-            write(mut self.pool_slot_base, 0, [0])
-            write(mut self.pool_seam_base, 0, [self.pool_cap])
-            self.verts.clear()
-            self.pool_exact_cells.clear()
-            if use_exact {
-                self.quad_recs.clear()
-                self.thin_keep.clear()
-                zero_u32_buf(mut self.vert_cert, self.watch_verts_cap)
-                zero_u32_buf(mut self.thin_proof, self.watch_verts_cap)
-                if self.place_cert_field_key != field_key {
-                    dispatch(
-                        reset_place_cert.bind(hash_slots: self.place_cert_hash.items_mut()),
-                        over: PLACE_CERT_HASH,
-                    )
-                    self.place_cert_entries.clear()
-                    self.place_cert_field_key = field_key
-                }
-                self.watch_origin = scratch.origin0
-                self.watch_shift = scratch.lattice
-            }
-            self.pool_field_key = field_key
-            self.pool_origin = scratch.origin0
-            self.pool_shift = scratch.lattice
-            self.pool_used_slots = 0
-            self.pool_used_idx = 0
-            self.pool_used_exact = 0
-        }
-        write(mut self.tri_count, 0, Vec::filled(TRI_WORDS, 0))
-        scratch.active.clear()
-        scratch.miss_interior.clear()
-        scratch.active_seam.clear()
-        scratch.draw_slots.clear()
-        scratch.seam_quads.clear()
-        scratch.seam_cells.clear()
-        scratch.seam_creases.clear()
-        scratch.seam_exact_cells.clear()
-        // What the probe counts and the seam strip's counts start each update at 0; what is
-        // drawn is the committed cut's until `pool_decide` commits.
-        write(mut scratch.seam_tri_count, 0, Vec::filled(16, 0))
-        write(mut scratch.pool_stats, 0, Vec::filled(8, 0))
-
-        let grids = scratch.grids.items()
-        let fc = frustum_cull_none()
-        label("mesh_extract_cull")
-        // Pass 0: Interval-cull all bricks of the new distance-only cut.
-        if use_super {
-            scratch.super_active.clear()
-            let super_most = lane_slice(
-                kernel_work(super_cull_bricks.bind(
-                    fields: fields,
-                    grids: grids,
-                    super_grids: scratch.super_grids.items(),
-                    things: things,
-                    first_super: 0,
-                    total_super: scratch.total_super,
-                    fc: fc,
-                    super_active: mut scratch.super_active,
-                )),
-                most: CULL_CHUNK,
-            )
-            var s_first: u32 = 0
-            while s_first < scratch.total_super {
-                let sn = min(scratch.total_super - s_first, super_most)
-                dispatch(
-                    super_cull_bricks.bind(
-                        fields: fields,
-                        grids: grids,
-                        super_grids: scratch.super_grids.items(),
-                        things: things,
-                        first_super: s_first,
-                        total_super: scratch.total_super,
-                        fc: fc,
-                        super_active: mut scratch.super_active,
-                    ),
-                    over: sn,
-                )
-                s_first += sn
-            }
-            dispatch(
-                prep_super_sub.bind(
-                    super_count: scratch.super_active.count(),
-                    cap_super: 65536,
-                    most: super_sub_slice,
-                    slices: super_slices,
-                    args: scratch.super_args.span_mut(start: 0, count: super_slices),
-                ),
-                over: super_slices,
-            )
-            for sk in 0..super_slices {
-                dispatch(
-                    cull_bricks_sub.bind(
-                        fields: fields,
-                        grids: grids,
-                        super_active: scratch.super_active.items(),
-                        super_count: scratch.super_active.count(),
-                        cap_super: 65536,
-                        first: sk * super_sub_slice,
-                        fc: fc,
-                        active: mut scratch.active,
-                    ),
-                    groups: scratch.super_args.at(sk),
-                    most: super_sub_slice,
-                )
-            }
-        } else {
-            let cull_most = lane_slice(
-                kernel_work(cull_bricks.bind(
-                    fields: fields,
-                    grids: grids,
-                    things: things,
-                    first_brick: 0,
-                    total_bricks: total_bricks,
-                    fc: fc,
-                    active: mut scratch.active,
-                )),
-                most: CULL_CHUNK,
-            )
-            var first: u32 = 0
-            while first < total_bricks {
-                let n = min(total_bricks - first, cull_most)
-                dispatch(
-                    cull_bricks.bind(
-                        fields: fields,
-                        grids: grids,
-                        things: things,
-                        first_brick: first,
-                        total_bricks: total_bricks,
-                        fc: fc,
-                        active: mut scratch.active,
-                    ),
-                    over: n,
-                )
-                first += n
-            }
-        }
-
-        label("mesh_extract_probe")
-        // Pass 1: Probe BrickPool hash table (resident hits -> draw_slots, misses -> miss_interior, seam -> active_seam).
-        let probe_cap = min(total_bricks, scratch.max_bricks)
-        dispatch(
-            prep_slices.bind(
-                count: scratch.active.count(),
-                cap: probe_cap,
-                most: probe_cap,
-                slices: 1,
-                args: scratch.surf_args.span_mut(start: 0, count: 1),
-            ),
-            over: 1,
-        )
-        dispatch(
-            pool_probe.bind(
-                grids: grids,
-                active: scratch.active.items(),
-                active_count: scratch.active.count(),
-                cap_active: probe_cap,
-                first: 0,
-                hash_mask: self.pool_hash_cap - 1,
-                hash_slots: self.pool_hash_slots.items(),
-                pool_keys: self.pool_keys.items(),
-                draw_slots: mut scratch.draw_slots,
-                miss_interior: mut scratch.miss_interior,
-                active_seam: mut scratch.active_seam,
-                pool_stats: mut scratch.pool_stats,
-            ),
-            groups: scratch.surf_args.at(0),
-            most: (probe_cap + 63) / 64,
-        )
-
-        // Commit or nothing: the misses and seam bricks this update extracts, and the counts it
-        // appends from (the last cut's seam tail reclaimed on a commit, kept whole on none).
-        dispatch(
-            pool_decide.bind(
-                miss_count: scratch.miss_interior.count(),
-                miss_limit: miss_limit,
-                seam_count: scratch.active_seam.count(),
-                seam_limit: seam_limit,
-                pool_cap: self.pool_cap,
-                cold: if warm { 0 } else { 1 },
-                verts_count: self.verts.count(),
-                quad_count: self.quad_recs.count(),
-                thin_count: self.thin_keep.count(),
-                exact_base: self.exact_base.items(),
-                marks: mut self.pool_marks,
-                slot_base: mut self.pool_slot_base,
-                pool_tri_count: mut self.pool_tri_count,
-                gate: mut scratch.pool_gate,
-            ),
-            over: 1,
-        )
-        let gate = scratch.pool_gate.items()
-        scratch.miss_interior.count_from(gate.sub(start: GATE_MISSES, count: 1))
-        scratch.active_seam.count_from(gate.sub(start: GATE_SEAMS, count: 1))
-        self.verts.count_from(gate.sub(start: GATE_VERTS, count: 1))
-        self.quad_recs.count_from(gate.sub(start: GATE_QUADS, count: 1))
-        self.thin_keep.count_from(gate.sub(start: GATE_THIN, count: 1))
-        self.pool_exact_cells.count_from(gate.sub(start: GATE_POOL_EXACT, count: 1))
-        if use_exact && warm {
-            dispatch(
-                prep_zero_seam_certs.bind(
-                    marks: self.pool_marks.items(),
-                    cap_verts: self.watch_verts_cap,
-                    args: mut scratch.zero_seam_args,
-                ),
-                over: 1,
-            )
-            dispatch(
-                zero_seam_certs.bind(
-                    marks: self.pool_marks.items(),
-                    cap_verts: self.watch_verts_cap,
-                    vert_cert: mut self.vert_cert,
-                    thin_proof: mut self.thin_proof,
-                ),
-                groups: scratch.zero_seam_args.at(0),
-                most: min((self.watch_verts_cap + 63) / 64, 65535),
-            )
-        }
-
-        label("mesh_extract_miss")
-        // Pass 2: Extract ONLY interior cache misses into persistent pool slots.
-        var chunk_start: u32 = 0
-        while chunk_start < miss_limit {
-            let chunk_n = min(miss_limit - chunk_start, CHUNK_BRICKS)
-            let eval_slices = (chunk_n + self.eval_slice - 1) / self.eval_slice
-            let quad_slices = (chunk_n + self.quad_slice - 1) / self.quad_slice
-            let chunk_slices = max(eval_slices, quad_slices)
-            dispatch(
-                prep_chunk.bind(
-                    active_count: scratch.miss_interior.count(),
-                    cap_bricks: miss_limit,
-                    chunk_start: chunk_start,
-                    eval_slice: self.eval_slice,
-                    quad_slice: self.quad_slice,
-                    vert_args: mut scratch.vert_args,
-                    eval_args: scratch.eval_args.span_mut(start: 0, count: chunk_slices),
-                    quad_args: scratch.quad_args.span_mut(start: 0, count: chunk_slices),
-                ),
-                over: chunk_slices,
-            )
-            for e in 0..eval_slices {
-                dispatch(
-                    eval_corners.bind(
-                        fields: fields,
-                        grids: grids,
-                        active: scratch.miss_interior.items(),
-                        active_count: scratch.miss_interior.count(),
-                        cap_bricks: miss_limit,
-                        chunk_start: chunk_start,
-                        brick_off: e * self.eval_slice,
-                        corners: scratch.corners.span_mut(
-                            start: e * self.eval_slice * CORNERS_BRICK,
-                            count: min(chunk_n - e * self.eval_slice, self.eval_slice) * CORNERS_BRICK,
-                        ),
-                    ),
-                    groups: scratch.eval_args.at(e),
-                    most: min(chunk_n - e * self.eval_slice, self.eval_slice) * 8,
-                )
-            }
-            scratch.creases.clear()
-            scratch.surf.clear()
-            if self.watched {
-                dispatch(
-                    keep_slots.bind(
-                        grids: grids,
-                        active: scratch.miss_interior.items(),
-                        active_count: scratch.miss_interior.count(),
-                        cap_bricks: miss_limit,
-                        chunk_start: chunk_start,
-                        slot_base: self.pool_slot_base.items(),
-                        max_slots: self.pool_cap,
-                        slots: mut self.slot_bricks,
-                        bits: mut self.watch_bits,
-                    ),
-                    over: chunk_n,
-                )
-            }
-            dispatch(
-                classify_cells.bind(
-                    grids: grids,
-                    active: scratch.miss_interior.items(),
-                    active_count: scratch.miss_interior.count(),
-                    cap_bricks: miss_limit,
-                    chunk_start: chunk_start,
-                    lip: lip,
-                    held: if use_exact { 1 } else { 0 },
-                    slot_base: self.pool_slot_base.items(),
-                    max_slots: self.pool_cap,
-                    corners: scratch.corners.items(),
-                    cell_verts: scratch.cell_verts.span_mut(
-                        start: 0,
-                        count: chunk_n * VERTS_STRIDE,
-                    ),
-                    exact_seen: mut scratch.exact_seen,
-                    surf: mut scratch.surf,
-                    watch_bits: mut self.watch_bits,
-                    thin_keep: mut self.thin_keep,
-                ),
-                groups: scratch.vert_args.at(0),
-                most: chunk_n * 6,
-            )
-            if uses_kept {
-                dispatch(
-                    mark_first.bind(
-                        vert_count: self.verts.count(),
-                        cap_verts: self.cap_verts,
-                        first: mut self.keep_first,
-                    ),
-                    over: 1,
-                )
-            }
-            let surf_slices = min(
-                (chunk_n * VERTS_BRICK + self.surf_slice - 1) / self.surf_slice,
-                SLICES_MOST,
-            )
-            dispatch(
-                prep_slices.bind(
-                    count: scratch.surf.count(),
-                    cap: CAP_SURF,
-                    most: self.surf_slice,
-                    slices: surf_slices,
-                    args: scratch.surf_args.span_mut(start: 0, count: surf_slices),
-                ),
-                over: surf_slices,
-            )
-            for k in 0..surf_slices {
-                dispatch(
-                    solve_verts.bind(
-                        fields: fields,
-                        grids: grids,
-                        active: scratch.miss_interior.items(),
-                        chunk_start: chunk_start,
-                        corners: scratch.corners.items(),
-                        surf: scratch.surf.items(),
-                        surf_count: scratch.surf.count(),
-                        first: k * self.surf_slice,
-                        cap_verts: self.cap_verts,
-                        cell_verts: mut scratch.cell_verts,
-                        verts: mut self.verts,
-                        creases: mut scratch.creases,
-                    ),
-                    groups: scratch.surf_args.at(k),
-                    most: self.surf_slice / 64,
-                )
-            }
-            let crease_slices = self.crease_slices(chunk_n)
-            dispatch(
-                prep_creases.bind(
-                    count: scratch.creases.count(),
-                    slices: crease_slices,
-                    slice: self.crease_slice,
-                    args: scratch.crease_args.span_mut(start: 0, count: crease_slices),
-                    seen: mut self.tri_count,
-                ),
-                over: crease_slices,
-            )
-            for k in 0..crease_slices {
-                for pass in 0..self.crease_passes {
-                    dispatch(
-                        refine_creases.bind(
-                            fields: fields,
-                            grids: grids,
-                            active: scratch.miss_interior.items(),
-                            chunk_start: chunk_start,
-                            corners: scratch.corners.items(),
-                            creases: scratch.creases.items(),
-                            crease_count: scratch.creases.count(),
-                            first: k * self.crease_slice,
-                            pass: pass,
-                            solves: mut scratch.crease_solves,
-                            cap_verts: self.cap_verts,
-                            cell_verts: mut scratch.cell_verts,
-                            verts: mut self.verts,
-                        ),
-                        groups: scratch.crease_args.at(k),
-                        most: self.crease_slice / 64,
-                    )
-                }
-            }
-            if uses_kept {
-                let keep_slices = min(
-                    (chunk_n * VERTS_BRICK + self.keep_slice - 1) / self.keep_slice,
-                    SLICES_MOST,
-                )
-                dispatch(
-                    prep_from.bind(
-                        count: self.verts.count(),
-                        cap: self.cap_verts,
-                        first: self.keep_first.items(),
-                        most: self.keep_slice,
-                        slices: keep_slices,
-                        args: self.keep_args.span_mut(start: 0, count: keep_slices),
-                    ),
-                    over: keep_slices,
-                )
-                for k in 0..keep_slices {
-                    dispatch(
-                        keep_verts.bind(
-                            fields: fields,
-                            verts: self.verts.items(),
-                            vert_count: self.verts.count(),
-                            cap_verts: self.cap_verts,
-                            first: self.keep_first.items(),
-                            from: k * self.keep_slice,
-                            vert_kept: mut self.vert_kept,
-                        ),
-                        groups: self.keep_args.at(k),
-                        most: self.keep_slice / 64,
-                    )
-                }
-            }
-            dispatch(
-                zero_chunk_counts.bind(
-                    counts: scratch.brick_idx_counts.span_mut(start: 0, count: chunk_n),
-                    cursors: scratch.brick_idx_cursor.span_mut(start: 0, count: chunk_n),
-                ),
-                over: chunk_n,
-            )
-            for q in 0..quad_slices {
-                dispatch(
-                    count_brick_tris_lod.bind(
-                        grids: grids,
-                        active: scratch.miss_interior.items(),
-                        active_count: scratch.miss_interior.count(),
-                        cap_bricks: miss_limit,
-                        chunk_start: chunk_start,
-                        brick_off: q * self.quad_slice,
-                        corners: scratch.corners.items(),
-                        cell_verts: scratch.cell_verts.items(),
-                        verts: self.verts.items(),
-                        brick_idx_counts: mut scratch.brick_idx_counts,
-                    ),
-                    groups: scratch.quad_args.at(q),
-                    most: min(chunk_n - q * self.quad_slice, self.quad_slice) * 4,
-                )
-            }
-            scan_chunk_offsets(
-                scratch.miss_interior.count(),
-                scratch.brick_idx_counts.items(),
-                mut scratch.group_sums,
-                mut scratch.group_offsets,
-                mut scratch.brick_idx_offsets,
-                mut self.pool_tri_count,
-                cap_bricks: miss_limit,
-                chunk_start: chunk_start,
-                chunk_n: chunk_n,
-            )
-            dispatch(
-                pool_write_meta.bind(
-                    grids: grids,
-                    active: scratch.miss_interior.items(),
-                    active_count: scratch.miss_interior.count(),
-                    cap_bricks: miss_limit,
-                    cap_indices: self.pool_idx_cap,
-                    chunk_start: chunk_start,
-                    slot_base_buf: self.pool_slot_base.items(),
-                    max_slots: self.pool_cap,
-                    is_interior: 1,
-                    brick_idx_saved: scratch.brick_idx_counts.items(),
-                    brick_idx_offsets: scratch.brick_idx_offsets.items(),
-                    slot_meta: mut self.pool_slot_meta,
-                    pool_keys: mut self.pool_keys,
-                    draw_slots: mut scratch.draw_slots,
-                ),
-                over: chunk_n,
-            )
-            for q in 0..quad_slices {
-                dispatch(
-                    emit_tris_lod.bind(
-                        grids: grids,
-                        active: scratch.miss_interior.items(),
-                        active_count: scratch.miss_interior.count(),
-                        cap_bricks: miss_limit,
-                        cap_indices: self.pool_idx_cap,
-                        cap_trans: self.cap_trans,
-                        chunk_start: chunk_start,
-                        brick_off: q * self.quad_slice,
-                        corners: scratch.corners.items(),
-                        cell_verts: scratch.cell_verts.items(),
-                        verts: self.verts.items(),
-                        brick_idx_offsets: scratch.brick_idx_offsets.items(),
-                        brick_idx_counts: mut scratch.brick_idx_cursor,
-                        tri_count: mut self.pool_tri_count,
-                        indices: mut self.pool_indices,
-                        trans_indices: mut self.trans_indices,
-                        cut_indices: mut self.cut_indices,
-                        seam_quads: mut scratch.seam_quads,
-                        seam_cells: mut scratch.seam_cells,
-                        seam_verts: mut scratch.seam_verts,
-                        held: if use_exact { 1 } else { 0 },
-                        slot_base: self.pool_slot_base.items(),
-                        max_slots: self.pool_cap,
-                        cap_exact_slots: self.pool_exact_cap,
-                        exact_seen: mut scratch.exact_seen,
-                        exact_cells: mut self.pool_exact_cells,
-                        exact_slots: mut self.pool_exact_slots,
-                        quad_recs: mut self.quad_recs,
-                    ),
-                    groups: scratch.quad_args.at(q),
-                    most: min(chunk_n - q * self.quad_slice, self.quad_slice) * 4,
-                )
-            }
-            chunk_start += chunk_n
-        }
-
-        // Insert newly extracted interior bricks into pool_hash_slots and save persistent watermarks.
-        dispatch(
-            prep_slices.bind(
-                count: scratch.miss_interior.count(),
-                cap: miss_limit,
-                most: miss_limit,
-                slices: 1,
-                args: scratch.surf_args.span_mut(start: 0, count: 1),
-            ),
-            over: 1,
-        )
-        dispatch(
-            pool_insert.bind(
-                active_count: scratch.miss_interior.count(),
-                cap_bricks: miss_limit,
-                first: 0,
-                slot_base_buf: self.pool_slot_base.items(),
-                pool_cap: self.pool_cap,
-                hash_mask: self.pool_hash_cap - 1,
-                pool_keys: self.pool_keys.items(),
-                hash_slots: mut self.pool_hash_slots,
-            ),
-            groups: scratch.surf_args.at(0),
-            most: (miss_limit + 63) / 64,
-        )
-        dispatch(
-            save_pool_marks.bind(
-                gate: scratch.pool_gate.items(),
-                miss_count: scratch.miss_interior.count(),
-                miss_limit: miss_limit,
-                pool_cap: self.pool_cap,
-                verts_count: self.verts.count(),
-                quad_count: self.quad_recs.count(),
-                thin_count: self.thin_keep.count(),
-                pool_tri_count: self.pool_tri_count.items(),
-                pool_exact_count: self.pool_exact_cells.count(),
-                marks: mut self.pool_marks,
-            ),
-            over: 1,
-        )
-
-        label("mesh_extract_seam")
-        // Pass 3: Extract transient 2:1 seam-boundary bricks + seam strip (only when `has_seams`).
-        if has_seams && seam_limit > 0 {
-            var s_chunk: u32 = 0
-            while s_chunk < seam_limit {
-                let chunk_n = min(seam_limit - s_chunk, CHUNK_BRICKS)
-                let seam_eval_slice = min(self.eval_slice, self.inherit_slice)
-                let eval_slices = (chunk_n + seam_eval_slice - 1) / seam_eval_slice
-                let quad_slices = (chunk_n + self.quad_slice - 1) / self.quad_slice
-                let chunk_slices = max(eval_slices, quad_slices)
-                dispatch(
-                    prep_chunk.bind(
-                        active_count: scratch.active_seam.count(),
-                        cap_bricks: seam_limit,
-                        chunk_start: s_chunk,
-                        eval_slice: seam_eval_slice,
-                        quad_slice: self.quad_slice,
-                        vert_args: mut scratch.vert_args,
-                        eval_args: scratch.eval_args.span_mut(start: 0, count: chunk_slices),
-                        quad_args: scratch.quad_args.span_mut(start: 0, count: chunk_slices),
-                    ),
-                    over: chunk_slices,
-                )
-                for e in 0..eval_slices {
-                    let band = min(chunk_n - e * seam_eval_slice, seam_eval_slice)
-                    dispatch(
-                        eval_corners.bind(
-                            fields: fields,
-                            grids: grids,
-                            active: scratch.active_seam.items(),
-                            active_count: scratch.active_seam.count(),
-                            cap_bricks: seam_limit,
-                            chunk_start: s_chunk,
-                            brick_off: e * seam_eval_slice,
-                            corners: scratch.corners_raw.span_mut(
-                                start: e * seam_eval_slice * CORNERS_BRICK,
-                                count: band * CORNERS_BRICK,
-                            ),
-                        ),
-                        groups: scratch.eval_args.at(e),
-                        most: band * 8,
-                    )
-                    dispatch(
-                        inherit_seam_corners.bind(
-                            fields: fields,
-                            grids: grids,
-                            active: scratch.active_seam.items(),
-                            active_count: scratch.active_seam.count(),
-                            cap_bricks: seam_limit,
-                            chunk_start: s_chunk,
-                            brick_off: e * seam_eval_slice,
-                            corners_in: scratch.corners_raw.items(),
-                            corners_out: scratch.corners.span_mut(
-                                start: e * seam_eval_slice * CORNERS_BRICK,
-                                count: band * CORNERS_BRICK,
-                            ),
-                        ),
-                        groups: scratch.eval_args.at(e),
-                        most: band * 8,
-                    )
-                }
-                scratch.creases.clear()
-                scratch.surf.clear()
-                if self.watched {
-                    dispatch(
-                        keep_slots.bind(
-                            grids: grids,
-                            active: scratch.active_seam.items(),
-                            active_count: scratch.active_seam.count(),
-                            cap_bricks: seam_limit,
-                            chunk_start: s_chunk,
-                            slot_base: self.pool_seam_base.items(),
-                            max_slots: total_slots,
-                            slots: mut self.slot_bricks,
-                            bits: mut self.watch_bits,
-                        ),
-                        over: chunk_n,
-                    )
-                }
-                dispatch(
-                    classify_cells.bind(
-                        grids: grids,
-                        active: scratch.active_seam.items(),
-                        active_count: scratch.active_seam.count(),
-                        cap_bricks: seam_limit,
-                        chunk_start: s_chunk,
-                        lip: lip,
-                        held: if use_exact { 1 } else { 0 },
-                        slot_base: self.pool_seam_base.items(),
-                        max_slots: total_slots,
-                        corners: scratch.corners.items(),
-                        cell_verts: scratch.cell_verts.span_mut(
-                            start: 0,
-                            count: chunk_n * VERTS_STRIDE,
-                        ),
-                        exact_seen: mut scratch.exact_seen,
-                        surf: mut scratch.surf,
-                        watch_bits: mut self.watch_bits,
-                        thin_keep: mut self.thin_keep,
-                    ),
-                    groups: scratch.vert_args.at(0),
-                    most: chunk_n * 6,
-                )
-                if uses_kept {
-                    dispatch(
-                        mark_first.bind(
-                            vert_count: self.verts.count(),
-                            cap_verts: self.cap_verts,
-                            first: mut self.keep_first,
-                        ),
-                        over: 1,
-                    )
-                }
-                let surf_slices = min(
-                    (chunk_n * VERTS_BRICK + self.surf_slice - 1) / self.surf_slice,
-                    SLICES_MOST,
-                )
-                dispatch(
-                    prep_slices.bind(
-                        count: scratch.surf.count(),
-                        cap: CAP_SURF,
-                        most: self.surf_slice,
-                        slices: surf_slices,
-                        args: scratch.surf_args.span_mut(start: 0, count: surf_slices),
-                    ),
-                    over: surf_slices,
-                )
-                for k in 0..surf_slices {
-                    dispatch(
-                        solve_verts.bind(
-                            fields: fields,
-                            grids: grids,
-                            active: scratch.active_seam.items(),
-                            chunk_start: s_chunk,
-                            corners: scratch.corners.items(),
-                            surf: scratch.surf.items(),
-                            surf_count: scratch.surf.count(),
-                            first: k * self.surf_slice,
-                            cap_verts: self.cap_verts,
-                            cell_verts: mut scratch.cell_verts,
-                            verts: mut self.verts,
-                            creases: mut scratch.creases,
-                        ),
-                        groups: scratch.surf_args.at(k),
-                        most: self.surf_slice / 64,
-                    )
-                }
-                let crease_slices = self.crease_slices(chunk_n)
-                dispatch(
-                    prep_creases.bind(
-                        count: scratch.creases.count(),
-                        slices: crease_slices,
-                        slice: self.crease_slice,
-                        args: scratch.crease_args.span_mut(start: 0, count: crease_slices),
-                        seen: mut scratch.seam_tri_count,
-                    ),
-                    over: crease_slices,
-                )
-                for k in 0..crease_slices {
-                    for pass in 0..self.crease_passes {
-                        dispatch(
-                            refine_creases.bind(
-                                fields: fields,
-                                grids: grids,
-                                active: scratch.active_seam.items(),
-                                chunk_start: s_chunk,
-                                corners: scratch.corners.items(),
-                                creases: scratch.creases.items(),
-                                crease_count: scratch.creases.count(),
-                                first: k * self.crease_slice,
-                                pass: pass,
-                                solves: mut scratch.crease_solves,
-                                cap_verts: self.cap_verts,
-                                cell_verts: mut scratch.cell_verts,
-                                verts: mut self.verts,
-                            ),
-                            groups: scratch.crease_args.at(k),
-                            most: self.crease_slice / 64,
-                        )
-                    }
-                }
-                if uses_kept {
-                    let keep_slices = min(
-                        (chunk_n * VERTS_BRICK + self.keep_slice - 1) / self.keep_slice,
-                        SLICES_MOST,
-                    )
-                    dispatch(
-                        prep_from.bind(
-                            count: self.verts.count(),
-                            cap: self.cap_verts,
-                            first: self.keep_first.items(),
-                            most: self.keep_slice,
-                            slices: keep_slices,
-                            args: self.keep_args.span_mut(start: 0, count: keep_slices),
-                        ),
-                        over: keep_slices,
-                    )
-                    for k in 0..keep_slices {
-                        dispatch(
-                            keep_verts.bind(
-                                fields: fields,
-                                verts: self.verts.items(),
-                                vert_count: self.verts.count(),
-                                cap_verts: self.cap_verts,
-                                first: self.keep_first.items(),
-                                from: k * self.keep_slice,
-                                vert_kept: mut self.vert_kept,
-                            ),
-                            groups: self.keep_args.at(k),
-                            most: self.keep_slice / 64,
-                        )
-                    }
-                }
-                dispatch(
-                    zero_chunk_counts.bind(
-                        counts: scratch.brick_idx_counts.span_mut(start: 0, count: chunk_n),
-                        cursors: scratch.brick_idx_cursor.span_mut(start: 0, count: chunk_n),
-                    ),
-                    over: chunk_n,
-                )
-                for q in 0..quad_slices {
-                    dispatch(
-                        count_brick_tris_lod.bind(
-                            grids: grids,
-                            active: scratch.active_seam.items(),
-                            active_count: scratch.active_seam.count(),
-                            cap_bricks: seam_limit,
-                            chunk_start: s_chunk,
-                            brick_off: q * self.quad_slice,
-                            corners: scratch.corners.items(),
-                            cell_verts: scratch.cell_verts.items(),
-                            verts: self.verts.items(),
-                            brick_idx_counts: mut scratch.brick_idx_counts,
-                        ),
-                        groups: scratch.quad_args.at(q),
-                        most: min(chunk_n - q * self.quad_slice, self.quad_slice) * 4,
-                    )
-                }
-                scan_chunk_offsets(
-                    scratch.active_seam.count(),
-                    scratch.brick_idx_counts.items(),
-                    mut scratch.group_sums,
-                    mut scratch.group_offsets,
-                    mut scratch.brick_idx_offsets,
-                    mut self.pool_tri_count,
-                    cap_bricks: seam_limit,
-                    chunk_start: s_chunk,
-                    chunk_n: chunk_n,
-                )
-                dispatch(
-                    pool_write_meta.bind(
-                        grids: grids,
-                        active: scratch.active_seam.items(),
-                        active_count: scratch.active_seam.count(),
-                        cap_bricks: seam_limit,
-                        cap_indices: self.pool_idx_cap,
-                        chunk_start: s_chunk,
-                        slot_base_buf: self.pool_seam_base.items(),
-                        max_slots: total_slots,
-                        is_interior: 0,
-                        brick_idx_saved: scratch.brick_idx_counts.items(),
-                        brick_idx_offsets: scratch.brick_idx_offsets.items(),
-                        slot_meta: mut self.pool_slot_meta,
-                        pool_keys: mut self.pool_keys,
-                        draw_slots: mut scratch.draw_slots,
-                    ),
-                    over: chunk_n,
-                )
-                for q in 0..quad_slices {
-                    dispatch(
-                        emit_tris_lod.bind(
-                            grids: grids,
-                            active: scratch.active_seam.items(),
-                            active_count: scratch.active_seam.count(),
-                            cap_bricks: seam_limit,
-                            cap_indices: self.pool_idx_cap,
-                            cap_trans: self.cap_trans,
-                            chunk_start: s_chunk,
-                            brick_off: q * self.quad_slice,
-                            corners: scratch.corners.items(),
-                            cell_verts: scratch.cell_verts.items(),
-                            verts: self.verts.items(),
-                            brick_idx_offsets: scratch.brick_idx_offsets.items(),
-                            brick_idx_counts: mut scratch.brick_idx_cursor,
-                            tri_count: mut self.pool_tri_count,
-                            indices: mut self.pool_indices,
-                            trans_indices: mut self.trans_indices,
-                            cut_indices: mut self.cut_indices,
-                            seam_quads: mut scratch.seam_quads,
-                            seam_cells: mut scratch.seam_cells,
-                            seam_verts: mut scratch.seam_verts,
-                            held: if use_exact { 1 } else { 0 },
-                            slot_base: self.pool_seam_base.items(),
-                            max_slots: total_slots,
-                            cap_exact_slots: 0,
-                            exact_seen: mut scratch.exact_seen,
-                            exact_cells: mut scratch.seam_exact_cells,
-                            exact_slots: mut scratch.dummy_exact_slots,
-                            quad_recs: mut self.quad_recs,
-                        ),
-                        groups: scratch.quad_args.at(q),
-                        most: min(chunk_n - q * self.quad_slice, self.quad_slice) * 4,
-                    )
-                }
-                s_chunk += chunk_n
-            }
-
-            // 2:1 seam strip (into transient `scratch.seam_strip_indices`).
-            let seam_slices = self.seam_slices()
-            dispatch(
-                note_seams.bind(
-                    seam_count: scratch.seam_cells.count(),
-                    tested: seam_slices * self.seam_slice,
-                    tri_count: mut scratch.seam_tri_count,
-                ),
-                over: 1,
-            )
-            dispatch(
-                prep_slices.bind(
-                    count: scratch.seam_cells.count(),
-                    cap: CAP_SEAM * 2,
-                    most: self.seam_slice,
-                    slices: seam_slices,
-                    args: scratch.seam_args.span_mut(start: 0, count: seam_slices),
-                ),
-                over: seam_slices,
-            )
-            if use_exact {
-                dispatch(
-                    reset_seam_seen.bind(
-                        seam_seen: scratch.seam_seen.span_mut(start: 0, count: SEAM_SEEN),
-                    ),
-                    over: SEAM_SEEN,
-                )
-                for k in 0..seam_slices {
-                    dispatch(
-                        box_seam_cells.bind(
-                            fields: fields,
-                            grids: grids,
-                            seam_cells: scratch.seam_cells.items(),
-                            seam_cell_count: scratch.seam_cells.count(),
-                            first: k * self.seam_slice,
-                            seam_seen: mut scratch.seam_seen,
-                            exact_cells: mut scratch.seam_exact_cells,
-                        ),
-                        groups: scratch.seam_args.at(k),
-                        most: self.seam_slice / 64,
-                    )
-                }
-            }
-            if uses_kept {
-                dispatch(
-                    mark_first.bind(
-                        vert_count: self.verts.count(),
-                        cap_verts: self.cap_verts,
-                        first: mut self.keep_first,
-                    ),
-                    over: 1,
-                )
-            }
-            for k in 0..seam_slices {
-                dispatch(
-                    solve_seam_smooth.bind(
-                        fields: fields,
-                        grids: grids,
-                        seam_cells: scratch.seam_cells.items(),
-                        seam_cell_count: scratch.seam_cells.count(),
-                        first: k * self.seam_slice,
-                        cap_verts: self.cap_verts,
-                        verts: mut self.verts,
-                        seam_verts: mut scratch.seam_verts,
-                        seam_creases: mut scratch.seam_creases,
-                    ),
-                    groups: scratch.seam_args.at(k),
-                    most: self.seam_slice / 64,
-                )
-            }
-            dispatch(
-                prep_slices.bind(
-                    count: scratch.seam_creases.count(),
-                    cap: CAP_SEAM * 2,
-                    most: seam_c_slice,
-                    slices: seam_c_slices,
-                    args: scratch.crease_args.span_mut(start: 0, count: seam_c_slices),
-                ),
-                over: seam_c_slices,
-            )
-            for k in 0..seam_c_slices {
-                for pass in 0..self.crease_passes {
-                    dispatch(
-                        refine_seam_creases.bind(
-                            fields: fields,
-                            grids: grids,
-                            seam_cells: scratch.seam_cells.items(),
-                            seam_creases: scratch.seam_creases.items(),
-                            seam_crease_count: scratch.seam_creases.count(),
-                            first: k * seam_c_slice,
-                            pass: pass,
-                            solves: mut scratch.crease_solves,
-                            cap_verts: self.cap_verts,
-                            verts: mut self.verts,
-                            seam_verts: mut scratch.seam_verts,
-                        ),
-                        groups: scratch.crease_args.at(k),
-                        most: seam_c_slice / 64,
-                    )
-                }
-            }
-            if uses_kept {
-                dispatch(
-                    prep_from.bind(
-                        count: self.verts.count(),
-                        cap: self.cap_verts,
-                        first: self.keep_first.items(),
-                        most: self.keep_slice,
-                        slices: seam_keep_slices,
-                        args: self.keep_args.span_mut(start: 0, count: seam_keep_slices),
-                    ),
-                    over: seam_keep_slices,
-                )
-                for k in 0..seam_keep_slices {
-                    dispatch(
-                        keep_verts.bind(
-                            fields: fields,
-                            verts: self.verts.items(),
-                            vert_count: self.verts.count(),
-                            cap_verts: self.cap_verts,
-                            first: self.keep_first.items(),
-                            from: k * self.keep_slice,
-                            vert_kept: mut self.vert_kept,
-                        ),
-                        groups: self.keep_args.at(k),
-                        most: self.keep_slice / 64,
-                    )
-                }
-            }
-            dispatch(
-                prep_slices.bind(
-                    count: scratch.seam_quads.count(),
-                    cap: CAP_SEAM,
-                    most: CAP_SEAM,
-                    slices: 1,
-                    args: scratch.surf_args.span_mut(start: 0, count: 1),
-                ),
-                over: 1,
-            )
-            dispatch(
-                finish_seam_tris.bind(
-                    seam_quads: scratch.seam_quads.items(),
-                    seam_quad_count: scratch.seam_quads.count(),
-                    seam_verts: scratch.seam_verts.items(),
-                    verts: self.verts.items(),
-                    cap_indices: CAP_SEAM * 6,
-                    cap_trans: self.cap_trans,
-                    tri_count: mut scratch.seam_tri_count,
-                    indices: mut scratch.seam_strip_indices,
-                    trans_indices: mut self.trans_indices,
-                    cut_indices: mut self.cut_indices,
-                ),
-                groups: scratch.surf_args.at(0),
-                most: CAP_SEAM / 64,
-            )
-        }
-
-        label("mesh_extract_compact")
-        // Pass 4: Compact all active brick indices (hits + new misses + active seams) + seam strip
-        // into one contiguous `self.indices` buffer (`< 0.1 ms` on GPU).
-        let compact_cap = COMPACT_GROUPS * COMPACT_PER_GROUP
-        dispatch(
-            compact_count_groups.bind(
-                gate: scratch.pool_gate.items(),
-                draw_slots: scratch.draw_slots.items(),
-                draw_count: scratch.draw_slots.count(),
-                cap_slots: compact_cap,
-                slot_meta: self.pool_slot_meta.items(),
-                group_sums: scratch.compact_group_sums.items_mut(),
-            ),
-            over: COMPACT_GROUPS,
-        )
-        dispatch(
-            compact_scan_groups.bind(
-                gate: scratch.pool_gate.items(),
-                group_sums: scratch.compact_group_sums.items(),
-                group_offsets: mut scratch.compact_group_offsets,
-                seam_start: mut self.seam_start,
-            ),
-            over: 1,
-        )
-        dispatch(
-            compact_local_offsets.bind(
-                gate: scratch.pool_gate.items(),
-                draw_slots: scratch.draw_slots.items(),
-                draw_count: scratch.draw_slots.count(),
-                cap_slots: compact_cap,
-                slot_meta: self.pool_slot_meta.items(),
-                group_offsets: scratch.compact_group_offsets.items(),
-                draw_slot_dst: mut scratch.draw_slot_dst,
-            ),
-            over: COMPACT_GROUPS,
-        )
-        dispatch(
-            prep_compact_args.bind(
-                gate: scratch.pool_gate.items(),
-                draw_count: scratch.draw_slots.count(),
-                cap_slots: compact_cap,
-                seam_tri_count: scratch.seam_tri_count.items(),
-                cap_seam_idx: CAP_SEAM * 6,
-                pool_exact_count: self.pool_exact_cells.count(),
-                cap_pool_exact: self.pool_exact_cap,
-                seam_exact_count: scratch.seam_exact_cells.count(),
-                cap_seam_exact: CAP_SEAM * 2,
-                copy_args: mut scratch.compact_copy_args,
-                seam_copy_args: mut scratch.compact_seam_args,
-                exact_copy_args: mut scratch.compact_exact_args,
-                seam_exact_args: mut scratch.compact_seam_exact_args,
-                alive_args: mut scratch.alive_args,
-            ),
-            over: 1,
-        )
-        // The committed cut's slots alive (what the outline, the exact cells and the light read);
-        // on no commit the drawn cut's stay.
-        dispatch(
-            pool_clear_alive.bind(
-                gate: scratch.pool_gate.items(),
-                n: total_slots,
-                alive: mut self.brick_alive,
-            ),
-            over: total_slots,
-        )
-        dispatch(
-            pool_mark_alive.bind(
-                gate: scratch.pool_gate.items(),
-                draw_slots: scratch.draw_slots.items(),
-                draw_count: scratch.draw_slots.count(),
-                cap_slots: compact_cap,
-                n: total_slots,
-                alive: mut self.brick_alive,
-            ),
-            groups: scratch.alive_args.at(0),
-            most: (compact_cap + 63) / 64,
-        )
-        let copy_k = compact_copy_indices.bind(
-            draw_slots: scratch.draw_slots.items(),
-            draw_count: scratch.draw_slots.count(),
-            cap_slots: compact_cap,
-            first: 0,
-            slot_meta: self.pool_slot_meta.items(),
-            draw_slot_dst: scratch.draw_slot_dst.items(),
-            pool_indices: self.pool_indices.items(),
-            cap_draw_indices: self.cap_indices,
-            draw_indices: mut self.indices,
-        )
-        let copy_slice = clamp(lane_slice(kernel_work(copy_k), most: compact_cap * 64) / 64, 64, 32768)
-        let copy_slices = min((compact_cap + copy_slice - 1) / copy_slice, SLICES_MOST)
-        dispatch(
-            prep_super_sub.bind(
-                super_count: scratch.draw_slots.count(),
-                cap_super: compact_cap,
-                most: copy_slice,
-                slices: copy_slices,
-                args: scratch.surf_args.span_mut(start: 0, count: copy_slices),
-            ),
-            over: copy_slices,
-        )
-        for k in 0..copy_slices {
-            dispatch(
-                compact_copy_indices.bind(
-                    draw_slots: scratch.draw_slots.items(),
-                    draw_count: scratch.draw_slots.count(),
-                    cap_slots: compact_cap,
-                    first: k * copy_slice,
-                    slot_meta: self.pool_slot_meta.items(),
-                    draw_slot_dst: scratch.draw_slot_dst.items(),
-                    pool_indices: self.pool_indices.items(),
-                    cap_draw_indices: self.cap_indices,
-                    draw_indices: mut self.indices,
-                ),
-                groups: scratch.surf_args.at(k),
-                most: copy_slice,
-            )
-        }
-        if has_seams {
-            dispatch(
-                compact_append_seam_strip.bind(
-                    seam_tri_count: scratch.seam_tri_count.items(),
-                    cap_seam_idx: CAP_SEAM * 6,
-                    seam_start: self.seam_start.items(),
-                    seam_strip_indices: scratch.seam_strip_indices.items(),
-                    cap_draw_indices: self.cap_indices,
-                    draw_indices: mut self.indices,
-                ),
-                groups: scratch.compact_seam_args.at(0),
-                most: (CAP_SEAM * 6 + 63) / 64,
-            )
-        }
-        if use_exact {
-            self.exact_cells.count_from(scratch.pool_gate.items().sub(start: GATE_EXACT, count: 1))
-            dispatch(
-                compact_pool_exact.bind(
-                    pool_exact_cells: self.pool_exact_cells.items(),
-                    pool_exact_slots: self.pool_exact_slots.items(),
-                    pool_exact_count: self.pool_exact_cells.count(),
-                    cap_pool_exact: self.pool_exact_cap,
-                    brick_alive: self.brick_alive.items(),
-                    exact_cells: mut self.exact_cells,
-                ),
-                groups: scratch.compact_exact_args.at(0),
-                most: (self.pool_exact_cap + 63) / 64,
-            )
-            if has_seams {
-                dispatch(
-                    compact_seam_exact.bind(
-                        seam_exact_cells: scratch.seam_exact_cells.items(),
-                        seam_exact_count: scratch.seam_exact_cells.count(),
-                        cap_seam_exact: CAP_SEAM * 2,
-                        exact_cells: mut self.exact_cells,
-                    ),
-                    groups: scratch.compact_seam_exact_args.at(0),
-                    most: (CAP_SEAM * 2 + 63) / 64,
-                )
-            }
-        }
-        dispatch(
-            finish_pool_draw.bind(
-                gate: scratch.pool_gate.items(),
-                active_count: scratch.active.count(),
-                verts_count: self.verts.count(),
-                seam_quad_count: scratch.seam_quads.count(),
-                seam_cell_count: scratch.seam_cells.count(),
-                exact_count: self.exact_cells.count(),
-                seam_start: self.seam_start.items(),
-                seam_tri_count: scratch.seam_tri_count.items(),
-                pool_tri_count: self.pool_tri_count.items(),
-                pool_stats: scratch.pool_stats.items(),
-                has_seams: if has_seams { 1 } else { 0 },
-                cap_indices: self.cap_indices,
-                cap_pool_indices: self.pool_idx_cap,
-                cap_trans: self.cap_trans,
-                cap_exact: self.cap_exact,
-                cap_pool_exact: self.pool_exact_cap,
-                inst_count: 1,
-                tri_count: mut self.tri_count,
-                args: mut self.draw_args,
-                trans_args: mut self.trans_draw_args,
-                cut_args: mut self.cut_draw_args,
-                seam_args: mut self.seam_draw_args,
-                exact_args: mut self.exact_draw_args,
-                marks: mut self.pool_marks,
-            ),
-            over: 1,
-        )
-        if use_exact {
-            copy(from: self.exact_cells.count().sub(start: 0, count: 1), to: self.exact_base.items_mut())
-        }
-        self.pooled = true
-        self.has_exact = use_exact
-        self.has_brick_draws = false
-        self.has_seams = has_seams
-        self.edit_patched = false
-        self.cpu_brick_slots = total_slots
-        self.note_extracted(true)
-        // The last few updates' cuts, for their readbacks (a moving eye updates every frame or
-        // two, and a readback comes a frame or two after).
-        var kept_cuts: Vec<GridSpec> = Vec::new()
-        var kept_at: Vec<vec3u> = Vec::new()
-        let first = if self.pool_pending_at.len() >= POOL_PENDING { 1 } else { 0 }
-        for k in first..self.pool_pending_at.len() {
-            let at = self.pool_pending_at[k]
-            kept_at.push(vec3u(at.x, kept_cuts.len(), at.z))
-            for j in 0..at.z {
-                kept_cuts.push(self.pool_pending[at.y + j])
-            }
-        }
-        kept_at.push(vec3u(self.gen, kept_cuts.len(), cut.len()))
-        for j in 0..cut.len() {
-            kept_cuts.push(cut[j])
-        }
-        self.pool_pending = take kept_cuts
-        self.pool_pending_at = take kept_at
     }
 
     /// Runs the 4-pass GPU rest-pose Hermite Dual Contouring pipeline for `Skinned` fields,
@@ -6850,7 +5305,6 @@ impl MeshBatch {
                 seam_quad_count: scratch.seam_quads.count(),
                 seam_cell_count: scratch.seam_cells.count(),
                 exact_count: self.exact_cells.count(),
-                seam_start: self.seam_start.items(),
                 has_seams: 0,
                 cap_indices: self.cap_indices,
                 cap_trans: self.cap_trans,
@@ -6860,7 +5314,6 @@ impl MeshBatch {
                 args: mut self.draw_args,
                 trans_args: mut self.trans_draw_args,
                 cut_args: mut self.cut_draw_args,
-                seam_args: mut self.seam_draw_args,
                 exact_args: mut self.exact_draw_args,
             ),
             over: 1,
