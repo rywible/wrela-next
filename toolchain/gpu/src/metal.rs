@@ -64,6 +64,9 @@ struct Shared {
     in_flight: Mutex<Vec<(SubmissionIndex, Id<dyn MTLCommandBuffer>, Vec<Arc<Group>>)>>,
     /// Staged writes, copied before the next submission's own work.
     pending: Mutex<Vec<PendingWrite>>,
+    /// New buffers' zeros, in pieces of at most `FILL_PIECE` bytes (`create_buffer`): committed
+    /// before the next submission, in submissions of their own (`submit_fills`).
+    fills: Mutex<Vec<(Id<dyn MTLBuffer>, u64, u64)>>,
     /// Errors the GPU reported: a failed command buffer, naming its encoder.
     errors: Arc<Mutex<Vec<String>>>,
     /// A buffer of zeros, shared, as large as the largest texture level zeroed so far.
@@ -143,16 +146,16 @@ impl StagingBuffer for Id<dyn MTLBuffer> {
 unsafe impl Send for Shared {}
 unsafe impl Sync for Shared {}
 
+/// The most bytes of new buffers' zeros one submission holds (`Device::submit_fills`): a few ms
+/// at the slowest GPU's fill rate, so no submission of them comes near the line.
+const FILL_PIECE: u64 = 64 << 20;
+
 enum PendingWrite {
     Buffer {
         staging: Id<dyn MTLBuffer>,
         staging_offset: u64,
         dst: Id<dyn MTLBuffer>,
         offset: u64,
-        len: u64,
-    },
-    Fill {
-        dst: Id<dyn MTLBuffer>,
         len: u64,
     },
     Texture {
@@ -276,6 +279,7 @@ impl Device {
                 in_flight: Mutex::new(Vec::new()),
                 table,
                 pending: Mutex::new(Vec::new()),
+                fills: Mutex::new(Vec::new()),
                 errors: Arc::new(Mutex::new(Vec::new())),
                 zeros: Mutex::new(None),
                 belt: Mutex::new(Belt::default()),
@@ -343,7 +347,13 @@ impl Device {
             .expect("Metal made no buffer");
         raw.setLabel(Some(&ns(desc.label)));
         if !desc.mappable {
-            lock(&self.0.pending).push(PendingWrite::Fill { dst: raw.clone(), len: size });
+            let mut fills = lock(&self.0.fills);
+            let mut at = 0;
+            while at < size {
+                let len = (size - at).min(FILL_PIECE);
+                fills.push((raw.clone(), at, len));
+                at += len;
+            }
         }
         Buffer { raw, size: desc.size, mappable: desc.mappable }
     }
@@ -744,6 +754,9 @@ impl Device {
         frame: Option<&SurfaceTexture>,
     ) -> SubmissionIndex {
         autoreleasepool(|_| {
+            // New buffers' zeros first, in submissions of their own: a frame that makes large
+            // buffers pays for their zeroing outside its work's submissions.
+            self.submit_fills();
             let index = self.0.submitted.fetch_add(1, Ordering::AcqRel) + 1;
             let pending = self.take_pending();
             let done = self.completed();
@@ -770,6 +783,43 @@ impl Device {
                 let cb = self.command_buffer();
                 cbs.push(cb);
             }
+            self.commit_buffers(index, cbs, kept, frame)
+        })
+    }
+
+    /// The new buffers' zeros (`fills`), in submissions of at most `FILL_PIECE` bytes each. They
+    /// stage nothing, so the belt is not turned for them: what is staged goes with the next
+    /// submission of writes, which they come before.
+    fn submit_fills(&self) {
+        let fills = std::mem::take(&mut *lock(&self.0.fills));
+        let mut k = 0;
+        while k < fills.len() {
+            let index = self.0.submitted.fetch_add(1, Ordering::AcqRel) + 1;
+            let cb = self.command_buffer();
+            cb.setLabel(Some(&ns("new buffers' zeros")));
+            let blit = cb.blitCommandEncoder().expect("Metal made no blit encoder");
+            let mut bytes = 0;
+            while k < fills.len() && (bytes == 0 || bytes + fills[k].2 <= FILL_PIECE) {
+                let (dst, at, len) = &fills[k];
+                blit.fillBuffer_range_value(dst, NSRange::new(*at as NSUInteger, *len as NSUInteger), 0);
+                bytes += len;
+                k += 1;
+            }
+            blit.endEncoding();
+            self.commit_buffers(index, vec![cb], Vec::new(), None);
+        }
+    }
+
+    /// Commits `cbs` as submission `index`, timing it and marking it done as its last completes,
+    /// that one presenting `frame`'s drawable; what they keep held till then.
+    fn commit_buffers(
+        &self,
+        index: SubmissionIndex,
+        cbs: Vec<Id<dyn MTLCommandBuffer>>,
+        kept: Vec<Arc<Group>>,
+        frame: Option<&SurfaceTexture>,
+    ) -> SubmissionIndex {
+        {
             let last = cbs.len() - 1;
             for (k, cb) in cbs.iter().enumerate() {
                 let errors = self.0.errors.clone();
@@ -835,7 +885,7 @@ impl Device {
             f.retain(|(i, ..)| *i > done);
             f.push((index, cbs[last].clone(), kept));
             index
-        })
+        }
     }
 
     /// The submissions done so far: every one up to this index.
@@ -897,7 +947,7 @@ impl Device {
 
     /// Submits the staged writes, if any, and waits for every submission to be done.
     pub fn wait_idle(&self) {
-        if !lock(&self.0.pending).is_empty() {
+        if !lock(&self.0.pending).is_empty() || !lock(&self.0.fills).is_empty() {
             self.submit(Vec::new());
         }
         self.wait(self.submitted());
@@ -961,9 +1011,6 @@ fn encode_write(blit: &ProtocolObject<dyn MTLBlitCommandEncoder>, w: &PendingWri
                     *offset as NSUInteger,
                     *len as NSUInteger,
                 );
-            }
-            PendingWrite::Fill { dst, len } => {
-                blit.fillBuffer_range_value(dst, NSRange::new(0, *len as NSUInteger), 0);
             }
             PendingWrite::Texture {
                 staging,

@@ -62,6 +62,9 @@ struct Shared {
     submitted: AtomicU64,
     /// Staged writes, recorded before the next submission's own work.
     pending: Mutex<Vec<Pending>>,
+    /// New buffers' zeros, in pieces of at most `FILL_PIECE` bytes (`create_buffer`): submitted
+    /// before the next submission, in submissions of their own (`submit_fills`).
+    fills: Mutex<Vec<(Arc<RawBuffer>, u64, u64)>>,
     /// Command pools and buffers of submissions not yet seen done, with what they hold alive.
     in_flight: Mutex<Vec<(SubmissionIndex, vk::CommandPool, Vec<Keep>)>>,
     /// Errors: the validation layer's messages, a lost device.
@@ -164,11 +167,13 @@ enum Keep {
     Image(Arc<RawImage>),
 }
 
+/// The most bytes of new buffers' zeros one submission holds (`Device::submit_fills`): a few ms
+/// at the slowest GPU's fill rate, so no submission of them comes near the line.
+const FILL_PIECE: u64 = 64 << 20;
+
 enum Pending {
     /// Bytes from a staging buffer (at `at`) into a buffer.
     Buffer { staging: Arc<RawBuffer>, at: u64, dst: Arc<RawBuffer>, offset: u64, len: u64 },
-    /// Zeros over a whole buffer.
-    Fill { dst: Arc<RawBuffer> },
     /// Texels from a staging buffer into a level and layer of an image.
     Texture {
         staging: Arc<RawBuffer>,
@@ -197,7 +202,6 @@ impl Pending {
             Pending::Buffer { staging, dst, .. } => {
                 (Some(staging.buffer.as_raw()), dst.buffer.as_raw())
             }
-            Pending::Fill { dst } => (None, dst.buffer.as_raw()),
             Pending::Texture { staging, dst, .. } => {
                 (Some(staging.buffer.as_raw()), dst.image.as_raw())
             }
@@ -234,6 +238,7 @@ impl Drop for Owner {
             let _ = s.raw.device_wait_idle();
         }
         drop(std::mem::take(&mut *lock(&s.pending)));
+        drop(std::mem::take(&mut *lock(&s.fills)));
         let flights = std::mem::take(&mut *lock(&s.in_flight));
         for (_, pool, keep) in flights {
             if pool != vk::CommandPool::null() {
@@ -679,6 +684,7 @@ impl Device {
                 clock_of: Mutex::new(std::collections::VecDeque::new()),
                 submitted: AtomicU64::new(0),
                 pending: Mutex::new(Vec::new()),
+                fills: Mutex::new(Vec::new()),
                 in_flight: Mutex::new(Vec::new()),
                 errors,
                 descriptor_pools: Mutex::new(Vec::new()),
@@ -857,7 +863,13 @@ impl Device {
             // SAFETY: the mapping is the buffer's whole size.
             unsafe { std::ptr::write_bytes(raw.mapped, 0, raw.size as usize) };
         } else {
-            lock(&self.0.pending).push(Pending::Fill { dst: raw.clone() });
+            let mut fills = lock(&self.0.fills);
+            let mut at = 0;
+            while at < raw.size {
+                let len = (raw.size - at).min(FILL_PIECE);
+                fills.push((raw.clone(), at, len));
+                at += len;
+            }
         }
         Buffer { raw, size: desc.size, mappable: desc.mappable }
     }
@@ -1435,6 +1447,10 @@ impl Device {
         buffers: Vec<CommandBuffer>,
         frame: Option<(vk::Semaphore, vk::Semaphore)>,
     ) -> SubmissionIndex {
+        // New buffers' zeros first, in submissions of their own: a frame that makes large
+        // buffers pays for their zeroing outside its work's submissions (the Radeon's cold
+        // frames held the GPU past twice the line with their fills inside one).
+        self.submit_fills();
         let pending = std::mem::take(&mut *lock(&self.0.pending));
         let index = self.0.submitted.fetch_add(1, Ordering::AcqRel) + 1;
         let done = self.completed();
@@ -1460,6 +1476,49 @@ impl Device {
             cbs.push(b.raw);
             keep.extend(b.keep);
         }
+        self.queue_submission(index, cbs, pools, keep, timed, frame);
+        index
+    }
+
+    /// The new buffers' zeros (`fills`), in submissions of at most `FILL_PIECE` bytes each. They
+    /// stage nothing, so the belt is not turned for them: what is staged goes with the next
+    /// submission of writes, which they come before.
+    fn submit_fills(&self) {
+        let fills = std::mem::take(&mut *lock(&self.0.fills));
+        let mut k = 0;
+        while k < fills.len() {
+            let index = self.0.submitted.fetch_add(1, Ordering::AcqRel) + 1;
+            let mut enc = CommandEncoder::new(self.clone());
+            let mut keep: Vec<Keep> = Vec::new();
+            let mut bytes = 0;
+            while k < fills.len() && (bytes == 0 || bytes + fills[k].2 <= FILL_PIECE) {
+                let (dst, at, len) = &fills[k];
+                let size = if (at + len) % 4 == 0 { *len } else { vk::WHOLE_SIZE };
+                // SAFETY: a fill of a live buffer's range, in a recording command buffer that
+                // keeps it.
+                unsafe { enc.d().cmd_fill_buffer(enc.raw, dst.buffer, *at, size, 0) };
+                keep.push(Keep::Buffer(dst.clone()));
+                bytes += len;
+                k += 1;
+            }
+            let cb = enc.finish();
+            let timed: Vec<u64> = cb.clock.into_iter().collect();
+            keep.extend(cb.keep);
+            self.queue_submission(index, vec![cb.raw], vec![cb.pool], keep, timed, None);
+        }
+    }
+
+    /// Submits `cbs` as submission `index` (its pools and what it keeps freed once it is done),
+    /// first waiting on `frame`'s image acquired and then signalling it rendered.
+    fn queue_submission(
+        &self,
+        index: SubmissionIndex,
+        cbs: Vec<vk::CommandBuffer>,
+        pools: Vec<vk::CommandPool>,
+        keep: Vec<Keep>,
+        timed: Vec<u64>,
+        frame: Option<(vk::Semaphore, vk::Semaphore)>,
+    ) {
         if let (Some(&first), Some(&last)) = (timed.first(), timed.last()) {
             let mut c = lock(&self.0.clock_of);
             c.push_back((index, first, last));
@@ -1528,7 +1587,6 @@ impl Device {
         f.extend(entries);
         drop(f);
         self.reclaim();
-        index
     }
 
     /// Frees what submissions now done held.
@@ -1645,7 +1703,7 @@ impl Device {
 
     /// Submits the staged writes, if any, and waits for every submission to be done.
     pub fn wait_idle(&self) {
-        if !lock(&self.0.pending).is_empty() {
+        if !lock(&self.0.pending).is_empty() || !lock(&self.0.fills).is_empty() {
             self.submit(Vec::new());
         }
         self.wait(self.submitted());
@@ -2630,10 +2688,6 @@ impl CommandEncoder {
                         [vk::BufferCopy { src_offset: *at, dst_offset: *offset, size: *len }];
                     d.cmd_copy_buffer(cb, staging.buffer, dst.buffer, &region);
                     keep.push(Keep::Buffer(staging.clone()));
-                    keep.push(Keep::Buffer(dst.clone()));
-                }
-                Pending::Fill { dst } => {
-                    d.cmd_fill_buffer(cb, dst.buffer, 0, vk::WHOLE_SIZE, 0);
                     keep.push(Keep::Buffer(dst.clone()));
                 }
                 Pending::Texture {
