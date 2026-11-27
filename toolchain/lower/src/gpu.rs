@@ -2988,6 +2988,12 @@ pub(crate) fn pipeline_stage5_finish(
                         }
                     }
                     (pre, Some(w)) if st.mb.m.strict => {
+                        if std::env::var("WRELA_WORK_DEBUG").is_ok() && pre.is_some_and(|p| p > 2 * w) {
+                            eprintln!("work: entry {idx} of {}: before flattening {:?}, after {w}", st.mb.m.functions.first().map(|f| f.name.as_str()).unwrap_or("?"), pre);
+                            if pre.is_some_and(|p| p > 20 * w) && std::env::var("WRELA_WORK_DUMP").is_ok() {
+                                let _ = std::fs::write(format!("/private/tmp/claude-501/workdump_{idx}_{w}.txt"), ir::print::print(&st.mb.m));
+                            }
+                        }
                         *slot = Some(pre.map_or(w, |pre| pre.max(w)));
                         if let Some(u) = st.unbounded.get_mut(idx) {
                             *u = None;

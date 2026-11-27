@@ -8,9 +8,9 @@ use mesh::dc::{
     lane_slice,
     crease_passes, crease_slice, crease_step_cost_of, crease_step_cost_rest_of, cull_bricks,
     cull_bricks_rest, cull_bricks_sub, deform_skinned_verts, eval_corners, eval_corners_rest,
-    eye_step, filter_thin_cells, inherit_seam_corners, keep_slice_of,
+    eye_step, filter_thin_cells, filter_thin_octants, inherit_seam_corners, keep_slice_of,
     keep_verts, mark_first, note_untested, prep_chunk, prep_creases, prep_from, prep_slices,
-    prep_super_sub, refine_creases, refine_creases_rest, solve_verts,
+    prep_lane_slices, prep_super_sub, refine_creases, refine_creases_rest, solve_verts,
     solve_verts_rest, super_cull_bricks, surf_slice,
 }
 use mesh::emit::{
@@ -133,6 +133,11 @@ pub struct ExtractScratch {
     pub creases: AppendBuffer<u32>,
     pub surf: AppendBuffer<u32>,
     pub thin_cands: AppendBuffer<u32>,
+    /// Each thin candidate of a slice: the octants its core's whole form didn't clear
+    /// (`filter_thin_cells`, for `filter_thin_octants`).
+    pub thin_masks: GpuBuffer<u32>,
+    /// `filter_thin_octants`' slices' dispatch sizes.
+    pub thin_args: GpuBuffer<DispatchArgs>,
     /// Outline cells put up for a certificate (`box_outline`, `certify_outline`).
     pub cert_cands: AppendBuffer<vec2u>,
     pub grids: GpuBuffer<GridSpec>,
@@ -203,6 +208,8 @@ pub fn extract_scratch(max_bricks: u32, lattice: vec3) -> ExtractScratch {
         creases: append_buffer(CAP_SURF),
         surf: append_buffer(CAP_SURF),
         thin_cands: append_buffer(CAP_SURF),
+        thin_masks: buffer(THIN_SLICE),
+        thin_args: buffer_of(Vec::filled(SLICES_MOST, DispatchArgs { x: 0, y: 1, z: 1 })),
         cert_cands: append_buffer(CAP_SURF),
         grids: buffer(grids_cap),
         super_grids: buffer(grids_cap),
@@ -462,8 +469,11 @@ pub struct MeshBatch {
     /// `filter_thin_cells`, 1,571,069 work an invocation, 64 ms.)
     thin_slice: u32,
     cert_slice: u32,
-    /// The bricks one `inherit_seam_corners` dispatch takes (512 invocations a brick).
+    /// The bricks one `inherit_seam_corners` dispatch takes (512 invocations a brick), and the
+    /// seam cells one `solve_seam_smooth` or `box_seam_cells` dispatch takes (at most
+    /// `SEAM_SLICE`; the Radeon refused 16,384 of the study's, 932,186 work an invocation).
     inherit_slice: u32,
+    seam_slice: u32,
     /// The bricks a dispatch of a chunk's corner kernel takes, and of its triangle kernels
     /// (`dc::brick_slice`).
     eval_slice: u32,
@@ -672,6 +682,7 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
         thin_slice: THIN_SLICE,
         cert_slice: CERT_SLICE,
         inherit_slice: 64,
+        seam_slice: SEAM_SLICE,
         eval_slice: CHUNK_BRICKS,
         quad_slice: CHUNK_BRICKS,
         crease_passes: CREASE_STEPS,
@@ -1254,10 +1265,14 @@ impl MeshBatch {
         if self.active_hint == 0 ||
             self.lod_cut ||
             self.extract_total > self.hint_total + self.hint_total / 4 {
-            return SEAM_SLICES
+            return thin_most(self.seam_slice, SEAM_SLICES * SEAM_SLICE)
         }
         let want = self.seam_hint + self.seam_hint / 4 + SEAM_SLICE / 16
-        clamp((want + SEAM_SLICE - 1) / SEAM_SLICE, 1, SEAM_SLICES)
+        clamp(
+            (want + self.seam_slice - 1) / self.seam_slice,
+            1,
+            thin_most(self.seam_slice, SEAM_SLICES * SEAM_SLICE),
+        )
     }
 
     /// Notes that `tri_count` was rewritten by a real extraction (or emptied, `real == false`).
@@ -2747,6 +2762,17 @@ impl MeshBatch {
                     ),
                     over: 1,
                 )
+                dispatch(
+                    prep_lane_slices.bind(
+                        count: scratch.thin_cands.count(),
+                        cap: CAP_SURF,
+                        most: self.thin_slice,
+                        slices: thin_slices,
+                        lanes: 8,
+                        args: scratch.thin_args.span_mut(start: 0, count: thin_slices),
+                    ),
+                    over: 1,
+                )
                 for ts in 0..thin_slices {
                     dispatch(
                         filter_thin_cells.bind(
@@ -2758,11 +2784,27 @@ impl MeshBatch {
                             thin_count: scratch.thin_cands.count(),
                             first: ts * self.thin_slice,
                             exact_eye: exact_eye,
-                            exact_seen: mut scratch.exact_seen,
-                            exact_cells: mut self.exact_cells,
+                            thin_masks: scratch.thin_masks.span_mut(start: 0, count: self.thin_slice),
                         ),
                         groups: scratch.crease_args.at(ts),
                         most: self.thin_slice / 64,
+                    )
+                    dispatch(
+                        filter_thin_octants.bind(
+                            fields: fbuf.items(),
+                            grids: grids,
+                            active: scratch.active.items(),
+                            chunk_start: chunk_start,
+                            thin_cands: scratch.thin_cands.items(),
+                            thin_count: scratch.thin_cands.count(),
+                            thin_masks: scratch.thin_masks.items(),
+                            first: ts * self.thin_slice,
+                            exact_eye: exact_eye,
+                            exact_seen: mut scratch.exact_seen,
+                            exact_cells: mut self.exact_cells,
+                        ),
+                        groups: scratch.thin_args.at(ts),
+                        most: self.thin_slice / 8,
                     )
                 }
                 dispatch(
@@ -2933,20 +2975,41 @@ impl MeshBatch {
         self.surf_slice = surf_slice(kernel_work(surf_kernel))
         // The thin cells' and the outline's slices, and the seams' corners', as their kernels'
         // own bounds let a dispatch hold.
-        self.thin_slice = lane_slice(
-            kernel_work(filter_thin_cells.bind(
-                fields: fields,
-                grids: scratch.grids.items(),
-                active: scratch.active.items(),
-                chunk_start: 0,
-                thin_cands: scratch.thin_cands.items(),
-                thin_count: scratch.thin_cands.count(),
-                first: 0,
-                exact_eye: exact_eye,
-                exact_seen: mut scratch.exact_seen,
-                exact_cells: mut self.exact_cells,
-            )),
-            most: THIN_SLICE,
+        // (A slice's octants are eight invocations a candidate.)
+        self.thin_slice = min(
+            lane_slice(
+                kernel_work(filter_thin_cells.bind(
+                    fields: fields,
+                    grids: scratch.grids.items(),
+                    active: scratch.active.items(),
+                    chunk_start: 0,
+                    thin_cands: scratch.thin_cands.items(),
+                    thin_count: scratch.thin_cands.count(),
+                    first: 0,
+                    exact_eye: exact_eye,
+                    thin_masks: scratch.thin_masks.span_mut(start: 0, count: THIN_SLICE),
+                )),
+                most: THIN_SLICE,
+            ),
+            max(
+                (lane_slice(
+                    kernel_work(filter_thin_octants.bind(
+                        fields: fields,
+                        grids: scratch.grids.items(),
+                        active: scratch.active.items(),
+                        chunk_start: 0,
+                        thin_cands: scratch.thin_cands.items(),
+                        thin_count: scratch.thin_cands.count(),
+                        thin_masks: scratch.thin_masks.items(),
+                        first: 0,
+                        exact_eye: exact_eye,
+                        exact_seen: mut scratch.exact_seen,
+                        exact_cells: mut self.exact_cells,
+                    )),
+                    most: 8 * THIN_SLICE,
+                ) / 512) * 64,
+                64,
+            ),
         )
         self.cert_slice = lane_slice(
             kernel_work(certify_outline.bind(
@@ -2961,6 +3024,34 @@ impl MeshBatch {
                 exact_cells: mut self.exact_cells,
             )),
             most: CERT_SLICE,
+        )
+        self.seam_slice = min(
+            lane_slice(
+                kernel_work(solve_seam_smooth.bind(
+                    fields: fields,
+                    grids: scratch.grids.items(),
+                    seam_cells: scratch.seam_cells.items(),
+                    seam_cell_count: scratch.seam_cells.count(),
+                    first: 0,
+                    cap_verts: self.cap_verts,
+                    verts: mut self.verts,
+                    seam_verts: mut scratch.seam_verts,
+                    seam_creases: mut scratch.seam_creases,
+                )),
+                most: SEAM_SLICE,
+            ),
+            lane_slice(
+                kernel_work(box_seam_cells.bind(
+                    fields: fields,
+                    grids: scratch.grids.items(),
+                    seam_cells: scratch.seam_cells.items(),
+                    seam_cell_count: scratch.seam_cells.count(),
+                    first: 0,
+                    seam_seen: mut scratch.seam_seen,
+                    exact_cells: mut self.exact_cells,
+                )),
+                most: SEAM_SLICE,
+            ),
         )
         self.inherit_slice = min(
             brick_slice(lanes: 512, invocation: kernel_work(inherit_seam_corners.bind(
@@ -3077,12 +3168,12 @@ impl MeshBatch {
             self.crease_slices(CHUNK_BRICKS) * self.crease_passes
         let seam_c_slice = min(SEAM_SLICE, self.seam_crease_slice)
         let seam_c_slices = if has_seams {
-            min((self.seam_slices() * SEAM_SLICE + seam_c_slice - 1) / seam_c_slice, SLICES_MOST)
+            min((self.seam_slices() * self.seam_slice + seam_c_slice - 1) / seam_c_slice, SLICES_MOST)
         } else {
             0
         }
         let seam_keep_slices = if has_seams && uses_kept {
-            min((self.seam_slices() * SEAM_SLICE + self.keep_slice - 1) / self.keep_slice, SLICES_MOST)
+            min((self.seam_slices() * self.seam_slice + self.keep_slice - 1) / self.keep_slice, SLICES_MOST)
         } else {
             0
         }
@@ -3660,6 +3751,17 @@ impl MeshBatch {
                     ),
                     over: 1,
                 )
+                dispatch(
+                    prep_lane_slices.bind(
+                        count: scratch.thin_cands.count(),
+                        cap: CAP_SURF,
+                        most: self.thin_slice,
+                        slices: thin_slices,
+                        lanes: 8,
+                        args: scratch.thin_args.span_mut(start: 0, count: thin_slices),
+                    ),
+                    over: 1,
+                )
                 for ts in 0..thin_slices {
                     dispatch(
                         filter_thin_cells.bind(
@@ -3671,11 +3773,27 @@ impl MeshBatch {
                             thin_count: scratch.thin_cands.count(),
                             first: ts * self.thin_slice,
                             exact_eye: exact_eye,
-                            exact_seen: mut scratch.exact_seen,
-                            exact_cells: mut self.exact_cells,
+                            thin_masks: scratch.thin_masks.span_mut(start: 0, count: self.thin_slice),
                         ),
                         groups: scratch.crease_args.at(ts),
                         most: self.thin_slice / 64,
+                    )
+                    dispatch(
+                        filter_thin_octants.bind(
+                            fields: fields,
+                            grids: grids,
+                            active: scratch.active.items(),
+                            chunk_start: chunk_start,
+                            thin_cands: scratch.thin_cands.items(),
+                            thin_count: scratch.thin_cands.count(),
+                            thin_masks: scratch.thin_masks.items(),
+                            first: ts * self.thin_slice,
+                            exact_eye: exact_eye,
+                            exact_seen: mut scratch.exact_seen,
+                            exact_cells: mut self.exact_cells,
+                        ),
+                        groups: scratch.thin_args.at(ts),
+                        most: self.thin_slice / 8,
                     )
                 }
                 dispatch(
@@ -3744,7 +3862,7 @@ impl MeshBatch {
             dispatch(
                 note_seams.bind(
                     seam_count: scratch.seam_cells.count(),
-                    slices: seam_slices,
+                    tested: seam_slices * self.seam_slice,
                     tri_count: mut self.tri_count,
                 ),
                 over: 1,
@@ -3753,7 +3871,7 @@ impl MeshBatch {
                 prep_slices.bind(
                     count: scratch.seam_cells.count(),
                     cap: CAP_SEAM * 2,
-                    most: SEAM_SLICE,
+                    most: self.seam_slice,
                     slices: seam_slices,
                     args: scratch.seam_args.span_mut(start: 0, count: seam_slices),
                 ),
@@ -3773,12 +3891,12 @@ impl MeshBatch {
                             grids: grids,
                             seam_cells: scratch.seam_cells.items(),
                             seam_cell_count: scratch.seam_cells.count(),
-                            first: k * SEAM_SLICE,
+                            first: k * self.seam_slice,
                             seam_seen: mut scratch.seam_seen,
                             exact_cells: mut self.exact_cells,
                         ),
                         groups: scratch.seam_args.at(k),
-                        most: SEAM_SLICE / 64,
+                        most: self.seam_slice / 64,
                     )
                 }
             }
@@ -3799,14 +3917,14 @@ impl MeshBatch {
                         grids: grids,
                         seam_cells: scratch.seam_cells.items(),
                         seam_cell_count: scratch.seam_cells.count(),
-                        first: k * SEAM_SLICE,
+                        first: k * self.seam_slice,
                         cap_verts: self.cap_verts,
                         verts: mut self.verts,
                         seam_verts: mut scratch.seam_verts,
                         seam_creases: mut scratch.seam_creases,
                     ),
                     groups: scratch.seam_args.at(k),
-                    most: SEAM_SLICE / 64,
+                    most: self.seam_slice / 64,
                 )
             }
             dispatch(

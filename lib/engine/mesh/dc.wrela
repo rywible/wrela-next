@@ -1280,8 +1280,30 @@ pub(package) fn note_untested(
     }
 }
 
-/// Compacted pass over all-positive thin-feature candidates (`classify_cells`): an exact cell for
-/// each the field's enclosure (`Surface::slope_affine`) can't prove empty, whole or by octants.
+/// The core of thin candidate `packed`'s cell (`filter_thin_cells`): the cell less a quarter
+/// pixel on every side, for the eye `exact_eye`, as its low corner and width; a width of 0 or
+/// less where the cell is thinner than a hole.
+fn thin_core(g: GridSpec, b: vec3u, cell: u32, exact_eye: vec4) -> (vec3, f32, vec3) {
+    let (cx, cy, cz) = decode_cell(cell)
+    let h = g.cell
+    let cell_lo = brick_corner(g, b, vec3u(cx, cy, cz))
+    let px = length(exact_eye.xyz - (cell_lo + vec3(0.5 * h))) * exact_eye.w
+    let m = 0.5 * HOLE_PX * px
+    (cell_lo + vec3(m), h - 2.0 * m, cell_lo)
+}
+
+/// Compacted pass over all-positive thin-feature candidates (`classify_cells`), its first half:
+/// each candidate's core whole (`thin_core`) against the field's enclosure
+/// (`Surface::slope_affine`, one path for every kind). A surface can hide inside a cell all of
+/// whose corners are outside it (a wand, a tip, a crest), and Dual Contouring, which sees only sign
+/// changes on edges, meshes none of it. The core is the cell less a quarter pixel on every side
+/// (`HOLE_PX / 2`): what reaches no further in is thinner than a hole (a pixel's middle missed
+/// with the field on every side of it), and asking all of the cell would ask every cell that a
+/// neighbour's surface runs along, which no interval proves empty. A core the whole's form proves
+/// empty is done; else the octants the whole's form doesn't clear (`af.octant_range(k)`) go to
+/// `filter_thin_octants` in `thin_masks` (a slice's, by its invocation), one enclosure an
+/// invocation there (a carved table's
+/// nine in one invocation were past the Radeon's line for one, 3,053,697 work).
 @strict
 @compute(64)
 pub(package) fn filter_thin_cells<M: Field<Substance>>(
@@ -1293,8 +1315,7 @@ pub(package) fn filter_thin_cells<M: Field<Substance>>(
     thin_count: [u32],
     first: u32,
     exact_eye: vec4,
-    exact_seen: mut Atomics<u32>,
-    exact_cells: mut Append<ExactCell>,
+    thin_masks: mut Slots<u32>,
     id: GlobalId,
 ) {
     let i = first + id.x
@@ -1302,61 +1323,62 @@ pub(package) fn filter_thin_cells<M: Field<Substance>>(
         return
     }
     let packed = thin_cands[i]
-    let local_bi = packed >> 9
-    let cell = packed & 511
-    let (cx, cy, cz) = decode_cell(cell)
-    let ab = active[chunk_start + local_bi]
-    let b = ab.coord
-    let g = grids[b.w]
-    let h = g.cell
-    let cell_lo = brick_corner(g, b.xyz, vec3u(cx, cy, cz))
-    let f = fields[g.orig_id]
-    let live = ab.live
-    // Exact cells for every cell whose core the field's enclosure (`Surface::slope_affine`, one
-    // path for every kind) can't prove empty, whole or by its eight octants (those the whole's
-    // form already clears, `af.octant_range(k)`, not asked): a
-    // surface can hide inside a cell all of whose corners are outside it (a wand, a tip, a crest),
-    // and Dual Contouring, which sees only sign changes on edges, meshes none of it. The core is
-    // the cell less a quarter pixel on every side (`HOLE_PX / 2`): what reaches no further in is
-    // thinner than a hole (a pixel's middle missed with the field on every side of it), and asking
-    // all of the cell would ask every cell that a neighbour's surface runs along, which no
-    // interval proves empty.
-    let px = length(exact_eye.xyz - (cell_lo + vec3(0.5 * h))) * exact_eye.w
-    let m = 0.5 * HOLE_PX * px
-    if 2.0 * m >= h {
-        return
-    }
-    let lo = cell_lo + vec3(m)
-    let w = h - 2.0 * m
-    var maybe = false
-    var oct_mask: u32 = 255
-    for k in 0..9 {
-        if !maybe && (k == 0 || ((oct_mask >> (k - 1)) & 1) != 0) {
-            let bx = if k == 0 {
-                Box3 { lo: lo, hi: lo + vec3(w) }
-            } else {
-                let j = k - 1
-                let o = lo + vec3(f32(j & 1), f32((j >> 1) & 1), f32((j >> 2) & 1)) * (0.5 * w)
-                Box3 { lo: o, hi: o + vec3(0.5 * w) }
-            }
-            let af = f.slope_affine(bx, live)
-            if k == 0 {
-                if af.lo() > 0.0 {
-                    return
+    let ab = active[chunk_start + (packed >> 9)]
+    let g = grids[ab.coord.w]
+    let (lo, w, _) = thin_core(g, ab.coord.xyz, packed & 511, exact_eye)
+    var mask: u32 = 0
+    if w > 0.0 {
+        let af = fields[g.orig_id].slope_affine(Box3 { lo: lo, hi: lo + vec3(w) }, ab.live)
+        if af.lo() <= 0.0 {
+            for j in 0..8 {
+                if af.octant_range(j).lo <= 0.0 {
+                    mask = mask | (u32(1) << j)
                 }
-                oct_mask = 0
-                for j in 0..8 {
-                    if af.octant_range(j).lo <= 0.0 {
-                        oct_mask = oct_mask | (u32(1) << j)
-                    }
-                }
-            } else if af.lo() <= 0.0 {
-                maybe = true
             }
         }
     }
-    if maybe && claim_exact_cell(mut exact_seen, local_bi, cell) {
-        let _ = exact_cells.push(ExactCell { lo: cell_lo, h, live: cell_live(f, cell_lo, h, live) })
+    thin_masks[id] = mask
+}
+
+/// The second half of `filter_thin_cells`: an invocation an octant of a candidate's core, eight a
+/// candidate, each the octant's own enclosure where the whole's form didn't clear it
+/// (`thin_masks`); an exact cell for each candidate one of whose octants the field's enclosure
+/// can't prove empty.
+@strict
+@compute(64)
+pub(package) fn filter_thin_octants<M: Field<Substance>>(
+    fields: [M],
+    grids: [GridSpec],
+    active: [ActiveBrick],
+    chunk_start: u32,
+    thin_cands: [u32],
+    thin_count: [u32],
+    thin_masks: [u32],
+    first: u32,
+    exact_eye: vec4,
+    exact_seen: mut Atomics<u32>,
+    exact_cells: mut Append<ExactCell>,
+    id: GlobalId,
+) {
+    let i = first + id.x / 8
+    let j = id.x % 8
+    if i >= min(thin_count[0], CAP_SURF) {
+        return
+    }
+    if ((thin_masks[id.x / 8] >> j) & 1) == 0 {
+        return
+    }
+    let packed = thin_cands[i]
+    let local_bi = packed >> 9
+    let cell = packed & 511
+    let ab = active[chunk_start + local_bi]
+    let g = grids[ab.coord.w]
+    let (lo, w, cell_lo) = thin_core(g, ab.coord.xyz, cell, exact_eye)
+    let o = lo + vec3(f32(j & 1), f32((j >> 1) & 1), f32((j >> 2) & 1)) * (0.5 * w)
+    let f = fields[g.orig_id]
+    let af = f.slope_affine(Box3 { lo: o, hi: o + vec3(0.5 * w) }, ab.live)
+    if af.lo() <= 0.0 && claim_exact_cell(mut exact_seen, local_bi, cell) {
+        let _ = exact_cells.push(ExactCell { lo: cell_lo, h: g.cell, live: cell_live(f, cell_lo, g.cell, ab.live) })
     }
 }
 
@@ -1445,10 +1467,32 @@ pub fn prep_slices(
     if id.x >= slices {
         return
     }
+    args[id] = DispatchArgs { x: (slice_items(count, cap, most, id.x) + 63) / 64, y: 1, z: 1 }
+}
+
+/// The items slice `k` of `most` holds of a list of `count[0]` (at most `cap`).
+fn slice_items(count: [u32], cap: u32, most: u32, k: u32) -> u32 {
     let n = min(count[0], cap)
-    let first = id.x * most
-    let m = if n > first { min(n - first, most) } else { 0 }
-    args[id] = DispatchArgs { x: (m + 63) / 64, y: 1, z: 1 }
+    let first = k * most
+    if n > first { min(n - first, most) } else { 0 }
+}
+
+/// `prep_slices` of a kernel that runs `lanes` invocations an item (`filter_thin_octants`: 8).
+@strict
+@compute(64)
+pub fn prep_lane_slices(
+    count: [u32],
+    cap: u32,
+    most: u32,
+    slices: u32,
+    lanes: u32,
+    args: mut Slots<DispatchArgs>,
+    id: GlobalId,
+) {
+    if id.x >= slices {
+        return
+    }
+    args[id] = DispatchArgs { x: (slice_items(count, cap, most, id.x) * lanes + 63) / 64, y: 1, z: 1 }
 }
 
 /// What one step of a crease cell's solve is given in a kernel, all of it unknown to the count:
