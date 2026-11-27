@@ -1058,7 +1058,16 @@ removes the faults of the retarget: slide, penetration and forces that cannot oc
   `--read targets=tools/movement/judge/targets`): every filtered clip judged beside its capture,
   each measure's share in its target, the share of each set followed to its end; the phase is
   done when the tracker follows 95% of each set to the end and the filtered capture keeps 95% of
-  its clips in each target.
+  its clips in each target. A clip that needs a seat (`bodies::seated`: slow, and in most frames
+  its centre of mass more than 3 cm outside the hull of what touches the floor) is left out.
+- The check on `p4h-12` (2026-11-27, the targets of today's declaration): 2,009 filtered clips.
+  Followed to the end: training 1,815 of 1,898 of 100STYLE and CeTI (95.6%; 100STYLE 91.1%, CeTI
+  97.9%), test 123 of 140 (87.9%; 100STYLE 83.5%); ACCAD's 94, new, none. In target, filtered
+  against captured: root residual 100% (mean 0.021 of the weight) against 97.6% (0.118); torque
+  100% against 98.8%; slide 99.8% (333 mm/s) against 98.1% (388); float 99.1% against 94.8%; goal
+  error 97.4% against 98.9%; penetration 0% (10.3 mm) against 97.1% (0.84); out of range 0%
+  (0.274 rad) against 99.0% (0.012); distance from capture 58.7% (2.36) against 98.6% (0.30);
+  tremor 0% (0.71) against 98.5% (0.018). Not done.
 
 ### Done when
 

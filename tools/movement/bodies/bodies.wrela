@@ -31,11 +31,15 @@ pub struct Def<const S: u32, const D: u32, const P: u32>: Copy {
     pub foot_right: u32,
 }
 
-/// Whether a clip's body sits: its root's median height under 0.9 of its height at rest, and the
-/// root still (its mean speed along the ground under 0.25 m/s, at `rate` frames a second; a lunge
-/// or a run of big steps is low and moves). It needs a seat that neither the judge's world nor the
-/// simulator has (MPI EMBM's narrators sit: 239 of its 288 clips on the human), so the tools leave
-/// it out until a seat is part of the world.
+/// Whether a clip's body sits: it needs a seat that neither the judge's world nor the simulator
+/// has. It moves slowly (its root under 0.25 m/s along the ground on average, at `rate` frames a
+/// second: a walk or a run is held up by its own momentum, its centre of mass often outside its
+/// feet), and in most of its frames (each fifth looked at) it is not held up by what touches the
+/// floor: its centre of mass, along the ground, is more than 3 cm outside the hull of its parts'
+/// lowest points within 3 cm of the floor (a body that stands, crouches, crawls or lies is over
+/// them; one that sits has its feet down and its weight behind them), or nothing touches. Until
+/// 2026-11-27 a low, still root was a seat: that left out ACCAD's crouching, crawling and lying
+/// with MPI EMBM's narrators (239 of whose 288 clips sit).
 pub fn seated<const S: u32, const D: u32, const P: u32>(
     def: Def<S, D, P>,
     poses: [Pose<D>],
@@ -45,18 +49,90 @@ pub fn seated<const S: u32, const D: u32, const P: u32>(
     if n < 2 {
         return false
     }
-    var hs: Vec<f32> = Vec::with_capacity(n)
     var path = 0.0
-    for i in 0..n {
-        hs.push(poses[i].root.t.y)
-        if i > 0 {
-            let d = poses[i].root.t - poses[i - 1].root.t
-            path += length(vec2(d.x, d.z))
-        }
+    for i in 1..n {
+        let d = poses[i].root.t - poses[i - 1].root.t
+        path += length(vec2(d.x, d.z))
     }
-    hs.sort_by(|a, b| a < b)
-    let speed = path * rate / f32(n - 1)
-    hs[n / 2] < 0.9 * def.rest.root.t.y && speed < 0.25
+    if path * rate / f32(n - 1) >= 0.25 {
+        return false
+    }
+    var total = 0.0
+    for m in def.masses {
+        total += m.mass
+    }
+    var looked = 0
+    var held = 0
+    var f = 0
+    while f < n {
+        let at = def.body.places(poses[f])
+        var com = vec3(0.0)
+        for s in 0..S {
+            com += at[s].apply(def.masses[s].centre) * def.masses[s].mass
+        }
+        com = com / total
+        var pts: Vec<vec2> = Vec::new()
+        for c in def.parts {
+            let (a, b) = c.placed(at)
+            if a.y - c.ra < 0.03 {
+                pts.push(vec2(a.x, a.z))
+            }
+            if b.y - c.rb < 0.03 {
+                pts.push(vec2(b.x, b.z))
+            }
+        }
+        looked += 1
+        if pts.len() > 0 && outside_hull(pts, vec2(com.x, com.z)) < 0.03 {
+            held += 1
+        }
+        f += 5
+    }
+    held * 2 < looked
+}
+
+/// How far `p` is outside the convex hull of `pts` (m; 0 inside): its distance to the nearest of
+/// the points, edges of the hull (Andrew's monotone chain), or 0 within it.
+fn outside_hull(pts: Vec<vec2>, p: vec2) -> f32 {
+    var q = pts.clone()
+    q.sort_by(|a, b| a.x < b.x || (a.x == b.x && a.y < b.y))
+    let cross = |o: vec2, a: vec2, b: vec2| (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x)
+    var hull: Vec<vec2> = Vec::new()
+    for pass in 0..2 {
+        let start = hull.len()
+        for i in 0..q.len() {
+            let v = if pass == 0 { q[i] } else { q[q.len() - 1 - i] }
+            while hull.len() >= start + 2 && cross(hull[hull.len() - 2], hull[hull.len() - 1], v) <= 0.0 {
+                let _ = hull.pop()
+            }
+            hull.push(v)
+        }
+        let _ = hull.pop()
+    }
+    let k = hull.len()
+    if k == 0 {
+        return 1.0e9
+    }
+    if k < 3 {
+        // A point or a segment: the distance to it.
+        let a = hull[0]
+        let b = hull[k - 1]
+        let ab = b - a
+        let t = if dot(ab, ab) > 1.0e-12 { clamp(dot(p - a, ab) / dot(ab, ab), 0.0, 1.0) } else { 0.0 }
+        return length(p - (a + ab * t))
+    }
+    var inside = true
+    var nearest = 1.0e9
+    for i in 0..k {
+        let a = hull[i]
+        let b = hull[(i + 1) % k]
+        if cross(a, b, p) < 0.0 {
+            inside = false
+        }
+        let ab = b - a
+        let t = clamp(dot(p - a, ab) / max(dot(ab, ab), 1.0e-12), 0.0, 1.0)
+        nearest = min(nearest, length(p - (a + ab * t)))
+    }
+    if inside { 0.0 } else { nearest }
 }
 
 /// How many parts the creature's flesh has (its 17 and the wand).
