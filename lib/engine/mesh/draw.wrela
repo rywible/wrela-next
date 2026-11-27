@@ -8,7 +8,8 @@ use matter::swarm::{NoSwarm, Swarm}
 use matter::world::one
 use mesh::cull::{HiZCuller, hiz_culler}
 use mesh::extract::{ExtractScratch, MeshBatch, extract_scratch, mesh_batch}
-use mesh::grid::{CELL_PX, placement}
+use mesh::grid::{CELL_PX, GridSpec, MAX_LOD_LEVELS, placement}
+use mesh::rings::{COARSE_STRIDE, COARSE_WORDS, coarse_pixels}
 use std::strict::{StrictCheck, strict_check}
 use mesh::height::{CLIP_RINGS, ClipmapMesh, clipmap_mesh, height_vs}
 use mesh::light::{
@@ -36,15 +37,26 @@ use std::gpu::{
     DepthPass2, DepthPass4, DepthTexture, Filter, GpuBuffer, Pass4, R16Float, R32Float, Rg16Float,
     Rg32Float, Rg32Uint, Rgba8, Rgba16Float, Rgba32Float, Sampler, Texture, begin_depth_pass, begin_pass,
     begin_pass2, begin_pass2_with_depth, begin_pass3, begin_pass4, begin_pass4_with_depth,
-    begin_pass_with_depth, buffer_of, copy_texture, depth_texture, dispatch, draw, label, sampler,
-    texture, writable_texture, write,
+    begin_pass_with_depth, buffer, buffer_of, copy, copy_texture, depth_texture, dispatch, draw, label,
+    read, sampler, texture, writable_texture, write,
 }
+use std::io::Pending
 use std::hash::Hasher
 
 pub use mesh::world_draw::MeshWorld
 
 pub struct MeshSight {
     pub drawn: Picture,
+    /// The rule's judge of the rings (`count_coarse`): each batch's drawn cut and how many levels
+    /// it has, the cell its rule wants a pixel at most, and the pixels counted since
+    /// `reset_coarse` (judged, drawn coarser than the rule wants, of a batch not judged).
+    ring_cuts: GpuBuffer<GridSpec>,
+    ring_levels: GpuBuffer<u32>,
+    ring_rules: GpuBuffer<f32>,
+    ring_counts: GpuBuffer<u32>,
+    /// Whether the next frame's pixels are counted against the rule, right after its opaque
+    /// visibility pass (`count_coarse`).
+    ring_asked: bool,
     /// `drawn.place` with transmissive surfaces in it (`place_with_trans_fs`), copied back.
     place_all: Texture<Rgba32Float>,
     pub hdr_direct: Texture<Rgba16Float>,
@@ -117,6 +129,11 @@ pub struct MeshSight {
 pub fn mesh_sight(gi: bool = true, place: u32 = 0, cell_px: f32 = CELL_PX) -> MeshSight {
     MeshSight {
         drawn: picture(width: 1, height: 1),
+        ring_cuts: buffer(MAX_LOD_LEVELS),
+        ring_levels: buffer(1),
+        ring_rules: buffer(1),
+        ring_counts: buffer(COARSE_WORDS),
+        ring_asked: false,
         place_all: texture(width: 1, height: 1),
         hdr_direct: texture(width: 1, height: 1),
         sun_cls: texture(width: 1, height: 1),
@@ -582,6 +599,9 @@ impl MeshSight {
         vp.end()
 
         self.vis.classify(width, height_px, nb)
+        if self.ring_asked {
+            self.counted_coarse(v, width, height_px)
+        }
 
         label("mesh_vis_resolve")
         let ep: DepthPass4<Rgba8, Rgba8, Rgba16Float, Rg16Float> = begin_pass4_with_depth(
@@ -1265,6 +1285,66 @@ impl MeshSight {
             self.batches[i].max_late_streak = 0
             self.batches[i].late_frames = 0
         }
+    }
+
+    /// Asks the next frame's pixels to be counted against the rule (`rings::coarse_pixels`),
+    /// each pixel of a meshed thing held to its batch's drawn cut, right after its opaque
+    /// visibility pass (what is drawn into the visibility texture after it is not the frame's).
+    pub fn count_coarse(mut self) {
+        self.ring_asked = true
+    }
+
+    /// The count `count_coarse` asked for, of the frame seen by `v` at `width` × `height`.
+    fn counted_coarse(mut self, v: View, width: u32, height: u32) {
+        self.ring_asked = false
+        let n = self.batches.len()
+        if n == 0 {
+            return
+        }
+        if self.ring_levels.len() < n {
+            self.ring_cuts = buffer(n * MAX_LOD_LEVELS)
+            self.ring_levels = buffer(n)
+            self.ring_rules = buffer(n)
+        }
+        var rules: Vec<f32> = Vec::new()
+        for i in 0..n {
+            copy(from: self.batches[i].drawn_grids.items(), to: self.ring_cuts.span_mut(start: i * MAX_LOD_LEVELS, count: MAX_LOD_LEVELS))
+            copy(from: self.batches[i].drawn_levels.items(), to: self.ring_levels.span_mut(start: i, count: 1))
+            rules.push(self.batches[i].drawn_rule)
+        }
+        write(mut self.ring_rules, 0, rules)
+        label("mesh_ring_judge")
+        dispatch(
+            coarse_pixels.bind(
+                vis: self.vis.tex,
+                depth: self.depth,
+                width: width,
+                height: height,
+                eye: v.at,
+                forward: v.forward,
+                right: v.right,
+                up: v.up,
+                focal: v.focal,
+                near: mesh::light::NEAR,
+                cuts: self.ring_cuts.items(),
+                levels: self.ring_levels.items(),
+                rules: self.ring_rules.items(),
+                n_batches: n,
+                counts: mut self.ring_counts,
+            ),
+            groups: ((width + 8 * COARSE_STRIDE - 1) / (8 * COARSE_STRIDE), (height + 8 * COARSE_STRIDE - 1) / (8 * COARSE_STRIDE), 1),
+        )
+    }
+
+    /// Starts the rule's count again (`count_coarse`).
+    pub fn reset_coarse(mut self) {
+        write(mut self.ring_counts, 0, Vec::filled(COARSE_WORDS, 0))
+    }
+
+    /// The rule's count since `reset_coarse`: pixels judged, drawn coarser than the rule wants,
+    /// and of batches not judged.
+    pub fn read_coarse(self) -> Pending<u32> {
+        read(self.ring_counts.items())
     }
 
     /// Total late frames summed across batches and the longest consecutive late streak of any

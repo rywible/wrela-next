@@ -18,6 +18,7 @@ use matter::substance::Substance
 use mesh::grid::{BRICK, GridSpec, MAX_LOD_LEVELS, NONE}
 use std::collections::Vec
 use std::derive::Box3
+use std::gpu::{Atomics, DepthTexture, GlobalId, Rg32Uint, Texture}
 
 /// The parent bricks the eye may move from a ring's centre before the ring moves with it.
 pub const RING_SLACK: f32 = 2.0
@@ -42,6 +43,58 @@ fn box_reach(b: Box3, e: vec3) -> (f32, f32) {
     (near, far)
 }
 
+/// The steps a ring's reach takes below the rule's (`ring_reach`): a quarter of a power of two.
+pub const REACH_STEP: f32 = 1.1892071
+
+/// The most steps in (`REACH_STEP`) a reach takes: a 64th of the rule's.
+pub const REACH_STEPS: u32 = 24
+
+/// The share of what a batch holds a reach chosen afresh aims its kept bricks at (`ring_reach`):
+/// a cut whose cull keeps more of its candidates than the last one did still fits.
+pub const REACH_AIM: f32 = 0.7
+
+/// The candidate bricks of the rings `build_ring_grids` makes at `reach`.
+fn ring_total(aabb: Box3, eye: vec3, px: f32, cell_px: f32, h_floor: f32, shift: vec3, reach: f32) -> u32 {
+    let (_, total, _) = build_ring_grids(aabb, eye, px, cell_px, h_floor, orig_id: 0, shift: shift, reach: reach)
+    total
+}
+
+/// The reach of the rings (`build_ring_grids`' `reach`) for a batch that holds `holds` bricks and
+/// whose cull keeps `density` of a cut's candidates (as its last readback found): the last reach,
+/// `last`, while the bricks it would keep are no more than the batch holds and a step out would
+/// keep more than `REACH_AIM` of it (so a still eye's cut moves with no readback); else the most,
+/// the rule's (1) or a power of `1 / REACH_STEP` below it, whose bricks are no more than
+/// `REACH_AIM` of it. With it, whether a step in was still to be had: false when the rings at a
+/// 64th of the rule's reach keep more (what the batch's cells coarsen for, `took_counts`).
+pub fn ring_reach(
+    aabb: Box3,
+    eye: vec3,
+    px: f32,
+    cell_px: f32,
+    h_floor: f32,
+    shift: vec3,
+    holds: u32,
+    density: f32,
+    last: f32,
+) -> (f32, bool) {
+    let room = f32(holds)
+    let aim = REACH_AIM * room
+    if last > 0.0 && last <= 1.0 && density * f32(ring_total(aabb, eye, px, cell_px, h_floor, shift, last)) <= room {
+        if last >= 1.0 ||
+            density * f32(ring_total(aabb, eye, px, cell_px, h_floor, shift, min(last * REACH_STEP, 1.0))) > aim {
+            return (last, true)
+        }
+    }
+    var reach = 1.0
+    for _step in 0..REACH_STEPS {
+        if density * f32(ring_total(aabb, eye, px, cell_px, h_floor, shift, reach)) <= aim {
+            return (reach, true)
+        }
+        reach = reach / REACH_STEP
+    }
+    (reach, false)
+}
+
 /// The finest cell a ring has (m): no finer than `CELL_LEAST` four times over, the finest a
 /// thing seen closest is meshed at.
 pub const RING_FINEST: f32 = 0.0004
@@ -56,6 +109,8 @@ pub fn ring_anchor(aabb: Box3) -> vec3 {
 }
 
 /// The rings of a thing whose tight box is `aabb`, for an eye at `eye` whose pixel is `px` wide
+/// (each reaching `reach` of the distance the rule wants it to: 1 but where what the batch holds
+/// is less, `ring_reach`)
 /// a metre out, cells `cell_px` pixels wide, the coarsest no finer than `h_floor` (`grid::
 /// size_floor`, what a compact thing's surface fits in) and none finer than `RING_FINEST`: the
 /// grids
@@ -69,6 +124,7 @@ pub fn build_ring_grids(
     h_floor: f32,
     orig_id: u32,
     shift: vec3,
+    reach: f32 = 1.0,
 ) -> (Vec<GridSpec>, u32, bool) {
     let per = cell_px * max(px, 1.0e-7)
     let (near, far) = box_reach(aabb, eye)
@@ -131,7 +187,7 @@ pub fn build_ring_grids(
         // distance level `k` is wanted to (`R_k`) and that slack past it.
         let step = RING_SLACK * pbspan
         let centre = origin + (floor((eye - origin) / step) + vec3(0.5)) * step
-        let half = pow2(k + 1) / per + step
+        let half = reach * pow2(k + 1) / per + step
         let lo_f = (centre - vec3(half) - prev_origin) / pbspan
         let hi_f = (centre + vec3(half) - prev_origin) / pbspan
         let lo_x = max(min_x, i32(floor(lo_f.x)))
@@ -206,4 +262,120 @@ pub fn build_ring_grids(
         }
     }
     (grids, total, seams)
+}
+
+// ---- the pixels drawn coarser than the rule wants ---------------------------------------------
+//
+// A pixel of a meshed thing is drawn from the finest level of its batch's drawn cut that holds the
+// point the pixel shows (`drawn_cell`): its cell is the pixel's. The rule wants that cell no wider
+// than `rule` pixels at the point's distance (`rule · px · d`, `rule` the batch's `CELL_PX`, finer
+// for a steep field); a pixel whose cell is wider is drawn coarser than the rule wants. What a
+// moving eye sees drawn coarse is the rings' and the pool's lateness: rings that stop short of
+// their reach, or a cut not yet drawn. (A batch drawn in a frame of its own, placed or posed, is
+// not counted: its pixels are `counts[2]`.)
+
+/// The cell of the finest of the first `levels` grids of `cuts` (from `base`, coarsest first) that
+/// holds `p` outside its hole, or 0 when none does.
+pub(package) fn drawn_cell(cuts: [GridSpec], base: u32, levels: u32, p: vec3) -> f32 {
+    var cell = 0.0
+    for k in 0..MAX_LOD_LEVELS {
+        if k >= levels {
+            break
+        }
+        let g = cuts[base + k]
+        let lo = g.origin + vec3(f32(g.cell_offset.x), f32(g.cell_offset.y), f32(g.cell_offset.z)) * g.cell + g.shift
+        let span = vec3(f32(g.dims.x), f32(g.dims.y), f32(g.dims.z)) * (g.cell * f32(BRICK))
+        let q = p - lo
+        if q.x >= 0.0 && q.y >= 0.0 && q.z >= 0.0 && q.x < span.x && q.y < span.y && q.z < span.z {
+            let c = vec3u(u32(q.x / g.cell), u32(q.y / g.cell), u32(q.z / g.cell))
+            let in_hole = g.has_hole != 0 &&
+                c.x >= g.hole_min.x && c.x < g.hole_max.x &&
+                c.y >= g.hole_min.y && c.y < g.hole_max.y &&
+                c.z >= g.hole_min.z && c.z < g.hole_max.z
+            if !in_hole {
+                cell = g.cell
+            }
+        }
+    }
+    cell
+}
+
+/// The words of `coarse_pixels`' counts: three of the whole frame (and one spare), then a row of
+/// each of the first `COARSE_BATCHES` batches (the last for the rest): its pixels judged, drawn
+/// coarse, and how many times the rule's cell those were, summed in sixteenths.
+pub const COARSE_ROWS: u32 = 8
+pub const COARSE_ROW_WORDS: u32 = 4
+pub const COARSE_BATCHES: u32 = 16
+pub const COARSE_WORDS: u32 = COARSE_ROWS + COARSE_ROW_WORDS * COARSE_BATCHES
+
+/// The pixels `coarse_pixels` judges: the middle one of each `COARSE_STRIDE` × `COARSE_STRIDE`
+/// block, a sample whose shares are the frame's (a judge of every pixel adds to the same few
+/// counts two million times a 1080p frame: 4.7 ms on the M4, inside the frames the gate times).
+pub const COARSE_STRIDE: u32 = 4
+
+/// Each pixel of the frame's sample (`COARSE_STRIDE`) held to the rule: `counts[0]` the pixels judged, `[1]` those drawn
+/// coarser than the rule wants, `[2]` those of a batch that draws no cut, and each batch's row. A batch's `levels` is its
+/// cut's grids, coarsest first, or with bit 31 set the one grid of a thing meshed in a frame of
+/// its own (placed or posed: its cell is the pixel's wherever the point lies). The point a
+/// pixel shows is the eye's ray to its depth (`NEAR / depth` along the view, the reversed depth of
+/// `light::clip_of`).
+@compute(8, 8)
+pub(package) fn coarse_pixels(
+    vis: Texture<Rg32Uint>,
+    depth: DepthTexture,
+    width: u32,
+    height: u32,
+    eye: vec3,
+    forward: vec3,
+    right: vec3,
+    up: vec3,
+    focal: f32,
+    near: f32,
+    cuts: [GridSpec],
+    levels: [u32],
+    rules: [f32],
+    n_batches: u32,
+    counts: mut Atomics<u32>,
+    id: GlobalId,
+) {
+    let x = id.x * COARSE_STRIDE + COARSE_STRIDE / 2
+    let y = id.y * COARSE_STRIDE + COARSE_STRIDE / 2
+    if x >= width || y >= height {
+        return
+    }
+    let h = vis.load(x, y).x
+    if (h & 2147483648) == 0 {
+        return
+    }
+    let batch = (h >> 16) & 8191
+    if batch >= n_batches || levels[batch] == 0 {
+        let _ = counts.add(i: 2, value: 1)
+        return
+    }
+    let z_rev = depth.load(x, y)
+    if !(z_rev > 0.0) {
+        return
+    }
+    let size = vec2(f32(width), f32(height))
+    let uv = ((vec2(f32(x), f32(y)) + vec2(0.5)) * 2.0 - size) / size.y
+    let ray = normalize(forward * focal + right * uv.x - up * uv.y)
+    let z = near / z_rev
+    let t = z / max(dot(ray, forward), 1.0e-6)
+    let p = eye + ray * t
+    // A thing meshed in a frame of its own (placed or posed) is meshed at its one grid's cell.
+    let placed = (levels[batch] & 2147483648) != 0
+    let cell = if placed { cuts[batch * MAX_LOD_LEVELS].cell } else {
+        drawn_cell(cuts, batch * MAX_LOD_LEVELS, levels[batch], p)
+    }
+    let _ = counts.add(i: 0, value: 1)
+    let px = 2.0 / (size.y * focal)
+    let row = COARSE_ROWS + COARSE_ROW_WORDS * min(batch, COARSE_BATCHES - 1)
+    let _ = counts.add(i: row, value: 1)
+    if cell > rules[batch] * px * t {
+        let _ = counts.add(i: 1, value: 1)
+        let _ = counts.add(i: row + 1, value: 1)
+        // How many times the rule's cell it is, in sixteenths (64 times at most).
+        let over = cell / max(rules[batch] * px * t, 1.0e-9)
+        let _ = counts.add(i: row + 2, value: u32(min(over, 64.0) * 16.0))
+    }
 }

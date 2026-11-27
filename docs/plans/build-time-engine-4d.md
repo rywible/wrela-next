@@ -461,26 +461,37 @@ radiance error rather than point-sampled sub-cell tessellation noise.
 Purpose: make a moving or turning eye cost little more than a still one, by keeping every brick
 it extracted, and prove the kept mesh is the mesh a cold extraction makes.
 
-**State (2026-11-27): not done.** Built: a held mesh is extracted for no eye, and its outline's
-exact cells are found each frame from what the extraction kept (`mesh::outline`); every grid's
-corners are on the world's lattice (`grid_for`). And in work in progress (`b6fe922`): a static,
-opaque mesh of nested rings is a `BrickPool` (`mesh::pool`): its bricks keyed by `(lattice brick,
-level, hole mask, thing)`, kept in persistent slots, a new cut probing the pool and extracting
-only its misses and its seam faces' bricks (a transient tail), its bricks' indices compacted into
-one draw. An update draws its new cut only when the cut is whole (`pool_decide`); else the last
-whole cut stays drawn, whole, and the update reads back late. Its misses are dispatched for as
-many as the two cuts' boxes bound (`cut_bounds`), a count, not a guess. The rings are fitted by
-distance alone (`build_lod_grids_distance`), with the eye's turn changing no brick.
+**State (2026-11-27, `197305e`): steps 1 and 2 built; step 3 next.** A static, opaque mesh of
+nested rings is a `BrickPool` (`mesh::pool`). Its bricks are keyed by what their mesh reads
+(`brick_key`: lattice brick, level, seam faces, hole mask, thing), every brick of a cut kept,
+seam faces' too: a brick on a 2:1 seam face keeps six indices of its own slice for each quad of
+the stitch across it (`count_lod_edge`, `emit_tris_lod`), and the stitch writes them there
+(`finish_seam_tris`), for every extraction, pooled or not, so there is no transient tail. An
+update culls and probes the cut, meshes as many misses as its frame's budget lets into new slots
+(the one mesher of every extraction: `mesh_chunk_cells`, `mesh_chunk_quads`, `stitch_seams`,
+`cull_cut`), and draws the cut only when every brick of it is in the pool (`pool_decide`); else
+the last whole cut stays drawn and the next update takes up the rest. Slots are freed by age: each
+slot is stamped by the commit that last drew it, and when what the pool may hold after an update
+would pass its room, a rebase keeps the drawn cut and the most lately drawn slots up to a quarter
+of the pool, moves their indices (each vertex renamed), vertices, certificates, outline records,
+thin cells and exact cells into second buffers, and makes the hash again (`rebase_pool`); a kept
+brick is never meshed again. Misses are dispatched for as many as the last readbacks found, twice
+over and a chunk more, never past the cut's boxes' bound (`cut_bounds`): a bound sized dispatch
+paid ~5 ms an update in chunks that found nothing (21 dispatches a chunk, most of them a few µs
+each).
 
-M4, 1080p, gate medians, `6c6adcc` against the pool (`b6fe922`'s parent, gate of 2026-11-27 10:29):
-SCENE 10 VIEW 3 31.7 → 27.0 ms, VIEW 4 68.2 → 25.8, VIEW 5 54.6 → 13.3; SCENE 13 VIEW 3 84.3 →
-53.1, VIEW 4 26.9 → 17.1, VIEW 5 19.3 → 8.8. Still spans held (SCENE 10 20.7, 13 15.7). On
-SCENE 10 VIEW 4 (frames 30 to 269) the pool updates in 91 of 240 frames: about 29,000 bricks
-kept, 1,000 extracted and 700 seam bricks a update; its own passes are under the median of every
-label (the extraction's 2.9 ms median a frame is the moving kinds', every frame, as still), and
-the outline's certificates (`mesh_watch*`, 6.2 ms) are the moving eye's cost. Open: a full pool is
-emptied and extracted again whole (every ~25 updates, a 18 ms frame); a cut that cannot commit
-extracts nothing toward it.
+The judge (step 1): `judge::pool`, the gate's `pool` step, a run at the game's fastest and a turn,
+a rebase forced a quarter of the way: the arena's courtyard (1,523,902 triangles, 1,566 exact
+cells, 759,644 outline records), the study's room (845,448) and its table close up (597,134), each
+the cold extraction of its cut bit for bit (exact cells compared as a set: the seam's
+`first_seam_sight` boxes a coarse cell twice when its slots are taken). A key that ignores the hole
+mask fails it (1,524,398 triangles against 1,523,902).
+
+M4, SCENE 10 VIEW 4 (running), 1080p, frames 30 to 269, the pool's passes a frame (means): cull
+0.024, probe 0.015, misses 0.150, compaction 0.281 ms, no rebase in the run: 0.47 ms over still,
+in step 2's target. The span is 27.9 ms, the outline's certificates (`mesh_watch*`, 6.0 ms) and the
+moving kinds' extraction (2.9 ms, as still) the rest of the moving cost. The rings are still
+`build_lod_grids_distance`'s, with its tuned caps (step 3).
 
 ### Steps, in order
 

@@ -48,6 +48,10 @@ const PROBE_MAX: u32 = 64
 pub const COMPACT_GROUPS: u32 = 256
 pub const COMPACT_PER_GROUP: u32 = 256
 
+/// The bricks a cut keeps at most: half the most a pool holds, room for its drawn cut and the
+/// one replacing it (`ring_reach`'s budget, and past it a batch's cells coarsen, `took_counts`).
+pub const CUT_ROOM: u32 = COMPACT_GROUPS * COMPACT_PER_GROUP / 2
+
 /// The bricks a pool holds for each brick of its drawn cut (its last readback's, or before one
 /// the candidates'): the drawn cut's and room for the cuts the eye's moves bring in after it.
 const POOL_CUTS: u32 = 3
@@ -617,6 +621,27 @@ pub(package) fn pool_mark_alive(
     }
 }
 
+/// On a commit, the cut's grids (`levels` of them) kept as the drawn cut's (what
+/// `rings::coarse_pixels` holds the drawn pixels to); else the drawn cut's stay.
+@strict
+@compute(64)
+pub(package) fn pool_drawn_cut(
+    gate: [u32],
+    grids: [GridSpec],
+    levels: u32,
+    drawn: mut Slots<GridSpec>,
+    drawn_levels: mut One<u32>,
+    id: GlobalId,
+) {
+    if gate[GATE_COMMIT] == GATE_NONE || id.x >= levels {
+        return
+    }
+    drawn[id] = grids[id.x]
+    if id.x == 0 {
+        drawn_levels.set(id, levels)
+    }
+}
+
 /// On a commit, the exact cells of the arena whose slot is alive, copied into the drawn list.
 @strict
 @compute(64)
@@ -768,6 +793,11 @@ pub struct BrickPool {
     /// The rebases made (`MeshBatch::rebase_pool`), and one asked for next update (`judge::pool`).
     pub rebases: u32,
     pub(package) rebase_next: bool,
+    /// Whether the last update read drew nothing new with every slot taken: if the drawn cut leaves
+    /// too little to free (`run_pool_update`), the next update starts the pool afresh.
+    pub(package) jammed: bool,
+    /// The bricks of its last read update's cut the cull kept, its hits and misses.
+    pub(package) cut_kept: u32,
     pub(package) rebase_gen: u32,
     /// The rebase's second buffers (each the size of its first, `ensure_rebase`), and its scans'.
     pub(package) r: RebaseBuffers,
@@ -903,6 +933,8 @@ pub fn brick_pool() -> BrickPool {
         stamp: buffer(1),
         rebases: 0,
         rebase_next: false,
+        jammed: false,
+        cut_kept: 0,
         rebase_gen: 0,
         r: rebase_buffers(),
     }
@@ -963,6 +995,8 @@ impl MeshBatch {
         gpu_ovf: u32,
     ) {
         let commit = c[17]
+        self.pool.jammed = commit == 0 && c[14] >= self.pool.cap
+        self.pool.cut_kept = c[10] + c[11]
         if commit == 0 {
             return
         }
@@ -1260,51 +1294,66 @@ impl MeshBatch {
         )
         if use_exact {
             self.pool.r.quads.clear()
-            dispatch(
-                rebase_quads.bind(
-                    slots: slots,
-                    keep: self.pool.r.keep.items(),
-                    new_id: self.pool.r.new_id.items(),
-                    meta: self.pool.meta.items(),
-                    new_first: self.pool.r.new_first.items(),
-                    quads: self.quad_recs.items(),
-                    quad_count: self.quad_recs.count(),
-                    cap_quads: self.watch_quads_cap,
-                    new_quads: mut self.pool.r.quads,
-                ),
-                over: self.watch_quads_cap,
-            )
+            var first_e: u32 = 0
+            while first_e < self.watch_quads_cap {
+                dispatch(
+                    rebase_quads.bind(
+                        slots: slots,
+                        first: first_e,
+                        keep: self.pool.r.keep.items(),
+                        new_id: self.pool.r.new_id.items(),
+                        meta: self.pool.meta.items(),
+                        new_first: self.pool.r.new_first.items(),
+                        quads: self.quad_recs.items(),
+                        quad_count: self.quad_recs.count(),
+                        cap_quads: self.watch_quads_cap,
+                        new_quads: mut self.pool.r.quads,
+                    ),
+                    over: min(self.watch_quads_cap - first_e, REBASE_LANES),
+                )
+                first_e += REBASE_LANES
+            }
             self.pool.r.thin.clear()
-            dispatch(
-                rebase_thin.bind(
-                    slots: slots,
-                    keep: self.pool.r.keep.items(),
-                    new_id: self.pool.r.new_id.items(),
-                    thin: self.thin_keep.items(),
-                    thin_count: self.thin_keep.count(),
-                    cap_thin: self.thin_proof.len(),
-                    proof: self.thin_proof.items(),
-                    new_thin: mut self.pool.r.thin,
-                    new_proof: mut self.pool.r.proof,
-                ),
-                over: self.thin_proof.len(),
-            )
+            var first_e: u32 = 0
+            while first_e < self.thin_proof.len() {
+                dispatch(
+                    rebase_thin.bind(
+                        slots: slots,
+                        first: first_e,
+                        keep: self.pool.r.keep.items(),
+                        new_id: self.pool.r.new_id.items(),
+                        thin: self.thin_keep.items(),
+                        thin_count: self.thin_keep.count(),
+                        cap_thin: self.thin_proof.len(),
+                        proof: self.thin_proof.items(),
+                        new_thin: mut self.pool.r.thin,
+                        new_proof: mut self.pool.r.proof,
+                    ),
+                    over: min(self.thin_proof.len() - first_e, REBASE_LANES),
+                )
+                first_e += REBASE_LANES
+            }
         }
         self.pool.r.exact.clear()
-        dispatch(
-            rebase_exact.bind(
-                slots: slots,
-                keep: self.pool.r.keep.items(),
-                new_id: self.pool.r.new_id.items(),
-                exact: self.pool.exact.items(),
-                exact_slots: self.pool.exact_slots.items(),
-                exact_count: self.pool.exact.count(),
-                cap_exact: self.pool.exact_cap,
-                new_exact: mut self.pool.r.exact,
-                new_slots: mut self.pool.r.exact_slots,
-            ),
-            over: self.pool.exact_cap,
-        )
+        var first_e: u32 = 0
+        while first_e < self.pool.exact_cap {
+            dispatch(
+                rebase_exact.bind(
+                    slots: slots,
+                    first: first_e,
+                    keep: self.pool.r.keep.items(),
+                    new_id: self.pool.r.new_id.items(),
+                    exact: self.pool.exact.items(),
+                    exact_slots: self.pool.exact_slots.items(),
+                    exact_count: self.pool.exact.count(),
+                    cap_exact: self.pool.exact_cap,
+                    new_exact: mut self.pool.r.exact,
+                    new_slots: mut self.pool.r.exact_slots,
+                ),
+                over: min(self.pool.exact_cap - first_e, REBASE_LANES),
+            )
+            first_e += REBASE_LANES
+        }
         // The second buffers are the pool's now.
         swap(mut self.verts, mut self.pool.r.verts)
         swap(mut self.vert_cert, mut self.pool.r.cert)
@@ -1351,7 +1400,7 @@ impl MeshBatch {
             over: 1,
         )
         write(mut scratch.pool_stats, 0, Vec::filled(8, 0))
-        self.pool_commit(mut scratch, use_exact)
+        self.pool_commit(mut scratch, use_exact, cut_levels: 0)
         self.pool.rebases += 1
         self.pool.rebase_gen = self.gen + 1
         self.pool.held = Vec::new()
@@ -1367,7 +1416,20 @@ impl MeshBatch {
     /// indices (`scratch.draw_slots`) copied from the arena into the draw, its slots alive and
     /// stamped, its exact cells copied (`use_exact`), and the draw's arguments and the readback's
     /// counts written (`finish_pool_draw`); nothing drawn changed when the cut is not whole.
-    pub(package) fn pool_commit(mut self, scratch: mut ExtractScratch, use_exact: bool) {
+    pub(package) fn pool_commit(mut self, scratch: mut ExtractScratch, use_exact: bool, cut_levels: u32) {
+        // The drawn cut's grids (none named on a rebase: its cut is the one drawn already).
+        if cut_levels > 0 {
+            dispatch(
+                pool_drawn_cut.bind(
+                    gate: scratch.pool_gate.items(),
+                    grids: scratch.grids.items(),
+                    levels: cut_levels,
+                    drawn: self.drawn_grids.span_mut(start: 0, count: cut_levels),
+                    drawn_levels: mut self.drawn_levels,
+                ),
+                over: cut_levels,
+            )
+        }
         // The commit: the cut's slots' indices copied into the draw, its slots alive, its exact
         // cells copied; none of it when the cut is not whole.
         let compact_cap = COMPACT_GROUPS * COMPACT_PER_GROUP
@@ -1542,10 +1604,12 @@ impl MeshBatch {
         let uses_kept = sample.uses_kept()
         self.size_slices(mut scratch, fields, sample, lod: true, held: held)
 
-        // Room for `POOL_CUTS` drawn cuts (the last readback's, or the candidates' before one).
+        // Room for `POOL_CUTS` drawn cuts: the last readback's, or this one's as the share of
+        // candidates the last cull kept says, the more (the candidates' before a readback).
         let old_verts = self.cap_verts
         let old_kept = self.vert_kept_cap
-        let drawn = if self.active_hint > 0 { self.active_hint } else { min(total_bricks, CUT_BRICKS) }
+        let this_cut = u32(self.ring_density * f32(total_bricks))
+        let drawn = if self.active_hint > 0 { max(self.active_hint, this_cut) } else { min(total_bricks, CUT_BRICKS) }
         let want = min(POOL_CUTS * drawn, min(self.max_bricks, COMPACT_GROUPS * COMPACT_PER_GROUP))
         self.ensure_cap(want)
         if uses_kept {
@@ -1559,7 +1623,12 @@ impl MeshBatch {
         let reallocated = grew || grew_watch || self.cap_verts != old_verts || self.vert_kept_cap != old_kept
         let same_space = self.pooled && !reallocated && self.pool.field_key == field_key &&
             self.pool.origin == scratch.origin0 && self.pool.shift == scratch.lattice
-        let warm = same_space
+        // Slots to free by age (`rebase_pool`): at least an eighth of them not the drawn cut's. A
+        // pool its last read found full, drawing nothing new, with none such to free, starts
+        // afresh: the drawn cut leaves no room for the bricks of the cut that would replace it.
+        let freeable = self.pool.used_slots > self.active_hint + self.pool.cap / 8
+        let warm = same_space && !(self.pool.jammed && !freeable)
+        self.pool.jammed = false
         // Dispatched for as many misses as the cut's boxes bound against the cut the pool holds,
         // as far as the frame's budget goes.
         let fc = frustum_cull_none()
@@ -1585,7 +1654,6 @@ impl MeshBatch {
             self.pool.used_idx + ahead * self.indices_per_brick > self.pool.idx_cap ||
             self.verts_known + ahead * self.verts_per_brick > self.cap_verts ||
             self.pool.used_exact > self.pool.exact_cap / 2
-        let freeable = self.pool.used_slots > self.active_hint + self.pool.cap / 8
         if warm && ((short && freeable) || self.pool.rebase_next) {
             self.rebase_pool(mut scratch, use_exact, uses_kept, target: self.pool.cap / 4)
             self.pool.rebase_next = false
@@ -1811,7 +1879,7 @@ impl MeshBatch {
         )
 
         label("mesh_extract_compact")
-        self.pool_commit(mut scratch, use_exact)
+        self.pool_commit(mut scratch, use_exact, cut_levels: cut.len())
         self.pooled = true
         self.has_exact = use_exact
         self.has_brick_draws = false
@@ -1868,6 +1936,10 @@ const REBASE_VERTS_GROUP: u32 = 4096
 
 /// The most vertex groups a rebase scans (16M vertices).
 const REBASE_VERT_GROUPS_MOST: u32 = 4096
+
+/// The lanes a rebase dispatches at most at once (a dispatch has at most 65,535 workgroups along
+/// an axis).
+const REBASE_LANES: u32 = 2097152
 
 /// `BrickPool::marks`' commits counted (a slot's stamp is one of them).
 pub const MARK_NOW: u32 = 3
@@ -2245,6 +2317,7 @@ pub(package) fn rebase_copy_slots(
 @compute(64)
 pub(package) fn rebase_quads(
     slots: [u32],
+    first: u32,
     keep: [u32],
     new_id: [u32],
     meta: [u32],
@@ -2256,10 +2329,11 @@ pub(package) fn rebase_quads(
     id: GlobalId,
 ) {
     let used = slots[MARK_SLOTS]
-    if id.x >= min(quad_count[0], cap_quads) {
+    let e_at = first + id.x
+    if e_at >= min(quad_count[0], cap_quads) {
         return
     }
-    let q = quads[id.x]
+    let q = quads[e_at]
     let slot = q.y & 1073741823
     if slot >= used || keep[slot] == 0 {
         return
@@ -2274,6 +2348,7 @@ pub(package) fn rebase_quads(
 @compute(64)
 pub(package) fn rebase_thin(
     slots: [u32],
+    first: u32,
     keep: [u32],
     new_id: [u32],
     thin: [u32],
@@ -2285,17 +2360,18 @@ pub(package) fn rebase_thin(
     id: GlobalId,
 ) {
     let used = slots[MARK_SLOTS]
-    if id.x >= min(thin_count[0], cap_thin) {
+    let e_at = first + id.x
+    if e_at >= min(thin_count[0], cap_thin) {
         return
     }
-    let e = thin[id.x]
+    let e = thin[e_at]
     let slot = e >> 9
     if slot >= used || keep[slot] == 0 {
         return
     }
     let j = new_thin.push((new_id[slot] << 9) | (e & 511))
     if j < cap_thin {
-        new_proof.store(i: j, value: proof[id.x])
+        new_proof.store(i: j, value: proof[e_at])
     }
 }
 
@@ -2304,6 +2380,7 @@ pub(package) fn rebase_thin(
 @compute(64)
 pub(package) fn rebase_exact(
     slots: [u32],
+    first: u32,
     keep: [u32],
     new_id: [u32],
     exact: [ExactCell],
@@ -2315,14 +2392,15 @@ pub(package) fn rebase_exact(
     id: GlobalId,
 ) {
     let used = slots[MARK_SLOTS]
-    if id.x >= min(exact_count[0], cap_exact) {
+    let e_at = first + id.x
+    if e_at >= min(exact_count[0], cap_exact) {
         return
     }
-    let slot = exact_slots[id.x]
+    let slot = exact_slots[e_at]
     if slot >= used || keep[slot] == 0 {
         return
     }
-    let j = new_exact.push(exact[id.x])
+    let j = new_exact.push(exact[e_at])
     if j < cap_exact {
         new_slots.store(i: j, value: new_id[slot])
     }

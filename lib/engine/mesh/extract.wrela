@@ -26,15 +26,15 @@ use mesh::outline::{
     place_cert_append, place_cert_link, reset_place_cert, stale_beside, thin_due, thin_watched,
     thin_watched_octants, uncertified, zero_words,
 }
-use mesh::pool::{BrickPool, COMPACT_GROUPS, COMPACT_PER_GROUP, GATE_WORDS, brick_pool}
+use mesh::rings::{build_ring_grids, ring_reach}
+use mesh::pool::{BrickPool, COMPACT_GROUPS, COMPACT_PER_GROUP, CUT_ROOM, GATE_WORDS, brick_pool}
 use mesh::grid::{
     ActiveBrick, BrickBound, CAP_EXACT_MAX, CAP_SEAM, CAP_SURF, CERT_SLICE,
     CHUNK_BRICKS, COLD_CREASE_SLICES, CORNERS_BRICK, CREASE_SLICE, CREASE_SLICE_LEAST, CULL_CHUNK, CUT_BRICKS,
     DEFORM_SLICE, FrustumCull, GridSpec, MAX_LOD_LEVELS, MOST_INDICES_PER_BRICK, NONE, PATCH_MOST,
     SEAM_SLICE, SEAM_SLICES, SLICES_MOST, START_INDICES_PER_BRICK, START_TRANS_PER_BRICK,
     START_VERTS_PER_BRICK, SeamCell, SeamQuad, THIN_SLICE, VERTS_BRICK, VERTS_STRIDE,
-    build_lod_grids_distance, expand_lod_grids, frustum_cull_none, frustum_cull_view, grid_for,
-    grids_hold, may_cross, tight_aabb_rest,
+    cell_rule, frustum_cull_none, frustum_cull_view, grid_for, may_cross, tight_aabb_rest,
 }
 use picture::eye::View
 use std::collections::Vec
@@ -50,7 +50,7 @@ use std::quat::Quat
 
 pub use mesh::dc::{HOLE_PX, project_posed}
 pub use mesh::grid::{
-    BRICK, CELL_PX, ExactCell, KEPT_TRANS, MeshVertex, STEEP_CELLS, NO_THING, OVERFLOW_BRICKS, OVERFLOW_CREASES,
+    BRICK, CELL_PX, ExactCell, KEPT_TRANS, MeshVertex, NO_THING, OVERFLOW_BRICKS, OVERFLOW_CREASES,
     OVERFLOW_CUT, OVERFLOW_EXACT, OVERFLOW_INDICES, OVERFLOW_NEAR, OVERFLOW_SEAMS, OVERFLOW_THIN,
     OVERFLOW_TRANS, OVERFLOW_VERTS, THING_IDS, eval_dqs, kept_part, octa, pack_kept,
     size_floor, steep, tight_aabb, unocta, unpack_is_trans, unpack_kept,
@@ -232,11 +232,6 @@ fn snapped_level(h: f32, prev: f32) -> f32 {
         floor(k + 0.35)
     }
 }
-
-/// A distance-fitted mesh's slack (`MeshBatch::sync_one_lod`): its rings reach `FIT_REACH` times as
-/// far as the eye's immediate need so walking keeps the active cut for dozens of frames before
-/// stepping one world-anchored ring.
-pub const FIT_REACH: f32 = 1.3
 
 /// The indirect dispatches extraction may make in a frame, of the host's 16,384: the rest are left
 /// to the swarm, skinning and the passes that follow.
@@ -546,11 +541,6 @@ pub struct MeshBatch {
     pub(package) lod_kt: f32,
     pub(package) lod_fit: Vec<GridSpec>,
     pub(package) lod_fit_total: u32,
-    pub(package) lod_fit_at: vec3,
-    pub(package) lod_fit_fwd: vec3,
-    pub(package) lod_fit_right: vec3,
-    pub(package) lod_fit_up: vec3,
-    pub(package) lod_fit_cos: f32,
     /// Whether the latest extraction meshed fewer chunks than it wanted, the frame's
     /// indirect-dispatch budget spent (`ExtractScratch::indirect_left`): it is extracted again
     /// each frame, though nothing it meshes has changed, until one is whole, and till then what
@@ -642,6 +632,21 @@ pub struct MeshBatch {
     pub pooled: bool,
     /// The pool of a pooled mesh (`mesh::pool`).
     pub(package) pool: BrickPool,
+    /// The grids of the cut this batch draws, coarsest first, and how many (0 for a batch drawn
+    /// in a frame of its own, placed or posed), and the cell its rule wants a pixel at most
+    /// (`CELL_PX`, finer for a steep field): what `rings::coarse_pixels` holds its pixels to.
+    pub(package) drawn_grids: GpuBuffer<GridSpec>,
+    pub(package) drawn_levels: GpuBuffer<u32>,
+    pub(package) drawn_rule: f32,
+    /// The share of a cut's candidate bricks its cull kept, as the last readback found it, for
+    /// `ring_reach`'s budget: one in eight before one (the kinds measured keep 4 to 15 in a
+    /// hundred), so a first cut is bounded (one at the rule's reach before a readback was the
+    /// stack's 8.6 million candidates, and the GPU fell 1.5 s behind).
+    pub(package) ring_density: f32,
+    /// The reach its last cut's rings had (`ring_reach`), and whether a step in was still to be
+    /// had then: its cells coarsen for what a batch holds only once none is.
+    pub(package) ring_reach: f32,
+    pub(package) reach_room: bool,
     pub(package) watch_slots_cap: u32,
     pub(package) watch_quads_cap: u32,
     pub(package) watch_verts_cap: u32,
@@ -946,11 +951,6 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
         lod_kt: -1000.0,
         lod_fit: Vec::new(),
         lod_fit_total: 0,
-        lod_fit_at: vec3(0.0),
-        lod_fit_fwd: vec3(0.0, 0.0, 1.0),
-        lod_fit_right: vec3(1.0, 0.0, 0.0),
-        lod_fit_up: vec3(0.0, 1.0, 0.0),
-        lod_fit_cos: 2.0,
         budget_short: false,
         last_wanted: 0,
         last_alone: 0,
@@ -1047,6 +1047,12 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
         place_cert_field_key: 0,
         pooled: false,
         pool: brick_pool(),
+        drawn_grids: buffer(MAX_LOD_LEVELS),
+        drawn_levels: buffer_of([0]),
+        drawn_rule: CELL_PX,
+        ring_density: 0.125,
+        ring_reach: 1.0,
+        reach_room: false,
         watch_slots_cap: 1,
         watch_quads_cap: 1,
         watch_verts_cap: 1,
@@ -2107,6 +2113,12 @@ impl MeshBatch {
             }
         }
         self.active_hint = c.z
+        // The share of the read cut's candidates its cull kept: a pool's hits and misses (its
+        // active count is the drawn cut's, which an update that drew nothing new is not).
+        let kept = if self.pooled { self.pool.cut_kept } else { c.z }
+        if self.poll_total > 0 {
+            self.ring_density = clamp(f32(kept) / f32(self.poll_total), 1.0 / 64.0, 1.0)
+        }
         self.crease_hint = creases
         self.seam_hint = self.seam_read
         // A list that outgrew its slices left cells untested: extract again, with slices for it.
@@ -2133,13 +2145,14 @@ impl MeshBatch {
         if regrow {
             self.built = false
         }
-        // More active bricks than the batch holds dropped bricks: coarsen every cell so they fit
-        // at 70% of the limit (by at least 20%, past the cached paths' 15% cell tolerance, so the
-        // next sync extracts again); relax back once well under it.
-        let limit = f32(max(self.poll_caps.w, 1))
+        // More active bricks than the batch holds dropped bricks, and its rings can reach no less
+        // (`ring_reach`): coarsen every cell so they fit at 70% of the limit (by at least 20%,
+        // past the cached paths' 15% cell tolerance, so the next sync extracts again); relax back
+        // once well under it. A pool's limit is what a cut keeps at most, `CUT_ROOM`.
+        let limit = f32(max(if self.pooled { CUT_ROOM } else { self.poll_caps.w }, 1))
         let got = f32(c.z)
         let aim = 0.7 * limit
-        if got > limit {
+        if got > limit && !self.reach_room {
             let s = self.poll_scale * max(sqrt(got / aim), 1.2)
             if s > self.cell_scale {
                 self.cell_scale = s
@@ -2722,64 +2735,44 @@ impl MeshBatch {
         }
         let eff_top = max(h_top * self.cell_scale, eff_near)
         let lip = field.lipschitz(1.0)
-        let is_st = steep(field)
         let z_near = d_surf
-        let eff_cpx = scratch.cell_px * (if lip > 2.5 { STEEP_CELLS } else { 1.0 })
-        let k_px = eff_cpx * (if is_st { 0.80 } else { 1.05 })
-        let screen_bricks = (v.size.x / f32(BRICK)) * (v.size.y / f32(BRICK))
-        let res_scale = clamp(screen_bricks / 4000.0, 0.65, 1.0)
-        let base_budget = if lip > 2.5 {
-            15500.0
-        } else if is_st {
-            16500.0
-        } else {
-            7200.0
-        }
-        let area_budget = u32(base_budget * res_scale / (eff_cpx * eff_cpx))
-        let px = v.pixel()
-        let (need, need_total, need_seams) = build_lod_grids_distance(
+        // The rule: a cell no wider than `cell_px` pixels where it is seen (`STEEP_CELLS` times
+        // finer for a steep field, `cell_rule`), each ring out to where the next coarser level is fine enough
+        // (`rings::build_ring_grids`), scaled by `cell_scale` when the cut's bricks pass what the
+        // batch holds (`took_counts`). The rings stand on a lattice of the thing's own and move
+        // only when the eye leaves their centre's bricks, so a still or turning eye changes no
+        // brick, and a moving one changes only the ring it leaves.
+        let eff_cpx = cell_rule(lip, scratch.cell_px)
+        // As far as the rule wants, but no more bricks kept than a cut holds (`CUT_ROOM`), as
+        // the share of candidates the batch's last cull kept says.
+        let (reach, reach_room) = ring_reach(
             aabb,
             v.at,
-            px,
-            eff_near,
+            v.pixel(),
+            eff_cpx * self.cell_scale,
             eff_top,
-            z_near: z_near,
-            orig_id: 0,
-            k_px: k_px,
-            max_parent_span: 128,
-            area_budget: area_budget,
-            shift: scratch.lattice,
-            reach_mult: 1.0,
+            scratch.lattice,
+            holds: CUT_ROOM,
+            density: self.ring_density,
+            last: self.ring_reach,
         )
-        // Distance-only cut reuse: if the previous world-anchored fit still covers every ring
-        // needed by `v.at`, keep it with zero extraction (pure camera rotation never changes a
-        // brick!). Otherwise build a wider distance fit (`FIT_REACH`) around `v.at`.
-        let kept_fit = self.lod_fit.len() > 0 && grids_hold(self.lod_fit.clone(), need.clone())
-        var grids = take need
-        var total_bricks = need_total
-        var has_seams = need_seams
-        if kept_fit {
-            grids = self.lod_fit.clone()
-            total_bricks = self.lod_fit_total
-            has_seams = false
-            for gi in 0..grids.len() {
-                if grids[gi].seam_mask != 0 {
-                    has_seams = true
-                }
-            }
-        } else if need_seams {
-            let (wide, wide_total, wide_seams) = expand_lod_grids(grids.clone())
-            if grids_hold(wide.clone(), grids.clone()) {
-                grids = take wide
-                total_bricks = wide_total
-                has_seams = wide_seams
-            }
-            self.lod_fit_at = v.at
-        }
-        if !kept_fit {
-            self.lod_fit = grids.clone()
-            self.lod_fit_total = total_bricks
-        }
+        self.ring_reach = reach
+        self.reach_room = reach_room
+        let (built_grids, built_total, built_seams) = build_ring_grids(
+            aabb,
+            v.at,
+            v.pixel(),
+            cell_px: eff_cpx * self.cell_scale,
+            h_floor: eff_top,
+            orig_id: 0,
+            shift: scratch.lattice,
+            reach: reach,
+        )
+        let grids = take built_grids
+        let total_bricks = built_total
+        let has_seams = built_seams
+        self.lod_fit = grids.clone()
+        self.lod_fit_total = total_bricks
         let fc = frustum_cull_none()
         // A field whose key holds from one sync to the next is still: whatever was built of it (an
         // update read back late is extracted again, the same field).
@@ -2811,11 +2804,14 @@ impl MeshBatch {
             bitcast_u32(g.cell).state_hash(mut h)
         }
         let key = h.finish()
+        // The finest ring's cell: what the batch is meshed at, as its key holds (the cell asked
+        // for near, `h_near`, chooses only whether rings are cut at all).
+        let ring_cell = if grids.len() > 0 { grids[grids.len() - 1].cell } else { eff_near }
         if self.built &&
             !self.is_skinned &&
             self.hash == key &&
             !self.budget_short &&
-            abs(self.cell - eff_near) <= 0.05 * max(self.cell, 1.0e-4) {
+            abs(self.cell - ring_cell) <= 0.05 * max(self.cell, 1.0e-4) {
             if self.prev_xforms_dirty {
                 copy(from: self.xforms.items(), to: self.prev_xforms.items_mut())
                 self.prev_xforms_dirty = false
@@ -2835,7 +2831,7 @@ impl MeshBatch {
             }
         }
         if same_lod_grids &&
-            self.try_patch_dirty(mut scratch, field, key: key, check_cell: eff_near) {
+            self.try_patch_dirty(mut scratch, field, key: key, check_cell: ring_cell) {
             return
         }
         let is_edited = match field.edit_base_hash() {
@@ -2913,11 +2909,13 @@ impl MeshBatch {
                 lip: extract_lip,
                 eye_reach: 1.7320508 * eye_step(d_surf),
                 field_key: field_key,
+                world_cut: true,
             )
         }
+        self.drawn_rule = eff_cpx
         self.lod_cut = false
         self.hash = key
-        self.cell = eff_near
+        self.cell = ring_cell
         self.built = true
         self.still_frames = 0
         if self.budget_short || self.overflowed() != 0 {
@@ -4765,6 +4763,7 @@ impl MeshBatch {
         lip: f32,
         eye_reach: f32 = 0.0,
         field_key: u64 = 0,
+        world_cut: bool = false,
     ) {
         label("mesh_extract")
         self.size_slices(mut scratch, fields, sample, lod: has_seams, held: if exact_eye.w > 0.0 { 1 } else { 0 })
@@ -4850,15 +4849,14 @@ impl MeshBatch {
             self.thin_keep.clear()
             zero_u32_buf(mut self.vert_cert, self.watch_verts_cap)
             zero_u32_buf(mut self.thin_proof, self.watch_verts_cap)
-            if self.place_cert_field_key != 0 && self.place_cert_field_key != field_key {
+            // The place-keyed certificates hold for the field they were made of alone: emptied
+            // when it changes (every extraction of a field that moves).
+            if self.place_cert_field_key != field_key || field_key == 0 {
                 dispatch(
                     reset_place_cert.bind(hash_slots: self.place_cert_hash.items_mut()),
                     over: PLACE_CERT_HASH,
                 )
                 self.place_cert_entries.clear()
-                self.place_cert_field_key = 0
-            }
-            if self.static_key_streak >= 1 && field_key != 0 {
                 self.place_cert_field_key = field_key
             }
             self.watch_origin = scratch.origin0
@@ -4951,6 +4949,11 @@ impl MeshBatch {
             // What it gave exact cells for every eye; each frame's outline follows them.
             copy(from: self.exact_cells.count().sub(start: 0, count: 1), to: self.exact_base.items_mut())
         }
+        // The cut it draws, for the rule's judge (`rings::coarse_pixels`): its grids, or (bit 31)
+        // the one grid of a thing meshed in a frame of its own, placed or posed.
+        let judged = min(things, MAX_LOD_LEVELS)
+        copy(from: scratch.grids.items().sub(start: 0, count: judged), to: self.drawn_grids.span_mut(start: 0, count: judged))
+        write(mut self.drawn_levels, 0, [if world_cut { judged } else { 2147483648 | judged }])
         self.pooled = false
         self.has_exact = use_exact
         self.has_brick_draws = true
