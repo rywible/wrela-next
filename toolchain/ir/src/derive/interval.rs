@@ -682,6 +682,36 @@ impl<'a> Ivx<'a> {
         self.select(out, ok, x, c)
     }
 
+    /// A scalar sum or difference whose operand `zero` is the single value 0 is the other
+    /// operand, `keep`, exactly (`x ± 0` rounds nothing, on every target): `keep`'s range there,
+    /// else `widened`. So a distance less a radius of 0 (an absent thing: a path of no width) is
+    /// the path's distance, at least 0, not an ulp below it, and a cull can say no point of the
+    /// box is inside. A vector's sum is widened as before.
+    fn exact_past_zero(&mut self, out: &mut Block, zero: Iv, keep: Iv, widened: Iv, ty: TypeId) -> Iv {
+        if !matches!(self.m.types.get(ty), TypeDef::Scalar(_)) {
+            return widened;
+        }
+        let z = self.fc(out, ty, 0.0);
+        let lo0 = self.cmp(out, BinOp::Eq, zero.0, z);
+        let hi0 = self.cmp(out, BinOp::Eq, zero.1, z);
+        let bt = self.m.types.bool();
+        let both = self.emit(out, bt, Expr::Binary(BinOp::And, lo0, hi0));
+        let mut exact = keep;
+        if !matches!(self.target, Target::Cpu) {
+            // A GPU may flush a subnormal result to zero: toward zero, never past it.
+            let t = self.tiny(ty);
+            let t = self.fc(out, ty, t);
+            let lo_pos = self.cmp(out, BinOp::Gt, keep.0, z);
+            let lo_t = self.bin(out, BinOp::Sub, keep.0, t, ty);
+            let lo_t = self.builtin(out, Builtin::Max, vec![lo_t, z], ty);
+            let hi_neg = self.cmp(out, BinOp::Lt, keep.1, z);
+            let hi_t = self.bin(out, BinOp::Add, keep.1, t, ty);
+            let hi_t = self.builtin(out, Builtin::Min, vec![hi_t, z], ty);
+            exact = (self.select(out, lo_pos, lo_t, keep.0), self.select(out, hi_neg, hi_t, keep.1));
+        }
+        (self.select(out, both, exact.0, widened.0), self.select(out, both, exact.1, widened.1))
+    }
+
     /// One correctly rounded operation (+, −, ×; WASM's ÷ and √): one ulp. Rounding to nearest
     /// is monotone, so this is more than a point evaluation needs; it also covers a GPU fusing
     /// a multiply into an add.
@@ -2131,11 +2161,14 @@ impl<'a> Ivx<'a> {
         Ok(match op {
             BinOp::Add => {
                 let r = (self.bin(out, op, ra.0, rb.0, ty), self.bin(out, op, ra.1, rb.1, ty));
-                self.widen1(out, r, ty)
+                let w = self.widen1(out, r, ty);
+                let w = self.exact_past_zero(out, rb, ra, w, ty);
+                self.exact_past_zero(out, ra, rb, w, ty)
             }
             BinOp::Sub => {
                 let r = (self.bin(out, op, ra.0, rb.1, ty), self.bin(out, op, ra.1, rb.0, ty));
-                self.widen1(out, r, ty)
+                let w = self.widen1(out, r, ty);
+                self.exact_past_zero(out, rb, ra, w, ty)
             }
             BinOp::Mul if self.track.same_value(a, b) => {
                 let r = self.sqr(out, ra, ty);

@@ -829,6 +829,7 @@ fn feed_function<F: FnMut(&[u8])>(w: &mut Sink<'_, F>, f: &Function) {
         Some(Known::ValueNoiseBox) => w.tag(4),
         Some(Known::LatticeCoord) => w.tag(5),
         Some(Known::Pcg) => w.tag(6),
+        Some(Known::Smax) => w.tag(7),
     }
     w.bool(f.relaxable);
     match f.budget {

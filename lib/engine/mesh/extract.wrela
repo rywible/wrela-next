@@ -26,12 +26,12 @@ use mesh::grid::{
     DEFORM_SLICE, FrustumCull, GridSpec, MAX_LOD_LEVELS, MOST_INDICES_PER_BRICK, NONE, PATCH_MOST,
     SEAM_SLICE, SEAM_SLICES, SLICES_MOST, START_INDICES_PER_BRICK, START_TRANS_PER_BRICK,
     START_VERTS_PER_BRICK, SeamCell, SeamQuad, THIN_SLICE, THIN_SLICES, VERTS_BRICK, VERTS_STRIDE,
-    build_lod_grids_view, frustum_cull_none, frustum_cull_view, grid_for, tight_aabb_rest,
+    build_lod_grids_view, frustum_cull_none, frustum_cull_view, grid_for, may_cross, tight_aabb_rest,
 }
 use picture::eye::View
 use std::collections::Vec
-use std::derive::Box3
-use std::field::{DualQuat, Field, Rigid}
+use std::derive::{Affine3, Box3}
+use std::field::{DualQuat, Field, Live, Pruned, Rigid}
 use std::gpu::{
     AppendBuffer, DispatchArgs, DrawIndexedArgs, GpuBuffer, GpuSpan, append_buffer, buffer,
     buffer_of, copy, dispatch, kernel_work, label, limits, read_settled, write,
@@ -47,6 +47,49 @@ pub use mesh::grid::{
     OVERFLOW_TRANS, OVERFLOW_VERTS, THING_IDS, eval_dqs, kept_part, octa, pack_kept,
     probe_visible_near, size_floor, steep, tight_aabb, unocta, unpack_is_trans, unpack_kept,
     unpack_oct_normal, unpack_smooth, unpack_thing,
+}
+
+/// What the extraction asks of a field at once (`mesh_answer`): a point, a box and the parts
+/// live in it, how near a steepness is asked for, and a solved vertex's gradient.
+pub struct MeshAsk: Copy + GpuData {
+    pub p: vec3,
+    pub near: f32,
+    pub b: Box3,
+    pub live: Live,
+}
+
+/// Everything a field's mesh is made of, asked as the extraction's kernels and its CPU side ask
+/// it: the distance and its parts' (`distance_live`, `pruned`, `interval_near`), its enclosure
+/// (`slope_affine`: the certificates and the thin cells), its bound and steepness, and what a
+/// vertex keeps of its channels (`vertex_meta`'s transmissive flag, `keep_verts`' kept part and
+/// story). Not its light: a mesh is the same however a thing glows.
+pub fn mesh_answer<M: Field<Substance>>(f: M, q: MeshAsk) -> (vec4, Pruned, Affine3, vec4, vec4, vec4) {
+    let pr = f.pruned(q.b, |x: vec3| x, 1.0, q.live, 0)
+    let iv = f.interval_near(q.b)
+    let bd = f.bound()
+    let trans = if !f.uses_kept() && f.field_facts().may_transmit && f.channels(q.p).transmission > 0.02 {
+        1.0
+    } else {
+        0.0
+    }
+    let (kd, part, k) = f.kept_at(q.p)
+    let kt = if f.field_facts().may_transmit { f.channels_kept(q.p, part, k).transmission } else { 0.0 }
+    (
+        vec4(f.distance_live(q.p, q.live), iv.lo, iv.hi, f.lipschitz(q.near)),
+        pr,
+        f.slope_affine(q.b, q.live),
+        vec4(bd.centre, bd.radius),
+        vec4(bd.slope, trans, kd + kt, f32(part)),
+        k,
+    )
+}
+
+/// A hash of what of `field` its mesh is made of (`mesh_answer`), and nothing else of it: the
+/// compiler's account of which of the field's scalars `mesh_answer`'s result depends on
+/// (`std::derive::kept_deps`), so the list can't go stale as a kind changes, and a field whose
+/// light alone changed (the branch of glass as it cools) is not meshed again.
+pub fn mesh_key<M: Field<Substance> + StateHash>(field: M, h: mut Hasher) {
+    std::derive::kept_deps(|f: M, q: MeshAsk| mesh_answer(f, q), field).state_hash(mut h)
 }
 
 /// or `(Rigid::identity(), None)` otherwise.
@@ -119,6 +162,11 @@ pub struct ExtractScratch {
     /// Where the world's lattice of cells stands (`grid::placement`): every grid made here is on
     /// it.
     pub lattice: vec3,
+}
+
+/// The slices of `slice` cells that hold `cells`, no more than a prepared list's (`SLICES_MOST`).
+fn thin_most(slice: u32, cells: u32) -> u32 {
+    clamp((cells + slice - 1) / max(slice, 1), 1, SLICES_MOST)
 }
 
 /// The indirect dispatches extraction may make in a frame, of the host's 16,384: the rest are left
@@ -406,6 +454,16 @@ pub struct MeshBatch {
     /// `refine_seam_creases`' cells a dispatch, by its own bound (`kernel_work`).
     seam_crease_slice: u32,
     surf_slice: u32,
+    /// The thin candidates one `filter_thin_cells` dispatch tests, and the outline cells one
+    /// `certify_outline` dispatch certifies: as many as the kernel's own bound for the field
+    /// extracted now lets a dispatch hold (`dc::lane_slice`), at most `THIN_SLICE` and
+    /// `CERT_SLICE`; a batch has slices for `THIN_SLICES · THIN_SLICE` and `CERT_SLICES ·
+    /// CERT_SLICE` cells whatever their size. (The Radeon refused 8,192 of the carved study's
+    /// `filter_thin_cells`, 1,571,069 work an invocation, 64 ms.)
+    thin_slice: u32,
+    cert_slice: u32,
+    /// The bricks one `inherit_seam_corners` dispatch takes (512 invocations a brick).
+    inherit_slice: u32,
     /// The bricks a dispatch of a chunk's corner kernel takes, and of its triangle kernels
     /// (`dc::brick_slice`).
     eval_slice: u32,
@@ -445,6 +503,11 @@ pub struct MeshBatch {
     cpu_ids: Vec<u32>,
     cpu_xforms: Vec<Rigid>,
     cpu_bones: Vec<DualQuat>,
+    /// What this batch has done since its counts were last asked (`extraction_counts`): real
+    /// extractions (whole or patched), readbacks of them, and the active bricks those read.
+    stat_extractions: u32,
+    stat_reads: u32,
+    stat_bricks: u32,
 }
 
 /// Creates a lazy `MeshBatch` (minimal initial buffers; grows cleanly on demand up to `max_bricks`).
@@ -606,6 +669,9 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
         crease_slice: CREASE_SLICE_LEAST,
         seam_crease_slice: CREASE_SLICE_LEAST,
         surf_slice: CAP_SURF,
+        thin_slice: THIN_SLICE,
+        cert_slice: CERT_SLICE,
+        inherit_slice: 64,
         eval_slice: CHUNK_BRICKS,
         quad_slice: CHUNK_BRICKS,
         crease_passes: CREASE_STEPS,
@@ -626,6 +692,9 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
         cpu_ids: Vec::new(),
         cpu_xforms: Vec::new(),
         cpu_bones: Vec::new(),
+        stat_extractions: 0,
+        stat_reads: 0,
+        stat_bricks: 0,
     }
 }
 
@@ -799,6 +868,60 @@ impl MeshBatch {
         self.still_frames += 1
     }
 
+    /// Makes this batch draw nothing, with no extraction: its counts zero, its draws empty.
+    /// (`key` and `cell` are what it now holds.)
+    fn make_empty(mut self, scratch: mut ExtractScratch, key: u64, first_cell: f32) {
+        write(mut self.tri_count, 0, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+        scratch.active.clear()
+        self.exact_cells.clear()
+        dispatch(
+            finish_draw.bind(
+                active_count: scratch.active.count(),
+                vert_count: scratch.active.count(),
+                seam_quad_count: scratch.seam_quads.count(),
+                seam_cell_count: scratch.seam_cells.count(),
+                exact_count: self.exact_cells.count(),
+                seam_start: self.seam_start.items(),
+                has_seams: 0,
+                cap_indices: self.cap_indices,
+                cap_trans: self.cap_trans,
+                cap_exact: self.cap_exact,
+                inst_count: 0,
+                tri_count: mut self.tri_count,
+                args: mut self.draw_args,
+                trans_args: mut self.trans_draw_args,
+                cut_args: mut self.cut_draw_args,
+                seam_args: mut self.seam_draw_args,
+                exact_args: mut self.exact_draw_args,
+            ),
+            over: 1,
+        )
+        self.has_exact = false
+        self.has_brick_draws = false
+        self.has_seams = false
+        self.edit_patched = false
+        self.cpu_brick_slots = 0
+        self.hash = key
+        self.cell = first_cell
+        self.built = true
+        self.still_frames = 0
+        self.inst_count = 0
+        self.note_extracted(false)
+        self.cpu_ids = Vec::new()
+        self.cpu_xforms = Vec::new()
+        self.cpu_bones = Vec::new()
+    }
+
+    /// Since this was last asked: the real extractions this batch made (whole or patched), how
+    /// many of them were read back, and the active bricks those read held; and they start again.
+    pub fn extraction_counts(mut self) -> vec3u {
+        let out = vec3u(self.stat_extractions, self.stat_reads, self.stat_bricks)
+        self.stat_extractions = 0
+        self.stat_reads = 0
+        self.stat_bricks = 0
+        out
+    }
+
     /// Sticky `OVERFLOW_*` bitflags reported by the latest settled extraction (`0` = no truncation).
     pub fn overflowed(self) -> u32 {
         self.overflow_flags | (if self.near_over { OVERFLOW_NEAR } else { 0 })
@@ -873,6 +996,8 @@ impl MeshBatch {
             }
             return
         }
+        self.stat_reads += 1
+        self.stat_bricks += c.z
         var ovf = gpu_ovf
         if c.z > self.poll_limit || c.z > self.poll_caps.w {
             ovf |= OVERFLOW_BRICKS
@@ -1096,10 +1221,14 @@ impl MeshBatch {
         if self.active_hint == 0 ||
             self.lod_cut ||
             self.extract_total > self.hint_total + self.hint_total / 4 {
-            return THIN_SLICES
+            return thin_most(self.thin_slice, THIN_SLICES * THIN_SLICE)
         }
         let want = self.thin_hint + self.thin_hint / 4 + THIN_SLICE / 16
-        clamp((want + THIN_SLICE - 1) / THIN_SLICE, 1, THIN_SLICES)
+        clamp(
+            (want + self.thin_slice - 1) / self.thin_slice,
+            1,
+            thin_most(self.thin_slice, THIN_SLICES * THIN_SLICE),
+        )
     }
 
     /// The `certify_outline` slices a batch dispatches: as `thin_slices` does, by the last
@@ -1108,10 +1237,14 @@ impl MeshBatch {
         if self.active_hint == 0 ||
             self.lod_cut ||
             self.extract_total > self.hint_total + self.hint_total / 4 {
-            return CERT_SLICES
+            return thin_most(self.cert_slice, CERT_SLICES * CERT_SLICE)
         }
         let want = self.cert_hint + self.cert_hint / 4 + CERT_SLICE / 16
-        clamp((want + CERT_SLICE - 1) / CERT_SLICE, 1, CERT_SLICES)
+        clamp(
+            (want + self.cert_slice - 1) / self.cert_slice,
+            1,
+            thin_most(self.cert_slice, CERT_SLICES * CERT_SLICE),
+        )
     }
 
     /// The seam slices a batch dispatches (`SEAM_SLICE` seam cells each, for each seam pass): as
@@ -1129,6 +1262,9 @@ impl MeshBatch {
 
     /// Notes that `tri_count` was rewritten by a real extraction (or emptied, `real == false`).
     fn note_extracted(mut self, real: bool) {
+        if real {
+            self.stat_extractions += 1
+        }
         self.gen = self.gen.wrapping_add(1)
         self.gen_real = real
         self.extract_scale = self.cell_scale
@@ -1197,7 +1333,7 @@ impl MeshBatch {
     ) {
         let cell = cell * self.cell_scale
         var h = Hasher::new()
-        field.state_hash(mut h)
+        mesh_key(field, mut h)
         let key = h.finish()
 
         if M::MAY_SKIN {
@@ -1519,6 +1655,17 @@ impl MeshBatch {
             }
         }
         let aabb = tight_aabb(field)
+        // A field none of whose points is inside (an absent thing: the bolt between strikes)
+        // has no surface to mesh: nothing is extracted, and nothing dispatched, however its
+        // state moves.
+        if !may_cross(field.interval_near(aabb)) {
+            if !(self.built && !self.gen_real && self.inst_count == 0) {
+                self.make_empty(mut scratch, 0, eff_near)
+            } else {
+                self.still_frames += 1
+            }
+            return
+        }
         let eff_top = max(h_top * self.cell_scale, eff_near)
         let lip = field.lipschitz(1.0)
         let is_st = steep(field)
@@ -1551,7 +1698,7 @@ impl MeshBatch {
         )
         let fc = if has_seams { frustum_cull_view(v, margin: 1.18) } else { frustum_cull_none() }
         var h = Hasher::new()
-        field.state_hash(mut h)
+        mesh_key(field, mut h)
         grids.len().state_hash(mut h)
         // The eye to a step (`eye_step`): its exact cells are found for it (`on_outline`).
         let step = eye_step(z_near)
@@ -1809,45 +1956,7 @@ impl MeshBatch {
             return
         }
         if vis_count == 0 {
-            write(mut self.tri_count, 0, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
-            scratch.active.clear()
-            self.exact_cells.clear()
-            dispatch(
-                finish_draw.bind(
-                    active_count: scratch.active.count(),
-                    vert_count: scratch.active.count(),
-                    seam_quad_count: scratch.seam_quads.count(),
-                    seam_cell_count: scratch.seam_cells.count(),
-                    exact_count: self.exact_cells.count(),
-                    seam_start: self.seam_start.items(),
-                    has_seams: 0,
-                    cap_indices: self.cap_indices,
-                    cap_trans: self.cap_trans,
-                    cap_exact: self.cap_exact,
-                    inst_count: 0,
-                    tri_count: mut self.tri_count,
-                    args: mut self.draw_args,
-                    trans_args: mut self.trans_draw_args,
-                    cut_args: mut self.cut_draw_args,
-                    seam_args: mut self.seam_draw_args,
-                    exact_args: mut self.exact_draw_args,
-                ),
-                over: 1,
-            )
-            self.has_exact = false
-            self.has_brick_draws = false
-            self.has_seams = false
-            self.edit_patched = false
-            self.cpu_brick_slots = 0
-            self.hash = key
-            self.cell = first_cell
-            self.built = true
-            self.still_frames = 0
-            self.inst_count = 0
-            self.note_extracted(false)
-            self.cpu_ids = Vec::new()
-            self.cpu_xforms = Vec::new()
-            self.cpu_bones = Vec::new()
+            self.make_empty(mut scratch, key, first_cell)
             return
         }
 
@@ -2122,7 +2231,12 @@ impl MeshBatch {
     /// The box of the parts of `field` whose state moved since the last extraction, each part's
     /// old box and new, or none where the batch kept no part states, every part moved, none did,
     /// or a part can't say what it's made of. Keeps the new states on an answer.
-    fn parts_dirty<M: Field<Substance>>(mut self, field: M) -> Option<Box3> {
+    /// The box the parts whose state moved since the last extraction cover, old and new
+    /// (`part_states`), with the parts' new hashes and boxes: none when no part moved, when all
+    /// did, or when the field's parts can't say. Nothing is kept here: the caller keeps the new
+    /// state only once the patch it makes of them is drawn (`try_patch_dirty`), so a patch that
+    /// falls back to a whole extraction leaves the state the drawn mesh was made from.
+    fn parts_dirty<M: Field<Substance>>(self, field: M) -> Option<(Box3, Vec<u64>, Vec<Box3>)> {
         let n = self.part_hashes.len()
         if n == 0 {
             return None
@@ -2144,9 +2258,7 @@ impl MeshBatch {
         if moved == 0 || moved == n {
             return None
         }
-        self.part_hashes = take hs
-        self.part_boxes = take bs
-        Some(Box3 { lo, hi })
+        Some((Box3 { lo, hi }, hs, bs))
     }
 
     /// Attempts an in-place dirty-region CSG patch for an `Edited<M>` field whose base solid
@@ -2179,7 +2291,9 @@ impl MeshBatch {
             return false
         }
         // An edit's dirty region on an unchanged base, or the boxes, old and new, of the parts
-        // whose state moved (the others' cells are the same).
+        // whose state moved (the others' cells are the same), and the parts' new state, kept
+        // once the patch is made.
+        var new_parts: Option<(Vec<u64>, Vec<Box3>)> = None
         let dirty_box = match field.edit_base_hash() {
             Some(bh) => {
                 if bh != self.edit_base_hash {
@@ -2193,7 +2307,10 @@ impl MeshBatch {
                 }
             },
             None => match self.parts_dirty(field) {
-                Some(bx) => bx,
+                Some((bx, hs, bs)) => {
+                    new_parts = Some((take hs, take bs))
+                    bx
+                },
                 None => {
                     return false
                 },
@@ -2298,6 +2415,7 @@ impl MeshBatch {
         }
 
         if patch_total == 0 {
+            self.keep_parts(take new_parts)
             self.hash = key
             return true
         }
@@ -2623,7 +2741,7 @@ impl MeshBatch {
                     prep_slices.bind(
                         count: scratch.thin_cands.count(),
                         cap: CAP_SURF,
-                        most: THIN_SLICE,
+                        most: self.thin_slice,
                         slices: thin_slices,
                         args: scratch.crease_args.span_mut(start: 0, count: thin_slices),
                     ),
@@ -2638,19 +2756,19 @@ impl MeshBatch {
                             chunk_start: chunk_start,
                             thin_cands: scratch.thin_cands.items(),
                             thin_count: scratch.thin_cands.count(),
-                            first: ts * THIN_SLICE,
+                            first: ts * self.thin_slice,
                             exact_eye: exact_eye,
                             exact_seen: mut scratch.exact_seen,
                             exact_cells: mut self.exact_cells,
                         ),
                         groups: scratch.crease_args.at(ts),
-                        most: THIN_SLICE / 64,
+                        most: self.thin_slice / 64,
                     )
                 }
                 dispatch(
                     note_untested.bind(
                         thin_count: scratch.thin_cands.count(),
-                        slices: thin_slices,
+                        tested: thin_slices * self.thin_slice,
                         tri_count: mut self.tri_count,
                     ),
                     over: 1,
@@ -2667,7 +2785,7 @@ impl MeshBatch {
                 prep_slices.bind(
                     count: scratch.cert_cands.count(),
                     cap: CAP_SURF,
-                    most: CERT_SLICE,
+                    most: self.cert_slice,
                     slices: cert_slices,
                     args: scratch.crease_args.span_mut(start: 0, count: cert_slices),
                 ),
@@ -2682,18 +2800,18 @@ impl MeshBatch {
                         verts: self.verts.items(),
                         cert_cands: scratch.cert_cands.items(),
                         cert_count: scratch.cert_cands.count(),
-                        first: cs * CERT_SLICE,
+                        first: cs * self.cert_slice,
                         exact_eye: exact_eye,
                         exact_cells: mut self.exact_cells,
                     ),
                     groups: scratch.crease_args.at(cs),
-                    most: CERT_SLICE / 64,
+                    most: self.cert_slice / 64,
                 )
             }
             dispatch(
                 note_uncertified.bind(
                     cert_count: scratch.cert_cands.count(),
-                    slices: cert_slices,
+                    tested: cert_slices * self.cert_slice,
                     tri_count: mut self.tri_count,
                 ),
                 over: 1,
@@ -2731,9 +2849,21 @@ impl MeshBatch {
         self.extract_total = patch_total
         self.extract_limit = est_slots
         self.note_extracted(true)
+        self.keep_parts(take new_parts)
         self.hash = key
         self.still_frames = 0
         true
+    }
+
+    /// Keeps the parts' state a patch was made from (`parts_dirty`), once it is made.
+    fn keep_parts(mut self, parts: take Option<(Vec<u64>, Vec<Box3>)>) {
+        match take parts {
+            Some((hs, bs)) => {
+                self.part_hashes = take hs
+                self.part_boxes = take bs
+            },
+            None => {},
+        }
     }
 
     fn run_extract<M: Field<Substance>>(
@@ -2801,6 +2931,51 @@ impl MeshBatch {
             creases: mut scratch.creases,
         )
         self.surf_slice = surf_slice(kernel_work(surf_kernel))
+        // The thin cells' and the outline's slices, and the seams' corners', as their kernels'
+        // own bounds let a dispatch hold.
+        self.thin_slice = lane_slice(
+            kernel_work(filter_thin_cells.bind(
+                fields: fields,
+                grids: scratch.grids.items(),
+                active: scratch.active.items(),
+                chunk_start: 0,
+                thin_cands: scratch.thin_cands.items(),
+                thin_count: scratch.thin_cands.count(),
+                first: 0,
+                exact_eye: exact_eye,
+                exact_seen: mut scratch.exact_seen,
+                exact_cells: mut self.exact_cells,
+            )),
+            most: THIN_SLICE,
+        )
+        self.cert_slice = lane_slice(
+            kernel_work(certify_outline.bind(
+                fields: fields,
+                grids: scratch.grids.items(),
+                active: scratch.active.items(),
+                verts: self.verts.items(),
+                cert_cands: scratch.cert_cands.items(),
+                cert_count: scratch.cert_cands.count(),
+                first: 0,
+                exact_eye: exact_eye,
+                exact_cells: mut self.exact_cells,
+            )),
+            most: CERT_SLICE,
+        )
+        self.inherit_slice = min(
+            brick_slice(lanes: 512, invocation: kernel_work(inherit_seam_corners.bind(
+                fields: fields,
+                grids: scratch.grids.items(),
+                active: scratch.active.items(),
+                active_count: scratch.active.count(),
+                cap_bricks: self.max_bricks,
+                chunk_start: 0,
+                brick_off: 0,
+                corners_in: scratch.corners_raw.items(),
+                corners_out: scratch.corners.span_mut(start: 0, count: CORNERS_BRICK),
+            ))),
+            CHUNK_BRICKS,
+        )
         // A chunk's corner and triangle dispatches take as many bricks as their kernel's own
         // bound lets a dispatch hold (`brick_slice`).
         self.eval_slice = brick_slice(
@@ -3144,7 +3319,7 @@ impl MeshBatch {
                 }
                 var inh_off: u32 = 0
                 while inh_off < chunk_n {
-                    let band = min(chunk_n - inh_off, 64)
+                    let band = min(chunk_n - inh_off, self.inherit_slice)
                     dispatch(
                         inherit_seam_corners.bind(
                             fields: fields,
@@ -3479,7 +3654,7 @@ impl MeshBatch {
                     prep_slices.bind(
                         count: scratch.thin_cands.count(),
                         cap: CAP_SURF,
-                        most: THIN_SLICE,
+                        most: self.thin_slice,
                         slices: thin_slices,
                         args: scratch.crease_args.span_mut(start: 0, count: thin_slices),
                     ),
@@ -3494,19 +3669,19 @@ impl MeshBatch {
                             chunk_start: chunk_start,
                             thin_cands: scratch.thin_cands.items(),
                             thin_count: scratch.thin_cands.count(),
-                            first: ts * THIN_SLICE,
+                            first: ts * self.thin_slice,
                             exact_eye: exact_eye,
                             exact_seen: mut scratch.exact_seen,
                             exact_cells: mut self.exact_cells,
                         ),
                         groups: scratch.crease_args.at(ts),
-                        most: THIN_SLICE / 64,
+                        most: self.thin_slice / 64,
                     )
                 }
                 dispatch(
                     note_untested.bind(
                         thin_count: scratch.thin_cands.count(),
-                        slices: thin_slices,
+                        tested: thin_slices * self.thin_slice,
                         tri_count: mut self.tri_count,
                     ),
                     over: 1,
@@ -3522,7 +3697,7 @@ impl MeshBatch {
                 prep_slices.bind(
                     count: scratch.cert_cands.count(),
                     cap: CAP_SURF,
-                    most: CERT_SLICE,
+                    most: self.cert_slice,
                     slices: cert_slices,
                     args: scratch.crease_args.span_mut(start: 0, count: cert_slices),
                 ),
@@ -3537,18 +3712,18 @@ impl MeshBatch {
                         verts: self.verts.items(),
                         cert_cands: scratch.cert_cands.items(),
                         cert_count: scratch.cert_cands.count(),
-                        first: cs * CERT_SLICE,
+                        first: cs * self.cert_slice,
                         exact_eye: exact_eye,
                         exact_cells: mut self.exact_cells,
                     ),
                     groups: scratch.crease_args.at(cs),
-                    most: CERT_SLICE / 64,
+                    most: self.cert_slice / 64,
                 )
             }
             dispatch(
                 note_uncertified.bind(
                     cert_count: scratch.cert_cands.count(),
-                    slices: cert_slices,
+                    tested: cert_slices * self.cert_slice,
                     tri_count: mut self.tri_count,
                 ),
                 over: 1,

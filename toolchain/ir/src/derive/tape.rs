@@ -1118,7 +1118,7 @@ impl Tp<'_> {
         // coordinates are integers, which `HASH`'s floats hold exactly only to 2²⁴, so its body
         // is taped, hashing the pairs as compiled code does.)
         if let (Some(v), Some(known)) =
-            (v, self.m.functions[g.index()].known.filter(|k| *k != Known::Meet))
+            (v, self.m.functions[g.index()].known.filter(|k| *k != Known::Meet && *k != Known::Smax))
         {
             let ty = self.f.value_ty(v);
             out.push(Stmt::Let(v, Expr::Zero(ty)));
@@ -1155,7 +1155,7 @@ impl Tp<'_> {
                 // range, 0 for an infinity or NaN.
                 Known::LatticeCoord => self.int_op(out, F2I, &[regs[0], regs[0]])?,
                 Known::Pcg => self.int_op(out, PCG, &[regs[0], regs[0]])?,
-                Known::Meet => unreachable!("a meet is taken as its body"),
+                Known::Meet | Known::Smax => unreachable!("a meet and a smax are taken as their bodies"),
             };
             self.rv.insert(v, r);
             return Ok(());

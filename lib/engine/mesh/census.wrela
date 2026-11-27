@@ -1,0 +1,78 @@
+// What the extraction's cull keeps of a field, counted on the CPU: the bricks of a grid round the
+// field at one cell size, those the cull keeps (`grid::cull_brick`, the GPU's own test), and of
+// them those whose corners change sign (what Dual Contouring meshes). The ratio of kept to crossed
+// is the work the cull's ranges leave: a field whose ranges are loose keeps bricks that mesh to
+// nothing, each a brick's 512 corners evaluated for nothing.
+
+use matter::substance::Substance
+use mesh::grid::{BRICK, CORNERS_BRICK, brick_corner, cull_brick, cull_super_brick, grid_for, tight_aabb}
+use std::field::Field
+
+/// A field's bricks at one cell size (`cull_census`).
+pub struct CullCensus: Copy {
+    /// The cell size (m).
+    pub cell: f32,
+    /// The bricks of the grid round the field's tight box.
+    pub bricks: u32,
+    /// The 4×4×4 super-bricks the first level of the cull keeps, of all of them.
+    pub supers: u32,
+    pub supers_kept: u32,
+    /// The bricks the cull keeps (in kept super-bricks), and of them those with a corner inside
+    /// and a corner not (`< 0`, as `classify_cells` reads them): what is meshed.
+    pub kept: u32,
+    pub crossed: u32,
+}
+
+/// `field`'s cull at cell size `cell` (`CullCensus`): every brick of a grid round its tight box,
+/// through the two levels of the GPU's cull (`cull_super_brick`, `cull_brick`), and each kept
+/// brick's 8×8×8 corners evaluated to see whether the surface crosses it.
+pub fn cull_census<M: Field<Substance>>(field: M, cell: f32) -> CullCensus {
+    let g = grid_for(tight_aabb(field), cell, base_brick: 0, orig_id: 0, shift: vec3(0.0))
+    let sd = (g.dims + vec3u(3, 3, 3)) / 4
+    var out = CullCensus {
+        cell,
+        bricks: g.dims.x * g.dims.y * g.dims.z,
+        supers: sd.x * sd.y * sd.z,
+        supers_kept: 0,
+        kept: 0,
+        crossed: 0,
+    }
+    for s in 0..out.supers {
+        let sb = vec3u(s % sd.x, (s / sd.x) % sd.y, s / (sd.x * sd.y))
+        let (may, _) = cull_super_brick(field, g, sb)
+        if !may {
+            continue
+        }
+        out.supers_kept += 1
+        let b0 = sb * 4
+        let b1 = min(b0 + vec3u(4, 4, 4), g.dims)
+        for bz in b0.z..b1.z {
+            for by in b0.y..b1.y {
+                for bx in b0.x..b1.x {
+                    let b = vec3u(bx, by, bz)
+                    let (hit, _) = cull_brick(field, g, b)
+                    if !hit {
+                        continue
+                    }
+                    out.kept += 1
+                    var inside = false
+                    var outside = false
+                    for c in 0..CORNERS_BRICK {
+                        let k = vec3u(c % 8, (c / 8) % 8, c / 64)
+                        if k.x <= BRICK + 1 && k.y <= BRICK + 1 && k.z <= BRICK + 1 {
+                            if field.distance(brick_corner(g, b, k)) < 0.0 {
+                                inside = true
+                            } else {
+                                outside = true
+                            }
+                        }
+                    }
+                    if inside && outside {
+                        out.crossed += 1
+                    }
+                }
+            }
+        }
+    }
+    out
+}

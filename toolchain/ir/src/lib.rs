@@ -18,6 +18,7 @@ mod const_fold;
 pub mod counted;
 pub use const_fold::FUEL as FOLD_FUEL;
 pub mod depends;
+pub mod field_deps;
 pub mod derive;
 mod error;
 pub mod fingerprint;
@@ -803,6 +804,11 @@ pub struct Budget {
 pub enum Known {
     /// `std::field::smin(a, b, k)`: `SMIN`.
     Smin,
+    /// `std::field::smax(a, b, k)`: `-smin(-a, -b, k)` in exact arithmetic (written as its own
+    /// sum, so a shader compiler can't fold its negations). A tape and the other derivations take
+    /// its body; `std::derive::lipschitz` bounds it as `smin` of the negated operands: a convex
+    /// combination of their gradients, no steeper than the steeper, across its seam.
+    Smax,
     /// `std::field::meets(at)`: `at > 0`, the condition of a branch whose two sides agree where
     /// `at` is 0. A tape and the other derivations take its body; only `std::derive::lipschitz`
     /// trusts it, taking the steeper side across the switch.

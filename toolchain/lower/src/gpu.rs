@@ -1575,6 +1575,9 @@ pub(crate) fn intrinsic(
         Some(Lang::ReadsOnlyInput) => {
             return reads_call(fl, c);
         }
+        Some(Lang::KeptDeps) => {
+            return kept_deps_call(fl, c);
+        }
         Some(
             l @ (Lang::LiftGradient
             | Lang::LiftJacobian
@@ -5038,6 +5041,74 @@ pub(crate) fn reads_call(fl: &mut Fl, c: &mir::Call) -> Option<ir::ValueId> {
     let only = !d.outside() && (0..inputs).all(|i| !d.on_param(i));
     let b = fl.mb.m.types.bool();
     Some(fl.value(b, ir::Expr::Const(ir::Const::Bool(only))))
+}
+
+/// `std::derive::kept_deps(f, value)` (language.md §14): `value` with every scalar of it that
+/// `f`'s result can't depend on, as its first argument, set to zero: its parts `f` reads into its
+/// result kept, followed through fields, components and elements (`ir::field_deps`), and the rest
+/// zero. Two values whose kept parts are the same give `f` the same result for the same second
+/// argument. A constant shape of the build, the same on the CPU and in GPU code.
+pub(crate) fn kept_deps_call(fl: &mut Fl, c: &mir::Call) -> Option<ir::ValueId> {
+    let key = callable_key(fl, c, "`kept_deps` reads")?;
+    let value = fl.arg_value(&c.args[1])?;
+    let beside = if fl.mb.gpu.is_some() { Some(&*fl.mb) } else { None };
+    let (mb, id) = as_gpu_code(fl.cx, &key, c.span, beside, "kept_deps")?;
+    let f = &mb.m.functions[id.index()];
+    // Its parameters: what it captures, then its two inputs: the value, then the other.
+    let at = f.params.len().saturating_sub(2) as u32;
+    let there = f.params.get(at as usize).map(|p| p.ty);
+    let d = ir::field_deps::depends_fields(&mb.m, id);
+    let keep = d.paths_of(at);
+    if std::env::var("WRELA_KEPT_DEBUG").is_ok() {
+        eprintln!("kept_deps: {:?} of param {at}\n{}", keep, ir::print::print(&mb.m));
+    }
+    let ty = fl.f.value_ty(value);
+    Some(kept_part(fl, &mb.m.types, there, value, ty, &mut Vec::new(), &keep))
+}
+
+/// `value` (of type `ty` here, `there` in the module the paths are of) with its parts under
+/// `path` that no path of `keep` reaches set to zero.
+fn kept_part(
+    fl: &mut Fl,
+    there_types: &ir::Types,
+    there: Option<ir::TypeId>,
+    value: ir::ValueId,
+    ty: ir::TypeId,
+    path: &mut Vec<u32>,
+    keep: &[Vec<u32>],
+) -> ir::ValueId {
+    if keep.iter().any(|k| path.starts_with(k)) {
+        return value;
+    }
+    if !keep.iter().any(|k| k.starts_with(path)) {
+        return fl.value(ty, ir::Expr::Zero(ty));
+    }
+    let def = fl.mb.m.types.get(ty).clone();
+    let there_def = there.map(|t| there_types.get(t).clone());
+    // The parts, each with its type here and there, where the two modules' types agree on them.
+    let parts: Option<Vec<(ir::TypeId, Option<ir::TypeId>)>> = match (&def, &there_def) {
+        (ir::TypeDef::Struct { fields, .. }, Some(ir::TypeDef::Struct { fields: tf, .. }))
+            if fields.len() == tf.len() =>
+        {
+            Some(fields.iter().zip(tf).map(|(a, b)| (a.1, Some(b.1))).collect())
+        }
+        (ir::TypeDef::Vector(sc, n), Some(ir::TypeDef::Vector(_, tn))) if n == tn => {
+            let st = fl.mb.m.types.scalar(*sc);
+            Some((0..*n).map(|_| (st, None)).collect())
+        }
+        _ => None,
+    };
+    let Some(parts) = parts else {
+        return value;
+    };
+    let mut out = Vec::with_capacity(parts.len());
+    for (k, (pt, tt)) in parts.into_iter().enumerate() {
+        let x = fl.value(pt, ir::Expr::Extract(value, k as u32));
+        path.push(k as u32);
+        out.push(kept_part(fl, there_types, tt, x, pt, path, keep));
+        path.pop();
+    }
+    fl.value(ty, ir::Expr::Construct(ty, out))
 }
 
 #[cfg(test)]

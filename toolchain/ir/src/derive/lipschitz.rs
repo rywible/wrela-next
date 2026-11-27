@@ -2272,6 +2272,22 @@ impl Lip<'_> {
                 self.vals.insert(v, r);
                 return Ok(());
             }
+            if known == Some(Known::Smax)
+                && mask[2] == 0
+                && let (Arg::Value(a), Arg::Value(b), Arg::Value(k)) =
+                    (&args[0], &args[1], &args[2])
+            {
+                // `smax(a, b, k) = -smin(-a, -b, k)`.
+                let f = self.f32_ty;
+                let na = self.of_as(out, *a, f);
+                let na = self.neg_lval(out, na, f);
+                let nb = self.of_as(out, *b, f);
+                let nb = self.neg_lval(out, nb, f);
+                let r = self.smin_of(out, na, nb, *k);
+                let r = self.neg_lval(out, r, f);
+                self.vals.insert(v, r);
+                return Ok(());
+            }
         }
         let params = self.m.functions[g.index()].params.clone();
         let dg = derive(self.m, self.cache, g, mask.clone(), self.n, self.target)?;
@@ -2337,9 +2353,27 @@ impl Lip<'_> {
     /// `smin(a, b, k)` (`k` inactive): convex combination of `∇a` and `∇b`, so
     /// `||∇smin(a, b, k)||₂ <= max(a.lip, b.lip)` identically everywhere!
     fn smin(&mut self, out: &mut Block, a: ValueId, b: ValueId, k: ValueId) -> LVal {
-        let f = self.f32_ty;
         let aa = self.of(out, a);
         let bb = self.of(out, b);
+        self.smin_of(out, aa, bb, k)
+    }
+
+    /// `-x`: its bounds and its Jacobian's negated, its steepness the same.
+    fn neg_lval(&mut self, out: &mut Block, a: LVal, ty: TypeId) -> LVal {
+        let (lo, hi) = self.iv_neg(out, (a.lo, a.hi), ty);
+        let mut j_lo = Vec::with_capacity(self.n);
+        let mut j_hi = Vec::with_capacity(self.n);
+        for i in 0..self.n {
+            let (jl, jh) = self.iv_neg(out, (a.j_lo[i], a.j_hi[i]), ty);
+            j_lo.push(jl);
+            j_hi.push(jh);
+        }
+        LVal { lo, hi, j_lo, j_hi, lip: a.lip }
+    }
+
+    /// [`Self::smin`] of operands already derived.
+    fn smin_of(&mut self, out: &mut Block, aa: LVal, bb: LVal, k: ValueId) -> LVal {
+        let f = self.f32_ty;
         // Value interval: `min(a, b) - max(k - |a - b|, 0)² / (4 k)`
         let mlo = self.builtin(out, Builtin::Min, vec![aa.lo, bb.lo], f);
         let mhi = self.builtin(out, Builtin::Min, vec![aa.hi, bb.hi], f);
