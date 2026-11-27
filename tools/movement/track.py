@@ -811,16 +811,22 @@ def widened_norm(s, n):
 
 
 def extra_width(sim):
-    return 2 * sim.mjm.nu + 3 * (sim.active.numel() - 1)
+    return 2 * sim.mjm.nu + 3 * (sim.active.numel() - 1) + 3
 
 
 def extra_of(sim, act):
     """What the simulator knows of a frame beside its poses (the filtered capture's step 8, "with
-    the contacts"): the net's action, each servo's force (N m) and the world's force on each moving
-    segment but the root's first (N, the floor's contacts: x, y, z)."""
+    the contacts"): the net's action, each servo's force (N m), the world's force on each moving
+    segment but the root at the frame's last step (N, the floor's contacts: x, y, z: which
+    segments touch), and the body's momentum (kg m/s), whose change over a frame less its weight
+    is the world's force averaged over the frame (what poses at 30 a second can give)."""
     mjw.rne_postconstraint(sim.m, sim.d)
     cf = wp.to_torch(sim.d.cfrc_ext)[:, sim.active[1:], 3:6].reshape(sim.n, -1)
-    return torch.cat([act, wp.to_torch(sim.d.actuator_force), cf], -1)
+    mjw.com_pos(sim.m, sim.d)
+    mjw.com_vel(sim.m, sim.d)
+    mjw.subtree_vel(sim.m, sim.d)
+    p = wp.to_torch(sim.d.subtree_linvel)[:, 1] * float(sim.mjm.body_subtreemass[1])
+    return torch.cat([act, wp.to_torch(sim.d.actuator_force), cf, p], -1)
 
 
 # ---- the generator: a clip under changes that physics permits (phase 5 step 16) ------------------
@@ -935,7 +941,8 @@ def filtered(sim, agent, norm, head, push=None):
     xs = zlib.compress(np.concatenate([r["extra"].astype("<f2") for r in results]).tobytes(), 6)
     xh = json.dumps({"clips": [c["name"] for c in clips], "frames": [c["frames"] for c in clips],
                      "columns": {"action": sim.mjm.nu, "servo_force": sim.mjm.nu,
-                                 "contact_force": 3 * (sim.active.numel() - 1)},
+                                 "contact_force": 3 * (sim.active.numel() - 1), "momentum": 3},
+                     "mass": float(sim.mjm.body_subtreemass[1]),
                      "segments": [sim.mjm.body(int(b)).name for b in sim.active[1:]],
                      "dtype": "float16", "rate": head["rate"]}).encode()
     extra = b"WFLX" + struct.pack("<I", len(xh)) + xh + xs
