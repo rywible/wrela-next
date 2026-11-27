@@ -461,7 +461,8 @@ radiance error rather than point-sampled sub-cell tessellation noise.
 Purpose: make a moving or turning eye cost little more than a still one, by keeping every brick
 it extracted, and prove the kept mesh is the mesh a cold extraction makes.
 
-**State (2026-11-27, `197305e`): steps 1 and 2 built; step 3 next.** A static, opaque mesh of
+**State (2026-11-27, `26eebf1`): steps 1, 2 and 3 built; the full gates on both machines
+next.** A static, opaque mesh of
 nested rings is a `BrickPool` (`mesh::pool`). Its bricks are keyed by what their mesh reads
 (`brick_key`: lattice brick, level, seam faces, hole mask, thing), every brick of a cut kept,
 seam faces' too: a brick on a 2:1 seam face keeps six indices of its own slice for each quad of
@@ -490,8 +491,47 @@ mask fails it (1,524,398 triangles against 1,523,902).
 M4, SCENE 10 VIEW 4 (running), 1080p, frames 30 to 269, the pool's passes a frame (means): cull
 0.024, probe 0.015, misses 0.150, compaction 0.281 ms, no rebase in the run: 0.47 ms over still,
 in step 2's target. The span is 27.9 ms, the outline's certificates (`mesh_watch*`, 6.0 ms) and the
-moving kinds' extraction (2.9 ms, as still) the rest of the moving cost. The rings are still
-`build_lod_grids_distance`'s, with its tuned caps (step 3).
+moving kinds' extraction (2.9 ms, as still) the rest of the moving cost.
+
+The rings (step 3) are `mesh::rings::build_ring_grids` for every ringed mesh, pooled or not, and
+`build_lod_grids_distance` with its caps is gone. Level `k` reaches `2^(k+1) / (rule · pixel)`
+from the eye (snapped to its parent's bricks two at a time, `RING_SLACK`), where the rule is
+`CELL_PX` pixels a cell, finer for a steep field (`grid::cell_rule`: `STEEP_CELLS` past
+`STEEP_LIPSCHITZ`, again past `STEEPEST_LIPSCHITZ`; the old builder hid a steep factor of 0.8 in
+its fit, and the thin bolt lost its outline without it). The reach is held to what a cut may keep,
+`CUT_ROOM` (half the pool's 65,536 slots), by `ring_reach`: the share of a cut's candidates the
+batch's cull kept (its last readback's hits and misses: a pool update that drew nothing new
+reports the drawn cut's count, not its own), steps of a quarter power of two below the rule's,
+aimed at 0.7 of the room when chosen, kept while within it, grown only when a step out would keep
+half of it or less and the share was read at the reach now drawn and since the eye's last jump (a
+share read of another eye's cut set the citadel's reach three ways in twelve frames). A thing's
+first cut takes the world's measured share (`ExtractScratch::density_prior`; one in eight before
+any: a first cut at the rule's reach was the stack's 8.6 million candidates and the GPU fell
+1.5 s behind). Cells coarsen (`cell_scale`) only when the reach can go no lower.
+
+The rule's count (`rings::coarse_pixels`, the gate's `coarse` rows): one pixel in each 4 × 4
+block of the frame held to its batch's drawn cut (16 per pixel cost 4.7 ms of SCENE 10's frame,
+inside the frames the gate times; 0.3 ms now). Distance-only against view-fitted with retention,
+by that count (M4, 1080p, frames 30 to 86): the same count on SCENE 10 still (547 of 1,000 against
+547), and view-fitted turning 41.1 ms with 120 late frames against distance-only's 22.3 ms with
+none: distance-only rings are kept, and view-fitted rings are not built.
+
+What the rule costs: SCENE 10's parry arc moves, so it is meshed every frame, and the rule wants
+all 2.9 m of it at 7.8 mm (9,300 bricks, 8.6 ms on the M4, against the 4,125 the old caps let it
+have). Phase 4's chart for the arc's clipped shell (no DC at all) is what pays it back.
+
+The pool after step 2: an update that found the pool full and drew nothing new marks it jammed;
+the next starts it afresh if no eighth of its slots is free of the drawn cut. The pool is sized for
+the incoming cut by the measured share, not only the last drawn cut.
+
+The small hole audit (160 × 90, 12 eyes, 20 kinds) passes, after these engine repairs it found:
+an outline certificate held to the hole's width (`HOLE_PX` pixels across its slab, not twice it:
+the crowd's near body lost a pixel at its outline); a thin cell skipped only beside a sheet across
+its face (a neighbour with only some far corners inside may hold a feature thinner than a cell
+going on into it: the bolt lost three pixels); place-keyed certificates emptied whenever the field
+changes (a moving field kept certificates of its earlier shapes); and the audit measures a hole's
+depth to the outline of the thing it is of (matter twice as far behind counts as past it), so a
+near thing's outline pixel before a far thing is not a crack.
 
 ### Steps, in order
 
@@ -597,6 +637,19 @@ Purpose: remove the remaining exact-cell proof debt on heavy showcase assets (`S
 Step 1 runs before phase 4 (revision 3), its first two items first: the turned profile's
 enclosure (`stick_turned`: 89 of the candlestick's 100 cells) and the flutes' steepness (the
 pillars' 12,039 and the column's 5,720, from `cmul` squared).
+
+**State (2026-11-27): step 1's first two items done.** The turned profile: where no one segment
+is nearest over a box (a profile's joints, and a cell over two short segments), its distance's
+enclosure is the near parts' (`kit::shapes::outline::near_parts_slope`: the gradient in the box
+of the outward normals of every part near enough to be nearest, and of the joints' cones, by
+Clarke's mean value theorem), not a slopeless ball. The candlestick's census at 4.8 mm: 15 of 100
+cells certified within a quarter cell (11 before); slopeless in the turned profile 36 (89 before),
+in the carving 11; 38 now have slopes and are curved past a quarter-cell slab (beads and coves of
+a few mm at 4.8 mm cells), which is step 3's question (second order), not a first-order one. Its
+enclosures stay proven sound (`candlestick_enclosures_are_sound`: 556 boxes proven, 1,585
+sampled). The flutes were repaired before (`5160766`: `std::field::wave_cos` and `wave_sin`,
+whose steepness the compiler bounds by `n / r0`): the pillars' derived bound is 2.35 (from
+12,039), the column's flutes are `wave_sin` too.
 
 1. **Upgrade enclosures for the failure classes measured in Phase 0 step 5.**
    - **Two-slope linear bounds** (CROWN, Zhang et al. 2018; DeepPoly, Singh et al. 2019 — cite in

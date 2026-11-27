@@ -140,6 +140,188 @@ fn segment_slope_box(
     (false, slope2_lip(d_at, 1.01, r_box))
 }
 
+/// The box `[lo, hi]` grown to hold `p`.
+fn grown(lo: vec2, hi: vec2, p: vec2) -> (vec2, vec2) {
+    (min(lo, p), max(hi, p))
+}
+
+/// The box of the unit directions on the shorter arc from `u` to `v` (each unit): theirs, and
+/// each axis's the arc passes.
+fn arc_dirs(u: vec2, v: vec2) -> (vec2, vec2) {
+    var lo = min(u, v)
+    var hi = max(u, v)
+    let turn = u.x * v.y - u.y * v.x
+    let mid = u + v
+    for k in 0..4 {
+        let w = if k == 0 { vec2(1.0, 0.0) } else if k == 1 { vec2(0.0, 1.0) } else if k == 2 {
+            vec2(-1.0, 0.0)
+        } else { vec2(0.0, -1.0) }
+        let a = u.x * w.y - u.y * w.x
+        let b = w.x * v.y - w.y * v.x
+        if a * turn >= 0.0 && b * turn >= 0.0 && dot(mid, w) >= 0.0 {
+            let (l2, h2) = grown(lo, hi, w)
+            lo = l2
+            hi = h2
+        }
+    }
+    (lo, hi)
+}
+
+/// A unit vector of `v`, or `fallback` where it has no length.
+fn unit_or(v: vec2, fallback: vec2) -> vec2 {
+    let l = length(v)
+    if l > 1.0e-20 { v / l } else { fallback }
+}
+
+/// What the segment from `a` to `b` bowed `bulge` (worked out as `arc`) gives the gradients of an
+/// outline's distance over the points whose nearest point on the outline is within `reach` of
+/// `at`: whether any point of it is that near, the box of its gradients there (its outward
+/// normals: an arc's over the angle about its centre that reach spans, a straight or shallow
+/// segment's over the stretch of it the reach spans, where its distance is the parabola's), and
+/// its outward normals at its ends (unit), for the joints' cones.
+fn part_gradients(at: vec2, reach: f32, a: vec2, b: vec2, bulge: f32, arc: Arc) -> (bool, vec2, vec2, vec2, vec2) {
+    let n = segment_of(at, a, b, bulge, arc)
+    let c = b - a
+    let l = max(arc.length, 1.0e-12)
+    let right = vec2(c.y, -c.x) / l
+    let c_hat = c / l
+    if arc.radius <= 0.0 {
+        let slope_u = 4.0 * bulge / l
+        let g0 = right - c_hat * slope_u
+        let g1 = right + c_hat * slope_u
+        let ends = (unit_or(g0, right), unit_or(g1, right))
+        if !(sqrt(max(n.d2, 0.0)) <= reach) {
+            return (false, vec2(0.0), vec2(0.0), ends.0, ends.1)
+        }
+        let u_at = dot(at - a, c) / (l * l)
+        let du = reach / l
+        let u0 = clamp(u_at - du, 0.0, 1.0)
+        let u1 = clamp(u_at + du, 0.0, 1.0)
+        let ga = right - c_hat * (slope_u * (1.0 - 2.0 * u0))
+        let gb = right - c_hat * (slope_u * (1.0 - 2.0 * u1))
+        return (true, min(ga, gb), max(ga, gb), ends.0, ends.1)
+    }
+    let side = sign(bulge)
+    let na = unit_or(a - arc.centre, right) * side
+    let nb = unit_or(b - arc.centre, right) * side
+    if !(sqrt(max(n.d2, 0.0)) <= reach) {
+        return (false, vec2(0.0), vec2(0.0), na, nb)
+    }
+    let v0 = at - arc.centre
+    let rho = length(v0)
+    let r = arc.radius
+    if rho < 1.0e-12 * (r + 1.0) {
+        return (true, vec2(-1.0), vec2(1.0), na, nb)
+    }
+    // The circle's points within `reach` of `at`: cos(θ - θ0) at least `kappa`.
+    let kappa = (r * r + rho * rho - reach * reach) / (2.0 * r * rho)
+    if kappa <= -1.0 {
+        return (true, vec2(-1.0), vec2(1.0), na, nb)
+    }
+    let m = v0 / rho
+    let cos_d = min(kappa, 1.0)
+    let sin_d = sqrt(max(1.0 - cos_d * cos_d, 0.0))
+    let e0 = vec2(m.x * cos_d - m.y * sin_d, m.x * sin_d + m.y * cos_d)
+    let e1 = vec2(m.x * cos_d + m.y * sin_d, -m.x * sin_d + m.y * cos_d)
+    var lo = min(e0, e1)
+    var hi = max(e0, e1)
+    for k in 0..4 {
+        let w = if k == 0 { vec2(1.0, 0.0) } else if k == 1 { vec2(0.0, 1.0) } else if k == 2 {
+            vec2(-1.0, 0.0)
+        } else { vec2(0.0, -1.0) }
+        if dot(w, m) >= cos_d {
+            let (l2, h2) = grown(lo, hi, w)
+            lo = l2
+            hi = h2
+        }
+    }
+    if side < 0.0 {
+        return (true, -hi, -lo, na, nb)
+    }
+    (true, lo, hi, na, nb)
+}
+
+/// Sound first-order Mean-Value enclosure of an outline's distance over `[at - rad, at + rad]`
+/// from the parts of it near enough to be nearest to some point of the box: `d_at` its distance
+/// at `at`, and its gradient (where it has one, the outward normal at the nearest point; else, by
+/// Clarke's mean value theorem, a mix of those) in the box of the near parts' normals and of the
+/// cones of the near joints between them (a point nearest a joint takes a direction on the
+/// shorter arc between the normals there). Where two segments are both near (a turned profile's
+/// joints, where its cells failed for want of one nearest), the enclosure is narrow wherever the
+/// outline is smooth. Its segments in order round the loop are the first `n` of `seg_a`, `seg_b`,
+/// `seg_bulge`, `seg_arc`, then the first `tail_n` of the straight `tail_a`, `tail_b`, `tail_arc`
+/// (a profile's closing lines).
+fn near_parts_slope<const M: u32>(
+    at: vec2,
+    rad: vec2,
+    r_box: f32,
+    d_at: f32,
+    seg_a: [vec2; M],
+    seg_b: [vec2; M],
+    seg_bulge: [f32; M],
+    seg_arc: [Arc; M],
+    n: u32,
+    tail_a: [vec2; 3],
+    tail_b: [vec2; 3],
+    tail_arc: [Arc; 3],
+    tail_n: u32,
+) -> Slope2 {
+    let l_max = 1.01
+    let reach = abs(d_at) + 2.0 * l_max * r_box + 1.0e-5
+    var lo = vec2(1.0e30)
+    var hi = vec2(-1.0e30)
+    var longest = 0.0
+    var first_a = vec2(0.0)
+    var first_start = vec2(0.0)
+    var prev_end = vec2(0.0)
+    var done: u32 = 0
+    for i in 0..M + 3 {
+        let main = i < n
+        let tail = i >= M && i - M < tail_n
+        if main || tail {
+            let t = if tail { i - M } else { 0 }
+            let a = if main { seg_a[i] } else { tail_a[t] }
+            let b = if main { seg_b[i] } else { tail_b[t] }
+            let bulge = if main { seg_bulge[i] } else { 0.0 }
+            let arc = if main { seg_arc[i] } else { tail_arc[t] }
+            let (near, glo, ghi, n_start, n_end) = part_gradients(at, reach, a, b, bulge, arc)
+            if near {
+                lo = min(lo, glo)
+                hi = max(hi, ghi)
+                longest = max(longest, arc.length)
+            }
+            // The joint where this segment begins, if it is near: the cone from the last one's
+            // end normal to this one's start normal.
+            if done > 0 && length(a - at) <= reach {
+                let (clo, chi) = arc_dirs(prev_end, n_start)
+                lo = min(lo, clo)
+                hi = max(hi, chi)
+            }
+            if done == 0 {
+                first_a = a
+                first_start = n_start
+            }
+            prev_end = n_end
+            done += 1
+        }
+    }
+    // The loop's last joint, back to the first segment's start.
+    if done > 0 && length(first_a - at) <= reach {
+        let (clo, chi) = arc_dirs(prev_end, first_start)
+        lo = min(lo, clo)
+        hi = max(hi, chi)
+    }
+    if !(lo.x <= hi.x && lo.y <= hi.y) {
+        return slope2_lip(d_at, l_max, r_box)
+    }
+    let g_mid = 0.5 * (lo + hi)
+    let g_rad = 0.5 * (hi - lo) + vec2(8.0 * SLOPE_EPS)
+    let err = (abs(d_at) + reach + longest) * (16.0 * SLOPE_EPS) + 1.0e-6
+    let span = dot(abs(g_mid) + g_rad, rad) + err
+    let rng_m = (abs(d_at) + span) * (10.0 * SLOPE_EPS) + 4.0 * SLOPE_TINY
+    Slope2 { g_mid, g_rad, d_at, err, range: Interval { lo: d_at - (span + rng_m), hi: d_at + (span + rng_m) } }
+}
+
 /// Where `p` is against one segment of an outline: the square of its distance from the segment,
 /// whether `p` is in the cap between the segment's chord and its arc (which changes which side
 /// of the outline `p` is on), whether a ray from `p` toward +x crosses the chord (the same), the
@@ -376,7 +558,13 @@ impl<const N: u32> Outline<N> {
                 return sb
             }
         }
-        slope2_lip(d_at, l_max, r_box)
+        var seg_b = self.points
+        for i in 0..N {
+            seg_b[i] = self.points[if i + 1 == N { 0 } else { i + 1 }]
+        }
+        let none_v = [vec2(0.0); 3]
+        let none_arc = [self.arcs[0]; 3]
+        near_parts_slope(at, rad, r_box, d_at, self.points, seg_b, self.bulges, self.arcs, N, none_v, none_v, none_arc, 0)
     }
 }
 
@@ -514,7 +702,15 @@ impl<const N: u32> Profile<N> {
                 return sb
             }
         }
-        slope2_lip(d_at, l_max, r_box)
+        // Segment `i` runs from point `i` to `i + 1` (the last unused), then the closing lines.
+        var seg_b = self.points
+        for i in 0..N {
+            seg_b[i] = self.points[if i + 1 < N { i + 1 } else { i }]
+        }
+        let tail_a = [last, top, bottom]
+        let tail_b = [top, bottom, first]
+        let tail_arc = [arc_of(last, top, 0.0), arc_of(top, bottom, 0.0), arc_of(bottom, first, 0.0)]
+        near_parts_slope(at, rad, r_box, d_at, self.points, seg_b, self.bulges, self.arcs, N - 1, tail_a, tail_b, tail_arc, 3)
     }
 }
 

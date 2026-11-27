@@ -26,7 +26,7 @@ use mesh::outline::{
     place_cert_append, place_cert_link, reset_place_cert, stale_beside, thin_due, thin_watched,
     thin_watched_octants, uncertified, zero_words,
 }
-use mesh::rings::{build_ring_grids, ring_reach}
+use mesh::rings::{LEVEL_SLOTS, build_ring_grids, grid_candidates, grid_reached, level_share, level_slot, ring_reach}
 use mesh::pool::{BrickPool, COMPACT_GROUPS, COMPACT_PER_GROUP, CUT_ROOM, GATE_WORDS, brick_pool}
 use mesh::grid::{
     ActiveBrick, BrickBound, CAP_EXACT_MAX, CAP_SEAM, CAP_SURF, CERT_SLICE,
@@ -205,6 +205,8 @@ pub struct ExtractScratch {
     /// batch's last readback found (`MeshBatch::ring_density`): a thing's first cut is reached by it
     /// (one in eight before any readback: the kinds measured keep 4 to 15 in a hundred).
     pub density_prior: f32,
+    /// The bricks the last cull kept of each of its first `MAX_LOD_LEVELS` grids (`cull_cut`).
+    pub level_kept: GpuBuffer<u32>,
 }
 
 /// Zeroes `count` words of `buf` in chunks of at most `2097152` elements (`32768` workgroups,
@@ -259,9 +261,11 @@ pub(package) struct ChunkMesh: Copy {
     pub(package) crease_slices: u32,
 }
 
-/// The words of a batch's `tri_count` (`mesh::pool::finish_pool_draw` says what each is), all read
-/// back.
-pub(package) const TRI_WORDS: u32 = 20
+/// The words of a batch's `tri_count` (`mesh::pool::finish_pool_draw` says what each is, and
+/// from `TRI_LEVELS` on, the bricks the cut's cull kept of each of its first `MAX_LOD_LEVELS`
+/// grids), all read back.
+pub(package) const TRI_WORDS: u32 = 28
+pub(package) const TRI_LEVELS: u32 = 20
 
 /// The indirect dispatches a chunk of `run_extract` makes besides its crease slices.
 const CHUNK_INDIRECT: u32 = 7
@@ -335,6 +339,7 @@ pub fn extract_scratch(max_bricks: u32, lattice: vec3, cell_px: f32 = CELL_PX) -
         cell_px,
         origin0: vec3(0.0),
         density_prior: 0.125,
+        level_kept: buffer(MAX_LOD_LEVELS),
     }
 }
 
@@ -657,8 +662,21 @@ pub struct MeshBatch {
     /// The reach of the cut `ring_density` was read of: a share read at another reach (an older
     /// cut's, read after the eye moved on) may make the rings reach less, never more.
     pub(package) density_reach: f32,
+    /// The share of its candidates each level's cull kept, by its cell (`rings::level_slot`), as
+    /// the readbacks found (0 where none was read): what `ring_reach` reaches a cut by. The levels
+    /// of the latest extraction (each one's cell slot and candidates), and of the one read.
+    pub(package) level_shares: [f32; LEVEL_SLOTS],
+    pub(package) level_gens: [u32; LEVEL_SLOTS],
+    pub(package) cut_slots: [u32; MAX_LOD_LEVELS],
+    pub(package) cut_cands: [u32; MAX_LOD_LEVELS],
+    pub(package) cut_levels: u32,
+    pub(package) poll_slots: [u32; MAX_LOD_LEVELS],
+    pub(package) poll_cands: [u32; MAX_LOD_LEVELS],
+    pub(package) poll_levels: u32,
     /// The first extraction since the eye last jumped (`lod_cut`).
     pub(package) cut_gen: u32,
+    /// The bricks the cut last made is expected to keep (`level_shares`).
+    pub(package) cut_predicted: u32,
     pub(package) watch_slots_cap: u32,
     pub(package) watch_quads_cap: u32,
     pub(package) watch_verts_cap: u32,
@@ -723,6 +741,7 @@ pub(package) fn cull_plan<M: Field<Substance>>(
         first: 0,
         fc: fc,
         active: mut scratch.active,
+        kept_levels: mut scratch.level_kept,
     )
     let super_sub_slice = max(
         u32(clamp(
@@ -761,6 +780,7 @@ pub(package) fn cull_cut<M: Field<Substance>>(
     plan: CullPlan,
 ) {
     scratch.active.clear()
+    write(mut scratch.level_kept, 0, Vec::filled(MAX_LOD_LEVELS, 0))
     let grids = scratch.grids.items()
     let use_super = plan.use_super
     let super_slices = plan.super_slices
@@ -819,6 +839,7 @@ pub(package) fn cull_cut<M: Field<Substance>>(
                     first: sk * super_sub_slice,
                     fc: fc,
                     active: mut scratch.active,
+                    kept_levels: mut scratch.level_kept,
                 ),
                 groups: scratch.super_args.at(sk),
                 most: super_sub_slice,
@@ -834,6 +855,7 @@ pub(package) fn cull_cut<M: Field<Substance>>(
                 total_bricks: total_bricks,
                 fc: fc,
                 active: mut scratch.active,
+                kept_levels: mut scratch.level_kept,
             )),
             most: CULL_CHUNK,
         )
@@ -849,6 +871,7 @@ pub(package) fn cull_cut<M: Field<Substance>>(
                     total_bricks: total_bricks,
                     fc: fc,
                     active: mut scratch.active,
+                    kept_levels: mut scratch.level_kept,
                 ),
                 over: n,
             )
@@ -1067,7 +1090,16 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
         ring_reach: 1.0,
         reach_room: false,
         density_reach: 1.0,
+        level_shares: [0.0; LEVEL_SLOTS],
+        level_gens: [0; LEVEL_SLOTS],
+        cut_slots: [0; MAX_LOD_LEVELS],
+        cut_cands: [0; MAX_LOD_LEVELS],
+        cut_levels: 0,
+        poll_slots: [0; MAX_LOD_LEVELS],
+        poll_cands: [0; MAX_LOD_LEVELS],
+        poll_levels: 0,
         cut_gen: 0,
+        cut_predicted: 0,
         watch_slots_cap: 1,
         watch_quads_cap: 1,
         watch_verts_cap: 1,
@@ -2031,6 +2063,12 @@ impl MeshBatch {
                     gpu_ovf = c[7]
                     exact_count = c[8]
                     self.seam_read = c[12]
+                    for j in 0..MAX_LOD_LEVELS {
+                        if j < self.poll_levels && self.poll_cands[j] > 0 {
+                            self.level_shares[self.poll_slots[j]] = clamp(f32(c[TRI_LEVELS + j]) / f32(self.poll_cands[j]), 0.0, 1.0)
+                            self.level_gens[self.poll_slots[j]] = self.poll_gen
+                        }
+                    }
                     if self.pooled {
                         self.took_pool_counts(c.clone(), c[7])
                     }
@@ -2199,6 +2237,9 @@ impl MeshBatch {
                 self.poll_scale = self.extract_scale
                 self.poll_total = self.extract_total
                 self.poll_reach = self.ring_reach
+                self.poll_slots = self.cut_slots
+                self.poll_cands = self.cut_cands
+                self.poll_levels = self.cut_levels
                 self.poll_limit = self.extract_limit
                 self.poll_caps = vec4u(
                     self.cap_verts,
@@ -2397,6 +2438,8 @@ impl MeshBatch {
         cell: f32,
     ) {
         let cell = cell * self.cell_scale
+        // One grid, not rings: its readbacks say nothing of the levels' shares.
+        self.cut_levels = 0
         var h = Hasher::new()
         mesh_key(field, mut h)
         let key = h.finish()
@@ -2763,6 +2806,22 @@ impl MeshBatch {
         let eff_cpx = cell_rule(lip, scratch.cell_px)
         // As far as the rule wants, but no more bricks kept than a cut holds (`CUT_ROOM`), as
         // the share of candidates the batch's last cull kept says.
+        // The levels' shares read for this eye: since its last jump, and not by a cut made before
+        // it (`cut_gen`); any other level is taken to keep the most any level of this batch was
+        // read to keep (a level an eye has newly come near holds as much surface as any).
+        let jumped = self.active_hint > 0 &&
+            (length(v.at - self.lod_view_at) > 0.35 * max(d_surf, 0.01) ||
+                dot(v.forward, self.lod_view_fwd) < 0.90)
+        var shares = [-1.0; LEVEL_SLOTS]
+        var share_most = if self.ring_density > 0.0 { self.ring_density } else { scratch.density_prior }
+        for k in 0..LEVEL_SLOTS {
+            if self.level_gens[k] > 0 {
+                share_most = max(share_most, self.level_shares[k])
+                if !jumped && self.level_gens[k] >= self.cut_gen {
+                    shares[k] = self.level_shares[k]
+                }
+            }
+        }
         let (reach, reach_room) = ring_reach(
             aabb,
             v.at,
@@ -2771,7 +2830,9 @@ impl MeshBatch {
             eff_top,
             scratch.lattice,
             holds: CUT_ROOM,
-            density: if self.ring_density > 0.0 { self.ring_density } else { scratch.density_prior },
+            shares: shares,
+            fallback: share_most,
+            clear: d_surf,
             last: self.ring_reach,
             may_grow: self.density_reach == self.ring_reach,
         )
@@ -2793,6 +2854,19 @@ impl MeshBatch {
         let grids = take built_grids
         let total_bricks = built_total
         let has_seams = built_seams
+        // The cut's levels as an extraction of it will read them back (`level_shares`), and the
+        // bricks they are expected to keep (the pool's room is sized by it).
+        self.cut_levels = min(grids.len(), MAX_LOD_LEVELS)
+        var predicted = 0.0
+        for j in 0..grids.len() {
+            let share = level_share(shares, level_slot(grids[j].cell), share_most)
+            predicted += share * f32(grid_reached(grids[j], v.at, d_surf))
+            if j < MAX_LOD_LEVELS {
+                self.cut_slots[j] = level_slot(grids[j].cell)
+                self.cut_cands[j] = grid_candidates(grids[j])
+            }
+        }
+        self.cut_predicted = u32(predicted)
         self.lod_fit = grids.clone()
         self.lod_fit_total = total_bricks
         let fc = frustum_cull_none()
@@ -3631,6 +3705,7 @@ impl MeshBatch {
                 total_bricks: patch_total,
                 fc: frustum_cull_none(),
                 active: mut scratch.active,
+                kept_levels: mut scratch.level_kept,
             )),
             most: CULL_CHUNK,
         )
@@ -3646,6 +3721,7 @@ impl MeshBatch {
                     total_bricks: patch_total,
                     fc: frustum_cull_none(),
                     active: mut scratch.active,
+                    kept_levels: mut scratch.level_kept,
                 ),
                 over: cn,
             )
@@ -4857,6 +4933,7 @@ impl MeshBatch {
 
         // Pass 0: Interval-cull bricks (2-level 4×4×4 super-bricks on large grids, else flat).
         cull_cut(mut scratch, fields, things: things, total_bricks: total_bricks, fc: fc, plan: cull)
+        copy(from: scratch.level_kept.items(), to: self.tri_count.span_mut(start: TRI_LEVELS, count: MAX_LOD_LEVELS))
 
         // Passes 1–3: Extract in bounded chunks of `CHUNK_BRICKS` active bricks using `chunk_limit`
         // (generous 1.5× + 1-chunk headroom; `took_counts` re-extracts automatically if exceeded).
