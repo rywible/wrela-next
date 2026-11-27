@@ -38,10 +38,11 @@ BODY = "creature"
 POSES = os.path.join(ROOT, ".movement/poses", BODY)
 
 
-def set_body(name):
+def set_body(name, poses_root=None):
     global BODY, POSES
     BODY = name
-    POSES = os.path.join(ROOT, ".movement/poses", name)
+    root = os.path.join(ROOT, ".movement/poses") if poses_root is None else poses_root
+    POSES = os.path.join(root, name)
 
 
 def read_pose(path):
@@ -319,10 +320,17 @@ def load_packed(path):
 
 
 def main():
-    if "--body" in sys.argv[1:3] and sys.argv[1] != "--out":
-        i = sys.argv.index("--body")
-        set_body(sys.argv[i + 1])
+    poses_root = None
+    if "--poses-root" in sys.argv[1:5] and sys.argv[1] != "--out":
+        i = sys.argv.index("--poses-root")
+        poses_root = sys.argv[i + 1]
         del sys.argv[i:i + 2]
+    if "--body" in sys.argv[1:5] and sys.argv[1] != "--out":
+        i = sys.argv.index("--body")
+        set_body(sys.argv[i + 1], poses_root)
+        del sys.argv[i:i + 2]
+    elif poses_root is not None:
+        set_body(BODY, poses_root)
     if len(sys.argv) > 1 and sys.argv[1] == "check":
         sys.exit(check(sys.argv[2:]))
     if len(sys.argv) > 1 and sys.argv[1] == "play-check":

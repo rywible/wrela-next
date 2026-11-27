@@ -395,6 +395,7 @@ than the balance fell (1.59 written, 1.12 fallen for the tests of 0.5).
 | 2026-11-27 | `p4h-10-small` (L4): phase 4 on human3: 100-update L4 validation of audited physics/obs/PPO fixes, done | 0.80 |
 | 2026-11-27 | `p4h-10` (L4): phase 4 on human3: 2038 sanitized clips, 25 active bodies, stable armature, 0% limit violations, multi-scale reward and value norm, 4000 updates, stopped | 2.26 |
 | 2026-11-27 | `p4h-11` (L4): phase 4 on human3: critically damped STIFF=2.5 kv=0.04, per-dim target_kl=0.002, annealed log_std -1.6..-2.5, 12-frame lookahead + ref_vel, 4000 updates, done | 11.55 |
+| 2026-11-27 | `p4h-12` (L4): phase 4 on human3 refs_clean: fine-tune from p4h-11 upd 4000 with startup-accel trim and 8x tail mining, 1200 updates, done | 4.07 |
 
 #### A new machine
 
@@ -1000,6 +1001,21 @@ removes the faults of the retarget: slide, penetration and forces that cannot oc
   (2,038 sanitized clips, 25 active bodies, `nq = 69`, `nu = 62`, 0.0000% joint limit violations,
   max root speed 4.99 m/s, 0.0023 mm kinematic error), along with the human torso/limb/ankle
   geometry polish in `game/world/human.wrela`.
+- Phase 4 completed on the human (2026-11-27, `p4h-11` and `p4h-12`): with explicit-stability
+  armature (`max(0.01, 1.5 * kp * dt^2 - i_max)`), critically damped servos (`STIFF = 2.5`,
+  `kv = 0.04 * kp`), per-dimension KL targeting (`0.002`), annealed action std (`-1.6` to `-2.5`),
+  12-frame lookahead with target root velocity, and physical startup-acceleration transient
+  trimming (`>10 m/s^2`, avg 1.7 frames on 634/2,038 clips = 0.04% of frames), `p4h-11` (4,000
+  updates, 11.55 units) reached 90.8% training / 90.0% test follow rate and 37.4 mm full-clip
+  error with 0 blown worlds and 0 solver overflows. Fine-tuning from `p4h-11` on `refs_clean.bin`
+  with 8x tail mining (`p4h-12`, 1,200 updates, 4.07 units) reached **96.5% training** (37.2 mm;
+  `100style` 93.0% / 40.5 mm, `ceti` 98.2% / 32.3 mm) and **95.0% test** (43.8 mm; `100style`
+  93.4% / 45.0 mm, `ceti` 98.0% / 37.5 mm) at 20 s, and **95.6% training** (36.0 mm) / **87.9%
+  test** (40.4 mm) played to the complete end of every clip (2,009 of 2,038 unfiltered to
+  `.movement/poses-filtered`, 2,632,605 frames). By the judge on `100style/Neutral_{FW,FR,SW,TR1}`,
+  physics filtering cut root residual by 58–87% (0.047–0.186 down to 0.013–0.024 of weight),
+  torque past strength by 64–91% (down to 0.007–0.016), run slide by 43% (1,093 down to 624 mm/s),
+  and turn float from 29 mm to 0 mm.
 
 ### Done when
 
