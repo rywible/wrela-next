@@ -13,13 +13,14 @@
 use arena::arena_courtyard
 use engine::matter::substance::Substance
 use engine::matter::contact::{Contact, contact}
+use engine::matter::medium::{Medium, MediumSample, empty_medium}
 use engine::matter::verify::{prove_field_facts, verify_field_soundness, verify_moving_soundness}
 use kit::substances::pbr::{emissive, glass, sand}
 use std::cmp::Eq
 use std::derive::Box3
 use std::field::{
     Bound, Field, FieldFacts, Rotate, RoundCone, Scale, Surface, Translate, Union, With, hash_u32,
-    round_cone, smax, smin,
+    round_cone, smax, smin, value_noise,
 }
 use std::hash::{StateHash, state_hash}
 use std::quat::Quat
@@ -174,9 +175,11 @@ pub const SAND_THROWN: f32 = 0.2
 const SAND_FLIGHT: f32 = 0.7
 const SAND_FADE: f32 = 1.4
 
-/// The thrown sand at a moment: the region it is in (an ellipsoid, `centre` and `reach`), how
-/// much of it is still in the air (`density`: 1 just spread, 0 gone), and where the grains are
-/// (a jittered lattice `GRAIN` m apart, each a grain clump `density` of `GRAIN_R` across).
+/// The thrown sand at a moment: the region it is in (an ellipsoid, `centre` and `reach`) and how
+/// much of it is still in the air (`density`: 1 just spread, 0 gone). Its grains are far finer
+/// than a pixel: it is a medium (`engine::matter::medium::Medium`), a cloud whose light is what
+/// its grains scatter and take away, not a surface. (Meshed as thousands of 12 mm clumps, each a
+/// thin feature moving every frame, SCENE 16 took 234 ms a frame on the M4.)
 pub struct SandVeil: Copy + GpuData + Eq + StateHash {
     pub centre: vec3,
     pub density: f32,
@@ -184,8 +187,18 @@ pub struct SandVeil: Copy + GpuData + Eq + StateHash {
     pub pad0: f32,
 }
 
-const GRAIN: f32 = 0.035
-const GRAIN_R: f32 = 0.006
+/// The handful's mass (kg: a hand's full), its grains' radius (m) and their stuff's density
+/// (kg/m³, quartz), and how much of the light meeting a grain it takes from the beam (its
+/// extinction efficiency: 2 for a grain many wavelengths across, half by what it stops, half by
+/// what it bends).
+const SAND_MASS: f32 = 0.1
+const GRAIN_RADIUS: f32 = 0.00015
+const QUARTZ: f32 = 2650.0
+const EXTINCTION_EFFICIENCY: f32 = 2.0
+
+/// The mean of `(1 - |q|²)²` over the unit ball: the share of its region's volume the sand's
+/// profile fills, so its mass is `SAND_MASS` however it spreads.
+const PROFILE_MEAN: f32 = 0.22857143
 
 /// The sand `time` s into the parry: flung from `SAND_FROM`, slowing as it spreads (its middle at
 /// `1 - (1 - u)^2` of the way), to `VEIL_AT` and `VEIL_REACH` at `SAND_THROWN + SAND_FLIGHT`, then
@@ -207,11 +220,6 @@ fn ellipsoid_below(p: vec3, centre: vec3, reach: vec3) -> f32 {
     (length(q) - 1.0) * min(reach.x, min(reach.y, reach.z))
 }
 
-/// A number in [0, 1) from three lattice coordinates.
-fn grain_hash(c: vec3) -> f32 {
-    unit(u32(c.x + 4096.0) ^ hash_u32(u32(c.y + 4096.0) ^ hash_u32(u32(c.z + 4096.0))))
-}
-
 impl SandVeil {
     /// The region the sand is in: `ellipsoid_below` of it, while any of it is in the air (none
     /// is: a region no point is inside).
@@ -223,48 +231,37 @@ impl SandVeil {
     }
 }
 
-impl Surface for SandVeil {
-    /// Its evaluation's work, held at build (`tools/layers` rule 7).
-    @budget(work: 2048)
-    fn distance(self, p: vec3) -> f32 {
-        // The grains: a clump at a jittered point of each lattice cell, the nearest of the eight
-        // cells round `p`, within the region.
-        let g = p / GRAIN - vec3(0.5)
-        let base = floor(g)
-        var near = 1.0e3
-        for k in 0..8 {
-            let c = base + vec3(f32(k & 1), f32((k >> 1) & 1), f32((k >> 2) & 1))
-            let j = vec3(grain_hash(c), grain_hash(c + vec3(17.0)), grain_hash(c + vec3(31.0)))
-            let at = (c + vec3(0.25) + 0.5 * j + vec3(0.5)) * GRAIN
-            near = min(near, length(p - at))
+impl Medium for SandVeil {
+    /// Its grains' extinction where it is: their number a cubic metre times what each takes from
+    /// a beam, `n · π r² · Q`, which for grains of mass density `ρ` is `(m / V) · 3 Q / (4 ρ r)`;
+    /// its mass spread over its region as `(1 - |q|²)²` (thickest in its middle, nothing at its
+    /// rim), in clumps a few centimetres across that keep its mass on average. Pale quartz, its
+    /// light thrown forward (grains many wavelengths across).
+    fn sample_at(self, p: vec3) -> MediumSample {
+        let smooth = self.extinction(p)
+        if smooth <= 0.0 {
+            return empty_medium()
         }
-        max(near - GRAIN_R * self.density, self.hull(p))
-    }
-
-    /// Round the region at its widest.
-    fn bound(self) -> Bound {
-        Bound { centre: self.centre, radius: max(self.reach.x, max(self.reach.y, self.reach.z)) + GRAIN, slope: 0.4 }
-    }
-
-    /// The nearest of exact distances to points, less a radius, and an ellipsoid's distance
-    /// scaled to be no steeper than one: one.
-    fn lipschitz(self, _near: f32) -> f32 {
-        1.0
+        let clumps = 1.0 + 0.6 * value_noise(p * 28.0)
+        MediumSample { density: smooth * clumps, albedo: vec3(0.82, 0.72, 0.55), emits: vec3(0.0), g: 0.75 }
     }
 }
 
-impl Field<Substance> for SandVeil {
-    /// Dry quartz sand, pale and matte.
-    fn channels(self, _p: vec3) -> Substance {
-        sand(vec3(0.78, 0.68, 0.50))
-    }
-
-    fn field_facts(self) -> FieldFacts {
-        SAND_FACTS
+impl SandVeil {
+    /// Its extinction at `p` before its clumps (m⁻¹): its mass in the air spread as `(1 - |q|²)²`
+    /// over its region, times what a kilogram of its grains takes from a beam.
+    pub fn extinction(self, p: vec3) -> f32 {
+        let q = (p - self.centre) / self.reach
+        let r2 = dot(q, q)
+        if self.density <= 0.0 || r2 >= 1.0 {
+            return 0.0
+        }
+        let volume = 4.18879 * self.reach.x * self.reach.y * self.reach.z
+        let mass_density = SAND_MASS * self.density / (volume * PROFILE_MEAN)
+        let per_mass = 3.0 * EXTINCTION_EFFICIENCY / (4.0 * QUARTZ * GRAIN_RADIUS)
+        mass_density * per_mass * (1.0 - r2) * (1.0 - r2)
     }
 }
-
-const SAND_FACTS: FieldFacts = prove_field_facts(sand_veil(SAND_THROWN + SAND_FLIGHT))
 
 /// The sand's region at a moment as a surface (`SandVeil::hull`), for the contact.
 pub struct SandHull: Copy + GpuData + Eq + StateHash {
@@ -278,8 +275,10 @@ impl Surface for SandHull {
         self.veil.hull(p)
     }
 
+    /// Round the region at its widest.
     fn bound(self) -> Bound {
-        self.veil.bound()
+        let v = self.veil
+        Bound { centre: v.centre, radius: max(v.reach.x, max(v.reach.y, v.reach.z)), slope: 0.4 }
     }
 
     fn lipschitz(self, _near: f32) -> f32 {
@@ -629,8 +628,8 @@ fn the_bolt_meets_the_sand_when_the_contact_says_and_never_before() {
 fn parry_field_contracts_are_sound() {
     verify_field_soundness(bolt(time: 0.5, struck: 1.0), "bolt")
     verify_field_soundness(glass_branch(age: 0.3, whole: 1.0), "glass_branch")
-    verify_field_soundness(sand_veil(1.0), "sand_veil")
-    let thrown = verify_moving_soundness(|t: f32| sand_veil(t), from: SAND_THROWN, to: 2.5, label: "sand_veil")
+    // The sand's region, which the contact asks: at every moment of its flight.
+    let thrown = verify_moving_soundness(|t: f32| SandHull { veil: sand_veil(t) }, from: SAND_THROWN, to: 2.5, label: "sand_hull")
     assert(thrown.rate < 1.0e12, "the sand's rate has no bound")
     // At every moment: the bolt for half a second of its strike, the branch as it cools.
     let struck = verify_moving_soundness(|t: f32| bolt(time: t, struck: 1.0), from: 0.0, to: 0.5, label: "bolt")
@@ -645,5 +644,29 @@ fn parry_field_contracts_are_sound() {
     // compiler bounds `smin`: no steeper than its steeper operand).
     assert(f_glass.lip < 2.0, f"glass facts: lip={f_glass.lip}")
     assert(f_glass.may_emit && f_glass.may_transmit, f"glass facts: emits {f_glass.may_emit}, transmits {f_glass.may_transmit}")
+}
+
+/// The sand's medium holds its mass however it spreads: its extinction (before its clumps, which
+/// keep it on average) summed over its region,
+/// over what each kilogram of grains takes from a beam, is the handful's mass still in the air
+/// (`SAND_MASS · density`), within 2%, compact as it leaves the hand and spread across the bolt.
+@test
+fn the_sands_cloud_holds_its_mass() {
+    let per_mass = 3.0 * EXTINCTION_EFFICIENCY / (4.0 * QUARTZ * GRAIN_RADIUS)
+    for t in [SAND_THROWN + 0.05, SAND_THROWN + SAND_FLIGHT, SAND_THROWN + SAND_FLIGHT + 0.7] {
+        let v = sand_veil(t)
+        let n: u32 = 48
+        var sum = 0.0
+        for i in 0..n * n * n {
+            let u = (vec3(f32(i % n), f32((i / n) % n), f32(i / (n * n))) + vec3(0.5)) / f32(n)
+            let p = v.centre + (u * 2.0 - vec3(1.0)) * v.reach
+            sum += v.extinction(p)
+        }
+        let cell = 8.0 * v.reach.x * v.reach.y * v.reach.z / f32(n * n * n)
+        let mass = sum * cell / per_mass
+        let want = SAND_MASS * v.density
+        std::io::print(f"sand at {t} s: {mass * 1000.0} g in the air (want {want * 1000.0} g), reach {v.reach}")
+        assert(abs(mass - want) <= 0.02 * want, f"the cloud holds {mass} kg, not {want}")
+    }
 }
 
