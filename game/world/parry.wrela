@@ -1,0 +1,397 @@
+// The parry the game is built toward: one caster throws lightning, the other throws sand into its
+// path, and the lightning melts the sand into a branch of glass that hangs in the air, glows, and
+// then breaks.
+//
+// Three fields, each what it is and nothing of how it is drawn: the bolt (a jagged path of
+// lightning, never still), the veil (where the thrown sand is in the air: a region, not a
+// surface), and the branch: the bolt as it was at the moment it met the veil, within the veil,
+// fused to glass. The branch is one field made of the two that met: the spell's answer.
+//
+// The bolt and the branch hold their contracts at every moment (`verify_moving_soundness`), not
+// at one, and the contract says how fast each can change.
+
+use arena::arena_courtyard
+use engine::matter::substance::Substance
+use engine::matter::verify::{prove_field_facts, verify_field_soundness, verify_moving_soundness}
+use kit::substances::pbr::{emissive, glass}
+use std::cmp::Eq
+use std::field::{
+    Bound, Field, FieldFacts, Rotate, RoundCone, Scale, Surface, Translate, Union, With, hash_u32,
+    round_cone, smax, smin,
+}
+use std::hash::{StateHash, state_hash}
+use std::quat::Quat
+
+/// Where the lightning leaves the hand that throws it, and the hand it is thrown at.
+pub const BOLT_FROM: vec3 = vec3(3.2, 1.55, 0.05)
+pub const BOLT_TO: vec3 = vec3(-2.4, 1.35, 0.20)
+
+/// The joints of the bolt's path (its ends and five between), how far a joint strays from the
+/// straight line between the hands (m), and the bolt's radius (m): a stroke's bright channel is a
+/// few centimetres across.
+const JOINTS: u32 = 7
+const WANDER: f32 = 0.16
+const BOLT_RADIUS: f32 = 0.018
+
+/// The moment of a parry's loop the bolt meets the veil (s), the moment the branch breaks, and
+/// the loop's length.
+pub const PARRY_HIT: f32 = 1.2
+pub const PARRY_BREAK: f32 = 3.4
+pub const PARRY_LOOP: f32 = 5.0
+
+/// A number in [0, 1) from `x`, the same on every machine.
+fn unit(x: u32) -> f32 {
+    f32(hash_u32(x) & 16777215) / 16777216.0
+}
+
+/// The `k`th joint of the bolt's path at `time`: on the line between the hands at its ends, and
+/// between them wandering off it, each joint at its own two rates (17 to 45 a second: a stroke
+/// flickers faster than an eye follows, but it does not jump).
+fn joint(k: u32, time: f32) -> vec3 {
+    let s = f32(k) / f32(JOINTS - 1)
+    let along = normalize(BOLT_TO - BOLT_FROM)
+    let side = normalize(cross(along, vec3(0.0, 1.0, 0.0)))
+    let up = cross(side, along)
+    let (h1, h2, h3, h4) = (unit(k * 97 + 13), unit(k * 193 + 29), unit(k * 317 + 47), unit(k * 431 + 7))
+    let a = sin(time * (23.0 + 9.0 * h1) + 6.2831853 * h2) +
+        0.5 * sin(time * (41.0 + 13.0 * h3) + 6.2831853 * h4)
+    let b = sin(time * (19.0 + 11.0 * h3) + 6.2831853 * h1) +
+        0.5 * sin(time * (37.0 + 7.0 * h2) + 6.2831853 * h4)
+    // Nothing at the hands, the most midway.
+    let reach = WANDER * sin(3.1415927 * s) / 1.5
+    mix(BOLT_FROM, BOLT_TO, vec3(s)) + (side * a + up * b) * reach
+}
+
+/// The distance from `p` to the segment from `a` to `b`.
+fn to_segment(p: vec3, a: vec3, b: vec3) -> f32 {
+    let pa = p - a
+    let ba = b - a
+    let h = clamp(dot(pa, ba) / max(dot(ba, ba), 1.0e-12), 0.0, 1.0)
+    length(pa - ba * h)
+}
+
+// =================================================================================================
+// The bolt
+// =================================================================================================
+
+/// A stroke of lightning between the hands: its path's joints (each a place, and the channel's
+/// radius there), worked out once a frame where it is made (`bolt`), so a point's distance is to
+/// six segments and no more.
+pub struct Bolt: Copy + GpuData + Eq + StateHash {
+    pub joints: [vec4; 7],
+}
+
+/// The bolt at `time`, `struck` of it there (1 while it strikes; 0 is no bolt: a path of no
+/// width, which no point is inside).
+pub fn bolt(time: f32, struck: f32) -> Bolt {
+    var joints = [vec4(BOLT_FROM, 0.0); 7]
+    for k in 0..JOINTS {
+        joints[k] = vec4(joint(k, time), BOLT_RADIUS * clamp(struck, 0.0, 1.0))
+    }
+    Bolt { joints }
+}
+
+impl Surface for Bolt {
+    /// Its evaluation's work, held at build (`tools/layers` rule 7).
+    @budget(work: 512)
+    fn distance(self, p: vec3) -> f32 {
+        var d = to_segment(p, self.joints[0].xyz, self.joints[1].xyz)
+        for k in 1..(JOINTS - 1) {
+            d = min(d, to_segment(p, self.joints[k].xyz, self.joints[k + 1].xyz))
+        }
+        d - self.joints[0].w
+    }
+
+    /// Round the middle of the hands: half the way between them, the most a joint strays (both
+    /// its ways at once), and the channel.
+    fn bound(self) -> Bound {
+        Bound {
+            centre: 0.5 * (BOLT_FROM + BOLT_TO),
+            radius: 0.5 * length(BOLT_TO - BOLT_FROM) + 1.5 * WANDER + BOLT_RADIUS,
+            slope: 1.0,
+        }
+    }
+
+    /// The least of exact distances to segments, less a radius: exact.
+    fn lipschitz(self, _near: f32) -> f32 {
+        1.0
+    }
+}
+
+impl Field<Substance> for Bolt {
+    /// A stroke's channel is about 30,000 K: blue-white, and far brighter than anything it
+    /// lights.
+    fn channels(self, _p: vec3) -> Substance {
+        emissive(vec3(0.82, 0.88, 1.0), vec3(150.0, 175.0, 260.0), roughness: 0.3)
+    }
+
+    fn field_facts(self) -> FieldFacts {
+        BOLT_FACTS
+    }
+}
+
+const BOLT_FACTS: FieldFacts = prove_field_facts(Bolt { joints: [vec4(0.0, 0.0, 0.0, 0.018); 7] })
+
+// =================================================================================================
+// The veil: where the thrown sand is
+// =================================================================================================
+
+/// The middle of the sand in the air at the moment the bolt meets it, and how far it reaches
+/// along the bolt, up and across (m): a handful thrown flat across the bolt's way.
+pub const VEIL_AT: vec3 = vec3(0.4, 1.45, 0.125)
+pub const VEIL_REACH: vec3 = vec3(0.95, 0.5, 0.42)
+
+/// No more than the distance from `p` to the veil (an ellipsoid about `VEIL_AT`), and below 0
+/// inside it: the distance of the sphere it is squeezed from, shrunk by its least reach.
+fn veil(p: vec3) -> f32 {
+    let q = (p - VEIL_AT) / VEIL_REACH
+    (length(q) - 1.0) * min(VEIL_REACH.x, min(VEIL_REACH.y, VEIL_REACH.z))
+}
+
+// =================================================================================================
+// The branch of glass
+// =================================================================================================
+
+/// The distance from `p` to a stretch of glass from `a` to `b` (each a place, and the glass's
+/// radius there): a segment's, less the radius between its ends'.
+fn stretch(p: vec3, a: vec4, b: vec4) -> f32 {
+    let pa = p - a.xyz
+    let ba = b.xyz - a.xyz
+    let h = clamp(dot(pa, ba) / max(dot(ba, ba), 1.0e-12), 0.0, 1.0)
+    length(pa - ba * h) - mix(a.w, b.w, h)
+}
+
+/// The glass a bolt left where it met the veil: the bolt's path as it was at that moment (its
+/// joints, each with the glass's radius there: it beads), two spurs where the stroke forked into
+/// the sand, all of it kept to the veil; and what it emits now, as hot as it still is.
+pub struct GlassBranch: Copy + GpuData + Eq + StateHash {
+    pub joints: [vec4; 7],
+    /// The spurs: each from a joint (`xyz`, `w` its radius there) to its tip (`xyz`, `w` its
+    /// radius there).
+    pub spurs: [vec4; 4],
+    /// Its emitted radiance (`xyz`), and how much of it is there (`w`: 1 whole, 0 none).
+    pub glow: vec4,
+}
+
+/// The glass's temperature when the stroke has just fused it (K: silica is worked near 2,000),
+/// the air's, and the time it takes to lose all but a part in e of the difference (s: a rod a
+/// few centimetres through, radiating and in moving air).
+const FUSED_K: f32 = 1950.0
+const AIR_K: f32 = 290.0
+const COOLING: f32 = 0.9
+
+/// Planck's radiance at wavelength `metres` and temperature `kelvin`, over the same at
+/// `FUSED_K`: how much dimmer that colour is as the glass cools.
+fn dimmer(metres: f32, kelvin: f32) -> f32 {
+    // The second radiation constant, hc / k (m K).
+    let c2 = 0.014388
+    (exp(c2 / (metres * FUSED_K)) - 1.0) / (exp(c2 / (metres * kelvin)) - 1.0)
+}
+
+/// What the glass emits `age` s after the stroke fused it: a black body's light at its
+/// temperature, which falls to the air's (Newton's cooling), in red, green and blue at 610, 550
+/// and 465 nm. Just fused it is the yellow-white of 1,950 K; it reddens and dims as it cools.
+fn glow(age: f32) -> vec3 {
+    let kelvin = AIR_K + (FUSED_K - AIR_K) * exp(-max(age, 0.0) / COOLING)
+    // At 1,950 K, in the picture's units: its red against its green and blue by Planck's law.
+    let fused = vec3(34.0, 15.5, 4.2)
+    fused * vec3(dimmer(6.1e-7, kelvin), dimmer(5.5e-7, kelvin), dimmer(4.65e-7, kelvin))
+}
+
+/// The branch a bolt leaves: the bolt as it is at `PARRY_HIT`, `age` s after it (`whole` of it
+/// there: 1, or 0 once it has broken).
+pub fn glass_branch(age: f32, whole: f32) -> GlassBranch {
+    let w = clamp(whole, 0.0, 1.0)
+    var joints = [vec4(VEIL_AT, 0.0); 7]
+    for k in 0..JOINTS {
+        // Glass beads along a stroke's path: thicker and thinner by turns.
+        let bead = 0.026 + 0.022 * unit(k * 599 + 3)
+        joints[k] = vec4(joint(k, PARRY_HIT), bead * w)
+    }
+    // Two forks, from the joints either side of the middle, out into the sand and thinning.
+    var spurs = [vec4(VEIL_AT, 0.0); 4]
+    for s in 0..2 {
+        let k = 2 + 2 * s
+        let from = joint(k, PARRY_HIT)
+        let way = normalize(
+            vec3(unit(s * 811 + 5) - 0.5, 0.55 - 1.3 * f32(s) * unit(s * 877 + 9), unit(s * 919 + 1) - 0.5),
+        )
+        spurs[2 * s] = vec4(from, joints[k].w)
+        spurs[2 * s + 1] = vec4(from + way * (0.24 + 0.1 * unit(s * 947 + 2)), 0.008 * w)
+    }
+    GlassBranch { joints, spurs, glow: vec4(glow(age), w) }
+}
+
+impl Surface for GlassBranch {
+    /// Its evaluation's work, held at build (`tools/layers` rule 7).
+    @budget(work: 1024)
+    fn distance(self, p: vec3) -> f32 {
+        // The path, a stretch at a time, each as thick as its beads (a joint's radius to the
+        // next's); joined smoothly, as fused glass is.
+        var d = stretch(p, self.joints[0], self.joints[1])
+        for k in 1..(JOINTS - 1) {
+            d = smin(d, stretch(p, self.joints[k], self.joints[k + 1]), 0.02)
+        }
+        for s in 0..2 {
+            d = smin(d, stretch(p, self.spurs[2 * s], self.spurs[2 * s + 1]), 0.02)
+        }
+        // Only where the sand was. (None of it: a path of no width, kept out by a hair.)
+        smax(d, veil(p), 0.03) + 1.0e-4 * (1.0 - self.glow.w)
+    }
+
+    /// Round the veil: the glass is nowhere else. Past it the distance is the veil's, which
+    /// grows along its longest reach as its least reach is to that (0.42 to 0.95): 0.44 a metre.
+    fn bound(self) -> Bound {
+        Bound { centre: VEIL_AT, radius: VEIL_REACH.x + 0.05, slope: 0.4 }
+    }
+
+    /// A tapering bead is as steep as sqrt(1 + (0.022 / 0.9)²) over its segment (the joints are
+    /// 0.93 m apart at least), a spur's 0.04 over 0.24 m: 1.02; the smooth joins mix them.
+    fn lipschitz(self, _near: f32) -> f32 {
+        1.03
+    }
+}
+
+impl Field<Substance> for GlassBranch {
+    /// Fulgurite: fused silica, greenish where the sand held iron, rough from the grains it took
+    /// up, and glowing as hot as it still is.
+    fn channels(self, _p: vec3) -> Substance {
+        Substance { emits: self.glow.xyz, ..glass(vec3(0.80, 0.93, 0.86), roughness: 0.12, ior: 1.46) }
+    }
+
+    fn field_facts(self) -> FieldFacts {
+        GLASS_BRANCH_FACTS
+    }
+}
+
+const GLASS_BRANCH_FACTS: FieldFacts = prove_field_facts(glass_branch(age: 0.3, whole: 1.0))
+
+// =================================================================================================
+// The pieces it breaks into
+// =================================================================================================
+
+/// One piece of the broken branch: a short rod of the same glass, turned and fallen.
+pub type BranchPiece = Translate<Rotate<Scale<With<Union<RoundCone, RoundCone>, Substance>>>>
+
+/// A piece as it is made: a rod thicker at its middle, along its own z.
+fn piece() -> With<Union<RoundCone, RoundCone>, Substance> {
+    let front = round_cone(vec3(0.0, 0.0, 0.0), vec3(0.0, 0.0, 0.5), r_top: 0.11, r_bottom: 0.05)
+    let back = round_cone(vec3(0.0, 0.0, -0.5), vec3(0.0, 0.0, 0.0), r_top: 0.05, r_bottom: 0.11)
+    front.union(back).with(glass(vec3(0.80, 0.93, 0.86), roughness: 0.12, ior: 1.46))
+}
+
+/// The pieces of the branch `since` s after it broke (below 0: not broken, and they are under
+/// the ground): one where each stretch of the path was, falling as things fall, each thrown a
+/// little outward and tumbling, until it lies on the ground.
+pub fn branch_pieces(since: f32) -> [BranchPiece; 6] {
+    let base = piece()
+    var out = [base.scale(0.3).rotate(Quat::identity()).translate(vec3(0.0, -4.0, 0.0)); 6]
+    if since < 0.0 {
+        return out
+    }
+    for k in 0..6 {
+        let a = joint(k, PARRY_HIT)
+        let b = joint(k + 1, PARRY_HIT)
+        let mid = 0.5 * (a + b)
+        // Only what was glass: the stretches in the veil.
+        if veil(mid) > 0.0 {
+            continue
+        }
+        let out_way = vec3(unit(k * 613 + 17) - 0.5, 0.3 * unit(k * 641 + 23), unit(k * 673 + 31) - 0.5)
+        // It lies where it lands on the court: the first moment of its fall it is within a rod's
+        // half thickness of the ground.
+        let down = landing(mid, out_way)
+        let landed = since >= down
+        let at = fallen(mid, out_way, min(since, down))
+        let spin = if landed { 0.6 * f32(k) } else { since * (5.0 + 4.0 * unit(k * 701 + 37)) }
+        let axis = normalize(vec3(unit(k * 733 + 41) - 0.5, 0.2, unit(k * 769 + 43) - 0.5))
+        let along = normalize(b - a)
+        let turn = Quat::axis_angle(axis, spin)
+        let lean = if landed { vec3(along.x, 0.0, along.z) } else { along }
+        out[k] = base.scale(0.32).rotate(turn.mul(aim_z(lean))).translate(at)
+    }
+    out
+}
+
+/// Where a piece that broke off at `from`, thrown `out_way`, is `t` s on: thrown, and falling as
+/// things fall.
+fn fallen(from: vec3, out_way: vec3, t: f32) -> vec3 {
+    from + out_way * (1.2 * t) + vec3(0.0, -0.5 * 9.81 * t * t, 0.0)
+}
+
+/// How long a piece that broke off at `from`, thrown `out_way`, falls before it lies on the
+/// court (s): its fall stepped through until the court is within a rod's half thickness, then
+/// halved onto that moment.
+fn landing(from: vec3, out_way: vec3) -> f32 {
+    let court = arena_courtyard()
+    var before = 0.0
+    var after = 2.0
+    for i in 1..101 {
+        let t = 0.02 * f32(i)
+        if court.distance(fallen(from, out_way, t)) <= 0.035 {
+            after = t
+            break
+        }
+        before = t
+    }
+    for _ in 0..12 {
+        let mid = 0.5 * (before + after)
+        if court.distance(fallen(from, out_way, mid)) <= 0.035 {
+            after = mid
+        } else {
+            before = mid
+        }
+    }
+    after
+}
+
+/// The turn that takes a thing's own z to `way`.
+fn aim_z(way: vec3) -> Quat {
+    let f = normalize(way)
+    let up = if abs(f.y) < 0.95 { vec3(0.0, 1.0, 0.0) } else { vec3(1.0, 0.0, 0.0) }
+    let r = normalize(cross(up, f))
+    let u = cross(f, r)
+    Quat::from_mat3(mat3(r, u, f))
+}
+
+// =================================================================================================
+// The parry, a moment of it
+// =================================================================================================
+
+/// What is there `time` s into a parry's loop: the bolt while it strikes, the branch from the
+/// moment it meets the veil until it breaks (cooling), and the pieces after.
+pub struct Parry: Copy {
+    pub bolt: Bolt,
+    pub branch: GlassBranch,
+    pub pieces: [BranchPiece; 6],
+}
+
+pub fn parry(time: f32) -> Parry {
+    let t = time - PARRY_LOOP * floor(time / PARRY_LOOP)
+    Parry {
+        bolt: bolt(time: t, struck: if t < PARRY_HIT { 1.0 } else { 0.0 }),
+        branch: glass_branch(
+            age: t - PARRY_HIT,
+            whole: if t >= PARRY_HIT && t < PARRY_BREAK { 1.0 } else { 0.0 },
+        ),
+        pieces: branch_pieces(t - PARRY_BREAK),
+    }
+}
+
+@test
+fn parry_field_contracts_are_sound() {
+    verify_field_soundness(bolt(time: 0.5, struck: 1.0), "bolt")
+    verify_field_soundness(glass_branch(age: 0.3, whole: 1.0), "glass_branch")
+    // At every moment: the bolt for half a second of its strike, the branch as it cools.
+    let struck = verify_moving_soundness(|t: f32| bolt(time: t, struck: 1.0), from: 0.0, to: 0.5, label: "bolt")
+    let cooled = verify_moving_soundness(|t: f32| glass_branch(age: t, whole: 1.0), from: 0.0, to: 2.0, label: "glass_branch")
+    // The branch is still: only its light changes.
+    assert(cooled.rate < 1.0e-3, f"the branch's shape changes at {cooled.rate} m a second")
+    assert(struck.rate < 1.0e12, "the bolt's rate has no bound")
+    let f_bolt = bolt(time: 0.5, struck: 1.0).field_facts()
+    let f_glass = glass_branch(age: 0.3, whole: 1.0).field_facts()
+    assert(f_bolt.lip < 1.0e12 && f_bolt.may_emit && !f_bolt.may_transmit, f"bolt facts: lip={f_bolt.lip}")
+    // (The build proves the branch no steepness of its own yet: `field_facts_report` says what
+    // it has, and its exact cells take the solver that needs none.)
+    assert(f_glass.may_emit && f_glass.may_transmit, f"glass facts: emits {f_glass.may_emit}, transmits {f_glass.may_transmit}")
+}

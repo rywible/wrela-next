@@ -13,7 +13,7 @@
 use matter::edits::Edited
 use matter::substance::Substance
 use std::collections::Vec
-use std::derive::{Box3, Interval, affine, affine_form, gradient, interval, lipschitz, work}
+use std::derive::{Box3, Box4, Interval, affine, affine_form, gradient, interval, lipschitz, work}
 use std::field::{
     ALL_LIVE, Bound, Field, FieldFacts, Live, Surface, Translate, UNBOUNDED, cuboid, fbm, form_box,
     hash_u32, round_cone, sphere,
@@ -614,6 +614,214 @@ pub fn verify_slope_soundness<S: Surface>(
     print(
         f"verify({label}): enclosures proven on {slope_p.proven} boxes ({slope_p.unproven} sampled), {boxes} boxes in its bound and cells round {found} points of its surface{how}",
     )
+}
+
+/// What `verify_moving_soundness` found of a field that moves, over a span of time: the boxes
+/// (of space and time) its bound and its steepness are proven on and sampled on, and how fast
+/// its distance changes where it is near its surface, in metres a second: `rate` the most the
+/// compiler's derivation allows anywhere it could bound it (infinite where it bounded none),
+/// and `seen` the most met at the points sampled.
+pub struct Moving: Copy {
+    pub bound: Proven,
+    pub steep: Proven,
+    pub rated: Proven,
+    pub rate: f32,
+    pub seen: f32,
+}
+
+/// The greater magnitude of `i`'s ends.
+fn most_abs(i: Interval) -> f32 {
+    max(abs(i.lo), abs(i.hi))
+}
+
+/// `b` halved across the axis it is widest along, its span of time weighed as `time` is to
+/// `space` (the widths of the box it came from).
+fn bisect4(b: Box4, space: f32, time: f32) -> (Box4, Box4) {
+    let e = b.hi - b.lo
+    let m = 0.5 * (b.lo + b.hi)
+    let wide = max(e.x, max(e.y, e.z)) / max(space, 1.0e-12)
+    if e.w / max(time, 1.0e-12) > wide {
+        (
+            Box4 { lo: b.lo, hi: vec4(b.hi.xyz, m.w) },
+            Box4 { lo: vec4(b.lo.xyz, m.w), hi: b.hi },
+        )
+    } else if e.x >= e.y && e.x >= e.z {
+        (
+            Box4 { lo: b.lo, hi: vec4(m.x, b.hi.y, b.hi.z, b.hi.w) },
+            Box4 { lo: vec4(m.x, b.lo.y, b.lo.z, b.lo.w), hi: b.hi },
+        )
+    } else if e.y >= e.z {
+        (
+            Box4 { lo: b.lo, hi: vec4(b.hi.x, m.y, b.hi.z, b.hi.w) },
+            Box4 { lo: vec4(b.lo.x, m.y, b.lo.z, b.lo.w), hi: b.hi },
+        )
+    } else {
+        (
+            Box4 { lo: b.lo, hi: vec4(b.hi.x, b.hi.y, m.z, b.hi.w) },
+            Box4 { lo: vec4(b.lo.x, b.lo.y, m.z, b.lo.w), hi: b.hi },
+        )
+    }
+}
+
+/// The boxes of space and time one of `verify_moving_soundness`'s tiles may be halved into
+/// before what is still unproven of it is sampled, and how many times over.
+const MOVING_NODES_MAX: u32 = 24
+const MOVING_DEPTH_MAX: u32 = 6
+
+/// Time as `verify_moving_soundness` scales it where it asks a field's steepness in space alone:
+/// the derived bound is of the gradient in space and time together, and with a second this many
+/// units long the rate of change is no part of it to speak of.
+const MOVING_TIME_SCALE: f32 = 1.0e-4
+
+/// Holds a field that moves to its contract at every moment from `from` to `to` (seconds), not
+/// at one: `at(t)` is the field at `t`. A moving thing's `bound()` and `lipschitz()` are stated of
+/// the field at a moment, and `verify_surface_soundness` holds them at the moment it is given;
+/// here the compiler's ranges are taken over boxes of space and time together (`std::derive`
+/// over a `vec4`, time its fourth coordinate), so what is proven is proven of every moment in
+/// the span:
+///
+/// - the bound: `at(t).bound().below(p) <= at(t).distance(p)` for every `p` and `t` of a box;
+/// - the steepness: the gradient in space no longer than the greatest `lipschitz` stated in the
+///   span, wherever the distance is within the bound's scope of 0;
+/// - the rate: the most the distance changes a second there (its derivative by time), which no
+///   contract states: it is what the engine may count on of a thing that moves (how far its
+///   surface can be from a mesh made a frame ago), and it is returned and said.
+///
+/// A box the proof can't close is halved, across space or time, to a budget, then sampled (the
+/// bound and the steepness asserted at its probes, the rate measured there). `spans` spans of
+/// time are each tiled round the bound at their middle.
+pub fn verify_moving_soundness<S: Surface, F: Copy + fn(f32) -> S>(
+    at: F,
+    from: f32,
+    to: f32,
+    label: str,
+    spans: u32 = 8,
+) -> Moving {
+    assert(to > from && spans > 0, f"verify({label}): a span of time from {from} to {to}")
+    let n: u32 = 4
+    let dt = (to - from) / f32(spans)
+    var bound_p = Proven { proven: 0, unproven: 0 }
+    var steep_p = Proven { proven: 0, unproven: 0 }
+    var rated_p = Proven { proven: 0, unproven: 0 }
+    var rate = 0.0
+    var seen = 0.0
+    for k in 0..spans {
+        let t0 = from + dt * f32(k)
+        let t1 = t0 + dt
+        let tm = 0.5 * (t0 + t1)
+        let b0 = at(t0).bound()
+        let b1 = at(t1).bound()
+        let bm = at(tm).bound()
+        // Round the bound at the span's middle, and as far again as its ends' stand from it.
+        let r = max(bm.radius, max(b0.radius, b1.radius)) +
+            max(length(b0.centre - bm.centre), length(b1.centre - bm.centre))
+        assert(r > 0.0 && r < 1.0e12, f"verify({label}): its bound's radius {r} at {tm} s is not finite positive")
+        let near = max(0.25 * r, 0.25)
+        let lip = max(at(tm).lipschitz(near), max(at(t0).lipschitz(near), at(t1).lipschitz(near)))
+        let check_lip = lip > 0.0 && lip < 1.0e12
+        let lim = lip * 1.0001 + 1.0e-6
+        let step = 3.0 * r / f32(n)
+        let lo = bm.centre - vec3(1.5 * r)
+        for i in 0..(n * n * n) {
+            let bx = tile(lo, step, n, i)
+            var work: Vec<(Box4, u32)> = Vec::new()
+            work.push((Box4 { lo: vec4(bx.lo, t0), hi: vec4(bx.hi, t1) }, 0))
+            var nodes: u32 = 0
+            while work.len() > 0 {
+                let (c, depth) = work.pop().unwrap()
+                nodes += 1
+                // The bound, where it is read (where it says the surface is some way off).
+                let asked_bound = affine(|v: vec4| at(v.w).bound().below(v.xyz), c).hi > 0.0
+                let bound_ok = !asked_bound ||
+                    affine(
+                        |v: vec4| {
+                            let s = at(v.w)
+                            s.distance(v.xyz) - s.bound().below(v.xyz)
+                        },
+                        c,
+                    ).lo >= -2.0e-3
+                // The steepness and the rate, where the surface can be near.
+                let f = interval(|v: vec4| at(v.w).distance(v.xyz), c)
+                let asked_near = !(f.lo >= near || f.hi <= -near)
+                // In space alone: with time scaled, the rate is no part of the gradient's length.
+                let scaled = Box4 {
+                    lo: vec4(c.lo.xyz, (c.lo.w - tm) / MOVING_TIME_SCALE),
+                    hi: vec4(c.hi.xyz, (c.hi.w - tm) / MOVING_TIME_SCALE),
+                }
+                let steep_ok = !asked_near ||
+                    !check_lip ||
+                    lipschitz(|v: vec4| at(tm + v.w * MOVING_TIME_SCALE).distance(v.xyz), scaled) <= lim
+                let by_time = if asked_near {
+                    most_abs(interval(|v: vec4| gradient(|u: vec4| at(u.w).distance(u.xyz), v).w, c))
+                } else {
+                    0.0
+                }
+                let rate_ok = !asked_near || by_time < 1.0e12
+                let done = bound_ok && steep_ok && rate_ok
+                if !done && depth < MOVING_DEPTH_MAX && nodes < MOVING_NODES_MAX {
+                    let (left, right) = bisect4(c, step, dt)
+                    work.push((left, depth + 1))
+                    work.push((right, depth + 1))
+                    continue
+                }
+                // A leaf: what is proven of it counted, the rest sampled.
+                if asked_bound && bound_ok {
+                    bound_p = Proven { proven: bound_p.proven + 1, unproven: bound_p.unproven }
+                }
+                if asked_near && check_lip && steep_ok {
+                    steep_p = Proven { proven: steep_p.proven + 1, unproven: steep_p.unproven }
+                }
+                if asked_near && rate_ok {
+                    rated_p = Proven { proven: rated_p.proven + 1, unproven: rated_p.unproven }
+                    rate = max(rate, by_time)
+                }
+                if asked_bound && !bound_ok {
+                    bound_p = Proven { proven: bound_p.proven, unproven: bound_p.unproven + 1 }
+                }
+                if asked_near && check_lip && !steep_ok {
+                    steep_p = Proven { proven: steep_p.proven, unproven: steep_p.unproven + 1 }
+                }
+                if asked_near && !rate_ok {
+                    rated_p = Proven { proven: rated_p.proven, unproven: rated_p.unproven + 1 }
+                    rate = 1.0 / 0.0
+                }
+                if !asked_bound && !asked_near {
+                    continue
+                }
+                let space = Box3 { lo: c.lo.xyz, hi: c.hi.xyz }
+                for m in 0..3 {
+                    let t = c.lo.w + (c.hi.w - c.lo.w) * (0.13 + 0.37 * f32(m))
+                    let s = at(t)
+                    for j in 0..9 {
+                        let p = probes(space, j)
+                        let d = s.distance(p)
+                        if asked_bound && !bound_ok {
+                            let below = s.bound().below(p)
+                            assert(
+                                below <= 0.0 || below <= d + 2.0e-3,
+                                f"verify({label}): at {t} s bound().below({p})={below} exceeds distance={d} (culling would drop matter)",
+                            )
+                        }
+                        if asked_near && abs(d) < near {
+                            let g = gradient(|u: vec4| at(u.w).distance(u.xyz), vec4(p, t))
+                            seen = max(seen, abs(g.w))
+                            if check_lip && !steep_ok {
+                                let gl = length(g.xyz)
+                                assert(
+                                    gl <= lip * 1.001 + 1.0e-4,
+                                    f"verify({label}): at {t} s ||grad({p})||={gl} exceeds lipschitz({near})={lip} (marching would step through surface)",
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    print(
+        f"verify({label}) moving, {from} to {to} s: bound proven on {bound_p.proven} boxes ({bound_p.unproven} sampled), steepness on {steep_p.proven} ({steep_p.unproven} sampled); near its surface its distance changes at most {rate} m a second by the derivation (bounded on {rated_p.proven} boxes, {rated_p.unproven} not), the most at a sampled point {seen}",
+    )
+    Moving { bound: bound_p, steep: steep_p, rated: rated_p, rate, seen }
 }
 
 /// Verifies that `Edited<M>`'s `dirty_region()` encloses every point where `edited.distance(p)`
