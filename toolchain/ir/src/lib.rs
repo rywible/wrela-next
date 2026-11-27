@@ -1064,6 +1064,14 @@ pub struct Module {
     /// CPU only, in a debug build: the text a float operation that creates a NaN panics with
     /// (language.md §11). A release build has none, and no such checks.
     pub nan_message: Option<(DataId, u32)>,
+    /// CPU only, in a debug build asked to say where (`WRELA_NAN_WHERE`): each function's own
+    /// text for `nan_message`, naming it (by function index; empty where not asked). A derived
+    /// function's operations carry its source function's span alone, so the span can't say
+    /// which derived function made a NaN; its name can.
+    pub nan_where: Vec<(DataId, u32)>,
+    /// And for the function `WRELA_NAN_FN` names, each float operation's own text, naming its
+    /// value and what it computes: `(function index, value index, text)`.
+    pub nan_values: Vec<(u32, u32, (DataId, u32))>,
     /// CPU only: the message a command too large for the host's command buffer panics with
     /// (std splits its own large commands; this is the backstop), as `nan_message` is held.
     pub command_message: Option<(DataId, u32)>,

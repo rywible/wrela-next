@@ -1761,6 +1761,15 @@ fn any_nan(fe: &mut Fe, x: ir::ValueId, parts: &(Option<bool>, Vec<u32>)) {
 /// that none of `operands` held: a NaN was created, not passed on (language.md §11).
 pub(crate) fn nan_check(fe: &mut Fe, v: ir::ValueId, operands: &[ir::ValueId]) {
     let Some(msg) = fe.m.nan_message else { return };
+    let msg = if fe.m.nan_where.is_empty() {
+        msg
+    } else {
+        let at = fe.m.functions.iter().position(|g| std::ptr::eq(g, fe.f));
+        let own = at.and_then(|i| {
+            fe.m.nan_values.iter().find(|(f, x, _)| *f as usize == i && *x == v.0).map(|t| t.2)
+        });
+        own.or_else(|| at.and_then(|i| fe.m.nan_where.get(i)).copied()).unwrap_or(msg)
+    };
     let Some(parts) = float_parts(&fe.m.types, fe.vty(v)) else { return };
     any_nan(fe, v, &parts);
     for &o in operands {

@@ -157,7 +157,7 @@ pub fn lower_consts(
     crate::thread_entries(&mut cx, &mut mb);
     if data.debug {
         // Constants run the same debug float checks as the program that reads them (§13).
-        mb.m.nan_message = Some(cx.text_data(&mut mb, crate::NAN_MESSAGE));
+        crate::nan_messages(&mut cx, &mut mb);
     }
     if !cx.missing.is_empty() {
         return (ConstLowering::Needs(cx.missing), Vec::new());
@@ -213,7 +213,7 @@ pub fn lower_tests(
     cx.drain(&mut mb);
     if data.debug {
         // A debug build's NaN checks (§11), made by the back end.
-        mb.m.nan_message = Some(cx.text_data(&mut mb, crate::NAN_MESSAGE));
+        crate::nan_messages(&mut cx, &mut mb);
     }
     if !cx.missing.is_empty() {
         cx.err(Diagnostic::internal("a test reads a constant the build didn't compute"));

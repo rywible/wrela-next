@@ -270,6 +270,40 @@ pub(crate) fn thread_entries(cx: &mut Cx, cpu: &mut ModuleBuilder) {
 /// What a debug build's NaN check panics with (§11).
 pub(crate) const NAN_MESSAGE: &str = "debug build: a float operation created a NaN";
 
+/// A debug build's NaN checks: `NAN_MESSAGE`, and with `WRELA_NAN_WHERE` set, a text for each
+/// function naming it (`ir::Module::nan_where`), for the compiler's own debugging of derived
+/// code, whose operations carry no span of their own.
+pub(crate) fn nan_messages(cx: &mut Cx, mb: &mut ModuleBuilder) {
+    mb.m.nan_message = Some(cx.text_data(mb, NAN_MESSAGE));
+    if std::env::var_os("WRELA_NAN_WHERE").is_some() {
+        let names: Vec<String> = mb.m.functions.iter().map(|f| f.name.clone()).collect();
+        mb.m.nan_where =
+            names.iter().map(|n| cx.text_data(mb, &format!("{NAN_MESSAGE} in `{n}`"))).collect();
+        // `WRELA_NAN_FN=<name>`: that function's each float operation named, by its value.
+        if let Ok(want) = std::env::var("WRELA_NAN_FN") {
+            let mut found: Vec<(u32, u32, String)> = Vec::new();
+            for (fi, f) in mb.m.functions.iter().enumerate() {
+                if f.name != want {
+                    continue;
+                }
+                ir::visit::walk(&f.body, &mut |st| {
+                    if let ir::Stmt::Let(v, e) = st
+                        && matches!(e, ir::Expr::Binary(..) | ir::Expr::Builtin(..))
+                    {
+                        found.push((fi as u32, v.0, format!("{NAN_MESSAGE} in `{want}` at v{}: {e:?}", v.0)));
+                    }
+                });
+            }
+            mb.m.nan_values =
+                found.into_iter().map(|(fi, v, t)| (fi, v, cx.text_data(mb, &t))).collect();
+        }
+        // And `WRELA_NAN_WHERE=<file>` writes the module there, to read the named function in.
+        if let Some(path) = std::env::var_os("WRELA_NAN_WHERE").filter(|p| p.len() > 1) {
+            let _ = std::fs::write(path, ir::print::print(&mb.m));
+        }
+    }
+}
+
 /// What a command too large for the host's command buffer panics with: std writes buffers and
 /// textures in pieces, and refuses a request over it by name, so this is the backstop.
 pub(crate) const COMMAND_MESSAGE: &str =
@@ -548,7 +582,7 @@ fn lower_in(
     mark_counted(&mut cx, &mut cpu);
     if data.debug {
         // Checked where floats are computed, by the back end.
-        cpu.m.nan_message = Some(cx.text_data(&mut cpu, NAN_MESSAGE));
+        nan_messages(&mut cx, &mut cpu);
     }
     cpu.m.command_message = Some(cx.text_data(&mut cpu, COMMAND_MESSAGE));
     let t_cpu_drain = t_lower_start.elapsed();

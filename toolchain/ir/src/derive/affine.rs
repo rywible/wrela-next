@@ -457,7 +457,7 @@ fn derive(
     let orig = m.functions[f.index()].clone();
     no_gpu_or_heap_work(&orig.body)?;
     let returns = returns_active(m, cache, f, mask.clone(), Mode::Interval) != 0;
-    let (func, result, act) = one_exit(m, cache, f, orig, &mask);
+    let (func, _, act) = one_exit(m, cache, f, orig, &mask);
     if act.active_loop_exit.is_some() {
         return Err(Error::not_derivable("a loop whose exit depends on the input"));
     }
@@ -550,11 +550,24 @@ fn derive(
     };
     let built = (|| -> R<Block> {
         let mut body = Vec::new();
-        if let Some(r) = result.filter(|r| !b.lparts[r.index()].is_empty()) {
-            // The result starts empty, so a side that never returns adds nothing to the hull.
-            let ty = b.f.locals[r.index()].ty;
-            let e = b.empty(&mut body, ty);
-            b.store_form(&mut body, &Place::local(r), &e)?;
+        // Every active local starts as the join's identity: a float's form empty (so a side
+        // that never returns, or never assigns it, adds nothing to the hull: the result, and a
+        // temporary only the other side of a branch computes), a bool surely neither. A local
+        // that started as whatever its frame held was joined as that: `Carved`'s `l.xy`,
+        // computed only past its early return, was joined with the bits a call before had left,
+        // an infinity among them, and its hull's centre was `-inf + inf`.
+        for (l, decl) in func.locals.iter().enumerate() {
+            if b.lparts[l].is_empty() {
+                continue;
+            }
+            let at = Place::local(LocalId(l as u32));
+            if decl.ty == bool_ty {
+                let no = b.bconst(&mut body, false);
+                b.store_sure(&mut body, &at, (no, no))?;
+            } else {
+                let e = b.empty(&mut body, decl.ty);
+                b.store_form(&mut body, &at, &e)?;
+            }
         }
         b.block_into(&func.body, &mut body)?;
         Ok(body)
@@ -4045,6 +4058,57 @@ mod tests {
             .filter(|s| matches!(s, Stmt::Store(p, _) if p.root == PlaceRoot::Param(0)))
             .count();
         assert!(stores_x >= 3, "x is restored and joined ({stores_x} stores)");
+    }
+
+    /// `fn early(q: f32) -> f32 { if q < 0 { return q }; var t = q * q; t }`: `t` is assigned only
+    /// past the early return, and the derived function joins every local where the two sides
+    /// meet. It starts empty (its error `-BIG`, the hull's identity), before any branch, so the
+    /// side that returned adds nothing to its join: it once started as whatever its frame held
+    /// (`Carved`'s `l.xy` joined an infinity a call before had left there, and its hull's centre
+    /// was `-inf + inf`).
+    #[test]
+    fn a_local_one_side_never_assigns_starts_empty() {
+        let mut m = Module::default();
+        let f32 = m.types.f32();
+        let bool_ty = m.types.bool();
+        let mut f = Function::new("early", vec![Param::value("q", f32)], Some(f32));
+        let t = f.new_local("t", f32);
+        let mut body = Vec::new();
+        let q = f.let_(&mut body, f32, Expr::Param(0));
+        let z = f.let_(&mut body, f32, Expr::Const(Const::F32(0.0)));
+        let c = f.let_(&mut body, bool_ty, Expr::Binary(BinOp::Lt, q, z));
+        body.push(Stmt::If { cond: c, then: vec![Stmt::Return(Some(q))], else_: Vec::new() });
+        let sq = f.let_(&mut body, f32, Expr::Binary(BinOp::Mul, q, q));
+        body.push(Stmt::Store(Place::local(t), sq));
+        let v = f.let_(&mut body, f32, Expr::Load(Place::local(t)));
+        body.push(Stmt::Return(Some(v)));
+        f.body = body;
+        let id = m.add_function(f);
+        verify(&m).expect("the source is valid IR");
+        let mut cache = DeriveCache::default();
+        let d = derive(&mut m, &mut cache, id, vec![1], 1, Target::Cpu)
+            .expect("an early return has an affine form");
+        verify(&m).expect("the affine form is valid IR");
+        let df = &m.functions[d.index()];
+        let mut all = Vec::new();
+        flat(&df.body, &mut all);
+        let consts: HashMap<ValueId, f32> = all
+            .iter()
+            .filter_map(|s| match s {
+                Stmt::Let(v, Expr::Const(Const::F32(x))) => Some((*v, *x)),
+                _ => None,
+            })
+            .collect();
+        // The first store of `t`'s error, before anything else writes it, is `-BIG`.
+        let first = all
+            .iter()
+            .find_map(|s| match s {
+                Stmt::Store(p, v) if local_named(df, p).as_deref() == Some("t_a1") => Some(*v),
+                _ => None,
+            })
+            .expect("t's error is stored");
+        let empty_error = consts.get(&first).is_some_and(|x| *x <= -1.0e29);
+        assert!(empty_error, "t's error starts at -BIG");
     }
 
     /// A call whose callee has no affine form, given an aggregate that depends on the input,
