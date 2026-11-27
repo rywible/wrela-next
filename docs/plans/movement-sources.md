@@ -46,7 +46,7 @@ Before a phase uses a source, it reads the licence file in the download, and it 
 | Source | Contents | Format | Fingers | Licence | Read |
 | --- | --- | --- | --- | --- | --- |
 | [100STYLE](https://ianxmason.github.io/100style) (2022) | More than 4 million frames at 60 frames a second: 100 styles of walk and run | BVH | No | CC BY 4.0 | 1 |
-| ACCAD Open Motion Project | Walk, run and other movement | BVH | No | CC BY 3.0 | In `docs/citations.md` |
+| ACCAD Open Motion Project | Walk, run and other movement; Male 2's martial arts (strikes, blocks, dodges, kicks) | BVH | No | CC BY 3.0 | Imported (2026-11-27: 299 clips), in `docs/citations.md` |
 | [Studio Galt sign language archive](https://github.com/StudioGalt/Sign-Language-Mocap-Archive) (2020 to 2026) | 2,710 movements of the arms, hands and fingers: 2,142 signs, letters and numbers. 60 frames a second | FBX | Yes | CC0 1.0 | 2 |
 | [Microsoft Rocketbox animations](https://github.com/microsoft/Microsoft-Rocketbox) (2022) | 417 clips: idle, gestures of talk, sit, crouch, wave, dance. In place, with no travel | FBX | Yes | MIT | 2 |
 | [Kyokushin karate](https://springernature.figshare.com/articles/dataset/12315629) (2021) | 37 athletes, 3,229 punches and kicks, in the air and on a target | C3D markers. A skeleton fit is necessary | No | CC0 | 2 |

@@ -325,6 +325,37 @@ fn maps(body: str, source: str) -> Vec<Map> {
         }
         return out
     }
+    if source == "accad" {
+        // ACCAD's skeleton (MotionBuilder's names, one for its three performers): three bones of
+        // spine (the lower back, the waist, the chest to the neck), a neck and a head, the
+        // shoulders, the arms, the hands (no fingers), the legs and the toes. Its rotations all 0
+        // are no pose of a person (its bones' axes run along them): `calibration` gives each
+        // bone's rest.
+        if body != "human" {
+            return out
+        }
+        out.push(m("Hips", hs::PELVIS, BOTH))
+        out.push(m("ToSpine", hs::LUMBAR_LOW, TURN))
+        out.push(m("Spine", hs::THORAX_LOW, TURN))
+        out.push(m("Spine1", hs::THORAX_HIGH, TURN))
+        out.push(m("Neck", hs::NECK, TURN))
+        out.push(m("Head", hs::HEAD, TURN))
+        let sides = [
+            ("Left", hs::CLAVICLE_LEFT, hs::THIGH_LEFT),
+            ("Right", hs::CLAVICLE_RIGHT, hs::THIGH_RIGHT),
+        ]
+        for (side, c, t) in sides {
+            out.push(m(f"{side}Shoulder".as_str(), c, TURN))
+            out.push(m(f"{side}Arm".as_str(), c + 2, TURN))
+            out.push(m(f"{side}ForeArm".as_str(), c + 3, PLACE))
+            out.push(m(f"{side}Hand".as_str(), c + 4, BOTH))
+            out.push(m(f"{side}UpLeg".as_str(), t, TURN))
+            out.push(m(f"{side}Leg".as_str(), t + 1, TURN))
+            out.push(m(f"{side}Foot".as_str(), t + 2, BOTH))
+            out.push(m(f"{side}ToeBase".as_str(), t + 3, BOTH))
+        }
+        return out
+    }
     if source != "100style" && source != "embm" {
         return out
     }
@@ -398,7 +429,9 @@ fn bone_of(ms: [Map], seg: u32) -> String {
 
 /// The units of a source's capture, in metres.
 fn unit(source: str) -> f32 {
-    if source == "100style" || source == "embm" || source == "ceti" { 0.01 } else { 1.0 }
+    if source == "100style" || source == "embm" || source == "ceti" || source == "accad" { 0.01 } else {
+        1.0
+    }
 }
 
 /// The credit a source asks for (docs/citations.md).
@@ -408,6 +441,8 @@ fn credit(source: str) -> Text {
         "MPI Emotional Body Motion Database, E. Volkova et al. 2014 (CC BY 4.0)"
     } else if source == "ceti" {
         "CeTI-Age-Kinematics, L. Pogrzeba et al., Sci. Data 12, 531, 2025 (CC BY 4.0)"
+    } else if source == "accad" {
+        "Open Motion Project by ACCAD/The Ohio State University is licensed under a Creative Commons Attribution 3.0 Unported License"
     } else { "" }
 }
 
@@ -554,6 +589,26 @@ fn import_into<const S: u32, const D: u32, const P: u32>(
     // at rest (its joint to its tip) to the bone's (its joint to its first child's, the capture's
     // rotations all 0), where they rest in different poses. A capture at rest in a T-pose
     // (100STYLE) needs none; one with its arms by its sides (MPI EMBM) turns each arm down.
+    // A source whose rotations all 0 are no pose (`calibration`): each bone at rest as it is in
+    // its performer's frame of standing, that frame's heading kept (from the right hip to the
+    // left, the body's +x), and the bone's direction there what its segment's is compared with.
+    var calib_turns: Vec<Quat> = Vec::new()
+    var heading = Quat::identity()
+    if let Some(cf) = calibration(c.source.as_str(), c.name.as_str()) {
+        let cb = read_all(f"capture/{cf}")?
+        let Some(ct) = String::from_utf8(take cb) else { return Err(ToolError::new("calibration: not UTF-8")) }
+        let cal = parse(take ct)?
+        var cal_places: Vec<vec3> = Vec::new()
+        posed(cal, 0, mut cal_places, mut calib_turns)
+        let lh = bone_index(cal, "LeftUpLeg")
+        let rh = bone_index(cal, "RightUpLeg")
+        if lh == NONE || rh == NONE {
+            return Err(ToolError::new("calibration: no hips"))
+        }
+        let left = cal_places[lh] - cal_places[rh]
+        let yaw = atan2(-left.z, left.x)
+        heading = Quat::axis_angle(vec3(0.0, 1.0, 0.0), yaw)
+    }
     var rest_turn: Vec<Quat> = Vec::new()
     for i in 0..ms.len() {
         let b = idx[i]
@@ -565,6 +620,10 @@ fn import_into<const S: u32, const D: u32, const P: u32>(
         }
         if length(cap) == 0.0 && bvh.bones[b].has_end {
             cap = bvh.bones[b].end
+        }
+        if calib_turns.len() > 0 {
+            // The bone's direction in the frame of standing, in that frame's heading.
+            cap = heading.inverse().rotate(calib_turns[b].rotate(cap))
         }
         let seg = ms[i].segment
         let ours = at0[seg].q.rotate(body.segments[seg].tip)
@@ -580,7 +639,8 @@ fn import_into<const S: u32, const D: u32, const P: u32>(
         let turn = if seg == t.pelvis || apart < 0.349066 {
             Quat::identity()
         } else { shortest_arc(normalize(ours), normalize(cap)) }
-        rest_turn.push(turn)
+        // Calibrated: the bone's turn in the frame of standing undone, that frame's heading kept.
+        rest_turn.push(if calib_turns.len() > 0 { calib_turns[b].inverse().mul(heading).mul(turn) } else { turn })
     }
     // The scale: the body's leg (hip to knee to ankle) against the capture's, at rest.
     let u = unit(c.source.as_str())
@@ -656,6 +716,7 @@ fn import_into<const S: u32, const D: u32, const P: u32>(
     var prev = rest
     var dist_sum = 0.0
     var dist_n = 0.0
+    var by_bone: Vec<f32> = Vec::filled(ms.len(), 0.0)
     var out_of_range = 0
     var worst_range = -1.0e9
     for j in 0..n {
@@ -698,8 +759,10 @@ fn import_into<const S: u32, const D: u32, const P: u32>(
             aims.push(aim_floor(sole.segment, sole.point, 0.0, SOLE))
         }
         if j == 0 {
+            // The pelvis's first turn as its aim will have it (its rest's turn too: a calibrated
+            // source's is no turn of the body).
             prev.root = Frame {
-                q: turns[idx[0]].mul(at0[t.pelvis].q),
+                q: turns[idx[0]].mul(rest_turn[0]).mul(at0[t.pelvis].q),
                 t: places[idx[0]] * (u * s) + vec3(0.0, lift, 0.0),
             }
         }
@@ -710,10 +773,10 @@ fn import_into<const S: u32, const D: u32, const P: u32>(
         // How far each mapped joint is from the scaled capture's.
         let at = body.places(prev)
         for i in 0..ms.len() {
-            dist_sum += length(
-                at[ms[i].segment].t - places[idx[i]] * (u * s) - vec3(0.0, lift, 0.0),
-            )
+            let e = length(at[ms[i].segment].t - places[idx[i]] * (u * s) - vec3(0.0, lift, 0.0))
+            dist_sum += e
             dist_n += 1.0
+            by_bone[i] += e
         }
         var worst = -1.0e9
         for sg in 1..S {
@@ -734,7 +797,13 @@ fn import_into<const S: u32, const D: u32, const P: u32>(
     let dir = f"out/{t.name}/{c.source}"
     write_all(f"{dir}/{c.name}.pose", take w.into_bytes())?
     let mm = 1000.0 * dist_sum / max(dist_n, 1.0)
-    let record = f"{{\"source\": \"{c.source}\", \"file\": \"{c.file}\", \"sha256\": \"{digest}\", \"credit\": \"{credit(c.source.as_str())}\", \"body\": \"{t.name}\", \"capture_frames\": [{first}, {last}], \"frames\": {n}, \"rate\": {RATE}, \"seconds\": {f32(n) / RATE}, \"length_scale\": {s}, \"time_scale\": {k}, \"mean_joint_mm\": {mm}, \"frames_out_of_range\": {out_of_range}, \"worst_range\": {worst_range}}}\n"
+    // Each mapped bone's mean distance (mm): where a skeleton's proportions or rest differ.
+    var bones_mm = String::new()
+    for i in 0..ms.len() {
+        let v = 1000.0 * by_bone[i] / f32(max(n, 1))
+        bones_mm.push_str(if i == 0 { f"\"{ms[i].bone}\": {v}" } else { f", \"{ms[i].bone}\": {v}" })
+    }
+    let record = f"{{\"source\": \"{c.source}\", \"file\": \"{c.file}\", \"sha256\": \"{digest}\", \"credit\": \"{credit(c.source.as_str())}\", \"body\": \"{t.name}\", \"capture_frames\": [{first}, {last}], \"frames\": {n}, \"rate\": {RATE}, \"seconds\": {f32(n) / RATE}, \"length_scale\": {s}, \"time_scale\": {k}, \"mean_joint_mm\": {mm}, \"joint_mm_by_bone\": {{{bones_mm}}}, \"frames_out_of_range\": {out_of_range}, \"worst_range\": {worst_range}}}\n"
     write_all(f"{dir}/{c.name}.json", Vec::from(record.as_bytes()))?
     Ok(
         Done {
@@ -788,6 +857,50 @@ fn clips_ceti() -> Result<Vec<Clip>, ToolError> {
         )
     }
     Ok(out)
+}
+
+/// ACCAD's clips: each BVH file of its three performers (`accad/bvh`, from the Open Motion
+/// Project's archives), whole. (Three other files of the archive, of another skeleton, are left out.)
+fn clips_accad() -> Result<Vec<Clip>, ToolError> {
+    var out: Vec<Clip> = Vec::new()
+    var names: Vec<String> = Vec::new()
+    for e in files::list("capture/accad/bvh").wait()? {
+        let n = e.name.as_str()
+        if n.ends_with(".bvh") && (n.starts_with("Female1_") || n.starts_with("Male1_") || n.starts_with("Male2_")) {
+            names.push(e.name.clone())
+        }
+    }
+    names.sort_by(|a, b| a.as_str() < b.as_str())
+    for n in names {
+        out.push(
+            Clip {
+                body: String::new(),
+                steps: STEPS,
+                source: String::from("accad"),
+                file: f"accad/bvh/{n}",
+                name: String::from(n.as_str().slice(0, n.len() - 4)),
+                first: 0,
+                last: 4294967295,
+            },
+        )
+    }
+    Ok(out)
+}
+
+/// The frame a source's skeleton is at rest in, where its rotations all 0 are no pose of a person
+/// (ACCAD's): each performer's first frame of standing (`Female1_A01_Stand`, `Male1_A1_Stand`,
+/// `Male2_A1_Stand`), standing upright with the arms down.
+fn calibration(source: str, name: str) -> Option<String> {
+    if source != "accad" {
+        return None
+    }
+    if name.starts_with("Female1_") {
+        Some(String::from("accad/bvh/Female1_A01_Stand.bvh"))
+    } else if name.starts_with("Male1_") {
+        Some(String::from("accad/bvh/Male1_A1_Stand.bvh"))
+    } else if name.starts_with("Male2_") {
+        Some(String::from("accad/bvh/Male2_A1_Stand.bvh"))
+    } else { None }
 }
 
 /// 100STYLE's clips: each style's takes, each cut to its clean frames (`Frame_Cuts.csv`).
@@ -1073,6 +1186,8 @@ pub fn tool() -> u32 {
         clips_embm()
     } else if source == "ceti" {
         clips_ceti()
+    } else if source == "accad" {
+        clips_accad()
     } else {
         Err(ToolError::new("unknown source"))
     }) else {
