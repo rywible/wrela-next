@@ -63,7 +63,7 @@ pub const SLOT_MARGIN: u32 = 55
 /// How much finer a pixel than the one a certificate or a thin cell's proof was made for the eye
 /// may come before it is made again: each is made for `WATCH_SLACK` of the pixel it is first
 /// needed for, so an eye coming nearer does not ask again each frame.
-pub const WATCH_SLACK: f32 = 1.0
+pub const WATCH_SLACK: f32 = 0.75
 
 /// The place of corner `c` (in a brick, `0..8`) of the brick in slot `s`: `grid::lattice`'s sum,
 /// bit for bit.
@@ -92,7 +92,7 @@ fn marked(bits: mut Atomics<u32>, slot: u32, set: u32, cell: u32) -> bool {
 /// Clears this frame's sets of each live slot (`SLOT_LINE`, `SLOT_EXACT`, `SLOT_CERT`).
 @strict
 @compute(64)
-pub(package) fn clear_watch(slots: u32, bits: mut Atomics<u32>, id: GlobalId) {
+pub(package) fn forget_frame(slots: u32, bits: mut Atomics<u32>, id: GlobalId) {
     let per = SLOT_BESIDE - SLOT_LINE
     let s = id.x / per
     if s >= slots {
@@ -215,18 +215,18 @@ pub(package) fn outline_quads(
     }
 }
 
-/// Each outline cell put up for a certificate (`outline_quads`): certified (`certify_sheet`, the
-/// surface in the cell within a slab a pixel wide about its vertex's plane) for a pixel no finer
-/// than this frame's there, or given an exact cell. A vertex's certificate is kept in `vert_cert`
-/// as the slab's width it was made for (or that width less than 0 where it failed): one made for
-/// a slab no wider than this frame's needs holds, one that failed for a slab no narrower fails,
-/// and else it is made again, for `WATCH_SLACK` of this frame's.
+/// Each outline cell put up for a certificate (`outline_quads`), held to what its vertex's
+/// certificate says (`vert_cert`: the slab's width it was made for, or that width less than 0
+/// where it failed): one made for a slab no wider than this frame's needs (`2 HOLE_PX` pixels)
+/// holds, and the cell needs nothing; one that failed for a slab no narrower fails, and the cell
+/// is given an exact cell; any other (none made yet, or made for an eye farther off) is put up to
+/// be made again (`due`: its place in `cert_cands`), so the costly certificates of a frame are of
+/// the few its eye's move left unsaid, asked together.
 @strict
 @compute(64)
-pub(package) fn certify_watched<M: Field<Substance>>(
+pub(package) fn cert_due<M: Field<Substance>>(
     fields: [M],
     slots: [SlotBrick],
-    verts: [MeshVertex],
     cert_cands: [vec2u],
     cert_count: [u32],
     cap: u32,
@@ -234,9 +234,10 @@ pub(package) fn certify_watched<M: Field<Substance>>(
     origin: vec3,
     shift: vec3,
     eye: vec4,
-    vert_cert: mut Atomics<u32>,
+    vert_cert: [u32],
     bits: mut Atomics<u32>,
     exact_cells: mut Append<ExactCell>,
+    due: mut Append<u32>,
     id: GlobalId,
 ) {
     let i = first + id.x
@@ -248,35 +249,72 @@ pub(package) fn certify_watched<M: Field<Substance>>(
     let slot = packed >> 9
     let cell = packed & 511
     let s = slots[slot]
-    let lo = slot_corner(s, origin, shift, cell3(cell))
-    let px = length(eye.xyz - (lo + vec3(0.5 * s.cell))) * eye.w
-    let need = 2.0 * HOLE_PX * px
-    let f = fields[s.orig]
     if vi != NONE {
-        let kept = bitcast_f32(vert_cert.load(i: vi))
+        let lo = slot_corner(s, origin, shift, cell3(cell))
+        let need = 2.0 * HOLE_PX * length(eye.xyz - (lo + vec3(0.5 * s.cell))) * eye.w
+        let kept = bitcast_f32(vert_cert[vi])
         if kept > 0.0 && kept <= need {
             return
         }
         if !(kept < 0.0 && -kept >= need) {
-            let w = WATCH_SLACK * need
-            let v = verts[vi]
-            let ok = certify_sheet(
-                fields,
-                s.orig,
-                s.live,
-                lo,
-                s.cell,
-                vec3(v.px, v.py, v.pz),
-                unpack_oct_normal(v.packed),
-                w,
-            )
-            vert_cert.store(i: vi, value: bitcast_u32(if ok { w } else { -need }))
-            if ok {
-                return
-            }
+            let _ = due.push(i)
+            return
         }
     }
-    exact_once(f, s, slot, cell, origin, shift, mut bits, mut exact_cells)
+    exact_once(fields[s.orig], s, slot, cell, origin, shift, mut bits, mut exact_cells)
+}
+
+/// Each outline cell `cert_due` put up: certified (`certify_sheet`, the surface in the cell
+/// within a slab about its vertex's plane) for `WATCH_SLACK` of this frame's pixel (so it holds
+/// while the eye comes no nearer than that), or given an exact cell; what it found kept in
+/// `vert_cert`.
+@strict
+@compute(64)
+pub(package) fn certify_watched<M: Field<Substance>>(
+    fields: [M],
+    slots: [SlotBrick],
+    verts: [MeshVertex],
+    cert_cands: [vec2u],
+    due: [u32],
+    due_count: [u32],
+    cap: u32,
+    first: u32,
+    origin: vec3,
+    shift: vec3,
+    eye: vec4,
+    vert_cert: mut Atomics<u32>,
+    bits: mut Atomics<u32>,
+    exact_cells: mut Append<ExactCell>,
+    id: GlobalId,
+) {
+    let i = first + id.x
+    if i >= min(due_count[0], cap) {
+        return
+    }
+    let at = due[i]
+    let packed = cert_cands[at].x
+    let vi = cert_cands[at].y
+    let slot = packed >> 9
+    let cell = packed & 511
+    let s = slots[slot]
+    let lo = slot_corner(s, origin, shift, cell3(cell))
+    let need = 2.0 * HOLE_PX * length(eye.xyz - (lo + vec3(0.5 * s.cell))) * eye.w
+    let w = WATCH_SLACK * need
+    let v = verts[vi]
+    let ok = certify_sheet(
+        fields,
+        s.orig,
+        s.live,
+        lo,
+        s.cell,
+        vec3(v.px, v.py, v.pz),
+        unpack_oct_normal(v.packed),
+        w,
+    )
+    vert_cert.store(i: vi, value: bitcast_u32(if ok { w } else { -need }))
+    if !ok {
+        exact_once(fields[s.orig], s, slot, cell, origin, shift, mut bits, mut exact_cells)
+    }
 }
 
 /// The core of cell `cell` of slot `s` for the eye `eye` (`filter_thin_cells`' core: the cell
@@ -490,7 +528,7 @@ pub(package) fn stale_beside(
 /// Zeroes `words`.
 @strict
 @compute(64)
-pub(package) fn clear_words(words: mut Slots<u32>, id: GlobalId) {
+pub(package) fn zero_words(words: mut Slots<u32>, id: GlobalId) {
     words[id] = 0
 }
 
@@ -545,16 +583,18 @@ pub(package) fn uncertified<M: Field<Substance>>(
     cert_cands: [vec2u],
     cert_count: [u32],
     cap: u32,
+    first: u32,
     origin: vec3,
     shift: vec3,
     bits: mut Atomics<u32>,
     exact_cells: mut Append<ExactCell>,
     id: GlobalId,
 ) {
-    if id.x >= min(cert_count[0], cap) {
+    let i = first + id.x
+    if i >= min(cert_count[0], cap) {
         return
     }
-    let packed = cert_cands[id.x].x
+    let packed = cert_cands[i].x
     let slot = packed >> 9
     let s = slots[slot]
     exact_once(fields[s.orig], s, slot, packed & 511, origin, shift, mut bits, mut exact_cells)

@@ -21,7 +21,7 @@ use mesh::emit::{
     write_brick_meta, zero_chunk_counts,
 }
 use mesh::outline::{
-    SLOT_BESIDE, SLOT_LINE, SLOT_WORDS, SlotBrick, stale_beside, certify_watched, uncertified, clear_watch, clear_words, keep_slots, outline_quads,
+    SLOT_BESIDE, SLOT_LINE, SLOT_WORDS, SlotBrick, cert_due, stale_beside, certify_watched, uncertified, forget_frame, zero_words, keep_slots, outline_quads,
     thin_due, thin_watched, thin_watched_octants,
 }
 use mesh::grid::{
@@ -181,15 +181,17 @@ fn thin_most(slice: u32, cells: u32) -> u32 {
     clamp((cells + slice - 1) / max(slice, 1), 1, SLICES_MOST)
 }
 
-/// How far past a cell asked for (in levels) the level kept for it may be before it moves to
-/// the asked one's nearest (`snapped_level`).
-pub const LEVEL_SLACK: f32 = 0.75
+/// How far from a cell asked for (in levels: powers of two) the cell kept for it may be before it
+/// moves to the one asked (`snapped_level`).
+pub const LEVEL_SLACK: f32 = 0.25
 
-/// The power of two (its exponent) a cell `h` wide is meshed at, `prev` the last (0 for none):
-/// kept while `h` is within `LEVEL_SLACK` levels of it.
+/// The cell (its exponent, a level) a cell asked `h` wide is meshed at, `prev` the last (0 for
+/// none): kept while `h` is within `LEVEL_SLACK` of it, else `h`. (Snapped to whole powers of
+/// two, the CSG-cut column's full audit held 51 to 81 holes at its eyes 5 and 12, its certified
+/// outline cells' quads short of the outline, which cells as asked do not: an open fault.)
 fn snapped_level(h: f32, prev: f32) -> f32 {
     let k = log2(max(h, 1.0e-6))
-    if prev != 0.0 && abs(k - prev) < LEVEL_SLACK { prev } else { round(k) }
+    if prev != 0.0 && abs(k - prev) < LEVEL_SLACK { prev } else { k }
 }
 
 /// A view-fitted mesh's slack (`MeshBatch::sync_one_lod`): its rings reach `FIT_REACH` times as
@@ -575,6 +577,7 @@ pub struct MeshBatch {
     thin_keep: AppendBuffer<u32>,
     thin_proof: GpuBuffer<u32>,
     thin_due: AppendBuffer<u32>,
+    cert_due: AppendBuffer<u32>,
     vert_cert: GpuBuffer<u32>,
     exact_base: GpuBuffer<u32>,
     watch_slots_cap: u32,
@@ -591,11 +594,13 @@ pub struct MeshBatch {
     watch_counts: GpuBuffer<u32>,
     watch_poll: Option<Pending<u32>>,
     pub watch_hint: vec3u,
+    watch_hint_cands: u32,
     /// The exact cells the last watch read back had, the extraction's and its own.
     pub watch_exact: u32,
     pub watch_split: vec3u,
     watch_known: bool,
     watch_taken: vec3u,
+    watch_taken_cands: u32,
     watch_short: bool,
     stat_extractions: u32,
     stat_reads: u32,
@@ -801,6 +806,7 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
         thin_keep: append_buffer(1),
         thin_proof: buffer(1),
         thin_due: append_buffer(1),
+        cert_due: append_buffer(CAP_SURF),
         vert_cert: buffer(1),
         exact_base: buffer(1),
         watch_slots_cap: 1,
@@ -813,10 +819,12 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
         watch_counts: buffer(8),
         watch_poll: None,
         watch_hint: vec3u(0, 0, 0),
+        watch_hint_cands: 0,
         watch_exact: 0,
         watch_split: vec3u(0, 0, 0),
         watch_known: false,
         watch_taken: vec3u(0, 0, 0),
+        watch_taken_cands: 0,
         watch_short: false,
         stat_extractions: 0,
         stat_reads: 0,
@@ -1083,7 +1091,7 @@ impl MeshBatch {
         let slots = self.cpu_brick_slots
         self.exact_cells.count_from(self.exact_base.items())
         dispatch(
-            clear_watch.bind(slots: slots, bits: mut self.watch_bits),
+            forget_frame.bind(slots: slots, bits: mut self.watch_bits),
             over: slots * (SLOT_BESIDE - SLOT_LINE),
         )
         dispatch(
@@ -1136,7 +1144,8 @@ impl MeshBatch {
             slots: self.slot_bricks.items(),
             verts: self.verts.items(),
             cert_cands: scratch.cert_cands.items(),
-            cert_count: scratch.cert_cands.count(),
+            due: self.cert_due.items(),
+            due_count: self.cert_due.count(),
             cap: CAP_SURF,
             first: 0,
             origin: self.watch_origin,
@@ -1150,64 +1159,112 @@ impl MeshBatch {
         let certifies = cert_w <= limits().lane_work
         let cert_slice = lane_slice(cert_w, most: CERT_SLICE)
         let cert_slices = if certifies { self.watch_slices(self.watch_hint.x, cert_slice, CAP_SURF) } else { 0 }
-        if !certifies {
-            // Its certificate is past what an invocation may do here: its outline cells are solved.
-            dispatch(
-                prep_slices.bind(
-                    count: scratch.cert_cands.count(),
-                    cap: CAP_SURF,
-                    most: CAP_SURF,
-                    slices: 1,
-                    args: scratch.surf_args.span_mut(start: 0, count: 1),
-                ),
-                over: 1,
-            )
-            dispatch(
-                uncertified.bind(
-                    fields: fields,
-                    slots: self.slot_bricks.items(),
-                    cert_cands: scratch.cert_cands.items(),
-                    cert_count: scratch.cert_cands.count(),
-                    cap: CAP_SURF,
-                    origin: self.watch_origin,
-                    shift: self.watch_shift,
-                    bits: mut self.watch_bits,
-                    exact_cells: mut self.exact_cells,
-                ),
-                groups: scratch.surf_args.at(0),
-                most: (CAP_SURF + 63) / 64,
-            )
-        }
+        // The candidates read in slices as their kernels' bounds let a dispatch hold (each may
+        // give an exact cell, whose live parts are asked of the field).
+        let read_k = cert_due.bind(
+            fields: fields,
+            slots: self.slot_bricks.items(),
+            cert_cands: scratch.cert_cands.items(),
+            cert_count: scratch.cert_cands.count(),
+            cap: CAP_SURF,
+            first: 0,
+            origin: self.watch_origin,
+            shift: self.watch_shift,
+            eye: eye,
+            vert_cert: self.vert_cert.items(),
+            bits: mut self.watch_bits,
+            exact_cells: mut self.exact_cells,
+            due: mut self.cert_due,
+        )
+        let read_slice = lane_slice(kernel_work(read_k), most: CAP_SURF)
+        let read_slices = self.watch_slices(self.watch_hint_cands, read_slice, CAP_SURF)
         dispatch(
             prep_slices.bind(
                 count: scratch.cert_cands.count(),
                 cap: CAP_SURF,
-                most: cert_slice,
-                slices: cert_slices,
-                args: scratch.crease_args.span_mut(start: 0, count: cert_slices),
+                most: read_slice,
+                slices: read_slices,
+                args: scratch.seam_args.span_mut(start: 0, count: read_slices),
             ),
-            over: cert_slices,
+            over: read_slices,
         )
-        for k in 0..cert_slices {
+        if certifies {
+            // The cached certificates read; the cells left unsaid put up (`cert_due`), and those
+            // certified.
+            self.cert_due.clear()
+            for k in 0..read_slices {
+                dispatch(
+                    cert_due.bind(
+                        fields: fields,
+                        slots: self.slot_bricks.items(),
+                        cert_cands: scratch.cert_cands.items(),
+                        cert_count: scratch.cert_cands.count(),
+                        cap: CAP_SURF,
+                        first: k * read_slice,
+                        origin: self.watch_origin,
+                        shift: self.watch_shift,
+                        eye: eye,
+                        vert_cert: self.vert_cert.items(),
+                        bits: mut self.watch_bits,
+                        exact_cells: mut self.exact_cells,
+                        due: mut self.cert_due,
+                    ),
+                    groups: scratch.seam_args.at(k),
+                    most: read_slice / 64,
+                )
+            }
             dispatch(
-                certify_watched.bind(
-                    fields: fields,
-                    slots: self.slot_bricks.items(),
-                    verts: self.verts.items(),
-                    cert_cands: scratch.cert_cands.items(),
-                    cert_count: scratch.cert_cands.count(),
+                prep_slices.bind(
+                    count: self.cert_due.count(),
                     cap: CAP_SURF,
-                    first: k * cert_slice,
-                    origin: self.watch_origin,
-                    shift: self.watch_shift,
-                    eye: eye,
-                    vert_cert: mut self.vert_cert,
-                    bits: mut self.watch_bits,
-                    exact_cells: mut self.exact_cells,
+                    most: cert_slice,
+                    slices: cert_slices,
+                    args: scratch.crease_args.span_mut(start: 0, count: cert_slices),
                 ),
-                groups: scratch.crease_args.at(k),
-                most: cert_slice / 64,
+                over: cert_slices,
             )
+            for k in 0..cert_slices {
+                dispatch(
+                    certify_watched.bind(
+                        fields: fields,
+                        slots: self.slot_bricks.items(),
+                        verts: self.verts.items(),
+                        cert_cands: scratch.cert_cands.items(),
+                        due: self.cert_due.items(),
+                        due_count: self.cert_due.count(),
+                        cap: CAP_SURF,
+                        first: k * cert_slice,
+                        origin: self.watch_origin,
+                        shift: self.watch_shift,
+                        eye: eye,
+                        vert_cert: mut self.vert_cert,
+                        bits: mut self.watch_bits,
+                        exact_cells: mut self.exact_cells,
+                    ),
+                    groups: scratch.crease_args.at(k),
+                    most: cert_slice / 64,
+                )
+            }
+        } else {
+            // Its certificate is past what an invocation may do here: its outline cells are solved.
+            for k in 0..read_slices {
+                dispatch(
+                    uncertified.bind(
+                        fields: fields,
+                        slots: self.slot_bricks.items(),
+                        cert_cands: scratch.cert_cands.items(),
+                        cert_count: scratch.cert_cands.count(),
+                        cap: CAP_SURF,
+                        first: k * read_slice,
+                        origin: self.watch_origin,
+                        shift: self.watch_shift,
+                        bits: mut self.watch_bits,
+                        exact_cells: mut self.exact_cells,
+                    ),
+                    groups: scratch.seam_args.at(k),
+                    most: read_slice / 64,
+                )
+            }
         }
         copy(from: self.exact_cells.count().sub(start: 0, count: 1), to: self.watch_counts.span_mut(start: 5, count: 1))
         // The thin cells beside the outline (`keep` 0), then the kept ones (`keep` 1).
@@ -1226,11 +1283,13 @@ impl MeshBatch {
             over: 1,
         )
         copy(from: self.exact_base.items(), to: self.watch_counts.span_mut(start: 4, count: 1))
-        copy(from: scratch.cert_cands.count().sub(start: 0, count: 1), to: self.watch_counts.span_mut(start: 0, count: 1))
+        copy(from: self.cert_due.count().sub(start: 0, count: 1), to: self.watch_counts.span_mut(start: 0, count: 1))
+        copy(from: scratch.cert_cands.count().sub(start: 0, count: 1), to: self.watch_counts.span_mut(start: 7, count: 1))
         copy(from: scratch.thin_cands.count().sub(start: 0, count: 1), to: self.watch_counts.span_mut(start: 1, count: 1))
         copy(from: self.thin_due.count().sub(start: 0, count: 1), to: self.watch_counts.span_mut(start: 2, count: 1))
         copy(from: self.exact_cells.count().sub(start: 0, count: 1), to: self.watch_counts.span_mut(start: 3, count: 1))
         self.watch_taken = vec3u(if certifies { cert_slices * cert_slice } else { CAP_SURF }, dilated, kept)
+        self.watch_taken_cands = read_slices * read_slice
         self.has_exact = true
     }
 
@@ -1410,11 +1469,12 @@ impl MeshBatch {
             Some(p) => match p.poll() {
                 Some(Ok(c)) => {
                     self.watch_hint = vec3u(c[0], c[1], c[2])
+                    self.watch_hint_cands = c[7]
                     self.watch_exact = c[3]
                     self.watch_split = vec3u(c[4], c[5], c[6])
                     self.watch_known = true
                     self.watch_short = c[0] > self.watch_taken.x || c[1] > self.watch_taken.y ||
-                        c[2] > self.watch_taken.z
+                        c[2] > self.watch_taken.z || c[7] > self.watch_taken_cands
                     self.watch_poll = None
                 },
                 Some(Err(_)) => {
@@ -3776,8 +3836,8 @@ impl MeshBatch {
             self.ensure_watch()
             self.quad_recs.clear()
             self.thin_keep.clear()
-            dispatch(clear_words.bind(words: self.vert_cert.items_mut()), over: self.watch_verts_cap)
-            dispatch(clear_words.bind(words: self.thin_proof.items_mut()), over: self.watch_verts_cap)
+            dispatch(zero_words.bind(words: self.vert_cert.items_mut()), over: self.watch_verts_cap)
+            dispatch(zero_words.bind(words: self.thin_proof.items_mut()), over: self.watch_verts_cap)
             self.watch_origin = scratch.origin0
             self.watch_shift = scratch.lattice
         }

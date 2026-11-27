@@ -1614,3 +1614,121 @@ fn two_level_super_cull_matches_flat_cull() {
     }
     assert(flat_hits > 0 && flat_hits == super_hits, f"flat={flat_hits} super={super_hits}")
 }
+
+/// How far the mesh `tris` of `f` stands from `f`'s surface, both ways, and how far its normals
+/// turn from the field's (the slow reference the mesh's error is held to: docs/plans/
+/// build-time-engine-4d.md, phase 3 stage B). Mesh to surface: at points across each triangle,
+/// the field's distance there (exact for a distance). Surface to mesh: points of the surface (a
+/// lattice `step` apart, each taken onto the surface by Newton's steps), each to its nearest
+/// triangle. Normals: each triangle's against the field's gradient at its centroid, in radians.
+/// `(mesh to surface, surface to mesh, the most normal error)`.
+fn two_sided<M: Field<Substance>>(f: M, tris: Vec<Tri>, lo: vec3, hi: vec3, step: f32) -> vec3 {
+    var m2s = 0.0
+    var turn = 0.0
+    var pts: Vec<vec3> = Vec::new()
+    for i in 0..tris.len() {
+        let a = vec3(bitcast_f32(tris[i].a.x), bitcast_f32(tris[i].a.y), bitcast_f32(tris[i].a.z))
+        let b = vec3(bitcast_f32(tris[i].b.x), bitcast_f32(tris[i].b.y), bitcast_f32(tris[i].b.z))
+        let c = vec3(bitcast_f32(tris[i].c.x), bitcast_f32(tris[i].c.y), bitcast_f32(tris[i].c.z))
+        for k in 0..6 {
+            let u = [0.333, 0.8, 0.1, 0.1, 0.45, 0.45][k]
+            let v = [0.333, 0.1, 0.8, 0.1, 0.45, 0.1][k]
+            m2s = max(m2s, abs(f.distance(a + (b - a) * u + (c - a) * v)))
+        }
+        let n = cross(b - a, c - a)
+        if dot(n, n) > 1.0e-14 {
+            let (_d, g) = value_and_gradient(|q: vec3| f.distance(q), (a + b + c) * (1.0 / 3.0))
+            if dot(g, g) > 1.0e-12 {
+                turn = max(turn, acos(clamp(dot(normalize(n), normalize(g)), -1.0, 1.0)))
+            }
+        }
+    }
+    // Surface points: lattice points within a step of the surface, taken onto it.
+    let n3 = vec3u(u32(ceil((hi.x - lo.x) / step)), u32(ceil((hi.y - lo.y) / step)), u32(ceil((hi.z - lo.z) / step)))
+    for k in 0..n3.x * n3.y * n3.z {
+        let p0 = lo + vec3(f32(k % n3.x), f32((k / n3.x) % n3.y), f32(k / (n3.x * n3.y))) * step
+        if abs(f.distance(p0)) < step {
+            var p = p0
+            for _ in 0..6 {
+                let (d, g) = value_and_gradient(|q: vec3| f.distance(q), p)
+                let gg = dot(g, g)
+                if gg > 1.0e-12 {
+                    p = p - g * (d / gg)
+                }
+            }
+            if abs(f.distance(p)) < 1.0e-5 {
+                pts.push(p)
+            }
+        }
+    }
+    var s2m = 0.0
+    for j in 0..pts.len() {
+        let p = pts[j]
+        var best = 1.0e30
+        for i in 0..tris.len() {
+            let a = vec3(bitcast_f32(tris[i].a.x), bitcast_f32(tris[i].a.y), bitcast_f32(tris[i].a.z))
+            let b = vec3(bitcast_f32(tris[i].b.x), bitcast_f32(tris[i].b.y), bitcast_f32(tris[i].b.z))
+            let c = vec3(bitcast_f32(tris[i].c.x), bitcast_f32(tris[i].c.y), bitcast_f32(tris[i].c.z))
+            if length(p - a) < best + 4.0 * step {
+                best = min(best, point_triangle(p, a, b, c))
+            }
+        }
+        s2m = max(s2m, best)
+    }
+    vec3(m2s, s2m, turn)
+}
+
+/// The distance from `p` to the triangle `(a, b, c)`.
+fn point_triangle(p: vec3, a: vec3, b: vec3, c: vec3) -> f32 {
+    let n = cross(b - a, c - a)
+    let nn = dot(n, n)
+    if nn > 1.0e-20 {
+        // Inside the triangle's prism, the plane's distance.
+        let q = p - n * (dot(p - a, n) / nn)
+        let w0 = dot(cross(b - a, q - a), n)
+        let w1 = dot(cross(c - b, q - b), n)
+        let w2 = dot(cross(a - c, q - c), n)
+        if w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0 {
+            return abs(dot(p - a, n)) / sqrt(nn)
+        }
+    }
+    min(point_segment(p, a, b), min(point_segment(p, b, c), point_segment(p, c, a)))
+}
+
+fn point_segment(p: vec3, a: vec3, b: vec3) -> f32 {
+    let ba = b - a
+    let h = clamp(dot(p - a, ba) / max(dot(ba, ba), 1.0e-20), 0.0, 1.0)
+    length(p - a - ba * h)
+}
+
+/// The mesh of a smooth field stands within its cells of the field both ways (mesh to surface,
+/// surface to mesh: a Hausdorff distance), and turns its normals little, held by the slow
+/// reference (`two_sided`): a sphere and a blob at 4 cm and 2 cm cells, each within a tenth of a
+/// cell, and within 0.2 rad of the field's normal.
+@test
+@fuel(2 ** 44)
+fn a_smooth_fields_mesh_is_within_a_tenth_of_a_cell_both_ways() {
+    let ball = sphere(0.5).with(lambert(vec3(0.5)))
+    let blob = ellipsoid(vec3(0.45, 0.3, 0.32))
+        .smooth_union(sphere(0.18).translate(vec3(0.38, 0.22, 0.0)), k: 0.12)
+        .with(lambert(vec3(0.5)))
+    for k in 0..2 {
+        let h = 0.04 * exp2(-f32(k))
+        for which in 0..2 {
+            let g = if which == 0 {
+                grid_for(tight_aabb(ball), h, base_brick: 0, orig_id: 0, shift: placement(k))
+            } else {
+                grid_for(tight_aabb(blob), h, base_brick: 0, orig_id: 0, shift: placement(k))
+            }
+            let e = if which == 0 {
+                two_sided(ball, mesh_bricked(ball, g), vec3(-0.6), vec3(0.6), 2.0 * h)
+            } else {
+                two_sided(blob, mesh_bricked(blob, g), vec3(-0.6), vec3(0.75), 2.0 * h)
+            }
+            let name = if which == 0 { "sphere" } else { "blob" }
+            print(f"two-sided: {name} at {h * 1000.0} mm cells: mesh to surface {e.x / h} cells, surface to mesh {e.y / h} cells, normal {e.z} rad")
+            assert(e.x <= 0.1 * h && e.y <= 0.1 * h, f"the {name}'s mesh is within a tenth of a cell both ways")
+            assert(e.z <= 0.2, f"the {name}'s mesh's normals turn {e.z} rad")
+        }
+    }
+}
