@@ -48,11 +48,17 @@ pub struct SlotBrick: Copy + GpuData {
 /// The words a slot keeps of its cells (343 of them, a bit each, 11 words): those all of whose
 /// corners are outside (`SLOT_OUT`), and this frame's outline cells (`SLOT_LINE`), cells given an
 /// exact cell (`SLOT_EXACT`) and outline cells put up for a certificate (`SLOT_CERT`).
-pub const SLOT_WORDS: u32 = 44
+pub const SLOT_WORDS: u32 = 56
 pub const SLOT_OUT: u32 = 0
 pub const SLOT_LINE: u32 = 11
 pub const SLOT_EXACT: u32 = 22
 pub const SLOT_CERT: u32 = 33
+/// And, kept from frame to frame: the all-outside cells beside an outline whose core its
+/// enclosure proved empty (`SLOT_BESIDE`), and the widest margin such a proof was made at
+/// (`SLOT_MARGIN`, an `f32`'s bits): each holds while the slot's cells' margins are no
+/// narrower (`stale_beside` clears them where the eye has come nearer).
+pub const SLOT_BESIDE: u32 = 44
+pub const SLOT_MARGIN: u32 = 55
 
 /// How much finer a pixel than the one a certificate or a thin cell's proof was made for the eye
 /// may come before it is made again: each is made for `WATCH_SLACK` of the pixel it is first
@@ -87,7 +93,7 @@ fn marked(bits: mut Atomics<u32>, slot: u32, set: u32, cell: u32) -> bool {
 @strict
 @compute(64)
 pub(package) fn clear_watch(slots: u32, bits: mut Atomics<u32>, id: GlobalId) {
-    let per = SLOT_WORDS - SLOT_LINE
+    let per = SLOT_BESIDE - SLOT_LINE
     let s = id.x / per
     if s >= slots {
         return
@@ -199,7 +205,8 @@ pub(package) fn outline_quads(
                 if (up && at < BRICK) || (!up && at > 0) {
                     let step = if axis == 0 { 1 } else if axis == 1 { 7 } else { 49 }
                     let n = if up { cell + step } else { cell - step }
-                    if marked(mut bits, slot, SLOT_OUT, n) && mark(mut bits, slot, SLOT_LINE, n) {
+                    if marked(mut bits, slot, SLOT_OUT, n) && mark(mut bits, slot, SLOT_LINE, n) &&
+                        !marked(mut bits, slot, SLOT_BESIDE, n) {
                         let _ = thin_cands.push((slot << 9) | n)
                     }
                 }
@@ -302,6 +309,7 @@ pub(package) fn thin_watched<M: Field<Substance>>(
     eye: vec4,
     keep: u32,
     thin_proof: mut Atomics<u32>,
+    bits: mut Atomics<u32>,
     thin_masks: mut Slots<u32>,
     id: GlobalId,
 ) {
@@ -339,6 +347,11 @@ pub(package) fn thin_watched<M: Field<Substance>>(
     if keep != 0 {
         // Proven empty for now, until an octant (`thin_watched_octants`) finds it isn't.
         thin_proof.store(i: at, value: bitcast_u32(mt))
+    } else if mask == 0 {
+        // A cell beside the outline the whole's form proved empty: kept, while it holds.
+        let slot = packed >> 9
+        let _ = bits.or(i: slot * SLOT_WORDS + SLOT_BESIDE + (cell >> 5), value: 1 << (cell & 31))
+        let _ = bits.max(i: slot * SLOT_WORDS + SLOT_MARGIN, value: bitcast_u32(mt))
     }
     thin_masks[id] = mask
 }
@@ -433,7 +446,45 @@ pub(package) fn keep_slots(
     let slot = slot_base + bi
     for w in 0..11 {
         bits.store(i: slot * SLOT_WORDS + SLOT_OUT + w, value: 0)
+        bits.store(i: slot * SLOT_WORDS + SLOT_BESIDE + w, value: 0)
     }
+    bits.store(i: slot * SLOT_WORDS + SLOT_MARGIN, value: 0)
+}
+
+/// Each live slot whose beside proofs (`SLOT_BESIDE`) may no longer hold for the eye `eye`: its
+/// nearest cell's margin narrower than the widest it proved one at (`SLOT_MARGIN`). Its proofs
+/// are forgotten, to be made again for this eye.
+@strict
+@compute(64)
+pub(package) fn stale_beside(
+    count: u32,
+    slots: [SlotBrick],
+    alive: [u32],
+    origin: vec3,
+    shift: vec3,
+    eye: vec4,
+    bits: mut Atomics<u32>,
+    id: GlobalId,
+) {
+    let slot = id.x
+    if slot >= count || alive[slot] == 0 {
+        return
+    }
+    let kept = bitcast_f32(bits.load(i: slot * SLOT_WORDS + SLOT_MARGIN))
+    if !(kept > 0.0) {
+        return
+    }
+    let s = slots[slot]
+    let lo = slot_corner(s, origin, shift, vec3u(0, 0, 0))
+    let side = s.cell * f32(BRICK + 1)
+    let near = length(max(max(lo - eye.xyz, eye.xyz - (lo + vec3(side))), vec3(0.0)))
+    if 0.5 * HOLE_PX * near * eye.w >= kept {
+        return
+    }
+    for w in 0..11 {
+        bits.store(i: slot * SLOT_WORDS + SLOT_BESIDE + w, value: 0)
+    }
+    bits.store(i: slot * SLOT_WORDS + SLOT_MARGIN, value: 0)
 }
 
 /// Zeroes `words`.

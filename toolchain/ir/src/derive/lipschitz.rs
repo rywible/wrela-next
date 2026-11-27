@@ -2272,6 +2272,16 @@ impl Lip<'_> {
                 self.vals.insert(v, r);
                 return Ok(());
             }
+            if matches!(known, Some(Known::WaveCos | Known::WaveSin))
+                && mask[1] == 0
+                && mask[2] == 0
+                && let (Arg::Value(r0), Arg::Value(n)) = (&args[1], &args[2])
+            {
+                let at = self.arg_lval(out, &args[0])?;
+                let r = self.wave(out, at, *r0, *n);
+                self.vals.insert(v, r);
+                return Ok(());
+            }
             if known == Some(Known::Smax)
                 && mask[2] == 0
                 && let (Arg::Value(a), Arg::Value(b), Arg::Value(k)) =
@@ -2369,6 +2379,35 @@ impl Lip<'_> {
             j_hi.push(jh);
         }
         LVal { lo, hi, j_lo, j_hi, lip: a.lip }
+    }
+
+    /// `wave_cos(v, r0, n)` or `wave_sin` (`r0` and `n` inactive): in `[-1, 1]`, its gradient
+    /// `n / r0` long at most times `v`'s (round the origin `n` turns of the angle, whose gradient
+    /// is `1 / |v|`, no more than `1 / r0` where it isn't faded; inside `r0`, `(|v| / r0)^n`'s,
+    /// `n |v|^(n-1) / r0^n`, again no more than `n / r0`).
+    fn wave(&mut self, out: &mut Block, v: LVal, r0: ValueId, n: ValueId) -> LVal {
+        let f = self.f32_ty;
+        let vt = self.ty(v.lo);
+        let nf = self.emit(out, f, Expr::Convert(n, Scalar::F32));
+        let least = self.kf(out, 1.0e-30);
+        let r = self.builtin(out, Builtin::Max, vec![r0, least], f);
+        let g = self.bin(out, BinOp::Div, nf, r, f);
+        let g = self.pad_up(out, g, 8.0);
+        let mut j_lo = Vec::with_capacity(self.n);
+        let mut j_hi = Vec::with_capacity(self.n);
+        for i in 0..self.n {
+            let col = self.vec_len_hi(out, (v.j_lo[i], v.j_hi[i]), vt);
+            let b = self.bin(out, BinOp::Mul, g, col, f);
+            let b = self.pad_up(out, b, 8.0);
+            j_lo.push(self.emit(out, f, Expr::Unary(UnOp::Neg, b)));
+            j_hi.push(b);
+        }
+        let raw = self.bin(out, BinOp::Mul, g, v.lip, f);
+        let raw = self.pad_up(out, raw, 8.0);
+        let lip = self.tighten(out, raw, &j_lo, &j_hi, f);
+        let lo = self.kf(out, -1.0);
+        let hi = self.kf(out, 1.0);
+        LVal { lo, hi, j_lo, j_hi, lip }
     }
 
     /// [`Self::smin`] of operands already derived.

@@ -1,0 +1,177 @@
+// When two moving things first touch: the earliest moment within a span of time that some point
+// is inside both, found from the compiler's ranges over space and time together
+// (`std::derive::interval` of a `vec4`'s function), never from samples alone.
+//
+// A box of space and time where the greater of the two distances is above 0 everywhere holds no
+// contact: it is put aside. What is left is halved, earliest first, in time and in space, until the
+// earliest box left is a moment no wider than `moment` and a box of space no wider than `size`
+// (or the steps run out): its start is the
+// earliest the contact can be (`Contact::enter`), and a point of it where both distances are below
+// 0 says the contact is there (`Contact::sure`). Every step is the same on every machine: the same
+// boxes, halved in the same order, so two machines agree on `enter` to the bit.
+
+use std::collections::Vec
+use std::derive::{Box3, Box4, interval}
+use std::field::Surface
+
+/// Where and when two things first touch (`contact`): whether the span can hold a contact at all
+/// (`found`: false where every box was proven to hold none), the earliest moment it can be
+/// (`enter`) and the box of space that is in, and whether a point inside both was found
+/// (`sure`), at the moment `leave`: the contact is between `enter` and `leave`.
+pub struct Contact: Copy {
+    pub found: bool,
+    pub sure: bool,
+    pub enter: f32,
+    pub leave: f32,
+    pub at: Box3,
+    /// The boxes asked, of the most it may ask.
+    pub steps: u32,
+}
+
+/// The most boxes `contact` asks, a step each: a bound of steps, never of time.
+pub const CONTACT_STEPS: u32 = 16384
+
+/// The earliest moment from `from` to `to` that `a(t)` and `b(t)` share a point inside `region`
+/// (`Contact`), to a moment `moment` s wide: the boxes of `region` and the span, halved earliest
+/// first, each put aside where the compiler's range of `max(a, b)` over it is above 0, until the
+/// earliest left is `moment` s and `size` m wide. A box is halved along its longest side, a span
+/// of time as long as the way the fastest of the two moves in it (`speed`, m/s).
+pub fn contact<A: Surface, B: Surface, FA: Copy + fn(f32) -> A, FB: Copy + fn(f32) -> B>(
+    a: FA,
+    b: FB,
+    from: f32,
+    to: f32,
+    region: Box3,
+    moment: f32,
+    speed: f32,
+    size: f32,
+) -> Contact {
+    let both = |v: vec4| max(a(v.w).distance(v.xyz), b(v.w).distance(v.xyz))
+    var none = Contact { found: false, sure: false, enter: to, leave: to, at: region, steps: 0 }
+    // The boxes left, each asked in turn earliest first: the one whose span starts first (the
+    // latest pushed of those that start together), so the first box narrow enough to answer is
+    // the earliest any contact can be.
+    var work: Vec<Box4> = Vec::new()
+    heap_push(mut work, Box4 { lo: vec4(region.lo, from), hi: vec4(region.hi, to) })
+    let scale = max(speed, 1.0e-6)
+    var steps: u32 = 0
+    var first_left = false
+    var enter = to
+    var enter_at = region
+    while work.len() > 0 && steps < CONTACT_STEPS {
+        let c = heap_pop(mut work)
+        steps += 1
+        if interval(both, c).lo > 0.0 {
+            continue
+        }
+        let e = c.hi - c.lo
+        let wide = max(e.x, max(e.y, e.z))
+        if e.w <= moment && wide <= size {
+            // A box that can hold a contact, narrow enough to answer: the first is the earliest
+            // a contact can be (`enter`). Is one there? A point of it inside both, at a moment of
+            // it, says so (the moment is `leave`); else the boxes after it are asked on.
+            let space = Box3 { lo: c.lo.xyz, hi: c.hi.xyz }
+            if !first_left {
+                first_left = true
+                enter = c.lo.w
+                enter_at = space
+            }
+            for k in 0..27 {
+                let u = vec3(f32(k % 3), f32((k / 3) % 3), f32(k / 9)) * 0.5
+                let p = space.lo + (space.hi - space.lo) * u
+                for m in 0..3 {
+                    let t = c.lo.w + e.w * (0.5 * f32(m))
+                    if both(vec4(p, t)) < 0.0 {
+                        return Contact { found: true, sure: true, enter, leave: t, at: enter_at, steps }
+                    }
+                }
+            }
+            continue
+        }
+        // Halve the longest side, time measured as the way the fastest moves in it.
+        let m = 0.5 * (c.lo + c.hi)
+        if e.w * scale >= wide {
+            heap_push(mut work, Box4 { lo: vec4(c.lo.xyz, m.w), hi: c.hi })
+            heap_push(mut work, Box4 { lo: c.lo, hi: vec4(c.hi.xyz, m.w) })
+        } else if e.x >= e.y && e.x >= e.z {
+            heap_push(mut work, Box4 { lo: vec4(m.x, c.lo.y, c.lo.z, c.lo.w), hi: c.hi })
+            heap_push(mut work, Box4 { lo: c.lo, hi: vec4(m.x, c.hi.y, c.hi.z, c.hi.w) })
+        } else if e.y >= e.z {
+            heap_push(mut work, Box4 { lo: vec4(c.lo.x, m.y, c.lo.z, c.lo.w), hi: c.hi })
+            heap_push(mut work, Box4 { lo: c.lo, hi: vec4(c.hi.x, m.y, c.hi.z, c.hi.w) })
+        } else {
+            heap_push(mut work, Box4 { lo: vec4(c.lo.x, c.lo.y, m.z, c.lo.w), hi: c.hi })
+            heap_push(mut work, Box4 { lo: c.lo, hi: vec4(c.hi.x, c.hi.y, m.z, c.hi.w) })
+        }
+    }
+    // Steps out (or boxes out) with no point found inside both: the earliest box left that could
+    // hold one says when a contact can first be, and none is sure.
+    if first_left || work.len() > 0 {
+        let first_t = if work.len() > 0 { work[0].lo.w } else { to }
+        let t = if first_left { min(enter, first_t) } else { first_t }
+        return Contact { found: true, sure: false, enter: t, leave: to, at: enter_at, steps }
+    }
+    none.steps = steps
+    none
+}
+
+/// Whether box `a` is asked before box `b`: it starts earlier, or as early and is nearer the
+/// region's low corner (a tie broken the same way on every machine).
+fn before(a: Box4, b: Box4) -> bool {
+    if a.lo.w != b.lo.w {
+        return a.lo.w < b.lo.w
+    }
+    if a.lo.x != b.lo.x {
+        return a.lo.x < b.lo.x
+    }
+    if a.lo.y != b.lo.y {
+        return a.lo.y < b.lo.y
+    }
+    a.lo.z < b.lo.z
+}
+
+/// Pushes `b` onto the heap `h` (its top the box asked first, `before`).
+fn heap_push(h: mut Vec<Box4>, b: Box4) {
+    h.push(b)
+    var i = h.len() - 1
+    while i > 0 {
+        let up = (i - 1) / 2
+        if !before(h[i], h[up]) {
+            break
+        }
+        let t = h[i]
+        h[i] = h[up]
+        h[up] = t
+        i = up
+    }
+}
+
+/// Takes the heap's top.
+fn heap_pop(h: mut Vec<Box4>) -> Box4 {
+    let top = h[0]
+    let last = h.pop().unwrap()
+    let n = h.len()
+    if n > 0 {
+        h[0] = last
+        var i: u32 = 0
+        loop {
+            let l = 2 * i + 1
+            let r = l + 1
+            var m = i
+            if l < n && before(h[l], h[m]) {
+                m = l
+            }
+            if r < n && before(h[r], h[m]) {
+                m = r
+            }
+            if m == i {
+                break
+            }
+            let t = h[i]
+            h[i] = h[m]
+            h[m] = t
+            i = m
+        }
+    }
+    top
+}

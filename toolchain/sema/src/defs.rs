@@ -710,6 +710,8 @@ lang_items! {
     TapeFinish = "std::stage::finish",
     Smin = "std::field::smin",
     Smax = "std::field::smax",
+    WaveCos = "std::field::wave_cos",
+    WaveSin = "std::field::wave_sin",
     Meet = "std::field::meets",
     ValueNoise = "std::field::value_noise",
     ValueNoiseBox = "std::field::value_noise_box",

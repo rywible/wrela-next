@@ -221,6 +221,67 @@ Purpose: measure every open premise on both machines before changing the archite
      ±10% cell-size changes, comparing the current point-sampled judge against a pixel-footprint
      mean of unfiltered rays on the unfiltered field.
 
+### What was measured (2026-11-26, at `fd1234f` unless said)
+
+**1. Spans and passes.** M4, 1080p, `tools/bench` (still: frames 30 to 89; moving: 30 to 269),
+one placement, passes timed alone:
+
+| Build | Span (ms) | Largest passes (ms) |
+| --- | --- | --- |
+| SCENE 10 | 20.06 | extract 4.87, refract 1.78, direct 1.65, vis_resolve 1.34, sun_map 1.18, eye 1.14, certify 0.62 |
+| SCENE 11 | 16.54 | vis_resolve 4.85, sun_map 2.05, exact 1.33, eye 1.17 |
+| SCENE 13 | 13.97 | exact 4.44, vis_resolve 2.26, sun_exact 1.89 |
+| SCENE 14 | 16.90 | exact 5.00, sun_exact 3.44, vis_resolve 2.27 |
+| SCENE 16 | 11.56 | extract 1.86, exact 1.22, eye 0.95 |
+| SCENE 10 VIEW 3 | 69.70 | extract 43.32, certify 7.34 |
+| SCENE 13 VIEW 3 | 108.57 | extract 70.46, exact 9.90, vis_resolve 5.67, sun_exact 4.99, certify 4.20 |
+| SCENE 10 VIEW 4 (running) | 73.97 | |
+| SCENE 10 VIEW 5 (turning) | 64.18 | |
+| SCENE 13 VIEW 5 (turning) | 20.73 | |
+
+Radeon (`tools/gate --full`, three placements, at `fd1234f` and `5c602e2`): SCENE 10 59.7, 11
+47.8, 13 22.6, 14 28.8, 16 29.6 ms; SCENE 10 VIEW 3 230 ms median (466 at 19 in 20); SCENE 13
+VIEW 3 519 ms; VIEW 4 and 5: 244, 221 (arena), 73, 42 (study). The Radeon refused
+`filter_thin_cells` (1,571,069 work an invocation), `inherit_seam_corners`, `solve_seam_smooth`
+and `certify_outline` (2,449,321 work an invocation, past its 2,441,406 a lane) dispatches, so
+its audit and its study's tour did not run; its sun judge's hard leaks were 724 to 2,912 across
+placements (`SCENE 13 VIEW 0`), against the M4's 754. Utilization by `tools/cost` and the
+schedule floor were not measured: no decision below reads them.
+
+**2. The fastest the rules allow.** `rules::caster`: a caster runs at 7 m/s and the eye turns at
+720°/s (`VIEW 4` strafes across `RUN_SPAN`, `VIEW 5` turns in place), in SCENE 10 and 13.
+
+**3. What moving meshes again.** `REPORT` (`MeshDraw::extraction_report`), SCENE 10 VIEW 3,
+frames 30 to 269: the courtyard 208 extractions of 19,576 active bricks, the pillars 223 of
+6,520, the brazier stands 205 of 2,040, the flames 239 of 1,557, the ward 239 of 2,831, the orb 1
+of 517: about 29,000 bricks a frame. SCENE 13 VIEW 3: the room 194 of 10,898, the table 207 of
+9,071, the book 197 of 4,410. The outline's certificates are per eye (they were made at
+extraction for its eye, and every eye step re-extracted).
+
+**4. The ward's bricks and the steep columns.** `engine::mesh::census::cull_census`: the ward
+(`parry_arc`) keeps 25,742 of 1,730,100 bricks at 5 mm and its surface crosses 21,950 (1.17 kept
+a crossed; 5,181 and 4,676 at 1 cm). The cull is tight: the ward is a shell 7 cm thick seen from
+both faces, a ring and a tether, about 9.4 m² of sheet, so the premise of 2,000 to 9,000 bricks was
+wrong. The pillars' steepness of 12,039 and the marble column's 5,720 come from their flutes'
+complex powers (`cmul` squared four times): the derived Lipschitz bound of `v / max(|v|, r)` is
+104 over the pillars' bound and each componentwise square doubles it, 425,400 for the tenth power
+(its true bound is about 10 / r).
+
+**5. The candlestick's enclosures.** `candlestick_enclosure_census`: of 100 cells 4.8 mm wide on
+its surface 11 certify within a quarter cell; all 89 others have no slope worth the name (a plane
+of less than an eighth of the field's slope) in the turned profile alone (`stick_turned`), before
+any carving; one part is live in each. The cause is the profile's (`Turned`'s) enclosure, not
+`Carved`'s. Its kinds are each one leaf (the ward and the candlestick write their joins inside
+one `distance`), so the CSG-split kill test has no operands to split there.
+
+**6. Rings by distance alone.** `ring_census_report` (`engine::mesh::rings::build_ring_grids`,
+1080p from SCENE 10's eye): the courtyard keeps 694,149 bricks over four levels (21,854 at 15.6
+mm, 173,400 at 7.8, 337,497 at 3.9, 161,398 at 2.0), 35 times the 19,576 the view-fitted grids
+keep. And error-driven cuts need tight enclosures: of the courtyard's 1,183 bricks at 12.5 cm
+cells, 651 have no slab within the brick's width (`flat_census`), at its min joins and creases.
+So Stage 3A as written (uniform rings by distance alone) is not built, and Stage 3C waits on
+phase 5's enclosures; phase 3 keeps the view-fitted rings, with slack (see phase 3).
+
 ### Done when
 
 - All seven measurement tables are recorded in this file and in the commit message.

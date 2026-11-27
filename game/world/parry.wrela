@@ -12,9 +12,11 @@
 
 use arena::arena_courtyard
 use engine::matter::substance::Substance
+use engine::matter::contact::{Contact, contact}
 use engine::matter::verify::{prove_field_facts, verify_field_soundness, verify_moving_soundness}
-use kit::substances::pbr::{emissive, glass}
+use kit::substances::pbr::{emissive, glass, sand}
 use std::cmp::Eq
+use std::derive::Box3
 use std::field::{
     Bound, Field, FieldFacts, Rotate, RoundCone, Scale, Surface, Translate, Union, With, hash_u32,
     round_cone, smax, smin,
@@ -33,9 +35,19 @@ const JOINTS: u32 = 7
 const WANDER: f32 = 0.16
 const BOLT_RADIUS: f32 = 0.018
 
-/// The moment of a parry's loop the bolt meets the veil (s), the moment the branch breaks, and
-/// the loop's length.
-pub const PARRY_HIT: f32 = 1.2
+/// The moment of a parry's loop the bolt is thrown (s), and how fast its leader runs along its
+/// path (m/s: a stepped leader's, about 2 × 10^5): the bolt reaches from the hand that throws it
+/// as far as its leader has run.
+pub const BOLT_THROWN: f32 = 1.0
+const LEADER_SPEED: f32 = 2.0e5
+
+/// The moment the bolt meets the sand (s): the first moment a point is inside both, found from
+/// the compiler's ranges over space and time (`engine::matter::contact`), to a microsecond.
+pub const PARRY_HIT: f32 = first_contact().enter
+
+/// How long the bolt's channel stays after it meets the sand (s: its return strokes), the moment
+/// the branch breaks, and the loop's length.
+const BOLT_AFTER: f32 = 0.06
 pub const PARRY_BREAK: f32 = 3.4
 pub const PARRY_LOOP: f32 = 5.0
 
@@ -76,19 +88,30 @@ fn to_segment(p: vec3, a: vec3, b: vec3) -> f32 {
 
 /// A stroke of lightning between the hands: its path's joints (each a place, and the channel's
 /// radius there), worked out once a frame where it is made (`bolt`), so a point's distance is to
-/// six segments and no more.
+/// six segments and no more; and how far its leader has run from the hand that throws it, along
+/// the line between the hands (`front.x`, m): past that, there is no bolt yet.
 pub struct Bolt: Copy + GpuData + Eq + StateHash {
     pub joints: [vec4; 7],
+    pub front: vec4,
 }
 
 /// The bolt at `time`, `struck` of it there (1 while it strikes; 0 is no bolt: a path of no
-/// width, which no point is inside).
-pub fn bolt(time: f32, struck: f32) -> Bolt {
+/// width, which no point is inside), reaching `reach` of the way along its path (its leader's
+/// front, square to the line between the hands).
+pub fn bolt(time: f32, struck: f32, reach: f32 = 1.0) -> Bolt {
     var joints = [vec4(BOLT_FROM, 0.0); 7]
     for k in 0..JOINTS {
         joints[k] = vec4(joint(k, time), BOLT_RADIUS * clamp(struck, 0.0, 1.0))
     }
-    Bolt { joints }
+    // Wholly run, the front stands past the far hand by the most a joint strays.
+    let whole = length(BOLT_TO - BOLT_FROM) + 2.0 * WANDER
+    Bolt { joints, front: vec4(clamp(reach, 0.0, 1.0) * whole, 0.0, 0.0, 0.0) }
+}
+
+/// How far along its path (0 to 1) the bolt's leader has run at `time` (`LEADER_SPEED` from
+/// `BOLT_THROWN`).
+pub fn leader(time: f32) -> f32 {
+    clamp((time - BOLT_THROWN) * LEADER_SPEED / (length(BOLT_TO - BOLT_FROM) + 2.0 * WANDER), 0.0, 1.0)
 }
 
 impl Surface for Bolt {
@@ -99,7 +122,9 @@ impl Surface for Bolt {
         for k in 1..(JOINTS - 1) {
             d = min(d, to_segment(p, self.joints[k].xyz, self.joints[k + 1].xyz))
         }
-        d - self.joints[0].w
+        // Past the leader's front (the line between the hands, from the throwing hand), none.
+        let along = dot(p - BOLT_FROM, normalize(BOLT_TO - BOLT_FROM))
+        max(d - self.joints[0].w, along - self.front.x)
     }
 
     /// Round the middle of the hands: half the way between them, the most a joint strays (both
@@ -130,22 +155,151 @@ impl Field<Substance> for Bolt {
     }
 }
 
-const BOLT_FACTS: FieldFacts = prove_field_facts(Bolt { joints: [vec4(0.0, 0.0, 0.0, 0.018); 7] })
+const BOLT_FACTS: FieldFacts = prove_field_facts(bolt(time: 0.5, struck: 1.0))
 
 // =================================================================================================
 // The veil: where the thrown sand is
 // =================================================================================================
 
-/// The middle of the sand in the air at the moment the bolt meets it, and how far it reaches
-/// along the bolt, up and across (m): a handful thrown flat across the bolt's way.
+/// Where the thrown sand is going: the middle of the handful as it spreads to its reach across the
+/// bolt's way, and how far it reaches along the bolt, up and across (m), once spread.
 pub const VEIL_AT: vec3 = vec3(0.4, 1.45, 0.125)
 pub const VEIL_REACH: vec3 = vec3(0.95, 0.5, 0.42)
 
-/// No more than the distance from `p` to the veil (an ellipsoid about `VEIL_AT`), and below 0
-/// inside it: the distance of the sphere it is squeezed from, shrunk by its least reach.
-fn veil(p: vec3) -> f32 {
-    let q = (p - VEIL_AT) / VEIL_REACH
-    (length(q) - 1.0) * min(VEIL_REACH.x, min(VEIL_REACH.y, VEIL_REACH.z))
+/// The hand that throws the sand (the caster the bolt is thrown at, its other hand), the moment it
+/// is thrown, and the time the handful takes to spread to its reach (s); after, it falls apart
+/// in `SAND_FADE` s.
+pub const SAND_FROM: vec3 = vec3(-2.05, 1.25, 0.6)
+pub const SAND_THROWN: f32 = 0.2
+const SAND_FLIGHT: f32 = 0.7
+const SAND_FADE: f32 = 1.4
+
+/// The thrown sand at a moment: the region it is in (an ellipsoid, `centre` and `reach`), how
+/// much of it is still in the air (`density`: 1 just spread, 0 gone), and where the grains are
+/// (a jittered lattice `GRAIN` m apart, each a grain clump `density` of `GRAIN_R` across).
+pub struct SandVeil: Copy + GpuData + Eq + StateHash {
+    pub centre: vec3,
+    pub density: f32,
+    pub reach: vec3,
+    pub pad0: f32,
+}
+
+const GRAIN: f32 = 0.035
+const GRAIN_R: f32 = 0.006
+
+/// The sand `time` s into the parry: flung from `SAND_FROM`, slowing as it spreads (its middle at
+/// `1 - (1 - u)^2` of the way), to `VEIL_AT` and `VEIL_REACH` at `SAND_THROWN + SAND_FLIGHT`, then
+/// drifting on, spreading and falling apart.
+pub fn sand_veil(time: f32) -> SandVeil {
+    let u = (time - SAND_THROWN) / SAND_FLIGHT
+    let w = if u < 1.0 { 1.0 - (1.0 - max(u, 0.0)) * (1.0 - max(u, 0.0)) } else { 1.0 }
+    let after = max(time - SAND_THROWN - SAND_FLIGHT, 0.0)
+    let centre = mix(SAND_FROM, VEIL_AT, vec3(w)) + vec3(0.25, -0.15, 0.0) * after
+    let reach = VEIL_REACH * (0.08 + 0.92 * w) * (1.0 + 0.3 * after)
+    let density = if u < 0.0 { 0.0 } else { clamp(1.0 - after / SAND_FADE, 0.0, 1.0) }
+    SandVeil { centre, density, reach, pad0: 0.0 }
+}
+
+/// No more than the distance from `p` to the ellipsoid of `centre` and `reach`, and below 0 inside
+/// it: the distance of the sphere it is squeezed from, shrunk by its least reach.
+fn ellipsoid_below(p: vec3, centre: vec3, reach: vec3) -> f32 {
+    let q = (p - centre) / reach
+    (length(q) - 1.0) * min(reach.x, min(reach.y, reach.z))
+}
+
+/// A number in [0, 1) from three lattice coordinates.
+fn grain_hash(c: vec3) -> f32 {
+    unit(u32(c.x + 4096.0) ^ hash_u32(u32(c.y + 4096.0) ^ hash_u32(u32(c.z + 4096.0))))
+}
+
+impl SandVeil {
+    /// The region the sand is in: `ellipsoid_below` of it, while any of it is in the air (none
+    /// is: a region no point is inside).
+    pub fn region(self, p: vec3) -> f32 {
+        if self.density <= 0.0 {
+            return 1.0e3
+        }
+        ellipsoid_below(p, self.centre, self.reach)
+    }
+}
+
+impl Surface for SandVeil {
+    /// Its evaluation's work, held at build (`tools/layers` rule 7).
+    @budget(work: 1024)
+    fn distance(self, p: vec3) -> f32 {
+        // The grains: a clump at a jittered point of each lattice cell, the nearest of the eight
+        // cells round `p`, within the region.
+        let g = p / GRAIN - vec3(0.5)
+        let base = floor(g)
+        var near = 1.0e3
+        for k in 0..8 {
+            let c = base + vec3(f32(k & 1), f32((k >> 1) & 1), f32((k >> 2) & 1))
+            let j = vec3(grain_hash(c), grain_hash(c + vec3(17.0)), grain_hash(c + vec3(31.0)))
+            let at = (c + vec3(0.25) + 0.5 * j + vec3(0.5)) * GRAIN
+            near = min(near, length(p - at))
+        }
+        max(near - GRAIN_R * self.density, self.region(p))
+    }
+
+    /// Round the region at its widest.
+    fn bound(self) -> Bound {
+        Bound { centre: self.centre, radius: max(self.reach.x, max(self.reach.y, self.reach.z)) + GRAIN, slope: 0.4 }
+    }
+
+    /// The nearest of exact distances to points, less a radius, and an ellipsoid's distance
+    /// scaled to be no steeper than one: one.
+    fn lipschitz(self, _near: f32) -> f32 {
+        1.0
+    }
+}
+
+impl Field<Substance> for SandVeil {
+    /// Dry quartz sand, pale and matte.
+    fn channels(self, _p: vec3) -> Substance {
+        sand(vec3(0.78, 0.68, 0.50))
+    }
+
+    fn field_facts(self) -> FieldFacts {
+        SAND_FACTS
+    }
+}
+
+const SAND_FACTS: FieldFacts = prove_field_facts(sand_veil(SAND_THROWN + SAND_FLIGHT))
+
+/// The sand's region at a moment as a surface (`SandVeil::region`), for the contact.
+pub struct SandRegion: Copy + GpuData + Eq + StateHash {
+    pub veil: SandVeil,
+}
+
+impl Surface for SandRegion {
+    fn distance(self, p: vec3) -> f32 {
+        self.veil.region(p)
+    }
+
+    fn bound(self) -> Bound {
+        self.veil.bound()
+    }
+
+    fn lipschitz(self, _near: f32) -> f32 {
+        1.0
+    }
+}
+
+/// When the bolt's leader first meets the thrown sand (`engine::matter::contact`), from the
+/// moment the bolt is thrown, to a microsecond: the bolt's path and the sand's region at each
+/// moment, inside the box round the bolt, its leader the fastest that moves.
+pub fn first_contact() -> Contact {
+    let b = bolt(time: 0.0, struck: 1.0).bound()
+    contact(
+        |t: f32| bolt(t, 1.0, reach: leader(t)),
+        |t: f32| SandRegion { veil: sand_veil(t) },
+        from: BOLT_THROWN,
+        to: PARRY_LOOP,
+        region: Box3 { lo: b.centre - vec3(b.radius), hi: b.centre + vec3(b.radius) },
+        moment: 1.0e-6,
+        speed: LEADER_SPEED,
+        size: 2.0 * BOLT_RADIUS,
+    )
 }
 
 // =================================================================================================
@@ -171,6 +325,9 @@ pub struct GlassBranch: Copy + GpuData + Eq + StateHash {
     pub spurs: [vec4; 4],
     /// Its emitted radiance (`xyz`), and how much of it is there (`w`: 1 whole, 0 none).
     pub glow: vec4,
+    /// The sand's region at the moment the bolt met it: its middle (`xyz`), and its reach.
+    pub sand_at: vec4,
+    pub sand_reach: vec4,
 }
 
 /// The glass's temperature when the stroke has just fused it (K: silica is worked near 2,000),
@@ -198,7 +355,8 @@ fn glow(age: f32) -> vec3 {
     fused * vec3(dimmer(6.1e-7, kelvin), dimmer(5.5e-7, kelvin), dimmer(4.65e-7, kelvin))
 }
 
-/// The branch a bolt leaves: the bolt as it is at `PARRY_HIT`, `age` s after it (`whole` of it
+/// The branch a bolt leaves: the bolt's path as it is at `PARRY_HIT`, the moment its leader met
+/// the sand, kept to the sand's region at that moment,, `age` s after it (`whole` of it
 /// there: 1, or 0 once it has broken).
 pub fn glass_branch(age: f32, whole: f32) -> GlassBranch {
     let w = clamp(whole, 0.0, 1.0)
@@ -219,7 +377,14 @@ pub fn glass_branch(age: f32, whole: f32) -> GlassBranch {
         spurs[2 * s] = vec4(from, joints[k].w)
         spurs[2 * s + 1] = vec4(from + way * (0.24 + 0.1 * unit(s * 947 + 2)), 0.008 * w)
     }
-    GlassBranch { joints, spurs, glow: vec4(glow(age), w) }
+    let sand = sand_veil(PARRY_HIT)
+    GlassBranch {
+        joints,
+        spurs,
+        glow: vec4(glow(age), w),
+        sand_at: vec4(sand.centre, 0.0),
+        sand_reach: vec4(sand.reach, 0.0),
+    }
 }
 
 impl Surface for GlassBranch {
@@ -236,13 +401,15 @@ impl Surface for GlassBranch {
             d = smin(d, stretch(p, self.spurs[2 * s], self.spurs[2 * s + 1]), 0.02)
         }
         // Only where the sand was. (None of it: a path of no width, kept out by a hair.)
-        smax(d, veil(p), 0.03) + 1.0e-4 * (1.0 - self.glow.w)
+        smax(d, ellipsoid_below(p, self.sand_at.xyz, self.sand_reach.xyz), 0.03) +
+            1.0e-4 * (1.0 - self.glow.w)
     }
 
     /// Round the veil: the glass is nowhere else. Past it the distance is the veil's, which
     /// grows along its longest reach as its least reach is to that (0.42 to 0.95): 0.44 a metre.
     fn bound(self) -> Bound {
-        Bound { centre: VEIL_AT, radius: VEIL_REACH.x + 0.05, slope: 0.4 }
+        let r = self.sand_reach.xyz
+        Bound { centre: self.sand_at.xyz, radius: max(r.x, max(r.y, r.z)) + 0.05, slope: 0.4 }
     }
 
     /// A tapering bead is as steep as sqrt(1 + (0.022 / 0.9)²) over its segment (the joints are
@@ -287,7 +454,8 @@ pub fn break_landings() -> [f32; 6] {
     var out = [-1.0; 6]
     for k in 0..6 {
         let mid = 0.5 * (joint(k, PARRY_HIT) + joint(k + 1, PARRY_HIT))
-        if veil(mid) <= 0.0 {
+        let sand = sand_veil(PARRY_HIT)
+        if ellipsoid_below(mid, sand.centre, sand.reach) <= 0.0 {
             out[k] = landing(mid, out_way(k))
         }
     }
@@ -376,10 +544,12 @@ fn aim_z(way: vec3) -> Quat {
 // The parry, a moment of it
 // =================================================================================================
 
-/// What is there `time` s into a parry's loop: the bolt while it strikes, the branch from the
-/// moment it meets the veil until it breaks (cooling), and the pieces after.
+/// What is there `time` s into a parry's loop: the sand from the moment it is thrown, the bolt
+/// from the moment it is thrown until a little after its leader meets the sand, the branch from
+/// that meeting until it breaks (cooling), and the pieces after.
 pub struct Parry: Copy {
     pub bolt: Bolt,
+    pub sand: SandVeil,
     pub branch: GlassBranch,
     pub pieces: [BranchPiece; 6],
 }
@@ -404,7 +574,12 @@ impl ParryLoop {
             self.broken = true
         }
         Parry {
-            bolt: bolt(time: t, struck: if t < PARRY_HIT { 1.0 } else { 0.0 }),
+            bolt: bolt(
+                time: t,
+                struck: if t >= BOLT_THROWN && t < PARRY_HIT + BOLT_AFTER { 1.0 } else { 0.0 },
+                reach: leader(t),
+            ),
+            sand: sand_veil(t),
             branch: glass_branch(
                 age: t - PARRY_HIT,
                 whole: if t >= PARRY_HIT && t < PARRY_BREAK { 1.0 } else { 0.0 },
@@ -421,10 +596,40 @@ pub fn parry(time: f32) -> Parry {
     l.at(time)
 }
 
+/// The bolt meets the sand where the contact says (`first_contact`), never before: at moments
+/// before it, along the bolt's path as far as its leader has run, no point is inside the sand's
+/// region; and a point of the bolt's path at the moment is (`sure`).
+@test
+fn the_bolt_meets_the_sand_when_the_contact_says_and_never_before() {
+    let c = first_contact()
+    std::io::print(f"contact: the bolt meets the sand at {c.enter} s (to {c.leave}), sure {c.sure}, in {c.steps} steps")
+    assert(c.found && c.sure, "the bolt meets the sand")
+    assert(c.enter > BOLT_THROWN && c.enter < SAND_THROWN + SAND_FLIGHT + 1.0, f"at {c.enter} s")
+    for i in 0..400 {
+        let t = BOLT_THROWN + (c.enter - BOLT_THROWN) * f32(i) / 400.0
+        let b = bolt(t, 1.0, reach: leader(t))
+        let sand = sand_veil(t)
+        for k in 0..(JOINTS - 1) {
+            for m in 0..32 {
+                let p = mix(b.joints[k].xyz, b.joints[k + 1].xyz, vec3(f32(m) / 31.0))
+                assert(
+                    !(b.distance(p) < 0.0 && sand.region(p) < 0.0),
+                    f"a contact at {t} s, at {p}, before {c.enter}",
+                )
+            }
+        }
+    }
+    let again = first_contact()
+    assert(bitcast_u32(again.enter) == bitcast_u32(c.enter), "the same moment again, to the bit")
+}
+
 @test
 fn parry_field_contracts_are_sound() {
     verify_field_soundness(bolt(time: 0.5, struck: 1.0), "bolt")
     verify_field_soundness(glass_branch(age: 0.3, whole: 1.0), "glass_branch")
+    verify_field_soundness(sand_veil(1.0), "sand_veil")
+    let thrown = verify_moving_soundness(|t: f32| sand_veil(t), from: SAND_THROWN, to: 2.5, label: "sand_veil")
+    assert(thrown.rate < 1.0e12, "the sand's rate has no bound")
     // At every moment: the bolt for half a second of its strike, the branch as it cools.
     let struck = verify_moving_soundness(|t: f32| bolt(time: t, struck: 1.0), from: 0.0, to: 0.5, label: "bolt")
     let cooled = verify_moving_soundness(|t: f32| glass_branch(age: t, whole: 1.0), from: 0.0, to: 2.0, label: "glass_branch")

@@ -1084,6 +1084,8 @@ impl<'a> Cx<'a> {
             f.known = match self.checked.program.func(*func).lang {
                 Some(Lang::Smin) => Some(ir::Known::Smin),
                 Some(Lang::Smax) => Some(ir::Known::Smax),
+                Some(Lang::WaveCos) => Some(ir::Known::WaveCos),
+                Some(Lang::WaveSin) => Some(ir::Known::WaveSin),
                 Some(Lang::Meet) => Some(ir::Known::Meet),
                 Some(Lang::ValueNoise) => Some(ir::Known::ValueNoise),
                 Some(Lang::ValueNoiseBox) => Some(ir::Known::ValueNoiseBox),

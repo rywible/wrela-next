@@ -809,6 +809,13 @@ pub enum Known {
     /// its body; `std::derive::lipschitz` bounds it as `smin` of the negated operands: a convex
     /// combination of their gradients, no steeper than the steeper, across its seam.
     Smax,
+    /// `std::field::wave_cos(v, r0, n)` and `wave_sin`: the cosine and sine of `n` times `v`'s
+    /// angle, faded as `(|v| / r0)^n` inside `r0` (`(v / max(|v|, r0))^n` as a complex number).
+    /// A tape and the other derivations take its body; `std::derive::lipschitz` bounds its
+    /// gradient by `n / r0` times `v`'s, which its body's componentwise products can't see (each
+    /// square doubles their bound).
+    WaveCos,
+    WaveSin,
     /// `std::field::meets(at)`: `at > 0`, the condition of a branch whose two sides agree where
     /// `at` is 0. A tape and the other derivations take its body; only `std::derive::lipschitz`
     /// trusts it, taking the steeper side across the switch.
