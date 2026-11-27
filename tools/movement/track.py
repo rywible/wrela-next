@@ -168,7 +168,7 @@ class Sim:
         jids = self.mjm.actuator_trnid[:, 0]
         self.jnt_lo = torch.tensor(self.mjm.jnt_range[jids, 0], device=device, dtype=torch.float32)
         self.jnt_hi = torch.tensor(self.mjm.jnt_range[jids, 1], device=device, dtype=torch.float32)
-        self.act_scale = (0.35 * (self.jnt_hi - self.jnt_lo)).clamp(min=0.08, max=0.6)
+        self.act_scale = (0.5 * (self.jnt_hi - self.jnt_lo)).clamp(min=0.15, max=1.0)
         self.rate = head["rate"]
         self.dt = 1.0 / self.rate
         # The clips: their frames, where each starts and how long it is.
@@ -287,7 +287,7 @@ class Sim:
 
 # ---- what the net reads, and the reward --------------------------------------------------------
 
-AHEAD = (1, 3, 6)
+AHEAD = (1, 3, 6, 12)
 
 
 def rot6d(q):
@@ -322,10 +322,12 @@ def observe(sim):
     parts.append(quat_rotate(hq[:, None].expand(-1, rel.shape[1], -1), rel).reshape(n, -1))
     for a in AHEAD:
         g = sim.global_frame(a)
-        # Direct per-body error vector to target (includes both root drift and local pose).
+        # Direct per-body error vector to target (includes both root drift and local pose),
+        # plus target root orientation, target root linear velocity, and joint angle deltas.
         dx = sim.ref_x[g] - act_x
         parts.append(quat_rotate(hq[:, None].expand(-1, dx.shape[1], -1), dx).reshape(n, -1))
         parts.append(rot6d(quat_mul(hq, sim.ref_r[g][:, 0])))
+        parts.append(quat_rotate(hq, sim.ref_vel(g)[:, :3]))
         parts.append(sim.ref_q[g][:, 7:] - sim.qpos[:, 7:])
     return torch.cat(parts, -1)
 
@@ -480,7 +482,7 @@ def make_agent(n_obs, n_act, hidden, log_std=None, layer_norm=True):
             self.log_std = torch.nn.Parameter(torch.full((n_act,), -2.3 if log_std is None else log_std),
                                               requires_grad=log_std is None)
             with torch.no_grad():
-                self.pi[-1].weight.mul_(0.01)
+                self.pi[-1].weight.mul_(0.05)
                 self.pi[-1].bias.zero_()
 
         def dist(self, o):
@@ -505,12 +507,14 @@ BOUND = 1.1
 
 
 def ppo(agent, opt, b_obs, b_act, b_logp, b_adv, b_ret, gen, target_kl, bounds=0.01, vnorm=None):
-    """PPO's epochs over the rollout (clipped at 0.2, 8 minibatches of 16,384 an epoch), actor and
+    """PPO's epochs over the rollout (clipped at 0.2, 4 minibatches of 32,768 an epoch), actor and
     critic gradients clipped to 1 apart, value targets normalized by `vnorm` when given, actions'
-    means held within `BOUND` (weight `bounds`), and smooth KL-adaptive learning rate."""
+    means held within `BOUND` (weight `bounds`), and smooth KL-adaptive learning rate using
+    per-action-dimension KL so high-DOF bodies (62+ actuators) are not throttled 60x too hard."""
     dev = b_obs.device
     n = b_obs.shape[0]
-    mb = max(n // 8, 1)
+    n_act = b_act.shape[-1]
+    mb = max(n // 4, 1)
     if vnorm is not None:
         vnorm.update(b_ret)
         b_ret_t = vnorm.norm(b_ret)
@@ -543,21 +547,21 @@ def ppo(agent, opt, b_obs, b_act, b_logp, b_adv, b_ret, gen, target_kl, bounds=0
             opt.step()
             with torch.no_grad():
                 agent.log_std.clamp_(min=LEAST_LOG_STD)
-                kls.append(float(((ratio - 1.0) - log_ratio).mean()))
+                kls.append(float(((ratio - 1.0) - log_ratio).mean()) / max(n_act, 1))
                 clips.append(float(((ratio - 1.0).abs() > 0.2).float().mean()))
                 vls.append(float(vl))
         epochs += 1
         if kls:
             kl, clipped, vloss = sum(kls) / len(kls), sum(clips) / len(clips), sum(vls) / len(vls)
-        if 0 < target_kl and kl > 2.0 * target_kl:
+        if 0 < target_kl and kl > 4.0 * target_kl:
             break
     if target_kl <= 0:
         return (kl, skipped), clipped, vloss, epochs
     for g in opt.param_groups:
         if kl > 1.5 * target_kl:
-            g["lr"] = max(g["lr"] / 1.25, 1e-5)
+            g["lr"] = max(g["lr"] / 1.25, 3e-5)
         elif kl < 0.5 * target_kl:
-            g["lr"] = min(g["lr"] * 1.25, 1e-3)
+            g["lr"] = min(g["lr"] * 1.25, 5e-4)
     return (kl, skipped), clipped, vloss, epochs
 
 
@@ -807,11 +811,13 @@ def main():
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--eval-every", type=int, default=200)
     p.add_argument("--bounds", type=float, default=0.01, help="the weight of the bounds loss on the actions' means")
-    p.add_argument("--log-std", type=float, default=-2.3,
-                   help="the actions' spread fixed at e^this; pass --learn-std to learn it")
-    p.add_argument("--learn-std", action="store_true", help="learn action log_std instead of fixing it")
-    p.add_argument("--target-kl", type=float, default=0.02,
-                   help="target mean KL per PPO update (adaptive LR); 0 disables")
+    p.add_argument("--log-std", type=float, default=-1.6,
+                   help="starting action log_std (annealed to --log-std-end unless --learn-std)")
+    p.add_argument("--log-std-end", type=float, default=-2.5,
+                   help="final action log_std reached at 80%% of training steps")
+    p.add_argument("--learn-std", action="store_true", help="learn action log_std instead of scheduling it")
+    p.add_argument("--target-kl", type=float, default=0.002,
+                   help="target mean per-dimension KL per PPO update (adaptive LR); 0 disables")
     p.add_argument("--start-share", type=float, default=0.25,
                    help="the share of worlds started at their clip's first frame (the evaluation plays each "
                         "clip from there)")
@@ -918,6 +924,11 @@ def main():
             best = state["best"]
         rate_t, rate_s = time.time(), samples
         while step < a.steps:
+            if not a.learn_std:
+                frac = min(step / max(0.8 * a.steps, 1.0), 1.0)
+                cur_ls = a.log_std + frac * (a.log_std_end - a.log_std)
+                with torch.no_grad():
+                    agent.log_std.fill_(cur_ls)
             ep_r, ep_fall, blown, skipped = 0.0, 0.0, 0, 0
             with torch.no_grad():
                 for h in range(H):

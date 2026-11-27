@@ -363,7 +363,7 @@ def main():
     p.add_argument("--fastest", type=float, default=2.0, help="the fastest wish (m/s)")
     p.add_argument("--episode", type=int, default=300, help="the most frames of a world before it starts again")
     p.add_argument("--eval-every", type=int, default=200)
-    p.add_argument("--target-kl", type=float, default=0.02)
+    p.add_argument("--target-kl", type=float, default=0.002)
     p.add_argument("--task", default="walk", choices=["walk", "cast", "parry", "dodge"],
                    help="what the net is rewarded for beside the style (tools/movement/tasks.py)")
     p.add_argument("--test-frames", type=int, default=600, help="the goal test's frames (20 s)")
