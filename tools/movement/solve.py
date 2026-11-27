@@ -229,7 +229,7 @@ def copies(argv):
     second than any two different clips' seconds come (the sample's least) is a clip given back:
     nearer than the 1st percentile is only near, as standing is near every standing."""
     import glob
-    train = [l.strip() for l in open(argv[0]) if l.strip()]
+    train = [l.strip() for l in open(argv[0]) if l.strip() and not l.strip().startswith("#")]
     def windows(x, rate, stride):
         q = x[:, 7:]
         n = q.shape[0]
@@ -238,8 +238,13 @@ def copies(argv):
         return np.stack([q[i:i + w:5].reshape(-1) for i in idx]) if idx else np.zeros((0, 6 * q.shape[1]))
     tw, owner = [], []
     for k, c in enumerate(train):
-        rate, x = read_pose(f"{POSES}/{c}.pose")
+        p = f"{POSES}/{c}.pose"
+        if not os.path.exists(p):
+            continue
+        rate, x = read_pose(p)
         w = windows(x, rate, 15)
+        if len(w) == 0:
+            continue
         tw.append(w)
         owner.extend([k] * len(w))
     tw = torch.tensor(np.concatenate(tw).astype(np.float32))
@@ -272,9 +277,42 @@ def copies(argv):
     return 0 if mine.min() >= between.min() else 1
 
 
+def lowpass_poses(x, fc, rate):
+    """Zero-phase 4th-order Butterworth low-pass filter (Winter 2009) removing high-frequency
+    servo jitter above `fc` Hz while keeping phase and foot-contact timing intact."""
+    n = x.shape[0]
+    if n < 8 or fc <= 0.0:
+        return x
+    pad = min(60, n - 1)
+    def filt(arr):
+        p = np.concatenate([2.0 * arr[0:1] - arr[pad:0:-1], arr, 2.0 * arr[-1:] - arr[-2:-pad - 2:-1]], axis=0)
+        m = p.shape[0]
+        freqs = np.fft.rfftfreq(m, d=1.0 / rate)
+        h = 1.0 / (1.0 + (freqs / fc) ** 8)
+        y = np.fft.irfft(np.fft.rfft(p, axis=0) * h[:, None], n=m, axis=0)
+        return y[pad:pad + n].astype(np.float32)
+    y = x.copy()
+    q = y[:, 3:7].copy()
+    for i in range(1, n):
+        if np.dot(q[i], q[i - 1]) < 0.0:
+            q[i] = -q[i]
+    y[:, :3] = filt(y[:, :3])
+    q = filt(q)
+    q /= np.maximum(np.linalg.norm(q, axis=1, keepdims=True), 1e-8)
+    y[:, 3:7] = q
+    y[:, 7:] = filt(y[:, 7:])
+    return y
+
+
 def pack(argv):
     import json
     import zlib
+    argv = list(argv)
+    smooth_hz = 0.0
+    if "--smooth-hz" in argv:
+        i = argv.index("--smooth-hz")
+        smooth_hz = float(argv[i + 1])
+        del argv[i:i + 2]
     out = argv[argv.index("-o") + 1]
     sets = [a for a in argv[:argv.index("-o")]]
     names, which, starts, lengths, chunks = [], [], [], [], []
@@ -291,6 +329,8 @@ def pack(argv):
             if not os.path.exists(path):
                 continue
             r, x = read_pose(path)
+            if smooth_hz > 0.0:
+                x = lowpass_poses(x, smooth_hz, r)
             assert rate in (None, r)
             rate, d = r, x.shape[1] - 7
             names.append(name)
@@ -301,10 +341,10 @@ def pack(argv):
             chunks.append(np.ascontiguousarray(x))
     body = zlib.compress(np.concatenate(chunks).astype("<f4").tobytes(), 6)
     head = json.dumps({"names": names, "sets": which, "starts": starts, "lengths": lengths,
-                       "rate": rate, "d": d}).encode()
+                       "rate": rate, "d": d, "smooth_hz": smooth_hz}).encode()
     with open(out, "wb") as f:
         f.write(b"WPSE" + struct.pack("<I", len(head)) + head + body)
-    print(f"pack: {len(names)} clips, {total} frames, {os.path.getsize(out) / 1e6:.1f} MB")
+    print(f"pack: {len(names)} clips, {total} frames, smooth_hz={smooth_hz}, {os.path.getsize(out) / 1e6:.1f} MB")
     return 0
 
 

@@ -396,6 +396,8 @@ than the balance fell (1.59 written, 1.12 fallen for the tests of 0.5).
 | 2026-11-27 | `p4h-10` (L4): phase 4 on human3: 2038 sanitized clips, 25 active bodies, stable armature, 0% limit violations, multi-scale reward and value norm, 4000 updates, stopped | 2.26 |
 | 2026-11-27 | `p4h-11` (L4): phase 4 on human3: critically damped STIFF=2.5 kv=0.04, per-dim target_kl=0.002, annealed log_std -1.6..-2.5, 12-frame lookahead + ref_vel, 4000 updates, done | 11.55 |
 | 2026-11-27 | `p4h-12` (L4): phase 4 on human3 refs_clean: fine-tune from p4h-11 upd 4000 with startup-accel trim and 8x tail mining, 1200 updates, done | 4.07 |
+| 2026-11-27 | `amp-walk` (L4): phase 5 step 14: AMP style prior + walk controller on human3 physics-filtered capture (1993 clips), 1500 updates, done | 3.29 |
+| 2026-11-27 | `amp-walk2` (L4): phase 5 step 14: calibrated AMP walk with 200k replay buffer, logit reg, gp=10, and upright athletic style-caster prior (120 clips, 2.10 h), 1200 updates, done | 2.93 |
 
 #### A new machine
 

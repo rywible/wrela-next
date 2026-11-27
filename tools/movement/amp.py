@@ -144,7 +144,7 @@ class Clips:
     """The clips' frames and the stretches of frames the discriminator reads, as they are and
     damaged."""
 
-    def __init__(self, head, refs, kin, device, gen, q=None, x=None, active=None):
+    def __init__(self, head, refs, kin, device, gen, q=None, x=None, active=None, allow=None):
         self.q = torch.tensor(refs, device=device) if q is None else q
         self.starts = torch.tensor(head["starts"], device=device, dtype=torch.long)
         self.lengths = torch.tensor(head["lengths"], device=device, dtype=torch.long)
@@ -155,9 +155,13 @@ class Clips:
         self.active = active
         self.x = kin.places(self.q) if x is None else x
         sets = head.get("sets") or ["training"] * len(head["names"])
-        self.train = [i for i, s in enumerate(sets) if s == "training"] or list(range(len(sets)))
-        self.test = [i for i, s in enumerate(sets) if s == "test"]
         self.names = head["names"]
+        def allowed(name):
+            return not allow or any(name.startswith(p) for p in allow)
+        self.train = [i for i, s in enumerate(sets) if s == "training" and allowed(self.names[i])]
+        if not self.train:
+            self.train = [i for i, s in enumerate(sets) if s == "training"] or list(range(len(sets)))
+        self.test = [i for i, s in enumerate(sets) if s == "test"]
         self.k = torch.arange(WINDOW, device=device)
         # Each training frame that starts a stretch, at the fastest damaged time too.
         need = math.ceil(FASTEST * (WINDOW - 1)) + 2
@@ -218,14 +222,52 @@ class Clips:
         return self.damaged(g, kinds[k], amount, seed=seed)
 
 
+class Replay:
+    """Ring buffer of past policy feature windows so the AMP discriminator does not overfit to
+    the current rollout and collapse the style reward (Peng et al. 2021)."""
+
+    def __init__(self, cap, dim, device):
+        self.cap = cap
+        self.buf = torch.zeros(cap, dim, device=device, dtype=torch.float16)
+        self.size = 0
+        self.pos = 0
+
+    def push(self, x):
+        n = x.shape[0]
+        if n >= self.cap:
+            self.buf.copy_(x[-self.cap:].to(torch.float16))
+            self.size = self.cap
+            self.pos = 0
+            return
+        end = self.pos + n
+        if end <= self.cap:
+            self.buf[self.pos:end] = x.to(torch.float16)
+        else:
+            k = self.cap - self.pos
+            self.buf[self.pos:] = x[:k].to(torch.float16)
+            self.buf[:n - k] = x[k:].to(torch.float16)
+        self.pos = end % self.cap
+        self.size = min(self.cap, self.size + n)
+
+    def sample(self, n, gen):
+        i = torch.randint(0, self.size, (n,), device=self.buf.device, generator=gen)
+        return self.buf[i].float()
+
+
 class Disc(object):
     """The discriminator: least squares (capture 1, the rest -1), its gradient at the capture held
-    small (Peng et al. 2021, weight 5), on normalised inputs."""
+    small plus weight decay and logit regularisation (Peng et al. 2021), on normalised inputs."""
 
-    def __init__(self, n_in, hidden, device, lr):
+    def __init__(self, n_in, hidden, device, lr, gp=10.0, logit_reg=0.05):
         self.net = track.mlp(n_in, 1, hidden).to(device)
         self.norm = track.Normal(n_in, device)
-        self.opt = torch.optim.Adam(self.net.parameters(), lr=lr)
+        self.gp = gp
+        self.logit_reg = logit_reg
+        # Last linear layer (logit weights) gets dedicated L2 regularisation; hidden weights get
+        # modest weight decay so the discriminator cannot saturate on high-dim windows.
+        last = [m for m in self.net.modules() if isinstance(m, torch.nn.Linear)][-1]
+        self.logit_layer = last
+        self.opt = torch.optim.AdamW(self.net.parameters(), lr=lr, weight_decay=1e-4)
 
     def score(self, f):
         with torch.no_grad():
@@ -235,7 +277,8 @@ class Disc(object):
         d = self.score(f)
         return (1.0 - 0.25 * (d - 1.0) ** 2).clamp(min=0.0)
 
-    def train(self, pos, neg, gp=5.0):
+    def train(self, pos, neg, gp=None):
+        gp = self.gp if gp is None else gp
         self.norm.update(pos)
         p = self.norm(pos).requires_grad_(True)
         n = self.norm(neg)
@@ -243,6 +286,8 @@ class Disc(object):
         loss = ((dp - 1.0) ** 2).mean() + ((dn + 1.0) ** 2).mean()
         g = torch.autograd.grad(dp.sum(), p, create_graph=True)[0]
         loss = loss + gp * (g * g).sum(-1).mean()
+        if self.logit_reg > 0.0:
+            loss = loss + self.logit_reg * (self.logit_layer.weight ** 2).sum()
         self.opt.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.net.parameters(), 1.0)
@@ -319,13 +364,20 @@ def remember(sim, clips, hist_q, hist_x, which):
     hist_x[idx] = clips.x[i]
 
 
+def load_allow(path):
+    if not path:
+        return None
+    with open(path) as f:
+        return [l.strip() for l in f if l.strip() and not l.strip().startswith("#")]
+
+
 def offline(a, run, dev, gen, head, refs, mjm):
     """The discriminator alone against damaged training clips: the check of its input."""
     active = torch.tensor([b for b in range(1, mjm.nbody) if mjm.body_jntnum[b] > 0], device=dev, dtype=torch.long)
     kin = Kin(mjm, a.batch, active=active)
-    clips = Clips(head, refs, kin, dev, gen, active=active)
+    clips = Clips(head, refs, kin, dev, gen, active=active, allow=load_allow(a.style_clips))
     n_in = clips.windows(clips.sample(2)).shape[1]
-    disc = Disc(n_in, [int(x) for x in a.disc_hidden.split(",")], dev, a.disc_lr)
+    disc = Disc(n_in, [int(x) for x in a.disc_hidden.split(",")], dev, a.disc_lr, gp=a.grad_penalty)
     print(f"offline: {len(clips.train)} training clips, {len(clips.test)} test, input {n_in}", flush=True)
     t0 = time.time()
     for step in range(1, a.steps + 1):
@@ -349,14 +401,18 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--model", default="human.xml")
     p.add_argument("--refs", default="refs.bin")
+    p.add_argument("--style-clips", default="", help="optional file of clip prefixes defining the style prior")
     p.add_argument("--worlds", type=int, default=4096)
     p.add_argument("--steps", type=int, default=1000, help="updates of the net")
     p.add_argument("--horizon", type=int, default=32)
-    p.add_argument("--substeps", type=int, default=4)
+    p.add_argument("--substeps", type=int, default=0, help="the simulator's steps to a frame (0: from the model)")
     p.add_argument("--hidden", default="1024,512")
     p.add_argument("--disc-hidden", default="1024,512")
     p.add_argument("--lr", type=float, default=2e-4)
-    p.add_argument("--disc-lr", type=float, default=1e-4)
+    p.add_argument("--disc-lr", type=float, default=5e-5)
+    p.add_argument("--disc-steps", type=int, default=2, help="max discriminator updates per PPO step")
+    p.add_argument("--grad-penalty", type=float, default=10.0, help="discriminator gradient penalty weight")
+    p.add_argument("--replay", type=int, default=200000, help="AMP replay buffer size (feature windows)")
     p.add_argument("--batch", type=int, default=4096, help="pairs of each kind in a step of the discriminator")
     p.add_argument("--damaged", type=float, default=0.25, help="the share of the negatives from damaged capture")
     p.add_argument("--style", type=float, default=0.5, help="the style's share of the reward")
@@ -432,12 +488,16 @@ def goal_test(a, sim, agent, norm, clips, head, fall_height, frames=600, kept=16
 def train(a, run, dev, gen, head, refs, mjm):
     T = track
     t0 = time.time()
+    allow = load_allow(a.style_clips)
     sim = T.Sim(a.model, head, refs, a.worlds, dev, a.substeps, gen)
     kin = Kin(mjm, a.batch, active=sim.active)
-    clips = Clips(head, refs, kin, dev, gen, q=sim.ref_q, x=sim.ref_x, active=sim.active)
+    clips = Clips(head, refs, kin, dev, gen, q=sim.ref_q, x=sim.ref_x, active=sim.active, allow=allow)
+    # Start episodes from the style prior's clips so worlds begin in the same motion distribution.
+    sim.train = torch.tensor(clips.train, device=dev, dtype=torch.long)
+    sim.weights = sim.lengths[sim.train].float()
     fall_height = a.fall * clips.root_height
-    print(f"sim: {a.worlds} worlds, {len(head['names'])} clips, root height {clips.root_height:.3f} m, "
-          f"set up in {time.time() - t0:.0f} s", flush=True)
+    print(f"sim: {a.worlds} worlds, {len(clips.train)} style clips ({len(head['names'])} total), "
+          f"root height {clips.root_height:.3f} m, set up in {time.time() - t0:.0f} s", flush=True)
     sim.reset(torch.ones(a.worlds, dtype=torch.bool, device=dev))
     N, H = a.worlds, a.horizon
     hist_q = torch.zeros(N, WINDOW, sim.nq, device=dev)
@@ -457,7 +517,8 @@ def train(a, run, dev, gen, head, refs, mjm):
     norm = T.Normal(n_obs, dev)
     vnorm = T.ValNorm(dev)
     n_in = clips.windows(clips.sample(2)).shape[1]
-    disc = Disc(n_in, [int(x) for x in a.disc_hidden.split(",")], dev, a.disc_lr)
+    disc = Disc(n_in, [int(x) for x in a.disc_hidden.split(",")], dev, a.disc_lr, gp=a.grad_penalty)
+    replay = Replay(a.replay, n_in, dev) if a.replay > 0 else None
     step, samples = 0, 0
     state = run.resume()
     if state is not None:
@@ -532,15 +593,32 @@ def train(a, run, dev, gen, head, refs, mjm):
                 last = delta + 0.99 * 0.95 * nonterm * last
                 adv[h] = last
             ret = adv + val_buf[:H]
-        # The discriminator: capture against the net's pairs and damaged capture.
+        # The discriminator: capture against the net's pairs (50% current + 50% replay buffer so
+        # the discriminator stays calibrated and cannot saturate on the current rollout) and
+        # damaged capture.
         flat = feat_buf.reshape(H * N, -1)
+        if replay is not None:
+            k_push = min(4096, H * N)
+            idx_push = torch.randint(0, H * N, (k_push,), device=dev, generator=gen)
+            replay.push(flat[idx_push])
         n_damaged = int(a.batch * a.damaged)
+        n_pol = a.batch - n_damaged
         d_loss = d_pos = d_neg = 0.0
-        steps_d = min(max(1, (H * N) // a.batch), 4)
-        for _ in range(steps_d):
-            j = torch.randint(0, H * N, (a.batch - n_damaged,), device=dev, generator=gen)
-            neg = torch.cat([flat[j], clips.damaged_sample(n_damaged)]) if n_damaged else flat[j]
+        steps_d = max(1, a.disc_steps)
+        for di in range(steps_d):
+            if replay is not None and replay.size >= n_pol:
+                n_cur = n_pol // 2
+                n_rep = n_pol - n_cur
+                j = torch.randint(0, H * N, (n_cur,), device=dev, generator=gen)
+                pol_neg = torch.cat([flat[j], replay.sample(n_rep, gen)], 0)
+            else:
+                j = torch.randint(0, H * N, (n_pol,), device=dev, generator=gen)
+                pol_neg = flat[j]
+            neg = torch.cat([pol_neg, clips.damaged_sample(n_damaged)], 0) if n_damaged else pol_neg
             d_loss, d_pos, d_neg = disc.train(clips.windows(clips.sample(a.batch)), neg)
+            # Throttle extra discriminator updates if it is already well separated from policy.
+            if di == 0 and (d_pos - d_neg) > 1.0:
+                break
         b_obs, b_act = obs_buf.reshape(H * N, -1), act_buf.reshape(H * N, -1)
         b_logp, b_adv, b_ret = logp_buf.reshape(-1), adv.reshape(-1), ret.reshape(-1)
         b_adv = (b_adv - b_adv.mean()) / (b_adv.std() + 1e-8)

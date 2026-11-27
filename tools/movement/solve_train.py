@@ -34,26 +34,48 @@ def mlp(n_in, n_out, hidden):
 class Data:
     """The clips of a set on the device, and where a window of `w` frames can start."""
 
-    def __init__(self, head, x, which, w, ahead, device, stride=1):
+    def __init__(self, head, x, which, w, ahead, device, stride=1, balance_sources=False):
         self.x = torch.tensor(np.array(x), device=device)
         starts, lengths = head["starts"], head["lengths"]
-        firsts, ends, clips = [], [], []
+        names = head.get("names") or [""] * len(starts)
+        firsts, ends, clips, by_src = [], [], [], {}
         # Each window has room for the largest stride: a frame that far before it, and its frames.
         for i, s in enumerate(head["sets"]):
             if s != which or lengths[i] < stride * (w + 1) + 3:
                 continue
             f = np.arange(starts[i] + stride, starts[i] + lengths[i] - stride * (w + 1) - 1)
+            e = np.full(f.shape, starts[i] + lengths[i] - 1)
             firsts.append(f)
-            ends.append(np.full(f.shape, starts[i] + lengths[i] - 1))
+            ends.append(e)
             clips.append(i)
+            src = names[i].split("/")[0] if "/" in names[i] else ""
+            by_src.setdefault(src, ([], []))
+            by_src[src][0].append(f)
+            by_src[src][1].append(e)
         self.first = torch.tensor(np.concatenate(firsts), device=device)
         self.end = torch.tensor(np.concatenate(ends), device=device)
         self.clips = clips
         self.ahead = ahead
+        self.sources = None
+        if balance_sources and len(by_src) > 1:
+            self.sources = [
+                (torch.tensor(np.concatenate(fs), device=device),
+                 torch.tensor(np.concatenate(es), device=device))
+                for _, (fs, es) in sorted(by_src.items())
+            ]
 
     def sample(self, n, gen):
-        i = torch.randint(0, self.first.shape[0], (n,), device=self.first.device, generator=gen)
-        return self.first[i], self.end[i]
+        if self.sources is None:
+            i = torch.randint(0, self.first.shape[0], (n,), device=self.first.device, generator=gen)
+            return self.first[i], self.end[i]
+        m = len(self.sources)
+        fs, es = [], []
+        for idx, (sf, se) in enumerate(self.sources):
+            k = n // m + (1 if idx < (n % m) else 0)
+            i = torch.randint(0, sf.shape[0], (k,), device=sf.device, generator=gen)
+            fs.append(sf[i])
+            es.append(se[i])
+        return torch.cat(fs), torch.cat(es)
 
 
 class Norm:
@@ -101,6 +123,12 @@ def main(load_packed):
                         "a body far from the eye is solved each few frames (phase 5 step 10)")
     p.add_argument("--slide-target", type=float, default=1000.0,
                    help="the judge's slide target (mm/s) used to scale the ground-slide physics loss")
+    p.add_argument("--smooth", type=float, default=0.0,
+                   help="weight of step-to-step joint acceleration smoothness penalty")
+    p.add_argument("--balance-sources", action="store_true",
+                   help="sample each capture source equally rather than by raw frame count")
+    p.add_argument("--cosine-lr", action="store_true",
+                   help="cosine-decay learning rate to 0.1*lr over the second half of training")
     p.add_argument("--eval-every", type=int, default=2000)
     p.add_argument("--threads", type=int, default=0)
     a = p.parse_args(run.args)
@@ -114,7 +142,7 @@ def main(load_packed):
     rate = head["rate"]
     body = motion.Body(a.body, dev)
     strides = [int(k) for k in a.strides.split(",")]
-    train = Data(head, x, "training", a.window, int(rate), dev, max(strides))
+    train = Data(head, x, "training", a.window, int(rate), dev, max(strides), balance_sources=a.balance_sources)
     test = Data(head, x, "test", a.window, int(rate), dev, max(strides))
     D = head["d"]
     ns, nt, ng = motion.STATE_ROOT + 2 * D, motion.STEP_ROOT + D, motion.GOAL
@@ -180,8 +208,9 @@ def main(load_packed):
         prior_rows = (torch.rand(B, 1, device=dev, generator=gen) < a.prior)
         # The codes at the frames the steps start at, as the engine draws them (a tick a frame).
         code_prior = smooth_codes(B, w * k, gen)[::k]
-        rec, kl, phys, ground = 0.0, 0.0, 0.0, 0.0
+        rec, kl, phys, ground, smooth = 0.0, 0.0, 0.0, 0.0, 0.0
         ends0 = None
+        prev_out = None
         # The window's mean velocity along the ground (its steps, in each frame's heading frame)
         # and its goals' mean, for the goal's loss.
         v_sum = torch.zeros(B, 2, device=dev)
@@ -203,6 +232,9 @@ def main(load_packed):
             else:
                 z = torch.randn(B, a.z, device=dev, generator=gen)
             out = decode(s, g, mask, z, k)
+            if a.smooth > 0.0 and prev_out is not None:
+                smooth = smooth + ((out - prev_out) ** 2).mean()
+            prev_out = out
             # A Gaussian likelihood of the step (spread 1 in its normalised numbers): summed over
             # the numbers, so the code's KL weighs against the whole step.
             rec = rec + 0.5 * ((out - n_step(tgt)) ** 2).sum(-1).mean()
@@ -241,7 +273,7 @@ def main(load_packed):
         # Only the windows whose speed goal was shown are held to it.
         shown = mask[:, 0:1]
         goal_err = (shown * (v_sum / w - g_sum / w) ** 2).sum(-1).mean()
-        return rec / w, kl / w, phys / w, goal_err, ground / w
+        return rec / w, kl / w, phys / w, goal_err, ground / w, smooth / max(w - 1, 1)
 
     # The parts the physics measures: those that stand on the floor at rest (the soles), whose
     # kinematics alone are worked out, as the judge's slide and depth are the feet's in walking.
@@ -330,8 +362,13 @@ def main(load_packed):
         # Each update one stride: 1 half the time, the others the rest alike.
         u = float(torch.rand(1, device=dev, generator=gen))
         k = strides[0] if (u < 0.5 or len(strides) == 1) else strides[1 + int((u - 0.5) * 2 * (len(strides) - 1))]
-        rec, kl, phys, goal_err, ground = rollout(train, starts, ends, a.window, fed, True, k)
-        loss = rec + a.beta * kl + a.physics * phys + a.goal * goal_err + a.ground * ground
+        if a.cosine_lr and step >= a.steps // 2:
+            prog = (step - a.steps // 2) / max(a.steps - a.steps // 2, 1)
+            lr_now = a.lr * (0.1 + 0.45 * (1.0 + math.cos(math.pi * prog)))
+            for pg in opt.param_groups:
+                pg["lr"] = lr_now
+        rec, kl, phys, goal_err, ground, smooth = rollout(train, starts, ends, a.window, fed, True, k)
+        loss = rec + a.beta * kl + a.physics * phys + a.goal * goal_err + a.ground * ground + a.smooth * smooth
         opt.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(list(enc.parameters()) + list(dec.parameters()), 1.0)
