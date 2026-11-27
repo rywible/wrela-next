@@ -1,6 +1,8 @@
 # Plan: a build-time engine with state-box proofs and continual LOD
 
-Status: draft (2026-11-26, revision 2 after adversarial review). Grounded in the code at commit
+Status: draft (2026-11-26, revision 2 after adversarial review; revision 3, 2026-11-27: phase 3's
+end is the pool's own cost and a bit-for-bit judge, stage 3C is dropped, 3B waits on a
+measurement, and every frame-time target is in section 17). Grounded in the code at commit
 `63f682a` on branch `engine-plan` and the record in `docs/plans/engine-at-build.md`. This plan
 succeeds the open work of `docs/plans/engine-at-build.md` once approved.
 
@@ -160,12 +162,19 @@ message.
 | 0 | Kill tests, roofline/utilization, and cut simulation on both machines | Low | Nothing |
 | 1 | Clean base: kernel-derived shape hash, bug fixes, Radeon gate | Low-medium | Phase 0 |
 | 2 | Footprint-integrated sun judge and conservative sun maps | Low-medium | Phase 1 |
-| 3 | World-anchored persistent `BrickPool` and continual LOD (staged) | High | Phase 2 |
-| 4 | State-box proofs `f(p; Theta)`, hard-CSG split, and motion by structure | Medium | Phase 3 |
-| 5 | Exact-pass specialization and two-slope / piecewise enclosures | Medium | Phases 0 and 3 |
+| 3 | World-anchored persistent `BrickPool`, judged bit for bit against a cold extraction | High | Phase 2 |
+| — | The schedule floor and SCENE 10's unlisted 7 ms, measured | Low | Phase 3 |
+| 5.1 | Phase 5 step 1 first: the turned profile's enclosure, the flutes' steepness | Medium | Phase 3 |
+| 4 | State-box proofs `f(p; Theta)`, hard-CSG split, and motion by structure | Medium | Phase 5.1 |
+| 5 | The rest of phase 5: exact-pass specialization | Medium | Phases 4 and 5.1 |
 | 6 | Moving sand veil, contact enclosure, and instantaneous fused glass | Low-medium | Phase 4 |
 
-Why this order:
+Revision 3 order (2026-11-27): phase 3 ends when the pool's own passes are cheap and a judge
+holds it to a cold extraction bit for bit, not on a frame time; then the schedule floor and the
+7 ms of SCENE 10's span that no listed pass holds are measured; then phase 5's first step, then
+phase 4. Every frame-time target is in section 17 and is held there, after the phases.
+
+Why this order (revision 2):
 
 - Phase 0 replaces every assumption with measured numbers on both machines before rewriting
   extraction.
@@ -449,119 +458,63 @@ radiance error rather than point-sampled sub-cell tessellation noise.
 
 ## 10. Phase 3: World-anchored brick pool and continual LOD
 
-Purpose: make moving and turning frames cost nearly the same as still frames, and deliver
-pop-free, crack-free continual LOD.
+Purpose: make a moving or turning eye cost little more than a still one, by keeping every brick
+it extracted, and prove the kept mesh is the mesh a cold extraction makes.
 
-**State (2026-11-27): not done.** Built so far: a held mesh is extracted for no eye, and its
-outline's exact cells are found each frame from what the extraction kept (`mesh::outline`, its
-certificates cached per vertex and its beside cells' proofs per slot); the view-fitted rings are
-made with slack and kept while they hold what the eye needs (`grids_hold`); every grid's corners
-are on the world's lattice (`grid_for`). M4, 1080p, gate medians: SCENE 10 VIEW 3 31.3 ms, VIEW 4
-(running) 68.3, VIEW 5 (turning) 54.7; SCENE 13 VIEW 3 83.8, VIEW 4 26.9, VIEW 5 19.4 (still: 20.8
-and 15.8). Against the 16.6 ms line the moving frames are 2 to 5 times over.
+**State (2026-11-27): not done.** Built: a held mesh is extracted for no eye, and its outline's
+exact cells are found each frame from what the extraction kept (`mesh::outline`); every grid's
+corners are on the world's lattice (`grid_for`). And in work in progress (`b6fe922`): a static,
+opaque mesh of nested rings is a `BrickPool` (`mesh::pool`): its bricks keyed by `(lattice brick,
+level, hole mask, thing)`, kept in persistent slots, a new cut probing the pool and extracting
+only its misses and its seam faces' bricks (a transient tail), its bricks' indices compacted into
+one draw. An update draws its new cut only when the cut is whole (`pool_decide`); else the last
+whole cut stays drawn, whole, and the update reads back late. Its misses are dispatched for as
+many as the two cuts' boxes bound (`cut_bounds`), a count, not a guess. The rings are fitted by
+distance alone (`build_lod_grids_distance`), with the eye's turn changing no brick.
 
-Where the time goes (serial passes, frames 30 to 129): SCENE 10 VIEW 4, extraction 21.7 ms and
-the outline's certificates 15.9 (beside and kept cells 9.9); SCENE 13 VIEW 3, the exact pass 29.5,
-extraction 23.2, the sun's exact rays 6.7. A moving eye extracts a batch again every time its fit
-changes, all of it: running, the courtyard 135 times in 240 frames, about 19,800 bricks each; on
-the tour the table 116 times at 10,300. Most of those bricks are the same bricks as the last
-extraction's, and each extraction also empties the certificates' cache.
+M4, 1080p, gate medians, `6c6adcc` against the pool (`b6fe922`'s parent, gate of 2026-11-27 10:29):
+SCENE 10 VIEW 3 31.7 → 27.0 ms, VIEW 4 68.2 → 25.8, VIEW 5 54.6 → 13.3; SCENE 13 VIEW 3 84.3 →
+53.1, VIEW 4 26.9 → 17.1, VIEW 5 19.3 → 8.8. Still spans held (SCENE 10 20.7, 13 15.7). On
+SCENE 10 VIEW 4 (frames 30 to 269) the pool updates in 91 of 240 frames: about 29,000 bricks
+kept, 1,000 extracted and 700 seam bricks a update; its own passes are under the median of every
+label (the extraction's 2.9 ms median a frame is the moving kinds', every frame, as still), and
+the outline's certificates (`mesh_watch*`, 6.2 ms) are the moving eye's cost. Open: a full pool is
+emptied and extracted again whole (every ~25 updates, a 18 ms frame); a cut that cannot commit
+extracts nothing toward it.
 
-What is next, in order:
-1. **Bricks kept across a fit's change.** The root grid's origin on the lattice of its bricks
-   (`BRICK` cells, not one), so a brick of a level is the same brick in every fit that has that
-   level's cell; a new fit re-extracts only the bricks whose level or seam neighbourhood changed,
-   as an edit's patch does now (`try_patch_dirty`: kill the old bricks' slots, append the new
-   ones), with the 2:1 seam bricks (those within a brick of a ring's face) always among them.
-   What the patch path lacks is the seam: a patched brick on a ring's face needs its coarse
-   neighbour's corners (`inherit_seam_corners`) and its seam cells (`box_seam_cells`). The slots'
-   outline records (`QuadRec`, `SlotBrick`) and the certificate cache stay with their slots.
-2. **The certificate cache by place, not by vertex**, so a re-extracted brick's vertices keep
-   their certificates (they are the same vertices, at the same bits, on the world's lattice).
-3. The exact pass's cost close up is phase 5's (the table's 37,303 exact cells on the tour).
+### Steps, in order
 
-Build this phase in three independently gated stages.
+1. **A judge of the pool, first.** After a walk and a turn, the pooled mesh is the mesh a cold
+   extraction of the same cut makes, bit for bit: the same triangles of the same vertices (each
+   brick's indices and the vertices they name, compared by place, not by slot), the same exact
+   cells, the same outline records. It replaces the path-independence test
+   (`distance_grids_are_path_independent_and_rotation_invariant`, which compares grids, never a
+   mesh) and is held by the gate. `quad_error_bound` and `brdf_normal_budget` (stage 3B's, read by
+   no engine code) are deleted with their test.
+2. **The pool frees slots as it goes.** A brick no cut has drawn for longest leaves when a slot,
+   index or vertex range is wanted, instead of the pool being emptied and extracted again whole
+   when full. An update fills the pool with the cut's misses up to the frame's budget even when the
+   cut cannot commit, and commits when the cut is whole. The pool moves out of `extract.wrela` into
+   its own module (`mesh::pool`), one path for its update.
+3. **Rings by a rule, not by caps.** `build_lod_grids_distance`'s tuned caps (spans of 40 and 28
+   bricks, volumes of 48,000 and 24,000, the area factors) are removed. A gated number counts the
+   pixels drawn from a coarser cell than the pixel rule (`CELL_PX`) wants; each ring's reach is
+   derived from that rule and the pool's size. Distance-only rings against view-fitted rings kept
+   while they hold are decided by that count and the pool's cost, measured on both machines.
+4. **Stage 3B only on a measurement.** The two-sided error and normal cone (`delta_pos`,
+   `delta_n`) are built only if a gated measurement (the sun's judge, the hole audit, or a judge of
+   the light) shows the slab certificates fail where they would not.
 
-### Stage 3A: World-anchored nested rings + persistent `BrickPool`
-
-1. **Use integer `BrickKey` and camera-relative coordinates.**
-   - Key every brick by integer `BrickKey = (batch_id, level, bx, by, bz)`.
-   - Compute draw positions relative to the eye (or brick-relative) so open worlds stay exact past
-     `2^24` cells from the world origin.
-2. **Put nested rings on one world-anchored power-of-two lattice with distance-only residency.**
-   - Select bricks by **eye distance only** (frustum-cull only at draw time) so fast turns cost
-     zero new extractions and off-screen sun casters stay resident.
-3. **Build the persistent GPU `BrickPool`.**
-   - Fixed-capacity GPU slot arenas sized from Phase 0's simulator counts.
-   - Open-addressed GPU hash table keyed by `BrickKey` with frame-stamp LRU eviction.
-   - Define both the **wanted cut** and the **drawn cut** (finest complete, balanced set of
-     resident bricks). Mark a batch `settled` only when `drawn == wanted` and seams are built.
-   - Add **lateness** (fraction of pixels drawn coarser than wanted, and longest frames late) to
-     `tools/gate`.
-4. **Reuse today's 2:1 ring seams** while keeping each brick's interior mesh cached across frames.
-   Verify zero re-extraction of resident bricks along `SCENE 13 VIEW 3` and the turning view.
-
-### Stage 3B: Unified two-sided error budget (`delta_pos` + `delta_n`)
-
-1. **Define one two-sided error bound per quad (`delta_pos`, `delta_n`).**
-   - **Position error (`delta_pos`):** take the convex slab of each quad's `2 × 2 × 2` dual
-     region. Make Dual Contouring **clamp each solved vertex into its dual-region slab** so the
-     quad provably lies in the slab. When the region is a single sheet over the plane, both
-     mesh-to-surface and surface-to-mesh distances are bounded by the slab width. Uncertified
-     cells stay `ExactCell` (bounded by march tolerance), so `delta_pos` is always finite.
-   - **Normal error (`delta_n`):** derive a normal cone from closed-form analytic leaf curvature
-     (or gradient intervals where no closed form exists) and compare against the material's BRDF
-     lobe width so smooth curved gold and glass do not facet at coarse levels.
-   - Add a slow CPU reference test checking true two-sided Hausdorff distance and normal error
-     between triangles and `f(p) = 0`.
-2. **Resolve `mesh_certify` residency using Phase 0 step 3's measurement.**
-   - If per-eye certification dominates turning, cache view-independent per-cell certificates on
-     each brick (and run only a tiny per-eye outline select or keep only truly uncertified cells
-     as `ExactCell`).
-
-### Stage 3C: Resolution-safe baked `delta` and continual LOD
-
-*(Proceed to Stage 3C only if Phase 0 step 6's simulator confirms error-driven cuts beat Stage
-3A's nested rings enough to justify the complexity.)*
-
-1. **Prove the 2:1 balance theorem on paper before coding it.**
-   - Bake `delta` in **metres** per coarse octree node at build time (no mesh needed; for moving
-     kinds, bake the worst `delta` over the legal state box `Theta` so no per-brick time term
-     breaks the theorem).
-   - At build time, apply a max-plus gradient-limiting pass (which only raises `delta`, so it is
-     always safe) enforcing:
-     1. **Nestedness:** child refined implies parent refined.
-     2. **Lipschitz bound at the finest supported pixel** `p_fine`.
-     3. **Gap condition `(1 + k) * s` at the coarsest supported pixel** `p_coarse` (covering
-        `640x360` and `320x180` audit/sun resolutions), including each node's half-diagonal for
-        top-down box tests and the edge/corner neighbor factor (`sqrt(2)` / `sqrt(3)`).
-   - Then 2:1 balance across faces and shared DC edges is a theorem for every eye position and
-     every supported screen resolution, with zero GPU balancing pass.
-2. **Prove pool size and per-frame budget from counts.**
-   - From maximum game movement speed (Phase 0 step 2) and the baked octree census, compute the
-     maximum resident bricks and maximum bricks entering per frame at build time. Parent fallback
-     is then needed only on teleports.
-3. **Decouple 2:1 seam faces from cached brick interiors.**
-   - Emit seam quads into a dedicated seam buffer for active level boundaries only, leaving
-     resident brick interiors untouched.
-4. **Remove old view-coupled grid code and arbitrary caps.**
-   - Delete `build_lod_grids_view` and its magic constants (`vol_cap 160000`, `area_cap 400..9000`,
-     `1.12`, `0.85`).
-5. **Add a path-independence test:** reach the same eye position by two different paths and
-   verify the settled brick sets are bit-identical.
+Stage 3C (baked `delta` cuts) is dropped: phase 0's census found 651 of the courtyard's 1,183
+coarse bricks without a slab, and the pool's cuts by distance hold the moving eye without it.
 
 ### Done when
 
-- `SCENE 13 VIEW 3` (moving eye) and the max-speed turning views have median span at or below
-  `16.6 ms` on the M4, and moving-minus-still overhead is under `2 ms` on `SCENE 10` and `SCENE
-  13`.
-- Zero resident bricks are re-extracted along `SCENE 13 VIEW 3` or during pure camera rotation.
-- Lateness is zero during max-speed walking and turning (within the proven per-frame entry count).
-- Full hole audit (still and moving), CPU two-sided Hausdorff + normal check, path-independence
-  test, and sun judge pass on both M4 and Radeon with zero cracks on opaque and transmissive
-  meshes.
-
----
+- The pool's own passes (cull, probe, misses, seam tail, compaction) cost under 2 ms over still
+  on the moving views (`SCENE 10 VIEW 3, 4, 5`, `SCENE 13 VIEW 3, 4, 5`), on the M4.
+- No resident brick is extracted again along those views (the pool's count of extractions of a
+  key it holds is 0), and the judge of step 1 holds after a walk and a turn.
+- `tools/gate --full` passes on the M4 and the Radeon.
 
 ## 11. Phase 4: State-box proofs `f(p; Theta)`, hard-CSG split, and motion by structure
 
@@ -619,7 +572,6 @@ Stage 3C, and parametric spell bounds.
 
 - `Auditing::move_eyes` passes with zero holes on the flame, the ward, the bolt, and a rigid mover
   on both M4 and Radeon.
-- `SCENE 10` (still, walking, and turning) is at or below `16.6 ms` on the M4.
 - GPU extraction work for the ward and flames drops by at least 50% compared to Phase 3.
 
 ---
@@ -630,6 +582,10 @@ Purpose: remove the remaining exact-cell proof debt on heavy showcase assets (`S
 `SCENE 14`), driven by Phase 0's failure census.
 
 ### Steps
+
+Step 1 runs before phase 4 (revision 3), its first two items first: the turned profile's
+enclosure (`stick_turned`: 89 of the candlestick's 100 cells) and the flutes' steepness (the
+pillars' 12,039 and the column's 5,720, from `cmul` squared).
 
 1. **Upgrade enclosures for the failure classes measured in Phase 0 step 5.**
    - **Two-slope linear bounds** (CROWN, Zhang et al. 2018; DeepPoly, Singh et al. 2019 — cite in
@@ -658,9 +614,8 @@ Purpose: remove the remaining exact-cell proof debt on heavy showcase assets (`S
 
 ### Done when
 
-- `SCENE 14` candlestick exact-cell cost drops from `8.2 ms` to under `2.5 ms` on the M4.
-- Every gate scene (`SCENE 10, 11, 13, 14, 16`, still, walking, and turning) is at or below
-  `16.6 ms` on the M4, and faster than Phase 1 on the Radeon.
+- The candlestick's, the table's and the pillars' certified cell rates are re-measured and in
+  this file, each failure class of phase 0's census repaired or named.
 - One-field rebuild time stays under 25 s on the M4, and `SCENE 6` Vulkan build RAM does not
   regress.
 
@@ -743,16 +698,14 @@ Any published method that later lands must be cited in `docs/citations.md`.
 
 ## 15. Main risks and open questions
 
-1. **Radeon baseline and per-pass breakdown (Phase 0 step 1):** The Radeon gate has not run on
-   this branch; its 56.6 ms line dates from `1c78609` before strict math. Measure it first.
-2. **Phase 3 scope and Stage 3C payoff:** Keep Stages 3A, 3B, and 3C strictly separate and gate
-   each one. Let Phase 0's error-driven simulator decide whether Stage 3C beats Stage 3A enough to
-   build it.
-3. **2:1 theorem across resolutions (Stage 3C):** Prove the top-down box test, nestedness, finest-
-   pixel Lipschitz bound, and coarsest-pixel gap on paper before writing GPU code.
-4. **CSG split overdraw & glass (Phase 4 step 2):** Gate hard-CSG splitting on Phase 0 step 5's
+1. **Radeon baseline and per-pass breakdown:** the Radeon's gate baseline is its full gate of
+   `6c6adcc` (`94003ce`); its per-pass table is still to be taken beside the M4's.
+2. **The pool's memory:** each pooled batch keeps its slots, its index and vertex arenas and an
+   exact-cell arena (262,144 cells, 8 MiB) on the GPU; the pool's size is what step 3 derives the
+   rings' reach from, so it is measured on both machines, not tuned.
+3. **CSG split overdraw & glass (Phase 4 step 2):** Gate hard-CSG splitting on Phase 0 step 5's
    leaf certification and overdraw kill test; keep joint meshes for transmissive surfaces.
-5. **Shader specialization vs Vulkan build RAM (Phase 5 step 2):** `SCENE 6` Vulkan builds already
+4. **Shader specialization vs Vulkan build RAM (Phase 5 step 2):** `SCENE 6` Vulkan builds already
    take 4.7 GB. Keep specialized exact-hit kernels strictly bounded by build RAM and compile time.
 
 ## 16. How to keep this plan
@@ -763,3 +716,19 @@ Any published method that later lands must be cited in `docs/citations.md`.
   when that phase completes.
 - If a measurement proves a step wrong, update that step in the same commit.
 - When all phases are done, remove this file.
+
+## 17. Frame-time targets
+
+Held after the phases (revision 3), on the gate's spans (`tools/gate`, 1080p, the mean over its
+placements), each phase's measurements recorded at its heading on the way:
+
+- Every gate scene (`SCENE 10, 11, 13, 14, 16`), still, walking and turning (`VIEW 3, 4, 5`), at
+  or below 16.6 ms on the M4, and faster than phase 1's baseline (`94003ce`, from `6c6adcc`) on
+  the Radeon.
+- Moving less still under 2 ms on `SCENE 10` and `SCENE 13`.
+- The candlestick's exact cells under 2.5 ms on `SCENE 14` (from 8.2 ms).
+
+Before phase 5's step 1 and phase 4, two measurements on both machines: the schedule floor (a
+frame with every dispatch emptied: what submission and the passes' order cost alone), and the
+7 ms of SCENE 10's 20.7 ms span that no pass of the per-pass table above 0.6 ms holds (passes
+summed, the idle inside the span, the floor).
