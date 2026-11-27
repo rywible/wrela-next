@@ -1092,6 +1092,7 @@ impl<'a> Counter<'a> {
                 let v = match (op, known(x)) {
                     (UnOp::Not, Some(Const::Bool(b))) => Some(Const::Bool(!b)),
                     (UnOp::Neg, Some(Const::I32(i))) => Some(Const::I32(i.wrapping_neg())),
+                    (UnOp::Neg, Some(Const::F32(x))) => Some(Const::F32(-x)),
                     _ => None,
                 };
                 (OP * comps(x), v)
@@ -1102,7 +1103,7 @@ impl<'a> Counter<'a> {
                 }
                 let n = binary_cost(&m.types, fr.f, *op, *a, *b);
                 let v = match (known(a), known(b)) {
-                    (Some(x), Some(y)) => fold(*op, x, y),
+                    (Some(x), Some(y)) => fold(*op, x, y, m.strict),
                     // One side settles it: `done && i < n` is false once `i` reaches `n`,
                     // whatever `done` is (a loop's exit the count can see).
                     (Some(Const::Bool(false)), _) | (_, Some(Const::Bool(false)))
@@ -1142,7 +1143,22 @@ impl<'a> Counter<'a> {
                     (Builtin::Clamp, Some([x, lo, hi]), Some(c)) if lo <= hi => {
                         same_int(c, (*x).max(*lo).min(*hi))
                     }
-                    _ => None,
+                    _ => {
+                        // Of known `f32`s, none NaN: their least, most and size are exact.
+                        let fs: Option<Vec<f32>> = args
+                            .iter()
+                            .map(|a| match fr.vals.get(a) {
+                                Some(Const::F32(x)) if !x.is_nan() => Some(*x),
+                                _ => None,
+                            })
+                            .collect();
+                        match (b, fs.as_deref()) {
+                            (Builtin::Min, Some([x, y])) => Some(Const::F32(x.min(*y))),
+                            (Builtin::Max, Some([x, y])) => Some(Const::F32(x.max(*y))),
+                            (Builtin::Abs, Some([x])) => Some(Const::F32(x.abs())),
+                            _ => None,
+                        }
+                    }
                 };
                 (w, v)
             }
@@ -1390,7 +1406,12 @@ fn texture_cost(op: TextureOp) -> u64 {
 }
 
 /// An integer or `bool` operation on known values, as the GPU computes it.
-fn fold(op: BinOp, a: Const, b: Const) -> Option<Const> {
+/// `a op b` where both are known. Integers and `bool`s always; two `f32`s compared always (a
+/// comparison of two values is exact everywhere), and their arithmetic where the module's is
+/// exact (`exact`: a strict module, IEEE rounding with no contraction) and no input or result is
+/// subnormal (a device may flush those): `steep(f)`, a constant steepness over a line, is then
+/// known as the flattened code knows it, and the work behind it is counted only where it runs.
+fn fold(op: BinOp, a: Const, b: Const, exact: bool) -> Option<Const> {
     use std::cmp::Ordering;
     let cmp = |o: Ordering| {
         Some(Const::Bool(match op {
@@ -1423,6 +1444,28 @@ fn fold(op: BinOp, a: Const, b: Const) -> Option<Const> {
             BinOp::Shl => Some(Const::U32(x.wrapping_shl(y))),
             BinOp::Shr => Some(Const::U32(x.wrapping_shr(y))),
             _ => cmp(x.cmp(&y)),
+        },
+        (Const::F32(x), Const::F32(y)) => match op {
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                Some(Const::Bool(match op {
+                    BinOp::Eq => x == y,
+                    BinOp::Ne => x != y,
+                    BinOp::Lt => x < y,
+                    BinOp::Le => x <= y,
+                    BinOp::Gt => x > y,
+                    _ => x >= y,
+                }))
+            }
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div if exact => {
+                let r = match op {
+                    BinOp::Add => x + y,
+                    BinOp::Sub => x - y,
+                    BinOp::Mul => x * y,
+                    _ => x / y,
+                };
+                [x, y, r].iter().all(|v| !v.is_subnormal()).then_some(Const::F32(r))
+            }
+            _ => None,
         },
         (Const::Bool(x), Const::Bool(y)) => match op {
             BinOp::And => Some(Const::Bool(x && y)),
@@ -1672,5 +1715,39 @@ mod tests {
         let (_, totals) = work_and_loop_totals(&m);
         let total = totals.get(&at).copied().flatten().expect("a bounded loop");
         assert!(total >= 50 * SLOW_OP, "{total}");
+    }
+
+    /// `fn steep() -> f32 { max(1.0, 0.5) }` and `if steep() > 1.15 { 50 square roots }`: the
+    /// steepness is a constant the call returns, so the comparison is known false and the branch
+    /// isn't counted, as the flattened code (which folds it away) isn't. (`cull_bricks`' octant
+    /// tests behind `steep(f)` once counted 12,636 work before flattening to 2,136 after.)
+    #[test]
+    fn a_constant_float_s_comparison_settles_its_branch() {
+        let mut m = Module::default();
+        let (b, f32_ty) = (m.types.bool(), m.types.f32());
+        let mut steep = Function::new("steep", Vec::new(), Some(f32_ty));
+        let mut sb = Vec::new();
+        let one = steep.let_(&mut sb, f32_ty, Expr::Const(Const::F32(1.0)));
+        let half = steep.let_(&mut sb, f32_ty, Expr::Const(Const::F32(0.5)));
+        let most = steep.let_(&mut sb, f32_ty, Expr::Builtin(Builtin::Max, vec![one, half]));
+        sb.push(Stmt::Return(Some(most)));
+        steep.body = sb;
+        let steep = m.add_function(steep);
+        let mut f = Function::new("f", Vec::new(), None);
+        let mut body = Vec::new();
+        let lip = f.let_(&mut body, f32_ty, Expr::Call(steep, Vec::new()));
+        let line = f.let_(&mut body, f32_ty, Expr::Const(Const::F32(1.15)));
+        let over = f.let_(&mut body, b, Expr::Binary(BinOp::Gt, lip, line));
+        let two = f.let_(&mut body, f32_ty, Expr::Const(Const::F32(2.0)));
+        let mut heavy = Vec::new();
+        for _ in 0..50 {
+            f.let_(&mut heavy, f32_ty, Expr::Builtin(Builtin::Sqrt, vec![two]));
+        }
+        body.push(Stmt::If { cond: over, then: heavy, else_: vec![] });
+        body.push(Stmt::Return(None));
+        f.body = body;
+        let f = m.add_function(f);
+        let w = entry_work(&m, f).work.expect("bounded");
+        assert!(w < 50 * SLOW_OP, "{w}");
     }
 }

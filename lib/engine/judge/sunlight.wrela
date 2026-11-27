@@ -11,12 +11,15 @@
 // surface faces away from part of the sun's disc (the terminator: the light there is the lean's,
 // not the shadow's) are counted apart and not judged.
 //
-// A pixel's light is the mean over its footprint, so the reference's is too: its rays leave
-// from `receivers` points of the pixel's square (each its own ray from the eye, taken to the
-// field), the sun's disc stratified among them, and the pixel's reference sun is the mean of all
-// its rays. A caster thinner than a cell shades part of a pixel's footprint and the judge sees
-// that part, where one point at the pixel's middle saw it whole or not at all as the lattice of
-// cells moved (SCENE 13 VIEW 0's hard leaks 754 to 882 with the cells 1% larger).
+// A pixel's light is the mean over its footprint, the engine's and the reference's alike: the
+// picture is drawn `SUN_FOOT` times as wide and high as the judged one, a judged pixel's light is
+// the mean of its `SUN_FOOT²` drawn pixels' (the engine's sun at each), and the reference's rays
+// leave from the same drawn pixels' points (each taken to the field), the sun's disc stratified
+// among them. A caster thinner than a cell shades part of a footprint and both sides see that
+// part, where one point at a pixel's middle saw it whole or not at all as the lattice of cells
+// moved (SCENE 13 VIEW 0's hard leaks 673 to 853 over eight placements, one point a pixel;
+// 28 to 54 with four). A reference of four points held to an engine of one counted each half-lit
+// footprint at an edge as half the sun wrong (a p99 of 128/255).
 
 use matter::matter::{Matter, SCOPE, matter}
 use matter::sky::Sky
@@ -92,15 +95,16 @@ fn onto_surface<M: Field<Substance>>(m: Matter<M>, p: vec3, tol: f32) -> (vec3, 
     (q, abs(m.field.distance(q)) <= tol)
 }
 
-/// The most receivers a pixel's footprint is judged from (`sun_judge`'s `receivers`), and where
-/// in the pixel's square each of four is: the middles of its quarters.
-pub const SUN_RECEIVERS_MOST: u32 = 4
+/// The drawn pixels along each side of a judged pixel's footprint: the picture the judge is
+/// given is this many times the judged one's width and height.
+pub const SUN_FOOT: u32 = 2
 
-fn receiver_at(j: u32, receivers: u32) -> vec2 {
-    if receivers <= 1 {
-        return vec2(0.5)
-    }
-    vec2(0.25 + 0.5 * f32(j & 1), 0.25 + 0.5 * f32((j >> 1) & 1))
+/// The drawn pixels of a judged pixel's footprint, each a receiver of its rays.
+pub const SUN_RECEIVERS: u32 = SUN_FOOT * SUN_FOOT
+
+/// The drawn pixel of receiver `j` of judged pixel `(x, y)`.
+fn drawn_of(x: u32, y: u32, j: u32) -> vec2u {
+    vec2u(x * SUN_FOOT + j % SUN_FOOT, y * SUN_FOOT + j / SUN_FOOT)
 }
 
 /// How far a judging ray marches a pass (steps), and in how many passes: a ray still going after
@@ -119,8 +123,9 @@ const RAY_MET: f32 = -2.0
 const RAY_LOST: f32 = -3.0
 const RAY_NONE: f32 = -4.0
 
-/// Each receiver of each pixel (`receivers` a pixel, `receiver_at`), its eye ray from the
-/// picture's depth taken to the field's own surface (`onto_surface`), and the way it faces:
+/// Each receiver of each judged pixel (its footprint's drawn pixels, `drawn_of`), its eye ray
+/// from the drawn picture's depth there taken to the field's own surface (`onto_surface`), and
+/// the way it faces:
 /// `at` `(p, 1)` and `facing` `(n, 0)` where judged; `at.w` 0 where not covered, 2 at the
 /// terminator, 3 off the field, 4 at an outline (the field's facing over 60° from the
 /// picture's).
@@ -131,25 +136,23 @@ pub fn sun_placed<M: Field<Substance>, S: Sky>(
     place: Texture<Rgba32Float>,
     v: View,
     first: u32,
-    receivers: u32,
     at: mut Slots<vec4>,
     facing: mut Slots<vec4>,
     id: GlobalId,
 ) {
-    let w = place.width()
+    let w = place.width() / SUN_FOOT
     let ri = first + id.x
-    let i = ri / receivers
-    if id.x >= SUN_PIXELS * 8 || i >= w * place.height() {
+    let i = ri / SUN_RECEIVERS
+    if id.x >= SUN_PIXELS * 8 || i >= w * (place.height() / SUN_FOOT) {
         return
     }
-    let x = i % w
-    let y = i / w
+    let px = drawn_of(i % w, i / w, ri % SUN_RECEIVERS)
     at[id] = vec4(0.0)
-    let cp = place.load(x, y)
+    let cp = place.load(px.x, px.y)
     if cp.w <= 0.0 {
         return
     }
-    let d = v.ray(vec2(f32(x), f32(y)) + receiver_at(ri % receivers, receivers))
+    let d = v.ray(vec2(f32(px.x), f32(px.y)) + vec2(0.5))
     let p0 = v.at + d * cp.w
     // The mesh's certified error is under half a pixel; four pixels' width is the most it is
     // allowed to be taken.
@@ -169,6 +172,24 @@ pub fn sun_placed<M: Field<Substance>, S: Sky>(
     at[id] = vec4(p, if dot(n, s.way) <= sin(s.size) + 0.002 { 2.0 } else { 1.0 })
 }
 
+/// Where a ray from the surface point `p` (facing `n`) starts: `LEAVE` out along `n`, and on out
+/// until the field says it is outside (`far` at least half of `LEAVE`). A point Newton's steps
+/// brought within their tolerance of a field whose value is no true distance (a carved face, a
+/// turned profile) can be inside by more than `LEAVE`, and a ray from there met the thing it
+/// left at its first step: the reference called the receiver dark, and the judge the engine's
+/// light there a leak.
+fn outside<M: Field<Substance>>(m: Matter<M>, p: vec3, n: vec3) -> vec3 {
+    var o = p + n * LEAVE
+    for _i in 0..8 {
+        let d = m.far(o)
+        if d >= 0.5 * LEAVE {
+            break
+        }
+        o = o + n * (LEAVE - d)
+    }
+    o
+}
+
 /// The ray `first + id` of `SUN_RAYS` a pixel toward the sun's disc (an 8 × 8 stratified square),
 /// marched `SUN_PASS_STEPS` more steps from where `state` left it (pass `pass` of `SUN_PASSES`),
 /// stepped as `traced::entered` steps; its state after into `next`.
@@ -182,7 +203,6 @@ pub fn sun_rays<M: Field<Substance>, S: Sky>(
     first: u32,
     count: u32,
     pass: u32,
-    receivers: u32,
     next: mut Slots<f32>,
     id: GlobalId,
 ) {
@@ -194,13 +214,13 @@ pub fn sun_rays<M: Field<Substance>, S: Sky>(
         next[id] = RAY_NONE
         return
     }
-    // The pixel's rays: receiver `k % receivers` of it, and the disc's square stratified among
-    // them, `side` by `side` a receiver.
+    // The pixel's rays: receiver `k % SUN_RECEIVERS` of it, and the disc's square stratified
+    // among them, `side` by `side` a receiver.
     let i = r / SUN_RAYS
     let k = r % SUN_RAYS
-    let j = i * receivers + k % receivers
-    let q = k / receivers
-    let side: u32 = if receivers >= 4 { 4 } else { 8 }
+    let j = i * SUN_RECEIVERS + k % SUN_RECEIVERS
+    let q = k / SUN_RECEIVERS
+    let side: u32 = 8 / SUN_FOOT
     let a = at[j]
     var t = if pass == 0 { if a.w > 0.5 && a.w < 1.5 { 0.0 } else { RAY_NONE } } else { state[r] }
     if t < 0.0 {
@@ -214,7 +234,7 @@ pub fn sun_rays<M: Field<Substance>, S: Sky>(
     let u = (f32(q % side) + die(h, 2 * k)) * inv
     let w2 = (f32(q / side) + die(h, 2 * k + 1)) * inv
     let w = sun_way(s, u, w2)
-    let o = a.xyz + n * LEAVE
+    let o = outside(m, a.xyz, n)
     let to = ends(m, o, w)
     var steps = pass * SUN_PASS_STEPS
     for _j in 0..SUN_PASS_STEPS {
@@ -233,41 +253,49 @@ pub fn sun_rays<M: Field<Substance>, S: Sky>(
     next[id] = if t >= to { RAY_OUT } else if pass + 1 >= SUN_PASSES { RAY_LOST } else { t }
 }
 
-/// Each pixel's engine sun against the reference's, counted (`SUN_COUNTS`), and its error in
-/// 255ths into the histogram after the counts (`SUN_HISTOGRAM` bins). A pixel is judged where
-/// each of its receivers is; else it is counted as the first that isn't.
+/// Each judged pixel's engine sun (the mean of its footprint's drawn pixels') against the
+/// reference's, counted (`SUN_COUNTS`), and its error in 255ths into the histogram after the
+/// counts (`SUN_HISTOGRAM` bins). A pixel is judged where each of its receivers is; else it is
+/// counted as the first that isn't. Its pixel is exact where any of its drawn pixels is.
 @compute(8, 8)
 pub fn sun_judged(
     at: [vec4],
     state: [f32],
     sun: Texture<R8>,
     cls: Texture<Rgba32Float>,
-    receivers: u32,
     out: mut Atomics<u32>,
     marks: mut Texels<Rgba16Float>,
     id: GlobalId,
 ) {
-    let w = sun.width()
-    if id.x >= w || id.y >= sun.height() {
+    let w = sun.width() / SUN_FOOT
+    if id.x >= w || id.y >= sun.height() / SUN_FOOT {
         return
     }
     let i = id.y * w + id.x
-    var a = at[i * receivers]
-    for j in 1..SUN_RECEIVERS_MOST {
-        if j < receivers && a.w > 0.5 && a.w < 1.5 {
-            a = at[i * receivers + j]
+    var a = at[i * SUN_RECEIVERS]
+    var e: f32 = 0.0
+    let with_cls = cls.width() == sun.width() && cls.height() == sun.height()
+    var reach: f32 = 0.0
+    for j in 0..SUN_RECEIVERS {
+        if j > 0 && a.w > 0.5 && a.w < 1.5 {
+            a = at[i * SUN_RECEIVERS + j]
+        }
+        let px = drawn_of(id.x, id.y, j)
+        let ej: f32 = sun.load(px.x, px.y)
+        e += ej / f32(SUN_RECEIVERS)
+        if with_cls {
+            reach = max(reach, cls.load(px.x, px.y).y)
         }
     }
-    let e0: f32 = sun.load(id.x, id.y)
-    var mark = vec4(vec3(e0 * 0.35), 1.0)
+    var mark = vec4(vec3(e * 0.35), 1.0)
     if a.w < 0.5 {
         marks.store(id, vec4(0.0, 0.0, 0.0, 1.0))
         return
     }
-    let exact = cls.width() == w && cls.height() == sun.height() && cls.load(id.x, id.y).y > 0.0
+    let exact = reach > 0.0
     if exact {
         let _ = out.add(i: 11, value: 1)
-        let _ = out.add(i: 12, value: u32(cls.load(id.x, id.y).y * 1000.0 + 0.5))
+        let _ = out.add(i: 12, value: u32(reach * 1000.0 + 0.5))
     }
     if a.w > 3.5 {
         let _ = out.add(i: 16, value: 1)
@@ -295,7 +323,6 @@ pub fn sun_judged(
         }
     }
     let r = got / f32(SUN_RAYS)
-    let e: f32 = sun.load(id.x, id.y)
     let _ = out.add(i: 0, value: 1)
     let diff = e - r
     if exact {
@@ -385,8 +412,8 @@ impl SunJudge {
     }
 
     /// Up to `dispatches` more dispatches of judging `picture` (drawn of `world` under `sky`
-    /// through `eye`): its surfaces placed, then their rays, then the counts, read back and said
-    /// as `what`.
+    /// through `eye`, `SUN_FOOT` times the judged size each way): its surfaces placed, then their
+    /// rays, then the counts, read back and said as `what`.
     pub fn work<W: World, S: Sky>(
         mut self,
         picture: Picture,
@@ -396,16 +423,15 @@ impl SunJudge {
         eye: Eye,
         what: str,
         dispatches: u32,
-        receivers: u32,
         untraced: u32,
     ) {
         if self.said {
             return
         }
-        let rc = clamp(receivers, 1, SUN_RECEIVERS_MOST)
+        let rc = SUN_RECEIVERS
         self.untraced = max(self.untraced, untraced)
-        let w = picture.width()
-        let h = picture.height()
+        let w = picture.width() / SUN_FOOT
+        let h = picture.height() / SUN_FOOT
         let n = w * h
         if !self.begun {
             self.begun = true
@@ -415,11 +441,11 @@ impl SunJudge {
             self.out = buffer_of(Vec::filled(SUN_COUNTS + SUN_HISTOGRAM, 0))
             self.marks = writable_texture(width: w, height: h, levels: 1)
             print(
-                f"sun judge: {what}: {w}x{h}, {SUN_RAYS} rays to the sun's disc a pixel from {rc} points of its footprint, at most {SUN_PASS_STEPS * SUN_PASSES} steps a ray, the field itself",
+                f"sun judge: {what}: {w}x{h} (drawn at {picture.width()}x{picture.height()}), {SUN_RAYS} rays to the sun's disc a pixel from {rc} points of its footprint, at most {SUN_PASS_STEPS * SUN_PASSES} steps a ray, the field itself",
             )
         }
         let m = matter(world.field())
-        let v = view(eye, w, h)
+        let v = view(eye, picture.width(), picture.height())
         var k: u32 = 0
         label("sun_judge")
         while k < dispatches && self.placed < n * rc {
@@ -430,7 +456,6 @@ impl SunJudge {
                     place: picture.place,
                     v: v,
                     first: self.placed,
-                    receivers: rc,
                     at: mut self.at_part,
                     facing: mut self.facing_part,
                 ),
@@ -454,7 +479,6 @@ impl SunJudge {
                     first: self.rayed,
                     count: rays,
                     pass: self.pass,
-                    receivers: rc,
                     next: mut self.state_part,
                 ),
                 over: SUN_SPAN,
@@ -475,7 +499,6 @@ impl SunJudge {
                     state: self.state.items(),
                     sun: picture.sun,
                     cls: cls,
-                    receivers: rc,
                     out: mut self.out,
                     marks: self.marks.level_mut(0),
                 ),

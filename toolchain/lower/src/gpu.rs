@@ -2987,14 +2987,13 @@ pub(crate) fn pipeline_stage5_finish(
                             *u = fw.unbounded;
                         }
                     }
-                    (pre, Some(w)) if st.mb.m.strict => {
-                        if std::env::var("WRELA_WORK_DEBUG").is_ok() && pre.is_some_and(|p| p > 2 * w) {
-                            eprintln!("work: entry {idx} of {}: before flattening {:?}, after {w}", st.mb.m.functions.first().map(|f| f.name.as_str()).unwrap_or("?"), pre);
-                            if pre.is_some_and(|p| p > 20 * w) && std::env::var("WRELA_WORK_DUMP").is_ok() {
-                                let _ = std::fs::write(format!("/private/tmp/claude-501/workdump_{idx}_{w}.txt"), ir::print::print(&st.mb.m));
-                            }
-                        }
-                        *slot = Some(pre.map_or(w, |pre| pre.max(w)));
+                    // The flattened code is the code that runs: its count is the kernel's
+                    // bound. (The source's count, before inlining, follows branches the
+                    // flattening folds away and work whose result nothing reads: `cull_bricks`'
+                    // octant tests behind `steep(f)`, a steepness of one; a one-part field's
+                    // `pruned` ranges where only its `live` is read.)
+                    (_, Some(w)) if st.mb.m.strict => {
+                        *slot = Some(w);
                         if let Some(u) = st.unbounded.get_mut(idx) {
                             *u = None;
                         }
@@ -5065,9 +5064,6 @@ pub(crate) fn kept_deps_call(fl: &mut Fl, c: &mir::Call) -> Option<ir::ValueId> 
     let there = f.params.get(at as usize).map(|p| p.ty);
     let d = ir::field_deps::depends_fields(&mb.m, id);
     let keep = d.paths_of(at);
-    if std::env::var("WRELA_KEPT_DEBUG").is_ok() {
-        eprintln!("kept_deps: {:?} of param {at}\n{}", keep, ir::print::print(&mb.m));
-    }
     let ty = fl.f.value_ty(value);
     Some(kept_part(fl, &mb.m.types, there, value, ty, &mut Vec::new(), &keep))
 }

@@ -25,11 +25,11 @@ use mesh::outline::{
     thin_due, thin_watched, thin_watched_octants,
 }
 use mesh::grid::{
-    ActiveBrick, BrickBound, CAP_EXACT_MAX, CAP_SEAM, CAP_SURF, CERT_SLICE, CERT_SLICES,
+    ActiveBrick, BrickBound, CAP_EXACT_MAX, CAP_SEAM, CAP_SURF, CERT_SLICE,
     CHUNK_BRICKS, COLD_CREASE_SLICES, CORNERS_BRICK, CREASE_SLICE, CREASE_SLICE_LEAST, CULL_CHUNK, CUT_BRICKS,
     DEFORM_SLICE, FrustumCull, GridSpec, MAX_LOD_LEVELS, MOST_INDICES_PER_BRICK, NONE, PATCH_MOST,
     SEAM_SLICE, SEAM_SLICES, SLICES_MOST, START_INDICES_PER_BRICK, START_TRANS_PER_BRICK,
-    START_VERTS_PER_BRICK, SeamCell, SeamQuad, THIN_SLICE, THIN_SLICES, VERTS_BRICK, VERTS_STRIDE,
+    START_VERTS_PER_BRICK, SeamCell, SeamQuad, THIN_SLICE, VERTS_BRICK, VERTS_STRIDE,
     build_lod_grids_view, frustum_cull_none, frustum_cull_view, grid_for, grids_hold, may_cross,
     tight_aabb_rest,
 }
@@ -139,11 +139,11 @@ pub struct ExtractScratch {
     pub surf: AppendBuffer<u32>,
     pub thin_cands: AppendBuffer<u32>,
     /// Each thin candidate of a slice: the octants its core's whole form didn't clear
-    /// (`filter_thin_cells`, for `filter_thin_octants`).
+    /// (`thin_watched`, for `thin_watched_octants`).
     pub thin_masks: GpuBuffer<u32>,
-    /// `filter_thin_octants`' slices' dispatch sizes.
+    /// `thin_watched_octants`' slices' dispatch sizes.
     pub thin_args: GpuBuffer<DispatchArgs>,
-    /// Outline cells put up for a certificate (`box_outline`, `certify_outline`).
+    /// Outline vertices put up for a certificate (`outline_quads`, `certify_watched`).
     pub cert_cands: AppendBuffer<vec2u>,
     pub grids: GpuBuffer<GridSpec>,
     pub super_grids: GpuBuffer<vec4u>,
@@ -511,14 +511,6 @@ pub struct MeshBatch {
     /// `refine_seam_creases`' cells a dispatch, by its own bound (`kernel_work`).
     seam_crease_slice: u32,
     surf_slice: u32,
-    /// The thin candidates one `filter_thin_cells` dispatch tests, and the outline cells one
-    /// `certify_outline` dispatch certifies: as many as the kernel's own bound for the field
-    /// extracted now lets a dispatch hold (`dc::lane_slice`), at most `THIN_SLICE` and
-    /// `CERT_SLICE`; a batch has slices for `THIN_SLICES · THIN_SLICE` and `CERT_SLICES ·
-    /// CERT_SLICE` cells whatever their size. (The Radeon refused 8,192 of the carved study's
-    /// `filter_thin_cells`, 1,571,069 work an invocation, 64 ms.)
-    thin_slice: u32,
-    cert_slice: u32,
     /// The bricks one `inherit_seam_corners` dispatch takes (512 invocations a brick), and the
     /// seam cells one `solve_seam_smooth` or `box_seam_cells` dispatch takes (at most
     /// `SEAM_SLICE`; the Radeon refused 16,384 of the study's, 932,186 work an invocation).
@@ -531,15 +523,9 @@ pub struct MeshBatch {
     /// The dispatches a crease slice's solves take for the field extracted now (`crease_passes`
     /// of `crease_part` of `crease_step_cost_of`, or of `crease_step_cost_rest_of` at rest).
     crease_passes: u32,
-    /// The most thin candidates a chunk of the latest read extraction held, and the outline cells
-    /// its batch put up for a certificate (`thin_slices`, `cert_slices`).
-    thin_hint: u32,
-    cert_hint: u32,
-    /// Its seam cells (`seam_slices`).
+    /// The seam cells of the latest read extraction (`seam_slices`).
     seam_hint: u32,
-    /// The latest readback's of them, for `took_counts`.
-    thin_read: u32,
-    cert_read: u32,
+    /// The latest readback's, for `took_counts`.
     seam_read: u32,
     /// The rest mesh's vertex count as a readback of extraction `verts_gen` gave it (`deform`).
     verts_known: u32,
@@ -775,18 +761,12 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
         crease_slice: CREASE_SLICE_LEAST,
         seam_crease_slice: CREASE_SLICE_LEAST,
         surf_slice: CAP_SURF,
-        thin_slice: THIN_SLICE,
-        cert_slice: CERT_SLICE,
         inherit_slice: 64,
         seam_slice: SEAM_SLICE,
         eval_slice: CHUNK_BRICKS,
         quad_slice: CHUNK_BRICKS,
         crease_passes: CREASE_STEPS,
-        thin_hint: 0,
-        cert_hint: 0,
         seam_hint: 0,
-        thin_read: 0,
-        cert_read: 0,
         seam_read: 0,
         verts_known: 0,
         verts_gen: 0,
@@ -1567,8 +1547,6 @@ impl MeshBatch {
                     cut_indices = c[6]
                     gpu_ovf = c[7]
                     exact_count = c[8]
-                    self.thin_read = c[10]
-                    self.cert_read = c[11]
                     self.seam_read = c[12]
                     have = true
                     self.stats_poll = None
@@ -1662,8 +1640,6 @@ impl MeshBatch {
         }
         self.active_hint = c.z
         self.crease_hint = creases
-        self.thin_hint = self.thin_read
-        self.cert_hint = self.cert_read
         self.seam_hint = self.seam_read
         // A list that outgrew its slices left cells untested: extract again, with slices for it.
         if self.poll_gen == self.gen && (gpu_ovf & OVERFLOW_THIN) != 0 {
@@ -1833,44 +1809,9 @@ impl MeshBatch {
         clamp((want + slice - 1) / slice, 1, most)
     }
 
-    /// The `filter_thin_cells` slices a chunk dispatches: as `crease_slices` does, the last
-    /// readback's most thin candidates a chunk held with a quarter and a sixteenth of a slice of
-    /// headroom, or all of them (`THIN_SLICES`) cold or after a cut. Each slice dispatched costs a
-    /// dispatch's start however few cells reach it; a chunk that outgrows them sets
-    /// `OVERFLOW_THIN` and is met by `took_counts`, which extracts again with slices for it.
-    fn thin_slices(self) -> u32 {
-        if self.active_hint == 0 ||
-            self.lod_cut ||
-            self.extract_total > self.hint_total + self.hint_total / 4 {
-            return thin_most(self.thin_slice, THIN_SLICES * THIN_SLICE)
-        }
-        let want = self.thin_hint + self.thin_hint / 4 + THIN_SLICE / 16
-        clamp(
-            (want + self.thin_slice - 1) / self.thin_slice,
-            1,
-            thin_most(self.thin_slice, THIN_SLICES * THIN_SLICE),
-        )
-    }
-
-    /// The `certify_outline` slices a batch dispatches: as `thin_slices` does, by the last
-    /// readback's outline cells, all of them (`CERT_SLICES`) cold or after a cut.
-    fn cert_slices(self) -> u32 {
-        if self.active_hint == 0 ||
-            self.lod_cut ||
-            self.extract_total > self.hint_total + self.hint_total / 4 {
-            return thin_most(self.cert_slice, CERT_SLICES * CERT_SLICE)
-        }
-        let want = self.cert_hint + self.cert_hint / 4 + CERT_SLICE / 16
-        clamp(
-            (want + self.cert_slice - 1) / self.cert_slice,
-            1,
-            thin_most(self.cert_slice, CERT_SLICES * CERT_SLICE),
-        )
-    }
-
-    /// The seam slices a batch dispatches (`SEAM_SLICE` seam cells each, for each seam pass): as
-    /// `thin_slices` does, by the last readback's seam cells, all of them (`SEAM_SLICES`) cold or
-    /// after a cut.
+    /// The seam slices a batch dispatches (`SEAM_SLICE` seam cells each, for each seam pass): by
+    /// the last readback's seam cells with a quarter and a sixteenth of a slice of headroom, all of
+    /// them (`SEAM_SLICES`) cold or after a cut.
     fn seam_slices(self) -> u32 {
         if self.active_hint == 0 ||
             self.lod_cut ||
