@@ -142,6 +142,7 @@ class Sim:
         self.xpos = wp.to_torch(self.d.xpos)
         self.xquat = wp.to_torch(self.d.xquat)
         self.xipos = wp.to_torch(self.d.xipos)
+        self.xfrc = wp.to_torch(self.d.xfrc_applied)
         self.geom_xpos = wp.to_torch(self.d.geom_xpos)
         self.geom_xmat = wp.to_torch(self.d.geom_xmat)
         self.warm = wp.to_torch(self.d.qacc_warmstart)
@@ -168,6 +169,11 @@ class Sim:
         self.frame = torch.zeros(worlds, dtype=torch.long, device=device)
         self.graph = None
         self.start_share = 0.0
+
+    def tilt(self, g):
+        """Each world's own gravity (`g`, worlds by 3): a floor tilted under the body is a slope.
+        Set before the first step (the step's graph reads the array it finds then)."""
+        self.m.opt.gravity = wp.from_torch(g.contiguous().float(), dtype=wp.vec3)
 
     def frames_of(self, q):
         """Each body's place and turn for each of the qpos `q` (by the simulator's kinematics, a
@@ -489,11 +495,13 @@ class Guard:
 
 
 
-def play(sim, agent, norm, clips, most_frames=None, record=False):
+def play(sim, agent, norm, clips, most_frames=None, record=False, push=None):
     """The clips `clips` (indices) played by the net from their first frames (its mean action),
     `sim.n` at a time, to their ends (or `most_frames`): for each, whether it was followed to its
     end with no fall, the frame it fell at (or its length), the mean distance of a segment from
-    its place while it was followed (m), and with `record`, each frame's qpos up to its fall."""
+    its place while it was followed (m), and with `record`, each frame's qpos up to its fall. With
+    `push` (a force on the root for each world in the world's frame, N, its first frame and how
+    many frames it lasts), the worlds of the first batch are pushed."""
     out = []
     clips = [int(c) for c in clips]
     for i in range(0, len(clips), sim.n):
@@ -520,6 +528,10 @@ def play(sim, agent, norm, clips, most_frames=None, record=False):
         for t in range(steps):
             with torch.no_grad():
                 a = agent.pi(norm(observe(sim)))
+            if push is not None and i == 0:
+                force, first, frames_on = push
+                on = (t >= first) & (t < first + frames_on)
+                sim.xfrc[:, 1, :3] = torch.where(on[:, None], force, torch.zeros_like(force))
             sim.step(sim.ref_q[sim.global_frame(1)][:, 7:] + 0.5 * a.clamp(-1, 1))
             _, fell, ex = reward(sim)
             live_clip = sim.frame < (sim.lengths[sim.clip] - 1)
@@ -541,6 +553,69 @@ def play(sim, agent, norm, clips, most_frames=None, record=False):
     return out
 
 
+# ---- the generator: a clip under changes that physics permits (phase 5 step 16) ------------------
+
+PUSH_N = (50.0, 300.0)
+PUSH_FRAMES = 6
+SLOPE_DEG = (2.0, 10.0)
+SPEEDS = (0.8, 1.25)
+
+
+def time_scaled(q, s):
+    """A clip's qpos `q` (frames by nq) played `s` times as fast: its frames at times s k."""
+    n = q.shape[0]
+    at = np.arange(0.0, n - 1, s)
+    i = np.floor(at).astype(int)
+    u = (at - i)[:, None]
+    a, b = q[i], q[np.minimum(i + 1, n - 1)]
+    out = a + (b - a) * u
+    qa, qb = a[:, 3:7], b[:, 3:7].copy()
+    qb[(qa * qb).sum(-1) < 0] *= -1.0
+    r = qa * (1 - u) + qb * u
+    out[:, 3:7] = r / np.linalg.norm(r, axis=-1, keepdims=True)
+    return out.astype(np.float32)
+
+
+def variants(head, refs, clip, n, seed):
+    """`n` variants of the clip named `clip`: a third pushed (a force on the root along the ground,
+    `PUSH_N`, for `PUSH_FRAMES` frames at a random time in its first 10 s), a third on a slope
+    (gravity tilted `SLOPE_DEG` in a random direction), a third at another speed (`SPEEDS`); the
+    first is the clip as it is. Returns the head and the frames of the variants as clips of their
+    own, and each one's kind, amount, gravity and push."""
+    rng = np.random.default_rng(seed)
+    c = head["names"].index(clip)
+    s, L = head["starts"][c], head["lengths"][c]
+    q = refs[s:s + L]
+    names, starts, lengths, chunks, kinds = [], [], [], [], []
+    g0 = np.array([0.0, -9.81, 0.0])
+    total = 0
+    for v in range(n):
+        kind = "as it is" if v == 0 else ("push", "slope", "speed")[(v - 1) % 3]
+        gravity, push, amount, frames = g0.copy(), (np.zeros(3), 0), 0.0, q
+        if kind == "push":
+            amount = rng.uniform(*PUSH_N)
+            a = rng.uniform(0.0, 2.0 * np.pi)
+            push = (amount * np.array([np.cos(a), 0.0, np.sin(a)]), int(rng.integers(30, min(300, L - 10))))
+        elif kind == "slope":
+            amount = rng.uniform(*SLOPE_DEG)
+            a = rng.uniform(0.0, 2.0 * np.pi)
+            t = np.radians(amount)
+            gravity = 9.81 * np.array([np.sin(t) * np.cos(a), -np.cos(t), np.sin(t) * np.sin(a)])
+        elif kind == "speed":
+            amount = rng.uniform(*SPEEDS)
+            frames = time_scaled(q, amount)
+        names.append(f"{clip}~{v}")
+        starts.append(total)
+        lengths.append(frames.shape[0])
+        chunks.append(frames)
+        total += frames.shape[0]
+        kinds.append({"kind": kind, "amount": float(amount), "gravity": gravity.tolist(),
+                      "force": push[0].tolist(), "push_at": push[1]})
+    h = dict(head)
+    h.update({"names": names, "starts": starts, "lengths": lengths, "sets": ["test"] * n})
+    return h, np.concatenate(chunks), kinds
+
+
 def summary(results):
     if not results:
         return {"clips": 0}
@@ -559,12 +634,12 @@ def evaluate(sim, agent, norm, most_frames=600):
             "test": summary(play(sim, agent, norm, sim.test.tolist(), most_frames))}
 
 
-def filtered(sim, agent, norm, head):
+def filtered(sim, agent, norm, head, push=None):
     """Every clip played to its end by the net, as the simulator moved the body (each frame's
     qpos, up to a fall): the filtered capture (`WFLT`: a u32 length and a JSON head of each clip's
     name, set, whether it was followed and its frames; then zlib of the float32 qpos, clip after
     clip)."""
-    results = play(sim, agent, norm, list(range(sim.starts.shape[0])), record=True)
+    results = play(sim, agent, norm, list(range(sim.starts.shape[0])), record=True, push=push)
     clips, chunks = [], []
     for r in results:
         clips.append({"name": head["names"][r["clip"]], "set": (head.get("sets") or ["training"] * 99999)[r["clip"]],
@@ -574,6 +649,27 @@ def filtered(sim, agent, norm, head):
     body = zlib.compress(np.concatenate(chunks).tobytes(), 6)
     h = json.dumps({"clips": clips, "nq": head["nq"], "rate": head["rate"]}).encode()
     return b"WFLT" + struct.pack("<I", len(h)) + h + body, results
+
+
+def play_variants(run, sim, agent, norm, head, kinds, t0):
+    """Each variant of the clip followed by the tracker to its end (`variants`): the share followed
+    with no fall, by kind, and the filtered capture of them (`filtered.bin`) for the judge."""
+    dev = sim.dev
+    sim.tilt(torch.tensor([k["gravity"] for k in kinds], device=dev))
+    force = torch.tensor([k["force"] for k in kinds], device=dev, dtype=torch.float32)
+    first = torch.tensor([k["push_at"] for k in kinds], device=dev)
+    data, results = filtered(sim, agent, norm, head, push=(force, first, PUSH_FRAMES))
+    by = {}
+    for r, k in zip(results, kinds):
+        f, n = by.get(k["kind"], (0, 0))
+        by[k["kind"]] = (f + int(r["followed"]), n + 1)
+        print(f"variant {head['names'][r['clip']]} ({k['kind']} {k['amount']:.2f}): followed {r['followed']}, "
+              f"frames {r['frames']} of {int(sim.lengths[r['clip']])}, mean {1000.0 * r['mean_m']:.1f} mm", flush=True)
+    out = {"followed": summary(results), "by_kind": {k: {"followed": f / n, "variants": n} for k, (f, n) in by.items()},
+           "variants": kinds}
+    print(f"the variants: {json.dumps(out['by_kind'])}", flush=True)
+    run.output("filtered.bin", data)
+    run.finish({"variants": out, "seconds": time.time() - t0})
 
 
 def main():
@@ -600,6 +696,10 @@ def main():
                    help="the share of worlds started at their clip's first frame (the evaluation plays each "
                         "clip from there)")
     p.add_argument("--filtered", action="store_true", help="play every clip to its end at the end")
+    p.add_argument("--variants", type=int, default=0,
+                   help="with --weights: play this many variants of --clip (pushed, on a slope, at another "
+                        "speed) and write them as a filtered capture")
+    p.add_argument("--clip", default="100style/Neutral_FW", help="the clip of --variants")
     p.add_argument("--weights", default="",
                    help="a trained tracker (tracker.pt): train nothing, play every clip of the refs to its end")
     a = p.parse_args(run.args)
@@ -608,6 +708,10 @@ def main():
     torch.manual_seed(run.seed)
     gen = torch.Generator(device=dev).manual_seed(run.seed)
     head, refs = load_refs(a.refs)
+    kinds = None
+    if a.weights and a.variants:
+        head, refs, kinds = variants(head, refs, a.clip, a.variants, run.seed)
+        a.worlds = a.variants
     t0 = time.time()
     with wp.ScopedDevice("cuda:0" if dev == "cuda" else "cpu"):
         sim = Sim(a.model, head, refs, a.worlds, dev, a.substeps, gen)
@@ -630,6 +734,8 @@ def main():
             w = torch.load(a.weights, map_location=dev, weights_only=False)
             agent.load_state_dict(w["agent"])
             norm.load(w["norm"], dev)
+            if kinds is not None:
+                return play_variants(run, sim, agent, norm, head, kinds, t0)
             results = play(sim, agent, norm, list(range(sim.starts.shape[0])))
             for r in results:
                 print(f"played {head['names'][r['clip']]}: followed {r['followed']}, frames {r['frames']} "

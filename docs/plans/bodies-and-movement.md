@@ -1118,6 +1118,15 @@ through the world with no cycle and no clip.
   16 worlds a filtered capture for the judge and the laws of movement. Checked on the CPU: a
   parry's spell reaches its point at its tick to 6 micrometres, and a body that stands still is
   hit by 285 of 285 spells.
+- The generator (step 16, `tools/movement/track.py --weights W --variants N --clip CLIP`): the
+  tracker follows N variants of a clip, a third pushed (50 to 300 N on the root along the ground
+  for 0.2 s), a third on a slope (each world's own gravity tilted 2 to 10 degrees under its flat
+  floor: the same physics), a third 0.8 to 1.25 times as fast; it writes the share followed by
+  kind and the variants as a filtered capture. Checked on the CPU: a world tilted 30 degrees falls
+  0.102 m along the ground and 0.177 m down in 0.2 s (half of g sin 30 and g cos 30 times t
+  squared), and `p4h-7`'s tracker follows 3 s of a walk as it is, pushed (115 N) and faster (1.13)
+  but not on a slope of 2.7 degrees. Another body's proportions need a second declaration: not
+  yet.
 - Not yet: the solver trained on the filtered capture (phase 4's tracker on the human is in work), the tracker following the
   solver's output, the bits on the two machines (the M4 is not measured), the prior of style and
   the skills.
