@@ -36,6 +36,35 @@ import time
 HEARTBEAT = 15.0
 
 
+def provenance(argv):
+    """What a run is: its command, the commit of the checkout it runs from (or `WRELA_COMMIT`, which
+    the run tool sets on a VM with no checkout), and each file its arguments name, by size and the
+    SHA-256 of its first and last 16 MB (a whole hash of a file of 900 MB costs seconds each start),
+    so a stopped run can be started again as it was."""
+    import hashlib
+    import subprocess
+    commit = os.environ.get("WRELA_COMMIT", "")
+    if not commit:
+        try:
+            commit = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True,
+                                    cwd=os.path.dirname(os.path.abspath(__file__)), timeout=10).stdout.strip()
+        except Exception:
+            commit = ""
+    files = {}
+    for x in argv[1:]:
+        for part in x.split("="):
+            if os.path.isfile(part):
+                n = os.path.getsize(part)
+                h = hashlib.sha256()
+                with open(part, "rb") as f:
+                    h.update(f.read(16 << 20))
+                    if n > 32 << 20:
+                        f.seek(n - (16 << 20))
+                        h.update(f.read())
+                files[part] = {"bytes": n, "sha256_ends": h.hexdigest()}
+    return {"argv": list(argv), "commit": commit, "files": files, "started": time.time()}
+
+
 class Run:
     def __init__(self, argv=None):
         p = argparse.ArgumentParser(add_help=False)
@@ -57,6 +86,7 @@ class Run:
         self.lock = threading.Lock()
         self.state = "running"
         self.result = None
+        self.provenance = provenance(argv if argv is not None else sys.argv)
         self._write_status()
         t = threading.Thread(target=self._beat, daemon=True)
         t.start()
@@ -82,7 +112,11 @@ class Run:
         return time.time() - self.last_ckpt_time >= self.opts.every
 
     def checkpoint(self, step, obj):
-        """Writes `obj` as the checkpoint of `step` and removes the older ones but the last."""
+        """Writes `obj` as the checkpoint of `step` and removes the older ones but the last; a
+        dict carries the run's `provenance` (its command, commit and data) with it."""
+        if isinstance(obj, dict):
+            obj = dict(obj)
+            obj.setdefault("provenance", self.provenance)
         d = os.path.join(self.out, "ckpt")
         name = f"{step:012d}.ckpt"
         tmp = os.path.join(d, name + ".part")

@@ -17,7 +17,7 @@
 //
 // Reads the pose files that tools/movement/capture writes.
 
-use clips::clips::{Clip, read_all, set}
+use clips::clips::{Clip, read_all, set, write_all}
 use engine::body::body::Pose
 use engine::body::joint::{Frame, turn_of_vector, vector_of_turn}
 use engine::judge::movement::{
@@ -29,6 +29,7 @@ use std::collections::Vec
 use std::field::half_space
 use std::hash::pcg
 use std::io::print
+use std::json::{TOP, parse}
 use std::quat::Quat
 use std::serialize::Reader
 use std::time::now
@@ -158,7 +159,7 @@ fn scored<const S: u32, const D: u32, const P: u32>(
 
 /// The measures a score is made of, each over its target (the calibration's), summed: 0 is a
 /// movement with nothing wrong, 1 a measure at its target.
-const MEASURES: u32 = 8
+const MEASURES: u32 = 9
 
 fn values(s: Scored) -> [f32; MEASURES] {
     [
@@ -170,6 +171,7 @@ fn values(s: Scored) -> [f32; MEASURES] {
         max(s.m.range_most, 0.0),
         s.distance,
         s.goal,
+        s.m.tremor,
     ]
 }
 
@@ -182,17 +184,36 @@ const NAMES: [Text; MEASURES] = [
     "out of range (rad)",
     "distance from capture",
     "goal error (m/s: the root's velocity against the clip's own over 1 s)",
+    "tremor (share of the joints' speed's power above 6 Hz)",
 ]
 
-/// Each body's calibration's targets (`calibrate`: each the clean clips' 95th percentile or its
-/// floor), which `play` and `goals` hold movements to: the creature's of 2026-11-25 (117
-/// calibration clips), the human's of 2026-11-26 (89 of 100STYLE; MPI EMBM's sit).
-fn targets(body: str) -> [f32; MEASURES] {
-    if body == "human" {
-        [0.4342245, 0.8948665, 1220.2483, 2.5811484, 32.24444, 0.01, 2.3248482, 0.41221356]
-    } else {
-        [0.92266834, 1.7351655, 984.02716, 2.0, 40.864124, 0.01, 4.7855315, 0.3195029]
+/// A body's targets, which `play` and `goals` hold movements to: its calibration's (`calibrate`:
+/// each measure the largest of each source's clean clips' 95th percentile, or its floor), from
+/// `targets/BODY.json` (`--read targets=tools/movement/judge/targets`), refused when they were
+/// calibrated on another declaration of the body (`bodies::declaration`).
+fn targets<const S: u32, const D: u32, const P: u32>(def: Def<S, D, P>) -> Result<[f32; MEASURES], ToolError> {
+    let bytes = read_all(f"targets/{def.name}.json")?
+    let Some(text) = String::from_utf8(take bytes) else { return Err(ToolError::new("targets: not UTF-8")) }
+    let Some(doc) = parse(text.as_str()) else { return Err(ToolError::new("targets: not JSON")) }
+    let Some(body) = doc.get(TOP, "body") else { return Err(ToolError::new("targets: no body")) }
+    let made_for = doc.text(body).unwrap_or(String::new())
+    let now = bodies::bodies::declaration(def)
+    if made_for.as_str() != now.as_str() {
+        return Err(
+            ToolError::new(
+                f"the targets of {def.name} were calibrated on its declaration {made_for}, and it is {now} now: calibrate again (`-- {def.name} calibrate`)",
+            ),
+        )
     }
+    let Some(list) = doc.get(TOP, "targets") else { return Err(ToolError::new("targets: no list")) }
+    if doc.count(list) != MEASURES {
+        return Err(ToolError::new(f"targets: {doc.count(list)} of them, the judge has {MEASURES} measures"))
+    }
+    var out = [0.0; MEASURES]
+    for i in 0..MEASURES {
+        out[i] = f32(doc.num(doc.at(list, i).unwrap()).unwrap_or(0.0))
+    }
+    Ok(out)
 }
 
 // ---- the laws of movement, calibrated ------------------------------------------------------------
@@ -354,7 +375,7 @@ fn judge_play<const S: u32, const D: u32, const P: u32>(
     names: Vec<String>,
 ) -> Result<u32, ToolError> {
     let refs_by = references(def, 120)?
-    let target = targets(def.name)
+    let target = targets(def)?
     var means = [0.0; MEASURES]
     var passed = [0; MEASURES]
     var all_passed = 0
@@ -399,7 +420,7 @@ fn judge_goals<const S: u32, const D: u32, const P: u32>(
     names: Vec<String>,
 ) -> Result<u32, ToolError> {
     let refs = references(def, 120)?.all
-    let target = targets(def.name)
+    let target = targets(def)?
     var all_passed = 0
     for name in names {
         let p = clips::clips::load::<D>("play", def.name, f"goal/{name}".as_str())?
@@ -446,7 +467,7 @@ fn score(v: [f32; MEASURES], target: [f32; MEASURES]) -> f32 {
 
 fn measures_line(name: str, s: Scored) -> String {
     let v = values(s)
-    f"{name}: residual {v[0]} torque {v[1]} slide {v[2]} pen {v[3]} float {v[4]} range {v[5]} dist {v[6]} goal {v[7]} | speed {s.m.speed} energy {s.m.energy} duty {s.m.duty} flight {s.m.flight}"
+    f"{name}: residual {v[0]} torque {v[1]} slide {v[2]} pen {v[3]} float {v[4]} range {v[5]} dist {v[6]} goal {v[7]} tremor {v[8]} | speed {s.m.speed} energy {s.m.energy} duty {s.m.duty} flight {s.m.flight}"
 }
 
 fn print_measures(name: str, s: Scored) {
@@ -539,6 +560,10 @@ fn refs_for<const D: u32>(r: Refs<D>, name: str) -> Stats<D> {
 struct Job<const D: u32>: Clone {
     name: String,
     refs: Stats<D>,
+    /// Where its poses are (`poses`, or `filtered`: the tracker's, whose goal is the capture's
+    /// velocity over the same frames), and whether it is judged with its damaged copies.
+    root: String,
+    damage: bool,
 }
 
 /// A clip judged with its damaged copies (the kinds in turn, each at its amounts): what it scored
@@ -583,18 +608,31 @@ fn judged_clip<const S: u32, const D: u32, const P: u32>(def: Def<S, D, P>, j: J
         seconds: 0.0,
         lines: Vec::new(),
     }
-    let Ok(c) = load::<D>(def.name, j.name.as_str()) else { return out }
+    let Ok(c) = clips::clips::load::<D>(j.root.as_str(), def.name, j.name.as_str()) else { return out }
     if bodies::bodies::seated(def, c.poses.clone(), c.rate) {
         out.lines.push(f"{c.name}: seated, left out")
         return out
     }
-    let goals = velocity_goals(c.poses.clone(), c.rate, 1.0)
+    // The goal: the capture's own velocity, over the frames the movement has.
+    var goals = velocity_goals(c.poses.clone(), c.rate, 1.0)
+    if j.root.as_str() != "poses" {
+        let Ok(raw) = load::<D>(def.name, j.name.as_str()) else { return out }
+        var same: Vec<Pose<D>> = Vec::new()
+        for f in 0..min(raw.poses.len(), c.poses.len()) {
+            same.push(raw.poses[f])
+        }
+        goals = velocity_goals(same, c.rate, 1.0)
+    }
     let t0 = now()
     let s0 = scored(def, c.poses.clone(), c.rate, j.refs, goals.clone(), 1.0)
     out.timing = f32(now() - t0)
     out.seconds = f32(c.poses.len()) / c.rate
     out.clean = values(s0)
     out.lines.push(measures_line(f"{c.name} clean", s0))
+    if !j.damage {
+        out.failed = false
+        return out
+    }
     for k in 0..5 {
         for a in 0..3 {
             if k == 4 && a > 0 {
@@ -626,14 +664,127 @@ fn calibration_jobs<const S: u32, const D: u32, const P: u32>(
     let count = min(most, names.len())
     var jobs: Vec<Job<D>> = Vec::new()
     for ci in 0..count {
-        jobs.push(Job { name: names[ci].clone(), refs: refs_for(refs_by.clone(), names[ci].as_str()) })
+        jobs.push(
+            Job {
+                name: names[ci].clone(),
+                refs: refs_for(refs_by.clone(), names[ci].as_str()),
+                root: String::from("poses"),
+                damage: true,
+            },
+        )
     }
     Ok(jobs)
 }
 
+/// The check of phase 4 (`check`): every clip of the training and test sets that the tracker
+/// filtered (`--read filtered=.movement/poses-filtered`), judged as the tracker moved it and as
+/// it was captured, each with its source's statistics.
+fn check_jobs<const S: u32, const D: u32, const P: u32>(def: Def<S, D, P>) -> Result<Vec<Job<D>>, ToolError> {
+    let refs_by = references(def, 120)?
+    var jobs: Vec<Job<D>> = Vec::new()
+    for which in ["training", "test"] {
+        for n in set(which)? {
+            if files::stat(f"filtered/{def.name}/{n}.pose").wait().is_err() {
+                continue
+            }
+            for root in ["filtered", "poses"] {
+                jobs.push(
+                    Job {
+                        name: n.clone(),
+                        refs: refs_for(refs_by.clone(), n.as_str()),
+                        root: String::from(root),
+                        damage: false,
+                    },
+                )
+            }
+        }
+    }
+    Ok(jobs)
+}
+
+/// Whether a filtered clip was followed to its end with no fall (the `.json` beside its poses that
+/// `export -- unfilter` writes).
+fn followed_to_end(body: str, name: str) -> bool {
+    let Ok(bytes) = read_all(f"filtered/{body}/{name}.json") else { return false }
+    let Some(text) = String::from_utf8(take bytes) else { return false }
+    let Some(doc) = parse(text.as_str()) else { return false }
+    match doc.get(TOP, "followed") {
+        Some(n) => doc.is_true(n),
+        None => false,
+    }
+}
+
+/// Phase 4's check: for the filtered capture and the capture, each measure's share of clips in its
+/// target and its mean; the share of the training and test sets followed to the end. The phase
+/// is done when the tracker follows 95% of each set to its end and the filtered capture keeps 95%
+/// of its clips in each target.
+fn check<const S: u32, const D: u32, const P: u32>(def: Def<S, D, P>, results: Vec<Judged>) -> Result<u32, ToolError> {
+    let target = targets(def)?
+    var inside = [vec2(0.0); MEASURES]
+    var inside_raw = [vec2(0.0); MEASURES]
+    var mean = [0.0; MEASURES]
+    var mean_raw = [0.0; MEASURES]
+    var judged = vec2(0.0)
+    var raw_n = 0.0
+    var failed = 0
+    for i in 0..results.len() {
+        let r = results[i].clone()
+        if r.failed {
+            failed += 1
+            continue
+        }
+        let filtered = i % 2 == 0
+        for k in 0..MEASURES {
+            let ok = if r.clean[k] <= target[k] { 1.0 } else { 0.0 }
+            if filtered {
+                inside[k] += vec2(ok, 1.0)
+                mean[k] += r.clean[k]
+            } else {
+                inside_raw[k] += vec2(ok, 1.0)
+                mean_raw[k] += r.clean[k]
+            }
+        }
+        if filtered {
+            judged.x += 1.0
+        } else {
+            raw_n += 1.0
+        }
+    }
+    // Followed to the end: each set's clips, filtered or not (a clip that fell in its first second
+    // has no filtered poses and is not followed).
+    var done = true
+    for which in ["training", "test"] {
+        var n = 0
+        var ok = 0
+        for name in set(which)? {
+            if files::stat(f"poses/{def.name}/{name}.pose").wait().is_err() {
+                continue
+            }
+            n += 1
+            if followed_to_end(def.name, name.as_str()) {
+                ok += 1
+            }
+        }
+        let share = f32(ok) / f32(max(n, 1))
+        done = done && share >= 0.95
+        print(f"check: {which}: {ok} of {n} clips followed to the end ({100.0 * share}%, the target 95%)")
+    }
+    print(f"check: {judged.x} filtered clips judged beside their capture ({failed} not read or seated)")
+    for k in 0..MEASURES {
+        let share = inside[k].x / max(inside[k].y, 1.0)
+        let raw = inside_raw[k].x / max(inside_raw[k].y, 1.0)
+        done = done && share >= 0.95
+        print(
+            f"check: {NAMES[k]}: target {target[k]}; filtered {100.0 * share}% in it (mean {mean[k] / max(judged.x, 1.0)}), captured {100.0 * raw}% (mean {mean_raw[k] / max(raw_n, 1.0)}){if share >= 0.95 { "" } else { "  FAILS" }}",
+        )
+    }
+    print(if done { "check: phase 4 is done" } else { "check: phase 4 is not done" })
+    Ok(if done { 0 } else { 1 })
+}
+
 /// The calibration from its judged clips: the targets, and how often the judge prefers the
 /// capture to each damaged copy.
-fn calibrate(results: Vec<Judged>) -> Result<u32, ToolError> {
+fn calibrate(results: Vec<Judged>, body: str, declaration: String) -> Result<u32, ToolError> {
     // Each clip and its damaged copies: the kinds, each at three amounts (the body that does not
     // move at one).
     let kinds = ["faster", "slid", "noisy", "raised", "still"]
@@ -672,7 +823,7 @@ fn calibrate(results: Vec<Judged>) -> Result<u32, ToolError> {
     // clips (a clean clip of each kind of movement passes: CeTI's tasks of each day are slower
     // than 100STYLE's walks and runs, and its percentiles of 2026-11-26 lower by a third to a
     // half), or a floor where that is 0.
-    let floors = [0.02, 0.02, 20.0, 2.0, 2.0, 0.01, 0.2, 0.05]
+    let floors = [0.02, 0.02, 20.0, 2.0, 2.0, 0.01, 0.2, 0.05, 0.05]
     var sources: Vec<String> = Vec::new()
     for src in clean_source.clone() {
         var seen = false
@@ -703,6 +854,14 @@ fn calibrate(results: Vec<Judged>) -> Result<u32, ToolError> {
         target[i] = max(most, floors[i])
         print(f"judge: target {NAMES[i]}: {target[i]} (each source's clean clips' 95th percentile:{line})")
     }
+    // The targets, kept for this declaration of the body (`--write targets=tools/movement/judge/targets`).
+    var list = String::new()
+    for i in 0..MEASURES {
+        list.push_str(if i == 0 { f"{target[i]}" } else { f", {target[i]}" })
+    }
+    let doc = f"{{\"body\": \"{declaration}\", \"clips\": {clean.len()}, \"targets\": [{list}]}}\n"
+    write_all(f"targets/{body}.json", Vec::from(doc.as_bytes()))?
+    print(f"judge: the targets of {body} written for its declaration {declaration}")
     // The pairs: each clean clip against each of its damaged copies.
     let per = 13
     var better = 0
@@ -773,13 +932,43 @@ pub fn tool() -> u32 {
             let Ok(jobs) = calibration_jobs(bodies::bodies::creature(), most) else { return 1 }
             all(take jobs, judged_creature)
         }
-        return match calibrate(take results) {
+        let declaration = if body.as_str() == "human" {
+            bodies::bodies::declaration(bodies::bodies::human())
+        } else {
+            bodies::bodies::declaration(bodies::bodies::creature())
+        }
+        return match calibrate(take results, body.as_str(), declaration) {
             Ok(_) => 0,
             Err(e) => {
                 print(f"judge: {e.message()}")
                 1
             },
         }
+    }
+    if what == "check" {
+        // Phase 4's check (`--read filtered=.movement/poses-filtered --read targets=...`).
+        let code = if body.as_str() == "human" {
+            let def = bodies::bodies::human()
+            let Ok(jobs) = check_jobs(def) else { return 1 }
+            match check(def, all(take jobs, judged_human)) {
+                Ok(c) => c,
+                Err(e) => {
+                    print(f"judge: {e.message()}")
+                    1
+                },
+            }
+        } else {
+            let def = bodies::bodies::creature()
+            let Ok(jobs) = check_jobs(def) else { return 1 }
+            match check(def, all(take jobs, judged_creature)) {
+                Ok(c) => c,
+                Err(e) => {
+                    print(f"judge: {e.message()}")
+                    1
+                },
+            }
+        }
+        return code
     }
     if what == "walk" {
         return walk()

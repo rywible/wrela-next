@@ -81,6 +81,10 @@ pub struct Measures: Copy {
     /// part touches (flight).
     pub duty: f32,
     pub flight: f32,
+    /// Tremor: the share of the joints' speed's power above `TREMOR_HZ` (each number's speed less
+    /// its zero-phase low-pass, over its whole). A person's movement keeps 0.5 to 3% of it there;
+    /// a controller that shakes its body (a tracker's loop at a quarter of its rate) 74 to 99%.
+    pub tremor: f32,
     /// The body's mass (kg).
     pub mass: f32,
     /// How many inner frames were judged.
@@ -219,6 +223,7 @@ pub fn judge_into<const S: u32, const D: u32, const P: u32, W: Surface>(
         energy: 0.0,
         duty: 0.0,
         flight: 0.0,
+        tremor: 0.0,
         mass: total,
         frames: 0,
     }
@@ -475,7 +480,94 @@ pub fn judge_into<const S: u32, const D: u32, const P: u32, W: Surface>(
     out.distance = dist
     out.speed = dist / (f32(n - 1) * dt)
     out.energy = if dist > 0.01 { energy / (dist * weight) } else { energy / (0.01 * weight) }
+    out.tremor = tremor(poses, rate)
     out
+}
+
+/// The frequency above which a joint's movement is tremor (Hz): human movement's power is below
+/// it (D. A. Winter, "Biomechanics and Motor Control of Human Movement", 2009: gait's markers
+/// low-passed at 6 Hz).
+pub const TREMOR_HZ: f32 = 6.0
+
+/// `xs` low-passed at `hz` with no lag: an eighth-order Butterworth filter (four second-order
+/// sections, at `rate` samples a second) run forward and back, so its gain is the square of the
+/// filter's: 0.6% of the power at 1.25 times `hz`, 97.6% at 0.83 times it; each end padded with
+/// its mirror through its last value (as a zero-phase filter is), so the ends do not ring.
+fn low_passed(xs: Vec<f32>, hz: f32, rate: f32) -> Vec<f32> {
+    let n = xs.len()
+    let pad = min(30, n - 1)
+    var x: Vec<f32> = Vec::with_capacity(n + 2 * pad)
+    for i in 0..pad {
+        x.push(2.0 * xs[0] - xs[pad - i])
+    }
+    for v in xs.clone() {
+        x.push(v)
+    }
+    for i in 0..pad {
+        x.push(2.0 * xs[n - 1] - xs[n - 2 - i])
+    }
+    let k = tan(3.14159265 * min(hz / rate, 0.49))
+    for pass in 0..2 {
+        for section in 1..5 {
+            // A Butterworth filter of order 8: each section's Q is 1 / (2 sin((2s - 1) pi / 16)).
+            let q = 1.0 / (2.0 * sin(f32(2 * section - 1) * 3.14159265 / 16.0))
+            let norm = 1.0 / (1.0 + k / q + k * k)
+            let b0 = k * k * norm
+            let a1 = 2.0 * (k * k - 1.0) * norm
+            let a2 = (1.0 - k / q + k * k) * norm
+            let m = x.len()
+            let first = if pass == 0 { x[0] } else { x[m - 1] }
+            var x1 = first
+            var x2 = first
+            var y1 = first
+            var y2 = first
+            for i in 0..m {
+                let at = if pass == 0 { i } else { m - 1 - i }
+                let x0 = x[at]
+                let y0 = b0 * (x0 + 2.0 * x1 + x2) - a1 * y1 - a2 * y2
+                x[at] = y0
+                x2 = x1
+                x1 = x0
+                y2 = y1
+                y1 = y0
+            }
+        }
+    }
+    var out: Vec<f32> = Vec::with_capacity(n)
+    for i in 0..n {
+        out.push(x[pad + i])
+    }
+    out
+}
+
+/// The share of the power of the joints' speeds above `TREMOR_HZ` (0 to 1; 0 for a body whose
+/// joints do not move): each number's speed from frame to frame, less its mean, against the same
+/// less its low-pass.
+pub fn tremor<const D: u32>(poses: Vec<Pose<D>>, rate: f32) -> f32 {
+    let n = poses.len()
+    if n < 8 || D == 0 {
+        return 0.0
+    }
+    var high = 0.0
+    var all = 0.0
+    for d in 0..D {
+        var v: Vec<f32> = Vec::with_capacity(n - 1)
+        var mean = 0.0
+        for f in 1..n {
+            let s = (poses[f].q[d] - poses[f - 1].q[d]) * rate
+            v.push(s)
+            mean += s
+        }
+        mean = mean / f32(n - 1)
+        let low = low_passed(v.clone(), TREMOR_HZ, rate)
+        for i in 0..v.len() {
+            let a = v[i] - mean
+            let h = v[i] - low[i]
+            all += a * a
+            high += h * h
+        }
+    }
+    if all < 1.0e-10 { 0.0 } else { min(high / all, 1.0) }
 }
 
 // ---- tests ------------------------------------------------------------------------------------
@@ -660,4 +752,30 @@ pub fn velocity_goals<const D: u32>(poses: Vec<Pose<D>>, rate: f32, window: f32)
         out.push(vec2(d.x, d.z) / t)
     }
     out
+}
+
+/// A joint that turns as a sine of `hz` (and, beside it, a slow one of 1 Hz at `slow` the
+/// amplitude), for four seconds at 30 frames a second.
+fn swinging(hz: f32, slow: f32) -> Vec<Pose<2>> {
+    var poses: Vec<Pose<2>> = Vec::new()
+    for i in 0..120 {
+        let t = f32(i) / 30.0
+        poses.push(Pose {
+            root: Frame::identity(),
+            q: [0.05 * sin(6.2831853 * hz * t), slow * sin(6.2831853 * t)],
+        })
+    }
+    poses
+}
+
+@test
+fn a_joint_that_shakes_at_a_quarter_of_the_rate_is_tremor() {
+    let fast = tremor(swinging(7.5, 0.0), 30.0)
+    assert(fast > 0.9, f"tremor of a 7.5 Hz shake {fast}")
+    let slow = tremor(swinging(1.0, 0.0), 30.0)
+    assert(slow < 0.02, f"tremor of a 1 Hz swing {slow}")
+    // A walk's swing of 0.5 rad with a shake of 0.05 rad beside it: the shake's speed is 7.5 times
+    // the swing's for each radian, so its power is 0.05^2 7.5^2 against 0.5^2 (and the shake's).
+    let mixed = tremor(swinging(7.5, 0.5), 30.0)
+    assert(mixed > 0.25 && mixed < 0.45, f"tremor of a swing with a shake {mixed}")
 }

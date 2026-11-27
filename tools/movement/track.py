@@ -159,7 +159,8 @@ class Sim:
         assert int(self.active[0]) == 1, f"root body 1 must be active, got {self.active[:4]}"
         self.names = list(head["names"])
         # Colliding capsules for computing ground clearance on reset (prevents underground launches).
-        caps = [g for g in range(self.mjm.ngeom) if self.mjm.geom_contype[g] != 0 and self.mjm.geom_type[g] == 3]
+        # (spheres too: a sphere is a capsule of no length, its half length 0 in the model)
+        caps = [g for g in range(self.mjm.ngeom) if self.mjm.geom_contype[g] != 0 and self.mjm.geom_type[g] in (2, 3)]
         self.caps = torch.tensor(caps, device=device, dtype=torch.long)
         self.cap_r = torch.tensor(self.mjm.geom_size[caps, 0], device=device, dtype=torch.float32) if caps else torch.zeros(0, device=device)
         self.cap_h = torch.tensor(self.mjm.geom_size[caps, 1], device=device, dtype=torch.float32) if caps else torch.zeros(0, device=device)
@@ -211,6 +212,21 @@ class Sim:
         self.ball_lo = torch.tensor(lo, device=device, dtype=torch.float32).reshape(-1, 3)
         self.ball_hi = torch.tensor(hi, device=device, dtype=torch.float32).reshape(-1, 3)
         self.range_weight = 0.0
+        # The net's last action (each world's, 0 when it starts), which it reads and pays for
+        # changing (`rate_weight`): a net that reads only the body's state shook it at a quarter of
+        # its rate (`p4h-12`: 83 to 99% of the joints' speed's power above 6 Hz, the servos alone
+        # 2%).
+        self.last_act = torch.zeros(worlds, self.mjm.nu, device=device)
+        self.read_last = False
+        self.rate_weight = 0.0
+        # The soles: the feet and the toes (segments 9, 10, 13 and 14 of the human), as places in
+        # the active bodies, held to the clip's height and stillness where its foot is planted.
+        act_list = self.active.tolist()
+        sole_ids = [self.mjm.body(f"s{k}").id for k in (9, 10, 13, 14) if f"s{k}" in
+                    [self.mjm.body(b).name for b in range(self.mjm.nbody)]]
+        self.soles = torch.tensor([act_list.index(b) for b in sole_ids if b in act_list], device=device,
+                                  dtype=torch.long)
+        self.sole_weight = 0.0
 
     def tilt(self, g):
         """Each world's own gravity (`g`, worlds by 3): a floor tilted under the body is a slope.
@@ -275,6 +291,7 @@ class Sim:
         self.qpos[idx, 1] += torch.where(lift > 0.002, lift, torch.zeros_like(lift))
         self.qvel[idx] = self.ref_vel(g)
         self.warm[idx] = 0.0
+        self.last_act[idx] = 0.0
         mjw.kinematics(self.m, self.d)
 
     def weigh(self, results):
@@ -293,6 +310,8 @@ class Sim:
         return self.starts[self.clip] + f
 
     def step(self, targets):
+        # The soles' places before the step: how far they slide in it (`reward`).
+        self.sole_before = self.xpos[:, self.active[self.soles]].clone() if self.soles.numel() else None
         self.ctrl[:] = torch.maximum(torch.minimum(targets, self.hi), self.lo)
         if self.graph is None and self.dev.startswith("cuda"):
             with wp.ScopedCapture() as cap:
@@ -353,6 +372,8 @@ def observe(sim):
         parts.append(rot6d(quat_mul(hq, sim.ref_r[g][:, 0])))
         parts.append(quat_rotate(hq, sim.ref_vel(g)[:, :3]))
         parts.append(sim.ref_q[g][:, 7:] - sim.qpos[:, 7:])
+    if sim.read_last:
+        parts.append(sim.last_act)
     return torch.cat(parts, -1)
 
 
@@ -434,8 +455,26 @@ def reward(sim, act_clamped=None):
     r_vel = 0.5 * torch.exp(-0.5 * dv_root * dv_root) + 0.5 * torch.exp(-0.05 * (dv * dv).mean(-1))
     r = (0.25 * r_pos_fine + 0.20 * r_pos_wide + 0.20 * r_loc +
          0.15 * r_rot + 0.10 * r_root + 0.10 * r_vel)
+    if sim.sole_weight > 0.0 and sim.soles.numel():
+        # The soles where the clip's foot is planted (moving under 0.15 m/s along the ground): at
+        # the clip's height (to 1 cm) and still (to 0.1 m/s). The places' terms above cannot see a
+        # millimetre: an error of 11 mm costs exp(-100 dx^2) 1%.
+        g1 = sim.global_frame(1)
+        ref_now, ref_next = sim.ref_x[g][:, sim.soles], sim.ref_x[g1][:, sim.soles]
+        planted = ((ref_next - ref_now)[..., [0, 2]].norm(dim=-1) * sim.rate) < 0.15
+        mine = sim.xpos[:, sim.active[sim.soles]]
+        dy = mine[..., 1] - ref_now[..., 1]
+        sliding = (mine - sim.sole_before)[..., [0, 2]].norm(dim=-1) * sim.rate
+        each = torch.exp(-(dy / 0.01) ** 2) * torch.exp(-(sliding / 0.1) ** 2)
+        k = planted.float().sum(-1)
+        r_sole = torch.where(k > 0, (each * planted.float()).sum(-1) / k.clamp(min=1.0), torch.ones_like(k))
+        r = (1.0 - sim.sole_weight) * r + sim.sole_weight * r_sole
     if act_clamped is not None:
         r = (r - 0.02 * (act_clamped * act_clamped).mean(-1)).clamp(min=0.0)
+        if sim.rate_weight > 0.0:
+            # A change of the action from the last costs (the shake's cure).
+            d = act_clamped - sim.last_act
+            r = (r - sim.rate_weight * (d * d).mean(-1)).clamp(min=0.0)
     if sim.range_weight > 0.0:
         # The body's ranges, which the simulator's hinges do not hold (`range_excess`).
         r = r * torch.exp(-sim.range_weight * range_excess(sim))
@@ -696,16 +735,20 @@ def play(sim, agent, norm, clips, most_frames=None, record=False, push=None):
         sim.qvel[:] = sim.ref_vel(g)
         sim.warm[:] = 0.0
         mjw.kinematics(sim.m, sim.d)
+        sim.last_act[:] = 0.0
         alive = torch.ones(sim.n, dtype=torch.bool, device=sim.dev)
         fell_at = sim.lengths[c].clone()
         dist = torch.zeros(sim.n, device=sim.dev)
+        past = torch.zeros(sim.n, device=sim.dev)
         count = torch.zeros(sim.n, device=sim.dev)
         steps = int(sim.lengths[c[:k]].max().item()) - 2
         if most_frames:
             steps = min(steps, most_frames)
         frames = [] if record else None
+        extras = [] if record else None
         if record:
             frames.append(sim.qpos[:k].float().cpu().clone())
+            extras.append(torch.zeros(k, extra_width(sim), dtype=torch.float16))
         for t in range(steps):
             with torch.no_grad():
                 a = agent.pi(norm(observe(sim)))
@@ -715,23 +758,69 @@ def play(sim, agent, norm, clips, most_frames=None, record=False, push=None):
                 sim.xfrc[:, 1, :3] = torch.where(on[:, None], force, torch.zeros_like(force))
             sim.step(sim.ref_q[sim.global_frame(1)][:, 7:] + sim.act_scale * a.clamp(-1, 1))
             _, fell, ex = reward(sim)
+            sim.last_act = a.clamp(-1, 1)
             live_clip = sim.frame < (sim.lengths[sim.clip] - 1)
             newly = alive & fell & live_clip
             fell_at = torch.where(newly, sim.frame, fell_at)
             alive &= ~(fell & live_clip)
             m = (alive & live_clip).float()
             dist += ex * m
+            past += range_excess(sim) * m
             count += m
             if record:
                 frames.append(sim.qpos[:k].float().cpu().clone())
+                extras.append(extra_of(sim, a.clamp(-1, 1))[:k].half().cpu())
         for j in range(k):
             entry = {"clip": batch[j], "followed": bool(alive[j]), "frames": int(fell_at[j]),
-                     "mean_m": float(dist[j] / max(float(count[j]), 1.0))}
+                     "mean_m": float(dist[j] / max(float(count[j]), 1.0)),
+                     "past_range": float(past[j] / max(float(count[j]), 1.0))}
             if record:
                 n = min(int(fell_at[j]), len(frames))
                 entry["qpos"] = torch.stack([f[j] for f in frames[:n]]).float().numpy()
+                entry["extra"] = torch.stack([e[j] for e in extras[:n]]).numpy()
             out.append(entry)
     return out
+
+
+def widened(mine, theirs, dev):
+    """Weights `theirs` for a net shaped as `mine` whose inputs are more (inputs added at the end,
+    as the last action is): each input layer's columns for the new inputs 0, so the net does what
+    it did until it learns to use them."""
+    out = {}
+    for k, v in mine.items():
+        t = theirs[k].to(dev)
+        if t.shape != v.shape:
+            assert t.dim() == 2 and t.shape[0] == v.shape[0] and t.shape[1] < v.shape[1], \
+                f"{k}: {tuple(t.shape)} does not widen to {tuple(v.shape)}"
+            w = torch.zeros_like(v)
+            w[:, :t.shape[1]] = t
+            t = w
+        out[k] = t
+    return out
+
+
+def widened_norm(s, n):
+    """An observations' scale for `n` inputs from one for fewer: the new ones mean 0, spread 1."""
+    k = s["mean"].shape[0]
+    if k == n:
+        return s
+    mean = torch.zeros(n, dtype=s["mean"].dtype)
+    var = torch.ones(n, dtype=s["var"].dtype)
+    mean[:k], var[:k] = s["mean"].cpu(), s["var"].cpu()
+    return {"mean": mean, "var": var, "count": s["count"]}
+
+
+def extra_width(sim):
+    return 2 * sim.mjm.nu + 3 * (sim.active.numel() - 1)
+
+
+def extra_of(sim, act):
+    """What the simulator knows of a frame beside its poses (the filtered capture's step 8, "with
+    the contacts"): the net's action, each servo's force (N m) and the world's force on each moving
+    segment but the root's first (N, the floor's contacts: x, y, z)."""
+    mjw.rne_postconstraint(sim.m, sim.d)
+    cf = wp.to_torch(sim.d.cfrc_ext)[:, sim.active[1:], 3:6].reshape(sim.n, -1)
+    return torch.cat([act, wp.to_torch(sim.d.actuator_force), cf], -1)
 
 
 # ---- the generator: a clip under changes that physics permits (phase 5 step 16) ------------------
@@ -804,6 +893,9 @@ def summary(results, names=None):
     frames = sum(r["frames"] for r in results)
     mean_mm = 1000.0 * sum(r["mean_m"] * r["frames"] for r in results) / max(frames, 1)
     out = {"clips": len(results), "followed": followed / len(results), "mean_segment_mm": mean_mm}
+    if "past_range" in results[0]:
+        # The ball joints' distances past the body's ranges, summed, on average over the frames.
+        out["past_range_rad"] = sum(r["past_range"] * r["frames"] for r in results) / max(frames, 1)
     if names is not None:
         groups = {}
         for r in results:
@@ -838,7 +930,16 @@ def filtered(sim, agent, norm, head, push=None):
         chunks.append(r["qpos"].astype("<f4"))
     body = zlib.compress(np.concatenate(chunks).tobytes(), 6)
     h = json.dumps({"clips": clips, "nq": head["nq"], "rate": head["rate"]}).encode()
-    return b"WFLT" + struct.pack("<I", len(h)) + h + body, results
+    # Beside it (`WFLX`, `filtered_extra.bin`): each frame's action, servos' forces and contact
+    # forces (`extra_of`, float16), the same frames clip after clip.
+    xs = zlib.compress(np.concatenate([r["extra"].astype("<f2") for r in results]).tobytes(), 6)
+    xh = json.dumps({"clips": [c["name"] for c in clips], "frames": [c["frames"] for c in clips],
+                     "columns": {"action": sim.mjm.nu, "servo_force": sim.mjm.nu,
+                                 "contact_force": 3 * (sim.active.numel() - 1)},
+                     "segments": [sim.mjm.body(int(b)).name for b in sim.active[1:]],
+                     "dtype": "float16", "rate": head["rate"]}).encode()
+    extra = b"WFLX" + struct.pack("<I", len(xh)) + xh + xs
+    return b"WFLT" + struct.pack("<I", len(h)) + h + body, results, extra
 
 
 def play_variants(run, sim, agent, norm, head, kinds, t0):
@@ -848,7 +949,8 @@ def play_variants(run, sim, agent, norm, head, kinds, t0):
     sim.tilt(torch.tensor([k["gravity"] for k in kinds], device=dev))
     force = torch.tensor([k["force"] for k in kinds], device=dev, dtype=torch.float32)
     first = torch.tensor([k["push_at"] for k in kinds], device=dev)
-    data, results = filtered(sim, agent, norm, head, push=(force, first, PUSH_FRAMES))
+    data, results, extra = filtered(sim, agent, norm, head, push=(force, first, PUSH_FRAMES))
+    run.output("filtered_extra.bin", extra)
     by = {}
     for r, k in zip(results, kinds):
         f, n = by.get(k["kind"], (0, 0))
@@ -886,6 +988,15 @@ def main():
     p.add_argument("--start-share", type=float, default=0.25,
                    help="the share of worlds started at their clip's first frame (the evaluation plays each "
                         "clip from there)")
+    p.add_argument("--read-last", action="store_true",
+                   help="the net reads its last action (a net that reads only the body shakes it)")
+    p.add_argument("--rate-weight", type=float, default=0.0,
+                   help="the reward less this times the mean square of the action's change from the last")
+    p.add_argument("--sole-weight", type=float, default=0.0,
+                   help="this share of the reward for the soles where the clip's foot is planted (height, stillness)")
+    p.add_argument("--best-from", type=int, default=0,
+                   help="only evaluations from this update on can be the best tracker (a fine-tune toward "
+                        "another reward: the weights it starts from are not the best)")
     p.add_argument("--range-weight", type=float, default=0.0,
                    help="the reward times e^-(this times the ball joints' distances past the body's ranges, rad)")
     p.add_argument("--fall-mean", type=float, default=0.5,
@@ -916,6 +1027,9 @@ def main():
         sim.start_share = a.start_share
         sim.fall_mean = a.fall_mean
         sim.range_weight = a.range_weight
+        sim.read_last = a.read_last
+        sim.rate_weight = a.rate_weight
+        sim.sole_weight = a.sole_weight
         print(f"sim: {a.worlds} worlds, {len(head['names'])} clips, {refs.shape[0]} frames, "
               f"{sim.active.numel()} active bodies, {sim.mjm.nu} actuators, "
               f"set up in {time.time() - t0:.0f} s", flush=True)
@@ -941,8 +1055,9 @@ def main():
                 return play_variants(run, sim, agent, norm, head, kinds, t0)
             if a.filtered:
                 # The clips as the tracker moves the body: a filtered capture of any states.
-                data, results = filtered(sim, agent, norm, head)
+                data, results, extra = filtered(sim, agent, norm, head)
                 run.output("filtered.bin", data)
+                run.output("filtered_extra.bin", extra)
             else:
                 results = play(sim, agent, norm, list(range(sim.starts.shape[0])))
             for r in results:
@@ -966,16 +1081,17 @@ def main():
                         w = pickle.load(fh)
                 finally:
                     ts._load_from_bytes = was
-            agent.load_state_dict({k: v.to(dev) for k, v in w["agent"].items()})
-            norm.load(w["norm"], dev)
+            agent.load_state_dict(widened(agent.state_dict(), w["agent"], dev))
+            norm.load(widened_norm(w["norm"], n_obs), dev)
             if "vnorm" in w:
                 vnorm.load(w["vnorm"], dev)
             print(f"init: the net and the observations' scale of {a.init} (its update {w.get('step')})", flush=True)
             init_eval = evaluate(sim, agent, norm)
             print(f"evaluate at 0 (init): {json.dumps(init_eval)}", flush=True)
-            best = {"followed": init_eval["training"].get("followed", 0.0), "step": 0, "evaluation": init_eval,
-                    "agent": {k: v.detach().cpu().clone() for k, v in agent.state_dict().items()},
-                    "norm": {k: (v.cpu().clone() if hasattr(v, "cpu") else v) for k, v in norm.state().items()}}
+            if a.best_from == 0:
+                best = {"followed": init_eval["training"].get("followed", 0.0), "step": 0, "evaluation": init_eval,
+                        "agent": {k: v.detach().cpu().clone() for k, v in agent.state_dict().items()},
+                        "norm": {k: (v.cpu().clone() if hasattr(v, "cpu") else v) for k, v in norm.state().items()}}
             sim.reset(torch.ones(a.worlds, dtype=torch.bool, device=dev))
         if state is not None:
             agent.load_state_dict(state["agent"])
@@ -1022,6 +1138,7 @@ def main():
                     act_c = act.clamp(-1, 1)
                     sim.step(sim.ref_q[sim.global_frame(1)][:, 7:] + sim.act_scale * act_c)
                     r, fell, _ = reward(sim, act_c)
+                    sim.last_act = act_c
                     blown += int(exploded(sim).sum())
                     ended = sim.frame >= (sim.lengths[sim.clip] - 2)
                     # At a clip's end the return goes on (its value); at a fall it stops.
@@ -1079,7 +1196,7 @@ def main():
                 last_eval = evaluate(sim, agent, norm)
                 print(f"evaluate at {step}: {json.dumps(last_eval)}", flush=True)
                 followed = last_eval["training"].get("followed", 0.0)
-                if best is None or followed > best["followed"]:
+                if step >= a.best_from and (best is None or followed > best["followed"]):
                     best = {"followed": followed, "step": step, "evaluation": last_eval,
                             "agent": {k: v.detach().cpu().clone() for k, v in agent.state_dict().items()},
                             "norm": {k: (v.cpu().clone() if hasattr(v, "cpu") else v) for k, v in norm.state().items()}}
@@ -1114,8 +1231,9 @@ def main():
         run.output("tracker.pt", buf.getvalue())
         full = {}
         if a.filtered:
-            data, results = filtered(sim, agent, norm, head)
+            data, results, extra = filtered(sim, agent, norm, head)
             run.output("filtered.bin", data)
+            run.output("filtered_extra.bin", extra)
             full = {"training": summary([r for r in results if r["clip"] in set(sim.train.tolist())], sim.names),
                     "test": summary([r for r in results if r["clip"] in set(sim.test.tolist())], sim.names)}
             print(f"the filtered capture, every clip to its end: {json.dumps(full)}", flush=True)
