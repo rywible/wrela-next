@@ -2,9 +2,9 @@
 
 use matter::substance::{Substance, lambert}
 use mesh::dc::{
-    CREASE_STEPS, CellCorners, Qef, cdist, cell_dual_vertex, corner_uvw, crease_part, crease_passes,
-    crease_start, crease_steps, decode_cell, facing, is_crease, load_corners, project_posed,
-    solve_crease_cell, trilinear_qef,
+    CREASE_STEPS, CellCorners, QUAD_FOLDED, Qef, cdist, cell_dual_vertex, corner_uvw, crease_part,
+    crease_passes, crease_start, crease_steps, decode_cell, facing, is_crease, load_corners,
+    on_outline, project_posed, solve_crease_cell, trilinear_qef,
 }
 use mesh::extract::{FRAME, NEVER, part_classes, part_states}
 use mesh::emit::{
@@ -33,11 +33,15 @@ use std::quat::Quat
 // do and holding the result to the solid: closed, facing out of it, and the same as one mesh of
 // the whole grid at once.
 
-/// A triangle by its three vertices' positions' bits, in winding order.
+/// A triangle by its three vertices' positions' bits, in winding order, and whether the engine
+/// draws its place by exact rays (`caught`): its quad folded (`dc::on_outline`'s `QUAD_FOLDED`,
+/// `QuadCover::Folded`), or it stitches a 2:1 seam (every seam cell is an exact cell,
+/// `emit::box_seam_cells`).
 struct Tri: Copy {
     a: vec3u,
     b: vec3u,
     c: vec3u,
+    caught: bool,
 }
 
 /// A position's bits.
@@ -61,9 +65,9 @@ fn canonical(t: Tri) -> Tri {
     if !key_before(t.b, t.a) && !key_before(t.c, t.a) {
         t
     } else if !key_before(t.c, t.b) {
-        Tri { a: t.b, b: t.c, c: t.a }
+        Tri { a: t.b, b: t.c, c: t.a, caught: t.caught }
     } else {
-        Tri { a: t.c, b: t.a, c: t.b }
+        Tri { a: t.c, b: t.a, c: t.b, caught: t.caught }
     }
 }
 
@@ -91,8 +95,21 @@ fn push_quad(tris: mut Vec<Tri>, at: Vec<vec3>, nm: Vec<vec3>, i: [u32; 4], flip
     let (q0, q1, q2, q3) = (at[j0], at[j1], at[j2], at[j3])
     let split = split_seam_13(q0, q1, q2, q3, nm[j0], nm[j1], nm[j2], nm[j3])
     let (a, b, c, d) = if split { (q1, q2, q3, q0) } else { (q0, q1, q2, q3) }
-    tris.push(Tri { a: bits(a), b: bits(b), c: bits(c) })
-    tris.push(Tri { a: bits(a), b: bits(c), c: bits(d) })
+    let caught = on_outline(
+        q0,
+        q1,
+        q2,
+        q3,
+        nm[j0],
+        nm[j1],
+        nm[j2],
+        nm[j3],
+        split13: split,
+        e: q0,
+        reach: 0.0,
+    ) == QUAD_FOLDED
+    tris.push(Tri { a: bits(a), b: bits(b), c: bits(c), caught })
+    tris.push(Tri { a: bits(a), b: bits(c), c: bits(d), caught })
 }
 
 /// Meshes `f` over grid `g` on the CPU as the GPU passes do: each brick culled by `cull_brick`,
@@ -326,6 +343,45 @@ fn inward<M: Field<Substance>>(f: M, tris: Vec<Tri>) -> u32 {
     bad
 }
 
+/// How many of `tris` face into `f`'s solid by more than `lean` (the sine of an angle past its
+/// tangent plane, at the best of its centroid and corners), where the engine doesn't draw their
+/// place by exact rays (`Tri::caught`): a fold a picture can show. A triangle standing edge-on at
+/// a crease (within `lean` of the surface's tangent plane: no area seen face-on, and seen edge-on
+/// it is the outline's, whose cells are solved) is not one, nor a sliver under a sixteenth of a
+/// cell `h` high (three corners nearly in a line, whose winding is their rounding's: a strip a
+/// sixteenth of a cell wide is a fortieth of a pixel at `CELL_PX`, and holds none).
+fn inward_uncaught<M: Field<Substance>>(f: M, tris: Vec<Tri>, lean: f32, h: f32) -> u32 {
+    var bad: u32 = 0
+    for i in 0..tris.len() {
+        if tris[i].caught {
+            continue
+        }
+        let a = vec3(bitcast_f32(tris[i].a.x), bitcast_f32(tris[i].a.y), bitcast_f32(tris[i].a.z))
+        let b = vec3(bitcast_f32(tris[i].b.x), bitcast_f32(tris[i].b.y), bitcast_f32(tris[i].b.z))
+        let c = vec3(bitcast_f32(tris[i].c.x), bitcast_f32(tris[i].c.y), bitcast_f32(tris[i].c.z))
+        let n = cross(b - a, c - a)
+        if !(dot(n, n) > 1.0e-14) {
+            continue
+        }
+        let longest = max(length(b - a), max(length(c - b), length(a - c)))
+        if length(n) / longest < h / 16.0 {
+            continue
+        }
+        let nn = normalize(n)
+        var best = -1.0
+        for p in [(a + b + c) * (1.0 / 3.0), a, b, c] {
+            let (_d, g) = value_and_gradient(|q: vec3| f.distance(q), p)
+            if dot(g, g) > 0.0 {
+                best = max(best, dot(nn, normalize(g)))
+            }
+        }
+        if best < -lean {
+            bad += 1
+        }
+    }
+    bad
+}
+
 /// Whether two triangle lists hold the same triangles, wound the same way, bit for bit.
 fn same_tris(x: Vec<Tri>, y: Vec<Tri>) -> bool {
     if x.len() != y.len() {
@@ -349,7 +405,8 @@ fn same_tris(x: Vec<Tri>, y: Vec<Tri>) -> bool {
 
 /// Meshes `f` at cell `cell` on the grid `sync_one` would, brick by brick, and holds the mesh to
 /// the solid: at least `least` triangles, closed (`manifold`: every edge 2 triangles'; else an
-/// even number, as Dual Contouring may pinch), none facing into the solid, and bit for bit the
+/// even number, as Dual Contouring may pinch), none facing into the solid where the engine draws
+/// it by its triangles (`inward_uncaught`), and bit for bit the
 /// mesh of the whole grid meshed at once with every part live.
 fn held_to_solid<M: Field<Substance>>(name: Text, f: M, cell: f32, manifold: bool, least: u32) {
     let g = grid_for(tight_aabb(f), cell, base_brick: 0, orig_id: 0, shift: placement(0))
@@ -358,8 +415,8 @@ fn held_to_solid<M: Field<Substance>>(name: Text, f: M, cell: f32, manifold: boo
     assert(bricked.len() >= least, f"{name}'s mesh has triangles")
     let open = open_edges(bricked, even: !manifold)
     assert(open == 0, f"{name}'s mesh has {open} open edges")
-    let bad = inward(f, bricked)
-    assert(bad == 0, f"{bad} of {name}'s triangles face into it")
+    let bad = inward_uncaught(f, bricked, sin(2.0 * 3.1415927 / 180.0), cell)
+    assert(bad == 0, f"{bad} of {name}'s triangles face into it where the engine draws them")
     assert(
         same_tris(bricked, mesh_whole(f, g)),
         f"{name} meshed in bricks isn't the whole grid's mesh",
@@ -671,7 +728,7 @@ fn push_seam_tri(tris: mut Vec<Tri>, pa: vec3, pb: vec3, pc: vec3) {
     if ka == kb || kb == kc || kc == ka {
         return
     }
-    tris.push(Tri { a: ka, b: kb, c: kc })
+    tris.push(Tri { a: ka, b: kb, c: kc, caught: true })
 }
 
 /// CPU mirror of `process_lod_edge` + `solve_seam_smooth`/`refine_seam_creases`/`finish_seam_tris`.
@@ -1140,8 +1197,8 @@ fn multilod_two_level_sphere_seam_is_watertight_and_faces_out() {
     assert(seams > 20, "seam boundary actually intersects the sphere surface")
     let open = open_edges(tris, even: false)
     assert(open == 0, f"multilod 2-level sphere has {open} open edges")
-    let bad = inward(f, tris)
-    assert(bad == 0, f"{bad} triangles of multilod 2-level sphere face inward")
+    let bad = inward_uncaught(f, tris, sin(2.0 * 3.1415927 / 180.0), 0.04)
+    assert(bad == 0, f"{bad} triangles of multilod 2-level sphere face inward where the engine draws them")
 }
 
 @test
@@ -1163,11 +1220,12 @@ fn multilod_three_level_nested_seams_are_watertight() {
     assert(seams > 40, "both 2:1 seam boundaries intersect the sphere surface")
     let open = open_edges(tris, even: false)
     assert(open == 0, f"multilod 3-level sphere has {open} open edges")
-    // All non-sliver triangles face outward (curved 2:1 seam corners can create <=0.02% sub-mm
-    // tangent slivers behind front-facing neighbors; zero cracks, zero open edges).
+    // A triangle that faces inward is a seam's (whose cells are exact cells) or of a quad the
+    // engine finds folded (`every_mesh_fold_is_drawn_by_exact_rays`).
     let bad = inward(f, tris)
-    print(f"multilod 3-level sphere: {bad} of {tris.len()} triangles face inward")
-    assert(bad * 5000 <= tris.len(), f"{bad} of {tris.len()} triangles face inward")
+    let open = inward_uncaught(f, tris, sin(2.0 * 3.1415927 / 180.0), 0.03)
+    print(f"multilod 3-level sphere: {bad} of {tris.len()} triangles face inward, {open} not drawn exactly")
+    assert(open == 0, f"{open} of {tris.len()} triangles face inward where the engine draws them")
 }
 
 @test
@@ -1194,8 +1252,9 @@ fn multilod_sharp_creased_rock_seam_is_watertight() {
     let open = open_edges(tris, even: true)
     assert(open == 0, f"multilod creased rock has {open} open edges")
     let bad = inward(f, tris)
-    print(f"multilod creased rock: {bad} of {tris.len()} triangles face inward")
-    assert(bad * 5000 <= tris.len(), f"{bad} of {tris.len()} creased rock triangles face inward")
+    let open = inward_uncaught(f, tris, sin(2.0 * 3.1415927 / 180.0), 0.035)
+    print(f"multilod creased rock: {bad} of {tris.len()} triangles face inward, {open} not drawn exactly")
+    assert(open == 0, f"{open} of {tris.len()} creased rock triangles face inward where the engine draws them")
 }
 
 @test
@@ -1731,4 +1790,70 @@ fn a_smooth_fields_mesh_is_within_a_tenth_of_a_cell_both_ways() {
             assert(e.z <= 0.2, f"the {name}'s mesh's normals turn {e.z} rad")
         }
     }
+}
+
+/// Triangles that face into their solid, over twelve placements of the lattice: a weathered
+/// rock's creases (one grid) and a sphere's and a creased rock's 2:1 seams (nested grids). Each
+/// is one whose place the engine draws by exact rays (`Tri::caught`): a quad that folds is
+/// `QuadCover::Folded` and its cells are solved, and every cell of a seam is an exact cell. A fold
+/// left to its triangles alone fails, unless it stands within 2° of edge-on or is a sliver under
+/// a sixteenth of a cell high (`inward_uncaught`). Over the twelve: the rock 10 folds of 93,532
+/// triangles, the seam sphere 4 of 343,658, the creased rock 17 of 151,986, each caught but one
+/// sliver of the rock's (0.43 mm high on 3 cm cells) and one edge-on triangle of the creased
+/// rock's. Before `on_outline` also held each triangle to its own corners' normals, 3 were not
+/// caught. A crease vertex clamped into its cell can lie inside the solid, and taking it onto the
+/// surface slid it off its crease and folded more (33 on the rock against 15): it stays on its
+/// crease, and the engine solves the fold's cells.
+@test
+@fuel(2 ** 46)
+fn every_mesh_fold_is_drawn_by_exact_rays() {
+    let rock = ellipsoid(vec3(0.55, 0.4, 0.45))
+        .intersect(half_space(vec3(0.3, 1.0, 0.1), 0.3))
+        .intersect(half_space(vec3(1.0, 0.2, -0.3), 0.42))
+        .intersect(half_space(vec3(-0.8, 0.3, 0.6), 0.36))
+        .intersect(half_space(vec3(0.1, -0.2, -1.0), 0.33))
+        .intersect(half_space(vec3(-0.2, 0.5, 1.0), 0.38))
+        .displace(fbm(freq: 5.0, octaves: 3, offset: vec3(1.0, 4.0, 2.0)), amp: 0.012)
+        .with(lambert(vec3(0.5)))
+    let ball = sphere(radius: 2.0).translate(vec3(-0.07, 0.04, -0.03)).with(lambert(vec3(0.5)))
+    let creased = ellipsoid(vec3(1.1, 0.8, 0.9))
+        .intersect(half_space(vec3(0.3, 1.0, 0.1), 0.55))
+        .intersect(half_space(vec3(1.0, 0.2, -0.3), 0.78))
+        .displace(fbm(freq: 3.5, octaves: 3, offset: vec3(1.0, 4.0, 2.0)), amp: 0.025)
+        .with(lambert(vec3(0.5)))
+    var totals = vec3u(0)
+    var folds = vec3u(0)
+    var open = vec3u(0)
+    var edge_on = vec3u(0)
+    for k in 0..12 {
+        let g = grid_for(tight_aabb(rock), 0.03, base_brick: 0, orig_id: 0, shift: placement(k))
+        let rt = mesh_bricked(rock, g)
+        let (bg, _tb, _s) = build_lod_grids(
+            tight_aabb(ball),
+            focus: vec3(1.92, 0.30, 0.15),
+            h_near: 0.03,
+            h_top: 0.12,
+            orig_id: 0,
+            half_parent_bricks: 2,
+            shift: placement(k),
+        )
+        let (bt, _bs) = mesh_multilod(ball, bg)
+        let (cg, _tc, _cs) = build_lod_grids(
+            tight_aabb(creased),
+            focus: vec3(0.75, 0.45, 0.10),
+            h_near: 0.035,
+            h_top: 0.07,
+            orig_id: 0,
+            half_parent_bricks: 2,
+            shift: placement(k),
+        )
+        let (ct, _c2) = mesh_multilod(creased, cg)
+        totals = totals + vec3u(rt.len(), bt.len(), ct.len())
+        folds = folds + vec3u(inward(rock, rt), inward(ball, bt), inward(creased, ct))
+        let lean = sin(2.0 * 3.1415927 / 180.0)
+        open = open + vec3u(inward_uncaught(rock, rt, lean, 0.03), inward_uncaught(ball, bt, lean, 0.03), inward_uncaught(creased, ct, lean, 0.035))
+        edge_on = edge_on + vec3u(inward_uncaught(rock, rt, 0.0, 0.0), inward_uncaught(ball, bt, 0.0, 0.0), inward_uncaught(creased, ct, 0.0, 0.0))
+    }
+    print(f"folds over 12 placements: rock {folds.x} of {totals.x} ({open.x} not caught; {edge_on.x} not caught with edge-on ones and slivers), seam sphere {folds.y} of {totals.y} ({open.y}; {edge_on.y}), creased rock {folds.z} of {totals.z} ({open.z}; {edge_on.z})")
+    assert(open == vec3u(0), f"folds the engine draws by their triangles alone: {open}")
 }
