@@ -310,6 +310,8 @@ pub(crate) struct Cx<'a> {
     /// `std::derive::work`'s count of each callable it was asked of (`None`: it can't be GPU
     /// code), once a build.
     pub works: HashMap<(InstanceKey, bool), Option<u32>>,
+    /// Optional persistent cache for GPU pipelines and `std::derive::work` counts.
+    pub pipeline_cache: Option<&'a dyn gpu::PipelineCache>,
 }
 
 /// One target module being built: the CPU module by default.
@@ -440,6 +442,7 @@ fn lower_in(
     cache: Option<&dyn PipelineCache>,
 ) -> (Lowered, Vec<Diagnostic>) {
     let mut cx = Cx::new(checked, data, emit_gpu);
+    cx.pipeline_cache = cache.filter(|_| std::env::var_os("WRELA_DUMP_IR").is_none());
     cx.lift = data.lift.as_ref().filter(|t| !t.literals.is_empty());
     let mut cpu = ModuleBuilder::default();
     cx.make_table(&mut cpu);
@@ -1038,6 +1041,7 @@ impl<'a> Cx<'a> {
             lift: None,
             hoist: false,
             works: HashMap::new(),
+            pipeline_cache: None,
         }
     }
 

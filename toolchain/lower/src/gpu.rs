@@ -131,6 +131,22 @@ pub trait PipelineCache: Sync {
         out: &PipelineOut,
         uncounted_most: Option<u64>,
     ) -> Option<Result<PreEmittedShader, String>>;
+    /// Returns the content-addressed key for a `std::derive::work` / `strict_work` count.
+    fn work_key(
+        &self,
+        _module: &ir::Module,
+        _id: ir::FuncId,
+        _strict: bool,
+        _divides_by_std: bool,
+    ) -> Option<String> {
+        None
+    }
+    /// Looks up a cached `std::derive::work` / `strict_work` count by `key`.
+    fn get_work(&self, _key: &str) -> Option<u32> {
+        None
+    }
+    /// Stores a computed `std::derive::work` / `strict_work` count under `key`.
+    fn put_work(&self, _key: &str, _work: u32) {}
 }
 
 /// A lowered pipeline: its module and what the manifest says about it.
@@ -4857,12 +4873,19 @@ fn count_work(
     strict: bool,
 ) -> Option<u32> {
     let (mut mb, id) = as_gpu_code(cx, key, span, beside, "work")?;
+    let div = crate::divides_by_std(cx);
+    let cache_key = cx.pipeline_cache.and_then(|c| c.work_key(&mb.m, id, strict, div));
+    if let (Some(c), Some(k)) = (cx.pipeline_cache, cache_key.as_deref())
+        && let Some(hit) = c.get_work(k)
+    {
+        return Some(hit);
+    }
     if strict {
         // As a strict kernel computes it (§11.3): its built-ins as the CPU's, std's code.
         mb.m.strict = true;
         ir::strict::lower_strict(&mut mb.m);
         crate::make_strict(cx, &mut mb);
-        if crate::divides_by_std(cx) {
+        if div {
             crate::strict_divisions(cx, &mut mb);
         }
     }
@@ -4902,7 +4925,11 @@ fn count_work(
             };
         }
     }
-    Some(w.map_or(u32::MAX, |w| u32::try_from(w).unwrap_or(u32::MAX)))
+    let out = w.map_or(u32::MAX, |w| u32::try_from(w).unwrap_or(u32::MAX));
+    if let (Some(c), Some(k)) = (cx.pipeline_cache, cache_key.as_deref()) {
+        c.put_work(k, out);
+    }
+    Some(out)
 }
 
 /// Function `id`'s captures (its parameters but the last) of a struct or an array type, each

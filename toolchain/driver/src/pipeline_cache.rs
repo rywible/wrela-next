@@ -27,6 +27,7 @@ use wrela_lower::{
 };
 
 const MAGIC: &[u8; 8] = b"wrelap\x00\x01";
+const MAGIC_WORK: &[u8; 8] = b"wrelaw\x00\x01";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const KEY_BYTES: usize = 64;
 const CHECKSUM_BYTES: usize = 32;
@@ -254,13 +255,82 @@ impl PipelineCache for DiskPipelineCache {
             shader: pre.clone(),
         };
         if let Some(bytes) = encode(key, &cached) {
-            write_atomic(&self.dir, key, &bytes);
+            write_atomic(&self.dir, key, "wpv", &bytes);
         }
         Some(Ok(pre))
     }
+
+    fn work_key(
+        &self,
+        module: &ir::Module,
+        id: ir::FuncId,
+        strict: bool,
+        divides_by_std: bool,
+    ) -> Option<String> {
+        let mut h = Sha256::new();
+        h.update(MAGIC_WORK);
+        h.update(self.exe_hash);
+        h.update([u8::from(strict), u8::from(strict && divides_by_std)]);
+        if strict {
+            h.update(self.std_hash);
+        }
+        h.update(id.0.to_le_bytes());
+        ir::fingerprint::feed_module(module, &mut |bytes| h.update(bytes));
+        let mut out = String::with_capacity(KEY_BYTES);
+        for b in h.finalize() {
+            let _ = write!(out, "{b:02x}");
+        }
+        Some(out)
+    }
+
+    fn get_work(&self, key: &str) -> Option<u32> {
+        let path = self.dir.join(format!("{key}.wwk"));
+        crate::ensure_no_symlink_path(&self.dir, &path).ok()?;
+        let bytes = std::fs::read(&path).ok()?;
+        let work = decode_work(key, &bytes)?;
+        let _ = std::fs::File::options()
+            .append(true)
+            .open(&path)
+            .and_then(|f| f.set_modified(std::time::SystemTime::now()));
+        Some(work)
+    }
+
+    fn put_work(&self, key: &str, work: u32) {
+        if let Some(bytes) = encode_work(key, work) {
+            write_atomic(&self.dir, key, "wwk", &bytes);
+        }
+    }
 }
 
-fn write_atomic(dir: &Path, key: &str, bytes: &[u8]) {
+fn encode_work(key: &str, work: u32) -> Option<Vec<u8>> {
+    if !is_key(key) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(MAGIC_WORK.len() + KEY_BYTES + 4 + CHECKSUM_BYTES);
+    out.extend_from_slice(MAGIC_WORK);
+    out.extend_from_slice(key.as_bytes());
+    out.extend_from_slice(&work.to_le_bytes());
+    let checksum = Sha256::digest(&out);
+    out.extend_from_slice(&checksum);
+    Some(out)
+}
+
+fn decode_work(key: &str, bytes: &[u8]) -> Option<u32> {
+    if !is_key(key) {
+        return None;
+    }
+    let checksum_at = bytes.len().checked_sub(CHECKSUM_BYTES)?;
+    let (body, stored) = bytes.split_at(checksum_at);
+    let actual: [u8; CHECKSUM_BYTES] = Sha256::digest(body).into();
+    if actual.as_slice() != stored {
+        return None;
+    }
+    let rest = body.strip_prefix(MAGIC_WORK.as_slice())?.strip_prefix(key.as_bytes())?;
+    let arr: [u8; 4] = rest.try_into().ok()?;
+    Some(u32::from_le_bytes(arr))
+}
+
+fn write_atomic(dir: &Path, key: &str, ext: &str, bytes: &[u8]) {
     if std::fs::create_dir_all(dir).is_err() {
         return;
     }
@@ -269,7 +339,7 @@ fn write_atomic(dir: &Path, key: &str, bytes: &[u8]) {
         .map_or(0, |d| d.subsec_nanos());
     let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp = dir.join(format!("{key}.{}-{nanos}-{seq}.tmp", std::process::id()));
-    let dst = dir.join(format!("{key}.wpv"));
+    let dst = dir.join(format!("{key}.{ext}"));
     if crate::ensure_no_symlink_path(dir, &tmp).is_err()
         || crate::ensure_no_symlink_path(dir, &dst).is_err()
     {
@@ -305,7 +375,7 @@ fn clean_if_due(dir: &Path) {
             continue;
         }
         let rest = &name[KEY_BYTES..];
-        let temporary = if rest == ".wpv" {
+        let temporary = if rest == ".wpv" || rest == ".wwk" {
             false
         } else if rest.starts_with('.') && rest.ends_with(".tmp") {
             true
@@ -1351,5 +1421,13 @@ mod tests {
             h.finalize()
         };
         assert_ne!(hash(&m1), hash(&m2));
+    }
+
+    #[test]
+    fn roundtrip_work_count_entry() {
+        let key = "a".repeat(KEY_BYTES);
+        let bytes = encode_work(&key, 42_123).expect("encodes");
+        assert_eq!(decode_work(&key, &bytes), Some(42_123));
+        assert_eq!(decode_work(&"b".repeat(KEY_BYTES), &bytes), None);
     }
 }
