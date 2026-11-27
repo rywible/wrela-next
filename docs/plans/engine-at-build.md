@@ -1,8 +1,21 @@
 # Plan: the engine makes its decisions at build
 
-Status: in progress. Phase 0 is done on the M4 (its Radeon half is open). The plan agreed with
-the code at commit `1c78609` (2026-11-25) when it was written; each phase's state is at its
-"Done when".
+Status: in progress (2026-11-26). Phases 0, 1 and 2 are done on the two machines' strict math
+and on the M4's gate; the Radeon's gate is in section 5. Phase 3 is rewritten: the frame with the
+eye moving is three to seven times the frame with it still, and that is now the plan's first
+target. Each phase's state is a table at its head.
+
+What the gate reads today (M4, 1080p, `tools/gate.json`; the bar is 16.6 ms):
+
+| Line | ms |
+| --- | --- |
+| SCENE 10, the arena, eye still | 20.05 |
+| SCENE 11, the citadel | 16.43 |
+| SCENE 13, the study | 16.27 |
+| SCENE 14, the forge's set | 17.24 |
+| SCENE 16, the parry | 11.34 |
+| SCENE 10, eye walking (median, and the span 19 frames in 20 are within) | 57.8 to 69.2, 67.9 to 94.1 |
+| SCENE 13, eye on its tour (the same) | 110.7, 143.7 |
 
 ## 1. Purpose
 
@@ -131,6 +144,20 @@ Use these commands. Do not use a different measure of a frame.
 - `tools/bench` also runs each pass alone and prints a table. The times in the table do not add
   up to the span. Use the table to compare one pass before and after a change.
 - Put each measurement in the commit message: before and after, same machine, same run.
+- The gate times a frame with the eye moving too (2026-11-26): SCENE 10 `VIEW 3` (the arena's
+  eye walking round the casters at 1.4 m/s) and SCENE 13 `VIEW 3` (the study's tour), frames 30
+  to 269, the median span and the span 19 frames in 20 are within. A still eye meshes nothing
+  again, so the four still spans say nothing of what an eye that moves costs.
+- The hole audit holds things that move (2026-11-26): a flame, the ward and the bolt, each seen
+  eight frames on from where the eye before saw it, drawn through each frame
+  (`Auditing::move_eyes`). What the engine keeps of a mesh from one frame to the next is judged
+  there, and nowhere else.
+- The sun's judge is drawn until its meshes are settled, then judged (it was 16 frames, which
+  left the Radeon's picture without casters).
+- When the Linux checkout is on another branch, use a second checkout there:
+  `WRELA_RADEON_DIR='~/projects/wrela-next-engine-plan' tools/radeon COMMAND`. That machine has
+  13 GB and other work on it: run its gate with `WRELA_GATE_JOBS=1` (a Vulkan build of SCENE 6
+  takes 4.7 GB, a Metal one 2.1 GB).
 
 ## 6. Rules for all phases
 
@@ -359,10 +386,9 @@ target) keeps a changed kind under 25 s.
 - The list of geometry kernels is in this file.
 - The gate passes on the two machines with the temporary option not used.
 
-State (2026-11-25): done on the M4 (the full gate passed: audit small passes, full fails only on
-the crowd's named debt, sun 13/0/1/2 hard leaks 754/1343/316, spans SCENE 10/11/13/14
-24.46/16.55/18.32/21.58 ms). The Radeon's measurements of 0.1 and its gate are open: it was in
-use by another project; they are to be run with the rest of the plan's Radeon work.
+State: done on the M4 (2026-11-25: the full gate passed with the temporary option not used).
+The Radeon's measurement of 0.1 was not made: phase 1 replaced the option, and the Radeon's
+strict cost is in phase 1's state.
 
 ## 9. Phase 1: strict math in the geometry kernels
 

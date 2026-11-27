@@ -1,0 +1,600 @@
+# Plan: a build-time engine with state-box proofs and continual LOD
+
+Status: draft (2026-11-26, revision 2 after adversarial review). Grounded in the code at commit
+`63f682a` on branch `engine-plan` and the record in `docs/plans/engine-at-build.md`. This plan
+succeeds the open work of `docs/plans/engine-at-build.md` once approved.
+
+Every claim about the repository comes from the code at `63f682a` and cited measurements. Phase 0
+collects every missing measurement before any large engine rewrite begins.
+
+## 1. Purpose
+
+With the eye still, four of five gate scenes are near or under 16.6 ms on the M4. With the eye
+moving, the gate records 57.8 to 69.2 ms median on `SCENE 10 VIEW 3` and 110.7 ms on `SCENE 13
+VIEW 3`. One unpaired M4 run of `SCENE 10 VIEW 3` at `63f682a` (1080p, frames 30 to 269) measured
+a 70.5 ms median span: `mesh_extract` 43.2 ms, `mesh_certify` 7.3 ms, and all other passes ~17 ms
+(`mesh_sdf` 0.59 ms, `mesh_shadow_static` 0.0 ms).
+
+This plan turns the engine into a build-time proof and code generator paired with a bounded GPU
+brick pool at run time:
+
+- The game stays a set of fields.
+- The engine stays in `lib/engine`.
+- The toolchain holds only general proof and code-generation mechanisms.
+- At build, the compiler and engine prove two-sided error bounds, refinement radii, state-box
+  bounds, and structural motion classes, and emit specialized kernels where counts justify them.
+- At run time, the GPU keeps a persistent pool of world-anchored bricks selected by eye distance
+  alone (never by the frustum), so walking and turning reuse bricks in place.
+
+### Why we bake proofs and kernels, not dense grids
+
+A 3D surface is a 2D manifold. Its fine bricks grow as $O(h^{-2})$: the census on branch
+`engine-plan-ladder` measured 779 MiB for the courtyard at 7.8 mm, 1.2 GiB for the pillars at
+3.9 mm, and 759 MiB for the table at 1 mm. Dense fine-grid cooks do not scale.
+
+Baked octree error bounds take roughly 8 bytes per node (~2 MiB for the courtyard's 255,480
+bricks). Proofs, error tables, and specialized kernels belong at build; fine bricks belong in a
+bounded GPU pool at run time.
+
+### What is in the repository today
+
+| Fact | Where |
+| --- | --- |
+| Strict GPU math (`@strict`), `lower_strict`, `std::math`, `sqrt_rounded`, `div_rounded`, `std::strict::strict_check`, `judge::bits` | `toolchain/ir/src/strict.rs`, `lib/std/math.wrela`, `lib/std/strict.wrela`, `lib/engine/judge/bits.wrela` |
+| Compositional first-order enclosures (`SlopeBox`, `MapBox`) on one certification path | `lib/std/field.wrela`, `lib/engine/matter/certify.wrela`, `lib/engine/matter/verify.wrela` |
+| Exact-cell hit/resolve split (`exact_box_hit_fs`, `exact_resolve_one_fs`) and 4x4x4 super-brick culling | `lib/engine/mesh/shade.wrela`, `lib/engine/mesh/dc.wrela`, `lib/engine/mesh/extract.wrela` |
+| 4D space-time contract verifier (`verify_moving_soundness`) and `SCENE 16` (bolt, glass branch, fallen pieces; no sand veil drawn yet) | `lib/engine/matter/verify.wrela`, `game/world/parry.wrela`, `game/scenes/main.wrela` |
+| Moving-eye benchmarks (`SCENE 10 VIEW 3`, `SCENE 13 VIEW 3`) and moving-field hole audit (`Auditing::move_eyes`); no fast-turning or max-speed view yet | `tools/gate`, `lib/engine/judge/audit.wrela` |
+| Counting build (`--tally`) and `tools/cost` diagnostic | `toolchain/ir/src/tally.rs`, `tools/cost` |
+| Smooth combinators (`SmoothUnion`, `SmoothUnionAll`, `SmoothSubtract`, `SmoothIntersect`) do not widen `part_bound` by `k`; `parts_dirty` mutates state before commit | `lib/std/field.wrela`, `lib/engine/mesh/extract.wrela` |
+| `GlassBranch` re-meshes every frame while cooling (`glow.xyz` changes its full `StateHash`); `branch_pieces` calls `landing()` on the CPU each frame; `GlassBranch` has infinite proven steepness | `game/world/parry.wrela` |
+| Absent `Bolt` (`struck: 0`) still wanders its joints with `t` and touches 0 along its path, so `lo > 0` culling does not drop it | `game/world/parry.wrela` |
+| `ParryArc` is `Shell(Displace(Sphere))` clipped by static planes (moving creases), touching a pulsing torus ring and a static `smin` tether, keeping ~100,000 candidate bricks for ~8 m² of sheet | `game/world/arena.wrela` |
+| `exact_box_hit_fs` and `vis_cut_*_fs` are not marked `@strict`; `exact_box_hit_fs` evaluates `field.channels` when `may_transmit` is true | `lib/engine/mesh/shade.wrela`, `lib/engine/mesh/visbuf.wrela` |
+| Flattened `ir::work` undercounts `cull_bricks` (`2,755` vs `164,544`), masked by `pre.max(flat)` for strict kernels | `toolchain/lower/src/gpu.rs`, `toolchain/ir/src/work.rs` |
+| `ir::derive::affine` hits a NaN on carved boards; `table` and `grimoire` use `derive: false` | `toolchain/ir/src/derive/affine.rs`, `game/world/certificates.wrela` |
+| Open mesh faults: 2:1 seam folds (5 in 220,018 triangles) and noise-rock crease folds (1 in 10,000); rigid exact-cell bracketing (`rigid_inv_point`) has no moving-rigid audit test | `lib/engine/mesh/emit.wrela`, `dc.wrela`, `shade.wrela` |
+| `tools/gate.json` lacks `SCENE 16` and `moving` entries, and its `radeon` block is from `1c78609` before this branch | `tools/gate.json` |
+
+### What earlier attempts showed
+
+Read these commits before starting Phase 3 or Phase 4 so you do not repeat their faults:
+
+- **Earlier brick pool** (`d6a9616`, removed in `b7edd49`): it kept a partial mesh cut short by
+  the dispatch budget and marked it settled. Phase 3 separates the *wanted cut* from the *drawn
+  cut*, measures lateness, and marks a batch settled only when `drawn == wanted`.
+- **Heuristic vertex flow** (`009c4a1`, removed in `ae3c1c4`): it cut `SCENE 10` from 20.26 ms to
+  16.45 ms on M4, but left 91 holes on the moving ward without reporting failure. Per-brick DC
+  advection breaks shared brick-face connectivity whenever an advected brick meets a re-extracted
+  neighbor. Phase 4 never mixes two motion methods across one brick face.
+- **Ladder grids blocked on sun leaks** (`engine-plan-ladder`, `f6125e6`): world-anchored grids
+  shared 4,689,500 bit-identical corners across three eyes, but failed `SCENE 13 VIEW 0` sun leaks
+  (`845` vs `773`). Passing per-pixel mesh error in `g_normal.w` spiked acne (`18 → 130`) without
+  fixing sub-cell caster leaks. Phase 2 fixes the sun judge first.
+- **Candlestick exact cells** (`engine-at-build.md` §12–13): 88 of 100 candlestick enclosures have
+  no slopes at all (balls from `Carved` or an unsure `min` in `Profile`), not curvature error
+  ($h^2 \kappa / 8 \approx 0.2\text{ mm}$ against a `1.2 mm` slab). A single-part shader took
+  2.1 ms against 8.2 ms for the monolithic field shader. Phase 5 fixes failure classes measured in
+  Phase 0 and specializes the exact pass before considering higher-order models.
+
+## 2. Terms
+
+Each term has one meaning in this plan.
+
+| Term | Meaning |
+| --- | --- |
+| Kind | One type of thing in the world (one `Field<Substance>` type) |
+| Eye | The camera |
+| Brick | One `6 × 6 × 6` block of cells (`7 × 7 × 7` vertices, `8 × 8 × 8` corners) on an integer world-anchored power-of-two lattice |
+| Brick key | `(batch_id, level, bx, by, bz)`: the unique integer world address of one brick |
+| Two-sided error (`delta_pos`) | A proven upper bound, in metres, on both mesh-to-surface and surface-to-mesh distance over each quad's `2 × 2 × 2` dual region |
+| Normal error (`delta_n`) | A proven upper bound, in radians, on normal deviation across a quad, compared against the material's BRDF lobe width |
+| Baked error (`delta`) | Per-node error in metres, baked at build time so 2:1 balance holds across all supported pixel sizes |
+| Wanted cut | The exact set of bricks selected by eye distance for the current pixel size |
+| Drawn cut | The finest complete, 2:1-balanced set of resident bricks drawn this frame |
+| Lateness | Fraction of pixels drawn from a coarser brick than the wanted cut, and the longest frame count any brick stays missing |
+| Brick pool | The fixed-capacity persistent GPU cache that stores extracted bricks by `BrickKey` |
+| State box (`Theta`) | An interval box over the float parameters `theta` of a field struct (`f(p; theta)`) |
+| Schedule floor | Frame span measured with every dispatch emptied (submission and pass-scheduling overhead alone) |
+| Utilization | `tallied_work / (pass_time * peak_rate)`: how much of the GPU's capacity a pass uses |
+| Proof debt | Run-time GPU work done only because a proof or certificate is missing |
+| Span | The GPU clock time from the start of a frame's first pass to the end of its last pass |
+| Gate | `tools/gate`: layers, tests, hole audit (still and moving), sun judge, still spans, moving-eye spans, and turning-eye spans |
+
+## 3. Where the code is
+
+| Subject | Place |
+| --- | --- |
+| Interval, affine, and Lipschitz derivations | `toolchain/ir/src/derive/interval.rs`, `affine.rs`, `lipschitz.rs` |
+| Strict lowering, work bounds, and tally | `toolchain/ir/src/strict.rs`, `work.rs`, `tally.rs`, `toolchain/lower/src/gpu.rs` |
+| Surface trait, combinators, `SlopeBox`, `MapBox`, `part_state` | `lib/std/field.wrela` |
+| Sheet certificates and field verification | `lib/engine/matter/certify.wrela`, `verify.wrela` |
+| Extraction grids, kernels, seams, and batch orchestration | `lib/engine/mesh/grid.wrela`, `dc.wrela`, `emit.wrela`, `extract.wrela` |
+| Exact-cell hit/resolve, visibility buffer, and sun classification | `lib/engine/mesh/shade.wrela`, `visbuf.wrela`, `proof.wrela`, `sunlight.wrela` |
+| Hole audit (still and moving), sun judge, and bit comparison | `lib/engine/judge/audit.wrela`, `sunlight.wrela`, `bits.wrela` |
+| Arena ward, parry scene, and certificate tests | `game/world/arena.wrela`, `parry.wrela`, `certificates.wrela`, `game/scenes/main.wrela` |
+| Gate, benchmarks, cost diagnostic, and Radeon runner | `tools/gate`, `tools/gate.json`, `tools/bench`, `tools/cost`, `tools/gpu`, `tools/radeon` |
+
+## 4. How to measure
+
+Use only these commands:
+
+| To get | Command |
+| --- | --- |
+| Build one scene | `tools/wrela build game/scenes -o DIR --set SCENE=10` |
+| First run of new GPU work (small, safe) | `tools/gpu DIR --size 320x180 --frames 2 --timestamps --serial` |
+| Still span and per-pass table | `tools/bench DIR --size 1920x1080 --frames 30-89` |
+| Moving-eye span and per-pass table | `tools/bench DIR --size 1920x1080 --frames 30-269` (built with `--set VIEW=3`) |
+| Paired comparison of two builds | `tools/bench DIR --size 1920x1080 --frames 30-89 --against DIR2` |
+| Full gate | `tools/gate --full` |
+| Certificate and facts reports | `tools/wrela test game/world` |
+| Run on the Radeon (commit and push first) | `WRELA_RADEON_DIR='~/projects/wrela-next-engine-plan' tools/radeon COMMAND` (use `WRELA_GATE_JOBS=1` on the Radeon) |
+
+Put before-and-after measurements from the same machine and same run in every completion commit
+message.
+
+## 5. Rules for all phases
+
+1. Follow `AGENTS.md` for all work, including the 50 ms dispatch rule, one Rust build at a time,
+   `tools/gpu` for every GPU run, and citing every published method that lands in
+   `docs/citations.md`.
+2. Keep the engine in `lib/engine`. Add only general mechanisms to `toolchain/` (code that knows
+   fields and functions, not engine passes or game kinds).
+3. Keep the judges and the reference independent. They read the author's field directly and never
+   read cached bricks, build-time shortcuts, or surrogates.
+4. Make every build decision from a proof or a count, never from a measured time.
+5. Every speedup must come from a proof. When a proof fails, fall back to the exact slow path and
+   report the debt.
+6. Remove the old method in the same change that lands its replacement.
+7. Measure and pass `tools/gate --full` on both the M4 and the Radeon before calling a phase done.
+8. Keep build-time proof searches bounded in steps, never in seconds, so every machine gets the
+   same build.
+9. Do not invent arbitrary constants when a physical quantity, a game rule, or a count from the
+   field exists.
+10. Never judge a change by eye; turn every visual check into a number.
+
+## 6. Order of the phases
+
+| Phase | Result | Difficulty | Depends on |
+| --- | --- | --- | --- |
+| 0 | Kill tests, roofline/utilization, and cut simulation on both machines | Low | Nothing |
+| 1 | Clean base: kernel-derived shape hash, bug fixes, Radeon gate | Low-medium | Phase 0 |
+| 2 | Footprint-integrated sun judge and conservative sun maps | Low-medium | Phase 1 |
+| 3 | World-anchored persistent `BrickPool` and continual LOD (staged) | High | Phase 2 |
+| 4 | State-box proofs `f(p; Theta)`, hard-CSG split, and motion by structure | Medium | Phase 3 |
+| 5 | Exact-pass specialization and two-slope / piecewise enclosures | Medium | Phases 0 and 3 |
+| 6 | Moving sand veil, contact enclosure, and instantaneous fused glass | Low-medium | Phase 4 |
+
+Why this order:
+
+- Phase 0 replaces every assumption with measured numbers on both machines before rewriting
+  extraction.
+- Phase 1 removes active soundness, compiler, and mesh faults and establishes true Radeon
+  baselines.
+- Phase 2 unblocks mesh changes so the sun judge stops failing on sub-cell tessellation noise.
+- Phase 3 fixes moving-eye cost (`57.8–111 ms`) in three gated stages: world-anchored rings,
+  two-sided error + normal cone, and resolution-safe baked `delta` cuts.
+- Phase 4 handles moving fields by structure (and opaque hard-CSG splitting) under one state-box
+  proof mechanism without mixed-motion brick cracks.
+- Phase 5 fixes the exact-pass failure classes measured in Phase 0.
+- Phase 6 completes the target parry scene once the sand exists as a moving field in `SCENE 16`.
+
+---
+
+## 7. Phase 0: Kill tests and measurements
+
+Purpose: measure every open premise on both machines before changing the architecture.
+
+### Steps
+
+1. **Paired per-pass tables, roofline, utilization, and schedule floor on both machines.**
+   - Run paired `tools/bench` on still scenes (`SCENE 10, 11, 13, 14, 16`) and moving views
+     (`10/3`, `13/3`) on both M4 and Radeon.
+   - Using `--tally` and `tools/cost`, record per-pass utilization `tallied_work / (time * peak)`
+     and `max(work/peak, bytes/bw, latency)` so each pass is classified as compute-bound,
+     bandwidth-bound, divergence/register-bound, or latency-bound.
+   - Measure the **schedule floor** (frame span with every dispatch emptied) on M4 and Radeon.
+2. **Add max-speed walking and real max-speed turning views to `tools/gate`.**
+   - Define the camera's maximum walk speed and maximum turn rate as game rules (mouse turns
+     exceed 360°/s). Add views exercising both in `SCENE 10` and `SCENE 13`.
+3. **Break down moving-eye extraction and certification.**
+   - Count bricks extracted per frame per kind on `10/3`, `13/3`, and the turning view.
+   - Measure whether `mesh_certify`'s `7.3 ms` is per-brick (removed by caching) or per-eye
+     (stays during turning unless cached per cell).
+4. **Diagnose `ParryArc`'s ~100,000 candidates and `arena_pillars`'s 12,039 steepness.**
+   - Count candidate bricks vs active surface bricks for `ParryArc` (~8 m² of sheet should take
+     2,000 to 9,000 bricks at 5–10 mm cells) and record why the cull keeps ~10× too many.
+   - Inspect `arena_pillars` (`lip = 12,039`) and `marble_column` (`lip = 5,720`) to name the
+     exact operation causing the steepness blowup.
+5. **Run the candlestick enclosure failure census.**
+   - Classify all 88 of 100 slope-less candlestick enclosures by exact cause (`Carved`, `Profile`
+     unsure `min`, `MapBox`, curvature) and record **live parts per failing cell**.
+   - Also run the **CSG-split kill test** on the ward and the candlestick: certified cells per
+     lone leaf vs joint mesh, and overdraw ratio.
+6. **Build a CPU cut simulator for Phase 3.**
+   - Simulate **both** world-anchored nested rings **and** error-driven baked-`delta` cuts on real
+     kinds along the max-speed walking and turning paths.
+   - Record peak resident bricks, bricks entering per frame (median and worst), VRAM size, and
+     the brick-count cost of enforcing the finest-pixel Lipschitz bound and coarsest-pixel gap.
+7. **Measure sun-judge placement variance.**
+   - Record `SCENE 13 VIEW 0, 1, 2` hard leaks and mean light error across 8 lattice shifts and
+     ±10% cell-size changes, comparing the current point-sampled judge against a pixel-footprint
+     mean of unfiltered rays on the unfiltered field.
+
+### Done when
+
+- All seven measurement tables are recorded in this file and in the commit message.
+- No phase below depends on an unmeasured assumption.
+
+---
+
+## 8. Phase 1: Clean base, kernel-derived shape hash, and bug fixes
+
+Purpose: repair all known soundness, compiler, and mesh faults, and establish true two-machine
+gate baselines.
+
+### Steps
+
+1. **Update `tools/gate.json` on both the M4 and the Radeon.**
+   - Record baselines for `SCENE 10, 11, 13, 14, 16`, moving views (`10/3`, `13/3`), and the
+     turning/max-speed views from Phase 0.
+   - Keep `--tally` and `tools/cost` as diagnostics; drop the "within 20% linear fit" gate target
+     from `engine-at-build.md`.
+   - Keep `@strict` as-is during Phase 1; revisit Radeon strict extraction cost only after Phase 3
+     reduces per-frame extraction and Phase 0 shows whether extraction is a top Radeon cost.
+2. **Fix smooth-combinator bounds and `parts_dirty` commit ordering.**
+   - In `lib/std/field.wrela`, widen `part_bound` by `self.k` (`.lowered(self.k)`) in
+     `SmoothUnion`, `SmoothUnionAll`, `SmoothSubtract`, and `SmoothIntersect`.
+   - Add a test in `lib/engine/mesh/extract_tests.wrela` proving the dirty box covers the blend
+     zone for a moving part inside `SmoothUnion` and `SmoothSubtract`.
+   - Change `parts_dirty` in `lib/engine/mesh/extract.wrela` to return the new hashes and boxes
+     and commit them only after `try_patch_dirty` succeeds.
+3. **Add compiler-derived `shape_hash` from what the geometry kernels read.**
+   - Derive a hash of only the struct fields and vector components of `self` read by the geometry
+     kernels (covering `distance`, `bound`, `lipschitz`, `slope_box`, `pruned`, and transmission
+     predicates automatically so the list cannot go stale).
+   - Use it in `MeshBatch` to skip extraction when only shading channels change (such as
+     `GlassBranch.glow.xyz`, while `GlassBranch.glow.w` stays in the hash).
+   - Remove hand-written `rigid_shape_hash` overrides that the derived hash replaces.
+4. **Fix the two open compiler faults.**
+   - Fix why flattened `ir::work` undercounts `cull_bricks` (`2,755` vs `164,544`), and remove
+     the `pre.max(flat)` workaround in `toolchain/lower/src/gpu.rs`.
+   - Fix the NaN in `toolchain/ir/src/derive/affine.rs` on carved boards, and remove
+     `derive: false` from `table_enclosures_are_sound` and `grimoire_enclosures_are_sound` in
+     `game/world/certificates.wrela`.
+5. **Fix the open mesh, exact-cell, and empty-surface faults.**
+   - Repair 2:1 seam triangle folds (`5 in 220,018` triangles across placements).
+   - Repair noise-rock crease triangle folds (`1 in 10,000` triangles where a clamped vertex falls
+     inside the solid).
+   - Add a moving-rigid test in `Auditing::move_eyes` (a rigid thing moving without re-meshing) to
+     verify `exact_box_hit_fs`'s `rigid_inv_point`/`rigid_inv_dir` bracketing.
+   - Fix empty-surface culling in the engine: check `classify_cells`'s `< 0` vs `<= 0` inside
+     convention and cull any box whose interval proves zero inside points (`lo >= 0` under `< 0`),
+     so an absent field (like `Bolt` at `struck: 0`) drops in zero extraction work for every kind.
+   - Fix `ParryArc`'s candidate-brick cull fault diagnosed in Phase 0 step 4.
+6. **Fix `game/world/parry.wrela` faults.**
+   - Compute `branch_pieces`'s six `landing()` times once at the break event and keep them as
+     state (not per frame, and not baked to a hardcoded `PARRY_HIT`).
+   - Fix why `GlassBranch::distance` gives infinite proven steepness.
+7. **Align exact-cell fragment strictness.**
+   - Make `exact_box_hit_fs` `@strict` so `EmptyProof` holds on the shipping build; keep
+     `exact_resolve_one_fs` relaxed.
+   - Document the compile-time `facts.lip` dead-code-elimination branch in `exact_box_hit_fs`, and
+     measure whether `may_transmit` channel checks belong in hit or resolve.
+
+### Done when
+
+- `tools/gate --full` passes on both M4 and Radeon with current baselines in `tools/gate.json`.
+- `GlassBranch` extracts zero bricks while cooling, and `Bolt` extracts zero bricks while absent.
+- `table` and `grimoire` pass `verify_slope_soundness` with `derive: true`.
+- `ir::work` agrees on `cull_bricks` before and after flattening with no `pre.max(flat)`.
+- 2:1 seam folds and noise-rock crease folds are zero across multi-placement tests.
+
+---
+
+## 9. Phase 2: Footprint-integrated sun judge and conservative sun maps
+
+Purpose: unblock every mesh change by making the sun judge measure physical pixel-footprint
+radiance error rather than point-sampled sub-cell tessellation noise.
+
+### What exists today
+
+- `lib/engine/judge/sunlight.wrela` integrates the sun's disc (`theta_sun ≈ 9.3 mrad`) at one
+  receiver point per pixel and counts binary `hard leaks` (reference `< 1/16`, engine `> 1/2`).
+- A thin caster of width `w` at distance `d` across the sun disc blocks up to `(4/pi) * w /
+  (d * theta_sun)` of the disc. A hard leak requires `d <= w / theta_sun` (~32 cm for a 3 mm
+  bead), which is already in contact range.
+- A 1% cell-size change moves `SCENE 13 VIEW 0` hard leaks from 754 to 882 because point sampling
+  on the receiver aliases sub-cell beads.
+
+### Steps
+
+1. **Upgrade the sun judge to integrate over the receiver pixel's footprint.**
+   - Replace the single-point receiver sample with the footprint mean of unfiltered rays on the
+     unfiltered field (so sub-pixel detail is integrated physically instead of aliased by a single
+     point).
+   - Define the physical light tolerance `eps` as one display code step at that pixel's luminance
+     after the tone curve (`Look::tone`), giving a concrete physical threshold instead of binary
+     pixel counts.
+2. **Use dual conservative sun shadow maps where needed.**
+   - Render an inner map (proven dark) and an outer map (including boxes of thin cells: proven
+     lit). Send only pixels between the two bounds to exact sun rays, keeping contact shadows
+     exact via `trace_sun_near`.
+3. **Run the placement-invariance kill test.**
+   - Shift the world lattice across 8 placements and vary cell size by ±10%.
+   - Hold the numeric footprint light-error mean and 99th percentile within the gate's slack
+     (measured quantitatively, never by eye).
+
+### Done when
+
+- The footprint sun judge passes on both M4 and Radeon with variance across 8 lattice placements
+  and ±10% cell-size shifts inside numeric slack.
+- `SCENE 13 VIEW 0, 1, 2` numeric contact-shadow error does not regress.
+
+---
+
+## 10. Phase 3: World-anchored brick pool and continual LOD
+
+Purpose: make moving and turning frames cost nearly the same as still frames, and deliver
+pop-free, crack-free continual LOD.
+
+Build this phase in three independently gated stages.
+
+### Stage 3A: World-anchored nested rings + persistent `BrickPool`
+
+1. **Use integer `BrickKey` and camera-relative coordinates.**
+   - Key every brick by integer `BrickKey = (batch_id, level, bx, by, bz)`.
+   - Compute draw positions relative to the eye (or brick-relative) so open worlds stay exact past
+     `2^24` cells from the world origin.
+2. **Put nested rings on one world-anchored power-of-two lattice with distance-only residency.**
+   - Select bricks by **eye distance only** (frustum-cull only at draw time) so fast turns cost
+     zero new extractions and off-screen sun casters stay resident.
+3. **Build the persistent GPU `BrickPool`.**
+   - Fixed-capacity GPU slot arenas sized from Phase 0's simulator counts.
+   - Open-addressed GPU hash table keyed by `BrickKey` with frame-stamp LRU eviction.
+   - Define both the **wanted cut** and the **drawn cut** (finest complete, balanced set of
+     resident bricks). Mark a batch `settled` only when `drawn == wanted` and seams are built.
+   - Add **lateness** (fraction of pixels drawn coarser than wanted, and longest frames late) to
+     `tools/gate`.
+4. **Reuse today's 2:1 ring seams** while keeping each brick's interior mesh cached across frames.
+   Verify zero re-extraction of resident bricks along `SCENE 13 VIEW 3` and the turning view.
+
+### Stage 3B: Unified two-sided error budget (`delta_pos` + `delta_n`)
+
+1. **Define one two-sided error bound per quad (`delta_pos`, `delta_n`).**
+   - **Position error (`delta_pos`):** take the convex slab of each quad's `2 × 2 × 2` dual
+     region. Make Dual Contouring **clamp each solved vertex into its dual-region slab** so the
+     quad provably lies in the slab. When the region is a single sheet over the plane, both
+     mesh-to-surface and surface-to-mesh distances are bounded by the slab width. Uncertified
+     cells stay `ExactCell` (bounded by march tolerance), so `delta_pos` is always finite.
+   - **Normal error (`delta_n`):** derive a normal cone from closed-form analytic leaf curvature
+     (or gradient intervals where no closed form exists) and compare against the material's BRDF
+     lobe width so smooth curved gold and glass do not facet at coarse levels.
+   - Add a slow CPU reference test checking true two-sided Hausdorff distance and normal error
+     between triangles and `f(p) = 0`.
+2. **Resolve `mesh_certify` residency using Phase 0 step 3's measurement.**
+   - If per-eye certification dominates turning, cache view-independent per-cell certificates on
+     each brick (and run only a tiny per-eye outline select or keep only truly uncertified cells
+     as `ExactCell`).
+
+### Stage 3C: Resolution-safe baked `delta` and continual LOD
+
+*(Proceed to Stage 3C only if Phase 0 step 6's simulator confirms error-driven cuts beat Stage
+3A's nested rings enough to justify the complexity.)*
+
+1. **Prove the 2:1 balance theorem on paper before coding it.**
+   - Bake `delta` in **metres** per coarse octree node at build time (no mesh needed; for moving
+     kinds, bake the worst `delta` over the legal state box `Theta` so no per-brick time term
+     breaks the theorem).
+   - At build time, apply a max-plus gradient-limiting pass (which only raises `delta`, so it is
+     always safe) enforcing:
+     1. **Nestedness:** child refined implies parent refined.
+     2. **Lipschitz bound at the finest supported pixel** `p_fine`.
+     3. **Gap condition `(1 + k) * s` at the coarsest supported pixel** `p_coarse` (covering
+        `640x360` and `320x180` audit/sun resolutions), including each node's half-diagonal for
+        top-down box tests and the edge/corner neighbor factor (`sqrt(2)` / `sqrt(3)`).
+   - Then 2:1 balance across faces and shared DC edges is a theorem for every eye position and
+     every supported screen resolution, with zero GPU balancing pass.
+2. **Prove pool size and per-frame budget from counts.**
+   - From maximum game movement speed (Phase 0 step 2) and the baked octree census, compute the
+     maximum resident bricks and maximum bricks entering per frame at build time. Parent fallback
+     is then needed only on teleports.
+3. **Decouple 2:1 seam faces from cached brick interiors.**
+   - Emit seam quads into a dedicated seam buffer for active level boundaries only, leaving
+     resident brick interiors untouched.
+4. **Remove old view-coupled grid code and arbitrary caps.**
+   - Delete `build_lod_grids_view` and its magic constants (`vol_cap 160000`, `area_cap 400..9000`,
+     `1.12`, `0.85`).
+5. **Add a path-independence test:** reach the same eye position by two different paths and
+   verify the settled brick sets are bit-identical.
+
+### Done when
+
+- `SCENE 13 VIEW 3` (moving eye) and the max-speed turning views have median span at or below
+  `16.6 ms` on the M4, and moving-minus-still overhead is under `2 ms` on `SCENE 10` and `SCENE
+  13`.
+- Zero resident bricks are re-extracted along `SCENE 13 VIEW 3` or during pure camera rotation.
+- Lateness is zero during max-speed walking and turning (within the proven per-frame entry count).
+- Full hole audit (still and moving), CPU two-sided Hausdorff + normal check, path-independence
+  test, and sun judge pass on both M4 and Radeon with zero cracks on opaque and transmissive
+  meshes.
+
+---
+
+## 11. Phase 4: State-box proofs `f(p; Theta)`, hard-CSG split, and motion by structure
+
+Purpose: unify dynamic proofs over field state boxes `f(p; Theta)` and select each moving kind's
+mesh and ray strategy by structure at build time, with zero mixed-motion brick cracks.
+
+### Why state boxes instead of time-only closures
+
+GPU kernels receive structs of float state `theta`, not `fn(f32) -> S` closures. Proving over
+`(space box B) × (state box Theta)` is one compiler mechanism that covers point hashing (`Theta`
+is a point), cached expiry (valid while `theta in Theta`), baked worst-case moving `delta` for
+Stage 3C, and parametric spell bounds.
+
+### Steps
+
+1. **Add state-box derivation `f(p; Theta)` to `toolchain/ir/src/derive/` and `lib/std/derive.wrela`.**
+   - Derive intervals, enclosures, and parameter sensitivity bounds over `Box3 × Theta`.
+   - Record each cached fact's valid `Theta` box.
+2. **Split opaque CSG trees at hard joins for meshing, rejoined in the raster** (gated on Phase
+   0 step 5's CSG-split kill test; Goldfeather et al. 1986, 1989 — cite in `docs/citations.md`).
+   - **Opaque `Union`:** mesh operands separately and let the depth test compose them.
+   - **Opaque `Intersect` / `Subtract`:** where the kill test confirms a net win, trim per
+     fragment against the other operand during visibility write, skipping the trim wherever a
+     brick is proven inside or outside.
+   - **Smooth joins (`smin` / `smax`) and transmissive/glass surfaces:** keep a joint mesh only in
+     the blend tube `|a - b| < k` (enabled by Phase 1's `k`-widened `part_bound`) and for
+     transmissive kinds where inner faces would refract.
+   - Also split static operands of `min` / `smin` that read no `self` (such as `ParryArc`'s
+     tether) into never-changing parts.
+   - Result: each operand of a moving composite gets its own cache and its own motion method, so
+     two motion methods never share one brick.
+3. **Select each moving operand's method by structure at build time** (and report the choice in
+   `wrela pipelines` / `game/world` reports):
+   - **Rigid, Skinned, Warp:** rest mesh once + transform (already exists; verified by
+     `Auditing::move_eyes`).
+   - **Explicit parametric graph (for smooth clipped waving sheets):** where a moving surface is
+     an explicit graph over a fixed chart with static clip bounds—such as `ParryArc`'s clipped
+     shell `r = R + wave(y, z, t) ± 0.036` over `(y, z)`—evaluate vertices directly on the chart
+     with zero DC extraction and verified two-sided coverage.
+   - **Unclipped `Displace(S, D(theta))`:** where `|D| < reach(S)` and `Lip(D) < 1` over `Theta`
+     with no moving clip crease, mesh `S` once and project vertices along `S`'s normal by one
+     monotone 1D root.
+   - **Unstructured movers (such as flames and the pulsing torus ring):**
+     - **Narrow band + proven empty-space expiry:** a corner keeps its sign while `|f(c, t0)| /
+       rate` holds, and empty coarse boxes expire at `|f|_min / rate` (no arbitrary time window).
+     - **Skip proven-sign corners in DC:** skip corner evaluations whose sign the brick's slab
+       already proves (bit-equal to full extraction).
+   - **Tiny fast transients (such as the 1.8 cm `Bolt`, 512 work):** when build-time work counts
+     favour pixel-rate solving over meshing, skip DC and emit culled `ExactCell` boxes directly,
+     using a per-leaf `ray` capability (closed under hard CSG, `k/4` bracket for `smin`) and 1D
+     slab bracket (`2e / |l·d|`) / 1D interval Newton.
+4. **Keep every fast path bit-verifiable** against full extraction where `judge::bits` applies.
+
+### Done when
+
+- `Auditing::move_eyes` passes with zero holes on the flame, the ward, the bolt, and a rigid mover
+  on both M4 and Radeon.
+- `SCENE 10` (still, walking, and turning) is at or below `16.6 ms` on the M4.
+- GPU extraction work for the ward and flames drops by at least 50% compared to Phase 3.
+
+---
+
+## 12. Phase 5: Exact-pass specialization and measured enclosure repairs
+
+Purpose: remove the remaining exact-cell proof debt on heavy showcase assets (`SCENE 13`,
+`SCENE 14`), driven by Phase 0's failure census.
+
+### Steps
+
+1. **Upgrade enclosures for the failure classes measured in Phase 0 step 5.**
+   - **Two-slope linear bounds** (CROWN, Zhang et al. 2018; DeepPoly, Singh et al. 2019 — cite in
+     `docs/citations.md`): separate lower and upper bounding planes with distinct slopes, tighter
+     than symmetric `c + l·u ± e` at the same cost.
+   - **Pruned `k`-term slab join trees** (tropical polyhedra, Allamigeon, Gaubert & Goubault 2008
+     — cite in `docs/citations.md`): keep both operands' slabs at an unsure `min`, dropping
+     dominated terms over the box. Where two planes meet at a sharp edge, their intersection
+     provides a **crease certificate and exact QEF** directly (measure whether it replaces the
+     64-step crease solve).
+   - **Profile & carving repairs:** enclose turned profiles in `(r, y)` coordinates where straight
+     segments are cones; repair `Carved` fallback enclosures.
+   - **Nonexpansive-map Lipschitz rules:** fix `arena_pillars` (`12,039`) and `marble_column`
+     (`5,720`) using the cause found in Phase 0 step 4 (for example segment projection is
+     1-Lipschitz by theorem).
+   - Re-measure certified cell rates on `candlestick`, `table`, `grimoire`, `chair`, and `shelf`.
+2. **Specialize the exact pass by live-part clusters.**
+   - For static kinds whose exact pass still exceeds 1 ms after step 1, bucket exact cells by
+     their live-part subsets at build time and emit specialized exact-hit kernels with dead parts
+     removed and proven-redundant `smin` joins folded.
+   - Gate cluster count by build-time work savings vs Vulkan build RAM (no arbitrary per-kind
+     constant cap; `SCENE 6` Vulkan build RAM must not regress).
+3. **Add `Taylor2` only if residual debt after steps 1–2 is proven curvature.** Do not add
+   `exact_quadric_hit_fs`: any cell certified to pixel error is meshed directly (and lone quadric
+   leaves from Phase 4 step 2 can use closed-form ray casting via Sigg et al. 2006 if warranted).
+
+### Done when
+
+- `SCENE 14` candlestick exact-cell cost drops from `8.2 ms` to under `2.5 ms` on the M4.
+- Every gate scene (`SCENE 10, 11, 13, 14, 16`, still, walking, and turning) is at or below
+  `16.6 ms` on the M4, and faster than Phase 1 on the Radeon.
+- One-field rebuild time stays under 25 s on the M4, and `SCENE 6` Vulkan build RAM does not
+  regress.
+
+---
+
+## 13. Phase 6: The parry — moving sand, contact enclosure, and instantaneous glass
+
+Purpose: complete the target game scene (`SCENE 16`) with a real moving sand veil and derive the
+fused glass branch from the instant the bolt meets the sand.
+
+### Steps
+
+1. **Make the thrown sand veil a moving `Surface` in `SCENE 16`.**
+   - Replace the static `veil(p)` helper in `game/world/parry.wrela` with a moving sand field
+     present in `SCENE 16`'s world so both spells exist and meet at a real event time.
+2. **Add a deterministic contact-enclosure solver.**
+   - Given two moving surfaces `A(p; theta(t))` and `B(p; theta(t))` over a search window, use
+     state-box / rate-bounded bisection with a fixed step cap to return either `None` (proven no
+     contact) or a guaranteed contact enclosure `[t_enter, t_exit]` and contact box.
+   - Use the lower end `t_enter` deterministically so any two machines agree to the bit.
+3. **Derive `GlassBranch` at the instant of contact.**
+   - A fulgurite fuses in microseconds along the instantaneous channel: define `GlassBranch` as
+     `bolt(t_enter) ∩ veil(t_enter)` (do not sweep the oscillating bolt across the window).
+   - Compute the six broken-piece `landing()` times once at the break event and keep them as
+     state.
+4. **Add build-time parametric safety proofs once spell parameter domains exist.**
+   - Over the legal state box `Theta` of a cast, prove worst-case Lipschitz constant, spatial
+     bound, and GPU kernel work bound at build time.
+
+### Done when
+
+- `SCENE 16` draws the lightning bolt, the moving sand veil, the fused glowing/cooling glass
+  branch, and the falling broken pieces, and passes `tools/gate --full` on both M4 and Radeon.
+- A CPU test proves the contact enclosure never misses a contact and produces bit-identical
+  `t_enter` across machines.
+
+---
+
+## 14. Work that is not in this plan
+
+Each hypothesis stays out of the active phases until its listed measurement or trigger reopens it.
+Any published method that later lands must be cited in `docs/citations.md`.
+
+| Idea | Why it is not here | Measurement / trigger that reopens it |
+| --- | --- | --- |
+| Field-guided spatial upscaling and 4D-proven TSR | Upscaling must not hide extraction or caching faults; native 1080p must hit the bar first | Phases 3 and 4 pass the gate at native 1080p on both machines, or when targeting 4K / faster Radeon frames |
+| Lighting cache upgrades: linear cached transfer for flickering emitters, Lipschitz sun-visibility spacing `(4/pi)/(d * theta_sun)` (Ward & Heckbert 1992; Arvo 1994), Fréchet static×dynamic sun bounds `max(0, Vs + Vd - 1) <= V <= min(Vs, Vd)`, and world-anchored `RadianceCache`/`SdfClipmap` | Extraction and exact cells are the measured bottlenecks today; `RadianceCache` already splits static and dynamic | Phase 0 still tables (or post-Phase-5 tables) show lighting passes dominate the remaining frame span; needs a frame-after-change light judge |
+| Hybrid surface/volume microflakes (Loubet & Neyret 2017) scoped strictly to proven-thin cells (`filter_thin_cells`) | Exponential transmittance leaks light through thin opaque sheets (Vicini, Jakob & Kaplanyan 2021); SGGX at all levels recreates the dense cook | Phase 2 is done AND a gate scene has sub-pixel geometry at long distance held to a supersampled reference |
+| Dense fine-grid disk cooks | Fine grids take 759 MiB to 1.2 GiB per kind (`engine-plan-ladder` census) | Only for an optional tiny warm-start cache of the coarsest 1–2 octree levels if cold start is too slow |
+| A server build target | Deferred until multiplayer game rules require running fields on a server | Phase 6 is done and server spell rules exist |
+| Per-brick DC vertex advection mixed with re-extracted neighbors | Breaks shared brick-face connectivity (`ae3c1c4`, 91 holes) | Do not look again |
+| Subgroup frustum tracing & Bernstein ray clipping | Driver-defined fragment lane mapping violates no-driver-proofs rule; arithmetic is ~1% of exact pass; Bernstein requires derivative remainder bounds | Do not look again |
+| Covariance tracing as a formal proof | Linearizes locally; occlusion has unbounded bandwidth so it estimates rather than proves | Do not look again |
+| Trimmed parametric B-reps for general CSG | Watertight trimmed patch intersection is an unsolved robustness problem | Do not look again |
+| Runtime shader compilation in the client | Adds attack surface, hitching, and driver variance | Never |
+| Unbounded general SMT solvers in the build | Run time is unstable across inputs and machines | Never |
+
+## 15. Main risks and open questions
+
+1. **Radeon baseline and per-pass breakdown (Phase 0 step 1):** The Radeon gate has not run on
+   this branch; its 56.6 ms line dates from `1c78609` before strict math. Measure it first.
+2. **Phase 3 scope and Stage 3C payoff:** Keep Stages 3A, 3B, and 3C strictly separate and gate
+   each one. Let Phase 0's error-driven simulator decide whether Stage 3C beats Stage 3A enough to
+   build it.
+3. **2:1 theorem across resolutions (Stage 3C):** Prove the top-down box test, nestedness, finest-
+   pixel Lipschitz bound, and coarsest-pixel gap on paper before writing GPU code.
+4. **CSG split overdraw & glass (Phase 4 step 2):** Gate hard-CSG splitting on Phase 0 step 5's
+   leaf certification and overdraw kill test; keep joint meshes for transmissive surfaces.
+5. **Shader specialization vs Vulkan build RAM (Phase 5 step 2):** `SCENE 6` Vulkan builds already
+   take 4.7 GB. Keep specialized exact-hit kernels strictly bounded by build RAM and compile time.
+
+## 16. How to keep this plan
+
+- Keep this file in `docs/plans/`.
+- Record Phase 0's measured tables in Section 7 as soon as they run.
+- Record "Done", the date, the commit, and the M4 and Radeon gate numbers at each phase heading
+  when that phase completes.
+- If a measurement proves a step wrong, update that step in the same commit.
+- When all phases are done, remove this file.
