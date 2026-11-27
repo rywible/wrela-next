@@ -17,8 +17,9 @@
 //   universal joint a hinge about x then one about y, as the engine turns it; a ball joint three
 //   hinges, its turn written as three turns exactly, the middle one about the axis of its
 //   narrowest range (`ball_order`); the root a free joint;
-// - each part a capsule (its two radii's mean) on the segment of its first end, colliding with
-//   the floor alone;
+// - each part a capsule of its smaller radius on the segment of its first end, and where its two
+//   radii differ a sphere at its larger end and one at its middle (the points the judge measures
+//   its depth at), colliding with the floor alone;
 // - each hinge driven by a position servo whose force is held to the joint's strength
 //   (`forcerange`), its stiffness `STIFF` times the strength a radian.
 //
@@ -56,11 +57,22 @@ const STIFF: f32 = 2.5
 /// high-frequency DOFs with negligible effect on whole-body balance and contact).
 const DYNAMIC_SHARE: f32 = 0.0006
 
+/// The floor's contact margin (m): the simulator's contact is soft, and a body that stands sinks
+/// into it (1.6 mm at the median with the time constant of 20 ms; a quarter of that at
+/// `CONTACT_TIME`); a contact that pushes from this far holds a part that carries weight at the
+/// floor's surface, as the engine's rigid flesh and the judge's depth have it.
+const FLOOR_MARGIN: f32 = 0.0005
+/// The contacts' time constant (s, MuJoCo's `solref`): at least two steps. The default 20 ms let a
+/// light segment that carries the body's weight (a toe, 57 g: a contact stiff in acceleration is
+/// soft in force on a light body) sink 6 mm in a walk and 11 mm in a run on average (`p4h-12`'s
+/// tracker, 2026-11-27); 10 ms at a step of 1/240 s, 0.8 and 1.7 mm.
+const CONTACT_TIME: f32 = 0.01
 /// The fewest frames of a filtered clip kept (1 s at 30 a second): the solver's windows are 16.
 const LEAST_FRAMES: u32 = 30
 
-/// The model's step (s): 4 to a frame of the poses at 30 a second.
-const STEP: f32 = 0.008333334
+/// The model's step (s): 8 to a frame of the poses at 30 a second (the tracker takes as many as
+/// a frame holds), short enough for the contacts' `CONTACT_TIME`.
+const STEP: f32 = 0.004166667
 
 fn v3(v: vec3) -> String {
     f"{v.x} {v.y} {v.z}"
@@ -285,11 +297,11 @@ fn model<const S: u32, const D: u32, const P: u32>(def: Def<S, D, P>, moves: [bo
     )
     x.push_str("  <default>\n    <joint limited=\"true\"/>\n")
     x.push_str(
-        "    <geom contype=\"1\" conaffinity=\"0\" condim=\"3\" friction=\"1.0 0.02 0.01\" density=\"0\"/>\n  </default>\n",
+        f"    <geom contype=\"1\" conaffinity=\"0\" condim=\"3\" solref=\"{CONTACT_TIME} 1\" friction=\"1.0 0.02 0.01\" density=\"0\"/>\n  </default>\n",
     )
     x.push_str("  <worldbody>\n")
     x.push_str(
-        "    <geom name=\"floor\" type=\"plane\" size=\"0 0 1\" zaxis=\"0 1 0\" contype=\"0\" conaffinity=\"1\"/>\n",
+        f"    <geom name=\"floor\" type=\"plane\" size=\"0 0 1\" zaxis=\"0 1 0\" contype=\"0\" conaffinity=\"1\" margin=\"{FLOOR_MARGIN}\"/>\n",
     )
     // Each segment's body, nested under its parent's.
     let order = depth_first(b)
@@ -333,24 +345,39 @@ fn model<const S: u32, const D: u32, const P: u32>(def: Def<S, D, P>, moves: [bo
             let arm = max(0.01, 1.5 * kp * STEP * STEP - i_max)
             let damp = clamp(0.01 * st, 0.05, 2.0)
             x.push_str(
-                f"{ind}  <joint name=\"s{s}h{h}\" type=\"hinge\" axis=\"{v3(ax)}\" range=\"{lo - 0.1} {hi + 0.1}\" armature=\"{arm}\" damping=\"{damp}\"/>\n",
+                f"{ind}  <joint name=\"s{s}h{h}\" type=\"hinge\" axis=\"{v3(ax)}\" range=\"{lo} {hi}\" armature=\"{arm}\" damping=\"{damp}\"/>\n",
             )
-            // Control target range extends past the hard joint range so the PD servo can exert
-            // full isometric torque right up to a limit (e.g. a straight knee in stance).
+            // The servo's target within the joint's range: at a limit the limit holds the joint
+            // (a straight knee in stance). A target past it (0.6 rad, and the range 0.1 wider,
+            // until 2026-11-27) let the servos press joints through their soft limits: `p4h-12`'s
+            // filtered capture left the body's ranges by up to 0.25 rad (the ankles).
             actuators.push_str(
-                f"    <position name=\"s{s}h{h}\" joint=\"s{s}h{h}\" kp=\"{kp}\" kv=\"{0.04 * kp}\" forcerange=\"{-st} {st}\" ctrlrange=\"{lo - 0.6} {hi + 0.6}\"/>\n",
+                f"    <position name=\"s{s}h{h}\" joint=\"s{s}h{h}\" kp=\"{kp}\" kv=\"{0.04 * kp}\" forcerange=\"{-st} {st}\" ctrlrange=\"{lo} {hi}\"/>\n",
             )
         }
-        // The parts whose first end is on this segment, as capsules in its frame. A welded
-        // segment's (a finger's) do not collide: its parent's parts (the palm) touch for it.
+        // The parts whose first end is on this segment, in its frame: each a cone of two radii,
+        // which the simulator has not, so a capsule of its smaller radius and a sphere at its
+        // larger end and at its middle with the cone's radius there: the points the judge
+        // measures each part's depth at. (A capsule of the radii's mean, until 2026-11-27, left
+        // the heel's flesh 5.5 mm under the surface that carried it.) A welded segment's parts (a
+        // finger's) do not collide: its parent's parts (the palm) touch for it.
         let collide = if moves[s] { "" } else { " contype=\"0\"" }
         for c in def.parts {
             if c.a.on == s {
                 let a = c.a.at
                 let bb = at[s].inverse().apply(at[c.b.on].apply(c.b.at))
                 x.push_str(
-                    f"{ind}  <geom type=\"capsule\" fromto=\"{v3(a)} {v3(bb)}\" size=\"{0.5 * (c.ra + c.rb)}\"{collide}/>\n",
+                    f"{ind}  <geom type=\"capsule\" fromto=\"{v3(a)} {v3(bb)}\" size=\"{min(c.ra, c.rb)}\"{collide}/>\n",
                 )
+                if abs(c.ra - c.rb) > 0.001 {
+                    let big = if c.ra > c.rb { a } else { bb }
+                    x.push_str(
+                        f"{ind}  <geom type=\"sphere\" pos=\"{v3(big)}\" size=\"{max(c.ra, c.rb)}\"{collide}/>\n",
+                    )
+                    x.push_str(
+                        f"{ind}  <geom type=\"sphere\" pos=\"{v3(0.5 * (a + bb))}\" size=\"{0.5 * (c.ra + c.rb)}\"{collide}/>\n",
+                    )
+                }
             }
         }
         open.push(s)
@@ -361,7 +388,21 @@ fn model<const S: u32, const D: u32, const P: u32>(def: Def<S, D, P>, moves: [bo
     }
     x.push_str("  </worldbody>\n  <actuator>\n")
     x.push_str(actuators.as_str())
-    x.push_str("  </actuator>\n</mujoco>\n")
+    x.push_str("  </actuator>\n")
+    // Each moving ball joint's range as the body holds it (`Joint::range`: an ellipse of its swing
+    // numbers and an interval of its twist), which its three hinges' box of Euler angles contains
+    // but does not equal: the tracker reads them (`ball_s{segment}`: lo then hi) to keep the body
+    // in its ranges.
+    x.push_str("  <custom>\n")
+    for s in 1..S {
+        let j = b.segments[s].joint
+        if moves[s] && j.kind == Kind::Ball {
+            x.push_str(
+                f"    <numeric name=\"ball_s{s}\" data=\"{j.lo.x} {j.lo.y} {j.lo.z} {j.hi.x} {j.hi.y} {j.hi.z}\"/>\n",
+            )
+        }
+    }
+    x.push_str("  </custom>\n</mujoco>\n")
     x
 }
 

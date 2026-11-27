@@ -134,7 +134,9 @@ class Sim:
                               njmax_nnz=njmax * self.mjm.nv)
         self.n = worlds
         self.dev = device
-        self.substeps = substeps
+        # The steps to a frame: as many as the model's step goes into a frame of the clips (8 at
+        # the export's 1/240 s), or `substeps` where it is given.
+        self.substeps = substeps or max(1, int(round(1.0 / (head["rate"] * self.mjm.opt.timestep))))
         self.gen = gen
         self.qpos = wp.to_torch(self.d.qpos)
         self.qvel = wp.to_torch(self.d.qvel)
@@ -190,6 +192,25 @@ class Sim:
         self.graph = None
         self.start_share = 0.0
         self.fall_mean = 0.5
+        # Each moving ball joint's range as the body holds it (the export's `ball_s{segment}`):
+        # its body, its parent's, its frame in the parent and its numbers' lo and hi.
+        child, parent, frame, lo, hi = [], [], [], [], []
+        for i in range(self.mjm.nnumeric):
+            name = self.mjm.numeric(i).name
+            if name.startswith("ball_s"):
+                b = self.mjm.body(f"s{name[6:]}").id
+                data = self.mjm.numeric(i).data
+                child.append(b)
+                parent.append(int(self.mjm.body_parentid[b]))
+                frame.append(self.mjm.body_quat[b].tolist())
+                lo.append(data[:3].tolist())
+                hi.append(data[3:6].tolist())
+        self.ball_child = torch.tensor(child, device=device, dtype=torch.long)
+        self.ball_parent = torch.tensor(parent, device=device, dtype=torch.long)
+        self.ball_frame = torch.tensor(frame, device=device, dtype=torch.float32).reshape(-1, 4)
+        self.ball_lo = torch.tensor(lo, device=device, dtype=torch.float32).reshape(-1, 3)
+        self.ball_hi = torch.tensor(hi, device=device, dtype=torch.float32).reshape(-1, 3)
+        self.range_weight = 0.0
 
     def tilt(self, g):
         """Each world's own gravity (`g`, worlds by 3): a floor tilted under the body is a slope.
@@ -357,6 +378,44 @@ def exploded(sim):
     return ~ok
 
 
+def ball_numbers(sim):
+    """Each moving ball joint's numbers as the engine has them (`joint::numbers_of`: the twist
+    about the joint's y, then the swing left as a vector, its x and z), from the simulator's
+    turns: worlds by joints by 3."""
+    n, k = sim.n, sim.ball_child.numel()
+    pq = sim.xquat[:, sim.ball_parent]
+    cq = sim.xquat[:, sim.ball_child]
+    fr = sim.ball_frame[None].expand(n, -1, -1)
+    r = quat_mul(quat_conj(fr), quat_mul(quat_conj(pq), cq))
+    r = torch.where(r[..., :1] < 0, -r, r)
+    tw = torch.zeros_like(r)
+    tw[..., 0], tw[..., 2] = r[..., 0], r[..., 2]
+    tw = tw / tw.norm(dim=-1, keepdim=True).clamp(min=1e-12)
+    angle = 2.0 * torch.atan2(tw[..., 2], tw[..., 0])
+    sw = quat_mul(r, quat_conj(tw))
+    sw = torch.where(sw[..., :1] < 0, -sw, sw)
+    sn = sw[..., 1:].norm(dim=-1, keepdim=True)
+    f = torch.where(sn < 1e-8, torch.full_like(sn, 2.0), 2.0 * torch.atan2(sn, sw[..., :1]) / sn.clamp(min=1e-12))
+    v = sw[..., 1:] * f
+    return torch.stack([v[..., 0], v[..., 2], angle], -1)
+
+
+def range_excess(sim):
+    """Each world's ball joints' distances past their ranges, summed (rad): the engine's
+    `Joint::range` (the swing's ellipse, scaled by its smaller half axis, and the twist's
+    interval), 0 within. The simulator's hinges hold a box of Euler angles that contains each
+    cone; this is what is outside the cone."""
+    if sim.ball_child.numel() == 0:
+        return torch.zeros(sim.n, device=sim.dev)
+    q = ball_numbers(sim)
+    lo, hi = sim.ball_lo[None], sim.ball_hi[None]
+    ax = torch.where(q[..., 0] >= 0, hi[..., 0], -lo[..., 0]).clamp(min=1e-4)
+    ay = torch.where(q[..., 1] >= 0, hi[..., 1], -lo[..., 1]).clamp(min=1e-4)
+    swing = (torch.sqrt((q[..., 0] / ax) ** 2 + (q[..., 1] / ay) ** 2) - 1.0) * torch.minimum(ax, ay)
+    twist = torch.maximum(lo[..., 2] - q[..., 2], q[..., 2] - hi[..., 2])
+    return torch.relu(torch.maximum(swing, twist)).sum(-1)
+
+
 def reward(sim, act_clamped=None):
     dx, dx_loc, dr = errors(sim)
     ex = dx.mean(-1)
@@ -377,6 +436,9 @@ def reward(sim, act_clamped=None):
          0.15 * r_rot + 0.10 * r_root + 0.10 * r_vel)
     if act_clamped is not None:
         r = (r - 0.02 * (act_clamped * act_clamped).mean(-1)).clamp(min=0.0)
+    if sim.range_weight > 0.0:
+        # The body's ranges, which the simulator's hinges do not hold (`range_excess`).
+        r = r * torch.exp(-sim.range_weight * range_excess(sim))
     bad = exploded(sim)
     fell = (ex > sim.fall_mean) | bad
     r = torch.where(bad | ~torch.isfinite(r), torch.zeros_like(r), r)
@@ -809,7 +871,7 @@ def main():
     p.add_argument("--worlds", type=int, default=4096)
     p.add_argument("--steps", type=int, default=1000, help="updates of the net")
     p.add_argument("--horizon", type=int, default=32)
-    p.add_argument("--substeps", type=int, default=4)
+    p.add_argument("--substeps", type=int, default=0, help="the simulator's steps to a frame (0: from the model)")
     p.add_argument("--hidden", default="1024,512,256")
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--eval-every", type=int, default=200)
@@ -824,6 +886,8 @@ def main():
     p.add_argument("--start-share", type=float, default=0.25,
                    help="the share of worlds started at their clip's first frame (the evaluation plays each "
                         "clip from there)")
+    p.add_argument("--range-weight", type=float, default=0.0,
+                   help="the reward times e^-(this times the ball joints' distances past the body's ranges, rad)")
     p.add_argument("--fall-mean", type=float, default=0.5,
                    help="a fall: the segments this far from their places on average (m)")
     p.add_argument("--init", default="",
@@ -851,6 +915,7 @@ def main():
         sim = Sim(a.model, head, refs, a.worlds, dev, a.substeps, gen)
         sim.start_share = a.start_share
         sim.fall_mean = a.fall_mean
+        sim.range_weight = a.range_weight
         print(f"sim: {a.worlds} worlds, {len(head['names'])} clips, {refs.shape[0]} frames, "
               f"{sim.active.numel()} active bodies, {sim.mjm.nu} actuators, "
               f"set up in {time.time() - t0:.0f} s", flush=True)
@@ -874,7 +939,12 @@ def main():
             norm.load(w["norm"], dev)
             if kinds is not None:
                 return play_variants(run, sim, agent, norm, head, kinds, t0)
-            results = play(sim, agent, norm, list(range(sim.starts.shape[0])))
+            if a.filtered:
+                # The clips as the tracker moves the body: a filtered capture of any states.
+                data, results = filtered(sim, agent, norm, head)
+                run.output("filtered.bin", data)
+            else:
+                results = play(sim, agent, norm, list(range(sim.starts.shape[0])))
             for r in results:
                 print(f"played {head['names'][r['clip']]}: followed {r['followed']}, frames {r['frames']} "
                       f"of {int(sim.lengths[r['clip']])}, mean {1000.0 * r['mean_m']:.1f} mm", flush=True)
