@@ -164,6 +164,7 @@ class Sim:
         self.clip = torch.zeros(worlds, dtype=torch.long, device=device)
         self.frame = torch.zeros(worlds, dtype=torch.long, device=device)
         self.graph = None
+        self.start_share = 0.0
 
     def frames_of(self, q):
         """Each body's place and turn for each of the qpos `q` (by the simulator's kinematics, a
@@ -195,7 +196,11 @@ class Sim:
         return v
 
     def reset(self, which):
-        """Starts the worlds `which` (a mask) at a random frame of a random clip."""
+        """Starts the worlds `which` (a mask) at a random frame of a random clip, or a share of
+        them (`start_share`) at its first frame: a clip of 100STYLE starts from standing, and a
+        tracker that started each world at a random frame alone (one frame in 2,400 the first)
+        fell in the first second of 38% of the clips it played from their starts, and in the first
+        20 s of 69% (`p4h-7`)."""
         idx = which.nonzero().flatten()
         if idx.numel() == 0:
             return
@@ -203,6 +208,8 @@ class Sim:
                                          generator=self.gen)]
         span = (self.lengths[c] - 2).clamp(min=1)
         f = (torch.rand(idx.numel(), device=self.dev, generator=self.gen) * span).long()
+        first = torch.rand(idx.numel(), device=self.dev, generator=self.gen) < self.start_share
+        f = torch.where(first, torch.zeros_like(f), f)
         self.clip[idx] = c
         self.frame[idx] = f
         g = self.starts[c] + f
@@ -586,6 +593,9 @@ def main():
     p.add_argument("--target-kl", type=float, default=0.02,
                    help="the epochs of an update stop when the mean KL of the last passes this, and the rate "
                         "follows it; 0: no target, the rate fixed")
+    p.add_argument("--start-share", type=float, default=0.25,
+                   help="the share of worlds started at their clip's first frame (the evaluation plays each "
+                        "clip from there)")
     p.add_argument("--filtered", action="store_true", help="play every clip to its end at the end")
     p.add_argument("--weights", default="",
                    help="a trained tracker (tracker.pt): train nothing, play every clip of the refs to its end")
@@ -598,6 +608,7 @@ def main():
     t0 = time.time()
     with wp.ScopedDevice("cuda:0" if dev == "cuda" else "cpu"):
         sim = Sim(a.model, head, refs, a.worlds, dev, a.substeps, gen)
+        sim.start_share = a.start_share
         print(f"sim: {a.worlds} worlds, {len(head['names'])} clips, {refs.shape[0]} frames, "
               f"set up in {time.time() - t0:.0f} s", flush=True)
         sim.reset(torch.ones(a.worlds, dtype=torch.bool, device=dev))
