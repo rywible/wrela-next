@@ -389,6 +389,7 @@ than the balance fell (1.59 written, 1.12 fallen for the tests of 0.5).
 | 2026-11-26 | `p4h-4` (L4): phase 4 on the human: 629 training clips, 91 test held out, 4000 updates; PPO's step held (KL 0.02) and collapses rolled back; past update 1,000 with no collapse, but its reward flat at 0.645 from update 600 (one epoch an update, its KL 0.034 to 0.049): stopped at update 1,110 for the rate that follows the KL | 2.25 |
 | 2026-11-26 | `p4h-5` (L4): phase 4 on the human: 629 training clips, 91 test held out, 4000 updates; the rate of learning follows PPO's KL, collapses rolled back; the rate fell to 2.6e-5 and the reward stayed at 0.66 to update 1,000 (0.3% of clips followed at 500): stopped for a fixed spread of the actions | 2.80 |
 | 2026-11-26 | `p4h-6` (L4): phase 4 on the human: 629 training clips, 91 test held out, 4000 updates; the actions' spread fixed at e^-2.3, the KL held to 0.05, collapses rolled back; stable, but the rate fell to 5.9e-5 and its falls a step at update 600 were 2.5% against p4h-3's 1.5%: stopped at update 690 for the bounds loss | 2.00 |
+| 2026-11-26 | `p4h-7` (L4): phase 4 on the human: 629 training clips, 91 test held out, 4000 updates; p4h-3's rate (2e-4, five epochs) with the actions' means held within 1.1 and collapses rolled back; no collapse, its best at update 2,000 (32.8% of training clips and 25.3% of test clips followed for 20 s, 54 mm), flat after, done | 10.71 |
 
 #### A new machine
 
@@ -714,6 +715,18 @@ capture's instead of 42): not kept. The tracker of phase 4 makes the slide physi
 slid 267 of 267, noisy 267 of 267, raised 267 of 267, faster 232 of 267, still 74 of 89; worse
 with more damage in 89 of 89 clips for slid and noisy, 76 for faster, 70 for raised.
 
+With CeTI (2026-11-26, 334 calibration clips: 89 of 100STYLE, 245 of CeTI): each source has its
+own statistics (`refs_for`: a movement's distance from capture is from the training clips of its
+own source, a source with none the pooled), and each target is the largest of the sources' 95th
+percentiles, so a clean clip of each kind of movement passes. They are 100STYLE's (the table
+above): CeTI's tasks of each day are slower, its percentiles a third to a half lower (the
+residual 0.239, the torque 0.439, the slide 774 mm/s, the distance 0.455, the goal error 0.255).
+A movement's score is now the length of its measures in units of their targets, not their sum:
+with the sum, a body that stands still beat a fast run (still, the physics measures are 0, though
+the goal error is 2.5 targets), and the capture won 4,097 of 4,342 pairs (94.4%; the still body
+187 of 334). With the length it wins 4,153 (95.6%): slid 1,002 of 1,002, noisy 1,002, raised 996,
+faster 833, still 320 of 334.
+
 The laws of movement on the human (`laws-calibrate`, 27 s for 7,178 s of clean movement): noise
 of 0.02, 0.05 and 0.1 rad puts 30, 78 and 102 of 117 clips outside the power law's band (0.019
 to 0.219) and 30, 74 and 77 of 78 outside the turn order's (0.34 to 0.73); the standing laws' bands
@@ -937,6 +950,17 @@ removes the faults of the retarget: slide, penetration and forces that cannot oc
   while the likelihood's gradient can push it on, and the net loses its control. A bounds loss
   now holds each mean within 1.1 (weight 0.01, as rl_games does), and the log gives the share of
   means past 1; `p4h-7` runs `p4h-3`'s rate (2e-4, five epochs, no KL target) with it.
+- `p4h-7` ran its 4,000 updates with no collapse (10.71 units): its reward 0.80 at update 1,000
+  and 0.77 after, its best evaluation at update 2,000 (32.8% of the training clips followed for
+  their first 20 s, 25.3% of the test clips, 54 mm) and flat to the end, while its KL grew from
+  0.04 to 0.3 to 1.0 with 80% of samples clipped (a fixed rate's step too large late in a run).
+  Every clip played from its start to its end: 23.2% of the training clips followed, 17.6% of
+  the test; of the 558 that fell, 275 fell in their first second, 496 in their first 20 s. A
+  clip of 100STYLE starts from standing and sets off into its style's gait, and a world started
+  at a random frame starts at a clip's first frame once in 2,400: the tracker never learned to
+  set off. `p4h-8` starts a quarter of its worlds at their clip's first frame, holds its rate to
+  a KL of 0.1, and trains on CeTI's clips too (2,038 clips, 25.9 h; CeTI moves the fingers, so
+  its model moves 35 segments, not 25).
 - The filtered capture back as poses (`tools/movement/export -- human unfilter`, `--read
   filtered=` the run's outputs, `--read sim=` its export, `--write out=.movement/poses-filtered`):
   each clip's qpos up to its fall as the body's numbers (a welded segment at rest), so the solver

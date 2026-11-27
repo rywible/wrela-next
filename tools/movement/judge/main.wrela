@@ -353,8 +353,7 @@ fn judge_play<const S: u32, const D: u32, const P: u32>(
     def: Def<S, D, P>,
     names: Vec<String>,
 ) -> Result<u32, ToolError> {
-    let refs_100 = reference(def, 120, "100style/")?
-    let refs_embm = reference(def, 120, "embm/")?
+    let refs_by = references(def, 120)?
     let target = targets(def.name)
     var means = [0.0; MEASURES]
     var passed = [0; MEASURES]
@@ -365,10 +364,7 @@ fn judge_play<const S: u32, const D: u32, const P: u32>(
         let c = load::<D>(def.name, name.as_str())?
         var goals = velocity_goals(c.poses.clone(), c.rate, 1.0)
         goals.truncate(p.poses.len())
-        let refs = if name.as_str().starts_with("embm/") { refs_embm.clone() } else {
-            refs_100.clone()
-        }
-        let s = scored(def, p.poses.clone(), p.rate, refs, goals, 1.0)
+        let s = scored(def, p.poses.clone(), p.rate, refs_for(refs_by.clone(), name.as_str()), goals, 1.0)
         let v = values(s)
         var ok = true
         for i in 0..MEASURES {
@@ -397,12 +393,12 @@ fn judge_play<const S: u32, const D: u32, const P: u32>(
 }
 
 /// The goal test's movements (`tools/movement/solver -- goaltest`, read as `play`): each judged
-/// with 100STYLE's statistics against the velocity it was asked for at each frame.
+/// with all the training capture's statistics against the velocity it was asked for at each frame.
 fn judge_goals<const S: u32, const D: u32, const P: u32>(
     def: Def<S, D, P>,
     names: Vec<String>,
 ) -> Result<u32, ToolError> {
-    let refs = reference(def, 120, "100style/")?
+    let refs = references(def, 120)?.all
     let target = targets(def.name)
     var all_passed = 0
     for name in names {
@@ -435,12 +431,17 @@ fn judge_goals<const S: u32, const D: u32, const P: u32>(
     Ok(all_passed)
 }
 
+/// A movement's distance from the perfect one: the length of its measures in units of their
+/// targets, so that one measure far past its target counts for more than several measures near
+/// theirs (a sum let a body that stands still beat a fast run: still, the physics measures are 0,
+/// though the goal error is 2.5 targets).
 fn score(v: [f32; MEASURES], target: [f32; MEASURES]) -> f32 {
     var s = 0.0
     for i in 0..MEASURES {
-        s += v[i] / max(target[i], 1.0e-6)
+        let r = v[i] / max(target[i], 1.0e-6)
+        s += r * r
     }
-    s
+    sqrt(s)
 }
 
 fn measures_line(name: str, s: Scored) -> String {
@@ -452,32 +453,86 @@ fn print_measures(name: str, s: Scored) {
     print(measures_line(name, s).as_str())
 }
 
-/// The training clips' statistics of one source (`SOURCE/` names), at most `most` clips of it: a
-/// movement is held to capture of its own kind (walks and runs to 100STYLE's, gestures while
-/// standing to MPI EMBM's).
-fn reference<const S: u32, const D: u32, const P: u32>(
+/// The training clips' statistics of each source (the part of a clip's name before its `/`), at
+/// most `most` clips of each, and of all of them together: a movement is held to capture of its
+/// own kind (100STYLE's walks and runs to 100STYLE's, CeTI's tasks of each day to CeTI's), and a
+/// movement of no source, or of a source whose training clips are all seated (MPI EMBM's), to all
+/// of it.
+struct Refs<const D: u32>: Clone {
+    sources: Vec<String>,
+    stats: Vec<Stats<D>>,
+    all: Stats<D>,
+}
+
+fn source_of(name: str) -> String {
+    match name.find("/") {
+        Some(i) => name.slice(0, i).to_string(),
+        None => name.to_string(),
+    }
+}
+
+fn merged<const D: u32>(a: Stats<D>, b: Stats<D>) -> Stats<D> {
+    var m = a
+    m.count += b.count
+    for k in 0..D {
+        m.sum[k] += b.sum[k]
+        m.square[k] += b.square[k]
+    }
+    m.root_sum += b.root_sum
+    m.root_square += b.root_square
+    m
+}
+
+fn references<const S: u32, const D: u32, const P: u32>(
     def: Def<S, D, P>,
     most: u32,
-    source: str,
-) -> Result<Stats<D>, ToolError> {
+) -> Result<Refs<D>, ToolError> {
     let body = def.name
-    var names: Vec<String> = Vec::new()
+    var sources: Vec<String> = Vec::new()
+    var names: Vec<Vec<String>> = Vec::new()
     for n in set("training")? {
-        if n.as_str().starts_with(source) {
-            names.push(n.clone())
+        let src = source_of(n.as_str())
+        var at = sources.len()
+        for i in 0..sources.len() {
+            if sources[i].as_str() == src.as_str() {
+                at = i
+            }
+        }
+        if at == sources.len() {
+            sources.push(take src)
+            names.push(Vec::new())
+        }
+        names[at].push(n.clone())
+    }
+    var stats: Vec<Stats<D>> = Vec::new()
+    var all_of = no_stats()
+    for i in 0..sources.len() {
+        var st = no_stats()
+        let step = max(names[i].len() / most, 1)
+        var k = 0
+        while k < names[i].len() {
+            let c = load::<D>(body, names[i][k].as_str())?
+            if !bodies::bodies::seated(def, c.poses.clone(), c.rate) {
+                add_stats(mut st, c.poses, c.rate)
+            }
+            k += step
+        }
+        print(f"judge: {body}: the training clips' statistics of {sources[i]}: {st.count} frames")
+        all_of = merged(all_of, st)
+        stats.push(st)
+    }
+    Ok(Refs { sources, stats, all: all_of })
+}
+
+/// The statistics a movement named `name` is held to: its source's, or all of them.
+fn refs_for<const D: u32>(r: Refs<D>, name: str) -> Stats<D> {
+    let src = source_of(name)
+    for i in 0..r.sources.len() {
+        if r.sources[i].as_str() == src.as_str() && r.stats[i].count > 0.0 {
+            return r.stats[i]
         }
     }
-    var st = no_stats()
-    let step = max(names.len() / most, 1)
-    var i = 0
-    while i < names.len() {
-        let c = load::<D>(body, names[i].as_str())?
-        if !bodies::bodies::seated(def, c.poses.clone(), c.rate) {
-            add_stats(mut st, c.poses, c.rate)
-        }
-        i += step
-    }
-    Ok(st)
+    r.all
 }
 
 /// One clip of the calibration set to judge, with the training clips' statistics.
@@ -489,6 +544,7 @@ struct Job<const D: u32>: Clone {
 /// A clip judged with its damaged copies (the kinds in turn, each at its amounts): what it scored
 /// and how long the judge took for the clean one.
 struct Judged: Clone {
+    name: String,
     failed: bool,
     clean: [f32; MEASURES],
     damaged: Vec<[f32; MEASURES]>,
@@ -519,6 +575,7 @@ fn judged_creature(j: take Job<cs::FREEDOM>) -> Judged {
 
 fn judged_clip<const S: u32, const D: u32, const P: u32>(def: Def<S, D, P>, j: Job<D>) -> Judged {
     var out = Judged {
+        name: j.name.clone(),
         failed: true,
         clean: [0.0; MEASURES],
         damaged: Vec::new(),
@@ -565,18 +622,11 @@ fn calibration_jobs<const S: u32, const D: u32, const P: u32>(
     most: u32,
 ) -> Result<Vec<Job<D>>, ToolError> {
     let names = set("calibration")?
-    let refs_100 = reference(def, 120, "100style/")?
-    let refs_embm = reference(def, 120, "embm/")?
-    print(
-        f"judge: {def.name}: the training clips' statistics over {refs_100.count} frames of 100STYLE and {refs_embm.count} of MPI EMBM",
-    )
+    let refs_by = references(def, 120)?
     let count = min(most, names.len())
     var jobs: Vec<Job<D>> = Vec::new()
     for ci in 0..count {
-        let refs = if names[ci].as_str().starts_with("embm/") { refs_embm.clone() } else {
-            refs_100.clone()
-        }
-        jobs.push(Job { name: names[ci].clone(), refs })
+        jobs.push(Job { name: names[ci].clone(), refs: refs_for(refs_by.clone(), names[ci].as_str()) })
     }
     Ok(jobs)
 }
@@ -595,6 +645,7 @@ fn calibrate(results: Vec<Judged>) -> Result<u32, ToolError> {
         vec3(1.0, 1.0, 1.0),
     ]
     var clean: Vec<[f32; MEASURES]> = Vec::new()
+    var clean_source: Vec<String> = Vec::new()
     var damaged: Vec<[f32; MEASURES]> = Vec::new()
     var timing = 0.0
     var seconds = 0.0
@@ -607,6 +658,7 @@ fn calibrate(results: Vec<Judged>) -> Result<u32, ToolError> {
         timing += r.timing
         seconds += r.seconds
         clean.push(r.clean)
+        clean_source.push(source_of(r.name.as_str()))
         for v in r.damaged {
             damaged.push(v)
         }
@@ -616,19 +668,40 @@ fn calibrate(results: Vec<Judged>) -> Result<u32, ToolError> {
     }
     print(f"judge: {clean.len()} clips judged, {left_out} left out (seated, or not read)")
     print(f"judge: {timing * 1000.0 / max(seconds, 1.0e-6)} ms a second of movement")
-    // The targets: the 95th percentile of each measure over the clean clips (a clean clip passes),
-    // or a floor where that is 0.
+    // The targets: for each measure, the largest of each source's 95th percentile over its clean
+    // clips (a clean clip of each kind of movement passes: CeTI's tasks of each day are slower
+    // than 100STYLE's walks and runs, and its percentiles of 2026-11-26 lower by a third to a
+    // half), or a floor where that is 0.
     let floors = [0.02, 0.02, 20.0, 2.0, 2.0, 0.01, 0.2, 0.05]
+    var sources: Vec<String> = Vec::new()
+    for src in clean_source.clone() {
+        var seen = false
+        for t in sources.clone() {
+            if t.as_str() == src.as_str() {
+                seen = true
+            }
+        }
+        if !seen {
+            sources.push(src.clone())
+        }
+    }
     var target = [0.0; MEASURES]
     for i in 0..MEASURES {
-        var xs: Vec<f32> = Vec::new()
-        for v in clean {
-            xs.push(v[i])
+        var line = String::new()
+        var most = 0.0
+        for src in sources.clone() {
+            var xs: Vec<f32> = Vec::new()
+            for c in 0..clean.len() {
+                if clean_source[c].as_str() == src.as_str() {
+                    xs.push(clean[c][i])
+                }
+            }
+            let p95 = percentile(xs.clone(), 0.95)
+            most = max(most, p95)
+            line.push_str(f" {src} {p95} ({xs.len()} clips)")
         }
-        xs.sort_by(|a, b| a < b)
-        let p95 = xs[min(u32(f32(xs.len()) * 0.95), xs.len() - 1)]
-        target[i] = max(p95, floors[i])
-        print(f"judge: target {NAMES[i]}: {target[i]} (the clean clips' 95th percentile {p95})")
+        target[i] = max(most, floors[i])
+        print(f"judge: target {NAMES[i]}: {target[i]} (each source's clean clips' 95th percentile:{line})")
     }
     // The pairs: each clean clip against each of its damaged copies.
     let per = 13
