@@ -201,6 +201,10 @@ pub struct ExtractScratch {
     pub cell_px: f32,
     /// The origin of the grids `set_grids` last set (every grid of a batch has its first's).
     pub origin0: vec3,
+    /// The share of a cut's candidates the world's culls keep, a running mean of what each
+    /// batch's last readback found (`MeshBatch::ring_density`): a thing's first cut is reached by it
+    /// (one in eight before any readback: the kinds measured keep 4 to 15 in a hundred).
+    pub density_prior: f32,
 }
 
 /// Zeroes `count` words of `buf` in chunks of at most `2097152` elements (`32768` workgroups,
@@ -330,6 +334,7 @@ pub fn extract_scratch(max_bricks: u32, lattice: vec3, cell_px: f32 = CELL_PX) -
         lattice,
         cell_px,
         origin0: vec3(0.0),
+        density_prior: 0.125,
     }
 }
 
@@ -558,6 +563,8 @@ pub struct MeshBatch {
     pub(package) extract_total: u32,
     pub(package) extract_limit: u32,
     pub(package) poll_total: u32,
+    /// The reach of the read extraction's rings (`ring_reach`).
+    pub(package) poll_reach: f32,
     pub(package) poll_limit: u32,
     /// The most creases a chunk of the latest read extraction held (`crease_slices`).
     pub(package) crease_hint: u32,
@@ -639,14 +646,19 @@ pub struct MeshBatch {
     pub(package) drawn_levels: GpuBuffer<u32>,
     pub(package) drawn_rule: f32,
     /// The share of a cut's candidate bricks its cull kept, as the last readback found it, for
-    /// `ring_reach`'s budget: one in eight before one (the kinds measured keep 4 to 15 in a
-    /// hundred), so a first cut is bounded (one at the rule's reach before a readback was the
+    /// `ring_reach`'s budget: 0 before one, when the world's (`ExtractScratch::density_prior`)
+    /// stands for it, so a first cut is bounded (one at the rule's reach before a readback was the
     /// stack's 8.6 million candidates, and the GPU fell 1.5 s behind).
     pub(package) ring_density: f32,
     /// The reach its last cut's rings had (`ring_reach`), and whether a step in was still to be
     /// had then: its cells coarsen for what a batch holds only once none is.
     pub(package) ring_reach: f32,
     pub(package) reach_room: bool,
+    /// The reach of the cut `ring_density` was read of: a share read at another reach (an older
+    /// cut's, read after the eye moved on) may make the rings reach less, never more.
+    pub(package) density_reach: f32,
+    /// The first extraction since the eye last jumped (`lod_cut`).
+    pub(package) cut_gen: u32,
     pub(package) watch_slots_cap: u32,
     pub(package) watch_quads_cap: u32,
     pub(package) watch_verts_cap: u32,
@@ -1006,6 +1018,7 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
         extract_total: 0,
         extract_limit: 0,
         poll_total: 0,
+        poll_reach: 1.0,
         poll_limit: 0,
         crease_hint: 0,
         crease_slice: CREASE_SLICE_LEAST,
@@ -1050,9 +1063,11 @@ pub fn mesh_batch(max_bricks: u32) -> MeshBatch {
         drawn_grids: buffer(MAX_LOD_LEVELS),
         drawn_levels: buffer_of([0]),
         drawn_rule: CELL_PX,
-        ring_density: 0.125,
+        ring_density: 0.0,
         ring_reach: 1.0,
         reach_room: false,
+        density_reach: 1.0,
+        cut_gen: 0,
         watch_slots_cap: 1,
         watch_quads_cap: 1,
         watch_verts_cap: 1,
@@ -2116,8 +2131,10 @@ impl MeshBatch {
         // The share of the read cut's candidates its cull kept: a pool's hits and misses (its
         // active count is the drawn cut's, which an update that drew nothing new is not).
         let kept = if self.pooled { self.pool.cut_kept } else { c.z }
-        if self.poll_total > 0 {
+        // (A cut made before the eye's last jump says nothing of this eye's.)
+        if self.poll_total > 0 && self.poll_gen >= self.cut_gen {
             self.ring_density = clamp(f32(kept) / f32(self.poll_total), 1.0 / 64.0, 1.0)
+            self.density_reach = self.poll_reach
         }
         self.crease_hint = creases
         self.seam_hint = self.seam_read
@@ -2181,6 +2198,7 @@ impl MeshBatch {
                 self.poll_real = self.gen_real
                 self.poll_scale = self.extract_scale
                 self.poll_total = self.extract_total
+                self.poll_reach = self.ring_reach
                 self.poll_limit = self.extract_limit
                 self.poll_caps = vec4u(
                     self.cap_verts,
@@ -2753,9 +2771,13 @@ impl MeshBatch {
             eff_top,
             scratch.lattice,
             holds: CUT_ROOM,
-            density: self.ring_density,
+            density: if self.ring_density > 0.0 { self.ring_density } else { scratch.density_prior },
             last: self.ring_reach,
+            may_grow: self.density_reach == self.ring_reach,
         )
+        if self.ring_density > 0.0 {
+            scratch.density_prior = 0.9 * scratch.density_prior + 0.1 * self.ring_density
+        }
         self.ring_reach = reach
         self.reach_room = reach_room
         let (built_grids, built_total, built_seams) = build_ring_grids(
@@ -2857,6 +2879,7 @@ impl MeshBatch {
                 dot(v.forward, self.lod_view_fwd) < 0.90)
         if self.lod_cut {
             self.watch_known = false
+            self.cut_gen = self.gen + 1
         }
         self.lod_view_at = v.at
         self.lod_view_fwd = v.forward
