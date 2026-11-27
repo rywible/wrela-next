@@ -1097,6 +1097,16 @@ through the world with no cycle and no clip.
   movements float (37 to 53 mm against 32) and their roots' residual rises (0.60 to 0.76 of the
   weight against 0.43): 1 of 8 in every target. Not kept: the feet's loss alone, on kinematics,
   lifts the root; the filtered capture is the means for the run's slide.
+- With CeTI (`human6`, 2,039 clips of 100STYLE and CeTI, 25.9 h, MPI EMBM's seated clips left
+  out; human5's settings, 30 minutes of 12 threads here): on held-out clips of both it follows its
+  speed goals to 0.084 m/s (each 2 frames 0.085, each 4 0.104), its physics measure 0.97. In the
+  goal test (today's judge, both nets) it keeps the same 7 of 8 movements in every target; it
+  slides less in each (the walk 708 mm/s against human5's 839, the run 1,246 against 1,366 for a
+  target of 1,220), its roots' residual and torque are lower (the run 0.051 and 0.038 against 0.140
+  and 0.177) and it is nearer the capture (1.11 against 1.38), but it follows the goals' speeds
+  less well (the goal error of the walk 0.19 m/s against 0.07, the run 0.28 against 0.13: inside
+  the target of 0.41; the walk at 0.71 of its 0.9 m/s), as CeTI's tasks are slow. human5 stays
+  the solver of the engine until one trains on the filtered capture.
 - The prior of style (step 14, `tools/movement/amp.py`): a least-squares discriminator of
   stretches of 10 frames (a third of a second: one pair of frames cannot tell a held pose from a
   body that stands) read the same way from the capture, its damaged copies and the simulator
