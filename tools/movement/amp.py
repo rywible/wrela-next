@@ -17,9 +17,11 @@ of its features), on the CPU here.
 The method is published work's (docs/citations.md): X. B. Peng et al., "AMP: Adversarial Motion
 Priors for Stylized Physics-Based Character Control" (2021): a least-squares discriminator of
 pairs of frames with a penalty on its gradient at the capture, its score as a reward beside the
-task's; PPO (J. Schulman et al., 2017). The net is rewarded for the wish of the solver's goal (a
-speed and a direction on the ground, changed at random every few seconds) and for the
-discriminator's score; each world starts at a random frame of a random training clip.
+task's; PPO (J. Schulman et al., 2017). The net is rewarded for its task (`--task`, tools/movement/tasks.py:
+the solver's wish of a speed and a direction, a cast, a parry or a dodge) and for the
+discriminator's score; each world starts at a random frame of a random training clip. At the end a
+goal test plays the task with the net's mean action and writes its first worlds' movement as a
+filtered capture (`played.bin`) for the judge.
 
 The discriminator sees one frame's state and its rates to the next, all from the qpos and the
 simulator's kinematics in the same way for the capture, its damaged copies and the net's
@@ -37,11 +39,16 @@ import io
 import json
 import math
 import os
+import struct
 import sys
 import time
+import zlib
+
+import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import runlib  # noqa: E402
+import tasks  # noqa: E402
 import track  # noqa: E402
 
 torch = mujoco = wp = mjw = None
@@ -274,22 +281,20 @@ def check(disc, clips):
 # ---- the net that moves under the prior ---------------------------------------------------------
 
 
-def observe(sim, wish):
-    """The body's state in its heading's frame (as the tracker's, with no clip) and the wish: a
-    velocity on the ground, in the same frame."""
+def observe(sim, task):
+    """The body's state in its heading's frame (as the tracker's, with no clip) and what the task
+    gives of its goal (`tasks`), in the same frame."""
     T = track
     root_q = sim.xquat[:, 1]
     root_x = sim.xpos[:, 1]
     hq = T.quat_conj(T.heading(root_q))
     n = sim.n
     rel = sim.xpos[:, 2:] - root_x[:, None]
-    w = torch.zeros(n, 3, device=sim.dev)
-    w[:, 0], w[:, 2] = wish[:, 0], wish[:, 1]
     return torch.cat([
         root_x[:, 1:2], T.quat_mul(hq, root_q), T.quat_rotate(hq, sim.qvel[:, :3]), sim.qvel[:, 3:6],
         sim.qpos[:, 7:], 0.1 * sim.qvel[:, 6:],
         T.quat_rotate(hq[:, None].expand(-1, rel.shape[1], -1), rel).reshape(n, -1),
-        T.quat_rotate(hq, w)[:, [0, 2]],
+        task.observe(),
     ], -1)
 
 
@@ -305,13 +310,6 @@ def remember(sim, clips, hist_q, hist_x, which):
     i = torch.maximum(g[:, None] - back, start[:, None])
     hist_q[idx] = clips.q[i]
     hist_x[idx] = clips.x[i]
-
-
-def new_wishes(n, device, gen, most):
-    """Wishes on the ground: a direction at random and a speed between 0 and `most` m/s."""
-    a = torch.rand(n, device=device, generator=gen) * 2.0 * math.pi
-    s = torch.rand(n, device=device, generator=gen) * most
-    return torch.stack([s * torch.cos(a), s * torch.sin(a)], -1)
 
 
 def offline(a, run, dev, gen, head, refs, mjm):
@@ -358,6 +356,10 @@ def main():
     p.add_argument("--episode", type=int, default=300, help="the most frames of a world before it starts again")
     p.add_argument("--eval-every", type=int, default=200)
     p.add_argument("--target-kl", type=float, default=0.02)
+    p.add_argument("--task", default="walk", choices=["walk", "cast", "parry", "dodge"],
+                   help="what the net is rewarded for beside the style (tools/movement/tasks.py)")
+    p.add_argument("--test-frames", type=int, default=600, help="the goal test's frames (20 s)")
+    p.add_argument("--fall", type=float, default=0.6, help="a fall: the root under this share of its usual height")
     p.add_argument("--offline", action="store_true", help="the discriminator alone against damaged capture")
     a = p.parse_args(run.args)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
@@ -372,13 +374,59 @@ def main():
         train(a, run, dev, gen, head, refs, mjm)
 
 
+def goal_test(a, sim, agent, norm, clips, head, fall_height, frames=600, kept=16):
+    """The task's goal test: every world from a training clip's frame, the net's mean action, for
+    `frames` frames, a world that falls not started again; the task's measures over all its
+    goals, the share of worlds that fell, and the first `kept` worlds' movement as a filtered
+    capture (`WFLT`, as track.py writes it: `tools/movement/export -- human unfilter` makes poses
+    of it for the judge and the laws of movement)."""
+    gen = torch.Generator(device=sim.dev).manual_seed(12345)
+    sim.gen = gen
+    kept = min(kept, sim.n)
+    sim.start_share = 0.0
+    sim.reset(torch.ones(sim.n, dtype=torch.bool, device=sim.dev))
+    mjw.kinematics(sim.m, sim.d)
+    task = tasks.make(a.task, sim, gen, a.fastest)
+    task.measures()
+    alive = torch.ones(sim.n, dtype=torch.bool, device=sim.dev)
+    fell_at = torch.full((sim.n,), frames, dtype=torch.long, device=sim.dev)
+    hist_q = sim.qpos[:, None].expand(-1, WINDOW, -1).clone()
+    reach = torch.maximum(sim.lo.abs(), sim.hi.abs())
+    record = [sim.qpos[:kept].float().cpu().clone()]
+    never = torch.zeros(sim.n, dtype=torch.bool, device=sim.dev)
+    for t in range(frames):
+        with torch.no_grad():
+            act = agent.pi(norm(observe(sim, task)))
+        # A world that fell stands still: its actions change nothing that is counted.
+        sim.step(act.clamp(-1, 1) * reach)
+        hist_q = torch.cat([hist_q[:, 1:], sim.qpos[:, None]], 1)
+        task.reward(hist_q, clips.rate)
+        fell = alive & (track.exploded(sim) | (sim.qpos[:, 1] < fall_height))
+        fell_at = torch.where(fell, torch.full_like(fell_at, t), fell_at)
+        alive &= ~fell
+        task.counted = alive.clone()
+        task.after(never)
+        record.append(sim.qpos[:kept].float().cpu().clone())
+    measures = task.measures()
+    measures["fell"] = float((~alive).float().mean())
+    chunks, listed = [], []
+    for j in range(kept):
+        n = int(fell_at[j]) + 1
+        chunks.append(torch.stack([f[j] for f in record[:n]]).numpy().astype("<f4"))
+        listed.append({"name": f"skill/{a.task}_{j}", "set": "test", "followed": bool(alive[j]),
+                       "frames": n, "length": frames + 1, "mean_segment_mm": 0.0})
+    body = zlib.compress(np.concatenate(chunks).tobytes(), 6)
+    h = json.dumps({"clips": listed, "nq": head["nq"], "rate": head["rate"]}).encode()
+    return measures, b"WFLT" + struct.pack("<I", len(h)) + h + body
+
+
 def train(a, run, dev, gen, head, refs, mjm):
     T = track
     t0 = time.time()
     sim = T.Sim(a.model, head, refs, a.worlds, dev, a.substeps, gen)
     kin = Kin(mjm, a.batch)
     clips = Clips(head, refs, kin, dev, gen, q=sim.ref_q, x=sim.ref_x)
-    fall_height = 0.6 * clips.root_height
+    fall_height = a.fall * clips.root_height
     print(f"sim: {a.worlds} worlds, {len(head['names'])} clips, root height {clips.root_height:.3f} m, "
           f"set up in {time.time() - t0:.0f} s", flush=True)
     sim.reset(torch.ones(a.worlds, dtype=torch.bool, device=dev))
@@ -387,10 +435,9 @@ def train(a, run, dev, gen, head, refs, mjm):
     hist_q = torch.zeros(N, WINDOW, sim.nq, device=dev)
     hist_x = torch.zeros(N, WINDOW, sim.nb, 3, device=dev)
     remember(sim, clips, hist_q, hist_x, torch.ones(N, dtype=torch.bool, device=dev))
-    wish = new_wishes(N, dev, gen, a.fastest)
-    left = torch.randint(60, 150, (N,), device=dev, generator=gen)
+    task = tasks.make(a.task, sim, gen, a.fastest)
     age = torch.zeros(N, dtype=torch.long, device=dev)
-    n_obs = observe(sim, wish).shape[1]
+    n_obs = observe(sim, task).shape[1]
     n_act = sim.mjm.nu
     reach = torch.maximum(sim.lo.abs(), sim.hi.abs())
     hidden = [int(x) for x in a.hidden.split(",")]
@@ -424,7 +471,7 @@ def train(a, run, dev, gen, head, refs, mjm):
         ep_task, ep_fall, blown = 0.0, 0.0, 0
         with torch.no_grad():
             for h in range(H):
-                o_raw = observe(sim, wish)
+                o_raw = observe(sim, task)
                 norm.update(o_raw)
                 o = norm(o_raw)
                 dist = agent.dist(o)
@@ -440,30 +487,25 @@ def train(a, run, dev, gen, head, refs, mjm):
                 hist_q = torch.cat([hist_q[:, 1:], sim.qpos[:, None]], 1)
                 hist_x = torch.cat([hist_x[:, 1:], sim.xpos[:, None]], 1)
                 feat_buf[h] = torch.nan_to_num(features(hist_q, hist_x, clips.rate), 0.0, 0.0, 0.0)
-                v = (hist_q[:, -1, [0, 2]] - hist_q[:, -2, [0, 2]]) * clips.rate
-                task = torch.exp(-2.5 * ((v - wish) ** 2).sum(-1))
-                fell = bad | (sim.qpos[:, 1] < fall_height) | ~torch.isfinite(task)
-                task = torch.where(fell, torch.zeros_like(task), task)
+                r_task = task.reward(hist_q, clips.rate)
+                fell = bad | (sim.qpos[:, 1] < fall_height) | ~torch.isfinite(r_task)
+                r_task = torch.where(fell, torch.zeros_like(r_task), r_task)
                 age += 1
                 ended = age >= a.episode
                 trunc_val[h] = 0.0
                 if ended.any():
-                    trunc_val[h] = torch.where(ended & ~fell, agent.v(norm(observe(sim, wish))).squeeze(-1), 0.0)
-                task_buf[h] = task
+                    trunc_val[h] = torch.where(ended & ~fell, agent.v(norm(observe(sim, task))).squeeze(-1), 0.0)
+                task_buf[h] = r_task
                 done_buf[h] = (fell | ended).float()
                 fell_buf[h] = fell.float()
-                ep_task += float(task.mean())
+                ep_task += float(r_task.mean())
                 ep_fall += float(fell.float().mean())
                 again = fell | ended
                 sim.reset(again)
                 remember(sim, clips, hist_q, hist_x, again)
                 age[again] = 0
-                left -= 1
-                change = (left <= 0) | again
-                if change.any():
-                    wish[change] = new_wishes(int(change.sum()), dev, gen, a.fastest)
-                    left[change] = torch.randint(60, 150, (int(change.sum()),), device=dev, generator=gen)
-            val_buf[H] = agent.v(norm(observe(sim, wish))).squeeze(-1)
+                task.after(again)
+            val_buf[H] = agent.v(norm(observe(sim, task))).squeeze(-1)
             style = disc.reward(feat_buf.reshape(H * N, -1)).reshape(H, N)
             # A fall earns nothing.
             style = style * (1.0 - fell_buf)
@@ -507,6 +549,7 @@ def train(a, run, dev, gen, head, refs, mjm):
         if a.eval_every and step % a.eval_every == 0:
             last_check = check(disc, clips)
             print(f"check at {step}: {json.dumps(last_check)}", flush=True)
+            print(f"the task at {step} ({a.task}, sampled actions): {json.dumps(task.measures())}", flush=True)
         if run.due() or step == a.steps:
             run.checkpoint(step, {
                 "agent": {k: v.cpu() for k, v in agent.state_dict().items()},
@@ -519,12 +562,16 @@ def train(a, run, dev, gen, head, refs, mjm):
             return
     final = check(disc, clips)
     print(f"check at the end: {json.dumps(final)}", flush=True)
+    test, data = goal_test(a, sim, agent, norm, clips, head, fall_height, frames=a.test_frames)
+    print(f"the goal test ({a.task}, the mean action): {json.dumps(test)}", flush=True)
+    run.output("played.bin", data)
     buf = io.BytesIO()
     torch.save({"agent": {k: v.cpu() for k, v in agent.state_dict().items()}, "norm": norm.state(),
                 "disc": disc.state(), "n_obs": n_obs, "n_act": n_act, "n_in": n_in, "hidden": hidden,
                 "seed": run.seed, "args": vars(a), "samples": samples}, buf)
     run.output("style.pt", buf.getvalue())
-    run.finish({"step": step, "samples": samples, "check": final, "seconds": time.time() - t0})
+    run.finish({"step": step, "samples": samples, "check": final, "goal_test": test,
+                "seconds": time.time() - t0})
 
 
 if __name__ == "__main__":

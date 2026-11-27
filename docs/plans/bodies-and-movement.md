@@ -1108,6 +1108,16 @@ through the world with no cycle and no clip.
   (83 to 92%), the slide, the noise, the raised root and the still body 98 to 100%. The run that
   trains a net under it, with the solver's wish of a speed and a direction as its task, is next on
   the L4.
+- The skills (step 15, `tools/movement/tasks.py`, trained by `amp.py --task`): `cast` (the right
+  palm, its hand's centre of mass, at a point within reach in front of the body, 0.4 to 1.5 s
+  ahead), `parry` (either palm at a thrown spell, 8 to 15 m/s from 6 to 10 m, where it reaches the
+  body's front, at its tick) and `dodge` (a spell of radius 0.12 m thrown at the trunk or the head,
+  no capsule of the body within it as it passes, the body held near where it was); the walk's
+  wish is the fourth. Each ends with a goal test of 20 s of the net's mean action in every world
+  (the palm's distance at its tick, the share of spells avoided, the share that fell), its first
+  16 worlds a filtered capture for the judge and the laws of movement. Checked on the CPU: a
+  parry's spell reaches its point at its tick to 6 micrometres, and a body that stands still is
+  hit by 285 of 285 spells.
 - Not yet: the solver trained on the filtered capture (phase 4's tracker on the human is in work), the tracker following the
   solver's output, the bits on the two machines (the M4 is not measured), the prior of style and
   the skills.

@@ -141,6 +141,9 @@ class Sim:
         self.ctrl = wp.to_torch(self.d.ctrl)
         self.xpos = wp.to_torch(self.d.xpos)
         self.xquat = wp.to_torch(self.d.xquat)
+        self.xipos = wp.to_torch(self.d.xipos)
+        self.geom_xpos = wp.to_torch(self.d.geom_xpos)
+        self.geom_xmat = wp.to_torch(self.d.geom_xmat)
         self.warm = wp.to_torch(self.d.qacc_warmstart)
         self.nq, self.nv, self.nb = self.mjm.nq, self.mjm.nv, self.mjm.nbody
         self.lo = torch.tensor(self.mjm.actuator_ctrlrange[:, 0], device=device)
