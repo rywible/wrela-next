@@ -451,6 +451,8 @@ def train(a, run, dev, gen, head, refs, mjm):
     half = 0.5 * (sim.jnt_hi - sim.jnt_lo)
     hidden = [int(x) for x in a.hidden.split(",")]
     agent = T.make_agent(n_obs, n_act, hidden).to(dev)
+    with torch.no_grad():
+        agent.log_std.fill_(-1.8)
     opt = torch.optim.Adam(agent.parameters(), lr=a.lr)
     norm = T.Normal(n_obs, dev)
     vnorm = T.ValNorm(dev)
@@ -534,7 +536,7 @@ def train(a, run, dev, gen, head, refs, mjm):
         flat = feat_buf.reshape(H * N, -1)
         n_damaged = int(a.batch * a.damaged)
         d_loss = d_pos = d_neg = 0.0
-        steps_d = max(1, (H * N) // a.batch)
+        steps_d = min(max(1, (H * N) // a.batch), 4)
         for _ in range(steps_d):
             j = torch.randint(0, H * N, (a.batch - n_damaged,), device=dev, generator=gen)
             neg = torch.cat([flat[j], clips.damaged_sample(n_damaged)]) if n_damaged else flat[j]
