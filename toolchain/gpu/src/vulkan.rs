@@ -1488,7 +1488,7 @@ impl Device {
         let mut k = 0;
         while k < fills.len() {
             let index = self.0.submitted.fetch_add(1, Ordering::AcqRel) + 1;
-            let mut enc = CommandEncoder::new(self.clone());
+            let enc = CommandEncoder::new(self.clone());
             let mut keep: Vec<Keep> = Vec::new();
             let mut bytes = 0;
             while k < fills.len() && (bytes == 0 || bytes + fills[k].2 <= FILL_PIECE) {
